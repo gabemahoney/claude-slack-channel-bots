@@ -49,6 +49,10 @@
 #                        directory is trusted when
 #                        `projects[<dir>].hasTrustDialogAccepted` is `true` for
 #                        its real path or for $PWD.
+#   pause-linger         report in at once, as `at-once` does, and answer the
+#                        `/exit` line agent-director's `pause` types by firing
+#                        SessionEnd and lingering until the harness releases
+#                        it (see THE PAUSE LINGER).
 #
 # Only the dev-channels dialog holds DEV_CHANNELS_DIALOG_NEEDLE, and only the
 # folder-trust prompt holds TRUST_DIALOG_NEEDLE.
@@ -77,6 +81,32 @@
 # Hook firing, the sentinel, the stop line and the re-fire are as stated
 # below, with or without a delay.
 #
+# THE PAUSE LINGER
+# ----------------
+# A harness addition (b.jg5 SRJ-1306, SRJ-1415) to confirm at the reconcile
+# pass, for HO §7 scenarios 13 and 24: a worker whose row reads `ended` while
+# its process and tmux session still run, as Claude Code's SessionEnd hook
+# marks the row before its process exits. It acts only in `pause-linger`:
+#   - agent-director's `pause` types C-u (which clears the pane's input line),
+#     `/exit` and Enter, so the stub reads the line `/exit` (a C-u that
+#     reaches the line as a character is dropped from its start). Once the
+#     stub has reported in, that line fires every SessionEnd hook the
+#     `--settings` JSON registers, once, by HOOK FIRING's rules; the stub then
+#     stops the re-fire, ends its MCP session (as Claude Code's shutdown
+#     closes its MCP clients) and lingers: its process, and so its tmux pane
+#     and session, keep running;
+#   - while it lingers it ignores every line but the sentinel, which ends it
+#     with no hook fired (SessionEnd has fired); stdin closing ends it too;
+#   - the harness releases it (lib/scenario.sh `stub_release`), which adds
+#     the line `<time> TAB <real path>` to the file `stub-claude-releases`
+#     beside the stub. The lingering stub reads that file every
+#     LINGER_POLL_S and exits 0, firing nothing, at the first line added
+#     after it began to linger that names its directory. It counts the
+#     file's lines when the `/exit` arrives, before it fires the hooks, so a
+#     line added before then never releases it.
+# A `/exit` line before the stub reported in, and a `/exit` line in any other
+# mode, is ignored as any other line is.
+#
 # Every mode keeps these rules:
 #   - Reporting in writes a minimal transcript JSONL at Claude Code's canonical
 #     location, fires every SessionStart hook the `--settings` JSON registers
@@ -91,6 +121,7 @@
 #   - The sentinel line `__CSCB_TEST_EXIT__` fires every SessionEnd hook the
 #     `--settings` JSON registers and exits 0 (in `silent`, it fires none). In
 #     a dialog mode it does so before the dialog is answered too.
+#   - In `pause-linger`, the `/exit` line too (see THE PAUSE LINGER).
 #   - When stdin closes (the pane was killed), the stub exits 0.
 #
 # RESUME
@@ -194,7 +225,8 @@
 # change and exits, or dies with the pane's hang-up. When the server ends the
 # session (a refusal, a stop), the client exits; a later `/mcp reconnect` line,
 # which CSCB types into a persona's pane to reconnect it, opens a new session
-# when none is running.
+# when none is running. In `pause-linger` the `/exit` line ends the session
+# (SIGTERM) and the lingering stub opens none (see THE PAUSE LINGER).
 # No session is opened when the client is not beside the stub (Test 4, Test 10
 # and Test 12, which copy only the stub), when the stub was given no
 # `--mcp-config`, or in a mode that has not reported in (`silent`, a dialog not
@@ -262,6 +294,7 @@ MODE_AT_ONCE=at-once
 MODE_SILENT=silent
 MODE_UNRECOGNISED=unrecognised-dialog
 MODE_FOLDER_TRUST=folder-trust
+MODE_PAUSE_LINGER=pause-linger
 
 STUB_DIR="${BASH_SOURCE[0]%/*}"
 [[ "${STUB_DIR}" == "${BASH_SOURCE[0]}" ]] && STUB_DIR=.
@@ -275,6 +308,7 @@ if [[ -f "${STUB_MODES_FILE}" ]]; then
 fi
 case "${MODE}" in
     "${MODE_DEV_CHANNELS}" | "${MODE_AT_ONCE}" | "${MODE_SILENT}" | "${MODE_UNRECOGNISED}" | "${MODE_FOLDER_TRUST}") ;;
+    "${MODE_PAUSE_LINGER}") ;;
     *)
         printf 'stub-claude: unknown mode %q selected for %s; running %s\n' \
             "${MODE}" "${REALCWD}" "${MODE_DEV_CHANNELS}" >&2
@@ -678,11 +712,68 @@ case "${MODE}" in
         ;;
     "${MODE_SILENT}")
         ;;
+    "${MODE_PAUSE_LINGER}")
+        report_in
+        ;;
 esac
+
+# ---------------------------------------------------------------------------
+# The pause linger (see THE PAUSE LINGER)
+# ---------------------------------------------------------------------------
+
+# The line agent-director's `pause` types, the release file beside the stub,
+# and how often a lingering stub reads that file, in seconds.
+PAUSE_EXIT_LINE=/exit
+STUB_RELEASES_FILE="${STUB_DIR}/stub-claude-releases"
+LINGER_POLL_S=0.25
+LINGERING=0
+# The release file's line count when the linger began.
+RELEASE_BASE=0
+
+# Set N_LINES to the release file's line count (0 when there is none).
+release_lines() {
+    local l
+    N_LINES=0
+    [[ -f "${STUB_RELEASES_FILE}" ]] || return 0
+    while IFS= read -r l || [[ -n "${l}" ]]; do
+        N_LINES=$(( N_LINES + 1 ))
+    done < "${STUB_RELEASES_FILE}"
+}
+
+# True when a release line added after the linger began names this directory.
+released() {
+    local n=0 rel_time rel_dir
+    [[ -f "${STUB_RELEASES_FILE}" ]] || return 1
+    while IFS=$'\t' read -r rel_time rel_dir || [[ -n "${rel_time}" ]]; do
+        n=$(( n + 1 ))
+        (( n > RELEASE_BASE )) && [[ "${rel_dir}" == "${REALCWD}" ]] && return 0
+    done < "${STUB_RELEASES_FILE}"
+    return 1
+}
+
+# The `/exit` line in `pause-linger`: count the release file's lines, fire
+# SessionEnd, stop the re-fire, end the MCP session, then linger.
+begin_linger() {
+    release_lines
+    RELEASE_BASE="${N_LINES}"
+    fire_session_end
+    stop_refire
+    close_mcp_session
+    LINGERING=1
+}
 
 # handle_line <line>: one line from stdin.
 handle_line() {
     local line="$1"
+    if (( LINGERING )); then
+        [[ "${line}" == "${SENTINEL}" ]] && exit 0
+        return 0
+    fi
+    if [[ "${MODE}" == "${MODE_PAUSE_LINGER}" ]] && (( REPORTED )) \
+        && [[ "${line##*$'\x15'}" == "${PAUSE_EXIT_LINE}" ]]; then
+        begin_linger
+        return 0
+    fi
     if [[ "${line}" == "${SENTINEL}" ]]; then
         [[ "${MODE}" == "${MODE_SILENT}" ]] || fire_session_end
         exit 0
@@ -703,7 +794,15 @@ handle_line() {
 partial=""
 while :; do
     line=""
-    if (( DIALOG_DUE_MS > 0 )); then
+    if (( LINGERING )); then
+        released && exit 0
+        IFS= read -r -t "${LINGER_POLL_S}" line
+        rc=$?
+        if (( rc > 128 )); then
+            partial+="${line}"
+            continue
+        fi
+    elif (( DIALOG_DUE_MS > 0 )); then
         now_ms
         wait_ms=$(( DIALOG_DUE_MS - NOW_MS ))
         if (( wait_ms <= 0 )); then

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Test 17 (HO §7 scenarios 5 and 11; b.jg5 SRJ-1406, SRJ-1413, SRJ-401,
-# SRJ-402, SRJ-404, SRJ-406, SRJ-407, SRJ-409, SRJ-410, SRJ-120, SRJ-310,
-# SRJ-710, SRJ-713, SRJ-1306, SRJ-1401, SRJ-1418; AC 3, AC 6, AC 29, AC 32): a
-# launch in progress, in four legs, run in this order:
+# Test 17 (HO §7 scenarios 5, 11 and 13; b.jg5 SRJ-1406, SRJ-1413,
+# SRJ-1415, SRJ-401, SRJ-402, SRJ-404, SRJ-406, SRJ-407, SRJ-409, SRJ-410,
+# SRJ-120, SRJ-308, SRJ-310, SRJ-710, SRJ-713, SRJ-1112, SRJ-1306, SRJ-1401,
+# SRJ-1418; AC 3, AC 6, AC 29, AC 32): a launch in progress, and a resume
+# right after an exit, in five legs, run in this order:
 # - scenario 5's leg (`leg_launch_pending`): a resume held at the
 #   dev-channels dialog reads `pending` with its kept claude_session_id and a
 #   launch start; health ticks and a `resume` forced meanwhile change nothing
@@ -29,7 +30,12 @@
 #   ErrTmuxSessionCreate and leaves a `pending` row; CSCB never kills it or
 #   launches over it, its own pending-row rule's `find-missing` marks it
 #   `missing` from G, and the persona is then brought up, with no post
-#   calling it a dispatcher bug and no escalation (AC 6).
+#   calling it a dispatcher bug and no escalation (AC 6);
+# - scenario 13's leg (`leg_still_stopping`): a bot the harness pauses
+#   reads `ended` while its worker still runs; the bot server's immediate
+#   `resume` is refused once as "still stopping" (UNAVAILABLE), followed by
+#   one `get`, and posts nothing; once the harness releases the worker, the
+#   retry timer's retry resumes the bot, before the next health tick.
 #
 # The fmk set-up (lib/scenario.sh, fmk mode: TEST_NAME carries `-fmk-`):
 # - its own HOME, agent-director store and tmux server under SCENARIO_ROOT;
@@ -39,8 +45,10 @@
 # - the tmux shim first on every CSCB process's PATH, in `log` mode apart
 #   from the launch-timeout legs' start and scenario 11's start (below);
 # - the stub as `claude`, in `dev-channels` (no selection) in every persona's
-#   working directory, with the dialog delay (`stub_dialog_delay`) where a
-#   leg sets it;
+#   working directory but scenario 13's, with the dialog delay
+#   (`stub_dialog_delay`) where a leg sets it; scenario 13's working
+#   directory is selected for `pause-linger` (`stub_mode`; the stub's header,
+#   THE PAUSE LINGER, a harness addition);
 # - the live server against the Slack stub (fixtures/slack-stub-server.ts
 #   with `--record`; posts are read from that record), one stub per leg,
 #   each answering ok only for that leg's personas' token pairs;
@@ -269,6 +277,77 @@
 # pending-row rule and collision lines, the startup-errors.log lines naming
 # F, and whether the counted failure posted a spawn-failure notice.
 #
+# Scenario 13's leg (`leg_still_stopping`), in run order, in state dir
+# `paused`, one persona S (working directory `paused`, selected for the
+# stub's `pause-linger`: the stub reports in at once, and answers the `/exit`
+# that agent-director's `pause` types by firing SessionEnd, ending its MCP
+# session and lingering, its process and tmux session still running, until
+# `stub_release`), with health ticks on (ruling S3): `health_check_interval`
+# ST_TICK_S and `session_restart_delay` ST_RESTART_DELAY_S, through the
+# config.
+#   1. The live start brings S up: the row reads `waiting` with a
+#      claude_session_id, the server registers the stub's MCP session as
+#      S's, the bring-up's approver has stopped (APPROVER_QUIET_S with no
+#      pane read), and the bring-up launch's pending-only retry timer has
+#      stopped (as many stopped lines as armed lines), so the refusal below
+#      arms a fresh timer.
+#   2. A health tick reads S: the bot server's next `status` of S (with the
+#      approver and the timer stopped, only a tick reads it) at T0.
+#   3. [harness] At once, a harness `pause` of S from the scenario's own
+#      shell, through the agent-director shim (a human's `pause`): it
+#      returns success no later than ST_PAUSE_S after T0 (checked), the row
+#      reads `ended` with the same claude_session_id, and the worker's tmux
+#      session and pane process still run.
+#   4. The stub's MCP session ended with SessionEnd, so the server schedules
+#      S's restart; after the restart delay the restart path resumes S, and
+#      agent-director refuses the resume: the row ended less than the
+#      stopping window ago and its agent still runs.
+#   5. [harness] Once server.log holds that refusal, `stub_release` releases
+#      the worker at once; its tmux session is gone within
+#      ST_SESSION_END_WAIT_S.
+#   6. The row reads `waiting` again with the same claude_session_id, and
+#      the server registers the resumed stub's session as S's.
+#   7. The next tick's read of S: the bot server's first `status` of S from
+#      T0 + ST_TICK_S - ST_TICK_JITTER_S on, no later than T0 + ST_TICK_S +
+#      ST_TICK_JITTER_S (checked); ST_TICK_SETTLE_S later that tick's onset
+#      check has run.
+#   8. Checks, over the bot server's agent-director calls of S's row
+#      (`call_table`) and server.log:
+#      - exactly two bot-server `resume`s of S after the pause, and no reuse
+#        spawn (`spawn --reuse-finished`) or `kill` of S from any CSCB
+#        process (each `resume` follows its ladder's plain spawn, which
+#        collides with S's row: recorded);
+#      - the first `resume` came inside the stopping window from the pause;
+#      - exactly one server.log refusal of S's `resume` carries
+#        STILL_STOPPING_PHRASE, between the two `resume`s;
+#      - exactly one post-UNAVAILABLE get line for S's `resume` (SRJ-407),
+#        and exactly one bot-server `get` of S from the refused `resume` to
+#        that line;
+#      - the retry timer's first retry line for S after the refusal comes
+#        after the release and after the worker's session ended, and the
+#        second `resume` follows it within ST_LAUNCH_SLACK_S, before the
+#        next tick's read and before the row read `waiting` again: the
+#        success is a retry's, not a tick's (SRD over the Epic and HO);
+#      - no post reaches the Slack stub's record from the pause on: none
+#        holds S's tmux-unresponsive onset (`tmuxUnresponsiveOnsetText`) or
+#        the spawn-failure notice's first line, and there is no alert or
+#        other post (SRJ-308: the single refusal cleared before the next
+#        tick);
+#      - no server.log line after the second `resume` names S with a
+#        reconnect, relaunch, restart scheduling or not-connected text
+#        (ruling S3: a tick acting on a stub with no MCP session stops the
+#        run).
+#   The server is then stopped with a plain `stop`, and [harness] S's worker
+#   ends with the sentinel (`stop --stop-bots` would pause it, and the
+#   stub would linger).
+# Recorded, not asserted (ruling S8): what scheduled the resume (the
+# restart-scheduling lines), the bot server's calls of S from the pause with
+# their times from T0, the plain spawns' count and collision lines, the
+# refusal line and every line naming S that carries
+# STILL_STOPPING_PHRASE, the get line, S's retry-timer and tmux-unresponsive
+# lines, and the times of the pause, the refused resume, the release, the
+# retry, the second resume and the next tick from T0.
+#
 # Waits and their derivation (seconds):
 # - DIALOG_DELAY_S = HEALTH_TICK_S + FORCED_RESUME_S + HOLD_SLACK_S: longer
 #   than one health tick interval plus the forced `resume` (bounded at
@@ -326,6 +405,22 @@
 #   config, should it wait), the approver's Enter, the stub's report-in and
 #   the harness's read. The failure itself is awaited within START_WAIT_S of
 #   the start.
+# - Scenario 13: ST_TICK_S = ST_PAUSE_S + ST_RESTART_DELAY_S +
+#   ST_LAUNCH_SLACK_S + UNAVAILABLE_RETRY_BASE_S + ST_LAUNCH_SLACK_S. From
+#   T0 (a tick's read) come the pause (bounded at ST_PAUSE_S, checked), the
+#   restart delay, the restart path's calls up to its refused `resume`
+#   (ST_LAUNCH_SLACK_S), the retry timer's first wait from the refusal
+#   (UNAVAILABLE_RETRY_BASE_S) and the retry's calls up to its `resume`
+#   (ST_LAUNCH_SLACK_S, checked), so the tick interval exceeds
+#   UNAVAILABLE_RETRY_BASE_S (checked) and the retry after the release comes
+#   before the next tick. The refused `resume` is due within ST_PAUSE_S +
+#   ST_RESTART_DELAY_S + ST_LAUNCH_SLACK_S of T0, shorter than the stopping
+#   window (DEFAULT_AD_SETTINGS.tmux.stopping_window_seconds; checked, and
+#   the first `resume`'s time from the pause is checked against it), so it
+#   meets "still stopping". The release follows the refusal at once, well
+#   inside the retry's first wait (checked: the retry line comes after the
+#   release and the session's end). ST_TIMER_WAIT_S = UNAVAILABLE_RETRY_BASE_S
+#   + LT_RETRY_SLACK_S bounds the bring-up timer's stop.
 #
 # Matched values. CSCB's values are printed by fixtures/fmk-texts.ts from
 # the installed package, never retyped: APPROVER_LOG_PREFIX,
@@ -344,7 +439,11 @@
 # entry `tmuxUnresponsiveEndedLines`); and the spawn-failure notice's head
 # for ErrTmuxSessionCreate (src/session-manager.ts spawnFailureNoticeText,
 # the body notifySpawnFailure posts; entry `spawnFailureNoticeHead`), whose
-# first line is matched on its own to find any spawn-failure post.
+# first line is matched on its own to find any spawn-failure post. Scenario
+# 13's: STILL_STOPPING_PHRASE (src/ad-description-phrases.ts), the stopping
+# window (src/ad-settings.ts DEFAULT_AD_SETTINGS.tmux.stopping_window_seconds)
+# and S's tmux-unresponsive onset body (src/persona-episodes.ts
+# tmuxUnresponsiveOnsetText, entry `tmuxUnresponsiveOnsetText`).
 # Fragments with no exported builder, each quoted from its source:
 # - `[slack] Session connected: persona <ref>` (src/server.ts, the MCP
 #   session's registration line);
@@ -354,9 +453,9 @@
 #   and LAUNCH_TIMEOUT_FORM_TEXT);
 # - `[slack] spawnForPersona: collision resolved, state=` and `for <ref>`
 #   (src/session-manager.ts runPersonaLadder's collision line);
-# - `[slack] unavailable-retry: persona=<key> ` with `retry ` and `stopped`
-#   (src/unavailable-retry.ts unavailableRetryRetryLine and
-#   unavailableRetryStoppedLine);
+# - `[slack] unavailable-retry: persona=<key> ` with `retry `, `stopped` and
+#   (scenario 13) `armed` (src/unavailable-retry.ts unavailableRetryRetryLine,
+#   unavailableRetryStoppedLine and unavailableRetryArmedLine);
 # - `[slack] conflict-latch: persona=<key> ` (src/conflict-latch.ts, the
 #   latch record's lines);
 # - `[slack] spawnForPersona: `, `failed for <ref>: ` and ErrTmuxSessionCreate
@@ -374,7 +473,13 @@
 # - `Scheduling restart for persona=<key>` (src/restart.ts scheduleRestart);
 # - the hold's trouble words `reconnect`, `relaunch`, `Scheduling restart`
 #   and `not connected` (src/restart.ts, src/session-manager.ts; matched
-#   case-insensitively on lines naming P's key or reference);
+#   case-insensitively on lines naming P's key or reference, and S's in
+#   scenario 13);
+# - `[slack] spawnForPersona: resume refused for <ref>: ` (src/session-manager.ts
+#   logRefusal, the refusal line, with `resume` as the call);
+# - the post-UNAVAILABLE get line's `resume of <ref> ended in UNAVAILABLE (`
+#   after GET_LINE_HEAD (src/session-manager.ts launchUnavailableGetLine and
+#   launchUnavailableFormText);
 # - the driver's outcome fields `called=`, `counted=`, `error=` (the
 #   fmk-driver.ts outcome line) and ErrSpawnNotResumable (agent-director's
 #   error name); ErrSpawnNotFound (agent-director's error name; a harness
@@ -487,6 +592,23 @@ SESSION_CREATE_ERR=ErrTmuxSessionCreate
 
 # The words SRJ-1413 says no post holds.
 DISPATCHER_BUG='dispatcher bug'
+
+# Scenario 13's persona S (working directory `paused`, selected for the
+# stub's pause linger).
+S_NAME="${SCENARIO_TAG}_paused"
+S_KEY="$(persona_key "${S_NAME}")"
+S_REF="$(persona_ref "${S_NAME}")"
+S_ID="cscb_${S_KEY}"
+S_CHANNEL="C0T17PSE1"
+S_SUFFIX=t17z
+
+# Scenario 13's leg (seconds; see the header for ST_TICK_S's derivation).
+ST_RESTART_DELAY_S=3      # session_restart_delay: the restart the session's end schedules
+ST_PAUSE_S=5              # from the tick read the pause follows to the pause's return (checked)
+ST_LAUNCH_SLACK_S=10      # a restart run's or a retry's calls before its resume (checked for the retry)
+ST_TICK_JITTER_S=2        # the next tick's read, against the first read plus the interval
+ST_TICK_SETTLE_S=3        # after the next tick's read: that tick's onset check has run
+ST_SESSION_END_WAIT_S=10  # after the release: the lingering worker's tmux session gone
 
 # Fragments with no exported builder (see the header).
 GET_LINE_HEAD='[slack] spawnForPersona: one get after the '
@@ -855,6 +977,24 @@ SPAWN_FAILURE_FIRST="${SPAWN_FAILURE_HEAD%%$'\n'*}"
 # Scenario 11's wait: from the launch start, G and one longest retry wait, then the bring-up.
 FC_BRINGUP_BOUND_S=$(( G_S + RETRY_CEILING_S + FC_BRINGUP_SLACK_S ))
 echo "${TEST_NAME}: scenario 11: bring-up bound ${FC_BRINGUP_BOUND_S}s from the launch start"
+
+STILL_STOPPING="$(fmk_text STILL_STOPPING_PHRASE)" || fail "setup: fmk-texts.ts could not print STILL_STOPPING_PHRASE"
+STOP_WINDOW_S="$(fmk_text DEFAULT_AD_SETTINGS.tmux.stopping_window_seconds)" \
+    || fail "setup: fmk-texts.ts could not print DEFAULT_AD_SETTINGS.tmux.stopping_window_seconds"
+S_ONSET="$(fmk_text tmuxUnresponsiveOnsetText "${S_KEY}")" || fail "setup: fmk-texts.ts could not print tmuxUnresponsiveOnsetText"
+[[ -n "${STILL_STOPPING}" && -n "${S_ONSET}" ]] || fail "setup: fmk-texts.ts printed an empty value"
+[[ "${STOP_WINDOW_S}" =~ ^[1-9][0-9]*$ ]] || fail "setup: the stopping window '${STOP_WINDOW_S}' is not a whole number of seconds"
+# Scenario 13's tick interval: from the tick read the pause follows, the
+# pause, the restart delay and the restart run's calls before its refused
+# resume, then the retry timer's first wait and the retry's calls before its
+# resume, all before the next tick.
+ST_TICK_S=$(( ST_PAUSE_S + ST_RESTART_DELAY_S + ST_LAUNCH_SLACK_S + RETRY_BASE_S + ST_LAUNCH_SLACK_S ))
+(( ST_TICK_S > RETRY_BASE_S )) || fail "setup: scenario 13's tick interval ${ST_TICK_S}s is not longer than the retry base ${RETRY_BASE_S}s"
+(( ST_PAUSE_S + ST_RESTART_DELAY_S + ST_LAUNCH_SLACK_S < STOP_WINDOW_S )) \
+    || fail "setup: scenario 13's refused resume is not due inside the stopping window ${STOP_WINDOW_S}s"
+# The bring-up launch's pending-only retry timer has run its first retry and stopped.
+ST_TIMER_WAIT_S=$(( RETRY_BASE_S + LT_RETRY_SLACK_S ))
+echo "${TEST_NAME}: scenario 13: stopping window ${STOP_WINDOW_S}s, health tick ${ST_TICK_S}s, restart delay ${ST_RESTART_DELAY_S}s, retry base ${RETRY_BASE_S}s"
 
 # ---------------------------------------------------------------------------
 # Scenario 5's leg
@@ -1706,10 +1846,215 @@ leg_fail_create() {
     stop_tracked_pid "${SLACK_STUB_PID}" 10 "${step}: the Slack stub did not exit on SIGTERM"
 }
 
+# ---------------------------------------------------------------------------
+# Scenario 13: a paused bot's immediate resume meets "still stopping"
+# ---------------------------------------------------------------------------
+
+# server_status_after <id> <time>: print the time of the bot server's
+# (SERVER_PID's) first `status` of row <id> after <time>, read straight from
+# the agent-director shim's log (empty when none).
+server_status_after() {
+    awk -F'\t' -v p="${SERVER_PID}" -v id="$1" -v t="$2" '
+        $1 == "call" && $4 == p && $2 + 0 > t + 0 && index(" " $6 " ", " status ") \
+            && index(" " $6 " ", " --claude-instance-id " id " ") { print $2; exit }' "${SCENARIO_AD_SHIM_LOG}"
+}
+
+# server_status_seen <id> <time>: true once `server_status_after` prints a time.
+server_status_seen() {
+    [[ -n "$(server_status_after "$1" "$2")" ]]
+}
+
+# st_timer_idle <from-line>: true when, after server.log line <from-line>, S's
+# retry timer has as many stopped lines as armed lines (none armed, or each
+# arm stopped).
+st_timer_idle() {
+    local armed stopped
+    armed="$(log_hits "$1" "[slack] unavailable-retry: persona=${S_KEY} armed" | wc -l)"
+    stopped="$(log_hits "$1" "[slack] unavailable-retry: persona=${S_KEY} stopped" | wc -l)"
+    (( stopped >= armed ))
+}
+
+# st_refusal_seen <from-line>: true once server.log holds, after line
+# <from-line>, the refusal of a `resume` of S carrying STILL_STOPPING_PHRASE.
+st_refusal_seen() {
+    [[ -n "$(log_hits "$1" "[slack] spawnForPersona: resume refused for ${S_REF}: " "${STILL_STOPPING}")" ]]
+}
+
+# st_session_gone <session>: true once the scenario's tmux server no longer
+# holds <session>.
+st_session_gone() {
+    ! has_session "$1"
+}
+
+leg_still_stopping() {
+    local step="scenario 13" creds="${SCENARIO_ROOT}/credentials-st" work srv sid session pane_pid
+    local t tick0 paused_at refusal_at release_at gone_at live_at next_tick gap retry_at get_at
+    local resume1 resume2 table="${SCENARIO_ROOT}/st-calls.tsv" n verb hits connected
+    local lines=() resumes=() posts=()
+
+    new_state_dir paused
+    mkdir -m 700 "${creds}"
+    start_slack_stub "${SCENARIO_ROOT}/slack-stub-st" "${S_SUFFIX}"
+    printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${S_SUFFIX}")" "$(fake_token app "${S_SUFFIX}")" \
+        | write_file "${creds}/s.json" 600
+    work="$(make_workdir paused)"
+    stub_mode "${work}" "${STUB_MODE_PAUSE_LINGER}"
+    persona_json "${S_NAME}" "${creds}/s.json" "${work}" "${S_CHANNEL}" \
+        | jq -s --argjson port "${SCENARIO_PORT}" --argjson tick "${ST_TICK_S}" --argjson delay "${ST_RESTART_DELAY_S}" \
+            '{personas: ., bind: "127.0.0.1", port: $port, health_check_interval: $tick, session_restart_delay: $delay, exit_timeout: 5}' \
+        | write_config
+
+    # Step 1: the live start brings S up; its stub reports in at once.
+    start_server --live
+    srv="${SERVER_PID}"
+    wait_for_log "$(completion_match 1)" "${START_WAIT_S}" "${step}: the start pass never completed"
+    expect_completion 1 "${step}" "0 not brought up"
+    wait_until "${REPORT_WAIT_S}" "${step}: row ${S_ID} never reported in (waiting) after the start" \
+        row_of_reads "${S_ID}" "${step}: bring-up" waiting
+    sid="${ROW_SID}"
+    session="${ROW_SESSION}"
+    [[ -n "${sid}" && -n "${session}" ]] || fail "${step}: the live row ${S_ID} has no claude_session_id or names no tmux session"
+    # src/server.ts: the MCP session's registration line.
+    connected="$(matcher "[slack] Session connected: persona ${S_REF}")"
+    wait_for_log "${connected}" "${CONNECT_WAIT_S}" "${step}: the server never registered the stub's session as S's"
+    wait_until "${APPROVER_STOP_WAIT_S}" "${step}: the bot server still reads S's pane ${APPROVER_STOP_WAIT_S}s after the bring-up" \
+        approver_quiet_of "${S_ID}"
+    # The bring-up launch's retry timer has stopped, so the refusal arms a
+    # fresh timer whose first retry is RETRY_BASE_S after it.
+    wait_until "${ST_TIMER_WAIT_S}" "${step}: S's retry timer from the bring-up had not stopped ${ST_TIMER_WAIT_S}s after it" \
+        st_timer_idle 0
+
+    # Step 2: a health tick's read of S (with the approver and the timer
+    # stopped, only a tick reads S's status).
+    t="$(now_s)"
+    wait_until "$(( ST_TICK_S + 10 ))" "${step}: no health tick read S's status within $(( ST_TICK_S + 10 ))s" \
+        server_status_seen "${S_ID}" "${t}"
+    tick0="$(server_status_after "${S_ID}" "${t}")"
+
+    # Step 3 [harness]: pause S from the scenario's shell, at once.
+    ad_capture pause --claude-instance-id "${S_ID}"
+    paused_at="$(now_s)"
+    (( AD_RC == 0 )) || fail "${step}: the harness pause of ${S_ID} exited ${AD_RC}: $(head -c 300 "${AD_ERR}") $(head -c 300 "${AD_OUT}")"
+    awk -v a="${tick0}" -v b="${paused_at}" -v s="${ST_PAUSE_S}" 'BEGIN { exit !(b - a <= s) }' \
+        || fail "${step}: the pause returned $(seconds_between "${tick0}" "${paused_at}")s after the tick read, longer than ST_PAUSE_S ${ST_PAUSE_S}s the tick interval is derived from"
+    read_row_of "${S_ID}" "${step}: after the pause"
+    [[ "${ROW_STATE}" == ended && "${ROW_SID}" == "${sid}" ]] \
+        || fail "${step}: after the pause the row reads ${ROW_STATE} (${ROW_SID}), not ended with ${sid}"
+    # The worker still runs: its tmux session and the pane's process.
+    has_session "${session}" || fail "${step}: the paused worker's tmux session ${session} is gone before its release"
+    pane_pid="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${session}:" '#{pane_pid}')" \
+        || fail "${step}: tmux could not read ${session}'s pane"
+    pid_alive "${pane_pid}" || fail "${step}: the paused worker's process ${pane_pid} is gone before its release"
+    echo "${TEST_NAME}: ${step}: paused $(seconds_between "${tick0}" "${paused_at}")s after the tick read; the row reads ended while the worker ${pane_pid} still runs"
+
+    # Step 4: the bot server's resume of S, refused as still stopping.
+    wait_until "$(( ST_RESTART_DELAY_S + ST_LAUNCH_SLACK_S + 10 ))" "${step}: no still-stopping refusal of S's resume after the pause" \
+        st_refusal_seen 0
+    refusal_at="$(log_hits 0 "[slack] spawnForPersona: resume refused for ${S_REF}: " "${STILL_STOPPING}" | head -n 1 | cut -f2)"
+
+    # Step 5 [harness]: release the lingering worker, at once.
+    stub_release "${work}"
+    release_at="$(now_s)"
+    wait_until "${ST_SESSION_END_WAIT_S}" "${step}: the worker's tmux session ${session} still runs ${ST_SESSION_END_WAIT_S}s after its release" \
+        st_session_gone "${session}"
+    gone_at="$(now_s)"
+    ! pid_alive "${pane_pid}" || fail "${step}: the released worker's process ${pane_pid} still runs"
+    echo "${TEST_NAME}: ${step}: released $(seconds_between "${refusal_at}" "${release_at}")s after the refusal; the session was gone by $(seconds_between "${refusal_at}" "${gone_at}")s"
+
+    # Step 6: a later resume succeeds: S reads waiting with the same session id.
+    wait_until "$(( RETRY_BASE_S + ST_LAUNCH_SLACK_S + REPORT_WAIT_S ))" "${step}: row ${S_ID} never read waiting again after the release" \
+        row_of_reads "${S_ID}" "${step}: after the release" waiting
+    live_at="${ROW_READ_AT}"
+    [[ "${ROW_SID}" == "${sid}" ]] || fail "${step}: the waiting row's claude_session_id is '${ROW_SID}', not the paused row's ${sid}"
+    wait_for_count "${connected}" 2 "${CONNECT_WAIT_S}" "${step}: the server never registered the resumed stub's session as S's"
+
+    # Step 7: the next health tick's read, then that tick's onset check.
+    wait_until "$(( ST_TICK_S + 10 ))" "${step}: no health tick read S's status near ${ST_TICK_S}s after the first" \
+        server_status_seen "${S_ID}" "$(plus_s "${tick0}" "$(( ST_TICK_S - ST_TICK_JITTER_S ))")"
+    next_tick="$(server_status_after "${S_ID}" "$(plus_s "${tick0}" "$(( ST_TICK_S - ST_TICK_JITTER_S ))")")"
+    gap="$(seconds_between "${tick0}" "${next_tick}")"
+    awk -v g="${gap}" -v i="${ST_TICK_S}" -v j="${ST_TICK_JITTER_S}" 'BEGIN { exit !(g <= i + j) }' \
+        || fail "${step}: the next tick's read of S came ${gap}s after the first, not within ${ST_TICK_JITTER_S}s of the interval ${ST_TICK_S}s"
+    sleep "${ST_TICK_SETTLE_S}"
+
+    # Step 8: the checks, over the bot server's calls (`call_table`).
+    call_table "${table}"
+    echo "${TEST_NAME}: ${step}: the bot server's calls of ${S_ID} from the pause, from the tick read (recorded): $(calls "${table}" "${srv}" "${S_ID}" - "${paused_at}" - | awk -F'\t' -v t="${tick0}" '{ a = $5; sub(/ --label .*/, " …", a); printf "+%.3fs %s [%s]; ", $1 - t, $3, a }')"
+    echo "${TEST_NAME}: ${step}: what scheduled the resume (recorded): $(log_hits 0 "Scheduling restart for persona=${S_KEY} " | cut -f3 | cut -c1-200 | tr '\n' '|')"
+    # Exactly two bot-server resumes of S after the pause; no reuse spawn or
+    # kill of S by any CSCB process (each ladder's plain spawn, its first
+    # step, collides with the row: recorded).
+    mapfile -t resumes < <(calls "${table}" "${srv}" "${S_ID}" resume "${paused_at}" - | cut -f1)
+    (( ${#resumes[@]} == 2 )) || fail "${step}: ${#resumes[@]} bot-server resume(s) of ${S_ID} after the pause, not two (the refused one and the retry's)"
+    resume1="${resumes[0]}"
+    resume2="${resumes[1]}"
+    n="$(count_calls "${table}" - "${S_ID}" spawn "${paused_at}" - --reuse-finished)"
+    (( n == 0 )) || fail "${step}: ${n} reuse spawn(s) of ${S_ID} by a CSCB process after the pause"
+    n="$(count_calls "${table}" - "${S_ID}" kill "${paused_at}" -)"
+    (( n == 0 )) || fail "${step}: ${n} kill call(s) of ${S_ID} by a CSCB process after the pause"
+    echo "${TEST_NAME}: ${step}: $(count_calls "${table}" "${srv}" "${S_ID}" spawn "${paused_at}" - '!--reuse-finished') plain spawn(s) of S after the pause, each a ladder's first step; their collision lines (recorded): $(log_hits 0 "[slack] spawnForPersona: collision resolved, state=" "for ${S_REF}" | cut -f3 | cut -c1-160 | tr '\n' '|')"
+    # The first resume fell inside the stopping window from the pause.
+    awk -v a="${paused_at}" -v b="${resume1}" -v w="${STOP_WINDOW_S}" 'BEGIN { exit !(b - a < w) }' \
+        || fail "${step}: the first resume came $(seconds_between "${paused_at}" "${resume1}")s after the pause, outside the stopping window ${STOP_WINDOW_S}s"
+    # Exactly one refusal of S's resume carries STILL_STOPPING_PHRASE, between the two resumes.
+    mapfile -t lines < <(log_hits 0 "[slack] spawnForPersona: resume refused for ${S_REF}: " "${STILL_STOPPING}")
+    (( ${#lines[@]} == 1 )) || fail "${step}: ${#lines[@]} still-stopping refusal line(s) for S's resume, not one"
+    awk -v a="${resume1}" -v r="${refusal_at}" -v b="${resume2}" 'BEGIN { exit !(r + 0 >= a - 0.001 && r + 0 <= b + 0) }' \
+        || fail "${step}: the refusal line is not between the two resumes"
+    echo "${TEST_NAME}: ${step}: the refusal (recorded): $(cut -f3 <<< "${lines[0]}" | cut -c1-400)"
+    echo "${TEST_NAME}: ${step}: every server.log line naming S that carries the still-stopping phrase (recorded): $(log_hits 0 "${STILL_STOPPING}" | cut -f3 | grep -F -e "persona=${S_KEY}" -e "${S_REF}" | cut -c1-200 | tr '\n' '|')"
+    # One get after the UNAVAILABLE outcome (SRJ-407): its line, and exactly
+    # one bot-server get of S from the refused resume to that line.
+    mapfile -t lines < <(log_hits 0 "${GET_LINE_HEAD}" "resume of ${S_REF} ended in UNAVAILABLE (")
+    (( ${#lines[@]} == 1 )) || fail "${step}: ${#lines[@]} post-refusal get line(s) for S's resume, not one"
+    get_at="$(cut -f2 <<< "${lines[0]}")"
+    echo "${TEST_NAME}: ${step}: the get line (recorded): $(cut -f3 <<< "${lines[0]}" | sed 's/ ended in UNAVAILABLE (.*): read / … read /' | cut -c1-400)"
+    n="$(count_calls "${table}" "${srv}" "${S_ID}" get "${resume1}" "${get_at}")"
+    (( n == 1 )) || fail "${step}: ${n} bot-server get(s) of ${S_ID} between the refused resume and its get line, not one"
+    # The retry: its line comes after the release (and after the worker's
+    # session ended), and the second resume follows it, before the next tick.
+    retry_at="$(log_hits 0 "[slack] unavailable-retry: persona=${S_KEY} retry " | awk -F'\t' -v r="${refusal_at}" '$2 + 0 > r + 0 { print $2; exit }')"
+    [[ -n "${retry_at}" ]] || fail "${step}: no retry line for S after the refusal"
+    echo "${TEST_NAME}: ${step}: S's retry-timer lines (recorded): $(log_hits 0 "[slack] unavailable-retry: persona=${S_KEY} " | cut -f3 | cut -c1-200 | tr '\n' '|')"
+    awk -v r="${retry_at}" -v l="${release_at}" -v g="${gone_at}" 'BEGIN { exit !(l + 0 < r + 0 && g + 0 < r + 0) }' \
+        || fail "${step}: the retry ($(seconds_between "${refusal_at}" "${retry_at}")s after the refusal) came before the release or before the worker's session ended"
+    awk -v r="${retry_at}" -v b="${resume2}" -v s="${ST_LAUNCH_SLACK_S}" 'BEGIN { exit !(b + 0 > r - 0.001 && b - r <= s) }' \
+        || fail "${step}: the second resume came $(seconds_between "${retry_at}" "${resume2}")s after the retry line, not within ${ST_LAUNCH_SLACK_S}s after it"
+    awk -v b="${resume2}" -v n="${next_tick}" 'BEGIN { exit !(b + 0 < n + 0) }' \
+        || fail "${step}: the second resume came after the next health tick's read of S"
+    awk -v b="${resume2}" -v l="${live_at}" 'BEGIN { exit !(b + 0 < l + 0) }' \
+        || fail "${step}: the row read waiting before the second resume"
+    echo "${TEST_NAME}: ${step}: from the tick read: pause +$(seconds_between "${tick0}" "${paused_at}")s, refused resume +$(seconds_between "${tick0}" "${resume1}")s, release +$(seconds_between "${tick0}" "${release_at}")s, retry +$(seconds_between "${tick0}" "${retry_at}")s, resume +$(seconds_between "${tick0}" "${resume2}")s, next tick +${gap}s"
+    echo "${TEST_NAME}: ${step}: S's tmux-unresponsive lines (recorded): $(log_hits 0 "persona=${S_KEY} " | cut -f3 | grep -F " tmux-unresponsive " | cut -c1-200 | tr '\n' '|')"
+    # No post: no onset, alert or spawn-failure notice, and nothing else.
+    mapfile -t posts < <(record_posts 1 | jq -c --arg o "${S_ONSET}" 'select((.text // "") | contains($o))')
+    (( ${#posts[@]} == 0 )) || fail "${step}: ${#posts[@]} post(s) hold S's tmux-unresponsive onset"
+    mapfile -t posts < <(record_posts 1 | jq -c --arg h "${SPAWN_FAILURE_FIRST}" 'select((.text // "") | contains($h))')
+    (( ${#posts[@]} == 0 )) || fail "${step}: ${#posts[@]} post(s) hold a spawn-failure notice"
+    mapfile -t posts < <(posts_to "" "${paused_at}")
+    (( ${#posts[@]} == 0 )) || {
+        printf '  | %s\n' "${posts[@]}" >&2
+        fail "${step}: ${#posts[@]} post(s) reached the Slack stub's record after the pause"
+    }
+    # Ruling S3: after the second resume no server.log line naming S has a
+    # reconnect, relaunch, restart scheduling or not-connected text.
+    hits="$(log_hits 0 "" | awk -F'\t' -v b="${resume2}" '$2 + 0 > b + 0' | cut -f3 \
+        | grep -F -e "persona=${S_KEY}" -e "${S_REF}" | grep -iE "${HOLD_TROUBLE}" || true)"
+    if [[ -n "${hits}" ]]; then
+        sed 's/^/  | /' <<< "${hits}" >&2
+        fail "${step}: after the second resume the server logged a reconnect, relaunch or not-connected line for S (ruling S3)"
+    fi
+
+    stop_server
+    end_worker "${S_ID}" "${step}: the end"
+    stop_tracked_pid "${SLACK_STUB_PID}" 10 "${step}: the Slack stub did not exit on SIGTERM"
+}
+
 leg_launch_pending
 leg_launch_timeouts
 leg_restart_mid_launch
 leg_fail_create
+leg_still_stopping
 
 assert_no_server_tmux
 assert_no_cscb_include_finished

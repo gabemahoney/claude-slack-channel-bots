@@ -47,8 +47,8 @@
  *   `fmk-driver.ts`, `stub-mcp-session.ts` and `fmk-texts.ts` (a listed set)
  *   each check the marker first and statically import only `node:` built-ins,
  *   type-only imports included; and scenario.sh's `install_ad_shim`,
- *   `ad_store_edit`, `ad_store_id`, `stub_mode`, `stub_dialog_delay` and
- *   `ad_store_pending_no_launch` call
+ *   `ad_store_edit`, `ad_store_id`, `stub_mode`, `stub_dialog_delay`,
+ *   `stub_release` and `ad_store_pending_no_launch` call
  *   `require_scenario_home` before their first
  *   sqlite3, copy, move or install step, a call of a scenario.sh function
  *   that makes one (such as `_scenario_place`) counting as one. Shell is read
@@ -1687,6 +1687,9 @@ const HOME_GUARDED_STUB_HELPERS: readonly string[] = ['stub_mode', 'ad_store_pen
 /** The stub's dialog delay setter (a harness addition), held to the same rule as `stub_mode`: a move of its settings file. */
 const HOME_GUARDED_STUB_DELAY_HELPERS: readonly string[] = ['stub_dialog_delay']
 
+/** The stub's pause linger release (a harness addition), held to the same rule as `stub_mode`: a move of its releases file. */
+const HOME_GUARDED_STUB_RELEASE_HELPERS: readonly string[] = ['stub_release']
+
 /**
  * The label, seeding, tmux-step, store-statement and 0.10.0-seeder helpers
  * held to the same rule: each reads or edits the store (directly or through
@@ -2391,6 +2394,18 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
 
       expect(unguarded).not.toBe(source)
       expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, HOME_GUARDED_STUB_DELAY_HELPERS), 'scenario.sh', RULE.homeCheckFirst)
+    })
+
+    test('the current tree: stub_release runs require_scenario_home before its first move', () => {
+      expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), HOME_GUARDED_STUB_RELEASE_HELPERS)).toEqual([])
+    })
+
+    test('stub_release without its require_scenario_home is flagged at its move', () => {
+      const source = readFileSync(SCENARIO_PATH, 'utf-8')
+      const unguarded = source.replace(/(\nstub_release\(\) \{\n(?:.*\n)*?)    require_scenario_home "\$\{step\}"\n/, '$1')
+
+      expect(unguarded).not.toBe(source)
+      expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, HOME_GUARDED_STUB_RELEASE_HELPERS), 'scenario.sh', RULE.homeCheckFirst)
     })
 
     test('the current tree: the label, seeding, tmux-step, store-statement and 0.10.0-seeder helpers run require_scenario_home before their first store, copy or move step', () => {

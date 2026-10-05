@@ -166,7 +166,7 @@ why:
   binary or the shim, every harness agent-director call (`ad`, `ad_capture`, `ad_admin`, `ad_admin_capture`),
   every harness `sqlite3` read or edit (`ad_store_edit`, `ad_store_id`,
   `ad_store_pending_no_launch`) and every stub-worker helper (`stub_mode`,
-  `stub_dialog_delay`, `stub_press_enter`, `write_mcp_config`) calls `require_ci_image` as its
+  `stub_dialog_delay`, `stub_release`, `stub_press_enter`, `write_mcp_config`) calls `require_ci_image` as its
   first step, which fails with
   `FAIL: <test>: <step>: refused: /etc/cscb-ci-image is absent …`.
 
@@ -216,7 +216,10 @@ tests/
                                    # closing enforcement; and the trap stopping the scenario's tmux server. Its stub legs show the stub's MCP session registered as
                                    # the persona's, with no reconnect or relaunch over three health ticks and the persona not connected once the stub ends; the stub
                                    # run directly (its version line, the default dev-channels dialog, `silent`, a stop line on stderr, and with a dialog delay a starting
-                                   # screen holding neither approver needle, then the same dialog byte for byte); the stub helpers (`stub_dialog_delay` among them) refusing
+                                   # screen holding neither approver needle, then the same dialog byte for byte; the pause linger: a `/exit` line ignored in `at-once`,
+                                   # and in `pause-linger` a release made before the `/exit` not acted on, SessionEnd fired once from the stub's own process, the
+                                   # stub lingering and ignoring further lines, then exiting 0 on `stub_release`); the stub helpers (`stub_dialog_delay` and
+                                   # `stub_release` among them) refusing
                                    # and working; the SessionStart re-fire in every reporting path (at once, a folder trusted in either config, and the dev-channels,
                                    # unrecognised and folder-trust dialogs answered by `stub_press_enter`) against a row a silent worker holds `pending`, every fire
                                    # ignored as `pid_mismatch` and none after G; exactly one stop line after a failed `status` read and after a `pending` row with no
@@ -231,7 +234,7 @@ tests/
                                    # re-bind (`tmux_server_steps`). The re-fire legs wait out agent-director's default G (60 s); only after them does
                                    # `store_statements` write a `[tmux]` table (`starting_session_seconds = 60`, `stopping_window_seconds = 30`), so the
                                    # kill need not wait 300 s. It runs about two and a half minutes and ends with the three closing assertions
-    test-17-fmk-launch-pending.sh  # HO §7 scenarios 5 (b.jg5 SRJ-1406, AC 3, AC 29, AC 32) and 11 (b.jg5 SRJ-1413, AC 6), fmk mode, live against the Slack stub, in four legs: a resume held at the dev-channels dialog
+    test-17-fmk-launch-pending.sh  # HO §7 scenarios 5 (b.jg5 SRJ-1406, AC 3, AC 29, AC 32), 11 (b.jg5 SRJ-1413, AC 6) and 13 (b.jg5 SRJ-1415), fmk mode, live against the Slack stub, in five legs, in this order: a resume held at the dev-channels dialog
                                    # (the stub's dialog delay) reads `pending` with its claude_session_id and a launch start; health ticks and a `resume` forced
                                    # through fixtures/fmk-driver.ts (ErrSpawnNotResumable, not counted, not posted) launch, kill, count or post nothing; the approver
                                    # clears the dialog through the bot server's `read-pane` and `send-keys` with `--allow-pending`, the row reaches `waiting`;
@@ -241,8 +244,12 @@ tests/
                                    # a start, cleared by the new server's pending-row lap from G; then (`leg_fail_create`, scenario 11) a plain spawn under the tmux
                                    # shim's `fail-create` ends in `ErrTmuxSessionCreate` and leaves a `pending` row, never killed or launched over; CSCB's own
                                    # pending-row run from G marks it `missing` (the harness runs no `find-missing`) and the persona is brought up, with no
-                                   # "dispatcher bug" post and no escalation; `health_check_interval` 0 in the last three legs. It runs about five and a half
-                                   # minutes and ends with the three closing assertions (see fmk scenarios)
+                                   # "dispatcher bug" post and no escalation; then (`leg_still_stopping`, scenario 13) a bot the harness pauses reads `ended` while
+                                   # its worker (the stub's `pause-linger`) still runs, the bot server's immediate `resume` is refused once as still stopping
+                                   # (`STILL_STOPPING_PHRASE`), followed by one `get`, with no post, and once the harness releases the worker (`stub_release`) a
+                                   # retry of the retry timer resumes it, before the next health tick, with the same claude_session_id; health ticks on in the
+                                   # first and last legs, `health_check_interval` 0 in the three between. It runs about seven and a half minutes and ends with
+                                   # the three closing assertions (see fmk scenarios)
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
@@ -256,14 +263,16 @@ tests/
       driver.ts                    # Test 4 driver: builds a one-persona config, calls spawnForPersona directly, then follows the persona's dialog approver through the package's seams
                                    # (running when the launch returns, stops because the row went live, keeps the launch start); deletes no row
       stub-claude.sh               # fake `claude` (Tests 4, 10 and 12, and every fmk script): runs the mode its working directory selects (the dev-channels
-                                   # dialog by default, at once, silent, an unrecognised dialog, the folder-trust prompt), reports in by firing every SessionStart
+                                   # dialog by default, at once, silent, an unrecognised dialog, the folder-trust prompt, the pause linger), reports in by firing every SessionStart
                                    # hook its `--settings` registers, and SessionEnd on its exit sentinel, as direct children of its own process (exec form:
                                    # `command` with its `args`; shell form: the command's words); re-fires SessionStart while its row reads `pending`, up to G;
                                    # holds an MCP session to the bot server (see The stub worker); in `dev-channels`, an optional per-directory delay before the
-                                   # dialog (`stub_dialog_delay`, a harness addition)
+                                   # dialog (`stub_dialog_delay`, a harness addition); in `pause-linger`, SessionEnd on the `/exit` line `pause` types, then a
+                                   # linger until `stub_release` (a harness addition)
       fmk-texts.ts                 # the fmk scenarios' one value printer, run with bun: prints a named `src/` export of the installed package (an approver needle,
-                                   # APPROVER_LOG_PREFIX, DIALOG_POLL_INTERVAL_MS, agent-director's default G and `create_timeout_ms`, CSCB's call timeout, the
-                                   # launch-timeout phrase, the retry timer's base and ceiling, a persona's tmux-unresponsive ended lines, the pending-row rule's
+                                   # APPROVER_LOG_PREFIX, DIALOG_POLL_INTERVAL_MS, agent-director's default G, `create_timeout_ms` and stopping window, CSCB's call
+                                   # timeout, the launch-timeout and still-stopping phrases, the retry timer's base and ceiling, a persona's tmux-unresponsive ended
+                                   # lines and onset notice body, the pending-row rule's
                                    # log head and its marked-missing run word, the spawn-failure notice's head for an error name; each script's header
                                    # names the entries it reads) with nothing added, so a script never retypes a value
                                    # CSCB defines; refuses to run without the image marker /etc/cscb-ci-image and imports the package only after that check
@@ -428,7 +437,7 @@ fmk mode. Sourcing also:
 - exports a PATH that starts with the scenario's bin directory
   (`SCENARIO_BIN`), where `claude` is a copy of `fixtures/stub-claude.sh`,
   with a copy of `fixtures/stub-mcp-session.ts` beside it and the stub's mode
-  selections and dialog delay settings (see The stub worker), followed by the container's PATH without every directory that holds an
+  selections, dialog delay settings and pause linger releases (see The stub worker), followed by the container's PATH without every directory that holds an
   `agent-director` (the image's default agent-director directory among them)
   and without relative or empty entries. bun's directory stays. No process of
   the scenario finds an agent-director on PATH: the client finds the scenario
@@ -791,6 +800,7 @@ three closing assertions.
 |---|---|---|---|
 | 5 (b.jg5 SRJ-1406, AC 3, AC 29, AC 32) | `test-17-fmk-launch-pending.sh` | A launch in progress: a resume held at the dev-channels dialog reads `pending` with its kept `claude_session_id` and a launch start. While it is held, health ticks and a `resume` forced through `fmk-driver.ts` change nothing: the forced call gets `ErrSpawnNotResumable`, not counted and not posted, and the bot server makes no other launch, no kill and no post, and writes no reconnect, relaunch or restart line for the persona. After the delay, the approver clears the dialog only through the bot server's `read-pane` and `send-keys` with `--allow-pending` on the `pending` row (no `send-keys` before the delay ends, no approver log line for the persona), the row reaches `waiting` with the same `claude_session_id`, and the bot server starts no tmux process (`assert_no_server_tmux`). Then the launch-timeout legs (`leg_launch_timeouts`, AC 29): a plain spawn (no row), a reuse (a finished row whose `cwd` differs from the persona's working directory, replaced with `spawn --reuse-finished`) and a `resume` (a finished row with its `claude_session_id`) each end in a launch timeout (`LAUNCH_TIMEOUT_PHRASE`, or the `ErrCallTimeout` form) and one post-timeout get line that starts the approver. Per persona: the launch is of its kind; one bot-server `get` of the row, after which a harness read finds it `pending`; then the bot server's `read-pane` and `send-keys` with `--allow-pending`, whose `send-keys` adopts the pane after the lost reply; the stub reports in only after that `send-keys`; a tmux-unresponsive ended line comes no later than the first read out of `pending`; every retry of the retry timer reads the row and launches nothing; no spawn, reuse or `resume` after the launch, no kill, no conflict-latch line, and no post (no spawn-failure or CONFLICT notice); the row reaches `waiting`, the `resume` keeping its `claude_session_id`. The reuse and `resume` personas' own plain spawn, the ladder's first step, collides first (recorded, not asserted). Then the restart leg (`leg_restart_mid_launch`, AC 32): a launch held at its starting screen across a plain `stop` (no `--stop-bots`) and a start is found `pending` by the new server, whose one plain spawn collides with the row and launches nothing; it runs no approver of its own, its first `read-pane` of the row comes at or after G past the launch start, and its pending-row lap's `send-keys` with `--allow-pending` clears the dialog, the only `send-keys` of the row before it leaves `pending`; the row reaches `waiting` with no reuse, `resume`, kill or post, and the old server runs no pending-row rule for it after its stop | Scenario 5's leg: the tmux shim in `log` throughout. The stub in `dev-channels` with a dialog delay (`stub_dialog_delay`) of 30 s, set in the persona's working directory before the resume: one health tick, the forced `resume`'s 20 s bound and 7 s slack, checked to be shorter than agent-director's default G (60 s) less the approver's clear. The worker ended with the stub's sentinel; the bot server's restart path makes the resume. `fmk-driver.ts`'s forced `resume` through `cscb_run`. Health ticks on through config: `health_check_interval` 3 s, `session_restart_delay` 5 s. The launch-timeout legs: `health_check_interval` 0 (no tick is needed). The reuse and `resume` personas are brought up in one state dir, stopped with a plain `stop` and their workers ended with the sentinel; the three launches start in a second state dir, with the reuse persona in another working directory. The tmux shim in `slow-create` for that start, its delay one whole create timeout (`create_timeout_ms`) plus 10 s, checked to be above agent-director's create timeout and below CSCB's agent-director call timeout, so the session is created and the launch call times out; the shim is set back to `log` once every persona's post-timeout get line is in `server.log`. Each persona's working directory has a dialog delay of one create timeout per persona plus 8 s (agent-director makes one session-creating call at a time), so a harness read after each `get` still finds the row `pending`; the stub then holds at the dev-channels dialog until the approver's Enter and reports in with its SessionStart re-fire. The restart leg: `health_check_interval` 0, one persona with a dialog delay of 30 s (longer than the stop and the start, checked; shorter than G, checked); the harness reads the row until it leaves `pending`, bounded at G + `UNAVAILABLE_RETRY_CEILING_S` + 10 s from the launch start. Each leg in its own state dir, each with its own Slack stub. agent-director at its defaults (no `config.toml`). Posts read from the Slack stub's record. The create timeout, the call timeout, G, the launch-timeout phrase and form, the retry timer's base and ceiling, the pending-row rule's log head and the tmux-unresponsive ended lines printed by `fmk-texts.ts` |
 | 11 (b.jg5 SRJ-1413, AC 6) | `test-17-fmk-launch-pending.sh` | A failed fresh spawn, test-17's fourth leg (`leg_fail_create`): a persona with no row, whose plain spawn under the tmux shim's `fail-create` ends in `ErrTmuxSessionCreate`, leaving a `pending` row with a launch start, the only `pending` row before G. The bot server's one launch call while the shim is in `fail-create` is that plain spawn (no `--reuse-finished`). It runs no `find-missing` between the launch start and G; its own pending-row run from G marks the row `missing` (one pending-row rule round line naming the run `PENDING_ROW_RUN_MARKED_MISSING` and its get `missing`, no later than the next launch), and the persona's next launch comes only after that `find-missing` and a bot-server `get` of the row between the two; a harness read of `missing`, when one catches it, comes after that run. No `kill` of the row from any CSCB process, and no `find-missing` in the leg from any process but the bot server. No post holds "dispatcher bug" (the whole recorded post, case-insensitively); at most one post holds the spawn-failure notice's first line, and that one holds the notice's head for `ErrTmuxSessionCreate`; no other post (no cap, alert or stuck-launch post). The row reaches `waiting` and the persona's session is registered. Whether the counted failure posted a spawn-failure notice is recorded, not asserted | `health_check_interval` 0 (the failure arms the retry timer at once, so no tick is needed). Its own state dir and Slack stub; one persona with no row and no dialog delay. The tmux shim set to `fail-create` before the start, and set back to `log` by the harness once `server.log` holds the plain spawn's `ErrTmuxSessionCreate` line for the persona; at least one `new-session` call reaches the shim in `fail-create`. The harness runs no `find-missing`: the persona is not latched, so CSCB's own pending-row runs mark its row. The harness reads the row every 1 s until it is live, bounded at G + `UNAVAILABLE_RETRY_CEILING_S` + 40 s from the launch start, and before G follows each `pending` read with `list --state pending`. agent-director at its defaults (no `config.toml`). Posts read from the Slack stub's record. G, the retry timer's ceiling, the pending-row rule's log head, `PENDING_ROW_RUN_MARKED_MISSING` and the spawn-failure notice's head for `ErrTmuxSessionCreate` (entry `spawnFailureNoticeHead`, from `spawnFailureNoticeText`) printed by `fmk-texts.ts` |
+| 13 (b.jg5 SRJ-1415) | `test-17-fmk-launch-pending.sh` | A paused bot's immediate `resume` meets a worker still stopping, test-17's fifth leg (`leg_still_stopping`). After a health tick's read of persona S, the harness pauses S: the `pause` returns within its bound of that read, the row reads `ended` with its `claude_session_id`, and the worker's tmux session and pane process still run. The bot server then resumes S inside the stopping window from the pause (what scheduled the resume is recorded, not asserted), and agent-director refuses it: exactly one server.log refusal of S's `resume` carries `STILL_STOPPING_PHRASE` (UNAVAILABLE), followed by exactly one post-UNAVAILABLE get line and exactly one bot-server `get` of the row between the refused `resume` and that line. Once the harness releases the worker, its session ends, and the retry timer's first retry after the refusal comes after the release and the session's end; the second `resume` follows that retry within its slack, before the next tick's read and before the row reads `waiting` again: the success is a retry's, not a tick's. Exactly two bot-server `resume`s of S after the pause; no reuse spawn or `kill` of S from any CSCB process (each `resume` follows its ladder's plain spawn, which collides with the row: recorded, not asserted). The row reads `waiting` with the same `claude_session_id` and the resumed stub's session is registered. No post from the pause on: none holds S's tmux-unresponsive onset or the spawn-failure notice's first line, and there is no alert or other post (a single refusal that clears by the next tick posts nothing). No server.log line after the second `resume` names S with a reconnect, relaunch, restart scheduling or not-connected text | Its own state dir (`paused`) and Slack stub; one persona whose working directory is selected for the stub's `pause-linger` (`stub_mode`; the pause linger, a harness addition). Health ticks on through config: `health_check_interval` 58 s, derived as the pause's bound (5 s), the restart delay, a launch slack (10 s), `UNAVAILABLE_RETRY_BASE_S` and a launch slack again, checked longer than the retry base; `session_restart_delay` 3 s. The refused `resume` is due within the pause's bound, the restart delay and a launch slack of the tick's read, checked shorter than agent-director's default stopping window (90 s). Before the pause the bring-up's approver and its retry timer have stopped, so only a tick reads S's status and the refusal arms a fresh timer. The harness plays a human's `pause` from the scenario's own shell, through the agent-director shim, and calls `stub_release` once server.log holds the refusal. The next tick's read is checked within 2 s of the interval. agent-director at its defaults (no `config.toml`). Posts read from the Slack stub's record. `STILL_STOPPING_PHRASE`, the stopping window (`DEFAULT_AD_SETTINGS.tmux.stopping_window_seconds`), the retry timer's base, the spawn-failure notice's head and S's tmux-unresponsive onset body (entry `tmuxUnresponsiveOnsetText`) printed by `fmk-texts.ts` |
 
 ### Harness-only steps
 
@@ -1008,6 +1018,7 @@ names are `scenario.sh` constants:
 | `silent` | `STUB_MODE_SILENT` | Prints nothing and never reports in; its exit sentinel fires no SessionEnd |
 | `unrecognised-dialog` | `STUB_MODE_UNRECOGNISED` | Prints a startup dialog that neither of the approver's needles matches, so CSCB never answers it, and reports in once Enter reaches its pane: the harness's `stub_press_enter <target>`, a human answering (scenarios 20 and 21) |
 | `folder-trust` | `STUB_MODE_FOLDER_TRUST` | Reports in at once when its folder is trusted in `<CLAUDE_CONFIG_DIR>/.claude.json`, or in `~/.claude.json` when `CLAUDE_CONFIG_DIR` is unset or empty; otherwise prints the folder-trust prompt and reports in once it is answered by Enter (scenario 22) |
+| `pause-linger` | `STUB_MODE_PAUSE_LINGER` | Reports in at once, then answers the `/exit` line agent-director's `pause` types with the pause linger below, a harness addition (scenarios 13 and 24) |
 
 `stub_press_enter <target>` sends Enter with the real tmux, from the
 scenario's own shell, into a pane on the scenario's tmux server: a pane id is
@@ -1042,8 +1053,35 @@ that waits for the approver's Enter, as the default does: agent-director
 applies no hook to a row whose pane it has not adopted, and the approver's
 `send-keys` adopts it before the stub reports in.
 
+The pause linger, a harness addition (b.jg5 SRJ-1306, SRJ-1415) to confirm
+at the reconcile pass, gives a worker whose row reads `ended` while its
+process and tmux session still run, as Claude Code's SessionEnd hook marks
+the row before its process exits (scenarios 13 and 24). It acts only in
+`pause-linger`, selected with `stub_mode`; every other mode handles a
+`/exit` line as any other line.
+
+- agent-director's `pause` types C-u, `/exit` and Enter. Once the stub has
+  reported in, the `/exit` line (a leading C-u dropped) fires every
+  SessionEnd hook once, by the hook rules below, stops the SessionStart
+  re-fire and ends the stub's MCP session, as Claude Code's shutdown closes
+  its MCP clients. The stub then lingers: its process, pane and session keep
+  running. A `/exit` before the stub has reported in is ignored.
+- While it lingers it ignores every line but the sentinel, which ends it
+  with no hook fired; stdin closing ends it too.
+- `stub_release <dir>` releases it: one `<time> TAB <real path>` line added
+  to `stub-claude-releases` beside the stub in `SCENARIO_BIN`
+  (`SCENARIO_STUB_RELEASES_NAME`), by an atomic rewrite. A lingering stub
+  reads that file every 0.25 s and exits 0, firing nothing, at the first
+  line added after its linger began that names its directory, so a release
+  made before the `/exit` is never acted on. `stub_release` does not wait for
+  the stub to exit. Like `stub_mode`, it is for fmk mode only and refuses a
+  `<dir>` that is not a directory under `SCENARIO_ROOT` (as written and by
+  real path).
+
 Hooks. To report in, the stub fires every SessionStart hook its `--settings`
-registers; its exit sentinel `__CSCB_TEST_EXIT__` fires every SessionEnd hook.
+registers; its exit sentinel `__CSCB_TEST_EXIT__` fires every SessionEnd hook
+(in `pause-linger`, the `/exit` line does too, and a later sentinel fires
+none).
 Each hook runs as a direct child of the stub's process, the pane's main
 process, with its payload on standard input and no `agent_id` in it, never
 through a shell. An exec-form entry runs `command` with its `args`; an entry
@@ -1088,7 +1126,8 @@ package's own MCP SDK as client `stub-claude` version `0.0.0-stub`, and
 answers the server's roots request with the stub's working directory, by
 which the server matches the persona. It ends with the stub (its exit, a
 kill, the pane's hang-up), so a stopped persona reads not connected; when the
-server ends it, a later `/mcp reconnect` in the pane opens a new one. Its
+server ends it, a later `/mcp reconnect` in the pane opens a new one. In
+`pause-linger` the `/exit` line ends it and the lingering stub opens none. Its
 lines go to `stub-mcp-session.log` beside the stub. No session is opened in
 a mode that has not reported in, without `--mcp-config`, or where the client
 is not beside the stub (Tests 4, 10 and 12, which copy only the stub and run

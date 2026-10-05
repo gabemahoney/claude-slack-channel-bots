@@ -87,7 +87,7 @@
 #                    every install, re-shim, swap, hide and restore helper,
 #                    `ad`, `ad_store_edit`, `ad_store_id`,
 #                    `ad_store_pending_no_launch`, `stub_mode`,
-#                    `stub_dialog_delay`,
+#                    `stub_dialog_delay`, `stub_release`,
 #                    `stub_press_enter`, `write_mcp_config` and every label,
 #                    seeding, tmux-step, store-statement, operator-action,
 #                    find-missing-loop and 0.10.0-seeder helper fails with the
@@ -203,12 +203,23 @@
 #                    printed by fixtures/fmk-texts.ts), and its output then
 #                    ends with the dev-channels dialog, byte for byte the
 #                    same fixture, after a screen with neither needle.
-#   stub_helpers     `stub_mode` refuses an unknown mode, a directory outside
+#                    The pause linger (a harness addition), the stub on a
+#                    FIFO, its hooks (exec form) recording their parent's
+#                    PID: in `at-once` a C-u and `/exit` line fires no hook
+#                    and the stub keeps running until the sentinel; in
+#                    `pause-linger` a `stub_release` made before the `/exit`
+#                    is not acted on, the `/exit` fires SessionEnd once, from
+#                    the stub's own process, the stub keeps running and
+#                    ignores further lines, and after `stub_release` it exits
+#                    0, firing nothing more.
+#   stub_helpers    `stub_mode` refuses an unknown mode, a directory outside
 #                    SCENARIO_ROOT (as written and by real path) and a path
 #                    that is no directory, and a directory's last selection
 #                    wins (the stub then runs it); `stub_dialog_delay` refuses
 #                    a value that is not a whole number and the same
 #                    directories, and a directory's last setting wins;
+#                    `stub_release` refuses the same directories and adds one
+#                    line per release naming the directory's real path;
 #                    `stub_press_enter` fails
 #                    with tmux's answer for no such pane and for a prefix of a
 #                    session's name (which gets no Enter), delivers Enter by
@@ -537,6 +548,12 @@ T4_ENV_SID=""
 # stub's screen, in seconds.
 STUB_DELAY_S=3
 STUB_DELAY_READ_S=1
+
+# The stub_direct leg's pause linger: how long the stub must keep running
+# after a `/exit` it does not end on, and the bound on its exit after
+# `stub_release` (its release poll is 0.25 s), in seconds.
+STUB_LINGER_HOLD_S=2
+STUB_RELEASE_WAIT_S=5
 
 # The fmk-driver legs' persona, its one channel and its working directory
 # (made by the first driver leg).
@@ -1575,6 +1592,7 @@ leg_guard_refusals() {
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_pending_no_launch "${T0_ROW_ID}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_mode "${SCENARIO_ROOT}/work" "${STUB_MODE_AT_ONCE}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_dialog_delay "${SCENARIO_ROOT}/work" 1
+        expect_fails_in_home "${step}" "${home}" "${reason}" stub_release "${SCENARIO_ROOT}/work"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_press_enter "${T0_SESSION}"
         expect_fails_in_home "${step}" "${home}" "${reason}" write_mcp_config "${SCENARIO_PORT}"
         # The labels, seeding, the human's tmux steps, the store statements,
@@ -2080,6 +2098,96 @@ leg_stub_direct() {
     [[ "$(line_count "${SCENARIO_AD_SHIM_LOG}")" == "${before}" ]] || fail "${step}: the stub wrote to the shim log"
 
     stub_direct_delay "${step}: dialog delay" "${fixture}"
+    stub_direct_linger "${step}: pause linger"
+}
+
+# fifo_stub <step> <dir> <name> <settings>: start the stub in <dir> from the
+# scenario's shell with no AGENT_DIRECTOR_INSTANCE_ID, its standard input the
+# FIFO <name>.fifo under SCENARIO_ROOT (held open for writing on FIFO_FD), its
+# output in <name>.out and <name>.err there; set FIFO_PID, the stub's own PID
+# (the subshell execs it through env).
+fifo_stub() {
+    local step="$1" dir="$2" name="$3" settings="$4" fifo="${SCENARIO_ROOT}/$3.fifo"
+    mkfifo -- "${fifo}" || fail "${step}: could not make ${fifo}"
+    (cd "${dir}" && exec env -u AGENT_DIRECTOR_INSTANCE_ID "${SCENARIO_BIN}/claude" --settings "${settings}" < "${fifo}") \
+        > "${SCENARIO_ROOT}/${name}.out" 2> "${SCENARIO_ROOT}/${name}.err" &
+    FIFO_PID=$!
+    track_pid "${FIFO_PID}"
+    exec {FIFO_FD}> "${fifo}"
+}
+
+# linger_settings <mark>: --settings JSON whose SessionStart and SessionEnd
+# hooks (exec form, /bin/sh) each append their parent's PID to <mark>.start
+# and <mark>.end: the stub's own PID when the hook is its direct child.
+linger_settings() {
+    jq -nc --arg m "$1" '{hooks: {
+        SessionStart: [{hooks: [{type: "command", command: "/bin/sh", args: ["-c", ("echo $PPID >> " + $m + ".start")]}]}],
+        SessionEnd: [{hooks: [{type: "command", command: "/bin/sh", args: ["-c", ("echo $PPID >> " + $m + ".end")]}]}]}}'
+}
+
+# stub_direct_linger <step>: the pause linger (a harness addition), the stub
+# run on a FIFO (`fifo_stub`) with hooks from `linger_settings`. In a
+# directory selected for `at-once` (a directory with no linger selected) a
+# C-u and `/exit` line fires no hook and the stub keeps running for
+# STUB_LINGER_HOLD_S, until the sentinel, which fires SessionEnd once from its
+# own process. In one selected for `pause-linger`, a `stub_release` made
+# before the `/exit` is not acted on: after report-in (SessionStart from the
+# stub's own process and the banner), the C-u and `/exit` line fires
+# SessionEnd once, from the stub's own process, and the stub keeps running for
+# STUB_LINGER_HOLD_S, ignoring further lines; after `stub_release` it exits 0
+# within STUB_RELEASE_WAIT_S, with no SessionEnd fired again.
+stub_direct_linger() {
+    local step="$1" dir mark rc=0 name
+    # The at-once stub: `/exit` ignored, the sentinel ends it.
+    name=stub-exit-ignored
+    mark="${SCENARIO_ROOT}/${name}-mark"
+    dir="$(make_workdir "${name}")"
+    stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
+    fifo_stub "${step}" "${dir}" "${name}" "$(linger_settings "${mark}")"
+    wait_until 10 "${step}: the at-once stub never fired SessionStart" test -s "${mark}.start"
+    printf '\x15/exit\n' >&"${FIFO_FD}"
+    sleep "${STUB_LINGER_HOLD_S}"
+    pid_alive "${FIFO_PID}" || fail "${step}: the at-once stub ended on a /exit line"
+    [[ ! -e "${mark}.end" ]] || fail "${step}: the at-once stub fired SessionEnd on a /exit line"
+    printf '__CSCB_TEST_EXIT__\n' >&"${FIFO_FD}"
+    wait "${FIFO_PID}" || rc=$?
+    exec {FIFO_FD}>&-
+    (( rc == 0 )) || fail "${step}: the at-once stub exited ${rc} on the sentinel"
+    [[ "$(cat -- "${mark}.end")" == "${FIFO_PID}" ]] \
+        || fail "${step}: the at-once stub's sentinel SessionEnd record is '$(tr '\n' ' ' < "${mark}.end")', not once from its process ${FIFO_PID}"
+
+    # The pause-linger stub.
+    name=stub-linger
+    mark="${SCENARIO_ROOT}/${name}-mark"
+    dir="$(make_workdir "${name}")"
+    stub_mode "${dir}" "${STUB_MODE_PAUSE_LINGER}"
+    # A release made before the linger begins is never acted on.
+    stub_release "${dir}"
+    fifo_stub "${step}" "${dir}" "${name}" "$(linger_settings "${mark}")"
+    wait_until 10 "${step}: the pause-linger stub never fired SessionStart" test -s "${mark}.start"
+    grep -qxF "Listening for channel messages from: server:slack-channel-router" "${SCENARIO_ROOT}/${name}.out" \
+        || fail "${step}: the pause-linger stub printed no banner: $(head -c 300 "${SCENARIO_ROOT}/${name}.out")"
+    [[ "$(cat -- "${mark}.start")" == "${FIFO_PID}" ]] \
+        || fail "${step}: the pause-linger stub's SessionStart record is '$(tr '\n' ' ' < "${mark}.start")', not once from its process ${FIFO_PID}"
+    printf '\x15/exit\n' >&"${FIFO_FD}"
+    wait_until 10 "${step}: the pause-linger stub never fired SessionEnd on /exit" test -s "${mark}.end"
+    sleep "${STUB_LINGER_HOLD_S}"
+    pid_alive "${FIFO_PID}" \
+        || fail "${step}: the pause-linger stub ended within ${STUB_LINGER_HOLD_S}s of /exit, before its release (the release made before the linger acted on it?)"
+    [[ "$(cat -- "${mark}.end")" == "${FIFO_PID}" ]] \
+        || fail "${step}: the pause-linger stub's SessionEnd record is '$(tr '\n' ' ' < "${mark}.end")', not once from its process ${FIFO_PID}"
+    # Lines while it lingers are ignored.
+    printf 'hello\n/exit\n' >&"${FIFO_FD}"
+    stub_release "${dir}"
+    wait_until "${STUB_RELEASE_WAIT_S}" "${step}: the pause-linger stub still runs ${STUB_RELEASE_WAIT_S}s after its release" \
+        _scenario_pid_gone "${FIFO_PID}"
+    wait "${FIFO_PID}" || rc=$?
+    exec {FIFO_FD}>&-
+    (( rc == 0 )) || fail "${step}: the released stub exited ${rc}"
+    [[ "$(line_count "${mark}.end")" == 1 ]] \
+        || fail "${step}: the pause-linger stub fired SessionEnd $(line_count "${mark}.end") times, not once"
+    ! grep -qF 'unknown mode' "${SCENARIO_ROOT}/${name}.err" \
+        || fail "${step}: the stub did not know the pause-linger mode: $(head -c 300 "${SCENARIO_ROOT}/${name}.err")"
 }
 
 # stub_direct_delay <step> <fixture>: a directory with a dialog delay of
@@ -2124,7 +2232,7 @@ stub_direct_delay() {
 
 # The stub helpers' own refusals, the mode selection file and the MCP config.
 leg_stub_helpers() {
-    local step="stub helpers" dir link file got
+    local step="stub helpers" dir link file got n
     dir="$(make_workdir stub-select)"
     expect_fails_in_home "${step}" "${HOME}" "unknown mode 'bogus'" stub_mode "${dir}" bogus
     expect_fails_in_home "${step}" "${HOME}" "refused: /tmp is not under SCENARIO_ROOT" stub_mode /tmp "${STUB_MODE_AT_ONCE}"
@@ -2156,6 +2264,19 @@ leg_stub_helpers() {
     [[ "$(tail -n 1 "${file}")" == "7"$'\t'"$(realpath -e -- "${dir}")" ]] \
         || fail "${step}: the dialog delay file's last line is '$(tail -n 1 "${file}")'"
     stub_dialog_delay "${dir}" 0
+
+    # The pause linger's release: its refusals, and one line added per
+    # release, naming the directory's real path.
+    expect_fails_in_home "${step}" "${HOME}" "refused: /tmp is not under SCENARIO_ROOT" stub_release /tmp
+    expect_fails_in_home "${step}" "${HOME}" "refused: ${link} resolves to" stub_release "${link}"
+    expect_fails_in_home "${step}" "${HOME}" "is not a directory" stub_release "${dir}/none"
+    file="${SCENARIO_BIN}/stub-claude-releases"
+    n="$(line_count "${file}")"
+    stub_release "${dir}"
+    [[ "$(line_count "${file}")" == "$(( n + 1 ))" ]] \
+        || fail "${step}: the release file holds $(line_count "${file}") line(s) after a release, not $(( n + 1 ))"
+    [[ "$(tail -n 1 "${file}" | cut -f2)" == "$(realpath -e -- "${dir}")" ]] \
+        || fail "${step}: the release file's last line is '$(tail -n 1 "${file}")'"
 
     expect_fails_in_home "${step}" "${HOME}" "tmux send-keys exited" stub_press_enter t0-no-such-pane
     expect_fails_in_home "${step}" "${HOME}" "refused: TMUX is set" with_tmux_set stub_press_enter "${T0_SESSION}"

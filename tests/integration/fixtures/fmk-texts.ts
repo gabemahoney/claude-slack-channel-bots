@@ -60,6 +60,12 @@
  *                                 `tmux.create_timeout_ms`: agent-director's default
  *                                 bound on its session-creating tmux call, in
  *                                 milliseconds
+ *   DEFAULT_AD_SETTINGS.tmux.stopping_window_seconds
+ *                                 src/ad-settings.ts DEFAULT_AD_SETTINGS, its
+ *                                 `tmux.stopping_window_seconds`: agent-director's
+ *                                 default stopping window, how long an ended row
+ *                                 whose agent has not exited counts as still
+ *                                 stopping, in whole seconds
  *   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS
  *                                 src/config.ts DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS:
  *                                 CSCB's default bound on one agent-director call, in
@@ -67,6 +73,9 @@
  *   LAUNCH_TIMEOUT_PHRASE         src/ad-description-phrases.ts LAUNCH_TIMEOUT_PHRASE:
  *                                 the phrase an ErrTmuxUnresponsive carries when it
  *                                 ends a launch call as a launch timeout
+ *   STILL_STOPPING_PHRASE         src/ad-description-phrases.ts STILL_STOPPING_PHRASE:
+ *                                 the phrase an ErrTmuxUnresponsive carries for a
+ *                                 row that appears to still be stopping
  *   LAUNCH_UNAVAILABLE_OUTCOME_APPROVER
  *                                 src/session-manager.ts
  *                                 LAUNCH_UNAVAILABLE_OUTCOME_APPROVER: the outcome the
@@ -94,6 +103,11 @@
  *                                 TMUX_UNRESPONSIVE_END_TEXT names, in its order, one
  *                                 line each: every ended line the persona's
  *                                 tmux-unresponsive condition can log
+ *   tmuxUnresponsiveOnsetText <key>
+ *                                 src/persona-episodes.ts tmuxUnresponsiveOnsetText for
+ *                                 persona key <key>: the body of the persona's
+ *                                 tmux-unresponsive onset notice (the persona
+ *                                 notifier adds its prefix)
  *   spawnFailureNoticeHead <error-name>
  *                                 src/session-manager.ts spawnFailureNoticeText (the
  *                                 body `notifySpawnFailure` posts) for an
@@ -212,6 +226,17 @@ async function tmuxUnresponsiveEndedLines(key: string): Promise<string> {
   return lines.join('\n')
 }
 
+/** The package's `tmuxUnresponsiveOnsetText(key)`: the onset notice's one body for persona `key`. */
+async function tmuxUnresponsiveOnsetText(key: string): Promise<string> {
+  const build = await packageExport('persona-episodes.ts', 'tmuxUnresponsiveOnsetText')
+  if (typeof build !== 'function') throw new PrinterFailure(PACKAGE_EXIT, "the installed package's src/persona-episodes.ts tmuxUnresponsiveOnsetText is not a function")
+  const text: unknown = (build as (key: string) => unknown)(key)
+  if (typeof text !== 'string' || text === '') {
+    throw new PrinterFailure(PACKAGE_EXIT, "the installed package's src/persona-episodes.ts tmuxUnresponsiveOnsetText gave no text")
+  }
+  return text
+}
+
 /** An agent-director error name: `Err`, then letters and digits. */
 const ERROR_NAME_RE = /^Err[A-Za-z0-9]+$/
 
@@ -252,10 +277,14 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   'DEFAULT_AD_SETTINGS.tmux.create_timeout_ms': noArguments('DEFAULT_AD_SETTINGS.tmux.create_timeout_ms', () =>
     wholeNumberAt('ad-settings.ts', 'DEFAULT_AD_SETTINGS', ['tmux', 'create_timeout_ms']),
   ),
+  'DEFAULT_AD_SETTINGS.tmux.stopping_window_seconds': noArguments('DEFAULT_AD_SETTINGS.tmux.stopping_window_seconds', () =>
+    wholeNumberAt('ad-settings.ts', 'DEFAULT_AD_SETTINGS', ['tmux', 'stopping_window_seconds']),
+  ),
   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS: noArguments('DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS', () =>
     wholeNumberAt('config.ts', 'DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS', []),
   ),
   LAUNCH_TIMEOUT_PHRASE: noArguments('LAUNCH_TIMEOUT_PHRASE', () => stringExport('ad-description-phrases.ts', 'LAUNCH_TIMEOUT_PHRASE')),
+  STILL_STOPPING_PHRASE: noArguments('STILL_STOPPING_PHRASE', () => stringExport('ad-description-phrases.ts', 'STILL_STOPPING_PHRASE')),
   LAUNCH_UNAVAILABLE_OUTCOME_APPROVER: noArguments('LAUNCH_UNAVAILABLE_OUTCOME_APPROVER', () =>
     stringExport('session-manager.ts', 'LAUNCH_UNAVAILABLE_OUTCOME_APPROVER'),
   ),
@@ -269,6 +298,7 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   UNAVAILABLE_RETRY_BASE_S: noArguments('UNAVAILABLE_RETRY_BASE_S', () => wholeNumberAt('unavailable-retry.ts', 'UNAVAILABLE_RETRY_BASE_S', [])),
   UNAVAILABLE_RETRY_CEILING_S: noArguments('UNAVAILABLE_RETRY_CEILING_S', () => wholeNumberAt('unavailable-retry.ts', 'UNAVAILABLE_RETRY_CEILING_S', [])),
   tmuxUnresponsiveEndedLines: oneArgument('tmuxUnresponsiveEndedLines', 'key', tmuxUnresponsiveEndedLines),
+  tmuxUnresponsiveOnsetText: oneArgument('tmuxUnresponsiveOnsetText', 'key', tmuxUnresponsiveOnsetText),
   spawnFailureNoticeHead: oneArgument('spawnFailureNoticeHead', 'error-name', spawnFailureNoticeHead),
 }
 
