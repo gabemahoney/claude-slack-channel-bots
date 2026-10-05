@@ -69,18 +69,30 @@
  *   rest of step 7 and step 8's revert still run;
  * - the texts the checks expect match what the package writes (the pending
  *   file header, the preview counts, the reload-applied line, the S3 error,
- *   and the start summary's buckets in their order);
- * - a start's summary line must end with the current ending, `0 failed, 0 not
- *   brought up, 0 not reconnected` (b.f2b's last bucket): the ending before
- *   b.f2b, any non-zero count in it and `10 failed` are findings, and the plan
- *   quotes the same ending and Check 1's line;
+ *   the retired removal line of Checks 27 and 28, the start summary's ending
+ *   and Check 1's line, the not-live row states and a teardown's kept-row
+ *   line), each built by or pinned against `src/`'s own builder, never a
+ *   literal (b.jg5 SRJ-1111, SRJ-1510, SRJ-1015, SRJ-715);
+ * - a start's summary line must end with the current ending, src/'s builder's
+ *   with every count 0 (b.f2b's not-reconnected bucket, then SRJ-1015's five
+ *   counts): an ending that stops before them, any non-zero count in it and
+ *   `10 failed` are findings, and the plan quotes the same ending, Check 1's
+ *   line and both checks' retired removal lines;
+ * - a removed persona's row is kept and not live (b.jg5 SRJ-715, AC 77):
+ *   Check 27 runs a guarded `agent-director find-missing` before it judges
+ *   the rows, expects D's row kept and not live and A, B and C's unchanged,
+ *   and exactly one teardown line for D's kill that succeeded with its row
+ *   kept; Check 28 expects one live row per persona, plus D's kept row when
+ *   this run brought D up;
  * - the guarded restart and Check 28's start after the reboot wait for each
  *   persona's Session connected line, not only the summary: a persona that
  *   connects after the summary (parked on a `working` row, b.f2b) is no
  *   finding, and one that never connects is.
  *
  * No docker, network or real host state: the container, the host probes, the
- * test human's session and the clock are fakes. The bash children (the `q`
+ * test human's session and the clock are fakes. The real teardown lines (and
+ * the real removal preview) come from the reload harness's real lifecycle
+ * over its agent-director stub, under its own temp root. The bash children (the `q`
  * quoting check and the transcript helpers) get their environment from
  * `hostSafeChildEnv`: a temp HOME the test removes and a PATH of the tools
  * they run.
@@ -99,7 +111,20 @@ import { parsePersonaConfigBytes } from '../src/config.ts'
 import { checkPersonaTarget } from '../src/registry.ts'
 import { renderAppliedLogLine } from '../src/reload-apply.ts'
 import { PENDING_FILE_HEADER } from '../src/reload-fingerprint.ts'
-import { PENDING_PREVIEW_TITLE, renderChangePlanCounts, type ChangePlanCounts, type ValidChangePlan } from '../src/reload-plan.ts'
+import { KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES } from '../src/kill-retry.ts'
+import { AGENT_DIRECTOR_DEAD_STATES } from '../src/liveness-reading.ts'
+import {
+  DESTRUCTIVE_PREFIX,
+  DESTRUCTIVE_RETIRED_CLAUSE,
+  PENDING_PREVIEW_TITLE,
+  REMOVED_RETIRED_CLAUSE,
+  removedLine,
+  renderChangePlanCounts,
+  type ChangePlanCounts,
+  type ValidChangePlan,
+} from '../src/reload-plan.ts'
+import * as previewClauses from '../src/reload-preview-clauses.ts'
+import * as summaryEndingModule from '../src/startup-summary-ending.ts'
 import { startupSummaryEnding, startupSummaryLine, type StartupSummaryCounts } from '../src/session-manager.ts'
 import {
   CHECK12_LIFT,
@@ -148,20 +173,29 @@ import {
   countsText,
   guardedRestart,
   hasWord,
+  isNotLiveRow,
   isPrompt,
+  isTeardownKeptRowLine,
+  keptRowSetProblems,
+  NOT_LIVE_ROW_STATES,
   parsePending,
   PENDING_HEADER,
+  personaRowId,
   previewHeader,
   promptState,
   q,
+  removalRowProblems,
+  removedPreviewLine,
   retriedBringUps,
   retryFailureClass,
   S,
   START_SUMMARY_END,
+  startSummaryEnding,
   TAG_TIMEOUT_MS,
   waitTags,
+  type Row,
 } from '../ci-live/checks/helpers.ts'
-import { check28, CHECK27_PROMPT, check29a, parseCount, parseLeakcount, parsePersonaCounts, personaCountsProblem } from '../ci-live/checks/lifecycle-checks.ts'
+import { check27, check28, CHECK27_PROMPT, check29a, parseCount, parseLeakcount, parsePersonaCounts, personaCountsProblem } from '../ci-live/checks/lifecycle-checks.ts'
 import { FINAL_CHECKS, hostCheck, PLAN_CHECKS, teardownCheck } from '../ci-live/checks/list.ts'
 import { AD_CLIENT_CHECK_FAILED, installCheck, s2Check, s3Check } from '../ci-live/checks/setup-checks.ts'
 import { AD_CLIENT_CHECK, AD_CLIENT_CHECK_PASSED } from '../ci-live/lib/ad-client-check.ts'
@@ -182,20 +216,22 @@ import { HumanSession, type SlackMessage } from '../ci-live/lib/human-session.ts
 import { buildLiveConfig, renderConfig } from '../ci-live/lib/live-config.ts'
 import type { ProcResult } from '../ci-live/lib/proc.ts'
 import { RESULTS_COLUMNS } from '../ci-live/lib/results.ts'
-import type { PersonaLetter } from '../ci-live/lib/personas.ts'
+import { personaName, type PersonaLetter } from '../ci-live/lib/personas.ts'
 import { MINUTE, SECOND } from '../ci-live/lib/wait.ts'
 import { emptyAppsState } from '../ci-live/lib/apps-state.ts'
+import { cannedErr, errTmuxKillFailed, type StubClientOptions } from './test-helpers/agent-director-stub.ts'
 import { virtualClock } from './test-helpers/ci-live.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { makeReloadHarness } from './test-helpers/reload-harness.ts'
 import { BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
-/** A container's answer: its stdout, a partial result, or stdout computed per call from the script. */
-type Reply = Partial<ProcResult> | string | ((script: string) => string)
+/** A container's answer: its stdout, a partial result, or either computed per call from the script. */
+type Reply = Partial<ProcResult> | string | ((script: string) => string | Partial<ProcResult>)
 
 /** A container whose `sh` answers by the first key its script contains; every script is recorded. */
 function fakeContainer(answers: ReadonlyArray<readonly [string, Reply]>) {
@@ -1807,13 +1843,23 @@ describe("the start's lines: the summary's ending (Part 2.3's Expected items)", 
     expect(await findingsFor(START_SUMMARY_END)).toEqual([])
   })
 
+  /** The clean ending's first `n` segments: an older package's ending, which stops there. */
+  const endingUpTo = (n: number) => START_SUMMARY_END.split(', ').slice(0, n).join(', ')
+
   test.each([
-    ['the ending before b.f2b, with no not-reconnected bucket', '0 failed, 0 not brought up'],
-    ['a persona left running but not reconnected', '0 failed, 0 not brought up, 1 not reconnected'],
-    ['a persona not brought up', '0 failed, 1 not brought up, 0 not reconnected'],
-    ['a failed launch', '1 failed, 0 not brought up, 0 not reconnected'],
-    ['ten failed launches (the ending matches whole counts only)', '10 failed, 0 not brought up, 0 not reconnected'],
+    ['the ending before b.f2b, with no not-reconnected bucket', endingUpTo(2)],
+    ["the ending before b.jg5 SRJ-1015, without its five counts (stopping at not reconnected)", endingUpTo(3)],
+    ['a persona left running but not reconnected', startSummaryEnding({ notReconnected: 1 })],
+    ['a persona not brought up', startSummaryEnding({ notBroughtUp: 1 })],
+    ['a failed launch', startSummaryEnding({ failed: 1 })],
+    ['ten failed launches (the ending matches whole counts only)', startSummaryEnding({ failed: 10 })],
+    ['a latched persona', startSummaryEnding({ latched: 1 })],
+    ['a persona left retrying', startSummaryEnding({ retrying: 1 })],
+    ['a persona waiting on a live-row sequence', startSummaryEnding({ sequenceWaiting: 1 })],
+    ['a persona held on invalid flags', startSummaryEnding({ held: 1 })],
+    ['a persona brought up fresh as a retired key', startSummaryEnding({ freshRetired: 1 })],
   ])('%s is a finding', async (_what, ending) => {
+    expect(ending).not.toBe(START_SUMMARY_END)
     expect(await findingsFor(ending)).toEqual([`the start summary does not end "${START_SUMMARY_END}"`])
   })
 })
@@ -1854,28 +1900,44 @@ describe('the guarded restart waits for every persona to connect, not only for t
   })
 })
 
+/** `rows`' line for a persona's row: its instance id, persona label and state. */
+function rowLine(letter: PersonaLetter, state = 'idle'): string {
+  return `${personaRowId(letter)} ${personaName(letter)} ${state}`
+}
+
+/** A, B and C's rows, live. */
+const ROWS = (['a', 'b', 'c'] as const).map((l) => rowLine(l)).join('\n')
+
+/**
+ * A live context for Check 28 whose reboot (`restartContainer`) starts the
+ * server: its lines are `startLog(cAt)`, timed from the reboot. The container
+ * sets the start-at-boot marker, gives a mark (also as the saved reboot mark),
+ * the rows (`rows(n)` for the n-th read, from 0: steps 1, 3 and 5; A, B and
+ * C live by default) and a running server; nothing answers in Slack, so the
+ * other steps record their own findings; time is virtual. `broughtUp` is the
+ * personas this run brought up (`ctx.shared.broughtUp`; unset by default).
+ */
+function rebootedRun(
+  cAt: number | null,
+  lines: readonly (readonly [number, string])[] = startLog(cAt),
+  opts: { rows?: (n: number) => string; broughtUp?: PersonaLetter[] } = {},
+) {
+  const clock = virtualClock()
+  const log = timedLog(clock, lines)
+  let reads = 0
+  const rowsAt = opts.rows ?? (() => ROWS)
+  const { container } = fakeContainer([
+    ['echo BOOT', 'BOOT'],
+    ['kill -0', 'running'],
+    ['', (script) => (script === 'mark' || script === 'cat ~/cscb-live/reboot-log-mark' ? '1:0' : script === 'rows' ? rowsAt(reads++) : (log.since(script) ?? ''))],
+  ])
+  const shared = opts.broughtUp === undefined ? {} : { broughtUp: opts.broughtUp }
+  return makeCtx({ mode: 'real', clock, human: scriptedHuman(clock).human, browser: idleBrowser(), container, shared, restartContainer: async () => log.begin() })
+}
+
 describe('Check 28 step 5: the start after the reboot waits for every persona to connect, not only for B', () => {
-  const ROWS = ['a', 'b', 'c'].map((l) => `cscb_persona_${l} persona_${l} idle`).join('\n')
   /** The findings that step 5's start lines give. */
   const START_FINDING = /^step 5|Session connected line|persona-start line|last-applied record|startupSessionManager complete|start summary|start failure/
-
-  /**
-   * A live context whose reboot (`restartContainer`) starts the server: its
-   * lines are `startLog(cAt)`, timed from the reboot. The container sets the
-   * start-at-boot marker, gives a mark (also as the saved reboot mark), the
-   * three rows and a running server; nothing answers in Slack, so the other
-   * steps record their own findings; time is virtual.
-   */
-  function rebootedRun(cAt: number | null, lines: readonly (readonly [number, string])[] = startLog(cAt)) {
-    const clock = virtualClock()
-    const log = timedLog(clock, lines)
-    const { container } = fakeContainer([
-      ['echo BOOT', 'BOOT'],
-      ['kill -0', 'running'],
-      ['', (script) => (script === 'mark' || script === 'cat ~/cscb-live/reboot-log-mark' ? '1:0' : script === 'rows' ? ROWS : (log.since(script) ?? ''))],
-    ])
-    return makeCtx({ mode: 'real', clock, human: scriptedHuman(clock).human, browser: idleBrowser(), container, restartContainer: async () => log.begin() })
-  }
 
   test('C, parked on a working row (b.f2b), connects 55 s after the summary: step 5 waits for it, so its start lines give no finding', async () => {
     const r = await check28.run(rebootedRun(155))
@@ -1893,7 +1955,7 @@ describe('Check 28 step 5: the start after the reboot waits for every persona to
     const r = await check28.run(rebootedRun(null, retriedStartLog()))
     expect((r.reason ?? '').split('; ').filter((x) => START_FINDING.test(x))).toEqual([])
     expect(r.notes).toContain(RETRIED_NOTE)
-    expect(r.notes).toContain(`Check 28 summary: 3 persona(s): 2 resumed, 0 fresh-spawned, 0 fresh-after-amnesia, 0 fresh-after-inconclusive-amnesia, 0 reconnected, 0 no-op, 0 failed, 1 not brought up, 0 not reconnected`)
+    expect(r.notes).toContain(`Check 28 summary: 3 persona(s): 2 resumed, 0 fresh-spawned, 0 fresh-after-amnesia, 0 fresh-after-inconclusive-amnesia, 0 reconnected, 0 no-op, ${startSummaryEnding({ notBroughtUp: 1 })}`)
   })
 
   test('the control: A never comes back, which fails as before (the summary, the failure line, no Session connected line)', async () => {
@@ -1929,7 +1991,7 @@ function retriedStartLog(opts: { up?: boolean; connected?: boolean; notBroughtUp
     [35, `[2026-09-26T19:51:41.070Z] [slack] persona-slack-unreachable: personas[0] ${ref} ${path}: Slack unreachable checking app_token via the Socket Mode open: WebSocket phase timed out after 10 s`],
     [80, session('b')],
     [90, session('c')],
-    [100, startSummary(`0 failed, ${notBroughtUp} not brought up, 0 not reconnected`)],
+    [100, startSummary(startSummaryEnding({ notBroughtUp }))],
   ]
   if (up) {
     lines.push([105, `[2026-09-26T19:51:46.284Z] [slack] persona-slack-unreachable: personas[0] ${ref} ${path}: cleared: Slack answered after being unreachable checking app_token via the Socket Mode open`])
@@ -1968,7 +2030,7 @@ describe("the start's lines: a persona not brought up that came up after its bri
     expect([retryFailureClass('Slack')?.source, retryFailureClass('directory'), retryFailureClass('credentials')]).toEqual(['\\] persona-slack-unreachable: ', null, null])
   })
 
-  const START = ['the start summary does not end "0 failed, 0 not brought up, 0 not reconnected"', 'start failure lines']
+  const START = [`the start summary does not end "${START_SUMMARY_END}"`, 'start failure lines']
 
   test.each([
     ['without the acceptance (a guarded restart)', retriedStartLog(), false, START],
@@ -1992,6 +2054,241 @@ describe("the start's lines: a persona not brought up that came up after its bri
   ])('accepted, but %s is still a finding (and the note stays)', async (_what, line, at) => {
     const r = await startFindings(retriedStartLog({ extra: [[at, line]] }))
     expect(r).toEqual({ failures: [`start failure lines: ${line}`], notes: [RETRIED_NOTE] })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A removed persona's row: killed and kept, not live (b.jg5 SRJ-715, AC 77)
+// ---------------------------------------------------------------------------
+
+/** A row as `rows` reads it. */
+function row(letter: PersonaLetter, state = 'idle'): Row {
+  return { id: personaRowId(letter), persona: personaName(letter), state }
+}
+
+/**
+ * src's own removal of persona D, with C kept, through the reload harness's
+ * real lifecycle and launch path over its agent-director stub (`agentDirector`
+ * scripts its kill): the pending preview the reload controller wrote, and the
+ * server log lines from the edit on. A kill that fails waits between its
+ * tries on the run's clock, which is moved until the apply settles. The run's
+ * captured artifacts are leak-checked (b.av2 SR-13.2).
+ */
+async function realRemovalOfD(agentDirector: StubClientOptions = {}): Promise<{ preview: string[]; logs: string[] }> {
+  const h = makeReloadHarness()
+  try {
+    const c = h.persona(personaName('c'))
+    const d = h.persona(personaName('d'))
+    h.materialize(c, d)
+    h.writeRecord({ personas: [c, d] })
+    h.writeConfig({ personas: [c, d] })
+    const run = await h.startDetecting({ realLaunch: true, agentDirector })
+    await run.ticks.tick()
+    const cp = run.checkpoint()
+    h.writeConfig({ personas: [c] })
+    await run.ticks.tick()
+    const preview = h.pendingLines() ?? []
+    h.confirm()
+    let applied = false
+    const applying = run.ticks.tick().then(() => {
+      applied = true
+    })
+    for (let i = 0; i < 10 * KILL_RETRY_TRIES && !applied; i++) await run.clock.advance(KILL_RETRY_SPACING_MS)
+    await applying
+    assertNoLeak(run.captured())
+    return { preview, logs: run.since(cp).logs }
+  } finally {
+    await h.cleanup()
+  }
+}
+
+/** A teardown kill that fails at every try (ErrTmuxKillFailed): the row stays live. */
+const failingKill = (): StubClientOptions => ({ killQueue: Array.from({ length: KILL_RETRY_TRIES }, () => cannedErr(errTmuxKillFailed())) })
+
+describe("a teardown's kept-row line: isTeardownKeptRowLine against src's real teardown of D", () => {
+  test("a kill that succeeded: src's line is D's kept-row line (with or without a timestamp), and not C's; the preview is the one Check 27 expects", async () => {
+    const { preview, logs } = await realRemovalOfD()
+    const kept = logs.filter((l) => isTeardownKeptRowLine(l, 'd'))
+    expect(kept.length).toBe(1)
+    expect(kept[0]!.startsWith(`[slack] persona teardown of "${personaName('d')}" (key=${personaName('d')}): agent-director kill of ${personaRowId('d')}: `)).toBe(true)
+    expect(isTeardownKeptRowLine(`[2026-09-26T19:51:41.070Z] ${kept[0]}`, 'd')).toBe(true)
+    expect(logs.filter((l) => isTeardownKeptRowLine(l, 'c'))).toEqual([])
+    expect(preview).toEqual([previewHeader({ removed: 1 }), removedPreviewLine('d')])
+  })
+
+  test("the control: a kill that failed after its tries logs src's failed-kill line, which is not one", async () => {
+    const { logs } = await realRemovalOfD(failingKill())
+    expect(logs.filter((l) => l.includes(`agent-director kill of ${personaRowId('d')} failed: `)).length).toBe(1)
+    expect(logs.filter((l) => isTeardownKeptRowLine(l, 'd'))).toEqual([])
+  })
+})
+
+describe("the row helpers: one live row per persona, a removed persona's row kept and not live", () => {
+  const LIVE = (['a', 'b', 'c'] as const).map((l) => row(l))
+
+  test('personaRowId and isNotLiveRow: the not-live states are the dead ones, every other state is live', () => {
+    expect(personaRowId('d')).toBe(`cscb_${personaName('d')}`)
+    for (const state of NOT_LIVE_ROW_STATES) expect(isNotLiveRow(row('d', state))).toBe(true)
+    for (const state of ['idle', 'working', 'waiting', 'pending', '']) expect(isNotLiveRow(row('d', state))).toBe(false)
+  })
+
+  test.each(NOT_LIVE_ROW_STATES.map((state) => [state]))("keptRowSetProblems accepts A, B and C live and D kept %s; without a kept persona, A, B and C live", (state) => {
+    expect(keptRowSetProblems([...LIVE, row('d', state)], ['a', 'b', 'c'], ['d'])).toEqual([])
+    expect(keptRowSetProblems(LIVE, ['a', 'b', 'c'], [])).toEqual([])
+  })
+
+  test.each<[string, Row[], PersonaLetter[], string[]]>([
+    ["D's kept row live", [...LIVE, row('d')], ['d'], ['cscb_persona_d is idle: kept but live, not ended or missing']],
+    ["D's kept row missing", LIVE, ['d'], ['0 cscb_persona_d row(s), not one']],
+    ['a second row for D', [...LIVE, row('d', 'ended'), row('d', 'ended')], ['d'], ['2 cscb_persona_d row(s), not one']],
+    ["D's row when no persona is kept", [...LIVE, row('d', 'ended')], [], ['an unexpected row cscb_persona_d']],
+    ['A not live', [row('a', 'ended'), row('b'), row('c')], [], ['cscb_persona_a is ended, not live']],
+    ["A's row carrying another persona label", [{ ...row('a'), persona: personaName('b') }, row('b'), row('c')], [], ['cscb_persona_a\'s persona label is persona_b, not persona_a']],
+    ['B missing', [row('a'), row('c')], [], ['0 cscb_persona_b row(s), not one']],
+  ])('keptRowSetProblems rejects %s', (_what, rows, kept, problems) => {
+    expect(keptRowSetProblems(rows, ['a', 'b', 'c'], kept)).toEqual(problems)
+  })
+
+  const BEFORE = [...LIVE, row('d')]
+
+  test.each(NOT_LIVE_ROW_STATES.map((state) => [state]))("removalRowProblems accepts D's row kept %s and A, B and C unchanged, in any order", (state) => {
+    expect(removalRowProblems(BEFORE, [row('d', state), ...LIVE].reverse(), 'd')).toEqual([])
+  })
+
+  test.each<[string, Row[], Row[], string[]]>([
+    ["D's row still live", BEFORE, [...LIVE, row('d')], ['cscb_persona_d is idle: kept but live, not ended or missing']],
+    ["D's row deleted (the expectation before SRJ-715)", BEFORE, LIVE, ['0 cscb_persona_d row(s) after the removal, not one kept row']],
+    ["D's kept row carrying another persona label", BEFORE, [...LIVE, { ...row('d', 'ended'), persona: personaName('c') }], ["cscb_persona_d's persona label is persona_c, not persona_d"]],
+    ['A not live after the removal', BEFORE, [row('a', 'missing'), row('b'), row('c'), row('d', 'ended')], ['cscb_persona_a is missing, not live']],
+    ["B's persona label changed", BEFORE, [row('a'), { ...row('b'), persona: personaName('a') }, row('c'), row('d', 'ended')], ["cscb_persona_b's persona label changed from persona_b to persona_a"]],
+    ["C's row deleted", BEFORE, [row('a'), row('b'), row('d', 'ended')], ['0 cscb_persona_c row(s) after the removal, not one']],
+    ['a new row', BEFORE, [...LIVE, row('d', 'ended'), { id: 'cscb_x', persona: 'x', state: 'idle' }], ['a new row cscb_x after the removal']],
+    ['no row for D before the removal', LIVE, [...LIVE, row('d', 'ended')], ['no cscb_persona_d row before the removal']],
+  ])('removalRowProblems rejects %s', (_what, before, after, problems) => {
+    expect(removalRowProblems(before, after, 'd')).toEqual(problems)
+  })
+})
+
+describe("Check 27: D's row is killed and kept, judged after a guarded find-missing", () => {
+  const FIND_MISSING = 'guard || exit 90\nagent-director find-missing'
+  const COMPLETE_D = `since '1:0' | grep -F -- '[slack] persona teardown of "${personaName('d')}" (key=${personaName('d')}): complete'`
+
+  /**
+   * A live context for Check 27 over `real` (src's removal of D,
+   * `realRemovalOfD`): the pending file holds its preview, and server.log
+   * its lines (its reload-applied line written for the container's state
+   * directory). Rows: A, B, C and D live; D's row is `missing` once
+   * find-missing has run (its agent process is gone), or no longer there
+   * with `deleted`. `findMissing` is the guarded find-missing's answer.
+   * The first mark is the log's start (`1:0`), every later one its end, so
+   * nothing is logged after them. Nothing answers in Slack; time is virtual.
+   */
+  function removalRun(real: { preview: string[]; logs: string[] }, opts: { findMissing?: Partial<ProcResult>; deleted?: boolean } = {}) {
+    const clock = virtualClock()
+    const { findMissing = { stdout: `${personaRowId('d')}: missing` }, deleted = false } = opts
+    let marked = false
+    let marks = 0
+    const log = [...real.logs.filter((l) => !l.startsWith('[slack] reload-applied:')), appliedLine({ removed: 1 })]
+    const pending = [PENDING_FILE_HEADER, `fingerprint: sha256:${'0'.repeat(64)}`, '', ...real.preview].join('\n')
+    const rowsNow = () => [...(['a', 'b', 'c'] as const).map((l) => rowLine(l)), ...(marked && deleted ? [] : [rowLine('d', marked ? 'missing' : 'idle')])].join('\n')
+    const { container, scripts } = fakeContainer([
+      [
+        'agent-director find-missing',
+        () => {
+          marked = (findMissing.code ?? 0) === 0
+          return findMissing
+        },
+      ],
+      ['showpending', pending],
+      ['[ -e "$S/config.json.', { code: 1 }],
+      [
+        '',
+        (script) => {
+          if (script === 'mark') return `1:${marks++ === 0 ? 0 : log.length}`
+          if (script === 'rows') return rowsNow()
+          if (script.startsWith('cat "$S/server.pid"')) return '4242'
+          if (script.startsWith("jq -r '.personas[].name'")) return (['a', 'b', 'c'] as const).map(personaName).join('\n')
+          return sinceOver(script, log.slice(Number(/^since '1:(\d+)'/.exec(script)?.[1] ?? 0))) ?? ''
+        },
+      ],
+    ])
+    const ctx = makeCtx({ mode: 'real', clock, human: scriptedHuman(clock).human, browser: idleBrowser(), container })
+    return { ctx, scripts }
+  }
+
+  /** The findings that are not Slack's silence (A's recall is the only Slack finding a silent workspace gives here). */
+  const findingsOf = (r: CheckResult) => (r.reason ?? '').split('; ').filter((x) => x !== '' && x !== 'A did not recall quillfeather')
+
+  test("D's kept row, not live once find-missing ran, and src's kill line: no finding; find-missing runs behind the guard after the teardown and before the rows are read", async () => {
+    const run = removalRun(await realRemovalOfD())
+    const r = await check27.run(run.ctx)
+    expect(findingsOf(r)).toEqual([])
+    expect(run.scripts.filter((s) => s.includes('find-missing'))).toEqual([FIND_MISSING])
+    const at = run.scripts.indexOf(FIND_MISSING)
+    expect(run.scripts.indexOf(COMPLETE_D)).toBeGreaterThan(-1)
+    expect(run.scripts.indexOf(COMPLETE_D)).toBeLessThan(at)
+    expect(run.scripts.lastIndexOf('rows')).toBeGreaterThan(at)
+    expect(r.evidence).toContain(`rows after: ${[...(['a', 'b', 'c'] as const).map((l) => `${personaRowId(l)}(idle)`), `${personaRowId('d')}(missing)`].join(', ')}`)
+  })
+
+  test("the control: find-missing refused by the guard leaves D's row live, which is a finding", async () => {
+    const r = await check27.run(removalRun(await realRemovalOfD(), { findMissing: { code: 90 } }).ctx)
+    expect(findingsOf(r)).toEqual(['agent-director find-missing did not run (exit 90)', 'rows after the removal: cscb_persona_d is idle: kept but live, not ended or missing'])
+  })
+
+  test("the control: D's row deleted (the expectation before SRJ-715) is a finding", async () => {
+    const r = await check27.run(removalRun(await realRemovalOfD(), { deleted: true }).ctx)
+    expect(findingsOf(r)).toEqual([
+      'rows after the removal: cscb_persona_a, cscb_persona_b, cscb_persona_c',
+      'rows after the removal: 0 cscb_persona_d row(s) after the removal, not one kept row',
+    ])
+  })
+
+  test("the control: src's lines for a kill that failed after its tries give no kept-row line, which is a finding", async () => {
+    const r = await check27.run(removalRun(await realRemovalOfD(failingKill())).ctx)
+    expect(findingsOf(r)).toEqual(['no clean teardown complete line for D', "not one teardown line for D's kill that succeeded, its row kept (b.jg5 SRJ-715)"])
+  })
+})
+
+describe("Check 28: one live row per persona at steps 1, 3 and 5, plus D's kept row when this run brought D up", () => {
+  /** Check 28's row findings (steps 1, 3 and 5). */
+  const ROW_FINDING = /^step [135]: (not one|the rows changed)/
+  const rowFindings = (r: CheckResult) => (r.reason ?? '').split('; ').filter((x) => ROW_FINDING.test(x))
+  const withD = (state: string) => `${ROWS}\n${rowLine('d', state)}`
+  const ALL: PersonaLetter[] = ['a', 'b', 'c', 'd']
+
+  test.each(NOT_LIVE_ROW_STATES.map((state) => [state]))("D's row kept %s at every step, D brought up by this run: no row finding", async (state) => {
+    const r = await check28.run(rebootedRun(155, undefined, { rows: () => withD(state), broughtUp: ALL }))
+    expect(rowFindings(r)).toEqual([])
+    expect(r.evidence).toContain(`rows before: ${[...(['a', 'b', 'c'] as const).map((l) => `${personaRowId(l)}(idle)`), `${personaRowId('d')}(${state})`].join(', ')}`)
+  })
+
+  test("the control: D's kept row live is a finding at each step", async () => {
+    const r = await check28.run(rebootedRun(155, undefined, { rows: () => withD('idle'), broughtUp: ALL }))
+    const live = 'cscb_persona_d is idle: kept but live, not ended or missing'
+    expect(rowFindings(r)).toEqual([
+      `step 1: not one live row per persona plus D's kept row: ${live}`,
+      `step 3: the rows changed: ${live}`,
+      `step 5: not one row per persona plus D's kept row: ${live}`,
+    ])
+  })
+
+  test('the control: a row for D when this run never brought D up is a finding at each step', async () => {
+    const r = await check28.run(rebootedRun(155, undefined, { rows: () => withD('ended'), broughtUp: ['a', 'b', 'c'] }))
+    expect(rowFindings(r)).toEqual([
+      'step 1: not one live row per persona: an unexpected row cscb_persona_d',
+      'step 3: the rows changed: an unexpected row cscb_persona_d',
+      'step 5: not one row per persona: an unexpected row cscb_persona_d',
+    ])
+  })
+
+  test("the control: D's kept row gone at step 3 (before the reboot) is a finding there, and again at step 5", async () => {
+    const r = await check28.run(rebootedRun(155, undefined, { rows: (n) => (n === 0 ? withD('ended') : ROWS), broughtUp: ALL }))
+    expect(rowFindings(r)).toEqual([
+      'step 3: the rows changed: cscb_persona_a, cscb_persona_b, cscb_persona_c',
+      'step 3: the rows changed: 0 cscb_persona_d row(s), not one',
+      "step 5: not one row per persona plus D's kept row: 0 cscb_persona_d row(s), not one",
+    ])
   })
 })
 
@@ -2218,21 +2515,54 @@ describe('expected texts match the package', () => {
     }
     const line = startupSummaryLine(3, { ...zero, freshSpawned: 3 })
     const ending = startupSummaryEnding(zero)
-    expect(line.endsWith(`, ${ending}`)).toBe(true)
-    // The checks' buckets are the package's, in its order, up to
-    // `not reconnected`. b.jg5 SRJ-1015's five counts follow it in the
-    // package; the checks gaining them (`START_SUMMARY_END` and Check 1's
-    // line, SRJ-1111) is E50's, so only the shared start is checked here.
-    expect(ending.startsWith(START_SUMMARY_END)).toBe(true)
-    expect(line.startsWith(COMPLETE_FIRST_START)).toBe(true)
+    // The checks' clean ending and Check 1's whole line are the package's
+    // (b.jg5 SRJ-1111, SRJ-1015): every bucket, b.f2b's not-reconnected and
+    // SRJ-1015's five counts included, in its order and words.
+    expect(START_SUMMARY_END).toBe(ending)
+    expect(line.endsWith(`, ${START_SUMMARY_END}`)).toBe(true)
+    expect(COMPLETE_FIRST_START).toBe(line)
   })
 
-  test("the plan quotes the same summary: every ending it gives has the not-reconnected bucket, and Check 1 quotes the line", () => {
+  test.each<[string, Parameters<typeof startSummaryEnding>[0]]>([
+    ['every count 0 (the clean ending)', {}],
+    ["the retried ending (Check 28's acceptRetried: one persona not brought up)", { notBroughtUp: 1 }],
+    ['every count its own value', { failed: 1, notBroughtUp: 2, notReconnected: 3, latched: 4, retrying: 5, sequenceWaiting: 6, held: 7, freshRetired: 8 }],
+  ])("the checks' summary ending with %s is the package's builder's", (_what, counts) => {
+    const all = { failed: 0, notBroughtUp: 0, notReconnected: 0, latched: 0, retrying: 0, sequenceWaiting: 0, held: 0, freshRetired: 0, ...counts }
+    expect(startSummaryEnding(counts)).toBe(startupSummaryEnding(all))
+  })
+
+  test("the import-free modules the checks build from are the ones src/reload-plan.ts and src/session-manager.ts re-export, unchanged", () => {
+    expect(startupSummaryEnding).toBe(summaryEndingModule.startupSummaryEnding)
+    expect([DESTRUCTIVE_PREFIX, REMOVED_RETIRED_CLAUSE, DESTRUCTIVE_RETIRED_CLAUSE]).toEqual([
+      previewClauses.DESTRUCTIVE_PREFIX,
+      previewClauses.REMOVED_RETIRED_CLAUSE,
+      previewClauses.DESTRUCTIVE_RETIRED_CLAUSE,
+    ])
+  })
+
+  test.each(['a', 'b', 'c', 'd'] as const)("persona %s's removal line (Checks 27 and 28) is the package's retired removal line, never the old 'will be destroyed' one", (letter) => {
+    const n = personaName(letter)
+    const line = removedPreviewLine(letter)
+    expect(line).toBe(removedLine({ key: n, name: n, index: 0 }))
+    expect(line).not.toContain('destroyed')
+  })
+
+  test("the row states the checks read as not live are agent-director's dead states", () => {
+    expect([...NOT_LIVE_ROW_STATES].sort()).toEqual([...AGENT_DIRECTOR_DEAD_STATES].sort())
+  })
+
+  test("the plan quotes the same texts: every summary ending it gives ends with the builder's last count, it holds the clean ending, Check 1's line and both checks' retired removal lines, and no 'will be destroyed'", () => {
     const plan = readFileSync(join(import.meta.dir, '..', 'testplans', 'b.yko', 'b.yko.md'), 'utf-8')
     const quoted = [...plan.matchAll(/`([^`]*\d+ failed, \d+ not brought up[^`]*)`/g)].map((m) => m[1]!)
-    expect(quoted.filter((x) => !/, \d+ not reconnected$/.test(x))).toEqual([])
+    // The builder's last segment (`<n> fresh as retired keys`), its count any number.
+    const lastWords = START_SUMMARY_END.split(', ').at(-1)!.replace(/^\d+ /, '')
+    expect(quoted.filter((x) => !new RegExp(`, \\d+ ${lastWords}$`).test(x))).toEqual([])
     expect(quoted).toContain(START_SUMMARY_END)
     expect(quoted).toContain(COMPLETE_FIRST_START)
+    expect(plan).toContain(removedPreviewLine('d'))
+    expect(plan).toContain(removedPreviewLine('c'))
+    expect(plan).not.toContain('will be destroyed')
   })
 
   test('parsePending splits the pending file the package writes', () => {

@@ -11,6 +11,10 @@
  * guarded restart (2.3), each returning findings to assert on.
  */
 
+// The two src/ modules below import nothing, so the runner loads no Slack SDK
+// or agent-director client on the host; no other src/ module is imported here.
+import { DESTRUCTIVE_PREFIX, REMOVED_RETIRED_CLAUSE } from '../../src/reload-preview-clauses.ts'
+import { startupSummaryEnding, type StartupSummaryEndingCounts } from '../../src/startup-summary-ending.ts'
 import { CONTAINER_STATE_DIR } from '../lib/live-config.ts'
 import { isFrom, messageText, type HumanSession, type SlackMessage } from '../lib/human-session.ts'
 import { personaName, type PersonaLetter } from '../lib/personas.ts'
@@ -147,6 +151,101 @@ export async function rows(ctx: CheckContext): Promise<Row[]> {
     const [id = '', persona = '', state = ''] = l.split(' ')
     return { id, persona, state }
   })
+}
+
+/**
+ * The row states of a finished row: its agent process is gone. A copy of
+ * src/liveness-reading.ts's `AGENT_DIRECTOR_DEAD_STATES` (the checks import
+ * no src/ module that loads the agent-director client), pinned by
+ * tests/ci-live-checks.test.ts. Every other state is live.
+ */
+export const NOT_LIVE_ROW_STATES: readonly string[] = ['ended', 'missing']
+
+/** True when a row's state is not live (`NOT_LIVE_ROW_STATES`). */
+export function isNotLiveRow(row: Row): boolean {
+  return NOT_LIVE_ROW_STATES.includes(row.state)
+}
+
+/** A persona's row: its instance id (`cscb_<key>`) and the persona label it carries. */
+export function personaRowId(letter: PersonaLetter): string {
+  return `cscb_${personaName(letter)}`
+}
+
+/**
+ * What is wrong with `rows`, judged against one row per persona in `live`,
+ * live, and one per persona in `kept`, kept and not live (a removed persona's
+ * row: a teardown kills the row and keeps it, b.jg5 SRJ-715, AC 77). Each row
+ * has its persona's instance id and persona label; no other row is there.
+ * Pure; empty when the rows are as expected.
+ */
+export function keptRowSetProblems(rows: readonly Row[], live: readonly PersonaLetter[], kept: readonly PersonaLetter[]): string[] {
+  const problems: string[] = []
+  const expected = [...live.map((l) => ({ l, live: true })), ...kept.map((l) => ({ l, live: false }))]
+  for (const { l, live: wantLive } of expected) {
+    const id = personaRowId(l)
+    const found = rows.filter((r) => r.id === id)
+    if (found.length !== 1) {
+      problems.push(`${found.length} ${id} row(s), not one`)
+      continue
+    }
+    const row = found[0] as Row
+    if (row.persona !== personaName(l)) problems.push(`${id}'s persona label is ${row.persona}, not ${personaName(l)}`)
+    if (wantLive && isNotLiveRow(row)) problems.push(`${id} is ${row.state}, not live`)
+    if (!wantLive && !isNotLiveRow(row)) problems.push(`${id} is ${row.state}: kept but live, not ${NOT_LIVE_ROW_STATES.join(' or ')}`)
+  }
+  const ids = new Set(expected.map(({ l }) => personaRowId(l)))
+  for (const r of rows.filter((x) => !ids.has(x.id))) problems.push(`an unexpected row ${r.id}`)
+  return problems
+}
+
+/**
+ * True when `line` is a persona teardown's line for a kill of the persona's
+ * row that succeeded, the row kept (src/persona-lifecycle.ts, b.jg5 SRJ-715):
+ * `[slack] persona teardown of "<name>" (key=<key>): agent-director kill of
+ * cscb_<key>: <outcome> after <n> kill(s); the row is kept (b.jg5 SRJ-715)`.
+ * A failed kill's line (`… kill of cscb_<key> failed: …`) is not one.
+ */
+export function isTeardownKeptRowLine(line: string, letter: PersonaLetter): boolean {
+  const n = personaName(letter)
+  const start = `[slack] persona teardown of "${n}" (key=${n}): agent-director kill of ${personaRowId(letter)}: `
+  const at = line.indexOf(start)
+  if (at < 0) return false
+  return / after \d+ kill\(s\); the row is kept \(b\.jg5 SRJ-715\)$/.test(line.slice(at + start.length).trimEnd())
+}
+
+/**
+ * Check 27's row judgement after a confirmed removal of `removed` (b.jg5
+ * SRJ-715, AC 77: the teardown kills the row and keeps it). `before` is the
+ * rows before the removal. The removed persona's row is kept and not live;
+ * every other row of `before` is unchanged (its instance id and persona
+ * label, still live); no row is added or deleted. Pure; empty when the rows
+ * are as expected.
+ */
+export function removalRowProblems(before: readonly Row[], after: readonly Row[], removed: PersonaLetter): string[] {
+  const removedId = personaRowId(removed)
+  const problems: string[] = []
+  if (!before.some((r) => r.id === removedId)) problems.push(`no ${removedId} row before the removal`)
+  const others = before.filter((r) => r.id !== removedId)
+  for (const b of others) {
+    const found = after.filter((r) => r.id === b.id)
+    if (found.length !== 1) {
+      problems.push(`${found.length} ${b.id} row(s) after the removal, not one`)
+      continue
+    }
+    const a = found[0] as Row
+    if (a.persona !== b.persona) problems.push(`${b.id}'s persona label changed from ${b.persona} to ${a.persona}`)
+    if (isNotLiveRow(a)) problems.push(`${b.id} is ${a.state}, not live`)
+  }
+  const keptRows = after.filter((r) => r.id === removedId)
+  if (keptRows.length !== 1) problems.push(`${keptRows.length} ${removedId} row(s) after the removal, not one kept row`)
+  else {
+    const k = keptRows[0] as Row
+    if (k.persona !== personaName(removed)) problems.push(`${removedId}'s persona label is ${k.persona}, not ${personaName(removed)}`)
+    if (!isNotLiveRow(k)) problems.push(`${removedId} is ${k.state}: kept but live, not ${NOT_LIVE_ROW_STATES.join(' or ')}`)
+  }
+  const known = new Set([...others.map((r) => r.id), removedId])
+  for (const r of after.filter((x) => !known.has(x.id))) problems.push(`a new row ${r.id} after the removal`)
+  return problems
 }
 
 /** Run `script` behind the plan's guard; false (and nothing run) when the guard refuses. */
@@ -356,6 +455,19 @@ export function previewHeader(counts: Parameters<typeof countsText>[0]): string 
   return `A configuration change is pending; nothing has been applied. ${countsText(counts)}.`
 }
 
+/**
+ * A persona's removal line in the reload preview, as src/reload-plan.ts's
+ * `removedLine` renders it (b.jg5 SRJ-1510): `DESTRUCTIVE: persona "<name>"
+ * (key=<key>) is removed: the persona will be retired: its session stopped
+ * and never resumed.`. The prefix and the retired clause are src/'s own
+ * (`src/reload-preview-clauses.ts`); the persona reference is the checks'
+ * name-and-key form.
+ */
+export function removedPreviewLine(letter: PersonaLetter): string {
+  const n = personaName(letter)
+  return `${DESTRUCTIVE_PREFIX} persona "${n}" (key=${n}) is removed: ${REMOVED_RETIRED_CLAUSE}.`
+}
+
 export function appliedLine(counts: Parameters<typeof countsText>[0]): string {
   return (
     `[slack] reload-applied: applied the confirmed configuration change without a restart (${countsText(counts)}); ` +
@@ -407,12 +519,35 @@ export function checkPreview(f: Findings, pending: Pending, expect: string[]): v
 export const START_FAILURE_RE = '\\) not brought up:|persona-(credentials|directory)-|persona-slack-unreachable'
 
 /**
- * How a clean start's `startupSessionManager: complete` line ends: no launch
- * failed, every persona was brought up, and none was left running but not
- * reconnected (the last bucket, added by b.f2b). Only this current ending is
- * accepted: the start under test is always this package's.
+ * A start's `startupSessionManager: complete` line's ending, from the failed
+ * count on, as src/'s builder writes it (`startupSummaryEnding`,
+ * `src/startup-summary-ending.ts`; b.f2b, b.jg5 SRJ-1015): every count 0
+ * except the ones given.
  */
-export const START_SUMMARY_END = '0 failed, 0 not brought up, 0 not reconnected'
+export function startSummaryEnding(counts: Partial<StartupSummaryEndingCounts> = {}): string {
+  return startupSummaryEnding({
+    failed: 0,
+    notBroughtUp: 0,
+    notReconnected: 0,
+    latched: 0,
+    retrying: 0,
+    sequenceWaiting: 0,
+    held: 0,
+    freshRetired: 0,
+    ...counts,
+  })
+}
+
+/**
+ * How a clean start's `startupSessionManager: complete` line ends: no launch
+ * failed, every persona was brought up, none was left running but not
+ * reconnected (b.f2b), and none was latched, left retrying, waiting on a
+ * live-row sequence, held on invalid flags or brought up fresh as a retired
+ * key (SRJ-1015's five counts). Built by src/'s builder with every count 0
+ * (`startSummaryEnding`). Only this current ending is accepted: the start
+ * under test is always this package's.
+ */
+export const START_SUMMARY_END = startSummaryEnding()
 
 /**
  * Wait for the start's summary line and a Session connected line per persona,
@@ -510,7 +645,7 @@ export async function checkStartLines(
   const endsWith = (ending: string) => summary !== undefined && summary.endsWith(` ${ending}`)
   // A retried persona is accepted only when the summary counts exactly the retried ones as not brought up.
   const retried = options.acceptRetried === undefined ? [] : retriedBringUps(all, letters).filter((r) => retryFailureClass(r.via) !== null)
-  const acceptRetried = retried.length > 0 && endsWith(`0 failed, ${retried.length} not brought up, 0 not reconnected`)
+  const acceptRetried = retried.length > 0 && endsWith(startSummaryEnding({ notBroughtUp: retried.length }))
   // Then their own failure lines of their retry's class, up to the retry, are the transient it recovered from.
   const accepted = new Set<number>()
   if (acceptRetried) {

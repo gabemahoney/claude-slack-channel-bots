@@ -1003,6 +1003,14 @@ when it has a new reply. A transient Slack failure during a wait (a network
 error, a timeout, a 5xx, a rate limit, `internal_error` and the like) counts
 as "not yet", not as a FAIL.
 
+The checks take the reload preview's removal lines (Checks 27 and 28) and
+the start summary's ending (every start the checks read) from `src/`'s two
+import-free modules, `src/reload-preview-clauses.ts` and
+`src/startup-summary-ending.ts`, so they expect what the package under test
+writes. A clean start's summary ends `0 failed, 0 not brought up, 0 not
+reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held
+on invalid flags, 0 fresh as retired keys`.
+
 | Check | In `/ci-live` |
 |---|---|
 | Provisioning | A result row of its own (the stages above) |
@@ -1019,8 +1027,8 @@ as "not yet", not as a FAIL.
 | 24, with its setup and teardown | Automated |
 | 25 | Automated. D is added by a `config.json` edit, not the wizard, and D's credentials file is moved from `credentials-staged/` into the mounted directory while the server runs |
 | 26 | `SKIPPED (optional)` |
-| 27 | Automated, with step 2's optional prompt |
-| 28 | Automated; the reboot is a container restart (see below). A persona Slack was unreachable for at the start, up after its bring-up retry and connected within the wait, is a note, not a failure |
+| 27 | Automated, with step 2's optional prompt. The teardown kills D's row and keeps it: once the teardown's complete line is logged, the runner runs a guarded `agent-director find-missing` in the container (a kill never changes a row's state; find-missing marks the row once its agent process is gone), then expects A's, B's and C's rows unchanged and D's row kept and not live (`ended` or `missing`), with one teardown line for a kill that kept the row |
+| 28 | Automated; the reboot is a container restart (see below). Steps 1, 3 and 5 expect one live row per configured persona, plus D's kept row, not live, when this run brought D up. A persona Slack was unreachable for at the start, up after its bring-up retry and connected within the wait, is a note, not a failure |
 | 29a | Automated. Always runs, also in a dry run and after a blocking failure; adds a host-side scan of the results. It requires a transcript only for each persona this run brought up (A to C in Check 1, D in Check 25) and sent a message to |
 | 29b | `SKIPPED (optional: needs host sudo/iptables)` |
 | Teardown | The personas' tmux panes, the container's own logs and the personas' transcript tails are copied into `container-logs/` (see [Outputs](#outputs)), then the container is removed. The apps and channels stay for the next run |
@@ -1068,7 +1076,9 @@ The start then counts that persona in `not brought up`, logs its
 and `persona "<name>" (key=<key>): up after its bring-up retry (Slack) —
 launching`. When each persona the summary counts as not brought up did that
 and then connected within the wait, step 5 accepts the summary's
-`0 failed, <n> not brought up, 0 not reconnected` and those personas'
+ending `0 failed, <n> not brought up, 0 not reconnected, 0 latched, 0
+retrying, 0 waiting on a live-row sequence, 0 held on invalid flags, 0 fresh
+as retired keys` and those personas'
 Slack-unreachable lines up to their retry, and records each in a note. A
 persona that never came back or never connected, a count that doesn't match,
 any other failure line (a credentials one, a later Slack-unreachable one,

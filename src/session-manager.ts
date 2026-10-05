@@ -1015,6 +1015,7 @@ import {
   personaArchiveEvidenceScope,
   rfc3339ToEpochSeconds,
 } from './jsonl-persistence-check.ts'
+import { startupSummaryEnding, type StartupSummaryEndingCounts } from './startup-summary-ending.ts'
 import { realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { resolve as resolvePath } from 'node:path'
@@ -19417,21 +19418,12 @@ export interface StartupSessionManagerResult {
 export type StartupSummaryCounts = Omit<StartupSessionManagerResult, 'perPersona' | 'succeeded' | 'waitingInBackground'>
 
 /**
- * The start summary line's ending, from `failed` on (b.f2b, b.jg5 SRJ-1015):
- * `<n> failed, <n> not brought up, <n> not reconnected`, then SRJ-1015's
- * five counts in its order and words: `, <n> latched, <n> retrying, <n>
- * waiting on a live-row sequence, <n> held on invalid flags, <n> fresh as
- * retired keys`.
+ * The start summary line's ending, from `failed` on (b.f2b, b.jg5 SRJ-1015),
+ * lives in the import-free `startup-summary-ending.ts`, so the /ci-live
+ * checks can build their expected endings from it; re-exported here
+ * unchanged.
  */
-export function startupSummaryEnding(
-  counts: Pick<StartupSummaryCounts, 'failed' | 'notBroughtUp' | 'notReconnected' | 'latched' | 'retrying' | 'sequenceWaiting' | 'held' | 'freshRetired'>,
-): string {
-  return (
-    `${counts.failed} failed, ${counts.notBroughtUp} not brought up, ${counts.notReconnected} not reconnected, ` +
-    `${counts.latched} latched, ${counts.retrying} retrying, ${counts.sequenceWaiting} waiting on a live-row sequence, ` +
-    `${counts.held} held on invalid flags, ${counts.freshRetired} fresh as retired keys`
-  )
-}
+export { startupSummaryEnding, type StartupSummaryEndingCounts }
 
 /**
  * `startupSessionManager`'s one summary line for a pass over `personaCount`
