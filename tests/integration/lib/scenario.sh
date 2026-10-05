@@ -290,16 +290,26 @@
 #   ad_store_id                        open the store read-only and print its store id (store_meta
 #                                      key store_id); fail, saying why, unless it is 16 lowercase hex
 #                                      characters (a 0.10.0 store has none)
+#   ad_store_backup <dest>             the switch-over runbook's online-consistent copy of the store
+#                                      (step 8): sqlite3's `.backup`, the store opened read-only, into
+#                                      <dest>, a new file under SCENARIO_ROOT (as written and by the real
+#                                      path of its directory) whose path holds no `'` or control
+#                                      character; then the copy's `PRAGMA integrity_check` must read
+#                                      `ok`, or it fails
 #   ad_store_pending_no_launch <instance-id>
 #                                      b.jg5 SRJ-1306's `pending` row with no launch start, made from
 #                                      the row (the persona's live row) with one `ad_store_edit`
 #                                      UPDATE: state `pending`; launch_started_at, launch_token, pid,
 #                                      proc_starttime, pane_id, pane_pid and pane_starttime NULL;
 #                                      row_version advanced by one; every other column kept. Fails
-#                                      when no row has <instance-id> (the UPDATE returns none) or the
-#                                      id holds a character other than letters, digits and `._:@-`;
-#                                      then a harness `status` read (`ad_capture`) must read `pending`
-#                                      with no launch_started_at, or it fails
+#                                      when the id holds a character other than letters, digits and
+#                                      `._:@-`, or no row has <instance-id>. The UPDATE is guarded by
+#                                      the row_version read before it (`AND row_version = <rv>`): it
+#                                      fails when it changed no row (agent-director wrote the row in
+#                                      between), and when the row read after it differs from the
+#                                      one before in any column but those named here, or not as
+#                                      named. Then a harness `status` read (`ad_capture`) must read
+#                                      `pending` with no launch_started_at, or it fails
 #
 #   Stub workers (fmk mode; fixtures/stub-claude.sh's header states the modes, the
 #   SessionStart re-fire, its stop line and the MCP session; each runs both guards first)
@@ -507,8 +517,9 @@
 #                                      CSCB process), so CSCB's filters count none of them. Sets
 #                                      FIND_MISSING_LOOP_PID and FIND_MISSING_LOOP_INTERVAL_S
 #   stop_find_missing_loop [<timeout-s>]
-#                                      SIGTERM the loop (a run in flight finishes first); fail unless
-#                                      it is gone within <timeout-s> (default 30)
+#                                      SIGTERM the loop (a run in flight finishes and writes its log
+#                                      line first); fail unless it is gone within <timeout-s>
+#                                      (default 30)
 #   find_missing_loop_runs             print how many runs the loop's log holds (0 when none)
 #   wait_find_missing_runs <n> [<timeout-s>]
 #                                      wait for <n> more runs than the log holds now; fails when the
@@ -597,7 +608,12 @@
 #                                      control: fail unless some invocation's parent is a bot server
 #                                      the scenario started (its version probe)
 #   assert_no_cscb_delete              fail on any `delete` invocation (agent-director-admin's, or an
-#                                      earlier agent-director's) whose parent is a CSCB process
+#                                      earlier agent-director's) whose parent is not the scenario's
+#                                      own shell or a subshell of it, as
+#                                      assert_no_cscb_include_finished tells them (so a CSCB process
+#                                      the record does not hold, a server refused before it wrote
+#                                      server.pid included, fails it); the harness's own delete
+#                                      (`ad_delete_unusable_row`) passes. No positive control
 #   cscb_ad_calls <verb> [<fragment>...]
 #                                      print the agent-director shim's `call` lines whose parent is a
 #                                      CSCB process, whose verb is <verb> (any verb when <verb> is
@@ -2114,17 +2130,49 @@ ad_store_id() {
     printf '%s\n' "${out}"
 }
 
+ad_store_backup() {
+    local dest="${1:-}" step db real_root real_dir out
+    step="ad_store_backup ${dest}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    db="${HOME}/.agent-director/state.db"
+    (( $# == 1 )) || fail "${step}: takes one destination, not $# arguments"
+    [[ "${dest}" == "${SCENARIO_ROOT}"/* ]] \
+        || fail "${step}: refused: ${dest} is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
+    # The path goes inside the dot-command's single quotes.
+    [[ "${dest}" != *[\'[:cntrl:]]* ]] || fail "${step}: the path holds a ' or a control character"
+    [[ ! -e "${dest}" && ! -L "${dest}" ]] || fail "${step}: ${dest} already exists"
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" \
+        || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
+    real_dir="$(realpath -e -- "$(dirname -- "${dest}")" 2> /dev/null)" \
+        || fail "${step}: the directory of ${dest} does not exist"
+    [[ "${real_dir}" == "${real_root}" || "${real_dir}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: the directory of ${dest} resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
+    [[ -f "${db}" ]] || fail "${step}: no store at ${db}"
+    out="$(sqlite3 -batch -bail -readonly -cmd ".timeout ${SCENARIO_STORE_BUSY_MS}" "${db}" ".backup '${dest}'" 2>&1)" \
+        || fail "${step}: sqlite3 .backup failed: ${out//$'\n'/ }"
+    [[ -f "${dest}" ]] || fail "${step}: sqlite3 .backup wrote no file at ${dest}"
+    out="$(sqlite3 -batch -bail -readonly "${dest}" "PRAGMA integrity_check;" 2>&1)" \
+        || fail "${step}: sqlite3 could not check the copy ${dest}: ${out//$'\n'/ }"
+    [[ "${out}" == ok ]] || fail "${step}: the copy's integrity check reads '${out//$'\n'/ }', not ok"
+}
+
 ad_store_pending_no_launch() {
     require_ci_image "ad_store_pending_no_launch"
     require_scenario_home "ad_store_pending_no_launch"
-    local id="${1:-}" step out
+    local id="${1:-}" step before after rv out
     step="ad_store_pending_no_launch ${id}"
-    [[ "${id}" =~ ^[A-Za-z0-9._:@-]+$ ]] \
-        || fail "${step}: instance id '${id}' is empty or holds a character other than letters, digits and ._:@-"
-    # One statement; RETURNING names the row it changed, so no row is seen.
-    out="$(ad_store_edit "UPDATE spawns SET state = 'pending', launch_started_at = NULL, launch_token = NULL, pid = NULL, proc_starttime = NULL, pane_id = NULL, pane_pid = NULL, pane_starttime = NULL, row_version = row_version + 1 WHERE claude_instance_id = '${id}' RETURNING claude_instance_id")" \
+    _scenario_check_instance_id "${step}" "${id}"
+    before="$(_scenario_row_json "${step}" "${id}")" || exit 1
+    rv="$(jq -r '.[0].row_version' <<< "${before}")"
+    [[ "${rv}" =~ ^[0-9]+$ ]] || fail "${step}: the row's row_version reads '${rv}'"
+    # One statement, guarded by the row_version read; RETURNING names the row it changed.
+    out="$(ad_store_edit "UPDATE spawns SET state = 'pending', launch_started_at = NULL, launch_token = NULL, pid = NULL, proc_starttime = NULL, pane_id = NULL, pane_pid = NULL, pane_starttime = NULL, row_version = row_version + 1 WHERE claude_instance_id = '${id}' AND row_version = ${rv} RETURNING claude_instance_id")" \
         || exit 1
-    [[ "${out}" == "${id}" ]] || fail "${step}: no row has instance id ${id}"
+    [[ "${out}" == "${id}" ]] || fail "${step}: the row's row_version is no longer ${rv}: agent-director wrote it in between, and the edit wrote nothing"
+    after="$(_scenario_row_json "${step}" "${id}")" || exit 1
+    _scenario_row_diff_check "${step}" "${before}" "${after}" \
+        "{\"state\": \"pending\", \"launch_started_at\": null, \"launch_token\": null, \"pid\": null, \"proc_starttime\": null, \"pane_id\": null, \"pane_pid\": null, \"pane_starttime\": null, \"row_version\": $(( rv + 1 ))}"
     ad_capture status --claude-instance-id "${id}"
     [[ "${AD_RC}" == 0 ]] \
         || fail "${step}: the harness status read exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
@@ -2580,7 +2628,9 @@ relabel_session() {
     _scenario_set_labels "${step}" "${sid}" "${pane}" "${owner}" "${pane_label}"
     SEEDED_SESSION_ID="${sid}"
     SEEDED_PANE_ID="${pane}"
+    # shellcheck disable=SC2034 # read by the scripts that source this file
     SEEDED_TOKEN="${token}"
+    # shellcheck disable=SC2034 # read by the scripts that source this file
     SEEDED_STORE_ID="${store}"
     printf '%s %s %s\n' "${sid}" "${pane}" "${token}"
 }
@@ -2769,6 +2819,7 @@ rebind_tmux_socket() {
     got="$("${SCENARIO_REAL_TMUX}" -S "${moved}" list-sessions -F '#{pid}' 2> /dev/null)" || got=""
     [[ "${got%%$'\n'*}" == "${old_pid}" ]] \
         || fail "${step}: the moved socket ${moved} answers with server pid '${got%%$'\n'*}', not the old server's ${old_pid}"
+    # shellcheck disable=SC2034 # read by the scripts that source this file
     REBOUND_SOCKET="${moved}"
     printf '%s %s %s\n' "${new_pid}" "${sid}" "${moved}"
 }
@@ -3000,12 +3051,16 @@ ad_delete_unusable_row() {
 # _scenario_find_missing_loop <dir> <interval-s>: the loop's body, run in a
 # background subshell of the scenario's shell: `find-missing` through the
 # harness call, its log line and output, then the interval, until SIGTERM.
+# The TERM trap only sets a flag and wakes the interval's sleep: bash runs it
+# once a `find-missing` in flight has returned, and that run still writes its
+# log line before the loop leaves, so no run's line is lost and a later loop
+# numbers its runs after it.
 _scenario_find_missing_loop() {
-    local dir="$1" interval="$2" n rc start end sleeper=""
-    trap '[[ -z "${sleeper}" ]] || kill "${sleeper}" 2> /dev/null; exit 0' TERM
+    local dir="$1" interval="$2" n rc start end sleeper="" stopping=0
+    trap 'stopping=1; [[ -z "${sleeper}" ]] || kill "${sleeper}" 2> /dev/null' TERM
     n="$(grep -c '^run ' "${dir}/loop.log" 2> /dev/null)" || true
     n="${n:-0}"
-    while :; do
+    while (( ! stopping )); do
         n=$(( n + 1 ))
         rc=0
         start="${EPOCHREALTIME/,/.}"
@@ -3016,11 +3071,17 @@ _scenario_find_missing_loop() {
             sed 's/^/  out| /' "${dir}/run.${n}.out"
             sed 's/^/  err| /' "${dir}/run.${n}.err"
         } >> "${dir}/loop.log"
+        (( ! stopping )) || break
         sleep "${interval}" &
         sleeper=$!
-        wait "${sleeper}" || true
+        if (( stopping )); then
+            kill "${sleeper}" 2> /dev/null || true
+        else
+            wait "${sleeper}" || true
+        fi
         sleeper=""
     done
+    exit 0
 }
 
 run_find_missing_loop() {
@@ -3040,6 +3101,7 @@ run_find_missing_loop() {
     FIND_MISSING_LOOP_INTERVAL_S="${interval}"
     ( _scenario_find_missing_loop "${dir}" "${interval}" ) < /dev/null &
     _SCENARIO_FM_LOOP_PID=$!
+    # shellcheck disable=SC2034 # read by the scripts that source this file
     FIND_MISSING_LOOP_PID="${_SCENARIO_FM_LOOP_PID}"
     track_pid "${_SCENARIO_FM_LOOP_PID}"
 }
@@ -3133,7 +3195,7 @@ _scenario_row_left_pending() {
 }
 
 seed_010_row() {
-    local id="${1:-}" name="${2:-}" dir="${3:-}" step mode label args=() out sid pane ppid argv=() a found=0 state
+    local id="${1:-}" name="${2:-}" dir="${3:-}" step mode label args=() out sid pane ppid argv=() a is_stub=0 state
     step="seed_010_row ${id}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
@@ -3170,9 +3232,9 @@ seed_010_row() {
         || fail "${step}: tmux read '${out}' for session ${name}"
     mapfile -d '' -t argv 2> /dev/null < "/proc/${ppid}/cmdline" || true
     for a in ${argv[@]+"${argv[@]}"}; do
-        [[ "${a}" == "${SCENARIO_BIN}/claude" ]] && found=1
+        [[ "${a}" == "${SCENARIO_BIN}/claude" ]] && is_stub=1
     done
-    (( found )) || fail "${step}: the session's pane process ${ppid} is not the stub ${SCENARIO_BIN}/claude"
+    (( is_stub )) || fail "${step}: the session's pane process ${ppid} is not the stub ${SCENARIO_BIN}/claude"
     if [[ "${mode}" == "${STUB_MODE_AT_ONCE}" ]]; then
         wait_until "${SCENARIO_SEED_REPORT_S}" "${step}: the row never reported in" \
             _scenario_row_left_pending "${step}" "${id}"
@@ -3238,6 +3300,7 @@ seed_prepersona_fleet() {
         fi
         cwd="$(jq -r --arg c "${cid}" '.routes[$c].cwd // empty' "${config}")" \
             || fail "${step}: could not read routes[${cid}].cwd"
+        # shellcheck disable=SC2088 # a literal ~ in config.json, expanded here
         if [[ "${cwd}" == "~" ]]; then
             cwd="${HOME}"
         elif [[ "${cwd}" == "~/"* ]]; then
@@ -3519,15 +3582,21 @@ assert_no_cscb_delete() {
     for i in "${!lines[@]}"; do
         _scenario_split_line "${lines[i]}"
         [[ "${_L_KIND}" == call ]] || continue
-        _scenario_role_at "${_L_PPID}" "${_L_US}" || continue
         _scenario_decode_words
         _scenario_ad_verb
-        if [[ "${_L_VERB}" == delete ]]; then
-            bad+=("$(( i + 1 ))")
+        [[ "${_L_VERB}" == delete ]] || continue
+        # Only the scenario's own shell, or a subshell of it, may delete: a
+        # parent with the script's own command line that no CSCB process
+        # held. Any other parent fails, a CSCB process the record does not
+        # hold (a server refused before it wrote server.pid) included.
+        if [[ "${_L_PARENT}" == "${SCENARIO_SHELL_CMDLINE}" ]] \
+            && ! _scenario_role_at "${_L_PPID}" "${_L_US}"; then
+            continue
         fi
+        bad+=("$(( i + 1 ))")
     done
     (( ${#bad[@]} == 0 )) \
-        || _scenario_offending "${step}" "${SCENARIO_AD_SHIM_LOG}" "run delete from a CSCB process" "${bad[@]}"
+        || _scenario_offending "${step}" "${SCENARIO_AD_SHIM_LOG}" "run delete from a parent other than the scenario's own shell or a subshell of it" "${bad[@]}"
     _scenario_closing_ran "${step}"
 }
 
@@ -3656,6 +3725,7 @@ _scenario_fmk_setup() {
     [[ "$(command -v claude || true)" == "${SCENARIO_BIN}/claude" ]] \
         || fail "claude resolves to '$(command -v claude || true)', not the stub ${SCENARIO_BIN}/claude"
 
+    # shellcheck disable=SC2034 # read by the scripts that source this file
     SCENARIO_AD_BIN="${HOME}/.agent-director/bin/agent-director"
     SCENARIO_AD_SHIM_LOG="${HOME}/.agent-director/bin/agent-director-shim.log"
     # The files the closing enforcement reads, whatever a script later sets

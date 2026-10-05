@@ -17,10 +17,9 @@
  * marker `/etc/cscb-ci-image`; without it, the driver prints
  * `FAIL: fmk-driver: refused: /etc/cscb-ci-image is absent …` on stderr and
  * exits 2, before it reads an argument or loads a module. Only `node:`
- * built-ins are imported statically: the package under test and the
- * agent-director client that package resolves are imported dynamically, after
- * the check, by the forced call that needs them, through the context's
- * `importPackageModule` and `importAgentDirectorClient`.
+ * built-ins are imported statically: the package under test is imported
+ * dynamically, after the check, by the forced call that needs it, through the
+ * context's `importPackageModule`.
  *
  * HOW A SCENARIO RUNS IT
  * ----------------------
@@ -81,6 +80,11 @@
  *   reuse-spawn    the package's `_forceReuseSpawnForPersona`: one reuse
  *                  spawn (`reuse_finished`) of the persona's own id
  *                  (scenarios 8 and 25).
+ *     A launch that returned success starts the persona's dialog approver
+ *     without awaiting it; before printing its line, each of the two stops
+ *     it through the package's shutdown stop (`stopAllDialogApprovers`) and
+ *     waits until it has ended, its call in progress included, so no
+ *     agent-director call it caused is in flight when the driver exits.
  *     Their line:
  *       DRIVER: FORCED <call> called=<bool> action=<action> counted=<bool> latched=<bool> error=<name> class=<class> [unknown_name=<name>] description=<json> result=<json>
  *     with `error=none` and no class or description when the call returned
@@ -143,8 +147,6 @@ const UNUSED_CREDENTIALS_FILE = '/tmp/fmk-driver-unused-credentials.json'
 interface ForcedCallContext {
   /** Import a module of the installed package's `src/` (for example `session-manager.ts`). */
   importPackageModule(relPath: string): Promise<Record<string, unknown>>
-  /** Import the agent-director client the installed package resolves. */
-  importAgentDirectorClient(): Promise<Record<string, unknown>>
 }
 
 /** One forced call: runs with its arguments and returns the driver's exit status. */
@@ -329,7 +331,17 @@ function forcedLaunchCall(call: keyof typeof FORCED_LAUNCH_SEAMS): ForcedCall {
       'session-manager.ts',
       FORCED_LAUNCH_SEAMS[call],
     )
+    const stopAllDialogApprovers = await packageFunction<() => Promise<void>>(
+      context,
+      'session-manager.ts',
+      'stopAllDialogApprovers',
+    )
     const outcome = await seam(prepared.persona, prepared.config)
+    // A launch that returned success started the persona's dialog approver
+    // without awaiting it. Its stop (the package's shutdown stop) waits for
+    // the call in progress, so no agent-director call of the driver's is left
+    // running when it prints its line and exits.
+    await stopAllDialogApprovers()
     console.log(forcedLaunchLine(call, outcome))
     return 0
   }
@@ -417,9 +429,6 @@ const FORCED_CALLS: Readonly<Record<string, ForcedCall>> = {
 const context: ForcedCallContext = {
   async importPackageModule(relPath) {
     return await import(join(PKG_DIR, 'src', relPath))
-  },
-  async importAgentDirectorClient() {
-    return await import(Bun.resolveSync('agent-director', join(PKG_DIR, 'src')))
   },
 }
 

@@ -156,6 +156,7 @@ fi
 
 # wait_delay: sleep <delay> seconds with no standard stream of the caller's.
 wait_delay() {
+    # shellcheck disable=SC2217 # drops the caller's stdin, so a killed shim's sleep holds none of agent-director's pipes
     /usr/bin/sleep "${delay}" < /dev/null > /dev/null 2>&1
 }
 

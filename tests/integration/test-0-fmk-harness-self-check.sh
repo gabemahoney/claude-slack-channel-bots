@@ -85,12 +85,13 @@
 #                    directory under /tmp holding a decoy install and store,
 #                    and a symlink under SCENARIO_ROOT that resolves to it),
 #                    every install, re-shim, swap, hide and restore helper,
-#                    `ad`, `ad_store_edit`, `ad_store_id`,
-#                    `ad_store_pending_no_launch`, `stub_mode`,
-#                    `stub_press_enter`, `write_mcp_config` and every label,
-#                    seeding, tmux-step, store-statement, operator-action,
-#                    find-missing-loop and 0.10.0-seeder helper fails with the
-#                    guard's reason, and the decoy is left exactly as it was.
+#                    `ad`, `ad_store_edit`, `ad_store_id`, `ad_store_backup`
+#                    (which writes no copy), `ad_store_pending_no_launch`,
+#                    `stub_mode`, `stub_press_enter`, `write_mcp_config` and
+#                    every label, seeding, tmux-step, store-statement,
+#                    operator-action, find-missing-loop and 0.10.0-seeder
+#                    helper fails with the guard's reason, and the decoy is
+#                    left exactly as it was.
 #   shim_check       `check_ad_shim` passes a correct layout and fails, with
 #                    its reason, on a symlink to the shim and on a copy of the
 #                    shim without its marker line.
@@ -275,9 +276,12 @@
 #                    SCENARIO_ROOT: each assertion passes a clean log and
 #                    fails, naming itself and the reason, on each violating
 #                    log (and each positive control on a log that lacks it);
-#                    a line whose parent PID a recorded process held only
-#                    outside that line's time never counts, nor a stop line;
-#                    a line not in the shims' format fails.
+#                    a stop line never counts. A `kill --include-finished`
+#                    or a `delete` passes only from the scenario's own shell
+#                    (its command line, on a PID no recorded process held at
+#                    that time), so one from a recorded process's command line
+#                    outside its window fails; for the other checks such a
+#                    line never counts. A line not in the shims' format fails.
 #   count_helpers    on a synthetic log, `cscb_ad_count` and `cscb_ad_calls`
 #                    count only the calls a CSCB process made in its window:
 #                    never a harness call or a stop line; the verb is read past
@@ -330,6 +334,10 @@
 #                    `ad_delete_unusable_row` and `ad_store_unusable_name`
 #                    refuse the live row, unchanged; `ad_store_unusable_name`
 #                    changes only the finished row's session name.
+#                    `ad_store_backup` refuses a destination outside
+#                    SCENARIO_ROOT, an existing one (left as it was) and a path
+#                    holding a `'`, each with its reason and no copy; then a
+#                    copy of the store reads integrity `ok` and the store's id.
 #   operator_actions once the other row's session is past the starting-session
 #                    bound: `ad_store_mark_finished` marks it `ended`, every
 #                    other column kept, its session still running; then
@@ -736,15 +744,15 @@ row_state_is() {
 # last_tmux_line_with <after> <fragment>...: print the last tmux shim log line
 # after line <after> that holds every fixed-string <fragment>.
 last_tmux_line_with() {
-    local after="$1" line frag found=""
+    local after="$1" line frag hit=""
     shift
     while IFS= read -r line; do
         for frag in "$@"; do
             [[ "${line}" == *"${frag}"* ]] || continue 2
         done
-        found="${line}"
+        hit="${line}"
     done < <(tail -n "+$(( after + 1 ))" "${SCENARIO_TMUX_SHIM_LOG}")
-    printf '%s\n' "${found}"
+    printf '%s\n' "${hit}"
 }
 
 # True when the tmux shim log holds more than <n> lines.
@@ -1051,6 +1059,7 @@ TRAIL_NOT_MISMATCH='.event == "ad.hook.ignored" and .hook_event == "SessionStart
 # trail_read <array-name> <jq-condition> [<jq-option>...]: set the array to
 # the times of the trail's records that <jq-condition> keeps, in trail order
 # (none when there is no trail yet). The options bind its variables.
+# shellcheck disable=SC2034 # trail_read_out is a nameref: it sets the caller's array
 trail_read() {
     local -n trail_read_out="$1"
     local cond="$2" out="${SCENARIO_ROOT}/trail-read.out"
@@ -1525,7 +1534,7 @@ leg_start_on_010() {
 }
 
 leg_guard_refusals() {
-    local step="guard refusals" link real_outside before home reason
+    local step="guard refusals" link real_outside before home reason backup="${SCENARIO_ROOT}/t0-guard-backup.db"
     OUTSIDE_HOME="$(mktemp -d /tmp/test-0-outside-home.XXXXXX)" || fail "${step}: could not make a HOME outside SCENARIO_ROOT"
     # A decoy install and store each helper would act on, were it not refused.
     mkdir -p "${OUTSIDE_HOME}/.agent-director/bin"
@@ -1558,6 +1567,9 @@ leg_guard_refusals() {
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_admin_capture version
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_edit "UPDATE spawns SET labels = '{}'"
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_id
+        # The copy would land under SCENARIO_ROOT, outside the decoy.
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_backup "${backup}"
+        [[ ! -e "${backup}" && ! -L "${backup}" ]] || fail "${step}: the refused ad_store_backup wrote ${backup}"
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_pending_no_launch "${T0_ROW_ID}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_mode "${SCENARIO_ROOT}/work" "${STUB_MODE_AT_ONCE}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_press_enter "${T0_SESSION}"
@@ -2265,7 +2277,7 @@ leg_stop_no_launch_start() {
 }
 
 leg_refire_grace() {
-    local step="re-fire until G" path pid times=() fired=() n first last g_end gap at_settle
+    local step="re-fire until G" path pid times=() fired=() n first last g_end gap
     local -A settled=()
     g_end="$(seconds_plus "${REFIRE_LS}" "${REFIRE_GRACE_S}")"
     sleep_until "$(seconds_plus "${g_end}" "${REFIRE_SETTLE_S}")"
@@ -2533,7 +2545,8 @@ leg_synthetic_include_finished() {
 }
 
 leg_synthetic_delete() {
-    local step="synthetic assert_no_cscb_delete" dir a="assert_no_cscb_delete" why="run delete from a CSCB process"
+    local step="synthetic assert_no_cscb_delete" dir a="assert_no_cscb_delete"
+    local why="run delete from a parent other than the scenario's own shell or a subshell of it"
     dir="$(syn_case delete-clean)"
     expect_on_files "${step}: clean" "${dir}" pass "${a}"
 
@@ -2550,14 +2563,34 @@ leg_synthetic_delete() {
     expect_on_files "${step}: from a CLI run, and after --store-path=" "${dir}" fail "${a}" \
         "2 agent-director-shim.log line(s) ${why} (line 3, 4)"
 
-    dir="$(syn_case delete-allowed)"
-    syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000073 "${SYN_SHELL}" "${SCENARIO_SHELL_CMDLINE}" \
-        delete --claude-instance-id t0-h
-    syn_line "${dir}/agent-director-shim.log" call 3000.000000 6000074 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
+    # Parents the record does not hold: the bot server's command line outside
+    # its window (as a server refused before it wrote server.pid would be),
+    # and a wrapper process.
+    dir="$(syn_case delete-unrecorded)"
+    syn_line "${dir}/agent-director-shim.log" call 3000.000000 6000073 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
         delete --claude-instance-id cscb_alpha
-    syn_line "${dir}/agent-director-shim.log" stop 1500.100000 6000075 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
+    syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000074 "${SYN_OTHER}" 'timeout 10 agent-director' \
+        delete --claude-instance-id cscb_alpha
+    expect_on_files "${step}: from the server's command line outside its window, and from a wrapper" "${dir}" fail "${a}" \
+        "2 agent-director-shim.log line(s) ${why} (line 3, 4)"
+
+    # The shell's command line, but a PID a CSCB process held at that time.
+    dir="$(syn_case delete-shell-text-cscb-pid)"
+    syn_line "${dir}/agent-director-shim.log" call 1150.000000 6000075 "${SYN_RUN}" "${SCENARIO_SHELL_CMDLINE}" \
+        delete --claude-instance-id cscb_alpha
+    expect_on_files "${step}: the shell's command line on a CSCB process's PID" "${dir}" fail "${a}" \
+        "1 agent-director-shim.log line(s) ${why} (line 3)"
+
+    # Not violations: the harness from its shell, on its own PID and on the
+    # server's PID outside the server's window, and a stop line.
+    dir="$(syn_case delete-allowed)"
+    syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000076 "${SYN_SHELL}" "${SCENARIO_SHELL_CMDLINE}" \
+        delete --claude-instance-id t0-h
+    syn_line "${dir}/agent-director-shim.log" call 3000.000000 6000077 "${SYN_SERVER}" "${SCENARIO_SHELL_CMDLINE}" \
+        delete --claude-instance-id t0-h
+    syn_line "${dir}/agent-director-shim.log" stop 1500.100000 6000078 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
         stub-claude delete
-    expect_on_files "${step}: the harness, a reused PID, a stop line" "${dir}" pass "${a}"
+    expect_on_files "${step}: the harness from its shell (its own PID, a reused PID), a stop line" "${dir}" pass "${a}"
 
     dir="$(syn_case delete-format)"
     printf 'call\t1500.000000\tx\t%s\t%s\tdelete\n' "${SYN_SERVER}" "${SYN_SERVER_CMD}" >> "${dir}/agent-director-shim.log"
@@ -2598,10 +2631,10 @@ leg_count_helpers() {
 # expect_count_on <step> <dir> <want> <verb> [<fragment>...]: cscb_ad_count on
 # <dir>'s files prints <want>.
 expect_count_on() {
-    local step="$1" dir="$2" want="$3" got
+    local step="$1" dir="$2" expected="$3" count
     shift 3
-    got="$(on_files "${dir}" cscb_ad_count "$@")" || fail "${step}: cscb_ad_count $* failed"
-    [[ "${got}" == "${want}" ]] || fail "${step}: cscb_ad_count $(quoted "$@") printed ${got}, not ${want}"
+    count="$(on_files "${dir}" cscb_ad_count "$@")" || fail "${step}: cscb_ad_count $* failed"
+    [[ "${count}" == "${expected}" ]] || fail "${step}: cscb_ad_count $(quoted "$@") printed ${count}, not ${expected}"
 }
 
 leg_closing_enforcement() {
@@ -2618,7 +2651,7 @@ leg_closing_enforcement() {
     expect_nested_markers "${step}: a violating line after the assertions" \
         assert_no_server_tmux assert_no_cscb_include_finished assert_no_cscb_delete "violating line written"
     expect_nested_only_fail "${step}: a violating line after the assertions" "${name}" \
-        "after the closing assertions: assert_no_cscb_delete: 1 agent-director-shim.log line(s) run delete from a CSCB process (line 2)"
+        "after the closing assertions: assert_no_cscb_delete: 1 agent-director-shim.log line(s) run delete from a parent other than the scenario's own shell or a subshell of it (line 2)"
 
     name="test-0-fmk-nested-closing-elsewhere"
     run_nested "${name}" release nested_closing_elsewhere nested_stand_in
@@ -2651,9 +2684,9 @@ row_snapshot() {
 # holds <want>'s values (a JSON object) in <want>'s columns and its value
 # before the edit in every other column.
 expect_row_change() {
-    local step="$1" before="$2" after="$3" want="$4" bad
+    local step="$1" before="$2" after="$3" changes="$4" bad
     [[ -n "${before}" && -n "${after}" ]] || fail "${step}: no row before or after the edit"
-    bad="$(jq -rn --argjson b "${before}" --argjson a "${after}" --argjson w "${want}" '
+    bad="$(jq -rn --argjson b "${before}" --argjson a "${after}" --argjson w "${changes}" '
         ([$a | keys[] as $k | select(($w | has($k)) | not) | select($a[$k] != $b[$k]) | "\($k) \($b[$k] | tojson) -> \($a[$k] | tojson)"]
          + [$w | keys[] as $k | select($a[$k] != $w[$k]) | "\($k) is \($a[$k] | tojson), not \($w[$k] | tojson)"]
          + (if ($a | keys) == ($b | keys) then [] else ["the columns changed"] end))
@@ -2931,6 +2964,25 @@ leg_store_statements() {
     after="$(row_snapshot "${T4_FIN_ID}")"
     expect_row_change "${step}: ad_store_unusable_name" "${before}" "${after}" \
         "$(jq -nc --arg n "${T4_UNUSABLE_NAME}" '{tmux_session_name: $n}')"
+
+    # ad_store_backup's own refusals each write no copy; then one copy.
+    local outside existing="${SCENARIO_ROOT}/t0-backup-existing.db" quoted="${SCENARIO_ROOT}/t0-backup-it's.db"
+    local copy="${SCENARIO_ROOT}/t0-backup.db" out
+    outside="$(mktemp -d /tmp/test-0-backup-outside.XXXXXX)" || fail "${step}: could not make a directory outside SCENARIO_ROOT"
+    expect_fails_in_home "${step}" "${HOME}" "refused: ${outside}/copy.db is not under SCENARIO_ROOT" \
+        ad_store_backup "${outside}/copy.db"
+    rmdir -- "${outside}" || fail "${step}: the refused ad_store_backup wrote under ${outside}"
+    printf 'decoy\n' > "${existing}"
+    expect_fails_in_home "${step}" "${HOME}" "${existing} already exists" ad_store_backup "${existing}"
+    [[ "$(< "${existing}")" == decoy ]] || fail "${step}: the refused ad_store_backup overwrote ${existing}"
+    expect_fails_in_home "${step}" "${HOME}" "the path holds a ' or a control character" ad_store_backup "${quoted}"
+    [[ ! -e "${quoted}" && ! -L "${quoted}" ]] || fail "${step}: the refused ad_store_backup wrote ${quoted}"
+    ad_store_backup "${copy}"
+    [[ -f "${copy}" ]] || fail "${step}: ad_store_backup left no copy at ${copy}"
+    out="$(sqlite3 -batch -bail -readonly "${copy}" "PRAGMA integrity_check;" 2>&1)"
+    [[ "${out}" == ok ]] || fail "${step}: the copy's integrity check reads '${out//$'\n'/ }'"
+    out="$(sqlite3 -batch -bail -readonly "${copy}" "SELECT value FROM store_meta WHERE key = 'store_id';" 2>&1)"
+    [[ "${out}" == "$(ad_store_id)" ]] || fail "${step}: the copy's store id '${out//$'\n'/ }' is not the store's"
 }
 
 leg_operator_actions() {
@@ -2999,7 +3051,7 @@ leg_operator_actions() {
 }
 
 leg_find_missing_loop() {
-    local step="find-missing loop" lines_before cscb_before runs line n=0 prev_end="" start end lines=() mine=() pid
+    local step="find-missing loop" lines_before cscb_before runs line n=0 prev_end="" start end lines=() mine=() pid run_re
     cscb_before="$(cscb_ad_count find-missing)"
     lines_before="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
     run_find_missing_loop "${T4_FM_INTERVAL_S}"
@@ -3018,7 +3070,8 @@ leg_find_missing_loop() {
     (( runs >= 2 )) || fail "${step}: the loop's log holds ${runs} run(s)"
     while IFS= read -r line; do
         n=$(( n + 1 ))
-        [[ "${line}" =~ ^run\ ${n}$'\t'start\ ([0-9]+\.[0-9]+)$'\t'end\ ([0-9]+\.[0-9]+)$'\t'exit\ 0$ ]] \
+        run_re="^run ${n}"$'\t'"start ([0-9]+\.[0-9]+)"$'\t'"end ([0-9]+\.[0-9]+)"$'\t'"exit 0\$"
+        [[ "${line}" =~ ${run_re} ]] \
             || fail "${step}: the loop's log line '${line}' is not run ${n} with exit 0"
         start="${BASH_REMATCH[1]}"
         end="${BASH_REMATCH[2]}"
@@ -3047,12 +3100,12 @@ leg_find_missing_loop() {
 # given. Fails unless it exits 0 with exactly one outcome line on standard
 # output, `DRIVER: FORCED <call> …` (DRIVER_LINE), and every agent-director
 # call in the shim's log during it has the driver as its parent (the run's
-# recorded PID; its command line bun's, or unknown for a call the driver left
-# in flight as it exited), CSCB's count rising by exactly those, none a
-# delete.
+# recorded PID, with bun's command line: the driver stops what it started
+# before it exits, so no call is left in flight), CSCB's count rising by
+# exactly those, none a delete.
 # Sets DRIVER_LINE and DRIVER_VERBS.
 run_driver() {
-    local step="$1" call="$2" out err rc=0 before cscb_before outcome=() lines=() line pid parent unknown=0
+    local step="$1" call="$2" out err rc=0 before cscb_before outcome=() lines=() line pid parent
     shift 2
     out="${SCENARIO_ROOT}/fmk-driver-${call}.out"
     err="${SCENARIO_ROOT}/fmk-driver-${call}.err"
@@ -3079,21 +3132,17 @@ run_driver() {
     DRIVER_VERBS=()
     for line in "${lines[@]}"; do
         read_call "${step}" "${line}"
-        # The parent's command line is bun's, or unknown (`?`) for a call
-        # the driver left in flight when it exited, before the shim read it;
-        # its PID is the driver's either way.
         parent="${CALL_PARENT[0]:-?}"
-        if [[ "${CALL_PPID}" != "${pid}" || ( "${parent}" != */bun && "${parent}" != bun && "${parent}" != '?' ) ]]; then
+        if [[ "${CALL_PPID}" != "${pid}" || ( "${parent}" != */bun && "${parent}" != bun ) ]]; then
             echo "  | ${line}" >&2
             fail "${step}: a call during the driver's run has parent ${CALL_PPID} '${CALL_PARENT[*]:-?}', not the driver ${pid} (bun)"
         fi
-        [[ "${parent}" != '?' ]] || unknown=$(( unknown + 1 ))
         _L_WORDS=("${CALL_WORDS[@]}")
         _scenario_ad_verb
         DRIVER_VERBS+=("${_L_VERB}")
         [[ "${_L_VERB}" != delete ]] || fail "${step}: the driver's run made a delete"
     done
-    echo "${TEST_NAME}: ${step}: agent-director calls: ${DRIVER_VERBS[*]} (${unknown} left in flight at the driver's exit)"
+    echo "${TEST_NAME}: ${step}: agent-director calls: ${DRIVER_VERBS[*]}"
     [[ "$(cscb_ad_count "")" == "$(( cscb_before + ${#lines[@]} ))" ]] \
         || fail "${step}: CSCB's call count went from ${cscb_before} to $(cscb_ad_count ""), not up by the driver's ${#lines[@]}"
     [[ "$(cscb_ad_count delete)" == 0 ]] || fail "${step}: a CSCB process made a delete"

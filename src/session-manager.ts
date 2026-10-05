@@ -21747,7 +21747,7 @@ async function runForcedLaunch(
  * outcome (`ForcedLaunchOutcome`), with the `resume`'s own error when it
  * threw. Never throws.
  *
- *   [slack] forced-launch: ErrSpawnNotResumable <description> on the forced resume of <ref> — nothing is read, killed or launched; answering retrying, no spawn-failure notice, nothing counted; the retry timer <is armed|could not be armed> (cause=lost-race; b.jg5 SRJ-710)
+ *   [slack] forced-launch: ErrSpawnNotResumable <description> on the forced resume of <ref> — nothing is read, killed or launched; answering retrying, no spawn-failure notice, nothing counted; the retry timer <is armed|could not be armed> (cause=spawn-not-resumable-lost-race; b.jg5 SRJ-710)
  */
 export function _forceResumeForPersona(persona: Persona, config: PersonaConfig): Promise<ForcedLaunchOutcome> {
   const { key } = persona

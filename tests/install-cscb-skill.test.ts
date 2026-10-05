@@ -35,8 +35,8 @@
  * T2): no branch names an install, re-install or upgrade command or runs the
  * installer, and each points to the README switch-over runbook.
  *   - `ad-system-install-not-found` names the runbook section's publishing-host
- *     block by its heading (`PUBLISHING_HOST_BLOCK_HEADING`, through
- *     tests/test-helpers/runbooks.ts) and the section by its title, holds no
+ *     block by its heading (`PUBLISHING_HOST_BLOCK_HEADING`, from
+ *     src/ad-version-gate.ts) and the section by its title, holds no
  *     fenced block, and carries no upgrade form and no offer to run a command.
  *   - `ad-version-floor-unreadable` names the client-package check (the first
  *     clause of `CLIENT_PACKAGE_REMEDY`, src/install-check.ts) and the section
@@ -105,7 +105,7 @@ import { resolve } from 'node:path'
 import type { UnreachableReason } from 'agent-director'
 
 import { INSTALL_CHECK_NOTE_LABEL } from '../scripts/install-check.ts'
-import { PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
+import { PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE, PUBLISHING_HOST_BLOCK_HEADING } from '../src/ad-version-gate.ts'
 import { CLIENT_PACKAGE_REMEDY } from '../src/install-check.ts'
 import {
   AD_SYSTEM_INSTALL_NOT_FOUND,
@@ -116,7 +116,7 @@ import {
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { UNREACHABLE_REASONS } from './test-helpers/install-check-fixtures.ts'
 import { classHeading, flat, headings, requiredSection, splitFences } from './test-helpers/markdown.ts'
-import { PUBLISHING_HOST_BLOCK_HEADING, ROLLBACK_RUNBOOK_SECTION_TITLE, stepHeadingPrefix, stepNumberOf } from './test-helpers/runbooks.ts'
+import { ROLLBACK_RUNBOOK_SECTION_TITLE, stepHeadingPrefix, stepNumberOf } from './test-helpers/runbooks.ts'
 import { type ForbiddenForm, UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 
 const SKILLS_DIR = resolve(import.meta.dirname, '..', 'skills')

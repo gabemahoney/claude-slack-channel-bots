@@ -96,7 +96,7 @@ import {
   PUBLISHING_HOST_BLOCK_POINTER,
   RUNBOOK_SECTION_POINTER,
 } from '../src/install-check.ts'
-import { PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE, RUNTIME_RECHECK_PHRASE } from '../src/ad-version-gate.ts'
+import { PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE, PUBLISHING_HOST_BLOCK_HEADING, RUNTIME_RECHECK_PHRASE } from '../src/ad-version-gate.ts'
 import { renderInstallSkillInstructions } from '../src/install-skill-pointer.ts'
 import { recordStartupError } from '../src/startup-errors.ts'
 import {
@@ -120,7 +120,6 @@ import {
 } from './test-helpers/agent-director-versions.ts'
 import { STALE_VERSION, UNREACHABLE_REASONS } from './test-helpers/install-check-fixtures.ts'
 import { flat } from './test-helpers/markdown.ts'
-import { PUBLISHING_HOST_BLOCK_HEADING } from './test-helpers/runbooks.ts'
 import { INSTALL_OR_REMOVAL_FORMS, UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 
 // ---------------------------------------------------------------------------

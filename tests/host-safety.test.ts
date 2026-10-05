@@ -44,17 +44,31 @@
  *   `tests/integration/test-*.sh` that does not source it (found from the
  *   directory) check `/etc/cscb-ci-image` before their first other step; each
  *   script that sources scenario.sh runs nothing before its source line;
- *   `fmk-driver.ts` and `stub-mcp-session.ts` (a listed pair) each check the
- *   marker first and statically import only `node:` built-ins, type-only
- *   imports included; and scenario.sh's `install_ad_shim`, `ad_store_edit`,
- *   `ad_store_id`, `stub_mode` and `ad_store_pending_no_launch` call
- *   `require_scenario_home` before their first
- *   sqlite3, copy, move or install step, a call of a scenario.sh function
- *   that makes one (such as `_scenario_place`) counting as one. Shell is read
- *   with comments, heredoc bodies and quoted text blanked; the shebang,
- *   comments, blank lines, `set` options and literal assignments are not
- *   steps. Each rule is pinned with synthetic violations (each finding names
- *   its file and rule) and allowed sources, then run over the tree.
+ *   `fmk-driver.ts`, `stub-mcp-session.ts` and `switch-over.ts` (a listed
+ *   set) each check the marker first and statically import only `node:`
+ *   built-ins, type-only imports included; and every scenario.sh function
+ *   with a step (sqlite3, a copy, move or install, an install.sh run, or a
+ *   run of agent-director by its path or a variable holding one; a call of a
+ *   scenario.sh function with a step counting as one), found from the file,
+ *   calls `require_scenario_home` before its first, less two commented
+ *   lists: `HOME_CHECK_EXEMPT` (primitives, setup and shared-mode helpers)
+ *   and `HOME_CHECKED_BY_CALLERS` (private helpers that every place
+ *   scenario.sh names runs after an audited helper's check, and no script
+ *   names). Shell is read with comments, heredoc bodies and quoted text
+ *   blanked; the shebang, comments, blank lines, `set` options and literal
+ *   assignments are not steps. Each rule is pinned with synthetic violations
+ *   (each finding names its file and rule) and allowed sources, then run over
+ *   the tree.
+ * - The harness's one agent-director delete (b.jg5 SRJ-1306), over every
+ *   file under `tests/integration` (shell or TypeScript, shellcheck's and
+ *   bun's config aside): in shell, any command whose first argument after
+ *   agent-director's global flags is `delete`, whatever its name but
+ *   scenario.sh's two shim-log readers (which run no agent-director); in
+ *   TypeScript, a `client-delete`
+ *   call (tests/fmk-source-audit.test.ts's receiver rule) or a `'delete'`
+ *   string. The only one is scenario.sh's `ad_delete_unusable_row`, which
+ *   runs agent-director-admin's `delete` (0.11.0 moved it there) through
+ *   `ad_admin_capture`.
  * - Preload check: the shared `preloadCheckFailures` (the one the preload
  *   guard runs), each failure label (`PRELOAD_CHECK`) pinned with a row.
  * - Preload redirect: the shared, side-effect-free `preloadRedirectedEnv`
@@ -1649,13 +1663,15 @@ const RUNNER_PATH = join(TESTS_DIR, 'runner.sh')
 const SCENARIO_PATH = join(INTEGRATION_DIR, 'lib', 'scenario.sh')
 const FMK_DRIVER_PATH = join(INTEGRATION_DIR, 'fixtures', 'fmk-driver.ts')
 const STUB_MCP_SESSION_PATH = join(INTEGRATION_DIR, 'fixtures', 'stub-mcp-session.ts')
+const SWITCH_OVER_PATH = join(INTEGRATION_DIR, 'fixtures', 'switch-over.ts')
 
 /**
  * The TypeScript fixtures run as a whole file in the image, each refusing
  * without the marker as its first statement and importing only `node:`
- * built-ins statically: the forced-call driver and the stub's MCP session.
+ * built-ins statically: the forced-call driver, the stub's MCP session and
+ * the switch-over fixture.
  */
-const IMAGE_GUARDED_TS_PATHS: readonly string[] = [FMK_DRIVER_PATH, STUB_MCP_SESSION_PATH]
+const IMAGE_GUARDED_TS_PATHS: readonly string[] = [FMK_DRIVER_PATH, STUB_MCP_SESSION_PATH, SWITCH_OVER_PATH]
 
 /** The file only the cscb-ci images carry (docker/Dockerfile.test.base). */
 const CI_IMAGE_MARKER = '/etc/cscb-ci-image'
@@ -1666,46 +1682,45 @@ const IMAGE_GUARD_RULE = {
   markerFirst: 'marker-check-first',
   /** A script that sources scenario.sh runs nothing before its source line. */
   sourceFirst: 'source-line-first',
-  /** The HOME-under-SCENARIO_ROOT check comes before the helper's first sqlite3, copy, move or install step. */
+  /** The HOME-under-SCENARIO_ROOT check comes before the helper's first step (sqlite3, copy, move, install, install.sh or agent-director run). */
   homeCheckFirst: 'home-check-before-step',
-  /** fmk-driver.ts and stub-mcp-session.ts statically import only `node:` built-ins. */
+  /** The image-guarded TypeScript fixtures statically import only `node:` built-ins. */
   driverStaticImport: 'driver-static-import',
 } as const
 
-/** The scenario.sh helpers whose HOME check must come before their first sqlite3, copy, move or install step. */
-const HOME_GUARDED_HELPERS: readonly string[] = ['install_ad_shim', 'ad_store_edit', 'ad_store_id']
-
-/** agent-director-admin's shim install, held to the same rule as `install_ad_shim`: a copy delegated to `_scenario_place`. */
-const HOME_GUARDED_ADMIN_HELPERS: readonly string[] = ['install_ad_admin_shim']
-
-/** The stub-worker and store helpers held to the same rule: the stub mode selector (a move) and the no-launch-start statement (a store edit). */
-const HOME_GUARDED_STUB_HELPERS: readonly string[] = ['stub_mode', 'ad_store_pending_no_launch']
+/**
+ * The scenario.sh functions with a step that need not run the HOME check,
+ * each with why: primitives and setup that touch only SCENARIO_ROOT, and the
+ * shared-mode helpers (shared mode has no scenario HOME to check). Every other
+ * function of scenario.sh with a step (its own, or a call of a function with
+ * one) must run `require_scenario_home` before its first, or be listed in
+ * HOME_CHECKED_BY_CALLERS. A call of a listed function still counts as a step
+ * in its caller.
+ */
+const HOME_CHECK_EXEMPT: ReadonlyMap<string, string> = new Map([
+  ['_scenario_place', 'the copy-and-rename primitive: it refuses outside the image and for a destination outside SCENARIO_ROOT, and each audited caller counts its call as a step'],
+  ['write_file', 'the scripts’ file writer in both modes: it writes only the path its caller names, and each audited caller counts its call as a step'],
+  ['write_config', 'shared mode’s config.json writer: it writes only SLACK_STATE_DIR’s config.json, and new_state_dir makes each state dir under SCENARIO_ROOT'],
+  ['hold_not_applied', 'shared mode’s reload hold: its one copy snapshots config.json.last-applied from SLACK_STATE_DIR into SCENARIO_ROOT'],
+  ['tmux_shim_mode', '_scenario_fmk_setup runs it before the scenario HOME is exported; it writes only the tmux shim’s mode file under SCENARIO_ROOT'],
+  ['_scenario_tmux_shim_reset', 'the EXIT trap’s reset of the tmux shim’s mode file under SCENARIO_ROOT; it never fails, so the trap’s stops still run'],
+  ['_scenario_cleanup', 'the EXIT trap: its only step is _scenario_tmux_shim_reset, and a refusal would skip the stops after it'],
+  ['_scenario_fmk_setup', 'the setup that makes and exports the scenario HOME: before the export it only places files under SCENARIO_ROOT (_scenario_place, tmux_shim_mode); the installs after it are audited helpers'],
+])
 
 /**
- * The label, seeding, tmux-step, store-statement and 0.10.0-seeder helpers
- * held to the same rule: each reads or edits the store (directly or through
- * another helper), or moves a tmux socket. The steps that only run tmux or
- * the harness's agent-director call have no such step for the audit to see.
+ * The scenario.sh functions with a step that run only from audited helpers
+ * after their `require_scenario_home` (callerCheckFindings checks it: every
+ * place scenario.sh names one, and no script does), each with its callers.
  */
-const HOME_GUARDED_SEEDING_HELPERS: readonly string[] = [
-  'ad_new_token',
-  'ad_other_store_id',
-  'ad_owner_label',
-  'seed_leftover',
-  'seed_unlabelled',
-  'seed_env_only',
-  'seed_borrowed_name',
-  'seed_other_store',
-  'relabel_session',
-  'ad_owner_global_set',
-  'rebind_tmux_socket',
-  'ad_store_mark_finished',
-  'ad_store_seed_pending',
-  'ad_store_unusable_name',
-  'ad_delete_unusable_row',
-  'seed_010_row',
-  'seed_prepersona_fleet',
-]
+const HOME_CHECKED_BY_CALLERS: ReadonlyMap<string, string> = new Map([
+  ['_scenario_row_json', 'the store-row read of the store-statement helpers (ad_store_mark_finished, ad_store_seed_pending, ad_store_unusable_name, ad_store_pending_no_launch)'],
+  ['_scenario_row_left_pending', 'seed_010_row’s wait_until predicate'],
+  ['_scenario_seed', 'the one body of the seed_* helpers'],
+  ['_scenario_require_010', 'the 0.10.0 seeders’ precondition (seed_010_row, seed_prepersona_fleet)'],
+  ['_scenario_find_missing_loop', 'run_find_missing_loop’s background loop body'],
+  ['_scenario_shim_over', 'the shim placement of install_ad_shim and install_ad_admin_shim'],
+])
 
 /** scenario.sh's guard that refuses unless HOME is under SCENARIO_ROOT. */
 const HOME_GUARD = 'require_scenario_home'
@@ -1715,6 +1730,9 @@ const STORE_OR_FILE_STEPS: readonly string[] = ['sqlite3', 'cp', 'mv', 'install'
 
 /** A command word that runs an install script (by its path or the variable holding it). */
 const INSTALL_SCRIPT_WORD = /install\.sh$|_INSTALL_SH\}?$/
+
+/** A path to agent-director's binary, agent-director-admin or the shim over either (`${HOME}/.agent-director/bin/agent-director`, `….real`, `${HOME}/.agent-director/admin/agent-director-admin`, an image copy). */
+const AGENT_DIRECTOR_PATH = /(?:^|\/)agent-director(?:-admin)?(?:\.real)?$/
 
 /** Reserved words that may stand before a command name; they open or close no step themselves. */
 const SHELL_RESERVED: ReadonlySet<string> = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', 'esac', '!', '{', '}', 'time'])
@@ -1739,6 +1757,8 @@ interface ShellCommand {
   name: string
   /** The words after it, quotes removed. */
   args: string[]
+  /** The `NAME=value` words before it (an `env` prefix's included), quotes removed. */
+  assignments: string[]
   /** The reserved words before it (`if`, `then`, `{` …). */
   keywords: string[]
   /** What comes before it: '' (start of a logical line), `;`, `&&`, `||`, `|`, `&`, `(`, `)` or `$(` (inside a substitution). */
@@ -1947,31 +1967,46 @@ function shellCommandsIn(code: string, raw: string, start: number, end: number, 
   flush('')
 }
 
-/** A simple command from its words: reserved words, assignments and `command` / `env` / `timeout` prefixes set aside. */
+/**
+ * A simple command from its words: reserved words, assignments and the
+ * `command` / `exec` / `nohup` / `builtin` / `env` / `timeout` prefixes (with
+ * their options) set aside.
+ */
 function shellCommand(words: readonly { raw: string; start: number }[], after: string, lineAt: (offset: number) => number): ShellCommand {
   const unquoted = words.map((w) => w.raw.replace(/["']/g, ''))
   const keywords: string[] = []
+  const assignments: string[] = []
+  /** The index after the options at `from` (`-x`, and the value of each option in `withValue`). */
+  const pastOptions = (from: number, withValue: readonly string[]): number => {
+    let at = from
+    while (at < unquoted.length && unquoted[at].startsWith('-')) at += withValue.includes(unquoted[at]) ? 2 : 1
+    return at
+  }
   let k = 0
   while (k < unquoted.length) {
     const w = unquoted[k]
     if (SHELL_RESERVED.has(w)) keywords.push(w)
-    else if (!SHELL_ASSIGNMENT.test(words[k].raw) && !SHELL_PREFIXES.has(w)) {
-      if (w === 'env') {
-        k++
-        while (k < unquoted.length && (unquoted[k].startsWith('-') || SHELL_ASSIGNMENT.test(unquoted[k]))) k += unquoted[k] === '-u' ? 2 : 1
-        continue
+    else if (SHELL_ASSIGNMENT.test(words[k].raw)) assignments.push(w)
+    else if (SHELL_PREFIXES.has(w)) {
+      // `command -v` / `-V` only looks the name up: the command is `command` itself.
+      if (w === 'command' && /^-[pvV]*[vV]/.test(unquoted[k + 1] ?? '')) break
+      k = pastOptions(k + 1, ['-a'])
+      continue
+    } else if (w === 'env') {
+      k++
+      while (k < unquoted.length && (unquoted[k].startsWith('-') || SHELL_ASSIGNMENT.test(unquoted[k]))) {
+        if (SHELL_ASSIGNMENT.test(unquoted[k])) assignments.push(unquoted[k])
+        k += unquoted[k] === '-u' ? 2 : 1
       }
-      if (w === 'timeout') {
-        k++
-        while (k < unquoted.length && unquoted[k].startsWith('-')) k++
-        k++
-        continue
-      }
-      break
-    }
+      continue
+    } else if (w === 'timeout') {
+      // The options, then the duration.
+      k = pastOptions(k + 1, ['-s', '--signal', '-k', '--kill-after']) + 1
+      continue
+    } else break
     k++
   }
-  return { name: unquoted[k] ?? '', args: unquoted.slice(k + 1), keywords, after, line: lineAt(words[0].start) }
+  return { name: unquoted[k] ?? '', args: unquoted.slice(k + 1), assignments, keywords, after, line: lineAt(words[0].start) }
 }
 
 /** `source` read as logical lines, each with its commands. */
@@ -2069,8 +2104,8 @@ function shellEntryFindings(file: string, source: string): string[] {
   return [`${file}:${first.line}: ${IMAGE_GUARD_RULE.markerFirst}: the first step is not the ${CI_IMAGE_MARKER} check that exits non-zero: ${shown(first)}`]
 }
 
-/** The commands of each `name() {` … `}` function of `source` (braces in column 0), by name. */
-function shellFunctions(source: string): Map<string, ShellCommand[]> {
+/** The commands of each `name() {` … `}` function of `source` (braces in column 0), by name; the commands outside them go to `outside`. */
+function shellFunctions(source: string, outside: ShellCommand[] = []): Map<string, ShellCommand[]> {
   const functions = new Map<string, ShellCommand[]>()
   let current: ShellCommand[] | undefined
   for (const line of shellLogicalLines(source)) {
@@ -2079,37 +2114,83 @@ function shellFunctions(source: string): Map<string, ShellCommand[]> {
       current = []
       functions.set(opening[1], current)
     } else if (current !== undefined && /^\}\s*$/.test(line.text)) current = undefined
-    else if (current !== undefined) current.push(...line.commands)
+    else (current ?? outside).push(...line.commands)
   }
   return functions
 }
 
-/** Whether `name` is itself a sqlite3, copy, move or install step. */
-function isStoreOrFileStep(name: string): boolean {
-  return STORE_OR_FILE_STEPS.includes(basename(name)) || INSTALL_SCRIPT_WORD.test(name)
-}
+/** Builtins whose arguments may be assignments (`local real="${HOME}/…"`). */
+const SHELL_DECLARATIONS: ReadonlySet<string> = new Set(['local', 'declare', 'typeset', 'export', 'readonly'])
 
 /**
- * The HOME-check findings for `helpers` in the shell file `file`: each must
- * call `require_scenario_home` unconditionally (at the top of its body, not
- * after `&&`, `||` or `|`, nor in a subshell or substitution) before its first
- * sqlite3, copy, move or install step. A call of a function of the same file
- * that makes such a step, directly or through another, counts as one (so a
- * copy delegated to `_scenario_place` is still a step). A helper with no step
- * the audit can see is a finding too.
+ * The variables `commands` assign an agent-director path to, anywhere
+ * (`local real="${HOME}/.agent-director/bin/agent-director.real"`,
+ * `SCENARIO_AD_BIN="${HOME}/…"`, `SCENARIO_RELEASE_BIN=/opt/…/agent-director`).
  */
-function helperHomeCheckFindings(file: string, source: string, helpers: readonly string[] = HOME_GUARDED_HELPERS): string[] {
+function agentDirectorPathVariables(commands: readonly ShellCommand[]): Set<string> {
+  const names = new Set<string>()
+  for (const c of commands) {
+    for (const word of [...c.assignments, ...(SHELL_DECLARATIONS.has(c.name) ? c.args : [])]) {
+      const m = /^([A-Za-z_][A-Za-z0-9_]*)\+?=(.*)$/.exec(word)
+      if (m !== null && AGENT_DIRECTOR_PATH.test(m[2])) names.add(m[1])
+    }
+  }
+  return names
+}
+
+/** Whether the command word `name` runs agent-director: by its path, or by a variable in `variables` (`"${real}"`, `"${SCENARIO_AD_BIN}"`). */
+function runsAgentDirector(name: string, variables: ReadonlySet<string>): boolean {
+  const variable = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?(?:\.real)?$/.exec(name)
+  return AGENT_DIRECTOR_PATH.test(name) || (variable !== null && variables.has(variable[1]))
+}
+
+/** The functions of a shell file and which of its commands and functions are steps. */
+interface ShellStepModel {
+  functions: Map<string, ShellCommand[]>
+  /** Whether a command is a step itself: sqlite3, a copy, move or install, an install.sh run or an agent-director run. */
+  isOwnStep: (command: ShellCommand) => boolean
+  /** The functions that make a step: their own, or through a call of another such function. */
+  stepFunctions: Set<string>
+}
+
+/** `source`'s step model (see ShellStepModel). */
+function shellStepModel(source: string): ShellStepModel {
   const functions = shellFunctions(source)
+  const variables = agentDirectorPathVariables(shellLogicalLines(source).flatMap((line) => line.commands))
+  const isOwnStep = (c: ShellCommand): boolean => STORE_OR_FILE_STEPS.includes(basename(c.name)) || INSTALL_SCRIPT_WORD.test(c.name) || runsAgentDirector(c.name, variables)
   const stepFunctions = new Set<string>()
   for (let grew = true; grew;) {
     grew = false
     for (const [name, body] of functions) {
-      if (!stepFunctions.has(name) && body.some((c) => isStoreOrFileStep(c.name) || stepFunctions.has(c.name))) {
+      if (!stepFunctions.has(name) && body.some((c) => isOwnStep(c) || stepFunctions.has(c.name))) {
         stepFunctions.add(name)
         grew = true
       }
     }
   }
+  return { functions, isOwnStep, stepFunctions }
+}
+
+/** The functions of `source` the HOME-check audit holds: every one with a step, less HOME_CHECK_EXEMPT and HOME_CHECKED_BY_CALLERS. */
+function homeCheckedHelpers(source: string): string[] {
+  return [...shellStepModel(source).stepFunctions].filter((name) => !HOME_CHECK_EXEMPT.has(name) && !HOME_CHECKED_BY_CALLERS.has(name)).sort()
+}
+
+/**
+ * The HOME-check findings for `helpers` (by default homeCheckedHelpers:
+ * every function of `source` with a step, less the two lists) in the shell
+ * file `file`:
+ * each must call `require_scenario_home` unconditionally (at the top of its
+ * body, not after `&&`, `||` or `|`, nor in a subshell or substitution)
+ * before its first step: sqlite3, a copy, move or install, an install.sh run,
+ * or a run of agent-director by its path or a variable holding one. A call of
+ * a function of the same file that makes such a step, directly or through
+ * another, counts as one (so a copy delegated to `_scenario_place` is still a
+ * step). A named helper that is not defined, or has no step the audit can
+ * see, is a finding too.
+ */
+function helperHomeCheckFindings(file: string, source: string, helpers: readonly string[] = homeCheckedHelpers(source)): string[] {
+  const { functions, isOwnStep, stepFunctions } = shellStepModel(source)
   const findings: string[] = []
   const rule = IMAGE_GUARD_RULE.homeCheckFirst
   for (const helper of helpers) {
@@ -2118,20 +2199,68 @@ function helperHomeCheckFindings(file: string, source: string, helpers: readonly
       findings.push(`${file}:1: ${rule}: ${helper} is not defined`)
       continue
     }
-    const firstStep = body.findIndex((c) => isStoreOrFileStep(c.name) || stepFunctions.has(c.name))
+    const firstStep = body.findIndex((c) => isOwnStep(c) || stepFunctions.has(c.name))
     if (firstStep < 0) {
-      findings.push(`${file}:1: ${rule}: ${helper} has no sqlite3, copy, move or install step the audit can see`)
+      findings.push(`${file}:1: ${rule}: ${helper} has no step the audit can see`)
       continue
     }
-    let depth = 0
-    let guard = -1
-    body.forEach((c, k) => {
-      if (guard < 0 && depth === 0 && c.name === HOME_GUARD && c.keywords.length === 0 && (c.after === '' || c.after === ';')) guard = k
-      depth += shellDepthChange(c)
-    })
+    const guard = homeGuardIndex(body)
     if (guard < 0 || guard > firstStep) {
       const step = body[firstStep]
       findings.push(`${file}:${step.line}: ${rule}: ${helper}: \`${step.name}\` runs before ${guard < 0 ? `any unconditional ${HOME_GUARD}` : HOME_GUARD}`)
+    }
+  }
+  return findings
+}
+
+/** The index in `body` of its first unconditional `require_scenario_home` (top level, not after `&&`, `||` or `|`, nor in a subshell or substitution); -1 when none. */
+function homeGuardIndex(body: readonly ShellCommand[]): number {
+  let depth = 0
+  for (let k = 0; k < body.length; k++) {
+    const c = body[k]
+    if (depth === 0 && c.name === HOME_GUARD && c.keywords.length === 0 && (c.after === '' || c.after === ';')) return k
+    depth += shellDepthChange(c)
+  }
+  return -1
+}
+
+/** Whether `command` names the function `name`: as the command, or as an argument word (`wait_until 10 x _scenario_row_left_pending …`). */
+function namesFunction(command: ShellCommand, name: string): boolean {
+  return command.name === name || command.args.includes(name)
+}
+
+/**
+ * The findings for HOME_CHECKED_BY_CALLERS (or `listed`) in the shell file
+ * `file` (scenario.sh) and the `scripts` that source it: each listed name is
+ * a function of `source` with a step; every command of `source` that names it
+ * is in an audited helper (a function with a step, not listed here nor in
+ * HOME_CHECK_EXEMPT) after that helper's unconditional `require_scenario_home`,
+ * or in another listed function; and no command outside a function, nor any
+ * script, names it.
+ */
+function callerCheckFindings(file: string, source: string, scripts: readonly { file: string; source: string }[], listed: ReadonlyMap<string, string> = HOME_CHECKED_BY_CALLERS): string[] {
+  const { functions, stepFunctions } = shellStepModel(source)
+  const rule = IMAGE_GUARD_RULE.homeCheckFirst
+  const findings: string[] = []
+  const outside: ShellCommand[] = []
+  shellFunctions(source, outside)
+  for (const name of listed.keys()) {
+    if (!stepFunctions.has(name)) {
+      findings.push(`${file}:1: ${rule}: ${name} is listed as checked by its callers but is ${functions.has(name) ? 'a function with no step' : 'not defined'}`)
+      continue
+    }
+    for (const [caller, body] of functions) {
+      if (listed.has(caller)) continue
+      const guard = HOME_CHECK_EXEMPT.has(caller) ? -1 : homeGuardIndex(body)
+      body.forEach((c, k) => {
+        if (namesFunction(c, name) && (guard < 0 || guard > k)) findings.push(`${file}:${c.line}: ${rule}: ${caller} runs ${name} before ${guard < 0 ? `any unconditional ${HOME_GUARD}` : HOME_GUARD}`)
+      })
+    }
+    for (const c of outside) if (namesFunction(c, name)) findings.push(`${file}:${c.line}: ${rule}: ${name} runs outside any helper`)
+    for (const script of scripts) {
+      for (const c of shellLogicalLines(script.source).flatMap((line) => line.commands)) {
+        if (namesFunction(c, name)) findings.push(`${script.file}:${c.line}: ${rule}: ${name} runs from a script, not from a helper after its ${HOME_GUARD}`)
+      }
     }
   }
   return findings
@@ -2201,8 +2330,8 @@ function expectNamedFindings(findings: readonly string[], file: string, rule: st
 
 describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first (b.jg5 SRJ-1306)', () => {
   // What is not a step. Shell: the shebang, comments, blank lines, `set`
-  // options and literal assignments. fmk-driver.ts: static imports of
-  // `node:` built-ins; a static import of any other module is a step, since
+  // options and literal assignments. The TypeScript fixtures: static imports
+  // of `node:` built-ins; a static import of any other module is a step, since
   // it is evaluated before the check. These files are read, never run.
 
   const MARKER_CHECK = lines(
@@ -2267,7 +2396,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
     })
   })
 
-  describe('the HOME-under-SCENARIO_ROOT check comes before the first sqlite3, copy, move or install step', () => {
+  describe('the HOME-under-SCENARIO_ROOT check comes before each scenario.sh helper’s first step', () => {
     const PRELUDE = lines(
       'fail() {',
       '    echo "FAIL: $1" >&2',
@@ -2284,6 +2413,11 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       '    cp -- "$1" "$2.tmp" || fail "$3: could not copy"',
       '    mv -f -- "$2.tmp" "$2" || fail "$3: could not rename"',
       '}',
+      'write_file() {',
+      '    cat > "$1.tmp" || fail "write_file: could not write $1"',
+      '    mv -f "$1.tmp" "$1" || fail "write_file: could not rename into $1"',
+      '}',
+      'SCENARIO_AD_BIN="${HOME}/.agent-director/bin/agent-director"',
     )
     const GUARDS = lines('    require_ci_image "${step}"', `    ${HOME_GUARD} "\${step}"`)
     const BODIES: Readonly<Record<string, string>> = {
@@ -2306,37 +2440,71 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
         '    out="$(sqlite3 -batch -readonly "${HOME}/.agent-director/state.db" \\',
         `        "SELECT value FROM store_meta WHERE key = 'store_id';" 2>&1)" || fail "ad_store_id: \${out}"`,
       ),
+      ad_store_backup: lines(
+        '    local dest="${1:-}" step out',
+        '    step="ad_store_backup ${dest}"',
+        GUARDS,
+        `    out="$(sqlite3 -batch -bail -readonly "\${HOME}/.agent-director/state.db" ".backup '\${dest}'" 2>&1)" \\`,
+        '        || fail "${step}: sqlite3 .backup failed: ${out}"',
+      ),
     }
-    /** A scenario.sh-shaped source: the guards and `_scenario_place`, then the three helpers with `bodies` replacing theirs (undefined leaves one out). */
-    function helperSource(bodies: Readonly<Record<string, string | undefined>> = {}): string {
-      const helpers = HOME_GUARDED_HELPERS.flatMap((name) => {
+    const SYNTHETIC_HELPERS = Object.keys(BODIES)
+    /** `name() {` `body` `}`. */
+    const fn = (name: string, ...body: string[]): string => lines(`${name}() {`, ...body, '}')
+    /**
+     * A scenario.sh-shaped source: the guards, `_scenario_place`, `write_file`
+     * and SCENARIO_AD_BIN, the four helpers with `bodies` replacing theirs
+     * (undefined leaves one out), then `extra`.
+     */
+    function helperSource(bodies: Readonly<Record<string, string | undefined>> = {}, ...extra: string[]): string {
+      const helpers = SYNTHETIC_HELPERS.flatMap((name) => {
         const body = name in bodies ? bodies[name] : BODIES[name]
-        return body === undefined ? [] : [`${name}() {`, body, '}']
+        return body === undefined ? [] : [fn(name, body)]
       })
-      return lines(PRELUDE, ...helpers)
+      return lines(PRELUDE, ...helpers, ...extra)
     }
 
-    const flagged: [label: string, bodies: Record<string, string | undefined>][] = [
-      ['install_ad_shim: a copy before its HOME check', { install_ad_shim: lines('    cp -- "${HOME}/.agent-director/bin/agent-director" /tmp/ad.bak', GUARDS, BODIES.install_ad_shim) }],
-      ['install_ad_shim: a move before its HOME check', { install_ad_shim: lines('    require_ci_image x', '    mv -f -- "${HOME}/.agent-director/bin/agent-director" /tmp/ad', `    ${HOME_GUARD} x`) }],
-      ['install_ad_shim: the copy delegated to _scenario_place before its HOME check', { install_ad_shim: lines('    require_ci_image x', '    _scenario_place "${SCENARIO_AD_SHIM_SRC}" "${HOME}/.agent-director/bin/agent-director" x', `    ${HOME_GUARD} x`) }],
-      ['install_ad_shim: an install.sh run before its HOME check', { install_ad_shim: lines('    (cd "${HOME}" && "${SCENARIO_RELEASE_INSTALL_SH}" --binary /opt/ad --no-hooks) < /dev/null', GUARDS) }],
+    // Each row's source is audited as a whole: every function with a step,
+    // less HOME_CHECK_EXEMPT and HOME_CHECKED_BY_CALLERS, is held to the rule.
+    const flagged: [label: string, source: string][] = [
+      ['install_ad_shim: a copy before its HOME check', helperSource({ install_ad_shim: lines('    cp -- "${HOME}/.agent-director/bin/agent-director" /tmp/ad.bak', GUARDS, BODIES.install_ad_shim) })],
+      ['install_ad_shim: a move before its HOME check', helperSource({ install_ad_shim: lines('    require_ci_image x', '    mv -f -- "${HOME}/.agent-director/bin/agent-director" /tmp/ad', `    ${HOME_GUARD} x`) })],
+      ['install_ad_shim: the copy delegated to _scenario_place before its HOME check', helperSource({ install_ad_shim: lines('    require_ci_image x', '    _scenario_place "${SCENARIO_AD_SHIM_SRC}" "${HOME}/.agent-director/bin/agent-director" x', `    ${HOME_GUARD} x`) })],
+      ['install_ad_shim: an install.sh run before its HOME check', helperSource({ install_ad_shim: lines('    (cd "${HOME}" && "${SCENARIO_RELEASE_INSTALL_SH}" --binary /opt/ad --no-hooks) < /dev/null', GUARDS) })],
+      ['ad_store_edit: sqlite3 in a command substitution before its HOME check', helperSource({ ad_store_edit: lines('    require_ci_image x', '    local out="$(sqlite3 "${HOME}/.agent-director/state.db" "$1;")"', `    ${HOME_GUARD} x`) })],
+      ['ad_store_edit: the HOME check only after an ||', helperSource({ ad_store_edit: lines('    [[ -f "${HOME}/.agent-director/state.db" ]] || ' + `${HOME_GUARD} x`, '    sqlite3 "${HOME}/.agent-director/state.db" "$1;"') })],
+      ['ad_store_edit: the HOME check only in a subshell', helperSource({ ad_store_edit: lines(`    ( ${HOME_GUARD} x )`, '    sqlite3 "${HOME}/.agent-director/state.db" "$1;"') })],
+      ['ad_store_id: the HOME check only inside an if', helperSource({ ad_store_id: lines('    if [[ -n "${STRICT:-}" ]]; then', `        ${HOME_GUARD} x`, '    fi', '    sqlite3 -readonly "${HOME}/.agent-director/state.db" "SELECT 1;"') })],
+      ['ad_store_id: no HOME check at all', helperSource({ ad_store_id: lines('    require_ci_image x', '    sqlite3 -readonly "${HOME}/.agent-director/state.db" "SELECT 1;"') })],
+      ['ad_store_backup: the .backup before its HOME check', helperSource({ ad_store_backup: lines('    require_ci_image x', `    sqlite3 -readonly "\${HOME}/.agent-director/state.db" ".backup '$1'"`, `    ${HOME_GUARD} x`) })],
+      ['ad_store_backup: only the image check', helperSource({ ad_store_backup: lines('    require_ci_image x', `    sqlite3 -readonly "\${HOME}/.agent-director/state.db" ".backup '$1'"`) })],
+      ['a new helper with a copy and no HOME check', helperSource({}, fn('stash_store', '    require_ci_image x', '    cp -- "${HOME}/.agent-director/state.db" "${SCENARIO_ROOT}/s.db"'))],
+      ['a new helper running agent-director by its HOME path before the check', helperSource({}, fn('ad_version', '    "${HOME}/.agent-director/bin/agent-director" version', `    ${HOME_GUARD} x`))],
+      ['a new helper running the binary behind the shim through a local holding its path', helperSource({}, fn('ad_real_version', '    local real="${HOME}/.agent-director/bin/agent-director.real" out', '    out="$("${real}" version)"'))],
+      ['a new helper running the shim by SCENARIO_AD_BIN', helperSource({}, fn('ad_list', '    "${SCENARIO_AD_BIN}" list'))],
+      ['a new helper running agent-director through exec -a', helperSource({}, fn('ad_exec', '    exec -a agent-director "${HOME}/.agent-director/bin/agent-director" list'))],
+      ['a new helper running agent-director under timeout with a signal option', helperSource({}, fn('ad_bounded', '    timeout -s KILL 5 "${SCENARIO_AD_BIN}" list'))],
+      ['a new helper running install.sh', helperSource({}, fn('reinstall_ad', '    "${SCENARIO_RELEASE_INSTALL_SH}" --binary /opt/ad --no-hooks'))],
+      ['a new helper whose only step is a call of an exempt primitive (write_file)', helperSource({}, fn('write_ad_config', '    write_file "${HOME}/.agent-director/config.toml" <<< "x"'))],
+      ['a new helper whose only step is a call of another helper', helperSource({}, fn('store_id_twice', '    ad_store_id', '    ad_store_id'))],
+    ]
+
+    test.each(flagged)('flags %s, naming the file and the rule', (_label, source) => {
+      expectNamedFindings(helperHomeCheckFindings('scenario.sh', source), 'scenario.sh', RULE.homeCheckFirst)
+    })
+
+    const flaggedNamed: [label: string, bodies: Record<string, string | undefined>][] = [
       ['install_ad_shim: left out', { install_ad_shim: undefined }],
-      ['ad_store_edit: sqlite3 in a command substitution before its HOME check', { ad_store_edit: lines('    require_ci_image x', '    local out="$(sqlite3 "${HOME}/.agent-director/state.db" "$1;")"', `    ${HOME_GUARD} x`) }],
-      ['ad_store_edit: the HOME check only after an ||', { ad_store_edit: lines('    [[ -f "${HOME}/.agent-director/state.db" ]] || ' + `${HOME_GUARD} x`, '    sqlite3 "${HOME}/.agent-director/state.db" "$1;"') }],
-      ['ad_store_edit: the HOME check only in a subshell', { ad_store_edit: lines(`    ( ${HOME_GUARD} x )`, '    sqlite3 "${HOME}/.agent-director/state.db" "$1;"') }],
-      ['ad_store_id: the HOME check only inside an if', { ad_store_id: lines('    if [[ -n "${STRICT:-}" ]]; then', `        ${HOME_GUARD} x`, '    fi', '    sqlite3 -readonly "${HOME}/.agent-director/state.db" "SELECT 1;"') }],
-      ['ad_store_id: no HOME check at all', { ad_store_id: lines('    require_ci_image x', '    sqlite3 -readonly "${HOME}/.agent-director/state.db" "SELECT 1;"') }],
       ['ad_store_id: no step the audit can see', { ad_store_id: lines(GUARDS, '    read_store_id_somehow') }],
     ]
 
-    test.each(flagged)('flags %s, naming the file and the rule', (_label, bodies) => {
-      expectNamedFindings(helperHomeCheckFindings('scenario.sh', helperSource(bodies)), 'scenario.sh', RULE.homeCheckFirst)
+    test.each(flaggedNamed)('a named helper list: flags %s', (_label, bodies) => {
+      expectNamedFindings(helperHomeCheckFindings('scenario.sh', helperSource(bodies), SYNTHETIC_HELPERS), 'scenario.sh', RULE.homeCheckFirst)
     })
 
-    const allowed: [label: string, bodies: Record<string, string>][] = [
-      ['the guards first, then the steps', {}],
-      ['step words in comments, strings and a heredoc before the HOME check', {
+    const allowed: [label: string, source: string][] = [
+      ['the guards first, then the steps', helperSource()],
+      ['step words in comments, strings and a heredoc before the HOME check', helperSource({
         install_ad_shim: lines(
           '    # cp the shim aside, then mv it into place',
           '    local step="${1:-cp and mv the shim}" note=\'sqlite3 install\'',
@@ -2347,52 +2515,122 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
           GUARDS,
           '    mv -f -- "${HOME}/a" "${HOME}/b"',
         ),
-      }],
-      ['a read-only grep of the shim before the HOME check', { install_ad_shim: lines('    grep -qxF -- "# marker" "${SCENARIO_AD_SHIM_SRC}" || fail x', GUARDS, '    _scenario_place a "${HOME}/b" x') }],
+      })],
+      ['a read-only grep of the shim before the HOME check', helperSource({ install_ad_shim: lines('    grep -qxF -- "# marker" "${SCENARIO_AD_SHIM_SRC}" || fail x', GUARDS, '    _scenario_place a "${HOME}/b" x') })],
+      ['a new helper with its HOME check before its agent-director run', helperSource({}, fn('ad_version', `    ${HOME_GUARD} x`, '    "${HOME}/.agent-director/bin/agent-director" version'))],
+      ['a lookup with command -v, and a run of another tool through a variable, before the check', helperSource({}, fn('ad_found', '    local tool="${HOME}/bin/jq"', '    command -v agent-director > /dev/null', '    "${tool}" -n 1', `    ${HOME_GUARD} x`, '    ad_store_id'))],
     ]
 
-    test.each(allowed)('allows %s', (_label, bodies) => {
-      expect(helperHomeCheckFindings('scenario.sh', helperSource(bodies))).toEqual([])
+    test.each(allowed)('allows %s', (_label, source) => {
+      expect(helperHomeCheckFindings('scenario.sh', source)).toEqual([])
     })
 
-    test('the current tree: install_ad_shim, ad_store_edit and ad_store_id run require_scenario_home before their first sqlite3, copy, move or install step', () => {
-      expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'))).toEqual([])
+    test('the exempt primitives (_scenario_place, write_file) have a step and no HOME check, and are not held to the rule', () => {
+      const source = helperSource()
+
+      expect([...shellStepModel(source).stepFunctions].sort()).toEqual(['_scenario_place', 'ad_store_backup', 'ad_store_edit', 'ad_store_id', 'install_ad_shim', 'write_file'])
+      expect(homeCheckedHelpers(source)).toEqual(['ad_store_backup', 'ad_store_edit', 'ad_store_id', 'install_ad_shim'])
     })
 
-    test('the current tree: install_ad_admin_shim runs require_scenario_home before its first copy or move', () => {
-      expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), HOME_GUARDED_ADMIN_HELPERS)).toEqual([])
+    describe('the helpers checked by their callers (HOME_CHECKED_BY_CALLERS)', () => {
+      const PRIVATE = '_scenario_store_peek'
+      const LISTED: ReadonlyMap<string, string> = new Map([[PRIVATE, 'a synthetic private read']])
+      const PRIVATE_FN = fn(PRIVATE, '    sqlite3 -readonly "${HOME}/.agent-director/state.db" "$1;"')
+      const callerSource = (...extra: string[]): string => helperSource({}, PRIVATE_FN, ...extra)
+
+      const flaggedCallers: [label: string, source: string, scripts: { file: string; source: string }[]][] = [
+        ['a call before the caller’s HOME check', callerSource(fn('peek_rows', '    require_ci_image x', `    ${PRIVATE} "SELECT 1"`, `    ${HOME_GUARD} x`)), []],
+        ['a call from a function with no HOME check', callerSource(fn('peek_rows', `    ${PRIVATE} "SELECT 1"`)), []],
+        ['a call named as an argument (a wait_until predicate) before the check', callerSource(fn('wait_rows', `    wait_until 10 "rows" ${PRIVATE} "SELECT 1"`, `    ${HOME_GUARD} x`)), []],
+        ['a call from an exempt function', callerSource(fn('write_file', `    ${PRIVATE} "SELECT 1"`)), []],
+        ['a call in a subshell before the check', callerSource(fn('peek_rows', `    ( ${PRIVATE} "SELECT 1" ) &`, `    ${HOME_GUARD} x`)), []],
+        ['a call outside any function', callerSource(`${PRIVATE} "SELECT 1"`), []],
+        ['a call from a script', callerSource(), [{ file: 'test-14-fmk-x.sh', source: lines('source "$(dirname "$0")/lib/scenario.sh"', `${PRIVATE} "SELECT 1"`) }]],
+        ['a listed name with no step', helperSource({}, fn(PRIVATE, '    echo "$1"')), []],
+        ['a listed name that is not defined', helperSource(), []],
+      ]
+
+      test.each(flaggedCallers)('flags %s', (_label, source, scripts) => {
+        const findings = callerCheckFindings('scenario.sh', source, scripts, LISTED)
+
+        expect(findings.length).toBeGreaterThan(0)
+        expect(findings.every((f) => new RegExp(`^(?:scenario\\.sh|test-14-fmk-x\\.sh):\\d+: ${RULE.homeCheckFirst}: `).test(f))).toBe(true)
+      })
+
+      test('allows calls only after each caller’s HOME check, from a function or a subshell, as an argument too', () => {
+        const source = callerSource(
+          fn('peek_rows', `    ${HOME_GUARD} x`, `    ${PRIVATE} "SELECT 1"`, `    ( ${PRIVATE} "SELECT 2" ) &`),
+          fn('wait_rows', `    ${HOME_GUARD} x`, `    wait_until 10 "rows" ${PRIVATE} "SELECT 1"`),
+        )
+        const scripts = [{ file: 'test-14-fmk-x.sh', source: lines('source "$(dirname "$0")/lib/scenario.sh"', 'peek_rows', `# ${PRIVATE}`, `echo "run ${PRIVATE} later"`) }]
+
+        expect(callerCheckFindings('scenario.sh', source, scripts, LISTED)).toEqual([])
+      })
     })
 
-    test('the current tree: stub_mode and ad_store_pending_no_launch run require_scenario_home before their first move or store edit', () => {
-      expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), HOME_GUARDED_STUB_HELPERS)).toEqual([])
+    /** scenario.sh as it stands, and its scripts. */
+    const scenario = (): string => readFileSync(SCENARIO_PATH, 'utf-8')
+    const scripts = (): { file: string; source: string }[] => integrationScripts().map((path) => ({ file: relative(REPO_ROOT, path), source: readFileSync(path, 'utf-8') }))
+
+    test('the current tree: every scenario.sh function with a step, less the two lists, runs require_scenario_home before its first', () => {
+      const source = scenario()
+
+      // The helpers the audit must find a step in (a parse that lost steps would shrink the set).
+      expect(homeCheckedHelpers(source)).toEqual(expect.arrayContaining([
+        'install_ad_shim', 'install_ad_admin_shim', 'install_ad_release', 'install_ad_010', 'reshim_ad', 'swap_ad_binary', 'hide_ad_install', 'restore_ad_install',
+        'ad', 'ad_capture', 'ad_admin', 'ad_admin_capture', '_scenario_store_read', 'ad_store_edit', 'ad_store_id', 'ad_store_backup', 'ad_store_pending_no_launch', 'stub_mode',
+        'ad_new_token', 'ad_other_store_id', 'ad_owner_label', 'seed_leftover', 'seed_unlabelled', 'seed_env_only', 'seed_borrowed_name', 'seed_other_store',
+        'relabel_session', 'ad_owner_global_set', 'rebind_tmux_socket', 'ad_store_mark_finished', 'ad_store_seed_pending', 'ad_store_unusable_name',
+        'ad_kill_include_finished', 'ad_delete_unusable_row', 'run_find_missing_loop', 'seed_010_row', 'seed_prepersona_fleet', 'write_mcp_config',
+      ]))
+      expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), source)).toEqual([])
     })
 
-    test('stub_mode without its require_scenario_home is flagged at its move', () => {
-      const source = readFileSync(SCENARIO_PATH, 'utf-8')
-      const unguarded = source.replace(/(\nstub_mode\(\) \{\n(?:.*\n)*?)    require_scenario_home "\$\{step\}"\n/, '$1')
-
-      expect(unguarded).not.toBe(source)
-      expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, ['stub_mode']), 'scenario.sh', RULE.homeCheckFirst)
+    test('the current tree: the helpers checked by their callers run only from audited helpers after their check, and no script runs them', () => {
+      expect(callerCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), scenario(), scripts())).toEqual([])
     })
 
-    test('the current tree: the label, seeding, tmux-step, store-statement and 0.10.0-seeder helpers run require_scenario_home before their first store, copy or move step', () => {
-      expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), HOME_GUARDED_SEEDING_HELPERS)).toEqual([])
+    test('the current tree: each exempt name is a scenario.sh function with a step, and no name is in both lists', () => {
+      const { stepFunctions } = shellStepModel(scenario())
+
+      expect([...HOME_CHECK_EXEMPT.keys()].filter((name) => !stepFunctions.has(name))).toEqual([])
+      expect([...HOME_CHECK_EXEMPT.keys()].filter((name) => HOME_CHECKED_BY_CALLERS.has(name))).toEqual([])
     })
+
+    /** scenario.sh with `helper`'s first `require_scenario_home "…"` line removed. */
+    function unguarded(helper: string): string {
+      const source = scenario()
+      const out = source.replace(new RegExp(`(\\n${helper}\\(\\) \\{\\n(?:.*\\n)*?)    require_scenario_home "[^"\\n]*"\\n`), '$1')
+      expect(out).not.toBe(source)
+      return out
+    }
 
     test.each([
-      ['ad_store_mark_finished', 'its store read, through another helper'],
-      ['seed_leftover', 'its seeding, through _scenario_seed'],
-      ['rebind_tmux_socket', 'its socket move'],
-    ])('%s without its require_scenario_home is flagged at %s', (helper) => {
-      const source = readFileSync(SCENARIO_PATH, 'utf-8')
-      const unguarded = source.replace(new RegExp(`(\\n${helper}\\(\\) \\{\\n(?:.*\\n)*?)    require_scenario_home "[^"\\n]*"\\n`), '$1')
+      ['stub_mode', 'its move', 'mv'],
+      ['ad_store_mark_finished', 'its store read, through another helper', '_scenario_row_json'],
+      ['seed_leftover', 'its seeding, through _scenario_seed', '_scenario_seed'],
+      ['rebind_tmux_socket', 'its socket move', 'mv'],
+      ['install_ad_release', 'its install.sh run', '${SCENARIO_RELEASE_INSTALL_SH}'],
+      ['ad_admin', 'its run of the HOME’s agent-director-admin', '${HOME}/.agent-director/admin/agent-director-admin'],
+      ['ad', 'its run of the HOME’s agent-director', '${HOME}/.agent-director/bin/agent-director'],
+      ['hide_ad_install', 'its move of the shim', 'mv'],
+      ['_scenario_store_read', 'its sqlite3 read', 'sqlite3'],
+    ])('%s without its require_scenario_home is flagged at %s', (helper, _label, step) => {
+      const findings = helperHomeCheckFindings('scenario.sh', unguarded(helper))
 
-      expect(unguarded).not.toBe(source)
-      expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, [helper]), 'scenario.sh', RULE.homeCheckFirst)
+      expectNamedFindings(findings, 'scenario.sh', RULE.homeCheckFirst)
+      expect(findings).toContainEqual(expect.stringContaining(`: ${helper}: \`${step}\` runs before any unconditional ${HOME_GUARD}`))
+    })
+
+    test('seed_010_row without its require_scenario_home: its calls of _scenario_require_010 and _scenario_row_left_pending are flagged', () => {
+      const findings = callerCheckFindings('scenario.sh', unguarded('seed_010_row'), [])
+
+      expect(findings).toContainEqual(expect.stringContaining(`: seed_010_row runs _scenario_require_010 before any unconditional ${HOME_GUARD}`))
+      expect(findings).toContainEqual(expect.stringContaining(`: seed_010_row runs _scenario_row_left_pending before any unconditional ${HOME_GUARD}`))
     })
   })
 
-  describe('fmk-driver.ts and stub-mcp-session.ts check the marker before their first step', () => {
+  describe('the image-guarded TypeScript fixtures check the marker before their first step', () => {
     const NODE_IMPORTS = lines("import { existsSync } from 'node:fs'", "import { join } from 'node:path'")
     const CHECK = lines(`if (!existsSync('${CI_IMAGE_MARKER}')) {`, "  console.error('FAIL: fmk-driver: refused')", '  process.exit(2)', '}')
     const AFTER = "const mod = await import(join(process.env['CSCB_PKG_DIR'] ?? '/test-repo', 'src', 'x.ts'))"
@@ -2413,10 +2651,10 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       ['a type-only import of a relative module', RULE.driverStaticImport, lines(NODE_IMPORTS, "import type { McpConfig } from './mcp-types.ts'", CHECK)],
       ['a type-only named binding from a package', RULE.driverStaticImport, lines(NODE_IMPORTS, "import { type Client } from '@modelcontextprotocol/sdk/client/index.js'", CHECK)],
     ]
-    const flagged: [file: string, label: string, rule: string, source: string][] = FILES.flatMap((file) => violations.map(([label, rule, source]): [string, string, string, string] => [file, label, rule, source]))
 
-    test.each(flagged)('%s: flags %s, naming the file and the rule', (file, _label, rule, source) => {
-      expectNamedFindings(driverGuardFindings(file, source), file, rule)
+    // driverGuardFindings reads each file alike, so the table runs once, under one name.
+    test.each(violations)('flags %s, naming the file and the rule', (_label, rule, source) => {
+      expectNamedFindings(driverGuardFindings('fmk-driver.ts', source), 'fmk-driver.ts', rule)
     })
 
     const allowed: [label: string, source: string][] = [
@@ -2428,8 +2666,8 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       expect(driverGuardFindings('fmk-driver.ts', source)).toEqual([])
     })
 
-    test('the audited files: the forced-call driver and the stub’s MCP session, both present', () => {
-      expect(FILES).toEqual(['fmk-driver.ts', 'stub-mcp-session.ts'])
+    test('the audited files: the forced-call driver, the stub’s MCP session and the switch-over fixture, all present', () => {
+      expect(FILES).toEqual(['fmk-driver.ts', 'stub-mcp-session.ts', 'switch-over.ts'])
       for (const path of IMAGE_GUARDED_TS_PATHS) expect(existsSync(path)).toBe(true)
     })
 
@@ -2449,17 +2687,15 @@ const AD_GLOBAL_FLAGS: readonly string[] = ['--store-path', '--home', '--tmux-co
 /** The scenario.sh helper that holds the harness's one `delete`: scenario 25's removal of the row with the unusable name. */
 const HARNESS_DELETE_HELPER = 'ad_delete_unusable_row'
 
+/** The files under tests/integration that are neither shell nor TypeScript, so hold no command or call: shellcheck's and bun's config. */
+const INTEGRATION_NON_CODE_FILES: readonly string[] = ['.shellcheckrc', 'bunfig.toml']
+
 /**
- * Whether `name` (a command word, quotes removed) runs agent-director or its
- * operator tool agent-director-admin (which holds `delete` from 0.11.0 on):
- * the harness calls `ad`, `ad_capture`, `ad_admin` and `ad_admin_capture`,
- * or either binary or its shim by a path or a variable holding one.
+ * scenario.sh's readers of the agent-director shim's log, whose first
+ * argument is the verb they count or print (`cscb_ad_count delete`): each is
+ * a scenario.sh function with no step, so it runs no agent-director.
  */
-function isAgentDirectorCommand(name: string): boolean {
-  return ['ad', 'ad_capture', 'ad_admin', 'ad_admin_capture'].includes(name) ||
-    /^agent-director(?:-admin)?(?:\.real)?$/.test(basename(name)) ||
-    /\bSCENARIO_AD_BIN\b|\bSCENARIO_RELEASE_BIN\b|\bSCENARIO_RELEASE_ADMIN\b|\bSCENARIO_AD_010_BIN\b/.test(name)
-}
+const AD_LOG_READERS: readonly string[] = ['cscb_ad_count', 'cscb_ad_calls']
 
 /** The verb of an agent-director argv: the first word after its global flags. */
 function agentDirectorVerb(args: readonly string[]): string {
@@ -2471,67 +2707,174 @@ function agentDirectorVerb(args: readonly string[]): string {
   return ''
 }
 
-/** `<file>:<line>` of every agent-director `delete` call in the shell file `file` (comments, strings and heredoc bodies are not calls). */
-function agentDirectorDeleteCalls(file: string, source: string): string[] {
+/**
+ * `<file>:<line>` of every command in the shell file `file` whose first
+ * argument after agent-director's global flags is `delete`, whatever the
+ * command: `ad`, `ad_capture`, the binary or the shim by a path or by any
+ * variable (`"${real}"`, `"${STATUS_BIN}"`), or any other name but the log
+ * readers (AD_LOG_READERS). Comments, strings and heredoc bodies are not
+ * commands.
+ */
+function shellDeleteCalls(file: string, source: string): string[] {
   return shellLogicalLines(source)
     .flatMap((line) => line.commands)
-    .filter((c) => isAgentDirectorCommand(c.name) && agentDirectorVerb(c.args) === 'delete')
+    .filter((c) => agentDirectorVerb(c.args) === 'delete' && !AD_LOG_READERS.includes(c.name))
     .map((c) => `${file}:${c.line}`)
 }
 
-/** Every shell file under tests/integration (the scripts, lib/ and fixtures/), read from the directory. */
-function integrationShellFiles(): string[] {
+/**
+ * Whether `receiver` (its text, whitespace and optional chaining removed) is
+ * one `verb` deletes a row on, by tests/fmk-source-audit.test.ts's
+ * `client-delete` rule: `delete` on the client (a last segment ending in
+ * `client`, or `getClient()`), the CLI's `deps` or a `director…`; `destroy`
+ * on a `director…`.
+ */
+function isDeleteReceiver(receiver: string, verb: string): boolean {
+  const last = receiver.split('.').at(-1)!
+  if (verb === 'destroy') return /^director/i.test(last)
+  return /client$/i.test(last) || last === 'getClient()' || last === 'deps' || /^director/i.test(last)
+}
+
+/**
+ * `<file>:<line>: <what>` of every agent-director delete in the TypeScript
+ * file `file`: a `client-delete` call (see isDeleteReceiver; `.delete(`,
+ * `?.delete(`, `['delete'](`, the receiver's parentheses and `await`
+ * dropped), and any `'delete'` string, which is how an argv names the CLI's
+ * verb (`spawn(bin, ['delete', …])`). Read with the TypeScript parser, so
+ * comments and other text never count.
+ */
+function tsDeleteCalls(file: string, source: string): string[] {
+  const sf = parse(source, file)
   const out: string[] = []
-  const walk = (dir: string): void => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const path = join(dir, entry.name)
-      if (entry.isDirectory()) walk(path)
-      else if (entry.isFile() && entry.name.endsWith('.sh')) out.push(path)
-    }
-  }
-  walk(INTEGRATION_DIR)
-  return out.sort()
+  forEachNode(sf, (node) => {
+    if (stringText(node) === 'delete') out.push(`${file}:${finding(sf, node, "the string 'delete'")}`)
+    if (!ts.isCallExpression(node)) return
+    const callee = unwrap(node.expression)
+    let verb: string | undefined
+    if (ts.isPropertyAccessExpression(callee)) verb = callee.name.text
+    else if (ts.isElementAccessExpression(callee)) verb = stringText(callee.argumentExpression)
+    if ((verb !== 'delete' && verb !== 'destroy') || !(ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee))) return
+    const receiver = unwrap(callee.expression).getText(sf).replace(/\s+/g, '').replace(/\?\./g, '.')
+    if (isDeleteReceiver(receiver, verb)) out.push(`${file}:${finding(sf, node, `${receiver}.${verb}(`)}`)
+  })
+  return out
 }
 
 describe('static audit: the harness’s one agent-director delete is scenario 25’s step (b.jg5 SRJ-1306)', () => {
-  const flagged: [label: string, source: string][] = [
-    ['ad delete', 'ad delete --claude-instance-id t0-x'],
-    ['ad_capture delete', 'ad_capture delete --claude-instance-id "${id}"'],
-    ['ad_admin delete', 'ad_admin delete --claude-instance-id t0-x'],
-    ['ad_admin_capture delete', 'ad_admin_capture delete --claude-instance-id "${id}"'],
-    ['agent-director-admin by its path', '"${HOME}/.agent-director/admin/agent-director-admin" delete --claude-instance-id t0-x'],
-    ['agent-director-admin by its image variable', '"${SCENARIO_RELEASE_ADMIN}" delete --claude-instance-id t0-x'],
-    ['a delete after a global flag with its value', 'ad --home /h delete --claude-instance-id t0-x'],
-    ['a delete after a global flag joined by =', 'ad_capture --store-path=/s/state.db delete --claude-instance-id t0-x'],
-    ['the shim by its variable', '"${SCENARIO_AD_BIN}" delete --claude-instance-id t0-x'],
-    ['the binary by its path', '"${HOME}/.agent-director/bin/agent-director.real" delete --claude-instance-id t0-x'],
-    ['a delete in a command substitution', 'out="$(ad delete --claude-instance-id t0-x 2>&1)"'],
-    ['a delete after &&', 'true && ad delete --claude-instance-id t0-x'],
-  ]
+  describe('shell', () => {
+    const flagged: [label: string, source: string][] = [
+      ['ad delete', 'ad delete --claude-instance-id t0-x'],
+      ['ad_capture delete', 'ad_capture delete --claude-instance-id "${id}"'],
+      ['ad_admin delete', 'ad_admin delete --claude-instance-id t0-x'],
+      ['ad_admin_capture delete', 'ad_admin_capture delete --claude-instance-id "${id}"'],
+      ['agent-director-admin by its path', '"${HOME}/.agent-director/admin/agent-director-admin" delete --claude-instance-id t0-x'],
+      ['agent-director-admin by its image variable', '"${SCENARIO_RELEASE_ADMIN}" delete --claude-instance-id t0-x'],
+      ['a delete after a global flag with its value', 'ad --home /h delete --claude-instance-id t0-x'],
+      ['a delete after a global flag joined by =', 'ad_capture --store-path=/s/state.db delete --claude-instance-id t0-x'],
+      ['the shim by its variable', '"${SCENARIO_AD_BIN}" delete --claude-instance-id t0-x'],
+      ['the binary by its path', '"${HOME}/.agent-director/bin/agent-director.real" delete --claude-instance-id t0-x'],
+      ['the binary by a local variable', '"${real}" delete --claude-instance-id t0-x'],
+      ['the hook binary by its variable', '"${STATUS_BIN}" delete --claude-instance-id "${id}"'],
+      ['a command of any other name', 'drop_row delete --claude-instance-id t0-x'],
+      ['a delete through exec -a', 'exec -a agent-director "${bin}" delete --claude-instance-id t0-x'],
+      ['a delete under timeout with a signal option', 'timeout -s KILL 5 "${bin}" delete --claude-instance-id t0-x'],
+      ['a delete under env with assignments', 'env -u TMUX HOME=/h "${bin}" delete --claude-instance-id t0-x'],
+      ['a delete in a command substitution', 'out="$(ad delete --claude-instance-id t0-x 2>&1)"'],
+      ['a delete in a subshell after cd', '( cd /x && "${ad_path}" delete --claude-instance-id t0-x )'],
+      ['a delete after &&', 'true && ad delete --claude-instance-id t0-x'],
+    ]
 
-  test.each(flagged)('finds %s', (_label, source) => {
-    expect(agentDirectorDeleteCalls('x.sh', lines('#!/usr/bin/env bash', source))).toEqual(['x.sh:2'])
+    test.each(flagged)('finds %s', (_label, source) => {
+      expect(shellDeleteCalls('x.sh', lines('#!/usr/bin/env bash', source))).toEqual(['x.sh:2'])
+    })
+
+    const allowed: [label: string, source: string][] = [
+      ['a comment', '# ad delete --claude-instance-id t0-x'],
+      ['a string', 'echo "ad delete --claude-instance-id t0-x"'],
+      ['a synthetic shim log line', "printf 'call\\t1.000000\\t1\\t2\\tx\\t%s\\n' 'delete --claude-instance-id cscb_x' >> \"${log}\""],
+      ['another verb carrying the word', 'ad get --claude-instance-id delete'],
+      ['a global flag whose value is delete', 'ad --home delete get --claude-instance-id t0-x'],
+      ['a heredoc body', lines('cat << EOF', 'ad delete --claude-instance-id t0-x', 'EOF')],
+      ['the word as a loop value', lines('for verb in kill delete; do', '    :', 'done')],
+      ['the word as a later argument of a log reader', 'cscb_lines "${LOG}" delete "${SCENARIO_ROOT}/leg-b-delete"'],
+      ['the word in a test and a case pattern', lines('[[ "${_L_VERB}" == delete ]] || continue', 'case "${verb}" in', '    delete) n=1 ;;', 'esac')],
+      ['the verb a log reader counts or prints', lines('[[ "$(cscb_ad_count delete)" == 0 ]] || fail x', 'cscb_ad_calls delete --claude-instance-id > "${out}"')],
+    ]
+
+    test.each(allowed)('does not count %s', (_label, source) => {
+      expect(shellDeleteCalls('x.sh', lines('#!/usr/bin/env bash', source))).toEqual([])
+    })
   })
 
-  const allowed: [label: string, source: string][] = [
-    ['a comment', '# ad delete --claude-instance-id t0-x'],
-    ['a string', 'echo "ad delete --claude-instance-id t0-x"'],
-    ['a synthetic shim log line', "printf 'call\\t1.000000\\t1\\t2\\tx\\t%s\\n' 'delete --claude-instance-id cscb_x' >> \"${log}\""],
-    ['another verb carrying the word', 'ad get --claude-instance-id delete'],
-    ['a global flag whose value is delete', 'ad --home delete get --claude-instance-id t0-x'],
-    ['a heredoc body', lines('cat << EOF', 'ad delete --claude-instance-id t0-x', 'EOF')],
-  ]
+  describe('TypeScript', () => {
+    const flagged: [label: string, source: string][] = [
+      ['getClient().delete', 'await getClient().delete({ claude_instance_id: id })'],
+      ['a delete on the awaited client in parentheses', 'await (await getClient()).delete({ claude_instance_id: id })'],
+      ['client?.delete', 'await client?.delete({ claude_instance_id: id })'],
+      ['client.delete?.()', 'await client.delete?.({ claude_instance_id: id })'],
+      ["client['delete']", "await client['delete']({ claude_instance_id: id })"],
+      ['this.adClient.delete', 'await this.adClient.delete({ claude_instance_id: id })'],
+      ['deps.delete', 'await deps.delete(id)'],
+      ['director.destroy', 'await director.destroy(id)'],
+      ["the CLI's verb in an argv", "spawnSync(adBin, ['delete', '--claude-instance-id', id])"],
+    ]
 
-  test.each(allowed)('does not count %s', (_label, source) => {
-    expect(agentDirectorDeleteCalls('x.sh', lines('#!/usr/bin/env bash', source))).toEqual([])
+    test.each(flagged)('finds %s', (_label, source) => {
+      // A module, as each fixture is, so a top-level `await` is the operator.
+      const calls = tsDeleteCalls('x.ts', lines('export {}', source))
+
+      expect(calls.length).toBeGreaterThan(0)
+      expect(calls.every((call) => call.startsWith('x.ts:2: '))).toBe(true)
+    })
+
+    const allowed: [label: string, source: string][] = [
+      ['a Map and a Set delete', lines('tickets.delete(ticket)', 'sockets.delete(ws)', 'const seen = new Set<string>(); seen.delete(key)')],
+      ['the delete operator', 'delete env.TMUX'],
+      ['comments and longer strings', lines('// await getClient().delete(x)', "const s = 'client.delete(x)'", 'const t = `the delete verb`')],
+      ['another client verb', 'await getClient().kill({ claude_instance_id: id })'],
+      ['destroy on a client', 'client.destroy()'],
+    ]
+
+    test.each(allowed)('does not count %s', (_label, source) => {
+      expect(tsDeleteCalls('x.ts', lines('export {}', source))).toEqual([])
+    })
+  })
+
+  test('the log readers are scenario.sh functions with no step, so they run no agent-director', () => {
+    const { functions, stepFunctions } = shellStepModel(readFileSync(SCENARIO_PATH, 'utf-8'))
+
+    expect(AD_LOG_READERS.filter((name) => !functions.has(name) || stepFunctions.has(name))).toEqual([])
+  })
+
+  /** Every file under tests/integration, by kind. */
+  function integrationFiles(): { shell: string[]; typescript: string[]; other: string[] } {
+    const all = filesUnder(INTEGRATION_DIR, () => true).sort()
+    return {
+      shell: all.filter((path) => path.endsWith('.sh')),
+      typescript: all.filter((path) => path.endsWith('.ts')),
+      other: all.filter((path) => !path.endsWith('.sh') && !path.endsWith('.ts')),
+    }
+  }
+
+  test('the audited files: every file under tests/integration is shell or TypeScript, shellcheck’s and bun’s config aside', () => {
+    const { shell, typescript, other } = integrationFiles()
+    const named = (paths: string[]): string[] => paths.map((path) => relative(INTEGRATION_DIR, path))
+
+    expect(named(other)).toEqual([...INTEGRATION_NON_CODE_FILES])
+    expect(named(shell)).toEqual(expect.arrayContaining([join('lib', 'scenario.sh'), join('fixtures', 'stub-claude.sh'), join('fixtures', 'agent-director-shim.sh')]))
+    expect(named(typescript)).toEqual(expect.arrayContaining(
+      ['driver.ts', 'fmk-driver.ts', 'stub-mcp-session.ts', 'switch-over.ts', 'phase1-client-check.ts', 'slack-stub-server.ts'].map((name) => join('fixtures', name)),
+    ))
   })
 
   test(`the current tree: the only agent-director delete under tests/integration is scenario.sh's ${HARNESS_DELETE_HELPER}`, () => {
-    const files = integrationShellFiles()
-    expect(files).toContain(SCENARIO_PATH)
-    const calls = files.flatMap((path) => agentDirectorDeleteCalls(relative(REPO_ROOT, path), readFileSync(path, 'utf-8')))
+    const { shell, typescript } = integrationFiles()
+    const calls = [
+      ...shell.flatMap((path) => shellDeleteCalls(relative(REPO_ROOT, path), readFileSync(path, 'utf-8'))),
+      ...typescript.flatMap((path) => tsDeleteCalls(relative(REPO_ROOT, path), readFileSync(path, 'utf-8'))),
+    ]
     const helper = shellFunctions(readFileSync(SCENARIO_PATH, 'utf-8')).get(HARNESS_DELETE_HELPER) ?? []
-    const own = helper.filter((c) => isAgentDirectorCommand(c.name) && agentDirectorVerb(c.args) === 'delete')
+    const own = helper.filter((c) => agentDirectorVerb(c.args) === 'delete')
 
     expect(own).toHaveLength(1)
     expect(calls).toEqual([`${relative(REPO_ROOT, SCENARIO_PATH)}:${own[0].line}`])

@@ -46,7 +46,8 @@
  *   from the README and the two skills resolves;
  * - the switch-over runbook, README "Switching over to agent-director
  *   Phase 1" (b.jg5 SRJ-1108; the E2-gate and E5 hatch notes): its steps
- *   1–11 read in order by the file-local step reader, one named case per
+ *   1–11 read in order by the shared step reader (`runbookSteps`,
+ *   tests/test-helpers/runbooks.ts), one named case per
  *   SRJ-1108 element over each carrier (`SWITCH_OVER_CARRIERS`: the README
  *   section and the CHANGELOG release entry's copy), the
  *   negative and order checks, the "Arrived here from a startup refusal?"
@@ -246,7 +247,7 @@ import { DELETE_HELPERS, REMOVED_IDENTIFIERS, SOURCE_WORD_RULES, type SourceWord
 import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
 import type { Via } from '../src/delivery-decision.ts'
 import { MCP_INSTRUCTIONS } from '../src/registry.ts'
-import { AD_VERSION_RECHECK_INTERVAL_MS, DEBUG_SKILL_PATH, DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE, installAdVersionRecheck, meetsPhase1Floor, PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
+import { AD_VERSION_RECHECK_INTERVAL_MS, DEBUG_SKILL_PATH, DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE, installAdVersionRecheck, meetsPhase1Floor, PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE, PUBLISHING_HOST_BLOCK_HEADING } from '../src/ad-version-gate.ts'
 import {
   AD_BELOW_PHASE1_FLOOR,
   AD_SHIM_CATALOG_INCOMPLETE,
@@ -384,9 +385,9 @@ import { errTmuxKillFailed, KILL_FAILED_DESCRIPTIONS, STUB_SURVIVOR_PIDS } from 
 import { humanOnlySentencesIn } from './test-helpers/conflict-cases.ts'
 import { CLIENT_MIN_VERSION, MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
-  PUBLISHING_HOST_BLOCK_HEADING,
   REFUSAL_BLOCK_HEADING,
   ROLLBACK_RUNBOOK_SECTION_TITLE,
+  runbookSteps,
   stepHeadingPrefix,
   stepNumberOf,
 } from './test-helpers/runbooks.ts'
@@ -2114,56 +2115,26 @@ interface RunbookCarrier {
 }
 
 /**
- * The step reader: from a runbook section's body, step n's text (its heading
- * line excluded, up to the next heading of its level or higher, flattened
- * with `flat`) at index n - 1. Steps are headings at `stepLevel` whose title
- * starts with the helper's `Step <n>: ` form. Steps are read by number on
- * purpose: the SRD's contract is "steps 1 to 11 in order", so a step is found
- * by its number, never its title. Throws naming the carrier and the step when
- * a step is missing, duplicated, out of order or beyond `count`. It takes the
- * carrier's text, so the rollback section (9 steps) and the CHANGELOG copies
- * reuse it. Pure.
+ * A runbook carrier read from `text` under `heading` (a section whose steps
+ * sit one level below it), through the shared step reader (`runbookSteps`,
+ * `tests/test-helpers/runbooks.ts`) at that level with `count` steps, each
+ * step's text flattened with `flat`. Every carrier (the README's switch-over
+ * and rollback sections and their CHANGELOG copies) is read here. Throws as
+ * the reader does, naming the carrier and the step.
  */
-function runbookSteps(carrier: string, section: string, stepLevel: number, count: number): { texts: string[]; titles: string[] } {
-  const lines = section.split('\n')
-  const hs = headings(section)
-  const steps = hs.flatMap((h, i) => {
-    const n = h.level === stepLevel ? stepNumberOf(h.title) : undefined
-    return n === undefined ? [] : [{ n, i, h }]
-  })
-  for (let n = 1; n <= count; n++) {
-    const found = steps.filter((s) => s.n === n).length
-    if (found === 0) throw new Error(`${carrier}: step ${n} is missing (no "${'#'.repeat(stepLevel)} ${stepHeadingPrefix(n)}…" heading)`)
-    if (found > 1) throw new Error(`${carrier}: step ${n} appears ${found} times`)
-  }
-  const extra = steps.find((s) => s.n < 1 || s.n > count)
-  if (extra !== undefined) throw new Error(`${carrier}: step ${extra.n} is beyond the expected ${count} steps`)
-  steps.forEach((s, k) => {
-    if (s.n !== k + 1) throw new Error(`${carrier}: step ${s.n} is out of order (found where step ${k + 1} belongs)`)
-  })
-  return {
-    titles: steps.map(({ h }) => h.title),
-    texts: steps.map(({ i, h }) => {
-      const next = hs.slice(i + 1).find((later) => later.level <= h.level)
-      return flat(lines.slice(h.line + 1, next === undefined ? lines.length : next.line).join('\n')).trim()
-    }),
-  }
-}
-
-/** A runbook carrier read from `text` under `heading` (a section whose steps sit one level below it). Throws as the reader does. */
 function readRunbookCarrier(file: string, text: string, heading: string, count: number): RunbookCarrier {
   const name = `${file} "${heading}"`
   const section = requiredSection(text, heading, file)
   const blockLevel = heading.indexOf(' ') + 1
   const lines = section.split('\n')
   const first = headings(section)[0]
-  const { texts, titles } = runbookSteps(name, section, blockLevel, count)
+  const steps = runbookSteps(section, { count, level: blockLevel, name })
   return {
     name,
     section,
     frame: flat(lines.slice(0, first === undefined ? lines.length : first.line).join('\n')).trim(),
-    steps: texts,
-    stepAnchors: titles.map(headingSlug),
+    steps: steps.map((step) => flat(step.text).trim()),
+    stepAnchors: steps.map((step) => headingSlug(step.title)),
     blockLevel,
   }
 }
@@ -2716,12 +2687,73 @@ const PUBLISHING_HOST_ELEMENTS: [element: string, required: readonly Item[]][] =
   ['a publishing host needs no install-gate go line', [ci('a publishing host needs no install-gate go line')]],
 ]
 
+/** The step reader's helper, loaded in the `/ci` image from `/tests`, which holds `tests/` without `src/` or the repo's `node_modules`. */
+const RUNBOOKS_HELPER = 'tests/test-helpers/runbooks.ts'
+
+/** The directory every file on `RUNBOOKS_HELPER`'s load path must sit in. */
+const IMAGE_SAFE_HELPERS_DIR = 'tests/test-helpers/'
+
+/** Each module specifier `text` imports or re-exports: `import … from`, `export … from`, a bare `import '…'`, `import('…')` and `require('…')`. */
+function moduleSpecifiers(text: string): string[] {
+  const forms = /^\s*(?:import|export)\b[^'";()`]*?\bfrom\s*['"]([^'"]+)['"]|^\s*import\s*['"]([^'"]+)['"]|\b(?:import|require)\s*\(\s*['"]([^'"]+)['"]/gm
+  return [...text.matchAll(forms)].map((m) => m[1] ?? m[2] ?? m[3])
+}
+
+/**
+ * The files on `entry`'s load path (repo-relative, `entry` first, in the order
+ * reached) and its problems: an import of anything but a relative file
+ * inside `IMAGE_SAFE_HELPERS_DIR` (`src/`, `agent-director`, a `node:` or
+ * other package), and any use of `Bun.`, `process.` or `Deno.`, through
+ * which a module reads or writes. `read` gives a file's text. Pure.
+ */
+function helperLoadPath(entry: string, read: (relPath: string) => string): { files: string[]; problems: string[] } {
+  const files = [entry]
+  const problems: string[] = []
+  for (let k = 0; k < files.length; k++) {
+    const file = files[k]
+    const text = read(file)
+    for (const use of text.match(/\b(?:Bun|process|Deno)\./g) ?? []) problems.push(`${file} uses ${use}`)
+    for (const spec of moduleSpecifiers(text)) {
+      const target = spec.startsWith('.') ? join(dirname(file), spec) : undefined
+      if (target === undefined || !target.startsWith(IMAGE_SAFE_HELPERS_DIR)) problems.push(`${file} imports "${spec}", outside ${IMAGE_SAFE_HELPERS_DIR}`)
+      else if (!files.includes(target)) files.push(target)
+    }
+  }
+  return { files, problems }
+}
+
 describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1108)`, () => {
+  describe(`the step reader's load path, from ${RUNBOOKS_HELPER} (ruling Q13; the /ci image's /tests)`, () => {
+    test(`${RUNBOOKS_HELPER} and everything it imports sit in ${IMAGE_SAFE_HELPERS_DIR}, import nothing from src/, agent-director or any package, and read and write nothing`, () => {
+      expect(helperLoadPath(RUNBOOKS_HELPER, readRepoFile)).toEqual({ files: [RUNBOOKS_HELPER, 'tests/test-helpers/markdown.ts'], problems: [] })
+    })
+
+    test.each([
+      ['a re-export from src/', `export { PUBLISHING_HOST_BLOCK_HEADING } from '../../src/ad-version-gate.ts'\n`, `${RUNBOOKS_HELPER} imports "../../src/ad-version-gate.ts", outside ${IMAGE_SAFE_HELPERS_DIR}`],
+      ['an agent-director import', `import type { UnreachableReason } from 'agent-director'\n`, `${RUNBOOKS_HELPER} imports "agent-director", outside ${IMAGE_SAFE_HELPERS_DIR}`],
+      ['a multi-line import from a node: module', `import {\n  readFileSync,\n} from 'node:fs'\n`, `${RUNBOOKS_HELPER} imports "node:fs", outside ${IMAGE_SAFE_HELPERS_DIR}`],
+      ['a file read through Bun', `const text = await Bun.file('x').text()\n`, `${RUNBOOKS_HELPER} uses Bun.`],
+    ])('self-check: with %s added to the helper, the load-path check names it', (_how, line, problem) => {
+      const read = (relPath: string) => (relPath === RUNBOOKS_HELPER ? line : '') + readRepoFile(relPath)
+      expect(helperLoadPath(RUNBOOKS_HELPER, read).problems).toEqual([problem])
+    })
+
+    test('self-check: a src/ import in a file the helper imports is named with that file', () => {
+      const markdown = 'tests/test-helpers/markdown.ts'
+      const read = (relPath: string) => (relPath === markdown ? `import { flat } from '../../src/text.ts'\n` : '') + readRepoFile(relPath)
+      expect(helperLoadPath(RUNBOOKS_HELPER, read).problems).toEqual([`${markdown} imports "../../src/text.ts", outside ${IMAGE_SAFE_HELPERS_DIR}`])
+    })
+  })
+
   describe('the step reader (self-checks, in memory)', () => {
     const section = (...numbers: number[]) => numbers.map((n) => `#### ${stepHeadingPrefix(n)}Do ${n}\nBody ${n}.`).join('\n')
 
     test('steps 1 to n in order are read by number, each without its heading line', () => {
-      expect(runbookSteps('fixture', section(1, 2, 3), 4, 3).texts).toEqual(['Body 1.', 'Body 2.', 'Body 3.'])
+      expect(runbookSteps(section(1, 2, 3), { count: 3, level: 4, name: 'fixture' })).toEqual([
+        { number: 1, title: `${stepHeadingPrefix(1)}Do 1`, line: 0, text: 'Body 1.' },
+        { number: 2, title: `${stepHeadingPrefix(2)}Do 2`, line: 2, text: 'Body 2.' },
+        { number: 3, title: `${stepHeadingPrefix(3)}Do 3`, line: 4, text: 'Body 3.' },
+      ])
     })
 
     test.each([
@@ -2731,12 +2763,32 @@ describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-
       ['beyond the count', section(1, 2, 3, 4), 3, 'fixture: step 4 is beyond the expected 3 steps'],
       ['at another level', section(1, 2).replace('#### Step 2', '##### Step 2'), 2, 'fixture: step 2 is missing'],
     ])('a step %s throws naming the step', (_how, text, count, message) => {
-      expect(() => runbookSteps('fixture', text, 4, count)).toThrow(message)
+      expect(() => runbookSteps(text, { count, level: 4, name: 'fixture' })).toThrow(message)
     })
 
     test("a step's text keeps its lower headings and stops at the next heading of its level or higher", () => {
       const text = `#### ${stepHeadingPrefix(1)}A\none\n##### Detail\ninner\n#### Other block\nafter\n#### ${stepHeadingPrefix(2)}B\ntwo\n### Next section\nout`
-      expect(runbookSteps('fixture', text, 4, 2).texts).toEqual(['one ##### Detail inner', 'two'])
+      expect(runbookSteps(text, { count: 2, level: 4, name: 'fixture' }).map((step) => step.text)).toEqual(['one\n##### Detail\ninner', 'two'])
+    })
+
+    test("with no level given, steps are read at the section's shallowest heading level, its blocks' level", () => {
+      const text = `Frame.\n#### A block\nblock\n${section(1, 2)}\n##### ${stepHeadingPrefix(3)}Nested\nnested`
+      expect(runbookSteps(text, { count: 2 }).map((step) => step.number)).toEqual([1, 2])
+      expect(() => runbookSteps(text.replace('#### A block', '### A block'), { count: 2 })).toThrow('step 1 is missing (no "### Step 1: …" heading)')
+    })
+
+    test('with no count given, the highest step number is the count, and a gap below it still throws naming the step', () => {
+      expect(runbookSteps(section(1, 2, 3, 4)).map((step) => step.number)).toEqual([1, 2, 3, 4])
+      expect(() => runbookSteps(section(1, 2, 4))).toThrow('step 3 is missing')
+      expect(() => runbookSteps(section(2, 1))).toThrow('step 2 is out of order')
+    })
+
+    test.each([
+      ['no heading at all', 'Only prose.', 'step 1 is missing (no "Step 1: …" heading)'],
+      ['no step heading', '#### A block\nblock', 'step 1 is missing (no "#### Step 1: …" heading)'],
+      ['a step 0', section(0, 1), 'step 0 is not a step number (steps start at 1)'],
+    ])('a section with %s throws naming the step, with no name before it when none is given', (_how, text, message) => {
+      expect(() => runbookSteps(text)).toThrow(new Error(message))
     })
 
     test.each(Array.from({ length: SWITCH_OVER_STEP_COUNT }, (_, i) => i + 1))("the helper's step form reads back step %d", (n) => {
@@ -5140,21 +5192,21 @@ const SWITCH_OVER_CARRIER_FILES: readonly string[] = SWITCH_OVER_CARRIERS.map(([
 
 /**
  * The 0-based [start, end) line ranges, in `text` (a carrier's whole file),
- * of switch-over `steps`: the step headings, at the runbook's step level,
- * inside the file's first `SWITCH_OVER_HEADING` section (the README's, or the
- * CHANGELOG release entry's copy, the file's first entry). Throws naming the
- * file when the section or a step is missing.
+ * of switch-over `steps`: each step's heading line to the end of its text, as
+ * the shared step reader (`runbookSteps`) reads the file's first
+ * `SWITCH_OVER_HEADING` section (the README's, or the CHANGELOG release
+ * entry's copy, the file's first entry) with all `SWITCH_OVER_STEP_COUNT`
+ * steps. Throws naming the file when the section is missing, and the file,
+ * the section and the step as the reader does.
  */
 function switchOverStepRanges(file: string, text: string, steps: readonly number[]): { start: number; end: number }[] {
   const section = sectionRange(text, SWITCH_OVER_HEADING)
   if (section === undefined) throw new Error(`${file} has no heading "${SWITCH_OVER_HEADING}"`)
-  const level = SWITCH_OVER_HEADING.indexOf(' ') + 1
-  const hs = headings(text)
+  const body = text.split('\n').slice(section.start + 1, section.end).join('\n')
+  const read = runbookSteps(body, { count: SWITCH_OVER_STEP_COUNT, level: SWITCH_OVER_HEADING.indexOf(' ') + 1, name: `${file} "${SWITCH_OVER_HEADING}"` })
   return steps.map((n) => {
-    const i = hs.findIndex((h) => h.line > section.start && h.line < section.end && h.level === level && stepNumberOf(h.title) === n)
-    if (i < 0) throw new Error(`${file}: switch-over step ${n} is missing`)
-    const next = hs.slice(i + 1).find((h) => h.level <= level)
-    return { start: hs[i].line, end: next === undefined ? text.split('\n').length : next.line }
+    const start = section.start + 1 + read[n - 1].line
+    return { start, end: start + 1 + read[n - 1].text.split('\n').length }
   })
 }
 
@@ -5995,34 +6047,38 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
       )
     })
 
-    /** A synthetic runbook carrier: the switch-over section with steps 4 to 6 (the reader's other steps are not read here), then another section. */
+    /** A synthetic runbook carrier: the switch-over section with all its steps, only steps 4 to 6 with a body, then another section. */
     const carrierText = (step4: string, step5: string, step6: string, after: string) =>
       [
         '# Doc', //                                            l.1
         SWITCH_OVER_HEADING, //                                l.2
-        `#### ${stepHeadingPrefix(4)}Wait`, //                 l.3
-        step4, //                                              l.4
-        `#### ${stepHeadingPrefix(5)}Check`, //                l.5
-        step5, //                                              l.6
-        `#### ${stepHeadingPrefix(6)}End`, //                  l.7
-        step6, //                                              l.8
-        '## Troubleshooting', //                               l.9
-        after, //                                              l.10
+        `#### ${stepHeadingPrefix(1)}Check`, //                l.3
+        `#### ${stepHeadingPrefix(2)}Stage`, //                l.4
+        `#### ${stepHeadingPrefix(3)}Stop`, //                 l.5
+        `#### ${stepHeadingPrefix(4)}Wait`, //                 l.6
+        step4, //                                              l.7
+        `#### ${stepHeadingPrefix(5)}Check`, //                l.8
+        step5, //                                              l.9
+        `#### ${stepHeadingPrefix(6)}End`, //                  l.10
+        step6, //                                              l.11
+        ...Array.from({ length: SWITCH_OVER_STEP_COUNT - 6 }, (_, k) => `#### ${stepHeadingPrefix(k + 7)}Later`), // l.12 to l.16
+        '## Troubleshooting', //                               l.17
+        after, //                                              l.18
       ].join('\n')
     const KILL = 'end it with `tmux kill-session -t =<name>`'
 
     test.each([
       ['in steps 5 and 6 of a carrier', 'README.md', carrierText('-', KILL, KILL, '-'), []],
-      ['in step 4 of a carrier', 'README.md', carrierText(KILL, KILL, '-', '-'), ['README.md:4: tmux kill-session']],
-      ['after the runbook in a carrier', CHANGELOG_FILE, carrierText('-', KILL, '-', `Or ${KILL.replace(' kill', '\nkill')}.`), [`${CHANGELOG_FILE}:10: tmux kill-session`]],
-      ['in a text that is no carrier, steps 5 and 6 included', DEBUG_SKILL_FILE, carrierText('-', KILL, KILL, '-'), [`${DEBUG_SKILL_FILE}:6: tmux kill-session`, `${DEBUG_SKILL_FILE}:8: tmux kill-session`]],
+      ['in step 4 of a carrier', 'README.md', carrierText(KILL, KILL, '-', '-'), ['README.md:7: tmux kill-session']],
+      ['after the runbook in a carrier', CHANGELOG_FILE, carrierText('-', KILL, '-', `Or ${KILL.replace(' kill', '\nkill')}.`), [`${CHANGELOG_FILE}:18: tmux kill-session`]],
+      ['in a text that is no carrier, steps 5 and 6 included', DEBUG_SKILL_FILE, carrierText('-', KILL, KILL, '-'), [`${DEBUG_SKILL_FILE}:9: tmux kill-session`, `${DEBUG_SKILL_FILE}:11: tmux kill-session`]],
     ] as const)('`tmux kill-session` %s', (_where, file, text, expected) => {
       expect(killSessionsOutsideSteps(file, text).map((hit) => `${hit.file}:${hit.line}: ${hit.term}`)).toEqual([...expected])
     })
 
     test('a carrier with no switch-over section, or no step 6, throws naming the file', () => {
       expect(() => killSessionsOutsideSteps('README.md', '# Doc\nNo runbook.')).toThrow(`README.md has no heading "${SWITCH_OVER_HEADING}"`)
-      expect(() => killSessionsOutsideSteps('README.md', carrierText('-', '-', '-', '-').replace(`${stepHeadingPrefix(6)}`, 'Then: '))).toThrow('README.md: switch-over step 6 is missing')
+      expect(() => killSessionsOutsideSteps('README.md', carrierText('-', '-', '-', '-').replace(`${stepHeadingPrefix(6)}`, 'Then: '))).toThrow(`README.md "${SWITCH_OVER_HEADING}": step 6 is missing`)
     })
 
     test('an attach without `=` is reported with file and line, wrapped or not; the exact target and the reason sentence are not', () => {
