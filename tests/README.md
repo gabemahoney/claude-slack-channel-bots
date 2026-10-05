@@ -239,6 +239,23 @@ tests/
                                    # leave `dev`'s row `waiting` (the stub ignores `pause`'s `/exit`, and no `find-missing` runs for an unlatched
                                    # persona). Modes: tmux shim `log`, the stub's dev-channels hold, agent-director's defaults (no config.toml). It runs
                                    # about 90 s and ends with the three closing assertions
+    test-16-fmk-conflict.sh  # HO §7 scenarios 4 and 19 (b.jg5 SRJ-1405, SRJ-1420), fmk: a session holding a persona's name latches it; re-checks retry until the harness removes it
+                                   # Built in five phases, one function each, so scenario 19's legs join the same phases: 1. the first life; 2. `stop
+                                   # --stop-bots`; 3. harness seeding with the server stopped; 4. the second life; 5. a restart-leg hook (empty). It holds
+                                   # scenario 4's leg (persona `nolabel`). Set-up: in the first life the persona reaches `waiting`; the harness then types the
+                                   # stub's exit sentinel into its pane (a human quitting Claude Code), so the stub fires SessionEnd, agent-director marks the
+                                   # row `ended` and the session ends; then `stop --stop-bots`. With the server stopped, the harness makes a session with no
+                                   # label named as the row records (`slack_bot_<key>`, `seed_unlabelled`), so it holds the finished row's name. Checks in
+                                   # the second life: the bring-up's `resume` gets CONFLICT "no valid instance id"; exactly one CONFLICT post, its lines in
+                                   # SRJ-1004's order (persona prefix, first line, description line, the pointer line to "Operator actions", list line,
+                                   # human-only line), naming no command; no CSCB `kill`, `kill-finished` or `delete` of the row; each 120 s re-check is one
+                                   # `status` read (`ended` or `missing`) then the `resume` retry, with no probe and no post, the row's state and
+                                   # `row_version` unchanged; the harness ends the session by its session id, the next round's `resume` launches with no
+                                   # `find-missing` between that round's `status` and `resume`, the persona reaches `waiting` with its first-life
+                                   # claude_session_id, and exactly one recovery post follows ("a retry of the refused operation was not refused"); no tmux
+                                   # command CSCB caused touches the seeded session; the row present at the end. The harness runs no `find-missing`. Modes:
+                                   # tmux shim `log`, the stub's dev-channels hold, `health_check_interval` 0, agent-director's defaults (no config.toml).
+                                   # It runs about 7 minutes and ends with the three closing assertions
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
