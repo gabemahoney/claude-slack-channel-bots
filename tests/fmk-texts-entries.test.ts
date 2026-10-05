@@ -65,6 +65,7 @@ import * as personaEpisodes from '../src/persona-episodes.ts'
 import * as personaIdentity from '../src/persona-identity.ts'
 import * as personaNotifier from '../src/persona-notifier.ts'
 import * as restart from '../src/restart.ts'
+import * as rowReadRules from '../src/row-read-rules.ts'
 import * as sessionManager from '../src/session-manager.ts'
 import * as unavailableRetry from '../src/unavailable-retry.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
@@ -91,6 +92,7 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'persona-identity.ts': personaIdentity,
   'persona-notifier.ts': personaNotifier,
   'restart.ts': restart,
+  'row-read-rules.ts': rowReadRules,
   'session-manager.ts': sessionManager,
   'unavailable-retry.ts': unavailableRetry,
 }
@@ -390,6 +392,41 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
       const read = new Set(reading.refs.filter((r) => r.file === file && r.kind === 'constant').map((r) => r.name))
       expect(names.filter((n) => !read.has(n))).toEqual([])
     }
+  })
+
+  // Scenario 20's references (test-23), each `<file>:<export>:<kind>`, with
+  // what the scenario reads of the value beyond its kind, when it reads more.
+  const named = new Set(reading.refs.map((r) => `${r.file}:${r.name}:${r.kind}`))
+  const scenario20Values: Readonly<Record<string, () => void>> = {
+    // test-23 prints `DEFAULT_AD_SETTINGS tmux starting_session_seconds`, the
+    // starting-session bound it waits past: a positive number.
+    'ad-settings.ts:DEFAULT_AD_SETTINGS:defined': () => {
+      const tables: unknown = MODULES['ad-settings.ts']?.DEFAULT_AD_SETTINGS
+      const tmux: unknown = typeof tables === 'object' && tables !== null && Object.hasOwn(tables, 'tmux') ? (tables as Record<string, unknown>).tmux : undefined
+      const bound: unknown =
+        typeof tmux === 'object' && tmux !== null && Object.hasOwn(tmux, 'starting_session_seconds')
+          ? (tmux as Record<string, unknown>).starting_session_seconds
+          : undefined
+      expect(typeof bound === 'bigint' || (typeof bound === 'number' && Number.isFinite(bound))).toBe(true)
+      expect(Number(bound)).toBeGreaterThan(0)
+    },
+    // The note a harness `get` shows on Part 1's note persona's row.
+    'row-read-rules.ts:LATCHING_LIVENESS_NOTE:constant': () => {
+      expect(rowReadRules.isLatchingLivenessNote(rowReadRules.LATCHING_LIVENESS_NOTE)).toBe(true)
+    },
+  }
+
+  test.each([
+    'pane-read.ts:PANE_READ_PANE:constant',
+    'pane-read.ts:PANE_READ_CONFLICT:constant',
+    'pane-read.ts:PANE_READ_GONE:constant',
+    'conflict-latch.ts:RECHECK_VERDICT_STILL_LATCHED:constant',
+    'ad-settings.ts:DEFAULT_AD_SETTINGS:defined',
+    'session-manager.ts:latchClearRetryAtOnceLineHead:function',
+    'row-read-rules.ts:LATCHING_LIVENESS_NOTE:constant',
+  ])("scenario 20's printer reads %s", (ref) => {
+    expect(named.has(ref)).toBe(true)
+    scenario20Values[ref]?.()
   })
 
   test('every file the printer names is a src/ module this file imports', () => {

@@ -63,7 +63,7 @@
  *   file under `tests/integration` (shell or TypeScript, shellcheck's and
  *   bun's config aside): in shell, any command whose first argument after
  *   agent-director's global flags is `delete`, whatever its name but
- *   scenario.sh's two shim-log readers (which run no agent-director); in
+ *   scenario.sh's three shim-log readers (which run no agent-director); in
  *   TypeScript, a `client-delete`
  *   call (tests/fmk-source-audit.test.ts's receiver rule) or a `'delete'`
  *   string. The only one is scenario.sh's `ad_delete_unusable_row`, which
@@ -2762,7 +2762,7 @@ const INTEGRATION_NON_CODE_FILES: readonly string[] = ['.shellcheckrc', 'bunfig.
  * argument is the verb they count or print (`cscb_ad_count delete`): each is
  * a scenario.sh function with no step, so it runs no agent-director.
  */
-const AD_LOG_READERS: readonly string[] = ['cscb_ad_count', 'cscb_ad_calls']
+const AD_LOG_READERS: readonly string[] = ['cscb_ad_count', 'cscb_ad_calls', 'shim_verb_lines']
 
 /** The verb of an agent-director argv: the first word after its global flags. */
 function agentDirectorVerb(args: readonly string[]): string {

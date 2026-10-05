@@ -134,6 +134,22 @@
  *   AD_ERROR_CLASS_UNUSABLE_NAME                 src/ad-error-class.ts, CSCB's class for an
  *                                                unusable recorded name, as fmk-driver.ts's
  *                                                outcome line gives it (`class=<class>`)
+ * Scenario 20's entries (test-23):
+ *   DEFAULT_AD_SETTINGS <table> <key>            src/ad-settings.ts, one of agent-director's
+ *                                                default settings (for example `tmux
+ *                                                starting_session_seconds`), in decimal
+ *   RECHECK_VERDICT_STILL_LATCHED                src/conflict-latch.ts, a probe's verdict that
+ *                                                keeps the latch (a probe round's answer)
+ *   PANE_READ_PANE, PANE_READ_CONFLICT, PANE_READ_GONE
+ *                                                src/pane-read.ts, the `read-pane` answer kinds
+ *                                                a probe round's answer names
+ *   latchClearRetryAtOnceLineHead <persona-name>
+ *                                                src/session-manager.ts, the head of the
+ *                                                after-clear retry's lines, the reference
+ *                                                renderPersonaRef(<persona-name>)
+ *   LATCHING_LIVENESS_NOTE                       src/row-read-rules.ts, the liveness note a
+ *                                                row's `get` carries that latches its persona
+ *                                                with "conflicting labels"
  *   Scenario 10 (test-22-fmk-wrong-server.sh). An entry of the same name in
  *   another scenario's lane takes the same arguments and prints the same value:
  *   personaInstanceId <key>                      src/persona-identity.ts, `cscb_<key>`
@@ -239,7 +255,7 @@
  *                                                verdict carried, for the package's RELAUNCH_NO_KILL_*
  *                                                reason and its src/liveness-reading.ts
  *                                                LIVENESS_READING_DEAD* reading named
- *   latchClearRetryAtOnceLineHead <ref>          src/session-manager.ts, the head of the after-clear
+ *   latchClearRetryAtOnceLineHeadForRef <ref>    src/session-manager.ts, the head of the after-clear
  *                                                retry's answer line for persona reference <ref>
  *   DEFAULT_AD_SETTINGS <table> <key>            src/ad-settings.ts: agent-director's default
  *                                                for `[<table>] <key>` (for example `tmux
@@ -1373,6 +1389,18 @@ const latchRecheckRoundLine: Entry = {
   },
 }
 
+/** `latchClearRetryAtOnceLineHead(ref)`: the head of the after-clear retry's lines, `ref` the persona reference `renderPersonaRef` gives the name. */
+const latchClearRetryAtOnceLineHead: Entry = {
+  synopsis: '<persona-name>',
+  async print(args, context) {
+    const entry = 'latchClearRetryAtOnceLineHead'
+    expectArguments(entry, args, ['persona-name'])
+    const ref = (await packageFunction<(name: string) => unknown>(context, 'persona-identity.ts', 'renderPersonaRef'))(args[0])
+    const build = await packageFunction<(ref: string) => unknown>(context, 'session-manager.ts', entry)
+    return builtString(entry, build(builtString(entry, ref)))
+  },
+}
+
 /** `personaTmuxSessionName(key)`: the tmux session name a persona's launches ask for. */
 const personaTmuxSessionName: Entry = {
   synopsis: '<key>',
@@ -1396,6 +1424,10 @@ function adSettingsDefaultMs(name: string): Entry {
     },
   }
 }
+
+/** pane-read.ts's `read-pane` answer kinds a probe round's answer names, each printed as it is. */
+const PANE_READ_KIND_NAMES: readonly string[] = ['PANE_READ_PANE', 'PANE_READ_CONFLICT', 'PANE_READ_GONE']
+
 
 
 /** An entry printing the output of the package builder `name` of `relPath` for its string arguments `argNames`. */
@@ -3012,12 +3044,15 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   adLaunchBoundMs: adSettingsDefaultMs('adLaunchBoundMs'),
   // Scenario 25 (test-27-fmk-unusable-name.sh).
   AD_ERROR_CLASS_UNUSABLE_NAME: constantEntry('ad-error-class.ts', 'AD_ERROR_CLASS_UNUSABLE_NAME'),
+  // Scenario 20 (test-23-fmk-latch-recheck.sh); its DEFAULT_AD_SETTINGS and
+  // RECHECK_VERDICT_STILL_LATCHED are the entries below.
+  ...constantEntries('pane-read.ts', PANE_READ_KIND_NAMES),
+  latchClearRetryAtOnceLineHead,
+  LATCHING_LIVENESS_NOTE: constantEntry('row-read-rules.ts', 'LATCHING_LIVENESS_NOTE'),
   // Scenario 10 (test-22-fmk-wrong-server.sh).
   RECHECK_VERDICT_STILL_LATCHED: constantEntry('conflict-latch.ts', 'RECHECK_VERDICT_STILL_LATCHED'),
   conflictLatchSetLineHead: conflictLatchSetHead,
   PROBE_PANE_READ_LINES: constantEntry('pane-read.ts', 'PROBE_PANE_READ_LINES'),
-  PANE_READ_PANE: constantEntry('pane-read.ts', 'PANE_READ_PANE'),
-  PANE_READ_GONE: constantEntry('pane-read.ts', 'PANE_READ_GONE'),
   STILL_STOPPING_PHRASE: constantEntry('ad-description-phrases.ts', 'STILL_STOPPING_PHRASE'),
   STILL_STARTING_PHRASE: constantEntry('ad-description-phrases.ts', 'STILL_STARTING_PHRASE'),
   AD_SETTINGS_RELATIVE_PATH: constantEntry('ad-settings.ts', 'AD_SETTINGS_RELATIVE_PATH'),
@@ -3040,7 +3075,7 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   reconnectGoneLineHead: reconnectGoneHead,
   relaunchAfterKillLine: relaunchAfterKill,
   relaunchWithoutKillLine: relaunchWithoutKill,
-  latchClearRetryAtOnceLineHead: builderEntry('session-manager.ts', 'latchClearRetryAtOnceLineHead', ['ref']),
+  latchClearRetryAtOnceLineHeadForRef: builderEntry('session-manager.ts', 'latchClearRetryAtOnceLineHead', ['ref']),
   DEFAULT_AD_SETTINGS: adSettingDefault,
   tmuxUnresponsiveOnsetText: builderEntry('persona-episodes.ts', 'tmuxUnresponsiveOnsetText', ['key']),
   tmuxUnresponsiveAlertText: unresponsiveAlert,

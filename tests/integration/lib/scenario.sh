@@ -730,6 +730,9 @@
 #                                      the record does not hold, a server refused before it wrote
 #                                      server.pid included, fails it); the harness's own delete
 #                                      (`ad_delete_unusable_row`) passes. No positive control
+#   shim_verb_lines <verb>              print the agent-director shim's `call` lines of <verb>,
+#                                      whatever their parent (the harness's and every CSCB
+#                                      process's), over the whole log; runs no agent-director
 #   cscb_ad_calls <verb> [<fragment>...]
 #                                      print the agent-director shim's `call` lines whose parent is a
 #                                      CSCB process, whose verb is <verb> (any verb when <verb> is
@@ -4201,6 +4204,22 @@ _scenario_cscb_ad_scan() {
     if [[ "${mode}" == count ]]; then
         echo "${n}"
     fi
+}
+
+shim_verb_lines() {
+    local lines=() i
+    _scenario_query_prep shim_verb_lines
+    _scenario_read_log shim_verb_lines "${SCENARIO_AD_SHIM_LOG}" lines
+    for i in "${!lines[@]}"; do
+        _scenario_split_line "${lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        _scenario_decode_words
+        _scenario_ad_verb
+        if [[ "${_L_VERB}" == "$1" ]]; then
+            printf '%s\n' "${lines[i]}"
+        fi
+    done
+    return 0
 }
 
 cscb_ad_calls() {

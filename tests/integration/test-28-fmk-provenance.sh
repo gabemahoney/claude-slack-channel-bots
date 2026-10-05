@@ -430,7 +430,7 @@ CAP_NOTICE="$(_scenario_printed "${STEP_VALUES}" restartCapReachedNoticeText)"
 SPAWN_FAILURE_HEAD="${CAP_NOTICE%%$'\n'*}"
 # src/session-manager.ts latchClearRetryAnsweredLine: the head of the
 # after-clear retry's answer line, before the outcome it carries.
-RETRY_AT_ONCE_HEAD_B="$(_scenario_printed "${STEP_VALUES}" latchClearRetryAtOnceLineHead "${REF_B}")"
+RETRY_AT_ONCE_HEAD_B="$(_scenario_printed "${STEP_VALUES}" latchClearRetryAtOnceLineHeadForRef "${REF_B}")"
 # src/conflict-latch.ts conflictLatchSetLine: the head of A's and B's latch
 # lines, up to and including `case=` (agent-director's description follows
 # the case).
