@@ -131,6 +131,30 @@
  *                                                <persona-key> and B <launch-bound-ms>
  *                                                (posted as a persona notice: wrap it in
  *                                                formatPersonaNotice)
+ *   DIALOG_POLL_INTERVAL_MS                      src/session-manager.ts, the dialog approver's
+ *                                                pace before G, in decimal
+ *   DIALOG_SLOW_POLL_INTERVAL_MS                 src/session-manager.ts, the dialog approver's
+ *                                                slow pace from G, in decimal
+ *   STARTUP_ERROR_SPAWN_FAILED                   src/session-manager.ts, the startup-errors
+ *                                                label of a launch failure
+ *   LIVE_ROW_SEQUENCE_LOG_PREFIX                 src/live-row-sequence.ts, the prefix of the
+ *                                                live-row sequence's lines
+ *   liveRowSequenceWaitArmedLine <persona-ref> <launch-start-ms> <grace-ms>
+ *                                                src/live-row-sequence.ts: the step-2 wait's
+ *                                                armed line for the persona <persona-ref> (as
+ *                                                the server renders it, `"<name>" (key=<key>)`),
+ *                                                a launch start in epoch milliseconds and G
+ *   liveRowSequenceWaitEndedLine <persona-ref>   src/live-row-sequence.ts: the step-2 wait's
+ *                                                end line
+ *   liveRowSequenceRunLine <persona-ref> <step> <run-number> <placement-export>
+ *                                                src/live-row-sequence.ts: the live-row
+ *                                                sequence's line for one `find-missing` run
+ *                                                of the persona <persona-ref> (as the server
+ *                                                renders it, `"<name>" (key=<key>)`) at step
+ *                                                <step> (3 or 4), run <run-number>, with the
+ *                                                placement the package exports as
+ *                                                <placement-export> (a `LIVE_ROW_RUN_…`
+ *                                                name, for example LIVE_ROW_RUN_NOT_JUDGED)
  *
  * In every `<key>=<integer>` argument <key> is one of the package's
  * AD_TMUX_KEYS and <integer> an integer in decimal; an unknown key, a key
@@ -501,6 +525,51 @@ const relaunchingText: Entry = {
   },
 }
 
+/** `liveRowSequenceWaitArmedLine(<persona-ref>, <launch-start-ms>, <grace-ms>)`: the step-2 wait's armed line. */
+const liveRowWaitArmedLine: Entry = {
+  synopsis: '<persona-ref> <launch-start-ms> <grace-ms>',
+  async print(args, context) {
+    const entry = 'liveRowSequenceWaitArmedLine'
+    expectArguments(entry, args, ['persona-ref', 'launch-start-ms', 'grace-ms'])
+    const [ref, start, grace] = args
+    const startMs = integerArgument(entry, 'launch-start-ms', start)
+    const graceMs = integerArgument(entry, 'grace-ms', grace)
+    const build = await packageFunction<(ref: string, launchStartMs: number, graceMs: number) => unknown>(context, 'live-row-sequence.ts', entry)
+    return builtString(entry, build(ref, Number(startMs), Number(graceMs)))
+  },
+}
+
+/** `liveRowSequenceWaitEndedLine(<persona-ref>)`: the step-2 wait's end line. */
+const liveRowWaitEndedLine: Entry = {
+  synopsis: '<persona-ref>',
+  async print(args, context) {
+    const entry = 'liveRowSequenceWaitEndedLine'
+    expectArguments(entry, args, ['persona-ref'])
+    const build = await packageFunction<(ref: string) => unknown>(context, 'live-row-sequence.ts', entry)
+    return builtString(entry, build(args[0]))
+  },
+}
+
+/**
+ * `liveRowSequenceRunLine(<persona-ref>, <step>, <run-number>, <the package's <placement-export>>)`:
+ * the live-row sequence's line for one `find-missing` run.
+ */
+const liveRowRunLine: Entry = {
+  synopsis: '<persona-ref> <step> <run-number> <placement-export>',
+  async print(args, context) {
+    const entry = 'liveRowSequenceRunLine'
+    expectArguments(entry, args, ['persona-ref', 'step', 'run-number', 'placement-export'])
+    const [ref, stepText, runText, placementExport] = args
+    const step = integerArgument(entry, 'step', stepText)
+    if (step !== 3n && step !== 4n) usageFail(`${entry}: <step> must be 3 or 4 (got '${stepText}')`)
+    const run = integerArgument(entry, 'run-number', runText)
+    if (!/^LIVE_ROW_RUN_[A-Z_]+$/.test(placementExport)) usageFail(`${entry}: <placement-export> '${placementExport}' is not a LIVE_ROW_RUN_… name`)
+    const placement = await packageString(context, 'live-row-sequence.ts', placementExport)
+    const build = await packageFunction<(ref: string, step: number, run: number, placement: string) => unknown>(context, 'live-row-sequence.ts', entry)
+    return builtString(entry, build(ref, Number(step), Number(run), placement))
+  },
+}
+
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = {
   // Scenario 8 (test-20-fmk-old-binary.sh).
@@ -536,6 +605,13 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   STILL_STOPPING_PHRASE: constantEntry('ad-description-phrases.ts', 'STILL_STOPPING_PHRASE'),
   STILL_STARTING_PHRASE: constantEntry('ad-description-phrases.ts', 'STILL_STARTING_PHRASE'),
   stuckLaunchRelaunchingText: relaunchingText,
+  DIALOG_POLL_INTERVAL_MS: constantEntry('session-manager.ts', 'DIALOG_POLL_INTERVAL_MS'),
+  DIALOG_SLOW_POLL_INTERVAL_MS: constantEntry('session-manager.ts', 'DIALOG_SLOW_POLL_INTERVAL_MS'),
+  STARTUP_ERROR_SPAWN_FAILED: constantEntry('session-manager.ts', 'STARTUP_ERROR_SPAWN_FAILED'),
+  LIVE_ROW_SEQUENCE_LOG_PREFIX: constantEntry('live-row-sequence.ts', 'LIVE_ROW_SEQUENCE_LOG_PREFIX'),
+  liveRowSequenceWaitArmedLine: liveRowWaitArmedLine,
+  liveRowSequenceWaitEndedLine: liveRowWaitEndedLine,
+  liveRowSequenceRunLine: liveRowRunLine,
 }
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */

@@ -166,9 +166,10 @@ why:
 - Every `scenario.sh` step that installs, moves or swaps an agent-director
   binary or the shim, every harness agent-director call (`ad`, `ad_capture`, `ad_admin`, `ad_admin_capture`),
   every harness `sqlite3` read or edit (`ad_store_edit`, `ad_store_id`,
-  `ad_store_pending_no_launch`) and every stub-worker helper (`stub_mode`,
-  `stub_press_enter`, `write_mcp_config`) calls `require_ci_image` as its
-  first step, which fails with
+  `ad_store_pending_no_launch`), every stub-worker helper (`stub_mode`,
+  `stub_press_enter`, `stub_release`, `write_mcp_config`) and the
+  agent-director settings writer (`write_ad_settings`) calls
+  `require_ci_image` as its first step, which fails with
   `FAIL: <test>: <step>: refused: /etc/cscb-ci-image is absent …`.
 
 The same helpers then call `require_scenario_home`, which refuses unless
@@ -235,6 +236,10 @@ tests/
                                    # the server; a re-check that cannot run logs once and changes nothing; an ErrInvalidFlags reuse holds or stops; the floor's
                                    # release-candidate form launches; development builds (`0.0.0-dev`, `dev`) are refused, launching nothing; CSCB judges the
                                    # binary's version, never the client's package version (see fmk scenarios below)
+    test-26-fmk-timing-settings.sh # HO §7 scenario 24 (b.jg5 SRJ-1426), fmk: agent-director's timing values are logged and govern the waits: the values line at
+                                   # every start; a held launch's approver pace, pending-row runs and live-row sequence runs waiting on G from its launch start;
+                                   # the relaunching stuck-launch post at B; "still stopping" following the written stopping window; a changed value used from
+                                   # the next read, a `[pause]`-only change logging none (see fmk scenarios below)
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
@@ -254,7 +259,8 @@ tests/
       driver.ts                    # Test 4 driver: builds a one-persona config, calls spawnForPersona directly, then follows the persona's dialog approver through the package's seams
                                    # (running when the launch returns, stops because the row went live, keeps the launch start); deletes no row
       stub-claude.sh               # fake `claude` (Tests 4, 10 and 12, and every fmk script): runs the mode its working directory selects (the dev-channels
-                                   # dialog by default, at once, silent, an unrecognised dialog, the folder-trust prompt), reports in by firing every SessionStart
+                                   # dialog by default, at once, silent, an unrecognised dialog, the folder-trust prompt, at once and lingering after `pause`'s
+                                   # `/exit`), reports in by firing every SessionStart
                                    # hook its `--settings` registers, and SessionEnd on its exit sentinel, as direct children of its own process (exec form:
                                    # `command` with its `args`; shell form: the command's words); re-fires SessionStart while its row reads `pending`, up to G;
                                    # holds an MCP session to the bot server (see The stub worker)
@@ -440,9 +446,10 @@ fmk mode. Sourcing also:
   store yet. `SCENARIO_AD_START` is `release` (the default) or `0.10.0`; a
   shared-mode script that sets it fails;
 - writes no agent-director `config.toml`, so agent-director runs on its
-  default settings. Scenarios 10 and 24 are the exceptions: they write a
-  `[tmux]` table. Test 0 writes one too, after its re-fire legs (see
-  Layout);
+  default settings. Scenarios 10 and 24 (Test 26) are the exceptions: they
+  write a `[tmux]` table with `write_ad_settings` (see Harness agent-director
+  calls and store helpers below). Test 0 writes one too, after its re-fire
+  legs (see Layout);
 - once `SCENARIO_PORT` is picked, writes `$HOME/.claude/slack-mcp.json`
   (`write_mcp_config`), naming the bot server's MCP URL on that port, the
   `mcp_config_path` a persona config defaults to, so the stub's MCP session
@@ -542,6 +549,25 @@ Harness agent-director calls and store helpers:
   saying why, unless it is 16 lowercase hex characters.
   `ad_store_pending_no_launch <instance-id>` is one such edit (see The stub
   worker).
+- `write_ad_settings [--pause <value>] [<key>=<value>...]` is the one writer
+  of the scenario HOME's agent-director settings file (a harness addition
+  for scenarios 24 and 10). The file is HOME joined with the package's
+  `AD_SETTINGS_RELATIVE_PATH`, and the table and pause-key names are the
+  package's too, all read through `fixtures/fmk-texts.ts`. It replaces the
+  file whole by one rename (`write_file`), so neither agent-director nor
+  CSCB reads half a file: a `[tmux]` table holding each `<key> = <value>`
+  in the order given, then, with `--pause`, a `[pause]` table holding
+  `timeout_seconds = <value>`. Each value is written as the TOML text given,
+  so a value below its minimum or of the wrong type can be written on
+  purpose. With no argument it removes the file, which puts agent-director
+  back on its defaults. It fails on a key that is not a lowercase TOML bare
+  key, a key given twice, or a value that is empty or holds a control
+  character, and refuses a settings directory
+  that resolves outside `SCENARIO_ROOT` or a path that is not a regular
+  file. It then reads the file back, fails unless it holds exactly what was
+  written, and sets `AD_SETTINGS_FILE` to its path.
+  `_scenario_ad_tmux_setting`, the stub's re-fire and
+  `ad_store_mark_finished` read the `[tmux]` values it writes.
 - Each of these, `install_ad_shim` and every other install helper above, and
   every helper under Harness-only steps below, calls `require_ci_image` and
   then `require_scenario_home` as its first two steps (see Image marker).
@@ -751,7 +777,8 @@ These hold for every fmk script (b.jg5 SRJ-1401):
 - It runs on the release (binary, agent-director-admin, client, and
   `install.sh` with its migration) unless it sets `SCENARIO_AD_START=0.10.0`, and at
   agent-director's default settings, with no `config.toml`, unless it is
-  scenario 10 or 24, which write a `[tmux]` table. Test 0, the harness's
+  scenario 10 or 24 (Test 26), which write a `[tmux]` table with
+  `write_ad_settings`. Test 0, the harness's
   self-check rather than a scenario, writes one once its re-fire legs are
   done, for its finished-row kill (see Layout).
 - It runs with both shims: `tmux-shim.sh` first on the PATH of its CSCB
@@ -785,7 +812,9 @@ These hold for every fmk script (b.jg5 SRJ-1401):
 - CSCB's timings are shortened only through its configuration
   (`health_check_interval`, `session_restart_delay`) and the package's
   exported seams, never by editing `src/`. agent-director's are changed only
-  through the `[tmux]` table of scenarios 10 and 24; every other scenario
+  through the `[tmux]` table of scenarios 10 and 24, written with
+  `write_ad_settings`, beside which scenario 24 also writes a `[pause]`
+  table; every other scenario
   waits out agent-director's default windows (at least 300 s where it needs
   the starting-session bound, as the finished-row kill does).
 - Posts are read from the Slack stub's record (`slack-stub-server.ts
@@ -804,6 +833,7 @@ not a scenario.
 |---|---|---|
 | 8 | `test-20-fmk-old-binary.sh` | b.jg5 SRJ-1410 (AC 21, 22, 23) |
 | 23 | `test-20-fmk-old-binary.sh` (legs 23a to 23c, after scenario 8's) | b.jg5 SRJ-1425 (AC 1, 11) |
+| 24 | `test-26-fmk-timing-settings.sh` | b.jg5 SRJ-1426 (AC 80, 84) |
 
 #### Scenario 8: test-20
 
@@ -1012,6 +1042,150 @@ package, beside scenario 8's floor, floor label and floor message:
 | The AC 11 check: whether the client's package version meets the floor | `meetsPhase1Floor <version>` | `src/ad-version-gate.ts` |
 | The `0.0.0-dev` floor message, startup form | `buildBelowPhase1FloorMessage 0.0.0-dev <path> startup` | `src/ad-version-gate.ts` |
 
+#### Scenario 24: test-26
+
+Test 26 shows agent-director's timing values are logged and govern CSCB's
+waits. It runs in fmk mode on the release, with the Slack stub recording
+each `chat.postMessage` text whole. Before the first start it writes the
+scenario HOME's agent-director settings file with `write_ad_settings`, a
+`[tmux]` table holding the scenario inputs SRJ-1426 names; scenario 24 is
+one of the two scenarios that write `[tmux]` (b.jg5 SRJ-1401, SRJ-1306).
+Each key is checked to be one of the package's `AD_TMUX_KEYS`, and each
+value to be at or above its minimum, before it is written:
+
+| `[tmux]` key | Written | Minimum it is checked against |
+|---|---|---|
+| `pending_grace_seconds` | 120 (240 in the change leg) | `pendingGraceMinimumSeconds` at the default `create_timeout_ms` and `pipe_close_wait_ms` |
+| `stopping_window_seconds` | 30 | `AD_SETTING_MINIMUMS stopping_window_seconds` |
+| `starting_session_seconds` | 120 | `AD_SETTING_MINIMUMS starting_session_seconds` |
+
+The other six `[tmux]` values stay agent-director's defaults. At these
+values G is 120 s, B 300 s and the alert threshold 180 s (printed, not used:
+the alert timings are unit-tested). CSCB's config sets
+`health_check_interval` 0 (no health tick launches anyone),
+`resume_enabled` true (S's finished row comes back by a `resume`),
+`exit_timeout` 5 and `agent_director_poll_interval_ms` 3600000 (the
+permission poller's `list` calls stay out of the shim's log), all CSCB's
+own, through its config. Test 26 runs about 19 minutes, most of it the held
+launch's B and the change leg's three waits for the next timed probe.
+
+Each persona (`t26_<x>`, one channel each) has its stub mode selected for
+its working directory with `stub_mode`:
+
+| Persona | Working directory and stub mode | Added |
+|---|---|---|
+| S | `work/s`, `linger-on-exit` | in the config from the first start |
+| P | `work/p`, `unrecognised-dialog`, switched to `at-once` before B so the relaunch after the abort reports in | across a plain stop and start |
+| Q | `work/q_link`, a symlink to `work/q_held` (`unrecognised-dialog`), re-pointed to `work/q_ready` (`at-once`) | across a plain stop and start |
+| R | `work/r`, `unrecognised-dialog`, answered by `stub_press_enter` | by a confirmed reload |
+
+A persona added across a restart is a plain stop, the config written, the
+state dir's `config.json.last-applied` removed, and a start: with no
+last-applied record the start applies `config.json` as it stands, with no
+preview to confirm (see "Reload" in the repository's `README.md`). R's reload is confirmed by
+renaming `config.json.pending` to `config.json.apply`, as Test 8 does.
+
+The harness steps, all from the scenario's own shell: `write_ad_settings`
+(set-up and the change leg), `stub_mode`, `stub_release` (S's lingering
+stub), `stub_press_enter` (R's dialog), re-pointing Q's symlinked working
+directory by one rename (Q's row records the real path, so its `cwd` no
+longer matches), the plain stops and starts, the `last-applied` removal and
+the reload's confirmation, and harness `get` calls that read a row's
+`launch_started_at` and `ended_at`. Every start of the script logs exactly
+one values line.
+
+The legs run in order, each on the state the one before left:
+
+- values. The first start, with S: exactly one values line, equal to the
+  printer's `buildAdSettingsValuesLine` for the written path, the three
+  written values and the six defaults (it carries the nine `[tmux]` values
+  only).
+- stopping (scenario 13's "still stopping"). With S up, its session's
+  creation time is taken, then `stop --stop-bots` (CSCB's `pause` makes S's
+  row `ended` while its stub lingers) and `start` at once. S's first
+  `resume`, made less than `stopping_window_seconds` after the row's
+  recorded `ended_at`, gets exactly one refusal line carrying
+  `STILL_STOPPING_PHRASE`. S's next `resume` (CSCB's UNAVAILABLE retry) is
+  made more than the window after `ended_at`, while the old worker still
+  runs and its session is younger than `starting_session_seconds`: its
+  refusal carries `STILL_STARTING_PHRASE` and never `STILL_STOPPING_PHRASE`.
+  After `stub_release`, a later `resume` brings S up (`waiting`). There is
+  no post to S's channel, every refusal line says no spawn-failure notice,
+  and there is no `spawn-failed` entry, no latch and no counted launch
+  failure.
+- held. P, launched by this server process: its `launch_started_at` is
+  read. P's `read-pane` calls in (G/2, G) from the launch start are more
+  than a 5 s pace allows, and those in (G + 5 s, G + 65 s) are at most that
+  (`floor(d / 5) + 1` reads in a window of d seconds). There is no CSCB
+  `find-missing` before the launch start plus G, and no post to P's channel
+  or CSCB kill of P before the relaunching post. Exactly one relaunching
+  post, compared whole: its stub record time is no earlier than B and less
+  than 30 s after it, and its text is the printer's relaunching notice for
+  P with B (in whole minutes). The stuck-launch line is no earlier than B.
+  P's pending-row lines and the abort that follows the post are printed,
+  not asserted; P then reports in.
+- sequence. Q is added across a restart and held; its launch start L is
+  read and its symlink re-pointed, then a plain stop and start runs before
+  L + G (a restart without teardown). The restart's start sweep (b.jg5
+  SRJ-714) runs first: it kills Q's live row, whose `cwd` is no longer the
+  persona's working directory, and makes its one `find-missing` run at
+  once. Its lines are printed, not asserted, since SRJ-1426's G rule is the
+  live-row sequence's. The start pass then starts Q's live-row sequence
+  (the script fails, saying so, when it does not). Its kill of Q comes
+  before its step-2 wait; the wait's armed line equals the printer's for L
+  and G; its first `find-missing` run comes no earlier than L + G, with no
+  CSCB `find-missing` between the sequence's start and it; and the wait's
+  end line is no earlier than L + G. Q is brought up by a reuse spawn. A
+  run line saying a run left Q's `pending` row in neither list is followed
+  by no kill of Q, and there is no post to Q's channel.
+- change. A `[pause]`-only change (`timeout_seconds` 60, the `[tmux]`
+  values kept) logs no values line through the next bot-server probe.
+  `pending_grace_seconds` raised to 240 logs exactly one values line,
+  naming 240, after the next probe and none before it. R, added by a
+  confirmed reload and held at its dialog, makes more `read-pane` calls in
+  (L + 130 s, L + 170 s) from its launch start L than a 5 s pace allows, so
+  the raised G is in use; a harness Enter brings R up. The earlier `[tmux]`
+  values are then written back with no `[pause]` table, and whether a
+  values line follows the next probe is printed.
+
+A bot-server probe is a CSCB `version` call in the agent-director shim's
+log whose parent is the bot server; the server reads the settings file
+again after each timed probe (`installAdSettings`, `src/ad-settings.ts`),
+so each change-leg wait is bounded by the re-check interval plus 10 s.
+Every time comes from the script's own polling, a shim line's time field,
+a `server.log` line's ISO prefix, a stub record's `ts`, or a row's
+`launch_started_at` or `ended_at`.
+
+Matched values, each printed by `fixtures/fmk-texts.ts` from the installed
+package:
+
+| Value | Printer entry | `src/` |
+|---|---|---|
+| The nine `[tmux]` keys | `AD_TMUX_KEYS` | `src/ad-settings.ts` |
+| The written values' minimums | `AD_SETTING_MINIMUMS <key>`, `pendingGraceMinimumSeconds` | `src/ad-settings.ts` |
+| The defaults the grace minimum is taken at | `DEFAULT_AD_SETTINGS tmux <key>` | `src/ad-settings.ts` |
+| The settings file's path, table names and pause key (read by `write_ad_settings`) | `AD_SETTINGS_RELATIVE_PATH`, `AD_TMUX_TABLE`, `AD_PAUSE_TABLE`, `AD_PAUSE_TIMEOUT_KEY` | `src/ad-settings.ts` |
+| The values line's prefix | `AD_SETTINGS_LOG_PREFIX` | `src/ad-settings.ts` |
+| The values lines | `buildAdSettingsValuesLine <path> <key>=<value>...` | `src/ad-settings.ts` |
+| G, B and the alert threshold | `adGraceMs`, `adLaunchBoundMs`, `adAlertThresholdMs` | `src/ad-settings.ts` |
+| B in whole minutes | `wholeMinutes <B>` | `src/ad-settings.ts` |
+| The re-check interval | `AD_VERSION_RECHECK_INTERVAL_MS` | `src/ad-version-gate.ts` |
+| The approver's paces before and from G | `DIALOG_POLL_INTERVAL_MS`, `DIALOG_SLOW_POLL_INTERVAL_MS` | `src/session-manager.ts` |
+| The "still stopping" and "still starting" phrases | `STILL_STOPPING_PHRASE`, `STILL_STARTING_PHRASE` | `src/ad-description-phrases.ts` |
+| The relaunching post for P | `formatPersonaNotice <P> stuckLaunchRelaunchingText <P's key> <B>` | `src/persona-notifier.ts`, `src/pending-row.ts` |
+| The spawn-failed class | `STARTUP_ERROR_SPAWN_FAILED` | `src/session-manager.ts` |
+| The live-row sequence's prefix | `LIVE_ROW_SEQUENCE_LOG_PREFIX` | `src/live-row-sequence.ts` |
+| The step-2 wait's armed and end lines | `liveRowSequenceWaitArmedLine <Q's ref> <L> <G>`, `liveRowSequenceWaitEndedLine <Q's ref>` | `src/live-row-sequence.ts` |
+| A run left in neither list | `liveRowSequenceRunLine <Q's ref> <step> <run> LIVE_ROW_RUN_NOT_JUDGED` | `src/live-row-sequence.ts` |
+
+Lines with no exported builder are matched by a fragment quoted from `src/`,
+each with its source named beside it in the script: the refusal line and
+its no-notice tail (`src/session-manager.ts` `logRefusal`), the latch line
+(`src/conflict-latch.ts`), the stuck-launch line
+(`src/pending-row.ts`), the relaunch-failed line (`src/restart.ts`), the
+start sweep's lines (`src/session-manager.ts` `reconcileOrphans`) and the
+`reload-applied` line (`src/reload-apply.ts`).
+
 ### The value printer
 
 `tests/integration/fixtures/fmk-texts.ts` is the one value printer of the
@@ -1056,6 +1230,36 @@ builder's output for the given arguments.
 | `AD_SYSTEM_INSTALL_UNREACHABLE` | the class label | `src/install-check-labels.ts` |
 | `UNREACHABLE_REASON_UNPARSEABLE_VERSION` | the `ErrSystemInstallUnreachable` reason of a version that does not parse | `src/ad-version-gate.ts` |
 | `meetsPhase1Floor <version>` | whether `<version>` meets the Phase 1 floor: `true` or `false` | `src/ad-version-gate.ts` |
+| `AD_SETTINGS_LOG_PREFIX` | the prefix of the settings reader's log lines | `src/ad-settings.ts` |
+| `buildAdSettingsValuesLine <path> [<key>=<integer>...]` | the values line for the settings file `<path>`: the nine `[tmux]` values, `DEFAULT_AD_SETTINGS`' own but for each given `<key>` | `src/ad-settings.ts` |
+| `AD_SETTINGS_RELATIVE_PATH` | the settings file's path relative to a HOME | `src/ad-settings.ts` |
+| `AD_TMUX_TABLE` | the timing keys' table name | `src/ad-settings.ts` |
+| `AD_PAUSE_TABLE` | `pause`'s table name | `src/ad-settings.ts` |
+| `AD_PAUSE_TIMEOUT_KEY` | `pause`'s wait key | `src/ad-settings.ts` |
+| `AD_TMUX_KEYS` | the nine `[tmux]` keys, in order, joined by single spaces | `src/ad-settings.ts` |
+| `AD_SETTING_MINIMUMS <key> [<part>]` | agent-director's minimum for `[tmux] <key>`, in decimal; for a minimum with parts (`pending_grace_seconds`), the named `<part>` (`floor` or `addend`) | `src/ad-settings.ts` |
+| `pendingGraceMinimumSeconds <create-timeout-ms> <pipe-close-wait-ms>` | the grace period's minimum, in decimal | `src/ad-settings.ts` |
+| `adGraceMs [<key>=<integer>...]` | G, in decimal | `src/ad-settings.ts` |
+| `adAlertThresholdMs [<key>=<integer>...]` | the alert threshold, in decimal | `src/ad-settings.ts` |
+| `adLaunchBoundMs [<key>=<integer>...]` | B, in decimal | `src/ad-settings.ts` |
+| `wholeMinutes <ms>` | `<ms>` in whole minutes, rounded down | `src/ad-settings.ts` |
+| `STILL_STOPPING_PHRASE` | the phrase an `ErrTmuxUnresponsive` carries for a row that still appears to be stopping | `src/ad-description-phrases.ts` |
+| `STILL_STARTING_PHRASE` | the phrase an `ErrTmuxUnresponsive` carries for a row that still appears to be starting | `src/ad-description-phrases.ts` |
+| `stuckLaunchRelaunchingText <persona-key> <launch-bound-ms>` | the stuck-launch post's relaunching text for that persona key and B (posted as a persona notice: wrap it in `formatPersonaNotice`) | `src/pending-row.ts` |
+| `DIALOG_POLL_INTERVAL_MS` | the dialog approver's pace before G, in decimal | `src/session-manager.ts` |
+| `DIALOG_SLOW_POLL_INTERVAL_MS` | the dialog approver's slow pace from G, in decimal | `src/session-manager.ts` |
+| `STARTUP_ERROR_SPAWN_FAILED` | the startup-errors class a failed start-pass launch writes | `src/session-manager.ts` |
+| `LIVE_ROW_SEQUENCE_LOG_PREFIX` | the prefix of the live-row sequence's lines | `src/live-row-sequence.ts` |
+| `liveRowSequenceWaitArmedLine <persona-ref> <launch-start-ms> <grace-ms>` | the step-2 wait's armed line for that persona ref (`"<name>" (key=<key>)`), launch start in epoch milliseconds and G | `src/live-row-sequence.ts` |
+| `liveRowSequenceWaitEndedLine <persona-ref>` | the step-2 wait's end line | `src/live-row-sequence.ts` |
+| `liveRowSequenceRunLine <persona-ref> <step> <run-number> <placement-export>` | the sequence's line for one `find-missing` run at step 3 or 4, with the placement the package exports as `<placement-export>` (a `LIVE_ROW_RUN_…` name) | `src/live-row-sequence.ts` |
+
+`adGraceMs`, `adAlertThresholdMs` and `adLaunchBoundMs` take the values in
+effect built from their arguments: the `[tmux]` values, `DEFAULT_AD_SETTINGS`'
+own but for each given `<key>`, and `DEFAULT_AD_SETTINGS_IN_EFFECT`'s
+`pauseTimeout`. In every `<key>=<integer>` argument `<key>` is one of the
+package's `AD_TMUX_KEYS`; an unknown key, a key given twice or a value that
+is not an integer exits 64.
 
 ### Harness-only steps
 
@@ -1273,12 +1477,23 @@ names are `scenario.sh` constants:
 | `silent` | `STUB_MODE_SILENT` | Prints nothing and never reports in; its exit sentinel fires no SessionEnd |
 | `unrecognised-dialog` | `STUB_MODE_UNRECOGNISED` | Prints a startup dialog that neither of the approver's needles matches, so CSCB never answers it, and reports in once Enter reaches its pane: the harness's `stub_press_enter <target>`, a human answering (scenarios 20 and 21) |
 | `folder-trust` | `STUB_MODE_FOLDER_TRUST` | Reports in at once when its folder is trusted in `<CLAUDE_CONFIG_DIR>/.claude.json`, or in `~/.claude.json` when `CLAUDE_CONFIG_DIR` is unset or empty; otherwise prints the folder-trust prompt and reports in once it is answered by Enter (scenario 22) |
+| `linger-on-exit` | `STUB_MODE_LINGER_ON_EXIT` | Reports in at once. On the `/exit` line agent-director's `pause` types, it marks itself lingering, fires every SessionEnd hook (the row reads `ended`), stops its re-fire and ends its MCP session, then keeps running, its pane and session with it, as a Claude Code still shutting down does, until `stub_release` or its stdin closing. Before it has reported in, `/exit` is ignored (scenarios 24 and 13) |
 
 `stub_press_enter <target>` sends Enter with the real tmux, from the
 scenario's own shell, into a pane on the scenario's tmux server: a pane id is
 used as given, and a session name is matched exactly, never as a prefix of
 another session's. It fails with tmux's message when tmux refuses, and
 refuses when `TMUX` is set or `TMUX_TMPDIR` is not the scenario's.
+
+`stub_release <target> [<timeout-s>]` ends a stub lingering in
+`linger-on-exit`: it reads the pane's process with the real tmux, from the
+scenario's own shell (the pane named as for `stub_press_enter`), sends it
+SIGUSR1 and fails unless it is gone within `<timeout-s>`
+(`SCENARIO_STUB_RELEASE_S`, 10 s, by default). Before any signal it refuses
+unless that process is a stub lingering in `linger-on-exit`, which a
+lingering stub shows by its marker `stub-claude-lingering.<pid>` beside it
+in `SCENARIO_BIN`; it refuses, as `stub_press_enter` does, when `TMUX` is
+set or `TMUX_TMPDIR` is not the scenario's.
 
 A scenario whose launch loses its create reply (`slow-create`) keeps a mode
 that waits for the approver's Enter, as the default does: agent-director
