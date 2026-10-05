@@ -230,6 +230,10 @@ tests/
     test-22-fmk-wrong-server.sh
                                    # HO §7 scenario 10 (b.jg5 SRJ-1412), fmk: a find-missing from another tmux environment marks nothing; the own-id conflict latches
                                    # and clears (see fmk scenario list). It writes the scenario HOME's `[tmux]` table and runs about ten minutes
+    test-28-fmk-provenance.sh
+                                   # HO §7 scenario 26 (b.jg5 SRJ-1428), fmk: CSCB never touches @ad_owner/@ad_pane; renamed, re-bound and restarted tmux
+                                   # servers (see fmk scenario list). Its first legs: a renamed session, another TMUX_TMPDIR, a re-bound socket, and no
+                                   # CSCB-parented tmux line. It runs at agent-director's default settings and holds past the outage's third retry
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
@@ -657,6 +661,16 @@ record under `SCENARIO_ROOT` (0 when it holds none).
 line (`jq -r` gives a post's text back). Each runs `require_ci_image` first
 and refuses a record that is not a file under `SCENARIO_ROOT`.
 
+CSCB's tmux calls (fmk mode; scenario 26; each a harness addition, confirm
+at the reconcile pass). `cscb_tmux_calls [<fragment>...]` prints the tmux
+shim's `call` lines whose parent is any CSCB process the record holds at the
+line's time (a bot server, a `start` or `stop` run, or a CLI command or
+driver run through `cscb_run`), and whose words, joined by single spaces,
+hold every fixed-string fragment in order; `cscb_tmux_count` with the same
+arguments prints how many. A line whose parent is agent-director, the
+scenario's own shell or a stub is never one. `assert_no_server_tmux` reads
+bot-server parents only.
+
 Matchers (E14 director decision 14). A matcher is one or more fixed-string
 fragments that must appear on one line in the given order, with anything
 between them; there is no regex. A plain string is a one-fragment matcher, so
@@ -783,6 +797,7 @@ script's header comment is its full specification.
 | Scenario | Script | Sites | Outcomes checked | Modes, helpers and settings |
 |---|---|---|---|---|
 | 10 (b.jg5 SRJ-1412; AC 1, AC 5) | `test-22-fmk-wrong-server.sh` | Part A: two harness `find-missing` runs (`ad_capture`) while the persona's worker runs, one with `TMUX_TMPDIR` set for that call only to an empty directory under `SCENARIO_ROOT`, one with `TMUX` set for that call only to a second tmux server (`start_second_tmux_server`). Part B: the harness's one store statement (`ad_store_mark_finished <id> missing`, scenario 10 part B's), made once the session is older than the larger `[tmux]` minimum; then the bot server restarted without teardown (a plain `stop`, then `start`), whose bring-up makes a plain `spawn` (agent-director answers `ErrInstanceIdCollision`) and then a `resume`; the latch re-check's probe; the human's finished-row kill, `ad_kill_include_finished` (agent-director-admin's `kill-finished`) from the scenario's own shell; the re-check after it | Part A: each run exits 0 with an `ids` array that does not hold the persona's instance id, logged with the scenario's shell as parent, and the prefix assignment does not outlive the call; the script does not check that each run saw the other environment (the shim logs arguments and parent, not environment). Then the row still reads `waiting` and the worker runs, and over one re-check interval and 5 s more no CSCB process makes a `resume`, `spawn`, `kill`, `read-pane` or `send-keys` for the persona, nor any `find-missing`; no post and no latch line. Part B, the latch: the new bot server's `resume` meets the own-id CONFLICT (`CONFLICT_OWN_ID_PHRASE`); an UNAVAILABLE line carrying `STILL_STOPPING_PHRASE` or `STILL_STARTING_PHRASE` may come before it, and none after (the wait past the starting-session bound means none is expected); the persona latches with `LATCH_CASE_OWN_ID`; exactly one post, carrying in order the persona prefix with `CONFLICT_NOTICE_FIRST_LINE_HEAD` and the quoted session name, `conflictCaseSentence`, `CONFLICT_NOTICE_POINTER_LINE` and `CONFLICT_NOTICE_HUMAN_ONLY_LINE` (`src/conflict-latch.ts`), with no session-ending command form in its CSCB-authored lines (`sessionEndingCommandsIn`). The held latch, over two re-checks: each window holds exactly one `status` and then one `read-pane --n-lines` `PROBE_PANE_READ_LINES` by the bot server (`version` left out), the round logs `still-latched (pane)` (src/session-manager.ts runLatchRecheckRound, from `RECHECK_VERDICT_STILL_LATCHED` and `PANE_READ_PANE`), no further post, the worker runs and the row reads `missing`. The kill: `kill_sent` true, the session and worker gone, `state`, `ended_at` and `row_version` unchanged. The clear: from the second re-check to the first `resume` after it, exactly `status`, the one-line `read-pane`, `find-missing` and `resume`, once each; the round logs `probe-cleared (gone)` (src/session-manager.ts, from `PANE_READ_GONE`, agent-director's `ErrTmuxCaptureFailed`); the row reads `waiting` again; the second and last post of part B is exactly `formatPersonaNotice` of `conflictRecoveryText` with `LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED`. Close: one finished-row kill in the shim log, the harness's, parented by the scenario's shell; no CSCB `kill`, and no CSCB `spawn` from the latch on | tmux-shim `log`; the stub's `dev-channels` hold (`STUB_MODE_DEV_CHANNELS`); `health_check_interval` 0; `agent_director_poll_interval_ms` at its allowed maximum (`MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS`, src/config.ts), so the permission poller's `list` calls do not fall in the counted re-check windows; the `[tmux]` table (`write_ad_tmux_table`) with `stopping_window_seconds` 30 and `starting_session_seconds` 60, their minimums from `AD_SETTING_MINIMUMS` (src/ad-settings.ts). Every text, phrase, label, interval and line count from `fixtures/fmk-texts.ts`; calls read with `cscb_ad_calls_between` / `cscb_ad_count_between` between `ad_shim_mark` marks, posts with `slack_record_mark` and `slack_posts`. Runs about ten minutes |
+| 26 (b.jg5 SRJ-1428, first legs; AC 1, AC 19, AC 86) | `test-28-fmk-provenance.sh` | Two personas, A and B. Renamed session: the harness renames A's session (`rename_session`), then the bot server restarted without teardown (a plain `stop`, then `start`), which for A's live `waiting` row makes `get`, a plain `spawn` (agent-director answers `ErrInstanceIdCollision`), `get` and a `send-keys` of `/mcp reconnect …` (its reconnect of the stub, whose MCP session ended with the old bot server), and no pane read; `fmk-driver.ts`'s `read-pane-other-tmux-tmpdir` for A through `cscb_run`; then `stop --stop-bots` (`stop_server --stop-bots`), whose teardown's pause times out (the `at-once` stub never answers `/exit`), and a start again. Another `TMUX_TMPDIR`: `fmk-driver.ts`'s `read-pane-other-tmux-tmpdir` for A and for B, with `TMUX_TMPDIR` set for that one call to an empty directory under `SCENARIO_ROOT`. Re-bound socket: the harness re-binds the scenario's socket path while the recorded server runs (`rebind_tmux_socket`), then the bot server restarted without teardown, whose reconnect is the tmux-touching call; the retry timer's waiting-row checks; then the harness restores the socket (`restore_tmux_socket`). Close: `stop --stop-bots`, then a scan of the tmux shim's log | Renamed session: a bot-server-parented `send-keys` of A follows the rename and reaches the renamed session's pane (A's stub opens a new MCP session); server.log holds no waiting-row GONE, reconnect GONE or escalate-dead line for A since the restart (`waitingRowPaneGoneLineHead`, `reconnectGoneLineHead`, `escalateDeadSweepLineHead`, src/session-manager.ts); no CSCB `resume`, `kill` or `delete` of A, and the restart's one refused `spawn` launched nothing (worker, pane process and launch token as before); A's row reads `waiting`. The driver's pane read of A answers `outcome=` `PANE_READ_PANE` with a driver-parented `read-pane`. The teardown's one-line `read-pane` (`PROBE_PANE_READ_LINES`) and plain `kill` of A (no `--include-finished`) both have the `stop` run as parent, and A's worker and renamed session are gone; after the start both rows read `waiting`. Another `TMUX_TMPDIR`: per persona one `DRIVER:` line with that `tmux_tmpdir`, `restored=true` and `outcome=` `PANE_READ_PANE`, a driver-parented `read-pane`; both rows read `waiting`, both workers as before, and no CSCB `spawn`, `resume`, `kill` or `delete`. Re-bound socket: each persona's first post is exactly `formatPersonaNotice` of `tmuxServerChangedOnset` (src/outage-state.ts, SRJ-1021); held until the third retry (from `UNAVAILABLE_RETRY_BASE_S`, src/unavailable-retry.ts: 210 s) and 30 s more, each persona's posts run onset, then any number of all-clear (`ALL_CLEAR_TEMPLATE` `tmux-unavailable`) and onset pairs, never the generic `ONSET_TEMPLATES` `tmux-unavailable` onset; server.log carries `DIFFERENT_TMUX_SERVER_PHRASE` (src/ad-description-phrases.ts); at least three bot-server `read-pane` calls per row; no CSCB `kill`, `delete`, `resume` or launching `spawn`; both rows read `waiting` with the same workers. After the restore each persona's last post is its all-clear (waited for until the fourth retry, 450 s after the onset, and 30 s more), the sequence still fits, each stub opens a new MCP session, and both rows read `waiting` with the same workers. Close: `cscb_tmux_count` finds no tmux shim line whose parent is a CSCB process (bot server, `start` or `stop` run, driver run), so none carries `SCENARIO_AD_OWNER_OPTION` or `SCENARIO_AD_PANE_OPTION`; the filter's control counts exactly the bot-server, `stop`-run and driver-parented lines added to a copy of the log, not the scenario shell's or an unrecorded process's; the positive control finds lines carrying each option with an agent-director parent; then the three closing assertions. SRJ-716's static half is `tests/fmk-source-audit.test.ts`. The script keeps a marked place before its close for scenario 26's other legs (a restarted tmux server, `remain-on-exit`, a `pending` row with no launch start), which this row does not cover | tmux-shim `log`; the stub's `at-once` mode (`STUB_MODE_AT_ONCE`), not the `dev-channels` hold: the answered dialog's text stays on the stub's pane, where the waiting-row check's pane read finds a prompt; agent-director's default settings (no `[tmux]` table); `health_check_interval` 0; `agent_director_poll_interval_ms` at its allowed maximum (`MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS`, src/config.ts). Working default (pending the orchestrator's decision): the bot-server restart without teardown is the trigger, and the SRD's "a health check's pane read" of the renamed session is shown by the restart's `send-keys`, the driver's pane read and the teardown's precheck `read-pane`. Every text, phrase, interval and line head from `fixtures/fmk-texts.ts`; calls read with `cscb_ad_calls_between` between `ad_shim_mark` marks, tmux calls with `cscb_tmux_calls` / `cscb_tmux_count`, posts with `slack_record_mark` and `slack_posts`. Holds about eight minutes in the re-bound leg |
 
 ### Harness-only steps
 
@@ -818,6 +833,7 @@ of another session's.
 | Respawning a worker's pane with another process | `respawn_worker_pane` |
 | Restarting the scenario's tmux server | `restart_tmux_server` |
 | Re-binding its socket path while the old server runs | `rebind_tmux_socket` |
+| Restoring a re-bound socket path to the recorded server, scenario 26 (harness addition, confirm at the reconcile pass) | `restore_tmux_socket` |
 | Scenario 10 part B's store statement | `ad_store_mark_finished` |
 | Scenario 19's `pending` row beside a leftover | `ad_store_seed_pending` |
 | Scenario 25's unusable recorded name | `ad_store_unusable_name` |
@@ -877,6 +893,26 @@ Each is a harness addition, confirm at the reconcile pass.
   only, is made from the scenario's own shell and reaches the binary behind
   the shim. The shim logs the call's arguments and parent, not its
   environment.
+
+#### Scenario 26's harness additions
+
+Each is a harness addition, confirm at the reconcile pass.
+
+- `restore_tmux_socket <moved-socket>` undoes `rebind_tmux_socket`, from the
+  scenario's own shell with the real tmux, refusing as the tmux steps do.
+  `<moved-socket>` is the `<socket>.rebound-<n>` socket under
+  `SCENARIO_ROOT/tmux` that `rebind_tmux_socket` moved the recorded server's
+  socket to (`REBOUND_SOCKET`). It reads the recorded server there, with its
+  sessions and panes, ends the other server at `<socket>` (`kill-server`,
+  then waits until its process is gone), moves `<moved-socket>` back to
+  `<socket>`, and fails unless `<socket>` then answers with the recorded
+  server's PID and the same sessions, panes and pane processes, each pane
+  process still running. It prints the recorded server's PID and clears
+  `REBOUND_SOCKET`.
+- `SCENARIO_AD_OWNER_OPTION` and `SCENARIO_AD_PANE_OPTION` are the two tmux
+  option names agent-director labels a session and its worker pane with,
+  `@ad_owner` and `@ad_pane`, as the seeding helpers set them. `src/` names
+  neither (SRJ-716).
 
 #### Seeding rules
 
@@ -1091,7 +1127,13 @@ package's own MCP SDK as client `stub-claude` version `0.0.0-stub`, and
 answers the server's roots request with the stub's working directory, by
 which the server matches the persona. It ends with the stub (its exit, a
 kill, the pane's hang-up), so a stopped persona reads not connected; when the
-server ends it, a later `/mcp reconnect` in the pane opens a new one. Its
+server ends it, a later `/mcp reconnect` in the pane opens a new one. The
+stub takes that line alone or with a server's name after it, the form CSCB
+types (`/mcp reconnect slack-channel-router`: src/session-manager.ts
+reconnectMcpWithCause with `MCP_SERVER_NAME`, src/config.ts); with a name, it first ends a client still running,
+as Claude Code reconnects the named server whatever its session's state
+(after a bot-server restart the old client may not yet have seen its
+session end), then opens a new one. Its
 lines go to `stub-mcp-session.log` beside the stub. No session is opened in
 a mode that has not reported in, without `--mcp-config`, or where the client
 is not beside the stub (Tests 4, 10 and 12, which copy only the stub and run

@@ -664,6 +664,37 @@
 #                                      (default 0), in record order, one JSON string per line
 #                                      (`jq -r` gives a post's text back)
 #
+#   Scenario 26's harness additions (fmk mode; b.jg5 SRJ-1428, SRJ-1306, SRJ-1401). Each is a
+#   harness addition, confirm at the reconcile pass.
+#   SCENARIO_AD_OWNER_OPTION SCENARIO_AD_PANE_OPTION
+#                                      (harness addition, confirm at the reconcile pass) the two
+#                                      tmux option names agent-director labels a session and its
+#                                      worker pane with, `@ad_owner` and `@ad_pane`, as the seeding
+#                                      helpers above set them; src/ names neither (SRJ-716)
+#   restore_tmux_socket <moved-socket> (harness addition, confirm at the reconcile pass) undo
+#                                      `rebind_tmux_socket`: both guards first, then, from the
+#                                      scenario's own shell with the real tmux (it refuses when
+#                                      TMUX_TMPDIR is not the scenario's or TMUX is set), it reads
+#                                      the recorded server on <moved-socket> (a
+#                                      `<socket>.rebound-<n>` socket under SCENARIO_ROOT/tmux, whose
+#                                      server's own socket path is <socket>) with its sessions and
+#                                      panes, ends the other server at <socket> (kill-server, then
+#                                      waits until its process is gone), moves <moved-socket> back
+#                                      to <socket>, and fails unless <socket> then answers with the
+#                                      recorded server's PID and the same sessions, panes and pane
+#                                      processes, each pane process still running; prints the
+#                                      recorded server's PID and clears REBOUND_SOCKET
+#   cscb_tmux_calls [<fragment>...]    (harness addition, confirm at the reconcile pass) print the
+#                                      tmux shim's `call` lines whose parent is any CSCB process the
+#                                      record holds at the line's time (a bot server, a `start` or
+#                                      `stop` run, or a CLI command or driver run through
+#                                      `cscb_run`), and whose words, joined by single spaces, hold
+#                                      every fixed-string <fragment> in order; a line whose parent is
+#                                      agent-director, the scenario's own shell or a stub is never
+#                                      one. `assert_no_server_tmux` reads bot-server parents only
+#   cscb_tmux_count [<fragment>...]    (harness addition, confirm at the reconcile pass) print how
+#                                      many lines `cscb_tmux_calls` would print
+#
 # Line builders (every fragment is quoted from src/; <ref> is `persona_ref`):
 #   persona_start_match   `[slack] persona-start: personas[<index>] <ref>`
 #                         (src/persona-bringup-controller.ts bringUp, format
@@ -3777,6 +3808,118 @@ slack_posts() {
     jq -c --arg l "${label}" --argjson a "${after}" \
         'select(.event == "api" and .method == "chat.postMessage" and .label == $l and (.seq // 0) > $a) | .text' \
         "${record}" || fail "${step}: jq could not read ${record}"
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 26's harness additions (fmk mode; each a harness addition, confirm
+# at the reconcile pass)
+# ---------------------------------------------------------------------------
+
+# The tmux options agent-director labels a session (@ad_owner) and its worker
+# pane (@ad_pane) with: the names `_scenario_set_labels` sets. Read by the
+# scenario scripts.
+# shellcheck disable=SC2034
+SCENARIO_AD_OWNER_OPTION='@ad_owner'
+# shellcheck disable=SC2034
+SCENARIO_AD_PANE_OPTION='@ad_pane'
+
+# _scenario_panes_of <step> <tmux-arg>...: print `<session id> <pane id>
+# <pane pid>` for every pane of the server the tmux arguments reach, sorted;
+# fail when it does not answer.
+_scenario_panes_of() {
+    local step="$1" out
+    shift
+    out="$("${SCENARIO_REAL_TMUX}" "$@" list-panes -a -F '#{session_id} #{pane_id} #{pane_pid}' 2> "${SCENARIO_ROOT}/harness-tmux.err")" \
+        || fail "${step}: tmux $* list-panes failed: $(_scenario_tmux_err)"
+    sort <<< "${out}"
+}
+
+restore_tmux_socket() {
+    local moved="${1:-}" step sock out line old_pid path new_pid before after pane_pid
+    step="restore_tmux_socket ${moved}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    [[ "${moved}" =~ ^(.+)\.rebound-[0-9]+$ ]] \
+        || fail "${step}: '${moved}' is not a socket rebind_tmux_socket moved (<socket>.rebound-<n>)"
+    sock="${BASH_REMATCH[1]}"
+    [[ "${moved}" == "${SCENARIO_ROOT}/tmux/"* && "${moved}" != */../* && -S "${moved}" ]] \
+        || fail "${step}: refused: '${moved}' is not a socket under ${SCENARIO_ROOT}/tmux"
+    # The recorded server, on the moved socket.
+    out="$("${SCENARIO_REAL_TMUX}" -S "${moved}" list-sessions -F '#{pid} #{socket_path}' 2> "${SCENARIO_ROOT}/harness-tmux.err")" \
+        || fail "${step}: no tmux server answers on ${moved}: $(_scenario_tmux_err)"
+    line="${out%%$'\n'*}"
+    old_pid="${line%% *}"
+    path="${line#* }"
+    [[ "${old_pid}" =~ ^[0-9]+$ ]] || fail "${step}: tmux gave server pid '${old_pid}' on ${moved}"
+    [[ "${path}" == "${sock}" ]] || fail "${step}: the server on ${moved} has socket path '${path}', not ${sock}"
+    before="$(_scenario_panes_of "${step}" -S "${moved}")" || exit 1
+    # The other server, at the socket path.
+    out="$(_scenario_tmux list-sessions -F '#{pid}')" \
+        || fail "${step}: no tmux server answers at ${sock}: $(_scenario_tmux_err)"
+    new_pid="${out%%$'\n'*}"
+    [[ "${new_pid}" =~ ^[0-9]+$ && "${new_pid}" != "${old_pid}" ]] \
+        || fail "${step}: ${sock} answers with server pid '${new_pid}', not another server than the recorded ${old_pid}"
+    _scenario_tmux kill-server || fail "${step}: tmux kill-server at ${sock} failed: $(_scenario_tmux_err)"
+    _scenario_poll_until "${SCENARIO_TMUX_STOP_S}" _scenario_pid_gone "${new_pid}" \
+        || fail "${step}: the other tmux server ${new_pid} still runs ${SCENARIO_TMUX_STOP_S} s after kill-server"
+    mv -f -- "${moved}" "${sock}" || fail "${step}: could not move ${moved} back to ${sock}"
+    out="$(_scenario_tmux list-sessions -F '#{pid}')" \
+        || fail "${step}: no tmux server answers at ${sock} after the move: $(_scenario_tmux_err)"
+    [[ "${out%%$'\n'*}" == "${old_pid}" ]] \
+        || fail "${step}: ${sock} answers with server pid '${out%%$'\n'*}', not the recorded server's ${old_pid}"
+    after="$(_scenario_panes_of "${step}" -S "${sock}")" || exit 1
+    [[ "${after}" == "${before}" ]] \
+        || fail "${step}: the recorded server's sessions and panes changed: '${before//$'\n'/; }' -> '${after//$'\n'/; }'"
+    while read -r _ _ pane_pid; do
+        [[ -z "${pane_pid}" ]] || pid_alive "${pane_pid}" \
+            || fail "${step}: pane process ${pane_pid} of the recorded server no longer runs"
+    done <<< "${after}"
+    REBOUND_SOCKET=""
+    printf '%s\n' "${old_pid}"
+}
+
+# _scenario_cscb_tmux_scan <step> <print|count> [<fragment>...]: over the
+# tmux shim's `call` lines whose parent is a CSCB process, the ones whose
+# words, joined by single spaces, hold every fragment in order: print them,
+# or how many.
+_scenario_cscb_tmux_scan() {
+    local step="$1" mode="$2" lines=() i n=0 rest frag ok
+    shift 2
+    _scenario_query_prep "${step}"
+    _scenario_read_log "${step}" "${SCENARIO_TMUX_SHIM_LOG}" lines
+    for i in "${!lines[@]}"; do
+        _scenario_split_line "${lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        _scenario_role_at "${_L_PPID}" "${_L_US}" || continue
+        _scenario_decode_words
+        printf -v rest '%s ' ${_L_WORDS[@]+"${_L_WORDS[@]}"}
+        rest="${rest% }"
+        ok=1
+        for frag in "$@"; do
+            if [[ "${rest}" != *"${frag}"* ]]; then
+                ok=0
+                break
+            fi
+            rest="${rest#*"${frag}"}"
+        done
+        (( ok )) || continue
+        n=$(( n + 1 ))
+        if [[ "${mode}" == print ]]; then
+            printf '%s\n' "${lines[i]}"
+        fi
+    done
+    if [[ "${mode}" == count ]]; then
+        echo "${n}"
+    fi
+}
+
+cscb_tmux_calls() {
+    _scenario_cscb_tmux_scan "cscb_tmux_calls" print "$@"
+}
+
+cscb_tmux_count() {
+    _scenario_cscb_tmux_scan "cscb_tmux_count" count "$@"
 }
 
 # ---------------------------------------------------------------------------

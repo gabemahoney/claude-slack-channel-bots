@@ -110,6 +110,30 @@
  *                                                CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD (lines split
  *                                                at CONFLICT_NOTICE_LINE_SEPARATOR)
  *
+ *   Scenario 26 (test-28-fmk-provenance.sh):
+ *   tmuxServerChangedOnset                       src/outage-state.ts, the `tmux-unavailable` onset
+ *                                                for a re-bound socket (SRJ-1021)
+ *   ONSET_TEMPLATES <outage-class>               src/outage-state.ts, the class's onset template
+ *                                                built with no detail (`tmux-unavailable`: the
+ *                                                generic onset); a class with no template is a
+ *                                                failure
+ *   ALL_CLEAR_TEMPLATE <outage-class>...         src/outage-state.ts, the all-clear for a bad
+ *                                                stretch that resolved the given classes, each
+ *                                                with no recorded detail (each one of
+ *                                                OUTAGE_CLASS_ORDER)
+ *   DIFFERENT_TMUX_SERVER_PHRASE                 src/ad-description-phrases.ts
+ *   UNAVAILABLE_RETRY_BASE_S                     src/unavailable-retry.ts, in decimal: the retry
+ *                                                timer's first wait, which each later wait doubles
+ *   waitingRowPaneGoneLineHead <key>             src/session-manager.ts: the head of a line, the
+ *   escalateDeadSweepLineHead <key>              text the builder (waitingRowPaneGoneLine,
+ *   reconnectGoneLineHead                        escalateDeadSweepLine, reconnectGoneLine) writes
+ *                                                before the part agent-director's answer or a
+ *                                                verdict fills: for persona <key> (as the builder's
+ *                                                own key reference renders it), and for
+ *                                                reconnectGoneLine the text before the persona's
+ *                                                reference, which its callers give in more than one
+ *                                                form
+ *
  * An entry is one `Entry` in `ENTRIES`: its argument synopsis, the export it
  * prints and a `print` function from its arguments to the value. Constants
  * use `constantEntry`; a builder entry checks its own arguments with
@@ -334,6 +358,82 @@ const sessionEndingForms: Entry = {
   },
 }
 
+/** `ONSET_TEMPLATES[<outage-class>]()`: the class's onset with no detail. */
+const onsetTemplate: Entry = {
+  synopsis: '<outage-class>',
+  async print(args, context) {
+    const entry = 'ONSET_TEMPLATES'
+    expectArguments(entry, args, ['outage-class'])
+    const [outageClass] = args
+    const templates = await packageExport(context, 'outage-state.ts', entry)
+    if (typeof templates !== 'object' || templates === null) fail(PRINTER_FAIL_EXIT, `the installed package's src/outage-state.ts export ${entry} is not an object`)
+    const template = Object.hasOwn(templates, outageClass) ? (templates as Record<string, unknown>)[outageClass] : undefined
+    if (typeof template !== 'function') fail(PRINTER_FAIL_EXIT, `the installed package's src/outage-state.ts ${entry} has no template for outage class '${outageClass}'`)
+    return builtString(entry, (template as () => unknown)())
+  },
+}
+
+/** `ALL_CLEAR_TEMPLATE(<map of each given class to a record with no detail>)`. */
+const allClearTemplate: Entry = {
+  synopsis: '<outage-class>...',
+  async print(args, context) {
+    const entry = 'ALL_CLEAR_TEMPLATE'
+    if (args.length === 0) usageFail(`${entry} takes <outage-class>... (got 0)`)
+    const order = await packageExport(context, 'outage-state.ts', 'OUTAGE_CLASS_ORDER')
+    if (!Array.isArray(order)) fail(PRINTER_FAIL_EXIT, `the installed package's src/outage-state.ts export OUTAGE_CLASS_ORDER is not an array`)
+    for (const outageClass of args) {
+      if (!order.includes(outageClass)) usageFail(`${entry}: '${outageClass}' is not one of OUTAGE_CLASS_ORDER (${order.join(', ')})`)
+    }
+    const build = await packageFunction<(resolved: Map<string, object>) => unknown>(context, 'outage-state.ts', entry)
+    return builtString(entry, build(new Map(args.map((outageClass) => [outageClass, {}]))))
+  },
+}
+
+/** Stands for the part of a line its builder fills from agent-director's answer, a verdict or a reference. */
+const HEAD_SENTINEL = 'FMK-TEXTS-HEAD-SENTINEL'
+
+/** The text of `line` before HEAD_SENTINEL; a failure when the sentinel is absent or opens the line. */
+function headBefore(entry: string, line: string): string {
+  const at = line.indexOf(HEAD_SENTINEL)
+  if (at <= 0) fail(PRINTER_FAIL_EXIT, `${entry}: the builder's line holds no text before the part it fills`)
+  return line.slice(0, at)
+}
+
+/** `waitingRowPaneGoneLine(<key>, <a GONE pane read>)` before the read's description. */
+const waitingRowPaneGoneHead: Entry = {
+  synopsis: '<key>',
+  async print(args, context) {
+    const entry = 'waitingRowPaneGoneLineHead'
+    expectArguments(entry, args, ['key'])
+    const kind = await packageString(context, 'pane-read.ts', 'PANE_READ_GONE')
+    const errorClass = await packageString(context, 'ad-error-class.ts', 'AD_ERROR_CLASS_GONE')
+    const build = await packageFunction<(key: string, read: object) => unknown>(context, 'session-manager.ts', 'waitingRowPaneGoneLine')
+    return headBefore(entry, builtString(entry, build(args[0], { kind, errorClass, description: HEAD_SENTINEL })))
+  },
+}
+
+/** `escalateDeadSweepLine(<key>, <verdict>)` before the verdict. */
+const escalateDeadSweepHead: Entry = {
+  synopsis: '<key>',
+  async print(args, context) {
+    const entry = 'escalateDeadSweepLineHead'
+    expectArguments(entry, args, ['key'])
+    const build = await packageFunction<(key: string, verdict: string) => unknown>(context, 'session-manager.ts', 'escalateDeadSweepLine')
+    return headBefore(entry, builtString(entry, build(args[0], HEAD_SENTINEL)))
+  },
+}
+
+/** `reconnectGoneLine(<ref>, <failure>)` before the persona's reference. */
+const reconnectGoneHead: Entry = {
+  synopsis: '',
+  async print(args, context) {
+    const entry = 'reconnectGoneLineHead'
+    expectArguments(entry, args, [])
+    const build = await packageFunction<(ref: string, failure: string) => unknown>(context, 'session-manager.ts', 'reconnectGoneLine')
+    return headBefore(entry, builtString(entry, build(HEAD_SENTINEL, `${HEAD_SENTINEL}-failure`)))
+  },
+}
+
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = {
   // Scenario 8 (test-20-fmk-old-binary.sh).
@@ -369,6 +469,15 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   AD_SETTING_MINIMUMS: settingMinimums,
   MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS: constantEntry('config.ts', 'MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS'),
   sessionEndingCommandsIn: sessionEndingForms,
+  // Scenario 26 (test-28-fmk-provenance.sh).
+  tmuxServerChangedOnset: builderEntry('outage-state.ts', 'tmuxServerChangedOnset', []),
+  ONSET_TEMPLATES: onsetTemplate,
+  ALL_CLEAR_TEMPLATE: allClearTemplate,
+  DIFFERENT_TMUX_SERVER_PHRASE: constantEntry('ad-description-phrases.ts', 'DIFFERENT_TMUX_SERVER_PHRASE'),
+  UNAVAILABLE_RETRY_BASE_S: constantEntry('unavailable-retry.ts', 'UNAVAILABLE_RETRY_BASE_S'),
+  waitingRowPaneGoneLineHead: waitingRowPaneGoneHead,
+  escalateDeadSweepLineHead: escalateDeadSweepHead,
+  reconnectGoneLineHead: reconnectGoneHead,
 }
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */

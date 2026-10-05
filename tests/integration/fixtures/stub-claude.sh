@@ -63,7 +63,8 @@
 #     finds that transcript.
 #   - After reporting in the stub keeps reading stdin, so the process and its
 #     tmux pane stay alive. Further lines are ignored, apart from the sentinel
-#     and `/mcp reconnect` (see THE MCP SESSION).
+#     and `/mcp reconnect`, alone or with a server's name (see THE MCP
+#     SESSION).
 #   - The sentinel line `__CSCB_TEST_EXIT__` fires every SessionEnd hook the
 #     `--settings` JSON registers and exits 0 (in `silent`, it fires none). In
 #     a dialog mode it does so before the dialog is answered too.
@@ -171,6 +172,11 @@
 # session (a refusal, a stop), the client exits; a later `/mcp reconnect` line,
 # which CSCB types into a persona's pane to reconnect it, opens a new session
 # when none is running.
+# That line is `/mcp reconnect` alone or with a server's name after it, as
+# CSCB types it (`/mcp reconnect slack-channel-router`); the form with a name
+# first ends a client still running (as Claude Code reconnects the named
+# server whatever its session's state: after a bot-server restart the old
+# client may not yet have seen its session end), then opens a new session.
 # No session is opened when the client is not beside the stub (Test 4, Test 10
 # and Test 12, which copy only the stub), when the stub was given no
 # `--mcp-config`, or in a mode that has not reported in (`silent`, a dialog not
@@ -631,6 +637,17 @@ handle_line() {
     if (( AWAITING_ENTER )); then
         report_in
     elif (( REPORTED )) && [[ "${line}" == '/mcp reconnect' ]]; then
+        open_mcp_session
+    elif (( REPORTED )) && [[ "${line}" == '/mcp reconnect '* ]]; then
+        # The form CSCB types, with the server's name after it
+        # (src/session-manager.ts reconnectMcpWithCause:
+        # `/mcp reconnect <MCP_SERVER_NAME>`). As Claude Code reconnects the
+        # named server whatever its session's state, a client still running
+        # (one whose server restarted before its next ping) ends first.
+        if mcp_session_running; then
+            close_mcp_session
+            wait "${MCP_PID}" 2> /dev/null
+        fi
         open_mcp_session
     fi
 }
