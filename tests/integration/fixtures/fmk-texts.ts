@@ -72,6 +72,191 @@
  *                                                prefix added, the key derived by the
  *                                                package's personaKey, as the config
  *                                                loader derives it)
+ *   classifyAdError <err-name>                   src/ad-error-class.ts: CSCB's class
+ *                                                (`errorClass`) for an instance of the
+ *                                                installed agent-director client's error
+ *                                                class <err-name>, built as the client
+ *                                                builds one from an error envelope (verb,
+ *                                                name, description); for the classes the
+ *                                                client builds from an envelope only
+ *   DEFAULT_AD_SETTINGS <table> <key>            src/ad-settings.ts: agent-director's default
+ *                                                for `[<table>] <key>` (for example `tmux
+ *                                                starting_session_seconds`), in decimal
+ *   CLIENT_DEV_SENTINEL_VERSION                  src/ad-version-gate.ts, the client's
+ *                                                development sentinel version
+ *   AD_SYSTEM_INSTALL_UNREACHABLE                src/install-check-labels.ts, the class label
+ *   UNREACHABLE_REASON_UNPARSEABLE_VERSION       src/ad-version-gate.ts, the
+ *                                                ErrSystemInstallUnreachable reason of a
+ *                                                version that does not parse
+ *   meetsPhase1Floor <version>                   src/ad-version-gate.ts: whether <version>
+ *                                                meets CSCB's Phase 1 floor, `true` or `false`
+ *   AD_SETTINGS_LOG_PREFIX                       src/ad-settings.ts, the prefix of the
+ *                                                settings reader's log lines
+ *   buildAdSettingsValuesLine <path> [<key>=<integer>…]
+ *                                                src/ad-settings.ts: the values line for the
+ *                                                settings file <path>, the nine [tmux] values
+ *                                                DEFAULT_AD_SETTINGS' own but for each given
+ *                                                <key>
+ *   AD_SETTINGS_RELATIVE_PATH                    src/ad-settings.ts, the settings file's path
+ *                                                relative to a HOME
+ *   AD_TMUX_TABLE                                src/ad-settings.ts, the timing keys' table
+ *   AD_PAUSE_TABLE                               src/ad-settings.ts, `pause`'s table
+ *   AD_PAUSE_TIMEOUT_KEY                         src/ad-settings.ts, `pause`'s wait key
+ *   AD_TMUX_KEYS                                 src/ad-settings.ts: the nine [tmux] keys, in
+ *                                                order, joined by single spaces
+ *   AD_SETTING_MINIMUMS <key> [<part>]           src/ad-settings.ts: agent-director's minimum
+ *                                                for [tmux] <key>, in decimal; for a minimum
+ *                                                with parts (pending_grace_seconds), the
+ *                                                named <part> (`floor` or `addend`)
+ *   pendingGraceMinimumSeconds <create-timeout-ms> <pipe-close-wait-ms>
+ *                                                src/ad-settings.ts: the grace period's
+ *                                                minimum, in decimal
+ *   adGraceMs [<key>=<integer>…]                 src/ad-settings.ts: G, in decimal
+ *   adAlertThresholdMs [<key>=<integer>…]        src/ad-settings.ts: the alert threshold, in
+ *                                                decimal
+ *   adLaunchBoundMs [<key>=<integer>…]           src/ad-settings.ts: B, in decimal. These
+ *                                                three take an AdSettingsInEffect built from
+ *                                                the arguments: the [tmux] values
+ *                                                DEFAULT_AD_SETTINGS' own but for each given
+ *                                                <key>, and DEFAULT_AD_SETTINGS_IN_EFFECT's
+ *                                                pauseTimeout
+ *   wholeMinutes <ms>                            src/ad-settings.ts: <ms> in whole minutes,
+ *                                                rounded down, in decimal
+ *   STILL_STOPPING_PHRASE                        src/ad-description-phrases.ts
+ *   STILL_STARTING_PHRASE                        src/ad-description-phrases.ts
+ *   stuckLaunchRelaunchingText <persona-key> <launch-bound-ms>
+ *                                                src/pending-row.ts: the stuck-launch post's
+ *                                                relaunching text for the persona with key
+ *                                                <persona-key> and B <launch-bound-ms>
+ *                                                (posted as a persona notice: wrap it in
+ *                                                formatPersonaNotice)
+ *   DIALOG_POLL_INTERVAL_MS                      src/session-manager.ts, the dialog approver's
+ *                                                pace before G, in decimal
+ *   DIALOG_SLOW_POLL_INTERVAL_MS                 src/session-manager.ts, the dialog approver's
+ *                                                slow pace from G, in decimal
+ *   STARTUP_ERROR_SPAWN_FAILED                   src/session-manager.ts, the startup-errors
+ *                                                label of a launch failure
+ *   liveRowSequenceWaitArmedLine <persona-ref> <launch-start-ms> <grace-ms>
+ *                                                src/live-row-sequence.ts: the step-2 wait's
+ *                                                armed line for the persona <persona-ref> (as
+ *                                                the server renders it, `"<name>" (key=<key>)`),
+ *                                                a launch start in epoch milliseconds and G
+ *   liveRowSequenceWaitEndedLine <persona-ref>   src/live-row-sequence.ts: the step-2 wait's
+ *                                                end line
+ *   liveRowSequenceRunLine <persona-ref> <step> <run-number> <placement-export>
+ *                                                src/live-row-sequence.ts: the live-row
+ *                                                sequence's line for one `find-missing` run
+ *                                                of the persona <persona-ref> (as the server
+ *                                                renders it, `"<name>" (key=<key>)`) at step
+ *                                                <step> (3 or 4), run <run-number>, with the
+ *                                                placement the package exports as
+ *                                                <placement-export> (a `LIVE_ROW_RUN_…`
+ *                                                name, for example LIVE_ROW_RUN_NOT_JUDGED)
+ *   AD_CONFIG_FILE_DISPLAY_NAME                  src/ad-config-file.ts, the settings file as a
+ *                                                notice names it (`~/…`)
+ *   adConfigMalformedOnset <description>         src/outage-state.ts: the `ad-config-malformed`
+ *                                                onset for agent-director's ErrConfigMalformed
+ *                                                answer with <description>, built as the
+ *                                                installed client throws it (its
+ *                                                ErrUnknownErrorName with that unknownName
+ *                                                and the error envelope; a client with a
+ *                                                class of that name fails). Given a
+ *                                                marker <description>, the text around the
+ *                                                marker is the onset's fixed part (posted as a
+ *                                                persona notice: wrap it in formatPersonaNotice)
+ *   adConfigMalformedRaisedLine <persona-key> <description>
+ *                                                src/outage-state.ts: the server-log raise line
+ *                                                for that answer (its classification by
+ *                                                src/ad-error-class.ts classifyAdError)
+ *   adConfigMalformedClearedLine <persona-key>   src/outage-state.ts: the server-log clear line
+ *   ALL_CLEAR_TEMPLATE <outage-class>…           src/outage-state.ts: the all-clear for a bad
+ *                                                stretch of the given classes (each one of the
+ *                                                package's OUTAGE_CLASS_ORDER, given once),
+ *                                                none with a detail (posted as a persona
+ *                                                notice: wrap it in formatPersonaNotice)
+ *   buildAdSettingsRefusedReadLine <path> <reason> <accepted|none>
+ *                                                src/ad-settings.ts: the line of a run of
+ *                                                refused reads of <path>, `accepted` when a
+ *                                                read was accepted before it, `none` when not;
+ *                                                given a marker <reason>, the text around the
+ *                                                marker is the line's fixed part
+ *   UNAVAILABLE_RETRY_BASE_S                     src/unavailable-retry.ts, the retry timer's
+ *                                                first wait (its waits double from it), in
+ *                                                seconds, in decimal
+ *   unavailableRetryRetryLine <persona-key> <retry> <full|pending-only>
+ *                                                src/unavailable-retry.ts: the line at the
+ *                                                start of retry <retry> of the persona's
+ *                                                retry timer, in that mode
+ *   unavailableRetryReArmedLine <persona-key> <retry> <full|pending-only> <reason> <wait-ms>
+ *                                                src/unavailable-retry.ts: the re-armed line
+ *                                                of that retry, answered <reason>, the mode
+ *                                                unchanged, the next retry in <wait-ms>; given
+ *                                                a marker <reason>, the text before the marker
+ *                                                is the line's fixed head for that retry
+ *   RESTART_OUTCOME_LIVENESS_UNKNOWN             src/restart.ts, the restart work's outcome
+ *                                                (and a retry's again-reason) when the
+ *                                                persona's liveness reads unknown
+ *   unavailableRetryStoppedLine <persona-key> <full|pending-only> <row|none> <reason>
+ *                                                src/unavailable-retry.ts: the line of a stop
+ *                                                of the persona's retry timer, in that mode,
+ *                                                naming the row read (`none`: no row); given
+ *                                                a marker <reason>, the text before it is the
+ *                                                line's fixed head
+ *   UNAVAILABLE_RETRY_CEILING_S                  src/unavailable-retry.ts, the retry timer's
+ *                                                longest wait, in seconds, in decimal
+ *   buildAdCallTimeoutWarningLine <call-timeout-ms> [<key>=<integer>…]
+ *                                                src/ad-settings.ts: the startup call-timeout
+ *                                                warning for the call timeout <call-timeout-ms>
+ *                                                and the values in effect built as for
+ *                                                adGraceMs; the empty text when the builder
+ *                                                gives no line
+ *   adCallTimeoutNeed [<key>=<integer>…]         src/ad-settings.ts: `<need-ms> <verb>`, the call
+ *                                                timeout's need in decimal and the verb whose
+ *                                                ceiling sets it, for the values in effect
+ *                                                built as for adGraceMs
+ *   LAUNCH_TIMEOUT_PHRASE                        src/ad-description-phrases.ts
+ *   AD_VERSION_RECHECK_STOP_EXIT_CODE            src/ad-version-gate.ts, the exit status of the
+ *                                                runtime re-check's stop, in decimal
+ *   launchUnavailableGetLine <persona-ref> <what> <err-name> <read> <launch-start|no> <outcome-export>
+ *                                                src/session-manager.ts: the line of the one get
+ *                                                after the <what> of <persona-ref> ended in a
+ *                                                launch timeout of the form <err-name> (the
+ *                                                value of one of src/ad-error-class.ts's
+ *                                                LAUNCH_TIMEOUT_FORM_… exports, named as
+ *                                                launchUnavailableFormText names it), the get
+ *                                                reading <read>; this launch's row has the
+ *                                                launch start <launch-start>, the row's
+ *                                                `launch_started_at` as agent-director wrote it,
+ *                                                read with src/pending-row.ts parseLaunchStart
+ *                                                (`no`: not this launch's row); the outcome the
+ *                                                package exports as <outcome-export> (a
+ *                                                `LAUNCH_UNAVAILABLE_OUTCOME_…` name)
+ *   UNAVAILABLE_RETRY_STOP_ROW_LIVE              src/unavailable-retry.ts, a stop's reason when a
+ *                                                pending-only retry reads the row live
+ *   UNAVAILABLE_RETRY_STOP_RECOVERED             src/unavailable-retry.ts, a stop's reason when a
+ *                                                retry finds nothing left to recover
+ *   stuckLaunchAbortStartedLine <persona-key> <persona-ref> <launch-start>
+ *                                                src/pending-row.ts: the stuck-launch abort's
+ *                                                start line; <launch-start> as a row's
+ *                                                `launch_started_at` (the line renders it)
+ *   reprobeDeadLine <persona-key>                src/restart.ts: the line of a row the re-probe
+ *                                                reads dead
+ *   liveRowSequenceStartLine <persona-ref> <entry-step-export> <instance-id> <last-read> <launch|no-launch> <alert-context>
+ *                                                src/live-row-sequence.ts: the live-row
+ *                                                sequence's start line, entered at the step the
+ *                                                package exports as <entry-step-export> (a
+ *                                                `LIVE_ROW_SEQUENCE_ENTRY_…` name), ending in a
+ *                                                launch or not
+ *   RELOAD_APPLIED                               src/reload-apply.ts, the class label of an
+ *                                                applied reload's line
+ *
+ * A builder entry given a marker argument (a key, a reference, a state or a
+ * description the scenario chooses) prints a line whose text around the
+ * marker is the line's fixed part; the scenario splits it there.
+ *
+ * In every `<key>=<integer>` argument <key> is one of the package's
+ * AD_TMUX_KEYS and <integer> an integer in decimal; an unknown key, a key
+ * given twice or a value that is not an integer is a usage failure (exit 64).
  *
  * The latch scenarios' entries (E42–E43, test-15 onward). Constants, each
  * printed as it is, named after their export:
@@ -127,9 +312,8 @@
  *   LATCH_ROW_STATE_KIND_NO_ROW                  src/conflict-latch.ts, the latch-set line's
  *                                                word for no row (conflictLatchSetLine's
  *                                                <row-state>)
- *   adGraceMs, adLaunchBoundMs                   src/ad-settings.ts, G and B in milliseconds at
- *                                                agent-director's default settings
- *                                                (DEFAULT_AD_SETTINGS_IN_EFFECT), in decimal
+ *   adGraceMs, adLaunchBoundMs                   G and B at agent-director's default settings:
+ *                                                the entries above, given no argument
  * Scenario 25's entries (test-27):
  *   AD_ERROR_CLASS_UNUSABLE_NAME                 src/ad-error-class.ts, CSCB's class for an
  *                                                unusable recorded name, as fmk-driver.ts's
@@ -919,6 +1103,8 @@ const PKG_DIR = process.env['CSCB_PKG_DIR'] ?? '/test-repo/node_modules/claude-s
 interface EntryContext {
   /** Import a module of the installed package's `src/` (for example `ad-version-gate.ts`). */
   importPackageModule(relPath: string): Promise<Record<string, unknown>>
+  /** Import the agent-director client the installed package resolves. */
+  importAgentDirectorClient(): Promise<Record<string, unknown>>
   /** The value another entry prints for `args` (for an entry that wraps one). */
   entryValue(name: string, args: readonly string[]): Promise<string>
 }
@@ -1411,19 +1597,6 @@ const personaTmuxSessionName: Entry = {
   },
 }
 
-/** An entry printing ad-settings.ts's `name(DEFAULT_AD_SETTINGS_IN_EFFECT)` in decimal: a wait at agent-director's default settings, in milliseconds. No argument. */
-function adSettingsDefaultMs(name: string): Entry {
-  return {
-    synopsis: '',
-    async print(args, context) {
-      expectArguments(name, args, [])
-      const defaults = await packageExport(context, 'ad-settings.ts', 'DEFAULT_AD_SETTINGS_IN_EFFECT')
-      const value = (await packageFunction<(values: unknown) => unknown>(context, 'ad-settings.ts', name))(defaults)
-      if (typeof value !== 'number' || !Number.isFinite(value)) fail(PRINTER_FAIL_EXIT, `${name} gave ${String(value)}, not a finite number`)
-      return String(value)
-    },
-  }
-}
 
 /** pane-read.ts's `read-pane` answer kinds a probe round's answer names, each printed as it is. */
 const PANE_READ_KIND_NAMES: readonly string[] = ['PANE_READ_PANE', 'PANE_READ_CONFLICT', 'PANE_READ_GONE']
@@ -1715,6 +1888,501 @@ const unavailableRetryDue: Entry = {
 }
 
 // ---------------------------------------------------------------------------
+// The entries of scenarios 8, 23 and 24 (test-20, test-26)
+// ---------------------------------------------------------------------------
+
+
+/** An error class's constructor as the client builds an error from an envelope. */
+type EnvelopeErrorClass = new (verb: string, errName: string, errDescription: string) => unknown
+
+/**
+ * `classifyAdError(<an instance of the client's class <err-name>>).errorClass`:
+ * CSCB's class for that agent-director error. The instance is built as the
+ * client builds one from an envelope (`spawn`, the name, a description).
+ */
+const adErrorClass: Entry = {
+  synopsis: '<err-name>',
+  async print(args, context) {
+    const entry = 'classifyAdError'
+    expectArguments(entry, args, ['err-name'])
+    const [errName] = args
+    const client = await context.importAgentDirectorClient()
+    const base = client['AgentDirectorError']
+    const errorClass = Object.hasOwn(client, errName) ? client[errName] : undefined
+    if (typeof base !== 'function' || typeof errorClass !== 'function' || !(errorClass.prototype instanceof base)) {
+      fail(PRINTER_FAIL_EXIT, `the installed agent-director client exports no error class ${errName}`)
+    }
+    const instance = new (errorClass as EnvelopeErrorClass)('spawn', errName, `${PRINTER_NAME}: ${errName}`)
+    const classify = await packageFunction<(value: unknown) => { readonly errorClass?: unknown }>(context, 'ad-error-class.ts', entry)
+    return builtString(entry, classify(instance).errorClass)
+  },
+}
+
+/** `meetsPhase1Floor(<version>)`: `true` or `false`. */
+const phase1Floor: Entry = {
+  synopsis: '<version>',
+  async print(args, context) {
+    const entry = 'meetsPhase1Floor'
+    expectArguments(entry, args, ['version'])
+    const [version] = args
+    const meets = await packageFunction<(version: string) => unknown>(context, 'ad-version-gate.ts', entry)
+    const value = meets(version)
+    if (typeof value !== 'boolean') fail(PRINTER_FAIL_EXIT, `${entry} answered a ${typeof value}, not a boolean`)
+    return String(value)
+  },
+}
+
+/** Fails with a usage failure unless `text` is an integer in decimal (an optional `-`, then digits); answers it as a `bigint`. */
+function integerArgument(entry: string, name: string, text: string): bigint {
+  if (!/^-?[0-9]+$/.test(text)) usageFail(`${entry}: <${name}> '${text}' is not an integer`)
+  return BigInt(text)
+}
+
+/** The package's `AD_TMUX_KEYS`: the nine `[tmux]` keys, in order. */
+async function packageTmuxKeys(context: EntryContext): Promise<readonly string[]> {
+  const keys = await packageExport(context, 'ad-settings.ts', 'AD_TMUX_KEYS')
+  if (!Array.isArray(keys) || keys.some((k) => typeof k !== 'string' || !/^[a-z_]+$/.test(k))) {
+    fail(PRINTER_FAIL_EXIT, "the installed package's src/ad-settings.ts export AD_TMUX_KEYS is not an array of key names")
+  }
+  return keys as string[]
+}
+
+/**
+ * The nine `[tmux]` values: `DEFAULT_AD_SETTINGS.tmux`, each key a
+ * `<key>=<integer>` argument names taking that value instead. A key not in
+ * `AD_TMUX_KEYS`, a key given twice or a value that is not an integer is a
+ * usage failure.
+ */
+async function tmuxValuesFrom(entry: string, pairs: readonly string[], context: EntryContext): Promise<Record<string, bigint>> {
+  const keys = await packageTmuxKeys(context)
+  const defaults = await packageExport(context, 'ad-settings.ts', 'DEFAULT_AD_SETTINGS')
+  const tmux = typeof defaults === 'object' && defaults !== null ? (defaults as Record<string, unknown>)['tmux'] : undefined
+  if (typeof tmux !== 'object' || tmux === null) fail(PRINTER_FAIL_EXIT, "the installed package's src/ad-settings.ts export DEFAULT_AD_SETTINGS has no tmux table")
+  const values: Record<string, bigint> = {}
+  for (const key of keys) {
+    const value = (tmux as Record<string, unknown>)[key]
+    if (typeof value !== 'bigint') fail(PRINTER_FAIL_EXIT, `the installed package's DEFAULT_AD_SETTINGS.tmux.${key} is a ${typeof value}, not a bigint`)
+    values[key] = value
+  }
+  const given = new Set<string>()
+  for (const pair of pairs) {
+    const eq = pair.indexOf('=')
+    const key = eq < 0 ? pair : pair.slice(0, eq)
+    if (eq < 0 || !keys.includes(key)) usageFail(`${entry}: '${pair}' is not <key>=<integer> for a [tmux] key (${keys.join(', ')})`)
+    if (given.has(key)) usageFail(`${entry}: ${key} is given twice`)
+    given.add(key)
+    values[key] = integerArgument(entry, key, pair.slice(eq + 1))
+  }
+  return values
+}
+
+/** The values in effect for `<key>=<integer>` arguments: those `[tmux]` values (`tmuxValuesFrom`) and `DEFAULT_AD_SETTINGS_IN_EFFECT`'s `pauseTimeout`. */
+async function settingsInEffectFrom(entry: string, pairs: readonly string[], context: EntryContext): Promise<object> {
+  const tmux = await tmuxValuesFrom(entry, pairs, context)
+  const inEffect = await packageExport(context, 'ad-settings.ts', 'DEFAULT_AD_SETTINGS_IN_EFFECT')
+  const pauseTimeout = typeof inEffect === 'object' && inEffect !== null ? (inEffect as Record<string, unknown>)['pauseTimeout'] : undefined
+  if (typeof pauseTimeout !== 'object' || pauseTimeout === null) fail(PRINTER_FAIL_EXIT, "the installed package's src/ad-settings.ts export DEFAULT_AD_SETTINGS_IN_EFFECT has no pauseTimeout")
+  return { tmux, pauseTimeout }
+}
+
+/** `<name>(<the values in effect for the <key>=<integer> arguments>)` in decimal: a derived wait of `src/ad-settings.ts`. */
+function derivedWaitEntry(name: string): Entry {
+  return {
+    synopsis: '[<key>=<integer>…]',
+    async print(args, context) {
+      const values = await settingsInEffectFrom(name, args, context)
+      const derive = await packageFunction<(values: object) => unknown>(context, 'ad-settings.ts', name)
+      return decimal(name, derive(values))
+    },
+  }
+}
+
+/** `buildAdSettingsValuesLine(<path>, <the [tmux] values for the <key>=<integer> arguments>)`: the server's values line. */
+const adSettingsValuesLine: Entry = {
+  synopsis: '<path> [<key>=<integer>…]',
+  async print(args, context) {
+    const entry = 'buildAdSettingsValuesLine'
+    const [path, ...pairs] = args
+    if (path === undefined || path === '') usageFail(`${entry} takes <path> [<key>=<integer>…] (no <path> given)`)
+    const values = await tmuxValuesFrom(entry, pairs, context)
+    const build = await packageFunction<(path: string, values: object) => unknown>(context, 'ad-settings.ts', entry)
+    return builtString(entry, build(path, values))
+  },
+}
+
+/** `AD_TMUX_KEYS`, the nine keys in order, joined by single spaces. */
+const adTmuxKeys: Entry = {
+  synopsis: '',
+  async print(args, context) {
+    expectArguments('AD_TMUX_KEYS', args, [])
+    return (await packageTmuxKeys(context)).join(' ')
+  },
+}
+
+/** `pendingGraceMinimumSeconds(<create-timeout-ms>, <pipe-close-wait-ms>)` in decimal. */
+const graceMinimum: Entry = {
+  synopsis: '<create-timeout-ms> <pipe-close-wait-ms>',
+  async print(args, context) {
+    const entry = 'pendingGraceMinimumSeconds'
+    expectArguments(entry, args, ['create-timeout-ms', 'pipe-close-wait-ms'])
+    const [create, pipe] = args
+    const minimum = await packageFunction<(create: bigint, pipe: bigint) => unknown>(context, 'ad-settings.ts', entry)
+    return decimal(entry, minimum(integerArgument(entry, 'create-timeout-ms', create), integerArgument(entry, 'pipe-close-wait-ms', pipe)))
+  },
+}
+
+/** `wholeMinutes(<ms>)` in decimal. */
+const minutesOf: Entry = {
+  synopsis: '<ms>',
+  async print(args, context) {
+    const entry = 'wholeMinutes'
+    expectArguments(entry, args, ['ms'])
+    const ms = integerArgument(entry, 'ms', args[0])
+    const minutes = await packageFunction<(ms: number) => unknown>(context, 'ad-settings.ts', entry)
+    return decimal(entry, minutes(Number(ms)))
+  },
+}
+
+/** `stuckLaunchRelaunchingText(<persona-key>, <launch-bound-ms>)`: the stuck-launch post's relaunching text. */
+const relaunchingText: Entry = {
+  synopsis: '<persona-key> <launch-bound-ms>',
+  async print(args, context) {
+    const entry = 'stuckLaunchRelaunchingText'
+    expectArguments(entry, args, ['persona-key', 'launch-bound-ms'])
+    const [key, bound] = args
+    const ms = integerArgument(entry, 'launch-bound-ms', bound)
+    const build = await packageFunction<(key: string, launchBoundMs: number) => unknown>(context, 'pending-row.ts', entry)
+    return builtString(entry, build(key, Number(ms)))
+  },
+}
+
+/** `liveRowSequenceWaitArmedLine(<persona-ref>, <launch-start-ms>, <grace-ms>)`: the step-2 wait's armed line. */
+const liveRowWaitArmedLine: Entry = {
+  synopsis: '<persona-ref> <launch-start-ms> <grace-ms>',
+  async print(args, context) {
+    const entry = 'liveRowSequenceWaitArmedLine'
+    expectArguments(entry, args, ['persona-ref', 'launch-start-ms', 'grace-ms'])
+    const [ref, start, grace] = args
+    const startMs = integerArgument(entry, 'launch-start-ms', start)
+    const graceMs = integerArgument(entry, 'grace-ms', grace)
+    const build = await packageFunction<(ref: string, launchStartMs: number, graceMs: number) => unknown>(context, 'live-row-sequence.ts', entry)
+    return builtString(entry, build(ref, Number(startMs), Number(graceMs)))
+  },
+}
+
+/** `liveRowSequenceWaitEndedLine(<persona-ref>)`: the step-2 wait's end line. */
+const liveRowWaitEndedLine: Entry = {
+  synopsis: '<persona-ref>',
+  async print(args, context) {
+    const entry = 'liveRowSequenceWaitEndedLine'
+    expectArguments(entry, args, ['persona-ref'])
+    const build = await packageFunction<(ref: string) => unknown>(context, 'live-row-sequence.ts', entry)
+    return builtString(entry, build(args[0]))
+  },
+}
+
+/** The `unknownName` agent-director's malformed-config answer carries (no client has a class for it). */
+const CONFIG_MALFORMED_ERR_NAME = 'ErrConfigMalformed'
+
+/**
+ * agent-director's `ErrConfigMalformed` answer, with `description` as its
+ * description, as CSCB meets it: the installed client has no class for the
+ * name, so it throws its `ErrUnknownErrorName` with that `unknownName` and
+ * the error envelope (`err_name`, `err_description`). The client's own
+ * `errorFromEnvelope` must not know the name either (it answers its base
+ * class for an unknown one); a client that has a class for it is a failure.
+ */
+async function configMalformedError(entry: string, description: string, context: EntryContext): Promise<unknown> {
+  const client = await context.importAgentDirectorClient()
+  const unknownClass = client['ErrUnknownErrorName']
+  if (typeof unknownClass !== 'function') fail(PRINTER_FAIL_EXIT, 'the installed agent-director client exports no ErrUnknownErrorName')
+  if (Object.hasOwn(client, CONFIG_MALFORMED_ERR_NAME)) {
+    fail(PRINTER_FAIL_EXIT, `${entry}: the installed agent-director client has a class ${CONFIG_MALFORMED_ERR_NAME}, so the answer would not arrive as an ErrUnknownErrorName`)
+  }
+  const envelope = { err_name: CONFIG_MALFORMED_ERR_NAME, err_description: description }
+  return new (unknownClass as new (unknownName: string, envelope: unknown) => unknown)(CONFIG_MALFORMED_ERR_NAME, envelope)
+}
+
+/** `adConfigMalformedOnset(<agent-director's ErrConfigMalformed with <description>>)`: the `ad-config-malformed` onset. */
+const configMalformedOnset: Entry = {
+  synopsis: '<description>',
+  async print(args, context) {
+    const entry = 'adConfigMalformedOnset'
+    expectArguments(entry, args, ['description'])
+    const err = await configMalformedError(entry, args[0], context)
+    const build = await packageFunction<(err: unknown) => unknown>(context, 'outage-state.ts', entry)
+    return builtString(entry, build(err))
+  },
+}
+
+/**
+ * `adConfigMalformedRaisedLine(<persona-key>, classifyAdError(<agent-director's
+ * ErrConfigMalformed with <description>>))`: the server-log raise line.
+ */
+const configMalformedRaisedLine: Entry = {
+  synopsis: '<persona-key> <description>',
+  async print(args, context) {
+    const entry = 'adConfigMalformedRaisedLine'
+    expectArguments(entry, args, ['persona-key', 'description'])
+    const [key, description] = args
+    const err = await configMalformedError(entry, description, context)
+    const classify = await packageFunction<(value: unknown) => unknown>(context, 'ad-error-class.ts', 'classifyAdError')
+    const build = await packageFunction<(key: string, classification: unknown) => unknown>(context, 'outage-state.ts', entry)
+    return builtString(entry, build(key, classify(err)))
+  },
+}
+
+/** `adConfigMalformedClearedLine(<persona-key>)`: the server-log clear line. */
+const configMalformedClearedLine: Entry = {
+  synopsis: '<persona-key>',
+  async print(args, context) {
+    const entry = 'adConfigMalformedClearedLine'
+    expectArguments(entry, args, ['persona-key'])
+    const build = await packageFunction<(key: string) => unknown>(context, 'outage-state.ts', entry)
+    return builtString(entry, build(args[0]))
+  },
+}
+
+/** The printer's words for whether a read was accepted before a refused one. */
+const HAD_ACCEPTED_READ: Readonly<Record<string, boolean>> = { accepted: true, none: false }
+
+/** `buildAdSettingsRefusedReadLine(<path>, <reason>, <hadAcceptedRead>)`: the line of a run of refused reads. */
+const refusedReadLine: Entry = {
+  synopsis: '<path> <reason> <accepted|none>',
+  async print(args, context) {
+    const entry = 'buildAdSettingsRefusedReadLine'
+    expectArguments(entry, args, ['path', 'reason', 'accepted|none'])
+    const [path, reason, earlier] = args
+    if (!Object.hasOwn(HAD_ACCEPTED_READ, earlier)) usageFail(`${entry}: the earlier read must be accepted or none (got '${earlier}')`)
+    const build = await packageFunction<(path: string, reason: string, hadAcceptedRead: boolean) => unknown>(context, 'ad-settings.ts', entry)
+    return builtString(entry, build(path, reason, HAD_ACCEPTED_READ[earlier]))
+  },
+}
+
+/** The printer's words for the mode a retry ran in: `pendingOnly` false or true. */
+const RETRY_MODES: Readonly<Record<string, boolean>> = { full: false, 'pending-only': true }
+
+/** A whole number of at least 1, from a decimal argument; a usage failure otherwise. */
+function retryNumber(entry: string, text: string): number {
+  const n = integerArgument(entry, 'retry', text)
+  if (n < 1n || n > BigInt(Number.MAX_SAFE_INTEGER)) usageFail(`${entry}: <retry> must be 1 or more (got '${text}')`)
+  return Number(n)
+}
+
+/** `unavailableRetryRetryLine(<persona-key>, <retry>, <pendingOnly>)`: the line at the start of a retry. */
+const retryLine: Entry = {
+  synopsis: '<persona-key> <retry> <full|pending-only>',
+  async print(args, context) {
+    const entry = 'unavailableRetryRetryLine'
+    expectArguments(entry, args, ['persona-key', 'retry', 'full|pending-only'])
+    const [key, retryText, mode] = args
+    if (!Object.hasOwn(RETRY_MODES, mode)) usageFail(`${entry}: the mode must be full or pending-only (got '${mode}')`)
+    const build = await packageFunction<(key: string, retry: number, pendingOnly: boolean) => unknown>(context, 'unavailable-retry.ts', entry)
+    return builtString(entry, build(key, retryNumber(entry, retryText), RETRY_MODES[mode]))
+  },
+}
+
+/**
+ * `unavailableRetryReArmedLine(<persona-key>, <retry>, <ranPendingOnly>, <reason>, undefined, <wait-ms>)`:
+ * the re-armed line of a retry that left the mode as it was. Given a marker
+ * <reason>, the text before the marker is the line's fixed head for that retry.
+ */
+const reArmedLine: Entry = {
+  synopsis: '<persona-key> <retry> <full|pending-only> <reason> <wait-ms>',
+  async print(args, context) {
+    const entry = 'unavailableRetryReArmedLine'
+    expectArguments(entry, args, ['persona-key', 'retry', 'full|pending-only', 'reason', 'wait-ms'])
+    const [key, retryText, mode, reason, waitText] = args
+    if (!Object.hasOwn(RETRY_MODES, mode)) usageFail(`${entry}: the mode must be full or pending-only (got '${mode}')`)
+    const waitMs = integerArgument(entry, 'wait-ms', waitText)
+    const build = await packageFunction<(key: string, retry: number, ranPendingOnly: boolean, reason: string, newMode: undefined, waitMs: number) => unknown>(
+      context,
+      'unavailable-retry.ts',
+      entry,
+    )
+    return builtString(entry, build(key, retryNumber(entry, retryText), RETRY_MODES[mode], reason, undefined, Number(waitMs)))
+  },
+}
+
+/**
+ * `unavailableRetryStoppedLine(<persona-key>, <pendingOnly>, <row>, <reason>)`:
+ * the line of a stop of the persona's retry timer; `none` for no row. Given
+ * a marker <reason>, the text before ` — <marker>` is the line's fixed head.
+ */
+const stoppedLine: Entry = {
+  synopsis: '<persona-key> <full|pending-only> <row|none> <reason>',
+  async print(args, context) {
+    const entry = 'unavailableRetryStoppedLine'
+    expectArguments(entry, args, ['persona-key', 'full|pending-only', 'row|none', 'reason'])
+    const [key, mode, row, reason] = args
+    if (!Object.hasOwn(RETRY_MODES, mode)) usageFail(`${entry}: the mode must be full or pending-only (got '${mode}')`)
+    const build = await packageFunction<(key: string, pendingOnly: boolean, row: string | undefined, reason: string) => unknown>(context, 'unavailable-retry.ts', entry)
+    return builtString(entry, build(key, RETRY_MODES[mode], row === 'none' ? undefined : row, reason))
+  },
+}
+
+/**
+ * `liveRowSequenceRunLine(<persona-ref>, <step>, <run-number>, <the package's <placement-export>>)`:
+ * the live-row sequence's line for one `find-missing` run.
+ */
+const liveRowRunLine: Entry = {
+  synopsis: '<persona-ref> <step> <run-number> <placement-export>',
+  async print(args, context) {
+    const entry = 'liveRowSequenceRunLine'
+    expectArguments(entry, args, ['persona-ref', 'step', 'run-number', 'placement-export'])
+    const [ref, stepText, runText, placementExport] = args
+    const step = integerArgument(entry, 'step', stepText)
+    if (step !== 3n && step !== 4n) usageFail(`${entry}: <step> must be 3 or 4 (got '${stepText}')`)
+    const run = integerArgument(entry, 'run-number', runText)
+    if (!/^LIVE_ROW_RUN_[A-Z_]+$/.test(placementExport)) usageFail(`${entry}: <placement-export> '${placementExport}' is not a LIVE_ROW_RUN_… name`)
+    const placement = await packageString(context, 'live-row-sequence.ts', placementExport)
+    const build = await packageFunction<(ref: string, step: number, run: number, placement: string) => unknown>(context, 'live-row-sequence.ts', entry)
+    return builtString(entry, build(ref, Number(step), Number(run), placement))
+  },
+}
+
+/**
+ * `buildAdCallTimeoutWarningLine(<call-timeout-ms>, <the values in effect for
+ * the <key>=<integer> arguments>)`: the startup call-timeout warning, or the
+ * empty text when the builder gives no line (the setting is above the need).
+ */
+const callTimeoutWarningLine: Entry = {
+  synopsis: '<call-timeout-ms> [<key>=<integer>…]',
+  async print(args, context) {
+    const entry = 'buildAdCallTimeoutWarningLine'
+    const [timeout, ...pairs] = args
+    if (timeout === undefined || timeout === '') usageFail(`${entry} takes <call-timeout-ms> [<key>=<integer>…] (no <call-timeout-ms> given)`)
+    const callTimeoutMs = integerArgument(entry, 'call-timeout-ms', timeout)
+    const values = await settingsInEffectFrom(entry, pairs, context)
+    const build = await packageFunction<(callTimeoutMs: number, values: object) => unknown>(context, 'ad-settings.ts', entry)
+    const line = build(Number(callTimeoutMs), values)
+    return line === undefined ? '' : builtString(entry, line)
+  },
+}
+
+/**
+ * `adCallTimeoutNeed(<the values in effect for the <key>=<integer>
+ * arguments>)`: `<need-ms> <verb>`, the need in decimal and the verb whose
+ * ceiling sets it. The values in effect carry DEFAULT_AD_SETTINGS_IN_EFFECT's
+ * pauseTimeout, which is used, so a verb always sets the need; any other
+ * answer is a failure.
+ */
+const callTimeoutNeed: Entry = {
+  synopsis: '[<key>=<integer>…]',
+  async print(args, context) {
+    const entry = 'adCallTimeoutNeed'
+    const values = await settingsInEffectFrom(entry, args, context)
+    const need = await packageFunction<(values: object) => unknown>(context, 'ad-settings.ts', entry)
+    const answer = need(values)
+    const { needMs, setBy } = (typeof answer === 'object' && answer !== null ? answer : {}) as { needMs?: unknown; setBy?: unknown }
+    const by = (typeof setBy === 'object' && setBy !== null ? setBy : {}) as { kind?: unknown; verb?: unknown }
+    if (by.kind !== 'verb' || typeof by.verb !== 'string' || !/^[a-z-]+$/.test(by.verb)) {
+      fail(PRINTER_FAIL_EXIT, `${entry} answered no verb that sets the need`)
+    }
+    return `${decimal(entry, needMs)} ${by.verb}`
+  },
+}
+
+/** The package's launch-timeout forms (src/ad-error-class.ts), by export name. */
+const LAUNCH_TIMEOUT_FORM_EXPORTS = ['LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT', 'LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE'] as const
+
+/**
+ * `launchUnavailableFormText(<form>, '')` for entry `entry`: how the
+ * launch-timeout get line names a launch timeout of the form `errName`,
+ * which must be the value of one of the package's LAUNCH_TIMEOUT_FORM_…
+ * exports (a usage failure otherwise).
+ */
+async function launchTimeoutFormTextOf(entry: string, errName: string, context: EntryContext): Promise<string> {
+  const forms: string[] = []
+  for (const name of LAUNCH_TIMEOUT_FORM_EXPORTS) forms.push(await packageString(context, 'ad-error-class.ts', name))
+  if (!forms.includes(errName)) usageFail(`${entry}: '${errName}' is not one of the package's launch-timeout forms (${forms.join(', ')})`)
+  const build = await packageFunction<(form: string, failure: string) => unknown>(context, 'session-manager.ts', 'launchUnavailableFormText')
+  return builtString('launchUnavailableFormText', build(errName, ''))
+}
+
+/**
+ * `launchUnavailableGetLine(<persona-ref>, <what>, <the form text of <err-name>>, <read>,
+ * <this launch's row>, <the package's <outcome-export>>)`: the line of the one
+ * `get` after a launch timeout. <launch-start> is the row's
+ * `launch_started_at` as agent-director wrote it, read as the package reads
+ * it (src/pending-row.ts parseLaunchStart), for this launch's row; `no` for
+ * none. <outcome-export> is a `LAUNCH_UNAVAILABLE_OUTCOME_…` name of
+ * src/session-manager.ts.
+ */
+const launchUnavailableGetLine: Entry = {
+  synopsis: '<persona-ref> <what> <err-name> <read> <launch-start|no> <outcome-export>',
+  async print(args, context) {
+    const entry = 'launchUnavailableGetLine'
+    expectArguments(entry, args, ['persona-ref', 'what', 'err-name', 'read', 'launch-start|no', 'outcome-export'])
+    const [ref, what, errName, read, launchStart, outcomeExport] = args
+    if (!/^LAUNCH_UNAVAILABLE_OUTCOME_[A-Z_]+$/.test(outcomeExport)) usageFail(`${entry}: <outcome-export> '${outcomeExport}' is not a LAUNCH_UNAVAILABLE_OUTCOME_… name`)
+    const form = await launchTimeoutFormTextOf(entry, errName, context)
+    const outcome = await packageString(context, 'session-manager.ts', outcomeExport)
+    let thisLaunchRow: { readonly launchStartMs: number } | undefined
+    if (launchStart !== 'no') {
+      const parse = await packageFunction<(raw: unknown) => unknown>(context, 'pending-row.ts', 'parseLaunchStart')
+      const launchStartMs = parse(launchStart)
+      if (typeof launchStartMs !== 'number' || !Number.isFinite(launchStartMs)) usageFail(`${entry}: <launch-start> '${launchStart}' is not a launch start the package parses`)
+      thisLaunchRow = { launchStartMs }
+    }
+    const build = await packageFunction<(ref: string, what: string, form: string, read: string, row: object | undefined, outcome: string) => unknown>(
+      context,
+      'session-manager.ts',
+      entry,
+    )
+    return builtString(entry, build(ref, what, form, read, thisLaunchRow, outcome))
+  },
+}
+
+/** `stuckLaunchAbortStartedLine(<persona-key>, <persona-ref>, <launch-start>)`: the stuck-launch abort's start line. */
+const abortStartedLine: Entry = {
+  synopsis: '<persona-key> <persona-ref> <launch-start>',
+  async print(args, context) {
+    const entry = 'stuckLaunchAbortStartedLine'
+    expectArguments(entry, args, ['persona-key', 'persona-ref', 'launch-start'])
+    const [key, ref, launchStart] = args
+    const build = await packageFunction<(key: string, ref: string, launchStart: unknown) => unknown>(context, 'pending-row.ts', entry)
+    return builtString(entry, build(key, ref, launchStart))
+  },
+}
+
+/** `reprobeDeadLine(<persona-key>)`: the re-probe's line of a row that reads dead. */
+const deadReprobeLine: Entry = {
+  synopsis: '<persona-key>',
+  async print(args, context) {
+    const entry = 'reprobeDeadLine'
+    expectArguments(entry, args, ['persona-key'])
+    const build = await packageFunction<(key: string) => unknown>(context, 'restart.ts', entry)
+    return builtString(entry, build(args[0]))
+  },
+}
+
+/** The printer's words for a live-row sequence's launch form: `launches` true or false. */
+const SEQUENCE_LAUNCH_FORMS: Readonly<Record<string, boolean>> = { launch: true, 'no-launch': false }
+
+/**
+ * `liveRowSequenceStartLine(<persona-ref>, <request>)`: the live-row
+ * sequence's start line, the request holding the fields the line names: the
+ * entry step the package exports as <entry-step-export> (a
+ * `LIVE_ROW_SEQUENCE_ENTRY_…` name), <instance-id>, <last-read>, the launch
+ * form and <alert-context>.
+ */
+const sequenceStartLine: Entry = {
+  synopsis: '<persona-ref> <entry-step-export> <instance-id> <last-read> <launch|no-launch> <alert-context>',
+  async print(args, context) {
+    const entry = 'liveRowSequenceStartLine'
+    expectArguments(entry, args, ['persona-ref', 'entry-step-export', 'instance-id', 'last-read', 'launch|no-launch', 'alert-context'])
+    const [ref, stepExport, instanceId, lastReadState, form, alertContext] = args
+    if (!/^LIVE_ROW_SEQUENCE_ENTRY_[A-Z_]+$/.test(stepExport)) usageFail(`${entry}: <entry-step-export> '${stepExport}' is not a LIVE_ROW_SEQUENCE_ENTRY_… name`)
+    if (!Object.hasOwn(SEQUENCE_LAUNCH_FORMS, form)) usageFail(`${entry}: the launch form must be launch or no-launch (got '${form}')`)
+    const entryStep = await packageExport(context, 'live-row-sequence.ts', stepExport)
+    if (typeof entryStep !== 'number') fail(PRINTER_FAIL_EXIT, `the installed package's src/live-row-sequence.ts export ${stepExport} is a ${typeof entryStep}, not a number`)
+    const build = await packageFunction<(ref: string, request: object) => unknown>(context, 'live-row-sequence.ts', entry)
+    return builtString(entry, build(ref, { instanceId, lastReadState, entryStep, launches: SEQUENCE_LAUNCH_FORMS[form], alertContext }))
+  },
+}
+
+// ---------------------------------------------------------------------------
 // The fixed-argument entries (scenarios 2, 6, 7, 9, 12, 15, 16 and 18)
 // ---------------------------------------------------------------------------
 
@@ -1915,7 +2583,7 @@ async function cliCommand(name: string): Promise<string> {
 }
 
 /** The value of the `AD_ERROR_CLASS_*` export named `name` (src/ad-error-class.ts). */
-async function adErrorClass(name: string): Promise<string> {
+async function adErrorClassLabel(name: string): Promise<string> {
   if (!/^AD_ERROR_CLASS_[A-Z_]+$/.test(name)) throw new PrinterFailure(`class '${name}' is not an AD_ERROR_CLASS_* export's name`, USAGE_EXIT)
   return text('ad-error-class.ts', name)
 }
@@ -2140,7 +2808,7 @@ const ARGS_ENTRIES: Readonly<Record<string, ArgsEntry>> = {
   // Scenario 9 (test-21; b.jg5 SRJ-1411).
   CLI_COMMAND_CLEAN_RESTART: { args: [], print: () => cliCommand('CLI_COMMAND_CLEAN_RESTART') },
   CLI_COMMAND_STOP_BOTS: { args: [], print: () => cliCommand('CLI_COMMAND_STOP_BOTS') },
-  adErrorClass: { args: ['class'], print: async ([name]) => adErrorClass(name) },
+  adErrorClass: { args: ['class'], print: async ([name]) => adErrorClassLabel(name) },
   adErrorName: {
     args: ['error-class'],
     print: async ([name]) => {
@@ -2158,7 +2826,7 @@ const ARGS_ENTRIES: Readonly<Record<string, ArgsEntry>> = {
       const line = (await fn<(c: string, p: object, f: object) => string>('cli-teardown.ts', 'precheckFailureLine'))(
         await cliCommand(commandName),
         await cliPersona(name),
-        { errorClass: await adErrorClass(className), description: DESCRIPTION_STAND_IN },
+        { errorClass: await adErrorClassLabel(className), description: DESCRIPTION_STAND_IN },
       )
       return around(line, DESCRIPTION_STAND_IN, 'precheckFailureLine').head
     },
@@ -2173,7 +2841,7 @@ const ARGS_ENTRIES: Readonly<Record<string, ArgsEntry>> = {
       const line = (await fn<(c: string, p: object, f: object) => string>('cli-teardown.ts', 'teardownFailureLine'))(
         await cliCommand(commandName),
         await cliPersona(name),
-        { errorClass: await adErrorClass(className), description: DESCRIPTION_STAND_IN },
+        { errorClass: await adErrorClassLabel(className), description: DESCRIPTION_STAND_IN },
       )
       return around(line, DESCRIPTION_STAND_IN, 'teardownFailureLine').head
     },
@@ -2203,7 +2871,7 @@ const ARGS_ENTRIES: Readonly<Record<string, ArgsEntry>> = {
   cleanRestartNotRestartedAlert: {
     args: ['class', 'names'],
     print: async ([className, names]) => {
-      const errorClass = await adErrorClass(className)
+      const errorClass = await adErrorClassLabel(className)
       const list = names.split(',')
       if (list.some((n) => n === '')) throw new PrinterFailure(`names '${names}' holds an empty name`, USAGE_EXIT)
       const failures = await Promise.all(list.map(async (n) => ({ persona: await cliPersona(n), errorClass })))
@@ -2241,20 +2909,6 @@ const ARGS_ENTRIES: Readonly<Record<string, ArgsEntry>> = {
   JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS: { args: [], print: () => text('session-manager.ts', 'JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS') },
   JSONL_TRANSCRIPT_LOST_ENTRY_CLASS: { args: [], print: () => text('session-manager.ts', 'JSONL_TRANSCRIPT_LOST_ENTRY_CLASS') },
   // Scenario 12 (test-19; b.jg5 SRJ-1414).
-  classifyAdError: {
-    args: ['error-class'],
-    print: async ([name]) => {
-      if (!/^Err[A-Za-z]+$/.test(name)) throw new PrinterFailure(`error class '${name}' is not an Err* name`, USAGE_EXIT)
-      const errorClass = (await packageModule('agent-director-errors.ts'))[name]
-      if (typeof errorClass !== 'function' || errorClass.name !== name) {
-        throw new PrinterFailure(`src/agent-director-errors.ts re-exports no error class named ${name}`, PRINTER_FAIL_EXIT)
-      }
-      const thrown = new (errorClass as new (verb: string, errName: string, errDescription: string) => Error)('spawn', name, '')
-      const classify = await fn<(v: unknown) => { readonly errorClass: string }>('ad-error-class.ts', 'classifyAdError')
-      return classify(thrown).errorClass
-    },
-  },
-  // Scenario 18 (test-19; b.jg5 SRJ-1419).
   RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY: { args: [], print: () => text('retired-keys.ts', 'RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY') },
   reloadAppliedLogLine: {
     args: ['added', 'removed', 'destructive', 'in-place', 'credentials', 'settings', 'config-path'],
@@ -2903,7 +3557,6 @@ const FN_ENTRIES: Readonly<Record<string, FnEntry>> = {
   APPROVER_LOG_PREFIX: noArguments('APPROVER_LOG_PREFIX', () => stringExport('session-manager.ts', 'APPROVER_LOG_PREFIX')),
   DEV_CHANNELS_DIALOG_NEEDLE: noArguments('DEV_CHANNELS_DIALOG_NEEDLE', () => stringExport('session-manager.ts', 'DEV_CHANNELS_DIALOG_NEEDLE')),
   TRUST_DIALOG_NEEDLE: noArguments('TRUST_DIALOG_NEEDLE', () => stringExport('session-manager.ts', 'TRUST_DIALOG_NEEDLE')),
-  DIALOG_POLL_INTERVAL_MS: noArguments('DIALOG_POLL_INTERVAL_MS', () => wholeNumberAt('session-manager.ts', 'DIALOG_POLL_INTERVAL_MS', [])),
   'DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds': noArguments('DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds', () =>
     wholeNumberAt('ad-settings.ts', 'DEFAULT_AD_SETTINGS', ['tmux', 'pending_grace_seconds']),
   ),
@@ -2913,7 +3566,6 @@ const FN_ENTRIES: Readonly<Record<string, FnEntry>> = {
   'DEFAULT_AD_SETTINGS.tmux.stopping_window_seconds': noArguments('DEFAULT_AD_SETTINGS.tmux.stopping_window_seconds', () =>
     wholeNumberAt('ad-settings.ts', 'DEFAULT_AD_SETTINGS', ['tmux', 'stopping_window_seconds']),
   ),
-  LAUNCH_TIMEOUT_PHRASE: noArguments('LAUNCH_TIMEOUT_PHRASE', () => stringExport('ad-description-phrases.ts', 'LAUNCH_TIMEOUT_PHRASE')),
   LAUNCH_UNAVAILABLE_OUTCOME_APPROVER: noArguments('LAUNCH_UNAVAILABLE_OUTCOME_APPROVER', () =>
     stringExport('session-manager.ts', 'LAUNCH_UNAVAILABLE_OUTCOME_APPROVER'),
   ),
@@ -3040,8 +3692,8 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   // Scenario 19 (test-16-fmk-conflict.sh).
   personaTmuxSessionName,
   LATCH_ROW_STATE_KIND_NO_ROW: constantEntry('conflict-latch.ts', 'LATCH_ROW_STATE_KIND_NO_ROW'),
-  adGraceMs: adSettingsDefaultMs('adGraceMs'),
-  adLaunchBoundMs: adSettingsDefaultMs('adLaunchBoundMs'),
+  adGraceMs: derivedWaitEntry('adGraceMs'),
+  adLaunchBoundMs: derivedWaitEntry('adLaunchBoundMs'),
   // Scenario 25 (test-27-fmk-unusable-name.sh).
   AD_ERROR_CLASS_UNUSABLE_NAME: constantEntry('ad-error-class.ts', 'AD_ERROR_CLASS_UNUSABLE_NAME'),
   // Scenario 20 (test-23-fmk-latch-recheck.sh); its DEFAULT_AD_SETTINGS and
@@ -3081,6 +3733,51 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   tmuxUnresponsiveAlertText: unresponsiveAlert,
   restartCapReachedNoticeText: builderEntry('session-manager.ts', 'restartCapReachedNoticeText', []),
   FULL_PANE_READ_LINES: constantEntry('pane-read.ts', 'FULL_PANE_READ_LINES'),
+  // Scenario 8 (test-20-fmk-old-binary.sh).
+  classifyAdError: adErrorClass,
+  // Scenario 23 (test-20-fmk-old-binary.sh).
+  CLIENT_DEV_SENTINEL_VERSION: constantEntry('ad-version-gate.ts', 'CLIENT_DEV_SENTINEL_VERSION'),
+  AD_SYSTEM_INSTALL_UNREACHABLE: constantEntry('install-check-labels.ts', 'AD_SYSTEM_INSTALL_UNREACHABLE'),
+  UNREACHABLE_REASON_UNPARSEABLE_VERSION: constantEntry('ad-version-gate.ts', 'UNREACHABLE_REASON_UNPARSEABLE_VERSION'),
+  meetsPhase1Floor: phase1Floor,
+  // Scenario 24 (test-26-fmk-timing-settings.sh).
+  AD_SETTINGS_LOG_PREFIX: constantEntry('ad-settings.ts', 'AD_SETTINGS_LOG_PREFIX'),
+  buildAdSettingsValuesLine: adSettingsValuesLine,
+  AD_TMUX_KEYS: adTmuxKeys,
+  pendingGraceMinimumSeconds: graceMinimum,
+  adAlertThresholdMs: derivedWaitEntry('adAlertThresholdMs'),
+  wholeMinutes: minutesOf,
+  stuckLaunchRelaunchingText: relaunchingText,
+  DIALOG_POLL_INTERVAL_MS: constantEntry('session-manager.ts', 'DIALOG_POLL_INTERVAL_MS'),
+  DIALOG_SLOW_POLL_INTERVAL_MS: constantEntry('session-manager.ts', 'DIALOG_SLOW_POLL_INTERVAL_MS'),
+  STARTUP_ERROR_SPAWN_FAILED: constantEntry('session-manager.ts', 'STARTUP_ERROR_SPAWN_FAILED'),
+  liveRowSequenceWaitArmedLine: liveRowWaitArmedLine,
+  liveRowSequenceWaitEndedLine: liveRowWaitEndedLine,
+  liveRowSequenceRunLine: liveRowRunLine,
+  // Scenario 24's refused values (test-26-fmk-timing-settings.sh).
+  AD_CONFIG_FILE_DISPLAY_NAME: constantEntry('ad-config-file.ts', 'AD_CONFIG_FILE_DISPLAY_NAME'),
+  adConfigMalformedOnset: configMalformedOnset,
+  adConfigMalformedRaisedLine: configMalformedRaisedLine,
+  adConfigMalformedClearedLine: configMalformedClearedLine,
+  buildAdSettingsRefusedReadLine: refusedReadLine,
+  unavailableRetryRetryLine: retryLine,
+  unavailableRetryReArmedLine: reArmedLine,
+  RESTART_OUTCOME_LIVENESS_UNKNOWN: constantEntry('restart.ts', 'RESTART_OUTCOME_LIVENESS_UNKNOWN'),
+  unavailableRetryStoppedLine: stoppedLine,
+  // Scenario 24's call timeout (test-26-fmk-timing-settings.sh).
+  buildAdCallTimeoutWarningLine: callTimeoutWarningLine,
+  adCallTimeoutNeed: callTimeoutNeed,
+  LAUNCH_TIMEOUT_PHRASE: constantEntry('ad-description-phrases.ts', 'LAUNCH_TIMEOUT_PHRASE'),
+  // Scenario 8's re-check stop (test-20-fmk-old-binary.sh).
+  AD_VERSION_RECHECK_STOP_EXIT_CODE: constantEntry('ad-version-gate.ts', 'AD_VERSION_RECHECK_STOP_EXIT_CODE'),
+  // Scenario 24's lines with exported builders (test-26-fmk-timing-settings.sh).
+  launchUnavailableGetLine: launchUnavailableGetLine,
+  UNAVAILABLE_RETRY_STOP_ROW_LIVE: constantEntry('unavailable-retry.ts', 'UNAVAILABLE_RETRY_STOP_ROW_LIVE'),
+  UNAVAILABLE_RETRY_STOP_RECOVERED: constantEntry('unavailable-retry.ts', 'UNAVAILABLE_RETRY_STOP_RECOVERED'),
+  stuckLaunchAbortStartedLine: abortStartedLine,
+  reprobeDeadLine: deadReprobeLine,
+  liveRowSequenceStartLine: sequenceStartLine,
+  RELOAD_APPLIED: constantEntry('reload-apply.ts', 'RELOAD_APPLIED'),
 }, argsEntries(ARGS_ENTRIES), fnEntries(FN_ENTRIES))
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */
@@ -3094,6 +3791,9 @@ async function entryValue(name: string | undefined, args: readonly string[]): Pr
 const context: EntryContext = {
   async importPackageModule(relPath) {
     return await import(join(PKG_DIR, 'src', relPath))
+  },
+  async importAgentDirectorClient() {
+    return await import(Bun.resolveSync('agent-director', join(PKG_DIR, 'src')))
   },
   entryValue,
 }

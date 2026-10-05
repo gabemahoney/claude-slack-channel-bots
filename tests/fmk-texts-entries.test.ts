@@ -17,7 +17,7 @@
  *   or a class the printer constructs); `packageString(…)`: a string;
  *   `packageExport(…)`: any defined value;
  * - each `latchStrings(context, <name>)`: an array of strings in
- *   `conflict-latch.ts`; each `adSettingsDefaultMs(<name>)`: a function in
+ *   `conflict-latch.ts`; each `derivedWaitEntry(<name>)`: a function in
  *   `ad-settings.ts`; each `builderEntry('<file>', '<name>', …)`: a function.
  *
  * A `<name>` is a string literal, or an identifier bound to one by a `const`
@@ -50,6 +50,7 @@ import { join } from 'node:path'
 import ts from 'typescript'
 
 import * as adDescriptionPhrases from '../src/ad-description-phrases.ts'
+import * as adConfigFile from '../src/ad-config-file.ts'
 import * as adErrorClass from '../src/ad-error-class.ts'
 import * as adSettings from '../src/ad-settings.ts'
 import * as adVersionGate from '../src/ad-version-gate.ts'
@@ -58,12 +59,15 @@ import * as config from '../src/config.ts'
 import * as conflictLatch from '../src/conflict-latch.ts'
 import * as installCheckLabels from '../src/install-check-labels.ts'
 import * as invalidFlagsHold from '../src/invalid-flags-hold.ts'
+import * as liveRowSequence from '../src/live-row-sequence.ts'
 import * as livenessReading from '../src/liveness-reading.ts'
 import * as outageState from '../src/outage-state.ts'
 import * as paneRead from '../src/pane-read.ts'
+import * as pendingRow from '../src/pending-row.ts'
 import * as personaEpisodes from '../src/persona-episodes.ts'
 import * as personaIdentity from '../src/persona-identity.ts'
 import * as personaNotifier from '../src/persona-notifier.ts'
+import * as reloadApply from '../src/reload-apply.ts'
 import * as restart from '../src/restart.ts'
 import * as rowReadRules from '../src/row-read-rules.ts'
 import * as sessionManager from '../src/session-manager.ts'
@@ -77,6 +81,7 @@ const PRINTER_PATH = join(REPO_ROOT, 'tests', 'integration', 'fixtures', 'fmk-te
 /** The `src/` modules the printer reads, by the file name it passes. */
 const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'ad-description-phrases.ts': adDescriptionPhrases,
+  'ad-config-file.ts': adConfigFile,
   'ad-error-class.ts': adErrorClass,
   'ad-settings.ts': adSettings,
   'ad-version-gate.ts': adVersionGate,
@@ -85,12 +90,15 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'conflict-latch.ts': conflictLatch,
   'install-check-labels.ts': installCheckLabels,
   'invalid-flags-hold.ts': invalidFlagsHold,
+  'live-row-sequence.ts': liveRowSequence,
   'liveness-reading.ts': livenessReading,
   'outage-state.ts': outageState,
   'pane-read.ts': paneRead,
+  'pending-row.ts': pendingRow,
   'persona-episodes.ts': personaEpisodes,
   'persona-identity.ts': personaIdentity,
   'persona-notifier.ts': personaNotifier,
+  'reload-apply.ts': reloadApply,
   'restart.ts': restart,
   'row-read-rules.ts': rowReadRules,
   'session-manager.ts': sessionManager,
@@ -124,8 +132,8 @@ const HELPERS: Readonly<Record<string, Helper>> = {
   packageString: { fileArg: 1, nameArg: 2, kind: 'string' },
   packageExport: { fileArg: 1, nameArg: 2, kind: 'defined' },
   latchStrings: { fixedFile: 'conflict-latch.ts', nameArg: 1, kind: 'string-array' },
-  adSettingsDefaultMs: { fixedFile: 'ad-settings.ts', nameArg: 0, kind: 'function' },
   builderEntry: { fileArg: 0, nameArg: 1, kind: 'function' },
+  derivedWaitEntry: { fixedFile: 'ad-settings.ts', nameArg: 0, kind: 'function' },
 }
 
 /** The helper naming a constant for every name of a top-level list: `constantEntries('<file>', <LIST>)`. */
@@ -140,6 +148,7 @@ const CHOSEN_FROM: Readonly<Record<string, string>> = {
   'recoveryReasonArgument:name': 'RECOVERY_REASON_EXPORTS',
   'belowPhase1FloorMessage:foundByExport': 'FOUND_BY_EXPORTS',
   'conflictLatchSetHead:outcomeExport': 'LATCH_SET_OUTCOME_EXPORTS',
+  'launchTimeoutFormTextOf:name': 'LAUNCH_TIMEOUT_FORM_EXPORTS',
 }
 
 /**
@@ -151,6 +160,9 @@ const CHOSEN_FROM: Readonly<Record<string, string>> = {
 const CHOSEN_BY_PREFIX: Readonly<Record<string, { readonly file: string; readonly prefix: string; readonly kind: ExportKind }>> = {
   'relaunchWithoutKill:reasonExport': { file: 'restart.ts', prefix: 'RELAUNCH_NO_KILL_', kind: 'string' },
   'relaunchWithoutKill:readingExport': { file: 'liveness-reading.ts', prefix: 'LIVENESS_READING_DEAD', kind: 'defined' },
+  'liveRowRunLine:placementExport': { file: 'live-row-sequence.ts', prefix: 'LIVE_ROW_RUN_', kind: 'string' },
+  'launchUnavailableGetLine:outcomeExport': { file: 'session-manager.ts', prefix: 'LAUNCH_UNAVAILABLE_OUTCOME_', kind: 'string' },
+  'sequenceStartLine:stepExport': { file: 'live-row-sequence.ts', prefix: 'LIVE_ROW_SEQUENCE_ENTRY_', kind: 'defined' },
 }
 
 /** What `printerRefs` reads from a source. */
@@ -170,8 +182,9 @@ function literalText(node: ts.Node | undefined): string | undefined {
   return undefined
 }
 
-/** The string values of a top-level `const` initializer: an array of literals, or an object whose values are literals. */
+/** The string values of a top-level `const` initializer: an array of literals, or an object whose values are literals (`as const` read through). */
 function collectionValues(init: ts.Expression): string[] | undefined {
+  if (ts.isAsExpression(init)) return collectionValues(init.expression)
   if (ts.isArrayLiteralExpression(init)) {
     const values = init.elements.map((e) => literalText(e))
     return values.every((v) => v !== undefined) ? (values as string[]) : undefined

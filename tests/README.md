@@ -167,6 +167,9 @@ why:
   built-ins and loads the installed package only after the check.
 - `fixtures/agent-director-list-refusing.sh`: its first step. It prints one
   line to stderr and exits 70 before it reads an argument or runs a binary.
+- `fixtures/ad-version-stand-in.sh`: checks the marker before it reads its
+  settings or runs agent-director; without it, it prints one
+  `ad-version-stand-in:` line on stderr and exits 70.
 - Every `scenario.sh` step that installs, moves or swaps an agent-director
   binary or the shim, every harness agent-director call (`ad`, `ad_capture`,
   `ad_admin`, `ad_admin_capture`), every harness `sqlite3` read, edit or copy
@@ -182,7 +185,10 @@ The same helpers then call `require_scenario_home`, which refuses unless
 `SCENARIO_ROOT` is a directory and HOME is under it, both as written and by
 real path (a HOME that is a symlink out of `SCENARIO_ROOT` is refused). The
 copy-and-rename every install and swap goes through also refuses a
-destination outside `SCENARIO_ROOT`. No harness step touches the invoking
+destination outside `SCENARIO_ROOT`, and the settings writers
+(`write_ad_settings` and the stand-in installs' settings write) resolve
+their directory with `realpath -e` and refuse one outside `SCENARIO_ROOT`
+before they remove, create or write anything there. No harness step touches the invoking
 user's own `~/.agent-director`.
 
 `tests/host-safety.test.ts` reads these files, and never runs them, to check
@@ -238,9 +244,9 @@ tests/
                                    # Slack stub's record (`slack_stub_record`: a `chat.postMessage` text over 300 characters recorded whole with `<token>` in the
                                    # token's place, the same text to `chat.update` cut to 300 characters, and no token-like text in the record); the stub
                                    # run directly (its version line, the default dev-channels dialog, `silent`, a stop line on stderr, and with a dialog delay a starting
-                                   # screen holding neither approver needle, then the same dialog byte for byte; the pause linger: a `/exit` line ignored in `at-once`,
-                                   # and in `pause-linger` a release made before the `/exit` not acted on, SessionEnd fired once from the stub's own process, the
-                                   # stub lingering and ignoring further lines (still running `STUB_LINGER_HOLD_S` after them), then exiting 0 on `stub_release`); the
+                                   # screen holding neither approver needle, then the same dialog byte for byte; the linger on exit: a `/exit` line ignored in `at-once`,
+                                   # and in `linger-on-exit` SessionEnd fired once from the stub's own process on `/exit`, its lingering marker written, the stub
+                                   # lingering and ignoring further lines (still running `STUB_LINGER_HOLD_S` after them), then exiting 0 on SIGUSR1); the
                                    # stub helpers refusing and working (`stub_dialog_delay`, `stub_release` and `stub_type_line` among them); `repoint_symlink`'s
                                    # real-path refusals and a re-point (`repoint_refusals`);
                                    # the SessionStart re-fire in every reporting path (at once, a folder trusted in either config, and the dev-channels,
@@ -351,7 +357,7 @@ tests/
                                    # shim's `fail-create` ends in `ErrTmuxSessionCreate` and leaves a `pending` row, never killed or launched over; CSCB's own
                                    # pending-row run from G marks it `missing` (the harness runs no `find-missing`) and the persona is brought up, with no
                                    # "dispatcher bug" post and no escalation; then (`leg_still_stopping`, scenario 13) a bot the harness pauses reads `ended` while
-                                   # its worker (the stub's `pause-linger`) still runs, the bot server's immediate `resume` is refused once as still stopping
+                                   # its worker (the stub's `linger-on-exit`) still runs, the bot server's immediate `resume` is refused once as still stopping
                                    # (`STILL_STOPPING_PHRASE`), followed by one `get`, with no post, and once the harness releases the worker (`stub_release`) a
                                    # retry of the retry timer resumes it, before the next health tick, with the same claude_session_id; health ticks on in the
                                    # first and last legs, `health_check_interval` 0 in the three between. It runs about seven and a half minutes and ends with
@@ -368,6 +374,10 @@ tests/
                                    # restarted and re-added with the same key, working directory and config directory, and a messaged persona whose
                                    # credentials_file changes, each come back by a reuse spawn with no `resume`, the old session absent from `get`, and CSCB
                                    # makes no `delete` (see fmk scenario list)
+    test-20-fmk-old-binary.sh      # HO §7 scenarios 8 and 23 (b.jg5 SRJ-1410, SRJ-1425), fmk: an old binary is refused at start; a binary swapped behind the shim stops
+                                   # the server; a re-check that cannot run logs once and changes nothing; an ErrInvalidFlags reuse holds or stops; the floor's
+                                   # release-candidate form launches; development builds (`0.0.0-dev`, `dev`) are refused, launching nothing; CSCB judges the
+                                   # binary's version, never the client's package version (see fmk scenarios below)
     test-21-fmk-teardown.sh        # HO §7 scenario 9 (b.jg5 SRJ-1411), fmk: teardowns that meet a conflict stop nothing; a pending persona's teardown escalates to a kill;
                                    # after a passing precheck a teardown whose kills fail restarts the server under clean_restart and leaves it stopped under
                                    # stop --stop-bots, and with agent-director refusing `list` at the fallback clean_restart starts nothing (see fmk scenario list)
@@ -470,6 +480,13 @@ tests/
                                    # `claude_config_dir` logs `failed`, its launch proceeds and the approver clears the folder-trust prompt; and no
                                    # CSCB-parented `spawn` or `resume` in the agent-director shim log carries `--no-pre-trust`. agent-director at its
                                    # defaults, `health_check_interval` 0
+    test-26-fmk-timing-settings.sh # HO §7 scenario 24 (b.jg5 SRJ-1426), fmk: agent-director's timing values are logged and govern the waits: the values line at
+                                   # every start; a held launch's approver pace, pending-row runs and live-row sequence runs waiting on G from its launch start;
+                                   # the relaunching stuck-launch post at B; "still stopping" following the written stopping window; a changed value used from
+                                   # the next read, a `[pause]`-only change logging none; refused values: one `ad-config-malformed` alert per affected
+                                   # persona, nothing destroyed or counted, the last values kept, one all-clear once fixed; the call timeout: below the
+                                   # need, the startup warning and a held launch ending in `ErrCallTimeout` with no launch over its row; above it, no warning
+                                   # and agent-director's launch-timeout `ErrTmuxUnresponsive` (see fmk scenarios below)
     test-27-fmk-unusable-name.sh  # HO §7 scenario 25 (b.jg5 SRJ-1427), fmk: an unusable recorded name latches with no tmux call; after the harness's delete it clears and comes up fresh
                                    # Set-up: in the first life persona `unusable` (U) reaches `waiting`; the harness types the stub's exit sentinel into its
                                    # pane (a human quitting Claude Code), so the row ends; then `stop --stop-bots`. With the server stopped, E39's scenario
@@ -524,24 +541,27 @@ tests/
                                    # for the dialog approvers to stop (`stopAllDialogApprovers`) before it prints its outcome and exits, so no agent-director
                                    # call it caused is in flight; refuses to run without the image marker /etc/cscb-ci-image and imports the installed package
                                    # only after that check
-      fmk-texts.ts                 # the fmk scenarios' one value printer: prints a CSCB-defined text, class label, log fragment or setting value from the
-                                   # installed package, through the export that builds or holds it, so no scenario retypes one; its header lists each entry and
-                                   # its `src/` export. Run from the scenario's own shell, never as a CSCB process; refuses to run without the image marker
-                                   # /etc/cscb-ci-image and imports the installed package only after that check
+      fmk-texts.ts                 # the one value printer of the fmk scenarios: prints the installed package's own export (a constant, or a builder's output for
+                                   # the given arguments) by entry name, so no script retypes a value src/ exports; refuses to run without the image marker
+                                   # /etc/cscb-ci-image and imports the package only after that check (see The value printer)
+      ad-version-stand-in.sh       # scenarios 8 and 23's agent-director version stand-in, behind the shim: reports a chosen version (or none a client parses), can turn the
+                                   # reuse flag into one the release does not define, and hands every other call to the image's release binary; refuses without
+                                   # the image marker or its settings file (see Scenario helper)
       driver.ts                    # Test 4 driver: builds a one-persona config, calls spawnForPersona directly, then follows the persona's dialog approver through the package's seams
                                    # (running when the launch returns, stops because the row went live, keeps the launch start); deletes no row
       stub-claude.sh               # fake `claude` (Tests 4, 10 and 12, and every fmk script): runs the mode its working directory selects (the dev-channels
                                    # dialog by default, at once, silent, an unrecognised dialog, the folder-trust prompt, the dev-channels dialog with the
-                                   # transcript written only at the first message, the pause linger), reports in by firing every SessionStart
+                                   # transcript written only at the first message, at once and lingering after `pause`'s `/exit`), reports in by firing every SessionStart
                                    # hook its `--settings` registers, and SessionEnd on its exit sentinel, as direct children of its own process (exec form:
                                    # `command` with its `args`; shell form: the command's words); re-fires SessionStart while its row reads `pending`, up to G;
                                    # holds an MCP session to the bot server (see The stub worker); clears its screen and scrollback when a dialog is answered,
                                    # before it reports in (see Stub worker modes); in `dev-channels`, an optional per-directory delay before the dialog
-                                   # (`stub_dialog_delay`); in `pause-linger`, SessionEnd on the `/exit` line `pause` types, then a linger until `stub_release`
+                                   # (`stub_dialog_delay`); in `linger-on-exit`, SessionEnd on the `/exit` line `pause` types, then a linger until `stub_release`
       stub-mcp-session.ts          # the stub's MCP session client, copied beside the stub in every fmk script: connects to the bot server named by the stub's
                                    # `--mcp-config` with the package's own MCP SDK and holds the session until the stub ends; refuses to run without the image
                                    # marker /etc/cscb-ci-image and imports the package only after that check
       slack-stub-server.ts         # Tests 10 and 12 loopback Slack stub: Web API, apps.connections.open, Socket Mode WebSocket, JSONL record
+                                   # (each `chat.postMessage` text whole, token-redacted)
       phase1-client-check.ts       # run by Test 1 on the installed package, after the client-under-test check
                                    # against the agent-director client the installed package resolves: the client exports SRJ-103's seven classes and the package's re-exports of them are the client's own,
                                    # client-built errors classify by class, the description and predicate helpers hold; refuses to run without the image marker /etc/cscb-ci-image
@@ -580,14 +600,38 @@ assertions).
 ### fmk scenarios
 
 Each fmk scenario of agent-director's handoff to CSCB, §7 (b.jg5 SRJ-14xx),
-is one script, named here as it is added; scenario 14 is the one exception,
-with no script. Test 0 is the harness's
+is one script, named here; scenario 14 has no script, and scenario 17 is a
+closing assertion of every fmk script. Test 0 is the harness's
 self-check, not a scenario.
 
 | Scenario | Script | What it covers |
 |---|---|---|
 | 1 | `test-13-fmk-switch-over.sh` | The switch-over from a pre-persona 0.10.0 fleet to this build on agent-director Phase 1, by the README's runbook (leg A), then a `clean_restart` on Phase 1 that resumes every persona (leg B) and this build's refusal of agent-director 0.10.0 (leg C) (SRJ-1402, SRJ-203, SRJ-1013) |
+| 2 | `test-14-fmk-kill-fails.sh` | A kill that really fails launches nothing, keeps the row and routes one alert (SRJ-1403); see fmk scenario list |
+| 3 | `test-15-fmk-prefix-neighbour.sh` | A hand-made prefix neighbour is never read, typed into or killed (SRJ-1404) |
+| 4 | `test-16-fmk-conflict.sh` | A session holding a finished row's name latches the persona until it ends (SRJ-1405) |
+| 5 | `test-17-fmk-launch-pending.sh` | A resume held at the dev-channels dialog reads `pending` and is never forced (SRJ-1406); see fmk scenario list |
+| 6 | `test-18-fmk-wedged.sh` | A wedged tmux gets no destructive action and one alert per persona (SRJ-1408); see fmk scenario list |
+| 7 | `test-19-fmk-reuse.sh` | A reuse spawn brings a finished row up when no resume can (SRJ-1409); see fmk scenario list |
+| 8 | `test-20-fmk-old-binary.sh` | Old binaries are refused and a swap to one stops the server (SRJ-1410); see Scenarios 8, 23 and 24 |
+| 9 | `test-21-fmk-teardown.sh` | Teardowns that meet a conflict stop nothing (SRJ-1411); see fmk scenario list |
+| 10 | `test-22-fmk-wrong-server.sh` | A `find-missing` from another tmux environment marks nothing, and the own-id latch clears (SRJ-1412); see fmk scenario list |
+| 11 | `test-17-fmk-launch-pending.sh` | A failed fresh spawn waits out G and is brought up once `missing` (SRJ-1413); see fmk scenario list |
+| 12 | `test-19-fmk-reuse.sh` | A `missing` row beside a leftover, and an `ended` row with a stale label, come up by reuse once the session is gone (SRJ-1414) |
+| 13 | `test-17-fmk-launch-pending.sh` | A paused bot's immediate resume meets "still stopping" once and succeeds later (SRJ-1415) |
 | 14 | none | A stale `serve` after the install. It tests agent-director's own `serve` process, so it is agent-director's to verify: CSCB has no script and runs no check for it (SRJ-1416) |
+| 15 | `test-14-fmk-kill-fails.sh` | A persona removal whose kill fails keeps the row (SRJ-1417) |
+| 16 | `test-14-fmk-kill-fails.sh` | An upgrade's first start with a failing kill keeps every row (SRJ-1417) |
+| 17 | every fmk script | `assert_no_server_tmux`: no bot server makes a tmux call of its own (see Closing assertions) |
+| 18 | `test-19-fmk-reuse.sh` | A persona removed and re-added comes back fresh by reuse, never resumed (SRJ-1419) |
+| 19 | `test-16-fmk-conflict.sh` | Each kind of leftover session latches its persona, and each clears once it ends (SRJ-1420) |
+| 20 | `test-23-fmk-latch-recheck.sh` | Every latch case is re-checked every 120 s with exactly its call (SRJ-1422) |
+| 21 | `test-24-fmk-stuck-launch.sh` | A launch stuck at an unrecognised prompt is aborted once at B and resumed (SRJ-1423) |
+| 22 | `test-25-fmk-pre-trust.sh` | Each launch's `pre_trust` is only logged (SRJ-1424) |
+| 23 | `test-20-fmk-old-binary.sh` | A `<P1>-rc.N` binary launches and development builds are refused (SRJ-1425); see Scenarios 8, 23 and 24 |
+| 24 | `test-26-fmk-timing-settings.sh` | agent-director's timing settings are logged and govern CSCB's waits (SRJ-1426); see Scenarios 8, 23 and 24 |
+| 25 | `test-27-fmk-unusable-name.sh` | An unusable recorded name latches with no tmux call and clears once the row is gone (SRJ-1427) |
+| 26 | `test-28-fmk-provenance.sh` | CSCB never touches `@ad_owner`/`@ad_pane`, whatever the tmux server's state (SRJ-1428); see fmk scenario list |
 
 Scenario 14 has no script by decision, not as a gap: the `/ci` suite covers
 every §7 scenario except scenario 14.
@@ -919,6 +963,9 @@ script's name:
 
 Sourcing it, in both modes:
 
+- exports `CSCB_PKG_DIR`, the installed package under test
+  (`$SCENARIO_REPO/node_modules/claude-slack-channel-bots`), which the value
+  printer and the drivers read;
 - makes a scratch root (`SCENARIO_ROOT`, `mktemp -d` under `/tmp`) and a
   first state dir under it, exported as `SLACK_STATE_DIR`, so a scenario never
   touches `~/.claude/channels/slack/` or another script's state, and its first
@@ -948,7 +995,7 @@ fmk mode. Sourcing also:
 - exports a PATH that starts with the scenario's bin directory
   (`SCENARIO_BIN`), where `claude` is a copy of `fixtures/stub-claude.sh`,
   with a copy of `fixtures/stub-mcp-session.ts` beside it and the stub's mode
-  selections, dialog delay settings and pause linger releases (see The stub worker), followed by the container's PATH without every directory that holds an
+  selections and dialog delay settings, and a lingering stub's marker (see The stub worker), followed by the container's PATH without every directory that holds an
   `agent-director` (the image's default agent-director directory among them)
   and without relative or empty entries. bun's directory stays. No process of
   the scenario finds an agent-director on PATH: the client finds the scenario
@@ -968,9 +1015,10 @@ fmk mode. Sourcing also:
   store yet. `SCENARIO_AD_START` is `release` (the default) or `0.10.0`; a
   shared-mode script that sets it fails;
 - writes no agent-director `config.toml`, so agent-director runs on its
-  default settings. Scenarios 10 and 24 are the exceptions: they write a
-  `[tmux]` table. Test 0 writes one too, after its re-fire legs (see
-  Layout);
+  default settings. Scenarios 10 and 24 (Test 26) are the exceptions: they
+  write a `[tmux]` table with `write_ad_settings` (see Harness agent-director
+  calls and store helpers below). Test 0 writes one too, after its re-fire
+  legs (see Layout);
 - once `SCENARIO_PORT` is picked, writes `$HOME/.claude/slack-mcp.json`
   (`write_mcp_config`), naming the bot server's MCP URL on that port, the
   `mcp_config_path` a persona config defaults to, so the stub's MCP session
@@ -1035,6 +1083,27 @@ Each change to the install goes through one helper:
   together (to `$SCENARIO_ROOT/ad-aside`), leaving no file at the standard
   path; restore moves both back, the binary first, then runs `check_ad_shim`.
   A move that fails halfway is rolled back and the step fails saying so.
+- `install_ad_stand_in <version|unparseable> <reject|pass> [<step>]` and
+  `restore_ad_install_with_stand_in <version|unparseable> <reject|pass>
+  [<step>]` are harness additions for scenario 8 (`install_ad_stand_in` for
+  scenario 23 too). Each puts
+  `fixtures/ad-version-stand-in.sh` behind the shim, after writing the
+  stand-in's settings beside the binary path
+  (`agent-director.real.settings`): what its `version` reports (`<version>`,
+  or for `unparseable` a line no client parses), whether `--reuse-finished`
+  is turned into a flag the release does not define (`reject`) or passed on
+  (`pass`), and the image's release binary (`SCENARIO_RELEASE_BIN`, never
+  found through PATH) that every other call is handed to. The settings
+  write refuses a bin directory that is not under `SCENARIO_ROOT` or
+  resolves (by `realpath -e`) outside it.
+  `install_ad_stand_in` places the stand-in through `swap_ad_binary`.
+  `restore_ad_install_with_stand_in`, after `hide_ad_install`, puts the
+  stand-in at `agent-director.real`, then moves the hidden shim back and
+  removes the hidden binary; when the shim cannot move, the stand-in is
+  removed again and the install stays hidden. Both end with `check_ad_shim`
+  and a check that the stand-in, with its settings, is behind the shim. The
+  stand-in reads no environment variable; its header states the settings
+  format.
 
 The list-refusing stand-in (`fixtures/agent-director-list-refusing.sh`; a
 harness addition, confirm at the reconcile pass) is the stand-in file
@@ -1093,7 +1162,9 @@ Harness agent-director calls and store helpers:
   back on its defaults. It fails on a key that is not a lowercase TOML bare
   key, a key given twice, or a value that is empty or holds a control
   character, and refuses a settings directory
-  that resolves outside `SCENARIO_ROOT` or a path that is not a regular
+  that resolves outside `SCENARIO_ROOT` (by `realpath -e`: checked, when the
+  directory exists, before the file is removed or the directory created,
+  and again once it is created) or a path that is not a regular
   file. It then reads the file back, fails unless it holds exactly what was
   written, and sets `AD_SETTINGS_FILE` to its path.
   `_scenario_ad_tmux_setting`, the stub's re-fire and
@@ -1249,6 +1320,11 @@ verb is `<verb>` (any verb when `<verb>` is empty) and whose arguments, joined
 by single spaces, hold every fixed-string fragment in order;
 `cscb_ad_count <verb> [<fragment>...]` prints how many. The harness's calls,
 the stub's calls and any `stop` line never count.
+`wait_for_cscb_ad_call <count-before> <timeout-s> <step> <verb>
+[<fragment>...]` (a harness addition for scenarios 8 and 23, which scenario
+24 uses too) waits until that count is above `<count-before>`, which the caller takes before the step it waits
+on, then prints the next such line (`cscb_ad_calls`' line `<count-before>` +
+1); it fails naming `<step>` when the count stays there for `<timeout-s>`.
 
 Readers for the latch scenarios (fmk mode; harness additions, b.jg5
 SRJ-1306). Test 15 and the latch scenarios read the logs through these;
@@ -1400,7 +1476,8 @@ These hold for every fmk script (b.jg5 SRJ-1401):
 - It runs on the release (binary, agent-director-admin, client, and
   `install.sh` with its migration) unless it sets `SCENARIO_AD_START=0.10.0`, and at
   agent-director's default settings, with no `config.toml`, unless it is
-  scenario 10 or 24, which write a `[tmux]` table. Test 0, the harness's
+  scenario 10 or 24 (Test 26), which write a `[tmux]` table with
+  `write_ad_settings`. Test 0, the harness's
   self-check rather than a scenario, writes one once its re-fire legs are
   done, for its finished-row kill (see Layout).
 - It runs with both shims: `tmux-shim.sh` first on the PATH of its CSCB
@@ -1436,7 +1513,9 @@ These hold for every fmk script (b.jg5 SRJ-1401):
 - CSCB's timings are shortened only through its configuration
   (`health_check_interval`, `session_restart_delay`) and the package's
   exported seams, never by editing `src/`. agent-director's are changed only
-  through the `[tmux]` table of scenarios 10 and 24; every other scenario
+  through the `[tmux]` table of scenarios 10 and 24, written with
+  `write_ad_settings`, beside which scenario 24 also writes a `[pause]`
+  table; every other scenario
   waits out agent-director's default windows (at least 300 s where it needs
   the starting-session bound, as the finished-row kill does).
 - Posts are read from the Slack stub's record (`slack-stub-server.ts
@@ -1465,11 +1544,670 @@ script's header comment is its full specification.
 | 9 (b.jg5 SRJ-1411, SRJ-901, SRJ-903 to SRJ-907, SRJ-909; AC 1, AC 4, AC 73, AC 75) | `test-21-fmk-teardown.sh` | `clean_restart` and `stop --stop-bots`, each run as a CLI command through `cscb_run` (so its calls count as CSCB's), every leg with its own personas, put in `config.json` while the server is stopped with the last-applied record moved aside. Precheck legs: A and B up (`waiting`); the harness respawns A's worker pane with a `sleep` (`respawn_worker_pane`), so the release's one-line `read-pane` of A answers CONFLICT ("the agent's pane was not found") while A's row stays live and B is untouched. Changing A's `launch_token` is not used: it makes `read-pane` read a leftover's pane, so the precheck would pass. Teardown-failure legs: C and E up; tmux-shim `fail-kill` (no target list) set just before the command; the stub ignores `pause`'s `/exit`, so each pause times out (30 s) and escalates to the kill, whose `KILL_RETRY_TRIES` tries each answer `ErrTmuxKillFailed`. Not-restarted leg: F and G up; the list-refusing stand-in swapped in behind the shim; `fail-kill`; `clean_restart`, whose answer check's `list` tries are refused. Pending-persona leg: D under `unrecognised-dialog`, its row `pending` with a launch start at a dialog CSCB never answers; `stop --stop-bots` (run before G has passed since D's launch start; the script fails otherwise); then D's directory switched to `dev-channels` and a start | Precheck legs, for each command: it exits non-zero; its output holds one precheck failure line naming A, its key, its session and CONFLICT, the description holding `CONFLICT_PANE_NOT_FOUND_PHRASE`, no such line for B, and "nothing was stopped" once, as its last line; A's failure line in neither `server.log` nor `startup-errors.log`; the bot server's PID unchanged and running; at least one CLI-parented `read-pane` of A and no CLI-parented `pause` or `kill`. A's and B's rows are unchanged (a harness `get` before and after). Then the harness ends A's session by its session id (`end_session`), and a harness `read-pane` of A answers `ErrTmuxCaptureFailed` (GONE). Teardown-failure legs, for each of C and E under each command: each kill try's per-try line answers `ErrTmuxKillFailed`, with exactly `KILL_RETRY_TRIES` CLI-parented kills of its id; its failure line printed once, followed by the ordinary alert for the CLI-teardown route, each appended once to `server.log` (and, under `clean_restart`, to `clean_restart.log`), and one `persona-kill-failed` entry holding both; two such entries per command; the last line counting 2; exit non-zero; no CSCB `delete`, both rows present and both sessions still there. After `clean_restart` the bot server runs with a new PID; after `stop --stop-bots` it is gone, with no `server.pid` and no server started after the command's mark. Not-restarted leg: a harness `list` is refused and a harness `version` and `get` answer through the stand-in; no precheck line; F's and G's UNAVAILABLE teardown failure lines; exactly 3 CLI-parented `list` calls carrying the `service` label, with one failed answer-check line per try in `clean_restart.log`; no bot server running and none started after the mark; exactly one not-restarted alert naming F and G, in the command's output, once in `clean_restart.log` and once in `server.log`, recorded as one `clean-restart-not-restarted` entry with the same text; the last line counting 2; exit non-zero; no CSCB `delete`; both rows present. Pending-persona leg: `stop --stop-bots` exits 0, its output holding one escalation line for D carrying `ErrSpawnNotPausable`, with one CLI-parented `pause` and one `kill` of D; the server and D's session are gone. After the next start D's row reads `waiting` within G + `UNAVAILABLE_RETRY_CEILING_S` + 120 s (at least 300 s); no CSCB `kill` of D after that start; no harness `find-missing` in the whole run; exactly one `ad.find_missing.tick` in agent-director's trail marking D's row `missing` from `pending`, with a CSCB `find-missing` at or before it; exactly one launch record for D after the start's mark (`ad.spawn.reused` or `ad.resume.moved_to_pending`), not before that tick. Logged as `NOTE:` lines, not asserted: each leg's CSCB calls of its ids by verb, D's row state after the kill and the restarted server's PID. Ends with the three closing assertions | tmux-shim `log` while personas launch, `fail-kill` (no target list) for the teardown-failure and not-restarted legs' commands, `log` again before the pending-persona leg; stub modes `dev-channels` (A, B, C, E, F, G, and D's recovery) and `unrecognised-dialog` (D); `respawn_worker_pane` and `end_session`; the list-refusing stand-in (`swap_ad_binary <path>`, then `swap_ad_binary release`); agent-director's default settings, no `config.toml` (`[pause] timeout_seconds` 30; G from `adGraceMs` of the defaults); `health_check_interval` 0, `session_restart_delay` 0 and `exit_timeout` 5 in `config.json`; the release start (`SCENARIO_AD_START` unset); live starts against the Slack stub, and the CLI commands with `SLACK_DRY_RUN` unset; values from `fixtures/fmk-texts.ts`; agent-director's trail (`ad-trail.jsonl`) for its marks and launch records |
 | 5 (b.jg5 SRJ-1406, AC 3, AC 29, AC 32) | `test-17-fmk-launch-pending.sh` | test-17's first leg (`leg_launch_pending`) | A launch in progress: a resume held at the dev-channels dialog reads `pending` with its kept `claude_session_id` and a launch start. While it is held, health ticks and a `resume` forced through `fmk-driver.ts` change nothing: the forced call gets `ErrSpawnNotResumable`, not counted and not posted (no notice line for the persona on the driver's standard error: neither the no-notifier line nor the driver's outage-notice line), and the bot server makes no other launch, no kill and no post, and writes no reconnect, relaunch or restart line for the persona. The health ticks are counted: over the hold of D seconds, at least ⌊D / tick interval⌋ − 1 bot-server `status` reads of the persona are not followed by a `read-pane` (a tick reads status only; an approver lap reads status, then the pane). After the delay, the approver clears the dialog only through the bot server's `read-pane` and `send-keys` with `--allow-pending` on the `pending` row (no `send-keys` before the delay ends, no approver log line for the persona), the row reaches `waiting` with the same `claude_session_id`, and the bot server starts no tmux process (`assert_no_server_tmux`). Then the launch-timeout legs (`leg_launch_timeouts`, AC 29): a plain spawn (no row), a reuse (a finished row whose `cwd` differs from the persona's working directory, replaced with `spawn --reuse-finished`) and a `resume` (a finished row with its `claude_session_id`) each end in a launch timeout (`LAUNCH_TIMEOUT_PHRASE`, or the `ErrCallTimeout` form) and one post-timeout get line that starts the approver. Per persona: the launch is of its kind; one bot-server `get` of the row, after which a harness read finds it `pending`; then the bot server's `read-pane` and `send-keys` with `--allow-pending`, whose `send-keys` adopts the pane after the lost reply; the stub reports in only after that `send-keys`; a tmux-unresponsive ended line comes no later than the first read out of `pending`; every retry line of the retry timer (matched whole, so never the re-armed line) is followed by a bot-server read of the row, with no launch (how many retries each persona had is recorded, not asserted); no spawn, reuse or `resume` after the launch, no kill, no conflict-latch line, and no post (no spawn-failure or CONFLICT notice); the row reaches `waiting`, the `resume` keeping its `claude_session_id`. The reuse and `resume` personas' own plain spawn, the ladder's first step, collides first (recorded, not asserted). Then the restart leg (`leg_restart_mid_launch`, AC 32): a launch held at its starting screen across a plain `stop` (no `--stop-bots`) and a start is found `pending` by the new server, whose one plain spawn collides with the row and launches nothing; it runs no approver of its own, its first `read-pane` of the row comes at or after G past the launch start, and its pending-row lap's `send-keys` with `--allow-pending` clears the dialog, the only `send-keys` of the row before it leaves `pending`; the row reaches `waiting` with no reuse, `resume`, kill or post; the old server's approver, stopped at shutdown (its one shutdown stop line for the persona in the old server's log), arms nothing for the row: no armed or not-armed retry-timer line for the persona follows that stop line | Scenario 5's leg: the tmux shim in `log` throughout. The stub in `dev-channels` with a dialog delay (`stub_dialog_delay`) of 30 s, set in the persona's working directory before the resume: one health tick, the forced `resume`'s 20 s bound and 7 s slack, checked to be shorter than agent-director's default G (60 s) less the approver's clear. The worker ended with the stub's sentinel; the bot server's restart path makes the resume. `fmk-driver.ts`'s forced `resume` through `cscb_run`. Health ticks on through config: `health_check_interval` 3 s, `session_restart_delay` 5 s. The launch-timeout legs: `health_check_interval` 0 (no tick is needed). The reuse and `resume` personas are brought up in one state dir, stopped with a plain `stop` and their workers ended with the sentinel; the three launches start in a second state dir, with the reuse persona in another working directory. The tmux shim in `slow-create` for that start, its delay one whole create timeout (`create_timeout_ms`) plus 10 s, checked to be above agent-director's create timeout and below CSCB's agent-director call timeout, so the session is created and the launch call times out; the shim is set back to `log` once every persona's post-timeout get line is in `server.log`. Each persona's working directory has a dialog delay of one create timeout per persona plus 8 s (agent-director makes one session-creating call at a time), so a harness read after each `get` still finds the row `pending`; the stub then holds at the dev-channels dialog until the approver's Enter and reports in with its SessionStart re-fire. The restart leg: `health_check_interval` 0, one persona with a dialog delay of 30 s (longer than the stop and the start, checked; shorter than G, checked); the harness reads the row until it leaves `pending`, bounded at G + `UNAVAILABLE_RETRY_CEILING_S` + 10 s from the launch start. Each leg in its own state dir, each with its own Slack stub. agent-director at its defaults (no `config.toml`). Posts read from the Slack stub's record. The create timeout, the call timeout, G, the launch-timeout phrase, the retry timer's base and ceiling, the pending-row rule's log head, the tmux-unresponsive ended lines, the retry-timer line heads (`unavailableRetryLineHead`, `unavailableRetryArmedHead`, `unavailableRetryStoppedHead`, `unavailableRetryNotArmedHead`), the retry line's parts (`unavailableRetryRetryLineParts`), the post-UNAVAILABLE get line's parts and form texts (`launchUnavailableGetLineParts`, `launchUnavailableFormText`), the tmux-unresponsive line head (`tmuxUnresponsiveLineHead`) and the approver's shutdown stop line (`approverShutdownStopLine`) printed by `fmk-texts.ts` |
 | 11 (b.jg5 SRJ-1413, AC 6) | `test-17-fmk-launch-pending.sh` | test-17's fourth leg (`leg_fail_create`) | A failed fresh spawn, test-17's fourth leg (`leg_fail_create`): a persona with no row, whose plain spawn under the tmux shim's `fail-create` ends in `ErrTmuxSessionCreate`, leaving a `pending` row with a launch start, the only `pending` row before G. The bot server's one launch call while the shim is in `fail-create` is that plain spawn (no `--reuse-finished`). It runs no `find-missing` between the launch start and G; its own pending-row run from G marks the row `missing` (one pending-row rule round line naming the run `PENDING_ROW_RUN_MARKED_MISSING` and its get `missing`, no later than the next launch), and the persona's next launch comes only after that `find-missing` and a bot-server `get` of the row between the two; a harness read of `missing`, when one catches it, comes after that run. No `kill` of the row from any CSCB process, and no `find-missing` in the leg from any process but the bot server. No post holds "dispatcher bug" (the whole recorded post, case-insensitively); at most one post holds the spawn-failure notice's first line, and that one holds the notice's head for `ErrTmuxSessionCreate`; no other post (no cap, alert or stuck-launch post). The row reaches `waiting` and the persona's session is registered. Whether the counted failure posted a spawn-failure notice is recorded, not asserted | `health_check_interval` 0 (the failure arms the retry timer at once, so no tick is needed). Its own state dir and Slack stub; one persona with no row and no dialog delay. The tmux shim set to `fail-create` before the start, and set back to `log` by the harness once `server.log` holds the plain spawn's `ErrTmuxSessionCreate` line for the persona; at least one `new-session` call reaches the shim in `fail-create`. The harness runs no `find-missing`: the persona is not latched, so CSCB's own pending-row runs mark its row. The harness reads the row every 1 s until it is live, bounded at G + `UNAVAILABLE_RETRY_CEILING_S` + 40 s from the launch start, and before G follows each `pending` read with `list --state pending`. agent-director at its defaults (no `config.toml`). Posts read from the Slack stub's record. G, the retry timer's ceiling, the pending-row rule's log head, `PENDING_ROW_RUN_MARKED_MISSING`, the spawn-failure notice's head for `ErrTmuxSessionCreate` (entry `spawnFailureNoticeHead`, from `spawnFailureNoticeText`) and the persona's retry-timer line head (entry `unavailableRetryLineHead`, for the recorded lines) printed by `fmk-texts.ts` |
-| 13 (b.jg5 SRJ-1415) | `test-17-fmk-launch-pending.sh` | test-17's fifth leg (`leg_still_stopping`) | A paused bot's immediate `resume` meets a worker still stopping, test-17's fifth leg (`leg_still_stopping`). After a health tick's read of persona S, the harness pauses S: the `pause` returns within its bound of that read, the row reads `ended` with its `claude_session_id`, and the worker's tmux session and pane process still run. The bot server then resumes S inside the stopping window from the pause (what scheduled the resume is recorded, not asserted), and agent-director refuses it: exactly one server.log refusal of S's `resume` carries `STILL_STOPPING_PHRASE` (UNAVAILABLE), followed by exactly one post-UNAVAILABLE get line and exactly one bot-server `get` of the row between the refused `resume` and that line. Once the harness releases the worker, its session ends, and the retry timer's first retry after the refusal comes after the release and the session's end; the second `resume` follows that retry within its slack, before the next tick's read and before the row reads `waiting` again: the success is a retry's, not a tick's. Exactly two bot-server `resume`s of S after the pause; no reuse spawn or `kill` of S from any CSCB process (each `resume` follows its ladder's plain spawn, which collides with the row: recorded, not asserted). The row reads `waiting` with the same `claude_session_id` and the resumed stub's session is registered. No post from the pause on: none holds S's tmux-unresponsive onset or the spawn-failure notice's first line, and there is no alert or other post (a single refusal that clears by the next tick posts nothing); these record checks run again once the server has stopped (shutdown ends every episode silently, so any post the next tick's onset check made is in the record by then). No server.log line after the second `resume` names S with a reconnect, relaunch, restart scheduling or not-connected text | Its own state dir (`paused`) and Slack stub; one persona whose working directory is selected for the stub's `pause-linger` (`stub_mode`; the pause linger, a harness addition). Health ticks on through config: `health_check_interval` 58 s, derived as the pause's bound (5 s), the restart delay, a launch slack (10 s), `UNAVAILABLE_RETRY_BASE_S` and a launch slack again, checked longer than the retry base; `session_restart_delay` 3 s. The refused `resume` is due within the pause's bound, the restart delay and a launch slack of the tick's read, checked shorter than agent-director's default stopping window (90 s). Before the pause the bring-up's approver and its retry timer have stopped, so only a tick reads S's status and the refusal arms a fresh timer. The harness plays a human's `pause` from the scenario's own shell, through the agent-director shim, and calls `stub_release` once server.log holds the refusal. The next tick's read is checked within 2 s of the interval. agent-director at its defaults (no `config.toml`). Posts read from the Slack stub's record. `STILL_STOPPING_PHRASE`, the stopping window (`DEFAULT_AD_SETTINGS.tmux.stopping_window_seconds`), the retry timer's base, the spawn-failure notice's head, S's tmux-unresponsive onset body (entry `tmuxUnresponsiveOnsetText`), the retry-timer line heads (`unavailableRetryLineHead`, `unavailableRetryArmedHead`, `unavailableRetryStoppedHead`), the retry line's parts (`unavailableRetryRetryLineParts`), the post-UNAVAILABLE get line's parts (`launchUnavailableGetLineParts`) and its plain UNAVAILABLE form head (`launchUnavailableFormText none`), and the tmux-unresponsive line head (`tmuxUnresponsiveLineHead`) printed by `fmk-texts.ts` |
+| 13 (b.jg5 SRJ-1415) | `test-17-fmk-launch-pending.sh` | test-17's fifth leg (`leg_still_stopping`) | A paused bot's immediate `resume` meets a worker still stopping, test-17's fifth leg (`leg_still_stopping`). After a health tick's read of persona S, the harness pauses S: the `pause` returns within its bound of that read, the row reads `ended` with its `claude_session_id`, and the worker's tmux session and pane process still run. The bot server then resumes S inside the stopping window from the pause (what scheduled the resume is recorded, not asserted), and agent-director refuses it: exactly one server.log refusal of S's `resume` carries `STILL_STOPPING_PHRASE` (UNAVAILABLE), followed by exactly one post-UNAVAILABLE get line and exactly one bot-server `get` of the row between the refused `resume` and that line. Once the harness releases the worker, its session ends, and the retry timer's first retry after the refusal comes after the release and the session's end; the second `resume` follows that retry within its slack, before the next tick's read and before the row reads `waiting` again: the success is a retry's, not a tick's. Exactly two bot-server `resume`s of S after the pause; no reuse spawn or `kill` of S from any CSCB process (each `resume` follows its ladder's plain spawn, which collides with the row: recorded, not asserted). The row reads `waiting` with the same `claude_session_id` and the resumed stub's session is registered. No post from the pause on: none holds S's tmux-unresponsive onset or the spawn-failure notice's first line, and there is no alert or other post (a single refusal that clears by the next tick posts nothing); these record checks run again once the server has stopped (shutdown ends every episode silently, so any post the next tick's onset check made is in the record by then). No server.log line after the second `resume` names S with a reconnect, relaunch, restart scheduling or not-connected text | Its own state dir (`paused`) and Slack stub; one persona whose working directory is selected for the stub's `linger-on-exit` (`stub_mode`). Health ticks on through config: `health_check_interval` 58 s, derived as the pause's bound (5 s), the restart delay, a launch slack (10 s), `UNAVAILABLE_RETRY_BASE_S` and a launch slack again, checked longer than the retry base; `session_restart_delay` 3 s. The refused `resume` is due within the pause's bound, the restart delay and a launch slack of the tick's read, checked shorter than agent-director's default stopping window (90 s). Before the pause the bring-up's approver and its retry timer have stopped, so only a tick reads S's status and the refusal arms a fresh timer. The harness plays a human's `pause` from the scenario's own shell, through the agent-director shim, and calls `stub_release` once server.log holds the refusal. The next tick's read is checked within 2 s of the interval. agent-director at its defaults (no `config.toml`). Posts read from the Slack stub's record. `STILL_STOPPING_PHRASE`, the stopping window (`DEFAULT_AD_SETTINGS.tmux.stopping_window_seconds`), the retry timer's base, the spawn-failure notice's head, S's tmux-unresponsive onset body (entry `tmuxUnresponsiveOnsetText`), the retry-timer line heads (`unavailableRetryLineHead`, `unavailableRetryArmedHead`, `unavailableRetryStoppedHead`), the retry line's parts (`unavailableRetryRetryLineParts`), the post-UNAVAILABLE get line's parts (`launchUnavailableGetLineParts`) and its plain UNAVAILABLE form head (`launchUnavailableFormText none`), and the tmux-unresponsive line head (`tmuxUnresponsiveLineHead`) printed by `fmk-texts.ts` |
 | 21 (b.jg5 SRJ-1423, AC 9) | `test-24-fmk-stuck-launch.sh` | test-24 (`leg_own_stuck_launch`, then `leg_other_process`) | A launch stuck at a startup prompt the approver does not recognise, in four legs, in this order. The own-launch leg (`leg_own_stuck_launch`, persona P): CSCB's start pass resumes P's finished row, and the launch, held at the stub's unrecognised dialog, reads `pending` with the same `claude_session_id` and a launch start. The bot server runs no `find-missing` from the launch start to G; from G its pending-row runs read the row not judged, at least one a retry's, consecutive runs at least 2 × `UNAVAILABLE_RETRY_BASE_S` (60 s) apart, the gap ending at the approver's stop's run excepted. At B: exactly one `server.log` line equal to the approver's line at B, and no post from the approver; the rule's run at that stop makes exactly one relaunching post and exactly one bot-server `kill --claude-instance-id cscb_<P>` (no `--include-finished`) whose abort line carries `kill_sent` true, after which P's worker is gone; a bot-server `find-missing` then marks the row `missing`, and a bot-server `resume` of the same session id brings it to `waiting`. Exactly two bot-server `resume`s of P's row (the start pass's and the relaunch), no reuse spawn, no counted failure, and no post but the relaunching one (no spawn-failure or held post). The other-process leg (`leg_other_process`, persona Q): the harness's own `resume` of Q's finished row, a harness call through the shim from the scenario's shell playing another process, holds Q at the unrecognised dialog; the server started after it finds the row `pending` and makes exactly one held post, equal to the held notice for Q's session and launch start with the attach remedy, and no second held post at a later retry. The harness's `resume` is the only one of Q's row; no CSCB process kills, resumes or reuse-spawns it. The relabelled-session leg (`legs_relabelled_session_and_grouped_viewer`, persona R): CSCB's start pass resumes R's finished row, held at the unrecognised dialog as in the own-launch leg; after the approver's first `status` lap of R's row and before B, the harness relabels R's own session to name an earlier launch of `cscb_<R>`, so the session is a leftover to agent-director while its worker still runs. At B: exactly one relaunching post for R, then exactly one bot-server `kill --claude-instance-id cscb_<R>` (no `--include-finished`), answered CONFLICT with a description carrying `CONFLICT_NOT_THIS_LAUNCH_PHRASE` ("not this launch's session") and no abort line with `kill_sent` true; R latches with exactly one latch-set line and no relatch, and R's posts are exactly the relaunching post and then one CONFLICT post (`conflictNoticeText`); no second `kill` of R's row through the first latch re-check round (`LATCH_RECHECK_INTERVAL_MS`, 120 s, after the latch), exactly one bot-server `resume` of R's row (the start pass's) and no counted failure. The grouped-viewer leg (the same function and server run, persona V): CSCB's own resumed launch held the same way, with a grouped viewer session the harness attaches to V's session (`attach_viewer`, playing a human watching); at B exactly one relaunching post for V and exactly one bot-server `kill --claude-instance-id cscb_<V>` whose abort line carries `kill_sent` true, after which V's worker is gone and V's relaunch reads `waiting` | Each leg in its own state dir with one persona and its own Slack stub (posts read from its record), except the relabelled-session and grouped-viewer legs, which share one state dir, server run and stub with R and V (a `find-missing` run judges both rows, so no check of these legs counts `find-missing` runs, and every check is attributed to one persona). The stub in `dev-channels` for each bring-up; a plain `stop` (no `--stop-bots`), then the worker ended with the stub's sentinel, so the row is finished with its `claude_session_id`; the persona's working directory then selected for `unrecognised-dialog`. Own-launch leg: a live start makes the held resume; the directory is then selected for `at-once`, so the relaunch reports in at once. Other-process leg: the harness's `resume`, then a live start timed so its retries reach B; cleanup is the harness's Enter into Q's pane (`stub_press_enter`, playing a human), after which the row reads `waiting`. Relabelled-session and grouped-viewer legs: a live start makes both held resumes; V's directory is then selected for `at-once` and the viewer attached (`new-session -t`, in the same session group); R's relabel (its labels drawn as `relabel_session` draws them, a fresh token other than the label's and the row's current launch token, and written in one tmux invocation, both `set-option`s one command list, so no agent-director read sees one label new and the other old) follows the seeding rules of b.jg5 SRJ-1306 (agent-director's handoff rev 15 and rev 17): the `@ad_owner` label keeps R's instance id and ends with the scenario store's own id (`ad_store_id`), and R's worker pane carries `@ad_pane` = `<token> <pane id>`, so the approver's laps' `read-pane` returns that pane; the relabel lands after the approver's first lap, once a later pane read of R is answered and while the next lap is due at least 0.5 s later (else on the next lap's pane read), and before B. `health_check_interval` 0 (the retry timer drives every pending-row run), `session_restart_delay` 5, `exit_timeout` 5. agent-director at its defaults (no `config.toml`, no `[tmux]` table), so the waits derive from G (60 s) and B (300 s) and run at least 300 s from each launch start. The tmux shim in `log` throughout. G, B, the retry timer's base and ceiling, the approver's line at B, the pending-row rule's lines, the relaunching and held posts, the poster's lines, the abort kill line's head and the live-row sequence's marked-missing lines printed by `fmk-texts.ts`, as are the CONFLICT abort kill line's head, `CONFLICT_NOT_THIS_LAUNCH_PHRASE`, the latch-set line, the CONFLICT post, the latch re-check round line's head and `LATCH_RECHECK_INTERVAL_MS` |
 | 22 (b.jg5 SRJ-1424, AC 10) | `test-25-fmk-pre-trust.sh` | test-25 | Each launch's `pre_trust` is only logged, through the exported builder (`preTrustLogLine` in `src/session-manager.ts`), and no launch opts out of pre-trust, in three legs, in this order. The migrated-row leg (`leg_migrated_row`, persona A): A's row, seeded on 0.10.0 and migrated by `install_ad_release`, reads finished with the same `claude_session_id`, session name and labels, the release behind the shim and both shims re-checked; CSCB's start pass then resumes it. Exactly one `pre_trust` line for A, for its `resume`, equal to `preTrustLogLine` for one of `ok`, `skipped`, `failed` or no field (the older-binary wording); the script logs which, and a value other than `ok` or `failed` is printed as a `REPORT:` line, not failed on. Exactly one bot-server `resume` of A's row, no reuse spawn or `kill` of it; every bot-server `send-keys --allow-pending` of A's row follows a bot-server `read-pane --allow-pending` of it made after the `resume` (the approver clears the folder-trust prompt if it appears); A reads `waiting` with the same `claude_session_id`. The new-persona legs (`legs_new_personas`, one server run): persona B, new, whose resolved `.claude.json` exists, gets one plain spawn and exactly one `pre_trust` line, `preTrustLogLine` for `ok`, and reads `waiting`; persona C, new, with a fresh `claude_config_dir` holding no `.claude.json`, gets one plain spawn and exactly one `pre_trust` line, `preTrustLogLine` for `failed`, and its launch proceeds: at least one bot-server `send-keys --allow-pending` of C's row, the first after a bot-server `read-pane --allow-pending` of it, C's pane holding the folder-trust prompt and not the dev-channels dialog, and C reads `waiting`. Neither gets a `resume`, reuse spawn or `kill`. The script-wide check (`check_no_pre_trust_opt_out`): no CSCB-parented `spawn` or `resume` in the agent-director shim log's argv carries `--no-pre-trust` (the 0.11.0 client's flag for `no_pre_trust`), with at least one of each to check | The scenario HOME starts on agent-director 0.10.0 (`SCENARIO_AD_START=0.10.0`, no store); `seed_010_row` makes A's row with 0.10.0's own `spawn` (`cscb_<A>`, A's session name and the labels a spawn of A carries) and a stub worker in `at-once`, which then ends with the stub's sentinel so the row has a `claude_session_id`, before `install_ad_release` runs the release's `install.sh` and its migration over it. Each leg in its own state dir with its own Slack stub. Every persona's working directory selected for `folder-trust` before its launch. The harness writes no `~/.claude.json` in the scenario HOME before A's resume (whether one is there is recorded); before the new-persona legs the harness writes `{}` there if it is absent, as B's resolved `.claude.json`; C's `claude_config_dir` is a new empty directory under the scenario root. `health_check_interval` 0, `session_restart_delay` 5, `exit_timeout` 5. agent-director at its defaults (no `config.toml`, no `[tmux]` table). The tmux shim in `log` throughout. The `pre_trust` lines and their head, the launch verbs, `TRUST_DIALOG_NEEDLE`, `DEV_CHANNELS_DIALOG_NEEDLE`, `DIALOG_POLL_INTERVAL_MS`, the instance id, session name and A's labels printed by `fmk-texts.ts`; the values `ok`, `skipped`, `failed` and the flags `--no-pre-trust` and `--allow-pending` quoted from the 0.11.0 client |
 | 10 (b.jg5 SRJ-1412; AC 1, AC 5) | `test-22-fmk-wrong-server.sh` | Part A: two harness `find-missing` runs (`ad_capture`) while the persona's worker runs, one with `TMUX_TMPDIR` set for that call only to an empty directory under `SCENARIO_ROOT`, one with `TMUX` set for that call only to a second tmux server (`start_second_tmux_server`). Part B: the harness's one store statement (`ad_store_mark_finished <id> missing`, scenario 10 part B's), made once the session is older than the larger `[tmux]` minimum; then the bot server restarted without teardown (a plain `stop`, then `start`), whose bring-up makes a plain `spawn` (agent-director answers `ErrInstanceIdCollision`) and then a `resume`; the latch re-check's probe; the human's finished-row kill, `ad_kill_include_finished` (agent-director-admin's `kill-finished`) from the scenario's own shell; the re-check after it | Part A: each run exits 0 with an `ids` array that does not hold the persona's instance id, logged with the scenario's shell as parent, and the prefix assignment does not outlive the call; the script does not check that each run saw the other environment (the shim logs arguments and parent, not environment). Then the row still reads `waiting` and the worker runs, and over one re-check interval and 5 s more no CSCB process makes a `resume`, `spawn`, `kill`, `read-pane` or `send-keys` for the persona, nor any `find-missing`; no post and no latch or relatch line (`conflictLatchSetLineHead <key> latched` and `relatched`). That hold is a no-trigger window: nothing in it would make CSCB call for the persona (no health tick, no latch, no restart), so its no-call checks cannot fail on their own; SRJ-1412 A's "CSCB does nothing" rests on the two runs' `ids` checks and on the row still reading `waiting` with the worker running after them, and the hold only shows that nothing follows. Part B, the latch: the new bot server's `resume` meets the own-id CONFLICT (`CONFLICT_OWN_ID_PHRASE`); an UNAVAILABLE line carrying `STILL_STOPPING_PHRASE` or `STILL_STARTING_PHRASE` may come before it, and none after (the wait past the starting-session bound means none is expected); the persona latches with `LATCH_CASE_OWN_ID` (its latch line: the printed `conflictLatchSetLineHead <key> latched`, the case, then agent-director's description carrying `CONFLICT_OWN_ID_PHRASE`); exactly one post, carrying in order the persona prefix with `CONFLICT_NOTICE_FIRST_LINE_HEAD` and the quoted session name, `conflictCaseSentence`, `CONFLICT_NOTICE_POINTER_LINE` and `CONFLICT_NOTICE_HUMAN_ONLY_LINE` (`src/conflict-latch.ts`), with no session-ending command form in its CSCB-authored lines (`sessionEndingCommandsIn`). The held latch, over two re-checks: each window holds exactly one `status` and then one `read-pane --n-lines` `PROBE_PANE_READ_LINES` by the bot server (`version` left out), each round logs its round line, printed whole by `latchRecheckRoundLine` with `RECHECK_STEP_TABLE`, `RECHECK_CALL_PROBE` and the answer `still-latched (pane)` (composed inline by src/session-manager.ts runLatchRecheckRound from `RECHECK_VERDICT_STILL_LATCHED` and `PANE_READ_PANE`), no further post, the worker runs and the row reads `missing`. The kill: `kill_sent` true, the session and worker gone, and the row unchanged: every column after the kill holds its value from before it (`_scenario_row_diff_check`, whose failure names each changed column with its values before and after). The clear: from the second re-check to the first `resume` after it, exactly `status`, the one-line `read-pane`, `find-missing` and `resume`, once each; the round logs its round line, printed by `latchRecheckRoundLine` with the call `<probe>+find-missing+<resume>` (`RECHECK_CALL_PROBE`, `RECHECK_CALL_RESUME`) and matched up to the answer's `probe-cleared (gone);` (composed inline by src/session-manager.ts from `PANE_READ_GONE`, agent-director's `ErrTmuxCaptureFailed`); the row reads `waiting` again; the second and last post of part B is exactly `formatPersonaNotice` of `conflictRecoveryText` with `LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED`; once that post has settled, the whole window from the second re-check holds exactly one CSCB `resume` of the instance id and exactly one CSCB `find-missing`. Close: one finished-row kill in the shim log, the harness's, parented by the scenario's shell; no CSCB `kill`, and no CSCB `spawn` from the latch on | tmux-shim `log`; the stub's `dev-channels` hold (`STUB_MODE_DEV_CHANNELS`); `health_check_interval` 0; `agent_director_poll_interval_ms` at its allowed maximum (`MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS`, src/config.ts), so the permission poller's `list` calls do not fall in the counted re-check windows; the `[tmux]` table (`write_ad_settings`) with `stopping_window_seconds` 30 and `starting_session_seconds` 60, each at its minimum from `AD_SETTING_MINIMUMS <key>` (src/ad-settings.ts). Every text, phrase, label, interval, line count, latch line head and round line from `fixtures/fmk-texts.ts`; calls read with `cscb_ad_calls_between` / `cscb_ad_count_between` between `ad_shim_mark` marks, posts with `slack_record_mark` and `slack_label_posts`. Runs about ten minutes |
 | 26 (b.jg5 SRJ-1428; AC 1, AC 19, AC 86) | `test-28-fmk-provenance.sh` | Two personas, A and B. Renamed session: the harness renames A's session (`rename_session`) and turns ticks on with the confirmed config edit (`apply_personas_config`, as in the restarted-tmux-server leg: `health_check_interval` 10, `session_restart_delay` 5), then the bot server restarted without teardown (a plain `stop`, then `start`), which for A's live `waiting` row makes `get`, a plain `spawn` (agent-director answers `ErrInstanceIdCollision`), `get` and a `send-keys` of `/mcp reconnect …` (its reconnect of the stub, whose MCP session ended with the old bot server), and no pane read; then the harness ends A's stub MCP client (`end_stub_mcp_session` on A's pane; the stub runs on): the stream close (`Session disconnected (SSE abort)`) schedules the restart path's restart of A after `session_restart_delay` (src/server.ts `_buildRestartDisconnectedPersona`), and its reconnect of A's live `waiting` row runs the waiting-row check (src/session-manager.ts `checkWaitingRowPane`), the same check a tick's restart runs (a health tick skips a persona with a restart pending, src/health-check.ts), which reads the pane, finds no prompt and types `/mcp reconnect …`; the same edit then turns ticks off again (`health_check_interval` 0 and the default restart delay), taking effect at the start after the teardown; `fmk-driver.ts`'s `read-pane-other-tmux-tmpdir` for A through `cscb_run`; then `stop --stop-bots` (`stop_server --stop-bots`), whose teardown's pause times out (the stub never answers `/exit`), and a start again. Another `TMUX_TMPDIR`: `fmk-driver.ts`'s `read-pane-other-tmux-tmpdir` for A and for B, with `TMUX_TMPDIR` set for that one call to an empty directory under `SCENARIO_ROOT`. Re-bound socket: the harness re-binds the scenario's socket path while the recorded server runs (`rebind_tmux_socket`), then the bot server restarted without teardown, whose reconnect is the tmux-touching call; the retry timer's waiting-row checks; then the harness restores the socket (`restore_tmux_socket`). Restarted tmux server: the harness's confirmed config edit (the script's `apply_personas_config`: `config.json` rewritten with `health_check_interval` 10 and `session_restart_delay` 5, the previewed `config.json.pending` renamed to `config.json.apply`, and the apply of two server-wide settings logged), then the bot server restarted without teardown, since a changed server-wide setting takes effect at the next start; the harness restarts the scenario's tmux server (`restart_tmux_server`: `kill-server`, then a new server with one session) and runs the find-missing loop (`run_find_missing_loop`, 10 s interval; decision D2) until each row is marked `missing` (it reads `missing`, the `ids` of a loop run started in the leg, read from its `run.<n>.out`, hold its instance id, or it records another launch), then stops it; the restart path brings each persona up again; then the same confirmed edit sets `health_check_interval` 0 (and the default restart delay) and the bot server is restarted without teardown. Remain-on-exit: once A's session is older than the starting-session bound (`DEFAULT_AD_SETTINGS <AD_TMUX_TABLE> starting_session_seconds`, 300 s), the harness turns `remain-on-exit` on for it (`set_remain_on_exit`) and ends A's worker with no SessionEnd (`end_worker_without_session_end`); the loop (D2) runs until A's row reads `missing`; the bot server restarted without teardown makes A's `resume`; the latch re-check; then the harness removes the dead session by its id (`end_session`). Pending row with no launch start: the harness's store statement (`ad_store_pending_no_launch`) on B's live row, its session and worker left in place; the bot server restarted without teardown makes the row's first read; the latch's status-only re-check; the find-missing loop until B's row reads `missing` (the loop's latched-row use); the clearing re-check and its one bring-up retry; then, if B's session name still holds the old session, the harness ends it (`end_session`). Close: `stop --stop-bots`, then a scan of the tmux shim's log | Renamed session: a bot-server-parented `send-keys` of A follows the rename and reaches the renamed session's pane (A's stub opens a new MCP session); server.log holds no waiting-row GONE, reconnect GONE or escalate-dead line for A since the restart (`waitingRowPaneGoneLineHead`, `reconnectGoneLineHead`, `escalateDeadSweepLineHead`, src/session-manager.ts); no CSCB `resume` or `kill` of A, CSCB makes no `delete` of A, and the restart's one refused `spawn` launched nothing (worker, pane process and launch token as before); A's row reads `waiting`. The health check's pane read (decision D4): after A's MCP client ended, exactly one CSCB `read-pane` of A, by the bot server, with `--n-lines` `FULL_PANE_READ_LINES` (src/pane-read.ts, 40, printed), followed by a bot-server `send-keys` of A (`/mcp reconnect …`), and A's stub opens a new MCP session; no CSCB `spawn`, `resume` or `kill` of A, and CSCB makes no `delete` of A; no waiting-row GONE, reconnect GONE or escalate-dead line for A; A's worker, pane process, launch token, `waiting` row and renamed session unchanged; B untouched (no CSCB `read-pane`, `send-keys`, `spawn`, `resume` or `kill` of B, and CSCB makes no `delete` of B, the same MCP client, worker and launch token, its row `waiting`). The restart's `send-keys`, the driver's pane read and the teardown's precheck `read-pane` below stand beside it as further evidence. The driver's pane read of A answers `outcome=` `PANE_READ_PANE` with a driver-parented `read-pane`. The teardown's one-line `read-pane` (`PROBE_PANE_READ_LINES`) and plain `kill` of A (no `--include-finished`) both have the `stop` run as parent, and A's worker and renamed session are gone; the positive control of leg 6's no-kill scan: over the teardown, between two tmux shim marks, at least one tmux shim line matching `kill-session` or `kill-pane` as a word has an agent-director process as its parent (agent-director's own kill of the session); after the start both rows read `waiting`. Another `TMUX_TMPDIR`: per persona one `DRIVER:` line with that `tmux_tmpdir`, `restored=true` and `outcome=` `PANE_READ_PANE`, a driver-parented `read-pane`; both rows read `waiting`, both workers as before, and no CSCB `spawn`, `resume` or `kill`, and CSCB makes no `delete`. Re-bound socket: each persona's first post is exactly `formatPersonaNotice` of `tmuxServerChangedOnset` (src/outage-state.ts, SRJ-1021); held until the third retry falls due (`unavailableRetryDueS 3`: src/backoff.ts doublingBackoffDelay summed over src/unavailable-retry.ts's `UNAVAILABLE_RETRY_BASE_S` and `UNAVAILABLE_RETRY_CEILING_S`, 210 s in this build) and 30 s more, each persona's posts run onset, then any number of all-clear (`ALL_CLEAR_TEMPLATE` `tmux-unavailable`) and onset pairs, never the generic `ONSET_TEMPLATES` `tmux-unavailable` onset; server.log carries `DIFFERENT_TMUX_SERVER_PHRASE` (src/ad-description-phrases.ts); at least three bot-server `read-pane` calls per row; no CSCB `kill`, `resume` or launching `spawn`, and CSCB makes no `delete`; both rows read `waiting` with the same workers. After the restore each persona's last post is its all-clear (waited for until the fourth retry, `unavailableRetryDueS 4`, 450 s after the onset in this build, and 30 s more), the sequence still fits, each stub opens a new MCP session, and both rows read `waiting` with the same workers. Restarted tmux server: Q12's control, over two tick intervals once the ticks are on, finds at least one `status` of each persona and no `send-keys`, `spawn`, `resume` or `kill`, the server makes no `delete`, with nothing launched; after the tmux restart each row reads `waiting` with a new launch token; per persona exactly one `resume`, by the bot server, at most one plain `spawn` before it and no `--reuse-finished` spawn, no CSCB `kill`, and CSCB makes no `delete`; server.log holds exactly one `relaunchWithoutKillLine` (`RELAUNCH_NO_KILL_ROW_READ`, `LIVENESS_READING_DEAD_MISSING`) and one `relaunchAfterKillLine` (`RELAUNCH_KILL_NONE`) per persona (src/restart.ts), and no counted-failure or cap line (`[slack] Session relaunch failed for persona=<key>`, `[slack] Cap reached for persona=<key> `, inline literals in src/restart.ts quoted as fragments); no post holds the spawn-failure notice's first line (`restartCapReachedNoticeText`'s). Remain-on-exit: right after the worker ends, A's row still reads `waiting` and its session remains; once the loop marks it, the session still remains and B's row reads `waiting` with its worker running; after the restart A latches on `CONFLICT_OWN_ID_PHRASE` with `LATCH_CASE_OWN_ID` (its latch line: the printed `conflictLatchSetLineHead <key> latched`, the case, then agent-director's description), and server.log holds at least one UNAVAILABLE line carrying `STILL_STOPPING_PHRASE` or `STILL_STARTING_PHRASE`, every one before the first CONFLICT line; A's posts in the leg end with one latch post carrying scenario 10's CONFLICT notice parts in order with no session-ending command form, and before it only the tmux-unresponsive onset and alert (`tmuxUnresponsiveOnsetText`, `tmuxUnresponsiveAlertText <key>`, the alert at agent-director's default settings, src/persona-episodes.ts; SRJ-308, SRJ-309), each at most once; no kill sent (decision D3): no CSCB `kill` or `delete` of A, no tmux shim line, whatever its parent, matching `kill-session` or `kill-pane` as a word since the leg began (leg 2's teardown is its positive control), and the dead session still holds A's name; at least one bot-server `resume`, no `--reuse-finished` spawn, and the row reads `missing` with its launch token. After `end_session`: up to the next `resume`, the bot server's calls of A (and any `find-missing`) are exactly `status`, the one-line `read-pane`, `find-missing` and `resume`; the round logs its round line, printed by `latchRecheckRoundLine` and matched up to the answer's `probe-cleared (gone);`; A's row reads `waiting`; A's posts in the leg end with the latch post and exactly one recovery post, `formatPersonaNotice` of `conflictRecoveryText` with `LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED`; once that post has settled, the whole window since the dead session's removal holds exactly one CSCB `resume` of A and exactly one CSCB `find-missing`. Pending row with no launch start: B latches with `LATCH_CASE_LAUNCH_START_NOT_RECORDED` (its latch line's printed head and the case) and its one post is exactly `formatPersonaNotice` of `launchStartNotRecordedNoticeText`; the first re-check makes one bot-server `status` of B and nothing else, its round line, printed whole by `latchRecheckRoundLine`, carrying `RECHECK_STEP_TABLE`, `RECHECK_CALL_NONE` and `RECHECK_VERDICT_STILL_LATCHED`; no CSCB `send-keys` or `kill` of B while it is latched; the worker runs and the row reads `pending`. Once the loop marks the row `missing`, a re-check's round line (printed whole by `latchRecheckRoundLine`) logs `cleared (` `RECHECK_STEP_TABLE` `)` and the after-clear retry's answer line follows (`latchClearRetryAtOnceLineHead`, exactly one); from the held re-check to that line, `status` first, no `find-missing`, no `send-keys` or `kill`, and exactly one bot-server `resume` (at most one plain `spawn` before it); server.log holds one `relaunchWithoutKillLine` (row read missing) and one `relaunchAfterKillLine` (no kill) for B; B's second post is exactly `formatPersonaNotice` of `holdRecoveryText` for `latchRecoveryReasonRowReads` `missing`, the only such post. What that retry meets beside the still-running old session (ruling S8) is logged, not asserted: its answer line, B's server.log lines, B's posts and its row. Close: `cscb_tmux_count` finds no tmux shim line whose parent is a CSCB process (bot server, `start` or `stop` run, driver run), so none carries `SCENARIO_AD_OWNER_OPTION` or `SCENARIO_AD_PANE_OPTION`; the filter's control counts exactly the bot-server, `stop`-run and driver-parented lines added to a copy of the log, not the scenario shell's or an unrecorded process's; the positive control finds lines carrying each option with an agent-director parent; then the three closing assertions. SRJ-716's static half is `tests/fmk-source-audit.test.ts` | tmux-shim `log`; the stub's `dev-channels` mode (`STUB_MODE_DEV_CHANNELS`); agent-director's default settings (no `[tmux]` table: a 90 s stopping window and a 300 s starting-session bound, printed from `DEFAULT_AD_SETTINGS`); `health_check_interval` 0 in every leg but the renamed-session and restarted-tmux-server ones (ruling S3, the Q12 Hatch gap), each of which sets 10 with `session_restart_delay` 5 through the confirmed config edit and sets 0 again before it ends; `agent_director_poll_interval_ms` at its allowed maximum (`MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS`, src/config.ts); the latch re-checks waited for one `LATCH_RECHECK_INTERVAL_MS` (120 s) and 60 s more. Decision D4: the SRD's "a health check's pane read" of the renamed session is the restart path's waiting-row check after A's MCP client ends, with ticks on. Ruling S4: the bot-server restart without teardown is the trigger of the re-bound socket leg's call, the `remain-on-exit` leg's `resume` and the `pending` row's first read. Decisions D2 (the find-missing loop for the restarted-server and `remain-on-exit` legs' unlatched rows) and D3 ("no kill" means no kill sent); ruling S8: the retry's outcome is recorded, not asserted. Every text, phrase, interval, line head and round line from `fixtures/fmk-texts.ts`; calls read with `cscb_ad_calls_between` / `cscb_ad_count_between` between `ad_shim_mark` marks, tmux calls with `cscb_tmux_calls` / `cscb_tmux_count`, posts with `slack_record_mark` and `slack_label_posts`. Holds about eight minutes in the re-bound leg and runs about 22 minutes |
+
+### Scenarios 8, 23 and 24 (Tests 20 and 26)
+
+Each fmk scenario of the handoff's scenario list (HO §7) is one script. Its
+header comment is its full statement: the legs, the binary behind the shim
+at each step, the waits and their bounds, and each matched value with the
+`src/` export or function it comes from. Test 0 is the harness's self-check,
+not a scenario.
+
+| HO §7 scenario | Script | Requirement |
+|---|---|---|
+| 8 | `test-20-fmk-old-binary.sh` | b.jg5 SRJ-1410 (AC 21, 22, 23) |
+| 23 | `test-20-fmk-old-binary.sh` (legs 23a to 23c, after scenario 8's) | b.jg5 SRJ-1425 (AC 1, 11) |
+| 24 | `test-26-fmk-timing-settings.sh` | b.jg5 SRJ-1426 (AC 80, 84) |
+
+#### Scenario 8: test-20
+
+Test 20 shows this build never runs against an agent-director older than
+Phase 1. It runs in fmk mode on the release, with one persona, P, whose
+working directory selects the stub's `at-once` mode, and the Slack stub
+recording. CSCB's config sets `health_check_interval` 0 (no health tick
+relaunches P), `resume_enabled` false (P's finished row comes back only by a
+reuse spawn), `exit_timeout` 5 and `agent_director_poll_interval_ms` 3600000
+(the permission poller's `list` calls stay out of the shim's log). These are
+the only delays set, all CSCB's own, through its config. agent-director runs
+at its default settings: the scenario HOME's agent-director settings file
+(the package's `AD_SETTINGS_RELATIVE_PATH` under HOME) carries no table named
+as the package's `AD_TMUX_TABLE`, and set-up fails if it does.
+
+The daemon is not the script's child, so its exit status is read from the
+CLI's start report (8a) or, for a re-check stop (8c, 8e), from its shutdown
+line naming the re-check, the one path that exits with
+`AD_VERSION_RECHECK_STOP_EXIT_CODE`. Set-up checks that the printer's
+`AD_VERSION_RECHECK_STOP_EXIT_CODE` is non-zero, so that line stands for a
+non-zero exit.
+
+The harness finishes P's row (`ad_store_mark_finished <P> ended`, then
+`ad_kill_include_finished`, in 8d and 8e) only once tmux reports P's session
+302 s old: the longer of agent-director's default starting-session bound
+(300 s) and default stopping window (90 s), both printed from
+`DEFAULT_AD_SETTINGS`, plus 2 s. `ad_store_mark_finished` needs the session
+older than the stopping window and agent-director-admin's `kill-finished`
+needs it past the starting-session bound. That wait is bounded by 332 s
+(the age plus 30 s). In 8d P's session is already older than that; in 8e,
+with the server stopped, the wait lasts about 300 s for the session the 8d
+reuse spawn made. Test 20 runs about 18 minutes.
+
+The shim stays at the standard path throughout, apart from the not-found
+step; every other change replaces only the binary behind it:
+
+| Leg | Behind the shim, in order |
+|---|---|
+| set-up | the release (0.11.0) |
+| 8a | 0.10.0 (`swap_ad_binary 0.10.0`), then the release |
+| 8b | the release; nothing at the standard path (`hide_ad_install` moves the shim and the binary aside, and no `agent-director` is on the server's PATH); the stand-in reporting no parseable version (`restore_ad_install_with_stand_in unparseable pass`); the release |
+| 8c | 0.10.0, then the release once the server has stopped |
+| 8d | the passing wrapper (`install_ad_stand_in <floor>-rc.1 reject`), then the release |
+| 8e | the release; the below-floor stand-in (`install_ad_stand_in <0.10.0's version> reject`) once the start-pass launch has failed; the release once the server has stopped |
+
+The legs run in order, each on the state the one before left:
+
+- 8a, refused start. With 0.10.0 behind the shim (its version read with a
+  harness `version` call and kept for 8e), a live `start` fails: the CLI
+  reports the daemon's non-zero exit, and exactly one
+  `ad-below-phase1-floor` entry equals the startup form of the floor message
+  for that version and the binary's path, with its one server-log line. The
+  start makes no spawn, resume, kill, `kill-finished`, delete or pause call,
+  no new tmux session and no new Slack stub record line (no Slack
+  connection).
+- 8b, a re-check that cannot run. P launches on the release and reports in;
+  its row (state, `row_version`, pid) and session are recorded. With the
+  install hidden (`ErrSystemInstallNotFound`), one could-not-run line
+  appears within the re-check interval plus 10 s, and no probe runs while it
+  is hidden. With the shim back and the unparseable stand-in behind it
+  (`ErrSystemInstallUnreachable`; a harness `version` call through it exits
+  0 and reads no `.version`), and then with the release back, each next
+  bot-server probe leaves that one line the only one and the server running.
+- 8c, a swap stops the server. Within the re-check interval plus 10 s of the
+  swap to 0.10.0 (`health_check_interval` 0), the server exits with its
+  re-check shutdown line (a non-zero exit) and exactly one new entry, equal to the runtime form
+  of the floor message (it carries the runtime re-check phrase and points to
+  the debug skill), with its one server-log line. No CSCB kill,
+  `kill-finished`, pause, delete, spawn or resume follows the swap. With the
+  release back, P's worker process and session are alive and its row's
+  state, `row_version` and pid are as 8b recorded. What CSCB's calls met while
+  0.10.0 sat behind the shim (`ErrSchemaMismatch` on the migrated store) is
+  printed, not asserted.
+- 8d, the hold. The harness finishes P's row (`ad_store_mark_finished <P>
+  ended`, then `ad_kill_include_finished`, agent-director-admin's
+  `kill-finished`) and puts the passing wrapper behind the shim. The server
+  starts: the start pass's plain spawn collides with P's finished row
+  (`ErrInstanceIdCollision`) and launches nothing (its count is printed, not
+  asserted), then exactly one reuse
+  spawn carrying `--reuse-finished` gets `ErrInvalidFlags` and is directly
+  followed by a bot-server probe (the immediate re-check). The server keeps
+  running, one post to P's channel holds the Cannot launch alert whole, and
+  P's row stays finished. Over the next timed re-check there is no further
+  launch and no second post. Putting the release back is the version change:
+  at the next timed re-check exactly one reuse spawn for P succeeds and P
+  reads `waiting`, still with one alert and no delete. While the hold lasts,
+  strictly after the rejected reuse spawn (its shim line's time) and before
+  the timed re-check that read the new version, CSCB makes no kill,
+  `kill-finished`, pause, delete, spawn or resume call, and P has no tmux
+  session.
+- 8e, the stop through the triggered re-check. With the server stopped, P's
+  row finished again the same way and the tmux shim in `fail-create`, the
+  server starts on the release: the gate passes and the start pass's reuse
+  spawn fails. The tmux shim goes back to `log` and the below-floor stand-in
+  goes behind the shim. P's next attempt is a reuse spawn made before the
+  first timed re-check (the script fails saying so when it is not); its
+  `ErrInvalidFlags` is directly followed by a bot-server probe, and the server
+  exits with its re-check shutdown line (a non-zero exit) and exactly one
+  more entry, the runtime form for 0.10.0's version,
+  all less than the re-check interval after the gate. No CSCB kill,
+  `kill-finished`, delete or pause follows, and P's row stays finished.
+
+Why the legs are built this way:
+
+- The server's effects come from its own reuse spawn of P, the persona with
+  `resume_enabled` false and a finished row: at the start pass under the
+  passing wrapper (8d), and at P's next attempt after a `fail-create` start
+  pass under the below-floor stand-in (8e).
+- `fixtures/fmk-driver.ts` runs its forced reuse of P (through `cscb_run`)
+  under the passing wrapper only, in 8d. It runs in its own process, behind
+  CSCB's startup gate, so it cannot stop the server or post an alert; its
+  one `DRIVER:` line naming `ErrInvalidFlags` and CSCB's class for it shows
+  the wrapper's rejection is a real `ErrInvalidFlags` through CSCB's
+  production classification.
+- The below-floor binary is a stand-in reporting 0.10.0's own version (read
+  in 8a): a real 0.10.0 answers `ErrSchemaMismatch` on the migrated store
+  before it parses flags, so it never answers `ErrInvalidFlags`.
+- The passing wrapper reports the floor with an `-rc.1` tag. CSCB compares
+  only major.minor.patch against the floor (b.jg5 SRJ-202), so it passes;
+  the release put back reads as a different version string, which ends the
+  hold.
+- With `reject`, the stand-in turns `--reuse-finished` into a flag the
+  release does not define and hands the call to the release, so the release
+  itself answers its `ErrInvalidFlags` envelope.
+- Every re-check wait is bounded by the re-check interval plus a 10 s allowance (the
+  probe, the shutdown and the script's polling), measured from the swap, and
+  watches shim-log and server-log lines.
+
+Matched values, each printed by `fixtures/fmk-texts.ts` from the installed
+package (see The value printer):
+
+| Value | Printer entry | `src/` |
+|---|---|---|
+| The Phase 1 floor | `PHASE1_FLOOR_VERSION` | `src/ad-version-gate.ts` |
+| The entry's class label | `AD_BELOW_PHASE1_FLOOR` | `src/install-check-labels.ts` |
+| The floor message, startup and runtime forms | `buildBelowPhase1FloorMessage <version> <path> <startup\|runtime>` | `src/ad-version-gate.ts` |
+| The runtime re-check phrase | `RUNTIME_RECHECK_PHRASE` | `src/ad-version-gate.ts` |
+| The re-check interval | `AD_VERSION_RECHECK_INTERVAL_MS` | `src/ad-version-gate.ts` |
+| The re-check stop's exit status (checked non-zero) | `AD_VERSION_RECHECK_STOP_EXIT_CODE` | `src/ad-version-gate.ts` |
+| The could-not-run line's prefix | `AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX` | `src/ad-version-gate.ts` |
+| The settings file and its `[tmux]` table (the no-table check) | `AD_SETTINGS_RELATIVE_PATH` (under HOME), `AD_TMUX_TABLE` | `src/ad-settings.ts` |
+| The Cannot launch alert's body | `INVALID_FLAGS_HOLD_ALERT_TEXT` | `src/invalid-flags-hold.ts` |
+| The alert as posted for P | `formatPersonaNotice <P> INVALID_FLAGS_HOLD_ALERT_TEXT` | `src/persona-notifier.ts` |
+| CSCB's class for `ErrInvalidFlags` | `classifyAdError ErrInvalidFlags` | `src/ad-error-class.ts` |
+| agent-director's default starting-session bound | `DEFAULT_AD_SETTINGS tmux starting_session_seconds` | `src/ad-settings.ts` |
+| agent-director's default stopping window | `DEFAULT_AD_SETTINGS tmux stopping_window_seconds` | `src/ad-settings.ts` |
+
+Lines with no exported builder are matched by a fragment quoted from `src/`,
+each with its source named beside it in the script: the start failure
+(`src/cli.ts`), the re-check's shutdown reason (`src/server.ts`), and the
+collision, reuse-failed and reuse-spawned lines
+(`src/session-manager.ts`).
+
+#### Scenario 23: test-20
+
+Scenario 23's legs run in Test 20 after scenario 8's and before the three
+closing assertions, on the same set-up, persona and config. They show that
+CSCB launches on the floor's release-candidate form, refuses the development
+builds `0.0.0-dev` and `dev` at startup, launching nothing, and judges the
+binary's version (the client's `binaryVersion`), never the client's package
+version (PRD AC 11). Each stand-in goes behind the shim with
+`install_ad_stand_in`, whose own shim check runs after each install, and
+the release goes back with `swap_ad_binary release` after each leg. The
+three legs take a few seconds of Test 20's run.
+
+| Leg | Behind the shim, in order |
+|---|---|
+| 23a | the stand-in reporting the floor's release-candidate form (`install_ad_stand_in <floor>-rc.1 pass`), then the release once the server has stopped |
+| 23b | the stand-in reporting the client's development sentinel (`install_ad_stand_in 0.0.0-dev pass`), then the release |
+| 23c | the stand-in reporting `dev` (`install_ad_stand_in dev pass`), then the release |
+
+- 23a, the release-candidate form launches. With the server stopped and P's
+  row finished (from 8e), the stand-in reporting the floor with an `-rc.1`
+  tag goes behind the shim in `pass` mode, handing every call to the
+  release, and a harness `version` call reads it. The server starts: the
+  gate passes (the bot server's first probe; the server keeps running), at
+  least one CSCB launch call (spawn or resume) follows, P reports in
+  (`waiting`), and the start writes no `ad-below-phase1-floor` entry. The
+  server is stopped.
+- The AC 11 check, before 23b. The script reads the package version of the
+  agent-director client the installed package resolves (the field the
+  client's `version()` reports) from that client's `package.json`, found as
+  `docker/ad-client-check.sh` finds it, with no agent-director call. The
+  printer's `meetsPhase1Floor` must print `true` for it: the client's package
+  version meets the floor, so a CSCB that judged it would launch in 23b and
+  23c, and their refusals show it judges the binary's version.
+- 23b, `0.0.0-dev` is refused. With the stand-in reporting the client's
+  development sentinel behind the shim, a live `start` fails: the CLI reports
+  the daemon's non-zero exit and no daemon runs; exactly one
+  `ad-below-phase1-floor` entry equals the startup form of the floor message
+  for `0.0.0-dev` and the binary's path, with its one server-log line; no
+  `ad-system-install-unreachable` entry is written. The start makes
+  `version` calls only (at least one), no new tmux session and no new Slack
+  stub record line.
+- 23c, `dev` is refused. With the stand-in reporting `dev` (a plain
+  `go build`'s version) behind the shim, a live `start` fails as in 23b,
+  launching nothing, with exactly one new `ad-system-install-unreachable`
+  entry naming the `unparseable-version` reason and the binary's path (the
+  client's `Client.create()` refuses a version that does not parse, b.jg5
+  SRJ-202) and no new `ad-below-phase1-floor` entry.
+
+8a, 23b and 23c share one refused-start check: the CLI's non-zero exit
+report, no daemon running, only `version` calls through the shim since the
+start (the shim log is read whole, since the refused daemon never wrote its
+PID file), no new tmux session and no new stub record line.
+
+The image holds the 0.11.0 release and no release candidate, so 23a runs on
+the stand-in reporting `<floor>-rc.1`, the form 8d's passing wrapper
+reports. `dev` is not a CSCB constant: the script quotes it, citing b.jg5
+SRJ-202 and HO §7 scenario 23.
+
+Matched values, each printed by `fixtures/fmk-texts.ts` from the installed
+package, beside scenario 8's floor, floor label and floor message:
+
+| Value | Printer entry | `src/` |
+|---|---|---|
+| The client's development sentinel | `CLIENT_DEV_SENTINEL_VERSION` | `src/ad-version-gate.ts` |
+| The unreachable entry's class label | `AD_SYSTEM_INSTALL_UNREACHABLE` | `src/install-check-labels.ts` |
+| The unparseable-version reason | `UNREACHABLE_REASON_UNPARSEABLE_VERSION` | `src/ad-version-gate.ts` |
+| The AC 11 check: whether the client's package version meets the floor | `meetsPhase1Floor <version>` | `src/ad-version-gate.ts` |
+| The `0.0.0-dev` floor message, startup form | `buildBelowPhase1FloorMessage 0.0.0-dev <path> startup` | `src/ad-version-gate.ts` |
+
+#### Scenario 24: test-26
+
+Test 26 shows agent-director's timing values are logged and govern CSCB's
+waits, and that a settings file agent-director refuses is one alert per
+affected persona, with nothing destroyed or counted, cleared once the file
+is fixed, and that CSCB's call timeout below agent-director's slowest verb
+is warned about at start and never retried over a live row, while above it
+agent-director's own launch-timeout answer arrives. It runs in fmk mode on the release, with the Slack stub recording
+each `chat.postMessage` text whole. Before the first start it writes the
+scenario HOME's agent-director settings file with `write_ad_settings`, a
+`[tmux]` table holding the scenario inputs SRJ-1426 names; scenario 24 is
+one of the two scenarios that write `[tmux]` (b.jg5 SRJ-1401, SRJ-1306).
+Each key is checked to be one of the package's `AD_TMUX_KEYS`, and each
+value of the first table (and the change leg's 240) to be at or above its
+minimum, before it is written:
+
+| `[tmux]` key | Written | Minimum it is checked against |
+|---|---|---|
+| `pending_grace_seconds` | 120 (240 in the change leg; 61 in the call-timeout legs) | `pendingGraceMinimumSeconds` at the default `create_timeout_ms` and `pipe_close_wait_ms`; in the call-timeout legs the value is `pendingGraceMinimumSeconds` at 40000 and the default `pipe_close_wait_ms` |
+| `stopping_window_seconds` | 30 | `AD_SETTING_MINIMUMS stopping_window_seconds` |
+| `starting_session_seconds` | 120 | `AD_SETTING_MINIMUMS starting_session_seconds` |
+| `create_timeout_ms` | 40000, in the call-timeout legs only | none (its key is checked, and the grace period is raised with it) |
+
+The other `[tmux]` values stay agent-director's defaults. At the first
+table's values G is 120 s, B 300 s and the alert threshold 180 s (printed,
+not used: the alert timings are unit-tested). CSCB's config sets
+`health_check_interval` 0 (no health tick launches anyone),
+`resume_enabled` true (S's finished row comes back by a `resume`),
+`exit_timeout` 5 and `agent_director_poll_interval_ms` 3600000 (the
+permission poller's `list` calls stay out of the shim's log), all CSCB's
+own, through its config; the refused-value legs also set
+`session_restart_delay` 0, and the call-timeout legs
+`agent_director_call_timeout_ms` (30000, then 61000). Test 26 runs about 39
+minutes: about 17 for the legs before the refused values, most of it the
+held launch's B and the change leg's three waits for the next timed probe,
+about 9 for each refused-value leg, and about 4 for the two call-timeout
+legs.
+
+Each persona (`t26_<x>`, one channel each) has its stub mode selected for
+its working directory with `stub_mode`:
+
+| Persona | Working directory and stub mode | Added |
+|---|---|---|
+| S | `work/s`, `linger-on-exit` | in the config from the first start |
+| P | `work/p`, `unrecognised-dialog`, switched to `at-once` before B so the relaunch after the abort reports in | across a plain stop and start |
+| Q | `work/q_link`, a symlink to `work/q_held` (`unrecognised-dialog`), re-pointed to `work/q_ready` (`at-once`) | across a plain stop and start |
+| R | `work/r`, `unrecognised-dialog`, answered by `stub_press_enter` | by a confirmed reload |
+| C1 | `work/c1`, `at-once` | by a confirmed reload while the settings file is refused (refused-stopping) |
+| C2 | `work/c2`, `at-once` | the same, in refused-grace |
+| T1 | `work/t1`, `dev-channels` (it reports in on the approver's Enter: a launch that loses its create reply runs the stub in that mode, `scenario.sh`'s seeding rules) | across a plain stop and start, in call-timeout-30000 |
+| T2 | `work/t2`, `dev-channels` | the same, in call-timeout-61000 |
+
+A persona added across a restart is a plain stop, the config written, the
+state dir's `config.json.last-applied` removed, and a start: with no
+last-applied record the start applies `config.json` as it stands, with no
+preview to confirm (see "Reload" in the repository's `README.md`). R's reload is confirmed by
+renaming `config.json.pending` to `config.json.apply`, as Test 8 does.
+
+The harness steps, all from the scenario's own shell: `write_ad_settings`
+(set-up, the change leg, the refused-value legs and the call-timeout legs),
+`stub_mode`, `stub_release` (S's lingering stub), `stub_press_enter` (R's
+dialog), `tmux_shim_mode` (`slow-create` with a 50 s delay in the
+call-timeout legs, then `log` again), re-pointing Q's symlinked working
+directory by one rename (Q's row records the real path, so its `cwd` no
+longer matches), the plain stops and starts, the `last-applied` removal and
+the reload's confirmation, and harness `get` calls that read a row's
+`launch_started_at`, `ended_at` or state (T1's, about once a second, in
+call-timeout-30000). Every start of the script logs exactly
+one values line.
+
+The legs run in order, each on the state the one before left:
+
+- values. The first start, with S: exactly one values line, equal to the
+  printer's `buildAdSettingsValuesLine` for the written path, the three
+  written values and the six defaults (it carries the nine `[tmux]` values
+  only).
+- stopping (scenario 13's "still stopping"). With S up, its session's
+  creation time is taken, then `stop --stop-bots` (CSCB's `pause` makes S's
+  row `ended` while its stub lingers) and `start` at once. S's first
+  `resume`, made less than `stopping_window_seconds` after the row's
+  recorded `ended_at`, gets exactly one refusal line carrying
+  `STILL_STOPPING_PHRASE`. S's next `resume` (CSCB's UNAVAILABLE retry) is
+  made more than the window after `ended_at`, while the old worker still
+  runs and its session is younger than `starting_session_seconds`: its
+  refusal carries `STILL_STARTING_PHRASE` and never `STILL_STOPPING_PHRASE`.
+  After `stub_release`, a later `resume` brings S up (`waiting`). There is
+  no post to S's channel, every refusal line says no spawn-failure notice,
+  and there is no `spawn-failed` entry, no latch and no counted launch
+  failure. S comes back by `resume`: CSCB makes no reuse spawn of S in the
+  leg, and each CSCB spawn of S in it (the collision ladder's plain spawn)
+  has its `ErrInstanceIdCollision` line for S (it met S's row and launched
+  nothing).
+- held. P, launched by this server process: its `launch_started_at` (L) is
+  read. No slower approver read comes before G: P's `read-pane` calls in
+  (L + 5 s, L + G) are at least two, every gap between consecutive ones is
+  below the mean of the two paces (3 s), and the last lies within the slow
+  pace (5 s) of L + G. Those in (L + G + 5 s, L + G + 65 s) are at most what
+  a 5 s pace allows (`floor(d / 5) + 1` reads in a window of d seconds). The
+  calls are timed by their shim lines' own time field, so a gap is measured
+  whole, never rounded to the script's polling. There is no CSCB
+  `find-missing` before the launch start plus G, and no post to P's channel
+  or CSCB kill of P before the relaunching post. Exactly one relaunching
+  post, compared whole: its stub record time is no earlier than B and less
+  than 30 s after it, and its text is the printer's relaunching notice for
+  P with B (in whole minutes). The stuck-launch line is no earlier than B.
+  P's pending-row lines and the abort that follows the post are printed,
+  not asserted; P then reports in.
+- sequence. Q is added across a restart and held; its launch start L is
+  read and its symlink re-pointed, then a plain stop and start runs before
+  L + G (a restart without teardown). The restart's start sweep (b.jg5
+  SRJ-714) runs first: it kills Q's live row, whose `cwd` is no longer the
+  persona's working directory, and makes its one `find-missing` run at
+  once. Its lines are printed, not asserted, since SRJ-1426's G rule is the
+  live-row sequence's. The start pass then starts Q's live-row sequence
+  (the script fails, saying so, when it does not), its start line
+  matching the printer's for Q entered at step 1
+  (`LIVE_ROW_SEQUENCE_ENTRY_KILL`) and ending in a launch. Its kill of Q comes
+  before its step-2 wait; the wait's armed line equals the printer's for L
+  and G; its first `find-missing` run comes no earlier than L + G, with no
+  CSCB `find-missing` between the sequence's start and it; and the wait's
+  end line is no earlier than L + G. Q is brought up by a reuse spawn. A
+  run line saying a run left Q's `pending` row in neither list is followed
+  by no kill of Q, and there is no post to Q's channel.
+- change. A `[pause]`-only change (`timeout_seconds` 60, the `[tmux]`
+  values kept) logs no values line through the next bot-server probe.
+  `pending_grace_seconds` raised to 240 logs exactly one values line,
+  naming 240, after the next probe and none before it. R, added by a
+  confirmed reload and held at its dialog, makes more `read-pane` calls in
+  (L + 130 s, L + 170 s) from its launch start L than a 5 s pace allows, so
+  the raised G is in use; a harness Enter brings R up. The earlier `[tmux]`
+  values are then written back with no `[pause]` table, and whether a
+  values line follows the next probe is printed.
+- refused-stopping. The server restarts with `session_restart_delay` 0
+  (`health_check_interval` is 0 throughout) and S, P, Q and R up. The file
+  is written with `stopping_window_seconds` 10, below its minimum. After the
+  next bot-server probe C1 is added by a confirmed reload; its launch meets
+  agent-director's `ErrConfigMalformed`, which reaches CSCB as
+  `ErrUnknownErrorName`, and it is retried on its timer at least twice, with
+  a bot-server probe inside the refusal. The earlier accepted file is then
+  written back. The checks are `refused_values_check`'s, below.
+- refused-grace. The same checks for `pending_grace_seconds = "60"` (a TOML
+  string), with C2 added by a confirmed reload and C1 among the personas
+  already up.
+- call-timeout-30000 (b.jg5 SRJ-1426, SRJ-213, SRJ-407; AC 84). A plain
+  stop; the settings file written with `create_timeout_ms` 40000,
+  `pending_grace_seconds` 61 and the earlier stopping and starting values,
+  with no `[pause]` table; `agent_director_call_timeout_ms` 30000 in CSCB's
+  config, T1 added, the tmux shim in `slow-create` with a 50 s delay (longer
+  than `create_timeout_ms`), and a start. That start logs exactly one values
+  line, the printer's for these values, and exactly one call-timeout
+  warning, the printer's line for 30000 and these values, before T1's spawn.
+  T1's plain spawn, made by this server process, ends in `ErrCallTimeout`:
+  its refusal line comes at least 30 s (less a 0.5 s allowance for the
+  shim's line) and less than 40 s after the call's line in the shim's log.
+  The first CSCB `get` of T1 after the spawn follows, and exactly one
+  `server.log` line equals the printer's `launchUnavailableGetLine` for it:
+  the plain spawn's `ErrCallTimeout` form, reading this launch's `pending`
+  row with the launch start the harness last read before the get, the
+  outcome `LAUNCH_UNAVAILABLE_OUTCOME_APPROVER` (the approver started). A
+  CSCB `send-keys` (the approver's Enter) follows it and T1 reads
+  `waiting`. The harness reads T1's row (its state and launch start) about
+  once a second from the spawn until T1 is up and its retry timer has
+  stopped: its full-mode retry finds nothing left to recover, and the
+  printer's `unavailableRetryStoppedLine` for T1 (`full none`,
+  `UNAVAILABLE_RETRY_STOP_RECOVERED`) is matched whole. Every later CSCB launch
+  call of T1 (`spawn` or `resume`) must follow a harness reading of `ended`
+  or `missing` (the latest before the call) and a CSCB `get` or `status` of
+  the row since the call before it; with none such, the spawn is T1's only
+  launch.
+- call-timeout-61000 (b.jg5 SRJ-1426; AC 84). A plain stop,
+  `agent_director_call_timeout_ms` 61000, T2 added, the same settings file
+  and `slow-create`, and a start, which logs no call-timeout warning (the
+  printer gives none for 61000). T2's plain spawn, the same launch as T1's
+  under the higher setting, ends in `ErrTmuxUnresponsive` carrying
+  `LAUNCH_TIMEOUT_PHRASE`, its refusal line at least 40 s and less than
+  61 s after the call. Exactly one `server.log` line equals the printer's
+  `launchUnavailableGetLine` for the `get` that follows: the
+  `ErrTmuxUnresponsive` form, reading this launch's `pending` row with the
+  launch start a harness `get` read while the held create kept it pending,
+  the outcome `LAUNCH_UNAVAILABLE_OUTCOME_APPROVER`. The approver brings T2
+  up (`waiting`). No `server.log` line for T2 names `ErrCallTimeout`, and no
+  warning follows. The tmux shim is set
+  back to `log`.
+
+The two refused-value legs hold the suite's only deliberately refused
+values (the exception b.jg5 SRJ-1401 makes; SRJ-1426, SRJ-209, SRJ-316,
+SRJ-1018; AC 84). agent-director answers every store-backed call with
+`ErrConfigMalformed` while the file is refused, and answers `version`. One
+function, `refused_values_check`, checks both legs:
+
+- The read. Exactly one refused-read line, at the first refused read,
+  carrying the printer's fixed parts (which name the file) with the refused
+  key between them; none at the next read, and no values line while the
+  file is refused, so the last accepted values stay in effect.
+- The alert. One onset post to the added persona's channel: the printer's
+  fixed parts, naming the config file, around agent-director's description.
+  One raise line for that persona and none for another; no post to any
+  other persona's channel.
+- Nothing done while refused. No CSCB delete, kill, `kill-finished` or
+  `resume`, no stuck-launch abort, no counted launch failure and no persona
+  read as dead. The one launch call is the added persona's plain spawn at
+  the reload; a persona already up gets none. Each of the added persona's
+  timed retries makes one `status` call, refused and read as unknown, not
+  dead, launches nothing, counts nothing, and is re-armed with the reason
+  `liveness-unknown`. SRJ-1426's "makes no spawn" is followed here: the
+  retries do not retry the launch.
+- `version` does not clear. The bot-server probe inside the refusal (its
+  `version` call is answered) is followed by no all-clear and no clear line.
+  The version probes inside the refusal ran: the count of could-not-run
+  lines (`AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX`) is unchanged across
+  the refusal.
+- After the fix. The persona reads `waiting`, and its channel gets exactly one all-clear
+  post, the printer's text, made after the fix, with one clear line. The
+  first bot-server probe after the fix logs no values line (the values are
+  unchanged) and no refused-read line.
+
+Each refused-value leg waits for the added persona's retry timer to stop
+(its pending-only retry reads the row `waiting`: the printer's
+`unavailableRetryStoppedLine` for that persona, `pending-only waiting`,
+`UNAVAILABLE_RETRY_STOP_ROW_LIVE`, matched whole) before it ends, so no persona
+up at the next leg has a timer: a pending-only retry landing inside the
+next leg's refusal would start a new episode.
+
+The call-timeout legs' need is 60.9 s: the launch ceiling at C = 40 s,
+max(Q + C + 2A + 4W, 2Q + C + 3W) = 45.9 s at agent-director's default Q, A
+and W, plus `AD_CALL_TIMEOUT_NEED_MARGIN_MS` (15 s, `src/ad-settings.ts`).
+`resume`, a reuse and a plain spawn share that ceiling, so there is no
+separate case for the plain spawn; their equality is unit-tested
+(`tests/ad-settings.test.ts`, b.jg5 SRJ-213) and only derived in the
+script's header. The file holds no `[pause]` table, so `pause`'s ceiling
+(9 s plus the default 30 s) is below the launch ceiling. The script takes
+the need from the printer (`adCallTimeoutNeed`, whose verb must be `resume`,
+the launch row's first verb) and checks before the legs that 30000 lies
+below `create_timeout_ms` and at or below the need, that 61000 lies above
+the need, that the delay is longer than `create_timeout_ms`, and that the
+printer's warning names 30000 and the need and gives none for 61000. "The
+same launch" of call-timeout-61000 is a second persona's fresh plain spawn,
+under the same settings file, after a restart without teardown that picks
+up 61000; T1 is up by then.
+
+A bot-server probe is a CSCB `version` call in the agent-director shim's
+log whose parent is the bot server; the server reads the settings file
+again after each timed probe (`installAdSettings`, `src/ad-settings.ts`),
+so each change-leg wait is bounded by the re-check interval plus 10 s.
+Every time comes from the script's own polling, a shim line's time field,
+a `server.log` line's ISO prefix, a stub record's `ts`, or a row's
+`launch_started_at` or `ended_at`.
+
+Matched values, each printed by `fixtures/fmk-texts.ts` from the installed
+package:
+
+| Value | Printer entry | `src/` |
+|---|---|---|
+| The nine `[tmux]` keys | `AD_TMUX_KEYS` | `src/ad-settings.ts` |
+| The written values' minimums | `AD_SETTING_MINIMUMS <key>`, `pendingGraceMinimumSeconds` | `src/ad-settings.ts` |
+| The defaults the grace minimum is taken at | `DEFAULT_AD_SETTINGS tmux <key>` | `src/ad-settings.ts` |
+| The settings file's path, table names and pause key (read by `write_ad_settings`) | `AD_SETTINGS_RELATIVE_PATH`, `AD_TMUX_TABLE`, `AD_PAUSE_TABLE`, `AD_PAUSE_TIMEOUT_KEY` | `src/ad-settings.ts` |
+| The values line's prefix | `AD_SETTINGS_LOG_PREFIX` | `src/ad-settings.ts` |
+| The values lines | `buildAdSettingsValuesLine <path> <key>=<value>...` | `src/ad-settings.ts` |
+| G, B and the alert threshold | `adGraceMs`, `adLaunchBoundMs`, `adAlertThresholdMs` | `src/ad-settings.ts` |
+| B in whole minutes | `wholeMinutes <B>` | `src/ad-settings.ts` |
+| The re-check interval | `AD_VERSION_RECHECK_INTERVAL_MS` | `src/ad-version-gate.ts` |
+| The approver's paces before and from G, and the held leg's gap limit (their mean) | `DIALOG_POLL_INTERVAL_MS`, `DIALOG_SLOW_POLL_INTERVAL_MS` | `src/session-manager.ts` |
+| The "still stopping" and "still starting" phrases | `STILL_STOPPING_PHRASE`, `STILL_STARTING_PHRASE` | `src/ad-description-phrases.ts` |
+| The relaunching post for P | `formatPersonaNotice <P> stuckLaunchRelaunchingText <P's key> <B>` | `src/persona-notifier.ts`, `src/pending-row.ts` |
+| The spawn-failed class | `STARTUP_ERROR_SPAWN_FAILED` | `src/session-manager.ts` |
+| The stuck-launch abort's start line's fixed parts | `stuckLaunchAbortStartedLine <marker> <marker> <launch-start marker>` | `src/pending-row.ts` |
+| The dead reading's fixed parts | `reprobeDeadLine <marker>` | `src/restart.ts` |
+| The `reload-applied` line's class (`[slack] <class>:`) | `RELOAD_APPLIED` | `src/reload-apply.ts` |
+| Q's sequence start line's fixed parts | `liveRowSequenceStartLine <Q's ref> LIVE_ROW_SEQUENCE_ENTRY_KILL <Q's id> <marker> launch <marker>` | `src/live-row-sequence.ts` |
+| The step-2 wait's armed and end lines | `liveRowSequenceWaitArmedLine <Q's ref> <L> <G>`, `liveRowSequenceWaitEndedLine <Q's ref>` | `src/live-row-sequence.ts` |
+| A run left in neither list | `liveRowSequenceRunLine <Q's ref> <step> <run> LIVE_ROW_RUN_NOT_JUDGED` | `src/live-row-sequence.ts` |
+| The config file as the onset names it | `AD_CONFIG_FILE_DISPLAY_NAME` | `src/ad-config-file.ts` |
+| The refused-read line's fixed parts | `buildAdSettingsRefusedReadLine <file> <marker> accepted` | `src/ad-settings.ts` |
+| The onset's fixed parts, as posted for C | `formatPersonaNotice <C> adConfigMalformedOnset <marker>` | `src/persona-notifier.ts`, `src/outage-state.ts` |
+| The all-clear, as posted for C | `formatPersonaNotice <C> ALL_CLEAR_TEMPLATE ad-config-malformed` | `src/persona-notifier.ts`, `src/outage-state.ts` |
+| The raise line's fixed parts and the clear line | `adConfigMalformedRaisedLine <C's key> <marker>`, `adConfigMalformedClearedLine <C's key>` | `src/outage-state.ts` |
+| The retry timer's first and longest waits | `UNAVAILABLE_RETRY_BASE_S`, `UNAVAILABLE_RETRY_CEILING_S` | `src/unavailable-retry.ts` |
+| A stop's reasons: a pending-only retry read the row live; a retry found nothing left to recover | `UNAVAILABLE_RETRY_STOP_ROW_LIVE`, `UNAVAILABLE_RETRY_STOP_RECOVERED` | `src/unavailable-retry.ts` |
+| The could-not-run line's prefix (none across a refusal) | `AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX` | `src/ad-version-gate.ts` |
+| The re-armed reason of a retry read as unknown | `RESTART_OUTCOME_LIVENESS_UNKNOWN` | `src/restart.ts` |
+| The retry timer's retry, re-armed and stop lines | `unavailableRetryRetryLine <C's key> <retry> full`, `unavailableRetryReArmedLine <C's key> <retry> full <marker> 0`, `unavailableRetryStoppedLine <C's key> pending-only waiting <UNAVAILABLE_RETRY_STOP_ROW_LIVE>`, `unavailableRetryStoppedLine <T1's key> full none <UNAVAILABLE_RETRY_STOP_RECOVERED>` | `src/unavailable-retry.ts` |
+| The call-timeout legs' grace period (61) | `pendingGraceMinimumSeconds 40000 <default pipe_close_wait_ms>` | `src/ad-settings.ts` |
+| The need and the verb whose ceiling sets it | `adCallTimeoutNeed <the call-timeout table>` | `src/ad-settings.ts` |
+| The startup warning for 30000, and none for 61000 | `buildAdCallTimeoutWarningLine <30000\|61000> <the call-timeout table>` | `src/ad-settings.ts` |
+| The launch-timeout phrase T2's answer carries | `LAUNCH_TIMEOUT_PHRASE` | `src/ad-description-phrases.ts` |
+| The line of the get after a launch timeout, whole | `launchUnavailableGetLine <T's ref> spawn <ErrCallTimeout\|ErrTmuxUnresponsive> pending <the row's launch_started_at> LAUNCH_UNAVAILABLE_OUTCOME_APPROVER` | `src/session-manager.ts`, `src/ad-error-class.ts`, `src/pending-row.ts` |
+
+C is the persona a refused-value leg adds (C1 or C2), and T is T1 or T2. A
+marker the script passes in place of agent-director's description, the
+reader's reason or a retry line's reason, or in place of a persona key, a
+reference, a row state or an alert context (a short identifier) or a launch
+start (an ISO time the lines render as given), splits a printed text into
+the fixed parts around it.
+
+Lines with no exported builder are matched by a fragment quoted from `src/`,
+each with its source named beside it in the script: the refusal line and
+its no-notice tail (`src/session-manager.ts` `logRefusal`), the latch line
+(`src/conflict-latch.ts`), the stuck-launch line (`src/pending-row.ts`),
+the relaunch-failed line and the liveness-unknown line (`src/restart.ts`),
+the refused liveness read's line (`src/server.ts` `isSessionAlive`), the
+collision ladder's `ErrInstanceIdCollision` line (`COLLISION_HEAD`,
+`src/session-manager.ts` `spawnForPersona`), the start sweep's lines
+(`src/session-manager.ts` `reconcileOrphans`) and the `ad-config-malformed`
+class the all-clear lists (`src/outage-state.ts` does not export it; the
+printer's `ALL_CLEAR_TEMPLATE` checks it is one of `OUTAGE_CLASS_ORDER`).
+The get line's `spawn` (what that line calls a plain spawn,
+`src/session-manager.ts` `spawnForPersona`) has no export and is quoted
+too.
+
+### The value printer
+
+`tests/integration/fixtures/fmk-texts.ts` is the one value printer of the
+fmk scenarios; its header comment is its full statement. A scenario script
+cannot import TypeScript and never retypes a notice text, class label,
+version or settings value that `src/` exports, so it asks the printer, which
+prints the installed package's own export: a constant as it is, or a
+builder's output for the given arguments.
+
+- Usage: `bun "${SCENARIO_FIXTURES}/fmk-texts.ts" <entry> [<arg>...]`, run in
+  the scenario's own shell (the printer is not a CSCB process, so not through
+  `cscb_run`) and captured with a command substitution, the scenario failing
+  when the printer fails. It prints the value byte for byte, with no trailing
+  newline added.
+- It reads the package from `CSCB_PKG_DIR` (default
+  `/test-repo/node_modules/claude-slack-channel-bots`), which `scenario.sh`
+  exports as the installed package under test
+  (`$SCENARIO_REPO/node_modules/claude-slack-channel-bots`), and an entry
+  that needs it, the agent-director client that package resolves.
+- Failures print one `FAIL: fmk-texts: <reason>` line on stderr: exit 64 for
+  no entry, an unknown one or arguments the entry does not take; exit 1 for
+  a missing or mistyped export or a builder that throws. Without the image
+  marker it exits 2 (see Image marker); `tests/host-safety.test.ts`'s marker
+  audit covers it.
+- It makes no agent-director call, starts no process or server, opens no
+  socket, reads no token and writes no file.
+- Its entries sit in one named map (`ENTRIES`), each named after the `src/`
+  export it prints; `ENTRIES` joins the shared table with the fixed-argument
+  and one-function tables (`ARGS_ENTRIES`, `FN_ENTRIES`) some scenarios'
+  entries were built in, and a name in two tables fails every run. A
+  scenario that needs another value adds a named entry there; there is never
+  a second printer. The table below lists scenarios 8, 23 and 24's entries;
+  the printer's header lists every entry.
+
+| Entry | Prints | `src/` |
+|---|---|---|
+| `PHASE1_FLOOR_VERSION` | the Phase 1 floor | `src/ad-version-gate.ts` |
+| `AD_BELOW_PHASE1_FLOOR` | the class label | `src/install-check-labels.ts` |
+| `buildBelowPhase1FloorMessage <found-version> <binary-path> <startup\|runtime>` | the floor message in the startup or runtime form | `src/ad-version-gate.ts` |
+| `RUNTIME_RECHECK_PHRASE` | the runtime re-check phrase | `src/ad-version-gate.ts` |
+| `AD_VERSION_RECHECK_INTERVAL_MS` | the re-check interval, in decimal | `src/ad-version-gate.ts` |
+| `AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX` | the could-not-run line's prefix | `src/ad-version-gate.ts` |
+| `INVALID_FLAGS_HOLD_ALERT_TEXT` | the Cannot launch alert's body | `src/invalid-flags-hold.ts` |
+| `formatPersonaNotice <persona-name> <entry> [<arg>...]` | another entry's value as posted in that persona's notice | `src/persona-notifier.ts` |
+| `classifyAdError <err-name>` | CSCB's class for the installed client's error class `<err-name>`, built from an envelope | `src/ad-error-class.ts` |
+| `DEFAULT_AD_SETTINGS <table> <key>` | agent-director's default for `[<table>] <key>`, in decimal; an unknown table or key exits 64 | `src/ad-settings.ts` |
+| `CLIENT_DEV_SENTINEL_VERSION` | the client's development sentinel version | `src/ad-version-gate.ts` |
+| `AD_SYSTEM_INSTALL_UNREACHABLE` | the class label | `src/install-check-labels.ts` |
+| `UNREACHABLE_REASON_UNPARSEABLE_VERSION` | the `ErrSystemInstallUnreachable` reason of a version that does not parse | `src/ad-version-gate.ts` |
+| `meetsPhase1Floor <version>` | whether `<version>` meets the Phase 1 floor: `true` or `false` | `src/ad-version-gate.ts` |
+| `AD_SETTINGS_LOG_PREFIX` | the prefix of the settings reader's log lines | `src/ad-settings.ts` |
+| `buildAdSettingsValuesLine <path> [<key>=<integer>...]` | the values line for the settings file `<path>`: the nine `[tmux]` values, `DEFAULT_AD_SETTINGS`' own but for each given `<key>` | `src/ad-settings.ts` |
+| `AD_SETTINGS_RELATIVE_PATH` | the settings file's path relative to a HOME | `src/ad-settings.ts` |
+| `AD_TMUX_TABLE` | the timing keys' table name | `src/ad-settings.ts` |
+| `AD_PAUSE_TABLE` | `pause`'s table name | `src/ad-settings.ts` |
+| `AD_PAUSE_TIMEOUT_KEY` | `pause`'s wait key | `src/ad-settings.ts` |
+| `AD_TMUX_KEYS` | the nine `[tmux]` keys, in order, joined by single spaces | `src/ad-settings.ts` |
+| `AD_SETTING_MINIMUMS <key> [<part>]` | agent-director's minimum for `[tmux] <key>`, in decimal; for a minimum with parts (`pending_grace_seconds`), the named `<part>` (`floor` or `addend`) | `src/ad-settings.ts` |
+| `pendingGraceMinimumSeconds <create-timeout-ms> <pipe-close-wait-ms>` | the grace period's minimum, in decimal | `src/ad-settings.ts` |
+| `adGraceMs [<key>=<integer>...]` | G, in decimal | `src/ad-settings.ts` |
+| `adAlertThresholdMs [<key>=<integer>...]` | the alert threshold, in decimal | `src/ad-settings.ts` |
+| `adLaunchBoundMs [<key>=<integer>...]` | B, in decimal | `src/ad-settings.ts` |
+| `wholeMinutes <ms>` | `<ms>` in whole minutes, rounded down | `src/ad-settings.ts` |
+| `STILL_STOPPING_PHRASE` | the phrase an `ErrTmuxUnresponsive` carries for a row that still appears to be stopping | `src/ad-description-phrases.ts` |
+| `STILL_STARTING_PHRASE` | the phrase an `ErrTmuxUnresponsive` carries for a row that still appears to be starting | `src/ad-description-phrases.ts` |
+| `stuckLaunchRelaunchingText <persona-key> <launch-bound-ms>` | the stuck-launch post's relaunching text for that persona key and B (posted as a persona notice: wrap it in `formatPersonaNotice`) | `src/pending-row.ts` |
+| `DIALOG_POLL_INTERVAL_MS` | the dialog approver's pace before G, in decimal | `src/session-manager.ts` |
+| `DIALOG_SLOW_POLL_INTERVAL_MS` | the dialog approver's slow pace from G, in decimal | `src/session-manager.ts` |
+| `STARTUP_ERROR_SPAWN_FAILED` | the startup-errors class a failed start-pass launch writes | `src/session-manager.ts` |
+| `liveRowSequenceWaitArmedLine <persona-ref> <launch-start-ms> <grace-ms>` | the step-2 wait's armed line for that persona ref (`"<name>" (key=<key>)`), launch start in epoch milliseconds and G | `src/live-row-sequence.ts` |
+| `liveRowSequenceWaitEndedLine <persona-ref>` | the step-2 wait's end line | `src/live-row-sequence.ts` |
+| `liveRowSequenceRunLine <persona-ref> <step> <run-number> <placement-export>` | the sequence's line for one `find-missing` run at step 3 or 4, with the placement the package exports as `<placement-export>` (a `LIVE_ROW_RUN_…` name) | `src/live-row-sequence.ts` |
+| `AD_CONFIG_FILE_DISPLAY_NAME` | the settings file as a notice names it (`~/…`) | `src/ad-config-file.ts` |
+| `adConfigMalformedOnset <description>` | the `ad-config-malformed` onset for agent-director's `ErrConfigMalformed` answer with `<description>`, built as the installed client throws it (its `ErrUnknownErrorName`; a client with a class of that name fails); posted as a persona notice: wrap it in `formatPersonaNotice` | `src/outage-state.ts` |
+| `adConfigMalformedRaisedLine <persona-key> <description>` | the server-log raise line for that answer, classified by `classifyAdError` | `src/outage-state.ts`, `src/ad-error-class.ts` |
+| `adConfigMalformedClearedLine <persona-key>` | the server-log clear line | `src/outage-state.ts` |
+| `ALL_CLEAR_TEMPLATE <outage-class>...` | the all-clear for a bad stretch of the given classes, each one of the package's `OUTAGE_CLASS_ORDER`, given once, none with a detail; posted as a persona notice: wrap it in `formatPersonaNotice` | `src/outage-state.ts` |
+| `buildAdSettingsRefusedReadLine <path> <reason> <accepted\|none>` | the line of a run of refused reads of `<path>`, `accepted` when a read was accepted before it, `none` when not | `src/ad-settings.ts` |
+| `UNAVAILABLE_RETRY_BASE_S` | the retry timer's first wait (its waits double from it), in seconds, in decimal | `src/unavailable-retry.ts` |
+| `unavailableRetryRetryLine <persona-key> <retry> <full\|pending-only>` | the line at the start of retry `<retry>` of the persona's retry timer, in that mode | `src/unavailable-retry.ts` |
+| `unavailableRetryReArmedLine <persona-key> <retry> <full\|pending-only> <reason> <wait-ms>` | the re-armed line of that retry, answered `<reason>`, the mode unchanged, the next retry in `<wait-ms>` | `src/unavailable-retry.ts` |
+| `RESTART_OUTCOME_LIVENESS_UNKNOWN` | the restart work's outcome, and a retry's again-reason, when the persona's liveness reads unknown | `src/restart.ts` |
+| `unavailableRetryStoppedLine <persona-key> <full\|pending-only> <row\|none> <reason>` | the line of a stop of the persona's retry timer, in that mode, naming the row read (`none`: no row) | `src/unavailable-retry.ts` |
+| `UNAVAILABLE_RETRY_CEILING_S` | the retry timer's longest wait, in seconds, in decimal | `src/unavailable-retry.ts` |
+| `buildAdCallTimeoutWarningLine <call-timeout-ms> [<key>=<integer>...]` | the startup call-timeout warning for that call timeout and the values in effect; the empty text when the builder gives no line | `src/ad-settings.ts` |
+| `adCallTimeoutNeed [<key>=<integer>...]` | `<need-ms> <verb>`: the call timeout's need, in decimal, and the verb whose ceiling sets it | `src/ad-settings.ts` |
+| `LAUNCH_TIMEOUT_PHRASE` | the phrase an `ErrTmuxUnresponsive` carries when it ends a launch call as a launch timeout | `src/ad-description-phrases.ts` |
+| `AD_VERSION_RECHECK_STOP_EXIT_CODE` | the exit status of the runtime re-check's stop, in decimal | `src/ad-version-gate.ts` |
+| `launchUnavailableGetLine <persona-ref> <what> <err-name> <read> <launch-start\|no> <outcome-export>` | the line of the one get after the `<what>` of `<persona-ref>` ended in a launch timeout of the form `<err-name>` (one of the package's `LAUNCH_TIMEOUT_FORM_…` values, named as `launchUnavailableFormText` names it), the get reading `<read>`; this launch's row has the launch start `<launch-start>`, the row's `launch_started_at` as agent-director wrote it, read with `parseLaunchStart` (`no`: not this launch's row); the outcome the package exports as `<outcome-export>` (a `LAUNCH_UNAVAILABLE_OUTCOME_…` name) | `src/session-manager.ts`, `src/ad-error-class.ts`, `src/pending-row.ts` |
+| `UNAVAILABLE_RETRY_STOP_ROW_LIVE` | a stop's reason when a pending-only retry reads the row live | `src/unavailable-retry.ts` |
+| `UNAVAILABLE_RETRY_STOP_RECOVERED` | a stop's reason when a retry finds nothing left to recover | `src/unavailable-retry.ts` |
+| `stuckLaunchAbortStartedLine <persona-key> <persona-ref> <launch-start>` | the stuck-launch abort's start line, `<launch-start>` as a row's `launch_started_at` (the line renders it) | `src/pending-row.ts` |
+| `reprobeDeadLine <persona-key>` | the line of a row the re-probe reads dead | `src/restart.ts` |
+| `liveRowSequenceStartLine <persona-ref> <entry-step-export> <instance-id> <last-read> <launch\|no-launch> <alert-context>` | the live-row sequence's start line, entered at the step the package exports as `<entry-step-export>` (a `LIVE_ROW_SEQUENCE_ENTRY_…` name), ending in a launch or not | `src/live-row-sequence.ts` |
+| `RELOAD_APPLIED` | the class label of an applied reload's line | `src/reload-apply.ts` |
+
+`adGraceMs`, `adAlertThresholdMs`, `adLaunchBoundMs`, `adCallTimeoutNeed`
+and `buildAdCallTimeoutWarningLine` take the values in effect built from
+their `<key>=<integer>` arguments: the `[tmux]` values, `DEFAULT_AD_SETTINGS`'
+own but for each given `<key>`, and `DEFAULT_AD_SETTINGS_IN_EFFECT`'s
+`pauseTimeout`. In every `<key>=<integer>` argument `<key>` is one of the
+package's `AD_TMUX_KEYS`; an unknown key, a key given twice or a value that
+is not an integer exits 64.
+
+Given a marker in place of `<description>` or `<reason>`,
+`adConfigMalformedOnset`, `adConfigMalformedRaisedLine` and
+`buildAdSettingsRefusedReadLine` print a text whose parts around the marker
+are its fixed parts; `unavailableRetryReArmedLine` and
+`unavailableRetryStoppedLine` print one whose part before the marker is the
+line's fixed head. More generally, a builder entry given a marker argument
+(a key, a reference, a state or a description the scenario chooses) prints
+a line whose text around the marker is the line's fixed part; the scenario
+splits it there.
 
 ### Harness-only steps
 
@@ -1645,7 +2383,7 @@ one.
 
 | Helper | Scenario | Columns it changes |
 |---|---|---|
-| `ad_store_mark_finished <id> <missing\|ended>` | 10 part B (SRJ-1412) | `state` to `missing` or `ended`; `ended_at` to now minus the stopping window, in whole seconds, in the store's `YYYY-MM-DD HH:MM:SS` UTC layout; `launch_started_at` NULL; `row_version` + 1. Prints the `ended_at` written |
+| `ad_store_mark_finished <id> <missing\|ended>` | 10 part B (SRJ-1412); 8 (SRJ-1410), in test-20's 8d and 8e | `state` to `missing` or `ended`; `ended_at` to now minus the stopping window, in whole seconds, in the store's `YYYY-MM-DD HH:MM:SS` UTC layout; `launch_started_at` NULL; `row_version` + 1. Prints the `ended_at` written |
 | `ad_store_seed_pending <id> [<leftover-token>]` | 19 (SRJ-1420) | the existing row made `pending`, as a spawn whose process stopped before its create leaves it: `state` `pending`; `launch_started_at` now, in milliseconds; `launch_token` a fresh token other than the row's current one and the leftover's; `ended_at`, `pid`, `proc_starttime`, `tmux_server_pid`, `tmux_server_started`, `tmux_server_starttime`, `pane_id`, `pane_pid` and `pane_starttime` NULL; `row_version` + 1. A harness `status` read must then read `pending` with a launch start. Prints the token |
 | `ad_store_unusable_name <id> <name>` | 25 (SRJ-1427) | only `tmux_session_name`, to a `<name>` holding a `.` and only letters, digits and `._-`, on an `ended` or `missing` row; `row_version` kept |
 | `ad_store_pending_no_launch <id>` | 20 and 26 | `state` `pending`; `launch_started_at`, `launch_token`, `pid`, `proc_starttime`, `pane_id`, `pane_pid` and `pane_starttime` NULL; `row_version` + 1. It reads the row first and guards the UPDATE on the `row_version` it read, failing when the UPDATE changes no row (agent-director wrote the row in between); it then reads the row again and fails unless only these columns changed, each as named. A harness `status` read must then read `pending` with no launch start |
@@ -1801,7 +2539,7 @@ names are `scenario.sh` constants:
 | `unrecognised-dialog` | `STUB_MODE_UNRECOGNISED` | Prints a startup dialog that neither of the approver's needles matches, so CSCB never answers it, and once Enter reaches its pane clears the answered dialog (below) and reports in: the harness's `stub_press_enter <target>`, a human answering (scenarios 20 and 21) |
 | `folder-trust` | `STUB_MODE_FOLDER_TRUST` | Reports in at once when its folder is trusted in `<CLAUDE_CONFIG_DIR>/.claude.json`, or in `~/.claude.json` when `CLAUDE_CONFIG_DIR` is unset or empty; otherwise prints the folder-trust prompt and, once it is answered by Enter, clears the answered dialog (below) and reports in (scenario 22) |
 | `transcript-on-first-message` | `STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE` | A harness addition, confirm at the reconcile pass. As `dev-channels` (the same dialog, reporting in on the Enter), except that reporting in writes no transcript: until the first message, every SessionStart (the report-in's and the re-fire's) names a `transcript_path` with no file at it, so agent-director's SessionStart finds none, as for a real life never messaged. The transcript is written at the first message after reporting in: the first line that is not the exit sentinel, does not start with `/` (a slash command, such as `/exit` or `/mcp reconnect`) and is not empty or blank, typed by the harness's `stub_type_line`. Once written it stays: later SessionStarts, and a resumed launch of that session, find it (scenario 7) |
-| `pause-linger` | `STUB_MODE_PAUSE_LINGER` | Reports in at once, then answers the `/exit` line agent-director's `pause` types with the pause linger below, a harness addition (scenarios 13 and 24) |
+| `linger-on-exit` | `STUB_MODE_LINGER_ON_EXIT` | Reports in at once. On the `/exit` line agent-director's `pause` types, it marks itself lingering, fires every SessionEnd hook (the row reads `ended`), stops its re-fire and ends its MCP session, then keeps running, its pane and session with it, as a Claude Code still shutting down does, until `stub_release` or its stdin closing. Before it has reported in, `/exit` is ignored (scenarios 24 and 13) |
 
 An answered dialog is cleared. The line that answers a dialog first makes
 the stub clear its screen and its scrollback (`ESC[H ESC[2J ESC[3J`), as
@@ -1843,6 +2581,16 @@ exactly. Like the other helpers it runs `require_ci_image` and
 `TMUX_TMPDIR` is not the scenario's. The stub then fires its SessionEnd
 hooks and exits; the helper does not wait for it to end.
 
+`stub_release <target> [<timeout-s>]` ends a stub lingering in
+`linger-on-exit`: it reads the pane's process with the real tmux, from the
+scenario's own shell (the pane named as for `stub_press_enter`), sends it
+SIGUSR1 and fails unless it is gone within `<timeout-s>`
+(`SCENARIO_STUB_RELEASE_S`, 10 s, by default). Before any signal it refuses
+unless that process is a stub lingering in `linger-on-exit`, which a
+lingering stub shows by its marker `stub-claude-lingering.<pid>` beside it
+in `SCENARIO_BIN`; it refuses, as `stub_press_enter` does, when `TMUX` is
+set or `TMUX_TMPDIR` is not the scenario's.
+
 The dialog delay, a harness addition (b.jg5 SRJ-1306) to confirm at the
 reconcile pass, holds a launch `pending` at the dev-channels dialog long
 enough for a scenario to act on it before the approver can answer (scenario
@@ -1870,35 +2618,9 @@ that waits for the approver's Enter, as the default does: agent-director
 applies no hook to a row whose pane it has not adopted, and the approver's
 `send-keys` adopts it before the stub reports in.
 
-The pause linger, a harness addition (b.jg5 SRJ-1306, SRJ-1415) to confirm
-at the reconcile pass, gives a worker whose row reads `ended` while its
-process and tmux session still run, as Claude Code's SessionEnd hook marks
-the row before its process exits (scenarios 13 and 24). It acts only in
-`pause-linger`, selected with `stub_mode`; every other mode handles a
-`/exit` line as any other line.
-
-- agent-director's `pause` types C-u, `/exit` and Enter. Once the stub has
-  reported in, the `/exit` line (a leading C-u dropped) fires every
-  SessionEnd hook once, by the hook rules below, stops the SessionStart
-  re-fire and ends the stub's MCP session, as Claude Code's shutdown closes
-  its MCP clients. The stub then lingers: its process, pane and session keep
-  running. A `/exit` before the stub has reported in is ignored.
-- While it lingers it ignores every line but the sentinel, which ends it
-  with no hook fired; stdin closing ends it too.
-- `stub_release <dir>` releases it: one `<time> TAB <real path>` line added
-  to `stub-claude-releases` beside the stub in `SCENARIO_BIN`
-  (`SCENARIO_STUB_RELEASES_NAME`), by an atomic rewrite. A lingering stub
-  reads that file every 0.25 s and exits 0, firing nothing, at the first
-  line added after its linger began that names its directory, so a release
-  made before the `/exit` is never acted on. `stub_release` does not wait for
-  the stub to exit. Like `stub_mode`, it is for fmk mode only and refuses a
-  `<dir>` that is not a directory under `SCENARIO_ROOT` (as written and by
-  real path).
-
 Hooks. To report in, the stub fires every SessionStart hook its `--settings`
 registers; its exit sentinel `__CSCB_TEST_EXIT__` fires every SessionEnd hook
-(in `pause-linger`, the `/exit` line does too, and a later sentinel fires
-none).
+(in `linger-on-exit`, the `/exit` line does too).
 Each hook runs as a direct child of the stub's process, the pane's main
 process, with its payload on standard input and no `agent_id` in it, never
 through a shell. An exec-form entry runs `command` with its `args`; an entry
@@ -1947,7 +2669,7 @@ server ends it, a later `/mcp reconnect` in the pane (bare, or followed by
 the server name as CSCB types it, `/mcp reconnect slack-channel-router`)
 opens a new one. A session client still running then is ended first:
 SIGTERM, then SIGKILL if it still runs 3 s later, and reaped. In
-`pause-linger` the `/exit` line ends it and the lingering stub opens none. Its
+`linger-on-exit` the `/exit` line ends it and the lingering stub opens none. Its
 lines go to `stub-mcp-session.log` beside the stub. No session is opened in
 a mode that has not reported in, without `--mcp-config`, or where the client
 is not beside the stub (Tests 4, 10 and 12, which copy only the stub and run
@@ -1980,8 +2702,9 @@ variable for the integration suite only (see Environment Variables in
   redacted (`slack_posts` reads them); every other method's `text` is cut at
   300 characters.
 - It has no `bun test` suite of its own; Test 10 exercises it end to end,
-  and Test 0's `slack_stub_record` leg checks the record's text cut and
-  token replacement.
+  Test 0's `slack_stub_record` leg checks the record's text cut and token
+  replacement, and Test 20's whole-text checks exercise its
+  `chat.postMessage` record.
 
 A live start also launches each persona through the real agent-director
 under the stub `claude` (see The stub worker), and stops with `--stop-bots`.

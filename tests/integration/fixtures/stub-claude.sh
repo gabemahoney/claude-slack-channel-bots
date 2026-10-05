@@ -71,10 +71,12 @@
 #                        RESUME) finds it at its SessionStart; a resumed
 #                        launch of a session never messaged finds none until
 #                        its own first message.
-#   pause-linger         report in at once, as `at-once` does, and answer the
-#                        `/exit` line agent-director's `pause` types by firing
-#                        SessionEnd and lingering until the harness releases
-#                        it (see THE PAUSE LINGER).
+#   linger-on-exit       harness addition (scenario 24, and scenario 13's
+#                        "still stopping"): report in at once, as `at-once`;
+#                        then, on the `/exit` line agent-director's `pause`
+#                        types, end the session but keep the process running,
+#                        as a Claude Code still shutting down does, until the
+#                        harness releases it (see LINGERING).
 #
 # Only the dev-channels dialog holds DEV_CHANNELS_DIALOG_NEEDLE, and only the
 # folder-trust prompt holds TRUST_DIALOG_NEEDLE.
@@ -103,31 +105,25 @@
 # Hook firing, the sentinel, the stop line and the re-fire are as stated
 # below, with or without a delay.
 #
-# THE PAUSE LINGER
-# ----------------
-# A harness addition (b.jg5 SRJ-1306, SRJ-1415) to confirm at the reconcile
-# pass, for HO §7 scenarios 13 and 24: a worker whose row reads `ended` while
-# its process and tmux session still run, as Claude Code's SessionEnd hook
-# marks the row before its process exits. It acts only in `pause-linger`:
-#   - agent-director's `pause` types C-u (which clears the pane's input line),
-#     `/exit` and Enter, so the stub reads the line `/exit` (a C-u that
-#     reaches the line as a character is dropped from its start). Once the
-#     stub has reported in, that line fires every SessionEnd hook the
-#     `--settings` JSON registers, once, by HOOK FIRING's rules; the stub then
-#     stops the re-fire, ends its MCP session (as Claude Code's shutdown
-#     closes its MCP clients) and lingers: its process, and so its tmux pane
-#     and session, keep running;
-#   - while it lingers it ignores every line but the sentinel, which ends it
-#     with no hook fired (SessionEnd has fired); stdin closing ends it too;
-#   - the harness releases it (lib/scenario.sh `stub_release`), which adds
-#     the line `<time> TAB <real path>` to the file `stub-claude-releases`
-#     beside the stub. The lingering stub reads that file every
-#     LINGER_POLL_S and exits 0, firing nothing, at the first line added
-#     after it began to linger that names its directory. It counts the
-#     file's lines when the `/exit` arrives, before it fires the hooks, so a
-#     line added before then never releases it.
-# A `/exit` line before the stub reported in, and a `/exit` line in any other
-# mode, is ignored as any other line is.
+# LINGERING
+# ---------
+# Harness addition (scenario 24, test-26, and scenario 13): a finished row
+# whose own session still runs. In `linger-on-exit`, once reported in, the
+# line `/exit` (agent-director's `pause` sends C-u, types `/exit` and Enter)
+# makes the stub linger:
+#   - it marks itself lingering: the file `stub-claude-lingering.<stub pid>`
+#     beside the stub, holding its working directory's real path, written by
+#     one rename;
+#   - it fires every SessionEnd hook the `--settings` JSON registers, as the
+#     sentinel does (see HOOK FIRING; reason `exit`, which agent-director takes
+#     as a session that ended), so the row reads `ended`;
+#   - it stops the SessionStart re-fire and ends its MCP session;
+#   - it keeps running, its pane and session with it, ignoring every further
+#     line, until it gets SIGUSR1 (the harness's release, lib/scenario.sh
+#     `stub_release`) or its stdin closes; then it removes its marker and
+#     exits 0.
+# Before it lingers, `/exit` is an ordinary line (ignored), and SIGUSR1 is
+# not handled.
 #
 # Every mode keeps these rules:
 #   - Reporting in writes a minimal transcript JSONL at Claude Code's canonical
@@ -142,7 +138,7 @@
 #   - After reporting in the stub keeps reading stdin, so the process and its
 #     tmux pane stay alive. Further lines are ignored, apart from the sentinel
 #     and `/mcp reconnect`, alone or with a server's name (see THE MCP
-#     SESSION).
+#     SESSION), and, in `linger-on-exit`, `/exit` (see LINGERING).
 #   - Answering a dialog (`dev-channels`, `unrecognised-dialog`, and
 #     `folder-trust` when it printed its prompt): the line that answers it
 #     first clears the screen and the scrollback (`ESC[H ESC[2J ESC[3J`), as
@@ -155,7 +151,7 @@
 #   - The sentinel line `__CSCB_TEST_EXIT__` fires every SessionEnd hook the
 #     `--settings` JSON registers and exits 0 (in `silent`, it fires none). In
 #     a dialog mode it does so before the dialog is answered too.
-#   - In `pause-linger`, the `/exit` line too (see THE PAUSE LINGER).
+#   - In `linger-on-exit`, the `/exit` line too (see LINGERING).
 #   - When stdin closes (the pane was killed), the stub exits 0.
 #
 # RESUME
@@ -264,8 +260,8 @@
 # running then (one whose server restarted before its next ping noticed) is
 # ended first, with SIGTERM, then SIGKILL if it still runs 3 s later, and
 # reaped, so a reconnect never holds the stub's read loop longer than that.
-# In `pause-linger` the `/exit` line ends the session (SIGTERM) and the
-# lingering stub opens none (see THE PAUSE LINGER).
+# In `linger-on-exit` the `/exit` line ends the session and the lingering
+# stub opens none (see LINGERING).
 # No session is opened when the client is not beside the stub (Test 4, Test 10
 # and Test 12, which copy only the stub), when the stub was given no
 # `--mcp-config`, or in a mode that has not reported in (`silent`, a dialog not
@@ -340,7 +336,7 @@ MODE_UNRECOGNISED=unrecognised-dialog
 MODE_FOLDER_TRUST=folder-trust
 # A harness addition, confirm at the reconcile pass.
 MODE_TRANSCRIPT_ON_FIRST_MESSAGE=transcript-on-first-message
-MODE_PAUSE_LINGER=pause-linger
+MODE_LINGER_ON_EXIT=linger-on-exit
 
 STUB_DIR="${BASH_SOURCE[0]%/*}"
 [[ "${STUB_DIR}" == "${BASH_SOURCE[0]}" ]] && STUB_DIR=.
@@ -355,7 +351,7 @@ fi
 case "${MODE}" in
     "${MODE_DEV_CHANNELS}" | "${MODE_AT_ONCE}" | "${MODE_SILENT}" | "${MODE_UNRECOGNISED}" | "${MODE_FOLDER_TRUST}") ;;
     "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}") ;;
-    "${MODE_PAUSE_LINGER}") ;;
+    "${MODE_LINGER_ON_EXIT}") ;;
     *)
         printf 'stub-claude: unknown mode %q selected for %s; running %s\n' \
             "${MODE}" "${REALCWD}" "${MODE_DEV_CHANNELS}" >&2
@@ -795,71 +791,49 @@ case "${MODE}" in
         ;;
     "${MODE_SILENT}")
         ;;
-    "${MODE_PAUSE_LINGER}")
+    "${MODE_LINGER_ON_EXIT}")
         report_in
         ;;
 esac
 
 # ---------------------------------------------------------------------------
-# The pause linger (see THE PAUSE LINGER)
+# Lingering (`linger-on-exit`; see LINGERING)
 # ---------------------------------------------------------------------------
 
-# The line agent-director's `pause` types, the release file beside the stub,
-# and how often a lingering stub reads that file, in seconds.
+# The line agent-director's `pause` types.
 PAUSE_EXIT_LINE=/exit
-STUB_RELEASES_FILE="${STUB_DIR}/stub-claude-releases"
-LINGER_POLL_S=0.25
-LINGERING=0
-# The release file's line count when the linger began.
-RELEASE_BASE=0
+LINGER_MARKER="${STUB_DIR}/stub-claude-lingering.$$"
+RELEASED=0
 
-# Set N_LINES to the release file's line count (0 when there is none).
-release_lines() {
-    local l
-    N_LINES=0
-    [[ -f "${STUB_RELEASES_FILE}" ]] || return 0
-    while IFS= read -r l || [[ -n "${l}" ]]; do
-        N_LINES=$(( N_LINES + 1 ))
-    done < "${STUB_RELEASES_FILE}"
-}
-
-# True when a release line added after the linger began names this directory.
-released() {
-    local n=0 rel_time rel_dir
-    [[ -f "${STUB_RELEASES_FILE}" ]] || return 1
-    while IFS=$'\t' read -r rel_time rel_dir || [[ -n "${rel_time}" ]]; do
-        n=$(( n + 1 ))
-        (( n > RELEASE_BASE )) && [[ "${rel_dir}" == "${REALCWD}" ]] && return 0
-    done < "${STUB_RELEASES_FILE}"
-    return 1
-}
-
-# The `/exit` line in `pause-linger`: count the release file's lines, fire
-# SessionEnd, stop the re-fire, end the MCP session, then linger.
-begin_linger() {
-    release_lines
-    RELEASE_BASE="${N_LINES}"
+# Mark the stub lingering, end the session, then wait for the release or the
+# end of stdin, and exit 0. Never returns.
+linger_after_exit() {
+    local rc
+    trap 'RELEASED=1' USR1
+    trap 'close_mcp_session; rm -f "${HOOK_FILE}" "${STATUS_OUT}" "${STATUS_OUT}.err" "${LINGER_MARKER}"' EXIT
+    { printf '%s\n' "${REALCWD}" > "${LINGER_MARKER}.tmp" && mv -f -- "${LINGER_MARKER}.tmp" "${LINGER_MARKER}"; } 2> /dev/null \
+        || printf 'stub-claude[%s]: could not write %s\n' "$$" "${LINGER_MARKER}" >&2
     fire_session_end
     stop_refire
     close_mcp_session
-    LINGERING=1
+    while (( ! RELEASED )); do
+        IFS= read -r -t 1 _
+        rc=$?
+        # A line or a timeout (or the release) goes round again; stdin closed ends it.
+        (( rc == 0 || rc > 128 )) || break
+    done
+    exit 0
 }
 
 # handle_line <line>: one line from stdin.
 handle_line() {
     local line="$1"
-    if (( LINGERING )); then
-        [[ "${line}" == "${SENTINEL}" ]] && exit 0
-        return 0
-    fi
-    if [[ "${MODE}" == "${MODE_PAUSE_LINGER}" ]] && (( REPORTED )) \
-        && [[ "${line##*$'\x15'}" == "${PAUSE_EXIT_LINE}" ]]; then
-        begin_linger
-        return 0
-    fi
     if [[ "${line}" == "${SENTINEL}" ]]; then
         [[ "${MODE}" == "${MODE_SILENT}" ]] || fire_session_end
         exit 0
+    fi
+    if [[ "${MODE}" == "${MODE_LINGER_ON_EXIT}" && "${line}" == "${PAUSE_EXIT_LINE}" ]] && (( REPORTED )); then
+        linger_after_exit
     fi
     # transcript-on-first-message: the first message after reporting in
     # writes the transcript; a slash command (a line starting with `/`, such
@@ -886,15 +860,7 @@ handle_line() {
 partial=""
 while :; do
     line=""
-    if (( LINGERING )); then
-        released && exit 0
-        IFS= read -r -t "${LINGER_POLL_S}" line
-        rc=$?
-        if (( rc > 128 )); then
-            partial+="${line}"
-            continue
-        fi
-    elif (( DIALOG_DUE_MS > 0 )); then
+    if (( DIALOG_DUE_MS > 0 )); then
         now_ms
         wait_ms=$(( DIALOG_DUE_MS - NOW_MS ))
         if (( wait_ms <= 0 )); then

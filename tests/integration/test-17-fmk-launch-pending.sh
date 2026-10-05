@@ -47,8 +47,8 @@
 # - the stub as `claude`, in `dev-channels` (no selection) in every persona's
 #   working directory but scenario 13's, with the dialog delay
 #   (`stub_dialog_delay`) where a leg sets it; scenario 13's working
-#   directory is selected for `pause-linger` (`stub_mode`; the stub's header,
-#   THE PAUSE LINGER, a harness addition);
+#   directory is selected for `linger-on-exit` (`stub_mode`; the stub's
+#   header, LINGERING);
 # - the live server against the Slack stub (fixtures/slack-stub-server.ts
 #   with `--record`; posts are read from that record), one stub per leg,
 #   each answering ok only for that leg's personas' token pairs;
@@ -300,10 +300,10 @@
 #
 # Scenario 13's leg (`leg_still_stopping`), in run order, in state dir
 # `paused`, one persona S (working directory `paused`, selected for the
-# stub's `pause-linger`: the stub reports in at once, and answers the `/exit`
+# stub's `linger-on-exit`: the stub reports in at once, and answers the `/exit`
 # that agent-director's `pause` types by firing SessionEnd, ending its MCP
 # session and lingering, its process and tmux session still running, until
-# `stub_release`), with health ticks on (ruling S3): `health_check_interval`
+# `stub_release`, by its tmux session), with health ticks on (ruling S3): `health_check_interval`
 # ST_TICK_S and `session_restart_delay` ST_RESTART_DELAY_S, through the
 # config.
 #   1. The live start brings S up: the row reads `waiting` with a
@@ -324,7 +324,8 @@
 #      agent-director refuses the resume: the row ended less than the
 #      stopping window ago and its agent still runs.
 #   5. [harness] Once server.log holds that refusal, `stub_release` releases
-#      the worker at once; its tmux session is gone within
+#      the worker at once (it waits for the stub's process to end); its tmux
+#      session is gone within
 #      ST_SESSION_END_WAIT_S.
 #   6. The row reads `waiting` again with the same claude_session_id, and
 #      the server registers the resumed stub's session as S's.
@@ -651,7 +652,7 @@ SESSION_CREATE_ERR=ErrTmuxSessionCreate
 DISPATCHER_BUG='dispatcher bug'
 
 # Scenario 13's persona S (working directory `paused`, selected for the
-# stub's pause linger). No persona's name, key or row id is a prefix of
+# stub's linger-on-exit). No persona's name, key or row id is a prefix of
 # another's.
 S_NAME="${SCENARIO_TAG}_stopping"
 S_KEY="$(persona_key "${S_NAME}")"
@@ -2140,7 +2141,7 @@ leg_still_stopping() {
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${S_SUFFIX}")" "$(fake_token app "${S_SUFFIX}")" \
         | write_file "${creds}/s.json" 600
     work="$(make_workdir paused)"
-    stub_mode "${work}" "${STUB_MODE_PAUSE_LINGER}"
+    stub_mode "${work}" "${STUB_MODE_LINGER_ON_EXIT}"
     persona_json "${S_NAME}" "${creds}/s.json" "${work}" "${S_CHANNEL}" \
         | jq -s --argjson port "${SCENARIO_PORT}" --argjson tick "${ST_TICK_S}" --argjson delay "${ST_RESTART_DELAY_S}" \
             '{personas: ., bind: "127.0.0.1", port: $port, health_check_interval: $tick, session_restart_delay: $delay, exit_timeout: 5}' \
@@ -2195,7 +2196,7 @@ leg_still_stopping() {
     refusal_at="$(log_hits 0 "[slack] spawnForPersona: resume refused for ${S_REF}: " "${STILL_STOPPING}" | head -n 1 | cut -f2)"
 
     # Step 5 [harness]: release the lingering worker, at once.
-    stub_release "${work}"
+    stub_release "${session}"
     release_at="$(now_s)"
     wait_until "${ST_SESSION_END_WAIT_S}" "${step}: the worker's tmux session ${session} still runs ${ST_SESSION_END_WAIT_S}s after its release" \
         st_session_gone "${session}"

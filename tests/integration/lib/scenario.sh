@@ -32,6 +32,9 @@
 # What sourcing does, in both modes:
 # - refuses outside a cscb-ci image (above);
 # - sets TEST_NAME from the script's file name when the script did not;
+# - exports CSCB_PKG_DIR, the installed package under test
+#   (`$SCENARIO_REPO/node_modules/claude-slack-channel-bots`), which the value
+#   printer and the drivers read;
 # - makes the scenario's scratch root (SCENARIO_ROOT, `mktemp -d` under /tmp,
 #   exported, so every process the scenario starts carries it in its
 #   environment) and a first state dir under it, exported as SLACK_STATE_DIR,
@@ -64,7 +67,7 @@
 #   fixtures/stub-claude.sh, with a copy of its MCP session client
 #   fixtures/stub-mcp-session.ts beside it (see "Stub workers"), and in which
 #   the stub's mode selections (`stub_mode`), dialog delay settings
-#   (`stub_dialog_delay`) and pause linger releases (`stub_release`) are
+#   (`stub_dialog_delay`) and a lingering stub's marker (`stub_release`) are
 #   kept, followed by the
 #   container's PATH without every
 #   directory that holds an `agent-director` (the image's default binary's
@@ -80,7 +83,8 @@
 #   binary (`install_ad_010`), with no release install, no agent-director-admin
 #   and no store yet (SCENARIO_AD_START is `release` or `0.10.0`; a
 #   shared-mode script that sets it fails);
-# - writes no agent-director config.toml: agent-director's default settings;
+# - writes no agent-director config.toml: agent-director's default settings
+#   (a scenario that needs others writes them with `write_ad_settings`);
 # - once SCENARIO_PORT is picked, writes the MCP config the stub's session
 #   reads, $HOME/.claude/slack-mcp.json naming that port (`write_mcp_config`),
 #   which is the `mcp_config_path` a persona config defaults to;
@@ -268,6 +272,24 @@
 #   restore_ad_install [<step>]        move both back, the binary first, then `check_ad_shim`; when
 #                                      the shim cannot move, the binary goes aside again before the
 #                                      step fails
+#   install_ad_stand_in <version|unparseable> <reject|pass> [<step>]
+#                                      harness addition (scenarios 8 and 23, test-20): put
+#                                      fixtures/ad-version-stand-in.sh behind the shim, through
+#                                      `swap_ad_binary`, after writing its settings beside it
+#                                      (<path>.real.settings): `version` reports <version> (or, for
+#                                      `unparseable`, a line no client parses), `reject` turns every
+#                                      reuse flag into a flag the release does not define, and every
+#                                      call goes to the image's release binary (SCENARIO_RELEASE_BIN);
+#                                      then the shim check and a check that the stand-in is behind it.
+#                                      The fixture's header states the settings format
+#   restore_ad_install_with_stand_in <version|unparseable> <reject|pass> [<step>]
+#                                      harness addition (scenario 8, test-20): after
+#                                      `hide_ad_install`, put the shim back with the stand-in, set as
+#                                      `install_ad_stand_in` sets it, behind it in place of the hidden
+#                                      binary: settings, then the stand-in at <path>.real, then the
+#                                      shim; the hidden binary is removed. When the shim cannot move,
+#                                      the stand-in is removed again (the install stays hidden) before
+#                                      the step fails; then both checks
 #   check_ad_shim [<step>]             fail unless the standard path holds a regular file, not a
 #                                      symlink, executable and carrying the shim's marker, with an
 #                                      executable binary beside it that is not the shim
@@ -333,7 +355,9 @@
 #                                      <key> that is not a TOML bare key of lowercase letters, digits
 #                                      and `_`, a key given twice, an empty <value> or one holding a
 #                                      control character, and refuses a settings directory that
-#                                      resolves outside SCENARIO_ROOT or a settings path that is not a
+#                                      resolves outside SCENARIO_ROOT (checked, when the directory
+#                                      exists, before the file is removed or the directory created,
+#                                      and again once it is created) or a settings path that is not a
 #                                      regular file. Reads the file back and fails unless it holds
 #                                      exactly what was written; sets AD_SETTINGS_FILE to its path.
 #                                      `_scenario_ad_tmux_setting`, the stub's re-fire and
@@ -350,15 +374,6 @@
 #   STUB_MODE_FOLDER_TRUST             the five modes' names (`dev-channels`, the default of a
 #                                      directory with no selection; `at-once`; `silent`;
 #                                      `unrecognised-dialog`; `folder-trust`)
-#   STUB_MODE_PAUSE_LINGER             `pause-linger`, a harness addition (b.jg5 SRJ-1306, SRJ-1415)
-#                                      to confirm at the reconcile pass, for HO §7 scenarios 13 and
-#                                      24: the stub reports in at once and answers the `/exit` line
-#                                      agent-director's `pause` types by firing SessionEnd (so the
-#                                      row reads `ended`), ending its MCP session and lingering, its
-#                                      process and tmux session still running, until `stub_release`
-#                                      (the stub's header, THE PAUSE LINGER). Selected with
-#                                      `stub_mode`; a directory with no selection keeps the stub's
-#                                      handling of `/exit` (ignored)
 #   stub_mode <dir> <mode>            select <mode> for every stub worker whose working directory is
 #                                      <dir>: one `<mode> TAB <real path of dir>` line added to
 #                                      $SCENARIO_BIN/stub-claude-modes (by an atomic rewrite), which
@@ -379,16 +394,6 @@
 #                                      in `dev-channels`; fails for a <seconds> that is not a whole
 #                                      number, or a <dir> that is not a directory under SCENARIO_ROOT
 #                                      (as written and by real path)
-#   stub_release <dir>                 a harness addition (b.jg5 SRJ-1306, SRJ-1415) to confirm at the
-#                                      reconcile pass, for HO §7 scenarios 13 and 24: release every
-#                                      stub worker lingering in `pause-linger` whose working directory
-#                                      is <dir>: one `<time> TAB <real path of dir>` line added to
-#                                      $SCENARIO_BIN/stub-claude-releases (by an atomic rewrite); a
-#                                      lingering stub reads that file every 0.25 s and exits at the
-#                                      first line added after it began to linger, so a release acts
-#                                      only on a stub lingering when it is made. It does not wait for
-#                                      the stub to exit; fails for a <dir> that is not a directory
-#                                      under SCENARIO_ROOT (as written and by real path)
 #   stub_press_enter <target>         a human answering a stub held at a startup dialog: send Enter
 #                                      into the tmux pane <target> (a pane id such as %3, or
 #                                      session[:window[.pane]], the session name matched exactly, never
@@ -398,6 +403,22 @@
 #                                      such pane, say), and refuses when TMUX_TMPDIR is not the
 #                                      scenario's or TMUX is set; it does not read the pane to check
 #                                      the effect
+#   STUB_MODE_LINGER_ON_EXIT           harness addition (scenario 24, test-26, and scenario 13):
+#                                      the mode `linger-on-exit`, selected with `stub_mode` like the
+#                                      others: the stub reports in at once and, on the `/exit` line
+#                                      agent-director's `pause` types, fires SessionEnd (the row reads
+#                                      `ended`) and keeps running, its session with it, until
+#                                      `stub_release`
+#   stub_release <target> [<timeout-s>]
+#                                      harness addition (scenario 24, test-26, and scenario 13):
+#                                      release the lingering stub in the tmux pane <target> (named as
+#                                      for `stub_press_enter`, on the scenario's own tmux server, read
+#                                      with the real tmux from the scenario's own shell): SIGUSR1 to
+#                                      the pane's process, then fail unless it is gone within
+#                                      <timeout-s> (default SCENARIO_STUB_RELEASE_S, 10). Refuses when
+#                                      TMUX_TMPDIR is not the scenario's or TMUX is set, and, before
+#                                      any signal, unless that process is a stub lingering in
+#                                      `linger-on-exit` (its marker `$SCENARIO_BIN/stub-claude-lingering.<pid>`)
 #   STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE
 #                                      (a harness addition, confirm at the reconcile pass) the mode
 #                                      `transcript-on-first-message`, a known mode of `stub_mode`:
@@ -743,6 +764,14 @@
 #                                      calls, the stub's lines and its stop line never count
 #   cscb_ad_count <verb> [<fragment>...]
 #                                      print how many lines `cscb_ad_calls` would print
+#   wait_for_cscb_ad_call <count-before> <timeout-s> <step> <verb> [<fragment>...]
+#                                      harness addition (scenarios 8 and 23, test-20, and
+#                                      scenario 24, test-26): wait until
+#                                      `cscb_ad_count <verb> [<fragment>...]` is above <count-before>
+#                                      (taken by the caller before the step it waits on), then print
+#                                      the next such line: `cscb_ad_calls`' line <count-before> + 1.
+#                                      Fails naming <step> when the count is not above it within
+#                                      <timeout-s>
 #
 #   Scenario 10's harness additions (fmk mode; b.jg5 SRJ-1412, SRJ-1306, SRJ-1401). Each is a
 #   harness addition, confirm at the reconcile pass; each runs `require_ci_image` first, and
@@ -934,6 +963,13 @@
 #   destructive_match     `DESTRUCTIVE: persona <ref>`, then ` <setting> changed` (src/reload-plan.ts
 #                         destructiveLine; matches the pending-file line and its reload-preview log line)
 #
+# Whole values: a scenario that compares a value src/ exports in full (a
+# notice text, class label, version or settings value) takes it from
+# fixtures/fmk-texts.ts, the one value printer, run in the scenario's own
+# shell: `V="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" <entry> [<arg>...])"
+# || fail …`. A value no entry prints yet gets a named entry there, never a
+# second printer (see the printer's header).
+#
 # `start` runs with SLACK_BOT_TOKEN, SLACK_APP_TOKEN and CSCB_PERSONA unset,
 # and with SLACK_DRY_RUN=1 unless `--live` is passed (then SLACK_DRY_RUN is
 # unset). Any other variable the scenario exports reaches the daemon.
@@ -1020,6 +1056,10 @@ fi
 SCENARIO_REPO="${SCENARIO_REPO:-/test-repo}"
 SCENARIO_CLI="${SCENARIO_CLI:-${SCENARIO_REPO}/node_modules/.bin/claude-slack-channel-bots}"
 
+# The installed package under test, as the value printer (fixtures/fmk-texts.ts)
+# and the drivers (fixtures/driver.ts, fixtures/fmk-driver.ts) read it.
+export CSCB_PKG_DIR="${SCENARIO_REPO}/node_modules/claude-slack-channel-bots"
+
 # Poll interval of every wait, in seconds.
 SCENARIO_POLL_S="0.2"
 
@@ -1054,6 +1094,11 @@ SCENARIO_AD_010_BIN=/opt/agent-director-0.10.0/bin/agent-director
 SCENARIO_AD_SHIM_SRC="${SCENARIO_FIXTURES}/agent-director-shim.sh"
 SCENARIO_AD_SHIM_MARKER='# CSCB_CI_AGENT_DIRECTOR_SHIM_MARKER'
 
+# The agent-director version stand-in (harness addition, scenarios 8 and 23)
+# and the whole line that marks it.
+SCENARIO_AD_STAND_IN_SRC="${SCENARIO_FIXTURES}/ad-version-stand-in.sh"
+SCENARIO_AD_STAND_IN_MARKER='# CSCB_CI_AD_VERSION_STAND_IN_MARKER'
+
 # Bound on each tmux kill-server the trap sends, and on the scenario's tmux
 # processes exiting after it, in seconds.
 SCENARIO_TMUX_STOP_S=10
@@ -1084,11 +1129,15 @@ SCENARIO_STUB_MCP_SRC="${SCENARIO_FIXTURES}/stub-mcp-session.ts"
 SCENARIO_STUB_MODES_NAME=stub-claude-modes
 # The file of the stub's dialog delay settings beside it (`stub_dialog_delay`).
 SCENARIO_STUB_DELAYS_NAME=stub-claude-dialog-delays
-# The pause linger's mode (a harness addition; fixtures/stub-claude.sh, THE
-# PAUSE LINGER), and the file of its releases beside the stub (`stub_release`).
-STUB_MODE_PAUSE_LINGER=pause-linger
-SCENARIO_STUB_MODES+=("${STUB_MODE_PAUSE_LINGER}")
-SCENARIO_STUB_RELEASES_NAME=stub-claude-releases
+
+# Harness addition (scenario 24, and scenario 13): the stub mode that answers
+# `pause`'s `/exit` with SessionEnd and lingers until `stub_release`, the
+# marker a lingering stub writes beside itself (this prefix, then its PID),
+# and the default bound on a released stub exiting, in seconds.
+STUB_MODE_LINGER_ON_EXIT=linger-on-exit
+SCENARIO_STUB_MODES+=("${STUB_MODE_LINGER_ON_EXIT}")
+SCENARIO_STUB_LINGER_PREFIX=stub-claude-lingering.
+SCENARIO_STUB_RELEASE_S=10
 
 # The MCP server name the package's install writes into slack-mcp.json
 # (src/config.ts MCP_SERVER_NAME).
@@ -2377,6 +2426,87 @@ restore_ad_install() {
     check_ad_shim "${step}"
 }
 
+# _scenario_stand_in_settings <step> <version|unparseable> <reject|pass>:
+# write the stand-in's settings file beside the binary behind the shim
+# ($HOME/.agent-director/bin/agent-director.real.settings), atomically, in
+# fixtures/ad-version-stand-in.sh's format, its release_bin the image's
+# release binary. The caller has run both guards. Refuses a bin directory
+# that is not under SCENARIO_ROOT or resolves outside it.
+_scenario_stand_in_settings() {
+    local step="$1" version="$2" reuse="$3" bin="${HOME}/.agent-director/bin" real_root real_bin
+    [[ -n "${version}" && "${version}" != *[[:cntrl:]]* ]] \
+        || fail "${step}: version '${version}' is empty or holds a control character"
+    [[ "${reuse}" == reject || "${reuse}" == pass ]] || fail "${step}: '${reuse}' is neither reject nor pass"
+    [[ -f "${SCENARIO_RELEASE_BIN}" && -x "${SCENARIO_RELEASE_BIN}" ]] \
+        || fail "${step}: the release's binary is missing from the image (${SCENARIO_RELEASE_BIN})"
+    [[ -d "${bin}" && "${bin}" == "${SCENARIO_ROOT}"/* ]] || fail "${step}: refused: ${bin} is not a directory under SCENARIO_ROOT"
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
+    real_bin="$(realpath -e -- "${bin}" 2> /dev/null)" || fail "${step}: cannot resolve ${bin}"
+    [[ "${real_bin}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: ${bin} resolves to ${real_bin}, which is not under SCENARIO_ROOT ${real_root}"
+    if [[ "${version}" == unparseable ]]; then
+        printf '%s\n' '# ad-version-stand-in settings (scenario.sh)' report=unparseable \
+            "reuse_finished=${reuse}" "release_bin=${SCENARIO_RELEASE_BIN}"
+    else
+        printf '%s\n' '# ad-version-stand-in settings (scenario.sh)' report=version "version=${version}" \
+            "reuse_finished=${reuse}" "release_bin=${SCENARIO_RELEASE_BIN}"
+    fi | write_file "${bin}/agent-director.real.settings" 0644
+}
+
+# _scenario_check_stand_in <step>: fail unless the binary behind the shim
+# at the standard path carries the stand-in's marker and its settings file
+# is beside it.
+_scenario_check_stand_in() {
+    local real="${HOME}/.agent-director/bin/agent-director.real"
+    grep -qxF -- "${SCENARIO_AD_STAND_IN_MARKER}" "${real}" 2> /dev/null \
+        || fail "$1: the binary behind the shim at ${real} is not the version stand-in"
+    [[ -f "${real}.settings" ]] || fail "$1: no stand-in settings at ${real}.settings"
+}
+
+install_ad_stand_in() {
+    local version="${1:-}" reuse="${2:-}"
+    local step="${3:-install the agent-director version stand-in (${1:-} ${2:-}) behind the shim}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ -f "${SCENARIO_AD_STAND_IN_SRC}" ]] && grep -qxF -- "${SCENARIO_AD_STAND_IN_MARKER}" "${SCENARIO_AD_STAND_IN_SRC}" \
+        || fail "${step}: the stand-in ${SCENARIO_AD_STAND_IN_SRC} is missing or carries no marker"
+    check_ad_shim "${step}: the shim before the stand-in"
+    # The settings first: the stand-in reads them at each call.
+    _scenario_stand_in_settings "${step}" "${version}" "${reuse}"
+    swap_ad_binary "${SCENARIO_AD_STAND_IN_SRC}" "${step}"
+    _scenario_check_stand_in "${step}"
+}
+
+restore_ad_install_with_stand_in() {
+    local version="${1:-}" reuse="${2:-}"
+    local step="${3:-restore the agent-director shim with the version stand-in (${1:-} ${2:-}) behind it}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    local path="${HOME}/.agent-director/bin/agent-director"
+    local aside="${SCENARIO_ROOT}/ad-aside"
+    [[ -f "${SCENARIO_AD_STAND_IN_SRC}" ]] && grep -qxF -- "${SCENARIO_AD_STAND_IN_MARKER}" "${SCENARIO_AD_STAND_IN_SRC}" \
+        || fail "${step}: the stand-in ${SCENARIO_AD_STAND_IN_SRC} is missing or carries no marker"
+    [[ -f "${aside}/agent-director" && -f "${aside}/agent-director.real" ]] \
+        || fail "${step}: nothing hidden in ${aside}"
+    [[ ! -e "${path}" && ! -L "${path}" ]] || fail "${step}: a file is already at ${path}"
+    [[ ! -e "${path}.real" && ! -L "${path}.real" ]] || fail "${step}: a file is already at ${path}.real"
+    _scenario_is_shim "${aside}/agent-director" || fail "${step}: ${aside}/agent-director is not the shim"
+    _scenario_stand_in_settings "${step}" "${version}" "${reuse}"
+    # The stand-in first, so the shim never runs without a binary behind it.
+    _scenario_place "${SCENARIO_AD_STAND_IN_SRC}" "${path}.real" "${step}"
+    if ! mv -- "${aside}/agent-director" "${path}"; then
+        # Take the stand-in away again, so a failed restore leaves the install hidden.
+        rm -f -- "${path}.real" \
+            || fail "${step}: could not restore ${path}, nor remove the stand-in at ${path}.real: the install is half restored"
+        fail "${step}: could not restore ${path} (the install is still hidden in ${aside})"
+    fi
+    # The binary that was hidden with the shim is not put back.
+    rm -f -- "${aside}/agent-director.real" || fail "${step}: could not remove the hidden binary ${aside}/agent-director.real"
+    rmdir -- "${aside}" || fail "${step}: could not remove ${aside}"
+    check_ad_shim "${step}"
+    _scenario_check_stand_in "${step}"
+}
+
 ad() {
     require_ci_image "ad $*"
     require_scenario_home "ad $*"
@@ -2575,33 +2705,6 @@ stub_dialog_delay() {
     mv -f -- "${tmp}" "${file}" || fail "${step}: could not rename into ${file}"
 }
 
-stub_release() {
-    local dir="${1:-}" step real_root real_dir file tmp
-    step="stub_release ${dir}"
-    require_ci_image "${step}"
-    require_scenario_home "${step}"
-    [[ "${SCENARIO_FMK}" == 1 ]] || fail "${step}: the stub's pause linger is for fmk scripts only"
-    [[ "${dir}" == "${SCENARIO_ROOT}"/* ]] \
-        || fail "${step}: refused: ${dir} is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
-    [[ -d "${dir}" ]] || fail "${step}: ${dir} is not a directory"
-    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" \
-        || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
-    real_dir="$(realpath -e -- "${dir}" 2> /dev/null)" || fail "${step}: cannot resolve ${dir}"
-    [[ "${real_dir}" == "${real_root}"/* ]] \
-        || fail "${step}: refused: ${dir} resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
-    [[ "${real_dir}" != *[$'\t\n']* ]] || fail "${step}: ${real_dir} holds a TAB or a newline"
-    file="${SCENARIO_BIN}/${SCENARIO_STUB_RELEASES_NAME}"
-    tmp="$(mktemp "${SCENARIO_BIN}/.scenario-stub-releases.XXXXXX")" \
-        || fail "${step}: could not create a temp file beside ${file}"
-    {
-        if [[ -f "${file}" ]]; then
-            cat -- "${file}"
-        fi
-        printf '%s\t%s\n' "${EPOCHREALTIME/,/.}" "${real_dir}"
-    } > "${tmp}" || fail "${step}: could not write ${tmp}"
-    # One rename, so a lingering stub never reads a half-written file.
-    mv -f -- "${tmp}" "${file}" || fail "${step}: could not rename into ${file}"
-}
 
 stub_press_enter() {
     local target="${1:-}" step err exact rc=0
@@ -2623,6 +2726,35 @@ stub_press_enter() {
     err="${SCENARIO_ROOT}/stub-press-enter.err"
     "${SCENARIO_REAL_TMUX}" send-keys -t "${exact}" Enter 2> "${err}" || rc=$?
     (( rc == 0 )) || fail "${step}: tmux send-keys exited ${rc}: $(tr '\n' ' ' < "${err}")"
+}
+
+# Harness addition (scenario 24, test-26, and scenario 13): release a stub
+# lingering in `linger-on-exit` (fixtures/stub-claude.sh, LINGERING).
+stub_release() {
+    local target="${1:-}" timeout_s="${2:-${SCENARIO_STUB_RELEASE_S}}" step exact err pid marker rc=0
+    step="stub_release ${target}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    [[ -n "${target}" ]] || fail "${step}: no pane named"
+    _scenario_check_timeout "${timeout_s}" "${step}"
+    # Named as for stub_press_enter: a pane id exactly, a session name exactly.
+    case "${target}" in
+        %*) exact="${target}" ;;
+        *:*) exact="=${target}" ;;
+        *) exact="=${target}:" ;;
+    esac
+    err="${SCENARIO_ROOT}/stub-release.err"
+    pid="$("${SCENARIO_REAL_TMUX}" display-message -p -t "${exact}" '#{pane_pid}' 2> "${err}")" || rc=$?
+    (( rc == 0 )) || fail "${step}: tmux display-message exited ${rc}: $(tr '\n' ' ' < "${err}")"
+    [[ "${pid}" =~ ^[1-9][0-9]*$ ]] \
+        || fail "${step}: no pane ${target} on the scenario's tmux server (tmux gave pane pid '${pid}')"
+    marker="${SCENARIO_BIN}/${SCENARIO_STUB_LINGER_PREFIX}${pid}"
+    pid_alive "${pid}" && [[ -f "${marker}" ]] \
+        || fail "${step}: refused: the process of pane ${target} (pid ${pid}) is not a stub lingering in ${STUB_MODE_LINGER_ON_EXIT} (no ${marker})"
+    kill -USR1 "${pid}" 2> "${err}" || fail "${step}: could not signal pid ${pid}: $(tr '\n' ' ' < "${err}")"
+    _scenario_poll_until "${timeout_s}" _scenario_pid_gone "${pid}" \
+        || fail "${step}: the released stub (pid ${pid}) still runs ${timeout_s}s after its release"
 }
 
 # A harness addition, confirm at the reconcile pass.
@@ -3341,6 +3473,14 @@ write_ad_settings() {
     if [[ -e "${path}" || -L "${path}" ]]; then
         [[ -f "${path}" && ! -L "${path}" ]] || fail "${step}: refused: ${path} is not a regular file"
     fi
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
+    # The file's directory, when it exists, resolves under SCENARIO_ROOT before
+    # anything is removed or created in it.
+    if [[ -e "${dir}" || -L "${dir}" ]]; then
+        real_dir="$(realpath -e -- "${dir}" 2> /dev/null)" || fail "${step}: cannot resolve ${dir}"
+        [[ "${real_dir}" == "${real_root}"/* ]] \
+            || fail "${step}: refused: ${dir} resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
+    fi
     AD_SETTINGS_FILE="${path}"
     if (( ${#pairs[@]} == 0 && ! have_pause )); then
         # No table: no file, so agent-director's defaults.
@@ -3349,7 +3489,6 @@ write_ad_settings() {
         return 0
     fi
     mkdir -p -- "${dir}" || fail "${step}: could not create ${dir}"
-    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
     real_dir="$(realpath -e -- "${dir}" 2> /dev/null)" || fail "${step}: cannot resolve ${dir}"
     [[ "${real_dir}" == "${real_root}"/* ]] \
         || fail "${step}: refused: ${dir} resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
@@ -3368,6 +3507,7 @@ write_ad_settings() {
     write_file "${path}" 0644 < <(printf '%s' "${content}")
     [[ "$(cat -- "${path}" && printf x)" == "${content}x" ]] || fail "${step}: ${path} does not hold what was written"
 }
+
 
 # ---------------------------------------------------------------------------
 # The human's filesystem steps (fmk mode; harness addition, confirm at the
@@ -4228,6 +4368,27 @@ cscb_ad_calls() {
 
 cscb_ad_count() {
     _scenario_cscb_ad_scan "cscb_ad_count" count "${1-}" "${@:2}"
+}
+
+# True when `cscb_ad_count <verb> [<fragment>...]` is above <count>.
+_scenario_cscb_ad_above() {
+    local count="$1" n
+    shift
+    n="$(cscb_ad_count "$@")" || return 1
+    (( n > count ))
+}
+
+wait_for_cscb_ad_call() {
+    local before="${1:-}" timeout_s="${2:-}" step="${3:-}" n
+    (( $# >= 4 )) || fail "wait_for_cscb_ad_call: takes <count-before> <timeout-s> <step> <verb> [<fragment>...]"
+    shift 3
+    [[ "${before}" =~ ^[0-9]+$ ]] || fail "${step}: count '${before}' is not a whole number"
+    _scenario_check_timeout "${timeout_s}" "${step}"
+    if ! _scenario_poll_until "${timeout_s}" _scenario_cscb_ad_above "${before}" "$@"; then
+        n="$(cscb_ad_count "$@")" || exit 1
+        fail "${step} (not within ${timeout_s}s; CSCB's calls matching '$*' stayed at ${n}, not above ${before})"
+    fi
+    cscb_ad_calls "$@" | sed -n "$(( before + 1 ))p"
 }
 
 # ---------------------------------------------------------------------------

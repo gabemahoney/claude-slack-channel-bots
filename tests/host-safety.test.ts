@@ -58,7 +58,10 @@
  *   blanked; the shebang, comments, blank lines, `set` options and literal
  *   assignments are not steps. Each rule is pinned with synthetic violations
  *   (each finding names its file and rule) and allowed sources, then run over
- *   the tree.
+ *   the tree. scenario.sh's settings writers resolve their directory with
+ *   `realpath -e` (the SCENARIO_ROOT containment check) before they write
+ *   there: `write_ad_settings` before its `rm` and its `mkdir`,
+ *   `_scenario_stand_in_settings` before its `write_file`.
  * - The harness's one agent-director delete (b.jg5 SRJ-1306), over every
  *   file under `tests/integration` (shell or TypeScript, shellcheck's and
  *   bun's config aside): in shell, any command whose first argument after
@@ -1685,6 +1688,8 @@ const IMAGE_GUARD_RULE = {
   sourceFirst: 'source-line-first',
   /** The HOME-under-SCENARIO_ROOT check comes before the helper's first step (sqlite3, copy, move, install, install.sh or agent-director run). */
   homeCheckFirst: 'home-check-before-step',
+  /** A settings writer resolves its directory under SCENARIO_ROOT (`realpath -e`) before it removes, creates or writes there. */
+  realpathCheckFirst: 'realpath-check-before-write',
   /** The image-guarded TypeScript fixtures statically import only `node:` built-ins. */
   driverStaticImport: 'driver-static-import',
 } as const
@@ -1710,6 +1715,8 @@ const HOME_CHECK_EXEMPT: ReadonlyMap<string, string> = new Map([
 ])
 
 
+
+
 /**
  * The scenario.sh functions with a step that run only from audited helpers
  * after their `require_scenario_home` (callerCheckFindings checks it: every
@@ -1722,6 +1729,7 @@ const HOME_CHECKED_BY_CALLERS: ReadonlyMap<string, string> = new Map([
   ['_scenario_require_010', 'the 0.10.0 seeders’ precondition (seed_010_row, seed_prepersona_fleet)'],
   ['_scenario_find_missing_loop', 'run_find_missing_loop’s background loop body'],
   ['_scenario_shim_over', 'the shim placement of install_ad_shim and install_ad_admin_shim'],
+  ['_scenario_stand_in_settings', 'the stand-in settings write of install_ad_stand_in and restore_ad_install_with_stand_in'],
 ])
 
 /** scenario.sh's guard that refuses unless HOME is under SCENARIO_ROOT. */
@@ -2268,6 +2276,43 @@ function callerCheckFindings(file: string, source: string, scripts: readonly { f
   return findings
 }
 
+/**
+ * scenario.sh's settings writers, each with the directory word its
+ * `realpath -e` check resolves and the commands that check must come before:
+ * `write_ad_settings` removes the settings file or creates its directory;
+ * `_scenario_stand_in_settings` writes the stand-in's settings.
+ */
+const REALPATH_CHECKED_WRITERS: readonly { helper: string; dir: string; steps: readonly string[] }[] = [
+  { helper: 'write_ad_settings', dir: '${dir}', steps: ['rm', 'mkdir'] },
+  { helper: '_scenario_stand_in_settings', dir: '${bin}', steps: ['write_file'] },
+]
+
+/**
+ * The containment-check findings of the settings writers in the shell file
+ * `file`: in each, a `realpath -e` of its directory word comes before the
+ * first of each of its steps. A writer, or a step, the audit cannot find is a
+ * finding too.
+ */
+function realpathCheckFindings(file: string, source: string): string[] {
+  const functions = shellFunctions(source)
+  const findings: string[] = []
+  const rule = IMAGE_GUARD_RULE.realpathCheckFirst
+  for (const { helper, dir, steps } of REALPATH_CHECKED_WRITERS) {
+    const body = functions.get(helper)
+    if (body === undefined) {
+      findings.push(`${file}:1: ${rule}: ${helper} is not defined`)
+      continue
+    }
+    const check = body.findIndex((c) => c.name === 'realpath' && c.args.includes('-e') && c.args.includes(dir))
+    for (const name of steps) {
+      const at = body.findIndex((c) => c.name === name)
+      if (at < 0) findings.push(`${file}:1: ${rule}: ${helper} has no \`${name}\` the audit can see`)
+      else if (check < 0 || check > at) findings.push(`${file}:${body[at].line}: ${rule}: ${helper}: \`${name}\` runs before the realpath -e check of ${dir}`)
+    }
+  }
+  return findings
+}
+
 /** Whether `statement` is the driver's marker check: `if (!existsSync('/etc/cscb-ci-image'))` (existsSync from `node:fs`) whose branch calls `process.exit` with a non-zero literal. */
 function isDriverMarkerCheck(statement: ts.Statement, sf: ts.SourceFile): boolean {
   if (!ts.isIfStatement(statement)) return false
@@ -2580,7 +2625,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       // The helpers the audit must find a step in (a parse that lost steps would shrink the set).
       expect(homeCheckedHelpers(source)).toEqual(expect.arrayContaining([
         'install_ad_shim', 'install_ad_admin_shim', 'install_ad_release', 'install_ad_010', 'reshim_ad', 'swap_ad_binary', 'hide_ad_install', 'restore_ad_install',
-        'ad', 'ad_capture', 'ad_admin', 'ad_admin_capture', '_scenario_store_read', 'ad_store_edit', 'ad_store_id', 'ad_store_backup', 'ad_store_pending_no_launch', 'stub_mode', 'stub_dialog_delay', 'stub_release', 'write_ad_settings',
+        'ad', 'ad_capture', 'ad_admin', 'ad_admin_capture', '_scenario_store_read', 'ad_store_edit', 'ad_store_id', 'ad_store_backup', 'ad_store_pending_no_launch', 'stub_mode', 'stub_dialog_delay', 'write_ad_settings', 'install_ad_stand_in', 'restore_ad_install_with_stand_in',
         'ad_new_token', 'ad_other_store_id', 'ad_owner_label', 'seed_leftover', 'seed_unlabelled', 'seed_env_only', 'seed_borrowed_name', 'seed_other_store',
         'relabel_session', 'ad_owner_global_set', 'rebind_tmux_socket', 'restore_tmux_socket', 'ad_store_mark_finished', 'ad_store_seed_pending', 'ad_store_unusable_name',
         'ad_kill_include_finished', 'ad_delete_unusable_row', 'run_find_missing_loop', 'seed_010_row', 'seed_prepersona_fleet', 'write_mcp_config',
@@ -2590,6 +2635,28 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
 
     test('the current tree: the helpers checked by their callers run only from audited helpers after their check, and no script runs them', () => {
       expect(callerCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), scenario(), scripts())).toEqual([])
+    })
+
+    test('the current tree: write_ad_settings and _scenario_stand_in_settings resolve their directory under SCENARIO_ROOT before they remove, create or write', () => {
+      expect(realpathCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'))).toEqual([])
+    })
+
+    test('write_ad_settings with its directory check only after the mkdir is flagged at its rm and its mkdir', () => {
+      const source = readFileSync(SCENARIO_PATH, 'utf-8')
+      const late = source.replace(/(\nwrite_ad_settings\(\) \{\n(?:.*\n)*?)    if \[\[ -e "\$\{dir\}" \|\| -L "\$\{dir\}" \]\]; then\n(?:.*\n)*?    fi\n/, '$1')
+      const findings = realpathCheckFindings('scenario.sh', late)
+
+      expect(late).not.toBe(source)
+      expectNamedFindings(findings, 'scenario.sh', RULE.realpathCheckFirst)
+      expect(findings.filter((f) => f.includes('write_ad_settings'))).toHaveLength(2)
+    })
+
+    test('_scenario_stand_in_settings without its realpath -e check is flagged at its write_file', () => {
+      const source = readFileSync(SCENARIO_PATH, 'utf-8')
+      const unchecked = source.replace(/(\n_scenario_stand_in_settings\(\) \{\n(?:.*\n)*?)    real_bin="\$\(realpath -e -- "\$\{bin\}"[^\n]*\n/, '$1')
+
+      expect(unchecked).not.toBe(source)
+      expectNamedFindings(realpathCheckFindings('scenario.sh', unchecked), 'scenario.sh', RULE.realpathCheckFirst)
     })
 
     test('the current tree: each exempt name is a scenario.sh function with a step, and no name is in both lists', () => {
@@ -2614,7 +2681,6 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       ['rebind_tmux_socket', 'its socket move', 'mv'],
       ['restore_tmux_socket', 'its socket move', 'mv'],
       ['stub_dialog_delay', 'its move', 'mv'],
-      ['stub_release', 'its move', 'mv'],
       ['install_ad_release', 'its install.sh run', '${SCENARIO_RELEASE_INSTALL_SH}'],
       ['ad_admin', 'its run of the HOME’s agent-director-admin', '${HOME}/.agent-director/admin/agent-director-admin'],
       ['ad', 'its run of the HOME’s agent-director', '${HOME}/.agent-director/bin/agent-director'],
