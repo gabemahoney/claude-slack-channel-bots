@@ -86,7 +86,9 @@
 #      CONFLICT_PANE_NOT_FOUND_PHRASE), no line for B, then its "nothing was
 #      stopped" line, last; A's precheck failure line in neither server.log
 #      nor startup-errors.log; the bot server's PID unchanged and running after
-#      each; no CLI-parented `pause` or `kill`; A's and B's rows unchanged (a
+#      each; at least one CLI-parented `read-pane` of A's id (the command's
+#      calls found) and no CLI-parented `pause` or `kill`; A's and B's rows
+#      unchanged (a
 #      harness `get` before and after). Then the harness ends A's session by
 #      its session id (`end_session`); a harness `read-pane` of A then
 #      answers GONE (ErrTmuxCaptureFailed), which the precheck passes.
@@ -127,7 +129,9 @@
 #      `stop --stop-bots`, the SRD names none): D configured with
 #      `unrecognised-dialog` and started (the start sweep kills F's and G's
 #      rows), D's row `pending` with a launch start. `stop --stop-bots` well
-#      before G (the pending grace period): its precheck passes on D's `pending` row (the release's
+#      before G (the pending grace period; the script fails, saying so,
+#      when G or more has passed since D's launch start before it runs the
+#      command): its precheck passes on D's `pending` row (the release's
 #      `read-pane` has no state guard, SRJ-901), D's CLI-parented `pause`
 #      answers ErrSpawnNotPausable (its escalation line in the CLI's output),
 #      the one CLI-parented `kill` that follows succeeds, the command exits 0,
@@ -764,7 +768,10 @@ t21_precheck_legs() {
         [[ "$(server_pid)" == "${pid}" ]] || fail "${step}: ${cmd}: server.pid reads '$(server_pid)', not the PID before the command, ${pid}"
         pid_alive "${pid}" || fail "${step}: ${cmd}: the bot server ${pid} is not running after the command"
 
-        # No CLI-parented pause or kill.
+        # No CLI-parented pause or kill; the positive control: the
+        # command's own precheck `read-pane` of A, so its calls are counted.
+        n="$(t21_run_count "${T21_RUN_PID}" "${MARK_TIME}" read-pane "${A_ID}")"
+        (( n >= 1 )) || fail "${step}: ${cmd}: no CLI-parented read-pane of ${A_ID} (run PID ${T21_RUN_PID}): the command's calls were not found"
         for t21_verb in pause kill; do
             n="$(t21_run_count "${T21_RUN_PID}" "${MARK_TIME}" "${t21_verb}")"
             [[ "${n}" == 0 ]] || fail "${step}: ${cmd}: ${n} CLI-parented ${t21_verb} call(s)"
@@ -956,8 +963,16 @@ t21_trail_after() {
         | select(.epoch >= $t)' "${trail}" || fail "could not read ${trail}'s $2 records for $3"
 }
 
+# t21_ms_since <iso-time> <step>: print the whole milliseconds from
+# <iso-time> to now.
+t21_ms_since() {
+    local then_ms
+    then_ms="$(date -u -d "$1" +%s%3N)" || fail "$2: could not read the time '$1'"
+    echo $(( $(date +%s%3N) - then_ms ))
+}
+
 t21_pending_leg() {
-    local step="pending persona" out ref n launch session mark tick tick_t launches fm_before
+    local step="pending persona" out ref n launch session mark tick tick_t launches fm_before age_ms
     stub_mode "${D_WORK}" "${STUB_MODE_UNRECOGNISED}"
     t21_config_for_next_start D
     t21_start_and_wait 1
@@ -966,7 +981,13 @@ t21_pending_leg() {
     echo "${TEST_NAME}: ${step}: ${D_ID} reads pending at its dialog, launch start ${launch}"
     t21_has_session "${D_SESSION}" || fail "${step}: no session ${D_SESSION} for D's pending launch"
 
-    # stop --stop-bots: D's pause answers ErrSpawnNotPausable, its kill succeeds.
+    # stop --stop-bots, before G (the pending grace period) has passed since
+    # D's launch start, so D's row still reads `pending`: D's pause answers
+    # ErrSpawnNotPausable, its kill succeeds.
+    age_ms="$(t21_ms_since "${launch}" "${step}")" || exit 1
+    (( age_ms < GRACE_MS )) \
+        || fail "${step}: ${age_ms} ms passed since ${D_ID}'s launch start before stop --stop-bots, not less than G (${GRACE_MS} ms): its row may no longer read pending"
+    echo "${TEST_NAME}: ${step}: stop --stop-bots ${age_ms} ms after ${D_ID}'s launch start (G ${GRACE_MS} ms)"
     t21_mark
     out="${SCENARIO_ROOT}/pending-stop.out"
     t21_cli "${out}" stop --stop-bots

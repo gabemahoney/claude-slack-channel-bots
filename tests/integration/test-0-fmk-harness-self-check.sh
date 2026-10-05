@@ -91,6 +91,8 @@
 #                    seeding, tmux-step, store-statement, operator-action,
 #                    find-missing-loop and 0.10.0-seeder helper fails with the
 #                    guard's reason, and the decoy is left exactly as it was.
+#                    So do `stub_type_line` and `repoint_symlink` (harness
+#                    additions, confirm at the reconcile pass).
 #   shim_check       `check_ad_shim` passes a correct layout and fails, with
 #                    its reason, on a symlink to the shim and on a copy of the
 #                    shim without its marker line.
@@ -223,6 +225,22 @@
 #                    row; `write_mcp_config` refuses a value that is not a
 #                    port, and the setup's MCP config names the server
 #                    `slack-channel-router` at the scenario's port over http.
+#                    `stub_type_line` (a harness addition, confirm at the
+#                    reconcile pass) refuses with TMUX set or another
+#                    TMUX_TMPDIR, an empty or blank line and a line holding a
+#                    control character.
+#   repoint_refusals `repoint_symlink` (a harness addition, confirm at the
+#                    reconcile pass) refuses by real path, saying why, and
+#                    leaves the link as it was: a link under SCENARIO_ROOT as
+#                    written whose directory resolves outside it (through a
+#                    symlinked directory to the guard_refusals leg's scratch
+#                    directory under /tmp), a target symlink under
+#                    SCENARIO_ROOT that resolves to /tmp, and a target that is
+#                    a file; then it re-points the same link to a directory
+#                    under SCENARIO_ROOT (the positive control). Its refusals
+#                    as written (a link or target outside SCENARIO_ROOT, a
+#                    link that is not a symlink, a missing target) are
+#                    test-14's setup check.
 #
 # The re-fire legs read SessionStart records in the scenario HOME's
 # ~/.agent-director/ad-trail.jsonl: `ad.hook.fired` (by instance id) and
@@ -1575,6 +1593,8 @@ leg_guard_refusals() {
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_pending_no_launch "${T0_ROW_ID}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_mode "${SCENARIO_ROOT}/work" "${STUB_MODE_AT_ONCE}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_press_enter "${T0_SESSION}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" stub_type_line "${T0_SESSION}" "a line"
+        expect_fails_in_home "${step}" "${home}" "${reason}" repoint_symlink "${SCENARIO_ROOT}/t0-guard-link" "${SCENARIO_ROOT}/work"
         expect_fails_in_home "${step}" "${home}" "${reason}" write_mcp_config "${SCENARIO_PORT}"
         # The labels, seeding, the human's tmux steps, the store statements,
         # the operator's actions, the find-missing loop and the 0.10.0
@@ -2192,6 +2212,14 @@ leg_stub_helpers() {
     expect_fails_in_home "${step}" "${HOME}" "refused: TMUX_TMPDIR '/tmp' is not the scenario's" \
         with_tmux_tmpdir /tmp stub_press_enter "${T0_SESSION}"
     press_enter_exact "${step}"
+    # stub_type_line's refusals (a harness addition, confirm at the
+    # reconcile pass), beside stub_press_enter's.
+    expect_fails_in_home "${step}" "${HOME}" "refused: TMUX is set" with_tmux_set stub_type_line "${T0_SESSION}" "a line"
+    expect_fails_in_home "${step}" "${HOME}" "refused: TMUX_TMPDIR '/tmp' is not the scenario's" \
+        with_tmux_tmpdir /tmp stub_type_line "${T0_SESSION}" "a line"
+    expect_fails_in_home "${step}" "${HOME}" "the line is empty or blank" stub_type_line "${T0_SESSION}" ""
+    expect_fails_in_home "${step}" "${HOME}" "the line is empty or blank" stub_type_line "${T0_SESSION}" "   "
+    expect_fails_in_home "${step}" "${HOME}" "the line holds a control character" stub_type_line "${T0_SESSION}" $'a\x1b[Aline'
 
     expect_fails_in_home "${step}" "${HOME}" "holds a character other than letters, digits and ._:@-" \
         ad_store_pending_no_launch "t0 bad'id"
@@ -2204,6 +2232,49 @@ leg_stub_helpers() {
         || fail "${step}: ${file} is not JSON"
     [[ "${got}" == "http http://127.0.0.1:${SCENARIO_PORT}/mcp" ]] \
         || fail "${step}: ${file} names '${got}', not the scenario's port ${SCENARIO_PORT}"
+}
+
+# repoint_symlink's refusals by real path (a harness addition, confirm at the
+# reconcile pass): each fails with its reason and leaves the link as it was;
+# then the same link is re-pointed, so the refusals are not the setup's.
+leg_repoint_refusals() {
+    local step="repoint refusals" one two outside_link via to_tmp file link
+    [[ -n "${OUTSIDE_HOME}" && -d "${OUTSIDE_HOME}" && -L "${SCENARIO_ROOT}/home-link-outside" ]] \
+        || fail "${step}: the guard_refusals leg's scratch directory and its link under SCENARIO_ROOT are not there"
+    one="$(make_workdir t0-repoint-one)"
+    two="$(make_workdir t0-repoint-two)"
+    link="${SCENARIO_ROOT}/work/t0-repoint-link"
+    ln -s -- "${one}" "${link}"
+
+    # A link under SCENARIO_ROOT as written, whose directory resolves outside
+    # it (SCENARIO_ROOT/home-link-outside is a symlink to the scratch
+    # directory under /tmp).
+    outside_link="${OUTSIDE_HOME}/t0-repoint-link"
+    ln -s -- "${one}" "${outside_link}"
+    via="${SCENARIO_ROOT}/home-link-outside/t0-repoint-link"
+    expect_fails_in_home "${step}" "${HOME}" "refused: the link's directory resolves to" repoint_symlink "${via}" "${two}"
+    [[ "$(readlink -- "${outside_link}")" == "${one}" ]] || fail "${step}: a refused repoint_symlink changed ${outside_link}"
+    [[ -z "$(find "${OUTSIDE_HOME}" -maxdepth 1 -name '.scenario-repoint.*' -print -quit)" ]] \
+        || fail "${step}: a refused repoint_symlink left a new link in ${OUTSIDE_HOME}"
+
+    # A target symlink under SCENARIO_ROOT that resolves to /tmp.
+    to_tmp="${SCENARIO_ROOT}/work/t0-repoint-to-tmp"
+    ln -s -- /tmp "${to_tmp}"
+    expect_fails_in_home "${step}" "${HOME}" "refused: the target resolves to $(realpath -e -- /tmp)" repoint_symlink "${link}" "${to_tmp}"
+    [[ "$(readlink -- "${link}")" == "${one}" ]] || fail "${step}: a refused repoint_symlink (target resolving to /tmp) changed ${link}"
+
+    # A target that is a file.
+    file="${SCENARIO_ROOT}/work/t0-repoint-file"
+    : > "${file}"
+    expect_fails_in_home "${step}" "${HOME}" "is not a directory" repoint_symlink "${link}" "${file}"
+    [[ "$(readlink -- "${link}")" == "${one}" ]] || fail "${step}: a refused repoint_symlink (target a file) changed ${link}"
+    [[ -z "$(find "${SCENARIO_ROOT}/work" -maxdepth 1 -name '.scenario-repoint.*' -print -quit)" ]] \
+        || fail "${step}: a refused repoint_symlink left a new link in ${SCENARIO_ROOT}/work"
+
+    # The positive control: the same link re-pointed.
+    repoint_symlink "${link}" "${two}"
+    [[ -L "${link}" && "$(realpath -e -- "${link}")" == "$(realpath -e -- "${two}")" ]] \
+        || fail "${step}: repoint_symlink ${link} ${two} left it resolving to '$(realpath -e -- "${link}" 2> /dev/null)'"
 }
 
 # press_enter_exact <step>: `stub_press_enter` matches a session name exactly.
@@ -3418,6 +3489,7 @@ LEGS=(
     harness_include_finished
     stub_direct
     stub_helpers
+    repoint_refusals
     refire_hold
     refire_at_once
     refire_trusted_config_dir

@@ -53,17 +53,24 @@
 #                        (a harness addition, confirm at the reconcile pass)
 #                        as `dev-channels` (the same dialog, reporting in on
 #                        the first line that reaches stdin), except that
-#                        reporting in writes no transcript: every SessionStart
-#                        (the report-in's, the re-fire's and a resume lap's)
-#                        names a `transcript_path` with no file at it, so
-#                        agent-director's SessionStart finds none. The
+#                        reporting in writes no transcript: until the first
+#                        message, every SessionStart (the report-in's and the
+#                        re-fire's) names a `transcript_path` with no file at
+#                        it, so agent-director's SessionStart finds none. The
 #                        transcript is written at the first message after
 #                        reporting in: the first line that is not the
-#                        sentinel, not `/mcp reconnect` and not empty or blank
-#                        (an extra Enter, which writes nothing in Claude Code
-#                        either), as a human typing into the pane
-#                        (lib/scenario.sh `stub_type_line`). Once written it
-#                        stays, as in every other mode.
+#                        sentinel, does not start with `/` (a slash command
+#                        typed into the pane, such as CSCB's `/exit` at a
+#                        `pause` or `/mcp reconnect`, is no message) and is
+#                        not empty or blank (an extra Enter, which writes
+#                        nothing in Claude Code either), as a human typing
+#                        into the pane (lib/scenario.sh `stub_type_line`).
+#                        Once written it stays, as in every other mode: the
+#                        life's later SessionStarts (its re-fire's) name it,
+#                        and a resumed launch of that session id (see
+#                        RESUME) finds it at its SessionStart; a resumed
+#                        launch of a session never messaged finds none until
+#                        its own first message.
 #
 # Only the dev-channels dialog holds DEV_CHANNELS_DIALOG_NEEDLE, and only the
 # folder-trust prompt holds TRUST_DIALOG_NEEDLE.
@@ -658,9 +665,10 @@ handle_line() {
         exit 0
     fi
     # transcript-on-first-message: the first message after reporting in
-    # writes the transcript.
+    # writes the transcript; a slash command (a line starting with `/`, such
+    # as `/exit` or `/mcp reconnect`) is no message.
     if (( REPORTED )) && [[ "${MODE}" == "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}" \
-        && "${line}" =~ [^[:space:]] && "${line}" != '/mcp reconnect' ]]; then
+        && "${line}" =~ [^[:space:]] && ! "${line}" =~ ^[[:space:]]*/ ]]; then
         TRANSCRIPT_DUE=1
         ensure_transcript
     fi

@@ -454,9 +454,12 @@ t18_note_calls() {
 }
 
 # t18_posts: the Slack stub's chat.postMessage records after the mark, one
-# JSON per line.
+# JSON per line. The stub may be writing its last line: a line that does not
+# parse (torn) is skipped, so a read never ends the script without a FAIL
+# line; a later read finds it whole.
 t18_posts() {
-    t18_after "${STUB_RECORD}" "${MARK_RECORD}" | jq -c 'select(.event == "api" and .method == "chat.postMessage")'
+    t18_after "${STUB_RECORD}" "${MARK_RECORD}" \
+        | jq -R -c 'fromjson? // empty | select(.event == "api" and .method == "chat.postMessage")'
 }
 
 # t18_post_times <channel> <text>: the times (seconds since the epoch) of the
@@ -653,7 +656,7 @@ t18_texts() {
 
 t18_condition_section() {
     local step="wedged condition" p head n deadline_s wait_s alert_t unwedge_t times t onset_n
-    local id_var key_var ch_var at_var alert_var onset_var rec_var verb
+    local id_var key_var ch_var at_var alert_var onset_var rec_var verb calls
 
     # Each persona's first refusal: its condition's started line.
     for p in "${KEPT[@]}"; do
@@ -744,7 +747,8 @@ t18_condition_section() {
             n="$(t18_cscb_count_since "${MARK_TIME}" "${verb}" "${!id_var}")"
             [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB ${verb} call(s) naming ${!id_var}"
         done
-        n="$(t18_cscb_calls_since "${MARK_TIME}" spawn "${!id_var}" | grep -cF -- '--reuse-finished' || true)"
+        calls="$(t18_cscb_calls_since "${MARK_TIME}" spawn "${!id_var}")" || exit 1
+        n="$(grep -cF -- '--reuse-finished' <<< "${calls}" || true)"
         [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB reuse spawn(s) of ${!id_var}"
         # No relaunch: the start pass's one plain spawn (it collides and
         # routes to `get`) is the only spawn naming its id.

@@ -72,6 +72,10 @@
  *                                    src/checked-kill.ts): a script finds the
  *                                    line holding it and reads agent-director's
  *                                    description, JSON-decoded, right after it
+ *   killRetryTryLine.description-head-of <instance-id> <try> <max>
+ *                                    the same, for try <try> of <max> (a start
+ *                                    sweep's row swept after the pass's
+ *                                    retries were spent makes one try of 1)
  *   killRetryEndLine.head <instance-id>
  *   killRetryEndLine.tail <instance-id>
  *                                    the parts of the bounded retry's end line
@@ -540,6 +544,18 @@ async function killRetryTryLineParts(instanceId: string, n: number, max: number,
   return around(tryLine('', instanceId, n, max, outcome, next), await describeKillOutcome(outcome), 'killRetryTryLine')
 }
 
+/**
+ * The per-try line's fixed part for an `ErrTmuxKillFailed` try `n` of `max`
+ * of `instanceId`, up to its JSON-quoted description. What follows the
+ * description (the next step) is not in it, so either next step gives it.
+ */
+async function killRetryTryDescriptionHead(instanceId: string, n: number, max: number): Promise<string> {
+  const outcome = await killFailedOutcome(DESCRIPTION_STAND_IN)
+  const next = await value('kill-retry.ts', n < max ? 'KILL_RETRY_NEXT_AGAIN' : 'KILL_RETRY_NEXT_EXHAUSTED')
+  const tryLine = await fn<(prefix: string, id: string, n: number, max: number, outcome: unknown, next: unknown) => string>('kill-retry.ts', 'killRetryTryLine')
+  return around(tryLine('', instanceId, n, max, outcome, next), JSON.stringify(DESCRIPTION_STAND_IN), 'killRetryTryLine').head
+}
+
 /** A stand-in class label, for the entry that cuts a line at its class: found once in it. */
 const CLASS_STAND_IN = 'FMKTEXTSCLASSSTANDIN'
 
@@ -613,13 +629,15 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   KILL_RETRY_TRIES: { args: [], print: async () => String(await killRetryTries()) },
   'killRetryTryLine.description-head': {
     args: ['instance-id', 'try'],
-    print: async ([instanceId, raw]) => {
+    print: async ([instanceId, raw]) => killRetryTryDescriptionHead(instanceId, tryNumber(raw), await killRetryTries()),
+  },
+  'killRetryTryLine.description-head-of': {
+    args: ['instance-id', 'try', 'max'],
+    print: async ([instanceId, raw, rawMax]) => {
       const n = tryNumber(raw)
-      const tries = await killRetryTries()
-      const outcome = await killFailedOutcome(DESCRIPTION_STAND_IN)
-      const next = await value('kill-retry.ts', n < tries ? 'KILL_RETRY_NEXT_AGAIN' : 'KILL_RETRY_NEXT_EXHAUSTED')
-      const tryLine = await fn<(prefix: string, id: string, n: number, max: number, outcome: unknown, next: unknown) => string>('kill-retry.ts', 'killRetryTryLine')
-      return around(tryLine('', instanceId, n, tries, outcome, next), JSON.stringify(DESCRIPTION_STAND_IN), 'killRetryTryLine').head
+      const max = tryNumber(rawMax)
+      if (n > max) throw new PrinterFailure(`try ${n} is past the last try, ${max}`, USAGE_EXIT)
+      return killRetryTryDescriptionHead(instanceId, n, max)
     },
   },
   'killRetryEndLine.head': { args: ['instance-id'], print: async ([instanceId]) => (await killRetryEndLineParts(instanceId)).head },

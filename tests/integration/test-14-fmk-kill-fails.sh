@@ -72,33 +72,43 @@
 #                   `silent`), which after the migration reads `pending` with
 #                   no launch start (SRJ-513, SRJ-1020); and absent persona
 #                   Q's live row. config.json names P (a Slack destination)
-#                   and not Q; `fail-kill` is limited to A's session and pane;
-#                   a start; once the start sweep's summary line is logged,
-#                   `log`. Then the summary's counts (4 listed, 1 recorded as
-#                   retired, 1 left for a latch, and every live stray not
-#                   killed kept with its kill failed); A's kill: each of its
-#                   KILL_RETRY_TRIES tries answered ErrTmuxKillFailed, its
-#                   session still there, exactly one `orphan-cleanup` entry
-#                   naming A (the pre-persona row's head, then the alert's
-#                   ordinary version in its start-sweep form) and one
-#                   server-log line of it; B's and Q's kills each either
-#                   succeeded (the sweep's per-row line, no entry, the
-#                   session gone) or did not (exactly one entry, the session
-#                   still there), which is logged: the release answers
-#                   ErrTmuxKillFailed with no kill sent for a 0.10.0 launch's
-#                   session, which carries no label it reads (HO rev 31 §2
-#                   (a)), and the pass's retry budget gives a later row one
-#                   try (AC 56); P latched from its own listed row, no CSCB
+#                   and not Q; `fail-kill` is limited to A's session and pane
+#                   (a guard only: the release sends no kill for a 0.10.0
+#                   launch's session, which carries no label it reads, and
+#                   answers ErrTmuxKillFailed with none sent, HO rev 31 §2
+#                   (a), so the target list does not decide A's outcome; how
+#                   many kills aimed at A's targets reached the tmux shim is
+#                   logged); a start; once the start sweep's summary line is
+#                   logged, `log`. Then the summary's counts (4 listed, 1
+#                   recorded as retired, 1 left for a latch, and every live
+#                   stray not killed kept with its kill failed); the pass's
+#                   retry budget (SRJ-702, AC 56), with A, B and Q in the
+#                   order CSCB first killed them (agent-director's `list`
+#                   order is not assumed): the first whose kill failed made
+#                   exactly KILL_RETRY_TRIES CSCB kills, each later one
+#                   exactly 1, and one whose kill succeeded before it is
+#                   logged; A's kill: each of its tries answered
+#                   ErrTmuxKillFailed, its session still there, exactly one
+#                   `orphan-cleanup` entry naming A (the pre-persona row's
+#                   head, then the alert's ordinary version in its start-sweep
+#                   form) and one server-log line of it; B's and Q's kills
+#                   each either succeeded (the sweep's per-row line, no entry,
+#                   the session gone) or did not (exactly one entry, the
+#                   session still there), which is logged; P latched from its
+#                   own listed row, no CSCB
 #                   kill of P's row, and exactly one launch-start-not-recorded
 #                   post at P's destination; Q's key in the retired-key record
 #                   with cause `absent-at-start`; no CSCB delete; every seeded
 #                   row present (harness `get`); every running stub worker in
-#                   a session a row of the harness's `list` records; nothing
+#                   a session a row of the harness's `list` records, and at
+#                   least A's and P's workers found running; nothing
 #                   about A in the Slack stub's record. A plain stop; then the
 #                   harness plays the human acting on the alerts ("Operator
 #                   actions"): it ends each old worker's session by its
-#                   session id and runs `find-missing` until A's, B's and Q's
-#                   rows read finished, so no later start sweeps them live.
+#                   session id and runs `find-missing` until A's, B's, Q's
+#                   and P's rows read finished, so no later start sweeps them
+#                   live and spends a later pass's retry budget (leg 1's X
+#                   keeps its KILL_RETRY_TRIES tries).
 #   1. start_sweep  persona X reports in (`log`); a plain stop; X removed from
 #                   config.json; `fail-kill`; a start. The start sweep
 #                   (`reconcileOrphans`) sweeps X's live row (absent persona)
@@ -112,7 +122,11 @@
 #                   outcome, carrying the alert's ordinary version in its
 #                   start-sweep form for the last try's description, and one
 #                   server-log line of it; nothing about X reaches the Slack
-#                   stub and no `tmux-unresponsive` post is made.
+#                   stub, no `tmux-unresponsive` post is made and no
+#                   `tmux-unresponsive` condition starts, for X or any
+#                   persona (no started line in server.log: a start-sweep
+#                   kill and ErrTmuxKillFailed never start one, SRJ-307, and
+#                   no persona is configured).
 #   2. config_dir   persona C (Slack destination) has a symlinked
 #                   claude_config_dir and the `silent` stub: its row stays
 #                   `pending` with a launch start. A plain stop; the symlink
@@ -128,9 +142,13 @@
 #                   description with the "keeps retrying" closing sentence);
 #                   C is observed through one further retry of its retry
 #                   timer, whose sequence's kill fails the same way and posts
-#                   no second alert; after the first failed try no CSCB
+#                   no second alert (no post of any text at C's destination
+#                   during the hold after it, NO_SECOND_ALERT_HOLD_S below,
+#                   and the same count of posts there just before the leg's
+#                   stop); after the first failed try no CSCB
 #                   delete, spawn or resume of C's id; C's row present; no
-#                   `tmux-unresponsive` post.
+#                   `tmux-unresponsive` post and no `tmux-unresponsive`
+#                   started line for C's key.
 #   3. cwd          persona W (Slack destination) has a symlinked
 #                   working_directory and the `silent` stub; a start (`log`)
 #                   launches it, its row reads `pending` and its retry timer
@@ -156,7 +174,8 @@
 #                   sentence, and one server-log line of it; no CSCB delete;
 #                   R's row present; R's key in the retired-key record with
 #                   cause `removed`; nothing about R in the Slack stub's
-#                   record after the edit, and no `tmux-unresponsive` post.
+#                   record after the edit, and no `tmux-unresponsive` post
+#                   and no `tmux-unresponsive` started line for R's key.
 #                   `log`; a plain stop.
 #   Rows a leg keeps are swept again by a later start (leg 1's first start,
 #   in `log`, sweeps P's row, P being absent then), so every check reads
@@ -170,7 +189,10 @@
 # KILL_WAIT_S (3 tries of up to the 5000 ms kill exit wait, 2 s apart, with
 # their reads); a further retry by its line, bounded at RETRY_WAIT_S (the
 # retry timer's next wait, 30 or 60 s, plus a kill's tries). No fixed sleep
-# but NO_SECOND_ALERT_HOLD_S, a hold that checks no second alert follows.
+# but the hold that checks no second alert follows: at least
+# NO_SECOND_ALERT_HOLD_S, and at least twice the first alert's measured
+# latency (from its kill tries' end line to its post, by their own times)
+# plus NO_SECOND_ALERT_MARGIN_S.
 #
 # Matched values (every one printed by fixtures/fmk-texts.ts from the
 # installed package, never typed here):
@@ -195,7 +217,8 @@
 #     PENDING_ROW_REASON_CWD_MISMATCH, src/pending-row.ts), which names the
 #     site that sent the row to the live-row sequence;
 #   - the `tmux-unresponsive` onset (`tmuxUnresponsiveOnsetText`,
-#     src/persona-episodes.ts), for absence checks;
+#     src/persona-episodes.ts) and the condition's started line up to its
+#     refusing verb (`tmuxUnresponsiveStartedLine`), for absence checks;
 #   - instance ids (`personaInstanceId`, src/persona-identity.ts; each alert's
 #     session is the one the row records, read with a harness `get`) and the
 #     last-applied record's suffix (LAST_APPLIED_FILE_SUFFIX, src/reload.ts);
@@ -260,9 +283,12 @@ t14_value SVC_LABEL SERVICE_LABEL
 t14_value PERSONA_LABEL PERSONA_LABEL_KEY
 
 # Two pre-persona rows (a `channel` label, no `persona` label), each with a
-# worker that reports in at once: A's kill is the one that fails, B's
-# succeeds. Their routes' channel names give their ids and session names
-# (`seed_prepersona_fleet`).
+# worker that reports in at once. A's session and pane are `fail-kill`'s only
+# targets, and A's kill must fail; B's outcome is logged, not asserted. On the
+# release no kill is sent for any 0.10.0-launched session (HO rev 31 §2 (a)),
+# so the target list does not act here: each such kill answers
+# ErrTmuxKillFailed with none sent. Their routes' channel names give their
+# ids and session names (`seed_prepersona_fleet`).
 U_CONFIG="${SCENARIO_ROOT}/prepersona-config.json"
 UA_CHANNEL="C0T14PPA"
 UB_CHANNEL="C0T14PPB"
@@ -316,8 +342,11 @@ KILL_WAIT_S=120
 RETRY_WAIT_S=180
 # A destination post reaching the Slack stub after its kill's tries ended.
 POST_WAIT_S=60
-# How long no second alert may follow a further retry's failed kill.
+# How long no second alert may follow a further retry's failed kill: at
+# least this, and at least twice the first alert's measured latency plus
+# NO_SECOND_ALERT_MARGIN_S.
 NO_SECOND_ALERT_HOLD_S=5
+NO_SECOND_ALERT_MARGIN_S=5
 # The Slack stub writing its ready file.
 STUB_WAIT_S=30
 # A stub process in no tmux pane ending (a short-lived run outside tmux).
@@ -587,12 +616,13 @@ t14_first_call_time() {
     head -n 1 <<< "${out}" | cut -f 2
 }
 
-# t14_try_description <id> <try> <nth>: print agent-director's description
-# of try <try> of the <nth> kill-retry of <id> logged after the leg's mark,
-# JSON-decoded from its per-try line; fail when there is none.
+# t14_try_description <id> <try> <nth> [<max>]: print agent-director's
+# description of try <try> (of <max>, KILL_RETRY_TRIES when not given) of the
+# <nth> kill-retry of <id> logged after the leg's mark, JSON-decoded from its
+# per-try line; fail when there is none.
 t14_try_description() {
-    local id="$1" n="$2" nth="$3" head out rc=0
-    t14_value head killRetryTryLine.description-head "${id}" "${n}"
+    local id="$1" n="$2" nth="$3" max="${4:-${KILL_TRIES}}" head out rc=0
+    t14_value head killRetryTryLine.description-head-of "${id}" "${n}" "${max}"
     out="$(python3 - "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "${head}" "${nth}" << 'EOF'
 import json, sys
 path, since, head, nth = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
@@ -648,9 +678,17 @@ t14_end_matcher() {
     matcher "${head}" "${tail}"
 }
 
+# t14_records_after <line>: the Slack stub's records after <line>, one JSON
+# per line. The stub may be writing its last line: a line that does not
+# parse (torn) is skipped, so a read never ends the script without a FAIL
+# line; a later read finds it whole.
+t14_records_after() {
+    t14_after "${STUB_RECORD}" "$1" | jq -R -c 'fromjson? // empty'
+}
+
 # t14_posts_after <line>: the Slack stub's chat.postMessage records after <line>, one JSON per line.
 t14_posts_after() {
-    t14_after "${STUB_RECORD}" "$1" | jq -c 'select(.event == "api" and .method == "chat.postMessage")'
+    t14_records_after "$1" | jq -c 'select(.event == "api" and .method == "chat.postMessage")'
 }
 
 # t14_count_posts <line> <channel> <text>: posts after <line> at <channel>
@@ -674,11 +712,51 @@ t14_no_new_post_hold() {
     local since="$1" want="$2" channel="$3" hold="$4" step="$5" deadline got
     deadline=$(( $(date +%s) + hold ))
     while :; do
-        got="$(t14_posts_after "${since}" | jq -s --arg c "${channel}" '[.[] | select(.channel == $c)] | length')"
+        got="$(t14_count_channel_posts "${since}" "${channel}")"
         [[ "${got}" == "${want}" ]] || fail "${step}: ${got} post(s) at ${channel} after the leg's mark, not ${want}"
         (( $(date +%s) < deadline )) || return 0
         sleep "${SCENARIO_POLL_S}"
     done
+}
+
+# t14_count_channel_posts <line> <channel>: every post at <channel> after
+# <line>, whatever its text.
+t14_count_channel_posts() {
+    t14_posts_after "$1" | jq -s --arg c "$2" '[.[] | select(.channel == $c)] | length'
+}
+
+# t14_epoch <iso-time>: print the time as seconds since the epoch, with
+# milliseconds.
+t14_epoch() {
+    date -u -d "$1" +%s.%3N || fail "could not read the time '$1'"
+}
+
+# t14_alert_latency <id> <channel> <text> <step>: print the seconds from the
+# first end line of <id>'s kill tries after the leg's mark (server.log's own
+# time) to the first post of <text> at <channel> after it (the Slack stub's
+# record time), never below 0.
+t14_alert_latency() {
+    local id="$1" channel="$2" text="$3" step="$4" head line iso end_t post_iso post_t
+    t14_value head killRetryEndLine.head "${id}"
+    line="$(t14_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" | grep -F -m 1 -- "${head}" || true)"
+    [[ "${line}" == \[* ]] || fail "${step}: no timed end line of ${id}'s kill tries after the mark: '${line:0:200}'"
+    iso="${line#\[}"
+    iso="${iso%%\]*}"
+    end_t="$(t14_epoch "${iso}")" || exit 1
+    post_iso="$(t14_posts_after "${MARK_RECORD}" | jq -r -s --arg c "${channel}" --arg t "${text}" \
+        '[.[] | select(.channel == $c and .text == $t)] | if length == 0 then "" else .[0].ts end')"
+    [[ -n "${post_iso}" ]] || fail "${step}: no post of the kill-failure alert for ${id} at ${channel} to time"
+    post_t="$(t14_epoch "${post_iso}")" || exit 1
+    awk -v a="${post_t}" -v b="${end_t}" 'BEGIN { d = a - b; if (d < 0) d = 0; printf "%.3f", d }'
+}
+
+# t14_recount_before_stop <step>: just before the leg's stop, the posts at the
+# destination the no-second-alert hold watched are still the count it held.
+t14_recount_before_stop() {
+    local n
+    n="$(t14_count_channel_posts "${MARK_RECORD}" "${T14_HOLD_CHANNEL}")"
+    [[ "${n}" == "${T14_HOLD_COUNT}" ]] \
+        || { t14_note_posts "${MARK_RECORD}" "${T14_HOLD_CHANNEL}" "$1"; fail "$1: ${n} post(s) at ${T14_HOLD_CHANNEL} after the leg's mark just before the stop, not the ${T14_HOLD_COUNT} the hold ended with"; }
 }
 
 # t14_note_posts <line> <channel> <step>: log every post at <channel> after
@@ -719,14 +797,41 @@ t14_start_and_wait() {
     wait_for_count "${m}" "$(( before + 1 ))" "${START_WAIT_S}" "the start pass never completed"
 }
 
-# t14_no_unresponsive_post <key> <step>: no post after the leg's mark holds
-# the persona's `tmux-unresponsive` onset (ErrTmuxKillFailed starts no such
-# condition, SRJ-307).
-t14_no_unresponsive_post() {
-    local onset n
+# t14_no_unresponsive <key> <step>: the persona's `tmux-unresponsive`
+# condition never started after the leg's mark: no server.log line after the
+# mark holds its started line up to the refusing verb (the line the condition
+# logs at its first refusal), and no post after the mark holds its onset
+# (ErrTmuxKillFailed starts no such condition and makes no such post,
+# SRJ-307). The started line is what makes this check able to fail within a
+# leg: no leg lasts the alert threshold past a first refusal, so a post alone
+# could never be seen.
+t14_no_unresponsive() {
+    local onset head n
+    t14_value head tmuxUnresponsiveStartedLine.head "$1"
+    n="$(t14_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "${head}")"
+    if [[ "${n}" != 0 ]]; then
+        t14_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" | grep -F -- "${head}" | sed 's/^/  | /' >&2 || true
+        fail "$2: ${n} tmux-unresponsive started line(s) for $1 after the leg's mark"
+    fi
     t14_value onset tmuxUnresponsiveOnsetText "$1"
     n="$(t14_count_posts_holding "${MARK_RECORD}" "${onset}")"
     [[ "${n}" == 0 ]] || fail "$2: ${n} tmux-unresponsive onset post(s) for $1"
+}
+
+# t14_no_unresponsive_any <key> <step>: as `t14_no_unresponsive` for <key>,
+# and no server.log line after the leg's mark is any persona's
+# `tmux-unresponsive` started line (the started line's head with the key
+# left open).
+t14_no_unresponsive_any() {
+    local head n
+    t14_no_unresponsive "$1" "$2"
+    t14_value head tmuxUnresponsiveStartedLine.head "$1"
+    [[ "${head}" == *"$1"* ]] || fail "$2: the tmux-unresponsive started line's head does not name the key $1: ${head}"
+    n="$(t14_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "$(matcher "${head%%"$1"*}" "${head#*"$1"}")")"
+    if [[ "${n}" != 0 ]]; then
+        t14_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" | grep -F -- "${head#*"$1"}" | sed 's/^/  | /' >&2 || true
+        fail "$2: ${n} tmux-unresponsive started line(s) for some persona after the leg's mark"
+    fi
 }
 
 # t14_no_launch_since <time> <id> <step>: no CSCB spawn or resume of <id>,
@@ -823,14 +928,15 @@ t14_proc_gone() {
     ! pid_alive "$1"
 }
 
-# t14_check_workers_have_rows <step>: every running stub worker runs in a tmux
-# session that a row of the harness's `list` records (no old worker is left
-# running without a row). A stub process in no pane that ends within
-# WORKER_GONE_S (a short-lived run of the stub outside tmux, such as a
-# version probe) is no worker; one still running then fails, with its
-# command line and its parent's.
+# t14_check_workers_have_rows <step> <min>: every running stub worker runs in
+# a tmux session that a row of the harness's `list` records (no old worker is
+# left running without a row), and at least <min> workers are found (the
+# workers the leg knows run), so the check never passes on finding none. A
+# stub process in no pane that ends within WORKER_GONE_S (a short-lived run
+# of the stub outside tmux, such as a version probe) is no worker; one still
+# running then fails, with its command line and its parent's.
 t14_check_workers_have_rows() {
-    local step="$1" workers pid session what n=0
+    local step="$1" min="$2" workers pid session what n=0
     workers="$(t14_stub_workers)" || fail "${step}: could not read the stub workers"
     ad_capture list
     [[ "${AD_RC}" == 0 ]] || fail "${step}: harness list exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
@@ -847,7 +953,8 @@ t14_check_workers_have_rows() {
         jq -e --arg s "${session}" 'any(.spawns[]; .tmux_session_name == $s)' "${AD_OUT}" > /dev/null \
             || fail "${step}: stub worker ${pid} runs in session ${session}, which no row of the harness's list records"
     done <<< "${workers}"
-    echo "${TEST_NAME}: ${step}: ${n} stub worker(s) running, each in a session a listed row records"
+    (( n >= min )) || fail "${step}: ${n} stub worker(s) found running, fewer than the ${min} the leg knows run"
+    echo "${TEST_NAME}: ${step}: ${n} stub worker(s) running (at least ${min} known), each in a session a listed row records"
 }
 
 # t14_session_ids <session>: print the session's id and its pane's id, `$N %N`,
@@ -867,7 +974,7 @@ t14_no_records_about() {
     local step="$1" n frags
     shift
     frags="$(printf '%s\n' "$@" | jq -R . | jq -s .)"
-    n="$(t14_after "${STUB_RECORD}" "${MARK_RECORD}" \
+    n="$(t14_records_after "${MARK_RECORD}" \
         | jq -s --argjson f "${frags}" '[.[] | select(.event == "api" and (. as $r | any($f[]; . as $x | (($r.channel // "") == $x) or (($r.text // "") | contains($x)))))] | length')"
     [[ "${n}" == 0 ]] || fail "${step}: ${n} Slack stub record(s) about $* after the mark"
 }
@@ -892,20 +999,104 @@ t14_check_summary() {
     echo "${TEST_NAME}: NOTE: ${step}: the start sweep's summary: ${found}"
 }
 
-# t14_check_kill_failed_tries <id> <step>: each of the KILL_RETRY_TRIES tries
-# of the first kill-retry of <id> after the leg's mark answered
+# t14_check_kill_failed_tries <id> <tries> <step>: each of the <tries> tries
+# (of <tries>) of the first kill-retry of <id> after the leg's mark answered
 # ErrTmuxKillFailed (its per-try line holds the outcome's fixed part); set
 # LAST_DESCRIPTION to the last try's description. The descriptions'
 # kill-failure words are not checked here: a 0.10.0 launch's description is
 # capped in the log before them (`renderLogMessageText`); legs 1 to 4 check
 # them.
 t14_check_kill_failed_tries() {
-    local id="$1" step="$2" n desc
-    for (( n = 1; n <= KILL_TRIES; n++ )); do
-        desc="$(t14_try_description "${id}" "${n}" 1)" || exit 1
-        echo "${TEST_NAME}: ${step}: kill try ${n} of ${KILL_TRIES} for ${id}: ErrTmuxKillFailed: ${desc}"
+    local id="$1" tries="$2" step="$3" n desc
+    for (( n = 1; n <= tries; n++ )); do
+        desc="$(t14_try_description "${id}" "${n}" 1 "${tries}")" || exit 1
+        echo "${TEST_NAME}: ${step}: kill try ${n} of ${tries} for ${id}: ErrTmuxKillFailed: ${desc}"
         LAST_DESCRIPTION="${desc}"
     done
+}
+
+# t14_later <a> <b>: true when the time <a> is later than <b>.
+t14_later() {
+    awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 > b + 0) }'
+}
+
+# t14_check_sweep_budget <step>: the start sweep's pass budget (SRJ-702, AC
+# 56) over the live strays A, B and Q, taken in the order of CSCB's first
+# kill of each after the leg's mark (agent-director's `list` order is not
+# assumed). Before the first row whose kill failed (its `orphan-cleanup`
+# entry), a row whose kill succeeded is logged with its kills; that first
+# failed row made exactly KILL_RETRY_TRIES CSCB kills; every row after it
+# exactly 1. Sets T14_TRIES_OF[<id>] to each row's CSCB kills, and logs the
+# order.
+declare -A T14_TRIES_OF=()
+t14_check_sweep_budget() {
+    local step="$1" id t first_t best spent=0 kills entries order=() rest=("${UA_ID}" "${UB_ID}" "${Q_ID}") keep
+    declare -A first=()
+    for id in "${rest[@]}"; do
+        t="$(t14_first_call_time "${MARK_TIME}" kill "${id}")" || exit 1
+        [[ -n "${t}" ]] || fail "${step}: no CSCB kill of the live stray ${id} after the start"
+        first["${id}"]="${t}"
+    done
+    while (( ${#rest[@]} > 0 )); do
+        best=""
+        first_t=""
+        for id in "${rest[@]}"; do
+            if [[ -z "${best}" ]] || t14_later "${first_t}" "${first[${id}]}"; then
+                best="${id}"
+                first_t="${first[${id}]}"
+            fi
+        done
+        order+=("${best}")
+        keep=()
+        for id in "${rest[@]}"; do
+            [[ "${id}" == "${best}" ]] || keep+=("${id}")
+        done
+        rest=(${keep[@]+"${keep[@]}"})
+    done
+    echo "${TEST_NAME}: ${step}: the live strays in the order CSCB first killed them: ${order[*]}"
+    for id in "${order[@]}"; do
+        kills="$(t14_cscb_count_since "${MARK_TIME}" kill "${id}")"
+        entries="$(t14_count_entries "${ORPHAN_LABEL}" "${id}")"
+        T14_TRIES_OF["${id}"]="${kills}"
+        if (( spent )); then
+            [[ "${kills}" == 1 ]] \
+                || fail "${step}: ${kills} CSCB kill(s) of ${id}, swept after the pass's retries were spent, not 1"
+            echo "${TEST_NAME}: ${step}: ${id}, swept after the pass's retries were spent: 1 CSCB kill"
+        elif [[ "${entries}" != 0 ]]; then
+            [[ "${kills}" == "${KILL_TRIES}" ]] \
+                || fail "${step}: ${kills} CSCB kill(s) of ${id}, the first swept row whose kill failed, not ${KILL_TRIES}"
+            echo "${TEST_NAME}: ${step}: ${id}, the first swept row whose kill failed: ${KILL_TRIES} CSCB kills"
+            spent=1
+        else
+            echo "${TEST_NAME}: NOTE: ${step}: ${id}'s kill succeeded, before the pass's retries were spent, after ${kills} CSCB kill(s)"
+        fi
+    done
+    (( spent )) || fail "${step}: no live stray's kill failed (A's must)"
+}
+
+# t14_note_kills_at <step> <target>...: log how many tmux calls after the
+# leg's mark holding a `kill-session` or `kill-pane` aimed at one of the
+# targets (a session name, `$N` or `%N`) reached the tmux shim, whoever made
+# them: under `fail-kill --targets` each was refused. A target word is read
+# as the shim compares it (a leading `=` and everything from the first `:`
+# dropped; the log's `printf %q` quoting of `$` undone).
+t14_note_kills_at() {
+    local step="$1" n
+    shift
+    n="$(awk -F'\t' -v t="${MARK_TIME}" -v targets="$*" '
+        BEGIN { split(targets, tl, " "); for (i in tl) want[tl[i]] = 1 }
+        $1 == "call" && $2 + 0 >= t + 0 {
+            k = split($6, w, " ")
+            kill = 0; hit = 0
+            for (i = 1; i <= k; i++) {
+                if (w[i] ~ /^kill-(session|pane)$|^killp$|^kill-ses|^kill-p/) kill = 1
+                x = w[i]; sub(/^=/, "", x); sub(/:.*$/, "", x); gsub(/\\\$/, "$", x)
+                if (x in want) hit = 1
+            }
+            if (kill && hit) n++
+        }
+        END { print n + 0 }' "${SCENARIO_TMUX_SHIM_LOG}" 2> /dev/null)" || n="?"
+    echo "${TEST_NAME}: NOTE: ${step}: ${n} tmux call(s) holding a kill aimed at $* reached the tmux shim after the mark (each refused under fail-kill --targets)"
 }
 
 # t14_check_other_stray <id> <persona> <session> <step>: the start sweep's
@@ -935,13 +1126,15 @@ t14_check_other_stray() {
     fi
 }
 
-# True once a harness `find-missing` run leaves A's, B's and Q's rows
-# finished (`missing` or `ended`).
+# True once a harness `find-missing` run leaves A's, B's, Q's and P's rows
+# finished (`missing` or `ended`). P's is among them: a live row of P that a
+# later start swept (P is absent from leg 1 on) would spend that pass's
+# retry budget (SRJ-702), leaving leg 1's X one try.
 t14_old_rows_finished() {
     local id state
     ad_capture find-missing
     [[ "${AD_RC}" == 0 ]] || return 1
-    for id in "${UA_ID}" "${UB_ID}" "${Q_ID}"; do
+    for id in "${UA_ID}" "${UB_ID}" "${Q_ID}" "${P_ID}"; do
         state="$(t14_row_state "${id}")"
         [[ "${state}" == missing || "${state}" == ended ]] || return 1
     done
@@ -949,7 +1142,7 @@ t14_old_rows_finished() {
 
 # t14_end_old_workers <step>: the human ends each 0.10.0 row's session still
 # running, by its session id, from the scenario's own shell, then runs
-# `find-missing` until A's, B's and Q's rows read finished.
+# `find-missing` until A's, B's, Q's and P's rows read finished.
 t14_end_old_workers() {
     local step="$1" session ids sid id
     for session in "${UA_SESSION}" "${UB_SESSION}" "${Q_SESSION}" "${P_SESSION}"; do
@@ -988,7 +1181,8 @@ leg_upgrade_sweep() {
         || fail "${step}: ${UA_SESSION} is now '${ids}', not the seeded ${UA_SID} ${UA_PANE}"
 
     # The configuration names P (a Slack destination) and not Q; A's session
-    # and pane are fail-kill's only targets.
+    # and pane are fail-kill's only targets (a guard: on the release no kill
+    # is sent for a 0.10.0-launched session, so the list does not act here).
     stub_mode "${P_WORK}" "${STUB_MODE_SILENT}"
     tmux_shim_mode log
     t14_config_for_next_start "$(t14_persona_json "${P_NAME}" "${P_LABEL}" "${P_WORK}" "${P_CFG}" "${P_CHANNEL}")"
@@ -1009,12 +1203,16 @@ leg_upgrade_sweep() {
     # answer ErrTmuxKillFailed with no kill sent, HO rev 31 §2 (a)); it is
     # logged, not asserted.
     t14_check_summary "${step}"
+    t14_note_kills_at "${step}" "${UA_SESSION}" "${UA_SID}" "${UA_PANE}"
 
-    # A: each try answered ErrTmuxKillFailed; exactly KILL_RETRY_TRIES CSCB
-    # kills; its session still there.
-    t14_check_kill_failed_tries "${UA_ID}" "${step}"
-    kills="$(t14_cscb_count_since "${MARK_TIME}" kill "${UA_ID}")"
-    [[ "${kills}" == "${KILL_TRIES}" ]] || fail "${step}: ${kills} CSCB kill(s) of ${UA_ID}, not ${KILL_TRIES}"
+    # The pass's retry budget, in the order CSCB swept the rows: the first
+    # row whose kill failed got KILL_RETRY_TRIES kills, every later one 1.
+    t14_check_sweep_budget "${step}"
+
+    # A: each of its tries answered ErrTmuxKillFailed; its session still
+    # there.
+    kills="${T14_TRIES_OF[${UA_ID}]}"
+    t14_check_kill_failed_tries "${UA_ID}" "${kills}" "${step}"
     t14_has_session "${UA_SESSION}" || fail "${step}: ${UA_SESSION} is gone after its failed kill"
 
     # Exactly one orphan-cleanup entry names A: its row, state, session and
@@ -1068,7 +1266,8 @@ leg_upgrade_sweep() {
         t14_row_get "${id}"
         echo "${TEST_NAME}: ${step}: ${id}'s row is kept, reading $(jq -r '.state' "${AD_OUT}")"
     done
-    t14_check_workers_have_rows "${step}"
+    # A's worker (its kill failed) and P's (latched, never killed) run.
+    t14_check_workers_have_rows "${step}" 2
     t14_no_records_about "${step}" "${UA_ID}" "${UA_SESSION}" "${UA_CHANNEL}"
 
     stop_server
@@ -1103,7 +1302,7 @@ leg_start_sweep() {
     t14_config_for_next_start
     tmux_shim_mode fail-kill
     start_server --live
-    m="$(matcher "] [${ORPHAN_LABEL}] " "instanceId=${X_ID} ")"
+    m="$(matcher "] [${ORPHAN_LABEL}] " "${X_ID}")"
     wait_until "${KILL_WAIT_S}" "${step}: no ${ORPHAN_LABEL} entry for ${X_ID} after the start" \
         t14_count_after_at_least "${SLACK_STATE_DIR}/startup-errors.log" "${MARK_ERRORS}" "${m}" 1
 
@@ -1116,7 +1315,7 @@ leg_start_sweep() {
     # then the alert's ordinary version in its start-sweep form.
     t14_value entry_head startSweepKillFailedEntry "${X_ID}" "${X_KEY}" waiting "${session}" "${LAST_DESCRIPTION}"
     t14_value alert killFailureAlertEntryText.start-sweep "${X_ID}" "${session}" "${LAST_DESCRIPTION}"
-    n="$(t14_count_after "${SLACK_STATE_DIR}/startup-errors.log" "${MARK_ERRORS}" "${m}")"
+    n="$(t14_count_entries "${ORPHAN_LABEL}" "${X_ID}")"
     [[ "${n}" == 1 ]] || fail "${step}: ${n} ${ORPHAN_LABEL} entries for ${X_ID}, not 1"
     n="$(t14_count_after "${SLACK_STATE_DIR}/startup-errors.log" "${MARK_ERRORS}" "$(matcher "] [${ORPHAN_LABEL}] ${entry_head}" "${alert}")")"
     if [[ "${n}" != 1 ]]; then
@@ -1133,11 +1332,15 @@ leg_start_sweep() {
     t14_row_is "${X_ID}" waiting || fail "${step}: ${X_ID} reads '$(t14_row_state "${X_ID}")' after the failed kill, not waiting"
 
     # Nothing about X reaches the Slack stub; no tmux-unresponsive post.
-    n="$(t14_after "${STUB_RECORD}" "${MARK_RECORD}" \
+    n="$(t14_records_after "${MARK_RECORD}" \
         | jq -s --arg id "${X_ID}" --arg name "${X_NAME}" --arg c "${X_CHANNEL}" --arg l "${X_LABEL}" \
             '[.[] | select(.event == "api" and ((.channel // "") == $c or .label == $l or ((.text // "") | contains($id) or contains($name))))] | length')"
     [[ "${n}" == 0 ]] || fail "${step}: ${n} Slack stub record(s) about ${X_NAME} after the mark"
-    t14_no_unresponsive_post "${X_KEY}" "${step}"
+    # No tmux-unresponsive condition starts, for X or any persona: X is
+    # absent, so its kill is the start sweep's, and neither a start-sweep
+    # kill nor ErrTmuxKillFailed starts one (SRJ-307); no persona is
+    # configured, so no launch or recovery attempt could start one either.
+    t14_no_unresponsive_any "${X_KEY}" "${step}"
 
     tmux_shim_mode log
     stop_server
@@ -1158,7 +1361,7 @@ leg_start_sweep() {
 # kill; the row kept.
 t14_check_destination_alert() {
     local name="$1" id="$2" channel="$3" session="$4" reason="$5" since="$6" step="$7" key end prefix body
-    local expected first_kill expected_two n state uncovered
+    local expected first_kill expected_two n state uncovered latency hold
     key="$(persona_key "${name}")"
     end="$(t14_end_matcher "${id}")" || exit 1
     wait_until "${KILL_WAIT_S}" "${step}: ${id}'s kill tries never ended exhausted" \
@@ -1176,6 +1379,9 @@ t14_check_destination_alert() {
     expected="${prefix}${body}"
     wait_until "${POST_WAIT_S}" "${step}: no kill-failure alert for ${id} reached ${channel}" \
         t14_post_arrived "${MARK_RECORD}" "${channel}" "${expected}"
+    latency="$(t14_alert_latency "${id}" "${channel}" "${expected}" "${step}")" || exit 1
+    hold="$(awk -v l="${latency}" -v m="${NO_SECOND_ALERT_MARGIN_S}" -v f="${NO_SECOND_ALERT_HOLD_S}" \
+        'BEGIN { h = 2 * l + m; h = (h == int(h)) ? h : int(h) + 1; if (h < f) h = f; print h }')"
 
     # One further retry: its sequence's kill fails the same way.
     wait_until "${RETRY_WAIT_S}" "${step}: no further retry's kill tries for ${id} ended" \
@@ -1183,9 +1389,13 @@ t14_check_destination_alert() {
     t14_check_try_descriptions "${id}" 2 "${step}: the further retry"
     t14_value body killFailureAlertText.destination "${id}" "${session}" "${LAST_DESCRIPTION}"
     expected_two="${prefix}${body}"
-    t14_no_new_post_hold "${MARK_RECORD}" \
-        "$(t14_posts_after "${MARK_RECORD}" | jq -s --arg c "${channel}" '[.[] | select(.channel == $c)] | length')" \
-        "${channel}" "${NO_SECOND_ALERT_HOLD_S}" "${step}: after the further retry"
+    # No post of any text at the destination for the hold: at least
+    # NO_SECOND_ALERT_HOLD_S, and twice the first alert's latency plus a
+    # margin; the count is checked again just before the leg's stop.
+    echo "${TEST_NAME}: ${step}: the first alert reached ${channel} ${latency} s after its kill tries' end line; holding ${hold} s for no further post there"
+    T14_HOLD_CHANNEL="${channel}"
+    T14_HOLD_COUNT="$(t14_count_channel_posts "${MARK_RECORD}" "${channel}")"
+    t14_no_new_post_hold "${MARK_RECORD}" "${T14_HOLD_COUNT}" "${channel}" "${hold}" "${step}: after the further retry"
 
     # Exactly one alert, at the destination only.
     n="$(t14_count_posts "${MARK_RECORD}" "" "${expected}")"
@@ -1196,7 +1406,7 @@ t14_check_destination_alert() {
     [[ "$(t14_count_posts "${MARK_RECORD}" "${channel}" "${expected}")" == 1 ]] \
         || fail "${step}: the kill-failure alert for ${id} is not at its destination ${channel}"
     t14_note_posts "${MARK_RECORD}" "${channel}" "${step}"
-    t14_no_unresponsive_post "${key}" "${step}"
+    t14_no_unresponsive "${key}" "${step}"
 
     # No delete and no launch after the first failed kill; the row kept.
     t14_no_launch_since "${first_kill}" "${id}" "${step}"
@@ -1233,6 +1443,7 @@ leg_config_dir() {
     t14_check_destination_alert "${C_NAME}" "${C_ID}" "${C_CHANNEL}" "${session}" \
         PENDING_ROW_REASON_CONFIG_DIR_MISMATCH "${MARK_LOG}" "${step}"
 
+    t14_recount_before_stop "${step}"
     tmux_shim_mode log
     stop_server
 }
@@ -1241,15 +1452,8 @@ leg_config_dir() {
 # Leg 3: a cwd mismatch met by a pending-only retry on a running server
 # ---------------------------------------------------------------------------
 
-# t14_seconds_since <rfc3339>: print the whole seconds from <rfc3339> to now.
-t14_seconds_since() {
-    local then
-    then="$(date -d "$1" +%s)" || fail "could not read the time '$1'"
-    echo $(( $(date +%s) - then ))
-}
-
 leg_cwd() {
-    local step="cwd mismatch" session launch age repoint_log uncovered n
+    local step="cwd mismatch" session launch launch_t repointed_t age repoint_log uncovered n
     stub_mode "${W_ONE}" "${STUB_MODE_SILENT}"
     tmux_shim_mode log
     t14_config_for_next_start "$(t14_persona_json "${W_NAME}" "${W_LABEL}" "${W_LINK}" "${W_CFG}" "${W_CHANNEL}")"
@@ -1258,19 +1462,24 @@ leg_cwd() {
     wait_until "${ROW_WAIT_S}" "${step}: ${W_ID} never read pending with a launch start" \
         t14_row_pending_launched "${W_ID}"
     launch="$(jq -r '.launch_started_at' "${AD_OUT}")"
+    launch_t="$(t14_epoch "${launch}")" || exit 1
+    # Printed before the re-point, so nothing slow sits between it and its time.
+    t14_value uncovered uncoveredPendingRowLine "${W_NAME}" PENDING_ROW_REASON_CWD_MISMATCH
 
-    # Before the first pending-only retry: `fail-kill`, then the re-point.
+    # Before the first pending-only retry: `fail-kill`, then the re-point,
+    # its time taken right after it.
     tmux_shim_mode fail-kill
     repoint_log="$(t14_lines "${SLACK_STATE_DIR}/server.log")"
     repoint_symlink "${W_LINK}" "${W_TWO}"
+    repointed_t="${EPOCHREALTIME/,/.}"
+    age="$(awk -v a="${repointed_t}" -v b="${launch_t}" 'BEGIN { printf "%.3f", a - b }')"
     # The start launched W on a covered row: nothing found it not covered before the re-point.
-    t14_value uncovered uncoveredPendingRowLine "${W_NAME}" PENDING_ROW_REASON_CWD_MISMATCH
     sed -n "$(( MARK_LOG + 1 )),${repoint_log}p" "${SLACK_STATE_DIR}/server.log" > "${SCENARIO_ROOT}/before-repoint.log"
     n="$(count_in "${SCENARIO_ROOT}/before-repoint.log" "${uncovered}")"
     [[ "${n}" == 0 ]] || fail "${step}: ${W_ID}'s pending row was found not covered before the re-point"
-    age="$(t14_seconds_since "${launch}")"
-    (( age <= REPOINT_BEFORE_S )) \
+    awk -v a="${age}" -v b="${REPOINT_BEFORE_S}" 'BEGIN { exit !(a + 0 <= b + 0) }' \
         || fail "${step}: the symlink was re-pointed ${age} s after ${W_ID}'s launch start, not within ${REPOINT_BEFORE_S} s (before its first retry)"
+    echo "${TEST_NAME}: ${step}: the symlink was re-pointed ${age} s after ${W_ID}'s launch start"
     t14_row_get "${W_ID}"
     session="$(jq -r '.tmux_session_name // empty' "${AD_OUT}")"
     [[ -n "${session}" ]] || fail "${step}: ${W_ID}'s row names no tmux session"
@@ -1284,6 +1493,7 @@ leg_cwd() {
     n="$(t14_count_after "${SLACK_STATE_DIR}/server.log" "${repoint_log}" "$(completion_match 1)")"
     [[ "${n}" == 0 ]] || fail "${step}: a start pass completed after the re-point"
 
+    t14_recount_before_stop "${step}"
     tmux_shim_mode log
     stop_server
 }
@@ -1355,7 +1565,7 @@ leg_persona_removal() {
 
     # Nothing about the failure reaches the Slack stub.
     t14_no_records_about "${step}" "${R_CHANNEL}" "${R_ID}" "${R_NAME}" "${session}"
-    t14_no_unresponsive_post "${R_KEY}" "${step}"
+    t14_no_unresponsive "${R_KEY}" "${step}"
 
     tmux_shim_mode log
     stop_server

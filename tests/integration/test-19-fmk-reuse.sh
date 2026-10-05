@@ -108,9 +108,11 @@
 #
 # Harness check, first: the two harness additions on a stub the harness
 # starts itself (`seed_unlabelled`, no agent-director and no CSCB process): in
-# `transcript-on-first-message` no transcript exists at its dialog nor after
-# the human's Enter reports it in, one exists once a line has been typed
-# (`stub_type_line`), and the typed sentinel ends it; `stub_type_line` aimed
+# `transcript-on-first-message` no transcript exists at its dialog, nor after
+# the human's Enter reports it in, nor for SLASH_HOLD_S after a typed slash
+# command (`/exit`, as CSCB's `pause` types it) shows in the pane; one exists
+# once a line has been typed (`stub_type_line`), and the typed sentinel ends
+# it; `stub_type_line` aimed
 # at a pane that does not exist fails with its FAIL line.
 #
 # Legs, in run order (one scenario HOME, store, tmux server and Slack stub):
@@ -134,7 +136,9 @@
 #        diagnosis runs, then the reuse spawn;
 #   4. a background harness `get` of the row (a subshell of the scenario's
 #      own shell), started before the start and stopped once the row reads
-#      `waiting`, records each read; checked: a read of `pending` with a
+#      `waiting` (through a stop file it checks at the top of its loop, then
+#      reaped, so its reads are whole before they are read), records each
+#      read; checked: a read of `pending` with a
 #      `launch_started_at`, then one of `waiting`, and no `waiting` before it;
 #   5. checked after `waiting`:
 #        - exactly one CSCB-parented `spawn` naming the persona's id with
@@ -186,10 +190,13 @@
 #        CSCB `resume` of G's id after the mark, and a server.log line
 #        naming ErrNoSessionId on a `resume` of G no later than the first
 #        CSCB reuse spawn of G's id; every CSCB-parented `spawn` of G's id
-#        carrying `--reuse-finished` made before the leftover was ended has
-#        its refusal line, each UNAVAILABLE or CONFLICT (the class
-#        `classifyAdError` gives the error name it names), and no reuse
-#        spawn succeeded before then; exactly one succeeded after; the row
+#        carrying `--reuse-finished` made before the harness began ending
+#        the leftover (the time taken just before `end_session`) has its
+#        refusal line before then, each UNAVAILABLE or CONFLICT (the class
+#        `classifyAdError` gives the error name it names), at least two,
+#        apart from at most one in flight across that time, whose outcome
+#        is accepted either way; no reuse spawn succeeded before then;
+#        exactly one succeeded after the mark; the row
 #        reads `waiting` with a session id; no CSCB `delete` after the mark;
 #        at least one background read answered and none ErrSpawnNotFound
 #        (another failed read is logged);
@@ -214,9 +221,10 @@
 #        carries `--reuse-finished`, apart from the collision ladder's first
 #        spawn of each attempt, which answers ErrInstanceIdCollision and
 #        writes nothing (its collision line; SRJ-111, SRJ-114); the reuse
-#        spawns made before the session was ended
-#        each have their refusal line, UNAVAILABLE or CONFLICT, and none
-#        succeeded before then; exactly one succeeded after; no CSCB
+#        spawns made before the harness began ending the session each have
+#        their refusal line, UNAVAILABLE or CONFLICT, as for G (one in
+#        flight across that time accepted either way), and none succeeded
+#        before then; exactly one succeeded after the mark; no CSCB
 #        `resume` of H's id after the mark; the row reads `waiting` with a
 #        session id other than the first life's; no CSCB `delete` after the
 #        mark; at least one background read answered and none
@@ -419,6 +427,9 @@ ENDED_WAIT_S=30
 # The harness check's transcript appearing after the typed line, and its
 # stub's report-in banner.
 TRANSCRIPT_WAIT_S=15
+# The harness check's hold after a typed slash command, in which no
+# transcript may be written (the stub reads a line at once).
+SLASH_HOLD_S=2
 # The background `get`'s pause between reads.
 POLL_PERIOD_S=0.05
 # Scenario 12: the first refused reuse spawn, from the launch: G (60 s at
@@ -434,6 +445,9 @@ REFUSAL_WAIT_S=480
 REUSE_WAIT_S=480
 # The scenario 12 background `get`'s pause between reads.
 WATCH_PERIOD_S=1
+# A background `get` ending at its stop file: the read in progress (a
+# harness `get`) and its pause.
+BG_STOP_WAIT_S=30
 # Scenario 18: a reload's preview reaching the pending file after a
 # config.json edit (the reload tick runs 5 s after the previous pass).
 RELOAD_WAIT_S=60
@@ -759,17 +773,38 @@ t19_end_life() {
 # The background harness `get` (the pending window)
 # ---------------------------------------------------------------------------
 
+# t19_bg_stop <pid> <stop-file> <step>: stop a background reader
+# (`t19_poller_start`, `t19_watch_start`): create its stop file, which it
+# checks at the top of its loop, wait for it to end (bounded at
+# BG_STOP_WAIT_S), then reap it (`wait`), so the reads it appended are whole
+# before its file is read. It is never signalled, so no read is cut short.
+t19_bg_stop() {
+    local pid="$1" stop="$2" step="$3"
+    : > "${stop}" || fail "${step}: could not create the stop file ${stop}"
+    wait_until "${BG_STOP_WAIT_S}" "${step}: the background reader ${pid} did not stop at its stop file" t19_pid_gone "${pid}"
+    # Gone (a zombie until reaped): drop it from the tracked PIDs, then reap it.
+    stop_tracked_pid "${pid}" 1 "${step}"
+    wait "${pid}" 2> /dev/null || true
+}
+
+t19_pid_gone() {
+    ! pid_alive "$1"
+}
+
 # t19_poller_start <id> <file>: from now on, a subshell of the scenario's own
 # shell (`track_pid`) reads the row with the harness `get`, every
 # POLL_PERIOD_S, and appends one JSON line per answered read to <file>:
-# {t, state, launch_started_at, claude_session_id}.
+# {t, state, launch_started_at, claude_session_id}. It ends at the top of its
+# loop once <file>.stop exists (`t19_bg_stop`).
 t19_poller_start() {
     local id="$1" file="$2"
     : > "${file}"
+    rm -f -- "${file}.stop"
     (
         set +e
         tmp="${file}.read"
         while :; do
+            [[ -e "${file}.stop" ]] && exit 0
             if ad get --claude-instance-id "${id}" > "${tmp}" 2> /dev/null; then
                 jq -c --arg t "${EPOCHREALTIME/,/.}" \
                     '{t: $t, state: .state, launch_started_at: (.launch_started_at // ""), claude_session_id: (.claude_session_id // "")}' \
@@ -844,6 +879,17 @@ t19_pane_shows() {
     "${SCENARIO_REAL_TMUX}" capture-pane -p -t "$1" 2> /dev/null | grep -qF -- "$2"
 }
 
+# t19_transcripts_hold <count> <hold-s> <step>: for <hold-s> seconds the
+# transcripts stay <count>.
+t19_transcripts_hold() {
+    local deadline=$(( SECONDS + $2 ))
+    while :; do
+        [[ "$(t19_transcripts)" == "$1" ]] || fail "$3: $(t19_transcripts) transcript(s), not $1"
+        (( SECONDS < deadline )) || return 0
+        sleep 0.2
+    done
+}
+
 t19_harness_check() {
     local step="harness check" dir pane before out
     dir="$(make_workdir "${SCENARIO_TAG}selfcheck_work")"
@@ -858,6 +904,11 @@ t19_harness_check() {
     stub_press_enter "${pane}"
     wait_until "${TRANSCRIPT_WAIT_S}" "${step}: the stub never reported in after Enter" t19_pane_shows "${pane}" 'Listening for channel messages from:'
     [[ "$(t19_transcripts)" == "${before}" ]] || fail "${step}: a transcript was written at report-in"
+    # A slash command typed into the pane (CSCB's `pause` types `/exit`) is no
+    # message: once the pane shows it, no transcript follows for the hold.
+    stub_type_line "${pane}" "/exit"
+    wait_until "${TRANSCRIPT_WAIT_S}" "${step}: the pane never showed the typed /exit" t19_pane_shows "${pane}" "/exit"
+    t19_transcripts_hold "${before}" "${SLASH_HOLD_S}" "${step}: after a typed /exit"
     stub_type_line "${pane}" "a first message"
     wait_until "${TRANSCRIPT_WAIT_S}" "${step}: no transcript after a typed line" t19_transcripts_are "$(( before + 1 ))"
     stub_type_line "${pane}" "${STUB_EXIT_SENTINEL}"
@@ -917,7 +968,7 @@ t19_leg() {
     t19_start_and_wait 1
     wait_until "${ROW_WAIT_S}" "${step}: ${id}'s new life never reported in (waiting)" t19_row_is "${id}" waiting
     wait_until 10 "${step}: the background get never read ${id} waiting" t19_poll_has_waiting "${poll}"
-    stop_tracked_pid "${T19_POLLER_PID}" 10 "${step}: stop the background get"
+    t19_bg_stop "${T19_POLLER_PID}" "${poll}.stop" "${step}: stop the background get"
 
     # 4. pending with a launch start, then waiting.
     t19_check_pending_then_waiting "${poll}" "${id}" "${step}"
@@ -1011,14 +1062,17 @@ t19_poll() {
 # shell (`track_pid`) reads the row with the harness `get` every
 # WATCH_PERIOD_S and appends one JSON line per read to <file>: {t, rc, state,
 # claude_session_id} for an answered read, {t, rc, err} (its output and
-# error, on one line) for a failed one.
+# error, on one line) for a failed one. It ends at the top of its loop once
+# <file>.stop exists (`t19_bg_stop`).
 t19_watch_start() {
     local id="$1" file="$2"
     : > "${file}"
+    rm -f -- "${file}.stop"
     (
         set +e
         tmp="${file}.read"
         while :; do
+            [[ -e "${file}.stop" ]] && exit 0
             t="${EPOCHREALTIME/,/.}"
             ad get --claude-instance-id "${id}" > "${tmp}" 2> "${tmp}.err"
             rc=$?
@@ -1135,25 +1189,28 @@ t19_reuse_succeeded() {
     [[ "$(t19_count_lines "$(t19_reuse_lines "${REUSE_SPAWNED_HEAD}" "$1 ")")" != 0 ]]
 }
 
-# t19_check_refusals <id> <ref> <t-end> <step>: every CSCB-parented `spawn`
-# of <id> carrying `--reuse-finished` after the mark and before <t-end> (when
-# the harness ended the session) has its refusal line before <t-end>, each
-# UNAVAILABLE or CONFLICT, and no reuse spawn succeeded before <t-end>;
-# exactly one succeeded after it. Logs each refusal's error name and
-# description.
+# t19_check_refusals <id> <ref> <t-begin> <step>: <t-begin> is the time taken
+# just before the harness began ending the session (`end_session`). Every
+# CSCB-parented `spawn` of <id> carrying `--reuse-finished` made after the
+# mark and before <t-begin> was refused, each UNAVAILABLE or CONFLICT, at
+# least 2 of them, and no reuse spawn succeeded before <t-begin>; exactly one
+# succeeded after the mark. A reuse spawn in flight while the session was
+# being ended (made before <t-begin>, its line logged after it) is accepted
+# either way: refused (logged) or the one success. Logs each refusal's error
+# name and description.
 t19_check_refusals() {
-    local id="$1" ref="$2" t_end="$3" step="$4" calls n_calls lines line t rest name cls n_refused=0 n_after=0 success
+    local id="$1" ref="$2" t_begin="$3" step="$4" calls n_calls lines line t rest name cls n_refused=0 n_after=0 success in_flight
     calls="$(t19_reuse_spawns_since "${MARK_TIME}" "${id}")" || exit 1
-    n_calls="$(t19_count_lines "$(awk -F'\t' -v e="${t_end}" '$2 + 0 < e + 0' <<< "${calls}")")"
+    n_calls="$(t19_count_lines "$(awk -F'\t' -v e="${t_begin}" '$2 + 0 < e + 0' <<< "${calls}")")"
     lines="$(t19_reuse_lines "${REUSE_REFUSED_HEAD}" "${ref}: ")"
     while IFS= read -r line; do
         [[ -n "${line}" ]] || continue
         t="$(t19_line_time "${line}")"
         rest="${line#*"${REUSE_REFUSED_HEAD}${ref}: "}"
         name="${rest%% *}"
-        if ! t19_at_or_before "${t}" "${t_end}"; then
+        if ! t19_at_or_before "${t}" "${t_begin}"; then
             n_after=$(( n_after + 1 ))
-            echo "${TEST_NAME}: NOTE: ${step}: a reuse spawn of ${id} refused after the session was ended, at ${t}: ${rest:0:300}"
+            echo "${TEST_NAME}: NOTE: ${step}: a reuse spawn of ${id} refused after the harness began ending the session, at ${t}: ${rest:0:300}"
             continue
         fi
         n_refused=$(( n_refused + 1 ))
@@ -1163,23 +1220,31 @@ t19_check_refusals() {
             || fail "${step}: a reuse spawn of ${id} was answered ${name} (${cls}), neither ${CLASS_UNAVAILABLE} nor ${CLASS_CONFLICT}: ${rest:0:300}"
         echo "${TEST_NAME}: ${step}: CSCB's reuse spawn of ${id} refused at ${t}, ${cls}: ${rest:0:300}"
     done <<< "${lines}"
-    (( n_calls >= 2 )) || { t19_dump_reuse "${id}" "${ref}"; fail "${step}: ${n_calls} CSCB reuse spawn(s) of ${id} before the session was ended, not at least 2"; }
-    [[ "${n_calls}" == "${n_refused}" ]] \
-        || { t19_dump_reuse "${id}" "${ref}"; fail "${step}: ${n_calls} CSCB reuse spawn(s) of ${id} before the session was ended, ${n_refused} refusal line(s)"; }
+    (( n_refused >= 2 )) || { t19_dump_reuse "${id}" "${ref}"; fail "${step}: ${n_refused} CSCB reuse spawn(s) of ${id} refused before the harness began ending the session, not at least 2"; }
+    # Each call made before <t-begin> is refused before it, or (at most one,
+    # a reuse spawn runs alone) is in flight across it.
+    in_flight=$(( n_calls - n_refused ))
+    (( in_flight == 0 || in_flight == 1 )) \
+        || { t19_dump_reuse "${id}" "${ref}"; fail "${step}: ${n_calls} CSCB reuse spawn(s) of ${id} before the harness began ending the session, ${n_refused} refusal line(s) before it"; }
+    if (( in_flight == 1 )); then
+        echo "${TEST_NAME}: NOTE: ${step}: one CSCB reuse spawn of ${id} was in flight when the harness began ending the session; its outcome is accepted either way"
+    fi
     success="$(t19_reuse_lines "${REUSE_SPAWNED_HEAD}" "${ref} ")"
     [[ "$(t19_count_lines "${success}")" == 1 ]] \
         || { t19_dump_reuse "${id}" "${ref}"; fail "${step}: $(t19_count_lines "${success}") successful reuse spawn(s) of ${id} after the mark, not 1"; }
     t="$(t19_line_time "${success}")"
-    t19_at_or_before "${t_end}" "${t}" || fail "${step}: the reuse spawn of ${id} succeeded at ${t}, before the session was ended (${t_end})"
-    echo "${TEST_NAME}: ${step}: ${n_refused} reuse spawn(s) of ${id} refused while the session ran; the reuse spawn at ${t}, after it was ended at ${t_end}, succeeded"
+    t19_at_or_before "${t_begin}" "${t}" || fail "${step}: the reuse spawn of ${id} succeeded at ${t}, before the harness began ending the session (${t_begin})"
+    echo "${TEST_NAME}: ${step}: ${n_refused} reuse spawn(s) of ${id} refused while the session ran; the reuse spawn at ${t}, after the harness began ending it at ${t_begin}, succeeded"
 }
 
 # t19_note_posts <channel> <record-line> <step>: log the posts at <channel>
 # in the Slack stub's record after <record-line>.
 t19_note_posts() {
     local texts
+    # A torn last line (the stub may be writing it) does not parse and is
+    # skipped.
     texts="$(t19_after "${STUB_RECORD}" "$2" \
-        | jq -r --arg c "$1" 'select(.event == "api" and .method == "chat.postMessage" and .channel == $c) | .text | gsub("\n"; " ") | .[0:200]')" || true
+        | jq -R -r --arg c "$1" 'fromjson? // empty | select(.event == "api" and .method == "chat.postMessage" and .channel == $c) | .text | gsub("\n"; " ") | .[0:200]')" || true
     echo "${TEST_NAME}: NOTE: $3: $(t19_count_lines "${texts}") post(s) at $1 after the mark"
     if [[ -n "${texts}" ]]; then
         sed "s/^/${TEST_NAME}: NOTE: $3:   post: /" <<< "${texts}"
@@ -1222,7 +1287,7 @@ t19_pane_dead() {
 
 t19_leg_missing_row() {
     local step="missing row, no session id" id="${G_ID}" name="${G_NAME}" session="${G_SESSION}" work="${G_WORK}"
-    local ref launch_start launch_s watch leftover_sid elapsed t_end missing_t fm_t first_reuse_t diag diag_t n all_fm sid mark_record
+    local ref launch_start launch_s watch leftover_sid elapsed t_begin missing_t fm_t first_reuse_t diag diag_t n all_fm sid mark_record
 
     ref="$(persona_ref "${name}")" || exit 1
 
@@ -1258,9 +1323,9 @@ t19_leg_missing_row() {
     #    refused while the leftover runs; then the harness ends it.
     t19_wait_refusals "${id}" "${ref}" 1 "${FIRST_REFUSAL_WAIT_S}" "${step}: the first refused reuse spawn"
     t19_wait_refusals "${id}" "${ref}" 2 "${REFUSAL_WAIT_S}" "${step}: a refused retry of the reuse spawn"
+    t_begin="${EPOCHREALTIME/,/.}"
     end_session "${leftover_sid}"
-    t_end="${EPOCHREALTIME/,/.}"
-    echo "${TEST_NAME}: ${step}: the harness ended the leftover ${leftover_sid} at ${t_end}"
+    echo "${TEST_NAME}: ${step}: the harness began ending the leftover ${leftover_sid} at ${t_begin}"
 
     # 4. The next reuse spawn succeeds; the row reads waiting.
     if ! t19_poll "${REUSE_WAIT_S}" t19_reuse_succeeded "${ref}"; then
@@ -1268,7 +1333,7 @@ t19_leg_missing_row() {
         fail "${step}: no reuse spawn of ${id} succeeded after the leftover was ended (not within ${REUSE_WAIT_S}s)"
     fi
     wait_until "${ROW_WAIT_S}" "${step}: ${id}'s new life never reported in (waiting)" t19_row_is "${id}" waiting
-    stop_tracked_pid "${T19_WATCH_PID}" 10 "${step}: stop the background get"
+    t19_bg_stop "${T19_WATCH_PID}" "${watch}.stop" "${step}: stop the background get"
 
     # 5. The checks.
     # The row read missing, marked by CSCB's own run: a CSCB find-missing
@@ -1297,7 +1362,7 @@ t19_leg_missing_row() {
     echo "${TEST_NAME}: ${step}: CSCB's resume of ${id} answered ${NO_SESSION_ID} at ${diag_t}; ${n} CSCB resume call(s) after the mark"
 
     # Each reuse spawn refused while the leftover ran; one succeeded after.
-    t19_check_refusals "${id}" "${ref}" "${t_end}" "${step}"
+    t19_check_refusals "${id}" "${ref}" "${t_begin}" "${step}"
 
     # The new life; no delete; the row present throughout.
     t19_row_get "${id}" "${step}: the new life"
@@ -1326,7 +1391,7 @@ t19_leg_missing_row() {
 
 t19_leg_stale_config_dir() {
     local step="ended row, stale config_dir" id="${H_ID}" name="${H_NAME}" session="${H_SESSION}"
-    local ref old_sid ids sid dead watch t_end n all collided new_sid mark_record
+    local ref old_sid ids sid dead watch t_begin n all collided new_sid mark_record
 
     ref="$(persona_ref "${name}")" || exit 1
 
@@ -1359,9 +1424,9 @@ t19_leg_stale_config_dir() {
     t19_watch_start "${id}" "${watch}"
     t19_start_and_wait 1
     t19_wait_refusals "${id}" "${ref}" 2 "${REFUSAL_WAIT_S}" "${step}: a refused retry of the reuse spawn"
+    t_begin="${EPOCHREALTIME/,/.}"
     end_session "${sid}"
-    t_end="${EPOCHREALTIME/,/.}"
-    echo "${TEST_NAME}: ${step}: the harness ended ${id}'s remaining session ${sid} at ${t_end}"
+    echo "${TEST_NAME}: ${step}: the harness began ending ${id}'s remaining session ${sid} at ${t_begin}"
 
     # 4. The next reuse spawn succeeds; the row reads waiting.
     if ! t19_poll "${REUSE_WAIT_S}" t19_reuse_succeeded "${ref}"; then
@@ -1369,7 +1434,7 @@ t19_leg_stale_config_dir() {
         fail "${step}: no reuse spawn of ${id} succeeded after its session was ended (not within ${REUSE_WAIT_S}s)"
     fi
     wait_until "${ROW_WAIT_S}" "${step}: ${id}'s new life never reported in (waiting)" t19_row_is "${id}" waiting
-    stop_tracked_pid "${T19_WATCH_PID}" 10 "${step}: stop the background get"
+    t19_bg_stop "${T19_WATCH_PID}" "${watch}.stop" "${step}: stop the background get"
 
     # 5. The checks.
     # Every CSCB spawn of H's id after the mark that carries no
@@ -1384,7 +1449,7 @@ t19_leg_stale_config_dir() {
     n="$(t19_cscb_count_since "${MARK_TIME}" resume "${id}")"
     [[ "${n}" == 0 ]] || { t19_dump_reuse "${id}" "${ref}"; fail "${step}: ${n} CSCB resume call(s) of ${id} after the mark: an ended row with a stale config_dir label is never resumed"; }
     echo "${TEST_NAME}: ${step}: of ${all} CSCB spawn(s) of ${id} after the mark, every one without --reuse-finished (${collided}) was the collision ladder's first spawn, answered ${INSTANCE_ID_COLLISION}; no CSCB resume of it was made"
-    t19_check_refusals "${id}" "${ref}" "${t_end}" "${step}"
+    t19_check_refusals "${id}" "${ref}" "${t_begin}" "${step}"
 
     # The new life; no delete; the row present throughout.
     t19_row_get "${id}" "${step}: the new life"
