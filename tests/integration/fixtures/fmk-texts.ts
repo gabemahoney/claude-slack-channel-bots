@@ -311,6 +311,19 @@
  *   JSONL_TRANSCRIPT_LOST_ENTRY_CLASS
  *                                    the diagnosis's startup-errors classes
  *                                    (src/session-manager.ts)
+ * Scenario 12, a missing row with no session id and an ended row with a
+ * stale `config_dir` label beside a running session (test-19; b.jg5
+ * SRJ-1414, SRJ-707, SRJ-410):
+ *   classifyAdError <error-class>    the class label `classifyAdError`
+ *                                    (src/ad-error-class.ts) gives an error of
+ *                                    the agent-director error class
+ *                                    <error-class> the package re-exports
+ *                                    (src/agent-director-errors.ts; for
+ *                                    example ErrTmuxSessionConflict), made
+ *                                    with the verb `spawn`, its own name and
+ *                                    an empty description: a script reads a
+ *                                    refused call's class from the error name
+ *                                    its log line names
  *
  * SPDX-License-Identifier: MIT
  */
@@ -874,6 +887,20 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   JSONL_DIAGNOSIS_REUSE_WORDING: { args: [], print: () => text('session-manager.ts', 'JSONL_DIAGNOSIS_REUSE_WORDING') },
   JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS: { args: [], print: () => text('session-manager.ts', 'JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS') },
   JSONL_TRANSCRIPT_LOST_ENTRY_CLASS: { args: [], print: () => text('session-manager.ts', 'JSONL_TRANSCRIPT_LOST_ENTRY_CLASS') },
+  // Scenario 12 (test-19; b.jg5 SRJ-1414).
+  classifyAdError: {
+    args: ['error-class'],
+    print: async ([name]) => {
+      if (!/^Err[A-Za-z]+$/.test(name)) throw new PrinterFailure(`error class '${name}' is not an Err* name`, USAGE_EXIT)
+      const errorClass = (await packageModule('agent-director-errors.ts'))[name]
+      if (typeof errorClass !== 'function' || errorClass.name !== name) {
+        throw new PrinterFailure(`src/agent-director-errors.ts re-exports no error class named ${name}`, ENTRY_FAIL_EXIT)
+      }
+      const thrown = new (errorClass as new (verb: string, errName: string, errDescription: string) => Error)('spawn', name, '')
+      const classify = await fn<(v: unknown) => { readonly errorClass: string }>('ad-error-class.ts', 'classifyAdError')
+      return classify(thrown).errorClass
+    },
+  },
 }
 
 async function main(argv: readonly string[]): Promise<number> {

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Test 19 (HO §7 scenario 7; b.jg5 SRJ-1409; AC 1): reuse replaces delete.
-# With `resume_enabled=false`, and separately with a missing transcript, a
+# Test 19 (HO §7 scenarios 7 and 12; b.jg5 SRJ-1409, SRJ-1414; AC 1): reuse
+# replaces delete.
+#
+# Scenario 7 (SRJ-1409): with `resume_enabled=false`, and separately with a
+# missing transcript, a
 # persona whose row is finished is brought up by a reuse spawn of its own id
 # (`spawn --reuse-finished`), never a delete: the row reads `pending` with a
 # `launch_started_at`, then `waiting`; `get`'s `prior_sessions` does not list
@@ -10,6 +13,16 @@
 # diagnosis runs before the reuse spawn (b.jg5 SRJ-707, SRJ-708, SRJ-711,
 # SRJ-712, SRJ-413, SRJ-716, SRJ-1306, SRJ-1401, SRJ-1418; E22's hatch note:
 # no CSCB `delete`).
+#
+# Scenario 12 (SRJ-1414): a `missing` row with no session id while a session
+# with the persona's exact name and label runs, and an `ended` row with a
+# stale `config_dir` label while its own session still runs. CSCB deletes
+# nothing: the first gets ErrNoSessionId from its `resume`, the second is
+# never resumed; each reuse spawn of the persona's id is refused (UNAVAILABLE
+# or CONFLICT) while the session runs; once the harness has ended the session
+# a reuse succeeds and the persona starts fresh (b.jg5 SRJ-1414, SRJ-707,
+# SRJ-709, SRJ-410, SRJ-501, SRJ-505, SRJ-716, SRJ-1401, SRJ-1418; E22's hatch
+# note: no CSCB `delete`).
 #
 # fmk setup (lib/scenario.sh fmk mode; b.jg5 SRJ-1306, SRJ-1401):
 # - its own HOME, agent-director store and tmux server, all under
@@ -23,13 +36,20 @@
 #   reconnects or relaunches a persona, and `session_restart_delay` 0, so the
 #   MCP session a stub's exit closes schedules no restart (SRJ-1401: CSCB's
 #   timings are changed only through its configuration); `resume_enabled`
-#   false for leg E, true (the default, written out) for leg F;
+#   false for leg E, true (the default, written out) for legs F, G and H;
 # - every start is live (`start_server --live`), against the loopback Slack
 #   stub (fixtures/slack-stub-server.ts, one for the script, every persona's
 #   token pair answered ok);
 # - each leg has its own persona (key, credentials, channel, directories):
-#   E (`resume_enabled=false` leg) and F (missing-transcript leg). Each
-#   persona's claude_config_dir holds a `.claude.json` (`{}`), as a user's
+#   E (`resume_enabled=false` leg), F (missing-transcript leg), G (missing-row
+#   leg) and H (stale `config_dir` leg); each is a Slack destination (its
+#   channel takes its permission prompts). H's claude_config_dir is a symlink
+#   under SCENARIO_ROOT to one directory, re-pointed to another by
+#   `repoint_symlink` (ruling S5's working default: CSCB writes the
+#   `config_dir` label by real path and compares the persona's directory by
+#   real path, so the re-point makes the row's label stale with no config
+#   edit). Each persona's claude_config_dir (both of H's directories) holds
+#   a `.claude.json` (`{}`), as a user's
 #   Claude config does, so agent-director's pre-trust has a file to write
 #   (`pre_trust` `ok`; with no file it reports `failed`). Between legs the
 #   harness plays the operator while the server is stopped: config.json is
@@ -39,7 +59,10 @@
 # - checks read only their own leg's ids and window: server.log and
 #   startup-errors.log from the leg's mark line, CSCB's agent-director calls
 #   (`cscb_ad_calls`: only the agent-director shim's lines whose parent is a
-#   CSCB process) from the mark's time; rows by a harness `get` or `status`.
+#   CSCB process) from the mark's time; rows by a harness `get` or `status`;
+#   posts from the Slack stub's record from the mark's line;
+# - the harness runs no `find-missing` (b.jg5 SRJ-1401): every row is marked
+#   by agent-director's own hooks or by CSCB's own runs.
 #
 # Stub modes (fixtures/stub-claude.sh): each persona's first life runs
 # `dev-channels` (the reporting stub: the approver's Enter makes it report in,
@@ -50,7 +73,10 @@
 # never-messaged life's does. Each life is ended by the harness typing the
 # stub's exit sentinel into the persona's pane (`stub_type_line`, a harness
 # addition, confirm at the reconcile pass): the stub fires SessionEnd and
-# exits, and the row reads `ended`.
+# exits, and the row reads `ended`. In scenario 12's legs, G's first life
+# and its leftover run `silent` (no dialog and no hook: the row keeps no
+# session id, and a read of the leftover's pane shows no dialog for CSCB to
+# answer) and G's new life `dev-channels`; H's lives run `dev-channels`.
 #
 # Harness check, first: the two harness additions on a stub the harness
 # starts itself (`seed_unlabelled`, no agent-director and no CSCB process): in
@@ -58,8 +84,10 @@
 # the human's Enter reports it in, one exists once a line has been typed
 # (`stub_type_line`), and the typed sentinel ends it.
 #
-# Legs, in run order (one scenario HOME, store, tmux server and Slack stub);
-# each:
+# Legs, in run order (one scenario HOME, store, tmux server and Slack stub):
+# scenario 7's legs E and F, then scenario 12's legs G and H.
+#
+# Scenario 7's legs (E, F); each:
 #   1. the persona's first life: config.json with the persona, a start, its
 #      row `waiting`; the harness reads the life's session id (`get`'s
 #      `claude_session_id`);
@@ -97,9 +125,83 @@
 #      harness agent-director call (`ad_capture`), which must exit non-zero
 #      answering ErrJsonlNeverWritten; the row is present afterwards.
 #
+# Scenario 12's legs (G, H), each with a background harness `get` of the row
+# (a subshell of the scenario's own shell, every WATCH_PERIOD_S) from the
+# row's first read until it reads `waiting` again, and the leg's mark before
+# its start:
+#   G (a `missing` row with no session id beside a leftover holding its name;
+#     working default: the silent stub ended by its sentinel before G, then
+#     the leftover seeded):
+#     1. `silent` selected for G's directory; config.json with G, the mark
+#        and a start: CSCB's plain spawn; the row reads `pending` with a
+#        launch start and no `claude_session_id`;
+#     2. before G has passed from the launch start (checked against
+#        `adGraceMs.default`), the harness types the exit sentinel into G's
+#        pane (the silent stub exits with no hook, and its session closes
+#        with it), seeds a leftover (`seed_leftover`) named G's session name
+#        whose `@ad_owner` names an earlier launch of G's id with the store's
+#        own id (`ad_store_id`, `ad_owner_label`) and whose pane carries
+#        `@ad_pane` (`ad_pane_label`), its worker the `silent` stub in G's
+#        directory, and then selects `dev-channels` for G's directory;
+#     3. CSCB's own pending-row runs mark the row `missing` past G; its
+#        `resume` answers ErrNoSessionId and the reuse spawn follows, refused
+#        while the leftover runs; the harness waits for at least two refused
+#        reuse spawns (the first, and a retry at the latch re-check's or the
+#        retry timer's cadence), with none in flight, then ends the leftover
+#        by its session id (`end_session`);
+#     4. the next reuse spawn succeeds and the row reads `waiting`;
+#     5. checked: a background read of `missing`, with a CSCB-parented
+#        `find-missing` after the mark no later than it, and no
+#        `find-missing` from any other process after the mark; at least one
+#        CSCB `resume` of G's id after the mark, and a server.log line
+#        naming ErrNoSessionId on a `resume` of G no later than the first
+#        CSCB reuse spawn of G's id; every CSCB-parented `spawn` of G's id
+#        carrying `--reuse-finished` made before the leftover was ended has
+#        its refusal line, each UNAVAILABLE or CONFLICT (the class
+#        `classifyAdError` gives the error name it names), and no reuse
+#        spawn succeeded before then; exactly one succeeded after; the row
+#        reads `waiting` with a session id; no CSCB `delete` after the mark;
+#        at least one background read answered and none ErrSpawnNotFound
+#        (another failed read is logged);
+#     6. a plain `stop`, and the harness ends G's new life with the exit
+#        sentinel (the row reads `ended`).
+#   H (an `ended` row with a stale `config_dir` label beside its remaining
+#     session; working default: `remain-on-exit` and the symlink re-point):
+#     1. config.json with H (its claude_config_dir the symlink), a start; the
+#        row reads `waiting`; the harness reads its session id;
+#     2. `set_remain_on_exit` on H's session, then the exit sentinel: the
+#        stub fires SessionEnd and exits, the row reads `ended`, and the
+#        session stays with its pane dead;
+#     3. the symlink re-pointed (`repoint_symlink`), a plain `stop`, the mark
+#        and a start: CSCB's collision `get` reads the row `ended` with a
+#        `config_dir` label that is not the persona's, so it makes a reuse
+#        spawn and no `resume` (SRJ-707's pre-resume guard), refused while
+#        the session remains; the harness waits for at least two refused
+#        reuse spawns, with none in flight, then ends the remaining session
+#        by its session id (`end_session`);
+#     4. the next reuse spawn succeeds and the row reads `waiting`;
+#     5. checked: every CSCB-parented `spawn` of H's id after the mark
+#        carries `--reuse-finished`, apart from the collision ladder's first
+#        spawn of each attempt, which answers ErrInstanceIdCollision and
+#        writes nothing (its collision line; SRJ-111, SRJ-114); the reuse
+#        spawns made before the session was ended
+#        each have their refusal line, UNAVAILABLE or CONFLICT, and none
+#        succeeded before then; exactly one succeeded after; no CSCB
+#        `resume` of H's id after the mark; the row reads `waiting` with a
+#        session id other than the first life's; no CSCB `delete` after the
+#        mark; at least one background read answered and none
+#        ErrSpawnNotFound (another failed read is logged);
+#     6. a plain `stop`, and the harness ends H's new life with the exit
+#        sentinel.
+#
 # Waits: rows reporting in at ROW_WAIT_S; start passes at START_WAIT_S; a
 # row reading `ended` after the sentinel, and its session going, at
-# ENDED_WAIT_S; the harness check's transcript at TRANSCRIPT_WAIT_S. The
+# ENDED_WAIT_S; the harness check's transcript at TRANSCRIPT_WAIT_S; in
+# scenario 12, the first refused reuse spawn at FIRST_REFUSAL_WAIT_S (G
+# past the launch start, then the retry timer's next run), a second at
+# REFUSAL_WAIT_S (the latch re-check's 120 s, or the retry timer's wait of
+# at most 300 s), and the reuse after the session is ended at
+# REUSE_WAIT_S. The
 # pending window is read by the background `get` (POLL_PERIOD_S between
 # reads), with no delay added to the stub: the window lasts from the reuse
 # spawn's reset of the row until the approver's Enter reaches the stub and
@@ -113,16 +215,35 @@
 # (JSONL_DIAGNOSIS_REUSE_WORDING) and its startup-errors classes
 # (JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS,
 # src/session-manager.ts); the error names ErrJsonlNeverWritten and
-# ErrJsonlMissing (`adErrorName`, src/agent-director-errors.ts); the
-# last-applied record's suffix (LAST_APPLIED_FILE_SUFFIX, src/reload.ts).
+# ErrJsonlMissing, and ErrNoSessionId, ErrSpawnNotFound and
+# ErrInstanceIdCollision (`adErrorName`,
+# src/agent-director-errors.ts); the class labels UNAVAILABLE and CONFLICT
+# (`adErrorClass`, src/ad-error-class.ts) and the class of each refusal's
+# error name (`classifyAdError`, a printer entry of scenario 12); G
+# at agent-director's default settings (`adGraceMs.default`,
+# src/ad-settings.ts); the last-applied record's suffix
+# (LAST_APPLIED_FILE_SUFFIX, src/reload.ts).
 # Quoted, with no exported builder: the diagnosis's log line head
 # `[slack] ErrJsonlMissing diagnostic: ` (src/session-manager.ts
-# diagnoseJsonlMissing, reportInconclusiveDiagnosis).
+# diagnoseJsonlMissing, reportInconclusiveDiagnosis); the reuse spawn's
+# refusal line head `[slack] reuseSpawnForPersona: reuse spawn refused for `
+# and success line head `[slack] reuseSpawnForPersona: reuse-spawned `
+# (src/session-manager.ts logRefusal, logConflict and reuseSpawnForPersona,
+# with REUSE_SPAWN_SITE and REUSE_SPAWN_WHAT); the collision ladder's line
+# `[slack] spawnForPersona: <ErrInstanceIdCollision> for <ref> — fetching
+# current state` (src/session-manager.ts runPersonaLadder); the
+# no-transcript line's
+# words ` resume ` and `nothing is deleted` (src/session-manager.ts, the
+# `noTranscript` rows of resumeOrFreshSpawn, the live-row sequence and the
+# latch re-check).
 #
 # Outcomes the SRD leaves open are logged as `NOTE:` lines, not asserted:
 # each leg's CSCB calls of its id by verb, the new life's session id and
 # `transcript_status`, the diagnosis's verdict (its startup-errors entries),
-# and the pending reads' launch starts.
+# and the pending reads' launch starts; in scenario 12, each refusal's error
+# name and description, the background reads' states in order, the posts at
+# the persona's channel, the `pre_trust` value of the reuse, and
+# agent-director's trail records naming G's id, by event.
 #
 # The script ends with the closing assertions, `assert_no_server_tmux`,
 # `assert_no_cscb_include_finished` and `assert_no_cscb_delete` (b.jg5
@@ -160,6 +281,38 @@ t19_value LAST_APPLIED_SUFFIX LAST_APPLIED_FILE_SUFFIX
 # exported builder): `[slack] ErrJsonlMissing diagnostic: <ref> instance=<id>`.
 DIAGNOSIS_HEAD='[slack] ErrJsonlMissing diagnostic: '
 
+# Scenario 12's values.
+t19_value NO_SESSION_ID adErrorName ErrNoSessionId
+t19_value NOT_FOUND adErrorName ErrSpawnNotFound
+t19_value INSTANCE_ID_COLLISION adErrorName ErrInstanceIdCollision
+t19_value CLASS_UNAVAILABLE adErrorClass AD_ERROR_CLASS_UNAVAILABLE
+t19_value CLASS_CONFLICT adErrorClass AD_ERROR_CLASS_CONFLICT
+t19_value T19_GRACE_MS adGraceMs.default
+[[ "${T19_GRACE_MS}" =~ ^[1-9][0-9]*$ ]] || fail "setup: adGraceMs.default printed '${T19_GRACE_MS}', not a whole number of milliseconds"
+GRACE_S="$(awk -v ms="${T19_GRACE_MS}" 'BEGIN { printf "%.3f", ms / 1000 }')"
+
+# The reuse spawn's refusal line head and success line head
+# (src/session-manager.ts: logRefusal for an UNAVAILABLE refusal and
+# logConflict for a CONFLICT, and reuseSpawnForPersona's success line, each
+# with REUSE_SPAWN_SITE and REUSE_SPAWN_WHAT; no exported builder):
+#   `[slack] reuseSpawnForPersona: reuse spawn refused for <ref>: <error name> …`
+#   `[slack] reuseSpawnForPersona: reuse-spawned <ref> instanceId=<id> — …`
+REUSE_REFUSED_HEAD='[slack] reuseSpawnForPersona: reuse spawn refused for '
+REUSE_SPAWNED_HEAD='[slack] reuseSpawnForPersona: reuse-spawned '
+# The words every no-transcript line holds after the error's description
+# (src/session-manager.ts, the `noTranscript` rows of resumeOrFreshSpawn,
+# the live-row sequence and the latch re-check; no exported builder):
+#   `<error name> … on resume for <ref> — … nothing is deleted …`, or
+#   `… on the re-check's resume of <ref> — … nothing is deleted …`.
+NO_TRANSCRIPT_RESUME_WORD=' resume '
+NO_TRANSCRIPT_NOTHING_DELETED='nothing is deleted'
+# The collision ladder's line after its first spawn collided
+# (src/session-manager.ts runPersonaLadder; no exported builder):
+#   `[slack] spawnForPersona: ErrInstanceIdCollision for <ref> — fetching current state`.
+LADDER_COLLISION_HEAD='[slack] spawnForPersona: '
+LADDER_COLLISION_FOR=' for '
+LADDER_COLLISION_TAIL=' — fetching current state'
+
 # ---------------------------------------------------------------------------
 # Bounds (seconds)
 # ---------------------------------------------------------------------------
@@ -177,6 +330,19 @@ ENDED_WAIT_S=30
 TRANSCRIPT_WAIT_S=15
 # The background `get`'s pause between reads.
 POLL_PERIOD_S=0.05
+# Scenario 12: the first refused reuse spawn, from the launch: G (60 s at
+# agent-director's default settings) past the launch start, then the retry
+# timer's next run and the restart path's decision.
+FIRST_REFUSAL_WAIT_S=420
+# A further refused reuse spawn: the latch re-check's interval (120 s) after
+# a CONFLICT, or the retry timer's next wait (at most 300 s) after an
+# UNAVAILABLE refusal, with room for a loaded host.
+REFUSAL_WAIT_S=480
+# The reuse spawn that succeeds once the session is ended: the same
+# cadences.
+REUSE_WAIT_S=480
+# The scenario 12 background `get`'s pause between reads.
+WATCH_PERIOD_S=1
 
 # ---------------------------------------------------------------------------
 # Personas: each with its own key, credentials, channel and directories
@@ -216,7 +382,20 @@ t19_persona() {
 
 t19_persona E reusee C0T19RSE1
 t19_persona F reusef C0T19RSF1
-ALL_PERSONAS=(E F)
+t19_persona G reuseg C0T19RSG1
+t19_persona H reuseh C0T19RSH1
+ALL_PERSONAS=(E F G H)
+
+# H's claude_config_dir: a symlink under SCENARIO_ROOT to its first directory
+# (t19_persona's, holding `.claude.json`), re-pointed in leg H to a second
+# one, which holds its own `.claude.json`.
+H_CFG_ONE="${H_CFG}"
+H_CFG_TWO="${CFG_ROOT}/${SCENARIO_TAG}reuseh_cfg_two"
+H_CFG_LINK="${CFG_ROOT}/${SCENARIO_TAG}reuseh_cfg_link"
+mkdir -p "${H_CFG_TWO}"
+printf '{}\n' | write_file "${H_CFG_TWO}/.claude.json" 600
+ln -s -- "${H_CFG_ONE}" "${H_CFG_LINK}" || fail "setup: could not link ${H_CFG_LINK} to ${H_CFG_ONE}"
+H_CFG="${H_CFG_LINK}"
 
 # t19_persona_json <prefix>: one persona entry: its credentials file, working
 # directory, claude_config_dir and one channel, which also takes its
@@ -677,11 +856,432 @@ t19_leg() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# Scenario 12 (b.jg5 SRJ-1414): helpers
+# ---------------------------------------------------------------------------
+
+# t19_poll <timeout-s> <command> [<arg>...]: run the command every second
+# until it succeeds (0) or the timeout passes (1).
+t19_poll() {
+    local timeout_s="$1" deadline
+    shift
+    deadline=$(( SECONDS + timeout_s ))
+    while :; do
+        "$@" && return 0
+        (( SECONDS < deadline )) || return 1
+        sleep 1
+    done
+}
+
+# t19_watch_start <id> <file>: from now on, a subshell of the scenario's own
+# shell (`track_pid`) reads the row with the harness `get` every
+# WATCH_PERIOD_S and appends one JSON line per read to <file>: {t, rc, state,
+# claude_session_id} for an answered read, {t, rc, err} (its output and
+# error, on one line) for a failed one.
+t19_watch_start() {
+    local id="$1" file="$2"
+    : > "${file}"
+    (
+        set +e
+        tmp="${file}.read"
+        while :; do
+            t="${EPOCHREALTIME/,/.}"
+            ad get --claude-instance-id "${id}" > "${tmp}" 2> "${tmp}.err"
+            rc=$?
+            if (( rc == 0 )); then
+                jq -c --arg t "${t}" '{t: $t, rc: 0, state: .state, claude_session_id: (.claude_session_id // "")}' \
+                    "${tmp}" >> "${file}" 2> /dev/null
+            else
+                jq -cn --arg t "${t}" --argjson rc "${rc}" --rawfile o "${tmp}" --rawfile e "${tmp}.err" \
+                    '{t: $t, rc: $rc, err: (($o + " " + $e) | gsub("\n"; " ") | .[0:400])}' >> "${file}" 2> /dev/null
+            fi
+            sleep "${WATCH_PERIOD_S}"
+        done
+    ) &
+    T19_WATCH_PID=$!
+    track_pid "${T19_WATCH_PID}"
+}
+
+# t19_watch_first <file> <state>: the time of the first answered read of
+# <state> in <file>, or nothing.
+t19_watch_first() {
+    jq -r -s --arg s "$2" '[.[] | select(.rc == 0 and .state == $s)] | if length == 0 then "" else .[0].t end' "$1"
+}
+
+# t19_watch_check <file> <id> <step>: the row was present at every read:
+# at least one answered read, and none answered ErrSpawnNotFound; logs any
+# other failed read (no reading of the row either way) and the states read,
+# in order.
+t19_watch_check() {
+    local file="$1" id="$2" step="$3" n answered failed states
+    n="$(t19_lines "${file}")"
+    answered="$(jq -s '[.[] | select(.rc == 0)] | length' "${file}")"
+    (( answered > 0 )) || fail "${step}: no background get of ${id} answered (${n} read(s))"
+    if jq -e -s --arg nf "${NOT_FOUND}" 'any(.[]; .rc != 0 and (.err | contains($nf)))' "${file}" > /dev/null; then
+        jq -c 'select(.rc != 0)' "${file}" | sed 's/^/  | /' >&2
+        fail "${step}: a background get of ${id} answered ${NOT_FOUND}: the row was gone"
+    fi
+    failed="$(( n - answered ))"
+    if [[ "${failed}" != 0 ]]; then
+        echo "${TEST_NAME}: NOTE: ${step}: ${failed} of ${n} background gets of ${id} failed other than ${NOT_FOUND}:"
+        jq -c 'select(.rc != 0)' "${file}" | sed "s/^/${TEST_NAME}: NOTE: ${step}:   /"
+    fi
+    states="$(jq -r -s '[.[] | select(.rc == 0) | .state] | reduce .[] as $s ([]; if length > 0 and .[-1] == $s then . else . + [$s] end) | join(" -> ")' "${file}")"
+    echo "${TEST_NAME}: ${step}: ${id}'s row was read present by ${answered} of ${n} background gets, and none answered ${NOT_FOUND}"
+    echo "${TEST_NAME}: NOTE: ${step}: the states read of ${id}, in order: ${states}"
+}
+
+# t19_count_lines <text>: how many non-empty lines <text> holds.
+t19_count_lines() {
+    grep -c . <<< "$1" || true
+}
+
+# t19_at_or_before <time> <limit>: true when <time> is at or before <limit>.
+t19_at_or_before() {
+    awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 <= b + 0) }'
+}
+
+declare -A T19_CLASS_OF=()
+
+# t19_error_class <error-name> <step>: set T19_CLASS to the class
+# `classifyAdError` gives an error of that agent-director error class
+# (printed once, then kept).
+t19_error_class() {
+    local name="$1" value
+    if [[ -z "${T19_CLASS_OF[${name}]+set}" ]]; then
+        [[ "${name}" =~ ^Err[A-Za-z]+$ ]] || fail "$2: the refusal names '${name}', not an agent-director error name"
+        t19_value value classifyAdError "${name}"
+        T19_CLASS_OF["${name}"]="${value}"
+    fi
+    T19_CLASS="${T19_CLASS_OF[${name}]}"
+}
+
+# t19_reuse_lines <head> <ref>: server.log's lines after the mark holding
+# <head><ref> (a reuse spawn's refusal or success line for <ref>).
+t19_reuse_lines() {
+    t19_log_after "$(matcher "$1$2")"
+}
+
+# t19_refusals_settled <id> <ref> <min> <step>: true once at least <min>
+# reuse spawns of <ref> were refused after the mark and every CSCB reuse
+# spawn of <id> after the mark has its refusal line (none in flight); fails
+# at once when a reuse spawn succeeded.
+t19_refusals_settled() {
+    local id="$1" ref="$2" min="$3" step="$4" refused calls n
+    n="$(t19_count_lines "$(t19_reuse_lines "${REUSE_SPAWNED_HEAD}" "${ref} ")")"
+    [[ "${n}" == 0 ]] || fail "${step}: a reuse spawn of ${id} succeeded while the session holding its name still ran"
+    refused="$(t19_count_lines "$(t19_reuse_lines "${REUSE_REFUSED_HEAD}" "${ref}: ")")"
+    (( refused >= min )) || return 1
+    calls="$(t19_reuse_spawns_since "${MARK_TIME}" "${id}")" || exit 1
+    [[ "$(t19_count_lines "${calls}")" == "${refused}" ]]
+}
+
+# t19_dump_reuse <id> <ref>: print the leg's reuse lines for <ref> and CSCB's
+# calls naming <id> since the mark, for a failure.
+t19_dump_reuse() {
+    {
+        echo "  | server.log after the mark, lines naming $2:"
+        t19_log_after "$(matcher "$2")" | sed 's/^/  |   /'
+        echo "  | CSCB's agent-director calls naming $1 since the mark:"
+        t19_cscb_calls_since "${MARK_TIME}" "" "$1" | awk -F'\t' '{ print "  |   " $2 " " $6 }'
+    } >&2 || true
+}
+
+# t19_wait_refusals <id> <ref> <min> <timeout-s> <step>
+t19_wait_refusals() {
+    if ! t19_poll "$4" t19_refusals_settled "$1" "$2" "$3" "$5"; then
+        t19_dump_reuse "$1" "$2"
+        fail "$5: fewer than $3 refused reuse spawn(s) of $1 with none in flight (not within $4s)"
+    fi
+}
+
+# t19_reuse_succeeded <ref>: true once a reuse spawn of <ref> succeeded
+# after the mark.
+t19_reuse_succeeded() {
+    [[ "$(t19_count_lines "$(t19_reuse_lines "${REUSE_SPAWNED_HEAD}" "$1 ")")" != 0 ]]
+}
+
+# t19_check_refusals <id> <ref> <t-end> <step>: every CSCB-parented `spawn`
+# of <id> carrying `--reuse-finished` after the mark and before <t-end> (when
+# the harness ended the session) has its refusal line before <t-end>, each
+# UNAVAILABLE or CONFLICT, and no reuse spawn succeeded before <t-end>;
+# exactly one succeeded after it. Logs each refusal's error name and
+# description.
+t19_check_refusals() {
+    local id="$1" ref="$2" t_end="$3" step="$4" calls n_calls lines line t rest name cls n_refused=0 n_after=0 success
+    calls="$(t19_reuse_spawns_since "${MARK_TIME}" "${id}")" || exit 1
+    n_calls="$(t19_count_lines "$(awk -F'\t' -v e="${t_end}" '$2 + 0 < e + 0' <<< "${calls}")")"
+    lines="$(t19_reuse_lines "${REUSE_REFUSED_HEAD}" "${ref}: ")"
+    while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
+        t="$(t19_line_time "${line}")"
+        rest="${line#*"${REUSE_REFUSED_HEAD}${ref}: "}"
+        name="${rest%% *}"
+        if ! t19_at_or_before "${t}" "${t_end}"; then
+            n_after=$(( n_after + 1 ))
+            echo "${TEST_NAME}: NOTE: ${step}: a reuse spawn of ${id} refused after the session was ended, at ${t}: ${rest:0:300}"
+            continue
+        fi
+        n_refused=$(( n_refused + 1 ))
+        t19_error_class "${name}" "${step}"
+        cls="${T19_CLASS}"
+        [[ "${cls}" == "${CLASS_UNAVAILABLE}" || "${cls}" == "${CLASS_CONFLICT}" ]] \
+            || fail "${step}: a reuse spawn of ${id} was answered ${name} (${cls}), neither ${CLASS_UNAVAILABLE} nor ${CLASS_CONFLICT}: ${rest:0:300}"
+        echo "${TEST_NAME}: ${step}: CSCB's reuse spawn of ${id} refused at ${t}, ${cls}: ${rest:0:300}"
+    done <<< "${lines}"
+    (( n_calls >= 2 )) || { t19_dump_reuse "${id}" "${ref}"; fail "${step}: ${n_calls} CSCB reuse spawn(s) of ${id} before the session was ended, not at least 2"; }
+    [[ "${n_calls}" == "${n_refused}" ]] \
+        || { t19_dump_reuse "${id}" "${ref}"; fail "${step}: ${n_calls} CSCB reuse spawn(s) of ${id} before the session was ended, ${n_refused} refusal line(s)"; }
+    success="$(t19_reuse_lines "${REUSE_SPAWNED_HEAD}" "${ref} ")"
+    [[ "$(t19_count_lines "${success}")" == 1 ]] \
+        || { t19_dump_reuse "${id}" "${ref}"; fail "${step}: $(t19_count_lines "${success}") successful reuse spawn(s) of ${id} after the mark, not 1"; }
+    t="$(t19_line_time "${success}")"
+    t19_at_or_before "${t_end}" "${t}" || fail "${step}: the reuse spawn of ${id} succeeded at ${t}, before the session was ended (${t_end})"
+    echo "${TEST_NAME}: ${step}: ${n_refused} reuse spawn(s) of ${id} refused while the session ran; the reuse spawn at ${t}, after it was ended at ${t_end}, succeeded"
+}
+
+# t19_note_posts <channel> <record-line> <step>: log the posts at <channel>
+# in the Slack stub's record after <record-line>.
+t19_note_posts() {
+    local texts
+    texts="$(t19_after "${STUB_RECORD}" "$2" \
+        | jq -r --arg c "$1" 'select(.event == "api" and .method == "chat.postMessage" and .channel == $c) | .text | gsub("\n"; " ") | .[0:200]')" || true
+    echo "${TEST_NAME}: NOTE: $3: $(t19_count_lines "${texts}") post(s) at $1 after the mark"
+    if [[ -n "${texts}" ]]; then
+        sed "s/^/${TEST_NAME}: NOTE: $3:   post: /" <<< "${texts}"
+    fi
+}
+
+# t19_note_pre_trust <name> <step>: log the reuse spawn's `pre_trust` lines
+# after the mark, by value.
+t19_note_pre_trust() {
+    local value line n summary=""
+    for value in ok skipped failed; do
+        t19_value line preTrustLogLine "$1" LAUNCH_VERB_REUSE_SPAWN "${value}"
+        n="$(t19_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "] ${line}")"
+        summary+="${value}=${n} "
+    done
+    echo "${TEST_NAME}: NOTE: $2: the reuse spawn's pre_trust lines after the mark: ${summary}"
+}
+
+# t19_all_find_missing_since <time>: how many agent-director calls of
+# `find-missing` the shim logged at or after <time>, whoever made them.
+t19_all_find_missing_since() {
+    [[ -f "${SCENARIO_AD_SHIM_LOG}" ]] || { echo 0; return 0; }
+    awk -F'\t' -v t="$1" '$1 == "call" && $2 + 0 >= t + 0 && (" " $6 " ") ~ / find-missing / { n++ } END { print n + 0 }' "${SCENARIO_AD_SHIM_LOG}"
+}
+
+t19_row_pending_launched() {
+    ad_capture status --claude-instance-id "$1"
+    [[ "${AD_RC}" == 0 ]] || return 1
+    jq -e '.state == "pending" and ((.launch_started_at // "") != "")' "${AD_OUT}" > /dev/null 2>&1
+}
+
+# t19_pane_dead <session>: true when the session's pane reads dead.
+t19_pane_dead() {
+    [[ "$("${SCENARIO_REAL_TMUX}" display-message -p -t "=$1:" '#{pane_dead}' 2> /dev/null)" == 1 ]]
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 12, leg G: a missing row with no session id beside a leftover
+# ---------------------------------------------------------------------------
+
+t19_leg_missing_row() {
+    local step="missing row, no session id" id="${G_ID}" name="${G_NAME}" session="${G_SESSION}" work="${G_WORK}"
+    local ref launch_start launch_s watch leftover_sid elapsed t_end missing_t fm_t first_reuse_t diag diag_t n all_fm sid mark_record
+
+    ref="$(persona_ref "${name}")" || exit 1
+
+    # 1. G's first life, silent: pending with a launch start, no session id.
+    stub_mode "${work}" "${STUB_MODE_SILENT}"
+    t19_config_for_next_start true G
+    t19_mark
+    mark_record="$(t19_lines "${STUB_RECORD}")"
+    t19_start_and_wait 1
+    wait_until "${ROW_WAIT_S}" "${step}: ${id} never read pending with a launch start" t19_row_pending_launched "${id}"
+    t19_row_get "${id}" "${step}: the launch"
+    launch_start="$(jq -r '.launch_started_at // empty' "${AD_OUT}")"
+    [[ -z "$(jq -r '.claude_session_id // empty' "${AD_OUT}")" ]] \
+        || fail "${step}: ${id}'s silent launch has a claude_session_id: $(jq -c . "${AD_OUT}")"
+    launch_s="$(date -u -d "${launch_start}" +%s.%3N)" || fail "${step}: could not read the launch start '${launch_start}'"
+    watch="${SCENARIO_ROOT}/watch-G.jsonl"
+    t19_watch_start "${id}" "${watch}"
+
+    # 2. Before G: the sentinel ends the silent worker (no hook) and its
+    #    session; the leftover is seeded; `dev-channels` is selected.
+    stub_type_line "${session}" "${STUB_EXIT_SENTINEL}"
+    wait_until "${ENDED_WAIT_S}" "${step}: ${session} is still there after the exit sentinel" t19_no_session "${session}"
+    seed_leftover -c "${work}" "${session}" "${id}" "${SCENARIO_BIN}/claude" > "${SCENARIO_ROOT}/seed-G.out"
+    leftover_sid="${SEEDED_SESSION_ID}"
+    elapsed="$(awk -v a="${EPOCHREALTIME/,/.}" -v b="${launch_s}" 'BEGIN { printf "%.3f", a - b }')"
+    awk -v e="${elapsed}" -v g="${GRACE_S}" 'BEGIN { exit !(e + 0 < g + 0) }' \
+        || fail "${step}: the leftover was seeded ${elapsed} s after ${id}'s launch start, not before G (${GRACE_S} s)"
+    t19_row_is "${id}" pending || fail "${step}: ${id} reads '$(t19_row_state "${id}")' after the leftover was seeded, not pending"
+    stub_mode "${work}" "${STUB_MODE_DEV_CHANNELS}"
+    echo "${TEST_NAME}: ${step}: the silent worker ended and the leftover ${leftover_sid} (pane ${SEEDED_PANE_ID}, token ${SEEDED_TOKEN}, store ${SEEDED_STORE_ID}) seeded ${elapsed} s after ${id}'s launch start (G ${GRACE_S} s)"
+
+    # 3. CSCB's own runs mark the row missing; its resume and reuse follow,
+    #    refused while the leftover runs; then the harness ends it.
+    t19_wait_refusals "${id}" "${ref}" 1 "${FIRST_REFUSAL_WAIT_S}" "${step}: the first refused reuse spawn"
+    t19_wait_refusals "${id}" "${ref}" 2 "${REFUSAL_WAIT_S}" "${step}: a refused retry of the reuse spawn"
+    end_session "${leftover_sid}"
+    t_end="${EPOCHREALTIME/,/.}"
+    echo "${TEST_NAME}: ${step}: the harness ended the leftover ${leftover_sid} at ${t_end}"
+
+    # 4. The next reuse spawn succeeds; the row reads waiting.
+    if ! t19_poll "${REUSE_WAIT_S}" t19_reuse_succeeded "${ref}"; then
+        t19_dump_reuse "${id}" "${ref}"
+        fail "${step}: no reuse spawn of ${id} succeeded after the leftover was ended (not within ${REUSE_WAIT_S}s)"
+    fi
+    wait_until "${ROW_WAIT_S}" "${step}: ${id}'s new life never reported in (waiting)" t19_row_is "${id}" waiting
+    stop_tracked_pid "${T19_WATCH_PID}" 10 "${step}: stop the background get"
+
+    # 5. The checks.
+    # The row read missing, marked by CSCB's own run: a CSCB find-missing
+    # after the mark no later than the first read of missing, and none
+    # from any other process.
+    missing_t="$(t19_watch_first "${watch}" missing)"
+    [[ -n "${missing_t}" ]] || { jq -c . "${watch}" | sed 's/^/  | /' >&2; fail "${step}: the background get never read ${id} missing"; }
+    fm_t="$(t19_cscb_calls_since "${MARK_TIME}" find-missing | awk -F'\t' 'NR == 1 { print $2 }')" || exit 1
+    [[ -n "${fm_t}" ]] || fail "${step}: no CSCB find-missing after the mark"
+    t19_at_or_before "${fm_t}" "${missing_t}" \
+        || fail "${step}: ${id} read missing at ${missing_t}, before CSCB's first find-missing after the mark (${fm_t})"
+    all_fm="$(t19_all_find_missing_since "${MARK_TIME}")"
+    n="$(t19_cscb_count_since "${MARK_TIME}" find-missing)"
+    [[ "${all_fm}" == "${n}" ]] || fail "${step}: ${all_fm} find-missing call(s) after the mark, of which ${n} CSCB's: another process ran find-missing"
+    echo "${TEST_NAME}: ${step}: CSCB's own find-missing (first at ${fm_t}; ${n} after the mark, no other) marked ${id} missing (first read ${missing_t})"
+
+    # The resume answered ErrNoSessionId, before the first reuse spawn.
+    n="$(t19_cscb_count_since "${MARK_TIME}" resume "${id}")"
+    (( n >= 1 )) || fail "${step}: no CSCB resume of ${id} after the mark"
+    first_reuse_t="$(t19_reuse_spawns_since "${MARK_TIME}" "${id}" | awk -F'\t' 'NR == 1 { print $2 }')"
+    diag="$(t19_log_after "$(matcher "${NO_SESSION_ID}" "${NO_TRANSCRIPT_RESUME_WORD}" "${ref}" "${NO_TRANSCRIPT_NOTHING_DELETED}")" | head -n 1)"
+    [[ -n "${diag}" ]] || { t19_dump_reuse "${id}" "${ref}"; fail "${step}: no server.log line after the mark naming ${NO_SESSION_ID} on a resume of ${ref}"; }
+    diag_t="$(t19_line_time "${diag}")"
+    t19_at_or_before "${diag_t}" "${first_reuse_t}" \
+        || fail "${step}: the ${NO_SESSION_ID} line (${diag_t}) is logged after CSCB's first reuse spawn of ${id} (${first_reuse_t})"
+    echo "${TEST_NAME}: ${step}: CSCB's resume of ${id} answered ${NO_SESSION_ID} at ${diag_t}; ${n} CSCB resume call(s) after the mark"
+
+    # Each reuse spawn refused while the leftover ran; one succeeded after.
+    t19_check_refusals "${id}" "${ref}" "${t_end}" "${step}"
+
+    # The new life; no delete; the row present throughout.
+    t19_row_get "${id}" "${step}: the new life"
+    sid="$(jq -r '.claude_session_id // empty' "${AD_OUT}")"
+    [[ -n "${sid}" ]] || fail "${step}: ${id}'s new life reads waiting with no claude_session_id"
+    echo "${TEST_NAME}: ${step}: ${id}'s new life reads waiting with session ${sid}"
+    n="$(t19_cscb_count_since "${MARK_TIME}" delete)"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB delete call(s) after the mark"
+    t19_watch_check "${watch}" "${id}" "${step}"
+
+    # Outcomes the SRD leaves open.
+    t19_note_calls "${MARK_TIME}" "${id}" "${step}"
+    t19_note_posts "${G_CHANNEL}" "${mark_record}" "${step}"
+    t19_note_pre_trust "${name}" "${step}"
+    echo "${TEST_NAME}: NOTE: ${step}: agent-director's trail records naming ${id}, by event: $(jq -r --arg id "${id}" 'select(.claude_instance_id == $id) | .event // "?"' "${HOME}/.agent-director/ad-trail.jsonl" 2> /dev/null | sort | uniq -c | awk '{ printf "%s=%s ", $2, $1 }')"
+
+    # 6. A plain stop; the harness ends the new life.
+    stop_server
+    t19_end_life G "${step}: the new life"
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 12, leg H: an ended row with a stale config_dir label beside its
+# remaining session
+# ---------------------------------------------------------------------------
+
+t19_leg_stale_config_dir() {
+    local step="ended row, stale config_dir" id="${H_ID}" name="${H_NAME}" session="${H_SESSION}"
+    local ref old_sid ids sid dead watch t_end n all collided new_sid mark_record
+
+    ref="$(persona_ref "${name}")" || exit 1
+
+    # 1. H's first life, reporting in.
+    t19_config_for_next_start true H
+    t19_start_and_wait 1
+    wait_until "${ROW_WAIT_S}" "${step}: ${id}'s first life never reported in (waiting)" t19_row_is "${id}" waiting
+    t19_row_get "${id}" "${step}: the first life"
+    old_sid="$(jq -r '.claude_session_id // empty' "${AD_OUT}")"
+    [[ -n "${old_sid}" ]] || fail "${step}: ${id}'s first life has no claude_session_id"
+    echo "${TEST_NAME}: ${step}: ${id}'s first life: session ${old_sid}, labels $(jq -c '.labels // null' "${AD_OUT}")"
+
+    # 2. remain-on-exit, then the sentinel: ended, the session stays.
+    set_remain_on_exit "${session}"
+    stub_type_line "${session}" "${STUB_EXIT_SENTINEL}"
+    wait_until "${ENDED_WAIT_S}" "${step}: ${id} does not read ended after the exit sentinel" t19_row_is "${id}" ended
+    wait_until "${ENDED_WAIT_S}" "${step}: ${session}'s pane never read dead after the exit sentinel" t19_pane_dead "${session}"
+    ids="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${session}:" '#{session_id} #{pane_dead}' 2> /dev/null)" \
+        || fail "${step}: ${session} is gone after the exit sentinel, with remain-on-exit on"
+    read -r sid dead <<< "${ids}"
+    [[ "${sid}" =~ ^\$[0-9]+$ && "${dead}" == 1 ]] || fail "${step}: ${session} reads '${ids}', not a session id and a dead pane"
+    echo "${TEST_NAME}: ${step}: ${id} reads ended; its session ${sid} remains with its pane dead"
+
+    # 3. The re-point, a plain stop, the mark and a start.
+    repoint_symlink "${H_CFG_LINK}" "${H_CFG_TWO}"
+    stop_server
+    t19_mark
+    mark_record="$(t19_lines "${STUB_RECORD}")"
+    watch="${SCENARIO_ROOT}/watch-H.jsonl"
+    t19_watch_start "${id}" "${watch}"
+    t19_start_and_wait 1
+    t19_wait_refusals "${id}" "${ref}" 2 "${REFUSAL_WAIT_S}" "${step}: a refused retry of the reuse spawn"
+    end_session "${sid}"
+    t_end="${EPOCHREALTIME/,/.}"
+    echo "${TEST_NAME}: ${step}: the harness ended ${id}'s remaining session ${sid} at ${t_end}"
+
+    # 4. The next reuse spawn succeeds; the row reads waiting.
+    if ! t19_poll "${REUSE_WAIT_S}" t19_reuse_succeeded "${ref}"; then
+        t19_dump_reuse "${id}" "${ref}"
+        fail "${step}: no reuse spawn of ${id} succeeded after its session was ended (not within ${REUSE_WAIT_S}s)"
+    fi
+    wait_until "${ROW_WAIT_S}" "${step}: ${id}'s new life never reported in (waiting)" t19_row_is "${id}" waiting
+    stop_tracked_pid "${T19_WATCH_PID}" 10 "${step}: stop the background get"
+
+    # 5. The checks.
+    # Every CSCB spawn of H's id after the mark that carries no
+    # `--reuse-finished` is the collision ladder's first spawn, answered
+    # ErrInstanceIdCollision (nothing written; SRJ-111, SRJ-114: the SRD's
+    # ladder makes it before its collision `get`); no resume.
+    all="$(t19_cscb_count_since "${MARK_TIME}" spawn "${id}")"
+    n="$(t19_count_lines "$(t19_reuse_spawns_since "${MARK_TIME}" "${id}")")"
+    collided="$(t19_count_lines "$(t19_log_after "$(matcher "${LADDER_COLLISION_HEAD}${INSTANCE_ID_COLLISION}${LADDER_COLLISION_FOR}${ref}${LADDER_COLLISION_TAIL}")")")"
+    [[ "$(( all - n ))" == "${collided}" ]] \
+        || { t19_dump_reuse "${id}" "${ref}"; fail "${step}: ${all} CSCB spawn(s) of ${id} after the mark, ${n} carrying --reuse-finished, but ${collided} collision line(s) for the others"; }
+    n="$(t19_cscb_count_since "${MARK_TIME}" resume "${id}")"
+    [[ "${n}" == 0 ]] || { t19_dump_reuse "${id}" "${ref}"; fail "${step}: ${n} CSCB resume call(s) of ${id} after the mark: an ended row with a stale config_dir label is never resumed"; }
+    echo "${TEST_NAME}: ${step}: of ${all} CSCB spawn(s) of ${id} after the mark, every one without --reuse-finished (${collided}) was the collision ladder's first spawn, answered ${INSTANCE_ID_COLLISION}; no CSCB resume of it was made"
+    t19_check_refusals "${id}" "${ref}" "${t_end}" "${step}"
+
+    # The new life; no delete; the row present throughout.
+    t19_row_get "${id}" "${step}: the new life"
+    new_sid="$(jq -r '.claude_session_id // empty' "${AD_OUT}")"
+    [[ -n "${new_sid}" && "${new_sid}" != "${old_sid}" ]] \
+        || fail "${step}: ${id}'s new life reads session '${new_sid}', not a new session id (the first life's was ${old_sid})"
+    echo "${TEST_NAME}: ${step}: ${id}'s new life reads waiting with session ${new_sid} (the first life's was ${old_sid}), labels $(jq -c '.labels // null' "${AD_OUT}")"
+    n="$(t19_cscb_count_since "${MARK_TIME}" delete)"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB delete call(s) after the mark"
+    t19_watch_check "${watch}" "${id}" "${step}"
+
+    # Outcomes the SRD leaves open.
+    t19_note_calls "${MARK_TIME}" "${id}" "${step}"
+    t19_note_posts "${H_CHANNEL}" "${mark_record}" "${step}"
+    t19_note_pre_trust "${name}" "${step}"
+
+    # 6. A plain stop; the harness ends the new life.
+    stop_server
+    t19_end_life H "${step}: the new life"
+}
+
 t19_harness_check
 # S3: resume_enabled=false (SRJ-707's `resumeOrFreshSpawn` site).
 t19_leg E "resume_enabled=false" false disabled
 # S4: a missing transcript (SRJ-707, SRJ-712).
 t19_leg F "missing transcript" true missing
+# E48 T2 S1: a missing row with no session id beside a leftover (SRJ-1414).
+t19_leg_missing_row
+# E48 T2 S2: an ended row with a stale config_dir label beside its remaining
+# session (SRJ-1414, SRJ-707's config_dir site).
+t19_leg_stale_config_dir
 
 # The closing assertions (b.jg5 SRJ-1401, SRJ-1418).
 assert_no_server_tmux
