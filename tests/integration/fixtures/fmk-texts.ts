@@ -183,6 +183,60 @@
  *                                 every line a step-3 run of the live-row sequence
  *                                 logs when it marked the row `missing`
  *
+ * The relabelled-session entries (scenario 21's abort kill answered CONFLICT,
+ * "not this launch's session"). <description> is agent-director's description
+ * of that CONFLICT as the latch's record holds it (the `message="…"` of its
+ * latch-set line, JSON-decoded); an entry given one that lacks
+ * CONFLICT_NOT_THIS_LAUNCH_PHRASE, or that the package recognises as another
+ * case, fails:
+ *   CONFLICT_NOT_THIS_LAUNCH_PHRASE
+ *                                 src/ad-description-phrases.ts
+ *                                 CONFLICT_NOT_THIS_LAUNCH_PHRASE: the phrase of
+ *                                 agent-director's "not this launch's session" CONFLICT
+ *   LATCH_RECHECK_INTERVAL_MS     src/conflict-latch.ts LATCH_RECHECK_INTERVAL_MS: the
+ *                                 latch re-check's interval, in milliseconds
+ * Neither of the above takes an argument.
+ *   stuckLaunchAbortKillConflictHead <key>
+ *                                 src/pending-row.ts stuckLaunchAbortKillLine for the
+ *                                 answer STUCK_LAUNCH_ABORT_KILL_LATCHED whose
+ *                                 description is src/checked-kill.ts
+ *                                 describeKillOutcome of the outcome killOutcomeOf
+ *                                 gives a thrown ErrTmuxSessionConflict (src/agent-
+ *                                 director-errors.ts, the client's class), cut where
+ *                                 agent-director's description begins: the abort kill's
+ *                                 line for a CONFLICT that latched the persona, up to
+ *                                 and including the `message="` before that description
+ *   conflictLatchSetLineHead <key> <latched|relatched>
+ *                                 src/conflict-latch.ts conflictLatchSetLine for a new
+ *                                 latch (CONFLICT_LATCH_SET_LATCHED) or a relatch
+ *                                 (CONFLICT_LATCH_SET_RELATCHED), cut where the case
+ *                                 begins: the head of every such line for the persona,
+ *                                 up to and including `case=`
+ *   conflictNotThisLaunchLatchedLine <key> <description>
+ *                                 src/conflict-latch.ts conflictLatchSetLine for the
+ *                                 latch the abort kill's CONFLICT sets: case
+ *                                 LATCH_CASE_NOT_THIS_LAUNCH, the session
+ *                                 conflictSessionName(<description>, <key>), refused
+ *                                 operation REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
+ *                                 the row state src/liveness-reading.ts
+ *                                 AGENT_DIRECTOR_PENDING_STATE (latchRowStateRead), and
+ *                                 the description (src/persona-connection-errors.ts
+ *                                 renderLogMessageText, as the record stores it)
+ *   conflictNotThisLaunchPost <name> <key> <description>
+ *                                 src/persona-notifier.ts formatPersonaNotice for the
+ *                                 persona over src/conflict-latch.ts conflictNoticeText
+ *                                 for that latch's record (the session, the case and
+ *                                 the description as above; the list line decided from
+ *                                 the session name, which the record keeps unchanged
+ *                                 for a name rendering does not change): the whole
+ *                                 CONFLICT post, multi-line
+ *   latchRecheckNotThisLaunchRoundHead <ref>
+ *                                 src/conflict-latch.ts latchRecheckRoundLine(<ref>,
+ *                                 LATCH_CASE_NOT_THIS_LAUNCH, …), cut where the step
+ *                                 begins: the head of every re-check round line of a
+ *                                 "not this launch's session" latch, up to and
+ *                                 including `step=`
+ *
  * It makes no agent-director call, starts no process or server, opens no
  * socket, reads no token and writes no file.
  */
@@ -424,6 +478,102 @@ async function liveRowSequenceStep3MarkedMissingLines(ref: string): Promise<stri
   return lines.join('\n')
 }
 
+/** Where the case begins in a built line; cut off with all that follows it. */
+const CASE_MARK = 'fmk-texts-case-mark'
+
+/** Where the step begins in a built line; cut off with all that follows it. */
+const STEP_MARK = 'fmk-texts-step-mark'
+
+/** `line` up to where `mark` begins, which must be inside it; `what` names the builder in the failure. */
+function cutAt(line: string, mark: string, what: string): string {
+  const at = line.indexOf(mark)
+  if (at <= 0) throw new PrinterFailure(PACKAGE_EXIT, `the installed package's ${what} gave no line holding the cut mark`)
+  return line.slice(0, at)
+}
+
+/** The abort kill's line for a CONFLICT (`ErrTmuxSessionConflict`) that latched persona `key`, up to where agent-director's description begins. */
+async function stuckLaunchAbortKillConflictHead(key: string): Promise<string> {
+  const lineOf = await functionExport('pending-row.ts', 'stuckLaunchAbortKillLine')
+  const describe = await functionExport('checked-kill.ts', 'describeKillOutcome')
+  const outcomeOf = await functionExport('checked-kill.ts', 'killOutcomeOf')
+  const latched = await stringExport('pending-row.ts', 'STUCK_LAUNCH_ABORT_KILL_LATCHED')
+  const conflictClass = await packageExport('agent-director-errors.ts', 'ErrTmuxSessionConflict')
+  if (typeof conflictClass !== 'function') {
+    throw new PrinterFailure(PACKAGE_EXIT, "the installed package's src/agent-director-errors.ts ErrTmuxSessionConflict is not a class")
+  }
+  const ctor = conflictClass as new (verb: string, name: string, description: string) => unknown
+  const error: unknown = new ctor('kill', conflictClass.name, DESCRIPTION_MARK)
+  const description = builtText('checked-kill.ts', 'describeKillOutcome', describe(outcomeOf({ thrown: error })))
+  const line = builtText('pending-row.ts', 'stuckLaunchAbortKillLine', lineOf(key, { kind: latched, description }, FOLLOWS_MARK))
+  return cutAt(line, DESCRIPTION_MARK, 'src/pending-row.ts stuckLaunchAbortKillLine over src/checked-kill.ts describeKillOutcome')
+}
+
+/** The head of persona `key`'s latch-set lines of the kind `outcome` (a new latch or a relatch), up to and including `case=`. */
+async function conflictLatchSetLineHead(key: string, outcome: string): Promise<string> {
+  const lineOf = await functionExport('conflict-latch.ts', 'conflictLatchSetLine')
+  const relatched = await stringExport('conflict-latch.ts', 'CONFLICT_LATCH_SET_RELATCHED')
+  const noRow = await packageExport('conflict-latch.ts', 'LATCH_ROW_STATE_NO_ROW')
+  const record = { sessionName: CASE_MARK, latchCase: CASE_MARK, refusedOperation: CASE_MARK, rowState: noRow }
+  const line = builtText('conflict-latch.ts', 'conflictLatchSetLine', outcome === relatched ? lineOf(key, record, CASE_MARK) : lineOf(key, record))
+  return cutAt(line, CASE_MARK, 'src/conflict-latch.ts conflictLatchSetLine')
+}
+
+/**
+ * The latch record the abort kill's CONFLICT sets for persona `key` and
+ * agent-director's `description`, as src/conflict-latch.ts builds it from a
+ * thrown CONFLICT: the case the package recognises in the description, which
+ * must be "not this launch's session"; the session `conflictSessionName`
+ * gives, rendered; the refused operation "P's next check or recovery"; the
+ * row state `pending`; the description rendered.
+ */
+async function notThisLaunchKillLatchRecord(entry: string, key: string, description: string): Promise<Record<string, unknown>> {
+  const phrase = await stringExport('ad-description-phrases.ts', 'CONFLICT_NOT_THIS_LAUNCH_PHRASE')
+  if (!description.includes(phrase)) throw new PrinterFailure(USAGE_EXIT, `${entry}: <description> '${description}' does not carry '${phrase}'`)
+  const recognise = await functionExport('conflict-latch.ts', 'recogniseConflictCase')
+  const notThisLaunch = await stringExport('conflict-latch.ts', 'LATCH_CASE_NOT_THIS_LAUNCH')
+  const recognised = recognise(description)
+  if (recognised !== notThisLaunch) {
+    throw new PrinterFailure(PACKAGE_EXIT, `${entry}: the installed package's src/conflict-latch.ts recogniseConflictCase reads the description as ${String(recognised)}, not ${notThisLaunch}`)
+  }
+  const sessionOf = await functionExport('conflict-latch.ts', 'conflictSessionName')
+  const render = await functionExport('persona-connection-errors.ts', 'renderLogMessageText')
+  const rowStateOf = await functionExport('conflict-latch.ts', 'latchRowStateRead')
+  const refused = await stringExport('conflict-latch.ts', 'REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY')
+  const pending = await stringExport('liveness-reading.ts', 'AGENT_DIRECTOR_PENDING_STATE')
+  const sessionName = builtText('persona-connection-errors.ts', 'renderLogMessageText', render(builtText('conflict-latch.ts', 'conflictSessionName', sessionOf(description, key))))
+  const rendered = builtText('persona-connection-errors.ts', 'renderLogMessageText', render(description))
+  return {
+    sessionName,
+    latchCase: notThisLaunch,
+    refusedOperation: refused,
+    rowState: rowStateOf(pending),
+    ...(rendered === '' ? {} : { description: rendered }),
+  }
+}
+
+/** The latch-set line of the abort kill's "not this launch's session" CONFLICT for persona `key`. */
+async function conflictNotThisLaunchLatchedLine(key: string, description: string): Promise<string> {
+  const lineOf = await functionExport('conflict-latch.ts', 'conflictLatchSetLine')
+  const record = await notThisLaunchKillLatchRecord('conflictNotThisLaunchLatchedLine', key, description)
+  return builtText('conflict-latch.ts', 'conflictLatchSetLine', lineOf(key, record))
+}
+
+/** The CONFLICT post of that latch for the persona `name` with key `key`. */
+async function conflictNotThisLaunchPost(name: string, key: string, description: string): Promise<string> {
+  const textOf = await functionExport('conflict-latch.ts', 'conflictNoticeText')
+  const record = await notThisLaunchKillLatchRecord('conflictNotThisLaunchPost', key, description)
+  const text = builtText('conflict-latch.ts', 'conflictNoticeText', textOf({ sessionName: record['sessionName'], latchCase: record['latchCase'], description: record['description'] }))
+  return await personaNotice(name, key, text)
+}
+
+/** The head of a "not this launch's session" latch's re-check round lines for `ref`, up to and including `step=`. */
+async function latchRecheckNotThisLaunchRoundHead(ref: string): Promise<string> {
+  const lineOf = await functionExport('conflict-latch.ts', 'latchRecheckRoundLine')
+  const notThisLaunch = await stringExport('conflict-latch.ts', 'LATCH_CASE_NOT_THIS_LAUNCH')
+  const line = builtText('conflict-latch.ts', 'latchRecheckRoundLine', lineOf(ref, notThisLaunch, STEP_MARK, STEP_MARK, STEP_MARK))
+  return cutAt(line, STEP_MARK, 'src/conflict-latch.ts latchRecheckRoundLine')
+}
+
 /** The entries, by the name a script passes. */
 const ENTRIES: Readonly<Record<string, Entry>> = {
   APPROVER_LOG_PREFIX: noArguments('APPROVER_LOG_PREFIX', () => stringExport('session-manager.ts', 'APPROVER_LOG_PREFIX')),
@@ -495,6 +645,25 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   }),
   stuckLaunchAbortKillSucceededHead: oneArgument('stuckLaunchAbortKillSucceededHead', 'key', stuckLaunchAbortKillSucceededHead),
   liveRowSequenceStep3MarkedMissingLines: oneArgument('liveRowSequenceStep3MarkedMissingLines', 'ref', liveRowSequenceStep3MarkedMissingLines),
+  CONFLICT_NOT_THIS_LAUNCH_PHRASE: noArguments('CONFLICT_NOT_THIS_LAUNCH_PHRASE', () =>
+    stringExport('ad-description-phrases.ts', 'CONFLICT_NOT_THIS_LAUNCH_PHRASE'),
+  ),
+  LATCH_RECHECK_INTERVAL_MS: noArguments('LATCH_RECHECK_INTERVAL_MS', () => wholeNumberAt('conflict-latch.ts', 'LATCH_RECHECK_INTERVAL_MS', [])),
+  stuckLaunchAbortKillConflictHead: oneArgument('stuckLaunchAbortKillConflictHead', 'key', stuckLaunchAbortKillConflictHead),
+  conflictLatchSetLineHead: exactArguments('conflictLatchSetLineHead', ['key', 'latched|relatched'], async ([key, outcome]) => {
+    const o = await oneOfExports('conflictLatchSetLineHead', 'latched|relatched', outcome!, 'conflict-latch.ts', [
+      'CONFLICT_LATCH_SET_LATCHED',
+      'CONFLICT_LATCH_SET_RELATCHED',
+    ])
+    return await conflictLatchSetLineHead(key!, o)
+  }),
+  conflictNotThisLaunchLatchedLine: exactArguments('conflictNotThisLaunchLatchedLine', ['key', 'description'], ([key, description]) =>
+    conflictNotThisLaunchLatchedLine(key!, description!),
+  ),
+  conflictNotThisLaunchPost: exactArguments('conflictNotThisLaunchPost', ['name', 'key', 'description'], ([name, key, description]) =>
+    conflictNotThisLaunchPost(name!, key!, description!),
+  ),
+  latchRecheckNotThisLaunchRoundHead: oneArgument('latchRecheckNotThisLaunchRoundHead', 'ref', latchRecheckNotThisLaunchRoundHead),
 }
 
 async function main(argv: readonly string[]): Promise<number> {
