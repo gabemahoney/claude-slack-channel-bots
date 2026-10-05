@@ -2099,6 +2099,32 @@ const HOME_GUARDED_HELPERS: readonly string[] = ['install_ad_shim', 'ad_store_ed
 /** The stub-worker and store helpers held to the same rule: the stub mode selector (a move) and the no-launch-start statement (a store edit). */
 const HOME_GUARDED_STUB_HELPERS: readonly string[] = ['stub_mode', 'ad_store_pending_no_launch']
 
+/**
+ * The label, seeding, tmux-step, store-statement and 0.10.0-seeder helpers
+ * held to the same rule: each reads or edits the store (directly or through
+ * another helper), or moves a tmux socket. The steps that only run tmux or
+ * the harness's agent-director call have no such step for the audit to see.
+ */
+const HOME_GUARDED_SEEDING_HELPERS: readonly string[] = [
+  'ad_new_token',
+  'ad_other_store_id',
+  'ad_owner_label',
+  'seed_leftover',
+  'seed_unlabelled',
+  'seed_env_only',
+  'seed_borrowed_name',
+  'seed_other_store',
+  'relabel_session',
+  'ad_owner_global_set',
+  'rebind_tmux_socket',
+  'ad_store_mark_finished',
+  'ad_store_seed_pending',
+  'ad_store_unusable_name',
+  'ad_delete_unusable_row',
+  'seed_010_row',
+  'seed_prepersona_fleet',
+]
+
 /** scenario.sh's guard that refuses unless HOME is under SCENARIO_ROOT. */
 const HOME_GUARD = 'require_scenario_home'
 
@@ -2762,6 +2788,22 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       expect(unguarded).not.toBe(source)
       expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, ['stub_mode']), 'scenario.sh', RULE.homeCheckFirst)
     })
+
+    test('the current tree: the label, seeding, tmux-step, store-statement and 0.10.0-seeder helpers run require_scenario_home before their first store, copy or move step', () => {
+      expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), HOME_GUARDED_SEEDING_HELPERS)).toEqual([])
+    })
+
+    test.each([
+      ['ad_store_mark_finished', 'its store read, through another helper'],
+      ['seed_leftover', 'its seeding, through _scenario_seed'],
+      ['rebind_tmux_socket', 'its socket move'],
+    ])('%s without its require_scenario_home is flagged at %s', (helper) => {
+      const source = readFileSync(SCENARIO_PATH, 'utf-8')
+      const unguarded = source.replace(new RegExp(`(\\n${helper}\\(\\) \\{\\n(?:.*\\n)*?)    require_scenario_home "[^"\\n]*"\\n`), '$1')
+
+      expect(unguarded).not.toBe(source)
+      expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, [helper]), 'scenario.sh', RULE.homeCheckFirst)
+    })
   })
 
   describe('fmk-driver.ts and stub-mcp-session.ts check the marker before their first step', () => {
@@ -2808,6 +2850,98 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
     test.each(IMAGE_GUARDED_TS_PATHS.map((path) => [basename(path), path]))('the current tree: %s imports only node: built-ins statically and checks the marker first', (_file, path) => {
       expect(driverGuardFindings(relative(REPO_ROOT, path), readFileSync(path, 'utf-8'))).toEqual([])
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: the harness's one agent-director delete (b.jg5 SRJ-1306)
+// ---------------------------------------------------------------------------
+
+/** agent-director's global flags, which it takes from anywhere in its argv, each with a value. */
+const AD_GLOBAL_FLAGS: readonly string[] = ['--store-path', '--home', '--tmux-command']
+
+/** The scenario.sh helper that holds the harness's one `delete`: scenario 25's removal of the row with the unusable name. */
+const HARNESS_DELETE_HELPER = 'ad_delete_unusable_row'
+
+/**
+ * Whether `name` (a command word, quotes removed) runs agent-director: the
+ * harness calls `ad` and `ad_capture`, or the binary or shim by a path or a
+ * variable holding one.
+ */
+function isAgentDirectorCommand(name: string): boolean {
+  return name === 'ad' || name === 'ad_capture' || /^agent-director(?:\.real)?$/.test(basename(name)) || /\bSCENARIO_AD_BIN\b|\bSCENARIO_RC_BIN\b|\bSCENARIO_AD_010_BIN\b/.test(name)
+}
+
+/** The verb of an agent-director argv: the first word after its global flags. */
+function agentDirectorVerb(args: readonly string[]): string {
+  for (let k = 0; k < args.length; k++) {
+    const word = args[k]
+    if (AD_GLOBAL_FLAGS.includes(word)) k++
+    else if (!AD_GLOBAL_FLAGS.some((flag) => word.startsWith(`${flag}=`))) return word
+  }
+  return ''
+}
+
+/** `<file>:<line>` of every agent-director `delete` call in the shell file `file` (comments, strings and heredoc bodies are not calls). */
+function agentDirectorDeleteCalls(file: string, source: string): string[] {
+  return shellLogicalLines(source)
+    .flatMap((line) => line.commands)
+    .filter((c) => isAgentDirectorCommand(c.name) && agentDirectorVerb(c.args) === 'delete')
+    .map((c) => `${file}:${c.line}`)
+}
+
+/** Every shell file under tests/integration (the scripts, lib/ and fixtures/), read from the directory. */
+function integrationShellFiles(): string[] {
+  const out: string[] = []
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) walk(path)
+      else if (entry.isFile() && entry.name.endsWith('.sh')) out.push(path)
+    }
+  }
+  walk(INTEGRATION_DIR)
+  return out.sort()
+}
+
+describe('static audit: the harness’s one agent-director delete is scenario 25’s step (b.jg5 SRJ-1306)', () => {
+  const flagged: [label: string, source: string][] = [
+    ['ad delete', 'ad delete --claude-instance-id t0-x'],
+    ['ad_capture delete', 'ad_capture delete --claude-instance-id "${id}"'],
+    ['a delete after a global flag with its value', 'ad --home /h delete --claude-instance-id t0-x'],
+    ['a delete after a global flag joined by =', 'ad_capture --store-path=/s/state.db delete --claude-instance-id t0-x'],
+    ['the shim by its variable', '"${SCENARIO_AD_BIN}" delete --claude-instance-id t0-x'],
+    ['the binary by its path', '"${HOME}/.agent-director/bin/agent-director.real" delete --claude-instance-id t0-x'],
+    ['a delete in a command substitution', 'out="$(ad delete --claude-instance-id t0-x 2>&1)"'],
+    ['a delete after &&', 'true && ad delete --claude-instance-id t0-x'],
+  ]
+
+  test.each(flagged)('finds %s', (_label, source) => {
+    expect(agentDirectorDeleteCalls('x.sh', lines('#!/usr/bin/env bash', source))).toEqual(['x.sh:2'])
+  })
+
+  const allowed: [label: string, source: string][] = [
+    ['a comment', '# ad delete --claude-instance-id t0-x'],
+    ['a string', 'echo "ad delete --claude-instance-id t0-x"'],
+    ['a synthetic shim log line', "printf 'call\\t1.000000\\t1\\t2\\tx\\t%s\\n' 'delete --claude-instance-id cscb_x' >> \"${log}\""],
+    ['another verb carrying the word', 'ad get --claude-instance-id delete'],
+    ['a global flag whose value is delete', 'ad --home delete get --claude-instance-id t0-x'],
+    ['a heredoc body', lines('cat << EOF', 'ad delete --claude-instance-id t0-x', 'EOF')],
+  ]
+
+  test.each(allowed)('does not count %s', (_label, source) => {
+    expect(agentDirectorDeleteCalls('x.sh', lines('#!/usr/bin/env bash', source))).toEqual([])
+  })
+
+  test(`the current tree: the only agent-director delete under tests/integration is scenario.sh's ${HARNESS_DELETE_HELPER}`, () => {
+    const files = integrationShellFiles()
+    expect(files).toContain(SCENARIO_PATH)
+    const calls = files.flatMap((path) => agentDirectorDeleteCalls(relative(REPO_ROOT, path), readFileSync(path, 'utf-8')))
+    const helper = shellFunctions(readFileSync(SCENARIO_PATH, 'utf-8')).get(HARNESS_DELETE_HELPER) ?? []
+    const own = helper.filter((c) => isAgentDirectorCommand(c.name) && agentDirectorVerb(c.args) === 'delete')
+
+    expect(own).toHaveLength(1)
+    expect(calls).toEqual([`${relative(REPO_ROOT, SCENARIO_PATH)}:${own[0].line}`])
   })
 })
 

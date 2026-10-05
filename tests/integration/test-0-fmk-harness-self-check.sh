@@ -71,13 +71,22 @@
 #                    their positive controls): the trap fails it with the
 #                    closing enforcement's line and no other FAIL line. The
 #                    nested run cleans up its own SCENARIO_ROOT.
+#   store_rows       two harness spawns (the stub at once) that the store and
+#                    operator legs use once their sessions are old enough:
+#                    both report in (`waiting`); `ad_new_token` prints 16
+#                    lowercase hex characters other than the row's launch
+#                    token and a given token; `ad_store_mark_finished` refuses
+#                    while the session is younger than the stopping window
+#                    and leaves the row as it was.
 #   guard_refusals   in subshells, with HOME outside SCENARIO_ROOT (a scratch
 #                    directory under /tmp holding a decoy install and store,
 #                    and a symlink under SCENARIO_ROOT that resolves to it),
 #                    every install, re-shim, swap, hide and restore helper,
 #                    `ad`, `ad_store_edit`, `ad_store_id`,
 #                    `ad_store_pending_no_launch`, `stub_mode`,
-#                    `stub_press_enter` and `write_mcp_config` fails with the
+#                    `stub_press_enter`, `write_mcp_config` and every label,
+#                    seeding, tmux-step, store-statement, operator-action,
+#                    find-missing-loop and 0.10.0-seeder helper fails with the
 #                    guard's reason, and the decoy is left exactly as it was.
 #   shim_check       `check_ad_shim` passes a correct layout and fails, with
 #                    its reason, on a symlink to the shim and on a copy of the
@@ -200,7 +209,8 @@
 # ~/.agent-director/ad-trail.jsonl: `ad.hook.fired` (by instance id) and
 # `ad.hook.ignored` (by instance id, and by the hook's parent PID, which is the
 # stub's own process). G is agent-director's default pending grace period
-# (REFIRE_GRACE_S): the self-check writes no config.toml.
+# (REFIRE_GRACE_S): the self-check writes no config.toml before the
+# store_statements leg, which runs after them.
 #   refire_hold      a harness spawn of row REFIRE_ID, its working directory
 #                    selected for the silent mode: the row reads `pending` with
 #                    a launch start; its worker's --settings hooks are exec
@@ -279,6 +289,89 @@
 #                    of its logs or in a subshell fails naming exactly those
 #                    as not passed; one that fails on its own prints only its
 #                    own FAIL line.
+#
+# The harness-only steps (b.jg5 SRJ-1306, SRJ-1401). Each helper runs once
+# from the scenario's own shell, and each leg reads the effect back itself,
+# with the real tmux on the scenario's server, the store (through
+# `ad_store_edit`) or a harness `get`.
+#   seeding          each seed_* helper once (worker `sleep`): the session's
+#                    name, id, pane and working directory are as printed;
+#                    every label holds its five fields (`ad1`, a 16-hex token,
+#                    the session's own id, the instance id, a store id) and
+#                    ends with the scenario store's id, or with another
+#                    16-hex id for `seed_other_store`; every labelled session's
+#                    pane carries @ad_pane `<that token> <its pane id>`; the
+#                    unlabelled and env-only sessions carry neither, and the
+#                    env-only worker's environment holds its instance id. A
+#                    taken name and a name holding `.` are refused, and the
+#                    refused name makes no session.
+#   tmux_steps       `relabel_session` gives the leftover a new token in both
+#                    labels and refuses the label's own token, an unlabelled
+#                    session and another store's; `attach_viewer` makes a
+#                    session in the leftover's group showing its windows;
+#                    `rename_session`, `set_remain_on_exit`, the global
+#                    @ad_owner set (five fields, `$0`, the store's id) and unset
+#                    (no value in any of the three scopes), `respawn_worker_pane`
+#                    (same pane, a new process, the old one gone) and
+#                    `end_session` each read back from the server; a step
+#                    with TMUX set is refused.
+#   store_statements writes the scenario HOME's agent-director config.toml
+#                    (the starting-session bound and the stopping window at
+#                    their safe minimums; the re-fire legs are done by now);
+#                    once the finished row's session is older than that
+#                    window, `ad_store_mark_finished` writes exactly the
+#                    state, ended_at (the file's window ago), no launch start
+#                    and the next row_version, every other column kept;
+#                    `ad_delete_unusable_row` and `ad_store_unusable_name`
+#                    refuse the live row, unchanged; `ad_store_unusable_name`
+#                    changes only the finished row's session name.
+#   operator_actions once the other row's session is past the starting-session
+#                    bound: `ad_store_mark_finished` marks it `ended`, every
+#                    other column kept, its session still running; then
+#                    `ad_kill_include_finished` gets kill_sent from a call
+#                    whose parent is the scenario's shell, the session ends,
+#                    and `assert_no_cscb_include_finished` still passes;
+#                    `ad_store_seed_pending` then makes that row `pending`
+#                    with a launch start and a fresh token (not the leftover's),
+#                    its pane and server identity NULL, every other column
+#                    kept, and a harness `status` reads it so;
+#                    `ad_delete_unusable_row` removes the finished row whose
+#                    name the statement made unusable, from the scenario's
+#                    shell, and `assert_no_cscb_delete` still passes.
+#   find_missing_loop
+#                    `run_find_missing_loop` at a short interval refuses a
+#                    second loop, runs `find-missing` twice (each run logged
+#                    with exit 0, the next starting no sooner than the
+#                    interval after it), its calls' parent the loop subshell
+#                    with the shell's command line and none counted as
+#                    CSCB's; once stopped, the loop is gone and
+#                    `wait_find_missing_runs` refuses.
+#   fmk_driver_reuse_spawn, fmk_driver_read_pane, fmk_driver_resume
+#                    fixtures/fmk-driver.ts, run through `cscb_run` once per
+#                    forced call against a self-check persona: it exits 0
+#                    with exactly one outcome line, `DRIVER: FORCED <call>`
+#                    and its fields; every agent-director call in the shim's
+#                    log during the run has the driver (bun) as its parent,
+#                    and CSCB's count rises by exactly those; the forced
+#                    call's verb is among them; no delete.
+#   seeders_010      a nested fmk run started on 0.10.0: `seed_prepersona_fleet`
+#                    refuses a routed channel with no name before any row or
+#                    store exists; `seed_010_row` and `seed_prepersona_fleet`
+#                    make rows named and labelled as the pre-persona package
+#                    names them, live, in their routes' directories; after
+#                    `install_ad_rc` (the release candidate's install.sh, then
+#                    the re-shim) the shim check passes, the store has a store
+#                    id, every row is still present with its name and labels
+#                    and its worker still runs; then each seeder refuses for
+#                    each of its three reasons. The nested run ends with the
+#                    closing assertions over a stand-in bot server and passes.
+#   tmux_server_steps
+#                    last, as it ends every session: `restart_tmux_server`
+#                    leaves a new server with only its one session and the
+#                    old server gone; `rebind_tmux_socket` leaves the old
+#                    server answering on the moved socket and a new one on
+#                    the socket path. The exit hook confirms the trap stopped
+#                    both.
 # The script then ends with the three closing assertions in its own shell,
 # met by the live start's own lines, with the stub's stop lines in the shim's
 # log.
@@ -355,7 +448,8 @@ NOLS_ID="t0-refire-nols"
 NOROW_ID="t0-refire-no-row"
 REFIRE_PATHS=(at-once trusted-config-dir trusted-home dev-channels unrecognised folder-trust)
 # G: agent-director's default pending_grace_seconds (the self-check writes no
-# ~/.agent-director/config.toml; the hold leg checks there is none).
+# ~/.agent-director/config.toml before the re-fire legs end; the hold leg
+# checks there is none).
 REFIRE_GRACE_S=60
 # The re-fire's period, and the gap allowed between two of one stub's records
 # (the period, plus its status read and hooks).
@@ -387,6 +481,47 @@ declare -A REFIRE_PID=()
 declare -A REFIRE_FROM=()
 REFIRE_AD_BEFORE=0
 REFIRE_CSCB_BEFORE=0
+
+# The harness-only step legs. Two rows the harness spawns early (the store
+# and operator legs need their sessions older than a bound); ids no row
+# holds for the seeded sessions; the name the scenario-25 statement writes.
+T4_FIN_ID="t0-t4-finished"
+T4_KILL_ID="t0-t4-kill"
+T4_UNUSABLE_NAME="t0.t4.unusable"
+T4_LEFTOVER_ID="t0-t4-leftover-id"
+T4_ENV_ID="t0-t4-env-id"
+T4_OTHER_ID="t0-t4-other-id"
+T4_BORROWED_ID="cscb_t0_borrowed_other"
+T4_LEFTOVER="t0-t4-leftover"
+T4_UNLABELLED="t0-t4-unlabelled"
+T4_ENV_ONLY="t0-t4-env-only"
+T4_BORROWED="slack_bot_t0_borrowed"
+T4_OTHER_STORE="t0-t4-other-store"
+# The [tmux] settings the store leg writes to the scenario HOME's
+# agent-director config.toml once the re-fire legs are done (they need
+# agent-director's defaults): the starting-session bound and the stopping
+# window at their safe minimums, in seconds. At the defaults (300 s, 90 s)
+# agent-director makes the include-finished kill only of a session at least
+# 300 s old.
+T4_STARTING_BOUND_S=60
+T4_STOPPING_WINDOW_S=30
+# Bound on a row reporting in, and on a killed session ending, in seconds.
+T4_REPORT_WAIT_S=30
+T4_END_WAIT_S=15
+# The find-missing loop's interval in its leg, in seconds.
+T4_FM_INTERVAL_S=2
+# Set by the legs: the leftover's session id, pane id and token, and the
+# unlabelled and env-only sessions' ids.
+T4_LEFTOVER_SID=""
+T4_LEFTOVER_PANE=""
+T4_LEFTOVER_TOKEN=""
+T4_ENV_SID=""
+
+# The fmk-driver legs' persona, its one channel and its working directory
+# (made by the first driver leg).
+DRV_NAME="${SCENARIO_TAG}_drv"
+DRV_CHANNEL="C0T0DRV01"
+DRV_WORK=""
 
 # The closing enforcement's FAIL line, after `FAIL: <test>: `, up to its list
 # of the assertions not passed.
@@ -1411,6 +1546,42 @@ leg_guard_refusals() {
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_mode "${SCENARIO_ROOT}/work" "${STUB_MODE_AT_ONCE}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_press_enter "${T0_SESSION}"
         expect_fails_in_home "${step}" "${home}" "${reason}" write_mcp_config "${SCENARIO_PORT}"
+        # The labels, seeding, the human's tmux steps, the store statements,
+        # the operator's actions, the find-missing loop and the 0.10.0
+        # seeders. Each would act on the scenario's own tmux server or
+        # store were its guard not first.
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_new_token "${T0_ROW_ID}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_other_store_id
+        # shellcheck disable=SC2016 # $1 is a literal tmux session id
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_owner_label 0123456789abcdef '$1' "${T0_ROW_ID}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_pane_label 0123456789abcdef %1
+        expect_fails_in_home "${step}" "${home}" "${reason}" seed_leftover t0-guard "${T0_ROW_ID}" sleep 1
+        expect_fails_in_home "${step}" "${home}" "${reason}" seed_unlabelled t0-guard sleep 1
+        expect_fails_in_home "${step}" "${home}" "${reason}" seed_env_only t0-guard "${T0_ROW_ID}" sleep 1
+        expect_fails_in_home "${step}" "${home}" "${reason}" seed_borrowed_name t0-guard "${T0_ROW_ID}" sleep 1
+        expect_fails_in_home "${step}" "${home}" "${reason}" seed_other_store t0-guard "${T0_ROW_ID}" sleep 1
+        expect_fails_in_home "${step}" "${home}" "${reason}" relabel_session "${T0_SESSION}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" attach_viewer "${T0_SESSION}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" rename_session "${T0_SESSION}" t0-guard
+        expect_fails_in_home "${step}" "${home}" "${reason}" set_remain_on_exit "${T0_SESSION}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_owner_global_set
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_owner_global_unset
+        expect_fails_in_home "${step}" "${home}" "${reason}" respawn_worker_pane "${T0_SESSION}" sleep 1
+        expect_fails_in_home "${step}" "${home}" "${reason}" restart_tmux_server
+        expect_fails_in_home "${step}" "${home}" "${reason}" rebind_tmux_socket
+        # shellcheck disable=SC2016 # $0 is a literal tmux session id
+        expect_fails_in_home "${step}" "${home}" "${reason}" end_session '$0'
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_mark_finished "${T0_ROW_ID}" missing
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_seed_pending "${T0_ROW_ID}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_unusable_name "${T0_ROW_ID}" t0.guard
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_kill_include_finished "${T0_ROW_ID}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_delete_unusable_row "${T0_ROW_ID}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" run_find_missing_loop 1
+        expect_fails_in_home "${step}" "${home}" "${reason}" stop_find_missing_loop
+        expect_fails_in_home "${step}" "${home}" "${reason}" find_missing_loop_runs
+        expect_fails_in_home "${step}" "${home}" "${reason}" wait_find_missing_runs 1
+        expect_fails_in_home "${step}" "${home}" "${reason}" seed_010_row t0-guard t0-guard "${SCENARIO_ROOT}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" seed_prepersona_fleet "${SCENARIO_ROOT}/none.json" C0T0GUARD=guard
     done
     [[ "$(tree_digest "${OUTSIDE_HOME}")" == "${before}" ]] \
         || fail "${step}: the HOME outside SCENARIO_ROOT changed under the refused helpers"
@@ -2435,6 +2606,657 @@ leg_closing_enforcement() {
 }
 
 # ---------------------------------------------------------------------------
+# The harness-only steps: helpers
+# ---------------------------------------------------------------------------
+
+# row_snapshot <instance-id>: print the row as one JSON object of every
+# column of `spawns`, read through `ad_store_edit` (nothing when no row has
+# the id).
+row_snapshot() {
+    local cols
+    cols="$(ad_store_edit "SELECT group_concat(quote(name) || ', \"' || name || '\"', ', ') FROM pragma_table_info('spawns')")"
+    [[ -n "${cols}" ]] || fail "row snapshot: the store has no spawns columns"
+    ad_store_edit "SELECT json_object(${cols}) FROM spawns WHERE claude_instance_id = '$1'"
+}
+
+# expect_row_change <step> <before> <after> <want>: the row after an edit
+# holds <want>'s values (a JSON object) in <want>'s columns and its value
+# before the edit in every other column.
+expect_row_change() {
+    local step="$1" before="$2" after="$3" want="$4" bad
+    [[ -n "${before}" && -n "${after}" ]] || fail "${step}: no row before or after the edit"
+    bad="$(jq -rn --argjson b "${before}" --argjson a "${after}" --argjson w "${want}" '
+        ([$a | keys[] as $k | select(($w | has($k)) | not) | select($a[$k] != $b[$k]) | "\($k) \($b[$k] | tojson) -> \($a[$k] | tojson)"]
+         + [$w | keys[] as $k | select($a[$k] != $w[$k]) | "\($k) is \($a[$k] | tojson), not \($w[$k] | tojson)"]
+         + (if ($a | keys) == ($b | keys) then [] else ["the columns changed"] end))
+        | join("; ")')" || fail "${step}: could not compare the row before and after"
+    [[ -z "${bad}" ]] || fail "${step}: ${bad}"
+}
+
+# session_age_at_least <step> <session> <seconds>: sleep until the tmux
+# session <session> is more than <seconds> old (at once when it already is).
+session_age_at_least() {
+    local step="$1" session="$2" s="$3" created wait_s
+    created="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${session}:" '#{session_created}')" \
+        || fail "${step}: no session ${session}"
+    wait_s=$(( created + s + 1 - $(date +%s) ))
+    if (( wait_s > 0 )); then
+        echo "${TEST_NAME}: ${step}: waiting ${wait_s}s until session ${session} is more than ${s}s old"
+        sleep "${wait_s}"
+    fi
+}
+
+# spawn_at_once <step> <instance-id>: a harness spawn of <instance-id> in a
+# working directory of its own selected for the at-once mode, session name
+# the id.
+spawn_at_once() {
+    local step="$1" id="$2" dir
+    dir="$(make_workdir "${id}")"
+    stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
+    ad_capture spawn --cwd "${dir}" --claude-instance-id "${id}" --tmux-session-name "${id}" --no-pre-trust
+    if (( AD_RC != 0 )); then
+        sed 's/^/  | /' "${AD_OUT}" "${AD_ERR}" >&2
+        fail "${step}: harness spawn of ${id} exited ${AD_RC}"
+    fi
+}
+
+# tmux_read <format> <target>: the real tmux's display-message of <format>
+# for <target> on the scenario's server.
+tmux_read() {
+    "${SCENARIO_REAL_TMUX}" display-message -p -t "$2" "$1"
+}
+
+# True when the scenario's tmux server holds no session named exactly <name>.
+no_session() {
+    ! has_session "$1"
+}
+
+# expect_seeded <step> <session> <dir> <instance-id|-> <own|other|none>: the
+# last seed_* call (run through `seed`) made session <session>
+# (SEEDED_SESSION_ID, its one pane SEEDED_PANE_ID) in <dir>, and printed
+# `<session id> <pane id>` and, for a labelled session, its token and store
+# id (in SEEDED_OUT). A labelled one
+# (own or other) carries a five-field @ad_owner naming its own session id and
+# <instance-id>, with the token and store id printed (the scenario store's,
+# or another 16-hex one), and its pane carries @ad_pane `<token> <pane id>`;
+# `none` carries neither.
+expect_seeded() {
+    local step="$1" session="$2" dir="$3" id="$4" which="$5" sid pane path owner pane_label f=() want
+    read -r sid pane path <<< "$(tmux_read '#{session_id} #{pane_id} #{pane_current_path}' "=${session}:")"
+    [[ "${sid}" == "${SEEDED_SESSION_ID}" && "${pane}" == "${SEEDED_PANE_ID}" ]] \
+        || fail "${step}: session ${session} is ${sid} ${pane}, not the seeded ${SEEDED_SESSION_ID} ${SEEDED_PANE_ID}"
+    [[ "$(tmux_read '#{session_windows} #{window_panes}' "=${session}:")" == "1 1" ]] \
+        || fail "${step}: session ${session} has more than one window or pane"
+    [[ "${path}" == "$(realpath -e -- "${dir}")" ]] || fail "${step}: the worker runs in ${path}, not ${dir}"
+    owner="$("${SCENARIO_REAL_TMUX}" show-options -qv -t "${sid}" @ad_owner)"
+    pane_label="$("${SCENARIO_REAL_TMUX}" show-options -p -qv -t "${pane}" @ad_pane)"
+    if [[ "${which}" == none ]]; then
+        [[ -z "${owner}" && -z "${pane_label}" ]] \
+            || fail "${step}: the unlabelled session carries @ad_owner '${owner}' or @ad_pane '${pane_label}'"
+        [[ -z "${SEEDED_TOKEN}" && -z "${SEEDED_STORE_ID}" ]] || fail "${step}: the helper set a token or a store id"
+        want="${sid} ${pane}"
+    else
+        read -r -a f <<< "${owner}"
+        (( ${#f[@]} == 5 )) && [[ "${f[0]}" == ad1 && "${f[1]}" =~ ^[0-9a-f]{16}$ && "${f[2]}" == "${sid}" && "${f[3]}" == "${id}" ]] \
+            || fail "${step}: @ad_owner '${owner}' is not 'ad1 <16-hex token> ${sid} ${id} <store id>'"
+        if [[ "${which}" == own ]]; then
+            [[ "${f[4]}" == "${T0_STORE_ID}" ]] || fail "${step}: the label ends with ${f[4]}, not the store's id ${T0_STORE_ID}"
+        else
+            [[ "${f[4]}" =~ ^[0-9a-f]{16}$ && "${f[4]}" != "${T0_STORE_ID}" ]] \
+                || fail "${step}: the label ends with '${f[4]}', not another store's 16-hex id"
+        fi
+        [[ "${f[1]}" == "${SEEDED_TOKEN}" && "${f[4]}" == "${SEEDED_STORE_ID}" ]] \
+            || fail "${step}: the label's token and store id are not the helper's ${SEEDED_TOKEN} ${SEEDED_STORE_ID}"
+        [[ "${pane_label}" == "${f[1]} ${pane}" ]] \
+            || fail "${step}: pane ${pane}'s @ad_pane is '${pane_label}', not '${f[1]} ${pane}'"
+        want="${sid} ${pane} ${f[1]} ${f[4]}"
+    fi
+    [[ "$(cat "${SEEDED_OUT}")" == "${want}" ]] || fail "${step}: the helper printed '$(cat "${SEEDED_OUT}")', not '${want}'"
+}
+
+# seed <helper> <arg>...: run a seed_* (or relabel) helper as a plain command,
+# so the SEEDED_* variables it sets stay, its output in SEEDED_OUT.
+SEEDED_OUT=""
+seed() {
+    SEEDED_OUT="${SCENARIO_ROOT}/seeded.out"
+    "$@" > "${SEEDED_OUT}"
+}
+
+# expect_last_call <step> <want-array-name>: the agent-director shim log's
+# last `call` line has the words <want> and the scenario's own shell ($$, with
+# its command line) as its parent.
+expect_last_call() {
+    local step="$1" mine=()
+    local -n expect_last_call_want="$2"
+    read_call "${step}" "$(last_call_line)"
+    same_words CALL_WORDS expect_last_call_want \
+        || fail "${step}: the last call's words are $(quoted "${CALL_WORDS[@]}"), not $(quoted "${expect_last_call_want[@]}")"
+    mapfile -d '' -t mine < "/proc/$$/cmdline"
+    [[ "${CALL_PPID}" == "$$" ]] && same_words CALL_PARENT mine \
+        || fail "${step}: the call's parent is ${CALL_PPID} $(quoted "${CALL_PARENT[@]}"), not the scenario's shell $$"
+}
+
+# ---------------------------------------------------------------------------
+# The harness-only steps: legs
+# ---------------------------------------------------------------------------
+
+leg_store_rows() {
+    local step="store rows" id current token before
+    for id in "${T4_FIN_ID}" "${T4_KILL_ID}"; do
+        spawn_at_once "${step}" "${id}"
+    done
+    for id in "${T4_FIN_ID}" "${T4_KILL_ID}"; do
+        wait_until "${T4_REPORT_WAIT_S}" "${step}: ${id} never reported in (waiting)" row_state_is "${id}" waiting
+    done
+    current="$(ad_store_edit "SELECT launch_token FROM spawns WHERE claude_instance_id = '${T4_KILL_ID}'")"
+    [[ "${current}" =~ ^[0-9a-f]{16}$ ]] || fail "${step}: ${T4_KILL_ID}'s launch token is '${current}'"
+    token="$(ad_new_token "${T4_KILL_ID}" 0123456789abcdef)"
+    [[ "${token}" =~ ^[0-9a-f]{16}$ && "${token}" != "${current}" && "${token}" != 0123456789abcdef ]] \
+        || fail "${step}: ad_new_token printed '${token}' (the row's token ${current}, the given 0123456789abcdef)"
+    # A session younger than the stopping window: refused, the row unchanged.
+    before="$(row_snapshot "${T4_FIN_ID}")"
+    expect_fails_in_home "${step}" "${HOME}" "refused: the worker's session was created" \
+        ad_store_mark_finished "${T4_FIN_ID}" missing
+    [[ "$(row_snapshot "${T4_FIN_ID}")" == "${before}" ]] || fail "${step}: the refused ad_store_mark_finished changed the row"
+}
+
+leg_seeding() {
+    local step="seeding" dir
+    dir="$(make_workdir seeding)"
+    seed seed_leftover -c "${dir}" "${T4_LEFTOVER}" "${T4_LEFTOVER_ID}" sleep 600
+    expect_seeded "${step}: seed_leftover" "${T4_LEFTOVER}" "${dir}" "${T4_LEFTOVER_ID}" own
+    T4_LEFTOVER_SID="${SEEDED_SESSION_ID}"
+    T4_LEFTOVER_PANE="${SEEDED_PANE_ID}"
+    T4_LEFTOVER_TOKEN="${SEEDED_TOKEN}"
+
+    seed seed_borrowed_name -c "${dir}" "${T4_BORROWED}" "${T4_BORROWED_ID}" sleep 600
+    expect_seeded "${step}: seed_borrowed_name" "${T4_BORROWED}" "${dir}" "${T4_BORROWED_ID}" own
+
+    seed seed_other_store -c "${dir}" "${T4_OTHER_STORE}" "${T4_OTHER_ID}" sleep 600
+    expect_seeded "${step}: seed_other_store" "${T4_OTHER_STORE}" "${dir}" "${T4_OTHER_ID}" other
+
+    # The default working directory is SCENARIO_ROOT.
+    seed seed_unlabelled "${T4_UNLABELLED}" sleep 600
+    expect_seeded "${step}: seed_unlabelled" "${T4_UNLABELLED}" "${SCENARIO_ROOT}" - none
+
+    seed seed_env_only -c "${dir}" "${T4_ENV_ONLY}" "${T4_ENV_ID}" sleep 600
+    expect_seeded "${step}: seed_env_only" "${T4_ENV_ONLY}" "${dir}" - none
+    T4_ENV_SID="${SEEDED_SESSION_ID}"
+    [[ "$("${SCENARIO_REAL_TMUX}" show-environment -t "${T4_ENV_SID}" AGENT_DIRECTOR_INSTANCE_ID)" == "AGENT_DIRECTOR_INSTANCE_ID=${T4_ENV_ID}" ]] \
+        || fail "${step}: seed_env_only: the session's environment does not hold AGENT_DIRECTOR_INSTANCE_ID=${T4_ENV_ID}"
+    tr '\0' '\n' < "/proc/$(tmux_read '#{pane_pid}' "${SEEDED_PANE_ID}")/environ" | grep -xF "AGENT_DIRECTOR_INSTANCE_ID=${T4_ENV_ID}" > /dev/null \
+        || fail "${step}: seed_env_only: the worker's environment does not hold AGENT_DIRECTOR_INSTANCE_ID=${T4_ENV_ID}"
+
+    expect_fails_in_home "${step}" "${HOME}" "a session named ${T4_LEFTOVER} already exists" \
+        seed_unlabelled "${T4_LEFTOVER}" sleep 600
+    expect_fails_in_home "${step}" "${HOME}" "session name 't0.t4.dot' is empty or holds '.'" \
+        seed_leftover t0.t4.dot "${T4_LEFTOVER_ID}" sleep 600
+    ! has_session t0.t4.dot && ! has_session t0_t4_dot || fail "${step}: a refused name made a session"
+}
+
+leg_tmux_steps() {
+    local step="tmux steps" sid pane token old vid value f=() w n=0 old_pid new_pid out scope
+    out="${SCENARIO_ROOT}/tmux-steps.out"
+
+    # relabel_session: a new token in both labels, the store's id kept.
+    old="${T4_LEFTOVER_TOKEN}"
+    relabel_session "${T4_LEFTOVER}" > "${out}"
+    read -r sid pane token < "${out}"
+    [[ "${sid}" == "${T4_LEFTOVER_SID}" && "${pane}" == "${T4_LEFTOVER_PANE}" && "${token}" =~ ^[0-9a-f]{16}$ && "${token}" != "${old}" ]] \
+        || fail "${step}: relabel_session printed '$(cat "${out}")' (the leftover ${T4_LEFTOVER_SID} ${T4_LEFTOVER_PANE}, old token ${old})"
+    [[ "$("${SCENARIO_REAL_TMUX}" show-options -qv -t "${sid}" @ad_owner)" == "ad1 ${token} ${sid} ${T4_LEFTOVER_ID} ${T0_STORE_ID}" ]] \
+        || fail "${step}: after relabel_session the @ad_owner is '$("${SCENARIO_REAL_TMUX}" show-options -qv -t "${sid}" @ad_owner)'"
+    [[ "$("${SCENARIO_REAL_TMUX}" show-options -p -qv -t "${pane}" @ad_pane)" == "${token} ${pane}" ]] \
+        || fail "${step}: after relabel_session the worker pane's @ad_pane is not '${token} ${pane}'"
+    T4_LEFTOVER_TOKEN="${token}"
+    expect_fails_in_home "${step}" "${HOME}" "is the label's or the row's current launch token" \
+        relabel_session "${T4_LEFTOVER}" "${token}"
+    expect_fails_in_home "${step}" "${HOME}" "carries no valid label of this store" relabel_session "${T4_UNLABELLED}"
+    expect_fails_in_home "${step}" "${HOME}" "carries no valid label of this store" relabel_session "${T4_OTHER_STORE}"
+
+    # attach_viewer: a grouped session showing the leftover's windows.
+    attach_viewer "${T4_LEFTOVER}" > "${out}"
+    vid="$(cat "${out}")"
+    [[ "${vid}" =~ ^\$[0-9]+$ && "${vid}" != "${sid}" ]] || fail "${step}: attach_viewer printed '${vid}'"
+    [[ "$(tmux_read '#{session_name}' "${vid}:")" == "${SCENARIO_TAG}_viewer_1" ]] \
+        || fail "${step}: the viewer is named '$(tmux_read '#{session_name}' "${vid}:")', not ${SCENARIO_TAG}_viewer_1"
+    [[ "$(tmux_read '#{session_group}' "${vid}:")" == "$(tmux_read '#{session_group}' "${sid}:")" \
+        && -n "$(tmux_read '#{session_group}' "${sid}:")" ]] || fail "${step}: the viewer is not in the leftover's group"
+    [[ "$("${SCENARIO_REAL_TMUX}" list-windows -t "${vid}" -F '#{window_id}')" == "$("${SCENARIO_REAL_TMUX}" list-windows -t "${sid}" -F '#{window_id}')" ]] \
+        || fail "${step}: the viewer does not show the leftover's windows"
+
+    # rename_session, then set_remain_on_exit on every window.
+    rename_session "${T4_UNLABELLED}" t0-t4-renamed > "${out}"
+    sid="$(cat "${out}")"
+    [[ "$(tmux_read '#{session_name}' "${sid}:")" == t0-t4-renamed ]] && ! has_session "${T4_UNLABELLED}" \
+        || fail "${step}: after rename_session ${sid} is named '$(tmux_read '#{session_name}' "${sid}:")'"
+    set_remain_on_exit t0-t4-renamed
+    while IFS= read -r w; do
+        n=$(( n + 1 ))
+        [[ "$("${SCENARIO_REAL_TMUX}" show-options -w -qv -t "${w}" remain-on-exit)" == on ]] \
+            || fail "${step}: window ${w} of t0-t4-renamed does not have remain-on-exit on"
+    done < <("${SCENARIO_REAL_TMUX}" list-windows -t "${sid}" -F '#{window_id}')
+    (( n > 0 )) || fail "${step}: t0-t4-renamed has no window"
+
+    # The global @ad_owner: set (five fields, $0, the store's id), then unset
+    # in all three scopes agent-director's lookup reads.
+    value="$(ad_owner_global_set)"
+    read -r -a f <<< "${value}"
+    (( ${#f[@]} == 5 )) && [[ "${f[0]}" == ad1 && "${f[1]}" =~ ^[0-9a-f]{16}$ && "${f[2]}" == "\$0" \
+        && "${f[3]}" == "${SCENARIO_TAG}_global" && "${f[4]}" == "${T0_STORE_ID}" ]] \
+        || fail "${step}: ad_owner_global_set printed '${value}'"
+    [[ "$("${SCENARIO_REAL_TMUX}" show-options -gqv @ad_owner)" == "${value}" ]] || fail "${step}: the global @ad_owner is not '${value}'"
+    ad_owner_global_unset
+    for scope in -gqv -sqv -gwqv; do
+        [[ -z "$("${SCENARIO_REAL_TMUX}" show-options "${scope}" @ad_owner)" ]] \
+            || fail "${step}: after ad_owner_global_unset, show-options ${scope} @ad_owner holds a value"
+    done
+
+    # respawn_worker_pane: the leftover's worker pane runs a new process.
+    old_pid="$(tmux_read '#{pane_pid}' "${T4_LEFTOVER_PANE}")"
+    respawn_worker_pane "${T4_LEFTOVER}" sleep 601 > "${out}"
+    read -r pane new_pid < "${out}"
+    [[ "${pane}" == "${T4_LEFTOVER_PANE}" && "${new_pid}" == "$(tmux_read '#{pane_pid}' "${T4_LEFTOVER_PANE}")" && "${new_pid}" != "${old_pid}" ]] \
+        || fail "${step}: respawn_worker_pane printed '$(cat "${out}")' (pane ${T4_LEFTOVER_PANE}, old pid ${old_pid})"
+    [[ "$(tr '\0' ' ' < "/proc/${new_pid}/cmdline")" == "sleep 601 " ]] || fail "${step}: the respawned pane does not run 'sleep 601'"
+    ! pid_alive "${old_pid}" || fail "${step}: the pane's old process ${old_pid} still runs"
+
+    # end_session: by session id only.
+    expect_fails_in_home "${step}" "${HOME}" "is not a session id" end_session "${T4_ENV_ONLY}"
+    end_session "${T4_ENV_SID}"
+    ! "${SCENARIO_REAL_TMUX}" has-session -t "${T4_ENV_SID}" 2> /dev/null || fail "${step}: ${T4_ENV_SID} still exists after end_session"
+
+    expect_fails_in_home "${step}" "${HOME}" "refused: TMUX is set" with_tmux_set attach_viewer "${T4_LEFTOVER}"
+}
+
+leg_store_statements() {
+    local step="store statements" before after rv ended_at e now
+    # The safe minimums, so the operator leg's kill need not wait out the
+    # default starting-session bound; `ad_store_mark_finished` reads the
+    # window from this file.
+    printf '[tmux]\nstarting_session_seconds = %s\nstopping_window_seconds = %s\n' \
+        "${T4_STARTING_BOUND_S}" "${T4_STOPPING_WINDOW_S}" | write_file "${HOME}/.agent-director/config.toml"
+    session_age_at_least "${step}" "${T4_FIN_ID}" "${T4_STOPPING_WINDOW_S}"
+    before="$(row_snapshot "${T4_FIN_ID}")"
+    rv="$(jq -r '.row_version' <<< "${before}")"
+    ended_at="$(ad_store_mark_finished "${T4_FIN_ID}" missing)"
+    now="$(date +%s)"
+    after="$(row_snapshot "${T4_FIN_ID}")"
+    expect_row_change "${step}: ad_store_mark_finished" "${before}" "${after}" \
+        "$(jq -nc --arg e "${ended_at}" --argjson rv "$(( rv + 1 ))" '{state: "missing", ended_at: $e, launch_started_at: null, row_version: $rv}')"
+    e="$(date -u -d "${ended_at}" +%s)" || fail "${step}: ended_at '${ended_at}' is not a time"
+    [[ "${ended_at}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}$ ]] \
+        && (( e <= now - T4_STOPPING_WINDOW_S && e >= now - T4_STOPPING_WINDOW_S - 5 )) \
+        || fail "${step}: ended_at '${ended_at}' is not config.toml's stopping window (${T4_STOPPING_WINDOW_S}s) before ${now}"
+    expect_row_state "${step}: after ad_store_mark_finished" "${T4_FIN_ID}" missing
+
+    # The live row: no unusable name, no delete; unchanged.
+    before="$(row_snapshot "${T4_KILL_ID}")"
+    expect_fails_in_home "${step}" "${HOME}" "refused: the row reads waiting, not a finished state" \
+        ad_store_unusable_name "${T4_KILL_ID}" "${T4_UNUSABLE_NAME}"
+    expect_fails_in_home "${step}" "${HOME}" "refused: the row's recorded session name '${T4_KILL_ID}' holds no '.'" \
+        ad_delete_unusable_row "${T4_KILL_ID}"
+    [[ "$(row_snapshot "${T4_KILL_ID}")" == "${before}" ]] || fail "${step}: a refused statement changed ${T4_KILL_ID}'s row"
+
+    before="${after}"
+    ad_store_unusable_name "${T4_FIN_ID}" "${T4_UNUSABLE_NAME}"
+    after="$(row_snapshot "${T4_FIN_ID}")"
+    expect_row_change "${step}: ad_store_unusable_name" "${before}" "${after}" \
+        "$(jq -nc --arg n "${T4_UNUSABLE_NAME}" '{tmux_session_name: $n}')"
+}
+
+leg_operator_actions() {
+    local step="operator actions" before after rv old token t0 t1 want=() ended_at
+    # Scenario 10 part B: the row marked ended while its session still runs
+    # (the `ended` statement, every other column kept), then the human's
+    # include-finished kill, which agent-director makes only for a finished
+    # row whose session is past its starting-session bound.
+    session_age_at_least "${step}" "${T4_KILL_ID}" "${T4_STARTING_BOUND_S}"
+    before="$(row_snapshot "${T4_KILL_ID}")"
+    rv="$(jq -r '.row_version' <<< "${before}")"
+    ended_at="$(ad_store_mark_finished "${T4_KILL_ID}" ended)"
+    expect_row_change "${step}: ad_store_mark_finished ended" "${before}" "$(row_snapshot "${T4_KILL_ID}")" \
+        "$(jq -nc --arg e "${ended_at}" --argjson rv "$(( rv + 1 ))" '{state: "ended", ended_at: $e, launch_started_at: null, row_version: $rv}')"
+    has_session "${T4_KILL_ID}" || fail "${step}: session ${T4_KILL_ID} ended before the kill"
+    ad_kill_include_finished "${T4_KILL_ID}" > /dev/null
+    (( AD_KILL_RC == 0 )) && [[ "$(jq -r '.kill_sent' "${AD_KILL_OUT}")" == true ]] \
+        || fail "${step}: the include-finished kill answered $(tr '\n' ' ' < "${AD_KILL_OUT}") (exit ${AD_KILL_RC})"
+    want=(kill --include-finished --claude-instance-id "${T4_KILL_ID}")
+    expect_last_call "${step}: the include-finished kill" want
+    ( assert_no_cscb_include_finished ) > "${SCENARIO_ROOT}/operator-include-finished.out" 2>&1 || {
+        sed 's/^/  | /' "${SCENARIO_ROOT}/operator-include-finished.out" >&2
+        fail "${step}: assert_no_cscb_include_finished failed after the harness's include-finished kill"
+    }
+    wait_until "${T4_END_WAIT_S}" "${step}: session ${T4_KILL_ID} outlived the kill" no_session "${T4_KILL_ID}"
+    ad_capture get --claude-instance-id "${T4_KILL_ID}"
+    echo "${TEST_NAME}: ${step}: after the kill ${T4_KILL_ID} reads $(jq -r '.state // empty' "${AD_OUT}")"
+
+    # The pending row beside a leftover: a fresh token, its pane and server
+    # identity cleared, everything else kept; status reads it pending with a
+    # launch start.
+    before="$(row_snapshot "${T4_KILL_ID}")"
+    rv="$(jq -r '.row_version' <<< "${before}")"
+    old="$(jq -r '.launch_token // empty' <<< "${before}")"
+    t0="$(date +%s%3N)"
+    token="$(ad_store_seed_pending "${T4_KILL_ID}" "${T4_LEFTOVER_TOKEN}")"
+    t1="$(date +%s%3N)"
+    after="$(row_snapshot "${T4_KILL_ID}")"
+    [[ "${token}" =~ ^[0-9a-f]{16}$ && "${token}" != "${old}" && "${token}" != "${T4_LEFTOVER_TOKEN}" ]] \
+        || fail "${step}: ad_store_seed_pending printed '${token}' (old ${old}, leftover ${T4_LEFTOVER_TOKEN})"
+    jq -e --argjson lo "${t0}" --argjson hi "${t1}" '.launch_started_at | type == "number" and . >= $lo and . <= $hi' <<< "${after}" > /dev/null \
+        || fail "${step}: launch_started_at is $(jq -c '.launch_started_at' <<< "${after}"), not between ${t0} and ${t1}"
+    expect_row_change "${step}: ad_store_seed_pending" "${before}" "${after}" \
+        "$(jq -nc --arg t "${token}" --argjson rv "$(( rv + 1 ))" --argjson ls "$(jq '.launch_started_at' <<< "${after}")" '{
+            state: "pending", launch_started_at: $ls, launch_token: $t, ended_at: null, pid: null, proc_starttime: null,
+            tmux_server_pid: null, tmux_server_started: null, tmux_server_starttime: null,
+            pane_id: null, pane_pid: null, pane_starttime: null, row_version: $rv}')"
+    ad_capture status --claude-instance-id "${T4_KILL_ID}"
+    (( AD_RC == 0 )) && jq -e '.state == "pending" and (.launch_started_at | type == "string")' "${AD_OUT}" > /dev/null \
+        || fail "${step}: a harness status read of ${T4_KILL_ID} answered $(tr '\n' ' ' < "${AD_OUT}")"
+
+    # Scenario 25's delete: the row the statement made unusable, from the
+    # scenario's shell.
+    ad_delete_unusable_row "${T4_FIN_ID}"
+    want=(delete --claude-instance-id "${T4_FIN_ID}")
+    expect_last_call "${step}: the delete" want
+    [[ -z "$(row_snapshot "${T4_FIN_ID}")" ]] || fail "${step}: ${T4_FIN_ID}'s row is still in the store"
+    ad_capture get --claude-instance-id "${T4_FIN_ID}"
+    (( AD_RC != 0 )) || fail "${step}: a harness get of the deleted ${T4_FIN_ID} succeeded"
+    [[ "$(cscb_ad_count delete)" == 0 ]] || fail "${step}: a CSCB process made a delete"
+    ( assert_no_cscb_delete ) > "${SCENARIO_ROOT}/operator-delete.out" 2>&1 || {
+        sed 's/^/  | /' "${SCENARIO_ROOT}/operator-delete.out" >&2
+        fail "${step}: assert_no_cscb_delete failed after the harness's delete"
+    }
+}
+
+leg_find_missing_loop() {
+    local step="find-missing loop" lines_before cscb_before runs line n=0 prev_end="" start end lines=() mine=() pid
+    cscb_before="$(cscb_ad_count find-missing)"
+    lines_before="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
+    run_find_missing_loop "${T4_FM_INTERVAL_S}"
+    pid="${FIND_MISSING_LOOP_PID}"
+    [[ "${FIND_MISSING_LOOP_INTERVAL_S}" == "${T4_FM_INTERVAL_S}" ]] && pid_alive "${pid}" \
+        || fail "${step}: the loop is not running at interval ${T4_FM_INTERVAL_S}"
+    expect_fails_in_home "${step}" "${HOME}" "the find-missing loop already runs" run_find_missing_loop "${T4_FM_INTERVAL_S}"
+    wait_find_missing_runs 2
+    stop_find_missing_loop
+    ! pid_alive "${pid}" || fail "${step}: the loop ${pid} still runs after stop_find_missing_loop"
+    expect_fails_in_home "${step}" "${HOME}" "the find-missing loop is not running" wait_find_missing_runs 1
+
+    # Its log: every run exited 0, each started at least the interval after
+    # the one before ended.
+    runs="$(find_missing_loop_runs)"
+    (( runs >= 2 )) || fail "${step}: the loop's log holds ${runs} run(s)"
+    while IFS= read -r line; do
+        n=$(( n + 1 ))
+        [[ "${line}" =~ ^run\ ${n}$'\t'start\ ([0-9]+\.[0-9]+)$'\t'end\ ([0-9]+\.[0-9]+)$'\t'exit\ 0$ ]] \
+            || fail "${step}: the loop's log line '${line}' is not run ${n} with exit 0"
+        start="${BASH_REMATCH[1]}"
+        end="${BASH_REMATCH[2]}"
+        if [[ -n "${prev_end}" ]]; then
+            ! time_before "${start}" "$(seconds_plus "${prev_end}" "${T4_FM_INTERVAL_S}")" \
+                || fail "${step}: run ${n} started at ${start}, less than ${T4_FM_INTERVAL_S}s after run $(( n - 1 )) ended (${prev_end})"
+        fi
+        prev_end="${end}"
+    done < <(grep '^run ' "${FIND_MISSING_LOOP_LOG}")
+
+    # Its calls: one find-missing per run, the loop subshell their parent,
+    # with the shell's command line; none is CSCB's.
+    mapfile -t lines < <(tail -n "+$(( lines_before + 1 ))" "${SCENARIO_AD_SHIM_LOG}" | awk -F'\t' '$1 == "call"')
+    (( ${#lines[@]} == runs )) || fail "${step}: ${#lines[@]} call line(s) during the loop, not its ${runs} run(s)"
+    mapfile -d '' -t mine < "/proc/$$/cmdline"
+    for line in "${lines[@]}"; do
+        read_call "${step}" "${line}"
+        [[ "${CALL_WORDS[*]}" == find-missing && "${CALL_PPID}" == "${pid}" ]] && same_words CALL_PARENT mine \
+            || fail "${step}: a call during the loop is $(quoted "${CALL_WORDS[@]}") from ${CALL_PPID}, not find-missing from the loop ${pid} with the shell's command line"
+    done
+    [[ "$(cscb_ad_count find-missing)" == "${cscb_before}" ]] || fail "${step}: CSCB's find-missing count changed"
+}
+
+# run_driver <step> <call> [<VAR>=<value>...]: fixtures/fmk-driver.ts with
+# <call>, through `cscb_run`, for the driver persona, with the variables
+# given. Fails unless it exits 0 with exactly one outcome line on standard
+# output, `DRIVER: FORCED <call> …` (DRIVER_LINE), and every agent-director
+# call in the shim's log during it has the driver as its parent (the run's
+# recorded PID; its command line bun's, or unknown for a call the driver left
+# in flight as it exited), CSCB's count rising by exactly those, none a
+# delete.
+# Sets DRIVER_LINE and DRIVER_VERBS.
+run_driver() {
+    local step="$1" call="$2" out err rc=0 before cscb_before outcome=() lines=() line pid parent unknown=0
+    shift 2
+    out="${SCENARIO_ROOT}/fmk-driver-${call}.out"
+    err="${SCENARIO_ROOT}/fmk-driver-${call}.err"
+    before="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
+    cscb_before="$(cscb_ad_count "")"
+    cscb_run env "CSCB_PKG_DIR=${SCENARIO_REPO}/node_modules/claude-slack-channel-bots" \
+        "DRIVER_PERSONA=${DRV_NAME}" "DRIVER_PERSONA_CHANNEL=${DRV_CHANNEL}" "DRIVER_WORKING_DIRECTORY=${DRV_WORK}" "$@" \
+        bun --no-install "${SCENARIO_FIXTURES}/fmk-driver.ts" "${call}" < /dev/null > "${out}" 2> "${err}" || rc=$?
+    mapfile -t outcome < <(grep -E '^DRIVER(_FAIL)?:' "${out}" || true)
+    if (( rc != 0 || ${#outcome[@]} != 1 )) || [[ "${outcome[0]}" != "DRIVER: FORCED ${call} "* || "$(line_count "${out}")" != 1 ]]; then
+        sed 's/^/  | /' "${out}" >&2
+        tail -n 20 "${err}" | sed 's/^/  | /' >&2
+        fail "${step}: the driver exited ${rc} with ${#outcome[@]} outcome line(s) (first: ${outcome[0]:-none}), not one 'DRIVER: FORCED ${call} …' line"
+    fi
+    DRIVER_LINE="${outcome[0]}"
+    echo "${TEST_NAME}: ${step}: ${DRIVER_LINE:0:400}"
+
+    # The driver's record entry (role run), whose PID is the driver's own.
+    line="$(awk -F'\t' -v w="fmk-driver.ts ${call}" '$1 == "proc" && $2 == "run" && index($6, w) { l = $0 } END { print l }' "${SCENARIO_CSCB_RECORD}")"
+    pid="$(cut -f3 <<< "${line}")"
+    [[ "${pid}" =~ ^[0-9]+$ ]] || fail "${step}: the record holds no run entry for the driver"
+    mapfile -t lines < <(tail -n "+$(( before + 1 ))" "${SCENARIO_AD_SHIM_LOG}" | awk -F'\t' '$1 == "call"')
+    (( ${#lines[@]} >= 1 )) || fail "${step}: the driver's run added no agent-director call line"
+    DRIVER_VERBS=()
+    for line in "${lines[@]}"; do
+        read_call "${step}" "${line}"
+        # The parent's command line is bun's, or unknown (`?`) for a call
+        # the driver left in flight when it exited, before the shim read it;
+        # its PID is the driver's either way.
+        parent="${CALL_PARENT[0]:-?}"
+        if [[ "${CALL_PPID}" != "${pid}" || ( "${parent}" != */bun && "${parent}" != bun && "${parent}" != '?' ) ]]; then
+            echo "  | ${line}" >&2
+            fail "${step}: a call during the driver's run has parent ${CALL_PPID} '${CALL_PARENT[*]:-?}', not the driver ${pid} (bun)"
+        fi
+        [[ "${parent}" != '?' ]] || unknown=$(( unknown + 1 ))
+        _L_WORDS=("${CALL_WORDS[@]}")
+        _scenario_ad_verb
+        DRIVER_VERBS+=("${_L_VERB}")
+        [[ "${_L_VERB}" != delete ]] || fail "${step}: the driver's run made a delete"
+    done
+    echo "${TEST_NAME}: ${step}: agent-director calls: ${DRIVER_VERBS[*]} (${unknown} left in flight at the driver's exit)"
+    [[ "$(cscb_ad_count "")" == "$(( cscb_before + ${#lines[@]} ))" ]] \
+        || fail "${step}: CSCB's call count went from ${cscb_before} to $(cscb_ad_count ""), not up by the driver's ${#lines[@]}"
+    [[ "$(cscb_ad_count delete)" == 0 ]] || fail "${step}: a CSCB process made a delete"
+}
+
+# expect_driver_verb <step> <verb>: the last driver run made a <verb> call.
+expect_driver_verb() {
+    local v
+    for v in "${DRIVER_VERBS[@]}"; do
+        [[ "${v}" == "$2" ]] && return 0
+    done
+    fail "$1: the driver made no $2 call (${DRIVER_VERBS[*]})"
+}
+
+leg_fmk_driver_reuse_spawn() {
+    local step="fmk-driver reuse-spawn"
+    DRV_WORK="$(make_workdir drv)"
+    stub_mode "${DRV_WORK}" "${STUB_MODE_AT_ONCE}"
+    run_driver "${step}" reuse-spawn
+    [[ "${DRIVER_LINE}" == *" called=true "* && "${DRIVER_LINE}" == *" result={"* ]] \
+        || fail "${step}: the outcome line has no called=true or no result: ${DRIVER_LINE}"
+    expect_driver_verb "${step}" spawn
+}
+
+leg_fmk_driver_read_pane() {
+    local step="fmk-driver read-pane-other-tmux-tmpdir" other="${SCENARIO_ROOT}/other-tmux"
+    mkdir -m 700 "${other}"
+    run_driver "${step}" read-pane-other-tmux-tmpdir "DRIVER_OTHER_TMUX_TMPDIR=${other}"
+    [[ "${DRIVER_LINE}" == *" tmux_tmpdir=\"${other}\" restored=true outcome="* ]] \
+        || fail "${step}: the outcome line does not name the other TMUX_TMPDIR, restored: ${DRIVER_LINE}"
+    expect_driver_verb "${step}" read-pane
+}
+
+leg_fmk_driver_resume() {
+    local step="fmk-driver resume"
+    run_driver "${step}" resume
+    [[ "${DRIVER_LINE}" == *" called=true "* && "${DRIVER_LINE}" == *" result={"* ]] \
+        || fail "${step}: the outcome line has no called=true or no result: ${DRIVER_LINE}"
+    expect_driver_verb "${step}" resume
+}
+
+# nested_expect_refused <reason> <command> [<arg>...]: in the nested run, the
+# command fails in a subshell, its first FAIL line holding <reason>.
+nested_expect_refused() {
+    local reason="$1" out="${SCENARIO_ROOT}/refused.out" rc=0 line
+    shift
+    ( "$@" ) > "${out}" 2>&1 || rc=$?
+    line="$(grep -m1 '^FAIL:' "${out}" || true)"
+    if (( rc == 0 )) || [[ "${line}" != *"${reason}"* ]]; then
+        sed 's/^/  | /' "${out}" >&2
+        fail "'$*' exited ${rc} without '${reason}'"
+    fi
+}
+
+# nested_expect_row <instance-id> <session> <labels-json>: in the nested run,
+# a harness get finds the row live or waiting, recording <session> and exactly
+# <labels-json>, and the session runs on the run's tmux server.
+nested_expect_row() {
+    local id="$1" session="$2" labels="$3"
+    ad_capture get --claude-instance-id "${id}"
+    (( AD_RC == 0 )) || fail "harness get of ${id} exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
+    jq -e --arg s "${session}" --argjson l "${labels}" '.tmux_session_name == $s and .labels == $l' "${AD_OUT}" > /dev/null \
+        || fail "row ${id} reads $(tr '\n' ' ' < "${AD_OUT}" | head -c 600), not session ${session} with labels ${labels}"
+    "${SCENARIO_REAL_TMUX}" has-session -t "=${session}" 2> /dev/null || fail "no session ${session} for row ${id}"
+}
+
+# The body of leg_seeders_010's nested fmk run (started on 0.10.0).
+nested_seed_010() {
+    local step="0.10.0 seeders" dir_row dir_a dir_b config out lines=() want=() id session sid pane pids=() i n
+    expect_shim_in_place "${step}" "${SCENARIO_AD_010_BIN}"
+    dir_row="$(make_workdir row)"
+    dir_a="${HOME}/t0-route-a"
+    mkdir -p "${dir_a}"
+    dir_b="$(make_workdir route-b)"
+    config="${SCENARIO_ROOT}/prepersona-config.json"
+    jq -n --arg b "${dir_b}" '{routes: {C0T0AAA01: {cwd: "~/t0-route-a"}, C0T0BBB02: {cwd: $b}}, bind: "127.0.0.1", port: 3100}' > "${config}"
+
+    # Every route is named and checked before the first row (and before
+    # 0.10.0's first spawn makes the store).
+    nested_expect_refused "no Slack channel name given for routed channel C0T0BBB02" \
+        seed_prepersona_fleet "${config}" "C0T0AAA01=Ops Team!"
+    [[ ! -e "${HOME}/.agent-director/state.db" ]] || fail "a refused fleet made a store"
+    echo "CHECK: fleet refused before its first row"
+
+    out="$(seed_010_row t0-010-row t0_010_row "${dir_row}" team=t0)"
+    read -r id session sid pane <<< "${out}"
+    [[ "${id}" == t0-010-row && "${session}" == t0_010_row && "${sid}" =~ ^\$[0-9]+$ && "${pane}" =~ ^%[0-9]+$ ]] \
+        || fail "seed_010_row printed '${out}'"
+    nested_expect_row t0-010-row t0_010_row '{"team":"t0"}'
+    echo "CHECK: seed_010_row"
+
+    out="$(seed_prepersona_fleet "${config}" "C0T0AAA01=Ops Team!" "C0T0BBB02=__")"
+    mapfile -t lines <<< "${out}"
+    want=(
+        "C0T0AAA01 cscb_ops_team_C0T0AAA01 slack_bot_ops_team_C0T0AAA01"
+        "C0T0BBB02 cscb_C0T0BBB02 slack_bot_C0T0BBB02"
+    )
+    (( ${#lines[@]} == 2 )) || fail "seed_prepersona_fleet printed ${#lines[@]} line(s): ${out}"
+    for i in 0 1; do
+        [[ "${lines[i]}" =~ ^${want[i]}\ \$[0-9]+\ %[0-9]+$ ]] || fail "seed_prepersona_fleet line $(( i + 1 )) is '${lines[i]}', not '${want[i]} <session id> <pane id>'"
+    done
+    nested_expect_row cscb_ops_team_C0T0AAA01 slack_bot_ops_team_C0T0AAA01 '{"service":"cscb","channel":"C0T0AAA01"}'
+    nested_expect_row cscb_C0T0BBB02 slack_bot_C0T0BBB02 '{"service":"cscb","channel":"C0T0BBB02"}'
+    [[ "$("${SCENARIO_REAL_TMUX}" display-message -p -t "=slack_bot_ops_team_C0T0AAA01:" '#{pane_current_path}')" == "$(realpath -e -- "${dir_a}")" ]] \
+        || fail "the first route's worker does not run in its ~ route directory ${dir_a}"
+    [[ "$("${SCENARIO_REAL_TMUX}" display-message -p -t "=slack_bot_C0T0BBB02:" '#{pane_current_path}')" == "$(realpath -e -- "${dir_b}")" ]] \
+        || fail "the second route's worker does not run in ${dir_b}"
+    echo "CHECK: seed_prepersona_fleet"
+
+    # The release candidate's install over the 0.10.0 rows.
+    for session in t0_010_row slack_bot_ops_team_C0T0AAA01 slack_bot_C0T0BBB02; do
+        pids+=("$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${session}:" '#{pane_pid}')")
+    done
+    install_ad_rc "${step}: install_ad_rc over the seeded rows"
+    check_ad_shim "${step}: after install_ad_rc"
+    expect_shim_in_place "${step}: after install_ad_rc" "${SCENARIO_RC_BIN}"
+    [[ "$(ad_store_id)" =~ ^[0-9a-f]{16}$ ]] || fail "no store id after install_ad_rc"
+    nested_expect_row t0-010-row t0_010_row '{"team":"t0"}'
+    nested_expect_row cscb_ops_team_C0T0AAA01 slack_bot_ops_team_C0T0AAA01 '{"service":"cscb","channel":"C0T0AAA01"}'
+    nested_expect_row cscb_C0T0BBB02 slack_bot_C0T0BBB02 '{"service":"cscb","channel":"C0T0BBB02"}'
+    n=0
+    for session in t0_010_row slack_bot_ops_team_C0T0AAA01 slack_bot_C0T0BBB02; do
+        [[ "$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${session}:" '#{pane_pid}')" == "${pids[n]}" ]] && pid_alive "${pids[n]}" \
+            || fail "the worker of ${session} (${pids[n]}) did not survive install_ad_rc"
+        n=$(( n + 1 ))
+    done
+    echo "CHECK: rows survive the release candidate's install"
+
+    # Each seeder now refuses, for each of its reasons: install.sh has run;
+    # the binary behind the shim is not 0.10.0; the store has a store_meta.
+    nested_expect_refused "refused: the release candidate's install.sh has run" seed_010_row t0-010-late t0_010_late "${dir_row}"
+    nested_expect_refused "refused: the release candidate's install.sh has run" \
+        seed_prepersona_fleet "${config}" "C0T0AAA01=Ops Team!" "C0T0BBB02=__"
+    nested_expect_refused "refused: the binary behind the shim reports version" nested_with_no_install seed_010_row t0-010-late t0_010_late "${dir_row}"
+    swap_ad_binary 0.10.0 "${step}: 0.10.0 behind the shim over the migrated store"
+    nested_expect_refused "refused: the store has a store_meta table" nested_with_no_install seed_010_row t0-010-late t0_010_late "${dir_row}"
+    nested_expect_refused "refused: the store has a store_meta table" nested_with_no_install \
+        seed_prepersona_fleet "${config}" "C0T0AAA01=Ops Team!" "C0T0BBB02=__"
+    swap_ad_binary rc "${step}: the release candidate back behind the shim"
+    "${SCENARIO_REAL_TMUX}" has-session -t "=t0_010_late" 2> /dev/null && fail "a refused seeder made a session"
+    echo "CHECK: seeders refuse after the install"
+
+    nested_stand_in
+    nested_closing
+    echo "PASS: ${TEST_NAME}"
+}
+
+# nested_with_no_install <command> [<arg>...]: run <command> as though no
+# install.sh had run in this shell (in the caller's subshell).
+nested_with_no_install() {
+    _SCENARIO_INSTALL_COUNT=0
+    "$@"
+}
+
+leg_seeders_010() {
+    local step="0.10.0 seeders" name="test-0-fmk-nested-seeders-010"
+    run_nested "${name}" 0.10.0 nested_seed_010 nested_expect_refused nested_expect_row nested_with_no_install \
+        expect_shim_in_place nested_stand_in nested_closing
+    expect_nested_markers "${step}" "fleet refused before its first row" seed_010_row seed_prepersona_fleet \
+        "rows survive the release candidate's install" "seeders refuse after the install" \
+        assert_no_server_tmux assert_no_cscb_include_finished assert_no_cscb_delete
+    if (( NESTED_RC != 0 )) || grep -q '^FAIL:' "${NESTED_OUT}" || ! grep -qxF "PASS: ${name}" "${NESTED_OUT}"; then
+        sed 's/^/  | /' "${NESTED_OUT}" >&2
+        fail "${step}: the nested run exited ${NESTED_RC}: $(grep -m1 '^FAIL:' "${NESTED_OUT}" || true)"
+    fi
+}
+
+leg_tmux_server_steps() {
+    local step="tmux server steps" out old_pid new_pid sid sock moved rb_pid rb_sid got
+    out="${SCENARIO_ROOT}/tmux-server-steps.out"
+    got="$("${SCENARIO_REAL_TMUX}" list-sessions -F '#{pid}')" || fail "${step}: no tmux server runs for the scenario"
+    old_pid="${got%%$'\n'*}"
+    restart_tmux_server > "${out}"
+    read -r new_pid sid < "${out}"
+    [[ "${new_pid}" != "${old_pid}" ]] && pid_alive "${new_pid}" && ! pid_alive "${old_pid}" \
+        || fail "${step}: restart_tmux_server printed '$(cat "${out}")' (old server ${old_pid})"
+    [[ "$("${SCENARIO_REAL_TMUX}" list-sessions -F '#{pid} #{session_id} #{session_name}')" == "${new_pid} ${sid} ${SCENARIO_TAG}_restart" ]] \
+        || fail "${step}: after the restart the server lists $("${SCENARIO_REAL_TMUX}" list-sessions -F '#{pid} #{session_id} #{session_name}' | tr '\n' ';')"
+
+    sock="$("${SCENARIO_REAL_TMUX}" display-message -p -t "${sid}:" '#{socket_path}')"
+    expect_fails_in_home "${step}" "${HOME}" "refused: TMUX is set" with_tmux_set rebind_tmux_socket
+    rebind_tmux_socket > "${out}"
+    read -r rb_pid rb_sid moved < "${out}"
+    [[ "${moved}" == "${sock}.rebound-1" && "${moved}" == "${REBOUND_SOCKET:-}" && "${rb_pid}" != "${new_pid}" ]] \
+        || fail "${step}: rebind_tmux_socket printed '$(cat "${out}")' (socket ${sock}, old server ${new_pid})"
+    got="$("${SCENARIO_REAL_TMUX}" -S "${moved}" list-sessions -F '#{pid} #{session_name}')"
+    [[ "${got}" == "${new_pid} ${SCENARIO_TAG}_restart" ]] || fail "${step}: the moved socket answers '${got}', not the old server"
+    got="$("${SCENARIO_REAL_TMUX}" list-sessions -F '#{pid} #{session_id} #{session_name}')"
+    [[ "${got}" == "${rb_pid} ${rb_sid} ${SCENARIO_TAG}_rebound_1" ]] || fail "${step}: the socket path answers '${got}', not the new server"
+}
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -2450,6 +3272,7 @@ LEGS=(
     hide_restore
     log_kept
     start_on_010
+    store_rows
     guard_refusals
     shim_check
     tmux_shim_log
@@ -2480,10 +3303,20 @@ LEGS=(
     synthetic_delete
     count_helpers
     closing_enforcement
+    seeding
+    tmux_steps
+    store_statements
+    operator_actions
+    find_missing_loop
+    fmk_driver_reuse_spawn
+    fmk_driver_read_pane
+    fmk_driver_resume
+    seeders_010
+    tmux_server_steps
 )
 
 for leg in "${LEGS[@]}"; do
-    echo "${TEST_NAME}: leg ${leg}"
+    echo "${TEST_NAME}: leg ${leg} (at ${SECONDS}s)"
     "leg_${leg}"
 done
 

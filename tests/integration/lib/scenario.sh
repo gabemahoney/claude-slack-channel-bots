@@ -130,9 +130,10 @@
 #   scenario's shell or a subshell of it makes.
 #
 # Guards. Every helper below that runs agent-director, installs, moves or
-# swaps an agent-director binary or the shim, or reads or edits the store
-# with sqlite3 calls `require_ci_image` and then `require_scenario_home` as
-# its first two steps, before any copy, move, install or sqlite3 step.
+# swaps an agent-director binary or the shim, reads or edits the store with
+# sqlite3, or plays a human's tmux step, seeds a session or label, or runs the
+# find-missing loop calls `require_ci_image` and then `require_scenario_home`
+# as its first two steps, before any copy, move, install, sqlite3 or tmux step.
 #
 # Matchers (E14 decision 14). Scenario scripts assert a line's class prefix,
 # persona ref and distinguishing fragments, never a whole sentence the unit
@@ -312,6 +313,235 @@
 #                                      server name slack-channel-router, as the package's install
 #                                      writes it (default <port>: SCENARIO_PORT; setup writes it so)
 #
+#   Labels and seeding (fmk mode; b.jg5 SRJ-1306's seeding steps, under the "Seeding rules"
+#   below; each runs both guards first)
+#   ad_new_token [<instance-id> [<token>...]]
+#                                      print a fresh launch token (16 lowercase hex characters, from
+#                                      /dev/urandom) other than <instance-id>'s current launch token
+#                                      in the store (when it has a row holding one) and other than
+#                                      each <token>
+#   ad_other_store_id                  print a 16-lowercase-hex store id other than the scenario
+#                                      store's (`ad_store_id`): another agent-director store's id
+#   ad_owner_label <token> <session-id> <instance-id> [<store-id>]
+#                                      print the @ad_owner value agent-director writes,
+#                                      `ad1 <token> <session-id> <instance-id> <store-id>`, where
+#                                      <session-id> is the labelled session's own tmux id ($N) and
+#                                      <store-id> is the scenario store's id unless given
+#   ad_pane_label <token> <pane-id>    print the @ad_pane value, `<token> <pane-id>` (%N)
+#   seed_leftover [-c <dir>] <name> <instance-id> <worker> [<arg>...]
+#                                      a leftover: session <name>, labelled with an earlier launch of
+#                                      <instance-id> (`ad_new_token <instance-id>`) and the store's
+#                                      id; its worker pane carries @ad_pane `<that token> <pane id>`
+#   seed_unlabelled [-c <dir>] <name> <worker> [<arg>...]
+#                                      a session with no label and no @ad_pane
+#   seed_env_only [-c <dir>] <name> <instance-id> <worker> [<arg>...]
+#                                      a session with no label whose tmux environment holds only
+#                                      the AGENT_DIRECTOR_INSTANCE_ID=<instance-id> it is given
+#   seed_borrowed_name [-c <dir>] <name> <instance-id> <worker> [<arg>...]
+#                                      another row's session holding <name> (a persona's session
+#                                      name): labelled as `seed_leftover` labels, naming
+#                                      <instance-id>, the other row's id, and the store's id
+#   seed_other_store [-c <dir>] <name> <instance-id> <worker> [<arg>...]
+#                                      another agent-director store's session: as `seed_leftover`,
+#                                      but its label ends with an `ad_other_store_id` id
+#                                      Each seed_* runs tmux new-session -d on the scenario's own
+#                                      tmux server from the scenario's own shell (working directory
+#                                      <dir>, default SCENARIO_ROOT; the pane runs <worker> with its
+#                                      <arg>s), refuses a <name> that is taken or holds `.`, `:` or a
+#                                      control character, reads the session's name, labels and
+#                                      environment back through tmux, fails when one is not as made,
+#                                      and prints `<session id> <pane id>`, then the token and the
+#                                      store id for a labelled session; it also sets
+#                                      SEEDED_SESSION_ID, SEEDED_PANE_ID, SEEDED_TOKEN and
+#                                      SEEDED_STORE_ID (empty when none), which a call inside
+#                                      `$( … )` does not keep
+#
+#   The human's tmux steps (fmk mode; b.jg5 SRJ-1306, SRJ-1401). Each runs both guards first,
+#   then the real tmux on the scenario's own tmux server, from the scenario's own shell, never
+#   a CSCB process (it refuses when TMUX_TMPDIR is not the scenario's or TMUX is set); it reads
+#   back the session, pane, option or server it changed and fails when the change is absent; none
+#   reads a pane's text, and none sets base-index. <session> is a session id ($N) or a session
+#   name, matched exactly (never as a prefix of another session's). Sending Enter into a held
+#   stub's pane is `stub_press_enter` (above).
+#   relabel_session <session> [<token>]
+#                                      relabel a persona's own session with an earlier launch's
+#                                      token: its @ad_owner keeps its instance id and ends with the
+#                                      store's id, with <token> (default: `ad_new_token`, other than
+#                                      the label's token and the row's current launch token; a given
+#                                      <token> may be neither), and its worker pane (the pane whose
+#                                      @ad_pane names it with the label's token) takes
+#                                      `<token> <pane id>`; fails unless the session carries a valid
+#                                      label of this store; prints `<session id> <pane id> <token>`
+#                                      (and sets the SEEDED_* variables)
+#   attach_viewer <session> [<viewer-name>]
+#                                      a grouped viewer session on <session> (new-session -t; default
+#                                      name <SCENARIO_TAG>_viewer_<n>, the first free <n>); prints its
+#                                      session id
+#   rename_session <session> <new-name>
+#                                      rename the session (a <new-name> that is taken or holds `.`,
+#                                      `:` or a control character is refused); prints its session id
+#   set_remain_on_exit <session>       remain-on-exit on, as a window option, on every window of
+#                                      <session>
+#   ad_owner_global_set [<value>]      set the global @ad_owner value (`set-option -g`, one of the
+#                                      three scopes agent-director's lookup reads: global, server,
+#                                      global-window), which makes the lookup answer conflicting
+#                                      labels; default <value>: `ad_owner_label <fresh token> $0
+#                                      <SCENARIO_TAG>_global`; prints the value
+#   ad_owner_global_unset              unset it (`set-option -gu`); fails unless the global, server
+#                                      and global-window scopes then hold no @ad_owner value
+#   respawn_worker_pane <pane-id|session> <command> [<arg>...]
+#                                      `respawn-pane -k`: the pane (for a <session>, its worker pane,
+#                                      the one whose @ad_pane names it, or its only pane) runs
+#                                      <command> instead; fails unless the pane keeps its id, runs a
+#                                      new process and the old one is gone within 10 s; prints
+#                                      `<pane id> <new pane pid>`
+#   restart_tmux_server [<session-name>]
+#                                      kill-server on the scenario's tmux server, wait until its
+#                                      process is gone, then start a new server with one detached
+#                                      session (default name <SCENARIO_TAG>_restart) running tmux's
+#                                      default command; prints `<new server pid> <session id>`
+#   rebind_tmux_socket [<session-name>]
+#                                      re-bind the scenario's socket path while the old server runs:
+#                                      the old server's socket is moved to `<socket>.rebound-<n>`
+#                                      (where it still answers), and a new server is started at the
+#                                      socket path with one detached session (default name
+#                                      <SCENARIO_TAG>_rebound_<n>); prints `<new server pid>
+#                                      <session id> <moved socket path>` (the path also in
+#                                      REBOUND_SOCKET). The trap stops both servers
+#   end_session <session-id>           a human ending a leftover or a hand-made session by its
+#                                      session id ($N): kill-session; fails unless it is gone
+#
+#   Store statements and the human's agent-director actions (fmk mode; b.jg5 SRJ-1306; both
+#   guards first). Each statement is one `ad_store_edit` UPDATE that names the row by
+#   <instance-id> (letters, digits and `._:@-` only) and its row_version as read just before,
+#   so an agent-director write in between leaves the row unwritten and the step failing; the
+#   row is read before and after (a read-only sqlite3 query) and the step fails unless the
+#   named columns hold their new values and every other column its old one. The pending row
+#   with no launch start is `ad_store_pending_no_launch` (above).
+#   ad_store_mark_finished <instance-id> <missing|ended>
+#                                      b.jg5 SRJ-1412 (scenario 10 part B): state <missing|ended>;
+#                                      ended_at = now minus the stopping window, in whole seconds, in
+#                                      the store's `YYYY-MM-DD HH:MM:SS` UTC layout; launch_started_at
+#                                      NULL; row_version + 1. The window is [tmux]
+#                                      stopping_window_seconds from $HOME/.agent-director/config.toml,
+#                                      or agent-director's default (90) without one. Refuses unless
+#                                      that ended_at is later, in whole seconds, than the creation of
+#                                      the worker's session (read on the row's socket, under
+#                                      SCENARIO_ROOT, by its recorded pane), so while the session is
+#                                      younger than the window; prints the ended_at written
+#   ad_store_seed_pending <instance-id> [<leftover-token>]
+#                                      b.jg5 SRJ-1420 (scenario 19): the persona's row made a `pending`
+#                                      row beside a leftover, as a spawn whose process stopped before
+#                                      its create leaves it: state `pending`; launch_started_at now (in
+#                                      milliseconds); launch_token a fresh token other than the row's
+#                                      current one and <leftover-token>; ended_at, pid,
+#                                      proc_starttime, the server identity (tmux_server_pid,
+#                                      tmux_server_started, tmux_server_starttime) and the pane
+#                                      identity (pane_id, pane_pid, pane_starttime) NULL; row_version
+#                                      + 1. A harness `status` read must then read `pending` with a
+#                                      launch start; prints the token
+#   ad_store_unusable_name <instance-id> <name>
+#                                      b.jg5 SRJ-1427 (scenario 25): a finished row's (`ended` or
+#                                      `missing`) tmux_session_name set to <name>, which holds a `.`
+#                                      and only letters, digits and `._-`; nothing else changes
+#                                      (row_version included)
+#   ad_kill_include_finished <instance-id>
+#                                      a human's `kill --include-finished --claude-instance-id <id>`
+#                                      through the harness call (`ad_capture`), as a direct child of
+#                                      the shell that calls it: the scenario's own shell, or a
+#                                      subshell of it, which `assert_no_cscb_include_finished`
+#                                      accepts. Sets AD_KILL_OUT (its output, a file under
+#                                      SCENARIO_ROOT), AD_KILL_ERR and AD_KILL_RC and prints the output;
+#                                      fails unless it exits 0 with a result holding kill_sent and its
+#                                      invocation is in the shim's log. agent-director makes this kill
+#                                      only for a finished row (`ended` or `missing`, as
+#                                      `ad_store_mark_finished` leaves it) whose session is past the
+#                                      starting-session bound ([tmux] starting_session_seconds in
+#                                      $HOME/.agent-director/config.toml: 300 s by default, 60 s at
+#                                      its safe minimum); before that it answers ErrSpawnNotResumable
+#                                      (a live row) or ErrTmuxUnresponsive (a younger session), and
+#                                      the step fails on that non-zero exit; a scenario that uses it
+#                                      lowers that bound in its [tmux] table or waits the 300 s
+#   ad_delete_unusable_row <instance-id>
+#                                      scenario 25's step, the only agent-director `delete` the
+#                                      harness makes (b.jg5 SRJ-1306): a human removing the row with
+#                                      the unusable name; refuses unless the row's recorded session
+#                                      name holds the `.` `ad_store_unusable_name` wrote; fails unless
+#                                      `delete` exits 0 and the row is gone
+#
+#   The find-missing loop (fmk mode; b.jg5 SRJ-1401: only for a latched persona's row, which CSCB
+#   makes no extra call for, as the host's find-missing loop marks it; an unlatched persona's
+#   row is CSCB's own pending-row runs' to mark; both guards first)
+#   run_find_missing_loop [<interval-s>]
+#                                      start the loop in the background, a subshell of the scenario's
+#                                      shell registered with `track_pid`: `find-missing`, with no
+#                                      arguments, through the harness call (`ad`, the scenario HOME's
+#                                      binary behind the shim), then a sleep of <interval-s> (default
+#                                      SCENARIO_FIND_MISSING_INTERVAL_S, 30), and again, until it is
+#                                      stopped or the trap ends it. Refuses when TMUX_TMPDIR is not
+#                                      the scenario's or TMUX is set, and while a loop runs. Each run
+#                                      writes run.<n>.out and run.<n>.err and one log line,
+#                                      `run <n> TAB start <time> TAB end <time> TAB exit <status>`,
+#                                      followed by its output's lines, indented (`  out| `,
+#                                      `  err| `), to FIND_MISSING_LOOP_LOG
+#                                      ($SCENARIO_ROOT/find-missing-loop/loop.log). Its calls'
+#                                      parent is that subshell (the script's own command line, no
+#                                      CSCB process), so CSCB's filters count none of them. Sets
+#                                      FIND_MISSING_LOOP_PID and FIND_MISSING_LOOP_INTERVAL_S
+#   stop_find_missing_loop [<timeout-s>]
+#                                      SIGTERM the loop (a run in flight finishes first); fail unless
+#                                      it is gone within <timeout-s> (default 30)
+#   find_missing_loop_runs             print how many runs the loop's log holds (0 when none)
+#   wait_find_missing_runs <n> [<timeout-s>]
+#                                      wait for <n> more runs than the log holds now; fails when the
+#                                      loop is not running, stops, or is not that far within
+#                                      <timeout-s> (default <n> intervals plus 60 s)
+#
+#   0.10.0 start and seeders (fmk mode; b.jg5 SRJ-1306, SRJ-1402, SRJ-1424). The 0.10.0 start is
+#   setup's: a script that sets SCENARIO_AD_START=0.10.0 before sourcing gets 0.10.0's binary
+#   behind the shim (`install_ad_010`) and no store, which 0.10.0's first `spawn` creates.
+#   `install_ad_rc` later runs the release candidate's install.sh over it (the migration), then
+#   re-shims and re-checks. Both seeders run both guards first, and refuse unless the binary
+#   behind the shim, run by its own name, reports 0.10.0, no `install_ad_rc` has run in this
+#   shell and the store, if any, has no store_meta table (the release candidate's install has
+#   not run in this HOME).
+#   seed_010_row <instance-id> <session-name> <dir> [<key>=<value>...]
+#                                      one row made with 0.10.0's own `spawn` through the harness call
+#                                      (`ad_capture`, from the scenario's shell): --cwd <dir>,
+#                                      --claude-instance-id, --tmux-session-name and a --label per
+#                                      <key>=<value>; refuses a <session-name> that is taken, longer
+#                                      than 64 bytes or holds `.`, `:`, `#` or a control character, and
+#                                      a <dir> that is not an absolute path to a directory. Its worker
+#                                      is the stub (`claude`), in the mode selected for <dir>:
+#                                      `at-once` (selected here) unless the caller selected
+#                                      another (`stub_mode`) first. 0.10.0's hooks
+#                                      are shell form, and the stub fires them from their words.
+#                                      Fails unless the session runs the stub; in `at-once` it then
+#                                      waits (SCENARIO_SEED_REPORT_S, 60 s) until the row has
+#                                      reported in (a live state other than `pending`). Prints
+#                                      `<instance id> <session name> <session id> <pane id>` (and
+#                                      sets SEEDED_SESSION_ID and SEEDED_PANE_ID)
+#   seed_prepersona_fleet <config.json> <channel-id>=<channel-name>...
+#                                      the pre-persona fleet: one `seed_010_row` per channel the
+#                                      pre-persona config's `routes` names, in its order, with that
+#                                      route's cwd (`~` and `~/` expanded against HOME; it must be
+#                                      absolute), named and labelled as the published pre-persona
+#                                      package (0.10.0) names and labels it: instance id
+#                                      `cscb_<name>_<channel id>`, session
+#                                      `slack_bot_<name>_<channel id>`, labels `service=cscb` and
+#                                      `channel=<channel id>`, no `persona` label. <name> is the
+#                                      package's normalizeChannelName of the channel's Slack name,
+#                                      which it reads from Slack (conversations.info) and never from
+#                                      config.json, so the caller gives it for every routed channel:
+#                                      lowercased, each run of characters other than a-z and 0-9
+#                                      turned into one `_`, leading and trailing `_` dropped; a name
+#                                      that normalizes to nothing gives the package's bare forms,
+#                                      `cscb_<channel id>` and `slack_bot_<channel id>`. ASCII names
+#                                      only. Every route, its name and its directory are checked
+#                                      before the first row is made. Prints one line per row,
+#                                      `<channel id> <instance id> <session name> <session id>
+#                                      <pane id>`
+#
 #   CSCB processes and the tmux shim (see "CSCB processes and the tmux shim")
 #   cscb_run <command> [<arg>...]      run <command> as a CSCB process (a CLI command of the package
 #                                      under test or another, such as scenario 1's pre-persona CLI, or
@@ -410,6 +640,25 @@
 # Shared-mode scripts (test-5 to test-12) have no closing assertions, no tmux
 # shim and no record.
 #
+# Seeding rules (fmk mode; b.jg5 SRJ-1306, agent-director's handoff rev 15 and
+# rev 17). The harness seeds and relabels sessions from the scenario's own
+# shell, never through a CSCB process, and:
+# - every @ad_owner label it seeds or relabels ends with the scenario store's
+#   own store id (`ad_store_id`), unless the step seeds another store's
+#   session (`seed_other_store`): agent-director reads a label with another id
+#   as another agent-director store's and never acts on it;
+# - every leftover it seeds or relabels carries @ad_pane = `<the label's token>
+#   <the pane's id>` on its worker's pane, as a leftover agent-director made
+#   does: agent-director finds a leftover's pane only through that label;
+# - a session seeded by hand for agent-director to adopt after a lost create
+#   reply would carry @ad_pane = `<the row's launch token> <the pane's id>`;
+#   no scenario seeds one, so no helper makes one;
+# - a scenario whose launch loses its create reply (the tmux shim's
+#   `slow-create`) runs the stub in a mode that waits for the approver's Enter
+#   before it reports in (`dev-channels`): agent-director applies no hook to a
+#   row whose pane it has not adopted, and the approver's send-keys adopts it;
+# - no helper sets base-index: no agent-director verb depends on pane indices.
+#
 # Exit hooks: `on_exit <function>` registers extra cleanup (removing files
 # outside SCENARIO_ROOT, for example). The trap runs the hooks in registration
 # order, each in a subshell, after every server and tracked process is
@@ -507,6 +756,21 @@ SCENARIO_MCP_SERVER_NAME=slack-channel-router
 # The closing assertions every fmk script ends with.
 SCENARIO_CLOSING_ASSERTIONS=(assert_no_server_tmux assert_no_cscb_include_finished assert_no_cscb_delete)
 
+# agent-director's default stopping window, in seconds (DefaultStoppingWindowSeconds
+# in its internal/config/tmux.go), used when the scenario HOME's config.toml
+# sets none.
+SCENARIO_AD_DEFAULT_STOPPING_WINDOW_S=90
+
+# run_find_missing_loop's default interval in /ci, in seconds (the host's loop
+# runs every 300 s).
+SCENARIO_FIND_MISSING_INTERVAL_S=30
+
+# Bound on a seed_010_row worker that reports in at once doing so, in seconds.
+SCENARIO_SEED_REPORT_S=60
+
+# The agent-director version the 0.10.0 seeders run on.
+SCENARIO_AD_010_VERSION=0.10.0
+
 # fmk mode: 1 when TEST_NAME carries `-fmk-` (set on source).
 SCENARIO_FMK=0
 
@@ -520,6 +784,8 @@ _SCENARIO_START_COUNT=0
 _SCENARIO_INSTALL_COUNT=0 # install.sh runs
 _SCENARIO_AD_COUNT=0      # ad_capture calls
 _SCENARIO_CLOSED=()       # closing assertions that passed in the script's own shell
+_SCENARIO_SEED_COUNT=0    # sessions the harness named by default (viewers, restarts, re-binds)
+_SCENARIO_FM_LOOP_PID=""  # the find-missing loop's PID while it runs
 
 fail() {
     echo "FAIL: ${TEST_NAME}: $1" >&2
@@ -1869,6 +2135,1026 @@ write_mcp_config() {
   }
 }
 EOF
+}
+
+# ---------------------------------------------------------------------------
+# The harness's tmux, store reads and labels (fmk mode)
+# ---------------------------------------------------------------------------
+
+# _scenario_tmux_check <step>: refuse outside fmk mode, and unless the
+# scenario's shell talks to the scenario's own tmux server (TMUX_TMPDIR the
+# scenario's, TMUX unset).
+_scenario_tmux_check() {
+    [[ "${SCENARIO_FMK}" == 1 ]] || fail "$1: the scenario's tmux server is for fmk scripts only"
+    [[ "${TMUX_TMPDIR:-}" == "${SCENARIO_ROOT}/tmux" ]] \
+        || fail "$1: refused: TMUX_TMPDIR '${TMUX_TMPDIR:-}' is not the scenario's ${SCENARIO_ROOT}/tmux"
+    [[ -z "${TMUX:-}" ]] || fail "$1: refused: TMUX is set, naming another tmux server"
+}
+
+# _scenario_tmux <arg>...: the real tmux on the scenario's own server (found
+# by TMUX_TMPDIR), from the scenario's own shell. Its standard error goes to
+# a file that `_scenario_tmux_err` prints on one line.
+_scenario_tmux() {
+    "${SCENARIO_REAL_TMUX}" "$@" 2> "${SCENARIO_ROOT}/harness-tmux.err"
+}
+
+_scenario_tmux_err() {
+    tr '\n' ' ' < "${SCENARIO_ROOT}/harness-tmux.err" 2> /dev/null || true
+}
+
+# _scenario_session_target <session>: tmux's exact target for a session id
+# ($N, as it is) or a session name (=<name>, never a prefix of another's).
+_scenario_session_target() {
+    if [[ "$1" =~ ^\$[0-9]+$ ]]; then
+        printf '%s\n' "$1"
+    else
+        printf '=%s\n' "$1"
+    fi
+}
+
+# _scenario_session_id <step> <session>: print the session id ($N) of
+# <session> on the scenario's tmux server; fail when there is none.
+_scenario_session_id() {
+    local step="$1" session="${2:-}" out
+    [[ -n "${session}" ]] || fail "${step}: no session named"
+    out="$(_scenario_tmux display-message -p -t "$(_scenario_session_target "${session}"):" '#{session_id}')" \
+        || fail "${step}: no session '${session}' on the scenario's tmux server: $(_scenario_tmux_err)"
+    [[ "${out}" =~ ^\$[0-9]+$ ]] || fail "${step}: tmux gave session id '${out}' for '${session}'"
+    printf '%s\n' "${out}"
+}
+
+# _scenario_check_session_name <step> <name>: refuse a name tmux would not
+# keep as given (it turns `.` and `:` into `_`) or that holds a control
+# character.
+_scenario_check_session_name() {
+    [[ -n "$2" && "$2" != *[.:[:cntrl:]]* ]] \
+        || fail "$1: session name '$2' is empty or holds '.', ':' or a control character"
+}
+
+# _scenario_free_session_name <prefix>: print <prefix>_<n> for the first <n>
+# from 1 that no session on the scenario's tmux server holds.
+_scenario_free_session_name() {
+    local n=1
+    while _scenario_tmux has-session -t "=$1_${n}"; do
+        n=$(( n + 1 ))
+    done
+    printf '%s_%s\n' "$1" "${n}"
+}
+
+# _scenario_worker_pane <step> <session-id> [<token>]: print the worker pane
+# of the session: the one pane whose @ad_pane is `<token> <its own pane id>`
+# (any 16-hex token when <token> is empty). Without <token>, a session with
+# no such pane and exactly one pane gives that pane. Fails otherwise.
+_scenario_worker_pane() {
+    local step="$1" sid="$2" token="${3:-}" out line p v found=() all=()
+    out="$(_scenario_tmux list-panes -s -t "${sid}" -F '#{pane_id} #{@ad_pane}')" \
+        || fail "${step}: could not list the panes of ${sid}: $(_scenario_tmux_err)"
+    while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
+        p="${line%% *}"
+        v="${line#* }"
+        all+=("${p}")
+        if [[ -n "${token}" ]]; then
+            [[ "${v}" == "${token} ${p}" ]] && found+=("${p}")
+        elif [[ "${v}" =~ ^[0-9a-f]{16}\ (%[0-9]+)$ && "${BASH_REMATCH[1]}" == "${p}" ]]; then
+            found+=("${p}")
+        fi
+    done <<< "${out}"
+    if (( ${#found[@]} == 0 )) && [[ -z "${token}" ]] && (( ${#all[@]} == 1 )); then
+        found=("${all[0]}")
+    fi
+    (( ${#found[@]} == 1 )) \
+        || fail "${step}: ${sid} has ${#found[@]} worker pane(s) carrying @ad_pane '${token:-<token>} <its pane id>', not one"
+    printf '%s\n' "${found[0]}"
+}
+
+# _scenario_check_labels <step> <session-id> <pane-id> <name|-> <owner> <pane-label>:
+# fail unless tmux reads the session's name (unless `-`), its own @ad_owner
+# and the pane's own @ad_pane (each empty when unset) as given.
+_scenario_check_labels() {
+    local step="$1" sid="$2" pane="$3" name="$4" owner="$5" pane_label="$6" got
+    if [[ "${name}" != - ]]; then
+        got="$(_scenario_tmux display-message -p -t "${sid}:" '#{session_name}')" \
+            || fail "${step}: could not read the name of ${sid}: $(_scenario_tmux_err)"
+        [[ "${got}" == "${name}" ]] || fail "${step}: session ${sid} is named '${got}', not '${name}'"
+    fi
+    got="$(_scenario_tmux show-options -qv -t "${sid}" @ad_owner)" \
+        || fail "${step}: could not read @ad_owner of ${sid}: $(_scenario_tmux_err)"
+    [[ "${got}" == "${owner}" ]] || fail "${step}: session ${sid}'s @ad_owner reads '${got}', not '${owner}'"
+    got="$(_scenario_tmux show-options -p -qv -t "${pane}" @ad_pane)" \
+        || fail "${step}: could not read @ad_pane of ${pane}: $(_scenario_tmux_err)"
+    [[ "${got}" == "${pane_label}" ]] || fail "${step}: pane ${pane}'s @ad_pane reads '${got}', not '${pane_label}'"
+}
+
+# _scenario_set_labels <step> <session-id> <pane-id> <owner> <pane-label>:
+# set the session's @ad_owner and the pane's @ad_pane, then read them back.
+_scenario_set_labels() {
+    local step="$1" sid="$2" pane="$3" owner="$4" pane_label="$5"
+    _scenario_tmux set-option -t "${sid}" @ad_owner "${owner}" \
+        || fail "${step}: could not set @ad_owner on ${sid}: $(_scenario_tmux_err)"
+    _scenario_tmux set-option -p -t "${pane}" @ad_pane "${pane_label}" \
+        || fail "${step}: could not set @ad_pane on ${pane}: $(_scenario_tmux_err)"
+    _scenario_check_labels "${step}" "${sid}" "${pane}" - "${owner}" "${pane_label}"
+}
+
+_scenario_check_instance_id() {
+    [[ "$2" =~ ^[A-Za-z0-9._:@-]+$ ]] \
+        || fail "$1: instance id '$2' is empty or holds a character other than letters, digits and ._:@-"
+}
+
+# _scenario_store_read <step> <query> [json]: one read-only sqlite3 query of
+# the scenario store (both guards first); print its output (rows as a JSON
+# array with `json`, nothing for no row); fail with sqlite3's error.
+_scenario_store_read() {
+    require_ci_image "$1"
+    require_scenario_home "$1"
+    local step="$1" query="$2" db="${HOME}/.agent-director/state.db" out mode=()
+    if [[ "${3:-}" == json ]]; then
+        mode=(-json)
+    fi
+    [[ -f "${db}" ]] || fail "${step}: no store at ${db}"
+    out="$(sqlite3 -batch -bail -readonly ${mode[@]+"${mode[@]}"} -cmd ".timeout ${SCENARIO_STORE_BUSY_MS}" "${db}" "${query};" 2>&1)" \
+        || fail "${step}: sqlite3 failed on '${query}': ${out//$'\n'/ }"
+    if [[ -n "${out}" ]]; then
+        printf '%s\n' "${out}"
+    fi
+}
+
+# _scenario_row_json <step> <instance-id>: print the row as a one-element
+# JSON array; fail when no row has the id.
+_scenario_row_json() {
+    local out
+    out="$(_scenario_store_read "$1" "SELECT * FROM spawns WHERE claude_instance_id = '$2'" json)" || exit 1
+    [[ -n "${out}" ]] || fail "$1: no row has instance id $2"
+    printf '%s\n' "${out}"
+}
+
+# _scenario_row_diff_check <step> <before> <after> <want>: fail unless the row
+# after an edit (a one-element JSON array, as `_scenario_row_json` prints)
+# holds <want>'s values (a JSON object) in <want>'s columns and its value
+# before the edit in every other column.
+_scenario_row_diff_check() {
+    local step="$1" bad
+    bad="$(jq -rn --argjson b "$2" --argjson a "$3" --argjson w "$4" '
+        ($b[0]) as $b | ($a[0]) as $a
+        | [ ($a | keys_unsorted[]) as $k | select(($w | has($k)) | not) | select($a[$k] != $b[$k])
+            | "\($k) changed from \($b[$k] | tojson) to \($a[$k] | tojson)" ]
+          + [ ($w | keys_unsorted[]) as $k | select($a[$k] != $w[$k])
+            | "\($k) reads \($a[$k] | tojson), not \($w[$k] | tojson)" ]
+          + (if ($a | keys) != ($b | keys) then ["the row'\''s columns changed"] else [] end)
+        | join("; ")')" || fail "${step}: could not compare the row before and after the edit"
+    [[ -z "${bad}" ]] || fail "${step}: after the edit, ${bad}"
+}
+
+ad_new_token() {
+    local id="${1:-}" step="ad_new_token${1:+ $1}" current="" token t i
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    if (( $# > 0 )); then
+        shift
+    fi
+    if [[ -n "${id}" ]]; then
+        _scenario_check_instance_id "${step}" "${id}"
+        if [[ -f "${HOME}/.agent-director/state.db" ]]; then
+            current="$(_scenario_store_read "${step}" "SELECT COALESCE(launch_token, '') FROM spawns WHERE claude_instance_id = '${id}'")" \
+                || exit 1
+        fi
+    fi
+    for i in 1 2 3 4 5 6 7 8; do
+        token="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+        [[ "${token}" =~ ^[0-9a-f]{16}$ ]] || fail "${step}: could not read 8 random bytes (draw ${i})"
+        [[ "${token}" != "${current}" ]] || continue
+        for t in "$@"; do
+            [[ "${token}" != "${t}" ]] || continue 2
+        done
+        printf '%s\n' "${token}"
+        return 0
+    done
+    fail "${step}: no fresh token in 8 draws"
+}
+
+ad_other_store_id() {
+    local step=ad_other_store_id own id i
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    own="$(ad_store_id)" || exit 1
+    for i in 1 2 3 4 5 6 7 8; do
+        id="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+        [[ "${id}" =~ ^[0-9a-f]{16}$ ]] || fail "${step}: could not read 8 random bytes (draw ${i})"
+        if [[ "${id}" != "${own}" ]]; then
+            printf '%s\n' "${id}"
+            return 0
+        fi
+    done
+    fail "${step}: no other store id in 8 draws"
+}
+
+ad_owner_label() {
+    local token="${1:-}" sid="${2:-}" id="${3:-}" store="${4:-}" step="ad_owner_label"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ "${token}" =~ ^[0-9a-f]{16}$ ]] || fail "${step}: token '${token}' is not 16 lowercase hex characters"
+    [[ "${sid}" =~ ^\$[0-9]+$ ]] || fail "${step}: '${sid}' is not a tmux session id (\$N)"
+    [[ -n "${id}" && "${id}" != *[[:cntrl:]]* ]] \
+        || fail "${step}: instance id '${id}' is empty or holds a control character"
+    if [[ -z "${store}" ]]; then
+        store="$(ad_store_id)" || exit 1
+    fi
+    [[ "${store}" =~ ^[0-9a-f]{16}$ ]] || fail "${step}: store id '${store}' is not 16 lowercase hex characters"
+    printf 'ad1 %s %s %s %s\n' "${token}" "${sid}" "${id}" "${store}"
+}
+
+ad_pane_label() {
+    local token="${1:-}" pane="${2:-}" step="ad_pane_label"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ "${token}" =~ ^[0-9a-f]{16}$ ]] || fail "${step}: token '${token}' is not 16 lowercase hex characters"
+    [[ "${pane}" =~ ^%[0-9]+$ ]] || fail "${step}: '${pane}' is not a tmux pane id (%N)"
+    printf '%s %s\n' "${token}" "${pane}"
+}
+
+# ---------------------------------------------------------------------------
+# Seeding (fmk mode; b.jg5 SRJ-1306's seeding steps and rules)
+# ---------------------------------------------------------------------------
+
+# _scenario_seed <step> <kind> [-c <dir>] <name> [<instance-id>] <worker> [<arg>...]:
+# the seeding helpers' one body. <kind> is leftover, unlabelled, env-only,
+# borrowed or other-store; every kind but unlabelled takes <instance-id>.
+_scenario_seed() {
+    local step="$1" kind="$2" cwd name id="" out sid pane token="" store="" owner="" pane_label="" got
+    shift 2
+    _scenario_tmux_check "${step}"
+    cwd="${SCENARIO_ROOT}"
+    if [[ "${1:-}" == -c ]]; then
+        (( $# >= 2 )) || fail "${step}: -c takes a directory"
+        cwd="$2"
+        shift 2
+    fi
+    name="${1:-}"
+    (( $# > 0 )) || fail "${step}: no session name given"
+    shift
+    if [[ "${kind}" != unlabelled ]]; then
+        id="${1:-}"
+        (( $# > 0 )) || fail "${step}: no instance id given"
+        shift
+        _scenario_check_instance_id "${step}" "${id}"
+    fi
+    (( $# > 0 )) || fail "${step}: no worker command given"
+    _scenario_check_session_name "${step}" "${name}"
+    [[ -d "${cwd}" ]] || fail "${step}: working directory '${cwd}' is not a directory"
+    if _scenario_tmux has-session -t "=${name}"; then
+        fail "${step}: a session named ${name} already exists"
+    fi
+    local args=(new-session -d -P -F '#{session_id} #{pane_id}' -s "${name}" -c "${cwd}")
+    if [[ "${kind}" == env-only ]]; then
+        args+=(-e "AGENT_DIRECTOR_INSTANCE_ID=${id}")
+    fi
+    out="$(_scenario_tmux "${args[@]}" -- "$@")" \
+        || fail "${step}: tmux new-session failed: $(_scenario_tmux_err)"
+    read -r sid pane <<< "${out}"
+    [[ "${sid}" =~ ^\$[0-9]+$ && "${pane}" =~ ^%[0-9]+$ ]] \
+        || fail "${step}: tmux new-session printed '${out}', not a session id and a pane id"
+    case "${kind}" in
+        leftover | borrowed | other-store)
+            token="$(ad_new_token "${id}")" || exit 1
+            if [[ "${kind}" == other-store ]]; then
+                store="$(ad_other_store_id)" || exit 1
+            else
+                store="$(ad_store_id)" || exit 1
+            fi
+            owner="$(ad_owner_label "${token}" "${sid}" "${id}" "${store}")" || exit 1
+            pane_label="$(ad_pane_label "${token}" "${pane}")" || exit 1
+            _scenario_set_labels "${step}" "${sid}" "${pane}" "${owner}" "${pane_label}"
+            ;;
+    esac
+    _scenario_check_labels "${step}" "${sid}" "${pane}" "${name}" "${owner}" "${pane_label}"
+    if [[ "${kind}" == env-only ]]; then
+        got="$(_scenario_tmux show-environment -t "${sid}" AGENT_DIRECTOR_INSTANCE_ID)" \
+            || fail "${step}: session ${sid} has no AGENT_DIRECTOR_INSTANCE_ID in its environment: $(_scenario_tmux_err)"
+        [[ "${got}" == "AGENT_DIRECTOR_INSTANCE_ID=${id}" ]] \
+            || fail "${step}: session ${sid}'s environment holds '${got}', not AGENT_DIRECTOR_INSTANCE_ID=${id}"
+    fi
+    SEEDED_SESSION_ID="${sid}"
+    SEEDED_PANE_ID="${pane}"
+    SEEDED_TOKEN="${token}"
+    SEEDED_STORE_ID="${store}"
+    printf '%s\n' "${sid} ${pane}${token:+ ${token}}${store:+ ${store}}"
+}
+
+seed_leftover() {
+    require_ci_image "seed_leftover $*"
+    require_scenario_home "seed_leftover $*"
+    _scenario_seed "seed_leftover $*" leftover "$@"
+}
+
+seed_unlabelled() {
+    require_ci_image "seed_unlabelled $*"
+    require_scenario_home "seed_unlabelled $*"
+    _scenario_seed "seed_unlabelled $*" unlabelled "$@"
+}
+
+seed_env_only() {
+    require_ci_image "seed_env_only $*"
+    require_scenario_home "seed_env_only $*"
+    _scenario_seed "seed_env_only $*" env-only "$@"
+}
+
+seed_borrowed_name() {
+    require_ci_image "seed_borrowed_name $*"
+    require_scenario_home "seed_borrowed_name $*"
+    _scenario_seed "seed_borrowed_name $*" borrowed "$@"
+}
+
+seed_other_store() {
+    require_ci_image "seed_other_store $*"
+    require_scenario_home "seed_other_store $*"
+    _scenario_seed "seed_other_store $*" other-store "$@"
+}
+
+# ---------------------------------------------------------------------------
+# The human's tmux steps (fmk mode; b.jg5 SRJ-1306, SRJ-1401)
+# ---------------------------------------------------------------------------
+
+relabel_session() {
+    local session="${1:-}" given="${2:-}" step sid cur store old id current pane token owner pane_label
+    step="relabel_session ${session}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    sid="$(_scenario_session_id "${step}" "${session}")" || exit 1
+    cur="$(_scenario_tmux show-options -qv -t "${sid}" @ad_owner)" \
+        || fail "${step}: could not read @ad_owner of ${sid}: $(_scenario_tmux_err)"
+    store="$(ad_store_id)" || exit 1
+    [[ "${cur}" =~ ^ad1\ ([0-9a-f]{16})\ (\$[0-9]+)\ (.+)\ ([0-9a-f]{16})$ \
+        && "${BASH_REMATCH[2]}" == "${sid}" && "${BASH_REMATCH[4]}" == "${store}" ]] \
+        || fail "${step}: session ${sid} carries no valid label of this store (its @ad_owner reads '${cur}')"
+    old="${BASH_REMATCH[1]}"
+    id="${BASH_REMATCH[3]}"
+    _scenario_check_instance_id "${step}" "${id}"
+    pane="$(_scenario_worker_pane "${step}" "${sid}" "${old}")" || exit 1
+    if [[ -n "${given}" ]]; then
+        [[ "${given}" =~ ^[0-9a-f]{16}$ ]] || fail "${step}: token '${given}' is not 16 lowercase hex characters"
+        current="$(_scenario_store_read "${step}" "SELECT COALESCE(launch_token, '') FROM spawns WHERE claude_instance_id = '${id}'")" \
+            || exit 1
+        [[ "${given}" != "${old}" && "${given}" != "${current}" ]] \
+            || fail "${step}: token ${given} is the label's or the row's current launch token, not an earlier launch's"
+        token="${given}"
+    else
+        token="$(ad_new_token "${id}" "${old}")" || exit 1
+    fi
+    owner="$(ad_owner_label "${token}" "${sid}" "${id}" "${store}")" || exit 1
+    pane_label="$(ad_pane_label "${token}" "${pane}")" || exit 1
+    _scenario_set_labels "${step}" "${sid}" "${pane}" "${owner}" "${pane_label}"
+    SEEDED_SESSION_ID="${sid}"
+    SEEDED_PANE_ID="${pane}"
+    SEEDED_TOKEN="${token}"
+    SEEDED_STORE_ID="${store}"
+    printf '%s %s %s\n' "${sid}" "${pane}" "${token}"
+}
+
+attach_viewer() {
+    local session="${1:-}" viewer="${2:-}" step sid vid group vgroup got
+    step="attach_viewer ${session}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    sid="$(_scenario_session_id "${step}" "${session}")" || exit 1
+    if [[ -z "${viewer}" ]]; then
+        viewer="$(_scenario_free_session_name "${SCENARIO_TAG}_viewer")"
+    fi
+    _scenario_check_session_name "${step}" "${viewer}"
+    if _scenario_tmux has-session -t "=${viewer}"; then
+        fail "${step}: a session named ${viewer} already exists"
+    fi
+    vid="$(_scenario_tmux new-session -d -P -F '#{session_id}' -t "${sid}" -s "${viewer}")" \
+        || fail "${step}: tmux new-session -t ${sid} failed: $(_scenario_tmux_err)"
+    [[ "${vid}" =~ ^\$[0-9]+$ ]] || fail "${step}: tmux new-session printed '${vid}', not a session id"
+    group="$(_scenario_tmux display-message -p -t "${sid}:" '#{session_group}')" \
+        || fail "${step}: could not read the group of ${sid}: $(_scenario_tmux_err)"
+    vgroup="$(_scenario_tmux display-message -p -t "${vid}:" '#{session_group}')" \
+        || fail "${step}: could not read the group of ${vid}: $(_scenario_tmux_err)"
+    [[ -n "${group}" && "${group}" == "${vgroup}" ]] \
+        || fail "${step}: viewer ${vid} is in group '${vgroup}', not ${sid}'s group '${group}'"
+    got="$(_scenario_tmux display-message -p -t "${vid}:" '#{session_name}')" || got=""
+    [[ "${got}" == "${viewer}" ]] || fail "${step}: viewer ${vid} is named '${got}', not '${viewer}'"
+    SEEDED_SESSION_ID="${vid}"
+    printf '%s\n' "${vid}"
+}
+
+rename_session() {
+    local session="${1:-}" new="${2:-}" step sid got
+    step="rename_session ${session} ${new}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    sid="$(_scenario_session_id "${step}" "${session}")" || exit 1
+    _scenario_check_session_name "${step}" "${new}"
+    if _scenario_tmux has-session -t "=${new}"; then
+        fail "${step}: a session named ${new} already exists"
+    fi
+    _scenario_tmux rename-session -t "${sid}" "${new}" \
+        || fail "${step}: tmux rename-session failed: $(_scenario_tmux_err)"
+    got="$(_scenario_tmux display-message -p -t "${sid}:" '#{session_name}')" \
+        || fail "${step}: could not read the name of ${sid}: $(_scenario_tmux_err)"
+    [[ "${got}" == "${new}" ]] || fail "${step}: session ${sid} is named '${got}', not '${new}'"
+    printf '%s\n' "${sid}"
+}
+
+set_remain_on_exit() {
+    local session="${1:-}" step sid out w got n=0
+    step="set_remain_on_exit ${session}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    sid="$(_scenario_session_id "${step}" "${session}")" || exit 1
+    out="$(_scenario_tmux list-windows -t "${sid}" -F '#{window_id}')" \
+        || fail "${step}: could not list the windows of ${sid}: $(_scenario_tmux_err)"
+    while IFS= read -r w; do
+        [[ "${w}" =~ ^@[0-9]+$ ]] || continue
+        _scenario_tmux set-option -w -t "${w}" remain-on-exit on \
+            || fail "${step}: could not set remain-on-exit on window ${w}: $(_scenario_tmux_err)"
+        got="$(_scenario_tmux show-options -w -qv -t "${w}" remain-on-exit)" || got=""
+        [[ "${got}" == on ]] || fail "${step}: window ${w}'s remain-on-exit reads '${got}', not on"
+        n=$(( n + 1 ))
+    done <<< "${out}"
+    (( n > 0 )) || fail "${step}: session ${sid} has no window"
+}
+
+ad_owner_global_set() {
+    local value="${1:-}" step="ad_owner_global_set" token got
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    if [[ -z "${value}" ]]; then
+        token="$(ad_new_token)" || exit 1
+        # shellcheck disable=SC2016 # $0 is a literal tmux session id
+        value="$(ad_owner_label "${token}" '$0' "${SCENARIO_TAG}_global")" || exit 1
+    fi
+    _scenario_tmux set-option -g @ad_owner "${value}" \
+        || fail "${step}: tmux set-option -g @ad_owner failed: $(_scenario_tmux_err)"
+    got="$(_scenario_tmux show-options -gqv @ad_owner)" \
+        || fail "${step}: could not read the global @ad_owner: $(_scenario_tmux_err)"
+    [[ "${got}" == "${value}" ]] || fail "${step}: the global @ad_owner reads '${got}', not '${value}'"
+    printf '%s\n' "${value}"
+}
+
+ad_owner_global_unset() {
+    local step="ad_owner_global_unset" scope got
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    _scenario_tmux set-option -gu @ad_owner \
+        || fail "${step}: tmux set-option -gu @ad_owner failed: $(_scenario_tmux_err)"
+    # The three scopes agent-director's lookup reads: global, server, global-window.
+    for scope in -gqv -sqv -gwqv; do
+        got="$(_scenario_tmux show-options "${scope}" @ad_owner)" \
+            || fail "${step}: tmux show-options ${scope} @ad_owner failed: $(_scenario_tmux_err)"
+        [[ -z "${got}" ]] || fail "${step}: tmux show-options ${scope} @ad_owner still reads '${got}'"
+    done
+}
+
+respawn_worker_pane() {
+    local target="${1:-}" step sid pane old_pid new_pid dead
+    step="respawn_worker_pane ${target}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    (( $# >= 2 )) || fail "${step}: takes <pane-id|session> <command> [<arg>...]"
+    shift
+    if [[ "${target}" =~ ^%[0-9]+$ ]]; then
+        pane="${target}"
+    else
+        sid="$(_scenario_session_id "${step}" "${target}")" || exit 1
+        pane="$(_scenario_worker_pane "${step}" "${sid}")" || exit 1
+    fi
+    old_pid="$(_scenario_tmux display-message -p -t "${pane}" '#{pane_pid}')" \
+        || fail "${step}: no pane ${pane} on the scenario's tmux server: $(_scenario_tmux_err)"
+    _scenario_tmux respawn-pane -k -t "${pane}" -- "$@" \
+        || fail "${step}: tmux respawn-pane failed: $(_scenario_tmux_err)"
+    read -r new_pid dead <<< "$(_scenario_tmux display-message -p -t "${pane}" '#{pane_pid} #{pane_dead}')"
+    [[ "${new_pid}" =~ ^[0-9]+$ && "${new_pid}" != "${old_pid}" && "${dead}" == 0 ]] \
+        || fail "${step}: after the respawn pane ${pane} reads pid '${new_pid}' (was ${old_pid}), dead '${dead}': no new process runs in it"
+    _scenario_poll_until 10 _scenario_pid_gone "${old_pid}" \
+        || fail "${step}: the pane's old process ${old_pid} still runs 10 s after the respawn"
+    printf '%s %s\n' "${pane}" "${new_pid}"
+}
+
+restart_tmux_server() {
+    local name="${1:-${SCENARIO_TAG}_restart}" step out old_pid new_pid sid
+    step="restart_tmux_server"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    _scenario_check_session_name "${step}" "${name}"
+    out="$(_scenario_tmux list-sessions -F '#{pid}')" \
+        || fail "${step}: no tmux server runs for the scenario: $(_scenario_tmux_err)"
+    old_pid="${out%%$'\n'*}"
+    [[ "${old_pid}" =~ ^[0-9]+$ ]] || fail "${step}: tmux gave server pid '${old_pid}'"
+    _scenario_tmux kill-server || fail "${step}: tmux kill-server failed: $(_scenario_tmux_err)"
+    _scenario_poll_until "${SCENARIO_TMUX_STOP_S}" _scenario_pid_gone "${old_pid}" \
+        || fail "${step}: the old tmux server ${old_pid} still runs ${SCENARIO_TMUX_STOP_S} s after kill-server"
+    out="$(_scenario_tmux new-session -d -P -F '#{pid} #{session_id}' -s "${name}")" \
+        || fail "${step}: tmux new-session on the new server failed: $(_scenario_tmux_err)"
+    read -r new_pid sid <<< "${out}"
+    [[ "${new_pid}" =~ ^[0-9]+$ && "${new_pid}" != "${old_pid}" && "${sid}" =~ ^\$[0-9]+$ ]] \
+        || fail "${step}: tmux new-session printed '${out}', not a new server's pid and a session id"
+    pid_alive "${new_pid}" || fail "${step}: the new tmux server ${new_pid} is not running"
+    printf '%s %s\n' "${new_pid}" "${sid}"
+}
+
+rebind_tmux_socket() {
+    local name="${1:-}" step out line old_pid sock moved n=1 new_pid sid got
+    step="rebind_tmux_socket"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    out="$(_scenario_tmux list-sessions -F '#{pid} #{socket_path}')" \
+        || fail "${step}: no tmux server runs for the scenario: $(_scenario_tmux_err)"
+    line="${out%%$'\n'*}"
+    old_pid="${line%% *}"
+    sock="${line#* }"
+    [[ "${old_pid}" =~ ^[0-9]+$ ]] || fail "${step}: tmux gave server pid '${old_pid}'"
+    [[ "${sock}" == "${SCENARIO_ROOT}/tmux/"* && -S "${sock}" ]] \
+        || fail "${step}: refused: the server's socket '${sock}' is not a socket under ${SCENARIO_ROOT}/tmux"
+    while [[ -e "${sock}.rebound-${n}" || -L "${sock}.rebound-${n}" ]]; do
+        n=$(( n + 1 ))
+    done
+    moved="${sock}.rebound-${n}"
+    if [[ -z "${name}" ]]; then
+        name="${SCENARIO_TAG}_rebound_${n}"
+    fi
+    _scenario_check_session_name "${step}" "${name}"
+    # The old server keeps its listening socket, now at the moved path.
+    mv -- "${sock}" "${moved}" || fail "${step}: could not move ${sock} to ${moved}"
+    out="$(_scenario_tmux new-session -d -P -F '#{pid} #{session_id}' -s "${name}")" \
+        || fail "${step}: tmux new-session at ${sock} failed: $(_scenario_tmux_err)"
+    read -r new_pid sid <<< "${out}"
+    [[ "${new_pid}" =~ ^[0-9]+$ && "${new_pid}" != "${old_pid}" && "${sid}" =~ ^\$[0-9]+$ ]] \
+        || fail "${step}: tmux new-session printed '${out}', not a new server's pid and a session id"
+    [[ -S "${sock}" ]] || fail "${step}: no socket at ${sock} after the new server started"
+    pid_alive "${old_pid}" || fail "${step}: the old tmux server ${old_pid} is gone"
+    got="$("${SCENARIO_REAL_TMUX}" -S "${moved}" list-sessions -F '#{pid}' 2> /dev/null)" || got=""
+    [[ "${got%%$'\n'*}" == "${old_pid}" ]] \
+        || fail "${step}: the moved socket ${moved} answers with server pid '${got%%$'\n'*}', not the old server's ${old_pid}"
+    REBOUND_SOCKET="${moved}"
+    printf '%s %s %s\n' "${new_pid}" "${sid}" "${moved}"
+}
+
+end_session() {
+    local sid="${1:-}" step
+    step="end_session ${sid}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    [[ "${sid}" =~ ^\$[0-9]+$ ]] || fail "${step}: '${sid}' is not a session id (\$N)"
+    _scenario_tmux has-session -t "${sid}" \
+        || fail "${step}: no session ${sid} on the scenario's tmux server: $(_scenario_tmux_err)"
+    _scenario_tmux kill-session -t "${sid}" \
+        || fail "${step}: tmux kill-session failed: $(_scenario_tmux_err)"
+    if _scenario_tmux has-session -t "${sid}"; then
+        fail "${step}: session ${sid} still exists after kill-session"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Store statements and the human's agent-director actions (fmk mode)
+# ---------------------------------------------------------------------------
+
+# _scenario_ad_tmux_setting <step> <key> <default>: print the scenario HOME's
+# agent-director `[tmux] <key>` from $HOME/.agent-director/config.toml, or
+# <default> when the file or the key is absent; fail when it is not a whole
+# number.
+_scenario_ad_tmux_setting() {
+    local step="$1" key="$2" def="$3" file="${HOME}/.agent-director/config.toml" v=""
+    if [[ -f "${file}" ]]; then
+        v="$(awk -v key="${key}" '
+            /^[[:space:]]*\[/ {
+                t = $0
+                sub(/#.*/, "", t)
+                gsub(/[[:space:]]/, "", t)
+                intmux = (t == "[tmux]")
+                next
+            }
+            intmux {
+                line = $0
+                sub(/^[[:space:]]+/, "", line)
+                if (index(line, key) != 1) next
+                rest = substr(line, length(key) + 1)
+                if (rest !~ /^[[:space:]]*=/) next
+                sub(/^[[:space:]]*=[[:space:]]*/, "", rest)
+                sub(/[[:space:]]*(#.*)?$/, "", rest)
+                print rest
+                exit
+            }
+        ' "${file}")" || fail "${step}: could not read ${file}"
+    fi
+    if [[ -z "${v}" ]]; then
+        printf '%s\n' "${def}"
+        return 0
+    fi
+    [[ "${v}" =~ ^[0-9]+$ ]] || fail "${step}: ${file} sets [tmux] ${key} = ${v}, not a whole number"
+    printf '%s\n' "$(( 10#${v} ))"
+}
+
+ad_store_mark_finished() {
+    local id="${1:-}" state="${2:-}" step window before after sock pane created now ended ended_at rv out
+    step="ad_store_mark_finished ${id} ${state}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    _scenario_check_instance_id "${step}" "${id}"
+    [[ "${state}" == missing || "${state}" == ended ]] || fail "${step}: state '${state}' is neither missing nor ended"
+    window="$(_scenario_ad_tmux_setting "${step}" stopping_window_seconds "${SCENARIO_AD_DEFAULT_STOPPING_WINDOW_S}")" \
+        || exit 1
+    before="$(_scenario_row_json "${step}" "${id}")" || exit 1
+    sock="$(jq -r '.[0].tmux_socket // empty' <<< "${before}")"
+    pane="$(jq -r '.[0].pane_id // empty' <<< "${before}")"
+    rv="$(jq -r '.[0].row_version' <<< "${before}")"
+    [[ "${rv}" =~ ^[0-9]+$ ]] || fail "${step}: the row's row_version reads '${rv}'"
+    [[ "${pane}" =~ ^%[0-9]+$ ]] || fail "${step}: the row records no pane ('${pane}'), so its worker's session cannot be found"
+    [[ "${sock}" == "${SCENARIO_ROOT}"/* ]] \
+        || fail "${step}: refused: the row's tmux socket '${sock}' is not under SCENARIO_ROOT"
+    created="$("${SCENARIO_REAL_TMUX}" -S "${sock}" display-message -p -t "${pane}" '#{session_created}' 2> "${SCENARIO_ROOT}/harness-tmux.err")" \
+        || fail "${step}: could not read the creation of pane ${pane}'s session on ${sock}: $(_scenario_tmux_err)"
+    [[ "${created}" =~ ^[0-9]+$ ]] || fail "${step}: tmux gave session creation '${created}'"
+    now="$(date +%s)"
+    ended=$(( now - window ))
+    (( ended > created )) \
+        || fail "${step}: refused: the worker's session was created $(( now - created )) s ago, not more than the stopping window (${window} s): ended_at must lie at least the window ago and later, in whole seconds, than the session's creation"
+    ended_at="$(date -u -d "@${ended}" '+%Y-%m-%d %H:%M:%S')" || fail "${step}: date could not format ${ended}"
+    out="$(ad_store_edit "UPDATE spawns SET state = '${state}', ended_at = '${ended_at}', launch_started_at = NULL, row_version = row_version + 1 WHERE claude_instance_id = '${id}' AND row_version = ${rv} RETURNING claude_instance_id")" \
+        || exit 1
+    [[ "${out}" == "${id}" ]] || fail "${step}: the row's row_version is no longer ${rv}: agent-director wrote it in between, and the edit wrote nothing"
+    after="$(_scenario_row_json "${step}" "${id}")" || exit 1
+    _scenario_row_diff_check "${step}" "${before}" "${after}" \
+        "{\"state\": \"${state}\", \"ended_at\": \"${ended_at}\", \"launch_started_at\": null, \"row_version\": $(( rv + 1 ))}"
+    printf '%s\n' "${ended_at}"
+}
+
+ad_store_seed_pending() {
+    local id="${1:-}" leftover="${2:-}" step before after rv token started out
+    step="ad_store_seed_pending ${id}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_check_instance_id "${step}" "${id}"
+    if [[ -n "${leftover}" ]]; then
+        [[ "${leftover}" =~ ^[0-9a-f]{16}$ ]] || fail "${step}: leftover token '${leftover}' is not 16 lowercase hex characters"
+    fi
+    before="$(_scenario_row_json "${step}" "${id}")" || exit 1
+    rv="$(jq -r '.[0].row_version' <<< "${before}")"
+    [[ "${rv}" =~ ^[0-9]+$ ]] || fail "${step}: the row's row_version reads '${rv}'"
+    token="$(ad_new_token "${id}" ${leftover:+"${leftover}"})" || exit 1
+    started="$(date +%s%3N)"
+    [[ "${started}" =~ ^[0-9]+$ ]] || fail "${step}: date gave '${started}' milliseconds"
+    out="$(ad_store_edit "UPDATE spawns SET state = 'pending', launch_started_at = ${started}, launch_token = '${token}', ended_at = NULL, pid = NULL, proc_starttime = NULL, tmux_server_pid = NULL, tmux_server_started = NULL, tmux_server_starttime = NULL, pane_id = NULL, pane_pid = NULL, pane_starttime = NULL, row_version = row_version + 1 WHERE claude_instance_id = '${id}' AND row_version = ${rv} RETURNING claude_instance_id")" \
+        || exit 1
+    [[ "${out}" == "${id}" ]] || fail "${step}: the row's row_version is no longer ${rv}: agent-director wrote it in between, and the edit wrote nothing"
+    after="$(_scenario_row_json "${step}" "${id}")" || exit 1
+    _scenario_row_diff_check "${step}" "${before}" "${after}" \
+        "{\"state\": \"pending\", \"launch_started_at\": ${started}, \"launch_token\": \"${token}\", \"ended_at\": null, \"pid\": null, \"proc_starttime\": null, \"tmux_server_pid\": null, \"tmux_server_started\": null, \"tmux_server_starttime\": null, \"pane_id\": null, \"pane_pid\": null, \"pane_starttime\": null, \"row_version\": $(( rv + 1 ))}"
+    ad_capture status --claude-instance-id "${id}"
+    [[ "${AD_RC}" == 0 ]] \
+        || fail "${step}: the harness status read exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
+    jq -e 'type == "object" and .state == "pending" and has("launch_started_at")' "${AD_OUT}" > /dev/null 2>&1 \
+        || fail "${step}: after the edit the row does not read pending with a launch start: $(tr '\n' ' ' < "${AD_OUT}")"
+    printf '%s\n' "${token}"
+}
+
+ad_store_unusable_name() {
+    local id="${1:-}" name="${2:-}" step before after state rv out
+    step="ad_store_unusable_name ${id} ${name}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_check_instance_id "${step}" "${id}"
+    [[ "${name}" == *.* && "${name}" =~ ^[A-Za-z0-9._-]+$ ]] \
+        || fail "${step}: name '${name}' holds no '.', or a character other than letters, digits and ._-"
+    before="$(_scenario_row_json "${step}" "${id}")" || exit 1
+    state="$(jq -r '.[0].state' <<< "${before}")"
+    rv="$(jq -r '.[0].row_version' <<< "${before}")"
+    [[ "${state}" == ended || "${state}" == missing ]] \
+        || fail "${step}: refused: the row reads ${state}, not a finished state (ended or missing)"
+    [[ "${rv}" =~ ^[0-9]+$ ]] || fail "${step}: the row's row_version reads '${rv}'"
+    out="$(ad_store_edit "UPDATE spawns SET tmux_session_name = '${name}' WHERE claude_instance_id = '${id}' AND state IN ('ended', 'missing') AND row_version = ${rv} RETURNING claude_instance_id")" \
+        || exit 1
+    [[ "${out}" == "${id}" ]] || fail "${step}: the row changed under the edit (no longer finished at row_version ${rv}), and the edit wrote nothing"
+    after="$(_scenario_row_json "${step}" "${id}")" || exit 1
+    _scenario_row_diff_check "${step}" "${before}" "${after}" "{\"tmux_session_name\": \"${name}\"}"
+}
+
+# _scenario_include_finished_lines: print how many `call` lines of the
+# agent-director shim's log carry --include-finished.
+_scenario_include_finished_lines() {
+    local n
+    n="$(grep -c -- $'^call\t.*--include-finished' "${SCENARIO_AD_SHIM_LOG}" 2> /dev/null)" || true
+    printf '%s\n' "${n:-0}"
+}
+
+ad_kill_include_finished() {
+    local id="${1:-}" step before
+    step="ad_kill_include_finished ${id}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_check_instance_id "${step}" "${id}"
+    before="$(_scenario_include_finished_lines)"
+    # ad_capture runs the binary as a direct child of this shell: the
+    # scenario's own shell, or the subshell of it this is called in.
+    ad_capture kill --include-finished --claude-instance-id "${id}"
+    AD_KILL_OUT="${AD_OUT}"
+    AD_KILL_ERR="${AD_ERR}"
+    AD_KILL_RC="${AD_RC}"
+    if (( AD_KILL_RC != 0 )); then
+        sed 's/^/  | /' "${AD_KILL_OUT}" "${AD_KILL_ERR}" >&2
+        fail "${step}: kill --include-finished exited ${AD_KILL_RC}"
+    fi
+    jq -e 'type == "object" and has("kill_sent")' "${AD_KILL_OUT}" > /dev/null 2>&1 \
+        || fail "${step}: kill --include-finished printed no result holding kill_sent: $(tr '\n' ' ' < "${AD_KILL_OUT}")"
+    (( $(_scenario_include_finished_lines) > before )) \
+        || fail "${step}: the agent-director shim's log holds no new call line carrying --include-finished"
+    cat -- "${AD_KILL_OUT}"
+}
+
+ad_delete_unusable_row() {
+    local id="${1:-}" step name n
+    step="ad_delete_unusable_row ${id}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_check_instance_id "${step}" "${id}"
+    name="$(_scenario_store_read "${step}" "SELECT tmux_session_name FROM spawns WHERE claude_instance_id = '${id}'")" \
+        || exit 1
+    [[ -n "${name}" ]] || fail "${step}: no row has instance id ${id}"
+    # The one delete the harness makes: scenario 25's removal of the row
+    # whose recorded name ad_store_unusable_name made unusable.
+    [[ "${name}" == *.* ]] \
+        || fail "${step}: refused: the row's recorded session name '${name}' holds no '.'; this step removes only the row scenario 25 made unusable"
+    ad_capture delete --claude-instance-id "${id}"
+    if (( AD_RC != 0 )); then
+        sed 's/^/  | /' "${AD_OUT}" "${AD_ERR}" >&2
+        fail "${step}: delete exited ${AD_RC}"
+    fi
+    n="$(_scenario_store_read "${step}" "SELECT count(*) FROM spawns WHERE claude_instance_id = '${id}'")" || exit 1
+    [[ "${n}" == 0 ]] || fail "${step}: the row is still in the store after delete: $(tr '\n' ' ' < "${AD_OUT}")"
+}
+
+# ---------------------------------------------------------------------------
+# The find-missing loop (fmk mode; b.jg5 SRJ-1401)
+# ---------------------------------------------------------------------------
+
+# _scenario_find_missing_loop <dir> <interval-s>: the loop's body, run in a
+# background subshell of the scenario's shell: `find-missing` through the
+# harness call, its log line and output, then the interval, until SIGTERM.
+_scenario_find_missing_loop() {
+    local dir="$1" interval="$2" n rc start end sleeper=""
+    trap '[[ -z "${sleeper}" ]] || kill "${sleeper}" 2> /dev/null; exit 0' TERM
+    n="$(grep -c '^run ' "${dir}/loop.log" 2> /dev/null)" || true
+    n="${n:-0}"
+    while :; do
+        n=$(( n + 1 ))
+        rc=0
+        start="${EPOCHREALTIME/,/.}"
+        ad find-missing > "${dir}/run.${n}.out" 2> "${dir}/run.${n}.err" || rc=$?
+        end="${EPOCHREALTIME/,/.}"
+        {
+            printf 'run %d\tstart %s\tend %s\texit %d\n' "${n}" "${start}" "${end}" "${rc}"
+            sed 's/^/  out| /' "${dir}/run.${n}.out"
+            sed 's/^/  err| /' "${dir}/run.${n}.err"
+        } >> "${dir}/loop.log"
+        sleep "${interval}" &
+        sleeper=$!
+        wait "${sleeper}" || true
+        sleeper=""
+    done
+}
+
+run_find_missing_loop() {
+    local interval="${1:-${SCENARIO_FIND_MISSING_INTERVAL_S}}" step dir
+    step="run_find_missing_loop ${interval}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    [[ "${interval}" =~ ^[1-9][0-9]*$ ]] || fail "${step}: interval '${interval}' is not a whole number of seconds above 0"
+    if [[ -n "${_SCENARIO_FM_LOOP_PID}" ]] && pid_alive "${_SCENARIO_FM_LOOP_PID}"; then
+        fail "${step}: the find-missing loop already runs (PID ${_SCENARIO_FM_LOOP_PID})"
+    fi
+    dir="${SCENARIO_ROOT}/find-missing-loop"
+    mkdir -p "${dir}" || fail "${step}: could not create ${dir}"
+    FIND_MISSING_LOOP_LOG="${dir}/loop.log"
+    : >> "${FIND_MISSING_LOOP_LOG}" || fail "${step}: could not create ${FIND_MISSING_LOOP_LOG}"
+    FIND_MISSING_LOOP_INTERVAL_S="${interval}"
+    ( _scenario_find_missing_loop "${dir}" "${interval}" ) < /dev/null &
+    _SCENARIO_FM_LOOP_PID=$!
+    FIND_MISSING_LOOP_PID="${_SCENARIO_FM_LOOP_PID}"
+    track_pid "${_SCENARIO_FM_LOOP_PID}"
+}
+
+stop_find_missing_loop() {
+    local timeout_s="${1:-30}" step="stop_find_missing_loop" pid
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    pid="${_SCENARIO_FM_LOOP_PID}"
+    [[ -n "${pid}" ]] || fail "${step}: no find-missing loop was started"
+    stop_tracked_pid "${pid}" "${timeout_s}" "${step}: the loop (PID ${pid}) did not end on SIGTERM"
+    wait "${pid}" 2> /dev/null || true
+    _SCENARIO_FM_LOOP_PID=""
+}
+
+find_missing_loop_runs() {
+    local n
+    require_ci_image "find_missing_loop_runs"
+    require_scenario_home "find_missing_loop_runs"
+    n="$(grep -c '^run ' "${SCENARIO_ROOT}/find-missing-loop/loop.log" 2> /dev/null)" || true
+    printf '%s\n' "${n:-0}"
+}
+
+# True once the loop's log holds <want> runs, or the loop no longer runs.
+_scenario_fm_progress() {
+    (( $(find_missing_loop_runs) >= $1 )) || ! pid_alive "${_SCENARIO_FM_LOOP_PID}"
+}
+
+wait_find_missing_runs() {
+    local more="${1:-}" timeout_s="${2:-}" step base want got
+    step="wait_find_missing_runs ${more}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ "${more}" =~ ^[1-9][0-9]*$ ]] || fail "${step}: '${more}' is not a whole number of runs above 0"
+    [[ -n "${_SCENARIO_FM_LOOP_PID}" ]] && pid_alive "${_SCENARIO_FM_LOOP_PID}" \
+        || fail "${step}: the find-missing loop is not running"
+    timeout_s="${timeout_s:-$(( more * FIND_MISSING_LOOP_INTERVAL_S + 60 ))}"
+    _scenario_check_timeout "${timeout_s}" "${step}"
+    base="$(find_missing_loop_runs)"
+    want=$(( base + more ))
+    _scenario_poll_until "${timeout_s}" _scenario_fm_progress "${want}" || true
+    got="$(find_missing_loop_runs)"
+    (( got >= want )) && return 0
+    pid_alive "${_SCENARIO_FM_LOOP_PID}" \
+        || fail "${step}: the find-missing loop stopped after ${got} run(s), before ${want}"
+    fail "${step}: the loop's log holds ${got} run(s), not ${want}, after ${timeout_s}s"
+}
+
+# ---------------------------------------------------------------------------
+# The 0.10.0 seeders (fmk mode; b.jg5 SRJ-1306, SRJ-1402, SRJ-1424)
+# ---------------------------------------------------------------------------
+
+# _scenario_require_010 <step>: refuse unless the binary behind the shim,
+# run by its own name (no shim line), reports 0.10.0, no install_ad_rc has
+# run in this shell, and the store, if any, has no store_meta table (the
+# release candidate's install has not migrated it).
+_scenario_require_010() {
+    local step="$1" real="${HOME}/.agent-director/bin/agent-director.real" out ver n
+    (( _SCENARIO_INSTALL_COUNT == 0 )) \
+        || fail "${step}: refused: the release candidate's install.sh has run in this HOME (${_SCENARIO_INSTALL_COUNT} run(s)); the 0.10.0 seeders run before it"
+    check_ad_shim "${step}"
+    out="$("${real}" version 2>&1)" || fail "${step}: the binary behind the shim (${real}) failed its version call: ${out//$'\n'/ }"
+    ver="$(jq -r '.version // empty' <<< "${out}" 2> /dev/null)" || ver=""
+    [[ "${ver}" == "${SCENARIO_AD_010_VERSION}" ]] \
+        || fail "${step}: refused: the binary behind the shim reports version '${ver}', not ${SCENARIO_AD_010_VERSION}"
+    if [[ -f "${HOME}/.agent-director/state.db" ]]; then
+        n="$(_scenario_store_read "${step}" "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_meta'")" \
+            || exit 1
+        [[ "${n}" == 0 ]] \
+            || fail "${step}: refused: the store has a store_meta table, so the release candidate's install has migrated it"
+    fi
+}
+
+# _scenario_stub_mode_of <dir>: print the stub mode last selected for <dir>
+# (by its real path), or nothing when none was.
+_scenario_stub_mode_of() {
+    local real file="${SCENARIO_BIN}/${SCENARIO_STUB_MODES_NAME}" mode path last=""
+    real="$(realpath -e -- "$1" 2> /dev/null)" || return 0
+    [[ -f "${file}" ]] || return 0
+    while IFS=$'\t' read -r mode path; do
+        [[ "${path}" == "${real}" ]] && last="${mode}"
+    done < "${file}"
+    printf '%s\n' "${last}"
+}
+
+# True once the row's state is one other than `pending`.
+_scenario_row_left_pending() {
+    local state
+    state="$(_scenario_store_read "$1" "SELECT state FROM spawns WHERE claude_instance_id = '$2'")" || exit 1
+    [[ -n "${state}" && "${state}" != pending ]]
+}
+
+seed_010_row() {
+    local id="${1:-}" name="${2:-}" dir="${3:-}" step mode label args=() out sid pane ppid argv=() a found=0 state
+    step="seed_010_row ${id}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    _scenario_require_010 "${step}"
+    (( $# >= 3 )) || fail "${step}: takes <instance-id> <session-name> <dir> [<key>=<value>...]"
+    shift 3
+    _scenario_check_instance_id "${step}" "${id}"
+    [[ -n "${name}" && "${name}" != *[.:#[:cntrl:]]* && ${#name} -le 64 ]] \
+        || fail "${step}: session name '${name}' is empty, longer than 64 bytes or holds '.', ':', '#' or a control character"
+    [[ "${dir}" == /* && -d "${dir}" ]] || fail "${step}: working directory '${dir}' is not an absolute path to a directory"
+    for label in "$@"; do
+        [[ "${label}" =~ ^[^=]+= ]] || fail "${step}: label '${label}' is not <key>=<value>"
+        args+=(--label "${label}")
+    done
+    if _scenario_tmux has-session -t "=${name}"; then
+        fail "${step}: a session named ${name} already exists"
+    fi
+    mode="$(_scenario_stub_mode_of "${dir}")"
+    if [[ -z "${mode}" ]]; then
+        stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
+        mode="${STUB_MODE_AT_ONCE}"
+    fi
+    ad_capture spawn --cwd "${dir}" --claude-instance-id "${id}" --tmux-session-name "${name}" \
+        ${args[@]+"${args[@]}"}
+    if (( AD_RC != 0 )); then
+        sed 's/^/  | /' "${AD_OUT}" "${AD_ERR}" >&2
+        fail "${step}: 0.10.0's spawn exited ${AD_RC}"
+    fi
+    out="$(_scenario_tmux display-message -p -t "=${name}:" '#{session_id} #{pane_id} #{pane_pid}')" \
+        || fail "${step}: no session ${name} on the scenario's tmux server after the spawn: $(_scenario_tmux_err)"
+    read -r sid pane ppid <<< "${out}"
+    [[ "${sid}" =~ ^\$[0-9]+$ && "${pane}" =~ ^%[0-9]+$ && "${ppid}" =~ ^[0-9]+$ ]] \
+        || fail "${step}: tmux read '${out}' for session ${name}"
+    mapfile -d '' -t argv 2> /dev/null < "/proc/${ppid}/cmdline" || true
+    for a in ${argv[@]+"${argv[@]}"}; do
+        [[ "${a}" == "${SCENARIO_BIN}/claude" ]] && found=1
+    done
+    (( found )) || fail "${step}: the session's pane process ${ppid} is not the stub ${SCENARIO_BIN}/claude"
+    if [[ "${mode}" == "${STUB_MODE_AT_ONCE}" ]]; then
+        wait_until "${SCENARIO_SEED_REPORT_S}" "${step}: the row never reported in" \
+            _scenario_row_left_pending "${step}" "${id}"
+        state="$(_scenario_store_read "${step}" "SELECT state FROM spawns WHERE claude_instance_id = '${id}'")" || exit 1
+        case "${state}" in
+            waiting | working | ask_user | check_permission) ;;
+            *) fail "${step}: the row reads ${state} after its worker reported in, not a live state" ;;
+        esac
+    fi
+    SEEDED_SESSION_ID="${sid}"
+    SEEDED_PANE_ID="${pane}"
+    printf '%s %s %s %s\n' "${id}" "${name}" "${sid}" "${pane}"
+}
+
+# _scenario_normalize_channel_name <step> <name>: the published pre-persona
+# package's normalizeChannelName (its src/config.ts): lowercased, every run
+# of characters other than a-z and 0-9 one `_`, leading and trailing `_`
+# dropped. ASCII names only.
+_scenario_normalize_channel_name() {
+    if [[ "$2" == *$'\n'* ]] || LC_ALL=C grep -q '[^ -~]' <<< "$2"; then
+        fail "$1: channel name '$2' is not printable ASCII"
+    fi
+    printf '%s' "$2" | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+        | LC_ALL=C sed -E 's/[^a-z0-9]+/_/g; s/^_+//; s/_+$//'
+    echo
+}
+
+seed_prepersona_fleet() {
+    local config="${1:-}" step spec cid norm cwd out i ids=() insts=() sesss=() cwds=() lines=()
+    local -A names=()
+    step="seed_prepersona_fleet ${config}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    _scenario_require_010 "${step}"
+    (( $# >= 1 )) || fail "${step}: takes <config.json> <channel-id>=<channel-name>..."
+    shift
+    [[ -f "${config}" ]] || fail "${step}: no file at '${config}'"
+    jq -e '.routes | type == "object" and length > 0' "${config}" > /dev/null 2>&1 \
+        || fail "${step}: ${config} has no non-empty routes object (not a pre-persona config)"
+    for spec in "$@"; do
+        [[ "${spec}" == ?*=* ]] || fail "${step}: '${spec}' is not <channel-id>=<channel-name>"
+        names["${spec%%=*}"]="${spec#*=}"
+    done
+    out="$(jq -r '.routes | keys_unsorted[]' "${config}")" || fail "${step}: could not read the routes of ${config}"
+    mapfile -t ids <<< "${out}"
+    for cid in "${!names[@]}"; do
+        jq -e --arg c "${cid}" '.routes | has($c)' "${config}" > /dev/null 2>&1 \
+            || fail "${step}: channel ${cid} has a name given but no route in ${config}"
+    done
+    # Every route is checked and named before the first row is made.
+    for cid in "${ids[@]}"; do
+        [[ "${cid}" =~ ^[A-Za-z0-9]+$ ]] || fail "${step}: routed channel id '${cid}' is not letters and digits"
+        [[ -n "${names[${cid}]+set}" ]] \
+            || fail "${step}: no Slack channel name given for routed channel ${cid} (the package reads it from Slack, never from config.json)"
+        norm="$(_scenario_normalize_channel_name "${step}" "${names[${cid}]}")" || exit 1
+        if [[ -n "${norm}" ]]; then
+            insts+=("cscb_${norm}_${cid}")
+            sesss+=("slack_bot_${norm}_${cid}")
+        else
+            insts+=("cscb_${cid}")
+            sesss+=("slack_bot_${cid}")
+        fi
+        cwd="$(jq -r --arg c "${cid}" '.routes[$c].cwd // empty' "${config}")" \
+            || fail "${step}: could not read routes[${cid}].cwd"
+        if [[ "${cwd}" == "~" ]]; then
+            cwd="${HOME}"
+        elif [[ "${cwd}" == "~/"* ]]; then
+            cwd="${HOME}${cwd:1}"
+        fi
+        [[ "${cwd}" == /* ]] || fail "${step}: routes[${cid}].cwd '${cwd}' is not absolute after ~ expansion"
+        cwd="$(realpath -m -s -- "${cwd}")" || fail "${step}: could not normalize ${cwd}"
+        [[ -d "${cwd}" ]] || fail "${step}: routes[${cid}].cwd ${cwd} is not a directory"
+        cwds+=("${cwd}")
+    done
+    for i in "${!ids[@]}"; do
+        seed_010_row "${insts[i]}" "${sesss[i]}" "${cwds[i]}" service=cscb "channel=${ids[i]}" > /dev/null
+        lines+=("${ids[i]} ${insts[i]} ${sesss[i]} ${SEEDED_SESSION_ID} ${SEEDED_PANE_ID}")
+    done
+    printf '%s\n' "${lines[@]}"
 }
 
 # ---------------------------------------------------------------------------

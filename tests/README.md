@@ -215,8 +215,17 @@ tests/
                                    # and working; the SessionStart re-fire in every reporting path (at once, a folder trusted in either config, and the dev-channels,
                                    # unrecognised and folder-trust dialogs answered by `stub_press_enter`) against a row a silent worker holds `pending`, every fire
                                    # ignored as `pid_mismatch` and none after G; exactly one stop line after a failed `status` read and after a `pending` row with no
-                                   # launch start; and no stub line counted as CSCB's. The re-fire legs wait out agent-director's default G (60 s; the self-check
-                                   # writes no `[tmux]` table), so it runs about two minutes. It ends with the three closing assertions
+                                   # launch start; and no stub line counted as CSCB's. Its harness-only step legs (see Harness-only steps) show each seeding
+                                   # helper's session, labels and @ad_pane read back from tmux (`seeding`); each human tmux step's effect read back, and its
+                                   # refusals (`tmux_steps`); the store statements writing exactly their columns and refusing a live row (`store_statements`);
+                                   # the include-finished kill from the scenario's shell, the `pending` row beside a leftover and the one `delete`
+                                   # (`operator_actions`); the find-missing loop's runs, interval and parent (`find_missing_loop`); fmk-driver.ts's three
+                                   # forced calls, each one `DRIVER: FORCED` line with its calls parented by the driver (`fmk_driver_reuse_spawn`,
+                                   # `fmk_driver_read_pane`, `fmk_driver_resume`); the 0.10.0 seeders in a nested run started on 0.10.0, their rows
+                                   # surviving `install_ad_rc` and each seeder's refusals (`seeders_010`); and, last, the tmux server restart and socket
+                                   # re-bind (`tmux_server_steps`). The re-fire legs wait out agent-director's default G (60 s); only after them does
+                                   # `store_statements` write a `[tmux]` table (`starting_session_seconds = 60`, `stopping_window_seconds = 30`), so the
+                                   # kill need not wait 300 s. It runs about two and a half minutes and ends with the three closing assertions
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
@@ -402,7 +411,8 @@ fmk mode. Sourcing also:
   that sets it fails;
 - writes no agent-director `config.toml`, so agent-director runs on its
   default settings. Scenarios 10 and 24 are the exceptions: they write a
-  `[tmux]` table;
+  `[tmux]` table. Test 0 writes one too, after its re-fire legs (see
+  Layout);
 - once `SCENARIO_PORT` is picked, writes `$HOME/.claude/slack-mcp.json`
   (`write_mcp_config`), naming the bot server's MCP URL on that port, the
   `mcp_config_path` a persona config defaults to, so the stub's MCP session
@@ -474,9 +484,9 @@ Harness agent-director calls and store helpers:
   saying why, unless it is 16 lowercase hex characters.
   `ad_store_pending_no_launch <instance-id>` is one such edit (see The stub
   worker).
-- Each of these, `install_ad_shim` and every other install helper above calls
-  `require_ci_image` and then `require_scenario_home` as its first two steps
-  (see Image marker).
+- Each of these, `install_ad_shim` and every other install helper above, and
+  every helper under Harness-only steps below, calls `require_ci_image` and
+  then `require_scenario_home` as its first two steps (see Image marker).
 
 The tmux shim and CSCB processes (fmk mode). A CSCB process is the bot
 server, or a CLI command or driver the scenario runs: every `start` run
@@ -677,7 +687,9 @@ These hold for every fmk script (b.jg5 SRJ-1401):
 - It runs on the release candidate (binary, client, and `install.sh` with its
   migration) unless it sets `SCENARIO_AD_START=0.10.0`, and at
   agent-director's default settings, with no `config.toml`, unless it is
-  scenario 10 or 24, which write a `[tmux]` table.
+  scenario 10 or 24, which write a `[tmux]` table. Test 0, the harness's
+  self-check rather than a scenario, writes one once its re-fire legs are
+  done, for its include-finished kill (see Layout).
 - It runs with both shims: `tmux-shim.sh` first on the PATH of its CSCB
   processes, in `log` mode unless the scenario sets `fail-kill`,
   `fail-create`, `slow-create` or `wedge` with `tmux_shim_mode`; and
@@ -700,19 +712,214 @@ These hold for every fmk script (b.jg5 SRJ-1401):
   the line format reserves for `stub-claude.sh`) and the harness's calls are
   not CSCB's.
 - A latched persona's row is marked `missing` by a `find-missing` loop the
-  harness runs, because CSCB makes no extra calls for a latched persona. For
-  an unlatched persona, CSCB's own pending-row runs mark it, and the harness
-  runs no `find-missing` for it.
+  harness runs (`run_find_missing_loop`, see Harness-only steps), because
+  CSCB makes no extra calls for a latched persona. For an unlatched persona,
+  CSCB's own pending-row runs mark it, and the harness runs no `find-missing`
+  for it.
 - A check that no row was deleted reads the row afterwards: it is present, in
   any state.
 - CSCB's timings are shortened only through its configuration
   (`health_check_interval`, `session_restart_delay`) and the package's
   exported seams, never by editing `src/`. agent-director's are changed only
   through the `[tmux]` table of scenarios 10 and 24; every other scenario
-  waits out agent-director's default windows.
+  waits out agent-director's default windows (at least 300 s where it needs
+  the starting-session bound, as the include-finished kill does).
 - Posts are read from the Slack stub's record (`slack-stub-server.ts
   --record`).
 - Shim logs are read by parent process, as above, never by scraping a pane.
+
+### Harness-only steps
+
+The harness plays a human's acts with the helpers below (b.jg5 SRJ-1306,
+SRJ-1401). Each step is test-only and runs only in fmk mode inside the
+image. It is made from the scenario's own shell (a subshell of it, such as a
+command substitution, counts as that shell), never by a CSCB process, and
+acts only on the scenario's own tmux server and store. `scenario.sh`'s
+header gives each helper's arguments and output.
+
+Every helper runs `require_ci_image` and then `require_scenario_home`
+first. The tmux steps and the seeders run the real tmux (never the tmux
+shim) on the scenario's server, and refuse when `TMUX_TMPDIR` is not the
+scenario's or `TMUX` is set. Each step reads its effect back (the session,
+pane, option, server, row or log it changed) and fails, through `fail`,
+when the effect is absent. None reads a pane's text. A `<session>` argument
+is a session id (`$N`) or a session name matched exactly, never as a prefix
+of another session's.
+
+| Step (SRJ-1306) | Helper |
+|---|---|
+| A leftover: a session labelled with an earlier launch of an instance id | `seed_leftover` |
+| A session with no label | `seed_unlabelled` |
+| A session with no label whose environment holds only `AGENT_DIRECTOR_INSTANCE_ID` | `seed_env_only` |
+| Another row's session holding a persona's session name | `seed_borrowed_name` |
+| Another agent-director store's session (its label ends with another 16-hex store id) | `seed_other_store` |
+| A persona's own session relabelled, in `@ad_owner` and its worker pane's `@ad_pane`, with an earlier launch's token | `relabel_session` |
+| A grouped viewer session on a persona's session | `attach_viewer` |
+| Renaming a session | `rename_session` |
+| `remain-on-exit` on for one session | `set_remain_on_exit` |
+| Setting and unsetting a global `@ad_owner` value (conflicting labels) | `ad_owner_global_set`, `ad_owner_global_unset` |
+| Sending Enter into a stub's pane held at a startup dialog | `stub_press_enter` (see The stub worker) |
+| Respawning a worker's pane with another process | `respawn_worker_pane` |
+| Restarting the scenario's tmux server | `restart_tmux_server` |
+| Re-binding its socket path while the old server runs | `rebind_tmux_socket` |
+| Scenario 10 part B's store statement | `ad_store_mark_finished` |
+| Scenario 19's `pending` row beside a leftover | `ad_store_seed_pending` |
+| Scenario 25's unusable recorded name | `ad_store_unusable_name` |
+| Scenarios 20 and 26's `pending` row with no launch start | `ad_store_pending_no_launch` (see The stub worker) |
+| A human ending a leftover or a hand-made session by its session id | `end_session` |
+| A human's `kill` of a finished row with the include-finished option (scenario 10) | `ad_kill_include_finished` |
+| A human's `delete` of the row with the unusable name (scenario 25) | `ad_delete_unusable_row` |
+| The host's `find-missing` loop | `run_find_missing_loop` |
+
+The step that set `base-index` is withdrawn: no agent-director verb depends
+on pane indices, and no helper sets it.
+
+The label builders the seeding steps use are helpers too: `ad_new_token`
+(a fresh 16-hex launch token, other than the row's current one and any
+given), `ad_other_store_id` (a 16-hex id other than the scenario store's),
+`ad_owner_label` (`ad1 <token> <session id> <instance id> <store id>`, the
+store id the scenario store's unless given) and `ad_pane_label`
+(`<token> <pane id>`).
+
+The seeding helpers (`seed_leftover`, `seed_unlabelled`, `seed_env_only`,
+`seed_borrowed_name`, `seed_other_store`) each run `new-session -d` with the
+given worker command, in `-c <dir>` (default `SCENARIO_ROOT`). They refuse a
+name that is taken or holds `.`, `:` or a control character. Each prints
+`<session id> <pane id>`, then the token and store id for a labelled
+session, and sets `SEEDED_SESSION_ID`, `SEEDED_PANE_ID`, `SEEDED_TOKEN` and
+`SEEDED_STORE_ID`, which a call inside `$( … )` does not keep.
+
+#### Seeding rules
+
+Every seeding and relabelling helper follows SRJ-1306's seeding rules
+(agent-director's handoff rev 15 and rev 17):
+
+- Every `@ad_owner` label the harness seeds or relabels ends with the
+  scenario store's own store id, which `ad_store_id` reads from the store's
+  `store_meta` table. The exception is `seed_other_store`, whose label ends
+  with an `ad_other_store_id` id: agent-director reads a label with another
+  id as another store's and never acts on it.
+- Every leftover the harness seeds or relabels carries `@ad_pane` =
+  `<the label's token> <the pane's id>` on its worker's pane, as a leftover
+  agent-director made does. agent-director finds a leftover's pane only
+  through that label; without it `read-pane` answers "the agent's pane was
+  not found".
+- A session seeded by hand for agent-director to adopt after a lost create
+  reply would carry `@ad_pane` = `<the row's launch token> <the pane's id>`.
+  No scenario seeds one, so no helper makes one.
+- A scenario whose launch loses its create reply (the tmux shim's
+  `slow-create`) runs the stub in a mode that waits for the approver's Enter
+  before it reports in (`dev-channels`, the default): agent-director applies
+  no hook to a row whose pane it has not adopted, and the approver's
+  `send-keys` adopts it.
+
+#### Store statements
+
+Each statement is one `ad_store_edit` UPDATE that names the row by its
+instance id and by its `row_version` as read just before, so an
+agent-director write in between leaves the row unwritten and the step
+failing. The row is read before and after, and the step fails unless the
+columns below hold their new values and every other column keeps its old
+one.
+
+| Helper | Scenario | Columns it changes |
+|---|---|---|
+| `ad_store_mark_finished <id> <missing\|ended>` | 10 part B (SRJ-1412) | `state` to `missing` or `ended`; `ended_at` to now minus the stopping window, in whole seconds, in the store's `YYYY-MM-DD HH:MM:SS` UTC layout; `launch_started_at` NULL; `row_version` + 1. Prints the `ended_at` written |
+| `ad_store_seed_pending <id> [<leftover-token>]` | 19 (SRJ-1420) | the existing row made `pending`, as a spawn whose process stopped before its create leaves it: `state` `pending`; `launch_started_at` now, in milliseconds; `launch_token` a fresh token other than the row's current one and the leftover's; `ended_at`, `pid`, `proc_starttime`, `tmux_server_pid`, `tmux_server_started`, `tmux_server_starttime`, `pane_id`, `pane_pid` and `pane_starttime` NULL; `row_version` + 1. A harness `status` read must then read `pending` with a launch start. Prints the token |
+| `ad_store_unusable_name <id> <name>` | 25 (SRJ-1427) | only `tmux_session_name`, to a `<name>` holding a `.` and only letters, digits and `._-`, on an `ended` or `missing` row; `row_version` kept |
+| `ad_store_pending_no_launch <id>` | 20 and 26 | `state` `pending`; `launch_started_at`, `launch_token`, `pid`, `proc_starttime`, `pane_id`, `pane_pid` and `pane_starttime` NULL; `row_version` + 1. A harness `status` read must then read `pending` with no launch start |
+
+`ad_store_mark_finished` reads the stopping window from `[tmux]
+stopping_window_seconds` in `$HOME/.agent-director/config.toml`, or uses
+agent-director's default, 90 s, without one. It refuses while the worker's
+session is younger than that window: the `ended_at` it writes must be later
+than the session's creation.
+
+#### The human's agent-director actions
+
+- `end_session <session id>` ends a leftover or a hand-made session with
+  `kill-session` and fails unless it is gone.
+- `ad_kill_include_finished <id>` is the human's `kill` with the
+  include-finished option, made through `ad_capture` as a direct child of
+  the shell that calls it, so `assert_no_cscb_include_finished` accepts it.
+  It sets `AD_KILL_OUT`, `AD_KILL_ERR` and `AD_KILL_RC`, prints the output,
+  and fails on a non-zero exit, on a result without `kill_sent`, or when the
+  shim's log holds no new line for the call. agent-director refuses this
+  kill on a live row, so the row must read `ended` or `missing` first (as
+  `ad_store_mark_finished` leaves it). It also refuses until the session is
+  at least the starting-session bound old: `[tmux]
+  starting_session_seconds`, 300 s by default and 60 s at its minimum. A
+  scenario that uses it sets a smaller bound in its `[tmux]` table
+  (scenario 10) or waits 300 s.
+- `ad_delete_unusable_row <id>` is scenario 25's step, a human removing the
+  row whose recorded name `ad_store_unusable_name` made unusable. It refuses
+  unless that name holds a `.`, and fails unless `delete` exits 0 and the
+  row is gone. It is the only agent-director `delete` under
+  `tests/integration`: no fixture calls `delete`, and
+  `tests/host-safety.test.ts` audits that statically.
+
+#### The find-missing loop
+
+`run_find_missing_loop [<interval-s>]` plays the host's `find-missing` loop,
+for a latched persona's row only (SRJ-1401): CSCB makes no extra call for a
+latched persona, so the loop marks its row `missing` or clears a
+`provenance_conflict` note. An unlatched persona's row is marked by CSCB's
+own pending-row runs, and the harness runs no loop for it.
+
+- The interval defaults to `SCENARIO_FIND_MISSING_INTERVAL_S`, 30 s in
+  `/ci`; the host's loop runs every 300 s.
+- The loop is a background subshell of the scenario's shell, registered
+  with `track_pid`. It runs `find-missing` with no arguments through `ad`,
+  then sleeps the interval, until it is stopped or the trap ends it. It
+  refuses to start while a loop runs.
+- Each run writes `run.<n>.out` and `run.<n>.err` and one line,
+  `run <n> TAB start <time> TAB end <time> TAB exit <status>`, followed by
+  its output indented (`  out| `, `  err| `), to `FIND_MISSING_LOOP_LOG`
+  (`$SCENARIO_ROOT/find-missing-loop/loop.log`). It sets
+  `FIND_MISSING_LOOP_PID` and `FIND_MISSING_LOOP_INTERVAL_S`.
+- Its calls' parent is the loop subshell, whose command line is the
+  script's own, so `cscb_ad_calls` and `cscb_ad_count` count none of them.
+- `stop_find_missing_loop [<timeout-s>]` stops it (default 30 s; a run in
+  flight finishes first). `find_missing_loop_runs` prints how many runs the
+  log holds, and `wait_find_missing_runs <n> [<timeout-s>]` waits for `<n>`
+  more (default `<n>` intervals plus 60 s), failing early when the loop
+  stops.
+
+#### The 0.10.0 seeders
+
+A script that sets `SCENARIO_AD_START=0.10.0` before sourcing starts on
+agent-director 0.10.0 (`install_ad_010`) with no store; 0.10.0's first
+`spawn` creates it. The seeders make 0.10.0-era rows in that store, before
+the release candidate's install (`install_ad_rc`) migrates it. Both refuse
+unless the binary behind the shim reports 0.10.0, no `install_ad_rc` has run
+in the shell, and the store, if any, has no `store_meta` table.
+
+- `seed_010_row <id> <session-name> <dir> [<key>=<value>...]` makes one row
+  with 0.10.0's own `spawn`, through `ad_capture` from the scenario's shell,
+  with a `--label` per `<key>=<value>`. Its worker is the stub in the mode
+  selected for `<dir>`, `at-once` unless the caller chose another with
+  `stub_mode` first; 0.10.0's hooks are shell form, and the stub fires them
+  from their words. In `at-once` it waits (`SCENARIO_SEED_REPORT_S`, 60 s)
+  until the row reports in to a live state. Prints `<id> <session-name>
+  <session id> <pane id>`.
+- `seed_prepersona_fleet <config.json> <channel-id>=<slack-name>...` makes
+  one `seed_010_row` per channel the pre-persona config's `routes` names, in
+  its order, in that route's `cwd` (`~` expanded; it must be absolute). It
+  names and labels each row as the published pre-persona package (0.10.0)
+  does: instance id `cscb_<name>_<channel id>`, session
+  `slack_bot_<name>_<channel id>`, labels `service=cscb` and
+  `channel=<channel id>`, and no `persona` label. `<name>` is the channel's
+  Slack name normalized as that package does: lowercased, each run of
+  characters other than `a-z` and `0-9` turned into one `_`, leading and
+  trailing `_` dropped; a name that normalizes to nothing gives
+  `cscb_<channel id>` and `slack_bot_<channel id>`. The package reads the
+  name from Slack, never from `config.json`, so the caller passes one per
+  routed channel (ASCII only). Every route is checked before the first row
+  is made. Prints one line per row, `<channel id> <instance id> <session
+  name> <session id> <pane id>`.
+
+After `install_ad_rc` the rows are kept, with no `launch_started_at`, and
+their workers still run; the seeders then refuse.
 
 ### The stub worker
 
@@ -894,7 +1101,9 @@ stdout/stderr where `docker logs` can capture them — never into `verdict.txt`.
 - Anything requiring LLM judgment ("did this response look reasonable").
 - Pane scraping, tmux capture, JSONL transcript parsing. Whose call a shim
   log line records is read from its parent process (the closing assertions,
-  `cscb_ad_calls`, `cscb_ad_count`), never from a pane.
+  `cscb_ad_calls`, `cscb_ad_count`), never from a pane. The harness's tmux
+  steps (see Harness-only steps) play the human; they are never assertions
+  made by reading a pane's text.
 - Retries, fix-it-yourself logic, or self-healing. A test is a strict assertion.
 
 ### Escape hatch: tests that genuinely need LLM judgment
