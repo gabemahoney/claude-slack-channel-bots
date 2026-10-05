@@ -155,10 +155,14 @@ why:
   `FAIL: <test>: refused: /etc/cscb-ci-image is absent …` and exits 1 before
   it makes a scratch root, picks a port or sets a trap. Tests 1 to 4, which do
   not source the helper, carry the same check as their own first step.
-- `fixtures/fmk-driver.ts` and `fixtures/stub-mcp-session.ts`: the first
-  statement of each checks the marker and exits 2 before it reads an argument
-  or loads a module; each statically imports only `node:` built-ins.
+- `fixtures/fmk-driver.ts`, `fixtures/stub-mcp-session.ts` and
+  `fixtures/fmk-texts.ts`: the first statement of each checks the marker and
+  exits 2 before it reads an argument or loads a module; each statically
+  imports only `node:` built-ins.
   (`fixtures/phase1-client-check.ts` also refuses to run without the marker.)
+- `fixtures/ad-version-stand-in.sh`: checks the marker before it reads its
+  settings or runs agent-director; without it, it prints one
+  `ad-version-stand-in:` line on stderr and exits 70.
 - Every `scenario.sh` step that installs, moves or swaps an agent-director
   binary or the shim, every harness agent-director call (`ad`, `ad_capture`, `ad_admin`, `ad_admin_capture`),
   every harness `sqlite3` read or edit (`ad_store_edit`, `ad_store_id`,
@@ -227,6 +231,8 @@ tests/
                                    # re-bind (`tmux_server_steps`). The re-fire legs wait out agent-director's default G (60 s); only after them does
                                    # `store_statements` write a `[tmux]` table (`starting_session_seconds = 60`, `stopping_window_seconds = 30`), so the
                                    # kill need not wait 300 s. It runs about two and a half minutes and ends with the three closing assertions
+    test-20-fmk-old-binary.sh      # HO §7 scenario 8 (b.jg5 SRJ-1410), fmk: an old binary is refused at start; a binary swapped behind the shim stops the server;
+                                   # a re-check that cannot run logs once and changes nothing; an ErrInvalidFlags reuse holds or stops (see fmk scenarios below)
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
@@ -237,6 +243,12 @@ tests/
                                    # with one `DRIVER:` outcome line: a `resume` (scenario 5) and a reuse spawn (scenarios 8 and 25) through the package's
                                    # forced-launch seams, and the persona's pane read under another TMUX_TMPDIR (scenario 26); refuses to run without the image
                                    # marker /etc/cscb-ci-image and imports the installed package and its agent-director client only after that check
+      fmk-texts.ts                 # the one value printer of the fmk scenarios: prints the installed package's own export (a constant, or a builder's output for
+                                   # the given arguments) by entry name, so no script retypes a value src/ exports; refuses to run without the image marker
+                                   # /etc/cscb-ci-image and imports the package only after that check (see The value printer)
+      ad-version-stand-in.sh       # scenario 8's agent-director version stand-in, behind the shim: reports a chosen version (or none a client parses), can turn the
+                                   # reuse flag into one the release does not define, and hands every other call to the image's release binary; refuses without
+                                   # the image marker or its settings file (see Scenario helper)
       driver.ts                    # Test 4 driver: builds a one-persona config, calls spawnForPersona directly, then follows the persona's dialog approver through the package's seams
                                    # (running when the launch returns, stops because the row went live, keeps the launch start); deletes no row
       stub-claude.sh               # fake `claude` (Tests 4, 10 and 12, and every fmk script): runs the mode its working directory selects (the dev-channels
@@ -248,6 +260,7 @@ tests/
                                    # `--mcp-config` with the package's own MCP SDK and holds the session until the stub ends; refuses to run without the image
                                    # marker /etc/cscb-ci-image and imports the package only after that check
       slack-stub-server.ts         # Tests 10 and 12 loopback Slack stub: Web API, apps.connections.open, Socket Mode WebSocket, JSONL record
+                                   # (each `chat.postMessage` text whole, token-redacted)
       phase1-client-check.ts       # run by Test 1 on the installed package, after the client-under-test check
                                    # against the agent-director client the installed package resolves: the client exports SRJ-103's seven classes and the package's re-exports of them are the client's own,
                                    # client-built errors classify by class, the description and predicate helpers hold; refuses to run without the image marker /etc/cscb-ci-image
@@ -491,6 +504,24 @@ Each change to the install goes through one helper:
   together (to `$SCENARIO_ROOT/ad-aside`), leaving no file at the standard
   path; restore moves both back, the binary first, then runs `check_ad_shim`.
   A move that fails halfway is rolled back and the step fails saying so.
+- `install_ad_stand_in <version|unparseable> <reject|pass> [<step>]` and
+  `restore_ad_install_with_stand_in <version|unparseable> <reject|pass>
+  [<step>]` are harness additions for scenario 8. Each puts
+  `fixtures/ad-version-stand-in.sh` behind the shim, after writing the
+  stand-in's settings beside the binary path
+  (`agent-director.real.settings`): what its `version` reports (`<version>`,
+  or for `unparseable` a line no client parses), whether `--reuse-finished`
+  is turned into a flag the release does not define (`reject`) or passed on
+  (`pass`), and the image's release binary (`SCENARIO_RELEASE_BIN`, never
+  found through PATH) that every other call is handed to.
+  `install_ad_stand_in` places the stand-in through `swap_ad_binary`.
+  `restore_ad_install_with_stand_in`, after `hide_ad_install`, puts the
+  stand-in at `agent-director.real`, then moves the hidden shim back and
+  removes the hidden binary; when the shim cannot move, the stand-in is
+  removed again and the install stays hidden. Both end with `check_ad_shim`
+  and a check that the stand-in, with its settings, is behind the shim. The
+  stand-in reads no environment variable; its header states the settings
+  format.
 
 Harness agent-director calls and store helpers:
 
@@ -634,6 +665,11 @@ verb is `<verb>` (any verb when `<verb>` is empty) and whose arguments, joined
 by single spaces, hold every fixed-string fragment in order;
 `cscb_ad_count <verb> [<fragment>...]` prints how many. The harness's calls,
 the stub's calls and any `stop` line never count.
+`wait_for_cscb_ad_call <count-before> <timeout-s> <step> <verb>
+[<fragment>...]` (a harness addition for scenario 8) waits until that count
+is above `<count-before>`, which the caller takes before the step it waits
+on, then prints the next such line (`cscb_ad_calls`' line `<count-before>` +
+1); it fails naming `<step>` when the count stays there for `<timeout-s>`.
 
 Matchers (E14 director decision 14). A matcher is one or more fixed-string
 fragments that must appear on one line in the given order, with anything
@@ -752,6 +788,196 @@ These hold for every fmk script (b.jg5 SRJ-1401):
 - Posts are read from the Slack stub's record (`slack-stub-server.ts
   --record`).
 - Shim logs are read by parent process, as above, never by scraping a pane.
+
+### fmk scenarios
+
+Each fmk scenario of the handoff's scenario list (HO §7) is one script. Its
+header comment is its full statement: the legs, the binary behind the shim
+at each step, the waits and their bounds, and each matched value with the
+`src/` export or function it comes from. Test 0 is the harness's self-check,
+not a scenario.
+
+| HO §7 scenario | Script | Requirement |
+|---|---|---|
+| 8 | `test-20-fmk-old-binary.sh` | b.jg5 SRJ-1410 (AC 21, 22, 23) |
+
+#### Scenario 8: test-20
+
+Test 20 shows this build never runs against an agent-director older than
+Phase 1. It runs in fmk mode on the release, with one persona, P, whose
+working directory selects the stub's `at-once` mode, and the Slack stub
+recording. CSCB's config sets `health_check_interval` 0 (no health tick
+relaunches P), `resume_enabled` false (P's finished row comes back only by a
+reuse spawn), `exit_timeout` 5 and `agent_director_poll_interval_ms` 3600000
+(the permission poller's `list` calls stay out of the shim's log). These are
+the only delays set, all CSCB's own, through its config. agent-director runs
+at its default settings: the scenario HOME's agent-director `config.toml`
+carries no `[tmux]` table, and set-up fails if it does.
+
+The harness finishes P's row (`ad_store_mark_finished <P> ended`, then
+`ad_kill_include_finished`, in 8d and 8e) only once tmux reports P's session
+302 s old: the longer of agent-director's default starting-session bound
+(300 s) and default stopping window (90 s), both printed from
+`DEFAULT_AD_SETTINGS`, plus 2 s. `ad_store_mark_finished` needs the session
+older than the stopping window and agent-director-admin's `kill-finished`
+needs it past the starting-session bound. That wait is bounded by 332 s
+(the age plus 30 s). In 8d P's session is already older than that; in 8e,
+with the server stopped, the wait lasts about 300 s for the session the 8d
+reuse spawn made. Test 20 runs about 18 minutes.
+
+The shim stays at the standard path throughout, apart from the not-found
+step; every other change replaces only the binary behind it:
+
+| Leg | Behind the shim, in order |
+|---|---|
+| set-up | the release (0.11.0) |
+| 8a | 0.10.0 (`swap_ad_binary 0.10.0`), then the release |
+| 8b | the release; nothing at the standard path (`hide_ad_install` moves the shim and the binary aside, and no `agent-director` is on the server's PATH); the stand-in reporting no parseable version (`restore_ad_install_with_stand_in unparseable pass`); the release |
+| 8c | 0.10.0, then the release once the server has stopped |
+| 8d | the passing wrapper (`install_ad_stand_in <floor>-rc.1 reject`), then the release |
+| 8e | the release; the below-floor stand-in (`install_ad_stand_in <0.10.0's version> reject`) once the start-pass launch has failed; the release once the server has stopped |
+
+The legs run in order, each on the state the one before left:
+
+- 8a, refused start. With 0.10.0 behind the shim (its version read with a
+  harness `version` call and kept for 8e), a live `start` fails: the CLI
+  reports the daemon's non-zero exit, and exactly one
+  `ad-below-phase1-floor` entry equals the startup form of the floor message
+  for that version and the binary's path, with its one server-log line. The
+  start makes no spawn, resume, kill, `kill-finished`, delete or pause call,
+  no new tmux session and no new Slack stub record line (no Slack
+  connection).
+- 8b, a re-check that cannot run. P launches on the release and reports in;
+  its row (state, `row_version`, pid) and session are recorded. With the
+  install hidden (`ErrSystemInstallNotFound`), one could-not-run line
+  appears within the re-check interval plus 10 s, and no probe runs while it
+  is hidden. With the shim back and the unparseable stand-in behind it
+  (`ErrSystemInstallUnreachable`), and then with the release back, each next
+  bot-server probe leaves that one line the only one and the server running.
+- 8c, a swap stops the server. Within the re-check interval plus 10 s of the
+  swap to 0.10.0 (`health_check_interval` 0), the server exits with its
+  re-check shutdown line and exactly one new entry, equal to the runtime form
+  of the floor message (it carries the runtime re-check phrase and points to
+  the debug skill), with its one server-log line. No CSCB kill,
+  `kill-finished`, pause, delete, spawn or resume follows the swap. With the
+  release back, P's worker process and session are alive and its row's
+  state, `row_version` and pid are as 8b recorded. What CSCB's calls met while
+  0.10.0 sat behind the shim (`ErrSchemaMismatch` on the migrated store) is
+  printed, not asserted.
+- 8d, the hold. The harness finishes P's row (`ad_store_mark_finished <P>
+  ended`, then `ad_kill_include_finished`, agent-director-admin's
+  `kill-finished`) and puts the passing wrapper behind the shim. The server
+  starts: the start pass's plain spawn collides with P's finished row
+  (`ErrInstanceIdCollision`) and launches nothing, then exactly one reuse
+  spawn carrying `--reuse-finished` gets `ErrInvalidFlags` and is directly
+  followed by a bot-server probe (the immediate re-check). The server keeps
+  running, one post to P's channel holds the Cannot launch alert whole, and
+  P's row stays finished. Over the next timed re-check there is no further
+  launch and no second post. Putting the release back is the version change:
+  at the next timed re-check exactly one reuse spawn for P succeeds and P
+  reads `waiting`, still with one alert and no delete. While the hold lasts,
+  CSCB makes no plain spawn, resume, delete or kill for P and P has no tmux
+  session.
+- 8e, the stop through the triggered re-check. With the server stopped, P's
+  row finished again the same way and the tmux shim in `fail-create`, the
+  server starts on the release: the gate passes and the start pass's reuse
+  spawn fails. The tmux shim goes back to `log` and the below-floor stand-in
+  goes behind the shim. P's next attempt is a reuse spawn made before the
+  first timed re-check (the script fails saying so when it is not); its
+  `ErrInvalidFlags` is directly followed by a bot-server probe, and the server
+  exits with exactly one more entry, the runtime form for 0.10.0's version,
+  all less than the re-check interval after the gate. No CSCB kill,
+  `kill-finished`, delete or pause follows, and P's row stays finished.
+
+Why the legs are built this way:
+
+- The server's effects come from its own reuse spawn of P, the persona with
+  `resume_enabled` false and a finished row: at the start pass under the
+  passing wrapper (8d), and at P's next attempt after a `fail-create` start
+  pass under the below-floor stand-in (8e).
+- `fixtures/fmk-driver.ts` runs its forced reuse of P (through `cscb_run`)
+  under the passing wrapper only, in 8d. It runs in its own process, behind
+  CSCB's startup gate, so it cannot stop the server or post an alert; its
+  one `DRIVER:` line naming `ErrInvalidFlags` and CSCB's class for it shows
+  the wrapper's rejection is a real `ErrInvalidFlags` through CSCB's
+  production classification.
+- The below-floor binary is a stand-in reporting 0.10.0's own version (read
+  in 8a): a real 0.10.0 answers `ErrSchemaMismatch` on the migrated store
+  before it parses flags, so it never answers `ErrInvalidFlags`.
+- The passing wrapper reports the floor with an `-rc.1` tag. CSCB compares
+  only major.minor.patch against the floor (b.jg5 SRJ-202), so it passes;
+  the release put back reads as a different version string, which ends the
+  hold.
+- With `reject`, the stand-in turns `--reuse-finished` into a flag the
+  release does not define and hands the call to the release, so the release
+  itself answers its `ErrInvalidFlags` envelope.
+- Every re-check wait is bounded by the re-check interval plus a 10 s allowance (the
+  probe, the shutdown and the script's polling), measured from the swap, and
+  watches shim-log and server-log lines.
+
+Matched values, each printed by `fixtures/fmk-texts.ts` from the installed
+package (see The value printer):
+
+| Value | Printer entry | `src/` |
+|---|---|---|
+| The Phase 1 floor | `PHASE1_FLOOR_VERSION` | `src/ad-version-gate.ts` |
+| The entry's class label | `AD_BELOW_PHASE1_FLOOR` | `src/install-check-labels.ts` |
+| The floor message, startup and runtime forms | `buildBelowPhase1FloorMessage <version> <path> <startup\|runtime>` | `src/ad-version-gate.ts` |
+| The runtime re-check phrase | `RUNTIME_RECHECK_PHRASE` | `src/ad-version-gate.ts` |
+| The re-check interval | `AD_VERSION_RECHECK_INTERVAL_MS` | `src/ad-version-gate.ts` |
+| The could-not-run line's prefix | `AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX` | `src/ad-version-gate.ts` |
+| The Cannot launch alert's body | `INVALID_FLAGS_HOLD_ALERT_TEXT` | `src/invalid-flags-hold.ts` |
+| The alert as posted for P | `formatPersonaNotice <P> INVALID_FLAGS_HOLD_ALERT_TEXT` | `src/persona-notifier.ts` |
+| CSCB's class for `ErrInvalidFlags` | `classifyAdError ErrInvalidFlags` | `src/ad-error-class.ts` |
+| agent-director's default starting-session bound | `DEFAULT_AD_SETTINGS tmux starting_session_seconds` | `src/ad-settings.ts` |
+| agent-director's default stopping window | `DEFAULT_AD_SETTINGS tmux stopping_window_seconds` | `src/ad-settings.ts` |
+
+Lines with no exported builder are matched by a fragment quoted from `src/`,
+each with its source named beside it in the script: the start failure
+(`src/cli.ts`), the re-check's shutdown reason (`src/server.ts`), and the
+collision, reuse-failed and reuse-spawned lines
+(`src/session-manager.ts`).
+
+### The value printer
+
+`tests/integration/fixtures/fmk-texts.ts` is the one value printer of the
+fmk scenarios; its header comment is its full statement. A scenario script
+cannot import TypeScript and never retypes a notice text, class label,
+version or settings value that `src/` exports, so it asks the printer, which
+prints the installed package's own export: a constant as it is, or a
+builder's output for the given arguments.
+
+- Usage: `bun "${SCENARIO_FIXTURES}/fmk-texts.ts" <entry> [<arg>...]`, run in
+  the scenario's own shell (the printer is not a CSCB process, so not through
+  `cscb_run`) and captured with a command substitution, the scenario failing
+  when the printer fails. It prints the value byte for byte, with no trailing
+  newline added.
+- It reads the package from `CSCB_PKG_DIR` (default
+  `/test-repo/node_modules/claude-slack-channel-bots`), and an entry that
+  needs it, the agent-director client that package resolves.
+- Failures print one `FAIL: fmk-texts: <reason>` line on stderr: exit 64 for
+  no entry, an unknown one or arguments the entry does not take; exit 1 for
+  a missing or mistyped export or a builder that throws. Without the image
+  marker it exits 2 (see Image marker); `tests/host-safety.test.ts`'s marker
+  audit covers it.
+- It makes no agent-director call, starts no process or server, opens no
+  socket, reads no token and writes no file.
+- Its entries sit in one named map (`ENTRIES`), each named after the `src/`
+  export it prints. A scenario that needs another value adds a named entry
+  there; there is never a second printer.
+
+| Entry | Prints | `src/` |
+|---|---|---|
+| `PHASE1_FLOOR_VERSION` | the Phase 1 floor | `src/ad-version-gate.ts` |
+| `AD_BELOW_PHASE1_FLOOR` | the class label | `src/install-check-labels.ts` |
+| `buildBelowPhase1FloorMessage <found-version> <binary-path> <startup\|runtime>` | the floor message in the startup or runtime form | `src/ad-version-gate.ts` |
+| `RUNTIME_RECHECK_PHRASE` | the runtime re-check phrase | `src/ad-version-gate.ts` |
+| `AD_VERSION_RECHECK_INTERVAL_MS` | the re-check interval, in decimal | `src/ad-version-gate.ts` |
+| `AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX` | the could-not-run line's prefix | `src/ad-version-gate.ts` |
+| `INVALID_FLAGS_HOLD_ALERT_TEXT` | the Cannot launch alert's body | `src/invalid-flags-hold.ts` |
+| `formatPersonaNotice <persona-name> <entry> [<arg>...]` | another entry's value as posted in that persona's notice | `src/persona-notifier.ts` |
+| `classifyAdError <err-name>` | CSCB's class for the installed client's error class `<err-name>`, built from an envelope | `src/ad-error-class.ts` |
+| `DEFAULT_AD_SETTINGS <table> <key>` | agent-director's default for `[<table>] <key>`, in decimal; an unknown table or key exits 64 | `src/ad-settings.ts` |
 
 ### Harness-only steps
 
@@ -1056,7 +1282,12 @@ variable for the integration suite only (see Environment Variables in
   rewrites it to switch answers mid-run.
 - Every request is one JSONL line in a record file, labelled with the persona
   the scenario assigned to the token and a token hash, never the token.
-- It has no `bun test` suite of its own; Test 10 exercises it end to end.
+- A line's `text` has token-like text replaced by `<token>` before it is
+  written. A `chat.postMessage` text is then recorded whole, so a scenario
+  compares a posted notice in full (Test 20's Cannot launch alert); every
+  other method's `text` is cut to at most 300 characters.
+- It has no `bun test` suite of its own; Test 10 exercises it end to end,
+  and Test 20's whole-text checks exercise its `chat.postMessage` record.
 
 A live start also launches each persona through the real agent-director
 under the stub `claude` (see The stub worker), and stops with `--stop-bots`.

@@ -1553,6 +1553,8 @@ leg_guard_refusals() {
         expect_fails_in_home "${step}" "${home}" "${reason}" swap_ad_binary release
         expect_fails_in_home "${step}" "${home}" "${reason}" hide_ad_install
         expect_fails_in_home "${step}" "${home}" "${reason}" restore_ad_install
+        expect_fails_in_home "${step}" "${home}" "${reason}" install_ad_stand_in 0.10.0 reject
+        expect_fails_in_home "${step}" "${home}" "${reason}" restore_ad_install_with_stand_in unparseable pass
         expect_fails_in_home "${step}" "${home}" "${reason}" ad version
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_admin version
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_admin_capture version

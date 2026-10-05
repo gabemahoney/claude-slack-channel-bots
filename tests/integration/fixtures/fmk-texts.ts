@@ -48,7 +48,9 @@
  * ------------
  *   CSCB_PKG_DIR   the installed package (default
  *                  /test-repo/node_modules/claude-slack-channel-bots), as
- *                  `driver.ts` and `fmk-driver.ts` read it
+ *                  `driver.ts` and `fmk-driver.ts` read it; the agent-director
+ *                  client is the one that package resolves, as `fmk-driver.ts`
+ *                  resolves it
  *
  * ENTRIES (each named after its `src/` export)
  * -------
@@ -71,6 +73,16 @@
  *                                                prefix added, the key derived by the
  *                                                package's personaKey, as the config
  *                                                loader derives it)
+ *   classifyAdError <err-name>                   src/ad-error-class.ts: CSCB's class
+ *                                                (`errorClass`) for an instance of the
+ *                                                installed agent-director client's error
+ *                                                class <err-name>, built as the client
+ *                                                builds one from an error envelope (verb,
+ *                                                name, description); for the classes the
+ *                                                client builds from an envelope only
+ *   DEFAULT_AD_SETTINGS <table> <key>            src/ad-settings.ts: agent-director's default
+ *                                                for `[<table>] <key>` (for example `tmux
+ *                                                starting_session_seconds`), in decimal
  *
  * An entry is one `Entry` in `ENTRIES`: its argument synopsis, the export it
  * prints and a `print` function from its arguments to the value. Constants
@@ -104,6 +116,8 @@ const PKG_DIR = process.env['CSCB_PKG_DIR'] ?? '/test-repo/node_modules/claude-s
 interface EntryContext {
   /** Import a module of the installed package's `src/` (for example `ad-version-gate.ts`). */
   importPackageModule(relPath: string): Promise<Record<string, unknown>>
+  /** Import the agent-director client the installed package resolves. */
+  importAgentDirectorClient(): Promise<Record<string, unknown>>
   /** The value another entry prints for `args` (for an entry that wraps one). */
   entryValue(name: string, args: readonly string[]): Promise<string>
 }
@@ -217,6 +231,56 @@ const personaNotice: Entry = {
   },
 }
 
+/** An error class's constructor as the client builds an error from an envelope. */
+type EnvelopeErrorClass = new (verb: string, errName: string, errDescription: string) => unknown
+
+/**
+ * `classifyAdError(<an instance of the client's class <err-name>>).errorClass`:
+ * CSCB's class for that agent-director error. The instance is built as the
+ * client builds one from an envelope (`spawn`, the name, a description).
+ */
+const adErrorClass: Entry = {
+  synopsis: '<err-name>',
+  async print(args, context) {
+    const entry = 'classifyAdError'
+    expectArguments(entry, args, ['err-name'])
+    const [errName] = args
+    const client = await context.importAgentDirectorClient()
+    const base = client['AgentDirectorError']
+    const errorClass = Object.hasOwn(client, errName) ? client[errName] : undefined
+    if (typeof base !== 'function' || typeof errorClass !== 'function' || !(errorClass.prototype instanceof base)) {
+      fail(PRINTER_FAIL_EXIT, `the installed agent-director client exports no error class ${errName}`)
+    }
+    const instance = new (errorClass as EnvelopeErrorClass)('spawn', errName, `${PRINTER_NAME}: ${errName}`)
+    const classify = await packageFunction<(value: unknown) => { readonly errorClass?: unknown }>(context, 'ad-error-class.ts', entry)
+    return builtString(entry, classify(instance).errorClass)
+  },
+}
+
+/**
+ * `DEFAULT_AD_SETTINGS[<table>][<key>]` in decimal: agent-director's default
+ * for one setting as CSCB records it (an integer, a `bigint` in the package).
+ */
+const adSettingDefault: Entry = {
+  synopsis: '<table> <key>',
+  async print(args, context) {
+    const entry = 'DEFAULT_AD_SETTINGS'
+    expectArguments(entry, args, ['table', 'key'])
+    const [table, key] = args
+    const defaults = await packageExport(context, 'ad-settings.ts', entry)
+    if (typeof defaults !== 'object' || defaults === null) fail(PRINTER_FAIL_EXIT, `the installed package's src/ad-settings.ts export ${entry} is not an object`)
+    const tables = defaults as Record<string, unknown>
+    const values = Object.hasOwn(tables, table) ? tables[table] : undefined
+    if (typeof values !== 'object' || values === null) usageFail(`${entry}: the installed package records no table '${table}'`)
+    const keyed = values as Record<string, unknown>
+    const value = Object.hasOwn(keyed, key) ? keyed[key] : undefined
+    if (value === undefined) usageFail(`${entry}: the installed package records no key '${key}' in table '${table}'`)
+    if (typeof value === 'bigint') return value.toString()
+    if (typeof value === 'number' && Number.isSafeInteger(value)) return String(value)
+    fail(PRINTER_FAIL_EXIT, `the installed package's ${entry}.${table}.${key} is a ${typeof value}, not an integer`)
+  },
+}
+
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = {
   // Scenario 8 (test-20-fmk-old-binary.sh).
@@ -228,6 +292,8 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX: constantEntry('ad-version-gate.ts', 'AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX'),
   INVALID_FLAGS_HOLD_ALERT_TEXT: constantEntry('invalid-flags-hold.ts', 'INVALID_FLAGS_HOLD_ALERT_TEXT'),
   formatPersonaNotice: personaNotice,
+  classifyAdError: adErrorClass,
+  DEFAULT_AD_SETTINGS: adSettingDefault,
 }
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */
@@ -241,6 +307,9 @@ async function entryValue(name: string | undefined, args: readonly string[]): Pr
 const context: EntryContext = {
   async importPackageModule(relPath) {
     return await import(join(PKG_DIR, 'src', relPath))
+  },
+  async importAgentDirectorClient() {
+    return await import(Bun.resolveSync('agent-director', join(PKG_DIR, 'src')))
   },
   entryValue,
 }

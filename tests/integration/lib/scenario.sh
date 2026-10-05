@@ -266,6 +266,24 @@
 #   restore_ad_install [<step>]        move both back, the binary first, then `check_ad_shim`; when
 #                                      the shim cannot move, the binary goes aside again before the
 #                                      step fails
+#   install_ad_stand_in <version|unparseable> <reject|pass> [<step>]
+#                                      harness addition (scenario 8, test-20): put
+#                                      fixtures/ad-version-stand-in.sh behind the shim, through
+#                                      `swap_ad_binary`, after writing its settings beside it
+#                                      (<path>.real.settings): `version` reports <version> (or, for
+#                                      `unparseable`, a line no client parses), `reject` turns every
+#                                      reuse flag into a flag the release does not define, and every
+#                                      call goes to the image's release binary (SCENARIO_RELEASE_BIN);
+#                                      then the shim check and a check that the stand-in is behind it.
+#                                      The fixture's header states the settings format
+#   restore_ad_install_with_stand_in <version|unparseable> <reject|pass> [<step>]
+#                                      harness addition (scenario 8, test-20): after
+#                                      `hide_ad_install`, put the shim back with the stand-in, set as
+#                                      `install_ad_stand_in` sets it, behind it in place of the hidden
+#                                      binary: settings, then the stand-in at <path>.real, then the
+#                                      shim; the hidden binary is removed. When the shim cannot move,
+#                                      the stand-in is removed again (the install stays hidden) before
+#                                      the step fails; then both checks
 #   check_ad_shim [<step>]             fail unless the standard path holds a regular file, not a
 #                                      symlink, executable and carrying the shim's marker, with an
 #                                      executable binary beside it that is not the shim
@@ -608,6 +626,13 @@
 #                                      calls, the stub's lines and its stop line never count
 #   cscb_ad_count <verb> [<fragment>...]
 #                                      print how many lines `cscb_ad_calls` would print
+#   wait_for_cscb_ad_call <count-before> <timeout-s> <step> <verb> [<fragment>...]
+#                                      harness addition (scenario 8, test-20): wait until
+#                                      `cscb_ad_count <verb> [<fragment>...]` is above <count-before>
+#                                      (taken by the caller before the step it waits on), then print
+#                                      the next such line: `cscb_ad_calls`' line <count-before> + 1.
+#                                      Fails naming <step> when the count is not above it within
+#                                      <timeout-s>
 #
 # Line builders (every fragment is quoted from src/; <ref> is `persona_ref`):
 #   persona_start_match   `[slack] persona-start: personas[<index>] <ref>`
@@ -628,6 +653,13 @@
 #                         `"<state dir>/config.json.last-applied"` (src/reload-apply.ts renderAppliedLogLine)
 #   destructive_match     `DESTRUCTIVE: persona <ref>`, then ` <setting> changed` (src/reload-plan.ts
 #                         destructiveLine; matches the pending-file line and its reload-preview log line)
+#
+# Whole values: a scenario that compares a value src/ exports in full (a
+# notice text, class label, version or settings value) takes it from
+# fixtures/fmk-texts.ts, the one value printer, run in the scenario's own
+# shell: `V="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" <entry> [<arg>...])"
+# || fail …`. A value no entry prints yet gets a named entry there, never a
+# second printer (see the printer's header).
 #
 # `start` runs with SLACK_BOT_TOKEN, SLACK_APP_TOKEN and CSCB_PERSONA unset,
 # and with SLACK_DRY_RUN=1 unless `--live` is passed (then SLACK_DRY_RUN is
@@ -748,6 +780,11 @@ SCENARIO_AD_010_BIN=/opt/agent-director-0.10.0/bin/agent-director
 # The agent-director shim and the whole line that marks it.
 SCENARIO_AD_SHIM_SRC="${SCENARIO_FIXTURES}/agent-director-shim.sh"
 SCENARIO_AD_SHIM_MARKER='# CSCB_CI_AGENT_DIRECTOR_SHIM_MARKER'
+
+# The agent-director version stand-in (harness addition, scenario 8) and the
+# whole line that marks it.
+SCENARIO_AD_STAND_IN_SRC="${SCENARIO_FIXTURES}/ad-version-stand-in.sh"
+SCENARIO_AD_STAND_IN_MARKER='# CSCB_CI_AD_VERSION_STAND_IN_MARKER'
 
 # Bound on each tmux kill-server the trap sends, and on the scenario's tmux
 # processes exiting after it, in seconds.
@@ -2039,6 +2076,82 @@ restore_ad_install() {
     fi
     rmdir -- "${aside}" || fail "${step}: could not remove ${aside}"
     check_ad_shim "${step}"
+}
+
+# _scenario_stand_in_settings <step> <version|unparseable> <reject|pass>:
+# write the stand-in's settings file beside the binary behind the shim
+# ($HOME/.agent-director/bin/agent-director.real.settings), atomically, in
+# fixtures/ad-version-stand-in.sh's format, its release_bin the image's
+# release binary. The caller has run both guards.
+_scenario_stand_in_settings() {
+    local step="$1" version="$2" reuse="$3" bin="${HOME}/.agent-director/bin"
+    [[ -n "${version}" && "${version}" != *[[:cntrl:]]* ]] \
+        || fail "${step}: version '${version}' is empty or holds a control character"
+    [[ "${reuse}" == reject || "${reuse}" == pass ]] || fail "${step}: '${reuse}' is neither reject nor pass"
+    [[ -f "${SCENARIO_RELEASE_BIN}" && -x "${SCENARIO_RELEASE_BIN}" ]] \
+        || fail "${step}: the release's binary is missing from the image (${SCENARIO_RELEASE_BIN})"
+    [[ -d "${bin}" && "${bin}" == "${SCENARIO_ROOT}"/* ]] || fail "${step}: refused: ${bin} is not a directory under SCENARIO_ROOT"
+    if [[ "${version}" == unparseable ]]; then
+        printf '%s\n' '# ad-version-stand-in settings (scenario.sh)' report=unparseable \
+            "reuse_finished=${reuse}" "release_bin=${SCENARIO_RELEASE_BIN}"
+    else
+        printf '%s\n' '# ad-version-stand-in settings (scenario.sh)' report=version "version=${version}" \
+            "reuse_finished=${reuse}" "release_bin=${SCENARIO_RELEASE_BIN}"
+    fi | write_file "${bin}/agent-director.real.settings" 0644
+}
+
+# _scenario_check_stand_in <step>: fail unless the binary behind the shim
+# at the standard path carries the stand-in's marker and its settings file
+# is beside it.
+_scenario_check_stand_in() {
+    local real="${HOME}/.agent-director/bin/agent-director.real"
+    grep -qxF -- "${SCENARIO_AD_STAND_IN_MARKER}" "${real}" 2> /dev/null \
+        || fail "$1: the binary behind the shim at ${real} is not the version stand-in"
+    [[ -f "${real}.settings" ]] || fail "$1: no stand-in settings at ${real}.settings"
+}
+
+install_ad_stand_in() {
+    local version="${1:-}" reuse="${2:-}"
+    local step="${3:-install the agent-director version stand-in (${1:-} ${2:-}) behind the shim}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ -f "${SCENARIO_AD_STAND_IN_SRC}" ]] && grep -qxF -- "${SCENARIO_AD_STAND_IN_MARKER}" "${SCENARIO_AD_STAND_IN_SRC}" \
+        || fail "${step}: the stand-in ${SCENARIO_AD_STAND_IN_SRC} is missing or carries no marker"
+    check_ad_shim "${step}: the shim before the stand-in"
+    # The settings first: the stand-in reads them at each call.
+    _scenario_stand_in_settings "${step}" "${version}" "${reuse}"
+    swap_ad_binary "${SCENARIO_AD_STAND_IN_SRC}" "${step}"
+    _scenario_check_stand_in "${step}"
+}
+
+restore_ad_install_with_stand_in() {
+    local version="${1:-}" reuse="${2:-}"
+    local step="${3:-restore the agent-director shim with the version stand-in (${1:-} ${2:-}) behind it}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    local path="${HOME}/.agent-director/bin/agent-director"
+    local aside="${SCENARIO_ROOT}/ad-aside"
+    [[ -f "${SCENARIO_AD_STAND_IN_SRC}" ]] && grep -qxF -- "${SCENARIO_AD_STAND_IN_MARKER}" "${SCENARIO_AD_STAND_IN_SRC}" \
+        || fail "${step}: the stand-in ${SCENARIO_AD_STAND_IN_SRC} is missing or carries no marker"
+    [[ -f "${aside}/agent-director" && -f "${aside}/agent-director.real" ]] \
+        || fail "${step}: nothing hidden in ${aside}"
+    [[ ! -e "${path}" && ! -L "${path}" ]] || fail "${step}: a file is already at ${path}"
+    [[ ! -e "${path}.real" && ! -L "${path}.real" ]] || fail "${step}: a file is already at ${path}.real"
+    _scenario_is_shim "${aside}/agent-director" || fail "${step}: ${aside}/agent-director is not the shim"
+    _scenario_stand_in_settings "${step}" "${version}" "${reuse}"
+    # The stand-in first, so the shim never runs without a binary behind it.
+    _scenario_place "${SCENARIO_AD_STAND_IN_SRC}" "${path}.real" "${step}"
+    if ! mv -- "${aside}/agent-director" "${path}"; then
+        # Take the stand-in away again, so a failed restore leaves the install hidden.
+        rm -f -- "${path}.real" \
+            || fail "${step}: could not restore ${path}, nor remove the stand-in at ${path}.real: the install is half restored"
+        fail "${step}: could not restore ${path} (the install is still hidden in ${aside})"
+    fi
+    # The binary that was hidden with the shim is not put back.
+    rm -f -- "${aside}/agent-director.real" || fail "${step}: could not remove the hidden binary ${aside}/agent-director.real"
+    rmdir -- "${aside}" || fail "${step}: could not remove ${aside}"
+    check_ad_shim "${step}"
+    _scenario_check_stand_in "${step}"
 }
 
 ad() {
@@ -3574,6 +3687,27 @@ cscb_ad_calls() {
 
 cscb_ad_count() {
     _scenario_cscb_ad_scan "cscb_ad_count" count "${1-}" "${@:2}"
+}
+
+# True when `cscb_ad_count <verb> [<fragment>...]` is above <count>.
+_scenario_cscb_ad_above() {
+    local count="$1" n
+    shift
+    n="$(cscb_ad_count "$@")" || return 1
+    (( n > count ))
+}
+
+wait_for_cscb_ad_call() {
+    local before="${1:-}" timeout_s="${2:-}" step="${3:-}" n
+    (( $# >= 4 )) || fail "wait_for_cscb_ad_call: takes <count-before> <timeout-s> <step> <verb> [<fragment>...]"
+    shift 3
+    [[ "${before}" =~ ^[0-9]+$ ]] || fail "${step}: count '${before}' is not a whole number"
+    _scenario_check_timeout "${timeout_s}" "${step}"
+    if ! _scenario_poll_until "${timeout_s}" _scenario_cscb_ad_above "${before}" "$@"; then
+        n="$(cscb_ad_count "$@")" || exit 1
+        fail "${step} (not within ${timeout_s}s; CSCB's calls matching '$*' stayed at ${n}, not above ${before})"
+    fi
+    cscb_ad_calls "$@" | sed -n "$(( before + 1 ))p"
 }
 
 # ---------------------------------------------------------------------------
