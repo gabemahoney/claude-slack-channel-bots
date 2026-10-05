@@ -353,29 +353,39 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
     }
   })
 
-  test("scenario 20's entries are read: the pane-read answer kinds, the probe's still-latched verdict and the default settings table", () => {
-    const named = new Set(reading.refs.map((r) => `${r.file}:${r.name}:${r.kind}`))
-    for (const ref of [
-      'pane-read.ts:PANE_READ_PANE:constant',
-      'pane-read.ts:PANE_READ_CONFLICT:constant',
-      'pane-read.ts:PANE_READ_GONE:constant',
-      'conflict-latch.ts:RECHECK_VERDICT_STILL_LATCHED:constant',
-      'ad-settings.ts:DEFAULT_AD_SETTINGS:defined',
-    ]) {
-      expect(named.has(ref)).toBe(true)
-    }
-  })
+  // Scenario 20's references (test-23), each `<file>:<export>:<kind>`, with
+  // what the scenario reads of the value beyond its kind, when it reads more.
+  const named = new Set(reading.refs.map((r) => `${r.file}:${r.name}:${r.kind}`))
+  const scenario20Values: Readonly<Record<string, () => void>> = {
+    // test-23 prints `DEFAULT_AD_SETTINGS tmux starting_session_seconds`, the
+    // starting-session bound it waits past: a positive number.
+    'ad-settings.ts:DEFAULT_AD_SETTINGS:defined': () => {
+      const tables: unknown = MODULES['ad-settings.ts']?.DEFAULT_AD_SETTINGS
+      const tmux: unknown = typeof tables === 'object' && tables !== null && Object.hasOwn(tables, 'tmux') ? (tables as Record<string, unknown>).tmux : undefined
+      const bound: unknown =
+        typeof tmux === 'object' && tmux !== null && Object.hasOwn(tmux, 'starting_session_seconds')
+          ? (tmux as Record<string, unknown>).starting_session_seconds
+          : undefined
+      expect(typeof bound === 'bigint' || (typeof bound === 'number' && Number.isFinite(bound))).toBe(true)
+      expect(Number(bound)).toBeGreaterThan(0)
+    },
+    // The note a harness `get` shows on Part 1's note persona's row.
+    'row-read-rules.ts:LATCHING_LIVENESS_NOTE:constant': () => {
+      expect(rowReadRules.isLatchingLivenessNote(rowReadRules.LATCHING_LIVENESS_NOTE)).toBe(true)
+    },
+  }
 
-  test("scenario 20's after-clear retry line head is read: session-manager.ts's latchClearRetryAtOnceLineHead, a function", () => {
-    const named = new Set(reading.refs.map((r) => `${r.file}:${r.name}:${r.kind}`))
-    expect(named.has('session-manager.ts:latchClearRetryAtOnceLineHead:function')).toBe(true)
-    expect(typeof sessionManager.latchClearRetryAtOnceLineHead).toBe('function')
-  })
-
-  test("scenario 20's note is read: row-read-rules.ts's LATCHING_LIVENESS_NOTE, a constant, the note isLatchingLivenessNote accepts", () => {
-    const named = new Set(reading.refs.map((r) => `${r.file}:${r.name}:${r.kind}`))
-    expect(named.has('row-read-rules.ts:LATCHING_LIVENESS_NOTE:constant')).toBe(true)
-    expect(rowReadRules.isLatchingLivenessNote(rowReadRules.LATCHING_LIVENESS_NOTE)).toBe(true)
+  test.each([
+    'pane-read.ts:PANE_READ_PANE:constant',
+    'pane-read.ts:PANE_READ_CONFLICT:constant',
+    'pane-read.ts:PANE_READ_GONE:constant',
+    'conflict-latch.ts:RECHECK_VERDICT_STILL_LATCHED:constant',
+    'ad-settings.ts:DEFAULT_AD_SETTINGS:defined',
+    'session-manager.ts:latchClearRetryAtOnceLineHead:function',
+    'row-read-rules.ts:LATCHING_LIVENESS_NOTE:constant',
+  ])("scenario 20's printer reads %s", (ref) => {
+    expect(named.has(ref)).toBe(true)
+    scenario20Values[ref]?.()
   })
 
   test('every file the printer names is a src/ module this file imports', () => {

@@ -343,7 +343,8 @@ tests/
                                    # least two still-latched rounds per case; a same-case re-refusal posts nothing; each case latches with exactly one
                                    # post; the cadence retries clear with no CSCB `find-missing` before them; each probe clear makes exactly one
                                    # `find-missing` and one retry; each clear makes one recovery post; the unusable recorded name is re-checked by
-                                   # `status` alone and stays latched to the end. Finished rows come from the stub's exit (`stub_type_exit`: the
+                                   # `status` alone and stays latched to the end (its rounds checked to the end); no CSCB `find-missing` comes from
+                                   # the last latch to the batched clear, a window holding only still-latched rounds. Finished rows come from the stub's exit (`stub_type_exit`: the
                                    # worker's SessionEnd hooks make agent-director mark the row `ended`); no step passes `--include-finished`.
                                    # Then, in run order, the cases cleared only once their row reads `missing`. "Launch start not recorded": the
                                    # set-up stop seeds the persona's live row `pending` with no launch start (`ad_store_pending_no_launch`; it
@@ -361,7 +362,8 @@ tests/
                                    # never clears the latch (the row's state and row_version unchanged). After the last clearing round above, right
                                    # after one more round of each leg, the harness respawns leg 1's worker pane with `sleep` (the relabelled
                                    # session stays) and ends leg 2's session by its id, then starts its find-missing loop (`run_find_missing_loop`,
-                                   # every 30 s), which marks each leg's row `missing`. Leg 1: the next round is one `status`, one `get` and one
+                                   # every 30 s), which marks each leg's row `missing` (no CSCB `find-missing` from the legs' events to the harness
+                                   # read showing it; whose `find-missing` it was is logged). Leg 1: the next round is one `status`, one `get` and one
                                    # `resume`, refused with "left over from an earlier life": it relatches with one new post and no recovery post,
                                    # each following round is `status` then `resume`, and it stays latched to the end. Leg 2: the same round's
                                    # `resume` launches, and it clears with one recovery post ("its row finished and a relaunch was not refused"),
@@ -369,8 +371,10 @@ tests/
                                    # serves the latched personas' rows; the loop's calls are the harness's, never counted as CSCB's. Modes: tmux
                                    # shim `log`, the stub's dev-channels hold (report-in at once for the note persona and the pane-not-found persona's relaunch; the unrecognised-dialog mode for the held-dialog persona's latch life, then report-in at once),
                                    # `health_check_interval` 0 (so the waiting-row `read-pane` a health tick makes is not shown; the reconnect
-                                   # comes from a server restart), agent-director's defaults (no config.toml). It runs about 32 minutes (Part 1 about 8.5, Part 2 about 24) and ends
-                                   # with the loop stopped, a plain `stop`, then the three closing assertions
+                                   # comes from a server restart), agent-director's defaults (no config.toml). It runs about 33 minutes (Part 1 about 8.5, Part 2 about 25) and ends
+                                   # with the loop stopped, a plain `stop`, the personas still latched (the unusable recorded name, leg 1, and
+                                   # "launch start not recorded" when its retry left it latched) keeping their rows and sessions, then the three
+                                   # closing assertions
     test-27-fmk-unusable-name.sh  # HO §7 scenario 25 (b.jg5 SRJ-1427), fmk: an unusable recorded name latches with no tmux call; after the harness's delete it clears and comes up fresh
                                    # Set-up: in the first life persona `unusable` (U) reaches `waiting`; the harness types the stub's exit sentinel into its
                                    # pane (a human quitting Claude Code), so the row ends; then `stop --stop-bots`. With the server stopped, E39's scenario

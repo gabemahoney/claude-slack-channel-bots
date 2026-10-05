@@ -95,7 +95,9 @@
 #      note. So, with the server stopped, the harness's statement
 #      (p1_proc_starttime) sets the live row's proc_starttime NULL; with no
 #      Part 2 persona on the store or the tmux server (p1_only, a fail check
-#      whenever the global value is set), the global `@ad_owner` value is set
+#      whenever the global value is set: a failed tmux listing fails it, and
+#      the note persona's row and session are its positive controls), the
+#      global `@ad_owner` value is set
 #      (ad_owner_global_set); one harness `find-missing` leaves the row
 #      `waiting` with the note (a harness `get` shows `liveness_note`
 #      LATCHING_LIVENESS_NOTE); the value is unset (ad_owner_global_unset)
@@ -145,8 +147,9 @@
 #   6. The checks, from the logs (p1_checks), in this order:
 #        - the note persona's rounds while the note showed: each one `get`
 #          alone at the cadence, no post beyond the latch's, at least
-#          MIN_LATCHED_ROUNDS before the unset, the row's state as at the
-#          latch;
+#          MIN_LATCHED_ROUNDS before the unset, the row's state (the store
+#          read taken once the note was gone, before the clearing round) as
+#          at the latch;
 #        - its clearing round: one `get` at the cadence, then one run of the
 #          restart path's decision on the live row (no `resume`, `kill`,
 #          `kill-finished` or `delete`, at most the ladder's plain spawn,
@@ -361,11 +364,12 @@
 #          harness selects `at-once` for its stub and ends its session by
 #          its id;
 #        the unusable recorded name keeps its rounds to the end; its rounds
-#          so far are taken right after its round in R5;
+#          so far are taken right after its round in R5 (and its rounds to
+#          the end in step 7);
 #        the relabelled legs' events (p2_relabel_events): right after one
-#          more round of each leg, the harness respawns leg 1's worker pane
-#          with `sleep` and ends leg 2's session by its id (END_MARK), then
-#          starts the find-missing loop (LOOP_MARK);
+#          more round of each leg (RELABEL_EVENTS_MARK), the harness respawns
+#          leg 1's worker pane with `sleep` and ends leg 2's session by its
+#          id (END_MARK), then starts the find-missing loop (LOOP_MARK);
 #        the legs' rounds (p2_relabel_rounds): a harness read shows each
 #          leg's row `missing` (the loop's mark); leg 1's next round's line
 #          (the finished-row retry, relatched with "left over from an earlier
@@ -373,9 +377,12 @@
 #          latched) are seen; leg 2's next round's line (the finished-row
 #          retry, cleared) is seen.
 #      Then the checks, from the logs (p2_checks, then p2_relabel_checks):
+#        - from the last latch to the batched round's clearing event (a window
+#          holding only still-latched rounds; a `find-missing` carries no
+#          instance id, so it is checked whole), no CSCB `find-missing`;
 #        - the round checker (check_latched_rounds), for every latched
 #          persona between its latch and its clearing event (for the unusable
-#          recorded name, its round in R5): its
+#          recorded name, its round in R5, and again to the end in step 7): its
 #          CSCB-parented shim lines naming its id are exactly, round by round,
 #          one `status` then the table's call (`latch_rounds`; read from the
 #          shim's argv: a `spawn` with or without `--reuse-finished`, a
@@ -418,13 +425,19 @@
 #          (the approver's read of a `pending` row);
 #        - the loop (check_loop_runs): its `find-missing` lines have the
 #          loop's subshell as their parent, none reads as a CSCB process's,
-#          the first comes after leg 2's end; the harness ran no
-#          `find-missing` in Part 2 before the loop;
+#          the first comes after leg 2's end; its log holds at least one run
+#          since Part 2's loop started (the log is shared with Part 1's
+#          loop); the harness ran no `find-missing` in Part 2 before the loop;
+#        - each leg's mark (check_relabel_marked): from the legs' events to
+#          the harness read showing the leg's row `missing` (a window holding
+#          only still-latched rounds), no CSCB `find-missing`, and at least
+#          one of the loop's, which marked the row; every `find-missing` line
+#          there is logged with whose it was;
 #        - AC 44 (check_nothing_typed): from the latch life's start to each
 #          leg's event, no tmux send-keys, send-prefix or paste-buffer
-#          reached the relabelled worker pane (by pane id, session id or
-#          name; the tmux shim's log); positive control: the first life's
-#          approver's send-keys into it;
+#          reached the relabelled worker pane (by pane id, window id, session
+#          id or name; the tmux shim's log); positive control: the first
+#          life's approver's send-keys into it;
 #        - each leg's rounds up to its event: the round checker (each
 #          `status` alone, at the cadence, no post) and the row's state and
 #          row_version as read at the latch (a live reading never clears);
@@ -455,15 +468,24 @@
 #          post, the printed one, right after the latch's notice. The
 #          retry's calls and answer, any later post and the row's state are
 #          logged (ruling S8).
-#   7. The loop stopped, then a plain `stop` (no --stop-bots, so no `pause`
+#   7. The loop stopped; right after the unusable recorded name's next round,
+#      the round checker over its whole latched span (each round one
+#      `status` alone, at the cadence, and the latch's notice its only post);
+#      then a plain `stop` (no --stop-bots, so no `pause`
 #      of any stub: each would wait out its 30 s timeout and the stop would
 #      pass its 90 s bound), then the closing assertions. The bots keep
-#      running; the trap ends them with the scenario's tmux server. The
-#      persona still latched with the unusable name keeps its row, which
-#      still records that name, and its latch never cleared (no clear line);
-#      leg 1 stayed latched (no clear line, no recovery post); every row is
-#      present; no counted launch-failure line names a Part 2 persona but
-#      "launch start not recorded"'s, whose count is logged (ruling S8).
+#      running; the trap ends them with the scenario's tmux server. Every
+#      row is present. The personas still latched keep their rows and
+#      sessions (each one's last latch-set, relatch or clear line in
+#      server.log is a latch-set or relatch line): the unusable recorded
+#      name, whose row still records that name, whose latch never cleared
+#      (no clear line) and for which no session was made (it had none at its
+#      latch); leg 1 (no clear line, no recovery post), its relabelled
+#      session still holding its name; "launch start not recorded" when its
+#      retry left it latched (logged otherwise, ruling S8), its session
+#      still holding its name. No counted launch-failure line names a Part 2
+#      persona but "launch start not recorded"'s, whose count is logged
+#      (ruling S8).
 #
 # Waits and their derivation (seconds): STUB_WAIT_S (20) for the Slack
 # stub's ready file; START_WAIT_S (120) per start pass and for each latch-set
@@ -483,7 +505,9 @@
 # interval and twice SETTLE_S for its n-th round from the latch. A leg's row is read
 # `missing` within the loop's interval (SCENARIO_FIND_MISSING_INTERVAL_S, 30)
 # plus 60 of the loop's start (its first run is at once); each leg's next
-# round line is waited for within twice the interval plus twice SETTLE_S.
+# round line is waited for within twice the interval plus twice SETTLE_S;
+# at the end, the unusable recorded name's next round line within the
+# interval plus twice SETTLE_S.
 # Part 1: the approver's first `read-pane` of the held-dialog persona's row
 # within START_WAIT_S of the note persona's latch-set line; its report-in
 # after the Enter within REPORT_WAIT_S; round k+1's line within the sum of
@@ -493,13 +517,14 @@
 # within the loop's interval plus 60 of the loop's start; the note persona's
 # clearing round line within twice the sum of the interval and twice
 # SETTLE_S; the held-dialog persona's worker's end within EXIT_WAIT_S.
-# Expected runtime: about 32 minutes. Part 1 about 8.5 (its first life and
+# Expected runtime: about 33 minutes. Part 1 about 8.5 (its first life and
 # the note under 0.5, the held-dialog persona's rounds k and k+1 and the note
 # persona's clearing round about 6, the checks and the end under 2); Part 2
-# about 24 (the first life and the age wait about 5.5, the set-up stop under
+# about 25 (the first life and the age wait about 5.5, the set-up stop under
 # 1, the latch life's rounds to the last clearing round about 11, one more
-# leg round, the retry round and the following round about 6, and the
-# checks).
+# leg round, the retry round and the following round about 6, the checks,
+# and the wait for the unusable recorded name's next round at the end, up to
+# 2.5).
 #
 # Matched values. CSCB's values come from fixtures/fmk-texts.ts, printed from
 # the installed package, never retyped:
@@ -1175,11 +1200,11 @@ declare -A SEED_SID=() LATCH_MARK=() LATCH_US=() SESSION_OF=() POSTS_BEFORE=() L
 declare -A STILL_LINE=() ROUND_HEAD=() FREE_ROUNDS=() FREE_MARK=() FREE_POSTS=() FREE_CONNECTS=() FREE_STATE=() FREE_RV=()
 declare -A PREV_US=()
 declare -A ROUND_END_HEAD=() ROUND_END_MARK=()
-# The "not this launch's session" legs, by key: the relabelled worker pane;
-# the tmux shim's mark at the harness's event (the pane respawn, or the
-# session's end); the shim mark once a harness read showed the row missing;
-# the shim mark once the leg's last checked round line was seen.
-declare -A SEED_PANE=() EVENT_TMUX_MARK=() MISSING_MARK=()
+# The "not this launch's session" legs, by key: the relabelled worker pane and
+# its window; the tmux shim's mark at the harness's event (the pane respawn,
+# or the session's end); the shim mark once a harness read showed the row
+# missing.
+declare -A SEED_PANE=() SEED_WID=() EVENT_TMUX_MARK=() MISSING_MARK=()
 
 echo "${TEST_NAME}: Part 2's per-case table:"
 for key in "${P2_KEYS[@]}"; do
@@ -1258,10 +1283,14 @@ note_gone() {
 }
 
 # p1_only <step>: no Part 2 persona exists: every row in the store and every
-# session on the scenario's tmux server is a Part 1 persona's.
+# session on the scenario's tmux server is a Part 1 persona's; fails when
+# tmux cannot list the sessions. Positive controls: the note persona's row
+# and its session are among them (both exist at every call).
 p1_only() {
-    local step="$1" ids id names name key ok
+    local step="$1" ids id names name key ok err="${SCENARIO_ROOT}/p1-only-tmux.err"
     ids="$(_scenario_store_read "${step}" "SELECT claude_instance_id FROM spawns")" || exit 1
+    grep -q -x -F -e "${PERSONA_ID[${CN_KEY}]}" <<< "${ids}" \
+        || fail "${step}: positive control: the store's ids ($(tr '\n' ' ' <<< "${ids}")) do not hold the note persona's ${PERSONA_ID[${CN_KEY}]}"
     while IFS= read -r id; do
         [[ -n "${id}" ]] || continue
         ok=0
@@ -1270,7 +1299,10 @@ p1_only() {
         done
         (( ok )) || fail "${step}: the store holds row ${id}, not a Part 1 persona's"
     done <<< "${ids}"
-    names="$("${SCENARIO_REAL_TMUX}" list-sessions -F '#{session_name}' 2> /dev/null)" || names=""
+    names="$("${SCENARIO_REAL_TMUX}" list-sessions -F '#{session_name}' 2> "${err}")" \
+        || fail "${step}: tmux list-sessions failed: $(head -c 300 "${err}")"
+    grep -q -x -F -e "${PERSONA_NAMED[${CN_KEY}]}" <<< "${names}" \
+        || fail "${step}: positive control: the scenario's tmux sessions ($(tr '\n' ' ' <<< "${names}")) do not hold the note persona's ${PERSONA_NAMED[${CN_KEY}]}"
     while IFS= read -r name; do
         [[ -n "${name}" ]] || continue
         ok=0
@@ -1342,6 +1374,7 @@ p1_life1() {
 # proc_starttime the row held before, as JSON.
 p1_proc_starttime() {
     local step="$1" id="$2" value="$3" before after rv old out sql
+    _scenario_check_instance_id "${step}" "${id}"
     case "${value}" in
         null) sql=NULL ;;
         *) [[ "${value}" =~ ^\"?([0-9]+)\"?$ ]] || fail "${step}: proc_starttime '${value}' is not null or a whole number"
@@ -1543,7 +1576,7 @@ p1_latch_life() {
 # a harness read shows the row `waiting`; then its round k+1's clear.
 p1_ac43() {
     local step="part 1: AC 43" k="${MIN_LATCHED_ROUNDS}" id="${PERSONA_ID[${HD_KEY}]}" n line
-    wait_rounds "${HD_KEY}" "${STILL_LINE[${HD_KEY}]}" "${k}" "${k}"
+    wait_rounds "part 1" "${HD_KEY}" "${STILL_LINE[${HD_KEY}]}" "${k}" "${k}"
     P1_K_MARK="$(ad_shim_mark)"
     n="$(count_log "${ROUND_HEAD[${HD_KEY}]}")"
     (( n == k )) || fail "${step}: ${HD_KEY} has ${n} round lines at the harness's steps, not ${k}"
@@ -1551,7 +1584,7 @@ p1_ac43() {
     FREE_MARK[${HD_KEY}]="${P1_K_MARK}"
     # The note persona latched first, so its round k comes first; it is
     # waited for here (a few seconds at most), inside the interval.
-    wait_rounds "${CN_KEY}" "${STILL_LINE[${CN_KEY}]}" "${k}" "${k}"
+    wait_rounds "part 1" "${CN_KEY}" "${STILL_LINE[${CN_KEY}]}" "${k}" "${k}"
     p1_only "${step}: before the unset"
     CN_ROUNDS_AT_UNSET="$(count_log "${STILL_LINE[${CN_KEY}]}")"
     ad_owner_global_unset
@@ -1568,7 +1601,7 @@ p1_ac43() {
     line="$(fmk_text latchRecheckRoundLine "${PERSONA_NAME[${HD_KEY}]}" "${CASE_CONFLICTING_LABELS}" "${STEP_REPORTED_IN}" "${CALL_NONE}" \
         "cleared (${STEP_REPORTED_IN})")" || fail "${step}: fmk-texts.ts could not print latchRecheckRoundLine"
     ROUND_END_HEAD[${HD_KEY}]="${line}"
-    wait_rounds "${HD_KEY}" "${line}" 1 1
+    wait_rounds "part 1" "${HD_KEY}" "${line}" 1 1
     ROUND_END_MARK[${HD_KEY}]="$(ad_shim_mark)"
 }
 
@@ -1593,7 +1626,12 @@ p1_note_clear() {
     echo "${TEST_NAME}: ${step}: the harness's find-missing loop started (PID ${P1_LOOP_PID}, every ${FIND_MISSING_LOOP_INTERVAL_S} s)"
     wait_until $(( FIND_MISSING_LOOP_INTERVAL_S + 60 )) "${step}: a harness get of ${id} still shows the note" note_gone "${id}"
     P1_NOTE_GONE_MARK="$(ad_shim_mark)"
-    echo "${TEST_NAME}: ${step}: [S8, recorded] the note was removed by ${who}; a harness get shows none (shim mark ${P1_NOTE_GONE_MARK}; the loop's runs so far: $(find_missing_loop_runs))"
+    # The row's state once the note is gone, before the clearing round
+    # (checked against the latch's in p1_check_note_rounds).
+    store_row "${step}" "${id}"
+    FREE_STATE[${CN_KEY}]="${STORE_STATE}"
+    FREE_RV[${CN_KEY}]="${STORE_RV}"
+    echo "${TEST_NAME}: ${step}: [S8, recorded] the note was removed by ${who}; a harness get shows none (shim mark ${P1_NOTE_GONE_MARK}; ${id} reads ${STORE_STATE} at row_version ${STORE_RV} in the store; the loop's runs so far: $(find_missing_loop_runs))"
     FREE_ROUNDS[${CN_KEY}]="$(count_log "${STILL_LINE[${CN_KEY}]}")"
     FREE_MARK[${CN_KEY}]="${P1_NOTE_GONE_MARK}"
     FREE_POSTS[${CN_KEY}]="$(post_count "${CN_KEY}")" || exit 1
@@ -1623,7 +1661,8 @@ cscb_find_missing_after() {
 # p1_check_note_rounds: the note persona's rounds while the note showed (up
 # to the harness get that showed none): each one `get` alone, at the cadence,
 # with no post beyond the latch's; at least MIN_LATCHED_ROUNDS of them before
-# the unset; the row keeps the state read at the latch.
+# the unset; the row keeps the state read at the latch (the store read taken
+# when the note was gone, before the clearing round: p1_note_clear).
 p1_check_note_rounds() {
     local key="${CN_KEY}" step="part 1: ${CN_KEY}'s note rounds" id="${PERSONA_ID[${CN_KEY}]}" rounds n i=0 prev s_pos s_us
     n="${FREE_ROUNDS[${key}]}"
@@ -1645,9 +1684,9 @@ p1_check_note_rounds() {
     PREV_US[${key}]="${prev}"
     (( FREE_POSTS[${key}] - POSTS_BEFORE[${key}] == 1 )) \
         || fail "${step}: ${PERSONA_CHANNEL[${key}]} held $(( FREE_POSTS[${key}] - POSTS_BEFORE[${key}] )) posts while the note showed, not only the latch's notice"
-    store_row "${step}" "${id}"
-    [[ "${STORE_STATE}" == "${LATCH_STATE[${key}]}" ]] || fail "${step}: ${id} reads ${STORE_STATE}, not ${LATCH_STATE[${key}]} as at the latch"
-    echo "${TEST_NAME}: ${step}: ${i} round(s) while the note showed (${CN_ROUNDS_AT_UNSET} before the unset), each one get alone; no post beyond the latch's"
+    [[ "${FREE_STATE[${key}]}" == "${LATCH_STATE[${key}]}" ]] \
+        || fail "${step}: ${id} read ${FREE_STATE[${key}]} in the store once the note was gone, not ${LATCH_STATE[${key}]} as at the latch"
+    echo "${TEST_NAME}: ${step}: ${i} round(s) while the note showed (${CN_ROUNDS_AT_UNSET} before the unset), each one get alone; no post beyond the latch's; ${id} read ${FREE_STATE[${key}]} once the note was gone, as at the latch"
 }
 
 # p1_check_note_clear: the note persona's round after the note was gone: one
@@ -1860,14 +1899,18 @@ p2_life1() {
 # ---------------------------------------------------------------------------
 
 p2_age_wait() {
-    local step="part 2: the own-id persona's session age" session="${PERSONA_NAMED[${OI_KEY}]}" created age want
+    local step="part 2: the own-id persona's session age" session="${PERSONA_NAMED[${OI_KEY}]}" created age want timeout_s
     created="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${session}:" '#{session_created}')" \
         || fail "${step}: tmux gives no creation time for ${session}"
     [[ "${created}" =~ ^[0-9]+$ ]] || fail "${step}: tmux gave session_created '${created}' for ${session}"
     want=$(( BOUND_S + AGE_MARGIN_S ))
     age=$(( $(date +%s) - created ))
+    # The wait's bound, at least 0 (a session already old enough is checked
+    # once).
+    timeout_s=$(( want - age + 10 ))
+    (( timeout_s >= 0 )) || timeout_s=0
     echo "${TEST_NAME}: ${step}: ${session} is ${age} s old; waiting until it is more than ${want} s old"
-    wait_until $(( want - age + 10 )) "${step}: ${session} never became more than ${want} s old" \
+    wait_until "${timeout_s}" "${step}: ${session} never became more than ${want} s old" \
         session_older_than "${session}" "${want}"
 }
 
@@ -1977,12 +2020,15 @@ p2_setup_relabel() {
     relabel_session "${session}" > "${SCENARIO_ROOT}/p2-${key}-relabel.out"
     SEED_SID[${key}]="${SEEDED_SESSION_ID}"
     SEED_PANE[${key}]="${SEEDED_PANE_ID}"
+    SEED_WID[${key}]="$("${SCENARIO_REAL_TMUX}" display-message -p -t "${SEEDED_PANE_ID}" '#{window_id}')" \
+        || fail "${step}: tmux gives no window id for ${SEEDED_PANE_ID}"
+    [[ "${SEED_WID[${key}]}" =~ ^@[0-9]+$ ]] || fail "${step}: tmux gave window id '${SEED_WID[${key}]}' for ${SEEDED_PANE_ID}"
     current="$(_scenario_store_read "${step}" "SELECT COALESCE(launch_token, '') FROM spawns WHERE claude_instance_id = '${id}'")" \
         || exit 1
     [[ "${current}" =~ ^[0-9a-f]{16}$ && "${current}" != "${SEEDED_TOKEN}" ]] \
         || fail "${step}: ${id} records launch token '${current}', not one other than the label's ${SEEDED_TOKEN}"
     row_reads "${step}" "${id}" waiting || fail "${step}: ${id} reads '${ROW_STATE}' after the relabel, not waiting"
-    echo "${TEST_NAME}: ${step}: ${session} (${SEEDED_SESSION_ID}, worker pane ${SEEDED_PANE_ID}) labelled with token ${SEEDED_TOKEN}; the row records ${current} and reads waiting"
+    echo "${TEST_NAME}: ${step}: ${session} (${SEEDED_SESSION_ID}, window ${SEED_WID[${key}]}, worker pane ${SEEDED_PANE_ID}) labelled with token ${SEEDED_TOKEN}; the row records ${current} and reads waiting"
 }
 
 # The "launch start not recorded" persona [harness]: E39's statement
@@ -2325,13 +2371,15 @@ p2_latch_life() {
 # Part 2: the clearing schedule (light steps only; the checks come after)
 # ---------------------------------------------------------------------------
 
-# wait_rounds <key> <matcher> <n> <round>: wait for <n> lines matching
-# <matcher>, the persona's <round>-th round from its latch being the last.
+# wait_rounds <part> <key> <matcher> <n> <round>: wait for <n> lines matching
+# <matcher>, the persona's <round>-th round from its latch (or from the
+# caller's starting point) being the last; <part> (`part 1`, `part 2`, `end`)
+# heads the failure's step.
 wait_rounds() {
-    local key="$1" m="$2" n="$3" round="$4"
+    local part="$1" key="$2" m="$3" n="$4" round="$5"
     if ! _scenario_poll_until $(( round * (INTERVAL_S + 2 * SETTLE_S) )) _scenario_log_count_at_least "${m}" "${n}"; then
         latch_lines_of "${key}"
-        fail "part 2: ${key}'s round ${round}: fewer than ${n} round line(s) '$(matcher_text "${m}")'"
+        fail "${part}: ${key}'s round ${round}: fewer than ${n} round line(s) '$(matcher_text "${m}")'"
     fi
 }
 
@@ -2363,9 +2411,12 @@ p2_clearing_schedule() {
     # R1 and R2: every batched persona still latched; then [harness] the
     # batched round's clearing event: the names are freed.
     for key in "${P2_BATCH_KEYS[@]}"; do
-        wait_rounds "${key}" "${ROUND_HEAD[${key}]}" "${MIN_LATCHED_ROUNDS}" "${MIN_LATCHED_ROUNDS}"
+        wait_rounds "part 2" "${key}" "${ROUND_HEAD[${key}]}" "${MIN_LATCHED_ROUNDS}" "${MIN_LATCHED_ROUNDS}"
     done
     step="part 2: the batched round's clearing event"
+    # The shim mark right before the event: the end of the window from the
+    # last latch in which every round is still latched (no CSCB find-missing).
+    BATCH_EVENT_MARK="$(ad_shim_mark)"
     for key in "${NL_KEY}" "${AS_KEY}" "${LO_KEY}" "${SL_KEY}" "${DS_KEY}"; do
         end_session "${SEED_SID[${key}]}"
     done
@@ -2380,9 +2431,9 @@ p2_clearing_schedule() {
     # The batched round (R3) and the own-id persona's R3; then [harness] the
     # own-id round's clearing event: its session ended by its id.
     for key in "${P2_BATCH_KEYS[@]}"; do
-        wait_rounds "${key}" "${ROUND_HEAD[${key}]}" $(( MIN_LATCHED_ROUNDS + 1 )) $(( MIN_LATCHED_ROUNDS + 1 ))
+        wait_rounds "part 2" "${key}" "${ROUND_HEAD[${key}]}" $(( MIN_LATCHED_ROUNDS + 1 )) $(( MIN_LATCHED_ROUNDS + 1 ))
     done
-    wait_rounds "${OI_KEY}" "${STILL_LINE[${OI_KEY}]}" $(( MIN_LATCHED_ROUNDS + 1 )) $(( MIN_LATCHED_ROUNDS + 1 ))
+    wait_rounds "part 2" "${OI_KEY}" "${STILL_LINE[${OI_KEY}]}" $(( MIN_LATCHED_ROUNDS + 1 )) $(( MIN_LATCHED_ROUNDS + 1 ))
     step="part 2: the own-id round's clearing event"
     n="$(count_log "${ROUND_HEAD[${OI_KEY}]}")"
     (( n == MIN_LATCHED_ROUNDS + 1 )) || fail "${step}: ${OI_KEY} has ${n} round lines at its clearing event, not $(( MIN_LATCHED_ROUNDS + 1 ))"
@@ -2396,9 +2447,9 @@ p2_clearing_schedule() {
     ROUND_END_HEAD[${OI_KEY}]="$(fmk_text latchRecheckRoundLine "${PERSONA_NAME[${OI_KEY}]}" "${CASE_OWN_ID}" "${STEP_TABLE}" \
         "${CALL_PROBE}+find-missing+${RETRY_OF[${OI_KEY}]}" "probe-cleared (${KIND_GONE}); ")" \
         || fail "part 2: fmk-texts.ts could not print latchRecheckRoundLine"
-    wait_rounds "${OI_KEY}" "$(matcher "${ROUND_END_HEAD[${OI_KEY}]}" "cleared (")" 1 $(( MIN_LATCHED_ROUNDS + 2 ))
+    wait_rounds "part 2" "${OI_KEY}" "$(matcher "${ROUND_END_HEAD[${OI_KEY}]}" "cleared (")" 1 $(( MIN_LATCHED_ROUNDS + 2 ))
     ROUND_END_MARK[${OI_KEY}]="$(ad_shim_mark)"
-    wait_rounds "${PN_KEY}" "${STILL_LINE[${PN_KEY}]}" $(( MIN_LATCHED_ROUNDS + 2 )) $(( MIN_LATCHED_ROUNDS + 2 ))
+    wait_rounds "part 2" "${PN_KEY}" "${STILL_LINE[${PN_KEY}]}" $(( MIN_LATCHED_ROUNDS + 2 )) $(( MIN_LATCHED_ROUNDS + 2 ))
     step="part 2: the pane-not-found round's clearing event"
     n="$(count_log "${ROUND_HEAD[${PN_KEY}]}")"
     (( n == MIN_LATCHED_ROUNDS + 2 )) || fail "${step}: ${PN_KEY} has ${n} round lines at its clearing event, not $(( MIN_LATCHED_ROUNDS + 2 ))"
@@ -2411,12 +2462,12 @@ p2_clearing_schedule() {
     ROUND_END_HEAD[${PN_KEY}]="$(fmk_text latchRecheckRoundLine "${PERSONA_NAME[${PN_KEY}]}" "${CASE_PANE_NOT_FOUND}" "${STEP_TABLE}" \
         "${CALL_PROBE}+find-missing+${RETRY_OF[${PN_KEY}]}" "probe-cleared (${KIND_GONE}); ")" \
         || fail "part 2: fmk-texts.ts could not print latchRecheckRoundLine"
-    wait_rounds "${PN_KEY}" "$(matcher "${ROUND_END_HEAD[${PN_KEY}]}" "cleared (")" 1 $(( MIN_LATCHED_ROUNDS + 3 ))
+    wait_rounds "part 2" "${PN_KEY}" "$(matcher "${ROUND_END_HEAD[${PN_KEY}]}" "cleared (")" 1 $(( MIN_LATCHED_ROUNDS + 3 ))
     ROUND_END_MARK[${PN_KEY}]="$(ad_shim_mark)"
 
     # The unusable recorded name, still latched: its rounds so far (as many
     # as the pane-not-found persona's), taken right after its last.
-    wait_rounds "${UN_KEY}" "${STILL_LINE[${UN_KEY}]}" $(( MIN_LATCHED_ROUNDS + 3 )) $(( MIN_LATCHED_ROUNDS + 3 ))
+    wait_rounds "part 2" "${UN_KEY}" "${STILL_LINE[${UN_KEY}]}" $(( MIN_LATCHED_ROUNDS + 3 )) $(( MIN_LATCHED_ROUNDS + 3 ))
     n="$(count_log "${STILL_LINE[${UN_KEY}]}")"
     free_snapshot "${UN_KEY}" "${n}"
     # A leg that joins Part 2 adds its clearing event here, in a round of its
@@ -2443,8 +2494,12 @@ p2_relabel_events() {
         want[${key}]=$(( n + 1 ))
     done
     for key in "${P2_RELABEL_KEYS[@]}"; do
-        wait_rounds "${key}" "${STILL_LINE[${key}]}" "${want[${key}]}" "${want[${key}]}"
+        wait_rounds "part 2" "${key}" "${STILL_LINE[${key}]}" "${want[${key}]}" "${want[${key}]}"
     done
+    # The agent-director shim's mark right before the events: from here to
+    # each leg's MISSING_MARK, every find-missing is checked (no CSCB one; the
+    # loop's marked the rows).
+    RELABEL_EVENTS_MARK="$(ad_shim_mark)"
     EVENT_TMUX_MARK[${R1_KEY}]="$(tmux_shim_mark)"
     out="$(respawn_worker_pane "${SEED_PANE[${R1_KEY}]}" sleep 86400)" || exit 1
     EVENT_TMUX_MARK[${R2_KEY}]="$(tmux_shim_mark)"
@@ -2458,6 +2513,9 @@ p2_relabel_events() {
     has_session_id "${SEED_SID[${R1_KEY}]}" || fail "${step}: ${R1_KEY}'s relabelled session ${SEED_SID[${R1_KEY}]} is gone after the respawn"
     echo "${TEST_NAME}: ${step}: the harness respawned ${R1_KEY}'s worker pane (pane and new pid ${out}; ${SEED_SID[${R1_KEY}]} stays) and ended ${PERSONA_NAMED[${R2_KEY}]} (${SEED_SID[${R2_KEY}]})"
     LOOP_MARK="$(ad_shim_mark)"
+    # The loop's log is shared with Part 1's loop: Part 2's runs are those
+    # logged after this count.
+    P2_LOOP_RUNS_BEFORE="$(find_missing_loop_runs)"
     run_find_missing_loop
     echo "${TEST_NAME}: part 2: the harness's find-missing loop started (PID ${FIND_MISSING_LOOP_PID}, every ${FIND_MISSING_LOOP_INTERVAL_S} s)"
 }
@@ -2504,12 +2562,13 @@ p2_relabel_rounds() {
 # Part 2: the checks, from the logs
 # ---------------------------------------------------------------------------
 
-# check_latched_rounds <key>: the round checker (see the header, life 6),
-# from the persona's latch to its clearing event's mark (FREE_MARK), with
-# FREE_ROUNDS still-latched round lines and FREE_POSTS posts then. Sets
-# PREV_US to the last round's status time.
+# check_latched_rounds <key> [<part>]: the round checker (see the header,
+# life 6), from the persona's latch to its clearing event's mark (FREE_MARK),
+# with FREE_ROUNDS still-latched round lines and FREE_POSTS posts then
+# (<part>, by default `part 2`, heads the step). Sets PREV_US to the last
+# round's status time.
 check_latched_rounds() {
-    local key="$1" step="part 2: $1's still-latched rounds" id="${PERSONA_ID[$1]}" rounds n i=0 prev to posts
+    local key="$1" step="${2:-part 2}: $1's still-latched rounds" id="${PERSONA_ID[$1]}" rounds n i=0 prev to posts
     local s_pos s_us c_pos c_us
     n="${FREE_ROUNDS[${key}]}"
     to="${FREE_MARK[${key}]}"
@@ -2663,8 +2722,29 @@ check_probe_clear() {
 }
 
 
+# check_no_cscb_find_missing <step> <from-mark> <to-mark> <window>: the
+# agent-director shim's log holds no CSCB find-missing in the window (named
+# <window> in the messages). A find-missing carries no instance id, so a
+# window holding only still-latched rounds is checked whole.
+check_no_cscb_find_missing() {
+    local step="$1" from="$2" to="$3" window="$4" rows
+    rows="$(ad_cscb_verb_between find-missing "${from}" "${to}")" || exit 1
+    if [[ -n "${rows}" ]]; then
+        sed 's/^/  | /' <<< "${rows}" >&2
+        fail "${step}: $(rows_count "${rows}") CSCB find-missing call(s) ${window} (shim marks ${from} to ${to}), where every round is still latched"
+    fi
+    echo "${TEST_NAME}: ${step}: no CSCB find-missing ${window} (shim marks ${from} to ${to})"
+}
+
 p2_checks() {
-    local key rows found verb n
+    local key rows found verb n from=0
+    # From the last latch to the batched round's clearing event every Part 2
+    # persona's rounds are still latched: no CSCB find-missing in that window.
+    for key in "${P2_KEYS[@]}"; do
+        (( LATCH_MARK[${key}] <= from )) || from="${LATCH_MARK[${key}]}"
+    done
+    check_no_cscb_find_missing "part 2: the still-latched rounds before the batched clearing event" "${from}" "${BATCH_EVENT_MARK}" \
+        "from the last latch to the batched round's clearing event"
     for key in "${P2_BATCH_KEYS[@]}"; do
         check_latched_rounds "${key}"
         check_retry_unwritten "${key}"
@@ -2749,8 +2829,9 @@ load_calls() {
 # check_loop_runs: the find-missing loop's runs are the harness's: at least
 # one `find-missing` line whose parent is the loop's subshell, the first one
 # after LOOP_MARK (which follows leg 2's end, END_MARK), none of them
-# CSCB-parented; and the harness ran no find-missing before the loop. Sets
-# LOOP_FIRST_POS.
+# CSCB-parented; at least one run in the loop's log since Part 2's loop
+# started (the log is shared with Part 1's loop); and the harness ran no
+# find-missing before the loop. Sets LOOP_FIRST_POS.
 check_loop_runs() {
     local step="part 2: the find-missing loop" rows pos us ppid role n=0 before=0 cscb_after=0 runs
     rows="$(shim_verb_rows find-missing)" || exit 1
@@ -2771,19 +2852,19 @@ check_loop_runs() {
     (( before == 0 )) || fail "${step}: ${before} find-missing call(s) not CSCB's in Part 2 before the loop started"
     (( END_MARK <= LOOP_MARK && LOOP_FIRST_POS > LOOP_MARK )) \
         || fail "${step}: the loop's first find-missing (shim line ${LOOP_FIRST_POS}) is not after leg 2's end (mark ${END_MARK}) and the loop's start (mark ${LOOP_MARK})"
-    runs="$(find_missing_loop_runs)"
-    (( runs > 0 )) || fail "${step}: the loop's log holds no run"
-    echo "${TEST_NAME}: ${step}: ${runs} run(s) logged, ${n} find-missing line(s) parented by the loop, the first at shim line ${LOOP_FIRST_POS}, after leg 2's end (mark ${END_MARK}); none CSCB's; ${cscb_after} CSCB find-missing call(s) since (recorded)"
+    runs=$(( $(find_missing_loop_runs) - P2_LOOP_RUNS_BEFORE ))
+    (( runs > 0 )) || fail "${step}: the loop's log holds no run of Part 2's loop (${P2_LOOP_RUNS_BEFORE} run(s) of Part 1's before it)"
+    echo "${TEST_NAME}: ${step}: ${runs} run(s) of Part 2's loop logged, ${n} find-missing line(s) parented by the loop, the first at shim line ${LOOP_FIRST_POS}, after leg 2's end (mark ${END_MARK}); none CSCB's; ${cscb_after} CSCB find-missing call(s) since (recorded)"
 }
 
 # check_nothing_typed <key>: AC 44: from the latch life's start to the leg's
 # event, no tmux send-keys, send-prefix or paste-buffer reached the
-# relabelled session's worker pane, by its pane id, session id or name (the
-# tmux shim's log); positive control: the first life's approver typed into
-# it.
+# relabelled session's worker pane, by its pane id, window id, session id or
+# name (the tmux shim's log); positive control: the first life's approver
+# typed into it.
 check_nothing_typed() {
     local key="$1" step="part 2: $1's relabelled session: nothing typed" target rows hits n=0 ctl=0
-    for target in "${SEED_PANE[${key}]}" "${SEED_SID[${key}]}" "${PERSONA_NAMED[${key}]}"; do
+    for target in "${SEED_PANE[${key}]}" "${SEED_WID[${key}]}" "${SEED_SID[${key}]}" "${PERSONA_NAMED[${key}]}"; do
         rows="$(tmux_shim_targets "${target}" "${LATCH_LIFE_TMUX_MARK}" "${EVENT_TMUX_MARK[${key}]}")" || exit 1
         hits="$([[ -z "${rows}" ]] || awk -F'\t' '$4 == "send-keys" || $4 == "send-prefix" || $4 == "paste-buffer"' <<< "${rows}")"
         if [[ -n "${hits}" ]]; then
@@ -2794,7 +2875,7 @@ check_nothing_typed() {
         hits="$([[ -z "${rows}" ]] || awk -F'\t' '$4 == "send-keys"' <<< "${rows}")"
         ctl=$(( ctl + $(rows_count "${hits}") ))
     done
-    (( n == 0 )) || fail "${step}: ${n} tmux call(s) typed into ${SEED_PANE[${key}]} (${SEED_SID[${key}]}, ${PERSONA_NAMED[${key}]}) in the latch life"
+    (( n == 0 )) || fail "${step}: ${n} tmux call(s) typed into ${SEED_PANE[${key}]} (${SEED_WID[${key}]}, ${SEED_SID[${key}]}, ${PERSONA_NAMED[${key}]}) in the latch life"
     (( ctl > 0 )) || fail "${step}: positive control: the reader finds no send-keys into ${SEED_PANE[${key}]} in the first life"
     echo "${TEST_NAME}: ${step}: no tmux typing reached ${SEED_PANE[${key}]} in the latch life up to its event (positive control: ${ctl} send-keys in the first life)"
 }
@@ -2982,11 +3063,66 @@ check_launch_start() {
     ad_trail_events ad.find_missing.tick "${id}" | sed "s/^/${TEST_NAME}: ${step}: [recorded] trail: /" || true
 }
 
+# check_relabel_marked <key>: from the legs' events (RELABEL_EVENTS_MARK) to
+# the harness read that showed the leg's row `missing` (MISSING_MARK), a
+# window holding only still-latched rounds: no CSCB find-missing in it, and
+# the harness's loop marked the row (at least one of its find-missing lines
+# in it); every find-missing line in it is logged with whose it was.
+check_relabel_marked() {
+    local key="$1" step="part 2: $1's row marked missing" fm pos ppid role marked="" loop=0
+    check_no_cscb_find_missing "${step}" "${RELABEL_EVENTS_MARK}" "${MISSING_MARK[${key}]}" \
+        "from the legs' events to the harness read showing ${PERSONA_ID[${key}]} missing"
+    fm="$(shim_verb_rows find-missing)" || exit 1
+    while IFS=$'\t' read -r pos _ ppid role; do
+        [[ -n "${pos}" ]] || continue
+        (( pos > RELABEL_EVENTS_MARK && pos <= MISSING_MARK[${key}] )) || continue
+        if [[ "${ppid}" == "${FIND_MISSING_LOOP_PID}" ]]; then
+            loop=$(( loop + 1 ))
+            marked+="${marked:+, }shim line ${pos} (the harness's loop)"
+        elif [[ "${role}" != - ]]; then
+            marked+="${marked:+, }shim line ${pos} (CSCB's ${role})"
+        else
+            marked+="${marked:+, }shim line ${pos} (the harness)"
+        fi
+    done <<< "${fm}"
+    (( loop > 0 )) \
+        || fail "${step}: no find-missing of the harness's loop (${FIND_MISSING_LOOP_PID}) from the legs' events (shim mark ${RELABEL_EVENTS_MARK}) to the read showing ${PERSONA_ID[${key}]} missing (mark ${MISSING_MARK[${key}]}); find-missing lines there: ${marked:-none}"
+    echo "${TEST_NAME}: ${step}: ${PERSONA_ID[${key}]} marked missing by the harness's loop; the find-missing lines from the legs' events to the harness read: ${marked}"
+}
+
+# latch_state_of <key>: print `latched` when the persona's last conflict-latch
+# set or clear line in server.log is a latch-set or relatch line, `cleared`
+# when it is a clear line, `none` when it has neither (the heads cut from the
+# package's conflictLatchSetLine and latchClearedLine at their ` — `).
+latch_state_of() {
+    local key="$1" step="end: $1's latch" set_head re_head clear_head last
+    set_head="$(fmk_text conflictLatchSetLine "${key}" "${CASE_OF[${key}]}" SESSIONSLOT "${OP_OF[${key}]}" "${LATCH_ROW_OF[${key}]}")" \
+        || fail "${step}: fmk-texts.ts could not print conflictLatchSetLine"
+    re_head="$(fmk_text conflictLatchSetLine "${key}" "${CASE_OF[${key}]}" SESSIONSLOT "${OP_OF[${key}]}" "${LATCH_ROW_OF[${key}]}" "${CASE_OF[${key}]}")" \
+        || fail "${step}: fmk-texts.ts could not print conflictLatchSetLine"
+    clear_head="$(fmk_text latchClearedLine "${key}" "${CASE_OF[${key}]}" SESSIONSLOT posted LATCH_RECOVERY_REASON_ROW_GONE)" \
+        || fail "${step}: fmk-texts.ts could not print latchClearedLine"
+    set_head="${set_head%% — *} — "
+    re_head="${re_head%% — *} — "
+    clear_head="${clear_head%% — *} — "
+    [[ "${set_head}" == *"=${key} latched — " && "${re_head}" == *"=${key} relatched — " && "${clear_head}" == *"=${key} cleared — " ]] \
+        || fail "${step}: the heads '${set_head}', '${re_head}' and '${clear_head}' are not ${key}'s latch, relatch and clear"
+    last="$(grep -F -e "${set_head}" -e "${re_head}" -e "${clear_head}" "${SLACK_STATE_DIR}/server.log" | tail -n 1)" || true
+    if [[ -z "${last}" ]]; then
+        echo none
+    elif [[ "${last}" == *"${clear_head}"* ]]; then
+        echo cleared
+    else
+        echo latched
+    fi
+}
+
 # p2_relabel_checks: the legs' and the loop's checks, from the logs.
 p2_relabel_checks() {
     local key
     check_loop_runs
     for key in "${P2_RELABEL_KEYS[@]}"; do
+        check_relabel_marked "${key}"
         check_nothing_typed "${key}"
         check_latched_rounds "${key}"
         check_retry_unwritten "${key}"
@@ -3028,6 +3164,16 @@ p2_checks
 p2_relabel_checks
 stop_find_missing_loop
 
+# The unusable recorded name's rounds to the end: right after its next round
+# (so no round is in flight), its snapshot, then the round checker over its
+# whole latched span (each round one status alone, at the cadence, and its
+# latch's notice the only post).
+n="$(count_log "${STILL_LINE[${UN_KEY}]}")"
+wait_rounds end "${UN_KEY}" "${STILL_LINE[${UN_KEY}]}" $(( n + 1 )) 1
+n="$(count_log "${STILL_LINE[${UN_KEY}]}")"
+free_snapshot "${UN_KEY}" "${n}"
+check_latched_rounds "${UN_KEY}" end
+
 # A plain stop, then the closing assertions. The persona still latched keeps
 # its row; every row is present.
 stop_server
@@ -3036,6 +3182,33 @@ for key in "${P2_KEYS[@]}"; do
     read_row "end" "${PERSONA_ID[${key}]}"
     [[ -n "${ROW_STATE}" ]] || fail "end: ${PERSONA_ID[${key}]} has no row at the end"
     echo "${TEST_NAME}: end: ${PERSONA_ID[${key}]} is present, reading ${ROW_STATE}"
+done
+# The personas still latched keep their rows (above) and sessions: the
+# unusable recorded name and leg 1 stay latched to the end; "launch start not
+# recorded" is checked when its retry left it latched (what the retry met is
+# ruling S8's). Leg 1's and "launch start not recorded"'s sessions, never
+# ended by the harness, still run under their names; the unusable recorded
+# name had no session at its latch (its worker ended in the set-up stop), and
+# none was made for it.
+for key in "${UN_KEY}" "${R1_KEY}" "${NS_KEY}"; do
+    state="$(latch_state_of "${key}")" || exit 1
+    if [[ "${key}" != "${NS_KEY}" ]]; then
+        [[ "${state}" == latched ]] || { latch_lines_of "${key}"; fail "end: ${key}'s last conflict-latch line reads ${state}, not a latch"; }
+    elif [[ "${state}" != latched ]]; then
+        echo "${TEST_NAME}: end: [S8, recorded] ${key} is not latched at the end (its last conflict-latch line reads ${state})"
+        continue
+    fi
+    if [[ "${key}" == "${UN_KEY}" ]]; then
+        session_gone "${PERSONA_NAMED[${key}]}" \
+            || fail "end: a session named ${PERSONA_NAMED[${key}]} runs for the latched ${key}, though none was there at its latch"
+        echo "${TEST_NAME}: end: ${key} is still latched; its row is present and no session was made for it"
+    else
+        has_session_id "${SEED_SID[${key}]}" || fail "end: the latched ${key}'s session ${SEED_SID[${key}]} is gone"
+        sid="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${PERSONA_NAMED[${key}]}:" '#{session_id}' 2> /dev/null)" || sid=""
+        [[ "${sid}" == "${SEED_SID[${key}]}" ]] \
+            || fail "end: ${PERSONA_NAMED[${key}]} is held by '${sid}', not the latched ${key}'s session ${SEED_SID[${key}]}"
+        echo "${TEST_NAME}: end: ${key} is still latched; its row is present and its session ${PERSONA_NAMED[${key}]} (${SEED_SID[${key}]}) still runs"
+    fi
 done
 # The unusable recorded name stayed latched to the end: its row still records
 # the name, and no clear line names it (the clear line's head, cut from the
