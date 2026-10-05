@@ -609,6 +609,66 @@
 #   cscb_ad_count <verb> [<fragment>...]
 #                                      print how many lines `cscb_ad_calls` would print
 #
+#   Readers for the latch scenarios (fmk mode; harness additions, b.jg5 SRJ-1306). The
+#   agent-director readers are built on `cscb_ad_calls`'s filter: only `call` lines whose
+#   parent is a CSCB process, so the harness's calls, the stub's own `status` reads and its
+#   stop line never count. A mark is a log position, the number of lines the log held when
+#   it was taken (0 for no log); a line is after <from-mark> when its line number is greater,
+#   and up to <to-mark> when it is not greater; `-` is no bound. Each time is the shim line's
+#   time field (seconds since the epoch, six decimals; the agent-director shim's header
+#   states it). An agent-director row prints, TAB-separated:
+#     <position> TAB <time> TAB <ppid> TAB <verb> TAB <instance id, or -> TAB <arguments>
+#   where <position> is the line number in SCENARIO_AD_SHIM_LOG, <ppid> the CSCB process that
+#   ran the call, <instance id> the value of the call's --claude-instance-id (`--flag value`
+#   or `--flag=value`) and <arguments> the words after the verb, `printf %q`-quoted, joined by
+#   single spaces.
+#   ad_shim_mark                       print the agent-director shim log's position now
+#   tmux_shim_mark                     print the tmux shim log's position now
+#   ad_cscb_calls <instance-id|*> [<from-mark> [<to-mark>]]
+#                                      print the rows of the CSCB-parented calls whose instance id is
+#                                      exactly <instance-id> (never one it is a prefix of), or, for
+#                                      `*`, of every CSCB-parented call that carries an instance id,
+#                                      in log order
+#   wait_for_ad_cscb_call <instance-id> <verb> <min-count> <timeout-s> [<step>]
+#                                      wait until `ad_cscb_calls <instance-id>` holds at least
+#                                      <min-count> rows of <verb> (a count over the whole log); fail,
+#                                      naming <step> and the count found, when not within <timeout-s>
+#   ad_cscb_verb_between <verb> <from-mark> <to-mark>
+#                                      print the rows of the CSCB-parented calls of <verb> between the
+#                                      two marks, for a verb that carries no instance id (find-missing,
+#                                      list, version)
+#   tmux_shim_targets <session-name|session-id|pane-id> [<from-mark> [<to-mark>]]
+#                                      print, for each tmux shim `call` line between the marks (every
+#                                      line of that log is a CSCB process's or agent-director's for
+#                                      one), one row per command of the call (chained commands each
+#                                      read, after tmux's global options, as tmux-shim.sh reads them)
+#                                      that reads from (capture-pane, pipe-pane), types into
+#                                      (send-keys, send-prefix, paste-buffer), kills (kill-session,
+#                                      kill-window, kill-pane) or respawns (respawn-pane,
+#                                      respawn-window) a target given with -t that names the target:
+#                                        <position> TAB <time> TAB <ppid> TAB <command> TAB <-t value> TAB <words>
+#                                      A command is matched by its name, alias or an unambiguous
+#                                      prefix, as tmux matches it. A pane id (%N) names the pane given
+#                                      exactly; for a session, the -t value's session part (before its
+#                                      first `:`, or its first `.` when it has none) names it when it
+#                                      is the session id ($N) given, or `=<name>` or `<name>` for the
+#                                      name given, or, written without `=`, a prefix of the name given
+#                                      (which tmux resolves to it when no session holds that exact
+#                                      name). A command that names no target is not printed
+#   slack_posts <channel> [<record>]   print the text of every chat.postMessage to <channel> in the
+#                                      Slack stub's record (default SCENARIO_SLACK_RECORD), in record
+#                                      order, each whole (the stub keeps it whole, with token-like text
+#                                      redacted) and followed by a NUL byte; read them with
+#                                      `slack_posts <channel> > <file>` then `mapfile -d '' -t <array> < <file>`.
+#                                      Fails when the record is not a file. Works in shared mode too
+#   ad_trail_events <event> [<instance-id>]
+#                                      both guards first; print agent-director's trail records
+#                                      ($HOME/.agent-director/ad-trail.jsonl) whose `event` is <event>
+#                                      and, when given, whose `claude_instance_id` is <instance-id>, one
+#                                      JSON object per line, in trail order (none when there is no
+#                                      trail; a line that is not JSON, a record still being written, is
+#                                      skipped). Read-only: it never writes
+#
 # Line builders (every fragment is quoted from src/; <ref> is `persona_ref`):
 #   persona_start_match   `[slack] persona-start: personas[<index>] <ref>`
 #                         (src/persona-bringup-controller.ts bringUp, format
@@ -3574,6 +3634,301 @@ cscb_ad_calls() {
 
 cscb_ad_count() {
     _scenario_cscb_ad_scan "cscb_ad_count" count "${1-}" "${@:2}"
+}
+
+# ---------------------------------------------------------------------------
+# Readers for the latch scenarios (fmk mode; harness additions)
+# ---------------------------------------------------------------------------
+
+# _scenario_check_mark <step> <what> <value>: fail unless <value> is a mark (a
+# whole number) or `-`.
+_scenario_check_mark() {
+    [[ "$3" == - || "$3" =~ ^[0-9]+$ ]] \
+        || fail "$1: ${2} '$3' is not a mark (a whole number from ad_shim_mark or tmux_shim_mark) or -"
+}
+
+# _scenario_in_window <position> <from-mark> <to-mark>: true when the line at
+# <position> is after <from-mark> and up to <to-mark> (`-`: no bound).
+_scenario_in_window() {
+    { [[ "$2" == - ]] || (( $1 > $2 )); } && { [[ "$3" == - ]] || (( $1 <= $3 )); }
+}
+
+# _scenario_log_mark <step> <log>: print how many lines <log> holds (0 when
+# there is no log).
+_scenario_log_mark() {
+    [[ "${SCENARIO_FMK}" == 1 ]] || fail "$1: the shim logs are for fmk scripts only"
+    if [[ ! -f "$2" ]]; then
+        echo 0
+        return 0
+    fi
+    wc -l < "$2" | tr -d ' '
+}
+
+ad_shim_mark() {
+    _scenario_log_mark ad_shim_mark "${SCENARIO_AD_SHIM_LOG}"
+}
+
+tmux_shim_mark() {
+    _scenario_log_mark tmux_shim_mark "${SCENARIO_TMUX_SHIM_LOG}"
+}
+
+# Set _L_ID to the value of --claude-instance-id in _L_ARGS (`--flag value`
+# or `--flag=value`); empty when the call carries none.
+_scenario_ad_id() {
+    local i
+    _L_ID=""
+    for (( i = 0; i < ${#_L_ARGS[@]}; i++ )); do
+        case "${_L_ARGS[i]}" in
+            --claude-instance-id)
+                _L_ID="${_L_ARGS[i + 1]:-}"
+                return 0
+                ;;
+            --claude-instance-id=*)
+                _L_ID="${_L_ARGS[i]#*=}"
+                return 0
+                ;;
+        esac
+    done
+}
+
+# Print _SCENARIO_US-style microseconds <us> as the logs' time (six decimals).
+_scenario_us_text() {
+    printf '%d.%06d\n' $(( $1 / 1000000 )) $(( $1 % 1000000 ))
+}
+
+# _scenario_cscb_ad_rows <step> <instance-id|*|> <verb> <from-mark> <to-mark>:
+# print the rows (see the header) of the agent-director shim's `call` lines
+# whose parent is a CSCB process, inside the window, whose instance id is
+# <instance-id> (`*`: any call carrying one; empty: any call) and whose verb
+# is <verb> (empty: any verb).
+_scenario_cscb_ad_rows() {
+    local step="$1" id="$2" verb="$3" from="$4" to="$5" lines=() i args
+    _scenario_query_prep "${step}"
+    _scenario_read_log "${step}" "${SCENARIO_AD_SHIM_LOG}" lines
+    for i in "${!lines[@]}"; do
+        _scenario_in_window "$(( i + 1 ))" "${from}" "${to}" || continue
+        _scenario_split_line "${lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        _scenario_role_at "${_L_PPID}" "${_L_US}" || continue
+        _scenario_decode_words
+        _scenario_ad_verb
+        [[ -z "${verb}" || "${_L_VERB}" == "${verb}" ]] || continue
+        _scenario_ad_id
+        case "${id}" in
+            "") ;;
+            '*') [[ -n "${_L_ID}" ]] || continue ;;
+            *) [[ "${_L_ID}" == "${id}" ]] || continue ;;
+        esac
+        args=""
+        if (( ${#_L_ARGS[@]} > 0 )); then
+            printf -v args '%q ' "${_L_ARGS[@]}"
+            args="${args% }"
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(( i + 1 ))" "$(_scenario_us_text "${_L_US}")" "${_L_PPID}" \
+            "${_L_VERB}" "${_L_ID:--}" "${args}"
+    done
+}
+
+ad_cscb_calls() {
+    local id="${1:-}" from="${2:--}" to="${3:--}"
+    [[ -n "${id}" ]] || fail "ad_cscb_calls: no instance id given (or * for every call carrying one)"
+    _scenario_check_mark ad_cscb_calls "<from-mark>" "${from}"
+    _scenario_check_mark ad_cscb_calls "<to-mark>" "${to}"
+    _scenario_cscb_ad_rows ad_cscb_calls "${id}" "" "${from}" "${to}"
+}
+
+# True when `ad_cscb_calls <instance-id>` holds at least <min> rows of <verb>;
+# sets _SCENARIO_FOUND to how many it holds.
+_scenario_ad_cscb_at_least() {
+    local out
+    out="$(_scenario_cscb_ad_rows wait_for_ad_cscb_call "$1" "$2" - -)" || return 1
+    _SCENARIO_FOUND=0
+    [[ -z "${out}" ]] || _SCENARIO_FOUND="$(wc -l <<< "${out}" | tr -d ' ')"
+    (( _SCENARIO_FOUND >= $3 ))
+}
+
+wait_for_ad_cscb_call() {
+    local id="${1:-}" verb="${2:-}" min="${3:-}" timeout_s="${4:-}"
+    local step="${5:-no ${min} CSCB ${verb} call(s) naming ${id}}"
+    [[ -n "${id}" && "${id}" != '*' && -n "${verb}" ]] \
+        || fail "wait_for_ad_cscb_call: takes <instance-id> <verb> <min-count> <timeout-s> [<step>]"
+    [[ "${min}" =~ ^[0-9]+$ ]] || fail "${step}: count '${min}' is not a whole number"
+    _scenario_check_timeout "${timeout_s}" "${step}"
+    _SCENARIO_FOUND=0
+    _scenario_poll_until "${timeout_s}" _scenario_ad_cscb_at_least "${id}" "${verb}" "${min}" \
+        || fail "${step} (not within ${timeout_s}s; found ${_SCENARIO_FOUND})"
+}
+
+ad_cscb_verb_between() {
+    local verb="${1:-}" from="${2:-}" to="${3:-}"
+    [[ -n "${verb}" ]] || fail "ad_cscb_verb_between: no verb given"
+    _scenario_check_mark ad_cscb_verb_between "<from-mark>" "${from}"
+    _scenario_check_mark ad_cscb_verb_between "<to-mark>" "${to}"
+    _scenario_cscb_ad_rows ad_cscb_verb_between "" "${verb}" "${from}" "${to}"
+}
+
+# The tmux commands `tmux_shim_targets` reports, one per line: the name, its
+# alias (`-` for none), the shortest prefix tmux takes for it unambiguously,
+# and the flags that take an argument (tmux 3.2a / 3.3a).
+_SCENARIO_TMUX_ACTING_COMMANDS=(
+    'capture-pane capturep 2 bESt'
+    'pipe-pane pipep 2 t'
+    'send-keys send 6 Nt'
+    'send-prefix - 6 t'
+    'paste-buffer pasteb 2 bst'
+    'kill-session - 8 t'
+    'kill-window killw 6 t'
+    'kill-pane killp 6 t'
+    'respawn-pane respawnp 9 cet'
+    'respawn-window respawnw 9 cet'
+)
+
+# _scenario_tmux_command_target <word> [<arg>...]: when <word> is one of the
+# acting commands and its options (read as getopt reads them: up to the first
+# word that is not an option, or `--`) give -t, add `<command> SEP <value>` to
+# _T_HITS.
+_scenario_tmux_command_target() {
+    local word="$1" spec name alias min flags cmd="" takes="" a j c value="" have=0
+    shift
+    for spec in "${_SCENARIO_TMUX_ACTING_COMMANDS[@]}"; do
+        read -r name alias min flags <<< "${spec}"
+        if [[ "${word}" == "${name}" || "${word}" == "${alias}" ]] \
+            || { (( ${#word} >= min )) && [[ "${name}" == "${word}"* ]]; }; then
+            cmd="${name}"
+            takes="${flags}"
+            break
+        fi
+    done
+    [[ -n "${cmd}" ]] || return 0
+    while (( $# > 0 )); do
+        a="$1"
+        shift
+        [[ "${a}" != -- ]] || break
+        [[ "${a}" == -?* ]] || break
+        for (( j = 1; j < ${#a}; j++ )); do
+            c="${a:j:1}"
+            [[ "${takes}" == *"${c}"* ]] || continue
+            if (( j + 1 < ${#a} )); then
+                value="${a:j+1}"
+            elif (( $# > 0 )); then
+                value="$1"
+                shift
+            else
+                value=""
+            fi
+            if [[ "${c}" == t ]]; then
+                have=1
+                break 2
+            fi
+            break
+        done
+    done
+    if (( have )) && [[ -n "${value}" ]]; then
+        _T_HITS+=("${cmd}${SCENARIO_SEP}${value}")
+    fi
+    return 0
+}
+
+# Set _T_HITS from _L_WORDS (one tmux call's argv): each acting command of
+# the call that gives a target, after tmux's global options, the call's
+# chained commands split as tmux-shim.sh splits them.
+_scenario_tmux_hits() {
+    local n=${#_L_WORDS[@]} i=0 j a next cmd=()
+    _T_HITS=()
+    while (( i < n )); do
+        a="${_L_WORDS[i]}"
+        if [[ "${a}" == -- ]]; then
+            i=$(( i + 1 ))
+            break
+        fi
+        [[ "${a}" == -?* ]] || break
+        next=0
+        for (( j = 1; j < ${#a}; j++ )); do
+            case "${a:j:1}" in
+                c | f | L | S | T)
+                    (( j + 1 == ${#a} )) && next=1
+                    break
+                    ;;
+            esac
+        done
+        i=$(( i + 1 + next ))
+    done
+    for (( ; i < n; i++ )); do
+        a="${_L_WORDS[i]}"
+        if [[ "${a}" == *';' && "${a}" != *'\;' ]]; then
+            a="${a%;}"
+            [[ -z "${a}" ]] || cmd+=("${a}")
+            (( ${#cmd[@]} == 0 )) || _scenario_tmux_command_target "${cmd[@]}"
+            cmd=()
+        else
+            cmd+=("${a}")
+        fi
+    done
+    (( ${#cmd[@]} == 0 )) || _scenario_tmux_command_target "${cmd[@]}"
+    return 0
+}
+
+# _scenario_tmux_names <value> <target>: true when the -t <value> names
+# <target> (see `tmux_shim_targets` in the header).
+_scenario_tmux_names() {
+    local v="$1" t="$2" s
+    if [[ "${t}" == %* ]]; then
+        [[ "${v}" == "${t}" ]]
+        return
+    fi
+    [[ "${v}" != %* ]] || return 1
+    s="${v%%:*}"
+    [[ "${v}" == *:* ]] || s="${s%%.*}"
+    if [[ "${t}" == \$* ]]; then
+        [[ "${s}" == "${t}" ]]
+        return
+    fi
+    [[ "${s}" == "=${t}" || "${s}" == "${t}" ]] && return 0
+    [[ -n "${s}" && "${s}" != [=\$@%]* && "${t}" == "${s}"* ]]
+}
+
+tmux_shim_targets() {
+    local target="${1:-}" from="${2:--}" to="${3:--}" step=tmux_shim_targets lines=() i hit
+    [[ -n "${target}" ]] || fail "${step}: no session name, session id or pane id given"
+    _scenario_check_mark "${step}" "<from-mark>" "${from}"
+    _scenario_check_mark "${step}" "<to-mark>" "${to}"
+    [[ "${SCENARIO_FMK}" == 1 ]] || fail "${step}: the tmux shim is for fmk scripts only"
+    _scenario_read_log "${step}" "${SCENARIO_TMUX_SHIM_LOG}" lines
+    for i in "${!lines[@]}"; do
+        _scenario_in_window "$(( i + 1 ))" "${from}" "${to}" || continue
+        _scenario_split_line "${lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        _scenario_decode_words
+        _scenario_tmux_hits
+        for hit in ${_T_HITS[@]+"${_T_HITS[@]}"}; do
+            _scenario_tmux_names "${hit#*"${SCENARIO_SEP}"}" "${target}" || continue
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(( i + 1 ))" "$(_scenario_us_text "${_L_US}")" "${_L_PPID}" \
+                "${hit%%"${SCENARIO_SEP}"*}" "${hit#*"${SCENARIO_SEP}"}" "${_L_RAW_WORDS}"
+        done
+    done
+}
+
+slack_posts() {
+    local channel="${1:-}" record="${2:-${SCENARIO_SLACK_RECORD:-}}"
+    [[ -n "${channel}" ]] || fail "slack_posts: no channel given"
+    [[ -n "${record}" && -f "${record}" ]] \
+        || fail "slack_posts: the Slack stub's record '${record}' is not a file (pass it, or set SCENARIO_SLACK_RECORD)"
+    jq -j --arg c "${channel}" \
+        'select(.event == "api" and .method == "chat.postMessage" and .channel == $c) | (.text // "") + "\u0000"' \
+        "${record}" || fail "slack_posts: jq could not read ${record}"
+}
+
+ad_trail_events() {
+    local event="${1:-}" id="${2:-}" step trail
+    step="ad_trail_events ${event}${id:+ ${id}}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ -n "${event}" ]] || fail "${step}: no event named"
+    trail="${HOME}/.agent-director/ad-trail.jsonl"
+    [[ -f "${trail}" ]] || return 0
+    jq -c -R --arg e "${event}" --arg id "${id}" \
+        'fromjson? | select(type == "object" and .event == $e and ($id == "" or .claude_instance_id == $id))' \
+        "${trail}" || fail "${step}: jq could not read ${trail}"
 }
 
 # ---------------------------------------------------------------------------

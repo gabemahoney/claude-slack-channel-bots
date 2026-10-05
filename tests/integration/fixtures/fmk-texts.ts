@@ -35,7 +35,8 @@
  *       || fail "fmk-texts: buildBelowPhase1FloorMessage"
  *
  * A command substitution drops trailing newlines. No value below ends with
- * one; an entry whose value can must be captured with a sentinel instead:
+ * one but CONFLICT_NOTICE_LINE_SEPARATOR, which is one; an entry whose value
+ * can must be captured with a sentinel instead:
  * `V="$(bun … && printf x)" || fail …; V="${V%x}"`.
  *
  * Failures print one `FAIL: fmk-texts: <reason>` line on stderr:
@@ -71,6 +72,57 @@
  *                                                prefix added, the key derived by the
  *                                                package's personaKey, as the config
  *                                                loader derives it)
+ *
+ * The latch scenarios' entries (E42–E43, test-15 onward). Constants, each
+ * printed as it is, named after their export:
+ *   LATCH_CASE_*, REFUSED_OPERATION_*, CONFLICT_NOTICE_*, UNUSABLE_NAME_NOTICE_*,
+ *   LAUNCH_START_NOTICE_*, LATCH_RECOVERY_REASON_ROW_READS_HEAD,
+ *   CONFLICT_RECOVERY_HEAD, CONFLICT_RECOVERY_REASON_LEAD, HOLD_RECOVERY_HEAD,
+ *   LATCH_RECOVERY_TAIL, LATCH_RECHECK_INTERVAL_MS (in decimal), RECHECK_STEP_*,
+ *   RECHECK_LINE_STEP_NOT_DECIDED, RECHECK_CALL_*
+ *                                                src/conflict-latch.ts (the full list is
+ *                                                LATCH_CONSTANT_NAMES below);
+ *                                                CONFLICT_NOTICE_LINE_SEPARATOR is a line
+ *                                                break, so capture it with the sentinel
+ *   UNUSABLE_RECORDED_NAME_PHRASE, CONFLICT_*_PHRASE (the nine case phrases),
+ *   PLAIN_SPAWN_LABEL_NAMES_THIS_ID_PHRASE, PLAIN_SPAWN_LABEL_NOT_THIS_ID_PHRASE,
+ *   NEW_ROW_ENDED_PHRASE, NOTHING_WRITTEN_PHRASE
+ *                                                src/ad-description-phrases.ts
+ * Builders (<case> is a latch case's value, as the LATCH_CASE_* entries print
+ * it; <reason> is LATCH_RECOVERY_REASON_ROW_GONE,
+ * LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED,
+ * LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED, LATCH_RECOVERY_REASON_CLEARED_BY_HAND,
+ * or `latchRecoveryReasonRowReads <state>`):
+ *   personaNoticePrefix <persona-name> [<key>]   src/persona-notifier.ts formatPersonaNotice's
+ *                                                prefix (its output for an empty body); the
+ *                                                key personaKey(<persona-name>) unless given
+ *   personaInstanceId <key>                      src/persona-identity.ts
+ *   conflictNoticeText <case> <session-name> [<description>]
+ *                                                src/conflict-latch.ts, the whole CONFLICT
+ *                                                notice body (a CONFLICT case only)
+ *   conflictNoticeFirstLine <case> <session-name>
+ *                                                its first line (head, the quoted session,
+ *                                                the case sentence when the case has one,
+ *                                                tail)
+ *   conflictNoticeListLine <session-name>        its list line for that name (or the
+ *                                                unsafe-name line in its place)
+ *   conflictCaseSentence <case>                  the case sentence; fails for a case with none
+ *   unusableNameNoticeText <key> <description>   SRJ-1019's notice body
+ *   launchStartNotRecordedNoticeText <key>       SRJ-1020's notice body
+ *   conflictRecoveryText <session-name> <reason> the CONFLICT recovery notice body
+ *   holdRecoveryText <reason>                    the hold recovery notice body
+ *   conflictLatchSetLine <key> <case> <session-name> <refused-operation> <row-state> [<previous-case>]
+ *                                                the latch-set server-log line (no description;
+ *                                                <row-state> a state read, `no-row` or
+ *                                                `unreadable`, as the LATCH_ROW_STATE_KIND_*
+ *                                                values spell them)
+ *   latchClearedLine <key> <case> <session-name> <posted|not-posted> <reason>
+ *                                                the clear's server-log line
+ *   latchRecheckRoundLine <persona-name> <case> <step> <call> <answer>
+ *                                                the re-check round's server-log line, the
+ *                                                reference renderPersonaRef(<persona-name>)
+ * The body entries print a body without the persona prefix; wrap one in
+ * `formatPersonaNotice <persona-name> <entry> …` for the posted text.
  *
  * An entry is one `Entry` in `ENTRIES`: its argument synopsis, the export it
  * prints and a `print` function from its arguments to the value. Constants
@@ -217,6 +269,363 @@ const personaNotice: Entry = {
   },
 }
 
+// ---------------------------------------------------------------------------
+// The latch scenarios' entries (E42–E43): the latch notices, the recovery
+// texts, agent-director's case phrases, the re-check interval and the latch's
+// server-log lines, every one from conflict-latch.ts, ad-description-phrases.ts,
+// persona-notifier.ts or persona-identity.ts.
+// ---------------------------------------------------------------------------
+
+/** conflict-latch.ts's constants the latch scenarios print as they are. */
+const LATCH_CONSTANT_NAMES: readonly string[] = [
+  'LATCH_CASE_CONFLICTING_LABELS',
+  'LATCH_CASE_PANE_NOT_FOUND',
+  'LATCH_CASE_NOT_THIS_LAUNCH',
+  'LATCH_CASE_LEFTOVER',
+  'LATCH_CASE_NEVER_REPORTED_IN',
+  'LATCH_CASE_OWN_ID',
+  'LATCH_CASE_NO_VALID_ID',
+  'LATCH_CASE_DIFFERENT_ID',
+  'LATCH_CASE_ANOTHER_STORE',
+  'LATCH_CASE_UNRECOGNISED',
+  'LATCH_CASE_UNUSABLE_RECORDED_NAME',
+  'LATCH_CASE_LAUNCH_START_NOT_RECORDED',
+  'REFUSED_OPERATION_PLAIN_SPAWN',
+  'REFUSED_OPERATION_REUSE_SPAWN',
+  'REFUSED_OPERATION_RESUME',
+  'REFUSED_OPERATION_BRING_UP',
+  'REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY',
+  'REFUSED_OPERATION_NONE',
+  'CONFLICT_NOTICE_FIRST_LINE_HEAD',
+  'CONFLICT_NOTICE_CASE_SENTENCE_LEAD',
+  'CONFLICT_NOTICE_FIRST_LINE_TAIL',
+  'CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD',
+  'CONFLICT_NOTICE_DESCRIPTION_LINE_TAIL',
+  'CONFLICT_NOTICE_POINTER_LINE',
+  'CONFLICT_NOTICE_DIFFERENT_ID_MUST_NOT_END_LINE',
+  'CONFLICT_NOTICE_ANOTHER_STORE_MUST_NOT_END_LINE',
+  'CONFLICT_NOTICE_LIST_LINE_HEAD',
+  'CONFLICT_NOTICE_LIST_LINE_TAIL',
+  'CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME',
+  'CONFLICT_NOTICE_HUMAN_ONLY_LINE',
+  'CONFLICT_NOTICE_LINE_SEPARATOR',
+  'UNUSABLE_NAME_NOTICE_HEAD',
+  'UNUSABLE_NAME_NOTICE_REASON',
+  'UNUSABLE_NAME_NOTICE_DESCRIPTION_END',
+  'UNUSABLE_NAME_NOTICE_POINTER',
+  'UNUSABLE_NAME_NOTICE_HOLD',
+  'UNUSABLE_NAME_NOTICE_SEPARATOR',
+  'LAUNCH_START_NOTICE_HEAD',
+  'LAUNCH_START_NOTICE_SESSION_END',
+  'LAUNCH_START_NOTICE_POINTER',
+  'LAUNCH_START_NOTICE_HOLD',
+  'LAUNCH_START_NOTICE_SEPARATOR',
+  'LATCH_RECOVERY_REASON_ROW_READS_HEAD',
+  'CONFLICT_RECOVERY_HEAD',
+  'CONFLICT_RECOVERY_REASON_LEAD',
+  'HOLD_RECOVERY_HEAD',
+  'LATCH_RECOVERY_TAIL',
+  'LATCH_RECHECK_INTERVAL_MS',
+  'RECHECK_STEP_CLEAR_REPORTED_IN',
+  'RECHECK_STEP_CLEAR_GONE',
+  'RECHECK_STEP_SPAWN_RETRY',
+  'RECHECK_STEP_FINISHED_ROW_RETRY',
+  'RECHECK_STEP_TABLE',
+  'RECHECK_STEP_NO_INFORMATION',
+  'RECHECK_LINE_STEP_NOT_DECIDED',
+  'RECHECK_CALL_NONE',
+  'RECHECK_CALL_PROBE',
+  'RECHECK_CALL_PENDING_READ_PANE',
+  'RECHECK_CALL_PLAIN_SPAWN',
+  'RECHECK_CALL_REUSE_SPAWN',
+  'RECHECK_CALL_RESUME',
+  'RECHECK_CALL_RESTART_DECISION',
+  'RECHECK_CALL_FINISHED_ROW',
+]
+
+/** ad-description-phrases.ts's words the latch scenarios match in agent-director's descriptions and fmk-driver.ts's outcome line. */
+const CASE_PHRASE_NAMES: readonly string[] = [
+  'UNUSABLE_RECORDED_NAME_PHRASE',
+  'CONFLICT_CONFLICTING_LABELS_PHRASE',
+  'CONFLICT_PANE_NOT_FOUND_PHRASE',
+  'CONFLICT_NOT_THIS_LAUNCH_PHRASE',
+  'CONFLICT_LEFTOVER_PHRASE',
+  'CONFLICT_NEVER_REPORTED_IN_PHRASE',
+  'CONFLICT_OWN_ID_PHRASE',
+  'CONFLICT_NO_VALID_ID_PHRASE',
+  'CONFLICT_DIFFERENT_ID_PHRASE',
+  'CONFLICT_ANOTHER_STORE_PHRASE',
+  'PLAIN_SPAWN_LABEL_NAMES_THIS_ID_PHRASE',
+  'PLAIN_SPAWN_LABEL_NOT_THIS_ID_PHRASE',
+  'NEW_ROW_ENDED_PHRASE',
+  'NOTHING_WRITTEN_PHRASE',
+]
+
+/** A `constantEntry` for each of `names`, all of `relPath`. */
+function constantEntries(relPath: string, names: readonly string[]): Record<string, Entry> {
+  return Object.fromEntries(names.map((name) => [name, constantEntry(relPath, name)]))
+}
+
+/** Fails with a usage failure unless `args` holds `min` to `names.length` non-empty arguments. */
+function expectSomeArguments(entry: string, args: readonly string[], names: readonly string[], min: number): void {
+  const shown = names.map((n, i) => (i < min ? `<${n}>` : `[<${n}>]`)).join(' ')
+  if (args.length < min || args.length > names.length) usageFail(`${entry} takes ${shown} (got ${args.length})`)
+  const empty = args.findIndex((a) => a === '')
+  if (empty >= 0) usageFail(`${entry}: <${names[empty]}> is empty`)
+}
+
+/** Export `name` of conflict-latch.ts, which must be an array of strings. */
+async function latchStrings(context: EntryContext, name: string): Promise<readonly string[]> {
+  const value = await packageExport(context, 'conflict-latch.ts', name)
+  if (!Array.isArray(value) || value.some((v) => typeof v !== 'string')) {
+    fail(PRINTER_FAIL_EXIT, `the installed package's src/conflict-latch.ts export ${name} is not an array of strings`)
+  }
+  return value as string[]
+}
+
+/** `value` when the package's LATCH_CASES holds it (a CONFLICT case only, with `conflictOnly`); a usage failure otherwise. */
+async function latchCaseArgument(context: EntryContext, entry: string, value: string, conflictOnly = false): Promise<string> {
+  const cases = await latchStrings(context, 'LATCH_CASES')
+  if (!cases.includes(value)) usageFail(`${entry}: '${value}' is not a latch case (${cases.join(', ')})`)
+  if (conflictOnly && (await latchStrings(context, 'HOLD_LATCH_CASES')).includes(value)) {
+    usageFail(`${entry}: '${value}' is a hold case, which takes no CONFLICT notice`)
+  }
+  return value
+}
+
+/** `value` when the package's REFUSED_OPERATIONS holds it; a usage failure otherwise. */
+async function refusedOperationArgument(context: EntryContext, entry: string, value: string): Promise<string> {
+  const operations = await latchStrings(context, 'REFUSED_OPERATIONS')
+  if (!operations.includes(value)) usageFail(`${entry}: '${value}' is not a refused operation (${operations.join(', ')})`)
+  return value
+}
+
+/** The recorded row state for a word: the package's no-row or unreadable value for its kind, else `latchRowStateRead(word)`. */
+async function rowStateArgument(context: EntryContext, word: string): Promise<unknown> {
+  if (word === (await packageString(context, 'conflict-latch.ts', 'LATCH_ROW_STATE_KIND_NO_ROW'))) {
+    return await packageExport(context, 'conflict-latch.ts', 'LATCH_ROW_STATE_NO_ROW')
+  }
+  if (word === (await packageString(context, 'conflict-latch.ts', 'LATCH_ROW_STATE_KIND_UNREADABLE'))) {
+    return await packageExport(context, 'conflict-latch.ts', 'LATCH_ROW_STATE_UNREADABLE')
+  }
+  const read = await packageFunction<(state: string) => unknown>(context, 'conflict-latch.ts', 'latchRowStateRead')
+  return read(word)
+}
+
+/** The SRJ-1005 reasons with no state, by the export that holds each. */
+const RECOVERY_REASON_EXPORTS: readonly string[] = [
+  'LATCH_RECOVERY_REASON_ROW_GONE',
+  'LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED',
+  'LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED',
+  'LATCH_RECOVERY_REASON_CLEARED_BY_HAND',
+]
+
+/** The state-bearing reason's builder, by its export name. */
+const ROW_READS_REASON = 'latchRecoveryReasonRowReads'
+
+/** The reason the words `<reason> [<state>]` name: one of RECOVERY_REASON_EXPORTS (no state), or ROW_READS_REASON with its state. */
+async function recoveryReasonArgument(context: EntryContext, entry: string, words: readonly string[]): Promise<unknown> {
+  const [name, ...rest] = words
+  if (name === ROW_READS_REASON && rest.length === 1 && rest[0] !== '') {
+    return (await packageFunction<(state: string) => unknown>(context, 'conflict-latch.ts', ROW_READS_REASON))(rest[0])
+  }
+  if (name !== undefined && RECOVERY_REASON_EXPORTS.includes(name) && rest.length === 0) {
+    return await packageExport(context, 'conflict-latch.ts', name)
+  }
+  usageFail(`${entry}: the reason must be one of ${RECOVERY_REASON_EXPORTS.join(', ')}, or ${ROW_READS_REASON} <state> (got '${words.join(' ')}')`)
+}
+
+/** `conflictNoticeText({ sessionName, latchCase, description })`: the CONFLICT notice body as src builds it. */
+async function conflictNoticeBody(context: EntryContext, entry: string, latchCase: string, sessionName: string, description?: string): Promise<string> {
+  const build = await packageFunction<(source: object) => unknown>(context, 'conflict-latch.ts', 'conflictNoticeText')
+  const source = description === undefined ? { sessionName, latchCase } : { sessionName, latchCase, description }
+  return builtString(entry, build(source))
+}
+
+/** The CONFLICT notice body's lines, split on the package's CONFLICT_NOTICE_LINE_SEPARATOR. */
+async function conflictNoticeLines(context: EntryContext, entry: string, latchCase: string, sessionName: string): Promise<string[]> {
+  const separator = await packageString(context, 'conflict-latch.ts', 'CONFLICT_NOTICE_LINE_SEPARATOR')
+  return (await conflictNoticeBody(context, entry, latchCase, sessionName)).split(separator)
+}
+
+/** The persona prefix `formatPersonaNotice` adds: `formatPersonaNotice({ name, key }, '')`, the key `personaKey(name)` unless given. */
+const personaNoticePrefix: Entry = {
+  synopsis: '<persona-name> [<key>]',
+  async print(args, context) {
+    const entry = 'personaNoticePrefix'
+    expectSomeArguments(entry, args, ['persona-name', 'key'], 1)
+    const [name, given] = args
+    const derive = await packageFunction<(name: string) => unknown>(context, 'persona-identity.ts', 'personaKey')
+    const key = given ?? builtString(entry, derive(name))
+    const format = await packageFunction<(persona: { name: string; key: string }, text: string) => unknown>(context, 'persona-notifier.ts', 'formatPersonaNotice')
+    return builtString(entry, format({ name, key }, ''))
+  },
+}
+
+/** `personaInstanceId(key)`: a persona's agent-director instance id. */
+const personaInstanceId: Entry = {
+  synopsis: '<key>',
+  async print(args, context) {
+    const entry = 'personaInstanceId'
+    expectArguments(entry, args, ['key'])
+    return builtString(entry, (await packageFunction<(key: string) => unknown>(context, 'persona-identity.ts', entry))(args[0]))
+  },
+}
+
+/** The whole CONFLICT notice body for a CONFLICT case, a quoted session and, when given, agent-director's description. */
+const conflictNoticeText: Entry = {
+  synopsis: '<case> <session-name> [<description>]',
+  async print(args, context) {
+    const entry = 'conflictNoticeText'
+    expectSomeArguments(entry, args, ['case', 'session-name', 'description'], 2)
+    const latchCase = await latchCaseArgument(context, entry, args[0], true)
+    return await conflictNoticeBody(context, entry, latchCase, args[1], args[2])
+  },
+}
+
+/** The CONFLICT notice's first line (head, `"<session>"`, the case sentence when the case has one, tail), from `conflictNoticeText`. */
+const conflictNoticeFirstLine: Entry = {
+  synopsis: '<case> <session-name>',
+  async print(args, context) {
+    const entry = 'conflictNoticeFirstLine'
+    expectArguments(entry, args, ['case', 'session-name'])
+    const latchCase = await latchCaseArgument(context, entry, args[0], true)
+    return (await conflictNoticeLines(context, entry, latchCase, args[1]))[0]
+  },
+}
+
+/** The CONFLICT notice's list line for a session name (or the unsafe-name line in its place), from `conflictNoticeText`. */
+const conflictNoticeListLine: Entry = {
+  synopsis: '<session-name>',
+  async print(args, context) {
+    const entry = 'conflictNoticeListLine'
+    expectArguments(entry, args, ['session-name'])
+    const leftover = await packageString(context, 'conflict-latch.ts', 'LATCH_CASE_LEFTOVER')
+    const lines = await conflictNoticeLines(context, entry, leftover, args[0])
+    const line = lines[lines.length - 2]
+    const head = await packageString(context, 'conflict-latch.ts', 'CONFLICT_NOTICE_LIST_LINE_HEAD')
+    const unsafe = await packageString(context, 'conflict-latch.ts', 'CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME')
+    if (line === undefined || !(line.startsWith(head) || line === unsafe)) {
+      fail(PRINTER_FAIL_EXIT, `${entry}: the notice's line before the human-only line is not its list line`)
+    }
+    return line
+  },
+}
+
+/** `conflictCaseSentence(case)`: SRJ-1004's case sentence; a failure for a case that has none. */
+const conflictCaseSentence: Entry = {
+  synopsis: '<case>',
+  async print(args, context) {
+    const entry = 'conflictCaseSentence'
+    expectArguments(entry, args, ['case'])
+    const latchCase = await latchCaseArgument(context, entry, args[0])
+    const sentence = (await packageFunction<(latchCase: string) => unknown>(context, 'conflict-latch.ts', entry))(latchCase)
+    if (sentence === undefined) fail(PRINTER_FAIL_EXIT, `${entry}: case '${latchCase}' has no case sentence`)
+    return builtString(entry, sentence)
+  },
+}
+
+/** `unusableNameNoticeText(key, description)`: SRJ-1019's notice body. */
+const unusableNameNoticeText: Entry = {
+  synopsis: '<key> <description>',
+  async print(args, context) {
+    const entry = 'unusableNameNoticeText'
+    expectArguments(entry, args, ['key', 'description'])
+    return builtString(entry, (await packageFunction<(key: string, d: string) => unknown>(context, 'conflict-latch.ts', entry))(args[0], args[1]))
+  },
+}
+
+/** `launchStartNotRecordedNoticeText(key)`: SRJ-1020's notice body. */
+const launchStartNotRecordedNoticeText: Entry = {
+  synopsis: '<key>',
+  async print(args, context) {
+    const entry = 'launchStartNotRecordedNoticeText'
+    expectArguments(entry, args, ['key'])
+    return builtString(entry, (await packageFunction<(key: string) => unknown>(context, 'conflict-latch.ts', entry))(args[0]))
+  },
+}
+
+/** `conflictRecoveryText(session, reason)`: the CONFLICT recovery notice body. */
+const conflictRecoveryText: Entry = {
+  synopsis: `<session-name> <${RECOVERY_REASON_EXPORTS.join('|')}|${ROW_READS_REASON} <state>>`,
+  async print(args, context) {
+    const entry = 'conflictRecoveryText'
+    const [sessionName, ...reasonWords] = args
+    if (sessionName === undefined || sessionName === '') usageFail(`${entry} takes <session-name> <reason> [<state>]`)
+    const reason = await recoveryReasonArgument(context, entry, reasonWords)
+    return builtString(entry, (await packageFunction<(s: string, r: unknown) => unknown>(context, 'conflict-latch.ts', entry))(sessionName, reason))
+  },
+}
+
+/** `holdRecoveryText(reason)`: the hold recovery notice body. */
+const holdRecoveryText: Entry = {
+  synopsis: `<${RECOVERY_REASON_EXPORTS.join('|')}|${ROW_READS_REASON} <state>>`,
+  async print(args, context) {
+    const entry = 'holdRecoveryText'
+    const reason = await recoveryReasonArgument(context, entry, args)
+    return builtString(entry, (await packageFunction<(r: unknown) => unknown>(context, 'conflict-latch.ts', entry))(reason))
+  },
+}
+
+/** `conflictLatchSetLine(key, record, previousCase)`: the latch-set server-log line, the record built from the arguments (no description). */
+const conflictLatchSetLine: Entry = {
+  synopsis: '<key> <case> <session-name> <refused-operation> <row-state> [<previous-case>]',
+  async print(args, context) {
+    const entry = 'conflictLatchSetLine'
+    expectSomeArguments(entry, args, ['key', 'case', 'session-name', 'refused-operation', 'row-state', 'previous-case'], 5)
+    const [key, caseWord, sessionName, operation, state, previous] = args
+    const record = {
+      sessionName,
+      latchCase: await latchCaseArgument(context, entry, caseWord),
+      refusedOperation: await refusedOperationArgument(context, entry, operation),
+      rowState: await rowStateArgument(context, state),
+    }
+    const previousCase = previous === undefined ? undefined : await latchCaseArgument(context, entry, previous)
+    const build = await packageFunction<(key: string, record: object, previous?: string) => unknown>(context, 'conflict-latch.ts', entry)
+    return builtString(entry, build(key, record, previousCase))
+  },
+}
+
+/** The printer's words for whether the recovery notice was posted. */
+const POSTED_WORDS: Readonly<Record<string, boolean>> = { posted: true, 'not-posted': false }
+
+/** `latchClearedLine(key, record, reason, posted)`: the clear's server-log line (the builder reads the record's case and session only). */
+const latchClearedLine: Entry = {
+  synopsis: `<key> <case> <session-name> <posted|not-posted> <${RECOVERY_REASON_EXPORTS.join('|')}|${ROW_READS_REASON} <state>>`,
+  async print(args, context) {
+    const entry = 'latchClearedLine'
+    const [key, caseWord, sessionName, postedWord, ...reasonWords] = args
+    if ([key, caseWord, sessionName, postedWord].some((a) => a === undefined || a === '')) {
+      usageFail(`${entry} takes <key> <case> <session-name> <posted|not-posted> <reason> [<state>]`)
+    }
+    const posted = Object.hasOwn(POSTED_WORDS, postedWord) ? POSTED_WORDS[postedWord] : undefined
+    if (posted === undefined) usageFail(`${entry}: <posted|not-posted> is '${postedWord}'`)
+    const record = {
+      sessionName,
+      latchCase: await latchCaseArgument(context, entry, caseWord),
+      refusedOperation: await packageString(context, 'conflict-latch.ts', 'REFUSED_OPERATION_NONE'),
+      rowState: await packageExport(context, 'conflict-latch.ts', 'LATCH_ROW_STATE_UNREADABLE'),
+    }
+    const reason = await recoveryReasonArgument(context, entry, reasonWords)
+    const build = await packageFunction<(key: string, record: object, reason: unknown, posted: boolean) => unknown>(context, 'conflict-latch.ts', entry)
+    return builtString(entry, build(key, record, reason, posted))
+  },
+}
+
+/** `latchRecheckRoundLine(ref, case, step, call, answer)`: the re-check round's server-log line, `ref` the persona reference `renderPersonaRef` gives the name. */
+const latchRecheckRoundLine: Entry = {
+  synopsis: '<persona-name> <case> <step> <call> <answer>',
+  async print(args, context) {
+    const entry = 'latchRecheckRoundLine'
+    expectArguments(entry, args, ['persona-name', 'case', 'step', 'call', 'answer'])
+    const [name, caseWord, step, call, answer] = args
+    const latchCase = await latchCaseArgument(context, entry, caseWord)
+    const ref = (await packageFunction<(name: string) => unknown>(context, 'persona-identity.ts', 'renderPersonaRef'))(name)
+    const build = await packageFunction<(ref: unknown, c: string, s: string, call: string, a: string) => unknown>(context, 'conflict-latch.ts', entry)
+    return builtString(entry, build(builtString(entry, ref), latchCase, step, call, answer))
+  },
+}
+
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = {
   // Scenario 8 (test-20-fmk-old-binary.sh).
@@ -228,6 +637,22 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX: constantEntry('ad-version-gate.ts', 'AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX'),
   INVALID_FLAGS_HOLD_ALERT_TEXT: constantEntry('invalid-flags-hold.ts', 'INVALID_FLAGS_HOLD_ALERT_TEXT'),
   formatPersonaNotice: personaNotice,
+  // The latch scenarios, E42–E43 (test-15 onward).
+  ...constantEntries('conflict-latch.ts', LATCH_CONSTANT_NAMES),
+  ...constantEntries('ad-description-phrases.ts', CASE_PHRASE_NAMES),
+  personaNoticePrefix,
+  personaInstanceId,
+  conflictNoticeText,
+  conflictNoticeFirstLine,
+  conflictNoticeListLine,
+  conflictCaseSentence,
+  unusableNameNoticeText,
+  launchStartNotRecordedNoticeText,
+  conflictRecoveryText,
+  holdRecoveryText,
+  conflictLatchSetLine,
+  latchClearedLine,
+  latchRecheckRoundLine,
 }
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */

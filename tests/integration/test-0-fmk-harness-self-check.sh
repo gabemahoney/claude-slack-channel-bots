@@ -1562,6 +1562,8 @@ leg_guard_refusals() {
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_mode "${SCENARIO_ROOT}/work" "${STUB_MODE_AT_ONCE}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_press_enter "${T0_SESSION}"
         expect_fails_in_home "${step}" "${home}" "${reason}" write_mcp_config "${SCENARIO_PORT}"
+        # The latch scenarios' trail reader (read-only, guarded all the same).
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_trail_events ad.hook.fired
         # The labels, seeding, the human's tmux steps, the store statements,
         # the operator's actions, the find-missing loop and the 0.10.0
         # seeders. Each would act on the scenario's own tmux server or

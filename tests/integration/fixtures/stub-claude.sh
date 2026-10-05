@@ -169,8 +169,11 @@
 # it SIGTERM, and on any other end of the stub (a kill) it sees its parent
 # change and exits, or dies with the pane's hang-up. When the server ends the
 # session (a refusal, a stop), the client exits; a later `/mcp reconnect` line,
-# which CSCB types into a persona's pane to reconnect it, opens a new session
-# when none is running.
+# alone or followed by a space and a server name as CSCB types it
+# (`/mcp reconnect slack-channel-router`) into a persona's pane to reconnect
+# it, opens a new session, as the real `claude` reconnects: a client still
+# running then (one whose server restarted before its next ping noticed) is
+# ended first, with SIGTERM, and waited for.
 # No session is opened when the client is not beside the stub (Test 4, Test 10
 # and Test 12, which copy only the stub), when the stub was given no
 # `--mcp-config`, or in a mode that has not reported in (`silent`, a dialog not
@@ -573,6 +576,17 @@ open_mcp_session() {
     MCP_PID=$!
 }
 
+# reconnect_mcp_session: `/mcp reconnect`: end the client if one still runs,
+# then open a new session.
+reconnect_mcp_session() {
+    if mcp_session_running; then
+        kill -TERM "${MCP_PID}" 2> /dev/null
+        wait "${MCP_PID}" 2> /dev/null
+        MCP_PID=""
+    fi
+    open_mcp_session
+}
+
 close_mcp_session() {
     if mcp_session_running; then
         kill -TERM "${MCP_PID}" 2> /dev/null
@@ -630,8 +644,8 @@ handle_line() {
     fi
     if (( AWAITING_ENTER )); then
         report_in
-    elif (( REPORTED )) && [[ "${line}" == '/mcp reconnect' ]]; then
-        open_mcp_session
+    elif (( REPORTED )) && [[ "${line}" == '/mcp reconnect' || "${line}" == '/mcp reconnect '?* ]]; then
+        reconnect_mcp_session
     fi
 }
 

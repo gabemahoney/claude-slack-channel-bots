@@ -162,7 +162,7 @@ why:
 - Every `scenario.sh` step that installs, moves or swaps an agent-director
   binary or the shim, every harness agent-director call (`ad`, `ad_capture`, `ad_admin`, `ad_admin_capture`),
   every harness `sqlite3` read or edit (`ad_store_edit`, `ad_store_id`,
-  `ad_store_pending_no_launch`) and every stub-worker helper (`stub_mode`,
+  `ad_store_pending_no_launch`), the trail reader `ad_trail_events` and every stub-worker helper (`stub_mode`,
   `stub_press_enter`, `write_mcp_config`) calls `require_ci_image` as its
   first step, which fails with
   `FAIL: <test>: <step>: refused: /etc/cscb-ci-image is absent …`.
@@ -227,6 +227,18 @@ tests/
                                    # re-bind (`tmux_server_steps`). The re-fire legs wait out agent-director's default G (60 s); only after them does
                                    # `store_statements` write a `[tmux]` table (`starting_session_seconds = 60`, `stopping_window_seconds = 30`), so the
                                    # kill need not wait 300 s. It runs about two and a half minutes and ends with the three closing assertions
+    test-15-fmk-prefix-neighbour.sh  # HO §7 scenario 3 (b.jg5 SRJ-1404), fmk: a hand-made prefix neighbour is never read or typed into
+                                   # Set-up: one persona `dev`; with the server stopped, the harness spawns the neighbour from the scenario's own shell
+                                   # (`ad_capture spawn`; CSCB rejects persona keys that prefix each other, so it is made by hand): a real agent-director
+                                   # row of another instance id (`<SCENARIO_TAG>_neighbour`, outside `cscb_`) with no label, so no `service=cscb`,
+                                   # session `slack_bot_dev_x`, its stub held at the dev-channels dialog. Checks: `dev` resumes with its own
+                                   # claude_session_id and reconnects on a plain restart; the approver, `resume` and the restart path never touch the
+                                   # neighbour (no CSCB agent-director call names its id or session name, no tmux shim command reads from, types into,
+                                   # kills or respawns its session or pane, its row still reads `pending` with the same stub alive and no hook fired);
+                                   # no latch notice or latch line for `dev`; `dev`'s row present at the end. The first life's `stop --stop-bots` may
+                                   # leave `dev`'s row `waiting` (the stub ignores `pause`'s `/exit`, and no `find-missing` runs for an unlatched
+                                   # persona). Modes: tmux shim `log`, the stub's dev-channels hold, agent-director's defaults (no config.toml). It runs
+                                   # about 90 s and ends with the three closing assertions
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
@@ -275,7 +287,9 @@ test).
 
 There is no Test 11. It is retired, with its driver: CSCB makes no tmux call
 of its own (b.jg5 SRJ-601), and fmk scenarios 3 and 17 replace it (b.jg5
-SRJ-1305).
+SRJ-1305). Scenario 3 is Test 15 (`test-15-fmk-prefix-neighbour.sh`);
+scenario 17 is `assert_no_server_tmux` across every fmk script (see Closing
+assertions).
 
 ### Testplan tickets
 
@@ -449,7 +463,8 @@ The agent-director shim (`fixtures/agent-director-shim.sh`):
   the real binary beside it as `agent-director.real`; the same file fronts
   agent-director-admin at the admin path, with its binary beside it as
   `agent-director-admin.real`;
-- for each invocation appends one `call` line to its log, holding argv, the
+- for each invocation appends one `call` line to its log, holding the time it
+  was written (seconds since the epoch, six decimals), argv, the
   parent's PID and the parent's command line, then execs the real binary
   beside it, keeping the PID, argv, standard streams and exit status. When it
   cannot append the line it runs nothing and exits 70, so no call goes
@@ -635,6 +650,45 @@ by single spaces, hold every fixed-string fragment in order;
 `cscb_ad_count <verb> [<fragment>...]` prints how many. The harness's calls,
 the stub's calls and any `stop` line never count.
 
+Readers for the latch scenarios (fmk mode; harness additions, b.jg5
+SRJ-1306). Test 15 and the latch scenarios read the logs through these;
+`scenario.sh`'s header gives each one's arguments and output.
+
+- Marks. `ad_shim_mark` and `tmux_shim_mark` print a shim log's position
+  now (how many lines it holds, 0 with no log). A reader taking
+  `<from-mark>` and `<to-mark>` reads the lines after the first and up to
+  the second; `-` is no bound.
+- `ad_cscb_calls <instance-id|*> [<from-mark> [<to-mark>]]` prints one row
+  per CSCB-parented agent-director call (the same filter as `cscb_ad_calls`)
+  whose `--claude-instance-id` is exactly `<instance-id>`, never one it is a
+  prefix of; `*` takes every call that carries an instance id. A row is
+  `<position> TAB <time> TAB <ppid> TAB <verb> TAB <instance id, or -> TAB
+  <arguments>`: the line number in the shim's log, the line's time field,
+  the CSCB process that ran the call, and the words after the verb.
+- `wait_for_ad_cscb_call <instance-id> <verb> <min-count> <timeout-s>
+  [<step>]` waits until that instance id has at least `<min-count>` such
+  calls of `<verb>`, and fails naming the count found.
+- `ad_cscb_verb_between <verb> <from-mark> <to-mark>` prints the same rows
+  for a verb that carries no instance id (`find-missing`, `list`,
+  `version`).
+- `tmux_shim_targets <session-name|session-id|pane-id> [<from-mark>
+  [<to-mark>]]` prints one row per tmux command, chained commands included,
+  that reads from (`capture-pane`, `pipe-pane`), types into (`send-keys`,
+  `send-prefix`, `paste-buffer`), kills or respawns a `-t` target naming the
+  one given: the pane id exactly; for a session, its id, `=<name>` or
+  `<name>`, or a session part written without `=` that is a prefix of the
+  name (which tmux resolves to that session when no session has the exact
+  name).
+- `slack_posts <channel> [<record>]` prints the text of each
+  `chat.postMessage` to `<channel>` in the Slack stub's record (default
+  `SCENARIO_SLACK_RECORD`), whole and followed by a NUL byte, in record
+  order (see Slack stub).
+- `ad_trail_events <event> [<instance-id>]` runs `require_ci_image` and
+  `require_scenario_home` first, then prints the scenario HOME's
+  agent-director trail records (`.agent-director/ad-trail.jsonl`) of that
+  event, and of that instance id when given, one JSON object per line. It
+  only reads.
+
 Matchers (E14 director decision 14). A matcher is one or more fixed-string
 fragments that must appear on one line in the given order, with anything
 between them; there is no regex. A plain string is a one-fragment matcher, so
@@ -750,7 +804,7 @@ These hold for every fmk script (b.jg5 SRJ-1401):
   waits out agent-director's default windows (at least 300 s where it needs
   the starting-session bound, as the finished-row kill does).
 - Posts are read from the Slack stub's record (`slack-stub-server.ts
-  --record`).
+  --record`), with `slack_posts`.
 - Shim logs are read by parent process, as above, never by scraping a pane.
 
 ### Harness-only steps
@@ -995,8 +1049,8 @@ then reads its own row every 2 s and fires SessionStart again while the row
 reads `pending`, until G has passed since the row's launch start.
 
 - It reads the row with `status --claude-instance-id <id>`, run with the
-  program its first registered SessionStart hook names. Under the release
-  candidate's hooks that is the real binary, so the reads bypass the
+  program its first registered SessionStart hook names. Under the release's
+  hooks that is the real binary, so the reads bypass the
   agent-director shim. The id is `AGENT_DIRECTOR_INSTANCE_ID`, which
   agent-director puts in the worker's environment; the hooks' `args` carry
   none.
@@ -1027,7 +1081,9 @@ package's own MCP SDK as client `stub-claude` version `0.0.0-stub`, and
 answers the server's roots request with the stub's working directory, by
 which the server matches the persona. It ends with the stub (its exit, a
 kill, the pane's hang-up), so a stopped persona reads not connected; when the
-server ends it, a later `/mcp reconnect` in the pane opens a new one. Its
+server ends it, a later `/mcp reconnect` in the pane (bare, or followed by
+the server name as CSCB types it, `/mcp reconnect slack-channel-router`)
+opens a new one, first ending a session client still running. Its
 lines go to `stub-mcp-session.log` beside the stub. No session is opened in
 a mode that has not reported in, without `--mcp-config`, or where the client
 is not beside the stub (Tests 4, 10 and 12, which copy only the stub and run
@@ -1055,7 +1111,10 @@ variable for the integration suite only (see Environment Variables in
   suffix: refused auth, a handshake to a closed port, and so on. The scenario
   rewrites it to switch answers mid-run.
 - Every request is one JSONL line in a record file, labelled with the persona
-  the scenario assigned to the token and a token hash, never the token.
+  the scenario assigned to the token and a token hash, never the token. A
+  `chat.postMessage` line keeps its `text` whole, with token-like text
+  redacted (`slack_posts` reads them); every other method's `text` is cut at
+  300 characters.
 - It has no `bun test` suite of its own; Test 10 exercises it end to end.
 
 A live start also launches each persona through the real agent-director
