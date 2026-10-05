@@ -377,7 +377,7 @@
  *                                    src/ad-settings.ts)
  * Scenario 7, reuse replaces delete (test-19; b.jg5 SRJ-1409, SRJ-413,
  * SRJ-707, SRJ-712):
- *   preTrustLogLine <name> <verb> <value>
+ *   personaPreTrustLogLine <name> <verb> <value>
  *                                    the one `pre_trust` line a successful
  *                                    launch logs (`preTrustLogLine`,
  *                                    src/session-manager.ts) for the persona
@@ -433,11 +433,14 @@
  * The body entries print a body without the persona prefix; wrap one in
  * `formatPersonaNotice <persona-name> <entry> …` for the posted text.
  *
- * The one-function entries of scenarios 5, 11 and 13 (`FN_ENTRIES`;
- * test-17). Each checks its own arguments. `DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS`,
+ * The one-function entries of scenarios 5, 11, 13, 21 and 22
+ * (`FN_ENTRIES`; test-17, test-24 and test-25). Each checks its own
+ * arguments. `DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS`,
  * `UNAVAILABLE_RETRY_BASE_S`, `UNAVAILABLE_RETRY_CEILING_S` and
  * `tmuxUnresponsiveOnsetText <key>`, which test-17 reads too, are the
- * fixed-argument entries above.
+ * fixed-argument entries above; `personaInstanceId <key>` and
+ * `personaTmuxSessionName <key>`, which test-24 and test-25 read, are the
+ * shared ones.
  *   APPROVER_LOG_PREFIX           src/session-manager.ts APPROVER_LOG_PREFIX: the head
  *                                 of every log line the dialog approver writes
  *   DEV_CHANNELS_DIALOG_NEEDLE    src/session-manager.ts DEV_CHANNELS_DIALOG_NEEDLE: the
@@ -555,6 +558,186 @@
  *                                 logs when it stops the persona's running approver
  * A <key> is a persona key (lower-case letters, digits and `_`); a <ref> is
  * one line. A head or part is printed as it is, a trailing space included.
+ *
+ * The stuck-launch entries (scenario 21), each printing a `src/` export or a
+ * builder's output for its arguments. <ref> is a persona reference as the
+ * server logs it (`"<name>" (key=<key>)`), <key> a persona key, <name> a
+ * persona name, <launch-start> a row's `launch_started_at` as agent-director
+ * prints it, and <bound-ms> B in milliseconds:
+ *   PENDING_ROW_RUN_NOT_JUDGED    src/pending-row.ts PENDING_ROW_RUN_NOT_JUDGED: the
+ *                                 placement a pending-row rule round's line gives
+ *                                 its bypassing `find-missing` run when the run left
+ *                                 the `pending` row in neither list (not judged)
+ *   PENDING_ROW_RULE_ORIGIN_RETRY src/pending-row.ts PENDING_ROW_RULE_ORIGIN_RETRY: the
+ *                                 origin a rule line names for a run at a retry of
+ *                                 the persona's retry timer
+ *   PENDING_ROW_RULE_ORIGIN_APPROVER_STOP
+ *                                 src/pending-row.ts
+ *                                 PENDING_ROW_RULE_ORIGIN_APPROVER_STOP: the origin a
+ *                                 rule line names for the run at the dialog
+ *                                 approver's stop
+ *   adLaunchBoundMs(DEFAULT_AD_SETTINGS_IN_EFFECT)
+ *                                 src/ad-settings.ts adLaunchBoundMs over
+ *                                 DEFAULT_AD_SETTINGS_IN_EFFECT: B, CSCB's launch
+ *                                 bound at agent-director's default settings, in
+ *                                 milliseconds
+ * None of the above takes an argument.
+ *   approverBoundLine <ref> <bound-ms>
+ *                                 src/session-manager.ts approverLogLine over
+ *                                 approverBoundMessage(<ref>, <bound-ms>,
+ *                                 APPROVER_BOUND_FROM_LAUNCH_START): the one line the
+ *                                 dialog approver writes when it stops at B measured
+ *                                 from the launch start
+ *   pendingRowRuleApproverStopRelaunchLine <ref>
+ *                                 src/session-manager.ts
+ *                                 pendingRowRuleApproverStopLine(<ref>,
+ *                                 APPROVER_STOP_BOUND, …) for the rule's answer
+ *                                 PENDING_ROW_RULE_RELAUNCH with
+ *                                 PENDING_ROW_RELAUNCH_SEQUENCE_STARTED
+ *                                 (src/pending-row.ts): the line of the rule's run at
+ *                                 the approver's stop at B that made the relaunching
+ *                                 post and the abort, and started the live-row
+ *                                 sequence
+ *   stuckLaunchRelaunchingPost <name> <key> <bound-ms>
+ *                                 src/persona-notifier.ts formatPersonaNotice for the
+ *                                 persona over src/pending-row.ts
+ *                                 stuckLaunchRelaunchingText(<key>, <bound-ms>): the
+ *                                 whole relaunching post as the persona notifier
+ *                                 posts it
+ *   stuckLaunchHeldPost <name> <key> <launch-start> <true|false>
+ *                                 src/persona-notifier.ts formatPersonaNotice for the
+ *                                 persona over src/pending-row.ts
+ *                                 stuckLaunchHeldText(<key>, <launch-start>, <met
+ *                                 not interactive>): the whole held post (with the
+ *                                 attach remedy for `false`), multi-line
+ *   describeLaunchStartForLog <launch-start>
+ *                                 src/pending-row.ts describeLaunchStartForLog: the one
+ *                                 renderer of a launch start, in the held text and
+ *                                 the rule's lines
+ *   stuckLaunchPostLine <key> <mark> <answer>
+ *                                 src/pending-row.ts stuckLaunchPostLine(<key>, <mark>,
+ *                                 <answer>), where <mark> is STUCK_LAUNCH_MARK_RELAUNCHING
+ *                                 or STUCK_LAUNCH_MARK_HELD and <answer> one of the
+ *                                 poster's answers (STUCK_LAUNCH_POSTED,
+ *                                 STUCK_LAUNCH_ALREADY_POSTED, STUCK_LAUNCH_SUPPRESSED,
+ *                                 STUCK_LAUNCH_NOT_POSTED_CLOSED,
+ *                                 STUCK_LAUNCH_POST_FAILED), each given by its value:
+ *                                 the poster's one line for that answer
+ *   stuckLaunchAbortKillSucceededHead <key>
+ *                                 src/pending-row.ts stuckLaunchAbortKillLine for the
+ *                                 answer STUCK_LAUNCH_ABORT_KILL_SUCCEEDED whose
+ *                                 description is src/checked-kill.ts
+ *                                 describeKillOutcome of a KILL_OUTCOME_KILLED outcome
+ *                                 with `kill_sent` true, cut where what follows
+ *                                 begins: the abort kill's line up to and including
+ *                                 the `— ` after the description
+ *   liveRowSequenceStep3MarkedMissingLines <ref>
+ *                                 src/live-row-sequence.ts liveRowSequenceRunLine(<ref>,
+ *                                 3, <n>, LIVE_ROW_RUN_MARKED_MISSING) for each <n> from
+ *                                 1 to LIVE_ROW_SEQUENCE_STEP3_RUNS, one line each:
+ *                                 every line a step-3 run of the live-row sequence
+ *                                 logs when it marked the row `missing`
+ *   stuckLaunchHeldPostedLines <key>
+ *                                 src/pending-row.ts stuckLaunchPostLine(<key>,
+ *                                 STUCK_LAUNCH_MARK_HELD, STUCK_LAUNCH_POSTED, …) for
+ *                                 each form of the held text (with the attach line,
+ *                                 and without it: `metNotInteractive` false, then
+ *                                 true), each unmuted, then muted by a submitted
+ *                                 teardown, one line each: every line the held
+ *                                 text's poster logs for the answer `posted`
+ *   pendingRowRuleRoundLineHead <ref> <origin>
+ *                                 src/pending-row.ts pendingRowRuleRoundLine(<ref>,
+ *                                 <origin>, …), where <origin> is
+ *                                 PENDING_ROW_RULE_ORIGIN_RETRY or
+ *                                 PENDING_ROW_RULE_ORIGIN_APPROVER_STOP by its value,
+ *                                 cut where the launch start's rendering
+ *                                 (describeLaunchStartForLog) begins: the head of every
+ *                                 round line of the pending-row rule for <ref> from
+ *                                 that origin, up to and including `launch started `
+ *
+ * The relabelled-session entries (scenario 21's abort kill answered CONFLICT,
+ * "not this launch's session"). <description> is agent-director's description
+ * of that CONFLICT as the latch's record holds it (the `message="…"` of its
+ * latch-set line, JSON-decoded); an entry given one that lacks
+ * CONFLICT_NOT_THIS_LAUNCH_PHRASE, or that the package recognises as another
+ * case, fails:
+ * Neither of the above takes an argument.
+ *   stuckLaunchAbortKillConflictHead <key>
+ *                                 src/pending-row.ts stuckLaunchAbortKillLine for the
+ *                                 answer STUCK_LAUNCH_ABORT_KILL_LATCHED whose
+ *                                 description is src/checked-kill.ts
+ *                                 describeKillOutcome of the outcome killOutcomeOf
+ *                                 gives a thrown ErrTmuxSessionConflict (src/agent-
+ *                                 director-errors.ts, the client's class), cut where
+ *                                 agent-director's description begins: the abort kill's
+ *                                 line for a CONFLICT that latched the persona, up to
+ *                                 and including the `message="` before that description
+ *   conflictLatchSetLineHead <key> <latched|relatched>
+ *                                 src/conflict-latch.ts conflictLatchSetLine for a new
+ *                                 latch (CONFLICT_LATCH_SET_LATCHED) or a relatch
+ *                                 (CONFLICT_LATCH_SET_RELATCHED), cut where the case
+ *                                 begins: the head of every such line for the persona,
+ *                                 up to and including `case=`
+ *   conflictNotThisLaunchLatchedLine <key> <description>
+ *                                 src/conflict-latch.ts conflictLatchSetLine for the
+ *                                 latch the abort kill's CONFLICT sets: case
+ *                                 LATCH_CASE_NOT_THIS_LAUNCH, the session
+ *                                 conflictSessionName(<description>, <key>), refused
+ *                                 operation REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
+ *                                 the row state src/liveness-reading.ts
+ *                                 AGENT_DIRECTOR_PENDING_STATE (latchRowStateRead), and
+ *                                 the description (src/persona-connection-errors.ts
+ *                                 renderLogMessageText, as the record stores it)
+ *   conflictNotThisLaunchPost <name> <key> <description>
+ *                                 src/persona-notifier.ts formatPersonaNotice for the
+ *                                 persona over src/conflict-latch.ts conflictNoticeText
+ *                                 for that latch's record (the session, the case and
+ *                                 the description as above; the list line decided from
+ *                                 the session name, which the record keeps unchanged
+ *                                 for a name rendering does not change): the whole
+ *                                 CONFLICT post, multi-line
+ *   latchRecheckNotThisLaunchRoundHead <ref>
+ *                                 src/conflict-latch.ts latchRecheckRoundLine(<ref>,
+ *                                 LATCH_CASE_NOT_THIS_LAUNCH, …), cut where the step
+ *                                 begins: the head of every re-check round line of a
+ *                                 "not this launch's session" latch, up to and
+ *                                 including `step=`
+ *
+ * The pre-trust entries (scenario 22). <ref> is a persona reference as the
+ * server logs it, <key> a persona key, <verb> a launch verb by its value (one
+ * of LAUNCH_VERB_SPAWN, LAUNCH_VERB_RESUME and LAUNCH_VERB_REUSE_SPAWN; any
+ * other fails), and <value> a `pre_trust` value as a launch result carries it:
+ *   LAUNCH_VERB_SPAWN            src/session-manager.ts LAUNCH_VERB_SPAWN: the verb a
+ *                                 `pre_trust` line names for a plain spawn
+ *   LAUNCH_VERB_RESUME            src/session-manager.ts LAUNCH_VERB_RESUME: the verb a
+ *                                 `pre_trust` line names for a `resume`
+ *   LAUNCH_VERB_REUSE_SPAWN       src/session-manager.ts LAUNCH_VERB_REUSE_SPAWN: the
+ *                                 verb a `pre_trust` line names for a reuse spawn
+ * None of the above takes an argument.
+ *   preTrustLogLine <ref> <verb> [<value>]
+ *                                 src/session-manager.ts preTrustLogLine(<ref>, <verb>,
+ *                                 <value>): the one line a successful launch writes
+ *                                 about its `pre_trust`; with no <value>, the line for
+ *                                 a result that carries no `pre_trust` field (the
+ *                                 older-binary wording)
+ *   preTrustLogLineHead <ref> <verb>
+ *                                 src/session-manager.ts preTrustLogLine for a present
+ *                                 value, cut where the value begins: the head of
+ *                                 every such line for <ref> and <verb>, whatever
+ *                                 value it shows
+ *   personaDefaultConfigDirLabels <key> <home>
+ *                                 the labels a spawn of persona <key> with no
+ *                                 `claude_config_dir` carries under the home
+ *                                 directory <home>, one per line, in the order
+ *                                 src/session-manager.ts buildSpawnParams lists them:
+ *                                 src/persona-identity.ts SERVICE_LABEL, then
+ *                                 PERSONA_LABEL_PREFIX and <key>, then
+ *                                 CONFIG_DIR_LABEL_PREFIX and
+ *                                 src/session-manager.ts personaConfigDirLabelValue
+ *                                 (no directory, <home>), which resolves
+ *                                 `<home>/.claude` to its real path (the one
+ *                                 derivation the spawn labels and the collision
+ *                                 ladder's `config_dir` comparison share)
  *
  * An entry is one `Entry` in `ENTRIES`: its argument synopsis, the export it
  * prints and a `print` function from its arguments to the value. Constants
@@ -1619,7 +1802,7 @@ const ARGS_ENTRIES: Readonly<Record<string, ArgsEntry>> = {
     },
   },
   // Scenario 7 (test-19; b.jg5 SRJ-1409).
-  preTrustLogLine: {
+  personaPreTrustLogLine: {
     args: ['name', 'verb', 'value'],
     print: async ([name, verbName, preTrust]) => {
       if (!/^LAUNCH_VERB_[A-Z_]+$/.test(verbName)) throw new PrinterFailure(`verb '${verbName}' is not a LAUNCH_VERB_* export's name`, USAGE_EXIT)
@@ -1699,7 +1882,7 @@ function joinEntryTables(...tables: readonly Readonly<Record<string, Entry>>[]):
 }
 
 // ---------------------------------------------------------------------------
-// The one-function entries (scenarios 5, 11 and 13)
+// The one-function entries (scenarios 5, 11, 13, 21 and 22)
 // ---------------------------------------------------------------------------
 
 /** Imports the installed package's `src/<relPath>`. */
@@ -1777,7 +1960,6 @@ async function tmuxUnresponsiveEndedLines(key: string): Promise<string> {
   return lines.join('\n')
 }
 
-/** The package's `tmuxUnresponsiveOnsetText(key)`: the onset notice's one body for persona `key`. */
 
 /** An agent-director error name: `Err`, then letters and digits. */
 const ERROR_NAME_RE = /^Err[A-Za-z0-9]+$/
@@ -1805,6 +1987,16 @@ async function spawnFailureNoticeHead(errorName: string): Promise<string> {
     throw new PrinterFailure("the installed package's src/session-manager.ts spawnFailureNoticeText gave no text holding the error's description", PRINTER_FAIL_EXIT)
   }
   return text.slice(0, at)
+}
+
+/** An entry that takes exactly the arguments `argNames` names, in its usage error, and prints `read(args)`. */
+function exactArguments(name: string, argNames: readonly string[], read: (args: readonly string[]) => Promise<string>): FnEntry {
+  return async (args) => {
+    if (args.length !== argNames.length) {
+      throw new PrinterFailure(`${name} takes ${argNames.map((a) => `<${a}>`).join(' ')} (got ${args.length} argument(s))`, USAGE_EXIT)
+    }
+    return await read(args)
+  }
 }
 
 /** Export `name` of `relPath`, which must be a function. */
@@ -2038,6 +2230,248 @@ async function approverShutdownStopLine(ref: string): Promise<string> {
   return line
 }
 
+/** A builder's output, which must be a string. */
+function builtText(relPath: string, name: string, value: unknown): string {
+  if (typeof value !== 'string') throw new PrinterFailure(`the installed package's src/${relPath} ${name} gave no text`, PRINTER_FAIL_EXIT)
+  return value
+}
+
+/** `arg`, named `argName` in `entry`'s usage error, as a whole number of milliseconds. */
+function wholeMsArgument(entry: string, argName: string, arg: string): number {
+  if (!/^[0-9]+$/.test(arg)) throw new PrinterFailure(`${entry}: <${argName}> '${arg}' is not a whole number of milliseconds`, USAGE_EXIT)
+  return Number(arg)
+}
+
+/** `arg`, named `argName` in `entry`'s usage error, as `true` or `false`. */
+function booleanArgument(entry: string, argName: string, arg: string): boolean {
+  if (arg !== 'true' && arg !== 'false') throw new PrinterFailure(`${entry}: <${argName}> '${arg}' is not true or false`, USAGE_EXIT)
+  return arg === 'true'
+}
+
+/** `arg`, named `argName` in `entry`'s usage error, which must be one of the string exports `names` of `relPath`. */
+async function oneOfExports(entry: string, argName: string, arg: string, relPath: string, names: readonly string[]): Promise<string> {
+  const values = await Promise.all(names.map((n) => stringExport(relPath, n)))
+  if (!values.includes(arg)) throw new PrinterFailure(`${entry}: <${argName}> '${arg}' is none of ${values.join(', ')}`, USAGE_EXIT)
+  return arg
+}
+
+/** The posted text of a notice for the persona `name` with key `key`: the persona notifier's `formatPersonaNotice` over `text`. */
+async function formattedPersonaNotice(name: string, key: string, text: string): Promise<string> {
+  const format = await functionExport('persona-notifier.ts', 'formatPersonaNotice')
+  return builtText('persona-notifier.ts', 'formatPersonaNotice', format({ name, key }, text))
+}
+
+/** The approver's one line at B measured from the launch start, for `ref` and B `boundMs`. */
+async function approverBoundLine(ref: string, boundMs: number): Promise<string> {
+  const lineOf = await functionExport('session-manager.ts', 'approverLogLine')
+  const messageOf = await functionExport('session-manager.ts', 'approverBoundMessage')
+  const from = await stringExport('session-manager.ts', 'APPROVER_BOUND_FROM_LAUNCH_START')
+  const message = builtText('session-manager.ts', 'approverBoundMessage', messageOf(ref, boundMs, from))
+  return builtText('session-manager.ts', 'approverLogLine', lineOf(message))
+}
+
+/** The line of the rule's run at the approver's stop at B that answered the relaunch with the sequence started, for `ref`. */
+async function pendingRowRuleApproverStopRelaunchLine(ref: string): Promise<string> {
+  const lineOf = await functionExport('session-manager.ts', 'pendingRowRuleApproverStopLine')
+  const bound = await stringExport('session-manager.ts', 'APPROVER_STOP_BOUND')
+  const relaunch = await stringExport('pending-row.ts', 'PENDING_ROW_RULE_RELAUNCH')
+  const started = await stringExport('pending-row.ts', 'PENDING_ROW_RELAUNCH_SEQUENCE_STARTED')
+  return builtText('session-manager.ts', 'pendingRowRuleApproverStopLine', lineOf(ref, bound, { kind: relaunch, answer: { kind: started } }))
+}
+
+/** The relaunching post for the persona `name` with key `key`, with B `boundMs`. */
+async function stuckLaunchRelaunchingPost(name: string, key: string, boundMs: number): Promise<string> {
+  const textOf = await functionExport('pending-row.ts', 'stuckLaunchRelaunchingText')
+  return await formattedPersonaNotice(name, key, builtText('pending-row.ts', 'stuckLaunchRelaunchingText', textOf(key, boundMs)))
+}
+
+/** The held post for the persona `name` with key `key`, its launch start `launchStart` and `metNotInteractive`. */
+async function stuckLaunchHeldPost(name: string, key: string, launchStart: string, metNotInteractive: boolean): Promise<string> {
+  const textOf = await functionExport('pending-row.ts', 'stuckLaunchHeldText')
+  return await formattedPersonaNotice(name, key, builtText('pending-row.ts', 'stuckLaunchHeldText', textOf(key, launchStart, metNotInteractive)))
+}
+
+/** What follows the description in the abort kill's line; cut off with all after it. */
+const FOLLOWS_MARK = 'fmk texts follows mark'
+
+/** The abort kill's line for a success with `kill_sent` true for persona `key`, up to where what follows begins. */
+async function stuckLaunchAbortKillSucceededHead(key: string): Promise<string> {
+  const lineOf = await functionExport('pending-row.ts', 'stuckLaunchAbortKillLine')
+  const describe = await functionExport('checked-kill.ts', 'describeKillOutcome')
+  const succeeded = await stringExport('pending-row.ts', 'STUCK_LAUNCH_ABORT_KILL_SUCCEEDED')
+  const killed = await stringExport('checked-kill.ts', 'KILL_OUTCOME_KILLED')
+  const description = builtText('checked-kill.ts', 'describeKillOutcome', describe({ kind: killed, killSent: true }))
+  const line = builtText('pending-row.ts', 'stuckLaunchAbortKillLine', lineOf(key, { kind: succeeded, killSent: true, description }, FOLLOWS_MARK))
+  const at = line.indexOf(FOLLOWS_MARK)
+  if (at <= 0) throw new PrinterFailure("the installed package's src/pending-row.ts stuckLaunchAbortKillLine gave no line holding what follows", PRINTER_FAIL_EXIT)
+  return line.slice(0, at)
+}
+
+/** Every step-3 run line of the live-row sequence for `ref` that marked the row `missing`, one per run number, joined by newlines. */
+async function liveRowSequenceStep3MarkedMissingLines(ref: string): Promise<string> {
+  const lineOf = await functionExport('live-row-sequence.ts', 'liveRowSequenceRunLine')
+  const runs = Number(await wholeNumberAt('live-row-sequence.ts', 'LIVE_ROW_SEQUENCE_STEP3_RUNS', []))
+  const marked = await stringExport('live-row-sequence.ts', 'LIVE_ROW_RUN_MARKED_MISSING')
+  const lines: string[] = []
+  for (let run = 1; run <= runs; run++) lines.push(builtText('live-row-sequence.ts', 'liveRowSequenceRunLine', lineOf(ref, 3, run, marked)))
+  if (lines.length === 0) throw new PrinterFailure("the installed package's src/live-row-sequence.ts LIVE_ROW_SEQUENCE_STEP3_RUNS names no run", PRINTER_FAIL_EXIT)
+  return lines.join('\n')
+}
+
+/** Every line the held text's poster logs for persona `key` with the answer `posted`: both forms of the text, each unmuted and muted, joined by newlines. */
+async function stuckLaunchHeldPostedLines(key: string): Promise<string> {
+  const lineOf = await functionExport('pending-row.ts', 'stuckLaunchPostLine')
+  const held = await stringExport('pending-row.ts', 'STUCK_LAUNCH_MARK_HELD')
+  const posted = await stringExport('pending-row.ts', 'STUCK_LAUNCH_POSTED')
+  const lines: string[] = []
+  for (const metNotInteractive of [false, true]) {
+    for (const muted of [false, true]) {
+      const line = builtText('pending-row.ts', 'stuckLaunchPostLine', lineOf(key, held, posted, { metNotInteractive, muted }))
+      if (line.includes('\n')) throw new PrinterFailure("the installed package's src/pending-row.ts stuckLaunchPostLine gave a line holding a newline", PRINTER_FAIL_EXIT)
+      lines.push(line)
+    }
+  }
+  if (new Set(lines).size !== lines.length) {
+    throw new PrinterFailure("the installed package's src/pending-row.ts stuckLaunchPostLine gave the same line for two forms of the held text", PRINTER_FAIL_EXIT)
+  }
+  return lines.join('\n')
+}
+
+/** A launch start the round line's head is cut at: 2000-01-01T00:00:00.000Z, in epoch milliseconds. */
+const LAUNCH_START_MARK_MS = 946_684_800_000
+
+/** The head of the pending-row rule's round lines for `ref` from `origin`, up to where the launch start's rendering begins. */
+async function pendingRowRuleRoundLineHead(ref: string, origin: string): Promise<string> {
+  const o = await oneOfExports('pendingRowRuleRoundLineHead', 'origin', origin, 'pending-row.ts', [
+    'PENDING_ROW_RULE_ORIGIN_RETRY',
+    'PENDING_ROW_RULE_ORIGIN_APPROVER_STOP',
+  ])
+  const lineOf = await functionExport('pending-row.ts', 'pendingRowRuleRoundLine')
+  const render = await functionExport('pending-row.ts', 'describeLaunchStartForLog')
+  const rendered = builtText('pending-row.ts', 'describeLaunchStartForLog', render(LAUNCH_START_MARK_MS))
+  if (!rendered.startsWith('2000-01-01T')) {
+    throw new PrinterFailure(`the installed package's src/pending-row.ts describeLaunchStartForLog rendered ${LAUNCH_START_MARK_MS} as '${rendered}'`, PRINTER_FAIL_EXIT)
+  }
+  const line = builtText('pending-row.ts', 'pendingRowRuleRoundLine', lineOf(ref, o, LAUNCH_START_MARK_MS, [STEP_MARK], FOLLOWS_MARK))
+  return cutAt(line, rendered, 'src/pending-row.ts pendingRowRuleRoundLine')
+}
+
+/** Where the case begins in a built line; cut off with all that follows it. */
+const CASE_MARK = 'fmk-texts-case-mark'
+
+/** Where the step begins in a built line; cut off with all that follows it. */
+const STEP_MARK = 'fmk-texts-step-mark'
+
+/** `line` up to where `mark` begins, which must be inside it; `what` names the builder in the failure. */
+function cutAt(line: string, mark: string, what: string): string {
+  const at = line.indexOf(mark)
+  if (at <= 0) throw new PrinterFailure(`the installed package's ${what} gave no line holding the cut mark`, PRINTER_FAIL_EXIT)
+  return line.slice(0, at)
+}
+
+/** The abort kill's line for a CONFLICT (`ErrTmuxSessionConflict`) that latched persona `key`, up to where agent-director's description begins. */
+async function stuckLaunchAbortKillConflictHead(key: string): Promise<string> {
+  const lineOf = await functionExport('pending-row.ts', 'stuckLaunchAbortKillLine')
+  const describe = await functionExport('checked-kill.ts', 'describeKillOutcome')
+  const outcomeOf = await functionExport('checked-kill.ts', 'killOutcomeOf')
+  const latched = await stringExport('pending-row.ts', 'STUCK_LAUNCH_ABORT_KILL_LATCHED')
+  const conflictClass = await exportOf('agent-director-errors.ts', 'ErrTmuxSessionConflict')
+  if (typeof conflictClass !== 'function') {
+    throw new PrinterFailure("the installed package's src/agent-director-errors.ts ErrTmuxSessionConflict is not a class", PRINTER_FAIL_EXIT)
+  }
+  const ctor = conflictClass as new (verb: string, name: string, description: string) => unknown
+  const error: unknown = new ctor('kill', conflictClass.name, DESCRIPTION_MARK)
+  const description = builtText('checked-kill.ts', 'describeKillOutcome', describe(outcomeOf({ thrown: error })))
+  const line = builtText('pending-row.ts', 'stuckLaunchAbortKillLine', lineOf(key, { kind: latched, description }, FOLLOWS_MARK))
+  return cutAt(line, DESCRIPTION_MARK, 'src/pending-row.ts stuckLaunchAbortKillLine over src/checked-kill.ts describeKillOutcome')
+}
+
+/** The head of persona `key`'s latch-set lines of the kind `outcome` (a new latch or a relatch), up to and including `case=`. */
+async function conflictLatchSetLineHead(key: string, outcome: string): Promise<string> {
+  const lineOf = await functionExport('conflict-latch.ts', 'conflictLatchSetLine')
+  const relatched = await stringExport('conflict-latch.ts', 'CONFLICT_LATCH_SET_RELATCHED')
+  const noRow = await exportOf('conflict-latch.ts', 'LATCH_ROW_STATE_NO_ROW')
+  const record = { sessionName: CASE_MARK, latchCase: CASE_MARK, refusedOperation: CASE_MARK, rowState: noRow }
+  const line = builtText('conflict-latch.ts', 'conflictLatchSetLine', outcome === relatched ? lineOf(key, record, CASE_MARK) : lineOf(key, record))
+  return cutAt(line, CASE_MARK, 'src/conflict-latch.ts conflictLatchSetLine')
+}
+
+/**
+ * The latch record the abort kill's CONFLICT sets for persona `key` and
+ * agent-director's `description`, as src/conflict-latch.ts builds it from a
+ * thrown CONFLICT: the case the package recognises in the description, which
+ * must be "not this launch's session"; the session `conflictSessionName`
+ * gives, rendered; the refused operation "P's next check or recovery"; the
+ * row state `pending`; the description rendered.
+ */
+async function notThisLaunchKillLatchRecord(entry: string, key: string, description: string): Promise<Record<string, unknown>> {
+  const phrase = await stringExport('ad-description-phrases.ts', 'CONFLICT_NOT_THIS_LAUNCH_PHRASE')
+  if (!description.includes(phrase)) throw new PrinterFailure(`${entry}: <description> '${description}' does not carry '${phrase}'`, USAGE_EXIT)
+  const recognise = await functionExport('conflict-latch.ts', 'recogniseConflictCase')
+  const notThisLaunch = await stringExport('conflict-latch.ts', 'LATCH_CASE_NOT_THIS_LAUNCH')
+  const recognised = recognise(description)
+  if (recognised !== notThisLaunch) {
+    throw new PrinterFailure(`${entry}: the installed package's src/conflict-latch.ts recogniseConflictCase reads the description as ${String(recognised)}, not ${notThisLaunch}`, PRINTER_FAIL_EXIT)
+  }
+  const sessionOf = await functionExport('conflict-latch.ts', 'conflictSessionName')
+  const render = await functionExport('persona-connection-errors.ts', 'renderLogMessageText')
+  const rowStateOf = await functionExport('conflict-latch.ts', 'latchRowStateRead')
+  const refused = await stringExport('conflict-latch.ts', 'REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY')
+  const pending = await stringExport('liveness-reading.ts', 'AGENT_DIRECTOR_PENDING_STATE')
+  const sessionName = builtText('persona-connection-errors.ts', 'renderLogMessageText', render(builtText('conflict-latch.ts', 'conflictSessionName', sessionOf(description, key))))
+  const rendered = builtText('persona-connection-errors.ts', 'renderLogMessageText', render(description))
+  return {
+    sessionName,
+    latchCase: notThisLaunch,
+    refusedOperation: refused,
+    rowState: rowStateOf(pending),
+    ...(rendered === '' ? {} : { description: rendered }),
+  }
+}
+
+/** The latch-set line of the abort kill's "not this launch's session" CONFLICT for persona `key`. */
+async function conflictNotThisLaunchLatchedLine(key: string, description: string): Promise<string> {
+  const lineOf = await functionExport('conflict-latch.ts', 'conflictLatchSetLine')
+  const record = await notThisLaunchKillLatchRecord('conflictNotThisLaunchLatchedLine', key, description)
+  return builtText('conflict-latch.ts', 'conflictLatchSetLine', lineOf(key, record))
+}
+
+/** The CONFLICT post of that latch for the persona `name` with key `key`. */
+async function conflictNotThisLaunchPost(name: string, key: string, description: string): Promise<string> {
+  const textOf = await functionExport('conflict-latch.ts', 'conflictNoticeText')
+  const record = await notThisLaunchKillLatchRecord('conflictNotThisLaunchPost', key, description)
+  const text = builtText('conflict-latch.ts', 'conflictNoticeText', textOf({ sessionName: record['sessionName'], latchCase: record['latchCase'], description: record['description'] }))
+  return await formattedPersonaNotice(name, key, text)
+}
+
+/** The head of a "not this launch's session" latch's re-check round lines for `ref`, up to and including `step=`. */
+async function latchRecheckNotThisLaunchRoundHead(ref: string): Promise<string> {
+  const lineOf = await functionExport('conflict-latch.ts', 'latchRecheckRoundLine')
+  const notThisLaunch = await stringExport('conflict-latch.ts', 'LATCH_CASE_NOT_THIS_LAUNCH')
+  const line = builtText('conflict-latch.ts', 'latchRecheckRoundLine', lineOf(ref, notThisLaunch, STEP_MARK, STEP_MARK, STEP_MARK))
+  return cutAt(line, STEP_MARK, 'src/conflict-latch.ts latchRecheckRoundLine')
+}
+
+/** The launch verbs a `pre_trust` line names, by their exports in src/session-manager.ts. */
+const LAUNCH_VERB_EXPORTS = ['LAUNCH_VERB_SPAWN', 'LAUNCH_VERB_RESUME', 'LAUNCH_VERB_REUSE_SPAWN'] as const
+
+/** `preTrustLogLine(ref, verb, value)` (a present value is built as VALUE_MARK, and the line cut off there with all that follows it), `value` undefined for a result with no `pre_trust` field; `entry` names the entry in a usage error. */
+async function preTrustLogLine(entry: string, ref: string, verb: string, value: string | undefined): Promise<string> {
+  const lineOf = await functionExport('session-manager.ts', 'preTrustLogLine')
+  const v = await oneOfExports(entry, 'verb', verb, 'session-manager.ts', LAUNCH_VERB_EXPORTS)
+  return builtText('session-manager.ts', 'preTrustLogLine', lineOf(ref, v, value))
+}
+
+/** The labels a spawn of persona `key` with no claude_config_dir carries under `home`, one per line. */
+async function personaDefaultConfigDirLabels(key: string, home: string): Promise<string> {
+  const service = await stringExport('persona-identity.ts', 'SERVICE_LABEL')
+  const personaPrefix = await stringExport('persona-identity.ts', 'PERSONA_LABEL_PREFIX')
+  const configDirPrefix = await stringExport('persona-identity.ts', 'CONFIG_DIR_LABEL_PREFIX')
+  const labelOf = await functionExport('session-manager.ts', 'personaConfigDirLabelValue')
+  const label = builtText('session-manager.ts', 'personaConfigDirLabelValue', labelOf(undefined, home))
+  return [service, `${personaPrefix}${key}`, `${configDirPrefix}${label}`].join('\n')
+}
+
 /** The one-function entries, by the name a script passes. */
 const FN_ENTRIES: Readonly<Record<string, FnEntry>> = {
   APPROVER_LOG_PREFIX: noArguments('APPROVER_LOG_PREFIX', () => stringExport('session-manager.ts', 'APPROVER_LOG_PREFIX')),
@@ -2076,6 +2510,81 @@ const FN_ENTRIES: Readonly<Record<string, FnEntry>> = {
   launchUnavailableFormText: oneArgument('launchUnavailableFormText', 'form', launchUnavailableFormText),
   tmuxUnresponsiveLineHead: oneArgument('tmuxUnresponsiveLineHead', 'key', tmuxUnresponsiveLineHead),
   approverShutdownStopLine: oneArgument('approverShutdownStopLine', 'ref', approverShutdownStopLine),
+  PENDING_ROW_RUN_NOT_JUDGED: noArguments('PENDING_ROW_RUN_NOT_JUDGED', () => stringExport('pending-row.ts', 'PENDING_ROW_RUN_NOT_JUDGED')),
+  PENDING_ROW_RULE_ORIGIN_RETRY: noArguments('PENDING_ROW_RULE_ORIGIN_RETRY', () => stringExport('pending-row.ts', 'PENDING_ROW_RULE_ORIGIN_RETRY')),
+  PENDING_ROW_RULE_ORIGIN_APPROVER_STOP: noArguments('PENDING_ROW_RULE_ORIGIN_APPROVER_STOP', () =>
+    stringExport('pending-row.ts', 'PENDING_ROW_RULE_ORIGIN_APPROVER_STOP'),
+  ),
+  'adLaunchBoundMs(DEFAULT_AD_SETTINGS_IN_EFFECT)': noArguments('adLaunchBoundMs(DEFAULT_AD_SETTINGS_IN_EFFECT)', async () => {
+    const bound = await functionExport('ad-settings.ts', 'adLaunchBoundMs')
+    const value: unknown = bound(await exportOf('ad-settings.ts', 'DEFAULT_AD_SETTINGS_IN_EFFECT'))
+    if (typeof value !== 'number' || !Number.isInteger(value)) {
+      throw new PrinterFailure("the installed package's src/ad-settings.ts adLaunchBoundMs gave no whole number of milliseconds", PRINTER_FAIL_EXIT)
+    }
+    return String(value)
+  }),
+  approverBoundLine: exactArguments('approverBoundLine', ['ref', 'bound-ms'], ([ref, ms]) =>
+    approverBoundLine(ref!, wholeMsArgument('approverBoundLine', 'bound-ms', ms!)),
+  ),
+  pendingRowRuleApproverStopRelaunchLine: oneArgument('pendingRowRuleApproverStopRelaunchLine', 'ref', pendingRowRuleApproverStopRelaunchLine),
+  stuckLaunchRelaunchingPost: exactArguments('stuckLaunchRelaunchingPost', ['name', 'key', 'bound-ms'], ([name, key, ms]) =>
+    stuckLaunchRelaunchingPost(name!, key!, wholeMsArgument('stuckLaunchRelaunchingPost', 'bound-ms', ms!)),
+  ),
+  stuckLaunchHeldPost: exactArguments('stuckLaunchHeldPost', ['name', 'key', 'launch-start', 'true|false'], ([name, key, start, met]) =>
+    stuckLaunchHeldPost(name!, key!, start!, booleanArgument('stuckLaunchHeldPost', 'true|false', met!)),
+  ),
+  describeLaunchStartForLog: oneArgument('describeLaunchStartForLog', 'launch-start', async (start) => {
+    const render = await functionExport('pending-row.ts', 'describeLaunchStartForLog')
+    return builtText('pending-row.ts', 'describeLaunchStartForLog', render(start))
+  }),
+  stuckLaunchPostLine: exactArguments('stuckLaunchPostLine', ['key', 'mark', 'answer'], async ([key, mark, answer]) => {
+    const lineOf = await functionExport('pending-row.ts', 'stuckLaunchPostLine')
+    const m = await oneOfExports('stuckLaunchPostLine', 'mark', mark!, 'pending-row.ts', ['STUCK_LAUNCH_MARK_RELAUNCHING', 'STUCK_LAUNCH_MARK_HELD'])
+    const a = await oneOfExports('stuckLaunchPostLine', 'answer', answer!, 'pending-row.ts', [
+      'STUCK_LAUNCH_POSTED',
+      'STUCK_LAUNCH_ALREADY_POSTED',
+      'STUCK_LAUNCH_SUPPRESSED',
+      'STUCK_LAUNCH_NOT_POSTED_CLOSED',
+      'STUCK_LAUNCH_POST_FAILED',
+    ])
+    return builtText('pending-row.ts', 'stuckLaunchPostLine', lineOf(key, m, a))
+  }),
+  stuckLaunchAbortKillSucceededHead: oneArgument('stuckLaunchAbortKillSucceededHead', 'key', stuckLaunchAbortKillSucceededHead),
+  liveRowSequenceStep3MarkedMissingLines: oneArgument('liveRowSequenceStep3MarkedMissingLines', 'ref', liveRowSequenceStep3MarkedMissingLines),
+  stuckLaunchHeldPostedLines: oneArgument('stuckLaunchHeldPostedLines', 'key', stuckLaunchHeldPostedLines),
+  pendingRowRuleRoundLineHead: exactArguments('pendingRowRuleRoundLineHead', ['ref', 'origin'], ([ref, origin]) =>
+    pendingRowRuleRoundLineHead(ref!, origin!),
+  ),
+  stuckLaunchAbortKillConflictHead: oneArgument('stuckLaunchAbortKillConflictHead', 'key', stuckLaunchAbortKillConflictHead),
+  conflictLatchSetLineHead: exactArguments('conflictLatchSetLineHead', ['key', 'latched|relatched'], async ([key, outcome]) => {
+    const o = await oneOfExports('conflictLatchSetLineHead', 'latched|relatched', outcome!, 'conflict-latch.ts', [
+      'CONFLICT_LATCH_SET_LATCHED',
+      'CONFLICT_LATCH_SET_RELATCHED',
+    ])
+    return await conflictLatchSetLineHead(key!, o)
+  }),
+  conflictNotThisLaunchLatchedLine: exactArguments('conflictNotThisLaunchLatchedLine', ['key', 'description'], ([key, description]) =>
+    conflictNotThisLaunchLatchedLine(key!, description!),
+  ),
+  conflictNotThisLaunchPost: exactArguments('conflictNotThisLaunchPost', ['name', 'key', 'description'], ([name, key, description]) =>
+    conflictNotThisLaunchPost(name!, key!, description!),
+  ),
+  latchRecheckNotThisLaunchRoundHead: oneArgument('latchRecheckNotThisLaunchRoundHead', 'ref', latchRecheckNotThisLaunchRoundHead),
+  LAUNCH_VERB_SPAWN: noArguments('LAUNCH_VERB_SPAWN', () => stringExport('session-manager.ts', 'LAUNCH_VERB_SPAWN')),
+  LAUNCH_VERB_RESUME: noArguments('LAUNCH_VERB_RESUME', () => stringExport('session-manager.ts', 'LAUNCH_VERB_RESUME')),
+  LAUNCH_VERB_REUSE_SPAWN: noArguments('LAUNCH_VERB_REUSE_SPAWN', () => stringExport('session-manager.ts', 'LAUNCH_VERB_REUSE_SPAWN')),
+  preTrustLogLine: async (args) => {
+    if (args.length !== 2 && args.length !== 3) {
+      throw new PrinterFailure(`preTrustLogLine takes <ref> <verb> [<value>] (got ${args.length} argument(s))`, USAGE_EXIT)
+    }
+    return await preTrustLogLine('preTrustLogLine', args[0]!, args[1]!, args[2])
+  },
+  preTrustLogLineHead: exactArguments('preTrustLogLineHead', ['ref', 'verb'], async ([ref, verb]) =>
+    cutAt(await preTrustLogLine('preTrustLogLineHead', ref!, verb!, VALUE_MARK), VALUE_MARK, 'src/session-manager.ts preTrustLogLine'),
+  ),
+  personaDefaultConfigDirLabels: exactArguments('personaDefaultConfigDirLabels', ['key', 'home'], ([key, home]) =>
+    personaDefaultConfigDirLabels(key!, home!),
+  ),
 }
 
 /** `table`'s one-function entries as entries: each checks its own arguments. */

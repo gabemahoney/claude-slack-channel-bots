@@ -1010,7 +1010,7 @@ t19_leg() {
     echo "${TEST_NAME}: NOTE: ${step}: ${id}'s new life: session '$(jq -r '.claude_session_id // ""' "${AD_OUT}")', transcript_status '$(jq -r '.transcript_status // ""' "${AD_OUT}")', prior_sessions $(jq -c '.prior_sessions' "${AD_OUT}")"
 
     # The pre_trust line: ok, for the reuse spawn.
-    t19_value line preTrustLogLine "${name}" LAUNCH_VERB_REUSE_SPAWN ok
+    t19_value line personaPreTrustLogLine "${name}" LAUNCH_VERB_REUSE_SPAWN ok
     n="$(t19_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "] ${line}")"
     if [[ "${n}" != 1 ]]; then
         t19_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" | grep -F -- 'pre_trust' | sed 's/^/  | /' >&2 || true
@@ -1256,7 +1256,7 @@ t19_note_posts() {
 t19_note_pre_trust() {
     local value line n summary=""
     for value in ok skipped failed; do
-        t19_value line preTrustLogLine "$1" LAUNCH_VERB_REUSE_SPAWN "${value}"
+        t19_value line personaPreTrustLogLine "$1" LAUNCH_VERB_REUSE_SPAWN "${value}"
         n="$(t19_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "] ${line}")"
         summary+="${value}=${n} "
     done
