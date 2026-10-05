@@ -151,9 +151,8 @@
 #
 # Matched values. CSCB's values are printed by fixtures/fmk-texts.ts from
 # the installed package, never retyped: the `pre_trust` lines
-# (`preTrustLogLine` in src/session-manager.ts, built on
-# PRE_TRUST_LOG_PREFIX, with LAUNCH_VERB_SPAWN, LAUNCH_VERB_RESUME and
-# LAUNCH_VERB_REUSE_SPAWN; `preTrustLogLineHead` for a line with any present
+# (`preTrustLogLine` in src/session-manager.ts, with LAUNCH_VERB_SPAWN,
+# LAUNCH_VERB_RESUME and LAUNCH_VERB_REUSE_SPAWN; `preTrustLogLineHead` for a line with any present
 # value); TRUST_DIALOG_NEEDLE, DEV_CHANNELS_DIALOG_NEEDLE and
 # DIALOG_POLL_INTERVAL_MS (src/session-manager.ts); the instance id and
 # session name (src/persona-identity.ts personaInstanceId,
@@ -420,9 +419,10 @@ count_calls() {
 }
 
 # first_call_at <table> <ppid> <id> <verb> <from> <to> [<word>|!<word>]...:
-# the time of the first line `calls` prints (empty when none).
+# the time of the first line `calls` prints (empty when none). `sed -n 1p`
+# reads all its input, so `calls` never meets a closed pipe under pipefail.
 first_call_at() {
-    calls "$@" | head -n 1 | cut -f1
+    calls "$@" | sed -n 1p | cut -f1
 }
 
 # calls_by_verb <table> <ppid> <id> <from>: the bot server's calls of row
@@ -551,7 +551,7 @@ expect_pane_read_before_send() {
     mapfile -t sends < <(calls "${table}" "${srv}" "${id}" send-keys "${from}" - "${ALLOW_PENDING_FLAG}" | cut -f1)
     for t in ${sends[@]+"${sends[@]}"}; do
         read_at="$(calls "${table}" "${srv}" "${id}" read-pane "${from}" - "${ALLOW_PENDING_FLAG}" \
-            | awk -F'\t' -v t="${t}" '$1 + 0 < t + 0 { print $1; exit }')"
+            | awk -F'\t' -v t="${t}" '!found && $1 + 0 < t + 0 { print $1; found = 1 }')"
         [[ -n "${read_at}" ]] \
             || fail "${step}: a bot-server send-keys of ${id} with ${ALLOW_PENDING_FLAG} follows no bot-server read-pane of it with ${ALLOW_PENDING_FLAG}"
     done
@@ -586,7 +586,6 @@ pane_holds() {
 DEV_NEEDLE="$(fmk_text DEV_CHANNELS_DIALOG_NEEDLE)" || fail "setup: fmk-texts.ts could not print DEV_CHANNELS_DIALOG_NEEDLE"
 TRUST_NEEDLE="$(fmk_text TRUST_DIALOG_NEEDLE)" || fail "setup: fmk-texts.ts could not print TRUST_DIALOG_NEEDLE"
 PACE_MS="$(fmk_text DIALOG_POLL_INTERVAL_MS)" || fail "setup: fmk-texts.ts could not print DIALOG_POLL_INTERVAL_MS"
-PRE_TRUST_PREFIX="$(fmk_text PRE_TRUST_LOG_PREFIX)" || fail "setup: fmk-texts.ts could not print PRE_TRUST_LOG_PREFIX"
 VERB_SPAWN="$(fmk_text LAUNCH_VERB_SPAWN)" || fail "setup: fmk-texts.ts could not print LAUNCH_VERB_SPAWN"
 VERB_RESUME="$(fmk_text LAUNCH_VERB_RESUME)" || fail "setup: fmk-texts.ts could not print LAUNCH_VERB_RESUME"
 VERB_REUSE_SPAWN="$(fmk_text LAUNCH_VERB_REUSE_SPAWN)" || fail "setup: fmk-texts.ts could not print LAUNCH_VERB_REUSE_SPAWN"
@@ -594,18 +593,12 @@ A_ID="$(fmk_text personaInstanceId "${A_KEY}")" || fail "setup: fmk-texts.ts cou
 B_ID="$(fmk_text personaInstanceId "${B_KEY}")" || fail "setup: fmk-texts.ts could not print personaInstanceId for B"
 C_ID="$(fmk_text personaInstanceId "${C_KEY}")" || fail "setup: fmk-texts.ts could not print personaInstanceId for C"
 A_SESSION="$(fmk_text personaTmuxSessionName "${A_KEY}")" || fail "setup: fmk-texts.ts could not print personaTmuxSessionName for A"
-for v in DEV_NEEDLE TRUST_NEEDLE PRE_TRUST_PREFIX VERB_SPAWN VERB_RESUME VERB_REUSE_SPAWN A_ID B_ID C_ID A_SESSION; do
+for v in DEV_NEEDLE TRUST_NEEDLE VERB_SPAWN VERB_RESUME VERB_REUSE_SPAWN A_ID B_ID C_ID A_SESSION; do
     [[ -n "${!v}" ]] || fail "setup: fmk-texts.ts printed an empty ${v}"
 done
 [[ "${PACE_MS}" =~ ^[1-9][0-9]*$ ]] || fail "setup: the approver's pace '${PACE_MS}' is not a whole number of milliseconds"
 # Three approver laps' worth of time, in whole seconds (at least one).
 APPROVER_QUIET_S=$(( (3 * PACE_MS + 999) / 1000 ))
-
-# Every pre_trust line starts with the prefix (a self-check of the entries).
-for v in "${VERB_SPAWN}" "${VERB_RESUME}"; do
-    line="$(fmk_text preTrustLogLine "${A_REF}" "${v}" "${PRE_TRUST_OK}")" || fail "setup: fmk-texts.ts could not print preTrustLogLine"
-    [[ "${line}" == "${PRE_TRUST_PREFIX}"* ]] || fail "setup: preTrustLogLine '${line}' does not start with PRE_TRUST_LOG_PREFIX '${PRE_TRUST_PREFIX}'"
-done
 
 # ---------------------------------------------------------------------------
 # The migrated-row leg: a row seeded on 0.10.0, migrated, then resumed
@@ -733,6 +726,7 @@ legs_new_personas() {
     if [[ -e "${HOME}/.claude.json" ]]; then
         echo "${TEST_NAME}: ${step}: B's resolved ~/.claude.json was already there (recorded): $(head -c 300 "${HOME}/.claude.json")"
     else
+        require_scenario_home "${step}"
         printf '{}\n' | write_file "${HOME}/.claude.json"
         echo "${TEST_NAME}: ${step}: B's resolved ~/.claude.json was absent; the harness wrote {} there"
     fi

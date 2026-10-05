@@ -182,6 +182,23 @@
  *                                 1 to LIVE_ROW_SEQUENCE_STEP3_RUNS, one line each:
  *                                 every line a step-3 run of the live-row sequence
  *                                 logs when it marked the row `missing`
+ *   stuckLaunchHeldPostedLines <key>
+ *                                 src/pending-row.ts stuckLaunchPostLine(<key>,
+ *                                 STUCK_LAUNCH_MARK_HELD, STUCK_LAUNCH_POSTED, …) for
+ *                                 each form of the held text (with the attach line,
+ *                                 and without it: `metNotInteractive` false, then
+ *                                 true), each unmuted, then muted by a submitted
+ *                                 teardown, one line each: every line the held
+ *                                 text's poster logs for the answer `posted`
+ *   pendingRowRuleRoundLineHead <ref> <origin>
+ *                                 src/pending-row.ts pendingRowRuleRoundLine(<ref>,
+ *                                 <origin>, …), where <origin> is
+ *                                 PENDING_ROW_RULE_ORIGIN_RETRY or
+ *                                 PENDING_ROW_RULE_ORIGIN_APPROVER_STOP by its value,
+ *                                 cut where the launch start's rendering
+ *                                 (describeLaunchStartForLog) begins: the head of every
+ *                                 round line of the pending-row rule for <ref> from
+ *                                 that origin, up to and including `launch started `
  *
  * The relabelled-session entries (scenario 21's abort kill answered CONFLICT,
  * "not this launch's session"). <description> is agent-director's description
@@ -241,9 +258,7 @@
  * server logs it, <key> a persona key, <verb> a launch verb by its value (one
  * of LAUNCH_VERB_SPAWN, LAUNCH_VERB_RESUME and LAUNCH_VERB_REUSE_SPAWN; any
  * other fails), and <value> a `pre_trust` value as a launch result carries it:
- *   PRE_TRUST_LOG_PREFIX          src/session-manager.ts PRE_TRUST_LOG_PREFIX: the head
- *                                 of every `pre_trust` line
- *   LAUNCH_VERB_SPAWN             src/session-manager.ts LAUNCH_VERB_SPAWN: the verb a
+ *   LAUNCH_VERB_SPAWN            src/session-manager.ts LAUNCH_VERB_SPAWN: the verb a
  *                                 `pre_trust` line names for a plain spawn
  *   LAUNCH_VERB_RESUME            src/session-manager.ts LAUNCH_VERB_RESUME: the verb a
  *                                 `pre_trust` line names for a `resume`
@@ -522,6 +537,44 @@ async function liveRowSequenceStep3MarkedMissingLines(ref: string): Promise<stri
   return lines.join('\n')
 }
 
+/** Every line the held text's poster logs for persona `key` with the answer `posted`: both forms of the text, each unmuted and muted, joined by newlines. */
+async function stuckLaunchHeldPostedLines(key: string): Promise<string> {
+  const lineOf = await functionExport('pending-row.ts', 'stuckLaunchPostLine')
+  const held = await stringExport('pending-row.ts', 'STUCK_LAUNCH_MARK_HELD')
+  const posted = await stringExport('pending-row.ts', 'STUCK_LAUNCH_POSTED')
+  const lines: string[] = []
+  for (const metNotInteractive of [false, true]) {
+    for (const muted of [false, true]) {
+      const line = builtText('pending-row.ts', 'stuckLaunchPostLine', lineOf(key, held, posted, { metNotInteractive, muted }))
+      if (line.includes('\n')) throw new PrinterFailure(PACKAGE_EXIT, "the installed package's src/pending-row.ts stuckLaunchPostLine gave a line holding a newline")
+      lines.push(line)
+    }
+  }
+  if (new Set(lines).size !== lines.length) {
+    throw new PrinterFailure(PACKAGE_EXIT, "the installed package's src/pending-row.ts stuckLaunchPostLine gave the same line for two forms of the held text")
+  }
+  return lines.join('\n')
+}
+
+/** A launch start the round line's head is cut at: 2000-01-01T00:00:00.000Z, in epoch milliseconds. */
+const LAUNCH_START_MARK_MS = 946_684_800_000
+
+/** The head of the pending-row rule's round lines for `ref` from `origin`, up to where the launch start's rendering begins. */
+async function pendingRowRuleRoundLineHead(ref: string, origin: string): Promise<string> {
+  const o = await oneOfExports('pendingRowRuleRoundLineHead', 'origin', origin, 'pending-row.ts', [
+    'PENDING_ROW_RULE_ORIGIN_RETRY',
+    'PENDING_ROW_RULE_ORIGIN_APPROVER_STOP',
+  ])
+  const lineOf = await functionExport('pending-row.ts', 'pendingRowRuleRoundLine')
+  const render = await functionExport('pending-row.ts', 'describeLaunchStartForLog')
+  const rendered = builtText('pending-row.ts', 'describeLaunchStartForLog', render(LAUNCH_START_MARK_MS))
+  if (!rendered.startsWith('2000-01-01T')) {
+    throw new PrinterFailure(PACKAGE_EXIT, `the installed package's src/pending-row.ts describeLaunchStartForLog rendered ${LAUNCH_START_MARK_MS} as '${rendered}'`)
+  }
+  const line = builtText('pending-row.ts', 'pendingRowRuleRoundLine', lineOf(ref, o, LAUNCH_START_MARK_MS, [STEP_MARK], FOLLOWS_MARK))
+  return cutAt(line, rendered, 'src/pending-row.ts pendingRowRuleRoundLine')
+}
+
 /** Where the case begins in a built line; cut off with all that follows it. */
 const CASE_MARK = 'fmk-texts-case-mark'
 
@@ -712,6 +765,10 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   }),
   stuckLaunchAbortKillSucceededHead: oneArgument('stuckLaunchAbortKillSucceededHead', 'key', stuckLaunchAbortKillSucceededHead),
   liveRowSequenceStep3MarkedMissingLines: oneArgument('liveRowSequenceStep3MarkedMissingLines', 'ref', liveRowSequenceStep3MarkedMissingLines),
+  stuckLaunchHeldPostedLines: oneArgument('stuckLaunchHeldPostedLines', 'key', stuckLaunchHeldPostedLines),
+  pendingRowRuleRoundLineHead: exactArguments('pendingRowRuleRoundLineHead', ['ref', 'origin'], ([ref, origin]) =>
+    pendingRowRuleRoundLineHead(ref!, origin!),
+  ),
   CONFLICT_NOT_THIS_LAUNCH_PHRASE: noArguments('CONFLICT_NOT_THIS_LAUNCH_PHRASE', () =>
     stringExport('ad-description-phrases.ts', 'CONFLICT_NOT_THIS_LAUNCH_PHRASE'),
   ),
@@ -731,7 +788,6 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
     conflictNotThisLaunchPost(name!, key!, description!),
   ),
   latchRecheckNotThisLaunchRoundHead: oneArgument('latchRecheckNotThisLaunchRoundHead', 'ref', latchRecheckNotThisLaunchRoundHead),
-  PRE_TRUST_LOG_PREFIX: noArguments('PRE_TRUST_LOG_PREFIX', () => stringExport('session-manager.ts', 'PRE_TRUST_LOG_PREFIX')),
   LAUNCH_VERB_SPAWN: noArguments('LAUNCH_VERB_SPAWN', () => stringExport('session-manager.ts', 'LAUNCH_VERB_SPAWN')),
   LAUNCH_VERB_RESUME: noArguments('LAUNCH_VERB_RESUME', () => stringExport('session-manager.ts', 'LAUNCH_VERB_RESUME')),
   LAUNCH_VERB_REUSE_SPAWN: noArguments('LAUNCH_VERB_REUSE_SPAWN', () => stringExport('session-manager.ts', 'LAUNCH_VERB_REUSE_SPAWN')),
