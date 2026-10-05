@@ -50,6 +50,9 @@
 #   R  work/r, `unrecognised-dialog`, answered by a harness Enter
 #      (`stub_press_enter`); added by a confirmed reload (config.json.pending
 #      renamed to config.json.apply)
+#   C1 work/c1, `at-once`; added by a confirmed reload while the settings file
+#      is refused (leg refused-stopping)
+#   C2 work/c2, `at-once`; the same in leg refused-grace
 #
 # Waits, all derived from the printer's values for the written table: G
 # (adGraceMs, 120 s), B (adLaunchBoundMs, 300 s), the alert threshold
@@ -65,8 +68,11 @@
 # paces come from the printer (DIALOG_POLL_INTERVAL_MS, 1 s before G;
 # DIALOG_SLOW_POLL_INTERVAL_MS, 5 s from G); "what a 5 s pace allows" in a
 # window of d seconds is floor(d / 5) + 1 reads. The whole script runs about
-# 19 minutes (measured: 1114 s), most of it the held launch's B and the
-# change leg's three waits for the next timed probe.
+# 37 minutes: about 19 for the legs before the refused values (most of it the
+# held launch's B and the change leg's three waits for the next timed probe)
+# and about 9 for each refused-value leg (the wait for the next timed probe,
+# the added persona's retries on its timer, and its timer's pending-only
+# retry after it comes up).
 #
 # Legs (in order, each a function below; the later Tasks of scenario 24 add
 # theirs before the closing assertions):
@@ -133,6 +139,51 @@
 #               (the new G is in use); a harness Enter brings R up; the file's
 #               earlier [tmux] values come back with no [pause] table, and
 #               whether a values line follows the next probe is printed.
+#   refused-stopping
+#               refused values (b.jg5 SRJ-1426, SRJ-209, SRJ-316, SRJ-1018;
+#               AC 84; the suite's only deliberately refused values, SRJ-1401's
+#               exception): the server restarted with `session_restart_delay`
+#               0 (and `health_check_interval` 0, as throughout), S, P, Q and
+#               R up; the file written with stopping_window_seconds 10, below
+#               its minimum; after the next bot-server probe C1 is added by a
+#               confirmed reload, its launch meets agent-director's
+#               ErrConfigMalformed (which reaches CSCB as ErrUnknownErrorName)
+#               and it is retried on its timer at least twice, with a
+#               bot-server probe inside the refusal; then the earlier accepted
+#               file is written back. The checks (`refused_values_check`, one
+#               function for both inputs): exactly one refused-read line, at
+#               the first refused read, carrying the printer's fixed parts
+#               (the file) and the key, none at the next read and no values
+#               line while refused; one onset post to C1's channel (the
+#               printer's fixed parts, naming the config file, around
+#               agent-director's description) and one raise line, for C1
+#               only; while refused no CSCB delete, kill, `kill-finished` or
+#               resume, no stuck-launch abort, no counted launch failure, no
+#               dead reading, one launch call (C1's plain spawn at the reload,
+#               none for a persona already up), and each of C1's timed retries
+#               reruns its recovery: one `status` call, refused and read as
+#               unknown, no launch, nothing counted, the timer re-armed with
+#               the reason liveness-unknown; no all-clear after the probe
+#               inside the refusal; after the fix C1 reads `waiting`, one
+#               all-clear post (the printer's text) made after the fix, one
+#               clear line, C1's
+#               retry timer stopped once a pending-only retry reads its row
+#               live (so no persona up at the next leg has a timer), and no
+#               values line through the next bot-server probe.
+#   refused-grace
+#               the same checks for pending_grace_seconds = "60" (a TOML
+#               string), with C2 added by a confirmed reload and C1 among the
+#               personas already up.
+#
+# The refused-value legs (hatch decisions, the Epic's "Hatch gap"): the
+# persona meeting the refusal is added by a confirmed reload, so the last
+# accepted read is the earlier file; the alert is one per affected persona
+# per episode. Where the hatch decision and the SRD differ, the SRD is
+# followed: "makes no spawn" (SRJ-1426) is checked as no launch call while
+# refused but the reload's own launch of the added persona, whose timed
+# retries rerun its recovery (a refused `status`, no launch) rather than
+# retry the launch; and the Epic's "every call" is every store-backed call,
+# `version` being answered.
 #
 # Matched values, each printed by fixtures/fmk-texts.ts from the installed
 # package (never retyped):
@@ -162,6 +213,31 @@
 #                                                            src/live-row-sequence.ts
 #   not-judged lines     liveRowSequenceRunLine <Q's ref> <step> <run> LIVE_ROW_RUN_NOT_JUDGED
 #                                                            src/live-row-sequence.ts
+#   CONFIG_FILE_NAME     AD_CONFIG_FILE_DISPLAY_NAME         src/ad-config-file.ts
+#   RETRY_BASE_S         UNAVAILABLE_RETRY_BASE_S            src/unavailable-retry.ts
+#   RETRY_CEILING_S      UNAVAILABLE_RETRY_CEILING_S         src/unavailable-retry.ts
+#   LIVENESS_UNKNOWN_REASON
+#                        RESTART_OUTCOME_LIVENESS_UNKNOWN    src/restart.ts
+#   the retry timer's lines
+#                        unavailableRetryRetryLine <C's key> <retry> full,
+#                        unavailableRetryReArmedLine <C's key> <retry> full <marker> 0,
+#                        unavailableRetryStoppedLine <C's key> full none <marker>
+#                                                            src/unavailable-retry.ts
+#   the refused-read line's fixed parts
+#                        buildAdSettingsRefusedReadLine <file> <marker> accepted
+#                                                            src/ad-settings.ts
+#   the onset's fixed parts
+#                        formatPersonaNotice <C> adConfigMalformedOnset <marker>
+#                                                            src/outage-state.ts
+#   the all-clear        formatPersonaNotice <C> ALL_CLEAR_TEMPLATE ad-config-malformed
+#                                                            src/outage-state.ts
+#   the raise line's fixed parts, the clear line
+#                        adConfigMalformedRaisedLine <C's key> <marker>,
+#                        adConfigMalformedClearedLine <C's key>
+#                                                            src/outage-state.ts
+# A marker the scenario passes in place of agent-director's description, the
+# reader's reason or a retry line's reason splits a printed text into the
+# fixed parts around it.
 # Lines with no exported builder are matched by a fragment quoted from src/
 # (ruling S7), each with its source beside it below.
 #
@@ -284,7 +360,7 @@ PROBE_ALLOWANCE_S=10  # a timed bot-server probe: within RECHECK_S plus this
 # Personas, channels and the Slack stub's token suffixes.
 P_NAME="${SCENARIO_TAG}_p"
 declare -A KEY=() ID=() REF=() CHANNEL=() SUFFIX=() WORK=()
-for x in s p q r; do
+for x in s p q r c1 c2; do
     n="${SCENARIO_TAG}_${x}"
     KEY[${x}]="$(persona_key "${n}")"
     # src/persona-identity.ts personaInstanceId.
@@ -327,6 +403,9 @@ STUB_DIR="${SCENARIO_ROOT}/slack-stub"
 STUB_RECORD="${STUB_DIR}/record.jsonl"
 CONFIG="${SLACK_STATE_DIR}/config.json"
 SERVER_PID=""
+# CSCB's session_restart_delay, written by write_personas when set (the
+# refused-value legs set it to 0).
+RESTART_DELAY_S=""
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -551,13 +630,13 @@ expect_one_values_line() {
     }
 }
 
-# start_slack_stub: the Slack stub in STUB_DIR, answering ok for the four
+# start_slack_stub: the Slack stub in STUB_DIR, answering ok for the six
 # personas' token pairs and refusing any other; export CSCB_SLACK_API_URL.
 start_slack_stub() {
     local step="slack stub" api_url pid
     mkdir "${STUB_DIR}" || fail "${step}: could not create ${STUB_DIR}"
-    jq -n --arg s "${SUFFIX[s]}" --arg p "${SUFFIX[p]}" --arg q "${SUFFIX[q]}" --arg r "${SUFFIX[r]}" '{
-        tokens: [$s, $p, $q, $r] | map({suffix: ., label: ., auth: "ok", connections: "ok"}),
+    printf '%s\n' "${SUFFIX[@]}" | jq -R . | jq -s '{
+        tokens: map({suffix: ., label: ., auth: "ok", connections: "ok"}),
         default: {auth: "invalid_auth", connections: "invalid_auth"}}' \
         | write_file "${STUB_DIR}/control.json"
     (cd "${STUB_DIR}" && exec bun "${SCENARIO_FIXTURES}/slack-stub-server.ts" --record "${STUB_RECORD}" \
@@ -578,7 +657,8 @@ persona_files() {
         | write_file "${CREDS_DIR}/${x}.json" 600
 }
 
-# write_personas <x>...: the config with the personas <x>..., in that order.
+# write_personas <x>...: the config with the personas <x>..., in that order,
+# and `session_restart_delay` RESTART_DELAY_S when that is set.
 write_personas() {
     local x personas="[]" one
     for x in "$@"; do
@@ -588,12 +668,12 @@ write_personas() {
                 channels: [{id: $ch, delivery: "all"}], permission_prompts: $ch}')"
         personas="$(jq -c --argjson one "${one}" '. + [$one]' <<< "${personas}")"
     done
-    jq -n --argjson personas "${personas}" --argjson port "${SCENARIO_PORT}" '{
+    jq -n --argjson personas "${personas}" --argjson port "${SCENARIO_PORT}" --arg delay "${RESTART_DELAY_S}" '{
         personas: $personas,
         bind: "127.0.0.1", port: $port,
         health_check_interval: 0, exit_timeout: 5, resume_enabled: true,
         agent_director_poll_interval_ms: 3600000
-    }' | write_config
+    } + (if $delay == "" then {} else {session_restart_delay: ($delay | tonumber)} end)' | write_config
 }
 
 # start_live <step> <expected-values-line>: start the server; wait for the
@@ -664,6 +744,8 @@ mkdir -m 700 "${CREDS_DIR}"
 WORK[s]="$(make_workdir s)"
 WORK[p]="$(make_workdir p)"
 WORK[r]="$(make_workdir r)"
+WORK[c1]="$(make_workdir c1)"
+WORK[c2]="$(make_workdir c2)"
 Q_HELD="$(make_workdir q_held)"
 Q_READY="$(make_workdir q_ready)"
 WORK[q]="${SCENARIO_ROOT}/work/q_link"
@@ -673,7 +755,9 @@ stub_mode "${WORK[p]}" "${STUB_MODE_UNRECOGNISED}"
 stub_mode "${WORK[r]}" "${STUB_MODE_UNRECOGNISED}"
 stub_mode "${Q_HELD}" "${STUB_MODE_UNRECOGNISED}"
 stub_mode "${Q_READY}" "${STUB_MODE_AT_ONCE}"
-for x in s p q r; do
+stub_mode "${WORK[c1]}" "${STUB_MODE_AT_ONCE}"
+stub_mode "${WORK[c2]}" "${STUB_MODE_AT_ONCE}"
+for x in s p q r c1 c2; do
     persona_files "${x}"
 done
 
@@ -989,6 +1073,323 @@ leg_change() {
 }
 
 # ---------------------------------------------------------------------------
+# Legs refused-stopping and refused-grace: a settings file agent-director
+# refuses raises one ad-config-malformed alert per affected persona, changes
+# nothing, keeps the last values, and clears once fixed
+# ---------------------------------------------------------------------------
+
+# iso_of <epoch-s>: the time as a server.log prefix or a stub record's `ts`
+# writes it (UTC, milliseconds), so such times compare as text.
+iso_of() {
+    date -u -d "@$1" '+%Y-%m-%dT%H:%M:%S.%3NZ'
+}
+
+# log_lines_from <from> <to> <matcher>: the server.log lines that match, whose
+# ISO prefix is at or after <from> and before <to> (epoch seconds; an empty
+# <to> is no bound).
+log_lines_from() {
+    local a b=""
+    a="$(iso_of "$1")"
+    [[ -z "$2" ]] || b="$(iso_of "$2")"
+    log_lines "$3" | LC_ALL=C awk -v a="${a}" -v b="${b}" '{ t = substr($0, 2, 24) } t >= a && (b == "" || t < b)'
+}
+
+count_log_from() {
+    log_lines_from "$@" | wc -l | tr -d ' '
+}
+
+# split_at_marker <step> <text>: set HEAD and TAIL to <text> before and after
+# REFUSED_MARKER, which must occur in it exactly once.
+split_at_marker() {
+    local rest="${2#*"${REFUSED_MARKER}"}"
+    [[ "${rest}" != "$2" && "${rest}" != *"${REFUSED_MARKER}"* ]] \
+        || fail "$1: the printer's text does not hold the marker exactly once: $2"
+    HEAD="${2%%"${REFUSED_MARKER}"*}"
+    TAIL="${rest}"
+}
+
+# The marker the printer is given in place of agent-director's description
+# and the reader's reason (the scenario's own; neither text holds it).
+REFUSED_MARKER='fmk-texts-refused-marker'
+# The refused inputs (b.jg5 SRJ-1426's scenario inputs): stopping_window_seconds
+# below its minimum, and pending_grace_seconds as a TOML string.
+REFUSED_STOPPING_S=10
+REFUSED_GRACE_TEXT='"60"'
+(( REFUSED_STOPPING_S < MIN_STOPPING )) || fail "setup: ${KEY_STOPPING} ${REFUSED_STOPPING_S} is not below its minimum ${MIN_STOPPING}"
+CONFIG_FILE_NAME="$(printed AD_CONFIG_FILE_DISPLAY_NAME)" || exit 1
+RETRY_BASE_S="$(printed UNAVAILABLE_RETRY_BASE_S)" || exit 1
+RETRY_CEILING_S="$(printed UNAVAILABLE_RETRY_CEILING_S)" || exit 1
+[[ "${RETRY_BASE_S}" =~ ^[1-9][0-9]*$ && "${RETRY_CEILING_S}" =~ ^[1-9][0-9]*$ ]] \
+    || fail "setup: UNAVAILABLE_RETRY_BASE_S '${RETRY_BASE_S}' or UNAVAILABLE_RETRY_CEILING_S '${RETRY_CEILING_S}' is not a whole number of seconds"
+# The ad-config-malformed class, as the all-clear lists it (the printer
+# checks it is one of the package's OUTAGE_CLASS_ORDER).
+CONFIG_CLASS='ad-config-malformed'
+# The refused-read line's fixed parts, for the settings file and a read
+# accepted before it (fixtures/fmk-texts.ts buildAdSettingsRefusedReadLine).
+line="$(printed buildAdSettingsRefusedReadLine "${AD_SETTINGS_FILE}" "${REFUSED_MARKER}" accepted)" || exit 1
+split_at_marker "setup: the refused-read line" "${line}"
+REFUSED_HEAD="${HEAD}"
+REFUSED_TAIL="${TAIL}"
+[[ "${REFUSED_HEAD}" == "${VALUES_PREFIX}"*"\"${AD_SETTINGS_FILE}\""* ]] \
+    || fail "setup: the refused-read line's fixed part does not start with AD_SETTINGS_LOG_PREFIX and name ${AD_SETTINGS_FILE}"
+# src/restart.ts: the line of a reconciled row that reads dead.
+READS_DEAD='[slack] Session reads dead'
+# src/server.ts isSessionAlive: `[slack] isSessionAlive: status error for
+# persona=<key>: <error> — read as unknown, not dead`.
+STATUS_ERROR_HEAD='[slack] isSessionAlive: status error for persona='
+STATUS_ERROR_TAIL=' — read as unknown, not dead'
+# src/restart.ts: `[slack] Liveness unknown for persona=<key>… — no
+# reconnect, kill or launch; nothing counted`.
+LIVENESS_UNKNOWN_HEAD='[slack] Liveness unknown for persona='
+LIVENESS_UNKNOWN_TAIL=' — no reconnect, kill or launch; nothing counted'
+# The again-reason of a retry whose liveness read was unknown.
+LIVENESS_UNKNOWN_REASON="$(printed RESTART_OUTCOME_LIVENESS_UNKNOWN)" || exit 1
+# src/pending-row.ts: the stuck-launch abort's start line, `[slack]
+# pending-row: persona=<key> stuck-launch abort started for <ref> …`.
+ABORT_WORDS=' stuck-launch abort started for '
+# The personas up when a refused-value leg starts (added to as each leg adds one).
+UP_PERSONAS=()
+
+# refused_values_check <label> <x> <key> <key>=<value>...: one refused-value
+# sub-leg (b.jg5 SRJ-1426, SRJ-209, SRJ-316, SRJ-1018). With the accepted
+# TABLE in effect and every persona of UP_PERSONAS up, the settings file is
+# written with the <key>=<value> pairs, which agent-director refuses for
+# <key>; after the next bot-server probe persona <x> is added by a confirmed
+# reload; its launch meets ErrConfigMalformed and it is retried on its timer
+# at least twice, with a bot-server probe inside the refusal; then TABLE is
+# written back. Checked:
+#   - the refused-read line: exactly one, at the first refused read, with the
+#     printer's fixed parts (the file in them) and <key> between them; none at
+#     the next read; no values line while refused;
+#   - the alert: one onset post to <x>'s channel, with the printer's fixed
+#     parts (naming the config file) around agent-director's description;
+#     one raise line for <x> and none for another persona; no other post;
+#   - nothing done while refused: no CSCB delete, kill or resume, no
+#     stuck-launch abort, no counted launch failure and no dead reading for
+#     any persona; the one launch call is <x>'s plain spawn at the reload (no
+#     launch call for a persona already up); at least two timed retries of
+#     <x>, each rerunning its recovery: one `status` call, refused and read
+#     as unknown, no launch, nothing counted, and the timer re-armed;
+#   - the probe inside the refusal is followed by no all-clear and no clear;
+#   - after the fix: <x>'s row reads `waiting`, one all-clear post (the
+#     printer's text) made after the fix, one clear line, <x>'s retry timer
+#     stops (its pending-only retry reads the row live), and the first
+#     bot-server probe after the fix is followed by no values line; no post
+#     to any other persona's channel.
+refused_values_check() {
+    local label="$1" x="$2" key="$3"
+    shift 3
+    local name="${SCENARIO_TAG}_${x}" y line t_bad t_fix t_onset t_probe n_version n_spawn n_applied
+    local values_before refused_before raised_m raised_before onset onset_head onset_tail all_clear cleared
+    local post text said n m retries spawns calls ch stopped_m raised_any_m t_read
+    local -A posts_before=()
+    onset="$(printed formatPersonaNotice "${name}" adConfigMalformedOnset "${REFUSED_MARKER}")" || exit 1
+    split_at_marker "${label}: the onset" "${onset}"
+    onset_head="${HEAD}"
+    onset_tail="${TAIL}"
+    [[ "${onset_head}${onset_tail}" == *"${CONFIG_FILE_NAME}"* ]] || fail "${label}: the onset's fixed part does not name ${CONFIG_FILE_NAME}"
+    all_clear="$(printed formatPersonaNotice "${name}" ALL_CLEAR_TEMPLATE "${CONFIG_CLASS}")" || exit 1
+    line="$(printed adConfigMalformedRaisedLine "${KEY[${x}]}" "${REFUSED_MARKER}")" || exit 1
+    split_at_marker "${label}: the raise line" "${line}"
+    raised_m="$(matcher "${HEAD}" "${TAIL}")"
+    cleared="$(printed adConfigMalformedClearedLine "${KEY[${x}]}")" || exit 1
+    # Any persona's raise line: the text before the persona key.
+    raised_any_m="$(matcher "${HEAD%%persona=*}persona=")"
+
+    values_before="$(values_lines)"
+    refused_before="$(count_log "$(matcher "${REFUSED_HEAD}")")"
+    raised_before="$(count_log "${raised_any_m}")"
+    for y in "${UP_PERSONAS[@]}" "${x}"; do
+        posts_before[${y}]="$(post_count "${CHANNEL[${y}]}")"
+    done
+    [[ "$(count_log "${raised_m}")" == 0 ]] || fail "${label}: ${name} was raised before the leg"
+
+    # The refused file; the next bot-server probe's read refuses it.
+    t_bad="$(now_s)"
+    write_ad_settings "$@"
+    n_version="$(cscb_ad_count version)"
+    wait_server_probe "${n_version}" "$(( RECHECK_S + PROBE_ALLOWANCE_S ))" "${label}: no bot-server probe after the refused file was written"
+    t_read="${CALL_T}"
+    settle_probe "${label}: the refused read"
+    wait_for_count "$(matcher "${REFUSED_HEAD}")" "$(( refused_before + 1 ))" "${LOG_WAIT_S}" "${label}: no refused-read line after the probe"
+    [[ "$(count_log "$(matcher "${REFUSED_HEAD}")")" == "$(( refused_before + 1 ))" ]] \
+        || fail "${label}: $(( $(count_log "$(matcher "${REFUSED_HEAD}")") - refused_before )) refused-read lines at the first refused read, not one"
+    line="$(_scenario_scan lastline "${SLACK_STATE_DIR}/server.log" "$(matcher "${REFUSED_HEAD}")")"
+    [[ "${line}" == *"${REFUSED_HEAD}"*"${key}"*"${REFUSED_TAIL}" ]] || {
+        printf '  | got:  %s\n  | want: …%s<reason naming %s>%s\n' "${line}" "${REFUSED_HEAD}" "${key}" "${REFUSED_TAIL}" >&2
+        fail "${label}: the refused-read line is not the printer's line naming ${key}"
+    }
+    time_before "${t_read}" "$(time_plus "$(log_time "${line}")" 0.001)" || fail "${label}: the refused-read line came before the probe's read"
+    echo "${TEST_NAME}: ${label}: refused-read line: ${line#*"${REFUSED_HEAD}"}"
+    [[ "$(values_lines)" == "${values_before}" ]] || fail "${label}: a values line at the refused read"
+
+    # Persona <x> added by a confirmed reload.
+    n_spawn="$(cscb_ad_count spawn --claude-instance-id "${ID[${x}]}")"
+    n_applied="$(count_log "${APPLIED_CLASS}")"
+    UP_PERSONAS+=("${x}")
+    write_personas "${UP_PERSONAS[@]}"
+    wait_for_file "${CONFIG}.pending" "${RELOAD_WAIT_S}" "${label}: the reload adding ${name} was not previewed"
+    check_pending_layout "${label}: the reload adding ${name}" added=1
+    mv -- "${CONFIG}.pending" "${CONFIG}.apply" || fail "${label}: could not confirm the reload"
+    wait_for_count "${APPLIED_CLASS}" "$(( n_applied + 1 ))" "${RELOAD_WAIT_S}" "${label}: the reload adding ${name} was not applied"
+    wait_for_cscb_ad_call "${n_spawn}" "${LAUNCH_WAIT_S}" "${label}: no spawn of ${name}" spawn --claude-instance-id "${ID[${x}]}" > /dev/null
+
+    # The alert: one onset post, the printer's fixed parts around
+    # agent-director's description.
+    wait_until "${LOG_WAIT_S}" "${label}: no onset post to ${name}'s channel" posts_above "${CHANNEL[${x}]}" "${posts_before[${x}]}"
+    wait_until "${LOG_WAIT_S}" "${label}: no raise line for ${name}" _scenario_log_has "${raised_m}"
+    post="$(posts_to "${CHANNEL[${x}]}" | tail -n 1)"
+    text="$(jq -r '.text' <<< "${post}")"
+    [[ "${text}" == "${onset_head}"*"${onset_tail}" ]] && (( ${#text} > ${#onset_head} + ${#onset_tail} )) || {
+        printf '  | got:  %s\n  | want: %s<agent-director'"'"'s description>%s\n' "${text}" "${onset_head}" "${onset_tail}" >&2
+        fail "${label}: the post to ${name}'s channel is not the printer's onset"
+    }
+    said="${text#"${onset_head}"}"
+    said="${said%"${onset_tail}"}"
+    t_onset="$(epoch_of "${label}" "$(jq -r '.ts' <<< "${post}")")" || exit 1
+    echo "${TEST_NAME}: ${label}: ${name}'s onset posted; agent-director's description in it: ${said}"
+
+    # A bot-server probe inside the refusal, and at least two timed retries.
+    n_version="$(cscb_ad_count version)"
+    wait_server_probe "${n_version}" "$(( RECHECK_S + PROBE_ALLOWANCE_S ))" "${label}: no bot-server probe inside the refusal"
+    t_probe="${CALL_T}"
+    settle_probe "${label}: the probe inside the refusal"
+    m="$(rearmed_matcher "${label}" "${x}" 2)" || exit 1
+    wait_for_count "${m}" 1 "$(( 3 * RETRY_BASE_S + LAUNCH_WAIT_S ))" "${label}: ${name} was not retried twice on its timer"
+    sleep "${PROBE_SETTLE_S}"
+    t_fix="$(now_s)"
+
+    # While refused.
+    print_cscb_calls "${t_bad}" "${t_fix}" "${label}: CSCB's calls while the file was refused (recorded)"
+    echo "${TEST_NAME}: ${label}: ${name}'s server.log lines while refused (recorded):"
+    log_lines_from "${t_bad}" "${t_fix}" "$(matcher "${KEY[${x}]}")" | cut -c1-260 | sed 's/^/  | /'
+    [[ "$(count_log "$(matcher "${REFUSED_HEAD}")")" == "$(( refused_before + 1 ))" ]] || fail "${label}: a refused-read line at a later refused read"
+    [[ "$(values_lines)" == "${values_before}" ]] || fail "${label}: a values line while the file was refused"
+    [[ "$(count_log "${raised_m}")" == 1 ]] || fail "${label}: $(count_log "${raised_m}") raise lines for ${name}, not one"
+    [[ "$(count_log "${raised_any_m}")" == "$(( raised_before + 1 ))" ]] || fail "${label}: a raise line for a persona other than ${name}"
+    [[ "$(count_log "${cleared}")" == 0 ]] || fail "${label}: ${name}'s outage cleared while the file was refused"
+    for y in "${UP_PERSONAS[@]}"; do
+        n="$(post_count "${CHANNEL[${y}]}")"
+        if [[ "${y}" == "${x}" ]]; then
+            (( n == posts_before[${x}] + 1 )) || fail "${label}: $(( n - posts_before[${x}] )) posts to ${name}'s channel while refused, not the one onset (the probe at +$(seconds_between "${t_onset}" "${t_probe}")s from it included)"
+        else
+            (( n == posts_before[${y}] )) || fail "${label}: a post to ${SCENARIO_TAG}_${y}'s channel while refused"
+        fi
+    done
+    for calls in kill delete kill-finished resume; do
+        n="$(cscb_calls_between "${t_bad}" "${t_fix}" "${calls}")"
+        [[ "${n}" == 0 ]] || fail "${label}: ${n} CSCB ${calls} call(s) while the file was refused"
+    done
+    # One launch: <x>'s plain spawn at the reload; no launch for a persona already up.
+    spawns="$(cscb_calls_between "${t_bad}" "${t_fix}" spawn)"
+    n="$(cscb_calls_between "${t_bad}" "${t_fix}" spawn --claude-instance-id "${ID[${x}]}")"
+    [[ "${spawns}" == 1 && "${n}" == 1 && "$(cscb_calls_between "${t_bad}" "${t_fix}" spawn --reuse-finished)" == 0 ]] \
+        || fail "${label}: ${spawns} CSCB spawn(s) while refused, ${n} of them ${name}'s, not its one plain launch"
+    # Each retry reran the recovery: its liveness read refused (read as
+    # unknown, not dead), no launch, nothing counted, and the timer re-armed.
+    retries=0
+    while :; do
+        m="$(printed unavailableRetryRetryLine "${KEY[${x}]}" "$(( retries + 1 ))" full)" || exit 1
+        [[ "$(count_log "${m}")" == 1 ]] || break
+        retries=$(( retries + 1 ))
+        m="$(rearmed_matcher "${label}" "${x}" "${retries}")" || exit 1
+        [[ "$(count_log "${m}")" == 1 ]] || fail "${label}: ${name}'s retry ${retries} was not re-armed as liveness unknown"
+    done
+    (( retries >= 2 )) || fail "${label}: ${retries} retries of ${name} while refused, not two or more"
+    n="$(cscb_calls_between "${t_bad}" "${t_fix}" status --claude-instance-id "${ID[${x}]}")"
+    [[ "${n}" == "${retries}" ]] || fail "${label}: ${n} CSCB status call(s) of ${name} for ${retries} retries"
+    n="$(count_log_from "${t_bad}" "${t_fix}" "$(matcher "${STATUS_ERROR_HEAD}${KEY[${x}]}: " "${STATUS_ERROR_TAIL}")")"
+    [[ "${n}" == "${retries}" ]] || fail "${label}: ${n} refused liveness read line(s) of ${name} for ${retries} retries"
+    n="$(count_log_from "${t_bad}" "${t_fix}" "$(matcher "${LIVENESS_UNKNOWN_HEAD}${KEY[${x}]}" "${LIVENESS_UNKNOWN_TAIL}")")"
+    [[ "${n}" == "${retries}" ]] || fail "${label}: ${n} 'no launch; nothing counted' line(s) of ${name} for ${retries} retries"
+    n="$(count_log_from "${t_bad}" "${t_fix}" "$(matcher "${STUCK_LINE_HEAD}" "${ABORT_WORDS}")")"
+    [[ "${n}" == 0 ]] || fail "${label}: a stuck-launch abort while refused"
+    n="$(count_log_from "${t_bad}" "${t_fix}" "$(matcher "${RELAUNCH_FAILED}")")"
+    [[ "${n}" == 0 ]] || fail "${label}: a launch failure was counted while refused"
+    n="$(count_log_from "${t_bad}" "${t_fix}" "$(matcher "${READS_DEAD}")")"
+    [[ "${n}" == 0 ]] || fail "${label}: a persona read as dead while refused"
+    echo "${TEST_NAME}: ${label}: ${name} launched once and retried ${retries} times while refused, each retry's liveness read refused; one onset; no all-clear after the probe at +$(seconds_between "${t_onset}" "${t_probe}")s from the onset"
+
+    # The fix: the earlier accepted file.
+    write_ad_settings "${TABLE[@]}"
+    t_fix="$(now_s)"
+    n_version="$(cscb_ad_count version)"
+    wait_until "$(( 4 * RETRY_BASE_S + REPORT_WAIT_S ))" "${label}: ${name} never reported in after the fix" row_state_is "${ID[${x}]}" waiting
+    wait_until "${LOG_WAIT_S}" "${label}: no all-clear post to ${name}'s channel after the fix" \
+        posts_above "${CHANNEL[${x}]}" "$(( posts_before[${x}] + 1 ))"
+    # The timer that launched <x> runs on in pending-only mode until a retry
+    # reads its row live; the next leg starts once it has stopped, so every
+    # persona already up then has no timer.
+    line="$(printed unavailableRetryStoppedLine "${KEY[${x}]}" full none "${REFUSED_MARKER}")" || exit 1
+    split_at_marker "${label}: the stop line" "${line}"
+    stopped_m="$(matcher "${HEAD%" — "}")"
+    wait_until "$(( RETRY_CEILING_S + LOG_WAIT_S ))" "${label}: ${name}'s retry timer did not stop after it came up" _scenario_log_has "${stopped_m}"
+    echo "${TEST_NAME}: ${label}: ${name}'s retry timer: $(log_lines "${stopped_m}" | tail -n 1 | cut -c1-200)"
+    wait_server_probe "${n_version}" "$(( RECHECK_S + PROBE_ALLOWANCE_S ))" "${label}: no bot-server probe after the fix"
+    settle_probe "${label}: the read after the fix"
+    sleep "${PROBE_SETTLE_S}"
+    [[ "$(post_count "${CHANNEL[${x}]}")" == "$(( posts_before[${x}] + 2 ))" ]] \
+        || fail "${label}: $(( $(post_count "${CHANNEL[${x}]}") - posts_before[${x}] )) posts to ${name}'s channel, not the onset and one all-clear"
+    post="$(posts_to "${CHANNEL[${x}]}" | tail -n 1)"
+    [[ "$(jq -r '.text' <<< "${post}")" == "${all_clear}" ]] || {
+        printf '  | got:  %s\n  | want: %s\n' "$(jq -r '.text' <<< "${post}")" "${all_clear}" >&2
+        fail "${label}: the post after the fix is not the printer's all-clear"
+    }
+    time_before "${t_fix}" "$(epoch_of "${label}" "$(jq -r '.ts' <<< "${post}")")" || fail "${label}: the all-clear came before the fix"
+    [[ "$(count_log "${cleared}")" == 1 ]] || fail "${label}: $(count_log "${cleared}") clear lines for ${name}, not one"
+    [[ "$(values_lines)" == "${values_before}" ]] || fail "${label}: a values line after the fix, which left the values unchanged"
+    [[ "$(count_log "$(matcher "${REFUSED_HEAD}")")" == "$(( refused_before + 1 ))" ]] || fail "${label}: a refused-read line after the fix"
+    for y in "${UP_PERSONAS[@]}"; do
+        [[ "${y}" == "${x}" ]] && continue
+        ch="$(post_count "${CHANNEL[${y}]}")"
+        [[ "${ch}" == "${posts_before[${y}]}" ]] || fail "${label}: a post to ${SCENARIO_TAG}_${y}'s channel"
+    done
+    echo "${TEST_NAME}: ${label}: after the fix ${name} is up, one all-clear at +$(seconds_between "${t_fix}" "$(epoch_of "${label}" "$(jq -r '.ts' <<< "${post}")")")s, no values line through the next probe"
+}
+
+# rearmed_matcher <step> <x> <retry>: a matcher of the re-armed line of
+# persona <x>'s full-mode retry <retry> answered liveness-unknown: the
+# printer's line up to its reason, the reason, and the words after it up to
+# the next wait.
+rearmed_matcher() {
+    local line
+    line="$(printed unavailableRetryReArmedLine "${KEY[$2]}" "$3" full "${REFUSED_MARKER}" 0)" || exit 1
+    split_at_marker "$1: the re-armed line" "${line}"
+    matcher "${HEAD}${LIVENESS_UNKNOWN_REASON}${TAIL%%,*}"
+}
+
+# True when <channel> has more than <n> posts.
+posts_above() {
+    (( $(post_count "$1") > $2 ))
+}
+
+leg_refused_stopping() {
+    leg refused-stopping
+    # The server restarted with session_restart_delay 0 (health_check_interval
+    # is 0 throughout).
+    RESTART_DELAY_S=0
+    UP_PERSONAS=(s p q r)
+    restart_with_personas "refused-stopping" "${UP_PERSONAS[@]}"
+    wait_until "${REPORT_WAIT_S}" "refused-stopping: a persona never reported in after the restart" all_up
+    refused_values_check refused-stopping c1 "${KEY_STOPPING}" \
+        "${KEY_GRACE}=${GRACE_S}" "${KEY_STOPPING}=${REFUSED_STOPPING_S}" "${KEY_STARTING}=${STARTING_S}"
+}
+
+leg_refused_grace() {
+    leg refused-grace
+    refused_values_check refused-grace c2 "${KEY_GRACE}" \
+        "${KEY_GRACE}=${REFUSED_GRACE_TEXT}" "${KEY_STOPPING}=${STOPPING_S}" "${KEY_STARTING}=${STARTING_S}"
+}
+
+# True when every persona of UP_PERSONAS reads waiting.
+all_up() {
+    local y
+    for y in "${UP_PERSONAS[@]}"; do
+        row_state_is "${ID[${y}]}" waiting || return 1
+    done
+}
+
+# ---------------------------------------------------------------------------
 # The legs, in order (later legs of scenario 24 are added before the closing
 # assertions)
 # ---------------------------------------------------------------------------
@@ -998,6 +1399,8 @@ leg_stopping
 leg_held
 leg_sequence
 leg_change
+leg_refused_stopping
+leg_refused_grace
 
 # ---------------------------------------------------------------------------
 # Closing assertions (b.jg5 SRJ-1401, SRJ-1418)

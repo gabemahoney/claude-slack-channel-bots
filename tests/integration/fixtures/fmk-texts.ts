@@ -155,6 +155,58 @@
  *                                                placement the package exports as
  *                                                <placement-export> (a `LIVE_ROW_RUN_…`
  *                                                name, for example LIVE_ROW_RUN_NOT_JUDGED)
+ *   AD_CONFIG_FILE_DISPLAY_NAME                  src/ad-config-file.ts, the settings file as a
+ *                                                notice names it (`~/…`)
+ *   adConfigMalformedOnset <description>         src/outage-state.ts: the `ad-config-malformed`
+ *                                                onset for agent-director's ErrConfigMalformed
+ *                                                answer with <description>, built as the
+ *                                                installed client throws it (its
+ *                                                ErrUnknownErrorName with that unknownName
+ *                                                and the error envelope; a client with a
+ *                                                class of that name fails). Given a
+ *                                                marker <description>, the text around the
+ *                                                marker is the onset's fixed part (posted as a
+ *                                                persona notice: wrap it in formatPersonaNotice)
+ *   adConfigMalformedRaisedLine <persona-key> <description>
+ *                                                src/outage-state.ts: the server-log raise line
+ *                                                for that answer (its classification by
+ *                                                src/ad-error-class.ts classifyAdError)
+ *   adConfigMalformedClearedLine <persona-key>   src/outage-state.ts: the server-log clear line
+ *   ALL_CLEAR_TEMPLATE <outage-class>…           src/outage-state.ts: the all-clear for a bad
+ *                                                stretch of the given classes (each one of the
+ *                                                package's OUTAGE_CLASS_ORDER, given once),
+ *                                                none with a detail (posted as a persona
+ *                                                notice: wrap it in formatPersonaNotice)
+ *   buildAdSettingsRefusedReadLine <path> <reason> <accepted|none>
+ *                                                src/ad-settings.ts: the line of a run of
+ *                                                refused reads of <path>, `accepted` when a
+ *                                                read was accepted before it, `none` when not;
+ *                                                given a marker <reason>, the text around the
+ *                                                marker is the line's fixed part
+ *   UNAVAILABLE_RETRY_BASE_S                     src/unavailable-retry.ts, the retry timer's
+ *                                                first wait (its waits double from it), in
+ *                                                seconds, in decimal
+ *   unavailableRetryRetryLine <persona-key> <retry> <full|pending-only>
+ *                                                src/unavailable-retry.ts: the line at the
+ *                                                start of retry <retry> of the persona's
+ *                                                retry timer, in that mode
+ *   unavailableRetryReArmedLine <persona-key> <retry> <full|pending-only> <reason> <wait-ms>
+ *                                                src/unavailable-retry.ts: the re-armed line
+ *                                                of that retry, answered <reason>, the mode
+ *                                                unchanged, the next retry in <wait-ms>; given
+ *                                                a marker <reason>, the text before the marker
+ *                                                is the line's fixed head for that retry
+ *   RESTART_OUTCOME_LIVENESS_UNKNOWN             src/restart.ts, the restart work's outcome
+ *                                                (and a retry's again-reason) when the
+ *                                                persona's liveness reads unknown
+ *   unavailableRetryStoppedLine <persona-key> <full|pending-only> <row|none> <reason>
+ *                                                src/unavailable-retry.ts: the line of a stop
+ *                                                of the persona's retry timer, in that mode,
+ *                                                naming the row read (`none`: no row); given
+ *                                                a marker <reason>, the text before it is the
+ *                                                line's fixed head
+ *   UNAVAILABLE_RETRY_CEILING_S                  src/unavailable-retry.ts, the retry timer's
+ *                                                longest wait, in seconds, in decimal
  *
  * In every `<key>=<integer>` argument <key> is one of the package's
  * AD_TMUX_KEYS and <integer> an integer in decimal; an unknown key, a key
@@ -550,6 +602,171 @@ const liveRowWaitEndedLine: Entry = {
   },
 }
 
+/** The `unknownName` agent-director's malformed-config answer carries (no client has a class for it). */
+const CONFIG_MALFORMED_ERR_NAME = 'ErrConfigMalformed'
+
+/**
+ * agent-director's `ErrConfigMalformed` answer, with `description` as its
+ * description, as CSCB meets it: the installed client has no class for the
+ * name, so it throws its `ErrUnknownErrorName` with that `unknownName` and
+ * the error envelope (`err_name`, `err_description`). The client's own
+ * `errorFromEnvelope` must not know the name either (it answers its base
+ * class for an unknown one); a client that has a class for it is a failure.
+ */
+async function configMalformedError(entry: string, description: string, context: EntryContext): Promise<unknown> {
+  const client = await context.importAgentDirectorClient()
+  const unknownClass = client['ErrUnknownErrorName']
+  if (typeof unknownClass !== 'function') fail(PRINTER_FAIL_EXIT, 'the installed agent-director client exports no ErrUnknownErrorName')
+  if (Object.hasOwn(client, CONFIG_MALFORMED_ERR_NAME)) {
+    fail(PRINTER_FAIL_EXIT, `${entry}: the installed agent-director client has a class ${CONFIG_MALFORMED_ERR_NAME}, so the answer would not arrive as an ErrUnknownErrorName`)
+  }
+  const envelope = { err_name: CONFIG_MALFORMED_ERR_NAME, err_description: description }
+  return new (unknownClass as new (unknownName: string, envelope: unknown) => unknown)(CONFIG_MALFORMED_ERR_NAME, envelope)
+}
+
+/** `adConfigMalformedOnset(<agent-director's ErrConfigMalformed with <description>>)`: the `ad-config-malformed` onset. */
+const configMalformedOnset: Entry = {
+  synopsis: '<description>',
+  async print(args, context) {
+    const entry = 'adConfigMalformedOnset'
+    expectArguments(entry, args, ['description'])
+    const err = await configMalformedError(entry, args[0], context)
+    const build = await packageFunction<(err: unknown) => unknown>(context, 'outage-state.ts', entry)
+    return builtString(entry, build(err))
+  },
+}
+
+/**
+ * `adConfigMalformedRaisedLine(<persona-key>, classifyAdError(<agent-director's
+ * ErrConfigMalformed with <description>>))`: the server-log raise line.
+ */
+const configMalformedRaisedLine: Entry = {
+  synopsis: '<persona-key> <description>',
+  async print(args, context) {
+    const entry = 'adConfigMalformedRaisedLine'
+    expectArguments(entry, args, ['persona-key', 'description'])
+    const [key, description] = args
+    const err = await configMalformedError(entry, description, context)
+    const classify = await packageFunction<(value: unknown) => unknown>(context, 'ad-error-class.ts', 'classifyAdError')
+    const build = await packageFunction<(key: string, classification: unknown) => unknown>(context, 'outage-state.ts', entry)
+    return builtString(entry, build(key, classify(err)))
+  },
+}
+
+/** `adConfigMalformedClearedLine(<persona-key>)`: the server-log clear line. */
+const configMalformedClearedLine: Entry = {
+  synopsis: '<persona-key>',
+  async print(args, context) {
+    const entry = 'adConfigMalformedClearedLine'
+    expectArguments(entry, args, ['persona-key'])
+    const build = await packageFunction<(key: string) => unknown>(context, 'outage-state.ts', entry)
+    return builtString(entry, build(args[0]))
+  },
+}
+
+/**
+ * `ALL_CLEAR_TEMPLATE(<a bad stretch of the given classes, none with a detail>)`:
+ * the all-clear notice. Each class must be one of the package's
+ * `OUTAGE_CLASS_ORDER`, given once.
+ */
+const allClear: Entry = {
+  synopsis: '<outage-class>…',
+  async print(args, context) {
+    const entry = 'ALL_CLEAR_TEMPLATE'
+    if (args.length === 0) usageFail(`${entry} takes <outage-class>… (got none)`)
+    const order = await packageExport(context, 'outage-state.ts', 'OUTAGE_CLASS_ORDER')
+    if (!Array.isArray(order) || order.some((c) => typeof c !== 'string')) {
+      fail(PRINTER_FAIL_EXIT, "the installed package's src/outage-state.ts export OUTAGE_CLASS_ORDER is not an array of class names")
+    }
+    const resolved = new Map<string, object>()
+    for (const cls of args) {
+      if (!order.includes(cls)) usageFail(`${entry}: '${cls}' is not one of the package's outage classes (${order.join(', ')})`)
+      if (resolved.has(cls)) usageFail(`${entry}: ${cls} is given twice`)
+      resolved.set(cls, {})
+    }
+    const build = await packageFunction<(resolved: Map<string, object>) => unknown>(context, 'outage-state.ts', entry)
+    return builtString(entry, build(resolved))
+  },
+}
+
+/** The printer's words for whether a read was accepted before a refused one. */
+const HAD_ACCEPTED_READ: Readonly<Record<string, boolean>> = { accepted: true, none: false }
+
+/** `buildAdSettingsRefusedReadLine(<path>, <reason>, <hadAcceptedRead>)`: the line of a run of refused reads. */
+const refusedReadLine: Entry = {
+  synopsis: '<path> <reason> <accepted|none>',
+  async print(args, context) {
+    const entry = 'buildAdSettingsRefusedReadLine'
+    expectArguments(entry, args, ['path', 'reason', 'accepted|none'])
+    const [path, reason, earlier] = args
+    if (!Object.hasOwn(HAD_ACCEPTED_READ, earlier)) usageFail(`${entry}: the earlier read must be accepted or none (got '${earlier}')`)
+    const build = await packageFunction<(path: string, reason: string, hadAcceptedRead: boolean) => unknown>(context, 'ad-settings.ts', entry)
+    return builtString(entry, build(path, reason, HAD_ACCEPTED_READ[earlier]))
+  },
+}
+
+/** The printer's words for the mode a retry ran in: `pendingOnly` false or true. */
+const RETRY_MODES: Readonly<Record<string, boolean>> = { full: false, 'pending-only': true }
+
+/** A whole number of at least 1, from a decimal argument; a usage failure otherwise. */
+function retryNumber(entry: string, text: string): number {
+  const n = integerArgument(entry, 'retry', text)
+  if (n < 1n || n > BigInt(Number.MAX_SAFE_INTEGER)) usageFail(`${entry}: <retry> must be 1 or more (got '${text}')`)
+  return Number(n)
+}
+
+/** `unavailableRetryRetryLine(<persona-key>, <retry>, <pendingOnly>)`: the line at the start of a retry. */
+const retryLine: Entry = {
+  synopsis: '<persona-key> <retry> <full|pending-only>',
+  async print(args, context) {
+    const entry = 'unavailableRetryRetryLine'
+    expectArguments(entry, args, ['persona-key', 'retry', 'full|pending-only'])
+    const [key, retryText, mode] = args
+    if (!Object.hasOwn(RETRY_MODES, mode)) usageFail(`${entry}: the mode must be full or pending-only (got '${mode}')`)
+    const build = await packageFunction<(key: string, retry: number, pendingOnly: boolean) => unknown>(context, 'unavailable-retry.ts', entry)
+    return builtString(entry, build(key, retryNumber(entry, retryText), RETRY_MODES[mode]))
+  },
+}
+
+/**
+ * `unavailableRetryReArmedLine(<persona-key>, <retry>, <ranPendingOnly>, <reason>, undefined, <wait-ms>)`:
+ * the re-armed line of a retry that left the mode as it was. Given a marker
+ * <reason>, the text before the marker is the line's fixed head for that retry.
+ */
+const reArmedLine: Entry = {
+  synopsis: '<persona-key> <retry> <full|pending-only> <reason> <wait-ms>',
+  async print(args, context) {
+    const entry = 'unavailableRetryReArmedLine'
+    expectArguments(entry, args, ['persona-key', 'retry', 'full|pending-only', 'reason', 'wait-ms'])
+    const [key, retryText, mode, reason, waitText] = args
+    if (!Object.hasOwn(RETRY_MODES, mode)) usageFail(`${entry}: the mode must be full or pending-only (got '${mode}')`)
+    const waitMs = integerArgument(entry, 'wait-ms', waitText)
+    const build = await packageFunction<(key: string, retry: number, ranPendingOnly: boolean, reason: string, newMode: undefined, waitMs: number) => unknown>(
+      context,
+      'unavailable-retry.ts',
+      entry,
+    )
+    return builtString(entry, build(key, retryNumber(entry, retryText), RETRY_MODES[mode], reason, undefined, Number(waitMs)))
+  },
+}
+
+/**
+ * `unavailableRetryStoppedLine(<persona-key>, <pendingOnly>, <row>, <reason>)`:
+ * the line of a stop of the persona's retry timer; `none` for no row. Given
+ * a marker <reason>, the text before ` — <marker>` is the line's fixed head.
+ */
+const stoppedLine: Entry = {
+  synopsis: '<persona-key> <full|pending-only> <row|none> <reason>',
+  async print(args, context) {
+    const entry = 'unavailableRetryStoppedLine'
+    expectArguments(entry, args, ['persona-key', 'full|pending-only', 'row|none', 'reason'])
+    const [key, mode, row, reason] = args
+    if (!Object.hasOwn(RETRY_MODES, mode)) usageFail(`${entry}: the mode must be full or pending-only (got '${mode}')`)
+    const build = await packageFunction<(key: string, pendingOnly: boolean, row: string | undefined, reason: string) => unknown>(context, 'unavailable-retry.ts', entry)
+    return builtString(entry, build(key, RETRY_MODES[mode], row === 'none' ? undefined : row, reason))
+  },
+}
+
 /**
  * `liveRowSequenceRunLine(<persona-ref>, <step>, <run-number>, <the package's <placement-export>>)`:
  * the live-row sequence's line for one `find-missing` run.
@@ -612,6 +829,19 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   liveRowSequenceWaitArmedLine: liveRowWaitArmedLine,
   liveRowSequenceWaitEndedLine: liveRowWaitEndedLine,
   liveRowSequenceRunLine: liveRowRunLine,
+  // Scenario 24's refused values (test-26-fmk-timing-settings.sh).
+  AD_CONFIG_FILE_DISPLAY_NAME: constantEntry('ad-config-file.ts', 'AD_CONFIG_FILE_DISPLAY_NAME'),
+  adConfigMalformedOnset: configMalformedOnset,
+  adConfigMalformedRaisedLine: configMalformedRaisedLine,
+  adConfigMalformedClearedLine: configMalformedClearedLine,
+  ALL_CLEAR_TEMPLATE: allClear,
+  buildAdSettingsRefusedReadLine: refusedReadLine,
+  UNAVAILABLE_RETRY_BASE_S: constantEntry('unavailable-retry.ts', 'UNAVAILABLE_RETRY_BASE_S'),
+  unavailableRetryRetryLine: retryLine,
+  unavailableRetryReArmedLine: reArmedLine,
+  RESTART_OUTCOME_LIVENESS_UNKNOWN: constantEntry('restart.ts', 'RESTART_OUTCOME_LIVENESS_UNKNOWN'),
+  unavailableRetryStoppedLine: stoppedLine,
+  UNAVAILABLE_RETRY_CEILING_S: constantEntry('unavailable-retry.ts', 'UNAVAILABLE_RETRY_CEILING_S'),
 }
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */

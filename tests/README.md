@@ -239,7 +239,8 @@ tests/
     test-26-fmk-timing-settings.sh # HO §7 scenario 24 (b.jg5 SRJ-1426), fmk: agent-director's timing values are logged and govern the waits: the values line at
                                    # every start; a held launch's approver pace, pending-row runs and live-row sequence runs waiting on G from its launch start;
                                    # the relaunching stuck-launch post at B; "still stopping" following the written stopping window; a changed value used from
-                                   # the next read, a `[pause]`-only change logging none (see fmk scenarios below)
+                                   # the next read, a `[pause]`-only change logging none; refused values: one `ad-config-malformed` alert per affected
+                                   # persona, nothing destroyed or counted, the last values kept, one all-clear once fixed (see fmk scenarios below)
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
@@ -1045,7 +1046,9 @@ package, beside scenario 8's floor, floor label and floor message:
 #### Scenario 24: test-26
 
 Test 26 shows agent-director's timing values are logged and govern CSCB's
-waits. It runs in fmk mode on the release, with the Slack stub recording
+waits, and that a settings file agent-director refuses is one alert per
+affected persona, with nothing destroyed or counted, cleared once the file
+is fixed. It runs in fmk mode on the release, with the Slack stub recording
 each `chat.postMessage` text whole. Before the first start it writes the
 scenario HOME's agent-director settings file with `write_ad_settings`, a
 `[tmux]` table holding the scenario inputs SRJ-1426 names; scenario 24 is
@@ -1066,8 +1069,11 @@ the alert timings are unit-tested). CSCB's config sets
 `resume_enabled` true (S's finished row comes back by a `resume`),
 `exit_timeout` 5 and `agent_director_poll_interval_ms` 3600000 (the
 permission poller's `list` calls stay out of the shim's log), all CSCB's
-own, through its config. Test 26 runs about 19 minutes, most of it the held
-launch's B and the change leg's three waits for the next timed probe.
+own, through its config; the refused-value legs also set
+`session_restart_delay` 0. Test 26 runs about 37 minutes: about 19 for the
+legs before the refused values, most of it the held launch's B and the
+change leg's three waits for the next timed probe, and about 9 for each
+refused-value leg.
 
 Each persona (`t26_<x>`, one channel each) has its stub mode selected for
 its working directory with `stub_mode`:
@@ -1078,6 +1084,8 @@ its working directory with `stub_mode`:
 | P | `work/p`, `unrecognised-dialog`, switched to `at-once` before B so the relaunch after the abort reports in | across a plain stop and start |
 | Q | `work/q_link`, a symlink to `work/q_held` (`unrecognised-dialog`), re-pointed to `work/q_ready` (`at-once`) | across a plain stop and start |
 | R | `work/r`, `unrecognised-dialog`, answered by `stub_press_enter` | by a confirmed reload |
+| C1 | `work/c1`, `at-once` | by a confirmed reload while the settings file is refused (refused-stopping) |
+| C2 | `work/c2`, `at-once` | the same, in refused-grace |
 
 A persona added across a restart is a plain stop, the config written, the
 state dir's `config.json.last-applied` removed, and a start: with no
@@ -1086,7 +1094,7 @@ preview to confirm (see "Reload" in the repository's `README.md`). R's reload is
 renaming `config.json.pending` to `config.json.apply`, as Test 8 does.
 
 The harness steps, all from the scenario's own shell: `write_ad_settings`
-(set-up and the change leg), `stub_mode`, `stub_release` (S's lingering
+(set-up, the change leg and the refused-value legs), `stub_mode`, `stub_release` (S's lingering
 stub), `stub_press_enter` (R's dialog), re-pointing Q's symlinked working
 directory by one rename (Q's row records the real path, so its `cwd` no
 longer matches), the plain stops and starts, the `last-applied` removal and
@@ -1147,6 +1155,52 @@ The legs run in order, each on the state the one before left:
   the raised G is in use; a harness Enter brings R up. The earlier `[tmux]`
   values are then written back with no `[pause]` table, and whether a
   values line follows the next probe is printed.
+- refused-stopping. The server restarts with `session_restart_delay` 0
+  (`health_check_interval` is 0 throughout) and S, P, Q and R up. The file
+  is written with `stopping_window_seconds` 10, below its minimum. After the
+  next bot-server probe C1 is added by a confirmed reload; its launch meets
+  agent-director's `ErrConfigMalformed`, which reaches CSCB as
+  `ErrUnknownErrorName`, and it is retried on its timer at least twice, with
+  a bot-server probe inside the refusal. The earlier accepted file is then
+  written back. The checks are `refused_values_check`'s, below.
+- refused-grace. The same checks for `pending_grace_seconds = "60"` (a TOML
+  string), with C2 added by a confirmed reload and C1 among the personas
+  already up.
+
+The two refused-value legs hold the suite's only deliberately refused
+values (the exception b.jg5 SRJ-1401 makes; SRJ-1426, SRJ-209, SRJ-316,
+SRJ-1018; AC 84). agent-director answers every store-backed call with
+`ErrConfigMalformed` while the file is refused, and answers `version`. One
+function, `refused_values_check`, checks both legs:
+
+- The read. Exactly one refused-read line, at the first refused read,
+  carrying the printer's fixed parts (which name the file) with the refused
+  key between them; none at the next read, and no values line while the
+  file is refused, so the last accepted values stay in effect.
+- The alert. One onset post to the added persona's channel: the printer's
+  fixed parts, naming the config file, around agent-director's description.
+  One raise line for that persona and none for another; no post to any
+  other persona's channel.
+- Nothing done while refused. No CSCB delete, kill, `kill-finished` or
+  `resume`, no stuck-launch abort, no counted launch failure and no persona
+  read as dead. The one launch call is the added persona's plain spawn at
+  the reload; a persona already up gets none. Each of the added persona's
+  timed retries makes one `status` call, refused and read as unknown, not
+  dead, launches nothing, counts nothing, and is re-armed with the reason
+  `liveness-unknown`. SRJ-1426's "makes no spawn" is followed here: the
+  retries do not retry the launch.
+- `version` does not clear. The bot-server probe inside the refusal (its
+  `version` call is answered) is followed by no all-clear and no clear line.
+- After the fix. The next retry's `status` clears the outage: the persona
+  launches and reads `waiting`, and its channel gets exactly one all-clear
+  post, the printer's text, made after the fix, with one clear line. The
+  first bot-server probe after the fix logs no values line (the values are
+  unchanged) and no refused-read line.
+
+Each refused-value leg waits for the added persona's retry timer to stop
+(its pending-only retry reads the row live) before it ends, so no persona
+up at the next leg has a timer: a pending-only retry landing inside the
+next leg's refusal would start a new episode.
 
 A bot-server probe is a CSCB `version` call in the agent-director shim's
 log whose parent is the bot server; the server reads the settings file
@@ -1177,13 +1231,27 @@ package:
 | The live-row sequence's prefix | `LIVE_ROW_SEQUENCE_LOG_PREFIX` | `src/live-row-sequence.ts` |
 | The step-2 wait's armed and end lines | `liveRowSequenceWaitArmedLine <Q's ref> <L> <G>`, `liveRowSequenceWaitEndedLine <Q's ref>` | `src/live-row-sequence.ts` |
 | A run left in neither list | `liveRowSequenceRunLine <Q's ref> <step> <run> LIVE_ROW_RUN_NOT_JUDGED` | `src/live-row-sequence.ts` |
+| The config file as the onset names it | `AD_CONFIG_FILE_DISPLAY_NAME` | `src/ad-config-file.ts` |
+| The refused-read line's fixed parts | `buildAdSettingsRefusedReadLine <file> <marker> accepted` | `src/ad-settings.ts` |
+| The onset's fixed parts, as posted for C | `formatPersonaNotice <C> adConfigMalformedOnset <marker>` | `src/persona-notifier.ts`, `src/outage-state.ts` |
+| The all-clear, as posted for C | `formatPersonaNotice <C> ALL_CLEAR_TEMPLATE ad-config-malformed` | `src/persona-notifier.ts`, `src/outage-state.ts` |
+| The raise line's fixed parts and the clear line | `adConfigMalformedRaisedLine <C's key> <marker>`, `adConfigMalformedClearedLine <C's key>` | `src/outage-state.ts` |
+| The retry timer's first and longest waits | `UNAVAILABLE_RETRY_BASE_S`, `UNAVAILABLE_RETRY_CEILING_S` | `src/unavailable-retry.ts` |
+| The re-armed reason of a retry read as unknown | `RESTART_OUTCOME_LIVENESS_UNKNOWN` | `src/restart.ts` |
+| The retry timer's retry, re-armed and stop lines | `unavailableRetryRetryLine <C's key> <retry> full`, `unavailableRetryReArmedLine <C's key> <retry> full <marker> 0`, `unavailableRetryStoppedLine <C's key> full none <marker>` | `src/unavailable-retry.ts` |
+
+C is the persona a refused-value leg adds (C1 or C2). A marker the script
+passes in place of agent-director's description, the reader's reason or a
+retry line's reason splits a printed text into the fixed parts around it.
 
 Lines with no exported builder are matched by a fragment quoted from `src/`,
 each with its source named beside it in the script: the refusal line and
 its no-notice tail (`src/session-manager.ts` `logRefusal`), the latch line
-(`src/conflict-latch.ts`), the stuck-launch line
-(`src/pending-row.ts`), the relaunch-failed line (`src/restart.ts`), the
-start sweep's lines (`src/session-manager.ts` `reconcileOrphans`) and the
+(`src/conflict-latch.ts`), the stuck-launch line and the stuck-launch
+abort's start line (`src/pending-row.ts`), the relaunch-failed line, the
+reads-dead line and the liveness-unknown line (`src/restart.ts`), the
+refused liveness read's line (`src/server.ts` `isSessionAlive`), the start
+sweep's lines (`src/session-manager.ts` `reconcileOrphans`) and the
 `reload-applied` line (`src/reload-apply.ts`).
 
 ### The value printer
@@ -1253,6 +1321,18 @@ builder's output for the given arguments.
 | `liveRowSequenceWaitArmedLine <persona-ref> <launch-start-ms> <grace-ms>` | the step-2 wait's armed line for that persona ref (`"<name>" (key=<key>)`), launch start in epoch milliseconds and G | `src/live-row-sequence.ts` |
 | `liveRowSequenceWaitEndedLine <persona-ref>` | the step-2 wait's end line | `src/live-row-sequence.ts` |
 | `liveRowSequenceRunLine <persona-ref> <step> <run-number> <placement-export>` | the sequence's line for one `find-missing` run at step 3 or 4, with the placement the package exports as `<placement-export>` (a `LIVE_ROW_RUN_…` name) | `src/live-row-sequence.ts` |
+| `AD_CONFIG_FILE_DISPLAY_NAME` | the settings file as a notice names it (`~/…`) | `src/ad-config-file.ts` |
+| `adConfigMalformedOnset <description>` | the `ad-config-malformed` onset for agent-director's `ErrConfigMalformed` answer with `<description>`, built as the installed client throws it (its `ErrUnknownErrorName`; a client with a class of that name fails); posted as a persona notice: wrap it in `formatPersonaNotice` | `src/outage-state.ts` |
+| `adConfigMalformedRaisedLine <persona-key> <description>` | the server-log raise line for that answer, classified by `classifyAdError` | `src/outage-state.ts`, `src/ad-error-class.ts` |
+| `adConfigMalformedClearedLine <persona-key>` | the server-log clear line | `src/outage-state.ts` |
+| `ALL_CLEAR_TEMPLATE <outage-class>...` | the all-clear for a bad stretch of the given classes, each one of the package's `OUTAGE_CLASS_ORDER`, given once, none with a detail; posted as a persona notice: wrap it in `formatPersonaNotice` | `src/outage-state.ts` |
+| `buildAdSettingsRefusedReadLine <path> <reason> <accepted\|none>` | the line of a run of refused reads of `<path>`, `accepted` when a read was accepted before it, `none` when not | `src/ad-settings.ts` |
+| `UNAVAILABLE_RETRY_BASE_S` | the retry timer's first wait (its waits double from it), in seconds, in decimal | `src/unavailable-retry.ts` |
+| `unavailableRetryRetryLine <persona-key> <retry> <full\|pending-only>` | the line at the start of retry `<retry>` of the persona's retry timer, in that mode | `src/unavailable-retry.ts` |
+| `unavailableRetryReArmedLine <persona-key> <retry> <full\|pending-only> <reason> <wait-ms>` | the re-armed line of that retry, answered `<reason>`, the mode unchanged, the next retry in `<wait-ms>` | `src/unavailable-retry.ts` |
+| `RESTART_OUTCOME_LIVENESS_UNKNOWN` | the restart work's outcome, and a retry's again-reason, when the persona's liveness reads unknown | `src/restart.ts` |
+| `unavailableRetryStoppedLine <persona-key> <full\|pending-only> <row\|none> <reason>` | the line of a stop of the persona's retry timer, in that mode, naming the row read (`none`: no row) | `src/unavailable-retry.ts` |
+| `UNAVAILABLE_RETRY_CEILING_S` | the retry timer's longest wait, in seconds, in decimal | `src/unavailable-retry.ts` |
 
 `adGraceMs`, `adAlertThresholdMs` and `adLaunchBoundMs` take the values in
 effect built from their arguments: the `[tmux]` values, `DEFAULT_AD_SETTINGS`'
@@ -1260,6 +1340,13 @@ own but for each given `<key>`, and `DEFAULT_AD_SETTINGS_IN_EFFECT`'s
 `pauseTimeout`. In every `<key>=<integer>` argument `<key>` is one of the
 package's `AD_TMUX_KEYS`; an unknown key, a key given twice or a value that
 is not an integer exits 64.
+
+Given a marker in place of `<description>` or `<reason>`,
+`adConfigMalformedOnset`, `adConfigMalformedRaisedLine` and
+`buildAdSettingsRefusedReadLine` print a text whose parts around the marker
+are its fixed parts; `unavailableRetryReArmedLine` and
+`unavailableRetryStoppedLine` print one whose part before the marker is the
+line's fixed head.
 
 ### Harness-only steps
 
