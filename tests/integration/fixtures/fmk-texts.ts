@@ -83,6 +83,14 @@
  *   DEFAULT_AD_SETTINGS <table> <key>            src/ad-settings.ts: agent-director's default
  *                                                for `[<table>] <key>` (for example `tmux
  *                                                starting_session_seconds`), in decimal
+ *   CLIENT_DEV_SENTINEL_VERSION                  src/ad-version-gate.ts, the client's
+ *                                                development sentinel version
+ *   AD_SYSTEM_INSTALL_UNREACHABLE                src/install-check-labels.ts, the class label
+ *   UNREACHABLE_REASON_UNPARSEABLE_VERSION       src/ad-version-gate.ts, the
+ *                                                ErrSystemInstallUnreachable reason of a
+ *                                                version that does not parse
+ *   meetsPhase1Floor <version>                   src/ad-version-gate.ts: whether <version>
+ *                                                meets CSCB's Phase 1 floor, `true` or `false`
  *
  * An entry is one `Entry` in `ENTRIES`: its argument synopsis, the export it
  * prints and a `print` function from its arguments to the value. Constants
@@ -281,6 +289,20 @@ const adSettingDefault: Entry = {
   },
 }
 
+/** `meetsPhase1Floor(<version>)`: `true` or `false`. */
+const phase1Floor: Entry = {
+  synopsis: '<version>',
+  async print(args, context) {
+    const entry = 'meetsPhase1Floor'
+    expectArguments(entry, args, ['version'])
+    const [version] = args
+    const meets = await packageFunction<(version: string) => unknown>(context, 'ad-version-gate.ts', entry)
+    const value = meets(version)
+    if (typeof value !== 'boolean') fail(PRINTER_FAIL_EXIT, `${entry} answered a ${typeof value}, not a boolean`)
+    return String(value)
+  },
+}
+
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = {
   // Scenario 8 (test-20-fmk-old-binary.sh).
@@ -294,6 +316,11 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   formatPersonaNotice: personaNotice,
   classifyAdError: adErrorClass,
   DEFAULT_AD_SETTINGS: adSettingDefault,
+  // Scenario 23 (test-20-fmk-old-binary.sh).
+  CLIENT_DEV_SENTINEL_VERSION: constantEntry('ad-version-gate.ts', 'CLIENT_DEV_SENTINEL_VERSION'),
+  AD_SYSTEM_INSTALL_UNREACHABLE: constantEntry('install-check-labels.ts', 'AD_SYSTEM_INSTALL_UNREACHABLE'),
+  UNREACHABLE_REASON_UNPARSEABLE_VERSION: constantEntry('ad-version-gate.ts', 'UNREACHABLE_REASON_UNPARSEABLE_VERSION'),
+  meetsPhase1Floor: phase1Floor,
 }
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */

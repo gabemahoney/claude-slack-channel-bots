@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# Test 20 (HO §7 scenario 8; b.jg5 SRJ-1410; AC 21, 22, 23): this build never
-# runs against an agent-director older than Phase 1. It refuses to start on
-# 0.10.0, stops without touching a worker or row when the binary behind the
-# shim becomes 0.10.0 while it runs, shrugs off a version re-check that cannot
-# run (one log line for the run), and on a reuse spawn's ErrInvalidFlags
-# either stops (a below-floor binary) or holds the persona with one alert and
-# no delete until the binary's version changes (a passing one).
+# Test 20 (HO §7 scenarios 8 and 23; b.jg5 SRJ-1410, SRJ-1425; AC 1, 11, 21,
+# 22, 23): this build never runs against an agent-director older than Phase 1
+# or a development build. It refuses to start on 0.10.0, stops without
+# touching a worker or row when the binary behind the shim becomes 0.10.0
+# while it runs, shrugs off a version re-check that cannot run (one log line
+# for the run), and on a reuse spawn's ErrInvalidFlags either stops (a
+# below-floor binary) or holds the persona with one alert and no delete until
+# the binary's version changes (a passing one) (scenario 8). It launches on
+# the floor's release-candidate form, refuses the development builds
+# `0.0.0-dev` and `dev` at startup, launching nothing, and judges the binary's
+# version (`binaryVersion`), never the client's package version (scenario
+# 23).
 #
 # Set-up (fmk mode, lib/scenario.sh): the scenario's own HOME, store and tmux
 # server under SCENARIO_ROOT; the agent-director 0.11.0 release installed
@@ -39,6 +44,13 @@
 #   8e           the release; the below-floor stand-in (`install_ad_stand_in
 #                <0.10.0's version> reject`) once the start-pass launch has
 #                failed; the release once the server has stopped
+#   23a          the stand-in reporting the floor's release-candidate form
+#                (`install_ad_stand_in <floor>-rc.1 pass`), then the release
+#                once the server has stopped
+#   23b          the stand-in reporting the client's development sentinel
+#                (`install_ad_stand_in 0.0.0-dev pass`), then the release
+#   23c          the stand-in reporting `dev` (`install_ad_stand_in dev
+#                pass`), then the release
 # The stand-in (fixtures/ad-version-stand-in.sh) hands every call but
 # `version` to the image's release binary; with `reject` it turns the reuse
 # flag into a flag the release does not define, so the release itself
@@ -58,11 +70,12 @@
 # two defaults, AD_STARTING_BOUND_S and AD_STOPPING_WINDOW_S below, plus
 # 2 s). In 8d P's session is already older than that; in 8e, with the server
 # stopped, the step waits about five minutes for the session the 8d reuse
-# spawn made. The whole script runs about 20 minutes. A
-# bot-server version probe is a CSCB `version` call in the agent-director
-# shim's log whose parent is the bot server. The shim's lines carry no
-# server-log timestamp, so every time is taken by this script as it polls,
-# or from a shim line's own time field.
+# spawn made. The whole script runs about 18 minutes (measured: 1060 s;
+# scenario 23's legs take a few seconds of it). A bot-server version probe
+# is a CSCB `version` call in the agent-director shim's log whose parent is
+# the bot server. The shim's lines carry no server-log timestamp, so every
+# time is taken by this script as it polls, or from a shim line's own time
+# field.
 #
 # Legs (in order; none is independent of the ones before it):
 #   8a   0.10.0 behind the shim; its reported version is read with a harness
@@ -131,6 +144,32 @@
 #        OLD_VERSION, all less than RECHECK_S after the gate; no CSCB kill,
 #        kill-finished, delete or pause follows, and P's row (read with the
 #        release back) stays finished.
+#   23a  the server stopped, P's row finished (from 8e); the stand-in
+#        reporting PASSING_VERSION (the floor's `<floor>-rc.N` form) goes
+#        behind the shim in `pass` mode, and a harness `version` call reads
+#        it. Start: the gate passes (the bot server's first probe; the
+#        server keeps running), at least one CSCB launch call (spawn or
+#        resume) follows, P reports in (`waiting`), and the start wrote no
+#        `ad-below-phase1-floor` entry. The server is stopped and the
+#        release goes back.
+#   23b  AC 11 first: the installed client's package version
+#        (CLIENT_PKG_VERSION, read from the package.json of the client the
+#        installed package resolves, as docker/ad-client-check.sh finds it)
+#        meets the floor (`meetsPhase1Floor` prints `true`). The stand-in
+#        reporting DEV_SENTINEL (`0.0.0-dev`) goes behind the shim; a live
+#        `start` fails: the CLI reports the daemon's non-zero exit, exactly
+#        one `ad-below-phase1-floor` entry equals the startup form of the
+#        floor message for DEV_SENTINEL and the binary's path (it names the
+#        floor), with its one server-log line, and no
+#        `ad-system-install-unreachable` entry; the start made `version`
+#        calls only (at least one), no new tmux session and no new
+#        stub-record line. The release goes back.
+#   23c  the stand-in reporting GO_BUILD_VERSION (`dev`) goes behind the
+#        shim; a live `start` fails as in 23b, launching nothing, with
+#        exactly one new `ad-system-install-unreachable` entry naming the
+#        reason UNPARSEABLE_REASON and the binary's path (the client's
+#        `Client.create()` refuses a version that does not parse) and no
+#        new `ad-below-phase1-floor` entry. The release goes back.
 #
 # Matched values, each printed by fixtures/fmk-texts.ts from the installed
 # package (never retyped):
@@ -151,6 +190,14 @@
 #                                                          src/ad-settings.ts
 #   AD_STOPPING_WINDOW_S DEFAULT_AD_SETTINGS tmux stopping_window_seconds
 #                                                          src/ad-settings.ts
+#   DEV_SENTINEL         CLIENT_DEV_SENTINEL_VERSION       src/ad-version-gate.ts
+#   UNREACHABLE_LABEL    AD_SYSTEM_INSTALL_UNREACHABLE     src/install-check-labels.ts
+#   UNPARSEABLE_REASON   UNREACHABLE_REASON_UNPARSEABLE_VERSION
+#                                                          src/ad-version-gate.ts
+#   the AC 11 check      meetsPhase1Floor <CLIENT_PKG_VERSION>
+#                                                          src/ad-version-gate.ts
+# GO_BUILD_VERSION (`dev`, a plain `go build`'s version) is not a CSCB
+# constant: it is quoted, citing b.jg5 SRJ-202 and HO §7 scenario 23.
 # Lines with no exported builder are matched by a fragment quoted from src/
 # (ruling S7), each with its source beside it below. The binary path in the
 # floor messages is the client's resolved path of the standard path (the
@@ -174,7 +221,14 @@
 #   that ends the hold (the hold ends only on a different version string);
 # - the exit bound is RECHECK_S + EXIT_ALLOWANCE_S, measured from the swap;
 # - ErrSchemaMismatch noise while 0.10.0 sits behind the shim is printed,
-#   not asserted.
+#   not asserted;
+# - scenario 23's release-candidate leg (23a) runs on the stand-in reporting
+#   PASSING_VERSION in `pass` mode, every call handed to the release, since
+#   the image holds the 0.11.0 release and no release candidate;
+# - AC 11: the installed client's package version is the release's (0.11.0),
+#   which meets the floor, so the proof is the development-build legs: a
+#   CSCB that judged the client's package version would launch on
+#   `0.0.0-dev` and `dev`, and it refuses both.
 #
 # The script ends with the three closing assertions (assert_no_server_tmux,
 # assert_no_cscb_include_finished, assert_no_cscb_delete), which count only
@@ -224,6 +278,19 @@ RECHECK_WAIT_S=$(( RECHECK_S + EXIT_ALLOWANCE_S ))
 # release put back (src/ad-version-gate.ts meetsPhase1Floor). The `-rc.1`
 # suffix is the scenario's own; the floor comes from the printer.
 PASSING_VERSION="${FLOOR}-rc.1"
+
+# Scenario 23's development builds: a `make` build without a version stamp
+# reports the client's development sentinel; a plain `go build` reports
+# `dev`, which CSCB exports no constant for (b.jg5 SRJ-202, which refuses a
+# version that does not parse; HO §7 scenario 23).
+DEV_SENTINEL="$(bun "${TEXTS}" CLIENT_DEV_SENTINEL_VERSION)" || fail "setup: fmk-texts CLIENT_DEV_SENTINEL_VERSION"
+GO_BUILD_VERSION='dev'
+UNREACHABLE_LABEL="$(bun "${TEXTS}" AD_SYSTEM_INSTALL_UNREACHABLE)" || fail "setup: fmk-texts AD_SYSTEM_INSTALL_UNREACHABLE"
+UNPARSEABLE_REASON="$(bun "${TEXTS}" UNREACHABLE_REASON_UNPARSEABLE_VERSION)" \
+    || fail "setup: fmk-texts UNREACHABLE_REASON_UNPARSEABLE_VERSION"
+
+# The installed package under test (as fmk-texts.ts and fmk-driver.ts read it).
+CSCB_PKG="${SCENARIO_REPO}/node_modules/claude-slack-channel-bots"
 
 # The release's identity, recorded in the image (docker/Dockerfile.test.base).
 AD_RELEASE_JSON=/opt/agent-director/client/release.json
@@ -275,6 +342,11 @@ SERVER_PID=""
 P_SESSION=""
 P_ROW0=""
 P_PID0=""
+CLIENT_PKG_JSON=""
+CLIENT_PKG_VERSION=""
+REFUSED_AD_LINES=0
+REFUSED_RECORD=0
+REFUSED_SESSIONS=""
 STUB_DIR="${SCENARIO_ROOT}/slack-stub"
 STUB_RECORD="${STUB_DIR}/record.jsonl"
 
@@ -576,6 +648,84 @@ leg() {
     echo "${TEST_NAME}: leg $1 (at ${SECONDS}s)"
 }
 
+# begin_refused_start: record what a start that must be refused may not
+# change: the agent-director shim log's length, the tmux sessions and the
+# Slack stub record's length.
+begin_refused_start() {
+    REFUSED_AD_LINES="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
+    REFUSED_RECORD="$(line_count "${STUB_RECORD}")"
+    REFUSED_SESSIONS="$(tmux_session_names)"
+}
+
+# expect_refused_start <step>: the last `run_start` was refused at startup
+# (after begin_refused_start): the CLI reports the daemon's non-zero exit and
+# no daemon runs; every agent-director call since then is a `version` call,
+# at least one (the daemon refused before it wrote its PID file, so it is not
+# in the CSCB record and the shim log is read whole); no new tmux session; no
+# new stub-record line (no Slack connection).
+expect_refused_start() {
+    local step="$1" report pid line verb versions=0 calls=()
+    (( START_RC != 0 )) || { cat "${START_OUT}" >&2; fail "${step}: the start exited 0"; }
+    report="$(grep -F -- "${START_FAILED_FRAGMENT}" "${START_OUT}" || true)"
+    [[ -n "${report}" && "${report}" != *"${START_FAILED_FRAGMENT}0)"* ]] \
+        || { sed 's/^/  | /' "${START_OUT}" >&2; fail "${step}: start did not report the daemon's non-zero exit"; }
+    pid="$(server_pid)"
+    [[ -z "${pid}" ]] || ! pid_alive "${pid}" || fail "${step}: a daemon (${pid}) is running after the refused start"
+    mapfile -t calls < <(tail -n "+$(( REFUSED_AD_LINES + 1 ))" "${SCENARIO_AD_SHIM_LOG}" | awk -F'\t' '$1 == "call"')
+    for line in ${calls[@]+"${calls[@]}"}; do
+        call_fields "${step}" "${line}"
+        for verb in "${TOUCH_VERBS[@]}"; do
+            [[ "${CALL_VERB}" != "${verb}" ]] || fail "${step}: the refused start made a ${verb} call: ${line}"
+        done
+        [[ "${CALL_VERB}" != version ]] || versions=$(( versions + 1 ))
+    done
+    (( versions >= 1 )) || fail "${step}: the refused start made no version probe through the shim"
+    echo "${TEST_NAME}: ${step}: the refused start's agent-director calls: ${#calls[@]} (${versions} version)"
+    [[ "$(tmux_session_names)" == "${REFUSED_SESSIONS}" ]] || fail "${step}: the refused start left a new tmux session"
+    [[ "$(line_count "${STUB_RECORD}")" == "${REFUSED_RECORD}" ]] \
+        || fail "${step}: the Slack stub recorded $(( $(line_count "${STUB_RECORD}") - REFUSED_RECORD )) line(s) during the refused start"
+}
+
+# launch_count: CSCB's launch calls (spawn and resume).
+launch_count() {
+    echo $(( $(cscb_ad_count spawn) + $(cscb_ad_count resume) ))
+}
+
+launch_count_above() {
+    (( $(launch_count) > $1 ))
+}
+
+# unreachable_entries: how many startup-errors.log entries carry
+# UNREACHABLE_LABEL.
+unreachable_entries() {
+    count_in "${SLACK_STATE_DIR}/startup-errors.log" "] [${UNREACHABLE_LABEL}] "
+}
+
+# read_client_package_version <step>: set CLIENT_PKG_JSON and
+# CLIENT_PKG_VERSION from the package metadata of the agent-director client
+# the installed package resolves (the field the client's `version()`
+# reports), found as docker/ad-client-check.sh finds it: bun's resolver from
+# the package's src/, then the nearest directory above the entry point whose
+# package.json names agent-director. No agent-director call.
+read_client_package_version() {
+    local step="$1" entry dir
+    entry="$(cd / && RESOLVE_FROM="${CSCB_PKG}/src" bun --no-install -e \
+        'process.stdout.write(Bun.resolveSync("agent-director", process.env.RESOLVE_FROM))')" \
+        || fail "${step}: the installed package at ${CSCB_PKG} resolves no agent-director client"
+    [[ "${entry}" == /* ]] || fail "${step}: the resolved entry point '${entry}' is not an absolute path"
+    dir="$(dirname "${entry}")"
+    while [[ "${dir}" != / ]]; do
+        if [[ -f "${dir}/package.json" && "$(jq -r '.name // empty' "${dir}/package.json")" == agent-director ]]; then
+            CLIENT_PKG_JSON="${dir}/package.json"
+            CLIENT_PKG_VERSION="$(jq -r '.version // empty' "${CLIENT_PKG_JSON}")"
+            [[ -n "${CLIENT_PKG_VERSION}" ]] || fail "${step}: ${CLIENT_PKG_JSON} records no version"
+            return 0
+        fi
+        dir="$(dirname "${dir}")"
+    done
+    fail "${step}: no agent-director package.json above ${entry}"
+}
+
 # ---------------------------------------------------------------------------
 # Set-up
 # ---------------------------------------------------------------------------
@@ -623,37 +773,13 @@ OLD_VERSION="$(jq -r '.version // empty' "${AD_OUT}")" || fail "8a: version prin
     || fail "8a: 0.10.0's binary reports '${OLD_VERSION}', not an older version than the floor ${FLOOR}"
 echo "${TEST_NAME}: 8a: 0.10.0's binary reports version ${OLD_VERSION}"
 
-ad_lines_before="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
-record_before="$(line_count "${STUB_RECORD}")"
-sessions_before="$(tmux_session_names)"
-entries_before="$(floor_entries_any)"
-run_start --live
-(( START_RC != 0 )) || { cat "${START_OUT}" >&2; fail "8a: start on 0.10.0 exited 0"; }
-start_report="$(grep -F -- "${START_FAILED_FRAGMENT}" "${START_OUT}" || true)"
-[[ -n "${start_report}" && "${start_report}" != *"${START_FAILED_FRAGMENT}0)"* ]] \
-    || { sed 's/^/  | /' "${START_OUT}" >&2; fail "8a: start did not report the daemon's non-zero exit"; }
-pid="$(server_pid)"
-[[ -z "${pid}" ]] || ! pid_alive "${pid}" || fail "8a: a daemon (${pid}) is running after the refused start"
 MSG_8A="$(bun "${TEXTS}" buildBelowPhase1FloorMessage "${OLD_VERSION}" "${AD_BIN_PATH}" startup)" \
     || fail "8a: fmk-texts buildBelowPhase1FloorMessage startup"
+entries_before="$(floor_entries_any)"
+begin_refused_start
+run_start --live
+expect_refused_start "8a"
 expect_one_floor_entry "8a" "${MSG_8A}" 0 "${entries_before}"
-
-# Every agent-director call of this start (the daemon refused before it wrote
-# its PID file, so it is not in the CSCB record): versions only, at least one.
-mapfile -t start_calls < <(tail -n "+$(( ad_lines_before + 1 ))" "${SCENARIO_AD_SHIM_LOG}" | awk -F'\t' '$1 == "call"')
-versions=0
-for line in ${start_calls[@]+"${start_calls[@]}"}; do
-    call_fields "8a" "${line}"
-    for verb in "${TOUCH_VERBS[@]}"; do
-        [[ "${CALL_VERB}" != "${verb}" ]] || fail "8a: the refused start made a ${verb} call: ${line}"
-    done
-    [[ "${CALL_VERB}" != version ]] || versions=$(( versions + 1 ))
-done
-(( versions >= 1 )) || fail "8a: the refused start made no version probe through the shim"
-echo "${TEST_NAME}: 8a: the refused start's agent-director calls: ${#start_calls[@]} (${versions} version)"
-[[ "$(tmux_session_names)" == "${sessions_before}" ]] || fail "8a: the refused start left a new tmux session"
-[[ "$(line_count "${STUB_RECORD}")" == "${record_before}" ]] \
-    || fail "8a: the Slack stub recorded $(( $(line_count "${STUB_RECORD}") - record_before )) line(s) during the refused start"
 swap_ad_binary release "8a: the release back behind the shim"
 
 # ---------------------------------------------------------------------------
@@ -753,7 +879,7 @@ ad_capture version
 n_reuse="$(cscb_ad_count spawn --reuse-finished)"
 driver_out="${SCENARIO_ROOT}/fmk-driver-reuse-spawn.out"
 driver_rc=0
-cscb_run env "CSCB_PKG_DIR=${SCENARIO_REPO}/node_modules/claude-slack-channel-bots" \
+cscb_run env "CSCB_PKG_DIR=${CSCB_PKG}" \
     "DRIVER_PERSONA=${P_NAME}" "DRIVER_PERSONA_CHANNEL=${P_CHANNEL}" "DRIVER_WORKING_DIRECTORY=${P_WORK}" \
     bun --no-install "${SCENARIO_FIXTURES}/fmk-driver.ts" reuse-spawn < /dev/null > "${driver_out}" 2> "${driver_out}.err" || driver_rc=$?
 mapfile -t driver_lines < <(grep -E '^DRIVER(_FAIL)?:' "${driver_out}" || true)
@@ -894,6 +1020,73 @@ expect_one_floor_entry "8e" "${MSG_RUNTIME}" "${same_before}" "${entries_before}
 expect_counts_unchanged "8e: after the stop" touch_8e kill kill-finished delete pause
 swap_ad_binary release "8e: the release back behind the shim"
 expect_finished "8e: after the stop"
+
+# ---------------------------------------------------------------------------
+# 23a: the floor's release-candidate form passes the gate and launches
+# ---------------------------------------------------------------------------
+
+leg 23a
+install_ad_stand_in "${PASSING_VERSION}" pass "23a: the stand-in reporting ${PASSING_VERSION} behind the shim"
+ad_capture version
+[[ "${AD_RC}" == 0 && "$(jq -r '.version // empty' "${AD_OUT}")" == "${PASSING_VERSION}" ]] \
+    || fail "23a: a harness version call through the stand-in reads '$(head -c 300 "${AD_OUT}")', not ${PASSING_VERSION}"
+entries_before="$(floor_entries_any)"
+n_version="$(cscb_ad_count version)"
+n_launch="$(launch_count)"
+start_server --live
+wait_server_probe "${n_version}" "${GATE_WAIT_S}" "23a: the startup gate's probe"
+wait_until "${REPORT_WAIT_S}" "23a: CSCB made no launch call (spawn or resume)" launch_count_above "${n_launch}"
+wait_until "${REPORT_WAIT_S}" "23a: P (${P_ID}) never reported in (waiting)" row_state_is "${P_ID}" waiting
+pid_alive "${SERVER_PID}" || fail "23a: the server stopped"
+[[ "$(floor_entries_any)" == "${entries_before}" ]] \
+    || fail "23a: the start on ${PASSING_VERSION} wrote $(( $(floor_entries_any) - entries_before )) ${FLOOR_LABEL} entr(y/ies)"
+echo "${TEST_NAME}: 23a: CSCB launch calls from this start: $(( $(launch_count) - n_launch ))"
+stop_server
+swap_ad_binary release "23a: the release back behind the shim"
+
+# ---------------------------------------------------------------------------
+# 23b, 23c: development builds launch nothing; CSCB reads binaryVersion
+# ---------------------------------------------------------------------------
+
+# AC 11: the installed client's package version (the field its `version()`
+# reports) meets the floor, so a CSCB that judged it would launch on the
+# development builds below; their refusals show CSCB judges the binary's
+# version (the client's `binaryVersion`).
+read_client_package_version "23 (AC 11)"
+client_meets="$(bun "${TEXTS}" meetsPhase1Floor "${CLIENT_PKG_VERSION}")" \
+    || fail "23 (AC 11): fmk-texts meetsPhase1Floor ${CLIENT_PKG_VERSION}"
+[[ "${client_meets}" == true ]] \
+    || fail "23 (AC 11): the installed client's package version ${CLIENT_PKG_VERSION} (${CLIENT_PKG_JSON}) does not meet the floor ${FLOOR} (meetsPhase1Floor: ${client_meets}), so the development-build legs cannot show which version CSCB judges"
+echo "${TEST_NAME}: 23 (AC 11): the installed client's package version ${CLIENT_PKG_VERSION} (${CLIENT_PKG_JSON}) meets the floor ${FLOOR}"
+
+leg 23b
+MSG_DEV="$(bun "${TEXTS}" buildBelowPhase1FloorMessage "${DEV_SENTINEL}" "${AD_BIN_PATH}" startup)" \
+    || fail "23b: fmk-texts buildBelowPhase1FloorMessage ${DEV_SENTINEL} startup"
+install_ad_stand_in "${DEV_SENTINEL}" pass "23b: the stand-in reporting ${DEV_SENTINEL} behind the shim"
+entries_before="$(floor_entries_any)"
+same_before="$(floor_entries "${MSG_DEV}")"
+unreachable_before="$(unreachable_entries)"
+begin_refused_start
+run_start --live
+expect_refused_start "23b"
+expect_one_floor_entry "23b" "${MSG_DEV}" "${same_before}" "${entries_before}"
+[[ "$(unreachable_entries)" == "${unreachable_before}" ]] || fail "23b: the refused start wrote an ${UNREACHABLE_LABEL} entry"
+swap_ad_binary release "23b: the release back behind the shim"
+
+leg 23c
+install_ad_stand_in "${GO_BUILD_VERSION}" pass "23c: the stand-in reporting ${GO_BUILD_VERSION} behind the shim"
+entries_before="$(floor_entries_any)"
+unreachable_before="$(unreachable_entries)"
+begin_refused_start
+run_start --live
+expect_refused_start "23c"
+[[ "$(unreachable_entries)" == "$(( unreachable_before + 1 ))" ]] \
+    || fail "23c: $(( $(unreachable_entries) - unreachable_before )) new ${UNREACHABLE_LABEL} entr(y/ies), not exactly one"
+entry="$(_scenario_scan lastline "${SLACK_STATE_DIR}/startup-errors.log" "] [${UNREACHABLE_LABEL}] ")"
+[[ "${entry}" == *"${UNPARSEABLE_REASON}"* && "${entry}" == *"${AD_BIN_PATH}"* ]] \
+    || fail "23c: the ${UNREACHABLE_LABEL} entry does not name the reason ${UNPARSEABLE_REASON} and the binary ${AD_BIN_PATH}: ${entry}"
+[[ "$(floor_entries_any)" == "${entries_before}" ]] || fail "23c: the refused start wrote an ${FLOOR_LABEL} entry"
+swap_ad_binary release "23c: the release back behind the shim"
 
 # ---------------------------------------------------------------------------
 # Closing assertions (b.jg5 SRJ-1401, SRJ-1418)

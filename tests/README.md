@@ -231,8 +231,10 @@ tests/
                                    # re-bind (`tmux_server_steps`). The re-fire legs wait out agent-director's default G (60 s); only after them does
                                    # `store_statements` write a `[tmux]` table (`starting_session_seconds = 60`, `stopping_window_seconds = 30`), so the
                                    # kill need not wait 300 s. It runs about two and a half minutes and ends with the three closing assertions
-    test-20-fmk-old-binary.sh      # HO §7 scenario 8 (b.jg5 SRJ-1410), fmk: an old binary is refused at start; a binary swapped behind the shim stops the server;
-                                   # a re-check that cannot run logs once and changes nothing; an ErrInvalidFlags reuse holds or stops (see fmk scenarios below)
+    test-20-fmk-old-binary.sh      # HO §7 scenarios 8 and 23 (b.jg5 SRJ-1410, SRJ-1425), fmk: an old binary is refused at start; a binary swapped behind the shim stops
+                                   # the server; a re-check that cannot run logs once and changes nothing; an ErrInvalidFlags reuse holds or stops; the floor's
+                                   # release-candidate form launches; development builds (`0.0.0-dev`, `dev`) are refused, launching nothing; CSCB judges the
+                                   # binary's version, never the client's package version (see fmk scenarios below)
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
@@ -246,7 +248,7 @@ tests/
       fmk-texts.ts                 # the one value printer of the fmk scenarios: prints the installed package's own export (a constant, or a builder's output for
                                    # the given arguments) by entry name, so no script retypes a value src/ exports; refuses to run without the image marker
                                    # /etc/cscb-ci-image and imports the package only after that check (see The value printer)
-      ad-version-stand-in.sh       # scenario 8's agent-director version stand-in, behind the shim: reports a chosen version (or none a client parses), can turn the
+      ad-version-stand-in.sh       # scenarios 8 and 23's agent-director version stand-in, behind the shim: reports a chosen version (or none a client parses), can turn the
                                    # reuse flag into one the release does not define, and hands every other call to the image's release binary; refuses without
                                    # the image marker or its settings file (see Scenario helper)
       driver.ts                    # Test 4 driver: builds a one-persona config, calls spawnForPersona directly, then follows the persona's dialog approver through the package's seams
@@ -506,7 +508,8 @@ Each change to the install goes through one helper:
   A move that fails halfway is rolled back and the step fails saying so.
 - `install_ad_stand_in <version|unparseable> <reject|pass> [<step>]` and
   `restore_ad_install_with_stand_in <version|unparseable> <reject|pass>
-  [<step>]` are harness additions for scenario 8. Each puts
+  [<step>]` are harness additions for scenario 8 (`install_ad_stand_in` for
+  scenario 23 too). Each puts
   `fixtures/ad-version-stand-in.sh` behind the shim, after writing the
   stand-in's settings beside the binary path
   (`agent-director.real.settings`): what its `version` reports (`<version>`,
@@ -666,7 +669,7 @@ by single spaces, hold every fixed-string fragment in order;
 `cscb_ad_count <verb> [<fragment>...]` prints how many. The harness's calls,
 the stub's calls and any `stop` line never count.
 `wait_for_cscb_ad_call <count-before> <timeout-s> <step> <verb>
-[<fragment>...]` (a harness addition for scenario 8) waits until that count
+[<fragment>...]` (a harness addition for scenarios 8 and 23) waits until that count
 is above `<count-before>`, which the caller takes before the step it waits
 on, then prints the next such line (`cscb_ad_calls`' line `<count-before>` +
 1); it fails naming `<step>` when the count stays there for `<timeout-s>`.
@@ -800,6 +803,7 @@ not a scenario.
 | HO §7 scenario | Script | Requirement |
 |---|---|---|
 | 8 | `test-20-fmk-old-binary.sh` | b.jg5 SRJ-1410 (AC 21, 22, 23) |
+| 23 | `test-20-fmk-old-binary.sh` (legs 23a to 23c, after scenario 8's) | b.jg5 SRJ-1425 (AC 1, 11) |
 
 #### Scenario 8: test-20
 
@@ -868,7 +872,8 @@ The legs run in order, each on the state the one before left:
   ended`, then `ad_kill_include_finished`, agent-director-admin's
   `kill-finished`) and puts the passing wrapper behind the shim. The server
   starts: the start pass's plain spawn collides with P's finished row
-  (`ErrInstanceIdCollision`) and launches nothing, then exactly one reuse
+  (`ErrInstanceIdCollision`) and launches nothing (its count is printed, not
+  asserted), then exactly one reuse
   spawn carrying `--reuse-finished` gets `ErrInvalidFlags` and is directly
   followed by a bot-server probe (the immediate re-check). The server keeps
   running, one post to P's channel holds the Cannot launch alert whole, and
@@ -938,6 +943,75 @@ each with its source named beside it in the script: the start failure
 collision, reuse-failed and reuse-spawned lines
 (`src/session-manager.ts`).
 
+#### Scenario 23: test-20
+
+Scenario 23's legs run in Test 20 after scenario 8's and before the three
+closing assertions, on the same set-up, persona and config. They show that
+CSCB launches on the floor's release-candidate form, refuses the development
+builds `0.0.0-dev` and `dev` at startup, launching nothing, and judges the
+binary's version (the client's `binaryVersion`), never the client's package
+version (PRD AC 11). Each stand-in goes behind the shim with
+`install_ad_stand_in`, whose own shim check runs after each install, and
+the release goes back with `swap_ad_binary release` after each leg. The
+three legs take a few seconds of Test 20's run.
+
+| Leg | Behind the shim, in order |
+|---|---|
+| 23a | the stand-in reporting the floor's release-candidate form (`install_ad_stand_in <floor>-rc.1 pass`), then the release once the server has stopped |
+| 23b | the stand-in reporting the client's development sentinel (`install_ad_stand_in 0.0.0-dev pass`), then the release |
+| 23c | the stand-in reporting `dev` (`install_ad_stand_in dev pass`), then the release |
+
+- 23a, the release-candidate form launches. With the server stopped and P's
+  row finished (from 8e), the stand-in reporting the floor with an `-rc.1`
+  tag goes behind the shim in `pass` mode, handing every call to the
+  release, and a harness `version` call reads it. The server starts: the
+  gate passes (the bot server's first probe; the server keeps running), at
+  least one CSCB launch call (spawn or resume) follows, P reports in
+  (`waiting`), and the start writes no `ad-below-phase1-floor` entry. The
+  server is stopped.
+- The AC 11 check, before 23b. The script reads the package version of the
+  agent-director client the installed package resolves (the field the
+  client's `version()` reports) from that client's `package.json`, found as
+  `docker/ad-client-check.sh` finds it, with no agent-director call. The
+  printer's `meetsPhase1Floor` must print `true` for it: the client's package
+  version meets the floor, so a CSCB that judged it would launch in 23b and
+  23c, and their refusals show it judges the binary's version.
+- 23b, `0.0.0-dev` is refused. With the stand-in reporting the client's
+  development sentinel behind the shim, a live `start` fails: the CLI reports
+  the daemon's non-zero exit and no daemon runs; exactly one
+  `ad-below-phase1-floor` entry equals the startup form of the floor message
+  for `0.0.0-dev` and the binary's path, with its one server-log line; no
+  `ad-system-install-unreachable` entry is written. The start makes
+  `version` calls only (at least one), no new tmux session and no new Slack
+  stub record line.
+- 23c, `dev` is refused. With the stand-in reporting `dev` (a plain
+  `go build`'s version) behind the shim, a live `start` fails as in 23b,
+  launching nothing, with exactly one new `ad-system-install-unreachable`
+  entry naming the `unparseable-version` reason and the binary's path (the
+  client's `Client.create()` refuses a version that does not parse, b.jg5
+  SRJ-202) and no new `ad-below-phase1-floor` entry.
+
+8a, 23b and 23c share one refused-start check: the CLI's non-zero exit
+report, no daemon running, only `version` calls through the shim since the
+start (the shim log is read whole, since the refused daemon never wrote its
+PID file), no new tmux session and no new stub record line.
+
+The image holds the 0.11.0 release and no release candidate, so 23a runs on
+the stand-in reporting `<floor>-rc.1`, the form 8d's passing wrapper
+reports. `dev` is not a CSCB constant: the script quotes it, citing b.jg5
+SRJ-202 and HO §7 scenario 23.
+
+Matched values, each printed by `fixtures/fmk-texts.ts` from the installed
+package, beside scenario 8's floor, floor label and floor message:
+
+| Value | Printer entry | `src/` |
+|---|---|---|
+| The client's development sentinel | `CLIENT_DEV_SENTINEL_VERSION` | `src/ad-version-gate.ts` |
+| The unreachable entry's class label | `AD_SYSTEM_INSTALL_UNREACHABLE` | `src/install-check-labels.ts` |
+| The unparseable-version reason | `UNREACHABLE_REASON_UNPARSEABLE_VERSION` | `src/ad-version-gate.ts` |
+| The AC 11 check: whether the client's package version meets the floor | `meetsPhase1Floor <version>` | `src/ad-version-gate.ts` |
+| The `0.0.0-dev` floor message, startup form | `buildBelowPhase1FloorMessage 0.0.0-dev <path> startup` | `src/ad-version-gate.ts` |
+
 ### The value printer
 
 `tests/integration/fixtures/fmk-texts.ts` is the one value printer of the
@@ -978,6 +1052,10 @@ builder's output for the given arguments.
 | `formatPersonaNotice <persona-name> <entry> [<arg>...]` | another entry's value as posted in that persona's notice | `src/persona-notifier.ts` |
 | `classifyAdError <err-name>` | CSCB's class for the installed client's error class `<err-name>`, built from an envelope | `src/ad-error-class.ts` |
 | `DEFAULT_AD_SETTINGS <table> <key>` | agent-director's default for `[<table>] <key>`, in decimal; an unknown table or key exits 64 | `src/ad-settings.ts` |
+| `CLIENT_DEV_SENTINEL_VERSION` | the client's development sentinel version | `src/ad-version-gate.ts` |
+| `AD_SYSTEM_INSTALL_UNREACHABLE` | the class label | `src/install-check-labels.ts` |
+| `UNREACHABLE_REASON_UNPARSEABLE_VERSION` | the `ErrSystemInstallUnreachable` reason of a version that does not parse | `src/ad-version-gate.ts` |
+| `meetsPhase1Floor <version>` | whether `<version>` meets the Phase 1 floor: `true` or `false` | `src/ad-version-gate.ts` |
 
 ### Harness-only steps
 
@@ -1075,7 +1153,7 @@ one.
 
 | Helper | Scenario | Columns it changes |
 |---|---|---|
-| `ad_store_mark_finished <id> <missing\|ended>` | 10 part B (SRJ-1412) | `state` to `missing` or `ended`; `ended_at` to now minus the stopping window, in whole seconds, in the store's `YYYY-MM-DD HH:MM:SS` UTC layout; `launch_started_at` NULL; `row_version` + 1. Prints the `ended_at` written |
+| `ad_store_mark_finished <id> <missing\|ended>` | 10 part B (SRJ-1412); 8 (SRJ-1410), in test-20's 8d and 8e | `state` to `missing` or `ended`; `ended_at` to now minus the stopping window, in whole seconds, in the store's `YYYY-MM-DD HH:MM:SS` UTC layout; `launch_started_at` NULL; `row_version` + 1. Prints the `ended_at` written |
 | `ad_store_seed_pending <id> [<leftover-token>]` | 19 (SRJ-1420) | the existing row made `pending`, as a spawn whose process stopped before its create leaves it: `state` `pending`; `launch_started_at` now, in milliseconds; `launch_token` a fresh token other than the row's current one and the leftover's; `ended_at`, `pid`, `proc_starttime`, `tmux_server_pid`, `tmux_server_started`, `tmux_server_starttime`, `pane_id`, `pane_pid` and `pane_starttime` NULL; `row_version` + 1. A harness `status` read must then read `pending` with a launch start. Prints the token |
 | `ad_store_unusable_name <id> <name>` | 25 (SRJ-1427) | only `tmux_session_name`, to a `<name>` holding a `.` and only letters, digits and `._-`, on an `ended` or `missing` row; `row_version` kept |
 | `ad_store_pending_no_launch <id>` | 20 and 26 | `state` `pending`; `launch_started_at`, `launch_token`, `pid`, `proc_starttime`, `pane_id`, `pane_pid` and `pane_starttime` NULL; `row_version` + 1. A harness `status` read must then read `pending` with no launch start |
