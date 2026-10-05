@@ -17,7 +17,8 @@
 # Scenario 19: a session holds the name of a persona with no row, or with a
 # `pending` row, and each variant latches with one post and is retried at the
 # cadence with exactly the call its row state allows, until the harness ends
-# the session and one recovery post follows; CSCB never kills:
+# the session and one recovery post follows; CSCB never kills and counts no
+# launch failure:
 #   - the scan refusal (persona `scanleft`): a leftover labelled with an
 #     earlier launch of the id; the plain spawn's pre-spawn scan refuses it
 #     and writes no row; rounds are `status` (no row) then the plain spawn;
@@ -67,8 +68,9 @@
 # Scenario 4's leg (persona `nolabel`, key `nolabel`). Steps marked
 # [harness] are the harness playing a human from the scenario's own shell;
 # no CSCB process makes them.
-#   Phase 1. The live start spawns `nolabel` fresh; the approver clears the
-#      dialog; a harness `get` reads the row `waiting`; its
+#   Phase 1. The live start spawns `nolabel` fresh (the start pass's
+#      completion line counts `0 failed` and `0 not brought up`); the
+#      approver clears the dialog; a harness `get` reads the row `waiting`; its
 #      claude_session_id and tmux session name are recorded.
 #   Phase 2. [harness] The human ends `nolabel`'s worker as a human ends
 #      Claude Code: the stub's exit line typed into its pane with the real
@@ -89,7 +91,11 @@
 #   Phase 3. [harness] With the server stopped, a session with no label and
 #      no @ad_pane, named as the row records (`slack_bot_<key>`), its pane
 #      running `sleep` (`seed_unlabelled`). The row still reads finished.
-#   Phase 4. The live start:
+#   Phase 4. The live start; scenario 4's persona runs through scenario 19's
+#      latch, rounds, end and clear steps (s19_latch, s19_rounds, s19_end,
+#      s19_clear, below), by its own entry in their tables (case
+#      `no-valid-id`, refused operation and re-check call `resume`, recorded
+#      row state its finished state, round step `step-2`):
 #      - the bring-up's one `resume` of `nolabel`'s row (parent: the bot
 #        server; its earlier calls, a `spawn` that meets the finished row
 #        among them, are recorded, not asserted) is refused: server.log
@@ -97,45 +103,57 @@
 #        `no-valid-id`, the session, refused operation `resume` and the
 #        state read (`conflictLatchSetLine`, followed by agent-director's
 #        description), once;
-#      - exactly one post on its channel holds the CONFLICT notice head, and
-#        its lines, in SRJ-1004's order, are: the persona prefix and the
-#        first line for that case quoting the session; the description line
-#        (head and tail as printed, holding agent-director's "no valid
-#        instance id" phrase and the session name); the pointer line; the
-#        list line; the human-only line. Every line but the description
-#        line equals the printed line, so the post names no command;
+#      - exactly one post on its channel since the second life began, the
+#        CONFLICT notice, whose lines, in SRJ-1004's order, are: the persona
+#        prefix and the first line for that case quoting the session; the
+#        description line (head and tail as printed, holding agent-director's
+#        "no valid instance id" phrase and the session name); the pointer
+#        line; the list line; the human-only line. Every line but the
+#        description line equals the printed line, so the post names no
+#        command;
 #      - the harness reads the row's state and row_version (the store,
 #        read-only) right after the latch;
-#      - REFUSED_ROUNDS (2) re-check rounds: `persona_rounds` reads the
-#        persona's CSCB calls after the latch, which must be exactly one
-#        `status` then one `resume` per round, no `read-pane` and no other
-#        call; the first round's `status` comes at least one interval
+#      - at least REFUSED_ROUNDS (2) re-check rounds, and then every round
+#        run since the latch (as many as have run; none is in flight and
+#        each has its round line): `latch_rounds` reads the persona's CSCB
+#        calls after the latch, which must be exactly one `status` then one
+#        `resume` per round, no `read-pane` and no other call; the first
+#        round's `status` comes at least one interval
 #        (LATCH_RECHECK_INTERVAL_MS) after the refused bring-up `resume` and
 #        within the interval plus SETTLE_S, each next round's at least one
 #        interval after the previous round's and within the interval plus
 #        SETTLE_S, and each round's `resume` within SETTLE_S of its
-#        `status`; after each, the round line (`latchRecheckRoundLine`, step
-#        `step-2`, call `resume`, answer `still-latched`) is logged, the row
-#        reads the same state and row_version, the seeded session is still
-#        there with the same id, and the channel holds no new post;
-#      - [harness] the human ends the seeded session by its session id
-#        (`end_session`);
+#        `status` (`check_cadence`); every round line since the latch
+#        (`latchRecheckRoundLine`, step `step-2`, call `resume`) answers
+#        `still-latched`; the row reads the same state and row_version, the
+#        seeded session is still there with the same id, and the channel
+#        holds no new post;
+#      - [harness] right before the human ends the seeded session by its
+#        session id (`end_session`), every round since the latch is read and
+#        checked again, so the clear below is checked on the first round
+#        after the end, never on a refused round that came before it;
 #      - the next round: its first two calls are one `status` then one
 #        `resume`, at the cadence, with no CSCB `find-missing` between them
 #        (`ad_cscb_verb_between`); the `resume` launches: the latch clears
 #        (`latchClearedLine`, reason "a retry of the refused operation was
-#        not refused", posted), the approver clears the dialog and the row
-#        reads `waiting` with the first life's claude_session_id; the server
-#        registers the stub's MCP session; exactly one post holds the
-#        recovery head, and it equals the printed recovery notice
-#        (`conflictRecoveryText`, reason LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED);
+#        not refused", posted), with no refused round line beyond those read
+#        before the end, the approver clears the dialog and the row reads
+#        `waiting` on its session name with the first life's
+#        claude_session_id; the server registers the stub's MCP session;
+#        exactly one post holds the recovery head, and it equals the printed
+#        recovery notice (`conflictRecoveryText`, reason
+#        LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED); the channel holds only the
+#        CONFLICT notice and that post; no counted launch-failure line names
+#        the persona;
 #      - no CSCB `kill`, `kill-finished` or `delete` names `nolabel`'s row
 #        in the second life; no tmux command CSCB caused reads from, types
-#        into, kills or respawns the seeded session (by its session id, pane
-#        id or name) up to the harness's end of it (`tmux_shim_targets`;
-#        tmux numbers sessions and panes from $0 and %0 again once its
-#        server, left with no session, exits and a new one starts); positive
-#        control: such commands act on the resumed session after it.
+#        into, kills or respawns the seeded session (by its session id, its
+#        one window's id, its pane id or its name) up to the harness's end
+#        of it (`tmux_shim_targets`; tmux numbers sessions, windows and panes
+#        from $0, @0 and %0 again once its server, left with no session,
+#        exits and a new one starts); positive control: such commands act on
+#        the resumed session (by name, session id, window id or pane id)
+#        after it.
 #
 # Scenario 19's legs (personas `scanleft`, `envonly`, `otherstore` and
 # `pendleft`, keys the same). Each seeded session is named as the package
@@ -172,7 +190,8 @@
 #        NULL and row_version + 1, named by its id, its `pending` state and
 #        its row_version as read just before; a store read after it shows
 #        every other column as the seed set it.
-#   Phase 4, in run order (scenario 4's latch checks come first):
+#   Phase 4, in run order (scenario 4's latch checks come first); the start
+#      pass's completion line counts `0 failed`:
 #      - each of `scanleft`, `envonly` and `otherstore` latches at the
 #        bring-up (s19_latch): the latch-set line (`conflictLatchSetLine`: case
 #        `leftover`, `no-valid-id` and `another-store`, refused operation
@@ -223,58 +242,75 @@
 #        `leftover`, refused operation `reuse-spawn`, state `missing`; one
 #        post, the CONFLICT notice; the store reads `missing`;
 #      - scenario 4's refused rounds;
-#      - the refused rounds (s19_rounds): two each for `scanleft`, `envonly`
-#        and `otherstore`, at least one for `pendleft` (each next round line
-#        waited for within the interval plus twice SETTLE_S). `latch_rounds`
-#        reads the persona's CSCB calls after the latch mark: exactly one
-#        `status` then one call per round, and no other call: for `scanleft`
-#        the plain spawn (round line step `spawn-retry`, call `plain-spawn`:
-#        the `status` found no row), for `envonly` and `otherstore` a `spawn`
-#        carrying `--reuse-finished` (read from the shim's argv; step
-#        `step-2`, call `reuse-spawn`), for `pendleft` the same reuse spawn
-#        (step `step-2`, call `reuse-spawn`, after a `status` reading
-#        `missing`); every round line answers `still-latched`;
-#        cadence as scenario 4's (`check_cadence`, the first round from the
-#        refused launch); the store still holds no row for `scanleft`, whose
-#        not_inserted records still number its spawns, and the others' rows
-#        keep their state and row_version; the seeded session is still there;
-#        no post beyond the CONFLICT notice;
-#      - [harness] the human ends `envonly`'s, `otherstore`'s and
-#        `pendleft`'s seeded sessions by their session ids (`end_session`);
-#        then scenario 4's clear, whose `end_session` ends `nolabel`'s;
-#      - each of the three clears (s19_clear): the next round line, waited
-#        for within the interval plus twice SETTLE_S; that round's first two
-#        calls are one `status` then the round's call, at the cadence, with no
-#        CSCB `find-missing` between them; the call launches: the clear line
-#        (`latchClearedLine`, reason "a retry of the refused operation was not
-#        refused", posted) within SETTLE_S, once; the row reads `waiting`
-#        within REPORT_WAIT_S, on its session name (`pendleft`'s on a fresh
-#        claude_session_id, not its first life's); the server registers the
-#        stub's MCP
-#        session; exactly one post holds the recovery head, equal to the
-#        printed recovery notice; the channel holds only the CONFLICT notice
-#        and that post;
-#      - `scanleft` stays latched: s19_rounds again, with three rounds, all
-#        refused plain spawns;
-#      - scenario 4's no-kill checks; no CSCB `kill`, `kill-finished` or
-#        `delete` names a scenario 19 persona's id in the second life.
-#   Phase 5, the restart leg (SRJ-504; E13): with `scanleft` latched, a plain
-#      `stop` (the bots keep running; the leftover is still there), then a
-#      live start, its start pass waited for within START_WAIT_S:
+#      - the refused rounds (s19_rounds): at least two each for `scanleft`,
+#        `envonly` and `otherstore`, at least one for `pendleft` (each next
+#        round line waited for within the interval plus twice SETTLE_S), and
+#        then, once the persona's rounds have settled (none in flight: no
+#        `status` without its call after it, and each round's line logged,
+#        waited for within SETTLE_S), every round since the latch, as many
+#        as have run (a slow mark of `pendleft`'s row lets more run).
+#        `latch_rounds` reads the persona's CSCB calls after the latch mark:
+#        exactly one `status` then one call per round, and no other call: for
+#        `scanleft` the plain spawn (round line step `spawn-retry`, call
+#        `plain-spawn`: the `status` found no row), for `envonly` and
+#        `otherstore` a `spawn` carrying `--reuse-finished` (read from the
+#        shim's argv; step `step-2`, call `reuse-spawn`), for `pendleft` the
+#        same reuse spawn (step `step-2`, call `reuse-spawn`, after a
+#        `status` reading `missing`); every round line since the latch
+#        answers `still-latched`; cadence as scenario 4's (`check_cadence`,
+#        the first round from the refused launch); the store still holds no
+#        row for `scanleft`, whose not_inserted records still number its
+#        spawns, and the others' rows keep their state and row_version; the
+#        seeded session is still there; no post beyond the CONFLICT notice;
+#      - [harness] the human ends `envonly`'s, `otherstore`'s, `pendleft`'s
+#        and then `nolabel`'s seeded sessions by their session ids (s19_end:
+#        right before each end, every round since the latch is read and
+#        checked again, as above, and the end follows once the rounds have
+#        settled with none added, so each clear below is checked on the
+#        first round after the end, never on a refused round before it);
+#      - each clear, `nolabel`'s first (s19_clear): the next round line,
+#        waited for within the interval plus twice SETTLE_S; that round's
+#        first two calls are one `status` then the round's call, at the
+#        cadence, with no CSCB `find-missing` between them; the call
+#        launches: the clear line (`latchClearedLine`, reason "a retry of the
+#        refused operation was not refused", posted) within SETTLE_S, once,
+#        and no refused round line beyond those read before the end; the row
+#        reads `waiting` within REPORT_WAIT_S, on the session name the latch
+#        quoted (`pendleft`'s on a fresh claude_session_id, not its first
+#        life's); the server registers the stub's MCP session; exactly one
+#        post holds the recovery head, equal to the printed recovery notice;
+#        the channel holds only the CONFLICT notice and that post; server.log
+#        holds no counted launch-failure line of the persona
+#        (`[slack] Launch failed for persona=<key>`,
+#        `[slack] Session relaunch failed for persona=<key>`);
+#      - `scanleft` stays latched: s19_rounds again, with at least three
+#        rounds, all refused plain spawns;
+#      - scenario 4's tmux checks; no CSCB `kill`, `kill-finished` or
+#        `delete` names a latched persona's id (`nolabel`'s or a scenario 19
+#        persona's) in the second life.
+#   Phase 5, the restart leg (SRJ-504; E13): every persona has conflict-latch
+#      lines before the restart (latch_line_count's positive control); with
+#      `scanleft` latched, a plain `stop` (the bots keep running; the
+#      leftover is still there), then a live start, its start pass waited
+#      for within START_WAIT_S, its completion line counting `0 failed`:
 #      - `scanleft` relatches at the bring-up's plain spawn (s19_latch over
 #        the new server's calls: the latch-set line now logged twice; one
 #        refused plain spawn by the new server; exactly one new post, the
 #        CONFLICT notice, as in phase 4; the store holds no row; the
 #        not_inserted records number all its spawns);
-#      - [harness] the human ends the leftover by its session id; the next
-#        round's plain spawn launches and the latch clears (s19_clear: one
-#        `status`, then the plain spawn, with no CSCB `find-missing` between
-#        them; the persona starts fresh and reaches `waiting`; one recovery
-#        post; the launching spawn wrote no not_inserted record);
+#      - [harness] the human ends the leftover by its session id (s19_end);
+#        the next round's plain spawn launches and the latch clears
+#        (s19_clear: one `status`, then the plain spawn, with no CSCB
+#        `find-missing` between them; the persona starts fresh and reaches
+#        `waiting`; one recovery post; the launching spawn wrote no
+#        not_inserted record); `scanleft`'s conflict-latch lines grew by at
+#        least two since the restart (its relatch and its clear: the
+#        positive control for the next check);
 #      - no other persona got a post or a conflict-latch line since the
 #        restart; no CSCB `kill`, `kill-finished` or `delete` of a scenario
-#        19 persona's id; no `find-missing` call from a process other than
-#        CSCB's.
+#        19 persona's id; no counted launch-failure line of a latched
+#        persona in the second life's server.log; no `find-missing` call
+#        from a process other than CSCB's.
 #   Then [harness] the human ends every persona's worker with the stub's
 #   exit line, as in phase 2 (each row reads `ended` or `missing` and its
 #   session is gone within EXIT_WAIT_S), so the closing `stop --stop-bots`
@@ -298,8 +334,9 @@
 # cadence checks hold each round's `status` to the interval plus SETTLE_S;
 # each round's server-log line, written once the round settled, is waited
 # for within the interval plus twice SETTLE_S from the previous round's
-# checks (n times that for n rounds); a clear line within SETTLE_S of its
-# round line. `pendleft`'s mark is bounded by B plus SETTLE_S from its launch
+# checks (n times that for n rounds); a persona's rounds settle (its round in
+# flight, if any, gets its call and its line) within SETTLE_S; a clear line
+# within SETTLE_S of its round line. `pendleft`'s mark is bounded by B plus SETTLE_S from its launch
 # start, as above, and its latch, made in the same retry, by SETTLE_S after
 # that. Expected runtime: about 9 minutes (phases 1 to 3 under a minute,
 # phase 4's rounds about 6 minutes, phase 5's relatch and clear about 2).
@@ -332,6 +369,12 @@
 # - the round answer `still-latched` (src/session-manager.ts
 #   runLatchRecheckRound's answerAfter, for a retry that left the persona
 #   latched);
+# - the counted launch-failure lines' heads `[slack] Launch failed for
+#   persona=` and `[slack] Session relaunch failed for persona=`, each
+#   followed by the key (src/restart.ts, countLaunchFailure's lines from
+#   recordLaunchResultOutsideRestartWork and from the restart work); the
+#   script first finds each in the installed package's src/restart.ts, so a
+#   rewording fails the script rather than leaving a zero count vacuous;
 # - the persona reference `"<name>" (key=<key>)` (lib/scenario.sh
 #   persona_ref, src/persona-identity.ts renderPersonaRef);
 # - `--reuse-finished`, the agent-director client's flag for a spawn's
@@ -363,7 +406,8 @@ EXIT_WAIT_S=30
 NOTICE_WAIT_S=30
 SETTLE_S=30
 
-# Scenario 4's refused rounds before the harness ends the session.
+# The fewest refused rounds of scenario 4's persona before the harness ends
+# its session (every round that has run by then is checked).
 REFUSED_ROUNDS=2
 
 FMK_TEXTS="${SCENARIO_FIXTURES}/fmk-texts.ts"
@@ -400,6 +444,8 @@ declare -A PERSONA_TOKEN=([${S4_KEY}]="t16nolabel" [${SCAN_KEY}]="t16scanleft" [
 # Filled in by the phases. PERSONA_NAMED is the session name the package
 # gives the persona's launches (personaTmuxSessionName).
 declare -A PERSONA_ID=() PERSONA_WORK=() PERSONA_CREDS=() PERSONA_SID=() PERSONA_SESSION=() PERSONA_NAMED=()
+# Each persona's reference as the server's lines render it (persona_ref).
+declare -A PERSONA_REF=()
 
 # The personas of the first life, and of the second (every persona). Of
 # scenario 19's, only the `pending` variant has a first life: its statement
@@ -408,6 +454,11 @@ LIFE1_KEYS=("${S4_KEY}" "${PEND_KEY}")
 LIFE2_KEYS=("${S4_KEY}" "${SCAN_KEY}" "${ENV_KEY}" "${STORE_KEY}" "${PEND_KEY}")
 # Scenario 19's personas, in run order.
 S19_KEYS=("${SCAN_KEY}" "${ENV_KEY}" "${STORE_KEY}" "${PEND_KEY}")
+# Every persona that latches (scenario 4's, then scenario 19's).
+LATCH_KEYS=("${S4_KEY}" "${S19_KEYS[@]}")
+# The start passes' completion lines, by persona count.
+LIFE1_DONE="$(completion_match "${#LIFE1_KEYS[@]}")" || exit 1
+LIFE2_DONE="$(completion_match "${#LIFE2_KEYS[@]}")" || exit 1
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -491,6 +542,7 @@ prepare_persona() {
     PERSONA_ID[${key}]="$(fmk_text personaInstanceId "${key}")" || fail "setup: fmk-texts.ts could not print personaInstanceId ${key}"
     PERSONA_NAMED[${key}]="$(fmk_text personaTmuxSessionName "${key}")" \
         || fail "setup: fmk-texts.ts could not print personaTmuxSessionName ${key}"
+    PERSONA_REF[${key}]="$(persona_ref "${PERSONA_NAME[${key}]}")" || exit 1
 }
 
 # write_personas_config <key>...: the server's config.json, configuring the
@@ -619,35 +671,6 @@ split_on() {
     PARTS+=("${rest}")
 }
 
-# persona_rounds <step> <instance-id> <from-mark> [<to-mark>]: the re-check
-# rounds of a persona latched on a `resume`, from E42 T1's reader
-# (`ad_cscb_calls`): its CSCB-parented calls after <from-mark> (up to
-# <to-mark>) must be, in log order, one `status` then one `resume` per
-# round, and no other call; fails otherwise, and on a `status` with no
-# `resume` after it. Prints one line per round,
-# `<status-pos> <status-us> <resume-pos> <resume-us>`.
-persona_rounds() {
-    local step="$1" id="$2" from="$3" to="${4:--}" rows pos time verb us want=status s_pos="" s_us=""
-    rows="$(ad_cscb_calls "${id}" "${from}" "${to}")"
-    [[ -n "${rows}" ]] || return 0
-    while IFS=$'\t' read -r pos time _ verb _; do
-        if [[ "${verb}" != "${want}" ]]; then
-            sed 's/^/  | /' <<< "${rows}" >&2
-            fail "${step}: CSCB call ${verb} of ${id} at shim line ${pos}, where a round's ${want} belongs (a round is one status then one resume, and nothing else)"
-        fi
-        us="$(us_of "${time}")"
-        if [[ "${verb}" == status ]]; then
-            s_pos="${pos}"
-            s_us="${us}"
-            want=resume
-        else
-            printf '%s %s %s %s\n' "${s_pos}" "${s_us}" "${pos}" "${us}"
-            want=status
-        fi
-    done <<< "${rows}"
-    [[ "${want}" == status ]] || fail "${step}: the status of ${id} at shim line ${s_pos} has no resume after it"
-}
-
 # check_cadence <step> <previous-us> <status-us> <call-us> [<call>]: fail
 # unless the round's status comes at least one interval after <previous-us>
 # and within the interval plus SETTLE_S, and its call (<call>, default
@@ -679,31 +702,64 @@ round_call_is() {
     esac
 }
 
-# latch_rounds <step> <instance-id> <call> <from-mark> [<to-mark>]: the
-# re-check rounds of a persona latched with the re-check call <call> (as
-# round_call_is reads it), from E42 T1's reader (`ad_cscb_calls`): its
-# CSCB-parented calls after <from-mark> (up to <to-mark>) must be, in log
-# order, one `status` then one <call> per round, and no other call; fails
-# otherwise, and on a `status` with no <call> after it. Prints one line per
-# round, `<status-pos> <status-us> <call-pos> <call-us>`.
+# latch_rounds <step> <instance-id> <call> <from-mark>: the re-check rounds
+# of a persona latched with the re-check call <call> (as round_call_is reads
+# it), from E42 T1's reader (`ad_cscb_calls`): its CSCB-parented calls after
+# <from-mark> must be, in log order, one `status` then one <call> per round,
+# and no other call; fails otherwise. Prints one line per round,
+# `<status-pos> <status-us> <call-pos> <call-us>`; a last `status` with no
+# <call> after it yet (a round in flight) is printed as
+# `<status-pos> <status-us> - -`.
 latch_rounds() {
-    local step="$1" id="$2" call="$3" from="$4" to="${5:--}" rows pos time verb args want=status s_pos="" s_us=""
-    rows="$(ad_cscb_calls "${id}" "${from}" "${to}")"
+    local step="$1" id="$2" call="$3" from="$4" rows pos time verb args us want=status s_pos="" s_us=""
+    rows="$(ad_cscb_calls "${id}" "${from}")" || exit 1
     [[ -n "${rows}" ]] || return 0
     while IFS=$'\t' read -r pos time _ verb _ args; do
         if [[ "${want}" == status && "${verb}" == status ]]; then
             s_pos="${pos}"
-            s_us="$(us_of "${time}")"
+            s_us="$(us_of "${time}")" || exit 1
             want="${call}"
         elif [[ "${want}" == "${call}" ]] && round_call_is "${call}" "${verb}" "${args}"; then
-            printf '%s %s %s %s\n' "${s_pos}" "${s_us}" "${pos}" "$(us_of "${time}")"
+            us="$(us_of "${time}")" || exit 1
+            printf '%s %s %s %s\n' "${s_pos}" "${s_us}" "${pos}" "${us}"
             want=status
         else
             sed 's/^/  | /' <<< "${rows}" >&2
             fail "${step}: CSCB call ${verb} of ${id} at shim line ${pos}, where a round's ${want} belongs (a round is one status then one ${call}, and nothing else)"
         fi
     done <<< "${rows}"
-    [[ "${want}" == status ]] || fail "${step}: the status of ${id} at shim line ${s_pos} has no ${call} after it"
+    [[ "${want}" == status ]] || printf '%s %s - -\n' "${s_pos}" "${s_us}"
+}
+
+# s19_round_lines <key>: print persona <key>'s round lines (the server.log
+# lines holding its round head) logged since its latch, that is after the
+# first S19_ROUND_BASE of them, from one read of the log.
+s19_round_lines() {
+    H="${S19_ROUND_HEAD[$1]}" LC_ALL=C awk -v skip="${S19_ROUND_BASE[$1]}" 'index($0, ENVIRON["H"]) { if (++n > skip) print }' \
+        "${SLACK_STATE_DIR}/server.log" || fail "s19_round_lines: awk could not read ${SLACK_STATE_DIR}/server.log"
+}
+
+# s19_settled <step> <key>: read persona <key>'s round lines since its latch
+# (S19_SNAP_LINES), then its rounds of calls since its latch mark
+# (latch_rounds, S19_SNAP_ROUNDS); true when no round is in flight and each
+# round of calls has its round line. A round's line is logged once its call
+# returned, so read in that order the lines never outnumber the rounds.
+s19_settled() {
+    local key="$2"
+    S19_SNAP_LINES="$(s19_round_lines "${key}")" || exit 1
+    S19_SNAP_ROUNDS="$(latch_rounds "$1" "${PERSONA_ID[${key}]}" "${S19_CALL[${key}]}" "${S19_LATCH_MARK[${key}]}")" || exit 1
+    [[ "$(tail -n 1 <<< "${S19_SNAP_ROUNDS}")" != *" - -" ]] || return 1
+    (( $(rows_count "${S19_SNAP_LINES}") == $(rows_count "${S19_SNAP_ROUNDS}") ))
+}
+
+# s19_settle <step> <key>: wait up to SETTLE_S for persona <key>'s rounds to
+# settle (s19_settled); fail, showing them, when they do not.
+s19_settle() {
+    if ! _scenario_poll_until "${SETTLE_S}" s19_settled "$1" "$2"; then
+        latch_lines_of "$2"
+        sed 's/^/  | round: /' <<< "${S19_SNAP_ROUNDS}" >&2
+        fail "$1: $2's rounds did not settle within ${SETTLE_S}s: $(rows_count "${S19_SNAP_LINES}") round line(s) since the latch, against the rounds of calls shown (a trailing '- -' is a status with no call after it)"
+    fi
 }
 
 # store_rows_of <step> <instance-id>: print how many rows the store holds
@@ -733,7 +789,9 @@ name_held_tmux_marks() {
 
 # has_name_held_tmux_mark <instance-id>: true once such a record exists.
 has_name_held_tmux_mark() {
-    [[ -n "$(name_held_tmux_marks "$1")" ]]
+    local marks
+    marks="$(name_held_tmux_marks "$1")" || exit 1
+    [[ -n "${marks}" ]]
 }
 
 # non_cscb_find_missing: print the agent-director shim's `find-missing` call
@@ -762,13 +820,27 @@ non_cscb_find_missing() {
 # (its latch, clear and round lines), indented, on stderr (for a failure's
 # diagnosis).
 latch_lines_of() {
-    grep -F -e "conflict-latch: persona=$1 " -e "conflict-latch: re-check of $(persona_ref "${PERSONA_NAME[$1]}")" \
+    grep -F -e "conflict-latch: persona=$1 " -e "conflict-latch: re-check of ${PERSONA_REF[$1]}" \
         "${SLACK_STATE_DIR}/server.log" | sed 's/^/  | /' >&2 || true
 }
 
 # now_ms: the time now, in milliseconds since the epoch.
 now_ms() {
     date +%s%3N
+}
+
+# no_counted_failures <step> <key>...: server.log holds no counted
+# launch-failure line (each of LAUNCH_FAILED_LINES followed by the key) for
+# any <key>.
+no_counted_failures() {
+    local step="$1" key frag
+    shift
+    for key in "$@"; do
+        for frag in "${LAUNCH_FAILED_LINES[@]}"; do
+            expect_count "${frag}${key}" 0 "${step}: counted launch-failure lines of ${key}"
+        done
+    done
+    echo "${TEST_NAME}: ${step}: no counted launch failure of $*"
 }
 
 # ---------------------------------------------------------------------------
@@ -817,48 +889,67 @@ BOUND_MS="$(fmk_text adLaunchBoundMs)" || fail "setup: fmk-texts.ts could not pr
 [[ -n "${STORE_MUST_NOT_END_LINE}" ]] || fail "setup: fmk-texts.ts printed an empty must-not-be-ended line"
 echo "${TEST_NAME}: G ${GRACE_MS} ms, B ${BOUND_MS} ms (agent-director's default settings)"
 
-# Each scenario 19 persona's latch: its case, the operation the bring-up's
+# The counted launch-failure lines' heads, each followed by the persona key
+# (src/restart.ts: countLaunchFailure's lines from the restart work and from
+# recordLaunchResultOutsideRestartWork, each a template literal). No export
+# carries them, so each is first found, whole up to the key, in the installed
+# package's src/restart.ts: a rewording fails here rather than leaving a zero
+# count vacuous.
+LAUNCH_FAILED_LINES=("[slack] Launch failed for persona=" "[slack] Session relaunch failed for persona=")
+RESTART_SRC="${SCENARIO_REPO}/node_modules/claude-slack-channel-bots/src/restart.ts"
+for frag in "${LAUNCH_FAILED_LINES[@]}"; do
+    # shellcheck disable=SC2016 # `${key}` is the source's own text.
+    grep -q -F -e "\`${frag}"'${key}' "${RESTART_SRC}" \
+        || fail "setup: the installed ${RESTART_SRC} logs no counted launch-failure line '${frag}\${key}…'"
+done
+
+# Each latching persona's latch (scenario 4's `nolabel` and scenario 19's
+# personas, one table entry each): its case, the operation the bring-up's
 # refused launch was (and so the latch-set line's refused operation), the
-# row state that line records, its re-check rounds' step and call (one
-# `status`, then that call), and the case phrase agent-director's
-# description carries.
-declare -A S19_CASE=([${SCAN_KEY}]="${CASE_LEFTOVER}" [${ENV_KEY}]="${CASE_NO_VALID_ID}"
+# row state that line records (`nolabel`'s, its finished state, set in
+# phase 2), its re-check rounds' step and call (one `status`, then that
+# call), and the case phrase agent-director's description carries.
+declare -A S19_CASE=([${S4_KEY}]="${CASE_NO_VALID_ID}" [${SCAN_KEY}]="${CASE_LEFTOVER}" [${ENV_KEY}]="${CASE_NO_VALID_ID}"
     [${STORE_KEY}]="${CASE_ANOTHER_STORE}" [${PEND_KEY}]="${CASE_LEFTOVER}")
-declare -A S19_OP=([${SCAN_KEY}]="${OP_PLAIN_SPAWN}" [${ENV_KEY}]="${OP_PLAIN_SPAWN}"
+declare -A S19_OP=([${S4_KEY}]="${OP_RESUME}" [${SCAN_KEY}]="${OP_PLAIN_SPAWN}" [${ENV_KEY}]="${OP_PLAIN_SPAWN}"
     [${STORE_KEY}]="${OP_PLAIN_SPAWN}" [${PEND_KEY}]="${OP_REUSE_SPAWN}")
-declare -A S19_REFUSED_CALL=([${SCAN_KEY}]="${CALL_PLAIN_SPAWN}" [${ENV_KEY}]="${CALL_PLAIN_SPAWN}"
+declare -A S19_REFUSED_CALL=([${S4_KEY}]="${CALL_RESUME}" [${SCAN_KEY}]="${CALL_PLAIN_SPAWN}" [${ENV_KEY}]="${CALL_PLAIN_SPAWN}"
     [${STORE_KEY}]="${CALL_PLAIN_SPAWN}" [${PEND_KEY}]="${CALL_REUSE_SPAWN}")
 declare -A S19_LATCH_ROW=([${SCAN_KEY}]="${ROW_NO_ROW}" [${ENV_KEY}]=ended [${STORE_KEY}]=ended [${PEND_KEY}]=missing)
-declare -A S19_STEP=([${SCAN_KEY}]="${STEP_SPAWN_RETRY}" [${ENV_KEY}]="${STEP_TABLE}"
+declare -A S19_STEP=([${S4_KEY}]="${STEP_TABLE}" [${SCAN_KEY}]="${STEP_SPAWN_RETRY}" [${ENV_KEY}]="${STEP_TABLE}"
     [${STORE_KEY}]="${STEP_TABLE}" [${PEND_KEY}]="${STEP_TABLE}")
-declare -A S19_CALL=([${SCAN_KEY}]="${CALL_PLAIN_SPAWN}" [${ENV_KEY}]="${CALL_REUSE_SPAWN}"
+declare -A S19_CALL=([${S4_KEY}]="${CALL_RESUME}" [${SCAN_KEY}]="${CALL_PLAIN_SPAWN}" [${ENV_KEY}]="${CALL_REUSE_SPAWN}"
     [${STORE_KEY}]="${CALL_REUSE_SPAWN}" [${PEND_KEY}]="${CALL_REUSE_SPAWN}")
-declare -A S19_PHRASE=([${SCAN_KEY}]="${LEFTOVER_PHRASE}" [${ENV_KEY}]="${NO_VALID_ID_PHRASE}"
+declare -A S19_PHRASE=([${S4_KEY}]="${NO_VALID_ID_PHRASE}" [${SCAN_KEY}]="${LEFTOVER_PHRASE}" [${ENV_KEY}]="${NO_VALID_ID_PHRASE}"
     [${STORE_KEY}]="${ANOTHER_STORE_PHRASE}" [${PEND_KEY}]="${LEFTOVER_PHRASE}")
 # Filled in by the phases, by key: the seeded session's id and pane, the
 # session name the latch quotes, the post count before phase 4, the latch's
-# shim mark, refused call's time and row reads, the round lines, and the
-# rounds' progress.
+# shim mark, refused call's time and row reads, the round lines, the rounds'
+# progress, and the tmux shim mark right after the harness ended the session.
 declare -A S19_SID=() S19_PANE=() S19_SESSION=() S19_POSTS_BEFORE=() S19_LATCH_MARK=() S19_LATCH_US=()
 declare -A S19_LATCH_STATE=() S19_LATCH_RV=() S19_ROUND_HEAD=() S19_ROUND_REFUSED=() S19_ROUND_BASE=()
 declare -A S19_REFUSED_BASE=() S19_ROUNDS=() S19_PREV_US=() S19_LAST_POS=() S19_CONNECTS=() S19_CONFLICTS=()
+declare -A S19_END_TMUX_MARK=()
+# s19_settled's last read: the round lines and the rounds of calls.
+S19_SNAP_LINES=""
+S19_SNAP_ROUNDS=""
 
 # ---------------------------------------------------------------------------
 # Phase 1: first life, for the personas that need a row
 # ---------------------------------------------------------------------------
 
 phase1_first_life() {
-    local step="phase 1: first life" key ref rows
+    local step="phase 1: first life" key ref calls rows
     for key in "${LIFE2_KEYS[@]}"; do
         prepare_persona "${key}"
     done
     write_personas_config "${LIFE1_KEYS[@]}"
     start_server --live
     LIFE1_PID="${SERVER_PID}"
-    wait_for_count "$(completion_match "${#LIFE1_KEYS[@]}")" 1 "${START_WAIT_S}" "${step}: the start pass never completed"
-    expect_completion "${#LIFE1_KEYS[@]}" "${step}" "0 not brought up"
+    wait_for_count "${LIFE1_DONE}" 1 "${START_WAIT_S}" "${step}: the start pass never completed"
+    expect_completion "${#LIFE1_KEYS[@]}" "${step}" "0 failed" "0 not brought up"
     for key in "${LIFE1_KEYS[@]}"; do
-        ref="$(persona_ref "${PERSONA_NAME[${key}]}")"
+        ref="${PERSONA_REF[${key}]}"
         wait_row "${step}: ${key}'s report-in" "${REPORT_WAIT_S}" "${PERSONA_ID[${key}]}" waiting
         [[ -n "${ROW_SID}" ]] || fail "${step}: the live row ${PERSONA_ID[${key}]} has no claude_session_id"
         [[ -n "${ROW_SESSION}" ]] || fail "${step}: the live row ${PERSONA_ID[${key}]} names no tmux session"
@@ -866,7 +957,8 @@ phase1_first_life() {
         PERSONA_SESSION[${key}]="${ROW_SESSION}"
         wait_for_count "[slack] Session connected: persona ${ref}" 1 "${CONNECT_WAIT_S}" \
             "${step}: the server never registered the stub's session as ${key}'s"
-        rows="$(server_rows "${LIFE1_PID}" "$(verb_rows send-keys "$(ad_cscb_calls "${PERSONA_ID[${key}]}")")")"
+        calls="$(ad_cscb_calls "${PERSONA_ID[${key}]}")"
+        rows="$(server_rows "${LIFE1_PID}" "$(verb_rows send-keys "${calls}")")"
         (( $(rows_count "${rows}") >= 1 )) || fail "${step}: no bot-server send-keys of ${PERSONA_ID[${key}]} (the approver's Enter)"
         echo "${TEST_NAME}: ${step}: ${PERSONA_ID[${key}]} reads waiting, claude_session_id ${ROW_SID}, session ${ROW_SESSION}"
     done
@@ -909,6 +1001,7 @@ phase2_stop_bots() {
         (( n == 0 )) || fail "${step}: ${n} CSCB ${verb} call(s) of ${id} after the worker's exit"
     done
     S4_FINISHED_STATE="${ROW_STATE}"
+    S19_LATCH_ROW[${S4_KEY}]="${S4_FINISHED_STATE}"
     echo "${TEST_NAME}: ${step}: ${id} reads ${ROW_STATE} with claude_session_id ${ROW_SID}"
     s19_pend_stopped
 }
@@ -931,16 +1024,22 @@ s19_pend_stopped() {
 # Phase 3: harness seeding, with the server stopped
 # ---------------------------------------------------------------------------
 
-# Scenario 4 [harness]: a session with no label holds the row's name.
+# Scenario 4 [harness]: a session with no label holds the row's name. Its
+# session id, its one window's id and its pane are recorded.
 s4_seed() {
     local step="phase 3: ${S4_KEY}'s name held" id="${PERSONA_ID[${S4_KEY}]}" session="${PERSONA_SESSION[${S4_KEY}]}"
     [[ -z "$(server_pid)" ]] || fail "${step}: a server is running"
     seed_unlabelled -c "${PERSONA_WORK[${S4_KEY}]}" "${session}" sleep 86400 > "${SCENARIO_ROOT}/s4-seed.out"
-    S4_SEEDED_SID="${SEEDED_SESSION_ID}"
-    S4_SEEDED_PANE="${SEEDED_PANE_ID}"
-    [[ "${S4_SEEDED_SID}" =~ ^\$[0-9]+$ ]] || fail "${step}: the seeded session id is '${S4_SEEDED_SID}'"
+    S19_SID[${S4_KEY}]="${SEEDED_SESSION_ID}"
+    S19_PANE[${S4_KEY}]="${SEEDED_PANE_ID}"
+    [[ "${S19_SID[${S4_KEY}]}" =~ ^\$[0-9]+$ && "${S19_PANE[${S4_KEY}]}" =~ ^%[0-9]+$ ]] \
+        || fail "${step}: the seeded session is '${S19_SID[${S4_KEY}]}', pane '${S19_PANE[${S4_KEY}]}'"
+    S4_SEEDED_WINDOW="$("${SCENARIO_REAL_TMUX}" list-windows -t "${S19_SID[${S4_KEY}]}" -F '#{window_id}')" \
+        || fail "${step}: tmux lists no window of the seeded session ${S19_SID[${S4_KEY}]}"
+    [[ "${S4_SEEDED_WINDOW}" =~ ^@[0-9]+$ ]] \
+        || fail "${step}: the seeded session ${S19_SID[${S4_KEY}]}'s windows are '${S4_SEEDED_WINDOW//$'\n'/ }', not one window id"
     row_reads "${step}" "${id}" "${S4_FINISHED_STATE}" || fail "${step}: ${id} reads '${ROW_STATE}', not ${S4_FINISHED_STATE}"
-    echo "${TEST_NAME}: ${step}: ${session} (${S4_SEEDED_SID}, pane ${S4_SEEDED_PANE}) has no label; ${id} reads ${ROW_STATE}"
+    echo "${TEST_NAME}: ${step}: ${session} (${S19_SID[${S4_KEY}]}, window ${S4_SEEDED_WINDOW}, pane ${S19_PANE[${S4_KEY}]}) has no label; ${id} reads ${ROW_STATE}"
 }
 
 # Scenario 19 [harness]: s19_seed <key> <seed helper>: the helper seeds a
@@ -1022,177 +1121,32 @@ phase3_seed() {
 # Phase 4: second life, every persona configured
 # ---------------------------------------------------------------------------
 
-# Scenario 4: the latch, its one notice, and the harness's reads at the latch.
-s4_latch() {
-    local step="phase 4: ${S4_KEY} latches" id="${PERSONA_ID[${S4_KEY}]}" session="${PERSONA_SESSION[${S4_KEY}]}"
-    local name="${PERSONA_NAME[${S4_KEY}]}" set_line rows notice prefix first list desc
-    set_line="$(fmk_text conflictLatchSetLine "${S4_KEY}" "${CASE_NO_VALID_ID}" "${session}" "${OP_RESUME}" "${S4_FINISHED_STATE}")" \
-        || fail "${step}: fmk-texts.ts could not print conflictLatchSetLine"
-    wait_for_count "${set_line}" 1 "${START_WAIT_S}" "${step}: no latch-set line '${set_line}'"
-    S4_LATCH_MARK="$(ad_shim_mark)"
-    S4_LATCH_TMUX_MARK="$(tmux_shim_mark)"
-    expect_count "${set_line}" 1 "${step}: latch-set lines"
-
-    # The bring-up's one resume, the bot server's, was refused.
-    rows="$(ad_cscb_calls "${id}" "${LIFE2_MARK}" "${S4_LATCH_MARK}")"
-    echo "${TEST_NAME}: ${step}: CSCB calls of ${id} up to the latch (recorded, not asserted): $(field_of 4 "${rows}" | tr '\n' ' ')"
-    rows="$(verb_rows resume "${rows}")"
-    (( $(rows_count "${rows}") == 1 )) || fail "${step}: $(rows_count "${rows}") CSCB resume call(s) of ${id} before the latch, not one"
-    [[ -n "$(server_rows "${LIFE2_PID}" "${rows}")" ]] || fail "${step}: the resume of ${id} is not the bot server's"
-    S4_LATCH_US="$(us_of "$(field_of 2 "${rows}")")"
-
-    # One CONFLICT notice, in SRJ-1004's order, naming no command.
-    wait_until "${NOTICE_WAIT_S}" "${step}: no CONFLICT notice on ${PERSONA_CHANNEL[${S4_KEY}]}" \
-        posts_holding_at_least "${S4_KEY}" "${S4_POSTS_BEFORE}" "${CONFLICT_HEAD}" 1
-    posts_holding "${S4_KEY}" 0 "${CONFLICT_HEAD}"
-    (( ${#HOLDING[@]} == 1 )) || fail "${step}: ${#HOLDING[@]} posts on ${PERSONA_CHANNEL[${S4_KEY}]} hold the CONFLICT notice head, not one"
-    notice="${HOLDING[0]}"
-    prefix="$(fmk_text personaNoticePrefix "${name}")" || fail "${step}: fmk-texts.ts could not print personaNoticePrefix"
-    first="$(fmk_text conflictNoticeFirstLine "${CASE_NO_VALID_ID}" "${session}")" || fail "${step}: fmk-texts.ts could not print conflictNoticeFirstLine"
-    list="$(fmk_text conflictNoticeListLine "${session}")" || fail "${step}: fmk-texts.ts could not print conflictNoticeListLine"
-    split_on "${notice}" "${NOTICE_SEP}"
-    if (( ${#PARTS[@]} != 5 )) || [[ "${PARTS[0]}" != "${prefix}${first}" || "${PARTS[2]}" != "${POINTER_LINE}" \
-        || "${PARTS[3]}" != "${list}" || "${PARTS[4]}" != "${HUMAN_LINE}" ]]; then
-        printf '  | posted:   %q\n  | expected: %q\n' "${notice}" "${prefix}${first}${NOTICE_SEP}${DESC_HEAD}…${DESC_TAIL}${NOTICE_SEP}${POINTER_LINE}${NOTICE_SEP}${list}${NOTICE_SEP}${HUMAN_LINE}" >&2
-        fail "${step}: the CONFLICT notice is not the prefix and first line, the description line, the pointer line, the list line and the human-only line"
-    fi
-    desc="${PARTS[1]}"
-    [[ "${desc}" == "${DESC_HEAD}"*"${DESC_TAIL}" ]] || fail "${step}: the notice's second line is not a description line: ${desc}"
-    desc="${desc#"${DESC_HEAD}"}"
-    desc="${desc%"${DESC_TAIL}"}"
-    [[ "${desc}" == *"${NO_VALID_ID_PHRASE}"* ]] || fail "${step}: agent-director's description does not say '${NO_VALID_ID_PHRASE}': ${desc}"
-    [[ "${desc}" == *"${session}"* ]] || fail "${step}: agent-director's description does not name ${session}: ${desc}"
-    S4_POSTS_AT_LATCH="$(post_count "${S4_KEY}")"
-    echo "${TEST_NAME}: ${step}: one CONFLICT notice; agent-director said: ${desc}"
-
-    # The harness's reads at the latch: the row and the seeded session.
-    store_row "${step}" "${id}"
-    [[ "${STORE_STATE}" == ended || "${STORE_STATE}" == missing ]] || fail "${step}: ${id} reads ${STORE_STATE} in the store at the latch"
-    S4_LATCH_STATE="${STORE_STATE}"
-    S4_LATCH_RV="${STORE_RV}"
-    has_session_id "${S4_SEEDED_SID}" || fail "${step}: the seeded session ${S4_SEEDED_SID} is gone"
-    echo "${TEST_NAME}: ${step}: ${id} reads ${S4_LATCH_STATE} at row_version ${S4_LATCH_RV}"
-}
-
-# Scenario 4: REFUSED_ROUNDS rounds, each one status then one resume,
-# refused, posting nothing and writing nothing.
-s4_refused_rounds() {
-    local id="${PERSONA_ID[${S4_KEY}]}" name="${PERSONA_NAME[${S4_KEY}]}" n step rounds prev status_us resume_us status_pos resume_pos
-    local line
-    line="$(fmk_text latchRecheckRoundLine "${name}" "${CASE_NO_VALID_ID}" "${STEP_TABLE}" "${CALL_RESUME}" ANSWER)" \
-        || fail "phase 4: fmk-texts.ts could not print latchRecheckRoundLine"
-    S4_ROUND_HEAD="${line%ANSWER}"
-    S4_ROUND_REFUSED="${S4_ROUND_HEAD}still-latched"
-    prev="${S4_LATCH_US}"
-    for (( n = 1; n <= REFUSED_ROUNDS; n++ )); do
-        step="phase 4: ${S4_KEY}'s round ${n} (refused)"
-        wait_for_count "${S4_ROUND_HEAD}" "${n}" $(( INTERVAL_S + SETTLE_S + SETTLE_S )) "${step}: no round line ${n}"
-        expect_count "${S4_ROUND_REFUSED}" "${n}" "${step}: refused round lines"
-        rounds="$(persona_rounds "${step}" "${id}" "${S4_LATCH_MARK}")"
-        (( $(rows_count "${rounds}") == n )) || fail "${step}: $(rows_count "${rounds}") rounds of ${id} after the latch, not ${n}"
-        read -r status_pos status_us resume_pos resume_us <<< "$(tail -n 1 <<< "${rounds}")"
-        check_cadence "${step}" "${prev}" "${status_us}" "${resume_us}"
-        prev="${status_us}"
-        S4_LAST_ROUND_POS="${resume_pos}"
-        store_row "${step}" "${id}"
-        [[ "${STORE_STATE}" == "${S4_LATCH_STATE}" && "${STORE_RV}" == "${S4_LATCH_RV}" ]] \
-            || fail "${step}: ${id} reads ${STORE_STATE} at row_version ${STORE_RV}, not ${S4_LATCH_STATE} at ${S4_LATCH_RV}"
-        has_session_id "${S4_SEEDED_SID}" || fail "${step}: the seeded session ${S4_SEEDED_SID} is gone"
-        (( $(post_count "${S4_KEY}") == S4_POSTS_AT_LATCH )) \
-            || fail "${step}: the channel holds $(post_count "${S4_KEY}") posts, not the ${S4_POSTS_AT_LATCH} it held at the latch"
-        echo "${TEST_NAME}: ${step}: status at shim line ${status_pos}, resume at ${resume_pos}; ${id} still ${STORE_STATE} at row_version ${STORE_RV}"
+# Scenario 4: no tmux command CSCB caused acted on the seeded session (by its
+# session id, its window id, its pane id or its name) up to the harness's end
+# of it (once the scenario's tmux server has no session left it exits, and
+# the next server numbers its sessions, windows and panes from $0, @0 and %0
+# again, so the window runs from the second life's start to that end).
+# Positive control: such commands act on the resumed session after the end.
+s4_untouched() {
+    local step="phase 4: ${S4_KEY}'s seeded session untouched" session="${PERSONA_SESSION[${S4_KEY}]}"
+    local end_mark="${S19_END_TMUX_MARK[${S4_KEY}]}" ids found target control="" resumed_sid resumed_window resumed_pane
+    for target in "${S19_SID[${S4_KEY}]}" "${S4_SEEDED_WINDOW}" "${S19_PANE[${S4_KEY}]}" "${session}"; do
+        found="$(tmux_shim_targets "${target}" "${LIFE2_TMUX_MARK}" "${end_mark}")"
+        [[ -z "${found}" ]] || { sed 's/^/  | /' <<< "${found}" >&2; fail "${step}: tmux shim line(s) act on ${target} while the seeded session held ${session}"; }
     done
-    S4_PREV_STATUS_US="${prev}"
-}
-
-# Scenario 4: the harness ends the session; the next round's resume launches
-# and the latch clears with one recovery post.
-s4_clear() {
-    local step="phase 4: ${S4_KEY}'s clear" id="${PERSONA_ID[${S4_KEY}]}" session="${PERSONA_SESSION[${S4_KEY}]}"
-    local name="${PERSONA_NAME[${S4_KEY}]}" ref rows s_pos s_time s_verb r_pos r_time r_verb s_us r_us between cleared recovery n
-    ref="$(persona_ref "${name}")"
-    S4_CONNECTS="$(count_log "[slack] Session connected: persona ${ref}")"
-    # [harness] The human ends the session by its id.
-    end_session "${S4_SEEDED_SID}"
-    S4_END_TMUX_MARK="$(tmux_shim_mark)"
-    echo "${TEST_NAME}: ${step}: the harness ended ${session} (${S4_SEEDED_SID})"
-
-    wait_for_count "${S4_ROUND_HEAD}" $(( REFUSED_ROUNDS + 1 )) $(( INTERVAL_S + SETTLE_S + SETTLE_S )) "${step}: no round line after the session ended"
-    rows="$(ad_cscb_calls "${id}" "${S4_LAST_ROUND_POS}")"
-    IFS=$'\t' read -r s_pos s_time _ s_verb _ <<< "$(sed -n 1p <<< "${rows}")"
-    IFS=$'\t' read -r r_pos r_time _ r_verb _ <<< "$(sed -n 2p <<< "${rows}")"
-    if [[ "${s_verb}" != status || "${r_verb}" != resume ]]; then
-        sed 's/^/  | /' <<< "${rows}" >&2
-        fail "${step}: the round's first calls of ${id} are '${s_verb}' and '${r_verb}', not status then resume"
-    fi
-    s_us="$(us_of "${s_time}")"
-    r_us="$(us_of "${r_time}")"
-    check_cadence "${step}" "${S4_PREV_STATUS_US}" "${s_us}" "${r_us}"
-    between="$(ad_cscb_verb_between find-missing "${s_pos}" "${r_pos}")"
-    [[ -z "${between}" ]] || { sed 's/^/  | /' <<< "${between}" >&2; fail "${step}: a CSCB find-missing between the round's status and its resume"; }
-
-    # The retry was not refused: the latch clears, posted.
-    cleared="$(fmk_text latchClearedLine "${S4_KEY}" "${CASE_NO_VALID_ID}" "${session}" posted LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)" \
-        || fail "${step}: fmk-texts.ts could not print latchClearedLine"
-    expect_count "${cleared}" 1 "${step}: the clear line '${cleared}'"
-    expect_count "${S4_ROUND_REFUSED}" "${REFUSED_ROUNDS}" "${step}: refused round lines"
-    echo "${TEST_NAME}: ${step}: round line: $(_scenario_scan lastline "${SLACK_STATE_DIR}/server.log" "${S4_ROUND_HEAD}" | sed 's/^.*\] //')"
-
-    # The resume launched: the persona comes back on its conversation.
-    wait_row "${step}: the resume's report-in" "${REPORT_WAIT_S}" "${id}" waiting
-    [[ "${ROW_SID}" == "${PERSONA_SID[${S4_KEY}]}" ]] \
-        || fail "${step}: the resumed row's claude_session_id is '${ROW_SID}', not ${PERSONA_SID[${S4_KEY}]}"
-    [[ "${ROW_SESSION}" == "${session}" ]] || fail "${step}: the resumed row records session '${ROW_SESSION}', not ${session}"
-    wait_for_count "[slack] Session connected: persona ${ref}" $(( S4_CONNECTS + 1 )) "${CONNECT_WAIT_S}" \
-        "${step}: the server never registered the resumed stub's session as ${S4_KEY}'s"
-    read -r S4_RESUMED_SID S4_RESUMED_PANE <<< "$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${session}:" '#{session_id} #{pane_id}' 2> /dev/null || true)"
-    [[ "${S4_RESUMED_SID}" =~ ^\$[0-9]+$ && "${S4_RESUMED_PANE}" =~ ^%[0-9]+$ ]] \
-        || fail "${step}: tmux gives no session id and pane for the resumed ${session}"
-
-    # Exactly one recovery post, the printed notice.
-    recovery="$(fmk_text formatPersonaNotice "${name}" conflictRecoveryText "${session}" LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)" \
-        || fail "${step}: fmk-texts.ts could not print the recovery notice"
-    wait_until "${NOTICE_WAIT_S}" "${step}: no recovery post on ${PERSONA_CHANNEL[${S4_KEY}]}" \
-        posts_holding_at_least "${S4_KEY}" "${S4_POSTS_AT_LATCH}" "${RECOVERY_HEAD}" 1
-    posts_holding "${S4_KEY}" 0 "${RECOVERY_HEAD}"
-    n="${#HOLDING[@]}"
-    (( n == 1 )) || fail "${step}: ${n} posts hold the recovery head, not one"
-    if [[ "${HOLDING[0]}" != "${recovery}" ]]; then
-        printf '  | posted:   %q\n  | expected: %q\n' "${HOLDING[0]}" "${recovery}" >&2
-        fail "${step}: the recovery post is not the printed recovery notice"
-    fi
-    posts_holding "${S4_KEY}" 0 "${CONFLICT_HEAD}"
-    (( ${#HOLDING[@]} == 1 )) || fail "${step}: ${#HOLDING[@]} posts hold the CONFLICT notice head, not one"
-    echo "${TEST_NAME}: ${step}: ${id} reads waiting with claude_session_id ${ROW_SID}; one recovery post"
-}
-
-# Scenario 4: nothing killed or deleted for the persona, and the seeded
-# session never acted on.
-s4_no_kill() {
-    local step="phase 4: ${S4_KEY} nothing killed" id="${PERSONA_ID[${S4_KEY}]}" rows verb n found target control=""
-    rows="$(ad_cscb_calls "${id}" "${LIFE2_MARK}")"
-    for verb in kill kill-finished delete; do
-        n="$(rows_count "$(verb_rows "${verb}" "${rows}")")"
-        (( n == 0 )) || fail "${step}: ${n} CSCB ${verb} call(s) of ${id} in the second life"
-    done
-    # Up to the harness's end of the seeded session: once the scenario's tmux
-    # server has no session left it exits, and the next server numbers its
-    # sessions and panes from $0 and %0 again.
-    found="$(tmux_shim_targets "${S4_SEEDED_SID}" "${LIFE2_TMUX_MARK}" "${S4_END_TMUX_MARK}")"
-    [[ -z "${found}" ]] || { sed 's/^/  | /' <<< "${found}" >&2; fail "${step}: tmux shim line(s) act on the seeded session ${S4_SEEDED_SID}"; }
-    found="$(tmux_shim_targets "${S4_SEEDED_PANE}" "${LIFE2_TMUX_MARK}" "${S4_END_TMUX_MARK}")"
-    [[ -z "${found}" ]] || { sed 's/^/  | /' <<< "${found}" >&2; fail "${step}: tmux shim line(s) act on the seeded pane ${S4_SEEDED_PANE}"; }
-    found="$(tmux_shim_targets "${PERSONA_SESSION[${S4_KEY}]}" "${LIFE2_TMUX_MARK}" "${S4_END_TMUX_MARK}")"
-    [[ -z "${found}" ]] || { sed 's/^/  | /' <<< "${found}" >&2; fail "${step}: tmux shim line(s) act on ${PERSONA_SESSION[${S4_KEY}]} while the seeded session held it"; }
     # Positive control: the approver typed into the resumed session.
-    for target in "${PERSONA_SESSION[${S4_KEY}]}" "${S4_RESUMED_SID}" "${S4_RESUMED_PANE}"; do
-        found="$(tmux_shim_targets "${target}" "${S4_END_TMUX_MARK}")"
+    ids="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${session}:" '#{session_id} #{window_id} #{pane_id}')" \
+        || fail "${step}: tmux gives no ids for the resumed ${session}"
+    read -r resumed_sid resumed_window resumed_pane <<< "${ids}"
+    [[ "${resumed_sid}" =~ ^\$[0-9]+$ && "${resumed_window}" =~ ^@[0-9]+$ && "${resumed_pane}" =~ ^%[0-9]+$ ]] \
+        || fail "${step}: tmux gives '${ids}' for the resumed ${session}, not a session, window and pane id"
+    for target in "${session}" "${resumed_sid}" "${resumed_window}" "${resumed_pane}"; do
+        found="$(tmux_shim_targets "${target}" "${end_mark}")"
         [[ -z "${found}" ]] || control+="${target}: $(field_of 4 "${found}" | sort | uniq -c | tr -s ' \n' ' ')"
     done
     [[ -n "${control}" ]] \
-        || fail "${step}: positive control: tmux_shim_targets finds no command acting on the resumed ${PERSONA_SESSION[${S4_KEY}]}, ${S4_RESUMED_SID} or ${S4_RESUMED_PANE}"
+        || fail "${step}: positive control: tmux_shim_targets finds no command acting on the resumed ${session}, ${resumed_sid}, ${resumed_window} or ${resumed_pane}"
     echo "${TEST_NAME}: ${step}: tmux commands acting on the resumed session: ${control}"
-    echo "${TEST_NAME}: ${step}: no kill, kill-finished or delete of ${id}; the seeded session untouched"
 }
 
 # ---------------------------------------------------------------------------
@@ -1202,7 +1156,9 @@ s4_no_kill() {
 # posts_since <key> <from-index>: print how many posts persona <key>'s channel
 # holds from index <from-index> on.
 posts_since() {
-    echo $(( $(post_count "$1") - $2 ))
+    local n
+    n="$(post_count "$1")" || exit 1
+    echo $(( n - $2 ))
 }
 
 # s19_check_notice <step> <key> <session> <from-index>: exactly one post on
@@ -1261,10 +1217,11 @@ s19_check_notice() {
 # persona's session name and the seeded leftover's tmux id. The session the
 # latch quotes is read from them (S19_SESSION), never from the capped post.
 s19_scan_trail() {
-    local step="$1" id="${PERSONA_ID[${SCAN_KEY}]}" recs n spawns want named
+    local step="$1" id="${PERSONA_ID[${SCAN_KEY}]}" recs n calls spawns want named
     recs="$(name_held_records "${id}" ad_spawn not_inserted)" || exit 1
     n="$(rows_count "${recs}")"
-    spawns="$(rows_count "$(verb_rows spawn "$(ad_cscb_calls "${id}" "${LIFE2_MARK}")")")"
+    calls="$(ad_cscb_calls "${id}" "${LIFE2_MARK}")" || exit 1
+    spawns="$(rows_count "$(verb_rows spawn "${calls}")")"
     want="${2:-${spawns}}"
     (( n == want )) \
         || fail "${step}: ${n} ad.launch.name_held record(s) of ${id} with row_result not_inserted, not ${want} (CSCB made ${spawns} spawn(s) of it since the second life began)"
@@ -1286,7 +1243,7 @@ s19_scan_trail() {
 # other process (the harness runs none), and no CSCB `kill` of the id.
 s19_pending_marked() {
     local step="phase 4: ${PEND_KEY}'s row marked missing" id="${PERSONA_ID[${PEND_KEY}]}" session="${PERSONA_NAMED[${PEND_KEY}]}"
-    local deadline_ms timeout_s marks tick_ms recs named fm pos time found="" other n
+    local deadline_ms timeout_s marks ts tick_ms recs named fm pos time us found="" other calls n
     deadline_ms=$(( PEND_LAUNCH_MS + BOUND_MS + SETTLE_S * 1000 ))
     timeout_s=$(( (deadline_ms - $(now_ms)) / 1000 + 1 ))
     (( timeout_s > 0 )) || timeout_s=1
@@ -1299,7 +1256,9 @@ s19_pending_marked() {
     (( n == 1 )) || fail "${step}: ${n} tmux_name_held marks of ${id}, not one"
     [[ "$(jq -r '"\(.prior_state) \(.tmux_session_name)"' <<< "${marks}")" == "pending ${session}" ]] \
         || fail "${step}: the mark is not of a pending row named ${session}: ${marks}"
-    tick_ms="$(date -u -d "$(jq -r '.ts' <<< "${marks}")" +%s%3N)" || fail "${step}: the mark's ts does not read as a time: ${marks}"
+    ts="$(jq -r '.ts // ""' <<< "${marks}")" || fail "${step}: jq could not read the mark: ${marks}"
+    [[ -n "${ts}" ]] || fail "${step}: the mark has no ts: ${marks}"
+    tick_ms="$(date -u -d "${ts}" +%s%3N)" || fail "${step}: the mark's ts does not read as a time: ${marks}"
     (( tick_ms >= PEND_LAUNCH_MS + GRACE_MS )) \
         || fail "${step}: the row was marked $(( tick_ms - PEND_LAUNCH_MS )) ms after its launch start, before G (${GRACE_MS} ms)"
     (( tick_ms <= deadline_ms )) \
@@ -1316,20 +1275,23 @@ s19_pending_marked() {
     fm="$(ad_cscb_verb_between find-missing "${LIFE2_MARK}" -)"
     while IFS=$'\t' read -r pos time _; do
         [[ -n "${pos}" ]] || continue
-        if (( $(us_of "${time}") / 1000 <= tick_ms )); then
+        us="$(us_of "${time}")"
+        if (( us / 1000 <= tick_ms )); then
             found="${pos}"
         fi
     done <<< "${fm}"
     [[ -n "${found}" ]] || fail "${step}: no CSCB find-missing call at or before the mark"
     other="$(non_cscb_find_missing)"
     [[ -z "${other}" ]] || { sed 's/^/  | /' <<< "${other}" >&2; fail "${step}: a find-missing call whose parent is not a CSCB process"; }
-    n="$(rows_count "$(verb_rows kill "$(ad_cscb_calls "${id}" "${LIFE2_MARK}")")")"
+    calls="$(ad_cscb_calls "${id}" "${LIFE2_MARK}")"
+    n="$(rows_count "$(verb_rows kill "${calls}")")"
     (( n == 0 )) || fail "${step}: ${n} CSCB kill call(s) of ${id}"
     echo "${TEST_NAME}: ${step}: marked $(( tick_ms - PEND_LAUNCH_MS )) ms after its launch start (G ${GRACE_MS} ms, B ${BOUND_MS} ms), naming ${S19_SESSION[${PEND_KEY}]} (${S19_SID[${PEND_KEY}]}); CSCB find-missing at shim line ${found}"
 }
 
 # s19_latch <key> <label> <from-mark> <server-pid> <set-count> <posts-from> <timeout-s>:
-# scenario 19's latch of persona <key> by the launch the server <server-pid>
+# the latch of persona <key> (scenario 4's or a scenario 19 variant's, by its
+# S19_* table entries) by the launch the server <server-pid>
 # made after <from-mark>: the latch-set line (the persona's case, refused
 # operation and recorded row state) is logged within <timeout-s>, and now
 # <set-count> times; the server's one refused launch of the id (the
@@ -1353,10 +1315,12 @@ s19_latch() {
     S19_LATCH_MARK[${key}]="$(ad_shim_mark)"
 
     # The session the latch quotes: the scan refusal's and the pending
-    # variant's from agent-director's trail, the others' the persona's name.
+    # variant's from agent-director's trail, scenario 4's the one its row
+    # records, the others' the persona's name.
     case "${key}" in
         "${SCAN_KEY}") s19_scan_trail "${step}" ;;
         "${PEND_KEY}") ;;
+        "${S4_KEY}") S19_SESSION[${key}]="${PERSONA_SESSION[${key}]}" ;;
         *) S19_SESSION[${key}]="${PERSONA_NAMED[${key}]}" ;;
     esac
     session="${S19_SESSION[${key}]}"
@@ -1381,7 +1345,7 @@ s19_latch() {
         # Recorded, not asserted: the server's line for a `resume` before the
         # reuse (the no-transcript step, src/session-manager.ts).
         echo "${TEST_NAME}: ${step}: server-log lines on a resume of ${id} (recorded, not asserted):"
-        grep -F "on resume for $(persona_ref "${name}")" "${SLACK_STATE_DIR}/server.log" | sed 's/^/  | /' || true
+        grep -F "on resume for ${PERSONA_REF[${key}]}" "${SLACK_STATE_DIR}/server.log" | sed 's/^/  | /' || true
     fi
     n="$(rows_count "$(verb_rows kill "${rows}")")"
     (( n == 0 )) || fail "${step}: ${n} CSCB kill call(s) of ${id} before the latch"
@@ -1417,32 +1381,43 @@ s19_latch() {
     echo "${TEST_NAME}: ${step}: case ${S19_CASE[${key}]}, refused ${S19_OP[${key}]}; ${id}: ${S19_LATCH_STATE[${key}]}${S19_LATCH_RV[${key}]:+ at row_version ${S19_LATCH_RV[${key}]}}"
 }
 
-# s19_rounds <key> <min>: once at least <min> rounds of persona <key> have
-# run since its latch (each next round's line waited for within
-# INTERVAL_S plus twice SETTLE_S), every round since the latch: one `status`
-# then the persona's re-check call (latch_rounds), each refused (its round
-# line's answer `still-latched`), at the cadence (check_cadence: the first
-# from the refused launch, each next from the previous round's status);
-# nothing written (no row for the scan refusal, with one not_inserted trail
-# record per refused plain spawn; else the same state and row_version); the
-# seeded session still there; no post beyond the CONFLICT notices.
+# s19_rounds <key> <min> [<label>]: once at least <min> rounds of persona
+# <key> have run since its latch (each next round's line waited for within
+# INTERVAL_S plus twice SETTLE_S), and its rounds have settled (s19_settle:
+# none in flight, each with its round line), every round since the latch, as
+# many as have run: one `status` then the persona's re-check call
+# (latch_rounds), each refused (every round line since the latch answers
+# `still-latched`), at the cadence (check_cadence: the first from the refused
+# launch, each next from the previous round's status); nothing written (no
+# row for the scan refusal, with one not_inserted trail record per refused
+# plain spawn; else the same state and row_version); the seeded session
+# still there; no post beyond the CONFLICT notices. Sets the rounds' count,
+# the last round's status time and its call's shim position.
 s19_rounds() {
-    local key="$1" min="$2" step="phase 4: $1's rounds (refused)" id="${PERSONA_ID[$1]}" rounds n i=0 s_pos s_us c_pos c_us prev last
-    wait_for_count "${S19_ROUND_HEAD[${key}]}" $(( S19_ROUND_BASE[${key}] + min )) $(( min * (INTERVAL_S + 2 * SETTLE_S) )) \
+    local key="$1" min="$2" step="${3:-phase 4}: $1's rounds (refused)" id="${PERSONA_ID[$1]}" left rounds lines bad n
+    local i=0 s_pos s_us c_pos c_us prev last
+    left=$(( min - S19_ROUNDS[${key}] ))
+    (( left > 0 )) || left=1
+    wait_for_count "${S19_ROUND_HEAD[${key}]}" $(( S19_ROUND_BASE[${key}] + min )) $(( left * (INTERVAL_S + 2 * SETTLE_S) )) \
         "${step}: fewer than ${min} round lines"
-    n=$(( $(count_log "${S19_ROUND_HEAD[${key}]}") - S19_ROUND_BASE[${key}] ))
-    expect_count "${S19_ROUND_REFUSED[${key}]}" $(( S19_REFUSED_BASE[${key}] + n )) "${step}: refused round lines"
-    rounds="$(latch_rounds "${step}" "${id}" "${S19_CALL[${key}]}" "${S19_LATCH_MARK[${key}]}")"
-    (( $(rows_count "${rounds}") == n )) || fail "${step}: $(rows_count "${rounds}") rounds of ${id} after the latch, not ${n}"
+    s19_settle "${step}" "${key}"
+    rounds="${S19_SNAP_ROUNDS}"
+    lines="${S19_SNAP_LINES}"
+    n="$(rows_count "${rounds}")"
+    (( n >= min )) || fail "${step}: ${n} rounds of ${id} after the latch, fewer than ${min}"
+    bad="$(R="${S19_ROUND_REFUSED[${key}]}" LC_ALL=C awk 'index($0, ENVIRON["R"]) == 0' <<< "${lines}")"
+    [[ -z "${bad}" ]] || { sed 's/^/  | /' <<< "${bad}" >&2; fail "${step}: a round line since the latch does not answer still-latched"; }
     prev="${S19_LATCH_US[${key}]}"
     last="${S19_LATCH_MARK[${key}]}"
-    while read -r s_pos s_us c_pos c_us; do
-        i=$(( i + 1 ))
-        check_cadence "${step}: round ${i}" "${prev}" "${s_us}" "${c_us}" "${S19_CALL[${key}]}"
-        echo "${TEST_NAME}: ${step}: round ${i}: status at shim line ${s_pos}, ${S19_CALL[${key}]} at ${c_pos}"
-        prev="${s_us}"
-        last="${c_pos}"
-    done <<< "${rounds}"
+    if [[ -n "${rounds}" ]]; then
+        while read -r s_pos s_us c_pos c_us; do
+            i=$(( i + 1 ))
+            check_cadence "${step}: round ${i}" "${prev}" "${s_us}" "${c_us}" "${S19_CALL[${key}]}"
+            echo "${TEST_NAME}: ${step}: round ${i}: status at shim line ${s_pos}, ${S19_CALL[${key}]} at ${c_pos}"
+            prev="${s_us}"
+            last="${c_pos}"
+        done <<< "${rounds}"
+    fi
     if [[ "${key}" == "${SCAN_KEY}" ]]; then
         n="$(store_rows_of "${step}" "${id}")" || exit 1
         [[ "${n}" == 0 ]] || fail "${step}: the store holds ${n} row(s) with id ${id}, not none"
@@ -1462,28 +1437,43 @@ s19_rounds() {
     echo "${TEST_NAME}: ${step}: ${i} refused round(s); ${id}: ${S19_LATCH_STATE[${key}]}${S19_LATCH_RV[${key}]:+ at row_version ${S19_LATCH_RV[${key}]}}"
 }
 
-# s19_end <key> [harness]: the human ends persona <key>'s seeded session by
-# its session id (`end_session`).
+# s19_end <key> <label> [harness]: right before the human ends persona
+# <key>'s seeded session, every round since the latch is read and checked
+# again (s19_rounds), and then, once the rounds have settled again with no
+# round added since (else the new rounds are checked too), the session is
+# ended by its session id (`end_session`). So the last refused round's
+# status time and call position are those of the round just before the end,
+# and s19_clear checks the first round after it. Records the server's MCP
+# registrations of the persona so far and the tmux shim mark right after the
+# end.
 s19_end() {
-    local key="$1"
-    S19_CONNECTS[${key}]="$(count_log "[slack] Session connected: persona $(persona_ref "${PERSONA_NAME[${key}]}")")"
+    local key="$1" label="$2" tries
+    for (( tries = 1; ; tries++ )); do
+        s19_rounds "${key}" "${S19_ROUNDS[${key}]}" "${label}"
+        s19_settle "${label}: ${key}'s end" "${key}"
+        (( $(rows_count "${S19_SNAP_ROUNDS}") != S19_ROUNDS[${key}] )) || break
+        (( tries < 3 )) || fail "${label}: ${key}'s rounds kept coming while they were read before the end"
+    done
+    S19_CONNECTS[${key}]="$(count_log "[slack] Session connected: persona ${PERSONA_REF[${key}]}")"
     end_session "${S19_SID[${key}]}"
-    echo "${TEST_NAME}: $2: the harness ended ${PERSONA_NAMED[${key}]} (${S19_SID[${key}]}) of ${key}"
+    S19_END_TMUX_MARK[${key}]="$(tmux_shim_mark)"
+    echo "${TEST_NAME}: ${label}: the harness ended ${S19_SESSION[${key}]} (${S19_SID[${key}]}) of ${key} after its ${S19_ROUNDS[${key}]} refused round(s)"
 }
 
 # s19_clear <key> <label>: the round after the harness ended the session:
 # its first two calls are one `status` then the persona's re-check call, at
 # the cadence, with no CSCB find-missing between them; the call launches: the
 # latch clears (latchClearedLine, reason "a retry of the refused operation
-# was not refused", posted), the persona reaches `waiting` (the pending
-# variant on a fresh claude_session_id, recorded as PEND_REUSED_SID, not its
-# first life's) and the server registers its
-# MCP session; exactly one recovery post, the printed recovery notice, and
-# no post beyond it and the CONFLICT notices.
+# was not refused", posted), with no refused round line beyond those read
+# before the end, the persona reaches `waiting` on the session name the latch
+# quoted (scenario 4's on its first life's claude_session_id; the pending
+# variant's on a fresh one, recorded as PEND_REUSED_SID) and the server
+# registers its MCP session; exactly one recovery post, the printed recovery
+# notice, and no post beyond it and the CONFLICT notices; no counted
+# launch failure of the persona.
 s19_clear() {
     local key="$1" step="$2: $1's clear" id="${PERSONA_ID[$1]}" name="${PERSONA_NAME[$1]}" session="${S19_SESSION[$1]}"
-    local rows s_pos s_time s_verb c_pos c_time c_verb c_args between cleared recovery n ref
-    ref="$(persona_ref "${name}")"
+    local rows s_pos s_time s_verb c_pos c_time c_verb c_args s_us c_us between cleared recovery n calls spawns
     wait_for_count "${S19_ROUND_HEAD[${key}]}" $(( S19_ROUND_BASE[${key}] + S19_ROUNDS[${key}] + 1 )) $(( INTERVAL_S + 2 * SETTLE_S )) \
         "${step}: no round line after the session ended"
     rows="$(ad_cscb_calls "${id}" "${S19_LAST_POS[${key}]}")"
@@ -1493,7 +1483,9 @@ s19_clear() {
         sed 's/^/  | /' <<< "${rows}" >&2
         fail "${step}: the round's first calls of ${id} are '${s_verb}' and '${c_verb}', not status then ${S19_CALL[${key}]}"
     fi
-    check_cadence "${step}" "${S19_PREV_US[${key}]}" "$(us_of "${s_time}")" "$(us_of "${c_time}")" "${S19_CALL[${key}]}"
+    s_us="$(us_of "${s_time}")"
+    c_us="$(us_of "${c_time}")"
+    check_cadence "${step}" "${S19_PREV_US[${key}]}" "${s_us}" "${c_us}" "${S19_CALL[${key}]}"
     between="$(ad_cscb_verb_between find-missing "${s_pos}" "${c_pos}")"
     [[ -z "${between}" ]] || { sed 's/^/  | /' <<< "${between}" >&2; fail "${step}: a CSCB find-missing between the round's status and its ${S19_CALL[${key}]}"; }
 
@@ -1510,15 +1502,21 @@ s19_clear() {
     # The launch: the persona reaches waiting on its own session.
     wait_row "${step}: the launch's report-in" "${REPORT_WAIT_S}" "${id}" waiting
     [[ -n "${ROW_SID}" ]] || fail "${step}: the launched row has no claude_session_id"
-    if [[ "${key}" == "${PEND_KEY}" ]]; then
-        # The reuse starts a fresh session, not the first life's.
-        [[ "${ROW_SID}" != "${PERSONA_SID[${key}]}" ]] \
-            || fail "${step}: the reused row's claude_session_id is the first life's ${PERSONA_SID[${key}]}, not a fresh session's"
-        PEND_REUSED_SID="${ROW_SID}"
-    fi
-    [[ "${ROW_SESSION}" == "${PERSONA_NAMED[${key}]}" ]] \
-        || fail "${step}: the launched row records session '${ROW_SESSION}', not ${PERSONA_NAMED[${key}]}"
-    wait_for_count "[slack] Session connected: persona ${ref}" $(( S19_CONNECTS[${key}] + 1 )) "${CONNECT_WAIT_S}" \
+    case "${key}" in
+        "${S4_KEY}")
+            # The resume keeps the first life's conversation.
+            [[ "${ROW_SID}" == "${PERSONA_SID[${key}]}" ]] \
+                || fail "${step}: the resumed row's claude_session_id is '${ROW_SID}', not the first life's ${PERSONA_SID[${key}]}"
+            ;;
+        "${PEND_KEY}")
+            # The reuse starts a fresh session, not the first life's.
+            [[ "${ROW_SID}" != "${PERSONA_SID[${key}]}" ]] \
+                || fail "${step}: the reused row's claude_session_id is the first life's ${PERSONA_SID[${key}]}, not a fresh session's"
+            PEND_REUSED_SID="${ROW_SID}"
+            ;;
+    esac
+    [[ "${ROW_SESSION}" == "${session}" ]] || fail "${step}: the launched row records session '${ROW_SESSION}', not ${session}"
+    wait_for_count "[slack] Session connected: persona ${PERSONA_REF[${key}]}" $(( S19_CONNECTS[${key}] + 1 )) "${CONNECT_WAIT_S}" \
         "${step}: the server never registered the launched stub's session as ${key}'s"
 
     # Exactly one recovery post, the printed notice; nothing else posted.
@@ -1540,30 +1538,33 @@ s19_clear() {
         || fail "${step}: ${PERSONA_CHANNEL[${key}]} holds ${n} posts since the second life began, not the CONFLICT notice(s) and the recovery post"
     if [[ "${key}" == "${SCAN_KEY}" ]]; then
         # The launching plain spawn met no leftover: no not_inserted record.
-        s19_scan_trail "${step}" "$(( $(rows_count "$(verb_rows spawn "$(ad_cscb_calls "${id}" "${LIFE2_MARK}")")") - 1 ))"
+        calls="$(ad_cscb_calls "${id}" "${LIFE2_MARK}")"
+        spawns="$(rows_count "$(verb_rows spawn "${calls}")")"
+        s19_scan_trail "${step}" "$(( spawns - 1 ))"
     fi
+    no_counted_failures "${step}" "${key}"
     echo "${TEST_NAME}: ${step}: ${id} reads waiting with claude_session_id ${ROW_SID}; one recovery post"
 }
 
-# s19_no_kill <label>: no CSCB `kill`, `kill-finished` or `delete` names a
-# scenario 19 persona's id from the second life on.
-s19_no_kill() {
-    local key id rows verb n
-    for key in "${S19_KEYS[@]}"; do
+# no_kill <label> <key>...: no CSCB `kill`, `kill-finished` or `delete`
+# names any <key>'s id from the second life on.
+no_kill() {
+    local label="$1" key id rows verb n
+    shift
+    for key in "$@"; do
         id="${PERSONA_ID[${key}]}"
         rows="$(ad_cscb_calls "${id}" "${LIFE2_MARK}")"
         for verb in kill kill-finished delete; do
             n="$(rows_count "$(verb_rows "${verb}" "${rows}")")"
-            (( n == 0 )) || fail "$1: ${n} CSCB ${verb} call(s) of ${id} from the second life on"
+            (( n == 0 )) || fail "${label}: ${n} CSCB ${verb} call(s) of ${id} from the second life on"
         done
     done
-    echo "${TEST_NAME}: $1: no kill, kill-finished or delete of a scenario 19 persona's row"
+    echo "${TEST_NAME}: ${label}: no kill, kill-finished or delete of the rows of $*"
 }
 
 phase4_second_life() {
     local step="phase 4: second life" completions key
-    S4_POSTS_BEFORE="$(post_count "${S4_KEY}")"
-    for key in "${S19_KEYS[@]}"; do
+    for key in "${LATCH_KEYS[@]}"; do
         S19_POSTS_BEFORE[${key}]="$(post_count "${key}")"
     done
     # A start runs the state dir's last-applied record, so the second life,
@@ -1572,35 +1573,36 @@ phase4_second_life() {
     write_personas_config "${LIFE2_KEYS[@]}"
     LIFE2_MARK="$(ad_shim_mark)"
     LIFE2_TMUX_MARK="$(tmux_shim_mark)"
-    completions="$(count_log "$(completion_match "${#LIFE2_KEYS[@]}")")"
+    completions="$(count_log "${LIFE2_DONE}")"
     start_server --live
     LIFE2_PID="${SERVER_PID}"
-    wait_for_count "$(completion_match "${#LIFE2_KEYS[@]}")" "$(( completions + 1 ))" "${START_WAIT_S}" "${step}: the start pass never completed"
-    echo "${TEST_NAME}: ${step}: $(_scenario_scan lastline "${SLACK_STATE_DIR}/server.log" "$(completion_match "${#LIFE2_KEYS[@]}")" | sed 's/^.*\] //')"
-    s4_latch
-    for key in "${SCAN_KEY}" "${ENV_KEY}" "${STORE_KEY}"; do
+    wait_for_count "${LIFE2_DONE}" "$(( completions + 1 ))" "${START_WAIT_S}" "${step}: the start pass never completed"
+    expect_completion "${#LIFE2_KEYS[@]}" "${step}" "0 failed"
+    echo "${TEST_NAME}: ${step}: $(_scenario_scan lastline "${SLACK_STATE_DIR}/server.log" "${LIFE2_DONE}" | sed 's/^.*\] //')"
+    # Scenario 4's latch first, then scenario 19's.
+    for key in "${S4_KEY}" "${SCAN_KEY}" "${ENV_KEY}" "${STORE_KEY}"; do
         s19_latch "${key}" "phase 4" "${LIFE2_MARK}" "${LIFE2_PID}" 1 "${S19_POSTS_BEFORE[${key}]}" "${START_WAIT_S}"
     done
     s19_pending_marked
     s19_latch "${PEND_KEY}" "phase 4" "${LIFE2_MARK}" "${LIFE2_PID}" 1 "${S19_POSTS_BEFORE[${PEND_KEY}]}" "${SETTLE_S}"
-    s4_refused_rounds
+    s19_rounds "${S4_KEY}" "${REFUSED_ROUNDS}"
     s19_rounds "${SCAN_KEY}" 2
     s19_rounds "${ENV_KEY}" 2
     s19_rounds "${STORE_KEY}" 2
     s19_rounds "${PEND_KEY}" 1
     # [harness] The human ends the environment-only, another store's and the
-    # pending variant's sessions; scenario 4's follows in s4_clear.
-    for key in "${ENV_KEY}" "${STORE_KEY}" "${PEND_KEY}"; do
+    # pending variant's sessions, then scenario 4's; each clears at its next
+    # round.
+    for key in "${ENV_KEY}" "${STORE_KEY}" "${PEND_KEY}" "${S4_KEY}"; do
         s19_end "${key}" "phase 4"
     done
-    s4_clear
-    for key in "${ENV_KEY}" "${STORE_KEY}" "${PEND_KEY}"; do
+    for key in "${S4_KEY}" "${ENV_KEY}" "${STORE_KEY}" "${PEND_KEY}"; do
         s19_clear "${key}" "phase 4"
     done
     # The scan refusal stays latched, retried as a plain spawn.
     s19_rounds "${SCAN_KEY}" 3
-    s4_no_kill
-    s19_no_kill "phase 4"
+    s4_untouched
+    no_kill "phase 4" "${LATCH_KEYS[@]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1618,22 +1620,26 @@ latch_line_count() {
 }
 
 phase5_restart_leg() {
-    local label="phase 5" step="phase 5: restart" key completions n
+    local label="phase 5" step="phase 5: restart" key completions n other
     local -A posts=() lines=()
+    # Positive control for the latch-line count: every persona latched in
+    # phase 4, so each has conflict-latch lines before the restart.
     for key in "${LIFE2_KEYS[@]}"; do
         posts[${key}]="$(post_count "${key}")"
         lines[${key}]="$(latch_line_count "${key}")"
+        (( lines[${key}] > 0 )) || fail "${step}: positive control: latch_line_count finds no conflict-latch line of ${key}, which latched in phase 4"
     done
     # A plain stop: the bots keep running.
     stop_server
     sed "s/^/${TEST_NAME}: ${step}: stop said: /" "${STOP_OUT}"
     has_session_id "${S19_SID[${SCAN_KEY}]}" || fail "${step}: the seeded leftover ${S19_SID[${SCAN_KEY}]} is gone"
     RESTART_MARK="$(ad_shim_mark)"
-    completions="$(count_log "$(completion_match "${#LIFE2_KEYS[@]}")")"
+    completions="$(count_log "${LIFE2_DONE}")"
     start_server --live
     RESTART_PID="${SERVER_PID}"
-    wait_for_count "$(completion_match "${#LIFE2_KEYS[@]}")" "$(( completions + 1 ))" "${START_WAIT_S}" "${step}: the start pass never completed"
-    echo "${TEST_NAME}: ${step}: $(_scenario_scan lastline "${SLACK_STATE_DIR}/server.log" "$(completion_match "${#LIFE2_KEYS[@]}")" | sed 's/^.*\] //')"
+    wait_for_count "${LIFE2_DONE}" "$(( completions + 1 ))" "${START_WAIT_S}" "${step}: the start pass never completed"
+    expect_completion "${#LIFE2_KEYS[@]}" "${step}" "0 failed"
+    echo "${TEST_NAME}: ${step}: $(_scenario_scan lastline "${SLACK_STATE_DIR}/server.log" "${LIFE2_DONE}" | sed 's/^.*\] //')"
 
     # The bring-up's plain spawn meets the scan again: one new post.
     s19_latch "${SCAN_KEY}" "${label}" "${RESTART_MARK}" "${RESTART_PID}" 2 "${posts[${SCAN_KEY}]}" "${START_WAIT_S}"
@@ -1641,6 +1647,10 @@ phase5_restart_leg() {
     # launches.
     s19_end "${SCAN_KEY}" "${label}"
     s19_clear "${SCAN_KEY}" "${label}"
+    # Positive control: the scan persona's relatch and clear lines are counted.
+    n="$(latch_line_count "${SCAN_KEY}")"
+    (( n >= lines[${SCAN_KEY}] + 2 )) \
+        || { latch_lines_of "${SCAN_KEY}"; fail "${step}: positive control: ${SCAN_KEY} has $(( n - lines[${SCAN_KEY}] )) new conflict-latch line(s) since the restart, not at least its relatch and its clear"; }
 
     # No other persona latched or got a post at this start.
     for key in "${LIFE2_KEYS[@]}"; do
@@ -1651,9 +1661,11 @@ phase5_restart_leg() {
         (( n == lines[${key}] )) || { latch_lines_of "${key}"; fail "${step}: ${key} has $(( n - lines[${key}] )) new conflict-latch line(s) since the restart"; }
     done
     echo "${TEST_NAME}: ${step}: no other persona latched or got a post"
-    s19_no_kill "${label}"
-    n="$(rows_count "$(non_cscb_find_missing)")"
-    (( n == 0 )) || fail "${step}: ${n} find-missing call(s) whose parent is not a CSCB process"
+    no_kill "${label}" "${S19_KEYS[@]}"
+    no_counted_failures "${step}" "${LATCH_KEYS[@]}"
+    other="$(non_cscb_find_missing)"
+    n="$(rows_count "${other}")"
+    (( n == 0 )) || { sed 's/^/  | /' <<< "${other}" >&2; fail "${step}: ${n} find-missing call(s) whose parent is not a CSCB process"; }
 }
 
 # end_workers [harness]: the human ends every persona's worker as a human

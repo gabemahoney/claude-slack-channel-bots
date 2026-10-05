@@ -163,7 +163,7 @@ why:
   binary or the shim, every harness agent-director call (`ad`, `ad_capture`, `ad_admin`, `ad_admin_capture`),
   every harness `sqlite3` read or edit (`ad_store_edit`, `ad_store_id`,
   `ad_store_pending_no_launch`), the trail reader `ad_trail_events` and every stub-worker helper (`stub_mode`,
-  `stub_press_enter`, `write_mcp_config`) calls `require_ci_image` as its
+  `stub_press_enter`, `stub_type_exit`, `write_mcp_config`) calls `require_ci_image` as its
   first step, which fails with
   `FAIL: <test>: <step>: refused: /etc/cscb-ci-image is absent …`.
 
@@ -210,8 +210,15 @@ tests/
                                    # real tmux; a live one-persona start whose dialog the approver clears through agent-director, with no tmux line whose parent is
                                    # the bot server and the three closing assertions passing, both positive controls met by that start's own lines; harness
                                    # finished-row kills (agent-director-admin's `kill-finished`) passing; each assertion, positive control and count helper failing on a violating log; the
-                                   # closing enforcement; and the trap stopping the scenario's tmux server. Its stub legs show the stub's MCP session registered as
-                                   # the persona's, with no reconnect or relaunch over three health ticks and the persona not connected once the stub ends; the stub
+                                   # closing enforcement; and the trap stopping the scenario's tmux server. Its synthetic reader leg (`synthetic_readers`) runs
+                                   # the latch scenarios' readers on synthetic logs: `tmux_shim_targets` (each -t form, alias, prefix and option position it must
+                                   # match, and the near misses it must not: `%12` for `%1`, `@12` for `@1`, `$30` for `$3`, a longer name), `ad_cscb_calls`
+                                   # (the instance id exactly, in both flag forms, never a harness call or a stop line) and `ad_cscb_verb_between`, each kept to
+                                   # its marks. Its stub legs show the stub's MCP session registered as
+                                   # the persona's, with no reconnect or relaunch over three health ticks; `/mcp reconnect` typed into the pane in both
+                                   # forms (`/mcp reconnect slack-channel-router`, as CSCB types it, then bare), each ending the old session client and
+                                   # connecting a new one the server registers as the persona's, the stub still running; then the stub's exit sentinel,
+                                   # sent through `stub_type_exit`, and the persona not connected once the stub ends; the stub
                                    # run directly (its version line, the default dev-channels dialog, `silent`, a stop line on stderr); the stub helpers refusing
                                    # and working; the SessionStart re-fire in every reporting path (at once, a folder trusted in either config, and the dev-channels,
                                    # unrecognised and folder-trust dialogs answered by `stub_press_enter`) against a row a silent worker holds `pending`, every fire
@@ -234,7 +241,8 @@ tests/
                                    # session `slack_bot_dev_x`, its stub held at the dev-channels dialog. Checks: `dev` resumes with its own
                                    # claude_session_id and reconnects on a plain restart; the approver, `resume` and the restart path never touch the
                                    # neighbour (no CSCB agent-director call names its id or session name, no tmux shim command reads from, types into,
-                                   # kills or respawns its session or pane, its row still reads `pending` with the same stub alive and no hook fired);
+                                   # kills or respawns its session, window or pane (by name, session id, window id or pane id), its row still reads
+                                   # `pending` on the same session, window and pane with the same stub alive and no hook fired);
                                    # no latch notice or latch line for `dev`; `dev`'s row present at the end. The first life's `stop --stop-bots` may
                                    # leave `dev`'s row `waiting` (the stub ignores `pause`'s `/exit`, and no `find-missing` runs for an unlatched
                                    # persona). Modes: tmux shim `log`, the stub's dev-channels hold, agent-director's defaults (no config.toml). It runs
@@ -248,12 +256,15 @@ tests/
                                    # label named as the row records (`slack_bot_<key>`, `seed_unlabelled`), so it holds the finished row's name. Checks in
                                    # the second life: the bring-up's `resume` gets CONFLICT "no valid instance id"; exactly one CONFLICT post, its lines in
                                    # SRJ-1004's order (persona prefix, first line, description line, the pointer line to "Operator actions", list line,
-                                   # human-only line), naming no command; no CSCB `kill`, `kill-finished` or `delete` of the row; each 120 s re-check is one
-                                   # `status` read (`ended` or `missing`) then the `resume` retry, with no probe and no post, the row's state and
-                                   # `row_version` unchanged; the harness ends the session by its session id, the next round's `resume` launches with no
-                                   # `find-missing` between that round's `status` and `resume`, the persona reaches `waiting` with its first-life
-                                   # claude_session_id, and exactly one recovery post follows ("a retry of the refused operation was not refused"); no tmux
-                                   # command CSCB caused touches the seeded session; the row present at the end.
+                                   # human-only line), naming no command; no CSCB `kill`, `kill-finished` or `delete` of the row. Scenario 4's leg runs
+                                   # through the same latch, round, end and clear steps as scenario 19's legs. Its rounds: at least two, then every round
+                                   # since the latch, each one `status` read (`ended` or `missing`) then the `resume` retry at the 120 s cadence, with no
+                                   # probe and no post, still latched, the row's state and `row_version` unchanged; right before the harness ends the
+                                   # session by its session id, the rounds are read again, so the clear is checked on the first round after the end. That
+                                   # round's `resume` launches with no `find-missing` between its `status` and `resume`, the persona reaches `waiting` with
+                                   # its first-life claude_session_id, and exactly one recovery post follows ("a retry of the refused operation was not
+                                   # refused"); no tmux command CSCB caused touches the seeded session (by its name, session id, window id or pane id), with
+                                   # a positive control on the resumed session; the row present at the end.
                                    # Scenario 19's legs (personas `scanleft`, `envonly`, `otherstore`, `pendleft`): the second life runs in a state dir of
                                    # its own (each start replays its state dir's `config.json.last-applied`, and this life adds these personas). Each
                                    # seeded session is named as the package names the persona's launches (`slack_bot_<key>`), its pane running `sleep`;
@@ -279,6 +290,12 @@ tests/
                                    # and no other persona posts or latches; once the harness ends the leftover by its session id, it clears. Each clear:
                                    # the round's `status` then its retry, with no CSCB `find-missing` between them, and one recovery post ("a retry of the
                                    # refused operation was not refused"). No CSCB `kill`, `kill-finished` or `delete` names a scenario 19 persona's id.
+                                   # Each variant's rounds: at least N (two, one for `pendleft`), then, once none is in progress, every round since the
+                                   # latch, each still latched; re-read right before each end, so each clear is checked on the first round after it.
+                                   # Both scenarios: each start pass's completion line counts `0 failed`; no counted launch-failure line of a latching
+                                   # persona at each clear or at the end (its fragments are first found in the installed package's `src/restart.ts`, so
+                                   # a rewording fails the script); the restart leg's count of conflict-latch lines has a positive control (every persona
+                                   # has such lines before the restart, and `scanleft`'s grow by its relatch and clear).
                                    # Before the closing `stop --stop-bots` the harness types the stub's exit line into every worker's pane, so no
                                    # `pause` waits out its 30 s timeout. The harness runs no `find-missing`. Modes: tmux shim `log`, the stub's
                                    # dev-channels hold, `health_check_interval` 0, agent-director's defaults (no config.toml). It runs about 9 minutes and
@@ -287,9 +304,10 @@ tests/
                                    # Set-up: in the first life persona `unusable` (U) reaches `waiting`; the harness types the stub's exit sentinel into its
                                    # pane (a human quitting Claude Code), so the row ends; then `stop --stop-bots`. With the server stopped, E39's scenario
                                    # 25 statement (`ad_store_unusable_name`, an `ad_store_edit`) puts a `.` in U's recorded name (`<U's session name>.x`),
-                                   # and the harness makes another caller's row: a harness `spawn` of `<SCENARIO_TAG>_other` (outside `cscb_`, no labels,
-                                   # its stub `silent`), then one script-local `ad_store_edit` statement making it live `waiting` with no recorded process
-                                   # and the recorded name `<SCENARIO_TAG>_other.x`. Checks in the second life: the bring-up's calls of U's row hold exactly
+                                   # and the harness makes another caller's row: a harness `spawn` of instance id `<SCENARIO_TAG>_other` (outside `cscb_`,
+                                   # no labels, its stub `silent`) in session `<SCENARIO_TAG>_stranger`, then one script-local `ad_store_edit` statement
+                                   # making it live `waiting` with no recorded process and the recorded name `<SCENARIO_TAG>_stranger.x`. Checks in the
+                                   # second life: the bring-up's calls of U's row hold exactly
                                    # one `resume` and no reuse spawn, `kill`, `kill-finished` or `delete` (the plain spawn the existing row refuses as a
                                    # collision, and its `get`, are recorded, not asserted); that `resume` gets `ErrUnknownErrorName` (`unknownName` "ErrInternal", the description holding the
                                    # unusable-name phrase and the name); U latches once (case "unusable recorded name", refused operation none) and the
@@ -298,13 +316,18 @@ tests/
                                    # forced through fixtures/fmk-driver.ts gets the same `ErrUnknownErrorName`/`ErrInternal` with the phrase, CSCB's
                                    # unusable-name class and `counted=false`, U's row unchanged. At least two re-check rounds, each one bot-server
                                    # `status` at the 120 s cadence and nothing else for U (no `delete`, `kill`, spawn, `resume` or pane verb), still
-                                   # latched, no new post; no tmux shim line at all from the latch to the harness's `delete`; nothing counted (no counted
-                                   # launch-failure line, no spawn-failure post). Then the harness plays the human's last procedure step,
+                                   # latched, no new post; no tmux shim line at all from the latch to the harness's `delete`; nothing counted: no counted
+                                   # launch-failure line (its fragments first found in the installed package's `src/restart.ts`, so a rewording fails the
+                                   # script), and no spawn-failure post, which U's channel holding exactly the expected posts, each matched whole and in
+                                   # order, rules out. Then the harness plays the human's last procedure step,
                                    # `ad_delete_unusable_row` (agent-director-admin's `delete`, from the scenario's own shell): the next round's `status`
                                    # gets `ErrSpawnNotFound`, the latch clears with one "Hold cleared" post (`holdRecoveryText`, reason "its
-                                   # agent-director row is gone"), then CSCB's one bypassing `find-missing` and one plain spawn, and U reaches `waiting`
-                                   # on a new claude_session_id. The other caller's row: after a CSCB `find-missing`, a harness `get` shows agent-director's
-                                   # `tmux_session_name_rewritten` note, and no CSCB call, latch line or post names it. At the end the agent-director
+                                   # agent-director row is gone"), then exactly one bypassing CSCB `find-missing` and one plain spawn, and U reaches
+                                   # `waiting` on a new claude_session_id; from the second life on, U's channel holds exactly the notice and the recovery
+                                   # post, in that order, each matched whole. The other caller's row: after a CSCB `find-missing`, a harness `get` shows
+                                   # agent-director's `tmux_session_name_rewritten` note; no CSCB call, latch line or post names its id or session name;
+                                   # and no tmux command a CSCB process causes reads from, types into, kills or respawns its session name, session id,
+                                   # window id or pane id (`tmux_shim_targets`, with a positive control on U's fresh session). At the end the agent-director
                                    # shim's log holds exactly one `delete`, the harness's, parented by the scenario's shell: this is the one fmk script
                                    # whose log holds a `delete`, and `assert_no_cscb_delete` still holds because it counts only CSCB-parented lines.
                                    # The harness runs no `find-missing`. Modes: tmux shim `log`, the stub's dev-channels hold for U,
@@ -742,14 +765,18 @@ SRJ-1306). Test 15 and the latch scenarios read the logs through these;
 - `ad_cscb_verb_between <verb> <from-mark> <to-mark>` prints the same rows
   for a verb that carries no instance id (`find-missing`, `list`,
   `version`).
-- `tmux_shim_targets <session-name|session-id|pane-id> [<from-mark>
-  [<to-mark>]]` prints one row per tmux command, chained commands included,
-  that reads from (`capture-pane`, `pipe-pane`), types into (`send-keys`,
-  `send-prefix`, `paste-buffer`), kills or respawns a `-t` target naming the
-  one given: the pane id exactly; for a session, its id, `=<name>` or
+- `tmux_shim_targets <session-name|session-id|window-id|pane-id>
+  [<from-mark> [<to-mark>]]` prints one row per tmux command, chained
+  commands included, that reads from (`capture-pane`, `pipe-pane`), types
+  into (`send-keys`, `send-prefix`, `paste-buffer`), kills or respawns a `-t`
+  target naming the one given: the pane id exactly; a window id (`@N`)
+  exactly, as the `-t` value's window part (`@N`, `@N.0`, `<session>:@N`),
+  so `@1` never matches `@12`; for a session, its id, `=<name>` or
   `<name>`, or a session part written without `=` that is a prefix of the
   name (which tmux resolves to that session when no session has the exact
-  name).
+  name). Each command's options are read as tmux reads them, so an option
+  that takes an argument (`send-keys`' `-c <client>`) never hides the `-t`
+  after it.
 - `slack_posts <channel> [<record>]` prints the text of each
   `chat.postMessage` to `<channel>` in the Slack stub's record (default
   `SCENARIO_SLACK_RECORD`), whole and followed by a NUL byte, in record
@@ -909,6 +936,7 @@ of another session's.
 | `remain-on-exit` on for one session | `set_remain_on_exit` |
 | Setting and unsetting a global `@ad_owner` value (conflicting labels) | `ad_owner_global_set`, `ad_owner_global_unset` |
 | Sending Enter into a stub's pane held at a startup dialog | `stub_press_enter` (see The stub worker) |
+| Ending a stub worker, as a human quits Claude Code | `stub_type_exit` (see The stub worker) |
 | Respawning a worker's pane with another process | `respawn_worker_pane` |
 | Restarting the scenario's tmux server | `restart_tmux_server` |
 | Re-binding its socket path while the old server runs | `rebind_tmux_socket` |
@@ -1101,6 +1129,15 @@ used as given, and a session name is matched exactly, never as a prefix of
 another session's. It fails with tmux's message when tmux refuses, and
 refuses when `TMUX` is set or `TMUX_TMPDIR` is not the scenario's.
 
+`stub_type_exit <target>` ends a stub worker as a human quits Claude Code:
+one `send-keys` of the stub's exit sentinel (`__CSCB_TEST_EXIT__`) and
+Enter, with the real tmux, from the scenario's own shell. The target is a
+pane id (`%N`) used as given, or a session id (`$N`) or session name matched
+exactly. Like the other helpers it runs `require_ci_image` and
+`require_scenario_home` first, and it refuses when `TMUX` is set or
+`TMUX_TMPDIR` is not the scenario's. The stub then fires its SessionEnd
+hooks and exits; the helper does not wait for it to end.
+
 A scenario whose launch loses its create reply (`slow-create`) keeps a mode
 that waits for the approver's Enter, as the default does: agent-director
 applies no hook to a row whose pane it has not adopted, and the approver's
@@ -1154,7 +1191,8 @@ which the server matches the persona. It ends with the stub (its exit, a
 kill, the pane's hang-up), so a stopped persona reads not connected; when the
 server ends it, a later `/mcp reconnect` in the pane (bare, or followed by
 the server name as CSCB types it, `/mcp reconnect slack-channel-router`)
-opens a new one, first ending a session client still running. Its
+opens a new one. A session client still running then is ended first:
+SIGTERM, then SIGKILL if it still runs 3 s later, and reaped. Its
 lines go to `stub-mcp-session.log` beside the stub. No session is opened in
 a mode that has not reported in, without `--mcp-config`, or where the client
 is not beside the stub (Tests 4, 10 and 12, which copy only the stub and run

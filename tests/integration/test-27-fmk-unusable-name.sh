@@ -69,18 +69,20 @@
 #        (`ad_capture`, from the scenario's shell) of instance id
 #        `<SCENARIO_TAG>_other`, outside CSCB's namespace, with no label at all
 #        (so no `service=cscb` label, which the start sweep would read as a
-#        CSCB row to kill, SRJ-714), in a working directory of its own whose
-#        stub is `silent`; the row reads `pending` and its pane runs the stub.
+#        CSCB row to kill, SRJ-714), in session `<SCENARIO_TAG>_stranger` (a
+#        name that does not hold the id) and a working directory of its own
+#        whose stub is `silent`; the row reads `pending`, its pane runs the
+#        stub, and its session id, window id and pane id are recorded.
 #        Then one script-local `ad_store_edit` UPDATE (other_row_unusable;
 #        lib/scenario.sh's store-statement rules: named by its id, its
 #        `pending` state and its row_version as read just before) makes it a
 #        live row with no recorded process and an unusable name: state
 #        `waiting` (with no launch start, as a row that reported in has),
 #        pid, proc_starttime, pane_pid and pane_starttime NULL,
-#        tmux_session_name `<SCENARIO_TAG>_other.x`, row_version + 1; a store
-#        read after it shows every other column unchanged, and a harness `get`
-#        reads it `waiting` with no liveness note. The shim's position is
-#        marked here (the seeding mark).
+#        tmux_session_name `<SCENARIO_TAG>_stranger.x`, row_version + 1; a
+#        store read after it shows every other column unchanged, and a harness
+#        `get` reads it `waiting` with no liveness note. The two shims'
+#        positions are marked here (the seeding marks).
 #   3. Second life (the live start, its start pass waited for):
 #      a. U's latch: server.log holds the latch-set line
 #         (`conflictLatchSetLine`: case "unusable recorded name", the session
@@ -127,7 +129,10 @@
 #         session name or its unusable name from the second life's start to
 #         the `delete` (`tmux_shim_targets`);
 #      f. nothing counted: server.log holds no counted launch-failure line for
-#         U, and no post on U's channel holds a spawn-failure notice;
+#         U (each fragment found first in the installed package's
+#         src/restart.ts, see Matched values). A spawn-failure post needs no
+#         check of its own: b and d hold U's channel to the one notice, and i
+#         to the notice and the recovery post, each matched whole;
 #      g. [harness] the human's last procedure step: `ad_delete_unusable_row`
 #         of U's row (agent-director-admin's `delete`, from the scenario's own
 #         shell; it refuses unless the recorded name holds the `.`, and checks
@@ -145,20 +150,29 @@
 #         registers the stub's MCP session; the bot server's calls of U's row
 #         after the `delete` hold exactly one `spawn`, with no
 #         `--reuse-finished` (a plain spawn), and no `resume`, `kill`,
-#         `kill-finished` or `delete`; a CSCB `find-missing` lies between the
-#         clearing round's `status` and that spawn (the step-1 clear's one
-#         bypassing run); U's channel holds exactly the notice and the
-#         recovery post from the second life on, neither a CONFLICT nor a
-#         launch-start notice.
+#         `kill-finished` or `delete`; exactly one CSCB `find-missing` lies
+#         between the clearing round's `status` and that spawn (the step-1
+#         clear's one bypassing run); U's channel holds exactly the notice and
+#         the recovery post from the second life on, in that order, each equal
+#         to the post b and h matched (so no spawn-failure, CONFLICT or
+#         launch-start notice); the fresh session's session id, window id and
+#         pane id are recorded.
 #   4. The other caller's row (SRJ-1427 bullet 2), checked after U's clear:
 #      - positive control: a CSCB `find-missing` came after the seeding mark
 #        (the first one is recorded; the step-1 clear's run, at the latest);
 #      - the harness's `get` of the row shows the `tmux_session_name_rewritten`
 #        note, the row still `waiting` with its unusable name;
 #      - no CSCB-parented call names the row's instance id or its session
-#        names (`cscb_ad_count`; positive control: CSCB calls name U's id);
-#      - no conflict-latch line in server.log names it, and no post in the
-#        Slack stub's record holds it.
+#        name (`cscb_ad_count`), no conflict-latch line in server.log names
+#        either, and no post in the Slack stub's record holds either; each
+#        fragment matches as a substring, so the session name covers its
+#        unusable form; positive controls: CSCB calls name U's id, and a
+#        conflict-latch line and a post name U's unusable name;
+#      - `tmux_shim_targets`, from the seeding's tmux mark to the end, finds
+#        no command that reads from, types into, kills or respawns the other
+#        caller's session name, session id, window id or pane id; positive
+#        control: from the `delete` on, it finds such commands for U's fresh
+#        session, session id, window id or pane id.
 #   5. [harness] The human ends U's fresh worker with the stub's exit line, so
 #      the closing `stop --stop-bots` pauses no live stub (a pause of the
 #      stub, which ignores the `/exit` it types, waits out its 30 s timeout);
@@ -194,15 +208,16 @@
 # - from src/conflict-latch.ts: LATCH_CASE_UNUSABLE_RECORDED_NAME,
 #   REFUSED_OPERATION_NONE, RECHECK_STEP_TABLE, RECHECK_STEP_CLEAR_GONE,
 #   RECHECK_CALL_NONE, LATCH_RECHECK_INTERVAL_MS, UNUSABLE_NAME_NOTICE_HEAD,
-#   UNUSABLE_NAME_NOTICE_POINTER, HOLD_RECOVERY_HEAD,
-#   CONFLICT_NOTICE_FIRST_LINE_HEAD, LAUNCH_START_NOTICE_HEAD, and the
-#   builders unusableNameNoticeText (with a placeholder description, split
-#   there into the text before and after it), holdRecoveryText,
-#   conflictLatchSetLine (whole, and cut before its `case=` for the count of
-#   latch-set lines; with a previous case, cut before its ` — `, for the
-#   relatch line), latchClearedLine and latchRecheckRoundLine (whole for the
-#   refused rounds; cut before its `step=` for every round line of U; cut
-#   before its answer for the clearing round);
+#   UNUSABLE_NAME_NOTICE_POINTER, HOLD_RECOVERY_HEAD, and the builders
+#   unusableNameNoticeText (with a placeholder description, split there into
+#   the text before and after it), holdRecoveryText, conflictLatchSetLine
+#   (whole, and cut before its `case=` for the count of latch-set lines; with
+#   a previous case, cut before its ` — `, for the relatch line),
+#   latchClearedLine and latchRecheckRoundLine (whole for the refused rounds;
+#   cut before its `step=` for every round line of U; cut before its answer
+#   for the clearing round); the lead every conflict-latch line shares is the
+#   common start of U's latch-set line cut before `case=` and U's round line
+#   cut before `step=`;
 # - UNUSABLE_RECORDED_NAME_PHRASE (src/ad-description-phrases.ts);
 # - AD_ERROR_CLASS_UNUSABLE_NAME (src/ad-error-class.ts).
 # Fragments with no exported builder, each quoted from its source:
@@ -218,8 +233,10 @@
 # - the counted launch-failure lines `[slack] Launch failed for persona=<key>`
 #   and `[slack] Session relaunch failed for persona=<key>` (src/restart.ts
 #   recordLaunchResultOutsideRestartWork and the restart work's
-#   countLaunchFailure), and the spawn-failure notice's first line
-#   `Spawn failure:` (src/session-manager.ts spawnFailureNoticeText);
+#   countLaunchFailure, each a template literal): before any count, each
+#   fragment, with the source's own `${key}` after it, is found with
+#   `grep -F` in the installed package's src/restart.ts, so a rewording fails
+#   the script rather than leaving a count of 0 that cannot fail;
 # - the persona reference `"<name>" (key=<key>)` (lib/scenario.sh
 #   persona_ref, src/persona-identity.ts renderPersonaRef);
 # - "Operator actions", the README section SRJ-1019's post points to;
@@ -234,7 +251,10 @@
 # Closing: the script ends with `assert_no_server_tmux`,
 # `assert_no_cscb_include_finished` and `assert_no_cscb_delete` in its own
 # shell. Every count of CSCB's agent-director calls reads only shim lines
-# whose parent is a CSCB process; no step reads a pane's text.
+# whose parent is a CSCB process; no step reads a pane's text. Each reader's
+# output (the shim-log, trail and Slack-record readers) is saved by its own
+# assignment before it is filtered or counted, so a reader that fails stops
+# the script.
 set -euo pipefail
 
 TEST_NAME="test-27-fmk-unusable-name"
@@ -249,10 +269,10 @@ U_CHANNEL="C0T27UN01"
 TOKEN_LABEL="t27unusable"
 
 # The other caller's row: an instance id outside CSCB's namespace, and its
-# session names (the one it is spawned in, and the unusable one the statement
-# records).
+# session names (the one it is spawned in, which does not hold the id, and
+# the unusable one the statement records, which holds the first).
 OTHER_ID="${SCENARIO_TAG}_other"
-OTHER_SESSION="${SCENARIO_TAG}_other"
+OTHER_SESSION="${SCENARIO_TAG}_stranger"
 OTHER_UNUSABLE="${OTHER_SESSION}.x"
 
 # Bounds (seconds; see the header).
@@ -270,6 +290,12 @@ STATUS_ROUNDS=2
 
 FMK_TEXTS="${SCENARIO_FIXTURES}/fmk-texts.ts"
 
+# The installed package under test.
+PKG_DIR="${SCENARIO_REPO}/node_modules/claude-slack-channel-bots"
+
+# The start pass's completion line for one persona.
+COMPLETED="$(completion_match 1)" || exit 1
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -277,6 +303,15 @@ FMK_TEXTS="${SCENARIO_FIXTURES}/fmk-texts.ts"
 # fmk_text <entry> [<arg>...]: print fixtures/fmk-texts.ts's value.
 fmk_text() {
     bun --no-install "${FMK_TEXTS}" "$@"
+}
+
+# common_prefix <a> <b>: print the longest common start of <a> and <b>.
+common_prefix() {
+    local a="$1" b="$2" i=0
+    while (( i < ${#a} && i < ${#b} )) && [[ "${a:i:1}" == "${b:i:1}" ]]; do
+        i=$(( i + 1 ))
+    done
+    printf '%s' "${a:0:i}"
 }
 
 # rows_count <text>: print how many lines <text> holds (0 when empty).
@@ -474,8 +509,8 @@ check_cadence() {
 # and on a call from any other CSCB process. Prints one line per `status`,
 # `<position> <us>`.
 status_rounds() {
-    local step="$1" from="$2" to="${3:--}" rows pos time ppid verb
-    rows="$(ad_cscb_calls "${U_ID}" "${from}" "${to}")"
+    local step="$1" from="$2" to="${3:--}" rows pos time ppid verb us
+    rows="$(ad_cscb_calls "${U_ID}" "${from}" "${to}")" || exit 1
     [[ -n "${rows}" ]] || return 0
     while IFS=$'\t' read -r pos time ppid verb _; do
         if [[ -n "${DRIVER_PID:-}" && "${ppid}" == "${DRIVER_PID}" ]]; then
@@ -485,7 +520,8 @@ status_rounds() {
             sed 's/^/  | /' <<< "${rows}" >&2
             fail "${step}: CSCB call ${verb} of ${U_ID} at shim line ${pos} from ${ppid}; after the latch only the bot server's (${LIFE2_PID}) status rounds may name the row"
         fi
-        printf '%s %s\n' "${pos}" "$(us_of "${time}")"
+        us="$(us_of "${time}")" || exit 1
+        printf '%s %s\n' "${pos}" "${us}"
     done <<< "${rows}"
 }
 
@@ -534,8 +570,6 @@ UNUSABLE_PHRASE="$(fmk_text UNUSABLE_RECORDED_NAME_PHRASE)" || fail "setup: fmk-
 UNUSABLE_HEAD="$(fmk_text UNUSABLE_NAME_NOTICE_HEAD)" || fail "setup: fmk-texts.ts could not print UNUSABLE_NAME_NOTICE_HEAD"
 UNUSABLE_POINTER="$(fmk_text UNUSABLE_NAME_NOTICE_POINTER)" || fail "setup: fmk-texts.ts could not print UNUSABLE_NAME_NOTICE_POINTER"
 HOLD_RECOVERY_HEAD="$(fmk_text HOLD_RECOVERY_HEAD)" || fail "setup: fmk-texts.ts could not print HOLD_RECOVERY_HEAD"
-CONFLICT_HEAD="$(fmk_text CONFLICT_NOTICE_FIRST_LINE_HEAD)" || fail "setup: fmk-texts.ts could not print CONFLICT_NOTICE_FIRST_LINE_HEAD"
-LAUNCH_START_HEAD="$(fmk_text LAUNCH_START_NOTICE_HEAD)" || fail "setup: fmk-texts.ts could not print LAUNCH_START_NOTICE_HEAD"
 CLASS_UNUSABLE="$(fmk_text AD_ERROR_CLASS_UNUSABLE_NAME)" || fail "setup: fmk-texts.ts could not print AD_ERROR_CLASS_UNUSABLE_NAME"
 PREFIX="$(fmk_text personaNoticePrefix "${U_NAME}")" || fail "setup: fmk-texts.ts could not print personaNoticePrefix"
 [[ -n "${UNUSABLE_PHRASE}" && -n "${UNUSABLE_HEAD}" && -n "${HOLD_RECOVERY_HEAD}" && -n "${CLASS_UNUSABLE}" ]] \
@@ -573,6 +607,23 @@ LINE_A="$(fmk_text conflictLatchSetLine "${U_KEY}" "${CASE_UNUSABLE}" SESSIONSLO
 RELATCH_HEAD="${LINE_A%% — *}"
 [[ "${LATCH_HEAD}" == *"=${U_KEY} "* && "${RELATCH_HEAD}" == *"=${U_KEY} "* && "${LATCH_HEAD}" != "${RELATCH_HEAD}"* ]] \
     || fail "setup: the latch-set and relatch fragments '${LATCH_HEAD}' and '${RELATCH_HEAD}' do not name U's key apart"
+# The lead every conflict-latch line shares, whoever it is for: what a
+# latch-set line and a re-check round line have in common.
+LATCH_LINE_LEAD="$(common_prefix "${LATCH_HEAD}" "${ROUND_HEAD}")"
+[[ -n "${LATCH_LINE_LEAD}" && "${LATCH_LINE_LEAD}" != *"${U_KEY}"* ]] \
+    || fail "setup: the latch-set and round lines share '${LATCH_LINE_LEAD}', not a lead free of U's key"
+
+# The counted launch-failure lines' fragments for U. src/restart.ts logs each
+# from a template literal with no exported builder, so each is first found,
+# whole up to the key, in the installed package's src/restart.ts: a rewording
+# fails the script instead of leaving a count of 0 that cannot fail.
+RESTART_SRC="${PKG_DIR}/src/restart.ts"
+COUNTED_FAILURE_LEADS=('[slack] Launch failed for persona=' '[slack] Session relaunch failed for persona=')
+for lead in "${COUNTED_FAILURE_LEADS[@]}"; do
+    # shellcheck disable=SC2016 # `${key}` is the source's own text.
+    grep -qF -- "\`${lead}"'${key}' "${RESTART_SRC}" \
+        || fail "setup: ${RESTART_SRC} logs no counted launch-failure line '${lead}\${key}…'"
+done
 echo "${TEST_NAME}: ${U_ID} in ${U_SESSION}; unusable name ${U_UNUSABLE}; re-check interval ${INTERVAL_MS} ms, settle ${SETTLE_S} s"
 
 # ---------------------------------------------------------------------------
@@ -581,7 +632,7 @@ echo "${TEST_NAME}: ${U_ID} in ${U_SESSION}; unusable name ${U_UNUSABLE}; re-che
 
 # Step 1: the first life, U's worker ended by hand, then stop --stop-bots.
 step_first_life() {
-    local step="step 1: first life" creds rows verb n
+    local step="step 1: first life" creds calls rows verb n
     creds="${SCENARIO_ROOT}/credentials"
     mkdir -m 700 "${creds}"
     U_WORK="$(make_workdir "${U_KEY}")"
@@ -607,14 +658,16 @@ EOF
     CONNECTED="$(matcher "[slack] Session connected: persona ${U_REF}")"
     start_server --live
     LIFE1_PID="${SERVER_PID}"
-    wait_for_count "$(completion_match 1)" 1 "${START_WAIT_S}" "${step}: the start pass never completed"
+    wait_for_count "${COMPLETED}" 1 "${START_WAIT_S}" "${step}: the start pass never completed"
     expect_completion 1 "${step}" "0 not brought up"
     wait_row "${step}: the report-in" "${REPORT_WAIT_S}" "${U_ID}" waiting
     U_SID="${ROW_SID}"
     [[ -n "${U_SID}" ]] || fail "${step}: the live row ${U_ID} has no claude_session_id"
     [[ "${ROW_SESSION}" == "${U_SESSION}" ]] || fail "${step}: the live row records session '${ROW_SESSION}', not ${U_SESSION}"
     wait_for_count "${CONNECTED}" 1 "${CONNECT_WAIT_S}" "${step}: the server never registered the stub's session as ${U_KEY}'s"
-    rows="$(server_rows "${LIFE1_PID}" "$(verb_rows send-keys "$(ad_cscb_calls "${U_ID}")")")"
+    calls="$(ad_cscb_calls "${U_ID}")" || exit 1
+    rows="$(verb_rows send-keys "${calls}")"
+    rows="$(server_rows "${LIFE1_PID}" "${rows}")"
     (( $(rows_count "${rows}") >= 1 )) || fail "${step}: no bot-server send-keys of ${U_ID} (the approver's Enter)"
     echo "${TEST_NAME}: ${step}: ${U_ID} reads waiting, claude_session_id ${U_SID}, session ${U_SESSION}"
 
@@ -626,7 +679,7 @@ EOF
     row_reads "${step}" "${U_ID}" ended missing || fail "${step}: ${U_ID} reads '${ROW_STATE}', not ended or missing"
     [[ "${ROW_SID}" == "${U_SID}" ]] || fail "${step}: ${U_ID}'s claude_session_id is '${ROW_SID}', not ${U_SID}"
     ! has_session "${U_SESSION}" || fail "${step}: session ${U_SESSION} is there"
-    rows="$(ad_cscb_calls "${U_ID}" "${EXIT_MARK}")"
+    rows="$(ad_cscb_calls "${U_ID}" "${EXIT_MARK}")" || exit 1
     for verb in resume spawn; do
         n="$(rows_count "$(verb_rows "${verb}" "${rows}")")"
         (( n == 0 )) || fail "${step}: ${n} CSCB ${verb} call(s) of ${U_ID} after the worker's exit"
@@ -671,7 +724,7 @@ other_row_unusable() {
 # Step 2b [harness]: the other caller's row, spawned by the harness and then
 # edited (SRJ-1427 bullet 2).
 step_other_row() {
-    local step="step 2: the other caller's row" dir pid
+    local step="step 2: the other caller's row" dir pid out
     [[ -z "$(server_pid)" ]] || fail "${step}: a server is running"
     dir="$(make_workdir other)"
     stub_mode "${dir}" "${STUB_MODE_SILENT}"
@@ -680,8 +733,11 @@ step_other_row() {
         sed 's/^/  | /' "${AD_OUT}" "${AD_ERR}" >&2
         fail "${step}: the harness spawn of ${OTHER_ID} exited ${AD_RC}"
     fi
-    pid="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${OTHER_SESSION}:" '#{pane_pid}' 2> /dev/null)" \
+    out="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${OTHER_SESSION}:" '#{session_id} #{window_id} #{pane_id} #{pane_pid}' 2> /dev/null)" \
         || fail "${step}: no session ${OTHER_SESSION} on the scenario's tmux server"
+    read -r OTHER_SID OTHER_WID OTHER_PANE pid <<< "${out}"
+    [[ "${OTHER_SID}" =~ ^\$[0-9]+$ && "${OTHER_WID}" =~ ^@[0-9]+$ && "${OTHER_PANE}" =~ ^%[0-9]+$ && "${pid}" =~ ^[0-9]+$ ]] \
+        || fail "${step}: tmux gave '${out}' for session ${OTHER_SESSION}"
     wait_until "${OTHER_WAIT_S}" "${step}: the other caller's pane process ${pid} never became the stub" stub_running "${pid}"
     read_row "${step}" "${OTHER_ID}"
     [[ "${ROW_STATE}" == pending ]] || fail "${step}: ${OTHER_ID} reads '${ROW_STATE}', not pending"
@@ -691,19 +747,20 @@ step_other_row() {
     [[ "${ROW_STATE}" == waiting && "${ROW_SESSION}" == "${OTHER_UNUSABLE}" && -z "${ROW_NOTE}" ]] \
         || fail "${step}: ${OTHER_ID} reads '${ROW_STATE}' in '${ROW_SESSION}' with note '${ROW_NOTE}', not waiting in ${OTHER_UNUSABLE} with no note"
     OTHER_SEED_MARK="$(ad_shim_mark)"
-    echo "${TEST_NAME}: ${step}: ${OTHER_ID} reads waiting, recorded session ${OTHER_UNUSABLE}, no note; its stub ${pid} runs in ${OTHER_SESSION}; seeding mark ${OTHER_SEED_MARK}"
+    OTHER_SEED_TMUX_MARK="$(tmux_shim_mark)"
+    echo "${TEST_NAME}: ${step}: ${OTHER_ID} reads waiting, recorded session ${OTHER_UNUSABLE}, no note; its stub ${pid} runs in ${OTHER_SESSION} (${OTHER_SID}, window ${OTHER_WID}, pane ${OTHER_PANE}); seeding marks ${OTHER_SEED_MARK} and tmux ${OTHER_SEED_TMUX_MARK}"
 }
 
 # Step 3a: the second life's start; U latches.
 step_latch() {
     local step="step 3a: U latches" completions rows unusable_line verb
-    POSTS_BEFORE="$(post_count)"
+    POSTS_BEFORE="$(post_count)" || exit 1
     LIFE2_MARK="$(ad_shim_mark)"
     LIFE2_TMUX_MARK="$(tmux_shim_mark)"
-    completions="$(count_log "$(completion_match 1)")"
+    completions="$(count_log "${COMPLETED}")"
     start_server --live
     LIFE2_PID="${SERVER_PID}"
-    wait_for_count "$(completion_match 1)" "$(( completions + 1 ))" "${START_WAIT_S}" "${step}: the start pass never completed"
+    wait_for_count "${COMPLETED}" "$(( completions + 1 ))" "${START_WAIT_S}" "${step}: the start pass never completed"
     LATCH_SET="$(fmk_text conflictLatchSetLine "${U_KEY}" "${CASE_UNUSABLE}" "${U_UNUSABLE}" "${OP_NONE}" "${U_FINISHED_STATE}")" \
         || fail "${step}: fmk-texts.ts could not print conflictLatchSetLine"
     wait_for_count "${LATCH_SET}" 1 "${START_WAIT_S}" "${step}: no latch-set line '${LATCH_SET}'"
@@ -712,7 +769,7 @@ step_latch() {
     expect_count "${LATCH_SET}" 1 "${step}: latch-set lines"
     expect_count "${LATCH_HEAD}" 1 "${step}: latch-set lines for ${U_KEY}"
     expect_completion 1 "${step}" "0 failed" "1 latched"
-    echo "${TEST_NAME}: ${step}: $(_scenario_scan lastline "${SLACK_STATE_DIR}/server.log" "$(completion_match 1)" | sed 's/^.*\] //')"
+    echo "${TEST_NAME}: ${step}: $(_scenario_scan lastline "${SLACK_STATE_DIR}/server.log" "${COMPLETED}" | sed 's/^.*\] //')"
 
     # The server's UNUSABLE NAME line for U: agent-director's ErrInternal,
     # with the description, latched.
@@ -722,7 +779,7 @@ step_latch() {
     # The bring-up's one resume, the bot server's; no reuse spawn, kill or
     # delete. The ladder's earlier calls (its plain spawn, which the existing
     # row refuses as a collision, and the get after it) are recorded.
-    rows="$(ad_cscb_calls "${U_ID}" "${LIFE2_MARK}" "${LATCH_MARK}")"
+    rows="$(ad_cscb_calls "${U_ID}" "${LIFE2_MARK}" "${LATCH_MARK}")" || exit 1
     echo "${TEST_NAME}: ${step}: CSCB calls of ${U_ID} up to the latch (recorded, not asserted): $(field_of 4 "${rows}" | tr '\n' ' ')"
     [[ " $(field_of 6 "$(verb_rows spawn "${rows}")" | tr '\n' ' ') " != *" --reuse-finished "* ]] \
         || fail "${step}: a CSCB reuse spawn of ${U_ID} before the latch"
@@ -732,17 +789,18 @@ step_latch() {
     rows="$(verb_rows resume "${rows}")"
     (( $(rows_count "${rows}") == 1 )) || fail "${step}: $(rows_count "${rows}") CSCB resume call(s) of ${U_ID} before the latch, not one"
     [[ -n "$(server_rows "${LIFE2_PID}" "${rows}")" ]] || fail "${step}: the resume of ${U_ID} is not the bot server's"
-    RESUME_US="$(us_of "$(field_of 2 "${rows}")")"
+    RESUME_US="$(us_of "$(field_of 2 "${rows}")")" || exit 1
     echo "${TEST_NAME}: ${step}: the bot server's resume at shim line $(field_of 1 "${rows}") was refused; latch mark ${LATCH_MARK}, tmux mark ${LATCH_TMUX_MARK}"
 }
 
 # Step 3b: one unusable-name notice, naming no command.
 step_notice() {
-    local step="step 3b: the unusable-name notice" notice desc
+    local step="step 3b: the unusable-name notice" notice desc posts
     wait_until "${NOTICE_WAIT_S}" "${step}: no unusable-name notice on ${U_CHANNEL}" \
         posts_holding_at_least "${POSTS_BEFORE}" "${UNUSABLE_HEAD}" 1
-    (( $(post_count) == POSTS_BEFORE + 1 )) \
-        || fail "${step}: ${U_CHANNEL} got $(( $(post_count) - POSTS_BEFORE )) posts since the second life began, not one"
+    posts="$(post_count)" || exit 1
+    (( posts == POSTS_BEFORE + 1 )) \
+        || fail "${step}: ${U_CHANNEL} got $(( posts - POSTS_BEFORE )) posts since the second life began, not one"
     posts_holding 0 "${UNUSABLE_HEAD}"
     (( ${#HOLDING[@]} == 1 )) || fail "${step}: ${#HOLDING[@]} posts hold the unusable-name notice head, not one"
     notice="${HOLDING[0]}"
@@ -754,7 +812,8 @@ step_notice() {
     desc="${desc%"${NOTICE_AFTER}"}"
     [[ "${desc}" == *"${UNUSABLE_PHRASE}"* && "${desc}" == *"${U_UNUSABLE}"* ]] \
         || fail "${step}: the quoted description does not say '${UNUSABLE_PHRASE}' and name ${U_UNUSABLE}: ${desc}"
-    POSTS_AT_LATCH="$(post_count)"
+    NOTICE_POST="${notice}"
+    POSTS_AT_LATCH="$(post_count)" || exit 1
     echo "${TEST_NAME}: ${step}: one notice; agent-director said: ${desc}"
 }
 
@@ -789,7 +848,8 @@ step_forced_reuse() {
     # The driver's record entry (role run), whose PID is the driver's own.
     DRIVER_PID="$(awk -F'\t' '$1 == "proc" && $2 == "run" && index($6, "fmk-driver.ts reuse-spawn") { p = $3 } END { print p }' "${SCENARIO_CSCB_RECORD}")"
     [[ "${DRIVER_PID}" =~ ^[0-9]+$ ]] || fail "${step}: the record holds no run entry for the driver"
-    rows="$(server_rows "${DRIVER_PID}" "$(ad_cscb_calls "${U_ID}" "${DRIVER_MARK}" "${DRIVER_END_MARK}")")"
+    rows="$(ad_cscb_calls "${U_ID}" "${DRIVER_MARK}" "${DRIVER_END_MARK}")" || exit 1
+    rows="$(server_rows "${DRIVER_PID}" "${rows}")"
     if (( $(rows_count "${rows}") != 1 )) || [[ "$(field_of 4 "${rows}")" != spawn || " $(field_of 6 "${rows}") " != *" --reuse-finished "* ]]; then
         sed 's/^/  | /' <<< "${rows}" >&2
         fail "${step}: the driver's calls of ${U_ID} are not one spawn carrying --reuse-finished"
@@ -801,20 +861,21 @@ step_forced_reuse() {
 
 # Step 3d: STATUS_ROUNDS status-only rounds at the cadence, with no post.
 step_status_rounds() {
-    local n step rounds pos us prev="${RESUME_US}"
+    local n step rounds pos us posts prev="${RESUME_US}"
     for (( n = 1; n <= STATUS_ROUNDS; n++ )); do
         step="step 3d: round ${n} (status only)"
         wait_for_count "${ROUND_HEAD}" "${n}" $(( INTERVAL_S + SETTLE_S + SETTLE_S )) "${step}: no round line ${n}"
         expect_count "${ROUND_STILL}" "${n}" "${step}: status-only round lines"
-        rounds="$(status_rounds "${step}" "${LATCH_MARK}")"
+        rounds="$(status_rounds "${step}" "${LATCH_MARK}")" || exit 1
         (( $(rows_count "${rounds}") == n )) || fail "${step}: $(rows_count "${rounds}") status call(s) of ${U_ID} after the latch, not ${n}"
         read -r pos us <<< "$(tail -n 1 <<< "${rounds}")"
         check_cadence "${step}" "${prev}" "${us}"
         prev="${us}"
         expect_count "${LATCH_HEAD}" 1 "${step}: latch-set lines for ${U_KEY}"
         expect_count "${RELATCH_HEAD}" 0 "${step}: relatch lines for ${U_KEY}"
-        (( $(post_count) == POSTS_AT_LATCH )) \
-            || fail "${step}: ${U_CHANNEL} holds $(post_count) posts, not the ${POSTS_AT_LATCH} it held at the latch"
+        posts="$(post_count)" || exit 1
+        (( posts == POSTS_AT_LATCH )) \
+            || fail "${step}: ${U_CHANNEL} holds ${posts} posts, not the ${POSTS_AT_LATCH} it held at the latch"
         echo "${TEST_NAME}: ${step}: status at shim line ${pos}"
     done
     LAST_STATUS_US="${prev}"
@@ -822,24 +883,23 @@ step_status_rounds() {
 
 # Steps 3e and 3f: no tmux line since the latch; nothing counted.
 step_no_tmux_nothing_counted() {
-    local step="step 3e: no tmux call" target found post
+    local step="step 3e: no tmux call" target found lead
     TMUX_AT_DELETE="$(tmux_shim_mark)"
     if (( TMUX_AT_DELETE != LATCH_TMUX_MARK )); then
         tail -n "+$(( LATCH_TMUX_MARK + 1 ))" "${SCENARIO_TMUX_SHIM_LOG}" | sed 's/^/  | /' >&2
         fail "${step}: the tmux shim's log holds $(( TMUX_AT_DELETE - LATCH_TMUX_MARK )) line(s) from the latch to the delete"
     fi
     for target in "${U_SESSION}" "${U_UNUSABLE}"; do
-        found="$(tmux_shim_targets "${target}" "${LIFE2_TMUX_MARK}" "${TMUX_AT_DELETE}")"
+        found="$(tmux_shim_targets "${target}" "${LIFE2_TMUX_MARK}" "${TMUX_AT_DELETE}")" || exit 1
         [[ -z "${found}" ]] || { sed 's/^/  | /' <<< "${found}" >&2; fail "${step}: tmux shim line(s) act on ${target} in the second life"; }
     done
     echo "${TEST_NAME}: ${step}: the tmux shim's log is at line ${TMUX_AT_DELETE}, as at the latch"
 
+    # No spawn-failure post needs a check of its own: 3b and 3d hold U's
+    # channel to the one notice since the second life began.
     step="step 3f: nothing counted"
-    expect_count "[slack] Launch failed for persona=${U_KEY}" 0 "${step}: counted launch-failure lines"
-    expect_count "[slack] Session relaunch failed for persona=${U_KEY}" 0 "${step}: counted relaunch-failure lines"
-    posts_of "${SCENARIO_ROOT}/posts-all.bin"
-    for post in ${POSTS[@]+"${POSTS[@]}"}; do
-        [[ "${post}" != *"Spawn failure:"* ]] || { printf '  | %q\n' "${post}" >&2; fail "${step}: a spawn-failure notice on ${U_CHANNEL}"; }
+    for lead in "${COUNTED_FAILURE_LEADS[@]}"; do
+        expect_count "${lead}${U_KEY}" 0 "${step}: counted launch-failure lines '${lead}${U_KEY}'"
     done
 }
 
@@ -854,7 +914,7 @@ step_delete() {
 # Steps 3h and 3i: the next round's status finds no row; the latch clears with
 # one recovery post, and U comes up fresh.
 step_clear_fresh() {
-    local step="step 3h: the clear" cleared recovery rows s_pos s_time s_ppid s_verb spawns n verb connections between
+    local step="step 3h: the clear" cleared recovery rows s_pos s_time s_ppid s_verb s_us spawns n verb connections between out
     connections="$(count_log "${CONNECTED}")"
     wait_for_count "${ROUND_CLEAR_HEAD}" 1 $(( INTERVAL_S + SETTLE_S + SETTLE_S )) "${step}: no clearing round line after the delete"
     expect_count "${ROUND_CLEAR_HEAD}" 1 "${step}: clearing round lines"
@@ -884,16 +944,23 @@ step_clear_fresh() {
     [[ "${ROW_SESSION}" == "${U_SESSION}" ]] || fail "${step}: the row records session '${ROW_SESSION}', not ${U_SESSION}"
     U_FRESH_SID="${ROW_SID}"
     wait_for_count "${CONNECTED}" "$(( connections + 1 ))" "${CONNECT_WAIT_S}" "${step}: the server never registered the fresh stub's session as ${U_KEY}'s"
+    # The fresh session's tmux ids (step 4's positive control).
+    out="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${U_SESSION}:" '#{session_id} #{window_id} #{pane_id}' 2> /dev/null)" \
+        || fail "${step}: no session ${U_SESSION} on the scenario's tmux server"
+    read -r U_FRESH_TMUX_SID U_FRESH_WID U_FRESH_PANE <<< "${out}"
+    [[ "${U_FRESH_TMUX_SID}" =~ ^\$[0-9]+$ && "${U_FRESH_WID}" =~ ^@[0-9]+$ && "${U_FRESH_PANE}" =~ ^%[0-9]+$ ]] \
+        || fail "${step}: tmux gave '${out}' for session ${U_SESSION}"
 
     # The bot server's calls of U's row after the delete: the clearing
     # round's status first, at the cadence, then one plain spawn.
-    rows="$(ad_cscb_calls "${U_ID}" "${DELETE_MARK}")"
+    rows="$(ad_cscb_calls "${U_ID}" "${DELETE_MARK}")" || exit 1
     echo "${TEST_NAME}: ${step}: CSCB calls of ${U_ID} after the delete (recorded, not asserted): $(field_of 4 "${rows}" | tr '\n' ' ')"
     [[ "$(rows_count "${rows}")" == "$(rows_count "$(server_rows "${LIFE2_PID}" "${rows}")")" ]] \
         || fail "${step}: a CSCB call of ${U_ID} after the delete is not the bot server's"
     IFS=$'\t' read -r s_pos s_time s_ppid s_verb _ <<< "$(sed -n 1p <<< "${rows}")"
     [[ "${s_verb}" == status ]] || fail "${step}: the bot server's first call of ${U_ID} after the delete is '${s_verb}', not the round's status"
-    check_cadence "step 3h: the clearing round" "${LAST_STATUS_US}" "$(us_of "${s_time}")"
+    s_us="$(us_of "${s_time}")" || exit 1
+    check_cadence "step 3h: the clearing round" "${LAST_STATUS_US}" "${s_us}"
     spawns="$(verb_rows spawn "${rows}")"
     if (( $(rows_count "${spawns}") != 1 )) || [[ " $(field_of 6 "${spawns}") " == *" --reuse-finished "* ]]; then
         sed 's/^/  | /' <<< "${rows}" >&2
@@ -903,25 +970,30 @@ step_clear_fresh() {
         n="$(rows_count "$(verb_rows "${verb}" "${rows}")")"
         (( n == 0 )) || fail "${step}: ${n} CSCB ${verb} call(s) of ${U_ID} after the delete"
     done
-    between="$(ad_cscb_verb_between find-missing "${s_pos}" "$(field_of 1 "${spawns}")")"
-    [[ -n "${between}" ]] || fail "${step}: no CSCB find-missing between the clearing round's status and the plain spawn"
+    # The step-1 clear's one bypassing find-missing, and no other.
+    between="$(ad_cscb_verb_between find-missing "${s_pos}" "$(field_of 1 "${spawns}")")" || exit 1
+    n="$(rows_count "${between}")"
+    if (( n != 1 )); then
+        [[ -z "${between}" ]] || sed 's/^/  | /' <<< "${between}" >&2
+        fail "${step}: ${n} CSCB find-missing call(s) between the clearing round's status and the plain spawn, not one"
+    fi
 
-    # U's channel: only the notice and the recovery post since the second life.
+    # U's channel: exactly the notice and the recovery post since the second
+    # life began, in that order, each matched whole (so no spawn-failure,
+    # CONFLICT or launch-start notice).
     posts_of "${SCENARIO_ROOT}/posts-end.bin"
     (( ${#POSTS[@]} == POSTS_BEFORE + 2 )) \
         || fail "${step}: ${U_CHANNEL} got $(( ${#POSTS[@]} - POSTS_BEFORE )) posts since the second life began, not the notice and the recovery post"
-    for (( n = POSTS_BEFORE; n < ${#POSTS[@]}; n++ )); do
-        [[ "${POSTS[n]}" != *"${CONFLICT_HEAD}"* && "${POSTS[n]}" != *"${LAUNCH_START_HEAD}"* ]] \
-            || fail "${step}: a CONFLICT or launch-start notice on ${U_CHANNEL}"
-    done
+    [[ "${POSTS[POSTS_BEFORE]}" == "${NOTICE_POST}" && "${POSTS[POSTS_BEFORE + 1]}" == "${recovery}" ]] \
+        || fail "${step}: the posts on ${U_CHANNEL} since the second life began are not the unusable-name notice, then the recovery post"
     echo "${TEST_NAME}: ${step}: ${U_ID} reads waiting with the fresh claude_session_id ${U_FRESH_SID}; one recovery post"
 }
 
 # Step 4: the other caller's row got its note from a CSCB find-missing, and
 # CSCB ignored it.
 step_other_ignored() {
-    local step="step 4: the other caller's row ignored" fm target n
-    fm="$(ad_cscb_verb_between find-missing "${OTHER_SEED_MARK}" -)"
+    local step="step 4: the other caller's row ignored" fm target n found control=""
+    fm="$(ad_cscb_verb_between find-missing "${OTHER_SEED_MARK}" -)" || exit 1
     [[ -n "${fm}" ]] || fail "${step}: positive control: no CSCB find-missing after the seeding"
     echo "${TEST_NAME}: ${step}: the first CSCB find-missing after the seeding is at shim line $(field_of 1 "$(sed -n 1p <<< "${fm}")") (the delete at ${DELETE_MARK}); $(rows_count "${fm}") in all"
     read_row "${step}" "${OTHER_ID}"
@@ -929,16 +1001,39 @@ step_other_ignored() {
         || fail "${step}: ${OTHER_ID}'s liveness note reads '${ROW_NOTE}', not tmux_session_name_rewritten"
     [[ "${ROW_STATE}" == waiting && "${ROW_SESSION}" == "${OTHER_UNUSABLE}" ]] \
         || fail "${step}: ${OTHER_ID} reads '${ROW_STATE}' in '${ROW_SESSION}', not waiting in ${OTHER_UNUSABLE}"
-    (( $(cscb_ad_count "" "${U_ID}") > 0 )) || fail "${step}: positive control: no CSCB call's arguments hold ${U_ID}"
-    for target in "${OTHER_ID}" "${OTHER_UNUSABLE}" "${OTHER_SESSION}"; do
-        n="$(cscb_ad_count "" "${target}")"
+    # Positive controls of the three readers: U's id in CSCB's calls, U's
+    # unusable name in a conflict-latch line, and in a post.
+    n="$(cscb_ad_count "" "${U_ID}")" || exit 1
+    (( n > 0 )) || fail "${step}: positive control: no CSCB call's arguments hold ${U_ID}"
+    n="$(count_log "$(matcher "${LATCH_LINE_LEAD}" "${U_UNUSABLE}")")"
+    (( n > 0 )) || fail "${step}: positive control: no conflict-latch line names ${U_UNUSABLE}"
+    n="$(record_posts_naming "${U_UNUSABLE}")" || exit 1
+    (( n > 0 )) || fail "${step}: positive control: no post in the Slack stub's record names ${U_UNUSABLE}"
+    # Fragments match as substrings, so the session name covers its unusable
+    # form too.
+    for target in "${OTHER_ID}" "${OTHER_SESSION}"; do
+        n="$(cscb_ad_count "" "${target}")" || exit 1
         (( n == 0 )) || { cscb_ad_calls "" "${target}" | sed 's/^/  | /' >&2; fail "${step}: ${n} CSCB call(s) name ${target}"; }
-        n="$(count_log "$(matcher "conflict-latch: " "${target}")")"
+        n="$(count_log "$(matcher "${LATCH_LINE_LEAD}" "${target}")")"
         (( n == 0 )) || fail "${step}: ${n} conflict-latch line(s) name ${target}"
-        n="$(record_posts_naming "${target}")"
+        n="$(record_posts_naming "${target}")" || exit 1
         (( n == 0 )) || fail "${step}: ${n} post(s) in the Slack stub's record name ${target}"
     done
-    echo "${TEST_NAME}: ${step}: ${OTHER_ID} carries ${ROW_NOTE}; no CSCB call, latch line or post names it"
+
+    # No tmux command CSCB caused, from the seeding on, reads from, types
+    # into, kills or respawns the other caller's session, by its name,
+    # session id, window id or pane id; positive control: such commands act
+    # on U's fresh session (the approver's Enter, after the delete).
+    for target in "${OTHER_SESSION}" "${OTHER_SID}" "${OTHER_WID}" "${OTHER_PANE}"; do
+        found="$(tmux_shim_targets "${target}" "${OTHER_SEED_TMUX_MARK}")" || exit 1
+        [[ -z "${found}" ]] || { sed 's/^/  | /' <<< "${found}" >&2; fail "${step}: tmux shim line(s) act on the other caller's ${target}"; }
+    done
+    for target in "${U_SESSION}" "${U_FRESH_TMUX_SID}" "${U_FRESH_WID}" "${U_FRESH_PANE}"; do
+        found="$(tmux_shim_targets "${target}" "${TMUX_AT_DELETE}")" || exit 1
+        [[ -z "${found}" ]] || control+="${target}: $(field_of 4 "${found}" | sort | uniq -c | tr -s ' \n' ' ')"
+    done
+    [[ -n "${control}" ]] || fail "${step}: positive control: tmux_shim_targets found no command acting on U's fresh ${U_SESSION}, ${U_FRESH_TMUX_SID}, ${U_FRESH_WID} or ${U_FRESH_PANE}"
+    echo "${TEST_NAME}: ${step}: ${OTHER_ID} carries ${ROW_NOTE}; no CSCB call, latch line, post or tmux command names it; tmux commands acting on U's fresh session: ${control}"
 }
 
 start_slack_stub "${SCENARIO_ROOT}/slack-stub" "${TOKEN_LABEL}"
@@ -960,7 +1055,7 @@ stop_server --stop-bots
 read_row "end" "${U_ID}"
 [[ -n "${ROW_STATE}" && "${ROW_SID}" == "${U_FRESH_SID}" ]] || fail "end: ${U_ID} reads '${ROW_STATE}' (${ROW_SID}) at the end"
 echo "${TEST_NAME}: end: ${U_ID} is present, reading ${ROW_STATE}"
-DELETES="$(delete_lines)"
+DELETES="$(delete_lines)" || exit 1
 if (( $(rows_count "${DELETES}") != 1 )) || [[ "$(field_of 2 "${DELETES}")" != "$$" || "$(field_of 3 "${DELETES}")" != harness \
     || "$(field_of 4 "${DELETES}")" != "${SCENARIO_SHELL_CMDLINE}" ]]; then
     sed 's/^/  | /' <<< "${DELETES}" >&2

@@ -173,7 +173,8 @@
 # (`/mcp reconnect slack-channel-router`) into a persona's pane to reconnect
 # it, opens a new session, as the real `claude` reconnects: a client still
 # running then (one whose server restarted before its next ping noticed) is
-# ended first, with SIGTERM, and waited for.
+# ended first, with SIGTERM, then SIGKILL if it still runs 3 s later, and
+# reaped, so a reconnect never holds the stub's read loop longer than that.
 # No session is opened when the client is not beside the stub (Test 4, Test 10
 # and Test 12, which copy only the stub), when the stub was given no
 # `--mcp-config`, or in a mode that has not reported in (`silent`, a dialog not
@@ -576,11 +577,24 @@ open_mcp_session() {
     MCP_PID=$!
 }
 
-# reconnect_mcp_session: `/mcp reconnect`: end the client if one still runs,
-# then open a new session.
+# How long `/mcp reconnect` waits for a still-running client to end on
+# SIGTERM before it sends SIGKILL, in tenths of a second.
+MCP_END_WAIT_TENTHS=30
+
+# reconnect_mcp_session: `/mcp reconnect`: end the client if one still runs
+# (SIGTERM; SIGKILL when it has not ended within MCP_END_WAIT_TENTHS), reap
+# it, then open a new session.
 reconnect_mcp_session() {
+    local i
     if mcp_session_running; then
         kill -TERM "${MCP_PID}" 2> /dev/null
+        for (( i = 0; i < MCP_END_WAIT_TENTHS; i++ )); do
+            mcp_session_running || break
+            sleep 0.1
+        done
+        if mcp_session_running; then
+            kill -KILL "${MCP_PID}" 2> /dev/null
+        fi
         wait "${MCP_PID}" 2> /dev/null
         MCP_PID=""
     fi

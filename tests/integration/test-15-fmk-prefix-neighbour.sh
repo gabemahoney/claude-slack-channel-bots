@@ -48,9 +48,10 @@
 #   4. [harness] With the server stopped, the harness spawns the neighbour
 #      (`ad_capture spawn`, from the scenario's shell): session
 #      `<dev's session name>_x`, which is `slack_bot_dev_x`, in a working
-#      directory of its own. Its session id, pane id and pane process are
-#      recorded; the pane process is the stub; a harness `get` reads the row
-#      `pending` with no label. The tmux shim's position is marked here.
+#      directory of its own. Its session id, window id, pane id and pane
+#      process are recorded; the pane process is the stub; a harness `get`
+#      reads the row `pending` with no label. The tmux shim's position is
+#      marked here.
 #   5. Second life: the live start makes one `resume` of `dev`'s row (parent
 #      the bot server; for a row still reading `waiting`, after its reconnect
 #      `send-keys` finds the worker gone, the dead evidence the resume needs);
@@ -65,18 +66,20 @@
 #      server registers `dev`'s session again, the row still `waiting` with
 #      the same claude_session_id. Then `stop --stop-bots`.
 #   7. Checks (each a stated `fail` step; each reader also finds a line it
-#      must find):
+#      must find; each reader's output is saved by its own assignment before
+#      it is filtered or counted, so a reader that fails stops the script):
 #      - every CSCB-parented agent-director call that carries an instance id
 #        (`ad_cscb_calls '*'`) names exactly `dev`'s; no CSCB-parented call's
 #        arguments hold the neighbour's instance id or session name
 #        (`cscb_ad_count`); positive control: calls naming `dev`'s id exist;
 #      - `tmux_shim_targets`, from step 4's mark, finds no command that reads
 #        from, types into, kills or respawns the neighbour's session name,
-#        session id or pane id; positive control: it finds such commands for
-#        `dev`'s second-life session or pane;
+#        session id, window id or pane id; positive control: it finds such
+#        commands for `dev`'s second-life session, session id, window id or
+#        pane id;
 #      - the neighbour's row still reads `pending`, its session still holds
-#        the same session id and pane, the pane process is the same stub
-#        process, alive, and agent-director's trail holds no `ad.hook.fired`
+#        the same session id, window and pane, the pane process is the same
+#        stub process, alive, and agent-director's trail holds no `ad.hook.fired`
 #        record for it (`ad_trail_events`); positive control: it holds one
 #        for `dev`;
 #      - `ad_cscb_verb_between` finds the start sweep's `list` in the second
@@ -151,6 +154,9 @@ NB_WAIT_S=10
 RECONNECT_WAIT_S=60
 
 FMK_TEXTS="${SCENARIO_FIXTURES}/fmk-texts.ts"
+
+# The start pass's completion line for one persona.
+COMPLETED="$(completion_match 1)" || exit 1
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -248,14 +254,15 @@ has_session() {
     "${SCENARIO_REAL_TMUX}" has-session -t "=$1" 2> /dev/null
 }
 
-# session_parts <step> <name>: set PART_SID, PART_PANE and PART_PID to the
-# session id, its pane id and the pane's process, read with the real tmux.
+# session_parts <step> <name>: set PART_SID, PART_WID, PART_PANE and
+# PART_PID to the session id, its window id, its pane id and the pane's
+# process, read with the real tmux.
 session_parts() {
     local out
-    out="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=$2:" '#{session_id} #{pane_id} #{pane_pid}' 2> /dev/null)" \
+    out="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=$2:" '#{session_id} #{window_id} #{pane_id} #{pane_pid}' 2> /dev/null)" \
         || fail "$1: no session $2 on the scenario's tmux server"
-    read -r PART_SID PART_PANE PART_PID <<< "${out}"
-    [[ "${PART_SID}" =~ ^\$[0-9]+$ && "${PART_PANE}" =~ ^%[0-9]+$ && "${PART_PID}" =~ ^[0-9]+$ ]] \
+    read -r PART_SID PART_WID PART_PANE PART_PID <<< "${out}"
+    [[ "${PART_SID}" =~ ^\$[0-9]+$ && "${PART_WID}" =~ ^@[0-9]+$ && "${PART_PANE}" =~ ^%[0-9]+$ && "${PART_PID}" =~ ^[0-9]+$ ]] \
         || fail "$1: tmux gave '${out}' for session $2"
 }
 
@@ -356,7 +363,7 @@ step_posts_control() {
 
 # Steps 1 and 2: the configuration and the first life.
 step_first_life() {
-    local step="step 2: first life" creds work rows
+    local step="step 2: first life" creds work calls rows
     creds="${SCENARIO_ROOT}/credentials"
     mkdir -m 700 "${creds}"
     work="$(make_workdir dev)"
@@ -382,7 +389,7 @@ EOF
     CONNECTED="$(matcher "[slack] Session connected: persona ${DEV_REF}")"
     start_server --live
     LIFE1_PID="${SERVER_PID}"
-    wait_for_count "$(completion_match 1)" 1 "${START_WAIT_S}" "${step}: the start pass never completed"
+    wait_for_count "${COMPLETED}" 1 "${START_WAIT_S}" "${step}: the start pass never completed"
     expect_completion 1 "${step}" "0 not brought up"
     wait_row "${step}: the report-in" "${REPORT_WAIT_S}" "${DEV_ID}" waiting
     DEV_SID="${ROW_SID}"
@@ -391,7 +398,9 @@ EOF
     [[ -n "${DEV_SESSION}" ]] || fail "${step}: the live row ${DEV_ID} names no tmux session"
     wait_for_count "${CONNECTED}" 1 "${CONNECT_WAIT_S}" "${step}: the server never registered the stub's session as dev's"
     # The approver cleared the dialog through agent-director on dev's row.
-    rows="$(server_rows "${LIFE1_PID}" "$(verb_rows send-keys "$(ad_cscb_calls "${DEV_ID}")")")"
+    calls="$(ad_cscb_calls "${DEV_ID}")" || exit 1
+    rows="$(verb_rows send-keys "${calls}")"
+    rows="$(server_rows "${LIFE1_PID}" "${rows}")"
     (( $(rows_count "${rows}") >= 1 )) || fail "${step}: no bot-server send-keys of ${DEV_ID}"
     echo "${TEST_NAME}: ${step}: ${DEV_ID} reads waiting, claude_session_id ${DEV_SID}, session ${DEV_SESSION}"
 }
@@ -421,6 +430,7 @@ step_make_neighbour() {
     fi
     session_parts "${step}" "${NB_SESSION}"
     NB_SID="${PART_SID}"
+    NB_WID="${PART_WID}"
     NB_PANE="${PART_PANE}"
     NB_PID="${PART_PID}"
     wait_until "${NB_WAIT_S}" "${step}: the neighbour's pane process ${NB_PID} never became the stub" stub_running "${NB_PID}"
@@ -429,62 +439,66 @@ step_make_neighbour() {
     [[ "${ROW_SESSION}" == "${NB_SESSION}" ]] || fail "${step}: ${NB_ID} records session '${ROW_SESSION}', not ${NB_SESSION}"
     [[ "$(jq -n --argjson l "${ROW_LABELS:-null}" '$l // [] | length')" == 0 ]] \
         || fail "${step}: ${NB_ID} carries labels ${ROW_LABELS}"
-    echo "${TEST_NAME}: ${step}: ${NB_ID} reads pending in ${NB_SESSION} (${NB_SID}, pane ${NB_PANE}, stub ${NB_PID}); tmux shim mark ${TMUX_MARK}"
+    echo "${TEST_NAME}: ${step}: ${NB_ID} reads pending in ${NB_SESSION} (${NB_SID}, window ${NB_WID}, pane ${NB_PANE}, stub ${NB_PID}); tmux shim mark ${TMUX_MARK}"
 }
 
 # Step 5: the second life resumes dev beside the neighbour.
 step_second_life() {
-    local step="step 5: second life" mark completions connections rows resume_pos n
+    local step="step 5: second life" mark completions connections rows resumes resume_pos n
     mark="$(ad_shim_mark)"
     LIFE2_MARK="${mark}"
-    completions="$(count_log "$(completion_match 1)")"
+    completions="$(count_log "${COMPLETED}")"
     connections="$(count_log "${CONNECTED}")"
     start_server --live
     LIFE2_PID="${SERVER_PID}"
-    wait_for_count "$(completion_match 1)" "$(( completions + 1 ))" "${START_WAIT_S}" "${step}: the start pass never completed"
+    wait_for_count "${COMPLETED}" "$(( completions + 1 ))" "${START_WAIT_S}" "${step}: the start pass never completed"
     expect_completion 1 "${step}" "0 not brought up"
     wait_row "${step}: the resume's report-in" "${REPORT_WAIT_S}" "${DEV_ID}" waiting
     [[ "${ROW_SID}" == "${DEV_SID}" ]] || fail "${step}: the resumed row's claude_session_id is '${ROW_SID}', not ${DEV_SID}"
     [[ "${ROW_SESSION}" == "${DEV_SESSION}" ]] || fail "${step}: the resumed row records session '${ROW_SESSION}', not ${DEV_SESSION}"
     wait_for_count "${CONNECTED}" "$(( connections + 1 ))" "${CONNECT_WAIT_S}" "${step}: the server never registered the resumed stub's session as dev's"
-    rows="$(ad_cscb_calls "${DEV_ID}" "${mark}")"
+    rows="$(ad_cscb_calls "${DEV_ID}" "${mark}")" || exit 1
     echo "${TEST_NAME}: ${step}: CSCB calls of ${DEV_ID} (recorded, not asserted): $(field_of 4 "${rows}" | tr '\n' ' ')"
-    n="$(rows_count "$(verb_rows resume "${rows}")")"
+    resumes="$(verb_rows resume "${rows}")"
+    n="$(rows_count "${resumes}")"
     (( n == 1 )) || fail "${step}: ${n} resume call(s) of ${DEV_ID} by CSCB, not one"
-    [[ -n "$(server_rows "${LIFE2_PID}" "$(verb_rows resume "${rows}")")" ]] \
+    [[ -n "$(server_rows "${LIFE2_PID}" "${resumes}")" ]] \
         || fail "${step}: the resume of ${DEV_ID} is not the bot server's"
-    resume_pos="$(field_of 1 "$(verb_rows resume "${rows}")")"
-    rows="$(server_rows "${LIFE2_PID}" "$(ad_cscb_calls "${DEV_ID}" "${resume_pos}")")"
+    resume_pos="$(field_of 1 "${resumes}")"
+    rows="$(ad_cscb_calls "${DEV_ID}" "${resume_pos}")" || exit 1
+    rows="$(server_rows "${LIFE2_PID}" "${rows}")"
     (( $(rows_count "$(verb_rows read-pane "${rows}")") >= 1 )) \
         || fail "${step}: no bot-server read-pane of ${DEV_ID} after its resume"
     (( $(rows_count "$(verb_rows send-keys "${rows}")") >= 1 )) \
         || fail "${step}: no bot-server send-keys of ${DEV_ID} after its resume (the approver's Enter)"
     session_parts "${step}" "${DEV_SESSION}"
     DEV_SID2="${PART_SID}"
+    DEV_WID2="${PART_WID}"
     DEV_PANE2="${PART_PANE}"
-    echo "${TEST_NAME}: ${step}: ${DEV_ID} resumed with claude_session_id ${ROW_SID} in ${DEV_SESSION} (${DEV_SID2}, pane ${DEV_PANE2})"
+    echo "${TEST_NAME}: ${step}: ${DEV_ID} resumed with claude_session_id ${ROW_SID} in ${DEV_SESSION} (${DEV_SID2}, window ${DEV_WID2}, pane ${DEV_PANE2})"
 }
 
 # Step 6: the restart leg, then stop --stop-bots.
 step_restart() {
-    local step="step 6: restart" mark completions connections keys rows n verb
+    local step="step 6: restart" mark completions connections keys calls rows n verb
     stop_server
     has_session "${DEV_SESSION}" || fail "${step}: a plain stop ended ${DEV_SESSION}"
     read_row "${step}" "${DEV_ID}"
     [[ "${ROW_STATE}" == waiting ]] || fail "${step}: after a plain stop ${DEV_ID} reads ${ROW_STATE}, not waiting"
     mark="$(ad_shim_mark)"
     RESTART_MARK="${mark}"
-    completions="$(count_log "$(completion_match 1)")"
+    completions="$(count_log "${COMPLETED}")"
     connections="$(count_log "${CONNECTED}")"
-    keys="$(rows_count "$(verb_rows send-keys "$(ad_cscb_calls "${DEV_ID}")")")"
+    calls="$(ad_cscb_calls "${DEV_ID}")" || exit 1
+    keys="$(rows_count "$(verb_rows send-keys "${calls}")")"
     start_server --live
     LIFE3_PID="${SERVER_PID}"
-    wait_for_count "$(completion_match 1)" "$(( completions + 1 ))" "${START_WAIT_S}" "${step}: the start pass never completed"
+    wait_for_count "${COMPLETED}" "$(( completions + 1 ))" "${START_WAIT_S}" "${step}: the start pass never completed"
     expect_completion 1 "${step}" "0 not brought up"
     wait_for_ad_cscb_call "${DEV_ID}" send-keys "$(( keys + 1 ))" "${RECONNECT_WAIT_S}" \
         "${step}: no reconnect send-keys of ${DEV_ID} after the restart"
     wait_for_count "${CONNECTED}" "$(( connections + 1 ))" "${CONNECT_WAIT_S}" "${step}: the server never registered dev's session again"
-    rows="$(ad_cscb_calls "${DEV_ID}" "${mark}")"
+    rows="$(ad_cscb_calls "${DEV_ID}" "${mark}")" || exit 1
     echo "${TEST_NAME}: ${step}: CSCB calls of ${DEV_ID} (recorded, not asserted): $(field_of 4 "${rows}" | tr '\n' ' ')"
     [[ -n "$(server_rows "${LIFE3_PID}" "$(verb_rows send-keys "${rows}")")" ]] \
         || fail "${step}: the reconnect send-keys of ${DEV_ID} is not the bot server's"
@@ -502,49 +516,54 @@ step_restart() {
 # Step 7: the checks.
 step_checks() {
     local step="step 7: checks" rows ids n target found control="" posts=() post file="${SCENARIO_ROOT}/dev-posts.bin"
+    local events completed
 
-    # CSCB's agent-director calls name dev's id only.
-    rows="$(ad_cscb_calls '*')"
+    # CSCB's agent-director calls name dev's id only. Each reader's output is
+    # saved by its own assignment, so a reader that fails stops the script.
+    rows="$(ad_cscb_calls '*')" || exit 1
     (( $(rows_count "${rows}") > 0 )) || fail "${step}: positive control: no CSCB call carries an instance id"
     ids="$(field_of 5 "${rows}" | sort -u | tr '\n' ' ')"
     [[ "${ids}" == "${DEV_ID} " ]] || fail "${step}: CSCB calls carry the instance ids '${ids% }', not only ${DEV_ID}"
-    (( $(cscb_ad_count "" "${DEV_ID}") > 0 )) || fail "${step}: positive control: no CSCB call's arguments hold ${DEV_ID}"
+    n="$(cscb_ad_count "" "${DEV_ID}")" || exit 1
+    (( n > 0 )) || fail "${step}: positive control: no CSCB call's arguments hold ${DEV_ID}"
     for target in "${NB_ID}" "${NB_SESSION}"; do
-        n="$(cscb_ad_count "" "${target}")"
+        n="$(cscb_ad_count "" "${target}")" || exit 1
         (( n == 0 )) || { cscb_ad_calls "" "${target}" | sed 's/^/  | /' >&2; fail "${step}: ${n} CSCB call(s) name ${target}"; }
     done
     echo "${TEST_NAME}: ${step}: $(rows_count "${rows}") CSCB call(s) carry an instance id, every one ${DEV_ID}"
 
     # The id-less reader: each start's sweep lists the store, between the marks.
-    (( $(rows_count "$(ad_cscb_verb_between list "${LIFE2_MARK}" "${RESTART_MARK}")") >= 1 )) \
-        || fail "${step}: positive control: no CSCB list call in the second life"
-    (( $(rows_count "$(ad_cscb_verb_between list "${RESTART_MARK}" -)") >= 1 )) \
-        || fail "${step}: positive control: no CSCB list call in the restart leg"
+    found="$(ad_cscb_verb_between list "${LIFE2_MARK}" "${RESTART_MARK}")" || exit 1
+    (( $(rows_count "${found}") >= 1 )) || fail "${step}: positive control: no CSCB list call in the second life"
+    found="$(ad_cscb_verb_between list "${RESTART_MARK}" -)" || exit 1
+    (( $(rows_count "${found}") >= 1 )) || fail "${step}: positive control: no CSCB list call in the restart leg"
 
     # The trail: dev's worker reported in; the neighbour's never did.
-    (( $(rows_count "$(ad_trail_events ad.hook.fired "${DEV_ID}")") >= 1 )) \
-        || fail "${step}: positive control: the trail holds no ad.hook.fired record for ${DEV_ID}"
-    n="$(rows_count "$(ad_trail_events ad.hook.fired "${NB_ID}")")"
+    events="$(ad_trail_events ad.hook.fired "${DEV_ID}")" || exit 1
+    (( $(rows_count "${events}") >= 1 )) || fail "${step}: positive control: the trail holds no ad.hook.fired record for ${DEV_ID}"
+    events="$(ad_trail_events ad.hook.fired "${NB_ID}")" || exit 1
+    n="$(rows_count "${events}")"
     (( n == 0 )) || fail "${step}: the trail holds ${n} ad.hook.fired record(s) for the neighbour ${NB_ID}"
 
-    # No tmux command CSCB caused reads from, types into, kills or respawns the neighbour.
-    for target in "${NB_SESSION}" "${NB_SID}" "${NB_PANE}"; do
-        found="$(tmux_shim_targets "${target}" "${TMUX_MARK}")"
+    # No tmux command CSCB caused reads from, types into, kills or respawns
+    # the neighbour, by its session name, session id, window id or pane id.
+    for target in "${NB_SESSION}" "${NB_SID}" "${NB_WID}" "${NB_PANE}"; do
+        found="$(tmux_shim_targets "${target}" "${TMUX_MARK}")" || exit 1
         [[ -z "${found}" ]] || { sed 's/^/  | /' <<< "${found}" >&2; fail "${step}: tmux shim line(s) act on the neighbour's ${target}"; }
     done
-    for target in "${DEV_SESSION}" "${DEV_SID2}" "${DEV_PANE2}"; do
-        found="$(tmux_shim_targets "${target}" "${TMUX_MARK}")"
+    for target in "${DEV_SESSION}" "${DEV_SID2}" "${DEV_WID2}" "${DEV_PANE2}"; do
+        found="$(tmux_shim_targets "${target}" "${TMUX_MARK}")" || exit 1
         [[ -z "${found}" ]] || control+="${target}: $(field_of 4 "${found}" | sort | uniq -c | tr -s ' \n' ' ')"
     done
-    [[ -n "${control}" ]] || fail "${step}: positive control: tmux_shim_targets found no command acting on dev's ${DEV_SESSION}, ${DEV_SID2} or ${DEV_PANE2}"
+    [[ -n "${control}" ]] || fail "${step}: positive control: tmux_shim_targets found no command acting on dev's ${DEV_SESSION}, ${DEV_SID2}, ${DEV_WID2} or ${DEV_PANE2}"
     echo "${TEST_NAME}: ${step}: tmux commands acting on dev from the neighbour's creation on: ${control}"
 
     # The neighbour is untouched: pending, the same session, pane and stub.
     read_row "${step}" "${NB_ID}"
     [[ "${ROW_STATE}" == pending ]] || fail "${step}: the neighbour ${NB_ID} reads '${ROW_STATE}', not pending"
     session_parts "${step}" "${NB_SESSION}"
-    [[ "${PART_SID} ${PART_PANE} ${PART_PID}" == "${NB_SID} ${NB_PANE} ${NB_PID}" ]] \
-        || fail "${step}: the neighbour's session reads ${PART_SID} ${PART_PANE} ${PART_PID}, not ${NB_SID} ${NB_PANE} ${NB_PID}"
+    [[ "${PART_SID} ${PART_WID} ${PART_PANE} ${PART_PID}" == "${NB_SID} ${NB_WID} ${NB_PANE} ${NB_PID}" ]] \
+        || fail "${step}: the neighbour's session reads ${PART_SID} ${PART_WID} ${PART_PANE} ${PART_PID}, not ${NB_SID} ${NB_WID} ${NB_PANE} ${NB_PID}"
     stub_running "${NB_PID}" || fail "${step}: the neighbour's stub ${NB_PID} no longer runs"
 
     # No latch notice on dev's channel, no latch line for dev.
@@ -559,8 +578,8 @@ step_checks() {
     echo "${TEST_NAME}: ${step}: ${#posts[@]} post(s) on ${DEV_CHANNEL}, none a latch notice"
     expect_count "${LATCH_HEAD}" 0 "${step}: latch set or clear lines for dev"
     expect_count "${RECHECK_HEAD}" 0 "${step}: latch re-check lines for dev"
-    (( $(count_log "$(completion_match 1)") == 3 )) \
-        || fail "${step}: positive control: server.log holds $(count_log "$(completion_match 1)") start completion line(s), not 3"
+    completed="$(count_log "${COMPLETED}")"
+    (( completed == 3 )) || fail "${step}: positive control: server.log holds ${completed} start completion line(s), not 3"
 
     # dev's row is present at the end.
     read_row "${step}" "${DEV_ID}"

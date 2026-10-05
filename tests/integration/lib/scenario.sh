@@ -323,6 +323,16 @@
 #                                      such pane, say), and refuses when TMUX_TMPDIR is not the
 #                                      scenario's or TMUX is set; it does not read the pane to check
 #                                      the effect
+#   stub_type_exit <target>            a human ending a stub worker: type the stub's sentinel line
+#                                      (SCENARIO_STUB_EXIT, `__CSCB_TEST_EXIT__`) and Enter into the
+#                                      tmux pane <target> (a pane id such as %3, a session id ($N) or a
+#                                      session name, matched exactly, never as a prefix of another
+#                                      session's), with the real tmux on the scenario's own tmux
+#                                      server, from the scenario's own shell; the stub fires its
+#                                      SessionEnd hooks and exits 0, which is how a scenario finishes
+#                                      a stub's row; fails, with tmux's message, when tmux refuses,
+#                                      and refuses when TMUX_TMPDIR is not the scenario's or TMUX is
+#                                      set; it does not wait for the stub to end
 #   write_mcp_config [<port>]          write $HOME/.claude/slack-mcp.json, the MCP config the stub's
 #                                      session reads, naming http://127.0.0.1:<port>/mcp under the
 #                                      server name slack-channel-router, as the package's install
@@ -637,7 +647,7 @@
 #                                      print the rows of the CSCB-parented calls of <verb> between the
 #                                      two marks, for a verb that carries no instance id (find-missing,
 #                                      list, version)
-#   tmux_shim_targets <session-name|session-id|pane-id> [<from-mark> [<to-mark>]]
+#   tmux_shim_targets <session-name|session-id|window-id|pane-id> [<from-mark> [<to-mark>]]
 #                                      print, for each tmux shim `call` line between the marks (every
 #                                      line of that log is a CSCB process's or agent-director's for
 #                                      one), one row per command of the call (chained commands each
@@ -648,8 +658,14 @@
 #                                      respawn-window) a target given with -t that names the target:
 #                                        <position> TAB <time> TAB <ppid> TAB <command> TAB <-t value> TAB <words>
 #                                      A command is matched by its name, alias or an unambiguous
-#                                      prefix, as tmux matches it. A pane id (%N) names the pane given
-#                                      exactly; for a session, the -t value's session part (before its
+#                                      prefix, as tmux matches it, and its options are read as tmux
+#                                      3.2a to 3.4 read them (send-keys' -c <client> included), so an
+#                                      option's argument before -t never ends the scan. A pane id (%N)
+#                                      names the pane given exactly; a window id (@N) names the window
+#                                      given exactly, as the -t value's window part (after its first
+#                                      `:`, or the whole value when it has none, up to its first `.`:
+#                                      `@N`, `@N.0`, `<session>:@N`), so `@1` never names `@12`; for a
+#                                      session, the -t value's session part (before its
 #                                      first `:`, or its first `.` when it has none) names it when it
 #                                      is the session id ($N) given, or `=<name>` or `<name>` for the
 #                                      name given, or, written without `=`, a prefix of the name given
@@ -830,6 +846,8 @@ SCENARIO_STUB_MODES=("${STUB_MODE_DEV_CHANNELS}" "${STUB_MODE_AT_ONCE}" "${STUB_
     "${STUB_MODE_UNRECOGNISED}" "${STUB_MODE_FOLDER_TRUST}")
 SCENARIO_STUB_MCP_SRC="${SCENARIO_FIXTURES}/stub-mcp-session.ts"
 SCENARIO_STUB_MODES_NAME=stub-claude-modes
+# The line that ends a stub worker (fixtures/stub-claude.sh's sentinel).
+SCENARIO_STUB_EXIT=__CSCB_TEST_EXIT__
 
 # The MCP server name the package's install writes into slack-mcp.json
 # (src/config.ts MCP_SERVER_NAME).
@@ -2248,6 +2266,24 @@ stub_press_enter() {
     err="${SCENARIO_ROOT}/stub-press-enter.err"
     "${SCENARIO_REAL_TMUX}" send-keys -t "${exact}" Enter 2> "${err}" || rc=$?
     (( rc == 0 )) || fail "${step}: tmux send-keys exited ${rc}: $(tr '\n' ' ' < "${err}")"
+}
+
+stub_type_exit() {
+    local target="${1:-}" step exact
+    step="stub_type_exit ${target}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    [[ -n "${target}" ]] || fail "${step}: no pane or session named"
+    # A pane id is exact; a session id or name is read as a session, matched
+    # exactly (never as a window or a name prefix).
+    case "${target}" in
+        %*) exact="${target}" ;;
+        *) exact="$(_scenario_session_target "${target}"):" ;;
+    esac
+    # The sentinel is no key name, so tmux types it as text.
+    _scenario_tmux send-keys -t "${exact}" "${SCENARIO_STUB_EXIT}" Enter \
+        || fail "${step}: tmux send-keys failed: $(_scenario_tmux_err)"
 }
 
 write_mcp_config() {
@@ -3769,11 +3805,12 @@ ad_cscb_verb_between() {
 
 # The tmux commands `tmux_shim_targets` reports, one per line: the name, its
 # alias (`-` for none), the shortest prefix tmux takes for it unambiguously,
-# and the flags that take an argument (tmux 3.2a / 3.3a).
+# and the flags that take an argument (tmux 3.2a to 3.4; send-keys' -c
+# <target-client> came in 3.4).
 _SCENARIO_TMUX_ACTING_COMMANDS=(
     'capture-pane capturep 2 bESt'
     'pipe-pane pipep 2 t'
-    'send-keys send 6 Nt'
+    'send-keys send 6 cNt'
     'send-prefix - 6 t'
     'paste-buffer pasteb 2 bst'
     'kill-session - 8 t'
@@ -3871,12 +3908,19 @@ _scenario_tmux_hits() {
 # _scenario_tmux_names <value> <target>: true when the -t <value> names
 # <target> (see `tmux_shim_targets` in the header).
 _scenario_tmux_names() {
-    local v="$1" t="$2" s
+    local v="$1" t="$2" s w
     if [[ "${t}" == %* ]]; then
         [[ "${v}" == "${t}" ]]
         return
     fi
     [[ "${v}" != %* ]] || return 1
+    if [[ "${t}" == @* ]]; then
+        # The window part: after the first `:` (the whole value when it has
+        # none), up to its first `.`.
+        w="${v#*:}"
+        [[ "${w%%.*}" == "${t}" ]]
+        return
+    fi
     s="${v%%:*}"
     [[ "${v}" == *:* ]] || s="${s%%.*}"
     if [[ "${t}" == \$* ]]; then
@@ -3889,7 +3933,7 @@ _scenario_tmux_names() {
 
 tmux_shim_targets() {
     local target="${1:-}" from="${2:--}" to="${3:--}" step=tmux_shim_targets lines=() i hit
-    [[ -n "${target}" ]] || fail "${step}: no session name, session id or pane id given"
+    [[ -n "${target}" ]] || fail "${step}: no session name, session id, window id or pane id given"
     _scenario_check_mark "${step}" "<from-mark>" "${from}"
     _scenario_check_mark "${step}" "<to-mark>" "${to}"
     [[ "${SCENARIO_FMK}" == 1 ]] || fail "${step}: the tmux shim is for fmk scripts only"
