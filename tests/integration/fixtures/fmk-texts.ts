@@ -130,6 +130,10 @@
  *   adGraceMs, adLaunchBoundMs                   src/ad-settings.ts, G and B in milliseconds at
  *                                                agent-director's default settings
  *                                                (DEFAULT_AD_SETTINGS_IN_EFFECT), in decimal
+ * Scenario 25's entries (test-27):
+ *   AD_ERROR_CLASS_UNUSABLE_NAME                 src/ad-error-class.ts, CSCB's class for an
+ *                                                unusable recorded name, as fmk-driver.ts's
+ *                                                outcome line gives it (`class=<class>`)
  * The body entries print a body without the persona prefix; wrap one in
  * `formatPersonaNotice <persona-name> <entry> …` for the posted text.
  *
@@ -691,6 +695,8 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   LATCH_ROW_STATE_KIND_NO_ROW: constantEntry('conflict-latch.ts', 'LATCH_ROW_STATE_KIND_NO_ROW'),
   adGraceMs: adSettingsDefaultMs('adGraceMs'),
   adLaunchBoundMs: adSettingsDefaultMs('adLaunchBoundMs'),
+  // Scenario 25 (test-27-fmk-unusable-name.sh).
+  AD_ERROR_CLASS_UNUSABLE_NAME: constantEntry('ad-error-class.ts', 'AD_ERROR_CLASS_UNUSABLE_NAME'),
 }
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */

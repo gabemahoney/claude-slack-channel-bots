@@ -272,7 +272,7 @@ tests/
                                    # a `seed_leftover` leftover (`ad_store_seed_pending`), then one `ad_store_edit` statement clears its
                                    # claude_session_id (a launch stopped before its create recorded no Claude session); CSCB's own pending-row runs mark
                                    # it `missing` (reason `tmux_name_held`, one `ad.launch.name_held` record from `ad_find_missing`) no earlier than G and
-                                   # by B after its launch start; never `kill`ed; the restart path's reuse spawn is refused as "left over from an earlier
+                                   # by B plus the settle after its launch start; never `kill`ed; the restart path's reuse spawn is refused as "left over from an earlier
                                    # life" with one post; rounds are `status` then the reuse spawn. The harness ends the seeded sessions of (2) to (4) by
                                    # their session ids, and each clears at its next round (`pendleft` on a fresh Claude session). (5) Phase 5, the
                                    # restart leg: a plain `stop`, then a start; the bring-up's plain spawn relatches `scanleft` with exactly one new post,
@@ -283,6 +283,33 @@ tests/
                                    # `pause` waits out its 30 s timeout. The harness runs no `find-missing`. Modes: tmux shim `log`, the stub's
                                    # dev-channels hold, `health_check_interval` 0, agent-director's defaults (no config.toml). It runs about 9 minutes and
                                    # ends with the three closing assertions
+    test-27-fmk-unusable-name.sh  # HO §7 scenario 25 (b.jg5 SRJ-1427), fmk: an unusable recorded name latches with no tmux call; after the harness's delete it clears and comes up fresh
+                                   # Set-up: in the first life persona `unusable` (U) reaches `waiting`; the harness types the stub's exit sentinel into its
+                                   # pane (a human quitting Claude Code), so the row ends; then `stop --stop-bots`. With the server stopped, E39's scenario
+                                   # 25 statement (`ad_store_unusable_name`, an `ad_store_edit`) puts a `.` in U's recorded name (`<U's session name>.x`),
+                                   # and the harness makes another caller's row: a harness `spawn` of `<SCENARIO_TAG>_other` (outside `cscb_`, no labels,
+                                   # its stub `silent`), then one script-local `ad_store_edit` statement making it live `waiting` with no recorded process
+                                   # and the recorded name `<SCENARIO_TAG>_other.x`. Checks in the second life: the bring-up's calls of U's row hold exactly
+                                   # one `resume` and no reuse spawn, `kill`, `kill-finished` or `delete` (the plain spawn the existing row refuses as a
+                                   # collision, and its `get`, are recorded, not asserted); that `resume` gets `ErrUnknownErrorName` (`unknownName` "ErrInternal", the description holding the
+                                   # unusable-name phrase and the name); U latches once (case "unusable recorded name", refused operation none) and the
+                                   # start pass counts `0 failed` and `1 latched`; exactly one post, the persona prefix then `unusableNameNoticeText`
+                                   # around agent-director's quoted description, pointing to "Operator actions" and naming no command. A reuse spawn
+                                   # forced through fixtures/fmk-driver.ts gets the same `ErrUnknownErrorName`/`ErrInternal` with the phrase, CSCB's
+                                   # unusable-name class and `counted=false`, U's row unchanged. At least two re-check rounds, each one bot-server
+                                   # `status` at the 120 s cadence and nothing else for U (no `delete`, `kill`, spawn, `resume` or pane verb), still
+                                   # latched, no new post; no tmux shim line at all from the latch to the harness's `delete`; nothing counted (no counted
+                                   # launch-failure line, no spawn-failure post). Then the harness plays the human's last procedure step,
+                                   # `ad_delete_unusable_row` (agent-director-admin's `delete`, from the scenario's own shell): the next round's `status`
+                                   # gets `ErrSpawnNotFound`, the latch clears with one "Hold cleared" post (`holdRecoveryText`, reason "its
+                                   # agent-director row is gone"), then CSCB's one bypassing `find-missing` and one plain spawn, and U reaches `waiting`
+                                   # on a new claude_session_id. The other caller's row: after a CSCB `find-missing`, a harness `get` shows agent-director's
+                                   # `tmux_session_name_rewritten` note, and no CSCB call, latch line or post names it. At the end the agent-director
+                                   # shim's log holds exactly one `delete`, the harness's, parented by the scenario's shell: this is the one fmk script
+                                   # whose log holds a `delete`, and `assert_no_cscb_delete` still holds because it counts only CSCB-parented lines.
+                                   # The harness runs no `find-missing`. Modes: tmux shim `log`, the stub's dev-channels hold for U,
+                                   # `health_check_interval` 0, agent-director's defaults (no config.toml). It runs about 8 minutes and ends with the
+                                   # three closing assertions
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
