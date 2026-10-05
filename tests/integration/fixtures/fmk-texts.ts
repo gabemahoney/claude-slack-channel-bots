@@ -289,6 +289,28 @@
  *                                    (`adGraceMs` of
  *                                    DEFAULT_AD_SETTINGS_IN_EFFECT,
  *                                    src/ad-settings.ts)
+ * Scenario 7, reuse replaces delete (test-19; b.jg5 SRJ-1409, SRJ-413,
+ * SRJ-707, SRJ-712):
+ *   preTrustLogLine <name> <verb> <value>
+ *                                    the one `pre_trust` line a successful
+ *                                    launch logs (`preTrustLogLine`,
+ *                                    src/session-manager.ts) for the persona
+ *                                    named <name> (its reference from
+ *                                    `renderPersonaRef`), <verb> the name of a
+ *                                    `LAUNCH_VERB_*` export of
+ *                                    src/session-manager.ts (for example
+ *                                    LAUNCH_VERB_REUSE_SPAWN) and <value> the
+ *                                    result's `pre_trust` (for example `ok`)
+ *   JSONL_DIAGNOSIS_REUSE_WORDING    the fixed fragment every log line of the
+ *                                    lost-transcript diagnosis
+ *                                    (`diagnoseJsonlMissing`,
+ *                                    src/session-manager.ts) holds: the
+ *                                    persona brought up fresh by a reuse spawn
+ *                                    of the same instance, its row kept
+ *   JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS
+ *   JSONL_TRANSCRIPT_LOST_ENTRY_CLASS
+ *                                    the diagnosis's startup-errors classes
+ *                                    (src/session-manager.ts)
  *
  * SPDX-License-Identifier: MIT
  */
@@ -839,6 +861,19 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
       return String((await fn<(values: unknown) => number>('ad-settings.ts', 'adGraceMs'))(defaults))
     },
   },
+  // Scenario 7 (test-19; b.jg5 SRJ-1409).
+  preTrustLogLine: {
+    args: ['name', 'verb', 'value'],
+    print: async ([name, verbName, preTrust]) => {
+      if (!/^LAUNCH_VERB_[A-Z_]+$/.test(verbName)) throw new PrinterFailure(`verb '${verbName}' is not a LAUNCH_VERB_* export's name`, USAGE_EXIT)
+      const verb = await text('session-manager.ts', verbName)
+      const ref = (await fn<(n: string) => string>('persona-identity.ts', 'renderPersonaRef'))(name)
+      return (await fn<(r: string, v: string, p: string) => string>('session-manager.ts', 'preTrustLogLine'))(ref, verb, preTrust)
+    },
+  },
+  JSONL_DIAGNOSIS_REUSE_WORDING: { args: [], print: () => text('session-manager.ts', 'JSONL_DIAGNOSIS_REUSE_WORDING') },
+  JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS: { args: [], print: () => text('session-manager.ts', 'JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS') },
+  JSONL_TRANSCRIPT_LOST_ENTRY_CLASS: { args: [], print: () => text('session-manager.ts', 'JSONL_TRANSCRIPT_LOST_ENTRY_CLASS') },
 }
 
 async function main(argv: readonly string[]): Promise<number> {

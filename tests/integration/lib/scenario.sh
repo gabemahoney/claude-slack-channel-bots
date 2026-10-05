@@ -323,6 +323,23 @@
 #                                      such pane, say), and refuses when TMUX_TMPDIR is not the
 #                                      scenario's or TMUX is set; it does not read the pane to check
 #                                      the effect
+#   STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE
+#                                      (a harness addition, confirm at the reconcile pass) the mode
+#                                      `transcript-on-first-message`, a known mode of `stub_mode`:
+#                                      `dev-channels`, except that reporting in writes no transcript
+#                                      (SessionStart finds none) and the first message after it does
+#   STUB_EXIT_SENTINEL                 (a harness addition, confirm at the reconcile pass) the stub's
+#                                      exit sentinel line, `__CSCB_TEST_EXIT__`: typed into a stub's
+#                                      pane (`stub_type_line`) it fires SessionEnd and exits
+#   stub_type_line <target> <line>     (a harness addition, confirm at the reconcile pass) a human
+#                                      typing <line> into the tmux pane <target> (as for
+#                                      `stub_press_enter`), then Enter: two send-keys of the real
+#                                      tmux on the scenario's own tmux server, from the scenario's own
+#                                      shell (never a CSCB process), the line as literal keys (-l);
+#                                      fails, with tmux's message, when tmux refuses, refuses when
+#                                      TMUX_TMPDIR is not the scenario's or TMUX is set, and refuses an
+#                                      empty or blank line (Enter alone is `stub_press_enter`) or one
+#                                      holding a control character; it does not read the pane
 #   write_mcp_config [<port>]          write $HOME/.claude/slack-mcp.json, the MCP config the stub's
 #                                      session reads, naming http://127.0.0.1:<port>/mcp under the
 #                                      server name slack-channel-router, as the package's install
@@ -792,6 +809,13 @@ STUB_MODE_UNRECOGNISED=unrecognised-dialog
 STUB_MODE_FOLDER_TRUST=folder-trust
 SCENARIO_STUB_MODES=("${STUB_MODE_DEV_CHANNELS}" "${STUB_MODE_AT_ONCE}" "${STUB_MODE_SILENT}"
     "${STUB_MODE_UNRECOGNISED}" "${STUB_MODE_FOLDER_TRUST}")
+# Harness additions, confirm at the reconcile pass: the stub mode that writes
+# its transcript only at the first message after reporting in, and the
+# stub's exit sentinel line (fixtures/stub-claude.sh SENTINEL), which a
+# scenario types with `stub_type_line`.
+STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE=transcript-on-first-message
+SCENARIO_STUB_MODES+=("${STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE}")
+STUB_EXIT_SENTINEL=__CSCB_TEST_EXIT__
 SCENARIO_STUB_MCP_SRC="${SCENARIO_FIXTURES}/stub-mcp-session.ts"
 SCENARIO_STUB_MODES_NAME=stub-claude-modes
 
@@ -2229,6 +2253,31 @@ stub_press_enter() {
     err="${SCENARIO_ROOT}/stub-press-enter.err"
     "${SCENARIO_REAL_TMUX}" send-keys -t "${exact}" Enter 2> "${err}" || rc=$?
     (( rc == 0 )) || fail "${step}: tmux send-keys exited ${rc}: $(tr '\n' ' ' < "${err}")"
+}
+
+# A harness addition, confirm at the reconcile pass.
+stub_type_line() {
+    local target="${1:-}" text="${2:-}" step exact err rc=0
+    step="stub_type_line ${target}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    (( $# == 2 )) || fail "${step}: takes <target> <line>"
+    _scenario_tmux_check "${step}"
+    [[ -n "${target}" ]] || fail "${step}: no pane named"
+    [[ "${text}" =~ [^[:space:]] ]] || fail "${step}: the line is empty or blank (an Enter alone is stub_press_enter)"
+    [[ "${text}" != *[[:cntrl:]]* ]] || fail "${step}: the line holds a control character"
+    # The same exact targets as stub_press_enter.
+    case "${target}" in
+        %*) exact="${target}" ;;
+        *:*) exact="=${target}" ;;
+        *) exact="=${target}:" ;;
+    esac
+    err="${SCENARIO_ROOT}/stub-type-line.err"
+    # The line as literal keys (-l: no key name is looked up), then Enter.
+    "${SCENARIO_REAL_TMUX}" send-keys -t "${exact}" -l -- "${text}" 2> "${err}" || rc=$?
+    (( rc == 0 )) || fail "${step}: tmux send-keys of the line exited ${rc}: $(tr '\n' ' ' < "${err}")"
+    "${SCENARIO_REAL_TMUX}" send-keys -t "${exact}" Enter 2> "${err}" || rc=$?
+    (( rc == 0 )) || fail "${step}: tmux send-keys of Enter exited ${rc}: $(tr '\n' ' ' < "${err}")"
 }
 
 write_mcp_config() {
