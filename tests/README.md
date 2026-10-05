@@ -301,7 +301,39 @@ tests/
                                    # dev-channels hold, `health_check_interval` 0, agent-director's defaults (no config.toml). It runs about 9 minutes and
                                    # ends with the three closing assertions
     test-23-fmk-latch-recheck.sh  # HO §7 scenario 20 (b.jg5 SRJ-1422), fmk: each latch case is re-checked with exactly its call
-                                   # Part 2's cases, one persona each: no valid instance id, a different instance id, another agent-director store,
+                                   # Part 1 runs first, before any Part 2 persona exists: a global `@ad_owner` value is per tmux server, so it would
+                                   # affect every persona on it (a check fails if a Part 2 persona's row or session exists while the harness sets it).
+                                   # Part 1's personas stay configured through Part 2's lives, each life in a state dir of its own. The note persona
+                                   # (`labelnote`), its stub reporting in at once (so its pane shows no answered dialog, which the restart path's
+                                   # reconnect would read as a prompt): its first life alone reaches `waiting`; a plain `stop`. The note set-up, with
+                                   # the server stopped, all the harness's: one guarded `ad_store_edit` statement sets the live row's `proc_starttime`
+                                   # NULL (agent-director 0.11.0's `find-missing` writes a `provenance_conflict` note only on a live row whose agent
+                                   # process it cannot check; this statement is a working default, a Hatch gap); the harness sets the global
+                                   # `@ad_owner` value (`ad_owner_global_set`), runs one `find-missing`, confirms the note with a harness `get`
+                                   # (`liveness_note` equal to `LATCHING_LIVENESS_NOTE`), unsets the value (`ad_owner_global_unset`) and puts
+                                   # `proc_starttime` back; the note stays. The latch life: the start pass's first `list` latches the note persona
+                                   # "conflicting labels" on its `waiting` row before any call of its id, with one post that has no `agent-director
+                                   # said` line, its session `"slack_bot_labelnote"`; the held-dialog persona (`helddialog`), its stub in the
+                                   # unrecognised-dialog mode, is launched by one plain spawn and its row reads `pending`; right after the approver's
+                                   # first `read-pane` of it, the harness sets the global value, and the approver's next `read-pane` answers CONFLICT
+                                   # and latches it on its `pending` row with one post. A latch on a live row stays latched while the row reads live:
+                                   # each of the note persona's rounds while the note shows is one `get` alone, with no post (at least two), and each
+                                   # of the held-dialog persona's rounds is one `get` then a one-line `read-pane` with `--allow-pending`, answering
+                                   # the same CONFLICT, with no post. AC 43: right after the held-dialog persona's round k (k is two; the round is seen
+                                   # in the agent-director shim's log) and within one re-check interval of its `get`, the harness unsets the global
+                                   # value, then sends Enter into the stub's pane (`stub_press_enter`); the row reports in and a harness read shows
+                                   # `waiting`; round k+1's `get` alone, with no `read-pane`, clears the latch with exactly one recovery post, reason
+                                   # `its agent-director row reads waiting`, and no relatch line or post follows; shim-log marks prove the order, with
+                                   # no call of its id between round k and the Enter. The answer of the retry after that clear is logged, not asserted.
+                                   # Then the harness starts its find-missing loop; once a harness `get` shows no note, the note persona's next round
+                                   # is its `get`, then one run of the restart path's decision on the live row (no `resume` or `kill`; in practice the
+                                   # reconnect), with no CSCB `find-missing` between them, which clears the latch with one recovery post ("a retry of
+                                   # the refused operation was not refused") and no relatch post. Which run removed the note (the store-wide
+                                   # `find-missing` after AC 43's clear, or the harness's loop) is logged, not asserted. The harness stops its loop;
+                                   # each Part 1 persona has one latch, exactly two posts and no CSCB `kill`, `kill-finished` or `delete` of its id; a
+                                   # plain `stop`; the harness ends the held-dialog persona's worker by its exit line (its stub then reporting in at
+                                   # once), so Part 2's first life resumes it with no dialog.
+                                   # Then Part 2's cases, one persona each: no valid instance id, a different instance id, another agent-director store,
                                    # left over from an earlier life, the scan's refusal with no row, "duplicate session" with the row `ended`, this
                                    # row's own id, the agent's pane was not found, the unusable recorded name, "not this launch's session" (two legs,
                                    # personas `relabelone` and `relabeltwo`) and "launch start not recorded" (persona `nostart`). The script header
@@ -333,11 +365,11 @@ tests/
                                    # `resume`, refused with "left over from an earlier life": it relatches with one new post and no recovery post,
                                    # each following round is `status` then `resume`, and it stays latched to the end. Leg 2: the same round's
                                    # `resume` launches, and it clears with one recovery post ("its row finished and a relaunch was not refused"),
-                                   # nothing posted between the latch's notice and it. The harness runs no `find-missing` before its loop, which
+                                   # nothing posted between the latch's notice and it. The harness runs no `find-missing` in Part 2 before its loop, which
                                    # serves the latched personas' rows; the loop's calls are the harness's, never counted as CSCB's. Modes: tmux
-                                   # shim `log`, the stub's dev-channels hold (and report-in at once for the pane-not-found persona's relaunch),
+                                   # shim `log`, the stub's dev-channels hold (report-in at once for the note persona and the pane-not-found persona's relaunch; the unrecognised-dialog mode for the held-dialog persona's latch life),
                                    # `health_check_interval` 0 (so the waiting-row `read-pane` a health tick makes is not shown; the reconnect
-                                   # comes from a server restart), agent-director's defaults (no config.toml). It runs about 24 minutes and ends
+                                   # comes from a server restart), agent-director's defaults (no config.toml). It runs about 32 minutes (Part 1 about 8.5, Part 2 about 24) and ends
                                    # with the loop stopped, a plain `stop`, then the three closing assertions
     test-27-fmk-unusable-name.sh  # HO §7 scenario 25 (b.jg5 SRJ-1427), fmk: an unusable recorded name latches with no tmux call; after the harness's delete it clears and comes up fresh
                                    # Set-up: in the first life persona `unusable` (U) reaches `waiting`; the harness types the stub's exit sentinel into its

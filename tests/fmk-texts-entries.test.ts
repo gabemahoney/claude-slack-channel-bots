@@ -54,6 +54,7 @@ import * as invalidFlagsHold from '../src/invalid-flags-hold.ts'
 import * as paneRead from '../src/pane-read.ts'
 import * as personaIdentity from '../src/persona-identity.ts'
 import * as personaNotifier from '../src/persona-notifier.ts'
+import * as rowReadRules from '../src/row-read-rules.ts'
 import * as sessionManager from '../src/session-manager.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 
@@ -73,6 +74,7 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'pane-read.ts': paneRead,
   'persona-identity.ts': personaIdentity,
   'persona-notifier.ts': personaNotifier,
+  'row-read-rules.ts': rowReadRules,
   'session-manager.ts': sessionManager,
 }
 
@@ -368,6 +370,12 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
     const named = new Set(reading.refs.map((r) => `${r.file}:${r.name}:${r.kind}`))
     expect(named.has('session-manager.ts:latchClearRetryAtOnceLineHead:function')).toBe(true)
     expect(typeof sessionManager.latchClearRetryAtOnceLineHead).toBe('function')
+  })
+
+  test("scenario 20's note is read: row-read-rules.ts's LATCHING_LIVENESS_NOTE, a constant, the note isLatchingLivenessNote accepts", () => {
+    const named = new Set(reading.refs.map((r) => `${r.file}:${r.name}:${r.kind}`))
+    expect(named.has('row-read-rules.ts:LATCHING_LIVENESS_NOTE:constant')).toBe(true)
+    expect(rowReadRules.isLatchingLivenessNote(rowReadRules.LATCHING_LIVENESS_NOTE)).toBe(true)
   })
 
   test('every file the printer names is a src/ module this file imports', () => {

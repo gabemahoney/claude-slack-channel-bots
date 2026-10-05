@@ -147,6 +147,9 @@
  *                                                src/session-manager.ts, the head of the
  *                                                after-clear retry's lines, the reference
  *                                                renderPersonaRef(<persona-name>)
+ *   LATCHING_LIVENESS_NOTE                       src/row-read-rules.ts, the liveness note a
+ *                                                row's `get` carries that latches its persona
+ *                                                with "conflicting labels"
  * The body entries print a body without the persona prefix; wrap one in
  * `formatPersonaNotice <persona-name> <entry> …` for the posted text.
  *
@@ -746,6 +749,7 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   RECHECK_VERDICT_STILL_LATCHED: constantEntry('conflict-latch.ts', 'RECHECK_VERDICT_STILL_LATCHED'),
   ...constantEntries('pane-read.ts', PANE_READ_KIND_NAMES),
   latchClearRetryAtOnceLineHead,
+  LATCHING_LIVENESS_NOTE: constantEntry('row-read-rules.ts', 'LATCHING_LIVENESS_NOTE'),
 }
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */
