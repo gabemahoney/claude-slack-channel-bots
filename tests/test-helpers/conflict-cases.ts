@@ -260,7 +260,8 @@
  *     rendered as a record holds it (`renderLogMessageText`) and both it and
  *     the session name escaped once for Slack (`escapeSlackControlCharacters`).
  *     It never calls `conflictNoticeText`, so it is an independent check of it;
- *   - {@link SESSION_ENDING_COMMAND_FORMS} and {@link sessionEndingCommandsIn}:
+ *   - {@link SESSION_ENDING_COMMAND_FORMS} and {@link sessionEndingCommandsIn}
+ *     (defined in the import-free `session-ending-commands.ts`, re-exported):
  *     the session-ending command forms of ADSRD SR-1.4 that SRJ-1001 lists
  *     (`kill` named as a command to run, `pause`, `--include-finished`,
  *     `tmux kill-session`, `tmux kill-server`), as patterns, and the names of
@@ -1059,44 +1060,14 @@ export function conflictNoticeForPersona(key: string, err: ReturnType<typeof con
 // Session-ending command forms (ADSRD SR-1.4; b.jg5 SRJ-1001)
 // ---------------------------------------------------------------------------
 
-/** One session-ending command form: what it names and the pattern that finds it. */
-export interface SessionEndingCommandForm {
-  readonly name: string
-  /** Not global, so it keeps no `lastIndex` between tests. */
-  readonly pattern: RegExp
-}
-
-/** Imperative verbs that put a command to run after them. */
-const RUN_VERBS = String.raw`(?:run|use|type|execute|issue|invoke)`
-
-/** `verb` named as a command: `agent-director <verb>`, a code span opening with it, `<verb>` with an option or a pid, or a run verb before it. */
-function commandFormOf(verb: string): RegExp {
-  return new RegExp(
-    String.raw`\bagent-director\s+${verb}\b|\x60\s*${verb}\b|\b${verb}\s+(?:-|\d)|\b${RUN_VERBS}\s+(?:the\s+|a\s+)?\x60?\s*${verb}\b`,
-    'i',
-  )
-}
-
-/**
- * The commands that end a session as ADSRD SR-1.4 defines one, as SRJ-1001
- * lists them for the CONFLICT, unusable-name, launch-start and stuck-launch
- * posts: `kill` named as a command to run (so agent-director's "no kill was
- * sent" and "retry kill later" are no hit), `pause` in any form,
- * `--include-finished` (with or without its dashes), `tmux kill-session` and
- * `tmux kill-server`.
- */
-export const SESSION_ENDING_COMMAND_FORMS: readonly SessionEndingCommandForm[] = Object.freeze([
-  Object.freeze({ name: 'kill as a command', pattern: commandFormOf('kill') }),
-  Object.freeze({ name: 'pause', pattern: /\bpause\b/i }),
-  Object.freeze({ name: '--include-finished', pattern: /include-finished/i }),
-  Object.freeze({ name: 'tmux kill-session', pattern: /\bkill-session\b/i }),
-  Object.freeze({ name: 'tmux kill-server', pattern: /\bkill-server\b/i }),
-])
-
-/** The names of the session-ending command forms `text` matches, in table order; empty when none does. */
-export function sessionEndingCommandsIn(text: string): string[] {
-  return SESSION_ENDING_COMMAND_FORMS.filter((form) => form.pattern.test(text)).map((form) => form.name)
-}
+// Defined once in the import-free `session-ending-commands.ts`, which the
+// scenario value printer loads in the `/ci` image (where this file, which
+// imports `src/`, cannot load); re-exported here for every unit test.
+export {
+  SESSION_ENDING_COMMAND_FORMS,
+  sessionEndingCommandsIn,
+  type SessionEndingCommandForm,
+} from './session-ending-commands.ts'
 
 /**
  * What CSCB's own notice and recovery lines never spell, beyond SR-1.4's five

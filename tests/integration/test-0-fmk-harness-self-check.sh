@@ -89,7 +89,8 @@
 #                    `ad_store_backup` (which writes no copy),
 #                    `ad_store_pending_no_launch`, `stub_mode`,
 #                    `stub_dialog_delay`, `stub_release`, `stub_press_enter`,
-#                    `stub_type_exit`, `write_mcp_config` and every label,
+#                    `stub_type_exit`, `write_mcp_config`, `write_ad_settings`
+#                    and every label,
 #                    seeding, tmux-step, store-statement, operator-action,
 #                    find-missing-loop and 0.10.0-seeder helper fails with the
 #                    guard's reason, and the decoy is left exactly as it was.
@@ -308,7 +309,10 @@
 #                    needle) and the folder-trust prompt, each shown in its
 #                    pane and answered by `stub_press_enter`: before the Enter,
 #                    for longer than a period, the stub fires no SessionStart
-#                    and shows no banner.
+#                    and shows no banner (and the unrecognised dialog shows
+#                    neither approver needle); once the banner shows, neither
+#                    the pane nor its scrollback holds the dialog's line (the
+#                    stub clears an answered dialog).
 #   stop_status_failure
 #                    a reporting stub given an instance id with no row: its
 #                    report-in fires SessionStart once, then nothing, and the
@@ -1311,14 +1315,26 @@ expect_reported_at_once() {
     ! pane_shows "${session}" "Enter to confirm" || fail "${step}: the stub's pane shows a dialog"
 }
 
-# refire_enter_leg <path> <mode> <dialog-line>: <path>'s stub, held at its
-# dialog (whose pane shows <dialog-line>) for longer than a period, fires no
-# SessionStart and shows no banner; the harness's Enter makes it report in.
+# True when the pane <target>, its scrollback included, shows <text>.
+pane_history_shows() {
+    "${SCENARIO_REAL_TMUX}" capture-pane -p -S - -t "$1" 2> /dev/null | grep -F -- "$2" > /dev/null
+}
+
+# refire_enter_leg <path> <mode> <dialog-line> [<absent-line>...]: <path>'s
+# stub, held at its dialog (whose pane shows <dialog-line> and no
+# <absent-line>) for longer than a period, fires no SessionStart and shows no
+# banner; the harness's Enter makes it report in, and the answered dialog is
+# cleared: once the banner shows, neither the pane nor its scrollback holds
+# <dialog-line>.
 refire_enter_leg() {
-    local path="$1" mode="$2" text="$3" step="re-fire $1" session="t0-refire-$1" t
+    local path="$1" mode="$2" text="$3" step="re-fire $1" session="t0-refire-$1" t absent
+    shift 3
     refire_dir "${path}" "${mode}"
     refire_start "${path}"
     wait_until 10 "${step}: the pane never showed the dialog line '${text}'" pane_shows "${session}" "${text}"
+    for absent in "$@"; do
+        ! pane_shows "${session}" "${absent}" || fail "${step}: the dialog holds '${absent}'"
+    done
     sleep "$(seconds_plus "${REFIRE_PERIOD_S}" 0.5)"
     [[ "$(records_from "${REFIRE_PID[${path}]}")" == 0 ]] \
         || fail "${step}: the stub fired SessionStart before the Enter"
@@ -1329,6 +1345,8 @@ refire_enter_leg() {
     REFIRE_FROM["${path}"]="${t}"
     wait_until 10 "${step}: the stub never reported in after the Enter" \
         pane_shows "${session}" "Listening for channel messages"
+    ! pane_history_shows "${session}" "${text}" \
+        || fail "${step}: the answered dialog's line '${text}' is still in the pane or its scrollback"
 }
 
 # stop_lines_for <instance-id>: print the shim log's stop lines whose words
@@ -1706,6 +1724,7 @@ leg_guard_refusals() {
         expect_fails_in_home "${step}" "${home}" "${reason}" write_mcp_config "${SCENARIO_PORT}"
         # The latch scenarios' trail reader (read-only, guarded all the same).
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_trail_events ad.hook.fired
+        expect_fails_in_home "${step}" "${home}" "${reason}" write_ad_settings pending_grace_seconds=120
         # The labels, seeding, the human's tmux steps, the store statements,
         # the operator's actions, the find-missing loop and the 0.10.0
         # seeders. Each would act on the scenario's own tmux server or
@@ -1729,6 +1748,10 @@ leg_guard_refusals() {
         expect_fails_in_home "${step}" "${home}" "${reason}" respawn_worker_pane "${T0_SESSION}" sleep 1
         expect_fails_in_home "${step}" "${home}" "${reason}" restart_tmux_server
         expect_fails_in_home "${step}" "${home}" "${reason}" rebind_tmux_socket
+        expect_fails_in_home "${step}" "${home}" "${reason}" restore_tmux_socket "${SCENARIO_ROOT}/tmux/tmux-0/default.rebound-1"
+        expect_fails_in_home "${step}" "${home}" "${reason}" start_second_tmux_server
+        expect_fails_in_home "${step}" "${home}" "${reason}" end_worker_without_session_end %1
+        expect_fails_in_home "${step}" "${home}" "${reason}" end_stub_mcp_session %1
         # shellcheck disable=SC2016 # $0 is a literal tmux session id
         expect_fails_in_home "${step}" "${home}" "${reason}" end_session '$0'
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_mark_finished "${T0_ROW_ID}" missing
@@ -2756,10 +2779,10 @@ leg_refire_dev_channels() {
 }
 
 leg_refire_unrecognised() {
-    local step="re-fire unrecognised" session="t0-refire-unrecognised"
-    refire_enter_leg unrecognised "${STUB_MODE_UNRECOGNISED}" "Choose the text style that looks best with your terminal"
-    ! pane_shows "${session}" "I am using this for local development" && ! pane_shows "${session}" "Yes, I trust this folder" \
-        || fail "${step}: the unrecognised dialog holds an approver's needle"
+    # The unrecognised dialog holds neither approver needle, read while it is
+    # shown (once answered, the stub clears it).
+    refire_enter_leg unrecognised "${STUB_MODE_UNRECOGNISED}" "Choose the text style that looks best with your terminal" \
+        "I am using this for local development" "Yes, I trust this folder"
 }
 
 leg_refire_folder_trust() {

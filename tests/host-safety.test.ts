@@ -1709,6 +1709,7 @@ const HOME_CHECK_EXEMPT: ReadonlyMap<string, string> = new Map([
   ['_scenario_fmk_setup', 'the setup that makes and exports the scenario HOME: before the export it only places files under SCENARIO_ROOT (_scenario_place, tmux_shim_mode); the installs after it are audited helpers'],
 ])
 
+
 /**
  * The scenario.sh functions with a step that run only from audited helpers
  * after their `require_scenario_home` (callerCheckFindings checks it: every
@@ -2579,9 +2580,9 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       // The helpers the audit must find a step in (a parse that lost steps would shrink the set).
       expect(homeCheckedHelpers(source)).toEqual(expect.arrayContaining([
         'install_ad_shim', 'install_ad_admin_shim', 'install_ad_release', 'install_ad_010', 'reshim_ad', 'swap_ad_binary', 'hide_ad_install', 'restore_ad_install',
-        'ad', 'ad_capture', 'ad_admin', 'ad_admin_capture', '_scenario_store_read', 'ad_store_edit', 'ad_store_id', 'ad_store_backup', 'ad_store_pending_no_launch', 'stub_mode', 'stub_dialog_delay', 'stub_release',
+        'ad', 'ad_capture', 'ad_admin', 'ad_admin_capture', '_scenario_store_read', 'ad_store_edit', 'ad_store_id', 'ad_store_backup', 'ad_store_pending_no_launch', 'stub_mode', 'stub_dialog_delay', 'stub_release', 'write_ad_settings',
         'ad_new_token', 'ad_other_store_id', 'ad_owner_label', 'seed_leftover', 'seed_unlabelled', 'seed_env_only', 'seed_borrowed_name', 'seed_other_store',
-        'relabel_session', 'ad_owner_global_set', 'rebind_tmux_socket', 'ad_store_mark_finished', 'ad_store_seed_pending', 'ad_store_unusable_name',
+        'relabel_session', 'ad_owner_global_set', 'rebind_tmux_socket', 'restore_tmux_socket', 'ad_store_mark_finished', 'ad_store_seed_pending', 'ad_store_unusable_name',
         'ad_kill_include_finished', 'ad_delete_unusable_row', 'run_find_missing_loop', 'seed_010_row', 'seed_prepersona_fleet', 'write_mcp_config',
       ]))
       expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), source)).toEqual([])
@@ -2611,6 +2612,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       ['ad_store_mark_finished', 'its store read, through another helper', '_scenario_row_json'],
       ['seed_leftover', 'its seeding, through _scenario_seed', '_scenario_seed'],
       ['rebind_tmux_socket', 'its socket move', 'mv'],
+      ['restore_tmux_socket', 'its socket move', 'mv'],
       ['stub_dialog_delay', 'its move', 'mv'],
       ['stub_release', 'its move', 'mv'],
       ['install_ad_release', 'its install.sh run', '${SCENARIO_RELEASE_INSTALL_SH}'],
@@ -3305,5 +3307,68 @@ describe('un-injected gate checks (after the preload check)', () => {
     // Discovery looked at the preload's HOME and PATH, and nowhere else.
     const checked = (check.detail as { checkedLocations: { detail: string | null }[] }).checkedLocations
     expect(checked.map((location) => location.detail)).toEqual([join(env.HOME!, AGENT_DIRECTOR_INSTALL_PATH), env.PATH!])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: end_stub_mcp_session's guards come before its signal (harness addition, b.jg5 SRJ-1306)
+// ---------------------------------------------------------------------------
+
+/** scenario.sh's helper that ends a stub worker's MCP session client with a signal. */
+const MCP_SESSION_END_HELPER = 'end_stub_mcp_session'
+
+/** Whether `command` only declares or assigns: `local …`, or a lone `NAME=…`. */
+function isDeclarationOnly(command: ShellCommand): boolean {
+  return command.name === '' || command.name === 'local' || SHELL_ASSIGNMENT.test(command.name)
+}
+
+/**
+ * The guard findings for `helper` in scenario.sh's `source`: before its first
+ * `kill`, the helper runs `require_ci_image` as its first command after its
+ * declarations, then `require_scenario_home`, each unconditionally (at the
+ * top of its body, at the start of a logical line or after `;`).
+ */
+function signalGuardFindings(source: string, helper: string): string[] {
+  const body = shellFunctions(source).get(helper)
+  if (body === undefined) return [`${helper} is not defined`]
+  const signal = body.findIndex((c) => c.name === 'kill')
+  if (signal < 0) return [`${helper} sends no signal the audit can see`]
+  const unconditional: string[] = []
+  let depth = 0
+  for (const command of body.slice(0, signal)) {
+    if (depth === 0 && command.keywords.length === 0 && (command.after === '' || command.after === ';') && !isDeclarationOnly(command)) unconditional.push(command.name)
+    depth += shellDepthChange(command)
+  }
+  const findings: string[] = []
+  if (unconditional[0] !== 'require_ci_image') findings.push(`${helper}: its first step is ${unconditional[0] ?? 'none'}, not require_ci_image`)
+  if (unconditional.indexOf(HOME_GUARD) < 1) findings.push(`${helper}: no unconditional ${HOME_GUARD} after require_ci_image and before its kill`)
+  return findings
+}
+
+describe(`${MCP_SESSION_END_HELPER}: both guards before its signal`, () => {
+  const source = readFileSync(SCENARIO_PATH, 'utf-8')
+  const guard = (name: string): RegExp => new RegExp(`(\\n${MCP_SESSION_END_HELPER}\\(\\) \\{\\n(?:.*\\n)*?)    ${name} "[^"\\n]*"\\n`)
+
+  test('the current tree: require_ci_image first, then require_scenario_home, both before its kill', () => {
+    expect(signalGuardFindings(source, MCP_SESSION_END_HELPER)).toEqual([])
+  })
+
+  test.each([
+    ['require_scenario_home', 'no unconditional require_scenario_home'],
+    ['require_ci_image', 'not require_ci_image'],
+  ])('without its %s it is flagged', (name, finding) => {
+    const unguarded = source.replace(guard(name), '$1')
+
+    expect(unguarded).not.toBe(source)
+    const findings = signalGuardFindings(unguarded, MCP_SESSION_END_HELPER)
+    expect(findings.length).toBeGreaterThan(0)
+    expect(findings.join('\n')).toContain(finding)
+  })
+
+  test('with its HOME check only inside an if, it is flagged', () => {
+    const conditional = source.replace(guard(HOME_GUARD), `$1    if [[ -n "\${STRICT:-}" ]]; then\n        ${HOME_GUARD} "\${step}"\n    fi\n`)
+
+    expect(conditional).not.toBe(source)
+    expect(signalGuardFindings(conditional, MCP_SESSION_END_HELPER).join('\n')).toContain(`no unconditional ${HOME_GUARD}`)
   })
 })

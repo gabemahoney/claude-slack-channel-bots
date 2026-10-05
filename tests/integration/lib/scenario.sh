@@ -316,6 +316,34 @@
 #                                      named. Then a harness `status` read (`ad_capture`) must read
 #                                      `pending` with no launch_started_at, or it fails
 #
+#   agent-director's settings file (fmk mode; harness addition, scenario 24, test-26, and
+#   scenario 10; the image guard, then the HOME check, before any write)
+#   write_ad_settings [--pause <value>] [<key>=<value>...]
+#                                      replace the scenario HOME's agent-director settings file
+#                                      (HOME joined with the package's AD_SETTINGS_RELATIVE_PATH,
+#                                      read through fixtures/fmk-texts.ts, as are the table names and
+#                                      the pause key) whole, by one rename (`write_file`), so no
+#                                      reader sees half a file: a `[tmux]` table holding each
+#                                      `<key> = <value>` in the order given, when any is given, then a
+#                                      `[pause]` table holding `timeout_seconds = <value>` with
+#                                      --pause. Each <value> is written as the TOML value text given
+#                                      (`120`, `29` below a minimum, `"120"` a string), so a refused
+#                                      value can be written on purpose. No table (no argument)
+#                                      removes the file: agent-director's defaults. Fails for a
+#                                      <key> that is not a TOML bare key of lowercase letters, digits
+#                                      and `_`, a key given twice, an empty <value> or one holding a
+#                                      control character, and refuses a settings directory that
+#                                      resolves outside SCENARIO_ROOT or a settings path that is not a
+#                                      regular file. Reads the file back and fails unless it holds
+#                                      exactly what was written; sets AD_SETTINGS_FILE to its path.
+#                                      `_scenario_ad_tmux_setting`, the stub's re-fire and
+#                                      `ad_store_mark_finished` read the `[tmux]` values it writes.
+#                                      Examples:
+#                                        write_ad_settings pending_grace_seconds=120 stopping_window_seconds=30
+#                                        write_ad_settings --pause 45 pending_grace_seconds=120
+#                                        write_ad_settings starting_session_seconds='"120"'
+#                                        write_ad_settings          (removes the file)
+#
 #   Stub workers (fmk mode; fixtures/stub-claude.sh's header states the modes, the
 #   SessionStart re-fire, its stop line and the MCP session; each runs both guards first)
 #   STUB_MODE_DEV_CHANNELS STUB_MODE_AT_ONCE STUB_MODE_SILENT STUB_MODE_UNRECOGNISED
@@ -712,6 +740,110 @@
 #                                      calls, the stub's lines and its stop line never count
 #   cscb_ad_count <verb> [<fragment>...]
 #                                      print how many lines `cscb_ad_calls` would print
+#
+#   Scenario 10's harness additions (fmk mode; b.jg5 SRJ-1412, SRJ-1306, SRJ-1401). Each is a
+#   harness addition, confirm at the reconcile pass; each runs `require_ci_image` first, and
+#   `start_second_tmux_server` and the window copies of `cscb_ad_calls_between` and
+#   `cscb_ad_count_between` also `require_scenario_home`, before any step. Scenario 10 writes
+#   its `[tmux]` table with `write_ad_settings` (above). A harness
+#   agent-director call under another tmux environment needs no helper: a prefix assignment
+#   on the call (`TMUX_TMPDIR=<dir> ad_capture …`, `TMUX=<value> ad_capture …`) holds for
+#   that one call only, from the scenario's own shell, and reaches the binary behind the shim.
+#   start_second_tmux_server [<session-name>]
+#                                      (harness addition, confirm at the reconcile pass) start
+#                                      another tmux server, with the real tmux from the scenario's
+#                                      own shell, on its own socket
+#                                      `$SCENARIO_ROOT/tmux-second/tmux-<uid>/default`, with one
+#                                      detached session (default name <SCENARIO_TAG>_second); it
+#                                      names that socket with -S on every call, so the scenario's
+#                                      own server is never touched, and the trap stops it with
+#                                      every other tmux socket under SCENARIO_ROOT. Refuses when
+#                                      TMUX_TMPDIR is not the scenario's or TMUX is set, and once
+#                                      one was started; fails unless the socket then answers with
+#                                      the new server's PID. Sets SECOND_TMUX_SOCKET and
+#                                      SECOND_TMUX, the TMUX value that points at it
+#                                      (`<socket>,<server pid>,<session number>`), and prints
+#                                      SECOND_TMUX
+#   (ad_shim_mark, with the latch scenarios' readers below, gives the marks for the two helpers
+#   that follow)
+#   cscb_ad_calls_between <from-mark> <to-mark|-> <verb> [<fragment>...]
+#   cscb_ad_count_between <from-mark> <to-mark|-> <verb> [<fragment>...]
+#                                      (harness addition, confirm at the reconcile pass)
+#                                      `cscb_ad_calls` and `cscb_ad_count` over only the shim
+#                                      log's lines after <from-mark> up to <to-mark> (`-`: up to
+#                                      the log's end now), read from a copy of those lines under
+#                                      SCENARIO_ROOT with the same CSCB process record
+#   slack_record_mark <record>         (harness addition, confirm at the reconcile pass) print
+#                                      the last `seq` of the Slack stub's record <record> (a file
+#                                      under SCENARIO_ROOT; 0 when it holds none)
+#   slack_label_posts <record> <label> [<after-seq>]
+#                                      (harness addition, confirm at the reconcile pass) print the
+#                                      text of each `chat.postMessage` the Slack stub recorded for
+#                                      the token label <label> with a `seq` above <after-seq>
+#                                      (default 0), in record order, one JSON string per line
+#                                      (`jq -r` gives a post's text back)
+#
+#   Scenario 26's harness additions (fmk mode; b.jg5 SRJ-1428, SRJ-1306, SRJ-1401). Each is a
+#   harness addition, confirm at the reconcile pass.
+#   SCENARIO_AD_OWNER_OPTION SCENARIO_AD_PANE_OPTION
+#                                      (harness addition, confirm at the reconcile pass) the two
+#                                      tmux option names agent-director labels a session and its
+#                                      worker pane with, `@ad_owner` and `@ad_pane`, as the seeding
+#                                      helpers above set them; src/ names neither (SRJ-716)
+#   restore_tmux_socket <moved-socket> (harness addition, confirm at the reconcile pass) undo
+#                                      `rebind_tmux_socket`: both guards first, then, from the
+#                                      scenario's own shell with the real tmux (it refuses when
+#                                      TMUX_TMPDIR is not the scenario's or TMUX is set), it reads
+#                                      the recorded server on <moved-socket> (a
+#                                      `<socket>.rebound-<n>` socket under SCENARIO_ROOT/tmux, whose
+#                                      server's own socket path is <socket>) with its sessions and
+#                                      panes, ends the other server at <socket> (kill-server, then
+#                                      waits until its process is gone; every tmux call names its
+#                                      socket with -S, and the server at <socket> is ended only
+#                                      when its PID is not the recorded server's, so the recorded
+#                                      server is never the one ended), moves <moved-socket> back
+#                                      to <socket>, and fails unless <socket> then answers with the
+#                                      recorded server's PID and the same sessions, panes and pane
+#                                      processes, each pane process still running; prints the
+#                                      recorded server's PID and clears REBOUND_SOCKET
+#   cscb_tmux_calls [<fragment>...]    (harness addition, confirm at the reconcile pass) print the
+#                                      tmux shim's `call` lines whose parent is any CSCB process the
+#                                      record holds at the line's time (a bot server, a `start` or
+#                                      `stop` run, or a CLI command or driver run through
+#                                      `cscb_run`), and whose words, joined by single spaces, hold
+#                                      every fixed-string <fragment> in order; a line whose parent is
+#                                      agent-director, the scenario's own shell or a stub is never
+#                                      one. `assert_no_server_tmux` reads bot-server parents only
+#   cscb_tmux_count [<fragment>...]    (harness addition, confirm at the reconcile pass) print how
+#                                      many lines `cscb_tmux_calls` would print
+#   end_worker_without_session_end <pane-id>
+#                                      (harness addition, confirm at the reconcile pass) a worker
+#                                      whose process ends with no SessionEnd: both guards first,
+#                                      then, from the scenario's own shell with the real tmux (it
+#                                      refuses when TMUX_TMPDIR is not the scenario's or TMUX is
+#                                      set), it reads the pane's main process (#{pane_pid}; the stub
+#                                      is that process) and sends it SIGKILL, so it runs no more of
+#                                      its own code and fires no hook; nothing else is signalled.
+#                                      Fails unless the pane is a live pane (%N) and its process is
+#                                      gone within 10 s. agent-director's row is not touched: it
+#                                      still reads live until a `find-missing` marks it, and with
+#                                      remain-on-exit on the pane and its session remain. Prints
+#                                      `<pane id> <ended pid>`
+#   end_stub_mcp_session <pane-id>     (harness addition, confirm at the reconcile pass) a stub
+#                                      worker's MCP session ended from the client's side: both
+#                                      guards first, then, from the scenario's own shell with the
+#                                      real tmux (it refuses when TMUX_TMPDIR is not the scenario's
+#                                      or TMUX is set), it reads the pane's main process
+#                                      (#{pane_pid}), refuses unless that process is the scenario's
+#                                      stub ($SCENARIO_BIN/claude), finds the stub's one child
+#                                      running the scenario's copy of the MCP session client
+#                                      ($SCENARIO_BIN/stub-mcp-session.ts, `pgrep -P`) and sends
+#                                      that child SIGTERM; the stub itself is never signalled.
+#                                      Fails unless the pane is a live pane (%N), the stub runs
+#                                      exactly one such client, the client is gone within 10 s and
+#                                      the stub still runs. The bot server sees the session close;
+#                                      agent-director's row is not touched. Prints `<pane id> <stub
+#                                      pid> <ended client pid>`
 #
 #   Readers for the latch scenarios (fmk mode; harness additions, b.jg5 SRJ-1306). The
 #   agent-director readers are built on `cscb_ad_calls`'s filter: only `call` lines whose
@@ -3136,6 +3268,105 @@ end_session() {
 }
 
 # ---------------------------------------------------------------------------
+# agent-director's settings file (fmk mode; harness addition, scenario 24,
+# test-26, and scenario 10)
+# ---------------------------------------------------------------------------
+
+# The settings file's path relative to HOME, the `[tmux]` and `[pause]`
+# table names and the pause wait's key, as the installed package exports
+# them (AD_SETTINGS_RELATIVE_PATH, AD_TMUX_TABLE, AD_PAUSE_TABLE,
+# AD_PAUSE_TIMEOUT_KEY), read through the printer at a shell's first
+# write_ad_settings.
+_SCENARIO_AD_SETTINGS_NAMES=()
+
+# _scenario_ad_settings_names <step>: fill _SCENARIO_AD_SETTINGS_NAMES, once
+# per shell; fail when the printer fails or a name is not of its kind.
+_scenario_ad_settings_names() {
+    local step="$1" entry value names=()
+    (( ${#_SCENARIO_AD_SETTINGS_NAMES[@]} == 4 )) && return 0
+    for entry in AD_SETTINGS_RELATIVE_PATH AD_TMUX_TABLE AD_PAUSE_TABLE AD_PAUSE_TIMEOUT_KEY; do
+        value="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" "${entry}")" || fail "${step}: fmk-texts: ${entry}"
+        names+=("${value}")
+    done
+    [[ -n "${names[0]}" && "${names[0]}" != /* && "/${names[0]}/" != */../* && "${names[0]}" != *[[:cntrl:]]* ]] \
+        || fail "${step}: the package's AD_SETTINGS_RELATIVE_PATH '${names[0]}' is not a relative path inside HOME"
+    for value in "${names[@]:1}"; do
+        [[ "${value}" =~ ^[a-z_]+$ ]] || fail "${step}: the package gives table or key name '${value}', not a TOML bare key"
+    done
+    _SCENARIO_AD_SETTINGS_NAMES=("${names[@]}")
+}
+
+# _scenario_ad_settings_value <step> <name> <value>: fail unless <value> is
+# one line of TOML value text: not empty, no control character.
+_scenario_ad_settings_value() {
+    [[ -n "$3" && "$3" != *[[:cntrl:]]* ]] || fail "$1: the value of $2 is empty or holds a control character"
+}
+
+write_ad_settings() {
+    local step="write_ad_settings $*" pause="" have_pause=0 pairs=() seen=" " key value path dir real_root real_dir content
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ "${SCENARIO_FMK}" == 1 ]] || fail "${step}: the scenario HOME's agent-director settings are for fmk scripts only"
+    while (( $# > 0 )); do
+        case "$1" in
+            --pause)
+                (( $# >= 2 )) || fail "${step}: --pause takes a value"
+                (( ! have_pause )) || fail "${step}: --pause is given twice"
+                _scenario_ad_settings_value "${step}" --pause "$2"
+                have_pause=1
+                pause="$2"
+                shift 2
+                ;;
+            *=*)
+                key="${1%%=*}"
+                value="${1#*=}"
+                [[ "${key}" =~ ^[a-z_][a-z0-9_]*$ ]] \
+                    || fail "${step}: key '${key}' is not a TOML bare key of lowercase letters, digits and _"
+                [[ "${seen}" != *" ${key} "* ]] || fail "${step}: ${key} is given twice"
+                seen+="${key} "
+                _scenario_ad_settings_value "${step}" "${key}" "${value}"
+                pairs+=("${key} = ${value}")
+                shift
+                ;;
+            *) fail "${step}: '$1' is neither <key>=<value> nor --pause <value>" ;;
+        esac
+    done
+    _scenario_ad_settings_names "${step}"
+    path="${HOME}/${_SCENARIO_AD_SETTINGS_NAMES[0]}"
+    dir="${path%/*}"
+    [[ "${path}" == "${SCENARIO_ROOT}"/* ]] || fail "${step}: refused: ${path} is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
+    if [[ -e "${path}" || -L "${path}" ]]; then
+        [[ -f "${path}" && ! -L "${path}" ]] || fail "${step}: refused: ${path} is not a regular file"
+    fi
+    AD_SETTINGS_FILE="${path}"
+    if (( ${#pairs[@]} == 0 && ! have_pause )); then
+        # No table: no file, so agent-director's defaults.
+        rm -f -- "${path}" || fail "${step}: could not remove ${path}"
+        [[ ! -e "${path}" ]] || fail "${step}: ${path} is still there after its removal"
+        return 0
+    fi
+    mkdir -p -- "${dir}" || fail "${step}: could not create ${dir}"
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
+    real_dir="$(realpath -e -- "${dir}" 2> /dev/null)" || fail "${step}: cannot resolve ${dir}"
+    [[ "${real_dir}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: ${dir} resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
+    content=""
+    if (( ${#pairs[@]} > 0 )); then
+        printf -v content '[%s]\n' "${_SCENARIO_AD_SETTINGS_NAMES[1]}"
+        printf -v value '%s\n' "${pairs[@]}"
+        content+="${value}"
+    fi
+    if (( have_pause )); then
+        [[ -z "${content}" ]] || content+=$'\n'
+        printf -v value '[%s]\n%s = %s\n' "${_SCENARIO_AD_SETTINGS_NAMES[2]}" "${_SCENARIO_AD_SETTINGS_NAMES[3]}" "${pause}"
+        content+="${value}"
+    fi
+    # One rename, so agent-director and CSCB never read half a file.
+    write_file "${path}" 0644 < <(printf '%s' "${content}")
+    [[ "$(cat -- "${path}" && printf x)" == "${content}x" ]] || fail "${step}: ${path} does not hold what was written"
+}
+
+# ---------------------------------------------------------------------------
 # The human's filesystem steps (fmk mode; harness addition, confirm at the
 # reconcile pass)
 # ---------------------------------------------------------------------------
@@ -3978,6 +4209,285 @@ cscb_ad_calls() {
 
 cscb_ad_count() {
     _scenario_cscb_ad_scan "cscb_ad_count" count "${1-}" "${@:2}"
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 10's harness additions (fmk mode; each a harness addition, confirm
+# at the reconcile pass)
+# ---------------------------------------------------------------------------
+
+# _scenario_printed <step> <entry> [<arg>...]: print fixtures/fmk-texts.ts's
+# value for <entry>; fail when the printer fails.
+_scenario_printed() {
+    local step="$1" entry="$2" out
+    shift 2
+    out="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" "${entry}" "$@")" \
+        || fail "${step}: fmk-texts could not print ${entry}"
+    printf '%s\n' "${out}"
+}
+
+start_second_tmux_server() {
+    local name="${1:-${SCENARIO_TAG}_second}" step="start_second_tmux_server" dir sock out pid sid got
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    _scenario_check_session_name "${step}" "${name}"
+    [[ -z "${SECOND_TMUX_SOCKET:-}" ]] \
+        || fail "${step}: a second tmux server was already started (${SECOND_TMUX_SOCKET})"
+    dir="${SCENARIO_ROOT}/tmux-second/tmux-$(id -u)"
+    sock="${dir}/default"
+    [[ "${sock}" != "${TMUX_TMPDIR}"/* ]] || fail "${step}: refused: ${sock} is under the scenario's own TMUX_TMPDIR"
+    mkdir -p -- "${dir}" || fail "${step}: could not create ${dir}"
+    chmod 00700 "${SCENARIO_ROOT}/tmux-second" "${dir}" || fail "${step}: could not set the modes of ${dir}"
+    [[ ! -e "${sock}" ]] || fail "${step}: ${sock} already exists"
+    out="$("${SCENARIO_REAL_TMUX}" -S "${sock}" new-session -d -P -F '#{pid} #{session_id}' -s "${name}" 2> "${SCENARIO_ROOT}/harness-tmux.err")" \
+        || fail "${step}: tmux new-session on ${sock} failed: $(_scenario_tmux_err)"
+    read -r pid sid <<< "${out}"
+    [[ "${pid}" =~ ^[0-9]+$ && "${sid}" =~ ^\$[0-9]+$ ]] \
+        || fail "${step}: tmux new-session printed '${out}', not a server pid and a session id"
+    got="$("${SCENARIO_REAL_TMUX}" -S "${sock}" list-sessions -F '#{pid}' 2> "${SCENARIO_ROOT}/harness-tmux.err")" \
+        || fail "${step}: ${sock} does not answer: $(_scenario_tmux_err)"
+    [[ "${got%%$'\n'*}" == "${pid}" && -S "${sock}" ]] \
+        || fail "${step}: ${sock} answers with server pid '${got%%$'\n'*}', not the new server's ${pid}"
+    pid_alive "${pid}" || fail "${step}: the new tmux server ${pid} is not running"
+    SECOND_TMUX_SOCKET="${sock}"
+    SECOND_TMUX="${sock},${pid},${sid#\$}"
+    printf '%s\n' "${SECOND_TMUX}"
+}
+
+
+# _scenario_ad_window <step> <from-mark> <to-mark|->: copy the shim log's
+# lines after <from-mark> up to <to-mark> to a new file under SCENARIO_ROOT
+# and print its path.
+_scenario_ad_window() {
+    local step="$1" from="$2" to="$3" file
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ "${from}" =~ ^[0-9]+$ ]] || fail "${step}: mark '${from}' is not a line count"
+    if [[ "${to}" == - ]]; then
+        to="$(ad_shim_mark)"
+    fi
+    [[ "${to}" =~ ^[0-9]+$ ]] || fail "${step}: mark '${to}' is not a line count"
+    mkdir -p -- "${SCENARIO_ROOT}/ad-windows" || fail "${step}: could not create ${SCENARIO_ROOT}/ad-windows"
+    file="$(mktemp "${SCENARIO_ROOT}/ad-windows/window.XXXXXX")" || fail "${step}: could not create a window file"
+    if (( to > from )); then
+        sed -n "$(( from + 1 )),${to}p" "${SCENARIO_AD_SHIM_LOG}" > "${file}" \
+            || fail "${step}: could not copy lines $(( from + 1 )) to ${to} of ${SCENARIO_AD_SHIM_LOG}"
+    fi
+    printf '%s\n' "${file}"
+}
+
+cscb_ad_calls_between() {
+    local file
+    file="$(_scenario_ad_window "cscb_ad_calls_between" "${1-}" "${2-}")" || exit 1
+    ( SCENARIO_AD_SHIM_LOG="${file}"; cscb_ad_calls "${3-}" "${@:4}" )
+}
+
+cscb_ad_count_between() {
+    local file
+    file="$(_scenario_ad_window "cscb_ad_count_between" "${1-}" "${2-}")" || exit 1
+    ( SCENARIO_AD_SHIM_LOG="${file}"; cscb_ad_count "${3-}" "${@:4}" )
+}
+
+# _scenario_slack_record <step> <record>: fail unless <record> is a file under
+# SCENARIO_ROOT.
+_scenario_slack_record() {
+    require_ci_image "$1"
+    [[ -n "$2" && "$2" == "${SCENARIO_ROOT}"/* && -f "$2" ]] \
+        || fail "$1: '$2' is not a Slack stub record under SCENARIO_ROOT"
+}
+
+slack_record_mark() {
+    local record="${1:-}" out
+    _scenario_slack_record "slack_record_mark" "${record}"
+    out="$(jq -s 'map(.seq // 0) | max // 0' "${record}")" \
+        || fail "slack_record_mark: jq could not read ${record}"
+    printf '%s\n' "${out}"
+}
+
+slack_label_posts() {
+    local record="${1:-}" label="${2:-}" after="${3:-0}" step="slack_label_posts ${2:-}"
+    _scenario_slack_record "${step}" "${record}"
+    [[ -n "${label}" ]] || fail "${step}: no label given"
+    [[ "${after}" =~ ^[0-9]+$ ]] || fail "${step}: '${after}' is not a seq"
+    jq -c --arg l "${label}" --argjson a "${after}" \
+        'select(.event == "api" and .method == "chat.postMessage" and .label == $l and (.seq // 0) > $a) | .text' \
+        "${record}" || fail "${step}: jq could not read ${record}"
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 26's harness additions (fmk mode; each a harness addition, confirm
+# at the reconcile pass)
+# ---------------------------------------------------------------------------
+
+# The tmux options agent-director labels a session (@ad_owner) and its worker
+# pane (@ad_pane) with: the names `_scenario_set_labels` sets. Read by the
+# scenario scripts.
+# shellcheck disable=SC2034
+SCENARIO_AD_OWNER_OPTION='@ad_owner'
+# shellcheck disable=SC2034
+SCENARIO_AD_PANE_OPTION='@ad_pane'
+
+# _scenario_panes_of <step> <tmux-arg>...: print `<session id> <pane id>
+# <pane pid>` for every pane of the server the tmux arguments reach, sorted;
+# fail when it does not answer.
+_scenario_panes_of() {
+    local step="$1" out
+    shift
+    out="$("${SCENARIO_REAL_TMUX}" "$@" list-panes -a -F '#{session_id} #{pane_id} #{pane_pid}' 2> "${SCENARIO_ROOT}/harness-tmux.err")" \
+        || fail "${step}: tmux $* list-panes failed: $(_scenario_tmux_err)"
+    sort <<< "${out}"
+}
+
+restore_tmux_socket() {
+    local moved="${1:-}" step sock out line old_pid path new_pid before after pane_pid
+    step="restore_tmux_socket ${moved}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    [[ "${moved}" =~ ^(.+)\.rebound-[0-9]+$ ]] \
+        || fail "${step}: '${moved}' is not a socket rebind_tmux_socket moved (<socket>.rebound-<n>)"
+    sock="${BASH_REMATCH[1]}"
+    [[ "${moved}" == "${SCENARIO_ROOT}/tmux/"* && "${moved}" != */../* && -S "${moved}" ]] \
+        || fail "${step}: refused: '${moved}' is not a socket under ${SCENARIO_ROOT}/tmux"
+    # The recorded server, on the moved socket.
+    out="$("${SCENARIO_REAL_TMUX}" -S "${moved}" list-sessions -F '#{pid} #{socket_path}' 2> "${SCENARIO_ROOT}/harness-tmux.err")" \
+        || fail "${step}: no tmux server answers on ${moved}: $(_scenario_tmux_err)"
+    line="${out%%$'\n'*}"
+    old_pid="${line%% *}"
+    path="${line#* }"
+    [[ "${old_pid}" =~ ^[0-9]+$ ]] || fail "${step}: tmux gave server pid '${old_pid}' on ${moved}"
+    [[ "${path}" == "${sock}" ]] || fail "${step}: the server on ${moved} has socket path '${path}', not ${sock}"
+    before="$(_scenario_panes_of "${step}" -S "${moved}")" || exit 1
+    # The other server, at the socket path, named with -S like every call
+    # here, so the one ended is the server at <socket> and never the recorded
+    # one (on <moved-socket>).
+    out="$(_scenario_tmux -S "${sock}" list-sessions -F '#{pid}')" \
+        || fail "${step}: no tmux server answers at ${sock}: $(_scenario_tmux_err)"
+    new_pid="${out%%$'\n'*}"
+    [[ "${new_pid}" =~ ^[0-9]+$ && "${new_pid}" != "${old_pid}" ]] \
+        || fail "${step}: ${sock} answers with server pid '${new_pid}', not another server than the recorded ${old_pid}"
+    _scenario_tmux -S "${sock}" kill-server || fail "${step}: tmux kill-server at ${sock} failed: $(_scenario_tmux_err)"
+    _scenario_poll_until "${SCENARIO_TMUX_STOP_S}" _scenario_pid_gone "${new_pid}" \
+        || fail "${step}: the other tmux server ${new_pid} still runs ${SCENARIO_TMUX_STOP_S} s after kill-server"
+    pid_alive "${old_pid}" || fail "${step}: the recorded tmux server ${old_pid} is gone"
+    mv -f -- "${moved}" "${sock}" || fail "${step}: could not move ${moved} back to ${sock}"
+    out="$(_scenario_tmux -S "${sock}" list-sessions -F '#{pid}')" \
+        || fail "${step}: no tmux server answers at ${sock} after the move: $(_scenario_tmux_err)"
+    [[ "${out%%$'\n'*}" == "${old_pid}" ]] \
+        || fail "${step}: ${sock} answers with server pid '${out%%$'\n'*}', not the recorded server's ${old_pid}"
+    after="$(_scenario_panes_of "${step}" -S "${sock}")" || exit 1
+    [[ "${after}" == "${before}" ]] \
+        || fail "${step}: the recorded server's sessions and panes changed: '${before//$'\n'/; }' -> '${after//$'\n'/; }'"
+    while read -r _ _ pane_pid; do
+        [[ -z "${pane_pid}" ]] || pid_alive "${pane_pid}" \
+            || fail "${step}: pane process ${pane_pid} of the recorded server no longer runs"
+    done <<< "${after}"
+    REBOUND_SOCKET=""
+    printf '%s\n' "${old_pid}"
+}
+
+# _scenario_cscb_tmux_scan <step> <print|count> [<fragment>...]: over the
+# tmux shim's `call` lines whose parent is a CSCB process, the ones whose
+# words, joined by single spaces, hold every fragment in order: print them,
+# or how many.
+_scenario_cscb_tmux_scan() {
+    local step="$1" mode="$2" lines=() i n=0 rest frag ok
+    shift 2
+    _scenario_query_prep "${step}"
+    _scenario_read_log "${step}" "${SCENARIO_TMUX_SHIM_LOG}" lines
+    for i in "${!lines[@]}"; do
+        _scenario_split_line "${lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        _scenario_role_at "${_L_PPID}" "${_L_US}" || continue
+        _scenario_decode_words
+        printf -v rest '%s ' ${_L_WORDS[@]+"${_L_WORDS[@]}"}
+        rest="${rest% }"
+        ok=1
+        for frag in "$@"; do
+            if [[ "${rest}" != *"${frag}"* ]]; then
+                ok=0
+                break
+            fi
+            rest="${rest#*"${frag}"}"
+        done
+        (( ok )) || continue
+        n=$(( n + 1 ))
+        if [[ "${mode}" == print ]]; then
+            printf '%s\n' "${lines[i]}"
+        fi
+    done
+    if [[ "${mode}" == count ]]; then
+        echo "${n}"
+    fi
+}
+
+cscb_tmux_calls() {
+    _scenario_cscb_tmux_scan "cscb_tmux_calls" print "$@"
+}
+
+cscb_tmux_count() {
+    _scenario_cscb_tmux_scan "cscb_tmux_count" count "$@"
+}
+
+# Bound on a worker's process ending after end_worker_without_session_end's
+# SIGKILL, in seconds.
+SCENARIO_WORKER_END_S=10
+
+end_worker_without_session_end() {
+    local pane="${1:-}" step out pid dead
+    step="end_worker_without_session_end ${pane}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    [[ "${pane}" =~ ^%[0-9]+$ ]] || fail "${step}: '${pane}' is not a pane id (%N)"
+    out="$(_scenario_tmux display-message -p -t "${pane}" '#{pane_pid} #{pane_dead}')" \
+        || fail "${step}: no pane ${pane} on the scenario's tmux server: $(_scenario_tmux_err)"
+    read -r pid dead <<< "${out}"
+    if [[ ! "${pid}" =~ ^[0-9]+$ || "${dead}" != 0 ]] || ! pid_alive "${pid}"; then
+        fail "${step}: pane ${pane} reads pid '${pid}', dead '${dead}': no live process runs in it"
+    fi
+    # SIGKILL: the process runs none of its own code again, so it fires no
+    # hook (the stub fires SessionEnd only on its sentinel) and runs no trap.
+    kill -KILL "${pid}" 2> /dev/null || fail "${step}: could not signal pane ${pane}'s process ${pid}"
+    _scenario_poll_until "${SCENARIO_WORKER_END_S}" _scenario_pid_gone "${pid}" \
+        || fail "${step}: pane ${pane}'s process ${pid} still runs ${SCENARIO_WORKER_END_S} s after SIGKILL"
+    printf '%s %s\n' "${pane}" "${pid}"
+}
+
+# Bound on a stub's MCP session client ending after end_stub_mcp_session's
+# SIGTERM, in seconds.
+SCENARIO_MCP_CLIENT_END_S=10
+
+end_stub_mcp_session() {
+    local pane="${1:-}" step out stub_pid dead clients=() client
+    step="end_stub_mcp_session ${pane}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    [[ "${pane}" =~ ^%[0-9]+$ ]] || fail "${step}: '${pane}' is not a pane id (%N)"
+    out="$(_scenario_tmux display-message -p -t "${pane}" '#{pane_pid} #{pane_dead}')" \
+        || fail "${step}: no pane ${pane} on the scenario's tmux server: $(_scenario_tmux_err)"
+    read -r stub_pid dead <<< "${out}"
+    if [[ ! "${stub_pid}" =~ ^[0-9]+$ || "${dead}" != 0 ]] || ! pid_alive "${stub_pid}"; then
+        fail "${step}: pane ${pane} reads pid '${stub_pid}', dead '${dead}': no live process runs in it"
+    fi
+    grep -qzxF -- "${SCENARIO_BIN}/claude" "/proc/${stub_pid}/cmdline" 2> /dev/null \
+        || fail "${step}: refused: pane ${pane}'s process ${stub_pid} is not the scenario's stub ${SCENARIO_BIN}/claude"
+    # The stub's MCP session client (stub-claude.sh open_mcp_session): a child
+    # of the stub, run with bun on the copy beside the stub.
+    mapfile -t clients < <(pgrep -P "${stub_pid}" -f -- 'stub-mcp-session\.ts' || true)
+    (( ${#clients[@]} == 1 )) \
+        || fail "${step}: the stub ${stub_pid} runs ${#clients[@]} MCP session client(s) (${clients[*]-none}), not one"
+    client="${clients[0]}"
+    grep -qzxF -- "${SCENARIO_BIN}/stub-mcp-session.ts" "/proc/${client}/cmdline" 2> /dev/null \
+        || fail "${step}: refused: the stub's child ${client} does not run the scenario's client ${SCENARIO_BIN}/stub-mcp-session.ts"
+    pid_alive "${client}" || fail "${step}: the stub's MCP session client ${client} no longer runs"
+    kill -TERM "${client}" 2> /dev/null || fail "${step}: could not signal the stub's MCP session client ${client}"
+    _scenario_poll_until "${SCENARIO_MCP_CLIENT_END_S}" _scenario_pid_gone "${client}" \
+        || fail "${step}: the stub's MCP session client ${client} still runs ${SCENARIO_MCP_CLIENT_END_S} s after SIGTERM"
+    pid_alive "${stub_pid}" || fail "${step}: the stub ${stub_pid} no longer runs after its MCP session client ended"
+    printf '%s %s %s\n' "${pane}" "${stub_pid}" "${client}"
 }
 
 # ---------------------------------------------------------------------------

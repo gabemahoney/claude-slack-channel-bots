@@ -18,16 +18,21 @@
  *   `packageExport(…)`: any defined value;
  * - each `latchStrings(context, <name>)`: an array of strings in
  *   `conflict-latch.ts`; each `adSettingsDefaultMs(<name>)`: a function in
- *   `ad-settings.ts`.
+ *   `ad-settings.ts`; each `builderEntry('<file>', '<name>', …)`: a function.
  *
  * A `<name>` is a string literal, or an identifier bound to one by a `const`
  * in an enclosing scope (an entry's `const entry = '<export>'`, a top-level
- * constant). Two names are chosen at run time from a top-level collection
- * (`CHOSEN_FROM`), and stand for every value of it. A call inside a helper's
+ * constant). Some names are chosen at run time from a top-level collection
+ * (`CHOSEN_FROM`), and stand for every value of it; a few are a script's
+ * argument the printer checks only for a prefix (`CHOSEN_BY_PREFIX`), and the
+ * module must export at least one name with that prefix, of the kind read. A call inside a helper's
  * own body that passes that helper's parameter on is the helper forwarding
  * its caller's name, and its callers are read instead. Any other name the
  * reader cannot resolve is a finding, so a new form of reference in the
- * printer fails here until this file learns it.
+ * printer fails here until this file learns it. Only the printer's shared
+ * table's forms are read: the fixed-argument and one-function tables
+ * (`ARGS_ENTRIES`, `FN_ENTRIES`) load their exports through their own helpers,
+ * which this reader does not follow.
  *
  * The reader is pinned with synthetic sources, then run over the printer;
  * each export it lists is looked up in the `src/` modules this file imports
@@ -48,11 +53,20 @@ import * as adDescriptionPhrases from '../src/ad-description-phrases.ts'
 import * as adErrorClass from '../src/ad-error-class.ts'
 import * as adSettings from '../src/ad-settings.ts'
 import * as adVersionGate from '../src/ad-version-gate.ts'
+import * as backoff from '../src/backoff.ts'
+import * as config from '../src/config.ts'
 import * as conflictLatch from '../src/conflict-latch.ts'
 import * as installCheckLabels from '../src/install-check-labels.ts'
 import * as invalidFlagsHold from '../src/invalid-flags-hold.ts'
+import * as livenessReading from '../src/liveness-reading.ts'
+import * as outageState from '../src/outage-state.ts'
+import * as paneRead from '../src/pane-read.ts'
+import * as personaEpisodes from '../src/persona-episodes.ts'
 import * as personaIdentity from '../src/persona-identity.ts'
 import * as personaNotifier from '../src/persona-notifier.ts'
+import * as restart from '../src/restart.ts'
+import * as sessionManager from '../src/session-manager.ts'
+import * as unavailableRetry from '../src/unavailable-retry.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 
 const REPO_ROOT = join(import.meta.dir, '..')
@@ -65,11 +79,20 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'ad-error-class.ts': adErrorClass,
   'ad-settings.ts': adSettings,
   'ad-version-gate.ts': adVersionGate,
+  'backoff.ts': backoff,
+  'config.ts': config,
   'conflict-latch.ts': conflictLatch,
   'install-check-labels.ts': installCheckLabels,
   'invalid-flags-hold.ts': invalidFlagsHold,
+  'liveness-reading.ts': livenessReading,
+  'outage-state.ts': outageState,
+  'pane-read.ts': paneRead,
+  'persona-episodes.ts': personaEpisodes,
   'persona-identity.ts': personaIdentity,
   'persona-notifier.ts': personaNotifier,
+  'restart.ts': restart,
+  'session-manager.ts': sessionManager,
+  'unavailable-retry.ts': unavailableRetry,
 }
 
 /** What the printer requires an export to be. */
@@ -100,6 +123,7 @@ const HELPERS: Readonly<Record<string, Helper>> = {
   packageExport: { fileArg: 1, nameArg: 2, kind: 'defined' },
   latchStrings: { fixedFile: 'conflict-latch.ts', nameArg: 1, kind: 'string-array' },
   adSettingsDefaultMs: { fixedFile: 'ad-settings.ts', nameArg: 0, kind: 'function' },
+  builderEntry: { fileArg: 0, nameArg: 1, kind: 'function' },
 }
 
 /** The helper naming a constant for every name of a top-level list: `constantEntries('<file>', <LIST>)`. */
@@ -113,6 +137,18 @@ const LIST_HELPER = 'constantEntries'
 const CHOSEN_FROM: Readonly<Record<string, string>> = {
   'recoveryReasonArgument:name': 'RECOVERY_REASON_EXPORTS',
   'belowPhase1FloorMessage:foundByExport': 'FOUND_BY_EXPORTS',
+  'conflictLatchSetHead:outcomeExport': 'LATCH_SET_OUTCOME_EXPORTS',
+}
+
+/**
+ * The names the printer takes from a script's argument, checked only for a
+ * prefix, by `<owner>:<identifier>`: the module, the prefix the printer
+ * requires and the kind it reads. Each must match at least one export of
+ * that module of that kind.
+ */
+const CHOSEN_BY_PREFIX: Readonly<Record<string, { readonly file: string; readonly prefix: string; readonly kind: ExportKind }>> = {
+  'relaunchWithoutKill:reasonExport': { file: 'restart.ts', prefix: 'RELAUNCH_NO_KILL_', kind: 'string' },
+  'relaunchWithoutKill:readingExport': { file: 'liveness-reading.ts', prefix: 'LIVENESS_READING_DEAD', kind: 'defined' },
 }
 
 /** What `printerRefs` reads from a source. */
@@ -120,7 +156,7 @@ interface PrinterReading {
   readonly refs: readonly PrinterRef[]
   /** One line per reference it could not resolve: `<line>: <call text>`. */
   readonly unresolved: readonly string[]
-  /** The `CHOSEN_FROM` keys it used. */
+  /** The `CHOSEN_FROM` and `CHOSEN_BY_PREFIX` keys it used. */
   readonly chosenUsed: readonly string[]
   /** The top-level string lists and string-valued objects, by name. */
   readonly collections: Readonly<Record<string, readonly string[]>>
@@ -225,6 +261,10 @@ function printerRefs(source: string): PrinterReading {
     if (Object.hasOwn(CHOSEN_FROM, key) && Object.hasOwn(collections, CHOSEN_FROM[key])) {
       chosenUsed.add(key)
       return collections[CHOSEN_FROM[key]]
+    }
+    if (Object.hasOwn(CHOSEN_BY_PREFIX, key)) {
+      chosenUsed.add(key)
+      return []
     }
     return undefined
   }
@@ -332,7 +372,12 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
 
   test('every name the printer passes is resolved, and every CHOSEN_FROM row is used', () => {
     expect(reading.unresolved).toEqual([])
-    expect(reading.chosenUsed).toEqual(Object.keys(CHOSEN_FROM).sort())
+    expect(reading.chosenUsed).toEqual([...Object.keys(CHOSEN_FROM), ...Object.keys(CHOSEN_BY_PREFIX)].sort())
+  })
+
+  test.each(Object.entries(CHOSEN_BY_PREFIX))('%s: src/ exports at least one name with its prefix, of its kind', (_key, { file, prefix, kind }) => {
+    const mod = MODULES[file] ?? {}
+    expect(Object.keys(mod).filter((name) => name.startsWith(prefix) && kindMismatch(mod[name], kind) === undefined).length).toBeGreaterThan(0)
   })
 
   test('the latch scenarios’ lists are read whole: every name of LATCH_CONSTANT_NAMES and CASE_PHRASE_NAMES is a constant reference', () => {
