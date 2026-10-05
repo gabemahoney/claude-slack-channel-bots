@@ -105,7 +105,7 @@ import ts from 'typescript'
 
 import { AD_TMUX_TABLE } from '../src/ad-settings.ts'
 import { PHASE1_ONLY_ERR_NAMES } from '../src/agent-director-errors.ts'
-import { AGENT_DIRECTOR_MODULE, agentDirectorNamespaceArguments, agentDirectorValueReads } from './test-helpers/ad-value-reads.ts'
+import { AD_NS, AGENT_DIRECTOR_MODULE, agentDirectorNamespaceArguments, agentDirectorValueReads, finding } from './test-helpers/ad-value-reads.ts'
 import {
   callArguments,
   DELETE_HELPERS,
@@ -1126,9 +1126,6 @@ describe('b.jg5 SRJ-101, SRJ-104: every class the client declares is decided by 
 /** The three Phase-1-only class names, as the audits below take them. */
 const PHASE1_NAMES: readonly string[] = PHASE1_ONLY_ERR_NAMES
 
-/** `1-based-line: what` for a finding at `node` in `sf`. */
-const findingAt = (sf: ts.SourceFile, node: ts.Node, what: string): string => `${sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1}: ${what}`
-
 /**
  * The Phase-1-only names `sf` does not re-export as plain static named
  * re-exports of agent-director: an element `X` (no `as`, not type-only) of an
@@ -1160,8 +1157,8 @@ function phase1ReadFindings(sf: ts.SourceFile): string[] {
   return [
     ...agentDirectorValueReads(sf, PHASE1_NAMES)
       .filter((read) => !ts.isImportSpecifier(read.node) && !ts.isExportSpecifier(read.node))
-      .map((read) => findingAt(sf, read.node, read.what)),
-    ...agentDirectorNamespaceArguments(sf).map((arg) => findingAt(sf, arg, 'the agent-director namespace passed to a call')),
+      .map((read) => finding(sf, read.node, read.what)),
+    ...agentDirectorNamespaceArguments(sf).map((arg) => finding(sf, arg, 'the agent-director namespace passed to a call')),
   ]
 }
 
@@ -1261,7 +1258,7 @@ function phase1StandInFindings(sf: ts.SourceFile, b: ClassNameBindings): string[
     })
     if (named.size > 0 || unreadable) {
       const as = named.size > 0 ? [...named].sort().join(', ') : 'a name the audit cannot read'
-      findings.push(findingAt(sf, node, `a class extending AgentDirectorError named ${as}`))
+      findings.push(finding(sf, node, `a class extending AgentDirectorError named ${as}`))
     }
   }
   return findings
@@ -1285,8 +1282,6 @@ const PHASE1_AUDIT_TREE: ReadonlyArray<readonly [string, string]> = [
 function auditPhase1(files: ReadonlyArray<readonly [string, string]>, audit: (sf: ts.SourceFile) => string[]): string[] {
   return files.flatMap(([file, text]) => audit(parseSource(file, text)).map((f) => `${file}:${f}`))
 }
-
-const AD_NS = "import * as ad from 'agent-director'"
 
 /** A plain re-export of every Phase-1-only name but `without`, as one declaration. */
 const reExportsWithout = (without: string): string => `export { AgentDirectorError, ${PHASE1_NAMES.filter((n) => n !== without).join(', ')} } from 'agent-director'`
@@ -1431,11 +1426,11 @@ function phase1TypesFindings(sf: ts.SourceFile): string[] {
     if (ts.isTypeAliasDeclaration(statement)) continue
     if (ts.isImportDeclaration(statement) && statement.importClause?.isTypeOnly === true
       && ts.isStringLiteral(statement.moduleSpecifier) && statement.moduleSpecifier.text === AGENT_DIRECTOR_MODULE) continue
-    findings.push(findingAt(sf, statement, `a statement other than a type alias or a type-only agent-director import: ${ts.SyntaxKind[statement.kind]}`))
+    findings.push(finding(sf, statement, `a statement other than a type alias or a type-only agent-director import: ${ts.SyntaxKind[statement.kind]}`))
   }
   forEachNode(sf, (node) => {
     if (ts.isInterfaceDeclaration(node) || ts.isTypeLiteralNode(node) || ts.isMappedTypeNode(node)) {
-      findings.push(findingAt(sf, node, `a field declaration: ${ts.SyntaxKind[node.kind]}`))
+      findings.push(finding(sf, node, `a field declaration: ${ts.SyntaxKind[node.kind]}`))
     }
   })
   return findings

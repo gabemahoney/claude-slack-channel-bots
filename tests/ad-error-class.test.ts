@@ -21,8 +21,8 @@
  *
  * Every value is built with the stub's builders; a value of a class with a
  * description no builder takes has that description set on the builder's
- * value. The one exception is `RC_KILL_FAILED_DESCRIPTIONS`, the release
- * candidate's kill-failure descriptions as literals, which pins the survivor
+ * value. The one exception is `AD_KILL_FAILED_DESCRIPTIONS`, agent-director
+ * v0.11.0's kill-failure descriptions as literals, which pins the survivor
  * pattern to agent-director's own wording. A base `AgentDirectorError` named like a class (`errGeneric`), an
  * `Error` named like one and an object shaped like one are the by-class
  * negatives. The client's classes (the three Phase-1-only ones,
@@ -768,8 +768,8 @@ const PHASE1_BUILDS: ReadonlyArray<readonly [label: string, errorClass: AdErrorC
  * description with the worker-and-survivor option, each with the default
  * pids: the survivor pids its survivor clause names (none for the three
  * descriptions without one) and whether it names the worker's pid. The forms
- * are agent-director 0.11.0-rc.1's (commit `d787cb4`,
- * `pkg/api/kill_errors.go`): the worker's pid is named in the
+ * are agent-director tag `v0.11.0`'s (`pkg/api/kill_errors.go`): the
+ * worker's pid is named in the
  * `outlived-exit-wait` and `no-session-no-kill` descriptions and beside the
  * survivor clause with the option, and is never a survivor.
  */
@@ -1008,20 +1008,22 @@ describe('stub builders: shape (SRJ-1303)', () => {
 // ---------------------------------------------------------------------------
 
 /**
- * The release candidate's `ErrTmuxKillFailed` descriptions as written: each
- * row is the full text the client delivers (agent-director's `err.Error()`,
+ * Agent-director's `ErrTmuxKillFailed` descriptions as written: each row is
+ * the full text the client delivers (agent-director's `err.Error()`,
  * `tmux: agent process still running: instance <id>: tmux session "<name>":
- * …`), copied by hand from agent-director 0.11.0-rc.1 (commit `d787cb4`,
- * `pkg/api/kill_errors.go`: `waitExpiredError`, `uncheckableError`,
- * `noPaneError`), with the survivor clause each names (none for a row
- * without one) and the pids `survivorPids` reads from it. This is the one
- * place the release candidate's wording is written out as literals, never
- * built from `src/ad-description-phrases.ts`, so a change to
+ * …`), in the wording of agent-director tag `v0.11.0`
+ * (`pkg/api/kill_errors.go`: `waitExpiredError`, `uncheckableError`,
+ * `noPaneError`; copied from the release candidate, and a source diff of
+ * that file from the release candidate to `v0.11.0` confirms the wording is
+ * unchanged), with the survivor clause each names (none for a row without
+ * one) and the pids `survivorPids` reads from it. This is the one place
+ * agent-director's wording is written out as literals, never built from
+ * `src/ad-description-phrases.ts`, so a change to
  * `SURVIVOR_CLAUSE_ONE_PHRASE` or `SURVIVOR_CLAUSE_MANY_PHRASE` that
- * agent-director does not share fails here. It is the check E51 re-runs
- * against 0.11.0. The worker's pid, 4321, is never a survivor.
+ * agent-director does not share fails here. The worker's pid, 4321, is
+ * never a survivor.
  */
-const RC_KILL_FAILED_DESCRIPTIONS: ReadonlyArray<readonly [label: string, description: string, clause: string | undefined, survivors: readonly number[]]> = [
+const AD_KILL_FAILED_DESCRIPTIONS: ReadonlyArray<readonly [label: string, description: string, clause: string | undefined, survivors: readonly number[]]> = [
   [
     'worker only',
     'tmux: agent process still running: instance cscb_alpha: tmux session "slack_bot_alpha": a kill was sent to the agent\'s pane and to its labelled session, and the agent process (pid 4321) was still running after the kill exit wait of 5 s; retry kill later; never delete this row',
@@ -1067,17 +1069,17 @@ const RC_KILL_FAILED_DESCRIPTIONS: ReadonlyArray<readonly [label: string, descri
 ]
 
 /**
- * The survivor clause's forms are agent-director 0.11.0-rc.1's (commit
- * `d787cb4`, `pkg/api/kill_errors.go`): one survivor named after
+ * The survivor clause's forms are agent-director tag `v0.11.0`'s
+ * (`pkg/api/kill_errors.go`): one survivor named after
  * `SURVIVOR_CLAUSE_ONE_PHRASE`, two or more after
- * `SURVIVOR_CLAUSE_MANY_PHRASE`. Apart from the release candidate's literal
- * descriptions (`RC_KILL_FAILED_DESCRIPTIONS`), every description is built by
+ * `SURVIVOR_CLAUSE_MANY_PHRASE`. Apart from agent-director's literal
+ * descriptions (`AD_KILL_FAILED_DESCRIPTIONS`), every description is built by
  * the stub's `errTmuxKillFailed`; a clause whose words and pid form disagree
  * is a stub description with the other clause's words swapped in.
  */
 describe('SURVIVOR_PID_PATTERN and survivorPids (b.jg5 SRJ-702)', () => {
-  test.each(RC_KILL_FAILED_DESCRIPTIONS)(
-    'the release candidate\'s description (%s): SURVIVOR_PID_PATTERN matches only its survivor clause and survivorPids reads exactly the survivor pids, never the worker\'s',
+  test.each(AD_KILL_FAILED_DESCRIPTIONS)(
+    'agent-director\'s description (%s): SURVIVOR_PID_PATTERN matches only its survivor clause and survivorPids reads exactly the survivor pids, never the worker\'s',
     (_label, description, clause, survivors) => {
       const matches = [...description.matchAll(new RegExp(SURVIVOR_PID_PATTERN.source, 'g'))].map((m) => m[0])
       expect(matches).toEqual(clause === undefined ? [] : [clause])

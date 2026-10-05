@@ -9,7 +9,10 @@
  *   classes (b.jg5 SRJ-101, SRJ-103), which `src/` takes only as plain named
  *   re-exports.
  *
- * Also exported: the parser primitives both audits are built on. Everything
+ * Also exported: `agentDirectorNamespaces`, which both audits collect the
+ * namespace bindings with; the parser primitives both audits are built on;
+ * and `finding` and `AD_NS`, the finding format and synthetic-source import
+ * line both suites share. Everything
  * here is pure over a parsed `ts.SourceFile`: no file is read and nothing is
  * loaded, so text in strings, comments, templates and regex literals never
  * counts.
@@ -21,6 +24,14 @@ import ts from 'typescript'
 
 /** The client's module specifier. */
 export const AGENT_DIRECTOR_MODULE = 'agent-director'
+
+/** A namespace import of agent-director as `ad`, the first line of the audits' synthetic sources. */
+export const AD_NS = "import * as ad from 'agent-director'"
+
+/** `1-based-line: what` for a finding at `node` in `sf`. */
+export function finding(sf: ts.SourceFile, node: ts.Node, what: string): string {
+  return `${sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1}: ${what}`
+}
 
 /** Calls `visit` on every node under `root`, depth first. */
 export function forEachNode(root: ts.Node, visit: (node: ts.Node) => void): void {
@@ -85,6 +96,64 @@ export function propertyNameText(name: ts.PropertyName | ts.BindingName | undefi
   return stringText(name)
 }
 
+/**
+ * The names in `sf` bound to the agent-director module namespace: a static
+ * namespace or default import (`import x from`, `import * as x from`,
+ * `import { default as x } from`), `import x = require`, and a copy of one
+ * (`const x = ns`, `const x = { ...ns }`, `const { ...x } = ns`, each through
+ * any wrapper), a dynamic `import()` or `require()` held in a variable
+ * included. Type-only imports bind none.
+ */
+export function agentDirectorNamespaces(sf: ts.SourceFile): Set<string> {
+  const namespaces = new Set<string>()
+  const isNamespace = isAgentDirectorNamespace(namespaces)
+  forEachNode(sf, (node) => {
+    if (ts.isImportDeclaration(node) && stringText(node.moduleSpecifier) === AGENT_DIRECTOR_MODULE) {
+      const clause = node.importClause
+      if (clause === undefined || clause.isTypeOnly) return
+      if (clause.name !== undefined) namespaces.add(clause.name.text)
+      const bindings = clause.namedBindings
+      if (bindings !== undefined && ts.isNamespaceImport(bindings)) namespaces.add(bindings.name.text)
+      else if (bindings !== undefined) {
+        for (const el of bindings.elements) if (!el.isTypeOnly && (el.propertyName ?? el.name).text === 'default') namespaces.add(el.name.text)
+      }
+    } else if (ts.isImportEqualsDeclaration(node) && !node.isTypeOnly && ts.isExternalModuleReference(node.moduleReference)
+      && stringText(node.moduleReference.expression) === AGENT_DIRECTOR_MODULE) {
+      namespaces.add(node.name.text)
+    }
+  })
+
+  // Copies of a namespace: `const x = ns`, `const x = { ...ns }`, `const { ...x } = ns`.
+  for (let grew = true; grew;) {
+    grew = false
+    forEachNode(sf, (node) => {
+      if (!ts.isVariableDeclaration(node) || node.initializer === undefined) return
+      const copies: string[] = []
+      const init = unwrap(node.initializer)
+      if (ts.isIdentifier(node.name) && (isNamespace(init) || (ts.isObjectLiteralExpression(init) && init.properties.some((p) => ts.isSpreadAssignment(p) && isNamespace(p.expression))))) {
+        copies.push(node.name.text)
+      } else if (ts.isObjectBindingPattern(node.name) && isNamespace(init)) {
+        for (const el of node.name.elements) if (el.dotDotDotToken !== undefined && ts.isIdentifier(el.name)) copies.push(el.name.text)
+      }
+      for (const name of copies) {
+        if (!namespaces.has(name)) {
+          namespaces.add(name)
+          grew = true
+        }
+      }
+    })
+  }
+  return namespaces
+}
+
+/** Whether an expression, through any wrapper, is one of `namespaces` or a dynamic load of agent-director. */
+function isAgentDirectorNamespace(namespaces: ReadonlySet<string>): (expr: ts.Expression) => boolean {
+  return (expr) => {
+    const inner = unwrap(expr)
+    return (ts.isIdentifier(inner) && namespaces.has(inner.text)) || moduleLoadOf(inner) === AGENT_DIRECTOR_MODULE
+  }
+}
+
 /** One place a file holds an agent-director export as a value (see `agentDirectorValueReads`). */
 export interface AgentDirectorValueRead {
   /** The export read, or undefined when the audit cannot tell which (a computed read, a load it cannot follow, `export *`). */
@@ -117,40 +186,26 @@ export function agentDirectorValueReads(sf: ts.SourceFile, names: readonly strin
   const flag = (node: ts.Node, what: string, name?: string): void => {
     findings.push({ name, node, what })
   }
-  const namespaces = new Set<string>()
-
-  const isNamespace = (expr: ts.Expression): boolean => {
-    const inner = unwrap(expr)
-    return (ts.isIdentifier(inner) && namespaces.has(inner.text)) || moduleLoadOf(inner) === AGENT_DIRECTOR_MODULE
-  }
+  const isNamespace = isAgentDirectorNamespace(agentDirectorNamespaces(sf))
   const checkBindingPattern = (pattern: ts.ObjectBindingPattern): void => {
     for (const el of pattern.elements) {
-      if (el.dotDotDotToken !== undefined) continue // a rest copy: collected as a namespace below
+      if (el.dotDotDotToken !== undefined) continue // a rest copy: a namespace (agentDirectorNamespaces)
       const name = propertyNameText(el.propertyName ?? el.name)
       if (name === undefined && el.propertyName !== undefined) flag(el, 'computed destructuring of agent-director')
       else if (name !== undefined && names.includes(name)) flag(el, `destructuring of ${name} from agent-director`, name)
     }
   }
 
-  // Bindings: static imports and re-exports, and dynamic loads.
+  // Named imports and re-exports, and dynamic loads (the namespaces they bind are agentDirectorNamespaces').
   forEachNode(sf, (node) => {
     if (ts.isImportDeclaration(node) && stringText(node.moduleSpecifier) === AGENT_DIRECTOR_MODULE) {
-      const clause = node.importClause
-      if (clause === undefined || clause.isTypeOnly) return
-      if (clause.name !== undefined) namespaces.add(clause.name.text)
-      const bindings = clause.namedBindings
-      if (bindings !== undefined && ts.isNamespaceImport(bindings)) namespaces.add(bindings.name.text)
-      else if (bindings !== undefined) {
+      const bindings = node.importClause?.isTypeOnly === false ? node.importClause.namedBindings : undefined
+      if (bindings !== undefined && ts.isNamedImports(bindings)) {
         for (const el of bindings.elements) {
-          if (el.isTypeOnly) continue
           const imported = (el.propertyName ?? el.name).text
-          if (names.includes(imported)) flag(el, `value import of ${imported} from agent-director`, imported)
-          if (imported === 'default') namespaces.add(el.name.text)
+          if (!el.isTypeOnly && names.includes(imported)) flag(el, `value import of ${imported} from agent-director`, imported)
         }
       }
-    } else if (ts.isImportEqualsDeclaration(node) && !node.isTypeOnly && ts.isExternalModuleReference(node.moduleReference)
-      && stringText(node.moduleReference.expression) === AGENT_DIRECTOR_MODULE) {
-      namespaces.add(node.name.text)
     } else if (ts.isExportDeclaration(node) && !node.isTypeOnly && stringText(node.moduleSpecifier) === AGENT_DIRECTOR_MODULE) {
       const clause = node.exportClause
       if (clause === undefined || ts.isNamespaceExport(clause)) flag(node, 'value re-export of the whole agent-director module')
@@ -165,35 +220,13 @@ export function agentDirectorValueReads(sf: ts.SourceFile, names: readonly strin
       const context = outer.parent
       if (isPromiseMemberUse(node as ts.CallExpression)) flag(node, 'agent-director loaded in a form the audit cannot follow')
       else if (ts.isVariableDeclaration(context) && context.initializer === outer) {
-        if (ts.isIdentifier(context.name)) namespaces.add(context.name.text)
-        // An object pattern is checked with the other destructurings below.
-        else if (!ts.isObjectBindingPattern(context.name)) flag(node, 'agent-director loaded into a pattern the audit cannot follow')
+        // A name is a namespace (agentDirectorNamespaces); an object pattern is checked with the other destructurings below.
+        if (!ts.isIdentifier(context.name) && !ts.isObjectBindingPattern(context.name)) flag(node, 'agent-director loaded into a pattern the audit cannot follow')
       } else if (!((ts.isPropertyAccessExpression(context) || ts.isElementAccessExpression(context)) && context.expression === outer) && !ts.isSpreadAssignment(context)) {
         flag(node, 'agent-director loaded in a form the audit cannot follow')
       }
     }
   })
-
-  // Copies of a namespace: `const x = ns`, `const x = { ...ns }`, `const { ...x } = ns`.
-  for (let grew = true; grew;) {
-    grew = false
-    forEachNode(sf, (node) => {
-      if (!ts.isVariableDeclaration(node) || node.initializer === undefined) return
-      const copies: string[] = []
-      const init = unwrap(node.initializer)
-      if (ts.isIdentifier(node.name) && (isNamespace(init) || (ts.isObjectLiteralExpression(init) && init.properties.some((p) => ts.isSpreadAssignment(p) && isNamespace(p.expression))))) {
-        copies.push(node.name.text)
-      } else if (ts.isObjectBindingPattern(node.name) && isNamespace(init)) {
-        for (const el of node.name.elements) if (el.dotDotDotToken !== undefined && ts.isIdentifier(el.name)) copies.push(el.name.text)
-      }
-      for (const name of copies) {
-        if (!namespaces.has(name)) {
-          namespaces.add(name)
-          grew = true
-        }
-      }
-    })
-  }
 
   // Reads through a namespace or one of its copies.
   forEachNode(sf, (node) => {
@@ -225,45 +258,7 @@ export function agentDirectorValueReads(sf: ts.SourceFile, names: readonly strin
  * `!`, parentheses, `await`): the callee may read any export.
  */
 export function agentDirectorNamespaceArguments(sf: ts.SourceFile): ts.Expression[] {
-  const namespaces = new Set<string>()
-  const isNamespace = (expr: ts.Expression): boolean => {
-    const inner = unwrap(expr)
-    return (ts.isIdentifier(inner) && namespaces.has(inner.text)) || moduleLoadOf(inner) === AGENT_DIRECTOR_MODULE
-  }
-  forEachNode(sf, (node) => {
-    if (ts.isImportDeclaration(node) && stringText(node.moduleSpecifier) === AGENT_DIRECTOR_MODULE) {
-      const clause = node.importClause
-      if (clause === undefined || clause.isTypeOnly) return
-      if (clause.name !== undefined) namespaces.add(clause.name.text)
-      const bindings = clause.namedBindings
-      if (bindings !== undefined && ts.isNamespaceImport(bindings)) namespaces.add(bindings.name.text)
-      else if (bindings !== undefined) {
-        for (const el of bindings.elements) if (!el.isTypeOnly && (el.propertyName ?? el.name).text === 'default') namespaces.add(el.name.text)
-      }
-    } else if (ts.isImportEqualsDeclaration(node) && !node.isTypeOnly && ts.isExternalModuleReference(node.moduleReference)
-      && stringText(node.moduleReference.expression) === AGENT_DIRECTOR_MODULE) {
-      namespaces.add(node.name.text)
-    }
-  })
-  for (let grew = true; grew;) {
-    grew = false
-    forEachNode(sf, (node) => {
-      if (!ts.isVariableDeclaration(node) || node.initializer === undefined) return
-      const init = unwrap(node.initializer)
-      const copies: string[] = []
-      if (ts.isIdentifier(node.name) && (isNamespace(init) || (ts.isObjectLiteralExpression(init) && init.properties.some((p) => ts.isSpreadAssignment(p) && isNamespace(p.expression))))) {
-        copies.push(node.name.text)
-      } else if (ts.isObjectBindingPattern(node.name) && isNamespace(init)) {
-        for (const el of node.name.elements) if (el.dotDotDotToken !== undefined && ts.isIdentifier(el.name)) copies.push(el.name.text)
-      }
-      for (const name of copies) {
-        if (!namespaces.has(name)) {
-          namespaces.add(name)
-          grew = true
-        }
-      }
-    })
-  }
+  const isNamespace = isAgentDirectorNamespace(agentDirectorNamespaces(sf))
   const found: ts.Expression[] = []
   forEachNode(sf, (node) => {
     if (ts.isCallExpression(node) || ts.isNewExpression(node)) found.push(...(node.arguments ?? []).filter(isNamespace))

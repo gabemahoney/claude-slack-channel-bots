@@ -121,7 +121,9 @@ import {
   resolveToolDir,
 } from './test-helpers/host-safe-env.ts'
 import {
+  AD_NS,
   agentDirectorValueReads,
+  finding,
   forEachNode,
   isPromiseMemberUse,
   moduleLoadOf,
@@ -461,11 +463,6 @@ const SCRIPT_FILE = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/
 /** `source` parsed as TypeScript, with parent links. */
 function parse(source: string, fileName = 'synthetic.ts'): ts.SourceFile {
   return ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
-}
-
-/** `1-based-line: what` for a finding at `node`. */
-function finding(sf: ts.SourceFile, node: ts.Node, what: string): string {
-  return `${sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1}: ${what}`
 }
 
 /** Every regular file under `dir` (`node_modules` and `.git` skipped) that `keep` accepts. */
@@ -1090,7 +1087,6 @@ function callSiteAudit(what: string): (sf: ts.SourceFile) => string[] {
 /** One source line per entry, so no synthetic line starts at column 0 in this file. */
 const lines = (...parts: string[]): string => parts.join('\n')
 
-const AD_NS = "import * as ad from 'agent-director'"
 const SAFE_ENV_IMPORT = "import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'"
 const SPAWN_SYNC_IMPORT = "import { spawnSync } from 'node:child_process'"
 

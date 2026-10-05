@@ -903,8 +903,8 @@ export function errTmuxUnresponsiveNewRowEnded(
 }
 
 /**
- * The four `ErrTmuxKillFailed` descriptions, in agent-director 0.11.0-rc.1's
- * wording (`pkg/api/kill_errors.go`):
+ * The four `ErrTmuxKillFailed` descriptions, in agent-director tag
+ * `v0.11.0`'s wording (`pkg/api/kill_errors.go`):
  *   - `'outlived-exit-wait'`: variant (a), worker only: a kill was sent and
  *     "the agent process (pid N)" was still running after the kill exit wait
  *     of 5 s, N being {@link STUB_WORKER_PID};

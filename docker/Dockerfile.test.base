@@ -24,8 +24,8 @@
 #   /opt/agent-director/admin/agent-director-admin
 #       the release's operator tool (`delete`, `kill-finished`), from the
 #       same install; never on PATH. It and its directory are mode 0755, so
-#       testuser can run it by this path (the scenario harness does, and
-#       install.sh --binary takes it as --admin-binary).
+#       a scenario harness running as testuser can run it by this path
+#       (install.sh --binary takes it as --admin-binary).
 #   /opt/agent-director/install/install.sh
 #       the release's install script, from agent-director's source tree at
 #       the release tag; off PATH; its directory holds nothing else.
