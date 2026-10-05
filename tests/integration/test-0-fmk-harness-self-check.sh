@@ -2596,7 +2596,7 @@ leg_stub_helpers() {
     stub_dialog_delay "${dir}" 0
 
     # The linger's release: it names a pane, and refuses before any signal.
-    expect_fails_in_home "${step}" "${HOME}" "tmux display-message exited" stub_release t0-no-such-pane
+    expect_fails_in_home "${step}" "${HOME}" "no pane t0-no-such-pane on the scenario's tmux server" stub_release t0-no-such-pane
     expect_fails_in_home "${step}" "${HOME}" "refused: TMUX is set" with_tmux_set stub_release "${T0_SESSION}"
 
     expect_fails_in_home "${step}" "${HOME}" "tmux send-keys exited" stub_press_enter t0-no-such-pane
