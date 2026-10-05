@@ -78,7 +78,12 @@
  *                                 timeout that was CSCB's own call timeout
  *   PENDING_ROW_RULE_LOG_HEAD     src/pending-row.ts PENDING_ROW_RULE_LOG_HEAD: the
  *                                 head of the pending-row rule's lines
- *   UNAVAILABLE_RETRY_BASE_S      src/unavailable-retry.ts UNAVAILABLE_RETRY_BASE_S: the
+ *   PENDING_ROW_RUN_MARKED_MISSING
+ *                                 src/pending-row.ts PENDING_ROW_RUN_MARKED_MISSING: the
+ *                                 placement a pending-row rule round's line gives
+ *                                 its bypassing `find-missing` run when the run
+ *                                 marked the row `missing`
+ *   UNAVAILABLE_RETRY_BASE_S     src/unavailable-retry.ts UNAVAILABLE_RETRY_BASE_S: the
  *                                 retry timer's first wait, in seconds
  *   UNAVAILABLE_RETRY_CEILING_S   src/unavailable-retry.ts UNAVAILABLE_RETRY_CEILING_S:
  *                                 the retry timer's longest wait, in seconds
@@ -89,6 +94,15 @@
  *                                 TMUX_UNRESPONSIVE_END_TEXT names, in its order, one
  *                                 line each: every ended line the persona's
  *                                 tmux-unresponsive condition can log
+ *   spawnFailureNoticeHead <error-name>
+ *                                 src/session-manager.ts spawnFailureNoticeText (the
+ *                                 body `notifySpawnFailure` posts) for an
+ *                                 agent-director error named <error-name> (letters
+ *                                 and digits, starting `Err`), cut where the error's
+ *                                 description begins: the notice's first line, then
+ *                                 its error line up to and including the `—` after
+ *                                 the label (the description is agent-director's and
+ *                                 the remediation follows it, so neither is printed)
  *
  * It makes no agent-director call, starts no process or server, opens no
  * socket, reads no token and writes no file.
@@ -198,6 +212,34 @@ async function tmuxUnresponsiveEndedLines(key: string): Promise<string> {
   return lines.join('\n')
 }
 
+/** An agent-director error name: `Err`, then letters and digits. */
+const ERROR_NAME_RE = /^Err[A-Za-z0-9]+$/
+
+/** The description the notice is built with; cut off with all that follows it. */
+const DESCRIPTION_MARK = 'fmk texts description mark'
+
+/**
+ * The spawn-failure notice's head for an error named `errorName`: the
+ * package's `spawnFailureNoticeText` for an `AgentDirectorError` of that name
+ * whose description is {@link DESCRIPTION_MARK}, up to where the mark begins.
+ */
+async function spawnFailureNoticeHead(errorName: string): Promise<string> {
+  if (!ERROR_NAME_RE.test(errorName)) {
+    throw new PrinterFailure(USAGE_EXIT, `spawnFailureNoticeHead: '${errorName}' is not an agent-director error name (Err, then letters and digits)`)
+  }
+  const build = await packageExport('session-manager.ts', 'spawnFailureNoticeText')
+  const errorClass = await packageExport('agent-director-errors.ts', 'AgentDirectorError')
+  if (typeof build !== 'function') throw new PrinterFailure(PACKAGE_EXIT, "the installed package's src/session-manager.ts spawnFailureNoticeText is not a function")
+  if (typeof errorClass !== 'function') throw new PrinterFailure(PACKAGE_EXIT, "the installed package's src/agent-director-errors.ts AgentDirectorError is not a class")
+  const error: unknown = new (errorClass as new (verb: string, name: string, description: string) => unknown)('spawn', errorName, DESCRIPTION_MARK)
+  const text: unknown = (build as (error: unknown) => unknown)(error)
+  const at = typeof text === 'string' ? text.indexOf(DESCRIPTION_MARK) : -1
+  if (typeof text !== 'string' || at <= 0) {
+    throw new PrinterFailure(PACKAGE_EXIT, "the installed package's src/session-manager.ts spawnFailureNoticeText gave no text holding the error's description")
+  }
+  return text.slice(0, at)
+}
+
 /** The entries, by the name a script passes. */
 const ENTRIES: Readonly<Record<string, Entry>> = {
   APPROVER_LOG_PREFIX: noArguments('APPROVER_LOG_PREFIX', () => stringExport('session-manager.ts', 'APPROVER_LOG_PREFIX')),
@@ -221,9 +263,13 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
     stringExport('ad-error-class.ts', 'LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT'),
   ),
   PENDING_ROW_RULE_LOG_HEAD: noArguments('PENDING_ROW_RULE_LOG_HEAD', () => stringExport('pending-row.ts', 'PENDING_ROW_RULE_LOG_HEAD')),
+  PENDING_ROW_RUN_MARKED_MISSING: noArguments('PENDING_ROW_RUN_MARKED_MISSING', () =>
+    stringExport('pending-row.ts', 'PENDING_ROW_RUN_MARKED_MISSING'),
+  ),
   UNAVAILABLE_RETRY_BASE_S: noArguments('UNAVAILABLE_RETRY_BASE_S', () => wholeNumberAt('unavailable-retry.ts', 'UNAVAILABLE_RETRY_BASE_S', [])),
   UNAVAILABLE_RETRY_CEILING_S: noArguments('UNAVAILABLE_RETRY_CEILING_S', () => wholeNumberAt('unavailable-retry.ts', 'UNAVAILABLE_RETRY_CEILING_S', [])),
   tmuxUnresponsiveEndedLines: oneArgument('tmuxUnresponsiveEndedLines', 'key', tmuxUnresponsiveEndedLines),
+  spawnFailureNoticeHead: oneArgument('spawnFailureNoticeHead', 'error-name', spawnFailureNoticeHead),
 }
 
 async function main(argv: readonly string[]): Promise<number> {

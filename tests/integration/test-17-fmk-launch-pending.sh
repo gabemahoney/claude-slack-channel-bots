@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Test 17 (HO §7 scenario 5; b.jg5 SRJ-1406, SRJ-401, SRJ-402, SRJ-404,
-# SRJ-406, SRJ-407, SRJ-409, SRJ-410, SRJ-310, SRJ-710, SRJ-1306, SRJ-1401,
-# SRJ-1418; AC 3, AC 29, AC 32): a launch in progress, in three legs, run in
-# this order:
+# Test 17 (HO §7 scenarios 5 and 11; b.jg5 SRJ-1406, SRJ-1413, SRJ-401,
+# SRJ-402, SRJ-404, SRJ-406, SRJ-407, SRJ-409, SRJ-410, SRJ-120, SRJ-310,
+# SRJ-710, SRJ-713, SRJ-1306, SRJ-1401, SRJ-1418; AC 3, AC 6, AC 29, AC 32): a
+# launch in progress, in four legs, run in this order:
 # - scenario 5's leg (`leg_launch_pending`): a resume held at the
 #   dev-channels dialog reads `pending` with its kept claude_session_id and a
 #   launch start; health ticks and a `resume` forced meanwhile change nothing
@@ -23,7 +23,13 @@
 #   screen across a server restart (a plain `stop`, then a start) is found
 #   `pending` by the new server, which made no launch for it and runs no
 #   approver of its own; the pending-row rule's lap from G clears the dialog
-#   and the row reaches `waiting`, with no launch, kill or post (AC 32).
+#   and the row reaches `waiting`, with no launch, kill or post (AC 32);
+# - scenario 11's leg (`leg_fail_create`): a fresh spawn whose
+#   session-creating tmux call fails (the tmux shim's `fail-create`) ends in
+#   ErrTmuxSessionCreate and leaves a `pending` row; CSCB never kills it or
+#   launches over it, its own pending-row rule's `find-missing` marks it
+#   `missing` from G, and the persona is then brought up, with no post
+#   calling it a dispatcher bug and no escalation (AC 6).
 #
 # The fmk set-up (lib/scenario.sh, fmk mode: TEST_NAME carries `-fmk-`):
 # - its own HOME, agent-director store and tmux server under SCENARIO_ROOT;
@@ -31,7 +37,7 @@
 #   shim (agent-director-admin too); agent-director's default settings (no
 #   config.toml, so no `[tmux]` table);
 # - the tmux shim first on every CSCB process's PATH, in `log` mode apart
-#   from the launch-timeout legs' start (below);
+#   from the launch-timeout legs' start and scenario 11's start (below);
 # - the stub as `claude`, in `dev-channels` (no selection) in every persona's
 #   working directory, with the dialog delay (`stub_dialog_delay`) where a
 #   leg sets it;
@@ -211,6 +217,58 @@
 # L, both servers' calls of Q with their times, the old server's approver
 # lines, and the new server's retry-timer and pending-row rule lines.
 #
+# Scenario 11's leg (`leg_fail_create`), in run order, in state dir
+# `failcreate`, `health_check_interval` 0 (ruling S3: the failure arms the
+# retry timer at once, so no tick is needed), one persona F (working
+# directory `failcreate`, no dialog delay), the only persona the server
+# launches while the shim is in `fail-create`. The harness runs no
+# `find-missing` (SRJ-1401: F is not latched, so its row is marked by CSCB's
+# own pending-row runs).
+#   1. [harness] F's row is absent (a harness `get` answers ErrSpawnNotFound).
+#   2. [harness] The tmux shim is set to `fail-create`, then the live start
+#      makes F's plain spawn: agent-director writes the row, its
+#      `new-session` call fails (the shim logs it, creates nothing and exits
+#      1), and the spawn ends in ErrTmuxSessionCreate.
+#   3. [harness] Once server.log holds the plain spawn's ErrTmuxSessionCreate
+#      line for F (the launch call has ended), the shim is set back to `log`;
+#      at least one `new-session` call reached the shim in `fail-create`.
+#   4. [harness] A `get` reads F's row `pending` with a launch start L that
+#      parses; a `list --state pending` lists F's row alone.
+#   5. [harness] F's row is read every FC_POLL_S until it is live, bounded at
+#      FC_BRINGUP_BOUND_S from L; each read before G that finds the row
+#      `pending` with launch start L is followed by `list --state pending`,
+#      which must list F's row alone. The row comes up `waiting` and the
+#      server registers F's session.
+#   6. Checks, over the bot server's agent-director calls (`call_table`):
+#      - its one launch call (spawn or `resume`, any row) while the shim was
+#        in `fail-create` is F's plain spawn (no `--reuse-finished`);
+#      - no `find-missing` of its between L and G after it;
+#      - F's next launch (the bot server's first spawn or `resume` of F's row
+#        after the failed spawn) comes after its last `find-missing` before
+#        that launch, which is at or after G, and after a `get` of F's row
+#        between the two;
+#      - exactly one PENDING_ROW_RULE_LOG_HEAD round line for F names its run
+#        PENDING_ROW_RUN_MARKED_MISSING and its get `missing`, written no
+#        later than F's next launch;
+#      - [harness] a harness read of `missing`, when one caught it, comes
+#        after that `find-missing`;
+#      - no `kill` of F's row from any CSCB process, and no `find-missing` in
+#        the leg from any process but the bot server (the scenario's shell
+#        makes none);
+#      - no post in the Slack stub's record holds "dispatcher bug" (matched
+#        case-insensitively over the whole recorded post); at most one post
+#        holds the spawn-failure notice's first line, and that one holds the
+#        notice's head for ErrTmuxSessionCreate; no other post (no cap,
+#        alert or stuck-launch post).
+#   The server is then stopped with a plain `stop`, and [harness] F's worker
+#   ends with the sentinel.
+# Recorded, not asserted (ruling S8): the failure line and how many
+# `new-session` calls failed, the start pass's summary, the harness reads in
+# order (whether one caught `missing`), the bot server's calls of F's row
+# and its `find-missing` runs with their times from L, F's retry-timer,
+# pending-row rule and collision lines, the startup-errors.log lines naming
+# F, and whether the counted failure posted a spawn-failure notice.
+#
 # Waits and their derivation (seconds):
 # - DIALOG_DELAY_S = HEALTH_TICK_S + FORCED_RESUME_S + HOLD_SLACK_S: longer
 #   than one health tick interval plus the forced `resume` (bounded at
@@ -259,6 +317,15 @@
 #   RESTART_LAP_SLACK_S covers the lap's calls, the stub's report-in and the
 #   harness's read. OLD_APPROVER_WAIT_S bounds the old server's approver's
 #   first pane read after the row read `pending`.
+# - FC_BRINGUP_BOUND_S = G + UNAVAILABLE_RETRY_CEILING_S +
+#   FC_BRINGUP_SLACK_S, from L: the failure armed F's retry timer, whose
+#   retries run the pending-row rule; the first retry at or after G runs the
+#   rule's `find-missing`, and no retry wait is longer than the ceiling;
+#   FC_BRINGUP_SLACK_S covers the rule's calls, the restart path's launch
+#   after the `missing` read (with `session_restart_delay`, 5 s in this
+#   config, should it wait), the approver's Enter, the stub's report-in and
+#   the harness's read. The failure itself is awaited within START_WAIT_S of
+#   the start.
 #
 # Matched values. CSCB's values are printed by fixtures/fmk-texts.ts from
 # the installed package, never retyped: APPROVER_LOG_PREFIX,
@@ -270,10 +337,14 @@
 # LAUNCH_TIMEOUT_PHRASE (src/ad-description-phrases.ts); CALL_TIMEOUT_NAME
 # (src/ad-error-class.ts LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT);
 # UNAVAILABLE_RETRY_BASE_S and UNAVAILABLE_RETRY_CEILING_S
-# (src/unavailable-retry.ts); PENDING_ROW_RULE_LOG_HEAD (src/pending-row.ts);
-# and each persona's tmux-unresponsive ended lines (src/persona-episodes.ts
+# (src/unavailable-retry.ts); PENDING_ROW_RULE_LOG_HEAD and
+# PENDING_ROW_RUN_MARKED_MISSING (src/pending-row.ts); each persona's
+# tmux-unresponsive ended lines (src/persona-episodes.ts
 # tmuxUnresponsiveEndedLine over the reasons of TMUX_UNRESPONSIVE_END_TEXT,
-# entry `tmuxUnresponsiveEndedLines`).
+# entry `tmuxUnresponsiveEndedLines`); and the spawn-failure notice's head
+# for ErrTmuxSessionCreate (src/session-manager.ts spawnFailureNoticeText,
+# the body notifySpawnFailure posts; entry `spawnFailureNoticeHead`), whose
+# first line is matched on its own to find any spawn-failure post.
 # Fragments with no exported builder, each quoted from its source:
 # - `[slack] Session connected: persona <ref>` (src/server.ts, the MCP
 #   session's registration line);
@@ -288,6 +359,14 @@
 #   unavailableRetryStoppedLine);
 # - `[slack] conflict-latch: persona=<key> ` (src/conflict-latch.ts, the
 #   latch record's lines);
+# - `[slack] spawnForPersona: `, `failed for <ref>: ` and ErrTmuxSessionCreate
+#   (src/session-manager.ts plainSpawnFailedAt, the LAUNCH FAILURE line, with
+#   describeAgentDirectorFailure's error name; ErrTmuxSessionCreate is
+#   agent-director's error name);
+# - `find-missing: ` and `get: missing` in the pending-row rule's round line
+#   (src/pending-row.ts createPendingRowRule's step words and describeRuleGet;
+#   `missing` is agent-director's state name);
+# - "dispatcher bug", quoted from b.jg5 SRJ-1413 for the absence check;
 # - ` rule (` after PENDING_ROW_RULE_LOG_HEAD and the reference
 #   (src/pending-row.ts, the rule's run line);
 # - `persona=<key> ` with ` tmux-unresponsive ` (src/persona-episodes.ts
@@ -307,7 +386,7 @@
 #
 # Closing: the script ends with `assert_no_server_tmux` (AC 3's "the bot
 # server starts no tmux process", over every leg's servers, the slow-create
-# start's included), `assert_no_cscb_include_finished` and
+# and fail-create starts' included), `assert_no_cscb_include_finished` and
 # `assert_no_cscb_delete` in its own shell. Every count of CSCB's
 # agent-director calls reads only shim lines whose parent is a CSCB process;
 # the harness's calls, the stub's own status reads and its stop lines never
@@ -390,6 +469,24 @@ RESTART_DIALOG_DELAY_S=30 # longer than the stop and the start take, shorter tha
 RESTART_LAP_SLACK_S=10    # past G and the retry ceiling: the lap's calls, the report-in, the harness read
 OLD_APPROVER_WAIT_S=15    # after the row read pending: the old server's approver reading the pane
 RESTART_POLL_S=1          # the harness's read of the row while it waits for the lap
+
+# Scenario 11's persona F (no row before its leg).
+F_NAME="${SCENARIO_TAG}_failed"
+F_KEY="$(persona_key "${F_NAME}")"
+F_REF="$(persona_ref "${F_NAME}")"
+F_ID="cscb_${F_KEY}"
+F_CHANNEL="C0T17FCR1"
+F_SUFFIX=t17f
+
+# Scenario 11's leg (seconds).
+FC_BRINGUP_SLACK_S=40     # past G and the retry ceiling: the rule's calls, the bring-up's launch, the approver, the report-in
+FC_POLL_S=1               # the harness's read of the row while it waits
+
+# agent-director's error name for a launch whose session-creating call failed.
+SESSION_CREATE_ERR=ErrTmuxSessionCreate
+
+# The words SRJ-1413 says no post holds.
+DISPATCHER_BUG='dispatcher bug'
 
 # Fragments with no exported builder (see the header).
 GET_LINE_HEAD='[slack] spawnForPersona: one get after the '
@@ -747,6 +844,17 @@ LT_RETRY_WAIT_S=$(( RETRY_BASE_S + LT_RETRY_SLACK_S ))
 # The restart leg's wait: from the launch start, G and one longest retry wait, then the lap and the report-in.
 RESTART_CLEAR_BOUND_S=$(( G_S + RETRY_CEILING_S + RESTART_LAP_SLACK_S ))
 echo "${TEST_NAME}: slow-create delay ${CREATE_DELAY_S}s (create timeout ${CREATE_TIMEOUT_MS}ms, call timeout ${CALL_TIMEOUT_MS}ms); retry base ${RETRY_BASE_S}s, ceiling ${RETRY_CEILING_S}s; restart leg: dialog delay ${RESTART_DIALOG_DELAY_S}s, clear bound ${RESTART_CLEAR_BOUND_S}s"
+
+MARKED_MISSING="$(fmk_text PENDING_ROW_RUN_MARKED_MISSING)" || fail "setup: fmk-texts.ts could not print PENDING_ROW_RUN_MARKED_MISSING"
+SPAWN_FAILURE_HEAD="$(fmk_text spawnFailureNoticeHead "${SESSION_CREATE_ERR}")" \
+    || fail "setup: fmk-texts.ts could not print spawnFailureNoticeHead"
+# The notice's first line, the same for every error.
+SPAWN_FAILURE_FIRST="${SPAWN_FAILURE_HEAD%%$'\n'*}"
+[[ -n "${MARKED_MISSING}" && -n "${SPAWN_FAILURE_FIRST}" && "${SPAWN_FAILURE_HEAD}" == *"${SESSION_CREATE_ERR}"* ]] \
+    || fail "setup: fmk-texts.ts printed an empty value, or a spawn-failure notice head naming no ${SESSION_CREATE_ERR}"
+# Scenario 11's wait: from the launch start, G and one longest retry wait, then the bring-up.
+FC_BRINGUP_BOUND_S=$(( G_S + RETRY_CEILING_S + FC_BRINGUP_SLACK_S ))
+echo "${TEST_NAME}: scenario 11: bring-up bound ${FC_BRINGUP_BOUND_S}s from the launch start"
 
 # ---------------------------------------------------------------------------
 # Scenario 5's leg
@@ -1419,9 +1527,189 @@ leg_restart_mid_launch() {
     stop_tracked_pid "${SLACK_STUB_PID}" 10 "${step}: the Slack stub did not exit on SIGTERM"
 }
 
+# ---------------------------------------------------------------------------
+# Scenario 11: a failed fresh spawn (fail-create), waited out from G
+# ---------------------------------------------------------------------------
+
+# fc_failure_seen <from-line>: true once server.log holds, after line
+# <from-line>, the plain spawn's ErrTmuxSessionCreate line for F.
+fc_failure_seen() {
+    [[ -n "$(log_hits "$1" '[slack] spawnForPersona: ' "failed for ${F_REF}: " "${SESSION_CREATE_ERR}")" ]]
+}
+
+# fc_only_pending <step>: a harness `list --state pending`; fail unless F's
+# row is the only `pending` row.
+fc_only_pending() {
+    local ids
+    ad_capture list --state pending
+    (( AD_RC == 0 )) || fail "$1: the harness list exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
+    ids="$(jq -r '(if type == "array" then . else .spawns end)[] | .claude_instance_id' "${AD_OUT}" | sort | tr '\n' ' ')" \
+        || fail "$1: the harness list printed no row list: $(head -c 300 "${AD_OUT}")"
+    [[ "${ids}" == "${F_ID} " ]] || fail "$1: the pending rows are '${ids% }', not ${F_ID} alone"
+}
+
+leg_fail_create() {
+    local step="scenario 11" creds="${SCENARIO_ROOT}/credentials-fc" work log0 srv leg_start reset_at creates
+    local l_ms l_s g_at deadline launch out_at first_missing="" reads="${SCENARIO_ROOT}/fc-reads.tsv"
+    local table="${SCENARIO_ROOT}/fc-calls.tsv" n spawn0 next_at fm_at get_at rule_at
+    local lines=() notices=()
+
+    new_state_dir failcreate
+    mkdir -m 700 "${creds}"
+    start_slack_stub "${SCENARIO_ROOT}/slack-stub-fc" "${F_SUFFIX}"
+    printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${F_SUFFIX}")" "$(fake_token app "${F_SUFFIX}")" \
+        | write_file "${creds}/f.json" 600
+    work="$(make_workdir failcreate)"
+    write_personas_config "$(persona_json "${F_NAME}" "${creds}/f.json" "${work}" "${F_CHANNEL}")"
+
+    # Step 1 [harness]: F has no row.
+    poll_row_of "${F_ID}" "${step}: before the start"
+    [[ "${ROW_STATE}" == absent ]] || fail "${step}: row ${F_ID} reads ${ROW_STATE} before the start, not absent"
+
+    # Step 2: fail-create, then the start: the server's plain spawn of F.
+    tmux_shim_mode fail-create
+    log0="$(line_count "${SLACK_STATE_DIR}/server.log")"
+    leg_start="$(now_s)"
+    start_server --live
+    srv="${SERVER_PID}"
+
+    # Step 3: once the spawn has failed, the tmux shim goes back to `log`.
+    wait_until "${START_WAIT_S}" "${step}: no ${SESSION_CREATE_ERR} line for ${F_REF} after the start" \
+        fc_failure_seen "${log0}"
+    tmux_shim_mode log
+    reset_at="$(now_s)"
+    echo "${TEST_NAME}: ${step}: the spawn failed by $(seconds_between "${leg_start}" "${reset_at}")s after the start; the tmux shim is back in log mode. Its line (recorded): $(log_hits "${log0}" '[slack] spawnForPersona: ' "failed for ${F_REF}: " "${SESSION_CREATE_ERR}" | head -n 1 | cut -f3 | cut -c1-400)"
+    creates="$(awk -F'\t' -v a="${leg_start}" -v b="${reset_at}" \
+        '$1 == "call" && $2 + 0 > a + 0 && $2 + 0 <= b + 0 && $6 ~ /(^| )new-session( |$)/ { n++ } END { print n + 0 }' "${SCENARIO_TMUX_SHIM_LOG}")"
+    (( creates >= 1 )) || fail "${step}: no new-session call reached the tmux shim while it was in fail-create"
+    echo "${TEST_NAME}: ${step}: ${creates} new-session call(s) failed in fail-create (recorded)"
+    wait_for_log "$(completion_match 1)" "${START_WAIT_S}" "${step}: the start pass never completed"
+    echo "${TEST_NAME}: ${step}: the start pass's summary (recorded): $(log_hits "${log0}" "$(completion_match 1)" | tail -n 1 | cut -f3)"
+
+    # Step 4 [harness]: the row reads pending with a launch start L, the only pending row.
+    read_row_of "${F_ID}" "${step}: after the failure"
+    [[ "${ROW_STATE}" == pending ]] || fail "${step}: after the failed spawn row ${F_ID} reads ${ROW_STATE}, not pending"
+    l_ms="$(launch_ms "${ROW_LAUNCH}")" || fail "${step}: the pending row's launch_started_at '${ROW_LAUNCH}' does not parse"
+    l_s="$(awk -v m="${l_ms}" 'BEGIN { printf "%.3f\n", m / 1000 }')"
+    g_at="$(plus_s "${l_s}" "${G_S}")"
+    echo "${TEST_NAME}: ${step}: F's row reads pending, launch_started_at ${ROW_LAUNCH}"
+    fc_only_pending "${step}: after the failure"
+
+    # Step 5 [harness]: read the row every FC_POLL_S until it is live,
+    # bounded from L; before G, F's is the only pending row.
+    : > "${reads}"
+    deadline=$(( l_ms + FC_BRINGUP_BOUND_S * 1000 ))
+    while :; do
+        poll_row_of "${F_ID}" "${step}: the wait"
+        printf '%s\t%s\t%s\n' "${ROW_READ_AT}" "${ROW_STATE}" "${ROW_LAUNCH}" >> "${reads}"
+        case "${ROW_STATE}" in
+            pending)
+                launch="$(launch_ms "${ROW_LAUNCH}")" || fail "${step}: a pending read's launch_started_at '${ROW_LAUNCH}' does not parse"
+                if [[ "${launch}" == "${l_ms}" ]] && awk -v n="$(now_s)" -v g="${g_at}" 'BEGIN { exit !(n + 0 < g + 0) }'; then
+                    fc_only_pending "${step}: before G"
+                fi ;;
+            missing) [[ -n "${first_missing}" ]] || first_missing="${ROW_READ_AT}" ;;
+            absent | ended) ;;
+            *)
+                out_at="${ROW_READ_AT}"
+                break ;;
+        esac
+        (( $(_scenario_now_ms) < deadline )) \
+            || fail "${step}: row ${F_ID} not live ${FC_BRINGUP_BOUND_S}s after its launch start (G, the retry ceiling and ${FC_BRINGUP_SLACK_S}s)"
+        sleep "${FC_POLL_S}"
+    done
+    echo "${TEST_NAME}: ${step}: the row read ${ROW_STATE} $(seconds_between "${l_s}" "${out_at}")s after its launch start; the harness reads in order (recorded): $(cut -f2 "${reads}" | uniq -c | awk '{ printf "%s x%s; ", $2, $1 }')"
+    [[ "${ROW_STATE}" == waiting ]] || fail "${step}: F's row came up ${ROW_STATE}, not waiting"
+    wait_for_log "$(matcher "[slack] Session connected: persona ${F_REF}")" "${CONNECT_WAIT_S}" \
+        "${step}: the server never registered F's session after the bring-up"
+
+    # Step 6: the checks, over the bot server's calls (`call_table`).
+    call_table "${table}"
+    echo "${TEST_NAME}: ${step}: the bot server's calls of ${F_ID} (recorded): $(calls "${table}" "${srv}" "${F_ID}" - - - | awk -F'\t' '{ a = $5; sub(/ --label .*/, " …", a); printf "%s %s [%s]; ", $1, $3, a }')"
+    echo "${TEST_NAME}: ${step}: the bot server's find-missing runs, from L (recorded): $(calls "${table}" "${srv}" - find-missing - - | cut -f1 | while read -r n; do printf '+%ss ' "$(seconds_between "${l_s}" "${n}")"; done)"
+    # While fail-create was set, the server's one launch: F's plain spawn.
+    mapfile -t lines < <(awk -F'\t' -v p="${srv}" -v a="${leg_start}" -v b="${reset_at}" \
+        '$2 == p && ($3 == "spawn" || $3 == "resume") && $1 + 0 > a + 0 && $1 + 0 <= b + 0' "${table}")
+    (( ${#lines[@]} == 1 )) || fail "${step}: the bot server made ${#lines[@]} launch call(s) while the shim was in fail-create, not one"
+    [[ "$(cut -f4 <<< "${lines[0]}")" == "${F_ID}" && "$(cut -f3 <<< "${lines[0]}")" == spawn && " $(cut -f5 <<< "${lines[0]}") " != *" --reuse-finished "* ]] \
+        || fail "${step}: the launch while the shim was in fail-create is not F's plain spawn: ${lines[0]}"
+    spawn0="$(cut -f1 <<< "${lines[0]}")"
+    # No bot-server find-missing from L to G after it.
+    n="$(count_calls "${table}" "${srv}" - find-missing "${l_s}" "$(plus_s "${g_at}" -0.001)")"
+    (( n == 0 )) || fail "${step}: the bot server ran find-missing ${n} time(s) between F's launch start and G after it"
+    # F's next launch, and the run and the get before it.
+    next_at="$(calls "${table}" "${srv}" "${F_ID}" - "${spawn0}" - | awk -F'\t' '$3 == "spawn" || $3 == "resume"' | head -n 1 | cut -f1)"
+    [[ -n "${next_at}" ]] || fail "${step}: the bot server made no launch of ${F_ID} after the failed spawn"
+    fm_at="$(calls "${table}" "${srv}" - find-missing - "${next_at}" | tail -n 1 | cut -f1)"
+    [[ -n "${fm_at}" ]] || fail "${step}: no bot-server find-missing before F's next launch"
+    awk -v f="${fm_at}" -v g="${g_at}" 'BEGIN { exit !(f + 0 >= g + 0) }' \
+        || fail "${step}: the last bot-server find-missing before F's next launch came $(seconds_between "${l_s}" "${fm_at}")s after L, before G ${G_S}s"
+    get_at="$(first_call_at "${table}" "${srv}" "${F_ID}" get "${fm_at}" "${next_at}")"
+    [[ -n "${get_at}" ]] || fail "${step}: no bot-server get of ${F_ID} between its find-missing and its next launch"
+    # The rule's round marked the row missing and its get read missing.
+    mapfile -t lines < <(log_hits "${log0}" "${PENDING_ROW_HEAD} ${F_REF} rule (" "find-missing: ${MARKED_MISSING}" "get: missing")
+    (( ${#lines[@]} == 1 )) || fail "${step}: ${#lines[@]} pending-row rule line(s) for F name the row marked and read missing, not one"
+    rule_at="$(cut -f2 <<< "${lines[0]}")"
+    awk -v r="${rule_at}" -v n="${next_at}" 'BEGIN { exit !(r + 0 <= n + 0) }' \
+        || fail "${step}: the pending-row rule's missing line came after F's next launch"
+    echo "${TEST_NAME}: ${step}: from L: find-missing +$(seconds_between "${l_s}" "${fm_at}")s, get +$(seconds_between "${l_s}" "${get_at}")s, next launch +$(seconds_between "${l_s}" "${next_at}")s ($(calls "${table}" "${srv}" "${F_ID}" - "$(plus_s "${next_at}" -0.001)" "${next_at}" | cut -f5 | sed 's/ --label .*/ …/'))"
+    # The harness's read of missing, when it made one, came after the run.
+    if [[ -n "${first_missing}" ]]; then
+        awk -v m="${first_missing}" -v f="${fm_at}" 'BEGIN { exit !(m + 0 > f + 0) }' \
+            || fail "${step}: the harness read F's row missing ($(seconds_between "${l_s}" "${first_missing}")s from L) before the bot server's find-missing"
+        echo "${TEST_NAME}: ${step}: the harness read the row missing at +$(seconds_between "${l_s}" "${first_missing}")s from L (recorded)"
+    else
+        echo "${TEST_NAME}: ${step}: no harness read caught the row missing (recorded)"
+    fi
+    # No kill of F's row from any CSCB process.
+    n="$(count_calls "${table}" - "${F_ID}" kill - -)"
+    (( n == 0 )) || fail "${step}: ${n} kill call(s) of ${F_ID} by a CSCB process"
+    # Only the bot server ran find-missing in the leg: none from the scenario's shell.
+    mapfile -t lines < <(awk -F'\t' -v a="${leg_start}" -v p="${srv}" \
+        '$1 == "call" && $2 + 0 > a + 0 && $4 != p && $6 ~ /(^| )find-missing( |$)/' "${SCENARIO_AD_SHIM_LOG}")
+    (( ${#lines[@]} == 0 )) || {
+        printf '  | %s\n' "${lines[@]}" >&2
+        fail "${step}: ${#lines[@]} find-missing call(s) in the leg not made by the bot server"
+    }
+    echo "${TEST_NAME}: ${step}: F's retry timer (recorded): $(log_hits "${log0}" "[slack] unavailable-retry: persona=${F_KEY} " | cut -f3 | cut -c1-200 | tr '\n' '|')"
+    echo "${TEST_NAME}: ${step}: F's pending-row rule lines (recorded): $(log_hits "${log0}" "${PENDING_ROW_HEAD} ${F_REF} rule (" | cut -f3 | cut -c1-900 | tr '\n' '|')"
+    echo "${TEST_NAME}: ${step}: F's collision lines (recorded): $(log_hits "${log0}" "[slack] spawnForPersona: collision resolved, state=" "for ${F_REF}" | cut -f3 | tr '\n' '|')"
+    echo "${TEST_NAME}: ${step}: startup-errors.log lines naming F (recorded): $(grep -F -- "${F_REF}" "${SLACK_STATE_DIR}/startup-errors.log" 2> /dev/null | cut -c1-300 | tr '\n' '|')"
+
+    # Posts: none holds "dispatcher bug"; at most one spawn-failure post,
+    # naming ErrTmuxSessionCreate (whether it was made is recorded); no other.
+    mapfile -t lines < <(record_posts 1 | jq -c --arg w "${DISPATCHER_BUG}" 'select(tostring | ascii_downcase | contains($w))')
+    (( ${#lines[@]} == 0 )) || {
+        printf '  | %s\n' "${lines[@]}" >&2
+        fail "${step}: ${#lines[@]} post(s) hold '${DISPATCHER_BUG}'"
+    }
+    mapfile -t notices < <(record_posts 1 | jq -c --arg h "${SPAWN_FAILURE_FIRST}" 'select((.text // "") | contains($h))')
+    (( ${#notices[@]} <= 1 )) || {
+        printf '  | %s\n' "${notices[@]}" >&2
+        fail "${step}: ${#notices[@]} spawn-failure posts, not at most one"
+    }
+    if (( ${#notices[@]} == 1 )); then
+        jq -e --arg h "${SPAWN_FAILURE_HEAD}" '(.text // "") | contains($h)' <<< "${notices[0]}" > /dev/null \
+            || fail "${step}: the spawn-failure post names no ${SESSION_CREATE_ERR}: ${notices[0]:0:400}"
+        echo "${TEST_NAME}: ${step}: the counted failure posted a spawn-failure notice (recorded): $(jq -c '{method, channel, text: ((.text // "") | .[0:300])}' <<< "${notices[0]}")"
+    else
+        echo "${TEST_NAME}: ${step}: the counted failure posted no spawn-failure notice (recorded)"
+    fi
+    mapfile -t lines < <(record_posts 1 | jq -c --arg h "${SPAWN_FAILURE_FIRST}" 'select((.text // "") | contains($h) | not) | {ts, method, channel, text: ((.text // "") | .[0:300])}')
+    (( ${#lines[@]} == 0 )) || {
+        printf '  | %s\n' "${lines[@]}" >&2
+        fail "${step}: ${#lines[@]} post(s) other than the spawn-failure notice (a cap, alert or stuck-launch post among them?)"
+    }
+
+    stop_server
+    end_worker "${F_ID}" "${step}: the end"
+    stop_tracked_pid "${SLACK_STUB_PID}" 10 "${step}: the Slack stub did not exit on SIGTERM"
+}
+
 leg_launch_pending
 leg_launch_timeouts
 leg_restart_mid_launch
+leg_fail_create
 
 assert_no_server_tmux
 assert_no_cscb_include_finished
