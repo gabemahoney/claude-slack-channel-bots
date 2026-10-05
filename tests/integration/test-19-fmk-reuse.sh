@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Test 19 (HO §7 scenarios 7 and 12; b.jg5 SRJ-1409, SRJ-1414; AC 1): reuse
-# replaces delete.
+# Test 19 (HO §7 scenarios 7, 12 and 18; b.jg5 SRJ-1409, SRJ-1414, SRJ-1419;
+# AC 1, AC 49): reuse replaces delete, and a re-added persona starts fresh.
 #
 # Scenario 7 (SRJ-1409): with `resume_enabled=false`, and separately with a
 # missing transcript, a
@@ -24,6 +24,20 @@
 # SRJ-709, SRJ-410, SRJ-501, SRJ-505, SRJ-716, SRJ-1401, SRJ-1418; E22's hatch
 # note: no CSCB `delete`).
 #
+# Scenario 18 (SRJ-1419): a persona that was messaged, removed and applied,
+# then, after a server restart, added back with the same key, working
+# directory and config directory, comes back by a reuse spawn of its id and
+# is never resumed: the first CSCB spawn after the re-add carries
+# `--reuse-finished`, no CSCB `resume` of its id is made from the removal on,
+# and a harness `get` shows the old session neither as current nor in
+# `prior_sessions`. The same holds for a messaged persona whose
+# `credentials_file` path changes, a destructive modify (AC 49). A removal
+# records the key `removed`, the old half of a destructive modify
+# `destructive-modify`, and while a key is recorded every launch is a reuse
+# (b.jg5 SRJ-1419, SRJ-803, SRJ-805, SRJ-806, SRJ-807, SRJ-715, SRJ-711,
+# SRJ-1401, SRJ-1418; E25's hatch note: a re-added persona starts fresh by
+# reuse, never resumed).
+#
 # fmk setup (lib/scenario.sh fmk mode; b.jg5 SRJ-1306, SRJ-1401):
 # - its own HOME, agent-director store and tmux server, all under
 #   SCENARIO_ROOT, with the agent-director shim in front of the binary and the
@@ -36,14 +50,23 @@
 #   reconnects or relaunches a persona, and `session_restart_delay` 0, so the
 #   MCP session a stub's exit closes schedules no restart (SRJ-1401: CSCB's
 #   timings are changed only through its configuration); `resume_enabled`
-#   false for leg E, true (the default, written out) for legs F, G and H;
+#   false for leg E, true (the default, written out) for legs F, G, H, J and
+#   K;
 # - every start is live (`start_server --live`), against the loopback Slack
 #   stub (fixtures/slack-stub-server.ts, one for the script, every persona's
 #   token pair answered ok);
 # - each leg has its own persona (key, credentials, channel, directories):
 #   E (`resume_enabled=false` leg), F (missing-transcript leg), G (missing-row
-#   leg) and H (stale `config_dir` leg); each is a Slack destination (its
-#   channel takes its permission prompts). H's claude_config_dir is a symlink
+#   leg), H (stale `config_dir` leg), J (removed-and-re-added leg) and K
+#   (`credentials_file` leg); each is a Slack destination (its channel takes
+#   its permission prompts). K has a second credentials file, its own fake
+#   token pair under its own label, written like every persona's (the Slack
+#   stub answers it ok too). J's and K's claude_config_dir is the scenario
+#   HOME's `.claude`, the directory the stub writes every transcript under, so
+#   a messaged life's transcript is where agent-director's `resume` looks for
+#   its session (`<CLAUDE_CONFIG_DIR>/projects/<slug of the cwd>/<session
+#   id>.jsonl`, the path it tries when the row records no `jsonl_path`;
+#   working default). H's claude_config_dir is a symlink
 #   under SCENARIO_ROOT to one directory, re-pointed to another by
 #   `repoint_symlink` (ruling S5's working default: CSCB writes the
 #   `config_dir` label by real path and compares the persona's directory by
@@ -55,7 +78,9 @@
 #   harness plays the operator while the server is stopped: config.json is
 #   rewritten to the next leg's persona and settings and the last-applied
 #   record moved aside, so the next start applies config.json as it stands
-#   (README "Reload");
+#   (README "Reload"). In scenario 18 the operator also edits config.json on
+#   the running server and confirms the change by renaming the pending file
+#   the reload tick writes to the apply file;
 # - checks read only their own leg's ids and window: server.log and
 #   startup-errors.log from the leg's mark line, CSCB's agent-director calls
 #   (`cscb_ad_calls`: only the agent-director shim's lines whose parent is a
@@ -76,16 +101,21 @@
 # exits, and the row reads `ended`. In scenario 12's legs, G's first life
 # and its leftover run `silent` (no dialog and no hook: the row keeps no
 # session id, and a read of the leftover's pane shows no dialog for CSCB to
-# answer) and G's new life `dev-channels`; H's lives run `dev-channels`.
+# answer) and G's new life `dev-channels`; H's lives run `dev-channels`. In
+# scenario 18 every life of J and K runs `transcript-on-first-message`, and
+# the harness types a first message into each first life (`stub_type_line`),
+# which writes its transcript.
 #
 # Harness check, first: the two harness additions on a stub the harness
 # starts itself (`seed_unlabelled`, no agent-director and no CSCB process): in
 # `transcript-on-first-message` no transcript exists at its dialog nor after
 # the human's Enter reports it in, one exists once a line has been typed
-# (`stub_type_line`), and the typed sentinel ends it.
+# (`stub_type_line`), and the typed sentinel ends it; `stub_type_line` aimed
+# at a pane that does not exist fails with its FAIL line.
 #
 # Legs, in run order (one scenario HOME, store, tmux server and Slack stub):
-# scenario 7's legs E and F, then scenario 12's legs G and H.
+# scenario 7's legs E and F, then scenario 12's legs G and H, then scenario
+# 18's legs J and K.
 #
 # Scenario 7's legs (E, F); each:
 #   1. the persona's first life: config.json with the persona, a start, its
@@ -110,7 +140,7 @@
 #        - exactly one CSCB-parented `spawn` naming the persona's id with
 #          `--reuse-finished` (agent-director shim's argv) after the mark;
 #        - E: no CSCB `resume` of its id after the mark; F: at least one, and
-#          the diagnosis's log line for F after the mark, its time no later
+#          exactly one diagnosis log line for F after the mark, its time no later
 #          than the reuse spawn's call;
 #        - a harness `get`: `prior_sessions` is an array that does not hold
 #          the first life's session id;
@@ -194,6 +224,48 @@
 #     6. a plain `stop`, and the harness ends H's new life with the exit
 #        sentinel.
 #
+# Scenario 18's legs (J, K), each with the tmux shim in `log`, so a
+# teardown's kill succeeds. "Messaged" (each first life): the harness reads
+# the life's session id and `cwd` (`get`), checks that no transcript is at
+# the path agent-director's `resume` looks for that session under the
+# persona's claude_config_dir, types a first message into the pane, and waits
+# for the transcript there; the row's `jsonl_path` and `transcript_status`
+# after it are logged.
+#   J (removed and re-added):
+#     1. config.json with J, a start; the row reads `waiting`; the human
+#        messages it;
+#     2. the removal mark; the operator removes J from config.json (no persona
+#        left) and confirms the apply: no pending file before the edit, the
+#        pending file renamed to the apply file, then the apply's
+#        `reload-applied` line (one removed); J's session is gone, the
+#        retired-key record gives J's key the cause `removed`, and J's row is
+#        kept (its state logged);
+#     3. a plain `stop` and a start (no persona);
+#     4. the re-add mark; the operator adds J back, with the same key,
+#        working directory and claude_config_dir, and confirms the apply (one
+#        added); the row reads `waiting` with a session other than the old
+#        one;
+#     5. checked: the first CSCB-parented `spawn` naming J's id after the
+#        re-add mark carries `--reuse-finished`; a harness `get` reads the row
+#        `waiting` with a session other than the old one, and `prior_sessions`
+#        is an array that does not hold the old session; from the removal
+#        mark on, no CSCB `resume` of J's id and no CSCB `delete`;
+#     6. a plain `stop`, and the harness ends J's new life with the exit
+#        sentinel.
+#   K (`credentials_file` changed):
+#     1. config.json with K (its first credentials file), a start; the row
+#        reads `waiting`; the human messages it;
+#     2. the change mark; the operator points K's `credentials_file` at its
+#        second file and confirms the apply (one destructively modified); the
+#        row reads `waiting` with a session other than the old one; the
+#        retired-key record's cause for K's key, when it still has an entry,
+#        is `destructive-modify` (working default: by then the new life may
+#        have begun and the entry been cleared, SRJ-806, SRJ-807; no entry is
+#        logged);
+#     3. checked, from the change mark on, as J's step 5;
+#     4. a plain `stop`, and the harness ends K's new life with the exit
+#        sentinel.
+#
 # Waits: rows reporting in at ROW_WAIT_S; start passes at START_WAIT_S; a
 # row reading `ended` after the sentinel, and its session going, at
 # ENDED_WAIT_S; the harness check's transcript at TRANSCRIPT_WAIT_S; in
@@ -201,7 +273,8 @@
 # past the launch start, then the retry timer's next run), a second at
 # REFUSAL_WAIT_S (the latch re-check's 120 s, or the retry timer's wait of
 # at most 300 s), and the reuse after the session is ended at
-# REUSE_WAIT_S. The
+# REUSE_WAIT_S; in scenario 18, the pending file after an edit at
+# RELOAD_WAIT_S and the apply's line at APPLY_WAIT_S. The
 # pending window is read by the background `get` (POLL_PERIOD_S between
 # reads), with no delay added to the stub: the window lasts from the reuse
 # spawn's reset of the row until the approver's Enter reaches the stub and
@@ -222,7 +295,14 @@
 # error name (`classifyAdError`, a printer entry of scenario 12); G
 # at agent-director's default settings (`adGraceMs.default`,
 # src/ad-settings.ts); the last-applied record's suffix
-# (LAST_APPLIED_FILE_SUFFIX, src/reload.ts).
+# (LAST_APPLIED_FILE_SUFFIX, src/reload.ts); in scenario 18, the pending and
+# apply files' suffixes (PENDING_FILE_SUFFIX, APPLY_FILE_SUFFIX,
+# src/reload.ts), the apply's line (`reloadAppliedLogLine`,
+# src/reload-apply.ts renderAppliedLogLine), the retired-key record's path
+# and causes (`retiredKeysPath`, RETIRED_KEY_CAUSE_REMOVED,
+# RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, src/retired-keys.ts; its `keys` and
+# `cause` fields are the record format's, SRJ-802, which exports no field
+# name).
 # Quoted, with no exported builder: the diagnosis's log line head
 # `[slack] ErrJsonlMissing diagnostic: ` (src/session-manager.ts
 # diagnoseJsonlMissing, reportInconclusiveDiagnosis); the reuse spawn's
@@ -243,7 +323,12 @@
 # and the pending reads' launch starts; in scenario 12, each refusal's error
 # name and description, the background reads' states in order, the posts at
 # the persona's channel, the `pre_trust` value of the reuse, and
-# agent-director's trail records naming G's id, by event.
+# agent-director's trail records naming G's id, by event; in scenario 18, the
+# messaged row's `jsonl_path` and `transcript_status`, the persona's CSCB
+# spawns after the mark (how many carry `--reuse-finished`), its CSCB calls
+# by verb, the row's state after the removal, the new life's
+# `transcript_status` and `prior_sessions`, and a destructive modify's
+# retired-key entry already cleared.
 #
 # The script ends with the closing assertions, `assert_no_server_tmux`,
 # `assert_no_cscb_include_finished` and `assert_no_cscb_delete` (b.jg5
@@ -290,6 +375,12 @@ t19_value CLASS_CONFLICT adErrorClass AD_ERROR_CLASS_CONFLICT
 t19_value T19_GRACE_MS adGraceMs.default
 [[ "${T19_GRACE_MS}" =~ ^[1-9][0-9]*$ ]] || fail "setup: adGraceMs.default printed '${T19_GRACE_MS}', not a whole number of milliseconds"
 GRACE_S="$(awk -v ms="${T19_GRACE_MS}" 'BEGIN { printf "%.3f", ms / 1000 }')"
+
+# Scenario 18's values.
+t19_value CAUSE_REMOVED RETIRED_KEY_CAUSE_REMOVED
+t19_value CAUSE_DESTRUCTIVE RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY
+t19_value PENDING_SUFFIX PENDING_FILE_SUFFIX
+t19_value APPLY_SUFFIX APPLY_FILE_SUFFIX
 
 # The reuse spawn's refusal line head and success line head
 # (src/session-manager.ts: logRefusal for an UNAVAILABLE refusal and
@@ -343,6 +434,12 @@ REFUSAL_WAIT_S=480
 REUSE_WAIT_S=480
 # The scenario 12 background `get`'s pause between reads.
 WATCH_PERIOD_S=1
+# Scenario 18: a reload's preview reaching the pending file after a
+# config.json edit (the reload tick runs 5 s after the previous pass).
+RELOAD_WAIT_S=60
+# Scenario 18: a confirmed apply logging its line once all its steps ran (a
+# teardown's kill, and a bring-up's launch through to its answer).
+APPLY_WAIT_S=300
 
 # ---------------------------------------------------------------------------
 # Personas: each with its own key, credentials, channel and directories
@@ -353,7 +450,7 @@ CFG_ROOT="${SCENARIO_ROOT}/claude-config"
 mkdir -m 700 "${CREDS_DIR}"
 mkdir -p "${CFG_ROOT}"
 
-# t19_persona <prefix> <short> <channel>: set <prefix>_NAME, _LABEL,
+# t19_persona <prefix> <short> <channel>: set <prefix>_NAME, _LABEL, _CREDS,
 # _CHANNEL, _WORK, _CFG, _KEY, _ID and _SESSION for one persona, write its
 # credentials file and its Claude config's `.claude.json`, and select
 # `dev-channels` for its working directory.
@@ -361,6 +458,7 @@ t19_persona() {
     local p="$1" short="$2" channel="$3" key value work cfg
     printf -v "${p}_NAME" '%s' "${SCENARIO_TAG}${short}"
     printf -v "${p}_LABEL" '%s' "${SCENARIO_TAG}${short}1"
+    printf -v "${p}_CREDS" '%s' "${CREDS_DIR}/${SCENARIO_TAG}${short}1.json"
     printf -v "${p}_CHANNEL" '%s' "${channel}"
     work="$(make_workdir "${SCENARIO_TAG}${short}_work")"
     printf -v "${p}_WORK" '%s' "${work}"
@@ -384,7 +482,9 @@ t19_persona E reusee C0T19RSE1
 t19_persona F reusef C0T19RSF1
 t19_persona G reuseg C0T19RSG1
 t19_persona H reuseh C0T19RSH1
-ALL_PERSONAS=(E F G H)
+t19_persona J reusej C0T19RSJ1
+t19_persona K reusek C0T19RSK1
+ALL_PERSONAS=(E F G H J K)
 
 # H's claude_config_dir: a symlink under SCENARIO_ROOT to its first directory
 # (t19_persona's, holding `.claude.json`), re-pointed in leg H to a second
@@ -397,24 +497,48 @@ printf '{}\n' | write_file "${H_CFG_TWO}/.claude.json" 600
 ln -s -- "${H_CFG_ONE}" "${H_CFG_LINK}" || fail "setup: could not link ${H_CFG_LINK} to ${H_CFG_ONE}"
 H_CFG="${H_CFG_LINK}"
 
+# J's and K's claude_config_dir: the scenario HOME's `.claude`, the directory
+# the stub writes every transcript under (fixtures/stub-claude.sh), so a
+# messaged life's transcript is where agent-director's `resume` looks for its
+# session, `<CLAUDE_CONFIG_DIR>/projects/<slug of the row's cwd>/<session
+# id>.jsonl`, the path it tries when the row records no `jsonl_path` (working
+# default: in `transcript-on-first-message` the life's SessionStart found no
+# transcript, so agent-director recorded none). It holds a `.claude.json`
+# (`{}`), as every persona's directory does.
+T19_HOME_CFG="${HOME}/.claude"
+mkdir -p "${T19_HOME_CFG}"
+if [[ ! -e "${T19_HOME_CFG}/.claude.json" ]]; then
+    printf '{}\n' | write_file "${T19_HOME_CFG}/.claude.json" 600
+fi
+J_CFG="${T19_HOME_CFG}"
+K_CFG="${T19_HOME_CFG}"
+
+# K's second credentials file: its own fake token pair under its own label,
+# which the Slack stub answers ok as it does every persona's.
+K_LABEL_TWO="${SCENARIO_TAG}reusek2"
+K_CREDS_ONE="${K_CREDS}"
+K_CREDS_TWO="${CREDS_DIR}/${K_LABEL_TWO}.json"
+printf '{"bot_token": "%s", "app_token": "%s"}\n' \
+    "$(fake_token bot "${K_LABEL_TWO}")" "$(fake_token app "${K_LABEL_TWO}")" \
+    | write_file "${K_CREDS_TWO}" 600
+
 # t19_persona_json <prefix>: one persona entry: its credentials file, working
 # directory, claude_config_dir and one channel, which also takes its
 # permission prompts (its destination).
 t19_persona_json() {
-    local n="$1_NAME" l="$1_LABEL" w="$1_WORK" c="$1_CFG" ch="$1_CHANNEL"
+    local n="$1_NAME" cr="$1_CREDS" w="$1_WORK" c="$1_CFG" ch="$1_CHANNEL"
     printf '{"name": "%s", "credentials_file": "%s", "working_directory": "%s", "claude_config_dir": "%s", "channels": [{"id": "%s", "delivery": "all"}], "permission_prompts": "%s"}' \
-        "${!n}" "${CREDS_DIR}/${!l}.json" "${!w}" "${!c}" "${!ch}" "${!ch}"
+        "${!n}" "${!cr}" "${!w}" "${!c}" "${!ch}" "${!ch}"
 }
 
 T19_RECORD_ASIDE=0
 
-# t19_config_for_next_start <resume-enabled> <prefix>...: the operator's edit
-# while the server is stopped: config.json holds these personas
-# (`health_check_interval` 0, `session_restart_delay` 0, `resume_enabled` as
-# given), and the last-applied record is moved aside, so the next start
-# applies config.json as it stands.
-t19_config_for_next_start() {
-    local resume="$1" joined="" p record
+# t19_config <resume-enabled> [<prefix>...]: the operator's edit of
+# config.json: it holds these personas (none with no prefix;
+# `health_check_interval` 0, `session_restart_delay` 0, `resume_enabled` as
+# given). On a running server the next reload tick previews it.
+t19_config() {
+    local resume="$1" joined="" p
     shift
     for p in "$@"; do
         joined+="${joined:+, }$(t19_persona_json "${p}")"
@@ -429,6 +553,15 @@ t19_config_for_next_start() {
   "resume_enabled": ${resume}
 }
 EOF
+}
+
+# t19_config_for_next_start <resume-enabled> <prefix>...: the operator's edit
+# while the server is stopped: config.json as `t19_config` writes it, and the
+# last-applied record moved aside, so the next start applies config.json as
+# it stands.
+t19_config_for_next_start() {
+    local record
+    t19_config "$@"
     record="${SLACK_STATE_DIR}/config.json${LAST_APPLIED_SUFFIX}"
     if [[ -e "${record}" ]]; then
         T19_RECORD_ASIDE=$(( T19_RECORD_ASIDE + 1 ))
@@ -448,6 +581,7 @@ for t19_p in "${ALL_PERSONAS[@]}"; do
     t19_label_var="${t19_p}_LABEL"
     t19_labels+=("${!t19_label_var}")
 done
+t19_labels+=("${K_LABEL_TWO}")
 python3 - "${t19_labels[@]}" << 'EOF' | write_file "${STUB_DIR}/control.json"
 import json, sys
 print(json.dumps({
@@ -1272,6 +1406,237 @@ t19_leg_stale_config_dir() {
     t19_end_life H "${step}: the new life"
 }
 
+# ---------------------------------------------------------------------------
+# Scenario 18 (b.jg5 SRJ-1419): helpers
+# ---------------------------------------------------------------------------
+
+# t19_retired_cause <key>: print the cause the retired-key record holds for
+# <key> (nothing when the record or the key's entry is missing). The record's
+# `keys` and `cause` fields are its format's (b.jg5 SRJ-802;
+# src/retired-keys.ts serializeRetiredKeys, which exports no field name).
+t19_retired_cause() {
+    local path
+    t19_value path retiredKeysPath "${SLACK_STATE_DIR}"
+    [[ -f "${path}" ]] || return 0
+    jq -r --arg k "$1" '.keys[$k].cause // empty' "${path}"
+}
+
+# t19_applied_logged <line>: true once server.log holds <line> after the mark.
+t19_applied_logged() {
+    [[ "$(t19_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "] $1")" != 0 ]]
+}
+
+# t19_apply_config <step> <added> <removed> <destructive> [<prefix>...]: the
+# operator's edit and confirmation on the running server: no pending file
+# before the edit; config.json holds these personas (`t19_config`, resume
+# enabled); the pending file the reload tick writes is renamed to the apply
+# file; then the apply's own line after the mark, for a change of those
+# counts, logged once every step of the apply ran.
+t19_apply_config() {
+    local step="$1" added="$2" removed="$3" destructive="$4" pending apply line
+    shift 4
+    pending="${SLACK_STATE_DIR}/config.json${PENDING_SUFFIX}"
+    apply="${SLACK_STATE_DIR}/config.json${APPLY_SUFFIX}"
+    [[ ! -e "${pending}" ]] || fail "${step}: ${pending} exists before the edit"
+    t19_config true "$@"
+    wait_for_file "${pending}" "${RELOAD_WAIT_S}" "${step}: no pending file after the config.json edit"
+    mv -f -- "${pending}" "${apply}" || fail "${step}: could not rename ${pending} to ${apply}"
+    t19_value line reloadAppliedLogLine "${added}" "${removed}" "${destructive}" 0 0 0 "${SLACK_STATE_DIR}/config.json"
+    if ! t19_poll "${APPLY_WAIT_S}" t19_applied_logged "${line}"; then
+        t19_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" | grep -F -- 'reload' | sed 's/^/  | /' >&2 || true
+        echo "  | expected: ${line}" >&2
+        fail "${step}: the apply never logged its line (not within ${APPLY_WAIT_S}s)"
+    fi
+    echo "${TEST_NAME}: ${step}: the operator confirmed the apply; it logged its line (${added} added, ${removed} removed, ${destructive} destructively modified)"
+}
+
+# t19_message_life <prefix> <step>: the human messages the persona's live life
+# (`stub_type_line`, a line that is not the sentinel), so its transcript
+# exists. Checked: before the message no transcript is at the path
+# agent-director's `resume` looks for the life's session under the row's
+# CLAUDE_CONFIG_DIR (the persona's claude_config_dir), and after it one is.
+# Logged: the row's `jsonl_path` and `transcript_status` after the message.
+# Sets T19_OLD_SID to the life's session id.
+t19_message_life() {
+    local p="$1" step="$2" id_var="$1_ID" session_var="$1_SESSION" cfg_var="$1_CFG" id sid cwd path
+    id="${!id_var}"
+    t19_row_get "${id}" "${step}"
+    sid="$(jq -r '.claude_session_id // empty' "${AD_OUT}")"
+    cwd="$(jq -r '.cwd // empty' "${AD_OUT}")"
+    [[ -n "${sid}" && -n "${cwd}" ]] || fail "${step}: ${id}'s row reads session '${sid}' and cwd '${cwd}'"
+    # agent-director's transcript path for a session under a config directory
+    # (its slug of the cwd: every character outside [A-Za-z0-9-] becomes `-`).
+    path="${!cfg_var}/projects/$(LC_ALL=C sed 's/[^A-Za-z0-9-]/-/g' <<< "${cwd}")/${sid}.jsonl"
+    [[ ! -e "${path}" ]] || fail "${step}: ${id}'s life has a transcript at ${path} before it was messaged"
+    stub_type_line "${!session_var}" "a first message"
+    wait_until "${TRANSCRIPT_WAIT_S}" "${step}: no transcript at ${path} after the message" test -f "${path}"
+    t19_row_get "${id}" "${step}: after the message"
+    echo "${TEST_NAME}: ${step}: the human messaged ${id}'s life (session ${sid}); its transcript is at ${path}, where agent-director's resume looks for that session"
+    echo "${TEST_NAME}: NOTE: ${step}: ${id}'s row after the message: state '$(jq -r '.state // ""' "${AD_OUT}")', jsonl_path '$(jq -r '.jsonl_path // ""' "${AD_OUT}")', transcript_status '$(jq -r '.transcript_status // ""' "${AD_OUT}")'"
+    T19_OLD_SID="${sid}"
+}
+
+# t19_row_waiting_new <id> <old-sid>: true when a harness `get` reads the row
+# `waiting` with a session id other than <old-sid>.
+t19_row_waiting_new() {
+    ad_capture get --claude-instance-id "$1"
+    [[ "${AD_RC}" == 0 ]] || return 1
+    jq -e --arg old "$2" '.state == "waiting" and ((.claude_session_id // "") != "") and .claude_session_id != $old' "${AD_OUT}" > /dev/null 2>&1
+}
+
+# t19_check_first_spawn_reuse <id> <ref> <since> <step>: the first
+# CSCB-parented `spawn` naming <id> at or after <since> carries
+# `--reuse-finished`; logs every CSCB spawn of it since then.
+t19_check_first_spawn_reuse() {
+    local id="$1" ref="$2" since="$3" step="$4" calls first n reuse
+    calls="$(t19_cscb_calls_since "${since}" spawn "${id}")" || exit 1
+    if [[ -z "${calls}" ]]; then
+        t19_dump_reuse "${id}" "${ref}"
+        fail "${step}: no CSCB spawn of ${id} after the mark"
+    fi
+    first="$(head -n 1 <<< "${calls}")"
+    if ! grep -qF -- '--reuse-finished' <<< "${first}"; then
+        t19_dump_reuse "${id}" "${ref}"
+        fail "${step}: the first CSCB spawn of ${id} after the mark carries no --reuse-finished: $(awk -F'\t' '{ print $6 }' <<< "${first}")"
+    fi
+    n="$(t19_count_lines "${calls}")"
+    reuse="$(t19_count_lines "$(grep -F -- '--reuse-finished' <<< "${calls}" || true)")"
+    echo "${TEST_NAME}: ${step}: CSCB's first spawn of ${id} after the mark, at $(awk -F'\t' '{ print $2 }' <<< "${first}"), carries --reuse-finished"
+    echo "${TEST_NAME}: NOTE: ${step}: ${n} CSCB spawn(s) of ${id} after the mark, ${reuse} carrying --reuse-finished"
+}
+
+# t19_check_fresh <id> <old-sid> <since> <step>: the persona came back fresh
+# and its old session is gone from its row: a harness `get` reads the row
+# (present) `waiting` with a session other than <old-sid>, and its
+# `prior_sessions` is an array that does not hold <old-sid>; no CSCB `resume`
+# of <id> and no CSCB `delete` at or after <since>.
+t19_check_fresh() {
+    local id="$1" old_sid="$2" since="$3" step="$4" sid n
+    t19_row_get "${id}" "${step}: the new life"
+    sid="$(jq -r '.claude_session_id // empty' "${AD_OUT}")"
+    [[ "$(jq -r '.state // empty' "${AD_OUT}")" == waiting && -n "${sid}" && "${sid}" != "${old_sid}" ]] \
+        || { sed 's/^/  | /' "${AD_OUT}" >&2; fail "${step}: the harness get of ${id} does not read waiting with a session other than the old one (${old_sid})"; }
+    jq -e '(.prior_sessions | type) == "array"' "${AD_OUT}" > /dev/null 2>&1 \
+        || { sed 's/^/  | /' "${AD_OUT}" >&2; fail "${step}: the harness get of ${id} carries no prior_sessions array"; }
+    if jq -e --arg sid "${old_sid}" '.prior_sessions | tostring | contains($sid)' "${AD_OUT}" > /dev/null 2>&1; then
+        sed 's/^/  | /' "${AD_OUT}" >&2
+        fail "${step}: the harness get of ${id}'s new life lists the old session ${old_sid} in prior_sessions"
+    fi
+    echo "${TEST_NAME}: ${step}: the harness get reads ${id} waiting with session ${sid}; the old session ${old_sid} is neither current nor in prior_sessions"
+    echo "${TEST_NAME}: NOTE: ${step}: ${id}'s new life: transcript_status '$(jq -r '.transcript_status // ""' "${AD_OUT}")', prior_sessions $(jq -c '.prior_sessions' "${AD_OUT}")"
+    n="$(t19_cscb_count_since "${since}" resume "${id}")"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB resume call(s) of ${id} after the mark: a retired key is never resumed"
+    n="$(t19_cscb_count_since "${since}" delete)"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB delete call(s) after the mark"
+    echo "${TEST_NAME}: ${step}: no CSCB resume of ${id} and no CSCB delete after the mark"
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 18, leg J: a persona messaged, removed, applied, restarted and
+# re-added with the same key, working directory and config directory
+# ---------------------------------------------------------------------------
+
+t19_leg_removed_readded() {
+    local step="removed and re-added" id="${J_ID}" name="${J_NAME}" session="${J_SESSION}"
+    local ref old_sid removal_t cause state
+
+    ref="$(persona_ref "${name}")" || exit 1
+
+    # 1. J's first life, in `transcript-on-first-message`, reporting in; the
+    #    human messages it.
+    stub_mode "${J_WORK}" "${STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE}"
+    tmux_shim_mode log
+    t19_config_for_next_start true J
+    t19_start_and_wait 1
+    wait_until "${ROW_WAIT_S}" "${step}: ${id}'s first life never reported in (waiting)" t19_row_is "${id}" waiting
+    t19_message_life J "${step}: the first life"
+    old_sid="${T19_OLD_SID}"
+
+    # 2. The operator removes J and confirms the apply: the teardown's kill
+    #    (the tmux shim in `log`) ends J's session; J's key is recorded
+    #    `removed`; its row is kept.
+    t19_mark
+    removal_t="${MARK_TIME}"
+    t19_apply_config "${step}: the removal" 0 1 0
+    wait_until "${ENDED_WAIT_S}" "${step}: ${session} is still there after the removal's apply" t19_no_session "${session}"
+    cause="$(t19_retired_cause "${J_KEY}")"
+    [[ "${cause}" == "${CAUSE_REMOVED}" ]] || fail "${step}: the retired-key record gives ${J_KEY} the cause '${cause}' after the removal, not ${CAUSE_REMOVED}"
+    state="$(t19_row_state "${id}")"
+    [[ -n "${state}" ]] || fail "${step}: ${id}'s row is gone after the removal: $(tr '\n' ' ' < "${AD_ERR}")"
+    echo "${TEST_NAME}: ${step}: the removal's teardown ended ${session}; ${J_KEY} is recorded ${CAUSE_REMOVED}; ${id}'s row is kept, reading ${state}"
+
+    # 3. A plain stop and a start, with no persona configured.
+    stop_server
+    t19_start_and_wait 0
+
+    # 4. The operator adds J back, with the same key, working directory and
+    #    claude_config_dir, and confirms the apply; J reports in.
+    t19_mark
+    t19_apply_config "${step}: the re-add" 1 0 0 J
+    wait_until "${ROW_WAIT_S}" "${step}: ${id} never read waiting with a new session after the re-add" t19_row_waiting_new "${id}" "${old_sid}"
+
+    # 5. The checks: the re-add's first spawn is a reuse; from the removal on,
+    #    no resume and no delete; the old session is gone from the row.
+    t19_check_first_spawn_reuse "${id}" "${ref}" "${MARK_TIME}" "${step}"
+    t19_check_fresh "${id}" "${old_sid}" "${removal_t}" "${step}"
+    t19_note_calls "${removal_t}" "${id}" "${step}"
+
+    # 6. A plain stop; the harness ends the new life.
+    stop_server
+    t19_end_life J "${step}: the new life"
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 18, leg K: a messaged persona whose credentials_file path changes
+# ---------------------------------------------------------------------------
+
+t19_leg_credentials_changed() {
+    local step="credentials_file changed" id="${K_ID}" name="${K_NAME}" session="${K_SESSION}"
+    local ref old_sid change_t cause
+
+    ref="$(persona_ref "${name}")" || exit 1
+
+    # 1. K's first life, in `transcript-on-first-message`, reporting in; the
+    #    human messages it.
+    stub_mode "${K_WORK}" "${STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE}"
+    tmux_shim_mode log
+    K_CREDS="${K_CREDS_ONE}"
+    t19_config_for_next_start true K
+    t19_start_and_wait 1
+    wait_until "${ROW_WAIT_S}" "${step}: ${id}'s first life never reported in (waiting)" t19_row_is "${id}" waiting
+    t19_message_life K "${step}: the first life"
+    old_sid="${T19_OLD_SID}"
+
+    # 2. The operator points K's credentials_file at the second file and
+    #    confirms the apply: a destructive modify, whose old half's teardown
+    #    ends K's session and whose new half brings K up.
+    t19_mark
+    change_t="${MARK_TIME}"
+    K_CREDS="${K_CREDS_TWO}"
+    t19_apply_config "${step}: the change" 0 0 1 K
+    wait_until "${ROW_WAIT_S}" "${step}: ${id} never read waiting with a new session after the change" t19_row_waiting_new "${id}" "${old_sid}"
+    # Working default: by now the new life may have begun and its entry been
+    # cleared (b.jg5 SRJ-806, SRJ-807), so only a cause other than the
+    # destructive modify's fails.
+    cause="$(t19_retired_cause "${K_KEY}")"
+    if [[ -n "${cause}" ]]; then
+        [[ "${cause}" == "${CAUSE_DESTRUCTIVE}" ]] || fail "${step}: the retired-key record gives ${K_KEY} the cause '${cause}', not ${CAUSE_DESTRUCTIVE}"
+        echo "${TEST_NAME}: ${step}: ${K_KEY} is recorded ${CAUSE_DESTRUCTIVE}"
+    else
+        echo "${TEST_NAME}: NOTE: ${step}: ${K_KEY} has no entry in the retired-key record once its new life reads waiting"
+    fi
+
+    # 3. The checks: the change's first spawn is a reuse; from the change on,
+    #    no resume and no delete; the old session is gone from the row.
+    t19_check_first_spawn_reuse "${id}" "${ref}" "${change_t}" "${step}"
+    t19_check_fresh "${id}" "${old_sid}" "${change_t}" "${step}"
+    t19_note_calls "${change_t}" "${id}" "${step}"
+
+    # 4. A plain stop; the harness ends the new life.
+    stop_server
+    t19_end_life K "${step}: the new life"
+}
+
 t19_harness_check
 # S3: resume_enabled=false (SRJ-707's `resumeOrFreshSpawn` site).
 t19_leg E "resume_enabled=false" false disabled
@@ -1282,6 +1647,12 @@ t19_leg_missing_row
 # E48 T2 S2: an ended row with a stale config_dir label beside its remaining
 # session (SRJ-1414, SRJ-707's config_dir site).
 t19_leg_stale_config_dir
+# E48 T3 S1: a persona messaged, removed, applied, restarted and re-added
+# (SRJ-1419, SRJ-805).
+t19_leg_removed_readded
+# E48 T3 S2: a messaged persona whose credentials_file path changes
+# (SRJ-1419, SRJ-803, SRJ-805; AC 49).
+t19_leg_credentials_changed
 
 # The closing assertions (b.jg5 SRJ-1401, SRJ-1418).
 assert_no_server_tmux

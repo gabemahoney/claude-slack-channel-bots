@@ -324,6 +324,25 @@
  *                                    an empty description: a script reads a
  *                                    refused call's class from the error name
  *                                    its log line names
+ * Scenario 18, a persona removed and re-added, and one whose
+ * `credentials_file` changes, comes back fresh by reuse (test-19; b.jg5
+ * SRJ-1419, SRJ-803, SRJ-805):
+ *   RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY
+ *                                    the retired-key record's cause of the old
+ *                                    half of a destructive modify
+ *                                    (src/retired-keys.ts)
+ *   reloadAppliedLogLine <added> <removed> <destructive> <in-place> <credentials> <settings> <config-path>
+ *                                    the `reload-applied` line an apply logs
+ *                                    once all its steps ran
+ *                                    (`renderAppliedLogLine`,
+ *                                    src/reload-apply.ts) for a change plan of
+ *                                    those counts (`changePlanCounts`,
+ *                                    src/reload-plan.ts, reads only its
+ *                                    classes' lengths, so the plan holds
+ *                                    stand-in entries), naming the
+ *                                    last-applied record beside the
+ *                                    configuration file at <config-path>
+ *                                    (`reloadFilePaths`, src/reload.ts)
  *
  * SPDX-License-Identifier: MIT
  */
@@ -899,6 +918,27 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
       const thrown = new (errorClass as new (verb: string, errName: string, errDescription: string) => Error)('spawn', name, '')
       const classify = await fn<(v: unknown) => { readonly errorClass: string }>('ad-error-class.ts', 'classifyAdError')
       return classify(thrown).errorClass
+    },
+  },
+  // Scenario 18 (test-19; b.jg5 SRJ-1419).
+  RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY: { args: [], print: () => text('retired-keys.ts', 'RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY') },
+  reloadAppliedLogLine: {
+    args: ['added', 'removed', 'destructive', 'in-place', 'credentials', 'settings', 'config-path'],
+    print: async ([added, removed, destructive, inPlace, credentials, settings, configPath]) => {
+      // Stand-in entries, each with its own key: the counts read only how
+      // many each class holds (`inPlace` and `nextLaunch` by distinct key).
+      const standIns = (raw: string, what: string) => Array.from({ length: count(raw) }, (_, i) => ({ key: `${what}${i}`, name: `${what}${i}` }))
+      const plan = {
+        added: standIns(added, 'added'),
+        removed: standIns(removed, 'removed'),
+        destructive: standIns(destructive, 'destructive'),
+        inPlace: standIns(inPlace, 'inplace'),
+        nextLaunch: [],
+        credentials: standIns(credentials, 'credentials'),
+        settings: standIns(settings, 'setting'),
+      }
+      const paths = (await fn<(p: string) => { readonly lastApplied: string }>('reload.ts', 'reloadFilePaths'))(configPath)
+      return (await fn<(p: object, recordPath: string) => string>('reload-apply.ts', 'renderAppliedLogLine'))(plan, paths.lastApplied)
     },
   },
 }
