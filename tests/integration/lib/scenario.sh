@@ -408,6 +408,13 @@
 #                                      agent-director's `pause` types, fires SessionEnd (the row reads
 #                                      `ended`) and keeps running, its session with it, until
 #                                      `stub_release`
+#   stub_shown_dialogs <target>       print every dialog the stub in the tmux pane <target> (named
+#                                      as for `stub_press_enter`) printed on its pane, byte for byte
+#                                      (its record $SCENARIO_BIN/stub-claude-shown-dialogs.<pid>; empty
+#                                      when it printed none): the stub clears an answered dialog from
+#                                      the pane and its scrollback, so a pane read after the answer
+#                                      no longer shows it. Reads only; refuses as stub_press_enter
+#                                      does, and fails when the pane is not on the scenario's server
 #   stub_release <target> [<timeout-s>]
 #                                      harness addition (scenario 24, test-26, and scenario 13):
 #                                      release the lingering stub in the tmux pane <target> (named as
@@ -1136,6 +1143,9 @@ SCENARIO_STUB_DELAYS_NAME=stub-claude-dialog-delays
 STUB_MODE_LINGER_ON_EXIT=linger-on-exit
 SCENARIO_STUB_MODES+=("${STUB_MODE_LINGER_ON_EXIT}")
 SCENARIO_STUB_LINGER_PREFIX=stub-claude-lingering.
+# The record of the dialogs a stub printed, beside it (this prefix, then its
+# PID): an answered dialog is cleared from the pane (fixtures/stub-claude.sh).
+SCENARIO_STUB_SHOWN_DIALOGS_PREFIX=stub-claude-shown-dialogs.
 SCENARIO_STUB_RELEASE_S=10
 
 # The MCP server name the package's install writes into slack-mcp.json
@@ -2724,6 +2734,27 @@ stub_press_enter() {
     err="${SCENARIO_ROOT}/stub-press-enter.err"
     "${SCENARIO_REAL_TMUX}" send-keys -t "${exact}" Enter 2> "${err}" || rc=$?
     (( rc == 0 )) || fail "${step}: tmux send-keys exited ${rc}: $(tr '\n' ' ' < "${err}")"
+}
+
+stub_shown_dialogs() {
+    local target="${1:-}" step exact err pid rc=0 file
+    step="stub_shown_dialogs ${target}"
+    require_ci_image "${step}"
+    _scenario_tmux_check "${step}"
+    [[ -n "${target}" ]] || fail "${step}: no pane named"
+    case "${target}" in
+        %*) exact="${target}" ;;
+        *:*) exact="=${target}" ;;
+        *) exact="=${target}:" ;;
+    esac
+    err="${SCENARIO_ROOT}/stub-shown-dialogs.err"
+    pid="$("${SCENARIO_REAL_TMUX}" display-message -p -t "${exact}" '#{pane_pid}' 2> "${err}")" || rc=$?
+    (( rc == 0 )) || fail "${step}: tmux display-message exited ${rc}: $(tr '\n' ' ' < "${err}")"
+    [[ "${pid}" =~ ^[1-9][0-9]*$ ]] \
+        || fail "${step}: no pane ${target} on the scenario's tmux server (tmux gave pane pid '${pid}')"
+    file="${SCENARIO_BIN}/${SCENARIO_STUB_SHOWN_DIALOGS_PREFIX}${pid}"
+    [[ -f "${file}" ]] || return 0
+    cat -- "${file}"
 }
 
 # Harness addition (scenario 24, test-26, and scenario 13): release a stub

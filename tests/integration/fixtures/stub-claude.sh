@@ -148,6 +148,9 @@
 #     live-session banner and no dialog text, which it would read as a
 #     prompt. Output before the answer, and a dialog left unanswered (stdin
 #     closed, or the sentinel), is unchanged.
+#   - Every dialog the stub prints is also appended, byte for byte, to
+#     `stub-claude-shown-dialogs.<stub pid>` beside it, so a scenario can
+#     still read what its pane showed once the answer has cleared it.
 #   - The sentinel line `__CSCB_TEST_EXIT__` fires every SessionEnd hook the
 #     `--settings` JSON registers and exits 0 (in `silent`, it fires none). In
 #     a dialog mode it does so before the dialog is answered too.
@@ -535,10 +538,25 @@ folder_trusted() {
     ' "${file}" > /dev/null 2>&1
 }
 
+# The record of every dialog this stub printed on its pane, beside it: the
+# dialog's bytes, as printed, appended to `stub-claude-shown-dialogs.<stub
+# pid>`. A pane read after an answer finds no dialog (see
+# clear_answered_dialog), so a scenario reads what its pane showed here.
+SHOWN_DIALOGS_FILE="${STUB_DIR}/stub-claude-shown-dialogs.$$"
+
+# show_dialog <printer>: run the dialog printer, its output to the pane and,
+# byte for byte, to SHOWN_DIALOGS_FILE (a failed record write is reported on
+# standard error and changes nothing on the pane).
+show_dialog() {
+    "$1" | tee -a -- "${SHOWN_DIALOGS_FILE}" 2> /dev/null \
+        || printf 'stub-claude[%s]: could not record the dialog in %s\n' "$$" "${SHOWN_DIALOGS_FILE}" >&2
+}
+
 # A dialog answered: clear the screen (cursor home, erase the screen) and the
 # scrollback (erase saved lines, which tmux fills with the erased screen),
 # as Claude Code redraws its screen once a dialog is answered, so no pane
-# read after the answer finds the dialog's text.
+# read after the answer finds the dialog's text (its record stays in
+# SHOWN_DIALOGS_FILE).
 clear_answered_dialog() {
     printf '\033[H\033[2J\033[3J'
 }
@@ -766,23 +784,23 @@ case "${MODE}" in
             now_ms
             DIALOG_DUE_MS=$(( NOW_MS + DIALOG_DELAY_S * 1000 ))
         else
-            print_dev_channels_dialog
+            show_dialog print_dev_channels_dialog
             AWAITING_ENTER=1
         fi
         ;;
     "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}")
-        print_dev_channels_dialog
+        show_dialog print_dev_channels_dialog
         AWAITING_ENTER=1
         ;;
     "${MODE_UNRECOGNISED}")
-        print_unrecognised_dialog
+        show_dialog print_unrecognised_dialog
         AWAITING_ENTER=1
         ;;
     "${MODE_FOLDER_TRUST}")
         if folder_trusted; then
             report_in
         else
-            print_trust_dialog
+            show_dialog print_trust_dialog
             AWAITING_ENTER=1
         fi
         ;;
@@ -866,7 +884,7 @@ while :; do
         if (( wait_ms <= 0 )); then
             DIALOG_DUE_MS=0
             clear_screen
-            print_dev_channels_dialog
+            show_dialog print_dev_channels_dialog
             AWAITING_ENTER=1
             continue
         fi

@@ -121,9 +121,11 @@
 #        and no `resume`, reuse spawn or `kill` of it;
 #      - at least one bot-server `send-keys` of C's row with
 #        `--allow-pending`, the first following a bot-server `read-pane` of C's
-#        row with `--allow-pending` made after the spawn; C's pane holds the
+#        row with `--allow-pending` made after the spawn; C's pane showed the
 #        folder-trust prompt (TRUST_DIALOG_NEEDLE) and not the dev-channels
-#        dialog, so the Enter the approver sent answered that prompt (the
+#        dialog (read from the stub's record of the dialogs it printed,
+#        `stub_shown_dialogs`, since the stub clears an answered dialog from
+#        its pane and scrollback, as Claude Code redraws), so the Enter the approver sent answered that prompt (the
 #        harness sends nothing into C's pane, and the stub reports in only on
 #        that Enter);
 #      - C's row reads `waiting` (step 4).
@@ -697,7 +699,7 @@ leg_migrated_row() {
 
     # Each approver send-keys with --allow-pending follows its read-pane with --allow-pending.
     sends="$(expect_pane_read_before_send "${step}" "${table}" "${srv}" "${A_ID}" "${resume_at}")" || exit 1
-    pane_history "${step}" "${A_SESSION}" "${pane}"
+    stub_shown_dialogs "${A_SESSION}" > "${pane}" || exit 1
     prompt_shown=no
     pane_holds "${pane}" "${TRUST_NEEDLE}" && prompt_shown=yes
     echo "${TEST_NAME}: ${step}: the folder-trust prompt on the migrated row's resume (recorded): shown ${prompt_shown}; the approver's send-keys with ${ALLOW_PENDING_FLAG}: ${sends}; bot-server read-pane with ${ALLOW_PENDING_FLAG}: $(count_calls "${table}" "${srv}" "${A_ID}" read-pane "${resume_at}" - "${ALLOW_PENDING_FLAG}")"
@@ -775,7 +777,7 @@ legs_new_personas() {
     expect_one_pre_trust_line "${step}: B" "${log0}" "${B_REF}" "${VERB_SPAWN}" "${want}"
     expect_launch_calls "${step}: B" "${table}" "${srv}" "${B_ID}" "${leg_start}" 1 0
     echo "${TEST_NAME}: ${step}: B's spawn reported pre_trust ${PRE_TRUST_OK}: ${want}"
-    pane_history "${step}: B" "${b_session}" "${b_pane}"
+    stub_shown_dialogs "${b_session}" > "${b_pane}" || exit 1
     echo "${TEST_NAME}: ${step}: B's folder-trust prompt (recorded): shown $(pane_holds "${b_pane}" "${TRUST_NEEDLE}" && echo yes || echo no); the approver's send-keys with ${ALLOW_PENDING_FLAG}: $(count_calls "${table}" "${srv}" "${B_ID}" send-keys "${leg_start}" - "${ALLOW_PENDING_FLAG}"); B's trust entry in ~/.claude.json: $(jq -c --arg d "$(realpath -e -- "${b_work}")" '.projects[$d] // "none"' "${HOME}/.claude.json" 2> /dev/null || echo unreadable)"
 
     # Step 6: C's checks.
@@ -786,8 +788,12 @@ legs_new_personas() {
     spawn_at="$(first_call_at "${table}" "${srv}" "${C_ID}" spawn "${leg_start}" -)"
     sends="$(expect_pane_read_before_send "${step}: C" "${table}" "${srv}" "${C_ID}" "${spawn_at}")" || exit 1
     (( sends >= 1 )) || fail "${step}: no bot-server send-keys of ${C_ID} with ${ALLOW_PENDING_FLAG}: the approver never answered C's folder-trust prompt"
+    # The stub clears an answered dialog from its pane and scrollback, so what
+    # C's pane showed is read from the stub's record of the dialogs it printed.
+    stub_shown_dialogs "${c_session}" > "${c_pane}.shown" || exit 1
+    pane_holds "${c_pane}.shown" "${TRUST_NEEDLE}" || fail "${step}: C's pane never showed the folder-trust prompt ('${TRUST_NEEDLE}')"
+    ! pane_holds "${c_pane}.shown" "${DEV_NEEDLE}" || fail "${step}: C's pane showed the dev-channels dialog ('${DEV_NEEDLE}')"
     pane_history "${step}: C" "${c_session}" "${c_pane}"
-    pane_holds "${c_pane}" "${TRUST_NEEDLE}" || fail "${step}: C's pane never showed the folder-trust prompt ('${TRUST_NEEDLE}')"
     ! pane_holds "${c_pane}" "${DEV_NEEDLE}" || fail "${step}: C's pane shows the dev-channels dialog ('${DEV_NEEDLE}')"
     echo "${TEST_NAME}: ${step}: C's folder-trust prompt was answered by the approver: ${sends} send-keys with ${ALLOW_PENDING_FLAG}, the first at +$(awk -v a="${spawn_at}" -v b="$(first_call_at "${table}" "${srv}" "${C_ID}" send-keys "${spawn_at}" - "${ALLOW_PENDING_FLAG}")" 'BEGIN { printf "%.3f", b - a }')s from the spawn"
     echo "${TEST_NAME}: ${step}: C's claude_config_dir after the launch (recorded): .claude.json $([[ -e "${c_config}/.claude.json" ]] && echo present || echo absent)"

@@ -224,7 +224,8 @@
 #                    touching a marker file: `claude --version` prints
 #                    `2.1.280 (Claude Code)`; in a directory with no selection
 #                    it prints the dev-channels dialog, byte for byte
-#                    tests/fixtures/dev-channels-pane-2.1.120.txt; `silent`
+#                    tests/fixtures/dev-channels-pane-2.1.120.txt, and its
+#                    record of the dialogs it showed holds the same bytes; `silent`
 #                    prints nothing, fires no hook, and on the sentinel fires
 #                    no SessionEnd; `at-once` with no
 #                    AGENT_DIRECTOR_INSTANCE_ID prints its banner, fires
@@ -2369,7 +2370,7 @@ mcp_ticks_or_trouble() {
 # agent-director), with hooks that each touch a marker file.
 leg_stub_direct() {
     local step="stub direct" dir out="${SCENARIO_ROOT}/stub-direct.out" err="${SCENARIO_ROOT}/stub-direct.err"
-    local mark="${SCENARIO_ROOT}/stub-direct-mark" settings got rc=0 before words=() want=()
+    local mark="${SCENARIO_ROOT}/stub-direct-mark" settings got rc=0 before words=() want=() pid
     local fixture="${SCENARIO_FIXTURES}/../../fixtures/dev-channels-pane-2.1.120.txt"
     settings="$(jq -nc --arg m "${mark}" '{hooks: {
         SessionStart: [{hooks: [{type: "command", command: "/usr/bin/touch", args: [($m + ".start")]}]}],
@@ -2378,11 +2379,16 @@ leg_stub_direct() {
     got="$("${SCENARIO_BIN}/claude" --version)" || fail "${step}: claude --version exited non-zero"
     [[ "${got}" == "2.1.280 (Claude Code)" ]] || fail "${step}: claude --version printed '${got}'"
 
-    # A directory with no selection: the dev-channels dialog, byte for byte.
+    # A directory with no selection: the dev-channels dialog, byte for byte,
+    # on its output and in its record of the dialogs it showed.
     dir="$(make_workdir stub-default)"
-    (cd "${dir}" && "${SCENARIO_BIN}/claude" < /dev/null) > "${out}" 2> "${err}" || rc=$?
+    (cd "${dir}" && exec "${SCENARIO_BIN}/claude" < /dev/null) > "${out}" 2> "${err}" &
+    pid=$!
+    wait "${pid}" || rc=$?
     (( rc == 0 )) || fail "${step}: the stub in a directory with no selection exited ${rc}"
     cmp -s -- "${fixture}" "${out}" || fail "${step}: with no selection the stub's output is not ${fixture##*/}, byte for byte"
+    cmp -s -- "${fixture}" "${SCENARIO_BIN}/${SCENARIO_STUB_SHOWN_DIALOGS_PREFIX}${pid}" \
+        || fail "${step}: the stub's record of the dialogs it showed (${SCENARIO_STUB_SHOWN_DIALOGS_PREFIX}${pid}) is not ${fixture##*/}, byte for byte"
     [[ ! -s "${err}" ]] || fail "${step}: with no selection the stub wrote to standard error: $(head -c 300 "${err}")"
 
     # Silent: no output, no SessionStart, and the sentinel fires no SessionEnd.

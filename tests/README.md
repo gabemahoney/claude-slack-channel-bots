@@ -2544,6 +2544,12 @@ takes history lines (`capture-pane -p -S -<n>`): CSCB's waiting-row check
 (src/pane-read.ts, 40) lines and would otherwise find the answered dialog's
 text and read it as a prompt. Output before the answer, and a dialog left
 unanswered (stdin closed, or the exit sentinel), is left as it is.
+Each dialog the stub prints is also appended, byte for byte, to its record
+`stub-claude-shown-dialogs.<stub pid>` beside it in `SCENARIO_BIN`
+(`SCENARIO_STUB_SHOWN_DIALOGS_PREFIX`). `stub_shown_dialogs <target>` (the
+pane named as for `stub_press_enter`) prints the record of the stub in that
+pane, so a scenario can check which dialog its pane showed after the answer
+has cleared it (test-25 checks C's folder-trust prompt this way).
 
 `stub_press_enter <target>` sends Enter with the real tmux, from the
 scenario's own shell, into a pane on the scenario's tmux server: a pane id is
