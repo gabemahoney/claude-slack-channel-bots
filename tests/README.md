@@ -180,7 +180,11 @@ user's own `~/.agent-director`.
 
 `tests/host-safety.test.ts` reads these files, and never runs them, to check
 that each check comes before the first step it guards (see the
-`host-safety.test.ts` row in `docs/testing-guide.md`).
+`host-safety.test.ts` row in `docs/testing-guide.md`). It finds the
+`scenario.sh` functions to hold from the file: every function with a step,
+less the ones its commented `HOME_CHECK_EXEMPT` and `HOME_CHECKED_BY_CALLERS`
+lists name with why; a function in the second list may run only after an
+audited helper's `require_scenario_home`.
 
 ### Layout
 
@@ -225,7 +229,7 @@ tests/
                                    # refusals (`tmux_steps`); the store statements writing exactly their columns and refusing a live row (`store_statements`);
                                    # the include-finished kill from the scenario's shell, the `pending` row beside a leftover and the one `delete`
                                    # (`operator_actions`); the find-missing loop's runs, interval and parent (`find_missing_loop`); fmk-driver.ts's three
-                                   # forced calls, each one `DRIVER: FORCED` line with its calls parented by the driver (`fmk_driver_reuse_spawn`,
+                                   # forced calls, each one `DRIVER: FORCED` line with every call during its run parented by the driver (`fmk_driver_reuse_spawn`,
                                    # `fmk_driver_read_pane`, `fmk_driver_resume`); the 0.10.0 seeders in a nested run started on 0.10.0, their rows
                                    # surviving `install_ad_rc` and each seeder's refusals (`seeders_010`); and, last, the tmux server restart and socket
                                    # re-bind (`tmux_server_steps`). The re-fire legs wait out agent-director's default G (60 s); only after them does
@@ -250,8 +254,10 @@ tests/
                                    # mode (log, fail-kill, fail-create, slow-create, wedge)
       fmk-driver.ts                # the driver of the calls an fmk scenario forces, run through `cscb_run`, each through the installed package's production code
                                    # with one `DRIVER:` outcome line: a `resume` (scenario 5) and a reuse spawn (scenarios 8 and 25) through the package's
-                                   # forced-launch seams, and the persona's pane read under another TMUX_TMPDIR (scenario 26); refuses to run without the image
-                                   # marker /etc/cscb-ci-image and imports the installed package and its agent-director client only after that check
+                                   # forced-launch seams, and the persona's pane read under another TMUX_TMPDIR (scenario 26); after a forced launch it waits
+                                   # for the dialog approvers to stop (`stopAllDialogApprovers`) before it prints its outcome and exits, so no agent-director
+                                   # call it caused is in flight; refuses to run without the image marker /etc/cscb-ci-image and imports the installed package
+                                   # only after that check
       driver.ts                    # Test 4 driver: builds a one-persona config, calls spawnForPersona directly, then follows the persona's dialog approver through the package's seams
                                    # (running when the launch returns, stops because the row went live, keeps the launch start); deletes no row
       stub-claude.sh               # fake `claude` (Tests 4, 10 and 12, and every fmk script): runs the mode its working directory selects (the dev-channels
@@ -377,6 +383,23 @@ Points where the script meets the runbook:
   persona's working directory in the stub's dev-channels mode, and waits for
   each persona's row to read `waiting` within B, CSCB's launch bound from
   step 8's settings.
+- Step 10's launch-start check (`container-list`) samples
+  `agent-director list --state pending` back to back, through the harness
+  call from a subshell of the scenario's shell, from before `start_server`
+  until every persona row reads `waiting`. Every sample must exit 0, and
+  every row a sample shows must be `pending` with a `launch_started_at`.
+  For each persona, agent-director's trail (the scenario HOME's
+  `~/.agent-director/ad-trail.jsonl`, the records after its length noted
+  before the start) must prove the row read `pending` until its
+  SessionStart: the row's first `ad.spawn.state_transition` moves it from
+  `pending` to `waiting` by SessionStart, and an `ad.send_keys.called`
+  record has `row_state` `pending` (the trail records no launch start; the
+  samples show it). Every sample taken wholly inside the stretch the row
+  provably read `pending`, from the bot server's first `read-pane` of it
+  after its spawn to the server's first `send-keys` of it (by their shim
+  lines), must show the row. The post-install check line in the fixture
+  record states how many samples showed each row `pending` and how many fell
+  inside that stretch.
 
 Health ticks run through config: the persona configuration sets
 `health_check_interval` (shorter than leg A's wait) and
@@ -405,8 +428,11 @@ CSCB process:
 - no persona reaches the restart cap: no restart-cap line in `server.log` and
   no cap notice in the Slack stub's record;
 - no post repeats: no two `chat.postMessage` requests in the stub's record
-  share a channel and text. The check logs how many posts it compared; none
-  in this scenario, since nothing in it posts.
+  share a channel and text. The check logs how many posts it compared, and
+  fails unless there are exactly 0, since nothing in the scenario posts;
+- the stub's record captures the personas' Slack traffic: its lines from
+  step 10's start on hold, for each persona's label, at least one
+  `apps.connections.open` request and one `ws-open`.
 
 Leg B: a `clean_restart` on Phase 1, after step 11. The script reads each
 persona's `claude_session_id` with `get`, then runs the new CLI's
@@ -447,10 +473,12 @@ server's calls are its shim lines after the restart:
   reads `pending` with a launch start until one reads `waiting`, within B_R;
 - the same from agent-director's trail (`ad-trail.jsonl` in the scenario
   HOME's `~/.agent-director/`, the records after the length noted before
-  `clean_restart`). For each row, the script takes the SessionStart
-  `pending`-to-`waiting` state transition, the last
-  `ad.resume.moved_to_pending` before it and the first SessionStart
-  `ad.hook.fired` after it. It orders them against the bot server's last
+  `clean_restart`). For each row, the script takes, in trail order, the
+  first SessionStart `pending`-to-`waiting` state transition and the last
+  `ad.resume.moved_to_pending` before it; and, by `ts`, the row's
+  SessionStart `ad.hook.fired` record nearest the transition: the latest at
+  or before it, else the first after it, whatever the records' order in the
+  trail. It orders them against the bot server's last
   resume call and the harness's reads. Both the move to `pending` and the
   SessionStart hook come after that resume, and the hook comes no later than
   the end of the first read of `waiting`. No read between that resume and
@@ -465,11 +493,16 @@ server's calls are its shim lines after the restart:
 - with no refusal, the start pass counts every persona resumed, none
   fresh-spawned and none not brought up (with one, none fresh-spawned);
 - no CSCB `delete`, no `kill` by the restarted server, and every persona row
-  and pre-persona row is still present.
+  and pre-persona row is still present;
+- the stub's record lines from before `clean_restart` on hold no post
+  (exactly 0) and, for each persona's label, at least one
+  `apps.connections.open` request and one `ws-open`.
 
 Leg C: this build refuses agent-director 0.10.0. The script stops leg B's
-server with its bots through the new CLI (`stop --stop-bots`), waits for
-every Slack socket the stub opened to close, and checks that no tmux session
+server with its bots through the new CLI (`stop --stop-bots`), fails unless
+the stub's record holds at least one `ws-open`, waits until it holds as many
+`ws-close` records as `ws-open` (every Slack socket the stub opened closed),
+and checks that no tmux session
 is left. It then notes the lengths of the shim log, the stub's record,
 `startup-errors.log` and `server.log`. `swap_ad_binary 0.10.0` replaces only
 the binary behind the shim and checks the shim. The script compares the
@@ -828,7 +861,7 @@ itself, how many lines and their numbers.
 |---|---|---|
 | `assert_no_server_tmux` | any tmux shim line whose parent is a bot server the scenario started | some tmux line's parent is an agent-director process a CSCB process ran: its PID is that of the latest agent-director shim `call` line at or before it, that call's parent is a CSCB process, and the parent's argv[0] is `agent-director`. The harness's own spawns never meet it |
 | `assert_no_cscb_include_finished` | any agent-director `kill` call carrying `--include-finished` (`-` or `--`, with or without `=<value>`) whose parent is not the scenario's own shell or a subshell of it (a command substitution or pipeline element included): a parent whose command line is `SCENARIO_SHELL_CMDLINE` and that no CSCB process held | some agent-director call's parent is a bot server the scenario started (its version probe) |
-| `assert_no_cscb_delete` | any agent-director `delete` call whose parent is a CSCB process | (no positive control) |
+| `assert_no_cscb_delete` | any agent-director `delete` call whose parent is not the scenario's own shell or a subshell of it, told apart as for `assert_no_cscb_include_finished`. Any other parent fails, a CSCB process the record does not hold included (a server refused before it wrote its PID file). The harness's own `ad_delete_unusable_row` passes. The failure text is "run delete from a parent other than the scenario's own shell or a subshell of it" | (no positive control) |
 
 Every fmk script ends with all three, in its own shell, whatever the tmux
 shim's mode. The positive controls keep an empty or bypassed log from passing:
@@ -1080,7 +1113,7 @@ one.
 | `ad_store_mark_finished <id> <missing\|ended>` | 10 part B (SRJ-1412) | `state` to `missing` or `ended`; `ended_at` to now minus the stopping window, in whole seconds, in the store's `YYYY-MM-DD HH:MM:SS` UTC layout; `launch_started_at` NULL; `row_version` + 1. Prints the `ended_at` written |
 | `ad_store_seed_pending <id> [<leftover-token>]` | 19 (SRJ-1420) | the existing row made `pending`, as a spawn whose process stopped before its create leaves it: `state` `pending`; `launch_started_at` now, in milliseconds; `launch_token` a fresh token other than the row's current one and the leftover's; `ended_at`, `pid`, `proc_starttime`, `tmux_server_pid`, `tmux_server_started`, `tmux_server_starttime`, `pane_id`, `pane_pid` and `pane_starttime` NULL; `row_version` + 1. A harness `status` read must then read `pending` with a launch start. Prints the token |
 | `ad_store_unusable_name <id> <name>` | 25 (SRJ-1427) | only `tmux_session_name`, to a `<name>` holding a `.` and only letters, digits and `._-`, on an `ended` or `missing` row; `row_version` kept |
-| `ad_store_pending_no_launch <id>` | 20 and 26 | `state` `pending`; `launch_started_at`, `launch_token`, `pid`, `proc_starttime`, `pane_id`, `pane_pid` and `pane_starttime` NULL; `row_version` + 1. A harness `status` read must then read `pending` with no launch start |
+| `ad_store_pending_no_launch <id>` | 20 and 26 | `state` `pending`; `launch_started_at`, `launch_token`, `pid`, `proc_starttime`, `pane_id`, `pane_pid` and `pane_starttime` NULL; `row_version` + 1. It reads the row first and guards the UPDATE on the `row_version` it read, failing when the UPDATE changes no row (agent-director wrote the row in between); it then reads the row again and fails unless only these columns changed, each as named. A harness `status` read must then read `pending` with no launch start |
 
 `ad_store_mark_finished` reads the stopping window from `[tmux]
 stopping_window_seconds` in `$HOME/.agent-director/config.toml`, or uses
@@ -1109,7 +1142,9 @@ than the session's creation.
   unless that name holds a `.`, and fails unless `delete` exits 0 and the
   row is gone. It is the only agent-director `delete` under
   `tests/integration`: no fixture calls `delete`, and
-  `tests/host-safety.test.ts` audits that statically.
+  `tests/host-safety.test.ts` audits that statically over every shell and
+  TypeScript file there. It runs from the scenario's own shell, as
+  `assert_no_cscb_delete` requires.
 
 #### The find-missing loop
 
@@ -1132,8 +1167,10 @@ own pending-row runs, and the harness runs no loop for it.
   `FIND_MISSING_LOOP_PID` and `FIND_MISSING_LOOP_INTERVAL_S`.
 - Its calls' parent is the loop subshell, whose command line is the
   script's own, so `cscb_ad_calls` and `cscb_ad_count` count none of them.
-- `stop_find_missing_loop [<timeout-s>]` stops it (default 30 s; a run in
-  flight finishes first). `find_missing_loop_runs` prints how many runs the
+- `stop_find_missing_loop [<timeout-s>]` stops it with SIGTERM (default
+  30 s). A run in flight finishes and writes its `run <n>` line, then the
+  loop leaves, so no run's line is lost and a later loop numbers its runs
+  after it. `find_missing_loop_runs` prints how many runs the
   log holds, and `wait_find_missing_runs <n> [<timeout-s>]` waits for `<n>`
   more (default `<n>` intervals plus 60 s), failing early when the loop
   stops.

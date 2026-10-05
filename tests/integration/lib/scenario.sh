@@ -287,10 +287,14 @@
 #                                      UPDATE: state `pending`; launch_started_at, launch_token, pid,
 #                                      proc_starttime, pane_id, pane_pid and pane_starttime NULL;
 #                                      row_version advanced by one; every other column kept. Fails
-#                                      when no row has <instance-id> (the UPDATE returns none) or the
-#                                      id holds a character other than letters, digits and `._:@-`;
-#                                      then a harness `status` read (`ad_capture`) must read `pending`
-#                                      with no launch_started_at, or it fails
+#                                      when the id holds a character other than letters, digits and
+#                                      `._:@-`, or no row has <instance-id>. The UPDATE is guarded by
+#                                      the row_version read before it (`AND row_version = <rv>`): it
+#                                      fails when it changed no row (agent-director wrote the row in
+#                                      between), and when the row read after it differs from the
+#                                      one before in any column but those named here, or not as
+#                                      named. Then a harness `status` read (`ad_capture`) must read
+#                                      `pending` with no launch_started_at, or it fails
 #
 #   Stub workers (fmk mode; fixtures/stub-claude.sh's header states the modes, the
 #   SessionStart re-fire, its stop line and the MCP session; each runs both guards first)
@@ -495,8 +499,9 @@
 #                                      CSCB process), so CSCB's filters count none of them. Sets
 #                                      FIND_MISSING_LOOP_PID and FIND_MISSING_LOOP_INTERVAL_S
 #   stop_find_missing_loop [<timeout-s>]
-#                                      SIGTERM the loop (a run in flight finishes first); fail unless
-#                                      it is gone within <timeout-s> (default 30)
+#                                      SIGTERM the loop (a run in flight finishes and writes its log
+#                                      line first); fail unless it is gone within <timeout-s>
+#                                      (default 30)
 #   find_missing_loop_runs             print how many runs the loop's log holds (0 when none)
 #   wait_find_missing_runs <n> [<timeout-s>]
 #                                      wait for <n> more runs than the log holds now; fails when the
@@ -583,7 +588,12 @@
 #                                      as the shims quote it) and that no CSCB process held; positive
 #                                      control: fail unless some invocation's parent is a bot server
 #                                      the scenario started (its version probe)
-#   assert_no_cscb_delete              fail on any `delete` invocation whose parent is a CSCB process
+#   assert_no_cscb_delete              fail on any `delete` invocation whose parent is not the
+#                                      scenario's own shell or a subshell of it, as
+#                                      assert_no_cscb_include_finished tells them (so a CSCB process
+#                                      the record does not hold, a server refused before it wrote
+#                                      server.pid included, fails it); the harness's own delete
+#                                      (`ad_delete_unusable_row`) passes. No positive control
 #   cscb_ad_calls <verb> [<fragment>...]
 #                                      print the agent-director shim's `call` lines whose parent is a
 #                                      CSCB process, whose verb is <verb> (any verb when <verb> is
@@ -2077,14 +2087,19 @@ ad_store_backup() {
 ad_store_pending_no_launch() {
     require_ci_image "ad_store_pending_no_launch"
     require_scenario_home "ad_store_pending_no_launch"
-    local id="${1:-}" step out
+    local id="${1:-}" step before after rv out
     step="ad_store_pending_no_launch ${id}"
-    [[ "${id}" =~ ^[A-Za-z0-9._:@-]+$ ]] \
-        || fail "${step}: instance id '${id}' is empty or holds a character other than letters, digits and ._:@-"
-    # One statement; RETURNING names the row it changed, so no row is seen.
-    out="$(ad_store_edit "UPDATE spawns SET state = 'pending', launch_started_at = NULL, launch_token = NULL, pid = NULL, proc_starttime = NULL, pane_id = NULL, pane_pid = NULL, pane_starttime = NULL, row_version = row_version + 1 WHERE claude_instance_id = '${id}' RETURNING claude_instance_id")" \
+    _scenario_check_instance_id "${step}" "${id}"
+    before="$(_scenario_row_json "${step}" "${id}")" || exit 1
+    rv="$(jq -r '.[0].row_version' <<< "${before}")"
+    [[ "${rv}" =~ ^[0-9]+$ ]] || fail "${step}: the row's row_version reads '${rv}'"
+    # One statement, guarded by the row_version read; RETURNING names the row it changed.
+    out="$(ad_store_edit "UPDATE spawns SET state = 'pending', launch_started_at = NULL, launch_token = NULL, pid = NULL, proc_starttime = NULL, pane_id = NULL, pane_pid = NULL, pane_starttime = NULL, row_version = row_version + 1 WHERE claude_instance_id = '${id}' AND row_version = ${rv} RETURNING claude_instance_id")" \
         || exit 1
-    [[ "${out}" == "${id}" ]] || fail "${step}: no row has instance id ${id}"
+    [[ "${out}" == "${id}" ]] || fail "${step}: the row's row_version is no longer ${rv}: agent-director wrote it in between, and the edit wrote nothing"
+    after="$(_scenario_row_json "${step}" "${id}")" || exit 1
+    _scenario_row_diff_check "${step}" "${before}" "${after}" \
+        "{\"state\": \"pending\", \"launch_started_at\": null, \"launch_token\": null, \"pid\": null, \"proc_starttime\": null, \"pane_id\": null, \"pane_pid\": null, \"pane_starttime\": null, \"row_version\": $(( rv + 1 ))}"
     ad_capture status --claude-instance-id "${id}"
     [[ "${AD_RC}" == 0 ]] \
         || fail "${step}: the harness status read exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
@@ -2938,12 +2953,16 @@ ad_delete_unusable_row() {
 # _scenario_find_missing_loop <dir> <interval-s>: the loop's body, run in a
 # background subshell of the scenario's shell: `find-missing` through the
 # harness call, its log line and output, then the interval, until SIGTERM.
+# The TERM trap only sets a flag and wakes the interval's sleep: bash runs it
+# once a `find-missing` in flight has returned, and that run still writes its
+# log line before the loop leaves, so no run's line is lost and a later loop
+# numbers its runs after it.
 _scenario_find_missing_loop() {
-    local dir="$1" interval="$2" n rc start end sleeper=""
-    trap '[[ -z "${sleeper}" ]] || kill "${sleeper}" 2> /dev/null; exit 0' TERM
+    local dir="$1" interval="$2" n rc start end sleeper="" stopping=0
+    trap 'stopping=1; [[ -z "${sleeper}" ]] || kill "${sleeper}" 2> /dev/null' TERM
     n="$(grep -c '^run ' "${dir}/loop.log" 2> /dev/null)" || true
     n="${n:-0}"
-    while :; do
+    while (( ! stopping )); do
         n=$(( n + 1 ))
         rc=0
         start="${EPOCHREALTIME/,/.}"
@@ -2954,11 +2973,17 @@ _scenario_find_missing_loop() {
             sed 's/^/  out| /' "${dir}/run.${n}.out"
             sed 's/^/  err| /' "${dir}/run.${n}.err"
         } >> "${dir}/loop.log"
+        (( ! stopping )) || break
         sleep "${interval}" &
         sleeper=$!
-        wait "${sleeper}" || true
+        if (( stopping )); then
+            kill "${sleeper}" 2> /dev/null || true
+        else
+            wait "${sleeper}" || true
+        fi
         sleeper=""
     done
+    exit 0
 }
 
 run_find_missing_loop() {
@@ -3465,15 +3490,21 @@ assert_no_cscb_delete() {
     for i in "${!lines[@]}"; do
         _scenario_split_line "${lines[i]}"
         [[ "${_L_KIND}" == call ]] || continue
-        _scenario_role_at "${_L_PPID}" "${_L_US}" || continue
         _scenario_decode_words
         _scenario_ad_verb
-        if [[ "${_L_VERB}" == delete ]]; then
-            bad+=("$(( i + 1 ))")
+        [[ "${_L_VERB}" == delete ]] || continue
+        # Only the scenario's own shell, or a subshell of it, may delete: a
+        # parent with the script's own command line that no CSCB process
+        # held. Any other parent fails, a CSCB process the record does not
+        # hold (a server refused before it wrote server.pid) included.
+        if [[ "${_L_PARENT}" == "${SCENARIO_SHELL_CMDLINE}" ]] \
+            && ! _scenario_role_at "${_L_PPID}" "${_L_US}"; then
+            continue
         fi
+        bad+=("$(( i + 1 ))")
     done
     (( ${#bad[@]} == 0 )) \
-        || _scenario_offending "${step}" "${SCENARIO_AD_SHIM_LOG}" "run delete from a CSCB process" "${bad[@]}"
+        || _scenario_offending "${step}" "${SCENARIO_AD_SHIM_LOG}" "run delete from a parent other than the scenario's own shell or a subshell of it" "${bad[@]}"
     _scenario_closing_ran "${step}"
 }
 

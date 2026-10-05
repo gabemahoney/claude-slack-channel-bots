@@ -33536,16 +33536,20 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
 // sequence's launch entry (`launchForLiveRowSequence`, the same wrapping: a
 // launch attempt, counted as a launch outside the restart work); for the
 // `resume`'s ErrSpawnNotResumable, the latch re-check's `resume`, the one
-// production site that answers it with no re-read; for an UNUSABLE NAME
+// production site that answers it with no re-read; for a collision (the
+// forced reuse spawn's, the reuse after a no-transcript answer's, the plain
+// spawn after ErrSpawnNotFound's), the latch re-check's `resume` once its
+// definite answer cleared the latch, whose launch's collision likewise ends
+// it with the collision cause armed and `retrying`; for an UNUSABLE NAME
 // answer, a retired key's first launch, the production reuse spawn that also
 // read nothing of the row first, so both latch after the one latch-time
 // `status` read (b.jg5 SRJ-501, SRJ-805; scenario 25's form).
 // ---------------------------------------------------------------------------
 
-/** The two seams, by the call each forces: the seam, and the stub verb of its call. */
+/** The two seams, by the call each forces: the seam, the stub verb of its call and the live-row sequence's launch of the same kind. */
 const FORCED_SEAMS = {
-  resume: { seam: _forceResumeForPersona, verb: 'resume' },
-  reuse: { seam: _forceReuseSpawnForPersona, verb: 'spawn' },
+  resume: { seam: _forceResumeForPersona, verb: 'resume', kind: LIVE_ROW_LAUNCH_RESUME },
+  reuse: { seam: _forceReuseSpawnForPersona, verb: 'spawn', kind: LIVE_ROW_LAUNCH_REUSE },
 } as const
 
 type ForcedSeamName = keyof typeof FORCED_SEAMS
@@ -33569,6 +33573,19 @@ async function recheckResumeLaunch(h: RecoveryHarness, key: string): Promise<und
   h.script(step1Status(LIVENESS_DEAD_ROW_ENDED))
   await h.advanceToRecheck()
   return undefined
+}
+
+/**
+ * The latch re-check's `resume` of persona `key` answered `make`'s error
+ * (`recheckResumeLaunch`): a definite answer clears the latch before its row,
+ * so a launch after it that collides is handled as after the clear
+ * (`latchRecheckCollided`: the collision cause armed, `retrying`).
+ */
+function recheckResumeMeeting(make: () => AgentDirectorError): (h: RecoveryHarness, key: string) => Promise<undefined> {
+  return (h, key) => {
+    h.script({ resumeError: make() })
+    return recheckResumeLaunch(h, key)
+  }
 }
 
 /** A retired key's first launch of persona `key` (b.jg5 SRJ-805): a reuse spawn with nothing of the row read first. */
@@ -33624,7 +33641,31 @@ interface ForcedLaunchRow {
   readonly versionRecheck?: true
   /** Effects the production site adds of its own, left out of the comparison: the latch re-check's latch and recovery posts. */
   readonly siteOwn?: readonly string[]
+  /** The answer of the launch call the production handling makes after the forced `resume`'s: its spawn's. */
+  readonly after?: () => RecoveryStubScript
+  /** The spawn after the forced `resume` is the handler's plain spawn of the same id (no reuse field), not a reuse. */
+  readonly plainSpawn?: true
+  /** What the forced launch itself leaves for P (`forcedComparedEffectsOf`), beyond its equality with the production path's. */
+  readonly effects?: Record<string, unknown>
 }
+
+/** A collision's answer to the forced launch: the collision cause armed for P, nothing counted, latched, held or posted. */
+const FORCED_COLLISION_EFFECTS: Record<string, unknown> = {
+  armed: [UNAVAILABLE_RETRY_CAUSE_COLLISION],
+  failures: 0,
+  notices: 0,
+  held: false,
+  latched: false,
+  posts: 0,
+  approverRunning: false,
+}
+
+/**
+ * The harness of a collision row: the latch re-check bound, for B's
+ * production `resume`; the scripted retry action, so P's retry, armed by the
+ * forced launch, makes no launch of its own when the clock moves to B's round.
+ */
+const FORCED_COLLISION_OPTIONS: RecoveryHarnessOptions = { latchRecheck: true, action: 'scripted' }
 
 const FORCED_LAUNCH_ROWS: ReadonlyArray<readonly [string, ForcedLaunchRow]> = [
   ['the resume, success', { seam: 'resume', make: () => undefined, calls: ['resume'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_RESUME) }],
@@ -33644,6 +33685,39 @@ const FORCED_LAUNCH_ROWS: ReadonlyArray<readonly [string, ForcedLaunchRow]> = [
     'the resume, ErrNoSessionId: the one reuse spawn of the same id follows, and the error answered is the resume\'s',
     { seam: 'resume', make: () => errNoSessionId(), calls: ['resume', 'spawn'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_RESUME) },
   ],
+  [
+    'the resume, ErrNoSessionId, then the reuse spawn collides: no get, nothing more called; retrying with the collision cause armed, not counted, not latched, not posted',
+    {
+      seam: 'resume',
+      make: () => errNoSessionId(),
+      after: () => ({ spawnError: errInstanceIdCollision() }),
+      calls: ['resume', 'spawn'],
+      production: recheckResumeMeeting(errNoSessionId),
+      result: (key) => ({ key, action: SPAWN_ACTION_RETRYING }),
+      options: FORCED_COLLISION_OPTIONS,
+      siteOwn: ['posts'],
+      effects: FORCED_COLLISION_EFFECTS,
+    },
+  ],
+  [
+    'the resume, ErrSpawnNotFound: the handler\'s one plain spawn of the same id follows, and the error answered is the resume\'s',
+    { seam: 'resume', make: () => errSpawnNotFound(), calls: ['resume', 'spawn'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_RESUME), plainSpawn: true },
+  ],
+  [
+    'the resume, ErrSpawnNotFound, then the plain spawn collides: no get, nothing more called; retrying with the collision cause armed, not counted, not latched, not posted',
+    {
+      seam: 'resume',
+      make: () => errSpawnNotFound(),
+      after: () => ({ spawnError: errInstanceIdCollision() }),
+      calls: ['resume', 'spawn'],
+      production: recheckResumeMeeting(errSpawnNotFound),
+      result: (key) => ({ key, action: SPAWN_ACTION_RETRYING }),
+      options: FORCED_COLLISION_OPTIONS,
+      siteOwn: ['posts'],
+      plainSpawn: true,
+      effects: FORCED_COLLISION_EFFECTS,
+    },
+  ],
   ['the reuse spawn, success', { seam: 'reuse', make: () => undefined, calls: ['spawn'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_REUSE) }],
   [
     'the reuse spawn, ErrInvalidFlags: one version re-check, then P held',
@@ -33661,6 +33735,20 @@ const FORCED_LAUNCH_ROWS: ReadonlyArray<readonly [string, ForcedLaunchRow]> = [
     'the reuse spawn, ErrTmuxSessionCreate: one counted launch failure',
     { seam: 'reuse', make: () => errTmuxSessionCreate('spawn'), calls: ['spawn'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_REUSE) },
   ],
+  [
+    // The production reuse whose collision answers retrying: the latch re-check's, after its resume's definite answer cleared the latch.
+    'the reuse spawn, ErrInstanceIdCollision: no get, nothing more called; retrying with the collision cause armed, not counted, not latched, not posted',
+    {
+      seam: 'reuse',
+      make: () => errInstanceIdCollision(),
+      calls: ['spawn'],
+      production: recheckResumeMeeting(errNoSessionId),
+      result: (key) => ({ key, action: SPAWN_ACTION_RETRYING }),
+      options: FORCED_COLLISION_OPTIONS,
+      siteOwn: ['posts'],
+      effects: FORCED_COLLISION_EFFECTS,
+    },
+  ],
 ]
 
 describe('b.jg5 SRJ-1306, SRJ-1401: the forced-launch seams make their one call through the production launch path, and answer as it does', () => {
@@ -33674,16 +33762,20 @@ describe('b.jg5 SRJ-1306, SRJ-1401: the forced-launch seams make their one call 
     const rechecks = row.versionRecheck === true ? h.recheckAnswers(PHASE1_RC_VERSION) : undefined
     const err = row.make()
     if (err !== undefined) h.script(FORCED_SEAMS[row.seam].verb === 'resume' ? { resumeError: err } : { spawnError: err })
+    if (row.after !== undefined) h.script(row.after())
     const order = recordCallOrder(h)
 
     const forced = await forceLaunch(h, p, row.seam)
 
     expect(order).toEqual([...row.calls])
     expect(h.stub.calls.resumeCalls).toEqual(row.calls.includes('resume') ? [{ claude_instance_id: personaInstanceId(p) }] : [])
-    // Every spawn is P's reuse: the reuse seam's call, or the reuse after a no-transcript answer.
-    expect(h.stub.calls.spawnCalls).toEqual(row.calls.includes('spawn') ? [reuseSpawnOf(h, p)] : [])
+    // Every spawn is P's: its reuse (the reuse seam's call, or the reuse after a no-transcript answer), or the plain spawn after ErrSpawnNotFound.
+    const spawned = row.calls.includes('spawn')
+    expect(h.stub.calls.spawnCalls).toEqual(spawned ? [row.plainSpawn === true ? expect.objectContaining({ claude_instance_id: personaInstanceId(p) }) : reuseSpawnOf(h, p)] : [])
+    expect(h.stub.calls.spawnCalls.filter((call) => 'reuse_finished' in call)).toHaveLength(spawned && row.plainSpawn !== true ? 1 : 0)
     expect(rechecks?.resolves.length).toBe(rechecks === undefined ? undefined : 1)
     const forcedEffects = forcedComparedEffectsOf(h, p)
+    if (row.effects !== undefined) expect(forcedEffects).toMatchObject(row.effects)
 
     const produced = await row.production(h, b)
 
@@ -33763,5 +33855,19 @@ describe('b.jg5 SRJ-1306, SRJ-1401: the forced-launch seams make their one call 
 
     expect<unknown>(forced).toStrictEqual({ called: false, result: await sequenceEntryLaunch(LIVE_ROW_LAUNCH_REUSE)(h, p), counted: false, latched: false })
     expect([h.stub.callCount(), getFailureCount(p), h.notices]).toEqual([0, 0, []])
+  })
+
+  test.each(SEAM_NAMES)('the forced %s in a dry run: no-op as the production launch of its kind answers, with no call; called false, nothing counted, nothing armed', async (name) => {
+    const { h, p } = srj105Build()
+    process.env['SLACK_DRY_RUN'] = '1'
+    const order = recordCallOrder(h)
+
+    const forced = await forceLaunch(h, p, name)
+    const forcedCalls = [...order]
+    const forcedEffects = forcedComparedEffectsOf(h, p)
+
+    expect<unknown>(forced).toStrictEqual({ called: false, result: await sequenceEntryLaunch(FORCED_SEAMS[name].kind)(h, p), counted: false, latched: false })
+    expect([forcedCalls, h.stub.callCount(), getFailureCount(p), h.notices]).toEqual([[], 0, 0, []])
+    expect(forcedEffects).toMatchObject({ armed: [], failures: 0, latched: false, posts: 0, approverRunning: false })
   })
 })

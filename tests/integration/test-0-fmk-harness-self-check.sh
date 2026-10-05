@@ -271,9 +271,12 @@
 #                    SCENARIO_ROOT: each assertion passes a clean log and
 #                    fails, naming itself and the reason, on each violating
 #                    log (and each positive control on a log that lacks it);
-#                    a line whose parent PID a recorded process held only
-#                    outside that line's time never counts, nor a stop line;
-#                    a line not in the shims' format fails.
+#                    a stop line never counts. A `kill --include-finished`
+#                    or a `delete` passes only from the scenario's own shell
+#                    (its command line, on a PID no recorded process held at
+#                    that time), so one from a recorded process's command line
+#                    outside its window fails; for the other checks such a
+#                    line never counts. A line not in the shims' format fails.
 #   count_helpers    on a synthetic log, `cscb_ad_count` and `cscb_ad_calls`
 #                    count only the calls a CSCB process made in its window:
 #                    never a harness call or a stop line; the verb is read past
@@ -2514,7 +2517,8 @@ leg_synthetic_include_finished() {
 }
 
 leg_synthetic_delete() {
-    local step="synthetic assert_no_cscb_delete" dir a="assert_no_cscb_delete" why="run delete from a CSCB process"
+    local step="synthetic assert_no_cscb_delete" dir a="assert_no_cscb_delete"
+    local why="run delete from a parent other than the scenario's own shell or a subshell of it"
     dir="$(syn_case delete-clean)"
     expect_on_files "${step}: clean" "${dir}" pass "${a}"
 
@@ -2531,14 +2535,34 @@ leg_synthetic_delete() {
     expect_on_files "${step}: from a CLI run, and after --store-path=" "${dir}" fail "${a}" \
         "2 agent-director-shim.log line(s) ${why} (line 3, 4)"
 
-    dir="$(syn_case delete-allowed)"
-    syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000073 "${SYN_SHELL}" "${SCENARIO_SHELL_CMDLINE}" \
-        delete --claude-instance-id t0-h
-    syn_line "${dir}/agent-director-shim.log" call 3000.000000 6000074 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
+    # Parents the record does not hold: the bot server's command line outside
+    # its window (as a server refused before it wrote server.pid would be),
+    # and a wrapper process.
+    dir="$(syn_case delete-unrecorded)"
+    syn_line "${dir}/agent-director-shim.log" call 3000.000000 6000073 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
         delete --claude-instance-id cscb_alpha
-    syn_line "${dir}/agent-director-shim.log" stop 1500.100000 6000075 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
+    syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000074 "${SYN_OTHER}" 'timeout 10 agent-director' \
+        delete --claude-instance-id cscb_alpha
+    expect_on_files "${step}: from the server's command line outside its window, and from a wrapper" "${dir}" fail "${a}" \
+        "2 agent-director-shim.log line(s) ${why} (line 3, 4)"
+
+    # The shell's command line, but a PID a CSCB process held at that time.
+    dir="$(syn_case delete-shell-text-cscb-pid)"
+    syn_line "${dir}/agent-director-shim.log" call 1150.000000 6000075 "${SYN_RUN}" "${SCENARIO_SHELL_CMDLINE}" \
+        delete --claude-instance-id cscb_alpha
+    expect_on_files "${step}: the shell's command line on a CSCB process's PID" "${dir}" fail "${a}" \
+        "1 agent-director-shim.log line(s) ${why} (line 3)"
+
+    # Not violations: the harness from its shell, on its own PID and on the
+    # server's PID outside the server's window, and a stop line.
+    dir="$(syn_case delete-allowed)"
+    syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000076 "${SYN_SHELL}" "${SCENARIO_SHELL_CMDLINE}" \
+        delete --claude-instance-id t0-h
+    syn_line "${dir}/agent-director-shim.log" call 3000.000000 6000077 "${SYN_SERVER}" "${SCENARIO_SHELL_CMDLINE}" \
+        delete --claude-instance-id t0-h
+    syn_line "${dir}/agent-director-shim.log" stop 1500.100000 6000078 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
         stub-claude delete
-    expect_on_files "${step}: the harness, a reused PID, a stop line" "${dir}" pass "${a}"
+    expect_on_files "${step}: the harness from its shell (its own PID, a reused PID), a stop line" "${dir}" pass "${a}"
 
     dir="$(syn_case delete-format)"
     printf 'call\t1500.000000\tx\t%s\t%s\tdelete\n' "${SYN_SERVER}" "${SYN_SERVER_CMD}" >> "${dir}/agent-director-shim.log"
@@ -2599,7 +2623,7 @@ leg_closing_enforcement() {
     expect_nested_markers "${step}: a violating line after the assertions" \
         assert_no_server_tmux assert_no_cscb_include_finished assert_no_cscb_delete "violating line written"
     expect_nested_only_fail "${step}: a violating line after the assertions" "${name}" \
-        "after the closing assertions: assert_no_cscb_delete: 1 agent-director-shim.log line(s) run delete from a CSCB process (line 2)"
+        "after the closing assertions: assert_no_cscb_delete: 1 agent-director-shim.log line(s) run delete from a parent other than the scenario's own shell or a subshell of it (line 2)"
 
     name="test-0-fmk-nested-closing-elsewhere"
     run_nested "${name}" rc nested_closing_elsewhere nested_stand_in
@@ -3047,12 +3071,12 @@ leg_find_missing_loop() {
 # given. Fails unless it exits 0 with exactly one outcome line on standard
 # output, `DRIVER: FORCED <call> …` (DRIVER_LINE), and every agent-director
 # call in the shim's log during it has the driver as its parent (the run's
-# recorded PID; its command line bun's, or unknown for a call the driver left
-# in flight as it exited), CSCB's count rising by exactly those, none a
-# delete.
+# recorded PID, with bun's command line: the driver stops what it started
+# before it exits, so no call is left in flight), CSCB's count rising by
+# exactly those, none a delete.
 # Sets DRIVER_LINE and DRIVER_VERBS.
 run_driver() {
-    local step="$1" call="$2" out err rc=0 before cscb_before outcome=() lines=() line pid parent unknown=0
+    local step="$1" call="$2" out err rc=0 before cscb_before outcome=() lines=() line pid parent
     shift 2
     out="${SCENARIO_ROOT}/fmk-driver-${call}.out"
     err="${SCENARIO_ROOT}/fmk-driver-${call}.err"
@@ -3079,21 +3103,17 @@ run_driver() {
     DRIVER_VERBS=()
     for line in "${lines[@]}"; do
         read_call "${step}" "${line}"
-        # The parent's command line is bun's, or unknown (`?`) for a call
-        # the driver left in flight when it exited, before the shim read it;
-        # its PID is the driver's either way.
         parent="${CALL_PARENT[0]:-?}"
-        if [[ "${CALL_PPID}" != "${pid}" || ( "${parent}" != */bun && "${parent}" != bun && "${parent}" != '?' ) ]]; then
+        if [[ "${CALL_PPID}" != "${pid}" || ( "${parent}" != */bun && "${parent}" != bun ) ]]; then
             echo "  | ${line}" >&2
             fail "${step}: a call during the driver's run has parent ${CALL_PPID} '${CALL_PARENT[*]:-?}', not the driver ${pid} (bun)"
         fi
-        [[ "${parent}" != '?' ]] || unknown=$(( unknown + 1 ))
         _L_WORDS=("${CALL_WORDS[@]}")
         _scenario_ad_verb
         DRIVER_VERBS+=("${_L_VERB}")
         [[ "${_L_VERB}" != delete ]] || fail "${step}: the driver's run made a delete"
     done
-    echo "${TEST_NAME}: ${step}: agent-director calls: ${DRIVER_VERBS[*]} (${unknown} left in flight at the driver's exit)"
+    echo "${TEST_NAME}: ${step}: agent-director calls: ${DRIVER_VERBS[*]}"
     [[ "$(cscb_ad_count "")" == "$(( cscb_before + ${#lines[@]} ))" ]] \
         || fail "${step}: CSCB's call count went from ${cscb_before} to $(cscb_ad_count ""), not up by the driver's ${#lines[@]}"
     [[ "$(cscb_ad_count delete)" == 0 ]] || fail "${step}: a CSCB process made a delete"

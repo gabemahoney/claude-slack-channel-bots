@@ -79,7 +79,9 @@
 #                              agent-director processes
 #   no-agents-restarted        step 9: no other agent is started again
 #   container-list             step 10: the launch-start check reads the
-#                              container's `agent-director list`
+#                              container's `agent-director list --state
+#                              pending`, sampled from the start until each
+#                              persona row reads waiting
 #   expire-skipped             step 11: the daily `expire` schedule
 #
 # The steps (SRJ-1108):
@@ -129,9 +131,23 @@
 #       against the Slack stub, each persona's working directory in the
 #       stub's dev-channels mode; each persona's row reads waiting within B,
 #       CSCB's launch bound as the installed build computes it from the
-#       settings step 8 recorded; `agent-director list --state pending` shows
-#       a launch_started_at on every row; the post-install check line is
-#       written to the fixture record. Then leg A's checks.
+#       settings step 8 recorded. The launch-start check: `agent-director list
+#       --state pending`, through the harness call from a subshell of the
+#       scenario's shell, sampled back to back from before the start until
+#       every persona row has read waiting; every row a sample shows is
+#       pending with a launch_started_at. Each persona's row read pending
+#       from its launch until its SessionStart, from the scenario HOME's
+#       ~/.agent-director/ad-trail.jsonl (the records after its length noted
+#       before the start): the row's first `ad.spawn.state_transition` record
+#       has prior_state pending, new_state waiting and triggering_event_name
+#       SessionStart, and an `ad.send_keys.called` record has row_state
+#       pending (the trail records no launch start). Every sample taken
+#       wholly inside the stretch the row provably read pending (from the bot
+#       server's first read-pane of it after its spawn to the server's first
+#       send-keys of it, by their shim lines) shows the row; how many samples
+#       showed each row pending, and how many fell inside that stretch, are
+#       recorded. The post-install check line is written to the fixture
+#       record. Then leg A's checks.
 #   11  the expire and prompt-wording substitutions.
 #
 # Leg A's checks (SRJ-1402, AC 12), each its own `fail` naming the persona or
@@ -153,7 +169,11 @@
 #   - no persona reaches the restart cap: no restart-cap line in server.log
 #     and no cap notice in the Slack stub's record;
 #   - no post repeats: no two chat.postMessage requests in the stub's record
-#     with the same channel and text (the number of posts compared printed).
+#     with the same channel and text (the number of posts compared printed),
+#     and the record holds no post at all (nothing in the scenario posts);
+#     its lines from step 10's start on hold, for each persona's label, at
+#     least one apps.connections.open request and one ws-open, so the record
+#     is shown to capture the personas' Slack traffic.
 # Health ticks run (Q12): config.json sets health_check_interval, shorter than
 # leg A's wait, and session_restart_delay. Once each persona's session is
 # connected, the bot server reads each persona's row on at least HEALTH_TICKS
@@ -200,13 +220,14 @@
 #   - the row reads pending until its resumed worker reports in, from the
 #     scenario HOME's ~/.agent-director/ad-trail.jsonl (the records after its
 #     length noted before clean_restart; a record's `ts` is UTC in whole
-#     milliseconds, taken as rounded down; one row's records are ordered by
-#     their place in the trail). The records read: the row's first
-#     `ad.spawn.state_transition` record with triggering_event_name
-#     SessionStart and prior_state pending (the move out of pending), the
-#     last `ad.resume.moved_to_pending` record before it, and the first
-#     `ad.hook.fired` record with event_name SessionStart after it (the
-#     resumed launch's SessionStart, the hook that made the move). The
+#     milliseconds, taken as rounded down). The records read: the row's first
+#     `ad.spawn.state_transition` record in trail order with
+#     triggering_event_name SessionStart and prior_state pending (the move out
+#     of pending), the last `ad.resume.moved_to_pending` record before it in
+#     trail order, and, by `ts`, the row's `ad.hook.fired` record with
+#     event_name SessionStart nearest the move: the latest at or before it,
+#     else the first after it (the resumed launch's SessionStart, the hook
+#     that made the move, whatever the records' order in the trail). The
 #     moved-to-pending record and the SessionStart record each come after the
 #     bot server's last resume call (its shim line); the SessionStart record
 #     comes at or before the end of the first harness read of waiting that
@@ -221,12 +242,16 @@
 #   - with no refusal the start pass counts every persona resumed, none
 #     fresh-spawned and none not brought up (with one, none fresh-spawned);
 #   - no CSCB delete and no kill by the restarted server; every persona row
-#     and every pre-persona row is present.
+#     and every pre-persona row is present;
+#   - the stub's record lines from before clean_restart on hold no post, and,
+#     for each persona's label, at least one apps.connections.open request
+#     and one ws-open.
 #
 # Leg C (SRJ-1402, SRJ-203, SRJ-1013, AC 12, AC 20): this build refuses
 # agent-director 0.10.0. Leg B's server is stopped with its bots through the
-# new CLI (`stop_server --stop-bots`), every Slack socket the stub opened is
-# closed and no tmux session is left; then the lengths of the shim log, the
+# new CLI (`stop_server --stop-bots`), the stub's record holds at least one
+# ws-open and as many ws-close (every Slack socket the stub opened is closed)
+# and no tmux session is left; then the lengths of the shim log, the
 # stub's record, startup-errors.log and server.log are noted. `swap_ad_binary
 # 0.10.0` puts 0.10.0 behind the shim (the binary is compared with the image's,
 # never run: the harness makes no 0.10.0 call against the migrated store), and
@@ -756,6 +781,158 @@ trail_us() {
     us="$(date -u -d "$1" +%s%3N)" || fail "the trail time '$1' does not read as a time"
     [[ "${us}" =~ ^[0-9]+$ ]] || fail "the trail time '$1' does not read as a time"
     printf '%s000\n' "${us}"
+}
+
+# The launch-start check's samples (step 10): `agent-director list --state
+# pending` through the harness call, from a subshell of the scenario's shell,
+# one after another from before the start until the stop file exists. Sample
+# <n> leaves <n>.out, <n>.err and <n>.at (its start and end in epoch
+# microseconds, and its exit status); a list in flight when the stop file
+# appears finishes first.
+PENDING_SAMPLES="${SCENARIO_ROOT}/pending-samples"
+# Bound on the sampler ending once the stop file exists, in seconds.
+SAMPLER_STOP_S=30
+pending_sampler() {
+    local n=0 from rc
+    while [[ ! -e "${PENDING_SAMPLES}/stop" ]]; do
+        n=$(( n + 1 ))
+        from="$(now_us)"
+        rc=0
+        ad list --state pending > "${PENDING_SAMPLES}/${n}.out" 2> "${PENDING_SAMPLES}/${n}.err" || rc=$?
+        printf '%s %s %s\n' "${from}" "$(now_us)" "${rc}" > "${PENDING_SAMPLES}/${n}.at"
+    done
+}
+sampler_gone() {
+    ! pid_alive "${pending_sampler_pid}"
+}
+
+# persona_slack_traffic <where> <record-file>: fail unless <record-file> (lines
+# of the Slack stub's record) holds, for each persona's label, at least one
+# apps.connections.open request and one ws-open, so the record is shown to
+# capture its Slack traffic. Sets TRAFFIC to what it counted.
+persona_slack_traffic() {
+    local where="$1" file="$2" cid name opens sockets
+    TRAFFIC=""
+    for cid in "${CHANNELS[@]}"; do
+        name="${PERSONA_OF[${cid}]}"
+        opens="$(jq -s --arg l "${name}" '[.[] | select(.event == "api" and .method == "apps.connections.open" and .label == $l)] | length' "${file}")" \
+            || fail "${where}: could not read the Slack stub's record ${SLACK_RECORD}"
+        sockets="$(jq -s --arg l "${name}" '[.[] | select(.event == "ws-open" and .label == $l)] | length' "${file}")" \
+            || fail "${where}: could not read the Slack stub's record ${SLACK_RECORD}"
+        (( opens >= 1 && sockets >= 1 )) \
+            || fail "${where}: the Slack stub's record holds ${opens} apps.connections.open and ${sockets} ws-open record(s) labelled ${name}: it shows no Slack connection of persona ${name}"
+        TRAFFIC+="${TRAFFIC:+, }${name}: ${opens} apps.connections.open, ${sockets} ws-open"
+    done
+}
+
+# check_pending_samples: over the sampler's samples, fail unless each exited
+# 0 with a spawns array, and every row a sample shows has state pending and a
+# launch_started_at. Sets SAMPLES (how many) and SEEN_PENDING (instance id to
+# how many samples showed it).
+declare -A SEEN_PENDING=()
+SAMPLES=0
+check_pending_samples() {
+    local at from to rc n out bad id
+    SAMPLES=0
+    SEEN_PENDING=()
+    for at in "${PENDING_SAMPLES}"/*.at; do
+        [[ -f "${at}" ]] || continue
+        n="${at##*/}"
+        n="${n%.at}"
+        out="${PENDING_SAMPLES}/${n}.out"
+        read -r from to rc < "${at}" || fail "step 10: the pending sample ${n} has no times"
+        (( rc == 0 )) || fail "step 10: the pending sample ${n} (agent-director list --state pending) exited ${rc}: $(head -c 300 "${PENDING_SAMPLES}/${n}.err")"
+        jq -e '.spawns | type == "array"' "${out}" > /dev/null 2>&1 \
+            || fail "step 10: the pending sample ${n} printed no spawns array: $(head -c 300 "${out}")"
+        bad="$(jq -r '[.spawns[] | select(.state != "pending" or (.launch_started_at // null) == null)
+            | "\(.claude_instance_id) (\(.state), launch_started_at \(.launch_started_at // "none"))"] | join(", ")' "${out}")" \
+            || fail "step 10: could not read the pending sample ${n}"
+        [[ -z "${bad}" ]] || fail "step 10: the pending sample ${n} (${from} to ${to}) shows row(s) not pending with a launch_started_at: ${bad}"
+        while IFS= read -r id; do
+            [[ -n "${id}" ]] || continue
+            SEEN_PENDING["${id}"]=$(( ${SEEN_PENDING[${id}]:-0} + 1 ))
+        done < <(jq -r '.spawns[].claude_instance_id' "${out}")
+        SAMPLES=$(( SAMPLES + 1 ))
+    done
+    (( SAMPLES > 0 )) || fail "step 10: the pending sampler took no sample"
+}
+
+# trail_fresh_pending <instance-id>: from step 10's trail lines (the scenario
+# HOME's ad-trail.jsonl after its length noted before the start), fail unless
+# the row's first `ad.spawn.state_transition` record moves it from pending to
+# waiting by SessionStart (a fresh spawn's insert writes no transition, so the
+# row read pending from its launch until its SessionStart), and an
+# `ad.send_keys.called` record shows it read pending (`row_state`) when the
+# bot server's dialog approver sent it keys. The trail records no launch
+# start; the samples show it. Sets TRAIL_NOTE.
+trail_fresh_pending() {
+    local id="$1" file="${SCENARIO_ROOT}/step10-trail" kind ts a b c moved="" keys=0 keys_ts=""
+    jq -r --arg id "${id}" 'select(.claude_instance_id == $id)
+        | if .event == "ad.spawn.state_transition" then "moved \(.ts) \(.prior_state // "-") \(.new_state // "-") \(.triggering_event_name // "-")"
+          elif .event == "ad.send_keys.called" then "keys \(.ts) \(.row_state // "-") - -"
+          else empty end' "${file}" > "${file}-${id}" \
+        || fail "step 10: could not read the trail ${AD_TRAIL}"
+    while read -r kind ts a b c; do
+        case "${kind}" in
+            moved)
+                [[ -n "${moved}" ]] || moved="${ts} ${a} ${b} ${c}"
+                ;;
+            keys)
+                if [[ "${a}" == pending ]]; then
+                    keys=$(( keys + 1 ))
+                    keys_ts="${keys_ts:-${ts}}"
+                fi
+                ;;
+        esac
+    done < "${file}-${id}"
+    [[ -n "${moved}" ]] || fail "step 10: the trail holds no ad.spawn.state_transition record for row ${id} after the start"
+    read -r ts a b c <<< "${moved}"
+    [[ "${a}" == pending && "${b}" == waiting && "${c}" == SessionStart ]] \
+        || fail "step 10: row ${id}'s first state transition in the trail after the start (${ts}) is ${a} to ${b} by ${c}, not pending to waiting by SessionStart"
+    (( keys > 0 )) || fail "step 10: the trail holds no ad.send_keys.called record for row ${id} with row_state pending"
+    TRAIL_NOTE="${keys} ad.send_keys.called record(s) with row_state pending (the first at ${keys_ts}); its first ad.spawn.state_transition moves it from pending to waiting by SessionStart at ${ts}"
+}
+
+# samples_inside_pending <instance-id>: the stretch over which the row
+# provably read pending, from step 10's shim lines, and the samples taken
+# wholly inside it. It starts at the bot server's first read-pane of the row
+# after its spawn of the row (the dialog approver, which starts once the
+# spawn returned, so the row exists, pending) and ends at the server's first
+# send-keys of the row (a send-keys read the row pending, by the trail, and
+# none read it before that call started; in leg A the row leaves pending only
+# once). Fails unless every sample that started and ended inside it shows the
+# row. Sets PENDING_FROM_US, PENDING_TO_US and INSIDE.
+samples_inside_pending() {
+    local id="$1" shim="${SCENARIO_ROOT}/step10-shim.log" times=() t at n from to rc
+    server_calls_naming "${shim}" spawn "${id}" "${SERVER_PID}" "${SCENARIO_ROOT}/step10-spawn"
+    mapfile -t times < <(line_times "${SCENARIO_ROOT}/step10-spawn")
+    (( ${#times[@]} >= 1 )) || fail "step 10: the bot server made no spawn of row ${id}"
+    from="${times[0]}"
+    server_calls_naming "${shim}" read-pane "${id}" "${SERVER_PID}" "${SCENARIO_ROOT}/step10-read-pane"
+    mapfile -t times < <(line_times "${SCENARIO_ROOT}/step10-read-pane")
+    PENDING_FROM_US=""
+    for t in ${times[@]+"${times[@]}"}; do
+        if (( t > from )); then
+            PENDING_FROM_US="${t}"
+            break
+        fi
+    done
+    [[ -n "${PENDING_FROM_US}" ]] || fail "step 10: the bot server made no read-pane of row ${id} after its spawn of it"
+    server_calls_naming "${shim}" send-keys "${id}" "${SERVER_PID}" "${SCENARIO_ROOT}/step10-send-keys"
+    mapfile -t times < <(line_times "${SCENARIO_ROOT}/step10-send-keys")
+    (( ${#times[@]} >= 1 )) || fail "step 10: the bot server made no send-keys of row ${id}"
+    PENDING_TO_US="${times[0]}"
+    INSIDE=0
+    for at in "${PENDING_SAMPLES}"/*.at; do
+        [[ -f "${at}" ]] || continue
+        n="${at##*/}"
+        n="${n%.at}"
+        read -r from to rc < "${at}" || fail "step 10: the pending sample ${n} has no times"
+        (( from >= PENDING_FROM_US && to <= PENDING_TO_US )) || continue
+        jq -e --arg id "${id}" 'any(.spawns[]; .claude_instance_id == $id)' "${PENDING_SAMPLES}/${n}.out" > /dev/null \
+            || fail "step 10: the pending sample ${n} (${from} to ${to}), taken while row ${id} provably read pending, does not show it"
+        INSIDE=$(( INSIDE + 1 ))
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -1306,6 +1483,12 @@ for cid in "${CHANNELS[@]}"; do
     PERSONA_IDS+=("cscb_$(persona_key "${name}")")
 done
 LEG_A_AD_FROM="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
+LEG_A_TRAIL_FROM="$(line_count "${AD_TRAIL}")"
+LEG_A_RECORD_FROM="$(line_count "${SLACK_RECORD}")"
+mkdir "${PENDING_SAMPLES}" || fail "step 10: could not create ${PENDING_SAMPLES}"
+pending_sampler &
+pending_sampler_pid=$!
+track_pid "${pending_sampler_pid}"
 leg_a_start_us="$(now_us)"
 start_server --live
 record "the new CSCB started (bot server PID ${SERVER_PID})"
@@ -1320,17 +1503,36 @@ for i in "${!PERSONA_IDS[@]}"; do
     WAITING_US["${id}"]="$(now_us)"
     record "row ${id} reads waiting"
 done
+# Every persona row has read waiting: the sampler stops.
+: > "${PENDING_SAMPLES}/stop" || fail "step 10: could not write ${PENDING_SAMPLES}/stop"
+wait_until "${SAMPLER_STOP_S}" "step 10: the pending sampler did not stop" sampler_gone
+sampler_rc=0
+wait "${pending_sampler_pid}" || sampler_rc=$?
+(( sampler_rc == 0 )) || fail "step 10: the pending sampler exited ${sampler_rc}"
+stop_tracked_pid "${pending_sampler_pid}" 5 "step 10: the pending sampler did not end"
 left_s=$(( (leg_a_deadline_us - $(now_us)) / 1000000 ))
 (( left_s > 0 )) || left_s=0
 wait_for_log "$(completion_match "${#PERSONA_IDS[@]}")" "${left_s}" "step 10: the start pass never completed"
 expect_completion "${#PERSONA_IDS[@]}" "step 10: every persona starts fresh once" \
     "0 resumed" "${#PERSONA_IDS[@]} fresh-spawned" "0 not brought up"
 
-list_rows "step 10" "${SCENARIO_ROOT}/rows-pending.json" --state pending
-missing_ls="$(jq -r '[.[] | select((.launch_started_at // null) == null) | .claude_instance_id] | join(" ")' "${SCENARIO_ROOT}/rows-pending.json")"
-[[ -z "${missing_ls}" ]] || fail "step 10: pending row(s) with no launch_started_at: ${missing_ls}"
-result="every pending row ($(jq 'length' "${SCENARIO_ROOT}/rows-pending.json")) has a launch_started_at"
+# The launch-start check: every row a sample showed pending has a launch
+# start, and each persona's row was pending from its launch until its
+# SessionStart (the trail); every sample taken wholly inside the stretch the
+# row provably read pending shows it.
+check_pending_samples
+lines_after "${SCENARIO_AD_SHIM_LOG}" "${LEG_A_AD_FROM}" "${SCENARIO_ROOT}/step10-shim.log"
+lines_after "${AD_TRAIL}" "${LEG_A_TRAIL_FROM}" "${SCENARIO_ROOT}/step10-trail"
+seen=""
+for id in "${PERSONA_IDS[@]}"; do
+    trail_fresh_pending "${id}"
+    samples_inside_pending "${id}"
+    seen+="${seen:+; }${id}: seen pending in ${SEEN_PENDING[${id}]:-0}, ${INSIDE} of them taken wholly inside its provable pending stretch (${PENDING_FROM_US} to ${PENDING_TO_US} epoch microseconds)"
+    record "the trail for row ${id}: ${TRAIL_NOTE}"
+done
+result="every pending row in ${SAMPLES} sample(s) of agent-director list --state pending has a launch_started_at; ${seen}"
 record "post-install check: ${result}"
+echo "${TEST_NAME}: step 10: ${result}"
 printf '%s %s post-install check: %s\n' "$(date -u +%F)" "${HOST_NAME}" "${result}" >> "${INSTALL_GATE_RECORD}" \
     || fail "step 10: could not write the post-install check line"
 runbook_substitute 10 container-list "the launch-start check reads the container's agent-director list"
@@ -1453,9 +1655,14 @@ done
 cap_posts="$(jq -r 'select(.event == "api" and (.text // "" | contains("consecutive session-launch failures — automatic restarts suspended"))) | .channel // "-"' \
     "${SLACK_RECORD}")" || fail "leg A: could not read the Slack stub's record ${SLACK_RECORD}"
 [[ -z "${cap_posts}" ]] || fail "leg A: the Slack stub's record holds a restart-cap notice (channel ${cap_posts//$'\n'/, })"
-# No post repeats.
+# No post repeats; nothing in the scenario posts, so the record holds none,
+# and it holds each persona's Slack traffic.
 no_repeated_posts "leg A"
-record "leg A: every persona started fresh once; pre-persona rows kept and never named; dialogs cleared through agent-director; no kill, delete or second launch; no restart cap; ${POSTS_COMPARED} post(s) compared, none repeated"
+(( POSTS_COMPARED == 0 )) \
+    || fail "leg A: the Slack stub's record holds ${POSTS_COMPARED} post(s), not 0: nothing in the scenario posts"
+lines_after "${SLACK_RECORD}" "${LEG_A_RECORD_FROM}" "${SCENARIO_ROOT}/leg-a-record"
+persona_slack_traffic "leg A" "${SCENARIO_ROOT}/leg-a-record"
+record "leg A: every persona started fresh once; pre-persona rows kept and never named; dialogs cleared through agent-director; no kill, delete or second launch; no restart cap; ${POSTS_COMPARED} post(s), none repeated; the Slack stub's record holds each persona's connection (${TRAFFIC})"
 
 # ---------------------------------------------------------------------------
 # Step 11
@@ -1718,10 +1925,11 @@ for i in "${!PERSONA_IDS[@]}"; do
         || fail "leg B: row ${id} read waiting more than ${LEG_B_WAIT_S}s after clean_restart's end"
 
     # It read pending until its resumed worker reported in, from the trail's
-    # records after leg B's start, in trail order: the first move out of
-    # pending by SessionStart, the last resume's move to pending before it,
-    # and the first SessionStart hook.fired record after it (the resumed
-    # launch's SessionStart).
+    # records after leg B's start: in trail order, the first move out of
+    # pending by SessionStart and the last resume's move to pending before
+    # it; and by time, the SessionStart hook.fired record nearest that move
+    # (the latest at or before it, else the first after it: the resumed
+    # launch's SessionStart, whatever the records' order in the trail).
     lines_after "${AD_TRAIL}" "${LEG_B_TRAIL_FROM}" "${SCENARIO_ROOT}/leg-b-trail"
     jq -r --arg id "${id}" 'select(.claude_instance_id == $id)
         | (if .event == "ad.resume.moved_to_pending" then "pending"
@@ -1734,6 +1942,7 @@ for i in "${!PERSONA_IDS[@]}"; do
     moved_ts=""
     moved_to=""
     fired_ts=""
+    fired_all=()
     candidate_pending=""
     while read -r kind ts new_state; do
         case "${kind}" in
@@ -1748,10 +1957,7 @@ for i in "${!PERSONA_IDS[@]}"; do
                 fi
                 ;;
             fired)
-                if [[ -n "${moved_ts}" ]]; then
-                    fired_ts="${ts}"
-                    break
-                fi
+                fired_all+=("${ts}")
                 ;;
         esac
     done < "${SCENARIO_ROOT}/leg-b-trail-${id}"
@@ -1759,11 +1965,33 @@ for i in "${!PERSONA_IDS[@]}"; do
         || fail "leg B: the trail holds no SessionStart ad.spawn.state_transition out of pending for row ${id} after the restart"
     [[ -n "${pending_ts}" ]] \
         || fail "leg B: the trail holds no ad.resume.moved_to_pending record for row ${id} before its move out of pending"
-    [[ -n "${fired_ts}" ]] \
-        || fail "leg B: the trail holds no SessionStart ad.hook.fired record for row ${id} after its move out of pending"
+    (( ${#fired_all[@]} > 0 )) \
+        || fail "leg B: the trail holds no SessionStart ad.hook.fired record for row ${id} after the restart"
     pending_us="$(trail_us "${pending_ts}")"
     moved_us="$(trail_us "${moved_ts}")"
-    fired_us="$(trail_us "${fired_ts}")"
+    before_ts=""
+    before_us=""
+    after_ts=""
+    after_us=""
+    for ts in "${fired_all[@]}"; do
+        us="$(trail_us "${ts}")"
+        if (( us <= moved_us )); then
+            if [[ -z "${before_us}" ]] || (( us >= before_us )); then
+                before_ts="${ts}"
+                before_us="${us}"
+            fi
+        elif [[ -z "${after_us}" ]] || (( us < after_us )); then
+            after_ts="${ts}"
+            after_us="${us}"
+        fi
+    done
+    if [[ -n "${before_ts}" ]]; then
+        fired_ts="${before_ts}"
+        fired_us="${before_us}"
+    else
+        fired_ts="${after_ts}"
+        fired_us="${after_us}"
+    fi
     (( pending_us > last_resume_us )) \
         || fail "leg B: row ${id}'s ad.resume.moved_to_pending record (${pending_ts}) does not come after the restarted server's last resume call"
     (( fired_us > last_resume_us )) \
@@ -1865,7 +2093,9 @@ done
 lines_after "${SLACK_RECORD}" "${LEG_B_RECORD_FROM}" "${SCENARIO_ROOT}/leg-b-record"
 posts="$(jq -s '[.[] | select(.event == "api" and .method == "chat.postMessage")] | length' "${SCENARIO_ROOT}/leg-b-record")" \
     || fail "leg B: could not read the Slack stub's record ${SLACK_RECORD}"
-record "leg B: no CSCB delete, no kill by the restarted server, every row present; ${posts} post(s) in leg B"
+(( posts == 0 )) || fail "leg B: the Slack stub's record holds ${posts} post(s) in leg B, not 0: nothing in the scenario posts"
+persona_slack_traffic "leg B" "${SCENARIO_ROOT}/leg-b-record"
+record "leg B: no CSCB delete, no kill by the restarted server, every row present; ${posts} post(s) in leg B; the Slack stub's record holds each persona's connection (${TRAFFIC})"
 
 # ---------------------------------------------------------------------------
 # Leg C: this build refuses agent-director 0.10.0
@@ -1880,14 +2110,20 @@ REQUIRED_AD_VERSION="$(cd / && GATE_MODULE="${CSCB_PKG_DIR}/src/ad-version-gate.
 # Leg B's server stopped with its bots through the new CLI; every Slack
 # socket closed and no worker left to run a hook against 0.10.0.
 stop_server --stop-bots
+# True when the stub's record holds at least one socket open and as many
+# closes as opens.
 slack_sockets_closed() {
-    jq -se '([.[] | select(.event == "ws-open")] | length) == ([.[] | select(.event == "ws-close")] | length)' \
+    jq -se '([.[] | select(.event == "ws-open")] | length) as $opens
+        | $opens > 0 and $opens == ([.[] | select(.event == "ws-close")] | length)' \
         "${SLACK_RECORD}" > /dev/null
 }
+ws_opens="$(jq -s '[.[] | select(.event == "ws-open")] | length' "${SLACK_RECORD}")" \
+    || fail "leg C: could not read the Slack stub's record ${SLACK_RECORD}"
+(( ws_opens > 0 )) || fail "leg C: the Slack stub's record holds no ws-open, so no socket is seen to close"
 wait_until "${SLACK_STUB_WAIT_S}" "leg C: a Slack socket stayed open after leg B's server stopped" slack_sockets_closed
 tmux_sessions sessions
 (( ${#sessions[@]} == 0 )) || fail "leg C: tmux session(s) left after stop --stop-bots: ${sessions[*]}"
-record "leg C: leg B's server and its bots stopped through the new CLI; every Slack socket closed; no tmux session"
+record "leg C: leg B's server and its bots stopped through the new CLI; every Slack socket closed (${ws_opens} opened); no tmux session"
 
 STARTUP_ERRORS="${SLACK_STATE_DIR}/startup-errors.log"
 LEG_C_AD_FROM="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
@@ -2002,8 +2238,8 @@ record "leg C: the release candidate ${RC_VERSION} back behind the shim"
 entered="$(grep -c '\] entered: ' "${SWITCH_LOG}")"
 [[ "${entered}" == "${RUNBOOK_COUNT}" ]] || fail "runbook: ${entered} step entries in the switch-over log, not ${RUNBOOK_COUNT}"
 
-# No post repeats over the Slack stub's whole record (legs A and B; leg C
-# added no line).
+# No post repeats over the Slack stub's whole record (legs A and B, each
+# shown to hold its personas' connections; leg C added no line).
 no_repeated_posts "end of run"
 record "end of run: ${POSTS_COMPARED} post(s) in the Slack stub's whole record compared, none repeated"
 
