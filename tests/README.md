@@ -176,7 +176,10 @@ The same helpers then call `require_scenario_home`, which refuses unless
 `SCENARIO_ROOT` is a directory and HOME is under it, both as written and by
 real path (a HOME that is a symlink out of `SCENARIO_ROOT` is refused). The
 copy-and-rename every install and swap goes through also refuses a
-destination outside `SCENARIO_ROOT`. No harness step touches the invoking
+destination outside `SCENARIO_ROOT`, and the settings writers
+(`write_ad_settings` and the stand-in installs' settings write) resolve
+their directory with `realpath -e` and refuse one outside `SCENARIO_ROOT`
+before they remove, create or write anything there. No harness step touches the invoking
 user's own `~/.agent-director`.
 
 `tests/host-safety.test.ts` reads these files, and never runs them, to check
@@ -400,6 +403,9 @@ script's name:
 
 Sourcing it, in both modes:
 
+- exports `CSCB_PKG_DIR`, the installed package under test
+  (`$SCENARIO_REPO/node_modules/claude-slack-channel-bots`), which the value
+  printer and the drivers read;
 - makes a scratch root (`SCENARIO_ROOT`, `mktemp -d` under `/tmp`) and a
   first state dir under it, exported as `SLACK_STATE_DIR`, so a scenario never
   touches `~/.claude/channels/slack/` or another script's state, and its first
@@ -526,7 +532,9 @@ Each change to the install goes through one helper:
   or for `unparseable` a line no client parses), whether `--reuse-finished`
   is turned into a flag the release does not define (`reject`) or passed on
   (`pass`), and the image's release binary (`SCENARIO_RELEASE_BIN`, never
-  found through PATH) that every other call is handed to.
+  found through PATH) that every other call is handed to. The settings
+  write refuses a bin directory that is not under `SCENARIO_ROOT` or
+  resolves (by `realpath -e`) outside it.
   `install_ad_stand_in` places the stand-in through `swap_ad_binary`.
   `restore_ad_install_with_stand_in`, after `hide_ad_install`, puts the
   stand-in at `agent-director.real`, then moves the hidden shim back and
@@ -566,7 +574,9 @@ Harness agent-director calls and store helpers:
   back on its defaults. It fails on a key that is not a lowercase TOML bare
   key, a key given twice, or a value that is empty or holds a control
   character, and refuses a settings directory
-  that resolves outside `SCENARIO_ROOT` or a path that is not a regular
+  that resolves outside `SCENARIO_ROOT` (by `realpath -e`: checked, when the
+  directory exists, before the file is removed or the directory created,
+  and again once it is created) or a path that is not a regular
   file. It then reads the file back, fails unless it holds exactly what was
   written, and sets `AD_SETTINGS_FILE` to its path.
   `_scenario_ad_tmux_setting`, the stub's re-fire and
@@ -848,8 +858,16 @@ relaunches P), `resume_enabled` false (P's finished row comes back only by a
 reuse spawn), `exit_timeout` 5 and `agent_director_poll_interval_ms` 3600000
 (the permission poller's `list` calls stay out of the shim's log). These are
 the only delays set, all CSCB's own, through its config. agent-director runs
-at its default settings: the scenario HOME's agent-director `config.toml`
-carries no `[tmux]` table, and set-up fails if it does.
+at its default settings: the scenario HOME's agent-director settings file
+(the package's `AD_SETTINGS_RELATIVE_PATH` under HOME) carries no table named
+as the package's `AD_TMUX_TABLE`, and set-up fails if it does.
+
+The daemon is not the script's child, so its exit status is read from the
+CLI's start report (8a) or, for a re-check stop (8c, 8e), from its shutdown
+line naming the re-check, the one path that exits with
+`AD_VERSION_RECHECK_STOP_EXIT_CODE`. Set-up checks that the printer's
+`AD_VERSION_RECHECK_STOP_EXIT_CODE` is non-zero, so that line stands for a
+non-zero exit.
 
 The harness finishes P's row (`ad_store_mark_finished <P> ended`, then
 `ad_kill_include_finished`, in 8d and 8e) only once tmux reports P's session
@@ -889,11 +907,12 @@ The legs run in order, each on the state the one before left:
   install hidden (`ErrSystemInstallNotFound`), one could-not-run line
   appears within the re-check interval plus 10 s, and no probe runs while it
   is hidden. With the shim back and the unparseable stand-in behind it
-  (`ErrSystemInstallUnreachable`), and then with the release back, each next
+  (`ErrSystemInstallUnreachable`; a harness `version` call through it exits
+  0 and reads no `.version`), and then with the release back, each next
   bot-server probe leaves that one line the only one and the server running.
 - 8c, a swap stops the server. Within the re-check interval plus 10 s of the
   swap to 0.10.0 (`health_check_interval` 0), the server exits with its
-  re-check shutdown line and exactly one new entry, equal to the runtime form
+  re-check shutdown line (a non-zero exit) and exactly one new entry, equal to the runtime form
   of the floor message (it carries the runtime re-check phrase and points to
   the debug skill), with its one server-log line. No CSCB kill,
   `kill-finished`, pause, delete, spawn or resume follows the swap. With the
@@ -914,7 +933,9 @@ The legs run in order, each on the state the one before left:
   launch and no second post. Putting the release back is the version change:
   at the next timed re-check exactly one reuse spawn for P succeeds and P
   reads `waiting`, still with one alert and no delete. While the hold lasts,
-  CSCB makes no plain spawn, resume, delete or kill for P and P has no tmux
+  strictly after the rejected reuse spawn (its shim line's time) and before
+  the timed re-check that read the new version, CSCB makes no kill,
+  `kill-finished`, pause, delete, spawn or resume call, and P has no tmux
   session.
 - 8e, the stop through the triggered re-check. With the server stopped, P's
   row finished again the same way and the tmux shim in `fail-create`, the
@@ -923,7 +944,8 @@ The legs run in order, each on the state the one before left:
   goes behind the shim. P's next attempt is a reuse spawn made before the
   first timed re-check (the script fails saying so when it is not); its
   `ErrInvalidFlags` is directly followed by a bot-server probe, and the server
-  exits with exactly one more entry, the runtime form for 0.10.0's version,
+  exits with its re-check shutdown line (a non-zero exit) and exactly one
+  more entry, the runtime form for 0.10.0's version,
   all less than the re-check interval after the gate. No CSCB kill,
   `kill-finished`, delete or pause follows, and P's row stays finished.
 
@@ -963,7 +985,9 @@ package (see The value printer):
 | The floor message, startup and runtime forms | `buildBelowPhase1FloorMessage <version> <path> <startup\|runtime>` | `src/ad-version-gate.ts` |
 | The runtime re-check phrase | `RUNTIME_RECHECK_PHRASE` | `src/ad-version-gate.ts` |
 | The re-check interval | `AD_VERSION_RECHECK_INTERVAL_MS` | `src/ad-version-gate.ts` |
+| The re-check stop's exit status (checked non-zero) | `AD_VERSION_RECHECK_STOP_EXIT_CODE` | `src/ad-version-gate.ts` |
 | The could-not-run line's prefix | `AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX` | `src/ad-version-gate.ts` |
+| The settings file and its `[tmux]` table (the no-table check) | `AD_SETTINGS_RELATIVE_PATH` (under HOME), `AD_TMUX_TABLE` | `src/ad-settings.ts` |
 | The Cannot launch alert's body | `INVALID_FLAGS_HOLD_ALERT_TEXT` | `src/invalid-flags-hold.ts` |
 | The alert as posted for P | `formatPersonaNotice <P> INVALID_FLAGS_HOLD_ALERT_TEXT` | `src/persona-notifier.ts` |
 | CSCB's class for `ErrInvalidFlags` | `classifyAdError ErrInvalidFlags` | `src/ad-error-class.ts` |
@@ -1133,11 +1157,18 @@ The legs run in order, each on the state the one before left:
   After `stub_release`, a later `resume` brings S up (`waiting`). There is
   no post to S's channel, every refusal line says no spawn-failure notice,
   and there is no `spawn-failed` entry, no latch and no counted launch
-  failure.
-- held. P, launched by this server process: its `launch_started_at` is
-  read. P's `read-pane` calls in (G/2, G) from the launch start are more
-  than a 5 s pace allows, and those in (G + 5 s, G + 65 s) are at most that
-  (`floor(d / 5) + 1` reads in a window of d seconds). There is no CSCB
+  failure. S comes back by `resume`: CSCB makes no reuse spawn of S in the
+  leg, and each CSCB spawn of S in it (the collision ladder's plain spawn)
+  has its `ErrInstanceIdCollision` line for S (it met S's row and launched
+  nothing).
+- held. P, launched by this server process: its `launch_started_at` (L) is
+  read. No slower approver read comes before G: P's `read-pane` calls in
+  (L + 5 s, L + G) are at least two, every gap between consecutive ones is
+  below the mean of the two paces (3 s), and the last lies within the slow
+  pace (5 s) of L + G. Those in (L + G + 5 s, L + G + 65 s) are at most what
+  a 5 s pace allows (`floor(d / 5) + 1` reads in a window of d seconds). The
+  calls are timed by their shim lines' own time field, so a gap is measured
+  whole, never rounded to the script's polling. There is no CSCB
   `find-missing` before the launch start plus G, and no post to P's channel
   or CSCB kill of P before the relaunching post. Exactly one relaunching
   post, compared whole: its stub record time is no earlier than B and less
@@ -1152,7 +1183,9 @@ The legs run in order, each on the state the one before left:
   persona's working directory, and makes its one `find-missing` run at
   once. Its lines are printed, not asserted, since SRJ-1426's G rule is the
   live-row sequence's. The start pass then starts Q's live-row sequence
-  (the script fails, saying so, when it does not). Its kill of Q comes
+  (the script fails, saying so, when it does not), its start line
+  matching the printer's for Q entered at step 1
+  (`LIVE_ROW_SEQUENCE_ENTRY_KILL`) and ending in a launch. Its kill of Q comes
   before its step-2 wait; the wait's armed line equals the printer's for L
   and G; its first `find-missing` run comes no earlier than L + G, with no
   CSCB `find-missing` between the sequence's start and it; and the wait's
@@ -1190,11 +1223,17 @@ The legs run in order, each on the state the one before left:
   T1's plain spawn, made by this server process, ends in `ErrCallTimeout`:
   its refusal line comes at least 30 s (less a 0.5 s allowance for the
   shim's line) and less than 40 s after the call's line in the shim's log.
-  The first CSCB `get` of T1 after the spawn follows, and exactly one get
-  line names the `ErrCallTimeout` form and reads this launch's `pending`
-  row; a CSCB `send-keys` (the approver's Enter) follows it and T1 reads
-  `waiting`. The harness reads T1's row about once a second from the spawn
-  until T1 is up and its retry timer has stopped. Every later CSCB launch
+  The first CSCB `get` of T1 after the spawn follows, and exactly one
+  `server.log` line equals the printer's `launchUnavailableGetLine` for it:
+  the plain spawn's `ErrCallTimeout` form, reading this launch's `pending`
+  row with the launch start the harness last read before the get, the
+  outcome `LAUNCH_UNAVAILABLE_OUTCOME_APPROVER` (the approver started). A
+  CSCB `send-keys` (the approver's Enter) follows it and T1 reads
+  `waiting`. The harness reads T1's row (its state and launch start) about
+  once a second from the spawn until T1 is up and its retry timer has
+  stopped: its full-mode retry finds nothing left to recover, and the
+  printer's `unavailableRetryStoppedLine` for T1 (`full none`,
+  `UNAVAILABLE_RETRY_STOP_RECOVERED`) is matched whole. Every later CSCB launch
   call of T1 (`spawn` or `resume`) must follow a harness reading of `ended`
   or `missing` (the latest before the call) and a CSCB `get` or `status` of
   the row since the call before it; with none such, the spawn is T1's only
@@ -1205,10 +1244,13 @@ The legs run in order, each on the state the one before left:
   printer gives none for 61000). T2's plain spawn, the same launch as T1's
   under the higher setting, ends in `ErrTmuxUnresponsive` carrying
   `LAUNCH_TIMEOUT_PHRASE`, its refusal line at least 40 s and less than
-  61 s after the call. Exactly one get line names the `ErrTmuxUnresponsive`
-  form and reads this launch's `pending` row; the approver brings T2 up
-  (`waiting`). No `server.log` line for T2 names `ErrCallTimeout`, no get
-  line names that form for T2, and no warning follows. The tmux shim is set
+  61 s after the call. Exactly one `server.log` line equals the printer's
+  `launchUnavailableGetLine` for the `get` that follows: the
+  `ErrTmuxUnresponsive` form, reading this launch's `pending` row with the
+  launch start a harness `get` read while the held create kept it pending,
+  the outcome `LAUNCH_UNAVAILABLE_OUTCOME_APPROVER`. The approver brings T2
+  up (`waiting`). No `server.log` line for T2 names `ErrCallTimeout`, and no
+  warning follows. The tmux shim is set
   back to `log`.
 
 The two refused-value legs hold the suite's only deliberately refused
@@ -1235,13 +1277,18 @@ function, `refused_values_check`, checks both legs:
   retries do not retry the launch.
 - `version` does not clear. The bot-server probe inside the refusal (its
   `version` call is answered) is followed by no all-clear and no clear line.
+  The version probes inside the refusal ran: the count of could-not-run
+  lines (`AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX`) is unchanged across
+  the refusal.
 - After the fix. The persona reads `waiting`, and its channel gets exactly one all-clear
   post, the printer's text, made after the fix, with one clear line. The
   first bot-server probe after the fix logs no values line (the values are
   unchanged) and no refused-read line.
 
 Each refused-value leg waits for the added persona's retry timer to stop
-(its pending-only retry reads the row live) before it ends, so no persona
+(its pending-only retry reads the row `waiting`: the printer's
+`unavailableRetryStoppedLine` for that persona, `pending-only waiting`,
+`UNAVAILABLE_RETRY_STOP_ROW_LIVE`, matched whole) before it ends, so no persona
 up at the next leg has a timer: a pending-only retry landing inside the
 next leg's refusal would start a new episode.
 
@@ -1284,11 +1331,14 @@ package:
 | G, B and the alert threshold | `adGraceMs`, `adLaunchBoundMs`, `adAlertThresholdMs` | `src/ad-settings.ts` |
 | B in whole minutes | `wholeMinutes <B>` | `src/ad-settings.ts` |
 | The re-check interval | `AD_VERSION_RECHECK_INTERVAL_MS` | `src/ad-version-gate.ts` |
-| The approver's paces before and from G | `DIALOG_POLL_INTERVAL_MS`, `DIALOG_SLOW_POLL_INTERVAL_MS` | `src/session-manager.ts` |
+| The approver's paces before and from G, and the held leg's gap limit (their mean) | `DIALOG_POLL_INTERVAL_MS`, `DIALOG_SLOW_POLL_INTERVAL_MS` | `src/session-manager.ts` |
 | The "still stopping" and "still starting" phrases | `STILL_STOPPING_PHRASE`, `STILL_STARTING_PHRASE` | `src/ad-description-phrases.ts` |
 | The relaunching post for P | `formatPersonaNotice <P> stuckLaunchRelaunchingText <P's key> <B>` | `src/persona-notifier.ts`, `src/pending-row.ts` |
 | The spawn-failed class | `STARTUP_ERROR_SPAWN_FAILED` | `src/session-manager.ts` |
-| The live-row sequence's prefix | `LIVE_ROW_SEQUENCE_LOG_PREFIX` | `src/live-row-sequence.ts` |
+| The stuck-launch abort's start line's fixed parts | `stuckLaunchAbortStartedLine <marker> <marker> <launch-start marker>` | `src/pending-row.ts` |
+| The dead reading's fixed parts | `reprobeDeadLine <marker>` | `src/restart.ts` |
+| The `reload-applied` line's class (`[slack] <class>:`) | `RELOAD_APPLIED` | `src/reload-apply.ts` |
+| Q's sequence start line's fixed parts | `liveRowSequenceStartLine <Q's ref> LIVE_ROW_SEQUENCE_ENTRY_KILL <Q's id> <marker> launch <marker>` | `src/live-row-sequence.ts` |
 | The step-2 wait's armed and end lines | `liveRowSequenceWaitArmedLine <Q's ref> <L> <G>`, `liveRowSequenceWaitEndedLine <Q's ref>` | `src/live-row-sequence.ts` |
 | A run left in neither list | `liveRowSequenceRunLine <Q's ref> <step> <run> LIVE_ROW_RUN_NOT_JUDGED` | `src/live-row-sequence.ts` |
 | The config file as the onset names it | `AD_CONFIG_FILE_DISPLAY_NAME` | `src/ad-config-file.ts` |
@@ -1297,32 +1347,37 @@ package:
 | The all-clear, as posted for C | `formatPersonaNotice <C> ALL_CLEAR_TEMPLATE ad-config-malformed` | `src/persona-notifier.ts`, `src/outage-state.ts` |
 | The raise line's fixed parts and the clear line | `adConfigMalformedRaisedLine <C's key> <marker>`, `adConfigMalformedClearedLine <C's key>` | `src/outage-state.ts` |
 | The retry timer's first and longest waits | `UNAVAILABLE_RETRY_BASE_S`, `UNAVAILABLE_RETRY_CEILING_S` | `src/unavailable-retry.ts` |
+| A stop's reasons: a pending-only retry read the row live; a retry found nothing left to recover | `UNAVAILABLE_RETRY_STOP_ROW_LIVE`, `UNAVAILABLE_RETRY_STOP_RECOVERED` | `src/unavailable-retry.ts` |
+| The could-not-run line's prefix (none across a refusal) | `AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX` | `src/ad-version-gate.ts` |
 | The re-armed reason of a retry read as unknown | `RESTART_OUTCOME_LIVENESS_UNKNOWN` | `src/restart.ts` |
-| The retry timer's retry, re-armed and stop lines | `unavailableRetryRetryLine <C's key> <retry> full`, `unavailableRetryReArmedLine <C's key> <retry> full <marker> 0`, `unavailableRetryStoppedLine <C's key> full none <marker>` | `src/unavailable-retry.ts` |
+| The retry timer's retry, re-armed and stop lines | `unavailableRetryRetryLine <C's key> <retry> full`, `unavailableRetryReArmedLine <C's key> <retry> full <marker> 0`, `unavailableRetryStoppedLine <C's key> pending-only waiting <UNAVAILABLE_RETRY_STOP_ROW_LIVE>`, `unavailableRetryStoppedLine <T1's key> full none <UNAVAILABLE_RETRY_STOP_RECOVERED>` | `src/unavailable-retry.ts` |
 | The call-timeout legs' grace period (61) | `pendingGraceMinimumSeconds 40000 <default pipe_close_wait_ms>` | `src/ad-settings.ts` |
 | The need and the verb whose ceiling sets it | `adCallTimeoutNeed <the call-timeout table>` | `src/ad-settings.ts` |
 | The startup warning for 30000, and none for 61000 | `buildAdCallTimeoutWarningLine <30000\|61000> <the call-timeout table>` | `src/ad-settings.ts` |
 | The launch-timeout phrase T2's answer carries | `LAUNCH_TIMEOUT_PHRASE` | `src/ad-description-phrases.ts` |
-| How the get line after a launch timeout names its form | `launchUnavailableFormText <ErrCallTimeout\|ErrTmuxUnresponsive>` | `src/session-manager.ts`, `src/ad-error-class.ts` |
+| The line of the get after a launch timeout, whole | `launchUnavailableGetLine <T's ref> spawn <ErrCallTimeout\|ErrTmuxUnresponsive> pending <the row's launch_started_at> LAUNCH_UNAVAILABLE_OUTCOME_APPROVER` | `src/session-manager.ts`, `src/ad-error-class.ts`, `src/pending-row.ts` |
 
-C is the persona a refused-value leg adds (C1 or C2). A marker the script
-passes in place of agent-director's description, the reader's reason or a
-retry line's reason splits a printed text into the fixed parts around it.
+C is the persona a refused-value leg adds (C1 or C2), and T is T1 or T2. A
+marker the script passes in place of agent-director's description, the
+reader's reason or a retry line's reason, or in place of a persona key, a
+reference, a row state or an alert context (a short identifier) or a launch
+start (an ISO time the lines render as given), splits a printed text into
+the fixed parts around it.
 
 Lines with no exported builder are matched by a fragment quoted from `src/`,
 each with its source named beside it in the script: the refusal line and
 its no-notice tail (`src/session-manager.ts` `logRefusal`), the latch line
-(`src/conflict-latch.ts`), the stuck-launch line and the stuck-launch
-abort's start line (`src/pending-row.ts`), the relaunch-failed line, the
-reads-dead line and the liveness-unknown line (`src/restart.ts`), the
-refused liveness read's line (`src/server.ts` `isSessionAlive`), the start
-sweep's lines (`src/session-manager.ts` `reconcileOrphans`), the
-`reload-applied` line (`src/reload-apply.ts`) and the `ad-config-malformed`
+(`src/conflict-latch.ts`), the stuck-launch line (`src/pending-row.ts`),
+the relaunch-failed line and the liveness-unknown line (`src/restart.ts`),
+the refused liveness read's line (`src/server.ts` `isSessionAlive`), the
+collision ladder's `ErrInstanceIdCollision` line (`COLLISION_HEAD`,
+`src/session-manager.ts` `spawnForPersona`), the start sweep's lines
+(`src/session-manager.ts` `reconcileOrphans`) and the `ad-config-malformed`
 class the all-clear lists (`src/outage-state.ts` does not export it; the
 printer's `ALL_CLEAR_TEMPLATE` checks it is one of `OUTAGE_CLASS_ORDER`).
-The get line after a launch timeout is matched by its head and its form and
-read parts, quoted from `src/session-manager.ts` `launchUnavailableGetLine`,
-with the form printed by `launchUnavailableFormText`.
+The get line's `spawn` (what that line calls a plain spawn,
+`src/session-manager.ts` `spawnForPersona`) has no export and is quoted
+too.
 
 ### The value printer
 
@@ -1339,8 +1394,10 @@ builder's output for the given arguments.
   when the printer fails. It prints the value byte for byte, with no trailing
   newline added.
 - It reads the package from `CSCB_PKG_DIR` (default
-  `/test-repo/node_modules/claude-slack-channel-bots`), and an entry that
-  needs it, the agent-director client that package resolves.
+  `/test-repo/node_modules/claude-slack-channel-bots`), which `scenario.sh`
+  exports as the installed package under test
+  (`$SCENARIO_REPO/node_modules/claude-slack-channel-bots`), and an entry
+  that needs it, the agent-director client that package resolves.
 - Failures print one `FAIL: fmk-texts: <reason>` line on stderr: exit 64 for
   no entry, an unknown one or arguments the entry does not take; exit 1 for
   a missing or mistyped export or a builder that throws. Without the image
@@ -1387,7 +1444,6 @@ builder's output for the given arguments.
 | `DIALOG_POLL_INTERVAL_MS` | the dialog approver's pace before G, in decimal | `src/session-manager.ts` |
 | `DIALOG_SLOW_POLL_INTERVAL_MS` | the dialog approver's slow pace from G, in decimal | `src/session-manager.ts` |
 | `STARTUP_ERROR_SPAWN_FAILED` | the startup-errors class a failed start-pass launch writes | `src/session-manager.ts` |
-| `LIVE_ROW_SEQUENCE_LOG_PREFIX` | the prefix of the live-row sequence's lines | `src/live-row-sequence.ts` |
 | `liveRowSequenceWaitArmedLine <persona-ref> <launch-start-ms> <grace-ms>` | the step-2 wait's armed line for that persona ref (`"<name>" (key=<key>)`), launch start in epoch milliseconds and G | `src/live-row-sequence.ts` |
 | `liveRowSequenceWaitEndedLine <persona-ref>` | the step-2 wait's end line | `src/live-row-sequence.ts` |
 | `liveRowSequenceRunLine <persona-ref> <step> <run-number> <placement-export>` | the sequence's line for one `find-missing` run at step 3 or 4, with the placement the package exports as `<placement-export>` (a `LIVE_ROW_RUN_…` name) | `src/live-row-sequence.ts` |
@@ -1406,7 +1462,14 @@ builder's output for the given arguments.
 | `buildAdCallTimeoutWarningLine <call-timeout-ms> [<key>=<integer>...]` | the startup call-timeout warning for that call timeout and the values in effect; the empty text when the builder gives no line | `src/ad-settings.ts` |
 | `adCallTimeoutNeed [<key>=<integer>...]` | `<need-ms> <verb>`: the call timeout's need, in decimal, and the verb whose ceiling sets it | `src/ad-settings.ts` |
 | `LAUNCH_TIMEOUT_PHRASE` | the phrase an `ErrTmuxUnresponsive` carries when it ends a launch call as a launch timeout | `src/ad-description-phrases.ts` |
-| `launchUnavailableFormText <err-name>` | how the line of the one get after a launch timeout names the timeout's form `<err-name>`, which must be one of the package's `LAUNCH_TIMEOUT_FORM_…` values | `src/session-manager.ts`, `src/ad-error-class.ts` |
+| `AD_VERSION_RECHECK_STOP_EXIT_CODE` | the exit status of the runtime re-check's stop, in decimal | `src/ad-version-gate.ts` |
+| `launchUnavailableGetLine <persona-ref> <what> <err-name> <read> <launch-start\|no> <outcome-export>` | the line of the one get after the `<what>` of `<persona-ref>` ended in a launch timeout of the form `<err-name>` (one of the package's `LAUNCH_TIMEOUT_FORM_…` values, named as `launchUnavailableFormText` names it), the get reading `<read>`; this launch's row has the launch start `<launch-start>`, the row's `launch_started_at` as agent-director wrote it, read with `parseLaunchStart` (`no`: not this launch's row); the outcome the package exports as `<outcome-export>` (a `LAUNCH_UNAVAILABLE_OUTCOME_…` name) | `src/session-manager.ts`, `src/ad-error-class.ts`, `src/pending-row.ts` |
+| `UNAVAILABLE_RETRY_STOP_ROW_LIVE` | a stop's reason when a pending-only retry reads the row live | `src/unavailable-retry.ts` |
+| `UNAVAILABLE_RETRY_STOP_RECOVERED` | a stop's reason when a retry finds nothing left to recover | `src/unavailable-retry.ts` |
+| `stuckLaunchAbortStartedLine <persona-key> <persona-ref> <launch-start>` | the stuck-launch abort's start line, `<launch-start>` as a row's `launch_started_at` (the line renders it) | `src/pending-row.ts` |
+| `reprobeDeadLine <persona-key>` | the line of a row the re-probe reads dead | `src/restart.ts` |
+| `liveRowSequenceStartLine <persona-ref> <entry-step-export> <instance-id> <last-read> <launch\|no-launch> <alert-context>` | the live-row sequence's start line, entered at the step the package exports as `<entry-step-export>` (a `LIVE_ROW_SEQUENCE_ENTRY_…` name), ending in a launch or not | `src/live-row-sequence.ts` |
+| `RELOAD_APPLIED` | the class label of an applied reload's line | `src/reload-apply.ts` |
 
 `adGraceMs`, `adAlertThresholdMs`, `adLaunchBoundMs`, `adCallTimeoutNeed`
 and `buildAdCallTimeoutWarningLine` take the values in effect built from
@@ -1421,7 +1484,10 @@ Given a marker in place of `<description>` or `<reason>`,
 `buildAdSettingsRefusedReadLine` print a text whose parts around the marker
 are its fixed parts; `unavailableRetryReArmedLine` and
 `unavailableRetryStoppedLine` print one whose part before the marker is the
-line's fixed head.
+line's fixed head. More generally, a builder entry given a marker argument
+(a key, a reference, a state or a description the scenario chooses) prints
+a line whose text around the marker is the line's fixed part; the scenario
+splits it there.
 
 ### Harness-only steps
 

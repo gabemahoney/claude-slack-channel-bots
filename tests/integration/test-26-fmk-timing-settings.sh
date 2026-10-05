@@ -78,7 +78,12 @@
 # `launch_started_at` or `ended_at` (read with a harness `get`). The approver's
 # paces come from the printer (DIALOG_POLL_INTERVAL_MS, 1 s before G;
 # DIALOG_SLOW_POLL_INTERVAL_MS, 5 s from G); "what a 5 s pace allows" in a
-# window of d seconds is floor(d / 5) + 1 reads. The call-timeout legs'
+# window of d seconds is floor(d / 5) + 1 reads, and PACE_GAP_LIMIT_S (3 s)
+# is halfway between the two paces. The held leg times P's `read-pane` calls
+# by their shim lines' own time field (the time the shim took as the call
+# started, from the clock this script's polling reads), so a gap between two
+# calls is measured whole, never rounded to this script's polling. The
+# call-timeout legs'
 # timing bounds come from their scenario inputs (CALL_TIMEOUT_LOW_MS,
 # CREATE_RAISED_MS, CALL_TIMEOUT_HIGH_MS) and the printer's need. The whole
 # script runs about 39 minutes: about 17 for the legs before the refused
@@ -109,12 +114,17 @@
 #               CONFLICT). Then the harness releases the stub; a later `resume`
 #               brings S up (`waiting`). No post to S's channel, every refusal
 #               line says no spawn-failure notice, no spawn-failed entry, no
-#               latch.
+#               latch; S comes back by `resume`: no CSCB reuse spawn of S in
+#               the leg, and each CSCB spawn of S in it (the collision
+#               ladder's plain spawn) has its collision line for S (it met
+#               S's row and launched nothing).
 #   held        P, launched by this server process (added across a restart):
-#               its `launch_started_at` read with a harness `get`; P's
-#               `read-pane` calls counted in (G/2, G) from the launch start
-#               (above what the slow pace allows) and in (G + 5, G + 65) (at
-#               most that); no CSCB `find-missing` before the launch start
+#               its `launch_started_at` (L) read with a harness `get`; no
+#               slower approver read before G: P's `read-pane` calls in
+#               (L + 5 s, L + G), at least two, no gap between consecutive
+#               ones as long as PACE_GAP_LIMIT_S, and the last within the slow
+#               pace of L + G; in (G + 5, G + 65) at most what the slow pace
+#               allows; no CSCB `find-missing` before the launch start
 #               plus G; no post to P's channel and no CSCB kill of P before
 #               the relaunching post; exactly one relaunching post, its stub
 #               record time no earlier than B and less than 30 s after it, its
@@ -176,13 +186,15 @@
 #               none for a persona already up), and each of C1's timed retries
 #               reruns its recovery: one `status` call, refused and read as
 #               unknown, no launch, nothing counted, the timer re-armed with
-#               the reason liveness-unknown; no all-clear after the probe
-#               inside the refusal; after the fix C1 reads `waiting`, one
-#               all-clear post (the printer's text) made after the fix, one
-#               clear line, C1's
-#               retry timer stopped once a pending-only retry reads its row
-#               live (so no persona up at the next leg has a timer), and no
-#               values line through the next bot-server probe.
+#               the reason liveness-unknown; the version probes inside the
+#               refusal ran (no new could-not-run line, its prefix
+#               AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX); no all-clear
+#               after the probe inside the refusal; after the fix C1 reads
+#               `waiting`, one all-clear post (the printer's text) made after
+#               the fix, one clear line, C1's retry timer stopped once a
+#               pending-only retry reads its row `waiting` (the printer's stop
+#               line, whole, so no persona up at the next leg has a timer),
+#               and no values line through the next bot-server probe.
 #   refused-grace
 #               the same checks for pending_grace_seconds = "60" (a TOML
 #               string), with C2 added by a confirmed reload and C1 among the
@@ -203,11 +215,15 @@
 #               this server process) ends in ErrCallTimeout: its refusal line
 #               comes at least 30 s (less SHIM_LINE_ALLOWANCE_S) and less than
 #               40 s after the call's line in the shim's log; a CSCB `get` of
-#               T1 follows, whose line names the launch timeout's
-#               ErrCallTimeout form and reads this launch's `pending` row; a
+#               T1 follows, and exactly one server.log line is the printer's
+#               line of that get after the plain spawn's ErrCallTimeout form,
+#               reading this launch's `pending` row, its launch start the one
+#               the harness last read before the get, the approver started; a
 #               CSCB send-keys (the approver's Enter) and T1 reads `waiting`.
-#               The harness reads T1's row about once a second from the spawn
-#               until T1 is up and its retry timer has stopped; every later
+#               The harness reads T1's row (its state and launch start) about
+#               once a second from the spawn until T1 is up and its retry timer
+#               has stopped (its full-mode retry found nothing left to
+#               recover: the printer's stop line, whole); every later
 #               CSCB launch call of T1 (spawn or resume) must follow a harness
 #               reading of `ended` or `missing` (its latest reading before the
 #               call) and a CSCB read of the row (a get or status) since the
@@ -220,10 +236,13 @@
 #               T2's plain spawn (the same launch as T1's: hatch decision) ends
 #               in ErrTmuxUnresponsive carrying LAUNCH_TIMEOUT_PHRASE, its
 #               refusal line at least 40 s and less than 61 s after the call;
-#               the CSCB `get` that follows names the launch timeout's
-#               ErrTmuxUnresponsive form and reads this launch's `pending`
-#               row; the approver brings T2 up (`waiting`); no server.log line
-#               for T2 names ErrCallTimeout. The tmux shim is set back to `log`.
+#               the CSCB `get` that follows has exactly one line, the
+#               printer's for the ErrTmuxUnresponsive form, reading this
+#               launch's `pending` row with the launch start a harness `get`
+#               read while the held create kept it pending, the approver
+#               started; the approver brings T2 up (`waiting`); no server.log
+#               line for T2 names ErrCallTimeout. The tmux shim is set back to
+#               `log`.
 #
 # The refused-value legs (hatch decisions, the Epic's "Hatch gap"): the
 # persona meeting the refusal is added by a confirmed reload, so the last
@@ -251,13 +270,22 @@
 #                                                            src/ad-version-gate.ts
 #   FAST_PACE_MS         DIALOG_POLL_INTERVAL_MS             src/session-manager.ts
 #   SLOW_PACE_MS         DIALOG_SLOW_POLL_INTERVAL_MS        src/session-manager.ts
+#   PACE_GAP_LIMIT_S     (FAST_PACE_MS + SLOW_PACE_MS) / 2, in seconds
 #   STILL_STOPPING       STILL_STOPPING_PHRASE               src/ad-description-phrases.ts
 #   STILL_STARTING       STILL_STARTING_PHRASE               src/ad-description-phrases.ts
 #   RELAUNCH_POST        formatPersonaNotice <P> stuckLaunchRelaunchingText <P's key> <B_MS>
 #                                                            src/persona-notifier.ts,
 #                                                            src/pending-row.ts
 #   SPAWN_FAILED_LABEL   STARTUP_ERROR_SPAWN_FAILED          src/session-manager.ts
-#   LIVE_PREFIX          LIVE_ROW_SEQUENCE_LOG_PREFIX        src/live-row-sequence.ts
+#   the abort's start line's fixed parts
+#                        stuckLaunchAbortStartedLine <marker> <marker> <launch-start marker>
+#                                                            src/pending-row.ts
+#   the dead reading's fixed parts
+#                        reprobeDeadLine <marker>            src/restart.ts
+#   APPLIED_CLASS        `[slack] <RELOAD_APPLIED>:`         src/reload-apply.ts
+#   Q's sequence start line's fixed parts
+#                        liveRowSequenceStartLine <Q's ref> LIVE_ROW_SEQUENCE_ENTRY_KILL <Q's id> <marker> launch <marker>
+#                                                            src/live-row-sequence.ts
 #   the wait's lines     liveRowSequenceWaitArmedLine <Q's ref> <L in ms> <G_MS>,
 #                        liveRowSequenceWaitEndedLine <Q's ref>
 #                                                            src/live-row-sequence.ts
@@ -266,12 +294,18 @@
 #   CONFIG_FILE_NAME     AD_CONFIG_FILE_DISPLAY_NAME         src/ad-config-file.ts
 #   RETRY_BASE_S         UNAVAILABLE_RETRY_BASE_S            src/unavailable-retry.ts
 #   RETRY_CEILING_S      UNAVAILABLE_RETRY_CEILING_S         src/unavailable-retry.ts
+#   STOP_ROW_LIVE, STOP_RECOVERED
+#                        UNAVAILABLE_RETRY_STOP_ROW_LIVE, UNAVAILABLE_RETRY_STOP_RECOVERED
+#                                                            src/unavailable-retry.ts
+#   COULD_NOT_RUN_PREFIX AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX
+#                                                            src/ad-version-gate.ts
 #   LIVENESS_UNKNOWN_REASON
 #                        RESTART_OUTCOME_LIVENESS_UNKNOWN    src/restart.ts
 #   the retry timer's lines
 #                        unavailableRetryRetryLine <C's key> <retry> full,
 #                        unavailableRetryReArmedLine <C's key> <retry> full <marker> 0,
-#                        unavailableRetryStoppedLine <C's key> full none <marker>
+#                        unavailableRetryStoppedLine <C's key> pending-only waiting <STOP_ROW_LIVE>,
+#                        unavailableRetryStoppedLine <T1's key> full none <STOP_RECOVERED>
 #                                                            src/unavailable-retry.ts
 #   the refused-read line's fixed parts
 #                        buildAdSettingsRefusedReadLine <file> <marker> accepted
@@ -292,12 +326,19 @@
 #   WARN_LOW, WARN_HIGH  buildAdCallTimeoutWarningLine <30000|61000> <the call-timeout table>
 #                                                            src/ad-settings.ts
 #   LAUNCH_PHRASE        LAUNCH_TIMEOUT_PHRASE               src/ad-description-phrases.ts
-#   the get line's forms launchUnavailableFormText <ErrCallTimeout|ErrTmuxUnresponsive>
+#   the get line after a launch timeout
+#                        launchUnavailableGetLine <T's ref> spawn <ErrCallTimeout|ErrTmuxUnresponsive>
+#                          pending <the row's launch_started_at> LAUNCH_UNAVAILABLE_OUTCOME_APPROVER
 #                                                            src/session-manager.ts,
-#                                                            src/ad-error-class.ts
+#                                                            src/ad-error-class.ts,
+#                                                            src/pending-row.ts
 # A marker the scenario passes in place of agent-director's description, the
-# reader's reason or a retry line's reason splits a printed text into the
-# fixed parts around it.
+# reader's reason or a retry line's reason (REFUSED_MARKER), or of a persona
+# key, a reference, a row state or an alert context (LINE_MARKER, a short
+# identifier) or a launch start (LAUNCH_START_MARKER, an ISO time the lines
+# render as given), splits a printed text into the fixed parts around it.
+# The get line's `spawn` (what the line calls a plain spawn,
+# src/session-manager.ts spawnForPersona) has no export and is quoted.
 # Lines with no exported builder are matched by a fragment quoted from src/
 # (ruling S7), each with its source beside it below.
 #
@@ -412,7 +453,7 @@ SLOW_PACE_MS="$(printed DIALOG_SLOW_POLL_INTERVAL_MS)" || exit 1
 STILL_STOPPING="$(printed STILL_STOPPING_PHRASE)" || exit 1
 STILL_STARTING="$(printed STILL_STARTING_PHRASE)" || exit 1
 SPAWN_FAILED_LABEL="$(printed STARTUP_ERROR_SPAWN_FAILED)" || exit 1
-LIVE_PREFIX="$(printed LIVE_ROW_SEQUENCE_LOG_PREFIX)" || exit 1
+COULD_NOT_RUN_PREFIX="$(printed AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX)" || exit 1
 for v in G_MS B_MS ALERT_MS G_RAISED_MS RECHECK_MS FAST_PACE_MS SLOW_PACE_MS; do
     [[ "${!v}" =~ ^[1-9][0-9]*$ && $(( ${!v} % 1000 )) == 0 ]] \
         || fail "setup: ${v} '${!v}' is not a whole number of seconds"
@@ -425,6 +466,10 @@ SLOW_PACE_S=$(( SLOW_PACE_MS / 1000 ))
 (( G_S < R_WINDOW_FROM_S && R_WINDOW_FROM_S < R_WINDOW_TO_S && R_WINDOW_TO_S < G_RAISED_S && R_WINDOW_TO_S < B_S )) \
     || fail "setup: R's window (${R_WINDOW_FROM_S}s, ${R_WINDOW_TO_S}s) does not lie past G ${G_S}s and before the raised G ${G_RAISED_S}s and B ${B_S}s"
 (( FAST_PACE_MS < SLOW_PACE_MS )) || fail "setup: the approver's pace before G (${FAST_PACE_MS} ms) is not faster than its slow pace (${SLOW_PACE_MS} ms)"
+# The longest gap between two approver reads of a launch before G: halfway
+# between the fast pace and the slow one, so a slow-paced read before G shows
+# as a longer gap.
+PACE_GAP_LIMIT_S="$(awk -v f="${FAST_PACE_MS}" -v s="${SLOW_PACE_MS}" 'BEGIN { printf "%.3f\n", (f + s) / 2000 }')"
 
 # Allowances (the scenario's own).
 POST_ALLOWANCE_S=30   # the relaunching post: no earlier than B, within this after it
@@ -457,10 +502,14 @@ LATCH_HEAD='[slack] conflict-latch: persona='
 STUCK_LINE_HEAD='[slack] pending-row: persona='
 # src/restart.ts countLaunchFailure's line for a relaunch: `[slack] Session relaunch failed for persona=<key>`.
 RELAUNCH_FAILED='[slack] Session relaunch failed for persona='
+# src/session-manager.ts spawnForPersona: the collision ladder's plain spawn
+# meeting the persona's row, `[slack] spawnForPersona: ErrInstanceIdCollision
+# for <ref> — fetching current state`.
+COLLISION_HEAD='[slack] spawnForPersona: ErrInstanceIdCollision for '
 # src/session-manager.ts reconcileOrphans' lines: `[slack] reconcileOrphans: …`.
 SWEEP_HEAD='[slack] reconcileOrphans: '
-# src/reload-apply.ts renderAppliedLogLine.
-APPLIED_CLASS='[slack] reload-applied:'
+# src/reload-apply.ts renderAppliedLogLine: `[slack] <RELOAD_APPLIED>: …`.
+APPLIED_CLASS="[slack] $(printed RELOAD_APPLIED):" || exit 1
 
 # Bounds, in seconds (the scenario's own).
 STUB_WAIT_S=20      # the Slack stub writing its ready file
@@ -597,9 +646,9 @@ row_field() {
     jq -r --arg f "$3" '.[$f] // empty' "${AD_OUT}"
 }
 
-# launch_start_of <step> <instance-id>: the row's launch start, read with a
-# harness `get` of a `pending` row, in epoch seconds.
-launch_start_of() {
+# launch_start_raw <step> <instance-id>: the row's launch start, read with a
+# harness `get` of a `pending` row, as agent-director wrote it.
+launch_start_raw() {
     local raw
     ad_capture get --claude-instance-id "$2"
     (( AD_RC == 0 )) || fail "$1: the harness get of $2 exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
@@ -607,6 +656,13 @@ launch_start_of() {
         || fail "$1: $2 reads '$(jq -r '.state // empty' "${AD_OUT}")', not pending"
     raw="$(jq -r '.launch_started_at // empty' "${AD_OUT}")"
     [[ -n "${raw}" ]] || fail "$1: $2's pending row has no launch_started_at: $(head -c 400 "${AD_OUT}")"
+    printf '%s\n' "${raw}"
+}
+
+# launch_start_of <step> <instance-id>: that launch start in epoch seconds.
+launch_start_of() {
+    local raw
+    raw="$(launch_start_raw "$1" "$2")" || exit 1
     epoch_of "$1" "${raw}"
 }
 
@@ -652,13 +708,17 @@ log_lines() {
         }' "${file}" "${SCENARIO_SEP}" "${m}"
 }
 
-# lines_ending_with <text>: how many server.log lines end with <text>.
-lines_ending_with() {
-    local file="${SLACK_STATE_DIR}/server.log"
-    [[ -f "${file}" ]] || { echo 0; return 0; }
-    LC_ALL=C awk -v want="$1" '
-        { n0 = length($0); n1 = length(want); if (n0 >= n1 && substr($0, n0 - n1 + 1) == want) n++ }
-        END { print n + 0 }' "${file}"
+# marker_matcher <step> <text> <marker>...: a matcher of <text>'s fixed
+# parts, <text> with each <marker> replaced by the matcher's separator; fails
+# when <text> does not hold a <marker>.
+marker_matcher() {
+    local step="$1" text="$2" m
+    shift 2
+    for m in "$@"; do
+        [[ "${text}" == *"${m}"* ]] || fail "${step}: the printer's text does not hold the marker '${m}': ${text}"
+        text="${text//"${m}"/${SCENARIO_SEP}}"
+    done
+    printf '%s\n' "${text}"
 }
 
 # posts_to <channel>: the stub record's chat.postMessage lines to <channel>, compact JSON.
@@ -871,8 +931,14 @@ leg_values() {
 
 leg_stopping() {
     leg stopping
-    local session ended_raw end_s n_resume line t1 t2 refused stop_m start_m posts_before entries_before
+    local session ended_raw end_s n_resume n_spawn n_reuse collided collided_before line t1 t2 refused stop_m start_m posts_before entries_before
     local errors_log="${SLACK_STATE_DIR}/startup-errors.log"
+    # S comes back by `resume`: no spawn of S in the leg launches anything
+    # (each is the collision ladder's plain spawn, which collides with S's
+    # row) and none is a reuse spawn.
+    n_spawn="$(cscb_ad_count spawn --claude-instance-id "${ID[s]}")"
+    n_reuse="$(cscb_ad_count spawn --claude-instance-id "${ID[s]}" --reuse-finished)"
+    collided_before="$(count_log "${COLLISION_HEAD}${REF[s]} ")"
     session="$(session_of "stopping" "${ID[s]}")" || exit 1
     S_CREATED="$(tmux_session_value "${session}" '#{session_created}')" || fail "stopping: S's session ${session} has no creation time"
     S_PANE="$(tmux_session_value "${session}" '#{pane_id}')" || fail "stopping: S's session ${session} has no pane"
@@ -935,7 +1001,13 @@ leg_stopping() {
     [[ "$(count_in "${errors_log}" "$(matcher "] [${SPAWN_FAILED_LABEL}] " "${REF[s]}")")" == "${entries_before}" ]] \
         || fail "stopping: a ${SPAWN_FAILED_LABEL} entry for S"
     [[ "$(count_log "${RELAUNCH_FAILED}${KEY[s]}")" == 0 ]] || fail "stopping: a launch failure of S was counted"
-    echo "${TEST_NAME}: stopping: S up after $(cscb_ad_count resume --claude-instance-id "${ID[s]}") resume(s) in all, $(count_log "${refused}") refusal(s)"
+    [[ "$(cscb_ad_count spawn --claude-instance-id "${ID[s]}" --reuse-finished)" == "${n_reuse}" ]] \
+        || fail "stopping: CSCB made a reuse spawn of S; S comes back by resume"
+    n_spawn=$(( $(cscb_ad_count spawn --claude-instance-id "${ID[s]}") - n_spawn ))
+    collided=$(( $(count_log "${COLLISION_HEAD}${REF[s]} ") - collided_before ))
+    [[ "${collided}" == "${n_spawn}" ]] \
+        || fail "stopping: CSCB made ${n_spawn} spawn(s) of S and ${collided} collided with its row; S comes back by resume"
+    echo "${TEST_NAME}: stopping: S up after $(cscb_ad_count resume --claude-instance-id "${ID[s]}") resume(s) in all, $(count_log "${refused}") refusal(s); ${n_spawn} spawn(s) of S in the leg, each colliding with its row"
 }
 
 # ---------------------------------------------------------------------------
@@ -945,7 +1017,7 @@ leg_stopping() {
 
 leg_held() {
     leg held
-    local n_spawn line l_p w1 n1 n2 allowed fm post post_t post_log_t kills posts stuck_m
+    local n_spawn line l_p n2 allowed fm post post_t post_log_t kills posts stuck_m reads pace n_fast gap_max tail_s
     n_spawn="$(cscb_ad_count spawn --claude-instance-id "${ID[p]}")"
     restart_with_personas "held" s p
     line="$(wait_for_cscb_ad_call "${n_spawn}" "${LAUNCH_WAIT_S}" "held: no spawn of P" spawn --claude-instance-id "${ID[p]}")" || exit 1
@@ -956,14 +1028,27 @@ leg_held() {
     echo "${TEST_NAME}: held: P's launch start is $(seconds_between "${CALL_T}" "${l_p}")s after its spawn call"
     wait_until "${REPORT_WAIT_S}" "S never reported in after the start" row_state_is "${ID[s]}" waiting
 
-    # The two windows: (G/2, G) and (G + 5, G + 65) from the launch start.
-    w1=$(( G_S / 2 ))
+    # Before G, (L + 5 s, L + G): the approver reads at its fast pace
+    # throughout, so no slower read: every gap between two consecutive
+    # read-pane calls of P is below PACE_GAP_LIMIT_S, and the last read lies
+    # within the slow pace of L + G. From G, (G + 5, G + 65): at most what
+    # the slow pace allows. The times are the shim lines' own.
     sleep_until "$(time_plus "${l_p}" "$(( G_S + 65 + 1 ))")"
-    allowed=$(( w1 / SLOW_PACE_S + 1 ))
-    n1="$(cscb_calls_between "$(time_plus "${l_p}" "${w1}")" "$(time_plus "${l_p}" "${G_S}")" read-pane --claude-instance-id "${ID[p]}")"
+    reads="$(cscb_ad_calls read-pane --claude-instance-id "${ID[p]}" \
+        | awk -F'\t' -v a="$(time_plus "${l_p}" 5)" -v b="$(time_plus "${l_p}" "${G_S}")" '$2 > a && $2 < b { print $2 }')"
+    pace="$(awk -v end="$(time_plus "${l_p}" "${G_S}")" '
+        NF { n++; if (n > 1 && $1 - prev > gap) gap = $1 - prev; prev = $1 }
+        END { printf "%d %.3f %.3f\n", n, gap + 0, (n > 0 ? end - prev : end) }' <<< "${reads}")"
+    read -r n_fast gap_max tail_s <<< "${pace}"
+    # The window (G + 5, G + 65) is 60 s long.
+    allowed=$(( 60 / SLOW_PACE_S + 1 ))
     n2="$(cscb_calls_between "$(time_plus "${l_p}" "$(( G_S + 5 ))")" "$(time_plus "${l_p}" "$(( G_S + 65 ))")" read-pane --claude-instance-id "${ID[p]}")"
-    echo "${TEST_NAME}: held: P's read-pane calls: ${n1} in (${w1}s, ${G_S}s), ${n2} in ($(( G_S + 5 ))s, $(( G_S + 65 ))s); the slow pace allows ${allowed} in each"
-    (( n1 > allowed )) || fail "held: ${n1} read-pane calls of P before G, not more than the slow pace allows (${allowed}): a slower approver read before G"
+    echo "${TEST_NAME}: held: P's read-pane calls: ${n_fast} in (5s, ${G_S}s), the longest gap ${gap_max}s (limit ${PACE_GAP_LIMIT_S}s), the last ${tail_s}s before G; ${n2} in ($(( G_S + 5 ))s, $(( G_S + 65 ))s), the slow pace allows ${allowed}"
+    (( n_fast >= 2 )) || fail "held: ${n_fast} read-pane call(s) of P in (5s, ${G_S}s) from its launch start, not the approver's fast pace"
+    time_before "${gap_max}" "${PACE_GAP_LIMIT_S}" \
+        || fail "held: a gap of ${gap_max}s between two read-pane calls of P before G, not below ${PACE_GAP_LIMIT_S}s: a slower approver read before G"
+    time_before "${tail_s}" "${SLOW_PACE_S}" \
+        || fail "held: P's last read-pane call before G came ${tail_s}s before G, not within the slow pace (${SLOW_PACE_S}s): a slower approver read before G"
     (( n2 <= allowed )) || fail "held: ${n2} read-pane calls of P from G, more than the slow pace allows (${allowed})"
     fm="$(cscb_calls_between "${T_START}" "$(time_plus "${l_p}" "${G_S}")" find-missing)"
     [[ "${fm}" == 0 ]] || fail "held: ${fm} CSCB find-missing run(s) before P's launch start plus G"
@@ -972,7 +1057,6 @@ leg_held() {
     stub_mode "${WORK[p]}" "${STUB_MODE_AT_ONCE}"
     wait_until "$(awk -v e="$(time_plus "${l_p}" "$(( B_S + POST_ALLOWANCE_S + 5 ))")" -v n="$(now_s)" 'BEGIN { d = e - n; printf "%d\n", (d > 0 ? d : 0) }')" \
         "held: no relaunching post for P by B + ${POST_ALLOWANCE_S}s" relaunch_post_seen
-    sleep 2
     [[ "$(relaunch_posts | wc -l | tr -d ' ')" == 1 ]] || fail "held: $(relaunch_posts | wc -l | tr -d ' ') relaunching posts for P, not exactly one"
     post="$(relaunch_posts)"
     post_t="$(epoch_of "held" "$(jq -r '.ts' <<< "${post}")")" || exit 1
@@ -1016,7 +1100,10 @@ leg_sequence() {
     wait_until "${LAUNCH_WAIT_S}" "sequence: Q's row never read pending" row_state_is "${ID[q]}" pending
     l_q="$(launch_start_of "sequence" "${ID[q]}")" || exit 1
     l_q_ms="$(awk -v t="${l_q}" 'BEGIN { printf "%.0f\n", t * 1000 }')"
-    seq_start_m="$(matcher "${LIVE_PREFIX} ${REF[q]}: started at step 1 for ${ID[q]} ")"
+    # The sequence's start line for Q, entered at step 1 and ending in a
+    # launch, its last read and alert context any.
+    line="$(printed liveRowSequenceStartLine "${REF[q]}" LIVE_ROW_SEQUENCE_ENTRY_KILL "${ID[q]}" "${LINE_MARKER}" launch "${LINE_MARKER}")" || exit 1
+    seq_start_m="$(marker_matcher "sequence: the live-row sequence's start line" "${line}" "${LINE_MARKER}")" || exit 1
     armed_line="$(printed liveRowSequenceWaitArmedLine "${REF[q]}" "${l_q_ms}" "${G_MS}")" || exit 1
     ended_line="$(printed liveRowSequenceWaitEndedLine "${REF[q]}")" || exit 1
     [[ "$(row_field "sequence" "${ID[q]}" cwd)" == "$(realpath -e -- "${Q_HELD}")" ]] \
@@ -1076,7 +1163,6 @@ leg_sequence() {
     fi
 
     # Q brought up by a reuse spawn.
-    n_reuse="$(cscb_calls_between "${t_restart}" "$(now_s)" spawn --claude-instance-id "${ID[q]}" --reuse-finished)"
     wait_until "${REPORT_WAIT_S}" "sequence: Q never reported in" row_state_is "${ID[q]}" waiting
     n_reuse="$(cscb_calls_between "${t_restart}" "$(now_s)" spawn --claude-instance-id "${ID[q]}" --reuse-finished)"
     (( n_reuse >= 1 )) || fail "sequence: Q came up with no reuse spawn"
@@ -1204,6 +1290,10 @@ REFUSED_GRACE_TEXT='"60"'
 CONFIG_FILE_NAME="$(printed AD_CONFIG_FILE_DISPLAY_NAME)" || exit 1
 RETRY_BASE_S="$(printed UNAVAILABLE_RETRY_BASE_S)" || exit 1
 RETRY_CEILING_S="$(printed UNAVAILABLE_RETRY_CEILING_S)" || exit 1
+# The reasons of a retry timer's stop: a pending-only retry read the row
+# live; a retry found nothing left to recover.
+STOP_ROW_LIVE="$(printed UNAVAILABLE_RETRY_STOP_ROW_LIVE)" || exit 1
+STOP_RECOVERED="$(printed UNAVAILABLE_RETRY_STOP_RECOVERED)" || exit 1
 [[ "${RETRY_BASE_S}" =~ ^[1-9][0-9]*$ && "${RETRY_CEILING_S}" =~ ^[1-9][0-9]*$ ]] \
     || fail "setup: UNAVAILABLE_RETRY_BASE_S '${RETRY_BASE_S}' or UNAVAILABLE_RETRY_CEILING_S '${RETRY_CEILING_S}' is not a whole number of seconds"
 # The ad-config-malformed class, as the all-clear lists it: src/outage-state.ts
@@ -1220,8 +1310,18 @@ REFUSED_HEAD="${HEAD}"
 REFUSED_TAIL="${TAIL}"
 [[ "${REFUSED_HEAD}" == "${VALUES_PREFIX}"*"\"${AD_SETTINGS_FILE}\""* ]] \
     || fail "setup: the refused-read line's fixed part does not start with AD_SETTINGS_LOG_PREFIX and name ${AD_SETTINGS_FILE}"
-# src/restart.ts: the line of a reconciled row that reads dead.
-READS_DEAD='[slack] Session reads dead'
+# The marker the printer is given in place of a persona key, a reference,
+# an instance id, a row state or an alert context (the scenario's own; a
+# short identifier, so a line that names a state only when it is one names
+# it as given).
+LINE_MARKER='fmk_texts_marker'
+# A launch start the printer is given in place of a row's (the scenario's
+# own; the lines render it as given).
+LAUNCH_START_MARKER='2000-01-01T00:00:00.000Z'
+# The re-probe's line of a row that reads dead, for any persona: the fixed
+# parts of fixtures/fmk-texts.ts reprobeDeadLine (src/restart.ts).
+line="$(printed reprobeDeadLine "${LINE_MARKER}")" || exit 1
+READS_DEAD_M="$(marker_matcher "setup: the dead re-probe line" "${line}" "${LINE_MARKER}")" || exit 1
 # src/server.ts isSessionAlive: `[slack] isSessionAlive: status error for
 # persona=<key>: <error> — read as unknown, not dead`.
 STATUS_ERROR_HEAD='[slack] isSessionAlive: status error for persona='
@@ -1232,9 +1332,11 @@ LIVENESS_UNKNOWN_HEAD='[slack] Liveness unknown for persona='
 LIVENESS_UNKNOWN_TAIL=' — no reconnect, kill or launch; nothing counted'
 # The again-reason of a retry whose liveness read was unknown.
 LIVENESS_UNKNOWN_REASON="$(printed RESTART_OUTCOME_LIVENESS_UNKNOWN)" || exit 1
-# src/pending-row.ts: the stuck-launch abort's start line, `[slack]
-# pending-row: persona=<key> stuck-launch abort started for <ref> …`.
-ABORT_WORDS=' stuck-launch abort started for '
+# The stuck-launch abort's start line, for any persona and launch start: the
+# fixed parts of fixtures/fmk-texts.ts stuckLaunchAbortStartedLine
+# (src/pending-row.ts).
+line="$(printed stuckLaunchAbortStartedLine "${LINE_MARKER}" "${LINE_MARKER}" "${LAUNCH_START_MARKER}")" || exit 1
+ABORT_M="$(marker_matcher "setup: the stuck-launch abort's start line" "${line}" "${LINE_MARKER}" "${LAUNCH_START_MARKER}")" || exit 1
 # The personas up when a refused-value leg starts (added to as each leg adds one).
 UP_PERSONAS=()
 
@@ -1269,7 +1371,7 @@ refused_values_check() {
     shift 3
     local name="${SCENARIO_TAG}_${x}" y line t_bad t_fix t_onset t_probe n_version n_spawn n_applied
     local values_before refused_before raised_m raised_before onset onset_head onset_tail all_clear cleared
-    local post text said n m retries spawns calls ch stopped_m raised_any_m t_read
+    local post text said n m retries spawns calls ch stopped_m raised_any_m t_read could_not_run_before
     local -A posts_before=()
     onset="$(printed formatPersonaNotice "${name}" adConfigMalformedOnset "${REFUSED_MARKER}")" || exit 1
     split_at_marker "${label}: the onset" "${onset}"
@@ -1293,6 +1395,7 @@ refused_values_check() {
     [[ "$(count_log "${raised_m}")" == 0 ]] || fail "${label}: ${name} was raised before the leg"
 
     # The refused file; the next bot-server probe's read refuses it.
+    could_not_run_before="$(count_log "${COULD_NOT_RUN_PREFIX}")"
     t_bad="$(now_s)"
     write_ad_settings "$@"
     n_version="$(cscb_ad_count version)"
@@ -1356,6 +1459,9 @@ refused_values_check() {
     [[ "$(count_log "${raised_m}")" == 1 ]] || fail "${label}: $(count_log "${raised_m}") raise lines for ${name}, not one"
     [[ "$(count_log "${raised_any_m}")" == "$(( raised_before + 1 ))" ]] || fail "${label}: a raise line for a persona other than ${name}"
     [[ "$(count_log "${cleared}")" == 0 ]] || fail "${label}: ${name}'s outage cleared while the file was refused"
+    # The version probes inside the refusal ran: no could-not-run line.
+    [[ "$(count_log "${COULD_NOT_RUN_PREFIX}")" == "${could_not_run_before}" ]] \
+        || fail "${label}: a version re-check could not run while the file was refused: $(_scenario_scan lastline "${SLACK_STATE_DIR}/server.log" "${COULD_NOT_RUN_PREFIX}")"
     for y in "${UP_PERSONAS[@]}"; do
         n="$(post_count "${CHANNEL[${y}]}")"
         if [[ "${y}" == "${x}" ]]; then
@@ -1390,11 +1496,11 @@ refused_values_check() {
     [[ "${n}" == "${retries}" ]] || fail "${label}: ${n} refused liveness read line(s) of ${name} for ${retries} retries"
     n="$(count_log_from "${t_bad}" "${t_fix}" "$(matcher "${LIVENESS_UNKNOWN_HEAD}${KEY[${x}]}" "${LIVENESS_UNKNOWN_TAIL}")")"
     [[ "${n}" == "${retries}" ]] || fail "${label}: ${n} 'no launch; nothing counted' line(s) of ${name} for ${retries} retries"
-    n="$(count_log_from "${t_bad}" "${t_fix}" "$(matcher "${STUCK_LINE_HEAD}" "${ABORT_WORDS}")")"
+    n="$(count_log_from "${t_bad}" "${t_fix}" "${ABORT_M}")"
     [[ "${n}" == 0 ]] || fail "${label}: a stuck-launch abort while refused"
     n="$(count_log_from "${t_bad}" "${t_fix}" "$(matcher "${RELAUNCH_FAILED}")")"
     [[ "${n}" == 0 ]] || fail "${label}: a launch failure was counted while refused"
-    n="$(count_log_from "${t_bad}" "${t_fix}" "$(matcher "${READS_DEAD}")")"
+    n="$(count_log_from "${t_bad}" "${t_fix}" "${READS_DEAD_M}")"
     [[ "${n}" == 0 ]] || fail "${label}: a persona read as dead while refused"
     echo "${TEST_NAME}: ${label}: ${name} launched once and retried ${retries} times while refused, each retry's liveness read refused; one onset; no all-clear after the probe at +$(seconds_between "${t_onset}" "${t_probe}")s from the onset"
 
@@ -1408,14 +1514,11 @@ refused_values_check() {
     # The timer that launched <x> runs on in pending-only mode until a retry
     # reads its row live; the next leg starts once it has stopped, so every
     # persona already up then has no timer.
-    line="$(printed unavailableRetryStoppedLine "${KEY[${x}]}" full none "${REFUSED_MARKER}")" || exit 1
-    split_at_marker "${label}: the stop line" "${line}"
-    stopped_m="$(matcher "${HEAD%" — "}")"
+    stopped_m="$(printed unavailableRetryStoppedLine "${KEY[${x}]}" pending-only waiting "${STOP_ROW_LIVE}")" || exit 1
     wait_until "$(( RETRY_CEILING_S + LOG_WAIT_S ))" "${label}: ${name}'s retry timer did not stop after it came up" _scenario_log_has "${stopped_m}"
     echo "${TEST_NAME}: ${label}: ${name}'s retry timer: $(log_lines "${stopped_m}" | tail -n 1 | cut -c1-200)"
     wait_server_probe "${n_version}" "$(( RECHECK_S + PROBE_ALLOWANCE_S ))" "${label}: no bot-server probe after the fix"
     settle_probe "${label}: the read after the fix"
-    sleep "${PROBE_SETTLE_S}"
     [[ "$(post_count "${CHANNEL[${x}]}")" == "$(( posts_before[${x}] + 2 ))" ]] \
         || fail "${label}: $(( $(post_count "${CHANNEL[${x}]}") - posts_before[${x}] )) posts to ${name}'s channel, not the onset and one all-clear"
     post="$(posts_to "${CHANNEL[${x}]}" | tail -n 1)"
@@ -1507,8 +1610,6 @@ read -r NEED_MS NEED_VERB <<< "${NEED_TEXT}"
 WARN_LOW="$(printed buildAdCallTimeoutWarningLine "${CALL_TIMEOUT_LOW_MS}" "${TABLE_CT[@]}")" || exit 1
 WARN_HIGH="$(printed buildAdCallTimeoutWarningLine "${CALL_TIMEOUT_HIGH_MS}" "${TABLE_CT[@]}")" || exit 1
 LAUNCH_PHRASE="$(printed LAUNCH_TIMEOUT_PHRASE)" || exit 1
-FORM_CALL_TIMEOUT="$(printed launchUnavailableFormText ErrCallTimeout)" || exit 1
-FORM_TMUX_UNRESPONSIVE="$(printed launchUnavailableFormText ErrTmuxUnresponsive)" || exit 1
 [[ "${NEED_MS}" =~ ^[1-9][0-9]*$ ]] || fail "setup: adCallTimeoutNeed gave '${NEED_TEXT}', not <need-ms> <verb>"
 # The launch row's ceiling sets the need: resume, a reuse and a plain spawn
 # share it, and a tie names resume, the row's first verb (HO rev 15).
@@ -1525,11 +1626,9 @@ WARN_STEM="${WARN_LOW%%" ${CALL_TIMEOUT_LOW_MS},"*} "
 CREATE_S="$(awk -v ms="${CREATE_RAISED_MS}" 'BEGIN { printf "%.3f\n", ms / 1000 }')"
 CALL_LOW_S="$(awk -v ms="${CALL_TIMEOUT_LOW_MS}" 'BEGIN { printf "%.3f\n", ms / 1000 }')"
 CALL_HIGH_S="$(awk -v ms="${CALL_TIMEOUT_HIGH_MS}" 'BEGIN { printf "%.3f\n", ms / 1000 }')"
-# src/session-manager.ts launchUnavailableGetLine: `[slack] spawnForPersona:
-# one get after the <what> of <ref> ended in <form>: read <read>; this
-# launch's row: <yes (launch start <iso>)|no> — <outcome>; …`.
-GET_LINE_HEAD='[slack] spawnForPersona: one get after the '
-GET_LINE_OWN_PENDING=": read pending; this launch's row: yes"
+# What the line of the one get after a launch timeout calls a plain spawn
+# (src/session-manager.ts spawnForPersona, `what: 'spawn'`; no export).
+PLAIN_SPAWN_WHAT='spawn'
 
 # launch_answer_line <x> <err-name>: the matcher of persona <x>'s refusal line
 # for a launch answered <err-name> (src/session-manager.ts logRefusal, the
@@ -1538,11 +1637,20 @@ launch_answer_line() {
     matcher "${REFUSED_FOR}${REF[$1]}: $2"
 }
 
-# get_after_timeout_line <x> <form-text>: the matcher of the one get's line
-# after persona <x>'s launch timeout of that form, which read this launch's
-# pending row.
-get_after_timeout_line() {
-    matcher "${GET_LINE_HEAD}" " of ${REF[$1]} ended in $2${GET_LINE_OWN_PENDING}"
+# expect_get_after_timeout_line <step> <x> <err-name> <launch-start>: exactly
+# one server.log line is the printer's line of the one get after persona
+# <x>'s plain spawn ended in a launch timeout of the form <err-name>, the get
+# reading this launch's `pending` row with the launch start <launch-start>
+# (its `launch_started_at`, as a harness get read it), the approver started
+# (LAUNCH_UNAVAILABLE_OUTCOME_APPROVER).
+expect_get_after_timeout_line() {
+    local step="$1" x="$2" want
+    want="$(printed launchUnavailableGetLine "${REF[${x}]}" "${PLAIN_SPAWN_WHAT}" "$3" pending "$4" LAUNCH_UNAVAILABLE_OUTCOME_APPROVER)" || exit 1
+    [[ "$(count_log "${want}")" == 1 ]] || {
+        log_lines "${want%%"${REF[${x}]}"*}${REF[${x}]}" | cut -c1-400 | sed 's/^/  | got:  /' >&2
+        printf '  | want: %s\n' "${want}" >&2
+        fail "${step}: $(count_log "${want}") line(s) of the get after ${SCENARIO_TAG}_${x}'s launch timeout equal to the printer's line, not one"
+    }
 }
 
 # start_call_timeout_leg <step> <x> <call-timeout-ms>: a plain stop, the
@@ -1593,7 +1701,7 @@ approver_brought_up() {
 }
 
 leg_call_timeout_low() {
-    local step="call-timeout-30000" x=t1 line warn_t elapsed get_line t_get readings state stopped_m deadline
+    local step="call-timeout-30000" x=t1 line warn_t elapsed get_line t_get readings state start_raw stopped_m deadline
     local t prev last reads n_pending n_live first_waiting
     leg "${step}"
     readings="${SCENARIO_ROOT}/${x}-row-readings.tsv"
@@ -1612,17 +1720,22 @@ leg_call_timeout_low() {
     time_before "${warn_t}" "${T_CALL}" || fail "${step}: the warning came after the start pass's launch of T1"
     echo "${TEST_NAME}: ${step}: warning: ${line#*"${VALUES_PREFIX} "}"
 
-    # The harness reads T1's row about once a second, from its spawn until
-    # T1 is up and its retry timer has stopped (its pending-only retry read
-    # the row live).
-    line="$(printed unavailableRetryStoppedLine "${KEY[${x}]}" full none "${REFUSED_MARKER}")" || exit 1
-    split_at_marker "${step}: the stop line" "${line}"
-    stopped_m="$(matcher "${HEAD%" — "}")"
+    # The harness reads T1's row (its state and launch start) about once a
+    # second, from its spawn until T1 is up and its retry timer has stopped:
+    # the timer the launch timeout armed runs in full mode, and its retry
+    # finds T1 connected, nothing left to recover (the printer's stop line).
+    stopped_m="$(printed unavailableRetryStoppedLine "${KEY[${x}]}" full none "${STOP_RECOVERED}")" || exit 1
     : > "${readings}"
     deadline=$(( SECONDS + CALL_TIMEOUT_LOW_MS / 1000 + REPORT_WAIT_S + RETRY_CEILING_S + LOG_WAIT_S ))
     while :; do
-        state="$(row_state "${ID[${x}]}")"
-        printf '%s\t%s\n' "$(now_s)" "${state:-none}" >> "${readings}"
+        ad_capture get --claude-instance-id "${ID[${x}]}"
+        state=""
+        start_raw=""
+        if (( AD_RC == 0 )); then
+            state="$(jq -r '.state // empty' "${AD_OUT}")"
+            start_raw="$(jq -r '.launch_started_at // empty' "${AD_OUT}")"
+        fi
+        printf '%s\t%s\t%s\n' "$(now_s)" "${state:-none}" "${start_raw:-none}" >> "${readings}"
         [[ "${state}" == waiting ]] && _scenario_log_has "${stopped_m}" && break
         (( SECONDS < deadline )) || fail "${step}: T1 was not up with its retry timer stopped by the leg's bound (last read '${state}')"
         sleep 1
@@ -1644,8 +1757,10 @@ leg_call_timeout_low() {
     [[ -n "${get_line}" ]] || fail "${step}: no CSCB get of T1 after its launch timeout"
     call_fields "${step}" "${get_line}"
     t_get="${CALL_T}"
-    [[ "$(count_log "$(get_after_timeout_line "${x}" "${FORM_CALL_TIMEOUT}")")" == 1 ]] \
-        || fail "${step}: no single line of the get after T1's launch timeout reading this launch's pending row: $(log_lines "$(matcher "${GET_LINE_HEAD}" " of ${REF[${x}]} ")" | cut -c1-300)"
+    # The row's launch start as the harness last read it pending before the get.
+    start_raw="$(awk -F'\t' -v t="${t_get}" '$1 < t && $2 == "pending" { s = $3 } END { print s }' "${readings}")"
+    [[ -n "${start_raw}" && "${start_raw}" != none ]] || fail "${step}: the harness never read T1's row pending with a launch start before CSCB's get"
+    expect_get_after_timeout_line "${step}" "${x}" ErrCallTimeout "${start_raw}"
     approver_brought_up "${step}" "${x}" "${t_get}"
     echo "${TEST_NAME}: ${step}: T1's get at +$(seconds_between "${T_CALL}" "${t_get}")s read this launch's pending row; the approver brought T1 up"
 
@@ -1674,12 +1789,16 @@ leg_call_timeout_low() {
 }
 
 leg_call_timeout_high() {
-    local step="call-timeout-61000" x=t2 elapsed get_line t_get n
+    local step="call-timeout-61000" x=t2 elapsed get_line t_get n start_raw
     leg "${step}"
     start_call_timeout_leg "${step}" "${x}" "${CALL_TIMEOUT_HIGH_MS}"
     # The check runs before the start pass, so by T2's spawn any warning of
     # this start is logged.
     [[ "$(count_log "${WARN_STEM}")" == "${WARN_BEFORE}" ]] || fail "${step}: a call-timeout warning at the start with ${CALL_TIMEOUT_HIGH_MS}: $(_scenario_scan lastline "${SLACK_STATE_DIR}/server.log" "${WARN_STEM}")"
+    # The row's launch start, read with a harness get while the held create
+    # keeps it pending.
+    wait_until "${LAUNCH_WAIT_S}" "${step}: T2's row never read pending" row_state_is "${ID[${x}]}" pending
+    start_raw="$(launch_start_raw "${step}" "${ID[${x}]}")" || exit 1
 
     # The launch's answer: agent-director's launch-timeout ErrTmuxUnresponsive,
     # at least create_timeout_ms and less than the call timeout after the call.
@@ -1698,15 +1817,12 @@ leg_call_timeout_high() {
     [[ -n "${get_line}" ]] || fail "${step}: no CSCB get of T2 after its launch timeout"
     call_fields "${step}" "${get_line}"
     t_get="${CALL_T}"
-    [[ "$(count_log "$(get_after_timeout_line "${x}" "${FORM_TMUX_UNRESPONSIVE}")")" == 1 ]] \
-        || fail "${step}: no single line of the get after T2's launch timeout reading this launch's pending row: $(log_lines "$(matcher "${GET_LINE_HEAD}" " of ${REF[${x}]} ")" | cut -c1-300)"
+    expect_get_after_timeout_line "${step}" "${x}" ErrTmuxUnresponsive "${start_raw}"
     approver_brought_up "${step}" "${x}" "${t_get}"
 
     # No ErrCallTimeout for T2, and still no warning.
     n="$(count_log "$(launch_answer_line "${x}" ErrCallTimeout)")"
     [[ "${n}" == 0 ]] || fail "${step}: ${n} ErrCallTimeout answer(s) for T2"
-    n="$(count_log "$(get_after_timeout_line "${x}" "${FORM_CALL_TIMEOUT}")")"
-    [[ "${n}" == 0 ]] || fail "${step}: ${n} get line(s) after an ErrCallTimeout of T2"
     n="$(log_lines_from "${T_CALL}" "" "$(matcher ErrCallTimeout)" | grep -c -F -e "${REF[${x}]}" -e "persona=${KEY[${x}]} " || true)"
     [[ "${n}" == 0 ]] || fail "${step}: ${n} server.log line(s) for T2 name ErrCallTimeout"
     [[ "$(count_log "${WARN_STEM}")" == "${WARN_BEFORE}" ]] || fail "${step}: a call-timeout warning after the start with ${CALL_TIMEOUT_HIGH_MS}"

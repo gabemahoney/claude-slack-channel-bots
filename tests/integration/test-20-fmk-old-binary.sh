@@ -18,7 +18,7 @@
 # front of tmux for every CSCB process, in `log` mode; the Slack stub
 # (fixtures/slack-stub-server.ts --record), which records each
 # chat.postMessage text whole. agent-director runs at its default settings:
-# the scenario HOME's agent-director config.toml carries no [tmux] table
+# the scenario HOME's agent-director settings file carries no [tmux] table
 # (b.jg5 SRJ-1401; set-up fails if it does). One persona, P (`t20_p`,
 # instance `cscb_t20_p`, one channel), whose working directory selects the
 # stub worker's `at-once` mode (it reports in with no dialog). Server-wide:
@@ -93,8 +93,9 @@
 #        could-not-run line (its prefix
 #        AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX) naming
 #        ErrSystemInstallNotFound, and no probe while hidden. Unparseable:
-#        the shim comes back with the unparseable stand-in behind it; at the
-#        next bot-server probe still exactly one line, the server running.
+#        the shim comes back with the unparseable stand-in behind it (a
+#        harness `version` call through it exits 0 and reads no version); at
+#        the next bot-server probe still exactly one line, the server running.
 #        Recovery: the release back; at the next probe (a pass) still one
 #        line, the server running.
 #   8c   0.10.0 swapped in (the time taken); the server exits within
@@ -126,9 +127,10 @@
 #        Same version: over the next timed re-check, no further launch and
 #        no second post. Version change: the release goes back; at the next
 #        timed re-check exactly one CSCB reuse spawn for P succeeds and P
-#        reads `waiting`; still one alert, no delete. While the hold lasts:
-#        no CSCB plain spawn, resume, delete or kill for P and no tmux
-#        session for P.
+#        reads `waiting`; still one alert, no delete. While the hold lasts,
+#        from the rejected reuse spawn (its shim line's time) to the timed
+#        re-check that read the new version: no CSCB kill, kill-finished,
+#        pause, delete, spawn or resume, and no tmux session for P.
 #   8e   the server stopped, P's row finished again (as in 8d, once P's new
 #        session is past the starting-session bound), the tmux shim in
 #        `fail-create`. Start on the release: the gate passes (the bot
@@ -140,10 +142,10 @@
 #        (hatch gap: if it is not, the script fails saying so and the build
 #        stops and reports); that rejected spawn is directly followed by a bot-server
 #        probe, with no other probe between the swap and it; the server exits
-#        with exactly one more entry, equal to the runtime form for
-#        OLD_VERSION, all less than RECHECK_S after the gate; no CSCB kill,
-#        kill-finished, delete or pause follows, and P's row (read with the
-#        release back) stays finished.
+#        with its re-check shutdown line and exactly one more entry, equal to
+#        the runtime form for OLD_VERSION, all less than RECHECK_S after the
+#        gate; no CSCB kill, kill-finished, delete or pause follows, and P's
+#        row (read with the release back) stays finished.
 #   23a  the server stopped, P's row finished (from 8e); the stand-in
 #        reporting PASSING_VERSION (the floor's `<floor>-rc.N` form) goes
 #        behind the shim in `pass` mode, and a harness `version` call reads
@@ -180,6 +182,7 @@
 #   RUNTIME_PHRASE       RUNTIME_RECHECK_PHRASE            src/ad-version-gate.ts
 #   RECHECK_S            AD_VERSION_RECHECK_INTERVAL_MS / 1000
 #                                                          src/ad-version-gate.ts
+#   RECHECK_STOP_EXIT    AD_VERSION_RECHECK_STOP_EXIT_CODE src/ad-version-gate.ts
 #   COULD_NOT_RUN_PREFIX AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX
 #                                                          src/ad-version-gate.ts
 #   ALERT_TEXT           INVALID_FLAGS_HOLD_ALERT_TEXT     src/invalid-flags-hold.ts
@@ -190,6 +193,8 @@
 #                                                          src/ad-settings.ts
 #   AD_STOPPING_WINDOW_S DEFAULT_AD_SETTINGS tmux stopping_window_seconds
 #                                                          src/ad-settings.ts
+#   the settings file    AD_SETTINGS_RELATIVE_PATH (under HOME), AD_TMUX_TABLE
+#   and its [tmux] table                                   src/ad-settings.ts
 #   DEV_SENTINEL         CLIENT_DEV_SENTINEL_VERSION       src/ad-version-gate.ts
 #   UNREACHABLE_LABEL    AD_SYSTEM_INSTALL_UNREACHABLE     src/install-check-labels.ts
 #   UNPARSEABLE_REASON   UNREACHABLE_REASON_UNPARSEABLE_VERSION
@@ -204,7 +209,9 @@
 # shim), read with realpath. The daemon is not this script's child, so its
 # exit status is read from the CLI's start report (8a) or, for a re-check
 # stop (8c, 8e), from its shutdown line naming the re-check, the one path
-# that exits with AD_VERSION_RECHECK_STOP_EXIT_CODE.
+# that exits with AD_VERSION_RECHECK_STOP_EXIT_CODE; set-up checks that the
+# printer's RECHECK_STOP_EXIT is non-zero, so that line stands for a
+# non-zero exit.
 #
 # Hatch decisions (the Epic's "Hatch gap"):
 # - scenario 8's server effects come from the server's own reuse spawn of P
@@ -257,6 +264,11 @@ INVALID_FLAGS_CLASS="$(bun "${TEXTS}" classifyAdError ErrInvalidFlags)" || fail 
 [[ "${RECHECK_MS}" =~ ^[0-9]+$ ]] && (( RECHECK_MS > 0 && RECHECK_MS % 1000 == 0 )) \
     || fail "setup: AD_VERSION_RECHECK_INTERVAL_MS '${RECHECK_MS}' is not a whole number of seconds"
 RECHECK_S=$(( RECHECK_MS / 1000 ))
+# The re-check's stop exits with this status, its shutdown line the one
+# path that does; non-zero, so that line stands for a non-zero exit.
+RECHECK_STOP_EXIT="$(bun "${TEXTS}" AD_VERSION_RECHECK_STOP_EXIT_CODE)" || fail "setup: fmk-texts AD_VERSION_RECHECK_STOP_EXIT_CODE"
+[[ "${RECHECK_STOP_EXIT}" =~ ^[1-9][0-9]*$ ]] \
+    || fail "setup: AD_VERSION_RECHECK_STOP_EXIT_CODE '${RECHECK_STOP_EXIT}' is not a non-zero exit status"
 # agent-director's default starting-session bound and stopping window, in
 # seconds, as CSCB records them; the session age the harness's finishing
 # steps wait for (past both).
@@ -289,8 +301,9 @@ UNREACHABLE_LABEL="$(bun "${TEXTS}" AD_SYSTEM_INSTALL_UNREACHABLE)" || fail "set
 UNPARSEABLE_REASON="$(bun "${TEXTS}" UNREACHABLE_REASON_UNPARSEABLE_VERSION)" \
     || fail "setup: fmk-texts UNREACHABLE_REASON_UNPARSEABLE_VERSION"
 
-# The installed package under test (as fmk-texts.ts and fmk-driver.ts read it).
-CSCB_PKG="${SCENARIO_REPO}/node_modules/claude-slack-channel-bots"
+# The installed package under test: lib/scenario.sh's CSCB_PKG_DIR, which
+# fmk-texts.ts and fmk-driver.ts read.
+CSCB_PKG="${CSCB_PKG_DIR}"
 
 # The release's identity, recorded in the image (docker/Dockerfile.test.base).
 AD_RELEASE_JSON=/opt/agent-director/client/release.json
@@ -410,10 +423,7 @@ wait_server_probe() {
         (( left > 0 )) || left=0
         line="$(wait_for_cscb_ad_call "${n}" "${left}" "${step}" version)" || exit 1
         call_fields "${step}" "${line}"
-        if [[ "${CALL_PPID}" == "${SERVER_PID}" ]]; then
-            SERVER_PROBE_LINE="${line}"
-            return 0
-        fi
+        [[ "${CALL_PPID}" == "${SERVER_PID}" ]] && return 0
         n=$(( n + 1 ))
     done
 }
@@ -454,6 +464,15 @@ cscb_calls_before() {
     local t="$1"
     shift
     cscb_ad_calls "$@" | awk -F'\t' -v t="${t}" '$2 < t' | wc -l | tr -d ' '
+}
+
+# cscb_calls_strictly_between <from> <to> <verb> [<fragment>...]: how many of
+# CSCB's calls matching <verb> and the fragments were made after <from> and
+# before <to>.
+cscb_calls_strictly_between() {
+    local a="$1" b="$2"
+    shift 2
+    cscb_ad_calls "$@" | awk -F'\t' -v a="${a}" -v b="${b}" '$2 > a && $2 < b' | wc -l | tr -d ' '
 }
 
 next_cscb_line_exists() {
@@ -731,10 +750,16 @@ read_client_package_version() {
 # ---------------------------------------------------------------------------
 
 # agent-director's default settings: no [tmux] table in the scenario HOME's
-# config.toml (b.jg5 SRJ-1401).
-AD_CONFIG="${HOME}/.agent-director/config.toml"
-if [[ -e "${AD_CONFIG}" ]] && grep -Eq '^[[:space:]]*\[[[:space:]]*tmux[[:space:]]*\]' "${AD_CONFIG}"; then
-    fail "setup: ${AD_CONFIG} carries a [tmux] table; scenario 8 runs at agent-director's default settings"
+# settings file (b.jg5 SRJ-1401), at the package's AD_SETTINGS_RELATIVE_PATH
+# under HOME, the table named as the package's AD_TMUX_TABLE.
+AD_SETTINGS_REL="$(bun "${TEXTS}" AD_SETTINGS_RELATIVE_PATH)" || fail "setup: fmk-texts AD_SETTINGS_RELATIVE_PATH"
+TMUX_TABLE="$(bun "${TEXTS}" AD_TMUX_TABLE)" || fail "setup: fmk-texts AD_TMUX_TABLE"
+[[ -n "${AD_SETTINGS_REL}" && "${AD_SETTINGS_REL}" != /* ]] \
+    || fail "setup: the package's AD_SETTINGS_RELATIVE_PATH '${AD_SETTINGS_REL}' is not a relative path"
+[[ "${TMUX_TABLE}" =~ ^[a-z_]+$ ]] || fail "setup: the package's AD_TMUX_TABLE '${TMUX_TABLE}' is not a TOML bare key"
+AD_CONFIG="${HOME}/${AD_SETTINGS_REL}"
+if [[ -e "${AD_CONFIG}" ]] && grep -Eq "^[[:space:]]*\[[[:space:]]*${TMUX_TABLE}[[:space:]]*\]" "${AD_CONFIG}"; then
+    fail "setup: ${AD_CONFIG} carries a [${TMUX_TABLE}] table; scenario 8 runs at agent-director's default settings"
 fi
 AD_BIN_PATH="$(realpath -e -- "${SCENARIO_AD_BIN}")" || fail "setup: cannot resolve ${SCENARIO_AD_BIN}"
 
@@ -816,6 +841,10 @@ pid_alive "${SERVER_PID}" || fail "8b not found: the server stopped"
 
 # Unparseable.
 restore_ad_install_with_stand_in unparseable pass "8b: the shim back with the unparseable stand-in"
+ad_capture version
+(( AD_RC == 0 )) || fail "8b unparseable: a harness version call through the stand-in exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
+! jq -e '.version' "${AD_OUT}" > /dev/null 2>&1 \
+    || fail "8b unparseable: a harness version call through the stand-in reads a version: $(head -c 300 "${AD_OUT}")"
 wait_server_probe "${n_version}" "${RECHECK_WAIT_S}" "8b unparseable: no bot-server probe"
 settle_probe "8b unparseable"
 expect_count "${COULD_NOT_RUN_PREFIX}" "$(( cnr + 1 ))" "8b unparseable: a second could-not-run line in one run"
@@ -907,6 +936,8 @@ start_server --live
 wait_server_probe "${n_version}" "${GATE_WAIT_S}" "8d: the startup gate's probe"
 reuse_line="$(wait_for_cscb_ad_call "${n_reuse}" "${REPORT_WAIT_S}" "8d: no reuse spawn of P at the start pass" spawn --reuse-finished)"
 call_fields "8d hold" "${reuse_line}"
+# The hold begins at the rejected reuse spawn.
+T_HOLD="${CALL_T}"
 [[ "${CALL_PPID}" == "${SERVER_PID}" ]] || fail "8d hold: the reuse spawn's parent is ${CALL_PPID}, not the bot server"
 expect_directly_followed_by_probe "8d hold" "${reuse_line}"
 settle_probe "8d hold"
@@ -943,9 +974,12 @@ n_version="$(cscb_ad_count version)"
 swap_ad_binary release "8d: the release back behind the shim"
 wait_server_probe "${n_version}" "${RECHECK_WAIT_S}" "8d version change: no timed bot-server probe"
 T_CHANGE="${CALL_T}"
+# From the rejected reuse spawn to the re-check that read the new version:
+# no CSCB call of a TOUCH_VERBS verb (every CSCB call is P's).
 for verb in "${TOUCH_VERBS[@]}"; do
-    [[ "$(cscb_calls_before "${T_CHANGE}" "${verb}")" == "${touch_hold[${verb}]}" ]] \
-        || fail "8d version change: CSCB made a ${verb} call while the hold lasted (before the re-check that read the new version)"
+    n="$(cscb_calls_strictly_between "${T_HOLD}" "${T_CHANGE}" "${verb}")"
+    [[ "${n}" == 0 ]] \
+        || fail "8d version change: CSCB made ${n} ${verb} call(s) while the hold lasted (after the rejected reuse spawn, before the re-check that read the new version)"
 done
 wait_for_cscb_ad_call "$(( n_reuse + 1 ))" 30 "8d version change: no reuse spawn of P after the hold ended" spawn --reuse-finished > /dev/null
 wait_until "${REPORT_WAIT_S}" "8d version change: P never reported in (waiting)" row_state_is "${P_ID}" waiting
@@ -971,6 +1005,7 @@ n_reuse="$(cscb_ad_count spawn --reuse-finished)"
 n_version="$(cscb_ad_count version)"
 entries_before="$(floor_entries_any)"
 same_before="$(floor_entries "${MSG_RUNTIME}")"
+shutdown_before="$(count_log "${RECHECK_SHUTDOWN_LINE}")"
 failed_before="$(count_log "${REUSE_FAILED_FRAGMENT}")"
 start_server --live
 wait_server_probe "${n_version}" "${GATE_WAIT_S}" "8e: the startup gate's probe"
@@ -1016,6 +1051,7 @@ echo "${TEST_NAME}: 8e: the server exited $(seconds_between "${T_GATE}" "${T_EXI
 awk -v a="$(seconds_between "${T_GATE}" "${T_EXIT}")" -v b="${RECHECK_S}" 'BEGIN { exit !(a < b) }' \
     || fail "8e: the server exited $(seconds_between "${T_GATE}" "${T_EXIT}")s after the gate, not less than ${RECHECK_S}s"
 _scenario_cscb_after || fail "8e: could not update the CSCB process record"
+expect_count "${RECHECK_SHUTDOWN_LINE}" "$(( shutdown_before + 1 ))" "8e: the re-check's shutdown line"
 expect_one_floor_entry "8e" "${MSG_RUNTIME}" "${same_before}" "${entries_before}"
 expect_counts_unchanged "8e: after the stop" touch_8e kill kill-finished delete pause
 swap_ad_binary release "8e: the release back behind the shim"

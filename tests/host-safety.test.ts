@@ -51,7 +51,11 @@
  *   `install_ad_stand_in`, `restore_ad_install_with_stand_in` and
  *   `write_ad_settings` call `require_scenario_home` before their first
  *   sqlite3, copy, move or install step, a call of a scenario.sh function
- *   that makes one (such as `_scenario_place`) counting as one. Shell is read
+ *   that makes one (such as `_scenario_place`) counting as one; and
+ *   scenario.sh's settings writers resolve their directory with `realpath -e`
+ *   (the SCENARIO_ROOT containment check) before they write there:
+ *   `write_ad_settings` before its `rm` and its `mkdir`,
+ *   `_scenario_stand_in_settings` before its `write_file`. Shell is read
  *   with comments, heredoc bodies and quoted text blanked; the shebang,
  *   comments, blank lines, `set` options and literal assignments are not
  *   steps. Each rule is pinned with synthetic violations (each finding names
@@ -1671,6 +1675,8 @@ const IMAGE_GUARD_RULE = {
   sourceFirst: 'source-line-first',
   /** The HOME-under-SCENARIO_ROOT check comes before the helper's first sqlite3, copy, move or install step. */
   homeCheckFirst: 'home-check-before-step',
+  /** A settings writer resolves its directory under SCENARIO_ROOT (`realpath -e`) before it removes, creates or writes there. */
+  realpathCheckFirst: 'realpath-check-before-write',
   /** fmk-driver.ts, stub-mcp-session.ts and fmk-texts.ts statically import only `node:` built-ins. */
   driverStaticImport: 'driver-static-import',
 } as const
@@ -2146,6 +2152,43 @@ function helperHomeCheckFindings(file: string, source: string, helpers: readonly
   return findings
 }
 
+/**
+ * scenario.sh's settings writers, each with the directory word its
+ * `realpath -e` check resolves and the commands that check must come before:
+ * `write_ad_settings` removes the settings file or creates its directory;
+ * `_scenario_stand_in_settings` writes the stand-in's settings.
+ */
+const REALPATH_CHECKED_WRITERS: readonly { helper: string; dir: string; steps: readonly string[] }[] = [
+  { helper: 'write_ad_settings', dir: '${dir}', steps: ['rm', 'mkdir'] },
+  { helper: '_scenario_stand_in_settings', dir: '${bin}', steps: ['write_file'] },
+]
+
+/**
+ * The containment-check findings of the settings writers in the shell file
+ * `file`: in each, a `realpath -e` of its directory word comes before the
+ * first of each of its steps. A writer, or a step, the audit cannot find is a
+ * finding too.
+ */
+function realpathCheckFindings(file: string, source: string): string[] {
+  const functions = shellFunctions(source)
+  const findings: string[] = []
+  const rule = IMAGE_GUARD_RULE.realpathCheckFirst
+  for (const { helper, dir, steps } of REALPATH_CHECKED_WRITERS) {
+    const body = functions.get(helper)
+    if (body === undefined) {
+      findings.push(`${file}:1: ${rule}: ${helper} is not defined`)
+      continue
+    }
+    const check = body.findIndex((c) => c.name === 'realpath' && c.args.includes('-e') && c.args.includes(dir))
+    for (const name of steps) {
+      const at = body.findIndex((c) => c.name === name)
+      if (at < 0) findings.push(`${file}:1: ${rule}: ${helper} has no \`${name}\` the audit can see`)
+      else if (check < 0 || check > at) findings.push(`${file}:${body[at].line}: ${rule}: ${helper}: \`${name}\` runs before the realpath -e check of ${dir}`)
+    }
+  }
+  return findings
+}
+
 /** Whether `statement` is the driver's marker check: `if (!existsSync('/etc/cscb-ci-image'))` (existsSync from `node:fs`) whose branch calls `process.exit` with a non-zero literal. */
 function isDriverMarkerCheck(statement: ts.Statement, sf: ts.SourceFile): boolean {
   if (!ts.isIfStatement(statement)) return false
@@ -2399,6 +2442,28 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
 
       expect(unguarded).not.toBe(source)
       expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, HOME_GUARDED_AD_SETTINGS_HELPERS), 'scenario.sh', RULE.homeCheckFirst)
+    })
+
+    test('the current tree: write_ad_settings and _scenario_stand_in_settings resolve their directory under SCENARIO_ROOT before they remove, create or write', () => {
+      expect(realpathCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'))).toEqual([])
+    })
+
+    test('write_ad_settings with its directory check only after the mkdir is flagged at its rm and its mkdir', () => {
+      const source = readFileSync(SCENARIO_PATH, 'utf-8')
+      const late = source.replace(/(\nwrite_ad_settings\(\) \{\n(?:.*\n)*?)    if \[\[ -e "\$\{dir\}" \|\| -L "\$\{dir\}" \]\]; then\n(?:.*\n)*?    fi\n/, '$1')
+      const findings = realpathCheckFindings('scenario.sh', late)
+
+      expect(late).not.toBe(source)
+      expectNamedFindings(findings, 'scenario.sh', RULE.realpathCheckFirst)
+      expect(findings.filter((f) => f.includes('write_ad_settings'))).toHaveLength(2)
+    })
+
+    test('_scenario_stand_in_settings without its realpath -e check is flagged at its write_file', () => {
+      const source = readFileSync(SCENARIO_PATH, 'utf-8')
+      const unchecked = source.replace(/(\n_scenario_stand_in_settings\(\) \{\n(?:.*\n)*?)    real_bin="\$\(realpath -e -- "\$\{bin\}"[^\n]*\n/, '$1')
+
+      expect(unchecked).not.toBe(source)
+      expectNamedFindings(realpathCheckFindings('scenario.sh', unchecked), 'scenario.sh', RULE.realpathCheckFirst)
     })
 
     test('stub_mode without its require_scenario_home is flagged at its move', () => {

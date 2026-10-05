@@ -48,7 +48,8 @@
  * ------------
  *   CSCB_PKG_DIR   the installed package (default
  *                  /test-repo/node_modules/claude-slack-channel-bots), as
- *                  `driver.ts` and `fmk-driver.ts` read it; the agent-director
+ *                  `driver.ts` and `fmk-driver.ts` read it; lib/scenario.sh
+ *                  exports it as the package under test; the agent-director
  *                  client is the one that package resolves, as `fmk-driver.ts`
  *                  resolves it
  *
@@ -137,8 +138,6 @@
  *                                                slow pace from G, in decimal
  *   STARTUP_ERROR_SPAWN_FAILED                   src/session-manager.ts, the startup-errors
  *                                                label of a launch failure
- *   LIVE_ROW_SEQUENCE_LOG_PREFIX                 src/live-row-sequence.ts, the prefix of the
- *                                                live-row sequence's lines
  *   liveRowSequenceWaitArmedLine <persona-ref> <launch-start-ms> <grace-ms>
  *                                                src/live-row-sequence.ts: the step-2 wait's
  *                                                armed line for the persona <persona-ref> (as
@@ -218,11 +217,44 @@
  *                                                ceiling sets it, for the values in effect
  *                                                built as for adGraceMs
  *   LAUNCH_TIMEOUT_PHRASE                        src/ad-description-phrases.ts
- *   launchUnavailableFormText <err-name>         src/session-manager.ts: how the line of the one
- *                                                get after a launch timeout names the timeout's
- *                                                form <err-name>, the value of one of
- *                                                src/ad-error-class.ts's LAUNCH_TIMEOUT_FORM_…
- *                                                exports
+ *   AD_VERSION_RECHECK_STOP_EXIT_CODE            src/ad-version-gate.ts, the exit status of the
+ *                                                runtime re-check's stop, in decimal
+ *   launchUnavailableGetLine <persona-ref> <what> <err-name> <read> <launch-start|no> <outcome-export>
+ *                                                src/session-manager.ts: the line of the one get
+ *                                                after the <what> of <persona-ref> ended in a
+ *                                                launch timeout of the form <err-name> (the
+ *                                                value of one of src/ad-error-class.ts's
+ *                                                LAUNCH_TIMEOUT_FORM_… exports, named as
+ *                                                launchUnavailableFormText names it), the get
+ *                                                reading <read>; this launch's row has the
+ *                                                launch start <launch-start>, the row's
+ *                                                `launch_started_at` as agent-director wrote it,
+ *                                                read with src/pending-row.ts parseLaunchStart
+ *                                                (`no`: not this launch's row); the outcome the
+ *                                                package exports as <outcome-export> (a
+ *                                                `LAUNCH_UNAVAILABLE_OUTCOME_…` name)
+ *   UNAVAILABLE_RETRY_STOP_ROW_LIVE              src/unavailable-retry.ts, a stop's reason when a
+ *                                                pending-only retry reads the row live
+ *   UNAVAILABLE_RETRY_STOP_RECOVERED             src/unavailable-retry.ts, a stop's reason when a
+ *                                                retry finds nothing left to recover
+ *   stuckLaunchAbortStartedLine <persona-key> <persona-ref> <launch-start>
+ *                                                src/pending-row.ts: the stuck-launch abort's
+ *                                                start line; <launch-start> as a row's
+ *                                                `launch_started_at` (the line renders it)
+ *   reprobeDeadLine <persona-key>                src/restart.ts: the line of a row the re-probe
+ *                                                reads dead
+ *   liveRowSequenceStartLine <persona-ref> <entry-step-export> <instance-id> <last-read> <launch|no-launch> <alert-context>
+ *                                                src/live-row-sequence.ts: the live-row
+ *                                                sequence's start line, entered at the step the
+ *                                                package exports as <entry-step-export> (a
+ *                                                `LIVE_ROW_SEQUENCE_ENTRY_…` name), ending in a
+ *                                                launch or not
+ *   RELOAD_APPLIED                               src/reload-apply.ts, the class label of an
+ *                                                applied reload's line
+ *
+ * A builder entry given a marker argument (a key, a reference, a state or a
+ * description the scenario chooses) prints a line whose text around the
+ * marker is the line's fixed part; the scenario splits it there.
  *
  * In every `<key>=<integer>` argument <key> is one of the package's
  * AD_TMUX_KEYS and <integer> an integer in decimal; an unknown key, a key
@@ -849,21 +881,98 @@ const callTimeoutNeed: Entry = {
 const LAUNCH_TIMEOUT_FORM_EXPORTS = ['LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT', 'LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE'] as const
 
 /**
- * `launchUnavailableFormText(<form>, '')`: how the launch-timeout get line
- * names a launch timeout of the form <err-name>, which must be the value of
- * one of the package's LAUNCH_TIMEOUT_FORM_… exports.
+ * `launchUnavailableFormText(<form>, '')` for entry `entry`: how the
+ * launch-timeout get line names a launch timeout of the form `errName`,
+ * which must be the value of one of the package's LAUNCH_TIMEOUT_FORM_…
+ * exports (a usage failure otherwise).
  */
-const launchTimeoutFormText: Entry = {
-  synopsis: '<err-name>',
+async function launchTimeoutFormTextOf(entry: string, errName: string, context: EntryContext): Promise<string> {
+  const forms: string[] = []
+  for (const name of LAUNCH_TIMEOUT_FORM_EXPORTS) forms.push(await packageString(context, 'ad-error-class.ts', name))
+  if (!forms.includes(errName)) usageFail(`${entry}: '${errName}' is not one of the package's launch-timeout forms (${forms.join(', ')})`)
+  const build = await packageFunction<(form: string, failure: string) => unknown>(context, 'session-manager.ts', 'launchUnavailableFormText')
+  return builtString('launchUnavailableFormText', build(errName, ''))
+}
+
+/**
+ * `launchUnavailableGetLine(<persona-ref>, <what>, <the form text of <err-name>>, <read>,
+ * <this launch's row>, <the package's <outcome-export>>)`: the line of the one
+ * `get` after a launch timeout. <launch-start> is the row's
+ * `launch_started_at` as agent-director wrote it, read as the package reads
+ * it (src/pending-row.ts parseLaunchStart), for this launch's row; `no` for
+ * none. <outcome-export> is a `LAUNCH_UNAVAILABLE_OUTCOME_…` name of
+ * src/session-manager.ts.
+ */
+const launchUnavailableGetLine: Entry = {
+  synopsis: '<persona-ref> <what> <err-name> <read> <launch-start|no> <outcome-export>',
   async print(args, context) {
-    const entry = 'launchUnavailableFormText'
-    expectArguments(entry, args, ['err-name'])
-    const [errName] = args
-    const forms: string[] = []
-    for (const name of LAUNCH_TIMEOUT_FORM_EXPORTS) forms.push(await packageString(context, 'ad-error-class.ts', name))
-    if (!forms.includes(errName)) usageFail(`${entry}: '${errName}' is not one of the package's launch-timeout forms (${forms.join(', ')})`)
-    const build = await packageFunction<(form: string, failure: string) => unknown>(context, 'session-manager.ts', entry)
-    return builtString(entry, build(errName, ''))
+    const entry = 'launchUnavailableGetLine'
+    expectArguments(entry, args, ['persona-ref', 'what', 'err-name', 'read', 'launch-start|no', 'outcome-export'])
+    const [ref, what, errName, read, launchStart, outcomeExport] = args
+    if (!/^LAUNCH_UNAVAILABLE_OUTCOME_[A-Z_]+$/.test(outcomeExport)) usageFail(`${entry}: <outcome-export> '${outcomeExport}' is not a LAUNCH_UNAVAILABLE_OUTCOME_… name`)
+    const form = await launchTimeoutFormTextOf(entry, errName, context)
+    const outcome = await packageString(context, 'session-manager.ts', outcomeExport)
+    let thisLaunchRow: { readonly launchStartMs: number } | undefined
+    if (launchStart !== 'no') {
+      const parse = await packageFunction<(raw: unknown) => unknown>(context, 'pending-row.ts', 'parseLaunchStart')
+      const launchStartMs = parse(launchStart)
+      if (typeof launchStartMs !== 'number' || !Number.isFinite(launchStartMs)) usageFail(`${entry}: <launch-start> '${launchStart}' is not a launch start the package parses`)
+      thisLaunchRow = { launchStartMs }
+    }
+    const build = await packageFunction<(ref: string, what: string, form: string, read: string, row: object | undefined, outcome: string) => unknown>(
+      context,
+      'session-manager.ts',
+      entry,
+    )
+    return builtString(entry, build(ref, what, form, read, thisLaunchRow, outcome))
+  },
+}
+
+/** `stuckLaunchAbortStartedLine(<persona-key>, <persona-ref>, <launch-start>)`: the stuck-launch abort's start line. */
+const abortStartedLine: Entry = {
+  synopsis: '<persona-key> <persona-ref> <launch-start>',
+  async print(args, context) {
+    const entry = 'stuckLaunchAbortStartedLine'
+    expectArguments(entry, args, ['persona-key', 'persona-ref', 'launch-start'])
+    const [key, ref, launchStart] = args
+    const build = await packageFunction<(key: string, ref: string, launchStart: unknown) => unknown>(context, 'pending-row.ts', entry)
+    return builtString(entry, build(key, ref, launchStart))
+  },
+}
+
+/** `reprobeDeadLine(<persona-key>)`: the re-probe's line of a row that reads dead. */
+const deadReprobeLine: Entry = {
+  synopsis: '<persona-key>',
+  async print(args, context) {
+    const entry = 'reprobeDeadLine'
+    expectArguments(entry, args, ['persona-key'])
+    const build = await packageFunction<(key: string) => unknown>(context, 'restart.ts', entry)
+    return builtString(entry, build(args[0]))
+  },
+}
+
+/** The printer's words for a live-row sequence's launch form: `launches` true or false. */
+const SEQUENCE_LAUNCH_FORMS: Readonly<Record<string, boolean>> = { launch: true, 'no-launch': false }
+
+/**
+ * `liveRowSequenceStartLine(<persona-ref>, <request>)`: the live-row
+ * sequence's start line, the request holding the fields the line names: the
+ * entry step the package exports as <entry-step-export> (a
+ * `LIVE_ROW_SEQUENCE_ENTRY_…` name), <instance-id>, <last-read>, the launch
+ * form and <alert-context>.
+ */
+const sequenceStartLine: Entry = {
+  synopsis: '<persona-ref> <entry-step-export> <instance-id> <last-read> <launch|no-launch> <alert-context>',
+  async print(args, context) {
+    const entry = 'liveRowSequenceStartLine'
+    expectArguments(entry, args, ['persona-ref', 'entry-step-export', 'instance-id', 'last-read', 'launch|no-launch', 'alert-context'])
+    const [ref, stepExport, instanceId, lastReadState, form, alertContext] = args
+    if (!/^LIVE_ROW_SEQUENCE_ENTRY_[A-Z_]+$/.test(stepExport)) usageFail(`${entry}: <entry-step-export> '${stepExport}' is not a LIVE_ROW_SEQUENCE_ENTRY_… name`)
+    if (!Object.hasOwn(SEQUENCE_LAUNCH_FORMS, form)) usageFail(`${entry}: the launch form must be launch or no-launch (got '${form}')`)
+    const entryStep = await packageExport(context, 'live-row-sequence.ts', stepExport)
+    if (typeof entryStep !== 'number') fail(PRINTER_FAIL_EXIT, `the installed package's src/live-row-sequence.ts export ${stepExport} is a ${typeof entryStep}, not a number`)
+    const build = await packageFunction<(ref: string, request: object) => unknown>(context, 'live-row-sequence.ts', entry)
+    return builtString(entry, build(ref, { instanceId, lastReadState, entryStep, launches: SEQUENCE_LAUNCH_FORMS[form], alertContext }))
   },
 }
 
@@ -905,7 +1014,6 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   DIALOG_POLL_INTERVAL_MS: constantEntry('session-manager.ts', 'DIALOG_POLL_INTERVAL_MS'),
   DIALOG_SLOW_POLL_INTERVAL_MS: constantEntry('session-manager.ts', 'DIALOG_SLOW_POLL_INTERVAL_MS'),
   STARTUP_ERROR_SPAWN_FAILED: constantEntry('session-manager.ts', 'STARTUP_ERROR_SPAWN_FAILED'),
-  LIVE_ROW_SEQUENCE_LOG_PREFIX: constantEntry('live-row-sequence.ts', 'LIVE_ROW_SEQUENCE_LOG_PREFIX'),
   liveRowSequenceWaitArmedLine: liveRowWaitArmedLine,
   liveRowSequenceWaitEndedLine: liveRowWaitEndedLine,
   liveRowSequenceRunLine: liveRowRunLine,
@@ -926,7 +1034,16 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   buildAdCallTimeoutWarningLine: callTimeoutWarningLine,
   adCallTimeoutNeed: callTimeoutNeed,
   LAUNCH_TIMEOUT_PHRASE: constantEntry('ad-description-phrases.ts', 'LAUNCH_TIMEOUT_PHRASE'),
-  launchUnavailableFormText: launchTimeoutFormText,
+  // Scenario 8's re-check stop (test-20-fmk-old-binary.sh).
+  AD_VERSION_RECHECK_STOP_EXIT_CODE: constantEntry('ad-version-gate.ts', 'AD_VERSION_RECHECK_STOP_EXIT_CODE'),
+  // Scenario 24's lines with exported builders (test-26-fmk-timing-settings.sh).
+  launchUnavailableGetLine: launchUnavailableGetLine,
+  UNAVAILABLE_RETRY_STOP_ROW_LIVE: constantEntry('unavailable-retry.ts', 'UNAVAILABLE_RETRY_STOP_ROW_LIVE'),
+  UNAVAILABLE_RETRY_STOP_RECOVERED: constantEntry('unavailable-retry.ts', 'UNAVAILABLE_RETRY_STOP_RECOVERED'),
+  stuckLaunchAbortStartedLine: abortStartedLine,
+  reprobeDeadLine: deadReprobeLine,
+  liveRowSequenceStartLine: sequenceStartLine,
+  RELOAD_APPLIED: constantEntry('reload-apply.ts', 'RELOAD_APPLIED'),
 }
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */

@@ -32,6 +32,9 @@
 # What sourcing does, in both modes:
 # - refuses outside a cscb-ci image (above);
 # - sets TEST_NAME from the script's file name when the script did not;
+# - exports CSCB_PKG_DIR, the installed package under test
+#   (`$SCENARIO_REPO/node_modules/claude-slack-channel-bots`), which the value
+#   printer and the drivers read;
 # - makes the scenario's scratch root (SCENARIO_ROOT, `mktemp -d` under /tmp,
 #   exported, so every process the scenario starts carries it in its
 #   environment) and a first state dir under it, exported as SLACK_STATE_DIR,
@@ -337,7 +340,9 @@
 #                                      <key> that is not a TOML bare key of lowercase letters, digits
 #                                      and `_`, a key given twice, an empty <value> or one holding a
 #                                      control character, and refuses a settings directory that
-#                                      resolves outside SCENARIO_ROOT or a settings path that is not a
+#                                      resolves outside SCENARIO_ROOT (checked, when the directory
+#                                      exists, before the file is removed or the directory created,
+#                                      and again once it is created) or a settings path that is not a
 #                                      regular file. Reads the file back and fails unless it holds
 #                                      exactly what was written; sets AD_SETTINGS_FILE to its path.
 #                                      `_scenario_ad_tmux_setting`, the stub's re-fire and
@@ -792,6 +797,10 @@ fi
 # The installed CLI (Test 1 installs the package into /test-repo).
 SCENARIO_REPO="${SCENARIO_REPO:-/test-repo}"
 SCENARIO_CLI="${SCENARIO_CLI:-${SCENARIO_REPO}/node_modules/.bin/claude-slack-channel-bots}"
+
+# The installed package under test, as the value printer (fixtures/fmk-texts.ts)
+# and the drivers (fixtures/driver.ts, fixtures/fmk-driver.ts) read it.
+export CSCB_PKG_DIR="${SCENARIO_REPO}/node_modules/claude-slack-channel-bots"
 
 # Poll interval of every wait, in seconds.
 SCENARIO_POLL_S="0.2"
@@ -2137,15 +2146,20 @@ restore_ad_install() {
 # write the stand-in's settings file beside the binary behind the shim
 # ($HOME/.agent-director/bin/agent-director.real.settings), atomically, in
 # fixtures/ad-version-stand-in.sh's format, its release_bin the image's
-# release binary. The caller has run both guards.
+# release binary. The caller has run both guards. Refuses a bin directory
+# that is not under SCENARIO_ROOT or resolves outside it.
 _scenario_stand_in_settings() {
-    local step="$1" version="$2" reuse="$3" bin="${HOME}/.agent-director/bin"
+    local step="$1" version="$2" reuse="$3" bin="${HOME}/.agent-director/bin" real_root real_bin
     [[ -n "${version}" && "${version}" != *[[:cntrl:]]* ]] \
         || fail "${step}: version '${version}' is empty or holds a control character"
     [[ "${reuse}" == reject || "${reuse}" == pass ]] || fail "${step}: '${reuse}' is neither reject nor pass"
     [[ -f "${SCENARIO_RELEASE_BIN}" && -x "${SCENARIO_RELEASE_BIN}" ]] \
         || fail "${step}: the release's binary is missing from the image (${SCENARIO_RELEASE_BIN})"
     [[ -d "${bin}" && "${bin}" == "${SCENARIO_ROOT}"/* ]] || fail "${step}: refused: ${bin} is not a directory under SCENARIO_ROOT"
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
+    real_bin="$(realpath -e -- "${bin}" 2> /dev/null)" || fail "${step}: cannot resolve ${bin}"
+    [[ "${real_bin}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: ${bin} resolves to ${real_bin}, which is not under SCENARIO_ROOT ${real_root}"
     if [[ "${version}" == unparseable ]]; then
         printf '%s\n' '# ad-version-stand-in settings (scenario.sh)' report=unparseable \
             "reuse_finished=${reuse}" "release_bin=${SCENARIO_RELEASE_BIN}"
@@ -3057,6 +3071,14 @@ write_ad_settings() {
     if [[ -e "${path}" || -L "${path}" ]]; then
         [[ -f "${path}" && ! -L "${path}" ]] || fail "${step}: refused: ${path} is not a regular file"
     fi
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
+    # The file's directory, when it exists, resolves under SCENARIO_ROOT before
+    # anything is removed or created in it.
+    if [[ -e "${dir}" || -L "${dir}" ]]; then
+        real_dir="$(realpath -e -- "${dir}" 2> /dev/null)" || fail "${step}: cannot resolve ${dir}"
+        [[ "${real_dir}" == "${real_root}"/* ]] \
+            || fail "${step}: refused: ${dir} resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
+    fi
     AD_SETTINGS_FILE="${path}"
     if (( ${#pairs[@]} == 0 && ! have_pause )); then
         # No table: no file, so agent-director's defaults.
@@ -3065,7 +3087,6 @@ write_ad_settings() {
         return 0
     fi
     mkdir -p -- "${dir}" || fail "${step}: could not create ${dir}"
-    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
     real_dir="$(realpath -e -- "${dir}" 2> /dev/null)" || fail "${step}: cannot resolve ${dir}"
     [[ "${real_dir}" == "${real_root}"/* ]] \
         || fail "${step}: refused: ${dir} resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
