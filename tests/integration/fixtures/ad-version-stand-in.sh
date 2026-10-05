@@ -2,8 +2,8 @@
 # CSCB_CI_AD_VERSION_STAND_IN_MARKER
 #
 # ad-version-stand-in.sh — an agent-director binary that reports a chosen
-# version (harness addition, scenario 8: test-20-fmk-old-binary.sh; b.jg5
-# SRJ-1410). Runs only in a cscb-ci image, where
+# version (harness addition, scenarios 8 and 23: test-20-fmk-old-binary.sh;
+# b.jg5 SRJ-1410, SRJ-1425). Runs only in a cscb-ci image, where
 # tests/integration/lib/scenario.sh installs it; never run it on a dev box.
 #
 # scenario.sh puts it behind the agent-director shim, at

@@ -268,7 +268,7 @@
 #                                      the shim cannot move, the binary goes aside again before the
 #                                      step fails
 #   install_ad_stand_in <version|unparseable> <reject|pass> [<step>]
-#                                      harness addition (scenario 8, test-20): put
+#                                      harness addition (scenarios 8 and 23, test-20): put
 #                                      fixtures/ad-version-stand-in.sh behind the shim, through
 #                                      `swap_ad_binary`, after writing its settings beside it
 #                                      (<path>.real.settings): `version` reports <version> (or, for
@@ -672,7 +672,8 @@
 #   cscb_ad_count <verb> [<fragment>...]
 #                                      print how many lines `cscb_ad_calls` would print
 #   wait_for_cscb_ad_call <count-before> <timeout-s> <step> <verb> [<fragment>...]
-#                                      harness addition (scenario 8, test-20): wait until
+#                                      harness addition (scenarios 8 and 23, test-20, and
+#                                      scenario 24, test-26): wait until
 #                                      `cscb_ad_count <verb> [<fragment>...]` is above <count-before>
 #                                      (taken by the caller before the step it waits on), then print
 #                                      the next such line: `cscb_ad_calls`' line <count-before> + 1.
@@ -826,8 +827,8 @@ SCENARIO_AD_010_BIN=/opt/agent-director-0.10.0/bin/agent-director
 SCENARIO_AD_SHIM_SRC="${SCENARIO_FIXTURES}/agent-director-shim.sh"
 SCENARIO_AD_SHIM_MARKER='# CSCB_CI_AGENT_DIRECTOR_SHIM_MARKER'
 
-# The agent-director version stand-in (harness addition, scenario 8) and the
-# whole line that marks it.
+# The agent-director version stand-in (harness addition, scenarios 8 and 23)
+# and the whole line that marks it.
 SCENARIO_AD_STAND_IN_SRC="${SCENARIO_FIXTURES}/ad-version-stand-in.sh"
 SCENARIO_AD_STAND_IN_MARKER='# CSCB_CI_AD_VERSION_STAND_IN_MARKER'
 

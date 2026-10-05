@@ -207,6 +207,22 @@
  *                                                line's fixed head
  *   UNAVAILABLE_RETRY_CEILING_S                  src/unavailable-retry.ts, the retry timer's
  *                                                longest wait, in seconds, in decimal
+ *   buildAdCallTimeoutWarningLine <call-timeout-ms> [<key>=<integer>…]
+ *                                                src/ad-settings.ts: the startup call-timeout
+ *                                                warning for the call timeout <call-timeout-ms>
+ *                                                and the values in effect built as for
+ *                                                adGraceMs; the empty text when the builder
+ *                                                gives no line
+ *   adCallTimeoutNeed [<key>=<integer>…]         src/ad-settings.ts: `<need-ms> <verb>`, the call
+ *                                                timeout's need in decimal and the verb whose
+ *                                                ceiling sets it, for the values in effect
+ *                                                built as for adGraceMs
+ *   LAUNCH_TIMEOUT_PHRASE                        src/ad-description-phrases.ts
+ *   launchUnavailableFormText <err-name>         src/session-manager.ts: how the line of the one
+ *                                                get after a launch timeout names the timeout's
+ *                                                form <err-name>, the value of one of
+ *                                                src/ad-error-class.ts's LAUNCH_TIMEOUT_FORM_…
+ *                                                exports
  *
  * In every `<key>=<integer>` argument <key> is one of the package's
  * AD_TMUX_KEYS and <integer> an integer in decimal; an unknown key, a key
@@ -787,6 +803,70 @@ const liveRowRunLine: Entry = {
   },
 }
 
+/**
+ * `buildAdCallTimeoutWarningLine(<call-timeout-ms>, <the values in effect for
+ * the <key>=<integer> arguments>)`: the startup call-timeout warning, or the
+ * empty text when the builder gives no line (the setting is above the need).
+ */
+const callTimeoutWarningLine: Entry = {
+  synopsis: '<call-timeout-ms> [<key>=<integer>…]',
+  async print(args, context) {
+    const entry = 'buildAdCallTimeoutWarningLine'
+    const [timeout, ...pairs] = args
+    if (timeout === undefined || timeout === '') usageFail(`${entry} takes <call-timeout-ms> [<key>=<integer>…] (no <call-timeout-ms> given)`)
+    const callTimeoutMs = integerArgument(entry, 'call-timeout-ms', timeout)
+    const values = await settingsInEffectFrom(entry, pairs, context)
+    const build = await packageFunction<(callTimeoutMs: number, values: object) => unknown>(context, 'ad-settings.ts', entry)
+    const line = build(Number(callTimeoutMs), values)
+    return line === undefined ? '' : builtString(entry, line)
+  },
+}
+
+/**
+ * `adCallTimeoutNeed(<the values in effect for the <key>=<integer>
+ * arguments>)`: `<need-ms> <verb>`, the need in decimal and the verb whose
+ * ceiling sets it. The values in effect carry DEFAULT_AD_SETTINGS_IN_EFFECT's
+ * pauseTimeout, which is used, so a verb always sets the need; any other
+ * answer is a failure.
+ */
+const callTimeoutNeed: Entry = {
+  synopsis: '[<key>=<integer>…]',
+  async print(args, context) {
+    const entry = 'adCallTimeoutNeed'
+    const values = await settingsInEffectFrom(entry, args, context)
+    const need = await packageFunction<(values: object) => unknown>(context, 'ad-settings.ts', entry)
+    const answer = need(values)
+    const { needMs, setBy } = (typeof answer === 'object' && answer !== null ? answer : {}) as { needMs?: unknown; setBy?: unknown }
+    const by = (typeof setBy === 'object' && setBy !== null ? setBy : {}) as { kind?: unknown; verb?: unknown }
+    if (by.kind !== 'verb' || typeof by.verb !== 'string' || !/^[a-z-]+$/.test(by.verb)) {
+      fail(PRINTER_FAIL_EXIT, `${entry} answered no verb that sets the need`)
+    }
+    return `${decimal(entry, needMs)} ${by.verb}`
+  },
+}
+
+/** The package's launch-timeout forms (src/ad-error-class.ts), by export name. */
+const LAUNCH_TIMEOUT_FORM_EXPORTS = ['LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT', 'LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE'] as const
+
+/**
+ * `launchUnavailableFormText(<form>, '')`: how the launch-timeout get line
+ * names a launch timeout of the form <err-name>, which must be the value of
+ * one of the package's LAUNCH_TIMEOUT_FORM_… exports.
+ */
+const launchTimeoutFormText: Entry = {
+  synopsis: '<err-name>',
+  async print(args, context) {
+    const entry = 'launchUnavailableFormText'
+    expectArguments(entry, args, ['err-name'])
+    const [errName] = args
+    const forms: string[] = []
+    for (const name of LAUNCH_TIMEOUT_FORM_EXPORTS) forms.push(await packageString(context, 'ad-error-class.ts', name))
+    if (!forms.includes(errName)) usageFail(`${entry}: '${errName}' is not one of the package's launch-timeout forms (${forms.join(', ')})`)
+    const build = await packageFunction<(form: string, failure: string) => unknown>(context, 'session-manager.ts', entry)
+    return builtString(entry, build(errName, ''))
+  },
+}
+
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = {
   // Scenario 8 (test-20-fmk-old-binary.sh).
@@ -842,6 +922,11 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   RESTART_OUTCOME_LIVENESS_UNKNOWN: constantEntry('restart.ts', 'RESTART_OUTCOME_LIVENESS_UNKNOWN'),
   unavailableRetryStoppedLine: stoppedLine,
   UNAVAILABLE_RETRY_CEILING_S: constantEntry('unavailable-retry.ts', 'UNAVAILABLE_RETRY_CEILING_S'),
+  // Scenario 24's call timeout (test-26-fmk-timing-settings.sh).
+  buildAdCallTimeoutWarningLine: callTimeoutWarningLine,
+  adCallTimeoutNeed: callTimeoutNeed,
+  LAUNCH_TIMEOUT_PHRASE: constantEntry('ad-description-phrases.ts', 'LAUNCH_TIMEOUT_PHRASE'),
+  launchUnavailableFormText: launchTimeoutFormText,
 }
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */

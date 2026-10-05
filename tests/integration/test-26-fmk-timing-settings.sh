@@ -9,12 +9,19 @@
 # its launch start, and its relaunching stuck-launch post at B (300 s);
 # scenario 13's "still stopping" follows the 30 s window; a value changed
 # while the server runs is used from the next read, and a [pause]-only change
-# logs no values line.
+# logs no values line. A refused settings file raises one ad-config-malformed
+# alert per affected persona, changes nothing, keeps the last values and
+# clears once fixed. With create_timeout_ms raised to 40000 (the grace period
+# with it) and the tmux shim's create held past it, CSCB's call timeout at
+# 30000 gives SRJ-213's startup warning and a launch ending in ErrCallTimeout
+# with no launch over its row; at 61000 there is no warning and the same
+# launch ends in agent-director's launch-timeout ErrTmuxUnresponsive.
 #
 # Set-up (fmk mode, lib/scenario.sh): the scenario's own HOME, store and tmux
 # server under SCENARIO_ROOT; the agent-director 0.11.0 release installed
 # through its install.sh, behind the agent-director shim; the tmux shim in
-# front of tmux for every CSCB process, in `log` mode; the Slack stub
+# front of tmux for every CSCB process, in `log` mode (`slow-create` in the
+# call-timeout legs); the Slack stub
 # (fixtures/slack-stub-server.ts --record), which records each
 # chat.postMessage text whole. Before the first start the scenario writes the
 # scenario HOME's agent-director settings file (`write_ad_settings`, at
@@ -53,6 +60,10 @@
 #   C1 work/c1, `at-once`; added by a confirmed reload while the settings file
 #      is refused (leg refused-stopping)
 #   C2 work/c2, `at-once`; the same in leg refused-grace
+#   T1 work/t1, `dev-channels` (reports in on the approver's Enter: a launch
+#      that loses its create reply runs the stub in that mode, scenario.sh's
+#      seeding rules); added across a restart in leg call-timeout-30000
+#   T2 work/t2, `dev-channels`; the same in leg call-timeout-61000
 #
 # Waits, all derived from the printer's values for the written table: G
 # (adGraceMs, 120 s), B (adLaunchBoundMs, 300 s), the alert threshold
@@ -67,15 +78,17 @@
 # `launch_started_at` or `ended_at` (read with a harness `get`). The approver's
 # paces come from the printer (DIALOG_POLL_INTERVAL_MS, 1 s before G;
 # DIALOG_SLOW_POLL_INTERVAL_MS, 5 s from G); "what a 5 s pace allows" in a
-# window of d seconds is floor(d / 5) + 1 reads. The whole script runs about
-# 37 minutes: about 19 for the legs before the refused values (most of it the
-# held launch's B and the change leg's three waits for the next timed probe)
-# and about 9 for each refused-value leg (the wait for the next timed probe,
-# the added persona's retries on its timer, and its timer's pending-only
-# retry after it comes up).
+# window of d seconds is floor(d / 5) + 1 reads. The call-timeout legs'
+# timing bounds come from their scenario inputs (CALL_TIMEOUT_LOW_MS,
+# CREATE_RAISED_MS, CALL_TIMEOUT_HIGH_MS) and the printer's need. The whole
+# script runs about 39 minutes: about 17 for the legs before the refused
+# values (most of it the held launch's B and the change leg's three waits for
+# the next timed probe), about 9 for each refused-value leg (the wait for the
+# next timed probe, the added persona's retries on its timer, and its timer's
+# pending-only retry after it comes up) and about 4 for the two call-timeout
+# legs (each held create, and T1's retry timer until it stops).
 #
-# Legs (in order, each a function below; the later Tasks of scenario 24 add
-# theirs before the closing assertions):
+# Legs (in order, each a function below):
 #   values      the first start, with S: exactly one values line, equal to
 #               the printer's line for the written path, the three written
 #               values and the six defaults (it carries the nine [tmux]
@@ -174,6 +187,43 @@
 #               the same checks for pending_grace_seconds = "60" (a TOML
 #               string), with C2 added by a confirmed reload and C1 among the
 #               personas already up.
+#   call-timeout-30000
+#               the call timeout below the need (b.jg5 SRJ-1426, SRJ-213,
+#               SRJ-407; AC 84): a plain stop; the settings file written with
+#               create_timeout_ms 40000, pending_grace_seconds 61 (the
+#               printer's pendingGraceMinimumSeconds for 40000 and the default
+#               pipe_close_wait_ms) and the earlier stopping and starting
+#               values, with no [pause] table; agent_director_call_timeout_ms
+#               30000 in CSCB's config, T1 added, the tmux shim in
+#               `slow-create` with a 50 s delay (longer than create_timeout_ms),
+#               and a start. Exactly one values line, the printer's for these
+#               values; exactly one call-timeout warning, the printer's line
+#               for 30000 and these values (its need 60.9 s, set by the launch
+#               ceiling), logged before T1's spawn. T1's plain spawn (made by
+#               this server process) ends in ErrCallTimeout: its refusal line
+#               comes at least 30 s (less SHIM_LINE_ALLOWANCE_S) and less than
+#               40 s after the call's line in the shim's log; a CSCB `get` of
+#               T1 follows, whose line names the launch timeout's
+#               ErrCallTimeout form and reads this launch's `pending` row; a
+#               CSCB send-keys (the approver's Enter) and T1 reads `waiting`.
+#               The harness reads T1's row about once a second from the spawn
+#               until T1 is up and its retry timer has stopped; every later
+#               CSCB launch call of T1 (spawn or resume) must follow a harness
+#               reading of `ended` or `missing` (its latest reading before the
+#               call) and a CSCB read of the row (a get or status) since the
+#               call before it; with none such, T1's spawn is its only launch.
+#   call-timeout-61000
+#               the call timeout above the need (b.jg5 SRJ-1426; AC 84): a plain
+#               stop, agent_director_call_timeout_ms 61000, T2 added, the same
+#               settings file and `slow-create`, and a start. No call-timeout
+#               warning from this start (the printer gives none for 61000).
+#               T2's plain spawn (the same launch as T1's: hatch decision) ends
+#               in ErrTmuxUnresponsive carrying LAUNCH_TIMEOUT_PHRASE, its
+#               refusal line at least 40 s and less than 61 s after the call;
+#               the CSCB `get` that follows names the launch timeout's
+#               ErrTmuxUnresponsive form and reads this launch's `pending`
+#               row; the approver brings T2 up (`waiting`); no server.log line
+#               for T2 names ErrCallTimeout. The tmux shim is set back to `log`.
 #
 # The refused-value legs (hatch decisions, the Epic's "Hatch gap"): the
 # persona meeting the refusal is added by a confirmed reload, so the last
@@ -235,6 +285,16 @@
 #                        adConfigMalformedRaisedLine <C's key> <marker>,
 #                        adConfigMalformedClearedLine <C's key>
 #                                                            src/outage-state.ts
+#   GRACE_CT_S           pendingGraceMinimumSeconds 40000 <default pipe_close_wait_ms>
+#                                                            src/ad-settings.ts
+#   NEED_MS, NEED_VERB   adCallTimeoutNeed <the call-timeout table>
+#                                                            src/ad-settings.ts
+#   WARN_LOW, WARN_HIGH  buildAdCallTimeoutWarningLine <30000|61000> <the call-timeout table>
+#                                                            src/ad-settings.ts
+#   LAUNCH_PHRASE        LAUNCH_TIMEOUT_PHRASE               src/ad-description-phrases.ts
+#   the get line's forms launchUnavailableFormText <ErrCallTimeout|ErrTmuxUnresponsive>
+#                                                            src/session-manager.ts,
+#                                                            src/ad-error-class.ts
 # A marker the scenario passes in place of agent-director's description, the
 # reader's reason or a retry line's reason splits a printed text into the
 # fixed parts around it.
@@ -256,7 +316,20 @@
 #   harness releases it; S's session is kept younger than
 #   starting_session_seconds, so agent-director's next rule is "still
 #   starting", never the own-id CONFLICT;
-# - R is added by a confirmed reload (test-8's approach).
+# - R is added by a confirmed reload (test-8's approach);
+# - the call-timeout legs' need is 60.9 s: the launch ceiling at C = 40 s,
+#   max(Q + C + 2A + 4W, 2Q + C + 3W) = 45.9 s at agent-director's default
+#   Q, A and W, plus AD_CALL_TIMEOUT_NEED_MARGIN_MS (15 s, src/ad-settings.ts).
+#   resume, a reuse and a plain spawn share that ceiling (HO rev 15), so there
+#   is no separate 44.3 s case; their equality is unit-tested
+#   (tests/ad-settings.test.ts, b.jg5 SRJ-213) and only derived here. The file
+#   holds no [pause] table, so pause's ceiling (9 s plus the default 30 s) is
+#   below the launch ceiling, and the need is the launch ceiling's. The
+#   script takes the need from the printer (adCallTimeoutNeed) and checks
+#   that 30000 lies at or below it and 61000 above it;
+# - "the same launch" of leg call-timeout-61000 is a second persona's (T2's)
+#   fresh plain spawn, under the same settings file, after a restart without
+#   teardown (ruling S4) that picks up 61000; T1 is up by then.
 # Where the SRD and the Task differ, the SRD is followed: the Task's "the
 # first CSCB find-missing after the restart comes no earlier than L + G" is
 # checked on the live-row sequence's first run (SRJ-1426), since the start
@@ -360,7 +433,7 @@ PROBE_ALLOWANCE_S=10  # a timed bot-server probe: within RECHECK_S plus this
 # Personas, channels and the Slack stub's token suffixes.
 P_NAME="${SCENARIO_TAG}_p"
 declare -A KEY=() ID=() REF=() CHANNEL=() SUFFIX=() WORK=()
-for x in s p q r c1 c2; do
+for x in s p q r c1 c2 t1 t2; do
     n="${SCENARIO_TAG}_${x}"
     KEY[${x}]="$(persona_key "${n}")"
     # src/persona-identity.ts personaInstanceId.
@@ -406,6 +479,9 @@ SERVER_PID=""
 # CSCB's session_restart_delay, written by write_personas when set (the
 # refused-value legs set it to 0).
 RESTART_DELAY_S=""
+# CSCB's agent_director_call_timeout_ms, written by write_personas when set
+# (the call-timeout legs set it).
+CALL_TIMEOUT_MS=""
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -630,7 +706,7 @@ expect_one_values_line() {
     }
 }
 
-# start_slack_stub: the Slack stub in STUB_DIR, answering ok for the six
+# start_slack_stub: the Slack stub in STUB_DIR, answering ok for the eight
 # personas' token pairs and refusing any other; export CSCB_SLACK_API_URL.
 start_slack_stub() {
     local step="slack stub" api_url pid
@@ -658,7 +734,8 @@ persona_files() {
 }
 
 # write_personas <x>...: the config with the personas <x>..., in that order,
-# and `session_restart_delay` RESTART_DELAY_S when that is set.
+# `session_restart_delay` RESTART_DELAY_S when that is set and
+# `agent_director_call_timeout_ms` CALL_TIMEOUT_MS when that is set.
 write_personas() {
     local x personas="[]" one
     for x in "$@"; do
@@ -668,12 +745,14 @@ write_personas() {
                 channels: [{id: $ch, delivery: "all"}], permission_prompts: $ch}')"
         personas="$(jq -c --argjson one "${one}" '. + [$one]' <<< "${personas}")"
     done
-    jq -n --argjson personas "${personas}" --argjson port "${SCENARIO_PORT}" --arg delay "${RESTART_DELAY_S}" '{
+    jq -n --argjson personas "${personas}" --argjson port "${SCENARIO_PORT}" --arg delay "${RESTART_DELAY_S}" \
+        --arg call_timeout "${CALL_TIMEOUT_MS}" '{
         personas: $personas,
         bind: "127.0.0.1", port: $port,
         health_check_interval: 0, exit_timeout: 5, resume_enabled: true,
         agent_director_poll_interval_ms: 3600000
-    } + (if $delay == "" then {} else {session_restart_delay: ($delay | tonumber)} end)' | write_config
+    } + (if $delay == "" then {} else {session_restart_delay: ($delay | tonumber)} end)
+      + (if $call_timeout == "" then {} else {agent_director_call_timeout_ms: ($call_timeout | tonumber)} end)' | write_config
 }
 
 # start_live <step> <expected-values-line>: start the server; wait for the
@@ -746,6 +825,8 @@ WORK[p]="$(make_workdir p)"
 WORK[r]="$(make_workdir r)"
 WORK[c1]="$(make_workdir c1)"
 WORK[c2]="$(make_workdir c2)"
+WORK[t1]="$(make_workdir t1)"
+WORK[t2]="$(make_workdir t2)"
 Q_HELD="$(make_workdir q_held)"
 Q_READY="$(make_workdir q_ready)"
 WORK[q]="${SCENARIO_ROOT}/work/q_link"
@@ -757,7 +838,11 @@ stub_mode "${Q_HELD}" "${STUB_MODE_UNRECOGNISED}"
 stub_mode "${Q_READY}" "${STUB_MODE_AT_ONCE}"
 stub_mode "${WORK[c1]}" "${STUB_MODE_AT_ONCE}"
 stub_mode "${WORK[c2]}" "${STUB_MODE_AT_ONCE}"
-for x in s p q r c1 c2; do
+# A launch that loses its create reply (`slow-create`) waits for the
+# approver's Enter (scenario.sh's seeding rules, b.jg5 SRJ-1306).
+stub_mode "${WORK[t1]}" "${STUB_MODE_DEV_CHANNELS}"
+stub_mode "${WORK[t2]}" "${STUB_MODE_DEV_CHANNELS}"
+for x in s p q r c1 c2 t1 t2; do
     persona_files "${x}"
 done
 
@@ -1121,8 +1206,11 @@ RETRY_BASE_S="$(printed UNAVAILABLE_RETRY_BASE_S)" || exit 1
 RETRY_CEILING_S="$(printed UNAVAILABLE_RETRY_CEILING_S)" || exit 1
 [[ "${RETRY_BASE_S}" =~ ^[1-9][0-9]*$ && "${RETRY_CEILING_S}" =~ ^[1-9][0-9]*$ ]] \
     || fail "setup: UNAVAILABLE_RETRY_BASE_S '${RETRY_BASE_S}' or UNAVAILABLE_RETRY_CEILING_S '${RETRY_CEILING_S}' is not a whole number of seconds"
-# The ad-config-malformed class, as the all-clear lists it (the printer
-# checks it is one of the package's OUTAGE_CLASS_ORDER).
+# The ad-config-malformed class, as the all-clear lists it: src/outage-state.ts
+# keeps the label in a const it does not export (its OutageClass
+# `ad-config-malformed`), so it is quoted here (ruling S7); the printer's
+# ALL_CLEAR_TEMPLATE entry checks it is one of the package's
+# OUTAGE_CLASS_ORDER.
 CONFIG_CLASS='ad-config-malformed'
 # The refused-read line's fixed parts, for the settings file and a read
 # accepted before it (fixtures/fmk-texts.ts buildAdSettingsRefusedReadLine).
@@ -1390,8 +1478,244 @@ all_up() {
 }
 
 # ---------------------------------------------------------------------------
-# The legs, in order (later legs of scenario 24 are added before the closing
-# assertions)
+# Legs call-timeout-30000 and call-timeout-61000: a call timeout at or below
+# the need gives the startup warning, and a launch held past it ends in
+# ErrCallTimeout with no launch over its row; one above the need gives no
+# warning, and the same launch ends in agent-director's own launch timeout
+# ---------------------------------------------------------------------------
+
+# Scenario inputs (b.jg5 SRJ-1426): create_timeout_ms raised to 40000, the two
+# call timeouts, and the tmux shim's slow-create delay, longer than the
+# create timeout.
+CREATE_RAISED_MS=40000
+CALL_TIMEOUT_LOW_MS=30000
+CALL_TIMEOUT_HIGH_MS=61000
+SLOW_CREATE_DELAY_S=50
+# The client arms its call timer as it starts the agent-director process, a
+# little before the shim writes the call's line, so a call its timer ends can
+# read up to this short of the timeout from that line (the scenario's own).
+SHIM_LINE_ALLOWANCE_S=0.5
+# The grace period raised with the create timeout, to its minimum.
+GRACE_CT_S="$(printed pendingGraceMinimumSeconds "${CREATE_RAISED_MS}" "${DEFAULT_PIPE}")" || exit 1
+# The call-timeout legs' table: the earlier table's stopping and starting
+# values kept, the grace period and the create timeout raised; no [pause]
+# table.
+TABLE_CT=("${KEY_GRACE}=${GRACE_CT_S}" "${KEY_STOPPING}=${STOPPING_S}" "${KEY_STARTING}=${STARTING_S}" "${KEY_CREATE}=${CREATE_RAISED_MS}")
+VALUES_LINE_CT="$(printed buildAdSettingsValuesLine "${AD_SETTINGS_FILE}" "${TABLE_CT[@]}")" || exit 1
+NEED_TEXT="$(printed adCallTimeoutNeed "${TABLE_CT[@]}")" || exit 1
+read -r NEED_MS NEED_VERB <<< "${NEED_TEXT}"
+WARN_LOW="$(printed buildAdCallTimeoutWarningLine "${CALL_TIMEOUT_LOW_MS}" "${TABLE_CT[@]}")" || exit 1
+WARN_HIGH="$(printed buildAdCallTimeoutWarningLine "${CALL_TIMEOUT_HIGH_MS}" "${TABLE_CT[@]}")" || exit 1
+LAUNCH_PHRASE="$(printed LAUNCH_TIMEOUT_PHRASE)" || exit 1
+FORM_CALL_TIMEOUT="$(printed launchUnavailableFormText ErrCallTimeout)" || exit 1
+FORM_TMUX_UNRESPONSIVE="$(printed launchUnavailableFormText ErrTmuxUnresponsive)" || exit 1
+[[ "${NEED_MS}" =~ ^[1-9][0-9]*$ ]] || fail "setup: adCallTimeoutNeed gave '${NEED_TEXT}', not <need-ms> <verb>"
+# The launch row's ceiling sets the need: resume, a reuse and a plain spawn
+# share it, and a tie names resume, the row's first verb (HO rev 15).
+[[ "${NEED_VERB}" == resume ]] || fail "setup: the need ${NEED_MS} ms is set by ${NEED_VERB}, not by the launch row's ceiling (resume)"
+(( CALL_TIMEOUT_LOW_MS < CREATE_RAISED_MS && CALL_TIMEOUT_LOW_MS <= NEED_MS && NEED_MS < CALL_TIMEOUT_HIGH_MS && SLOW_CREATE_DELAY_S * 1000 > CREATE_RAISED_MS )) \
+    || fail "setup: the call timeouts ${CALL_TIMEOUT_LOW_MS} and ${CALL_TIMEOUT_HIGH_MS} ms do not lie below ${KEY_CREATE} ${CREATE_RAISED_MS} and the need ${NEED_MS} ms, and above the need, or the slow-create delay ${SLOW_CREATE_DELAY_S}s is not longer than ${KEY_CREATE}"
+[[ -n "${WARN_LOW}" && "${WARN_LOW}" == "${VALUES_PREFIX} "*" ${CALL_TIMEOUT_LOW_MS},"*" ${NEED_MS} ms "* ]] \
+    || fail "setup: the printer's warning for ${CALL_TIMEOUT_LOW_MS} does not name the setting's value and the need ${NEED_MS} ms: ${WARN_LOW}"
+[[ -z "${WARN_HIGH}" ]] || fail "setup: the printer gives a warning for ${CALL_TIMEOUT_HIGH_MS}: ${WARN_HIGH}"
+# Any call-timeout warning: the printer's line up to the setting's value.
+WARN_STEM="${WARN_LOW%%" ${CALL_TIMEOUT_LOW_MS},"*} "
+[[ "${VALUES_LINE_CT}" != *"${WARN_STEM}"* ]] || fail "setup: the values line holds the warning's stem"
+# Seconds, with decimals, for the timing checks.
+CREATE_S="$(awk -v ms="${CREATE_RAISED_MS}" 'BEGIN { printf "%.3f\n", ms / 1000 }')"
+CALL_LOW_S="$(awk -v ms="${CALL_TIMEOUT_LOW_MS}" 'BEGIN { printf "%.3f\n", ms / 1000 }')"
+CALL_HIGH_S="$(awk -v ms="${CALL_TIMEOUT_HIGH_MS}" 'BEGIN { printf "%.3f\n", ms / 1000 }')"
+# src/session-manager.ts launchUnavailableGetLine: `[slack] spawnForPersona:
+# one get after the <what> of <ref> ended in <form>: read <read>; this
+# launch's row: <yes (launch start <iso>)|no> — <outcome>; …`.
+GET_LINE_HEAD='[slack] spawnForPersona: one get after the '
+GET_LINE_OWN_PENDING=": read pending; this launch's row: yes"
+
+# launch_answer_line <x> <err-name>: the matcher of persona <x>'s refusal line
+# for a launch answered <err-name> (src/session-manager.ts logRefusal, the
+# answer described by its errName first).
+launch_answer_line() {
+    matcher "${REFUSED_FOR}${REF[$1]}: $2"
+}
+
+# get_after_timeout_line <x> <form-text>: the matcher of the one get's line
+# after persona <x>'s launch timeout of that form, which read this launch's
+# pending row.
+get_after_timeout_line() {
+    matcher "${GET_LINE_HEAD}" " of ${REF[$1]} ended in $2${GET_LINE_OWN_PENDING}"
+}
+
+# start_call_timeout_leg <step> <x> <call-timeout-ms>: a plain stop, the
+# config with persona <x> added and agent_director_call_timeout_ms
+# <call-timeout-ms>, the last-applied record removed, the tmux shim in
+# slow-create, and a start (`start_live`, the values line VALUES_LINE_CT).
+# Sets WARN_BEFORE (the warning lines before the start) and T_CALL (the time
+# of <x>'s plain spawn in the shim's log).
+start_call_timeout_leg() {
+    local step="$1" x="$2" n_spawn line
+    stop_server
+    write_ad_settings "${TABLE_CT[@]}"
+    CALL_TIMEOUT_MS="$3"
+    UP_PERSONAS+=("${x}")
+    write_personas "${UP_PERSONAS[@]}"
+    rm -f -- "${CONFIG}.last-applied" || fail "${step}: could not remove ${CONFIG}.last-applied"
+    tmux_shim_mode slow-create "${SLOW_CREATE_DELAY_S}"
+    WARN_BEFORE="$(count_log "${WARN_STEM}")"
+    n_spawn="$(cscb_ad_count spawn --claude-instance-id "${ID[${x}]}")"
+    start_live "${step}" "${VALUES_LINE_CT}"
+    line="$(wait_for_cscb_ad_call "${n_spawn}" "${LAUNCH_WAIT_S}" "${step}: no spawn of ${SCENARIO_TAG}_${x}" spawn --claude-instance-id "${ID[${x}]}")" || exit 1
+    call_fields "${step}" "${line}"
+    [[ "${CALL_PPID}" == "${SERVER_PID}" ]] || fail "${step}: ${SCENARIO_TAG}_${x}'s spawn was not made by this server process"
+    [[ " ${_L_ARGS[*]} " != *" --reuse-finished "* ]] || fail "${step}: ${SCENARIO_TAG}_${x}'s first launch is a reuse spawn, not a plain spawn"
+    T_CALL="${CALL_T}"
+}
+
+# launch_answer_at <step> <x> <err-name> <bound-s>: wait up to <bound-s> for
+# exactly one refusal line of persona <x>'s launch answered <err-name>. Sets
+# ANSWER_LINE to it and T_END to its time.
+launch_answer_at() {
+    local step="$1" x="$2" m
+    m="$(launch_answer_line "${x}" "$3")"
+    wait_until "$4" "${step}: no ${3} answer for ${SCENARIO_TAG}_${x}'s spawn" _scenario_log_has "${m}"
+    [[ "$(count_log "${m}")" == 1 ]] || fail "${step}: $(count_log "${m}") ${3} answers for ${SCENARIO_TAG}_${x}, not one"
+    ANSWER_LINE="$(log_lines "${m}")"
+    T_END="$(log_time "${ANSWER_LINE}")" || exit 1
+}
+
+# approver_brought_up <step> <x> <from>: persona <x>'s pending row reported
+# in through the approver (b.jg5 SRJ-407): a CSCB send-keys of <x> at or
+# after <from>, and the row reads waiting.
+approver_brought_up() {
+    local step="$1" x="$2" n
+    wait_until "${REPORT_WAIT_S}" "${step}: ${SCENARIO_TAG}_${x} never reported in after its launch timeout" row_state_is "${ID[${x}]}" waiting
+    n="$(cscb_calls_between "$3" "$(now_s)" send-keys --claude-instance-id "${ID[${x}]}")"
+    (( n >= 1 )) || fail "${step}: ${SCENARIO_TAG}_${x} reported in with no CSCB send-keys (the approver's Enter) after its launch timeout"
+}
+
+leg_call_timeout_low() {
+    local step="call-timeout-30000" x=t1 line warn_t elapsed get_line t_get readings state stopped_m deadline
+    local t prev last reads n_pending n_live first_waiting
+    leg "${step}"
+    readings="${SCENARIO_ROOT}/${x}-row-readings.tsv"
+    start_call_timeout_leg "${step}" "${x}" "${CALL_TIMEOUT_LOW_MS}"
+
+    # The startup warning: exactly one from this start, the printer's line
+    # for 30000 and these values, logged before the start pass's launch.
+    wait_for_count "${WARN_STEM}" "$(( WARN_BEFORE + 1 ))" "${LOG_WAIT_S}" "${step}: no call-timeout warning at the start"
+    [[ "$(count_log "${WARN_STEM}")" == "$(( WARN_BEFORE + 1 ))" ]] || fail "${step}: $(( $(count_log "${WARN_STEM}") - WARN_BEFORE )) call-timeout warnings at the start, not one"
+    line="$(_scenario_scan lastline "${SLACK_STATE_DIR}/server.log" "${WARN_STEM}")"
+    [[ "${line}" == *"${WARN_LOW}" ]] || {
+        printf '  | got:  %s\n  | want: %s\n' "${line}" "${WARN_LOW}" >&2
+        fail "${step}: the warning line is not the printer's line"
+    }
+    warn_t="$(log_time "${line}")" || exit 1
+    time_before "${warn_t}" "${T_CALL}" || fail "${step}: the warning came after the start pass's launch of T1"
+    echo "${TEST_NAME}: ${step}: warning: ${line#*"${VALUES_PREFIX} "}"
+
+    # The harness reads T1's row about once a second, from its spawn until
+    # T1 is up and its retry timer has stopped (its pending-only retry read
+    # the row live).
+    line="$(printed unavailableRetryStoppedLine "${KEY[${x}]}" full none "${REFUSED_MARKER}")" || exit 1
+    split_at_marker "${step}: the stop line" "${line}"
+    stopped_m="$(matcher "${HEAD%" — "}")"
+    : > "${readings}"
+    deadline=$(( SECONDS + CALL_TIMEOUT_LOW_MS / 1000 + REPORT_WAIT_S + RETRY_CEILING_S + LOG_WAIT_S ))
+    while :; do
+        state="$(row_state "${ID[${x}]}")"
+        printf '%s\t%s\n' "$(now_s)" "${state:-none}" >> "${readings}"
+        [[ "${state}" == waiting ]] && _scenario_log_has "${stopped_m}" && break
+        (( SECONDS < deadline )) || fail "${step}: T1 was not up with its retry timer stopped by the leg's bound (last read '${state}')"
+        sleep 1
+    done
+
+    # The launch's answer: ErrCallTimeout, at least the call timeout and
+    # less than create_timeout_ms after the call.
+    launch_answer_at "${step}" "${x}" ErrCallTimeout "${LOG_WAIT_S}"
+    elapsed="$(seconds_between "${T_CALL}" "${T_END}")"
+    echo "${TEST_NAME}: ${step}: T1's spawn answered at +${elapsed}s: ${ANSWER_LINE#*"${REFUSED_FOR}"}"
+    if time_before "${elapsed}" "$(time_plus "${CALL_LOW_S}" "-${SHIM_LINE_ALLOWANCE_S}")"; then
+        fail "${step}: T1's spawn ended in ErrCallTimeout ${elapsed}s after its call, before the call timeout (${CALL_LOW_S}s)"
+    fi
+    time_before "${elapsed}" "${CREATE_S}" || fail "${step}: T1's spawn ended ${elapsed}s after its call, not before ${KEY_CREATE} (${CREATE_S}s)"
+
+    # b.jg5 SRJ-407: one CSCB get after the timeout, which read this launch's
+    # pending row; the approver brought it up.
+    get_line="$(first_cscb_call_at_or_after "${T_CALL}" get --claude-instance-id "${ID[${x}]}")"
+    [[ -n "${get_line}" ]] || fail "${step}: no CSCB get of T1 after its launch timeout"
+    call_fields "${step}" "${get_line}"
+    t_get="${CALL_T}"
+    [[ "$(count_log "$(get_after_timeout_line "${x}" "${FORM_CALL_TIMEOUT}")")" == 1 ]] \
+        || fail "${step}: no single line of the get after T1's launch timeout reading this launch's pending row: $(log_lines "$(matcher "${GET_LINE_HEAD}" " of ${REF[${x}]} ")" | cut -c1-300)"
+    approver_brought_up "${step}" "${x}" "${t_get}"
+    echo "${TEST_NAME}: ${step}: T1's get at +$(seconds_between "${T_CALL}" "${t_get}")s read this launch's pending row; the approver brought T1 up"
+
+    # No launch over the row: every CSCB launch call of T1 after its spawn
+    # follows a harness reading of ended or missing (its latest reading
+    # before the call) and a CSCB read of the row (a get or status) since
+    # the call before it.
+    prev="${T_CALL}"
+    while IFS= read -r line; do
+        call_fields "${step}" "${line}"
+        t="${CALL_T}"
+        time_before "${T_CALL}" "${t}" || continue
+        last="$(awk -F'\t' -v t="${t}" '$1 < t { s = $2 } END { print s }' "${readings}")"
+        [[ "${last}" == ended || "${last}" == missing ]] \
+            || fail "${step}: a CSCB ${CALL_VERB} of T1 at +$(seconds_between "${T_CALL}" "${t}")s, while the harness read its row '${last:-nothing}'"
+        reads=$(( $(cscb_calls_between "${prev}" "${t}" get --claude-instance-id "${ID[${x}]}") + $(cscb_calls_between "${prev}" "${t}" status --claude-instance-id "${ID[${x}]}") ))
+        (( reads >= 1 )) || fail "${step}: a CSCB ${CALL_VERB} of T1 at +$(seconds_between "${T_CALL}" "${t}")s with no CSCB read of its row before it"
+        prev="${t}"
+    done < <({ cscb_ad_calls spawn --claude-instance-id "${ID[${x}]}"; cscb_ad_calls resume --claude-instance-id "${ID[${x}]}"; } | sort -t $'\t' -k2,2n)
+    n_pending="$(awk -F'\t' '$2 == "pending"' "${readings}" | wc -l | tr -d ' ')"
+    n_live="$(awk -F'\t' '$2 != "pending" && $2 != "ended" && $2 != "missing" && $2 != "none"' "${readings}" | wc -l | tr -d ' ')"
+    first_waiting="$(awk -F'\t' '$2 == "waiting" { print $1; exit }' "${readings}")"
+    echo "${TEST_NAME}: ${step}: T1's row read ${n_pending} time(s) pending and ${n_live} time(s) live (waiting from +$(seconds_between "${T_CALL}" "${first_waiting}")s), never ended or missing; $(( $(cscb_ad_count spawn --claude-instance-id "${ID[${x}]}") + $(cscb_ad_count resume --claude-instance-id "${ID[${x}]}") )) CSCB launch call(s) of T1 in all"
+    echo "${TEST_NAME}: ${step}: T1's retry timer: $(log_lines "${stopped_m}" | tail -n 1 | cut -c1-200)"
+    print_cscb_calls "${T_CALL}" "$(now_s)" "${step}: CSCB's calls from T1's spawn until its timer stopped (recorded)"
+}
+
+leg_call_timeout_high() {
+    local step="call-timeout-61000" x=t2 elapsed get_line t_get n
+    leg "${step}"
+    start_call_timeout_leg "${step}" "${x}" "${CALL_TIMEOUT_HIGH_MS}"
+    # The check runs before the start pass, so by T2's spawn any warning of
+    # this start is logged.
+    [[ "$(count_log "${WARN_STEM}")" == "${WARN_BEFORE}" ]] || fail "${step}: a call-timeout warning at the start with ${CALL_TIMEOUT_HIGH_MS}: $(_scenario_scan lastline "${SLACK_STATE_DIR}/server.log" "${WARN_STEM}")"
+
+    # The launch's answer: agent-director's launch-timeout ErrTmuxUnresponsive,
+    # at least create_timeout_ms and less than the call timeout after the call.
+    launch_answer_at "${step}" "${x}" ErrTmuxUnresponsive "$(( CALL_TIMEOUT_HIGH_MS / 1000 + LOG_WAIT_S ))"
+    elapsed="$(seconds_between "${T_CALL}" "${T_END}")"
+    echo "${TEST_NAME}: ${step}: T2's spawn answered at +${elapsed}s: ${ANSWER_LINE#*"${REFUSED_FOR}"}"
+    [[ "${ANSWER_LINE}" == *"${LAUNCH_PHRASE}"* ]] || fail "${step}: T2's ErrTmuxUnresponsive does not carry LAUNCH_TIMEOUT_PHRASE: ${ANSWER_LINE}"
+    if time_before "${elapsed}" "${CREATE_S}"; then
+        fail "${step}: T2's spawn ended ${elapsed}s after its call, before ${KEY_CREATE} (${CREATE_S}s)"
+    fi
+    time_before "${elapsed}" "${CALL_HIGH_S}" || fail "${step}: T2's spawn ended ${elapsed}s after its call, not before the call timeout (${CALL_HIGH_S}s)"
+
+    # b.jg5 SRJ-407: the one get read this launch's pending row, which CSCB
+    # took as a launch timeout of that form; the approver brought it up.
+    get_line="$(first_cscb_call_at_or_after "${T_CALL}" get --claude-instance-id "${ID[${x}]}")"
+    [[ -n "${get_line}" ]] || fail "${step}: no CSCB get of T2 after its launch timeout"
+    call_fields "${step}" "${get_line}"
+    t_get="${CALL_T}"
+    [[ "$(count_log "$(get_after_timeout_line "${x}" "${FORM_TMUX_UNRESPONSIVE}")")" == 1 ]] \
+        || fail "${step}: no single line of the get after T2's launch timeout reading this launch's pending row: $(log_lines "$(matcher "${GET_LINE_HEAD}" " of ${REF[${x}]} ")" | cut -c1-300)"
+    approver_brought_up "${step}" "${x}" "${t_get}"
+
+    # No ErrCallTimeout for T2, and still no warning.
+    n="$(count_log "$(launch_answer_line "${x}" ErrCallTimeout)")"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} ErrCallTimeout answer(s) for T2"
+    n="$(count_log "$(get_after_timeout_line "${x}" "${FORM_CALL_TIMEOUT}")")"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} get line(s) after an ErrCallTimeout of T2"
+    n="$(log_lines_from "${T_CALL}" "" "$(matcher ErrCallTimeout)" | grep -c -F -e "${REF[${x}]}" -e "persona=${KEY[${x}]} " || true)"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} server.log line(s) for T2 name ErrCallTimeout"
+    [[ "$(count_log "${WARN_STEM}")" == "${WARN_BEFORE}" ]] || fail "${step}: a call-timeout warning after the start with ${CALL_TIMEOUT_HIGH_MS}"
+    echo "${TEST_NAME}: ${step}: no warning; T2's get at +$(seconds_between "${T_CALL}" "${t_get}")s read this launch's pending row; T2 up (waiting) at +$(seconds_between "${T_CALL}" "$(now_s)")s with no ErrCallTimeout"
+    tmux_shim_mode log
+}
+
+# ---------------------------------------------------------------------------
+# The legs, in order
 # ---------------------------------------------------------------------------
 
 leg_values
@@ -1401,6 +1725,8 @@ leg_sequence
 leg_change
 leg_refused_stopping
 leg_refused_grace
+leg_call_timeout_low
+leg_call_timeout_high
 
 # ---------------------------------------------------------------------------
 # Closing assertions (b.jg5 SRJ-1401, SRJ-1418)

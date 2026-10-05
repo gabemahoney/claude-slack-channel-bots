@@ -240,7 +240,9 @@ tests/
                                    # every start; a held launch's approver pace, pending-row runs and live-row sequence runs waiting on G from its launch start;
                                    # the relaunching stuck-launch post at B; "still stopping" following the written stopping window; a changed value used from
                                    # the next read, a `[pause]`-only change logging none; refused values: one `ad-config-malformed` alert per affected
-                                   # persona, nothing destroyed or counted, the last values kept, one all-clear once fixed (see fmk scenarios below)
+                                   # persona, nothing destroyed or counted, the last values kept, one all-clear once fixed; the call timeout: below the
+                                   # need, the startup warning and a held launch ending in `ErrCallTimeout` with no launch over its row; above it, no warning
+                                   # and agent-director's launch-timeout `ErrTmuxUnresponsive` (see fmk scenarios below)
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
@@ -696,8 +698,8 @@ by single spaces, hold every fixed-string fragment in order;
 `cscb_ad_count <verb> [<fragment>...]` prints how many. The harness's calls,
 the stub's calls and any `stop` line never count.
 `wait_for_cscb_ad_call <count-before> <timeout-s> <step> <verb>
-[<fragment>...]` (a harness addition for scenarios 8 and 23) waits until that count
-is above `<count-before>`, which the caller takes before the step it waits
+[<fragment>...]` (a harness addition for scenarios 8 and 23, which scenario
+24 uses too) waits until that count is above `<count-before>`, which the caller takes before the step it waits
 on, then prints the next such line (`cscb_ad_calls`' line `<count-before>` +
 1); it fails naming `<step>` when the count stays there for `<timeout-s>`.
 
@@ -1048,32 +1050,38 @@ package, beside scenario 8's floor, floor label and floor message:
 Test 26 shows agent-director's timing values are logged and govern CSCB's
 waits, and that a settings file agent-director refuses is one alert per
 affected persona, with nothing destroyed or counted, cleared once the file
-is fixed. It runs in fmk mode on the release, with the Slack stub recording
+is fixed, and that CSCB's call timeout below agent-director's slowest verb
+is warned about at start and never retried over a live row, while above it
+agent-director's own launch-timeout answer arrives. It runs in fmk mode on the release, with the Slack stub recording
 each `chat.postMessage` text whole. Before the first start it writes the
 scenario HOME's agent-director settings file with `write_ad_settings`, a
 `[tmux]` table holding the scenario inputs SRJ-1426 names; scenario 24 is
 one of the two scenarios that write `[tmux]` (b.jg5 SRJ-1401, SRJ-1306).
 Each key is checked to be one of the package's `AD_TMUX_KEYS`, and each
-value to be at or above its minimum, before it is written:
+value of the first table (and the change leg's 240) to be at or above its
+minimum, before it is written:
 
 | `[tmux]` key | Written | Minimum it is checked against |
 |---|---|---|
-| `pending_grace_seconds` | 120 (240 in the change leg) | `pendingGraceMinimumSeconds` at the default `create_timeout_ms` and `pipe_close_wait_ms` |
+| `pending_grace_seconds` | 120 (240 in the change leg; 61 in the call-timeout legs) | `pendingGraceMinimumSeconds` at the default `create_timeout_ms` and `pipe_close_wait_ms`; in the call-timeout legs the value is `pendingGraceMinimumSeconds` at 40000 and the default `pipe_close_wait_ms` |
 | `stopping_window_seconds` | 30 | `AD_SETTING_MINIMUMS stopping_window_seconds` |
 | `starting_session_seconds` | 120 | `AD_SETTING_MINIMUMS starting_session_seconds` |
+| `create_timeout_ms` | 40000, in the call-timeout legs only | none (its key is checked, and the grace period is raised with it) |
 
-The other six `[tmux]` values stay agent-director's defaults. At these
-values G is 120 s, B 300 s and the alert threshold 180 s (printed, not used:
-the alert timings are unit-tested). CSCB's config sets
+The other `[tmux]` values stay agent-director's defaults. At the first
+table's values G is 120 s, B 300 s and the alert threshold 180 s (printed,
+not used: the alert timings are unit-tested). CSCB's config sets
 `health_check_interval` 0 (no health tick launches anyone),
 `resume_enabled` true (S's finished row comes back by a `resume`),
 `exit_timeout` 5 and `agent_director_poll_interval_ms` 3600000 (the
 permission poller's `list` calls stay out of the shim's log), all CSCB's
 own, through its config; the refused-value legs also set
-`session_restart_delay` 0. Test 26 runs about 37 minutes: about 19 for the
-legs before the refused values, most of it the held launch's B and the
-change leg's three waits for the next timed probe, and about 9 for each
-refused-value leg.
+`session_restart_delay` 0, and the call-timeout legs
+`agent_director_call_timeout_ms` (30000, then 61000). Test 26 runs about 39
+minutes: about 17 for the legs before the refused values, most of it the
+held launch's B and the change leg's three waits for the next timed probe,
+about 9 for each refused-value leg, and about 4 for the two call-timeout
+legs.
 
 Each persona (`t26_<x>`, one channel each) has its stub mode selected for
 its working directory with `stub_mode`:
@@ -1086,6 +1094,8 @@ its working directory with `stub_mode`:
 | R | `work/r`, `unrecognised-dialog`, answered by `stub_press_enter` | by a confirmed reload |
 | C1 | `work/c1`, `at-once` | by a confirmed reload while the settings file is refused (refused-stopping) |
 | C2 | `work/c2`, `at-once` | the same, in refused-grace |
+| T1 | `work/t1`, `dev-channels` (it reports in on the approver's Enter: a launch that loses its create reply runs the stub in that mode, `scenario.sh`'s seeding rules) | across a plain stop and start, in call-timeout-30000 |
+| T2 | `work/t2`, `dev-channels` | the same, in call-timeout-61000 |
 
 A persona added across a restart is a plain stop, the config written, the
 state dir's `config.json.last-applied` removed, and a start: with no
@@ -1094,12 +1104,15 @@ preview to confirm (see "Reload" in the repository's `README.md`). R's reload is
 renaming `config.json.pending` to `config.json.apply`, as Test 8 does.
 
 The harness steps, all from the scenario's own shell: `write_ad_settings`
-(set-up, the change leg and the refused-value legs), `stub_mode`, `stub_release` (S's lingering
-stub), `stub_press_enter` (R's dialog), re-pointing Q's symlinked working
+(set-up, the change leg, the refused-value legs and the call-timeout legs),
+`stub_mode`, `stub_release` (S's lingering stub), `stub_press_enter` (R's
+dialog), `tmux_shim_mode` (`slow-create` with a 50 s delay in the
+call-timeout legs, then `log` again), re-pointing Q's symlinked working
 directory by one rename (Q's row records the real path, so its `cwd` no
 longer matches), the plain stops and starts, the `last-applied` removal and
 the reload's confirmation, and harness `get` calls that read a row's
-`launch_started_at` and `ended_at`. Every start of the script logs exactly
+`launch_started_at`, `ended_at` or state (T1's, about once a second, in
+call-timeout-30000). Every start of the script logs exactly
 one values line.
 
 The legs run in order, each on the state the one before left:
@@ -1166,6 +1179,37 @@ The legs run in order, each on the state the one before left:
 - refused-grace. The same checks for `pending_grace_seconds = "60"` (a TOML
   string), with C2 added by a confirmed reload and C1 among the personas
   already up.
+- call-timeout-30000 (b.jg5 SRJ-1426, SRJ-213, SRJ-407; AC 84). A plain
+  stop; the settings file written with `create_timeout_ms` 40000,
+  `pending_grace_seconds` 61 and the earlier stopping and starting values,
+  with no `[pause]` table; `agent_director_call_timeout_ms` 30000 in CSCB's
+  config, T1 added, the tmux shim in `slow-create` with a 50 s delay (longer
+  than `create_timeout_ms`), and a start. That start logs exactly one values
+  line, the printer's for these values, and exactly one call-timeout
+  warning, the printer's line for 30000 and these values, before T1's spawn.
+  T1's plain spawn, made by this server process, ends in `ErrCallTimeout`:
+  its refusal line comes at least 30 s (less a 0.5 s allowance for the
+  shim's line) and less than 40 s after the call's line in the shim's log.
+  The first CSCB `get` of T1 after the spawn follows, and exactly one get
+  line names the `ErrCallTimeout` form and reads this launch's `pending`
+  row; a CSCB `send-keys` (the approver's Enter) follows it and T1 reads
+  `waiting`. The harness reads T1's row about once a second from the spawn
+  until T1 is up and its retry timer has stopped. Every later CSCB launch
+  call of T1 (`spawn` or `resume`) must follow a harness reading of `ended`
+  or `missing` (the latest before the call) and a CSCB `get` or `status` of
+  the row since the call before it; with none such, the spawn is T1's only
+  launch.
+- call-timeout-61000 (b.jg5 SRJ-1426; AC 84). A plain stop,
+  `agent_director_call_timeout_ms` 61000, T2 added, the same settings file
+  and `slow-create`, and a start, which logs no call-timeout warning (the
+  printer gives none for 61000). T2's plain spawn, the same launch as T1's
+  under the higher setting, ends in `ErrTmuxUnresponsive` carrying
+  `LAUNCH_TIMEOUT_PHRASE`, its refusal line at least 40 s and less than
+  61 s after the call. Exactly one get line names the `ErrTmuxUnresponsive`
+  form and reads this launch's `pending` row; the approver brings T2 up
+  (`waiting`). No `server.log` line for T2 names `ErrCallTimeout`, no get
+  line names that form for T2, and no warning follows. The tmux shim is set
+  back to `log`.
 
 The two refused-value legs hold the suite's only deliberately refused
 values (the exception b.jg5 SRJ-1401 makes; SRJ-1426, SRJ-209, SRJ-316,
@@ -1191,8 +1235,7 @@ function, `refused_values_check`, checks both legs:
   retries do not retry the launch.
 - `version` does not clear. The bot-server probe inside the refusal (its
   `version` call is answered) is followed by no all-clear and no clear line.
-- After the fix. The next retry's `status` clears the outage: the persona
-  launches and reads `waiting`, and its channel gets exactly one all-clear
+- After the fix. The persona reads `waiting`, and its channel gets exactly one all-clear
   post, the printer's text, made after the fix, with one clear line. The
   first bot-server probe after the fix logs no values line (the values are
   unchanged) and no refused-read line.
@@ -1201,6 +1244,23 @@ Each refused-value leg waits for the added persona's retry timer to stop
 (its pending-only retry reads the row live) before it ends, so no persona
 up at the next leg has a timer: a pending-only retry landing inside the
 next leg's refusal would start a new episode.
+
+The call-timeout legs' need is 60.9 s: the launch ceiling at C = 40 s,
+max(Q + C + 2A + 4W, 2Q + C + 3W) = 45.9 s at agent-director's default Q, A
+and W, plus `AD_CALL_TIMEOUT_NEED_MARGIN_MS` (15 s, `src/ad-settings.ts`).
+`resume`, a reuse and a plain spawn share that ceiling, so there is no
+separate case for the plain spawn; their equality is unit-tested
+(`tests/ad-settings.test.ts`, b.jg5 SRJ-213) and only derived in the
+script's header. The file holds no `[pause]` table, so `pause`'s ceiling
+(9 s plus the default 30 s) is below the launch ceiling. The script takes
+the need from the printer (`adCallTimeoutNeed`, whose verb must be `resume`,
+the launch row's first verb) and checks before the legs that 30000 lies
+below `create_timeout_ms` and at or below the need, that 61000 lies above
+the need, that the delay is longer than `create_timeout_ms`, and that the
+printer's warning names 30000 and the need and gives none for 61000. "The
+same launch" of call-timeout-61000 is a second persona's fresh plain spawn,
+under the same settings file, after a restart without teardown that picks
+up 61000; T1 is up by then.
 
 A bot-server probe is a CSCB `version` call in the agent-director shim's
 log whose parent is the bot server; the server reads the settings file
@@ -1239,6 +1299,11 @@ package:
 | The retry timer's first and longest waits | `UNAVAILABLE_RETRY_BASE_S`, `UNAVAILABLE_RETRY_CEILING_S` | `src/unavailable-retry.ts` |
 | The re-armed reason of a retry read as unknown | `RESTART_OUTCOME_LIVENESS_UNKNOWN` | `src/restart.ts` |
 | The retry timer's retry, re-armed and stop lines | `unavailableRetryRetryLine <C's key> <retry> full`, `unavailableRetryReArmedLine <C's key> <retry> full <marker> 0`, `unavailableRetryStoppedLine <C's key> full none <marker>` | `src/unavailable-retry.ts` |
+| The call-timeout legs' grace period (61) | `pendingGraceMinimumSeconds 40000 <default pipe_close_wait_ms>` | `src/ad-settings.ts` |
+| The need and the verb whose ceiling sets it | `adCallTimeoutNeed <the call-timeout table>` | `src/ad-settings.ts` |
+| The startup warning for 30000, and none for 61000 | `buildAdCallTimeoutWarningLine <30000\|61000> <the call-timeout table>` | `src/ad-settings.ts` |
+| The launch-timeout phrase T2's answer carries | `LAUNCH_TIMEOUT_PHRASE` | `src/ad-description-phrases.ts` |
+| How the get line after a launch timeout names its form | `launchUnavailableFormText <ErrCallTimeout\|ErrTmuxUnresponsive>` | `src/session-manager.ts`, `src/ad-error-class.ts` |
 
 C is the persona a refused-value leg adds (C1 or C2). A marker the script
 passes in place of agent-director's description, the reader's reason or a
@@ -1251,8 +1316,13 @@ its no-notice tail (`src/session-manager.ts` `logRefusal`), the latch line
 abort's start line (`src/pending-row.ts`), the relaunch-failed line, the
 reads-dead line and the liveness-unknown line (`src/restart.ts`), the
 refused liveness read's line (`src/server.ts` `isSessionAlive`), the start
-sweep's lines (`src/session-manager.ts` `reconcileOrphans`) and the
-`reload-applied` line (`src/reload-apply.ts`).
+sweep's lines (`src/session-manager.ts` `reconcileOrphans`), the
+`reload-applied` line (`src/reload-apply.ts`) and the `ad-config-malformed`
+class the all-clear lists (`src/outage-state.ts` does not export it; the
+printer's `ALL_CLEAR_TEMPLATE` checks it is one of `OUTAGE_CLASS_ORDER`).
+The get line after a launch timeout is matched by its head and its form and
+read parts, quoted from `src/session-manager.ts` `launchUnavailableGetLine`,
+with the form printed by `launchUnavailableFormText`.
 
 ### The value printer
 
@@ -1333,9 +1403,14 @@ builder's output for the given arguments.
 | `RESTART_OUTCOME_LIVENESS_UNKNOWN` | the restart work's outcome, and a retry's again-reason, when the persona's liveness reads unknown | `src/restart.ts` |
 | `unavailableRetryStoppedLine <persona-key> <full\|pending-only> <row\|none> <reason>` | the line of a stop of the persona's retry timer, in that mode, naming the row read (`none`: no row) | `src/unavailable-retry.ts` |
 | `UNAVAILABLE_RETRY_CEILING_S` | the retry timer's longest wait, in seconds, in decimal | `src/unavailable-retry.ts` |
+| `buildAdCallTimeoutWarningLine <call-timeout-ms> [<key>=<integer>...]` | the startup call-timeout warning for that call timeout and the values in effect; the empty text when the builder gives no line | `src/ad-settings.ts` |
+| `adCallTimeoutNeed [<key>=<integer>...]` | `<need-ms> <verb>`: the call timeout's need, in decimal, and the verb whose ceiling sets it | `src/ad-settings.ts` |
+| `LAUNCH_TIMEOUT_PHRASE` | the phrase an `ErrTmuxUnresponsive` carries when it ends a launch call as a launch timeout | `src/ad-description-phrases.ts` |
+| `launchUnavailableFormText <err-name>` | how the line of the one get after a launch timeout names the timeout's form `<err-name>`, which must be one of the package's `LAUNCH_TIMEOUT_FORM_…` values | `src/session-manager.ts`, `src/ad-error-class.ts` |
 
-`adGraceMs`, `adAlertThresholdMs` and `adLaunchBoundMs` take the values in
-effect built from their arguments: the `[tmux]` values, `DEFAULT_AD_SETTINGS`'
+`adGraceMs`, `adAlertThresholdMs`, `adLaunchBoundMs`, `adCallTimeoutNeed`
+and `buildAdCallTimeoutWarningLine` take the values in effect built from
+their `<key>=<integer>` arguments: the `[tmux]` values, `DEFAULT_AD_SETTINGS`'
 own but for each given `<key>`, and `DEFAULT_AD_SETTINGS_IN_EFFECT`'s
 `pauseTimeout`. In every `<key>=<integer>` argument `<key>` is one of the
 package's `AD_TMUX_KEYS`; an unknown key, a key given twice or a value that
