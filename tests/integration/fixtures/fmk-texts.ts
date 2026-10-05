@@ -223,6 +223,72 @@
  *                                    what follows it, <next> the name of a
  *                                    `KILL_RETRY_NEXT_*` export of
  *                                    src/kill-retry.ts
+ * Scenario 9, teardowns that meet a conflict (test-21; b.jg5 SRJ-1411,
+ * SRJ-901, SRJ-903 to SRJ-907, SRJ-909, SRJ-1007, SRJ-1013). <command> is the
+ * name of a `CLI_COMMAND_*` export of src/cli-teardown.ts, <class> the name of
+ * an `AD_ERROR_CLASS_*` export of src/ad-error-class.ts, and a persona is
+ * named by <name> (its key from `personaKey`, its session from
+ * `personaTmuxSessionName`):
+ *   CLI_COMMAND_CLEAN_RESTART        the two teardown commands as their lines
+ *   CLI_COMMAND_STOP_BOTS            name them (src/cli-teardown.ts)
+ *   adErrorClass <class>             the class label (src/ad-error-class.ts)
+ *   adErrorName <error-class>        the error name of the agent-director error
+ *                                    class <error-class> the package re-exports
+ *                                    (src/agent-director-errors.ts; for
+ *                                    example ErrSpawnNotPausable)
+ *   CONFLICT_PANE_NOT_FOUND_PHRASE   agent-director's CONFLICT words "the
+ *                                    agent's pane was not found"
+ *                                    (src/ad-description-phrases.ts)
+ *   precheckFailureLine.head <command> <name> <class>
+ *                                    the precheck's failure line
+ *                                    (`precheckFailureLine`) up to its
+ *                                    description: the persona, key, session
+ *                                    and class
+ *   precheckNothingStoppedLine <command>
+ *                                    the failed precheck's last line
+ *   teardownFailureLine.head <command> <name> <class>
+ *                                    a persona's teardown failure line
+ *                                    (`teardownFailureLine`) up to its
+ *                                    description
+ *   cliTeardownKillFailed.failure-line <command> <name> <description>
+ *   cliTeardownKillFailed.alert-line <command> <name> <description>
+ *   cliTeardownKillFailed.entry-class <command> <name> <description>
+ *   cliTeardownKillFailed.entry-message <command> <name> <description>
+ *                                    the report of a persona whose teardown
+ *                                    kill's tries ended exhausted on an
+ *                                    `ErrTmuxKillFailed` carrying
+ *                                    <description> with the ordinary alert
+ *                                    decided (`teardownKillOutcomeOf`, then
+ *                                    `personaTeardownReportOf`,
+ *                                    src/cli-teardown.ts): its failure line,
+ *                                    the kill-failure alert's ordinary
+ *                                    version for the CLI-teardown route with
+ *                                    its closing sentence (the line after
+ *                                    it), and its startup-errors entry's
+ *                                    class and message
+ *   teardownNotStoppedLine <command> <count>
+ *                                    the command's last line when <count>
+ *                                    personas could not be stopped
+ *   PERSONA_KILL_FAILED_LABEL        the CLI-teardown route's startup-errors
+ *                                    class (src/kill-failure-alert.ts)
+ *   CLEAN_RESTART_NOT_RESTARTED_LABEL
+ *                                    the not-restarted alert's class
+ *                                    (src/cli-teardown.ts)
+ *   cleanRestartNotRestartedAlert <class> <names>
+ *                                    `clean_restart`'s not-restarted alert
+ *                                    for the personas <names> (comma-
+ *                                    separated, in configuration order), each
+ *                                    failed under <class>
+ *   answerCheckFailedTryLine.head <try>
+ *                                    `clean_restart`'s answer check's line
+ *                                    for a failed `list` try <try>
+ *                                    (`answerCheckFailedTryLine`) up to its
+ *                                    class
+ *   adGraceMs.default                agent-director's pending grace period G
+ *                                    in milliseconds at its default settings
+ *                                    (`adGraceMs` of
+ *                                    DEFAULT_AD_SETTINGS_IN_EFFECT,
+ *                                    src/ad-settings.ts)
  *
  * SPDX-License-Identifier: MIT
  */
@@ -418,6 +484,59 @@ async function killRetryTryLineParts(instanceId: string, n: number, max: number,
   const outcome = await killFailedOutcome(DESCRIPTION_STAND_IN)
   const tryLine = await fn<(prefix: string, id: string, n: number, max: number, outcome: unknown, next: unknown) => string>('kill-retry.ts', 'killRetryTryLine')
   return around(tryLine('', instanceId, n, max, outcome, next), await describeKillOutcome(outcome), 'killRetryTryLine')
+}
+
+/** A stand-in class label, for the entry that cuts a line at its class: found once in it. */
+const CLASS_STAND_IN = 'FMKTEXTSCLASSSTANDIN'
+
+/** The value of the `CLI_COMMAND_*` export named `name` (src/cli-teardown.ts). */
+async function cliCommand(name: string): Promise<string> {
+  if (!/^CLI_COMMAND_[A-Z_]+$/.test(name)) throw new PrinterFailure(`command '${name}' is not a CLI_COMMAND_* export's name`, USAGE_EXIT)
+  return text('cli-teardown.ts', name)
+}
+
+/** The value of the `AD_ERROR_CLASS_*` export named `name` (src/ad-error-class.ts). */
+async function adErrorClass(name: string): Promise<string> {
+  if (!/^AD_ERROR_CLASS_[A-Z_]+$/.test(name)) throw new PrinterFailure(`class '${name}' is not an AD_ERROR_CLASS_* export's name`, USAGE_EXIT)
+  return text('ad-error-class.ts', name)
+}
+
+/** The persona named `name` as the CLI's lines take it: its name and key (`personaKey`). */
+async function cliPersona(name: string): Promise<{ readonly name: string; readonly key: string }> {
+  return { name, key: (await fn<(n: string) => string>('persona-identity.ts', 'personaKey'))(name) }
+}
+
+/**
+ * The report (`personaTeardownReportOf`) of the persona named `name` under
+ * the `CLI_COMMAND_*` export `commandName`, whose teardown kill's tries
+ * ended exhausted after `KILL_RETRY_TRIES` kills on an `ErrTmuxKillFailed`
+ * carrying `description`, with the ordinary alert decided, its outcome
+ * mapped by `teardownKillOutcomeOf` as the CLI maps it.
+ */
+async function cliTeardownKillFailedReport(
+  commandName: string,
+  name: string,
+  description: string,
+): Promise<{ readonly printed: readonly string[]; readonly entry?: { readonly classLabel: string; readonly message: string } }> {
+  const command = await cliCommand(commandName)
+  const persona = await cliPersona(name)
+  const tries = await killRetryTries()
+  const result = {
+    outcome: await killFailedOutcome(description),
+    end: await value('kill-retry.ts', 'KILL_RETRY_END_EXHAUSTED'),
+    tries,
+    reads: tries - 1,
+    alert: { kind: await value('kill-retry.ts', 'KILL_RETRY_ALERT_ORDINARY'), lastKillFailedDescription: description },
+  }
+  const outcome = (await fn<(r: object) => unknown>('cli-teardown.ts', 'teardownKillOutcomeOf'))(result)
+  const report = (await fn<(c: string, p: object, o: unknown) => { printed: string[]; entry?: { classLabel: string; message: string } }>(
+    'cli-teardown.ts',
+    'personaTeardownReportOf',
+  ))(command, persona, outcome)
+  if (report.printed.length !== 2 || report.entry === undefined) {
+    throw new PrinterFailure('personaTeardownReportOf did not give a failure line, an alert line and an entry for a kill that failed with the ordinary alert', ENTRY_FAIL_EXIT)
+  }
+  return report
 }
 
 /** The entries, by the name a script passes. */
@@ -627,6 +746,97 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
       if (!/^KILL_RETRY_NEXT_[A-Z_]+$/.test(nextName)) throw new PrinterFailure(`next '${nextName}' is not a KILL_RETRY_NEXT_* export's name`, USAGE_EXIT)
       const next = await value('kill-retry.ts', nextName)
       return (await killRetryTryLineParts(DESCRIPTION_STAND_IN.toLowerCase(), 1, 1, next)).tail
+    },
+  },
+  // Scenario 9 (test-21; b.jg5 SRJ-1411).
+  CLI_COMMAND_CLEAN_RESTART: { args: [], print: () => cliCommand('CLI_COMMAND_CLEAN_RESTART') },
+  CLI_COMMAND_STOP_BOTS: { args: [], print: () => cliCommand('CLI_COMMAND_STOP_BOTS') },
+  adErrorClass: { args: ['class'], print: async ([name]) => adErrorClass(name) },
+  adErrorName: {
+    args: ['error-class'],
+    print: async ([name]) => {
+      if (!/^Err[A-Za-z]+$/.test(name)) throw new PrinterFailure(`error class '${name}' is not an Err* name`, USAGE_EXIT)
+      const errorClass = await value('agent-director-errors.ts', name)
+      if (typeof errorClass !== 'function' || errorClass.name !== name) {
+        throw new PrinterFailure(`src/agent-director-errors.ts's ${name} is not an error class named ${name}`, ENTRY_FAIL_EXIT)
+      }
+      return errorClass.name
+    },
+  },
+  CONFLICT_PANE_NOT_FOUND_PHRASE: { args: [], print: () => text('ad-description-phrases.ts', 'CONFLICT_PANE_NOT_FOUND_PHRASE') },
+  'precheckFailureLine.head': {
+    args: ['command', 'name', 'class'],
+    print: async ([commandName, name, className]) => {
+      const line = (await fn<(c: string, p: object, f: object) => string>('cli-teardown.ts', 'precheckFailureLine'))(
+        await cliCommand(commandName),
+        await cliPersona(name),
+        { errorClass: await adErrorClass(className), description: DESCRIPTION_STAND_IN },
+      )
+      return around(line, DESCRIPTION_STAND_IN, 'precheckFailureLine').head
+    },
+  },
+  precheckNothingStoppedLine: {
+    args: ['command'],
+    print: async ([commandName]) => (await fn<(c: string) => string>('cli-teardown.ts', 'precheckNothingStoppedLine'))(await cliCommand(commandName)),
+  },
+  'teardownFailureLine.head': {
+    args: ['command', 'name', 'class'],
+    print: async ([commandName, name, className]) => {
+      const line = (await fn<(c: string, p: object, f: object) => string>('cli-teardown.ts', 'teardownFailureLine'))(
+        await cliCommand(commandName),
+        await cliPersona(name),
+        { errorClass: await adErrorClass(className), description: DESCRIPTION_STAND_IN },
+      )
+      return around(line, DESCRIPTION_STAND_IN, 'teardownFailureLine').head
+    },
+  },
+  'cliTeardownKillFailed.failure-line': {
+    args: ['command', 'name', 'description'],
+    print: async ([commandName, name, description]) => (await cliTeardownKillFailedReport(commandName, name, description)).printed[0],
+  },
+  'cliTeardownKillFailed.alert-line': {
+    args: ['command', 'name', 'description'],
+    print: async ([commandName, name, description]) => (await cliTeardownKillFailedReport(commandName, name, description)).printed[1],
+  },
+  'cliTeardownKillFailed.entry-class': {
+    args: ['command', 'name', 'description'],
+    print: async ([commandName, name, description]) => (await cliTeardownKillFailedReport(commandName, name, description)).entry!.classLabel,
+  },
+  'cliTeardownKillFailed.entry-message': {
+    args: ['command', 'name', 'description'],
+    print: async ([commandName, name, description]) => (await cliTeardownKillFailedReport(commandName, name, description)).entry!.message,
+  },
+  teardownNotStoppedLine: {
+    args: ['command', 'count'],
+    print: async ([commandName, raw]) => (await fn<(c: string, n: number) => string>('cli-teardown.ts', 'teardownNotStoppedLine'))(await cliCommand(commandName), count(raw)),
+  },
+  PERSONA_KILL_FAILED_LABEL: { args: [], print: () => text('kill-failure-alert.ts', 'PERSONA_KILL_FAILED_LABEL') },
+  CLEAN_RESTART_NOT_RESTARTED_LABEL: { args: [], print: () => text('cli-teardown.ts', 'CLEAN_RESTART_NOT_RESTARTED_LABEL') },
+  cleanRestartNotRestartedAlert: {
+    args: ['class', 'names'],
+    print: async ([className, names]) => {
+      const errorClass = await adErrorClass(className)
+      const list = names.split(',')
+      if (list.some((n) => n === '')) throw new PrinterFailure(`names '${names}' holds an empty name`, USAGE_EXIT)
+      const failures = await Promise.all(list.map(async (n) => ({ persona: await cliPersona(n), errorClass })))
+      return (await fn<(f: readonly object[]) => string>('cli-teardown.ts', 'cleanRestartNotRestartedAlert'))(failures)
+    },
+  },
+  'answerCheckFailedTryLine.head': {
+    args: ['try'],
+    print: async ([raw]) => {
+      const line = (await fn<(n: number, r: object) => string>('cli-teardown.ts', 'answerCheckFailedTryLine'))(tryNumber(raw), {
+        errorClass: CLASS_STAND_IN,
+        description: DESCRIPTION_STAND_IN,
+      })
+      return around(line, CLASS_STAND_IN, 'answerCheckFailedTryLine').head
+    },
+  },
+  'adGraceMs.default': {
+    args: [],
+    print: async () => {
+      const defaults = await value('ad-settings.ts', 'DEFAULT_AD_SETTINGS_IN_EFFECT')
+      return String((await fn<(values: unknown) => number>('ad-settings.ts', 'adGraceMs'))(defaults))
     },
   },
 }

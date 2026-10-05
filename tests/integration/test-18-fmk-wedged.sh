@@ -6,7 +6,8 @@
 # per persona and none once its alert has posted, one alert per persona once
 # the alert threshold has passed, caps no persona, keeps retrying, and makes
 # one recovery post per persona when tmux answers again; the start sweep's
-# delay stays within one row's retries (b.jg5 SRJ-302, SRJ-305, SRJ-307 to
+# delay stays within one row's retries and one try per later row (b.jg5
+# SRJ-302, SRJ-305, SRJ-307 to
 # SRJ-310, SRJ-702, SRJ-1006, SRJ-1016, SRJ-1401, SRJ-1418).
 #
 # fmk setup (lib/scenario.sh fmk mode; b.jg5 SRJ-1306, SRJ-1401):

@@ -2478,6 +2478,44 @@ describe('static audit: fmk-texts.ts and repoint_symlink check the image and HOM
 })
 
 // ---------------------------------------------------------------------------
+// Static audit: the list-refusing agent-director stand-in (b.jg5 SRJ-1306,
+// SRJ-1411; test-21's harness addition, confirm at the reconcile pass)
+// ---------------------------------------------------------------------------
+
+/** The stand-in that refuses `list` and runs the release for every other verb, swapped in behind the shim. */
+const LIST_REFUSING_STAND_IN_PATH = join(INTEGRATION_DIR, 'fixtures', 'agent-director-list-refusing.sh')
+
+/** The value of the first literal `<name>=<path>` assignment in a shell file, or undefined. */
+function literalAssignment(source: string, name: string): string | undefined {
+  return new RegExp(`^${name}=(/[^\\s"'$;]+)$`, 'm').exec(source)?.[1]
+}
+
+describe('static audit: the list-refusing stand-in checks the image marker first (b.jg5 SRJ-1306)', () => {
+  test('the current tree: its first step is the /etc/cscb-ci-image check that exits non-zero', () => {
+    expect(existsSync(LIST_REFUSING_STAND_IN_PATH)).toBe(true)
+    expect(shellEntryFindings(relative(REPO_ROOT, LIST_REFUSING_STAND_IN_PATH), readFileSync(LIST_REFUSING_STAND_IN_PATH, 'utf-8'))).toEqual([])
+  })
+
+  test('the stand-in with a step before its marker check is flagged, naming the file and the rule', () => {
+    const source = readFileSync(LIST_REFUSING_STAND_IN_PATH, 'utf-8')
+    const stepFirst = source.replace(/\nif \[\[ ! -e \/etc\/cscb-ci-image \]\]; then\n/, '\nrelease=/opt/agent-director/bin/agent-director; "${release}" version\n$&')
+
+    expect(stepFirst).not.toBe(source)
+    expectNamedFindings(shellEntryFindings('agent-director-list-refusing.sh', stepFirst), 'agent-director-list-refusing.sh', IMAGE_GUARD_RULE.markerFirst)
+  })
+
+  test('the binary it runs is the release scenario.sh names (SCENARIO_RELEASE_BIN), never the shim or a binary on PATH', () => {
+    const release = literalAssignment(readFileSync(SCENARIO_PATH, 'utf-8'), 'SCENARIO_RELEASE_BIN')
+    const standIn = readFileSync(LIST_REFUSING_STAND_IN_PATH, 'utf-8')
+
+    expect(release).toBeDefined()
+    expect(literalAssignment(standIn, 'release')).toBe(release)
+    expect(standIn).toContain('exec -a "$0" "${release}" "$@"')
+    expect(standIn).not.toContain('CSCB_CI_AGENT_DIRECTOR_SHIM_MARKER')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Static audit: the harness's one agent-director delete (b.jg5 SRJ-1306)
 // ---------------------------------------------------------------------------
 
