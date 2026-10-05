@@ -20,6 +20,12 @@
 #
 # Before the main flow, a pre-persona leg starts against a `routes` config in
 # its own temp SLACK_STATE_DIR and must fail with the SR-1.7 conversion error.
+# Runs only in a cscb-ci image: without its marker, refuse before any other step.
+if [[ ! -e /etc/cscb-ci-image ]]; then
+    echo "FAIL: test-1-install-startup: refused: /etc/cscb-ci-image is absent; this test runs only in a cscb-ci image (/ci)" >&2
+    exit 1
+fi
+
 set -euo pipefail
 
 TEST_NAME="test-1-install-startup"

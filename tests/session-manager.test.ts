@@ -519,6 +519,24 @@
  *     the old-life cause, `launchSession` answers the uncounted `refused`
  *     for a wait and for a sequence, and the start pass counts the wait's
  *     `sequence-waiting` once.
+ *   - b.jg5 SRJ-1306, SRJ-1401 (E39 T3), on `makeRecoveryHarness`: the
+ *     forced-launch seams `tests/integration/fixtures/fmk-driver.ts` calls
+ *     (`_forceResumeForPersona`, `_forceReuseSpawnForPersona`) each make
+ *     their one call, the `resume` of P's own id or its reuse spawn, with
+ *     nothing read of the row first, whatever the row reads (`pending`
+ *     included), and no kill, delete or other call beyond what the
+ *     production handling of the answer makes. For success, the
+ *     `resume`'s ErrSpawnNotResumable and ErrNoSessionId, and the reuse's
+ *     ErrInvalidFlags, ErrInternal (an ErrUnknownErrorName) in its
+ *     UNCLASSIFIED and UNUSABLE NAME forms and ErrTmuxSessionCreate, the
+ *     seam's calls, answer (result, the error with `classifyAdError`'s
+ *     class, counted, latched) and effects on P equal what a production path
+ *     meeting the same answer gives B on the same harness: the live-row
+ *     sequence's launch entry; for ErrSpawnNotResumable the latch re-check's
+ *     `resume`; for UNUSABLE NAME a retired key's first launch, whose reuse
+ *     also read nothing first, so both latch after the one latch-time
+ *     `status` read. A launch of P in flight is joined and an unresolvable
+ *     `claude_config_dir` defers, each with no call.
  *
  * Most blocks use a stand-in persona keyed by its channel ID
  * (`makeStandInPersonaConfig`), so their `cscb_<channelId>` ids and outage
@@ -1051,6 +1069,7 @@ import {
   ErrTmuxCaptureFailed,
   ErrTmuxSendKeys,
   ErrTmuxSessionCreate,
+  ErrUnknownErrorName,
   ERR_STORE_OPEN_NAME,
 } from '../src/agent-director-errors.ts'
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
@@ -1585,6 +1604,7 @@ import {
 import { KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT } from '../src/kill-failure-alert.ts'
 import { LIVE_ROW_SEQUENCE_ENTRY_GET, type LiveRowSequenceRegistry } from '../src/live-row-sequence.ts'
 import { STUCK_LAUNCH_ABORT_CONFLICT_CASE_ROWS, STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS } from './test-helpers/conflict-cases.ts'
+import { _forceResumeForPersona, _forceReuseSpawnForPersona, type ForcedLaunchError, type ForcedLaunchOutcome } from '../src/session-manager.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -33506,5 +33526,244 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
     expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
     expect(h.latch.isLatched(p)).toBe(false)
     if (h.approverRunning(p)) await h.runApproverToStop(p)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-1306, SRJ-1401 (E39 T3): the forced-launch seams
+// `tests/integration/fixtures/fmk-driver.ts` calls, on `makeRecoveryHarness`.
+// Each seam makes its one launch call through the production launch path with
+// nothing read of P's row first. Each answer is checked against a production
+// path meeting the same answer, run for B on the same harness: the live-row
+// sequence's launch entry (`launchForLiveRowSequence`, the same wrapping: a
+// launch attempt, counted as a launch outside the restart work); for the
+// `resume`'s ErrSpawnNotResumable, the latch re-check's `resume`, the one
+// production site that answers it with no re-read; for an UNUSABLE NAME
+// answer, a retired key's first launch, the production reuse spawn that also
+// read nothing of the row first, so both latch after the one latch-time
+// `status` read (b.jg5 SRJ-501, SRJ-805; scenario 25's form).
+// ---------------------------------------------------------------------------
+
+/** The two seams, by the call each forces: the seam, and the stub verb of its call. */
+const FORCED_SEAMS = {
+  resume: { seam: _forceResumeForPersona, verb: 'resume' },
+  reuse: { seam: _forceReuseSpawnForPersona, verb: 'spawn' },
+} as const
+
+type ForcedSeamName = keyof typeof FORCED_SEAMS
+
+/** Persona `key`'s forced launch through seam `name`, over the harness's applied configuration. */
+function forceLaunch(h: RecoveryHarness, key: string, name: ForcedSeamName): Promise<ForcedLaunchOutcome> {
+  return FORCED_SEAMS[name].seam(harnessPersona(h, key), h.config)
+}
+
+/** What the sequence's launch entry last read before its launch: the row `ended`. */
+const FORCED_COMPARED_LAST_READ = latchRowStateRead(LIVENESS_DEAD_ROW_ENDED)
+
+/** The live-row sequence's launch entry for persona `key`, of `kind`: the production path a forced launch is compared with. */
+function sequenceEntryLaunch(kind: LiveRowSequenceLaunchKind): (h: RecoveryHarness, key: string) => Promise<unknown> {
+  return (h, key) => launchForLiveRowSequence(harnessPersona(h, key), h.config, { kind, lastRead: FORCED_COMPARED_LAST_READ })
+}
+
+/** The latch re-check's `resume` of persona `key` (a resume latch on a row read ended), run as its timer runs it; it answers no launch result. */
+async function recheckResumeLaunch(h: RecoveryHarness, key: string): Promise<undefined> {
+  latchForRecheck(h, key, RESUME_RECHECK_LATCH, ROW_ENDED)
+  h.script(step1Status(LIVENESS_DEAD_ROW_ENDED))
+  await h.advanceToRecheck()
+  return undefined
+}
+
+/** A retired key's first launch of persona `key` (b.jg5 SRJ-805): a reuse spawn with nothing of the row read first. */
+function retiredFirstLaunch(h: RecoveryHarness, key: string): Promise<unknown> {
+  h.retireKey(key)
+  return spawnForPersona(harnessPersona(h, key), h.config, false)
+}
+
+/** What a launch of persona `key` left, which a forced launch and the production path are compared on. */
+function forcedComparedEffectsOf(h: RecoveryHarness, key: string): Record<string, unknown> {
+  return {
+    armed: h.triggers.filter((t) => t.key === key).map((t) => t.kind),
+    failures: getFailureCount(key),
+    notices: h.notices.filter((notice) => notice.key === key).length,
+    outages: [...getOutageFlags(key)],
+    unclassified: [h.unclassifiedErrorOpen(key), unclassifiedStartedLines(h, key).length],
+    held: h.invalidFlagsHold.isHeld(key),
+    latched: h.latch.isLatched(key),
+    latchRecord: [h.latch.record(key)?.latchCase, h.latch.record(key)?.refusedOperation, h.latch.record(key)?.rowState],
+    posts: h.episodeNotices.filter((notice) => notice.key === key).length,
+    approverRunning: h.approverRunning(key),
+  }
+}
+
+/**
+ * The forced call's own error `err` as a seam answers it: its name, the class
+ * CSCB's classifier gives it, its description rendered for a line (an
+ * ErrUnknownErrorName's from its envelope) and an ErrUnknownErrorName's
+ * unknown name.
+ */
+function expectedForcedError(err: AgentDirectorError): ForcedLaunchError {
+  const { errorClass } = classifyAdError(err)
+  if (err instanceof ErrUnknownErrorName) {
+    const reported = (err.envelope as { readonly err_description: string }).err_description
+    return { name: err.errName, errorClass, description: renderLogMessageText(reported), unknownName: err.unknownName }
+  }
+  return { name: err.errName, errorClass, description: renderLogMessageText(err.errDescription) }
+}
+
+/** One answer a forced launch meets, and the production path it is compared with. */
+interface ForcedLaunchRow {
+  readonly seam: ForcedSeamName
+  /** The forced call's answer: an error to throw, or success. */
+  readonly make: () => AgentDirectorError | undefined
+  /** The stub calls the forced launch makes, in order: its one call, then only what the production handling of the answer calls. */
+  readonly calls: readonly string[]
+  /** The production path meeting the same answer for persona `key`: its result, or undefined where it answers none. */
+  readonly production: (h: RecoveryHarness, key: string) => Promise<unknown>
+  /** The result, where the production path answers none: the result that site's handler answers. */
+  readonly result?: (key: string) => SpawnPersonaResult
+  readonly options?: RecoveryHarnessOptions
+  /** Install agent-director's version re-check: an ErrInvalidFlags makes its one immediate re-check (b.jg5 SRJ-104, SRJ-204). */
+  readonly versionRecheck?: true
+  /** Effects the production site adds of its own, left out of the comparison: the latch re-check's latch and recovery posts. */
+  readonly siteOwn?: readonly string[]
+}
+
+const FORCED_LAUNCH_ROWS: ReadonlyArray<readonly [string, ForcedLaunchRow]> = [
+  ['the resume, success', { seam: 'resume', make: () => undefined, calls: ['resume'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_RESUME) }],
+  [
+    'the resume, ErrSpawnNotResumable: no re-read, nothing killed or launched; retrying with the lost-race cause, not counted, not posted',
+    {
+      seam: 'resume',
+      make: () => errSpawnNotResumable(),
+      calls: ['resume'],
+      production: recheckResumeLaunch,
+      result: (key) => ({ key, action: SPAWN_ACTION_RETRYING }),
+      options: { latchRecheck: true },
+      siteOwn: ['posts'],
+    },
+  ],
+  [
+    'the resume, ErrNoSessionId: the one reuse spawn of the same id follows, and the error answered is the resume\'s',
+    { seam: 'resume', make: () => errNoSessionId(), calls: ['resume', 'spawn'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_RESUME) },
+  ],
+  ['the reuse spawn, success', { seam: 'reuse', make: () => undefined, calls: ['spawn'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_REUSE) }],
+  [
+    'the reuse spawn, ErrInvalidFlags: one version re-check, then P held',
+    { seam: 'reuse', make: () => errInvalidFlags('spawn'), calls: ['spawn'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_REUSE), versionRecheck: true },
+  ],
+  [
+    'the reuse spawn, ErrUnknownErrorName for ErrInternal: UNCLASSIFIED, refused, not counted, reported to P\'s episode',
+    { seam: 'reuse', make: () => errInternal(), calls: ['spawn'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_REUSE) },
+  ],
+  [
+    'the reuse spawn, ErrUnknownErrorName for ErrInternal naming the recorded tmux session name: UNUSABLE NAME, P latched with one post after the one latch-time status read; nothing counted',
+    { seam: 'reuse', make: () => errUnusableName(), calls: ['spawn', 'status'], production: retiredFirstLaunch },
+  ],
+  [
+    'the reuse spawn, ErrTmuxSessionCreate: one counted launch failure',
+    { seam: 'reuse', make: () => errTmuxSessionCreate('spawn'), calls: ['spawn'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_REUSE) },
+  ],
+]
+
+describe('b.jg5 SRJ-1306, SRJ-1401: the forced-launch seams make their one call through the production launch path, and answer as it does', () => {
+  afterEach(() => {
+    expectNoKillOrDelete(srj105Harness!)
+    srj105AfterEach()
+  })
+
+  test.each(FORCED_LAUNCH_ROWS)('%s: the forced launch\'s calls, answer and effects on P equal the production path\'s for B', async (_label, row) => {
+    const { h, p, b } = srj105Build(row.options)
+    const rechecks = row.versionRecheck === true ? h.recheckAnswers(PHASE1_RC_VERSION) : undefined
+    const err = row.make()
+    if (err !== undefined) h.script(FORCED_SEAMS[row.seam].verb === 'resume' ? { resumeError: err } : { spawnError: err })
+    const order = recordCallOrder(h)
+
+    const forced = await forceLaunch(h, p, row.seam)
+
+    expect(order).toEqual([...row.calls])
+    expect(h.stub.calls.resumeCalls).toEqual(row.calls.includes('resume') ? [{ claude_instance_id: personaInstanceId(p) }] : [])
+    // Every spawn is P's reuse: the reuse seam's call, or the reuse after a no-transcript answer.
+    expect(h.stub.calls.spawnCalls).toEqual(row.calls.includes('spawn') ? [reuseSpawnOf(h, p)] : [])
+    expect(rechecks?.resolves.length).toBe(rechecks === undefined ? undefined : 1)
+    const forcedEffects = forcedComparedEffectsOf(h, p)
+
+    const produced = await row.production(h, b)
+
+    expect<unknown>(forced).toStrictEqual({
+      called: true,
+      result: produced === undefined ? row.result!(p) : { ...(produced as object), key: p },
+      ...(err === undefined ? {} : { error: expectedForcedError(err) }),
+      // Counted when it was counted as one launch failure, as the production path counted B's.
+      counted: getFailureCount(p) > 0,
+      latched: h.latch.isLatched(p),
+    })
+    const siteOwn = (effects: Record<string, unknown>) => Object.fromEntries(Object.entries(effects).filter(([name]) => !(row.siteOwn ?? []).includes(name)))
+    expect(siteOwn(forcedEffects)).toEqual(siteOwn(forcedComparedEffectsOf(h, b)))
+    // The production site's own effects are none for the forced launch: nothing posted for P.
+    for (const name of row.siteOwn ?? []) expect(forcedEffects[name]).toBe(0)
+    for (const key of [p, b]) if (h.approverRunning(key)) await h.runApproverToStop(key)
+  })
+
+  // The forced resume decides on no row state: whatever P's row reads, nothing reads it before the one resume.
+  test.each([...AGENT_DIRECTOR_LIVE_STATES, ...AGENT_DIRECTOR_DEAD_STATES, 'no row'])('the forced resume with P\'s row reading %s: the one resume, nothing read first; it answers as the production resume does', async (state) => {
+    const { h, p, b } = srj105Build()
+    h.script(
+      state === 'no row'
+        ? { statusError: errSpawnNotFound(), getError: errSpawnNotFound() }
+        : {
+            // With no launch start, a read of a pending row would latch P (b.jg5 SRJ-513).
+            statusResult: cannedStatusResult({ state, launch_started_at: SAMPLE_LAUNCH_START_NONE }),
+            getResult: harnessRow(h, harnessPersona(h, p), { state }),
+          },
+    )
+    const order = recordCallOrder(h)
+
+    const forced = await forceLaunch(h, p, 'resume')
+
+    expect(order).toEqual(['resume'])
+    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect<unknown>(forced).toStrictEqual({
+      called: true,
+      result: { ...((await sequenceEntryLaunch(LIVE_ROW_LAUNCH_RESUME)(h, b)) as object), key: p },
+      counted: false,
+      latched: false,
+    })
+    for (const key of [p, b]) if (h.approverRunning(key)) await h.runApproverToStop(key)
+  })
+
+  const SEAM_NAMES = Object.keys(FORCED_SEAMS) as ForcedSeamName[]
+
+  test.each(SEAM_NAMES)('the forced %s while a launch of P is in flight: joins it with no call of its own; called false, the in-flight launch\'s result', async (name) => {
+    const { h, p } = srj105Build()
+    const id = personaInstanceId(p)
+    const hold = holdSpawns(h.stub.client)
+    const inFlight = h.launch(p)
+    await hold.entered(id)
+    const order = recordCallOrder(h)
+
+    const forced = forceLaunch(h, p, name)
+    await h.clock.flush()
+    // The seam's own calls: those made before the launch in flight settles (whose after-launch step makes its own).
+    const seamCalls = [...order]
+    hold.release(id)
+    const launched = await inFlight
+    // A spawn the seam made would be held too: answer it, so a failing case ends.
+    hold.releaseAll()
+
+    expect(await forced).toStrictEqual({ called: false, result: launched, counted: false, latched: false })
+    expect([seamCalls, hold.calls.length, h.stub.calls.resumeCalls]).toEqual([[], 1, []])
+    await h.runApproverToStop(p)
+  })
+
+  test.each(SEAM_NAMES)('the forced %s of a persona whose claude_config_dir does not resolve: deferred as the production launch is, with no call; called false, nothing counted', async (name) => {
+    const configDir = fixtureSubdir('claude-config')
+    const { h, p } = srj105Build({ personas: [{ claude_config_dir: configDir }, {}] })
+    setConfigDirUnresolvableHook(() => false)
+    _setConfigDirFs({ realpath: realpathFailingUnder(configDir, () => true) })
+
+    const forced = await forceLaunch(h, p, name)
+
+    expect<unknown>(forced).toStrictEqual({ called: false, result: await sequenceEntryLaunch(LIVE_ROW_LAUNCH_REUSE)(h, p), counted: false, latched: false })
+    expect([h.stub.callCount(), getFailureCount(p), h.notices]).toEqual([0, 0, []])
   })
 })

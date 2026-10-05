@@ -181,6 +181,15 @@
  *   itself (`withItemCut`, only where the row's passage reads them) with the
  *   row's real check run on the edited document, and the rows SRJ-1103's and
  *   SRJ-1104's Test lines name reverted to the old wording.
+ * - E39 T5's check of tests/README.md (b.jg5 SRJ-1112), with
+ *   tests/integration/ listed read-only: the README names every `test-*.sh`
+ *   there and no `test-<n>-<name>.sh` that is not there; no passage about
+ *   the start sweep says it deletes, removes or loses a row
+ *   (`SWEEP_DELETE_CLAIMS`, read through `affirmedClaims`); its Test 10
+ *   passage says the sweep kills live rows, deletes none and records absent
+ *   personas' keys as retired, so the rows stay. Each self-checked on
+ *   in-memory copies, the old Test 10 passage among them. tests/README.md is
+ *   no shipped description: `SHIPPED_TEXTS` does not hold it.
  * CHANGELOG.md and docs/ are not shipped descriptions: the forbidden-term
  * audit still reads only `SHIPPED_TEXTS`, which holds neither. Besides the
  * two docs read through `OPERATOR_TEXTS`, the one docs/ file read is
@@ -6438,6 +6447,199 @@ describe('E36 T4: the debugging skill describes the build (b.jg5 SRJ-1104; AC 78
       const edited = text.slice(0, entryStart) + rest
       expect(edited).not.toBe(text)
       expect(debugRefusalEntryProblems(label, edited)).not.toEqual([])
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// E39 T5: tests/README.md names the integration scripts and keeps the start
+// sweep's rows (b.jg5 SRJ-1112). Each later scenario Epic names its script
+// there, and this block enforces it. tests/README.md is no shipped
+// description, so the forbidden-term audit does not read it.
+// ---------------------------------------------------------------------------
+
+const TESTS_README_FILE = 'tests/README.md'
+const INTEGRATION_DIR = 'tests/integration'
+
+/** Every `test-*.sh` file name in tests/integration/, listed read-only, sorted. */
+function integrationScripts(): string[] {
+  return readdirSync(resolve(REPO_ROOT, INTEGRATION_DIR))
+    .filter((name) => /^test-.*\.sh$/.test(name))
+    .sort()
+}
+
+/** Whether `text` names the file `name` as a whole name: not inside a longer name, a path ending in it (`tests/integration/<name>`) included. */
+function namesFile(text: string, name: string): boolean {
+  return new RegExp(`(?<![\\w.-])${escapeRegExp(name)}(?![\\w-]|\\.\\w)`).test(text)
+}
+
+/** Each of `scripts` that `readme` does not name. */
+function unnamedScripts(readme: string, scripts: readonly string[]): string[] {
+  return scripts.filter((name) => !namesFile(readme, name))
+}
+
+/** A `test-<n>-<name>.sh` file name, a number then a name; the `test-N-<short-name>.sh` template is none. */
+const SCRIPT_FILE_NAME = /(?<![\w.-])test-\d+-[\w-]+\.sh(?![\w-]|\.\w)/g
+
+/** Each `test-<n>-<name>.sh` `readme` names that is not one of `scripts` (a removed script), once, in order. */
+function removedScriptsNamed(readme: string, scripts: readonly string[]): string[] {
+  return [...new Set(readme.match(SCRIPT_FILE_NAME) ?? [])].filter((name) => !scripts.includes(name))
+}
+
+/** A text unit about the server's start sweep. */
+const NAMES_SWEEP = /\bsweep\b|\breconcileOrphans\b/i
+
+/**
+ * A start sweep that loses rows (SRJ-1112: it deletes none, so the rows
+ * earlier scripts leave stay), file-local, read through `affirmedClaims`, so
+ * a negation that governs the verb passes ("never deletes a row", "does not
+ * delete", "No row is deleted"). Any delete verb counts, a backticked
+ * `delete` included, unless its object is negated ("deletes no row",
+ * "deletes none"); `ROW_DELETE_CLAIMS` needs a determiner before "row" and
+ * reads "kills … and deletes none" as a delete, so it is not reused here.
+ */
+const SWEEP_DELETE_CLAIMS: readonly [label: string, pattern: RegExp][] = [
+  ['a delete', /`?\bdelet(?:e|es|ed|ing)\b`?(?!\s+(?:no|none|nothing)\b)/gi],
+  ['a row removed', /\bremov(?:e|es|ed|ing)\s+(?:the|its|their|a|each|every|all|that|this|one)\s+(?:[^\s.;]+\s+){0,3}?rows?\b/gi],
+  ['a row gone or removed', /\brows?\b[^.;]{0,80}?\b(?:is|are|was|were)\s+(?:then\s+)?(?:gone|removed)\b/gi],
+]
+
+/** Each `SWEEP_DELETE_CLAIMS` match no negation governs, in the text units of `readme` that name the start sweep, as `<label>: <matched text>`. */
+function sweepDeleteClaims(readme: string): string[] {
+  return textUnits(readme)
+    .filter((unit) => NAMES_SWEEP.test(unit))
+    .flatMap((unit) => affirmedClaims(unit, SWEEP_DELETE_CLAIMS))
+}
+
+/** SRJ-1112's Test 10 passage, element by element: [element, pattern over the flattened passage]. */
+const TEST_10_SWEEP_ELEMENTS: readonly [element: string, pattern: RegExp][] = [
+  ['the sweep kills live rows', /\bkills\b[^.;]*?\blive\b/i],
+  ['it deletes none', /\b(?:deletes\s+(?:no\s+rows?|none|nothing)|never\s+deletes|does\s+not\s+delete)\b/i],
+  ["it records absent personas' keys as retired", /\brecords\b(?=[^.;]*\bkeys?\b)(?=[^.;]*\babsent\b)(?=[^.;]*\bretired\b)/i],
+  ['the rows earlier scripts leave stay', /\brows?\b[^.;]*?\bstays?\b/i],
+]
+
+/** Whether a text unit or paragraph is the Test 10 passage: it names Test 10 and the start sweep. */
+function isTest10Passage(text: string): boolean {
+  return /\bTest 10\b/.test(text) && NAMES_SWEEP.test(text)
+}
+
+/** Each `TEST_10_SWEEP_ELEMENTS` element the Test 10 passage of `readme` lacks; one problem unless exactly one unit is that passage. */
+function test10PassageProblems(readme: string): string[] {
+  const passages = textUnits(readme).filter(isTest10Passage)
+  if (passages.length !== 1) return [`${passages.length} passages name Test 10 and the start sweep, expected 1`]
+  return TEST_10_SWEEP_ELEMENTS.filter(([, pattern]) => !pattern.test(passages[0])).map(([element]) => `lacks: ${element}`)
+}
+
+/** `readme` with its one Test 10 paragraph replaced by `passage`, in memory; throws unless exactly one paragraph is that passage. */
+function withTest10Passage(readme: string, passage: string): string {
+  const paragraphs = readme.split('\n\n')
+  const at = paragraphs.map((p, i) => (isTest10Passage(p) ? i : -1)).filter((i) => i >= 0)
+  if (at.length !== 1) throw new Error(`${TESTS_README_FILE}: ${at.length} paragraphs name Test 10 and the start sweep, expected 1`)
+  return [...paragraphs.slice(0, at[0]), passage, ...paragraphs.slice(at[0] + 1)].join('\n\n')
+}
+
+/** The Test 10 passage the README carried before SRJ-1112: the sweep killed and deleted rows, and the rows were gone. */
+const OLD_TEST_10_PASSAGE = `Test 10's live start runs the server's start sweep (\`reconcileOrphans\`,
+\`src/session-manager.ts\`), which kills and deletes every \`service=cscb\`
+agent-director row whose persona is not in Test 10's own config (and any row
+with a foreign instance ID or another working directory; a row with no
+persona label is killed when live and kept). Every persona row an earlier
+script left behind is gone after Test 10's start, and Test 12's live start
+does the same to Test 10's rows; that is acceptable only because the
+container is ephemeral and the scripts run one at a time. The sweep reaches
+only the shared store: an fmk script's rows are in its own store, which no
+other script's start sees.`
+
+describe(`E39 T5: ${TESTS_README_FILE} names every integration script and keeps the start sweep's rows (b.jg5 SRJ-1112)`, () => {
+  const readme = () => readRepoFile(TESTS_README_FILE)
+
+  test(`every ${INTEGRATION_DIR}/test-*.sh on disk is named in ${TESTS_README_FILE}`, () => {
+    const scripts = integrationScripts()
+    expect(scripts).not.toEqual([])
+    expect(unnamedScripts(readme(), scripts)).toEqual([])
+  })
+
+  test(`every test-<n>-<name>.sh ${TESTS_README_FILE} names exists in ${INTEGRATION_DIR} (no removed script)`, () => {
+    expect(removedScriptsNamed(readme(), integrationScripts())).toEqual([])
+  })
+
+  test(`no passage of ${TESTS_README_FILE} about the start sweep says it deletes, removes or loses a row`, () => {
+    expect(textUnits(readme()).some((unit) => NAMES_SWEEP.test(unit))).toBe(true)
+    expect(sweepDeleteClaims(readme())).toEqual([])
+  })
+
+  test("the Test 10 passage says the sweep kills live rows, deletes none and records absent personas' keys as retired, so the rows stay", () => {
+    expect(test10PassageProblems(readme())).toEqual([])
+  })
+
+  test(`the forbidden-term audit does not read ${TESTS_README_FILE}`, () => {
+    expect(SHIPPED_TEXTS.map(([name]) => name)).not.toContain(TESTS_README_FILE)
+  })
+
+  describe('self-checks, on in-memory copies', () => {
+    test('a script on disk the README does not name is reported', () => {
+      expect(unnamedScripts(readme(), [...integrationScripts(), 'test-29-fmk-unnamed-scenario.sh'])).toEqual(['test-29-fmk-unnamed-scenario.sh'])
+    })
+
+    test('a script named only inside a longer name is not named', () => {
+      expect(unnamedScripts('Runs `xtest-1-install-startup.sh` and `test-1-install-startup.sh.bak`.', ['test-1-install-startup.sh'])).toEqual(['test-1-install-startup.sh'])
+      expect(unnamedScripts('Runs `tests/integration/test-1-install-startup.sh`.', ['test-1-install-startup.sh'])).toEqual([])
+    })
+
+    test('a removed script the README names is reported, added to the README or gone from disk', () => {
+      const scripts = integrationScripts()
+      const added = `${readme()}\n\`test-11-exact-tmux-targets.sh\` checks the exact tmux targets.\n`
+      expect(removedScriptsNamed(added, scripts)).toEqual(['test-11-exact-tmux-targets.sh'])
+      expect(removedScriptsNamed(readme(), scripts.filter((name) => name !== 'test-12-bot-hook-absoluteness.sh'))).toEqual(['test-12-bot-hook-absoluteness.sh'])
+    })
+
+    test('the new-script template test-N-<short-name>.sh names no script', () => {
+      expect(removedScriptsNamed('Add `tests/integration/test-N-<short-name>.sh`, or `test-N-fmk-<short-name>`.', [])).toEqual([])
+    })
+
+    test.each([
+      ['the old Test 10 passage', OLD_TEST_10_PASSAGE],
+      ['kills and deletes', "Test 10's start sweep kills and deletes each live row whose persona is absent."],
+      ['deletes the rows', "Test 10's start sweep deletes the rows of absent personas."],
+      ['and deleted', "Test 10's start sweep kills each live stray and deleted its row."],
+      ['a passive delete', "Test 10's start sweep kills each live stray, and its row is deleted."],
+      ['a delete after the kill', "Test 10's start sweep kills each live stray, then deletes it."],
+      ['a `delete` call', "Test 10's start sweep calls `delete` on each absent persona's row."],
+      ['removes the row', "Test 10's start sweep removes each absent persona's row."],
+      ['rows gone', "Every row an earlier script left behind is gone after Test 10's start sweep."],
+    ])('the Test 10 passage saying the sweep loses rows (%s) is reported', (_label, passage) => {
+      expect(sweepDeleteClaims(withTest10Passage(readme(), passage))).not.toEqual([])
+    })
+
+    test.each([
+      ['deletes none', "Test 10's start sweep kills each live stray, deletes none and records each absent persona's key as retired; the rows earlier scripts leave stay."],
+      ['deletes no row', "Test 10's start sweep kills live strays and deletes no row."],
+      ['never deletes', "Test 10's start sweep never deletes a row: it kills live strays and records absent personas' keys as retired."],
+      ['does not delete', "Test 10's start sweep does not delete a row."],
+      ['no row is deleted', "Test 10's start sweep kills live strays. No row is deleted."],
+      ['no `delete` call', "Test 10's start sweep makes no `delete` call."],
+    ])('the Test 10 passage saying the sweep keeps rows (%s) is not reported', (_label, passage) => {
+      expect(sweepDeleteClaims(withTest10Passage(readme(), passage))).toEqual([])
+    })
+
+    test('the old Test 10 passage lacks every element', () => {
+      expect(test10PassageProblems(withTest10Passage(readme(), OLD_TEST_10_PASSAGE))).toEqual(TEST_10_SWEEP_ELEMENTS.map(([element]) => `lacks: ${element}`))
+    })
+
+    test.each([
+      ['the sweep kills live rows', "Test 10's start sweep deletes no row and records the key of every row whose persona is absent as retired, so every row stays."],
+      ['it deletes none', "Test 10's start sweep kills each live stray and records the key of every row whose persona is absent as retired, so every row stays."],
+      ["it records absent personas' keys as retired", "Test 10's start sweep kills each live stray and deletes no row, so every row stays."],
+      ['the rows earlier scripts leave stay', "Test 10's start sweep kills each live stray, deletes no row and records the key of every row whose persona is absent as retired."],
+    ])('a Test 10 passage without "%s" is reported', (element, passage) => {
+      expect(test10PassageProblems(withTest10Passage(readme(), passage))).toEqual([`lacks: ${element}`])
+    })
+
+    test('a README with no Test 10 passage, or two, is reported', () => {
+      expect(test10PassageProblems(withTest10Passage(readme(), 'Test 12 starts live.'))).toEqual(['0 passages name Test 10 and the start sweep, expected 1'])
+      const twice = `${readme()}\n\nTest 10's start sweep kills live strays.\n`
+      expect(test10PassageProblems(twice)).toEqual(['2 passages name Test 10 and the start sweep, expected 1'])
     })
   })
 })

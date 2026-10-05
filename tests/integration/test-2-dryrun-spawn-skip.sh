@@ -3,6 +3,12 @@
 # and dry-run skipped the spawn of both personas (the zero-channel one
 # included), then check /interject's status codes on the daemon's port.
 # Depends on Test 1 having left the daemon running with its two-persona config.
+# Runs only in a cscb-ci image: without its marker, refuse before any other step.
+if [[ ! -e /etc/cscb-ci-image ]]; then
+    echo "FAIL: test-2-dryrun-spawn-skip: refused: /etc/cscb-ci-image is absent; this test runs only in a cscb-ci image (/ci)" >&2
+    exit 1
+fi
+
 set -euo pipefail
 
 TEST_NAME="test-2-dryrun-spawn-skip"

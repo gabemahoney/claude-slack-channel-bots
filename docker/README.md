@@ -61,8 +61,8 @@ Every path is readable by every user, `testuser` included, except the global cli
 
 | Path | What it is |
 |---|---|
-| `/opt/agent-director/bin/agent-director` | The release's binary (agent-director `0.11.0`, commit `AD_COMMIT`), the image's default agent-director. Its directory holds nothing else and is first on the default `PATH` (`/opt/agent-director/bin:/usr/local/sbin:/usr/local/bin:…`), so every `/ci` test (test-1 to test-12) finds it, and a test can drop the directory from `PATH` and still find bun. `/usr/local/bin` holds no agent-director. In the live image the runner's staged binary takes this path (see [The live image's agent-director](#the-live-images-agent-director)), and `docker/live/`'s scripts put this directory first on their `PATH` |
-| `/opt/agent-director/admin/agent-director-admin` | The release's operator tool (`delete`, `kill-finished`), from the same install. It and its directory are mode 0755, so a scenario harness running as `testuser` can run it by this path; `install.sh --binary` takes it as `--admin-binary`. Never on `PATH`: the build fails if `command -v agent-director-admin` finds one |
+| `/opt/agent-director/bin/agent-director` | The release's binary (agent-director `0.11.0`, commit `AD_COMMIT`), the image's default agent-director. Its directory holds nothing else and is first on the default `PATH` (`/opt/agent-director/bin:/usr/local/sbin:/usr/local/bin:…`), so every `/ci` test (test-1 to test-12) finds it, and an fmk script (test-0, and every script whose name carries `-fmk-`) drops the directory from its `PATH` and still finds bun. `/usr/local/bin` holds no agent-director. In the live image the runner's staged binary takes this path (see [The live image's agent-director](#the-live-images-agent-director)), and `docker/live/`'s scripts put this directory first on their `PATH` |
+| `/opt/agent-director/admin/agent-director-admin` | The release's operator tool (`delete`, `kill-finished`), from the same install. It and its directory are mode 0755, so a scenario harness running as `testuser` can run it by this path; `install.sh --binary` takes it as `--admin-binary`, as the fmk harness's install does (`install_ad_release` in `tests/integration/lib/scenario.sh`). Never on `PATH`: the build fails if `command -v agent-director-admin` finds one |
 | `/opt/agent-director/install/install.sh` | The release's install script (mode 0755), from agent-director's source tree at the release tag `v0.11.0`. Off `PATH`; its directory holds nothing else |
 | `/opt/agent-director/client/agent-director-0.11.0.tgz` | The release's TypeScript client tarball, from the npm registry, checked against the pinned `AD_CLIENT_TGZ_SHA256` |
 | `/opt/agent-director/client/release.json` | The release record: `version`, `commit`, `client_tarball` (the tarball's path above) and `client_tarball_sha256` |
@@ -215,7 +215,11 @@ Only the `cscb-ci` images carry `/etc/cscb-ci-image`, written by the base
 build (so `cscb-ci` and `cscb-ci-live` have it too). `tests/runner.sh` checks
 for it first and, when it is absent, prints one line on stderr and exits 2,
 so the runner never runs outside a `cscb-ci` image. `ad-client-check.sh`
-checks for it the same way and exits 3.
+checks for it the same way and exits 3. Every integration script, the fmk
+driver and stub-session fixtures, `fixtures/phase1-client-check.ts`, and every
+harness step that installs or swaps an agent-director binary or shim or reads
+or edits a store with `sqlite3` refuse without it too (see `tests/README.md`,
+Image marker).
 
 ## Credential env vars passed to the container
 
