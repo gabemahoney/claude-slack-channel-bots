@@ -22,10 +22,12 @@
  *   with a code subject, subject and body agreeing; Gmail's confirm link only
  *   from Google's forwarding confirmation, an https link on Gmail's hosts,
  *   never one marked as the cancel link, and never one of two;
- * - a Slack code counts only when the mail was sent to the test email itself
- *   (any case, never its form without the `+tag` nor another tag): among the
- *   recipients mail.tm lists, else among its source's `To`, `Cc`,
- *   `Delivered-To` and `X-Original-To` headers; no test email, no code;
+ * - a Slack code counts only when the mail was sent to the signing-in
+ *   account's own address, the test human's or the second account's (any
+ *   case, never its form without the `+tag`, another tag, nor the other
+ *   account's address, though both accounts' mail lands in one mailbox):
+ *   among the recipients mail.tm lists, else among its source's `To`, `Cc`,
+ *   `Delivered-To` and `X-Original-To` headers; no address, no code;
  * - the sign-in waits at most 2 minutes for mail received after the attempt
  *   started, types each code once, and otherwise falls back (`needs-code`),
  *   a flow error on the code prompt included;
@@ -111,6 +113,15 @@ const HUMAN = 'test-human+cscbtest@gmail.invalid'
 const TAGLESS = 'test-human@gmail.invalid'
 /** The same inbox with another tag. */
 const OTHER_TAG = 'test-human+other@gmail.invalid'
+/** The second workspace user's address (live.json `second_user.email`), whose Slack mail is forwarded to the same mailbox. */
+const SECOND_USER = 'second-user+cscbsecond@other.invalid'
+/** The second account's address without its `+tag`. */
+const SECOND_TAGLESS = 'second-user@other.invalid'
+/** Each account that signs in: who, its own address, that address without its `+tag`, and the other account's address. */
+const ACCOUNTS = [
+  ['the test human', HUMAN, TAGLESS, SECOND_USER],
+  ['the second account', SECOND_USER, SECOND_TAGLESS, HUMAN],
+] as const
 const SLACK: MailAddress = { address: 'no-reply@slack.com', name: 'Slack' }
 const GOOGLE: MailAddress = { address: 'forwarding-noreply@google.com', name: 'Gmail Team' }
 const PERSON: MailAddress = { address: 'bob.smith@corp.invalid', name: 'Bob Smith' }
@@ -1163,6 +1174,36 @@ describe('waitForSlackSignInCode', () => {
     expect([[...exclude], transient.length]).toEqual([[decoy.id, genuine.id], 1])
   })
 
+  // Both accounts' Slack mail lands in the one mailbox: each sign-in matches only its own address.
+  describe.each(ACCOUNTS)('signing in as %s, with both accounts\' Slack code mail in one inbox', (_who, own, tagless, other) => {
+    test.each([
+      ['listed by mail.tm', [own], undefined],
+      ["forwarded, named by the source's To alone", [ADDRESS], () => rawSource([`Delivered-To: ${ADDRESS}`, `To: ${own}`])],
+      ["forwarded, named by the source's Delivered-To alone", [ADDRESS], () => rawSource([`Delivered-To: ${ADDRESS}`, `Delivered-To: ${own}`, `To: ${ADDRESS}`])],
+    ])('its own older code (%s) is taken; the newer codes to the other account, to its own +tag-less form and naming it only in X-Forwarded-For are each read by source once and never fetched', async (_how, recipients, source) => {
+      const clock = virtualClock(T0)
+      const genuine = slackMail(CODE, { at: -4 * SECOND, recipients })
+      const otherListed = slackMail(OTHER_CODE, { at: -3 * SECOND, recipients: [other] })
+      const otherForwarded = slackMail(signInCode(4), { at: -2 * SECOND, recipients: [ADDRESS] })
+      const taglessForm = slackMail(signInCode(5), { at: -1 * SECOND, recipients: [ADDRESS] })
+      const forwardedForOnly = slackMail(signInCode(6), { at: 0, recipients: [ADDRESS] })
+      const r = fakeReader(clock, [genuine, otherListed, otherForwarded, taglessForm, forwardedForOnly], {
+        sources: {
+          ...(source ? { [genuine.id]: source() } : {}),
+          [otherListed.id]: forwardedSource(other),
+          [otherForwarded.id]: forwardedSource(other),
+          [taglessForm.id]: forwardedSource(tagless),
+          [forwardedForOnly.id]: rawSource([`Delivered-To: ${ADDRESS}`, `X-Forwarded-For: ${own} ${ADDRESS}`, `To: ${ADDRESS}`]),
+        },
+      })
+      const exclude = new Set<string>()
+      expect(await waitForSlackSignInCode(r.reader, { ...options(clock, exclude), testEmail: own })).toEqual({ id: genuine.id, code: CODE })
+      const decoys = [forwardedForOnly, taglessForm, otherForwarded, otherListed].map((m) => m.id)
+      expect(r.calls).toEqual(['list @0s', ...decoys.map((id) => `source ${id}`), ...(source ? [`source ${genuine.id}`] : []), `get ${genuine.id}`])
+      expect([...exclude]).toEqual([...decoys, genuine.id])
+    })
+  })
+
   test.each(['', '   '])('no test email (%p): null at once, with no mailbox call and no time passed', async (testEmail) => {
     const clock = virtualClock(T0)
     const r = fakeReader(clock, [slackMail(CODE, { at: 0 })])
@@ -1388,6 +1429,38 @@ describe('answerSignInCodeFromMailbox', () => {
     expect(run.events).toEqual([WAITING, 'secret CODE', 'secret bare CODE', READ, 'type CODE @20s'])
     expect(run.calls.filter((c) => c.endsWith(decoy.id))).toEqual([`source ${decoy.id}`])
     expectNoCodeOrSecret(run)
+  })
+
+  describe.each(ACCOUNTS)('signing in as %s, with both accounts\' mail forwarded to the one mailbox', (_who, own, tagless, other) => {
+    /** No log line names either account's address, in any form or case. */
+    const expectNoAddress = (run: SignInRun): void => {
+      const lines = run.events.filter((e) => e.startsWith('info') || e.startsWith('detail')).map((l) => l.toLowerCase())
+      expect([HUMAN, TAGLESS, SECOND_USER, SECOND_TAGLESS].filter((a) => lines.some((l) => l.includes(a)))).toEqual([])
+    }
+    const forwarded = (code: string, at: number, to: string) => ({ mail: slackMail(code, { at, recipients: [ADDRESS] }), source: forwardedSource(to) })
+    const inbox = (...mails: Array<{ mail: MailMessage; source: string }>) => ({
+      messages: mails.map((m) => m.mail),
+      script: { sources: Object.fromEntries(mails.map((m) => [m.mail.id, m.source])) },
+    })
+
+    test("only its own code is typed: not the other account's, not its +tag-less form's, nor its own from before the attempt", async () => {
+      const stale = forwarded(signInCode(4), -MAIL_CLOCK_SKEW_MS - 1, own)
+      const others = forwarded(OTHER_CODE, 5 * SECOND, other)
+      const taglessForm = forwarded(signInCode(5), 10 * SECOND, tagless)
+      const run = await signIn({ ...inbox(stale, others, taglessForm, forwarded(CODE, 20 * SECOND, own)), testEmail: own })
+      expect(run.outcome).toBe('signed-in')
+      expect(run.events).toEqual([WAITING, 'secret CODE', 'secret bare CODE', READ, 'type CODE @20s'])
+      for (const decoy of [others, taglessForm]) expect(run.calls.filter((c) => c.endsWith(decoy.mail.id))).toEqual([`source ${decoy.mail.id}`])
+      expect(run.calls.filter((c) => c.endsWith(stale.mail.id))).toEqual([])
+      expectNoCodeOrSecret(run)
+      expectNoAddress(run)
+    })
+
+    test("only the other account's code arrives: needs-code at the deadline, nothing typed or registered", async () => {
+      const run = await signIn({ ...inbox(forwarded(OTHER_CODE, 5 * SECOND, other)), testEmail: own })
+      expect([run.outcome, run.events, run.elapsedMs]).toEqual(['needs-code', [WAITING, 'info sign-in code: not received within 2 min'], 2 * MINUTE])
+      expectNoAddress(run)
+    })
   })
 
   test('a FlowError on the code prompt: needs-code (the operator runs login), the step named with no code, and no other code typed', async () => {

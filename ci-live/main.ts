@@ -1062,9 +1062,10 @@ async function runLogin(env: RunEnv, signals: SignalControl): Promise<number> {
  * newest Gmail forwarding confirmation (newer mail may have come since), plus
  * its confirm link, the one value printed on purpose. Never the mailbox's
  * token or password (both registered with the redactor, which every line
- * goes through), nor the test human's address (registered too, and every
- * other address is masked). Exit 2 when there is no mailbox or no such
- * message.
+ * goes through), nor the test human's or the second account's address (when
+ * live.json names one: each registered in every form, with and without its
+ * `+tag`, and every other address is masked). Exit 2 when there is no
+ * mailbox or no such message.
  */
 async function runMailbox(options: RunOptions, redactor: Redactor): Promise<number> {
   const out = (line: string): void => {
@@ -1076,9 +1077,11 @@ async function runMailbox(options: RunOptions, redactor: Redactor): Promise<numb
   const realConfigDir = resolveConfigDir(process.env, homedir())
   const store = new SecretStore({ fs: nodeSecureFs, paths: livePathsIn(realConfigDir), env: process.env, redactor, dryRun: false, realConfigDir })
   try {
-    // Mail about the test human (Gmail's forwarding request) names its address, with and without the +tag.
+    // Mail about either account (Gmail's forwarding request for it) names its address, with and without the +tag.
     try {
-      for (const form of addressForms(store.readLiveConfig().testEmail)) redactor.addSecret(form)
+      const live = store.readLiveConfig()
+      for (const form of addressForms(live.testEmail)) redactor.addSecret(form)
+      if (live.secondUser) for (const form of addressForms(live.secondUser.email)) redactor.addSecret(form)
     } catch {
       /* no usable live.json: the other-address masking still applies */
     }
@@ -1215,7 +1218,11 @@ function runnerRow(id: string, title: string, reason: string, t0: number): Recor
   return { id, title, row: null, durationMs: Date.now() - t0, ...fail(reason, []) }
 }
 
-/** The test human's (and the second user's) session. A second account that needs a sign-in code skips its checks. */
+/**
+ * The test human's (and the second user's) session. A second account whose
+ * emailed sign-in code was not read from the test mailbox skips its checks;
+ * the skip reason names the mailbox and `login --second`, never an address.
+ */
 async function openSessions(ws: Workspace, log: RunLog): Promise<{ human: HumanSession; second: SecondUser | null; browser: BrowserDriver; secondSkip: string | null }> {
   const browser = await ws.browser()
   const human = new HumanSession(await browser.humanApi(), realClock)
@@ -1229,7 +1236,7 @@ async function openSessions(ws: Workspace, log: RunLog): Promise<{ human: HumanS
     }
   } catch (err) {
     if (!(err instanceof SignInCodeNeededError && err.who === 'second')) throw err
-    secondSkip = 'second account needs a sign-in code: run login --second'
+    secondSkip = 'second account needs a sign-in code the test mailbox (mailbox.json) did not give: check its mail is forwarded there, or run login --second'
     log.info(`session: ${secondSkip}; Checks 14, 16 and 20 are skipped`)
   }
   return { human, second, browser, secondSkip }

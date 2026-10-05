@@ -3,7 +3,20 @@
  * prompts (15–23), and the "Turn A's DMs on" gesture between 16 and 17.
  *
  * Checks 14, 16 and 20 need a second workspace user (live.json
- * `second_user`); without one they are SKIPPED (no second account).
+ * `second_user`); without one they are SKIPPED (no second account). They
+ * run on every run with the same second account: none of them reads that
+ * account's Slack DM history from before the run.
+ * - Check 14's "first-time user" is first-time to this run's server: the
+ *   server runs in this run's fresh container (its state dir in the
+ *   container's own layer), so it has no record of the account until the
+ *   check reaches it. Before posting, the check makes sure no server log
+ *   line and no persona tag in this container names the account's user ID
+ *   (`priorContact`); when one does, it is SKIPPED "not verified". The DM
+ *   with B may exist from an earlier run (`openDm` returns it); every
+ *   assertion is on what follows the check's own posts.
+ * - Checks 16 and 20 judge the DM with A by what it holds after the check's
+ *   first ask (`postsAfter`): in 16 nothing, in 20 A's message, in the DM
+ *   the call's result names (`sentDmId`).
  *
  * Checks 16 and 20 ask A for one outbound reply-tool call. When A says done
  * but made no call, they ask once more (the plan's Check 16 rule). A that
@@ -12,7 +25,7 @@
  * plan has no "not run" branch.
  */
 
-import { isFrom, messageText, type SlackMessage } from '../lib/human-session.ts'
+import { isFrom, messageText, tsAfter, type BotRef, type SlackMessage } from '../lib/human-session.ts'
 import { MINUTE, REPLY_TIMEOUT_MS, SECOND } from '../lib/wait.ts'
 import type { CheckContext } from './context.ts'
 import { expectOneTag, tagAttr } from './channel-checks.ts'
@@ -68,6 +81,74 @@ async function dmWith(ctx: CheckContext, letter: 'a' | 'b' | 'c'): Promise<strin
   const id = await needHuman(ctx).openDm(ctx.ids.bots[letter].userId)
   ctx.shared[key] = id
   return id
+}
+
+// ---------------------------------------------------------------------------
+// Rerunnable with the same second account: run-scoped decisions
+// ---------------------------------------------------------------------------
+
+/** True when `line` names the Slack ID `id` as a whole ID (not as part of a longer one). An empty `id` names nothing. */
+export function namesSlackId(line: string, id: string): boolean {
+  if (id === '') return false
+  for (let at = line.indexOf(id); at !== -1; at = line.indexOf(id, at + 1)) {
+    const before = line[at - 1] ?? ''
+    const after = line[at + id.length] ?? ''
+    if (!/[A-Z0-9]/.test(before) && !/[A-Z0-9]/.test(after)) return true
+  }
+  return false
+}
+
+/**
+ * Why this run's server is not meeting `userId` for the first time, or
+ * `null` when it is: no line of its server log (every rotation, in this
+ * run's container) and no `<channel …>` tag delivered to a persona (every
+ * transcript in the container) names the ID. Check 14 asks this before
+ * posting; a reason makes it SKIPPED "not verified". An empty `userId`
+ * (the account's ID unknown) is a reason too: nothing could be shown.
+ */
+export function priorContact(logLines: readonly string[], tagLines: readonly string[], userId: string): string | null {
+  if (userId === '') return "the second account's user ID is unknown"
+  const log = logLines.filter((l) => namesSlackId(l, userId)).length
+  const tagged = tagLines.filter((l) => namesSlackId(l, userId)).length
+  if (log === 0 && tagged === 0) return null
+  const parts = [...(log > 0 ? [`${log} server log line(s)`] : []), ...(tagged > 0 ? [`${tagged} persona tag(s)`] : [])]
+  return `this run's server has already seen the second account (${parts.join(' and ')} name its user ID before the check posted); it is no longer a first-time user`
+}
+
+/**
+ * The messages of `messages` newer than `after` (a Slack ts), from `from`
+ * when given and holding `text` in their text when given. Checks 16 and 20
+ * read the second user's DM with A through it, from the check's first ask
+ * on: what an earlier run left there is older.
+ */
+export function postsAfter(messages: readonly SlackMessage[], after: string, from?: BotRef, text?: string): SlackMessage[] {
+  return messages.filter((m) => tsAfter(m.ts, after) && (from === undefined || isFrom(m, from)) && (text === undefined || m.text.includes(text)))
+}
+
+/** The DM a successful reply call names (`Sent 1 message(s) to D…`), or `null` when it names none. */
+export function sentDmId(call: string): string | null {
+  return /Sent 1 message\(s\) to (D[A-Z0-9]+)\b/.exec(call)?.[1] ?? null
+}
+
+/**
+ * The jq filter `tags` reads a transcript with (cscb-live-helpers.sh): the
+ * content of each delivered message, a user entry or a queued command.
+ */
+const DELIVERED_JQ =
+  'if .type == "user" then .message.content elif .type == "attachment" and .attachment.type? == "queued_command" then .attachment.prompt else empty end | if type == "string" then . else (.[]? | .text? // empty) end'
+
+/**
+ * Every line naming `userId` in this container's server log (all of
+ * `server.log*`) and every `<channel …>` tag naming it in any persona's
+ * transcripts (not only the current one `tags` reads): `priorContact`'s input.
+ */
+async function contactLines(ctx: CheckContext, userId: string): Promise<{ log: string[]; tags: string[] }> {
+  const log = await lines(ctx, `cat "$S"/server.log* 2>/dev/null | grep -F -- ${q(userId)}`)
+  const tagLines = await lines(
+    ctx,
+    `for t in ~/.claude/projects/*-cscb-live-*/*.jsonl; do [ -e "$t" ] && jq -r ${q(DELIVERED_JQ)} "$t" 2>/dev/null; done | grep -oE '<channel source="slack[^"]*"[^>]*>' | grep -F -- ${q(userId)}`,
+  )
+  return { log, tags: tagLines }
 }
 
 // ---------------------------------------------------------------------------
@@ -157,11 +238,10 @@ export const check14: CheckDef<CheckContext> = {
     const f = new Findings()
     const second = need2(ctx)
     const ids = ctx.ids
-    for (const l of ['a', 'b', 'c'] as const) {
-      if ((await second.human.usedDm(ids.bots[l].userId)) !== null) {
-        return skipped('not verified: the second account already has a DM with a persona (a rerun; it is no longer a first-time user)')
-      }
-    }
+    // First-time to this run's server (fresh per run), whatever the account's Slack history: see the header.
+    const seen = await contactLines(ctx, second.userId)
+    const prior = priorContact(seen.log, seen.tags, second.userId)
+    if (prior !== null) return skipped(`not verified: ${prior}`)
     const post = await run(
       ctx,
       [
@@ -192,6 +272,7 @@ export const check14: CheckDef<CheckContext> = {
     // The plan's setup: the human invites the first-time user to A-home (already a member is fine).
     await needHuman(ctx).invite(ids.aHome, second.userId)
     const tsCh = await second.human.post(ids.aHome, 'Reply with the word open-channel.')
+    // New on a first run; an earlier run's on a rerun (conversations.open returns it): only what follows TS_DM is read.
     const bNewDm = await second.human.openDm(ids.bots.b.userId)
     const tsDm = await second.human.post(bNewDm, 'Reply with the word open-dm.')
     f.add(`TS_CH ${tsCh}, TS_DM ${tsDm}, B_NEW_DM_ID ${bNewDm}`)
@@ -258,9 +339,6 @@ export const check16: CheckDef<CheckContext> = {
   async run(ctx) {
     const f = new Findings()
     const second = need2(ctx)
-    if ((await second.human.usedDm(ctx.ids.bots.a.userId)) !== null) {
-      return skipped('not verified: the second account already has a DM with A (a rerun)')
-    }
     const m = await mark(ctx)
     const o = await askForOutboundCall(
       ctx,
@@ -281,7 +359,12 @@ export const check16: CheckDef<CheckContext> = {
     f.expect(call.includes(`Persona "persona_a" (key=persona_a) may not target "${second.userId}": DMs are off for this persona (dm.enabled is false).`), 'the refusal text is not the expected one')
     const open = (await sinceGrep(ctx, m, 'could not open a DM')).filter((l) => l.includes('persona_a') && l.includes(second.userId))
     f.expect(open.length === 0, 'a failed DM open was logged')
-    f.expect((await second.human.usedDm(ctx.ids.bots.a.userId)) === null, 'the second user has a DM with A')
+    // Nothing reached the second user: its DM with A (an earlier run's, if any) holds no message newer than the first ask,
+    // top-level or in a thread, from A or anyone.
+    const firstAsk = o.asks[0]!.ts
+    const dm = await second.human.existingDm(ctx.ids.bots.a.userId)
+    const posted = dm === null ? [] : postsAfter(await second.human.everythingAfter(dm, firstAsk, '0'), firstAsk)
+    f.expect(posted.length === 0, "the second user's DM with A got a message during this check")
     return f.result()
   },
 }
@@ -445,9 +528,6 @@ export const check20: CheckDef<CheckContext> = {
   async run(ctx) {
     const f = new Findings()
     const second = need2(ctx)
-    if ((await second.human.usedDm(ctx.ids.bots.a.userId)) !== null) {
-      return skipped('not verified: the second account already has a DM with A (a rerun)')
-    }
     const m = await mark(ctx)
     const o = await askForOutboundCall(
       ctx,
@@ -467,12 +547,17 @@ export const check20: CheckDef<CheckContext> = {
     const call = o.call
     f.expect(o.asks.at(-1)!.reply !== null, 'A did not say done')
     f.expect(call.startsWith(`chat_id=${second.userId} error=false`), 'the call to the second user failed')
-    f.expect(/Sent 1 message\(s\) to D[A-Z0-9]+/.test(call) && call.includes(` (the DM with ${second.userId})`), 'the result does not name the new DM')
+    // The DM is new on a first run, an earlier run's on a rerun: either way the one the result names.
+    const named = sentDmId(call)
+    f.expect(named !== null && call.includes(` (the DM with ${second.userId})`), 'the result does not name the DM')
     f.expect((await sinceGrep(ctx, m, 'could not open a DM')).length === 0, 'a failed DM open was logged')
     const dm = await second.human.existingDm(ctx.ids.bots.a.userId)
     if (f.expect(dm !== null, 'the second user has no DM with A')) {
-      const msgs = await second.human.history(dm!, '0')
-      f.expect(msgs.some((mm) => isFrom(mm, bot(ctx, 'a')) && mm.text.includes('DMs-on outbound check')), 'the DM does not hold A\'s message')
+      if (named !== null) f.expect(named === dm, "the result names another DM than the second user's DM with A")
+      // This check's message, not an earlier run's: newer than the first ask.
+      const firstAsk = o.asks[0]!.ts
+      const msgs = await second.human.history(dm!, firstAsk)
+      f.expect(postsAfter(msgs, firstAsk, bot(ctx, 'a'), 'DMs-on outbound check').length > 0, "the DM does not hold A's message from this check")
     }
     return f.result()
   },

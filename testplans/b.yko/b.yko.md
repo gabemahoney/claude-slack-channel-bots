@@ -238,14 +238,12 @@ production install (see Safety). People take part only by role; no person is
 named in this plan or in its results.
 
 - **The operator** runs every step on the test host, is an admin of the test workspace, posts the plan's messages from their own Slack account, and records the results. The operator is also B's and C's DM contact (`<OPERATOR_USER_ID>`).
-- **The second test user** is a workspace account, other than the operator's, that the operator can sign in as (for example in another browser profile). It has never had a DM with app A. Checks 16 and 20 use it.
-- **The first-time user** is a workspace account, other than the operator's, that has never posted in A-home, never had a DM with any persona app, and was never messaged by one. Check 14 uses it.
+- **The second test user** is a workspace account, other than the operator's, that the operator can sign in as (for example in another browser profile). Checks 16 and 20 use it. Its Slack history does not matter: a DM with app A that an earlier run left is judged only by what arrives in it after the check's first post.
+- **The first-time user** is a workspace account, other than the operator's, that this run's server has never seen: until Check 14 posts, no line of the server's log and no `<channel …>` tag delivered to a persona names its member ID. A server started with a fresh state directory meets every account for the first time, whatever the account's Slack history (posts in A-home, DMs with the persona apps from earlier runs). Check 14 uses it.
 
 One account may serve as both the first-time user and the second test user,
-in that order: Check 14 gives it a post in A-home and a DM with B, but no DM
-with A, so it still qualifies as the second test user for Checks 16 and 20,
-which run later. After the run, the account qualifies for neither role in a
-rerun: Check 20 opens a DM from A.
+in that order (Check 14 runs before Checks 16 and 20), and the same account
+serves every run.
 
 ### 1.2 Workspace prerequisites and placeholders
 
@@ -1273,8 +1271,8 @@ A is mentions-only in coordination again.
 
 ## Part 6: Open access
 
-This check verifies the live leg of AC 17: a workspace user who has never
-interacted with the bots gets answers from a persona in a channel and by DM,
+This check verifies the live leg of AC 17: a workspace user the server has
+never seen gets answers from a persona in a channel and by DM,
 with no allowlist and no pairing step. It covers b.av2 SR-10.1 (the server
 neither reads nor writes `access.json`, and a stale one is ignored and left
 in place) and SR-10.2's access rows, and checks what postinstall left on the
@@ -1287,7 +1285,7 @@ nothing is pending.
 
 ### Setup for this check
 
-- **The first-time user** (Part 1.1). Its sidebar and **Apps** list show no conversation with "CSCB Test A", "CSCB Test B" or "CSCB Test C". Invite it to A-home.
+- **The first-time user** (Part 1.1). Before step 1, `if guard; then cat "$S"/server.log* 2>/dev/null | grep -cF '<FIRST_TIME_USER_ID>'; fi` prints `0`, and no persona's transcripts hold a delivered `<channel …>` tag with `user_id="<FIRST_TIME_USER_ID>"`. Otherwise this run's server has already seen the account: record Check 14 as "not verified" with the reason in Notes, and skip it. Invite it to A-home (already a member is fine).
 - **Nothing added for it.** No config edit, allowlist entry or approval of any kind is made for this user, before or during the check.
 
 ### Check 14: a first-time user reaches a persona in a channel and by DM, with no approval step (AC 17)
@@ -1325,7 +1323,7 @@ Steps:
 3. Restart the test server with the "Guarded restart" (Part 2.3), so the start runs with the stale file in place. Its expected results apply unchanged.
 4. Record where the log ends: `MARK=$(mark)`.
 5. Signed in as the first-time user, post in A-home: "Reply with the word open-channel." Work out its `<TS>` (call it `<TS_CH>`).
-6. As the same user, send "Reply with the word open-dm." in a new DM with app B. Work out its `<TS>` (`<TS_DM>`) and note the DM conversation ID as `<B_NEW_DM_ID>`.
+6. As the same user, send "Reply with the word open-dm." in its DM with app B (opened now, or the one an earlier run left). Work out its `<TS>` (`<TS_DM>`) and note the DM conversation ID as `<B_NEW_DM_ID>`. Only what follows `<TS_CH>` and `<TS_DM>` is judged.
 7. Wait for both answers, then run:
 
    ```sh
@@ -1347,7 +1345,7 @@ Expected:
 - Step 7: `tags a <TS_CH>` prints exactly one tag, with `chat_id="<A_HOME_CHANNEL_ID>"`, `via="receive_all"` and `user_id="<FIRST_TIME_USER_ID>"`. `tags b <TS_DM>` prints exactly one, with `chat_id="<B_NEW_DM_ID>"`, `via="dm"` and `user_id="<FIRST_TIME_USER_ID>"`. The last `replies a` line has `chat_id=<A_HOME_CHANNEL_ID>` and the last `replies b` line has `chat_id=<B_NEW_DM_ID>`, each with `error=false` and a result containing `Sent`. The `grep` prints nothing. `stale file unchanged` is printed, and the count of `.corrupt.` files is `0`.
 - At no point does the first-time user get a pairing code, an approval prompt or any message other than the two answers, in the channel, in the DM or as a Slackbot message. No config edit, allowlist entry or approval is made for the user.
 
-Pass: a user who had never interacted with the bots got answers from A in its channel and from B by DM, with no approval step; the stale `access.json` was neither read nor changed; and postinstall left no `access.json`, a `debug-slack-channel-bots` link into the package and no link to the retired skill.
+Pass: a user the server had never seen got answers from A in its channel and from B by DM, with no approval step; the stale `access.json` was neither read nor changed; and postinstall left no `access.json`, a `debug-slack-channel-bots` link into the package and no link to the retired skill.
 
 
 ---
@@ -1407,10 +1405,10 @@ setup failure. Fix it as the `debug-slack-channel-bots` skill's section "A
 persona can't open a DM: re-install its app to gain `im:write`" says, and
 record it in Notes.
 
-The **second test user** (Part 1.1) must never have had a DM with app A: in
-that account's sidebar and **Apps** list, no conversation with "CSCB Test A"
-exists. Check 14 gave the first-time user a post in A-home and a DM with B
-only, so the same account qualifies.
+The **second test user** (Part 1.1) may already have a DM with app A from
+an earlier run. Checks 16 and 20 judge that DM only by the messages newer than
+the check's own first post in A-home (step 2), so the same account serves
+every run, and Check 14's first-time user may be it.
 
 A DM message's `<TS>` comes from its **Copy link** URL, as for channel
 messages. The same URL's path holds the DM conversation ID (`D…`): note the
@@ -1467,13 +1465,13 @@ Steps:
    since "$MARK" | grep -F 'could not open a DM'
    ```
 
-4. Signed in as the second test user, look for any DM or **Apps** conversation from "CSCB Test A".
+4. Signed in as the second test user, look for its DM or **Apps** conversation with "CSCB Test A" (an earlier run's, if any).
 
 Expected:
 
 - The `replies a` line starts `chat_id=<SECOND_USER_ID> error=true` and contains `Persona "persona_a" (key=persona_a) may not target "<SECOND_USER_ID>": DMs are off for this persona (dm.enabled is false).`
 - The `grep` prints no line naming `persona_a` and `<SECOND_USER_ID>`: no failed DM open was logged.
-- The second test user has no conversation with A and no new message from it.
+- The second test user's DM with A, if it has one, holds no message newer than step 2's post: none from A or anyone, top-level or in a thread.
 
 If the `replies a` command prints nothing, A made no call to
 `<SECOND_USER_ID>`: it chose not to call the tool. Ask once more; if there is still no call, record the check as "not run"
@@ -1662,8 +1660,8 @@ Pass: C started and connected with no failure line, answered the DM in place wit
 
 ### Check 20: a persona with DMs on opens a DM with a user and posts as itself (AC 38)
 
-A's DMs are now on. The second test user still has no DM with A (Check 16
-posted nothing).
+A's DMs are now on. Check 16 posted nothing to the second test user; its DM
+with A may exist from an earlier run.
 
 Steps:
 
@@ -1682,9 +1680,9 @@ Expected:
 
 - The `replies a` line starts `chat_id=<SECOND_USER_ID> error=false` and contains `Sent 1 message(s) to D` followed by the DM's ID and ` (the DM with <SECOND_USER_ID>)`.
 - The `grep` prints nothing. A `missing_scope` failure here means app A lacks `im:write` (see this part's setup).
-- The second test user has a new DM from app A, holding "DMs-on outbound check" under A's name and avatar.
+- The DM ID in that line is the second test user's DM with app A (new on a first run, an earlier run's on a rerun), and that DM holds "DMs-on outbound check" from A, under A's name and avatar, newer than step 2's post.
 
-Pass: A's call opened a DM with the second test user and the message appears there under A's identity.
+Pass: A's call reached the second test user's DM with A and the message appears there under A's identity.
 
 
 ### Check 21: an edit that adds a mention wakes the persona once
@@ -2602,9 +2600,12 @@ results, and also when the run stopped early.
 
 agent-director keeps the stopped rows for resume, and the pre-flight fails
 while they exist. A rerun on this host needs them removed with
-agent-director's own tools first, or a fresh test host. A rerun also needs a
-second test user and a first-time user that meet Part 1.1 again: this run's
-accounts now have a DM with A and a history with A and B.
+agent-director's own tools first, or a fresh test host. The same second test
+user and first-time user serve a rerun: Part 1.1 defines the first-time user
+by the run's server, not by the account's Slack history. A rerun whose server
+has already seen the account (its log or a persona's transcripts name it, as
+with a reused state directory) records Check 14 as "not verified" (see its
+setup).
 
 ---
 

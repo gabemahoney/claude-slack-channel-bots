@@ -403,7 +403,9 @@ runner lives in `ci-live/` and is not part of the npm package.
      "(transient: rerun later)" and replaces nothing.
 
 8. Opens the test human's session (and the second account's, when
-   configured).
+   configured). Either account's emailed sign-in code is read from the test
+   mailbox (see [The test mailbox](#the-test-mailbox)); a code-only second
+   account requests one whenever it has no usable saved session.
 9. Packs the working tree (`npm pack --ignore-scripts`), builds
    `cscb-ci-live` and starts the container with its memory and PID caps.
 10. Runs the plan's checks in the plan's order, with the prompt guard
@@ -691,10 +693,10 @@ The runner keeps its secrets and state in `~/.config/cscb-test/`
 
 | File | Holds | Secret | Written by |
 |---|---|---|---|
-| `live.json` | `workspace_domain`, `test_email`, optional `second_user` | no (the email is config, never logged) | the operator |
+| `live.json` | `workspace_domain`, `test_email`, optional `second_user` (its `email`, and `password_file` or `password_env` for a password account; neither for a code-only account) | no (the emails are config, never logged) | the operator |
 | `slack_config_token`, `slack_config_refresh_token` (optional) | the app configuration token and its refresh token. The configuration token is optional too once `apps.json` records all four apps | yes | the operator; the runner rewrites both after a rotation |
 | `test_password` (or env `CSCB_LIVE_TEST_PASSWORD`) | the test human's password | yes | the operator |
-| the file or variable `live.json`'s `second_user` names (`password_file`, `password_env`) | the second account's password | yes | the operator |
+| the file or variable `live.json`'s `second_user` names (`password_file`, `password_env`), for a password account only | the second account's password | yes | the operator |
 | `playwright-state.json`, `playwright-state-second.json` | the browser sessions (cookies) | yes | the runner, or `login` / `login --second` |
 | `apps.json` | app, bot, team, channel and user IDs, each app's app-level token name, and a persona's `pending_create` intent while its create is unfinished | no | the runner |
 | `mailbox.json` (optional) | the test mailbox's mail.tm account: `provider`, `api`, `address`, `password`, `account_id`, `token` | yes (the password and the token; the address is not) | the operator; the runner rewrites the token |
@@ -748,7 +750,8 @@ How they are handled:
   it, before it is written as JSON or Markdown. It masks every secret value
   the run knows of 4 characters or more (the passwords, the configuration
   tokens, the generated tokens, the web session token and cookie, the Claude
-  key, the test emails, the test mailbox's password and token, an emailed
+  key, the test emails (the second account's with and without its `+`
+  tag, registered before any sign-in), the test mailbox's password and token, an emailed
   sign-in code), as it is and in its escaped forms (JSON as encoders write
   it: also with `/` as `\/` and non-ASCII characters as `\uXXXX`; JSON
   inside JSON; Markdown), and any token-shaped text (`xox?-…`, `xapp-…`,
@@ -774,15 +777,18 @@ How they are handled:
 
 ### The test mailbox
 
-Slack emails the test human a sign-in code when it sees a new device. The
-test mailbox, a mail.tm account in `mailbox.json`, receives that email
-through a Gmail filter (setup in `ci-live/README.md`), so a run answers the
-code itself:
+Slack emails an account a sign-in code when it sees a new device, and a
+code-only second account (a `second_user` with no password keys) one on
+every sign-in. The test mailbox, a mail.tm account in `mailbox.json`,
+receives both accounts' mail through Gmail filters (setup in
+`ci-live/README.md`), so a run answers the code itself:
 
 - **The order.** At Slack's code prompt for the test human, the run first
   reads the code from the mailbox. Only when that gives none does it stop
   (exit 2, "Slack asked for an emailed sign-in code"); the operator then runs
-  `login`, which asks on the terminal.
+  `login`, which reads the mailbox the same way, then asks on the terminal.
+  For the second account the run does not stop: Checks 14, 16 and 20 report
+  `SKIPPED (second account needs a sign-in code the test mailbox (mailbox.json) did not give: check its mail is forwarded there, or run login --second)`.
 - **The wait.** Every 5 seconds, for up to 2 minutes, it looks for a code
   email from Slack (slack.com or slack-mail.com, a subject naming a code)
   received after the sign-in started, newest first, and reads each message
@@ -790,13 +796,16 @@ code itself:
   refuses a code, the run looks for a newer one, 3 codes at most. Before
   typing, it clears the code field, and a refusal still showing from an
   earlier code doesn't count against the new one.
-- **Only the test human's code.** The filter forwards from a Gmail inbox that
-  may hold other accounts' mail, so a code email counts only when it was sent
-  to the test email exactly (case-insensitive; the address without its `+`
-  tag does not count). The run checks the recipients mail.tm lists (`to`,
+- **Only the account's own code.** The filters forward from a Gmail inbox
+  that may hold other accounts' mail, so a code email counts only when it was
+  sent exactly to the address of the account signing in: `test_email` for
+  the test human, `second_user.email` for the second account
+  (case-insensitive; the address without its `+` tag does not count). One
+  account's code never answers the other's prompt. The run checks the recipients mail.tm lists (`to`,
   `cc`) and, when those show only the mailbox, the original message's `To`,
   `Cc`, `Delivered-To` and `X-Original-To` headers (read from mail.tm's
-  message source). Forward from the inbox that receives the test email.
+  message source). Forward from the inbox that receives each account's
+  address.
 - **Failures.** A failed poll (a network error, a timeout, an HTTP error, a
   rate limit after the retries) costs only that poll. mail.tm refusing the
   mailbox's address and password ends the wait. A failure of the code prompt
@@ -817,8 +826,13 @@ code itself:
   temp file, renamed). A 429 is retried after its `Retry-After`, else after
   1, 2, 4 … seconds (30 at most, 4 retries). An error names the call and the
   HTTP status, never a token, the password or a body.
-- **The second account.** Its mail is not forwarded: its code still needs
-  `login --second`.
+- **The second account.** Either kind's code is read from the same mailbox,
+  by the same rules. A code-only account requests its code on the
+  workspace's email sign-in page. When Slack shows a reCAPTCHA there instead
+  of emailing a code, the run stops (exit 2) with `Slack showed a captcha
+  ("I'm not a robot") instead of emailing a sign-in code: the runner does not
+  answer captchas; give the account a password (live.json
+  second_user.password_file or password_env)`.
 
 The `mailbox` command reads the mailbox for the operator. It takes one of
 `--latest` and `--forwarding`, never both. It holds no lock, so it runs beside
@@ -832,8 +846,9 @@ a run, and writes no results directory or `run.log`:
 
 - **Senders and addresses.** A Slack or Google sender is shown as it is, any
   other only as `an address at <domain>`. Every other address in the output
-  is `<email>`, except the mailbox's own; the test human's address is masked
-  with and without its `+` tag.
+  is `<email>`, except the mailbox's own; the test human's address, and the
+  second account's when `live.json` names one, is masked with and without
+  its `+` tag.
 - **The confirm link.** `--forwarding` prints Gmail's confirm link on
   purpose: opening it approves the forwarding. It takes only an https link on
   mail-settings.google.com (or google.com) that the message marks as the
@@ -998,7 +1013,7 @@ as "not yet", not as a FAIL.
 | 1 to 6, 8 to 11, 13 | Automated |
 | 7 | Automated. The crash is a guarded `tmux kill-session` of A's session in the container |
 | 12 | Automated. The start message first tells A who it and B are (persona name and key, bot user IDs), so A has no reason to look itself up (in run 6 it ran `env` for that, and nobody expected the prompt). The stop message ends the exchange without banning later posts. If the personas keep posting after it, the runner stops them in their tmux sessions (Escape, then a message). Once coordination is quiet, the runner lifts the stop the way it was given: in coordination, and in the tmux sessions (no Escape) if it typed there, so A and B still post in coordination in later checks |
-| 14, 16, 20 | Need a second workspace account (`second_user` in `live.json`); `SKIPPED (no second account)` without one, and `SKIPPED (second account needs a sign-in code: run login --second)` when Slack asks it for an emailed code (its mail doesn't go to the test mailbox). In Checks 16 and 20 the runner asks A for the reply-tool call at most twice: if A never answers, the check fails; if A answers twice without making the call, Check 16 is `SKIPPED (not run: …)`, as the plan says, and Check 20 fails |
+| 14, 16, 20 | Need a second workspace account (`second_user` in `live.json`); `SKIPPED (no second account)` without one, and `SKIPPED (second account needs a sign-in code the test mailbox (mailbox.json) did not give: check its mail is forwarded there, or run login --second)` when Slack asks it for an emailed code the mailbox does not give. They run on every run with the same account; none reads its Slack DM history from before the run. Check 14's first-time user is new to this run's server (a fresh container with its own state directory): before posting, it looks for the account's user ID in the container's `server.log*` and in the `<channel …>` tags delivered to any persona's transcripts, and is `SKIPPED (not verified: this run's server has already seen the second account …)` when one names it. A DM with B from an earlier run is reused, and every assertion is on what follows the check's own posts. Check 16's postcondition: the account's DM with A, if any, holds no message (from anyone, top-level or in a thread) newer than the check's first ask. Check 20: the DM A's call result names is the account's DM with A, and it holds A's `DMs-on outbound check` message newer than the first ask. In Checks 16 and 20 the runner asks A for the reply-tool call at most twice: if A never answers, the check fails; if A answers twice without making the call, Check 16 is `SKIPPED (not run: …)`, as the plan says, and Check 20 fails |
 | 15, 17, 19, 21 to 23 | Automated. "Turn A's DMs on" is a confirmed config edit. Check 23 has the prompt guard deny any prompt it raised that is still open when it ends, even after an early return or a throw |
 | 18 | Automated. C's prompt is started by typing into C's tmux session |
 | 24, with its setup and teardown | Automated |
@@ -1164,8 +1179,8 @@ not answer (see [The test mailbox](#the-test-mailbox)).
 |---|---|
 | `bun ci-live/run.ts` | The full live run (about 2 to 3 hours; an agent runs it detached, as `.claude/skills/ci-live/SKILL.md` describes) |
 | `bun ci-live/run.ts --dry-run` | The dry run |
-| `bun ci-live/run.ts login` | Signs the test human in, asking on the terminal for an emailed code if Slack wants one (interactive terminal only) |
-| `bun ci-live/run.ts login --second` | The same for the second account (`second_user` in `live.json`) |
+| `bun ci-live/run.ts login` | Signs the test human in. If Slack wants an emailed code, it reads it from the test mailbox first and asks on the terminal only when the mailbox gives none (that prompt needs an interactive terminal) |
+| `bun ci-live/run.ts login --second` | The same for the second account (`second_user` in `live.json`). It first reads an emailed code from the test mailbox (only Slack mail sent to the account's own address counts) and asks on the terminal only when the mailbox gives none. For a code-only account it requests the code on the workspace's email sign-in page; a reCAPTCHA there stops it (exit 2) |
 | `bun ci-live/run.ts mailbox --latest\|--forwarding [--show-body]` | Shows the test mailbox's newest message, or its newest Gmail forwarding confirmation with the confirm link (see [The test mailbox](#the-test-mailbox)) |
 | `bun ci-live/run.ts config-token --rotate` | Rotates the configuration token pair once (see [Maintenance commands](#maintenance-commands)) |
 | `bun ci-live/run.ts apps --list` | Lists the test human's apps and which `apps.json` records |
@@ -1191,9 +1206,10 @@ not answer (see [The test mailbox](#the-test-mailbox)).
   mid-create adopts the app that create made, or creates it when there is
   none (see [What a run does](#what-a-run-does)).
 - **The plan's rerun branches.** Check 18 finds C's DM from an earlier run and
-  records "rerun". Checks 14, 16 and 20 need an account new to the personas:
-  after one run with a second account, they report
-  `SKIPPED (not verified: … a rerun)` until `live.json` names a fresh one.
+  records "rerun". Checks 14, 16 and 20 run on every run with the same
+  second account: Check 14's first-time user is new to this run's fresh
+  server, and Checks 16 and 20 read the account's DM with A only from the
+  check's first ask on (see [What runs per check](#what-runs-per-check)).
 
 ## Out of scope (future work)
 

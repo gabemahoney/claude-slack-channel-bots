@@ -1,8 +1,9 @@
 /**
- * mailbox.ts — the test mailbox: a mail.tm account the test human's mail is
- * forwarded to, so the runner can read the sign-in code Slack emails when it
- * sees a new device, and the operator can read Gmail's forwarding
- * confirmation.
+ * mailbox.ts — the test mailbox: a mail.tm account the test human's mail,
+ * and the second workspace user's, is forwarded to, so the runner can read
+ * the sign-in code Slack emails to either account (on a new device, or on
+ * every sign-in of a code-only second account), and the operator can read
+ * Gmail's forwarding confirmation.
  *
  * - `parseMailboxFile` / `serializeMailboxFile`: `mailbox.json`
  *   (`{provider, api, address, password, account_id, token}`). The file is
@@ -24,13 +25,14 @@
  *   subject.
  * - `waitForSlackSignInCode`: poll, on the injected clock and with a
  *   deadline its mailbox calls keep too, for a Slack code email received at or
- *   after a given time and sent to the test human: the test email (compared
+ *   after a given time and sent to the account signing in (the test human or
+ *   the second account): that account's own address (compared
  *   case-insensitively, exactly: not its form without a `+tag`, which other
- *   mail of the same inbox shares) is among the recipients mail.tm lists
+ *   mail of the same inbox shares, nor the other account's address) is
+ *   among the recipients mail.tm lists
  *   (`to`, `cc`), or else among the recipient headers of the message's
  *   source (`To`, `Cc`, `Delivered-To`, `X-Original-To`), which a forward
- *   keeps when mail.tm lists only the mailbox itself. No test email, no
- *   code.
+ *   keeps when mail.tm lists only the mailbox itself. No address, no code.
  * - `describeLatestMessage` / `describeForwardingMessage`: the `mailbox`
  *   command's report. Without `--show-body` it never shows a Slack sign-in
  *   code: code-shaped text in a subject that names a code is `<code>`.
@@ -652,7 +654,10 @@ export interface SlackCodeFound {
 export interface WaitForCodeOptions {
   /** Only mail received at or after this time (ms since the epoch) counts. */
   sinceMs: number
-  /** Only mail sent to this address counts (see `isSentTo`); empty: none does. */
+  /**
+   * Only mail sent to this address counts (see `isSentTo`): the signing-in
+   * account's own, the test human's or the second account's. Empty: none does.
+   */
   testEmail: string
   timeoutMs: number
   pollMs: number
@@ -719,7 +724,7 @@ async function mailSentTo(reader: MailReader, summary: MailSummary, email: strin
  * request cannot carry the wait past it by more than `DEADLINE_GRACE_MS`.
  */
 export async function waitForSlackSignInCode(reader: MailReader, o: WaitForCodeOptions): Promise<SlackCodeFound | null> {
-  // No mail can be shown to be the test human's: there is nothing to wait for.
+  // No mail can be shown to be the signing-in account's: there is nothing to wait for.
   if (o.testEmail.trim() === '') return null
   const transient = (err: unknown): null => {
     if (isFatalMailboxError(err)) throw err

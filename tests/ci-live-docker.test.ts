@@ -63,6 +63,13 @@
  * - the browser is bounded (one Chrome, at most two contexts and two pages,
  *   idle on about:blank between flows and after a sign-in), and its flows run
  *   one at a time (the prompt guard clicks while a check may);
+ * - each account's emailed sign-in code is read from the test mailbox with
+ *   its own address; the second account's address is registered with the
+ *   redactor in every `addressForms` form before any sign-in (and by
+ *   `mailbox`); a second account the mailbox gave no code skips Checks 14, 16
+ *   and 20 with a fixed reason naming no address; and those checks read none
+ *   of its DM history from before the check (no `usedDm`), so they rerun
+ *   with the same account;
  * - the prompt guard runs from the first plan check to the last (its hooks
  *   around each, stopped before Teardown, halted by a stop's cleanup, its
  *   report in the results), reaches the container only through the checks'
@@ -1913,6 +1920,71 @@ describe('runner wiring (source audit of ci-live/)', () => {
     // A captcha is never answered: no flow clicks or types into the reCAPTCHA frame.
     expect(flow).not.toMatch(/recaptcha[^\n]*\.(click|fill|check|type)\(/i)
     expect(code(join('lib', 'slack-urls.ts'))).toContain('codeSignIn: (domain) => `https://${domain}.slack.com/`')
+  })
+
+  test("the workspace registers the second account's address with the redactor in every addressForms form, and the test email as it is, before any sign-in", () => {
+    const text = code(join('runtime', 'workspace.ts'))
+    expect(text).toMatch(/^import \{[^}]*\baddressForms\b[^}]*\} from '\.\.\/lib\/mailbox\.ts'$/m)
+    const open = text.slice(...balancedAfter(text, text.indexOf('export function openWorkspace('), '{', '}'))
+    const registered = open.split('\n').map((l) => l.trim()).filter((l) => /\baddSecret\(/.test(l) && /\blive\./.test(l))
+    expect(registered).toEqual([
+      'o.redactor.addSecret(live.testEmail)',
+      'if (live.secondUser) for (const form of addressForms(live.secondUser.email)) o.redactor.addSecret(form)',
+    ])
+    // In openWorkspace's own body, before the workspace it returns can launch either account.
+    expectInOrder(open, ['const live = store.readLiveConfig()', ...registered, 'return {', "launch(o, 'human'", "launch(o, 'second'"])
+  })
+
+  test("mailbox registers both accounts' addresses in every addressForms form (the second's when live.json names one) before it reads the mailbox; a live.json it cannot read registers none and the run goes on", () => {
+    const text = code('main.ts')
+    expect(text).toMatch(/^import \{[^}]*\baddressForms\b[^}]*\} from '\.\/lib\/mailbox\.ts'$/m)
+    const mailbox = text.slice(...balancedAfter(text, text.indexOf('async function runMailbox('), '{', '}')).replace(/\s+/g, ' ')
+    expect(mailbox).toContain(
+      'try { const live = store.readLiveConfig() for (const form of addressForms(live.testEmail)) redactor.addSecret(form) if (live.secondUser) for (const form of addressForms(live.secondUser.email)) redactor.addSecret(form) } catch { } const config = store.readMailbox()',
+    )
+    expect((mailbox.match(/\baddressForms\(/g) ?? []).length).toBe(2)
+    expectInOrder(mailbox, ['addressForms(live.secondUser.email)', 'const config = store.readMailbox()', 'await client.listMessages()'])
+  })
+
+  test('a second account whose emailed code the mailbox did not give skips Checks 14, 16 and 20 with one fixed reason naming mailbox.json and login --second (a plain literal: no address), and the reason reaches their rows', () => {
+    const text = code('main.ts')
+    const start = text.indexOf('async function openSessions(')
+    const sessions = text.slice(...balancedAfter(text, text.indexOf('}> {', start) + 2, '{', '}'))
+    const assigned = [...sessions.matchAll(/\bsecondSkip = /g)].map((m) => /^'(?:[^'\\\n]|\\.)*'/.exec(sessions.slice(m.index! + m[0].length))?.[0] ?? null)
+    expect(assigned).toEqual(["'second account needs a sign-in code the test mailbox (mailbox.json) did not give: check its mail is forwarded there, or run login --second'"])
+    expectInOrder(sessions, [
+      'const sb = await ws.secondBrowser()',
+      "if (!(err instanceof SignInCodeNeededError && err.who === 'second')) throw err",
+      'secondSkip = ',
+      'log.info(`session: ${secondSkip}; Checks 14, 16 and 20 are skipped`)',
+    ])
+    expect(text).toContain("const needReasons = sessions?.secondSkip ? { 'second-user': sessions.secondSkip } : undefined")
+  })
+
+  test('Checks 14, 16 and 20 rerun with the same second account: nothing reads its DM history from before the check (no usedDm); 14 skips only when this run has already seen the account, before any setup; 16 only when A made no call; 20 never', () => {
+    expect(runnerSources().filter((p) => /\busedDm\b/.test(stripComments(readFileSync(p, 'utf-8')))).map((p) => relative(CI_LIVE, p))).toEqual([])
+    const text = code(join('checks', 'dm-checks.ts'))
+    /** A check's definition, up to the next export; from its run method's body when `run` is set. */
+    const body = (id: string, run = false): string => {
+      const at = text.indexOf(`export const check${id}:`)
+      const def = text.slice(at, text.indexOf('\nexport ', at + 1))
+      return run ? def.slice(def.indexOf('async run(ctx) {') + 'async run(ctx) {'.length) : def
+    }
+    const skips = (id: string): string[] => callsOf(body(id), 'skipped').map((at) => callArguments(body(id), at).replace(/\s+/g, ' ').trim())
+    expect(skips('14')).toEqual(['`not verified: ${prior}`'])
+    expect(skips('16').map((s) => s.startsWith('`not run: A made no reply-tool call to ${second.userId} '))).toEqual([true])
+    expect(skips('20')).toEqual([])
+    // Check 14: the run-scoped question (this container's server log and persona tags) comes first; nothing posts, invites, restarts or reads Slack before it.
+    const c14 = body('14', true)
+    const guard = 'if (prior !== null) return skipped('
+    expectInOrder(c14, ['const seen = await contactLines(ctx, second.userId)', 'const prior = priorContact(seen.log, seen.tags, second.userId)', guard])
+    expect(c14.slice(0, c14.indexOf(guard))).not.toMatch(/second\.human|needHuman\(|\b(run|guarded|guardedRestart|mark)\(/)
+    // Checks 16 and 20: the second user's Slack is read only after A is asked.
+    for (const id of ['16', '20']) {
+      const b = body(id, true)
+      const ask = b.indexOf('askForOutboundCall(')
+      expect([id, ask > 0, b.indexOf('second.human.') > ask]).toEqual([id, true, true])
+    }
   })
 })
 

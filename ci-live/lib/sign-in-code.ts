@@ -2,13 +2,17 @@
  * sign-in-code.ts — answering Slack's emailed sign-in code from the test
  * mailbox, before the runner gives up on a sign-in (exit 2, "run login").
  *
- * When Slack asks the test human for an emailed code (a new device), the
- * runner polls the mailbox for up to 2 minutes for a Slack code email
- * received after the sign-in attempt started and sent to the test email,
- * registers the code with the redactor, types it into the page and goes on.
- * It answers `needs-code` (the caller then stops as before, with "run
- * login") when there is no mailbox, the mailbox is unusable, there is no
- * test email to match the mail against, no code arrives in time, Slack
+ * The account signing in is the test human or the second workspace user
+ * (a password account on a new device, or a code-only account, whose every
+ * sign-in requests a code); both have their Slack mail forwarded to the one
+ * test mailbox. When Slack asks that account for an emailed code, the runner
+ * polls the mailbox for up to 2 minutes for a Slack code email received
+ * after the sign-in attempt started and sent to that account's own address
+ * (never the other account's, never the form without a `+tag`), registers
+ * the code with the redactor, types it into the page and goes on. It answers
+ * `needs-code` (the caller then stops as before, with "run login" or "run
+ * login --second") when there is no mailbox, the mailbox is unusable, there
+ * is no address to match the mail against, no code arrives in time, Slack
  * accepts none of the codes, or the code prompt fails (a flow error).
  *
  * The log says only where the code came from or why none did; never the
@@ -30,8 +34,8 @@ export const MAX_CODE_SUBMISSIONS = 3
 /**
  * Mail received this long before the attempt started still counts: the
  * tolerance for this host's clock against the mail server's. The attempt
- * start is taken before the password is submitted, so Slack's email comes
- * later still.
+ * start is taken before the password is submitted or the code is requested,
+ * so Slack's email comes later still.
  */
 export const MAIL_CLOCK_SKEW_MS = 5 * SECOND
 
@@ -40,13 +44,17 @@ export interface MailboxSignInDeps {
   openMailbox: () => MailReader | null
   /** Type the code into the page's code prompt; the outcome after Slack answers. Throws a `FlowError` when the prompt fails. */
   submitCode: (code: string) => Promise<SignInOutcome>
-  /** The test human's email (live.json): only Slack mail sent to it counts. Empty: none does. */
+  /**
+   * The signing-in account's own email (live.json: `test_email` for the test
+   * human, `second_user.email` for the second account): only Slack mail sent
+   * exactly to it counts. Empty: none does.
+   */
   testEmail: string
   /** Registers a code before anything can log it. */
   addSecret: (value: string) => void
   clock: Clock
   log: { info(message: string): void; detail(message: string): void }
-  /** When the sign-in attempt started, on `clock` (before the password was submitted). */
+  /** When the sign-in attempt started, on `clock` (before the password was submitted or the code requested). */
   attemptStartedAt: number
   timeoutMs?: number
   pollMs?: number
@@ -60,7 +68,7 @@ function minutes(ms: number): string {
 /**
  * Answer the code prompt from the mailbox. `signed-in` when Slack accepted a
  * code; `needs-code` otherwise (the caller falls back to the operator's
- * `login`), a flow error on the code prompt included. Throws only what
+ * `login` or `login --second`), a flow error on the code prompt included. Throws only what
  * `submitCode` throws besides a `FlowError` (such as a signed-in page with
  * no session: not runnable).
  */

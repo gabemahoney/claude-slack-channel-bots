@@ -41,6 +41,14 @@
  *   only when A said done but made no new call; A that never says done is a
  *   FAIL; no call after two asks is Check 16's "not run" (SKIPPED) and a FAIL
  *   in Check 20; only a call made after the check's baseline is evaluated;
+ * - Checks 14, 16 and 20 rerun with the same second account: an earlier
+ *   run's DM is no skip. Check 14 is SKIPPED "not verified" only when this
+ *   run's server log or a persona tag names the second user's whole ID before
+ *   it posts, and otherwise reaches A and B (in the earlier run's DM) with no
+ *   approval step, judged on this run's answers only; Check 16 fails on any
+ *   message in the DM with A newer than its first ask (top-level or in a
+ *   thread, from anyone), never on an older one; Check 20 passes only on A's
+ *   message newer than the first ask, in the DM its call result names;
  * - Check 8 asks for a bug when the RAW prefix lacks user/bot_id; Check 9
  *   falls back to the message text and needs one RAW line of each kind;
  *   `waitTags` polls to a deadline; Check 12's limit search fails on any
@@ -114,6 +122,7 @@ import { DRY_RUN_IDS, liveIdsFrom, type CheckContext } from '../ci-live/checks/c
 import type { CheckPromptGuard, PromptExpectation } from '../ci-live/checks/prompt-guard.ts'
 import {
   callsTo,
+  check14,
   check16,
   check20,
   check23,
@@ -122,9 +131,13 @@ import {
   CHECK23_B_EXTRA,
   CHECK23_PROMPT_A,
   CHECK23_PROMPT_B,
+  namesSlackId,
   newCallTo,
   OUTBOUND_ASKS,
   outboundNext,
+  postsAfter,
+  priorContact,
+  sentDmId,
 } from '../ci-live/checks/dm-checks.ts'
 import { Findings, NEED_SKIP_REASONS, runChecks, skipReason, verdictOf, type CheckDef, type CheckResult, type Need } from '../ci-live/checks/framework.ts'
 import {
@@ -165,7 +178,7 @@ import {
   snapshotHost,
   type HostSnapshot,
 } from '../ci-live/lib/host-state.ts'
-import { HumanSession } from '../ci-live/lib/human-session.ts'
+import { HumanSession, type SlackMessage } from '../ci-live/lib/human-session.ts'
 import { buildLiveConfig, renderConfig } from '../ci-live/lib/live-config.ts'
 import type { ProcResult } from '../ci-live/lib/proc.ts'
 import { RESULTS_COLUMNS } from '../ci-live/lib/results.ts'
@@ -399,7 +412,9 @@ describe('skipReason', () => {
   })
 
   test("the runner's reason for a missing need replaces the default one (a second account that needs a sign-in code), in runChecks too", async () => {
-    const needReasons = { 'second-user': 'second account needs a sign-in code: run login --second' }
+    const needReasons = {
+      'second-user': 'second account needs a sign-in code the test mailbox (mailbox.json) did not give: check its mail is forwarded there, or run login --second',
+    }
     const needsSecond = check('14', { needs: ['workspace', 'second-user'] })
     const workspaceOnly = new Set<Need>(['workspace'])
     expect(skipReason(needsSecond, { blockedBy: null }, { available: workspaceOnly, only: [], needReasons })).toBe(needReasons['second-user'])
@@ -1120,6 +1135,117 @@ describe('Checks 16 and 20: the outbound reply-tool call helpers', () => {
   })
 })
 
+describe('Checks 14, 16 and 20 on a rerun: the run-scoped decisions', () => {
+  const ID = 'U0DRYSECND'
+
+  test.each([
+    ['the ID alone', ID, ID, true],
+    ['the ID after "=" in a log line', `[slack] dropped message user=${ID} channel=C0DRYAHOME`, ID, true],
+    ['the ID in quotes in a tag', `<channel source="slack" user_id="${ID}" via="dm">`, ID, true],
+    ['a longer ID that starts with it', `user=${ID}9`, ID, false],
+    ['a longer ID that ends with it', `user=X${ID}`, ID, false],
+    ['a longer ID, then the ID itself', `user=${ID}9 then user=${ID}`, ID, true],
+    ['another user only', 'user=U0DRYOTHER', ID, false],
+    ['an empty ID', `user=${ID}`, '', false],
+  ])('namesSlackId: %s is %p', (_what, line, id, named) => {
+    expect(namesSlackId(line, id)).toBe(named)
+  })
+
+  const seen = (what: string) => `this run's server has already seen the second account (${what} name its user ID before the check posted); it is no longer a first-time user`
+
+  test.each([
+    ['nothing names the user: a first-time user', [], [], ID, null],
+    ['only a longer ID and another user (lines grep -F also prints)', [`user=${ID}9`, 'user=U0DRYOTHER'], [`<channel user_id="X${ID}">`], ID, null],
+    ['one log line', [`user=${ID}`, `user=${ID}9`], [], ID, seen('1 server log line(s)')],
+    ['one persona tag', [], [`<channel user_id="${ID}">`], ID, seen('1 persona tag(s)')],
+    ['log lines and a tag, each counted', [`user=${ID}`, `chat_id=${ID}`], [`<channel user_id="${ID}">`], ID, seen('2 server log line(s) and 1 persona tag(s)')],
+    ['an unknown (empty) user ID, with nothing logged', [], [], '', "the second account's user ID is unknown"],
+  ])('priorContact: %s', (_what, log, tagLines, id, reason) => {
+    expect(priorContact(log, tagLines, id)).toBe(reason)
+  })
+
+  test("postsAfter keeps only messages newer than the ts (not one at it, not an earlier run's), from the bot and with the text when given", () => {
+    const after = '1700000100.000005'
+    const messages: SlackMessage[] = [
+      { ts: '1690000000.000100', text: 'DMs-on outbound check', user: A.userId },
+      { ts: after, text: 'DMs-on outbound check', user: A.userId },
+      { ts: '1700000100.000006', text: 'DMs-on outbound check', bot_id: A.botId },
+      { ts: '1700000100.000007', text: 'something else', user: A.userId },
+      { ts: '1700000100.000008', text: 'DMs-on outbound check', user: 'U0DRYOTHER' },
+    ]
+    const tss = (found: SlackMessage[]) => found.map((m) => m.ts)
+    expect(tss(postsAfter(messages, after))).toEqual(['1700000100.000006', '1700000100.000007', '1700000100.000008'])
+    expect(tss(postsAfter(messages, after, A))).toEqual(['1700000100.000006', '1700000100.000007'])
+    expect(tss(postsAfter(messages, after, A, 'DMs-on outbound check'))).toEqual(['1700000100.000006'])
+    expect(postsAfter(messages, '1700000100.000008')).toEqual([])
+  })
+
+  test.each([
+    ['a sent result', `chat_id=${ID} error=false result=Sent 1 message(s) to D0DRYSECDM (the DM with ${ID}) [ts: 1700000300.000001]`, 'D0DRYSECDM'],
+    ['a refusal', `chat_id=${ID} error=true result=Persona "persona_a" (key=persona_a) may not target "${ID}"`, null],
+    ['a message sent to a channel, not a DM', 'chat_id=C0DRYAHOME error=false result=Sent 1 message(s) to C0DRYAHOME', null],
+    ['no call', '', null],
+  ])('sentDmId: %s gives %p', (_what, call, dm) => {
+    expect(sentDmId(call)).toBe(dm)
+  })
+})
+
+/** A message in a scripted conversation; `thread` puts it in the thread under that ts. */
+interface ScriptedMessage extends CannedMessage {
+  channel: string
+  thread?: string
+}
+
+/**
+ * Slack as a test account's session reads it, over `messages`: history lists
+ * a conversation's top-level messages after `oldest` (from it when
+ * `inclusive`), each thread parent with its reply count and newest reply;
+ * replies list a thread's parent and its replies; `conversations.list` lists
+ * `dms()`; `conversations.open` gives `openDm`. A post is stored under the
+ * next ts (`nextTs`) as `poster`'s, then `onPost` plays what follows it.
+ */
+function scriptedSlack(opts: {
+  messages: ScriptedMessage[]
+  nextTs: () => string
+  poster: string
+  onPost: (channel: string, text: string, ts: string) => void
+  dms?: () => { id: string; user: string }[]
+  openDm?: string
+}): HumanApi {
+  const { messages, nextTs, poster, onPost, dms = () => [], openDm = 'D0DRYDM001' } = opts
+  const asSlack = (m: ScriptedMessage) => ({ ts: m.ts, text: m.text, user: m.user, ...(m.thread === undefined ? {} : { thread_ts: m.thread }) })
+  return {
+    call: async (method, params = {}) => {
+      const channel = String(params.channel ?? '')
+      const inChannel = messages.filter((m) => m.channel === channel)
+      if (method === 'chat.postMessage') {
+        const ts = nextTs()
+        messages.push({ channel, ts, text: String(params.text), user: poster })
+        onPost(channel, String(params.text), ts)
+        return { ok: true, ts }
+      }
+      if (method === 'conversations.history') {
+        const oldest = String(params.oldest ?? '0')
+        const listed = inChannel.filter((m) => m.thread === undefined && (params.inclusive === true ? m.ts >= oldest : m.ts > oldest))
+        return {
+          ok: true,
+          messages: listed.map((m) => {
+            const replies = inChannel.filter((r) => r.thread === m.ts).map((r) => r.ts).sort()
+            return replies.length === 0 ? asSlack(m) : { ...asSlack(m), reply_count: replies.length, latest_reply: replies.at(-1) }
+          }),
+        }
+      }
+      if (method === 'conversations.replies') {
+        const ts = String(params.ts)
+        return { ok: true, messages: inChannel.filter((m) => m.ts === ts || m.thread === ts).map(asSlack) }
+      }
+      if (method === 'conversations.list') return { ok: true, channels: dms() }
+      if (method === 'conversations.open') return { ok: true, channel: { id: openDm } }
+      return { ok: true }
+    },
+  }
+}
+
 describe('Checks 16 and 20 against a scripted A', () => {
   const SECOND_ID = 'U0DRYSECND'
   const NEW_DM = 'D0DRYSECDM'
@@ -1132,15 +1258,26 @@ describe('Checks 16 and 20 against a scripted A', () => {
   })()
   // Check 20's call: the DM opened, one message sent.
   const SENT = `chat_id=${SECOND_ID} error=false result=Sent 1 message(s) to ${NEW_DM} (the DM with ${SECOND_ID}) [ts: 1700000300.000001]`
+  /** A's message in the second user's DM with A from an earlier run, before this run's asks. */
+  const EARLIER_TS = '1690000000.000100'
 
   /** What A does on one ask: says done or not, and the `replies a` line of the call it makes, if any. */
   interface AskStep {
     done: boolean
     call?: string
+    /** With a successful call: false when A's message never reaches the DM (default true). */
+    delivered?: boolean
+    /** A message from `user` that reaches the second user's DM with A after the ask: top-level, or in the thread under the earlier run's message. */
+    dmPost?: { user: string; inThread: boolean }
   }
 
-  /** The second user's DM with A before the check: none listed, listed but empty (as Slack lists one from the day an account joins), or holding a message. */
-  type DmBefore = 'none' | 'empty' | 'used'
+  /**
+   * The second user's DM with A before the check: none listed, listed but
+   * empty (as Slack lists one from the day an account joins), or an earlier
+   * run's, holding A's old `DMs-on outbound check` message with the second
+   * user's old reply in its thread.
+   */
+  type DmBefore = 'none' | 'empty' | 'earlier'
 
   /**
    * A-home, `replies a` and the second user's DMs, scripted per ask: each
@@ -1154,38 +1291,35 @@ describe('Checks 16 and 20 against a scripted A', () => {
     const clock = virtualClock()
     let seq = 0
     const nextTs = () => `1700000100.${String(++seq).padStart(6, '0')}`
-    const messages: (CannedMessage & { channel: string })[] = []
+    const messages: ScriptedMessage[] =
+      dmBefore === 'earlier'
+        ? [
+            { channel: NEW_DM, ts: EARLIER_TS, text: 'DMs-on outbound check', user: A.userId },
+            { channel: NEW_DM, ts: '1690000000.000200', text: 'got it', user: SECOND_ID, thread: EARLIER_TS },
+          ]
+        : []
     const replyLines = [...earlier]
     const asks: { text: string; ts: string; done: string | null }[] = []
     let dmOpen = dmBefore !== 'none'
-    if (dmBefore === 'used') messages.push({ channel: NEW_DM, ts: nextTs(), text: 'hello from an earlier run', user: SECOND_ID })
-    const api: HumanApi = {
-      call: async (method, params = {}) => {
-        const channel = String(params.channel ?? '')
-        if (method === 'chat.postMessage') {
-          const ts = nextTs()
-          messages.push({ channel, ts, text: String(params.text), user: DRY_RUN_IDS.humanUserId })
-          if (channel !== DRY_RUN_IDS.aHome) return { ok: true, ts }
-          const step = steps[asks.length] ?? { done: false }
-          if (step.call !== undefined) {
-            replyLines.push(step.call)
-            if (step.call.startsWith(`chat_id=${SECOND_ID} error=false`)) {
-              dmOpen = true
-              messages.push({ channel: NEW_DM, ts: nextTs(), text: 'DMs-on outbound check', user: A.userId })
-            }
-          }
-          const done = step.done ? nextTs() : null
-          if (done) messages.push({ channel, ts: done, text: 'done', user: A.userId })
-          asks.push({ text: String(params.text), ts, done })
-          return { ok: true, ts }
+    const onPost = (channel: string, text: string, ts: string) => {
+      if (channel !== DRY_RUN_IDS.aHome) return
+      const step = steps[asks.length] ?? { done: false }
+      if (step.call !== undefined) {
+        replyLines.push(step.call)
+        if (step.call.startsWith(`chat_id=${SECOND_ID} error=false`)) {
+          dmOpen = true
+          if (step.delivered !== false) messages.push({ channel: NEW_DM, ts: nextTs(), text: 'DMs-on outbound check', user: A.userId })
         }
-        if (method === 'conversations.history') {
-          return { ok: true, messages: messages.filter((m) => m.channel === channel && m.ts >= String(params.oldest ?? '0')) }
-        }
-        if (method === 'conversations.list') return { ok: true, channels: dmOpen ? [{ id: NEW_DM, user: A.userId }] : [] }
-        return { ok: true, messages: [] }
-      },
+      }
+      if (step.dmPost) {
+        dmOpen = true
+        messages.push({ channel: NEW_DM, ts: nextTs(), text: 'hello', user: step.dmPost.user, ...(step.dmPost.inThread ? { thread: EARLIER_TS } : {}) })
+      }
+      const done = step.done ? nextTs() : null
+      if (done) messages.push({ channel, ts: done, text: 'done', user: A.userId })
+      asks.push({ text, ts, done })
     }
+    const api = scriptedSlack({ messages, nextTs, poster: DRY_RUN_IDS.humanUserId, onPost, dms: () => (dmOpen ? [{ id: NEW_DM, user: A.userId }] : []) })
     const { container } = fakeContainer([['', (script) => (script === 'mark' ? '1:0' : script === 'replies a' ? replyLines.join('\n') : '')]])
     const ctx = makeCtx({ mode: 'real', clock, human: new HumanSession(api, clock), second: { human: new HumanSession(api, clock), userId: SECOND_ID }, container })
     /** The evidence line each ask should leave. */
@@ -1261,23 +1395,140 @@ describe('Checks 16 and 20 against a scripted A', () => {
     expect(fresh.asks.length).toBe(1)
   })
 
-  test.each(BOTH)('Check %s: an empty DM with A listed before the check is no rerun: the check runs and passes', async (_id, check, call) => {
+  test.each(BOTH)('Check %s: an empty DM with A listed before the check: the check runs and passes', async (_id, check, call) => {
     const { r, asks } = await runWith(check, [{ done: true, call }], [], 'empty')
     expect([r.status, r.reason]).toEqual(['PASS', undefined])
     expect(asks.length).toBe(1)
   })
 
-  test.each(BOTH)('Check %s: a DM with A that holds a message before the check is a rerun: SKIPPED, nothing asked', async (_id, check, call) => {
-    const { r, asks } = await runWith(check, [{ done: true, call }], [], 'used')
-    expect([r.status, r.reason]).toEqual(['SKIPPED', 'not verified: the second account already has a DM with A (a rerun)'])
-    expect(asks.length).toBe(0)
+  test.each(BOTH)("Check %s on a rerun: an earlier run's DM with A, holding A's old message and an old thread reply, is no skip: the check runs and passes", async (_id, check, call) => {
+    const { r, asks } = await runWith(check, [{ done: true, call }], [], 'earlier')
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    expect(asks.length).toBe(1)
+  })
+
+  test.each([
+    ['top-level, from A', [{ done: true, call: REFUSED, dmPost: { user: A.userId, inThread: false } }]],
+    ["in the thread under the earlier run's message, from A", [{ done: true, call: REFUSED, dmPost: { user: A.userId, inThread: true } }]],
+    ['top-level, from another user', [{ done: true, call: REFUSED, dmPost: { user: 'U0DRYOTHER', inThread: false } }]],
+    ['after the first ask, before the second ask that got the refusal', [{ done: true, dmPost: { user: A.userId, inThread: false } }, { done: true, call: REFUSED }]],
+  ])("Check 16 on a rerun: a message reaching the earlier run's DM with A after the first ask fails it, the refusal notwithstanding (%s)", async (_what, steps) => {
+    const { r } = await runWith(check16, steps, [], 'earlier')
+    expect([r.status, r.reason]).toEqual(['FAIL', "the second user's DM with A got a message during this check"])
+  })
+
+  test("Check 20 on a rerun: only the earlier run's message from A in the DM (the call names the DM, nothing new arrives) is a FAIL", async () => {
+    const { r } = await runWith(check20, [{ done: true, call: SENT, delivered: false }], [], 'earlier')
+    expect([r.status, r.reason]).toEqual(['FAIL', "the DM does not hold A's message from this check"])
+  })
+
+  test("Check 20: a result naming a DM other than the second user's DM with A is a FAIL, though A's new message is in the DM with A", async () => {
+    const { r } = await runWith(check20, [{ done: true, call: SENT.replace(NEW_DM, 'D0DRYOTHER') }], [], 'earlier')
+    expect([r.status, r.reason]).toEqual(['FAIL', "the result names another DM than the second user's DM with A"])
   })
 
   test("the call evaluated must be the check's own: Check 16 fails a sent message, Check 20 fails a refusal", async () => {
     const c16 = await runWith(check16, [{ done: true, call: SENT }])
-    expect([c16.r.status, c16.r.reason]).toEqual(['FAIL', 'the call was not refused; the refusal text is not the expected one; the second user has a DM with A'])
+    expect([c16.r.status, c16.r.reason]).toEqual(['FAIL', "the call was not refused; the refusal text is not the expected one; the second user's DM with A got a message during this check"])
     const c20 = await runWith(check20, [{ done: true, call: REFUSED }])
-    expect([c20.r.status, c20.r.reason]).toEqual(['FAIL', 'the call to the second user failed; the result does not name the new DM; the second user has no DM with A'])
+    expect([c20.r.status, c20.r.reason]).toEqual(['FAIL', 'the call to the second user failed; the result does not name the DM; the second user has no DM with A'])
+  })
+})
+
+describe("Check 14: a first-time user to this run's server, with the same second account on every run", () => {
+  const SECOND_ID = 'U0DRYSECND'
+  const B = DRY_RUN_IDS.bots.b
+  /** The second user's DM with B from an earlier run: `conversations.open` gives it again. */
+  const B_DM = 'D0DRYSECDB'
+  const SHA = 'c'.repeat(64)
+  /** The earlier run's exchange in that DM: the ask and B's open-dm answer. */
+  const EARLIER: ScriptedMessage[] = [
+    { channel: B_DM, ts: '1690000000.000100', text: 'Reply with the word open-dm.', user: SECOND_ID },
+    { channel: B_DM, ts: '1690000000.000200', text: 'open-dm', user: B.userId },
+  ]
+
+  /**
+   * Check 14 on a live context. The container's server log and persona tags
+   * print `log` and `tagLines` for the check's search for the second user;
+   * the install and the stale access.json are as the plan expects, the
+   * guarded restart comes up, and the access-control search prints
+   * `accessLines`. On the second account's session A answers open-channel in
+   * A-home and, when `bAnswers`, B answers open-dm in the DM with B, which
+   * holds the earlier run's exchange.
+   */
+  function check14Run(opts: { log?: string[]; tagLines?: string[]; bAnswers?: boolean; accessLines?: string[] } = {}) {
+    const { log = [], tagLines = [], bAnswers = true, accessLines = [] } = opts
+    const clock = virtualClock()
+    const start = timedLog(clock, startLog(155))
+    let seq = 0
+    const nextTs = () => `1700000100.${String(++seq).padStart(6, '0')}`
+    const messages: ScriptedMessage[] = [...EARLIER]
+    const answer = (channel: string, user: string, text: string) => messages.push({ channel, ts: nextTs(), text, user })
+    const api = scriptedSlack({
+      messages,
+      nextTs,
+      poster: SECOND_ID,
+      openDm: B_DM,
+      onPost: (channel, text) => {
+        if (channel === DRY_RUN_IDS.aHome && text.includes('open-channel')) answer(channel, A.userId, 'open-channel')
+        if (channel === B_DM && text.includes('open-dm') && bAnswers) answer(channel, B.userId, 'open-dm')
+      },
+    })
+    const { container, scripts } = fakeContainer([
+      ['server.log*', log.join('\n')],
+      ['.jsonl', tagLines.join('\n')],
+      ['ACCESS=present', 'ACCESS=absent\nLINK=symlink\nSKILL_LINK_OK\nSKILLMD=yes\nRETIRED=absent'],
+      ['CREATED=0', `CREATED=1 ${SHA}`],
+      [
+        'claude-slack-channel-bots start',
+        () => {
+          start.begin()
+          return ''
+        },
+      ],
+      ['[ -e "$S/config.json.pending" ]', { code: 1 }],
+      ["grep -iE 'pairing", accessLines.join('\n')],
+      ['tags a ', `<channel source="slack" chat_id="${DRY_RUN_IDS.aHome}" user_id="${SECOND_ID}" via="receive_all">`],
+      ['tags b ', `<channel source="slack" chat_id="${B_DM}" user_id="${SECOND_ID}" via="dm">`],
+      ['replies a | tail', `chat_id=${DRY_RUN_IDS.aHome} error=false result=Sent 1 message(s) to ${DRY_RUN_IDS.aHome}`],
+      ['replies b | tail', `chat_id=${B_DM} error=false result=Sent 1 message(s) to ${B_DM}`],
+      ['sha256sum "$S/access.json" | cut -d" "', SHA],
+      ['access.json.corrupt', '0'],
+      ['', (script) => (script === 'mark' ? '1:0' : (start.since(script) ?? ''))],
+    ])
+    const ctx = makeCtx({ mode: 'real', clock, human: scriptedHuman(clock).human, second: { human: new HumanSession(api, clock), userId: SECOND_ID }, container })
+    /** What the second account posted in this run. */
+    const posted = () => messages.filter((m) => m.user === SECOND_ID && !EARLIER.includes(m))
+    return { ctx, scripts, posted }
+  }
+
+  test("an earlier run's DM with B, and a log line naming only a longer ID: the check runs in that DM, A and B answer with no approval step, a PASS", async () => {
+    const r = await check14.run(check14Run({ log: [`[slack] dropped message user=${SECOND_ID}9 channel=C0DRYOTHER`] }).ctx)
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    expect(r.evidence).toContain(`TS_CH 1700000100.000001, TS_DM 1700000100.000003, B_NEW_DM_ID ${B_DM}`)
+  })
+
+  test.each([
+    ["B silent this run: the earlier run's open-dm answer in the DM does not count", { bAnswers: false }, 'B did not answer open-dm'],
+    ['an approval step (a pairing line after the mark)', { accessLines: [`[slack] pairing code sent to ${SECOND_ID}`] }, 'access-control lines appeared: 1'],
+  ])('%s: a FAIL', async (_what, opts, reason) => {
+    const r = await check14.run(check14Run(opts).ctx)
+    expect([r.status, r.reason]).toEqual(['FAIL', reason])
+  })
+
+  test.each([
+    ['a server log line', { log: [`[slack] Dispatching to persona "persona_a" (key=persona_a) chat_id=C0DRYAHOME user=${SECOND_ID}`] }, '1 server log line(s)'],
+    ['a persona tag', { tagLines: [`<channel source="slack" chat_id="C0DRYAHOME" user_id="${SECOND_ID}" via="receive_all">`] }, '1 persona tag(s)'],
+  ])("this run's server already saw the second user (%s): SKIPPED \"not verified\" before any setup or post", async (_what, opts, what) => {
+    const run = check14Run(opts)
+    const r = await check14.run(run.ctx)
+    expect([r.status, r.reason]).toEqual([
+      'SKIPPED',
+      `not verified: this run's server has already seen the second account (${what} name its user ID before the check posted); it is no longer a first-time user`,
+    ])
+    expect(run.scripts.length).toBe(2)
+    expect(run.scripts.every((s) => s.includes(`'${SECOND_ID}'`))).toBe(true)
+    expect(run.posted()).toEqual([])
   })
 })
 
@@ -2186,5 +2437,88 @@ describe("tags and tagstext over a transcript (the container's helpers and the p
     expect(helper(source, 'tagstext', 'a', 'Blocks prompt.')).toEqual([tag(TS.blocks, 'mention')])
     expect(helper(source, 'tagstext', 'a', 'Idle delivery.')).toEqual([tag(TS.idle, 'mention')])
     expect(helper(source, 'tagstext', 'a', 'never sent')).toEqual([])
+  })
+
+  // Check 14's search for the second user (dm-checks.ts `contactLines`): the
+  // two scripts it hands the container, run by bash over the fixture home.
+  describe("Check 14's search for the second user in this container's server log and persona transcripts", () => {
+    const SECOND_ID = 'U0DRYSECND'
+    const secondTag = (ts: string) => `<channel source="slack" chat_id="${DRY_RUN_IDS.aHome}" user_id="${SECOND_ID}" ts="${ts}" via="receive_all">`
+    const secondBody = (ts: string) => `${secondTag(ts)}\nHello from the second user.\n</channel>`
+    /** The helpers' own `S=` line: the server's state dir under the container user's home. */
+    const STATE_LINE = /^S=.*$/m.exec(containerHelpers)![0]
+    /** What the two scripts run by name. */
+    const CONTACT_TOOLS = ['bash', 'cat', 'grep', 'jq']
+
+    /** The log search and the tag search Check 14 runs for `userId`, in that order (the log answer names the ID, so it SKIPs after both). */
+    async function contactScripts(userId: string): Promise<[string, string]> {
+      const clock = virtualClock()
+      const { container, scripts } = fakeContainer([['server.log*', `user=${userId}`]])
+      const r = await check14.run(makeCtx({ mode: 'real', clock, second: { human: scriptedHuman(clock).human, userId }, container }))
+      expect(r.status).toBe('SKIPPED')
+      expect(scripts.length).toBe(2)
+      return [scripts[0]!, scripts[1]!]
+    }
+
+    /** Run one script as the container's `sh` does (bash, `S` set as the helpers set it) in the fixture home; its output lines. */
+    function inContainer(script: string): string[] {
+      const r = Bun.spawnSync([Bun.which('bash')!, '-c', `${STATE_LINE}\n${script}`], { env: hostSafeChildEnv(home, { tools: CONTACT_TOOLS }) })
+      expect(r.stderr.toString()).toBe('')
+      return r.stdout.toString().split('\n').filter((l) => l !== '')
+    }
+
+    /** A transcript of `entries` at `~/.claude/projects/<dir>/<file>`. */
+    function transcript(dir: string, file: string, entries: unknown[]): void {
+      mkdirSync(join(home, '.claude', 'projects', dir), { recursive: true })
+      writeFileSync(join(home, '.claude', 'projects', dir, file), entries.map((e) => JSON.stringify(e)).join('\n') + '\n')
+    }
+
+    test.each(SOURCES)("%s: the tag search reads a transcript with tags()'s own jq filter (the two cannot drift)", async (_where, source) => {
+      const filter = (script: string) => /jq -r '([^']*)'/.exec(script)?.[1]?.replace(/\s+/g, ' ')
+      const [, tagScript] = await contactScripts(SECOND_ID)
+      expect(filter(tagScript)).toBeDefined()
+      expect(filter(tagScript)).toBe(filter(shellFunction(source, 'tags'))!)
+    })
+
+    test("over one persona's transcript the tag search prints exactly the tags tags() prints for each delivered message, in order", async () => {
+      const [, tagScript] = await contactScripts(DRY_RUN_IDS.humanUserId)
+      const byTs = [TS.idle, TS.midTurn, TS.blocks, TS.userBlocks].flatMap((ts) => helper(containerHelpers, 'tags', 'a', ts))
+      expect(byTs.length).toBe(4)
+      expect(inContainer(tagScript)).toEqual(byTs)
+    })
+
+    test('it reads every rotated server.log* and every transcript of every persona, and nothing else; priorContact counts what names the whole ID', async () => {
+      const state = join(home, '.claude', 'channels', 'slack')
+      mkdirSync(state, { recursive: true })
+      const current = `[slack] Dispatching to persona "persona_c" (key=persona_c) chat_id=${DRY_RUN_IDS.aHome} user=${SECOND_ID}`
+      const rotated = `[slack] dropped message user=${SECOND_ID} channel=C0DRYOTHER`
+      const longer = `[slack] dropped message user=${SECOND_ID}9 channel=C0DRYOTHER`
+      writeFileSync(join(state, 'server.log'), `[slack] started\n${current}\n[slack] dropped message user=U0DRYOTHER\n`)
+      writeFileSync(join(state, 'server.log.1'), `${rotated}\n`)
+      writeFileSync(join(state, 'server.log.2'), `${longer}\n`)
+      // Persona c: an earlier transcript (a user entry) and the current one (a queued_command attachment), whose
+      // queue entry and A's quote of a tag are no delivery; a project that is no persona's is not read.
+      transcript('-home-testuser-cscb-live-c', '1-earlier.jsonl', [{ type: 'user', message: { role: 'user', content: secondBody('1700000200.000001') } }])
+      transcript('-home-testuser-cscb-live-c', '2-current.jsonl', [
+        { type: 'queue-operation', operation: 'enqueue', content: secondBody('1700000200.000002') },
+        { type: 'attachment', attachment: { type: 'queued_command', commandMode: 'prompt', prompt: secondBody('1700000200.000002') } },
+        { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: `I saw ${secondTag('1700000200.000003')}` }] } },
+      ])
+      transcript('-home-testuser-elsewhere', 'other.jsonl', [{ type: 'user', message: { role: 'user', content: secondBody('1700000200.000004') } }])
+
+      const [logScript, tagScript] = await contactScripts(SECOND_ID)
+      const log = inContainer(logScript)
+      const tagLines = inContainer(tagScript)
+      expect(log).toEqual([current, rotated, longer])
+      expect(tagLines).toEqual([secondTag('1700000200.000001'), secondTag('1700000200.000002')])
+      expect(priorContact(log, tagLines, SECOND_ID)).toBe(
+        "this run's server has already seen the second account (2 server log line(s) and 2 persona tag(s) name its user ID before the check posted); it is no longer a first-time user",
+      )
+    })
+
+    test('a fresh container (no server log yet, no transcript naming the ID): both searches print nothing and fail on nothing', async () => {
+      const [logScript, tagScript] = await contactScripts(SECOND_ID)
+      expect([inContainer(logScript), inContainer(tagScript)]).toEqual([[], []])
+    })
   })
 })

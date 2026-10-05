@@ -15,6 +15,12 @@
  * - A dry run reads none of the real files: its store points at a temporary
  *   directory, ignores the environment overrides, and refuses (throws) any
  *   access under the real config directory.
+ * - live.json's optional `second_user` is one of two kinds: a password
+ *   account (its email, and a `password_file` or `password_env`) or a
+ *   code-only account (its email and neither password key), which signs in
+ *   by a code Slack emails to it and the run reads from the test mailbox.
+ *   An entry whose password keys are all malformed is dropped, never taken
+ *   as code-only.
  *
  * File-system access goes through the injected `SecureFs`, so tests can
  * drive every branch with an in-memory fake.
@@ -283,8 +289,15 @@ export function readPrivateFile(fs: SecureFs, path: string): string {
 // The store
 // ---------------------------------------------------------------------------
 
+/**
+ * live.json's `second_user`, of either kind: a password account names where
+ * its password is (`password_file`, `password_env` or both); a code-only
+ * account names neither, and `readSecondPassword` gives `null` for it (its
+ * sign-in requests an emailed code, read from the test mailbox). Either
+ * kind's emailed code is read only from Slack mail sent exactly to `email`.
+ */
 export interface SecondUserConfig {
-  /** The second workspace user's email (config, never logged). */
+  /** The second workspace user's email (config, never logged: registered with the redactor). */
   email: string
   /**
    * Where its password is: a file path (mode 600) or an environment variable
@@ -294,6 +307,12 @@ export interface SecondUserConfig {
   password_env?: string
 }
 
+/**
+ * live.json with its overrides applied: the workspace, the test human's
+ * email, and the second workspace user (a password account or a code-only
+ * one, see `SecondUserConfig`), or `null` when none is configured or the
+ * entry is unusable (no valid email, or only malformed password keys).
+ */
 export interface LiveConfig {
   workspaceDomain: string
   testEmail: string
@@ -627,6 +646,11 @@ export class SecretStore {
   }
 }
 
+/**
+ * live.json's `second_user`: a password account (at least one well-formed
+ * password key), a code-only account (a valid email and neither key), or
+ * `null` (no valid email, or password keys given but all malformed).
+ */
 function parseSecondUser(value: unknown): SecondUserConfig | null {
   if (!value || typeof value !== 'object') return null
   const v = value as Record<string, unknown>
