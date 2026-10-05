@@ -80,8 +80,7 @@
 # `kill-p…`). A call with no command and neither -c nor -V is tmux's default
 # `new-session`.
 #
-# fail-kill's target list (a harness addition, confirm at the reconcile
-# pass). Each listed target is a session name, a session id (`$N`) or a pane
+# fail-kill's target list (a harness addition). Each listed target is a session name, a session id (`$N`) or a pane
 # id (`%N`). A kill command's target is its `-t` value (`-t <t>`, `-t<t>`, or
 # `t` last in a flag cluster such as `-at <t>`), read up to `--` or its first
 # word that is not a flag; a kill with no `-t` is aimed at no listed target.
@@ -155,7 +154,7 @@ fi
 mode=log
 delay=""
 # fail-kill's target list: the mode file's lines after the first (a harness
-# addition, confirm at the reconcile pass).
+# addition).
 target_lines=()
 if [[ -e "${mode_file}" ]]; then
     mode=""
@@ -285,7 +284,7 @@ for c in ${commands[@]+"${commands[@]}"}; do
 done
 
 # ---------------------------------------------------------------------------
-# fail-kill's target list (a harness addition, confirm at the reconcile pass):
+# fail-kill's target list (a harness addition):
 # whether a kill command of the call is aimed at a listed target.
 # ---------------------------------------------------------------------------
 

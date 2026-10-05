@@ -1,7 +1,6 @@
 #!/bin/bash -p
 # agent-director-list-refusing.sh — the fmk scenarios' agent-director stand-in
-# that refuses `list` (b.jg5 SRJ-1306, SRJ-906, SRJ-1411). A harness addition,
-# confirm at the reconcile pass. Runs only in a cscb-ci image; never run it on
+# that refuses `list` (b.jg5 SRJ-1306, SRJ-906, SRJ-1411). A harness addition. Runs only in a cscb-ci image; never run it on
 # a dev box: its first step checks for the image marker /etc/cscb-ci-image
 # and, when it is absent, prints one line to standard error and exits 70,
 # running nothing.

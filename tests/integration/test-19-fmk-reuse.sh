@@ -92,12 +92,11 @@
 # Stub modes (fixtures/stub-claude.sh): each persona's first life runs
 # `dev-channels` (the reporting stub: the approver's Enter makes it report in,
 # and it writes its transcript before SessionStart). Its new life runs
-# `transcript-on-first-message` (a harness addition, confirm at the reconcile
-# pass): the same dialog and report-in, but no transcript until a message is
+# `transcript-on-first-message` (a harness addition): the same dialog and report-in, but no transcript until a message is
 # typed, so the new life's SessionStart finds no transcript, as a real
 # never-messaged life's does. Each life is ended by the harness typing the
 # stub's exit sentinel into the persona's pane (`stub_type_line`, a harness
-# addition, confirm at the reconcile pass): the stub fires SessionEnd and
+# addition): the stub fires SessionEnd and
 # exits, and the row reads `ended`. In scenario 12's legs, G's first life
 # and its leftover run `silent` (no dialog and no hook: the row keeps no
 # session id, and a read of the leftover's pane shows no dialog for CSCB to
@@ -856,7 +855,7 @@ t19_check_pending_then_waiting() {
 
 # ---------------------------------------------------------------------------
 # Harness check: the transcript-on-first-message mode and stub_type_line
-# (harness additions, confirm at the reconcile pass)
+# (harness additions)
 # ---------------------------------------------------------------------------
 
 # t19_transcripts: how many transcript files the scenario HOME's Claude

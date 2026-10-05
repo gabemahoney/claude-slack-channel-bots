@@ -2774,7 +2774,7 @@ describe('static audit: repoint_symlink checks HOME first (b.jg5 SRJ-1306)', () 
 
 // ---------------------------------------------------------------------------
 // Static audit: the list-refusing agent-director stand-in (b.jg5 SRJ-1306,
-// SRJ-1411; test-21's harness addition, confirm at the reconcile pass)
+// SRJ-1411; test-21's harness addition)
 // ---------------------------------------------------------------------------
 
 /** The stand-in that refuses `list` and runs the release for every other verb, swapped in behind the shim. */

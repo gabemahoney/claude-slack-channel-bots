@@ -73,8 +73,7 @@
 # each answer ErrTmuxKillFailed (UNAVAILABLE), so the persona's teardown
 # fails with the kill-failure alert's ordinary version (SRJ-702, SRJ-1007).
 # How agent-director stops answering at the fallback (S5): the list-refusing
-# stand-in (fixtures/agent-director-list-refusing.sh, a harness addition,
-# confirm at the reconcile pass) swapped in behind the shim
+# stand-in (fixtures/agent-director-list-refusing.sh, a harness addition) swapped in behind the shim
 # (`swap_ad_binary`, shim check after the swap and after the restore): it
 # refuses `list` and runs the release for every other verb.
 #

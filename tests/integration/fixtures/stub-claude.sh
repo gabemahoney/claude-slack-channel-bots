@@ -50,7 +50,7 @@
 #                        `projects[<dir>].hasTrustDialogAccepted` is `true` for
 #                        its real path or for $PWD.
 #   transcript-on-first-message
-#                        (a harness addition, confirm at the reconcile pass)
+#                        (a harness addition)
 #                        as `dev-channels` (the same dialog, reporting in on
 #                        the first line that reaches stdin), except that
 #                        reporting in writes no transcript: until the first
@@ -83,7 +83,7 @@
 #
 # THE DIALOG DELAY
 # ----------------
-# A harness addition (b.jg5 SRJ-1306) to confirm at the reconcile pass: an
+# A harness addition (b.jg5 SRJ-1306): an
 # optional delay before the dev-channels dialog, set per working directory,
 # so a launch stays `pending` at the dialog long enough for a scenario to act
 # on it before CSCB's approver can answer. The harness writes it
@@ -334,7 +334,7 @@ MODE_AT_ONCE=at-once
 MODE_SILENT=silent
 MODE_UNRECOGNISED=unrecognised-dialog
 MODE_FOLDER_TRUST=folder-trust
-# A harness addition, confirm at the reconcile pass.
+# A harness addition.
 MODE_TRANSCRIPT_ON_FIRST_MESSAGE=transcript-on-first-message
 MODE_LINGER_ON_EXIT=linger-on-exit
 

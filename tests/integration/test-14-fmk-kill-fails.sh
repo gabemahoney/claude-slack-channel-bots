@@ -35,8 +35,7 @@
 # - the tmux shim's mode per leg: `log` while a leg launches its persona,
 #   `fail-kill` for the kills the leg checks, `log` again at the leg's end;
 #   legs 0 and 4 limit `fail-kill` to one row's session name, session id and
-#   pane id (`tmux_shim_mode fail-kill --targets`, a harness addition,
-#   confirm at the reconcile pass), so every other kill runs the real tmux;
+#   pane id (`tmux_shim_mode fail-kill --targets`, a harness addition), so every other kill runs the real tmux;
 # - the stub worker's mode per working directory (`stub_mode`): the start
 #   sweep's persona reports in (`dev-channels`, the approver's Enter), the
 #   `config_dir` and `cwd` personas never do (`silent`), so their rows stay
@@ -54,7 +53,7 @@
 #   teardown), an edit of config.json and the last-applied record moved aside,
 #   so the next start applies config.json as it stands (README "Reload");
 # - re-pointing a symlinked `working_directory` or `claude_config_dir`
-#   (`repoint_symlink`, a harness addition, confirm at the reconcile pass) is
+#   (`repoint_symlink`, a harness addition) is
 #   the working default that makes a real `cwd` or `config_dir` mismatch with
 #   no config edit: agent-director's spawn records the real `cwd`, CSCB writes
 #   the `config_dir` label by real path, and `compareRowToPersona` resolves the
@@ -436,8 +435,7 @@ mkdir -p "${X_CFG}" "${C_CFG_ONE}" "${C_CFG_TWO}" "${W_CFG}" "${P_CFG}" "${R_CFG
 ln -s -- "${C_CFG_ONE}" "${C_CFG_LINK}"
 ln -s -- "${W_ONE}" "${W_LINK}"
 
-# repoint_symlink's refusals (a harness addition, confirm at the reconcile
-# pass), each in a subshell: it fails, saying why, and changes nothing.
+# repoint_symlink's refusals (a harness addition), each in a subshell: it fails, saying why, and changes nothing.
 t14_expect_refusal() {
     local why="$1" err="${SCENARIO_ROOT}/repoint-refusal.err" rc=0
     shift

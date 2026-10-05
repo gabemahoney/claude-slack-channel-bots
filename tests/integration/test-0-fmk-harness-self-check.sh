@@ -123,8 +123,7 @@
 #                    commands run. After a change to `log`, the next call
 #                    kills the session.
 #   fail_kill_targets
-#                    `fail-kill` limited to a target list (a harness addition,
-#                    confirm at the reconcile pass): `tmux_shim_mode fail-kill
+#                    `fail-kill` limited to a target list (a harness addition): `tmux_shim_mode fail-kill
 #                    --targets` writes the mode line, then one target per line;
 #                    a kill-pane of the listed pane id, a kill-session of the
 #                    listed session id (alone, in a flag cluster and in a
@@ -266,12 +265,10 @@
 #                    row; `write_mcp_config` refuses a value that is not a
 #                    port, and the setup's MCP config names the server
 #                    `slack-channel-router` at the scenario's port over http.
-#                    `stub_type_line` (a harness addition, confirm at the
-#                    reconcile pass) refuses with TMUX set or another
+#                    `stub_type_line` (a harness addition) refuses with TMUX set or another
 #                    TMUX_TMPDIR, an empty or blank line and a line holding a
 #                    control character.
-#   repoint_refusals `repoint_symlink` (a harness addition, confirm at the
-#                    reconcile pass) refuses by real path, saying why, and
+#   repoint_refusals `repoint_symlink` (a harness addition) refuses by real path, saying why, and
 #                    leaves the link as it was: a link under SCENARIO_ROOT as
 #                    written whose directory resolves outside it (through a
 #                    symlinked directory to the guard_refusals leg's scratch
@@ -1892,7 +1889,7 @@ fk_no_session() {
     ! has_session "$1"
 }
 
-# fail-kill's target list (a harness addition, confirm at the reconcile pass).
+# fail-kill's target list (a harness addition).
 leg_fail_kill_targets() {
     local step="fail-kill targets" listed="t0-fk-listed" other="t0-fk-other" ids sid pane other_pane want
     "${SCENARIO_REAL_TMUX}" new-session -d -s "${listed}" -- sleep 600 || fail "${step}: could not make ${listed}"
@@ -2607,8 +2604,7 @@ leg_stub_helpers() {
     expect_fails_in_home "${step}" "${HOME}" "refused: TMUX_TMPDIR '/tmp' is not the scenario's" \
         with_tmux_tmpdir /tmp stub_type_exit "${T0_SESSION}"
     press_enter_exact "${step}"
-    # stub_type_line's refusals (a harness addition, confirm at the
-    # reconcile pass), beside stub_press_enter's.
+    # stub_type_line's refusals (a harness addition), beside stub_press_enter's.
     expect_fails_in_home "${step}" "${HOME}" "refused: TMUX is set" with_tmux_set stub_type_line "${T0_SESSION}" "a line"
     expect_fails_in_home "${step}" "${HOME}" "refused: TMUX_TMPDIR '/tmp' is not the scenario's" \
         with_tmux_tmpdir /tmp stub_type_line "${T0_SESSION}" "a line"
@@ -2629,8 +2625,7 @@ leg_stub_helpers() {
         || fail "${step}: ${file} names '${got}', not the scenario's port ${SCENARIO_PORT}"
 }
 
-# repoint_symlink's refusals by real path (a harness addition, confirm at the
-# reconcile pass): each fails with its reason and leaves the link as it was;
+# repoint_symlink's refusals by real path (a harness addition): each fails with its reason and leaves the link as it was;
 # then the same link is re-pointed, so the refusals are not the setup's.
 leg_repoint_refusals() {
     local step="repoint refusals" one two outside_link via to_tmp file link

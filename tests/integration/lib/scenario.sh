@@ -381,8 +381,7 @@
 #                                      resume in <dir> on; the last selection of a directory wins;
 #                                      fails for an unknown mode, or a <dir> that is not a directory
 #                                      under SCENARIO_ROOT (as written and by real path)
-#   stub_dialog_delay <dir> <seconds>  a harness addition (b.jg5 SRJ-1306) to confirm at the
-#                                      reconcile pass: delay the dev-channels dialog of every stub
+#   stub_dialog_delay <dir> <seconds>  a harness addition (b.jg5 SRJ-1306): delay the dev-channels dialog of every stub
 #                                      worker whose working directory is <dir> by <seconds> (a whole
 #                                      number; 0 for none): one `<seconds> TAB <real path of dir>`
 #                                      line added to $SCENARIO_BIN/stub-claude-dialog-delays (by an
@@ -420,14 +419,14 @@
 #                                      any signal, unless that process is a stub lingering in
 #                                      `linger-on-exit` (its marker `$SCENARIO_BIN/stub-claude-lingering.<pid>`)
 #   STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE
-#                                      (a harness addition, confirm at the reconcile pass) the mode
+#                                      (a harness addition) the mode
 #                                      `transcript-on-first-message`, a known mode of `stub_mode`:
 #                                      `dev-channels`, except that reporting in writes no transcript
 #                                      (SessionStart finds none) and the first message after it does
-#   STUB_EXIT_SENTINEL                 (a harness addition, confirm at the reconcile pass) the stub's
+#   STUB_EXIT_SENTINEL                 (a harness addition) the stub's
 #                                      exit sentinel line, `__CSCB_TEST_EXIT__`: typed into a stub's
 #                                      pane (`stub_type_line`) it fires SessionEnd and exits
-#   stub_type_line <target> <line>     (a harness addition, confirm at the reconcile pass) a human
+#   stub_type_line <target> <line>     (a harness addition) a human
 #                                      typing <line> into the tmux pane <target> (as for
 #                                      `stub_press_enter`), then Enter: two send-keys of the real
 #                                      tmux on the scenario's own tmux server, from the scenario's own
@@ -684,7 +683,7 @@
 #                                      `<channel id> <instance id> <session name> <session id>
 #                                      <pane id>`
 #
-#   The human's filesystem steps (fmk mode; harness addition, confirm at the reconcile pass;
+#   The human's filesystem steps (fmk mode; harness addition;
 #   both guards first; no tmux or agent-director call)
 #   repoint_symlink <link> <target>    re-point the existing symlink <link> to the existing
 #                                      directory <target>, both under SCENARIO_ROOT (as written
@@ -714,7 +713,7 @@
 #                                      or wedge its delay in seconds (the shim's defaults: 15, 60),
 #                                      by an atomic write of the mode file; the next call reads it
 #   tmux_shim_mode fail-kill --targets <target>...
-#                                      (a harness addition, confirm at the reconcile pass)
+#                                      (a harness addition)
 #                                      `fail-kill` limited to the targets given (session names,
 #                                      session ids `$N`, pane ids `%N`): the mode file holds the mode
 #                                      line, then one target per line, written atomically; only a
@@ -774,7 +773,7 @@
 #                                      <timeout-s>
 #
 #   Scenario 10's harness additions (fmk mode; b.jg5 SRJ-1412, SRJ-1306, SRJ-1401). Each is a
-#   harness addition, confirm at the reconcile pass; each runs `require_ci_image` first, and
+#   harness addition; each runs `require_ci_image` first, and
 #   `start_second_tmux_server` and the window copies of `cscb_ad_calls_between` and
 #   `cscb_ad_count_between` also `require_scenario_home`, before any step. Scenario 10 writes
 #   its `[tmux]` table with `write_ad_settings` (above). A harness
@@ -782,7 +781,7 @@
 #   on the call (`TMUX_TMPDIR=<dir> ad_capture …`, `TMUX=<value> ad_capture …`) holds for
 #   that one call only, from the scenario's own shell, and reaches the binary behind the shim.
 #   start_second_tmux_server [<session-name>]
-#                                      (harness addition, confirm at the reconcile pass) start
+#                                      (harness addition) start
 #                                      another tmux server, with the real tmux from the scenario's
 #                                      own shell, on its own socket
 #                                      `$SCENARIO_ROOT/tmux-second/tmux-<uid>/default`, with one
@@ -800,29 +799,29 @@
 #   that follow)
 #   cscb_ad_calls_between <from-mark> <to-mark|-> <verb> [<fragment>...]
 #   cscb_ad_count_between <from-mark> <to-mark|-> <verb> [<fragment>...]
-#                                      (harness addition, confirm at the reconcile pass)
+#                                      (harness addition)
 #                                      `cscb_ad_calls` and `cscb_ad_count` over only the shim
 #                                      log's lines after <from-mark> up to <to-mark> (`-`: up to
 #                                      the log's end now), read from a copy of those lines under
 #                                      SCENARIO_ROOT with the same CSCB process record
-#   slack_record_mark <record>         (harness addition, confirm at the reconcile pass) print
+#   slack_record_mark <record>         (harness addition) print
 #                                      the last `seq` of the Slack stub's record <record> (a file
 #                                      under SCENARIO_ROOT; 0 when it holds none)
 #   slack_label_posts <record> <label> [<after-seq>]
-#                                      (harness addition, confirm at the reconcile pass) print the
+#                                      (harness addition) print the
 #                                      text of each `chat.postMessage` the Slack stub recorded for
 #                                      the token label <label> with a `seq` above <after-seq>
 #                                      (default 0), in record order, one JSON string per line
 #                                      (`jq -r` gives a post's text back)
 #
 #   Scenario 26's harness additions (fmk mode; b.jg5 SRJ-1428, SRJ-1306, SRJ-1401). Each is a
-#   harness addition, confirm at the reconcile pass.
+#   harness addition.
 #   SCENARIO_AD_OWNER_OPTION SCENARIO_AD_PANE_OPTION
-#                                      (harness addition, confirm at the reconcile pass) the two
+#                                      (harness addition) the two
 #                                      tmux option names agent-director labels a session and its
 #                                      worker pane with, `@ad_owner` and `@ad_pane`, as the seeding
 #                                      helpers above set them; src/ names neither (SRJ-716)
-#   restore_tmux_socket <moved-socket> (harness addition, confirm at the reconcile pass) undo
+#   restore_tmux_socket <moved-socket> (harness addition) undo
 #                                      `rebind_tmux_socket`: both guards first, then, from the
 #                                      scenario's own shell with the real tmux (it refuses when
 #                                      TMUX_TMPDIR is not the scenario's or TMUX is set), it reads
@@ -838,7 +837,7 @@
 #                                      recorded server's PID and the same sessions, panes and pane
 #                                      processes, each pane process still running; prints the
 #                                      recorded server's PID and clears REBOUND_SOCKET
-#   cscb_tmux_calls [<fragment>...]    (harness addition, confirm at the reconcile pass) print the
+#   cscb_tmux_calls [<fragment>...]    (harness addition) print the
 #                                      tmux shim's `call` lines whose parent is any CSCB process the
 #                                      record holds at the line's time (a bot server, a `start` or
 #                                      `stop` run, or a CLI command or driver run through
@@ -846,10 +845,10 @@
 #                                      every fixed-string <fragment> in order; a line whose parent is
 #                                      agent-director, the scenario's own shell or a stub is never
 #                                      one. `assert_no_server_tmux` reads bot-server parents only
-#   cscb_tmux_count [<fragment>...]    (harness addition, confirm at the reconcile pass) print how
+#   cscb_tmux_count [<fragment>...]    (harness addition) print how
 #                                      many lines `cscb_tmux_calls` would print
 #   end_worker_without_session_end <pane-id>
-#                                      (harness addition, confirm at the reconcile pass) a worker
+#                                      (harness addition) a worker
 #                                      whose process ends with no SessionEnd: both guards first,
 #                                      then, from the scenario's own shell with the real tmux (it
 #                                      refuses when TMUX_TMPDIR is not the scenario's or TMUX is
@@ -861,7 +860,7 @@
 #                                      still reads live until a `find-missing` marks it, and with
 #                                      remain-on-exit on the pane and its session remain. Prints
 #                                      `<pane id> <ended pid>`
-#   end_stub_mcp_session <pane-id>     (harness addition, confirm at the reconcile pass) a stub
+#   end_stub_mcp_session <pane-id>     (harness addition) a stub
 #                                      worker's MCP session ended from the client's side: both
 #                                      guards first, then, from the scenario's own shell with the
 #                                      real tmux (it refuses when TMUX_TMPDIR is not the scenario's
@@ -1118,7 +1117,7 @@ STUB_MODE_UNRECOGNISED=unrecognised-dialog
 STUB_MODE_FOLDER_TRUST=folder-trust
 SCENARIO_STUB_MODES=("${STUB_MODE_DEV_CHANNELS}" "${STUB_MODE_AT_ONCE}" "${STUB_MODE_SILENT}"
     "${STUB_MODE_UNRECOGNISED}" "${STUB_MODE_FOLDER_TRUST}")
-# Harness additions, confirm at the reconcile pass: the stub mode that writes
+# Harness additions: the stub mode that writes
 # its transcript only at the first message after reporting in, and the
 # stub's exit sentinel line (fixtures/stub-claude.sh SENTINEL), which a
 # scenario types with `stub_type_line` or `stub_type_exit`.
@@ -2045,8 +2044,7 @@ tmux_shim_mode() {
     local mode="${1:-}" delay="${2:-}" m known=0
     local t text
     [[ "${SCENARIO_FMK}" == 1 ]] || fail "tmux_shim_mode: the tmux shim is for fmk scripts only"
-    # fail-kill's target list (a harness addition, confirm at the reconcile
-    # pass): `fail-kill --targets <target>...`, one target per line after
+    # fail-kill's target list (a harness addition): `fail-kill --targets <target>...`, one target per line after
     # the mode line.
     if [[ "${delay}" == --targets ]]; then
         [[ "${mode}" == fail-kill ]] || fail "tmux_shim_mode: only fail-kill takes --targets"
@@ -2757,7 +2755,7 @@ stub_release() {
         || fail "${step}: the released stub (pid ${pid}) still runs ${timeout_s}s after its release"
 }
 
-# A harness addition, confirm at the reconcile pass.
+# A harness addition.
 stub_type_line() {
     local target="${1:-}" text="${2:-}" step exact err rc=0
     step="stub_type_line ${target}"
@@ -3510,8 +3508,7 @@ write_ad_settings() {
 
 
 # ---------------------------------------------------------------------------
-# The human's filesystem steps (fmk mode; harness addition, confirm at the
-# reconcile pass)
+# The human's filesystem steps (fmk mode; harness addition)
 # ---------------------------------------------------------------------------
 
 repoint_symlink() {
@@ -4392,8 +4389,7 @@ wait_for_cscb_ad_call() {
 }
 
 # ---------------------------------------------------------------------------
-# Scenario 10's harness additions (fmk mode; each a harness addition, confirm
-# at the reconcile pass)
+# Scenario 10's harness additions (fmk mode; each a harness addition)
 # ---------------------------------------------------------------------------
 
 # _scenario_printed <step> <entry> [<arg>...]: print fixtures/fmk-texts.ts's
@@ -4496,8 +4492,7 @@ slack_label_posts() {
 }
 
 # ---------------------------------------------------------------------------
-# Scenario 26's harness additions (fmk mode; each a harness addition, confirm
-# at the reconcile pass)
+# Scenario 26's harness additions (fmk mode; each a harness addition)
 # ---------------------------------------------------------------------------
 
 # The tmux options agent-director labels a session (@ad_owner) and its worker
