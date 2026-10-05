@@ -482,7 +482,7 @@ GONE_WAIT_S=10        # after the kill: the worker's process gone
 OTHER_START_MARGIN_S=15
 HELD_SLACK_S=40
 LAP_WAIT_S=30         # after R's first pending read: the approver's first lap, then its next pane read
-LAP_SETTLE_S=0.3      # after the approver's pane read is logged: its call answered, before the relabel
+LAP_SETTLE_S=0.15     # after the approver's pane read is logged: its call answered, before the relabel
 LATCH_WAIT_S=30       # after R's kill: the latch-set line
 RECHECK_SLACK_S=60
 
