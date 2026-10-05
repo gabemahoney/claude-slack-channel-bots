@@ -159,11 +159,14 @@ why:
   statement of each checks the marker and exits 2 before it reads an argument
   or loads a module; each statically imports only `node:` built-ins.
   (`fixtures/phase1-client-check.ts` also refuses to run without the marker.)
+- `fixtures/fmk-texts.ts`: the same first-statement check, exiting 2 before
+  it reads an argument or loads the package; it statically imports only
+  `node:` built-ins.
 - Every `scenario.sh` step that installs, moves or swaps an agent-director
   binary or the shim, every harness agent-director call (`ad`, `ad_capture`, `ad_admin`, `ad_admin_capture`),
   every harness `sqlite3` read or edit (`ad_store_edit`, `ad_store_id`,
   `ad_store_pending_no_launch`) and every stub-worker helper (`stub_mode`,
-  `stub_press_enter`, `write_mcp_config`) calls `require_ci_image` as its
+  `stub_dialog_delay`, `stub_press_enter`, `write_mcp_config`) calls `require_ci_image` as its
   first step, which fails with
   `FAIL: <test>: <step>: refused: /etc/cscb-ci-image is absent …`.
 
@@ -212,7 +215,8 @@ tests/
                                    # finished-row kills (agent-director-admin's `kill-finished`) passing; each assertion, positive control and count helper failing on a violating log; the
                                    # closing enforcement; and the trap stopping the scenario's tmux server. Its stub legs show the stub's MCP session registered as
                                    # the persona's, with no reconnect or relaunch over three health ticks and the persona not connected once the stub ends; the stub
-                                   # run directly (its version line, the default dev-channels dialog, `silent`, a stop line on stderr); the stub helpers refusing
+                                   # run directly (its version line, the default dev-channels dialog, `silent`, a stop line on stderr, and with a dialog delay a starting
+                                   # screen holding neither approver needle, then the same dialog byte for byte); the stub helpers (`stub_dialog_delay` among them) refusing
                                    # and working; the SessionStart re-fire in every reporting path (at once, a folder trusted in either config, and the dev-channels,
                                    # unrecognised and folder-trust dialogs answered by `stub_press_enter`) against a row a silent worker holds `pending`, every fire
                                    # ignored as `pid_mismatch` and none after G; exactly one stop line after a failed `status` read and after a `pending` row with no
@@ -227,6 +231,11 @@ tests/
                                    # re-bind (`tmux_server_steps`). The re-fire legs wait out agent-director's default G (60 s); only after them does
                                    # `store_statements` write a `[tmux]` table (`starting_session_seconds = 60`, `stopping_window_seconds = 30`), so the
                                    # kill need not wait 300 s. It runs about two and a half minutes and ends with the three closing assertions
+    test-17-fmk-launch-pending.sh  # HO §7 scenario 5 (b.jg5 SRJ-1406, AC 3), fmk mode, live against the Slack stub: a resume held at the dev-channels dialog
+                                   # (the stub's dialog delay) reads `pending` with its claude_session_id and a launch start; health ticks and a `resume` forced
+                                   # through fixtures/fmk-driver.ts (ErrSpawnNotResumable, not counted, not posted) launch, kill, count or post nothing; the approver
+                                   # clears the dialog through the bot server's `read-pane` and `send-keys` with `--allow-pending`, the row reaches `waiting`;
+                                   # ends with the three closing assertions (see fmk scenarios)
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
@@ -243,7 +252,11 @@ tests/
                                    # dialog by default, at once, silent, an unrecognised dialog, the folder-trust prompt), reports in by firing every SessionStart
                                    # hook its `--settings` registers, and SessionEnd on its exit sentinel, as direct children of its own process (exec form:
                                    # `command` with its `args`; shell form: the command's words); re-fires SessionStart while its row reads `pending`, up to G;
-                                   # holds an MCP session to the bot server (see The stub worker)
+                                   # holds an MCP session to the bot server (see The stub worker); in `dev-channels`, an optional per-directory delay before the
+                                   # dialog (`stub_dialog_delay`, a harness addition)
+      fmk-texts.ts                 # the fmk scenarios' one value printer, run with bun: prints a named `src/` export of the installed package (an approver needle,
+                                   # APPROVER_LOG_PREFIX, DIALOG_POLL_INTERVAL_MS, agent-director's default G) with nothing added, so a script never retypes a value
+                                   # CSCB defines; refuses to run without the image marker /etc/cscb-ci-image and imports the package only after that check
       stub-mcp-session.ts          # the stub's MCP session client, copied beside the stub in every fmk script: connects to the bot server named by the stub's
                                    # `--mcp-config` with the package's own MCP SDK and holds the session until the stub ends; refuses to run without the image
                                    # marker /etc/cscb-ci-image and imports the package only after that check
@@ -405,7 +418,7 @@ fmk mode. Sourcing also:
 - exports a PATH that starts with the scenario's bin directory
   (`SCENARIO_BIN`), where `claude` is a copy of `fixtures/stub-claude.sh`,
   with a copy of `fixtures/stub-mcp-session.ts` beside it and the stub's mode
-  selections (see The stub worker), followed by the container's PATH without every directory that holds an
+  selections and dialog delay settings (see The stub worker), followed by the container's PATH without every directory that holds an
   `agent-director` (the image's default agent-director directory among them)
   and without relative or empty entries. bun's directory stays. No process of
   the scenario finds an agent-director on PATH: the client finds the scenario
@@ -752,6 +765,21 @@ These hold for every fmk script (b.jg5 SRJ-1401):
 - Posts are read from the Slack stub's record (`slack-stub-server.ts
   --record`).
 - Shim logs are read by parent process, as above, never by scraping a pane.
+- A value CSCB defines (a needle, a log prefix, a pace, a default setting) is
+  printed from the installed package by `fixtures/fmk-texts.ts`, never
+  retyped. A scenario that needs another value adds a named entry there;
+  there is no second printer.
+
+### fmk scenarios
+
+Each HO §7 scenario maps to the script that runs it. A script's header
+comment is its specification; this list says what each checks and how it is
+set up. Every one follows Rules for every fmk scenario and ends with the
+three closing assertions.
+
+| Scenario | Script | What it checks | Set-up |
+|---|---|---|---|
+| 5 (b.jg5 SRJ-1406, AC 3) | `test-17-fmk-launch-pending.sh` | A launch in progress: a resume held at the dev-channels dialog reads `pending` with its kept `claude_session_id` and a launch start. While it is held, health ticks and a `resume` forced through `fmk-driver.ts` change nothing: the forced call gets `ErrSpawnNotResumable`, not counted and not posted, and the bot server makes no other launch, no kill and no post, and writes no reconnect, relaunch or restart line for the persona. After the delay, the approver clears the dialog only through the bot server's `read-pane` and `send-keys` with `--allow-pending` on the `pending` row (no `send-keys` before the delay ends, no approver log line for the persona), the row reaches `waiting` with the same `claude_session_id`, and the bot server starts no tmux process (`assert_no_server_tmux`) | The tmux shim in `log` throughout. The stub in `dev-channels` with a dialog delay (`stub_dialog_delay`) of 30 s, set in the persona's working directory before the resume: one health tick, the forced `resume`'s 20 s bound and 7 s slack, checked to be shorter than agent-director's default G (60 s) less the approver's clear. The worker ended with the stub's sentinel; the bot server's restart path makes the resume. `fmk-driver.ts`'s forced `resume` through `cscb_run`. Health ticks on through config: `health_check_interval` 3 s, `session_restart_delay` 5 s. agent-director at its defaults (no `config.toml`). Posts read from the Slack stub's record |
 
 ### Harness-only steps
 
@@ -976,6 +1004,28 @@ used as given, and a session name is matched exactly, never as a prefix of
 another session's. It fails with tmux's message when tmux refuses, and
 refuses when `TMUX` is set or `TMUX_TMPDIR` is not the scenario's.
 
+The dialog delay, a harness addition (b.jg5 SRJ-1306) to confirm at the
+reconcile pass, holds a launch `pending` at the dev-channels dialog long
+enough for a scenario to act on it before the approver can answer (scenario
+5). `stub_dialog_delay <dir> <seconds>` adds one `<seconds> TAB <real path>`
+line to `stub-claude-dialog-delays` beside the stub in `SCENARIO_BIN`
+(`SCENARIO_STUB_DELAYS_NAME`), by an atomic rewrite. Like `stub_mode`, it is
+for fmk mode only, refuses a `<dir>` that is not a directory under
+`SCENARIO_ROOT` (as written and by real path), and the last setting of a
+directory wins from the next launch or resume there; it also refuses a
+`<seconds>` that is not a whole number, and 0 means no delay.
+
+- The delay acts only in `dev-channels`. For the set seconds the stub shows
+  a starting screen (`Starting Claude Code...`) that holds neither approver
+  needle, then clears the screen, prints the dev-channels dialog, the same
+  bytes as with no delay, and waits for Enter as the mode does.
+- During the delay the exit sentinel ends the stub and every other line is
+  ignored.
+- A setting the stub reads that is not a whole number is reported on its
+  standard error and read as no delay.
+- With no setting, or with no settings file beside the stub (Tests 4, 10 and
+  12), the stub behaves exactly as the mode table states.
+
 A scenario whose launch loses its create reply (`slow-create`) keeps a mode
 that waits for the approver's Enter, as the default does: agent-director
 applies no hook to a row whose pane it has not adopted, and the approver's
@@ -1056,6 +1106,9 @@ variable for the integration suite only (see Environment Variables in
   rewrites it to switch answers mid-run.
 - Every request is one JSONL line in a record file, labelled with the persona
   the scenario assigned to the token and a token hash, never the token.
+  A request's `text` is recorded with token-like text replaced by `<token>`;
+  a `chat.postMessage` text is kept whole, and every other method's is cut to
+  300 characters.
 - It has no `bun test` suite of its own; Test 10 exercises it end to end.
 
 A live start also launches each persona through the real agent-director

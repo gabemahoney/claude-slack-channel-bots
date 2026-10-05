@@ -53,6 +53,30 @@
 # Only the dev-channels dialog holds DEV_CHANNELS_DIALOG_NEEDLE, and only the
 # folder-trust prompt holds TRUST_DIALOG_NEEDLE.
 #
+# THE DIALOG DELAY
+# ----------------
+# A harness addition (b.jg5 SRJ-1306) to confirm at the reconcile pass: an
+# optional delay before the dev-channels dialog, set per working directory,
+# so a launch stays `pending` at the dialog long enough for a scenario to act
+# on it before CSCB's approver can answer. The harness writes it
+# (lib/scenario.sh `stub_dialog_delay`) to the file `stub-claude-dialog-delays`
+# beside the stub, one line per setting: `<seconds> TAB <real path>`; the last
+# line naming the directory wins. A directory with no setting, a setting of
+# 0, or a stub with no such file beside it has no delay, and the stub behaves
+# as the modes above state. The delay acts only in `dev-channels`:
+#   - for the set number of seconds, from the stub's start, it shows a
+#     starting screen that holds neither DEV_CHANNELS_DIALOG_NEEDLE nor
+#     TRUST_DIALOG_NEEDLE, so the approver finds nothing to answer;
+#   - it then clears the screen and prints the dev-channels dialog, the same
+#     bytes as with no delay, and holds until Enter, reporting in as the
+#     dialog mode does (the re-fire and the MCP session included);
+#   - while the delay runs the sentinel ends the stub, as in a dialog mode,
+#     and any other line is ignored: it answers no dialog;
+#   - a setting that is not a whole number is reported on stderr and read as
+#     no delay.
+# Hook firing, the sentinel, the stop line and the re-fire are as stated
+# below, with or without a delay.
+#
 # Every mode keeps these rules:
 #   - Reporting in writes a minimal transcript JSONL at Claude Code's canonical
 #     location, fires every SessionStart hook the `--settings` JSON registers
@@ -258,6 +282,22 @@ case "${MODE}" in
         ;;
 esac
 
+# The dialog delay, in whole seconds (see THE DIALOG DELAY): the last setting
+# naming the directory, 0 when none does.
+STUB_DELAYS_FILE="${STUB_DIR}/stub-claude-dialog-delays"
+DIALOG_DELAY_S=0
+if [[ -f "${STUB_DELAYS_FILE}" ]]; then
+    while IFS=$'\t' read -r sel_delay sel_dir; do
+        [[ "${sel_dir}" == "${REALCWD}" ]] && DIALOG_DELAY_S="${sel_delay}"
+    done < "${STUB_DELAYS_FILE}"
+fi
+if [[ ! "${DIALOG_DELAY_S}" =~ ^[0-9]+$ ]]; then
+    printf 'stub-claude: dialog delay %q set for %s is not a whole number of seconds; no delay\n' \
+        "${DIALOG_DELAY_S}" "${REALCWD}" >&2
+    DIALOG_DELAY_S=0
+fi
+DIALOG_DELAY_S=$(( 10#${DIALOG_DELAY_S} ))
+
 # ---------------------------------------------------------------------------
 # Registered hooks. HOOK_ARGV_JQ emits, for each `"type": "command"` entry of
 # event $ev in every group, the entry's argv length and then its argv
@@ -353,6 +393,16 @@ Channels: server:slack-channel-router
 
 Enter to confirm · Esc to cancel
 DIALOG
+}
+
+# The starting screen the dialog delay shows: no needle of CSCB's approver.
+print_delay_screen() {
+    printf 'Starting Claude Code...\n'
+}
+
+# Clear the screen, so the dialog after the delay is all the pane shows.
+clear_screen() {
+    printf '\033[H\033[2J'
 }
 
 # A startup dialog no needle of CSCB's approver matches.
@@ -587,6 +637,9 @@ trap 'close_mcp_session; rm -f "${HOOK_FILE}" "${STATUS_OUT}" "${STATUS_OUT}.err
 
 REPORTED=0
 AWAITING_ENTER=0
+# While the dialog delay runs: the time the dialog is due, in milliseconds
+# since the epoch; 0 otherwise.
+DIALOG_DUE_MS=0
 
 report_in() {
     REPORTED=1
@@ -599,8 +652,14 @@ report_in() {
 
 case "${MODE}" in
     "${MODE_DEV_CHANNELS}")
-        print_dev_channels_dialog
-        AWAITING_ENTER=1
+        if (( DIALOG_DELAY_S > 0 )); then
+            print_delay_screen
+            now_ms
+            DIALOG_DUE_MS=$(( NOW_MS + DIALOG_DELAY_S * 1000 ))
+        else
+            print_dev_channels_dialog
+            AWAITING_ENTER=1
+        fi
         ;;
     "${MODE_UNRECOGNISED}")
         print_unrecognised_dialog
@@ -635,14 +694,33 @@ handle_line() {
     fi
 }
 
-# Read loop. While the re-fire runs, each read waits at most until the next
-# tick, and a read that times out runs the tick; the part of a line it had
-# read by then (none from a terminal, which hands over whole lines) is kept
-# for the next read.
+# Read loop. While the dialog delay runs, each read waits at most until the
+# dialog is due, and once it is due the dialog is shown. While the re-fire
+# runs, each read waits at most until the next tick, and a read that times
+# out runs the tick. In either wait, the part of a line read by the timeout
+# (none from a terminal, which hands over whole lines) is kept for the next
+# read.
 partial=""
 while :; do
     line=""
-    if (( REFIRE_ON )); then
+    if (( DIALOG_DUE_MS > 0 )); then
+        now_ms
+        wait_ms=$(( DIALOG_DUE_MS - NOW_MS ))
+        if (( wait_ms <= 0 )); then
+            DIALOG_DUE_MS=0
+            clear_screen
+            print_dev_channels_dialog
+            AWAITING_ENTER=1
+            continue
+        fi
+        printf -v wait_s '%d.%03d' $(( wait_ms / 1000 )) $(( wait_ms % 1000 ))
+        IFS= read -r -t "${wait_s}" line
+        rc=$?
+        if (( rc > 128 )); then
+            partial+="${line}"
+            continue
+        fi
+    elif (( REFIRE_ON )); then
         now_ms
         wait_ms=$(( NEXT_TICK_MS - NOW_MS ))
         if (( wait_ms <= 0 )); then

@@ -82,9 +82,10 @@
  *   {"event":"upload"} / {"event":"stop"}
  *
  * `api` lines also carry `channel`, `user` and `text` when the request has
- * them (`text` with token-like text replaced by `<token>`, at most 300
- * characters) and `args_token_like` (whether any argument held token-like
- * text). No token value is ever written or printed: only its kind (`bot`,
+ * them (`text` with token-like text replaced by `<token>`; a
+ * `chat.postMessage` text is kept whole, every other method's is cut to at
+ * most 300 characters after the replacement) and `args_token_like` (whether
+ * any argument held token-like text). No token value is ever written or printed: only its kind (`bot`,
  * `app`, `user`, `other`, `none`) and the first 12 hex digits of its SHA-256.
  * The control's `suffix` values are not written either.
  *
@@ -188,6 +189,14 @@ function tokenHash(token: string): string {
 
 function redactText(text: string): string {
   return text.replace(TOKEN_LIKE_ALL, '<token>').slice(0, 300)
+}
+
+/** The Web API method whose recorded `text` is kept whole (still redacted). */
+const WHOLE_TEXT_METHOD = 'chat.postMessage'
+
+/** A request's `text` as the record keeps it: redacted, and cut to 300 characters unless `method` is {@link WHOLE_TEXT_METHOD}. */
+function recordedText(method: string, text: string): string {
+  return method === WHOLE_TEXT_METHOD ? text.replace(TOKEN_LIKE_ALL, '<token>') : redactText(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -441,7 +450,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
       }
       if (args.channel !== undefined) fields.channel = args.channel
       if (args.user !== undefined) fields.user = args.user
-      if (args.text !== undefined) fields.text = redactText(args.text)
+      if (args.text !== undefined) fields.text = recordedText(method, args.text)
       fields.args_token_like = Object.entries(args).some(([k, v]) => k !== 'token' && TOKEN_LIKE.test(v))
 
       const answer = (name: string, body: Record<string, unknown> | undefined, status = 200): Response => {

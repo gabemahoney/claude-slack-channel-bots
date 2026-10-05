@@ -87,6 +87,7 @@
 #                    every install, re-shim, swap, hide and restore helper,
 #                    `ad`, `ad_store_edit`, `ad_store_id`,
 #                    `ad_store_pending_no_launch`, `stub_mode`,
+#                    `stub_dialog_delay`,
 #                    `stub_press_enter`, `write_mcp_config` and every label,
 #                    seeding, tmux-step, store-statement, operator-action,
 #                    find-missing-loop and 0.10.0-seeder helper fails with the
@@ -196,11 +197,19 @@
 #                    SessionStart, writes one stop line (reason
 #                    `AGENT_DIRECTOR_INSTANCE_ID is unset or empty`, id `-`)
 #                    to standard error, as no shim log is beside its hooks'
-#                    binary, and on the sentinel fires SessionEnd.
+#                    binary, and on the sentinel fires SessionEnd. With a
+#                    dialog delay set (`stub_dialog_delay`), partway into the
+#                    delay its screen holds neither approver needle (both
+#                    printed by fixtures/fmk-texts.ts), and its output then
+#                    ends with the dev-channels dialog, byte for byte the
+#                    same fixture, after a screen with neither needle.
 #   stub_helpers     `stub_mode` refuses an unknown mode, a directory outside
 #                    SCENARIO_ROOT (as written and by real path) and a path
 #                    that is no directory, and a directory's last selection
-#                    wins (the stub then runs it); `stub_press_enter` fails
+#                    wins (the stub then runs it); `stub_dialog_delay` refuses
+#                    a value that is not a whole number and the same
+#                    directories, and a directory's last setting wins;
+#                    `stub_press_enter` fails
 #                    with tmux's answer for no such pane and for a prefix of a
 #                    session's name (which gets no Enter), delivers Enter by
 #                    the full session name and by pane id, and refuses with
@@ -523,6 +532,11 @@ T4_LEFTOVER_SID=""
 T4_LEFTOVER_PANE=""
 T4_LEFTOVER_TOKEN=""
 T4_ENV_SID=""
+
+# The stub_direct leg's dialog delay, and how long into it the leg reads the
+# stub's screen, in seconds.
+STUB_DELAY_S=3
+STUB_DELAY_READ_S=1
 
 # The fmk-driver legs' persona, its one channel and its working directory
 # (made by the first driver leg).
@@ -1560,6 +1574,7 @@ leg_guard_refusals() {
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_id
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_pending_no_launch "${T0_ROW_ID}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_mode "${SCENARIO_ROOT}/work" "${STUB_MODE_AT_ONCE}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" stub_dialog_delay "${SCENARIO_ROOT}/work" 1
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_press_enter "${T0_SESSION}"
         expect_fails_in_home "${step}" "${home}" "${reason}" write_mcp_config "${SCENARIO_PORT}"
         # The labels, seeding, the human's tmux steps, the store statements,
@@ -2063,6 +2078,48 @@ leg_stub_direct() {
     want=(stub-claude stopped re-firing SessionStart for instance -: AGENT_DIRECTOR_INSTANCE_ID is unset or empty)
     same_words words want || fail "${step}: the stop line's words are $(quoted "${words[@]}"), not $(quoted "${want[@]}")"
     [[ "$(line_count "${SCENARIO_AD_SHIM_LOG}")" == "${before}" ]] || fail "${step}: the stub wrote to the shim log"
+
+    stub_direct_delay "${step}: dialog delay" "${fixture}"
+}
+
+# stub_direct_delay <step> <fixture>: a directory with a dialog delay of
+# STUB_DELAY_S. STUB_DELAY_READ_S into it the stub shows a starting screen
+# holding neither approver needle (both printed by fixtures/fmk-texts.ts);
+# its whole output then ends with the dev-channels dialog, <fixture> byte for
+# byte, and what comes before the dialog holds neither needle.
+stub_direct_delay() {
+    local step="$1" fixture="$2" dir out="${SCENARIO_ROOT}/stub-delay.out" err="${SCENARIO_ROOT}/stub-delay.err"
+    local head="${SCENARIO_ROOT}/stub-delay.head" dev trust needle pid rc=0 size
+    dev="$(bun --no-install "${SCENARIO_FIXTURES}/fmk-texts.ts" DEV_CHANNELS_DIALOG_NEEDLE)" \
+        || fail "${step}: fmk-texts.ts could not print DEV_CHANNELS_DIALOG_NEEDLE"
+    trust="$(bun --no-install "${SCENARIO_FIXTURES}/fmk-texts.ts" TRUST_DIALOG_NEEDLE)" \
+        || fail "${step}: fmk-texts.ts could not print TRUST_DIALOG_NEEDLE"
+    [[ -n "${dev}" && -n "${trust}" ]] || fail "${step}: fmk-texts.ts printed an empty needle"
+    grep -qF -- "${dev}" "${fixture}" || fail "${step}: ${fixture##*/} does not hold the dev-channels needle '${dev}'"
+
+    dir="$(make_workdir stub-delay)"
+    stub_dialog_delay "${dir}" "${STUB_DELAY_S}"
+    (cd "${dir}" && { sleep "$(( STUB_DELAY_S + 2 ))"; echo __CSCB_TEST_EXIT__; } | "${SCENARIO_BIN}/claude") \
+        > "${out}" 2> "${err}" &
+    pid=$!
+    track_pid "${pid}"
+    sleep "${STUB_DELAY_READ_S}"
+    [[ -s "${out}" ]] || fail "${step}: ${STUB_DELAY_READ_S}s into the delay the stub shows no starting screen"
+    for needle in "${dev}" "${trust}"; do
+        ! grep -qF -- "${needle}" "${out}" \
+            || fail "${step}: ${STUB_DELAY_READ_S}s into the ${STUB_DELAY_S}s delay the stub's screen holds '${needle}'"
+    done
+    wait "${pid}" || rc=$?
+    (( rc == 0 )) || fail "${step}: the stub with a dialog delay exited ${rc}"
+    size="$(stat -c '%s' "${fixture}")"
+    tail -c "${size}" "${out}" | cmp -s - "${fixture}" \
+        || fail "${step}: after the delay the stub's output does not end with ${fixture##*/}, byte for byte"
+    head -c "-${size}" "${out}" > "${head}"
+    [[ -s "${head}" ]] || fail "${step}: the stub printed the dialog with no starting screen before it"
+    for needle in "${dev}" "${trust}"; do
+        ! grep -qF -- "${needle}" "${head}" || fail "${step}: the screen before the dialog holds '${needle}'"
+    done
+    [[ ! -s "${err}" ]] || fail "${step}: the stub with a dialog delay wrote to standard error: $(head -c 300 "${err}")"
 }
 
 # The stub helpers' own refusals, the mode selection file and the MCP config.
@@ -2085,6 +2142,20 @@ leg_stub_helpers() {
         || fail "${step}: the stub in ${dir} exited non-zero"
     [[ "${got}" == "Listening for channel messages from: server:slack-channel-router" ]] \
         || fail "${step}: after silent then at-once, the stub printed '${got}', not the at-once banner"
+
+    # The dialog delay's setter: its refusals, and the last setting of a
+    # directory wins (written as a whole number).
+    expect_fails_in_home "${step}" "${HOME}" "'1.5' is not a whole number of seconds" stub_dialog_delay "${dir}" 1.5
+    expect_fails_in_home "${step}" "${HOME}" "'' is not a whole number of seconds" stub_dialog_delay "${dir}"
+    expect_fails_in_home "${step}" "${HOME}" "refused: /tmp is not under SCENARIO_ROOT" stub_dialog_delay /tmp 1
+    expect_fails_in_home "${step}" "${HOME}" "refused: ${link} resolves to" stub_dialog_delay "${link}" 1
+    expect_fails_in_home "${step}" "${HOME}" "is not a directory" stub_dialog_delay "${dir}/none" 1
+    stub_dialog_delay "${dir}" 5
+    stub_dialog_delay "${dir}" 007
+    file="${SCENARIO_BIN}/stub-claude-dialog-delays"
+    [[ "$(tail -n 1 "${file}")" == "7"$'\t'"$(realpath -e -- "${dir}")" ]] \
+        || fail "${step}: the dialog delay file's last line is '$(tail -n 1 "${file}")'"
+    stub_dialog_delay "${dir}" 0
 
     expect_fails_in_home "${step}" "${HOME}" "tmux send-keys exited" stub_press_enter t0-no-such-pane
     expect_fails_in_home "${step}" "${HOME}" "refused: TMUX is set" with_tmux_set stub_press_enter "${T0_SESSION}"

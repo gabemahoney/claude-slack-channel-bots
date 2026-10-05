@@ -63,7 +63,8 @@
 #   (SCENARIO_BIN, `$SCENARIO_ROOT/bin`), in which `claude` is a copy of
 #   fixtures/stub-claude.sh, with a copy of its MCP session client
 #   fixtures/stub-mcp-session.ts beside it (see "Stub workers"), and in which
-#   the stub's mode selections are kept (`stub_mode`), followed by the
+#   the stub's mode selections (`stub_mode`) and dialog delay settings
+#   (`stub_dialog_delay`) are kept, followed by the
 #   container's PATH without every
 #   directory that holds an `agent-director` (the image's default binary's
 #   own directory among them) and without relative or empty entries. bun's
@@ -314,6 +315,19 @@
 #                                      resume in <dir> on; the last selection of a directory wins;
 #                                      fails for an unknown mode, or a <dir> that is not a directory
 #                                      under SCENARIO_ROOT (as written and by real path)
+#   stub_dialog_delay <dir> <seconds>  a harness addition (b.jg5 SRJ-1306) to confirm at the
+#                                      reconcile pass: delay the dev-channels dialog of every stub
+#                                      worker whose working directory is <dir> by <seconds> (a whole
+#                                      number; 0 for none): one `<seconds> TAB <real path of dir>`
+#                                      line added to $SCENARIO_BIN/stub-claude-dialog-delays (by an
+#                                      atomic rewrite), which the stub reads at start-up, so it holds
+#                                      from the next launch or resume in <dir> on; the last setting of
+#                                      a directory wins. The stub shows a starting screen holding no
+#                                      approver needle for <seconds>, then the dialog, the same bytes
+#                                      as with no delay (its header, THE DIALOG DELAY). It acts only
+#                                      in `dev-channels`; fails for a <seconds> that is not a whole
+#                                      number, or a <dir> that is not a directory under SCENARIO_ROOT
+#                                      (as written and by real path)
 #   stub_press_enter <target>          a human answering a stub held at a startup dialog: send Enter
 #                                      into the tmux pane <target> (a pane id such as %3, or
 #                                      session[:window[.pane]], the session name matched exactly, never
@@ -770,6 +784,8 @@ SCENARIO_STUB_MODES=("${STUB_MODE_DEV_CHANNELS}" "${STUB_MODE_AT_ONCE}" "${STUB_
     "${STUB_MODE_UNRECOGNISED}" "${STUB_MODE_FOLDER_TRUST}")
 SCENARIO_STUB_MCP_SRC="${SCENARIO_FIXTURES}/stub-mcp-session.ts"
 SCENARIO_STUB_MODES_NAME=stub-claude-modes
+# The file of the stub's dialog delay settings beside it (`stub_dialog_delay`).
+SCENARIO_STUB_DELAYS_NAME=stub-claude-dialog-delays
 
 # The MCP server name the package's install writes into slack-mcp.json
 # (src/config.ts MCP_SERVER_NAME).
@@ -2163,6 +2179,35 @@ stub_mode() {
             cat -- "${file}"
         fi
         printf '%s\t%s\n' "${mode}" "${real_dir}"
+    } > "${tmp}" || fail "${step}: could not write ${tmp}"
+    # One rename, so a starting stub never reads a half-written file.
+    mv -f -- "${tmp}" "${file}" || fail "${step}: could not rename into ${file}"
+}
+
+stub_dialog_delay() {
+    local dir="${1:-}" seconds="${2:-}" step real_root real_dir file tmp
+    step="stub_dialog_delay ${dir} ${seconds}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ "${SCENARIO_FMK}" == 1 ]] || fail "${step}: the stub's dialog delay is for fmk scripts only"
+    [[ "${seconds}" =~ ^[0-9]+$ ]] || fail "${step}: '${seconds}' is not a whole number of seconds"
+    [[ "${dir}" == "${SCENARIO_ROOT}"/* ]] \
+        || fail "${step}: refused: ${dir} is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
+    [[ -d "${dir}" ]] || fail "${step}: ${dir} is not a directory"
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" \
+        || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
+    real_dir="$(realpath -e -- "${dir}" 2> /dev/null)" || fail "${step}: cannot resolve ${dir}"
+    [[ "${real_dir}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: ${dir} resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
+    [[ "${real_dir}" != *[$'\t\n']* ]] || fail "${step}: ${real_dir} holds a TAB or a newline"
+    file="${SCENARIO_BIN}/${SCENARIO_STUB_DELAYS_NAME}"
+    tmp="$(mktemp "${SCENARIO_BIN}/.scenario-stub-delays.XXXXXX")" \
+        || fail "${step}: could not create a temp file beside ${file}"
+    {
+        if [[ -f "${file}" ]]; then
+            cat -- "${file}"
+        fi
+        printf '%s\t%s\n' "$(( 10#${seconds} ))" "${real_dir}"
     } > "${tmp}" || fail "${step}: could not write ${tmp}"
     # One rename, so a starting stub never reads a half-written file.
     mv -f -- "${tmp}" "${file}" || fail "${step}: could not rename into ${file}"

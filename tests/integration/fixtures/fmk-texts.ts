@@ -1,0 +1,166 @@
+/**
+ * fmk-texts.ts — the value printer of the fmk scenarios (b.jg5 SRJ-1306,
+ * SRJ-1401). A scenario script cannot import TypeScript, and a test never
+ * retypes a notice text, class label, version or settings value CSCB
+ * defines, so a script that matches such a value prints it here, from the
+ * installed package under test (the tarball /ci installs), and matches what
+ * this prints. This is the one printer for every fmk scenario: a scenario
+ * that needs another value adds a named entry to `ENTRIES` below, never a
+ * second printer.
+ *
+ * REFUSAL
+ * -------
+ * Runs only in a cscb-ci image. Its first statement checks for the image
+ * marker `/etc/cscb-ci-image`; without it, it prints
+ * `FAIL: fmk-texts: refused: /etc/cscb-ci-image is absent …` on stderr and
+ * exits 2, before it reads an argument or loads a module. Only `node:`
+ * built-ins are imported statically: the package under test is imported
+ * dynamically, after the check, by the entry that needs it.
+ *
+ * USAGE
+ * -----
+ *   bun fmk-texts.ts <entry> [<arg>...]
+ *
+ * It prints exactly the value of the named entry for its arguments on
+ * stdout, a multi-line text as it is, with nothing added (no newline after
+ * it), and exits 0. A script captures a value with a command substitution,
+ * as a standalone assignment so a failure ends the script:
+ *
+ *   PREFIX="$(bun --no-install "${SCENARIO_FIXTURES}/fmk-texts.ts" APPROVER_LOG_PREFIX)" \
+ *       || fail "setup: fmk-texts.ts could not print APPROVER_LOG_PREFIX"
+ *
+ * (A command substitution drops trailing newlines; no entry below ends with
+ * one.) With no entry named, an unknown entry, arguments an entry does not
+ * take, or a package that lacks the export, it prints
+ * `FAIL: fmk-texts: <reason>` on one line on stderr and exits 64 (a usage
+ * error) or 1 (the package).
+ *
+ * INPUTS (env)
+ * ------------
+ *   CSCB_PKG_DIR   the installed package (default
+ *                  /test-repo/node_modules/claude-slack-channel-bots), read as
+ *                  `driver.ts` and `fmk-driver.ts` read it
+ *
+ * ENTRIES (each prints a `src/` export of the installed package)
+ * -------
+ *   APPROVER_LOG_PREFIX           src/session-manager.ts APPROVER_LOG_PREFIX: the head
+ *                                 of every log line the dialog approver writes
+ *   DEV_CHANNELS_DIALOG_NEEDLE    src/session-manager.ts DEV_CHANNELS_DIALOG_NEEDLE: the
+ *                                 approver's needle for the dev-channels dialog
+ *   TRUST_DIALOG_NEEDLE           src/session-manager.ts TRUST_DIALOG_NEEDLE: the
+ *                                 approver's needle for the folder-trust prompt
+ *   DIALOG_POLL_INTERVAL_MS       src/session-manager.ts DIALOG_POLL_INTERVAL_MS: the
+ *                                 approver's pace before G, in milliseconds
+ *   DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds
+ *                                 src/ad-settings.ts DEFAULT_AD_SETTINGS, its
+ *                                 `tmux.pending_grace_seconds`: agent-director's
+ *                                 default pending grace period G, in whole seconds
+ * None of them takes an argument.
+ *
+ * It makes no agent-director call, starts no process or server, opens no
+ * socket, reads no token and writes no file.
+ */
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
+
+if (!existsSync('/etc/cscb-ci-image')) {
+  console.error('FAIL: fmk-texts: refused: /etc/cscb-ci-image is absent; this printer runs only in a cscb-ci image (/ci)')
+  process.exit(2)
+}
+
+/** The name the printer's FAIL lines carry. */
+const PRINTER_NAME = 'fmk-texts'
+
+/** Exit status for a missing or unknown entry, or arguments an entry does not take (EX_USAGE). */
+const USAGE_EXIT = 64
+
+/** Exit status when the installed package lacks an export or holds a value of another kind. */
+const PACKAGE_EXIT = 1
+
+/** The installed package under test. */
+const PKG_DIR = process.env['CSCB_PKG_DIR'] ?? '/test-repo/node_modules/claude-slack-channel-bots'
+
+/** A failure: one `FAIL: fmk-texts: <reason>` line on stderr, then `code`. */
+class PrinterFailure extends Error {
+  constructor(
+    readonly code: number,
+    reason: string,
+  ) {
+    super(reason)
+  }
+}
+
+/** Imports the installed package's `src/<relPath>`. */
+async function importPackageModule(relPath: string): Promise<Record<string, unknown>> {
+  return (await import(join(PKG_DIR, 'src', relPath))) as Record<string, unknown>
+}
+
+/** Export `name` of the package module `relPath`, which must be defined. */
+async function packageExport(relPath: string, name: string): Promise<unknown> {
+  const mod = await importPackageModule(relPath)
+  const value = mod[name]
+  if (value === undefined) throw new PrinterFailure(PACKAGE_EXIT, `the installed package's src/${relPath} exports no ${name}`)
+  return value
+}
+
+/** Export `name` of `relPath`, which must be a string; printed as it is. */
+async function stringExport(relPath: string, name: string): Promise<string> {
+  const value = await packageExport(relPath, name)
+  if (typeof value !== 'string') throw new PrinterFailure(PACKAGE_EXIT, `the installed package's src/${relPath} ${name} is not a string`)
+  return value
+}
+
+/** Export `name` of `relPath`, or the value at `path` inside it, which must be a whole number (a bigint or an integer); printed in decimal. */
+async function wholeNumberAt(relPath: string, name: string, path: readonly string[]): Promise<string> {
+  let value: unknown = await packageExport(relPath, name)
+  for (const key of path) {
+    value = typeof value === 'object' && value !== null ? (value as Record<string, unknown>)[key] : undefined
+  }
+  const at = [name, ...path].join('.')
+  if (typeof value === 'bigint') return value.toString()
+  if (typeof value === 'number' && Number.isInteger(value)) return String(value)
+  throw new PrinterFailure(PACKAGE_EXIT, `the installed package's src/${relPath} ${at} is not a whole number`)
+}
+
+/** One entry: prints its value for its arguments. */
+type Entry = (args: readonly string[]) => Promise<string>
+
+/** An entry that takes no argument and prints `read()`. */
+function noArguments(name: string, read: () => Promise<string>): Entry {
+  return async (args) => {
+    if (args.length > 0) throw new PrinterFailure(USAGE_EXIT, `${name} takes no argument (got ${args.length})`)
+    return await read()
+  }
+}
+
+/** The entries, by the name a script passes. */
+const ENTRIES: Readonly<Record<string, Entry>> = {
+  APPROVER_LOG_PREFIX: noArguments('APPROVER_LOG_PREFIX', () => stringExport('session-manager.ts', 'APPROVER_LOG_PREFIX')),
+  DEV_CHANNELS_DIALOG_NEEDLE: noArguments('DEV_CHANNELS_DIALOG_NEEDLE', () => stringExport('session-manager.ts', 'DEV_CHANNELS_DIALOG_NEEDLE')),
+  TRUST_DIALOG_NEEDLE: noArguments('TRUST_DIALOG_NEEDLE', () => stringExport('session-manager.ts', 'TRUST_DIALOG_NEEDLE')),
+  DIALOG_POLL_INTERVAL_MS: noArguments('DIALOG_POLL_INTERVAL_MS', () => wholeNumberAt('session-manager.ts', 'DIALOG_POLL_INTERVAL_MS', [])),
+  'DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds': noArguments('DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds', () =>
+    wholeNumberAt('ad-settings.ts', 'DEFAULT_AD_SETTINGS', ['tmux', 'pending_grace_seconds']),
+  ),
+}
+
+async function main(argv: readonly string[]): Promise<number> {
+  const [name, ...args] = argv
+  const known = Object.keys(ENTRIES).sort().join(', ')
+  try {
+    if (name === undefined || name === '') throw new PrinterFailure(USAGE_EXIT, `no entry was named; usage: bun fmk-texts.ts <entry> [<arg>...] (entries: ${known})`)
+    const entry = Object.hasOwn(ENTRIES, name) ? ENTRIES[name] : undefined
+    if (entry === undefined) throw new PrinterFailure(USAGE_EXIT, `unknown entry '${name}' (entries: ${known})`)
+    const text = await entry(args)
+    // Written whole before the exit below.
+    await new Promise<void>((resolve) => process.stdout.write(text, () => resolve()))
+    return 0
+  } catch (err) {
+    const code = err instanceof PrinterFailure ? err.code : PACKAGE_EXIT
+    const reason = err instanceof Error ? err.message : String(err)
+    console.error(`FAIL: ${PRINTER_NAME}: ${reason.replace(/\s*\n\s*/g, ' ')}`)
+    return code
+  }
+}
+
+process.exit(await main(process.argv.slice(2)))
