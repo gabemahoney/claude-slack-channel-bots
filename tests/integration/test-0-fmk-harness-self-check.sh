@@ -85,14 +85,15 @@
 #                    directory under /tmp holding a decoy install and store,
 #                    and a symlink under SCENARIO_ROOT that resolves to it),
 #                    every install, re-shim, swap, hide and restore helper,
-#                    `ad`, `ad_store_edit`, `ad_store_id`, `ad_store_backup`
+#                    `ad`, `ad_store_edit`, `ad_store_id`, `ad_store_row`,
+#                    `ad_store_backup`
 #                    (which writes no copy), `ad_store_pending_no_launch`,
-#                    `stub_mode`, `stub_press_enter`, `write_mcp_config` and
-#                    every label, seeding, tmux-step, store-statement,
-#                    operator-action, find-missing-loop and 0.10.0-seeder
-#                    helper fails with the guard's reason, and the decoy is
-#                    left exactly as it was. So do `stub_type_line` and
-#                    `repoint_symlink`.
+#                    `stub_mode`, `stub_press_enter`, `stub_type_exit`,
+#                    `write_mcp_config` and every label, seeding, tmux-step,
+#                    store-statement, operator-action, find-missing-loop and
+#                    0.10.0-seeder helper fails with the guard's reason, and
+#                    the decoy is left exactly as it was. So do
+#                    `stub_type_line` and `repoint_symlink`.
 #   shim_check       `check_ad_shim` passes a correct layout and fails, with
 #                    its reason, on a symlink to the shim and on a copy of the
 #                    shim without its marker line.
@@ -188,9 +189,19 @@
 #                    server logs no reconnect, relaunch, restart or
 #                    not-connected line, no CSCB process runs send-keys,
 #                    spawn, resume or kill for the row, the row reads
-#                    `waiting` and /interject answers 200. After the sentinel
-#                    ends the stub, the server logs the session's end, the
-#                    client is gone and /interject answers 503: the persona
+#                    `waiting` and /interject answers 200. The next two legs
+#                    go on with this stub and server.
+#   mcp_reconnect    `/mcp reconnect slack-channel-router` (as CSCB types it),
+#                    then a bare `/mcp reconnect`, typed into that stub's pane
+#                    while its session client runs: each time the client logs
+#                    its SIGTERM end in stub-mcp-session.log and is gone, a new
+#                    client, a child of the stub, logs its connection there,
+#                    the server logs the old session's end and registers the
+#                    new one as the persona's (`Session connected`), and the
+#                    stub still runs.
+#   mcp_end          `stub_type_exit` types the sentinel into that pane: the
+#                    server logs the session's end, the stub and its current
+#                    client are gone and /interject answers 503: the persona
 #                    reads not connected. The start is stopped with
 #                    --stop-bots.
 #   harness_include_finished
@@ -220,7 +231,8 @@
 #                    with tmux's answer for no such pane and for a prefix of a
 #                    session's name (which gets no Enter), delivers Enter by
 #                    the full session name and by pane id, and refuses with
-#                    TMUX set or another TMUX_TMPDIR; `ad_store_pending_no_launch`
+#                    TMUX set or another TMUX_TMPDIR, as `stub_type_exit` does;
+#                    `ad_store_pending_no_launch`
 #                    refuses an id with other characters and an id with no
 #                    row; `write_mcp_config` refuses a value that is not a
 #                    port, and the setup's MCP config names the server
@@ -318,6 +330,26 @@
 #                    never a harness call or a stop line; the verb is read past
 #                    agent-director's global flags and fragments match in
 #                    order.
+#   synthetic_readers
+#                    on synthetic logs, the latch scenarios' readers:
+#                    `tmux_shim_targets` reports a send-keys, capture-pane,
+#                    pipe-pane, kill-session or respawn-pane whose -t names
+#                    the target as `=<name>:`, `<name>:0.0`, an unambiguous
+#                    prefix of the name, `$N`, `%N`, `@N`, `@N.0` or
+#                    `<name>:@N`, by the alias `send`, the prefix `send-k`, as
+#                    `-t<value>`, after a global option, after options with
+#                    and without an argument (send-keys' -c and -N), and in a
+#                    chained command; it never reports display-message or
+#                    has-session, `%12` for `%1`, `@12` for `@1`, `$30` for
+#                    `$3`, another session or a longer name, and keeps to its
+#                    marks. `ad_cscb_calls` matches the instance id exactly,
+#                    in its `--flag=value` and `--flag value` forms (never
+#                    `cscb_dev_x` for `cscb_dev`), past agent-director's global
+#                    flags, and never prints a harness call, a stop line or a
+#                    line whose parent PID a CSCB process held only outside
+#                    its time; `*` prints every CSCB call carrying an id; both
+#                    it and `ad_cscb_verb_between` keep to their marks, and a
+#                    mark that is not a number fails.
 #   closing_enforcement
 #                    nested fmk runs written into SCENARIO_ROOT, each with a
 #                    stand-in bot server (a process of the run, recorded as a
@@ -471,8 +503,9 @@ LIVE_START_WAIT_S=120  # the start pass: one bring-up and one launch
 LIVE_REPORT_WAIT_S=60  # after the start pass: the approver's Enter and the row reporting in
 
 # The mcp_session leg's persona, its health-check interval, how many ticks it
-# watches, and a restart delay longer than the leg's run after the stub ends
-# (so no relaunch connects the persona again while the leg reads it).
+# watches, and a restart delay longer than the MCP legs' run after the
+# session's first end (the mcp_reconnect leg's), so no relaunch connects the
+# persona again while the legs read it.
 MCP_NAME="${SCENARIO_TAG}_mcp"
 MCP_INSTANCE_ID="cscb_$(persona_key "${MCP_NAME}")"
 MCP_TICK_S=3
@@ -481,6 +514,16 @@ MCP_TICKS_WAIT_S=30    # for MCP_TICKS ticks after the session connected
 MCP_RESTART_DELAY_S=120
 MCP_CONNECT_WAIT_S=30  # after the row reported in: the server registering the stub's session
 MCP_END_WAIT_S=20      # after the sentinel: the server seeing the session end
+MCP_RECONNECT_WAIT_S=20 # after a `/mcp reconnect` line: the old client ending, the new one connecting
+# The stub's MCP session clients' log (beside the stub).
+MCP_CLIENT_LOG="${SCENARIO_BIN}/stub-mcp-session.log"
+# Set by the mcp_session leg, for the mcp_reconnect and mcp_end legs: the
+# stub's tmux session, its PID and its session client's PID (the reconnect
+# leg moves it to each new client).
+MCP_SESSION=""
+MCP_STUB_PID=""
+MCP_CLIENT_PID=""
+MCP_FOUND_CLIENT=""
 # A server log line about a reconnect, relaunch, restart or not-connected
 # persona (case-insensitive ERE).
 MCP_TROUBLE='reconnect|relaunch|restart|not[- ]connected|disconnected'
@@ -856,7 +899,8 @@ expect_on_files() {
 }
 
 # ---------------------------------------------------------------------------
-# Synthetic logs and records (the synthetic_* and count_helpers legs)
+# Synthetic logs and records (the synthetic_*, count_helpers and
+# synthetic_readers legs)
 # ---------------------------------------------------------------------------
 
 # A synthetic record: a bot server (PID SYN_SERVER) whose window is 1000 to
@@ -1598,6 +1642,7 @@ leg_guard_refusals() {
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_admin_capture version
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_edit "UPDATE spawns SET labels = '{}'"
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_id
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_row "${T0_ROW_ID}"
         # The copy would land under SCENARIO_ROOT, outside the decoy.
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_backup "${backup}"
         [[ ! -e "${backup}" && ! -L "${backup}" ]] || fail "${step}: the refused ad_store_backup wrote ${backup}"
@@ -1606,7 +1651,10 @@ leg_guard_refusals() {
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_press_enter "${T0_SESSION}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_type_line "${T0_SESSION}" "a line"
         expect_fails_in_home "${step}" "${home}" "${reason}" repoint_symlink "${SCENARIO_ROOT}/t0-guard-link" "${SCENARIO_ROOT}/work"
+        expect_fails_in_home "${step}" "${home}" "${reason}" stub_type_exit "${T0_SESSION}"
         expect_fails_in_home "${step}" "${home}" "${reason}" write_mcp_config "${SCENARIO_PORT}"
+        # The latch scenarios' trail reader (read-only, guarded all the same).
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_trail_events ad.hook.fired
         # The labels, seeding, the human's tmux steps, the store statements,
         # the operator's actions, the find-missing loop and the 0.10.0
         # seeders. Each would act on the scenario's own tmux server or
@@ -2037,7 +2085,7 @@ EOF
 
 leg_mcp_session() {
     local step="MCP session" creds work config_dir ref connected session stub_pid client_pid s0 verb t_conn conn_line
-    local disconnected window="${SCENARIO_ROOT}/mcp-session-window.log" hits
+    local window="${SCENARIO_ROOT}/mcp-session-window.log" hits
     local -A before=()
     creds="${SCENARIO_ROOT}/credentials-mcp"
     mkdir -m 700 "${creds}"
@@ -2046,7 +2094,6 @@ leg_mcp_session() {
     work="$(make_workdir mcp)"
     ref="$(persona_ref "${MCP_NAME}")"
     connected="$(matcher "[slack] Session connected: persona ${ref}")"
-    disconnected="$(matcher "[slack] Session disconnected" ": persona ${ref}")"
 
     # A state directory of its own: a start runs the last-applied record of
     # its state directory, so the live start's settings would hold there.
@@ -2119,13 +2166,78 @@ EOF
     expect_row_state "${step}" "${MCP_INSTANCE_ID}" waiting
     expect_interject "${MCP_NAME}" 200 "${step}: with the stub's session held"
 
-    # The stub ends (the sentinel): its session ends with it, and the
-    # persona reads not connected.
-    "${SCENARIO_REAL_TMUX}" send-keys -t "${session}" __CSCB_TEST_EXIT__ Enter \
-        || fail "${step}: could not send the sentinel into ${session}"
-    wait_for_log "${disconnected}" "${MCP_END_WAIT_S}" "${step}: the server never saw ${ref}'s session end"
-    wait_until 10 "${step}: the stub ${stub_pid} still runs after the sentinel" _scenario_pid_gone "${stub_pid}"
-    wait_until 10 "${step}: the MCP session client ${client_pid} outlived the stub" _scenario_pid_gone "${client_pid}"
+    # The mcp_reconnect and mcp_end legs go on with this stub and server.
+    MCP_SESSION="${session}"
+    MCP_STUB_PID="${stub_pid}"
+    MCP_CLIENT_PID="${client_pid}"
+}
+
+# `/mcp reconnect`, as CSCB types it (with the server's name) and bare, into
+# the mcp_session leg's stub while its session client runs.
+leg_mcp_reconnect() {
+    local step="MCP reconnect" text
+    for text in "/mcp reconnect ${SCENARIO_MCP_SERVER_NAME}" "/mcp reconnect"; do
+        mcp_reconnect_once "${step}: '${text}'" "${text}"
+    done
+}
+
+# mcp_reconnect_once <step> <line>: type <line> into MCP_SESSION while the
+# session client MCP_CLIENT_PID runs. The client logs its SIGTERM end and is
+# gone; a new client, a child of the stub, logs its connection after the
+# line; the server logs the old session's end and registers the new one as
+# the persona's; the stub still runs. MCP_CLIENT_PID is then the new client.
+mcp_reconnect_once() {
+    local step="$1" text="$2" old="${MCP_CLIENT_PID}" ref connected disconnected mark n_conn n_disc
+    ref="$(persona_ref "${MCP_NAME}")"
+    connected="$(matcher "[slack] Session connected: persona ${ref}")"
+    disconnected="$(matcher "[slack] Session disconnected" ": persona ${ref}")"
+    pid_alive "${old}" || fail "${step}: the session client ${old} is not running before the line"
+    mark="$(line_count "${MCP_CLIENT_LOG}")"
+    n_conn="$(count_log "${connected}")"
+    n_disc="$(count_log "${disconnected}")"
+    "${SCENARIO_REAL_TMUX}" send-keys -t "${MCP_SESSION}" "${text}" Enter \
+        || fail "${step}: could not type the line into ${MCP_SESSION}"
+    wait_until "${MCP_RECONNECT_WAIT_S}" "${step}: the session client ${old} still runs" _scenario_pid_gone "${old}"
+    wait_until "${MCP_RECONNECT_WAIT_S}" "${step}: the client log holds no SIGTERM end of ${old}" \
+        mcp_log_after "${mark}" "^stub-mcp-session\[${old}\]: SIGTERM: ending the session\$"
+    wait_until "${MCP_RECONNECT_WAIT_S}" "${step}: no new session client of the stub ${MCP_STUB_PID} logged its connection" \
+        mcp_new_client "${old}" "${mark}"
+    wait_for_count "${disconnected}" "$(( n_disc + 1 ))" "${MCP_RECONNECT_WAIT_S}" \
+        "${step}: the server never saw the old session end"
+    wait_for_count "${connected}" "$(( n_conn + 1 ))" "${MCP_RECONNECT_WAIT_S}" \
+        "${step}: the server never registered the new session as ${ref}'s"
+    stub_running "${MCP_STUB_PID}" || fail "${step}: the stub ${MCP_STUB_PID} no longer runs"
+    MCP_CLIENT_PID="${MCP_FOUND_CLIENT}"
+}
+
+# mcp_log_after <mark> <ERE>: true when a line of the client log after line
+# <mark> matches <ERE>.
+mcp_log_after() {
+    awk -v m="$1" 'NR > m' "${MCP_CLIENT_LOG}" | grep -E -- "$2" > /dev/null
+}
+
+# mcp_new_client <old> <mark>: true when the stub has one session client
+# child, not <old>, whose connection (to the server, its parent the stub) the
+# client log holds after line <mark>; sets MCP_FOUND_CLIENT to it.
+mcp_new_client() {
+    local pid
+    pid="$(pgrep -P "${MCP_STUB_PID}" -f stub-mcp-session.ts || true)"
+    [[ "${pid}" =~ ^[0-9]+$ && "${pid}" != "$1" ]] || return 1
+    mcp_log_after "$2" "^stub-mcp-session\[${pid}\]: connected to .* \(session [^,]+, parent ${MCP_STUB_PID}\)\$" || return 1
+    MCP_FOUND_CLIENT="${pid}"
+}
+
+# The mcp_session leg's stub ends (the sentinel, through `stub_type_exit`):
+# its session ends with it, and the persona reads not connected.
+leg_mcp_end() {
+    local step="MCP session end" ref disconnected n
+    ref="$(persona_ref "${MCP_NAME}")"
+    disconnected="$(matcher "[slack] Session disconnected" ": persona ${ref}")"
+    n="$(count_log "${disconnected}")"
+    stub_type_exit "${MCP_SESSION}"
+    wait_for_count "${disconnected}" "$(( n + 1 ))" "${MCP_END_WAIT_S}" "${step}: the server never saw ${ref}'s session end"
+    wait_until 10 "${step}: the stub ${MCP_STUB_PID} still runs after the sentinel" _scenario_pid_gone "${MCP_STUB_PID}"
+    wait_until 10 "${step}: the MCP session client ${MCP_CLIENT_PID} outlived the stub" _scenario_pid_gone "${MCP_CLIENT_PID}"
     expect_interject "${MCP_NAME}" 503 "${step}: after the stub ended"
 
     stop_server --stop-bots
@@ -2222,6 +2334,9 @@ leg_stub_helpers() {
     expect_fails_in_home "${step}" "${HOME}" "refused: TMUX is set" with_tmux_set stub_press_enter "${T0_SESSION}"
     expect_fails_in_home "${step}" "${HOME}" "refused: TMUX_TMPDIR '/tmp' is not the scenario's" \
         with_tmux_tmpdir /tmp stub_press_enter "${T0_SESSION}"
+    expect_fails_in_home "${step}" "${HOME}" "refused: TMUX is set" with_tmux_set stub_type_exit "${T0_SESSION}"
+    expect_fails_in_home "${step}" "${HOME}" "refused: TMUX_TMPDIR '/tmp' is not the scenario's" \
+        with_tmux_tmpdir /tmp stub_type_exit "${T0_SESSION}"
     press_enter_exact "${step}"
     # stub_type_line's refusals (a harness addition, confirm at the
     # reconcile pass), beside stub_press_enter's.
@@ -2806,6 +2921,116 @@ expect_count_on() {
     shift 3
     count="$(on_files "${dir}" cscb_ad_count "$@")" || fail "${step}: cscb_ad_count $* failed"
     [[ "${count}" == "${expected}" ]] || fail "${step}: cscb_ad_count $(quoted "$@") printed ${count}, not ${expected}"
+}
+
+leg_synthetic_readers() {
+    local step="synthetic readers" dir t
+    # tmux_shim_targets. Base: line 1, a new-session (no acting command).
+    # Then, each naming session t0-syn ($3, window @1, pane %1) or not:
+    dir="$(syn_case readers-tmux)"
+    t="${dir}/tmux-shim.log"
+    syn_tmux "${t}" send-keys -t =t0-syn: Enter                  # 2  =name:
+    syn_tmux "${t}" capture-pane -p -t t0-syn:0.0                # 3  name:0.0
+    syn_tmux "${t}" send-keys -t t0-s Enter                      # 4  an unambiguous prefix
+    # shellcheck disable=SC2016 # literal tmux session ids
+    syn_tmux "${t}" kill-session -t '$3'                         # 5  $N
+    syn_tmux "${t}" pipe-pane -t %1 cat                          # 6  %N
+    syn_tmux "${t}" send-keys -t %12 Enter                       # 7  not %1
+    syn_tmux "${t}" respawn-pane -k -t @1.0                      # 8  @N.0
+    syn_tmux "${t}" kill-window -t @12                           # 9  not @1
+    syn_tmux "${t}" send -t t0-syn Enter                         # 10 the alias
+    syn_tmux "${t}" send-k -t t0-syn Enter                       # 11 a command prefix
+    syn_tmux "${t}" send-keys -tt0-syn Enter                     # 12 -tVALUE
+    syn_tmux "${t}" display-message -p -t t0-syn '#{pane_pid}'   # 13 reads no pane text
+    syn_tmux "${t}" has-session -t =t0-syn                       # 14 neither
+    syn_tmux "${t}" list-sessions ';' send-keys -t t0-syn Enter  # 15 chained (`\;`)
+    syn_tmux "${t}" send-keys -t t0-other Enter                  # 16 another session
+    syn_tmux "${t}" send-keys -t t0-syn-long Enter               # 17 a longer name
+    syn_tmux "${t}" send-keys -c /dev/pts/1 -t t0-syn Enter      # 18 an option's argument first
+    syn_tmux "${t}" -S /tmp/t0-sock send-keys -t t0-syn:@1 Enter # 19 after a global option; session:@N
+    # shellcheck disable=SC2016 # a literal tmux session id
+    syn_tmux "${t}" kill-session -t '$30'                        # 20 not $3
+    syn_tmux "${t}" send-keys -l -N 2 -t @1 x                    # 21 @N, after flags with and without an argument
+    expect_reader "${step}: by name" "${dir}" "1,4,5" \
+        "$(target_row 2 send-keys =t0-syn:)|$(target_row 3 capture-pane t0-syn:0.0)|$(target_row 4 send-keys t0-s)|$(target_row 10 send-keys t0-syn)|$(target_row 11 send-keys t0-syn)|$(target_row 12 send-keys t0-syn)|$(target_row 15 send-keys t0-syn)|$(target_row 18 send-keys t0-syn)|$(target_row 19 send-keys t0-syn:@1)" \
+        tmux_shim_targets t0-syn
+    # shellcheck disable=SC2016 # literal tmux session ids
+    expect_reader "${step}: by session id" "${dir}" "1,4,5" "$(target_row 5 kill-session '$3')" tmux_shim_targets '$3'
+    expect_reader "${step}: by pane id" "${dir}" "1,4,5" "$(target_row 6 pipe-pane %1)" tmux_shim_targets %1
+    expect_reader "${step}: by window id" "${dir}" "1,4,5" \
+        "$(target_row 8 respawn-pane @1.0)|$(target_row 19 send-keys t0-syn:@1)|$(target_row 21 send-keys @1)" tmux_shim_targets @1
+    expect_reader "${step}: another session" "${dir}" "1,4,5" "$(target_row 16 send-keys t0-other)" tmux_shim_targets t0-other
+    expect_reader "${step}: between marks" "${dir}" "1,4,5" "$(target_row 3 capture-pane t0-syn:0.0)|$(target_row 4 send-keys t0-s)" \
+        tmux_shim_targets t0-syn 2 9
+    # The whole row: position, time, ppid, command, -t value, the raw words.
+    expect_reader "${step}: a whole row" "${dir}" "1-6" \
+        "$(printf '%s %s %s %s %s ' 12 1012.000000 6000002 send-keys t0-syn)$(sed -n 12p "${t}" | cut -f6)" \
+        tmux_shim_targets t0-syn 11 12
+
+    # ad_cscb_calls and ad_cscb_verb_between. Base: the server's version (1)
+    # and spawn of cscb_alpha (2). Then:
+    dir="$(syn_case readers-ad)"
+    t="${dir}/agent-director-shim.log"
+    syn_line "${t}" call 1003.000000 6000090 "${SYN_SERVER}" "${SYN_SERVER_CMD}" resume --claude-instance-id=cscb_dev        # 3
+    syn_line "${t}" call 1004.000000 6000091 "${SYN_SERVER}" "${SYN_SERVER_CMD}" status --claude-instance-id cscb_dev        # 4
+    syn_line "${t}" call 1005.000000 6000092 "${SYN_SERVER}" "${SYN_SERVER_CMD}" status --claude-instance-id cscb_dev_x      # 5
+    syn_line "${t}" call 1006.000000 6000093 "${SYN_SHELL}" "${SCENARIO_SHELL_CMDLINE}" kill --claude-instance-id cscb_dev   # 6 harness
+    syn_line "${t}" stop 1007.000000 6000094 "${SYN_SERVER}" "${SYN_SERVER_CMD}" stub-claude status --claude-instance-id cscb_dev # 7 stop
+    syn_line "${t}" call 1008.000000 6000095 "${SYN_SERVER}" "${SYN_SERVER_CMD}" find-missing                                 # 8
+    syn_line "${t}" call 3000.000000 6000096 "${SYN_SERVER}" "${SYN_SERVER_CMD}" status --claude-instance-id cscb_dev        # 9 outside the window
+    syn_line "${t}" call 1150.000000 6000097 "${SYN_RUN}" "${SYN_RUN_CMD}" kill --claude-instance-id cscb_dev                # 10 a CLI run
+    syn_line "${t}" call 1011.000000 6000098 "${SYN_SERVER}" "${SYN_SERVER_CMD}" --home /h status --claude-instance-id cscb_dev # 11
+    syn_line "${t}" call 1012.000000 6000099 "${SYN_SERVER}" "${SYN_SERVER_CMD}" find-missing                                # 12
+    syn_line "${t}" call 1013.000000 6000100 "${SYN_SHELL}" "${SCENARIO_SHELL_CMDLINE}" find-missing                          # 13 harness
+    expect_reader "${step}: ad_cscb_calls cscb_dev" "${dir}" "1-6" \
+        "$(printf '%s ' 3 1003.000000 "${SYN_SERVER}" resume cscb_dev)--claude-instance-id=cscb_dev|$(printf '%s ' 4 1004.000000 "${SYN_SERVER}" status cscb_dev)--claude-instance-id cscb_dev|$(printf '%s ' 10 1150.000000 "${SYN_RUN}" kill cscb_dev)--claude-instance-id cscb_dev|$(printf '%s ' 11 1011.000000 "${SYN_SERVER}" status cscb_dev)--claude-instance-id cscb_dev" \
+        ad_cscb_calls cscb_dev
+    expect_reader "${step}: ad_cscb_calls cscb_dev_x" "${dir}" "1,5" "5 cscb_dev_x" ad_cscb_calls cscb_dev_x
+    expect_reader "${step}: ad_cscb_calls *" "${dir}" "1,5" \
+        "2 cscb_alpha|3 cscb_dev|4 cscb_dev|5 cscb_dev_x|10 cscb_dev|11 cscb_dev" ad_cscb_calls '*'
+    expect_reader "${step}: ad_cscb_calls between marks" "${dir}" "1" "4|10" ad_cscb_calls cscb_dev 3 10
+    expect_reader "${step}: ad_cscb_calls up to a mark" "${dir}" "1" "3|4" ad_cscb_calls cscb_dev - 4
+    expect_reader "${step}: ad_cscb_verb_between, no bound" "${dir}" "1,4,5" "8 find-missing -|12 find-missing -" \
+        ad_cscb_verb_between find-missing - -
+    expect_reader "${step}: ad_cscb_verb_between after a mark" "${dir}" "1" "12" ad_cscb_verb_between find-missing 8 -
+    expect_reader "${step}: ad_cscb_verb_between up to a mark" "${dir}" "1" "8" ad_cscb_verb_between find-missing - 8
+    expect_reader "${step}: ad_cscb_verb_between, none in the window" "${dir}" "1" "" ad_cscb_verb_between find-missing 8 11
+    expect_reader "${step}: ad_cscb_verb_between status" "${dir}" "1,5" "4 cscb_dev|5 cscb_dev_x|11 cscb_dev" \
+        ad_cscb_verb_between status 3 11
+    expect_fails_in_home "${step}" "${HOME}" "ad_cscb_calls: <from-mark> 'x' is not a mark" \
+        on_files "${dir}" ad_cscb_calls cscb_dev x
+}
+
+# syn_tmux <file> <word>...: append a tmux shim `call` line to <file> whose
+# parent is the base case's agent-director process (6000002, its spawn), at
+# the time 1000 + its line number.
+syn_tmux() {
+    local file="$1" n parent
+    shift
+    n="$(( $(line_count "${file}") + 1 ))"
+    printf -v parent '%q spawn' "${SCENARIO_AD_BIN}"
+    syn_line "${file}" call "$(( 1000 + n )).000000" "$(( 7000000 + n ))" 6000002 "${parent}" "$@"
+}
+
+# target_row <position> <command> <-t value>: the fields 1, 4 and 5 of a
+# `tmux_shim_targets` row, as `expect_reader` joins them.
+target_row() {
+    printf '%s %s %s' "$1" "$2" "$3"
+}
+
+# expect_reader <step> <dir> <fields> <want> <reader> [<arg>...]: run <reader>
+# on <dir>'s files; fail unless it succeeds and its rows' TAB-separated
+# <fields> (a `cut -f` list), joined by spaces, one row after another joined
+# by `|`, are <want> exactly (empty: no row).
+expect_reader() {
+    local step="$1" dir="$2" fields="$3" want="$4" out got
+    shift 4
+    out="$(on_files "${dir}" "$@")" || fail "${step}: $(quoted "$@") failed"
+    got=""
+    if [[ -n "${out}" ]]; then
+        got="$(cut -f "${fields}" <<< "${out}" | tr '\t' ' ' | paste -sd '|')"
+    fi
+    [[ "${got}" == "${want}" ]] || fail "${step}: $(quoted "$@") printed '${got}', not '${want}'"
 }
 
 leg_closing_enforcement() {
@@ -3534,6 +3759,8 @@ LEGS=(
     path_wiring
     live_start
     mcp_session
+    mcp_reconnect
+    mcp_end
     harness_include_finished
     stub_direct
     stub_helpers
@@ -3553,6 +3780,7 @@ LEGS=(
     synthetic_include_finished
     synthetic_delete
     count_helpers
+    synthetic_readers
     closing_enforcement
     seeding
     tmux_steps

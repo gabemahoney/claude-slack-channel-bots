@@ -1246,7 +1246,7 @@ leg_upgrade_sweep() {
     [[ "${n}" == 1 ]] || fail "${step}: ${n} line(s) of ${P_NAME} latched from its own listed row, not 1"
     n="$(t14_cscb_count_since "${MARK_TIME}" kill "${P_ID}")"
     [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB kill(s) of ${P_ID}, whose persona latched"
-    t14_value prefix formatPersonaNotice "${P_NAME}"
+    t14_value prefix personaNoticePrefix "${P_NAME}"
     t14_value body launchStartNotRecordedNoticeText "${P_KEY}"
     wait_until "${POST_WAIT_S}" "${step}: no launch-start-not-recorded post for ${P_NAME} reached ${P_CHANNEL}" \
         t14_post_arrived "${MARK_RECORD}" "${P_CHANNEL}" "${prefix}${body}"
@@ -1374,7 +1374,7 @@ t14_check_destination_alert() {
     [[ -n "${first_kill}" ]] || fail "${step}: no CSCB kill of ${id} after the mark"
     t14_note_calls_before "${MARK_TIME}" "${first_kill}" "${id}" "${step}"
 
-    t14_value prefix formatPersonaNotice "${name}"
+    t14_value prefix personaNoticePrefix "${name}"
     t14_value body killFailureAlertText.destination "${id}" "${session}" "${LAST_DESCRIPTION}"
     expected="${prefix}${body}"
     wait_until "${POST_WAIT_S}" "${step}: no kill-failure alert for ${id} reached ${channel}" \

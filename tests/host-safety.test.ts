@@ -44,8 +44,8 @@
  *   `tests/integration/test-*.sh` that does not source it (found from the
  *   directory) check `/etc/cscb-ci-image` before their first other step; each
  *   script that sources scenario.sh runs nothing before its source line;
- *   `fmk-driver.ts`, `stub-mcp-session.ts` and `switch-over.ts` (a listed
- *   set) each check the marker first and statically import only `node:`
+ *   `fmk-driver.ts`, `stub-mcp-session.ts`, `switch-over.ts` and
+ *   `fmk-texts.ts` (a listed set) each check the marker first and statically import only `node:`
  *   built-ins, type-only imports included; and every scenario.sh function
  *   with a step (sqlite3, a copy, move or install, an install.sh run, or a
  *   run of agent-director by its path or a variable holding one; a call of a
@@ -1664,14 +1664,15 @@ const SCENARIO_PATH = join(INTEGRATION_DIR, 'lib', 'scenario.sh')
 const FMK_DRIVER_PATH = join(INTEGRATION_DIR, 'fixtures', 'fmk-driver.ts')
 const STUB_MCP_SESSION_PATH = join(INTEGRATION_DIR, 'fixtures', 'stub-mcp-session.ts')
 const SWITCH_OVER_PATH = join(INTEGRATION_DIR, 'fixtures', 'switch-over.ts')
+const FMK_TEXTS_PATH = join(INTEGRATION_DIR, 'fixtures', 'fmk-texts.ts')
 
 /**
  * The TypeScript fixtures run as a whole file in the image, each refusing
  * without the marker as its first statement and importing only `node:`
  * built-ins statically: the forced-call driver, the stub's MCP session and
- * the switch-over fixture.
+ * the switch-over fixture and the scenario value printer.
  */
-const IMAGE_GUARDED_TS_PATHS: readonly string[] = [FMK_DRIVER_PATH, STUB_MCP_SESSION_PATH, SWITCH_OVER_PATH]
+const IMAGE_GUARDED_TS_PATHS: readonly string[] = [FMK_DRIVER_PATH, STUB_MCP_SESSION_PATH, SWITCH_OVER_PATH, FMK_TEXTS_PATH]
 
 /** The file only the cscb-ci images carry (docker/Dockerfile.test.base). */
 const CI_IMAGE_MARKER = '/etc/cscb-ci-image'
@@ -1714,7 +1715,7 @@ const HOME_CHECK_EXEMPT: ReadonlyMap<string, string> = new Map([
  * place scenario.sh names one, and no script does), each with its callers.
  */
 const HOME_CHECKED_BY_CALLERS: ReadonlyMap<string, string> = new Map([
-  ['_scenario_row_json', 'the store-row read of the store-statement helpers (ad_store_mark_finished, ad_store_seed_pending, ad_store_unusable_name, ad_store_pending_no_launch)'],
+  ['_scenario_row_json', 'the store-row read of ad_store_row and the store-statement helpers (ad_store_mark_finished, ad_store_seed_pending, ad_store_unusable_name, ad_store_pending_no_launch)'],
   ['_scenario_row_left_pending', 'seed_010_row’s wait_until predicate'],
   ['_scenario_seed', 'the one body of the seed_* helpers'],
   ['_scenario_require_010', 'the 0.10.0 seeders’ precondition (seed_010_row, seed_prepersona_fleet)'],
@@ -2650,6 +2651,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       ['no check at all', RULE.markerFirst, lines(NODE_IMPORTS, AFTER)],
       ['a type-only import of a relative module', RULE.driverStaticImport, lines(NODE_IMPORTS, "import type { McpConfig } from './mcp-types.ts'", CHECK)],
       ['a type-only named binding from a package', RULE.driverStaticImport, lines(NODE_IMPORTS, "import { type Client } from '@modelcontextprotocol/sdk/client/index.js'", CHECK)],
+      ['a static import of a src/ module by relative path before the check', RULE.driverStaticImport, lines(NODE_IMPORTS, "import { PHASE1_FLOOR_VERSION } from '../../../src/ad-version-gate.ts'", CHECK)],
     ]
 
     // driverGuardFindings reads each file alike, so the table runs once, under one name.
@@ -2666,8 +2668,8 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       expect(driverGuardFindings('fmk-driver.ts', source)).toEqual([])
     })
 
-    test('the audited files: the forced-call driver, the stub’s MCP session and the switch-over fixture, all present', () => {
-      expect(FILES).toEqual(['fmk-driver.ts', 'stub-mcp-session.ts', 'switch-over.ts'])
+    test('the audited files: the forced-call driver, the stub’s MCP session, the switch-over fixture and the scenario value printer, all present', () => {
+      expect(FILES).toEqual(['fmk-driver.ts', 'stub-mcp-session.ts', 'switch-over.ts', 'fmk-texts.ts'])
       for (const path of IMAGE_GUARDED_TS_PATHS) expect(existsSync(path)).toBe(true)
     })
 
@@ -2678,30 +2680,15 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: the value printer and the symlink re-point helper (b.jg5
-// SRJ-1306, SRJ-1401; test-14's harness additions, confirm at the reconcile pass)
+// Static audit: the symlink re-point helper (b.jg5 SRJ-1306, SRJ-1401;
+// test-14's harness addition). The value printer, fmk-texts.ts, is one of
+// IMAGE_GUARDED_TS_PATHS above.
 // ---------------------------------------------------------------------------
-
-/** The fmk scenarios' value printer, which imports the package under test as `fmk-driver.ts` does. */
-const FMK_TEXTS_PATH = join(INTEGRATION_DIR, 'fixtures', 'fmk-texts.ts')
 
 /** scenario.sh's re-point of a symlinked directory under SCENARIO_ROOT: a move. */
 const HOME_GUARDED_REPOINT_HELPERS: readonly string[] = ['repoint_symlink']
 
-describe('static audit: fmk-texts.ts and repoint_symlink check the image and HOME first (b.jg5 SRJ-1306)', () => {
-  const NODE_IMPORTS = lines("import { existsSync } from 'node:fs'", "import { join } from 'node:path'")
-  const CHECK = lines(`if (!existsSync('${CI_IMAGE_MARKER}')) {`, "  console.error('FAIL: fmk-texts: refused')", '  process.exit(2)', '}')
-
-  test('the current tree: fmk-texts.ts imports only node: built-ins statically and checks the marker first', () => {
-    expect(existsSync(FMK_TEXTS_PATH)).toBe(true)
-    expect(driverGuardFindings(relative(REPO_ROOT, FMK_TEXTS_PATH), readFileSync(FMK_TEXTS_PATH, 'utf-8'))).toEqual([])
-  })
-
-  test('fmk-texts.ts: a static package import before the marker check is flagged, naming the file and the rule', () => {
-    const source = lines(NODE_IMPORTS, "import { ORPHAN_CLEANUP_LABEL } from 'claude-slack-channel-bots/src/kill-failure-alert.ts'", CHECK)
-    expectNamedFindings(driverGuardFindings('fmk-texts.ts', source), 'fmk-texts.ts', IMAGE_GUARD_RULE.driverStaticImport)
-  })
-
+describe('static audit: repoint_symlink checks HOME first (b.jg5 SRJ-1306)', () => {
   test('the current tree: repoint_symlink runs require_scenario_home before its first move', () => {
     expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), HOME_GUARDED_REPOINT_HELPERS)).toEqual([])
   })

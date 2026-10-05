@@ -645,7 +645,7 @@ t18_first_refusal() {
 # texts: the persona notifier's prefix, then the printer's body.
 t18_texts() {
     local n="$1_NAME" k="$1_KEY" prefix body
-    t18_value prefix formatPersonaNotice "${!n}"
+    t18_value prefix personaNoticePrefix "${!n}"
     t18_value body tmuxUnresponsiveOnsetText "${!k}"
     printf -v "$1_ONSET" '%s' "${prefix}${body}"
     t18_value body tmuxUnresponsiveAlertText "${!k}"
