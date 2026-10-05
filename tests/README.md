@@ -160,7 +160,7 @@ why:
   or loads a module; each statically imports only `node:` built-ins.
   (`fixtures/phase1-client-check.ts` also refuses to run without the marker.)
 - Every `scenario.sh` step that installs, moves or swaps an agent-director
-  binary or the shim, every harness agent-director call (`ad`, `ad_capture`),
+  binary or the shim, every harness agent-director call (`ad`, `ad_capture`, `ad_admin`, `ad_admin_capture`),
   every harness `sqlite3` read or edit (`ad_store_edit`, `ad_store_id`,
   `ad_store_pending_no_launch`) and every stub-worker helper (`stub_mode`,
   `stub_press_enter`, `write_mcp_config`) calls `require_ci_image` as its
@@ -201,7 +201,7 @@ tests/
                                    # the reply guard runs the installed package's script
     test-0-fmk-harness-self-check.sh
                                    # SRJ-1306, fmk mode: the harness's self-check, run after Test 4 and before every fmk scenario. Its legs show the scenario's own HOME,
-                                   # TMUX_TMPDIR and PATH (no agent-director on it, the stub as `claude`, bun kept); the release candidate behind the shim at the standard path;
+                                   # TMUX_TMPDIR and PATH (no agent-director on it, the stub as `claude`, bun kept); the release behind the shim at the standard path, and its agent-director-admin behind the shim at the admin path;
                                    # a harness call logged with its argv and the scenario shell as parent; the client's version probe through the shim; a spawn on the
                                    # scenario's own tmux server; `ad_store_id` and `ad_store_edit` on the scenario's store; the shim a regular file carrying its marker
                                    # after every install, re-shim, swap and restore, with the log kept; a 0.10.0 start; every guarded helper refusing a HOME outside
@@ -209,7 +209,7 @@ tests/
                                    # as its header says; `cscb_run` putting the shim first on a CSCB process's PATH and recording it, the scenario shell keeping the
                                    # real tmux; a live one-persona start whose dialog the approver clears through agent-director, with no tmux line whose parent is
                                    # the bot server and the three closing assertions passing, both positive controls met by that start's own lines; harness
-                                   # `kill --include-finished` calls passing; each assertion, positive control and count helper failing on a violating log; the
+                                   # finished-row kills (agent-director-admin's `kill-finished`) passing; each assertion, positive control and count helper failing on a violating log; the
                                    # closing enforcement; and the trap stopping the scenario's tmux server. Its stub legs show the stub's MCP session registered as
                                    # the persona's, with no reconnect or relaunch over three health ticks and the persona not connected once the stub ends; the stub
                                    # run directly (its version line, the default dev-channels dialog, `silent`, a stop line on stderr); the stub helpers refusing
@@ -219,11 +219,11 @@ tests/
                                    # launch start; and no stub line counted as CSCB's. Its harness-only step legs (see Harness-only steps) show each seeding
                                    # helper's session, labels and @ad_pane read back from tmux (`seeding`); each human tmux step's effect read back, and its
                                    # refusals (`tmux_steps`); the store statements writing exactly their columns and refusing a live row (`store_statements`);
-                                   # the include-finished kill from the scenario's shell, the `pending` row beside a leftover and the one `delete`
+                                   # the finished-row kill from the scenario's shell, the `pending` row beside a leftover and the one `delete`
                                    # (`operator_actions`); the find-missing loop's runs, interval and parent (`find_missing_loop`); fmk-driver.ts's three
                                    # forced calls, each one `DRIVER: FORCED` line with its calls parented by the driver (`fmk_driver_reuse_spawn`,
                                    # `fmk_driver_read_pane`, `fmk_driver_resume`); the 0.10.0 seeders in a nested run started on 0.10.0, their rows
-                                   # surviving `install_ad_rc` and each seeder's refusals (`seeders_010`); and, last, the tmux server restart and socket
+                                   # surviving `install_ad_release` and each seeder's refusals (`seeders_010`); and, last, the tmux server restart and socket
                                    # re-bind (`tmux_server_steps`). The re-fire legs wait out agent-director's default G (60 s); only after them does
                                    # `store_statements` write a `[tmux]` table (`starting_session_seconds = 60`, `stopping_window_seconds = 30`), so the
                                    # kill need not wait 300 s. It runs about two and a half minutes and ends with the three closing assertions
@@ -411,17 +411,19 @@ fmk mode. Sourcing also:
   the scenario finds an agent-director on PATH: the client finds the scenario
   HOME's at its standard path, `$HOME/.agent-director/bin/agent-director`;
 - installs agent-director into the scenario HOME behind the shim. By default
-  that is the release candidate: `install_ad_rc` runs the release
-  candidate's `install.sh` (from agent-director's tree at the release
-  candidate's commit, in the image) in the scenario HOME with
-  `--binary <the image's release-candidate binary> --no-symlink --no-hooks`,
-  stdin from `/dev/null`, which puts the binary at the standard path and makes
-  the HOME's store with its store id, then re-shims. A script that sets
+  that is the release: `install_ad_release` runs the release's `install.sh`
+  (from agent-director's tree at the release tag, in the image) in the
+  scenario HOME with `--binary <the image's release binary> --admin-binary
+  <the image's release agent-director-admin> --no-symlink --no-hooks`, stdin
+  from `/dev/null`, which puts the binary at the standard path, the operator
+  tool agent-director-admin at the admin path
+  (`$HOME/.agent-director/admin/agent-director-admin`) and makes the HOME's
+  store with its store id, then re-shims both. A script that sets
   `SCENARIO_AD_START=0.10.0` before its source line starts on agent-director
   0.10.0 instead: `install_ad_010` copies 0.10.0's binary to the standard path
-  behind the shim, with no `install.sh` run and no store yet.
-  `SCENARIO_AD_START` is `rc` (the default) or `0.10.0`; a shared-mode script
-  that sets it fails;
+  behind the shim, with no `install.sh` run, no agent-director-admin and no
+  store yet. `SCENARIO_AD_START` is `release` (the default) or `0.10.0`; a
+  shared-mode script that sets it fails;
 - writes no agent-director `config.toml`, so agent-director runs on its
   default settings. Scenarios 10 and 24 are the exceptions: they write a
   `[tmux]` table. Test 0 writes one too, after its re-fire legs (see
@@ -444,7 +446,9 @@ The agent-director shim (`fixtures/agent-director-shim.sh`):
 
 - sits at the standard path as a regular file (the client takes the standard
   path first and follows symlinks, so a symlink there would bypass it), with
-  the real binary beside it as `agent-director.real`;
+  the real binary beside it as `agent-director.real`; the same file fronts
+  agent-director-admin at the admin path, with its binary beside it as
+  `agent-director-admin.real`;
 - for each invocation appends one `call` line to its log, holding argv, the
   parent's PID and the parent's command line, then execs the real binary
   beside it, keeping the PID, argv, standard streams and exit status. When it
@@ -454,7 +458,8 @@ The agent-director shim (`fixtures/agent-director-shim.sh`):
   `/` and a scrubbed environment): it finds the real binary and its log from
   its own path;
 - logs to `agent-director-shim.log` beside the real binary
-  (`SCENARIO_AD_SHIM_LOG`), in one line format of six TAB-separated fields,
+  (`SCENARIO_AD_SHIM_LOG`; run as agent-director-admin it logs to that same
+  file, so one log holds every call of either binary), in one line format of six TAB-separated fields,
   stated in the shim's header and nowhere else. A reader of invocations takes
   only the lines whose first field is `call`; the format's other kind, `stop`,
   is reserved for `stub-claude.sh`. Every install, re-shim, swap, hide and
@@ -462,7 +467,8 @@ The agent-director shim (`fixtures/agent-director-shim.sh`):
 - carries a marker line. `check_ad_shim` fails unless the standard path holds
   a regular, executable file (not a symlink) carrying it, with an executable
   binary beside it that is not the shim; every install, re-shim, swap and
-  restore runs it after its change.
+  restore runs it after its change. `check_ad_admin_shim` makes the same
+  check at the admin path.
 
 Each change to the install goes through one helper:
 
@@ -470,14 +476,16 @@ Each change to the install goes through one helper:
   shim: it copies the binary to `agent-director.real`, then renames the shim
   over the standard path, so the standard path always holds the binary or the
   shim. It fails when the standard path is missing, a symlink or already the
-  shim.
+  shim. `install_ad_admin_shim` does the same at the admin path.
 - `install.sh` replaces whatever is at the standard path with its binary, so
   every `install.sh` run is followed by `reshim_ad`, which puts the shim back
-  and re-checks it. `install_ad_rc` does this itself; a runbook step that runs
-  its own install command calls `reshim_ad` after it.
-- `swap_ad_binary <rc|0.10.0|<abs-path>>` replaces only the binary behind
-  the shim (the release candidate, 0.10.0, or a stand-in file), checking the
-  shim before and after.
+  at the standard path, and at the admin path when agent-director-admin is
+  installed, and re-checks it. `install_ad_release` does this itself; a
+  runbook step that runs its own install command calls `reshim_ad` after it.
+- `swap_ad_binary <release|0.10.0|<abs-path>>` replaces only the binary behind
+  the shim at the standard path (the release's, 0.10.0's, or a stand-in
+  file), checking the shim before and after; agent-director-admin stays as
+  installed.
 - `hide_ad_install` and `restore_ad_install` are the one exception, for
   scenario 8's not-found step: hide moves the shim and the binary aside
   together (to `$SCENARIO_ROOT/ad-aside`), leaving no file at the standard
@@ -490,7 +498,10 @@ Harness agent-director calls and store helpers:
   path, so every harness call goes through the shim to the scenario's binary,
   from the scenario's own shell: run as a plain command, the shim logs the
   script's shell (`$$`) as the call's parent. `ad_capture` sets `AD_RC`,
-  `AD_OUT` and `AD_ERR` and never fails on the call's status.
+  `AD_OUT` and `AD_ERR` and never fails on the call's status. `ad_admin` and
+  `ad_admin_capture` do the same for agent-director-admin at the admin path,
+  through its shim; a scenario makes its `kill-finished` and `delete` only
+  through `ad_kill_include_finished` and `ad_delete_unusable_row`.
 - `ad_store_edit <statement>` runs exactly one `sqlite3` statement on the
   scenario HOME's `.agent-director/state.db` and fails with sqlite3's error;
   `ad_store_id` opens the store read-only and prints its store id, failing,
@@ -589,8 +600,8 @@ itself, how many lines and their numbers.
 | Assertion | Fails on | Positive control: fails unless |
 |---|---|---|
 | `assert_no_server_tmux` | any tmux shim line whose parent is a bot server the scenario started | some tmux line's parent is an agent-director process a CSCB process ran: its PID is that of the latest agent-director shim `call` line at or before it, that call's parent is a CSCB process, and the parent's argv[0] is `agent-director`. The harness's own spawns never meet it |
-| `assert_no_cscb_include_finished` | any agent-director `kill` call carrying `--include-finished` (`-` or `--`, with or without `=<value>`) whose parent is not the scenario's own shell or a subshell of it (a command substitution or pipeline element included): a parent whose command line is `SCENARIO_SHELL_CMDLINE` and that no CSCB process held | some agent-director call's parent is a bot server the scenario started (its version probe) |
-| `assert_no_cscb_delete` | any agent-director `delete` call whose parent is a CSCB process | (no positive control) |
+| `assert_no_cscb_include_finished` | any finished-row kill, agent-director-admin's `kill-finished` or an agent-director `kill` call carrying `--include-finished` (`-` or `--`, with or without `=<value>`), whose parent is not the scenario's own shell or a subshell of it (a command substitution or pipeline element included): a parent whose command line is `SCENARIO_SHELL_CMDLINE` and that no CSCB process held | some agent-director call's parent is a bot server the scenario started (its version probe) |
+| `assert_no_cscb_delete` | any `delete` call (agent-director-admin's, or an earlier agent-director's) whose parent is a CSCB process | (no positive control) |
 
 Every fmk script ends with all three, in its own shell, whatever the tmux
 shim's mode. The positive controls keep an empty or bypassed log from passing:
@@ -687,7 +698,8 @@ The contract for a scenario:
 - Never replace the EXIT trap. Register a background process with
   `track_pid` and extra cleanup with `on_exit` instead.
 - In fmk mode, keep HOME, `TMUX_TMPDIR` and PATH as sourcing set them; make
-  every harness agent-director call with `ad` or `ad_capture`, every store
+  every harness agent-director call with `ad` or `ad_capture` (or, for
+  agent-director-admin, its two helpers below), every store
   read or edit with `ad_store_id` or `ad_store_edit`, and every change to the
   install with the helpers above, followed by `reshim_ad` after any
   `install.sh` run; run every other CSCB CLI command or driver through
@@ -697,12 +709,12 @@ The contract for a scenario:
 
 These hold for every fmk script (b.jg5 SRJ-1401):
 
-- It runs on the release candidate (binary, client, and `install.sh` with its
-  migration) unless it sets `SCENARIO_AD_START=0.10.0`, and at
+- It runs on the release (binary, agent-director-admin, client, and
+  `install.sh` with its migration) unless it sets `SCENARIO_AD_START=0.10.0`, and at
   agent-director's default settings, with no `config.toml`, unless it is
   scenario 10 or 24, which write a `[tmux]` table. Test 0, the harness's
   self-check rather than a scenario, writes one once its re-fire legs are
-  done, for its include-finished kill (see Layout).
+  done, for its finished-row kill (see Layout).
 - It runs with both shims: `tmux-shim.sh` first on the PATH of its CSCB
   processes, in `log` mode unless the scenario sets `fail-kill`,
   `fail-create`, `slow-create` or `wedge` with `tmux_shim_mode`; and
@@ -736,7 +748,7 @@ These hold for every fmk script (b.jg5 SRJ-1401):
   exported seams, never by editing `src/`. agent-director's are changed only
   through the `[tmux]` table of scenarios 10 and 24; every other scenario
   waits out agent-director's default windows (at least 300 s where it needs
-  the starting-session bound, as the include-finished kill does).
+  the starting-session bound, as the finished-row kill does).
 - Posts are read from the Slack stub's record (`slack-stub-server.ts
   --record`).
 - Shim logs are read by parent process, as above, never by scraping a pane.
@@ -780,8 +792,8 @@ of another session's.
 | Scenario 25's unusable recorded name | `ad_store_unusable_name` |
 | Scenarios 20 and 26's `pending` row with no launch start | `ad_store_pending_no_launch` (see The stub worker) |
 | A human ending a leftover or a hand-made session by its session id | `end_session` |
-| A human's `kill` of a finished row with the include-finished option (scenario 10) | `ad_kill_include_finished` |
-| A human's `delete` of the row with the unusable name (scenario 25) | `ad_delete_unusable_row` |
+| A human's finished-row kill, agent-director-admin's `kill-finished` (scenario 10) | `ad_kill_include_finished` |
+| A human's agent-director-admin `delete` of the row with the unusable name (scenario 25) | `ad_delete_unusable_row` |
 | The host's `find-missing` loop | `run_find_missing_loop` |
 
 The step that set `base-index` is withdrawn: no agent-director verb depends
@@ -852,12 +864,13 @@ than the session's creation.
 
 - `end_session <session id>` ends a leftover or a hand-made session with
   `kill-session` and fails unless it is gone.
-- `ad_kill_include_finished <id>` is the human's `kill` with the
-  include-finished option, made through `ad_capture` as a direct child of
-  the shell that calls it, so `assert_no_cscb_include_finished` accepts it.
+- `ad_kill_include_finished <id>` is the human's finished-row kill,
+  agent-director-admin's `kill-finished` (agent-director's own `kill` takes
+  no `--include-finished`), made through `ad_admin_capture` as a direct child of the shell that calls it,
+  so `assert_no_cscb_include_finished` accepts it.
   It sets `AD_KILL_OUT`, `AD_KILL_ERR` and `AD_KILL_RC`, prints the output,
   and fails on a non-zero exit, on a result without `kill_sent`, or when the
-  shim's log holds no new line for the call. agent-director refuses this
+  shim's log holds no new line for the call. agent-director-admin refuses this
   kill on a live row, so the row must read `ended` or `missing` first (as
   `ad_store_mark_finished` leaves it). It also refuses until the session is
   at least the starting-session bound old: `[tmux]
@@ -866,8 +879,9 @@ than the session's creation.
   (scenario 10) or waits 300 s.
 - `ad_delete_unusable_row <id>` is scenario 25's step, a human removing the
   row whose recorded name `ad_store_unusable_name` made unusable. It refuses
-  unless that name holds a `.`, and fails unless `delete` exits 0 and the
-  row is gone. It is the only agent-director `delete` under
+  unless that name holds a `.`, and fails unless agent-director-admin's
+  `delete` (through `ad_admin_capture`) exits 0 reporting the id `ok` and
+  the row is gone. It is the only agent-director `delete` under
   `tests/integration`: no fixture calls `delete`, and
   `tests/host-safety.test.ts` audits that statically.
 
@@ -903,8 +917,8 @@ own pending-row runs, and the harness runs no loop for it.
 A script that sets `SCENARIO_AD_START=0.10.0` before sourcing starts on
 agent-director 0.10.0 (`install_ad_010`) with no store; 0.10.0's first
 `spawn` creates it. The seeders make 0.10.0-era rows in that store, before
-the release candidate's install (`install_ad_rc`) migrates it. Both refuse
-unless the binary behind the shim reports 0.10.0, no `install_ad_rc` has run
+the release's install (`install_ad_release`) migrates it. Both refuse
+unless the binary behind the shim reports 0.10.0, no `install_ad_release` has run
 in the shell, and the store, if any, has no `store_meta` table.
 
 - `seed_010_row <id> <session-name> <dir> [<key>=<value>...]` makes one row
@@ -931,7 +945,7 @@ in the shell, and the store, if any, has no `store_meta` table.
   is made. Prints one line per row, `<channel id> <instance id> <session
   name> <session id> <pane id>`.
 
-After `install_ad_rc` the rows are kept, with no `launch_started_at`, and
+After `install_ad_release` the rows are kept, with no `launch_started_at`, and
 their workers still run; the seeders then refuse.
 
 ### The stub worker
@@ -1091,7 +1105,7 @@ stdout/stderr where `docker logs` can capture them — never into `verdict.txt`.
    An fmk scenario is named `test-N-fmk-<short-name>` (`TEST_NAME` carrying
    `-fmk-`). Sourcing the helper then gives it its own HOME, agent-director
    install and store, tmux server and shim (see fmk mode under Scenario
-   helper), on the release candidate. To start on agent-director 0.10.0, set
+   helper), on the release. To start on agent-director 0.10.0, set
    `SCENARIO_AD_START=0.10.0` on its own line before the source line. It
    follows Rules for every fmk scenario and ends with the three closing
    assertions, in the script's own shell, before its PASS line:

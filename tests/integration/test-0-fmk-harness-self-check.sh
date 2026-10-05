@@ -5,12 +5,13 @@
 # on, and checks their effect. tests/runner.sh
 # finds it by name and, in version order, runs it right after Tests 1 to 4
 # and before every fmk scenario. Its TEST_NAME carries `-fmk-`, so sourcing
-# lib/scenario.sh gives it its own HOME, agent-director install (the release
-# candidate, through its install.sh, behind the shim), store and tmux server,
+# lib/scenario.sh gives it its own HOME, agent-director install (the release,
+# through its install.sh, behind the shim, agent-director-admin too), store
+# and tmux server,
 # all under SCENARIO_ROOT.
 #
-# The release candidate's version and commit come from the image's recorded
-# release identity (/opt/agent-director-rc/client/release.json), never from a
+# The release's version and commit come from the image's recorded
+# release identity (/opt/agent-director/client/release.json), never from a
 # literal. The shim log is read as the shim's header states its line format:
 # only lines whose first field is `call` are invocations, and a quoted field
 # gives back its words through `eval`.
@@ -30,9 +31,11 @@
 #                    the recorded version and commit, and adds no log line.
 #   setup_install    after the setup's install the standard path holds the
 #                    shim (a regular file, the fixture byte for byte, with its
-#                    marker), the release candidate's binary is behind it, a
-#                    call through it reports the recorded version, and the
-#                    install made the HOME's store.
+#                    marker), the release's binary is behind it, a
+#                    call through it reports the recorded version, the admin
+#                    path holds the shim with the release's
+#                    agent-director-admin behind it, and the install made
+#                    the HOME's store.
 #   harness_call_log a harness call (`ad_capture`, an argument holding a
 #                    space) adds one `call` line: its time is the call's, its
 #                    parent is the scenario's own shell ($$) with that shell's
@@ -50,20 +53,20 @@
 #                    labels is what a later harness `get` returns.
 #   swap             after a swap to 0.10.0 the shim is in place with 0.10.0
 #                    behind it and a call through it reports 0.10.0; after the
-#                    swap back, the release candidate again.
-#   reinstall        after a second run of the release candidate's install.sh
+#                    swap back, the release again.
+#   reinstall        after a second run of the release's install.sh
 #                    and its re-shim, the shim is in place with the release
-#                    candidate behind it, and the store id is unchanged.
+#                    behind it at both paths, and the store id is unchanged.
 #   hide_restore     hide leaves no file at the standard path and none behind
 #                    it, and keeps the log; restore puts the shim back with the
-#                    release candidate behind it.
+#                    release behind it.
 #   log_kept         the harness call's line is still in the log after every
 #                    install, swap, hide and restore, and every line of the log
 #                    has the format's six fields and a known kind.
 #   start_on_010     a nested fmk run written into SCENARIO_ROOT, set to start
 #                    on 0.10.0 (SCENARIO_AD_START=0.10.0), holds 0.10.0 behind
-#                    the shim, no release-candidate binary anywhere in its HOME
-#                    and no store; `install_ad_rc` then puts the release
+#                    the shim, no release binary anywhere in its HOME
+#                    and no store; `install_ad_release` then puts the release
 #                    candidate behind the shim and makes a store with a store
 #                    id. The nested run prints a `CHECK:` marker for each of
 #                    these checks and then exits 0 without the closing
@@ -175,11 +178,13 @@
 #                    reads not connected. The start is stopped with
 #                    --stop-bots.
 #   harness_include_finished
-#                    a harness `kill --include-finished` from the scenario's
+#                    a harness finished-row kill (agent-director-admin's
+#                    `kill-finished`, through its shim) from the scenario's
 #                    shell, from a command substitution and from a pipeline
-#                    each add a line whose parent has the shell's command
-#                    line (the shell itself, then subshells of it), and
-#                    `assert_no_cscb_include_finished` passes.
+#                    each add a line to the one shim log whose parent has
+#                    the shell's command line (the shell itself, then
+#                    subshells of it), and `assert_no_cscb_include_finished`
+#                    passes.
 #   stub_direct      the stub run from the scenario's shell, its hooks each
 #                    touching a marker file: `claude --version` prints
 #                    `2.1.280 (Claude Code)`; in a directory with no selection
@@ -328,15 +333,17 @@
 #   operator_actions once the other row's session is past the starting-session
 #                    bound: `ad_store_mark_finished` marks it `ended`, every
 #                    other column kept, its session still running; then
-#                    `ad_kill_include_finished` gets kill_sent from a call
-#                    whose parent is the scenario's shell, the session ends,
+#                    `ad_kill_include_finished` gets kill_sent from an
+#                    agent-director-admin `kill-finished` whose parent is
+#                    the scenario's shell, the session ends,
 #                    and `assert_no_cscb_include_finished` still passes;
 #                    `ad_store_seed_pending` then makes that row `pending`
 #                    with a launch start and a fresh token (not the leftover's),
 #                    its pane and server identity NULL, every other column
 #                    kept, and a harness `status` reads it so;
 #                    `ad_delete_unusable_row` removes the finished row whose
-#                    name the statement made unusable, from the scenario's
+#                    name the statement made unusable, with an
+#                    agent-director-admin `delete` from the scenario's
 #                    shell, and `assert_no_cscb_delete` still passes.
 #   find_missing_loop
 #                    `run_find_missing_loop` at a short interval refuses a
@@ -359,7 +366,7 @@
 #                    store exists; `seed_010_row` and `seed_prepersona_fleet`
 #                    make rows named and labelled as the pre-persona package
 #                    names them, live, in their routes' directories; after
-#                    `install_ad_rc` (the release candidate's install.sh, then
+#                    `install_ad_release` (the release's install.sh, then
 #                    the re-shim) the shim check passes, the store has a store
 #                    id, every row is still present with its name and labels
 #                    and its worker still runs; then each seeder refuses for
@@ -385,16 +392,16 @@ source "$(dirname "$0")/lib/scenario.sh"
 
 SCENARIO_LIB="$(cd "$(dirname "$0")" && pwd)/lib/scenario.sh"
 
-# The release candidate's identity, recorded in the image
+# The release's identity, recorded in the image
 # (docker/Dockerfile.test.base).
-RC_RELEASE_JSON=/opt/agent-director-rc/client/release.json
-[[ -f "${RC_RELEASE_JSON}" ]] || fail "setup: the release candidate's identity ${RC_RELEASE_JSON} is missing"
-RC_VERSION="$(jq -r '.version // empty' "${RC_RELEASE_JSON}")" \
-    || fail "setup: could not read .version from ${RC_RELEASE_JSON}"
-RC_COMMIT="$(jq -r '.commit // empty' "${RC_RELEASE_JSON}")" \
-    || fail "setup: could not read .commit from ${RC_RELEASE_JSON}"
-[[ -n "${RC_VERSION}" && -n "${RC_COMMIT}" ]] \
-    || fail "setup: ${RC_RELEASE_JSON} names no version or no commit"
+AD_RELEASE_JSON=/opt/agent-director/client/release.json
+[[ -f "${AD_RELEASE_JSON}" ]] || fail "setup: the release's identity ${AD_RELEASE_JSON} is missing"
+REL_VERSION="$(jq -r '.version // empty' "${AD_RELEASE_JSON}")" \
+    || fail "setup: could not read .version from ${AD_RELEASE_JSON}"
+REL_COMMIT="$(jq -r '.commit // empty' "${AD_RELEASE_JSON}")" \
+    || fail "setup: could not read .commit from ${AD_RELEASE_JSON}"
+[[ -n "${REL_VERSION}" && -n "${REL_COMMIT}" ]] \
+    || fail "setup: ${AD_RELEASE_JSON} names no version or no commit"
 
 # The row and tmux session the tmux_and_store leg spawns.
 T0_ROW_ID="t0-self-check"
@@ -607,11 +614,12 @@ quoted() {
     printf '%s\n' "${q% }"
 }
 
-# expect_shim_in_place <step> <binary>: the standard path holds the shim (a
-# regular executable file, not a symlink, the fixture byte for byte, carrying
-# its marker line) and the file behind it is <binary>, byte for byte.
+# expect_shim_in_place <step> <binary> [<path>]: <path> (default the
+# standard path) holds the shim (a regular executable file, not a symlink, the
+# fixture byte for byte, carrying its marker line) and the file behind it is
+# <binary>, byte for byte.
 expect_shim_in_place() {
-    local step="$1" binary="$2" path="${SCENARIO_AD_BIN}"
+    local step="$1" binary="$2" path="${3:-${SCENARIO_AD_BIN}}"
     [[ -f "${path}" && ! -L "${path}" ]] || fail "${step}: ${path} is not a regular file"
     grep -qxF -- "${SCENARIO_AD_SHIM_MARKER}" "${path}" || fail "${step}: ${path} does not carry the shim's marker"
     cmp -s -- "${SCENARIO_AD_SHIM_SRC}" "${path}" || fail "${step}: ${path} is not the shim ${SCENARIO_AD_SHIM_SRC}"
@@ -872,7 +880,7 @@ syn_case() {
 
 # run_nested <name> <ad-start> <body> [<function>...]: write a nested fmk run
 # into SCENARIO_ROOT (TEST_NAME <name>, SCENARIO_AD_START <ad-start>, sourcing
-# lib/scenario.sh, then RC_VERSION and RC_COMMIT, the <function>s and <body>,
+# lib/scenario.sh, then REL_VERSION and REL_COMMIT, the <function>s and <body>,
 # and a call of <body>), run it, and set NESTED_RC and NESTED_OUT (its output).
 run_nested() {
     local name="$1" ad_start="$2" body="$3" script
@@ -885,7 +893,7 @@ run_nested() {
         printf 'TEST_NAME=%q\n' "${name}"
         printf 'SCENARIO_AD_START=%q\n' "${ad_start}"
         printf 'source %q\n' "${SCENARIO_LIB}"
-        printf 'RC_VERSION=%q\nRC_COMMIT=%q\n' "${RC_VERSION}" "${RC_COMMIT}"
+        printf 'REL_VERSION=%q\nREL_COMMIT=%q\n' "${REL_VERSION}" "${REL_COMMIT}"
         declare -f "$@" "${body}"
         printf '%s\n' "${body}"
     } > "${script}"
@@ -1281,7 +1289,7 @@ on_exit remove_outside_home
 # ---------------------------------------------------------------------------
 
 leg_isolation() {
-    local step="isolation" passwd_home real_root real_home rc_dir dir found entries=()
+    local step="isolation" passwd_home real_root real_home release_dir dir found entries=()
     [[ "${HOME}" == "${SCENARIO_ROOT}/home" && "${HOME}" == "${SCENARIO_HOME}" && -d "${HOME}" ]] \
         || fail "${step}: HOME '${HOME}' is not the scenario HOME ${SCENARIO_ROOT}/home"
     real_root="$(realpath -e -- "${SCENARIO_ROOT}")"
@@ -1295,13 +1303,13 @@ leg_isolation() {
         || fail "${step}: TMUX_TMPDIR '${TMUX_TMPDIR:-}' is not ${SCENARIO_ROOT}/tmux"
     [[ -z "${TMUX+set}" && -z "${TMUX_PANE+set}" ]] || fail "${step}: TMUX or TMUX_PANE is set"
 
-    rc_dir="${SCENARIO_RC_BIN%/*}"
+    release_dir="${SCENARIO_RELEASE_BIN%/*}"
     IFS=: read -r -a entries <<< "${PATH}"
     [[ "${entries[0]:-}" == "${SCENARIO_BIN}" ]] \
         || fail "${step}: PATH starts with '${entries[0]:-}', not the scenario's bin ${SCENARIO_BIN}"
     for dir in "${entries[@]}"; do
         [[ "${dir}" == /* ]] || fail "${step}: PATH holds the relative or empty entry '${dir}'"
-        [[ "${dir}" != "${rc_dir}" ]] || fail "${step}: PATH holds the image's default agent-director directory ${rc_dir}"
+        [[ "${dir}" != "${release_dir}" ]] || fail "${step}: PATH holds the image's default agent-director directory ${release_dir}"
         [[ ! -e "${dir}/agent-director" && ! -L "${dir}/agent-director" ]] \
             || fail "${step}: PATH entry ${dir} holds an agent-director"
     done
@@ -1329,15 +1337,17 @@ leg_real_binary() {
     out="$("${SCENARIO_AD_BIN}.real" version)" || fail "${step}: ${SCENARIO_AD_BIN}.real version failed"
     got="$(jq -r '.version // empty' <<< "${out}")"
     got_commit="$(jq -r '.commit // empty' <<< "${out}")"
-    [[ "${got}" == "${RC_VERSION}" && "${got_commit}" == "${RC_COMMIT}" ]] \
-        || fail "${step}: the binary behind the shim reports ${got} ${got_commit}, not the recorded ${RC_VERSION} ${RC_COMMIT}"
+    [[ "${got}" == "${REL_VERSION}" && "${got_commit}" == "${REL_COMMIT}" ]] \
+        || fail "${step}: the binary behind the shim reports ${got} ${got_commit}, not the recorded ${REL_VERSION} ${REL_COMMIT}"
     [[ "$(call_count)" == "${before}" ]] || fail "${step}: running the real binary by its own name added a shim log line"
 }
 
 leg_setup_install() {
     local step="setup install"
-    expect_shim_in_place "${step}: after the setup's install" "${SCENARIO_RC_BIN}"
-    expect_ad_version "${step}" "${RC_VERSION}" "${RC_COMMIT}"
+    expect_shim_in_place "${step}: after the setup's install" "${SCENARIO_RELEASE_BIN}"
+    expect_ad_version "${step}" "${REL_VERSION}" "${REL_COMMIT}"
+    expect_shim_in_place "${step}: agent-director-admin after the setup's install" "${SCENARIO_RELEASE_ADMIN}" \
+        "${HOME}/.agent-director/admin/agent-director-admin"
     [[ -f "${HOME}/.agent-director/state.db" ]] || fail "${step}: no store at ${HOME}/.agent-director/state.db"
 }
 
@@ -1387,7 +1397,7 @@ EOF
     got="$(jq -r '.path' "${out}")"
     [[ "${got}" == "${SCENARIO_AD_BIN}" ]] || fail "${step}: the client resolved '${got}', not the shim at ${SCENARIO_AD_BIN}"
     got="$(jq -r '.version' "${out}")"
-    [[ "${got}" == "${RC_VERSION}" ]] || fail "${step}: the probe got version '${got}', not the recorded ${RC_VERSION}"
+    [[ "${got}" == "${REL_VERSION}" ]] || fail "${step}: the probe got version '${got}', not the recorded ${REL_VERSION}"
     [[ "$(call_count)" == "$(( before + 1 ))" ]] || fail "${step}: the probe did not add exactly one call line"
     read_call "${step}" "$(last_call_line)"
     [[ "${CALL_WORDS[0]:-}" == version ]] || fail "${step}: the probe's line has words $(quoted "${CALL_WORDS[@]}"), not version …"
@@ -1440,17 +1450,19 @@ leg_swap() {
     expect_shim_in_place "${step}: after the swap to 0.10.0" "${SCENARIO_AD_010_BIN}"
     expect_ad_version "${step}: after the swap to 0.10.0" 0.10.0
     got_commit="$(jq -r '.commit // empty' "${AD_OUT}")"
-    [[ "${got_commit}" != "${RC_COMMIT}" ]] || fail "${step}: 0.10.0 reports the release candidate's commit"
-    swap_ad_binary rc "${step}: back to the release candidate"
-    expect_shim_in_place "${step}: after the swap back" "${SCENARIO_RC_BIN}"
-    expect_ad_version "${step}: after the swap back" "${RC_VERSION}" "${RC_COMMIT}"
+    [[ "${got_commit}" != "${REL_COMMIT}" ]] || fail "${step}: 0.10.0 reports the release's commit"
+    swap_ad_binary release "${step}: back to the release"
+    expect_shim_in_place "${step}: after the swap back" "${SCENARIO_RELEASE_BIN}"
+    expect_ad_version "${step}: after the swap back" "${REL_VERSION}" "${REL_COMMIT}"
 }
 
 leg_reinstall() {
     local step="reinstall" store_id
-    install_ad_rc "${step}: install.sh again"
-    expect_shim_in_place "${step}: after install.sh and its re-shim" "${SCENARIO_RC_BIN}"
-    expect_ad_version "${step}" "${RC_VERSION}" "${RC_COMMIT}"
+    install_ad_release "${step}: install.sh again"
+    expect_shim_in_place "${step}: after install.sh and its re-shim" "${SCENARIO_RELEASE_BIN}"
+    expect_shim_in_place "${step}: agent-director-admin after install.sh and its re-shim" "${SCENARIO_RELEASE_ADMIN}" \
+        "${HOME}/.agent-director/admin/agent-director-admin"
+    expect_ad_version "${step}" "${REL_VERSION}" "${REL_COMMIT}"
     store_id="$(ad_store_id)"
     [[ "${store_id}" == "${T0_STORE_ID}" ]] || fail "${step}: the store id changed from ${T0_STORE_ID} to ${store_id}"
 }
@@ -1463,8 +1475,8 @@ leg_hide_restore() {
         || fail "${step}: a file is at ${SCENARIO_AD_BIN}.real after the hide"
     [[ -f "${SCENARIO_AD_SHIM_LOG}" ]] || fail "${step}: the shim log went with the hide"
     restore_ad_install "${step}: restore"
-    expect_shim_in_place "${step}: after the restore" "${SCENARIO_RC_BIN}"
-    expect_ad_version "${step}: after the restore" "${RC_VERSION}" "${RC_COMMIT}"
+    expect_shim_in_place "${step}: after the restore" "${SCENARIO_RELEASE_BIN}"
+    expect_ad_version "${step}: after the restore" "${REL_VERSION}" "${REL_COMMIT}"
 }
 
 leg_log_kept() {
@@ -1483,18 +1495,18 @@ nested_start_on_010() {
     expect_shim_in_place "${step}: after the setup's install" "${SCENARIO_AD_010_BIN}"
     echo "CHECK: 0.10.0 behind the shim"
     while IFS= read -r -d '' file; do
-        ! cmp -s -- "${SCENARIO_RC_BIN}" "${file}" || fail "${step}: ${file} is the release candidate's binary"
+        ! cmp -s -- "${SCENARIO_RELEASE_BIN}" "${file}" || fail "${step}: ${file} is the release's binary"
     done < <(find "${HOME}" -type f -print0)
-    echo "CHECK: no release-candidate binary"
-    [[ ! -e "${HOME}/.agent-director/state.db" ]] || fail "${step}: a store exists before the release candidate's install"
+    echo "CHECK: no release binary"
+    [[ ! -e "${HOME}/.agent-director/state.db" ]] || fail "${step}: a store exists before the release's install"
     echo "CHECK: no store"
     expect_ad_version "${step}: a call through the shim" 0.10.0
     echo "CHECK: 0.10.0 answers"
-    install_ad_rc "${step}: install_ad_rc"
-    expect_shim_in_place "${step}: after install_ad_rc" "${SCENARIO_RC_BIN}"
-    echo "CHECK: release candidate behind the shim"
-    expect_ad_version "${step}: after install_ad_rc" "${RC_VERSION}" "${RC_COMMIT}"
-    echo "CHECK: release candidate answers"
+    install_ad_release "${step}: install_ad_release"
+    expect_shim_in_place "${step}: after install_ad_release" "${SCENARIO_RELEASE_BIN}"
+    echo "CHECK: release behind the shim"
+    expect_ad_version "${step}: after install_ad_release" "${REL_VERSION}" "${REL_COMMIT}"
+    echo "CHECK: release answers"
     store_id="$(ad_store_id)"
     [[ "${store_id}" =~ ^[0-9a-f]{16}$ ]] || fail "${step}: ad_store_id printed '${store_id}'"
     echo "CHECK: store id"
@@ -1504,8 +1516,8 @@ nested_start_on_010() {
 leg_start_on_010() {
     local step="0.10.0 start" name="test-0-fmk-nested-start-on-010"
     run_nested "${name}" 0.10.0 nested_start_on_010 expect_shim_in_place expect_ad_version
-    expect_nested_markers "${step}" "0.10.0 behind the shim" "no release-candidate binary" "no store" \
-        "0.10.0 answers" "release candidate behind the shim" "release candidate answers" "store id"
+    expect_nested_markers "${step}" "0.10.0 behind the shim" "no release binary" "no store" \
+        "0.10.0 answers" "release behind the shim" "release answers" "store id"
     # It started no bot server, so it cannot meet the closing assertions'
     # positive controls: it exits 0 without them, and the trap fails it.
     expect_nested_only_fail "${step}" "${name}" \
@@ -1533,13 +1545,17 @@ leg_guard_refusals() {
             reason="refused: HOME '${OUTSIDE_HOME}' is not under SCENARIO_ROOT"
         fi
         expect_fails_in_home "${step}" "${home}" "${reason}" install_ad_shim
+        expect_fails_in_home "${step}" "${home}" "${reason}" install_ad_admin_shim
+        expect_fails_in_home "${step}" "${home}" "${reason}" check_ad_admin_shim
         expect_fails_in_home "${step}" "${home}" "${reason}" reshim_ad
-        expect_fails_in_home "${step}" "${home}" "${reason}" install_ad_rc
+        expect_fails_in_home "${step}" "${home}" "${reason}" install_ad_release
         expect_fails_in_home "${step}" "${home}" "${reason}" install_ad_010
-        expect_fails_in_home "${step}" "${home}" "${reason}" swap_ad_binary rc
+        expect_fails_in_home "${step}" "${home}" "${reason}" swap_ad_binary release
         expect_fails_in_home "${step}" "${home}" "${reason}" hide_ad_install
         expect_fails_in_home "${step}" "${home}" "${reason}" restore_ad_install
         expect_fails_in_home "${step}" "${home}" "${reason}" ad version
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_admin version
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_admin_capture version
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_edit "UPDATE spawns SET labels = '{}'"
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_id
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_pending_no_launch "${T0_ROW_ID}"
@@ -1591,7 +1607,7 @@ leg_shim_check() {
     local step="shim check" home="${SCENARIO_ROOT}/home-shim-check" bin
     bin="${home}/.agent-director/bin"
     mkdir -p "${bin}"
-    cp -- "${SCENARIO_RC_BIN}" "${bin}/agent-director.real"
+    cp -- "${SCENARIO_RELEASE_BIN}" "${bin}/agent-director.real"
     cp -- "${SCENARIO_AD_SHIM_SRC}" "${bin}/agent-director"
     chmod 0755 "${bin}/agent-director.real" "${bin}/agent-director"
     ( export HOME="${home}"; check_ad_shim "${step}: a correct layout" ) \
@@ -2341,15 +2357,16 @@ leg_stub_lines_not_cscb() {
 leg_harness_include_finished() {
     local step="harness include-finished" before i mine=() lines=()
     before="$(call_count)"
-    ad kill --claude-instance-id "${T0_ROW_ID}" --include-finished > /dev/null 2>&1 || true
-    : "$(ad kill --claude-instance-id "${T0_ROW_ID}" --include-finished 2>&1)"
-    ad kill --claude-instance-id "${T0_ROW_ID}" --include-finished 2>&1 | cat > /dev/null || true
+    # The row is live, so agent-director-admin refuses each kill and sends none.
+    ad_admin kill-finished --claude-instance-id "${T0_ROW_ID}" > /dev/null 2>&1 || true
+    : "$(ad_admin kill-finished --claude-instance-id "${T0_ROW_ID}" 2>&1)"
+    ad_admin kill-finished --claude-instance-id "${T0_ROW_ID}" 2>&1 | cat > /dev/null || true
     mapfile -t lines < <(awk -F'\t' '$1 == "call"' "${SCENARIO_AD_SHIM_LOG}" | tail -n "+$(( before + 1 ))")
     (( ${#lines[@]} == 3 )) || fail "${step}: the three calls added ${#lines[@]} call line(s)"
     mapfile -d '' -t mine < "/proc/$$/cmdline"
     for i in 0 1 2; do
         read_call "${step}" "${lines[i]}"
-        [[ "${CALL_WORDS[0]:-}" == kill && " ${CALL_WORDS[*]} " == *" --include-finished "* ]] \
+        [[ "${CALL_WORDS[0]:-}" == kill-finished ]] \
             || fail "${step}: call $(( i + 1 ))'s words are $(quoted "${CALL_WORDS[@]}")"
         same_words CALL_PARENT mine \
             || fail "${step}: call $(( i + 1 ))'s parent $(quoted "${CALL_PARENT[@]}") does not have the shell's command line"
@@ -2429,7 +2446,7 @@ leg_synthetic_server_tmux() {
 
 leg_synthetic_include_finished() {
     local step="synthetic assert_no_cscb_include_finished" dir got a="assert_no_cscb_include_finished"
-    local why="run kill with --include-finished from a parent other than the scenario's own shell or a subshell of it"
+    local why="run a finished-row kill (kill-finished, or kill with --include-finished) from a parent other than the scenario's own shell or a subshell of it"
     dir="$(syn_case finished-clean)"
     expect_on_files "${step}: clean" "${dir}" pass "${a}"
 
@@ -2437,6 +2454,15 @@ leg_synthetic_include_finished() {
     syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000040 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
         kill --claude-instance-id cscb_alpha --include-finished
     expect_on_files "${step}: from the bot server" "${dir}" fail "${a}" "1 agent-director-shim.log line(s) ${why} (line 3)"
+
+    # agent-director-admin's kill-finished, which the same shim logs.
+    dir="$(syn_case finished-admin-server)"
+    syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000047 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
+        kill-finished --claude-instance-id cscb_alpha
+    syn_line "${dir}/agent-director-shim.log" call 1500.100000 6000048 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
+        --home /h kill-finished --claude-instance-id cscb_alpha
+    expect_on_files "${step}: kill-finished from the bot server, and after a global flag" "${dir}" fail "${a}" \
+        "2 agent-director-shim.log line(s) ${why} (line 3, 4)"
 
     dir="$(syn_case finished-run)"
     syn_line "${dir}/agent-director-shim.log" call 1150.000000 6000041 "${SYN_RUN}" "${SYN_RUN_CMD}" \
@@ -2472,6 +2498,8 @@ leg_synthetic_include_finished() {
     dir="$(syn_case finished-allowed)"
     syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000050 "${SYN_SHELL}" "${SCENARIO_SHELL_CMDLINE}" \
         kill --claude-instance-id cscb_alpha --include-finished
+    syn_line "${dir}/agent-director-shim.log" call 1500.050000 6000055 "${SYN_SHELL}" "${SCENARIO_SHELL_CMDLINE}" \
+        kill-finished --claude-instance-id cscb_alpha
     syn_line "${dir}/agent-director-shim.log" call 1500.100000 6000051 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
         kill --claude-instance-id cscb_alpha
     syn_line "${dir}/agent-director-shim.log" call 1500.200000 6000052 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
@@ -2579,28 +2607,28 @@ expect_count_on() {
 leg_closing_enforcement() {
     local step="closing enforcement" name
     name="test-0-fmk-nested-closing-pass"
-    run_nested "${name}" rc nested_closing_pass nested_stand_in nested_closing
+    run_nested "${name}" release nested_closing_pass nested_stand_in nested_closing
     if (( NESTED_RC != 0 )) || grep -q '^FAIL:' "${NESTED_OUT}" || ! grep -qxF "PASS: ${name}" "${NESTED_OUT}"; then
         sed 's/^/  | /' "${NESTED_OUT}" >&2
         fail "${step}: a run that ends with the closing assertions exited ${NESTED_RC}: $(grep -m1 '^FAIL:' "${NESTED_OUT}" || true)"
     fi
 
     name="test-0-fmk-nested-violation-after"
-    run_nested "${name}" rc nested_violation_after nested_stand_in nested_closing
+    run_nested "${name}" release nested_violation_after nested_stand_in nested_closing
     expect_nested_markers "${step}: a violating line after the assertions" \
         assert_no_server_tmux assert_no_cscb_include_finished assert_no_cscb_delete "violating line written"
     expect_nested_only_fail "${step}: a violating line after the assertions" "${name}" \
         "after the closing assertions: assert_no_cscb_delete: 1 agent-director-shim.log line(s) run delete from a CSCB process (line 2)"
 
     name="test-0-fmk-nested-closing-elsewhere"
-    run_nested "${name}" rc nested_closing_elsewhere nested_stand_in
+    run_nested "${name}" release nested_closing_elsewhere nested_stand_in
     expect_nested_markers "${step}: assertions over copies and in a subshell" assert_no_server_tmux \
         "assert_no_cscb_include_finished over copies" "assert_no_cscb_delete in a subshell"
     expect_nested_only_fail "${step}: assertions over copies and in a subshell" "${name}" \
         "${ENFORCEMENT_LINE}assert_no_cscb_include_finished, assert_no_cscb_delete: not passed in its own shell)"
 
     name="test-0-fmk-nested-own-failure"
-    run_nested "${name}" rc nested_own_failure nested_stand_in
+    run_nested "${name}" release nested_own_failure nested_stand_in
     expect_nested_markers "${step}: a run that fails on its own" stand-in
     expect_nested_only_fail "${step}: a run that fails on its own" "${name}" "planted failure before the closing assertions"
 }
@@ -2909,8 +2937,9 @@ leg_operator_actions() {
     local step="operator actions" before after rv old token t0 t1 want=() ended_at
     # Scenario 10 part B: the row marked ended while its session still runs
     # (the `ended` statement, every other column kept), then the human's
-    # include-finished kill, which agent-director makes only for a finished
-    # row whose session is past its starting-session bound.
+    # finished-row kill (agent-director-admin's kill-finished), which it
+    # makes only for a finished row whose session is past its
+    # starting-session bound.
     session_age_at_least "${step}" "${T4_KILL_ID}" "${T4_STARTING_BOUND_S}"
     before="$(row_snapshot "${T4_KILL_ID}")"
     rv="$(jq -r '.row_version' <<< "${before}")"
@@ -2921,7 +2950,7 @@ leg_operator_actions() {
     ad_kill_include_finished "${T4_KILL_ID}" > /dev/null
     (( AD_KILL_RC == 0 )) && [[ "$(jq -r '.kill_sent' "${AD_KILL_OUT}")" == true ]] \
         || fail "${step}: the include-finished kill answered $(tr '\n' ' ' < "${AD_KILL_OUT}") (exit ${AD_KILL_RC})"
-    want=(kill --include-finished --claude-instance-id "${T4_KILL_ID}")
+    want=(kill-finished --claude-instance-id "${T4_KILL_ID}")
     expect_last_call "${step}: the include-finished kill" want
     ( assert_no_cscb_include_finished ) > "${SCENARIO_ROOT}/operator-include-finished.out" 2>&1 || {
         sed 's/^/  | /' "${SCENARIO_ROOT}/operator-include-finished.out" >&2
@@ -3174,36 +3203,36 @@ nested_seed_010() {
         || fail "the second route's worker does not run in ${dir_b}"
     echo "CHECK: seed_prepersona_fleet"
 
-    # The release candidate's install over the 0.10.0 rows.
+    # The release's install over the 0.10.0 rows.
     for session in t0_010_row slack_bot_ops_team_C0T0AAA01 slack_bot_C0T0BBB02; do
         pids+=("$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${session}:" '#{pane_pid}')")
     done
-    install_ad_rc "${step}: install_ad_rc over the seeded rows"
-    check_ad_shim "${step}: after install_ad_rc"
-    expect_shim_in_place "${step}: after install_ad_rc" "${SCENARIO_RC_BIN}"
-    [[ "$(ad_store_id)" =~ ^[0-9a-f]{16}$ ]] || fail "no store id after install_ad_rc"
+    install_ad_release "${step}: install_ad_release over the seeded rows"
+    check_ad_shim "${step}: after install_ad_release"
+    expect_shim_in_place "${step}: after install_ad_release" "${SCENARIO_RELEASE_BIN}"
+    [[ "$(ad_store_id)" =~ ^[0-9a-f]{16}$ ]] || fail "no store id after install_ad_release"
     nested_expect_row t0-010-row t0_010_row '{"team":"t0"}'
     nested_expect_row cscb_ops_team_C0T0AAA01 slack_bot_ops_team_C0T0AAA01 '{"service":"cscb","channel":"C0T0AAA01"}'
     nested_expect_row cscb_C0T0BBB02 slack_bot_C0T0BBB02 '{"service":"cscb","channel":"C0T0BBB02"}'
     n=0
     for session in t0_010_row slack_bot_ops_team_C0T0AAA01 slack_bot_C0T0BBB02; do
         [[ "$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${session}:" '#{pane_pid}')" == "${pids[n]}" ]] && pid_alive "${pids[n]}" \
-            || fail "the worker of ${session} (${pids[n]}) did not survive install_ad_rc"
+            || fail "the worker of ${session} (${pids[n]}) did not survive install_ad_release"
         n=$(( n + 1 ))
     done
-    echo "CHECK: rows survive the release candidate's install"
+    echo "CHECK: rows survive the release's install"
 
     # Each seeder now refuses, for each of its reasons: install.sh has run;
     # the binary behind the shim is not 0.10.0; the store has a store_meta.
-    nested_expect_refused "refused: the release candidate's install.sh has run" seed_010_row t0-010-late t0_010_late "${dir_row}"
-    nested_expect_refused "refused: the release candidate's install.sh has run" \
+    nested_expect_refused "refused: the release's install.sh has run" seed_010_row t0-010-late t0_010_late "${dir_row}"
+    nested_expect_refused "refused: the release's install.sh has run" \
         seed_prepersona_fleet "${config}" "C0T0AAA01=Ops Team!" "C0T0BBB02=__"
     nested_expect_refused "refused: the binary behind the shim reports version" nested_with_no_install seed_010_row t0-010-late t0_010_late "${dir_row}"
     swap_ad_binary 0.10.0 "${step}: 0.10.0 behind the shim over the migrated store"
     nested_expect_refused "refused: the store has a store_meta table" nested_with_no_install seed_010_row t0-010-late t0_010_late "${dir_row}"
     nested_expect_refused "refused: the store has a store_meta table" nested_with_no_install \
         seed_prepersona_fleet "${config}" "C0T0AAA01=Ops Team!" "C0T0BBB02=__"
-    swap_ad_binary rc "${step}: the release candidate back behind the shim"
+    swap_ad_binary release "${step}: the release back behind the shim"
     "${SCENARIO_REAL_TMUX}" has-session -t "=t0_010_late" 2> /dev/null && fail "a refused seeder made a session"
     echo "CHECK: seeders refuse after the install"
 
@@ -3224,7 +3253,7 @@ leg_seeders_010() {
     run_nested "${name}" 0.10.0 nested_seed_010 nested_expect_refused nested_expect_row nested_with_no_install \
         expect_shim_in_place nested_stand_in nested_closing
     expect_nested_markers "${step}" "fleet refused before its first row" seed_010_row seed_prepersona_fleet \
-        "rows survive the release candidate's install" "seeders refuse after the install" \
+        "rows survive the release's install" "seeders refuse after the install" \
         assert_no_server_tmux assert_no_cscb_include_finished assert_no_cscb_delete
     if (( NESTED_RC != 0 )) || grep -q '^FAIL:' "${NESTED_OUT}" || ! grep -qxF "PASS: ${name}" "${NESTED_OUT}"; then
         sed 's/^/  | /' "${NESTED_OUT}" >&2

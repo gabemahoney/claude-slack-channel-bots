@@ -1675,6 +1675,9 @@ const IMAGE_GUARD_RULE = {
 /** The scenario.sh helpers whose HOME check must come before their first sqlite3, copy, move or install step. */
 const HOME_GUARDED_HELPERS: readonly string[] = ['install_ad_shim', 'ad_store_edit', 'ad_store_id']
 
+/** agent-director-admin's shim install, held to the same rule as `install_ad_shim`: a copy delegated to `_scenario_place`. */
+const HOME_GUARDED_ADMIN_HELPERS: readonly string[] = ['install_ad_admin_shim']
+
 /** The stub-worker and store helpers held to the same rule: the stub mode selector (a move) and the no-launch-start statement (a store edit). */
 const HOME_GUARDED_STUB_HELPERS: readonly string[] = ['stub_mode', 'ad_store_pending_no_launch']
 
@@ -1732,7 +1735,7 @@ const SHELL_LITERAL_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"$`\\]*"|'[^']*'
 
 /** One simple command of a shell file, as the audit reads it. */
 interface ShellCommand {
-  /** The command word with its quotes removed (`cp`, `require_scenario_home`, `${SCENARIO_RC_INSTALL_SH}`); empty for a line of reserved words only (`fi`). */
+  /** The command word with its quotes removed (`cp`, `require_scenario_home`, `${SCENARIO_RELEASE_INSTALL_SH}`); empty for a line of reserved words only (`fi`). */
   name: string
   /** The words after it, quotes removed. */
   args: string[]
@@ -2317,7 +2320,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       ['install_ad_shim: a copy before its HOME check', { install_ad_shim: lines('    cp -- "${HOME}/.agent-director/bin/agent-director" /tmp/ad.bak', GUARDS, BODIES.install_ad_shim) }],
       ['install_ad_shim: a move before its HOME check', { install_ad_shim: lines('    require_ci_image x', '    mv -f -- "${HOME}/.agent-director/bin/agent-director" /tmp/ad', `    ${HOME_GUARD} x`) }],
       ['install_ad_shim: the copy delegated to _scenario_place before its HOME check', { install_ad_shim: lines('    require_ci_image x', '    _scenario_place "${SCENARIO_AD_SHIM_SRC}" "${HOME}/.agent-director/bin/agent-director" x', `    ${HOME_GUARD} x`) }],
-      ['install_ad_shim: an install.sh run before its HOME check', { install_ad_shim: lines('    (cd "${HOME}" && "${SCENARIO_RC_INSTALL_SH}" --binary /opt/ad --no-hooks) < /dev/null', GUARDS) }],
+      ['install_ad_shim: an install.sh run before its HOME check', { install_ad_shim: lines('    (cd "${HOME}" && "${SCENARIO_RELEASE_INSTALL_SH}" --binary /opt/ad --no-hooks) < /dev/null', GUARDS) }],
       ['install_ad_shim: left out', { install_ad_shim: undefined }],
       ['ad_store_edit: sqlite3 in a command substitution before its HOME check', { ad_store_edit: lines('    require_ci_image x', '    local out="$(sqlite3 "${HOME}/.agent-director/state.db" "$1;")"', `    ${HOME_GUARD} x`) }],
       ['ad_store_edit: the HOME check only after an ||', { ad_store_edit: lines('    [[ -f "${HOME}/.agent-director/state.db" ]] || ' + `${HOME_GUARD} x`, '    sqlite3 "${HOME}/.agent-director/state.db" "$1;"') }],
@@ -2354,6 +2357,10 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
 
     test('the current tree: install_ad_shim, ad_store_edit and ad_store_id run require_scenario_home before their first sqlite3, copy, move or install step', () => {
       expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'))).toEqual([])
+    })
+
+    test('the current tree: install_ad_admin_shim runs require_scenario_home before its first copy or move', () => {
+      expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), HOME_GUARDED_ADMIN_HELPERS)).toEqual([])
     })
 
     test('the current tree: stub_mode and ad_store_pending_no_launch run require_scenario_home before their first move or store edit', () => {
@@ -2443,12 +2450,15 @@ const AD_GLOBAL_FLAGS: readonly string[] = ['--store-path', '--home', '--tmux-co
 const HARNESS_DELETE_HELPER = 'ad_delete_unusable_row'
 
 /**
- * Whether `name` (a command word, quotes removed) runs agent-director: the
- * harness calls `ad` and `ad_capture`, or the binary or shim by a path or a
- * variable holding one.
+ * Whether `name` (a command word, quotes removed) runs agent-director or its
+ * operator tool agent-director-admin (which holds `delete` from 0.11.0 on):
+ * the harness calls `ad`, `ad_capture`, `ad_admin` and `ad_admin_capture`,
+ * or either binary or its shim by a path or a variable holding one.
  */
 function isAgentDirectorCommand(name: string): boolean {
-  return name === 'ad' || name === 'ad_capture' || /^agent-director(?:\.real)?$/.test(basename(name)) || /\bSCENARIO_AD_BIN\b|\bSCENARIO_RC_BIN\b|\bSCENARIO_AD_010_BIN\b/.test(name)
+  return ['ad', 'ad_capture', 'ad_admin', 'ad_admin_capture'].includes(name) ||
+    /^agent-director(?:-admin)?(?:\.real)?$/.test(basename(name)) ||
+    /\bSCENARIO_AD_BIN\b|\bSCENARIO_RELEASE_BIN\b|\bSCENARIO_RELEASE_ADMIN\b|\bSCENARIO_AD_010_BIN\b/.test(name)
 }
 
 /** The verb of an agent-director argv: the first word after its global flags. */
@@ -2487,6 +2497,10 @@ describe('static audit: the harness’s one agent-director delete is scenario 25
   const flagged: [label: string, source: string][] = [
     ['ad delete', 'ad delete --claude-instance-id t0-x'],
     ['ad_capture delete', 'ad_capture delete --claude-instance-id "${id}"'],
+    ['ad_admin delete', 'ad_admin delete --claude-instance-id t0-x'],
+    ['ad_admin_capture delete', 'ad_admin_capture delete --claude-instance-id "${id}"'],
+    ['agent-director-admin by its path', '"${HOME}/.agent-director/admin/agent-director-admin" delete --claude-instance-id t0-x'],
+    ['agent-director-admin by its image variable', '"${SCENARIO_RELEASE_ADMIN}" delete --claude-instance-id t0-x'],
     ['a delete after a global flag with its value', 'ad --home /h delete --claude-instance-id t0-x'],
     ['a delete after a global flag joined by =', 'ad_capture --store-path=/s/state.db delete --claude-instance-id t0-x'],
     ['the shim by its variable', '"${SCENARIO_AD_BIN}" delete --claude-instance-id t0-x'],

@@ -15,6 +15,13 @@
 # line above is the shim's marker; scenario.sh's `check_ad_shim` checks for
 # it after every install, re-shim, swap and restore.
 #
+# The same file fronts agent-director-admin, the operator tool that holds
+# `kill-finished` and `delete` (agent-director 0.11.0 on):
+# `install_ad_admin_shim` puts it at $HOME/.agent-director/admin/agent-director-admin
+# with the binary beside it as agent-director-admin.real, and
+# `check_ad_admin_shim` checks it. Run by that name, the shim execs
+# agent-director-admin.real and logs to the one log below.
+#
 # For each invocation the shim appends one `call` line to its log, then
 # replaces itself with the real binary beside it (`exec`): the same process
 # (PID), argv (argv[0] included), standard input, output and error, and exit
@@ -31,7 +38,9 @@
 # -------
 # <dir>/agent-director-shim.log, where <dir> is the directory holding the
 # shim and the real binary ($HOME/.agent-director/bin under the scenario
-# HOME). agent-director registers hook commands that name the real binary, so
+# HOME); run as agent-director-admin, the shim writes to that same file, in
+# the bin directory beside its own admin directory, so one log holds every
+# invocation of either binary. agent-director registers hook commands that name the real binary, so
 # a process run as a hook, or one reading such a command (stub-claude.sh),
 # derives the log from that command's directory. Installs, re-shims, swaps
 # and scenario 8's hide and restore move only the shim and the binary: the
@@ -74,8 +83,13 @@
 self="$0"
 [[ "${self}" == /* ]] || self="$(pwd -P)/${self}"
 dir="${self%/*}"
-real="${dir}/agent-director.real"
-log="${dir}/agent-director-shim.log"
+if [[ "${self##*/}" == agent-director-admin ]]; then
+    real="${dir}/agent-director-admin.real"
+    log="${dir%/*}/bin/agent-director-shim.log"
+else
+    real="${dir}/agent-director.real"
+    log="${dir}/agent-director-shim.log"
+fi
 
 words=""
 if (( $# > 0 )); then

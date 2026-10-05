@@ -70,12 +70,14 @@
 #   directory stays. No process of the scenario finds an agent-director on
 #   PATH: the client finds the scenario HOME's at its standard path;
 # - installs agent-director into the scenario HOME behind the shim
-#   (fixtures/agent-director-shim.sh): by default the release candidate,
-#   through its install.sh (`install_ad_rc`), which creates the HOME's store
-#   with its store id; or, for a script that sets SCENARIO_AD_START=0.10.0
-#   before sourcing, agent-director 0.10.0's binary (`install_ad_010`), with
-#   no release-candidate install and no store yet (SCENARIO_AD_START is `rc`
-#   or `0.10.0`; a shared-mode script that sets it fails);
+#   (fixtures/agent-director-shim.sh): by default the release, through its
+#   install.sh (`install_ad_release`), which creates the HOME's store with its
+#   store id and installs agent-director-admin, behind the same shim, at
+#   $HOME/.agent-director/admin/agent-director-admin; or, for a script that
+#   sets SCENARIO_AD_START=0.10.0 before sourcing, agent-director 0.10.0's
+#   binary (`install_ad_010`), with no release install, no agent-director-admin
+#   and no store yet (SCENARIO_AD_START is `release` or `0.10.0`; a
+#   shared-mode script that sets it fails);
 # - writes no agent-director config.toml: agent-director's default settings;
 # - once SCENARIO_PORT is picked, writes the MCP config the stub's session
 #   reads, $HOME/.claude/slack-mcp.json naming that port (`write_mcp_config`),
@@ -231,25 +233,32 @@
 #                                      both as written and by real path
 #
 #   agent-director install (fmk mode; standard path = $HOME/.agent-director/bin/agent-director,
-#   the real binary beside it = <standard path>.real; each runs both guards first, and
-#   each that changes the install runs `check_ad_shim` after its change, apart from
-#   `hide_ad_install`, which leaves no file at the standard path to check)
+#   admin path = $HOME/.agent-director/admin/agent-director-admin, the real binary beside
+#   either = <path>.real; each runs both guards first, and each that changes the install
+#   checks the shim after its change, apart from `hide_ad_install`, which leaves no file at
+#   the standard path to check)
 #   install_ad_shim [<step>]           put the binary installed at the standard path behind the shim:
 #                                      it is copied to <standard path>.real, then the shim is renamed
 #                                      over the standard path (which so always holds the binary or
 #                                      the shim); fails when the standard path is missing, a symlink
 #                                      or already the shim
+#   install_ad_admin_shim [<step>]     the same for the agent-director-admin installed at the admin
+#                                      path
 #   reshim_ad [<step>]                 the re-shim after any install.sh run (the harness's or a
-#                                      runbook's own install command): `install_ad_shim`
-#   install_ad_rc [<step>]             run the release candidate's install.sh in the scenario HOME
-#                                      (`--binary <RC binary> --no-symlink --no-hooks`, stdin from
-#                                      /dev/null, cwd HOME; output in AD_INSTALL_OUT), then `reshim_ad`;
-#                                      a failed run fails the step with install.sh's output
+#                                      runbook's own install command): `install_ad_shim`, then
+#                                      `install_ad_admin_shim` when a file is at the admin path
+#   install_ad_release [<step>]        run the release's install.sh in the scenario HOME
+#                                      (`--binary <release binary> --admin-binary <release
+#                                      agent-director-admin> --no-symlink --no-hooks`, stdin from
+#                                      /dev/null, cwd HOME; output in AD_INSTALL_OUT), then `reshim_ad`
+#                                      and `check_ad_admin_shim`; a failed run fails the step with
+#                                      install.sh's output
 #   install_ad_010 [<step>]            copy agent-director 0.10.0's binary to the standard path, then
 #                                      `install_ad_shim` (no install.sh run, no store made)
-#   swap_ad_binary <rc|0.10.0|<abs-path>> [<step>]
-#                                      replace only the binary behind the shim (the release
-#                                      candidate, 0.10.0, or a stand-in or wrapper file)
+#   swap_ad_binary <release|0.10.0|<abs-path>> [<step>]
+#                                      replace only the binary behind the shim at the standard path
+#                                      (the release's, 0.10.0's, or a stand-in or wrapper file);
+#                                      agent-director-admin stays as installed
 #   hide_ad_install [<step>]           scenario 8's not-found step: move the shim and the binary
 #                                      aside together (to $SCENARIO_ROOT/ad-aside), leaving no file
 #                                      at the standard path; when the binary cannot move, the shim
@@ -260,6 +269,7 @@
 #   check_ad_shim [<step>]             fail unless the standard path holds a regular file, not a
 #                                      symlink, executable and carrying the shim's marker, with an
 #                                      executable binary beside it that is not the shim
+#   check_ad_admin_shim [<step>]       the same check at the admin path
 #
 #   Harness agent-director calls (fmk mode; both guards first; run the standard path, the shim)
 #   ad <arg>...                        run agent-director with <arg>...; status and output pass
@@ -268,6 +278,11 @@
 #   ad_capture <arg>...                the same, as a direct child of the shell; set AD_RC, AD_OUT
 #                                      (stdout file) and AD_ERR (stderr file); never fails on the
 #                                      call's status
+#   ad_admin <arg>...                  `ad` for agent-director-admin at the admin path (its shim):
+#   ad_admin_capture <arg>...          and `ad_capture` for it. agent-director-admin is the
+#                                      operator tool that holds `kill-finished` and `delete`; a
+#                                      scenario makes those only through `ad_kill_include_finished`
+#                                      and `ad_delete_unusable_row`
 #
 #   The scenario store ($HOME/.agent-director/state.db; both guards first; no other store)
 #   ad_store_edit <statement>          run exactly one sqlite3 statement (no `;` but one at its end);
@@ -446,14 +461,16 @@
 #                                      and only letters, digits and `._-`; nothing else changes
 #                                      (row_version included)
 #   ad_kill_include_finished <instance-id>
-#                                      a human's `kill --include-finished --claude-instance-id <id>`
-#                                      through the harness call (`ad_capture`), as a direct child of
-#                                      the shell that calls it: the scenario's own shell, or a
-#                                      subshell of it, which `assert_no_cscb_include_finished`
-#                                      accepts. Sets AD_KILL_OUT (its output, a file under
-#                                      SCENARIO_ROOT), AD_KILL_ERR and AD_KILL_RC and prints the output;
-#                                      fails unless it exits 0 with a result holding kill_sent and its
-#                                      invocation is in the shim's log. agent-director makes this kill
+#                                      a human's finished-row kill, agent-director-admin's
+#                                      `kill-finished --claude-instance-id <id>` (agent-director's own
+#                                      `kill` takes no --include-finished), through
+#                                      `ad_admin_capture`, as a direct child of the shell that calls
+#                                      it: the scenario's own shell, or a subshell of it, which
+#                                      `assert_no_cscb_include_finished` accepts. Sets AD_KILL_OUT (its
+#                                      output, a file under SCENARIO_ROOT), AD_KILL_ERR and AD_KILL_RC
+#                                      and prints the output; fails unless it exits 0 with a result
+#                                      holding kill_sent and its invocation is in the shim's log.
+#                                      agent-director-admin makes this kill
 #                                      only for a finished row (`ended` or `missing`, as
 #                                      `ad_store_mark_finished` leaves it) whose session is past the
 #                                      starting-session bound ([tmux] starting_session_seconds in
@@ -464,10 +481,11 @@
 #                                      lowers that bound in its [tmux] table or waits the 300 s
 #   ad_delete_unusable_row <instance-id>
 #                                      scenario 25's step, the only agent-director `delete` the
-#                                      harness makes (b.jg5 SRJ-1306): a human removing the row with
-#                                      the unusable name; refuses unless the row's recorded session
-#                                      name holds the `.` `ad_store_unusable_name` wrote; fails unless
-#                                      `delete` exits 0 and the row is gone
+#                                      harness makes (b.jg5 SRJ-1306), through agent-director-admin
+#                                      (`ad_admin_capture`): a human removing the row with the
+#                                      unusable name; refuses unless the row's recorded session name
+#                                      holds the `.` `ad_store_unusable_name` wrote; fails unless
+#                                      `delete` exits 0 reporting the id `ok` and the row is gone
 #
 #   The find-missing loop (fmk mode; b.jg5 SRJ-1401: only for a latched persona's row, which CSCB
 #   makes no extra call for, as the host's find-missing loop marks it; an unlatched persona's
@@ -500,10 +518,10 @@
 #   0.10.0 start and seeders (fmk mode; b.jg5 SRJ-1306, SRJ-1402, SRJ-1424). The 0.10.0 start is
 #   setup's: a script that sets SCENARIO_AD_START=0.10.0 before sourcing gets 0.10.0's binary
 #   behind the shim (`install_ad_010`) and no store, which 0.10.0's first `spawn` creates.
-#   `install_ad_rc` later runs the release candidate's install.sh over it (the migration), then
+#   `install_ad_release` later runs the release's install.sh over it (the migration), then
 #   re-shims and re-checks. Both seeders run both guards first, and refuse unless the binary
-#   behind the shim, run by its own name, reports 0.10.0, no `install_ad_rc` has run in this
-#   shell and the store, if any, has no store_meta table (the release candidate's install has
+#   behind the shim, run by its own name, reports 0.10.0, no `install_ad_release` has run in
+#   this shell and the store, if any, has no store_meta table (the release's install has
 #   not run in this HOME).
 #   seed_010_row <instance-id> <session-name> <dir> [<key>=<value>...]
 #                                      one row made with 0.10.0's own `spawn` through the harness call
@@ -569,15 +587,17 @@
 #                                      (its PID that of an agent-director shim `call` line whose own
 #                                      parent is a CSCB process, the latest such line at or before it,
 #                                      and its argv[0] agent-director)
-#   assert_no_cscb_include_finished    fail on any `kill` invocation carrying --include-finished
-#                                      (`-` or `--`, with or without `=<value>`) whose parent is not the
+#   assert_no_cscb_include_finished    fail on any finished-row kill, agent-director-admin's
+#                                      `kill-finished` or a `kill` carrying --include-finished (`-` or
+#                                      `--`, with or without `=<value>`), whose parent is not the
 #                                      scenario's own shell or a subshell of it (a command
 #                                      substitution or pipeline element included): a parent whose
 #                                      command line is the script's own (SCENARIO_SHELL_CMDLINE, quoted
 #                                      as the shims quote it) and that no CSCB process held; positive
 #                                      control: fail unless some invocation's parent is a bot server
 #                                      the scenario started (its version probe)
-#   assert_no_cscb_delete              fail on any `delete` invocation whose parent is a CSCB process
+#   assert_no_cscb_delete              fail on any `delete` invocation (agent-director-admin's, or an
+#                                      earlier agent-director's) whose parent is a CSCB process
 #   cscb_ad_calls <verb> [<fragment>...]
 #                                      print the agent-director shim's `call` lines whose parent is a
 #                                      CSCB process, whose verb is <verb> (any verb when <verb> is
@@ -716,11 +736,13 @@ PENDING_HEADER='claude-slack-channel-bots: pending configuration change (written
 # The integration fixtures (stub-claude.sh, agent-director-shim.sh, drivers).
 SCENARIO_FIXTURES="$(cd "$(dirname "${BASH_SOURCE[0]}")/../fixtures" && pwd)"
 
-# The image's agent-director files (docker/Dockerfile.test.base): the release
-# candidate's binary and its install.sh (from agent-director's tree at the
-# release candidate's commit), and agent-director 0.10.0's binary.
-SCENARIO_RC_BIN=/opt/agent-director-rc/bin/agent-director
-SCENARIO_RC_INSTALL_SH=/opt/agent-director-rc/install/install.sh
+# The image's agent-director files (docker/Dockerfile.test.base): the
+# release's binary, its operator tool agent-director-admin and its install.sh
+# (from agent-director's tree at the release tag), and agent-director
+# 0.10.0's binary.
+SCENARIO_RELEASE_BIN=/opt/agent-director/bin/agent-director
+SCENARIO_RELEASE_ADMIN=/opt/agent-director/admin/agent-director-admin
+SCENARIO_RELEASE_INSTALL_SH=/opt/agent-director/install/install.sh
 SCENARIO_AD_010_BIN=/opt/agent-director-0.10.0/bin/agent-director
 
 # The agent-director shim and the whole line that marks it.
@@ -1843,11 +1865,11 @@ _scenario_place() {
     mv -f -- "${tmp}" "${dest}" || fail "${step}: could not rename into ${dest}"
 }
 
-check_ad_shim() {
-    local step="${1:-the agent-director shim check}"
-    require_ci_image "${step}"
-    require_scenario_home "${step}"
-    local path="${HOME}/.agent-director/bin/agent-director"
+# _scenario_check_shim_at <path> <step>: fail unless <path> holds a regular
+# file, not a symlink, carrying the shim's marker and executable, with an
+# executable regular file that is not the shim at <path>.real.
+_scenario_check_shim_at() {
+    local path="$1" step="$2"
     local real="${path}.real"
     [[ -e "${path}" || -L "${path}" ]] || fail "${step}: no file at ${path}"
     [[ ! -L "${path}" ]] || fail "${step}: ${path} is a symlink, not the shim"
@@ -1859,11 +1881,24 @@ check_ad_shim() {
     ! _scenario_is_shim "${real}" || fail "${step}: the file behind the shim at ${real} is the shim itself"
 }
 
-install_ad_shim() {
-    local step="${1:-install the agent-director shim}"
+check_ad_shim() {
+    local step="${1:-the agent-director shim check}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    local path="${HOME}/.agent-director/bin/agent-director"
+    _scenario_check_shim_at "${HOME}/.agent-director/bin/agent-director" "${step}"
+}
+
+check_ad_admin_shim() {
+    local step="${1:-the agent-director-admin shim check}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_check_shim_at "${HOME}/.agent-director/admin/agent-director-admin" "${step}"
+}
+
+# _scenario_shim_over <path> <step>: put the binary installed at <path>
+# behind the shim. The caller has run both guards.
+_scenario_shim_over() {
+    local path="$1" step="$2"
     [[ -f "${SCENARIO_AD_SHIM_SRC}" ]] && _scenario_is_shim "${SCENARIO_AD_SHIM_SRC}" \
         || fail "${step}: the shim ${SCENARIO_AD_SHIM_SRC} is missing or carries no marker"
     [[ -e "${path}" || -L "${path}" ]] || fail "${step}: no binary installed at ${path}"
@@ -1875,7 +1910,21 @@ install_ad_shim() {
     # or the shim, and a failure at either leaves the binary in place.
     _scenario_place "${path}" "${path}.real" "${step}"
     _scenario_place "${SCENARIO_AD_SHIM_SRC}" "${path}" "${step}"
-    check_ad_shim "${step}"
+    _scenario_check_shim_at "${path}" "${step}"
+}
+
+install_ad_shim() {
+    local step="${1:-install the agent-director shim}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_shim_over "${HOME}/.agent-director/bin/agent-director" "${step}"
+}
+
+install_ad_admin_shim() {
+    local step="${1:-install the agent-director-admin shim}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_shim_over "${HOME}/.agent-director/admin/agent-director-admin" "${step}"
 }
 
 reshim_ad() {
@@ -1883,20 +1932,27 @@ reshim_ad() {
     require_ci_image "${step}"
     require_scenario_home "${step}"
     install_ad_shim "${step}"
+    # install.sh installs agent-director-admin too; 0.10.0 had none.
+    if [[ -e "${HOME}/.agent-director/admin/agent-director-admin" ]]; then
+        install_ad_admin_shim "${step}: agent-director-admin"
+    fi
 }
 
-install_ad_rc() {
-    local step="${1:-install the release candidate with its install.sh}"
+install_ad_release() {
+    local step="${1:-install the release with its install.sh}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
     local rc=0 last
-    [[ -f "${SCENARIO_RC_INSTALL_SH}" && -x "${SCENARIO_RC_INSTALL_SH}" ]] \
-        || fail "${step}: the release candidate's install.sh is missing from the image (${SCENARIO_RC_INSTALL_SH})"
-    [[ -f "${SCENARIO_RC_BIN}" && -x "${SCENARIO_RC_BIN}" ]] \
-        || fail "${step}: the release candidate's binary is missing from the image (${SCENARIO_RC_BIN})"
+    [[ -f "${SCENARIO_RELEASE_INSTALL_SH}" && -x "${SCENARIO_RELEASE_INSTALL_SH}" ]] \
+        || fail "${step}: the release's install.sh is missing from the image (${SCENARIO_RELEASE_INSTALL_SH})"
+    [[ -f "${SCENARIO_RELEASE_BIN}" && -x "${SCENARIO_RELEASE_BIN}" ]] \
+        || fail "${step}: the release's binary is missing from the image (${SCENARIO_RELEASE_BIN})"
+    [[ -f "${SCENARIO_RELEASE_ADMIN}" && -x "${SCENARIO_RELEASE_ADMIN}" ]] \
+        || fail "${step}: the release's agent-director-admin is missing from the image (${SCENARIO_RELEASE_ADMIN})"
     _SCENARIO_INSTALL_COUNT=$(( _SCENARIO_INSTALL_COUNT + 1 ))
     AD_INSTALL_OUT="${SCENARIO_ROOT}/install-sh.${_SCENARIO_INSTALL_COUNT}.out"
-    (cd "${HOME}" && "${SCENARIO_RC_INSTALL_SH}" --binary "${SCENARIO_RC_BIN}" --no-symlink --no-hooks) \
+    (cd "${HOME}" && "${SCENARIO_RELEASE_INSTALL_SH}" --binary "${SCENARIO_RELEASE_BIN}" \
+        --admin-binary "${SCENARIO_RELEASE_ADMIN}" --no-symlink --no-hooks) \
         < /dev/null > "${AD_INSTALL_OUT}" 2>&1 || rc=$?
     if [[ "${rc}" -ne 0 ]]; then
         # Indented, so no line of it can pass for the runner's FAIL line.
@@ -1907,6 +1963,7 @@ install_ad_rc() {
         fail "${step}: install.sh exited ${rc}: ${last:-no output}"
     fi
     reshim_ad "${step}: re-shim"
+    check_ad_admin_shim "${step}: agent-director-admin"
 }
 
 install_ad_010() {
@@ -1931,10 +1988,10 @@ swap_ad_binary() {
     require_scenario_home "${step}"
     local src
     case "${what}" in
-        rc) src="${SCENARIO_RC_BIN}" ;;
+        release) src="${SCENARIO_RELEASE_BIN}" ;;
         0.10.0) src="${SCENARIO_AD_010_BIN}" ;;
         /*) src="${what}" ;;
-        *) fail "${step}: '${what}' is not rc, 0.10.0 or an absolute path" ;;
+        *) fail "${step}: '${what}' is not release, 0.10.0 or an absolute path" ;;
     esac
     [[ -f "${src}" && -x "${src}" ]] || fail "${step}: ${src} is not an executable file"
     ! _scenario_is_shim "${src}" || fail "${step}: ${src} is the shim, not a binary"
@@ -1998,6 +2055,22 @@ ad_capture() {
     AD_ERR="${SCENARIO_ROOT}/ad.${_SCENARIO_AD_COUNT}.err"
     AD_RC=0
     "${HOME}/.agent-director/bin/agent-director" "$@" > "${AD_OUT}" 2> "${AD_ERR}" || AD_RC=$?
+}
+
+ad_admin() {
+    require_ci_image "ad_admin $*"
+    require_scenario_home "ad_admin $*"
+    "${HOME}/.agent-director/admin/agent-director-admin" "$@"
+}
+
+ad_admin_capture() {
+    require_ci_image "ad_admin_capture $*"
+    require_scenario_home "ad_admin_capture $*"
+    _SCENARIO_AD_COUNT=$(( _SCENARIO_AD_COUNT + 1 ))
+    AD_OUT="${SCENARIO_ROOT}/ad.${_SCENARIO_AD_COUNT}.out"
+    AD_ERR="${SCENARIO_ROOT}/ad.${_SCENARIO_AD_COUNT}.err"
+    AD_RC=0
+    "${HOME}/.agent-director/admin/agent-director-admin" "$@" > "${AD_OUT}" 2> "${AD_ERR}" || AD_RC=$?
 }
 
 # ---------------------------------------------------------------------------
@@ -2841,12 +2914,33 @@ ad_store_unusable_name() {
     _scenario_row_diff_check "${step}" "${before}" "${after}" "{\"tmux_session_name\": \"${name}\"}"
 }
 
-# _scenario_include_finished_lines: print how many `call` lines of the
-# agent-director shim's log carry --include-finished.
-_scenario_include_finished_lines() {
-    local n
-    n="$(grep -c -- $'^call\t.*--include-finished' "${SCENARIO_AD_SHIM_LOG}" 2> /dev/null)" || true
-    printf '%s\n' "${n:-0}"
+# _scenario_finished_kill_words: succeed when _L_WORDS is a finished-row
+# kill: agent-director-admin's `kill-finished`, or a `kill` carrying
+# --include-finished (`-` or `--`, with or without `=<value>`), the flag's
+# spelling before agent-director moved that kill to agent-director-admin.
+_scenario_finished_kill_words() {
+    local a
+    _scenario_ad_verb
+    [[ "${_L_VERB}" == kill-finished ]] && return 0
+    [[ "${_L_VERB}" == kill ]] || return 1
+    for a in ${_L_ARGS[@]+"${_L_ARGS[@]}"}; do
+        [[ "${a}" =~ ^--?include-finished(=.*)?$ ]] && return 0
+    done
+    return 1
+}
+
+# _scenario_finished_kill_lines: print how many `call` lines of the
+# agent-director shim's log are a finished-row kill.
+_scenario_finished_kill_lines() {
+    local lines=() i n=0
+    _scenario_read_log "_scenario_finished_kill_lines" "${SCENARIO_AD_SHIM_LOG}" lines
+    for i in "${!lines[@]}"; do
+        _scenario_split_line "${lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        _scenario_decode_words
+        _scenario_finished_kill_words && n=$(( n + 1 ))
+    done
+    printf '%s\n' "${n}"
 }
 
 ad_kill_include_finished() {
@@ -2855,21 +2949,22 @@ ad_kill_include_finished() {
     require_ci_image "${step}"
     require_scenario_home "${step}"
     _scenario_check_instance_id "${step}" "${id}"
-    before="$(_scenario_include_finished_lines)"
-    # ad_capture runs the binary as a direct child of this shell: the
-    # scenario's own shell, or the subshell of it this is called in.
-    ad_capture kill --include-finished --claude-instance-id "${id}"
+    check_ad_admin_shim "${step}"
+    before="$(_scenario_finished_kill_lines)"
+    # ad_admin_capture runs agent-director-admin as a direct child of this
+    # shell: the scenario's own shell, or the subshell of it this is called in.
+    ad_admin_capture kill-finished --claude-instance-id "${id}"
     AD_KILL_OUT="${AD_OUT}"
     AD_KILL_ERR="${AD_ERR}"
     AD_KILL_RC="${AD_RC}"
     if (( AD_KILL_RC != 0 )); then
         sed 's/^/  | /' "${AD_KILL_OUT}" "${AD_KILL_ERR}" >&2
-        fail "${step}: kill --include-finished exited ${AD_KILL_RC}"
+        fail "${step}: agent-director-admin kill-finished exited ${AD_KILL_RC}"
     fi
     jq -e 'type == "object" and has("kill_sent")' "${AD_KILL_OUT}" > /dev/null 2>&1 \
-        || fail "${step}: kill --include-finished printed no result holding kill_sent: $(tr '\n' ' ' < "${AD_KILL_OUT}")"
-    (( $(_scenario_include_finished_lines) > before )) \
-        || fail "${step}: the agent-director shim's log holds no new call line carrying --include-finished"
+        || fail "${step}: agent-director-admin kill-finished printed no result holding kill_sent: $(tr '\n' ' ' < "${AD_KILL_OUT}")"
+    (( $(_scenario_finished_kill_lines) > before )) \
+        || fail "${step}: the agent-director shim's log holds no new kill-finished call line"
     cat -- "${AD_KILL_OUT}"
 }
 
@@ -2886,11 +2981,14 @@ ad_delete_unusable_row() {
     # whose recorded name ad_store_unusable_name made unusable.
     [[ "${name}" == *.* ]] \
         || fail "${step}: refused: the row's recorded session name '${name}' holds no '.'; this step removes only the row scenario 25 made unusable"
-    ad_capture delete --claude-instance-id "${id}"
+    check_ad_admin_shim "${step}"
+    ad_admin_capture delete --claude-instance-id "${id}"
     if (( AD_RC != 0 )); then
         sed 's/^/  | /' "${AD_OUT}" "${AD_ERR}" >&2
-        fail "${step}: delete exited ${AD_RC}"
+        fail "${step}: agent-director-admin delete exited ${AD_RC}"
     fi
+    jq -e --arg id "${id}" '.results[$id] == "ok"' "${AD_OUT}" > /dev/null 2>&1 \
+        || fail "${step}: agent-director-admin delete did not report ${id} ok: $(tr '\n' ' ' < "${AD_OUT}")"
     n="$(_scenario_store_read "${step}" "SELECT count(*) FROM spawns WHERE claude_instance_id = '${id}'")" || exit 1
     [[ "${n}" == 0 ]] || fail "${step}: the row is still in the store after delete: $(tr '\n' ' ' < "${AD_OUT}")"
 }
@@ -2995,13 +3093,13 @@ wait_find_missing_runs() {
 # ---------------------------------------------------------------------------
 
 # _scenario_require_010 <step>: refuse unless the binary behind the shim,
-# run by its own name (no shim line), reports 0.10.0, no install_ad_rc has
-# run in this shell, and the store, if any, has no store_meta table (the
-# release candidate's install has not migrated it).
+# run by its own name (no shim line), reports 0.10.0, no install_ad_release
+# has run in this shell, and the store, if any, has no store_meta table (the
+# release's install has not migrated it).
 _scenario_require_010() {
     local step="$1" real="${HOME}/.agent-director/bin/agent-director.real" out ver n
     (( _SCENARIO_INSTALL_COUNT == 0 )) \
-        || fail "${step}: refused: the release candidate's install.sh has run in this HOME (${_SCENARIO_INSTALL_COUNT} run(s)); the 0.10.0 seeders run before it"
+        || fail "${step}: refused: the release's install.sh has run in this HOME (${_SCENARIO_INSTALL_COUNT} run(s)); the 0.10.0 seeders run before it"
     check_ad_shim "${step}"
     out="$("${real}" version 2>&1)" || fail "${step}: the binary behind the shim (${real}) failed its version call: ${out//$'\n'/ }"
     ver="$(jq -r '.version // empty' <<< "${out}" 2> /dev/null)" || ver=""
@@ -3011,7 +3109,7 @@ _scenario_require_010() {
         n="$(_scenario_store_read "${step}" "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_meta'")" \
             || exit 1
         [[ "${n}" == 0 ]] \
-            || fail "${step}: refused: the store has a store_meta table, so the release candidate's install has migrated it"
+            || fail "${step}: refused: the store has a store_meta table, so the release's install has migrated it"
     fi
 }
 
@@ -3387,7 +3485,7 @@ assert_no_server_tmux() {
 }
 
 assert_no_cscb_include_finished() {
-    local step=assert_no_cscb_include_finished lines=() bad=() i a control=0 finished
+    local step=assert_no_cscb_include_finished lines=() bad=() i control=0
     _scenario_query_prep "${step}"
     _scenario_read_log "${step}" "${SCENARIO_AD_SHIM_LOG}" lines
     for i in "${!lines[@]}"; do
@@ -3397,13 +3495,7 @@ assert_no_cscb_include_finished() {
             control=1
         fi
         _scenario_decode_words
-        _scenario_ad_verb
-        [[ "${_L_VERB}" == kill ]] || continue
-        finished=0
-        for a in ${_L_ARGS[@]+"${_L_ARGS[@]}"}; do
-            [[ "${a}" =~ ^--?include-finished(=.*)?$ ]] && finished=1
-        done
-        (( finished )) || continue
+        _scenario_finished_kill_words || continue
         # The scenario's own shell, or a subshell of it (a command
         # substitution or a pipeline element included): a parent with the
         # script's own command line that no CSCB process held.
@@ -3414,7 +3506,7 @@ assert_no_cscb_include_finished() {
         bad+=("$(( i + 1 ))")
     done
     (( ${#bad[@]} == 0 )) \
-        || _scenario_offending "${step}" "${SCENARIO_AD_SHIM_LOG}" "run kill with --include-finished from a parent other than the scenario's own shell or a subshell of it" "${bad[@]}"
+        || _scenario_offending "${step}" "${SCENARIO_AD_SHIM_LOG}" "run a finished-row kill (kill-finished, or kill with --include-finished) from a parent other than the scenario's own shell or a subshell of it" "${bad[@]}"
     (( control )) \
         || fail "${step}: positive control: no invocation in ${SCENARIO_AD_SHIM_LOG} (${#lines[@]} line(s)) has a bot server the scenario started as its parent (its version probe), so the shim's log shows no call CSCB made"
     _scenario_closing_ran "${step}"
@@ -3503,9 +3595,9 @@ _scenario_path_without_ad() {
 }
 
 _scenario_fmk_setup() {
-    case "${SCENARIO_AD_START:=rc}" in
-        rc | 0.10.0) ;;
-        *) fail "SCENARIO_AD_START '${SCENARIO_AD_START}' is neither rc nor 0.10.0" ;;
+    case "${SCENARIO_AD_START:=release}" in
+        release | 0.10.0) ;;
+        *) fail "SCENARIO_AD_START '${SCENARIO_AD_START}' is neither release nor 0.10.0" ;;
     esac
     SCENARIO_REAL_TMUX="$(command -v tmux || true)"
     [[ "${SCENARIO_REAL_TMUX}" == /* ]] || fail "tmux not on PATH (base image prerequisite)"
@@ -3574,9 +3666,9 @@ _scenario_fmk_setup() {
     if [[ "${SCENARIO_AD_START}" == 0.10.0 ]]; then
         install_ad_010 "fmk setup: install agent-director 0.10.0"
     else
-        install_ad_rc "fmk setup: install the release candidate"
+        install_ad_release "fmk setup: install the release"
         [[ -f "${HOME}/.agent-director/state.db" ]] \
-            || fail "fmk setup: the release candidate's install.sh made no store at ${HOME}/.agent-director/state.db"
+            || fail "fmk setup: the release's install.sh made no store at ${HOME}/.agent-director/state.db"
     fi
 }
 
