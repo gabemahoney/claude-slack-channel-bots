@@ -45,8 +45,8 @@
  *   directory) check `/etc/cscb-ci-image` before their first other step; each
  *   script that sources scenario.sh runs nothing before its source line;
  *   `fmk-driver.ts`, `stub-mcp-session.ts`, `switch-over.ts` and
- *   `fmk-texts.ts` (a listed set) each check the marker first and statically import only `node:`
- *   built-ins, type-only imports included; and every scenario.sh function
+ *   `fmk-texts.ts` (a listed set) each check the marker first and
+ *   statically import only `node:` built-ins, type-only imports included; and every scenario.sh function
  *   with a step (sqlite3, a copy, move or install, an install.sh run, or a
  *   run of agent-director by its path or a variable holding one; a call of a
  *   scenario.sh function with a step counting as one), found from the file,
@@ -2579,7 +2579,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       // The helpers the audit must find a step in (a parse that lost steps would shrink the set).
       expect(homeCheckedHelpers(source)).toEqual(expect.arrayContaining([
         'install_ad_shim', 'install_ad_admin_shim', 'install_ad_release', 'install_ad_010', 'reshim_ad', 'swap_ad_binary', 'hide_ad_install', 'restore_ad_install',
-        'ad', 'ad_capture', 'ad_admin', 'ad_admin_capture', '_scenario_store_read', 'ad_store_edit', 'ad_store_id', 'ad_store_backup', 'ad_store_pending_no_launch', 'stub_mode',
+        'ad', 'ad_capture', 'ad_admin', 'ad_admin_capture', '_scenario_store_read', 'ad_store_edit', 'ad_store_id', 'ad_store_backup', 'ad_store_pending_no_launch', 'stub_mode', 'stub_dialog_delay', 'stub_release',
         'ad_new_token', 'ad_other_store_id', 'ad_owner_label', 'seed_leftover', 'seed_unlabelled', 'seed_env_only', 'seed_borrowed_name', 'seed_other_store',
         'relabel_session', 'ad_owner_global_set', 'rebind_tmux_socket', 'ad_store_mark_finished', 'ad_store_seed_pending', 'ad_store_unusable_name',
         'ad_kill_include_finished', 'ad_delete_unusable_row', 'run_find_missing_loop', 'seed_010_row', 'seed_prepersona_fleet', 'write_mcp_config',
@@ -2611,6 +2611,8 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       ['ad_store_mark_finished', 'its store read, through another helper', '_scenario_row_json'],
       ['seed_leftover', 'its seeding, through _scenario_seed', '_scenario_seed'],
       ['rebind_tmux_socket', 'its socket move', 'mv'],
+      ['stub_dialog_delay', 'its move', 'mv'],
+      ['stub_release', 'its move', 'mv'],
       ['install_ad_release', 'its install.sh run', '${SCENARIO_RELEASE_INSTALL_SH}'],
       ['ad_admin', 'its run of the HOME’s agent-director-admin', '${HOME}/.agent-director/admin/agent-director-admin'],
       ['ad', 'its run of the HOME’s agent-director', '${HOME}/.agent-director/bin/agent-director'],

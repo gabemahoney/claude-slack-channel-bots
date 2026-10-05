@@ -71,9 +71,63 @@
 #                        RESUME) finds it at its SessionStart; a resumed
 #                        launch of a session never messaged finds none until
 #                        its own first message.
+#   pause-linger         report in at once, as `at-once` does, and answer the
+#                        `/exit` line agent-director's `pause` types by firing
+#                        SessionEnd and lingering until the harness releases
+#                        it (see THE PAUSE LINGER).
 #
 # Only the dev-channels dialog holds DEV_CHANNELS_DIALOG_NEEDLE, and only the
 # folder-trust prompt holds TRUST_DIALOG_NEEDLE.
+#
+# THE DIALOG DELAY
+# ----------------
+# A harness addition (b.jg5 SRJ-1306) to confirm at the reconcile pass: an
+# optional delay before the dev-channels dialog, set per working directory,
+# so a launch stays `pending` at the dialog long enough for a scenario to act
+# on it before CSCB's approver can answer. The harness writes it
+# (lib/scenario.sh `stub_dialog_delay`) to the file `stub-claude-dialog-delays`
+# beside the stub, one line per setting: `<seconds> TAB <real path>`; the last
+# line naming the directory wins. A directory with no setting, a setting of
+# 0, or a stub with no such file beside it has no delay, and the stub behaves
+# as the modes above state. The delay acts only in `dev-channels`:
+#   - for the set number of seconds, from the stub's start, it shows a
+#     starting screen that holds neither DEV_CHANNELS_DIALOG_NEEDLE nor
+#     TRUST_DIALOG_NEEDLE, so the approver finds nothing to answer;
+#   - it then clears the screen and prints the dev-channels dialog, the same
+#     bytes as with no delay, and holds until Enter, reporting in as the
+#     dialog mode does (the re-fire and the MCP session included);
+#   - while the delay runs the sentinel ends the stub, as in a dialog mode,
+#     and any other line is ignored: it answers no dialog;
+#   - a setting that is not a whole number is reported on stderr and read as
+#     no delay.
+# Hook firing, the sentinel, the stop line and the re-fire are as stated
+# below, with or without a delay.
+#
+# THE PAUSE LINGER
+# ----------------
+# A harness addition (b.jg5 SRJ-1306, SRJ-1415) to confirm at the reconcile
+# pass, for HO §7 scenarios 13 and 24: a worker whose row reads `ended` while
+# its process and tmux session still run, as Claude Code's SessionEnd hook
+# marks the row before its process exits. It acts only in `pause-linger`:
+#   - agent-director's `pause` types C-u (which clears the pane's input line),
+#     `/exit` and Enter, so the stub reads the line `/exit` (a C-u that
+#     reaches the line as a character is dropped from its start). Once the
+#     stub has reported in, that line fires every SessionEnd hook the
+#     `--settings` JSON registers, once, by HOOK FIRING's rules; the stub then
+#     stops the re-fire, ends its MCP session (as Claude Code's shutdown
+#     closes its MCP clients) and lingers: its process, and so its tmux pane
+#     and session, keep running;
+#   - while it lingers it ignores every line but the sentinel, which ends it
+#     with no hook fired (SessionEnd has fired); stdin closing ends it too;
+#   - the harness releases it (lib/scenario.sh `stub_release`), which adds
+#     the line `<time> TAB <real path>` to the file `stub-claude-releases`
+#     beside the stub. The lingering stub reads that file every
+#     LINGER_POLL_S and exits 0, firing nothing, at the first line added
+#     after it began to linger that names its directory. It counts the
+#     file's lines when the `/exit` arrives, before it fires the hooks, so a
+#     line added before then never releases it.
+# A `/exit` line before the stub reported in, and a `/exit` line in any other
+# mode, is ignored as any other line is.
 #
 # Every mode keeps these rules:
 #   - Reporting in writes a minimal transcript JSONL at Claude Code's canonical
@@ -91,6 +145,7 @@
 #   - The sentinel line `__CSCB_TEST_EXIT__` fires every SessionEnd hook the
 #     `--settings` JSON registers and exits 0 (in `silent`, it fires none). In
 #     a dialog mode it does so before the dialog is answered too.
+#   - In `pause-linger`, the `/exit` line too (see THE PAUSE LINGER).
 #   - When stdin closes (the pane was killed), the stub exits 0.
 #
 # RESUME
@@ -199,6 +254,8 @@
 # running then (one whose server restarted before its next ping noticed) is
 # ended first, with SIGTERM, then SIGKILL if it still runs 3 s later, and
 # reaped, so a reconnect never holds the stub's read loop longer than that.
+# In `pause-linger` the `/exit` line ends the session (SIGTERM) and the
+# lingering stub opens none (see THE PAUSE LINGER).
 # No session is opened when the client is not beside the stub (Test 4, Test 10
 # and Test 12, which copy only the stub), when the stub was given no
 # `--mcp-config`, or in a mode that has not reported in (`silent`, a dialog not
@@ -273,6 +330,7 @@ MODE_UNRECOGNISED=unrecognised-dialog
 MODE_FOLDER_TRUST=folder-trust
 # A harness addition, confirm at the reconcile pass.
 MODE_TRANSCRIPT_ON_FIRST_MESSAGE=transcript-on-first-message
+MODE_PAUSE_LINGER=pause-linger
 
 STUB_DIR="${BASH_SOURCE[0]%/*}"
 [[ "${STUB_DIR}" == "${BASH_SOURCE[0]}" ]] && STUB_DIR=.
@@ -287,12 +345,29 @@ fi
 case "${MODE}" in
     "${MODE_DEV_CHANNELS}" | "${MODE_AT_ONCE}" | "${MODE_SILENT}" | "${MODE_UNRECOGNISED}" | "${MODE_FOLDER_TRUST}") ;;
     "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}") ;;
+    "${MODE_PAUSE_LINGER}") ;;
     *)
         printf 'stub-claude: unknown mode %q selected for %s; running %s\n' \
             "${MODE}" "${REALCWD}" "${MODE_DEV_CHANNELS}" >&2
         MODE="${MODE_DEV_CHANNELS}"
         ;;
 esac
+
+# The dialog delay, in whole seconds (see THE DIALOG DELAY): the last setting
+# naming the directory, 0 when none does.
+STUB_DELAYS_FILE="${STUB_DIR}/stub-claude-dialog-delays"
+DIALOG_DELAY_S=0
+if [[ -f "${STUB_DELAYS_FILE}" ]]; then
+    while IFS=$'\t' read -r sel_delay sel_dir; do
+        [[ "${sel_dir}" == "${REALCWD}" ]] && DIALOG_DELAY_S="${sel_delay}"
+    done < "${STUB_DELAYS_FILE}"
+fi
+if [[ ! "${DIALOG_DELAY_S}" =~ ^[0-9]+$ ]]; then
+    printf 'stub-claude: dialog delay %q set for %s is not a whole number of seconds; no delay\n' \
+        "${DIALOG_DELAY_S}" "${REALCWD}" >&2
+    DIALOG_DELAY_S=0
+fi
+DIALOG_DELAY_S=$(( 10#${DIALOG_DELAY_S} ))
 
 # ---------------------------------------------------------------------------
 # Registered hooks. HOOK_ARGV_JQ emits, for each `"type": "command"` entry of
@@ -389,6 +464,16 @@ Channels: server:slack-channel-router
 
 Enter to confirm · Esc to cancel
 DIALOG
+}
+
+# The starting screen the dialog delay shows: no needle of CSCB's approver.
+print_delay_screen() {
+    printf 'Starting Claude Code...\n'
+}
+
+# Clear the screen, so the dialog after the delay is all the pane shows.
+clear_screen() {
+    printf '\033[H\033[2J'
 }
 
 # A startup dialog no needle of CSCB's approver matches.
@@ -647,6 +732,9 @@ trap 'close_mcp_session; rm -f "${HOOK_FILE}" "${STATUS_OUT}" "${STATUS_OUT}.err
 
 REPORTED=0
 AWAITING_ENTER=0
+# While the dialog delay runs: the time the dialog is due, in milliseconds
+# since the epoch; 0 otherwise.
+DIALOG_DUE_MS=0
 
 report_in() {
     REPORTED=1
@@ -659,8 +747,14 @@ report_in() {
 
 case "${MODE}" in
     "${MODE_DEV_CHANNELS}")
-        print_dev_channels_dialog
-        AWAITING_ENTER=1
+        if (( DIALOG_DELAY_S > 0 )); then
+            print_delay_screen
+            now_ms
+            DIALOG_DUE_MS=$(( NOW_MS + DIALOG_DELAY_S * 1000 ))
+        else
+            print_dev_channels_dialog
+            AWAITING_ENTER=1
+        fi
         ;;
     "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}")
         print_dev_channels_dialog
@@ -683,11 +777,68 @@ case "${MODE}" in
         ;;
     "${MODE_SILENT}")
         ;;
+    "${MODE_PAUSE_LINGER}")
+        report_in
+        ;;
 esac
+
+# ---------------------------------------------------------------------------
+# The pause linger (see THE PAUSE LINGER)
+# ---------------------------------------------------------------------------
+
+# The line agent-director's `pause` types, the release file beside the stub,
+# and how often a lingering stub reads that file, in seconds.
+PAUSE_EXIT_LINE=/exit
+STUB_RELEASES_FILE="${STUB_DIR}/stub-claude-releases"
+LINGER_POLL_S=0.25
+LINGERING=0
+# The release file's line count when the linger began.
+RELEASE_BASE=0
+
+# Set N_LINES to the release file's line count (0 when there is none).
+release_lines() {
+    local l
+    N_LINES=0
+    [[ -f "${STUB_RELEASES_FILE}" ]] || return 0
+    while IFS= read -r l || [[ -n "${l}" ]]; do
+        N_LINES=$(( N_LINES + 1 ))
+    done < "${STUB_RELEASES_FILE}"
+}
+
+# True when a release line added after the linger began names this directory.
+released() {
+    local n=0 rel_time rel_dir
+    [[ -f "${STUB_RELEASES_FILE}" ]] || return 1
+    while IFS=$'\t' read -r rel_time rel_dir || [[ -n "${rel_time}" ]]; do
+        n=$(( n + 1 ))
+        (( n > RELEASE_BASE )) && [[ "${rel_dir}" == "${REALCWD}" ]] && return 0
+    done < "${STUB_RELEASES_FILE}"
+    return 1
+}
+
+# The `/exit` line in `pause-linger`: count the release file's lines, fire
+# SessionEnd, stop the re-fire, end the MCP session, then linger.
+begin_linger() {
+    release_lines
+    RELEASE_BASE="${N_LINES}"
+    fire_session_end
+    stop_refire
+    close_mcp_session
+    LINGERING=1
+}
 
 # handle_line <line>: one line from stdin.
 handle_line() {
     local line="$1"
+    if (( LINGERING )); then
+        [[ "${line}" == "${SENTINEL}" ]] && exit 0
+        return 0
+    fi
+    if [[ "${MODE}" == "${MODE_PAUSE_LINGER}" ]] && (( REPORTED )) \
+        && [[ "${line##*$'\x15'}" == "${PAUSE_EXIT_LINE}" ]]; then
+        begin_linger
+        return 0
+    fi
     if [[ "${line}" == "${SENTINEL}" ]]; then
         [[ "${MODE}" == "${MODE_SILENT}" ]] || fire_session_end
         exit 0
@@ -707,14 +858,41 @@ handle_line() {
     fi
 }
 
-# Read loop. While the re-fire runs, each read waits at most until the next
-# tick, and a read that times out runs the tick; the part of a line it had
-# read by then (none from a terminal, which hands over whole lines) is kept
-# for the next read.
+# Read loop. While the dialog delay runs, each read waits at most until the
+# dialog is due, and once it is due the dialog is shown. While the re-fire
+# runs, each read waits at most until the next tick, and a read that times
+# out runs the tick. In either wait, the part of a line read by the timeout
+# (none from a terminal, which hands over whole lines) is kept for the next
+# read.
 partial=""
 while :; do
     line=""
-    if (( REFIRE_ON )); then
+    if (( LINGERING )); then
+        released && exit 0
+        IFS= read -r -t "${LINGER_POLL_S}" line
+        rc=$?
+        if (( rc > 128 )); then
+            partial+="${line}"
+            continue
+        fi
+    elif (( DIALOG_DUE_MS > 0 )); then
+        now_ms
+        wait_ms=$(( DIALOG_DUE_MS - NOW_MS ))
+        if (( wait_ms <= 0 )); then
+            DIALOG_DUE_MS=0
+            clear_screen
+            print_dev_channels_dialog
+            AWAITING_ENTER=1
+            continue
+        fi
+        printf -v wait_s '%d.%03d' $(( wait_ms / 1000 )) $(( wait_ms % 1000 ))
+        IFS= read -r -t "${wait_s}" line
+        rc=$?
+        if (( rc > 128 )); then
+            partial+="${line}"
+            continue
+        fi
+    elif (( REFIRE_ON )); then
         now_ms
         wait_ms=$(( NEXT_TICK_MS - NOW_MS ))
         if (( wait_ms <= 0 )); then
