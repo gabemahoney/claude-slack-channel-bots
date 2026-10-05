@@ -2920,3 +2920,66 @@ describe('un-injected gate checks (after the preload check)', () => {
     expect(checked.map((location) => location.detail)).toEqual([join(env.HOME!, AGENT_DIRECTOR_INSTALL_PATH), env.PATH!])
   })
 })
+
+// ---------------------------------------------------------------------------
+// Static audit: end_stub_mcp_session's guards come before its signal (harness addition, b.jg5 SRJ-1306)
+// ---------------------------------------------------------------------------
+
+/** scenario.sh's helper that ends a stub worker's MCP session client with a signal. */
+const MCP_SESSION_END_HELPER = 'end_stub_mcp_session'
+
+/** Whether `command` only declares or assigns: `local …`, or a lone `NAME=…`. */
+function isDeclarationOnly(command: ShellCommand): boolean {
+  return command.name === '' || command.name === 'local' || SHELL_ASSIGNMENT.test(command.name)
+}
+
+/**
+ * The guard findings for `helper` in scenario.sh's `source`: before its first
+ * `kill`, the helper runs `require_ci_image` as its first command after its
+ * declarations, then `require_scenario_home`, each unconditionally (at the
+ * top of its body, at the start of a logical line or after `;`).
+ */
+function signalGuardFindings(source: string, helper: string): string[] {
+  const body = shellFunctions(source).get(helper)
+  if (body === undefined) return [`${helper} is not defined`]
+  const signal = body.findIndex((c) => c.name === 'kill')
+  if (signal < 0) return [`${helper} sends no signal the audit can see`]
+  const unconditional: string[] = []
+  let depth = 0
+  for (const command of body.slice(0, signal)) {
+    if (depth === 0 && command.keywords.length === 0 && (command.after === '' || command.after === ';') && !isDeclarationOnly(command)) unconditional.push(command.name)
+    depth += shellDepthChange(command)
+  }
+  const findings: string[] = []
+  if (unconditional[0] !== 'require_ci_image') findings.push(`${helper}: its first step is ${unconditional[0] ?? 'none'}, not require_ci_image`)
+  if (unconditional.indexOf(HOME_GUARD) < 1) findings.push(`${helper}: no unconditional ${HOME_GUARD} after require_ci_image and before its kill`)
+  return findings
+}
+
+describe(`${MCP_SESSION_END_HELPER}: both guards before its signal`, () => {
+  const source = readFileSync(SCENARIO_PATH, 'utf-8')
+  const guard = (name: string): RegExp => new RegExp(`(\\n${MCP_SESSION_END_HELPER}\\(\\) \\{\\n(?:.*\\n)*?)    ${name} "[^"\\n]*"\\n`)
+
+  test('the current tree: require_ci_image first, then require_scenario_home, both before its kill', () => {
+    expect(signalGuardFindings(source, MCP_SESSION_END_HELPER)).toEqual([])
+  })
+
+  test.each([
+    ['require_scenario_home', 'no unconditional require_scenario_home'],
+    ['require_ci_image', 'not require_ci_image'],
+  ])('without its %s it is flagged', (name, finding) => {
+    const unguarded = source.replace(guard(name), '$1')
+
+    expect(unguarded).not.toBe(source)
+    const findings = signalGuardFindings(unguarded, MCP_SESSION_END_HELPER)
+    expect(findings.length).toBeGreaterThan(0)
+    expect(findings.join('\n')).toContain(finding)
+  })
+
+  test('with its HOME check only inside an if, it is flagged', () => {
+    const conditional = source.replace(guard(HOME_GUARD), `$1    if [[ -n "\${STRICT:-}" ]]; then\n        ${HOME_GUARD} "\${step}"\n    fi\n`)
+
+    expect(conditional).not.toBe(source)
+    expect(signalGuardFindings(conditional, MCP_SESSION_END_HELPER).join('\n')).toContain(`no unconditional ${HOME_GUARD}`)
+  })
+})

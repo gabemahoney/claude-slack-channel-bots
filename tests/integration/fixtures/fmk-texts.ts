@@ -191,6 +191,8 @@
  *                                                DEFAULT_AD_SETTINGS_IN_EFFECT)
  *   restartCapReachedNoticeText                  src/session-manager.ts, the restart-cap notice's body,
  *                                                a spawn-failure notice (several lines)
+ *   FULL_PANE_READ_LINES                         src/pane-read.ts, in decimal: the line count of a
+ *                                                full pane read (the waiting-row check's)
  *
  * An entry is one `Entry` in `ENTRIES`: its argument synopsis, the export it
  * prints and a `print` function from its arguments to the value. Constants
@@ -814,6 +816,7 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   tmuxUnresponsiveOnsetText: builderEntry('persona-episodes.ts', 'tmuxUnresponsiveOnsetText', ['key']),
   tmuxUnresponsiveAlertText: unresponsiveAlert,
   restartCapReachedNoticeText: builderEntry('session-manager.ts', 'restartCapReachedNoticeText', []),
+  FULL_PANE_READ_LINES: constantEntry('pane-read.ts', 'FULL_PANE_READ_LINES'),
 }
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */

@@ -17,18 +17,17 @@
 # under SCENARIO_ROOT, with agent-director's default settings (no `[tmux]`
 # table). The tmux shim stays in `log` mode, first on every CSCB process's
 # PATH. Two personas, A (PERSONA_A) and B (PERSONA_B), each with its own
-# working directory in the stub's `at-once` mode (STUB_MODE_AT_ONCE: the stub
-# reports in at once and opens its MCP session; it answers `/mcp reconnect`
-# with a new session and ignores every other line but its sentinel, so a
-# teardown's pause, whose `/exit` it never answers, escalates to the kill,
-# b.jg5 SRJ-903). Not `dev-channels`: that dialog's text stays on the stub's
-# pane once answered, and the waiting-row check's full pane read
-# (src/session-manager.ts checkWaitingRowPane) then finds a prompt
-# (blocked-on-prompt) and never types the reconnect that ends leg 4's outage.
+# working directory in the stub's `dev-channels` mode (STUB_MODE_DEV_CHANNELS:
+# each stub worker is held at the dev-channels dialog until CSCB's dialog
+# approver answers it, then clears its screen and scrollback, reports in and
+# opens its MCP session; it answers `/mcp reconnect` with a new session and
+# ignores every other line but its sentinel, so a teardown's pause, whose
+# `/exit` it never answers, escalates to the kill, b.jg5 SRJ-903; a resumed
+# launch shows the dialog again, which the approver answers again).
 # A live start against the Slack stub
 # (fixtures/slack-stub-server.ts, both token pairs answered ok), with
-# `health_check_interval` 0 (ruling S3: no leg but leg 5 needs a health tick;
-# leg 5 sets a short interval for itself and sets 0 again before it ends) and
+# `health_check_interval` 0 (ruling S3: only legs 2 and 5 need health ticks;
+# each sets a short interval for itself and sets 0 again before it ends) and
 # `agent_director_poll_interval_ms` at its largest allowed value
 # (MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS, src/config.ts: one hour, longer than
 # the script), so the permission poller makes no store-wide `list` during the
@@ -45,20 +44,30 @@
 # its stop line never count. The `version` calls the bot server makes on its
 # own timer are left out of every window's call list.
 #
-# The working default (ruling S4, pending the orchestrator; the SRD names "a
-# health check's pane read"): a bot-server restart without teardown, a plain
-# `stop`, then `start`, provokes the tmux-touching call of the renamed-session
-# leg and of the re-bound socket leg; it also provokes leg 6's `resume` and the
-# first read of leg 7's edited row (the SRD names no trigger for either). For
-# a live `waiting` row that call is
+# Triggers. The SRD's "a health check's pane read" of the renamed session
+# (decision D4) is made with health ticks on: the harness ends A's stub's MCP
+# session from the client's side (`end_stub_mcp_session`), and the restart
+# path's reconnect of A's live `waiting` row (src/server.ts
+# _buildReconnectSessionAdapter) reads its pane (src/session-manager.ts
+# checkWaitingRowPane: one `read-pane` of FULL_PANE_READ_LINES), finds no
+# prompt (classifyWorkingPane) and types `/mcp reconnect …`. That restart is
+# scheduled by the server's session-disconnect handler, which sees the
+# client's stream end (src/server.ts _buildRestartDisconnectedPersona, after
+# `session_restart_delay`); a health tick skips a persona with a restart
+# pending (src/health-check.ts), so the read is the restart path's
+# waiting-row check, the same one a tick's `scheduleRestart` runs. A bot-server
+# restart without teardown, a plain `stop`, then `start` (ruling S4), is the
+# trigger of the other legs' calls: the re-bound socket leg's tmux-touching
+# call, leg 6's `resume` and the first read of leg 7's edited row (the SRD
+# names no trigger for these). For a live `waiting` row the restart's call is
 # the start pass's reconnect, a `send-keys` of `/mcp reconnect` (the stub's
 # MCP session ended with the old bot server), not a pane read: the restart
-# makes `get`, `spawn`, `get`, `send-keys` for the persona. So in leg 2 the
-# SRD's health-check pane read is stood in for by the restart's `send-keys`
-# reaching the renamed pane, fmk-driver.ts's pane read (the package's
-# readPersonaOwnPane) and the teardown's precheck `read-pane`, and the restart
-# path's waiting-row pane read is the one leg 4's retries make, with the
-# socket re-bound. A restart's bring-up of a live persona
+# makes `get`, `spawn`, `get`, `send-keys` for the persona. Leg 2 keeps that
+# restart's `send-keys` reaching the renamed pane, fmk-driver.ts's pane read
+# (the package's readPersonaOwnPane) and the teardown's precheck `read-pane`
+# as further evidence beside the health check's read; the restart path's
+# waiting-row pane read is also the one leg 4's retries make, with the socket
+# re-bound. A restart's bring-up of a live persona
 # makes one plain `spawn` first, which agent-director refuses with
 # ErrInstanceIdCollision, before its own-row decision; so a "no spawn" window
 # below allows that one spawn per persona and checks that it launched
@@ -79,15 +88,36 @@
 #   1. Start. The server's start pass launches both personas and both rows
 #      read `waiting` (harness `status` reads).
 #   2. Renamed session (SRJ-1428 bullet 2; SRJ-612; SRJ-901, SRJ-903,
-#      SRJ-904). The harness renames A's session (`rename_session`) and
-#      restarts the bot server without teardown. A bot-server-parented
+#      SRJ-904). The harness renames A's session (`rename_session`); ticks on
+#      for this leg: the confirmed edit (`apply_personas_config`, as leg 5
+#      makes it) sets `health_check_interval` TICK_S and
+#      `session_restart_delay` RESTART_DELAY_S, and the harness restarts the
+#      bot server without teardown. A bot-server-parented
 #      `send-keys` of A's instance id follows the rename and reaches the
 #      renamed session's pane: A's stub opens a new MCP session (a new child
 #      of its pane process); server.log holds no waiting-row GONE, reconnect
 #      GONE or escalate-dead line for A since the restart; no CSCB process
 #      made a `resume`, `kill` or `delete` of A, nor a `spawn` that launched
 #      (above);
-#      A's worker runs and its row reads `waiting`. fmk-driver.ts's
+#      A's worker runs and its row reads `waiting`. The health check's pane
+#      read: the harness ends A's stub's MCP session client
+#      (`end_stub_mcp_session` on A's pane; the stub runs on), and the restart
+#      the server schedules for the disconnected persona (above) reconnects
+#      it. Since then:
+#      exactly one CSCB `read-pane` of A, by the bot server, with `--n-lines`
+#      FULL_PANE_READ_LINES, after the client ended, followed by a
+#      bot-server `send-keys` of A (the reconnect), and A's stub opens a new
+#      MCP session; no CSCB `spawn`, `resume`, `kill` or `delete` of A; no
+#      waiting-row GONE, reconnect GONE or escalate-dead line for A in
+#      server.log; A's worker, pane process and launch token as before, its
+#      row reads `waiting` and the renamed session remains. B is untouched:
+#      no CSCB `read-pane`, `send-keys`, `spawn`, `resume`, `kill` or
+#      `delete` of B, the same MCP session client, worker and launch token,
+#      and its row reads `waiting`. Each call of A is printed with its time
+#      after the client ended, with A's server.log lines. Ticks off again:
+#      the confirmed edit sets `health_check_interval` 0 (and the default
+#      restart delay), which takes effect at the start after the teardown
+#      below. fmk-driver.ts's
 #      `read-pane-other-tmux-tmpdir` for A (as in leg 3) answers
 #      `outcome=<PANE_READ_PANE>`: a CSCB pane read returns the renamed
 #      session's pane. Then `stop --stop-bots` (`stop_server --stop-bots`, a
@@ -133,7 +163,7 @@
 #      retry's reconnect reached it), and both rows read `waiting` (harness
 #      `status` reads) with the same workers.
 #   5. Restarted tmux server (SRJ-1428 bullet 5; SRJ-303, SRJ-314; ruling S3,
-#      the Q12 Hatch gap). Ticks for this leg only: the harness's confirmed
+#      the Q12 Hatch gap). Ticks for this leg, as in leg 2: the harness's confirmed
 #      edit (`apply_personas_config`: config.json rewritten, its pending file
 #      renamed to config.json.apply once previewed, the apply logged) sets
 #      `health_check_interval` TICK_S and `session_restart_delay`
@@ -145,7 +175,7 @@
 #      Then the harness restarts the scenario's tmux server
 #      (`restart_tmux_server`: kill-server, then a new server with one
 #      session) and runs the find-missing loop (`run_find_missing_loop`,
-#      FM_INTERVAL_S; working default D2) until each row has been marked
+#      FM_INTERVAL_S; decision D2) until each row has been marked
 #      `missing` (it reads `missing`, the `ids` of a loop run started in this
 #      leg (its run.<n>.out, read with jq) hold its instance id, or it
 #      already records another launch), then stops it. Each row then reads `waiting`
@@ -184,7 +214,7 @@
 #      once, which the UNAVAILABLE answers post when
 #      the CONFLICT comes late (the session's age above makes it come at the
 #      retry after the stopping window, before the onset's floor, so none is
-#      expected). No kill sent (working default D3): no CSCB `kill` or
+#      expected). No kill sent (decision D3): no CSCB `kill` or
 #      `delete` of A, no tmux shim line, whatever its parent, matching
 #      TMUX_KILL_RE since the leg began (`tmux_kill_lines`; leg 2's teardown
 #      is its positive control), and the dead session still holds A's name; at
@@ -245,7 +275,7 @@
 #      static half (no `ad_owner` or `ad_pane` in src/) is
 #      tests/fmk-source-audit.test.ts.
 #
-# Working defaults, pending the orchestrator: D2, the harness's find-missing
+# Decisions: D2, the harness's find-missing
 # loop plays the host's find-missing cron for the unlatched rows of legs 5
 # and 6 (SRJ-1428 names find-missing, not CSCB, as what marks those rows; a
 # find-missing CSCB makes itself is allowed in leg 5); leg 7's row is latched
@@ -272,8 +302,10 @@
 #   - RECHECK_S, from LATCH_RECHECK_INTERVAL_MS (src/conflict-latch.ts,
 #     120000): each re-check of legs 6 and 7 is waited for up to RECHECK_S
 #     and RECHECK_ALLOWANCE_S.
-#   - TICK_S and RESTART_DELAY_S (10 s and 5 s) are leg 5's
-#     `health_check_interval` and `session_restart_delay`; Q12's control
+#   - TICK_S and RESTART_DELAY_S (10 s and 5 s) are legs 2 and 5's
+#     `health_check_interval` and `session_restart_delay`; leg 2 waits for
+#     A's new MCP session up to two tick intervals, the restart delay and
+#     REPORT_WAIT_S after the client ended; Q12's control
 #     holds two tick intervals and SETTLE_S more; FM_INTERVAL_S (10 s) the
 #     find-missing loop's interval in legs 5 to 7, and MARK_WAIT_S the bound
 #     on its marking a row;
@@ -328,6 +360,7 @@ ID_B="$(_scenario_printed "${STEP_VALUES}" personaInstanceId "${KEY_B}")"
 SESSION_A="$(_scenario_printed "${STEP_VALUES}" personaTmuxSessionName "${KEY_A}")"
 # src/pane-read.ts.
 PROBE_LINES="$(_scenario_printed "${STEP_VALUES}" PROBE_PANE_READ_LINES)"
+FULL_LINES="$(_scenario_printed "${STEP_VALUES}" FULL_PANE_READ_LINES)"
 READ_PANE="$(_scenario_printed "${STEP_VALUES}" PANE_READ_PANE)"
 # src/config.ts.
 POLL_INTERVAL_MS="$(_scenario_printed "${STEP_VALUES}" MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS)"
@@ -418,6 +451,8 @@ ROUND_CLEARED_B="$(_scenario_printed "${STEP_VALUES}" latchRecheckRoundLine "${P
 
 [[ "${PROBE_LINES}" =~ ^[1-9][0-9]*$ && "${POLL_INTERVAL_MS}" =~ ^[1-9][0-9]*$ ]] \
     || fail "${STEP_VALUES}: the probe's line count '${PROBE_LINES}' or the poll interval '${POLL_INTERVAL_MS}' is not a whole number"
+[[ "${FULL_LINES}" =~ ^[1-9][0-9]*$ && "${FULL_LINES}" != "${PROBE_LINES}" ]] \
+    || fail "${STEP_VALUES}: the full read's line count '${FULL_LINES}' is not a whole number other than the probe's ${PROBE_LINES}"
 [[ "${RETRY_THIRD_S}" =~ ^[1-9][0-9]*$ && "${RETRY_FOURTH_S}" =~ ^[1-9][0-9]*$ && "${RETRY_THIRD_S}" -lt "${RETRY_FOURTH_S}" ]] \
     || fail "${STEP_VALUES}: the third and fourth retries' due times '${RETRY_THIRD_S}' and '${RETRY_FOURTH_S}' are not rising whole numbers"
 [[ -n "${SPAWN_FAILURE_HEAD}" && "${SPAWN_FAILURE_HEAD}" != "${CAP_NOTICE}" ]] \
@@ -601,14 +636,16 @@ log_slice() {
 }
 
 # window_calls <step> <from-mark> <to-mark|-> <id>: set WIN_VERBS, WIN_ARGS
-# (the arguments joined by single spaces) and WIN_PPIDS to each CSCB-parented
-# agent-director call in the shim log's window that names
-# `--claude-instance-id <id>`, in log order.
+# (the arguments joined by single spaces), WIN_PPIDS and WIN_US (the line's
+# time, in microseconds since the epoch) to each CSCB-parented agent-director
+# call in the shim log's window that names `--claude-instance-id <id>`, in
+# log order.
 window_calls() {
     local step="$1" out line a
     WIN_VERBS=()
     WIN_ARGS=()
     WIN_PPIDS=()
+    WIN_US=()
     out="$(cscb_ad_calls_between "$2" "$3" "" "--claude-instance-id $4")" || exit 1
     [[ -n "${out}" ]] || return 0
     while IFS= read -r line; do
@@ -620,7 +657,20 @@ window_calls() {
         printf -v a '%s ' ${_L_ARGS[@]+"${_L_ARGS[@]}"}
         WIN_ARGS+=("${a% }")
         WIN_PPIDS+=("${_L_PPID}")
+        WIN_US+=("${_L_US}")
     done <<< "${out}"
+}
+
+# echo_window_timed <step> <from-us>: print each call of the last
+# window_calls on one line, with its time in seconds after <from-us>
+# (microseconds since the epoch), its parent and its arguments.
+echo_window_timed() {
+    local i d
+    for i in "${!WIN_VERBS[@]}"; do
+        d=$(( WIN_US[i] - $2 ))
+        printf '%s: %s: +%d.%03ds %s (parent %s) %s\n' "${TEST_NAME}" "$1" $(( d / 1000000 )) $(( (d % 1000000) / 1000 )) \
+            "${WIN_VERBS[i]}" "${WIN_PPIDS[i]}" "${WIN_ARGS[i]:0:200}"
+    done
 }
 
 # window_has <verb> <ppid> [<fragment>]: true when the last window_calls holds
@@ -1036,8 +1086,8 @@ mkdir -p "${SCENARIO_ROOT}/claude-config-a" "${SCENARIO_ROOT}/claude-config-b" \
     || fail "${STEP}: could not create the personas' config dirs"
 WORK_A="$(make_workdir alpha)"
 WORK_B="$(make_workdir beta)"
-stub_mode "${WORK_A}" "${STUB_MODE_AT_ONCE}"
-stub_mode "${WORK_B}" "${STUB_MODE_AT_ONCE}"
+stub_mode "${WORK_A}" "${STUB_MODE_DEV_CHANNELS}"
+stub_mode "${WORK_B}" "${STUB_MODE_DEV_CHANNELS}"
 # The other TMUX_TMPDIR of the driver's pane reads: empty, under SCENARIO_ROOT.
 EMPTY_TMPDIR="${SCENARIO_ROOT}/tmux-empty"
 mkdir -m 700 "${EMPTY_TMPDIR}" || fail "${STEP}: could not create ${EMPTY_TMPDIR}"
@@ -1063,8 +1113,8 @@ for id in "${ID_A}" "${ID_B}"; do
 done
 
 # ---------------------------------------------------------------------------
-# Leg 2: a renamed session; the restart's reconnect, a pane read and the
-# teardown's kill
+# Leg 2: a renamed session; the restart's reconnect, the health check's pane
+# read (ticks on for this leg), a driver's pane read and the teardown's kill
 # ---------------------------------------------------------------------------
 
 STEP="leg 2 (renamed session)"
@@ -1072,6 +1122,10 @@ RENAMED_A="${SCENARIO_TAG}_renamed_alpha"
 SID_A="$(rename_session "${SESSION_A}" "${RENAMED_A}")"
 no_session "${SESSION_A}" || fail "${STEP}: a session named ${SESSION_A} still exists after the rename"
 echo "${TEST_NAME}: ${STEP}: session ${SID_A} renamed ${SESSION_A} -> ${RENAMED_A}"
+
+# Ticks on for this leg (decision D4: the health check's pane read): the
+# confirmed edit, as leg 5 makes it, which takes effect at the restart below.
+apply_personas_config "${STEP}: ticks on" "${TICK_S}" "${RESTART_DELAY_S}"
 
 # The bot server restarted without teardown (ruling S4's working default).
 MARK_R="$(ad_shim_mark)"
@@ -1105,8 +1159,87 @@ done
 expect_nothing_launched "${STEP}" "${MARK_R}" "${ID_A}"
 expect_status "${STEP}" "${ID_A}" waiting
 
+# The health check's pane read of the renamed session (SRJ-1428 bullet 2,
+# decision D4): A's stub's MCP session ends from the client's side
+# (`end_stub_mcp_session`); the server schedules a restart for the
+# disconnected persona, and the restart path's reconnect of A's live
+# `waiting` row reads its pane (src/session-manager.ts checkWaitingRowPane:
+# one `read-pane` of FULL_PANE_READ_LINES), finds no prompt and types
+# `/mcp reconnect …`, which reaches the renamed session's pane.
+STEP="leg 2 (health check's pane read)"
+expect_same_launch "${STEP}" "${ID_B}"
+for id in "${ID_A}" "${ID_B}"; do
+    MCP_PID[${id}]="$(mcp_session_pid "${id}")"
+    [[ -n "${MCP_PID[${id}]}" ]] || fail "${STEP}: ${id}'s stub runs no MCP session client"
+done
+row="$(row_json "${STEP}" "${ID_A}")"
+pane_a="$(jq -r '.pane_id // empty' <<< "${row}")"
+[[ "${pane_a}" =~ ^%[0-9]+$ ]] || fail "${STEP}: row ${ID_A} records pane '${pane_a}', not a pane id"
+[[ "$("${SCENARIO_REAL_TMUX}" display-message -p -t "${pane_a}" '#{session_name}')" == "${RENAMED_A}" ]] \
+    || fail "${STEP}: A's pane ${pane_a} is not in the renamed session ${RENAMED_A}"
+FROM_US="${EPOCHREALTIME//[!0-9]/}"
+MARK_H="$(ad_shim_mark)"
+LOG_H="$(wc -l < "${SLACK_STATE_DIR}/server.log")"
+ended="$(end_stub_mcp_session "${pane_a}")" || exit 1
+ENDED_US="${EPOCHREALTIME//[!0-9]/}"
+echo "${TEST_NAME}: ${STEP}: ended (pane, stub, client): ${ended}"
+wait_until $(( 2 * TICK_S + RESTART_DELAY_S + REPORT_WAIT_S )) \
+    "${STEP}: A's stub opened no new MCP session after its session ended" new_mcp_session "${ID_A}"
+sleep "${SETTLE_S}"
+window_calls "${STEP}" "${MARK_H}" - "${ID_A}"
+echo "${TEST_NAME}: ${STEP}: the client ended at +$(( (ENDED_US - FROM_US) / 1000 ))ms; CSCB calls of ${ID_A} since:"
+echo_window_timed "${STEP}" "${FROM_US}"
+SLICE="$(log_slice "${LOG_H}")"
+echo_log_lines "${STEP}" "${SLICE}" "${KEY_A}"
+read_at=-1
+n=0
+for i in "${!WIN_VERBS[@]}"; do
+    if [[ "${WIN_VERBS[i]}" == read-pane ]]; then
+        n=$(( n + 1 ))
+        read_at="${i}"
+    fi
+done
+(( n == 1 )) || fail "${STEP}: CSCB processes made ${n} read-pane call(s) of ${ID_A} after its MCP session ended, not 1"
+[[ "${WIN_PPIDS[read_at]}" == "${SERVER_PID}" ]] \
+    || fail "${STEP}: the read-pane of ${ID_A} has parent ${WIN_PPIDS[read_at]}, not the bot server ${SERVER_PID}"
+[[ " ${WIN_ARGS[read_at]} " == *" --n-lines ${FULL_LINES} "* ]] \
+    || fail "${STEP}: the read-pane of ${ID_A} does not read ${FULL_LINES} lines: ${WIN_ARGS[read_at]}"
+(( WIN_US[read_at] > ENDED_US )) || fail "${STEP}: the read-pane of ${ID_A} came before its MCP session ended"
+reconnect=0
+for (( i = read_at + 1; i < ${#WIN_VERBS[@]}; i++ )); do
+    [[ "${WIN_VERBS[i]}" == send-keys && "${WIN_PPIDS[i]}" == "${SERVER_PID}" ]] && reconnect=1
+done
+(( reconnect )) || fail "${STEP}: no bot-server send-keys of ${ID_A} followed its pane read (its calls: ${WIN_VERBS[*]-none})"
+for verb in spawn resume kill delete; do
+    n="$(window_count "${verb}")"
+    [[ "${n}" == 0 ]] || fail "${STEP}: a CSCB process made ${n} ${verb} call(s) of ${ID_A} after its MCP session ended"
+done
+for m in "${WAITING_GONE_HEAD_A}" "${ESCALATE_HEAD_A}" "${RECONNECT_GONE_A}"; do
+    n="$(count_in "${SLICE}" "${m}")"
+    [[ "${n}" == 0 ]] || fail "${STEP}: server.log holds ${n} line(s) '$(matcher_text "${m}")' since A's MCP session ended"
+done
+expect_same_launch "${STEP}" "${ID_A}"
+expect_status "${STEP}" "${ID_A}" waiting
+has_session "${RENAMED_A}" || fail "${STEP}: the renamed session ${RENAMED_A} is gone"
+# B is untouched: no call beyond a tick's read, the same MCP session and worker.
+window_calls "${STEP}" "${MARK_H}" - "${ID_B}"
+echo "${TEST_NAME}: ${STEP}: CSCB calls of ${ID_B} since A's MCP session ended: ${WIN_VERBS[*]-none}"
+for verb in read-pane send-keys spawn resume kill delete; do
+    n="$(window_count "${verb}")"
+    [[ "${n}" == 0 ]] || fail "${STEP}: a CSCB process made ${n} ${verb} call(s) of ${ID_B}"
+done
+[[ "$(mcp_session_pid "${ID_B}")" == "${MCP_PID[${ID_B}]}" ]] \
+    || fail "${STEP}: B's MCP session client changed from ${MCP_PID[${ID_B}]} to '$(mcp_session_pid "${ID_B}")'"
+expect_same_launch "${STEP}" "${ID_B}"
+row_reads "${ID_B}" waiting || fail "${STEP}: row ${ID_B} no longer reads waiting"
+
+# Ticks off again, as leg 5 leaves them: the confirmed edit, which takes
+# effect at the start after the teardown below.
+apply_personas_config "${STEP}: ticks off" 0
+
 # A CSCB pane read of the renamed session (the package's readPersonaOwnPane,
 # through fmk-driver.ts) returns A's pane.
+STEP="leg 2 (driver's pane read)"
 mark="$(ad_shim_mark)"
 run_driver "${STEP}" "${PERSONA_A}" "${CHANNEL_A}" "${WORK_A}" "${EMPTY_TMPDIR}"
 [[ "${DRIVER_LINE}" == *" restored=true outcome=${READ_PANE} "* ]] \
@@ -1259,7 +1392,7 @@ done
 # ---------------------------------------------------------------------------
 # Leg 5: a restarted tmux server; both rows marked missing, both personas
 # brought up by the restart path's decision with nothing counted (health
-# ticks in this leg only)
+# ticks on for this leg)
 # ---------------------------------------------------------------------------
 
 STEP="leg 5 (ticks on)"

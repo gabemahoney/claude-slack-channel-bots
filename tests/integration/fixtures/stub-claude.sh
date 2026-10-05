@@ -65,6 +65,15 @@
 #     tmux pane stay alive. Further lines are ignored, apart from the sentinel
 #     and `/mcp reconnect`, alone or with a server's name (see THE MCP
 #     SESSION).
+#   - Answering a dialog (`dev-channels`, `unrecognised-dialog`, and
+#     `folder-trust` when it printed its prompt): the line that answers it
+#     first clears the screen and the scrollback (`ESC[H ESC[2J ESC[3J`), as
+#     Claude Code redraws its screen once a dialog is answered, and then the
+#     stub reports in. So a pane read after the answer (CSCB's waiting-row
+#     check reads `FULL_PANE_READ_LINES` lines, scrollback included) finds the
+#     live-session banner and no dialog text, which it would read as a
+#     prompt. Output before the answer, and a dialog left unanswered (stdin
+#     closed, or the sentinel), is unchanged.
 #   - The sentinel line `__CSCB_TEST_EXIT__` fires every SessionEnd hook the
 #     `--settings` JSON registers and exits 0 (in `silent`, it fires none). In
 #     a dialog mode it does so before the dialog is answered too.
@@ -414,6 +423,14 @@ folder_trusted() {
     ' "${file}" > /dev/null 2>&1
 }
 
+# A dialog answered: clear the screen (cursor home, erase the screen) and the
+# scrollback (erase saved lines, which tmux fills with the erased screen),
+# as Claude Code redraws its screen once a dialog is answered, so no pane
+# read after the answer finds the dialog's text.
+clear_answered_dialog() {
+    printf '\033[H\033[2J\033[3J'
+}
+
 # ---------------------------------------------------------------------------
 # Clock
 # ---------------------------------------------------------------------------
@@ -635,6 +652,7 @@ handle_line() {
         exit 0
     fi
     if (( AWAITING_ENTER )); then
+        clear_answered_dialog
         report_in
     elif (( REPORTED )) && [[ "${line}" == '/mcp reconnect' ]]; then
         open_mcp_session

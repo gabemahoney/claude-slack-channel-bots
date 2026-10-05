@@ -726,6 +726,21 @@
 #                                      still reads live until a `find-missing` marks it, and with
 #                                      remain-on-exit on the pane and its session remain. Prints
 #                                      `<pane id> <ended pid>`
+#   end_stub_mcp_session <pane-id>     (harness addition, confirm at the reconcile pass) a stub
+#                                      worker's MCP session ended from the client's side: both
+#                                      guards first, then, from the scenario's own shell with the
+#                                      real tmux (it refuses when TMUX_TMPDIR is not the scenario's
+#                                      or TMUX is set), it reads the pane's main process
+#                                      (#{pane_pid}), refuses unless that process is the scenario's
+#                                      stub ($SCENARIO_BIN/claude), finds the stub's one child
+#                                      running the scenario's copy of the MCP session client
+#                                      ($SCENARIO_BIN/stub-mcp-session.ts, `pgrep -P`) and sends
+#                                      that child SIGTERM; the stub itself is never signalled.
+#                                      Fails unless the pane is a live pane (%N), the stub runs
+#                                      exactly one such client, the client is gone within 10 s and
+#                                      the stub still runs. The bot server sees the session close;
+#                                      agent-director's row is not touched. Prints `<pane id> <stub
+#                                      pid> <ended client pid>`
 #
 # Line builders (every fragment is quoted from src/; <ref> is `persona_ref`):
 #   persona_start_match   `[slack] persona-start: personas[<index>] <ref>`
@@ -4044,6 +4059,41 @@ end_worker_without_session_end() {
     _scenario_poll_until "${SCENARIO_WORKER_END_S}" _scenario_pid_gone "${pid}" \
         || fail "${step}: pane ${pane}'s process ${pid} still runs ${SCENARIO_WORKER_END_S} s after SIGKILL"
     printf '%s %s\n' "${pane}" "${pid}"
+}
+
+# Bound on a stub's MCP session client ending after end_stub_mcp_session's
+# SIGTERM, in seconds.
+SCENARIO_MCP_CLIENT_END_S=10
+
+end_stub_mcp_session() {
+    local pane="${1:-}" step out stub_pid dead clients=() client
+    step="end_stub_mcp_session ${pane}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    [[ "${pane}" =~ ^%[0-9]+$ ]] || fail "${step}: '${pane}' is not a pane id (%N)"
+    out="$(_scenario_tmux display-message -p -t "${pane}" '#{pane_pid} #{pane_dead}')" \
+        || fail "${step}: no pane ${pane} on the scenario's tmux server: $(_scenario_tmux_err)"
+    read -r stub_pid dead <<< "${out}"
+    if [[ ! "${stub_pid}" =~ ^[0-9]+$ || "${dead}" != 0 ]] || ! pid_alive "${stub_pid}"; then
+        fail "${step}: pane ${pane} reads pid '${stub_pid}', dead '${dead}': no live process runs in it"
+    fi
+    grep -qzxF -- "${SCENARIO_BIN}/claude" "/proc/${stub_pid}/cmdline" 2> /dev/null \
+        || fail "${step}: refused: pane ${pane}'s process ${stub_pid} is not the scenario's stub ${SCENARIO_BIN}/claude"
+    # The stub's MCP session client (stub-claude.sh open_mcp_session): a child
+    # of the stub, run with bun on the copy beside the stub.
+    mapfile -t clients < <(pgrep -P "${stub_pid}" -f -- 'stub-mcp-session\.ts' || true)
+    (( ${#clients[@]} == 1 )) \
+        || fail "${step}: the stub ${stub_pid} runs ${#clients[@]} MCP session client(s) (${clients[*]-none}), not one"
+    client="${clients[0]}"
+    grep -qzxF -- "${SCENARIO_BIN}/stub-mcp-session.ts" "/proc/${client}/cmdline" 2> /dev/null \
+        || fail "${step}: refused: the stub's child ${client} does not run the scenario's client ${SCENARIO_BIN}/stub-mcp-session.ts"
+    pid_alive "${client}" || fail "${step}: the stub's MCP session client ${client} no longer runs"
+    kill -TERM "${client}" 2> /dev/null || fail "${step}: could not signal the stub's MCP session client ${client}"
+    _scenario_poll_until "${SCENARIO_MCP_CLIENT_END_S}" _scenario_pid_gone "${client}" \
+        || fail "${step}: the stub's MCP session client ${client} still runs ${SCENARIO_MCP_CLIENT_END_S} s after SIGTERM"
+    pid_alive "${stub_pid}" || fail "${step}: the stub ${stub_pid} no longer runs after its MCP session client ended"
+    printf '%s %s %s\n' "${pane}" "${stub_pid}" "${client}"
 }
 
 # ---------------------------------------------------------------------------
