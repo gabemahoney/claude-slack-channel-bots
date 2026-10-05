@@ -91,7 +91,6 @@ import {
   killOutcomeOf,
   type KillOutcome,
 } from '../src/checked-kill.ts'
-import type { Phase1SpawnParams } from '../src/ad-phase1-types.ts'
 import { createPersonaRelaunchGate } from '../src/persona-start.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import { createPersonaSerializer, type PersonaSerialize } from '../src/persona-serializer.ts'
@@ -225,11 +224,13 @@ import {
   stubCallCount,
   type SpawnHold,
   type StubCallLog,
+  type StubDeleteParams,
   type StubResolveSystemBinaryOutcome,
+  type StubSpawnResult,
   type UnavailableForm,
 } from './test-helpers/agent-director-stub.ts'
 import type { Client } from 'agent-director'
-import type { DeleteParams, FindMissingParams, KillParams, ReadPaneParams, ResumeParams, SendKeysParams, SpawnParams, SpawnResult, StatusParams } from 'agent-director'
+import type { FindMissingParams, KillParams, ReadPaneParams, ResumeParams, SendKeysParams, SpawnParams, SpawnResult, StatusParams } from 'agent-director'
 import { configDirLabelValue, personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
@@ -1874,7 +1875,7 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
   let statusCalls: StatusParams[]
   let sendKeysCalls: SendKeysParams[]
   let killCalls: KillParams[]
-  let deleteCalls: DeleteParams[]
+  let deleteCalls: StubDeleteParams[]
   let spawnCalls: SpawnParams[]
   let findMissingCalls: FindMissingParams[]
   let errLines: string[]
@@ -4408,16 +4409,16 @@ describe('restart: the reply-guard record holds the effective value before the r
     installRecordingReplyGuard(() => applied.personas, rg.stateDir, events)
     // The row the first relaunch leaves behind, labelled for the old directory.
     const oldRow = cannedGetResult({ state: 'ended' }, a, dir)
-    const deleteCalls: DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     const stub = makeStubClient({
       statusFn: () => ({ state: 'waiting' }),
       spawnCalls,
       resumeCalls,
       deleteCalls,
       spawnQueue: [
-        cannedOk<SpawnResult>({ claude_instance_id: personaInstanceId(a.key) }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: personaInstanceId(a.key) }),
         cannedErr<SpawnResult>(errInstanceIdCollision()),
-        cannedOk<SpawnResult>({ claude_instance_id: personaInstanceId(a.key) }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: personaInstanceId(a.key) }),
       ],
       getResult: oldRow,
     })
@@ -4453,7 +4454,7 @@ describe('restart: the reply-guard record holds the effective value before the r
     // b.jg5 SRJ-707, SRJ-1504: the finished old-label row is replaced by a reuse spawn of the same id; nothing is deleted.
     expect(deleteCalls).toEqual([])
     expect(spawnCalls).toHaveLength(3)
-    expect((spawnCalls as Phase1SpawnParams[]).map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+    expect(spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
       [personaInstanceId(a.key), undefined],
       [personaInstanceId(a.key), undefined],
       [personaInstanceId(a.key), true],

@@ -46,7 +46,8 @@ import {
   AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNCLASSIFIED,
 } from '../src/ad-error-class.ts'
-import type { Phase1KillResult, Phase1StatusResult } from '../src/ad-phase1-types.ts'
+import type { StatusResult } from 'agent-director'
+import type { StubKillResult } from './test-helpers/agent-director-stub.ts'
 import { ERR_SPAWN_NOT_FOUND_NAME } from '../src/agent-director-errors.ts'
 import {
   KILL_OUTCOME_KILLED,
@@ -166,12 +167,12 @@ const SEED_WAITING = killRetrySeedOfState('waiting')
 const SEED_PENDING = killRetrySeedOfState('pending')
 
 /** One read between tries: a stub `status` answer, or what a caller's own read answers (latched, no row). */
-type ReadStep = CannedResponse<Phase1StatusResult> | KillRetryRead
+type ReadStep = CannedResponse<StatusResult> | KillRetryRead
 
 /** One bounded retry, scripted. */
 interface RunSpec {
   /** The kill's answers, one per try, through the stub's kill queue. */
-  readonly kills: CannedResponse<Phase1KillResult>[]
+  readonly kills: CannedResponse<StubKillResult>[]
   /** The reads' answers, one per read; once they run out the stub reads the row `waiting`. */
   readonly reads?: ReadStep[]
   /** The state the path last read; a row read `waiting` by default. */
@@ -211,7 +212,7 @@ afterEach(() => {
 })
 
 /** A stub canned response is `resolve` or `reject`; a caller's read carries one of the read kinds. */
-function isCanned(step: ReadStep): step is CannedResponse<Phase1StatusResult> {
+function isCanned(step: ReadStep): step is CannedResponse<StatusResult> {
   return step.kind === 'resolve' || step.kind === 'reject'
 }
 
@@ -241,7 +242,7 @@ async function run(spec: RunSpec): Promise<Run> {
   const calls: string[] = []
   const killTimes: number[] = []
   const lines: string[] = []
-  const statusQueue: CannedResponse<Phase1StatusResult>[] = []
+  const statusQueue: CannedResponse<StatusResult>[] = []
   const client = makeStubClient({ killQueue: [...spec.kills], statusQueue })
   const reads = [...(spec.reads ?? [])]
   const work = runKillRetry<AnyKillOutcome>({
@@ -291,8 +292,8 @@ async function run(spec: RunSpec): Promise<Run> {
 }
 
 /** `n` copies of the kill answer rejecting with `make()`'s value (a fresh value each). */
-function failing(n: number, make: () => Error): CannedResponse<Phase1KillResult>[] {
-  return Array.from({ length: n }, () => cannedErr<Phase1KillResult>(make()))
+function failing(n: number, make: () => Error): CannedResponse<StubKillResult>[] {
+  return Array.from({ length: n }, () => cannedErr<StubKillResult>(make()))
 }
 
 /** The not-killed outcome a kill answering `err` gives. */
@@ -312,7 +313,7 @@ const plainKillFailed = (): Error => errTmuxKillFailed(undefined, 'outlived-exit
 const descriptionOf = (err: Error): string => (err as Error & { errDescription: string }).errDescription
 
 /** A read of the row in `state`, through the stub. */
-const readState = (state: string): CannedResponse<Phase1StatusResult> => cannedOk(cannedStatusResult({ state }))
+const readState = (state: string): CannedResponse<StatusResult> => cannedOk(cannedStatusResult({ state }))
 
 /** What the retry is handed for `step`, as `run`'s read hands it over: the row's state, the failure, or the caller's own answer. */
 function readOf(step: ReadStep): KillRetryRead {
@@ -346,7 +347,7 @@ describe('runKillRetry: the schedule (b.jg5 SRJ-702, AC 56)', () => {
   test.each(RETRIED_FORMS)('%s at every try: exactly the exported try count, spaced by the exported spacing, with one read before each further try; the last outcome stands, exhausted', async (_label, make) => {
     const errors = Array.from({ length: KILL_RETRY_TRIES }, () => make('kill'))
 
-    const r = await run({ kills: errors.map((e) => cannedErr<Phase1KillResult>(e)) })
+    const r = await run({ kills: errors.map((e) => cannedErr<StubKillResult>(e)) })
 
     expect(r.result.tries).toBe(KILL_RETRY_TRIES)
     expect(r.result.reads).toBe(KILL_RETRY_TRIES - 1)
@@ -520,7 +521,7 @@ describe('runKillRetry: one status read before each further try (b.jg5 SRJ-702, 
 
   test('a CONFIG read on a row last read pending ends the tries with no further kill; the last try\'s outcome stands; its read line says so, then the end line', async () => {
     const last = errTmuxUnresponsive('kill')
-    const config = cannedErr<Phase1StatusResult>(errConfigMalformed())
+    const config = cannedErr<StatusResult>(errConfigMalformed())
 
     const r = await run({ kills: [cannedErr(last), ...failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill'))], reads: [config], lastRead: SEED_PENDING })
 
@@ -534,7 +535,7 @@ describe('runKillRetry: one status read before each further try (b.jg5 SRJ-702, 
     ['absent (the server\'s rule)', undefined],
     ['false', false],
   ])('a CONFIG read on a row last read waiting, configReadEndsTries %s, lets the next try go ahead; the result keeps no read; the read line says the try goes ahead', async (_label, configReadEndsTries) => {
-    const config = cannedErr<Phase1StatusResult>(errConfigMalformed('starting_session_seconds', sentinelInMessage('read-config')))
+    const config = cannedErr<StatusResult>(errConfigMalformed('starting_session_seconds', sentinelInMessage('read-config')))
     const r = await run({
       kills: failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill')),
       reads: [config, config],
@@ -554,7 +555,7 @@ describe('runKillRetry: one status read before each further try (b.jg5 SRJ-702, 
     ['seeded waiting, read pending, then CONFIG: the tries end', SEED_WAITING, 'pending', ['kill', 'status', 'kill', 'status'], KILL_RETRY_END_READ_CONFIG],
     ['seeded pending, read waiting, then CONFIG: the try goes ahead', SEED_PENDING, 'waiting', ['kill', 'status', 'kill', 'status', 'kill'], KILL_RETRY_END_EXHAUSTED],
   ])('%s', async (_label, lastRead, readBetween, calls, end) => {
-    const [between, config] = [readState(readBetween), cannedErr<Phase1StatusResult>(errConfigMalformed())]
+    const [between, config] = [readState(readBetween), cannedErr<StatusResult>(errConfigMalformed())]
     const r = await run({ kills: failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill')), reads: [between, config], lastRead })
 
     expect(r.calls).toEqual(calls)
@@ -734,7 +735,7 @@ describe('runKillRetry: the survivor rule and the alert decision (b.jg5 SRJ-702,
     expect(r.result).toEqual({ outcome: rowFinished(KILL_ROW_FINISHED_ENDED), end: KILL_RETRY_END_ROW_FINISHED, tries: 1, reads: 1, alert: alert(descriptionOf(err)) })
   })
 
-  const LATER_SUCCESSES: ReadonlyArray<readonly [string, CannedResponse<Phase1KillResult>, KillOutcome]> = [
+  const LATER_SUCCESSES: ReadonlyArray<readonly [string, CannedResponse<StubKillResult>, KillOutcome]> = [
     ['succeeding with kill_sent false', cannedOk(cannedKillResult(false)), { kind: KILL_OUTCOME_KILLED, killSent: false }],
     ['succeeding with kill_sent true', cannedOk(cannedKillResult(true)), { kind: KILL_OUTCOME_KILLED, killSent: true }],
   ]
@@ -745,7 +746,7 @@ describe('runKillRetry: the survivor rule and the alert decision (b.jg5 SRJ-702,
 
   test.each([
     ...LATER_SUCCESSES.flatMap(([what, kill, outcome]) => READS_BEFORE.map(([before, read]) => [`${what}, after ${before}`, kill, read, outcome] as const)),
-    ['answering ErrSpawnNotFound, after a read that found the row live', cannedErr<Phase1KillResult>(errSpawnNotFound()), readState('waiting'), { kind: KILL_OUTCOME_ROW_GONE } as KillOutcome] as const,
+    ['answering ErrSpawnNotFound, after a read that found the row live', cannedErr<StubKillResult>(errSpawnNotFound()), readState('waiting'), { kind: KILL_OUTCOME_ROW_GONE } as KillOutcome] as const,
   ])('a survivor-naming first try, then a second try %s: that success stands, the decision is the survivor version quoting the survivor-naming description, and both tries are logged', async (_label, second, read, outcome) => {
     const { err, survivor } = survivorFirst()
 
@@ -887,7 +888,7 @@ describe('runKillRetry: the survivor rule and the alert decision (b.jg5 SRJ-702,
     expect(r.result.alert).toEqual({ kind: KILL_RETRY_ALERT_NONE })
   })
 
-  test.each<[string, CannedResponse<Phase1KillResult>[]]>([
+  test.each<[string, CannedResponse<StubKillResult>[]]>([
     ['at the first try', [cannedOk(cannedKillResult(false))]],
     ['after an ErrTmuxKillFailed naming no survivor', [cannedErr(plainKillFailed()), cannedOk(cannedKillResult(false))]],
   ])('b.jg5 SRJ-703: a success with kill_sent false %s and no survivor-naming failure gives no alert decision', async (_label, kills) => {
@@ -1070,7 +1071,7 @@ describe('runKillRetry: an old-life wait\'s hold that ends while the tries run e
     expect([result.outcome, result.end, result.tries]).toEqual([HOLD_ENDED_SUCCESS, KILL_RETRY_END_HOLD_ENDED, 1])
   })
 
-  test.each<[string, CannedResponse<Phase1KillResult>[], KillOutcome['kind'], KillRetryResult['end']]>([
+  test.each<[string, CannedResponse<StubKillResult>[], KillOutcome['kind'], KillRetryResult['end']]>([
     ['a CONFLICT (no UNAVAILABLE outcome to stand)', [cannedErr(errTmuxSessionConflict('kill', 'not-this-launch'))], KILL_OUTCOME_NOT_KILLED, KILL_RETRY_END_SETTLED],
     ['a success', [cannedOk(cannedKillResult(true))], KILL_OUTCOME_KILLED, KILL_RETRY_END_SETTLED],
   ])('a hold already ended when the first try answers %s: that outcome stands, the query never asked', async (_label, kills, kind, end) => {
@@ -1188,7 +1189,7 @@ describe('runKillRetry: each try and each read is logged, redacted (b.jg5 SRJ-70
   // builder's: the try number, the outcome (`describeKillOutcome`, its
   // kill_sent and its redacted description) and what follows. A fake token
   // rides in every description that has a slot for one.
-  test.each<[string, CannedResponse<Phase1KillResult>, KillRetrySeed, string | undefined, number, KillRetryTryNext]>([
+  test.each<[string, CannedResponse<StubKillResult>, KillRetrySeed, string | undefined, number, KillRetryTryNext]>([
     ['a success with kill_sent true', cannedOk(cannedKillResult(true)), SEED_WAITING, undefined, KILL_RETRY_TRIES, KILL_RETRY_NEXT_SUCCESS],
     ['a success with kill_sent false', cannedOk(cannedKillResult(false)), SEED_WAITING, undefined, KILL_RETRY_TRIES, KILL_RETRY_NEXT_SUCCESS],
     ['a success with no kill_sent', cannedOk(cannedKillResult()), SEED_WAITING, undefined, KILL_RETRY_TRIES, KILL_RETRY_NEXT_SUCCESS],

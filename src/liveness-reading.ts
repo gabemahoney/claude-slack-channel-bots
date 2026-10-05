@@ -35,14 +35,14 @@
  * re-exported by `src/session-manager.ts`, so the restart and health-check
  * modules can import the readings without loading the session manager.
  *
- * Pure: no I/O, clock, module state or log line. The `status` result's
- * launch start field is typed through CSCB's own Phase 1 declarations
- * (`src/ad-phase1-types.ts`, a type-only import), never through the client.
+ * Pure: no I/O, clock, module state or log line. The `status` result,
+ * launch start field included, is typed by the client's own `StatusResult`
+ * (a type-only import).
  *
  * SPDX-License-Identifier: MIT
  */
 
-import type { Phase1StatusResult } from './ad-phase1-types.ts'
+import type { StatusResult } from 'agent-director'
 
 // ---------------------------------------------------------------------------
 // Row states (agent-director's spawn state machine, SR-11)
@@ -272,7 +272,7 @@ export function deadLivenessReading(rowRead?: DeadRowRead): DeadLivenessReading 
  * string, or a row in any other state, whose field is ignored). No parsing or
  * ageing. Never throws.
  */
-export function pendingLaunchStartOf(result: Phase1StatusResult | null | undefined): string | undefined {
+export function pendingLaunchStartOf(result: StatusResult | null | undefined): string | undefined {
   try {
     if (result === null || result === undefined) return undefined
     if (result.state !== AGENT_DIRECTOR_PENDING_STATE) return undefined
@@ -297,7 +297,7 @@ export function pendingLivenessReading(launchStartedAt?: string): PendingLivenes
  * with a `pending` reading carrying the row's launch start
  * (`pendingLaunchStartOf`). Never throws.
  */
-export function livenessReadingForStatus(result: Phase1StatusResult | null | undefined): LivenessReading {
+export function livenessReadingForStatus(result: StatusResult | null | undefined): LivenessReading {
   let state: unknown
   try {
     state = result?.state

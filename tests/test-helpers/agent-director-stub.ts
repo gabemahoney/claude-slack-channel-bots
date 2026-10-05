@@ -41,10 +41,9 @@
  * `resetStubSpawnPath` leaves no approver running.
  *
  * A recorded `spawn` may be a reuse spawn (b.jg5 SRJ-112, SRJ-708): the
- * stub records its parameters with the CSCB-side reuse flag
- * (`Phase1SpawnParams.reuse_finished`, declared in `src/ad-phase1-types.ts`),
- * so a test reads the flag from `spawnCalls` with no cast, and answers it like
- * any spawn, from the same queue and knobs.
+ * stub records its parameters as the client's own `SpawnParams`, reuse flag
+ * (`reuse_finished`) included, so a test reads the flag from `spawnCalls`
+ * with no cast, and answers it like any spawn, from the same queue and knobs.
  *
  * Per-call answers: `statusFn`, `getFn`, `spawnFn`, `resumeFn`,
  * `findMissingFn`, `readPaneFn`, `sendKeysFn` and `killFn` compute a verb's
@@ -69,7 +68,7 @@
  * failure with an error, and release of every held call for cleanup.
  *
  * Phase 1 errors and results (b.jg5 SRJ-1303):
- *   - Every error builder uses the installed client's own class, except:
+ *   - Every error builder uses the client's own class, except:
  *       - `errGeneric`, which builds the base `AgentDirectorError` for any
  *         `errName` (a base error named like a class is not that class:
  *         the classifier answers UNCLASSIFIED for it);
@@ -79,14 +78,10 @@
  *         under test recognises both by `errName`.
  *     The three families for the errors only the Phase 1 client declares
  *     (`errTmuxUnresponsive*`, `errTmuxKillFailed`, `errTmuxSessionConflict`)
- *     build with `new` on the bindings `ErrTmuxUnresponsive`,
- *     `ErrTmuxKillFailed` and `ErrTmuxSessionConflict` of
- *     `src/agent-director-errors.ts`: the installed client's own classes when
- *     it declares them, else CSCB's stand-ins (the host's 0.10.0 client).
- *     No file names those three in a named import, re-export or
- *     destructuring of `agent-director` (b.jg5 SRJ-101); this helper reads
- *     them only through `src/agent-director-errors.ts`. Each value carries
- *     its verb, its name as `errName` and its description.
+ *     build with `new` on `ErrTmuxUnresponsive`, `ErrTmuxKillFailed` and
+ *     `ErrTmuxSessionConflict`, the client's own classes as
+ *     `src/agent-director-errors.ts` re-exports them. Each value carries its
+ *     verb, its name as `errName` and its description.
  *   - `ErrInternal`, `ErrConfigMalformed` and the three store-open names
  *     (`ErrSchemaMismatch`, `ErrSchemaMigrationRequired`, `ErrStoreOpen`)
  *     have no class in any client and arrive as `ErrUnknownErrorName`;
@@ -106,11 +101,15 @@
  *   - The description words CSCB matches come from
  *     `src/ad-description-phrases.ts`; the Phase 1 result fields
  *     (`kill_sent`, `launch_started_at`, `liveness_note`, `pre_trust`) are
- *     typed by `src/ad-phase1-types.ts`, never imported from `agent-director`.
+ *     typed by the client's own result types. A binary older than Phase 1
+ *     omits `kill_sent` and `pre_trust`, which the client declares required,
+ *     so the stub's `kill`, spawn and `resume` answers are typed
+ *     `StubKillResult`, `StubSpawnResult` and `StubResumeResult`: the
+ *     client's type with that one field optional ({@link MayLackPhase1Fields}).
  *   - Liveness notes (b.jg5 SRJ-114): `provenanceNote` is the only note that
  *     latches; `nonLatchingNotes` is every other note agent-director names,
  *     the list a `test.each` iterates for "no other note latches", typed as
- *     the 0.10.0 client's free text; `unknownNote` is a note CSCB does not
+ *     the client's free text; `unknownNote` is a note CSCB does not
  *     know. Tests take note values from here and never type them.
  *   - Launch starts (b.jg5 SRJ-513): the canned row builders
  *     (`cannedStatusResult`, `cannedGetResult`, `cannedListRow`) and the stub
@@ -173,13 +172,15 @@ import type {
   ClientOptions,
   DecideParams,
   DecideResult,
-  DeleteParams,
-  DeleteResult,
   FindMissingParams,
   FindMissingResult,
   GetParams,
+  GetResult,
   KillParams,
+  KillResult,
   ListParams,
+  ListResult,
+  ListRow,
   MakeTemplateParams,
   MakeTemplateResult,
   PauseParams,
@@ -187,10 +188,13 @@ import type {
   ReadPaneParams,
   ReadPaneResult,
   ResumeParams,
+  ResumeResult,
   SendKeysParams,
   SendKeysResult,
+  SpawnParams,
   SpawnResult,
   StatusParams,
+  StatusResult,
   VersionParams,
   VersionResult,
 } from 'agent-director'
@@ -252,18 +256,7 @@ import {
   UNUSABLE_RECORDED_NAME_PHRASE,
   survivorPids,
 } from '../../src/ad-description-phrases.ts'
-import type {
-  LivenessNote,
-  Phase1GetResult,
-  Phase1KillResult,
-  Phase1ListResult,
-  Phase1ListRow,
-  Phase1ResumeResult,
-  Phase1SpawnParams,
-  Phase1SpawnResult,
-  Phase1StatusResult,
-  PreTrust,
-} from '../../src/ad-phase1-types.ts'
+import type { LivenessNote, PreTrust } from '../../src/ad-phase1-types.ts'
 import type { StartupGateDeps } from '../../src/agent-director-startup.ts'
 import { CSCB_UNKNOWN_ERROR_NAME } from '../../src/ad-error-class.ts'
 import { UNAVAILABLE_RETRY_CAUSE_KILL_FAILED, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE } from '../../src/unavailable-retry.ts'
@@ -328,11 +321,29 @@ export interface FindMissingPlacement {
 }
 
 /**
+ * A result as agent-director may answer it: the client's own type `T`, with
+ * the fields `K` that the client declares required left optional, because a
+ * binary older than Phase 1 omits them (b.jg5 SRJ-110: a `kill` result with
+ * no `kill_sent`; SRJ-413: a spawn or `resume` result with no `pre_trust`).
+ * Every field keeps the client's own type.
+ */
+export type MayLackPhase1Fields<T, K extends keyof T> = Omit<T, K> & Partial<Pick<T, K>>
+
+/** A `kill` answer: the client's `KillResult`, `kill_sent` absent from a binary older than Phase 1. */
+export type StubKillResult = MayLackPhase1Fields<KillResult, 'kill_sent'>
+
+/** A spawn answer (plain or reuse): the client's `SpawnResult`, `pre_trust` absent from a binary older than Phase 1. */
+export type StubSpawnResult = MayLackPhase1Fields<SpawnResult, 'pre_trust'>
+
+/** A `resume` answer: the client's `ResumeResult`, `pre_trust` absent from a binary older than Phase 1. */
+export type StubResumeResult = MayLackPhase1Fields<ResumeResult, 'pre_trust'>
+
+/**
  * Build a canned `kill` result. `killSent` is the Phase 1 `kill_sent` field
  * (whether agent-director sent a kill); omit it for a result from a binary
  * older than Phase 1, which has no such field (the key is then absent).
  */
-export function cannedKillResult(killSent?: boolean): Phase1KillResult {
+export function cannedKillResult(killSent?: boolean): StubKillResult {
   return killSent === undefined ? {} : { kill_sent: killSent }
 }
 
@@ -382,10 +393,10 @@ function withDefaultLaunchStart<T extends { state?: unknown }>(row: T, overrides
 }
 
 /**
- * A `liveness_note` as the 0.10.0 client types it: free text, since
+ * A `liveness_note` as the client types it: free text, since
  * agent-director has notes CSCB does not tell apart.
  */
-type ClientLivenessNote = NonNullable<Phase1GetResult['liveness_note']>
+type ClientLivenessNote = NonNullable<GetResult['liveness_note']>
 
 /**
  * The `liveness_note` that latches a persona with the CONFLICT case
@@ -447,7 +458,7 @@ function omitUndefined<T extends object>(row: T, keys: readonly string[]): T {
  * given as `undefined` (`SAMPLE_LAUNCH_START_NONE`) the key is left out, and
  * given as `null` it is shown as `null`.
  */
-export function cannedStatusResult(overrides: Partial<Phase1StatusResult> = {}): Phase1StatusResult {
+export function cannedStatusResult(overrides: Partial<StatusResult> = {}): StatusResult {
   return omitUndefined(withDefaultLaunchStart({ state: 'waiting', ...overrides }, overrides), ['launch_started_at'])
 }
 
@@ -456,14 +467,14 @@ export function cannedStatusResult(overrides: Partial<Phase1StatusResult> = {}):
  * `pre_trust` field (`ok`, `skipped`, `failed`); omit it for a result from a
  * binary older than Phase 1 (the key is then absent).
  */
-export function cannedSpawnResult(claudeInstanceId: string = 'cscb_test', preTrust?: PreTrust): Phase1SpawnResult {
+export function cannedSpawnResult(claudeInstanceId: string = 'cscb_test', preTrust?: PreTrust): StubSpawnResult {
   return preTrust === undefined
     ? { claude_instance_id: claudeInstanceId }
     : { claude_instance_id: claudeInstanceId, pre_trust: preTrust }
 }
 
 /** Build a canned `resume` result, with `pre_trust` as `cannedSpawnResult` takes it. */
-export function cannedResumeResult(claudeInstanceId: string = 'cscb_test', preTrust?: PreTrust): Phase1ResumeResult {
+export function cannedResumeResult(claudeInstanceId: string = 'cscb_test', preTrust?: PreTrust): StubResumeResult {
   return preTrust === undefined
     ? { claude_instance_id: claudeInstanceId }
     : { claude_instance_id: claudeInstanceId, pre_trust: preTrust }
@@ -716,7 +727,7 @@ export function errInvalidFlags(verb: string = 'decide'): ErrInvalidFlags {
 /**
  * Build an ErrAmbiguousRequest (decide; defense-in-depth backstop, should be
  * unreachable under contract). Built as a base `AgentDirectorError` with the
- * canonical `errName`, not the 0.10.0 client's `ErrAmbiguousRequest` class;
+ * canonical `errName`, not the client's `ErrAmbiguousRequest` class;
  * callers match on `errName`.
  */
 export function errAmbiguousRequest(): AgentDirectorError {
@@ -726,7 +737,7 @@ export function errAmbiguousRequest(): AgentDirectorError {
 /**
  * Build the AD `ErrPermissionRequestNotFound` sentinel returned by the
  * paired-release `get-permission` verb when the row has aged out of AD's
- * store. The 0.10.0 client exports an `ErrPermissionRequestNotFound` class,
+ * store. The client exports an `ErrPermissionRequestNotFound` class,
  * but this builder keeps the base `AgentDirectorError`: the poller's
  * `isErrPermissionRequestNotFound` predicate matches on
  * `errName === 'ErrPermissionRequestNotFound'`, so a base error with that
@@ -783,8 +794,8 @@ export const STUB_TMUX_SOCKET_PATH = '/tmp/tmux-1000/default'
 const STUB_AD_CONFIG_PATH = '/home/agent/.agent-director/config.toml'
 
 /**
- * Build an `ErrTmuxUnresponsive` (the class binding of
- * `src/agent-director-errors.ts`): a tmux call that did not answer
+ * Build an `ErrTmuxUnresponsive` (the client's class, as
+ * `src/agent-director-errors.ts` re-exports it): a tmux call that did not answer
  * (default verb `resume`; `status` only reads the store and never returns
  * it). The default description is a call timeout that did nothing; pass
  * `description` for another. See `errTmuxUnresponsiveLaunchTimeout`,
@@ -800,7 +811,7 @@ export function errTmuxUnresponsive(
 }
 
 /**
- * Build an `ErrTmuxUnresponsive` (the class binding) met after tmux answered
+ * Build an `ErrTmuxUnresponsive` (the client's class) met after tmux answered
  * "duplicate session": the session holding the name could not be read, so
  * nothing was started (default verb `resume`).
  */
@@ -813,7 +824,7 @@ export function errTmuxUnresponsiveAfterDuplicateSession(verb: string = 'resume'
 }
 
 /**
- * Build an `ErrTmuxUnresponsive` (the class binding) that ends a launch call as a launch
+ * Build an `ErrTmuxUnresponsive` (the client's class) that ends a launch call as a launch
  * timeout: its description carries "the session may have been created"
  * (default verb `spawn`; pass `resume` for a resume).
  */
@@ -829,7 +840,7 @@ export function errTmuxUnresponsiveLaunchTimeout(
 }
 
 /**
- * Build an `ErrTmuxUnresponsive` (the class binding) for a row that "appears to still be
+ * Build an `ErrTmuxUnresponsive` (the client's class) for a row that "appears to still be
  * stopping": it ended less than the stopping window (90 s) ago and its own
  * session still runs. The description names the quoted session name, as
  * agent-director's does (default verb `resume`; reuse and
@@ -847,7 +858,7 @@ export function errTmuxUnresponsiveStillStopping(
 }
 
 /**
- * Build an `ErrTmuxUnresponsive` (the class binding) for a row that "appears to still be
+ * Build an `ErrTmuxUnresponsive` (the client's class) for a row that "appears to still be
  * starting": its own session is younger than the starting-session bound
  * (300 s). The description names the quoted session name, as
  * agent-director's does (default verb `resume`; reuse also returns it).
@@ -872,7 +883,7 @@ export function errTmuxUnresponsiveStillStarting(
 export const NEW_ROW_ENDED_RETRY = 'retry with reuse_finished once the session name is free'
 
 /**
- * Build an `ErrTmuxUnresponsive` (the class binding) from a plain spawn whose
+ * Build an `ErrTmuxUnresponsive` (the client's class) from a plain spawn whose
  * `tmux new-session` answered "duplicate session" and whose re-lookup of the
  * session holding the name could not answer (HO rev 26; b.jg5 SRJ-111,
  * SRJ-1303): agent-director ended the new row, so the description carries
@@ -965,8 +976,8 @@ function killFailedInstanceId(sessionName: string): string {
 }
 
 /**
- * Build an `ErrTmuxKillFailed` (the class binding of
- * `src/agent-director-errors.ts`; verb `kill`) with one of its four
+ * Build an `ErrTmuxKillFailed` (the client's class, as
+ * `src/agent-director-errors.ts` re-exports it; verb `kill`) with one of its four
  * descriptions ({@link KillFailedDescription}), each the full text the client
  * delivers: agent-director's error text, `tmux: agent process still running:
  * instance <id>: ` (the id `cscb_<key>` for a session `slack_bot_<key>`,
@@ -1081,8 +1092,8 @@ const CONFLICT_OPTION_CASES: Readonly<Record<keyof ConflictOptions, readonly Con
 export const STUB_TMUX_SESSION_ID = '$7'
 
 /**
- * Build an `ErrTmuxSessionConflict` (the class binding of
- * `src/agent-director-errors.ts`) for `conflictCase`. Each
+ * Build an `ErrTmuxSessionConflict` (the client's class, as
+ * `src/agent-director-errors.ts` re-exports it) for `conflictCase`. Each
  * description carries the quoted session name and the case words of ADSRD
  * SR-1.4 (from `src/ad-description-phrases.ts`), with that table's extras,
  * and ends with the `list --tmux-session-name` line naming the session:
@@ -1448,9 +1459,9 @@ function defaultRowFields(claudeInstanceId: string): {
  * `undefined` (`SAMPLE_LAUNCH_START_NONE` for the launch start) is left out
  * of the row; a `null` launch start is shown as `null`.
  */
-export function cannedListRow(overrides: Partial<Phase1ListRow> & { claude_instance_id: string }): Phase1ListRow
-export function cannedListRow(overrides: Partial<Phase1ListRow>, persona: CannedRowPersona, home: string): Phase1ListRow
-export function cannedListRow(overrides: Partial<Phase1ListRow>, persona?: CannedRowPersona, home?: string): Phase1ListRow {
+export function cannedListRow(overrides: Partial<ListRow> & { claude_instance_id: string }): ListRow
+export function cannedListRow(overrides: Partial<ListRow>, persona: CannedRowPersona, home: string): ListRow
+export function cannedListRow(overrides: Partial<ListRow>, persona?: CannedRowPersona, home?: string): ListRow {
   if (persona) {
     if (home === undefined) throw new Error('cannedListRow: the persona form needs a home')
     return omitUndefined(withDefaultLaunchStart({
@@ -1473,7 +1484,7 @@ export function cannedListRow(overrides: Partial<Phase1ListRow>, persona?: Canne
     last_seen_at: '2026-05-24T12:00:00Z',
     ended_at: null,
     ...overrides,
-  } as Phase1ListRow, overrides), PHASE1_ROW_FIELDS)
+  } as ListRow, overrides), PHASE1_ROW_FIELDS)
 }
 
 /**
@@ -1503,13 +1514,13 @@ export function cannedPermissionRequest(
  * cast inside the poller.
  */
 export type GetResultOverrides =
-  & Partial<Phase1GetResult>
+  & Partial<GetResult>
   & { claude_instance_id: string }
   & { permission_requests?: PermissionRequestRow[] | null }
 
 /** `GetResultOverrides` for the persona form, where `claude_instance_id` defaults to `cscb_<key>`. */
 export type PersonaGetResultOverrides =
-  & Partial<Phase1GetResult>
+  & Partial<GetResult>
   & { permission_requests?: PermissionRequestRow[] | null }
 
 /**
@@ -1519,7 +1530,7 @@ export type PersonaGetResultOverrides =
  * `GetResultWithPermissionRequests` at the use site, so the extra field
  * flows through without polluting the upstream type.
  */
-export type CannedGetResult = Phase1GetResult & { permission_requests?: PermissionRequestRow[] | null }
+export type CannedGetResult = GetResult & { permission_requests?: PermissionRequestRow[] | null }
 
 /**
  * Build a canned `GetResult`. Pass `permission_requests` for check_permission
@@ -1724,14 +1735,14 @@ export interface StubClientOptions {
   makeTemplateCalls?: MakeTemplateParams[]
 
   // spawn() — a result may carry the Phase 1 `pre_trust` (`cannedSpawnResult`).
-  // A recorded call may be a reuse spawn: its parameters carry the CSCB-side
-  // `reuse_finished` (`Phase1SpawnParams`, b.jg5 SRJ-112, SRJ-708), readable
+  // A recorded call may be a reuse spawn: its parameters carry the client's
+  // `reuse_finished` (`SpawnParams`, b.jg5 SRJ-112, SRJ-708), readable
   // with no cast. The stub answers a reuse like any spawn, from the same
   // queue and knobs.
-  spawnResult?: Phase1SpawnResult
+  spawnResult?: StubSpawnResult
   spawnError?: Error
-  spawnQueue?: CannedResponse<Phase1SpawnResult>[]
-  spawnCalls?: Phase1SpawnParams[]
+  spawnQueue?: CannedResponse<StubSpawnResult>[]
+  spawnCalls?: SpawnParams[]
   /**
    * Per-call `spawn` answer (b.jg5 SRJ-407), like `getFn`: when supplied, it
    * is called with each call's parameters, after the call is recorded in
@@ -1743,14 +1754,14 @@ export interface StubClientOptions {
    * `spawnFn` were set. A reuse spawn reaches it too (its parameters carry
    * `reuse_finished`).
    */
-  spawnFn?: (params: Phase1SpawnParams) => StubCallAnswer<Phase1SpawnResult>
+  spawnFn?: (params: SpawnParams) => StubCallAnswer<StubSpawnResult>
 
   // status() — a result may carry the Phase 1 `launch_started_at`
   // (`cannedStatusResult`). Default: `cannedStatusResult()`, a `waiting` row
   // (no launch start, as on every row but a `pending` one).
-  statusResult?: Phase1StatusResult
+  statusResult?: StatusResult
   statusError?: Error
-  statusQueue?: CannedResponse<Phase1StatusResult>[]
+  statusQueue?: CannedResponse<StatusResult>[]
   statusCalls?: StatusParams[]
   /**
    * Dynamic status seam (b.m4r). When supplied, takes precedence over
@@ -1763,13 +1774,13 @@ export interface StubClientOptions {
    * one persona's instance can leave every other instance alone). The call
    * is still recorded in `statusCalls` and `callLog`.
    */
-  statusFn?: (params: StatusParams) => Phase1StatusResult | Error | undefined
+  statusFn?: (params: StatusParams) => StatusResult | Error | undefined
 
   // get() — a row may carry the Phase 1 `launch_started_at` and
   // `liveness_note` (`cannedGetResult`).
-  getResult?: Phase1GetResult
+  getResult?: GetResult
   getError?: Error
-  getQueue?: CannedResponse<Phase1GetResult>[]
+  getQueue?: CannedResponse<GetResult>[]
   getCalls?: GetParams[]
   /**
    * Computed `get` row, like `statusFn`: when supplied, takes precedence over
@@ -1779,7 +1790,7 @@ export interface StubClientOptions {
    * queue first, as if no `getFn` were set. The call is still recorded in
    * `getCalls`.
    */
-  getFn?: (params: GetParams) => Phase1GetResult | Error | undefined
+  getFn?: (params: GetParams) => GetResult | Error | undefined
 
   // sendKeys()
   sendKeysResult?: SendKeysResult
@@ -1823,9 +1834,9 @@ export interface StubClientOptions {
 
   // kill() — a result may carry the Phase 1 `kill_sent` (`cannedKillResult`).
   // Default: `{}` (no `kill_sent`, as from a binary older than Phase 1).
-  killResult?: Phase1KillResult
+  killResult?: StubKillResult
   killError?: Error
-  killQueue?: CannedResponse<Phase1KillResult>[]
+  killQueue?: CannedResponse<StubKillResult>[]
   killCalls?: KillParams[]
   /**
    * Per-call `kill` answer (b.jg5 SRJ-412, SRJ-702), as `spawnFn` is for
@@ -1836,7 +1847,7 @@ export interface StubClientOptions {
    * leaves the call to the other `kill` knobs on `undefined`. Lets a kill's
    * success end the row the case scripts.
    */
-  killFn?: (params: KillParams) => StubCallAnswer<Phase1KillResult>
+  killFn?: (params: KillParams) => StubCallAnswer<StubKillResult>
 
   // decide()
   decideResult?: DecideResult
@@ -1845,9 +1856,9 @@ export interface StubClientOptions {
   decideCalls?: DecideParams[]
 
   // resume() — a result may carry the Phase 1 `pre_trust` (`cannedResumeResult`).
-  resumeResult?: Phase1ResumeResult
+  resumeResult?: StubResumeResult
   resumeError?: Error
-  resumeQueue?: CannedResponse<Phase1ResumeResult>[]
+  resumeQueue?: CannedResponse<StubResumeResult>[]
   resumeCalls?: ResumeParams[]
   /**
    * Per-call `resume` answer (b.jg5 SRJ-407), as `spawnFn` is for `spawn`:
@@ -1856,7 +1867,7 @@ export interface StubClientOptions {
    * async, rejects with an `Error`, resolves with a result, and leaves the
    * call to the other `resume` knobs on `undefined`.
    */
-  resumeFn?: (params: ResumeParams) => StubCallAnswer<Phase1ResumeResult>
+  resumeFn?: (params: ResumeParams) => StubCallAnswer<StubResumeResult>
 
   // findMissing() — b.4dk: dead-session recovery runs one findMissing before
   // resume so AD transitions the dead live-state row to `missing`. Defaults to
@@ -1878,15 +1889,17 @@ export interface StubClientOptions {
    */
   findMissingFn?: (params: FindMissingParams) => StubCallAnswer<FindMissingResult>
 
-  // delete()
-  deleteResult?: DeleteResult
+  // delete() — a tripwire: the client has no `delete` (agent-director 0.11.0
+  // moved the verb to its operator tool), so no CSCB path may call one; the
+  // stub records any call made on it so a case can assert there was none.
+  deleteResult?: StubDeleteResult
   deleteError?: Error
-  deleteCalls?: DeleteParams[]
+  deleteCalls?: StubDeleteParams[]
 
   // list() — rows may carry the Phase 1 fields (`cannedListRow`).
-  listResult?: Phase1ListResult
+  listResult?: ListResult
   listError?: Error
-  listQueue?: CannedResponse<Phase1ListResult>[]
+  listQueue?: CannedResponse<ListResult>[]
   listCalls?: ListParams[]
 
   // pause()
@@ -1913,23 +1926,33 @@ export interface StubClientOptions {
   callLog?: string[]
 }
 
+/** The parameters the stub's tripwire `delete` records: the instance ids a call named. */
+export interface StubDeleteParams {
+  claude_instance_id: string[]
+}
+
+/** The stub's tripwire `delete` answer: one outcome per instance id. */
+export interface StubDeleteResult {
+  results: Record<string, string>
+}
+
 /** Structural-typed `Client` stub satisfying every verb CSCB uses. */
 export type StubClient = {
   readonly binaryPath: string
   readonly binaryVersion: string
   version(params: VersionParams): Promise<VersionResult>
   makeTemplate(params: MakeTemplateParams): Promise<MakeTemplateResult>
-  spawn(params: Phase1SpawnParams): Promise<Phase1SpawnResult>
-  status(params: StatusParams): Promise<Phase1StatusResult>
-  get(params: GetParams): Promise<Phase1GetResult>
+  spawn(params: SpawnParams): Promise<StubSpawnResult>
+  status(params: StatusParams): Promise<StatusResult>
+  get(params: GetParams): Promise<GetResult>
   sendKeys(params: SendKeysParams): Promise<SendKeysResult>
   readPane(params: ReadPaneParams): Promise<ReadPaneResult>
-  kill(params: KillParams): Promise<Phase1KillResult>
+  kill(params: KillParams): Promise<StubKillResult>
   decide(params: DecideParams): Promise<DecideResult>
-  resume(params: ResumeParams): Promise<Phase1ResumeResult>
+  resume(params: ResumeParams): Promise<StubResumeResult>
   findMissing(params: FindMissingParams): Promise<FindMissingResult>
-  delete(params: DeleteParams): Promise<DeleteResult>
-  list(params: ListParams): Promise<Phase1ListResult>
+  delete(params: StubDeleteParams): Promise<StubDeleteResult>
+  list(params: ListParams): Promise<ListResult>
   pause(params: PauseParams): Promise<PauseResult>
   /**
    * Paired-AD-release `get-permission` verb (SR-7.1). Optional on the
@@ -1981,7 +2004,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
         opts.makeTemplateResult ?? cannedMakeTemplate(`~/.agent-director/templates/${params.name}.toml`)
       )
     },
-    async spawn(params: Phase1SpawnParams): Promise<Phase1SpawnResult> {
+    async spawn(params: SpawnParams): Promise<StubSpawnResult> {
       opts.spawnCalls?.push(params)
       if (opts.spawnFn) {
         const r = await opts.spawnFn(params)
@@ -1992,7 +2015,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
         claude_instance_id: params.claude_instance_id ?? 'cscb_test',
       })
     },
-    async status(params: StatusParams): Promise<Phase1StatusResult> {
+    async status(params: StatusParams): Promise<StatusResult> {
       opts.callLog?.push('status')
       opts.statusCalls?.push(params)
       if (opts.statusFn) {
@@ -2002,7 +2025,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
       }
       return nextResponse('status', opts.statusQueue, opts.statusResult, opts.statusError, cannedStatusResult())
     },
-    async get(params: GetParams): Promise<Phase1GetResult> {
+    async get(params: GetParams): Promise<GetResult> {
       opts.getCalls?.push(params)
       if (opts.getFn) {
         const r = opts.getFn(params)
@@ -2042,7 +2065,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
       }
       return { pane: '' }
     },
-    async kill(params: KillParams): Promise<Phase1KillResult> {
+    async kill(params: KillParams): Promise<StubKillResult> {
       opts.killCalls?.push(params)
       if (opts.killFn) {
         const r = await opts.killFn(params)
@@ -2055,7 +2078,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
       opts.decideCalls?.push(params)
       return nextResponse('decide', opts.decideQueue, opts.decideResult, opts.decideError, {})
     },
-    async resume(params: ResumeParams): Promise<Phase1ResumeResult> {
+    async resume(params: ResumeParams): Promise<StubResumeResult> {
       opts.callLog?.push('resume')
       opts.resumeCalls?.push(params)
       if (opts.resumeFn) {
@@ -2083,12 +2106,12 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
         cannedFindMissing(),
       )
     },
-    async delete(params: DeleteParams): Promise<DeleteResult> {
+    async delete(params: StubDeleteParams): Promise<StubDeleteResult> {
       opts.deleteCalls?.push(params)
       if (opts.deleteError) throw opts.deleteError
       return opts.deleteResult ?? { results: Object.fromEntries(params.claude_instance_id.map((id) => [id, 'ok'])) }
     },
-    async list(params: ListParams): Promise<Phase1ListResult> {
+    async list(params: ListParams): Promise<ListResult> {
       opts.listCalls?.push(params)
       return nextResponse('list', opts.listQueue, opts.listResult, opts.listError, { spawns: [] })
     },
@@ -2119,7 +2142,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
 /** Handle returned by `holdSpawns`. */
 export interface SpawnHold {
   /** Every `spawn` the stub received, held or not, in call order (a reuse spawn's with its `reuse_finished`). */
-  calls: Phase1SpawnParams[]
+  calls: SpawnParams[]
   /** Instance IDs of the spawns still held open, oldest first. */
   held(): string[]
   /** Resolves once a spawn for `id` has been issued (at once if one already was). */
@@ -2192,8 +2215,8 @@ export function holdFindMissing(stub: StubClient): FindMissingHold {
  * persona's launch in flight while it drives a second call.
  */
 export function holdSpawns(stub: StubClient, shouldHold: (id: string) => boolean = () => true): SpawnHold {
-  const calls: Phase1SpawnParams[] = []
-  const held: Array<{ id: string; resolve: (r: SpawnResult) => void; reject: (err: Error) => void }> = []
+  const calls: SpawnParams[] = []
+  const held: Array<{ id: string; resolve: (r: StubSpawnResult) => void; reject: (err: Error) => void }> = []
   const entries = new Map<string, { promise: Promise<void>; resolve: () => void }>()
   const entry = (id: string) => {
     let e = entries.get(id)
@@ -2211,12 +2234,12 @@ export function holdSpawns(stub: StubClient, shouldHold: (id: string) => boolean
     return held.splice(i, 1)[0]!
   }
   const original = stub.spawn.bind(stub)
-  stub.spawn = (params: Phase1SpawnParams): Promise<SpawnResult> => {
+  stub.spawn = (params: SpawnParams): Promise<StubSpawnResult> => {
     calls.push(params)
     const id = String(params.claude_instance_id)
     entry(id).resolve()
     if (!shouldHold(id)) return original(params)
-    return new Promise<SpawnResult>((resolve, reject) => { held.push({ id, resolve, reject }) })
+    return new Promise<StubSpawnResult>((resolve, reject) => { held.push({ id, resolve, reject }) })
   }
   return {
     calls,

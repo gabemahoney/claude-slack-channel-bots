@@ -159,7 +159,7 @@ import {
   type AdCall,
   type LaunchTimeoutForm,
 } from '../src/ad-error-class.ts'
-import type { Phase1StatusResult } from '../src/ad-phase1-types.ts'
+import type { StatusResult } from 'agent-director'
 import { adAlertThresholdMs, adAlertThresholdMsInEffect, DEFAULT_AD_SETTINGS_IN_EFFECT } from '../src/ad-settings.ts'
 import { ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
@@ -2475,7 +2475,7 @@ async function spawnTimingOut(h: RecoveryHarness, key: string, form: LaunchTimeo
   let state: string = AGENT_DIRECTOR_PENDING_STATE
   const id = personaInstanceId(key)
   h.script({
-    statusFn: (params) => (params.claude_instance_id === id ? launch.statusRow({ state: state as Phase1StatusResult['state'] }) : cannedStatusResult()),
+    statusFn: (params) => (params.claude_instance_id === id ? launch.statusRow({ state: state as StatusResult['state'] }) : cannedStatusResult()),
     ...(paneAnswers ? {} : { readPaneError: errTmuxUnresponsive('read-pane') }),
   })
   expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })

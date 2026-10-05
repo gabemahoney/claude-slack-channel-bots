@@ -1342,7 +1342,9 @@ import {
 import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING } from '../src/liveness-reading.ts'
 import { adLaunchBoundMsInEffect } from '../src/ad-settings.ts'
 import { PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED, parseLaunchStart } from '../src/pending-row.ts'
-import type { Phase1GetResult, Phase1KillResult, Phase1ListRow, Phase1ResumeResult, Phase1SpawnParams, Phase1SpawnResult, Phase1StatusResult, PreTrust } from '../src/ad-phase1-types.ts'
+import type { GetResult, ListRow, SpawnParams, StatusResult } from 'agent-director'
+import type { PreTrust } from '../src/ad-phase1-types.ts'
+import type { StubDeleteParams, StubKillResult, StubResumeResult, StubSpawnResult } from './test-helpers/agent-director-stub.ts'
 import {
   loadRetiredKeyStore,
   OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL,
@@ -1969,7 +1971,7 @@ async function launchThenRunApprover<T>(clock: FakeClock, key: string, launch: P
 const SAMPLE_LAUNCH_START_MS = parseLaunchStart(SAMPLE_LAUNCH_START_DEFAULT)!
 
 /** A `status` answer through the stub's canned builder: a `pending` row carries the sample launch start. */
-function statusReads(...states: string[]): CannedResponse<Phase1StatusResult>[] {
+function statusReads(...states: string[]): CannedResponse<StatusResult>[] {
   return states.map((state) => cannedOk(cannedStatusResult({ state })))
 }
 
@@ -2418,21 +2420,21 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
   // reuse spawn of the same id; nothing is deleted.
   test('ended state + ErrNoSessionId on resume → one reuse spawn of the same id, no delete', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       spawnCalls,
       deleteCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
       ],
       resumeError: errNoSessionId(),
       getResult: personaRow(cfg, 'C', { state: 'ended' }),
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
-    expect((spawnCalls as Phase1SpawnParams[]).map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+    expect(spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
       ['cscb_C', undefined],
       ['cscb_C', true],
     ])
@@ -2444,7 +2446,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
   test('missing state + resume_enabled=false → one reuse spawn of the same id (no resume, kill or delete)', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { resume_enabled: false })
     installStub({
@@ -2454,14 +2456,14 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
       resumeCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
       ],
       getResult: personaRow(cfg, 'C', { state: 'missing' }),
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
     expect(resumeCalls).toHaveLength(0)
-    expect((spawnCalls as Phase1SpawnParams[]).map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+    expect(spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
       ['cscb_C', undefined],
       ['cscb_C', true],
     ])
@@ -2504,7 +2506,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
   test('b.2oy: ErrSpawnNotFound on resume → fresh spawn (no kill, no delete, no spawn-failure notice)', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     const home = useSpawnHome()
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
@@ -2513,7 +2515,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
       deleteCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
       ],
       resumeError: errSpawnNotFound(),
       getResult: personaRow(cfg, 'C', { state: 'ended' }),
@@ -2538,7 +2540,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
   // spawn-failure notice goes to the persona's destination (b.av2 SR-7.2).
   test('b.2oy: ErrSpawnNotFound on resume + fresh spawn fails → failed + spawn-failure notice to the persona destination', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     const readLog = captureStartupErrors()
     const cfg = makeNoticeConfig()
     const launchFailure = errTmuxSessionCreate('spawn')
@@ -2573,7 +2575,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
       spawnCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
       ],
       getError: errSpawnNotFound(),
     })
@@ -2629,14 +2631,14 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
       spawnCalls: [] as import('agent-director').SpawnParams[],
       resumeCalls: [] as import('agent-director').ResumeParams[],
       killCalls: [] as import('agent-director').KillParams[],
-      deleteCalls: [] as import('agent-director').DeleteParams[],
+      deleteCalls: [] as StubDeleteParams[],
     }
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       ...calls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
       ],
       resumeError,
       getResult: personaRow(cfg, 'C', { state: 'ended' }),
@@ -2693,7 +2695,7 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
     expect(result).toEqual({ key: 'C', action: 'spawned' })
     expect(calls.resumeCalls).toHaveLength(1)
     expect(calls.deleteCalls).toEqual([])
-    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => call.reuse_finished)).toEqual([undefined, true])
+    expect(calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
   })
 
   // E8 (b.jg5 SRJ-205, SRJ-302): a re-check that decides the stop posts
@@ -2905,7 +2907,7 @@ describe('compareRowToPersona (b.av2 SR-6.2, SR-6.3)', () => {
 interface LadderCalls {
   spawnCalls: import('agent-director').SpawnParams[]
   killCalls: import('agent-director').KillParams[]
-  deleteCalls: import('agent-director').DeleteParams[]
+  deleteCalls: StubDeleteParams[]
   resumeCalls: import('agent-director').ResumeParams[]
   sendKeysCalls: import('agent-director').SendKeysParams[]
   findMissingCalls: import('agent-director').FindMissingParams[]
@@ -2939,7 +2941,7 @@ describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
       ...calls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
       ],
       getResult: row,
       ...extra,
@@ -2964,7 +2966,7 @@ describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
     expect(result).toEqual({ key: 'C', action: 'spawned' })
     expect([calls.killCalls, calls.deleteCalls]).toEqual([[], []])
     // The colliding plain spawn, then exactly one reuse spawn of the same id, in the persona's directory.
-    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => [call.claude_instance_id, call.reuse_finished, call.cwd])).toEqual([
+    expect(calls.spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished, call.cwd])).toEqual([
       ['cscb_C', undefined, work],
       ['cscb_C', true, work],
     ])
@@ -3027,7 +3029,7 @@ describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
 
     expect(result).toEqual({ key: 'C', action: 'spawned' })
     expect([calls.killCalls, calls.deleteCalls, calls.resumeCalls]).toEqual([[], [], []])
-    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => [call.reuse_finished, call.cwd])).toEqual([[undefined, work], [true, work]])
+    expect(calls.spawnCalls.map((call) => [call.reuse_finished, call.cwd])).toEqual([[undefined, work], [true, work]])
   })
 
   test.each(['empty', 'absent'] as const)('a row with an %s cwd is a mismatch; the log prints cwd=<none>, never cwd=undefined', async (variant) => {
@@ -3044,7 +3046,7 @@ describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
 
     expect(result).toEqual({ key: 'C', action: 'spawned' })
     expect([calls.killCalls, calls.deleteCalls, calls.resumeCalls]).toEqual([[], [], []])
-    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => [call.reuse_finished, call.cwd])).toEqual([[undefined, work], [true, work]])
+    expect(calls.spawnCalls.map((call) => [call.reuse_finished, call.cwd])).toEqual([[undefined, work], [true, work]])
     expect(errLog).toContain(mismatchLine('<none>', work, 'ended'))
     expect(errLog).not.toContain('cwd=undefined')
   })
@@ -3095,7 +3097,7 @@ function installResumeEntry(entry: ResumeEntry, row: CannedGetResult, calls: Lad
     ...calls,
     spawnQueue: [
       cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-      cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${key}` }),
+      cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${key}` }),
     ],
     getResult: { ...row, state },
     sendKeysError: state === 'waiting' ? errTmuxSendKeys() : undefined,
@@ -3170,7 +3172,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
       expect(calls.spawnCalls).toHaveLength(1)
     } else {
       expect(result).toEqual({ key: 'C', action: 'spawned' })
-      expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => call.reuse_finished)).toEqual([undefined, true])
+      expect(calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
       expect(calls.spawnCalls[1].label).toEqual(['service=cscb', 'persona=C', `config_dir=${expectedLabel}`])
       expect(calls.spawnCalls[1].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(configDir)
     }
@@ -3254,7 +3256,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
       ...calls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
       ],
       getResult: personaRow(cfg, 'C', { state: 'ended', labels: labelsFor('changed', cfg, home) }),
     })
@@ -3266,7 +3268,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
 
     expect(result).toEqual({ key: 'C', action: 'spawned' })
     expect([calls.resumeCalls, calls.killCalls, calls.deleteCalls]).toEqual([[], [], []])
-    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => call.reuse_finished)).toEqual([undefined, true])
+    expect(calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
     expect(errLog).toContain(`resume_enabled=false for ${renderPersonaRef('C', 'C')} — not resuming; replacing its row by a reuse spawn of the same id`)
     expect(errLog).not.toContain('config_dir label')
   })
@@ -3301,7 +3303,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
     resetClientForTests()
 
     const spawnCalls: import('agent-director').SpawnParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
     installStub({
       spawnCalls,
@@ -3309,7 +3311,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
       resumeCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
       ],
       getResult: row,
     })
@@ -3319,7 +3321,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
     expect(result).toEqual({ key: 'C', action: 'spawned' })
     expect(resumeCalls).toHaveLength(0)
     expect(deleteCalls).toEqual([])
-    expect((spawnCalls as Phase1SpawnParams[]).map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([['cscb_C', undefined], ['cscb_C', true]])
+    expect(spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([['cscb_C', undefined], ['cscb_C', true]])
     expect(spawnCalls[1].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(later)
     expect(spawnCalls[1].label).toEqual(['service=cscb', 'persona=C', configDirLabelFor(later)])
     expect(spawnCalls[1].label).not.toContain(configDirLabelFor(earlier))
@@ -3406,7 +3408,7 @@ describe('pre-launch trust patch (b.av2 SR-6.2)', () => {
           ...calls,
           spawnQueue: [
             cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-            cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+            cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
           ],
           getResult: personaRow(cfg, 'C', { state: 'ended' }),
           resumeError: errJsonlMissing(),
@@ -3620,7 +3622,7 @@ describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
 
   type SpawnResult = import('agent-director').SpawnResult
   const collision = () => cannedErr<SpawnResult>(errInstanceIdCollision())
-  const spawnOk = () => cannedOk<SpawnResult>({ claude_instance_id: GUARD_INSTANCE })
+  const spawnOk = () => cannedOk<StubSpawnResult>({ claude_instance_id: GUARD_INSTANCE })
 
   /**
    * The reply-guard persona with a real working directory and its own real
@@ -3939,7 +3941,7 @@ describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
 
     expect(result).toStrictEqual(expected)
     expect(events).toEqual([...expectedEvents])
-    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => call.reuse_finished)).toEqual(expectedEvents.filter((e) => e === 'spawn').map(() => true))
+    expect(calls.spawnCalls.map((call) => call.reuse_finished)).toEqual(expectedEvents.filter((e) => e === 'spawn').map(() => true))
     expect(calls.resumeCalls).toEqual([])
   })
 
@@ -4039,7 +4041,7 @@ describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
 describe('prompt suggestions off on every launch (b.svb, b.f2b)', () => {
   type SpawnResult = import('agent-director').SpawnResult
   const collision = () => cannedErr<SpawnResult>(errInstanceIdCollision())
-  const spawnOk = () => cannedOk<SpawnResult>({ claude_instance_id: 'cscb_C' })
+  const spawnOk = () => cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' })
 
   /** The env var and value every persona launch must run with, written out here, not taken from src. */
   const VAR = 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION'
@@ -4384,7 +4386,7 @@ describe('next launch: the applied values at launch time (b.av2 SR-8.6 next-laun
       ...second,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: GUARD_INSTANCE }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: GUARD_INSTANCE }),
       ],
       getResult: row,
     })
@@ -4396,7 +4398,7 @@ describe('next launch: the applied values at launch time (b.av2 SR-8.6 next-laun
     expect(result).toBe(true)
     expect(second.resumeCalls).toHaveLength(0)
     expect(second.deleteCalls).toEqual([])
-    expect((second.spawnCalls as Phase1SpawnParams[]).map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+    expect(second.spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
       [GUARD_INSTANCE, undefined],
       [GUARD_INSTANCE, true],
     ])
@@ -4427,7 +4429,7 @@ describe('spawnForPersona: fixed instance ID and one launch in flight per person
       getCalls,
       sendKeysCalls,
       spawnQueue: [
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
       ],
       getResult: personaRow(cfg, 'C', { state: 'waiting' }),
@@ -4523,13 +4525,13 @@ describe('spawnForPersona: fixed instance ID and one launch in flight per person
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const first =
       settlement === 'success'
-        ? cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' })
+        ? cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' })
         : settlement === 'failed'
           ? cannedErr<import('agent-director').SpawnResult>(errGeneric('spawn', 'ErrSpawnBroken'))
           : cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())
     const stub = installStub({
       spawnCalls,
-      spawnQueue: [first, cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' })],
+      spawnQueue: [first, cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' })],
     })
     // 'a throw': the collision get returns no row, so the ladder throws while reading it.
     stub.get = async () => undefined as unknown as import('agent-director').GetResult
@@ -4997,7 +4999,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     const gamma = personaOf(cfg, 'gamma')
     const elsewhere = fixtureSubdir('elsewhere')
     const killCalls: import('agent-director').KillParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     const listCalls: import('agent-director').ListParams[] = []
     installStub({
       killCalls,
@@ -5066,7 +5068,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       const gamma = personaOf(cfg, 'gamma')
       const elsewhere = fixtureSubdir('elsewhere')
       const killCalls: import('agent-director').KillParams[] = []
-      const deleteCalls: import('agent-director').DeleteParams[] = []
+      const deleteCalls: StubDeleteParams[] = []
       installStub({
         killCalls,
         deleteCalls,
@@ -5120,7 +5122,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       fixtureDir,
     )
     const killCalls: import('agent-director').KillParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     installStub({
       killCalls,
       deleteCalls,
@@ -5163,7 +5165,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       fixtureDir,
     )
     const killCalls: import('agent-director').KillParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     installStub({
       killCalls,
       deleteCalls,
@@ -5268,7 +5270,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       const listed = rows(cfg, home)
       const killCalls: import('agent-director').KillParams[] = []
       const statusCalls: import('agent-director').StatusParams[] = []
-      const deleteCalls: import('agent-director').DeleteParams[] = []
+      const deleteCalls: StubDeleteParams[] = []
       const findMissingCalls: import('agent-director').FindMissingParams[] = []
       installStub({ killCalls, statusCalls, deleteCalls, findMissingCalls, listResult: { spawns: listed }, ...script })
       const clock = createFakeClock()
@@ -5511,7 +5513,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         const { cfg, home } = sweepConfig()
         const alpha = personaOf(cfg, 'alpha')
         const killCalls: import('agent-director').KillParams[] = []
-        const deleteCalls: import('agent-director').DeleteParams[] = []
+        const deleteCalls: StubDeleteParams[] = []
         const callLog: string[] = []
         const err = errInvalidFlags('kill')
         const spawns = [
@@ -5560,7 +5562,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         const readLog = captureStartupErrors()
         const { cfg } = sweepConfig()
         const killCalls: import('agent-director').KillParams[] = []
-        const deleteCalls: import('agent-director').DeleteParams[] = []
+        const deleteCalls: StubDeleteParams[] = []
         const callLog: string[] = []
         const err = errInvalidFlags('kill')
         const legacy = prePersonaRow('waiting')
@@ -5694,7 +5696,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       })
 
       test('a first row whose tries end in a success leaves the budget unspent, so a later row still gets its tries; a row listed ended gets no kill and no read', async () => {
-        const unresponsive = (): CannedResponse<Phase1KillResult> => cannedErr(errTmuxUnresponsive('kill'))
+        const unresponsive = (): CannedResponse<StubKillResult> => cannedErr(errTmuxUnresponsive('kill'))
         const r = await sweepListed(
           (cfg, home) => [
             sweptRow(cfg, home, 'cscb_alpha_old', 'alpha'),
@@ -5758,7 +5760,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       const { cfg, home } = sweepConfig()
       const killed = rows(cfg)
       const order: string[] = []
-      const deleteCalls: import('agent-director').DeleteParams[] = []
+      const deleteCalls: StubDeleteParams[] = []
       const stub = installStub({
         deleteCalls,
         ...(killError === undefined ? {} : { killError }),
@@ -5796,7 +5798,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     test('every live state gets one kill call and all share one findMissing sweep, whose line counts the killed pending row left in neither list as not judged and a killed pending row in unverified_ids as still live; ended and missing pre-persona rows get no kill, no delete and no line', async () => {
       const { cfg } = sweepConfig()
       const killCalls: import('agent-director').KillParams[] = []
-      const deleteCalls: import('agent-director').DeleteParams[] = []
+      const deleteCalls: StubDeleteParams[] = []
       const findMissingCalls: import('agent-director').FindMissingParams[] = []
       const states = [...AGENT_DIRECTOR_LIVE_STATES, 'ended', 'missing']
       const liveIds = [...AGENT_DIRECTOR_LIVE_STATES].map((s) => `cscb_old_${s}_C0OLD`)
@@ -6068,7 +6070,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expectNoNoteLatch(h)
     })
 
-    test.each<[string, Readonly<Record<string, RetiredKeySeed>>, (h: RecoveryHarness) => Phase1ListRow[], number]>([
+    test.each<[string, Readonly<Record<string, RetiredKeySeed>>, (h: RecoveryHarness) => ListRow[], number]>([
       ['every absent key already recorded with no mark', { [LAUNCH_START_ABSENT_PERSONA_KEY]: { cause: RETIRED_KEY_CAUSE_REMOVED } }, (h) => [absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { state: 'ended' })], 1],
       ['no absent persona\'s row listed', { [LAUNCH_START_ABSENT_PERSONA_KEY]: { cause: RETIRED_KEY_CAUSE_REMOVED } }, (h) => [listed(h, h.keys[0]!)], 0],
     ])('nothing new to record (%s): no write, the record file byte-identical and no store line', async (_label, seeded, rows, named) => {
@@ -6127,7 +6129,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     // AC 55: P's own row carrying the note latches P, and the sweep leaves it
     // as it is, whatever it would otherwise decide (another cwd is swept when
     // P is not latched).
-    test.each<[string, string, (h: RecoveryHarness) => Partial<Phase1ListRow>]>([
+    test.each<[string, string, (h: RecoveryHarness) => Partial<ListRow>]>([
       ['in P\'s working directory', 'waiting', () => ({})],
       ['in P\'s working directory', LIVENESS_DEAD_ROW_ENDED, () => ({})],
       ['in another existing cwd', 'waiting', (h) => ({ cwd: h.home })],
@@ -6153,7 +6155,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       ...launchStartCurrentLifeOf('list').slice(0, 1).map((row) => ({
         ...row,
         name: `${row.name}, provenance_conflict note`,
-        build: (persona: CannedRowPersona, home: string): Phase1ListRow => ({ ...row.build(persona, home), liveness_note: provenanceNote }),
+        build: (persona: CannedRowPersona, home: string): ListRow => ({ ...row.build(persona, home), liveness_note: provenanceNote }),
       })),
     ]
 
@@ -6181,7 +6183,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
     // The note on a row that is not a configured persona's own latches no one.
     // Each such row is live, so with no latch the sweep kills it as today.
-    test.each<[string, (h: RecoveryHarness, p: string) => Phase1ListRow]>([
+    test.each<[string, (h: RecoveryHarness, p: string) => ListRow]>([
       ['a row labelled P under another instance id', (h, p) => listed(h, p, { claude_instance_id: `${personaInstanceId(p)}_old`, liveness_note: provenanceNote })],
       ['an absent persona\'s own row', (h) => absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { liveness_note: provenanceNote })],
       ['a pre-persona row', () => ({ ...prePersonaRow('waiting'), liveness_note: provenanceNote })],
@@ -6260,7 +6262,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
     // AC 45's list half (b.jg5 SRJ-504): a restart is two harness lifetimes
     // over the same listed row; the second starts with P unlatched.
-    test.each<[string, (h: RecoveryHarness, p: string) => Phase1ListRow, (h: RecoveryHarness, p: string) => void]>([
+    test.each<[string, (h: RecoveryHarness, p: string) => ListRow, (h: RecoveryHarness, p: string) => void]>([
       ['carries provenance_conflict', (h, p) => listed(h, p, { liveness_note: provenanceNote }), (h, p) => expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))],
       [
         'reads pending with no launch start',
@@ -6506,7 +6508,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     // left unkilled count as kept, and it logs one stop line and its summary.
     describe('the shutdown stop (b.jg5 SRJ-714, SRJ-702)', () => {
       /** P's own row with the note (P latches), an absent persona's row (its key recorded) and B's row under another instance id (swept). */
-      function stopRows(h: RecoveryHarness, p: string, b: string): Phase1ListRow[] {
+      function stopRows(h: RecoveryHarness, p: string, b: string): ListRow[] {
         return [
           listed(h, b, { claude_instance_id: `${personaInstanceId(b)}_old` }),
           listed(h, p, { liveness_note: provenanceNote }),
@@ -6796,10 +6798,10 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     })
 
     /** The sweep's two holds: an absent persona's live row (its kill succeeds, held by the listing) and B's row under another instance id (its kill fails, held by the failure and marked). */
-    function heldRows(h: RecoveryHarness, b: string): { absent: Phase1ListRow; bOld: Phase1ListRow } {
+    function heldRows(h: RecoveryHarness, b: string): { absent: ListRow; bOld: ListRow } {
       const absent = absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)
       const bOld = listed(h, b, { claude_instance_id: `${personaInstanceId(b)}_old`, cwd: h.home })
-      h.script({ killQueue: [cannedOk(cannedKillResult(true)), ...Array.from({ length: KILL_RETRY_TRIES }, () => cannedErr<Phase1KillResult>(errTmuxKillFailed()))] })
+      h.script({ killQueue: [cannedOk(cannedKillResult(true)), ...Array.from({ length: KILL_RETRY_TRIES }, () => cannedErr<StubKillResult>(errTmuxKillFailed()))] })
       return { absent, bOld }
     }
 
@@ -6877,10 +6879,10 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
   }
 
   /** `n` colliding spawns, then one that succeeds. */
-  function collisionsThenOk(n: number): CannedResponse<import('agent-director').SpawnResult>[] {
+  function collisionsThenOk(n: number): CannedResponse<StubSpawnResult>[] {
     return [
       ...Array.from({ length: n }, () => cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())),
-      cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+      cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
     ]
   }
 
@@ -6980,7 +6982,7 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
     expect(result).toEqual({ key: 'C', action: 'failed', countedClass: true })
     expect([calls.killCalls, calls.deleteCalls, calls.resumeCalls]).toEqual([[], [], []])
     // The colliding spawn, then the reuse in the persona's directory.
-    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => [call.reuse_finished, call.cwd])).toEqual([[undefined, work], [true, work]])
+    expect(calls.spawnCalls.map((call) => [call.reuse_finished, call.cwd])).toEqual([[undefined, work], [true, work]])
     expect(errLog).toContain(
       `spawnForPersona: ${renderPersonaRef('C', 'C')} row cwd=${elsewhere} differs from working_directory=${work} (state=ended) — replacing the row by a reuse spawn of the same id; nothing is deleted`,
     )
@@ -7051,7 +7053,7 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
 
     expect(result).toEqual({ key: 'C', action: 'spawned' })
     expect([calls.resumeCalls, calls.killCalls, calls.deleteCalls]).toEqual([[], [], []])
-    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => call.reuse_finished)).toEqual([undefined, true])
+    expect(calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
     expect(errLog).toContain(`spawnForPersona: ${renderPersonaRef('C', 'C')} config_dir label changed (was=${stale}`)
   })
 })
@@ -7762,7 +7764,7 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     const stub = installStub({
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${f.b.key}` }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${f.b.key}` }),
       ],
       getResult: personaRow(f.cfg, f.a.key, { state: 'ended' }),
     })
@@ -8089,7 +8091,7 @@ describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
   // lost race: nothing is killed, deleted or launched.
   test('spawnForPersona waiting branch (b.3ce): dead session + resume not resumable, the re-read finds the row ended → a lost race: retrying, nothing killed, deleted or launched', async () => {
     const killCalls: import('agent-director').KillParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     const getCalls: import('agent-director').GetParams[] = []
@@ -8102,7 +8104,7 @@ describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
       getCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
+        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
       ],
       getQueue: [cannedOk(personaRow(cfg, 'C', { state: 'waiting' }))],
       getResult: personaRow(cfg, 'C', { state: LIVENESS_DEAD_ROW_ENDED }),
@@ -8549,7 +8551,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     const err = make()
     const destructive = {
       killCalls: [] as import('agent-director').KillParams[],
-      deleteCalls: [] as import('agent-director').DeleteParams[],
+      deleteCalls: [] as StubDeleteParams[],
       resumeCalls: [] as import('agent-director').ResumeParams[],
     }
     const opts = (): StubClientOptions => ({ ...workingCollision(cfg), ...destructive })
@@ -8764,7 +8766,7 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
@@ -8775,7 +8777,7 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
       spawnCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
+        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
       ],
       getQueue: [cannedOk(personaRow(cfg, 'C', { state: 'waiting' }))],
       getResult: personaRow(cfg, 'C', { state: LIVENESS_DEAD_ROW_ENDED }),
@@ -8799,7 +8801,7 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { resume_enabled: false })
     installStub({
       findMissingCalls,
@@ -8808,7 +8810,7 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
       deleteCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
+        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
       ],
       getResult: personaRow(cfg, 'C', { state: 'waiting' }),
       sendKeysError: errTmuxSendKeys(),
@@ -11288,7 +11290,7 @@ describe('SR-8.6 invariants', () => {
       spawnCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
       ],
       resumeError: errNoSessionId(),
       getResult: personaRow(cfg, 'C', { state: 'ended' }),
@@ -11968,7 +11970,7 @@ function successSiteConfig(overrides: Partial<Omit<PersonaConfig, 'personas'>> =
 type SpawnResultOf = import('agent-director').SpawnResult
 const collision = () => cannedErr<SpawnResultOf>(errInstanceIdCollision())
 /** A spawn that succeeds, its result carrying `preTrust` (the field absent when it is undefined). */
-const spawnOk = (preTrust?: PreTrust) => cannedOk<Phase1SpawnResult>(cannedSpawnResult(SUCCESS_SITE_ID, preTrust))
+const spawnOk = (preTrust?: PreTrust) => cannedOk<StubSpawnResult>(cannedSpawnResult(SUCCESS_SITE_ID, preTrust))
 
 /**
  * A success site of the ladder: the stub answers that reach it (the launch
@@ -12171,7 +12173,7 @@ describe('b.jg5 SRJ-401: the approver runs after every launch that returns succe
    * flight (the ladder's own reads), and after it the approver's laps:
    * `pending` with `launchStart` (`LAUNCH_START` by default), then `waiting`.
    */
-  function approverReadsPendingThenLive(key: string, launchStart: string = LAUNCH_START): () => Phase1StatusResult {
+  function approverReadsPendingThenLive(key: string, launchStart: string = LAUNCH_START): () => StatusResult {
     let laps = 0
     return () => {
       if (isLaunchInFlight(key)) return cannedStatusResult({ state: 'waiting' })
@@ -12288,7 +12290,7 @@ describe('b.jg5 SRJ-401: the approver runs after every launch that returns succe
   /** The collision `get` reads the persona's row `ended`; the call after `resume` answers `resumeErr` is the timed one. */
   const afterResume = (resumeErr: Error) => (cfg: PersonaConfig, err: Error, pendingRow: CannedGetResult): StubClientOptions => ({
     spawnQueue: [collision(), cannedErr<SpawnResultOf>(err)],
-    getQueue: [cannedOk<Phase1GetResult>(endedRow(cfg))],
+    getQueue: [cannedOk<GetResult>(endedRow(cfg))],
     getResult: pendingRow,
     resumeError: resumeErr,
   })
@@ -12298,7 +12300,7 @@ describe('b.jg5 SRJ-401: the approver runs after every launch that returns succe
     [
       'the retry spawn after the collision get answers ErrSpawnNotFound',
       {
-        script: (_cfg, err, pendingRow) => ({ spawnQueue: [collision(), cannedErr<SpawnResultOf>(err)], getQueue: [cannedErr<Phase1GetResult>(errSpawnNotFound())], getResult: pendingRow }),
+        script: (_cfg, err, pendingRow) => ({ spawnQueue: [collision(), cannedErr<SpawnResultOf>(err)], getQueue: [cannedErr<GetResult>(errSpawnNotFound())], getResult: pendingRow }),
         launchVerb: 'spawn',
       },
     ],
@@ -12307,7 +12309,7 @@ describe('b.jg5 SRJ-401: the approver runs after every launch that returns succe
       {
         script: (cfg, err, pendingRow) => ({
           spawnQueue: [collision(), cannedErr<SpawnResultOf>(err)],
-          getQueue: [cannedOk<Phase1GetResult>(personaRow(cfg, KEY, { state: 'ended', cwd: fixtureSubdir('elsewhere') }))],
+          getQueue: [cannedOk<GetResult>(personaRow(cfg, KEY, { state: 'ended', cwd: fixtureSubdir('elsewhere') }))],
           getResult: pendingRow,
         }),
         launchVerb: LAUNCH_VERB_REUSE_SPAWN,
@@ -12318,7 +12320,7 @@ describe('b.jg5 SRJ-401: the approver runs after every launch that returns succe
     [
       'the resume of an ended row',
       {
-        script: (cfg, err, pendingRow) => ({ spawnQueue: [collision()], getQueue: [cannedOk<Phase1GetResult>(endedRow(cfg))], getResult: pendingRow, resumeError: err }),
+        script: (cfg, err, pendingRow) => ({ spawnQueue: [collision()], getQueue: [cannedOk<GetResult>(endedRow(cfg))], getResult: pendingRow, resumeError: err }),
         launchVerb: 'resume',
       },
     ],
@@ -12819,7 +12821,7 @@ describe('b.jg5 SRJ-413: each launch\'s pre_trust is logged once with the person
   test.each(NO_OBJECT_RESULTS)('the resume of an ended row whose result is %s: the launch writes the absent field\'s line, P\'s, and the ladder still returns resumed', async (_name, value) => {
     const clock = useApproverClock()
     const cfg = successSiteConfig()
-    installStub({ spawnQueue: [collision()], getResult: endedRow(cfg), resumeQueue: [cannedOk(value as unknown as Phase1ResumeResult)] })
+    installStub({ spawnQueue: [collision()], getResult: endedRow(cfg), resumeQueue: [cannedOk(value as unknown as StubResumeResult)] })
 
     let result: SpawnPersonaResult | undefined
     const errLog = await withCapturedErr(async () => {
@@ -13042,7 +13044,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect([calls.killCalls, calls.deleteCalls]).toEqual([[], []])
-    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => call.reuse_finished)).toEqual([undefined, true])
+    expect(calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
     expect(notices).toHaveLength(0)
   })
@@ -13267,7 +13269,7 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${CH}` }),
       ],
       getError: errSpawnNotFound(),
     })
@@ -13287,7 +13289,7 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${CH}` }),
       ],
       getResult: personaRow(cfg, CH, { state: 'ended' }),
     })
@@ -13322,7 +13324,7 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${CH}` }),
       ],
       getResult: personaRow(cfg, CH, { state: 'ended' }),
       resumeError: errNoSessionId(),
@@ -13378,7 +13380,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     /** The resume's rejection; default `errJsonlMissing(jsonlDescription)`. */
     resumeError?: Error
     spawnCalls?: import('agent-director').SpawnParams[]
-    deleteCalls?: import('agent-director').DeleteParams[]
+    deleteCalls?: StubDeleteParams[]
     /** Persona key the row belongs to; default the stand-in CH. */
     key?: string
   }) {
@@ -13388,7 +13390,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       deleteCalls: opts.deleteCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${key}` }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${key}` }),
       ],
       resumeError: opts.resumeError ?? errJsonlMissing(opts.jsonlDescription),
       getResult: opts.getError
@@ -13442,10 +13444,10 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       // C1 fresh (clean spawn), C2 collision→resumed, C3 collision→ErrJsonlMissing
       // amnesia, C4 spawn throws → failed.
       spawnQueue: [
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C1' }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C1' }),
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C3' }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C3' }),
         cannedErr<import('agent-director').SpawnResult>(errGeneric('spawn', 'ErrSpawnBroken')),
       ],
     })
@@ -13683,7 +13685,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   test('inconclusive (a): the diagnostic row fetch finds no row (ErrSpawnNotFound) → no throw, fresh-after-inconclusive-amnesia', async () => {
     captureStartupErrors()
     const spawnCalls: import('agent-director').SpawnParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     // First get() (collision recovery) returns ended; second get() (diagnostic)
     // finds no row.
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
@@ -13697,7 +13699,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(result.action).toBe('fresh-after-inconclusive-amnesia')
     expect(deleteCalls).toEqual([])
     // The colliding optimistic spawn, then the one reuse spawn of the same id.
-    expect((spawnCalls as Phase1SpawnParams[]).map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+    expect(spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
       [`cscb_${CH}`, undefined],
       [`cscb_${CH}`, true],
     ])
@@ -13738,7 +13740,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   test('b.jg5 SRJ-105, SRJ-316: inconclusive (a) via startup with a CONFIG answer at the row fetch → refused: no amnesia counter, no jsonl-diagnosis-inconclusive record, no delete or fresh spawn, no notice, one ad-config-malformed onset', async () => {
     const readLog = captureStartupErrors()
     const spawnCalls: import('agent-director').SpawnParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     const err = errConfigMalformed()
     installDiagnosisGetFailure(cfg, () => err, { spawnCalls, deleteCalls })
@@ -13768,7 +13770,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   function installDiagnosisGetFailure(
     cfg: PersonaConfig,
     makeErr: () => unknown,
-    calls: { spawnCalls: import('agent-director').SpawnParams[]; deleteCalls: import('agent-director').DeleteParams[] },
+    calls: { spawnCalls: import('agent-director').SpawnParams[]; deleteCalls: StubDeleteParams[] },
     jsonlDescription?: string,
   ): void {
     const stub = installStub({
@@ -13776,7 +13778,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       deleteCalls: calls.deleteCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${CH}` }),
       ],
       resumeError: errJsonlMissing(jsonlDescription),
     })
@@ -13826,7 +13828,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     setConflictLatch(latch)
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     const spawnCalls: import('agent-director').SpawnParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     installDiagnosisGetFailure(cfg, leakyUnusableName, { spawnCalls, deleteCalls })
     const shown = describeAdFailureForLog(leakyUnusableName())
     let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
@@ -13924,7 +13926,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     const persona = personaOf(cfg, CH)
     const spawnCalls: import('agent-director').SpawnParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     installDiagnosisGetFailure(cfg, makeErr, { spawnCalls, deleteCalls })
     let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
     const errArgs = await withErrArgs(async () => {
@@ -14003,7 +14005,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     })
 
     expect(result?.action).toBe('fresh-after-amnesia')
-    expect((spawnCalls as Phase1SpawnParams[]).map((call) => call.reuse_finished)).toEqual([undefined, true])
+    expect(spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
     const entry = onlyStartupEntry(readLog(), JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
     expect(entry).toContain('2 message(s) since spawn')
     const cause = entry.slice(entry.lastIndexOf(' — ') + ' — '.length)
@@ -14300,7 +14302,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       message_archive_db: makeArchiveWithMessagesSince(startedAt, 2),
     })
     const spawnCalls: import('agent-director').SpawnParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     const getCalls: import('agent-director').GetParams[] = []
     installStub({
       spawnCalls,
@@ -14318,7 +14320,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(result?.action).toBe('fresh-after-amnesia')
     // The collision get, then the diagnosis get; the colliding plain spawn, then the one reuse.
     expect([getCalls.length, deleteCalls]).toEqual([2, []])
-    expect((spawnCalls as Phase1SpawnParams[]).map((call) => call.reuse_finished)).toEqual([undefined, true])
+    expect(spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
     const log = readLog()
     expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
     const entry = onlyStartupEntry(log, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
@@ -14715,7 +14717,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(log).not.toContain(resolveJsonlPath(CWD, 'sess-own', topLevel))
     expect(log).not.toContain(`${topLevel}/projects`)
     // The reuse spawn after the diagnosis runs under the persona's directory too.
-    expect((spawnCalls[1] as Phase1SpawnParams | undefined)?.reuse_finished).toBe(true)
+    expect(spawnCalls[1]?.reuse_finished).toBe(true)
     expect(spawnCalls[1]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(own)
   })
 
@@ -14728,7 +14730,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     installStub({
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${CH}` }),
       ],
       getResult: personaRow(cfg, CH, { state: 'ended' }),
       resumeError: errNoSessionId(),
@@ -14752,7 +14754,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     for (const verb of ['get', 'spawn', 'resume', 'delete'] as const) {
       const original = client[verb]!
       client[verb] = (params) => {
-        order.push(verb === 'spawn' && (params as Phase1SpawnParams).reuse_finished === true ? 'reuse spawn' : verb)
+        order.push(verb === 'spawn' && (params as SpawnParams).reuse_finished === true ? 'reuse spawn' : verb)
         return original.call(stub, params)
       }
     }
@@ -14790,7 +14792,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   test.each(SRJ712_VERDICTS)('b.jg5 SRJ-712 (AC 60), %s, through the start pass: the diagnosis get comes before the one reuse spawn and nothing is deleted; the start summary counts the amnesia action; its entry and notice are kept; each of its lines, entries and notices says the persona is brought up fresh by a reuse spawn and its row is kept, and none says delete', async (_label, verdict) => {
     const readLog = captureStartupErrors()
     const cfg = srj712Config(verdict.archived)
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     const order = recordAmnesiaCalls(installAmnesia({ cfg, deleteCalls, getResult: SRJ712_ROW }))
 
     let result!: Awaited<ReturnType<typeof startupSessionManager>>
@@ -14830,7 +14832,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   test('b.jg5 SRJ-712: lost, then a reuse spawn that fails (ErrTmuxSessionCreate): the lost entry is kept, the lost notice is not posted, and only the spawn-failure notice is; nothing is deleted', async () => {
     const readLog = captureStartupErrors()
     const cfg = srj712Config(2)
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     const stub = installStub({
       deleteCalls,
       spawnQueue: [
@@ -14886,14 +14888,14 @@ describe('b.jgf: ErrJsonlNeverWritten → a lossless reuse spawn of the same id'
    */
   function installNeverWritten(cfg: PersonaConfig, opts?: {
     spawnCalls?: import('agent-director').SpawnParams[]
-    deleteCalls?: import('agent-director').DeleteParams[]
+    deleteCalls?: StubDeleteParams[]
     getCalls?: import('agent-director').GetParams[]
   }) {
     return installStub({
       ...opts,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+        cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${CH}` }),
       ],
       resumeError: errJsonlNeverWritten(),
       getResult: personaRow(cfg, CH, {
@@ -14912,7 +14914,7 @@ describe('b.jgf: ErrJsonlNeverWritten → a lossless reuse spawn of the same id'
   // posted into the channel.
   test('REGRESSION: resume ErrJsonlNeverWritten → one reuse spawn of the same id and no delete, action=spawned, no spawn-failure notice, no diagnosis get', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const deleteCalls: StubDeleteParams[] = []
     const getCalls: import('agent-director').GetParams[] = []
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     installNeverWritten(cfg, { spawnCalls, deleteCalls, getCalls })
@@ -14924,7 +14926,7 @@ describe('b.jgf: ErrJsonlNeverWritten → a lossless reuse spawn of the same id'
     expect(result).toEqual({ key: CH, action: 'spawned' })
     // Nothing deleted: the same id is spawned again with the reuse flag (b.jg5 SRJ-707).
     expect(deleteCalls).toEqual([])
-    expect((spawnCalls as Phase1SpawnParams[]).map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+    expect(spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
       [`cscb_${CH}`, undefined],
       [`cscb_${CH}`, true],
     ])
@@ -15824,7 +15826,7 @@ describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, check
     assertNoLeak(lines)
   })
 
-  test.each<[string, CannedResponse<Phase1StatusResult>, string]>([
+  test.each<[string, CannedResponse<StatusResult>, string]>([
     ['ended', cannedOk(cannedStatusResult({ state: 'ended' })), KILL_ROW_FINISHED_ENDED],
     ['missing', cannedOk(cannedStatusResult({ state: 'missing' })), KILL_ROW_FINISHED_MISSING],
     ['ErrSpawnNotFound', cannedErr(errSpawnNotFound()), KILL_ROW_FINISHED_NO_ROW],
@@ -15950,7 +15952,7 @@ describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, check
     expect(h.latch.isLatched(p)).toBe(false)
   })
 
-  test.each<[string, boolean, Phase1StatusResult]>([
+  test.each<[string, boolean, StatusResult]>([
     ['P marked, its row read pending with a launch start', true, cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE })],
     ['P marked, its own row read pending with no launch start (no latch here)', true, cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE })],
     ['P recorded with no mark, its row read waiting', false, cannedStatusResult({ state: 'waiting' })],
@@ -17541,7 +17543,7 @@ describe('b.jg5 SRJ-702: the live-row sequence\'s kill of a row read live at a r
   // b.jg5 SRJ-702 (hatch A2), SRJ-502: a read between tries that latches P
   // ends the tries with no further kill; the latch stops the sequence, and
   // nothing is armed for the latched persona.
-  test.each<[string, CannedResponse<Phase1StatusResult>, Record<string, unknown>]>([
+  test.each<[string, CannedResponse<StatusResult>, Record<string, unknown>]>([
     ['an UNUSABLE NAME answer', cannedErr(errUnusableName()), { latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME, refusedOperation: REFUSED_OPERATION_NONE, rowState: LATCH_ROW_STATE_UNREADABLE }],
     ['P\'s own row pending with no launch start', cannedOk(cannedStatusResult({ state: 'pending', launch_started_at: SAMPLE_LAUNCH_START_NONE })), { latchCase: LATCH_CASE_LAUNCH_START_NOT_RECORDED, rowState: latchRowStateRead('pending') }],
   ])('a read between tries answering %s latches P and ends the tries with no further kill: the sequence stops for the latch; no get, launch or delete, nothing armed', async (_label, read, record) => {
@@ -17719,7 +17721,7 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
   // ends the tries with no further kill; an ErrTmuxKillFailed that then stands
   // raises the ordinary version with the latched closing, after P's own hold
   // post, and no retry timer runs for P.
-  test.each<[string, () => Error, CannedResponse<Phase1StatusResult>]>([
+  test.each<[string, () => Error, CannedResponse<StatusResult>]>([
     ['a survivor-naming ErrTmuxKillFailed', survivorErr, cannedErr(errUnusableName())],
     ['an ErrTmuxKillFailed naming no survivor', () => errTmuxKillFailed(), cannedErr(errUnusableName())],
     ['an ErrTmuxKillFailed naming no survivor (P\'s own row read pending with no launch start)', () => errTmuxKillFailed(), cannedOk(cannedStatusResult({ state: 'pending', launch_started_at: SAMPLE_LAUNCH_START_NONE }))],
@@ -23576,7 +23578,7 @@ describe('b.jg5 SRJ-513, SRJ-114, SRJ-408: the controls at the collision get —
 interface LaunchStartStatusSite {
   readonly name: string
   setup?(h: RecoveryHarness): void
-  script(h: RecoveryHarness, persona: Persona, result: Phase1StatusResult): RecoveryStubScript
+  script(h: RecoveryHarness, persona: Persona, result: StatusResult): RecoveryStubScript
   /** Whether the site is the working-row wait's (which logs its latched end). */
   readonly wait: boolean
 }
@@ -24077,7 +24079,7 @@ interface HoldReadSite {
 }
 
 /** A `status` answer for `answer`. */
-const holdStatusAnswer = (answer: HoldReadAnswer): CannedResponse<Phase1StatusResult> =>
+const holdStatusAnswer = (answer: HoldReadAnswer): CannedResponse<StatusResult> =>
   'noRow' in answer ? cannedErr(errSpawnNotFound()) : cannedOk(cannedStatusResult({ state: answer.state }))
 
 /** The read name an own-row read site gives in a hold's end line. */
@@ -26227,7 +26229,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     site.setup?.(h)
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), site.row(h, p)))],
+      getQueue: [cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), site.row(h, p)))],
       getResult: endedWithSession(h, p),
       ...site.script,
       ...extra,
@@ -26287,7 +26289,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     const persona = harnessPersona(h, p)
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, route.row(h, p, LIVE))), cannedOk<Phase1GetResult>(harnessRow(h, persona, route.row(h, p, reread)))],
+      getQueue: [cannedOk<GetResult>(harnessRow(h, persona, route.row(h, p, LIVE))), cannedOk<GetResult>(harnessRow(h, persona, route.row(h, p, reread)))],
       getResult: endedWithSession(h, p),
       ...NOT_INTERACTIVE_WAITING,
     })
@@ -26366,7 +26368,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     const err = unavailableAt('get')
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, route.row(h, p, LIVE))), cannedErr<Phase1GetResult>(err)],
+      getQueue: [cannedOk<GetResult>(harnessRow(h, persona, route.row(h, p, LIVE))), cannedErr<GetResult>(err)],
       ...NOT_INTERACTIVE_WAITING,
     })
     const order = recordCallOrder(h)
@@ -26463,7 +26465,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
   function scriptReuseSite(h: RecoveryHarness, p: string, site: ReuseSite, ...spawns: Array<Error | undefined>): void {
     site.setup?.(h)
     h.script({
-      spawnQueue: [cannedErr(errInstanceIdCollision()), ...spawns.map((err) => (err === undefined ? cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: personaInstanceId(p) }) : cannedErr<import('agent-director').SpawnResult>(err)))],
+      spawnQueue: [cannedErr(errInstanceIdCollision()), ...spawns.map((err) => (err === undefined ? cannedOk<StubSpawnResult>({ claude_instance_id: personaInstanceId(p) }) : cannedErr<import('agent-director').SpawnResult>(err)))],
       getResult: harnessRow(h, harnessPersona(h, p), site.row(h, p)),
       ...(site.resumeError === undefined ? {} : { resumeError: site.resumeError() }),
     })
@@ -26613,7 +26615,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     const persona = harnessPersona(h, p)
     h.script({
       ...collided(h, persona, { state }),
-      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, { state }))],
+      getQueue: [cannedOk<GetResult>(harnessRow(h, persona, { state }))],
       getResult: harnessRow(h, persona, { state: LIVENESS_DEAD_ROW_ENDED }),
       ...script,
       resumeError: errSpawnNotResumable(),
@@ -26660,7 +26662,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     const persona = harnessPersona(h, p)
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, { state: 'waiting' })), cannedOk<Phase1GetResult>(harnessRow(h, persona, { state: 'waiting' }))],
+      getQueue: [cannedOk<GetResult>(harnessRow(h, persona, { state: 'waiting' })), cannedOk<GetResult>(harnessRow(h, persona, { state: 'waiting' }))],
       getResult: endedWithSession(h, p),
       resumeQueue: [cannedErr(errSpawnNotResumable()), cannedErr(errJsonlMissing())],
       ...GONE_WAITING,
@@ -26924,7 +26926,7 @@ describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case
     const row = CONFLICT_CASE_ROWS.find((caseRow) => caseRow.site === 'plain spawn' && caseRow.stubCase === 'scan-leftover')!
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(row.build())],
-      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION))],
+      getQueue: [cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION))],
       getError: errSpawnNotFound(),
       resumeError: errSpawnNotFound(),
     })
@@ -27052,11 +27054,11 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
    * once (a later `resume` succeeds), its re-read answering `reread`, and
    * every later `get` (a sequence's) reading the row `ended` with a session id.
    */
-  function scriptNotResumable(h: RecoveryHarness, p: string, path: NotResumablePath, reread: CannedResponse<Phase1GetResult>): void {
+  function scriptNotResumable(h: RecoveryHarness, p: string, path: NotResumablePath, reread: CannedResponse<GetResult>): void {
     const persona = harnessPersona(h, p)
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, { state: path === 'dead evidence' ? 'waiting' : LIVENESS_DEAD_ROW_ENDED })), reread],
+      getQueue: [cannedOk<GetResult>(harnessRow(h, persona, { state: path === 'dead evidence' ? 'waiting' : LIVENESS_DEAD_ROW_ENDED })), reread],
       getResult: harnessRow(h, persona, ENDED_WITH_SESSION),
       resumeQueue: [cannedErr(errSpawnNotResumable())],
       ...(path === 'dead evidence' ? { sendKeysError: errTmuxSendKeys() } : {}),
@@ -27079,7 +27081,7 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
   test.each([...PATHS])('a covered pending row with a launch start (AC 3: held at the dev-channels dialog, its session id kept), the path holding %s: the ladder\'s pending step answers no-op and arms P\'s timer in pending-only mode (b.jg5 SRJ-409); no sequence, kill, delete or launch; nothing counted or posted; its arms equal a direct call of the ladder\'s pending branch on the same row', async (path) => {
     const { h, p, b } = srj105Build()
     const pendingOf = (key: string) => harnessRow(h, harnessPersona(h, key), { state: AGENT_DIRECTOR_PENDING_STATE, claude_session_id: ENDED_WITH_SESSION.claude_session_id })
-    scriptNotResumable(h, p, path, cannedOk<Phase1GetResult>(pendingOf(p)))
+    scriptNotResumable(h, p, path, cannedOk<GetResult>(pendingOf(p)))
     const order = recordCallOrder(h)
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'no-op' })
@@ -27107,7 +27109,7 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
     const { h, p } = srj105Build()
     const persona = harnessPersona(h, p)
     const mismatched = harnessRow(h, persona, relabelledRow(h, persona, AGENT_DIRECTOR_PENDING_STATE))
-    scriptNotResumable(h, p, path, cannedOk<Phase1GetResult>(mismatched))
+    scriptNotResumable(h, p, path, cannedOk<GetResult>(mismatched))
     const order = recordCallOrder(h)
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
@@ -27127,7 +27129,7 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
     ['a waiting row carrying a provenance_conflict note (latch case "conflicting labels")', (h, p) => harnessRow(h, harnessPersona(h, p), { state: 'waiting', liveness_note: provenanceNote })],
   ])('the re-read latches P on %s: latched, with no further call, no sequence and no kill, though the path holds dead evidence', async (_name, row) => {
     const { h, p } = srj105Build()
-    scriptNotResumable(h, p, 'dead evidence', cannedOk<Phase1GetResult>(row(h, p)))
+    scriptNotResumable(h, p, 'dead evidence', cannedOk<GetResult>(row(h, p)))
     const order = recordCallOrder(h)
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
@@ -27139,10 +27141,10 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
   })
 
   /** Re-reads that are a lost race on a path with no evidence: a finished row, no row, and every live state but `pending`. */
-  const LOST_RACE_REREADS: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => CannedResponse<Phase1GetResult>]> = [
-    ...[...AGENT_DIRECTOR_DEAD_STATES].map((state) => [`the row ${state}`, (h: RecoveryHarness, p: string) => cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), { state }))] as const),
-    ['no row (ErrSpawnNotFound)', () => cannedErr<Phase1GetResult>(errSpawnNotFound())],
-    ...[...AGENT_DIRECTOR_LIVE_STATES].filter((state) => state !== AGENT_DIRECTOR_PENDING_STATE).map((state) => [`the row ${state}, the path holding no dead evidence`, (h: RecoveryHarness, p: string) => cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), { state }))] as const),
+  const LOST_RACE_REREADS: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => CannedResponse<GetResult>]> = [
+    ...[...AGENT_DIRECTOR_DEAD_STATES].map((state) => [`the row ${state}`, (h: RecoveryHarness, p: string) => cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), { state }))] as const),
+    ['no row (ErrSpawnNotFound)', () => cannedErr<GetResult>(errSpawnNotFound())],
+    ...[...AGENT_DIRECTOR_LIVE_STATES].filter((state) => state !== AGENT_DIRECTOR_PENDING_STATE).map((state) => [`the row ${state}, the path holding no dead evidence`, (h: RecoveryHarness, p: string) => cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), { state }))] as const),
   ]
 
   test.each(LOST_RACE_REREADS)('the re-read reads %s: a lost race: retrying; no kill, delete or launch; nothing counted or posted; P armed with the lost-race cause and re-evaluated at its retry', async (_name, reread) => {
@@ -27173,7 +27175,7 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
   )
   test.each(REFUSED_REREADS)('the re-read is refused (%s), the path holding %s: no sequence, kill or launch; nothing counted; P armed with the read\'s own cause, then the lost-race cause', async (_what, path, make, cause) => {
     const { h, p } = srj105Build()
-    scriptNotResumable(h, p, path, cannedErr<Phase1GetResult>(make()))
+    scriptNotResumable(h, p, path, cannedErr<GetResult>(make()))
     const order = recordCallOrder(h)
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
@@ -27365,7 +27367,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     const persona = harnessPersona(h, p)
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, { state: path.collision })), cannedOk<Phase1GetResult>(harnessRow(h, persona, { state: rereadState }))],
+      getQueue: [cannedOk<GetResult>(harnessRow(h, persona, { state: path.collision })), cannedOk<GetResult>(harnessRow(h, persona, { state: rereadState }))],
       getResult: harnessRow(h, persona, ENDED_WITH_SESSION),
       resumeQueue: [cannedErr(errSpawnNotResumable())],
       ...path.script,
@@ -27459,10 +27461,10 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
   test.each(UNKNOWN_REREAD_STATES)('SRJ-710 at the sequence\'s step 6: GONE-based evidence and a waiting re-read start the sequence; its step-6 resume answering ErrSpawnNotResumable, the re-read finding %s, ends it not launched: no second sequence, kill or launch; nothing counted or posted; the lost-race cause armed', async (_label, state, named) => {
     const { h, p, b } = srj105Build()
     const persona = harnessPersona(h, p)
-    const ended = cannedOk<Phase1GetResult>(harnessRow(h, persona, ENDED_WITH_SESSION))
+    const ended = cannedOk<GetResult>(harnessRow(h, persona, ENDED_WITH_SESSION))
     // The collision get, the ladder's re-read, the sequence's two gets, then step 6's re-read.
     scriptPath(h, p, PATH_CAUSES[0]!, {
-      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, { state: 'waiting' })), cannedOk<Phase1GetResult>(harnessRow(h, persona, { state: 'waiting' })), ended, ended, cannedOk<Phase1GetResult>(harnessRow(h, persona, { state }))],
+      getQueue: [cannedOk<GetResult>(harnessRow(h, persona, { state: 'waiting' })), cannedOk<GetResult>(harnessRow(h, persona, { state: 'waiting' })), ended, ended, cannedOk<GetResult>(harnessRow(h, persona, { state }))],
       resumeQueue: [cannedErr(errSpawnNotResumable()), cannedErr(errSpawnNotResumable())],
     })
     const order = recordCallOrder(h)
@@ -27592,15 +27594,15 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     readonly voided: Voided
   }
 
-  const waitingOf = (h: RecoveryHarness, p: string): CannedResponse<Phase1GetResult> => cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), { state: 'waiting' }))
-  const endedOf = (h: RecoveryHarness, p: string): CannedResponse<Phase1GetResult> => cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION))
-  const collides = (): CannedResponse<Phase1SpawnResult> => cannedErr(errInstanceIdCollision())
+  const waitingOf = (h: RecoveryHarness, p: string): CannedResponse<GetResult> => cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), { state: 'waiting' }))
+  const endedOf = (h: RecoveryHarness, p: string): CannedResponse<GetResult> => cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION))
+  const collides = (): CannedResponse<StubSpawnResult> => cannedErr(errInstanceIdCollision())
 
   const RERUNS: readonly Rerun[] = [
     {
       // b.jg5 SRJ-111: the collision get found no row; the plain spawn after it collides.
       name: 'the collision get answers ErrSpawnNotFound and the plain spawn after it collides',
-      script: (h, p) => ({ spawnQueue: [collides(), collides()], getQueue: [cannedErr<Phase1GetResult>(errSpawnNotFound()), waitingOf(h, p), waitingOf(h, p)] }),
+      script: (h, p) => ({ spawnQueue: [collides(), collides()], getQueue: [cannedErr<GetResult>(errSpawnNotFound()), waitingOf(h, p), waitingOf(h, p)] }),
       calls: ['spawn', 'get', 'spawn', 'get', 'resume', 'get'],
       voided: { pieces: [CARRIED_GONE], by: deadEvidenceVoidingRead(DEAD_EVIDENCE_READ_BY_COLLISION_GET, LATCH_ROW_STATE_NO_ROW) },
     },
@@ -27719,9 +27721,9 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
   const listing = (p: string, where: 'unverified_ids' | 'ids'): import('agent-director').FindMissingResult => cannedFindMissing({ rows: { [personaInstanceId(p)]: where } })
 
   /** The SRJ-120 `get`'s answers: the row ended or missing, or no row. */
-  const POST_SWEEP_READS: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => CannedResponse<Phase1GetResult>, LatchRowState]> = [
-    ...[...AGENT_DIRECTOR_DEAD_STATES].map((state) => [`the row ${state}`, (h: RecoveryHarness, p: string) => cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), { state })), latchRowStateRead(state)] as const),
-    ['no row (ErrSpawnNotFound)', () => cannedErr<Phase1GetResult>(errSpawnNotFound()), LATCH_ROW_STATE_NO_ROW],
+  const POST_SWEEP_READS: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => CannedResponse<GetResult>, LatchRowState]> = [
+    ...[...AGENT_DIRECTOR_DEAD_STATES].map((state) => [`the row ${state}`, (h: RecoveryHarness, p: string) => cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), { state })), latchRowStateRead(state)] as const),
+    ['no row (ErrSpawnNotFound)', () => cannedErr<GetResult>(errSpawnNotFound()), LATCH_ROW_STATE_NO_ROW],
   ]
 
   test.each(POST_SWEEP_READS)('SRJ-120: a waiting row whose reconnect answers GONE (tmux-gone), its find-missing run listing P in unverified_ids, the get after it finding %s; resume answers ErrSpawnNotResumable and the re-read finds waiting: the get voided the GONE, a lost race', async (_label, read, readState) => {
@@ -27784,7 +27786,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     const persona = harnessPersona(h, p)
     h.script({
       spawnQueue: [collides()],
-      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, relabelledRow(h, persona, 'waiting'))), endedOf(h, p)],
+      getQueue: [cannedOk<GetResult>(harnessRow(h, persona, relabelledRow(h, persona, 'waiting'))), endedOf(h, p)],
       sendKeysError: errTmuxSendKeys(),
       findMissingResult: listing(p, 'unverified_ids'),
     })
@@ -28751,7 +28753,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
    * launch was decided.
    */
   function recordDuringReuse(h: RecoveryHarness, key: string): void {
-    const client = h.stub.client as unknown as { spawn: (params: Phase1SpawnParams) => unknown }
+    const client = h.stub.client as unknown as { spawn: (params: SpawnParams) => unknown }
     const spawn = client.spawn.bind(client)
     client.spawn = (params) => {
       if (params.reuse_finished === true) h.retireKey(key)
@@ -29076,7 +29078,7 @@ const START_RESULT_ROWS: ReadonlyArray<readonly [string, StartResultRow]> = [
         const persona = harnessPersona(h, p)
         h.script({
           spawnQueue: [cannedErr(errInstanceIdCollision())],
-          getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, ENDED_WITH_SESSION)), cannedOk<Phase1GetResult>(harnessRow(h, persona, { state: 'waiting' }))],
+          getQueue: [cannedOk<GetResult>(harnessRow(h, persona, ENDED_WITH_SESSION)), cannedOk<GetResult>(harnessRow(h, persona, { state: 'waiting' }))],
           resumeQueue: [cannedErr(errSpawnNotResumable())],
         })
       },
@@ -30492,14 +30494,14 @@ interface PlainSpawnSite {
   readonly key: PlainSpawnSiteKey
   readonly name: string
   /** Stub answers bringing P's launch to the plain spawn, which answers `answer` (success when unset), the `get`s after it answering `after`. */
-  script(h: RecoveryHarness, p: string, answer: Error | undefined, after: ReadonlyArray<CannedResponse<Phase1GetResult>>): RecoveryStubScript
+  script(h: RecoveryHarness, p: string, answer: Error | undefined, after: ReadonlyArray<CannedResponse<GetResult>>): RecoveryStubScript
   launch(h: RecoveryHarness, p: string): Promise<unknown>
   /** The launch and read calls (`LAUNCH_AND_READ_VERBS`) up to and including the plain spawn. */
   readonly calls: readonly string[]
 }
 
 /** The plain spawn's own answer, queued after the site's earlier spawns: none for a success (the stub's default). */
-const plainSpawnAnswer = (answer: Error | undefined): Array<CannedResponse<Phase1SpawnResult>> => (answer === undefined ? [] : [cannedErr(answer)])
+const plainSpawnAnswer = (answer: Error | undefined): Array<CannedResponse<StubSpawnResult>> => (answer === undefined ? [] : [cannedErr(answer)])
 
 const PLAIN_SPAWN_SITES: Readonly<Record<PlainSpawnSiteKey, PlainSpawnSite>> = {
   first: {
@@ -30524,7 +30526,7 @@ const PLAIN_SPAWN_SITES: Readonly<Record<PlainSpawnSiteKey, PlainSpawnSite>> = {
     name: 'the spawn after resume answers ErrSpawnNotFound (resumeOrFreshSpawn)',
     script: (h, p, answer, after) => ({
       spawnQueue: [cannedErr(errInstanceIdCollision()), ...plainSpawnAnswer(answer)],
-      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION)), ...after],
+      getQueue: [cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION)), ...after],
       resumeError: errSpawnNotFound(),
     }),
     launch: (h, p) => h.launch(p),
@@ -30687,7 +30689,7 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
   test.each(PLAIN_SPAWN_ROWS.flatMap((row) => row.sites.map((key) => [PLAIN_SPAWN_SITES[key].name, row.name, PLAIN_SPAWN_SITES[key], row] as const)))('SRJ-111 at %s: the plain spawn answering %s', async (_site, _row, site, row) => {
     const { h, p, b } = srj105Build()
     const rechecks = row.recheck === true ? h.recheckAnswers(PHASE1_RC_VERSION) : undefined
-    const after = row.getAfter === undefined ? [] : [row.getAfter === 'none' ? cannedErr<Phase1GetResult>(errSpawnNotFound()) : cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED }))]
+    const after = row.getAfter === undefined ? [] : [row.getAfter === 'none' ? cannedErr<GetResult>(errSpawnNotFound()) : cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED }))]
     h.script(site.script(h, p, row.make?.(), after))
     const order = recordCallOrder(h)
 
@@ -30744,7 +30746,7 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
     [
       'the retry spawn collides; the re-run\'s get reads the row ended with a session id: it is resumed',
       'retry',
-      (h, p) => ({ spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errInstanceIdCollision())], getQueue: [cannedErr(errSpawnNotFound()), cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION))] }),
+      (h, p) => ({ spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errInstanceIdCollision())], getQueue: [cannedErr(errSpawnNotFound()), cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION))] }),
       ['spawn', 'get', 'spawn', 'get', 'resume'],
       { action: 'resumed' },
       [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
@@ -30755,7 +30757,7 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
       'resume',
       (h, p) => ({
         spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errInstanceIdCollision())],
-        getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION)), cannedErr(errSpawnNotFound())],
+        getQueue: [cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION)), cannedErr(errSpawnNotFound())],
         resumeError: errSpawnNotFound(),
       }),
       ['spawn', 'get', 'resume', 'spawn', 'get', 'spawn'],
@@ -30790,7 +30792,7 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
       'resume',
       (h, p) => ({
         spawnQueue: [0, 1, 2].map(() => cannedErr(errInstanceIdCollision())),
-        getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION)), cannedErr(errSpawnNotFound())],
+        getQueue: [cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION)), cannedErr(errSpawnNotFound())],
         resumeError: errSpawnNotFound(),
       }),
       ['spawn', 'get', 'resume', 'spawn', 'get', 'spawn'],
@@ -31249,19 +31251,19 @@ describe('b.jg5 SRJ-410, SRJ-409, SRJ-710: the ladder\'s pending step on P\'s co
   const goneAnswer = (state: DeadRowRead): PendingRowRuleAnswer => ({ kind: PENDING_ROW_RULE_GONE, state })
 
   /** What the rule's `get` after its run reads, and the ladder's answer for it. */
-  const RULE_GETS: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => CannedResponse<Phase1GetResult>, SpawnPersonaResult['action'], PendingRowRuleAnswer | undefined]> = [
-    ['still pending (not judged): a refusal', (h, p) => cannedOk<Phase1GetResult>(pendingRowOf(h, p)), 'no-op', undefined],
-    ['waiting: live', (h, p) => cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), { state: 'waiting' })), 'no-op', undefined],
+  const RULE_GETS: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => CannedResponse<GetResult>, SpawnPersonaResult['action'], PendingRowRuleAnswer | undefined]> = [
+    ['still pending (not judged): a refusal', (h, p) => cannedOk<GetResult>(pendingRowOf(h, p)), 'no-op', undefined],
+    ['waiting: live', (h, p) => cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), { state: 'waiting' })), 'no-op', undefined],
     ...([LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING] as const).map(
-      (state) => [`${state}: gone`, (h: RecoveryHarness, p: string) => cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), { state })), SPAWN_ACTION_RETRYING, goneAnswer(state)] as const,
+      (state) => [`${state}: gone`, (h: RecoveryHarness, p: string) => cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), { state })), SPAWN_ACTION_RETRYING, goneAnswer(state)] as const,
     ),
-    ['no row (ErrSpawnNotFound): gone', () => cannedErr<Phase1GetResult>(errSpawnNotFound()), SPAWN_ACTION_RETRYING, goneAnswer(LIVENESS_DEAD_ROW_NO_ROW)],
+    ['no row (ErrSpawnNotFound): gone', () => cannedErr<GetResult>(errSpawnNotFound()), SPAWN_ACTION_RETRYING, goneAnswer(LIVENESS_DEAD_ROW_NO_ROW)],
   ]
 
   test.each(RULE_GETS)('inside a retry, the rule\'s get reading %s: the ladder answers %s, with one retrying line for a gone row; nothing launched, killed, counted or posted; no arm beyond the step\'s', async (_what, ruleGet, action, gone) => {
     const { h, p } = srj105Build()
     await pastSampleGrace(h)
-    h.script({ ...collided(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE }), getQueue: [cannedOk<Phase1GetResult>(pendingRowOf(h, p)), ruleGet(h, p)] })
+    h.script({ ...collided(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE }), getQueue: [cannedOk<GetResult>(pendingRowOf(h, p)), ruleGet(h, p)] })
     const order = recordCallOrder(h)
 
     expect(await runInTimerRetry(p, () => h.launch(p))).toStrictEqual({ key: p, action })
@@ -31279,7 +31281,7 @@ describe('b.jg5 SRJ-410, SRJ-409, SRJ-710: the ladder\'s pending step on P\'s co
     const { h, p } = srj105Build()
     await pastSampleGrace(h)
     const err = unavailableAt('get')
-    h.script({ ...collided(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE }), getQueue: [cannedOk<Phase1GetResult>(pendingRowOf(h, p)), cannedErr<Phase1GetResult>(err)] })
+    h.script({ ...collided(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE }), getQueue: [cannedOk<GetResult>(pendingRowOf(h, p)), cannedErr<GetResult>(err)] })
 
     expect(await runInTimerRetry(p, () => h.launch(p))).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
 
@@ -31324,7 +31326,7 @@ describe('b.jg5 SRJ-410, SRJ-409, SRJ-710: the ladder\'s pending step on P\'s co
     const persona = harnessPersona(h, p)
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, ENDED_WITH_SESSION)), cannedOk<Phase1GetResult>(pendingRowOf(h, p))],
+      getQueue: [cannedOk<GetResult>(harnessRow(h, persona, ENDED_WITH_SESSION)), cannedOk<GetResult>(pendingRowOf(h, p))],
       getResult: pendingRowOf(h, p),
       resumeQueue: [cannedErr(errSpawnNotResumable())],
     })
@@ -33351,7 +33353,7 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
     const record = latchForRecheck(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
     h.script({
       ...bothRead(LIVENESS_DEAD_ROW_ENDED),
-      spawnQueue: [0, 1, 2].map(() => cannedErr<Phase1SpawnResult>(errInstanceIdCollision())),
+      spawnQueue: [0, 1, 2].map(() => cannedErr<StubSpawnResult>(errInstanceIdCollision())),
       getResult: harnessRow(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED }),
     })
     const eventsBefore = h.latchEvents.length
@@ -33489,7 +33491,7 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
     h.script({
       statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }),
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), elsewhere(h, 'waiting')))],
+      getQueue: [cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), elsewhere(h, 'waiting')))],
       getError: errSpawnNotFound(),
     })
     const order = recordCallOrder(h)

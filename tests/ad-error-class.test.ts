@@ -25,10 +25,10 @@
  * candidate's kill-failure descriptions as literals, which pins the survivor
  * pattern to agent-director's own wording. A base `AgentDirectorError` named like a class (`errGeneric`), an
  * `Error` named like one and an object shaped like one are the by-class
- * negatives. The client's classes, the bindings of the three Phase-1-only
- * classes (`ErrTmuxKillFailed`, `ErrTmuxUnresponsive`,
- * `ErrTmuxSessionConflict`: the host client's stand-ins) and the name
- * constants come from `src/agent-director-errors.ts`. Class labels come from
+ * negatives. The client's classes (the three Phase-1-only ones,
+ * `ErrTmuxKillFailed`, `ErrTmuxUnresponsive` and `ErrTmuxSessionConflict`,
+ * included) and the name constants come from `src/agent-director-errors.ts`,
+ * which re-exports the classes from the client. Class labels come from
  * `src/ad-error-class.ts`, the description words, the survivor pattern and
  * `survivorPids` from `src/ad-description-phrases.ts` and the cap from
  * `src/persona-connection-errors.ts`.

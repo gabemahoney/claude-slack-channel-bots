@@ -162,7 +162,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import type { Phase1ListRow } from '../src/ad-phase1-types.ts'
+import type { ListRow } from 'agent-director'
 import {
   AD_ERROR_CLASS_CONFLICT,
   AD_ERROR_CLASS_UNAVAILABLE,
@@ -467,7 +467,7 @@ function harnessAfterEach(): void {
 const holdsOf = (h: RecoveryHarness): HoldFields[] => h.oldLifeHolds.snapshot().map(fieldsOf)
 
 /** A live pre-persona row (b.1ix): only the `service` and `channel` labels. */
-function prePersonaRow(state = 'waiting'): Phase1ListRow {
+function prePersonaRow(state = 'waiting'): ListRow {
   const id = `cscb_old_${state}_C0OLD`
   return cannedListRow({ claude_instance_id: id, state, labels: { ...PRE_PERSONA_LABELS }, tmux_session_name: id.replace(/^cscb_/, 'slack_bot_') })
 }
@@ -916,7 +916,7 @@ describe('b.jg5 SRJ-809 starts 2 and 3, SRJ-714: the start sweep holds the cwd o
     expect(beganLinesIn(h.errors)).toHaveLength(1)
   })
 
-  test.each<[string, (h: RecoveryHarness, p: string) => Phase1ListRow, (h: RecoveryHarness, p: string) => string]>([
+  test.each<[string, (h: RecoveryHarness, p: string) => ListRow, (h: RecoveryHarness, p: string) => string]>([
     ['P\'s own row in its directory: kept, with no kill', (h, p) => listed(h, p), (_h, p) => p],
     ['P\'s own row listed pending (a launch start): kept, with no kill', (h, p) => listed(h, p, { state: AGENT_DIRECTOR_PENDING_STATE }), (_h, p) => p],
     ['P\'s own row carrying provenance_conflict: spared for P\'s latch, with no kill', (h, p) => listed(h, p, { liveness_note: provenanceNote }), (_h, p) => p],
@@ -932,7 +932,7 @@ describe('b.jg5 SRJ-809 starts 2 and 3, SRJ-714: the start sweep holds the cwd o
     expect(beganLinesIn(h.errors)).toEqual([oldLifeHoldBeganLine(h.oldLifeHolds.snapshot()[0]!)])
   })
 
-  test.each<[string, (h: RecoveryHarness, p: string, b: string) => Phase1ListRow[]]>([
+  test.each<[string, (h: RecoveryHarness, p: string, b: string) => ListRow[]]>([
     ['P recorded with its mark set, its own row live', (h, p) => {
       h.retireKey(p, { mark: true })
       return [listed(h, p, { state: AGENT_DIRECTOR_PENDING_STATE })]
@@ -952,7 +952,7 @@ describe('b.jg5 SRJ-809 starts 2 and 3, SRJ-714: the start sweep holds the cwd o
     expect(holdLinesIn(h.errors)).toEqual([])
   })
 
-  test.each<[string, (h: RecoveryHarness) => boolean, (h: RecoveryHarness, absent: Phase1ListRow) => HoldFields[], number]>([
+  test.each<[string, (h: RecoveryHarness) => boolean, (h: RecoveryHarness, absent: ListRow) => HoldFields[], number]>([
     ['by the time the list returns', (h) => h.stub.calls.listCalls.length > 0, () => [], 0],
     ['once the absent key is recorded, before the first kill', (h) => h.retiredKeyWrites.length > 0, () => [], 0],
     [
@@ -1550,7 +1550,7 @@ describe('b.jg5 SRJ-1001, SRJ-811: the session a wait\'s kill-failure alert name
 
   test('a pre-persona row the start sweep listed and failed to kill (a CONFLICT): the wait\'s persona-kill-failed entry names the listing\'s tmux_session_name', async () => {
     const { h, p } = build()
-    const row: Phase1ListRow = { ...prePersonaRow(), cwd: personaOf(h, p).working_directory }
+    const row: ListRow = { ...prePersonaRow(), cwd: personaOf(h, p).working_directory }
     h.script({ killQueue: [cannedErr(errTmuxSessionConflict('kill', 'different-id'))] })
     await sweepOver(h, [row])
     expect(holdsOf(h)).toEqual([hold(row.claude_instance_id, row.claude_instance_id, row.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL)])
@@ -2317,7 +2317,7 @@ describe('b.jg5 SRJ-810 bullet 3, SRJ-1502, SRJ-301: the launch gate holds back 
 })
 
 /** A live row the start sweep kills, in P's working directory, by source (SRJ-809's sweep start; Q-9). */
-const SWEPT_IN_P_DIR: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string, b: string) => Phase1ListRow]> = [
+const SWEPT_IN_P_DIR: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string, b: string) => ListRow]> = [
   ['an absent persona\'s row', (h) => absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)],
   ['a live pre-persona row', (h, p) => ({ ...prePersonaRow(), cwd: personaOf(h, p).working_directory })],
   ['a row swept for its instance id (B\'s label, another id)', (h, p, b) => listed(h, b, { claude_instance_id: `${personaInstanceId(b)}_old`, cwd: personaOf(h, p).working_directory })],

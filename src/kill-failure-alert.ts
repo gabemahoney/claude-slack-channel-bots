@@ -36,8 +36,8 @@
  * text says that no bot, including any persona that sees the post, may run
  * it; the survivor version names no command. The survivor version's pid list
  * holds the pids of the description's survivor clause only, in the form
- * `SURVIVOR_PID_PATTERN` defines (SRJ-702, checked against agent-director's
- * release candidate), never the worker's own pid.
+ * `SURVIVOR_PID_PATTERN` defines (SRJ-702, checked against agent-director
+ * 0.11.0), never the worker's own pid.
  *
  * The route selection ({@link selectKillFailureAlertRoute}, SRJ-704, first
  * match wins, for either version):

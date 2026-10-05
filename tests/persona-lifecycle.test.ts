@@ -266,7 +266,8 @@ import {
   classifyAdError,
   killFailedDescriptionOf,
 } from '../src/ad-error-class.ts'
-import type { Phase1KillResult, Phase1StatusResult } from '../src/ad-phase1-types.ts'
+import type { StatusResult } from 'agent-director'
+import type { StubKillResult } from './test-helpers/agent-director-stub.ts'
 import {
   createUnavailableRetryController,
   runInAttempt,
@@ -2906,10 +2907,10 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
    */
   function makeReal(opts: {
     killError?: Error
-    killResult?: Phase1KillResult
-    killQueue?: CannedResponse<Phase1KillResult>[]
-    statusResult?: Phase1StatusResult
-    statusQueue?: CannedResponse<Phase1StatusResult>[]
+    killResult?: StubKillResult
+    killQueue?: CannedResponse<StubKillResult>[]
+    statusResult?: StatusResult
+    statusQueue?: CannedResponse<StatusResult>[]
     post?: Record<string, readonly WebApiOutcome[]>
     triggerSink?: UnavailableRetryController
     overrides?: (f: () => Fixture) => Partial<PersonaLifecycleDeps>
@@ -3170,7 +3171,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
   // b.jg5 SRJ-715, SRJ-701, SRJ-703, SRJ-104: a success (`kill_sent` true,
   // false or absent), `ErrSpawnNotFound` and GONE end the kill step at the
   // first try with its outcome line; no delete follows, nothing is raised.
-  test.each<[string, { killResult?: Phase1KillResult; killError?: Error }, KillOutcome]>([
+  test.each<[string, { killResult?: StubKillResult; killError?: Error }, KillOutcome]>([
     ['kill_sent true', { killResult: cannedKillResult(true) }, { kind: KILL_OUTCOME_KILLED, killSent: true }],
     ['kill_sent false', { killResult: cannedKillResult(false) }, { kind: KILL_OUTCOME_KILLED, killSent: false }],
     ['ErrSpawnNotFound (the row already gone)', { killError: errSpawnNotFound() }, { kind: KILL_OUTCOME_ROW_GONE }],

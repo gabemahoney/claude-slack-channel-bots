@@ -20,7 +20,7 @@
  * agent-director offers no interface that reports its effective timing
  * values, so CSCB reads `~/.agent-director/config.toml` itself, under the
  * server process's HOME (`process.env.HOME` at read time, else
- * `os.homedir()`, the source the 0.10.0 client uses for its store path).
+ * `os.homedir()`, the source the client uses for its store path).
  * The file is parsed only with `smol-toml`, integers as `BigInt`, so a TOML
  * integer is told apart from a float such as `60.0` or `6e1`; CSCB never
  * parses TOML by hand. Every value is kept as the `bigint` read, with no
@@ -188,7 +188,10 @@ export const DEFAULT_AD_SETTINGS: AdSettingsDefaults = Object.freeze({
     action_timeout_ms: 2000n,
     create_timeout_ms: 5000n,
     pipe_close_wait_ms: 100n,
-    // agent-director's measured default, the value its release ships (b.jg5 SRJ-209).
+    // The 0.11.0 release's default (b.jg5 SRJ-209): its release notes list the
+    // key under the `[tmux]` settings, and its value is `DefaultKillExitWaitMs`
+    // in agent-director's `internal/config/tmux.go` at tag `v0.11.0`, measured
+    // (the slowest exit after a pane kill, 603 ms).
     kill_exit_wait_ms: 5000n,
   }),
   pause: Object.freeze({ timeout_seconds: 30n }),
@@ -492,7 +495,7 @@ export interface AdSettingsReader {
   valuesInEffect(): AdSettingsInEffect
 }
 
-/** The server's HOME at read time, as the 0.10.0 client finds it: `process.env.HOME`, else `os.homedir()` when it is unset. */
+/** The server's HOME at read time, as the client finds it: `process.env.HOME`, else `os.homedir()` when it is unset. */
 export function productionAdSettingsHome(): string {
   return process.env.HOME ?? homedir()
 }

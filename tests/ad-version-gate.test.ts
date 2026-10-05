@@ -33,15 +33,19 @@
  * interval, time limit, runbook title and the runtime phrase is imported from
  * `src/`; one case pins the interval constant to SRJ-204's 120 s.
  *
- * The floor's confirmation from the Phase 1 release candidate is external to
- * this file: `tests/ci-live-docker.test.ts` checks that the release candidate
- * pinned in `docker/Dockerfile.test.base` (`AD_RC_VERSION`) has
- * `PHASE1_FLOOR_VERSION` as its major.minor.patch and passes the floor
- * (SRJ-201, SRJ-202). Here, the `PHASE1_RC_VERSION` case (it parses as the
- * floor with pre-release `rc.1`, SRJ-1304) guards the versions helper's
- * shape only, since the helper builds it from the floor; and any
- * `<floor>-rc.N` passes the floor (SRJ-202). The floor's confirmation from
- * the Phase 1 release itself is the Plan's Epic E51's.
+ * `PHASE1_FLOOR_VERSION` is confirmed from the Phase 1 release (SRJ-201),
+ * the agent-director version `package.json` pins exactly (checked in
+ * `tests/packaging-completeness.test.ts`). The floor cases hold for it: the
+ * release before Phase 1 and the dev sentinel are refused, the floor and its
+ * release candidates pass, later versions pass, and an earlier version's
+ * release candidate is refused. Its lexical traps (`LEXICAL_TRAPS`) are not
+ * empty, so a string comparison planted in the floor check fails a case.
+ * `tests/ci-live-docker.test.ts` checks that the release candidate pinned in
+ * `docker/Dockerfile.test.base` (`AD_RC_VERSION`) has the floor as its
+ * major.minor.patch and passes it (SRJ-201, SRJ-202). Here, the
+ * `PHASE1_RC_VERSION` case (it parses as the floor with pre-release `rc.1`,
+ * SRJ-1304) guards the versions helper's shape only, since the helper builds
+ * it from the floor; and any `<floor>-rc.N` passes the floor (SRJ-202).
  *
  * The runtime re-check runs on `createFakeClock` with
  * `makeStubResolveSystemBinary` and no health check (the

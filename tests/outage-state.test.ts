@@ -971,7 +971,9 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
 
   /** Run `verb` for `key` through its wrapper and answer what it rejected with (it must reject). */
   async function rejectionOf(key: string, verb: Verb): Promise<unknown> {
-    const { wrap, declared, call } = VERBS[verb]
+    const { wrap, declared } = VERBS[verb]
+    // Each verb answers its own result type; only the rejection is read here.
+    const call: (c: Client) => Promise<unknown> = VERBS[verb].call
     try {
       await wrap(key, '/persona/workdir', declared, call)
     } catch (err) {

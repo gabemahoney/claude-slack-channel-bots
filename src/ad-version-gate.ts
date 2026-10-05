@@ -16,12 +16,12 @@
  * {@link buildInstallCheckPhase1Note} for the install check.
  *
  * The floor check sits beside the agent-director client's own too-old refusal
- * (client minimum 0.7.0) and gates on the version alone. The 0.10.0 client
- * ranks its `0.0.0-dev` sentinel above every version, so `Client.create()`
+ * (client minimum 0.7.0) and gates on the version alone. The client ranks
+ * its `0.0.0-dev` sentinel above every version, so `Client.create()`
  * admits it; the floor has no such special case and refuses it on its own.
  *
- * Parse rule mirrors the 0.10.0 client's strict SemVer parser (which the
- * client does not export): `major.minor.patch`, optional `-prerelease`, no
+ * Parse rule mirrors the client's strict SemVer parser (which the client
+ * does not export): `major.minor.patch`, optional `-prerelease`, no
  * leading `v`, no `+build` metadata, no whitespace trimming. A version that
  * does not parse never passes (fail closed). There is no development override.
  * {@link compareAdVersions} mirrors the client's version order (which it does
@@ -77,9 +77,14 @@
  * right after the startup gate passes, and `shutdown()` disposes it through
  * {@link disposeAdVersionRecheck}.
  *
- * agent-director errors are classified by name (their `errName`, else `name`,
- * read as a string) and their fields are read structurally: no `instanceof`
- * and no value import from `agent-director`. The module starts no process and
+ * The module keeps no value import from `agent-director`, so it decides the
+ * client's three system-install refusals (`ErrSystemInstallNotFound`,
+ * `ErrSystemInstallTooOld`, `ErrSystemInstallUnreachable`) by name (their
+ * `errName`, else `name`, read as a string) and reads their fields
+ * structurally. These three comparisons are the sanctioned by-name checks
+ * (`SANCTIONED_BY_NAME`, `tests/fmk-source-audit.test.ts`); every other
+ * agent-director error is decided by class through `src/ad-error-class.ts`.
+ * The module starts no process and
  * reads no file. A stop holds no Slack sink: it reaches only the injected
  * `recordStartupError` (a startup-errors entry and its server-log line) and
  * `stop` (b.jg5 SRJ-1002). Nothing is armed, read or logged at import or at
@@ -100,10 +105,10 @@ import { redactSlackLogText } from './slack-log-redaction.ts'
 /**
  * CSCB's Phase 1 floor: the Phase 1 agent-director release's version.
  *
- * b.jg5 SRJ-201: confirmed from the Phase 1 release candidate, which reports
- * `0.11.0-rc.1` and so counts as 0.11.0 (only major.minor.patch is compared,
- * SRJ-202). The confirmation from the Phase 1 release itself is the Plan's
- * Epic E51's, with the client's pin.
+ * b.jg5 SRJ-201: confirmed from the Phase 1 release, agent-director 0.11.0
+ * (tag `v0.11.0`; npm `agent-director@0.11.0`, the client `package.json`
+ * pins). Only major.minor.patch is compared (SRJ-202), so a `0.11.0-rc.1`
+ * binary counts as 0.11.0.
  */
 export const PHASE1_FLOOR_VERSION = '0.11.0'
 
@@ -159,7 +164,7 @@ export const DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE = 'Found while the server wa
 export const DEBUG_SKILL_RUNTIME_STOP_POINTER =
   `see the debug skill (${DEBUG_SKILL_PATH}), section "${DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE}", for what to do`
 
-/** Strict SemVer rule, identical to the 0.10.0 client's parser regex. */
+/** Strict SemVer rule, identical to the client's parser regex. */
 const STRICT_SEMVER_RE = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/
 
 /**

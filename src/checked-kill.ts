@@ -110,7 +110,7 @@ import {
   isAdErrorInstance,
   killFailedDescriptionOf,
 } from './ad-error-class.ts'
-import type { Phase1KillResult } from './ad-phase1-types.ts'
+import type { KillResult } from 'agent-director'
 import { RECHECK_OUTCOME_STOP, type AdVersionRecheckTriggerAnswer } from './ad-version-gate.ts'
 import { ERR_TMUX_KILL_FAILED_NAME, ErrSpawnNotFound, ErrTmuxKillFailed } from './agent-director-errors.ts'
 import { describeLogMessage } from './persona-connection-errors.ts'
@@ -336,7 +336,7 @@ function killedOutcome(result: unknown): KillKilled {
 function readKillSent(result: unknown): boolean | undefined {
   if (typeof result !== 'object' || result === null) return undefined
   try {
-    const killSent = (result as Phase1KillResult).kill_sent
+    const killSent = (result as KillResult).kill_sent
     return typeof killSent === 'boolean' ? killSent : undefined
   } catch {
     return undefined

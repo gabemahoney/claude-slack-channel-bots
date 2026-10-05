@@ -5,7 +5,7 @@
  * there) loads it once, before any test file; it runs for its side effects
  * only, exports nothing, and no test file imports it.
  *
- * The agent-director 0.10.0 client's `Client.create()` and
+ * The agent-director client's `Client.create()` and
  * `resolveSystemBinary()` read `process.env.HOME` and `process.env.PATH` when
  * called, so after this guard a test that forgot its stub fails in process
  * with `ErrSystemInstallNotFound` instead of reaching the host's real install

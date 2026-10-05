@@ -620,7 +620,7 @@ import {
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import type { MakeTemplateParams } from 'agent-director'
-import type { Phase1SpawnParams } from '../../src/ad-phase1-types.ts'
+import type { SpawnParams } from 'agent-director'
 
 import { _resetAckTracker, consumeAck, forgetPersonaAcks } from '../../src/ack-tracker.ts'
 import { resetClientForTests, setClientForTests } from '../../src/agent-director-client.ts'
@@ -2763,7 +2763,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           agentDirectorOrder.push(`delete ${ids.join(',')}`)
           return tracked({ verb: 'delete', id: ids.join(',') }, () => stub.delete(params))
         },
-        spawn(params: Phase1SpawnParams) {
+        spawn(params: SpawnParams) {
           const id = String(params.claude_instance_id)
           const labels = parseLabels(params.label)
           const reuse = params.reuse_finished === true

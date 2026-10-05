@@ -6,19 +6,17 @@
  * Only the checker, its problem kinds and its fail-line helper are imported;
  * the fixture's entry point never runs (it runs only when the file is executed
  * directly, in a cscb-ci image). No case reads `/etc/cscb-ci-image` or an
- * installed package, starts a process or reads the real agent-director
- * client: the client is a file-local fake namespace whose three Phase-1-only
- * classes are `src/agent-director-errors.ts`'s bindings, whose 0.10.0 classes
- * are that module's re-exports, and whose `errorFromEnvelope` builds each
- * error from those classes. The package's modules are this worktree's
- * `src/agent-director-errors.ts` (its presence flag set true),
- * `src/ad-error-class.ts` and `src/ad-description-phrases.ts`, patched per
- * case. Covers:
+ * installed package, starts a process or calls the real agent-director
+ * client: the client is a file-local fake namespace whose classes are
+ * `src/agent-director-errors.ts`'s re-exports and whose `errorFromEnvelope`
+ * builds each error from those classes. The package's modules are this
+ * worktree's `src/agent-director-errors.ts`, `src/ad-error-class.ts` and
+ * `src/ad-description-phrases.ts`, patched per case. Covers:
  *
  *   1. That consistent input gives no problem.
  *   2. One mismatched input per rule, each named by its problem kind: an
- *      export the checker needs missing; the presence flag not true; an
- *      export that is not the client's own, or a class the client lacks; a
+ *      export the checker needs missing; an export that is not the client's
+ *      own, or a class the client lacks (each Phase-1-only one included); a
  *      client-built error that is no instance of its export, or a build that
  *      throws; a wrong class from the classifier; a description
  *      `conflictDescriptionOf` or `killFailedDescriptionOf` does not return;
@@ -54,7 +52,7 @@ import {
   ErrUnknownErrorName,
   PHASE1_ONLY_ERR_NAMES,
 } from '../src/agent-director-errors.ts'
-import type { AdErrorClassConstructor, Phase1OnlyErrName } from '../src/agent-director-errors.ts'
+import type { Phase1OnlyErrName } from '../src/agent-director-errors.ts'
 import {
   PHASE1_CLIENT_CHECK_TEST_NAME,
   PROBLEM_CLASSIFICATION,
@@ -65,7 +63,6 @@ import {
   PROBLEM_KILL_FAILED_DESCRIPTION,
   PROBLEM_LAUNCH_TIMEOUT,
   PROBLEM_MISSING_EXPORT,
-  PROBLEM_PRESENCE_FLAG,
   checkPhase1Client,
   phase1ClientCheckFailLine,
 } from './integration/fixtures/phase1-client-check.ts'
@@ -76,21 +73,24 @@ import type { ModuleNamespace, Phase1ClientCheckModules, Phase1ClientCheckProble
 // Fake modules
 // ---------------------------------------------------------------------------
 
-/** Each Phase-1-only binding of `src/agent-director-errors.ts`, by name. */
-const BINDINGS: Readonly<Record<Phase1OnlyErrName, AdErrorClassConstructor>> = {
+/** A client error class, built from (verb, errName, description). */
+type ErrorClass = new (verb: string, errName: string, description: string) => AgentDirectorError
+
+/** Each Phase-1-only re-export of `src/agent-director-errors.ts`, by name. */
+const BINDINGS: Readonly<Record<Phase1OnlyErrName, ErrorClass>> = {
   [ERR_TMUX_KILL_FAILED_NAME]: ErrTmuxKillFailed,
   [ERR_TMUX_UNRESPONSIVE_NAME]: ErrTmuxUnresponsive,
   [ERR_TMUX_SESSION_CONFLICT_NAME]: ErrTmuxSessionConflict,
 }
 
 /** The classes the fake client's `errorFromEnvelope` builds, by err_name: the four the checker builds. */
-const ENVELOPE_CLASSES: Readonly<Record<string, AdErrorClassConstructor>> = {
+const ENVELOPE_CLASSES: Readonly<Record<string, ErrorClass>> = {
   ...BINDINGS,
   [ErrTmuxNotAvailable.name]: ErrTmuxNotAvailable,
 }
 
 /** A fake client's `errorFromEnvelope`: builds `classes[err_name]`, a base `AgentDirectorError` for any other name. */
-function fakeErrorFromEnvelope(classes: Readonly<Record<string, AdErrorClassConstructor>> = ENVELOPE_CLASSES) {
+function fakeErrorFromEnvelope(classes: Readonly<Record<string, ErrorClass>> = ENVELOPE_CLASSES) {
   return (verb: string, errName: string, description: string): AgentDirectorError => new (classes[errName] ?? AgentDirectorError)(verb, errName, description)
 }
 
@@ -119,7 +119,7 @@ interface ModulePatch {
 /** The consistent input, with `patch` spread over each module. */
 function modulesWith(patch: ModulePatch = {}): Phase1ClientCheckModules {
   return {
-    errors: { ...agentDirectorErrors, PHASE1_ERROR_CLASSES_FROM_CLIENT: true, ...patch.errors },
+    errors: { ...agentDirectorErrors, ...patch.errors },
     errorClass: { ...adErrorClass, ...patch.errorClass },
     phrases: { ...adDescriptionPhrases, ...patch.phrases },
     client: { ...fakeClient(), ...patch.client },
@@ -171,10 +171,6 @@ const MISMATCHES: readonly MismatchCase[] = [
   { label: 'ad-error-class lacks AD_LAUNCH_VERBS', patch: { errorClass: { AD_LAUNCH_VERBS: undefined } }, kinds: [PROBLEM_MISSING_EXPORT], names: 'AD_LAUNCH_VERBS' },
   { label: 'ad-error-class has an empty AD_LAUNCH_VERBS', patch: { errorClass: { AD_LAUNCH_VERBS: new Set<string>() } }, kinds: [PROBLEM_MISSING_EXPORT], names: 'AD_LAUNCH_VERBS' },
 
-  // The presence flag.
-  { label: 'the presence flag is false', patch: { errors: { PHASE1_ERROR_CLASSES_FROM_CLIENT: false } }, kinds: [PROBLEM_PRESENCE_FLAG], names: 'PHASE1_ERROR_CLASSES_FROM_CLIENT' },
-  { label: 'the presence flag is missing', patch: { errors: { PHASE1_ERROR_CLASSES_FROM_CLIENT: undefined } }, kinds: [PROBLEM_PRESENCE_FLAG], names: 'PHASE1_ERROR_CLASSES_FROM_CLIENT' },
-
   // Identity: a Phase-1-only export that is not the client's also builds no instance of it.
   ...PHASE1_ONLY_ERR_NAMES.map((name): MismatchCase => ({
     label: `agent-director-errors ${name} is not the client's class`,
@@ -188,7 +184,13 @@ const MISMATCHES: readonly MismatchCase[] = [
     kinds: [PROBLEM_IDENTITY],
     names: name,
   })),
-  { label: 'the client exports no ErrTmuxCaptureFailed', patch: { client: { [ErrTmuxCaptureFailed.name]: undefined } }, kinds: [PROBLEM_IDENTITY], names: ErrTmuxCaptureFailed.name },
+  // A class the client lacks: each Phase-1-only one, and one every client declares.
+  ...[...PHASE1_ONLY_ERR_NAMES, ErrTmuxCaptureFailed.name].map((name): MismatchCase => ({
+    label: `the client exports no ${name}`,
+    patch: { client: { [name]: undefined } },
+    kinds: [PROBLEM_IDENTITY],
+    names: name,
+  })),
 
   // A client-built error that is no instance of its export.
   ...[...PHASE1_ONLY_ERR_NAMES, ErrTmuxNotAvailable.name].map((name): MismatchCase => ({
@@ -241,7 +243,7 @@ describe('checkPhase1Client: a module whose every read throws', () => {
   test('answers problems and does not throw', () => {
     const refusing: ModuleNamespace = new Proxy({}, { get: throwing })
     const problems = checkPhase1Client({ ...modulesWith(), errors: refusing })
-    expect(new Set(kindsOf(problems))).toEqual(new Set([PROBLEM_MISSING_EXPORT, PROBLEM_PRESENCE_FLAG, PROBLEM_IDENTITY, PROBLEM_ENVELOPE_BUILD]))
+    expect(new Set(kindsOf(problems))).toEqual(new Set([PROBLEM_MISSING_EXPORT, PROBLEM_IDENTITY, PROBLEM_ENVELOPE_BUILD]))
   })
 })
 
@@ -251,8 +253,8 @@ describe('checkPhase1Client: a module whose every read throws', () => {
 
 describe('phase1ClientCheckFailLine', () => {
   test('names the test, the kind and the detail', () => {
-    const [problem] = checkPhase1Client(modulesWith({ errors: { PHASE1_ERROR_CLASSES_FROM_CLIENT: false } }))
+    const [problem] = checkPhase1Client(modulesWith({ errors: { [ErrTmuxSendKeys.name]: Impostor } }))
     expect(problem).toBeDefined()
-    expect(phase1ClientCheckFailLine(problem!)).toBe(`FAIL: ${PHASE1_CLIENT_CHECK_TEST_NAME}: ${PROBLEM_PRESENCE_FLAG}: ${problem!.detail}`)
+    expect(phase1ClientCheckFailLine(problem!)).toBe(`FAIL: ${PHASE1_CLIENT_CHECK_TEST_NAME}: ${PROBLEM_IDENTITY}: ${problem!.detail}`)
   })
 })

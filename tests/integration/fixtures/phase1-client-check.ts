@@ -1,7 +1,8 @@
 /**
  * phase1-client-check.ts — the image-side check that an installed CSCB
  * package uses the Phase 1 agent-director client's own error classes (b.jg5
- * SRJ-101, SRJ-103, SRJ-104).
+ * SRJ-101, SRJ-103, SRJ-104): the client it resolves exports the three
+ * Phase-1-only classes, and the package's re-exports are those classes.
  *
  * Two parts:
  *
@@ -16,8 +17,7 @@
  *     `resolveSystemBinary()`, and reads no file. Host unit tests drive it
  *     with fake namespaces.
  *   - An entry point that runs only when this file is executed directly
- *     (`import.meta.main`), in a cscb-ci image after the release-candidate
- *     client swap: it refuses to run without the image marker
+ *     (`import.meta.main`), in a cscb-ci image: it refuses to run without the image marker
  *     `/etc/cscb-ci-image`, imports the installed package's three modules
  *     from `CSCB_PKG_DIR` (default `/test-repo/node_modules/claude-slack-channel-bots`)
  *     and the `agent-director` module that package's `src/` resolves, all at
@@ -27,12 +27,13 @@
  *     package path resolved.
  *
  * What the checker checks:
- *   - the package's presence flag (`PHASE1_ERROR_CLASSES_FROM_CLIENT`) is
- *     true, so no stand-in class is in use;
- *   - each of SRJ-103's seven exports of `src/agent-director-errors.ts`
+ *   - the client exports each of SRJ-103's seven classes
  *     (`ErrTmuxKillFailed`, `ErrTmuxUnresponsive`, `ErrTmuxSessionConflict`,
  *     `ErrTmuxSendKeys`, `ErrTmuxCaptureFailed`, `ErrTmuxSessionCreate`,
- *     `ErrUnknownErrorName`) is the client's own export, by identity;
+ *     `ErrUnknownErrorName`), and each of those exports of
+ *     `src/agent-director-errors.ts` is the client's own, by identity (a
+ *     package whose plain re-export names a class the client lacks fails to
+ *     load, which the entry point reports);
  *   - for each of the three Phase-1-only names, the client's own
  *     `errorFromEnvelope(verb, name, description)` builds an instance of the
  *     package's export, which the package's classifier classes as SRJ-104
@@ -84,9 +85,7 @@ export interface Phase1ClientCheckModules {
 
 /** A module the checker needs lacks an export, or the export is not of the kind needed. */
 export const PROBLEM_MISSING_EXPORT = 'missing-export'
-/** The package's presence flag is not true: a stand-in class is in use. */
-export const PROBLEM_PRESENCE_FLAG = 'presence-flag'
-/** One of SRJ-103's seven exports is not the client's own export. */
+/** The client lacks one of SRJ-103's seven classes, or the package's export of it is not the client's own. */
 export const PROBLEM_IDENTITY = 'identity'
 /** The client's `errorFromEnvelope` threw, or built no instance of the package's export. */
 export const PROBLEM_ENVELOPE_BUILD = 'envelope-build'
@@ -104,7 +103,6 @@ export const PROBLEM_DIFFERENT_TMUX_SERVER = 'different-tmux-server'
 /** Every problem kind, in the order the checker checks. */
 export const PHASE1_CLIENT_CHECK_PROBLEM_KINDS = [
   PROBLEM_MISSING_EXPORT,
-  PROBLEM_PRESENCE_FLAG,
   PROBLEM_IDENTITY,
   PROBLEM_ENVELOPE_BUILD,
   PROBLEM_CLASSIFICATION,
@@ -232,12 +230,6 @@ export function checkPhase1Client(modules: Phase1ClientCheckModules): Phase1Clie
   const launchTimeoutPhrase = need(phrases, 'ad-description-phrases', 'LAUNCH_TIMEOUT_PHRASE', asString, 'string')
   const differentServerPhrase = need(phrases, 'ad-description-phrases', 'DIFFERENT_TMUX_SERVER_PHRASE', asString, 'string')
   const errorFromEnvelope = need(client, 'agent-director', 'errorFromEnvelope', asFunction, 'function')
-
-  // The presence flag.
-  const flag = read(errors, 'PHASE1_ERROR_CLASSES_FROM_CLIENT')
-  if (flag !== true) {
-    problem(PROBLEM_PRESENCE_FLAG, `agent-director-errors PHASE1_ERROR_CLASSES_FROM_CLIENT is ${show(flag)}, not true: a stand-in class is in use`)
-  }
 
   // SRJ-103's seven exports, by identity.
   const phase1Names = [killFailedName, unresponsiveName, conflictName].filter((name): name is string => name !== undefined)

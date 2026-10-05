@@ -48,7 +48,7 @@ src/agent-director-template.ts | installSlackChannelBotTemplate | const client =
 src/agent-director-template.ts | refreshSlackChannelBotTemplate | const client = deps.getClient() as { makeTemplate: (p: MakeTemplateParams) => Promise<MakeTemplateResult> }  # apply-time, non-fatal template refresh (b.av2 SR-8.6 step 5): one makeTemplate for the server, not for one persona
 src/session-manager.ts | reconcileOrphans | const client = getClient()  # reconcileOrphans start sweep (its rows have no single-persona attribution)
 src/permission-poller.ts | runTick | const client = deps.getClient()  # list-level client.list at top of runTick (no single-persona context)
-src/cli.ts | directorGet | const r: Phase1GetResult = await getClient().get({ claude_instance_id: id })  # CLI precheck: get of cscb_<key>
+src/cli.ts | directorGet | const r: GetResult = await getClient().get({ claude_instance_id: id })  # CLI precheck: get of cscb_<key>
 src/cli.ts | directorReadPane | const r = await getClient().readPane({ claude_instance_id: id, n_lines: nLines })  # CLI precheck: one-line read-pane of cscb_<key>
 src/cli.ts | directorStatus | const r = await getClient().status({ claude_instance_id: id })  # CLI persona teardown: status of cscb_<key>
 src/cli.ts | directorPause | await getClient().pause({ claude_instance_id: id })  # CLI persona teardown: pause cscb_<key>

@@ -13,7 +13,8 @@
  * text or exit codes, apart from matching agent-director's fixed description
  * words, which are kept in `src/ad-description-phrases.ts`.
  *
- * Classes of the tmux-side and unknown-name errors (b.jg5 SRJ-103, SRJ-104):
+ * The seven classes of the tmux-side and unknown-name errors (b.jg5 SRJ-103,
+ * SRJ-104), each a named re-export of the client's own class:
  *   - ErrTmuxSendKeys           GONE
  *   - ErrTmuxCaptureFailed      GONE
  *   - ErrTmuxSessionCreate      LAUNCH FAILURE
@@ -28,28 +29,16 @@
  *   - ErrTmuxUnresponsive       UNAVAILABLE
  *   - ErrTmuxSessionConflict    CONFLICT
  *
- * The first four are named re-exports of the client's classes. The last three
- * are the installed client's own classes wherever the client declares them:
- * {@link resolvePhase1ErrorClasses} reads them once, at module load, through a
- * namespace import of `agent-director` and a typed optional cast, and each
- * binding below is the client's class when the client declares it, else a
- * CSCB stand-in subclass of the client's `AgentDirectorError` with the same
- * `name`. {@link PHASE1_ERROR_CLASSES_FROM_CLIENT} is true only when all three
- * came from the client. The stand-ins are reachable only on a client the
- * startup gate refuses (`ad-shim-catalog-incomplete`: `REQUIRED_ERR_NAMES`,
- * `src/agent-director-startup.ts`, b.jg5 SRJ-102), so production code never
- * meets one.
- *
- * The narrowed interim rule (b.jg5 SRJ-101), until the package pins the
- * Phase 1 client: no file in `src/` or `tests/` names
- * `ErrTmuxKillFailed`, `ErrTmuxUnresponsive` or `ErrTmuxSessionConflict` in a
- * named import, a re-export or a destructuring of `agent-director`, and this
- * module is the one place they are read from the client; every other file
- * imports the bindings from here. Their names are also exported below as plain
- * strings, for the startup gate's dist-text check and for log labels only. So
- * are the three store-open `unknownName`s (`ErrSchemaMismatch`,
- * `ErrSchemaMigrationRequired`, `ErrStoreOpen`) and `ErrInternal`, which no
- * client declares as a class and the classifier matches by `unknownName`.
+ * Every class the client declares is decided by `instanceof` that class,
+ * through the classifier; apart from the sanctioned by-name checks
+ * (`SANCTIONED_BY_NAME` in `tests/fmk-source-audit.test.ts`), no code decides
+ * a client class by its name. The names of the
+ * last three are also exported below as plain strings, for the startup gate's
+ * dist-text check (`REQUIRED_ERR_NAMES`, `src/agent-director-startup.ts`,
+ * b.jg5 SRJ-102) and for log labels only. So are the three store-open
+ * `unknownName`s (`ErrSchemaMismatch`, `ErrSchemaMigrationRequired`,
+ * `ErrStoreOpen`) and `ErrInternal`, which no client declares as a class and
+ * the classifier matches by `unknownName`.
  *
  * Catalog (SR-0.2):
  *   - ErrBunVersionTooOld       (Client constructor / Bun version gate)
@@ -61,6 +50,12 @@
  *   - ErrTmuxSessionCreate      (spawn / tmux could not create the session)
  *   - ErrTmuxSendKeys           (send-keys / the tmux session is gone)
  *   - ErrTmuxCaptureFailed      (read-pane / the tmux session is gone)
+ *   - ErrTmuxKillFailed         (kill / the agent process, or another process of
+ *                               the session's panes, outlived the kill)
+ *   - ErrTmuxUnresponsive       (any tmux-touching verb / tmux did not answer
+ *                               usably)
+ *   - ErrTmuxSessionConflict    (spawn / resume / kill / the session found is not
+ *                               this launch's, or tmux holds conflicting labels)
  *   - ErrUnknownErrorName       (any verb / the binary reported an err_name the
  *                               client has no class for)
  *   - ErrCwdNotFound            (spawn / persona working directory does not exist on disk)
@@ -112,7 +107,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-import * as agentDirectorClient from 'agent-director'
 import { AgentDirectorError } from 'agent-director'
 
 /**
@@ -138,10 +132,10 @@ export class ErrSpawnCapReached extends AgentDirectorError {
 /**
  * Names of the three errors only the Phase 1 client declares (b.jg5 SRJ-102,
  * SRJ-103), as plain strings. They serve the startup gate's dist-text check
- * (`REQUIRED_ERR_NAMES`, `src/agent-director-startup.ts`), the stand-ins'
- * `name` and log labels only; no code decides an error by them. The errors
- * themselves are recognised by class: the bindings {@link ErrTmuxKillFailed},
- * {@link ErrTmuxUnresponsive} and {@link ErrTmuxSessionConflict} below.
+ * (`REQUIRED_ERR_NAMES`, `src/agent-director-startup.ts`) and log labels
+ * only; no code decides an error by them. The errors themselves are
+ * recognised by class: the re-exported `ErrTmuxKillFailed`,
+ * `ErrTmuxUnresponsive` and `ErrTmuxSessionConflict` below.
  */
 export const ERR_TMUX_KILL_FAILED_NAME = 'ErrTmuxKillFailed'
 export const ERR_TMUX_UNRESPONSIVE_NAME = 'ErrTmuxUnresponsive'
@@ -156,115 +150,6 @@ export const PHASE1_ONLY_ERR_NAMES = [
 
 /** One of the three Phase-1-only error names. */
 export type Phase1OnlyErrName = (typeof PHASE1_ONLY_ERR_NAMES)[number]
-
-/**
- * A constructor of an agent-director error class built, like the client's
- * catalogue classes, from (verb, errName, description).
- */
-export type AdErrorClassConstructor = new (verb: string, errName: string, errDescription: string) => AgentDirectorError
-
-/**
- * What {@link resolvePhase1ErrorClasses} reads: a namespace-like object (the
- * `agent-director` module namespace, or a test's fake) that may or may not
- * declare the three Phase-1-only classes. Every field is optional and
- * `unknown`, so the read typechecks against a client that lacks them.
- */
-export interface Phase1ErrorNamespace {
-  readonly ErrTmuxKillFailed?: unknown
-  readonly ErrTmuxUnresponsive?: unknown
-  readonly ErrTmuxSessionConflict?: unknown
-}
-
-/** What {@link resolvePhase1ErrorClasses} answers: one class per Phase-1-only name, and where they came from. */
-export interface Phase1ErrorClasses {
-  readonly ErrTmuxKillFailed: AdErrorClassConstructor
-  readonly ErrTmuxUnresponsive: AdErrorClassConstructor
-  readonly ErrTmuxSessionConflict: AdErrorClassConstructor
-  /** True only when all three are the namespace's own classes (no stand-in). */
-  readonly fromClient: boolean
-}
-
-/**
- * A CSCB stand-in for a Phase-1-only class the installed client does not
- * declare: a subclass of the client's `AgentDirectorError` whose class name
- * and instances' `name` are `name`, built from (verb, errName, description)
- * as the client's classes are. Reachable only on a client the startup gate
- * refuses (`ad-shim-catalog-incomplete`, b.jg5 SRJ-102).
- */
-function phase1StandIn(name: Phase1OnlyErrName): AdErrorClassConstructor {
-  const StandIn = class extends AgentDirectorError {
-    constructor(verb: string, errName: string, errDescription: string) {
-      super(verb, errName, errDescription)
-      this.name = name
-    }
-  }
-  Object.defineProperty(StandIn, 'name', { value: name })
-  return StandIn
-}
-
-/** One stand-in per Phase-1-only name, made once so every fallback answer shares it. */
-const PHASE1_STAND_INS: Readonly<Record<Phase1OnlyErrName, AdErrorClassConstructor>> = {
-  [ERR_TMUX_KILL_FAILED_NAME]: phase1StandIn(ERR_TMUX_KILL_FAILED_NAME),
-  [ERR_TMUX_UNRESPONSIVE_NAME]: phase1StandIn(ERR_TMUX_UNRESPONSIVE_NAME),
-  [ERR_TMUX_SESSION_CONFLICT_NAME]: phase1StandIn(ERR_TMUX_SESSION_CONFLICT_NAME),
-}
-
-/** True when `value` is a subclass of the client's `AgentDirectorError`. Never throws. */
-function isAgentDirectorErrorClass(value: unknown): value is AdErrorClassConstructor {
-  try {
-    return typeof value === 'function' && value.prototype instanceof AgentDirectorError
-  } catch {
-    return false
-  }
-}
-
-/**
- * The three Phase-1-only classes, chosen per name from `namespace` (b.jg5
- * SRJ-101, SRJ-103): the namespace's own class when it declares one (a
- * subclass of the client's `AgentDirectorError`), else the CSCB
- * stand-in for that name. `fromClient` is true only when all three came from
- * the namespace. Pure apart from reading the three fields; never throws (a
- * throwing read counts as an absent class).
- */
-export function resolvePhase1ErrorClasses(namespace: Phase1ErrorNamespace): Phase1ErrorClasses {
-  const pick = (name: Phase1OnlyErrName): { readonly cls: AdErrorClassConstructor; readonly own: boolean } => {
-    let declared: unknown
-    try {
-      declared = namespace[name]
-    } catch {
-      declared = undefined
-    }
-    return isAgentDirectorErrorClass(declared) ? { cls: declared, own: true } : { cls: PHASE1_STAND_INS[name], own: false }
-  }
-  const killFailed = pick(ERR_TMUX_KILL_FAILED_NAME)
-  const unresponsive = pick(ERR_TMUX_UNRESPONSIVE_NAME)
-  const sessionConflict = pick(ERR_TMUX_SESSION_CONFLICT_NAME)
-  return {
-    ErrTmuxKillFailed: killFailed.cls,
-    ErrTmuxUnresponsive: unresponsive.cls,
-    ErrTmuxSessionConflict: sessionConflict.cls,
-    fromClient: killFailed.own && unresponsive.own && sessionConflict.own,
-  }
-}
-
-/** The installed client's answer, read once at module load through the namespace and a typed optional cast. */
-const INSTALLED_PHASE1_ERROR_CLASSES = resolvePhase1ErrorClasses(agentDirectorClient as unknown as Phase1ErrorNamespace)
-
-/** `ErrTmuxKillFailed` (UNAVAILABLE): the installed client's class, or its stand-in on a client the startup gate refuses. */
-export const ErrTmuxKillFailed: AdErrorClassConstructor = INSTALLED_PHASE1_ERROR_CLASSES.ErrTmuxKillFailed
-
-/** `ErrTmuxUnresponsive` (UNAVAILABLE): the installed client's class, or its stand-in on a client the startup gate refuses. */
-export const ErrTmuxUnresponsive: AdErrorClassConstructor = INSTALLED_PHASE1_ERROR_CLASSES.ErrTmuxUnresponsive
-
-/** `ErrTmuxSessionConflict` (CONFLICT): the installed client's class, or its stand-in on a client the startup gate refuses. */
-export const ErrTmuxSessionConflict: AdErrorClassConstructor = INSTALLED_PHASE1_ERROR_CLASSES.ErrTmuxSessionConflict
-
-/**
- * True only when the installed client declares all three Phase-1-only
- * classes, so {@link ErrTmuxKillFailed}, {@link ErrTmuxUnresponsive} and
- * {@link ErrTmuxSessionConflict} are its own classes and no stand-in is in use.
- */
-export const PHASE1_ERROR_CLASSES_FROM_CLIENT: boolean = INSTALLED_PHASE1_ERROR_CLASSES.fromClient
 
 /**
  * `unknownName`s of the three errors agent-director's CLI answers when it
@@ -321,6 +206,9 @@ export {
   ErrTmuxSessionCreate,
   ErrTmuxSendKeys,
   ErrTmuxCaptureFailed,
+  ErrTmuxKillFailed,
+  ErrTmuxUnresponsive,
+  ErrTmuxSessionConflict,
   ErrUnknownErrorName,
   ErrCwdNotFound,
   ErrCwdNotADirectory,

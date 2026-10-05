@@ -131,7 +131,8 @@ import type {
   StatusParams,
 } from 'agent-director'
 
-import type { Phase1GetResult, Phase1KillResult, Phase1ResumeResult, Phase1SpawnParams, Phase1SpawnResult, Phase1StatusResult } from '../../src/ad-phase1-types.ts'
+import type { GetResult, SpawnParams, StatusResult } from 'agent-director'
+import type { StubKillResult, StubResumeResult, StubSpawnResult } from './agent-director-stub.ts'
 import { adGraceMsInEffect } from '../../src/ad-settings.ts'
 import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING } from '../../src/liveness-reading.ts'
 import { RECHECK_READING_NO_ROW, RECHECK_READING_STATE, type LatchRecheckReading } from '../../src/conflict-latch.ts'
@@ -484,7 +485,7 @@ export interface PendingRowModelOptions {
   /** The first `send-keys` answers, in order: an error rejects the call (nothing typed), `undefined` is the model's own answer. */
   readonly sendKeys?: ReadonlyArray<Error | undefined>
   /** The first `kill` answers, in order (`cannedKillResult(...)`, or an error builder's value); `cannedKillResult(true)` after. */
-  readonly kill?: ReadonlyArray<Phase1KillResult | Error>
+  readonly kill?: ReadonlyArray<StubKillResult | Error>
   /**
    * The first `spawn` and `resume` answers, one queue shared by every form,
    * in order: an error rejects the call, a refusal also leaves the row as it
@@ -520,7 +521,7 @@ export interface PendingRowModel {
   /** What the pane shows now. */
   dialog(): PendingRowDialog
   /** The row as `status` and `get` answer it now; each throws when there is no row. */
-  statusRow(): Phase1StatusResult
+  statusRow(): StatusResult
   getRow(): CannedGetResult
   /** Whether the row carries the `provenance_conflict` note now. */
   note(): boolean
@@ -536,7 +537,7 @@ export interface PendingRowModel {
   scriptGet(...answers: Array<Error | undefined>): void
   scriptReadPane(...answers: Array<Error | undefined>): void
   scriptSendKeys(...answers: Array<Error | undefined>): void
-  scriptKill(...answers: Array<Phase1KillResult | Error>): void
+  scriptKill(...answers: Array<StubKillResult | Error>): void
   scriptLaunches(...answers: PendingRowLaunchAnswer[]): void
   scriptPlainSpawns(...answers: PendingRowLaunchAnswer[]): void
   scriptReuseSpawns(...answers: PendingRowLaunchAnswer[]): void
@@ -558,8 +559,8 @@ function isFinished(state: PendingRowModelState): boolean {
 type LaunchForm = 'plain' | 'reuse' | 'resume'
 
 /** Whether a `spawn` call is a reuse (`reuse_finished: true`). */
-function isReuseSpawn(params: Phase1SpawnParams): boolean {
-  return (params as { reuse_finished?: unknown }).reuse_finished === true
+function isReuseSpawn(params: SpawnParams): boolean {
+  return params.reuse_finished === true
 }
 
 /**
@@ -627,7 +628,7 @@ export function makePendingRowModel(host: PendingRowModelHost, key: string, opti
   const isPending = (): boolean => state === AGENT_DIRECTOR_PENDING_STATE
   const launchStartMs = (): number | undefined => parseLaunchStart(launchStartedAt)
 
-  const statusRow = (): Phase1StatusResult => {
+  const statusRow = (): StatusResult => {
     applyDueChanges()
     if (state === PENDING_ROW_MODEL_NO_ROW) throw new Error(`makePendingRowModel: persona ${key} has no row`)
     return isPending() ? cannedStatusResult({ state, launch_started_at: launchStartedAt }) : cannedStatusResult({ state })
@@ -680,7 +681,7 @@ export function makePendingRowModel(host: PendingRowModelHost, key: string, opti
   const ownId = (params: { claude_instance_id?: unknown }): boolean => params.claude_instance_id === id
 
   const knobs: PendingRowModelKnobs = {
-    statusFn: (params: StatusParams): Phase1StatusResult | Error | undefined => {
+    statusFn: (params: StatusParams): StatusResult | Error | undefined => {
       if (!ownId(params)) return earlier.statusFn?.(params)
       applyDueChanges()
       record('status', params)
@@ -688,7 +689,7 @@ export function makePendingRowModel(host: PendingRowModelHost, key: string, opti
       if (scripted !== undefined) return scripted
       return state === PENDING_ROW_MODEL_NO_ROW ? errSpawnNotFound() : statusRow()
     },
-    getFn: (params): Phase1GetResult | Error | undefined => {
+    getFn: (params): GetResult | Error | undefined => {
       if (!ownId(params)) return earlier.getFn?.(params)
       applyDueChanges()
       record('get', params)
@@ -740,7 +741,7 @@ export function makePendingRowModel(host: PendingRowModelHost, key: string, opti
       const unverifiedIds = [...new Set([...(earlierAnswer.unverified_ids ?? []), ...own.unverified_ids])].sort()
       return { ...earlierAnswer, count: ids.length, ids, unverified: unverifiedIds.length, unverified_ids: unverifiedIds }
     },
-    killFn: (params: KillParams): StubCallAnswer<Phase1KillResult> => {
+    killFn: (params: KillParams): StubCallAnswer<StubKillResult> => {
       if (!ownId(params)) return earlier.killFn?.(params)
       applyDueChanges()
       record('kill', params)
@@ -750,12 +751,12 @@ export function makePendingRowModel(host: PendingRowModelHost, key: string, opti
       if (state !== PENDING_ROW_MODEL_NO_ROW) state = LIVENESS_DEAD_ROW_ENDED
       return scripted ?? cannedKillResult(true)
     },
-    spawnFn: (params: Phase1SpawnParams): StubCallAnswer<Phase1SpawnResult> => {
+    spawnFn: (params: SpawnParams): StubCallAnswer<StubSpawnResult> => {
       if (!ownId(params)) return earlier.spawnFn?.(params)
       applyDueChanges()
       return launch('spawn', isReuseSpawn(params) ? 'reuse' : 'plain', params, () => cannedSpawnResult(id))
     },
-    resumeFn: (params: ResumeParams): StubCallAnswer<Phase1ResumeResult> => {
+    resumeFn: (params: ResumeParams): StubCallAnswer<StubResumeResult> => {
       if (!ownId(params)) return earlier.resumeFn?.(params)
       applyDueChanges()
       return launch('resume', 'resume', params, () => cannedResumeResult(id))

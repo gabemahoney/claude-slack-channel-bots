@@ -293,7 +293,7 @@ import {
   type ConflictLatchSetEvent,
 } from '../src/conflict-latch.ts'
 import { describeAdFailureForLog } from '../src/ad-error-class.ts'
-import type { Phase1StatusResult } from '../src/ad-phase1-types.ts'
+import type { StatusResult } from 'agent-director'
 import {
   AD_SETTING_INTEGER_MAX,
   AD_WAIT_NEVER_ENDS,
@@ -453,7 +453,7 @@ const isoAt = (ms: number): string => new Date(ms).toISOString()
  * `startedAtMs`, the original spawn's time, which no wait may read (b.jg5
  * SRJ-406).
  */
-function resumedRow(launchStartedAt: string, startedAtMs: number): Phase1StatusResult {
+function resumedRow(launchStartedAt: string, startedAtMs: number): StatusResult {
   return Object.assign(cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: launchStartedAt }), {
     started_at: isoAt(startedAtMs),
   })
@@ -621,7 +621,7 @@ afterEach(() => {
 })
 
 /** A `status` answer: a row, or an error the call rejects with. */
-type StatusAnswer = Phase1StatusResult | Error
+type StatusAnswer = StatusResult | Error
 
 /**
  * Install the stub. `status` answers `statusAnswers` in order, one per lap,
@@ -856,7 +856,7 @@ describe('approvePreSessionDialogs: the lap on a pending row with a launch start
 
 describe('approvePreSessionDialogs: the stops on a row state (b.jg5 SRJ-402)', () => {
   /** [when, the status answers before the stopping one]. */
-  const WHEN: ReadonlyArray<readonly [string, readonly Phase1StatusResult[]]> = [
+  const WHEN: ReadonlyArray<readonly [string, readonly StatusResult[]]> = [
     ['at the first lap', []],
     ['after a pending lap', [PENDING_ROW]],
   ]
@@ -1053,7 +1053,7 @@ describe('approvePreSessionDialogs: the pace, from the launch start (b.jg5 SRJ-4
       expect(adLaunchBoundMsInEffect()).toBeGreaterThan(MAX_TIMER_DELAY_MS)
       if (label.endsWith('(it never ends)')) expect(adGraceMsInEffect()).toBe(AD_WAIT_NEVER_ENDS)
       startClockAt(LAUNCH_START_MS)
-      let row: Phase1StatusResult = PENDING_ROW
+      let row: StatusResult = PENDING_ROW
       installStub(() => row, { readPaneResults: [CLEAR_PANE] })
       const run = startApprover(PLAIN, true)
 
@@ -1623,7 +1623,7 @@ const RECORD_LAUNCH_STARTS: ReadonlyArray<readonly [string, string]> = [
 ]
 
 /** A `pending` row whose launch start is `raw`. */
-function pendingRowAt(raw: string): Phase1StatusResult {
+function pendingRowAt(raw: string): StatusResult {
   return cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: raw })
 }
 
@@ -1890,7 +1890,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
   /** Every call's start (`<verb> <instance id>`) and every marker a case adds, in order. */
   let events: string[]
   /** Status answers per instance id, the last sticking. */
-  let rows: Map<string, Array<Phase1StatusResult | Error>>
+  let rows: Map<string, Array<StatusResult | Error>>
   /** The pane per instance id (no dialog unless set). */
   let panes: Map<string, { pane: string }>
   /** One-shot failures per `<verb> <instance id>`. */
@@ -2552,7 +2552,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
 
   /** [the reason, the status answers, the launch start kept, optional setup]. */
   const OWN_STOPS: ReadonlyArray<
-    readonly [ApproverStopReason, () => Array<Phase1StatusResult | Error>, number | undefined, (() => void) | undefined]
+    readonly [ApproverStopReason, () => Array<StatusResult | Error>, number | undefined, (() => void) | undefined]
   > = [
     [APPROVER_STOP_LIVE, () => [PENDING_ROW, LIVE_ROW], LAUNCH_START_MS, undefined],
     [APPROVER_STOP_FINISHED, () => [cannedStatusResult({ state: [...AGENT_DIRECTOR_DEAD_STATES][0]! })], undefined, undefined],

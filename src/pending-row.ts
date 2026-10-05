@@ -133,9 +133,8 @@
  * episode's end, the rule's driver and the abort is pure; those act only
  * through the dependencies they are given (the abort's per-episode state
  * lives in its instance). Errors are classified by class through
- * `src/ad-error-class.ts`, the Phase-1-only classes through the bindings
- * of `src/agent-director-errors.ts`; the result field is typed through CSCB's own Phase 1
- * declarations (`src/ad-phase1-types.ts`, a type-only import).
+ * `src/ad-error-class.ts`; the result fields are typed by the client's own
+ * `StatusResult` (a type-only import).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -152,7 +151,7 @@ import {
   isAdErrorInstance,
   type AdErrorClass,
 } from './ad-error-class.ts'
-import type { Phase1StatusResult } from './ad-phase1-types.ts'
+import type { StatusResult } from 'agent-director'
 import {
   adGraceMsInEffect,
   adLaunchBoundMsInEffect,
@@ -258,7 +257,7 @@ export function parseLaunchStart(raw: unknown): number | undefined {
  * What the predicate reads of a row: its state and its raw launch start.
  * A `status` result, a `get` result and a `list` row all carry both.
  */
-export type PendingRowFields = Pick<Phase1StatusResult, 'state' | 'launch_started_at'>
+export type PendingRowFields = Pick<StatusResult, 'state' | 'launch_started_at'>
 
 /**
  * True when `row` (a `get` or `list` row, or a `status` result as the client

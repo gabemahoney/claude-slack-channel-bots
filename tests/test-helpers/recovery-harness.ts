@@ -1132,7 +1132,7 @@ import { join } from 'node:path'
 import type { WebClient } from '@slack/web-api'
 import type { Client, SpawnResult } from 'agent-director'
 
-import type { Phase1SpawnParams, Phase1StatusResult } from '../../src/ad-phase1-types.ts'
+import type { SpawnParams, StatusResult } from 'agent-director'
 
 import {
   adAlertThresholdMsInEffect,
@@ -2026,7 +2026,7 @@ export interface RecoveryHarness {
    * The reuse spawns the stub recorded (b.jg5 SRJ-112, SRJ-708): its `spawn`
    * calls carrying the reuse field (`reuse_finished`), in order; read-only.
    */
-  reuseSpawns(): readonly Phase1SpawnParams[]
+  reuseSpawns(): readonly SpawnParams[]
   /**
    * The sequence-start request for persona `key` that `startSequence` hands
    * the session manager's start entry, with `request`'s fields and the
@@ -4283,7 +4283,7 @@ export function ownRowsLiveThenMissing(h: RecoveryHarness): void {
  * SRJ-708), for `toEqual`: a `spawn` of `cscb_<key>` with the reuse flag set
  * and the persona's `extra_env` (`personaSpawnEnv`, prompt suggestions off).
  */
-export function reuseSpawnOf(h: RecoveryHarness, key: string): Phase1SpawnParams {
+export function reuseSpawnOf(h: RecoveryHarness, key: string): SpawnParams {
   const persona = personaOf(h, key)
   return expect.objectContaining({
     claude_instance_id: personaInstanceId(key),
@@ -4304,7 +4304,7 @@ export function reuseSpawnOf(h: RecoveryHarness, key: string): Phase1SpawnParams
 export function holdSequenceReuse(
   h: RecoveryHarness,
   key: string,
-): { readonly entered: Promise<void>; readonly calls: readonly Phase1SpawnParams[]; release(): void } {
+): { readonly entered: Promise<void>; readonly calls: readonly SpawnParams[]; release(): void } {
   const id = personaInstanceId(key)
   const hold = holdSpawns(h.stub.client, (spawned) => spawned === id)
   return { entered: hold.entered(id), calls: hold.calls, release: () => hold.release(id) }
@@ -4439,7 +4439,7 @@ export interface TimedLaunch {
    * a case hands this to its own `statusFn` or `statusQueue` (an approver's
    * lap reads `status`). Throws before the call ends.
    */
-  statusRow(overrides?: Partial<Phase1StatusResult>): Phase1StatusResult
+  statusRow(overrides?: Partial<StatusResult>): StatusResult
 }
 
 /**

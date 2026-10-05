@@ -37,7 +37,7 @@
 
 import { realpathSync } from 'node:fs'
 
-import type { Phase1ListRow } from '../../src/ad-phase1-types.ts'
+import type { ListRow } from 'agent-director'
 import type { PersonaConfig } from '../../src/config.ts'
 import {
   OLD_LIFE_WAIT_END_HOLD_ENDED,
@@ -82,7 +82,7 @@ export const PRE_PERSONA_SESSION = personaTmuxSessionName(PRE_PERSONA_ID.replace
 // ---------------------------------------------------------------------------
 
 /** Persona `key`'s own row as the start sweep's `list` gives it (its id, labels and directory; `waiting`), with `overrides`. */
-export function listed(h: RecoveryHarness, key: string, overrides: Partial<Phase1ListRow> = {}): Phase1ListRow {
+export function listed(h: RecoveryHarness, key: string, overrides: Partial<ListRow> = {}): ListRow {
   return cannedListRow(overrides, personaOf(h, key), h.home)
 }
 
@@ -91,7 +91,7 @@ export function listed(h: RecoveryHarness, key: string, overrides: Partial<Phase
  * (`cscb_<key>`, labelled `key`, in the harness's first persona's working
  * directory), with `overrides`.
  */
-export function absentRow(h: RecoveryHarness, key: string, overrides: Partial<Phase1ListRow> = {}): Phase1ListRow {
+export function absentRow(h: RecoveryHarness, key: string, overrides: Partial<ListRow> = {}): ListRow {
   return cannedListRow(overrides, { ...personaOf(h, h.keys[0]!), key }, h.home)
 }
 
@@ -109,7 +109,7 @@ export interface SweepRun {
  */
 export async function sweepOver(
   h: RecoveryHarness,
-  rows: readonly Phase1ListRow[],
+  rows: readonly ListRow[],
   config: PersonaConfig = h.config,
   isShuttingDown?: () => boolean,
 ): Promise<SweepRun> {

@@ -242,7 +242,7 @@ import {
   type KillRetryResult,
 } from '../src/kill-retry.ts'
 import { adAlertThresholdMs, adAlertThresholdMsInEffect, adGraceMsInEffect, adLaunchBoundMsInEffect, DEFAULT_AD_SETTINGS_IN_EFFECT } from '../src/ad-settings.ts'
-import type { Phase1GetResult, Phase1SpawnParams } from '../src/ad-phase1-types.ts'
+import type { GetResult } from 'agent-director'
 import { ERR_SCHEMA_MISMATCH_NAME, ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
@@ -7337,7 +7337,7 @@ function noSessionIdReuse(h: RecoveryHarness, key: string, make: () => Error): N
   const spawn = client.spawn.bind(client)
   client.spawn = async (params) => {
     const result = await spawn(params)
-    if ((params as Phase1SpawnParams).reuse_finished !== true) throw errInstanceIdCollision()
+    if (params.reuse_finished !== true) throw errInstanceIdCollision()
     const held = hold
     hold = undefined
     if (held !== undefined) {
@@ -9008,7 +9008,7 @@ describe('unavailable retry: the collision ladder\'s second reuse collision, its
   // b.jg5 SRJ-710, SRJ-301: resume's ErrSpawnNotResumable makes one re-read;
   // a finished row, no row, or a live row on a path with no dead evidence is
   // a lost race, re-evaluated at P's next retry.
-  test.each<[string, (h: RecoveryHarness, key: string) => CannedResponse<Phase1GetResult>]>([
+  test.each<[string, (h: RecoveryHarness, key: string) => CannedResponse<GetResult>]>([
     ['the row ended', (h, key) => cannedOk(personaRow(h, key, { state: LIVENESS_DEAD_ROW_ENDED }))],
     ['the row missing', (h, key) => cannedOk(personaRow(h, key, { state: LIVENESS_DEAD_ROW_MISSING }))],
     ['no row (ErrSpawnNotFound)', () => cannedErr(errSpawnNotFound())],
@@ -9098,7 +9098,7 @@ describe('unavailable retry: the collision ladder\'s second reuse collision, its
 
 describe('unavailable retry: ErrSpawnNotResumable\'s re-read as a trigger: pending arms only what the ladder\'s pending branch arms, a running sequence refuses the retry, step 6\'s end brings the next retry (SRJ-710, SRJ-301, SRJ-706)', () => {
   /** P's launch through its `waiting` row's GONE dead-session route (dead evidence), its `resume` answering ErrSpawnNotResumable once and its re-read reading `reread`; every later `get` reads `after`. */
-  function scriptGone(h: RecoveryHarness, key: string, reread: Phase1GetResult, after: Phase1GetResult): void {
+  function scriptGone(h: RecoveryHarness, key: string, reread: GetResult, after: GetResult): void {
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getQueue: [cannedOk(personaRow(h, key)), cannedOk(reread)],

@@ -114,8 +114,8 @@ const SUPPORTED_PLATFORMS = ['linux-x64', 'darwin-arm64'] as const
  * required: CSCB recognises those errors by the client's own classes
  * (`src/agent-director-errors.ts`), and a client without them turns a Phase 1
  * binary's errors into `ErrUnknownErrorName`, which the classifier would
- * misclassify, and leaves CSCB on its stand-in classes. The check reads names
- * in the dist text and imports none of them (b.jg5 SRJ-101).
+ * misclassify. The check reads names in the dist text; it imports none of
+ * them.
  */
 export const REQUIRED_ERR_NAMES = [
   'ErrInvalidFlags',
@@ -302,7 +302,7 @@ function mergeDeps(overrides?: Partial<StartupGateDeps>): StartupGateDeps {
  * still pass through), plus `callTimeoutMs` when a call timeout is given
  * (b.jg5 SRJ-213). With none, no `callTimeoutMs` key is set and the client
  * uses its own default. The gate's client and the persona client differ only
- * in that key. The 0.10.0 client fixes the timeout at construction.
+ * in that key. The client fixes the timeout at construction.
  */
 function buildAdClientOptions(callTimeoutMs?: number): ClientOptions {
   return {
@@ -670,7 +670,7 @@ export type PersonaClientDeps = Pick<StartupGateDeps, 'createClient' | 'closeCli
  * Build the client the server makes its persona calls with, carrying
  * `callTimeoutMs` (b.jg5 SRJ-213, SRJ-121), and install it as the singleton.
  *
- * Why a second client: the 0.10.0 client fixes `callTimeoutMs` at
+ * Why a second client: the client fixes `callTimeoutMs` at
  * construction, and the server's gate builds its client before the start has
  * read the configuration that holds the setting (SRJ-213 lets the gate's
  * version probe use the client's default). Once the start has resolved its

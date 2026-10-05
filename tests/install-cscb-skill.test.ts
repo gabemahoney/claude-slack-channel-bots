@@ -58,7 +58,9 @@
  * (b.jg5 SRJ-1110, AC 15, AC 20, AC 81; SRJ-101's skill clause; hatch notes
  * E5, E35, E36):
  *   - The pin: every `agent-director@<spec>` in the whole skill (a file-local
- *     extractor) equals `PHASE1_FLOOR_VERSION`, and there is at least one. No
+ *     extractor) equals `PHASE1_FLOOR_VERSION`, and equals `package.json`'s
+ *     `dependencies['agent-director']`, read from the file (SRJ-101); there is
+ *     at least one. No
  *     `@latest` and no other dist-tag appears anywhere in the skill. Self-checks
  *     build `@latest`, a caret range of the floor, the floor's release
  *     candidate (`PHASE1_RC_VERSION`) and `OLD_AD_VERSION` from the shared
@@ -92,12 +94,6 @@
  * The too-old clause of SRJ-1110 is the too-old branch's block above; the
  * `access.json` ban for skills lives in tests/access-file-retired.test.ts.
  *
- * Residual R2 (E51): once `package.json` pins the released client, a case
- * asserts that every `agent-director@<spec>` in the skill equals
- * `package.json`'s `dependencies['agent-director']` (SRJ-101). Until then the
- * skill's pin is checked against the floor only, and `package.json` still
- * names the 0.10.0 client's range.
- *
  * SPDX-License-Identifier: MIT
  */
 
@@ -126,6 +122,12 @@ import { type ForbiddenForm, UPGRADE_FORMS } from './test-helpers/upgrade-forms.
 const SKILLS_DIR = resolve(import.meta.dirname, '..', 'skills')
 const SKILL_PATH = resolve(SKILLS_DIR, 'install-cscb', 'SKILL.md')
 const skillContent = readFileSync(SKILL_PATH, 'utf-8')
+
+/** The repo's `package.json`: its scripts and its runtime dependencies. */
+const PACKAGE_JSON = JSON.parse(readFileSync(resolve(import.meta.dirname, '..', 'package.json'), 'utf-8')) as {
+  scripts?: Record<string, string>
+  dependencies?: Record<string, string>
+}
 
 const FRONTMATTER_FIELDS = [
   'name:',
@@ -535,6 +537,12 @@ describe('install-cscb skill: the pinned agent-director client (b.jg5 SRJ-1110, 
     expect(clientPins(skillContent).filter((spec) => spec !== PHASE1_FLOOR_VERSION)).toEqual([])
   })
 
+  test("a pin other than package.json's: every agent-director@<spec> in the skill is package.json's dependencies['agent-director']", () => {
+    const pkgSpec = PACKAGE_JSON.dependencies?.['agent-director']
+    expect(pkgSpec).toBeDefined()
+    expect(clientPins(skillContent).filter((spec) => spec !== pkgSpec)).toEqual([])
+  })
+
   test('no @latest and no other dist-tag anywhere in the skill', () => {
     expect(skillContent.match(DIST_TAG) ?? []).toEqual([])
   })
@@ -586,12 +594,9 @@ describe('install-cscb skill: the pinned agent-director client (b.jg5 SRJ-1110, 
 const STEP1_TITLE = 'Run the shared check'
 
 /** `package.json`'s script names whose command runs the install check's script. */
-const INSTALL_CHECK_SCRIPTS: string[] = (() => {
-  const pkg = JSON.parse(readFileSync(resolve(import.meta.dirname, '..', 'package.json'), 'utf-8')) as { scripts?: Record<string, string> }
-  return Object.entries(pkg.scripts ?? {})
-    .filter(([, command]) => command.split(/\s+/).includes('scripts/install-check.ts'))
-    .map(([name]) => name)
-})()
+const INSTALL_CHECK_SCRIPTS: string[] = Object.entries(PACKAGE_JSON.scripts ?? {})
+  .filter(([, command]) => command.split(/\s+/).includes('scripts/install-check.ts'))
+  .map(([name]) => name)
 
 /** The install check's note label as a code span, as the skill names it. */
 const NOTE_LABEL_SPAN = `\`${INSTALL_CHECK_NOTE_LABEL}\``

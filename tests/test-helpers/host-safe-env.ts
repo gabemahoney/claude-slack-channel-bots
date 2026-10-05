@@ -3,7 +3,7 @@
  * environment of a child process it starts, and the agent-director checks the
  * `bun test` preload guard shares (b.jg5 SRJ-1301, SRJ-1302, SRJ-1304).
  *
- * The agent-director 0.10.0 client finds its binary at the standard install
+ * The agent-director client finds its binary at the standard install
  * path under `HOME` (`AGENT_DIRECTOR_INSTALL_PATH`), then as the first file or
  * symlink named `agent-director` (`AGENT_DIRECTOR_BINARY_NAME`) in a `PATH`
  * directory. It exports neither, so both are written once, here. A child that

@@ -147,10 +147,9 @@ import { ErrSpawnNotFound } from './agent-director-errors.ts'
 import { isAdErrorInstance } from './ad-error-class.ts'
 import { checkedKill, type PlainKillParams } from './checked-kill.ts'
 import { killRetrySeedOfState, runKillRetry, type KillRetryRead } from './kill-retry.ts'
-import type { Phase1GetResult } from './ad-phase1-types.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { getClient } from './agent-director-client.ts'
-import type { Client, ListRow } from 'agent-director'
+import type { Client, GetResult, ListRow } from 'agent-director'
 import { SERVICE_LABEL, personaInstanceId, personaKey, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import { REFUSAL_KIND_CLIENT_TOO_OLD, runStartupGate } from './agent-director-startup.ts'
 import type { StartupGateDeps, StartupGateOptions, StartupGateRefusalKind } from './agent-director-startup.ts'
@@ -1800,7 +1799,7 @@ export function createDirectorOps(getClient: () => DirectorClient): DirectorOps 
   return {
     directorGet: async (id) => {
       try {
-        const r: Phase1GetResult = await getClient().get({ claude_instance_id: id })
+        const r: GetResult = await getClient().get({ claude_instance_id: id })
         return { state: r.state, liveness_note: r.liveness_note, launch_started_at: r.launch_started_at }
       } catch (err) {
         if (isAdErrorInstance(err, ErrSpawnNotFound)) return null

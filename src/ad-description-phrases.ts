@@ -144,7 +144,7 @@ export const SURVIVOR_CLAUSE_MANY_PHRASE = 'other processes of panes of the labe
  * The survivor-naming form (b.jg5 SRJ-702, SRJ-1303, SRJ-1007): the survivor
  * clause of an `ErrTmuxKillFailed` description, which names the processes of
  * the labelled session's panes that outlived the kill exit wait. Checked
- * against agent-director 0.11.0-rc.1 (commit `d787cb4`,
+ * against agent-director 0.11.0 (tag `v0.11.0`,
  * `pkg/api/kill_errors.go`, `waitExpiredError` and `noPaneError`; pinned by
  * `pkg/api/apitest/descriptions_kill.go`):
  *   - one survivor: "another process of a pane of the labelled session

@@ -36,9 +36,8 @@
  * Recognition is by class: every row names an error class the client
  * declares, and a value is of that row when it is an instance of the class
  * (`instanceof`, through {@link isAdErrorInstance}), never by its `errName`
- * or `name`. The classes come from `src/agent-director-errors.ts`, the three
- * Phase-1-only ones (`ErrTmuxKillFailed`, `ErrTmuxUnresponsive`,
- * `ErrTmuxSessionConflict`) through its bindings. An `ErrUnknownErrorName`
+ * or `name`. The classes are the client's own, re-exported by
+ * `src/agent-director-errors.ts`. An `ErrUnknownErrorName`
  * instance is then decided by its `unknownName` and the envelope's
  * `err_description`: `ErrInternal`, `ErrConfigMalformed` and the three
  * store-open names, which no client declares as a class, are matched exactly
@@ -332,8 +331,8 @@ export type AdErrorClass = (typeof AD_ERROR_CLASSES)[number]
 // ---------------------------------------------------------------------------
 
 /**
- * Any agent-director error class (the client's own, a Phase-1-only binding
- * from `src/agent-director-errors.ts`, or CSCB's own subclass), whatever its
+ * Any agent-director error class (the client's own, re-exported by
+ * `src/agent-director-errors.ts`, or CSCB's own subclass), whatever its
  * constructor's parameters: what {@link isAdErrorInstance} tests against.
  */
 export type AdErrorConstructor = abstract new (...args: never[]) => AgentDirectorError
@@ -510,9 +509,9 @@ export function isInvalidFlagsError(value: unknown): value is InvalidFlagsError 
 /**
  * True when `value` is an instance of the agent-director error class
  * `errorClass`: one of the client's classes, imported from
- * `src/agent-director-errors.ts` (a Phase-1-only one through its binding
- * there), or CSCB's own subclass. The one way a site tells one agent-director
- * error class from another (a STATE class's meaning is set per site). A base
+ * `src/agent-director-errors.ts`, or CSCB's own subclass. The one way a site
+ * tells one agent-director error class from another (a STATE class's meaning
+ * is set per site). A base
  * `AgentDirectorError` whose `errName` merely equals a class's name is not an
  * instance of that class. Never throws: a value that is not an object, or an
  * `instanceof` that throws, answers false.

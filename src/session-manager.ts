@@ -444,16 +444,18 @@
  * SPDX-License-Identifier: MIT
  */
 
-import type { Client, ListRow, SpawnParams, FindMissingResult, GetResult } from 'agent-director'
-
 import type {
-  Phase1GetResult,
-  Phase1ResumeResult,
-  Phase1SpawnParams,
-  Phase1SpawnResult,
-  Phase1StatusResult,
-  PreTrust,
-} from './ad-phase1-types.ts'
+  Client,
+  FindMissingResult,
+  GetResult,
+  ListRow,
+  ResumeResult,
+  SpawnParams,
+  SpawnResult,
+  StatusResult,
+} from 'agent-director'
+
+import type { PreTrust } from './ad-phase1-types.ts'
 
 import { checkCozempicAvailable, resolveJsonlPath } from './cozempic.ts'
 import {
@@ -2897,7 +2899,7 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
   noteOldLifeRowRead(personaInstanceId(key), { kind: OLD_LIFE_ROW_READ_STATE, state: row.state, cwd: row.cwd }, oldLifeReadName(at))
   const latched = actOnOwnRowRead(key, row, at, true) !== undefined
   // b.jg5 SRJ-310 rule 3, SRJ-407: this launch's row read live other than `pending` ends the condition.
-  checkThisLaunchRowOnRead(key, { state: row.state, launchStartedAt: (row as Phase1GetResult).launch_started_at }, latched, at)
+  checkThisLaunchRowOnRead(key, { state: row.state, launchStartedAt: row.launch_started_at }, latched, at)
   return { kind: OWN_ROW_READ_ROW, row, latched }
 }
 
@@ -3109,13 +3111,13 @@ function logUnusableNameRead(key: string, at: OwnRowReadSite, err: unknown, outc
 /**
  * One `status` answer from persona P's own row, for the own-row `status`
  * step: the result it returned, or the value it threw. The result is the
- * one the client returned, passed whole: its `launch_started_at` (raw,
- * `src/ad-phase1-types.ts`) is what the launch-start decision reads, so a
+ * one the client returned, passed whole: its `launch_started_at` (raw) is
+ * what the launch-start decision reads, so a
  * caller that rebuilt the result from its `state` alone would make a
  * `pending` row with a launch start read as one with none.
  */
 export type OwnRowStatusAnswer =
-  | { readonly result: Phase1StatusResult }
+  | { readonly result: StatusResult }
   | { readonly thrown: unknown }
 
 /**
@@ -3261,7 +3263,7 @@ export type OwnRowStatusRead =
  */
 export async function readPersonaOwnRowStatus(key: string, at: OwnRowReadSite): Promise<OwnRowStatusRead> {
   // The result whole, so the step reads its launch start (b.jg5 SRJ-513).
-  let result: Phase1StatusResult
+  let result: StatusResult
   try {
     result = await withOutageDetection(key, undefined, 'status', (client) =>
       client.status({ claude_instance_id: personaInstanceId(key) }),
@@ -10041,7 +10043,7 @@ export interface PlainSpawnSite<R> {
    */
   readonly marksDirectoryCounted?: boolean
   /** The site's line for a success, given the spawn's result. */
-  readonly spawnedLine: (launched: Phase1SpawnResult) => string
+  readonly spawnedLine: (launched: SpawnResult) => string
   /**
    * The site's `ErrInstanceIdCollision` row (b.jg5 SRJ-111, SRJ-114): the
    * collision ladder's get-then-act (its first run after the first spawn,
@@ -10099,7 +10101,7 @@ export async function plainSpawnOutcomeAt<R>(site: PlainSpawnSite<R>): Promise<S
   const { persona, isStartup, ref, params } = site
   const { key } = persona
   const replyGuardUndo = runPreLaunchReplyGuard(persona, ref)
-  let launched: Phase1SpawnResult
+  let launched: SpawnResult
   try {
     launched = await launchCallWithWindow(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
   } catch (err) {
@@ -11566,7 +11568,7 @@ async function resumeAtSite<R>(site: ResumeSite<R>): Promise<SpawnPersonaResult 
   const { persona, isStartup, ref, lastRead, head } = site
   const { key } = persona
   try {
-    const launched: Phase1ResumeResult = await launchWithReplyGuard(persona, ref, 'resume', (client) =>
+    const launched: ResumeResult = await launchWithReplyGuard(persona, ref, 'resume', (client) =>
       client.resume({ claude_instance_id: personaInstanceId(key) }),
     )
     console.error(`${head} resumed ${ref}`)
@@ -13333,8 +13335,8 @@ async function afterLaunchUnavailable(
     log('nothing (a refused read)', undefined, LAUNCH_UNAVAILABLE_OUTCOME_REFUSED)
     return notLaunched()
   }
-  // The row whole, so its launch start is read (`src/ad-phase1-types.ts`).
-  const row: Phase1GetResult = read.row
+  // The row whole, so its launch start is read.
+  const row: GetResult = read.row
   const readText = launchUnavailableReadText(row.state)
   if (row.state !== AGENT_DIRECTOR_PENDING_STATE) {
     const outcome = AGENT_DIRECTOR_DEAD_STATES.has(row.state)
@@ -14296,7 +14298,7 @@ function afterLaunchSucceeded(
   isStartup: boolean,
   ref: string,
   verb: LaunchVerb,
-  launched: Phase1SpawnResult | Phase1ResumeResult,
+  launched: SpawnResult | ResumeResult,
 ): void {
   console.error(preTrustLogLine(ref, verb, launched?.pre_trust))
   armPendingRowWatch(key, ref)
@@ -15273,15 +15275,14 @@ export async function reuseSpawnForPersona(
   }
   const configDirLabel = configDirLabelValue(configDir.realPath, spawnHomeDir())
   // b.jg5 SRJ-708: one derivation of the parameters; only the flag is added.
-  // The Phase 1 client emits `--reuse-finished` for `reuse_finished: true`
-  // (its spawn flag builder, `pkg/ts-bun-client/src/internal/argv.ts` at
-  // agent-director `d787cb4`); the 0.10.0 client drops the field. Once
-  // the package pins the Phase 1 client, its own `SpawnParams` replaces
-  // `Phase1SpawnParams`.
-  const params: Phase1SpawnParams = { ...buildSpawnParams(persona, config, configDirLabel), reuse_finished: true }
+  // `reuse_finished` is the client's own `SpawnParams` field, which the
+  // 0.11.0 client emits as `--reuse-finished` for `reuse_finished: true` (its
+  // spawn flag builder, `pkg/ts-bun-client/src/internal/argv.ts` at
+  // agent-director tag `v0.11.0`, as read from its packed client).
+  const params: SpawnParams = { ...buildSpawnParams(persona, config, configDirLabel), reuse_finished: true }
   // b.av2 SR-6.2: the trust patch precedes every launch, once per attempt.
   if (options.trustPatchRan !== true) runPreLaunchTrustPatch(persona, ref)
-  let launched: Phase1SpawnResult
+  let launched: SpawnResult
   // b.av2 SR-9.4: the reply guard immediately before the call; a retired
   // key's first launch undoes it on a collision, as the plain first spawn does.
   const replyGuardUndo = runPreLaunchReplyGuard(persona, ref)
@@ -16648,7 +16649,7 @@ async function readSequenceRow(key: string, ref: string): Promise<LiveRowSequenc
   switch (read.kind) {
     case OWN_ROW_READ_ROW:
       // The row whole, so the sequence reads its launch start and session id.
-      return read.latched ? { kind: LIVE_ROW_READ_LATCHED } : { kind: LIVE_ROW_READ_ROW, row: read.row as Phase1GetResult }
+      return read.latched ? { kind: LIVE_ROW_READ_LATCHED } : { kind: LIVE_ROW_READ_ROW, row: read.row }
     case OWN_ROW_READ_ABSENT:
       return { kind: LIVE_ROW_READ_ABSENT }
     case OWN_ROW_READ_LATCHED:
@@ -17270,7 +17271,7 @@ async function readOldLifeRow(target: OldLifeWaitTarget, record: OldLifeWaitReco
       case OWN_ROW_READ_ROW:
         record.session = rowSessionName(read.row) ?? record.session
         clearOldLifeWaitConfigOutage(target)
-        return read.latched ? { kind: LIVE_ROW_READ_LATCHED } : { kind: LIVE_ROW_READ_ROW, row: read.row as Phase1GetResult }
+        return read.latched ? { kind: LIVE_ROW_READ_LATCHED } : { kind: LIVE_ROW_READ_ROW, row: read.row }
       case OWN_ROW_READ_ABSENT:
         return { kind: LIVE_ROW_READ_ABSENT }
       case OWN_ROW_READ_LATCHED:
@@ -17286,7 +17287,7 @@ async function readOldLifeRow(target: OldLifeWaitTarget, record: OldLifeWaitReco
     record.session = rowSessionName(row) ?? record.session
     // b.jg5 SRJ-809: a row read `ended` or `missing` ends the hold; a live one's `cwd` becomes the held directory.
     noteOldLifeRowRead(instanceId, { kind: OLD_LIFE_ROW_READ_STATE, state: row.state, cwd: row.cwd }, `${OLD_LIFE_WAIT_SITE}: ${OLD_LIFE_WAIT_GET_WHAT}`)
-    return { kind: LIVE_ROW_READ_ROW, row: row as Phase1GetResult }
+    return { kind: LIVE_ROW_READ_ROW, row }
   } catch (err) {
     if (isAdErrorInstance(err, ErrSpawnNotFound)) {
       noteOldLifeRowRead(instanceId, { kind: OLD_LIFE_ROW_READ_NO_ROW }, `${OLD_LIFE_WAIT_SITE}: ${OLD_LIFE_WAIT_GET_WHAT}`)
@@ -17312,7 +17313,7 @@ async function readOldLifeKillRow(target: OldLifeWaitTarget, record: OldLifeWait
   const { instanceId, oldKey } = target
   const own = isConfiguredOwnRow(target)
   const at: OwnRowReadSite = { site: OLD_LIFE_WAIT_SITE, what: OLD_LIFE_WAIT_STATUS_WHAT, ref }
-  let result: Phase1StatusResult
+  let result: StatusResult
   try {
     result = await withOutageDetection(oldKey, undefined, 'status', (client) => client.status({ claude_instance_id: instanceId }), oldLifeWaitCallOptions(target))
     clearOldLifeWaitConfigOutage(target)

@@ -441,7 +441,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import type { Phase1GetResult, Phase1ListRow, Phase1StatusResult } from '../../src/ad-phase1-types.ts'
+import type { GetResult, ListRow, StatusResult } from 'agent-director'
 import {
   AGENT_DIRECTOR_DEAD_STATES,
   AGENT_DIRECTOR_LIVE_STATES,
@@ -2409,9 +2409,9 @@ export function reconnectUnusableNameRowsAt(lastRead: ReconnectLastRead): readon
 
 /** What each read shape answers, as the stub's canned builders build it. */
 export interface LaunchStartReadResults {
-  readonly status: Phase1StatusResult
+  readonly status: StatusResult
   readonly get: CannedGetResult
-  readonly list: Phase1ListRow
+  readonly list: ListRow
 }
 
 /** A read the server makes of a row: `status`, `get` or `list`. */
@@ -2471,7 +2471,7 @@ export const LAUNCH_START_PRE_PERSONA_KEY = 'legacy'
 interface LaunchStartRowOverrides {
   readonly state: string
   readonly launch_started_at: string | null | undefined
-  readonly liveness_note?: Phase1GetResult['liveness_note']
+  readonly liveness_note?: GetResult['liveness_note']
   readonly cwd?: string
   readonly labels?: Record<string, string>
   readonly claude_instance_id?: string
@@ -2570,7 +2570,7 @@ export interface LaunchStartCaseRowOf<S extends LaunchStartReadShape> extends La
   /** Its form of "no launch start". */
   readonly form: NoLaunchStartForm
   /** The `liveness_note` the row also carries (`provenanceNote` on {@link LAUNCH_START_AND_NOTE_ROW} only). */
-  readonly livenessNote: Phase1GetResult['liveness_note'] | undefined
+  readonly livenessNote: GetResult['liveness_note'] | undefined
   /** "launch start not recorded". */
   readonly latchCase: typeof LATCH_CASE_LAUNCH_START_NOT_RECORDED
   /** "none": the re-check reads only `status`. */
@@ -2613,7 +2613,7 @@ export type LaunchStartCaseRow = { [S in LaunchStartReadShape]: LaunchStartCaseR
 function ownRowSpec(
   variant: LaunchStartRowVariant,
   launchStart: string | null | undefined,
-  note: Phase1GetResult['liveness_note'] | undefined,
+  note: GetResult['liveness_note'] | undefined,
 ): (persona: CannedRowPersona, home: string) => LaunchStartRowSpec {
   return (persona, home) => {
     const base: LaunchStartRowOverrides = {
@@ -2634,7 +2634,7 @@ function launchStartRow<S extends LaunchStartReadShape>(
   shape: S,
   variant: LaunchStartRowVariant,
   form: NoLaunchStartForm,
-  note?: Phase1GetResult['liveness_note'],
+  note?: GetResult['liveness_note'],
 ): LaunchStartCaseRowOf<S> {
   const launchStart = NO_LAUNCH_START_FORMS[form]
   const noteLabel = note === undefined ? '' : `, ${note} note`

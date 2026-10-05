@@ -467,7 +467,7 @@ import {
   RETRY_KILL_LATER_PHRASE,
 } from '../src/ad-description-phrases.ts'
 import { adAlertThresholdMsInEffect, adLaunchBoundMsInEffect } from '../src/ad-settings.ts'
-import type { Phase1GetResult, Phase1ListRow } from '../src/ad-phase1-types.ts'
+import type { GetResult, ListRow } from 'agent-director'
 import { ERR_TMUX_SESSION_CONFLICT_NAME, ErrTmuxSessionConflict } from '../src/agent-director-errors.ts'
 import {
   CONFLICT_CASE_ORDER,
@@ -4384,7 +4384,7 @@ describe('SRJ-513: a pending row with no launch start holds P for a human on eve
   // hatch note): the sweep lists P's own row reading pending with no launch
   // start, as `main()` runs it before the start pass. Another existing cwd
   // is a row the sweep kills when P is not latched.
-  const LISTED_NO_LAUNCH_START: ReadonlyArray<readonly [string, (h: RecoveryHarness) => Partial<Phase1ListRow>]> = [
+  const LISTED_NO_LAUNCH_START: ReadonlyArray<readonly [string, (h: RecoveryHarness) => Partial<ListRow>]> = [
     ['in P\'s working directory', () => ({})],
     ['also carrying the provenance_conflict note (the launch-start case only)', () => ({ liveness_note: provenanceNote })],
     ['in another existing cwd', (h) => ({ cwd: h.home })],
@@ -5064,8 +5064,8 @@ describe('the live-row sequence\'s own latches: a kill CONFLICT or UNUSABLE NAME
     const { h, p } = makeSequenceRun()
     h.script({
       getQueue: [
-        ...Array.from({ length: before }, () => cannedOk<Phase1GetResult>(personaRow(h, p))),
-        cannedOk<Phase1GetResult>(personaRow(h, p, { liveness_note: provenanceNote })),
+        ...Array.from({ length: before }, () => cannedOk<GetResult>(personaRow(h, p))),
+        cannedOk<GetResult>(personaRow(h, p, { liveness_note: provenanceNote })),
       ],
     })
     const order = recordCallOrder(h)

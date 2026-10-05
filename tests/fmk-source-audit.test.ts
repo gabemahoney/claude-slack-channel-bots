@@ -44,21 +44,52 @@
  * TypeScript parser, so text in strings and comments never counts, and finds
  * any recognition of a class the client declares by name rather than by class
  * (b.jg5 SRJ-101, SRJ-104). The class names are read from the installed
- * client's namespace (every subclass of its `AgentDirectorError`), with the
- * three Phase-1-only classes (`PHASE1_ONLY_ERR_NAMES`), never listed here. A
- * name is the literal, a constant holding it, or an element of a collection
- * of them; its rules are listed at `byNameFindings`. The only by-name uses
- * kept are `SANCTIONED_BY_NAME`'s (`ErrAmbiguousRequest` in the click handler,
- * `ErrPermissionRequestNotFound` in the client module, the system-install
- * classes in the version gate, the GONE names in the checked kill's log label,
- * and the stub's two base-error builders), each checked to be a client class
- * still used there by its rule. The same rows pin each
- * rule with a planted violation, at a synthetic path or at a real kill or
- * sanctioned site's path, and the allowed uses (the name constants and
- * `PHASE1_ONLY_ERR_NAMES`, `REQUIRED_ERR_NAMES` and the catalogue check, log
- * labels, the stub's builders on the class bindings, the A-13 and
- * `UnknownError` rows, the sanctioned comparisons, and the stand-in
- * declarations in `src/agent-director-errors.ts`).
+ * client's namespace (every subclass of its `AgentDirectorError`, the three
+ * Phase-1-only classes in `PHASE1_ONLY_ERR_NAMES` among them), never listed
+ * here. A name is the literal, a constant holding it, or an element of a
+ * collection of them; its rules are listed at `byNameFindings`. The only
+ * by-name uses kept are `SANCTIONED_BY_NAME`'s (`ErrAmbiguousRequest` in the
+ * click handler, `ErrPermissionRequestNotFound` in the client module, the
+ * system-install classes in the version gate, the GONE names in the checked
+ * kill's log label, and the stub's two base-error builders), each checked to
+ * be a client class still used there by its rule; no file and no declaration
+ * is exempt otherwise. The same rows pin each rule with a planted violation,
+ * at a synthetic path or at a real kill, sanctioned site's or
+ * `src/agent-director-errors.ts`'s path, and the allowed uses (the name
+ * constants and `PHASE1_ONLY_ERR_NAMES`, `REQUIRED_ERR_NAMES` and the
+ * catalogue check, log labels, the stub's builders on the class bindings, the
+ * A-13 and `UnknownError` rows, and the sanctioned comparisons).
+ *
+ * A third audit, with the same parser, holds the three Phase-1-only classes
+ * to the pinned client's own (b.jg5 SRJ-101, SRJ-103, SRJ-1203):
+ *
+ * - `phase1ReExportFindings`: `src/agent-director-errors.ts` re-exports
+ *   each of them by its own name in an `export { … } from 'agent-director'`
+ *   declaration (not type-only, not aliased); a local binding exported in its
+ *   place, a type-only or renamed re-export, a re-export from another module
+ *   or `export *` is a finding.
+ * - `phase1ReadFindings`: no file in `src/` or `tests/test-helpers/` reads
+ *   one from agent-director other than by a named import or re-export: a
+ *   property or element read through the namespace (a typed optional cast,
+ *   a copy, a default or `import x = require` binding, or a dynamic
+ *   `import()` or `require()` included), a destructuring, a read the audit
+ *   cannot name, or the namespace passed to a call
+ *   (`agentDirectorValueReads` and `agentDirectorNamespaceArguments`,
+ *   `tests/test-helpers/ad-value-reads.ts`).
+ * - `phase1StandInFindings`: no file in `src/` or `tests/test-helpers/`
+ *   declares a class extending `AgentDirectorError` (or a client class) that
+ *   is named one of the three: by its declaration, the variable or property
+ *   it is bound to, or a `name` it is given (`this.name = …` or
+ *   `Object.defineProperty(…, 'name', …)`), a name the audit cannot read
+ *   counting as one.
+ *
+ * Each rule is pinned with flagged and allowed synthetic rows, then run over
+ * the tree.
+ *
+ * A fourth, `phase1TypesFindings`, holds `src/ad-phase1-types.ts` to type
+ * aliases and type-only agent-director imports, with no interface, object
+ * type literal or mapped type, so it declares no field the client declares
+ * (b.jg5 SRJ-101, SRJ-1303); it is pinned the same way.
  *
  * The file starts no process and reads nothing outside the repository and
  * its installed client.
@@ -74,6 +105,7 @@ import ts from 'typescript'
 
 import { AD_TMUX_TABLE } from '../src/ad-settings.ts'
 import { PHASE1_ONLY_ERR_NAMES } from '../src/agent-director-errors.ts'
+import { AGENT_DIRECTOR_MODULE, agentDirectorNamespaceArguments, agentDirectorValueReads } from './test-helpers/ad-value-reads.ts'
 import {
   callArguments,
   DELETE_HELPERS,
@@ -574,13 +606,8 @@ interface ByNameFinding {
 const CLIENT_CLASS_EXPORTS: ReadonlyArray<readonly [string, { readonly name: string }]> = Object.entries(agentDirectorClient as Record<string, unknown>)
   .filter((entry): entry is [string, { readonly name: string }] => typeof entry[1] === 'function' && entry[1].prototype instanceof agentDirectorClient.AgentDirectorError)
 
-/**
- * Every class name the audit guards: the installed client's classes, and the
- * three Phase-1-only classes (`PHASE1_ONLY_ERR_NAMES`), which
- * `src/agent-director-errors.ts` resolves from a Phase 1 client and the 0.10.0
- * client lacks.
- */
-const CLASS_NAMES: ReadonlySet<string> = new Set([...CLIENT_CLASS_EXPORTS.map(([name]) => name), ...PHASE1_ONLY_ERR_NAMES])
+/** Every class name the audit guards: the installed client's classes. */
+const CLASS_NAMES: ReadonlySet<string> = new Set(CLIENT_CLASS_EXPORTS.map(([name]) => name))
 
 /**
  * The only by-name uses of a class the client declares that the tree keeps,
@@ -633,13 +660,8 @@ const LOOKUP_METHODS: readonly string[] = ['get', 'has', 'includes', 'indexOf', 
 /** Callees whose arguments are log text (`console.error`, `log`, `deps.warn`). */
 const LOG_CALLEES: readonly string[] = ['log', 'warn', 'error', 'info', 'debug']
 
-/**
- * The module that resolves the three Phase-1-only classes from the client,
- * and its declarations that make the stand-ins and pick each class by name
- * (b.jg5 SRJ-101): the audit allows anything inside them, in that file only.
- */
-const STAND_IN_FILE = 'src/agent-director-errors.ts'
-const STAND_IN_DECLARATIONS: readonly string[] = ['phase1StandIn', 'PHASE1_STAND_INS', 'resolvePhase1ErrorClasses']
+/** The module that re-exports the client's error classes (b.jg5 SRJ-103). */
+const ERRORS_FILE = 'src/agent-director-errors.ts'
 
 /** The agent-director stub, audited beside `src/`. */
 const STUB_FILE = 'tests/test-helpers/agent-director-stub.ts'
@@ -769,14 +791,6 @@ function isBaseErrorNew(expr: ts.Expression): boolean {
   return ts.isNewExpression(inner) && memberName(inner.expression) === 'AgentDirectorError'
 }
 
-/** Whether `node` sits inside one of `STAND_IN_DECLARATIONS`. */
-function inStandInDeclaration(node: ts.Node): boolean {
-  for (let at = node.parent; at !== undefined; at = at.parent) {
-    if ((ts.isFunctionDeclaration(at) || ts.isVariableDeclaration(at)) && at.name !== undefined && ts.isIdentifier(at.name) && STAND_IN_DECLARATIONS.includes(at.name.text)) return true
-  }
-  return false
-}
-
 const EQUALITY_OPERATORS = new Set([ts.SyntaxKind.EqualsEqualsEqualsToken, ts.SyntaxKind.ExclamationEqualsEqualsToken, ts.SyntaxKind.EqualsEqualsToken, ts.SyntaxKind.ExclamationEqualsToken])
 
 /**
@@ -800,8 +814,7 @@ const EQUALITY_OPERATORS = new Set([ts.SyntaxKind.EqualsEqualsEqualsToken, ts.Sy
  *   or a base error whose `name` or `errName` is then set (an assignment,
  *   `Object.defineProperty` or `Object.assign` on it).
  *
- * Allowed: anything inside `STAND_IN_DECLARATIONS` in `STAND_IN_FILE`; a
- * `new` of any other class with a name (the stub's builders on the class
+ * Allowed: a `new` of any other class with a name (the stub's builders on the class
  * bindings); names in templates and string concatenation (log labels);
  * declaring and iterating the constants and collections
  * (`PHASE1_ONLY_ERR_NAMES`, `REQUIRED_ERR_NAMES` and the catalogue check).
@@ -814,7 +827,6 @@ function byNameFindings(files: ReadonlyArray<readonly [string, string]>, base?: 
   for (const sf of sources) {
     const file = sf.fileName
     const add = (rule: ByNameRule, node: ts.Node, names: readonly string[]): void => {
-      if (file === STAND_IN_FILE && inStandInDeclaration(node)) return
       const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1
       findings.push({ file, rule, names: [...new Set(names)].sort(), at: `${line}: ${node.getText(sf).replace(/\s+/g, ' ').slice(0, 120)}` })
     }
@@ -926,7 +938,6 @@ const BY_NAME_PLANTED: ReadonlyArray<readonly [string, string, ByNameRule]> = [
   ['an optional by-name helper on a receiver', `${ERRORS_IMPORT}\ndeps.matchesName?.(err, ERR_TMUX_UNRESPONSIVE_NAME)`, 'class-by-name-call'],
   ['a by-name builder (errGeneric)', `${ERRORS_IMPORT}\nthrow errGeneric('spawn', ERR_TMUX_SESSION_CONFLICT_NAME, 'not this launch')`, 'class-by-name-call'],
   ['a by-name builder of ErrSpawnNotFound', `${ERRORS_IMPORT}\nthrow errGeneric('kill', ERR_SPAWN_NOT_FOUND_NAME, 'row gone')`, 'class-by-name-call'],
-  ['a call inside a function named like a stand-in declaration, outside src/agent-director-errors.ts', `${ERRORS_IMPORT}\nfunction resolvePhase1ErrorClasses(err: unknown) { return hasAdErrorName(err, ERR_TMUX_KILL_FAILED_NAME) }`, 'class-by-name-call'],
   // Map or set lookups keyed by a name.
   ['a map get at a constant', `${ERRORS_IMPORT}\nconst cls = CLASS_BY_NAME.get(ERR_TMUX_KILL_FAILED_NAME)`, 'class-name-lookup'],
   ['PHASE1_ONLY_ERR_NAMES.includes(errName)', `${ERRORS_IMPORT}\nif (PHASE1_ONLY_ERR_NAMES.includes(err.errName)) retry()`, 'class-name-lookup'],
@@ -976,6 +987,14 @@ const BY_NAME_PLANTED_AT: ReadonlyArray<readonly [string, string, string, ByName
     "return new AgentDirectorError('kill', 'ErrSpawnNotFound', 'row gone')", 'base-error-named'],
   ['a sanctioned name compared in the stub, where only its base-error builder is sanctioned', STUB_FILE,
     "if (err.errName === 'ErrAmbiguousRequest') return true", 'class-name-comparison'],
+  // The module that re-exports the client's classes has no exemption: the shapes of a resolver that
+  // picked a class or a stand-in by name are findings there too.
+  ['a by-name call inside a resolver in the re-export module', ERRORS_FILE,
+    'function resolveClasses(err: unknown) { return hasAdErrorName(err, ERR_TMUX_KILL_FAILED_NAME) }', 'class-by-name-call'],
+  ['a stand-in table built by name in the re-export module', ERRORS_FILE,
+    'const STAND_INS = { [ERR_TMUX_KILL_FAILED_NAME]: makeStandIn(ERR_TMUX_KILL_FAILED_NAME) }', 'class-by-name-call'],
+  ['a stand-in table read at a name in the re-export module', ERRORS_FILE,
+    'const STAND_INS = { [ERR_TMUX_KILL_FAILED_NAME]: KillFailedStandIn }\nconst pick = (name: string) => STAND_INS[name]', 'class-name-lookup'],
 ]
 
 /** [what the source holds, its repository path, the synthetic source]: none is a finding. */
@@ -1055,19 +1074,6 @@ const BY_NAME_ALLOWED: ReadonlyArray<readonly [string, string, string]> = [
     "const doc = \"err.errName === 'ErrTmuxSessionConflict'\"",
     "// if (error?.errName === 'ErrSpawnNotFound') return { kind: KILL_OUTCOME_ROW_GONE }",
   ].join('\n')],
-  ['the stand-in declarations in src/agent-director-errors.ts', STAND_IN_FILE, [
-    "export const ERR_TMUX_KILL_FAILED_NAME = 'ErrTmuxKillFailed'",
-    'function phase1StandIn(name: string) {',
-    '  const StandIn = class extends AgentDirectorError { constructor(v: string, e: string, d: string) { super(v, e, d); this.name = name } }',
-    "  Object.defineProperty(StandIn, 'name', { value: name })",
-    '  return StandIn',
-    '}',
-    'const PHASE1_STAND_INS = { [ERR_TMUX_KILL_FAILED_NAME]: phase1StandIn(ERR_TMUX_KILL_FAILED_NAME) }',
-    'export function resolvePhase1ErrorClasses(namespace: Record<string, unknown>) {',
-    '  const pick = (name: string) => namespace[name] ?? PHASE1_STAND_INS[name]',
-    '  return { ErrTmuxKillFailed: pick(ERR_TMUX_KILL_FAILED_NAME) }',
-    '}',
-  ].join('\n')],
 ]
 
 /** The client's declared subclasses of `AgentDirectorError`, read from its shipped declarations, which the namespace read must match. */
@@ -1077,15 +1083,15 @@ const DECLARED_CLASS_NAMES: readonly string[] = [
 ].map((m) => m[1]!).filter((name) => name !== 'AgentDirectorError')
 
 describe('b.jg5 SRJ-101, SRJ-104: every class the client declares is decided by class in src/ and the stub, never by name', () => {
-  test('the class names are read from the installed client: each of its declared error classes, by its own name, and the three Phase-1-only classes', () => {
+  test('the class names are read from the installed client: each of its declared error classes, by its own name, the three Phase-1-only classes among them', () => {
     expect(CLIENT_CLASS_EXPORTS.map(([name]) => name).sort()).toEqual([...DECLARED_CLASS_NAMES].sort())
     for (const [name, cls] of CLIENT_CLASS_EXPORTS) expect(cls.name).toBe(name)
     expect(CLASS_NAMES.has('AgentDirectorError')).toBe(false)
-    expect([...CLASS_NAMES]).toEqual(expect.arrayContaining([...PHASE1_ONLY_ERR_NAMES]))
+    expect(DECLARED_CLASS_NAMES).toEqual(expect.arrayContaining([...PHASE1_ONLY_ERR_NAMES]))
   })
 
   test('the real src/ and the stub have no finding but the sanctioned uses', () => {
-    expect(BY_NAME_TREE.map(([file]) => file)).toEqual(expect.arrayContaining([STAND_IN_FILE, 'src/ad-error-class.ts', 'src/checked-kill.ts', 'src/kill-retry.ts', STUB_FILE]))
+    expect(BY_NAME_TREE.map(([file]) => file)).toEqual(expect.arrayContaining([ERRORS_FILE, 'src/ad-error-class.ts', 'src/checked-kill.ts', 'src/kill-retry.ts', STUB_FILE]))
     expect(unsanctioned(TREE_FINDINGS)).toEqual([])
   })
 
@@ -1099,15 +1105,6 @@ describe('b.jg5 SRJ-101, SRJ-104: every class the client declares is decided by 
     expect([...TREE_BINDINGS.collections.keys()]).toEqual(expect.arrayContaining(['PHASE1_ONLY_ERR_NAMES', 'REQUIRED_ERR_NAMES']))
   })
 
-  test('every allowed stand-in declaration is declared in src/agent-director-errors.ts', () => {
-    const sf = parseSource(STAND_IN_FILE, BY_NAME_TREE.find(([file]) => file === STAND_IN_FILE)![1])
-    const declared: string[] = []
-    forEachNode(sf, (node) => {
-      if ((ts.isFunctionDeclaration(node) || ts.isVariableDeclaration(node)) && node.name !== undefined && ts.isIdentifier(node.name)) declared.push(node.name.text)
-    })
-    expect(declared).toEqual(expect.arrayContaining([...STAND_IN_DECLARATIONS]))
-  })
-
   test.each(BY_NAME_PLANTED)('%s: one finding of its rule, naming the synthetic file', (what, source, rule) => {
     const file = plantedFile(what)
     expect(unsanctioned(byNameFindings([[file, source]], TREE_BINDINGS)).map(({ file: f, rule: r }) => ({ file: f, rule: r }))).toEqual([{ file, rule }])
@@ -1119,5 +1116,353 @@ describe('b.jg5 SRJ-101, SRJ-104: every class the client declares is decided by 
 
   test.each(BY_NAME_ALLOWED)('%s: no finding', (_what, file, source) => {
     expect(unsanctioned(byNameFindings([[file, source]], TREE_BINDINGS))).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The three Phase-1-only classes are the pinned client's own (b.jg5 SRJ-101, SRJ-103, SRJ-1203)
+// ---------------------------------------------------------------------------
+
+/** The three Phase-1-only class names, as the audits below take them. */
+const PHASE1_NAMES: readonly string[] = PHASE1_ONLY_ERR_NAMES
+
+/** `1-based-line: what` for a finding at `node` in `sf`. */
+const findingAt = (sf: ts.SourceFile, node: ts.Node, what: string): string => `${sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1}: ${what}`
+
+/**
+ * The Phase-1-only names `sf` does not re-export as plain static named
+ * re-exports of agent-director: an element `X` (no `as`, not type-only) of an
+ * `export { … } from 'agent-director'` declaration that is not type-only.
+ * Anything else that would export the name (a local binding, an aliased or
+ * type-only re-export, a re-export from another module, `export *`) leaves
+ * it missing.
+ */
+function phase1ReExportFindings(sf: ts.SourceFile): string[] {
+  const reExported = new Set<string>()
+  forEachNode(sf, (node) => {
+    if (!ts.isExportDeclaration(node) || node.isTypeOnly || node.moduleSpecifier === undefined) return
+    if (!ts.isStringLiteral(node.moduleSpecifier) || node.moduleSpecifier.text !== AGENT_DIRECTOR_MODULE) return
+    const clause = node.exportClause
+    if (clause === undefined || !ts.isNamedExports(clause)) return
+    for (const el of clause.elements) if (!el.isTypeOnly && el.propertyName === undefined) reExported.add(el.name.text)
+  })
+  return PHASE1_NAMES.filter((name) => !reExported.has(name)).map((name) => `no plain re-export of ${name} from agent-director`)
+}
+
+/**
+ * Where `sf` reads a Phase-1-only class from agent-director other than by a
+ * named import or re-export (see the header): every read
+ * `agentDirectorValueReads` finds of the three or cannot name, its named
+ * import and re-export specifiers aside, and the namespace or a copy of it
+ * passed to a call.
+ */
+function phase1ReadFindings(sf: ts.SourceFile): string[] {
+  return [
+    ...agentDirectorValueReads(sf, PHASE1_NAMES)
+      .filter((read) => !ts.isImportSpecifier(read.node) && !ts.isExportSpecifier(read.node))
+      .map((read) => findingAt(sf, read.node, read.what)),
+    ...agentDirectorNamespaceArguments(sf).map((arg) => findingAt(sf, arg, 'the agent-director namespace passed to a call')),
+  ]
+}
+
+/** Whether `node` is `this.name` or `this['name']`. */
+function isThisName(node: ts.Expression): boolean {
+  const inner = unwrap(node)
+  if (ts.isPropertyAccessExpression(inner)) return inner.expression.kind === ts.SyntaxKind.ThisKeyword && inner.name.text === 'name'
+  return ts.isElementAccessExpression(inner) && inner.expression.kind === ts.SyntaxKind.ThisKeyword && literalOf(inner.argumentExpression) === 'name'
+}
+
+/** The class `node` sits in, nearest first, or undefined. */
+function enclosingClass(node: ts.Node): ts.ClassLikeDeclaration | undefined {
+  for (let at = node.parent; at !== undefined; at = at.parent) if (ts.isClassLike(at)) return at
+  return undefined
+}
+
+/** Whether `id` names a parameter of a function `site` sits in. */
+function isParameterAt(site: ts.Node, id: string): boolean {
+  for (let at = site.parent; at !== undefined; at = at.parent) {
+    if (ts.isFunctionLike(at) && at.parameters.some((p) => ts.isIdentifier(p.name) && p.name.text === id)) return true
+  }
+  return false
+}
+
+/**
+ * What a `name` given to a class at `site` reads as: the Phase-1-only names
+ * it is (a literal or a constant holding one), none for another literal or
+ * constant, or `unreadable` (a parameter, or anything else).
+ */
+function givenNames(value: ts.Expression, site: ts.Node, b: ClassNameBindings): string[] | 'unreadable' {
+  const inner = unwrap(value)
+  const literal = literalOf(inner)
+  if (literal !== undefined) return PHASE1_NAMES.includes(literal) ? [literal] : []
+  if (ts.isIdentifier(inner) && isParameterAt(site, inner.text)) return 'unreadable'
+  const held = memberName(inner) === undefined ? undefined : b.constants.get(memberName(inner)!)
+  if (held !== undefined) return [...held].filter((name) => PHASE1_NAMES.includes(name))
+  return 'unreadable'
+}
+
+/**
+ * Every class in `sf` that extends `AgentDirectorError` or a client class
+ * (by any import or namespace name ending in it) and is named one of the
+ * three Phase-1-only classes: by its own name, the variable, property or
+ * computed key it is bound to, or a `name` it is given (`this.name = …` or
+ * `this['name'] = …` in its body, `Object.defineProperty(<it or this>,
+ * 'name', …)`), where a name the audit cannot read counts as one. `b` holds
+ * the name constants.
+ */
+function phase1StandInFindings(sf: ts.SourceFile, b: ClassNameBindings): string[] {
+  const findings: string[] = []
+  const bases = new Set(['AgentDirectorError', ...CLASS_NAMES])
+  const classes: Array<{ readonly node: ts.ClassLikeDeclaration; readonly bound: string[] }> = []
+  forEachNode(sf, (node) => {
+    if (!ts.isClassLike(node)) return
+    const heritage = node.heritageClauses?.find((h) => h.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]?.expression
+    if (heritage === undefined || !bases.has(memberName(unwrap(heritage)) ?? '')) return
+    const bound: string[] = node.name !== undefined ? [node.name.text] : []
+    let outer: ts.Node = node
+    while (outer.parent !== undefined && (ts.isParenthesizedExpression(outer.parent) || ts.isAsExpression(outer.parent) || ts.isSatisfiesExpression(outer.parent))) outer = outer.parent
+    const context = outer.parent
+    if (context !== undefined && ts.isVariableDeclaration(context) && ts.isIdentifier(context.name)) bound.push(context.name.text)
+    else if (context !== undefined && ts.isPropertyAssignment(context)) {
+      if (ts.isComputedPropertyName(context.name)) bound.push(...namesOf(context.name.expression, b))
+      else bound.push(literalOf(context.name) ?? (ts.isIdentifier(context.name) ? context.name.text : ''))
+    } else if (context !== undefined && ts.isBinaryExpression(context) && context.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      bound.push(memberName(unwrap(context.left)) ?? '')
+    }
+    classes.push({ node, bound })
+  })
+  for (const { node, bound } of classes) {
+    const named = new Set(bound.filter((name) => PHASE1_NAMES.includes(name)))
+    let unreadable = false
+    const give = (value: ts.Expression | undefined, site: ts.Node): void => {
+      if (value === undefined) return
+      const names = givenNames(value, site, b)
+      if (names === 'unreadable') unreadable = true
+      else for (const name of names) named.add(name)
+    }
+    const isThisClass = (target: ts.Expression, site: ts.Node): boolean => {
+      const inner = unwrap(target)
+      if (inner.kind === ts.SyntaxKind.ThisKeyword) return enclosingClass(site) === node
+      if (inner === node) return true
+      return ts.isIdentifier(inner) && bound.includes(inner.text)
+    }
+    forEachNode(sf, (site) => {
+      if (ts.isBinaryExpression(site) && site.operatorToken.kind === ts.SyntaxKind.EqualsToken && isThisName(site.left) && enclosingClass(site) === node) {
+        give(site.right, site)
+      } else if (ts.isCallExpression(site) && site.expression.getText(sf).replace(/\s+/g, '') === 'Object.defineProperty' && site.arguments.length >= 3
+        && literalOf(site.arguments[1]!) === 'name' && isThisClass(site.arguments[0]!, site)) {
+        const descriptor = unwrap(site.arguments[2]!)
+        const value = ts.isObjectLiteralExpression(descriptor)
+          ? descriptor.properties.find((p): p is ts.PropertyAssignment => ts.isPropertyAssignment(p) && propertyKey(p.name) === 'value')?.initializer
+          : undefined
+        if (value === undefined) unreadable = true
+        else give(value, site)
+      }
+    })
+    if (named.size > 0 || unreadable) {
+      const as = named.size > 0 ? [...named].sort().join(', ') : 'a name the audit cannot read'
+      findings.push(findingAt(sf, node, `a class extending AgentDirectorError named ${as}`))
+    }
+  }
+  return findings
+}
+
+/** The text of a plain property key (an identifier or string). */
+function propertyKey(name: ts.PropertyName): string | undefined {
+  return ts.isIdentifier(name) ? name.text : literalOf(name)
+}
+
+/** Every `.ts` file under `src/` and `tests/test-helpers/`: [repository path, text]. */
+const PHASE1_AUDIT_TREE: ReadonlyArray<readonly [string, string]> = [
+  ...SRC_FILES.map(([name, text]) => [`src/${name}`, text] as const),
+  ...(readdirSync(join(import.meta.dir, 'test-helpers'), { recursive: true }) as string[])
+    .filter((name) => name.endsWith('.ts'))
+    .sort()
+    .map((name) => [`tests/test-helpers/${name}`, readFileSync(join(import.meta.dir, 'test-helpers', name), 'utf-8')] as const),
+]
+
+/** `audit` over every file of `files`, each finding prefixed with its path. */
+function auditPhase1(files: ReadonlyArray<readonly [string, string]>, audit: (sf: ts.SourceFile) => string[]): string[] {
+  return files.flatMap(([file, text]) => audit(parseSource(file, text)).map((f) => `${file}:${f}`))
+}
+
+const AD_NS = "import * as ad from 'agent-director'"
+
+/** A plain re-export of every Phase-1-only name but `without`, as one declaration. */
+const reExportsWithout = (without: string): string => `export { AgentDirectorError, ${PHASE1_NAMES.filter((n) => n !== without).join(', ')} } from 'agent-director'`
+
+describe('b.jg5 SRJ-103, SRJ-1203: src/agent-director-errors.ts re-exports the three Phase-1-only classes by name from agent-director', () => {
+  const [kill, unresponsive, conflict] = PHASE1_NAMES as [string, string, string]
+
+  test('the real module re-exports each of them plainly', () => {
+    expect(phase1ReExportFindings(parseSource(ERRORS_FILE, BY_NAME_TREE.find(([file]) => file === ERRORS_FILE)![1]))).toEqual([])
+  })
+
+  test.each<readonly [string, string, string]>([
+    ['a re-export through a local alias of a named import', kill, `import { ${kill} as Imported } from 'agent-director'\nexport { Imported as ${kill} }`],
+    ['a named import exported as a local binding', unresponsive, `import { ${unresponsive} } from 'agent-director'\nexport { ${unresponsive} }`],
+    ['a local constant read through the namespace and exported', conflict, `${AD_NS}\nexport const ${conflict} = ad.${conflict}`],
+    ['a local stand-in class exported under the name', kill, `export class ${kill} extends AgentDirectorError {}`],
+    ['a type-only re-export', unresponsive, `export type { ${unresponsive} } from 'agent-director'`],
+    ['an inline type-only re-export', conflict, `export { type ${conflict} } from 'agent-director'`],
+    ['an aliased re-export under another name', kill, `export { ${kill} as KillFailed } from 'agent-director'`],
+    ['another class re-exported under the name', unresponsive, `export { ErrTmuxNotAvailable as ${unresponsive} } from 'agent-director'`],
+    ['a re-export from another module', conflict, `export { ${conflict} } from './phase1-stand-ins.ts'`],
+    ['a re-export of the whole module', kill, "export * from 'agent-director'"],
+  ])('%s leaves %s with no plain re-export', (_label, name, planted) => {
+    expect(phase1ReExportFindings(parseSource(ERRORS_FILE, `${reExportsWithout(name)}\n${planted}`))).toEqual([`no plain re-export of ${name} from agent-director`])
+  })
+
+  test.each<readonly [string, string]>([
+    ['the three in one declaration beside other names', `export { AgentDirectorError, ErrTmuxSendKeys, ${PHASE1_NAMES.join(', ')} } from 'agent-director'`],
+    ['the three across two declarations, another name aliased beside them', `export { ${kill}, ErrTmuxNotAvailable as NotAvailable } from 'agent-director'\nexport { ${unresponsive}, ${conflict} } from 'agent-director'`],
+  ])('%s: no finding', (_label, source) => {
+    expect(phase1ReExportFindings(parseSource(ERRORS_FILE, source))).toEqual([])
+  })
+})
+
+describe('b.jg5 SRJ-101, SRJ-1203: no file in src/ or tests/test-helpers/ reads a Phase-1-only class from agent-director but by a named import or re-export', () => {
+  const flagged: ReadonlyArray<readonly [string, string]> = [
+    ['a namespace property read', `${AD_NS}\nconst killFailed = ad.ErrTmuxKillFailed`],
+    ['a guarded read through a typed optional cast', `${AD_NS}\nconst killFailed = (ad as unknown as { readonly ErrTmuxKillFailed?: unknown }).ErrTmuxKillFailed ?? StandIn`],
+    ['a namespace element read', `${AD_NS}\nconst unresponsive = ad['ErrTmuxUnresponsive']`],
+    ['a computed namespace element read', `${AD_NS}\nconst key = 'ErrTmuxSessionConflict'\nconst conflict = ad[key]`],
+    ['a read through a cast copy of the namespace', `${AD_NS}\nconst ns = ad as unknown as OptionalClasses\nns.ErrTmuxSessionConflict`],
+    ['a read through a spread copy of the namespace', `${AD_NS}\nconst REAL = { ...ad }\nREAL.ErrTmuxKillFailed`],
+    ['destructuring of the namespace', `${AD_NS}\nconst { ErrTmuxUnresponsive } = ad`],
+    ['destructuring of the namespace through a cast', `${AD_NS}\nconst { ErrTmuxKillFailed } = ad as unknown as OptionalClasses`],
+    ['a destructuring assignment from the namespace', `${AD_NS}\nlet ErrTmuxSessionConflict\n({ ErrTmuxSessionConflict } = ad)`],
+    ['a default import read', "import ad from 'agent-director'\nad.ErrTmuxSessionConflict"],
+    ['an import-equals require read', "import ad = require('agent-director')\nad.ErrTmuxKillFailed"],
+    ['a read on a dynamic import', "const Conflict = (await import('agent-director')).ErrTmuxSessionConflict"],
+    ['a destructured dynamic import', "const { ErrTmuxSessionConflict } = await import('agent-director')"],
+    ['a destructured require', "const { ErrTmuxKillFailed: KillFailed } = require('agent-director')"],
+    ['a dynamic import used through then()', "import('agent-director').then((ad) => ad.ErrTmuxKillFailed)"],
+    ['the namespace passed to a resolver through a cast', `${AD_NS}\nconst classes = resolveClasses(ad as unknown as OptionalClasses)`],
+    ['a dynamic import passed to a call', "const classes = resolveClasses(await import('agent-director'))"],
+    ['a copy of the namespace passed to a call', `${AD_NS}\nconst REAL = { ...ad }\nconst entries = Object.entries(REAL)`],
+  ]
+
+  test.each(flagged)('flags %s', (_label, source) => {
+    expect(phase1ReadFindings(parseSource('planted/read.ts', source)).length).toBeGreaterThan(0)
+  })
+
+  const allowed: ReadonlyArray<readonly [string, string]> = [
+    ['the plain re-exports', `export { ${PHASE1_NAMES.join(', ')} } from 'agent-director'`],
+    ['a named import', "import { ErrTmuxKillFailed, ErrTmuxSessionConflict as Conflict } from 'agent-director'"],
+    ['the re-exports from src/agent-director-errors.ts', "import { ErrTmuxKillFailed } from './agent-director-errors.ts'\nif (err instanceof ErrTmuxKillFailed) retry()"],
+    ['other names through the namespace', `${AD_NS}\nad.ErrTmuxNotAvailable\nconst { ErrSpawnNotFound } = ad`],
+    ['a type-only import and an import type in a type', "import type { ErrTmuxUnresponsive } from 'agent-director'\nlet cls: typeof import('agent-director').ErrTmuxKillFailed | undefined"],
+    ['text in strings, templates and comments', "// ad.ErrTmuxKillFailed\nconst s = \"(await import('agent-director')).ErrTmuxSessionConflict\"\nconst t = `ad.ErrTmuxUnresponsive`"],
+  ]
+
+  test.each(allowed)('allows %s', (_label, source) => {
+    expect(phase1ReadFindings(parseSource('planted/read.ts', source))).toEqual([])
+  })
+
+  test('the current tree: no finding in src/ or tests/test-helpers/', () => {
+    expect(PHASE1_AUDIT_TREE.map(([file]) => file)).toEqual(expect.arrayContaining([ERRORS_FILE, STUB_FILE]))
+    expect(auditPhase1(PHASE1_AUDIT_TREE, phase1ReadFindings)).toEqual([])
+  })
+})
+
+describe('b.jg5 SRJ-101, SRJ-1203: no file in src/ or tests/test-helpers/ declares a stand-in for a Phase-1-only class', () => {
+  const ERRORS_IMPORT_NAMES = "import { ERR_SPAWN_CAP_REACHED_NAME, ERR_TMUX_KILL_FAILED_NAME, ERR_TMUX_UNRESPONSIVE_NAME } from './agent-director-errors.ts'"
+  const standInFindings = (source: string): string[] => phase1StandInFindings(parseSource('planted/stand-in.ts', source), TREE_BINDINGS)
+
+  const flagged: ReadonlyArray<readonly [string, string]> = [
+    ['a class declared under the name', 'export class ErrTmuxKillFailed extends AgentDirectorError {}'],
+    ['a class extending the base through a namespace', "import * as ad from 'agent-director'\nexport class ErrTmuxUnresponsive extends ad.AgentDirectorError {}"],
+    ['a subclass of another client class under the name', 'class ErrTmuxSessionConflict extends ErrTmuxSendKeys {}'],
+    ['a class expression bound to the name', 'export const ErrTmuxSessionConflict = class extends AgentDirectorError {}'],
+    ['a class expression bound to the name through a cast', 'export const ErrTmuxKillFailed = (class extends AgentDirectorError {}) as AdErrorClassConstructor'],
+    ['a class expression keyed by the name', 'const STAND_INS = { ErrTmuxUnresponsive: class extends AgentDirectorError {} }'],
+    ['a class expression keyed by a name constant', `${ERRORS_IMPORT_NAMES}\nconst STAND_INS = { [ERR_TMUX_KILL_FAILED_NAME]: class extends AgentDirectorError {} }`],
+    ['a class whose constructor sets this.name to the name', "class Unresponsive extends AgentDirectorError {\n  constructor(v: string, e: string, d: string) { super(v, e, d); this.name = 'ErrTmuxUnresponsive' }\n}"],
+    ['a class renamed by Object.defineProperty with a name constant', `${ERRORS_IMPORT_NAMES}\nconst StandIn = class extends AgentDirectorError {}\nObject.defineProperty(StandIn, 'name', { value: ERR_TMUX_KILL_FAILED_NAME })`],
+    ['a stand-in factory naming its class from a parameter', [
+      'function makeStandIn(name: string) {',
+      '  const StandIn = class extends AgentDirectorError { constructor(v: string, e: string, d: string) { super(v, e, d); this.name = name } }',
+      "  Object.defineProperty(StandIn, 'name', { value: name })",
+      '  return StandIn',
+      '}',
+    ].join('\n')],
+  ]
+
+  test.each(flagged)('flags %s', (_label, source) => {
+    expect(standInFindings(source)).toHaveLength(1)
+  })
+
+  const allowed: ReadonlyArray<readonly [string, string]> = [
+    ["CSCB's own subclass under its own name", `${ERRORS_IMPORT_NAMES}\nexport class ErrSpawnCapReached extends AgentDirectorError {\n  constructor(description: string) { super('spawn', ERR_SPAWN_CAP_REACHED_NAME, description) }\n}`],
+    ['a subclass that sets another literal name', "class CapReached extends AgentDirectorError {\n  constructor(d: string) { super('spawn', 'SpawnCapReached', d); this.name = 'SpawnCapReached' }\n}"],
+    ["a class of the name that is no agent-director error", 'class ErrTmuxKillFailed extends Map<string, number> {}'],
+    ['an instance renamed outside any class', "const restored = new Made(err.verb, err.errName, description)\nrestored.name = err.name"],
+    ['the re-exported classes used by class', "import { ErrTmuxKillFailed } from './agent-director-errors.ts'\nconst err = new ErrTmuxKillFailed('kill', ERR_TMUX_KILL_FAILED_NAME, description)"],
+    ['a stand-in in strings and comments', "// class ErrTmuxKillFailed extends AgentDirectorError {}\nconst s = 'class ErrTmuxUnresponsive extends AgentDirectorError {}'"],
+  ]
+
+  test.each(allowed)('allows %s', (_label, source) => {
+    expect(standInFindings(source)).toEqual([])
+  })
+
+  test('the current tree: no finding in src/ or tests/test-helpers/, which declare agent-director error subclasses', () => {
+    expect(PHASE1_AUDIT_TREE.map(([file]) => file)).toEqual(expect.arrayContaining([ERRORS_FILE, STUB_FILE]))
+    expect(auditPhase1(PHASE1_AUDIT_TREE, (sf) => phase1StandInFindings(sf, TREE_BINDINGS))).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// src/ad-phase1-types.ts declares no field (b.jg5 SRJ-101, SRJ-1303)
+// ---------------------------------------------------------------------------
+
+/** The module of CSCB's own Phase 1 value types. */
+const PHASE1_TYPES_FILE = 'src/ad-phase1-types.ts'
+
+/**
+ * Where `sf` declares a field or holds anything but types: an interface, an
+ * object type literal or a mapped type (each declares fields over or beside
+ * the client's), a statement other than a type alias or a type-only import
+ * from agent-director (runtime code, or a value or non-client import).
+ */
+function phase1TypesFindings(sf: ts.SourceFile): string[] {
+  const findings: string[] = []
+  for (const statement of sf.statements) {
+    if (ts.isTypeAliasDeclaration(statement)) continue
+    if (ts.isImportDeclaration(statement) && statement.importClause?.isTypeOnly === true
+      && ts.isStringLiteral(statement.moduleSpecifier) && statement.moduleSpecifier.text === AGENT_DIRECTOR_MODULE) continue
+    findings.push(findingAt(sf, statement, `a statement other than a type alias or a type-only agent-director import: ${ts.SyntaxKind[statement.kind]}`))
+  }
+  forEachNode(sf, (node) => {
+    if (ts.isInterfaceDeclaration(node) || ts.isTypeLiteralNode(node) || ts.isMappedTypeNode(node)) {
+      findings.push(findingAt(sf, node, `a field declaration: ${ts.SyntaxKind[node.kind]}`))
+    }
+  })
+  return findings
+}
+
+describe('b.jg5 SRJ-101, SRJ-1303: src/ad-phase1-types.ts declares no field; the client declares them all', () => {
+  const findings = (source: string): string[] => phase1TypesFindings(parseSource(PHASE1_TYPES_FILE, source))
+
+  test('the real module: no finding', () => {
+    expect(findings(readFileSync(join(SRC_DIR, 'ad-phase1-types.ts'), 'utf-8'))).toEqual([])
+  })
+
+  test.each<readonly [string, string]>([
+    ['a field added to a client type where the client lacks it', "import type { KillResult } from 'agent-director'\nexport type K = KillResult & Omit<{ kill_sent?: boolean }, keyof KillResult>"],
+    ['a field redeclared over a client type', "import type { SpawnResult } from 'agent-director'\nexport type S = SpawnResult & { pre_trust?: 'ok' | 'skipped' | 'failed' }"],
+    ['an interface extending a client type', "import type { ListResult, ListRow } from 'agent-director'\nexport interface L extends ListResult { spawns: ListRow[] }"],
+    ['a mapped type over a client type', "import type { GetResult } from 'agent-director'\nexport type G = { [K in keyof GetResult]?: GetResult[K] }"],
+    ['a value import of the client', "import { SpawnResult } from 'agent-director'\nexport type P = SpawnResult['pre_trust']"],
+    ['runtime code', "export const PRE_TRUST_VALUES = ['ok', 'skipped', 'failed'] as const"],
+  ])('flags %s', (_label, source) => {
+    expect(findings(source).length).toBeGreaterThan(0)
+  })
+
+  test.each<readonly [string, string]>([
+    ['a union of literal values', "export type LivenessNote = 'provenance_conflict' | 'tmux_server_changed'"],
+    ["a client field's own type, read through a type-only import", "import type { SpawnResult } from 'agent-director'\nexport type PreTrust = SpawnResult['pre_trust']"],
+  ])('allows %s', (_label, source) => {
+    expect(findings(source)).toEqual([])
   })
 })

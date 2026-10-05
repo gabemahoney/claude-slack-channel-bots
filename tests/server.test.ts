@@ -62,7 +62,8 @@ import {
   type DeadRowRead,
   type LivenessReading,
 } from '../src/liveness-reading.ts'
-import type { Phase1KillResult, Phase1StatusResult } from '../src/ad-phase1-types.ts'
+import type { StatusResult } from 'agent-director'
+import type { StubKillResult } from './test-helpers/agent-director-stub.ts'
 import {
   ALL_CLEAR_TEMPLATE,
   ONSET_TEMPLATES,
@@ -733,7 +734,7 @@ const NO_LAUNCH_STARTS: ReadonlyArray<readonly [string, unknown]> = [
 
 describe("liveness-reading: a pending row's launch start (b.jg5 SRJ-115)", () => {
   /** A `status` result whose `launch_started_at` is `value` (any type; `undefined` omits it). */
-  function statusWith(state: string, value: unknown): Phase1StatusResult {
+  function statusWith(state: string, value: unknown): StatusResult {
     return cannedStatusResult({ state, launch_started_at: value as string | null | undefined })
   }
 
@@ -758,7 +759,7 @@ describe("liveness-reading: a pending row's launch start (b.jg5 SRJ-115)", () =>
   test('a pending result whose launch start cannot be read (a throwing getter) → none, and no throw', () => {
     const result = Object.defineProperty({ state: AGENT_DIRECTOR_PENDING_STATE }, 'launch_started_at', {
       get() { throw new Error('boom') },
-    }) as Phase1StatusResult
+    }) as StatusResult
 
     expect(pendingLaunchStartOf(result)).toBeUndefined()
     expect(livenessReadingForStatus(result)).toBe(LIVENESS_READING_PENDING)
@@ -774,7 +775,7 @@ describe("liveness-reading: a pending row's launch start (b.jg5 SRJ-115)", () =>
   })
 
   test('no result, or one whose state cannot be read → no launch start; reads unknown, and no throw', () => {
-    const throwing = Object.defineProperty({}, 'state', { get() { throw new Error('boom') } }) as Phase1StatusResult
+    const throwing = Object.defineProperty({}, 'state', { get() { throw new Error('boom') } }) as StatusResult
     for (const result of [null, undefined, throwing]) {
       expect(pendingLaunchStartOf(result)).toBeUndefined()
       expect(livenessReadingForStatus(result)).toBe(LIVENESS_READING_UNKNOWN)
@@ -4068,7 +4069,7 @@ describe('_buildReconnectSessionAdapter', () => {
 
 describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the liveness and reconnect adapters', () => {
   /** C1's own row `pending` with the launch start `start` (the key left out for `undefined`). */
-  const pendingRow = (start: string | null | undefined): Phase1StatusResult =>
+  const pendingRow = (start: string | null | undefined): StatusResult =>
     cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: start })
 
   const LIVENESS_SITE = `${LIVENESS_STATUS_SITE.site}: ${LIVENESS_STATUS_SITE.what}`
@@ -4080,7 +4081,7 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
   interface LatchingStatus {
     readonly name: string
     /** C1's `status` answer: thrown when an error, else the result. */
-    readonly answer: () => Error | Phase1StatusResult
+    readonly answer: () => Error | StatusResult
     readonly record: (key: string) => ConflictLatchRecord
     readonly notice: (key: string) => string
     /** The own-row `status` step's line for C1 at `site`'s read of `answer`, with `outcome` (what became of the latch). */
@@ -4168,7 +4169,7 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
    * every other persona's row reads `waiting`; every send-keys succeeds.
    * Spies on every sink.
    */
-  function install(c1Status: Error | Phase1StatusResult): StubCallLog {
+  function install(c1Status: Error | StatusResult): StubCallLog {
     const log = makeStubCallLog()
     const stub = makeStubClient({
       ...log,
@@ -4433,7 +4434,7 @@ describe('b.jg5 SRJ-704, SRJ-1016: the liveness and reconnect adapters\' own-row
   })
 
   /** A stub whose `status` answers `answer` for `key`'s row (thrown when an error) and `waiting` for every other row; every send-keys succeeds. */
-  function install(key: string, answer: Error | Phase1StatusResult): void {
+  function install(key: string, answer: Error | StatusResult): void {
     const stub = makeStubClient({
       statusFn: ({ claude_instance_id }) => (claude_instance_id === personaInstanceId(key) ? answer : cannedStatusResult({ state: 'waiting' })),
       sendKeysResult: {},
@@ -4549,7 +4550,7 @@ describe('b.jg5 SRJ-1016, SRJ-1017: the liveness and reconnect adapters\' own-ro
   })
 
   /** A stub whose `status` answers `answer` for `key`'s row and `waiting` for every other row; every send-keys succeeds. */
-  function install(key: string, answer: Phase1StatusResult): void {
+  function install(key: string, answer: StatusResult): void {
     const stub = makeStubClient({
       statusFn: ({ claude_instance_id }) => (claude_instance_id === personaInstanceId(key) ? answer : cannedStatusResult({ state: 'waiting' })),
       sendKeysResult: {},
@@ -4662,7 +4663,7 @@ describe('b.jg5 SRJ-807, SRJ-115: the liveness and reconnect adapters clear a re
   })
 
   /** A stub whose `status` answers `answer` for C1's row (thrown when an error) and `waiting` for every other row; every send-keys succeeds. */
-  function install(answer: Error | Phase1StatusResult): StubCallLog {
+  function install(answer: Error | StatusResult): StubCallLog {
     const log = makeStubCallLog()
     const stub = makeStubClient({
       ...log,
@@ -4713,7 +4714,7 @@ describe('b.jg5 SRJ-807, SRJ-115: the liveness and reconnect adapters clear a re
     expectC1Cleared(state, LIVENESS_SITE)
   })
 
-  test.each<[string, () => Error | Phase1StatusResult, LivenessReading]>([
+  test.each<[string, () => Error | StatusResult, LivenessReading]>([
     ['pending (a launch start recorded)', () => cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_WHOLE }), { ...LIVENESS_READING_PENDING, launchStartedAt: SAMPLE_LAUNCH_START_WHOLE }],
     ['ended', () => cannedStatusResult({ state: 'ended' }), LIVENESS_READING_DEAD_ENDED],
     ['missing', () => cannedStatusResult({ state: 'missing' }), LIVENESS_READING_DEAD_MISSING],
@@ -4736,7 +4737,7 @@ describe('b.jg5 SRJ-807, SRJ-115: the liveness and reconnect adapters clear a re
     expectC1Cleared('waiting', RECONNECT_SITE)
   })
 
-  test.each<[string, () => Error | Phase1StatusResult, AdapterAnswer]>([
+  test.each<[string, () => Error | StatusResult, AdapterAnswer]>([
     ['pending (a launch start recorded)', () => cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_WHOLE }), 'pending'],
     ['a failed read (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('status'), 'transient'],
   ])('reconnect adapter, C1\'s status answering %s with C1\'s mark set: the answer is unchanged, nothing is typed and nothing is cleared', async (_label, answer, expected) => {
@@ -4801,7 +4802,7 @@ describe('b.jg5 SRJ-809, SRJ-115: the liveness and reconnect adapters\' own-row 
   })
 
   /** A stub whose `status` answers `answer` for C1's row (thrown when an error) and `waiting` for every other row; every send-keys succeeds. */
-  function install(answer: Error | Phase1StatusResult): void {
+  function install(answer: Error | StatusResult): void {
     const stub = makeStubClient({
       statusFn: ({ claude_instance_id }) => (claude_instance_id === personaInstanceId('C1') ? answer : cannedStatusResult({ state: 'waiting' })),
       sendKeysResult: {},
@@ -5670,9 +5671,9 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
    */
   function install(
     killError?: Error,
-    killResult: Phase1KillResult = cannedKillResult(true),
+    killResult: StubKillResult = cannedKillResult(true),
     statusError?: Error,
-    killQueue?: CannedResponse<Phase1KillResult>[],
+    killQueue?: CannedResponse<StubKillResult>[],
   ): StubClient {
     killErr = killError
     const stub = makeStubClient({

@@ -170,7 +170,7 @@ tests/
                                    # hook its `--settings` registers, as direct children of its own process (exec form: `command` with its `args`; shell form: the command's words)
       slack-stub-server.ts         # Tests 10 and 12 loopback Slack stub: Web API, apps.connections.open, Socket Mode WebSocket, JSONL record
       phase1-client-check.ts       # run by Test 1 on the installed package, after the client-under-test check
-                                   # against the agent-director client the installed package resolves: the package's Phase-1-only bindings and SRJ-103 classes are the client's own,
+                                   # against the agent-director client the installed package resolves: the client exports SRJ-103's seven classes and the package's re-exports of them are the client's own,
                                    # client-built errors classify by class, the description and predicate helpers hold; refuses to run without the image marker /etc/cscb-ci-image
                                    # (its pure checker is unit-tested in tests/phase1-client-check.test.ts)
     .shellcheckrc                  # lets shellcheck follow `source lib/scenario.sh` without -x

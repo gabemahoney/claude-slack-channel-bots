@@ -133,7 +133,7 @@ import {
   LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT,
   LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE,
 } from '../src/ad-error-class.ts'
-import type { Phase1GetResult } from '../src/ad-phase1-types.ts'
+import type { GetResult } from 'agent-director'
 import { getFailureCount } from '../src/backoff.ts'
 import { killOutcomeOf, type KillFailureClass } from '../src/checked-kill.ts'
 import {
@@ -425,7 +425,7 @@ function placed(key: string, where: FindMissingRowPlacement): FindMissingResult 
 }
 
 /** The stub's `get` answers, in order: a row, or an error to reject with. */
-function gets(h: RecoveryHarness, ...answers: Array<Phase1GetResult | Error>): void {
+function gets(h: RecoveryHarness, ...answers: Array<GetResult | Error>): void {
   h.script({ getQueue: answers.map((answer) => (answer instanceof Error ? cannedErr(answer) : cannedOk(answer))) })
 }
 
@@ -628,7 +628,7 @@ describe('pacing and limits: one kill, three runs spaced apart, a second kill, t
 // ---------------------------------------------------------------------------
 
 /** The `get` answers that go to step 6: `ended`, `missing` and no row (`ErrSpawnNotFound`, SRJ-114). */
-const FINISHED_READS: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: string) => Phase1GetResult | Error]> = [
+const FINISHED_READS: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: string) => GetResult | Error]> = [
   [ENDED, (h, key) => personaRow(h, key, { state: ENDED })],
   [MISSING, (h, key) => personaRow(h, key, { state: MISSING })],
   ['no row (ErrSpawnNotFound)', () => errSpawnNotFound()],
@@ -2447,7 +2447,7 @@ describe('scheduling: each sequence runs in the background, one per persona at a
 
 describe('started at a collision ladder replacement site: the launch answers while the sequence runs in the background, the sequence ends in a reuse, and a later retry begins a new episode (SRJ-707, SRJ-706)', () => {
   /** P's row in another directory read `state`, with a session id: a resume would keep the conversation. */
-  const elsewhereWithSession = (h: RecoveryHarness, key: string, state: string): Phase1GetResult =>
+  const elsewhereWithSession = (h: RecoveryHarness, key: string, state: string): GetResult =>
     personaRow(h, key, { cwd: h.home, state, claude_session_id: SESSION_ID })
 
   /** The start line of P's sequence as the ladder starts it, the state it last read the seed. */
@@ -2626,7 +2626,7 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
    * `resume` answers ErrSpawnNotResumable once, its re-read finding the row
    * `waiting`; every later `get` (the sequence's) answers `sequenceRow`.
    */
-  function scriptGoneNotResumable(h: RecoveryHarness, key: string, sequenceRow: Phase1GetResult): void {
+  function scriptGoneNotResumable(h: RecoveryHarness, key: string, sequenceRow: GetResult): void {
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getQueue: [cannedOk(personaRow(h, key)), cannedOk(personaRow(h, key))],
@@ -2747,7 +2747,7 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
   const SEQUENCE_CALLS = ['kill', 'get', 'findMissing', 'get', 'resume'] as const
 
   /** Run P's sequence to its step-6 `resume`, which answers `err`; the `get` after it (the not-resumable step's re-read) answers `reread`. */
-  async function runToStep6Resume(h: RecoveryHarness, key: string, err: Error, reread?: Phase1GetResult | Error): Promise<{ outcome: LiveRowSequenceOutcome; order: string[] }> {
+  async function runToStep6Resume(h: RecoveryHarness, key: string, err: Error, reread?: GetResult | Error): Promise<{ outcome: LiveRowSequenceOutcome; order: string[] }> {
     const row = personaRow(h, key, { state: ENDED, claude_session_id: SESSION_ID })
     h.script({ resumeError: err, getResult: row, ...(reread === undefined ? {} : { getQueue: [cannedOk(row), cannedOk(row), reread instanceof Error ? cannedErr(reread) : cannedOk(reread)] }) })
     const order = recordCallOrder(h)
@@ -2824,7 +2824,7 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
    * Step 6's ErrSpawnNotResumable, by what its re-read finds: the not-launched reason, the line's re-read and outcome, and the cause the end arms (none when the re-read latches P).
    * A re-read in a state CSCB does not know (an unreadable one included) is the SRJ-611 describe's in tests/session-manager.test.ts, on a sequence a GONE-based path started.
    */
-  const STEP6_NOT_RESUMABLE: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: string) => Phase1GetResult | Error, LiveRowSequenceNotLaunchedReason, (h: RecoveryHarness, key: string) => PersonaRowReread, string, LiveRowSequenceArmCause | undefined, readonly string[]]> = [
+  const STEP6_NOT_RESUMABLE: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: string) => GetResult | Error, LiveRowSequenceNotLaunchedReason, (h: RecoveryHarness, key: string) => PersonaRowReread, string, LiveRowSequenceArmCause | undefined, readonly string[]]> = [
     ['the row ended (a lost race)', (h, key) => personaRow(h, key, { state: ENDED }), LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE, () => ({ kind: ROW_REREAD_FINISHED, lastRead: latchRowStateRead(ENDED) }), SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME, LIVE_ROW_ARM_LOST_RACE, []],
     ['no row (a lost race)', () => errSpawnNotFound(), LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE, () => ({ kind: ROW_REREAD_FINISHED, lastRead: LATCH_ROW_STATE_NO_ROW }), SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME, LIVE_ROW_ARM_LOST_RACE, []],
     ['the row waiting (live, yet no second sequence: a lost race)', (h, key) => personaRow(h, key), LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE, (h, key) => ({ kind: ROW_REREAD_LIVE, row: personaRow(h, key), lastRead: latchRowStateRead(LIVE) }), SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME, LIVE_ROW_ARM_LOST_RACE, []],

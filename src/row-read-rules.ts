@@ -68,12 +68,14 @@
  *
  * Pure: no module-scope state, no timer, no agent-director call, no log line,
  * nothing run at import. No label option name is spelled here (b.jg5
- * SRJ-716), and nothing names an export only the Phase 1 client has.
+ * SRJ-716).
  *
  * SPDX-License-Identifier: MIT
  */
 
-import type { LivenessNote, Phase1StatusResult } from './ad-phase1-types.ts'
+import type { StatusResult } from 'agent-director'
+
+import type { LivenessNote } from './ad-phase1-types.ts'
 import {
   LATCH_CASE_CONFLICTING_LABELS,
   LATCH_CASE_LAUNCH_START_NOT_RECORDED,
@@ -96,7 +98,7 @@ import { personaInstanceId } from './persona-identity.ts'
 export const LATCHING_LIVENESS_NOTE = 'provenance_conflict' as const satisfies LivenessNote
 
 /** A row state as the client types it. */
-export type RowReadState = Phase1StatusResult['state']
+export type RowReadState = StatusResult['state']
 
 /**
  * The row states that clear a retired key's entry when its mark is set
@@ -111,9 +113,9 @@ export const RETIRED_ENTRY_CLEARING_STATES: ReadonlySet<RowReadState> = new Set<
 /**
  * What the decision reads of a row: the fields a `get` result, a `list` row
  * and a `status` result (given P's own id by its caller) carry.
- * `liveness_note` is the 0.10.0 client's free text, absent from a `status`
+ * `liveness_note` is the client's free text, absent from a `status`
  * result; `launch_started_at` is the raw launch start, shown on `pending`
- * rows only (`src/ad-phase1-types.ts`).
+ * rows only.
  */
 export interface RowReadRow {
   readonly claude_instance_id: string
