@@ -50,7 +50,10 @@
  *   `ad_store_id`, `stub_mode`, `ad_store_pending_no_launch` and
  *   `write_ad_settings` call `require_scenario_home` before their first
  *   sqlite3, copy, move or install step, a call of a scenario.sh function
- *   that makes one (such as `_scenario_place`) counting as one. Shell is read
+ *   that makes one (such as `_scenario_place`) counting as one; and
+ *   `end_stub_mcp_session` runs `require_ci_image` as its first command after
+ *   its declarations, then `require_scenario_home`, both unconditional and
+ *   before its `kill`. Shell is read
  *   with comments, heredoc bodies and quoted text blanked; the shebang,
  *   comments, blank lines, `set` options and literal assignments are not
  *   steps. Each rule is pinned with synthetic violations (each finding names

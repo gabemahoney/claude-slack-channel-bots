@@ -1127,7 +1127,7 @@ echo "${TEST_NAME}: ${STEP}: session ${SID_A} renamed ${SESSION_A} -> ${RENAMED_
 # confirmed edit, as leg 5 makes it, which takes effect at the restart below.
 apply_personas_config "${STEP}: ticks on" "${TICK_S}" "${RESTART_DELAY_S}"
 
-# The bot server restarted without teardown (ruling S4's working default).
+# The bot server restarted without teardown (ruling S4, decided).
 MARK_R="$(ad_shim_mark)"
 LOG_R="$(wc -l < "${SLACK_STATE_DIR}/server.log")"
 OLD_SERVER_PID="${SERVER_PID}"

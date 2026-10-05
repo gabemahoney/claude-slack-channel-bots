@@ -76,8 +76,8 @@
 #      statement; its column rules are checked in Test 0) marks the row
 #      `missing`; a harness `status` read shows `missing` with no launch
 #      start, and the worker still runs. The bot server is restarted without
-#      teardown (ruling S4, the working default where the SRD names no
-#      trigger: a plain `stop`, then `start`). The new bot server makes a
+#      teardown (ruling S4, decided: where the SRD names no trigger, a
+#      plain `stop`, then `start`). The new bot server makes a
 #      `resume` for the instance id; any UNAVAILABLE line carrying
 #      STILL_STOPPING_PHRASE or STILL_STARTING_PHRASE comes before the first
 #      line carrying CONFLICT_OWN_ID_PHRASE (the wait past BOUND_S means the
