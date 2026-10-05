@@ -231,10 +231,14 @@ tests/
                                    # re-bind (`tmux_server_steps`). The re-fire legs wait out agent-director's default G (60 s); only after them does
                                    # `store_statements` write a `[tmux]` table (`starting_session_seconds = 60`, `stopping_window_seconds = 30`), so the
                                    # kill need not wait 300 s. It runs about two and a half minutes and ends with the three closing assertions
-    test-13-fmk-switch-over.sh     # SRJ-1402 leg A, SRJ-1108, fmk mode on agent-director 0.10.0: fmk scenario 1, the switch-over. From a pre-persona 0.10.0 fleet (the
-                                   # published CSCB 0.10.0 on agent-director's 0.10.0 client, two channels seeded by `seed_prepersona_fleet`, no server started), it
-                                   # follows the README's switch-over runbook, steps 1 to 11 once each, read from the package's README through `switch-over.ts steps`,
-                                   # with only SRJ-1402's declared substitutions; leg A's checks follow step 10's live start (see Scenario 1: the switch-over (Test 13)).
+    test-13-fmk-switch-over.sh     # SRJ-1402 legs A, B and C, SRJ-1108, SRJ-203, SRJ-1013, fmk mode on agent-director 0.10.0: fmk scenario 1, the switch-over. From a
+                                   # pre-persona 0.10.0 fleet (the published CSCB 0.10.0 on agent-director's 0.10.0 client, two channels seeded by
+                                   # `seed_prepersona_fleet`, no server started), it follows the README's switch-over runbook, steps 1 to 11 once each, read from the
+                                   # package's README through `switch-over.ts steps`, with only SRJ-1402's declared substitutions; leg A's checks follow step 10's live
+                                   # start. After step 11, leg B runs the new CLI's `clean_restart` on Phase 1 (each persona back through a collision then `resume`,
+                                   # its conversation kept, its row `pending` until it reports in) and leg C puts 0.10.0 behind the shim and checks that `start --live`
+                                   # refuses it once (one `ad-below-phase1-floor` entry, nothing at the Slack stub, only `version` calls), then puts the release
+                                   # candidate back (see Scenario 1: the switch-over (Test 13)).
                                    # Its host files sit under SCENARIO_ROOT/host: the fixture install-gate record, the switch-over log, the staged persona
                                    # configuration, the `/interject` caller file and the rollback copies; the crontable is in the state directory
     lib/
@@ -299,7 +303,7 @@ self-check, not a scenario.
 
 | Scenario | Script | What it covers |
 |---|---|---|
-| 1 | `test-13-fmk-switch-over.sh` | The switch-over from a pre-persona 0.10.0 fleet to this build on agent-director Phase 1, by the README's runbook: leg A (SRJ-1402) |
+| 1 | `test-13-fmk-switch-over.sh` | The switch-over from a pre-persona 0.10.0 fleet to this build on agent-director Phase 1, by the README's runbook (leg A), then a `clean_restart` on Phase 1 that resumes every persona (leg B) and this build's refusal of agent-director 0.10.0 (leg C) (SRJ-1402, SRJ-203, SRJ-1013) |
 
 ### Scenario 1: the switch-over (Test 13)
 
@@ -393,10 +397,99 @@ CSCB process:
 - no persona reaches the restart cap: no restart-cap line in `server.log` and
   no cap notice in the Slack stub's record;
 - no post repeats: no two `chat.postMessage` requests in the stub's record
-  share a channel and text.
+  share a channel and text. The check logs how many posts it compared; none
+  in this scenario, since nothing in it posts.
 
-The script closes by checking that steps 1 to 11 were each entered once,
-prints the switch-over log, and ends with `assert_no_server_tmux`,
+Leg B: a `clean_restart` on Phase 1, after step 11. The script reads each
+persona's `claude_session_id` with `get`, then runs the new CLI's
+`clean_restart` from the install path through `cscb_run`, so it and the
+server it leaves are recorded CSCB processes. It runs in the background while
+the harness reads each persona's row with `status` from the scenario's shell.
+Each persona's working directory stays in the stub's dev-channels mode, so the
+resumed worker shows the dialog again, and the stub re-fires SessionStart
+while its row reads `pending`. Two bounds apply:
+
+- `clean_restart` must end within the installed package's precheck and
+  teardown bounds (`precheckBoundMs` and `teardownBoundMs` from
+  `src/cli-teardown.ts`, at `config.json`'s call timeout and `exit_timeout`),
+  plus the harness's bound on the CLI's `stop` (`SCENARIO_STOP_CLI_S`) and the
+  CLI's daemon startup wait;
+- each row must read `waiting` within B_R of `clean_restart` ending: the
+  stopping window and G as step 1 recorded them, plus one health tick.
+
+Leg B's checks, each its own `fail` naming the persona or row. The bot
+server's calls are its shim lines after the restart:
+
+- `clean_restart` exits 0, leg A's bot server is gone, and a new one runs and
+  answers on the port;
+- the restarted server's start pass completes, each persona's session
+  connects again, and the server reads each row on three more health ticks
+  with no reconnect;
+- at most one still-stopping refusal per persona (a `server.log` line naming
+  it with the still-stopping phrase), with no restart scheduled beyond one
+  per refusal;
+- each persona comes back through a collision then a resume: a plain spawn of
+  its instance id (no `--reuse-finished`) and then a resume of that id, one
+  more resume per refusal. The restarted server logs its
+  `ErrInstanceIdCollision` line for the persona, the first between the first
+  spawn and the first resume;
+- the row reads `pending` with a launch start until it reports in, from the
+  harness's reads: every read that starts after the bot server's resumed line
+  reads `pending` with a launch start until one reads `waiting`, within B_R;
+- the same from agent-director's trail (`ad-trail.jsonl` in the scenario
+  HOME's `~/.agent-director/`, the records after the length noted before
+  `clean_restart`). For each row, the script takes the SessionStart
+  `pending`-to-`waiting` state transition, the last
+  `ad.resume.moved_to_pending` before it and the first SessionStart
+  `ad.hook.fired` after it. It orders them against the bot server's last
+  resume call and the harness's reads. Both the move to `pending` and the
+  SessionStart hook come after that resume, and the hook comes no later than
+  the end of the first read of `waiting`. No read between that resume and
+  the transition reads `waiting`, and each such read that starts after the
+  move to `pending` reads `pending` with a launch start;
+- the dialog is cleared through agent-director: `read-pane` and `send-keys`
+  naming the row, by the bot server, after its last resume and before the row
+  read `waiting`;
+- the conversation is kept: the row keeps the `claude_session_id` read
+  before, and the worker in its session's pane was started with
+  `--resume <id>`;
+- with no refusal, the start pass counts every persona resumed, none
+  fresh-spawned and none not brought up (with one, none fresh-spawned);
+- no CSCB `delete`, no `kill` by the restarted server, and every persona row
+  and pre-persona row is still present.
+
+Leg C: this build refuses agent-director 0.10.0. The script stops leg B's
+server with its bots through the new CLI (`stop --stop-bots`), waits for
+every Slack socket the stub opened to close, and checks that no tmux session
+is left. It then notes the lengths of the shim log, the stub's record,
+`startup-errors.log` and `server.log`. `swap_ad_binary 0.10.0` replaces only
+the binary behind the shim and checks the shim. The script compares the
+binary with the image's 0.10.0 and never runs it against the migrated store.
+It then starts the new CSCB with `start --live`. The version required is the
+installed package's `PHASE1_FLOOR_VERSION`. Each check is its own `fail`:
+
+- `start` exits non-zero, with its server-failed line;
+- it alerts once: exactly one new `startup-errors.log` entry, the
+  `ad-below-phase1-floor` entry naming 0.10.0 and the Phase 1 floor, and
+  exactly one new `server.log` line carrying that label and matching it;
+- the stub's record has no new line: no `auth.test`, no
+  `apps.connections.open`, no WebSocket and no post;
+- no server runs, nothing answers on the port, and no tmux session exists;
+- every agent-director call in the window is a `version` call. The refused
+  server exits before it writes its PID file, so it is not in the CSCB
+  process record. The leg therefore reads every shim `call` line added in the
+  window, not only the CSCB-parented ones. It fails on any launch, kill or
+  delete from any parent and on any harness call, and needs at least one
+  `version` probe.
+
+`swap_ad_binary rc` then puts the release candidate back behind the shim,
+checked against the image's binary. The `version` probes of leg A's and leg
+B's servers are `assert_no_cscb_include_finished`'s positive control.
+
+The script closes by checking that steps 1 to 11 were each entered once, and
+runs the no-repeated-posts check again over the stub's whole record, logging
+how many posts it compared (none: nothing in the scenario posts). It prints
+the switch-over log and ends with `assert_no_server_tmux`,
 `assert_no_cscb_include_finished` and `assert_no_cscb_delete`.
 
 The host check. `tests/fmk-switch-over-runbook.test.ts`, run by plain

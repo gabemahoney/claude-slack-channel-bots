@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Test 13 (b.jg5 SRJ-1402, SRJ-1108, SRJ-1401, SRJ-1418): scenario 1, the
-# switch-over. The script follows the README's switch-over runbook (section
-# "Switching over to agent-director Phase 1", steps 1 to 11, each a
-# `Step <n>: …` heading) in the container, entering each step once and in
-# order, and replaces only the host-only parts SRJ-1402 lists (the
-# substitution table below).
+# Test 13 (b.jg5 SRJ-1402, SRJ-1108, SRJ-1401, SRJ-1418, SRJ-203, SRJ-1013):
+# scenario 1, the switch-over, legs A, B and C. The script follows the
+# README's switch-over runbook (section "Switching over to agent-director
+# Phase 1", steps 1 to 11, each a `Step <n>: …` heading) in the container,
+# entering each step once and in order, and replaces only the host-only parts
+# SRJ-1402 lists (the substitution table below). Legs B and C follow step 11.
 #
 # Runs only in a cscb-ci image (/ci), after Test 1 (which installs the package
 # the default SCENARIO_CLI names). Its TEST_NAME carries `-fmk-` and it sets
@@ -153,13 +153,100 @@
 #   - no persona reaches the restart cap: no restart-cap line in server.log
 #     and no cap notice in the Slack stub's record;
 #   - no post repeats: no two chat.postMessage requests in the stub's record
-#     with the same channel and text.
+#     with the same channel and text (the number of posts compared printed).
 # Health ticks run (Q12): config.json sets health_check_interval, shorter than
 # leg A's wait, and session_restart_delay. Once each persona's session is
 # connected, the bot server reads each persona's row on at least HEALTH_TICKS
 # more ticks, with no reconnect or restart scheduled for it. A tick that
 # reconnects or relaunches a persona whose stub holds its MCP session fails
 # naming it as a harness defect; no bound, matcher or count is weakened for it.
+#
+# Leg B (SRJ-1402, AC 12), after step 11: a clean_restart of the new CSCB on
+# Phase 1. Each persona's claude_session_id is read (`get`) first. The new
+# CLI's `clean_restart` runs through the install path as a CSCB process
+# (`cscb_run`, the tmux shim first on its PATH, start's environment), in the
+# background, while the harness reads each persona's row (`status`, from the
+# scenario's shell) until it reads waiting; clean_restart's own pause and kill
+# are expected. Each persona's working directory stays in the stub's
+# dev-channels mode, so the resume lap shows the dialog again. The bound B_R
+# on each row reading waiting after clean_restart ends is the stopping window
+# and G as step 1 recorded them (`tmux.stopping_window_seconds`, `grace_ms`)
+# plus one health tick (config.json's health_check_interval). clean_restart
+# itself ends within the installed package's bounds on its precheck and
+# teardown (src/cli-teardown.ts precheckBoundMs and teardownBoundMs, at
+# config.json's call timeout and exit_timeout), plus the harness's bound on
+# the CLI's `stop` (SCENARIO_STOP_CLI_S) and the CLI's daemon startup wait.
+# Each its own `fail` naming the persona or row:
+#   - clean_restart exits 0, leg A's bot server is gone and a new one runs and
+#     answers on the port;
+#   - the restarted server's start pass completes and each persona's session
+#     connects again;
+#   - the restarted server reads each row on HEALTH_TICKS more health ticks,
+#     with no reconnect, and no restart scheduled beyond one per still-stopping
+#     refusal (Q12, as in leg A);
+#   - at most one still-stopping refusal per persona (a server.log line naming
+#     it with the still-stopping phrase);
+#   - from the bot server's shim lines after the restart: a plain spawn of the
+#     persona's id (no --reuse-finished), answered by a collision: a resume of
+#     the id follows it, one resume more per refusal (and one spawn more at
+#     most); the restarted server's collision line for the persona, one per
+#     spawn with no refusal (at most one per spawn with one), the first
+#     written between the first spawn and the first resume;
+#   - the harness's reads see the row pending with a launch start: every read
+#     that starts after the bot server's resumed line (server.log, written
+#     once the resume returned) reads pending with a launch start until one
+#     reads waiting, within B_R. From clean_restart's "starting server" line
+#     (clean_restart.log) on, the rows are read with no pause between reads;
+#   - the row reads pending until its resumed worker reports in, from the
+#     scenario HOME's ~/.agent-director/ad-trail.jsonl (the records after its
+#     length noted before clean_restart; a record's `ts` is UTC in whole
+#     milliseconds, taken as rounded down; one row's records are ordered by
+#     their place in the trail). The records read: the row's first
+#     `ad.spawn.state_transition` record with triggering_event_name
+#     SessionStart and prior_state pending (the move out of pending), the
+#     last `ad.resume.moved_to_pending` record before it, and the first
+#     `ad.hook.fired` record with event_name SessionStart after it (the
+#     resumed launch's SessionStart, the hook that made the move). The
+#     moved-to-pending record and the SessionStart record each come after the
+#     bot server's last resume call (its shim line); the SessionStart record
+#     comes at or before the end of the first harness read of waiting that
+#     starts after that call; no harness read that starts after that call and
+#     ends before the transition record reads waiting, and every such read
+#     that starts after the moved-to-pending record reads pending with a
+#     launch start;
+#   - read-pane and send-keys calls naming the row, by the bot server, after
+#     its last resume and before it read waiting;
+#   - the row keeps the claude_session_id read before, and the worker behind
+#     its session's worker pane was started with --resume and that id;
+#   - with no refusal the start pass counts every persona resumed, none
+#     fresh-spawned and none not brought up (with one, none fresh-spawned);
+#   - no CSCB delete and no kill by the restarted server; every persona row
+#     and every pre-persona row is present.
+#
+# Leg C (SRJ-1402, SRJ-203, SRJ-1013, AC 12, AC 20): this build refuses
+# agent-director 0.10.0. Leg B's server is stopped with its bots through the
+# new CLI (`stop_server --stop-bots`), every Slack socket the stub opened is
+# closed and no tmux session is left; then the lengths of the shim log, the
+# stub's record, startup-errors.log and server.log are noted. `swap_ad_binary
+# 0.10.0` puts 0.10.0 behind the shim (the binary is compared with the image's,
+# never run: the harness makes no 0.10.0 call against the migrated store), and
+# `run_start --live` starts the new CSCB. The version required is the
+# installed package's PHASE1_FLOOR_VERSION. Each its own `fail`:
+#   - start exits non-zero, with its server-failed line;
+#   - exactly one new startup-errors.log entry, the ad-below-phase1-floor
+#     entry naming 0.10.0 and the version required, and exactly one new
+#     server.log line carrying that label, matching it;
+#   - the stub's record has no new line (no auth.test, no
+#     apps.connections.open, no WebSocket, no post);
+#   - no server runs, nothing answers on the port, and no tmux session exists;
+#   - every agent-director shim `call` line since the lengths were noted is a
+#     version probe (the refused server exits before it writes its PID file,
+#     so it is not in the CSCB process record and every line is read): no
+#     launch, kill or delete from any parent, no harness call, and at least
+#     one probe.
+# Then `swap_ad_binary rc` puts the release candidate back (compared with the
+# image's binary) before the closing checks. Legs A and B's servers' version
+# probes are `assert_no_cscb_include_finished`'s positive control.
 #
 # Text quoted from src/ (and from the published 0.10.0 package), by source:
 #   src/persona-identity.ts personaInstanceId: a persona's instance id is
@@ -176,6 +263,25 @@
 #     `[slack] Cap reached for persona=`; restartRetryCapSkippedLine: `the
 #     persona is at the restart cap`
 #   src/health-check.ts: `is at cap — skipping tick`
+#   src/ad-description-phrases.ts STILL_STOPPING_PHRASE: `appears to still be
+#     stopping`
+#   src/session-manager.ts resumeAtSite: `<head> resumed <ref>`
+#   src/session-manager.ts spawnForPersona's collision: `[slack]
+#     spawnForPersona: ErrInstanceIdCollision for <ref> — fetching current
+#     state`
+#   src/cli.ts clean_restart's spawnStart: `[slack] clean_restart: starting
+#     server`
+#   src/cli.ts DAEMON_STARTUP_WAIT_MS: the CLI's daemon startup wait, 30 s
+#   src/cli-teardown.ts precheckBoundMs and teardownBoundMs: read from the
+#     installed package
+#   src/cli.ts reportDaemonFailure: `[slack] Server failed to start (`
+#   src/install-check-labels.ts AD_BELOW_PHASE1_FLOOR: `ad-below-phase1-floor`
+#   src/startup-errors.ts recordStartupError: an entry and its server.log line
+#     are `[<time>] [<label>] <message>`
+#   src/ad-version-gate.ts buildBelowPhase1FloorMessage: `agent-director
+#     version <found> is below CSCB's Phase 1 floor: version <floor> or later
+#     is required`, then `found by the startup check`; PHASE1_FLOOR_VERSION
+#     is <floor>, read from the installed package
 #   src/session-manager.ts restartCapReachedError: the cap notice's
 #     `consecutive session-launch failures — automatic restarts suspended`
 #   scripts/install-check.ts renderSuccess: `agent-director install check:
@@ -192,11 +298,13 @@
 # SCENARIO_AD_010_VERSION, the old CSCB's and the build under test's from
 # their tarballs' package.json.
 #
-# The script ends with the three closing assertions (`assert_no_server_tmux`,
-# `assert_no_cscb_include_finished`, `assert_no_cscb_delete`), after checking
-# that every runbook step was entered once, in order; the EXIT trap stops the
-# bot server (`stop --stop-bots` through the CLI at the install path) and
-# enforces the closing assertions.
+# The script ends, after legs B and C, by checking that every runbook step
+# was entered once, in order, and that no post repeats over the Slack stub's
+# whole record (legs A and B; the same channel-and-text comparison as leg A's,
+# the number of posts compared printed), then the three closing assertions
+# (`assert_no_server_tmux`, `assert_no_cscb_include_finished`,
+# `assert_no_cscb_delete`); the EXIT trap stops any bot server left (`stop --stop-bots` through
+# the CLI at the install path) and enforces the closing assertions.
 set -euo pipefail
 
 TEST_NAME="test-13-fmk-switch-over"
@@ -253,6 +361,10 @@ TOKEN_VARS="${HOST_DIR}/slack-token-variables.env"
 COPIES_DIR="${HOST_DIR}/rollback-copies"
 STORE_BACKUP="${HOST_DIR}/state.db.backup"
 SUBSTITUTIONS="${HOST_DIR}/substitutions"
+# The agent-director settings step 1 records (`switch-over.ts settings`).
+STEP1_SETTINGS="${SCENARIO_ROOT}/settings-step1"
+# agent-director's trail in the scenario HOME.
+AD_TRAIL="${HOME}/.agent-director/ad-trail.jsonl"
 
 # The global install (bun's global directory and bin directory under
 # SCENARIO_ROOT): the scenario's one install path, the old package's and then
@@ -297,11 +409,19 @@ CALL_TIMEOUT_HEADROOM_MS=6000
 OLD_EXIT_TIMEOUT_S=5
 OLD_STOP_TIMEOUT_S=5
 
+# src/install-check-labels.ts AD_BELOW_PHASE1_FLOOR: the startup gate's class
+# label for a binary below CSCB's Phase 1 floor.
+AD_BELOW_PHASE1_FLOOR_LABEL=ad-below-phase1-floor
+
 # The runbook's own bound in step 4: "wait at most 5 minutes".
 STEP4_WAIT_S=300
 
 # Bound on the Slack stub writing its ready file, in seconds.
 SLACK_STUB_WAIT_S=20
+
+# src/cli.ts DAEMON_STARTUP_WAIT_MS, in seconds: how long the CLI's start
+# (clean_restart's included) waits for the daemon.
+DAEMON_STARTUP_WAIT_S=30
 
 # Filled in by the steps.
 OLD_IDS=()
@@ -315,6 +435,7 @@ sessions=()
 LEG_A_WAIT_S=""
 SLACK_STUB_DIR=""
 SLACK_RECORD=""
+POSTS_COMPARED=""
 
 # The runbook's state: the next step, the step being run and the step count.
 RUNBOOK_NEXT=1
@@ -551,8 +672,8 @@ calls_naming() {
     : > "${out}"
     while IFS= read -r line; do
         [[ -n "${line}" ]] || continue
-        _scenario_split_line "${line}" || fail "leg A: a shim line does not split: ${line}"
-        _scenario_decode_words || fail "leg A: a shim line's words do not decode: ${line}"
+        _scenario_split_line "${line}" || fail "${log##*/}: a shim line does not split: ${line}"
+        _scenario_decode_words || fail "${log##*/}: a shim line's words do not decode: ${line}"
         _scenario_ad_verb
         for a in ${_L_ARGS[@]+"${_L_ARGS[@]}"}; do
             if [[ "${a}" == "${id}" || "${a}" == *"=${id}" ]]; then
@@ -570,6 +691,71 @@ line_count() {
         return 0
     fi
     wc -l < "$1" | tr -d ' '
+}
+
+# lines_after <file> <n> <out-file>: the lines of <file> after its first <n>
+# into <out-file> (none when <file> is missing).
+lines_after() {
+    if [[ ! -f "$1" ]]; then
+        : > "$3"
+        return 0
+    fi
+    tail -n "+$(( $2 + 1 ))" "$1" > "$3"
+}
+
+# server_calls_naming <log> <verb> <instance-id> <server-pid> <out-file>: of
+# `calls_naming`, the lines whose parent is the bot server <server-pid>.
+server_calls_naming() {
+    local log="$1" verb="$2" id="$3" pid="$4" out="$5" line
+    calls_naming "${log}" "${verb}" "${id}" "${out}.cscb"
+    : > "${out}"
+    while IFS= read -r line; do
+        _scenario_split_line "${line}" || fail "${log##*/}: a shim line does not split: ${line}"
+        if [[ "${_L_PPID}" == "${pid}" ]]; then
+            printf '%s\n' "${line}" >> "${out}"
+        fi
+    done < "${out}.cscb"
+}
+
+# line_times <file>: print the time (microseconds) of each shim line of <file>, in order.
+line_times() {
+    local line
+    while IFS= read -r line; do
+        _scenario_split_line "${line}" || fail "${1##*/}: a shim line does not split: ${line}"
+        printf '%s\n' "${_L_US}"
+    done < "$1"
+}
+
+# recorded_setting <settings-file> <name>: the whole-number value a
+# `switch-over.ts settings` output records for <name>.
+recorded_setting() {
+    local v
+    v="$(awk -v n="$2" '$1 == n { print $2; exit }' "$1")"
+    [[ "${v}" =~ ^[0-9]+$ ]] || fail "${1##*/} records no whole-number ${2} ('${v}')"
+    printf '%s\n' "${v}"
+}
+
+# no_repeated_posts <where>: fail unless no two chat.postMessage requests in
+# the Slack stub's whole record have the same channel and text; print how
+# many posts were compared, and set POSTS_COMPARED to it.
+no_repeated_posts() {
+    local repeats
+    POSTS_COMPARED="$(jq -s '[.[] | select(.event == "api" and .method == "chat.postMessage")] | length' "${SLACK_RECORD}")" \
+        || fail "$1: could not read the Slack stub's record ${SLACK_RECORD}"
+    repeats="$(jq -rs '[.[] | select(.event == "api" and .method == "chat.postMessage") | {channel, text}]
+        | group_by([.channel, .text]) | map(select(length > 1)) | map("\(.[0].channel): \(.[0].text | tostring | .[0:80]) (\(length) times)") | .[]' \
+        "${SLACK_RECORD}")" || fail "$1: could not read the Slack stub's record ${SLACK_RECORD}"
+    [[ -z "${repeats}" ]] || fail "$1: a post repeats: ${repeats//$'\n'/; }"
+    echo "${TEST_NAME}: $1: ${POSTS_COMPARED} post(s) compared by channel and text, none repeated"
+}
+
+# trail_us <ts>: a trail record's `ts` (UTC, whole milliseconds) in
+# microseconds, the milliseconds taken as rounded down.
+trail_us() {
+    local us
+    us="$(date -u -d "$1" +%s%3N)" || fail "the trail time '$1' does not read as a time"
+    [[ "${us}" =~ ^[0-9]+$ ]] || fail "the trail time '$1' does not read as a time"
+    printf '%s000\n' "${us}"
 }
 
 # ---------------------------------------------------------------------------
@@ -789,7 +975,7 @@ record "staged release: ${PKG_NAME} ${STAGED_VERSION} from ${PACKAGE_TGZ}, in ${
 runbook_substitute 1 staging-build-under-test "the release staged is the build under test, the image's ${PACKAGE_TGZ}, unpacked into ${STAGING_DIR}"
 
 [[ ! -e "${HOME}/.agent-director/config.toml" ]] || fail "step 1: the scenario HOME has an agent-director config.toml"
-read_settings "${STAGED_PKG}" "${SCENARIO_ROOT}/settings-step1"
+read_settings "${STAGED_PKG}" "${STEP1_SETTINGS}"
 [[ "${SETTINGS[file_exists]}" == false ]] || fail "step 1: the settings read found a config.toml"
 check_windows "step 1"
 NEED_MS="${SETTINGS[call_timeout_need_ms]}"
@@ -1268,12 +1454,8 @@ cap_posts="$(jq -r 'select(.event == "api" and (.text // "" | contains("consecut
     "${SLACK_RECORD}")" || fail "leg A: could not read the Slack stub's record ${SLACK_RECORD}"
 [[ -z "${cap_posts}" ]] || fail "leg A: the Slack stub's record holds a restart-cap notice (channel ${cap_posts//$'\n'/, })"
 # No post repeats.
-repeats="$(jq -rs '[.[] | select(.event == "api" and .method == "chat.postMessage") | {channel, text}]
-    | group_by([.channel, .text]) | map(select(length > 1)) | map("\(.[0].channel): \(.[0].text | tostring | .[0:80]) (\(length) times)") | .[]' \
-    "${SLACK_RECORD}")" || fail "leg A: could not read the Slack stub's record ${SLACK_RECORD}"
-[[ -z "${repeats}" ]] || fail "leg A: a post repeats: ${repeats//$'\n'/; }"
-posts="$(jq -s '[.[] | select(.event == "api" and .method == "chat.postMessage")] | length' "${SLACK_RECORD}")"
-record "leg A: every persona started fresh once; pre-persona rows kept and never named; dialogs cleared through agent-director; no kill, delete or second launch; no restart cap; ${posts} post(s), none repeated"
+no_repeated_posts "leg A"
+record "leg A: every persona started fresh once; pre-persona rows kept and never named; dialogs cleared through agent-director; no kill, delete or second launch; no restart cap; ${POSTS_COMPARED} post(s) compared, none repeated"
 
 # ---------------------------------------------------------------------------
 # Step 11
@@ -1284,6 +1466,534 @@ runbook_substitute 11 expire-skipped "the daily agent-director expire schedule i
 runbook_substitute 11 prompt-wording-skipped "the orchestrator prompt's hold-until-after wording (§6) is skipped"
 
 # ---------------------------------------------------------------------------
+# Leg B: a clean_restart on Phase 1
+# ---------------------------------------------------------------------------
+
+# The bound on each persona reading waiting again once clean_restart is done:
+# the stopping window and G as step 1 recorded them, and one health tick as
+# config.json sets it.
+LEG_B_STOPPING_S="$(recorded_setting "${STEP1_SETTINGS}" tmux.stopping_window_seconds)"
+LEG_B_GRACE_MS="$(recorded_setting "${STEP1_SETTINGS}" grace_ms)"
+LEG_B_TICK_S="$(jq -r '.health_check_interval // empty' "${STATE_DIR}/config.json")"
+[[ "${LEG_B_TICK_S}" =~ ^[1-9][0-9]*$ ]] || fail "leg B: config.json sets no health_check_interval ('${LEG_B_TICK_S}')"
+LEG_B_WAIT_S=$(( LEG_B_STOPPING_S + LEG_B_TICK_S + (LEG_B_GRACE_MS + 999) / 1000 ))
+record "leg B bound: ${LEG_B_WAIT_S}s = the stopping window ${LEG_B_STOPPING_S}s + one health tick ${LEG_B_TICK_S}s + G ${LEG_B_GRACE_MS}ms"
+
+# Each persona's conversation before the restart.
+declare -A SID_OF=()
+for i in "${!PERSONA_IDS[@]}"; do
+    id="${PERSONA_IDS[i]}"
+    row_get "leg B: before the restart" "${id}"
+    SID_OF["${id}"]="$(jq -r '.claude_session_id // empty' "${AD_OUT}")"
+    [[ -n "${SID_OF[${id}]}" ]] || fail "leg B: before the restart, row ${id} has no claude_session_id"
+    record "leg B: row ${id} ($(jq -r '.state' "${AD_OUT}")) holds conversation ${SID_OF[${id}]}"
+done
+
+LEG_A_SERVER_PID="${SERVER_PID}"
+LEG_B_AD_FROM="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
+LEG_B_SERVER_LOG_FROM="$(line_count "${SLACK_STATE_DIR}/server.log")"
+LEG_B_RESTART_LOG_FROM="$(line_count "${SLACK_STATE_DIR}/clean_restart.log")"
+LEG_B_RECORD_FROM="$(line_count "${SLACK_RECORD}")"
+LEG_B_TRAIL_FROM="$(line_count "${AD_TRAIL}")"
+completions_before="$(count_log "$(completion_match "${#PERSONA_IDS[@]}")")"
+declare -A CONNECTED_BEFORE=()
+for cid in "${CHANNELS[@]}"; do
+    name="${PERSONA_OF[${cid}]}"
+    CONNECTED_BEFORE["${name}"]="$(count_log "[slack] Session connected: persona $(persona_ref "${name}")")"
+done
+
+# The new CLI's clean_restart, through the install path, as a CSCB process
+# (the tmux shim first on its PATH), with start's environment. It runs in the
+# background so that the harness's status reads see each row through it.
+LEG_B_OUT="${SCENARIO_ROOT}/clean-restart.out"
+# Bound on clean_restart itself: the installed package's own bounds on its
+# precheck and its teardown (src/cli-teardown.ts precheckBoundMs and
+# teardownBoundMs, at config.json's agent_director_call_timeout_ms and
+# exit_timeout), the harness's bound on the CLI's `stop` for the server's
+# stop, and the CLI's daemon startup wait.
+leg_b_call_ms="$(jq -r '.agent_director_call_timeout_ms // empty' "${STATE_DIR}/config.json")"
+leg_b_exit_s="$(jq -r '.exit_timeout // empty' "${STATE_DIR}/config.json")"
+[[ "${leg_b_call_ms}" =~ ^[1-9][0-9]*$ && "${leg_b_exit_s}" =~ ^[1-9][0-9]*$ ]] \
+    || fail "leg B: config.json sets no agent_director_call_timeout_ms ('${leg_b_call_ms}') or exit_timeout ('${leg_b_exit_s}')"
+leg_b_cli_ms="$(cd / && TEARDOWN_MODULE="${CSCB_PKG_DIR}/src/cli-teardown.ts" CALL_MS="${leg_b_call_ms}" EXIT_S="${leg_b_exit_s}" bun --no-install -e \
+    'const m = await import(process.env.TEARDOWN_MODULE); const call = Number(process.env.CALL_MS); const exit = Number(process.env.EXIT_S); const ms = m.precheckBoundMs(call) + m.teardownBoundMs(exit, call); if (!Number.isInteger(ms) || ms <= 0) process.exit(1); process.stdout.write(String(ms))')" \
+    || fail "leg B: could not read precheckBoundMs and teardownBoundMs from ${CSCB_PKG_DIR}/src/cli-teardown.ts"
+[[ "${leg_b_cli_ms}" =~ ^[1-9][0-9]*$ ]] || fail "leg B: the CLI's precheck and teardown bounds read as '${leg_b_cli_ms}'"
+LEG_B_RESTART_BOUND_S=$(( (leg_b_cli_ms + 999) / 1000 + SCENARIO_STOP_CLI_S + DAEMON_STARTUP_WAIT_S ))
+record "leg B: clean_restart bound ${LEG_B_RESTART_BOUND_S}s = the CLI's precheck and teardown bounds ${leg_b_cli_ms}ms + the stop bound ${SCENARIO_STOP_CLI_S}s + the daemon startup wait ${DAEMON_STARTUP_WAIT_S}s"
+restart_from_us="$(now_us)"
+(
+    rc=0
+    cscb_run env -u SLACK_BOT_TOKEN -u SLACK_APP_TOKEN -u CSCB_PERSONA -u SLACK_DRY_RUN \
+        "${CSCB_CLI}" clean_restart < /dev/null > "${LEG_B_OUT}" 2>&1 || rc=$?
+    exit "${rc}"
+) &
+restart_pid=$!
+track_pid "${restart_pid}"
+echo "${TEST_NAME}: leg B: clean_restart started"
+
+# Harness status reads, from the scenario's shell, until each row reads
+# waiting after its resume. The resume is known from server.log (the bot
+# server's resumed line, written once agent-director's resume returned):
+# every read that starts after that line must read pending with a launch
+# start, until one reads waiting. Once clean_restart says it is starting the
+# server (clean_restart.log), the rows are read with no pause between reads.
+# Every read is kept in LEG_B_READS for the trail checks after the restart.
+declare -A REF_OF=() RESUMED_US=() WAITING_B_US=()
+for i in "${!PERSONA_IDS[@]}"; do
+    REF_OF["${PERSONA_IDS[i]}"]="$(persona_ref "${PERSONA_OF[${CHANNELS[i]}]}")"
+done
+LEG_B_LOG="${SCENARIO_ROOT}/leg-b-shim.log"
+LEG_B_SERVER_LOG="${SCENARIO_ROOT}/leg-b-server.log"
+LEG_B_READS="${SCENARIO_ROOT}/leg-b-reads"
+: > "${LEG_B_READS}"
+restart_done_us=""
+hot=0
+while :; do
+    left=0
+    if (( ! hot )) && LC_ALL=C awk -v n="${LEG_B_RESTART_LOG_FROM}" -v m='[slack] clean_restart: starting server' \
+        'NR > n && index($0, m) { found = 1; exit } END { exit !found }' "${SLACK_STATE_DIR}/clean_restart.log" 2> /dev/null; then
+        hot=1
+    fi
+    for id in "${PERSONA_IDS[@]}"; do
+        [[ -z "${WAITING_B_US[${id}]:-}" ]] || continue
+        left=$(( left + 1 ))
+        if (( hot )) && [[ -z "${RESUMED_US[${id}]:-}" ]]; then
+            line="$(tail -n "+$(( LEG_B_SERVER_LOG_FROM + 1 ))" "${SLACK_STATE_DIR}/server.log" | grep -m1 -F -- " resumed ${REF_OF[${id}]}" || true)"
+            if [[ -n "${line}" ]]; then
+                [[ "${line}" =~ ^\[([0-9TZ:.-]+)\]\  ]] || fail "leg B: server.log's resumed line has no time: ${line}"
+                us="$(date -u -d "${BASH_REMATCH[1]}" +%s%6N)" || fail "leg B: could not read the time of server.log's resumed line: ${line}"
+                # The line's time is in whole milliseconds: one more covers its rounding down.
+                RESUMED_US["${id}"]=$(( 10#${us} + 1000 ))
+            fi
+        fi
+        read_from_us="$(now_us)"
+        ad_capture status --claude-instance-id "${id}"
+        read_us="$(now_us)"
+        (( AD_RC == 0 )) || fail "leg B: a harness status read of row ${id} exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
+        if ! read -r state launch < <(jq -r '[.state // "-", .launch_started_at // "-"] | join(" ")' "${AD_OUT}"); then
+            fail "leg B: a harness status read of row ${id} printed no status: $(head -c 300 "${AD_OUT}")"
+        fi
+        printf '%s %s %s %s %s\n' "${read_from_us}" "${read_us}" "${id}" "${state}" "${launch}" >> "${LEG_B_READS}"
+        if [[ -n "${RESUMED_US[${id}]:-}" ]] && (( read_from_us > RESUMED_US[${id}] )); then
+            case "${state}" in
+                pending)
+                    [[ "${launch}" != - ]] || fail "leg B: row ${id} read pending with no launch start after its resume" ;;
+                waiting) WAITING_B_US["${id}"]="${read_us}" ;;
+                *) fail "leg B: row ${id} read ${state} after its resume, before it read waiting" ;;
+            esac
+        fi
+    done
+    (( left > 0 )) || break
+    if [[ -z "${restart_done_us}" ]] && ! pid_alive "${restart_pid}"; then
+        restart_done_us="$(now_us)"
+    fi
+    if [[ -z "${restart_done_us}" ]] && (( $(now_us) > restart_from_us + LEG_B_RESTART_BOUND_S * 1000000 )); then
+        sed 's/^/  | /' "${LEG_B_OUT}" >&2
+        fail "leg B: clean_restart did not end within ${LEG_B_RESTART_BOUND_S}s (the CLI's precheck and teardown bounds ${leg_b_cli_ms}ms + the stop bound ${SCENARIO_STOP_CLI_S}s + the daemon startup wait ${DAEMON_STARTUP_WAIT_S}s)"
+    fi
+    if [[ -n "${restart_done_us}" ]] && (( $(now_us) > restart_done_us + LEG_B_WAIT_S * 1000000 )); then
+        sed 's/^/  | /' "${LEG_B_READS}" | tail -n 20 >&2
+        fail "leg B: a row did not read waiting after its resume within ${LEG_B_WAIT_S}s of clean_restart's end"
+    fi
+    if (( ! hot )); then
+        sleep "${SCENARIO_POLL_S}"
+    fi
+done
+restart_rc=0
+wait "${restart_pid}" || restart_rc=$?
+stop_tracked_pid "${restart_pid}" 5 "leg B: the clean_restart run did not end"
+if [[ -z "${restart_done_us}" ]]; then
+    restart_done_us="$(now_us)"
+fi
+if (( restart_rc != 0 )); then
+    sed 's/^/  | /' "${LEG_B_OUT}" >&2
+    fail "leg B: clean_restart exited ${restart_rc}"
+fi
+! pid_alive "${LEG_A_SERVER_PID}" || fail "leg B: leg A's bot server (PID ${LEG_A_SERVER_PID}) still runs after clean_restart"
+SERVER_PID="$(server_pid)"
+[[ -n "${SERVER_PID}" ]] && pid_alive "${SERVER_PID}" || fail "leg B: no bot server runs after clean_restart"
+[[ "${SERVER_PID}" != "${LEG_A_SERVER_PID}" ]] || fail "leg B: server.pid still names leg A's server ${LEG_A_SERVER_PID}"
+port_listening "${SCENARIO_PORT}" || fail "leg B: nothing answers on 127.0.0.1:${SCENARIO_PORT} after clean_restart"
+record "leg B: clean_restart exited 0 after $(( (restart_done_us - restart_from_us) / 1000 ))ms (bound ${LEG_B_RESTART_BOUND_S}s); the bot server is PID ${SERVER_PID} (leg A's ${LEG_A_SERVER_PID} is gone)"
+
+# The new server's start pass and each persona's MCP session.
+wait_for_count "$(completion_match "${#PERSONA_IDS[@]}")" "$(( completions_before + 1 ))" "${LEG_B_WAIT_S}" \
+    "leg B: the restarted server's start pass never completed"
+for cid in "${CHANNELS[@]}"; do
+    name="${PERSONA_OF[${cid}]}"
+    wait_for_count "[slack] Session connected: persona $(persona_ref "${name}")" "$(( CONNECTED_BEFORE[${name}] + 1 ))" \
+        "${LEG_B_WAIT_S}" "leg B: persona ${name}'s resumed session never connected"
+done
+
+# Health ticks (Q12) on the restarted server, as in leg A.
+leg_b_status_reads() {
+    lines_after "${SCENARIO_AD_SHIM_LOG}" "${LEG_B_AD_FROM}" "${LEG_B_LOG}"
+    server_calls_naming "${LEG_B_LOG}" status "$1" "${SERVER_PID}" "${SCENARIO_ROOT}/leg-b-status"
+    line_count "${SCENARIO_ROOT}/leg-b-status"
+}
+leg_b_status_reads_at_least() {
+    (( $(leg_b_status_reads "$1") >= $2 ))
+}
+declare -A reads_before_b=()
+for id in "${PERSONA_IDS[@]}"; do
+    reads_before_b["${id}"]="$(leg_b_status_reads "${id}")"
+done
+for id in "${PERSONA_IDS[@]}"; do
+    wait_until "${tick_wait_s}" "leg B: the restarted server read row ${id} on fewer than ${HEALTH_TICKS} health ticks" \
+        leg_b_status_reads_at_least "${id}" "$(( reads_before_b[${id}] + HEALTH_TICKS ))"
+done
+
+lines_after "${SCENARIO_AD_SHIM_LOG}" "${LEG_B_AD_FROM}" "${LEG_B_LOG}"
+lines_after "${SLACK_STATE_DIR}/server.log" "${LEG_B_SERVER_LOG_FROM}" "${LEG_B_SERVER_LOG}"
+refusals_total=0
+for i in "${!PERSONA_IDS[@]}"; do
+    id="${PERSONA_IDS[i]}"
+    name="${PERSONA_OF[${CHANNELS[i]}]}"
+    ref="$(persona_ref "${name}")"
+    key="$(persona_key "${name}")"
+    # "Still stopping" refusals (src/ad-description-phrases.ts STILL_STOPPING_PHRASE).
+    refusals="$(grep -F -- "${ref}" "${LEG_B_SERVER_LOG}" | grep -cF 'appears to still be stopping' || true)"
+    (( refusals <= 1 )) || fail "leg B: persona ${name} took ${refusals} still-stopping refusals, not at most one"
+    refusals_total=$(( refusals_total + refusals ))
+    # Q12: no tick reconnects or relaunches the persona, past a refusal's one retry.
+    n="$(count_in "${LEG_B_SERVER_LOG}" "[slack] Session alive but disconnected — reconnecting MCP for persona=${key}")"
+    if (( n > 0 )); then
+        grep -F -- "persona=${key}" "${LEG_B_SERVER_LOG}" | sed 's/^/  | /' >&2
+        fail "leg B (Q12): a health tick reconnected persona ${name} while its stub held its MCP session: a harness defect, reported, not worked around"
+    fi
+    n="$(count_in "${LEG_B_SERVER_LOG}" "[slack] Scheduling restart for persona=${key} ")"
+    if (( n > refusals )); then
+        grep -F -- "persona=${key}" "${LEG_B_SERVER_LOG}" | sed 's/^/  | /' >&2
+        fail "leg B (Q12): the restarted server scheduled ${n} restart(s) of persona ${name} after ${refusals} still-stopping refusal(s): a harness defect, reported, not worked around"
+    fi
+
+    # A plain spawn of its id by the bot server, answered by a collision: a
+    # resume of the same id follows it (one more after a still-stopping refusal).
+    server_calls_naming "${LEG_B_LOG}" spawn "${id}" "${SERVER_PID}" "${SCENARIO_ROOT}/leg-b-spawn"
+    server_calls_naming "${LEG_B_LOG}" resume "${id}" "${SERVER_PID}" "${SCENARIO_ROOT}/leg-b-resume"
+    spawns="$(line_count "${SCENARIO_ROOT}/leg-b-spawn")"
+    resumes="$(line_count "${SCENARIO_ROOT}/leg-b-resume")"
+    (( spawns >= 1 )) || fail "leg B: the restarted server made no spawn of persona ${name}'s id ${id}"
+    (( refusals == 1 || spawns == 1 )) || fail "leg B: the restarted server made ${spawns} spawns of persona ${name}'s id ${id}, not one"
+    (( spawns <= 1 + refusals )) || fail "leg B: the restarted server made ${spawns} spawns of persona ${name}'s id ${id} after ${refusals} refusal(s)"
+    (( resumes == 1 + refusals )) \
+        || fail "leg B: the restarted server made ${resumes} resume(s) of persona ${name}'s id ${id}, not $(( 1 + refusals )) (${refusals} still-stopping refusal(s))"
+    while IFS= read -r line; do
+        if ! _scenario_split_line "${line}" || ! _scenario_decode_words; then
+            fail "leg B: persona ${name}'s spawn line does not parse"
+        fi
+        _scenario_ad_verb
+        for a in ${_L_ARGS[@]+"${_L_ARGS[@]}"}; do
+            # src/ad-phase1-types.ts: a reuse spawn's flag.
+            [[ "${a}" != --reuse-finished* ]] || fail "leg B: persona ${name} (${id}) was spawned with ${a}, not resumed"
+        done
+    done < "${SCENARIO_ROOT}/leg-b-spawn"
+    first_spawn_us="$(line_times "${SCENARIO_ROOT}/leg-b-spawn" | head -n 1)"
+    mapfile -t resume_us < <(line_times "${SCENARIO_ROOT}/leg-b-resume")
+    (( first_spawn_us < resume_us[0] )) || fail "leg B: persona ${name}'s resume does not follow its spawn"
+    last_resume_us="${resume_us[${#resume_us[@]} - 1]}"
+    # The spawn answered by a collision: the restarted server's collision line
+    # for the persona (src/session-manager.ts spawnForPersona), one per spawn
+    # with no refusal, the first written between the first spawn and the
+    # first resume (its time in whole milliseconds, taken as rounded down).
+    collision_m="[slack] spawnForPersona: ErrInstanceIdCollision for ${ref} — fetching current state"
+    collisions="$(count_in "${LEG_B_SERVER_LOG}" "$(matcher "${collision_m}")")"
+    (( collisions >= 1 )) \
+        || fail "leg B: server.log has no collision line for persona ${name} after the restart: its spawn of ${id} was not answered by a collision"
+    (( collisions <= spawns && (refusals == 1 || collisions == spawns) )) \
+        || fail "leg B: server.log has ${collisions} collision line(s) for persona ${name} after the restart, for ${spawns} spawn(s) and ${refusals} still-stopping refusal(s)"
+    line="$(grep -m1 -F -- "${collision_m}" "${LEG_B_SERVER_LOG}" || true)"
+    [[ "${line}" =~ ^\[([0-9TZ:.-]+)\]\  ]] || fail "leg B: server.log's collision line for persona ${name} has no time: ${line}"
+    collision_us="$(date -u -d "${BASH_REMATCH[1]}" +%s%6N)" \
+        || fail "leg B: could not read the time of server.log's collision line for persona ${name}: ${line}"
+    collision_us=$(( 10#${collision_us} ))
+    (( collision_us + 1000 > first_spawn_us && collision_us <= resume_us[0] )) \
+        || fail "leg B: persona ${name}'s first collision line (${BASH_REMATCH[1]}) does not fall between its first spawn and its first resume"
+
+    # Its row read pending, with a launch start, from the resume until it read
+    # waiting: every read after the resume returned did (checked as read).
+    [[ -n "${WAITING_B_US[${id}]:-}" ]] || fail "leg B: the harness never read row ${id} waiting after its resume"
+    (( WAITING_B_US[${id}] <= restart_done_us + LEG_B_WAIT_S * 1000000 )) \
+        || fail "leg B: row ${id} read waiting more than ${LEG_B_WAIT_S}s after clean_restart's end"
+
+    # It read pending until its resumed worker reported in, from the trail's
+    # records after leg B's start, in trail order: the first move out of
+    # pending by SessionStart, the last resume's move to pending before it,
+    # and the first SessionStart hook.fired record after it (the resumed
+    # launch's SessionStart).
+    lines_after "${AD_TRAIL}" "${LEG_B_TRAIL_FROM}" "${SCENARIO_ROOT}/leg-b-trail"
+    jq -r --arg id "${id}" 'select(.claude_instance_id == $id)
+        | (if .event == "ad.resume.moved_to_pending" then "pending"
+           elif .event == "ad.spawn.state_transition" and .triggering_event_name == "SessionStart" and .prior_state == "pending" then "moved"
+           elif .event == "ad.hook.fired" and .event_name == "SessionStart" then "fired"
+           else empty end) as $kind
+        | "\($kind) \(.ts) \(.new_state // "-")"' "${SCENARIO_ROOT}/leg-b-trail" > "${SCENARIO_ROOT}/leg-b-trail-${id}" \
+        || fail "leg B: could not read the trail ${AD_TRAIL}"
+    pending_ts=""
+    moved_ts=""
+    moved_to=""
+    fired_ts=""
+    candidate_pending=""
+    while read -r kind ts new_state; do
+        case "${kind}" in
+            pending)
+                [[ -n "${moved_ts}" ]] || candidate_pending="${ts}"
+                ;;
+            moved)
+                if [[ -z "${moved_ts}" ]]; then
+                    pending_ts="${candidate_pending}"
+                    moved_ts="${ts}"
+                    moved_to="${new_state}"
+                fi
+                ;;
+            fired)
+                if [[ -n "${moved_ts}" ]]; then
+                    fired_ts="${ts}"
+                    break
+                fi
+                ;;
+        esac
+    done < "${SCENARIO_ROOT}/leg-b-trail-${id}"
+    [[ -n "${moved_ts}" ]] \
+        || fail "leg B: the trail holds no SessionStart ad.spawn.state_transition out of pending for row ${id} after the restart"
+    [[ -n "${pending_ts}" ]] \
+        || fail "leg B: the trail holds no ad.resume.moved_to_pending record for row ${id} before its move out of pending"
+    [[ -n "${fired_ts}" ]] \
+        || fail "leg B: the trail holds no SessionStart ad.hook.fired record for row ${id} after its move out of pending"
+    pending_us="$(trail_us "${pending_ts}")"
+    moved_us="$(trail_us "${moved_ts}")"
+    fired_us="$(trail_us "${fired_ts}")"
+    (( pending_us > last_resume_us )) \
+        || fail "leg B: row ${id}'s ad.resume.moved_to_pending record (${pending_ts}) does not come after the restarted server's last resume call"
+    (( fired_us > last_resume_us )) \
+        || fail "leg B: row ${id}'s SessionStart record (${fired_ts}) does not come after the restarted server's last resume call"
+    first_waiting_us=""
+    trail_pending=0
+    while read -r from_us at_us rid rstate rlaunch; do
+        [[ "${rid}" == "${id}" ]] && (( from_us > last_resume_us )) || continue
+        if [[ "${rstate}" == waiting && -z "${first_waiting_us}" ]]; then
+            first_waiting_us="${at_us}"
+        fi
+        (( at_us < moved_us )) || continue
+        [[ "${rstate}" != waiting ]] \
+            || fail "leg B: a harness read of row ${id} ending before its move out of pending (${moved_ts}) read waiting"
+        (( from_us >= pending_us + 1000 )) || continue
+        [[ "${rstate}" == pending && "${rlaunch}" != - ]] \
+            || fail "leg B: a harness read of row ${id} after its move to pending (${pending_ts}) and before its move out (${moved_ts}) read ${rstate} with launch start ${rlaunch}, not pending with a launch start"
+        trail_pending=$(( trail_pending + 1 ))
+    done < "${LEG_B_READS}"
+    [[ -n "${first_waiting_us}" ]] || fail "leg B: no harness read of row ${id} after the restarted server's last resume call read waiting"
+    (( fired_us <= first_waiting_us )) \
+        || fail "leg B: row ${id}'s SessionStart record (${fired_ts}) comes after the first harness read of waiting"
+
+    # Its dialog cleared through agent-director, on its row, after the resume.
+    for verb in read-pane send-keys; do
+        server_calls_naming "${LEG_B_LOG}" "${verb}" "${id}" "${SERVER_PID}" "${SCENARIO_ROOT}/leg-b-${verb}"
+        cleared=0
+        while IFS= read -r t; do
+            if (( t > last_resume_us && t <= WAITING_B_US[${id}] )); then
+                cleared=1
+            fi
+        done < <(line_times "${SCENARIO_ROOT}/leg-b-${verb}")
+        (( cleared )) || fail "leg B: no ${verb} of row ${id} by the restarted server after its resume and before it read waiting"
+    done
+
+    # Its conversation kept: the same claude_session_id, and a worker started with --resume and that id.
+    row_get "leg B: persona ${name}'s row is gone" "${id}"
+    got="$(jq -r '.claude_session_id // empty' "${AD_OUT}")"
+    [[ "${got}" == "${SID_OF[${id}]}" ]] \
+        || fail "leg B: row ${id} holds conversation '${got}' after the restart, not ${SID_OF[${id}]}"
+    session="$(jq -r '.tmux_session_name // empty' "${AD_OUT}")"
+    [[ -n "${session}" ]] || fail "leg B: row ${id} names no tmux session"
+    panes="$("${SCENARIO_REAL_TMUX}" list-panes -s -t "=${session}" -F '#{pane_id} #{pane_pid} #{@ad_pane}')" \
+        || fail "leg B: could not list the panes of row ${id}'s session ${session}"
+    worker_pids=()
+    all_pids=()
+    while read -r pane pid label; do
+        [[ -n "${pane}" ]] || continue
+        all_pids+=("${pid}")
+        if [[ "${label}" =~ ^[0-9a-f]{16}\ (%[0-9]+)$ && "${BASH_REMATCH[1]}" == "${pane}" ]]; then
+            worker_pids+=("${pid}")
+        fi
+    done <<< "${panes}"
+    if (( ${#worker_pids[@]} == 0 && ${#all_pids[@]} == 1 )); then
+        worker_pids=("${all_pids[0]}")
+    fi
+    (( ${#worker_pids[@]} == 1 )) || fail "leg B: row ${id}'s session ${session} has ${#worker_pids[@]} worker pane(s), not one"
+    mapfile -d '' -t worker_argv < "/proc/${worker_pids[0]}/cmdline" \
+        || fail "leg B: could not read the command line of row ${id}'s worker (PID ${worker_pids[0]})"
+    resumed_with=""
+    for j in "${!worker_argv[@]}"; do
+        if [[ "${worker_argv[j]}" == --resume ]]; then
+            resumed_with="${worker_argv[j + 1]:-}"
+        elif [[ "${worker_argv[j]}" == --resume=* ]]; then
+            resumed_with="${worker_argv[j]#--resume=}"
+        fi
+    done
+    [[ "${resumed_with}" == "${SID_OF[${id}]}" ]] \
+        || fail "leg B: row ${id}'s worker (PID ${worker_pids[0]}) was started with --resume '${resumed_with}', not ${SID_OF[${id}]}"
+    record "leg B: persona ${name}: ${spawns} spawn(s), ${collisions} answered by a collision, then ${resumes} resume(s) by the bot server, ${refusals} still-stopping refusal(s); its row read pending with a launch start, then waiting; last resume call at ${last_resume_us} (epoch microseconds); the trail: moved to pending ${pending_ts}, out of pending to ${moved_to} by SessionStart ${moved_ts}, SessionStart hook fired ${fired_ts}, first harness read of waiting ended at ${first_waiting_us} (epoch microseconds); ${trail_pending} harness read(s) between the moves, each pending with a launch start; dialog cleared through read-pane and send-keys; conversation ${SID_OF[${id}]} kept, worker started with --resume"
+done
+if (( refusals_total == 0 )); then
+    expect_completion "${#PERSONA_IDS[@]}" "leg B: every persona comes back resumed" \
+        "${#PERSONA_IDS[@]} resumed" "0 fresh-spawned" "0 not brought up"
+else
+    expect_completion "${#PERSONA_IDS[@]}" "leg B: no persona comes back fresh" "0 fresh-spawned"
+fi
+# No delete by CSCB and no kill by the restarted server (clean_restart's own
+# pause and kill are expected); every row is present.
+cscb_lines "${LEG_B_LOG}" delete "${SCENARIO_ROOT}/leg-b-delete"
+n="$(line_count "${SCENARIO_ROOT}/leg-b-delete")"
+if [[ "${n}" != 0 ]]; then
+    sed 's/^/  | /' "${SCENARIO_ROOT}/leg-b-delete" >&2
+    fail "leg B: CSCB made ${n} delete call(s)"
+fi
+cscb_lines "${LEG_B_LOG}" kill "${SCENARIO_ROOT}/leg-b-kill"
+n=0
+while IFS= read -r line; do
+    _scenario_split_line "${line}" || fail "leg B: a shim line does not split: ${line}"
+    if [[ "${_L_PPID}" == "${SERVER_PID}" ]]; then
+        echo "  | ${line}" >&2
+        n=$(( n + 1 ))
+    fi
+done < "${SCENARIO_ROOT}/leg-b-kill"
+(( n == 0 )) || fail "leg B: the restarted server made ${n} kill call(s)"
+for id in "${PERSONA_IDS[@]}" "${OLD_IDS[@]}"; do
+    row_get "leg B: row ${id} is gone after the restart" "${id}"
+done
+lines_after "${SLACK_RECORD}" "${LEG_B_RECORD_FROM}" "${SCENARIO_ROOT}/leg-b-record"
+posts="$(jq -s '[.[] | select(.event == "api" and .method == "chat.postMessage")] | length' "${SCENARIO_ROOT}/leg-b-record")" \
+    || fail "leg B: could not read the Slack stub's record ${SLACK_RECORD}"
+record "leg B: no CSCB delete, no kill by the restarted server, every row present; ${posts} post(s) in leg B"
+
+# ---------------------------------------------------------------------------
+# Leg C: this build refuses agent-director 0.10.0
+# ---------------------------------------------------------------------------
+
+# The version the floor requires, as the installed package holds it.
+REQUIRED_AD_VERSION="$(cd / && GATE_MODULE="${CSCB_PKG_DIR}/src/ad-version-gate.ts" bun --no-install -e \
+    'const m = await import(process.env.GATE_MODULE); if (typeof m.PHASE1_FLOOR_VERSION !== "string") process.exit(1); process.stdout.write(m.PHASE1_FLOOR_VERSION)')" \
+    || fail "leg C: could not read PHASE1_FLOOR_VERSION from ${CSCB_PKG_DIR}/src/ad-version-gate.ts"
+[[ -n "${REQUIRED_AD_VERSION}" ]] || fail "leg C: ${CSCB_PKG_DIR}/src/ad-version-gate.ts holds an empty PHASE1_FLOOR_VERSION"
+
+# Leg B's server stopped with its bots through the new CLI; every Slack
+# socket closed and no worker left to run a hook against 0.10.0.
+stop_server --stop-bots
+slack_sockets_closed() {
+    jq -se '([.[] | select(.event == "ws-open")] | length) == ([.[] | select(.event == "ws-close")] | length)' \
+        "${SLACK_RECORD}" > /dev/null
+}
+wait_until "${SLACK_STUB_WAIT_S}" "leg C: a Slack socket stayed open after leg B's server stopped" slack_sockets_closed
+tmux_sessions sessions
+(( ${#sessions[@]} == 0 )) || fail "leg C: tmux session(s) left after stop --stop-bots: ${sessions[*]}"
+record "leg C: leg B's server and its bots stopped through the new CLI; every Slack socket closed; no tmux session"
+
+STARTUP_ERRORS="${SLACK_STATE_DIR}/startup-errors.log"
+LEG_C_AD_FROM="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
+LEG_C_RECORD_FROM="$(line_count "${SLACK_RECORD}")"
+LEG_C_ERRORS_FROM="$(line_count "${STARTUP_ERRORS}")"
+LEG_C_SERVER_LOG_FROM="$(line_count "${SLACK_STATE_DIR}/server.log")"
+
+# 0.10.0 behind the shim (the swap checks the shim); the binary is compared,
+# never run, so the harness makes no 0.10.0 call against the migrated store.
+swap_ad_binary 0.10.0 "leg C: agent-director 0.10.0 behind the shim"
+cmp -s -- "${SCENARIO_AD_010_BIN}" "${HOME}/.agent-director/bin/agent-director.real" \
+    || fail "leg C: the binary behind the shim is not agent-director 0.10.0's"
+record "leg C: agent-director ${SCENARIO_AD_010_VERSION} behind the shim"
+
+run_start --live
+LEG_C_LOG="${SCENARIO_ROOT}/leg-c-shim.log"
+lines_after "${STARTUP_ERRORS}" "${LEG_C_ERRORS_FROM}" "${SCENARIO_ROOT}/leg-c-errors"
+lines_after "${SLACK_STATE_DIR}/server.log" "${LEG_C_SERVER_LOG_FROM}" "${SCENARIO_ROOT}/leg-c-server.log"
+lines_after "${SLACK_RECORD}" "${LEG_C_RECORD_FROM}" "${SCENARIO_ROOT}/leg-c-record"
+
+# It exits non-zero, its daemon having failed.
+if (( START_RC == 0 )); then
+    sed 's/^/  | /' "${START_OUT}" >&2
+    fail "leg C: start against agent-director ${SCENARIO_AD_010_VERSION} exited 0"
+fi
+if ! grep -qF '[slack] Server failed to start (' "${START_OUT}"; then
+    sed 's/^/  | /' "${START_OUT}" >&2
+    fail "leg C: start exited ${START_RC} without its server-failed line"
+fi
+
+# It alerts once: one startup-errors entry, the floor's, naming the version
+# found and the version required, and one matching server-log line.
+floor_entry="$(matcher "[${AD_BELOW_PHASE1_FLOOR_LABEL}] " \
+    "agent-director version ${SCENARIO_AD_010_VERSION} is below CSCB's Phase 1 floor: version ${REQUIRED_AD_VERSION} or later is required" \
+    "found by the startup check")"
+n="$(line_count "${SCENARIO_ROOT}/leg-c-errors")"
+if [[ "${n}" != 1 ]]; then
+    sed 's/^/  | /' "${SCENARIO_ROOT}/leg-c-errors" >&2
+    fail "leg C: ${n} new startup-errors.log entries, not one"
+fi
+[[ "$(count_in "${SCENARIO_ROOT}/leg-c-errors" "${floor_entry}")" == 1 ]] \
+    || fail "leg C: the new startup-errors.log entry is not an ${AD_BELOW_PHASE1_FLOOR_LABEL} entry naming ${SCENARIO_AD_010_VERSION} and ${REQUIRED_AD_VERSION}: $(head -c 400 "${SCENARIO_ROOT}/leg-c-errors")"
+n="$(count_in "${SCENARIO_ROOT}/leg-c-server.log" "[${AD_BELOW_PHASE1_FLOOR_LABEL}] ")"
+if [[ "${n}" != 1 ]]; then
+    sed 's/^/  | /' "${SCENARIO_ROOT}/leg-c-server.log" >&2
+    fail "leg C: ${n} new server.log lines carry ${AD_BELOW_PHASE1_FLOOR_LABEL}, not one"
+fi
+[[ "$(count_in "${SCENARIO_ROOT}/leg-c-server.log" "${floor_entry}")" == 1 ]] \
+    || fail "leg C: the server.log line does not name ${SCENARIO_AD_010_VERSION} and ${REQUIRED_AD_VERSION}"
+record "leg C: start exited ${START_RC}; one ${AD_BELOW_PHASE1_FLOOR_LABEL} entry and one server.log line naming ${SCENARIO_AD_010_VERSION} and ${REQUIRED_AD_VERSION}"
+
+# Nothing reaches the Slack stub: no auth.test, no apps.connections.open, no
+# WebSocket, no post.
+n="$(line_count "${SCENARIO_ROOT}/leg-c-record")"
+if [[ "${n}" != 0 ]]; then
+    sed 's/^/  | /' "${SCENARIO_ROOT}/leg-c-record" >&2
+    fail "leg C: the Slack stub's record has ${n} new line(s)"
+fi
+
+# No server is left running, and no instance was launched.
+pid="$(server_pid)"
+if [[ -n "${pid}" ]] && pid_alive "${pid}"; then
+    fail "leg C: a bot server runs (PID ${pid} in ${SLACK_STATE_DIR}/server.pid)"
+fi
+port_closed "${SCENARIO_PORT}" || fail "leg C: something answers on 127.0.0.1:${SCENARIO_PORT}"
+tmux_sessions sessions
+(( ${#sessions[@]} == 0 )) || fail "leg C: tmux session(s) after the refused start: ${sessions[*]}"
+
+# Every agent-director call while 0.10.0 sat behind the shim: the refused
+# server is not in the CSCB process record (it wrote no PID file), so every
+# line is read. Each must be a harness call (the scenario's shell or a
+# subshell as parent, no CSCB process) or a version call; the harness makes
+# none against 0.10.0.
+lines_after "${SCENARIO_AD_SHIM_LOG}" "${LEG_C_AD_FROM}" "${LEG_C_LOG}"
+cscb_lines "${LEG_C_LOG}" "" "${SCENARIO_ROOT}/leg-c-cscb"
+probes=0
+harness=0
+others=0
+while IFS= read -r line; do
+    if ! _scenario_split_line "${line}" || ! _scenario_decode_words; then
+        fail "leg C: a shim line does not parse: ${line}"
+    fi
+    [[ "${_L_KIND}" == call ]] || continue
+    _scenario_ad_verb
+    if [[ "${_L_PARENT}" == "${SCENARIO_SHELL_CMDLINE}" ]] && ! grep -qxF -- "${line}" "${SCENARIO_ROOT}/leg-c-cscb"; then
+        harness=$(( harness + 1 ))
+        echo "  | harness: ${line}" >&2
+    elif [[ "${_L_VERB}" == version ]]; then
+        probes=$(( probes + 1 ))
+    else
+        others=$(( others + 1 ))
+        echo "  | ${line}" >&2
+    fi
+done < "${LEG_C_LOG}"
+(( others == 0 )) || fail "leg C: ${others} agent-director call(s) other than a version probe (a launch, kill or delete) while ${SCENARIO_AD_010_VERSION} sat behind the shim"
+(( harness == 0 )) || fail "leg C: the harness made ${harness} agent-director call(s) while ${SCENARIO_AD_010_VERSION} sat behind the shim"
+(( probes >= 1 )) || fail "leg C: no version probe reached the shim: the refused server never read agent-director's version"
+record "leg C: ${probes} version probe(s), no other agent-director call; nothing reached the Slack stub; no server left running; no tmux session"
+
+# The release candidate back behind the shim (the swap checks the shim).
+swap_ad_binary rc "leg C: the release candidate back behind the shim"
+cmp -s -- "${SCENARIO_RC_BIN}" "${HOME}/.agent-director/bin/agent-director.real" \
+    || fail "leg C: the binary behind the shim is not the release candidate's"
+record "leg C: the release candidate ${RC_VERSION} back behind the shim"
+
+# ---------------------------------------------------------------------------
 # Closing
 # ---------------------------------------------------------------------------
 
@@ -1291,6 +2001,12 @@ runbook_substitute 11 prompt-wording-skipped "the orchestrator prompt's hold-unt
     || fail "runbook: steps 1 to $(( RUNBOOK_NEXT - 1 )) entered, not the runbook's ${RUNBOOK_COUNT}"
 entered="$(grep -c '\] entered: ' "${SWITCH_LOG}")"
 [[ "${entered}" == "${RUNBOOK_COUNT}" ]] || fail "runbook: ${entered} step entries in the switch-over log, not ${RUNBOOK_COUNT}"
+
+# No post repeats over the Slack stub's whole record (legs A and B; leg C
+# added no line).
+no_repeated_posts "end of run"
+record "end of run: ${POSTS_COMPARED} post(s) in the Slack stub's whole record compared, none repeated"
+
 echo "${TEST_NAME}: switch-over log:"
 sed 's/^/  /' "${SWITCH_LOG}"
 
