@@ -117,6 +117,62 @@
  *                                 its error line up to and including the `—` after
  *                                 the label (the description is agent-director's and
  *                                 the remediation follows it, so neither is printed)
+ *   unavailableRetryLineHead <key>
+ *                                 src/unavailable-retry.ts: the longest head that
+ *                                 unavailableRetryArmedLine, unavailableRetryRetryLine,
+ *                                 unavailableRetryReArmedLine and
+ *                                 unavailableRetryStoppedLine for persona key <key>
+ *                                 share: the head of every retry-timer line of the
+ *                                 persona
+ *   unavailableRetryArmedHead <key>
+ *                                 src/unavailable-retry.ts unavailableRetryArmedLine for
+ *                                 <key>, in full and in pending-only mode, each cut
+ *                                 where its description begins, then their longest
+ *                                 shared head: the head of the persona's arm line in
+ *                                 either mode
+ *   unavailableRetryStoppedHead <key>
+ *                                 src/unavailable-retry.ts unavailableRetryStoppedLine
+ *                                 for <key>, with no tag and with the pending-only
+ *                                 mode and a row read, each cut where its reason
+ *                                 begins, then their longest shared head: the head of
+ *                                 the persona's stop line in either form
+ *   unavailableRetryNotArmedHead <key>
+ *                                 src/unavailable-retry.ts
+ *                                 unavailableRetryNotArmedClosedLine for <key>, cut
+ *                                 where the refused cause begins: the head of the line
+ *                                 an arm logs once the controller is closed (the
+ *                                 server's shutdown)
+ *   unavailableRetryRetryLineParts <key>
+ *                                 src/unavailable-retry.ts unavailableRetryRetryLine
+ *                                 for <key>, split where the retry number stands, three
+ *                                 lines: the head before the number, the text after it
+ *                                 in full mode, then in pending-only mode. A retry line
+ *                                 is exactly the head, a number and one of the two
+ *                                 tails; the re-armed line, which starts the same way,
+ *                                 is neither
+ *   launchUnavailableGetLineParts <ref>
+ *                                 src/session-manager.ts launchUnavailableGetLine for
+ *                                 persona reference <ref>, two lines: the text before
+ *                                 the call's name (`what`), then the text from after it
+ *                                 to the outcome's form
+ *   launchUnavailableFormText <form>
+ *                                 src/session-manager.ts launchUnavailableFormText: for
+ *                                 <form> the name of a src/ad-error-class.ts
+ *                                 launch-timeout form export (LAUNCH_TIMEOUT_FORM_…),
+ *                                 the text naming that form; for `none` (no launch
+ *                                 timeout), the UNAVAILABLE text cut where the rendered
+ *                                 failure begins
+ *   tmuxUnresponsiveLineHead <key>
+ *                                 src/persona-episodes.ts tmuxUnresponsiveLine for <key>,
+ *                                 cut where its text begins: the head of every
+ *                                 tmux-unresponsive line of the persona
+ *   approverShutdownStopLine <ref>
+ *                                 src/session-manager.ts approverLogLine of
+ *                                 approverStopRequestedMessage for persona reference
+ *                                 <ref> and APPROVER_STOP_SHUTDOWN: the line shutdown
+ *                                 logs when it stops the persona's running approver
+ * A <key> is a persona key (lower-case letters, digits and `_`); a <ref> is
+ * one line. A head or part is printed as it is, a trailing space included.
  *
  * It makes no agent-director call, starts no process or server, opens no
  * socket, reads no token and writes no file.
@@ -265,6 +321,237 @@ async function spawnFailureNoticeHead(errorName: string): Promise<string> {
   return text.slice(0, at)
 }
 
+/** Export `name` of `relPath`, which must be a function. */
+async function functionExport(relPath: string, name: string): Promise<(...args: unknown[]) => unknown> {
+  const value = await packageExport(relPath, name)
+  if (typeof value !== 'function') throw new PrinterFailure(PACKAGE_EXIT, `the installed package's src/${relPath} ${name} is not a function`)
+  return value as (...args: unknown[]) => unknown
+}
+
+/** A persona key as lib/scenario.sh `persona_key` makes it: lower-case letters, digits and `_`. */
+const KEY_RE = /^[a-z0-9_]+$/
+
+/** Fails with a usage error unless `key` is a persona key. */
+function checkKey(entry: string, key: string): void {
+  if (!KEY_RE.test(key)) throw new PrinterFailure(USAGE_EXIT, `${entry}: '${key}' is not a persona key (lower-case letters, digits and _)`)
+}
+
+/** Fails with a usage error when `arg` is empty or holds a newline. */
+function checkOneLine(entry: string, argName: string, arg: string): void {
+  if (arg === '' || arg.includes('\n')) throw new PrinterFailure(USAGE_EXIT, `${entry}: <${argName}> is empty or holds a newline`)
+}
+
+/** The marker a builder's variable part is given; the text is cut where it begins. */
+const VALUE_MARK = 'fmk-texts-value-mark'
+
+/** A second marker, for a builder with two variable parts. */
+const SECOND_MARK = 'fmk-texts-second-mark'
+
+/** The retry number the retry line is built with; the line is split where it stands. */
+const RETRY_MARK = 987654321
+
+/**
+ * `text`, the result of the package's `builder`, up to where `mark` begins.
+ * The mark must stand once, after at least one character, in a one-line text.
+ */
+function cutAtMark(builder: string, text: unknown, mark: string): string {
+  if (typeof text !== 'string' || text.includes('\n')) {
+    throw new PrinterFailure(PACKAGE_EXIT, `the installed package's ${builder} gave no one-line text`)
+  }
+  const at = text.indexOf(mark)
+  if (at <= 0 || text.indexOf(mark, at + 1) !== -1) {
+    throw new PrinterFailure(PACKAGE_EXIT, `the installed package's ${builder} gave a text that does not hold its variable part once, after a head`)
+  }
+  return text.slice(0, at)
+}
+
+/** The longest text every one of `texts` starts with. */
+function commonHead(texts: readonly string[]): string {
+  let head = texts[0] ?? ''
+  for (const text of texts.slice(1)) {
+    let n = 0
+    while (n < head.length && n < text.length && head[n] === text[n]) n++
+    head = head.slice(0, n)
+  }
+  return head
+}
+
+/** Fails unless `head`, the common head of `builder`'s forms for persona `key`, holds `persona=<key> ` (the key whole). */
+function checkKeyHead(builder: string, head: string, key: string): string {
+  if (!head.includes(`persona=${key} `)) {
+    throw new PrinterFailure(PACKAGE_EXIT, `the installed package's ${builder} forms share no head naming persona=${key}`)
+  }
+  return head
+}
+
+/**
+ * The head every line of persona `key`'s retry timer starts with: the
+ * longest text the package's arm, retry, re-armed and stop lines for `key`
+ * (src/unavailable-retry.ts `unavailableRetryArmedLine`,
+ * `unavailableRetryRetryLine`, `unavailableRetryReArmedLine` and
+ * `unavailableRetryStoppedLine`) all start with.
+ */
+async function unavailableRetryLineHead(key: string): Promise<string> {
+  checkKey('unavailableRetryLineHead', key)
+  const armed = await functionExport('unavailable-retry.ts', 'unavailableRetryArmedLine')
+  const retry = await functionExport('unavailable-retry.ts', 'unavailableRetryRetryLine')
+  const reArmed = await functionExport('unavailable-retry.ts', 'unavailableRetryReArmedLine')
+  const stopped = await functionExport('unavailable-retry.ts', 'unavailableRetryStoppedLine')
+  const builder = 'src/unavailable-retry.ts unavailableRetryArmedLine, unavailableRetryRetryLine, unavailableRetryReArmedLine and unavailableRetryStoppedLine'
+  const retryMark = String(RETRY_MARK)
+  const heads = [
+    cutAtMark(builder, armed(key, false, VALUE_MARK, 1000), VALUE_MARK),
+    cutAtMark(builder, retry(key, RETRY_MARK, false), retryMark),
+    cutAtMark(builder, reArmed(key, RETRY_MARK, false, VALUE_MARK, undefined, 1000), retryMark),
+    cutAtMark(builder, stopped(key, false, undefined, VALUE_MARK), VALUE_MARK),
+  ]
+  return checkKeyHead(builder, commonHead(heads), key)
+}
+
+/**
+ * The head of persona `key`'s arm line in either mode: the longest text the
+ * package's `unavailableRetryArmedLine` for `key`, in full and in
+ * pending-only mode, starts with, each cut where its description begins.
+ */
+async function unavailableRetryArmedHead(key: string): Promise<string> {
+  checkKey('unavailableRetryArmedHead', key)
+  const build = await functionExport('unavailable-retry.ts', 'unavailableRetryArmedLine')
+  const builder = 'src/unavailable-retry.ts unavailableRetryArmedLine'
+  const forms = [false, true].map((pendingOnly) => cutAtMark(builder, build(key, pendingOnly, VALUE_MARK, 1000), VALUE_MARK))
+  return checkKeyHead(builder, commonHead(forms), key)
+}
+
+/**
+ * The head of persona `key`'s stop line in either form: the longest text the
+ * package's `unavailableRetryStoppedLine` for `key`, with no mode named and
+ * with the pending-only mode and a row read named, starts with, each cut
+ * where its reason begins.
+ */
+async function unavailableRetryStoppedHead(key: string): Promise<string> {
+  checkKey('unavailableRetryStoppedHead', key)
+  const build = await functionExport('unavailable-retry.ts', 'unavailableRetryStoppedLine')
+  const builder = 'src/unavailable-retry.ts unavailableRetryStoppedLine'
+  const forms = [
+    cutAtMark(builder, build(key, false, undefined, VALUE_MARK), VALUE_MARK),
+    cutAtMark(builder, build(key, true, SECOND_MARK, VALUE_MARK), VALUE_MARK),
+  ]
+  return checkKeyHead(builder, commonHead(forms), key)
+}
+
+/**
+ * The head of persona `key`'s not-armed line (an arm refused once the
+ * controller is closed, the server's shutdown): the package's
+ * `unavailableRetryNotArmedClosedLine` for `key`, cut where the refused
+ * cause begins.
+ */
+async function unavailableRetryNotArmedHead(key: string): Promise<string> {
+  checkKey('unavailableRetryNotArmedHead', key)
+  const build = await functionExport('unavailable-retry.ts', 'unavailableRetryNotArmedClosedLine')
+  const builder = 'src/unavailable-retry.ts unavailableRetryNotArmedClosedLine'
+  return checkKeyHead(builder, cutAtMark(builder, build(key, VALUE_MARK, SECOND_MARK), VALUE_MARK), key)
+}
+
+/**
+ * Persona `key`'s retry line in its parts, three lines: the head before the
+ * retry number, then the text after the number in full mode, then in
+ * pending-only mode (the package's `unavailableRetryRetryLine` for `key`,
+ * split where the number stands). A retry line is exactly the head, a
+ * number and one of the two tails; the re-armed line, which starts the same
+ * way, is neither.
+ */
+async function unavailableRetryRetryLineParts(key: string): Promise<string> {
+  checkKey('unavailableRetryRetryLineParts', key)
+  const build = await functionExport('unavailable-retry.ts', 'unavailableRetryRetryLine')
+  const builder = 'src/unavailable-retry.ts unavailableRetryRetryLine'
+  const mark = String(RETRY_MARK)
+  const parts = [false, true].map((pendingOnly) => {
+    const line = build(key, RETRY_MARK, pendingOnly)
+    const head = cutAtMark(builder, line, mark)
+    const tail = (line as string).slice(head.length + mark.length)
+    if (tail === '') throw new PrinterFailure(PACKAGE_EXIT, `the installed package's ${builder} gave a line that ends at its retry number`)
+    return { head, tail }
+  })
+  const [full, pendingOnly] = parts as [{ head: string; tail: string }, { head: string; tail: string }]
+  if (full.head !== pendingOnly.head) throw new PrinterFailure(PACKAGE_EXIT, `the installed package's ${builder} gave its two modes different heads`)
+  checkKeyHead(builder, full.head, key)
+  return [full.head, full.tail, pendingOnly.tail].join('\n')
+}
+
+/**
+ * The post-UNAVAILABLE get line's fixed parts for persona reference `ref`,
+ * two lines: the text before the call's name (`what`), then the text from
+ * after it to the outcome's form (the package's `launchUnavailableGetLine`,
+ * src/session-manager.ts, built with markers for the two and cut at them).
+ */
+async function launchUnavailableGetLineParts(ref: string): Promise<string> {
+  checkOneLine('launchUnavailableGetLineParts', 'ref', ref)
+  const build = await functionExport('session-manager.ts', 'launchUnavailableGetLine')
+  const builder = 'src/session-manager.ts launchUnavailableGetLine'
+  const line = build(ref, VALUE_MARK, SECOND_MARK, 'pending', undefined, 'outcome')
+  const toWhat = cutAtMark(builder, line, VALUE_MARK)
+  const toForm = cutAtMark(builder, line, SECOND_MARK)
+  const between = toForm.slice(toWhat.length + VALUE_MARK.length)
+  if (toForm.length < toWhat.length + VALUE_MARK.length || !between.includes(ref)) {
+    throw new PrinterFailure(PACKAGE_EXIT, `the installed package's ${builder} gave no line naming the call, then ${ref}, then the form`)
+  }
+  return [toWhat, between].join('\n')
+}
+
+/** An ad-error-class.ts launch-timeout form's export name. */
+const LAUNCH_TIMEOUT_FORM_NAME_RE = /^LAUNCH_TIMEOUT_FORM_[A-Z_]+$/
+
+/**
+ * How the post-UNAVAILABLE get line names the launch's outcome (the
+ * package's `launchUnavailableFormText`, src/session-manager.ts): for
+ * `<form>` the name of a src/ad-error-class.ts launch-timeout form export
+ * (`LAUNCH_TIMEOUT_FORM_…`), that form's text; for `none` (no launch
+ * timeout), the UNAVAILABLE text cut where the rendered failure begins.
+ */
+async function launchUnavailableFormText(form: string): Promise<string> {
+  const build = await functionExport('session-manager.ts', 'launchUnavailableFormText')
+  const builder = 'src/session-manager.ts launchUnavailableFormText'
+  if (form === 'none') return cutAtMark(builder, build(undefined, VALUE_MARK), VALUE_MARK)
+  if (!LAUNCH_TIMEOUT_FORM_NAME_RE.test(form)) {
+    throw new PrinterFailure(USAGE_EXIT, `launchUnavailableFormText: '${form}' is neither none nor a LAUNCH_TIMEOUT_FORM_ export name`)
+  }
+  const value = await stringExport('ad-error-class.ts', form)
+  const text = build(value, VALUE_MARK)
+  if (typeof text !== 'string' || text === '' || text.includes('\n') || text.includes(VALUE_MARK) || !text.includes(value)) {
+    throw new PrinterFailure(PACKAGE_EXIT, `the installed package's ${builder} gave no one-line text naming the form ${value}`)
+  }
+  return text
+}
+
+/**
+ * The head of persona `key`'s tmux-unresponsive lines: the package's
+ * `tmuxUnresponsiveLine` (src/persona-episodes.ts) for `key`, cut where its
+ * text begins.
+ */
+async function tmuxUnresponsiveLineHead(key: string): Promise<string> {
+  checkKey('tmuxUnresponsiveLineHead', key)
+  const build = await functionExport('persona-episodes.ts', 'tmuxUnresponsiveLine')
+  const builder = 'src/persona-episodes.ts tmuxUnresponsiveLine'
+  return checkKeyHead(builder, cutAtMark(builder, build(key, VALUE_MARK), VALUE_MARK), key)
+}
+
+/**
+ * The approver's line when shutdown stops it for persona reference `ref`:
+ * the package's `approverLogLine(approverStopRequestedMessage(ref,
+ * APPROVER_STOP_SHUTDOWN))` (src/session-manager.ts), the line
+ * `stopAllDialogApprovers` logs.
+ */
+async function approverShutdownStopLine(ref: string): Promise<string> {
+  checkOneLine('approverShutdownStopLine', 'ref', ref)
+  const logLine = await functionExport('session-manager.ts', 'approverLogLine')
+  const message = await functionExport('session-manager.ts', 'approverStopRequestedMessage')
+  const reason = await stringExport('session-manager.ts', 'APPROVER_STOP_SHUTDOWN')
+  const line = logLine(message(ref, reason))
+  if (typeof line !== 'string' || line.includes('\n') || !line.includes(ref) || !line.includes(reason)) {
+    throw new PrinterFailure(PACKAGE_EXIT, "the installed package's src/session-manager.ts approverStopRequestedMessage gave no one-line text naming the reference and the shutdown reason")
+  }
+  return line
+}
+
 /** The entries, by the name a script passes. */
 const ENTRIES: Readonly<Record<string, Entry>> = {
   APPROVER_LOG_PREFIX: noArguments('APPROVER_LOG_PREFIX', () => stringExport('session-manager.ts', 'APPROVER_LOG_PREFIX')),
@@ -300,6 +587,15 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   tmuxUnresponsiveEndedLines: oneArgument('tmuxUnresponsiveEndedLines', 'key', tmuxUnresponsiveEndedLines),
   tmuxUnresponsiveOnsetText: oneArgument('tmuxUnresponsiveOnsetText', 'key', tmuxUnresponsiveOnsetText),
   spawnFailureNoticeHead: oneArgument('spawnFailureNoticeHead', 'error-name', spawnFailureNoticeHead),
+  unavailableRetryLineHead: oneArgument('unavailableRetryLineHead', 'key', unavailableRetryLineHead),
+  unavailableRetryArmedHead: oneArgument('unavailableRetryArmedHead', 'key', unavailableRetryArmedHead),
+  unavailableRetryStoppedHead: oneArgument('unavailableRetryStoppedHead', 'key', unavailableRetryStoppedHead),
+  unavailableRetryNotArmedHead: oneArgument('unavailableRetryNotArmedHead', 'key', unavailableRetryNotArmedHead),
+  unavailableRetryRetryLineParts: oneArgument('unavailableRetryRetryLineParts', 'key', unavailableRetryRetryLineParts),
+  launchUnavailableGetLineParts: oneArgument('launchUnavailableGetLineParts', 'ref', launchUnavailableGetLineParts),
+  launchUnavailableFormText: oneArgument('launchUnavailableFormText', 'form', launchUnavailableFormText),
+  tmuxUnresponsiveLineHead: oneArgument('tmuxUnresponsiveLineHead', 'key', tmuxUnresponsiveLineHead),
+  approverShutdownStopLine: oneArgument('approverShutdownStopLine', 'ref', approverShutdownStopLine),
 }
 
 async function main(argv: readonly string[]): Promise<number> {

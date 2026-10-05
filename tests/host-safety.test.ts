@@ -1681,14 +1681,13 @@ const HOME_GUARDED_HELPERS: readonly string[] = ['install_ad_shim', 'ad_store_ed
 /** agent-director-admin's shim install, held to the same rule as `install_ad_shim`: a copy delegated to `_scenario_place`. */
 const HOME_GUARDED_ADMIN_HELPERS: readonly string[] = ['install_ad_admin_shim']
 
-/** The stub-worker and store helpers held to the same rule: the stub mode selector (a move) and the no-launch-start statement (a store edit). */
-const HOME_GUARDED_STUB_HELPERS: readonly string[] = ['stub_mode', 'ad_store_pending_no_launch']
-
-/** The stub's dialog delay setter (a harness addition), held to the same rule as `stub_mode`: a move of its settings file. */
-const HOME_GUARDED_STUB_DELAY_HELPERS: readonly string[] = ['stub_dialog_delay']
-
-/** The stub's pause linger release (a harness addition), held to the same rule as `stub_mode`: a move of its releases file. */
-const HOME_GUARDED_STUB_RELEASE_HELPERS: readonly string[] = ['stub_release']
+/**
+ * The stub-worker and store helpers held to the same rule: the stub mode
+ * selector, the dialog delay setter and the pause linger's release (each a
+ * move of its file; the last two harness additions) and the no-launch-start
+ * statement (a store edit).
+ */
+const HOME_GUARDED_STUB_HELPERS: readonly string[] = ['stub_mode', 'stub_dialog_delay', 'stub_release', 'ad_store_pending_no_launch']
 
 /**
  * The label, seeding, tmux-step, store-statement and 0.10.0-seeder helpers
@@ -2372,7 +2371,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), HOME_GUARDED_ADMIN_HELPERS)).toEqual([])
     })
 
-    test('the current tree: stub_mode and ad_store_pending_no_launch run require_scenario_home before their first move or store edit', () => {
+    test('the current tree: stub_mode, stub_dialog_delay, stub_release and ad_store_pending_no_launch run require_scenario_home before their first move or store edit', () => {
       expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), HOME_GUARDED_STUB_HELPERS)).toEqual([])
     })
 
@@ -2384,30 +2383,6 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, ['stub_mode']), 'scenario.sh', RULE.homeCheckFirst)
     })
 
-    test('the current tree: stub_dialog_delay runs require_scenario_home before its first move', () => {
-      expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), HOME_GUARDED_STUB_DELAY_HELPERS)).toEqual([])
-    })
-
-    test('stub_dialog_delay without its require_scenario_home is flagged at its move', () => {
-      const source = readFileSync(SCENARIO_PATH, 'utf-8')
-      const unguarded = source.replace(/(\nstub_dialog_delay\(\) \{\n(?:.*\n)*?)    require_scenario_home "\$\{step\}"\n/, '$1')
-
-      expect(unguarded).not.toBe(source)
-      expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, HOME_GUARDED_STUB_DELAY_HELPERS), 'scenario.sh', RULE.homeCheckFirst)
-    })
-
-    test('the current tree: stub_release runs require_scenario_home before its first move', () => {
-      expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), HOME_GUARDED_STUB_RELEASE_HELPERS)).toEqual([])
-    })
-
-    test('stub_release without its require_scenario_home is flagged at its move', () => {
-      const source = readFileSync(SCENARIO_PATH, 'utf-8')
-      const unguarded = source.replace(/(\nstub_release\(\) \{\n(?:.*\n)*?)    require_scenario_home "\$\{step\}"\n/, '$1')
-
-      expect(unguarded).not.toBe(source)
-      expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, HOME_GUARDED_STUB_RELEASE_HELPERS), 'scenario.sh', RULE.homeCheckFirst)
-    })
-
     test('the current tree: the label, seeding, tmux-step, store-statement and 0.10.0-seeder helpers run require_scenario_home before their first store, copy or move step', () => {
       expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), HOME_GUARDED_SEEDING_HELPERS)).toEqual([])
     })
@@ -2416,6 +2391,8 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       ['ad_store_mark_finished', 'its store read, through another helper'],
       ['seed_leftover', 'its seeding, through _scenario_seed'],
       ['rebind_tmux_socket', 'its socket move'],
+      ['stub_dialog_delay', 'its move'],
+      ['stub_release', 'its move'],
     ])('%s without its require_scenario_home is flagged at %s', (helper) => {
       const source = readFileSync(SCENARIO_PATH, 'utf-8')
       const unguarded = source.replace(new RegExp(`(\\n${helper}\\(\\) \\{\\n(?:.*\\n)*?)    require_scenario_home "[^"\\n]*"\\n`), '$1')

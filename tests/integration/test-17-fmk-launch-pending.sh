@@ -86,15 +86,24 @@
 #      - fixtures/fmk-driver.ts forces one `resume` of P (through
 #        `cscb_run`, a CSCB process): its outcome line names
 #        ErrSpawnNotResumable, `called=true` and `counted=false`, and it is
-#        the driver's only launch call;
+#        the driver's only launch call; it posted nothing: the driver installs
+#        no notifier, so a notice would be logged on its standard error, and
+#        that holds neither the no-notifier line for P
+#        (src/session-manager.ts sendPersonaNotice) nor the driver's own
+#        outage-notice line for P;
 #      - the row still reads `pending` and the pane still shows neither
 #        needle once the driver has returned;
-#      - health ticks run: the bot server reads P's status more often than
-#        the approver reads the pane (each approver lap reads both; a tick
-#        reads status only).
+#      - health ticks run: in the hold, from its first read to the last pane
+#        read with no needle (D seconds), the bot server's `status` reads of
+#        P whose next call of P's row (`status` or `read-pane`) is not a
+#        `read-pane` (an approver lap reads status, then the pane; a tick
+#        reads status only) number at least ⌊D / HEALTH_TICK_S⌋ - 1 (see
+#        Waits).
 #   6. [harness] The pane is read until it shows the dev-channels needle (the
 #      delay's end), then the row is read until it leaves `pending`: it reads
-#      `waiting` with the same claude_session_id.
+#      `waiting` with the same claude_session_id. The last pane read with no
+#      needle is the one after the forced resume when the first read of this
+#      step already shows the dialog.
 #   7. Checks over the leg, counting only shim lines whose parent is the bot
 #      server (or, for the forced call, the driver):
 #      - exactly one `resume` of P by the bot server, and no `spawn`
@@ -117,8 +126,8 @@
 #   The server is then stopped with `stop --stop-bots`.
 # Outcomes the SRD leaves open are recorded in the script's output, not
 # asserted (ruling S8): what scheduled the restart, the driver's `latched`,
-# `class` and `action`, the hold's status and pane-read counts, and every
-# post across the leg.
+# `class` and `action`, the hold's status and pane-read counts beside the
+# tick reads' count, and every post across the leg.
 #
 # The launch-timeout legs (`leg_launch_timeouts`), in run order, with
 # `health_check_interval` 0 (ruling S3: no tick is needed). Three personas,
@@ -159,9 +168,11 @@
 #        reuse spawn); the reuse and resume personas' own plain spawn, the
 #        ladder's first step, collided first (recorded);
 #      - the launch timeout: a server.log line naming the persona carries
-#        LAUNCH_TIMEOUT_PHRASE, or its get line names CALL_TIMEOUT_NAME (E28
-#        T3's ErrCallTimeout form); exactly one post-timeout get line, which
-#        names a launch timeout and OUTCOME_APPROVER (the approver started);
+#        LAUNCH_TIMEOUT_PHRASE, or its get line names the ErrCallTimeout form
+#        (E28 T3; FORM_CALL_TIMEOUT); exactly one post-timeout get line, which
+#        names a launch timeout (FORM_CALL_TIMEOUT or FORM_TMUX_UNRESPONSIVE
+#        right after the persona's reference) and OUTCOME_APPROVER (the
+#        approver started);
 #      - exactly one bot-server `get` of the row between the launch and the
 #        first bot-server `read-pane` with `--allow-pending`, then a
 #        bot-server `send-keys` with `--allow-pending`, the only `send-keys`
@@ -175,9 +186,15 @@
 #      - one of the persona's tmux-unresponsive ended lines
 #        (`tmuxUnresponsiveEndedLines`) comes no later than the first harness
 #        read out of `pending`;
-#      - every retry line of the persona's retry timer is followed within
+#      - every retry line of the persona's retry timer (the retry builder's
+#        line exactly, so never the re-armed line) is followed within
 #        LT_RETRY_READ_S by a bot-server `status` or `get` of the row (and no
-#        launch, above);
+#        launch, above); how many there are is recorded, not asserted: a
+#        retry is not certain, as the tmux-unresponsive condition ends before
+#        the timer's first wait (UNAVAILABLE_RETRY_BASE_S) from the launch
+#        timeout has passed, and that end keeps the timer only while the
+#        row's last read is `pending` (src/unavailable-retry.ts
+#        `conditionEnded`): an end that brings a live reading stops it;
 #      - no conflict-latch line names the persona;
 #      and no post reaches the Slack stub's record from the start on (no
 #      spawn-failure or CONFLICT notice among them).
@@ -187,8 +204,8 @@
 # Recorded, not asserted (ruling S8): the start pass's summary line, each
 # persona's agent-director calls with their times, the plain spawns'
 # collision lines, the timeout-phrase and get lines, its tmux-unresponsive
-# and retry-timer lines, and the reuse row's claude_session_id before and
-# after.
+# and retry-timer lines, its number of retries, and the reuse row's
+# claude_session_id before and after.
 #
 # The restart leg (`leg_restart_mid_launch`), in run order, in state dir
 # `restart`, `health_check_interval` 0, one persona Q (working directory
@@ -215,9 +232,13 @@
 #        `read-pane` before the first read out of `pending`, and it is the
 #        only `send-keys` of Q from any CSCB process before then (the old
 #        server's approver typed nothing);
-#      - the old server's approver stopped at shutdown with no pending-row
-#        rule run after it (SRJ-404): no PENDING_ROW_RULE_LOG_HEAD line names
-#        Q in the old server's log lines;
+#      - the old server's approver stopped at shutdown and armed nothing
+#        (SRJ-404): the old server's log holds its shutdown stop line for Q
+#        once, and no arm line for Q after it, neither armed nor not armed
+#        (shutdown closes the retry controller before it stops the
+#        approvers, so an arm after the stop would log the not-armed line).
+#        The pending-row rule's run, which shutdown also rules out, is not
+#        checked: for a row younger than G it writes no line;
 #      - no post reaches the Slack stub's record in the leg.
 #   The server is then stopped with a plain `stop`, and [harness] Q's worker
 #   ends with the sentinel.
@@ -309,8 +330,7 @@
 #      the server registers the resumed stub's session as S's.
 #   7. The next tick's read of S: the bot server's first `status` of S from
 #      T0 + ST_TICK_S - ST_TICK_JITTER_S on, no later than T0 + ST_TICK_S +
-#      ST_TICK_JITTER_S (checked); ST_TICK_SETTLE_S later that tick's onset
-#      check has run.
+#      ST_TICK_JITTER_S (checked).
 #   8. Checks, over the bot server's agent-director calls of S's row
 #      (`call_table`) and server.log:
 #      - exactly two bot-server `resume`s of S after the pause, and no reuse
@@ -332,14 +352,16 @@
 #        holds S's tmux-unresponsive onset (`tmuxUnresponsiveOnsetText`) or
 #        the spawn-failure notice's first line, and there is no alert or
 #        other post (SRJ-308: the single refusal cleared before the next
-#        tick);
+#        tick); checked here and again once the server has stopped (any post
+#        the next tick's onset check made is in the record by then, as
+#        shutdown ends every episode silently; the Slack stub still runs);
 #      - no server.log line after the second `resume` names S with a
 #        reconnect, relaunch, restart scheduling or not-connected text
 #        (ruling S3: a tick acting on a stub with no MCP session stops the
 #        run).
-#   The server is then stopped with a plain `stop`, and [harness] S's worker
-#   ends with the sentinel (`stop --stop-bots` would pause it, and the
-#   stub would linger).
+#   The server is then stopped with a plain `stop` (the record checks above
+#   run again), and [harness] S's worker ends with the sentinel (`stop
+#   --stop-bots` would pause it, and the stub would linger).
 # Recorded, not asserted (ruling S8): what scheduled the resume (the
 # restart-scheduling lines), the bot server's calls of S from the pause with
 # their times from T0, the plain spawns' count and collision lines, the
@@ -349,6 +371,15 @@
 # retry, the second resume and the next tick from T0.
 #
 # Waits and their derivation (seconds):
+# - Scenario 5's tick reads: health ticks fire every HEALTH_TICK_S, so a
+#   hold of D seconds holds at least ⌊D / HEALTH_TICK_S⌋ tick instants, each
+#   reading P's status once; one is allowed lost at the window's end (a tick
+#   whose read lands just after its last pane read with no needle). An
+#   approver lap's status read is followed by its `read-pane`, so among the
+#   status reads not followed by a `read-pane` each tick read adds exactly
+#   one (when it falls between a lap's two reads, the lap's status read is
+#   the one counted) and a lap adds none by itself; other status-only reads,
+#   such as a retry's, only raise the count.
 # - DIALOG_DELAY_S = HEALTH_TICK_S + FORCED_RESUME_S + HOLD_SLACK_S: longer
 #   than one health tick interval plus the forced `resume` (bounded at
 #   FORCED_RESUME_S, checked) plus HOLD_SLACK_S for the resume's launch call
@@ -429,8 +460,7 @@
 # create_timeout_ms (src/ad-settings.ts DEFAULT_AD_SETTINGS.tmux
 # .pending_grace_seconds and .create_timeout_ms); the call timeout
 # (src/config.ts DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS);
-# LAUNCH_TIMEOUT_PHRASE (src/ad-description-phrases.ts); CALL_TIMEOUT_NAME
-# (src/ad-error-class.ts LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT);
+# LAUNCH_TIMEOUT_PHRASE (src/ad-description-phrases.ts);
 # UNAVAILABLE_RETRY_BASE_S and UNAVAILABLE_RETRY_CEILING_S
 # (src/unavailable-retry.ts); PENDING_ROW_RULE_LOG_HEAD and
 # PENDING_ROW_RUN_MARKED_MISSING (src/pending-row.ts); each persona's
@@ -444,18 +474,42 @@
 # window (src/ad-settings.ts DEFAULT_AD_SETTINGS.tmux.stopping_window_seconds)
 # and S's tmux-unresponsive onset body (src/persona-episodes.ts
 # tmuxUnresponsiveOnsetText, entry `tmuxUnresponsiveOnsetText`).
+# Log lines with an exported builder are matched by what fmk-texts.ts cuts
+# from the builder, per persona key or reference, a variable part cut at a
+# marker:
+# - the head of every retry-timer line (RT_LINE_HEAD, entry
+#   `unavailableRetryLineHead`: the head unavailableRetryArmedLine,
+#   unavailableRetryRetryLine, unavailableRetryReArmedLine and
+#   unavailableRetryStoppedLine share), for the recorded lines; the arm
+#   line's head in either mode (RT_ARMED, `unavailableRetryArmedHead`), the
+#   stop line's (RT_STOPPED, `unavailableRetryStoppedHead`) and the
+#   not-armed line's (RT_NOT_ARMED, `unavailableRetryNotArmedHead`, from
+#   unavailableRetryNotArmedClosedLine); the retry line in its parts
+#   (`unavailableRetryRetryLineParts`), matched whole (`retry_hits`: the
+#   head, a number and one of its two tails, so the re-armed line, which
+#   starts the same way, never matches) (all src/unavailable-retry.ts);
+# - the post-UNAVAILABLE get line's head before the call's name (GET_HEAD)
+#   and its text from after the name to the form (GET_OF, entry
+#   `launchUnavailableGetLineParts`, src/session-manager.ts
+#   launchUnavailableGetLine); the form right after it: each launch-timeout
+#   form's text (FORM_CALL_TIMEOUT and FORM_TMUX_UNRESPONSIVE, entry
+#   `launchUnavailableFormText` with the src/ad-error-class.ts export names
+#   LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT and LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE)
+#   or a plain UNAVAILABLE's head (FORM_UNAVAILABLE_HEAD, `none`;
+#   src/session-manager.ts launchUnavailableFormText);
+# - the head of the tmux-unresponsive lines (TU_HEAD, entry
+#   `tmuxUnresponsiveLineHead`, src/persona-episodes.ts
+#   tmuxUnresponsiveLine), for the recorded condition lines;
+# - the approver's shutdown stop line for Q (entry `approverShutdownStopLine`:
+#   src/session-manager.ts approverLogLine of approverStopRequestedMessage
+#   with APPROVER_STOP_SHUTDOWN), matched as a whole line.
 # Fragments with no exported builder, each quoted from its source:
 # - `[slack] Session connected: persona <ref>` (src/server.ts, the MCP
 #   session's registration line);
-# - the post-timeout get line's `[slack] spawnForPersona: one get after the `
-#   (GET_LINE_HEAD), `of <ref> ended in ` and `a launch timeout (`
-#   (LAUNCH_TIMEOUT_FORM) (src/session-manager.ts launchUnavailableGetLine
-#   and LAUNCH_TIMEOUT_FORM_TEXT);
+# - `resume` (RESUME_WHAT), the call's name the post-UNAVAILABLE get line
+#   gives a `resume` (src/session-manager.ts, the resume site's literal);
 # - `[slack] spawnForPersona: collision resolved, state=` and `for <ref>`
 #   (src/session-manager.ts runPersonaLadder's collision line);
-# - `[slack] unavailable-retry: persona=<key> ` with `retry `, `stopped` and
-#   (scenario 13) `armed` (src/unavailable-retry.ts unavailableRetryRetryLine,
-#   unavailableRetryStoppedLine and unavailableRetryArmedLine);
 # - `[slack] conflict-latch: persona=<key> ` (src/conflict-latch.ts, the
 #   latch record's lines);
 # - `[slack] spawnForPersona: `, `failed for <ref>: ` and ErrTmuxSessionCreate
@@ -468,8 +522,6 @@
 # - "dispatcher bug", quoted from b.jg5 SRJ-1413 for the absence check;
 # - ` rule (` after PENDING_ROW_RULE_LOG_HEAD and the reference
 #   (src/pending-row.ts, the rule's run line);
-# - `persona=<key> ` with ` tmux-unresponsive ` (src/persona-episodes.ts
-#   tmuxUnresponsiveLine), for the recorded condition lines;
 # - `Scheduling restart for persona=<key>` (src/restart.ts scheduleRestart);
 # - the hold's trouble words `reconnect`, `relaunch`, `Scheduling restart`
 #   and `not connected` (src/restart.ts, src/session-manager.ts; matched
@@ -477,9 +529,10 @@
 #   scenario 13);
 # - `[slack] spawnForPersona: resume refused for <ref>: ` (src/session-manager.ts
 #   logRefusal, the refusal line, with `resume` as the call);
-# - the post-UNAVAILABLE get line's `resume of <ref> ended in UNAVAILABLE (`
-#   after GET_LINE_HEAD (src/session-manager.ts launchUnavailableGetLine and
-#   launchUnavailableFormText);
+# - the forced resume's notice lines on the driver's standard error:
+#   `no notifier installed — notice for persona=<key> not posted`
+#   (src/session-manager.ts sendPersonaNotice, ruling S7) and
+#   `[fmk-driver] outage-notice persona=<key>: ` (fixtures/fmk-driver.ts);
 # - the driver's outcome fields `called=`, `counted=`, `error=` (the
 #   fmk-driver.ts outcome line) and ErrSpawnNotResumable (agent-director's
 #   error name); ErrSpawnNotFound (agent-director's error name; a harness
@@ -488,6 +541,10 @@
 # - the persona reference `"<name>" (key=<key>)` (lib/scenario.sh
 #   persona_ref, src/persona-identity.ts renderPersonaRef) and the instance id
 #   `cscb_<key>` (src/persona-identity.ts personaInstanceId).
+# Every match on a persona is whole: no persona's name, key or row id is a
+# prefix of another's, a key is matched as `persona=<key>` followed by no
+# key character (`naming_persona`) or with the text after it, and a row id as
+# a whole word of the call (` --claude-instance-id <id> `).
 #
 # Closing: the script ends with `assert_no_server_tmux` (AC 3's "the bot
 # server starts no tmux process", over every leg's servers, the slow-create
@@ -594,8 +651,9 @@ SESSION_CREATE_ERR=ErrTmuxSessionCreate
 DISPATCHER_BUG='dispatcher bug'
 
 # Scenario 13's persona S (working directory `paused`, selected for the
-# stub's pause linger).
-S_NAME="${SCENARIO_TAG}_paused"
+# stub's pause linger). No persona's name, key or row id is a prefix of
+# another's.
+S_NAME="${SCENARIO_TAG}_stopping"
 S_KEY="$(persona_key "${S_NAME}")"
 S_REF="$(persona_ref "${S_NAME}")"
 S_ID="cscb_${S_KEY}"
@@ -607,12 +665,11 @@ ST_RESTART_DELAY_S=3      # session_restart_delay: the restart the session's end
 ST_PAUSE_S=5              # from the tick read the pause follows to the pause's return (checked)
 ST_LAUNCH_SLACK_S=10      # a restart run's or a retry's calls before its resume (checked for the retry)
 ST_TICK_JITTER_S=2        # the next tick's read, against the first read plus the interval
-ST_TICK_SETTLE_S=3        # after the next tick's read: that tick's onset check has run
 ST_SESSION_END_WAIT_S=10  # after the release: the lingering worker's tmux session gone
 
-# Fragments with no exported builder (see the header).
-GET_LINE_HEAD='[slack] spawnForPersona: one get after the '
-LAUNCH_TIMEOUT_FORM='a launch timeout ('
+# The call's name (`what`) the post-UNAVAILABLE get line gives a `resume`
+# (src/session-manager.ts, the resume site's literal; no export).
+RESUME_WHAT=resume
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -628,9 +685,80 @@ seconds_between() {
     awk -v a="$1" -v b="$2" 'BEGIN { printf "%.3f\n", b - a }'
 }
 
-# fmk_text <entry> [<arg>...]: print fixtures/fmk-texts.ts's value for <entry>.
+# fmk_text <entry> [<arg>...]: print fixtures/fmk-texts.ts's value for
+# <entry>, read from the package the server and the driver run (PKG_DIR).
 fmk_text() {
-    bun --no-install "${FMK_TEXTS}" "$@"
+    CSCB_PKG_DIR="${PKG_DIR}" bun --no-install "${FMK_TEXTS}" "$@"
+}
+
+# text_parts <array-name> <count> <entry> <arg>: set the array to the lines
+# of fixtures/fmk-texts.ts's value for <entry> <arg>; fail unless there are
+# <count> lines, none empty.
+text_parts() {
+    local -n text_parts_out="$1"
+    local value part
+    value="$(fmk_text "$3" "$4")" || fail "setup: fmk-texts.ts could not print $3 $4"
+    mapfile -t text_parts_out <<< "${value}"
+    (( ${#text_parts_out[@]} == $2 )) || fail "setup: fmk-texts.ts printed ${#text_parts_out[@]} line(s) for $3 $4, not $2"
+    for part in "${text_parts_out[@]}"; do
+        [[ -n "${part}" ]] || fail "setup: fmk-texts.ts printed an empty line for $3 $4"
+    done
+}
+
+# key_text <array-name> <entry> <key>: set the associative array's element
+# <key> to fixtures/fmk-texts.ts's one-line value for <entry> <key> (a head
+# cut from the entry's builder); fail when it is empty or cannot be printed.
+key_text() {
+    local -n key_text_out="$1"
+    local value
+    value="$(fmk_text "$2" "$3")" || fail "setup: fmk-texts.ts could not print $2 $3"
+    [[ -n "${value}" && "${value}" != *$'\n'* ]] || fail "setup: fmk-texts.ts printed no one-line value for $2 $3"
+    key_text_out["$3"]="${value}"
+}
+
+# naming_persona <key> <ref>: print the lines of standard input that name
+# persona <key> whole (`persona=<key>` followed by no key character) or hold
+# its reference <ref>, so no other persona's key or reference matches.
+naming_persona() {
+    awk -v k="persona=$1" -v r="$2" '
+        {
+            hit = index($0, r) > 0
+            s = $0
+            while (!hit && (p = index(s, k)) > 0) {
+                c = substr(s, p + length(k), 1)
+                if (c !~ /[a-z0-9_]/) hit = 1
+                s = substr(s, p + length(k))
+            }
+            if (hit) print
+        }'
+}
+
+# retry_hits <from-line> <head> <tail>...: `log_hits`'s output for the
+# server.log lines after <from-line> whose text after the `[<ISO time>] `
+# head is exactly <head>, a whole number and one of the <tail>s: the retry
+# lines (fmk-texts.ts `unavailableRetryRetryLineParts`), never the re-armed
+# line, which starts the same way.
+retry_hits() {
+    python3 - "${SLACK_STATE_DIR}/server.log" "$@" << 'EOF'
+import datetime, re, sys
+path, start, head, tails = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4:]
+line_re = re.compile(re.escape(head) + "[0-9]+(?:" + "|".join(re.escape(t) for t in tails) + ")")
+try:
+    lines = open(path, encoding="utf-8", errors="replace").read().split("\n")
+except FileNotFoundError:
+    sys.exit(0)
+for n, text in enumerate(lines, 1):
+    if n <= start or not text.startswith("[") or "] " not in text:
+        continue
+    at = text.index("] ")
+    if not line_re.fullmatch(text[at + 2:]):
+        continue
+    try:
+        t = datetime.datetime.strptime(text[1:at], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        continue
+    print(f"{n}\t{t:.3f}\t{text}")
+EOF
 }
 
 # start_slack_stub <dir> <suffix>...: start the Slack stub in a new <dir>,
@@ -748,14 +876,16 @@ server_calls() {
 }
 
 # server_calls_of <id> <verb> <from> <to> [<fragment>...]: `server_calls` for
-# row <id>.
+# row <id>, named whole (` --claude-instance-id <id> ` in the line's words),
+# so another row whose id <id> is a prefix of is never counted.
 server_calls_of() {
     local id="$1" verb="$2" from="$3" to="$4" lines=()
     shift 4
     mapfile -t lines < <(cscb_ad_calls "${verb}" "--claude-instance-id ${id}" "$@")
     (( ${#lines[@]} > 0 )) || return 0
-    printf '%s\n' "${lines[@]}" | awk -F'\t' -v p="${SERVER_PID}" -v a="${from}" -v b="${to}" \
-        '$4 == p && (a == "-" || $2 + 0 > a + 0) && (b == "-" || $2 + 0 <= b + 0)'
+    printf '%s\n' "${lines[@]}" | awk -F'\t' -v p="${SERVER_PID}" -v id="${id}" -v a="${from}" -v b="${to}" '
+        $4 == p && index(" " $6 " ", " --claude-instance-id " id " ") \
+            && (a == "-" || $2 + 0 > a + 0) && (b == "-" || $2 + 0 <= b + 0)'
 }
 
 # server_count <verb> <from> <to> [<fragment>...]: how many lines
@@ -790,8 +920,8 @@ approver_quiet_of() {
 }
 
 # any_calls_naming <verb> <from> <to>: print every agent-director shim `call`
-# line, from any parent, whose words hold <verb> and P's row id, with a time
-# in (<from>, <to>] (`-` for no bound).
+# line, from any parent, whose words hold <verb> and P's row id, each as a
+# whole word, with a time in (<from>, <to>] (`-` for no bound).
 any_calls_naming() {
     any_calls_naming_of "${P_ID}" "$@"
 }
@@ -799,7 +929,7 @@ any_calls_naming() {
 # any_calls_naming_of <id> <verb> <from> <to>: `any_calls_naming` for row <id>.
 any_calls_naming_of() {
     awk -F'\t' -v v="$2" -v id="$1" -v a="$3" -v b="$4" '
-        $1 == "call" && index($6, v) && index($6, id) \
+        $1 == "call" && index(" " $6 " ", " " v " ") && index(" " $6 " ", " " id " ") \
             && (a == "-" || $2 + 0 > a + 0) && (b == "-" || $2 + 0 <= b + 0)
     ' "${SCENARIO_AD_SHIM_LOG}"
 }
@@ -938,9 +1068,16 @@ OUTCOME_APPROVER="$(fmk_text LAUNCH_UNAVAILABLE_OUTCOME_APPROVER)" \
     || fail "setup: fmk-texts.ts could not print LAUNCH_UNAVAILABLE_OUTCOME_APPROVER"
 RETRY_BASE_S="$(fmk_text UNAVAILABLE_RETRY_BASE_S)" || fail "setup: fmk-texts.ts could not print UNAVAILABLE_RETRY_BASE_S"
 RETRY_CEILING_S="$(fmk_text UNAVAILABLE_RETRY_CEILING_S)" || fail "setup: fmk-texts.ts could not print UNAVAILABLE_RETRY_CEILING_S"
-CALL_TIMEOUT_NAME="$(fmk_text LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT)" || fail "setup: fmk-texts.ts could not print LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT"
 PENDING_ROW_HEAD="$(fmk_text PENDING_ROW_RULE_LOG_HEAD)" || fail "setup: fmk-texts.ts could not print PENDING_ROW_RULE_LOG_HEAD"
-[[ -n "${CALL_TIMEOUT_NAME}" && -n "${PENDING_ROW_HEAD}" ]] || fail "setup: fmk-texts.ts printed an empty value"
+# How the post-UNAVAILABLE get line names the outcome: each launch-timeout
+# form, and the head of a plain UNAVAILABLE.
+FORM_CALL_TIMEOUT="$(fmk_text launchUnavailableFormText LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT)" \
+    || fail "setup: fmk-texts.ts could not print launchUnavailableFormText LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT"
+FORM_TMUX_UNRESPONSIVE="$(fmk_text launchUnavailableFormText LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE)" \
+    || fail "setup: fmk-texts.ts could not print launchUnavailableFormText LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE"
+FORM_UNAVAILABLE_HEAD="$(fmk_text launchUnavailableFormText none)" || fail "setup: fmk-texts.ts could not print launchUnavailableFormText none"
+[[ -n "${PENDING_ROW_HEAD}" && -n "${FORM_CALL_TIMEOUT}" && -n "${FORM_TMUX_UNRESPONSIVE}" && -n "${FORM_UNAVAILABLE_HEAD}" ]] \
+    || fail "setup: fmk-texts.ts printed an empty value"
 [[ "${CREATE_TIMEOUT_MS}" =~ ^[1-9][0-9]*$ && "${CALL_TIMEOUT_MS}" =~ ^[1-9][0-9]*$ ]] \
     || fail "setup: the create timeout '${CREATE_TIMEOUT_MS}' or the call timeout '${CALL_TIMEOUT_MS}' is not a whole number of milliseconds"
 [[ "${RETRY_BASE_S}" =~ ^[1-9][0-9]*$ && "${RETRY_CEILING_S}" =~ ^[1-9][0-9]*$ ]] \
@@ -996,6 +1133,56 @@ ST_TICK_S=$(( ST_PAUSE_S + ST_RESTART_DELAY_S + ST_LAUNCH_SLACK_S + RETRY_BASE_S
 ST_TIMER_WAIT_S=$(( RETRY_BASE_S + LT_RETRY_SLACK_S ))
 echo "${TEST_NAME}: scenario 13: stopping window ${STOP_WINDOW_S}s, health tick ${ST_TICK_S}s, restart delay ${ST_RESTART_DELAY_S}s, retry base ${RETRY_BASE_S}s"
 
+# The log lines with exported builders, per persona key, each printed by
+# fmk-texts.ts (see the header): the head of every retry-timer line
+# (RT_LINE_HEAD), of the arm line in either mode (RT_ARMED), of the stop line
+# (RT_STOPPED), of the not-armed line (RT_NOT_ARMED), the retry line's parts
+# (RT_RETRY_HEAD, then RT_RETRY_FULL or RT_RETRY_PENDING after its number),
+# the head of the tmux-unresponsive lines (TU_HEAD), and the
+# post-UNAVAILABLE get line's text between the call's name and the form
+# (GET_OF; GET_HEAD before the call's name, the same for every persona).
+declare -A RT_LINE_HEAD=() RT_ARMED=() RT_STOPPED=() RT_NOT_ARMED=() RT_RETRY_HEAD=() RT_RETRY_FULL=() RT_RETRY_PENDING=()
+declare -A TU_HEAD=() GET_OF=()
+GET_HEAD=""
+
+# retry_texts <key>: RT_LINE_HEAD, RT_STOPPED, the retry line's parts and
+# TU_HEAD for <key>.
+retry_texts() {
+    local parts=()
+    key_text RT_LINE_HEAD unavailableRetryLineHead "$1"
+    key_text RT_STOPPED unavailableRetryStoppedHead "$1"
+    key_text TU_HEAD tmuxUnresponsiveLineHead "$1"
+    text_parts parts 3 unavailableRetryRetryLineParts "$1"
+    RT_RETRY_HEAD[$1]="${parts[0]}"
+    RT_RETRY_FULL[$1]="${parts[1]}"
+    RT_RETRY_PENDING[$1]="${parts[2]}"
+}
+
+# get_line_texts <key> <ref>: GET_OF for <key> (persona reference <ref>),
+# and GET_HEAD, which must be the same for every reference.
+get_line_texts() {
+    local parts=()
+    text_parts parts 2 launchUnavailableGetLineParts "$2"
+    [[ -z "${GET_HEAD}" || "${GET_HEAD}" == "${parts[0]}" ]] \
+        || fail "setup: the get line's head for $2 is '${parts[0]}', not '${GET_HEAD}'"
+    GET_HEAD="${parts[0]}"
+    GET_OF[$1]="${parts[1]}"
+}
+
+for role in "${LT_ROLES[@]}"; do
+    retry_texts "${LT_KEY[${role}]}"
+    get_line_texts "${LT_KEY[${role}]}" "${LT_REF[${role}]}"
+done
+key_text RT_LINE_HEAD unavailableRetryLineHead "${Q_KEY}"
+key_text RT_ARMED unavailableRetryArmedHead "${Q_KEY}"
+key_text RT_NOT_ARMED unavailableRetryNotArmedHead "${Q_KEY}"
+Q_SHUTDOWN_STOP="$(fmk_text approverShutdownStopLine "${Q_REF}")" || fail "setup: fmk-texts.ts could not print approverShutdownStopLine"
+[[ -n "${Q_SHUTDOWN_STOP}" ]] || fail "setup: fmk-texts.ts printed an empty approverShutdownStopLine"
+key_text RT_LINE_HEAD unavailableRetryLineHead "${F_KEY}"
+retry_texts "${S_KEY}"
+key_text RT_ARMED unavailableRetryArmedHead "${S_KEY}"
+get_line_texts "${S_KEY}" "${S_REF}"
+
 # ---------------------------------------------------------------------------
 # Scenario 5's leg
 # ---------------------------------------------------------------------------
@@ -1004,7 +1191,7 @@ leg_launch_pending() {
     local step="scenario 5" creds work connected sid session sentinel_at resume_line resume_at
     local hold_at hold_log0 hold_log1 posts0 launch_ms drv_out drv_err drv_rc=0 drv_at drv_end drv_s
     local drv_line drv_pid outcome=() lines=() line verb launches=0 pane="${SCENARIO_ROOT}/p-pane.txt"
-    local deadline last_clear="" dialog_at="" live_at statuses panes n first_send first_read hits
+    local deadline last_clear="" dialog_at="" live_at statuses panes ticks want_ticks n first_send first_read hits
     local restart_lines
 
     # Step 1: the live start brings P up.
@@ -1117,6 +1304,16 @@ EOF
     [[ "${drv_line}" == *" error=${NOT_RESUMABLE} "* ]] || fail "${step}: the forced resume did not get ${NOT_RESUMABLE}: ${drv_line}"
     [[ "${drv_line}" == *" counted=false "* ]] || fail "${step}: the forced resume's ${NOT_RESUMABLE} was counted: ${drv_line}"
     echo "${TEST_NAME}: ${step}: the forced resume's own fields (recorded, not asserted):$(grep -oE ' (action|latched|class)=[^ ]+' <<< "${drv_line}" | tr '\n' ' ')"
+    # It posted nothing: the driver installs no notifier, so a notice would
+    # be logged on its stderr by either sink, never posted: src/session-manager.ts
+    # sendPersonaNotice's no-notifier line (no export; ruling S7), or the
+    # driver's own outage-notice line (fixtures/fmk-driver.ts).
+    hits="$(grep -F -e "no notifier installed — notice for persona=${P_KEY} not posted" \
+        -e "[fmk-driver] outage-notice persona=${P_KEY}: " "${drv_err}" || true)"
+    if [[ -n "${hits}" ]]; then
+        sed 's/^/  | /' <<< "${hits}" >&2
+        fail "${step}: the forced resume tried to post a notice for P (its line on the driver's stderr)"
+    fi
     # It is the driver's only launch call (spawn or resume).
     line="$(awk -F'\t' -v w="fmk-driver.ts resume" '$1 == "proc" && $2 == "run" && index($6, w) { l = $0 } END { print l }' "${SCENARIO_CSCB_RECORD}")"
     drv_pid="$(cut -f3 <<< "${line}")"
@@ -1139,6 +1336,10 @@ EOF
     read_row "${step}: after the forced resume"
     [[ "${ROW_STATE}" == pending && "${ROW_SID}" == "${sid}" ]] \
         || fail "${step}: after the forced resume the row reads ${ROW_STATE} (${ROW_SID}), not still pending: the delay ended too soon"
+    # This capture, with no needle, is the hold's first known clear read: the
+    # delay's end is bounded below from it even when the loop below finds
+    # the dialog at its first read.
+    last_clear="$(now_s)"
     pane_capture "${step}" "${session}" "${pane}"
     if grep -qF -- "${DEV_NEEDLE}" "${pane}"; then
         fail "${step}: the dialog showed before the forced resume returned (${drv_s}s): the hold did not cover it"
@@ -1173,13 +1374,23 @@ EOF
     [[ "${ROW_SID}" == "${sid}" ]] || fail "${step}: the waiting row's claude_session_id is '${ROW_SID}', not the kept ${sid}"
     hold_log1="$(line_count "${SLACK_STATE_DIR}/server.log")"
 
-    # Step 7: the checks. Health ticks ran in the hold: more bot-server
-    # status reads of P than approver pane reads.
+    # Step 7: the checks. Health ticks ran in the hold: the bot server's
+    # status reads of P whose next call of P's row (status or read-pane) is
+    # not a read-pane (an approver lap reads status, then the pane; a tick
+    # reads status only) number at least one per health tick interval in the
+    # hold, less one (see the header).
     statuses="$(server_count status "${hold_at}" "${last_clear}")"
     panes="$(server_count read-pane "${hold_at}" "${last_clear}")"
-    echo "${TEST_NAME}: ${step}: in the hold before the dialog: ${statuses} status read(s) and ${panes} read-pane call(s) of P by the bot server"
-    (( statuses > panes )) \
-        || fail "${step}: the bot server read P's status ${statuses} time(s) and its pane ${panes} time(s) in the hold: no health tick read it"
+    ticks="$({ server_calls status - -; server_calls read-pane - -; } | sort -t $'\t' -k2,2n \
+        | awk -F'\t' -v a="${hold_at}" -v b="${last_clear}" '
+            { verb = (index(" " $6 " ", " read-pane ") ? "pane" : "status") }
+            prev_status && verb != "pane" { n++ }
+            { prev_status = (verb == "status" && $2 + 0 > a + 0 && $2 + 0 <= b + 0) }
+            END { if (prev_status) n++; print n + 0 }')"
+    want_ticks="$(awk -v a="${hold_at}" -v b="${last_clear}" -v t="${HEALTH_TICK_S}" 'BEGIN { n = int((b - a) / t) - 1; print (n < 0 ? 0 : n) }')"
+    echo "${TEST_NAME}: ${step}: in the hold before the dialog ($(seconds_between "${hold_at}" "${last_clear}")s): ${statuses} status read(s) and ${panes} read-pane call(s) of P by the bot server, ${ticks} status read(s) with no read-pane after them (at least ${want_ticks} wanted)"
+    (( ticks >= want_ticks )) \
+        || fail "${step}: only ${ticks} bot-server status read(s) of P in the hold had no read-pane after them, fewer than ${want_ticks}: health ticks did not read it every ${HEALTH_TICK_S}s"
 
     # No spawn, reuse, resume or kill of P by the bot server after the resume.
     for verb in spawn resume kill; do
@@ -1221,7 +1432,7 @@ EOF
 
     # Ruling S3: no reconnect, relaunch or not-connected line for P in the hold.
     hits="$(sed -n "$(( hold_log0 + 1 )),${hold_log1}p" "${SLACK_STATE_DIR}/server.log" \
-        | grep -F -e "persona=${P_KEY}" -e "${P_REF}" | grep -iE "${HOLD_TROUBLE}" || true)"
+        | naming_persona "${P_KEY}" "${P_REF}" | grep -iE "${HOLD_TROUBLE}" || true)"
     if [[ -n "${hits}" ]]; then
         sed 's/^/  | /' <<< "${hits}" >&2
         fail "${step}: in the hold the server logged a reconnect, relaunch or not-connected line for P (ruling S3: a health tick acted on the stub's missing MCP session)"
@@ -1297,7 +1508,7 @@ plus_s() {
 timeout_get_lines_seen() {
     local role
     for role in "${LT_ROLES[@]}"; do
-        [[ -n "$(log_hits "$1" "${GET_LINE_HEAD}" "of ${LT_REF[${role}]} ended in ")" ]] || return 1
+        [[ -n "$(log_hits "$1" "${GET_HEAD}" "${GET_OF[${LT_KEY[${role}]}]}")" ]] || return 1
     done
 }
 
@@ -1306,7 +1517,7 @@ timeout_get_lines_seen() {
 lt_timers_stopped() {
     local role
     for role in "${LT_ROLES[@]}"; do
-        [[ -n "$(log_hits "$1" "[slack] unavailable-retry: persona=${LT_KEY[${role}]} stopped")" ]] || return 1
+        [[ -n "$(log_hits "$1" "${RT_STOPPED[${LT_KEY[${role}]}]}")" ]] || return 1
     done
 }
 
@@ -1474,14 +1685,15 @@ leg_launch_timeouts() {
         # The launch timeout: a server.log line naming the persona carries
         # LAUNCH_TIMEOUT_PHRASE (or the get line names ErrCallTimeout), and
         # its one post-timeout get line started the approver.
-        mapfile -t hits < <(log_hits "${log0}" "${TIMEOUT_PHRASE}" | grep -F -e "persona=${key} " -e "${ref}" || true)
-        mapfile -t lines < <(log_hits "${log0}" "${GET_LINE_HEAD}" "of ${ref} ended in ")
+        mapfile -t hits < <(log_hits "${log0}" "${TIMEOUT_PHRASE}" | naming_persona "${key}" "${ref}")
+        mapfile -t lines < <(log_hits "${log0}" "${GET_HEAD}" "${GET_OF[${key}]}")
         (( ${#lines[@]} == 1 )) || fail "${step}: ${role}: ${#lines[@]} post-timeout get line(s) for ${ref}, not one"
         echo "${TEST_NAME}: ${step}: ${role}: ${#hits[@]} server.log line(s) naming it carry the launch-timeout phrase; its get line: $(cut -f3 <<< "${lines[0]}")"
-        (( ${#hits[@]} > 0 )) || [[ "${lines[0]}" == *"${LAUNCH_TIMEOUT_FORM}${CALL_TIMEOUT_NAME})"* ]] \
-            || fail "${step}: ${role}: no server.log line naming ${ref} carries the launch-timeout phrase, and its get line names no ${CALL_TIMEOUT_NAME}"
-        [[ "${lines[0]}" == *"${LAUNCH_TIMEOUT_FORM}"* && "${lines[0]}" == *"${OUTCOME_APPROVER}"* ]] \
-            || fail "${step}: ${role}: its get line names no launch timeout or did not start the approver"
+        (( ${#hits[@]} > 0 )) || [[ "${lines[0]}" == *"${GET_OF[${key}]}${FORM_CALL_TIMEOUT}"* ]] \
+            || fail "${step}: ${role}: no server.log line naming ${ref} carries the launch-timeout phrase, and its get line names no '${FORM_CALL_TIMEOUT}'"
+        [[ "${lines[0]}" == *"${GET_OF[${key}]}${FORM_CALL_TIMEOUT}"* || "${lines[0]}" == *"${GET_OF[${key}]}${FORM_TMUX_UNRESPONSIVE}"* ]] \
+            || fail "${step}: ${role}: its get line names no launch timeout ('${FORM_CALL_TIMEOUT}' or '${FORM_TMUX_UNRESPONSIVE}')"
+        [[ "${lines[0]}" == *"${OUTCOME_APPROVER}"* ]] || fail "${step}: ${role}: its get line did not start the approver"
 
         # One bot-server get after the launch, then read-pane and send-keys
         # with --allow-pending, and no spawn, reuse or resume after it.
@@ -1522,12 +1734,15 @@ leg_launch_timeouts() {
         t="$(log_hits "$(( n - 1 ))" "" | head -n 1 | cut -f2)"
         awk -v e="${t:-0}" -v o="${out_at[${role}]}" 'BEGIN { exit !(e + 0 > 0 && e + 0 <= o + 0) }' \
             || fail "${step}: ${role}: the tmux-unresponsive ended line (${t:-no time}) came after the first harness read out of pending (${out_at[${role}]})"
-        echo "${TEST_NAME}: ${step}: ${role}: its tmux-unresponsive condition (recorded): $(log_hits "${log0}" "persona=${key} " | cut -f3 | grep -F " tmux-unresponsive " | cut -c1-200 | tr '\n' '|')"
+        echo "${TEST_NAME}: ${step}: ${role}: its tmux-unresponsive condition (recorded): $(log_hits "${log0}" "${TU_HEAD[${key}]}" | cut -f3 | cut -c1-200 | tr '\n' '|')"
 
-        # Every retry reads the row (status or get) within LT_RETRY_READ_S and
-        # launches nothing (above); the retry lines are recorded.
-        echo "${TEST_NAME}: ${step}: ${role}: its retry timer (recorded): $(log_hits "${log0}" "[slack] unavailable-retry: persona=${key} " | cut -f3 | cut -c1-200 | tr '\n' '|')"
-        mapfile -t lines < <(log_hits "${log0}" "[slack] unavailable-retry: persona=${key} retry " | cut -f2)
+        # Every retry (its retry line exactly, never the re-armed line) reads
+        # the row (status or get) within LT_RETRY_READ_S and launches nothing
+        # (above); the retry-timer lines and the number of retries are
+        # recorded (a retry is not certain; see the header).
+        echo "${TEST_NAME}: ${step}: ${role}: its retry timer (recorded): $(log_hits "${log0}" "${RT_LINE_HEAD[${key}]}" | cut -f3 | cut -c1-200 | tr '\n' '|')"
+        mapfile -t lines < <(retry_hits "${log0}" "${RT_RETRY_HEAD[${key}]}" "${RT_RETRY_FULL[${key}]}" "${RT_RETRY_PENDING[${key}]}" | cut -f2)
+        echo "${TEST_NAME}: ${step}: ${role}: ${#lines[@]} retry line(s) of its retry timer (recorded)"
         for t in "${lines[@]}"; do
             n=$(( $(count_calls "${table}" "${srv}" "${id}" status "$(plus_s "${t}" -0.001)" "$(plus_s "${t}" "${LT_RETRY_READ_S}")") \
                 + $(count_calls "${table}" "${srv}" "${id}" get "$(plus_s "${t}" -0.001)" "$(plus_s "${t}" "${LT_RETRY_READ_S}")") ))
@@ -1562,7 +1777,7 @@ leg_launch_timeouts() {
 leg_restart_mid_launch() {
     local step="restart mid-launch" creds="${SCENARIO_ROOT}/credentials-rs" work log0 old_pid new_pid leg_start
     local l_ms l_s stopped_at restarted_at deadline out_at="" table="${SCENARIO_ROOT}/rs-calls.tsv" n verb
-    local spawn_at first_pane send posts=() lines=()
+    local spawn_at first_pane send old_log posts=() lines=()
 
     new_state_dir restart
     mkdir -m 700 "${creds}"
@@ -1650,11 +1865,22 @@ leg_restart_mid_launch() {
     n="$(count_calls "${table}" - "${Q_ID}" send-keys - "${out_at}")"
     (( n == 1 )) || fail "${step}: ${n} send-keys of ${Q_ID} by a CSCB process before the row left pending, not the lap's one"
     echo "${TEST_NAME}: ${step}: the new server's first read-pane +$(seconds_between "${l_s}" "${first_pane}")s, its send-keys +$(seconds_between "${l_s}" "${send}")s from the launch start"
-    # The old server's approver stopped at shutdown with no pending-row run after it (SRJ-404).
-    n="$(count_in <(head -n "${log0}" "${SLACK_STATE_DIR}/server.log") "$(matcher "${PENDING_ROW_HEAD} ${Q_REF} rule (")")"
-    (( n == 0 )) || fail "${step}: the old server logged ${n} pending-row rule run(s) for Q"
-    echo "${TEST_NAME}: ${step}: the old server's approver lines for Q (recorded): $(head -n "${log0}" "${SLACK_STATE_DIR}/server.log" | grep -F -- "${APPROVER_PREFIX}" | grep -F -- "${Q_REF}" | cut -c1-200 | tr '\n' '|')"
-    echo "${TEST_NAME}: ${step}: the new server's retry and pending-row lines for Q (recorded): $(log_hits "${log0}" "" | cut -f3 | grep -F -e "persona=${Q_KEY} " -e "${PENDING_ROW_HEAD} ${Q_REF}" | cut -c1-260 | tr '\n' '|')"
+    # The old server's approver stopped at shutdown and armed nothing
+    # (SRJ-404): its shutdown stop line for Q is in the old server's log, and
+    # no arm line for Q follows it there, neither armed nor refused as not
+    # armed (shutdown closes the retry controller before it stops the
+    # approvers, so an arm after the stop would log the not-armed line).
+    old_log="${SCENARIO_ROOT}/rs-old-server.log"
+    head -n "${log0}" "${SLACK_STATE_DIR}/server.log" > "${old_log}"
+    mapfile -t lines < <(grep -nxF -- "${Q_SHUTDOWN_STOP}" <(sed -E 's/^\[[^]]*\] //' "${old_log}") | cut -d: -f1)
+    (( ${#lines[@]} == 1 )) || fail "${step}: ${#lines[@]} shutdown stop line(s) of the approver for Q in the old server's log, not one"
+    n="$(tail -n "+$(( lines[0] + 1 ))" "${old_log}" | grep -cF -e "${RT_ARMED[${Q_KEY}]}" -e "${RT_NOT_ARMED[${Q_KEY}]}" || true)"
+    (( n == 0 )) || {
+        tail -n "+$(( lines[0] + 1 ))" "${old_log}" | grep -F -e "${RT_ARMED[${Q_KEY}]}" -e "${RT_NOT_ARMED[${Q_KEY}]}" | sed 's/^/  | /' >&2
+        fail "${step}: ${n} arm line(s) for Q after the old approver's shutdown stop"
+    }
+    echo "${TEST_NAME}: ${step}: the old server's approver lines for Q (recorded): $(grep -F -- "${APPROVER_PREFIX}" "${old_log}" | grep -F -- "${Q_REF}" | cut -c1-200 | tr '\n' '|')"
+    echo "${TEST_NAME}: ${step}: the new server's retry and pending-row lines for Q (recorded): $(log_hits "${log0}" "" | cut -f3 | grep -F -e "${RT_LINE_HEAD[${Q_KEY}]}" -e "${PENDING_ROW_HEAD} ${Q_REF}" | cut -c1-260 | tr '\n' '|')"
     # No post in the leg.
     mapfile -t posts < <(posts_to "" "${leg_start}")
     (( ${#posts[@]} == 0 )) || {
@@ -1811,7 +2037,7 @@ leg_fail_create() {
         printf '  | %s\n' "${lines[@]}" >&2
         fail "${step}: ${#lines[@]} find-missing call(s) in the leg not made by the bot server"
     }
-    echo "${TEST_NAME}: ${step}: F's retry timer (recorded): $(log_hits "${log0}" "[slack] unavailable-retry: persona=${F_KEY} " | cut -f3 | cut -c1-200 | tr '\n' '|')"
+    echo "${TEST_NAME}: ${step}: F's retry timer (recorded): $(log_hits "${log0}" "${RT_LINE_HEAD[${F_KEY}]}" | cut -f3 | cut -c1-200 | tr '\n' '|')"
     echo "${TEST_NAME}: ${step}: F's pending-row rule lines (recorded): $(log_hits "${log0}" "${PENDING_ROW_HEAD} ${F_REF} rule (" | cut -f3 | cut -c1-900 | tr '\n' '|')"
     echo "${TEST_NAME}: ${step}: F's collision lines (recorded): $(log_hits "${log0}" "[slack] spawnForPersona: collision resolved, state=" "for ${F_REF}" | cut -f3 | tr '\n' '|')"
     echo "${TEST_NAME}: ${step}: startup-errors.log lines naming F (recorded): $(grep -F -- "${F_REF}" "${SLACK_STATE_DIR}/startup-errors.log" 2> /dev/null | cut -c1-300 | tr '\n' '|')"
@@ -1869,8 +2095,8 @@ server_status_seen() {
 # arm stopped).
 st_timer_idle() {
     local armed stopped
-    armed="$(log_hits "$1" "[slack] unavailable-retry: persona=${S_KEY} armed" | wc -l)"
-    stopped="$(log_hits "$1" "[slack] unavailable-retry: persona=${S_KEY} stopped" | wc -l)"
+    armed="$(log_hits "$1" "${RT_ARMED[${S_KEY}]}" | wc -l)"
+    stopped="$(log_hits "$1" "${RT_STOPPED[${S_KEY}]}" | wc -l)"
     (( stopped >= armed ))
 }
 
@@ -1886,11 +2112,27 @@ st_session_gone() {
     ! has_session "$1"
 }
 
+# st_no_posts <step> <from-time>: the Slack stub's record holds no post with
+# S's tmux-unresponsive onset or the spawn-failure notice's first line, and
+# no post at all from <from-time> (epoch seconds) on.
+st_no_posts() {
+    local posts=()
+    mapfile -t posts < <(record_posts 1 | jq -c --arg o "${S_ONSET}" 'select((.text // "") | contains($o))')
+    (( ${#posts[@]} == 0 )) || fail "$1: ${#posts[@]} post(s) hold S's tmux-unresponsive onset"
+    mapfile -t posts < <(record_posts 1 | jq -c --arg h "${SPAWN_FAILURE_FIRST}" 'select((.text // "") | contains($h))')
+    (( ${#posts[@]} == 0 )) || fail "$1: ${#posts[@]} post(s) hold a spawn-failure notice"
+    mapfile -t posts < <(posts_to "" "$2")
+    (( ${#posts[@]} == 0 )) || {
+        printf '  | %s\n' "${posts[@]}" >&2
+        fail "$1: ${#posts[@]} post(s) reached the Slack stub's record after the pause"
+    }
+}
+
 leg_still_stopping() {
     local step="scenario 13" creds="${SCENARIO_ROOT}/credentials-st" work srv sid session pane_pid
     local t tick0 paused_at refusal_at release_at gone_at live_at next_tick gap retry_at get_at
     local resume1 resume2 table="${SCENARIO_ROOT}/st-calls.tsv" n verb hits connected
-    local lines=() resumes=() posts=()
+    local lines=() resumes=()
 
     new_state_dir paused
     mkdir -m 700 "${creds}"
@@ -1968,14 +2210,14 @@ leg_still_stopping() {
     [[ "${ROW_SID}" == "${sid}" ]] || fail "${step}: the waiting row's claude_session_id is '${ROW_SID}', not the paused row's ${sid}"
     wait_for_count "${connected}" 2 "${CONNECT_WAIT_S}" "${step}: the server never registered the resumed stub's session as S's"
 
-    # Step 7: the next health tick's read, then that tick's onset check.
+    # Step 7: the next health tick's read (its onset check is covered by the
+    # record checks run again after the server's stop).
     wait_until "$(( ST_TICK_S + 10 ))" "${step}: no health tick read S's status near ${ST_TICK_S}s after the first" \
         server_status_seen "${S_ID}" "$(plus_s "${tick0}" "$(( ST_TICK_S - ST_TICK_JITTER_S ))")"
     next_tick="$(server_status_after "${S_ID}" "$(plus_s "${tick0}" "$(( ST_TICK_S - ST_TICK_JITTER_S ))")")"
     gap="$(seconds_between "${tick0}" "${next_tick}")"
     awk -v g="${gap}" -v i="${ST_TICK_S}" -v j="${ST_TICK_JITTER_S}" 'BEGIN { exit !(g <= i + j) }' \
         || fail "${step}: the next tick's read of S came ${gap}s after the first, not within ${ST_TICK_JITTER_S}s of the interval ${ST_TICK_S}s"
-    sleep "${ST_TICK_SETTLE_S}"
 
     # Step 8: the checks, over the bot server's calls (`call_table`).
     call_table "${table}"
@@ -2002,20 +2244,21 @@ leg_still_stopping() {
     awk -v a="${resume1}" -v r="${refusal_at}" -v b="${resume2}" 'BEGIN { exit !(r + 0 >= a - 0.001 && r + 0 <= b + 0) }' \
         || fail "${step}: the refusal line is not between the two resumes"
     echo "${TEST_NAME}: ${step}: the refusal (recorded): $(cut -f3 <<< "${lines[0]}" | cut -c1-400)"
-    echo "${TEST_NAME}: ${step}: every server.log line naming S that carries the still-stopping phrase (recorded): $(log_hits 0 "${STILL_STOPPING}" | cut -f3 | grep -F -e "persona=${S_KEY}" -e "${S_REF}" | cut -c1-200 | tr '\n' '|')"
+    echo "${TEST_NAME}: ${step}: every server.log line naming S that carries the still-stopping phrase (recorded): $(log_hits 0 "${STILL_STOPPING}" | cut -f3 | naming_persona "${S_KEY}" "${S_REF}" | cut -c1-200 | tr '\n' '|')"
     # One get after the UNAVAILABLE outcome (SRJ-407): its line, and exactly
     # one bot-server get of S from the refused resume to that line.
-    mapfile -t lines < <(log_hits 0 "${GET_LINE_HEAD}" "resume of ${S_REF} ended in UNAVAILABLE (")
+    mapfile -t lines < <(log_hits 0 "${GET_HEAD}${RESUME_WHAT}${GET_OF[${S_KEY}]}${FORM_UNAVAILABLE_HEAD}")
     (( ${#lines[@]} == 1 )) || fail "${step}: ${#lines[@]} post-refusal get line(s) for S's resume, not one"
     get_at="$(cut -f2 <<< "${lines[0]}")"
-    echo "${TEST_NAME}: ${step}: the get line (recorded): $(cut -f3 <<< "${lines[0]}" | sed 's/ ended in UNAVAILABLE (.*): read / … read /' | cut -c1-400)"
+    echo "${TEST_NAME}: ${step}: the get line (recorded): $(cut -f3 <<< "${lines[0]}" | cut -c1-400)"
     n="$(count_calls "${table}" "${srv}" "${S_ID}" get "${resume1}" "${get_at}")"
     (( n == 1 )) || fail "${step}: ${n} bot-server get(s) of ${S_ID} between the refused resume and its get line, not one"
     # The retry: its line comes after the release (and after the worker's
     # session ended), and the second resume follows it, before the next tick.
-    retry_at="$(log_hits 0 "[slack] unavailable-retry: persona=${S_KEY} retry " | awk -F'\t' -v r="${refusal_at}" '$2 + 0 > r + 0 { print $2; exit }')"
+    retry_at="$(retry_hits 0 "${RT_RETRY_HEAD[${S_KEY}]}" "${RT_RETRY_FULL[${S_KEY}]}" "${RT_RETRY_PENDING[${S_KEY}]}" \
+        | awk -F'\t' -v r="${refusal_at}" '$2 + 0 > r + 0 { print $2; exit }')"
     [[ -n "${retry_at}" ]] || fail "${step}: no retry line for S after the refusal"
-    echo "${TEST_NAME}: ${step}: S's retry-timer lines (recorded): $(log_hits 0 "[slack] unavailable-retry: persona=${S_KEY} " | cut -f3 | cut -c1-200 | tr '\n' '|')"
+    echo "${TEST_NAME}: ${step}: S's retry-timer lines (recorded): $(log_hits 0 "${RT_LINE_HEAD[${S_KEY}]}" | cut -f3 | cut -c1-200 | tr '\n' '|')"
     awk -v r="${retry_at}" -v l="${release_at}" -v g="${gone_at}" 'BEGIN { exit !(l + 0 < r + 0 && g + 0 < r + 0) }' \
         || fail "${step}: the retry ($(seconds_between "${refusal_at}" "${retry_at}")s after the refusal) came before the release or before the worker's session ended"
     awk -v r="${retry_at}" -v b="${resume2}" -v s="${ST_LAUNCH_SLACK_S}" 'BEGIN { exit !(b + 0 > r - 0.001 && b - r <= s) }' \
@@ -2025,27 +2268,23 @@ leg_still_stopping() {
     awk -v b="${resume2}" -v l="${live_at}" 'BEGIN { exit !(b + 0 < l + 0) }' \
         || fail "${step}: the row read waiting before the second resume"
     echo "${TEST_NAME}: ${step}: from the tick read: pause +$(seconds_between "${tick0}" "${paused_at}")s, refused resume +$(seconds_between "${tick0}" "${resume1}")s, release +$(seconds_between "${tick0}" "${release_at}")s, retry +$(seconds_between "${tick0}" "${retry_at}")s, resume +$(seconds_between "${tick0}" "${resume2}")s, next tick +${gap}s"
-    echo "${TEST_NAME}: ${step}: S's tmux-unresponsive lines (recorded): $(log_hits 0 "persona=${S_KEY} " | cut -f3 | grep -F " tmux-unresponsive " | cut -c1-200 | tr '\n' '|')"
+    echo "${TEST_NAME}: ${step}: S's tmux-unresponsive lines (recorded): $(log_hits 0 "${TU_HEAD[${S_KEY}]}" | cut -f3 | cut -c1-200 | tr '\n' '|')"
     # No post: no onset, alert or spawn-failure notice, and nothing else.
-    mapfile -t posts < <(record_posts 1 | jq -c --arg o "${S_ONSET}" 'select((.text // "") | contains($o))')
-    (( ${#posts[@]} == 0 )) || fail "${step}: ${#posts[@]} post(s) hold S's tmux-unresponsive onset"
-    mapfile -t posts < <(record_posts 1 | jq -c --arg h "${SPAWN_FAILURE_FIRST}" 'select((.text // "") | contains($h))')
-    (( ${#posts[@]} == 0 )) || fail "${step}: ${#posts[@]} post(s) hold a spawn-failure notice"
-    mapfile -t posts < <(posts_to "" "${paused_at}")
-    (( ${#posts[@]} == 0 )) || {
-        printf '  | %s\n' "${posts[@]}" >&2
-        fail "${step}: ${#posts[@]} post(s) reached the Slack stub's record after the pause"
-    }
+    st_no_posts "${step}" "${paused_at}"
     # Ruling S3: after the second resume no server.log line naming S has a
     # reconnect, relaunch, restart scheduling or not-connected text.
     hits="$(log_hits 0 "" | awk -F'\t' -v b="${resume2}" '$2 + 0 > b + 0' | cut -f3 \
-        | grep -F -e "persona=${S_KEY}" -e "${S_REF}" | grep -iE "${HOLD_TROUBLE}" || true)"
+        | naming_persona "${S_KEY}" "${S_REF}" | grep -iE "${HOLD_TROUBLE}" || true)"
     if [[ -n "${hits}" ]]; then
         sed 's/^/  | /' <<< "${hits}" >&2
         fail "${step}: after the second resume the server logged a reconnect, relaunch or not-connected line for S (ruling S3)"
     fi
 
+    # The record checks again once the server has stopped: any post the
+    # next tick's onset check made is in the record by then (shutdown ends
+    # every episode silently, and the Slack stub still runs).
     stop_server
+    st_no_posts "${step}: after the server's stop" "${paused_at}"
     end_worker "${S_ID}" "${step}: the end"
     stop_tracked_pid "${SLACK_STUB_PID}" 10 "${step}: the Slack stub did not exit on SIGTERM"
 }
