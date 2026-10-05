@@ -134,6 +134,15 @@
  *   AD_ERROR_CLASS_UNUSABLE_NAME                 src/ad-error-class.ts, CSCB's class for an
  *                                                unusable recorded name, as fmk-driver.ts's
  *                                                outcome line gives it (`class=<class>`)
+ * Scenario 20's entries (test-23):
+ *   DEFAULT_AD_SETTINGS <table> <key>            src/ad-settings.ts, one of agent-director's
+ *                                                default settings (for example `tmux
+ *                                                starting_session_seconds`), in decimal
+ *   RECHECK_VERDICT_STILL_LATCHED                src/conflict-latch.ts, a probe's verdict that
+ *                                                keeps the latch (a probe round's answer)
+ *   PANE_READ_PANE, PANE_READ_CONFLICT, PANE_READ_GONE
+ *                                                src/pane-read.ts, the `read-pane` answer kinds
+ *                                                a probe round's answer names
  * The body entries print a body without the persona prefix; wrap one in
  * `formatPersonaNotice <persona-name> <entry> …` for the posted text.
  *
@@ -663,6 +672,25 @@ function adSettingsDefaultMs(name: string): Entry {
   }
 }
 
+/** pane-read.ts's `read-pane` answer kinds a probe round's answer names, each printed as it is. */
+const PANE_READ_KIND_NAMES: readonly string[] = ['PANE_READ_PANE', 'PANE_READ_CONFLICT', 'PANE_READ_GONE']
+
+/** `DEFAULT_AD_SETTINGS[<table>][<key>]` (ad-settings.ts): one of agent-director's default settings, in decimal. */
+const defaultAdSetting: Entry = {
+  synopsis: '<table> <key>',
+  async print(args, context) {
+    const entry = 'DEFAULT_AD_SETTINGS'
+    expectArguments(entry, args, ['table', 'key'])
+    const [table, key] = args
+    const defaults = await packageExport(context, 'ad-settings.ts', entry)
+    const tableValues = typeof defaults === 'object' && defaults !== null && Object.hasOwn(defaults, table) ? (defaults as Record<string, unknown>)[table] : undefined
+    if (typeof tableValues !== 'object' || tableValues === null) usageFail(`${entry}: '${table}' is not a table of agent-director's default settings`)
+    const value = Object.hasOwn(tableValues, key) ? (tableValues as Record<string, unknown>)[key] : undefined
+    if (typeof value === 'bigint' || (typeof value === 'number' && Number.isFinite(value))) return String(value)
+    usageFail(`${entry}: '${table} ${key}' is not a numeric default setting`)
+  },
+}
+
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = {
   // Scenario 8 (test-20-fmk-old-binary.sh).
@@ -697,6 +725,10 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   adLaunchBoundMs: adSettingsDefaultMs('adLaunchBoundMs'),
   // Scenario 25 (test-27-fmk-unusable-name.sh).
   AD_ERROR_CLASS_UNUSABLE_NAME: constantEntry('ad-error-class.ts', 'AD_ERROR_CLASS_UNUSABLE_NAME'),
+  // Scenario 20 (test-23-fmk-latch-recheck.sh).
+  DEFAULT_AD_SETTINGS: defaultAdSetting,
+  RECHECK_VERDICT_STILL_LATCHED: constantEntry('conflict-latch.ts', 'RECHECK_VERDICT_STILL_LATCHED'),
+  ...constantEntries('pane-read.ts', PANE_READ_KIND_NAMES),
 }
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */

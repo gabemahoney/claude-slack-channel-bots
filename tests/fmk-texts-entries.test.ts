@@ -51,6 +51,7 @@ import * as adVersionGate from '../src/ad-version-gate.ts'
 import * as conflictLatch from '../src/conflict-latch.ts'
 import * as installCheckLabels from '../src/install-check-labels.ts'
 import * as invalidFlagsHold from '../src/invalid-flags-hold.ts'
+import * as paneRead from '../src/pane-read.ts'
 import * as personaIdentity from '../src/persona-identity.ts'
 import * as personaNotifier from '../src/persona-notifier.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
@@ -68,6 +69,7 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'conflict-latch.ts': conflictLatch,
   'install-check-labels.ts': installCheckLabels,
   'invalid-flags-hold.ts': invalidFlagsHold,
+  'pane-read.ts': paneRead,
   'persona-identity.ts': personaIdentity,
   'persona-notifier.ts': personaNotifier,
 }
@@ -344,6 +346,19 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
       expect(names.length).toBeGreaterThan(0)
       const read = new Set(reading.refs.filter((r) => r.file === file && r.kind === 'constant').map((r) => r.name))
       expect(names.filter((n) => !read.has(n))).toEqual([])
+    }
+  })
+
+  test("scenario 20's entries are read: the pane-read answer kinds, the probe's still-latched verdict and the default settings table", () => {
+    const named = new Set(reading.refs.map((r) => `${r.file}:${r.name}:${r.kind}`))
+    for (const ref of [
+      'pane-read.ts:PANE_READ_PANE:constant',
+      'pane-read.ts:PANE_READ_CONFLICT:constant',
+      'pane-read.ts:PANE_READ_GONE:constant',
+      'conflict-latch.ts:RECHECK_VERDICT_STILL_LATCHED:constant',
+      'ad-settings.ts:DEFAULT_AD_SETTINGS:defined',
+    ]) {
+      expect(named.has(ref)).toBe(true)
     }
   })
 

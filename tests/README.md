@@ -300,6 +300,21 @@ tests/
                                    # `pause` waits out its 30 s timeout. The harness runs no `find-missing`. Modes: tmux shim `log`, the stub's
                                    # dev-channels hold, `health_check_interval` 0, agent-director's defaults (no config.toml). It runs about 9 minutes and
                                    # ends with the three closing assertions
+    test-23-fmk-latch-recheck.sh  # HO §7 scenario 20 (b.jg5 SRJ-1422), fmk: each latch case is re-checked with exactly its call
+                                   # Part 2's cases, one persona each: no valid instance id, a different instance id, another agent-director store,
+                                   # left over from an earlier life, the scan's refusal with no row, "duplicate session" with the row `ended`, this
+                                   # row's own id, the agent's pane was not found, and the unusable recorded name. The script header holds the per-case
+                                   # table (each case's set-up step, round call and clear), the lives, the waits and the runtime. Checks: with
+                                   # `health_check_interval` 0, each re-check, 120 s apart, is one `status` read of the row plus exactly SRJ-505's
+                                   # call for its case and nothing else, counted from the agent-director shim's log (CSCB-parented lines only); at
+                                   # least two still-latched rounds per case; a same-case re-refusal posts nothing; each case latches with exactly one
+                                   # post; the cadence retries clear with no CSCB `find-missing` before them; each probe clear makes exactly one
+                                   # `find-missing` and one retry; each clear makes one recovery post; the unusable recorded name is re-checked by
+                                   # `status` alone and stays latched to the end. Finished rows come from the stub's exit (`stub_type_exit`: the
+                                   # worker's SessionEnd hooks make agent-director mark the row `ended`); no step passes `--include-finished`. The
+                                   # harness runs no `find-missing`. Modes: tmux shim `log`, the stub's dev-channels hold (and report-in at once for
+                                   # the pane-not-found persona's relaunch), agent-director's defaults (no config.toml). It runs about 17 minutes and
+                                   # ends with a plain `stop`, then the three closing assertions
     test-27-fmk-unusable-name.sh  # HO §7 scenario 25 (b.jg5 SRJ-1427), fmk: an unusable recorded name latches with no tmux call; after the harness's delete it clears and comes up fresh
                                    # Set-up: in the first life persona `unusable` (U) reaches `waiting`; the harness types the stub's exit sentinel into its
                                    # pane (a human quitting Claude Code), so the row ends; then `stop --stop-bots`. With the server stopped, E39's scenario
