@@ -82,9 +82,11 @@
  *   {"event":"upload"} / {"event":"stop"}
  *
  * `api` lines also carry `channel`, `user` and `text` when the request has
- * them (`text` with token-like text replaced by `<token>`, at most 300
- * characters) and `args_token_like` (whether any argument held token-like
- * text). No token value is ever written or printed: only its kind (`bot`,
+ * them, and `args_token_like` (whether any argument held token-like text).
+ * `text` always has token-like text replaced by `<token>`, before it is
+ * written. A `chat.postMessage` text is then recorded whole, so a scenario
+ * can compare a posted notice in full; every other method's `text` is cut to
+ * at most 300 characters. No token value is ever written or printed: only its kind (`bot`,
  * `app`, `user`, `other`, `none`) and the first 12 hex digits of its SHA-256.
  * The control's `suffix` values are not written either.
  *
@@ -186,8 +188,16 @@ function tokenHash(token: string): string {
   return createHash('sha256').update(token).digest('hex').slice(0, 12)
 }
 
-function redactText(text: string): string {
-  return text.replace(TOKEN_LIKE_ALL, '<token>').slice(0, 300)
+/** The Web API method whose `text` is recorded whole: the posts scenarios compare in full. */
+const WHOLE_TEXT_METHOD = 'chat.postMessage'
+
+/** The most characters of `text` recorded for any other method. */
+const RECORDED_TEXT_MAX = 300
+
+/** `text` as `method`'s record line carries it: token-like text replaced, then cut unless the method's text is kept whole. */
+function recordedText(method: string, text: string): string {
+  const redacted = text.replace(TOKEN_LIKE_ALL, '<token>')
+  return method === WHOLE_TEXT_METHOD ? redacted : redacted.slice(0, RECORDED_TEXT_MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -441,7 +451,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
       }
       if (args.channel !== undefined) fields.channel = args.channel
       if (args.user !== undefined) fields.user = args.user
-      if (args.text !== undefined) fields.text = redactText(args.text)
+      if (args.text !== undefined) fields.text = recordedText(method, args.text)
       fields.args_token_like = Object.entries(args).some(([k, v]) => k !== 'token' && TOKEN_LIKE.test(v))
 
       const answer = (name: string, body: Record<string, unknown> | undefined, status = 200): Response => {
