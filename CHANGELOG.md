@@ -4,7 +4,11 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ---
 
-## Unreleased (next patch version)
+## Unreleased
+
+---
+
+## 0.11.1 (2026-10-06)
 
 - Docs: the switch-over runbook no longer refers to an agent-director install-gate record; the go-ahead is the operator's and is recorded in the switch-over log.
 
