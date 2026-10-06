@@ -4,7 +4,13 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ---
 
-## Unreleased (next major version)
+## Unreleased (next patch version)
+
+- Docs: the switch-over runbook no longer refers to an agent-director install-gate record; the go-ahead is the operator's and is recorded in the switch-over log.
+
+---
+
+## 0.11.0 (2026-10-06)
 
 This release replaces the single-bot setup with **personas**, and runs them on agent-director Phase 1. It is a breaking release: an existing install is converted by hand and switched over together with agent-director, by the runbook at the end of this entry, before the server starts again.
 
@@ -137,13 +143,15 @@ Never reinstall the old CSCB onto the migrated store. At the restart in step 4 o
 2. A host with no agent-director installs agent-director's Phase 1 release by agent-director's own install, then publishes. It has no agents and nothing to back up.
 3. A host below the client's minimum (0.7.0) publishes from another host, and is not a target of this runbook: it brings agent-director to 0.10.0 first, outside this runbook, since step 1 stops on any version but 0.10.0. This block gives no command for it.
 
-A publishing host needs no install-gate go line.
+A publishing host needs no operator go-ahead.
 
 #### Step 1: Check the host and stage the release
 
 Do this beforehand, with the old CSCB running and still installed as the global package. Nothing goes down in this step.
 
-1. **The go line.** Confirm that agent-director's Phase 1 install-gate record has this host's dated go line. It is written before the Phase 1 install and is the approval for the switch-over. If it does not, stop here, before anything goes down. This runbook never writes the go line.
+1. **The go-ahead (operator action).** Confirm the go-ahead for the switch-over on this host, and record it in the switch-over log. The go-ahead is the approval for the switch-over. If there is no go-ahead, stop here, before anything goes down.
+
+   The go-ahead is the operator's decision, and agent-director ships no install-gate file or record. agent-director's Phase 1 install gate is the set of CSCB fixes that must be in place on a host before Phase 1 is installed there. This release, installed together with agent-director Phase 1 as this runbook does, meets it.
 2. **agent-director's version.** Run `agent-director version` in the bot server's launcher environment, as the workers' user, the same as the Claude Code check below, and confirm that it shows 0.10.0, the only supported starting point. If it does not, stop here, before anything goes down. A host on an earlier version (below 0.7.0, or 0.7.0 to 0.9.x) first brings agent-director to 0.10.0, outside this runbook; this step names no command for it.
 3. **The tmux socket (operator action).** Pin the tmux socket for the bot server's launcher, the host's sweep schedule and the workers. The sweep schedule is whatever runs `agent-director find-missing` on a schedule on your host: a cron entry, a systemd timer or a loop script. Run `tmux display-message -p '#{socket_path}'` from the bot server's launcher, the sweep schedule's environment and a worker's. Confirm that all three print the same path, that it is the pinned path (a `TMUX_TMPDIR` that names a missing path falls back silently to `/tmp`), and that the three share one HOME. A host with no sweep schedule checks the other two, and runs the one step 11 adds in the same environment. Record the result in the switch-over log.
 4. **tmux.** Confirm tmux 3.2 or later, with `remain-on-exit` off.
@@ -226,9 +234,9 @@ Steps 4, 7 and 8 of [Upgrading to personas](README.md#upgrading-to-personas) bel
 
 #### Step 8: Install agent-director Phase 1
 
-1. **The go line.** Confirm that the install-gate record has this host's dated go line.
+1. **The go-ahead (operator action).** Confirm that the go-ahead for this host still stands, and record it in the switch-over log.
 
-   **No go.** If it does not, there is no Phase 1 install. Reinstall the previous CSCB, the version step 1 recorded, with the `config.json`, crontable, `/interject` callers, `access.json` and Slack token environment variables saved in step 1. Start it on 0.10.0 and re-enable its autostart (operator action). Every other agent this step already stopped is started again on 0.10.0 by its owner (operator action). The runbook stops there.
+   **No go.** If there is no go-ahead, there is no Phase 1 install. Reinstall the previous CSCB, the version step 1 recorded, with the `config.json`, crontable, `/interject` callers, `access.json` and Slack token environment variables saved in step 1. Start it on 0.10.0 and re-enable its autostart (operator action). Every other agent this step already stopped is started again on 0.10.0 by its owner (operator action). The runbook stops there.
 2. **Stop every other agent (operator action).** Otherwise, before the install, stop every other agent on the host: orchestrators' workers, hand-started sessions and sessions with an `agent-director serve`. Confirm with `agent-director list` that each stopped agent's row reads `ended` or `missing` (a row that 0.10.0 left stuck live for a dead agent is expected), and with a read-only `tmux ls` that no agent session is left. Record it in the switch-over log. An agent that cannot be stopped means "no go".
 3. **Back up the store.** Back up `~/.agent-director/state.db` with an online-consistent copy, sqlite3's `.backup`, not a plain file copy, because the store runs in WAL mode:
    ```sh
@@ -252,7 +260,7 @@ Every other agent on the host is started again by its owner (operator action), w
    claude-slack-channel-bots start
    ```
    The first start has no last-applied record yet, so it checks `config.json`, records it and applies it; after that, edits wait until you apply them (see [Reload](README.md#reload)). Each persona starts fresh once. Pre-persona rows are kept and never resumed.
-3. **The post-install check (operator action).** Once every agent has been started again, confirm that `agent-director list --state pending` shows a `launch_started_at` on every row. Record the result in the switch-over log, and as this host's dated post-install check line in agent-director's install-gate record. A row without one is a human's to look at, and the persona whose row it is is held (see "A persona posts a *Held: launch start not recorded* notice" and "How a hold ends" in [Troubleshooting](README.md#troubleshooting)).
+3. **The post-install check (operator action).** Once every agent has been started again, confirm that `agent-director list --state pending` shows a `launch_started_at` on every row. Record the result in the switch-over log. A row without one is a human's to look at, and the persona whose row it is is held (see "A persona posts a *Held: launch start not recorded* notice" and "How a hold ends" in [Troubleshooting](README.md#troubleshooting)).
 
 #### Step 11: Schedule the daily expire
 

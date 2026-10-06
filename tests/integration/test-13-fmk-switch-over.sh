@@ -32,8 +32,9 @@
 #   labels service=cscb and channel=<channel id>, no persona label), each with
 #   a running stub worker. No pre-persona server is started.
 # - The loopback Slack stub runs with --record; it maps the personas' fake
-#   tokens. The harness writes the fixture install-gate record, holding this
-#   container's dated go line; no runbook step writes it.
+#   tokens. The harness, playing the operator, records the operator's dated
+#   go-ahead for this container as an entry in the switch-over log; the
+#   go-ahead is the operator's own, and no runbook step writes that entry.
 # - The build under test is unpacked from the image's package-under-test
 #   tarball into the staging directory (nothing runs from it), so the runbook
 #   the script follows is the staged release's own README; step 1 finishes
@@ -49,9 +50,10 @@
 # asks for goes to the switch-over log, a file under SCENARIO_ROOT.
 #
 # SRJ-1402's substitutions (kind: where; what replaces the host-only part):
-#   install-gate-fixture       steps 1, 8, 10: the go line is read from, and
-#                              the post-install check line written to, the
-#                              fixture install-gate record
+#   operator-go-ahead          steps 1, 8: the operator's go-ahead is the
+#                              entry the harness, playing the operator,
+#                              records in the switch-over log before step 1;
+#                              steps 1 and 8 read it from there
 #   container-settings         steps 1, 8: the timing settings are the
 #                              container's (the scenario HOME's
 #                              ~/.agent-director/config.toml, through
@@ -85,8 +87,10 @@
 #   expire-skipped             step 11: the daily `expire` schedule
 #
 # The steps (SRJ-1108):
-#   1   the go line; `agent-director version` (0.10.0, behind the shim, from
-#       the scenario's shell); C7 from the CSCB launcher's environment, the
+#   1   the go-ahead, confirmed in the switch-over log (none fails the run
+#       there: "no go") and recorded; `agent-director version` (0.10.0,
+#       behind the shim, from the scenario's shell); C7 from the CSCB
+#       launcher's environment, the
 #       find-missing loop's environment and a seeded worker's environment
 #       (one socket path, the pinned one under SCENARIO_ROOT, one HOME); tmux
 #       3.2 or later with remain-on-exit off; the staging (dependencies
@@ -115,8 +119,10 @@
 #       file written by the new CLI's `credentials`; the crontable targets and
 #       `/interject` callers rewritten to name personas; the new install check
 #       passing on the still-installed 0.10.0 with its Phase 1 note.
-#   8   the go line; the harness's stop of other agents (none; every non-CSCB
-#       row ended or missing, no tmux session left); the store's online
+#   8   the go-ahead, confirmed as still standing in the switch-over log (none
+#       fails the run there: "no go") and recorded; the harness's stop of
+#       other agents (none; every non-CSCB row ended or missing, no tmux
+#       session left); the store's online
 #       backup (`ad_store_backup`); the release's install.sh, run in the
 #       scenario HOME as the runbook's install command (`install_ad_release`:
 #       --binary at the image's release binary, --admin-binary at its
@@ -147,8 +153,8 @@
 #       server's first read-pane of it after its spawn to the server's first
 #       send-keys of it, by their shim lines) shows the row; how many samples
 #       showed each row pending, and how many fell inside that stretch, are
-#       recorded. The post-install check line is written to the fixture
-#       record. Then leg A's checks.
+#       recorded. The post-install check is recorded in the switch-over log,
+#       as the runbook says, and nowhere else. Then leg A's checks.
 #   11  the expire and prompt-wording substitutions.
 #
 # Leg A's checks (SRJ-1402, AC 12), each its own `fail` naming the persona or
@@ -375,11 +381,10 @@ CLI_NAME="$(tarball_field "${PACKAGE_TGZ}" '.bin | keys[0]')"
 # The scenario's names, files and bounds
 # ---------------------------------------------------------------------------
 
-# The host's own files: the install-gate record, the switch-over log, the
-# staged persona configuration, the crontable prompts, the /interject callers,
-# the token variables and the rollback copies.
+# The host's own files: the switch-over log (which holds the operator's
+# go-ahead), the staged persona configuration, the crontable prompts, the
+# /interject callers, the token variables and the rollback copies.
 HOST_DIR="${SCENARIO_ROOT}/host"
-INSTALL_GATE_RECORD="${HOST_DIR}/install-gate-record"
 SWITCH_LOG="${HOST_DIR}/switch-over.log"
 STAGED_CONFIG="${HOST_DIR}/config.persona.json"
 INTERJECT_CALLERS="${HOST_DIR}/interject-callers.sh"
@@ -469,7 +474,7 @@ RUNBOOK_CURRENT=""
 RUNBOOK_COUNT=""
 
 # The substitution kinds SRJ-1402 allows (see the table in the header).
-SUBSTITUTION_KINDS=(install-gate-fixture container-settings one-socket claude-code-check-skipped
+SUBSTITUTION_KINDS=(operator-go-ahead container-settings one-socket claude-code-check-skipped
     staging-build-under-test slack-fixtures prompt-wording-skipped autostart-skipped
     harness-stops-agents release-install-script no-agents-restarted container-list expire-skipped)
 
@@ -946,11 +951,14 @@ mkdir -p "${HOST_DIR}" "${COPIES_DIR}" "${STATE_DIR}" "${STAGING_DIR}" "${BUN_CA
 : > "${SUBSTITUTIONS}" || fail "setup: could not create ${SUBSTITUTIONS}"
 export SLACK_STATE_DIR="${STATE_DIR}"
 
-# The fixture install-gate record: this container's dated go line, written by
-# the harness, never by a runbook step.
+# The operator's go-ahead for the switch-over on this container: the harness,
+# playing the operator, records it in the switch-over log before step 1,
+# never in a runbook step. Steps 1 and 8 read it from there; with none, the
+# run fails there ("no go"). GO_AHEAD_ENTRY is the line `record` writes.
 HOST_NAME="$(cat /proc/sys/kernel/hostname)" || fail "setup: could not read the host name"
-GO_LINE="$(date -u +%F) ${HOST_NAME} go: agent-director Phase 1 install approved (fixture)"
-printf '%s\n' "${GO_LINE}" | write_file "${INSTALL_GATE_RECORD}"
+GO_AHEAD="$(date -u +%F) ${HOST_NAME}: the switch-over to agent-director Phase 1 approved (the operator's, given by the harness)"
+record "go-ahead: ${GO_AHEAD}"
+GO_AHEAD_ENTRY="[setup] go-ahead: ${GO_AHEAD}"
 
 # The loopback Slack stub: each persona's token pair answered ok, any other
 # token refused.
@@ -1088,10 +1096,10 @@ tar -xzf "${PACKAGE_TGZ}" -C "${STAGING_DIR}" --no-same-owner || fail "setup: co
 
 runbook_step 1
 
-grep -qxF "${GO_LINE}" "${INSTALL_GATE_RECORD}" \
-    || fail "step 1: the install-gate record has no dated go line for ${HOST_NAME}"
-record "go line: ${GO_LINE}"
-runbook_substitute 1 install-gate-fixture "the go line is read from the fixture install-gate record the harness wrote"
+grep -qxF "${GO_AHEAD_ENTRY}" "${SWITCH_LOG}" \
+    || fail "step 1: the switch-over log holds no go-ahead for ${HOST_NAME}: no go, stopping before anything goes down"
+record "go-ahead confirmed: ${GO_AHEAD}"
+runbook_substitute 1 operator-go-ahead "the operator's go-ahead is the switch-over log entry the harness recorded before step 1"
 
 ad_capture version
 (( AD_RC == 0 )) || fail "step 1: agent-director version exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
@@ -1398,10 +1406,10 @@ record "install check: OK on ${SCENARIO_AD_010_VERSION}, with its Phase 1 note"
 # ---------------------------------------------------------------------------
 
 runbook_step 8
-grep -qxF "${GO_LINE}" "${INSTALL_GATE_RECORD}" \
-    || fail "step 8: the install-gate record has no dated go line for ${HOST_NAME}"
-record "go line: ${GO_LINE}"
-runbook_substitute 8 install-gate-fixture "the go line is read from the fixture install-gate record"
+grep -qxF "${GO_AHEAD_ENTRY}" "${SWITCH_LOG}" \
+    || fail "step 8: the switch-over log no longer holds the go-ahead for ${HOST_NAME}: no go, no Phase 1 install"
+record "go-ahead still stands: ${GO_AHEAD}"
+runbook_substitute 8 operator-go-ahead "the operator's go-ahead is the switch-over log entry the harness recorded before step 1"
 
 # The harness's stop of every other agent: none is seeded.
 list_rows "step 8" "${SCENARIO_ROOT}/rows-step8.json"
@@ -1543,12 +1551,11 @@ for id in "${PERSONA_IDS[@]}"; do
     record "the trail for row ${id}: ${TRAIL_NOTE}"
 done
 result="every pending row in ${SAMPLES} sample(s) of agent-director list --state pending has a launch_started_at; ${seen}"
+# The post-install check's result goes to the switch-over log, as the runbook
+# says, and nowhere else.
 record "post-install check: ${result}"
 echo "${TEST_NAME}: step 10: ${result}"
-printf '%s %s post-install check: %s\n' "$(date -u +%F)" "${HOST_NAME}" "${result}" >> "${INSTALL_GATE_RECORD}" \
-    || fail "step 10: could not write the post-install check line"
 runbook_substitute 10 container-list "the launch-start check reads the container's agent-director list"
-runbook_substitute 10 install-gate-fixture "the post-install check line is written to the fixture install-gate record"
 
 # ---------------------------------------------------------------------------
 # Leg A

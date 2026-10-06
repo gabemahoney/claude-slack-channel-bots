@@ -70,7 +70,9 @@
  *   debugging, install and setup skills, docs/architecture.md,
  *   docs/engineering-guide.md and CHANGELOG.md), read for SRJ-1107's checks:
  *   no "Upgrade steps" heading or link and no "checks its tmux session first"
- *   in any of them; the CHANGELOG release entry's elements, one case each
+ *   in any of them; the CHANGELOG release entry (the 0.11.0 entry, found by
+ *   its version and publish date, never by its place; it alone holds the
+ *   runbook copies) and its elements, one case each
  *   (exactly one unreleased entry, first; the breaking note's parts; the
  *   retired access file kept until rollback is no longer wanted and never
  *   deleted; the relaunch through agent-director; the dropped tmux-commands
@@ -80,6 +82,13 @@
  *   exports; the two runbook copies, which join `SWITCH_OVER_CARRIERS` and
  *   `ROLLBACK_CARRIERS`, name the README as the maintained copy and match it
  *   word for word; and every CHANGELOG link resolves (hatch A3).
+ * - Bug b.7sd (SRD A-19): no operator text, the CHANGELOG read as its
+ *   release entry, nor any other shipped skill file or the registry-install
+ *   runbook names an agent-director install-gate record (or any gate
+ *   record), go line or post-install check line for the operator to read or
+ *   write (only step 1's "agent-director ships no install-gate file or
+ *   record" passes); self-checked on 0.11.0's runbook wording and on new
+ *   forms, a denial by any other "no" among them.
  * - E36 T1's checks, also read through `OPERATOR_TEXTS`: no operator text
  *   quotes a sentence of the *Kill failed* or *Process outlived kill* alert
  *   but its title and closing sentences (the E20 note; both versions rendered
@@ -194,7 +203,7 @@
  * CHANGELOG.md and docs/ are not shipped descriptions: the forbidden-term
  * audit still reads only `SHIPPED_TEXTS`, which holds neither. Besides the
  * two docs read through `OPERATOR_TEXTS`, the one docs/ file read is
- * docs/registry-install-runbook.md, for its links.
+ * docs/registry-install-runbook.md, for its links and bug b.7sd's check.
  *
  * Reads repo files resolved from this file's location, so the working
  * directory doesn't matter. The one writer is the complete-example load: it
@@ -2214,7 +2223,8 @@ const OPERATOR_ACTION = '(operator action)'
  * One row per SRJ-1108 element: where it sits (`frame`, `step <n>` or
  * `step <n> › <item lead>`), the element, and the items its text must hold.
  * The `operator action` rows mark each operator-only action SRJ-1108 names
- * (C6, C7, C15, the §6 prompt, the host's autostart for CSCB) at its step.
+ * (C6, C7, C15, the go-ahead of steps 1 and 8 (A-19), the §6 prompt, the
+ * host's autostart for CSCB) at its step.
  */
 const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly Item[]][] = [
   // The section-level statements.
@@ -2245,12 +2255,16 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
   ['step 1', 'beforehand, with the old CSCB running and still installed as the global package', [
     ci('beforehand, with the old CSCB running and still installed as the global package'),
   ]],
-  ['step 1 › The go line', "the install-gate record's dated go line, the approval, written before the install; stop before anything goes down; the runbook never writes it", [
-    ci("install-gate record has this host's dated go line"),
-    ci('written before the Phase 1 install'),
-    ci('the approval for the switch-over'),
-    ci('stop here, before anything goes down'),
-    ci('never writes the go line'),
+  ['step 1 › The go-ahead', "the operator's go-ahead for the switch-over on this host, the approval, confirmed and recorded in the switch-over log; with none, stop before anything goes down (A-19)", [
+    ci('confirm the go-ahead for the switch-over on this host, and record it in the switch-over log'),
+    ci('the go-ahead is the approval for the switch-over'),
+    ci('if there is no go-ahead, stop here, before anything goes down'),
+  ]],
+  ['step 1 › The go-ahead', 'operator action: the go-ahead (C15; A-19)', [OPERATOR_ACTION]],
+  ['step 1 › The go-ahead', "the go-ahead is the operator's decision and agent-director ships no install-gate file or record; the install gate is the CSCB fixes Phase 1 needs on a host, which this release installed with Phase 1 meets (A-19; bug b.7sd)", [
+    ci("the go-ahead is the operator's decision, and agent-director ships no install-gate file or record"),
+    ci("agent-director's Phase 1 install gate is the set of CSCB fixes that must be in place on a host before Phase 1 is installed there"),
+    ci('this release, installed together with agent-director Phase 1 as this runbook does, meets it'),
   ]],
   ["step 1 › agent-director's version", `\`agent-director version\` in the launcher environment as the workers' user shows ${OLD_AD_VERSION}, the only supported starting point; stop before anything goes down; no command for an earlier version`, [
     code('agent-director version'),
@@ -2441,9 +2455,12 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
   ]],
   ['step 7', 'from this step the new CSCB is deployed but not started', [ci('from this step the new CSCB is deployed but not started')]],
   ['step 7', `the conversion steps kept in "${UPGRADING_TITLE}" are linked (SRJ-1103; the E35 T1 PM note)`, [upgradingLink]],
-  ['step 8', "the install-gate record's dated go line confirmed", [ci("confirm that the install-gate record has this host's dated go line")]],
+  ['step 8 › The go-ahead', "the go-ahead for this host confirmed as still standing, and recorded in the switch-over log (A-19)", [
+    ci('confirm that the go-ahead for this host still stands, and record it in the switch-over log'),
+  ]],
+  ['step 8 › The go-ahead', 'operator action: confirming the go-ahead (A-19)', [OPERATOR_ACTION]],
   ['step 8', `"no go": no Phase 1 install; the previous CSCB back with step 1's files, started on ${OLD_AD_VERSION}, autostart re-enabled, the stopped agents started again; the runbook stops`, [
-    ci('if it does not, there is no Phase 1 install'),
+    ci('if there is no go-ahead, there is no Phase 1 install'),
     ci('with the `config.json`, crontable, `/interject` callers, `access.json` and Slack token environment variables saved in step 1'),
     ci(`start it on ${OLD_AD_VERSION} and re-enable its autostart`),
     ci(`every other agent this step already stopped is started again on ${OLD_AD_VERSION} by its owner`),
@@ -2513,16 +2530,16 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci('each persona starts fresh once'),
     ci('pre-persona rows are kept and never resumed'),
   ]],
-  ['step 10 › The post-install check', 'once every agent is started again, every pending row shows launch_started_at; recorded in the log and as the dated post-install check line; a row without one held', [
+  ['step 10 › The post-install check', 'once every agent is started again, every pending row shows launch_started_at; the result recorded in the switch-over log only (A-19); a row without one held', [
     ci('once every agent has been started again'),
     code('agent-director list --state pending'),
     ci('shows a `launch_started_at` on every row'),
-    ci('record the result in the switch-over log'),
-    ci("as this host's dated post-install check line in agent-director's install-gate record"),
+    // The full stop: the record goes to the switch-over log and nowhere else.
+    ci('record the result in the switch-over log.'),
     ci("a row without one is a human's to look at"),
     ci('the persona whose row it is is held'),
   ]],
-  ['step 10 › The post-install check', 'operator action: the post-install check line (C15)', [OPERATOR_ACTION]],
+  ['step 10 › The post-install check', 'operator action: the post-install check (C15)', [OPERATOR_ACTION]],
   ['step 11', `a daily agent-director expire at the default retention, never ${vocab('expireAll')}, as the workers' user in the pinned tmux environment`, [
     ci(`schedule a daily \`agent-director expire\` at the default retention, never ${vocab('expireAll')}`),
     ci("as the workers' user in the tmux environment step 1 pinned"),
@@ -2684,7 +2701,7 @@ const PUBLISHING_HOST_ELEMENTS: [element: string, required: readonly Item[]][] =
     ci(`brings agent-director to ${OLD_AD_VERSION} first, outside this runbook, since step 1 stops on any version but ${OLD_AD_VERSION}`),
     ci('gives no command for it'),
   ]],
-  ['a publishing host needs no install-gate go line', [ci('a publishing host needs no install-gate go line')]],
+  ['a publishing host needs no operator go-ahead', [ci('a publishing host needs no operator go-ahead')]],
 ]
 
 /** The step reader's helper, loaded in the `/ci` image from `/tests`, which holds `tests/` without `src/` or the repo's `node_modules`. */
@@ -2823,9 +2840,9 @@ describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-
       expect(read().steps[0]).not.toContain(term)
     })
 
-    test.each(SWITCH_OVER_CARRIERS)("%s: step 1's version check comes right after the go-line item, before anything else", (_name, read) => {
+    test.each(SWITCH_OVER_CARRIERS)("%s: step 1's version check comes right after the go-ahead item, before anything else", (_name, read) => {
       const items = stepItems(read().steps[0])
-      expect(items.findIndex((item) => item.text.includes('dated go line'))).toBe(0)
+      expect(items.findIndex((item) => item.text.includes('Confirm the go-ahead for the switch-over on this host'))).toBe(0)
       expect(items.findIndex((item) => item.text.includes(code('agent-director version')))).toBe(1)
     })
 
@@ -2836,10 +2853,10 @@ describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-
       },
     )
 
-    test.each(SWITCH_OVER_CARRIERS)('%s: step 8 confirms the go line, stops the agents, backs up, installs, writes [tmux] and restarts serve, in that order', (_name, read) => {
+    test.each(SWITCH_OVER_CARRIERS)('%s: step 8 confirms the go-ahead, stops the agents, backs up, installs, writes [tmux] and restarts serve, in that order', (_name, read) => {
       const step = read().steps[7]
       const order = [
-        ci("this host's dated go line"),
+        ci('confirm that the go-ahead for this host still stands'),
         ci('stop every other agent on the host'),
         ci(vocab('sqliteBackup')),
         ci('schema migration adds'),
@@ -3567,11 +3584,39 @@ describe('the runbooks name no host-specific path (b.3ut)', () => {
 // The CHANGELOG release entry (b.jg5 SRJ-1107; hatch A3), read through OPERATOR_TEXTS
 // ---------------------------------------------------------------------------
 
-/** The CHANGELOG's release entry: the first `##` section's body. Throws when the file has no `##` heading. */
+/**
+ * The release that introduced the switch-over and rollback runbooks (b.jg5
+ * SRJ-1107). Its CHANGELOG entry, the release entry, carries the two runbook
+ * copies and the release notes SRJ-1107 checks. A later runbook change is
+ * made in that copy in place, and the file's first, unreleased entry says
+ * what changed (the doc-writing guide's "Release notes (CHANGELOG.md)").
+ */
+const RUNBOOK_RELEASE_VERSION = '0.11.0'
+
+/** A published release's `##` heading title: its version, then its publish date (`0.11.0 (2026-10-06)`). */
+function publishedTitle(version: string): RegExp {
+  return new RegExp(`^${escapeRegExp(version)} \\(\\d{4}-\\d{2}-\\d{2}\\)$`)
+}
+
+/**
+ * The 0-based line range `[start, end)` of the CHANGELOG's release entry,
+ * found by its version, never by its place in the file: the one `##` section
+ * titled `RUNBOOK_RELEASE_VERSION` and its publish date. Throws unless
+ * exactly one `##` heading is.
+ */
+function releaseEntryRange(changelog: string): { start: number; end: number } {
+  const title = publishedTitle(RUNBOOK_RELEASE_VERSION)
+  const found = headings(changelog).filter((h) => h.level === 2 && title.test(h.title))
+  if (found.length !== 1) {
+    throw new Error(`${CHANGELOG_FILE} has ${found.length} \`##\` entries titled ${RUNBOOK_RELEASE_VERSION} and its publish date, expected 1`)
+  }
+  return sectionRange(changelog, found[0].text)!
+}
+
+/** The CHANGELOG's release entry (`releaseEntryRange`): its body, heading line excluded. */
 function releaseEntry(changelog: string): string {
-  const first = headings(changelog).find((h) => h.level === 2)
-  if (first === undefined) throw new Error(`${CHANGELOG_FILE} has no \`##\` release entry`)
-  return requiredSection(changelog, first.text, CHANGELOG_FILE)
+  const { start, end } = releaseEntryRange(changelog)
+  return changelog.split('\n').slice(start + 1, end).join('\n')
 }
 
 /** The release entry's notes: the entry without its two runbook copies, so a note is never found in a runbook's words. */
@@ -3846,6 +3891,7 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
     const REVERTS: [element: string, how: string, edit: (text: string) => string][] = [
       [RELEASE_ENTRY_CHECKS[0][0], 'an earlier release entry placed first', (text) => text.replace(/^## /m, '## 1.0.0\n\nAn earlier release.\n\n## ')],
       [RELEASE_ENTRY_CHECKS[0][0], 'a second unreleased entry', (text) => `${text}\n## Unreleased (patch)\n\nMore.\n`],
+      [RELEASE_ENTRY_CHECKS[0][0], 'the unreleased entry published, none left', (text) => text.replace(/^## Unreleased\b.*$/m, '## 0.11.1 (2026-10-07)')],
       ...BREAKING_NOTE.map(([part]): [string, string, (text: string) => string] => [`the breaking note: ${part}`, "the breaking note dropped, as in b.ob2's entry", breakingNote]),
       ['`access.json` is kept until rollback is no longer wanted, because the previous CSCB reads it', 'the keep sentence dropped', (text) =>
         text.replace(/ Keep `access\.json` until rollback is no longer wanted, because the previous CSCB reads it\./, '')],
@@ -3884,6 +3930,25 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
   })
 
   describe('the runbook copies (SRJ-1107; hatch A3: the README is the maintained copy)', () => {
+    test.each(RUNBOOK_COPIES)(`the copy of "%s" sits in the ${RUNBOOK_RELEASE_VERSION} entry, the release that introduced it, and nowhere else in the file`, (_title, heading) => {
+      const text = changelog()
+      const { start, end } = releaseEntryRange(text)
+      expect(headings(text).filter((h) => h.text === heading).map((h) => h.line > start && h.line < end)).toEqual([true])
+    })
+
+    test('self-check: the release entry is found by its version and publish date, not by its place', () => {
+      const text = changelog()
+      expect(releaseEntry(text.replace(/^## /m, '## 0.12.0 (2026-11-01)\n\nA later release.\n\n## '))).toBe(releaseEntry(text))
+      const undated = text.replace(new RegExp(`^## ${escapeRegExp(RUNBOOK_RELEASE_VERSION)} \\(.*$`, 'm'), `## ${RUNBOOK_RELEASE_VERSION}`)
+      expect(undated).not.toBe(text)
+      expect(() => releaseEntry(undated)).toThrow(
+        `${CHANGELOG_FILE} has 0 \`##\` entries titled ${RUNBOOK_RELEASE_VERSION} and its publish date, expected 1`,
+      )
+      expect(() => releaseEntry(`${text}\n## ${RUNBOOK_RELEASE_VERSION} (2026-10-07)\n\nAgain.\n`)).toThrow(
+        `${CHANGELOG_FILE} has 2 \`##\` entries titled ${RUNBOOK_RELEASE_VERSION} and its publish date, expected 1`,
+      )
+    })
+
     test.each(RUNBOOK_COPIES)('the copy of "%s" names the README section as the maintained copy, by a link that resolves', (title, heading) => {
       const units = textUnits(requiredSection(releaseEntry(changelog()), heading, CHANGELOG_FILE)).filter((unit) => MAINTAINED_COPY.test(unit))
       expect(units).toHaveLength(1)
@@ -3922,6 +3987,118 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
     ])('self-check: %s fails naming the link', (_label, text, problem) => {
       expect(brokenRepoLinks(CHANGELOG_FILE, text).broken).toEqual([problem])
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Bug b.7sd: no operator text sends the operator to an agent-director
+// install-gate record. agent-director ships none (SRD A-19); the go-ahead is
+// the operator's, recorded in the switch-over log.
+// ---------------------------------------------------------------------------
+
+/**
+ * An agent-director install-gate file, record, line, entry or log (the install
+ * gate's own one too), or a gate record by any other name, matched across a
+ * line wrap. An operator text names one only in step 1's denial, which
+ * `SHIPS_NO_DENIAL` passes.
+ */
+const INSTALL_GATE_ARTIFACT: Term = [
+  'an install-gate file, record, line or entry, or a gate record',
+  /\b(?:install[-\s]gate(?:['’]s)?\s+(?:files?|records?|lines?|entr(?:y|ies)|logs?)|gate(?:['’]s)?\s+records?)\b/gi,
+]
+
+/**
+ * Step 1's sanctioned denial, "agent-director ships no install-gate file or
+ * record", as the text right before an `INSTALL_GATE_ARTIFACT` hit (across a
+ * line wrap). Only a hit it ends right before passes; one after any other
+ * "no" ("has no", "there is no") is reported.
+ */
+const SHIPS_NO_DENIAL = /\bagent-director\s+ships\s+no\s+$/i
+
+/**
+ * The lines 0.11.0's runbook had the operator read from and write to that
+ * record: this host's dated go line (steps 1 and 8, the publishing host) and
+ * its dated post-install check line (step 10). No operator text names either,
+ * denied or not.
+ */
+const INSTALL_GATE_LINES: readonly Term[] = [
+  ['a go line', /\bgo[-\s]lines?\b/gi],
+  ['a post-install check line', /\bpost-install\s+check\s+lines?\b/gi],
+]
+
+/** Each `INSTALL_GATE_ARTIFACT` hit in `text` (the text `file`) not right after `SHIPS_NO_DENIAL`, then each `INSTALL_GATE_LINES` hit. Pure. */
+function installGateHits(file: string, text: string): TermHit[] {
+  const denied = (index: number) => SHIPS_NO_DENIAL.test(text.slice(Math.max(0, index - 64), index))
+  return [
+    ...findTermsAt(file, text, [INSTALL_GATE_ARTIFACT]).filter(({ index }) => !denied(index)),
+    ...findTermsAt(file, text, INSTALL_GATE_LINES),
+  ].map(({ hit }) => hit)
+}
+
+/** `text` with every line outside `range` blanked, so a check reads only that range and still names each hit by its line in the file. */
+function onlyLines(text: string, range: { start: number; end: number }): string {
+  return text
+    .split('\n')
+    .map((line, i) => (i >= range.start && i < range.end ? line : ''))
+    .join('\n')
+}
+
+/**
+ * The texts an operator reads for the switch-over, [name, text]: every
+ * operator text (`OPERATOR_TEXTS`), the CHANGELOG read as its release entry
+ * only (the runbook copies and their release's notes; a later entry may say
+ * what changed), every other shipped skill file, and the registry-install
+ * runbook, which a publishing host follows.
+ */
+const SWITCH_OVER_OPERATOR_TEXTS: [name: string, read: () => string][] = [
+  ...OPERATOR_TEXTS.map(([name, read]): [string, () => string] =>
+    name === CHANGELOG_FILE
+      ? [`${CHANGELOG_FILE} (its ${RUNBOOK_RELEASE_VERSION} entry)`, () => {
+          const text = read()
+          return onlyLines(text, releaseEntryRange(text))
+        }]
+      : [name, read]),
+  ...shippedSkillFiles()
+    .filter((file) => !OPERATOR_TEXTS.some(([name]) => name === file))
+    .map((file): [string, () => string] => [file, () => readRepoFile(file)]),
+  ['docs/registry-install-runbook.md', () => readRepoFile('docs/registry-install-runbook.md')],
+]
+
+describe('bug b.7sd: no operator text sends the operator to an agent-director install-gate record (SRD A-19)', () => {
+  test.each(SWITCH_OVER_OPERATOR_TEXTS)('%s: names no install-gate record, go line or post-install check line for the operator to read or write', (name, read) => {
+    expect(installGateHits(name, read()).map(formatHit)).toEqual([])
+  })
+
+  // 0.11.0's runbook wording, which these cases report (bug b.7sd).
+  test.each([
+    [
+      "step 1's go-line item",
+      "1. **The go line.** Confirm that agent-director's Phase 1 install-gate record has this host's dated go line. It is written before the Phase 1 install and is the approval for the switch-over. If it does not, stop here, before anything goes down. This runbook never writes the go line.",
+      ['install-gate record', 'go line', 'go line', 'go line'],
+    ],
+    ["step 8's go-line item", "1. **The go line.** Confirm that the install-gate record has this host's dated go line.", ['install-gate record', 'go line', 'go line']],
+    [
+      "step 10's post-install record",
+      "Record the result in the switch-over log, and as this host's dated post-install check line in agent-director's install-gate record.",
+      ['install-gate record', 'post-install check line'],
+    ],
+    ["the publishing host's go line", 'A publishing host needs no install-gate go line.', ['go line']],
+    ['a record named across a line wrap', "Record it in agent-director's install-gate\n   record.", ['install-gate record']],
+    ['an install-gate file to check', "Check the install-gate file for this host's entry.", ['install-gate file']],
+    // After a "no" that is not step 1's denial, and by other names.
+    ['a missing record entry to stop on', 'If this host has no install-gate record entry, stop here, before anything goes down.', ['install-gate record']],
+    ['a missing entry that stops the install', 'If there is no install-gate entry for this host, there is no Phase 1 install.', ['install-gate entry']],
+    ["agent-director's gate record to check", "Check agent-director's gate record for this host.", ['gate record']],
+    ["the install gate's record to confirm", "Confirm the install gate's record has this host's approval.", ["install gate's record"]],
+  ])("self-check: 0.11.0's or a new form, %s, is reported", (_label, text, matches) => {
+    expect(installGateHits('README.md', text).map((hit) => hit.match)).toEqual(matches)
+  })
+
+  test.each([
+    ['as written', "The go-ahead is the operator's decision, and agent-director ships no install-gate file or record. agent-director's Phase 1 install gate is the set of CSCB fixes that must be in place on a host before Phase 1 is installed there."],
+    ['across a line wrap', "The go-ahead is the operator's decision, and agent-director ships\n   no install-gate file or record."],
+  ])("self-check: step 1's statement that agent-director ships no install-gate file or record passes, %s", (_label, statement) => {
+    expect(installGateHits('README.md', statement)).toEqual([])
   })
 })
 
@@ -5195,7 +5372,7 @@ const SWITCH_OVER_CARRIER_FILES: readonly string[] = SWITCH_OVER_CARRIERS.map(([
  * of switch-over `steps`: each step's heading line to the end of its text, as
  * the shared step reader (`runbookSteps`) reads the file's first
  * `SWITCH_OVER_HEADING` section (the README's, or the CHANGELOG release
- * entry's copy, the file's first entry) with all `SWITCH_OVER_STEP_COUNT`
+ * entry's copy, the only one in the file) with all `SWITCH_OVER_STEP_COUNT`
  * steps. Throws naming the file when the section is missing, and the file,
  * the section and the step as the reader does.
  */

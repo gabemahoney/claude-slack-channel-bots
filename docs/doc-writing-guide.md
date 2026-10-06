@@ -26,7 +26,8 @@
 
 ### Release notes (CHANGELOG.md)
 - Target audience: operators upgrading from an earlier release
-- Covers: what's new, breaking changes, and the coupled switch-over and rollback runbooks copied from the README, under one "Unreleased" heading, the file's first `##` entry, until the release is cut
+- Covers: what's new and breaking changes, one `##` entry per release. The next release's notes go under one "Unreleased" heading, the file's first `##` entry, until the release is cut; a published release's heading is its version and publish date, as in `## 0.11.0 (2026-10-06)`
+- The coupled switch-over and rollback runbooks, copied from the README, sit in the 0.11.0 entry, the release that introduced them. A later runbook change is made in that copy in place, and the "Unreleased" entry says what changed
 - No "Upgrade steps" section: the two runbooks are the upgrade and its way back. No operator text (the README, the three skills, `docs/architecture.md`, `docs/engineering-guide.md`, the CHANGELOG) has a heading of that title or a link to one
 - The README's two runbook sections are the maintained copy. Change the README first, then the CHANGELOG copy: each copy opens with one line naming its README section as the maintained copy, by a `README.md#` link, and otherwise matches the README section word for word, headings included. A same-file link to a runbook heading stays a same-file link to the copy's own heading; only a link to a README section the CHANGELOG does not carry is written as a `README.md#` link. Like the README, a copy says "the Slack token environment variables" and never names one
 - A retired file the previous release reads is kept until rollback is no longer wanted. That file's bullet under Breaking changes says so, with the reason (the previous CSCB reads it), and nothing in the file tells the operator to delete it

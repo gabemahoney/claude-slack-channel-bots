@@ -273,7 +273,7 @@ tests/
                                    # its conversation kept, its row `pending` until it reports in) and leg C puts 0.10.0 behind the shim and checks that `start --live`
                                    # refuses it once (one `ad-below-phase1-floor` entry, nothing at the Slack stub, only `version` calls), then puts the release
                                    # back (see Scenario 1: the switch-over (Test 13)).
-                                   # Its host files sit under SCENARIO_ROOT/host: the fixture install-gate record, the switch-over log, the staged persona
+                                   # Its host files sit under SCENARIO_ROOT/host: the switch-over log (holding the operator's go-ahead), the staged persona
                                    # configuration, the crontable's prompt files, the `/interject` caller file, the token variables file, the store backup
                                    # and the rollback copies; the crontable is in the state directory
     test-14-fmk-kill-fails.sh      # HO §7 scenarios 16, 2 and 15, in that order (b.jg5 SRJ-1403, SRJ-1417), fmk: a kill that really fails deletes and launches
@@ -659,9 +659,10 @@ shim, with no store until 0.10.0's first `spawn`. Setup then:
 - seeds the fleet with `seed_prepersona_fleet`, one row per routed channel
   named and labelled as 0.10.0 does, each with a running stub worker, and
   starts no pre-persona server;
-- starts the loopback Slack stub with `--record`, writes the fixture
-  install-gate record (this container's dated go line) and unpacks the build
-  under test into a staging directory.
+- starts the loopback Slack stub with `--record`, records the operator's
+  dated go-ahead for this container as an entry in the switch-over log (the
+  harness plays the operator; the go-ahead is the operator's own) and unpacks
+  the build under test into a staging directory.
 
 Following the runbook. Each step is entered once, in order, through
 `runbook_step <n>`, which reads the step titles from the package's own README
@@ -674,17 +675,20 @@ section. Every record a step asks for goes to the switch-over log.
 
 | Step | Substitutions declared |
 |---|---|
-| 1 | `install-gate-fixture`, `one-socket`, `claude-code-check-skipped`, `staging-build-under-test`, `container-settings`, `slack-fixtures`, `prompt-wording-skipped` |
+| 1 | `operator-go-ahead`, `one-socket`, `claude-code-check-skipped`, `staging-build-under-test`, `container-settings`, `slack-fixtures`, `prompt-wording-skipped` |
 | 2 | `autostart-skipped` |
 | 3 to 6 | none |
 | 7 | `staging-build-under-test`, `slack-fixtures` |
-| 8 | `install-gate-fixture`, `harness-stops-agents`, `release-install-script`, `container-settings` |
+| 8 | `operator-go-ahead`, `harness-stops-agents`, `release-install-script`, `container-settings` |
 | 9 | `no-agents-restarted` |
-| 10 | `prompt-wording-skipped`, `autostart-skipped`, `container-list`, `install-gate-fixture` |
+| 10 | `prompt-wording-skipped`, `autostart-skipped`, `container-list` |
 | 11 | `expire-skipped`, `prompt-wording-skipped` |
 
 Points where the script meets the runbook:
 
+- Steps 1 and 8 confirm the go-ahead (`operator-go-ahead`): each fails the
+  run unless the switch-over log still holds the go-ahead entry the harness
+  recorded before step 1 ("no go"), then records the confirmation there.
 - Step 3 runs the old package's own `stop --stop-bots` through the old CLI
   (`cscb_run`), against the seeded fleet on 0.10.0.
 - Step 7 points the global install's agent-director override at the
@@ -718,9 +722,9 @@ Points where the script meets the runbook:
   samples show it). Every sample taken wholly inside the stretch the row
   provably read `pending`, from the bot server's first `read-pane` of it
   after its spawn to the server's first `send-keys` of it (by their shim
-  lines), must show the row. The post-install check line in the fixture
-  record states how many samples showed each row `pending` and how many fell
-  inside that stretch.
+  lines), must show the row. The post-install check, recorded in the
+  switch-over log as the runbook says and nowhere else, states how many
+  samples showed each row `pending` and how many fell inside that stretch.
 
 Health ticks run through config: the persona configuration sets
 `health_check_interval` (shorter than leg A's wait) and
