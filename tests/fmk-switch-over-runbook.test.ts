@@ -63,9 +63,12 @@ interface Substitution {
  * cleanup) and 11 ("hold until after"). By ruling, the build under test that
  * step 1 stages and the Slack fixtures are declared at step 7 too, where the
  * staged build is installed and the credentials files are written.
+ *
+ * Step 10's post-install check is recorded in the switch-over log as the
+ * runbook says; it is no substitution.
  */
 const SUBSTITUTIONS: readonly Substitution[] = [
-  { step: 1, kind: 'install-gate-fixture', basis: 'the install-gate record checks of steps 1 and 8 read a fixture record' },
+  { step: 1, kind: 'operator-go-ahead', basis: 'the harness records the operator go-ahead in the switch-over log, and the go-ahead checks of steps 1 and 8 read it from there' },
   { step: 1, kind: 'one-socket', basis: "the C7 socket pinning and its display-message check run against the container's one tmux socket" },
   { step: 1, kind: 'claude-code-check-skipped', basis: "step 1's Claude Code check is skipped (the container's workers are stub-claude.sh)" },
   { step: 1, kind: 'staging-build-under-test', basis: "step 1's staging stages the build under test" },
@@ -75,7 +78,7 @@ const SUBSTITUTIONS: readonly Substitution[] = [
   { step: 2, kind: 'autostart-skipped', basis: 'the host-autostart steps 2 and 10 are skipped' },
   { step: 7, kind: 'staging-build-under-test', basis: "step 1's staging stages the build under test (installed at step 7, by ruling)" },
   { step: 7, kind: 'slack-fixtures', basis: "Slack apps and token variables are the container's fixtures (the credentials files of step 7, by ruling)" },
-  { step: 8, kind: 'install-gate-fixture', basis: 'the install-gate record checks of steps 1 and 8 read a fixture record' },
+  { step: 8, kind: 'operator-go-ahead', basis: 'the harness records the operator go-ahead in the switch-over log, and the go-ahead checks of steps 1 and 8 read it from there' },
   { step: 8, kind: 'harness-stops-agents', basis: "step 8's stop of every other agent is the harness's" },
   {
     step: 8,
@@ -87,7 +90,6 @@ const SUBSTITUTIONS: readonly Substitution[] = [
   { step: 10, kind: 'prompt-wording-skipped', basis: 'the §6 prompt wording is skipped (worker cleanup)' },
   { step: 10, kind: 'autostart-skipped', basis: 'the host-autostart steps 2 and 10 are skipped' },
   { step: 10, kind: 'container-list', basis: "step 10's launch-start check reads the container's list" },
-  { step: 10, kind: 'install-gate-fixture', basis: "step 10's post-install check line is written to the fixture record" },
   { step: 11, kind: 'expire-skipped', basis: "step 11's expire schedule is skipped" },
   { step: 11, kind: 'prompt-wording-skipped', basis: 'the §6 prompt wording is skipped ("hold until after")' },
 ]

@@ -56,8 +56,10 @@ availability, finished-work audit, and the `/ci` Docker suite).
 Release notes live in `CHANGELOG.md` at the repo root, under an "Unreleased"
 heading until the release is cut. `/publish` does not read that file: the
 release commit and the annotated `v<version>` tag `/publish prepare` creates
-both stay `Release v<version>`. It is not in `package.json`'s `files`, so the
-npm tarball does not carry it.
+both stay `Release v<version>`. Once the release is published, rename its
+"Unreleased" heading to the version and publish date by hand, as in
+`## 0.11.0 (2026-10-06)`. `CHANGELOG.md` is not in `package.json`'s `files`,
+so the npm tarball does not carry it.
 
 > **Version note.** `/publish prepare` does **not** publish the in-tree
 > `package.json` version as it stands — it runs `npm version <kind>` against it,
