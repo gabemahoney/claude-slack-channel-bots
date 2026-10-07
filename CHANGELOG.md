@@ -6,6 +6,43 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+This release adds a second channel mode, fungible mode, beside the declarative mode of 0.11.x. It is not breaking: a 0.11.x configuration loads unchanged and runs in declarative mode.
+
+### Two channel modes
+
+The top-level setting `allow_invited_channels` picks the channel mode for every persona at once. See [Channel modes](README.md#channel-modes) and [What each mode serves](README.md#what-each-mode-serves).
+
+- **Declarative mode** (`allow_invited_channels` absent or `false`, the default) is the behaviour of 0.11.1: each persona serves only the channels listed in its `channels`, each at its `delivery`.
+- **Fungible mode** (`allow_invited_channels: true`):
+  - `channels` and the top-level `permission_prompts` are not read;
+  - each persona serves every public or private channel its Slack app is a member of that Slack does not mark as externally shared;
+  - a channel is served at `mentions` unless the persona's agent stored `all` for it with `set_channel_delivery` (see [Channel delivery in fungible mode](README.md#channel-delivery-in-fungible-mode));
+  - each stored choice persists in `channel-delivery.json` in the state directory, beside `config.json`;
+  - the persona's permission prompts and notices go to its `invited.permission_prompts`, `"dm"` when it is absent (see [Permission prompts in fungible mode](README.md#permission-prompts-in-fungible-mode));
+  - Slack enforces channel membership for the persona's outbound calls.
+- **The switch changes through a pending change and its confirmation,** with no restart, in either direction. See [Turning fungible mode on or off](README.md#turning-fungible-mode-on-or-off).
+- **Before turning fungible mode on,** read [Who can reach a persona in fungible mode](README.md#who-can-reach-a-persona-in-fungible-mode): an invite then changes who can reach a persona's worker.
+
+### Upgrading from 0.11.x
+
+- **Upgrades stay declarative, with no migration.** A 0.11.x `config.json` loads unchanged, in declarative mode, and nothing rewrites it. Fungible mode begins only when you set `allow_invited_channels` to `true`.
+- **No Slack change.** Neither mode needs a new Slack scope, a manifest change or a Slack app re-install.
+
+### What the persona's agent sees
+
+- **A new tool, `set_channel_delivery`,** with two inputs: `channel`, a channel ID, and `delivery`, `mentions` or `all`. In fungible mode it stores the persona's channel delivery for that channel. In declarative mode it is listed in every session and every call is refused.
+- **One session instructions text** serves both modes.
+- **Tool targets per mode, and Slack's refusals as tool errors,** are described in [Tools](README.md#tools), with its note on the permission prompt the new tool can raise.
+
+### Downgrading from this release
+
+The README's [Downgrading to an earlier release](README.md#downgrading-to-an-earlier-release) is the maintained text. An earlier release's loader rejects `allow_invited_channels` and `invited` as unknown keys, and a restarted server runs the last-applied record, so the record must not hold either key when the older build starts. A host whose `config.json` has never held either key downgrades as from any release: install the older build and restart the server on it. Otherwise, follow these steps in order, with the server running:
+
+1. **Give every persona a valid declarative section.** Turning fungible mode off is checked by the declarative rules, so each persona needs a `permission_prompts`, and `channels` unless its `dm.enabled` is `true`, that pass them (see [Load-time rules](README.md#load-time-rules)).
+2. **Remove `allow_invited_channels` and every persona's `invited` from `config.json`.**
+3. **Confirm the pending change, and wait for its `reload-applied` or `reload-noop` line** (see [Confirming a change](README.md#confirming-a-change)). Either one means the last-applied record holds the configuration without the two keys. A host that was already in declarative mode confirms as `reload-noop`.
+4. **Install the older build and restart the server on it.** For example, `bun install -g claude-slack-channel-bots@<version>`, then `claude-slack-channel-bots stop` and `claude-slack-channel-bots start`. The older build ignores `channel-delivery.json`, so the file can stay where it is.
+
 ---
 
 ## 0.11.1 (2026-10-06)
