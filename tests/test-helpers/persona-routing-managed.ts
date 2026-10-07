@@ -1,7 +1,8 @@
 /**
  * test-helpers/persona-routing-managed.ts — The real inbound routing module
  * over the real connection manager's seams, built as `src/server.ts` builds
- * it (b.av2 SR-3.1, SR-4.1, SR-4.2 step 2).
+ * it (b.av2 SR-3.1, SR-4.1 with b.deo SRI-301 and SRI-302, SR-4.2 step 2
+ * with b.deo SRI-303 to SRI-309).
  *
  * `makeManagedRouting(h, baseDir, opts?)` takes a connection harness
  * (`makeConnectionHarness`) and builds `createPersonaRouting` with the same
