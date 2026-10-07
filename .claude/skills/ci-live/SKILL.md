@@ -168,7 +168,9 @@ installed Google Chrome, headless; no browser download):
    - `--provision-only [--stage apps|install|tokens|channels]`: provisioning only.
    - `--only 1,2,5`: run only these checks. The pre-flight, install, setup and
      Check 1 always run, as later checks need their state, and so do 29a,
-     Teardown and HOST; every other check reports `SKIPPED (not selected)`.
+     Teardown and HOST, and Check 34 whenever any of Checks 30 to 33 is
+     selected (it undoes their state); every other check reports
+     `SKIPPED (not selected)`.
    - `--create-apps`: let a real run create the four apps when there is no
      `apps.json` (only when the apps are really gone from the workspace).
    - `--keep-container`: leave the container for inspection (remove it with
@@ -272,6 +274,17 @@ installed Google Chrome, headless; no browser download):
    "Prompt guard" section (its check, persona and command): a denial fails
    nothing, but it shows a bot Claude's detour.
 
+   After a PASS or a FAIL, also relay Check 33's recorded outcomes from
+   `results.md`: each note in Check 33's row that starts `Check 33 residual:`
+   (one each for `react`, `edit_message on C's earlier post` and
+   `fetch_messages with thread_ts`, saying `accepted`, `refused by Slack
+   (<code>)`, `refused with no Slack code`, `made, with no result` or `not
+   made`), word for word. They are recorded, never judged: every call Slack
+   accepted is a residual the README must state before the release. Relay
+   Check 33's two refusal-code notes from the same row word for word too:
+   `reply: refused by Slack (<code>)` and `fetch_messages without thread_ts:
+   refused by Slack (<code>)`.
+
 ## Maintenance commands
 
 Each takes the real run lock (never while a run is going), runs in the
@@ -329,4 +342,7 @@ Check 14's first-time user is new to this run's server: it is
 transcript already names the account. Checks 16 and 20 judge only what
 follows their first ask. Part 1.5 and Check 25 are done by the runner with config edits
 instead of the wizard (noted in the results). The run leaves the apps and
-channels in place for the next run.
+the three provisioned channels in place for the next run. It also creates
+one public channel of its own for Checks 30–34
+(`cscb-live-invited-<RUN_ID>`), which Check 34 archives, so archived run
+channels build up in the test workspace.

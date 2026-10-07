@@ -19,8 +19,9 @@
  *   --stage <stage>    run only that provisioning stage (implies
  *                      --provision-only; not with --dry-run)
  *   --only <ids>       run only these checks (for example 1,2,S2); the others
- *                      are SKIPPED (not selected), except the prerequisites
- *                      and the always-run checks
+ *                      are SKIPPED (not selected), except the prerequisites,
+ *                      the always-run checks, and Check 34 whenever any of
+ *                      Checks 30 to 33 is selected (it undoes their state)
  *   --keep-container   leave the test container for inspection
  *   --clean            remove the results dir when the run passes
  *   --create-apps      let a real run create the four test apps when no

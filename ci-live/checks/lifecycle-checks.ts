@@ -1,8 +1,10 @@
 /**
- * lifecycle-checks.ts — testplans/b.yko Parts 8–11: the lost message (24,
- * with its setup and teardown), runtime add and remove (25–27), the reboot
- * (28, a `docker restart` of the container with the start-at-boot marker
- * set) and the closing secrecy check (29a), plus the optional 26 and 29b.
+ * lifecycle-checks.ts — testplans/b.yko Parts 8–10 and 12: the lost message
+ * (24, with its setup and teardown), runtime add and remove (25–27), the
+ * reboot (28, a `docker restart` of the container with the start-at-boot
+ * marker set) and the closing secrecy check (29a), plus the optional 26 and
+ * 29b. Part 11's invited-channel checks (30–34) live in invited-checks.ts and
+ * run between Check 28 and the closing checks (`CLOSING_CHECKS`).
  */
 
 import { isFrom, messageText } from '../lib/human-session.ts'
@@ -508,7 +510,7 @@ export const check28: CheckDef<CheckContext> = {
 }
 
 // ---------------------------------------------------------------------------
-// Part 11
+// Part 12
 // ---------------------------------------------------------------------------
 
 /** The per-file counts `leakcount` prints: `tokens checked: N`, then `<file>: <n|absent>`. */
@@ -559,6 +561,26 @@ export function personaCountsProblem(letter: string, value: string | undefined):
   return `persona ${letter}: malformed transcript count (${what} is not "<transcripts> <dispatched>")`
 }
 
+/**
+ * The state files Check 29a's token-shape count and leak count read, as shell
+ * words for its `F=(…)` array: the config, the record, the pending file and
+ * the stored-choice file the server writes in fungible mode (b.deo SRI-401,
+ * SRI-1501; b.av2 AC 20), the server logs, the startup-errors log, the
+ * permission trail and the boot-start log. An absent file (the pending file
+ * after a clean run, the stored-choice file in a dry run or a run with no
+ * fungible mode) is no finding.
+ */
+export const CHECK29A_STATE_FILES: readonly string[] = [
+  '"$S/config.json"',
+  '"$S/config.json.last-applied"',
+  '"$S/config.json.pending"',
+  '"$S/channel-delivery.json"',
+  '"$S"/server.log*',
+  '"$S/startup-errors.log"',
+  '"$S/permission-trail.jsonl"',
+  '~/cscb-live/boot-start.log',
+]
+
 export const check29a: CheckDef<CheckContext> = {
   id: '29a',
   title: 'Check 29a: no credential in any file the run wrote (AC 20), plus the host-side scan of the results',
@@ -568,9 +590,8 @@ export const check29a: CheckDef<CheckContext> = {
   always: true,
   async run(ctx) {
     const f = new Findings()
-    const files = '"$S/config.json" "$S/config.json.last-applied" "$S/config.json.pending" "$S"/server.log* "$S/startup-errors.log" "$S/permission-trail.jsonl" ~/cscb-live/boot-start.log'
     const script = [
-      `F=(${files})`,
+      `F=(${CHECK29A_STATE_FILES.join(' ')})`,
       "mapfile -d '' T < <(find ~/.claude/projects/ -path '*-cscb-live-[abcd]/*' -name '*.jsonl' -print0 2>/dev/null)",
       'echo "TRANSCRIPTS=${#T[@]}"',
       // Per persona: its transcripts, and how many messages the server dispatched to it (all of server.log*).
@@ -645,4 +666,8 @@ export const check29b: CheckDef<CheckContext> = {
   run: async () => pass([]),
 }
 
-export const LIFECYCLE_CHECKS = [check24Setup, check24, check24Teardown, check25, check26, check27, check28, check29a, check29b]
+/** Parts 8–10, in run order. */
+export const LIFECYCLE_CHECKS = [check24Setup, check24, check24Teardown, check25, check26, check27, check28]
+
+/** Part 12, the closing checks: they run last, after every check that writes logs or files (b.deo SRI-1501). */
+export const CLOSING_CHECKS = [check29a, check29b]

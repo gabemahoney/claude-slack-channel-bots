@@ -4,6 +4,12 @@
  * `<@U…>`, `<!here>`, `<!channel>`), editing, opening DMs, reading history
  * and replies, and waiting for a persona's answer with a deadline.
  *
+ * The channel gestures of the invited-channel checks (b.deo SRI-1502,
+ * SRI-1505, SRI-1506): `createChannel` (a public channel, returning only its
+ * ID), `invite`, `kick` (a user already gone is fine) and `archive` (a
+ * channel already archived is fine). Any other Slack refusal is a
+ * `HumanCallError` naming only the method and a safe error code.
+ *
  * Waits poll only the conversation a check watches, from the check's own
  * starting point: one `conversations.history` page, plus `conversations.replies`
  * only for a thread whose latest reply is new. A transient Slack failure
@@ -155,6 +161,29 @@ export class HumanSession {
     if (!answer.ok && safeErrorCode(answer) !== 'already_in_channel') throw new HumanCallError('conversations.invite', safeErrorCode(answer))
   }
 
+  /**
+   * Create a public channel named `name`; returns only its ID. An answer with
+   * no `C…` channel ID is refused (`no_channel_id`).
+   */
+  async createChannel(name: string): Promise<string> {
+    const answer = await this.need('conversations.create', { name, is_private: false })
+    const channel = answer.channel && typeof answer.channel === 'object' ? (answer.channel as Record<string, unknown>).id : undefined
+    if (typeof channel !== 'string' || !/^C[A-Z0-9]+$/.test(channel)) throw new HumanCallError('conversations.create', 'no_channel_id')
+    return channel
+  }
+
+  /** Remove `user` from `channel`; a user not in it is fine. */
+  async kick(channel: string, user: string): Promise<void> {
+    const answer = await this.api.call('conversations.kick', { channel, user })
+    if (!answer.ok && safeErrorCode(answer) !== 'not_in_channel') throw new HumanCallError('conversations.kick', safeErrorCode(answer))
+  }
+
+  /** Archive `channel`; a channel already archived is fine. */
+  async archive(channel: string): Promise<void> {
+    const answer = await this.api.call('conversations.archive', { channel })
+    if (!answer.ok && safeErrorCode(answer) !== 'already_archived') throw new HumanCallError('conversations.archive', safeErrorCode(answer))
+  }
+
   /** The DM conversation between the human and `user` (a bot user), opened when needed. */
   async openDm(user: string): Promise<string> {
     const answer = await this.need('conversations.open', { users: user, return_im: true })
@@ -260,7 +289,11 @@ export class HumanSession {
     return [profile.display_name, profile.real_name, u.real_name, u.name].filter((n): n is string => typeof n === 'string' && n !== '')
   }
 
-  /** The conversations `user` is a member of (public and private channels). */
+  /**
+   * The conversations `user` is a member of (public and private channels,
+   * archived ones included: Slack's `exclude_archived` defaults to false), as
+   * provisioning reads them.
+   */
   async conversationsOf(user: string): Promise<string[]> {
     const answer = await this.need('users.conversations', { user, types: 'public_channel,private_channel', limit: 200 })
     return (Array.isArray(answer.channels) ? answer.channels : [])

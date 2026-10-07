@@ -4,7 +4,9 @@
  * Container side: every call runs the plan's helper (`mark`, `since`,
  * `tags`, `replies`, `posts` …) in the test container through
  * `ContainerExec.sh`, and every command that starts, stops or changes
- * something runs behind the plan's `guard`. Slack side: the human session
+ * something runs behind the plan's `guard`. `toolCalls` reads any session
+ * tool's calls from a persona's transcript (a runner-side script, so the
+ * plan's `replies` stays as it is). Slack side: the human session
  * posts and waits for a persona's answer with a deadline.
  *
  * Also the plan's Part 2 procedures: a confirmed config edit (2.2) and the
@@ -96,6 +98,84 @@ export async function tagstext(ctx: CheckContext, letter: PersonaLetter, text: s
 
 export async function replies(ctx: CheckContext, letter: PersonaLetter): Promise<string[]> {
   return lines(ctx, `replies ${letter}`)
+}
+
+/**
+ * One call of a session tool in a persona's transcript, as `toolCalls`
+ * projects it: the inputs a check reads and how the call ended. An accepted
+ * call's result (message text Slack returned, a stored-choice summary) is
+ * never read.
+ */
+export interface ToolCall {
+  /** The conversation the call named: its `chat_id` input, or `channel` (fetch_messages, set_channel_delivery); '' when neither. */
+  channel: string
+  /** Its `message_id` input (react, edit_message), or null. */
+  ts: string | null
+  /** Whether a non-empty `thread_ts` input was given. */
+  threadTs: boolean
+  /** Its `delivery` input (set_channel_delivery), or null. */
+  delivery: string | null
+  /** `ok` (the server returned no error), `error`, or `none` (no result in the transcript yet). */
+  outcome: 'ok' | 'error' | 'none'
+  /** A refused call's tool error text, or null (an accepted call's content is never carried). */
+  error: string | null
+}
+
+/** The CSCB MCP server's name (src/config.ts's `MCP_SERVER_NAME`): a session tool is `mcp__<server>__<tool>` in a transcript. */
+export const CSCB_MCP_SERVER_NAME = 'slack-channel-router'
+
+/**
+ * The script `toolCalls` hands the container (b.deo SRI-1505): every call of
+ * the CSCB session tool `tool` (named `mcp__<server>__<tool>`; another
+ * server's tool of the same name is not one) in persona `letter`'s current
+ * transcript, one compact JSON line each, in call order: the projection
+ * `ToolCall` describes, with the result matched by its `tool_use_id`. Reads
+ * only.
+ */
+export function toolCallsScript(letter: PersonaLetter, tool: string): string {
+  const filter = [
+    '[ .[] | select(.type == "assistant") | .message.content | arrays | .[]',
+    '  | select(.type? == "tool_use" and .name == ("mcp__" + $server + "__" + $tool)) ] as $calls',
+    '| [ .[] | select(.type == "user") | .message.content | arrays | .[] | select(.type? == "tool_result") ] as $results',
+    '| $calls[] | . as $c | ($c.input // {}) as $in',
+    '| ([ $results[] | select(.tool_use_id == $c.id) ] | first) as $r',
+    '| (if $r == null then "none" elif ($r.is_error // false) then "error" else "ok" end) as $outcome',
+    '| { channel: (($in.chat_id // $in.channel // "") | tostring),',
+    '    ts: (if $in.message_id == null then null else ($in.message_id | tostring) end),',
+    '    threadTs: ((($in.thread_ts // "") | tostring) != ""),',
+    '    delivery: (if $in.delivery == null then null else ($in.delivery | tostring) end),',
+    '    outcome: $outcome,',
+    '    error: (if $outcome == "error" then ($r.content | if type == "string" then . elif type == "array" then ([ .[] | .text? // empty ] | join(" ")) else "" end) else null end) }',
+  ].join('\n')
+  return [
+    `t="$(ls -t ~/.claude/projects/*-cscb-live-${letter}/*.jsonl 2>/dev/null | head -1)"`,
+    '[ -n "$t" ] || exit 0',
+    `jq -cs --arg server ${q(CSCB_MCP_SERVER_NAME)} --arg tool ${q(tool)} ${q(filter)} "$t"`,
+  ].join('\n')
+}
+
+/** One `toolCalls` line as a `ToolCall`, or null when it is not one. */
+function asToolCall(value: unknown): ToolCall | null {
+  if (!value || typeof value !== 'object') return null
+  const v = value as Record<string, unknown>
+  const outcome = v.outcome === 'ok' || v.outcome === 'error' || v.outcome === 'none' ? v.outcome : null
+  if (outcome === null || typeof v.channel !== 'string') return null
+  return {
+    channel: v.channel,
+    ts: typeof v.ts === 'string' ? v.ts : null,
+    threadTs: v.threadTs === true,
+    delivery: typeof v.delivery === 'string' ? v.delivery : null,
+    outcome,
+    error: outcome === 'error' && typeof v.error === 'string' ? v.error : null,
+  }
+}
+
+/** Persona `letter`'s calls of the session tool `tool`, from its current transcript (`toolCallsScript`). */
+export async function toolCalls(ctx: InContainer, letter: PersonaLetter, tool: string): Promise<ToolCall[]> {
+  return jsonLines<unknown>(await lines(ctx, toolCallsScript(letter, tool))).flatMap((v) => {
+    const call = asToolCall(v)
+    return call === null ? [] : [call]
+  })
 }
 
 export interface PromptPost {
@@ -430,16 +510,27 @@ export function parsePending(text: string): Pending | null {
   return { header: all[0] ?? '', fingerprint: all[1] ?? '', preview: all.slice(3).filter((l) => l !== '') }
 }
 
-/** Wait for `config.json.pending` and read it through `showpending` (only shown when it holds no token-shaped text). */
-export async function waitPending(ctx: CheckContext, timeoutMs = RELOAD_TIMEOUT_MS): Promise<Pending | null> {
+/**
+ * Wait for `config.json.pending` and read it through `showpending` (only
+ * shown when it holds no token-shaped text). With `otherThan` (an earlier
+ * file's fingerprint line), wait for a file whose fingerprint line differs.
+ */
+export async function waitPending(ctx: CheckContext, timeoutMs = RELOAD_TIMEOUT_MS, otherThan?: string): Promise<Pending | null> {
   const text = await waitFor(
     async () => {
       const r = await run(ctx, 'showpending')
-      return r.code === 0 ? r.out : null
+      if (r.code !== 0) return null
+      return otherThan !== undefined && parsePending(r.out)?.fingerprint === otherThan ? null : r.out
     },
     { timeoutMs, intervalMs: POLL_MS, clock: ctx.clock },
   )
   return text === null ? null : parsePending(text)
+}
+
+/** The fingerprint line of `config.json.pending` now, or undefined when there is none to read. */
+export async function pendingFingerprint(ctx: CheckContext): Promise<string | undefined> {
+  const r = await run(ctx, 'showpending')
+  return r.code === 0 ? parsePending(r.out)?.fingerprint : undefined
 }
 
 /** The counts field of a preview header / applied line. */
