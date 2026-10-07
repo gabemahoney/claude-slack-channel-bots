@@ -1,8 +1,10 @@
 /**
- * fmk-texts-entries.test.ts — Every `src/` export the fmk scenarios' value
- * printer (`tests/integration/fixtures/fmk-texts.ts`, b.jg5 SRJ-1401) names
- * exists in `src/` with the kind the printer reads it as, so a renamed,
- * removed or retyped export fails on the host, before `/ci` runs a scenario.
+ * fmk-texts-entries.test.ts — Every `src/` export the `/ci` scenarios' value
+ * printer (`tests/integration/fixtures/fmk-texts.ts`, b.jg5 SRJ-1401, b.deo
+ * SRI-1404; read by every fmk scenario and by the shared-mode
+ * test-29-invited-channels.sh) names exists in `src/` with the kind the
+ * printer reads it as, so a renamed, removed or retyped export fails on the
+ * host, before `/ci` runs a scenario.
  *
  * The printer refuses to run without the cscb-ci image marker, so it is never
  * imported or run here: `printerRefs` reads its text with the TypeScript
@@ -55,8 +57,10 @@ import * as adErrorClass from '../src/ad-error-class.ts'
 import * as adSettings from '../src/ad-settings.ts'
 import * as adVersionGate from '../src/ad-version-gate.ts'
 import * as backoff from '../src/backoff.ts'
+import * as channelDelivery from '../src/channel-delivery.ts'
 import * as config from '../src/config.ts'
 import * as conflictLatch from '../src/conflict-latch.ts'
+import * as deliveryDecision from '../src/delivery-decision.ts'
 import * as installCheckLabels from '../src/install-check-labels.ts'
 import * as invalidFlagsHold from '../src/invalid-flags-hold.ts'
 import * as liveRowSequence from '../src/live-row-sequence.ts'
@@ -64,10 +68,13 @@ import * as livenessReading from '../src/liveness-reading.ts'
 import * as outageState from '../src/outage-state.ts'
 import * as paneRead from '../src/pane-read.ts'
 import * as pendingRow from '../src/pending-row.ts'
+import * as personaDiagnostics from '../src/persona-diagnostics.ts'
 import * as personaEpisodes from '../src/persona-episodes.ts'
 import * as personaIdentity from '../src/persona-identity.ts'
 import * as personaNotifier from '../src/persona-notifier.ts'
+import * as registry from '../src/registry.ts'
 import * as reloadApply from '../src/reload-apply.ts'
+import * as reloadPlan from '../src/reload-plan.ts'
 import * as restart from '../src/restart.ts'
 import * as rowReadRules from '../src/row-read-rules.ts'
 import * as sessionManager from '../src/session-manager.ts'
@@ -86,8 +93,10 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'ad-settings.ts': adSettings,
   'ad-version-gate.ts': adVersionGate,
   'backoff.ts': backoff,
+  'channel-delivery.ts': channelDelivery,
   'config.ts': config,
   'conflict-latch.ts': conflictLatch,
+  'delivery-decision.ts': deliveryDecision,
   'install-check-labels.ts': installCheckLabels,
   'invalid-flags-hold.ts': invalidFlagsHold,
   'live-row-sequence.ts': liveRowSequence,
@@ -95,10 +104,13 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'outage-state.ts': outageState,
   'pane-read.ts': paneRead,
   'pending-row.ts': pendingRow,
+  'persona-diagnostics.ts': personaDiagnostics,
   'persona-episodes.ts': personaEpisodes,
   'persona-identity.ts': personaIdentity,
   'persona-notifier.ts': personaNotifier,
+  'registry.ts': registry,
   'reload-apply.ts': reloadApply,
+  'reload-plan.ts': reloadPlan,
   'restart.ts': restart,
   'row-read-rules.ts': rowReadRules,
   'session-manager.ts': sessionManager,
@@ -440,6 +452,47 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
   ])("scenario 20's printer reads %s", (ref) => {
     expect(named.has(ref)).toBe(true)
     scenario20Values[ref]?.()
+  })
+
+  // test-29's references (test-29-invited-channels.sh, b.deo SRI-1404), each
+  // `<file>:<export>:<kind>`: the invited-channel texts it matches, the
+  // switch's key, mode name and class labels its upgrade phase checks no
+  // line names, and the applied line, tmux session names and relaunch line
+  // it reads beside them.
+  test.each([
+    'reload-apply.ts:RELOAD_APPLIED:constant',
+    'persona-identity.ts:personaKey:function',
+    'persona-identity.ts:personaTmuxSessionName:function',
+    'restart.ts:relaunchAfterKillLine:function',
+    'restart.ts:RELAUNCH_KILL_NONE:string',
+    'persona-diagnostics.ts:UNCLAIMED_CHANNEL:constant',
+    'persona-diagnostics.ts:unclaimedChannelCause:function',
+    'persona-diagnostics.ts:UNCLAIMED_REASON_EXTERNALLY_SHARED:constant',
+    'persona-diagnostics.ts:UNCLAIMED_REASON_FLAG_MISSING:constant',
+    'persona-diagnostics.ts:UNCLAIMED_REASON_FLAG_NOT_BOOLEAN:constant',
+    'persona-diagnostics.ts:fungibleUnclaimedChannelCause:function',
+    'delivery-decision.ts:FUNGIBLE_REFUSALS:defined',
+    'persona-diagnostics.ts:PERSONA_INVITED_CHANNEL:constant',
+    'persona-diagnostics.ts:invitedChannelCause:function',
+    'persona-diagnostics.ts:PERSONA_CHANNEL_DELIVERY_SET:constant',
+    'persona-diagnostics.ts:channelDeliverySetCause:function',
+    'persona-diagnostics.ts:NO_STORED_CHOICE:string',
+    'persona-diagnostics.ts:NO_STORED_CHOICE:constant',
+    'channel-delivery.ts:SET_CHANNEL_DELIVERY_TOOL:constant',
+    'registry.ts:channelDeliveryDeclarativeRefusal:function',
+    'registry.ts:channelDeliveryChannelRefusal:function',
+    'registry.ts:channelDeliveryValueRefusal:function',
+    'registry.ts:channelDeliverySetResultText:function',
+    'reload-plan.ts:modeSwitchLine:function',
+    'config.ts:CHANNEL_MODES:defined',
+    'config.ts:DELIVERY_MODES:defined',
+    'config.ts:channelModeOf:function',
+    'reload-plan.ts:MODE_SWITCH_SETTING:constant',
+    'channel-delivery.ts:CHANNEL_DELIVERY_FILE_NAME:constant',
+    'channel-delivery.ts:CHANNEL_DELIVERY_LOG_PREFIX:constant',
+    'channel-delivery.ts:CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES:defined',
+  ])("test-29's printer reads %s", (ref) => {
+    expect(named.has(ref)).toBe(true)
   })
 
   test('every file the printer names is a src/ module this file imports', () => {

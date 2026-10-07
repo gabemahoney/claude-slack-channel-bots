@@ -1,8 +1,9 @@
 /**
  * slack-stub-server.ts — a loopback stand-in for Slack's Web API and Socket
- * Mode, for the docker integration scenarios that start CSCB outside dry run
- * (Task 4 of E14, the E13 credentials scenario and the decision-13
- * handshake-failure check).
+ * Mode, for the docker integration scenarios that start CSCB outside dry run:
+ * Test 10 (the credentials change and the decision-13 handshake-failure
+ * check), Test 12, the fmk scenarios, and test-29 (the invited-channel
+ * scenario, which also pushes events through it).
  *
  * Real Slack is not reachable in the `/ci` container. A non-dry-run server
  * reaches this stub through the opt-in Slack API base URL, an environment

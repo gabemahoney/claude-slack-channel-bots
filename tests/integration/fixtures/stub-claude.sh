@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # stub-claude.sh — a fake `claude` binary for the integration tests that launch
-# a real bot through agent-director and tmux (Test 4, Test 10, Test 12 and the
-# fmk scenarios, test-0 and test-13 onward).
+# a real bot through agent-director and tmux (Test 4, Test 10, Test 12,
+# Test 29 and the fmk scenarios, test-0 and test-13 to test-28).
 #
 # Each of those tests copies this file first on PATH as `claude`, so the real
 # agent-director and tmux launch path runs without the Anthropic API or a
@@ -21,7 +21,7 @@
 # naming the directory wins. The selection reads no environment variable, so
 # it holds whatever environment tmux or agent-director gives the worker. A
 # directory with no selection, or a stub with no such file beside it (Test 4,
-# Test 10, Test 12), runs `dev-channels`. The modes:
+# Test 10, Test 12, Test 29), runs `dev-channels`. The modes:
 #
 #   dev-channels         print the dev-channels warning dialog, byte-identical
 #                        to tests/fixtures/dev-channels-pane-2.1.120.txt, which
@@ -238,8 +238,8 @@
 # It is appended in one write, under `/usr/bin/flock -x` on the log, to
 # `agent-director-shim.log` in the directory of the read's <bin> (the shim's
 # log, beside the real binary, in an fmk HOME); where no such file exists
-# (test-1 to test-12), to the stub's stderr. A reader that counts invocations
-# takes only `call` lines, so the stop line is never read as one.
+# (test-1 to test-12, and test-29), to the stub's stderr. A reader that counts
+# invocations takes only `call` lines, so the stop line is never read as one.
 #
 # THE MCP SESSION
 # ---------------

@@ -1,13 +1,16 @@
 /**
- * fmk-texts.ts — the one value printer of the fmk scenarios (b.jg5 SRJ-1401,
- * SRJ-1306). A scenario script cannot import TypeScript, and a test never
+ * fmk-texts.ts — the one value printer of the `/ci` scenarios that match
+ * texts `src/` exports: every fmk scenario, and the shared-mode
+ * test-29-invited-channels.sh (b.jg5 SRJ-1401, SRJ-1306; b.deo SRI-1401,
+ * SRI-1404). A scenario script cannot import TypeScript, and a test never
  * retypes a notice text, class label, version or settings value that `src/`
  * exports. So a script asks this printer for the value, and the printer
  * prints the installed package's own export (the tarball under test): a
  * constant as it is, or a builder's output for the script's arguments.
  *
- * Every fmk scenario uses this one printer. A scenario that needs another
- * value adds a named entry to `ENTRIES` here, and never a second printer.
+ * Every fmk scenario uses this one printer, and so does test-29. A scenario
+ * that needs another value adds a named entry to `ENTRIES` here, and never a
+ * second printer.
  *
  * REFUSAL
  * -------
@@ -249,6 +252,54 @@
  *                                                launch or not
  *   RELOAD_APPLIED                               src/reload-apply.ts, the class label of an
  *                                                applied reload's line
+ *
+ * test-29's entries (test-29-invited-channels.sh, a shared-mode scenario;
+ * b.deo SRI-1401, SRI-1404). <channel> is a channel ID, <delivery>, <stored>,
+ * <after> and <before> one of src/config.ts DELIVERY_MODES (<before> may also
+ * be NO_STORED_CHOICE, below), <name> a persona name and <key> its key:
+ *   UNCLAIMED_CHANNEL                            src/persona-diagnostics.ts, the class label
+ *   unclaimedChannelCause <channel>              src/persona-diagnostics.ts: the declarative-mode
+ *                                                `unclaimed-channel` cause (0.11.1's)
+ *   UNCLAIMED_REASON_EXTERNALLY_SHARED           src/persona-diagnostics.ts, the fungible-mode
+ *   UNCLAIMED_REASON_FLAG_MISSING                `unclaimed-channel` reasons test-29 meets, each
+ *   UNCLAIMED_REASON_FLAG_NOT_BOOLEAN            printed as it is
+ *   fungibleUnclaimedChannelCause <channel> <refusal>
+ *                                                src/persona-diagnostics.ts: the fungible-mode
+ *                                                `unclaimed-channel` cause, <refusal> one of
+ *                                                src/delivery-decision.ts FUNGIBLE_REFUSALS
+ *   PERSONA_INVITED_CHANNEL                      src/persona-diagnostics.ts, the class label
+ *   invitedChannelCause <channel> <public|private> <delivery>
+ *                                                src/persona-diagnostics.ts: its cause
+ *   PERSONA_CHANNEL_DELIVERY_SET                 src/persona-diagnostics.ts, the class label
+ *   channelDeliverySetCause <channel> <before> <after> <delivery>
+ *                                                src/persona-diagnostics.ts: its cause; <before>
+ *                                                is the package's NO_STORED_CHOICE for no stored
+ *                                                choice before the call
+ *   NO_STORED_CHOICE                             src/persona-diagnostics.ts, how that line names
+ *                                                no stored choice
+ *   SET_CHANNEL_DELIVERY_TOOL                    src/channel-delivery.ts, the tool's name
+ *   channelDeliveryDeclarativeRefusal <name> <key>
+ *   channelDeliveryChannelRefusal <name> <key> <channel>
+ *   channelDeliveryValueRefusal <name> <key> <value>
+ *                                                src/registry.ts: the tool's refusals in
+ *                                                declarative mode, for a channel not known, and
+ *                                                for a delivery value it does not take
+ *   channelDeliverySetResultText <channel> <stored> <delivery> <held|not-held>
+ *                                                src/registry.ts: an accepted call's result, the
+ *                                                channel delivery <delivery>, held at it by the
+ *                                                loop guard or not
+ *   modeSwitchLine <mode> [<persona-name>…]      src/reload-plan.ts: the switch's preview line
+ *                                                turning <mode> (one of src/config.ts
+ *                                                CHANNEL_MODES) on, for the personas named, in
+ *                                                order, each keyed by the package's personaKey
+ *   channelModeOf <true|false>                   src/config.ts: the name of the mode the switch's
+ *                                                value picks
+ *   MODE_SWITCH_SETTING                          src/reload-plan.ts, the switch's key
+ *   CHANNEL_DELIVERY_FILE_NAME                   src/channel-delivery.ts, the stored-choice file
+ *   CHANNEL_DELIVERY_LOG_PREFIX                  src/channel-delivery.ts, the head of the store's
+ *                                                own lines
+ *   CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES          src/channel-delivery.ts, the store's class
+ *                                                labels, one per line
  *
  * A builder entry given a marker argument (a key, a reference, a state or a
  * description the scenario chooses) prints a line whose text around the
@@ -3662,6 +3713,162 @@ function fnEntries(table: Readonly<Record<string, FnEntry>>): Record<string, Ent
   return Object.fromEntries(Object.entries(table).map(([name, print]) => [name, { synopsis: '[<arg>…]', print: async (args) => await print(args) } satisfies Entry]))
 }
 
+// ---------------------------------------------------------------------------
+// test-29's entries (test-29-invited-channels.sh; b.deo SRI-1401, SRI-1404):
+// the invited-channel texts, every one from persona-diagnostics.ts,
+// registry.ts, reload-plan.ts, channel-delivery.ts, delivery-decision.ts or
+// config.ts.
+// ---------------------------------------------------------------------------
+
+/** persona-diagnostics.ts's fungible-mode `unclaimed-channel` reasons test-29 meets, each printed as it is. */
+const UNCLAIMED_REASON_NAMES: readonly string[] = [
+  'UNCLAIMED_REASON_EXTERNALLY_SHARED',
+  'UNCLAIMED_REASON_FLAG_MISSING',
+  'UNCLAIMED_REASON_FLAG_NOT_BOOLEAN',
+]
+
+/** The package's `DELIVERY_MODES` (config.ts): fails unless it is a list of strings. */
+async function deliveryModes(context: EntryContext): Promise<readonly string[]> {
+  const modes = await packageExport(context, 'config.ts', 'DELIVERY_MODES')
+  if (!Array.isArray(modes) || !modes.every((m) => typeof m === 'string')) {
+    fail(PRINTER_FAIL_EXIT, "the installed package's src/config.ts export DELIVERY_MODES is not a list of strings")
+  }
+  return modes as readonly string[]
+}
+
+/** Fails with a usage failure unless `value` is one of the package's `DELIVERY_MODES`. */
+async function checkDeliveryArgument(context: EntryContext, entry: string, name: string, value: string): Promise<void> {
+  const modes = await deliveryModes(context)
+  if (!modes.includes(value)) usageFail(`${entry}: <${name}> must be one of ${modes.join(', ')} (got '${value}')`)
+}
+
+/** `CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES` (channel-delivery.ts): the store's own class labels, one per line, in its order. No argument. */
+const channelDeliveryDiagnosticClasses: Entry = {
+  synopsis: '',
+  async print(args, context) {
+    const entry = 'CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES'
+    expectArguments(entry, args, [])
+    const classes = await packageExport(context, 'channel-delivery.ts', entry)
+    if (!Array.isArray(classes) || classes.length === 0 || !classes.every((c) => typeof c === 'string' && c !== '' && !c.includes('\n'))) {
+      fail(PRINTER_FAIL_EXIT, `the installed package's src/channel-delivery.ts export ${entry} is not a non-empty list of one-line strings`)
+    }
+    return (classes as readonly string[]).join('\n')
+  },
+}
+
+/** `channelModeOf({ allow_invited_channels: <true|false> })` (config.ts): the name of the mode the switch's value picks. */
+const channelModeOfSwitch: Entry = {
+  synopsis: '<true|false>',
+  async print(args, context) {
+    const entry = 'channelModeOf'
+    expectArguments(entry, args, ['true|false'])
+    const [value] = args
+    if (value !== 'true' && value !== 'false') usageFail(`${entry}: the switch's value must be true or false (got '${value}')`)
+    const modeOf = await packageFunction<(config: { allow_invited_channels: boolean }) => unknown>(context, 'config.ts', entry)
+    return builtString(entry, modeOf({ allow_invited_channels: value === 'true' }))
+  },
+}
+
+/**
+ * `modeSwitchLine(<mode>, <personas>)` (reload-plan.ts): the switch's preview
+ * line turning <mode> on, for the personas named, in the order given, each
+ * keyed by the package's personaKey, as the config loader derives it.
+ */
+const modeSwitchLineEntry: Entry = {
+  synopsis: '<mode> [<persona-name>…]',
+  async print(args, context) {
+    const entry = 'modeSwitchLine'
+    const [mode, ...names] = args
+    if (mode === undefined || mode === '') usageFail(`${entry} takes <mode> [<persona-name>…] (got no mode)`)
+    if (names.some((n) => n === '')) usageFail(`${entry}: a <persona-name> is empty`)
+    const modes = await packageExport(context, 'config.ts', 'CHANNEL_MODES')
+    if (!Array.isArray(modes) || !modes.includes(mode)) usageFail(`${entry}: <mode> '${mode}' is not one of the package's CHANNEL_MODES`)
+    const personaKey = await packageFunction<(name: string) => unknown>(context, 'persona-identity.ts', 'personaKey')
+    const build = await packageFunction<(mode: string, personas: readonly { name: string; key: unknown }[]) => unknown>(context, 'reload-plan.ts', entry)
+    return builtString(entry, build(mode, names.map((name) => ({ name, key: personaKey(name) }))))
+  },
+}
+
+/**
+ * `fungibleUnclaimedChannelCause(<channel>, <refusal>)` (persona-diagnostics.ts),
+ * <refusal> one of the package's FUNGIBLE_REFUSALS (delivery-decision.ts).
+ */
+const fungibleUnclaimedCause: Entry = {
+  synopsis: '<channel> <refusal>',
+  async print(args, context) {
+    const entry = 'fungibleUnclaimedChannelCause'
+    expectArguments(entry, args, ['channel', 'refusal'])
+    const [channel, refusal] = args
+    const refusals = await packageExport(context, 'delivery-decision.ts', 'FUNGIBLE_REFUSALS')
+    if (!Array.isArray(refusals) || !refusals.includes(refusal)) usageFail(`${entry}: <refusal> '${refusal}' is not one of the package's FUNGIBLE_REFUSALS`)
+    const build = await packageFunction<(channel: string, refusal: string) => unknown>(context, 'persona-diagnostics.ts', entry)
+    return builtString(entry, build(channel!, refusal!))
+  },
+}
+
+/** `invitedChannelCause(<channel>, <public|private>, <delivery>)` (persona-diagnostics.ts). */
+const invitedCause: Entry = {
+  synopsis: '<channel> <public|private> <delivery>',
+  async print(args, context) {
+    const entry = 'invitedChannelCause'
+    expectArguments(entry, args, ['channel', 'public|private', 'delivery'])
+    const [channel, channelType, delivery] = args
+    if (channelType !== 'public' && channelType !== 'private') usageFail(`${entry}: the channel type must be public or private (got '${channelType}')`)
+    await checkDeliveryArgument(context, entry, 'delivery', delivery!)
+    const build = await packageFunction<(channel: string, channelType: string, delivery: string) => unknown>(context, 'persona-diagnostics.ts', entry)
+    return builtString(entry, build(channel!, channelType, delivery!))
+  },
+}
+
+/**
+ * `channelDeliverySetCause(<channel>, <before>, <after>, <delivery>)`
+ * (persona-diagnostics.ts); <before> is the package's NO_STORED_CHOICE for no
+ * stored choice before the call (passed as undefined), else a delivery.
+ */
+const deliverySetCause: Entry = {
+  synopsis: '<channel> <before> <after> <delivery>',
+  async print(args, context) {
+    const entry = 'channelDeliverySetCause'
+    expectArguments(entry, args, ['channel', 'before', 'after', 'delivery'])
+    const [channel, before, after, delivery] = args
+    const none = await packageString(context, 'persona-diagnostics.ts', 'NO_STORED_CHOICE')
+    if (before !== none) await checkDeliveryArgument(context, entry, 'before', before!)
+    await checkDeliveryArgument(context, entry, 'after', after!)
+    await checkDeliveryArgument(context, entry, 'delivery', delivery!)
+    const build = await packageFunction<(channel: string, before: string | undefined, after: string, delivery: string) => unknown>(
+      context,
+      'persona-diagnostics.ts',
+      entry,
+    )
+    return builtString(entry, build(channel!, before === none ? undefined : before, after!, delivery!))
+  },
+}
+
+/** How a result's loop-guard hold is named on the command line. */
+const HELD_WORDS: Readonly<Record<string, boolean>> = { held: true, 'not-held': false }
+
+/**
+ * `channelDeliverySetResultText(<channel>, <stored>, { delivery, heldByLoopGuard })`
+ * (registry.ts): the result of an accepted `set_channel_delivery` call.
+ */
+const deliverySetResult: Entry = {
+  synopsis: '<channel> <stored> <delivery> <held|not-held>',
+  async print(args, context) {
+    const entry = 'channelDeliverySetResultText'
+    expectArguments(entry, args, ['channel', 'stored', 'delivery', 'held|not-held'])
+    const [channel, stored, delivery, held] = args
+    if (!Object.hasOwn(HELD_WORDS, held!)) usageFail(`${entry}: the hold must be held or not-held (got '${held}')`)
+    await checkDeliveryArgument(context, entry, 'stored', stored!)
+    await checkDeliveryArgument(context, entry, 'delivery', delivery!)
+    const build = await packageFunction<(channel: string, stored: string, result: { delivery: string; heldByLoopGuard: boolean }) => unknown>(
+      context,
+      'registry.ts',
+      entry,
+    )
+    return builtString(entry, build(channel!, stored!, { delivery: delivery!, heldByLoopGuard: HELD_WORDS[held!]! }))
+  },
+}
+
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   // Scenario 8 (test-20-fmk-old-binary.sh).
@@ -3778,6 +3985,27 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   reprobeDeadLine: deadReprobeLine,
   liveRowSequenceStartLine: sequenceStartLine,
   RELOAD_APPLIED: constantEntry('reload-apply.ts', 'RELOAD_APPLIED'),
+  // test-29 (test-29-invited-channels.sh), a shared-mode scenario.
+  UNCLAIMED_CHANNEL: constantEntry('persona-diagnostics.ts', 'UNCLAIMED_CHANNEL'),
+  unclaimedChannelCause: builderEntry('persona-diagnostics.ts', 'unclaimedChannelCause', ['channel']),
+  ...constantEntries('persona-diagnostics.ts', UNCLAIMED_REASON_NAMES),
+  fungibleUnclaimedChannelCause: fungibleUnclaimedCause,
+  PERSONA_INVITED_CHANNEL: constantEntry('persona-diagnostics.ts', 'PERSONA_INVITED_CHANNEL'),
+  invitedChannelCause: invitedCause,
+  PERSONA_CHANNEL_DELIVERY_SET: constantEntry('persona-diagnostics.ts', 'PERSONA_CHANNEL_DELIVERY_SET'),
+  channelDeliverySetCause: deliverySetCause,
+  NO_STORED_CHOICE: constantEntry('persona-diagnostics.ts', 'NO_STORED_CHOICE'),
+  SET_CHANNEL_DELIVERY_TOOL: constantEntry('channel-delivery.ts', 'SET_CHANNEL_DELIVERY_TOOL'),
+  channelDeliveryDeclarativeRefusal: builderEntry('registry.ts', 'channelDeliveryDeclarativeRefusal', ['name', 'key']),
+  channelDeliveryChannelRefusal: builderEntry('registry.ts', 'channelDeliveryChannelRefusal', ['name', 'key', 'channel']),
+  channelDeliveryValueRefusal: builderEntry('registry.ts', 'channelDeliveryValueRefusal', ['name', 'key', 'value']),
+  channelDeliverySetResultText: deliverySetResult,
+  modeSwitchLine: modeSwitchLineEntry,
+  channelModeOf: channelModeOfSwitch,
+  MODE_SWITCH_SETTING: constantEntry('reload-plan.ts', 'MODE_SWITCH_SETTING'),
+  CHANNEL_DELIVERY_FILE_NAME: constantEntry('channel-delivery.ts', 'CHANNEL_DELIVERY_FILE_NAME'),
+  CHANNEL_DELIVERY_LOG_PREFIX: constantEntry('channel-delivery.ts', 'CHANNEL_DELIVERY_LOG_PREFIX'),
+  CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES: channelDeliveryDiagnosticClasses,
 }, argsEntries(ARGS_ENTRIES), fnEntries(FN_ENTRIES))
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */
