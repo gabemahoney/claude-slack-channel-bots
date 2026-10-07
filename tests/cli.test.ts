@@ -22,6 +22,16 @@
  * byte-identical, a marked key whose row the stub client reports live
  * included, and creates none where there was none.
  *
+ * The stored-choice file (b.deo SRI-401): only the server reads or writes
+ * `channel-delivery.json`. Every command that acts, over the same command
+ * table and bundle as the retired-key cases, leaves a file seeded by
+ * `writeChannelDeliveryRecord` byte-identical (a key the server's start would
+ * drop, and a file its module's parser refuses, included), removes none,
+ * creates none (nor a write's temporary file beside it) where there was none,
+ * and logs no line of the file's module. `src/cli.ts` imports nothing from
+ * `src/channel-delivery.ts` and names none of its entries that load, write,
+ * parse or locate the file.
+ *
  * Isolation (b.av2 SR-13.2): every real path sits under a per-test
  * `mkdtempSync` directory removed in `afterEach`. The token variables are
  * removed for the whole file (restored afterwards), so no case or failure
@@ -112,7 +122,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, relative, resolve } from 'node:path'
+import { basename, join, relative, resolve } from 'node:path'
 import {
   CLEAR_LATCH_USAGE,
   CLEAR_LATCH_USAGE_ENTRY,
@@ -275,6 +285,13 @@ import { readAppliedPersonaConfig } from '../src/reload.ts'
 import { RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, RETIRED_KEY_CAUSE_REMOVED, retiredKeysPath } from '../src/retired-keys.ts'
 import type * as RetiredKeysModule from '../src/retired-keys.ts'
 import {
+  CHANNEL_DELIVERY_FILE_NAME,
+  CHANNEL_DELIVERY_LOG_PREFIX,
+  CHANNEL_DELIVERY_UNREADABLE,
+  channelDeliveryPath,
+} from '../src/channel-delivery.ts'
+import type * as ChannelDeliveryModule from '../src/channel-delivery.ts'
+import {
   APP_TOKEN_PREFIX,
   assertNoLeak,
   BOT_TOKEN_PREFIX,
@@ -343,6 +360,7 @@ import {
 } from './test-helpers/persona-config.ts'
 import { reloadTermsIn } from './test-helpers/reload-terms.ts'
 import { writeRetiredKeysRecord } from './test-helpers/retired-keys.ts'
+import { declarationOf, writeChannelDeliveryRecord } from './test-helpers/channel-delivery.ts'
 import {
   balancedAfter,
   callArguments,
@@ -3032,10 +3050,10 @@ describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
   })
 
   // The CLI's clock is pinned under the kill's describe (Date.now and setTimeout only in realDeps) and its tries
-  // under callWithCliTries.
-  test('src/cli.ts imports nothing from the session manager, the conflict latch or the retired-key record module (static)', () => {
+  // under callWithCliTries. The stored-choice module is the server's alone too (b.deo SRI-401).
+  test('src/cli.ts imports nothing from the session manager, the conflict latch, the retired-key record module or the stored-choice module (static)', () => {
     const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
-    const banned = ['./session-manager.ts', './conflict-latch.ts', './retired-keys.ts']
+    const banned = ['./session-manager.ts', './conflict-latch.ts', './retired-keys.ts', './channel-delivery.ts']
     expect(importedSpecifiers(code).filter((s) => banned.includes(s))).toEqual([])
   })
 
@@ -5381,13 +5399,98 @@ describe('clear-latch <persona>: entry point and production wiring', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The retired-key record: only the server writes it (b.jg5 SRJ-801)
+// The server's own state files: no CLI command touches the retired-key record
+// (b.jg5 SRJ-801) or the stored-choice file (b.deo SRI-401)
 //
-// The CLI shares modules with the server (src/reload.ts, src/config.ts), so
-// the check is behavioural: each command that acts runs here over a state
-// directory with and without a seeded record. The CLI's own imports are also
-// checked directly.
+// The CLI shares modules with the server (src/reload.ts, src/config.ts, and
+// through src/reload.ts both files' modules), so the check is behavioural:
+// each command that acts runs over a state directory with and without the
+// seeded file. The CLI's own imports are also checked directly.
 // ---------------------------------------------------------------------------
+
+/** What `actingDeps` answers: the bundle, and the stub client's precheck and teardown calls. */
+interface ActingRun {
+  b: Bundle
+  statusCalls: unknown[]
+  getCalls: unknown[]
+  readPaneCalls: unknown[]
+}
+
+/**
+ * A bundle whose configuration is the last-applied record (copied from
+ * config.json, both with stop_timeout and exit_timeout 0) read by the real
+ * applied-config loader, and whose agent-director verbs are the stub
+ * client's through createDirectorOps; its `status` reports every row live.
+ */
+function actingDeps(o: Overrides): ActingRun {
+  writeConfigFile(stateDir, makePersonaConfigInput({ personas: [makePersona({ name: OPS_NAME }, root)], stop_timeout: 0, exit_timeout: 0 }, root))
+  writeFileSync(recordPath(), readFileSync(configPath))
+  const statusCalls: NonNullable<StubClientOptions['statusCalls']> = []
+  const getCalls: NonNullable<StubClientOptions['getCalls']> = []
+  const readPaneCalls: NonNullable<StubClientOptions['readPaneCalls']> = []
+  // The precheck's get reads the marked key's row live (b.jg5 SRJ-114: the CLI applies no clear).
+  const client = makeStubClient({
+    statusResult: cannedStatusResult({ state: 'waiting' }),
+    statusCalls,
+    getResult: cannedGetResult({ claude_instance_id: opsId(), state: 'waiting' }),
+    getCalls,
+    readPaneCalls,
+  })
+  const ops = createDirectorOps(() => client as unknown as DirectorClient)
+  const b = makeDeps({ loadConfig: appliedLoader, ...ops, ...o })
+  return { b, statusCalls, getCalls, readPaneCalls }
+}
+
+/** A server up at the first liveness check and gone after. */
+const upOnce = (): Overrides => {
+  let calls = 0
+  return { serverPid: 4242, isProcessRunning: () => ++calls === 1 }
+}
+
+/**
+ * A running server with its `server.port` record, whose route answers that
+ * the Ops persona's latch was cleared (b.jg5 SRJ-509, SRJ-510); the dial is
+ * a stub, so no request is made.
+ */
+const clearsOnRunningServer = (): Overrides => {
+  writeServerPortRecord(serverPortFilePath(stateDir), { pid: 4242, port: 39_999 })
+  const answer: ClearLatchDialAnswer = { status: 200, body: JSON.stringify({ ok: true, persona: OPS_NAME, cleared: true }) }
+  return { serverPid: 4242, isProcessRunning: () => true, dialClearLatch: async () => answer }
+}
+
+/**
+ * Every command that acts: its label, its overrides, how it runs, and whether
+ * it reads the persona's row (the precheck and the teardown).
+ */
+const ACTING_COMMANDS: ReadonlyArray<readonly [string, () => Overrides, (b: Bundle) => Promise<void>, boolean]> = [
+  ['start (pre-flight and daemon start)', () => ({}), (b) => createCli(b.deps).start(), false],
+  ['stop', upOnce, (b) => createCli(b.deps).stop(), false],
+  ['stop --stop-bots', upOnce, (b) => createCli(b.deps).stop({ stopBots: true }), true],
+  ['clean_restart', () => ({}), (b) => createCli(b.deps).clean_restart(), true],
+  ['credentials <persona>', () => ({}), (b) => createCli(b.deps).credentials([OPS_NAME]), false],
+  ['clear-latch <persona> (a running server clears the latch)', clearsOnRunningServer, (b) => createCli(b.deps).clearLatch([OPS_NAME]), false],
+]
+
+/**
+ * The command acted: the daemon spawned, the server signalled, the rows
+ * prechecked, read and torn down, the script run, or clear-latch's route
+ * dialled. A command that reads no row made no agent-director call.
+ */
+function expectActed({ b, statusCalls, getCalls, readPaneCalls }: ActingRun, readsRows: boolean): void {
+  expect(b.daemonSpawns.length + b.serverSignals.length + b.credentialsRuns.length + b.spawnCalls.length + b.dialCalls.length).toBeGreaterThan(0)
+  if (readsRows) {
+    expect(getCalls).toEqual([{ claude_instance_id: opsId() }])
+    expect(readPaneCalls).toEqual([{ claude_instance_id: opsId(), n_lines: PROBE_PANE_READ_LINES }])
+    expect(statusCalls.length).toBeGreaterThan(0)
+    expect(b.killCalls).toEqual([opsId()])
+  } else {
+    expect([getCalls, readPaneCalls, statusCalls]).toEqual([[], [], []])
+  }
+}
+
+/** Run an acting command; an exit through the bundle's `exit` is the command's own end. */
+const runActing = (run: (b: Bundle) => Promise<void>, b: Bundle): Promise<void> =>
+  run(b).catch((err) => { if (!(err instanceof ExitError)) throw err })
 
 describe('no CLI command writes the retired-key record (b.jg5 SRJ-801)', () => {
   /** What could build a store or write the record; typed against the module, so a rename fails the typecheck. */
@@ -5410,78 +5513,16 @@ describe('no CLI command writes the retired-key record (b.jg5 SRJ-801)', () => {
     return new Uint8Array(readFileSync(retiredKeysPath(stateDir)))
   }
 
-  /**
-   * A bundle whose configuration is the last-applied record (copied from
-   * config.json, both with stop_timeout and exit_timeout 0) read by the real
-   * applied-config loader, and whose agent-director verbs are the stub
-   * client's through createDirectorOps; its `status` reports every row live.
-   */
-  function actingDeps(o: Overrides): { b: Bundle; statusCalls: unknown[]; getCalls: unknown[]; readPaneCalls: unknown[] } {
-    writeConfigFile(stateDir, makePersonaConfigInput({ personas: [makePersona({ name: OPS_NAME }, root)], stop_timeout: 0, exit_timeout: 0 }, root))
-    writeFileSync(recordPath(), readFileSync(configPath))
-    const statusCalls: NonNullable<StubClientOptions['statusCalls']> = []
-    const getCalls: NonNullable<StubClientOptions['getCalls']> = []
-    const readPaneCalls: NonNullable<StubClientOptions['readPaneCalls']> = []
-    // The precheck's get reads the marked key's row live (b.jg5 SRJ-114: the CLI applies no clear).
-    const client = makeStubClient({
-      statusResult: cannedStatusResult({ state: 'waiting' }),
-      statusCalls,
-      getResult: cannedGetResult({ claude_instance_id: opsId(), state: 'waiting' }),
-      getCalls,
-      readPaneCalls,
-    })
-    const ops = createDirectorOps(() => client as unknown as DirectorClient)
-    const b = makeDeps({ loadConfig: appliedLoader, ...ops, ...o })
-    return { b, statusCalls, getCalls, readPaneCalls }
-  }
-
-  /** A server up at the first liveness check and gone after. */
-  const upOnce = (): Overrides => {
-    let calls = 0
-    return { serverPid: 4242, isProcessRunning: () => ++calls === 1 }
-  }
-
-  /**
-   * A running server with its `server.port` record, whose route answers that
-   * the Ops persona's latch was cleared (b.jg5 SRJ-509, SRJ-510); the dial is
-   * a stub, so no request is made.
-   */
-  const clearsOnRunningServer = (): Overrides => {
-    writeServerPortRecord(serverPortFilePath(stateDir), { pid: 4242, port: 39_999 })
-    const answer: ClearLatchDialAnswer = { status: 200, body: JSON.stringify({ ok: true, persona: OPS_NAME, cleared: true }) }
-    return { serverPid: 4242, isProcessRunning: () => true, dialClearLatch: async () => answer }
-  }
-
-  const COMMANDS: Array<[string, () => Overrides, (b: Bundle) => Promise<void>, boolean]> = [
-    ['start (pre-flight and daemon start)', () => ({}), (b) => createCli(b.deps).start(), false],
-    ['stop', upOnce, (b) => createCli(b.deps).stop(), false],
-    ['stop --stop-bots', upOnce, (b) => createCli(b.deps).stop({ stopBots: true }), true],
-    ['clean_restart', () => ({}), (b) => createCli(b.deps).clean_restart(), true],
-    ['credentials <persona>', () => ({}), (b) => createCli(b.deps).credentials([OPS_NAME]), false],
-    ['clear-latch <persona> (a running server clears the latch)', clearsOnRunningServer, (b) => createCli(b.deps).clearLatch([OPS_NAME]), false],
-  ]
-
-  test.each(COMMANDS.flatMap(([label, overrides, run, readsRows]) => [
+  test.each(ACTING_COMMANDS.flatMap(([label, overrides, run, readsRows]) => [
     [label, 'a seeded record is left byte-identical', overrides, run, readsRows, true] as const,
     [label, 'with no record none is created', overrides, run, readsRows, false] as const,
   ]))('%s: %s', async (_label, _outcome, overrides, run, readsRows, seeded) => {
     const before = seeded ? seedRecord() : null
-    const { b, statusCalls, getCalls, readPaneCalls } = actingDeps(overrides())
+    const acting = actingDeps(overrides())
 
-    await run(b).catch((err) => { if (!(err instanceof ExitError)) throw err })
+    await runActing(run, acting.b)
 
-    // The command acted: the daemon spawned, the server signalled, the rows
-    // prechecked, read and torn down, the script run, or clear-latch's route
-    // dialled.
-    expect(b.daemonSpawns.length + b.serverSignals.length + b.credentialsRuns.length + b.spawnCalls.length + b.dialCalls.length).toBeGreaterThan(0)
-    if (readsRows) {
-      expect(getCalls).toEqual([{ claude_instance_id: opsId() }])
-      expect(readPaneCalls).toEqual([{ claude_instance_id: opsId(), n_lines: PROBE_PANE_READ_LINES }])
-      expect(statusCalls.length).toBeGreaterThan(0)
-      expect(b.killCalls).toEqual([opsId()])
-    } else {
-      expect([getCalls, readPaneCalls, statusCalls]).toEqual([[], [], []])
-    }
+    expectActed(acting, readsRows)
     const path = retiredKeysPath(stateDir)
     if (before === null) expect(existsSync(path)).toBe(false)
     else expect(new Uint8Array(readFileSync(path)) as Uint8Array).toEqual(before)
@@ -5490,6 +5531,86 @@ describe('no CLI command writes the retired-key record (b.jg5 SRJ-801)', () => {
   test('src/cli.ts names no store factory, start read or serialiser of the record module, so it imports none (static)', () => {
     const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
     for (const name of WRITING_NAMES) expect([name, indicesOf(new RegExp(`\\b${name}\\b`, 'g'), code)]).toEqual([name, []])
+  })
+})
+
+describe('no CLI command reads, writes, creates or removes the stored-choice file (b.deo SRI-401)', () => {
+  /**
+   * What could load, write, parse or locate the file: the store factory, the
+   * start load, the serialiser, the parser, the path function and the file
+   * name. Typed against the module, so a rename fails the typecheck.
+   */
+  const FILE_NAMES: ReadonlyArray<keyof typeof ChannelDeliveryModule> = [
+    'loadChannelDeliveryStore',
+    'loadChannelDeliveryAtStart',
+    'serializeChannelDelivery',
+    'parseChannelDelivery',
+    'channelDeliveryPath',
+    'CHANNEL_DELIVERY_FILE_NAME',
+  ]
+
+  /** What the file's module logs: its drop and failed-write lines, its class, and the file's name in a line naming the file. */
+  const MODULE_MARKS = [CHANNEL_DELIVERY_LOG_PREFIX, CHANNEL_DELIVERY_UNREADABLE, CHANNEL_DELIVERY_FILE_NAME]
+
+  /** The state directory's entries named after the file: the file itself, or a write's temporary file beside it. */
+  const fileEntries = (): string[] => readdirSync(stateDir).filter((name) => name.startsWith(CHANNEL_DELIVERY_FILE_NAME))
+
+  /**
+   * The file: the Ops persona's two channels under its declaration as the
+   * applied configuration resolves it, and a key that configuration lacks,
+   * which the server's start would drop (b.deo SRI-407). `refused` appends a
+   * byte to what the serialiser wrote, so the module's parser refuses the
+   * file and a load through the module would log its unreadable line (b.deo
+   * SRI-403). Answers the file's bytes.
+   */
+  function seedStoredChoices(refused: boolean): Uint8Array {
+    const ops = appliedLoader(recordPath()).personas[0]!
+    const path = writeChannelDeliveryRecord(stateDir, {
+      [personaKey(OPS_NAME)]: {
+        declaration: declarationOf(ops),
+        channels: { [OPS_CHANNEL]: { delivery: 'all' }, C0TEST002: { delivery: 'mentions' } },
+      },
+      [personaKey('Retired Bot')]: {
+        declaration: declarationOf({ ...ops, name: 'Retired Bot' }),
+        channels: { C0TEST003: { delivery: 'all' } },
+      },
+    })
+    if (refused) appendFileSync(path, '}')
+    return new Uint8Array(readFileSync(path))
+  }
+
+  /** Every line the case captured: the console, and the teardown's `server.log` and startup-errors log. */
+  const capturedLines = (): string[] => [
+    ...stderr,
+    ...[logPath, startupErrorsPath()].filter((p) => existsSync(p)).flatMap((p) => readFileSync(p, 'utf-8').split('\n')),
+  ]
+
+  test.each(ACTING_COMMANDS.flatMap(([label, overrides, run, readsRows]) => [
+    [label, 'a seeded file is left byte-identical', overrides, run, readsRows, 'valid'] as const,
+    [label, 'a seeded file the module\'s parser refuses is left byte-identical', overrides, run, readsRows, 'refused'] as const,
+    [label, 'with no file none is created', overrides, run, readsRows, 'none'] as const,
+  ]))('%s: %s; the command removes nothing and logs no line of the file\'s module', async (_label, _outcome, overrides, run, readsRows, seed) => {
+    const acting = actingDeps(overrides())
+    const before = seed === 'none' ? null : seedStoredChoices(seed === 'refused')
+
+    await runActing(run, acting.b)
+
+    expectActed(acting, readsRows)
+    if (before === null) {
+      expect(fileEntries()).toEqual([])
+    } else {
+      expect(fileEntries()).toEqual([CHANNEL_DELIVERY_FILE_NAME])
+      expect(new Uint8Array(readFileSync(channelDeliveryPath(stateDir))) as Uint8Array).toEqual(before)
+    }
+    // The bundle's unlinkSync only records, so a removal shows here, not on disk.
+    expect(acting.b.unlinked.filter((p) => basename(p).startsWith(CHANNEL_DELIVERY_FILE_NAME))).toEqual([])
+    expect(capturedLines().filter((line) => MODULE_MARKS.some((mark) => line.includes(mark)))).toEqual([])
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls, exitCodes: acting.b.exitCodes, files: writtenTeardownLogs() })
+  })
+
+  test('src/cli.ts names none of the module\'s store factory, start load, serialiser, parser, path function or file-name constant (static)', () => {
+    const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
+    for (const name of FILE_NAMES) expect([name, indicesOf(new RegExp(`\\b${name}\\b`, 'g'), code)]).toEqual([name, []])
   })
 })
 

@@ -1,6 +1,6 @@
 /**
  * secrecy-audit.test.ts — Repo-level credential-secrecy audit (b.av2 SR-10.3
- * closing audit, SR-13.2; AC 20).
+ * closing audit, SR-13.2; AC 20; b.deo SRI-907).
  *
  * A static audit of the repository's test and source files, in the pattern
  * of the getClient() allowlist audit (tests/outage-state.test.ts case 22). It
@@ -43,11 +43,14 @@
  *    lines carry agent-director failure text, the old-life wait's round
  *    end, whose notice texts carry agent-director's CONFLICT and
  *    unusable-name answers, the pending-row rule, whose lines quote
- *    the lap's and the run's agent-director outcomes, and the clear-latch
- *    route, whose clear-failed line carries a clear by hand's rejection), a
- *    value import of one
+ *    the lap's and the run's agent-director outcomes, the clear-latch
+ *    route, whose clear-failed line carries a clear by hand's rejection, and
+ *    the stored-choice store (b.deo SRI-907), whose record holds each
+ *    persona's declaration, a credentials file's path among them, and which
+ *    logs its read and write failures), a value import of one
  *    of the `HELPER_SURFACES` helpers (the token builders and sentinel, the
- *    config-file writer, the agent-director settings-file writer, the reload,
+ *    config-file writer, the agent-director settings-file writer, the
+ *    stored-choice file writer, the reload,
  *    connection, routing and recovery harnesses, the Slack client factory
  *    stub), or sets a stub's `leakMarker`. A suite that matches but has no
  *    secret-bearing surface is listed in `EXEMPT` with its reason; an
@@ -155,6 +158,8 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/pending-row\.ts$/, "the pending-row rule, whose round, gate and failure lines quote the lap's and the bypassing run's agent-director outcomes (described, redacted) and whose lap Enter outcomes keep the thrown agent-director error raw"],
   [/^src\/persona-routing\.ts$/, "the persona routing, which receives a persona's Slack events, archives through its client and logs Slack failure text and its lost-message row read's agent-director failure text (described, redacted)"],
   [/^src\/clear-latch\.ts$/, "the clear-latch route and the server.port record, whose clear-failed line carries a clear by hand's rejection (described, redacted), which can be agent-director failure text"],
+  // b.deo SRI-907: the stored-choice file holds the credentials file's path, never its content.
+  [/^src\/channel-delivery\.ts$/, "the stored-choice store, which records each persona's declaration, a credentials file's path among them, and logs its read and write failures"],
 ]
 
 /** Test helpers whose named exports build tokens, credentials or config files, or plant the sentinel. */
@@ -169,6 +174,7 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
   },
   'tests/test-helpers/persona-config.ts': { writeConfigFile: 'writes a config file' },
   'tests/test-helpers/ad-settings.ts': { writeAgentDirectorConfig: "writes agent-director's config.toml" },
+  'tests/test-helpers/channel-delivery.ts': { writeChannelDeliveryRecord: 'writes a stored-choice file holding persona declarations' },
   'tests/test-helpers/reload-harness.ts': { makeReloadHarness: 'builds the reload harness' },
   'tests/test-helpers/persona-connection-harness.ts': { makeConnectionHarness: 'builds the connection manager over credentials files' },
   'tests/test-helpers/persona-routing-harness.ts': { makeRoutingHarness: 'builds sentinel-bearing Slack stubs' },
@@ -294,15 +300,15 @@ function touchReasonsOf(file: string, code: string): string[] {
   return reasons
 }
 
-/** The local name `file` binds `assertNoLeak` to from the credentials helper, if it imports it. */
-function assertNoLeakBinding(file: string): string | undefined {
-  return valueImports(file, codeOf(file)).find((b) => b.module === CREDENTIALS_HELPER && b.imported === 'assertNoLeak')?.local
+/** The local name `file` (whose comment-stripped code is `code`) binds `assertNoLeak` to from the credentials helper, if it imports it. */
+function assertNoLeakBinding(file: string, code: string = codeOf(file)): string | undefined {
+  return valueImports(file, code).find((b) => b.module === CREDENTIALS_HELPER && b.imported === 'assertNoLeak')?.local
 }
 
-/** Whether `file` imports `assertNoLeak` from the credentials helper and calls it. */
-function callsAssertNoLeak(file: string): boolean {
-  const local = assertNoLeakBinding(file)
-  return local !== undefined && callsOf(codeOf(file), local).length > 0
+/** Whether `file` (whose comment-stripped code is `code`) imports `assertNoLeak` from the credentials helper and calls it. */
+function callsAssertNoLeak(file: string, code: string = codeOf(file)): boolean {
+  const local = assertNoLeakBinding(file, code)
+  return local !== undefined && callsOf(code, local).length > 0
 }
 
 /** The argument text of every `assertNoLeak` call in `file` (none when it doesn't import it). */
@@ -565,6 +571,39 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
   })
 
+  // b.deo SRI-907: the stored-choice store's record holds each persona's declaration (a credentials file's path,
+  // never its content), and its read and write failures reach log lines.
+  test('src/channel-delivery.ts is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
+    const suite = 'tests/channel-delivery.test.ts'
+    expect(SOURCE_SURFACES.some(([re]) => re.test('src/channel-delivery.ts'))).toBe(true)
+    expect(touchReasonsOf(suite, "import { loadChannelDeliveryStore } from '../src/channel-delivery.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { channelDeliveryUnreadableLine as line } from '../src/channel-delivery.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { CHANNEL_DELIVERY_FILE_NAME, SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import type { ChannelDeliveryStore } from '../src/channel-delivery.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import { type ChannelDeliveryRecord } from '../src/channel-delivery.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import type * as ChannelDeliveryModule from '../src/channel-delivery.ts'")).toEqual([])
+    expect(touchReasons(suite).some((r) => r.includes('src/channel-delivery.ts') && r.includes('the stored-choice store'))).toBe(true)
+    const touching = SUITES.filter((file) => touchReasons(file).some((r) => r.includes('src/channel-delivery.ts')))
+    expect(touching).toContain(suite)
+    expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
+    // The suite with its assertNoLeak calls taken out (its import kept) still touches the module and fails the rule.
+    const withoutCalls = codeOf(suite).replace(/(?<![\w.$])assertNoLeak\s*\(/g, 'void (')
+    expect(touchReasonsOf(suite, withoutCalls).some((r) => r.includes('src/channel-delivery.ts'))).toBe(true)
+    expect(callsAssertNoLeak(suite, withoutCalls)).toBe(false)
+  })
+
+  // b.deo SRI-907: the stored-choice file the helper writes holds persona declarations.
+  test("the stored-choice helper's writeChannelDeliveryRecord touches, its other exports do not, and every suite that imports it leak-checks with no exemption", () => {
+    const suite = 'tests/channel-delivery.test.ts'
+    expect(touchReasonsOf(suite, "import { writeChannelDeliveryRecord as seed } from './test-helpers/channel-delivery.ts'")).toEqual([
+      'imports writeChannelDeliveryRecord from tests/test-helpers/channel-delivery.ts: writes a stored-choice file holding persona declarations',
+    ])
+    expect(touchReasonsOf(suite, "import { declarationOf, readChannelDeliveryRecord, SAMPLE_SET_AT } from './test-helpers/channel-delivery.ts'")).toEqual([])
+    const importing = SUITES.filter((file) => touchReasons(file).some((r) => r.includes('tests/test-helpers/channel-delivery.ts')))
+    expect(importing).toContain(suite)
+    expect(importing.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(importing.map((file) => [file, true, false]))
+  })
+
   test("each suite that builds the reload harness leak-checks a run's captured() artifacts", () => {
     const harnessSuites = SUITES.filter((file) =>
       valueImports(file, codeOf(file)).some((b) => b.module === 'tests/test-helpers/reload-harness.ts' && b.imported === 'makeReloadHarness'),
@@ -583,7 +622,15 @@ describe('no token literal under tests/ (b.av2 SR-13.2, TEST-1)', () => {
 
   test('the scan covers every file under tests/, this file and the credentials helper included', () => {
     const scanned = TEST_FILES.map(repoPath)
-    expect(scanned).toEqual(expect.arrayContaining(['tests/secrecy-audit.test.ts', CREDENTIALS_HELPER, ...NAMED_LEGS]))
+    expect(scanned).toEqual(
+      expect.arrayContaining([
+        'tests/secrecy-audit.test.ts',
+        CREDENTIALS_HELPER,
+        ...NAMED_LEGS,
+        'tests/channel-delivery.test.ts',
+        'tests/test-helpers/channel-delivery.ts',
+      ]),
+    )
   })
 
   test('no file holds a token-like value by the matcher assertNoLeak applies', () => {
@@ -903,8 +950,10 @@ describe("a caught error's text reaches a log line under src/ only redacted (E14
     entry.file === f.file && f.call.includes(entry.anchor)
 
   test('the scan reads every file under src/ and finds the log calls of the Slack and agent-director modules (it is not vacuous)', () => {
-    expect(SOURCE_FILES).toEqual(expect.arrayContaining(['src/session-manager.ts', 'src/restart.ts', 'src/persona-connections.ts', 'src/cli.ts', 'src/server.ts']))
-    const counts = ['src/session-manager.ts', 'src/restart.ts', 'src/permission-poller.ts', 'src/persona-lifecycle.ts', 'src/persona-episodes.ts'].map(
+    expect(SOURCE_FILES).toEqual(
+      expect.arrayContaining(['src/session-manager.ts', 'src/restart.ts', 'src/persona-connections.ts', 'src/cli.ts', 'src/server.ts', 'src/channel-delivery.ts']),
+    )
+    const counts = ['src/session-manager.ts', 'src/restart.ts', 'src/permission-poller.ts', 'src/persona-lifecycle.ts', 'src/persona-episodes.ts', 'src/channel-delivery.ts'].map(
       (file) => logCalls(codeOf(file)).length,
     )
     expect(counts.every((n) => n > 0)).toBe(true)
