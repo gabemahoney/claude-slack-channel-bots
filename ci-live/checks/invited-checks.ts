@@ -21,6 +21,7 @@
  * - Check 34: whatever 30–33 found, it restores the config.json bytes Check
  *   30 copied, kicks C's app if it is still in the channel, archives the
  *   channel, and passes only when C is in no channel, archived ones included.
+ *   Under `--only`, it runs whenever any of 30–33 is selected.
  *
  * Checks 31 and 33 follow Check 16's ask rule: at most two asks, a second
  * only when C said done but made no call; C never answering is a FAIL, and
@@ -62,6 +63,7 @@ import {
   mention,
   needHuman,
   pause,
+  pendingFingerprint,
   previewHeader,
   q,
   recorded,
@@ -137,11 +139,27 @@ export function slackRefusalText(tool: string, name: string, channel: string, co
   return `Tool ${JSON.stringify(tool)} failed for persona ${ref(name)} on channel ${JSON.stringify(channel)}: Slack refused the call (${code}).`
 }
 
-/** The Slack code in `text` when it is `slackRefusalText(tool, name, channel, <code>)` for some plain code, else null. */
+/**
+ * A Slack code as the server quotes one: src/persona-connection-errors.ts
+ * `SAFE_IDENTIFIER_RE`'s short identifier (`slackPlatformReason` passes no
+ * other), without its anchors.
+ */
+export const SLACK_CODE_PATTERN = '[A-Za-z_$][A-Za-z0-9_$]{0,63}'
+
+/** `text` as a literal in a regular expression. */
+function literal(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * The Slack code in `text` when it contains `slackRefusalText(tool, name,
+ * channel, <code>)` for some code, else null. Read as Check 16 reads a
+ * refused call: the server's text may sit inside a wrapper the client adds.
+ */
 export function slackRefusalCode(tool: string, name: string, channel: string, text: string | null): string | null {
   if (text === null) return null
-  const code = /\(([a-z_]{1,64})\)\.$/.exec(text)?.[1]
-  return code !== undefined && text === slackRefusalText(tool, name, channel, code) ? code : null
+  const [head, tail] = slackRefusalText(tool, name, channel, '\u0000').split('\u0000') as [string, string]
+  return new RegExp(`${literal(head)}(${SLACK_CODE_PATTERN})${literal(tail)}`).exec(text)?.[1] ?? null
 }
 
 /** src/reload-plan.ts `modeSwitchLine`: the switch's preview line, for the personas present in both configurations. */
@@ -540,19 +558,23 @@ export const check33: CheckDef<CheckContext> = {
       f.expect(false, `C did not say done${a.asks.length > 1 ? ' to the second ask' : ''} and made no ${REPLY_TOOL} and ${FETCH_MESSAGES_TOOL} call on the run channel`)
       return f.result()
     }
-    let skippedReason: string | null = null
-    if (a.next === 'no-call') {
-      skippedReason = `C made no ${REPLY_TOOL} and ${FETCH_MESSAGES_TOOL} call on the run channel (asked ${a.asks.length} times)`
-    } else {
-      f.expect(a.asks.at(-1)!.reply !== null, 'C did not say done')
-      const calls = await refusedCalls()
-      for (const [tool, call] of [[REPLY_TOOL, calls.reply], [FETCH_MESSAGES_TOOL, calls.fetch]] as const) {
-        const code = call?.outcome === 'error' ? slackRefusalCode(tool, c, ch.id, call.error) : null
-        if (f.expect(code !== null, `C's ${tool} call on the run channel was not refused with the tool error naming C, the channel and Slack's code`)) {
-          f.add(`${tool}${tool === FETCH_MESSAGES_TOOL ? ' without thread_ts' : ''}: refused by Slack (${code})`)
-        }
+    // Each call C made is judged, even when the other is missing; a missing call alone is "not run".
+    f.expect(a.asks.at(-1)!.reply !== null, 'C did not say done')
+    const calls = await refusedCalls()
+    const missing: string[] = []
+    for (const [tool, call] of [[REPLY_TOOL, calls.reply], [FETCH_MESSAGES_TOOL, calls.fetch]] as const) {
+      if (call === undefined) {
+        missing.push(tool)
+        continue
+      }
+      const code = call.outcome === 'error' ? slackRefusalCode(tool, c, ch.id, call.error) : null
+      if (f.expect(code !== null, `C's ${tool} call on the run channel was not refused with the tool error naming C, the channel and Slack's code`)) {
+        const line = `${tool}${tool === FETCH_MESSAGES_TOOL ? ' without thread_ts' : ''}: refused by Slack (${code})`
+        f.add(line)
+        f.note(line)
       }
     }
+    const skippedReason = missing.length === 0 ? null : `C made no ${missing.join(' and ')} call on the run channel (asked ${a.asks.length} times)`
 
     // The three calls whose outcome is recorded, never judged.
     const target = ctx.shared.invitedCAnswerTs
@@ -597,6 +619,11 @@ async function restoreConfig(ctx: CheckContext, f: Findings, copy: string): Prom
   if (!f.expect(copyView !== null && recordView !== null, 'config: the copy or the last-applied record could not be read')) return
   const neverConfirmed = (await run(ctx, `cmp -s ${copy} "$S/config.json.last-applied"`)).code === 0
   const pendingBefore = await fileExists(ctx, '"$S/config.json.pending"')
+  // A pending file already there is an earlier edit's: its fingerprint is noted so the
+  // restore's own file (a new fingerprint) is the one read and confirmed. With config.json
+  // already the copy, the restore changes nothing and that file is already the restore's.
+  const stale =
+    pendingBefore && !neverConfirmed && (await run(ctx, `cmp -s ${copy} "$S/config.json"`)).code !== 0 ? await pendingFingerprint(ctx) : undefined
   const m = await mark(ctx)
   const restored = await guarded(ctx, `cp ${copy} "$S/config.json"`)
   if (!f.expect(restored.ok && restored.code === 0, 'config: the guarded restore of config.json did not run')) return
@@ -608,13 +635,17 @@ async function restoreConfig(ctx: CheckContext, f: Findings, copy: string): Prom
     f.expect(nothing.length === (pendingBefore ? 1 : 0), `config: ${nothing.length} ${NOTHING_PENDING_CLASS} line(s), not ${pendingBefore ? 1 : 0}`)
   } else {
     const expected = restorePreview(copyView!, recordView!)
-    const pending = await waitPending(ctx)
-    if (f.expect(pending !== null, 'config: config.json.pending did not appear (or held token-shaped text)')) checkPreview(f, pending!, expected.preview)
-    const confirmed = await guarded(ctx, 'mv "$S/config.json.pending" "$S/config.json.apply"')
-    f.expect(confirmed.ok && confirmed.code === 0, 'config: the confirming rename did not run')
-    const cls = expected.outcome.slice(0, expected.outcome.indexOf(':') + 1)
-    const outcome = (await waitLog(ctx, m, cls, RELOAD_TIMEOUT_MS)) ?? []
-    f.expect(outcome.length === 1 && outcome[0]!.includes(expected.outcome), `config: expected one line "${expected.outcome}", found ${outcome.length} ${cls} line(s)`)
+    const pending = await waitPending(ctx, RELOAD_TIMEOUT_MS, stale)
+    const missing = stale === undefined ? 'did not appear' : 'was not rewritten for the restore (it kept the earlier fingerprint)'
+    if (f.expect(pending !== null, `config: config.json.pending ${missing} (or held token-shaped text)`)) checkPreview(f, pending!, expected.preview)
+    // An earlier edit's file is never confirmed: with no file for the restore, nothing is renamed.
+    if (pending !== null || stale === undefined) {
+      const confirmed = await guarded(ctx, 'mv "$S/config.json.pending" "$S/config.json.apply"')
+      f.expect(confirmed.ok && confirmed.code === 0, 'config: the confirming rename did not run')
+      const cls = expected.outcome.slice(0, expected.outcome.indexOf(':') + 1)
+      const outcome = (await waitLog(ctx, m, cls, RELOAD_TIMEOUT_MS)) ?? []
+      f.expect(outcome.length === 1 && outcome[0]!.includes(expected.outcome), `config: expected one line "${expected.outcome}", found ${outcome.length} ${cls} line(s)`)
+    }
   }
   const same = (await run(ctx, `cmp -s ${copy} "$S/config.json"`)).code === 0
   f.expect(same, 'config: config.json is not the copy')
@@ -643,6 +674,8 @@ export const check34: CheckDef<CheckContext> = {
   title: 'Check 34: the cast is restored: config.json as Check 30 found it, nothing pending, the run channel archived, C in no channel (b.deo AC 46)',
   needs: LIVE,
   row: '34',
+  // Under --only, a selection of any of 30 to 33 runs it too (b.deo SRI-1506).
+  undoes: ['30', '31', '32', '33'],
   async run(ctx) {
     const copy = ctx.shared.invitedConfigCopy
     const channel = ctx.shared.invitedChannel

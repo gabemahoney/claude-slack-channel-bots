@@ -168,7 +168,9 @@ installed Google Chrome, headless; no browser download):
    - `--provision-only [--stage apps|install|tokens|channels]`: provisioning only.
    - `--only 1,2,5`: run only these checks. The pre-flight, install, setup and
      Check 1 always run, as later checks need their state, and so do 29a,
-     Teardown and HOST; every other check reports `SKIPPED (not selected)`.
+     Teardown and HOST, and Check 34 whenever any of Checks 30 to 33 is
+     selected (it undoes their state); every other check reports
+     `SKIPPED (not selected)`.
    - `--create-apps`: let a real run create the four apps when there is no
      `apps.json` (only when the apps are really gone from the workspace).
    - `--keep-container`: leave the container for inspection (remove it with
@@ -278,7 +280,10 @@ installed Google Chrome, headless; no browser download):
    `fetch_messages with thread_ts`, saying `accepted`, `refused by Slack
    (<code>)`, `refused with no Slack code`, `made, with no result` or `not
    made`), word for word. They are recorded, never judged: every call Slack
-   accepted is a residual the README must state before the release.
+   accepted is a residual the README must state before the release. Relay
+   Check 33's two refusal-code notes from the same row word for word too:
+   `reply: refused by Slack (<code>)` and `fetch_messages without thread_ts:
+   refused by Slack (<code>)`.
 
 ## Maintenance commands
 

@@ -510,16 +510,27 @@ export function parsePending(text: string): Pending | null {
   return { header: all[0] ?? '', fingerprint: all[1] ?? '', preview: all.slice(3).filter((l) => l !== '') }
 }
 
-/** Wait for `config.json.pending` and read it through `showpending` (only shown when it holds no token-shaped text). */
-export async function waitPending(ctx: CheckContext, timeoutMs = RELOAD_TIMEOUT_MS): Promise<Pending | null> {
+/**
+ * Wait for `config.json.pending` and read it through `showpending` (only
+ * shown when it holds no token-shaped text). With `otherThan` (an earlier
+ * file's fingerprint line), wait for a file whose fingerprint line differs.
+ */
+export async function waitPending(ctx: CheckContext, timeoutMs = RELOAD_TIMEOUT_MS, otherThan?: string): Promise<Pending | null> {
   const text = await waitFor(
     async () => {
       const r = await run(ctx, 'showpending')
-      return r.code === 0 ? r.out : null
+      if (r.code !== 0) return null
+      return otherThan !== undefined && parsePending(r.out)?.fingerprint === otherThan ? null : r.out
     },
     { timeoutMs, intervalMs: POLL_MS, clock: ctx.clock },
   )
   return text === null ? null : parsePending(text)
+}
+
+/** The fingerprint line of `config.json.pending` now, or undefined when there is none to read. */
+export async function pendingFingerprint(ctx: CheckContext): Promise<string | undefined> {
+  const r = await run(ctx, 'showpending')
+  return r.code === 0 ? parsePending(r.out)?.fingerprint : undefined
 }
 
 /** The counts field of a preview header / applied line. */

@@ -6,8 +6,9 @@
  * - a fixed `skip` reason (manual-only or optional checks) → SKIPPED;
  * - a failed `blocking` check earlier → SKIPPED (blocked by <id>), except
  *   for `always` checks (the host check);
- * - `--only` given and the check neither selected, a `prerequisite` nor
- *   `always` → SKIPPED (not selected);
+ * - `--only` given and the check neither selected, a `prerequisite`,
+ *   `always`, nor the undo of a selected check (`undoes`) → SKIPPED (not
+ *   selected);
  * - a need the run lacks → SKIPPED with the need's reason (a dry run has no
  *   workspace; a run with no second account skips Checks 14, 16 and 20), or
  *   the reason the runner gives for it (a second account that needs a
@@ -50,6 +51,8 @@ export interface CheckDef<Ctx> {
   always?: boolean
   /** Runs under `--only` even when not selected (a later check needs its state). */
   prerequisite?: boolean
+  /** The checks whose state this one undoes: under `--only`, it runs whenever any of them is selected. */
+  undoes?: readonly string[]
   run(ctx: Ctx): Promise<CheckResult>
 }
 
@@ -120,7 +123,7 @@ export function skipReason<Ctx>(
   if (check.skip) return check.skip
   if (state.blockedBy !== null && !check.always) return `blocked by ${state.blockedBy}`
   if (options.only.length > 0 && !options.only.includes(check.id) && !check.prerequisite && !check.always) {
-    return 'not selected'
+    if (!(check.undoes ?? []).some((id) => options.only.includes(id))) return 'not selected'
   }
   const missing = check.needs.find((need) => !options.available.has(need))
   return missing ? (options.needReasons?.[missing] ?? NEED_SKIP_REASONS[missing]) : null

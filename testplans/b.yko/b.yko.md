@@ -809,7 +809,7 @@ runs:
 1. Edit `config.json` (the checks use `jq`, behind `guard`), or re-save a credentials file with the wizard's credentials command.
 2. Within about 5 s the server writes `config.json.pending` and logs the same preview in `server.log`, one `[slack] reload-preview: …` line per preview line. Read the file with `showpending` (Part 1.3), which shows it only when it holds no token-shaped text, and read the log lines through `showsafe`: `since "$MARK" | grep -F 'reload-preview:' | showsafe`. The file's first two lines are `claude-slack-channel-bots: pending configuration change (written by the server)` and `fingerprint: sha256:<64 hex digits>`, then a blank line and the preview. The preview's first line starts `A configuration change is pending; nothing has been applied.` and gives the counts; a line starting `DESTRUCTIVE:` names a persona the change retires (a removal, or a destructive change that brings it up fresh). Check that the preview describes the edit you made.
 3. Confirm by renaming the file, unchanged: `if guard; then mv "$S/config.json.pending" "$S/config.json.apply"; fi`.
-4. Within about 5 s the server applies the change without a restart and logs one `[slack] reload-applied: applied the confirmed configuration change without a restart (<counts>); the last-applied record "<path of config.json>.last-applied" now holds it` line. Afterwards `config.json` and the record are byte-identical, and neither `config.json.pending` nor `config.json.apply` exists.
+4. Within about 5 s the server applies the change without a restart and logs one `[slack] reload-applied: applied the confirmed configuration change without a restart (<counts>); the last-applied record "<path of config.json>.last-applied" now holds it` line (a `reload-noop` line for an edit with no effective change, described under "What the apply does"). Afterwards `config.json` and the record are byte-identical, and neither `config.json.pending` nor `config.json.apply` exists.
 
 A `[slack] reload-stale-confirmation: …` line instead means `config.json` or a
 credentials file changed after that preview was written; nothing is applied.
@@ -818,7 +818,7 @@ file, and never delete `config.json.last-applied` while the server runs.
 
 What the apply does:
 
-- **Per-persona changes** take effect at the apply. An added persona is brought up, and a removed one is torn down (a `DESTRUCTIVE:` line). `channels`, `delivery`, `permission_prompts`, `dm.enabled`, `dm.contact` and `invited.permission_prompts` are updated in place. A persona whose credentials file changed at the same path is reconnected with it, or brought up again when it was down because of its credentials.
+- **Per-persona changes** take effect at the apply. An added persona is brought up, and a removed one is torn down (a `DESTRUCTIVE:` line). `dm.enabled` and `dm.contact` are updated in place. The mode the edited `config.json` turns on (its `allow_invited_channels`) decides which channel section is in force (b.deo SRI-802, SRI-804): `channels`, `delivery` and `permission_prompts` in declarative mode, `invited.permission_prompts` in fungible mode. A change to the section in force is updated in place; a change to the other section previews a `… changed in the <section> section: recorded, with no effect until allow_invited_channels selects <section> mode.` line and is only recorded. An edit made only of recorded changes previews `no effective change`, and its confirmation logs one `[slack] reload-noop: …` line in place of `reload-applied`. A persona whose credentials file changed at the same path is reconnected with it, or brought up again when it was down because of its credentials.
 - **Server-wide settings**, such as `session_restart_delay` or `port`, are only recorded at the apply. Their preview line says `once applied, it is recorded and takes effect at the next server start after that.` For such an edit, confirm it, then run the "Guarded restart" (Part 2.3), which starts the server from the record. The one exception is the invited-channel switch, `allow_invited_channels`: it applies in place at the confirmation, with no restart, and its preview line says `applied in place at once, from the next event, tool call, prompt and notice`.
 
 The run uses this gesture in Checks 13 and 24 (and Check 24's teardown),
@@ -2563,7 +2563,7 @@ Steps:
 Expected:
 
 - Step 1: the preview is Check 32's two lines with `turns fungible mode on` in place of `turns declarative mode on`, and one `reload-applied` line with the same counts.
-- Step 4: each line is a call newer than step 3's count, with `"outcome":"error"`. The `reply` call's `error` is exactly `Tool "reply" failed for persona "persona_c" (key=persona_c) on channel "<RUN_CHANNEL_ID>": Slack refused the call (<SLACK_ERROR_CODE>).`, and the `fetch_messages` call's is `Tool "fetch_messages" failed for persona "persona_c" (key=persona_c) on channel "<RUN_CHANNEL_ID>": Slack refused the call (<SLACK_ERROR_CODE>).`. Record each code in Notes, as `reply: refused by Slack (<SLACK_ERROR_CODE>)` and `fetch_messages without thread_ts: refused by Slack (<SLACK_ERROR_CODE>)`.
+- Step 4: each line is a call newer than step 3's count, with `"outcome":"error"`. The `reply` call's `error` contains `Tool "reply" failed for persona "persona_c" (key=persona_c) on channel "<RUN_CHANNEL_ID>": Slack refused the call (<SLACK_ERROR_CODE>).`, and the `fetch_messages` call's contains `Tool "fetch_messages" failed for persona "persona_c" (key=persona_c) on channel "<RUN_CHANNEL_ID>": Slack refused the call (<SLACK_ERROR_CODE>).`. The client may wrap the server's text, so the text is read anywhere in the error, as Check 16 reads it. `<SLACK_ERROR_CODE>` is any code made of letters, digits, `_` and `$`. Record each code in Notes, as `reply: refused by Slack (<SLACK_ERROR_CODE>)` and `fetch_messages without thread_ts: refused by Slack (<SLACK_ERROR_CODE>)`.
 - Step 5 is recorded, never judged. For each of the three calls, add one line to Notes in this form: `Check 33 residual: <call> after the kick: <outcome>`, where `<call>` is `react`, `edit_message on C's earlier post` or `fetch_messages with thread_ts`, and `<outcome>` is:
   - `accepted` (`"outcome":"ok"`);
   - `refused by Slack (<SLACK_ERROR_CODE>)` (`"outcome":"error"` with the tool error form above);
@@ -2574,10 +2574,12 @@ Expected:
 
 C never saying done to step 4's ask fails this check. So does C neither
 saying done to step 5's ask nor making its three calls. If C says done to
-either ask without making all its calls, ask once more. With step 4's calls
-still not made after the second ask, record the check as "not run" (Check
-16's rule), keeping step 5's notes; a call step 5 still lacks is recorded
-`not made`.
+either ask without making all its calls, ask once more. A step 4 call C did
+make is judged even when the other is missing: one that is not Slack's
+refusal fails the check. With a step 4 call still not made after the second
+ask and nothing failed, record the check as "not run" (Check 16's rule),
+naming the missing call or calls in the reason and keeping step 5's notes; a
+call step 5 still lacks is recorded `not made`.
 
 Pass: after the kick, C's `reply` and `fetch_messages` without `thread_ts`
 on the channel each returned the tool error naming C, the channel and
@@ -2586,7 +2588,8 @@ Slack's code, and step 5's three outcomes are in Notes.
 ### Check 34: the cast is restored: config.json as Check 30 found it, nothing pending, the run channel archived, C in no channel (b.deo AC 46)
 
 Run it whenever Check 30 copied `config.json` or created the run channel,
-whatever Checks 30 to 33 found. If Check 30 did neither, there is nothing to
+whatever Checks 30 to 33 found. With `--only`, the runner runs it whenever
+any of Checks 30 to 33 is selected. If Check 30 did neither, there is nothing to
 restore, and the check passes. Each half below undoes only its own part:
 skip the config half when there is no copy, and the channel half when there
 is no channel.
@@ -2601,6 +2604,8 @@ Steps:
    jq -c '(.allow_invited_channels // false)' "$S/config.json.last-applied"
    ```
 
+   If `ls` finds a pending file, it is an earlier edit's: note its fingerprint line (`showpending`, line 2) before step 2, and whether `config.json` already holds the copy (`cmp -s ~/cscb-live/config-before-invited.json "$S/config.json" && echo ALREADY-RESTORED`).
+
 2. Note the log mark, then restore the copy's bytes, only if the guard passes:
 
    ```sh
@@ -2608,7 +2613,7 @@ Steps:
    if guard; then cp ~/cscb-live/config-before-invited.json "$S/config.json"; fi
    ```
 
-3. If step 1 printed `NEVER-CONFIRMED` (Check 30's edit was never confirmed), wait 30 s and run `since "$MARK" | grep -F '] reload-nothing-pending: '`. Otherwise wait about 10 s, read the preview with `showpending`, confirm by the rename, and run `since "$MARK" | grep -E 'reload-(applied|noop):'`.
+3. If step 1 printed `NEVER-CONFIRMED` (Check 30's edit was never confirmed), wait 30 s and run `since "$MARK" | grep -F '] reload-nothing-pending: '`. Otherwise wait about 10 s, read the preview with `showpending`, confirm by the rename, and run `since "$MARK" | grep -E 'reload-(applied|noop):'`. When step 1 noted a fingerprint line and did not print `ALREADY-RESTORED`, first wait until `showpending` shows a different fingerprint line: only that file is the restore's. Never confirm the earlier file.
 4. Check the result, then remove the copy once `config.json` matches it:
 
    ```sh
@@ -2633,6 +2638,7 @@ Expected:
   The rename logs exactly one `[slack] reload-applied: applied the confirmed configuration change without a restart (personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 1 changed); the last-applied record "<path of config.json>.last-applied" now holds it` line.
 - With the record holding the switch off (Check 33's edit did not apply), the preview is `A configuration change is pending; nothing has been applied. no effective change: applying it would change no persona and no server-wide setting.` followed by the same recorded lines, and the rename logs exactly one `[slack] reload-noop: the confirmed configuration has no effective change, so no persona and no server-wide setting changed; the last-applied record "<path of config.json>.last-applied" was rewritten with it` line.
 - With `NEVER-CONFIRMED`: the restore leaves nothing pending. The `grep` prints exactly one `reload-nothing-pending` line if step 1's `ls` found a pending file, and none otherwise. Record in Notes that Check 30's edit was never confirmed.
+- A pending file still showing step 1's fingerprint line, never rewritten for the restore, is a FAIL, and nothing is renamed.
 - Step 4 prints `restored` and `recorded`, and `ls` reports that `config.json.pending` does not exist.
 - Step 6: C is in no channel, archived channels included.
 
