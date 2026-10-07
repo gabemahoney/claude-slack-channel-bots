@@ -661,7 +661,8 @@ export function resolveRealPathStrict(path: string, fs?: Partial<StrictRealPathF
  * invalid edit still protects the paths it names. It is read through
  * `readPersonaConfigBytes`, so a path that is not a regular file (a FIFO or a
  * device) is never read. It reads without the 64 KiB cap (`uncapped`, as the
- * retired-key record's read does): a configuration file larger than `MAX_RELOAD_FILE_BYTES`
+ * retired-key record's start read and the stored-choice file's start read do,
+ * b.deo SRI-403): a configuration file larger than `MAX_RELOAD_FILE_BYTES`
  * still protects the paths it names, so the cap never shrinks what the guard
  * refuses. An unreadable or non-regular file, unparseable JSON, or a file
  * without a `personas` array contributes nothing; this never throws. The
@@ -1602,11 +1603,14 @@ export const CONFIG_NOT_REGULAR_FILE_CODE = 'not a regular file'
  * and hashing work a file grown by mistake could cost. Applied in the readers
  * rather than by one caller, so the start, the bring-up and the reload tick
  * see the same outcome (and the same credentials digest marker) for one file.
- * Two reads are exempt (`readPersonaConfigBytes` with `uncapped`): the SR-5.2
- * file guard's read of the configuration file (`credentialsFilesToProtect`),
- * and the start's read of the retired-key record (`loadRetiredKeyStore` in
+ * Three reads are exempt (`readPersonaConfigBytes` with `uncapped`): the SR-5.2
+ * file guard's read of the configuration file (`credentialsFilesToProtect`);
+ * the start's read of the retired-key record (`loadRetiredKeyStore` in
  * `retired-keys.ts`), a file only the server writes that can legitimately
- * grow past the cap, read once at start and never hashed or compared.
+ * grow past the cap, read once at start and never hashed or compared; and
+ * the start's read of the stored-choice file (`loadChannelDeliveryStore` in
+ * `src/channel-delivery.ts`, b.deo SRI-403), likewise written only by the
+ * server, read once at start, and parsed only, never hashed or compared.
  */
 export const MAX_RELOAD_FILE_BYTES = 64 * 1024
 
@@ -1701,11 +1705,13 @@ export interface PersonaConfigFs {
 /** How `readPersonaConfigBytes` reads. */
 export interface ReadPersonaConfigBytesOptions {
   /**
-   * Read the whole file, with no `MAX_RELOAD_FILE_BYTES` cap. Only two reads
-   * set it: the SR-5.2 file guard's read (`credentialsFilesToProtect`) and
-   * the start's read of the retired-key record (`loadRetiredKeyStore`); every
-   * other caller stays capped. Stat-first is unchanged: a directory or a
-   * non-regular file is still refused and never read.
+   * Read the whole file, with no `MAX_RELOAD_FILE_BYTES` cap. Only three reads
+   * set it: the SR-5.2 file guard's read (`credentialsFilesToProtect`), the
+   * start's read of the retired-key record (`loadRetiredKeyStore`), and the
+   * start's read of the stored-choice file (`loadChannelDeliveryStore` in
+   * `src/channel-delivery.ts`, b.deo SRI-403); every other caller is capped.
+   * Stat-first applies all the same: a directory or a non-regular file is
+   * refused and never read.
    */
   uncapped?: boolean
 }
@@ -1807,20 +1813,23 @@ export function parsePersonaConfigBytes(
  * refused and never read in full.
  *
  * The exception is `options.uncapped`, which reads the whole file with no size
- * limit (stat-first still applies). Two reads set it: the SR-5.2 file guard
+ * limit (stat-first applies). Three reads set it: the SR-5.2 file guard
  * (`credentialsFilesToProtect`), which must never protect fewer credentials
- * files because the configuration file grew past the cap; and the start's
- * read of the retired-key record (`loadRetiredKeyStore` in
- * `retired-keys.ts`), a file only the server writes, which grows with every
- * retired key until a clear or a restore removes it, is read once at start
- * and is never hashed or compared, so a record past the cap is still one the
- * server wrote and must not stop the start. Every other caller (the start's
+ * files because the configuration file grew past the cap; the start's read
+ * of the retired-key record (`loadRetiredKeyStore` in `retired-keys.ts`), a
+ * file only the server writes, which grows with every retired key until a
+ * clear or a restore removes it, is read once at start and is never hashed or
+ * compared, so a record past the cap is still one the server wrote and must
+ * not stop the start; and the start's read of the stored-choice file
+ * (`loadChannelDeliveryStore` in `src/channel-delivery.ts`, b.deo SRI-403),
+ * which only the server writes, which is read once at start, and whose bytes
+ * are parsed only, never hashed or compared. Every other caller (the start's
  * configuration file, the last-applied record, the pending and apply files,
  * the reload tick) is capped.
  *
  * @param configPath  Absolute path of the file.
  * @param fs          File-system overrides; unset operations use `DEFAULT_PERSONA_CONFIG_FS`.
- * @param options     `uncapped` for the file guard's and the retired-key record's reads only.
+ * @param options     `uncapped` for the file guard's, the retired-key record's and the stored-choice file's reads only (b.deo SRI-403).
  */
 export function readPersonaConfigBytes(
   configPath: string,
