@@ -206,7 +206,7 @@ import {
   formatPersonaDiagnostic,
 } from '../src/persona-diagnostics.ts'
 import { configDirLabelValue, personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
-import { DESTRUCTIVE_SETTINGS, type DestructiveSetting, type InPlaceSetting } from '../src/reload-plan.ts'
+import { DESTRUCTIVE_SETTINGS, type DestructiveSetting, type InPlaceSetting, MODE_SWITCH_SETTING } from '../src/reload-plan.ts'
 import { renderNoopLogLine } from '../src/reload-apply.ts'
 import { destinationSettingOf, FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
 import { destinationClearedCause, destinationFailedCause, type DestinationFailedAt } from '../src/persona-destination-hold.ts'
@@ -6149,7 +6149,7 @@ function fungibleDestinationOf(name: string): string {
 
 /** The switch in file form for `mode`, written either way, so each direction changes its resolved value (b.deo SRI-101). */
 function switchTop(mode: ChannelMode): TopLevel {
-  return { allow_invited_channels: mode === 'fungible' }
+  return { [MODE_SWITCH_SETTING]: mode === 'fungible' }
 }
 
 /** A rig persona: `h.persona(name)` with its fungible destination, then `overrides`. */
@@ -6312,7 +6312,7 @@ describe('b.deo SRI-201, SRI-203, SRI-805: a confirmed switch change applies in 
 
     expect(run.serverConfig()).toMatchObject({ allow_invited_channels: true, port: 3101 })
     expect(run.appliedConfigs.at(-1)).toMatchObject({ allow_invited_channels: true, port: 3102 })
-    expect(JSON.parse(h.readRecord()!.toString('utf-8'))).toMatchObject({ allow_invited_channels: true, port: 3102 })
+    expect(JSON.parse(h.readRecord()!.toString('utf-8'))).toMatchObject({ [MODE_SWITCH_SETTING]: true, port: 3102 })
     await expectNothingPendingAfter(run)
     expectModeNoLeak()
   })
@@ -6429,11 +6429,13 @@ describe('b.deo SRI-802, SRI-804, SRI-805: in-place and recorded section changes
     const session = run.session('bravo')!
     const sides = { alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }
     const cp = run.checkpoint()
+    const calls = run.composition!.calls.length
 
     await applyIn(run, 'fungible', [alpha!, { ...bravo!, invited: { permission_prompts: NEW_FUNGIBLE_DESTINATION } }])
 
     expect(run.since(cp).lifecycle).toEqual([{ op: 'update-in-place', key: bravoKey, via: 'apply', settings: [FUNGIBLE_DESTINATION_SETTING] }])
-    expect(run.composition!.calls).toEqual(LIFECYCLE_DM_DESTINATION_SETTINGS.has(FUNGIBLE_DESTINATION_SETTING) ? [['destinations.forget', bravoKey]] : [])
+    // A change of the fungible destination forgets the cached DM conversation (b.deo SRI-703).
+    expect(run.composition!.calls.slice(calls)).toEqual([['destinations.forget', bravoKey]])
     expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
     expect(run.session('bravo')).toBe(session)
     expect(session.connected).toBe(true)
@@ -6526,22 +6528,22 @@ const PROMPT_TS_B = '1700000100.000002'
 /** An hour of a fake clock: past every retry a held notice waits for. */
 const HOUR_MS = 60 * 60 * 1000
 
-/** Yield event-loop turns (no timer): a manual poller tick or a click still settling after `until` saw its effect. */
-async function settleTurns(): Promise<void> {
-  for (let i = 0; i < 20; i++) await new Promise((done) => setImmediate(done))
-}
-
 /**
- * The permission relay over a run (the reload harness has none), composed as
- * `server.ts` composes it: the real poller on a manual interval
- * (`startManualPoller`) and the real click handler, each over the run's
- * applied personas (`run.serverConfig()`, read at each use), the run's Slack
- * stubs (`makePersonaClients`, the stub serving each persona now) and the
- * run's up check; the poller's destination resolver reads the switch from
- * `run.serverConfig()` at each attempt. agent-director lists bravo's row in
- * `check_permission` with the requests `open()` names; the click's `decide`
- * goes to the run's composition stub (through the outage state the real
- * composition installs). Trail events and lines are captured, never written.
+ * The permission relay over a run (the reload harness has none): the real
+ * poller on a manual interval (`startManualPoller`) and the real click
+ * handler. Shared with the run, as `server.ts` shares them: the run's applied
+ * personas (`run.serverConfig()`, read at each use), the run's Slack stubs
+ * (`makePersonaClients`, the stub serving each persona now) and the run's up
+ * check. Not shared: `server.ts` hands its poller the notifier's destination
+ * resolver, destination hold and teardown-notice window, while `ReloadRun`
+ * exposes none of them, so this poller runs on its own module-level resolver
+ * and hold (reset by `_resetPollerState`), the resolver built over
+ * `getPersonaConfig: () => run.serverConfig()` so it reads the switch in force
+ * at each attempt, and with no teardown-notice window. agent-director lists
+ * bravo's row in `check_permission` with the requests `open()` names; the
+ * click's `decide` goes to the run's composition stub (through the outage
+ * state the real composition installs). Trail events and lines are captured,
+ * never written.
  */
 function promptRelay(run: ReloadRun, open: () => readonly string[]) {
   const nameOf = (key: string) => MODE_RIG.find((name) => h.key(name) === key)
@@ -6579,7 +6581,7 @@ function promptRelay(run: ReloadRun, open: () => readonly string[]) {
     async tick(done: () => boolean): Promise<void> {
       interval.fire()
       await until(done)
-      await settleTurns()
+      await turns()
     },
     /** A click on bravo's prompt for `token`, received on bravo's connection. */
     click: (decision: 'allow' | 'deny', token: string) =>
@@ -6594,7 +6596,11 @@ function promptRelay(run: ReloadRun, open: () => readonly string[]) {
   }
 }
 
-/** A held-notice opening (`failed`) or cleared line of bravo's destination episode, built from T5's builders. */
+/**
+ * A held-notice opening (`failed`) or cleared line of bravo's destination
+ * episode: `formatPersonaDiagnostic` over `destinationFailedCause` or
+ * `destinationClearedCause` (`src/persona-destination-hold.ts`).
+ */
 function destinationLine(run: ReloadRun, mode: ChannelMode, failure: DestinationFailedAt, cleared = false): string {
   const bravo = run.serverConfig()!.personas.find((p) => p.key === h.key('bravo'))!
   const at = { setting: destinationSettingOf({ allow_invited_channels: mode === 'fungible' }), destination: destinationIn(mode) }
@@ -6695,9 +6701,10 @@ describe('b.deo SRI-703: prompts and notices after a confirmed switch change go 
     // The first notice opens the DM, the second reuses the cached conversation.
     expect(await noticeCalls(run, 'bravo')).toEqual([`conversations.open ${CONTACT}`, `chat.postMessage ${dm}`])
     expect(await noticeCalls(run, 'bravo')).toEqual([`chat.postMessage ${dm}`])
-    // The expectation comes from the lifecycle's own set of DM destination settings.
-    const forgets = LIFECYCLE_DM_DESTINATION_SETTINGS.has(FUNGIBLE_DESTINATION_SETTING)
+    // The lifecycle's DM destination settings name the fungible destination.
+    expect(LIFECYCLE_DM_DESTINATION_SETTINGS.has(FUNGIBLE_DESTINATION_SETTING)).toBe(true)
     const cp = run.checkpoint()
+    const calls = run.composition!.calls.length
 
     await applyIn(run, 'fungible', [alpha!, { ...bravo!, invited: { permission_prompts: fungibleDestinationOf('bravo') } }])
     expect(await noticeCalls(run, 'bravo')).toEqual([`chat.postMessage ${fungibleDestinationOf('bravo')}`])
@@ -6705,11 +6712,9 @@ describe('b.deo SRI-703: prompts and notices after a confirmed switch change go 
 
     const update: ReloadLifecycleRecord = { op: 'update-in-place', key: bravoKey, via: 'apply', settings: [FUNGIBLE_DESTINATION_SETTING] }
     expect(run.since(cp).lifecycle).toEqual([update, update])
-    expect(run.composition!.calls).toEqual(forgets ? [['destinations.forget', bravoKey], ['destinations.forget', bravoKey]] : [])
+    expect(run.composition!.calls.slice(calls)).toEqual([['destinations.forget', bravoKey], ['destinations.forget', bravoKey]])
     expect(run.session('bravo')).toBeDefined()
-    expect(await noticeCalls(run, 'bravo')).toEqual(
-      forgets ? [`conversations.open ${CONTACT}`, `chat.postMessage ${dm}`] : [`chat.postMessage ${dm}`],
-    )
+    expect(await noticeCalls(run, 'bravo')).toEqual([`conversations.open ${CONTACT}`, `chat.postMessage ${dm}`])
     expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test'])
     expectModeNoLeak()
   })
@@ -7025,8 +7030,9 @@ describe("b.deo SRI-409: a retired key's stored choices never apply again, on ea
     // The write still failing: no successful write before the restart.
     const restarted = await restartOf(run, { realLaunch: true })
 
-    // The new life's launch set its key's mark, so only the declaration rule can drop it.
-    expect(restarted.retiredKeys.isRecorded(bravoKey) && !restarted.retiredKeys.isMarked(bravoKey)).toBe(false)
+    // The retired-key record no longer holds the key (its entry is removed once the new life is seen running,
+    // b.jg5 SRJ-807), so only the declaration rule can drop it.
+    expect([restarted.retiredKeys.isRecorded(bravoKey), restarted.retiredKeys.isMarked(bravoKey)]).toEqual([false, false])
     expect(restarted.logs).toContain(channelDeliveryDropLine(bravoKey, 1, CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED))
     await expectAtMentions(restarted, 'bravo', EXTRA_CHANNEL)
     expectModeNoLeak()

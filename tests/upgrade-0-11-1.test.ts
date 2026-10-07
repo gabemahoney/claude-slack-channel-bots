@@ -67,13 +67,13 @@ import {
   channelModeOf,
   DM_DESTINATION,
   loadPersonaConfig,
-  PERSONA_INVITED_KEYS,
   PERSONA_TOP_LEVEL_KEYS,
   type ChannelEntryInput,
   type PersonaDmInput,
 } from '../src/config.ts'
 import type { Via } from '../src/delivery-decision.ts'
 import { FUNGIBLE_MODE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
+import { FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import {
   FUNGIBLE_REFUSAL_TEXTS,
@@ -93,7 +93,6 @@ import {
 } from '../src/registry.ts'
 import { RELOAD_APPLIED } from '../src/reload-apply.ts'
 import {
-  IN_PLACE_SETTINGS,
   MODE_SWITCH_SETTING,
   modeSwitchLine,
   PENDING_PREVIEW_TITLE,
@@ -197,12 +196,6 @@ function modeSwitchLineHead(mode: (typeof CHANNEL_MODES)[number]): string {
 }
 
 /**
- * `invited.permission_prompts`, from the in-place settings: the entry naming
- * a key of the `invited` section.
- */
-const INVITED_PERMISSION_PROMPTS = IN_PLACE_SETTINGS.find((s) => PERSONA_INVITED_KEYS.some((k) => s.endsWith(`.${k}`)))
-
-/**
  * What no log line, preview or pending-file text, or Slack-posted text of a
  * 0.11.1 configuration may carry. Every entry is imported from `src/`. It
  * does not apply to `set_channel_delivery`'s listing, its declarative
@@ -215,7 +208,7 @@ const TERM_LIST: readonly Term[] = [
   ...CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES.map((text) => ({ label: `CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES ${text}`, text })),
   { label: 'CHANNEL_DELIVERY_LOG_PREFIX', text: CHANNEL_DELIVERY_LOG_PREFIX },
   { label: 'CHANNEL_DELIVERY_FILE_NAME', text: CHANNEL_DELIVERY_FILE_NAME },
-  { label: `IN_PLACE_SETTINGS ${INVITED_PERMISSION_PROMPTS}`, text: INVITED_PERMISSION_PROMPTS ?? '' },
+  { label: 'FUNGIBLE_DESTINATION_SETTING', text: FUNGIBLE_DESTINATION_SETTING },
   // The switch's key. Its membership in the top-level keys is pinned below,
   // so a rename fails the suite instead of leaving this entry checking nothing.
   { label: 'MODE_SWITCH_SETTING', text: MODE_SWITCH_SETTING },
@@ -282,14 +275,28 @@ function makeHarness(): ReloadHarness {
   return harness
 }
 
+/** Close every listing client, each in its own `try`, so one throwing close never skips the next or the cleanup. */
+async function closeListingClients(clients: readonly Client[]): Promise<void> {
+  const [client, ...rest] = clients
+  if (client === undefined) return
+  try {
+    await client.close()
+  } finally {
+    await closeListingClients(rest)
+  }
+}
+
 afterEach(async () => {
   try {
-    for (const client of listingClients.splice(0)) await client.close()
-    if (harness !== undefined) await harness.cleanup()
+    await closeListingClients(listingClients.splice(0))
   } finally {
-    harness = undefined
-    if (rig !== undefined) rmSync(rig.root, { recursive: true, force: true })
-    rig = undefined
+    try {
+      if (harness !== undefined) await harness.cleanup()
+    } finally {
+      harness = undefined
+      if (rig !== undefined) rmSync(rig.root, { recursive: true, force: true })
+      rig = undefined
+    }
   }
 })
 
@@ -329,9 +336,16 @@ describe('upgrade fixtures and the term list (b.deo SRI-1204, SRI-1201, SRI-106)
     expect(PERSONA_TOP_LEVEL_KEYS).toContain(MODE_SWITCH_SETTING)
   })
 
-  test('every term-list entry is a non-empty text, so no entry checks nothing', () => {
-    expect(TERM_LIST.filter((t) => t.text.length === 0).map((t) => t.label)).toEqual([])
-    expect(INVITED_PERMISSION_PROMPTS).toBeDefined()
+  // Positive controls: the checker reports each term, and each suggestive word in mixed case, inside other text.
+  test.each(TERM_LIST.map((t) => [t.label, t] as const))('the checker reports term %s inside other text', (_label, t) => {
+    expect(termsIn(`x ${t.text} y`)).toContain(t.label)
+  })
+
+  test.each([
+    ['fungible', 'a FunGible mode', 'FunGible'],
+    ['invited', 'an InViTed channel', 'InViTed'],
+  ])('the checker reports the word "%s" in mixed case', (_word, text, hit) => {
+    expect(termsIn(text)).toEqual([`word "${hit}"`])
   })
 
   test.each(FIXTURES.map((f) => [f.file, f] as const))('%s has its pinned SHA-256', (_file, fixture) => {
@@ -693,7 +707,11 @@ interface SampleEvent {
   readonly bothEvents?: boolean
 }
 
-/** Whether `line` is a drop line: `unclaimed-channel`, or the plain `dropped message` line. */
+/**
+ * Whether `line` is a drop line: `unclaimed-channel`, or the plain `dropped
+ * message` line. The second pins the 0.11.1 line shape of
+ * `src/persona-routing.ts`, which exports no builder or prefix for it.
+ */
 function isDropLine(line: string): boolean {
   return line.startsWith(`[slack] ${UNCLAIMED_CHANNEL}: `) || line.includes(' dropped message from ')
 }
@@ -753,7 +771,11 @@ function unclaimedLine(h: ReloadHarness, fixture: UpgradeFixture, name: string, 
   })
 }
 
-/** A `not-mentioned` drop line of the persona in `channel` (the reason is the line's last word). */
+/**
+ * A `not-mentioned` drop line of the persona in `channel` (the reason is the
+ * line's last word). It pins the 0.11.1 line shape of
+ * `src/persona-routing.ts`, which exports no builder or prefix for it.
+ */
 function notMentioned(h: ReloadHarness, name: string, channel: string) {
   return expect.stringMatching(
     new RegExp(`^${escapeRegExp(`[slack] persona ${renderPersonaRef(name, h.key(name))} dropped message from channel=${channel} `)}.*: not-mentioned$`),

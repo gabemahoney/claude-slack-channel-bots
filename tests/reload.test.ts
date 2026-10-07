@@ -113,7 +113,8 @@ import {
 import { composePendingFile, PENDING_FILE_HEADER, reloadFingerprint } from '../src/reload-fingerprint.ts'
 import { createReloadTickDriver } from '../src/reload-timer.ts'
 import { channelDeliveryDeclarativeRefusal, channelDeliverySetResultText } from '../src/registry.ts'
-import { DESTRUCTIVE_PREFIX, DESTRUCTIVE_RETIRED_CLAUSE, REMOVED_RETIRED_CLAUSE } from '../src/reload-plan.ts'
+import { DESTRUCTIVE_PREFIX, DESTRUCTIVE_RETIRED_CLAUSE, MODE_SWITCH_SETTING, REMOVED_RETIRED_CLAUSE } from '../src/reload-plan.ts'
+import { FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
 import { OLD_LIFE_HOLD_LOG_PREFIX, RETIRED_KEYS_LOG_PREFIX } from '../src/retired-keys.ts'
 import {
   APP_TOKEN_PREFIX,
@@ -667,12 +668,12 @@ function bothSections(name: string, overrides: Partial<PersonaInput> = {}): Pers
 
 /** The switch as a start writes it for `mode`: absent in declarative mode, `true` in fungible mode. */
 function startSwitch(mode: ChannelMode): Record<string, unknown> {
-  return mode === 'fungible' ? { allow_invited_channels: true } : {}
+  return mode === 'fungible' ? { [MODE_SWITCH_SETTING]: true } : {}
 }
 
 /** The switch as a candidate writes it to turn `mode` on: `true`, or an explicit `false`. */
 function turnOn(mode: ChannelMode): Record<string, unknown> {
-  return { allow_invited_channels: mode === 'fungible' }
+  return { [MODE_SWITCH_SETTING]: mode === 'fungible' }
 }
 
 const OTHER_MODE: Readonly<Record<ChannelMode, ChannelMode>> = { declarative: 'fungible', fungible: 'declarative' }
@@ -727,10 +728,10 @@ describe('b.deo SRI-105: a start without a record judges the configuration file 
     // bravo's declarative section is valid: only the fungible rules reject it.
     const personas = [bothSections('alpha'), h.persona('bravo')]
     h.materialize(...personas)
-    const file = configWith({ allow_invited_channels: true }, personas)
+    const file = configWith({ [MODE_SWITCH_SETTING]: true }, personas)
     const configBytes = h.writeConfig(file)
     const error = loaderErrorFor(file)
-    expectNamesBravoAnd(error, 'invited.permission_prompts')
+    expectNamesBravoAnd(error, FUNGIBLE_DESTINATION_SETTING)
 
     const run = await h.start()
 
@@ -1749,14 +1750,14 @@ describe('b.deo SRI-105: the reload tick judges a candidate by the mode its own 
       from: 'declarative',
       start: () => [bothSections('alpha'), h.persona('bravo')],
       bravo: (bravo) => bravo,
-      setting: 'invited.permission_prompts',
+      setting: FUNGIBLE_DESTINATION_SETTING,
     },
     {
       label: 'turns fungible mode on and sets bravo’s invited.permission_prompts to "dm" with DMs off',
       from: 'declarative',
       start: () => [bothSections('alpha'), bothSections('bravo')],
       bravo: (bravo) => ({ ...bravo, invited: { permission_prompts: 'dm' } }),
-      setting: 'invited.permission_prompts',
+      setting: FUNGIBLE_DESTINATION_SETTING,
     },
     {
       label: 'turns fungible mode off by removing the switch, the only edit, while bravo’s permission_prompts names a channel it does not list',
@@ -1901,32 +1902,39 @@ function fungibleConsumers({ destination = invitedDestination('bravo'), heldByLo
 }
 
 describe('b.deo SRI-801: an edit of the switch or of invited is held until confirmation (b.av2 SR-8.3 to SR-8.5)', () => {
-  test.each<{ label: string; from: ChannelMode; candidate: (alpha: PersonaInput, bravo: PersonaInput) => Record<string, unknown>; confirmed: () => ConsumersNow }>([
+  /**
+   * Each row's `changed`: the one consumer field its edit changes once
+   * confirmed (the mode, the notice destination, or the loop guard's result
+   * for `set_channel_delivery`). The whole consumer state after a switch
+   * change or an in-place `invited` change is pinned in
+   * `tests/reload-apply.test.ts` (b.deo SRI-203, SRI-703, SRI-805).
+   */
+  test.each<{ label: string; from: ChannelMode; candidate: (alpha: PersonaInput, bravo: PersonaInput) => Record<string, unknown>; changed: () => Partial<ConsumersNow> }>([
     {
       label: 'the switch turned on',
       from: 'declarative',
       candidate: (alpha, bravo) => configWith(turnOn('fungible'), [alpha, bravo]),
-      confirmed: () => fungibleConsumers(),
+      changed: () => ({ mode: 'fungible' }),
     },
     {
       label: 'the switch turned off',
       from: 'fungible',
       candidate: (alpha, bravo) => configWith(turnOn('declarative'), [alpha, bravo]),
-      confirmed: () => declarativeConsumers(),
+      changed: () => ({ mode: 'declarative' }),
     },
     {
       label: 'bravo’s invited.permission_prompts moved in fungible mode',
       from: 'fungible',
       candidate: (alpha, bravo) => configWith(startSwitch('fungible'), [alpha, { ...bravo, invited: { permission_prompts: MOVED_DESTINATION } }]),
-      confirmed: () => fungibleConsumers({ destination: MOVED_DESTINATION }),
+      changed: () => ({ notice: fungibleConsumers({ destination: MOVED_DESTINATION }).notice }),
     },
     {
       label: 'alpha’s invited.permission_prompts moved onto the unlisted channel bravo serves at all, in fungible mode',
       from: 'fungible',
       candidate: (alpha, bravo) => configWith(startSwitch('fungible'), [{ ...alpha, invited: { permission_prompts: UNLISTED_CHANNEL } }, bravo]),
-      confirmed: () => fungibleConsumers({ heldByLoopGuard: true }),
+      changed: () => ({ setChannelDelivery: fungibleConsumers({ heldByLoopGuard: true }).setChannelDelivery }),
     },
-  ])('$label: over many checks the pending file and preview are written, and delivery, posting scope, set_channel_delivery and the notice destination stay as they were until the confirmation', async ({ from, candidate, confirmed }) => {
+  ])('$label: over many checks the pending file and preview are written, and delivery, posting scope, set_channel_delivery and the notice destination stay as they were until the confirmation', async ({ from, candidate, changed }) => {
     const personas = [bothSections('alpha'), bothSections('bravo')]
     const { run, recordBytes } = await runningIn(from, personas, { realLifecycle: true })
     run.registerSession('alpha')
@@ -1961,8 +1969,9 @@ describe('b.deo SRI-801: an edit of the switch or of invited is held until confi
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
     expect(h.readRecord()).toEqual(h.readConfig())
     const after = await consumersNow(run)
-    expect(after).toEqual(confirmed())
     expect(after).not.toEqual(before)
+    expect(before).not.toMatchObject(changed())
+    expect(after).toMatchObject(changed())
     assertNoLeak(run.captured({ after }))
   })
 })
@@ -1972,15 +1981,15 @@ describe('b.deo SRI-907: a pasted value in the switch or in invited.permission_p
     {
       label: 'the switch as a string',
       from: 'declarative',
-      candidate: (alpha, bravo) => configWith({ allow_invited_channels: LEAK_SENTINEL }, [alpha, bravo]),
-      setting: 'allow_invited_channels',
+      candidate: (alpha, bravo) => configWith({ [MODE_SWITCH_SETTING]: LEAK_SENTINEL }, [alpha, bravo]),
+      setting: MODE_SWITCH_SETTING,
       bravoNamed: false,
     },
     {
       label: 'bravo’s invited.permission_prompts in fungible mode',
       from: 'fungible',
       candidate: (alpha, bravo) => configWith(startSwitch('fungible'), [alpha, { ...bravo, invited: { permission_prompts: LEAK_SENTINEL } }]),
-      setting: 'invited.permission_prompts',
+      setting: FUNGIBLE_DESTINATION_SETTING,
       bravoNamed: true,
     },
   ])('$label holding the sentinel is an INVALID candidate naming the setting only, and its confirmation applies nothing', async ({ from, candidate, setting, bravoNamed }) => {
