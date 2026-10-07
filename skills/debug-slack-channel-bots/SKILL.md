@@ -771,8 +771,8 @@ running are not affected. See
     and, before that, [Who can reach a persona in fungible mode](../../README.md#who-can-reach-a-persona-in-fungible-mode)).
   - Remove the app from the channel.
 
-  Fungible mode is never the fix for a group DM: a group DM is never served
-  in either mode. If the ID is a group DM (someone @mentioned the persona in
+  Turning fungible mode on is a fix for a channel only,
+  and never for a group DM: a group DM is never served in either mode. If the ID is a group DM (someone @mentioned the persona in
   a multi-person DM), the line is expected: do not add that ID to any
   persona's `channels`, because that would deliver group-DM mentions to it.
 
@@ -977,6 +977,16 @@ running are not affected. See
   and fix are under
   [The store's `[slack] channel-delivery:` lines](#the-stores-slack-channel-delivery-lines).
   Once the cause is fixed, ask the persona to set the value again.
+- **An input the store refuses:** a call that passed every refusal above can
+  still be turned away by the store's own check of what it would write. The
+  agent gets
+  `Tool "set_channel_delivery" failed for persona "<name>" (key=<key>): the choice was not stored (the store refused its <field>), so channel delivery is unchanged.`
+  This is not one of the refusals above, which the server checks before the
+  store. Nothing is stored or written, and no line is logged. `<field>` is
+  `key`, `channel`, `delivery`, `declaration` or `set_at`. The refusals above
+  screen the first four, so in practice it is `set_at`: the host's clock gave
+  no valid time to store with the choice. Fix: have the operator check the
+  host's system clock, then ask the persona to set the value again.
 
 ### `persona-destination-failed`
 
@@ -991,8 +1001,9 @@ running are not affected. See
   - **Declarative mode:** its `permission_prompts` value. The lines read as
     above.
   - **Fungible mode:** its fungible destination, the
-    `invited.permission_prompts` value, or `dm` when that is absent. The
-    lines name the setting after the value:
+    `invited.permission_prompts` value; when that is absent, its default
+    `"dm"`, which the lines render as `dm`. The lines name the setting after
+    the value:
     - `[slack] persona-destination-failed: personas[<i>] "<name>" (key=<key>): <step> failed for destination=<dest> (invited.permission_prompts) with error <code>; holding its permission prompts and notices and retrying with backoff`
     - `[slack] persona-destination-failed: personas[<i>] "<name>" (key=<key>): cleared: destination=<dest> (invited.permission_prompts) accepts posts again (was <step> error <code>); delivering what was held`
 
@@ -1038,7 +1049,8 @@ running are not affected. See
     retry delivers what was held.
   - `not_in_channel`: the persona's app isn't a member of its destination
     channel: its `permission_prompts` channel in declarative mode, its
-    `invited.permission_prompts` channel in fungible mode. Invite the app to
+    `invited.permission_prompts` channel in fungible mode (a channel ID set
+    there; its default, `"dm"`, posts to the DM instead). Invite the app to
     that channel (in Slack, `/invite @<app name>` in the channel). In
     fungible mode the invite also makes the persona hear that channel, at
     `mentions` unless its agent chose otherwise.
@@ -1053,7 +1065,7 @@ running are not affected. See
   - To send the persona's prompts and notices somewhere else instead, change
     its destination setting in `config.json`: `permission_prompts` in
     declarative mode, `invited.permission_prompts` in fungible mode (a
-    channel its app is in, or `dm`), or its `dm.contact`. The edit becomes pending (see
+    channel its app is in, or `"dm"`, its default), or its `dm.contact`. The edit becomes pending (see
     [Pending changes](#pending-changes)); once confirmed (see
     [Confirming a pending change](#confirming-a-pending-change)) it applies
     in place, with no restart, and the persona keeps its instance and
@@ -1280,8 +1292,10 @@ restarts were capped, restart the server.
 
 ### Two personas post lost-message notices about each other
 
-This arises only in declarative mode. In fungible mode the loop guard holds
-every persona at `mentions` in each other persona's fungible destination
+This arises only in declarative mode, where a persona's destination is its
+`permission_prompts`. In fungible mode a persona's destination is its
+`invited.permission_prompts` (default `"dm"`), and the loop guard holds every
+persona at `mentions` in each other persona's `invited.permission_prompts`
 channel, whatever it chose there (see **The loop guard** under
 [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to)),
 so no persona receives every message in another's destination.
@@ -1367,7 +1381,7 @@ line shows that the message's event reached the persona's app at all.
 | **An edit that adds a mention** (fungible mode) | A plain `… dropped message from channel=<id> …: non-message` line for the edit. In fungible mode an @mention is delivered from its `message` event, and an edit arrives as an `app_mention` (which fungible mode never decides on) plus a `message_changed` event, which is never delivered. | Post another message that @mentions the persona. |
 | **A message posted before the invite** | No line at all, not even a `RAW message event` line: Slack sends the app no event for a message posted before it joined the channel. | Post the message again. The persona can read earlier messages with `fetch_messages` when asked. |
 | **The channel at `mentions`, and the message doesn't @mention the persona** (fungible mode) | A plain `… dropped message from channel=<id> …: not-mentioned` line. The channel's `persona-invited-channel` line shows `at channel delivery mentions`. | @mention the persona, or ask it in that channel to switch the channel to `all` (it calls `set_channel_delivery`; see [`persona-channel-delivery-set`](#persona-channel-delivery-set)). |
-| **The loop guard** (fungible mode) | As for `mentions` above, but the channel is another applied persona's fungible destination (its `invited.permission_prompts` channel), so the `persona-invited-channel` line shows `mentions` whatever this persona chose. A `persona-channel-delivery-set` line for it reads `to all, at channel delivery mentions after the loop guard`. | @mention the persona there. Asking it to switch to `all` changes nothing while the guard holds the channel. To serve it at `all`, have the operator give the other persona a different `invited.permission_prompts` and confirm the change. |
+| **The loop guard** (fungible mode) | As for `mentions` above, but the channel is another applied persona's fungible destination (its `invited.permission_prompts` channel), so the `persona-invited-channel` line shows `mentions` whatever this persona chose. A `persona-channel-delivery-set` line for it reads `to all, at channel delivery mentions after the loop guard`. | @mention the persona there. Asking it to switch to `all` changes nothing while the guard holds the channel. To serve it at `all`, have the operator give the other persona a different `invited.permission_prompts` (another channel, or its default `"dm"`) and confirm the change. |
 | **The stored-choice file is unreadable** (fungible mode) | A [`channel-delivery-unreadable`](#channel-delivery-unreadable) line at the latest start. Every `persona-invited-channel` line shows `mentions`, and `set_channel_delivery` is refused. | See [`channel-delivery-unreadable`](#channel-delivery-unreadable). |
 | **The persona isn't up, or its instance isn't taking messages** | A class line after its latest `persona-start` line, or a *Message lost* notice at its destination with a `No live session` or `DROP: no _GET_stream` line. A lost message still logs the channel's `persona-invited-channel` line in fungible mode. | See [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running) and [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected). |
 
@@ -6189,7 +6203,8 @@ writes it; it is absent until a key is first recorded. Never edit it.
 The server keeps the channel deliveries that personas' agents choose with
 `set_channel_delivery` in `channel-delivery.json`, in the state directory
 beside `retired-keys.json`. For each persona key it holds the persona's
-declaration (its `name`, `credentials_file` and `working_directory`) and, for
+declaration (its `name`, and its `credentials_file` and `working_directory`
+as absolute paths with `~` expanded) and, for
 each channel, the stored choice (`mentions` or `all`) and when it was stored.
 That is persona keys, names, paths, channel IDs, choices and times only: no
 token, no credentials content and no message text.
@@ -6312,7 +6327,7 @@ sets them again. `<reason>` is one of:
 |---|---|
 | `retired by a confirmed change` | A confirmed change retired the key: the persona was removed, renamed (its old key), or destructively modified (`name`, `credentials_file` or `working_directory` changed; see [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)). Logged once the change's last-applied record is written. At a start it also covers a key that `retired-keys.json` holds as retired while the persona's next session has not begun. |
 | `not an applied persona at start` | At a start, the key belongs to no persona in the configuration the start runs: the persona was removed or renamed, for example by a start without the record. |
-| `its declaration changed` | At a start, the persona's `name`, `credentials_file` or `working_directory` differs from the one stored with its choices. Paths count as equal when they are equal as written or resolve to the same real path, so a symlink retargeted to another directory counts as changed. |
+| `its declaration changed` | At a start, the persona's `name`, `credentials_file` or `working_directory` differs from the one stored with its choices. Paths count as equal when they are equal as written (after `~` is expanded) or resolve to the same real path. Retargeting a symlink that the persona's path names is no change. A path that a confirmed change respelled to another path with the same real path counts as changed if that real path later changes before an accepted `set_channel_delivery` call writes the persona's entry again. |
 
 The start rules run right after the read at every start, in both modes, so
 drop lines can appear in declarative mode whenever the file exists. A key that

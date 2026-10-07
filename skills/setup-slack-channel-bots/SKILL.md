@@ -148,8 +148,10 @@ mode in force is the record's when the record exists (Step 3), otherwise
   `"allow_invited_channels": true` to `config.json`, keeping every other
   field. For declarative mode, write nothing.
 - **An existing install:** state the mode in force and ask only whether to
-  change it. If `config.json`'s switch differs from the record's, a switch
-  change is already pending: say so, and ask whether to keep it.
+  change it. Compare the two files' modes, not their printed values: `null`
+  and `false` are the same mode. Only when `config.json`'s mode differs from
+  the record's is a switch change already pending: say so, and ask whether to
+  keep it.
 
 Step 5 adds each persona in the mode `config.json` holds after this step.
 
@@ -187,11 +189,12 @@ to review, for each persona's app:
 
 - its channel memberships in Slack, private channels included: each one
   becomes a channel the persona serves;
-- its past `unclaimed-channel` lines in `server.log`, which show channels
-  whose messages reached the app with no persona serving them:
+- its past `unclaimed-channel` lines in `server.log` and its rotated files
+  (`server.log.1` and later), which show channels whose messages reached the
+  app with no persona serving them:
 
   ```bash
-  grep -F unclaimed-channel "$STATE_DIR/server.log"
+  grep -h -F unclaimed-channel "$STATE_DIR"/server.log.* "$STATE_DIR"/server.log 2>/dev/null
   ```
 
 and to read the README's `### Who can reach a persona in fungible mode`, since
