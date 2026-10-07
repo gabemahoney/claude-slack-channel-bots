@@ -170,8 +170,9 @@ section the mode turned on needs:
   doesn't read them, and declarative mode uses them again if the switch is
   turned off. See the README's `### Permission prompts in fungible mode`.
 - **Turning fungible mode off** (remove `allow_invited_channels`, or set it to
-  `false`): every persona needs `channels` and a top-level
-  `permission_prompts` valid by the declarative-mode rules. A persona whose
+  `false`): every persona needs a top-level `permission_prompts`, and
+  `channels` unless its `dm.enabled` is `true`, valid by the declarative-mode
+  rules. A persona whose
   declarative section already passes them keeps it; for each other persona,
   collect them as in 5.5 to 5.7. Its `invited` may stay: declarative mode
   doesn't read it.

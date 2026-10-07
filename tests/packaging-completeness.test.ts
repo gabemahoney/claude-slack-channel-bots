@@ -60,9 +60,11 @@
  *   - the entry for a persona silent in a channel its app was invited to is
  *     a heading exactly once;
  *   - each passage that describes a destination as the `permission_prompts`
- *     value (a file-local list, located by heading or table row) also names
- *     `invited.permission_prompts` and its `"dm"` default (`DM_DESTINATION`,
- *     quoted or bare as a log line renders it).
+ *     value (a file-local list, located by heading, table row or bullet
+ *     lead) also names `invited.permission_prompts` and its `"dm"` default
+ *     (`DM_DESTINATION`, quoted or bare as a log line renders it); a passage
+ *     naming the setting a confirmed change moves the destination by names
+ *     `invited.permission_prompts`.
  * Each check is a pure function of the skill's text and has a self-check
  * that cuts its element from an in-memory copy and sees that element alone
  * reported.
@@ -136,6 +138,12 @@ import {
   PERSONA_DIAGNOSTIC_CLASSES,
   PERSONA_INVITED_CHANNEL,
   UNCLAIMED_CHANNEL,
+  channelDeliverySetCause,
+  formatPersonaDiagnostic,
+  fungibleUnclaimedChannelCause,
+  invitedChannelCause,
+  NO_STORED_CHOICE,
+  type PersonaDiagnosticClass,
 } from '../src/persona-diagnostics.ts'
 import { RELOAD_DIAGNOSTIC_CLASSES, RELOAD_RECORD_WRITE_FAILED, reloadChannelDeliveryWriteFailedLine } from '../src/reload.ts'
 import { modeSwitchLine, recordedLine, type RecordedSectionKey } from '../src/reload-plan.ts'
@@ -715,13 +723,37 @@ const DM_SPAN = `\`"?${escapeRegExp(DM_DESTINATION)}"?\``
 /** The `"dm"` default stated beside `"dm"`: "default" or "absent" within one clause of the span, either side. */
 const DM_DEFAULT = new RegExp(`${DM_SPAN}.{0,80}\\b(?:default|absent)\\b|\\b(?:default|absent)\\b.{0,80}${DM_SPAN}`)
 
+/** What a passage lacks of the fungible destination setting's name (b.deo SRI-1108). */
+function settingProblems(passage: string): string[] {
+  return flat(passage).includes(FUNGIBLE_DESTINATION_SETTING) ? [] : [`names no ${FUNGIBLE_DESTINATION_SETTING}`]
+}
+
 /** What a destination passage lacks: the fungible destination setting, and its `"dm"` default (b.deo SRI-1108, SRI-702). */
 function destinationProblems(passage: string): string[] {
-  const text = flat(passage)
-  return [
-    ...(text.includes(FUNGIBLE_DESTINATION_SETTING) ? [] : [`names no ${FUNGIBLE_DESTINATION_SETTING}`]),
-    ...(DM_DEFAULT.test(text) ? [] : [`names no "${DM_DESTINATION}" default`]),
-  ]
+  return [...settingProblems(passage), ...(DM_DEFAULT.test(flat(passage)) ? [] : [`names no "${DM_DESTINATION}" default`])]
+}
+
+/**
+ * The bullet in `section` whose line starts (after its indent) with `lead`,
+ * with its continuation and nested lines: up to the next non-blank line
+ * indented no deeper than it. Throws naming `where` when no line has the lead.
+ */
+function bulletLed(section: string, lead: string, where: string): string {
+  const lines = section.split('\n')
+  const indentOf = (line: string) => line.length - line.trimStart().length
+  const start = lines.findIndex((line) => line.trimStart().startsWith(lead))
+  if (start < 0) throw new Error(`${where} has no bullet led by "${lead}"`)
+  const end = lines.findIndex((line, i) => i > start && line.trim() !== '' && indentOf(line) <= indentOf(lines[start]))
+  return lines.slice(start, end < 0 ? undefined : end).join('\n')
+}
+
+/** The bullet led by `lead` in the `persona-destination-failed` entry. */
+function destinationFailedBullet(text: string, lead: string): string {
+  return bulletLed(
+    requiredSection(text, classHeading(PERSONA_DESTINATION_FAILED), SKILL_REL),
+    lead,
+    `${SKILL_REL}, under the \`${PERSONA_DESTINATION_FAILED}\` entry,`,
+  )
 }
 
 /** Triage step `n` of the skill, from its `n. ` line to the next numbered step. */
@@ -741,7 +773,12 @@ function triageStep(text: string, n: number): string {
  */
 const DESTINATION_PASSAGES: [string, (text: string) => string][] = [
   ['Triage step 1', (text) => triageStep(text, 1)],
-  [`the \`${PERSONA_DESTINATION_FAILED}\` entry`, (text) => requiredSection(text, classHeading(PERSONA_DESTINATION_FAILED), SKILL_REL)],
+  [`the \`${PERSONA_DESTINATION_FAILED}\` entry's fungible-mode <dest>`, (text) => destinationFailedBullet(text, '- **Fungible mode:**')],
+  [`the \`${PERSONA_DESTINATION_FAILED}\` entry's not_in_channel fix`, (text) => destinationFailedBullet(text, '- `not_in_channel`:')],
+  [
+    `the \`${PERSONA_DESTINATION_FAILED}\` entry's fix sending prompts and notices elsewhere`,
+    (text) => destinationFailedBullet(text, "- To send the persona's prompts and notices somewhere else"),
+  ],
   ["\"A running persona's directory disappears later\"", (text) => requiredSection(text, "### A running persona's directory disappears later", SKILL_REL)],
   [
     `the "Other lines you may see" row for a "${DM_DESTINATION}" destination without DMs or a contact`,
@@ -752,13 +789,47 @@ const DESTINATION_PASSAGES: [string, (text: string) => string][] = [
         `${SKILL_REL}, under "## Other lines you may see",`,
       ),
   ],
-  ["\"A persona can't open a DM\"", (text) => requiredSection(text, /^## A persona can't open a DM\b/, SKILL_REL)],
+  [
+    '"A persona can\'t open a DM"\'s "Same cause, prompts and notices" bullet',
+    (text) =>
+      bulletLed(
+        requiredSection(text, /^## A persona can't open a DM\b/, SKILL_REL),
+        '- **Same cause, prompts and notices:**',
+        `${SKILL_REL}, under "## A persona can't open a DM",`,
+      ),
+  ],
   ['"Two personas post lost-message notices about each other"', (text) => requiredSection(text, '### Two personas post lost-message notices about each other', SKILL_REL)],
   [
     "the silence entry's loop-guard row",
     (text) => rowHolding(requiredSection(text, `## ${SILENCE_TITLE}`, SKILL_REL), '| **The loop guard**', `${SKILL_REL}, under "## ${SILENCE_TITLE}",`),
   ],
 ]
+
+/**
+ * Passages that name the destination setting a confirmed change moves the
+ * destination by, rather than the destination itself: each must name
+ * `invited.permission_prompts` for fungible mode. An absent value and `"dm"`
+ * count as the same, so no change between them moves the destination and no
+ * `"dm"` default is asked of them.
+ */
+const SETTING_PASSAGES: [string, (text: string) => string][] = [
+  [
+    `the \`${PERSONA_DESTINATION_FAILED}\` entry's destination moved by a confirmed change`,
+    (text) => destinationFailedBullet(text, '- the line is logged once per episode.'),
+  ],
+]
+
+/**
+ * The skill's text with `cut` applied to the passage `passageOf` locates (an
+ * in-memory copy), and that passage located again in the copy. Asserts the
+ * cut changed the copy, so a self-check never passes on an untouched text.
+ */
+function passageAfterCut(passageOf: (text: string) => string, cut: (passage: string) => string): string {
+  const passage = passageOf(debugSkill())
+  const edited = debugSkill().replace(passage, () => cut(passage))
+  expect(edited).not.toBe(debugSkill())
+  return passageOf(edited)
+}
 
 describe('b.deo SRI-1108: the debugging skill describes fungible mode (AC 43)', () => {
   describe('the three entries', () => {
@@ -878,14 +949,26 @@ describe('b.deo SRI-1108: the debugging skill describes fungible mode (AC 43)', 
     })
 
     test.each(DESTINATION_PASSAGES)(`self-check: %s with ${FUNGIBLE_DESTINATION_SETTING} cut fails on it alone`, (_label, passageOf) => {
-      expect(destinationProblems(passageOf(debugSkill()).replaceAll(FUNGIBLE_DESTINATION_SETTING, ''))).toEqual([
+      expect(destinationProblems(passageAfterCut(passageOf, (p) => p.replaceAll(FUNGIBLE_DESTINATION_SETTING, '')))).toEqual([
         `names no ${FUNGIBLE_DESTINATION_SETTING}`,
       ])
     })
 
     test.each(DESTINATION_PASSAGES)(`self-check: %s with its "${DM_DESTINATION}" default cut fails on it alone`, (_label, passageOf) => {
-      expect(destinationProblems(passageOf(debugSkill()).replace(/\b(?:default|absent)\b/g, ''))).toEqual([
+      expect(destinationProblems(passageAfterCut(passageOf, (p) => p.replace(/\b(?:default|absent)\b/g, '')))).toEqual([
         `names no "${DM_DESTINATION}" default`,
+      ])
+    })
+  })
+
+  describe(`each passage naming the setting a confirmed change moves the destination by names ${FUNGIBLE_DESTINATION_SETTING}`, () => {
+    test.each(SETTING_PASSAGES)('%s', (_label, passageOf) => {
+      expect(settingProblems(passageOf(debugSkill()))).toEqual([])
+    })
+
+    test.each(SETTING_PASSAGES)(`self-check: %s with ${FUNGIBLE_DESTINATION_SETTING} cut fails`, (_label, passageOf) => {
+      expect(settingProblems(passageAfterCut(passageOf, (p) => p.replaceAll(FUNGIBLE_DESTINATION_SETTING, '')))).toEqual([
+        `names no ${FUNGIBLE_DESTINATION_SETTING}`,
       ])
     })
   })
@@ -899,6 +982,7 @@ describe('b.deo SRI-1108: the debugging skill describes fungible mode (AC 43)', 
 const NAME = '<name>'
 const KEY = '<key>'
 const PATH = '<path>'
+const CHANNEL = '<id>'
 
 /** Sample values a builder needs in a checked shape, each swapped for its placeholder after rendering. */
 const SAMPLE_KEY = 'ops_bot'
@@ -909,6 +993,11 @@ const SAMPLE_VALUE = 'often'
 function afterRef(rendered: string): string {
   const ref = `(key=${KEY}): `
   return rendered.slice(rendered.indexOf(ref) + ref.length)
+}
+
+/** The persona line of class `label` with `cause`, its index, name and key as the skill's placeholders. */
+function personaLineTemplate(label: PersonaDiagnosticClass, cause: string): string {
+  return formatPersonaDiagnostic({ class: label, name: NAME, key: KEY, index: 0, cause }).replace('personas[0]', 'personas[<i>]')
 }
 
 /** A recorded change's preview line for `fields`, with its fields and its section's mode as the skill's placeholders. */
@@ -932,10 +1021,37 @@ function modeSwitchTemplate(mode: ChannelMode): string {
  * `set_channel_delivery` refusals and failed-write texts (b.deo SRI-502,
  * SRI-503, SRI-506), the store's lines (SRI-904, SRI-905), the stored-choice
  * `reload-record-write-failed` line (SRI-408), and the switch's and the
- * recorded change's preview lines (SRI-803, SRI-804). Rendered when a case
- * runs, never at collection.
+ * recorded change's preview lines (SRI-803, SRI-804), and the
+ * `persona-invited-channel`, `persona-channel-delivery-set` and fungible-mode
+ * `unclaimed-channel` lines (SRI-902, SRI-903). Rendered when a case runs,
+ * never at collection.
  */
 const QUOTED_TEXTS: [label: string, where: HeadingMatch, render: () => string][] = [
+  [
+    `the ${PERSONA_INVITED_CHANNEL} line`,
+    classHeading(PERSONA_INVITED_CHANNEL),
+    () =>
+      personaLineTemplate(PERSONA_INVITED_CHANNEL, invitedChannelCause(CHANNEL, 'public', 'mentions'))
+        .replace('hears public channel', 'hears <public|private> channel')
+        .replace('at channel delivery mentions', 'at channel delivery <mentions|all>'),
+  ],
+  [
+    `the ${PERSONA_CHANNEL_DELIVERY_SET} line`,
+    classHeading(PERSONA_CHANNEL_DELIVERY_SET),
+    () =>
+      personaLineTemplate(PERSONA_CHANNEL_DELIVERY_SET, channelDeliverySetCause(CHANNEL, undefined, 'all', 'mentions'))
+        .replace(`from ${NO_STORED_CHOICE} to all,`, `from <${NO_STORED_CHOICE}|mentions|all> to <mentions|all>,`)
+        .replace('at channel delivery mentions after', 'at channel delivery <mentions|all> after'),
+  ],
+  [
+    `the fungible-mode ${UNCLAIMED_CHANNEL} line`,
+    classHeading(UNCLAIMED_CHANNEL),
+    () =>
+      personaLineTemplate(UNCLAIMED_CHANNEL, fungibleUnclaimedChannelCause(CHANNEL, 'externally-shared')).replace(
+        FUNGIBLE_REFUSAL_TEXTS['externally-shared'],
+        '<reason>',
+      ),
+  ],
   ['the session-not-matched refusal', classHeading(PERSONA_CHANNEL_DELIVERY_SET), () => sessionNotMatchedRefusal(SET_CHANNEL_DELIVERY_TOOL)],
   ['the not-an-applied-persona refusal', classHeading(PERSONA_CHANNEL_DELIVERY_SET), () => personaNotAppliedRefusal(SET_CHANNEL_DELIVERY_TOOL, KEY)],
   ['the declarative-mode refusal', classHeading(PERSONA_CHANNEL_DELIVERY_SET), () => channelDeliveryDeclarativeRefusal(NAME, KEY)],
@@ -1034,9 +1150,16 @@ describe("the debugging skill's quoted texts are their builders' renderings (b.d
     expect(quotes(requiredSection(debugSkill(), where, SKILL_REL), rendered)).toBe(true)
   })
 
-  test.each(QUOTED_TEXTS)('self-check: %s cut from its section is no longer found', (_label, where, render) => {
-    const section = flat(requiredSection(debugSkill(), where, SKILL_REL))
-    expect(quotes(section.replaceAll(flat(render()), ''), render())).toBe(false)
+  test.each(QUOTED_TEXTS)('self-check: %s with one word changed where its section quotes it is no longer found', (_label, where, render) => {
+    const rendered = render()
+    expect(rendered.trim()).not.toBe('')
+    const word = rendered.match(/[A-Za-z]{3,}/)?.[0]
+    if (word === undefined) throw new Error(`the rendering "${rendered}" has no word to change`)
+    // Every place the section quotes the rendering, however the skill wraps it.
+    const quoted = new RegExp(flat(rendered).split(' ').map(escapeRegExp).join('\\s+'), 'g')
+    const edited = editSection(debugSkill(), where, (body) => body.replace(quoted, (quote) => quote.replace(word, 'XYZZY')))
+    expect(edited).not.toBe(debugSkill())
+    expect(quotes(requiredSection(edited, where, SKILL_REL), rendered)).toBe(false)
   })
 })
 

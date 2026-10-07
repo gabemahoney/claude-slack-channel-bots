@@ -22,8 +22,9 @@
  * switch, the fungible destination, the tool name and the class label are
  * imported from src/ as SCREAMING_CASE constants, and every other setting name
  * is checked against the loader's key lists, so this suite stays
- * non-touching. A control block cuts each pinned phrase, and
- * moves the step, on an in-memory copy, and checks the case then fails.
+ * non-touching. A control block cuts each pinned phrase, puts some back only
+ * just outside the part of the wizard they are read in, and moves the step, on
+ * an in-memory copy, and checks the case then fails.
  *
  * Covered elsewhere, not repeated here: the credentials command itself (its
  * section's one-line block, the CLI subcommand and the packaged script it
@@ -252,9 +253,9 @@ const CHANNEL_MODE_ELEMENTS: Element[] = [
     rx`for each persona whose \`${DM_ENABLED}\` isn't \`true\` or that has no \`${DM_CONTACT}\`, ask for its fungible destination, \`${INVITED_DESTINATION}\``,
   ],
   [
-    'turning fungible mode off needs channels and a top-level permission_prompts valid by the declarative-mode rules',
+    'turning fungible mode off needs a top-level permission_prompts, and channels unless DMs are on, valid by the declarative-mode rules',
     (doc) => listItem(channelModeStep(doc), 'Turning fungible mode off'),
-    rx`every persona needs \`${CHANNELS}\` and a top-level \`${PERMISSION_PROMPTS}\` valid by the declarative-mode rules`,
+    rx`every persona needs a top-level \`${PERMISSION_PROMPTS}\`, and \`${CHANNELS}\` unless its \`${DM_ENABLED}\` is \`true\`, valid by the declarative-mode rules`,
   ],
   ['checks every persona against the load-time rules of the mode in force after the edit', channelModeStep, rx`check every persona against the load-time rules of the mode in force after the edit`],
   ['names both rule sets, each for its mode', channelModeStep, rx`the declarative-mode rules when the switch is off, or the fungible-mode rules when it is on`],
@@ -382,6 +383,114 @@ function cut(doc: string, pattern: RegExp): string {
   return doc.replace(new RegExp(pattern.source.replaceAll(' ', '\\s+'), `${pattern.flags.replace('g', '')}g`), '')
 }
 
+const ALL_ELEMENTS: Element[] = [...CHANNEL_MODE_ELEMENTS, ...FUNGIBLE_ELEMENTS, ...DECLARATIVE_ELEMENTS]
+
+/** The pinned element labelled `label`, throwing when there is none, so a renamed label fails its control. */
+function element(label: string): Element {
+  const found = ALL_ELEMENTS.find(([l]) => l === label)
+  if (found === undefined) throw new Error(`no channel-mode element labelled "${label}"`)
+  return found
+}
+
+/**
+ * The offset in `doc` of the heading line of the section `path` names, each
+ * heading looked for inside the section before it (outermost first); -1 when
+ * one is missing.
+ */
+function headingOffset(doc: string, ...path: RegExp[]): number {
+  let offset = 0
+  let text = doc
+  for (const match of path) {
+    const range = sectionRange(text, match)
+    if (range === undefined) return -1
+    const lines = text.split('\n')
+    offset += lines.slice(0, range.start).reduce((n, line) => n + line.length + 1, 0)
+    text = lines.slice(range.start, range.end).join('\n')
+  }
+  return offset
+}
+
+/** The offset of the first `needle` in `doc` at or after the heading `path` names; -1 when either is missing. */
+function leadOffset(doc: string, needle: string, ...path: RegExp[]): number {
+  const start = headingOffset(doc, ...path)
+  return start < 0 ? -1 : doc.indexOf(needle, start)
+}
+
+/** The offset just after the first `needle` at or after the heading `path` names; -1 when either is missing. */
+function afterLead(doc: string, needle: string, ...path: RegExp[]): number {
+  const at = leadOffset(doc, needle, ...path)
+  return at < 0 ? -1 : at + needle.length
+}
+
+const STEP_CHANNEL_MODE = titled(3, 'Channel mode')
+const STEP_ADD_PERSONA = titled(3, 'Add a persona')
+
+/**
+ * Controls for the scope helpers: each element's phrase is cut from where it
+ * belongs and put back once just outside its scope (the step before, the other
+ * list item, before its lead, the other mode's part, a sibling sub-step), so a
+ * scope helper that reads too much (up to the whole wizard) fails its control,
+ * which `cut` alone, removing every copy, never shows. One at least per scope
+ * helper: `channelModeStep` (both ends), `listItem` (both items), `fromLead`,
+ * `modePart` (each lead), and `addPersonaSub` through `declareSub`.
+ */
+const MISPLACED: [label: string, where: string, at: (doc: string) => number, place: (phrase: string) => string][] = [
+  [
+    'names the switch, which picks the mode for every persona',
+    'at the end of "Detect the server state", before the channel-mode step',
+    (doc) => headingOffset(doc, STEP_CHANNEL_MODE),
+    (phrase) => `${phrase}.\n\n`,
+  ],
+  [
+    'the pending change is never INVALID',
+    'at the start of "Add a persona", after the channel-mode step',
+    (doc) => afterLead(doc, '\n', STEP_ADD_PERSONA),
+    (phrase) => `\n${phrase}.\n`,
+  ],
+  [
+    'turning fungible mode on sets the switch to true',
+    'in the "Turning fungible mode off" item',
+    (doc) => afterLead(doc, '**Turning fungible mode off**', STEP_CHANNEL_MODE),
+    (phrase) => ` ${phrase}`,
+  ],
+  [
+    'turning fungible mode off needs a top-level permission_prompts, and channels unless DMs are on, valid by the declarative-mode rules',
+    'in the "Turning fungible mode on" item',
+    (doc) => afterLead(doc, '**Turning fungible mode on**', STEP_CHANNEL_MODE),
+    (phrase) => ` ${phrase}.`,
+  ],
+  [
+    `the review step: the command that finds the ${UNCLAIMED_CHANNEL} lines`,
+    'in the channel-mode step, before the review step\'s lead',
+    (doc) => leadOffset(doc, '**Before turning fungible mode on', STEP_CHANNEL_MODE),
+    (phrase) => `${phrase}\n\n`,
+  ],
+  [
+    '"Channels", either-mode part: in fungible mode the invite makes the persona serve the channel',
+    'at the end of the fungible part of "Channels"',
+    (doc) => leadOffset(doc, EITHER_PART, STEP_ADD_PERSONA, titled(4, 'Channels')),
+    (phrase) => `${phrase}.\n\n`,
+  ],
+  [
+    '"Channels", declarative part: each channel\'s id',
+    'at the end of the fungible part of "Channels"',
+    (doc) => leadOffset(doc, EITHER_PART, STEP_ADD_PERSONA, titled(4, 'Channels')),
+    (phrase) => `${phrase}.\n\n`,
+  ],
+  [
+    `"Permission prompts", fungible part: the top-level ${PERMISSION_PROMPTS} is not read`,
+    'at the end of the declarative part of "Permission prompts"',
+    (doc) => leadOffset(doc, FUNGIBLE_PART, STEP_ADD_PERSONA, titled(4, 'Permission prompts')),
+    (phrase) => `${phrase}.\n\n`,
+  ],
+  [
+    '"Declare the persona": the fungible entry has no declarative section',
+    'at the end of the sub-step before "Declare the persona"',
+    (doc) => headingOffset(doc, STEP_ADD_PERSONA, titled(4, 'Declare the persona')),
+    (phrase) => `${phrase}.\n\n`,
+  ],
+]
+
 describe('setup wizard: the setting names the channel-mode cases read are loader keys', () => {
   test.each(SETTING_NAMES)('%s is in %s', (name, _list, keys) => {
     expect(keys).toContain(name)
@@ -413,7 +522,7 @@ describe('setup wizard: "Add a persona" in fungible mode (b.deo SRI-1109, AC 43)
 })
 
 // Controls for the channel-mode cases: each fails on an in-memory copy of the
-// wizard with its phrase cut, or with the step moved.
+// wizard with its phrase cut, its phrase only outside its scope, or the step moved.
 describe('setup wizard: the channel-mode cases fail when their element is gone', () => {
   test('moving the channel-mode step after "Add a persona" fails the order case', () => {
     const lines = skill.split('\n')
@@ -425,9 +534,21 @@ describe('setup wizard: the channel-mode cases fail when their element is gone',
     expect(modeStepOrder(moved)).toEqual(['Detect the server state', 'Add a persona', 'Channel mode'])
   })
 
-  test.each([...CHANNEL_MODE_ELEMENTS, ...FUNGIBLE_ELEMENTS, ...DECLARATIVE_ELEMENTS])('cutting the phrase fails: %s', (_label, scope, pattern) => {
+  test.each(ALL_ELEMENTS)('cutting the phrase fails: %s', (_label, scope, pattern) => {
     const mutant = cut(skill, pattern)
     expect(mutant).not.toBe(skill)
+    expect(flat(scope(mutant))).not.toMatch(pattern)
+  })
+
+  test.each(MISPLACED)('the phrase only outside its scope fails: %s, %s', (label, _where, at, place) => {
+    const [, scope, pattern] = element(label)
+    const phrase = flat(skill).match(pattern)?.[0]
+    expect(phrase).toBeDefined()
+    const cutDoc = cut(skill, pattern)
+    const offset = at(cutDoc)
+    expect(offset).toBeGreaterThanOrEqual(0)
+    const mutant = cutDoc.slice(0, offset) + place(phrase!) + cutDoc.slice(offset)
+    expect(flat(mutant)).toMatch(pattern)
     expect(flat(scope(mutant))).not.toMatch(pattern)
   })
 

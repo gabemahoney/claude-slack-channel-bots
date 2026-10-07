@@ -229,8 +229,10 @@
  *     and rows, "Confirming a change" and the switch's take-effect exception
  *     (SRI-1103); the troubleshooting entries and the downgrade steps
  *     (SRI-1105). Setting names come from `src/` or typed names, preview
- *     lines from `modeSwitchLine` and `recordedLine`, labels from their
- *     exports;
+ *     lines from `modeSwitchLine` and `recordedLine` (built when the row
+ *     runs), labels from their exports; the switch's line is read in its
+ *     second carrier too, the setup wizard's step on how a change takes
+ *     effect (`WIZARD_SWITCH_LINE_ROW`);
  *   - the declarative-scoped sections' pointers resolve into `## Channel
  *     modes`; the tools table lists exactly six tools; the fungible-mode
  *     preview example is `renderPreviewLines` of the change it describes,
@@ -487,6 +489,7 @@ import {
   PERSONA_CHANNEL_DELIVERY_SET,
   PERSONA_INVITED_CHANNEL,
   UNCLAIMED_CHANNEL,
+  UNCLAIMED_REASON_CHANNEL_ID_MALFORMED,
   UNCLAIMED_REASON_EXTERNALLY_SHARED,
 } from '../src/persona-diagnostics.ts'
 import { FUNGIBLE_MODE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
@@ -779,6 +782,25 @@ describe('README.md', () => {
      */
     const RETIRED_SESSION = 'Retired: never resumed'
 
+    /** The server-wide row: a server-wide setting, found by "server-wide" in its Change cell. */
+    const SERVER_WIDE_ROW: Expected = {
+      label: 'a server-wide setting',
+      find: (row) => /server-wide/i.test(row.change),
+      session: 'Not affected',
+      destructive: false,
+    }
+
+    /** The switch's row, found by the switch named in its Change cell (b.deo SRI-805). */
+    const SWITCH_ROW: Expected = { label: `the switch ${MODE_SWITCH_SETTING}`, find: naming(MODE_SWITCH_SETTING), session: 'Kept', destructive: false }
+
+    /** The recorded row, found by the section keys its Change cell names (b.deo SRI-805, SRI-1103). */
+    const RECORDED_ROW: Expected = {
+      label: `a recorded change to the section not in force (${RECORDED_SECTION_KEYS.join(', ')})`,
+      find: naming(...RECORDED_SECTION_KEYS),
+      session: 'Kept',
+      destructive: false,
+    }
+
     /**
      * One entry per change kind the plan classifies (`ValidChangePlan`'s lists),
      * the settings expanded from the plan's exported classes. A new kind in the
@@ -828,23 +850,8 @@ describe('README.md', () => {
         session: RETIRED_SESSION,
         destructive: true,
       })),
-      settings: [
-        {
-          label: 'a server-wide setting',
-          find: (row) => /server-wide/i.test(row.change),
-          session: 'Not affected',
-          destructive: false,
-        },
-        { label: `the switch ${MODE_SWITCH_SETTING}`, find: naming(MODE_SWITCH_SETTING), session: 'Kept', destructive: false },
-      ],
-      recorded: [
-        {
-          label: `a recorded change to the section not in force (${RECORDED_SECTION_KEYS.join(', ')})`,
-          find: naming(...RECORDED_SECTION_KEYS),
-          session: 'Kept',
-          destructive: false,
-        },
-      ],
+      settings: [SERVER_WIDE_ROW, SWITCH_ROW],
+      recorded: [RECORDED_ROW],
       added: [
         {
           label: 'a persona is added',
@@ -869,7 +876,7 @@ describe('README.md', () => {
     )
 
     test('the server-wide row names a real top-level setting, such as port', () => {
-      const row = rows.find(EXPECTED.settings[0].find)
+      const row = rows.find(SERVER_WIDE_ROW.find)
       if (!row) throw new Error('no server-wide row in the table')
       const named = codeSpans(row.change)
       expect(named).toContain('port')
@@ -878,7 +885,7 @@ describe('README.md', () => {
 
     /** The server-wide row's problems in `all`: its Once confirmed cell keeps the next server start and names the switch as its exception (b.deo SRI-805). */
     function serverWideExceptionProblems(all: readonly Row[]): string[] {
-      const row = all.find(EXPECTED.settings[0].find)
+      const row = all.find(SERVER_WIDE_ROW.find)
       if (row === undefined) return ['no server-wide row']
       return [
         ...(/\bnext server start\b/.test(row.confirmed) ? [] : ['Once confirmed names no next server start']),
@@ -891,21 +898,28 @@ describe('README.md', () => {
       expect(serverWideExceptionProblems(rows)).toEqual([])
     })
 
+    /** The recorded row's problems in `all`: its Once confirmed cell names no `reload-noop` (b.deo SRI-804, SRI-1103). */
+    function recordedNoopProblems(all: readonly Row[]): string[] {
+      const row = all.find(RECORDED_ROW.find)
+      if (row === undefined) return ['no recorded row']
+      return codeSpans(row.confirmed).includes(RELOAD_NOOP) ? [] : [`Once confirmed names no \`${RELOAD_NOOP}\``]
+    }
+
     test(`the recorded row's Once confirmed cell names \`${RELOAD_NOOP}\` for a confirmation of recorded changes only (b.deo SRI-804, SRI-1103)`, () => {
-      const row = rows.find(EXPECTED.recorded[0].find)
-      if (row === undefined) throw new Error('no recorded row in the table')
-      expect(codeSpans(row.confirmed)).toContain(RELOAD_NOOP)
+      expect(recordedNoopProblems(rows)).toEqual([])
     })
 
     /**
      * Self-checks on edited copies of the README (b.deo SRI-805): each of the
      * two rows this work adds, the switch's and the recorded one, fails its
      * case when it is removed or duplicated, when its Live session changes,
-     * and when its Once confirmed cell gains `DESTRUCTIVE:`; the server-wide
-     * exception case fails when the switch is cut from that row.
+     * and when its Once confirmed cell gains `DESTRUCTIVE:`; each leg of the
+     * server-wide exception case (the next server start, the switch, the word
+     * "exception") fails alone when cut from that row; and the recorded row's
+     * `reload-noop` case fails when the label is cut from that row.
      */
     describe('self-checks, on edited copies', () => {
-      const NEW_ROWS: readonly Expected[] = [EXPECTED.settings[1], EXPECTED.recorded[0]]
+      const NEW_ROWS: readonly Expected[] = [SWITCH_ROW, RECORDED_ROW]
 
       /** `text` with `edit` applied to the raw line of the one table row `expected` finds; an edit to '' removes the line. */
       function withRowEdited(text: string, expected: Expected, edit: (line: string) => string): string {
@@ -938,10 +952,20 @@ describe('README.md', () => {
         },
       )
 
-      test(`the server-wide row with \`${MODE_SWITCH_SETTING}\` cut fails the exception case`, () => {
-        const edited = withRowEdited(readme, EXPECTED.settings[0], (line) => line.replaceAll(`\`${MODE_SWITCH_SETTING}\``, 'the switch'))
+      test.each([
+        [`\`${MODE_SWITCH_SETTING}\``, (line: string) => line.replaceAll(`\`${MODE_SWITCH_SETTING}\``, 'the switch'), `Once confirmed names no \`${MODE_SWITCH_SETTING}\``],
+        ['"next server start"', (line: string) => line.replaceAll('next server start', 'next start'), 'Once confirmed names no next server start'],
+        ['"exception"', (line: string) => line.replace(/\bexception\b/gi, 'difference'), 'Once confirmed names no exception'],
+      ] as const)('the server-wide row with %s cut fails the exception case on that leg alone', (_cut, edit, problem) => {
+        const edited = withRowEdited(readme, SERVER_WIDE_ROW, edit)
         expect(edited).not.toBe(readme)
-        expect(serverWideExceptionProblems(rowsOf(edited))).toEqual([`Once confirmed names no \`${MODE_SWITCH_SETTING}\``])
+        expect(serverWideExceptionProblems(rowsOf(edited))).toEqual([problem])
+      })
+
+      test(`the recorded row with \`${RELOAD_NOOP}\` cut fails the ${RELOAD_NOOP} case`, () => {
+        const edited = withRowEdited(readme, RECORDED_ROW, (line) => line.replaceAll(`\`${RELOAD_NOOP}\``, 'a no-op line'))
+        expect(edited).not.toBe(readme)
+        expect(recordedNoopProblems(rowsOf(edited))).toEqual([`Once confirmed names no \`${RELOAD_NOOP}\``])
       })
     })
   })
@@ -1213,9 +1237,11 @@ function crontableHeaderText(): string {
  * rendered with (b.deo SRI-1308): a persona from `makePersona` (its key from
  * `personaKey`), a channel ID, a stored-choice file path, and one value and
  * one channel each builder echoes and one each does not show (b.deo
- * SRI-503). No token, no `LEAK_SENTINEL`, no banned term.
+ * SRI-503). No token, no `LEAK_SENTINEL`, no banned term. Built at its first
+ * call, when a case runs, so a `makePersona` change fails only the cases that
+ * read it.
  */
-const TOOL_TEXT_SAMPLE = (() => {
+const toolTextSample = lazy(() => {
   const persona = makePersona()
   const name = String(persona.name)
   return {
@@ -1227,35 +1253,36 @@ const TOOL_TEXT_SAMPLE = (() => {
     hiddenValue: 42,
     hiddenChannel: 'not a channel ID',
   }
-})()
+})
 
 /**
  * `set_channel_delivery`'s shipped texts (b.deo SRI-501, SRI-503 to SRI-506,
  * SRI-1308), each read through its export in src/registry.ts:
  * [export name, form ('' for a text with one form), text]. The listing texts
- * as exported; each builder rendered with `TOOL_TEXT_SAMPLE`, the value and
+ * as exported; each builder rendered with `toolTextSample()`, the value and
  * channel refusals in their echoed and their not-shown forms, the result in
  * its plain and its loop-guard-held forms; and the two resolution refusals
- * every tool shares (b.av2 SR-5.1, b.deo SRI-502), named for this tool.
+ * every tool shares (b.av2 SR-5.1, b.deo SRI-502), named for this tool. Each
+ * text is rendered when its case runs.
  */
 const SET_CHANNEL_DELIVERY_TEXTS: readonly [exportName: string, form: string, text: () => string][] = (() => {
-  const { name, key, channel, path } = TOOL_TEXT_SAMPLE
+  const s = toolTextSample
   return [
     ['SET_CHANNEL_DELIVERY_DESCRIPTION', '', () => SET_CHANNEL_DELIVERY_DESCRIPTION],
     ['SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION', '', () => SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION],
     ['SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION', '', () => SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION],
-    [channelDeliveryDeclarativeRefusal.name, '', () => channelDeliveryDeclarativeRefusal(name, key)],
-    [channelDeliveryUnreadableRefusal.name, '', () => channelDeliveryUnreadableRefusal(name, key, path)],
-    [channelDeliveryValueRefusal.name, 'echoed', () => channelDeliveryValueRefusal(name, key, TOOL_TEXT_SAMPLE.echoedValue)],
-    [channelDeliveryValueRefusal.name, 'not shown', () => channelDeliveryValueRefusal(name, key, TOOL_TEXT_SAMPLE.hiddenValue)],
-    [channelDeliveryChannelRefusal.name, 'echoed', () => channelDeliveryChannelRefusal(name, key, channel)],
-    [channelDeliveryChannelRefusal.name, 'not shown', () => channelDeliveryChannelRefusal(name, key, TOOL_TEXT_SAMPLE.hiddenChannel)],
-    [channelDeliverySetResultText.name, 'plain', () => channelDeliverySetResultText(channel, 'all', { delivery: 'all', heldByLoopGuard: false })],
-    [channelDeliverySetResultText.name, 'held by the loop guard', () => channelDeliverySetResultText(channel, 'all', { delivery: 'mentions', heldByLoopGuard: true })],
-    [channelDeliveryWriteFailedText.name, '', () => channelDeliveryWriteFailedText(name, key, path)],
-    [channelDeliveryNotStoredText.name, '', () => channelDeliveryNotStoredText(name, key, 'set_at')],
+    [channelDeliveryDeclarativeRefusal.name, '', () => channelDeliveryDeclarativeRefusal(s().name, s().key)],
+    [channelDeliveryUnreadableRefusal.name, '', () => channelDeliveryUnreadableRefusal(s().name, s().key, s().path)],
+    [channelDeliveryValueRefusal.name, 'echoed', () => channelDeliveryValueRefusal(s().name, s().key, s().echoedValue)],
+    [channelDeliveryValueRefusal.name, 'not shown', () => channelDeliveryValueRefusal(s().name, s().key, s().hiddenValue)],
+    [channelDeliveryChannelRefusal.name, 'echoed', () => channelDeliveryChannelRefusal(s().name, s().key, s().channel)],
+    [channelDeliveryChannelRefusal.name, 'not shown', () => channelDeliveryChannelRefusal(s().name, s().key, s().hiddenChannel)],
+    [channelDeliverySetResultText.name, 'plain', () => channelDeliverySetResultText(s().channel, 'all', { delivery: 'all', heldByLoopGuard: false })],
+    [channelDeliverySetResultText.name, 'held by the loop guard', () => channelDeliverySetResultText(s().channel, 'all', { delivery: 'mentions', heldByLoopGuard: true })],
+    [channelDeliveryWriteFailedText.name, '', () => channelDeliveryWriteFailedText(s().name, s().key, s().path)],
+    [channelDeliveryNotStoredText.name, '', () => channelDeliveryNotStoredText(s().name, s().key, 'set_at')],
     [sessionNotMatchedRefusal.name, '', () => sessionNotMatchedRefusal(SET_CHANNEL_DELIVERY_TOOL)],
-    [personaNotAppliedRefusal.name, '', () => personaNotAppliedRefusal(SET_CHANNEL_DELIVERY_TOOL, key)],
+    [personaNotAppliedRefusal.name, '', () => personaNotAppliedRefusal(SET_CHANNEL_DELIVERY_TOOL, s().key)],
   ]
 })()
 
@@ -1639,10 +1666,11 @@ describe(`AC 46: forbidden-term audit (README, skills, manifest, MCP instruction
 
   test(`each two-form ${SET_CHANNEL_DELIVERY_TOOL} builder is read in both forms: the echoed form names the sample, the not-shown one does not`, () => {
     const text = (exportName: string, form: string) => SET_CHANNEL_DELIVERY_TEXTS.find(([n, f]) => n === exportName && f === form)![2]()
-    expect(text(channelDeliveryValueRefusal.name, 'echoed')).toContain(JSON.stringify(TOOL_TEXT_SAMPLE.echoedValue))
-    expect(text(channelDeliveryValueRefusal.name, 'not shown')).toMatch(/not shown/)
-    expect(text(channelDeliveryChannelRefusal.name, 'echoed')).toContain(JSON.stringify(TOOL_TEXT_SAMPLE.channel))
-    expect(text(channelDeliveryChannelRefusal.name, 'not shown')).not.toContain(TOOL_TEXT_SAMPLE.hiddenChannel)
+    const sample = toolTextSample()
+    expect(text(channelDeliveryValueRefusal.name, 'echoed')).toContain(JSON.stringify(sample.echoedValue))
+    expect(text(channelDeliveryValueRefusal.name, 'not shown')).not.toContain(String(sample.hiddenValue))
+    expect(text(channelDeliveryChannelRefusal.name, 'echoed')).toContain(JSON.stringify(sample.channel))
+    expect(text(channelDeliveryChannelRefusal.name, 'not shown')).not.toContain(sample.hiddenChannel)
     expect(text(channelDeliverySetResultText.name, 'held by the loop guard')).not.toBe(text(channelDeliverySetResultText.name, 'plain'))
   })
 
@@ -5938,18 +5966,40 @@ const unitOf = (file: string, heading: HeadingMatch, lead: string) => (text: str
 /** The Troubleshooting entry whose title holds `*<title>*` (a row's passage). */
 const entryOf = (title: () => string) => (readme: string) => troubleshootingEntry(readme, `*${title()}*`)
 
-/** One row: an element, the passage of its text it sits in, and the items the passage must hold. */
-type DocRow = readonly [element: string, passage: (text: string) => string, required: readonly (string | RegExp)[]]
+/**
+ * An item a row's passage must hold: a literal, a pattern, or a thunk that
+ * builds one when the row runs (a quote rendered by a `src/` builder), so a
+ * builder whose wording changes fails only its own row, never the whole file
+ * at collection.
+ */
+type DocItem = string | RegExp | (() => string | RegExp)
 
-/** A row's problems on `text`: its passage missing, or each item it lacks. */
-function docRowProblems(passage: (text: string) => string, required: readonly (string | RegExp)[], text: string): string[] {
+/** One row: an element, the passage of its text it sits in, and the items the passage must hold. */
+type DocRow = readonly [element: string, passage: (text: string) => string, required: readonly DocItem[]]
+
+/** `item` as a literal or pattern: a thunk's answer, else `item` itself. Throws what the thunk throws. */
+function resolveItem(item: DocItem): string | RegExp {
+  return typeof item === 'function' ? item() : item
+}
+
+/** A row's problems on `text`: its passage missing, each item that cannot be built (its error), or each item it lacks. */
+function docRowProblems(passage: (text: string) => string, required: readonly DocItem[], text: string): string[] {
+  const unbuilt: string[] = []
+  const items = required.flatMap((item) => {
+    try {
+      return [resolveItem(item)]
+    } catch (err) {
+      unbuilt.push(err instanceof Error ? err.message : String(err))
+      return []
+    }
+  })
   let found: string
   try {
     found = passage(text)
   } catch (err) {
-    return [err instanceof Error ? err.message : String(err)]
+    return [...unbuilt, err instanceof Error ? err.message : String(err)]
   }
-  return lacking(found, required)
+  return [...unbuilt, ...lacking(found, items)]
 }
 
 /** What a cut leaves in place of a letter or digit: a character no item holds. */
@@ -6870,7 +6920,7 @@ describe('E36 T4: the README describes the build (b.jg5 SRJ-1103; AC 78, AC 79)'
 
   describe('self-checks', () => {
     test.each(README_SRJ_1103_ROWS)('%s: each of its items, cut from its passage in the README, is reported by the row', (element, passage, required) => {
-      for (const item of required) {
+      for (const item of required.map(resolveItem)) {
         const edited = withItemCut(readme(), passage, item)
         expect({ element, item: String(item), reported: docRowProblems(passage, required, edited).includes(`lacks ${String(item)}`) }).toEqual({ element, item: String(item), reported: true })
       }
@@ -7001,7 +7051,7 @@ describe('E36 T4: the debugging skill describes the build (b.jg5 SRJ-1104; AC 78
 
   describe('self-checks', () => {
     test.each(DEBUG_SKILL_SRJ_1104_ROWS)('%s: each of its items, cut from its passage in the skill, is reported by the row', (element, passage, required) => {
-      for (const item of required) {
+      for (const item of required.map(resolveItem)) {
         const edited = withItemCut(skill(), passage, item)
         expect({ element, item: String(item), reported: docRowProblems(passage, required, edited).includes(`lacks ${String(item)}`) }).toEqual({ element, item: String(item), reported: true })
       }
@@ -7318,36 +7368,38 @@ const SILENT_INVITED_TITLE = 'A persona is silent in a channel it was invited to
 const RECEIVES_EVERYTHING_TITLE = 'A persona receives every message in a channel'
 const UNCLAIMED_ENTRY_TITLE = 'Messages in a channel no persona is configured into are not delivered'
 
-/** The one troubleshooting entry titled `title` exactly, its title and text flattened; throws unless exactly one is (a row's passage). */
-const titledEntry = (title: string) => (readme: string) => {
-  const entries = troubleshootingEntries(readme).filter((entry) => entry.title === `**${title}**`)
-  if (entries.length !== 1) throw new Error(`README.md "${TROUBLESHOOTING_HEADING}": ${entries.length} entries titled "${title}", expected 1`)
-  return `${entries[0].title} ${entries[0].text}`
-}
+/** The one troubleshooting entry whose title line is `**<title>**`, its title and text flattened; throws unless exactly one is (a row's passage). */
+const titledEntry = (title: string) => (readme: string) => troubleshootingEntry(readme, `**${title}**`)
 
 /**
  * The part of `FUNGIBLE_MODE_ZERO_REASON` (src/jsonl-persistence-check.ts,
  * b.deo SRI-704) the README's `jsonl-diagnosis-inconclusive` item quotes:
  * the reason up to "and the configuration cannot predict its traffic".
+ * Throws when the reason holds no such phrase (its row's item, built when
+ * the row runs).
  */
-const FUNGIBLE_ZERO_REASON_QUOTED: string = (() => {
+function fungibleZeroReasonQuoted(): string {
   const [quoted, rest] = FUNGIBLE_MODE_ZERO_REASON.split(' and the configuration cannot predict')
   if (rest === undefined) throw new Error(`FUNGIBLE_MODE_ZERO_REASON has no "and the configuration cannot predict": ${FUNGIBLE_MODE_ZERO_REASON}`)
   return quoted
-})()
+}
 
-/** The sample persona the preview lines are rendered with: `TOOL_TEXT_SAMPLE`'s name and key (from `makePersona`). */
-const PREVIEW_SAMPLE = { name: TOOL_TEXT_SAMPLE.name, key: TOOL_TEXT_SAMPLE.key }
+/** The sample persona the preview lines are rendered with: `toolTextSample()`'s name and key (from `makePersona`). */
+function previewSample(): { name: string; key: string } {
+  const { name, key } = toolTextSample()
+  return { name, key }
+}
 
 /**
- * The switch's preview line as README "Reading the preview" quotes it
- * (b.deo SRI-803): `modeSwitchLine` rendered for `mode` with one persona,
- * the mode replaced by `<mode>` and the persona list by `…`. The row reads
- * the quote of each direction, so the README's one quote stands for both
- * only while both directions give the same text.
+ * The switch's preview line as README "Reading the preview" and the wizard's
+ * Step 10 quote it (b.deo SRI-803): `modeSwitchLine` rendered for `mode`
+ * with one persona, the mode replaced by `<mode>` and the persona list by
+ * `…`. Each carrier's row reads the quote of each direction, so a carrier's
+ * one quote stands for both only while both directions give the same text.
+ * Called when a row runs; throws when the line renders no mode or list.
  */
 function switchLineQuote(mode: ChannelMode): string {
-  const line = modeSwitchLine(mode, [PREVIEW_SAMPLE])
+  const line = modeSwitchLine(mode, [previewSample()])
   const at = line.lastIndexOf(', for ')
   if (at < 0 || !line.includes(` turns ${mode} mode on`)) throw new Error(`modeSwitchLine renders no mode or persona list: ${line}`)
   return `${line.slice(0, at).replace(` turns ${mode} mode on`, ' turns <mode> mode on')}, for …`
@@ -7367,7 +7419,7 @@ function switchLineNoPersonaEnding(): string {
  */
 function recordedLineQuote(section: ChannelMode): string {
   const fields: RecordedSectionKey[] = section === 'fungible' ? [FUNGIBLE_SECTION_KEY] : [CHANNELS_KEY]
-  const line = recordedLine({ ...PREVIEW_SAMPLE, fields })
+  const line = recordedLine({ ...previewSample(), fields })
   const at = line.indexOf(' changed in the ')
   if (at < 0) throw new Error(`recordedLine renders no " changed in the ": ${line}`)
   return `…${line.slice(at)}`
@@ -7378,14 +7430,14 @@ function recordedLineQuote(section: ChannelMode): string {
  * (`DocRow`, read by `docRowProblems`; each item self-checked by
  * `withItemCut`): one row per element, its passage the narrowest section,
  * unit, table row or entry that holds it. Setting names come from `src/` or
- * the typed names above; preview lines from their builders; labels from
- * their exports.
+ * the typed names above; preview lines from their builders, as `DocItem`
+ * thunks built when the row runs; labels from their exports.
  */
 const README_DEO_ROWS: readonly DocRow[] = [
   // SRI-1102, the two modes: "## Channel modes" (T20 S2).
   ['Channel modes: what each mode serves, the switch, who sets delivery and the destination, per mode', readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [
     ci(`| The switch | ${SWITCH} absent or ${code('false')}, the default | ${code(`${MODE_SWITCH_SETTING}: true`)} |`),
-    ci(`The channels listed in its ${code(CHANNELS_KEY)} | Every public or private channel its Slack app is a member of that Slack does not mark as externally shared`),
+    ci(`The channels listed in its ${code(CHANNELS_KEY)} | Every public or private channel its Slack app is a member of that Slack marks as not externally shared`),
     ci(`The operator, with each channel entry's ${code(DELIVERY_KEY)} | The persona's agent, with ${TOOL}; ${code(MENTIONS)} otherwise`),
     ci(`| Destination of prompts and notices | ${code(PROMPTS_KEY)} | ${code(INVITED_DESTINATION)}, ${DM_VALUE} when it is absent`),
   ]],
@@ -7402,7 +7454,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
   [`Channel modes: before turning it on, the operator reviews each app's channels and past ${UNCLAIMED_CHANNEL} lines`, readmeSection(TURNING_FUNGIBLE_HEADING), [
     ci("Before you turn it on, review each persona's app's channel memberships in Slack, private channels included"),
     ci(`Past ${code(UNCLAIMED_CHANNEL)} lines in ${code('server.log')} show channels`),
-    `grep ${UNCLAIMED_CHANNEL} ~/.claude/channels/slack/server.log`,
+    `grep ${UNCLAIMED_CHANNEL} ~/.claude/channels/slack/server.log*`,
   ]],
   ['Channel modes: upgrades stay declarative, with no migration', readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [
     ci(`**Upgrades stay declarative.** A configuration without ${SWITCH} runs in declarative mode`),
@@ -7454,17 +7506,15 @@ const README_DEO_ROWS: readonly DocRow[] = [
   [`Persona fields: the note on ${DM_KEY} names ${FUNGIBLE_SECTION_KEY}`, unitOf('README.md', '#### Persona fields', `${code(DM_KEY)} is an object`), [
     ci(`${code(FUNGIBLE_SECTION_KEY)} is an object holding ${code(INVITED_DESTINATION_KEY)}`),
   ]],
-  ['Channel entries: applies in declarative mode, with its pointer', readmeSection('#### Channel entries'), [
+  // Each section's pointer into "## Channel modes" is read by `pointerProblems` (DECLARATIVE_POINTERS), not here.
+  ['Channel entries: applies in declarative mode', readmeSection('#### Channel entries'), [
     ci('Channel entries apply in declarative mode'),
-    anchorLink(WHAT_EACH_MODE_SERVES_HEADING),
   ]],
-  ['Channel delivery: applies in declarative mode, with its pointer', readmeSection('#### Channel delivery'), [
+  ['Channel delivery: applies in declarative mode', readmeSection('#### Channel delivery'), [
     ci('This section applies in declarative mode'),
-    anchorLink(FUNGIBLE_DELIVERY_HEADING),
   ]],
-  ['Permission prompts: applies in declarative mode, with its pointer', readmeSection('#### Permission prompts'), [
+  ['Permission prompts: applies in declarative mode', readmeSection('#### Permission prompts'), [
     ci(`This section applies in declarative mode, where ${code(PROMPTS_KEY)} is required`),
-    anchorLink(FUNGIBLE_PROMPTS_HEADING),
   ]],
   ['Load-time rules: the switch is checked before any persona, and a non-boolean value is rejected naming it', readmeSection('#### Load-time rules'), [
     ci(`It checks the server-wide settings first, ${SWITCH} among them, before any persona, in either mode`),
@@ -7599,7 +7649,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci(`the first ${TOOL} call raises a permission prompt, in either mode`),
   ]],
   [`Startup errors: the ${JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS} item gives the fungible-mode reason (FUNGIBLE_MODE_ZERO_REASON, SRI-704)`, (readme) => readmeLabelItem(STARTUP_ERRORS_HEADING, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, readme), [
-    FUNGIBLE_ZERO_REASON_QUOTED,
+    fungibleZeroReasonQuoted,
     ci('so the archive counts no channel and a zero count proves nothing'),
   ]],
 
@@ -7632,14 +7682,14 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci('A persona whose only changes are recorded ones (changes to the section not in force, see the table below) is not counted as modified'),
   ]],
   ["Reading the preview: the switch's line, as modeSwitchLine renders it in each direction, and its row", readmeSection('### Reading the preview'), [
-    `| ${code(switchLineQuote('fungible'))} |`,
-    `| ${code(switchLineQuote('declarative'))} |`,
-    ci(`ends ${code(switchLineNoPersonaEnding())} when there is none`),
+    () => `| ${code(switchLineQuote('fungible'))} |`,
+    () => `| ${code(switchLineQuote('declarative'))} |`,
+    () => ci(`ends ${code(switchLineNoPersonaEnding())} when there is none`),
     ci('Unlike other server-wide settings, it applies at once, with no restart, and every session is kept'),
   ]],
   ['Reading the preview: the recorded lines, as recordedLine renders them for each section, and their row', readmeSection('### Reading the preview'), [
-    code(recordedLineQuote('declarative')),
-    code(recordedLineQuote('fungible')),
+    () => code(recordedLineQuote('declarative')),
+    () => code(recordedLineQuote('fungible')),
     ci(`(${code(CHANNELS_KEY)} or ${code(PROMPTS_KEY)} in fungible mode, ${code(FUNGIBLE_SECTION_KEY)} in declarative mode)`),
     ci('These lines come after every persona line and before the server-wide setting lines'),
     ci(`A change made only of recorded changes previews as ${code(NO_EFFECTIVE_CHANGE)}, followed by its recorded lines`),
@@ -7699,10 +7749,12 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci('For a public or private channel that is not externally shared, turning fungible mode on is the other fix'),
     ci('a group DM is never served'),
   ]],
-  [`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in fungible mode, each reason (FUNGIBLE_REFUSAL_TEXTS), served only in declarative mode with the channel listed`, titledEntry(UNCLAIMED_ENTRY_TITLE), [
+  [`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in fungible mode, each reason (FUNGIBLE_REFUSAL_TEXTS); for every reason but a malformed channel ID, served only in declarative mode with the channel listed; a malformed channel ID served in neither mode`, titledEntry(UNCLAIMED_ENTRY_TITLE), [
     ci("**In fungible mode,** the line says why fungible mode doesn't serve the channel"),
-    ...Object.values(FUNGIBLE_REFUSAL_TEXTS).map(code),
-    ci('Such a channel is served only in declarative mode, with the channel listed'),
+    // Each reason inside the sentence that lists them, since one is named again after it.
+    ...Object.values(FUNGIBLE_REFUSAL_TEXTS).map((reason) => new RegExp(`${escapeRegExp("the line says why fungible mode doesn't serve the channel: ")}[^.]*${escapeRegExp(code(reason))}`, 'i')),
+    ci(`For every reason but ${code(UNCLAIMED_REASON_CHANNEL_ID_MALFORMED)}, the channel is served only in declarative mode, with the channel listed`),
+    ci('Neither mode serves a malformed channel ID: declarative mode rejects a listed one'),
   ]],
   [`Downgrading: an earlier release rejects ${MODE_SWITCH_SETTING} and ${FUNGIBLE_SECTION_KEY}, so the record must hold neither`, readmeSection(DOWNGRADE_HEADING), [
     ci(`An earlier release's loader rejects ${SWITCH} and ${code(FUNGIBLE_SECTION_KEY)} as unknown keys`),
@@ -7722,6 +7774,22 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci('**Install the older build and restart the server on it.**'),
     ci(`The older build ignores ${code(CHANNEL_DELIVERY_FILE_NAME)}`),
   ]],
+]
+
+/** The setup wizard's step on how a change takes effect, found by its title, whatever its number. */
+const WIZARD_TAKES_EFFECT_HEADING = /^### Step \d+ — How the change takes effect$/
+
+/**
+ * The switch's preview line in its second carrier, the setup wizard's step on
+ * how a change takes effect (b.deo SRI-803): the step quotes the line as
+ * README "Reading the preview" does, so it is read against `modeSwitchLine`
+ * in each direction (`switchLineQuote`) as the README's row is. Read here, so
+ * the wizard's own suite renders no builder.
+ */
+const WIZARD_SWITCH_LINE_ROW: DocRow = [
+  `${WIZARD_FILE}: the switch's line, as modeSwitchLine renders it in each direction`,
+  sectionOf(WIZARD_FILE, WIZARD_TAKES_EFFECT_HEADING),
+  [() => code(switchLineQuote('fungible')), () => code(switchLineQuote('declarative'))],
 ]
 
 /** Where a README heading must stand: exactly once, inside `parent`, right after `previous` (the nearest heading at its level or above), and after a line matching `after`. */
@@ -7839,10 +7907,21 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
     })
 
     test.each(README_DEO_ROWS)('self-check: %s: each of its items, cut from its passage in the README, is reported by the row', (element, passage, required) => {
-      for (const item of required) {
+      for (const item of required.map(resolveItem)) {
         const edited = withItemCut(readme(), passage, item)
         expect({ element, item: String(item), reported: docRowProblems(passage, required, edited).includes(`lacks ${String(item)}`) }).toEqual({ element, item: String(item), reported: true })
       }
+    })
+
+    test('self-check: an item whose builder throws fails its own row with the error, and the row still reads its other items', () => {
+      const passage = readmeSection('### Reading the preview')
+      const broken = () => {
+        throw new Error('modeSwitchLine renders no mode or persona list')
+      }
+      expect(docRowProblems(passage, [broken, ci('no such phrase anywhere')], readme())).toEqual([
+        'modeSwitchLine renders no mode or persona list',
+        `lacks ${String(ci('no such phrase anywhere'))}`,
+      ])
     })
   })
 
@@ -7895,6 +7974,32 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
   })
 
   describe('"Reading the preview": the lines it quotes are the builders\' (SRI-803, SRI-804)', () => {
+    describe(`the switch's line in its second carrier, ${WIZARD_FILE} (SRI-803)`, () => {
+      const wizard = () => operatorText(WIZARD_FILE)
+      const [element, passage, required] = WIZARD_SWITCH_LINE_ROW
+
+      test(element, () => {
+        expect(docRowProblems(passage, required, wizard())).toEqual([])
+      })
+
+      test('self-check: the quote cut from the step, or reworded, is reported by the row', () => {
+        for (const item of required.map(resolveItem)) {
+          const edited = withItemCut(wizard(), passage, item)
+          expect(docRowProblems(passage, required, edited)).toContain(`lacks ${String(item)}`)
+        }
+        const reworded = wizard().replace('applied in place at once, from the next event,', 'applied at once, from the next event,')
+        expect(reworded).not.toBe(wizard())
+        expect(docRowProblems(passage, required, reworded)).not.toEqual([])
+      })
+
+      test('self-check: the step found by its title, so its heading renamed is reported', () => {
+        const renamed = withLineEdited(wizard(), (line) => WIZARD_TAKES_EFFECT_HEADING.test(line), (line) => `${line} again`)
+        expect(docRowProblems(passage, required, renamed)).toEqual([`${WIZARD_FILE} has no heading matching ${String(WIZARD_TAKES_EFFECT_HEADING)}`])
+        const renumbered = withLineEdited(wizard(), (line) => WIZARD_TAKES_EFFECT_HEADING.test(line), (line) => line.replace(/Step \d+/, 'Step 12'))
+        expect(docRowProblems(passage, required, renumbered)).toEqual([])
+      })
+    })
+
     test(`every example's header line opens with PENDING_PREVIEW_TITLE`, () => {
       const blocks = splitFences(requiredSection(readme(), '### Reading the preview', 'README.md')).blocks
       expect(blocks.length).toBeGreaterThanOrEqual(2)
@@ -7953,7 +8058,7 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
       for (const [element, passage, required] of rows) {
         expect({ element, problems: docRowProblems(passage, required, edited) }).toEqual({
           element,
-          problems: [`README.md "${TROUBLESHOOTING_HEADING}": 2 entries titled "${title}", expected 1`],
+          problems: [`README.md "${TROUBLESHOOTING_HEADING}": 2 entries' titles hold "**${title}**", expected 1`],
         })
       }
     })
@@ -7968,13 +8073,6 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
     /** The numbers of the downgrade steps, in order, comma-separated. */
     const stepNumbers = (text: string) => downgradeSteps(text).map((step) => /^\d+/.exec(step)![0]).join(',')
 
-    /** The rows of downgrade steps 1 and 2. */
-    const firstTwoStepRows = [1, 2].map((n) => {
-      const row = README_DEO_ROWS.find(([element]) => element.startsWith(`Downgrading: step ${n} `))
-      if (row === undefined) throw new Error(`README_DEO_ROWS has no row for downgrade step ${n}`)
-      return row
-    })
-
     test('"Downgrading to an earlier release" has exactly four numbered steps, 1 to 4', () => {
       expect(stepNumbers(readme())).toBe('1,2,3,4')
     })
@@ -7985,6 +8083,11 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
     })
 
     test('self-check: steps 1 and 2 swapped, numbers kept, fail the rows of steps 1 and 2', () => {
+      const firstTwoStepRows = [1, 2].map((n) => {
+        const row = README_DEO_ROWS.find(([element]) => element.startsWith(`Downgrading: step ${n} `))
+        if (row === undefined) throw new Error(`README_DEO_ROWS has no row for downgrade step ${n}`)
+        return row
+      })
       const lines = readme().split('\n')
       const range = sectionRange(readme(), DOWNGRADE_HEADING)!
       const at = lines.flatMap((line, i) => (i > range.start && i < range.end && /^\d+\. /.test(line) ? [i] : []))

@@ -600,7 +600,7 @@ The top-level setting `allow_invited_channels` picks the channel mode for every 
 | | Declarative mode | Fungible mode |
 |---|---|---|
 | The switch | `allow_invited_channels` absent or `false`, the default | `allow_invited_channels: true` |
-| Channels a persona serves | The channels listed in its `channels` | Every public or private channel its Slack app is a member of that Slack does not mark as externally shared |
+| Channels a persona serves | The channels listed in its `channels` | Every public or private channel its Slack app is a member of that Slack marks as not externally shared |
 | Who sets a channel's delivery | The operator, with each channel entry's `delivery` | The persona's agent, with `set_channel_delivery`; `mentions` otherwise (see [Channel delivery in fungible mode](#channel-delivery-in-fungible-mode)) |
 | Destination of prompts and notices | `permission_prompts` | `invited.permission_prompts`, `"dm"` when it is absent (see [Permission prompts in fungible mode](#permission-prompts-in-fungible-mode)) |
 | Persona settings read | `channels` and the top-level `permission_prompts` | `invited` |
@@ -626,7 +626,7 @@ The switch changes through a confirmed edit, like every other setting:
 Before you turn it on, review each persona's app's channel memberships in Slack, private channels included: each one becomes a channel the persona serves. Past `unclaimed-channel` lines in `server.log` show channels whose messages reached a persona's app with no persona serving them:
 
 ```sh
-grep unclaimed-channel ~/.claude/channels/slack/server.log
+grep unclaimed-channel ~/.claude/channels/slack/server.log*
 ```
 
 **Turning it off.** The change is checked by the declarative rules, so each persona needs a valid declarative section: a persona whose `channels` or `permission_prompts` breaks a declarative-mode rule makes the change `INVALID` (see [Load-time rules](#load-time-rules)). From the next event, each persona serves its listed channels again, each at its `delivery`. Turning it off changes no stored choice on disk: the choices stop applying, and they apply again when fungible mode is turned back on.
@@ -1808,7 +1808,7 @@ grep unclaimed-channel ~/.claude/channels/slack/server.log
 ```
 
 - **In declarative mode,** the channel is in no persona's `channels`, even though a persona's Slack app is a member. Add the channel to a persona's `channels` and apply the change (see [Reload](#reload)); restarting the server alone doesn't apply it. For a public or private channel that is not externally shared, turning fungible mode on is the other fix (see [Channel modes](#channel-modes)); a group DM is never served.
-- **In fungible mode,** the line says why fungible mode doesn't serve the channel: `the channel is externally shared`, `the event envelope carries no is_ext_shared_channel flag`, `the event envelope's is_ext_shared_channel flag is not a boolean`, `the channel ID is malformed` or `the conversation is not a public or private channel`. Such a channel is served only in declarative mode, with the channel listed.
+- **In fungible mode,** the line says why fungible mode doesn't serve the channel: `the channel is externally shared`, `the event envelope carries no is_ext_shared_channel flag`, `the event envelope's is_ext_shared_channel flag is not a boolean`, `the channel ID is malformed` or `the conversation is not a public or private channel`. For every reason but `the channel ID is malformed`, the channel is served only in declarative mode, with the channel listed. Neither mode serves a malformed channel ID: declarative mode rejects a listed one.
 
 **Permission relay not working**
 Check that the persona's Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state via `agent-director list --state check_permission --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json` and apply the change (see [Reload](#reload)); like every server-wide setting but the switch `allow_invited_channels`, which applies at once, it takes effect at the next server start.
