@@ -8006,18 +8006,27 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
       for (const block of blocks) expect(block.body.split('\n').filter((line) => line.startsWith(PENDING_PREVIEW_TITLE))).toHaveLength(1)
     })
 
-    /**
-     * The second example, a body excerpt (no title, no `fingerprint:` line),
-     * is the preview of the change the README describes, made to the
-     * declarative `#### Example`: the switch turned on, `planner` given an
-     * `invited.permission_prompts` (its home channel, so the candidate is
-     * valid), and `reviewer`'s `channels` edited. Both configurations load
-     * through the real loader in a temp dir; the plan's rendered lines must
-     * be the block's lines, byte for byte.
-     */
-    test('the fungible-mode example is renderPreviewLines of the change it describes, made to the declarative Example', () => {
-      const dir = realpathSync(mkdtempSync(join(tmpdir(), 'shipped-docs-preview-')))
-      try {
+    describe('the fungible-mode example through the real loader', () => {
+      let dir: string
+
+      beforeEach(() => {
+        dir = realpathSync(mkdtempSync(join(tmpdir(), 'shipped-docs-preview-')))
+      })
+
+      afterEach(() => {
+        rmSync(dir, { recursive: true, force: true })
+      })
+
+      /**
+       * The second example, a body excerpt (no title, no `fingerprint:` line),
+       * is the preview of the change the README describes, made to the
+       * declarative `#### Example`: the switch turned on, `planner` given an
+       * `invited.permission_prompts` (its home channel, so the candidate is
+       * valid), and `reviewer`'s `channels` edited. Both configurations load
+       * through the real loader in a temp dir; the plan's rendered lines must
+       * be the block's lines, byte for byte.
+       */
+      test('the fungible-mode example is renderPreviewLines of the change it describes, made to the declarative Example', () => {
         const home = join(dir, 'home')
         mkdirSync(home)
         const load = (name: string, raw: unknown): PersonaConfig => {
@@ -8044,9 +8053,7 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
         const excerpts = blocks.filter((block) => block.body.startsWith(PENDING_PREVIEW_TITLE))
         expect(excerpts).toHaveLength(1)
         expect(excerpts[0].body.trimEnd().split('\n')).toEqual(renderPreviewLines(plan))
-      } finally {
-        rmSync(dir, { recursive: true, force: true })
-      }
+      })
     })
   })
 
