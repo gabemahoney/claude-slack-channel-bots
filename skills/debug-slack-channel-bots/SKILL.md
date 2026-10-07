@@ -1,6 +1,6 @@
 ---
 name: debug-slack-channel-bots
-description: Diagnose a claude-slack-channel-bots persona that is silent, down or refused — find its server-log lines, match the class, and follow the fix for every persona failure, every config.json rejection, every last-applied record failure at start, and every pending configuration change and its confirmation.
+description: Diagnose a claude-slack-channel-bots persona that is silent, down or refused — find its server-log lines, match the class, and follow the fix for every persona failure, every config.json rejection, every last-applied record failure at start, and every pending configuration change and its confirmation, in declarative and fungible channel mode, with the stored-choice file channel-delivery.json.
 version: 1.0.0
 license: MIT
 user-invocable: true
@@ -15,9 +15,11 @@ doesn't come up, or gets refused. Every persona failure is logged to the
 server log with a class label. This skill says where that log is, how to find
 one persona's lines, what each line means, and what the operator does about it.
 It also covers every reason `config.json` is rejected at start, every
-reason the last-applied record (`config.json.last-applied`) stops a start, and
+reason the last-applied record (`config.json.last-applied`) stops a start,
 how to read and confirm a pending configuration change
-(`config.json.pending`).
+(`config.json.pending`), both channel modes (declarative and fungible, set by
+`allow_invited_channels`), and the stored-choice file
+(`channel-delivery.json`).
 
 One broken persona never stops the server. Every healthy persona keeps serving,
 and nothing about a broken persona is posted to Slack under any identity. The
@@ -65,6 +67,9 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
   step of the "Operator actions" section of agent-director's README for it.
   Those notices are for a human only (see
   [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice)).
+- NEVER edit, write or delete the stored-choice file `channel-delivery.json`,
+  and move it aside only on the operator's say-so (see
+  [The stored-choice file: `channel-delivery.json`](#the-stored-choice-file-channel-deliveryjson)).
 
 ---
 
@@ -74,8 +79,10 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    prompts log `no-session`.** Find its key: the `persona-start` line for its
    name (see [Reading a persona line](#reading-a-persona-line)). If the
    persona is up but its instance can't take messages, each message sent to
-   it is lost: its destination (its `permission_prompts` channel, or its DM
-   with `dm.contact`) has a *Message lost* notice whose `Recovery:` wording
+   it is lost: its destination (its `permission_prompts` channel in
+   declarative mode, its `invited.permission_prompts` channel in fungible
+   mode, or its DM with `dm.contact` for a `"dm"` destination, which in
+   fungible mode is also the default) has a *Message lost* notice whose `Recovery:` wording
    says whether a server restart is needed. `held for a human`,
    `cannot launch`, `kill failed`, `not answering` and `starting` say no
    restart was started and what the persona waits on: a human to resolve
@@ -92,6 +99,14 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    reaction nor its reply was most likely not dispatched to it. Adding the
    reaction can fail without a log line, so treat this as a hint and confirm
    in `server.log`.
+   **Silent only in a channel its app was invited to?** See
+   [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to).
+   **Answering every message in a channel, not only @mentions?** See
+   [A persona receives every message in a channel](#a-persona-receives-every-message-in-a-channel).
+   An `unclaimed-channel` line ending
+   `to serve this channel, use declarative mode with the channel listed` is
+   the fungible-mode form: see its reasons under
+   [`unclaimed-channel`](#unclaimed-channel).
 2. **Pull every line for that key** from `server.log` (see
    [The server log](#the-server-log)).
 3. **Match the class** of the first failure line after its latest
@@ -202,6 +217,11 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change).
    Its channels, destination or DM settings were changed? See
    [A persona's routing settings were changed by a confirmed change](#a-personas-routing-settings-were-changed-by-a-confirmed-change).
+   `allow_invited_channels` was turned on or off? It applies in place, with
+   every session kept: see the switch under
+   [Confirming a pending change](#confirming-a-pending-change), then
+   [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to)
+   for a channel that isn't served as expected.
    A confirmed change to its credentials file didn't take? Look for a
    [`persona-credentials-change-failed`](#persona-credentials-change-failed)
    line. A persona broken by its credentials whose app was fixed on Slack's
@@ -222,6 +242,12 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
 11. **The cause of a hold is fixed but the persona is still held, or
     `clear-latch` printed a line and exited non-zero?** See
     [Clearing a hold by hand: `clear-latch`](#clearing-a-hold-by-hand-clear-latch).
+12. **A `channel-delivery-unreadable` line, or `[slack] channel-delivery:`
+    lines?** See
+    [The stored-choice file: `channel-delivery.json`](#the-stored-choice-file-channel-deliveryjson).
+    **An agent's `set_channel_delivery` call was refused or failed?** The
+    refusals, in the order they are checked, and the failed write are under
+    [`persona-channel-delivery-set`](#persona-channel-delivery-set).
 
 ---
 
@@ -332,7 +358,7 @@ A persona diagnostic line looks like this:
 | `personas[1]` | The persona's position in `config.json`'s `personas` array, counting from 0. |
 | `"Ops Bot"` | The persona's name, JSON-quoted as configured. |
 | `(key=ops_bot_5e2526f3)` | The persona's key, derived from its name. |
-| `path="…"` | The file or directory the line is about: the credentials file for credentials and Slack classes, the working directory for directory classes, the Claude config directory for `persona-config-dir-unresolvable`. Absent on `persona-start`, `unclaimed-channel`, `persona-dm-dropped` and `persona-destination-failed`. |
+| `path="…"` | The file or directory the line is about: the credentials file for credentials and Slack classes, the working directory for directory classes, the Claude config directory for `persona-config-dir-unresolvable`. Absent on `persona-start`, `unclaimed-channel` (in both channel modes), `persona-dm-dropped`, `persona-destination-failed`, `persona-invited-channel` and `persona-channel-delivery-set`. |
 | After `path="…": ` (or `(key=<key>): ` when there is no path) | The cause. It may itself contain `: `. A bad token is named only by its key (`bot_token`, `app_token`) and the rule it breaks, never by value. |
 
 **The key.** A name of 1–40 characters using only `a-z`, `0-9` and `_` is its
@@ -718,19 +744,63 @@ running are not affected. See
 ### `unclaimed-channel`
 
 - **State:** the persona is `up`; this is about a message, not the persona.
+- **Two forms.** The line has one form per channel mode, the mode in force
+  when the message arrived. Either way it is logged by the persona whose app
+  received the message, one event logs at most one drop line, and the line
+  has no `path` part.
+
+**Declarative mode** (`allow_invited_channels` absent or `false`):
+
 - **Line:** `[slack] unclaimed-channel: personas[<i>] "<name>" (key=<key>): message in channel <id> not delivered: no applied persona lists this channel`
-- **Meaning:** The persona's Slack app is a member of a channel that no
-  persona lists in `channels`, so the message reached no one. Logged by each
-  persona whose app received it.
-- **Fix:** Add the channel to the right persona's `channels` in `config.json`,
-  or remove the app from the channel. A `config.json` edit becomes pending (see
-  [Pending changes](#pending-changes)); once confirmed (see
-  [Confirming a pending change](#confirming-a-pending-change)) it applies in
-  place, with no restart, and the persona keeps its instance and
-  conversation. If the ID is a
-  group DM (someone @mentioned the persona in a multi-person DM), the line is
-  expected: do not add that ID to any persona's `channels`, because that would
-  deliver group-DM mentions to it.
+- **Meaning:** In declarative mode, the persona's Slack app is a member of a
+  channel that no persona lists in `channels`, so the message reached no one.
+  Logged by each persona whose app received it. A channel that another
+  applied persona lists logs nothing: that persona receives the message. An
+  @mention of the persona in a group DM logs this line too (see **Group DMs**
+  under [`persona-dm-dropped`](#persona-dm-dropped)).
+- **Fix:** one of:
+  - Add the channel to the right persona's `channels` in `config.json`. The
+    edit becomes pending (see [Pending changes](#pending-changes)); once
+    confirmed (see [Confirming a pending change](#confirming-a-pending-change))
+    it applies in place, with no restart, and the persona keeps its instance
+    and conversation.
+  - For a public or private channel that is not externally shared: turn
+    fungible mode on, which serves every such channel each persona's app is
+    a member of (see
+    [Turning fungible mode on or off](../../README.md#turning-fungible-mode-on-or-off)
+    and, before that, [Who can reach a persona in fungible mode](../../README.md#who-can-reach-a-persona-in-fungible-mode)).
+  - Remove the app from the channel.
+
+  Fungible mode is never the fix for a group DM: a group DM is never served
+  in either mode. If the ID is a group DM (someone @mentioned the persona in
+  a multi-person DM), the line is expected: do not add that ID to any
+  persona's `channels`, because that would deliver group-DM mentions to it.
+
+**Fungible mode** (`allow_invited_channels` is `true`):
+
+- **Line:** `[slack] unclaimed-channel: personas[<i>] "<name>" (key=<key>): message in channel <id> not delivered in fungible mode: <reason>; to serve this channel, use declarative mode with the channel listed`
+- **Meaning:** In fungible mode, a `message` event the persona's app received
+  was refused by the fungible path, so it reached no one. One line per
+  refused `message` event, logged by the persona that received it, and no
+  `persona-invited-channel` line for it. An `app_mention` never logs this
+  line in fungible mode: the `message` event carrying the same mention
+  decides. The line's own advice is the one way to serve such a channel:
+  declarative mode, with the channel listed.
+- **Reasons and fixes:** the conditions are checked in this order, and the
+  first that fails is the reason:
+
+  | `<reason>` | Meaning | Fix |
+  |---|---|---|
+  | `the conversation is not a public or private channel` | The event's `channel_type` is neither `channel` (public) nor `group` (private), or it is missing. A DM and a group DM never reach this check (see [`persona-dm-dropped`](#persona-dm-dropped)). | None in fungible mode. Serve it in declarative mode, with the channel listed, or remove the app from the conversation. |
+  | `the channel ID is malformed` | The channel ID isn't a `C…` or `G…` ID of capital letters and digits. | None: `config.json` can't list such an ID either, so neither mode serves it. If the line repeats, report it as a bug, with the line. |
+  | `the event envelope carries no is_ext_shared_channel flag` | Slack's event envelope didn't say whether the channel is externally shared, so the server can't tell and doesn't serve it. | None in fungible mode. Serve it in declarative mode, with the channel listed. |
+  | `the event envelope's is_ext_shared_channel flag is not a boolean` | The envelope's flag is neither `true` nor `false`, so the server can't tell and doesn't serve it. | None in fungible mode. Serve it in declarative mode, with the channel listed. |
+  | `the channel is externally shared` | Slack marks the channel as externally shared (Slack Connect). Fungible mode never serves it. | Serve it in declarative mode, with the channel listed, or remove the app from the channel. |
+
+  Serving a channel in declarative mode means turning fungible mode off for
+  every persona (see
+  [Channel modes](../../README.md#channel-modes)); there is no per-channel
+  exception.
 
 ### `persona-dm-dropped`
 
@@ -747,13 +817,18 @@ running are not affected. See
   conversation. DMs sent before that aren't delivered later. Leaving it off
   is valid when the persona should ignore DMs; the line is then expected.
 - **Group DMs:** a group DM (a direct message with more than one person) is
-  not delivered and never logs `persona-dm-dropped`, whatever `dm.enabled`
-  says. This is by design, not a fault; turning `dm.enabled` on does not
-  change it. A group-DM message that Slack marks with `channel_type` `mpim`
-  logs the plain `[slack] persona "<name>" (key=<key>) dropped message from
-  channel=<id> …: group-dm` line. An @mention of the persona in a group DM
-  arrives without `channel_type`, so it logs `unclaimed-channel` instead (see
-  [`unclaimed-channel`](#unclaimed-channel)).
+  never delivered, in either channel mode, and never logs
+  `persona-dm-dropped`, whatever `dm.enabled` says. This is by design, not a
+  fault; turning `dm.enabled` on, or turning fungible mode on, does not
+  change it. What it logs:
+  - a group-DM message that Slack marks with `channel_type` `mpim` logs the
+    plain `[slack] persona "<name>" (key=<key>) dropped message from
+    channel=<id> …: group-dm` line, in both modes;
+  - an @mention of the persona in a group DM arrives as an `app_mention`
+    event without `channel_type`. In declarative mode it logs
+    [`unclaimed-channel`](#unclaimed-channel). In fungible mode it logs no
+    line of its own, only the server's
+    `[slack] RAW app_mention event persona=<key>: …` intake line.
 
 ### `persona-invited-channel`
 
@@ -777,19 +852,35 @@ running are not affected. See
     token.
 
   The delivery shown is the one in force at that first event; a later
-  change to it logs no second line.
+  change to it logs no second line of this class (a change made with
+  `set_channel_delivery` logs a
+  [`persona-channel-delivery-set`](#persona-channel-delivery-set) line).
+- **Log rotation:** because the line is logged once per persona life and
+  channel, log rotation can discard a channel's only audit line on a
+  long-running server (see [The server log](#the-server-log)). After a
+  restart, the first fungible-path event from each channel logs it again.
 - **Cause:** The persona's Slack app is a member of that public or private
   channel, the channel isn't externally shared, and `allow_invited_channels`
   is `true`. The invite alone is enough: Slack sends the app events only from
   channels it is in, so nothing about membership is stored and no Slack call
   checks it.
 - **Fix:** None when the persona is expected to hear the channel. To stop the
-  persona hearing it, remove its app from the channel in Slack. The delivery
-  shown is `mentions`, whatever the persona chose for the channel, when the
-  channel is another persona's fungible destination (its
+  persona hearing it, remove its app from the channel in Slack. To change the
+  delivery shown, ask the persona in that channel: its agent calls
+  `set_channel_delivery`, which logs a
+  [`persona-channel-delivery-set`](#persona-channel-delivery-set) line. The
+  delivery shown is `mentions`, whatever the persona chose for the channel,
+  when the channel is another persona's fungible destination (its
   `invited.permission_prompts` channel), so two personas can't answer each
   other in a loop. It is `mentions` too when the persona has no stored
-  choice for the channel, or the stored choices can't be read.
+  choice for the channel, or when the stored-choice file can't be read (see
+  [`channel-delivery-unreadable`](#channel-delivery-unreadable)). A persona
+  that hears a channel but doesn't answer there is covered under
+  [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to).
+- **Two personas at `all` in one channel:** don't. Each receives every
+  message there, the other's posts included, so the two can keep answering
+  each other with no human involved. Keep at most one at `all` (see
+  [Channel delivery in fungible mode](../../README.md#channel-delivery-in-fungible-mode)).
 
 ### `persona-channel-delivery-set`
 
@@ -820,48 +911,72 @@ running are not affected. See
   under the same key (`working_directory` or `credentials_file` changed, or
   `name` changed without changing the key; see **Destructively modified
   persona** under
-  [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)).
-  The persona brought up fresh is at `mentions` in every channel until its
-  agent stores a new choice.
+  [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)),
+  with a drop line naming the reason `retired by a confirmed change` (see
+  [The store's `[slack] channel-delivery:` lines](#the-stores-slack-channel-delivery-lines),
+  which also covers the drops a start makes). The persona brought up fresh is
+  at `mentions` in every channel until its agent stores a choice again.
 - **Cause:** The persona's agent called the tool, usually because someone in
   that channel asked it to listen to every message there (`all`), or only to
   @mentions and `@here` or `@channel` broadcasts (`mentions`).
 - **Fix:** None when the change was expected. To undo it, ask the persona in
-  that channel to set the other value. Note:
+  that channel to set the other value; the other fixes for a persona that
+  receives every message in a channel are under
+  [A persona receives every message in a channel](#a-persona-receives-every-message-in-a-channel).
+  Note:
   - a line with `to all` and `at channel delivery mentions` means the loop
     guard holds the channel at `mentions`, because it is another applied
     persona's fungible destination (its `invited.permission_prompts`
     channel), so two personas can't answer each other in a loop. The choice
     stays stored, and applies once the channel is no longer that
-    destination;
-  - a refused call logs no line of this class: the agent gets a tool error
-    instead, naming the persona and the reason (declarative mode, the
-    stored-choice file unreadable, a `delivery` other than `mentions` or
-    `all`, or a channel the persona hasn't heard in fungible mode and holds
-    no choice for), and nothing is stored;
-  - `Tool "set_channel_delivery" refused: persona key=<key> is not an applied persona.`
-    is the refusal for a call the server can't tie to an applied persona.
-    Besides a key absent from the applied configuration, it covers a key
-    that a confirmed change still in progress is retiring (a destructive
-    modify, from the change's apply until its teardown has settled), and a
-    session the server has dropped (the teardown of a removal or destructive
-    modify) or replaced with a newer registration, even while the persona is
-    still in `config.json`. Nothing is stored. Once the persona's new
-    session is up, its agent can call the tool again;
-  - a failed write of the stored-choice file gives the agent
-    `Tool "set_channel_delivery" failed for persona "<name>" (key=<key>): the stored-choice file "<path>" could not be written, so the choice was not stored and channel delivery is unchanged.`
-    and logs one line, with no `persona-channel-delivery-set` line:
-    `[slack] channel-delivery: cannot store the channel delivery of persona=<key> for channel <id> in "<path>"<detail>; the stored choices in memory are unchanged (b.deo SRI-404, SRI-506)`.
-    `<detail>` is ` (<code>); the file is unchanged` (no ` (<code>)` when
-    the error has none), or, when the file was written but its directory
-    could not be synced,
-    `: the record was written but its directory could not be synced (<code>); <write-back>`,
-    where `<write-back>` says the earlier file was put back, or
-    `putting the previous state back failed too (<code>), so the file holds the refused choice until the next successful write`.
-    The choice is not
-    stored and the persona's channel delivery is unchanged. Fix the cause
-    the code names (a full disk, or permissions on the state directory),
-    then ask the persona to set the value again.
+    destination.
+- **Refusals:** a refused call logs no line of this class, and no other
+  line: the agent gets a tool error, and nothing is stored or written. A
+  call is checked in this order, and the first rule it breaks gives the
+  error:
+  1. The session resolves to no applied persona, with the same refusals the
+     other tools give:
+     - `Tool "set_channel_delivery" refused: this session is not matched to a persona.`
+       The calling session is matched to no persona.
+     - `Tool "set_channel_delivery" refused: persona key=<key> is not an applied persona.`
+       Besides a key absent from the applied configuration, it covers a key
+       that a confirmed change still in progress is retiring (a destructive
+       modify, from the change's apply until its teardown has settled), and
+       a session the server has dropped (the teardown of a removal or
+       destructive modify) or replaced with a later registration, even while
+       the persona is still in `config.json`. Once the persona's session is
+       up again, its agent can call the tool again.
+  2. Declarative mode:
+     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): invited channels are off, and in declarative mode channel delivery is set by the operator in config.json.`
+     Expected while `allow_invited_channels` is absent or `false`: the
+     operator sets each channel's `delivery` in `config.json`.
+  3. The stored-choice file is unreadable:
+     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the stored-choice file "<path>" is not readable, so no channel delivery can be stored. To fix: the operator moves the file aside, then restarts the server.`
+     See [`channel-delivery-unreadable`](#channel-delivery-unreadable).
+  4. A bad value:
+     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): delivery "<value>" is not "mentions" or "all".`
+     A value that is missing, not a string, or anything but 1 to 48
+     letters and underscores reads
+     `… delivery is not "mentions" or "all" (the value given is not shown).`
+  5. An unknown channel:
+     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): channel "<channel>" is not known: it is not a channel this persona has heard a message from in fungible mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.`
+     A value that isn't 1 to 24 capital letters and digits reads
+     `… the channel is not known (the value given is not shown): …`. The
+     persona has heard the channel only once a message from it took its
+     fungible path in its current life (see
+     [`persona-invited-channel`](#persona-invited-channel)); an externally
+     shared channel, a group DM and a DM never count. Fix: wait for a
+     message in that channel, then ask again.
+- **A failed write:** a failed write of the stored-choice file gives the
+  agent
+  `Tool "set_channel_delivery" failed for persona "<name>" (key=<key>): the stored-choice file "<path>" could not be written, so the choice was not stored and channel delivery is unchanged.`
+  and logs one `[slack] channel-delivery: cannot store the channel delivery of persona=<key> for channel <id> in "<path>"…`
+  line, with no `persona-channel-delivery-set` line. The choice is not
+  stored and the persona's channel delivery is unchanged. The line's forms,
+  including the one where the refused choice stays on disk, and the cause
+  and fix are under
+  [The store's `[slack] channel-delivery:` lines](#the-stores-slack-channel-delivery-lines).
+  Once the cause is fixed, ask the persona to set the value again.
 
 ### `persona-destination-failed`
 
@@ -871,8 +986,17 @@ running are not affected. See
   - `[slack] persona-destination-failed: personas[<i>] "<name>" (key=<key>): <step> failed for destination=<dest> with error <code>; holding its permission prompts and notices and retrying with backoff`
   - `[slack] persona-destination-failed: personas[<i>] "<name>" (key=<key>): cleared: destination=<dest> accepts posts again (was <step> error <code>); delivering what was held`
 
-  `<dest>` is the persona's `permission_prompts` value: a channel ID, or
-  `dm`. `<step>` is `conversations.open` (opening the DM with `dm.contact`,
+  `<dest>` is the persona's destination in the mode in force, a channel ID
+  or `dm`:
+  - **Declarative mode:** its `permission_prompts` value. The lines read as
+    above.
+  - **Fungible mode:** its fungible destination, the
+    `invited.permission_prompts` value, or `dm` when that is absent. The
+    lines name the setting after the value:
+    - `[slack] persona-destination-failed: personas[<i>] "<name>" (key=<key>): <step> failed for destination=<dest> (invited.permission_prompts) with error <code>; holding its permission prompts and notices and retrying with backoff`
+    - `[slack] persona-destination-failed: personas[<i>] "<name>" (key=<key>): cleared: destination=<dest> (invited.permission_prompts) accepts posts again (was <step> error <code>); delivering what was held`
+
+  `<step>` is `conversations.open` (opening the DM with `dm.contact`,
   for `dm` only) or `chat.postMessage` (the post). For `missing_scope` on
   `conversations.open` the start line has
   ` — the Slack app lacks the im:write scope: re-install the app with im:write to grant it`
@@ -889,10 +1013,14 @@ running are not affected. See
   - a permission request stays open in agent-director. Its prompt is posted
     at the first retry that succeeds, if the request is still open then;
   - the line is logged once per episode. Failed retries log nothing, except
-    that when `permission_prompts` was changed by a confirmed reload during
-    the episode, the first failure at the new destination logs one more start
-    line naming it. The `cleared:` line names the destination the successful
-    post went to;
+    that when a confirmed change during the episode moved the destination
+    (a change of `permission_prompts` in declarative mode, of
+    `invited.permission_prompts` in fungible mode, or of
+    `allow_invited_channels`), the first failure at a destination the
+    episode hasn't named yet logs one more start line naming it. A switch
+    change counts even when both settings hold the same value, because the
+    line names the setting too. The `cleared:` line names the destination
+    the successful post went to;
   - a spawn-failure notice that fails at startup writes a `spawn-failure-post`
     record to `startup-errors.log` at its first failed attempt. The notice is
     still held, so the record can be followed by the `cleared:` line and the
@@ -908,9 +1036,12 @@ running are not affected. See
     It covers the scope, the re-install and the check for a changed bot
     token. The server keeps retrying, so once the app has `im:write`, a later
     retry delivers what was held.
-  - `not_in_channel`: the persona's app isn't a member of its
-    `permission_prompts` channel. Invite the app to that channel (in Slack,
-    `/invite @<app name>` in the channel).
+  - `not_in_channel`: the persona's app isn't a member of its destination
+    channel: its `permission_prompts` channel in declarative mode, its
+    `invited.permission_prompts` channel in fungible mode. Invite the app to
+    that channel (in Slack, `/invite @<app name>` in the channel). In
+    fungible mode the invite also makes the persona hear that channel, at
+    `mentions` unless its agent chose otherwise.
   - Any other error: another Slack error such as `channel_not_found` or
     `is_archived`, or a network error or timeout (`network_error`,
     `unknown_error`, …). It's held and retried the same way. Check that the
@@ -920,8 +1051,9 @@ running are not affected. See
     Slack. The Slack client retries a network failure itself first, for up to
     about 30 minutes, so a network outage can reach this line late.
   - To send the persona's prompts and notices somewhere else instead, change
-    its `permission_prompts` (a channel its app is in, or `dm`) or its
-    `dm.contact` in `config.json`. The edit becomes pending (see
+    its destination setting in `config.json`: `permission_prompts` in
+    declarative mode, `invited.permission_prompts` in fungible mode (a
+    channel its app is in, or `dm`), or its `dm.contact`. The edit becomes pending (see
     [Pending changes](#pending-changes)); once confirmed (see
     [Confirming a pending change](#confirming-a-pending-change)) it applies
     in place, with no restart, and the persona keeps its instance and
@@ -1140,14 +1272,23 @@ This is not a bring-up retry. A persona that was up and whose working directory
 is later removed follows the restart path: its launches fail, restarts back off
 from `session_restart_delay` and stop after 5 consecutive failures (a
 `SpawnCapReached` notice), and a *Working directory unreachable* notice is
-posted to the persona's `permission_prompts` channel. Restore the directory; if
+posted to the persona's destination: its `permission_prompts` channel or DM
+in declarative mode, its fungible destination (`invited.permission_prompts`,
+or its DM with `dm.contact` when that is `"dm"` or absent) in fungible mode.
+Restore the directory; if
 restarts were capped, restart the server.
 
 ### Two personas post lost-message notices about each other
 
-A lost-message notice is a Slack post like any other, so a persona with
-`delivery: all` in another persona's destination channel receives that
-persona's notices. When two personas each receive every message in the other's
+This arises only in declarative mode. In fungible mode the loop guard holds
+every persona at `mentions` in each other persona's fungible destination
+channel, whatever it chose there (see **The loop guard** under
+[A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to)),
+so no persona receives every message in another's destination.
+
+A lost-message notice is a Slack post like any other, so in declarative mode
+a persona with `delivery: all` in another persona's destination channel
+receives that persona's notices. When two personas each receive every message in the other's
 destination channel and neither persona's instance can take messages, each
 loses the other's notices and posts a *Message lost* notice about each one.
 They keep posting notices about each other until either instance takes
@@ -1184,6 +1325,84 @@ end' "$CREDS" 2>/dev/null || echo "not valid JSON, or unreadable"
 
 Never `cat`, `head` or `jq .` a credentials file. A good shape doesn't prove
 Slack accepts the token: `persona-credentials-refused` is Slack's answer.
+
+---
+
+## A persona is silent in a channel its app was invited to
+
+The persona's Slack app is a member of a channel, but a message there gets no
+answer. An invite is enough only in fungible mode, and only for some
+conversations. Work it out from two things.
+
+**1. The mode in force.** The running server runs its last-applied record, so
+read the switch there (the record holds no token):
+
+```sh
+STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+grep -F '"allow_invited_channels"' "$STATE/config.json.last-applied"
+```
+
+`true` is fungible mode. No match, or `false`, is declarative mode. An edit of
+`config.json` that isn't confirmed yet changes nothing (see
+[Pending changes](#pending-changes)).
+
+**2. The persona's lines for that channel.** Replace `ops_bot` with the
+persona's key and `C0123456789` with the channel ID:
+
+```sh
+grep -h -E '\(key=ops_bot\)|persona=ops_bot\b' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | grep -F 'C0123456789' | sort
+```
+
+Look for a [`persona-invited-channel`](#persona-invited-channel) line for the
+channel (in fungible mode, logged by the first message from it that the
+persona heard in its current life) and for the drop line, if any, logged at
+the time of the silent message. A `[slack] RAW message event persona=<key>: …`
+line shows that the message's event reached the persona's app at all.
+
+| Cause | Sign in the log | Fix |
+|---|---|---|
+| **Declarative mode** | The declarative [`unclaimed-channel`](#unclaimed-channel) line (`… not delivered: no applied persona lists this channel`). No line at all when another applied persona lists the channel: that persona receives it. A `not-mentioned` plain line when this persona lists it at `delivery: mentions`. | List the channel in this persona's `channels` and confirm the change, or turn fungible mode on for a public or private channel that is not externally shared (see the Fix under [`unclaimed-channel`](#unclaimed-channel)). |
+| **An externally shared channel** (fungible mode) | The fungible [`unclaimed-channel`](#unclaimed-channel) line with the reason `the channel is externally shared`, and no `persona-invited-channel` line. The other four reasons of that line are covered there too. | Fungible mode never serves it. Serve it in declarative mode, with the channel listed. |
+| **A group DM** | In both modes, a plain `[slack] persona "<name>" (key=<key>) dropped message from channel=<id> …: group-dm` line. An @mention there logs `unclaimed-channel` in declarative mode and no line of its own in fungible mode. | None: a group DM is never served, in either mode (see **Group DMs** under [`persona-dm-dropped`](#persona-dm-dropped)). Use a channel, or a DM with the persona. |
+| **An edit that adds a mention** (fungible mode) | A plain `… dropped message from channel=<id> …: non-message` line for the edit. In fungible mode an @mention is delivered from its `message` event, and an edit arrives as an `app_mention` (which fungible mode never decides on) plus a `message_changed` event, which is never delivered. | Post another message that @mentions the persona. |
+| **A message posted before the invite** | No line at all, not even a `RAW message event` line: Slack sends the app no event for a message posted before it joined the channel. | Post the message again. The persona can read earlier messages with `fetch_messages` when asked. |
+| **The channel at `mentions`, and the message doesn't @mention the persona** (fungible mode) | A plain `… dropped message from channel=<id> …: not-mentioned` line. The channel's `persona-invited-channel` line shows `at channel delivery mentions`. | @mention the persona, or ask it in that channel to switch the channel to `all` (it calls `set_channel_delivery`; see [`persona-channel-delivery-set`](#persona-channel-delivery-set)). |
+| **The loop guard** (fungible mode) | As for `mentions` above, but the channel is another applied persona's fungible destination (its `invited.permission_prompts` channel), so the `persona-invited-channel` line shows `mentions` whatever this persona chose. A `persona-channel-delivery-set` line for it reads `to all, at channel delivery mentions after the loop guard`. | @mention the persona there. Asking it to switch to `all` changes nothing while the guard holds the channel. To serve it at `all`, have the operator give the other persona a different `invited.permission_prompts` and confirm the change. |
+| **The stored-choice file is unreadable** (fungible mode) | A [`channel-delivery-unreadable`](#channel-delivery-unreadable) line at the latest start. Every `persona-invited-channel` line shows `mentions`, and `set_channel_delivery` is refused. | See [`channel-delivery-unreadable`](#channel-delivery-unreadable). |
+| **The persona isn't up, or its instance isn't taking messages** | A class line after its latest `persona-start` line, or a *Message lost* notice at its destination with a `No live session` or `DROP: no _GET_stream` line. A lost message still logs the channel's `persona-invited-channel` line in fungible mode. | See [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running) and [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected). |
+
+The README's troubleshooting entry **A persona is silent in a channel it was
+invited to** (under [Troubleshooting](../../README.md#troubleshooting)) gives
+the operator's short version, and
+[Channel modes](../../README.md#channel-modes) explains the two modes.
+
+### A persona receives every message in a channel
+
+The companion case: a persona answers, or receives, every message in a
+channel, not only @mentions and broadcasts.
+
+- **Fungible mode.** The persona's agent chose `all` for that channel with
+  `set_channel_delivery`. Its sign is a
+  [`persona-channel-delivery-set`](#persona-channel-delivery-set) line for
+  the channel ending `to all, at channel delivery all after the loop guard`.
+  The choice is kept across restarts, so the line can be in an older log
+  generation, or rotated away: the channel's entry in
+  [`channel-delivery.json`](#the-stored-choice-file-channel-deliveryjson)
+  then shows `"delivery": "all"`. Fixes, any one of:
+  - ask the persona, in that channel or by DM, to switch the channel back to
+    `mentions`;
+  - remove the persona's app from the channel;
+  - turn fungible mode off with a confirmed change (see
+    [Turning fungible mode on or off](../../README.md#turning-fungible-mode-on-or-off)).
+    The stored choice stays on disk and applies again if fungible mode is
+    turned back on.
+- **Declarative mode.** The channel's entry in the persona's `channels` has
+  `delivery: all`. Have the operator change it to `mentions` and confirm the
+  change (see [Confirming a pending change](#confirming-a-pending-change)).
+
+Two personas at `all` in one channel each receive the other's posts and can
+keep answering each other: keep at most one at `all` (see
+[Channel delivery in fungible mode](../../README.md#channel-delivery-in-fungible-mode)).
 
 ---
 
@@ -2997,6 +3216,21 @@ No notice raised during its teardown reaches the new half's destination (see
 is an internal error in that cancel; the teardown still runs. Report it as a
 bug.
 
+**Stored channel choices.** Once the change's last-applied record is
+written, the stored channel deliveries of every key it retires (a removed
+persona's, a renamed persona's old key, and a destructively modified
+persona's) are dropped from `channel-delivery.json`, in either mode, with a
+`[slack] channel-delivery: dropped the stored choices of persona=<key> in <n> channels: retired by a confirmed change (b.deo SRI-405, SRI-905)`
+line (see
+[The store's `[slack] channel-delivery:` lines](#the-stores-slack-channel-delivery-lines)).
+They never apply again. A persona brought up under that key, a
+destructively modified persona's new half included, is at `mentions` in
+every channel in fungible mode until its agent sets a channel again with
+`set_channel_delivery`. From the change's apply until its teardowns have
+settled, a destructively modified persona's `set_channel_delivery` calls are
+refused as for a key that isn't applied (see
+[`persona-channel-delivery-set`](#persona-channel-delivery-set)).
+
 **Either.** `[slack] reload: apply step <n> (<step>) failed for persona "<name>" (key=<key>): <error>`
 is an internal error in that persona's teardown or bring-up; the other
 personas were still handled. Report it as a bug, with the persona's lines.
@@ -3110,6 +3344,17 @@ has begun, the server marks the key; once it then reads the new session
 running, it removes the key's entry, and the persona is resumed as usual from
 then on. Search `server.log` for `key is retired`.
 
+The stored channel choices of a retired key don't come back with it. The
+confirmed change that retired the key dropped them (see **Stored channel
+choices** under
+[A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)),
+so a persona added again or renamed back starts at `mentions` in every
+channel in fungible mode. If that drop's write failed, the confirmed change
+that adds the persona back writes the stored-choice file first, and applies
+nothing if it can't (see
+[`reload-record-write-failed`](#reload-record-write-failed)); a start drops
+them too, while the key is absent or held as retired with no new life begun.
+
 A server start records keys too: before its clean-up of old instances ends
 any of them, it records as retired, in one write, the key of every
 agent-director instance labelled with a persona that is not in the applied
@@ -3147,9 +3392,21 @@ grep -h -E 'retired-keys: (recorded|cannot record) .*cause=absent-at-start|recon
 
 ## A persona's routing settings were changed by a confirmed change
 
-A confirmed change to a kept persona's `channels` (each entry's `delivery`
-included), `permission_prompts`, `dm.enabled` or `dm.contact` applies in
-place on the running server, with no restart. The persona's instance, its
+A confirmed change to a kept persona's routing settings applies in place on
+the running server, with no restart. Which settings those are depends on the
+mode the change's own `allow_invited_channels` picks:
+
+- **Declarative mode:** `channels` (each entry's `delivery` included) and
+  `permission_prompts`;
+- **Fungible mode:** `invited.permission_prompts`, the fungible destination
+  (an absent value and `"dm"` count as the same);
+- **both modes:** `dm.enabled` and `dm.contact`.
+
+A change to the other mode's section is recorded only and applies nothing
+(the preview's `recorded, with no effect until …` line; see
+[Pending changes](#pending-changes)). A change of `allow_invited_channels`
+itself also applies in place, keeping every session (see
+[Confirming a pending change](#confirming-a-pending-change)). The persona's instance, its
 conversation, its Slack connection and its MCP session are kept. The new
 values govern its next message, tool call, permission prompt and notice. This
 holds for a persona that is `retrying` or `broken` too: it uses the new values
@@ -3166,8 +3423,8 @@ once it is up.
 
 | Line | Meaning |
 |---|---|
-| `[slack] persona "<name>" (key=<key>): updated in place (<settings>); its instance, Slack connection and MCP session are kept` | The change was applied. `<settings>` lists what changed, such as `channels, dm.contact`. Normal. The same line is logged for a persona that is `retrying` or `broken`, though it has no instance, connection or session yet; it serves with the new values once it comes up. |
-| … the same line ending `; its cached DM conversation is forgotten` | `permission_prompts` or `dm.*` changed, so the next post to a DM destination opens the DM again. Normal. |
+| `[slack] persona "<name>" (key=<key>): updated in place (<settings>); its instance, Slack connection and MCP session are kept` | The change was applied. `<settings>` lists what changed, such as `channels, dm.contact` in declarative mode or `invited.permission_prompts, dm.enabled` in fungible mode. Normal. The same line is logged for a persona that is `retrying` or `broken`, though it has no instance, connection or session yet; it serves with the new values once it comes up. |
+| … the same line ending `; its cached DM conversation is forgotten` | The destination setting (`permission_prompts`, or `invited.permission_prompts` in fungible mode) or `dm.*` changed, so the next post to a DM destination opens the DM again. Normal. |
 | … the same line ending `; forgetting its cached DM conversation failed: <error>` | An internal error. The new values still apply. Report it as a bug. |
 | `[slack] persona "<name>" (key=<key>): in-place update failed: <error>` | An internal error. The new values still apply, because the server reads them at each use. Report it as a bug. |
 
@@ -3261,15 +3518,17 @@ registers again with its history. If the new token is refused too, a new
   `Tool "reply" failed for persona <ref>: could not open a DM with "<user>" (missing_scope). The persona's Slack app lacks the im:write scope; add it and re-install the app.`
   `server.log` has a matching `[slack] Tool "reply" failed for persona <ref>: could not open a DM with "<user>" …`
   line. Nothing is posted.
-- **Same cause, prompts and notices:** a persona whose `permission_prompts`
-  is `"dm"` opens its DM with `dm.contact` the same way, so its permission
+- **Same cause, prompts and notices:** a persona with a `"dm"` destination
+  (its `permission_prompts` is `"dm"` in declarative mode; in fungible mode
+  its `invited.permission_prompts` is `"dm"` or absent, `"dm"` being the
+  default) opens its DM with `dm.contact` the same way, so its permission
   prompts, stuck-prompt warnings and server notices can't be posted either.
   They are held, not lost: `server.log` has one
   [`persona-destination-failed`](#persona-destination-failed) line naming
   `conversations.open`, `missing_scope` and `im:write`, and the server
   retries with backoff (up to 5 minutes apart), logging nothing per attempt.
 - **Cause:** starting a DM with a user (a `reply` to a user ID, or a persona
-  whose `permission_prompts` is `"dm"`) needs the `im:write` bot scope. The
+  with a `"dm"` destination) needs the `im:write` bot scope. The
   persona's Slack app was created, or last installed, from a manifest without
   it. A `"dm"` destination always opens its DM through `conversations.open`
   before it first posts there, even when the DM already exists, so an
@@ -4175,9 +4434,9 @@ agent-director get --claude-instance-id <id>
 | `[slack] spawnForPersona: <step> failed for "<name>" (key=<key>): <error> — a counted launch failure; nothing is killed and no spawn is made in its place (b.jg5 SRJ-602)` | A launch of the persona could not create its tmux session (`ErrTmuxSessionCreate`). `<step>` is `spawn` (the first spawn), `retry-spawn`, `resume` or `fresh spawn after ErrSpawnNotFound on resume`; a reuse spawn logs its own line (`reuseSpawnForPersona: reuse spawn failed …`, below). The server posts a `Spawn failure:` notice and writes a `spawn-failed` entry when this happens at a start. The failure counts toward the restart limit only when the launch is a restart's (logged next as `[slack] Session relaunch failed for persona=<key>`) or the live-row sequence's own launch (`[slack] Launch failed for persona=<key> — counted (b.jg5 SRJ-112, SRJ-113, SRJ-602)`); a start adds it only to the `failed` count of its `[slack] startupSessionManager: complete — …` line, and any other launch counts nothing. The launch also starts the persona's retries in pending-only mode, logged as `[slack] unavailable-retry: persona=<key> armed in pending-only mode (pending-row) — first retry in 30 s`, so the next try reads the persona's row first. When the persona's retries are already pending, no such line is logged: they keep their mode and their next try's time. The session holding the name is left running, and no other launch is made in its place. When the failed launch left the persona's instance still starting, that launch is never the server's own: the retries check it from `pending_grace_seconds`, never end it, post *Session not starting* once at the limit, and bring the persona up once agent-director marks it missing; see [A persona posts a Launch stuck or Session not starting notice](#a-persona-posts-a-launch-stuck-or-session-not-starting-notice). Nothing, unless that notice comes. |
 | `[slack] spawnForPersona: <step> failed for "<name>" (key=<key>): <error>` | A launch step failed for another reason (`<step>` as in the row above). The server posts a `Spawn failure:` notice and, for a spawn at a start, writes a `spawn-failed` entry; the persona's next restart tries again. |
 | `[slack] spawnForPersona: <error> on resume for "<name>" (key=<key>) — a reuse spawn of the same id follows; nothing is deleted (b.jg5 SRJ-707)` | agent-director had no conversation to resume (`ErrNoSessionId`, `ErrJsonlMissing` or `ErrJsonlNeverWritten`), so the persona is brought up fresh on the same instance id by a reuse spawn, and its agent-director row is kept as an earlier life. After `ErrJsonlMissing` an `ErrJsonlMissing diagnostic:` line (below) comes first; then the reuse spawn's own line. Nothing. |
-| `[slack] ErrJsonlMissing diagnostic: "<name>" (key=<key>) instance=cscb_<key>: resume threw ErrJsonlMissing and the persona is brought up fresh by a reuse spawn of the same instance, and its row is kept (its history archived to the earlier life), but the message archive holds <n> message(s) since spawn (started_at=<time>). Conversation history was LOST. Transcript candidates tried (<source>): <paths>.` | The persona's transcript was missing although the message archive shows messages since it started: its conversation memory is lost. At a start a `jsonl-transcript-lost-on-resume` entry with the same text goes to `startup-errors.log`. Once the persona is up, its destination gets a warning ("… my conversation memory has been lost and I was brought up fresh by a reuse spawn of the same instance, and its row is kept (its history archived to the earlier life). …"); when bringing it up fails, the entry stays and no warning is posted. The start's summary counts it as `fresh-after-amnesia`. A human checks the transcript storage under the persona's `claude_config_dir` (the paths the line names; each path is shown on one line, with anything that looks like a credential masked and a long one shortened). |
-| `[slack] ErrJsonlMissing diagnostic: "<name>" (key=<key>) instance=cscb_<key> — transcript never created (archive consulted: 0 archived messages since spawn). Nothing to lose; the persona is brought up fresh by a reuse spawn of the same instance, and its row is kept (its history archived to the earlier life). Transcript candidates tried (<source>): <paths>.` | The persona never had a conversation since it started, so no transcript was written; nothing was lost. No entry and no warning; the start's summary counts it as `fresh-after-amnesia`. Nothing. |
-| `[slack] ErrJsonlMissing diagnostic: "<name>" (key=<key>) instance=cscb_<key>: resume threw ErrJsonlMissing and the persona is brought up fresh by a reuse spawn of the same instance, and its row is kept (its history archived to the earlier life), but diagnosis was INCONCLUSIVE — could not determine whether conversation history was lost because <reason>.` | The server could not tell whether the persona's conversation was lost (`<reason>`: its row was absent, its start time unreadable, the archive not configured or unreadable, or a zero count it can't attribute). At a start a `jsonl-diagnosis-inconclusive` entry goes to `startup-errors.log`; once the persona is up, its destination gets a warning ("on restart I was brought up fresh by a reuse spawn of the same instance, and its row is kept (its history archived to the earlier life); I could not determine whether my prior conversation history was preserved …"), and none when bringing it up fails. The start's summary counts it as `fresh-after-inconclusive-amnesia`. When the reason is the archive, configure `message_archive_db`; otherwise a human checks the transcript storage. |
+| `[slack] ErrJsonlMissing diagnostic: "<name>" (key=<key>) instance=cscb_<key>: resume threw ErrJsonlMissing and the persona is brought up fresh by a reuse spawn of the same instance, and its row is kept (its history archived to the earlier life), but the message archive holds <n> message(s) since spawn (started_at=<time>). Conversation history was LOST. Transcript candidates tried (<source>): <paths>.` | Declarative mode only: in fungible mode no channel is counted, so this line is never logged there (see the `INCONCLUSIVE` row below). The persona's transcript was missing although the message archive shows messages since it started: its conversation memory is lost. At a start a `jsonl-transcript-lost-on-resume` entry with the same text goes to `startup-errors.log`. Once the persona is up, its destination gets a warning ("… my conversation memory has been lost and I was brought up fresh by a reuse spawn of the same instance, and its row is kept (its history archived to the earlier life). …"); when bringing it up fails, the entry stays and no warning is posted. The start's summary counts it as `fresh-after-amnesia`. A human checks the transcript storage under the persona's `claude_config_dir` (the paths the line names; each path is shown on one line, with anything that looks like a credential masked and a long one shortened). |
+| `[slack] ErrJsonlMissing diagnostic: "<name>" (key=<key>) instance=cscb_<key> — transcript never created (archive consulted: 0 archived messages since spawn). Nothing to lose; the persona is brought up fresh by a reuse spawn of the same instance, and its row is kept (its history archived to the earlier life). Transcript candidates tried (<source>): <paths>.` | Declarative mode only, like the `LOST` row above. The persona never had a conversation since it started, so no transcript was written; nothing was lost. No entry and no warning; the start's summary counts it as `fresh-after-amnesia`. Nothing. |
+| `[slack] ErrJsonlMissing diagnostic: "<name>" (key=<key>) instance=cscb_<key>: resume threw ErrJsonlMissing and the persona is brought up fresh by a reuse spawn of the same instance, and its row is kept (its history archived to the earlier life), but diagnosis was INCONCLUSIVE — could not determine whether conversation history was lost because <reason>.` | The server could not tell whether the persona's conversation was lost (`<reason>`: its row was absent, its start time unreadable, the archive not configured or unreadable, a zero count it can't attribute, or fungible mode). In fungible mode every diagnosis with a readable start time is inconclusive with the reason `` the server is in fungible mode (`allow_invited_channels` is true), where a persona serves every channel its app is a member of and the configuration cannot predict its traffic, so no channel is counted and 0 archived messages since spawn proves nothing ``, whether or not `message_archive_db` is set: the archive is never consulted, so a persona with no archive gets this reason, not the hint to enable the archive. At a start a `jsonl-diagnosis-inconclusive` entry goes to `startup-errors.log`; once the persona is up, its destination gets a warning ("on restart I was brought up fresh by a reuse spawn of the same instance, and its row is kept (its history archived to the earlier life); I could not determine whether my prior conversation history was preserved …"), and none when bringing it up fails. The start's summary counts it as `fresh-after-inconclusive-amnesia`. When the reason is the archive, configure `message_archive_db` (in declarative mode only: in fungible mode the archive can't decide it); otherwise a human checks the transcript storage. |
 | `[slack] reuseSpawnForPersona: reuse-spawned "<name>" (key=<key>) instanceId=cscb_<key> — a new life on its own id; its row is kept as an earlier life (b.jg5 SRJ-112)` | The persona was brought up fresh on its own instance id, and its agent-director row and history are kept as an earlier life. With `the id had no row when last read (an ordinary fresh spawn), so no earlier life is kept` in place of `its row is kept as an earlier life`, the instance id had no row, so this was an ordinary fresh spawn. Its `pre_trust` line follows. Nothing. |
 | `[slack] reuseSpawnForPersona: <error> on the reuse spawn of "<name>" (key=<key>) — its row is live, so nothing was launched; no spawn-failure notice, nothing counted (b.jg5 SRJ-112)` | That spawn found the instance id's row live again (`ErrInstanceIdCollision`), so nothing was launched, nothing posted and nothing counted. The line after it says what follows: at a launch, the `collided with a live row` line above (the launch reads the row once more; a second collision ends it, and it is retried), or, at the live-row sequence's launch, its `live-row-sequence: the reuse spawn of … collided with a live row` line (below), and the replacement ends (`not launched (…; reuse-collision)`). Nothing. |
 | `[slack] reuseSpawnForPersona: reuse spawn failed for "<name>" (key=<key>): <error> — a counted launch failure; nothing is killed and no spawn is made in its place (b.jg5 SRJ-112, SRJ-602)` | That spawn could not create its tmux session (`ErrTmuxSessionCreate`). A `Spawn failure:` notice is posted, and at a start a `spawn-failed` entry (`reuse spawn failed for …`) is written. The failure counts toward the restart limit only when the launch is a restart's (logged next as `[slack] Session relaunch failed for persona=<key>`) or the live-row sequence's own launch (`[slack] Launch failed for persona=<key> — counted (b.jg5 SRJ-112, SRJ-113, SRJ-602)`); a start adds it only to the `failed` count of its `[slack] startupSessionManager: complete — …` line, and any other launch counts nothing. The persona's retries start in pending-only mode, so the next try reads the row first. Nothing is killed, and no other launch is made in its place; an instance it left still starting is waited out as for the `<step> failed … a counted launch failure` line above. |
@@ -4280,7 +4539,8 @@ agent-director get --claude-instance-id <id>
 | `[slack] persona-routing: lost-message row read for persona "<name>" (key=<key>) failed — session-starting left out: …` | The server's one check with agent-director for a lost message (see `starting` in the `No live session` row) failed internally, so the notice reports the next state that applies, never `starting`. The message was lost as usual and its notice still goes out. If the state is `starting now`, the restart it started checks agent-director again before launching and never launches over a session still starting. Nothing to do unless it repeats; then report it as a bug, with the persona's lines around it. |
 | `[slack] Session connected with CWD "<path>" — no matching persona` | A Claude session connected from a directory that is no persona's `working_directory` (compared by real path). It is not registered: the server disconnects it. Start it from the persona's directory, or fix `working_directory`. |
 | `[slack] Session refused: its working directory "<path>" is held for an old life that may still be running (instanceId="<id>"[, instanceId="<id>" …]) — registered as no persona's session until the hold ends (b.jg5 SRJ-810, SRJ-1505)` | A Claude session connected from a directory where an old instance (each `<id>`) may still be running, so it is registered as no persona's and disconnected, whichever persona names the directory and whether or not that persona is up. It is checked before any persona is matched. With `(the held-directory query failed: <error> — taken as held)` in place of the ids, the server could not tell and refused it to be safe: report that as a bug. Nothing to do for the session itself: once agent-director reads the old instance finished, a session from the directory is decided as usual. Check the old instance read-only with `agent-director get --claude-instance-id <id>`, and see [A persona waiting on an old instance](#a-persona-waiting-on-an-old-instance). |
-| `[slack] persona-destination: <ref> has permission_prompts set to "dm" but dm.enabled is not true — no DM opened and nothing posted` (or `… dm.contact is not set …`; for a prompt the line starts `[slack] permission-poller: <ref>` and ends `— prompt for <instance> (request_token=…) not posted and no DM opened`) | The persona's prompt or notice had a `"dm"` destination without DMs on or a contact, which the loader rejects, so it should not happen. Nothing is sent. Report it as a bug, with the persona's lines. |
+| `[slack] persona-destination: <ref> has permission_prompts set to "dm" but dm.enabled is not true — no DM opened and nothing posted` (or `… dm.contact is not set …`; for a prompt the line starts `[slack] permission-poller: <ref>` and ends `— prompt for <instance> (request_token=…) not posted and no DM opened`). In fungible mode the line names the fungible destination's setting: `… <ref> has invited.permission_prompts set to "dm" but …`, also when `invited.permission_prompts` is absent and `"dm"` is its default | The persona's prompt or notice had a `"dm"` destination without DMs on or a contact, which the loader rejects in the mode in force, so it should not happen. Nothing is sent. Report it as a bug, with the persona's lines. |
+| `[slack] Tool "<tool>" failed for persona "<name>" (key=<key>) on channel "<channel>": <error>` (fungible mode) | In fungible mode a persona's tools may target any channel ID and Slack decides, so a call on a channel can fail at Slack. The agent gets `Tool "<tool>" failed for persona "<name>" (key=<key>) on channel "<channel>": Slack refused the call (<code>).`, or `…: the tool call failed.` when the failure has no Slack error code (a network or local failure). `not_in_channel`, or `channel_not_found` for a private channel, means the persona's app isn't in that channel: invite the app to it, or have the persona use a channel its app is in. A target that is neither a channel ID nor an allowed DM target is refused before any Slack call, with the tool error `Persona "<name>" (key=<key>) may not target "<target>": it is neither a channel ID nor an allowed DM target.` In declarative mode a channel the persona doesn't list is refused before any Slack call instead, with `… may not target "<target>": it is not one of the persona's configured channels.` |
 | `[slack] persona-destination-hold: more than 20 notices held for "<name>" (key=<key>) while its destination fails — oldest held notice dropped, not posted: <first line>` | The persona's destination has been failing for a while (see [`persona-destination-failed`](#persona-destination-failed)) and more than 20 notices are waiting. The oldest is dropped; the line shows its first line. Fix the destination. |
 | `[slack] persona-destination-hold: persona=<key> is no longer applied — <n> held notice(s) dropped, not posted` | The persona was removed from the configuration while notices waited for its failing destination. They are dropped. Nothing to do. |
 | `[slack] persona-destination-hold: shutting down — <n> held notice(s) for "<name>" (key=<key>) dropped, not posted` | The server stopped while the persona's destination was failing. Its held notices are lost; its still-open prompts are posted after the next start. Fix the destination (see [`persona-destination-failed`](#persona-destination-failed)). |
@@ -4899,13 +5159,29 @@ edit, confirm it (see [Confirming a pending change](#confirming-a-pending-change
 
 Messages about one persona start `personas[<i>] "<name>" (key=<key>): `, or
 just `personas[<i>]: ` when the name itself is the problem. A malformed value
-(a bad channel ID, `dm.contact` or `permission_prompts`) is never echoed, and
+(a bad channel ID, `dm.contact`, `permission_prompts` or
+`invited.permission_prompts`) is never echoed, and neither is a rejected
+`allow_invited_channels`, and
 no message shows a `bot_token` or `app_token` value. Messages do quote
 persona names (as written) and keys, channel IDs, the configuration file's path and, in the duplicate-path rules, the
 persona paths. An unknown key's name is quoted only when it is a plain setting
 name (letters and underscores, up to 48 characters); any other unknown key is
 counted instead, since it could be a pasted token. A name with a digit, such
 as `channels2`, is therefore not shown. After a fix, start the server again.
+
+**Each mode has its own persona rules.** The switch `allow_invited_channels`
+is checked with the server-wide settings, before any persona entry, and the
+mode it picks sets which rules each entry is checked by: declarative mode
+(absent or `false`) checks `channels` and the top-level
+`permission_prompts`, fungible mode (`true`) checks `invited`. Each mode
+leaves the other section unchecked and unread, so a malformed `invited`
+loads in declarative mode, and malformed `channels` or `permission_prompts`
+load in fungible mode. `dm` and the rules [across personas](#across-personas)
+apply in both modes. A pending change is judged by the mode its own switch
+picks, not the mode in force: an edit that turns fungible mode on or off
+can give an `INVALID` preview for a persona section that loaded until then
+(see [`reload-invalid`](#reload-invalid)). The README's
+[Load-time rules](../../README.md#load-time-rules) list each mode's rules.
 
 ### Before any persona is read
 
@@ -4921,32 +5197,49 @@ as `channels2`, is therefore not shown. After a fix, start the server again.
 | `claude_director_poll_interval_ms has been renamed to agent_director_poll_interval_ms …` | Old key name. | Rename it. |
 | `personas is required: an array of persona entries, which may be empty.` / `personas must be an array, got <type>.` | Missing or wrong type. | Add `"personas": [ … ]`. |
 | Server-wide type and range errors: `<key> must be a non-negative number.`, `<key> is invalid. Allowed values are: ….`, `<key> must be a boolean.`, `<key> must be a non-empty string when set.`, `<key> must be a string when set.`, `<key> must be a positive integer (>= 1) when set.`, `agent_director_poll_interval_ms must be a positive integer in [200, 3600000].`, `agent_director_call_timeout_ms must be a positive integer in [1000, 3600000].`, `cron_table_path must be a non-empty string.`, `cron_log_path must be a non-empty string.` | A server-wide setting has the wrong type or is out of range. | Correct the named key. |
+| `allow_invited_channels must be a boolean.` | The channel-mode switch is a string, a number, `null`, an object or an array. Its value is never shown. Checked in either mode, after the other server-wide settings and before any persona entry. | Use `true` (fungible mode) or `false`, or remove the key (declarative mode). See [Channel modes](../../README.md#channel-modes). |
 
 ### Persona entries
 
-| Message (after the persona prefix) | Cause | Fix |
-|---|---|---|
-| `personas[<i>] must be a JSON object, got <type>.` | An array element isn't an object. | Make it a persona object. |
-| `unknown field(s) in the persona entry: "<key>".`, `… in dm: …`, `… in channels[<j>]: …`, each possibly with `1 field whose name is not shown …` or `plus <n> fields whose names are not shown …` | A key the schema doesn't have, at that level. As at the top level, only plain setting names are shown; others (a digit, as in `channels2`, a dash, a pasted token) are counted. | Remove or correct it. For an unshown field, compare that entry's keys with the persona keys in the README. |
-| `name is required.` / `name must be a non-empty string.` | Missing or blank name. Any other name is accepted: there is no format rule. | Give the persona a name. |
-| `credentials_file is required.` / `working_directory is required.` | Missing path. | Add it. |
-| `<setting> must be an absolute path, "~" or a path starting with "~/".` | `credentials_file`, `working_directory` or `claude_config_dir` is relative (or not a string). | Use an absolute path or `~/…`. |
-| `stop_hook_bootstrap must be a boolean.` / `dm.enabled must be a boolean.` | Wrong type. | Use `true` or `false`. |
-| `dm must be a JSON object, got <type>.` / `channels must be an array, got <type>.` / `channels[<j>] must be a JSON object, got <type>.` | Wrong shape. | Fix the shape. |
-| `channels[<j>].id is required.` / `channels[<j>].delivery is required.` | A channel entry lacks a key. | Every channel needs `id` and `delivery`. |
-| `channels[<j>].id must be a Slack channel ID matching ^[CG][A-Z0-9]+$.` | Malformed channel ID (a name, a lower-case ID, a URL). | Use the channel ID, e.g. `C0123ABCD`. |
-| `channels[<j>].delivery is invalid. Allowed values are: all, mentions.` | Bad delivery value. | `all` or `mentions`. |
-| `channel <id> is listed more than once (channels[<a>] and channels[<b>]).` | One persona lists a channel twice. | Keep one entry. (Several personas may list the same channel.) |
-| `dm.contact must be a Slack user ID matching ^[UW][A-Z0-9]+$.` | Malformed `dm.contact`. | Use a user ID, e.g. `U0123ABCD`. |
-| `permission_prompts is required: set it to "dm" or one of the persona's channel IDs.` | Missing. | Add it. |
-| `permission_prompts must be "dm" or a Slack channel ID matching ^[CG][A-Z0-9]+$.` | Malformed value. | Use `"dm"` or a channel ID. |
-| `permission_prompts names channel <id>, which is not in the persona's channels.` | The destination channel isn't one the persona lists. | Add the channel to its `channels`, or pick one it lists. |
-| `permission_prompts is "dm" but dm.contact is not set` / `… but dm.enabled is not true` / both, joined by `and` | A `dm` destination needs both. | Set `dm.contact` and `"dm": {"enabled": true, …}`, or use a channel. |
-| `the persona has no channels and dm.enabled is not true, so it can receive no messages. Add a channel or set dm.enabled to true.` | Zero channels with DMs off. | Add a channel or turn DMs on. |
+The **Mode** column says which mode checks the rule: *both*, *declarative*
+(`allow_invited_channels` absent or `false`) or *fungible* (`true`). A rule
+of one mode is never checked in the other.
+
+| Message (after the persona prefix) | Mode | Cause | Fix |
+|---|---|---|---|
+| `personas[<i>] must be a JSON object, got <type>.` | both | An array element isn't an object. | Make it a persona object. |
+| `unknown field(s) in the persona entry: "<key>".`, `… in dm: …`, each possibly with `1 field whose name is not shown …` or `plus <n> fields whose names are not shown …` | both | A key the schema doesn't have, at that level. As at the top level, only plain setting names are shown; others (a digit, as in `channels2`, a dash, a pasted token) are counted. `channels`, `permission_prompts` and `invited` are known persona-entry keys in both modes. | Remove or correct it. For an unshown field, compare that entry's keys with the persona keys in the README. |
+| `unknown field(s) in channels[<j>]: …`, with the same forms | declarative | A key a channel entry doesn't have. | Remove or correct it. |
+| `invited must be a JSON object, got <type>.` | fungible | `invited` is a string, a number, an array or another non-object. | Make it an object, `{"permission_prompts": "<channel ID or dm>"}`, or remove it to use the default `"dm"`. |
+| `unknown field(s) in invited: "<key>".`, with the same forms as the persona entry's | fungible | `invited` holds a key other than `permission_prompts`. | Remove or correct it. |
+| `name is required.` / `name must be a non-empty string.` | both | Missing or blank name. Any other name is accepted: there is no format rule. | Give the persona a name. |
+| `credentials_file is required.` / `working_directory is required.` | both | Missing path. | Add it. |
+| `<setting> must be an absolute path, "~" or a path starting with "~/".` | both | `credentials_file`, `working_directory` or `claude_config_dir` is relative (or not a string). | Use an absolute path or `~/…`. |
+| `stop_hook_bootstrap must be a boolean.` / `dm.enabled must be a boolean.` | both | Wrong type. | Use `true` or `false`. |
+| `dm must be a JSON object, got <type>.` | both | Wrong shape. | Fix the shape. |
+| `channels must be an array, got <type>.` / `channels[<j>] must be a JSON object, got <type>.` | declarative | Wrong shape. | Fix the shape. |
+| `channels[<j>].id is required.` / `channels[<j>].delivery is required.` | declarative | A channel entry lacks a key. | Every channel needs `id` and `delivery`. |
+| `channels[<j>].id must be a Slack channel ID matching ^[CG][A-Z0-9]+$.` | declarative | Malformed channel ID (a name, a lower-case ID, a URL). | Use the channel ID, e.g. `C0123ABCD`. |
+| `channels[<j>].delivery is invalid. Allowed values are: all, mentions.` | declarative | Bad delivery value. | `all` or `mentions`. |
+| `channel <id> is listed more than once (channels[<a>] and channels[<b>]).` | declarative | One persona lists a channel twice. | Keep one entry. (Several personas may list the same channel.) |
+| `dm.contact must be a Slack user ID matching ^[UW][A-Z0-9]+$.` | both | Malformed `dm.contact`. | Use a user ID, e.g. `U0123ABCD`. |
+| `permission_prompts is required: set it to "dm" or one of the persona's channel IDs.` | declarative | Missing. | Add it. |
+| `permission_prompts must be "dm" or a Slack channel ID matching ^[CG][A-Z0-9]+$.` | declarative | Malformed value. | Use `"dm"` or a channel ID. |
+| `invited.permission_prompts must be "dm" or a Slack channel ID matching ^[CG][A-Z0-9]+$.` | fungible | Malformed fungible destination (a channel name, a lower-case ID, a non-string). Checked after `dm.contact`. | Use `"dm"` or a channel ID. The channel needs no listing: invite the persona's app to it so posts there succeed. |
+| `the persona has no channels and dm.enabled is not true, so it can receive no messages. Add a channel or set dm.enabled to true.` | declarative | Zero channels with DMs off. Checked before the two destination rules below. | Add a channel or turn DMs on. |
+| `permission_prompts names channel <id>, which is not in the persona's channels.` | declarative | The destination channel isn't one the persona lists. | Add the channel to its `channels`, or pick one it lists. |
+| `permission_prompts is "dm" but dm.contact is not set` / `… but dm.enabled is not true` / both, joined by `and` | declarative | A `dm` destination needs both. | Set `dm.contact` and `"dm": {"enabled": true, …}`, or use a channel. |
+| `invited.permission_prompts is "dm" but dm.contact is not set.` / `… but dm.enabled is not true.` / `… but dm.contact is not set and dm.enabled is not true.` | fungible | An explicit `"dm"` fungible destination needs DMs on and a contact. | Set `dm.contact` and `"dm": {"enabled": true, …}`, or set `invited.permission_prompts` to a channel ID. |
+| `invited.permission_prompts is not set, so it is "dm" by default, but dm.contact is not set.` / `… but dm.enabled is not true.` / `… but dm.contact is not set and dm.enabled is not true.` | fungible | No `invited.permission_prompts`, so the destination is `"dm"` by default, which needs DMs on and a contact. A persona with DMs off and no contact needs a channel destination in fungible mode. | Set `invited.permission_prompts` to a channel ID, or set `dm.contact` and `"dm": {"enabled": true, …}`. |
+
+In fungible mode no rule asks a persona for a way to receive: a persona with
+DMs off, no `channels` and a channel fungible destination loads, and receives
+from the channels its app is invited to.
 
 ### Across personas
 
-Checked only after every entry is valid. The two shared-path rules below are
+Checked only after every entry is valid, in both channel modes, with the
+same messages. The two shared-path rules below are
 checked only for `config.json` at a start without a record. At a start from
 the last-applied record, a shared path is a bring-up failure of each persona
 involved instead ([`persona-directory-unusable`](#persona-directory-unusable)
@@ -5095,11 +5388,14 @@ A configuration change is pending; nothing has been applied. personas: <n> added
 a next-launch setting changed on the persona's own entry. A persona that only
 inherits a changed top-level default isn't counted there; the setting counts
 under `server-wide settings`. A persona with both an in-place change and
-changed credentials counts in both.
+changed credentials counts in both. A persona whose only change is recorded
+(a change to the section its mode doesn't read) counts nowhere.
+`allow_invited_channels` counts under `server-wide settings`.
 
 **Line order and kinds.** After the header: removals, destructive modifies,
-additions, other changed personas (in `config.json` order), then server-wide
-settings.
+additions, other changed personas (in `config.json` order), recorded
+changes (in `config.json` order), then server-wide settings, the switch's
+line among them.
 
 | Line | Meaning |
 |---|---|
@@ -5107,7 +5403,7 @@ settings.
 | `DESTRUCTIVE: persona "<name>" (key=<key>) working_directory changed to "<path>": the persona will be retired and brought up fresh: its session stopped and never resumed.` | Its `credentials_file` or `working_directory` (compared by real path) changed, or its `name` changed without changing its key (`name changed`). Several are joined by ` and `, e.g. `credentials_file changed to "<path>" and working_directory changed to "<path>"`. At the confirmation the persona is retired (its session stopped and never resumed) and brought up fresh: the instance is replaced and loses its session history. |
 | `persona "<name>" (key=<key>) is added: it will be brought up and launched.` | A new persona. |
 | `persona "<name>" (key=<key>) is added but cannot come up: <cause>; <cause>.` | A new persona whose bring-up would fail now. The causes, in this order, are the credentials and working-directory cause texts under [Persona diagnostic classes](#persona-diagnostic-classes) (for example `credentials file does not exist`, `credentials file is invalid: …`, `working directory does not exist`), then `claude_config_dir cannot be resolved to a real path (<errno>)`, or `(<errno>: a symlink on its path points to nothing)` for a dangling symlink (see [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable)). Every check runs, so one cause never hides another. A `claude_config_dir` not created yet under an existing parent is not listed. Fix them before the change is applied. |
-| `persona "<name>" (key=<key>): <settings> changed: applied in place immediately, instance kept.` | `<settings>` lists one or more of `channels` (a channel added or removed), `delivery` (a kept channel's mode), `permission_prompts`, `dm.enabled`, `dm.contact`. Reordering channels isn't a change. |
+| `persona "<name>" (key=<key>): <settings> changed: applied in place immediately, instance kept.` | `<settings>` lists one or more of the in-place settings of the mode the edit's own `allow_invited_channels` picks. Declarative mode: `channels` (a channel added or removed), `delivery` (a kept channel's mode), `permission_prompts`. Fungible mode: `invited.permission_prompts` (an absent value and `"dm"` count as the same). Both modes: `dm.enabled`, `dm.contact`. Reordering channels isn't a change. When the same edit turns the switch on or off, the newly selected section counts as changed wherever its JSON differs from before. |
 | `…: stop_hook_bootstrap changed: takes effect at its next launch, instance kept.` | The persona's own `stop_hook_bootstrap` changed. The running instance doesn't see it until it is launched again. |
 | `…: claude_config_dir changed: takes effect at its next launch, which starts fresh (the conversation is not resumed), instance kept until then.` | The persona's own `claude_config_dir` changed (by real path). The running instance is kept; its next launch uses the new directory and starts a new conversation. With both settings changed, the line reads `claude_config_dir, stop_hook_bootstrap changed:` with this effect. |
 | `…: claude_config_dir changed: …, instance kept until then; but at that launch it cannot come up: claude_config_dir cannot be resolved to a real path (<errno>).` | A warning: the new directory can't be resolved now, with the same check and wording as an added persona's (`(<errno>: a symlink on its path points to nothing)` for a dangling symlink). It is not a refusal: confirming applies the change, and at the persona's next launch it is held as [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable) (its Slack connection closed, its launch waiting) until the directory resolves. The same warning ends a changed top-level `claude_config_dir` line, naming the inheriting personas it stops (`; but at that launch "<name>" (key=<key>), … cannot come up: …`), and a `DESTRUCTIVE:` line whose persona's `claude_config_dir` changed too (`; but it cannot come up: …`; that persona is held when it is brought up at the confirmation). Fix the directory, or the setting, before confirming. If the check itself failed, the line ends `; whether it can come up at that launch could not be checked` (see the `cannot check` line below). |
@@ -5119,6 +5415,8 @@ settings.
 | `…: credentials file "<path>" changed, but it cannot be used (<cause>): it stays broken by its credentials.` | The same bad content, for a persona broken by its credentials. It stays broken until the file is fixed. |
 | `persona "<name>" (key=<key>) is added; whether it can come up could not be checked.` | A new persona whose credentials and working directory the check couldn't examine (see the `cannot check` line below). It isn't counted differently in the header. |
 | `…: credentials file "<path>" changed; whether it is broken by its credentials now could not be checked.` | A credentials change whose persona's bring-up state couldn't be read (see the `cannot check` line below). With bad content it starts `credentials file "<path>" changed, but it cannot be used (<cause>);`. |
+| `persona "<name>" (key=<key>): <fields> changed in the <declarative or fungible> section: recorded, with no effect until allow_invited_channels selects <declarative or fungible> mode.` | A change to the section the edit's mode doesn't read: `channels` or `permission_prompts` (the declarative section) while the edit is in fungible mode, or `invited` (the fungible section) while it is in declarative mode. `<fields>` lists the changed keys, such as `channels, permission_prompts`. The change is written into the record at the confirmation and does nothing until the switch selects that section; it is never validated until then. The persona isn't counted as modified. |
+| `server-wide setting allow_invited_channels changed: turns <fungible or declarative> mode on, applied in place at once, from the next event, tool call, prompt and notice, for "<name>" (key=<key>), ….` | The channel-mode switch changed. Every persona present before and after the edit is named, in `config.json` order; with none, the line ends `; no persona is affected.` instead. It applies in place at the confirmation, with no restart and every session kept (see [Confirming a pending change](#confirming-a-pending-change)). Writing `false` where the switch was absent is no change. Before turning fungible mode on, review each app's channels and past `unclaimed-channel` lines (see [Turning fungible mode on or off](../../README.md#turning-fungible-mode-on-or-off)). |
 | `server-wide setting <name> changed: once applied, it is recorded and takes effect at the next server start after that.` | A top-level setting such as `port` or `bind`. |
 | `server-wide setting <name> changed: once applied, it is recorded, and the CLI takes it from the record from then on (the running server does not use it).` | `stop_timeout` or `exit_timeout`, which only the CLI uses. |
 | `server-wide setting <name> changed: once applied, it is recorded, the CLI takes it from the record from then on, and the running server uses it from its next start.` | `agent_director_call_timeout_ms`, which both the CLI and the server use. |
@@ -5148,6 +5446,11 @@ default value:
 ```text
 A configuration change is pending; nothing has been applied. no effective change: applying it would change no persona and no server-wide setting.
 ```
+
+An edit made only of recorded changes (see the `recorded, with no effect
+until …` row above) is also no effective change: its preview is this line
+followed by its recorded lines. Confirming it rewrites the record and logs
+[`reload-noop`](#reload-noop).
 
 **Logged once.** The same preview goes to `server.log` under
 [`reload-preview`](#reload-preview) (or `reload-invalid`), once each time the
@@ -5239,8 +5542,9 @@ What changes at once, with no restart:
   `agent-director kill of cscb_<key> failed` row there).
   See [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change).
 - **A kept persona's routing settings**, the preview's `… changed: applied in
-  place immediately, instance kept` lines: `channels`, a channel's
-  `delivery`, `permission_prompts` and `dm.*`. See
+  place immediately, instance kept` lines: in declarative mode `channels`, a
+  channel's `delivery` and `permission_prompts`; in fungible mode
+  `invited.permission_prompts`; `dm.*` in both. See
   [A persona's routing settings were changed by a confirmed change](#a-personas-routing-settings-were-changed-by-a-confirmed-change).
 - **A kept persona's credentials file content** (same path), the preview's
   `credentials file "<path>" changed …` lines. A persona that is up is
@@ -5256,8 +5560,26 @@ What changes at once, with no restart:
   line and its usual class line (`persona-credentials-invalid`,
   `-missing`, `-unreadable` or `-refused`), stays broken, and nothing is
   pending until the file changes again.
+- **The channel-mode switch `allow_invited_channels`**, the preview's
+  `server-wide setting allow_invited_channels changed: turns … mode on …`
+  line. It is the one server-wide setting applied in place, at once: no
+  persona is torn down, brought up, relaunched or reconnected, and every
+  persona keeps its instance, conversation, Slack connection and MCP session.
+  The mode it turns on applies from the next event, tool call, permission
+  prompt and notice. Turning fungible mode on serves, from its next message,
+  every public or private channel each persona's app is already in that is
+  not externally shared, at `mentions` unless a stored choice applies;
+  listed `delivery` values are not carried over. Turning it off returns
+  every persona to its `channels` from the next event; stored choices stay
+  in `channel-delivery.json` and stop applying. Prompts and notices go to
+  the destination of the mode turned on, held ones included, and prompts
+  already posted stay answerable. See
+  [Channel modes](../../README.md#channel-modes).
+- **A recorded change** to the section the mode doesn't read, the preview's
+  `recorded, with no effect until …` lines: written into the record, with no
+  effect until the switch selects that section.
 
-Next-launch and server-wide settings are recorded and take effect later (see
+Next-launch and other server-wide settings are recorded and take effect later (see
 [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)).
 Never delete the record to apply an edit: the confirmation has already
 written the change into it. Deleting the record is only for a server that
@@ -5267,7 +5589,12 @@ can't start (see [Starting without the record](#starting-without-the-record)).
 
 A confirmation records these changes in `config.json.last-applied`, and they
 take effect later. Until then, each persona keeps running as it was launched,
-with the same instance, conversation and Slack connection.
+with the same instance, conversation and Slack connection. The one exception
+among server-wide settings is `allow_invited_channels`, which applies in
+place at once, with every session kept, from the next event, tool call,
+prompt and notice (see
+[Confirming a pending change](#confirming-a-pending-change)); it never waits
+for a server start.
 
 | Preview line | After the confirmation | To carry it out sooner |
 |---|---|---|
@@ -5305,11 +5632,11 @@ Look in `server.log` for the lines logged after the rename (the `grep` in
 
 | Line | Meaning |
 |---|---|
-| [`reload-applied`](#reload-applied) | The change was applied. Personas added, removed, destructively modified, changed in place or with a changed credentials file are handled (a credentials file that can't be used logs [`persona-credentials-change-failed`](#persona-credentials-change-failed) and stays pending); next-launch and server-wide settings are recorded (see [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)). A persona that isn't up has its own class line. |
+| [`reload-applied`](#reload-applied) | The change was applied. Personas added, removed, destructively modified, changed in place or with a changed credentials file are handled (a credentials file that can't be used logs [`persona-credentials-change-failed`](#persona-credentials-change-failed) and stays pending); `allow_invited_channels` applies at once, in place; next-launch and other server-wide settings are recorded (see [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)). A persona that isn't up has its own class line. |
 | [`reload-noop`](#reload-noop) | The change had no effect (whitespace, key order, a default written out); the record now matches `config.json`. Nothing else happens. |
 | [`reload-invalid`](#reload-invalid), `the confirmed configuration is invalid, so nothing is applied` | `config.json` was invalid. Nothing is applied and the confirmation is used up. Fix the file, then confirm the new preview. |
 | [`reload-stale-confirmation`](#reload-stale-confirmation) | The confirmation didn't match the files as they stand, or couldn't be read. Nothing is applied. |
-| [`reload-record-write-failed`](#reload-record-write-failed), `the confirmed change is not applied and stays pending` | The record, or the retired-key record written before it, couldn't be written. Nothing is applied; fix the state directory, then confirm again. |
+| [`reload-record-write-failed`](#reload-record-write-failed), `the confirmed change is not applied and stays pending` | The record, the retired-key record written before it, or the stored-choice file (`channel-delivery.json`) written before both, couldn't be written. Nothing is applied; fix the state directory, then confirm again. |
 | `[slack] reload: cannot remove the confirmation "<apply path>" (<errno>); it was acted on once and is ignored until its content changes` | The confirmation was acted on once (one of the lines above), but the server couldn't delete it. It is ignored while its content stays the same. Fix the directory's permissions (or the read-only filesystem), then remove `config.json.apply` by hand. |
 | `[slack] reload: apply step <n> (<step>) failed …` or `[slack] reload: updating the server's applied configuration failed: <error>` | An internal error during the apply. Report it as a bug, with the lines around it. |
 
@@ -5418,9 +5745,10 @@ record was deleted, failing on the listening address:
 
 ### `reload-record-write-failed`
 
-The server couldn't write `config.json.last-applied` durably. It happens in
-two places: at a start without a record, and when a running server applies a
-confirmed change. The `(<errno>)` part appears only when the error has a
+The server couldn't write `config.json.last-applied` durably, or, at a
+confirmed apply, a file it writes before that record (the stored-choice file
+or the retired-key record). It happens in two places: at a start without a
+record, and when a running server applies a confirmed change. The `(<errno>)` part appears only when the error has a
 code.
 
 **At a start without a record.**
@@ -5440,13 +5768,33 @@ code.
 - **Fix:** Fix the cause below, then start the server again.
 
 **At a confirmed apply.** A running server acting on a confirmation
-(`config.json.apply`) first records the keys of the personas the change
-retires (removed personas, a renamed persona's old key, and personas whose
-`name`, `credentials_file` or `working_directory` changed) in the retired-key
-record, `retired-keys.json` in the state directory, then writes the record,
-before it changes anything else.
+(`config.json.apply`) writes, in this order, before it changes anything
+else:
+
+1. the stored-choice file, `channel-delivery.json` in the state directory
+   (see [The stored-choice file: `channel-delivery.json`](#the-stored-choice-file-channel-deliveryjson)),
+   only when the change brings up a persona (an added persona, or the new
+   half of a destructive modify) whose key has a drop of its stored choices
+   that no write has carried yet (an earlier
+   `[slack] channel-delivery: cannot write the drop of persona=<key> …`
+   line). The write carries only drops already in force. Otherwise nothing
+   is written here;
+2. the retired-key record, `retired-keys.json` in the state directory, with
+   the keys of the personas the change retires (removed personas, a renamed
+   persona's old key, and personas whose `name`, `credentials_file` or
+   `working_directory` changed);
+3. the record.
 
 - **Line:** one of:
+  - `[slack] reload-record-write-failed: cannot write the stored-choice file "<path>" before bringing up a persona whose stored choices were dropped; the retired-key record is not written, the last-applied record "<record path>" is not rewritten, and the confirmed change is not applied and stays pending (b.deo SRI-408; b.jg5 SRJ-804)`:
+    the stored-choice file couldn't be written (a write whose directory
+    couldn't be synced counts as failed), so neither record was touched.
+    The store's own `[slack] channel-delivery: cannot write the drop of persona=<key> in "<path>"<detail>; …`
+    line before it carries the error code (see
+    [The store's `[slack] channel-delivery:` lines](#the-stores-slack-channel-delivery-lines)).
+    The dropped choices still don't apply, and the persona isn't brought up
+    until a confirmation succeeds; a restart before then drops them again at
+    start.
   - `[slack] reload-record-write-failed: cannot write the last-applied record "<record path>" (<errno>); the confirmed change is not applied and stays pending`:
     the old record is unchanged.
   - `[slack] reload-record-write-failed: wrote the last-applied record "<record path>" but could not sync its directory (<errno>); the previous record was written back; the confirmed change is not applied and stays pending`:
@@ -5464,7 +5812,8 @@ before it changes anything else.
     `[slack] retired-keys: cannot restore …` line. The end can instead read
     `putting the retired-key record back to what it held before this apply failed too, so a key this apply recorded that reached the file stays retired`.
 
-  When the retired-key record was written first, the first two lines end with
+  When the retired-key record was written first, the two last-applied record
+  lines end with
   `; the retired-key record "<path>" is put back to what it held before this apply: the keys this apply recorded are removed again, and keys recorded before it stay (b.jg5 SRJ-804)`,
   or, when putting it back failed,
   `; putting the retired-key record "<path>" back to what it held before this apply failed, so the keys this apply recorded stay retired (b.jg5 SRJ-804)`.
@@ -5612,7 +5961,10 @@ or a filesystem that doesn't support syncing a directory).
   later start runs it too. A changed server-wide setting is recorded and takes
   effect at the next start, or for the CLI at once (`stop_timeout`,
   `exit_timeout`), or both: the CLI at once and the server at its next start
-  (`agent_director_call_timeout_ms`), as its preview line says.
+  (`agent_director_call_timeout_ms`), as its preview line says. The
+  exception is `allow_invited_channels`: it takes effect at once, in place,
+  from the next event, tool call, prompt and notice, with every session kept
+  and no lifecycle step for any persona.
 - **What happens to personas now:** the apply switches the persona set the
   server runs at once. Message delivery, the up check, the notifier and the
   permission poller read that set at each use. Then:
@@ -5640,9 +5992,12 @@ or a filesystem that doesn't support syncing a directory).
       entry in `startup-errors.log` (see
       [A notice raised during a teardown](#a-notice-raised-during-a-teardown));
     - it is never restarted or relaunched again;
-  - a kept persona's `channels` (each entry's `delivery` included), `dm.*`
-    and `permission_prompts`
-    take effect at once, for the next message, notice or prompt;
+  - a kept persona's routing settings take effect at once, for the next
+    message, notice or prompt: `channels` (each entry's `delivery` included)
+    and `permission_prompts` in declarative mode,
+    `invited.permission_prompts` in fungible mode, and `dm.*` in both;
+  - a change to the section the mode doesn't read is only written into the
+    record, with no effect until the switch selects that section;
   - a kept persona's `stop_hook_bootstrap` or `claude_config_dir` change
     takes effect at its next launch (a relaunch after the bot dies, a
     `clean_restart`, `stop --stop-bots` then `start`, or a host reboot; a
@@ -5668,7 +6023,7 @@ or a filesystem that doesn't support syncing a directory).
     `persona-credentials-invalid`) and stays broken; nothing is pending.
 
   The next start runs the new record, which also carries out the server-wide
-  settings (see
+  settings other than `allow_invited_channels`, already in force (see
   [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)); the record already holds the change, so don't delete it.
 - **Fix:** None. If `config.json.pending` is written again after this line,
   something is still pending: see [Pending changes](#pending-changes). With
@@ -5686,9 +6041,14 @@ or a filesystem that doesn't support syncing a directory).
 - **When:** a confirmation (`config.json.apply`) matched a pending change
   whose preview said `no effective change`: `config.json`'s bytes differ from
   the record's, but nothing they configure does. A whitespace or key-order
-  edit, or a setting written out with its default value, does this.
+  edit, a setting written out with its default value (`allow_invited_channels`
+  written as `false` included), or an edit made only of recorded changes to
+  the section the mode doesn't read (the preview's
+  `recorded, with no effect until …` lines) does this.
 - **Meaning:** The record was rewritten with `config.json`'s bytes, so the two
   match again and nothing is pending. No persona, instance or setting changed.
+  The record holds any recorded change, which takes effect only once a
+  later confirmed change turns the switch to the mode that reads it.
   A `claude_config_dir` moved to another path for the same real directory
   (through a symlink) still logs one `template refresh:` line (see
   [Memory-note reads](#next-launch-and-server-wide-settings)): the template's
@@ -5821,6 +6181,205 @@ writes it; it is absent until a key is first recorded. Never edit it.
 - **Cost:** The keys the moved file held are no longer retired, so a persona
   whose key it held may resume the conversation of the life that was retired.
   Keep the moved file for the operator to read.
+
+---
+
+## The stored-choice file: `channel-delivery.json`
+
+The server keeps the channel deliveries that personas' agents choose with
+`set_channel_delivery` in `channel-delivery.json`, in the state directory
+beside `retired-keys.json`. For each persona key it holds the persona's
+declaration (its `name`, `credentials_file` and `working_directory`) and, for
+each channel, the stored choice (`mentions` or `all`) and when it was stored.
+That is persona keys, names, paths, channel IDs, choices and times only: no
+token, no credentials content and no message text.
+
+- **Only the server reads and writes it.** No CLI command reads, writes,
+  creates or removes it. Never edit it by hand (see
+  [Constraints](#constraints)).
+- **Read once per start.** The server reads it whole, with no size cap, once
+  at every start, in both channel modes and in dry run, before any persona is
+  brought up. It isn't read again while the server runs.
+- **Absent until the first stored choice.** A missing file is an empty
+  record. Only the first accepted `set_channel_delivery` call creates it.
+  Every call is refused in declarative mode, so declarative mode never
+  creates it.
+- **Stored choices apply only in fungible mode** (`allow_invited_channels`
+  is `true`). While the switch is off they stay on disk and apply again once
+  it is back on (see
+  [`persona-channel-delivery-set`](#persona-channel-delivery-set)).
+- **The server on its own only ever drops choices.** A confirmed change
+  that retires a persona's key drops its choices, and so do the start rules
+  at every start; each drop logs a line (see
+  [The store's `[slack] channel-delivery:` lines](#the-stores-slack-channel-delivery-lines)).
+
+To see whether the file exists and what it holds (no token is in it):
+
+```sh
+STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+ls -l "$STATE/channel-delivery.json"
+cat "$STATE/channel-delivery.json"
+```
+
+### `channel-delivery-unreadable`
+
+- **Line:** one line at start, with no persona reference:
+
+  ```text
+  [slack] channel-delivery-unreadable: the stored-choice file "<path>" <what>. It is left in place, and this run neither writes it nor drops anything from it: in fungible mode every channel is served at mentions, and set_channel_delivery is refused. To fix: move the file aside, then restart the server (b.deo SRI-403, SRI-904)
+  ```
+
+  `<what>` says which step failed. It never shows the file's content:
+  - `could not be read (<code>)`: the read failed. `<code>` is the error
+    code, such as `EACCES` or `EPERM` (permissions), `EISDIR` (the path is a
+    directory) or `not a regular file` (a FIFO, socket or device, which is
+    never read). The ` (<code>)` part is missing when the error has none.
+  - `could not be parsed: it is not valid UTF-8`, or
+    `could not be parsed: it is not valid JSON at line <L>, column <C>`
+    (`it is not valid JSON` when there is no position).
+  - `could not be validated: it is invalid: <problem>`: the JSON breaks a
+    rule of the format. `<problem>` names an entry by its position
+    (``entry <n> of `personas` ``, ``channel <n> of `channels` ``), never by
+    its key, channel ID or value; for example
+    `it has a top-level field the format does not name` or
+    ``entry 2 of `personas` has no `declaration` ``.
+- **Meaning:** The server couldn't use the stored-choice file, so for the
+  rest of this run the store is unreadable: no stored choice applies, and
+  nothing is stored.
+- **Cause:** The file could not be read, parsed or validated. Usually its
+  permissions (the server's user can't read it), a directory or other
+  non-regular file at its path, invalid JSON, or a damaged or hand-edited
+  file (a field the format doesn't name, a `version` other than 1, a key that
+  isn't a persona key, a `delivery` other than `mentions` or `all`, or a
+  `set_at` that isn't an RFC 3339 UTC time ending in `Z`).
+- **Effect:**
+  - In fungible mode every channel is served at `mentions`, whatever was
+    stored, and each `persona-invited-channel` line shows `mentions`. Every
+    `set_channel_delivery` call is refused, with this tool error, and nothing
+    is stored:
+    `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the stored-choice file "<path>" is not readable, so no channel delivery can be stored. To fix: the operator moves the file aside, then restarts the server.`
+  - Nothing is written to the file and nothing is dropped from it, and the
+    start rules don't run, so this run logs no drop line.
+  - The server starts and runs every persona. Declarative mode delivers by
+    each persona's listed channels, as it always does.
+  - The state lasts for the rest of the run, even if a confirmed change turns
+    fungible mode on later in it: readability is decided once, at start.
+  - No `startup-errors.log` entry is written, and nothing is posted to Slack.
+    This line in `server.log` is the only sign.
+- **Fix:** With the operator's say-so, move the file aside. Never edit it in
+  place:
+
+  ```sh
+  STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+  mv "$STATE/channel-delivery.json" "$STATE/channel-delivery.json.moved-aside"
+  ```
+
+  Then, also with the operator's say-so, restart the server
+  (`claude-slack-channel-bots stop && claude-slack-channel-bots start`; the
+  bots keep running). The start finds no file, so every stored choice is
+  gone: each channel is served at `mentions` until a persona's agent sets it
+  again with `set_channel_delivery`. Keep the moved file for the operator to
+  read.
+- **Restoring the file instead of moving it aside:** while the store is
+  unreadable nothing can be dropped from it. If the operator makes that same
+  file usable again in place (fixes its permissions, or puts the same bytes
+  back) and restarts, a persona that was removed and added back during that
+  run with the same `name`, `credentials_file` and `working_directory` gets
+  its earlier stored choices again. Moving the file aside avoids this.
+
+### The store's `[slack] channel-delivery:` lines
+
+The store logs plain lines with no class label, each starting
+`[slack] channel-delivery:`. None of them names a channel's choice, and none
+carries a token or message text. Declarative mode with no stored-choice file
+logs none of them. To list them:
+
+```sh
+grep -h -F '[slack] channel-delivery:' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
+```
+
+**Drop lines.** One line per persona key whose stored choices a drop removed:
+
+```text
+[slack] channel-delivery: dropped the stored choices of persona=<key> in <n> channels: <reason> (b.deo SRI-405, SRI-905)
+```
+
+(`in 1 channel` for one.) The key's choices stop applying at once, so in
+fungible mode its persona is at `mentions` in those channels until its agent
+sets them again. `<reason>` is one of:
+
+| Reason | Meaning |
+|---|---|
+| `retired by a confirmed change` | A confirmed change retired the key: the persona was removed, renamed (its old key), or destructively modified (`name`, `credentials_file` or `working_directory` changed; see [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)). Logged once the change's last-applied record is written. At a start it also covers a key that `retired-keys.json` holds as retired while the persona's next session has not begun. |
+| `not an applied persona at start` | At a start, the key belongs to no persona in the configuration the start runs: the persona was removed or renamed, for example by a start without the record. |
+| `its declaration changed` | At a start, the persona's `name`, `credentials_file` or `working_directory` differs from the one stored with its choices. Paths count as equal when they are equal as written or resolve to the same real path, so a symlink retargeted to another directory counts as changed. |
+
+The start rules run right after the read at every start, in both modes, so
+drop lines can appear in declarative mode whenever the file exists. A key that
+matches several rules is dropped once, with the first reason in the order
+`not an applied persona at start`, `its declaration changed`,
+`retired by a confirmed change`. With no file there is nothing to drop, so
+nothing is written or logged. Each rule only ever drops choices, toward
+`mentions`. No fix is
+needed: if a persona should hear a channel at `all` again, ask it in that
+channel to set it.
+
+**Failed-write lines.** One line per failed write, naming the action, the file
+and the error:
+
+```text
+[slack] channel-delivery: cannot <action> in "<path>"<detail>; <what holds>
+```
+
+- **A stored choice's write** (a `set_channel_delivery` call):
+
+  ```text
+  [slack] channel-delivery: cannot store the channel delivery of persona=<key> for channel <id> in "<path>"<detail>; the stored choices in memory are unchanged (b.deo SRI-404, SRI-506)
+  ```
+
+  The agent gets the tool error
+  `Tool "set_channel_delivery" failed for persona "<name>" (key=<key>): the stored-choice file "<path>" could not be written, so the choice was not stored and channel delivery is unchanged.`,
+  and no `persona-channel-delivery-set` line is logged. `<detail>` is one of:
+  - ` (<code>); the file is unchanged`;
+  - `: the record was written but its directory could not be synced (<code>); <write-back>`,
+    where `<write-back>` is `the previous record was written back`, or
+    `the file, absent before, was removed again` when the call would have
+    created it, either one possibly followed by
+    `, though its directory could not be synced either`;
+  - the write-back variant:
+    `: the record was written but its directory could not be synced (<code>); putting the previous state back failed too (<code>), so the file holds the refused choice until the next successful write`.
+    The refused choice is on disk but not in memory, so it doesn't apply in
+    this run. It stays there until the next successful write of the file
+    replaces it with the record held in memory. A restart before that write
+    reads it, and the refused choice then applies.
+- **A drop's write** (a confirmed change's drop, the start rules, or a later
+  write that carries an earlier failed drop):
+
+  ```text
+  [slack] channel-delivery: cannot write the drop of persona=<key> in "<path>"<detail>; the dropped choices do not apply, and the next successful write of the file carries the drop (b.deo SRI-405)
+  ```
+
+  A drop of several keys names each, sorted and joined by `, `
+  (`persona=<key>, persona=<key>`). `<detail>` is ` (<code>); the file is unchanged`, or
+  `: the record was written but its directory could not be synced (<code>), so a crash can undo it`.
+  The dropped choices stop applying at once in memory, whatever the write
+  did. The drop stays unwritten until the next successful write of the file,
+  which carries it: an accepted `set_channel_delivery` call, another drop, or
+  a confirmed change that brings that key up again (which writes the file
+  first, and applies nothing if it can't; see
+  [`reload-record-write-failed`](#reload-record-write-failed)). A restart
+  before then reads the file with the dropped choices still in it, and the
+  start rules drop them again.
+
+The `(<code>)` parts appear only when the error has a code. **Cause and fix of
+a failed write:** as under
+[`reload-record-write-failed`](#reload-record-write-failed), usually the state
+directory: the server's user can't create or rename files in it (`EACCES`,
+`EPERM`), the disk or quota is full (`ENOSPC`, `EDQUOT`), or the filesystem is
+read-only (`EROFS`); a directory that can't be synced points at the
+filesystem. Have the operator fix it, then ask the persona to set the choice
+again. Any later successful write also carries an unwritten drop and replaces
+a refused choice left on disk.
 
 ---
 
