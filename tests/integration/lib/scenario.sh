@@ -949,6 +949,84 @@
 #                                      trail; a line that is not JSON, a record still being written, is
 #                                      skipped). Read-only: it never writes
 #
+#   The Slack stub's pushes and the stub MCP session's records (both modes; harness additions,
+#   b.jg5 SRJ-1306, b.deo SRI-1404). Each helper here is a harness addition that works in both
+#   modes: it runs `require_ci_image` as its first step and never `require_scenario_home` (a
+#   shared-mode script has no scenario HOME), and reads and writes only under SCENARIO_ROOT. A
+#   setting it needs that is unset or bad fails the step at once, with its reason; it never waits
+#   out a bound on one. None touches HOME, ~/.claude, a state dir's files or port 3100, and none
+#   runs agent-director, tmux or sqlite3.
+#   SCENARIO_STUB_DIR                  (harness addition, both modes) the directory holding the
+#                                      scenario's stub worker and its copy of the MCP session
+#                                      client (fixtures/stub-mcp-session.ts; a regular file, not a
+#                                      symlink, as Bun runs a symlinked client from its target's
+#                                      directory), under SCENARIO_ROOT
+#                                      as written and by real path: SCENARIO_BIN in fmk mode (setup
+#                                      sets it); a shared-mode script sets it to the directory it
+#                                      copied the stub and the client into. The client keeps its
+#                                      records there
+#   SCENARIO_SLACK_STUB_URL            (harness addition, both modes) the Slack stub's loopback
+#                                      base URL, exactly `http://127.0.0.1:<port>` (no path, no
+#                                      trailing `/`; never port 3100); the script sets it once the
+#                                      stub's ready file exists
+#   SCENARIO_STUB_DELIVERIES_PREFIX SCENARIO_STUB_REQUESTS_PREFIX SCENARIO_STUB_RESULTS_PREFIX
+#   SCENARIO_STUB_RECORD_SUFFIX        (harness addition, both modes) the names of the client's
+#                                      three records of a working directory in SCENARIO_STUB_DIR,
+#                                      `<prefix><key>.jsonl` (`stub-mcp-deliveries.`,
+#                                      `stub-mcp-requests.`, `stub-mcp-results.`), as
+#                                      fixtures/stub-mcp-session.ts names them. <key> is the
+#                                      lowercase hex SHA-256, all 64 characters, of the working
+#                                      directory's real path (`realpath -e`), hashed with no
+#                                      trailing newline; a directory that does not resolve fails
+#                                      the step
+#   slack_stub_push [--expect-refused] <label> <event-json> [<flag>]
+#                                      (harness addition, both modes) push one Slack `events_api`
+#                                      envelope carrying <event-json> (the inner event, which must
+#                                      be a JSON object) over the WebSocket the token label <label>
+#                                      opened last: `POST $SCENARIO_SLACK_STUB_URL/_push`, bounded
+#                                      at SCENARIO_SLACK_PUSH_S (10 s). <flag> sets the payload's
+#                                      `is_ext_shared_channel`: not given (or empty), `false`;
+#                                      `omit`, left out of the payload; any other JSON value
+#                                      (`true`, `false`, `"yes"`, `null`, `1`), sent as given; a
+#                                      <flag> that is neither fails. Prints the envelope ID on a
+#                                      sent push; fails, naming <label> and the stub's reason,
+#                                      when the stub refuses the push (any answer but HTTP 200
+#                                      with `ok: true`) or does not answer in time. The stub's
+#                                      record gains a `push` line per sent push and a
+#                                      `push-refused` line per refusal (its header states both).
+#                                      With --expect-refused (a positive control, such as a push
+#                                      to a label with no open WebSocket): succeeds only when the
+#                                      stub refuses the push, printing its reason (`no-open-socket`
+#                                      for that label) and no FAIL line; fails when the push is
+#                                      sent, or when the stub does not answer or answers without a
+#                                      reason
+#   stub_session_deliveries <dir>      (harness addition, both modes) print the delivery record of
+#                                      the working directory <dir> (a directory under
+#                                      SCENARIO_ROOT, as written and by real path): every channel
+#                                      notification the stub's MCP session received there, one
+#                                      JSON object per line, as recorded, in record order; only
+#                                      complete lines. Prints nothing when there is no record yet.
+#                                      Read-only
+#   stub_session_call <dir> <tool> <json-args>
+#                                      (harness addition, both modes) call the MCP tool <tool>
+#                                      (1 to 128 letters, digits, `_`, `-` or `.`) with
+#                                      <json-args> (a JSON object) over the session of the stub
+#                                      working in <dir> (as for stub_session_deliveries): appends
+#                                      one request line with an ID unique in the scenario (the
+#                                      calling process's PID, its clock to the microsecond and a
+#                                      random number, so a call in `$( … )` or another subshell
+#                                      gets its own) to the directory's request file, in one write
+#                                      of the whole line (at most SCENARIO_STUB_REQUEST_MAX_BYTES,
+#                                      4000 bytes), so the client never reads part of it; then
+#                                      polls the results record every SCENARIO_POLL_S for that
+#                                      ID's result line, at most SCENARIO_STUB_CALL_S (30 s), and
+#                                      prints it as recorded: `{"id","isError","text"}`, with
+#                                      `"error"` when the call ended without a tool result. Fails,
+#                                      naming <tool>, the request ID and <dir>, when no result
+#                                      line comes in time; an `isError: true` result is the
+#                                      scenario's to judge, not a failure. Writes only the request
+#                                      file, in SCENARIO_STUB_DIR
+#
 # Line builders (every fragment is quoted from src/; <ref> is `persona_ref`):
 #   persona_start_match   `[slack] persona-start: personas[<index>] <ref>`
 #                         (src/persona-bringup-controller.ts bringUp, format
@@ -5000,6 +5078,221 @@ ad_trail_events() {
 }
 
 # ---------------------------------------------------------------------------
+# The Slack stub's pushes and the stub MCP session's records (both modes;
+# harness additions, b.jg5 SRJ-1306, b.deo SRI-1404)
+# ---------------------------------------------------------------------------
+
+# The stub MCP session's records of a working directory, in the client's
+# directory: `<prefix><key><suffix>` (fixtures/stub-mcp-session.ts
+# DELIVERIES_PREFIX, REQUESTS_PREFIX, RESULTS_PREFIX and RECORD_SUFFIX).
+SCENARIO_STUB_DELIVERIES_PREFIX=stub-mcp-deliveries.
+SCENARIO_STUB_REQUESTS_PREFIX=stub-mcp-requests.
+SCENARIO_STUB_RESULTS_PREFIX=stub-mcp-results.
+SCENARIO_STUB_RECORD_SUFFIX=.jsonl
+
+# Bound on a push's request to the Slack stub, in seconds.
+SCENARIO_SLACK_PUSH_S=10
+
+# Bound on a tool call's result line, in seconds.
+SCENARIO_STUB_CALL_S=30
+
+# The most bytes a request line may take, its newline included: less than the
+# 4096-byte buffer bash's printf fills before it writes, so the line reaches
+# the request file in one write.
+SCENARIO_STUB_REQUEST_MAX_BYTES=4000
+
+# _scenario_check_stub_url <step>: fail, with the reason, unless
+# SCENARIO_SLACK_STUB_URL is exactly `http://127.0.0.1:<port>` (a port from 1
+# to 65535, never 3100).
+_scenario_check_stub_url() {
+    local step="$1" re='^http://127\.0\.0\.1:([1-9][0-9]{0,4})$' port
+    [[ -n "${SCENARIO_SLACK_STUB_URL:-}" ]] \
+        || fail "${step}: SCENARIO_SLACK_STUB_URL is unset: set it to the Slack stub's base URL, http://127.0.0.1:<port>, once the stub's ready file exists"
+    [[ "${SCENARIO_SLACK_STUB_URL}" =~ ${re} ]] \
+        || fail "${step}: refused: SCENARIO_SLACK_STUB_URL '${SCENARIO_SLACK_STUB_URL}' is not http://127.0.0.1:<port>"
+    port="${BASH_REMATCH[1]}"
+    (( port <= 65535 )) || fail "${step}: refused: SCENARIO_SLACK_STUB_URL names port ${port}, above 65535"
+    (( port != 3100 )) || fail "${step}: refused: SCENARIO_SLACK_STUB_URL names port 3100, the container's own server, not the Slack stub"
+}
+
+# _scenario_stub_dir <step>: print the real path of SCENARIO_STUB_DIR; fail,
+# with the reason, unless it is set, under SCENARIO_ROOT as written and by
+# real path, a directory, and holds a copy of the MCP session client.
+_scenario_stub_dir() {
+    local step="$1" client="${SCENARIO_STUB_MCP_SRC##*/}" real_root real_dir
+    [[ -n "${SCENARIO_STUB_DIR:-}" ]] \
+        || fail "${step}: SCENARIO_STUB_DIR is unset: set it to the directory holding the stub and its copy of ${client} (SCENARIO_BIN in fmk mode)"
+    [[ -n "${SCENARIO_ROOT:-}" && -d "${SCENARIO_ROOT}" ]] \
+        || fail "${step}: refused: SCENARIO_ROOT '${SCENARIO_ROOT:-}' is not a directory"
+    [[ "${SCENARIO_STUB_DIR}" == "${SCENARIO_ROOT}"/* ]] \
+        || fail "${step}: refused: SCENARIO_STUB_DIR ${SCENARIO_STUB_DIR} is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" \
+        || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
+    real_dir="$(realpath -e -- "${SCENARIO_STUB_DIR}" 2> /dev/null)" \
+        || fail "${step}: refused: SCENARIO_STUB_DIR ${SCENARIO_STUB_DIR} does not exist"
+    [[ "${real_dir}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: SCENARIO_STUB_DIR ${SCENARIO_STUB_DIR} resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
+    [[ -d "${real_dir}" ]] || fail "${step}: refused: SCENARIO_STUB_DIR ${SCENARIO_STUB_DIR} is not a directory"
+    # A copy, not a symlink: Bun runs a symlinked client from its target's
+    # directory, and the client keeps its records beside the file Bun runs.
+    [[ -f "${real_dir}/${client}" && ! -L "${real_dir}/${client}" ]] \
+        || fail "${step}: refused: SCENARIO_STUB_DIR ${SCENARIO_STUB_DIR} holds no copy of the MCP session client ${client} (a regular file, not a symlink)"
+    printf '%s\n' "${real_dir}"
+}
+
+# _scenario_stub_key <step> <dir>: print the record key of the working
+# directory <dir> (fixtures/stub-mcp-session.ts, "The key"): the lowercase hex
+# SHA-256 of its real path, hashed with no trailing newline. Fails unless
+# <dir> is a directory under SCENARIO_ROOT, as written and by real path.
+_scenario_stub_key() {
+    local step="$1" dir="$2" real_root real_dir key
+    [[ -n "${dir}" && "${dir}" == "${SCENARIO_ROOT}"/* ]] \
+        || fail "${step}: refused: '${dir}' is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
+    [[ -d "${dir}" ]] || fail "${step}: ${dir} is not a directory"
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" \
+        || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
+    real_dir="$(realpath -e -- "${dir}" 2> /dev/null)" || fail "${step}: cannot resolve ${dir}"
+    [[ "${real_dir}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: ${dir} resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
+    key="$(printf '%s' "${real_dir}" | sha256sum | cut -d ' ' -f 1)" \
+        || fail "${step}: could not hash the real path of ${dir}"
+    [[ "${key}" =~ ^[0-9a-f]{64}$ ]] || fail "${step}: the key of ${real_dir} reads '${key}', not 64 lowercase hex digits"
+    printf '%s\n' "${key}"
+}
+
+slack_stub_push() {
+    local expect_refused=0 label event flag body out status answer reason envelope_id step
+    step="slack_stub_push ${1:-}"
+    require_ci_image "${step}"
+    if [[ "${1:-}" == --expect-refused ]]; then
+        expect_refused=1
+        shift
+    fi
+    (( $# >= 2 && $# <= 3 )) || fail "${step}: takes [--expect-refused] <label> <event-json> [<flag>]"
+    label="$1"
+    event="$2"
+    flag="${3:-}"
+    step="slack_stub_push ${label}"
+    (( expect_refused == 0 )) || step="slack_stub_push --expect-refused ${label}"
+    [[ -n "${label}" ]] || fail "${step}: no label given"
+    _scenario_check_stub_url "${step}"
+    jq -n -e --argjson e "${event}" '$e | type == "object"' > /dev/null 2>&1 \
+        || fail "${step}: the event is not a JSON object"
+    case "${flag}" in
+        '')
+            body="$(jq -c -n --arg l "${label}" --argjson e "${event}" '{label: $l, event: $e}')" \
+                || fail "${step}: could not build the push"
+            ;;
+        omit)
+            body="$(jq -c -n --arg l "${label}" --argjson e "${event}" \
+                '{label: $l, event: $e, envelope: {omit: ["is_ext_shared_channel"]}}')" \
+                || fail "${step}: could not build the push"
+            ;;
+        *)
+            jq -n --argjson f "${flag}" 'true' > /dev/null 2>&1 \
+                || fail "${step}: the flag '${flag}' is neither omit nor a JSON value"
+            body="$(jq -c -n --arg l "${label}" --argjson e "${event}" --argjson f "${flag}" \
+                '{label: $l, event: $e, envelope: {is_ext_shared_channel: $f}}')" \
+                || fail "${step}: could not build the push"
+            ;;
+    esac
+    # The answer's body, then a line holding its HTTP status (000 when nothing answered).
+    out="$(curl -s --max-time "${SCENARIO_SLACK_PUSH_S}" -w '\n%{http_code}' -X POST \
+        -H 'Content-Type: application/json' --data-binary "${body}" \
+        "${SCENARIO_SLACK_STUB_URL}/_push" || true)"
+    status="${out##*$'\n'}"
+    answer="${out%$'\n'*}"
+    [[ "${status}" =~ ^[0-9]{3}$ && "${status}" != 000 ]] \
+        || fail "${step}: no answer from the Slack stub at ${SCENARIO_SLACK_STUB_URL} within ${SCENARIO_SLACK_PUSH_S} s"
+    envelope_id="$(jq -r 'if type == "object" and .ok == true and (.envelope_id | type) == "string" then .envelope_id else empty end' \
+        <<< "${answer}" 2> /dev/null || true)"
+    reason="$(jq -r 'if type == "object" and (.error | type) == "string" then .error else empty end' \
+        <<< "${answer}" 2> /dev/null || true)"
+    if [[ "${status}" == 200 && -n "${envelope_id}" ]]; then
+        (( expect_refused == 0 )) \
+            || fail "${step}: the Slack stub sent the push to label ${label} (envelope ${envelope_id}); a refusal was expected"
+        printf '%s\n' "${envelope_id}"
+        return 0
+    fi
+    if (( expect_refused )); then
+        [[ -n "${reason}" ]] \
+            || fail "${step}: the Slack stub answered the push to label ${label} with HTTP ${status} and no reason"
+        printf '%s\n' "${reason}"
+        return 0
+    fi
+    fail "${step}: the Slack stub refused the push to label ${label} (HTTP ${status}: ${reason:-no reason given})"
+}
+
+stub_session_deliveries() {
+    local dir="${1:-}" stub key file content step
+    step="stub_session_deliveries ${dir}"
+    require_ci_image "${step}"
+    (( $# == 1 )) || fail "${step}: takes one argument, the working directory"
+    stub="$(_scenario_stub_dir "${step}")" || exit 1
+    key="$(_scenario_stub_key "${step}" "${dir}")" || exit 1
+    file="${stub}/${SCENARIO_STUB_DELIVERIES_PREFIX}${key}${SCENARIO_STUB_RECORD_SUFFIX}"
+    [[ -e "${file}" || -L "${file}" ]] || return 0
+    [[ -f "${file}" && ! -L "${file}" ]] || fail "${step}: the delivery record ${file} is not a regular file"
+    # The `x` keeps the record's last newline through the substitution.
+    content="$(cat -- "${file}" && printf x)" || fail "${step}: could not read the delivery record ${file}"
+    content="${content%x}"
+    # Complete lines only: a line the client is appending is left for a later read.
+    content="${content%"${content##*$'\n'}"}"
+    printf '%s' "${content}"
+}
+
+stub_session_call() {
+    local dir="${1:-}" tool="${2:-}" args="${3:-}" stub key requests results id line found deadline step
+    step="stub_session_call ${dir} ${tool}"
+    require_ci_image "${step}"
+    (( $# == 3 )) || fail "${step}: takes <dir> <tool> <json-args>"
+    [[ "${tool}" =~ ^[A-Za-z0-9_.-]{1,128}$ ]] \
+        || fail "${step}: '${tool}' is not a tool name (1 to 128 letters, digits, '_', '-' or '.')"
+    jq -n -e --argjson a "${args}" '$a | type == "object"' > /dev/null 2>&1 \
+        || fail "${step}: the arguments are not a JSON object"
+    stub="$(_scenario_stub_dir "${step}")" || exit 1
+    key="$(_scenario_stub_key "${step}" "${dir}")" || exit 1
+    requests="${stub}/${SCENARIO_STUB_REQUESTS_PREFIX}${key}${SCENARIO_STUB_RECORD_SUFFIX}"
+    results="${stub}/${SCENARIO_STUB_RESULTS_PREFIX}${key}${SCENARIO_STUB_RECORD_SUFFIX}"
+    [[ ! -L "${requests}" && ! -L "${results}" ]] \
+        || fail "${step}: refused: a record of ${dir} in ${stub} is a symlink"
+    [[ ! -e "${requests}" || -f "${requests}" ]] || fail "${step}: the request file ${requests} is not a regular file"
+    [[ ! -e "${results}" || -f "${results}" ]] || fail "${step}: the results record ${results} is not a regular file"
+    # Unique in the scenario: the PID of the process making this call
+    # (distinct between processes that run at once, a `$( … )` or other
+    # subshell included), its clock to the microsecond (distinct between the
+    # calls one process makes, and from a later process given the same PID)
+    # and a random number.
+    id="${SCENARIO_TAG}-${BASHPID}-${EPOCHREALTIME//[.,]/}-${RANDOM}"
+    if [[ -f "${requests}" ]] && grep -qF -- "\"id\":\"${id}\"" "${requests}"; then
+        fail "${step}: the request ID ${id} is already in ${requests}"
+    fi
+    # ASCII only (-a), so the line's length is its size in bytes.
+    line="$(jq -c -a -n --arg id "${id}" --arg tool "${tool}" --argjson a "${args}" \
+        '{id: $id, tool: $tool, arguments: $a}')" || fail "${step}: could not build the request line"
+    (( ${#line} < SCENARIO_STUB_REQUEST_MAX_BYTES )) \
+        || fail "${step}: the request line takes ${#line} bytes; at most $(( SCENARIO_STUB_REQUEST_MAX_BYTES - 1 )) reach the file in one write"
+    # One append of the whole line in one write: the client reads only
+    # complete lines, and no other writer's line lands inside this one.
+    printf '%s\n' "${line}" >> "${requests}" || fail "${step}: could not append request ${id} to ${requests}"
+    deadline=$(( $(_scenario_now_ms) + SCENARIO_STUB_CALL_S * 1000 ))
+    while :; do
+        if [[ -f "${results}" ]]; then
+            found="$(jq -n -r -R --arg id "${id}" \
+                'first(inputs | select((fromjson? | type == "object" and .id == $id) // false))' "${results}")" \
+                || fail "${step}: jq could not read the results record ${results}"
+            if [[ -n "${found}" ]]; then
+                printf '%s\n' "${found}"
+                return 0
+            fi
+        fi
+        (( $(_scenario_now_ms) < deadline )) || break
+        sleep "${SCENARIO_POLL_S}"
+    done
+    fail "${step}: no result line for request ${id} (tool ${tool}, working directory ${dir}) in ${results} within ${SCENARIO_STUB_CALL_S} s"
+}
+
+# ---------------------------------------------------------------------------
 # fmk mode setup
 # ---------------------------------------------------------------------------
 
@@ -5030,6 +5323,9 @@ _scenario_fmk_setup() {
 
     SCENARIO_HOME="${SCENARIO_ROOT}/home"
     SCENARIO_BIN="${SCENARIO_ROOT}/bin"
+    # The directory of the stub's MCP session records, which stub_session_deliveries
+    # and stub_session_call read and write (b.deo SRI-1404).
+    SCENARIO_STUB_DIR="${SCENARIO_BIN}"
     mkdir -p "${SCENARIO_HOME}" "${SCENARIO_BIN}" "${SCENARIO_ROOT}/tmux" \
         || fail "could not create the scenario's HOME, bin and tmux directories"
     chmod 00700 "${SCENARIO_ROOT}/tmux" || fail "could not set the mode of ${SCENARIO_ROOT}/tmux"
