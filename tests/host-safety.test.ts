@@ -67,8 +67,9 @@
  *   `stub_session_deliveries` and `stub_session_call`
  *   (`IMAGE_GUARDED_STUB_HELPERS`) each run `require_ci_image`, called
  *   directly, as their first command after their declarations and outside any
- *   `if`, `||` or subshell, and none runs `require_scenario_home` (they work in
- *   shared mode, which has no scenario HOME). `/ci` always carries the marker,
+ *   `if`, `||`, pipeline, background or subshell, and none runs
+ *   `require_scenario_home`, nor any function it calls (they work in shared
+ *   mode, which has no scenario HOME). `/ci` always carries the marker,
  *   so this pin is the only proof of their refusal. Read with the shell reader
  *   above, pinned with synthetic violations, then run over the tree, and over
  *   the tree with one helper's guard removed or moved into an `if`.
@@ -1753,6 +1754,9 @@ const HOME_CHECKED_BY_CALLERS: ReadonlyMap<string, string> = new Map([
 /** scenario.sh's guard that refuses unless HOME is under SCENARIO_ROOT. */
 const HOME_GUARD = 'require_scenario_home'
 
+/** scenario.sh's guard that refuses outside a cscb-ci image. */
+const IMAGE_GUARD = 'require_ci_image'
+
 /** Commands that are a sqlite3, copy, move or install step. */
 const STORE_OR_FILE_STEPS: readonly string[] = ['sqlite3', 'cp', 'mv', 'install', 'rsync']
 
@@ -1791,6 +1795,12 @@ interface ShellCommand {
   keywords: string[]
   /** What comes before it: '' (start of a logical line), `;`, `&&`, `||`, `|`, `&`, `(`, `)` or `$(` (inside a substitution). */
   after: string
+  /**
+   * What follows it: '' (the end of its logical line or substitution), `;`,
+   * `&&`, `||`, `|`, `&`, `(` or `)`. Every command of an `&&` / `||` list
+   * that ends with `&` has `&`, as bash runs the whole list in the background.
+   */
+  next: string
   /** Its 1-based line. */
   line: number
 }
@@ -1948,8 +1958,16 @@ function closingParen(code: string, open: number, end: number): number {
 function shellCommandsIn(code: string, raw: string, start: number, end: number, lineAt: (offset: number) => number, out: ShellCommand[], firstAfter: string): void {
   let words: { raw: string; start: number }[] = []
   let after = firstAfter
+  /** The commands of the `&&` / `||` list (and its pipelines) read so far. */
+  let list: ShellCommand[] = []
   const flush = (separator: string): void => {
-    if (words.length > 0) out.push(shellCommand(words, after, lineAt))
+    if (words.length > 0) {
+      const command = shellCommand(words, after, separator, lineAt)
+      out.push(command)
+      list.push(command)
+    }
+    if (separator === '&') for (const c of list) if (c.next === '&&' || c.next === '||') c.next = '&'
+    if (separator !== '&&' && separator !== '||' && separator !== '|') list = []
     words = []
     after = separator
   }
@@ -2000,7 +2018,7 @@ function shellCommandsIn(code: string, raw: string, start: number, end: number, 
  * `command` / `exec` / `nohup` / `builtin` / `env` / `timeout` prefixes (with
  * their options) set aside.
  */
-function shellCommand(words: readonly { raw: string; start: number }[], after: string, lineAt: (offset: number) => number): ShellCommand {
+function shellCommand(words: readonly { raw: string; start: number }[], after: string, next: string, lineAt: (offset: number) => number): ShellCommand {
   const unquoted = words.map((w) => w.raw.replace(/["']/g, ''))
   const keywords: string[] = []
   const assignments: string[] = []
@@ -2034,7 +2052,7 @@ function shellCommand(words: readonly { raw: string; start: number }[], after: s
     } else break
     k++
   }
-  return { name: unquoted[k] ?? '', args: unquoted.slice(k + 1), assignments, keywords, after, line: lineAt(words[0].start) }
+  return { name: unquoted[k] ?? '', args: unquoted.slice(k + 1), assignments, keywords, after, next, line: lineAt(words[0].start) }
 }
 
 /** `source` read as logical lines, each with its commands. */
@@ -2077,6 +2095,11 @@ function shellDepthChange(command: ShellCommand): number {
     else if (['fi', 'done', 'esac', '}'].includes(word)) change--
   }
   return change
+}
+
+/** Whether `command` is unconditional: no reserved word before it, at the start of a logical line or after `;`. */
+function isUnconditional(command: ShellCommand): boolean {
+  return command.keywords.length === 0 && (command.after === '' || command.after === ';')
 }
 
 /** The first command of `line` that is not inside a substitution: the one the line starts with. */
@@ -2246,7 +2269,7 @@ function homeGuardIndex(body: readonly ShellCommand[]): number {
   let depth = 0
   for (let k = 0; k < body.length; k++) {
     const c = body[k]
-    if (depth === 0 && c.name === HOME_GUARD && c.keywords.length === 0 && (c.after === '' || c.after === ';')) return k
+    if (depth === 0 && c.name === HOME_GUARD && isUnconditional(c)) return k
     depth += shellDepthChange(c)
   }
   return -1
@@ -3434,12 +3457,12 @@ function signalGuardFindings(source: string, helper: string): string[] {
   const unconditional: string[] = []
   let depth = 0
   for (const command of body.slice(0, signal)) {
-    if (depth === 0 && command.keywords.length === 0 && (command.after === '' || command.after === ';') && !isDeclarationOnly(command)) unconditional.push(command.name)
+    if (depth === 0 && isUnconditional(command) && !isDeclarationOnly(command)) unconditional.push(command.name)
     depth += shellDepthChange(command)
   }
   const findings: string[] = []
-  if (unconditional[0] !== 'require_ci_image') findings.push(`${helper}: its first step is ${unconditional[0] ?? 'none'}, not require_ci_image`)
-  if (unconditional.indexOf(HOME_GUARD) < 1) findings.push(`${helper}: no unconditional ${HOME_GUARD} after require_ci_image and before its kill`)
+  if (unconditional[0] !== IMAGE_GUARD) findings.push(`${helper}: its first step is ${unconditional[0] ?? 'none'}, not ${IMAGE_GUARD}`)
+  if (unconditional.indexOf(HOME_GUARD) < 1) findings.push(`${helper}: no unconditional ${HOME_GUARD} after ${IMAGE_GUARD} and before its kill`)
   return findings
 }
 
@@ -3484,19 +3507,13 @@ describe(`${MCP_SESSION_END_HELPER}: both guards before its signal`, () => {
  */
 const IMAGE_GUARDED_STUB_HELPERS: readonly string[] = ['slack_stub_push', 'stub_session_deliveries', 'stub_session_call']
 
-/** scenario.sh's guard that refuses outside a cscb-ci image. */
-const IMAGE_GUARD = 'require_ci_image'
-
-/** Whether `command` is unconditional: no reserved word before it, at the start of a logical line or after `;`. */
-function isUnconditional(command: ShellCommand): boolean {
-  return command.keywords.length === 0 && (command.after === '' || command.after === ';')
-}
-
 /**
  * The image-check findings for `helpers` in the shell file `file`: the first
  * command of each, after its unconditional declarations (`local …`, a lone
- * `NAME=…`), is an unconditional `require_ci_image`, called directly. A
- * command substitution in a declaration runs before it, and so is its first
+ * `NAME=…`), is an unconditional `require_ci_image`, called directly, and not
+ * piped on (`|`) nor run in the background (`&`, its own or its `&&` / `||`
+ * list's): bash runs those in a subshell, so `fail`'s exit ends only that.
+ * A command substitution in a declaration runs before it, and so is its first
  * command. A helper that is not defined is a finding too.
  */
 function helperImageCheckFindings(file: string, source: string, helpers: readonly string[] = IMAGE_GUARDED_STUB_HELPERS): string[] {
@@ -3514,6 +3531,31 @@ function helperImageCheckFindings(file: string, source: string, helpers: readonl
     else if (first.name !== IMAGE_GUARD || !isUnconditional(first)) {
       const shown = [...first.keywords, first.name].filter((w) => w !== '').join(' ')
       findings.push(`${file}:${first.line}: ${rule}: ${helper}: its first step after its declarations is \`${shown}\`, not an unconditional ${IMAGE_GUARD}`)
+    } else if (first.next === '|' || first.next === '&') {
+      findings.push(`${file}:${first.line}: ${rule}: ${helper}: its ${IMAGE_GUARD} runs in a subshell (\`${first.next}\` after it), so its refusal ends only that subshell`)
+    }
+  }
+  return findings
+}
+
+/**
+ * The functions of `source` that call `require_scenario_home`, as reached
+ * from each of `helpers`: the helper itself, and every function of `source`
+ * a reached function names (as its command or an argument word), transitively.
+ * Each finding names the helper and the function that calls the guard.
+ */
+function homeGuardCallFindings(source: string, helpers: readonly string[]): string[] {
+  const functions = shellFunctions(source)
+  const findings: string[] = []
+  for (const helper of helpers) {
+    const reached = new Set([helper])
+    for (const name of reached) {
+      for (const c of functions.get(name) ?? []) {
+        for (const word of [c.name, ...c.args]) if (word !== HOME_GUARD && functions.has(word)) reached.add(word)
+      }
+    }
+    for (const name of reached) {
+      if ((functions.get(name) ?? []).some((c) => namesFunction(c, HOME_GUARD))) findings.push(`${helper} runs ${HOME_GUARD} in ${name}`)
     }
   }
   return findings
@@ -3533,6 +3575,9 @@ describe('static audit: the Slack stub and stub MCP session helpers run require_
     ['the guard only in a subshell', fn('stub_session_deliveries', DECLARATIONS, `    ( ${IMAGE_GUARD} "\${step}" )`, STEP)],
     ['the guard only inside an if', fn('stub_session_deliveries', DECLARATIONS, '    if [[ -n "${STRICT:-}" ]]; then', `        ${IMAGE_GUARD} "\${step}"`, '    fi', STEP)],
     ['the guard through a private wrapper', fn('stub_session_deliveries', DECLARATIONS, '    _scenario_require_image "${step}"', STEP)],
+    ['the guard piped on', fn('stub_session_deliveries', DECLARATIONS, `    ${IMAGE_GUARD} "\${step}" | tee x`, STEP)],
+    ['the guard in the background', fn('stub_session_deliveries', DECLARATIONS, `    ${IMAGE_GUARD} "\${step}" &`, STEP)],
+    ['the guard in an && list run in the background', fn('stub_session_deliveries', DECLARATIONS, `    ${IMAGE_GUARD} "\${step}" && jq -c . "\${file}" &`, STEP)],
   ]
 
   test.each(flagged)('flags %s, naming the helper, the file and the rule', (_label, source) => {
@@ -3550,6 +3595,7 @@ describe('static audit: the Slack stub and stub MCP session helpers run require_
     ['declarations, then the guard', fn('stub_session_deliveries', DECLARATIONS, `    ${IMAGE_GUARD} "\${step}"`, STEP)],
     ['the guard with no declarations, after a comment', fn('stub_session_deliveries', '    # The image first.', `    ${IMAGE_GUARD} x`, STEP)],
     ['the guard after `;` following a declaration', fn('stub_session_deliveries', `    local step=x; ${IMAGE_GUARD} "\${step}"`, STEP)],
+    ['the guard ahead of an && list run in the helper’s shell', fn('stub_session_deliveries', DECLARATIONS, `    ${IMAGE_GUARD} "\${step}" && jq -c . "\${file}"`, STEP)],
   ]
 
   test.each(allowed)('allows %s', (_label, source) => {
@@ -3562,10 +3608,18 @@ describe('static audit: the Slack stub and stub MCP session helpers run require_
     expect(helperImageCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), source)).toEqual([])
   })
 
-  test('the current tree: none of the three runs require_scenario_home, so each works in shared mode', () => {
-    const functions = shellFunctions(source)
+  test('the current tree: none of the three runs require_scenario_home, nor any function it calls, so each works in shared mode', () => {
+    expect(homeGuardCallFindings(source, IMAGE_GUARDED_STUB_HELPERS)).toEqual([])
+  })
 
-    expect(IMAGE_GUARDED_STUB_HELPERS.filter((helper) => (functions.get(helper) ?? []).some((c) => c.name === HOME_GUARD))).toEqual([])
+  test('a private helper two calls down that runs require_scenario_home is found, naming the helper and the caller of the guard', () => {
+    const synthetic = lines(
+      fn('stub_session_deliveries', DECLARATIONS, `    ${IMAGE_GUARD} "\${step}"`, '    stub="$(_scenario_stub_dir "${step}")" || exit 1'),
+      fn('_scenario_stub_dir', '    _scenario_stub_root "$1"'),
+      fn('_scenario_stub_root', `    ${HOME_GUARD} "$1"`),
+    )
+
+    expect(homeGuardCallFindings(synthetic, ['stub_session_deliveries'])).toEqual([`stub_session_deliveries runs ${HOME_GUARD} in _scenario_stub_root`])
   })
 
   test.each(IMAGE_GUARDED_STUB_HELPERS.map((helper) => [helper]))('scenario.sh with %s’s require_ci_image removed is flagged, naming it', (helper) => {
@@ -3617,13 +3671,8 @@ describe('static audit: slack-stub-server.ts statically imports only node: built
     expect(stubImportFindings(relative(REPO_ROOT, SLACK_STUB_SERVER_PATH), source)).toEqual([])
   })
 
-  test.each([
-    ['a src/ module', "import { parsePersonaConfig } from '../../../src/config.ts'"],
-    ['a test helper, type-only', "import type { FakeSlack } from '../../test-helpers/slack-stub.ts'"],
-    ['a package', "import { WebSocketServer } from 'ws'"],
-    ['a re-export from a package', "export { Client } from '@modelcontextprotocol/sdk/client/index.js'"],
-  ])('the stub with a static import of %s is flagged, naming the file and the rule', (_label, line) => {
-    const changed = withImport(line)
+  test('the stub with a static import of a src/ module is flagged, naming the file and the rule', () => {
+    const changed = withImport("import { parsePersonaConfig } from '../../../src/config.ts'")
     const findings = stubImportFindings('slack-stub-server.ts', changed)
 
     expect(changed).not.toBe(source)

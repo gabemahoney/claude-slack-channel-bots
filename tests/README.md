@@ -212,8 +212,9 @@ audited helper's `require_scenario_home`. The Slack push and stub session
 helpers make no step in that audit's sense (no `sqlite3`, copy, move,
 install or agent-director run), so it does not hold them and neither list
 names them; a separate pin (`IMAGE_GUARDED_STUB_HELPERS`) checks that each
-runs `require_ci_image` first, outside any `if`, `||` or subshell, and that
-none runs `require_scenario_home`.
+runs `require_ci_image` first, outside any `if`, `||`, pipeline, background
+or subshell, and that none runs `require_scenario_home`, nor any function it
+calls.
 
 ### Layout
 
