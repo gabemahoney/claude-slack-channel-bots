@@ -31,6 +31,12 @@
  *   kill, bound as `main()` binds them), what P holds set through the
  *   harness's real routes, each left-over read through its module's query;
  * - the ack-reaction entries: the real ack tracker's `forgetPersonaAcks`;
+ * - the heard set (b.av2 SR-6.5 with b.deo SRI-307, AC 13): the real routing
+ *   in fungible mode (`makeRoutingHarness`), its `forget` as
+ *   `routing.forget`, each persona's heard set filled by events through the
+ *   routing and read through its own `heardChannels`; the registry and
+ *   restart state the harness installs are reset after the case
+ *   (`resetRoutingState`);
  * - the notice episodes (b.jg5 SRJ-1016): a real `createPersonaEpisodes`
  *   instance on a fake clock, its `forget` as `forgetNoticeEpisodes`;
  * - the latch (b.jg5 SRJ-504): a real `createConflictLatch` with the CONFLICT
@@ -324,7 +330,14 @@ import {
   type NotifierHarness,
   type StartupEntry,
 } from './test-helpers/persona-notifier.ts'
-import { INITIAL_CREDENTIALS, makeDeferredWebApiCall, type WebApiOutcome } from './test-helpers/slack-stub.ts'
+import { makeRoutingHarness, resetRoutingState } from './test-helpers/persona-routing-harness.ts'
+import {
+  INITIAL_CREDENTIALS,
+  makeChannelMessage,
+  makeDeferredWebApiCall,
+  makePrivateChannelMessage,
+  type WebApiOutcome,
+} from './test-helpers/slack-stub.ts'
 
 
 /** The kill's success the fixture's `killInstance` answers: `kill_sent: true` (b.jg5 SRJ-701). */
@@ -1880,6 +1893,33 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(episodes.post(b, PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE, 'beta notice')).toBe(true)
     expect(posts.slice(postsBefore)).toEqual([{ key: b, text: 'beta notice' }])
     expect(clock.pendingCount()).toBe(0)
+  })
+
+  test('b.deo SRI-307 (AC 13): over the real routing in fungible mode, tearing B down empties B\'s heard set and leaves A\'s, holding the same channel, unchanged', async () => {
+    const h = makeRoutingHarness([{ name: NAME_A }, { name: NAME_B }], dir, { mode: 'fungible' })
+    cleanups.push(resetRoutingState)
+    const f = makeFixture({ overrides: { routing: { forget: (key) => h.forget(key) } } })
+    const [a, b] = [f.a.key, f.b.key]
+    expect(h.keys([NAME_A, NAME_B])).toEqual([a, b])
+    // Channel X is heard by both; Y by A alone; Z, a private channel, by B alone.
+    const [x, y, z] = ['C0HEARDX01', 'C0HEARDY01', 'G0HEARDZ01']
+    await h.receive(makeChannelMessage({ channel: x }), [NAME_A, NAME_B])
+    await h.receive(makeChannelMessage({ channel: y }), [NAME_A])
+    await h.receive(makePrivateChannelMessage({ channel: z }), [NAME_B])
+    expect(h.heardChannels(a)).toEqual(new Set([x, y]))
+    expect(h.heardChannels(b)).toEqual(new Set([x, z]))
+    const routingLogsBefore = h.logs.length
+
+    await f.lifecycle.teardown(f.b)
+
+    // Every other step still ran, in order (the real forget records no trail entry).
+    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)).filter((c) => c !== `routing.forget:${b}`))
+    expect(f.lines).toEqual(cleanTeardownLines(f.b))
+    expect(h.heardChannels(b)).toEqual(new Set())
+    expect(h.heardChannels(a)).toEqual(new Set([x, y]))
+    // The forget is silent: the routing logged nothing during the teardown.
+    expect(h.logs.slice(routingLogsBefore)).toEqual([])
+    assertNoLeak({ lines: f.lines, ...h.captured() })
   })
 })
 
