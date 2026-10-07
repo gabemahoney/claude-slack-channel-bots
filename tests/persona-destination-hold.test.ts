@@ -142,6 +142,7 @@ beforeEach(() => {
     },
     destinationOf: (p) => real.destinationOf(p),
     refusalOf: (p) => real.refusalOf(p),
+    settingOf: (p) => real.settingOf!(p),
     forget: (key) => real.forget(key),
   }
   hold = createPersonaDestinationHold({
