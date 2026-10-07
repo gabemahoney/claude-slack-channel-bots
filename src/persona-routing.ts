@@ -42,7 +42,8 @@
  *    flag, `CHANNEL_ID_RE`, the stored choices read through
  *    `getChannelDelivery` (readability and lookup only; the routing never
  *    writes to the store or drops from it), and each applied persona's
- *    destination through the one destination rule (`personaDestinationOf`).
+ *    destination through the one destination rule, built by the loop
+ *    guard's one input builder (`fungibleDestinationsOf`).
  *    In declarative mode it gets none of them. It returns deliver with
  *    `via`, or drop with a reason, and says whether the event took the
  *    fungible path. A DM is decided only against the persona whose
@@ -153,7 +154,7 @@ import {
   type FungiblePath,
   type StoredChoices,
 } from './delivery-decision.ts'
-import { personaDestinationOf } from './persona-destination.ts'
+import { fungibleDestinationsOf } from './persona-destination.ts'
 import { hasGetStreamKey, sanitizeFilename } from './lib.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import {
@@ -552,7 +553,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       isExtSharedChannel,
       channelIdPattern: CHANNEL_ID_RE,
       storedChoices: deps.getChannelDelivery?.() ?? undefined,
-      fungibleDestinations: config.personas.map((p) => ({ key: p.key, destination: personaDestinationOf(config, p) })),
+      fungibleDestinations: fungibleDestinationsOf(config, config.personas),
     }
   }
 

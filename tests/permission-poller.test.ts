@@ -350,7 +350,7 @@ function startPoller(
   getClient: PollerDeps['getClient'],
   opts: Partial<PollerDeps> = {},
 ): ManualIntervalControl {
-  return startManualPoller({ getClient, clientFor: clients.clientFor, getPersona, ...opts })
+  return startManualPoller({ getClient, clientFor: clients.clientFor, getPersona, getPersonaConfig: () => config, ...opts })
 }
 
 /**
@@ -449,7 +449,7 @@ function makeHold(logCalls: unknown[][], destinations?: PersonaDestinations): He
   const clock = createFakeClock()
   const log = (line: string): void => { logCalls.push([line]) }
   const hold = createPersonaDestinationHold({
-    destinations: destinations ?? createPersonaDestinations({ log }),
+    destinations: destinations ?? createPersonaDestinations({ log, getPersonaConfig: () => config }),
     getPersona,
     clientFor: clients.clientFor,
     clock,
@@ -929,7 +929,7 @@ describe('poller tick — `dm` destination (b.av2 SR-7.1, SR-5.1)', () => {
   })
 
   test('an injected destination resolver is the one used: a DM it already opened (as the notifier would) is reused with no second open', async () => {
-    const destinations = createPersonaDestinations({ log: () => {} })
+    const destinations = createPersonaDestinations({ log: () => {}, getPersonaConfig: () => config })
     expect(await destinations.post(D, asWebClient(stubD.web), { text: 'a notice' })).toMatchObject({ outcome: 'posted', channelId: D_DM })
     const ivl = startPoller(() => ({
       list: async () => ({ spawns: [checkPermRow(D)] }),
@@ -1691,8 +1691,9 @@ describe('poller tick — a throw while a persona\'s retry is due leaves it retr
       }
       lines.push(line)
     }
+    const destinations = createPersonaDestinations({ log, getPersonaConfig: () => config })
     const hold = createPersonaDestinationHold({
-      destinations: createPersonaDestinations({ log }), getPersona, clientFor: clients.clientFor, clock, log,
+      destinations, getPersona, clientFor: clients.clientFor, clock, log,
     })
     let throwOnPostAttempted = false
     const emitTrail = (event) => {
@@ -1721,7 +1722,7 @@ describe('poller tick — a throw while a persona\'s retry is due leaves it retr
       }),
       clientFor: clients.clientFor, getPersona, isPersonaUp: () => true,
       setInterval: ivl.setInterval, clearInterval: ivl.clearInterval,
-      destinationHold: hold, log, emitTrail,
+      destinations, destinationHold: hold, log, emitTrail,
     })
 
     const posts = (persona) => stubs[persona.key].calls.postMessage.length
@@ -2562,6 +2563,7 @@ describe('poller lifecycle', () => {
       getClient,
       clientFor: clients.clientFor,
       getPersona,
+      getPersonaConfig: () => config,
       isPersonaUp: () => true,
       intervalMs: 1000,
       setInterval: ivl.setInterval,

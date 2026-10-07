@@ -7,10 +7,8 @@
  * `permission_prompts` setting in declarative mode, its fungible destination
  * (`invited.permission_prompts`, `dm` by default) in fungible mode; either way
  * a channel ID, or `dm`. The resolver reads the configuration in effect
- * through its injected `getPersonaConfig` at each attempt (b.deo SRI-201);
- * with none injected, it takes the switch the persona of that attempt was
- * loaded under (a fungible destination is resolved in fungible mode only).
- * The destination hold and the permission poller ask the resolver
+ * through its injected `getPersonaConfig` at each attempt (b.deo SRI-201),
+ * which every resolver is given. The destination hold and the permission poller ask the resolver
  * (`destinationOf`, `refusalOf`, `settingOf`), so all of them read the one
  * switch. In fungible mode prompts and notices go to the fungible
  * destination on the persona's own client (b.deo SRI-702), and after a
@@ -72,6 +70,7 @@
 
 import type { WebClient } from '@slack/web-api'
 import { DM_DESTINATION, channelModeOf, type Persona, type ServerSettings } from './config.ts'
+import type { PersonaFungibleDestination } from './delivery-decision.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
 
@@ -180,13 +179,20 @@ export interface PersonaDestinationsDeps {
   /**
    * The configuration in effect, read at each attempt (b.deo SRI-201), never
    * a copy taken earlier: the destination rule takes the switch from it.
-   * Production passes the server's applied configuration. Absent: the mode is
-   * derived from the persona of the attempt, read from the configuration in
-   * effect by the caller (`loadedModeOf`): fungible when the loader gave it a
-   * fungible destination, else declarative.
+   * Production passes the server's applied configuration.
    */
-  getPersonaConfig?(): DestinationConfig
+  getPersonaConfig(): DestinationConfig
 }
+
+/**
+ * Where a consumer that builds a destination resolver of its own when none is
+ * given gets one: the given resolver, or the configuration in effect that its
+ * own resolver reads (b.deo SRI-201). A consumer never builds a resolver
+ * without the configuration in effect.
+ */
+export type PersonaDestinationsSource =
+  | { destinations: PersonaDestinations; getPersonaConfig?: () => DestinationConfig }
+  | { destinations?: undefined; getPersonaConfig: () => DestinationConfig }
 
 /** A destination resolver instance, holding the per-persona DM cache. */
 export interface PersonaDestinations {
@@ -215,11 +221,9 @@ export interface PersonaDestinations {
    * The setting that names the persona's destination now
    * (`destinationSettingOf` over the configuration in effect at this call,
    * b.deo SRI-906): the one a line naming the destination `destinationOf`
-   * gives at the same moment names. Optional for a stand-in resolver; read
-   * through `destinationSettingFrom`, which derives it from the persona
-   * (`loadedModeOf`) when it is absent.
+   * gives at the same moment names. Read through `destinationSettingFrom`.
    */
-  settingOf?(persona: PersonaDestinationFields): DestinationSetting
+  settingOf(persona: PersonaDestinationFields): DestinationSetting
   /** Drop the persona's cached DM conversation (and any in-flight open's claim to the cache). */
   forget(personaKey: string): void
 }
@@ -277,28 +281,30 @@ export function destinationSettingOf(config: DestinationConfig): DestinationSett
 
 /**
  * The setting in force for `persona`, asked of a resolver
- * (`PersonaDestinations.settingOf`), or, for a resolver without one, derived
- * from the persona as loaded (`loadedModeOf`) (b.deo SRI-906). Every line
- * outside this module that names a destination setting reads it here.
+ * (`PersonaDestinations.settingOf`, b.deo SRI-906). Every line outside this
+ * module that names a destination setting reads it here.
  */
 export function destinationSettingFrom(
   destinations: Pick<PersonaDestinations, 'settingOf'>,
   persona: PersonaDestinationFields,
 ): DestinationSetting {
-  return destinations.settingOf?.(persona) ?? destinationSettingOf(loadedModeOf(persona))
+  return destinations.settingOf(persona)
 }
 
 /**
- * The switch a persona was loaded under, in the form the one destination
- * rule reads (b.deo SRI-102, SRI-201): `true` when the loader gave it a
- * fungible destination, which it does in fungible mode only, else `false`.
- * The rule's input where no configuration is injected: the persona is the
- * caller's read of the configuration in effect at that attempt, so after a
- * confirmed switch change it is the persona as the mode turned on resolved
- * it. Pure.
+ * The loop guard's input (b.deo SRI-305, SRI-504): each of `personas` (the
+ * applied personas of the configuration in effect) with its destination by
+ * the one destination rule over `config`, in their order. The one builder of
+ * that input: the routing passes it to the delivery decision at each
+ * fungible-mode event, and `set_channel_delivery` passes it to
+ * `channelDeliveryFor` for its result and line, so both read the same
+ * destinations. Pure.
  */
-function loadedModeOf(persona: PersonaDestinationFields): DestinationConfig {
-  return { allow_invited_channels: persona.fungible_destination !== undefined }
+export function fungibleDestinationsOf(
+  config: DestinationConfig,
+  personas: readonly (PersonaDestinationFields & Pick<Persona, 'key'>)[],
+): PersonaFungibleDestination[] {
+  return personas.map((p) => ({ key: p.key, destination: personaDestinationOf(config, p) }))
 }
 
 /**
@@ -391,25 +397,16 @@ export function safeFailureCode(code: string): string {
 export function createPersonaDestinations(deps: PersonaDestinationsDeps): PersonaDestinations {
   const dmCache = new Map<string, DmCacheEntry>()
 
-  /**
-   * The configuration in effect now for `persona`'s attempt, read at each
-   * call (b.deo SRI-201): the injected one, else the switch `persona` was
-   * loaded under (`loadedModeOf`).
-   */
-  function configInEffect(persona: PersonaDestinationFields): DestinationConfig {
-    return deps.getPersonaConfig !== undefined ? deps.getPersonaConfig() : loadedModeOf(persona)
-  }
-
   function destinationOf(persona: PersonaDestinationFields): string {
-    return personaDestinationOf(configInEffect(persona), persona)
+    return personaDestinationOf(deps.getPersonaConfig(), persona)
   }
 
   function refusalOf(persona: PersonaDestinationFields & Pick<Persona, 'dm'>): DmDestinationRefusal | undefined {
-    return dmDestinationRefusal(configInEffect(persona), persona)
+    return dmDestinationRefusal(deps.getPersonaConfig(), persona)
   }
 
   function settingOf(persona: PersonaDestinationFields): DestinationSetting {
-    return destinationSettingOf(configInEffect(persona))
+    return destinationSettingOf(deps.getPersonaConfig())
   }
 
   /**
@@ -451,7 +448,7 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
     message: DestinationMessage,
   ): Promise<DestinationPostResult> {
     // One read of the configuration in effect for the whole attempt.
-    const config = configInEffect(persona)
+    const config = deps.getPersonaConfig()
     const destination = resolvePersonaDestination(config, persona)
     let channelId: string
     // The cache entry the post used, so a stale-conversation failure drops

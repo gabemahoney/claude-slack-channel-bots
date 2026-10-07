@@ -20309,6 +20309,7 @@ describe('b.jg5 SRJ-114, SRJ-122 (hatch A2): the gets SRJ-114 leaves alone latch
       getClient: () => h.stub.client as unknown as ReturnType<PollerDeps['getClient']>,
       clientFor: makePersonaClients((key) => (key === p ? slack : undefined)).clientFor,
       getPersona: (key) => h.config.personas.find((candidate) => candidate.key === key),
+      getPersonaConfig: () => h.config,
       emitTrail: trail.emit,
     })
 
@@ -23754,6 +23755,7 @@ describe('b.jg5 SRJ-122, SRJ-513 (hatch A2): the gets SRJ-122 leaves alone latch
       getClient: () => h.stub.client as unknown as ReturnType<PollerDeps['getClient']>,
       clientFor: makePersonaClients((key) => (key === p ? slack : undefined)).clientFor,
       getPersona: (key) => h.config.personas.find((candidate) => candidate.key === key),
+      getPersonaConfig: () => h.config,
       emitTrail: trail.emit,
     })
 

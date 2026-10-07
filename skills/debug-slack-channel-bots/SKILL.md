@@ -791,6 +791,78 @@ running are not affected. See
   other in a loop. It is `mentions` too when the persona has no stored
   choice for the channel, or the stored choices can't be read.
 
+### `persona-channel-delivery-set`
+
+- **State:** the persona is `up`; this is an audit line, not a failure.
+- **Line:** `[slack] persona-channel-delivery-set: personas[<i>] "<name>" (key=<key>): stored choice for channel <id> set from <none|mentions|all> to <mentions|all>, at channel delivery <mentions|all> after the loop guard`
+
+  `from` is the persona's stored choice for the channel before the call
+  (`none` when it had none), `to` is the choice the call stored, and
+  `at channel delivery` is the persona's channel delivery there after the
+  loop guard. The line has no `path` part.
+- **Meaning:** The persona's agent called `set_channel_delivery` and the
+  server stored its choice for that channel. The line:
+  - is logged once for each accepted call, including one that stores the
+    value already stored, and including in dry run, where the tool stores
+    its choice the same way and makes no Slack call;
+  - is logged only in fungible mode (`allow_invited_channels` is `true`):
+    in declarative mode every call is refused;
+  - goes only to `server.log`, in the `[slack]` stream: no
+    `startup-errors.log` entry, and nothing is posted to Slack;
+  - carries no message text, user ID or token.
+
+  The choice applies from the next event in that channel. It is kept in the
+  state directory across server restarts and persona relaunches, and across
+  `allow_invited_channels` turned off and on again by confirmed changes: it
+  doesn't apply while the switch is off, and applies again once it is back
+  on. A confirmed change that retires the persona's key drops its stored
+  choices: a removal, a rename that changes the key, or a destructive modify
+  under the same key (`working_directory` or `credentials_file` changed, or
+  `name` changed without changing the key; see **Destructively modified
+  persona** under
+  [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)).
+  The persona brought up fresh is at `mentions` in every channel until its
+  agent stores a new choice.
+- **Cause:** The persona's agent called the tool, usually because someone in
+  that channel asked it to listen to every message there (`all`), or only to
+  @mentions and `@here` or `@channel` broadcasts (`mentions`).
+- **Fix:** None when the change was expected. To undo it, ask the persona in
+  that channel to set the other value. Note:
+  - a line with `to all` and `at channel delivery mentions` means the loop
+    guard holds the channel at `mentions`, because it is another applied
+    persona's fungible destination (its `invited.permission_prompts`
+    channel), so two personas can't answer each other in a loop. The choice
+    stays stored, and applies once the channel is no longer that
+    destination;
+  - a refused call logs no line of this class: the agent gets a tool error
+    instead, naming the persona and the reason (declarative mode, the
+    stored-choice file unreadable, a `delivery` other than `mentions` or
+    `all`, or a channel the persona hasn't heard in fungible mode and holds
+    no choice for), and nothing is stored;
+  - `Tool "set_channel_delivery" refused: persona key=<key> is not an applied persona.`
+    is the refusal for a call the server can't tie to an applied persona.
+    Besides a key absent from the applied configuration, it covers a key
+    that a confirmed change still in progress is retiring (a destructive
+    modify, from the change's apply until its teardown has settled), and a
+    session the server has dropped (the teardown of a removal or destructive
+    modify) or replaced with a newer registration, even while the persona is
+    still in `config.json`. Nothing is stored. Once the persona's new
+    session is up, its agent can call the tool again;
+  - a failed write of the stored-choice file gives the agent
+    `Tool "set_channel_delivery" failed for persona "<name>" (key=<key>): the stored-choice file "<path>" could not be written, so the choice was not stored and channel delivery is unchanged.`
+    and logs one line, with no `persona-channel-delivery-set` line:
+    `[slack] channel-delivery: cannot store the channel delivery of persona=<key> for channel <id> in "<path>"<detail>; the stored choices in memory are unchanged (b.deo SRI-404, SRI-506)`.
+    `<detail>` is ` (<code>); the file is unchanged` (no ` (<code>)` when
+    the error has none), or, when the file was written but its directory
+    could not be synced,
+    `: the record was written but its directory could not be synced (<code>); <write-back>`,
+    where `<write-back>` says the earlier file was put back, or
+    `putting the previous state back failed too (<code>), so the file holds the refused choice until the next successful write`.
+    The choice is not
+    stored and the persona's channel delivery is unchanged. Fix the cause
+    the code names (a full disk, or permissions on the state directory),
+    then ask the persona to set the value again.
+
 ### `persona-destination-failed`
 
 - **State:** the persona stays `up`; this is about its permission prompts,

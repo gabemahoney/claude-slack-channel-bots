@@ -10,8 +10,8 @@
  * - the applied config (`h.config`), built by `makeMultiPersonaConfig` and
  *   read by the routing at call time, in the channel mode the `mode` option
  *   picks through its `allow_invited_channels` switch (b.deo SRI-101,
- *   SRI-201): declarative with no `invited` section when absent, as in
- *   0.11.1. `fungibleDestinations` sets, by persona name, the persona's
+ *   SRI-201): declarative with no `invited` section when absent.
+ *   `fungibleDestinations` sets, by persona name, the persona's
  *   `invited.permission_prompts`, so the decision's fungible destinations
  *   (b.deo SRI-305) and the notifier's destination (SRI-701) come from the
  *   one configuration. `h.setMode(mode)` replaces `h.config` with the same
@@ -187,7 +187,11 @@
  *   same `clientFor`, the real ack tracker and the same reply settings source
  *   as the routing, as src/server.ts shares one source between the inbound ack
  *   step and the `reply` tool. So an ack-tracker entry the routing recorded is
- *   observed as a `reactions.remove` on the persona's own stub;
+ *   observed as a `reactions.remove` on the persona's own stub. Its posting
+ *   scope follows the harness's mode: the session tools' `getChannelMode`
+ *   reads `h.config`'s switch at each call, as `h.setMode` leaves it
+ *   (b.deo SRI-201, SRI-601), so with no `mode` option and no switch in
+ *   `overrides` it is declarative;
  * - a line capture for the module's log seam, the notifier and the hold
  *   (`h.logs`), and an order capture (`h.order`) for ack, archive, config and
  *   identity reads.
@@ -221,6 +225,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 
 import {
+  channelModeOf,
   replySettingsOf,
   type ChannelMode,
   type Persona,
@@ -768,7 +773,7 @@ export interface RoutingHarnessOptions {
    * The channel mode `h.config` is built in, through its
    * `allow_invited_channels` switch (b.deo SRI-101); it replaces a switch in
    * `overrides`. Absent: the switch as `overrides` sets it, else declarative
-   * mode, as in 0.11.1.
+   * mode.
    */
   mode?: ChannelMode
   /**
@@ -1102,6 +1107,9 @@ export function makeRoutingHarness(
       resolveUserName: async (_key, userId) => userId,
       consumeAck,
       serverPort: 0,
+      // The mode of the configuration in effect, read on every call from
+      // `h.config` as src/server.ts reads it (b.deo SRI-201, SRI-601).
+      getChannelMode: () => channelModeOf(h.config),
     }
     const entry: SessionEntry = {
       cwd: join(baseDir, 'reply', persona.key),

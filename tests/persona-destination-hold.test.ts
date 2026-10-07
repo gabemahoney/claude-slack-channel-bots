@@ -131,7 +131,7 @@ beforeEach(() => {
   const log = (line: string): void => {
     logs.push(line)
   }
-  const real = createPersonaDestinations({ log })
+  const real = createPersonaDestinations({ log, getPersonaConfig: () => config })
   const destinations: PersonaDestinations = {
     post: (persona, c, message) => {
       if (resolverThrows > 0) {
@@ -142,7 +142,7 @@ beforeEach(() => {
     },
     destinationOf: (p) => real.destinationOf(p),
     refusalOf: (p) => real.refusalOf(p),
-    settingOf: (p) => real.settingOf!(p),
+    settingOf: (p) => real.settingOf(p),
     forget: (key) => real.forget(key),
   }
   hold = createPersonaDestinationHold({

@@ -21,11 +21,13 @@
  * The labels cover credentials refused, Slack unreachable, connection lost
  * and restored, the unclaimed channel and the DM drop, the per-persona start
  * line, the destination failure, the failed credentials change, the
- * unresolvable claude_config_dir, and the channel a persona hears in fungible
- * mode (b.deo SRI-901). The channel causes (b.deo SRI-902, SRI-903) are built
- * here once: `invitedChannelCause`, `unclaimedChannelCause` for declarative
- * mode, and `fungibleUnclaimedChannelCause` with its exported reason texts
- * for fungible mode. None carries message text, a user ID or a token.
+ * unresolvable claude_config_dir, the channel a persona hears in fungible
+ * mode, and the channel delivery its agent stores (b.av2 SR-10.3; b.deo
+ * SRI-901). The channel causes (b.deo SRI-902, SRI-903) are built here once:
+ * `invitedChannelCause`, `channelDeliverySetCause`, `unclaimedChannelCause`
+ * for declarative mode, and `fungibleUnclaimedChannelCause` with its exported
+ * reason texts for fungible mode. None carries message text, a user ID or a
+ * token.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -143,6 +145,17 @@ export const PERSONA_CONFIG_DIR_UNRESOLVABLE = 'persona-config-dir-unresolvable'
  */
 export const PERSONA_INVITED_CHANNEL = 'persona-invited-channel'
 
+/**
+ * A persona's agent stored a channel delivery with `set_channel_delivery`
+ * (b.deo SRI-505, SRI-901, SRI-902): one line per accepted call, logged after
+ * the store's write succeeded, to `server.log` only; nothing is posted to
+ * Slack. The cause (`channelDeliverySetCause`) names the channel ID, the
+ * stored choice before the call (`none` when there was none) and after it,
+ * and the persona's channel delivery there after the loop guard; the line
+ * has no path.
+ */
+export const PERSONA_CHANNEL_DELIVERY_SET = 'persona-channel-delivery-set'
+
 /** Every persona diagnostic class label, in a fixed order. */
 export const PERSONA_DIAGNOSTIC_CLASSES = [
   PERSONA_START,
@@ -161,6 +174,7 @@ export const PERSONA_DIAGNOSTIC_CLASSES = [
   PERSONA_CREDENTIALS_CHANGE_FAILED,
   PERSONA_CONFIG_DIR_UNRESOLVABLE,
   PERSONA_INVITED_CHANNEL,
+  PERSONA_CHANNEL_DELIVERY_SET,
 ] as const
 
 /** A persona diagnostic class label (closed set). */
@@ -285,6 +299,31 @@ export function invitedChannelCause(
   delivery: DeliveryMode,
 ): string {
   return `hears ${channelType} channel ${channel} in fungible mode, at channel delivery ${delivery}`
+}
+
+/** How a `persona-channel-delivery-set` line names the absence of a stored choice before the call (b.deo SRI-902). */
+export const NO_STORED_CHOICE = 'none'
+
+/**
+ * The `persona-channel-delivery-set` cause (b.deo SRI-902), formatted through
+ * `formatPersonaDiagnostic` with no path:
+ *
+ *   `stored choice for channel <channel> set from <none|mentions|all> to <mentions|all>, at channel delivery <mentions|all> after the loop guard`
+ *
+ * `before` is the stored choice before the call, undefined when there was
+ * none (written `none`); `after` is the choice the call stored; `delivery`
+ * is the persona's channel delivery there after the loop guard. Pure.
+ */
+export function channelDeliverySetCause(
+  channel: string,
+  before: DeliveryMode | undefined,
+  after: DeliveryMode,
+  delivery: DeliveryMode,
+): string {
+  return (
+    `stored choice for channel ${channel} set from ${before ?? NO_STORED_CHOICE} to ${after}, ` +
+    `at channel delivery ${delivery} after the loop guard`
+  )
 }
 
 /**

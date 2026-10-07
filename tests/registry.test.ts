@@ -73,6 +73,7 @@ import {
   checkPersonaTarget,
   isSlackHostedFileUrl,
   MCP_INSTRUCTIONS,
+  SET_CHANNEL_DELIVERY_TOOL,
   type PersonaTargetAction,
   type PersonaTargetCheck,
   _resetRegistry,
@@ -2161,7 +2162,9 @@ describe('reply — chunking by the server-wide settings', () => {
 // ---------------------------------------------------------------------------
 
 describe('tool list and instructions', () => {
-  test('lists exactly the five tools with their inputs and required inputs unchanged; no tool name, description or input schema text carries reload wording (AC 74)', async () => {
+  // b.deo SRI-501: six tools, the five Slack tools with their inputs and
+  // `set_channel_delivery` with `channel` and `delivery`, both required.
+  test('lists exactly the six tools with their inputs and required inputs unchanged; no tool name, description or input schema text carries reload wording (AC 74)', async () => {
     const { client } = await openPersonaSession(h.alpha)
 
     const { tools } = await client.listTools()
@@ -2176,6 +2179,7 @@ describe('tool list and instructions', () => {
       edit_message: { properties: ['chat_id', 'message_id', 'text'], required: ['chat_id', 'message_id', 'text'] },
       fetch_messages: { properties: ['channel', 'limit', 'thread_ts'], required: ['channel'] },
       download_attachment: { properties: ['chat_id', 'message_id'], required: ['chat_id', 'message_id'] },
+      [SET_CHANNEL_DELIVERY_TOOL]: { properties: ['channel', 'delivery'], required: ['channel', 'delivery'] },
     })
     // b.av2 SR-8.8: the whole tool definition (name, description, every schema
     // property name and description), so a reload tool or hint can't slip in.

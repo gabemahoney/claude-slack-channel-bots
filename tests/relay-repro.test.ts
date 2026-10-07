@@ -225,7 +225,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     const getClient = () => sharedClient
 
     initOutageState({ getClient: getClient as unknown as () => Client, notify: () => {} })
-    const ivl = startManualPoller({ getClient, clientFor: clients.clientFor, getPersona })
+    const ivl = startManualPoller({ getClient, clientFor: clients.clientFor, getPersona, getPersonaConfig: () => null })
 
     // -----------------------------------------------------------------
     // Tick N — two open rows produce two distinct prompts

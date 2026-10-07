@@ -1356,8 +1356,9 @@ describe('no writes', () => {
 // ---------------------------------------------------------------------------
 
 describe('diagnostic lines', () => {
-  test('the label set is exactly the start, credentials, Slack-validation, connection, directory, unclaimed-channel, DM-drop, destination-failed, credentials-change-failed, config-dir-unresolvable and persona-invited-channel classes', () => {
+  test('the label set is exactly the start, credentials, Slack-validation, connection, directory, unclaimed-channel, DM-drop, destination-failed, credentials-change-failed, config-dir-unresolvable, persona-invited-channel and persona-channel-delivery-set classes', () => {
     expect([...PERSONA_DIAGNOSTIC_CLASSES].sort()).toEqual([
+      'persona-channel-delivery-set',
       'persona-config-dir-unresolvable',
       'persona-connection-lost',
       'persona-connection-restored',
@@ -6298,6 +6299,7 @@ function makeBringUpFixture(opts: BringUpFixtureOptions = {}): BringUpFixture {
   const notifier = createPersonaNotifier({
     getPersona: key => h.getPersona(key),
     clientFor: key => h.clientFor(key),
+    getPersonaConfig: () => h.config,
     isDryRun: () => dryRun,
     log: line => void notifierLines.push(line),
   })

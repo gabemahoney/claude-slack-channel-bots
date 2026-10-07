@@ -4654,12 +4654,14 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
   })
 
   // A new routing input (one reading the unclassified-error episode, say)
-  // fails here until it is pinned like the others.
+  // fails here until it is pinned like the others. `getChannelDelivery` gives
+  // the stored choices and their readability the routing reads at each
+  // fungible-mode event (b.deo SRI-305, SRI-403).
   test('the routing\'s call binds exactly these members, no more', () => {
     const MEMBERS: Array<keyof PersonaRoutingDeps> = [
       'getPersonaConfig', 'getBotIdentity', 'clientFor', 'resolveUserName', 'archive', 'getReplySettings', 'notify', 'log',
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
-      'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS,
+      'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery',
     ]
     expect([...onlyCallProps('createPersonaRouting').keys()].sort()).toEqual([...MEMBERS].sort())
   })
