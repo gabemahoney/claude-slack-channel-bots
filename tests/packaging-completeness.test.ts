@@ -33,8 +33,50 @@
  * so a class added without a skill entry, or an entry cut down to a passing
  * mention, fails here. RELOAD_DIAGNOSTIC_CLASSES (src/reload.ts, imported,
  * side-effect free) gets the same heading check in its own `test.each`, plus
- * a non-empty, duplicate-free check on the list. Content audits of shipped text (forbidden terms, the
- * SR-1.7 exception) are later Epics' work (E6/E14), not this file's.
+ * a non-empty, duplicate-free check on the list. The stored-choice store's
+ * own closed list, CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES (src/channel-delivery.ts,
+ * imported; b.deo SRI-901), gets the same heading check in its own
+ * `test.each`, behind a non-empty guard; the list's exact content is pinned
+ * in tests/channel-delivery.test.ts, not here. The forbidden-term audit and
+ * the SR-1.7 exception over all shipped text live in
+ * tests/shipped-docs.test.ts.
+ *
+ * b.deo SRI-1108 (AC 43): the debugging skill's fungible-mode content, read
+ * by heading title through the markdown helper, with every class label, drop
+ * reason, `unclaimed-channel` reason text, file name and setting name
+ * imported from `src/`:
+ *   - the entries for `persona-invited-channel`, `persona-channel-delivery-set`
+ *     and `channel-delivery-unreadable` each quote their `[slack] <label>:`
+ *     line and have a Line, Meaning, Cause and Fix bullet;
+ *   - `unclaimed-channel` has a declarative-mode and a fungible-mode part: the
+ *     declarative Fix offers fungible mode as a second fix for a public or
+ *     private channel that is not externally shared, and never for a group
+ *     DM; the fungible part quotes its line and has a table row with a fix
+ *     for each fungible-mode reason;
+ *   - `### \`channel-delivery-unreadable\`` and the store's
+ *     `[slack] channel-delivery:` lines subsection sit inside the
+ *     stored-choice file's section, and the subsection has a row for each
+ *     drop reason;
+ *   - the entry for a persona silent in a channel its app was invited to is
+ *     a heading exactly once;
+ *   - each passage that describes a destination as the `permission_prompts`
+ *     value (a file-local list, located by heading or table row) also names
+ *     `invited.permission_prompts` and its `"dm"` default (`DM_DESTINATION`,
+ *     quoted or bare as a log line renders it).
+ * Each check is a pure function of the skill's text and has a self-check
+ * that cuts its element from an in-memory copy and sees that element alone
+ * reported.
+ *
+ * The texts the debugging skill quotes from `src/` builders (the
+ * `set_channel_delivery` refusals and failed-write texts, the store's lines,
+ * the stored-choice `reload-record-write-failed` line, and the switch's and
+ * the recorded change's preview lines) are rendered by their builders with
+ * the skill's placeholders and must appear in the section that quotes them.
+ * Importing those builders makes this suite touch config, credentials and
+ * reload surfaces (tests/secrecy-audit.test.ts), so each rendered text goes
+ * through `assertNoLeak` before it is compared. Every same-file anchor and
+ * relative link in the skill resolves to a heading, or a file and its
+ * heading.
  *
  * b.av2 SR-12: the setup wizard's credentials script,
  * `scripts/write-credentials.sh` (which `claude-slack-channel-bots
@@ -84,14 +126,60 @@
 import { describe, test, expect } from 'bun:test'
 import { readFileSync, readdirSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import semver from 'semver'
-import { PERSONA_DIAGNOSTIC_CLASSES } from '../src/persona-diagnostics.ts'
-import { RELOAD_DIAGNOSTIC_CLASSES } from '../src/reload.ts'
+import {
+  FUNGIBLE_REFUSAL_TEXTS,
+  PERSONA_CHANNEL_DELIVERY_SET,
+  PERSONA_DESTINATION_FAILED,
+  PERSONA_DIAGNOSTIC_CLASSES,
+  PERSONA_INVITED_CHANNEL,
+  UNCLAIMED_CHANNEL,
+} from '../src/persona-diagnostics.ts'
+import { RELOAD_DIAGNOSTIC_CLASSES, RELOAD_RECORD_WRITE_FAILED, reloadChannelDeliveryWriteFailedLine } from '../src/reload.ts'
+import { modeSwitchLine, recordedLine, type RecordedSectionKey } from '../src/reload-plan.ts'
+import {
+  CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES,
+  CHANNEL_DELIVERY_DROP_REASONS,
+  CHANNEL_DELIVERY_DROP_RETIRED,
+  CHANNEL_DELIVERY_FILE_NAME,
+  CHANNEL_DELIVERY_LOG_PREFIX,
+  CHANNEL_DELIVERY_UNREADABLE,
+  CHANNEL_DELIVERY_UNREADABLE_READ,
+  SET_CHANNEL_DELIVERY_TOOL,
+  channelDeliveryDropAction,
+  channelDeliveryDropLine,
+  channelDeliverySetAction,
+  channelDeliveryUnreadableLine,
+  channelDeliveryWriteFailedLine,
+} from '../src/channel-delivery.ts'
+import {
+  channelDeliveryChannelRefusal,
+  channelDeliveryDeclarativeRefusal,
+  channelDeliveryNotStoredText,
+  channelDeliveryUnreadableRefusal,
+  channelDeliveryValueRefusal,
+  channelDeliveryWriteFailedText,
+  personaNotAppliedRefusal,
+  sessionNotMatchedRefusal,
+} from '../src/registry.ts'
+import { DECLARATIVE_DESTINATION_SETTING, FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
+import { DM_DESTINATION, type ChannelMode } from '../src/config.ts'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
 import { HostSafetyError, hostSafeChildEnv, resolveToolDir } from './test-helpers/host-safe-env.ts'
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import { assertNoLeak } from './test-helpers/credentials.ts'
+import {
+  classHeading,
+  flat,
+  headingAnchors,
+  headings,
+  requiredSection,
+  sectionRange,
+  splitFences,
+  type HeadingMatch,
+} from './test-helpers/markdown.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
 
@@ -464,6 +552,541 @@ describe('b.av2 SR-12: the debugging skill covers every reload diagnostic class'
       expect(skillHasClassHeading(label)).toBe(true)
     },
   )
+})
+
+describe("b.deo SRI-901: the debugging skill covers every class in the stored-choice store's closed list", () => {
+  // The store's own closed class list (src/channel-delivery.ts), kept apart
+  // from the persona and reload classes. Imported, never hand-copied; its
+  // exact content is pinned in tests/channel-delivery.test.ts.
+  test('CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES is non-empty, so the heading cases never pass on nothing', () => {
+    expect(CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES.length).toBeGreaterThan(0)
+  })
+
+  test.each([...CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES])(
+    'SRI-901: the skill has a heading for class %s',
+    (label) => {
+      expect(skillHasClassHeading(label)).toBe(true)
+    },
+  )
+})
+
+// ---------------------------------------------------------------------------
+// 3c. b.deo SRI-1108 — the debugging skill's fungible-mode content (AC 43)
+// ---------------------------------------------------------------------------
+
+let skillCache: string | undefined
+
+/** The debugging skill's text, read once, on first use inside a case. */
+function debugSkill(): string {
+  skillCache ??= readFileSync(resolve(REPO_ROOT, SKILL_REL), 'utf-8')
+  return skillCache
+}
+
+/**
+ * `text` with the body of the first section whose heading matches `match`
+ * (its heading line kept) replaced by `edit(body)`: an in-memory copy for a
+ * self-check. Throws when no heading matches.
+ */
+function editSection(text: string, match: HeadingMatch, edit: (body: string) => string): string {
+  const range = sectionRange(text, match)
+  if (range === undefined) throw new Error(`no heading ${String(match)} to edit`)
+  const lines = text.split('\n')
+  const body = lines.slice(range.start + 1, range.end).join('\n')
+  return [...lines.slice(0, range.start + 1), edit(body), ...lines.slice(range.end)].join('\n')
+}
+
+/** Whether the first heading matching `inner` lies inside the section the first heading matching `outer` opens. */
+function sitsInside(text: string, outer: HeadingMatch, inner: HeadingMatch): boolean {
+  const out = sectionRange(text, outer)
+  const at = sectionRange(text, inner)
+  return out !== undefined && at !== undefined && at.start > out.start && at.start < out.end
+}
+
+/** A Markdown table row's cells, trimmed (the leading and trailing pipes dropped). */
+function rowCells(row: string): string[] {
+  return row.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim())
+}
+
+/** Whether `line` is a table row (indented or not) whose first cell is `value` as a code span. */
+function isRowFor(line: string, value: string): boolean {
+  return line.trimStart().startsWith(`| \`${value}\` |`)
+}
+
+/** The first table row in `section` holding `has`; throws naming `where` when there is none. */
+function rowHolding(section: string, has: string, where: string): string {
+  const row = section.split('\n').find((line) => line.trimStart().startsWith('|') && line.includes(has))
+  if (row === undefined) throw new Error(`${where} has no table row holding "${has}"`)
+  return row
+}
+
+/** The classes SRI-1108 gives an entry each: the two persona classes this work adds and the store's class. */
+const SRI_1108_CLASSES = [PERSONA_INVITED_CHANNEL, PERSONA_CHANNEL_DELIVERY_SET, CHANNEL_DELIVERY_UNREADABLE] as const
+
+/** The parts SRI-1108 asks of each entry, each a bold-lead bullet (`- **Line:**`). */
+const ENTRY_PARTS = ['Line', 'Meaning', 'Cause', 'Fix'] as const
+
+/** A bullet whose bold lead is `part` (`- **Fix:**`), at the start of a line. */
+function partLead(part: string): RegExp {
+  return new RegExp(`^- \\*\\*${part}:\\*\\*`, 'm')
+}
+
+/**
+ * What the class `label`'s entry in `text` lacks: `the line` when it never
+ * quotes a `[slack] <label>:` line, and each part whose bold-lead bullet it
+ * has not.
+ */
+function entryProblems(text: string, label: string): string[] {
+  const entry = requiredSection(text, classHeading(label), SKILL_REL)
+  return [
+    ...(entry.includes(`[slack] ${label}:`) ? [] : ['the line']),
+    ...ENTRY_PARTS.filter((part) => !partLead(part).test(entry)),
+  ]
+}
+
+/** The bold leads that open `unclaimed-channel`'s two per-mode parts. */
+const DECLARATIVE_LEAD = '**Declarative mode**'
+const FUNGIBLE_LEAD = '**Fungible mode**'
+
+/**
+ * What `unclaimed-channel`'s entry in `text` lacks under SRI-1108: both
+ * per-mode parts; in the declarative part, a Fix that offers fungible mode as
+ * a second fix for a public or private channel that is not externally shared
+ * and never for a group DM; in the fungible part, the line, and for each
+ * fungible-mode reason (imported) a table row with a fix.
+ */
+function unclaimedProblems(text: string): string[] {
+  const lines = requiredSection(text, classHeading(UNCLAIMED_CHANNEL), SKILL_REL).split('\n')
+  const d = lines.findIndex((line) => line.startsWith(DECLARATIVE_LEAD))
+  const f = lines.findIndex((line) => line.startsWith(FUNGIBLE_LEAD))
+  const problems: string[] = []
+  if (d < 0) problems.push('no declarative-mode part')
+  if (f < 0) problems.push('no fungible-mode part')
+  if (problems.length > 0) return problems
+
+  const declarative = lines.slice(d, f > d ? f : undefined).join('\n')
+  const fix = declarative.search(partLead('Fix'))
+  if (fix < 0) {
+    problems.push('declarative: no Fix')
+  } else {
+    const fixText = flat(declarative.slice(fix))
+    if (!fixText.includes('fungible mode on')) problems.push('declarative Fix: no fungible mode as a second fix')
+    if (!fixText.includes('public or private channel that is not externally shared')) {
+      problems.push('declarative Fix: fungible mode not scoped to a public or private channel that is not externally shared')
+    }
+    if (!fixText.includes('never for a group DM')) problems.push('declarative Fix: no "never for a group DM"')
+  }
+
+  const fungible = lines.slice(f, d > f ? d : undefined).join('\n')
+  if (!partLead('Line').test(fungible) || !fungible.includes(`[slack] ${UNCLAIMED_CHANNEL}:`)) problems.push('fungible: no line')
+  for (const reason of Object.values(FUNGIBLE_REFUSAL_TEXTS)) {
+    const row = fungible.split('\n').find((line) => isRowFor(line, reason))
+    const cells = row === undefined ? [] : rowCells(row)
+    if (cells.length < 3 || cells[2] === '') problems.push(`fungible: no row with a fix for reason "${reason}"`)
+  }
+  return problems
+}
+
+/** The stored-choice file's section and the store's lines subsection, built from the store's exports. */
+const STORED_CHOICE_HEADING = `## The stored-choice file: \`${CHANNEL_DELIVERY_FILE_NAME}\``
+const STORE_LINES_HEADING = `### The store's \`${CHANNEL_DELIVERY_LOG_PREFIX}\` lines`
+
+/** What the store's lines subsection in `text` lacks: its place in the stored-choice section, and a row naming each drop reason (imported). */
+function storeLinesProblems(text: string): string[] {
+  const section = requiredSection(text, STORE_LINES_HEADING, SKILL_REL)
+  return [
+    ...(sitsInside(text, STORED_CHOICE_HEADING, STORE_LINES_HEADING) ? [] : ['not inside the stored-choice section']),
+    ...CHANNEL_DELIVERY_DROP_REASONS.filter(
+      (reason) => !section.split('\n').some((line) => isRowFor(line, reason)),
+    ).map((reason) => `no row for drop reason "${reason}"`),
+  ]
+}
+
+/** The silence entry's title (T18's heading, which the wizard and the triage point to). */
+const SILENCE_TITLE = 'A persona is silent in a channel its app was invited to'
+
+/** How many headings in `text`, at any level, carry the silence entry's title. */
+function silenceEntryCount(text: string): number {
+  return headings(text).filter((h) => h.title === SILENCE_TITLE).length
+}
+
+/** `DM_DESTINATION` as its own code span, quoted as a setting value (`"dm"`) or bare as a line renders it (`dm`). */
+const DM_SPAN = `\`"?${escapeRegExp(DM_DESTINATION)}"?\``
+
+/** The `"dm"` default stated beside `"dm"`: "default" or "absent" within one clause of the span, either side. */
+const DM_DEFAULT = new RegExp(`${DM_SPAN}.{0,80}\\b(?:default|absent)\\b|\\b(?:default|absent)\\b.{0,80}${DM_SPAN}`)
+
+/** What a destination passage lacks: the fungible destination setting, and its `"dm"` default (b.deo SRI-1108, SRI-702). */
+function destinationProblems(passage: string): string[] {
+  const text = flat(passage)
+  return [
+    ...(text.includes(FUNGIBLE_DESTINATION_SETTING) ? [] : [`names no ${FUNGIBLE_DESTINATION_SETTING}`]),
+    ...(DM_DEFAULT.test(text) ? [] : [`names no "${DM_DESTINATION}" default`]),
+  ]
+}
+
+/** Triage step `n` of the skill, from its `n. ` line to the next numbered step. */
+function triageStep(text: string, n: number): string {
+  const lines = requiredSection(text, '## Triage', SKILL_REL).split('\n')
+  const start = lines.findIndex((line) => line.startsWith(`${n}. `))
+  if (start < 0) throw new Error(`${SKILL_REL}, under "## Triage", has no step ${n}`)
+  const end = lines.findIndex((line, i) => i > start && /^\d+\. /.test(line))
+  return lines.slice(start, end < 0 ? undefined : end).join('\n')
+}
+
+/**
+ * Every passage that describes a persona's destination as its
+ * `permission_prompts` value, each located in the skill (T18's closing notes,
+ * report-deo-e1 (d)). Each must also give the fungible-mode wording:
+ * `invited.permission_prompts`, or `"dm"` when it is absent.
+ */
+const DESTINATION_PASSAGES: [string, (text: string) => string][] = [
+  ['Triage step 1', (text) => triageStep(text, 1)],
+  [`the \`${PERSONA_DESTINATION_FAILED}\` entry`, (text) => requiredSection(text, classHeading(PERSONA_DESTINATION_FAILED), SKILL_REL)],
+  ["\"A running persona's directory disappears later\"", (text) => requiredSection(text, "### A running persona's directory disappears later", SKILL_REL)],
+  [
+    `the "Other lines you may see" row for a "${DM_DESTINATION}" destination without DMs or a contact`,
+    (text) =>
+      rowHolding(
+        requiredSection(text, '## Other lines you may see', SKILL_REL),
+        `has ${DECLARATIVE_DESTINATION_SETTING} set to "${DM_DESTINATION}"`,
+        `${SKILL_REL}, under "## Other lines you may see",`,
+      ),
+  ],
+  ["\"A persona can't open a DM\"", (text) => requiredSection(text, /^## A persona can't open a DM\b/, SKILL_REL)],
+  ['"Two personas post lost-message notices about each other"', (text) => requiredSection(text, '### Two personas post lost-message notices about each other', SKILL_REL)],
+  [
+    "the silence entry's loop-guard row",
+    (text) => rowHolding(requiredSection(text, `## ${SILENCE_TITLE}`, SKILL_REL), '| **The loop guard**', `${SKILL_REL}, under "## ${SILENCE_TITLE}",`),
+  ],
+]
+
+describe('b.deo SRI-1108: the debugging skill describes fungible mode (AC 43)', () => {
+  describe('the three entries', () => {
+    test.each([...SRI_1108_CLASSES])('the entry for %s quotes its line and has its Line, Meaning, Cause and Fix', (label) => {
+      expect(entryProblems(debugSkill(), label)).toEqual([])
+    })
+
+    test.each(SRI_1108_CLASSES.flatMap((label) => ENTRY_PARTS.map((part) => [label, part] as const)))(
+      'self-check: the entry for %s with its %s lead cut fails on that part alone',
+      (label, part) => {
+        const cut = editSection(debugSkill(), classHeading(label), (body) => body.replace(partLead(part), `- ${part}:`))
+        expect(entryProblems(cut, label)).toEqual([part])
+      },
+    )
+
+    test.each([...SRI_1108_CLASSES])('self-check: the entry for %s with its line cut fails on the line alone', (label) => {
+      const cut = editSection(debugSkill(), classHeading(label), (body) => body.replaceAll(`[slack] ${label}:`, ''))
+      expect(entryProblems(cut, label)).toEqual(['the line'])
+    })
+  })
+
+  describe(`\`${UNCLAIMED_CHANNEL}\`, per mode`, () => {
+    test('both modes have their part; the declarative Fix offers fungible mode for a public or private channel that is not externally shared, never for a group DM; the fungible part has its line and a row with a fix for each reason', () => {
+      expect(unclaimedProblems(debugSkill())).toEqual([])
+    })
+
+    test('FUNGIBLE_REFUSAL_TEXTS is non-empty, so the reason rows are never checked over nothing', () => {
+      expect(Object.values(FUNGIBLE_REFUSAL_TEXTS).length).toBeGreaterThan(0)
+    })
+
+    /** An in-memory copy of the skill with `edit` applied to `unclaimed-channel`'s entry. */
+    const cutEntry = (edit: (body: string) => string) => editSection(debugSkill(), classHeading(UNCLAIMED_CHANNEL), edit)
+
+    test.each(Object.values(FUNGIBLE_REFUSAL_TEXTS))('self-check: the row for reason "%s" cut fails on that reason alone', (reason) => {
+      const cut = cutEntry((body) => body.split('\n').filter((line) => !isRowFor(line, reason)).join('\n'))
+      expect(unclaimedProblems(cut)).toEqual([`fungible: no row with a fix for reason "${reason}"`])
+    })
+
+    test.each(Object.values(FUNGIBLE_REFUSAL_TEXTS))('self-check: the fix of reason "%s" emptied fails on that reason alone', (reason) => {
+      const cut = cutEntry((body) =>
+        body
+          .split('\n')
+          .map((line) => (isRowFor(line, reason) ? `  | ${rowCells(line).slice(0, 2).join(' | ')} | |` : line))
+          .join('\n'),
+      )
+      expect(unclaimedProblems(cut)).toEqual([`fungible: no row with a fix for reason "${reason}"`])
+    })
+
+    test.each<[string, (body: string) => string, string[]]>([
+      ['the declarative-mode lead', (body) => body.replace(DECLARATIVE_LEAD, 'Declarative mode'), ['no declarative-mode part']],
+      ['the fungible-mode lead', (body) => body.replace(FUNGIBLE_LEAD, 'Fungible mode'), ['no fungible-mode part']],
+      [
+        "the declarative part's Fix lead",
+        (body) => body.replace(new RegExp(`(${DECLARATIVE_LEAD.replace(/\*/g, '\\*')}[\\s\\S]*?)- \\*\\*Fix:\\*\\*`), '$1- Fix:'),
+        ['declarative: no Fix'],
+      ],
+      ['fungible mode as the second fix', (body) => body.replaceAll('fungible mode on', 'it on'), ['declarative Fix: no fungible mode as a second fix']],
+      [
+        "the second fix's scope",
+        (body) => body.replaceAll('public or private channel that is not externally shared', 'channel'),
+        ['declarative Fix: fungible mode not scoped to a public or private channel that is not externally shared'],
+      ],
+      ['"never for a group DM"', (body) => body.replace(/never for\s+a\s+group\s+DM/, 'not a DM'), ['declarative Fix: no "never for a group DM"']],
+      ["the fungible part's line", (body) => body.replace(/^(\*\*Fungible mode\*\*[\s\S]*?)- \*\*Line:\*\*/m, '$1- Shown:'), ['fungible: no line']],
+    ])('self-check: %s cut fails on it alone', (_label, edit, expected) => {
+      expect(unclaimedProblems(cutEntry(edit))).toEqual(expected)
+    })
+  })
+
+  describe(`the stored-choice file: \`${CHANNEL_DELIVERY_UNREADABLE}\` and the store's lines`, () => {
+    test(`the \`${CHANNEL_DELIVERY_UNREADABLE}\` entry sits inside "${STORED_CHOICE_HEADING}"`, () => {
+      expect(sitsInside(debugSkill(), STORED_CHOICE_HEADING, classHeading(CHANNEL_DELIVERY_UNREADABLE))).toBe(true)
+    })
+
+    test(`self-check: the \`${CHANNEL_DELIVERY_UNREADABLE}\` entry moved under another section fails`, () => {
+      const heading = `### \`${CHANNEL_DELIVERY_UNREADABLE}\``
+      const moved = debugSkill().replace(heading, `## Elsewhere\n\n${heading}`)
+      expect(sitsInside(moved, STORED_CHOICE_HEADING, classHeading(CHANNEL_DELIVERY_UNREADABLE))).toBe(false)
+    })
+
+    test('CHANNEL_DELIVERY_DROP_REASONS is non-empty, so the drop-reason rows are never checked over nothing', () => {
+      expect(CHANNEL_DELIVERY_DROP_REASONS.length).toBeGreaterThan(0)
+    })
+
+    test(`"${STORE_LINES_HEADING}" sits inside the stored-choice section and has a row for each drop reason`, () => {
+      expect(storeLinesProblems(debugSkill())).toEqual([])
+    })
+
+    test.each([...CHANNEL_DELIVERY_DROP_REASONS])('self-check: the row for drop reason "%s" cut fails on that reason alone', (reason) => {
+      const cut = editSection(debugSkill(), STORE_LINES_HEADING, (body) =>
+        body.split('\n').filter((line) => !isRowFor(line, reason)).join('\n'),
+      )
+      expect(storeLinesProblems(cut)).toEqual([`no row for drop reason "${reason}"`])
+    })
+
+    test("self-check: the store's lines subsection moved under another section fails on its place alone", () => {
+      const moved = debugSkill().replace(STORE_LINES_HEADING, `## Elsewhere\n\n${STORE_LINES_HEADING}`)
+      expect(storeLinesProblems(moved)).toEqual(['not inside the stored-choice section'])
+    })
+  })
+
+  describe('the silence entry', () => {
+    test(`"${SILENCE_TITLE}" is a heading exactly once`, () => {
+      expect(silenceEntryCount(debugSkill())).toBe(1)
+    })
+
+    test('self-check: with its heading cut the count is 0, and with it repeated the count is 2', () => {
+      const heading = `## ${SILENCE_TITLE}`
+      expect(silenceEntryCount(debugSkill().replace(heading, '## A persona is quiet'))).toBe(0)
+      expect(silenceEntryCount(`${debugSkill()}\n\n${heading}\n`)).toBe(2)
+    })
+  })
+
+  describe(`each destination passage gives the fungible-mode wording: ${FUNGIBLE_DESTINATION_SETTING}, or "${DM_DESTINATION}" when it is absent`, () => {
+    test.each(DESTINATION_PASSAGES)('%s', (_label, passageOf) => {
+      expect(destinationProblems(passageOf(debugSkill()))).toEqual([])
+    })
+
+    test.each(DESTINATION_PASSAGES)(`self-check: %s with ${FUNGIBLE_DESTINATION_SETTING} cut fails on it alone`, (_label, passageOf) => {
+      expect(destinationProblems(passageOf(debugSkill()).replaceAll(FUNGIBLE_DESTINATION_SETTING, ''))).toEqual([
+        `names no ${FUNGIBLE_DESTINATION_SETTING}`,
+      ])
+    })
+
+    test.each(DESTINATION_PASSAGES)(`self-check: %s with its "${DM_DESTINATION}" default cut fails on it alone`, (_label, passageOf) => {
+      expect(destinationProblems(passageOf(debugSkill()).replace(/\b(?:default|absent)\b/g, ''))).toEqual([
+        `names no "${DM_DESTINATION}" default`,
+      ])
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 3d. The debugging skill's quoted texts are its builders' renderings
+// ---------------------------------------------------------------------------
+
+/** The placeholders the skill writes in its quoted texts. */
+const NAME = '<name>'
+const KEY = '<key>'
+const PATH = '<path>'
+
+/** Sample values a builder needs in a checked shape, each swapped for its placeholder after rendering. */
+const SAMPLE_KEY = 'ops_bot'
+const SAMPLE_CHANNEL = 'C0123456789'
+const SAMPLE_VALUE = 'often'
+
+/** The text after the persona reference (`"<name>" (key=<key>): `) of a rendered tool error. */
+function afterRef(rendered: string): string {
+  const ref = `(key=${KEY}): `
+  return rendered.slice(rendered.indexOf(ref) + ref.length)
+}
+
+/** A recorded change's preview line for `fields`, with its fields and its section's mode as the skill's placeholders. */
+function recordedTemplate(fields: RecordedSectionKey[], mode: ChannelMode): string {
+  return recordedLine({ name: NAME, key: KEY, fields })
+    .replace(`: ${fields.join(', ')} changed`, ': <fields> changed')
+    .replace(`the ${mode} section`, 'the <declarative or fungible> section')
+    .replace(`selects ${mode} mode`, 'selects <declarative or fungible> mode')
+}
+
+/** The switch's preview line turning `mode` on for one persona, with the mode and the further personas as the skill's placeholders. */
+function modeSwitchTemplate(mode: ChannelMode): string {
+  return modeSwitchLine(mode, [{ name: NAME, key: KEY }])
+    .replace(`turns ${mode} mode on`, 'turns <fungible or declarative> mode on')
+    .replace(/\.$/, ', ….')
+}
+
+/**
+ * Each text the debugging skill quotes from a `src/` builder, rendered by the
+ * builder with the skill's placeholders, and the section that quotes it: the
+ * `set_channel_delivery` refusals and failed-write texts (b.deo SRI-502,
+ * SRI-503, SRI-506), the store's lines (SRI-904, SRI-905), the stored-choice
+ * `reload-record-write-failed` line (SRI-408), and the switch's and the
+ * recorded change's preview lines (SRI-803, SRI-804). Rendered when a case
+ * runs, never at collection.
+ */
+const QUOTED_TEXTS: [label: string, where: HeadingMatch, render: () => string][] = [
+  ['the session-not-matched refusal', classHeading(PERSONA_CHANNEL_DELIVERY_SET), () => sessionNotMatchedRefusal(SET_CHANNEL_DELIVERY_TOOL)],
+  ['the not-an-applied-persona refusal', classHeading(PERSONA_CHANNEL_DELIVERY_SET), () => personaNotAppliedRefusal(SET_CHANNEL_DELIVERY_TOOL, KEY)],
+  ['the declarative-mode refusal', classHeading(PERSONA_CHANNEL_DELIVERY_SET), () => channelDeliveryDeclarativeRefusal(NAME, KEY)],
+  ['the unreadable-store refusal', classHeading(PERSONA_CHANNEL_DELIVERY_SET), () => channelDeliveryUnreadableRefusal(NAME, KEY, PATH)],
+  ['the unreadable-store refusal, in its own entry', classHeading(CHANNEL_DELIVERY_UNREADABLE), () => channelDeliveryUnreadableRefusal(NAME, KEY, PATH)],
+  [
+    'the bad-value refusal naming the value',
+    classHeading(PERSONA_CHANNEL_DELIVERY_SET),
+    () => channelDeliveryValueRefusal(NAME, KEY, SAMPLE_VALUE).replace(JSON.stringify(SAMPLE_VALUE), '"<value>"'),
+  ],
+  ['the bad-value refusal not showing the value', classHeading(PERSONA_CHANNEL_DELIVERY_SET), () => `… ${afterRef(channelDeliveryValueRefusal(NAME, KEY, 42))}`],
+  [
+    'the unknown-channel refusal naming the channel',
+    classHeading(PERSONA_CHANNEL_DELIVERY_SET),
+    () => channelDeliveryChannelRefusal(NAME, KEY, SAMPLE_CHANNEL).replace(JSON.stringify(SAMPLE_CHANNEL), '"<channel>"'),
+  ],
+  [
+    'the unknown-channel refusal not showing the channel, up to its reason',
+    classHeading(PERSONA_CHANNEL_DELIVERY_SET),
+    () => {
+      const tail = afterRef(channelDeliveryChannelRefusal(NAME, KEY, 42))
+      return `… ${tail.slice(0, tail.indexOf('): ') + 3)}…`
+    },
+  ],
+  ['the failed-write tool error', classHeading(PERSONA_CHANNEL_DELIVERY_SET), () => channelDeliveryWriteFailedText(NAME, KEY, PATH)],
+  ['the failed-write tool error, under the store\'s lines', STORE_LINES_HEADING, () => channelDeliveryWriteFailedText(NAME, KEY, PATH)],
+  [
+    'the not-stored tool error',
+    classHeading(PERSONA_CHANNEL_DELIVERY_SET),
+    () => channelDeliveryNotStoredText(NAME, KEY, 'set_at').replace('its set_at)', 'its <field>)'),
+  ],
+  [
+    `the ${CHANNEL_DELIVERY_UNREADABLE} line`,
+    classHeading(CHANNEL_DELIVERY_UNREADABLE),
+    () =>
+      channelDeliveryUnreadableLine(PATH, { stage: CHANNEL_DELIVERY_UNREADABLE_READ, code: undefined }).replace(
+        `${JSON.stringify(PATH)} could not be read.`,
+        `${JSON.stringify(PATH)} <what>.`,
+      ),
+  ],
+  [
+    "the store's drop line",
+    STORE_LINES_HEADING,
+    () =>
+      channelDeliveryDropLine(SAMPLE_KEY, 2, CHANNEL_DELIVERY_DROP_RETIRED)
+        .replace(`persona=${SAMPLE_KEY}`, `persona=${KEY}`)
+        .replace('in 2 channels', 'in <n> channels')
+        .replace(CHANNEL_DELIVERY_DROP_RETIRED, '<reason>'),
+  ],
+  [
+    "the store's failed-write line for a stored choice",
+    STORE_LINES_HEADING,
+    () =>
+      channelDeliveryWriteFailedLine(PATH, channelDeliverySetAction(SAMPLE_KEY, SAMPLE_CHANNEL), '', false)
+        .replace(`persona=${SAMPLE_KEY}`, `persona=${KEY}`)
+        .replace(`channel ${SAMPLE_CHANNEL}`, 'channel <id>')
+        .replace(`${JSON.stringify(PATH)};`, `${JSON.stringify(PATH)}<detail>;`),
+  ],
+  [
+    "the store's failed-write line for a drop",
+    STORE_LINES_HEADING,
+    () =>
+      channelDeliveryWriteFailedLine(PATH, channelDeliveryDropAction([SAMPLE_KEY]), '', true)
+        .replace(`persona=${SAMPLE_KEY}`, `persona=${KEY}`)
+        .replace(`${JSON.stringify(PATH)};`, `${JSON.stringify(PATH)}<detail>;`),
+  ],
+  [
+    `the stored-choice ${RELOAD_RECORD_WRITE_FAILED} line`,
+    classHeading(RELOAD_RECORD_WRITE_FAILED),
+    () => reloadChannelDeliveryWriteFailedLine(PATH, '<record path>'),
+  ],
+  ['the recorded line for the declarative section', '### Pending changes', () => recordedTemplate(['channels', 'permission_prompts'], 'declarative')],
+  ['the recorded line for the fungible section', '### Pending changes', () => recordedTemplate(['invited'], 'fungible')],
+  ["the switch's line turning fungible mode on", '### Pending changes', () => modeSwitchTemplate('fungible')],
+  ["the switch's line turning declarative mode on", '### Pending changes', () => modeSwitchTemplate('declarative')],
+  [
+    "the switch line's ending with no persona affected",
+    '### Pending changes',
+    () => {
+      const line = modeSwitchLine('fungible', [])
+      return `\`${line.slice(line.lastIndexOf('; '))}\``
+    },
+  ],
+]
+
+/** Whether `section` quotes `text`, compared with whitespace runs collapsed so a wrapped quote still counts. */
+function quotes(section: string, text: string): boolean {
+  return flat(section).includes(flat(text))
+}
+
+describe("the debugging skill's quoted texts are their builders' renderings (b.deo SRI-1108)", () => {
+  test.each(QUOTED_TEXTS)('%s', (label, where, render) => {
+    const rendered = render()
+    assertNoLeak(rendered, label)
+    expect(rendered).not.toContain('\n')
+    expect(quotes(requiredSection(debugSkill(), where, SKILL_REL), rendered)).toBe(true)
+  })
+
+  test.each(QUOTED_TEXTS)('self-check: %s cut from its section is no longer found', (_label, where, render) => {
+    const section = flat(requiredSection(debugSkill(), where, SKILL_REL))
+    expect(quotes(section.replaceAll(flat(render()), ''), render())).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 3e. The debugging skill's own links resolve
+// ---------------------------------------------------------------------------
+
+/** Every inline link target in the prose of `text` (fenced blocks skipped), as written. */
+function linkTargets(text: string): string[] {
+  return [...splitFences(text).prose.matchAll(/\]\(([^)\s]+)\)/g)].map((m) => m[1])
+}
+
+/**
+ * Every link in `text` (the skill's text) that resolves nowhere: a same-file
+ * anchor that is no heading's anchor in `text`, or a relative path (from the
+ * skill's directory) to no file, or with an anchor that is no heading's
+ * anchor in that file. Links with a scheme (`https:`) are not followed.
+ */
+function brokenSkillLinks(text: string): { checked: number; broken: string[] } {
+  const own = headingAnchors(text)
+  const anchorsOf = new Map<string, string[]>()
+  const targets = linkTargets(text).filter((target) => !/^[a-z][a-z0-9+.-]*:/i.test(target))
+  const broken = targets.filter((target) => {
+    const hash = target.indexOf('#')
+    const path = hash < 0 ? target : target.slice(0, hash)
+    const anchor = hash < 0 ? '' : target.slice(hash + 1)
+    if (path === '') return !own.includes(anchor)
+    const file = resolve(REPO_ROOT, dirname(SKILL_REL), path)
+    if (!existsSync(file)) return true
+    if (anchor === '') return false
+    if (!anchorsOf.has(file)) anchorsOf.set(file, headingAnchors(readFileSync(file, 'utf-8')))
+    return !anchorsOf.get(file)!.includes(anchor)
+  })
+  return { checked: targets.length, broken }
+}
+
+describe("the debugging skill's links resolve", () => {
+  test('every same-file anchor names a skill heading, and every relative link an existing file and, with an anchor, one of its headings', () => {
+    const { checked, broken } = brokenSkillLinks(debugSkill())
+    expect(broken).toEqual([])
+    expect(checked).toBeGreaterThan(0)
+  })
+
+  test.each([
+    ['a same-file anchor with no heading', '[gone](#no-such-heading-in-the-skill)', '#no-such-heading-in-the-skill'],
+    ['a relative link to no file', '[gone](../../NO_SUCH_FILE.md)', '../../NO_SUCH_FILE.md'],
+    ['a README link to no heading', '[gone](../../README.md#no-such-heading-in-the-readme)', '../../README.md#no-such-heading-in-the-readme'],
+  ])('self-check: %s added to a copy is reported', (_label, link, target) => {
+    expect(brokenSkillLinks(`${debugSkill()}\n\nSee ${link}.\n`).broken).toEqual([target])
+  })
 })
 
 // ---------------------------------------------------------------------------
