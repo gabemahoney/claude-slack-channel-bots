@@ -12,11 +12,11 @@ This release adds a second channel mode, fungible mode, beside the declarative m
 
 The top-level setting `allow_invited_channels` picks the channel mode for every persona at once. See [Channel modes](README.md#channel-modes) and [What each mode serves](README.md#what-each-mode-serves).
 
-- **Declarative mode** (`allow_invited_channels` absent or `false`, the default) is the behaviour of 0.11.1: each persona serves only the channels listed in its `channels`, each at its `delivery`.
+- **Declarative mode** (`allow_invited_channels` absent or `false`, the default) serves channels as 0.11.1 does: each persona serves only the channels listed in its `channels`, each at its `delivery`.
 - **Fungible mode** (`allow_invited_channels: true`):
   - `channels` and the top-level `permission_prompts` are not read;
   - each persona serves every public or private channel its Slack app is a member of that Slack does not mark as externally shared;
-  - a channel is served at `mentions` unless the persona's agent stored `all` for it with `set_channel_delivery` (see [Channel delivery in fungible mode](README.md#channel-delivery-in-fungible-mode));
+  - a channel is served at `mentions` by default, and at `all` only when the persona's agent stored `all` for it with `set_channel_delivery` (see [Channel delivery in fungible mode](README.md#channel-delivery-in-fungible-mode));
   - each stored choice persists in `channel-delivery.json` in the state directory, beside `config.json`;
   - the persona's permission prompts and notices go to its `invited.permission_prompts`, `"dm"` when it is absent (see [Permission prompts in fungible mode](README.md#permission-prompts-in-fungible-mode));
   - Slack enforces channel membership for the persona's outbound calls.
@@ -34,9 +34,11 @@ The top-level setting `allow_invited_channels` picks the channel mode for every 
 - **One session instructions text** serves both modes.
 - **Tool targets per mode, and Slack's refusals as tool errors,** are described in [Tools](README.md#tools), with its note on the permission prompt the new tool can raise.
 
-### Downgrading from this release
+### Downgrading to an earlier release
 
-The README's [Downgrading to an earlier release](README.md#downgrading-to-an-earlier-release) is the maintained text. An earlier release's loader rejects `allow_invited_channels` and `invited` as unknown keys, and a restarted server runs the last-applied record, so the record must not hold either key when the older build starts. A host whose `config.json` has never held either key downgrades as from any release: install the older build and restart the server on it. Otherwise, follow these steps in order, with the server running:
+The README section [Downgrading to an earlier release](README.md#downgrading-to-an-earlier-release) is the maintained copy of this runbook; this copy carries the same steps and words.
+
+An earlier release's loader rejects `allow_invited_channels` and `invited` as unknown keys, and a restarted server runs the last-applied record, so the record must not hold either key when the older build starts. A host whose `config.json` has never held either key downgrades as from any release: install the older build and restart the server on it. Otherwise, follow these steps in order, with the server running:
 
 1. **Give every persona a valid declarative section.** Turning fungible mode off is checked by the declarative rules, so each persona needs a `permission_prompts`, and `channels` unless its `dm.enabled` is `true`, that pass them (see [Load-time rules](README.md#load-time-rules)).
 2. **Remove `allow_invited_channels` and every persona's `invited` from `config.json`.**

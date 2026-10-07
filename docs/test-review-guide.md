@@ -121,7 +121,7 @@ For every script whose `TEST_NAME` carries `-fmk-` (b.jg5 SRJ-1401, SRJ-1306; se
 
 ### Conciseness
 - [ ] 3+ tests with the same structure and different inputs use `test.each`
-- [ ] No meta-tests — tests of factories, stubs, or other test infrastructure add no value; real tests validate them. `tests/integration/test-0-fmk-harness-self-check.sh` is not one: it is the `/ci` check of the fmk harness that the Epic requires, run in the container before every fmk scenario, not a unit meta-test
+- [ ] No meta-tests — tests of factories, stubs, or other test infrastructure add no value; real tests validate them. `tests/integration/test-0-fmk-harness-self-check.sh` is not one: it is the `/ci` check of the fmk harness that the Epic requires, run in the container before every fmk scenario, not a unit meta-test. Two kinds of helper test are kept as well: a shared helper's isolation and refusal contract (the refused homes and temp directories, the bytes it writes), as in the stored-choice helper's contract in `tests/channel-delivery.test.ts` and the retired-key helper's in `tests/retired-keys.test.ts`, and a builder's parity with the production loader, as in the fungible parity case in `tests/config.test.ts`
 - [ ] No constants wrapping simple domain strings (`const STATUS_OPEN = 'open'`) — inline them
 - [ ] Tests assert behavior (outputs, state, captured calls), not implementation (which internal function was called, with what encoding)
 - [ ] No gold-plating — 80/20 rule; redundant permutations of an already-covered behavior should be removed
