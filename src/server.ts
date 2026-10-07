@@ -735,6 +735,18 @@ const sessionToolDeps: SessionToolDeps = {
   // The channel mode of the configuration in effect, read at each tool call
   // (b.deo SRI-201, SRI-601).
   getChannelMode: () => channelModeOf(personaConfig),
+  // b.av2 SR-5.1 beside b.deo SRI-502: set_channel_delivery's inputs, each
+  // read at call time. The one stored-choice store, through the holder main()
+  // sets (undefined before then, so the call is refused and nothing is
+  // written); the routing's heard set; the applied personas of the
+  // configuration in effect, for the loop guard. The routing is built further
+  // down, so it is named only inside the arrow.
+  getChannelDelivery: () => channelDeliveryStore,
+  heardChannels: (key) => personaRouting.heardChannels(key),
+  getAppliedPersonas: () => personaConfig?.personas ?? [],
+  // b.deo SRI-505, SRI-901: the persona-channel-delivery-set line goes to the
+  // [slack] stream, as the routing's persona lines do.
+  log: (line) => console.error(line),
 }
 
 // ---------------------------------------------------------------------------
@@ -1155,6 +1167,11 @@ const personaRouting = createPersonaRouting({
   // module is still loading.
   notify: (key, text, options) => personaNotifier.notify(key, text, options),
   log: (line) => console.error(line),
+  // b.av2 SR-4.2 beside b.deo SRI-305, SRI-403: the stored choices and their
+  // readability, read at each fungible-mode event through the holder main()
+  // sets, which the session tools and the reload controller read too. Before
+  // main() loads the store it is undefined, so no stored choice applies.
+  getChannelDelivery: () => channelDeliveryStore,
   // A lost message for a persona that is not up restarts nothing (b.av2 SR-6.4).
   isPersonaUp,
   // b.jg5 SRJ-1011: the lost-message state inputs, each read at call time.
@@ -1264,8 +1281,10 @@ let reloadController: ReloadController | undefined
  * The one stored-choice store (`channel-delivery.ts`; b.deo SRI-401,
  * SRI-403): set once by main(), which loads it after the start resolves its
  * configuration and before the start bring-up pass, and read at call time by
- * the reload controller's `channelDelivery` accessor. Undefined before main()
- * loads it (nothing is read at import).
+ * the routing's `getChannelDelivery`, the session tools' `getChannelDelivery`
+ * (b.deo SRI-305, SRI-502) and the reload controller's `channelDelivery`
+ * accessor. Undefined before main() loads it (nothing is read at import):
+ * the routing then applies no stored choice and the tool refuses.
  */
 let channelDeliveryStore: ChannelDeliveryStore | undefined
 

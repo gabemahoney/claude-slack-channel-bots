@@ -72,6 +72,7 @@
 
 import type { WebClient } from '@slack/web-api'
 import { DM_DESTINATION, channelModeOf, type Persona, type ServerSettings } from './config.ts'
+import type { PersonaFungibleDestination } from './delivery-decision.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
 
@@ -299,6 +300,22 @@ export function destinationSettingFrom(
  */
 function loadedModeOf(persona: PersonaDestinationFields): DestinationConfig {
   return { allow_invited_channels: persona.fungible_destination !== undefined }
+}
+
+/**
+ * The loop guard's input (b.deo SRI-305, SRI-504): each of `personas` (the
+ * applied personas of the configuration in effect) with its destination by
+ * the one destination rule over `config`, in their order. The one builder of
+ * that input: the routing passes it to the delivery decision at each
+ * fungible-mode event, and `set_channel_delivery` passes it to
+ * `channelDeliveryFor` for its result and line, so both read the same
+ * destinations. Pure.
+ */
+export function fungibleDestinationsOf(
+  config: DestinationConfig,
+  personas: readonly (PersonaDestinationFields & Pick<Persona, 'key'>)[],
+): PersonaFungibleDestination[] {
+  return personas.map((p) => ({ key: p.key, destination: personaDestinationOf(config, p) }))
 }
 
 /**

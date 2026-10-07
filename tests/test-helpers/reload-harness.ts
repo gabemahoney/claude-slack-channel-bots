@@ -1,5 +1,6 @@
 /**
- * test-helpers/reload-harness.ts — The shared reload harness (b.av2 SR-13.4):
+ * test-helpers/reload-harness.ts — The shared reload harness (b.av2 SR-13.4,
+ * b.deo SRI-1203):
  * the reload controller (`src/reload.ts`) over a temp configuration directory,
  * a manual tick driver, a lifecycle recorder and the real bring-up checks.
  *
@@ -237,11 +238,24 @@
  *   drivers (b.av2 SR-13.1): `run.registerSession(name)` registers the
  *   persona's MCP session in the real registry (`run.session(name)` is it
  *   now, compared by identity to show it was kept); `run.deliver(name,
- *   event)` delivers an event on its socket stub, and `run.deliveries(name)`
- *   is what reached its session (`chat_id`, `via`, `content`);
- *   `run.notice(name, text)` raises a notice through the notifier (its Slack
- *   calls are on `run.stub(name).callLog`); `run.callTool(name, tool,
- *   args)` calls an MCP tool as its instance over `createSessionServer`.
+ *   event, envelope?)` delivers an event on its socket stub, with
+ *   `envelope`'s overrides passed to the stub unchanged (b.deo SRI-1203,
+ *   e.g. an `is_ext_shared_channel` form; none gives `false`), and
+ *   `run.deliveries(name)` is what reached its session (`chat_id`, `via`,
+ *   `content`); `run.notice(name, text)` raises a notice through the
+ *   notifier (its Slack calls are on `run.stub(name).callLog`);
+ *   `run.callTool(name, tool, args, session?)` calls an MCP tool as its
+ *   instance over `createSessionServer`, through its registered session
+ *   now, or through `session`, an entry kept from `run.session(name)`, even
+ *   after the registry dropped or replaced it (b.deo SRI-502, SRI-1203).
+ *   The routing and the tool deps are bound as server.ts binds them (b.deo
+ *   SRI-1203): the routing reads the run's stored-choice store (below) at
+ *   each event; the tools read, at each call, the channel mode of
+ *   `run.serverConfig()`, that same store, the routing's heard set and the
+ *   applied personas, so `set_channel_delivery` runs as in production, its
+ *   `persona-channel-delivery-set` line in `run.logs` in every run. The
+ *   notifier's destination resolver reads the switch from
+ *   `run.serverConfig()` at each attempt, as server.ts's does.
  *   Deliver only to a persona with a registered session (a lost message
  *   would reach the restart module, which the harness does not set up).
  *   The routing and the MCP tools get the server-wide reply settings
@@ -340,7 +354,13 @@
  *   an accessor with `main()`'s guard (it throws when an apply runs before
  *   the load), so a confirmed apply's step 1 writes unwritten drops before a
  *   bring-up, drops the retired keys' choices and marks the retiring keys
- *   through it (b.deo SRI-406, SRI-408, SRI-502). `run.channelDelivery` is
+ *   through it (b.deo SRI-406, SRI-408, SRI-502). The routing's
+ *   `getChannelDelivery` and the session tools' `getChannelDelivery` read
+ *   the same store at call time (b.deo SRI-305, SRI-502, SRI-1203), so a
+ *   choice it holds reaches the routing's decision and a
+ *   `set_channel_delivery` call writes through it; before the load, and
+ *   after a refused start, both read none (no stored choice applies; the
+ *   tool refuses). `run.channelDelivery` is
  *   the store; reading it before the start resolved to an applied
  *   configuration throws. Its lines go to `run.logs` and its times come from
  *   `run.clock`. Its writes take the run's writer path, so they are in
@@ -625,6 +645,7 @@ import {
   type ChannelDeliveryStore,
 } from '../../src/channel-delivery.ts'
 import {
+  channelModeOf,
   DM_DESTINATION,
   MAX_RELOAD_FILE_BYTES,
   replySettingsOf,
@@ -838,6 +859,7 @@ import { makeSessionServer, makeTransport, type ChannelNotification } from './pe
 import { REPLY_GUARD_DIR_NAME } from './reply-guard-record.ts'
 import {
   INITIAL_CREDENTIALS,
+  type EnvelopeOverrides,
   type SlackEvent,
   type StubSlack,
   type StubSlackFactory,
@@ -1120,8 +1142,10 @@ export interface LifecycleTimelineEntry {
  * (`stopLiveRowSequence`: the session manager's `stopLiveRowSequence` with
  * the teardown reason, as `main()` binds it, b.jg5 SRJ-706, SRJ-715), with
  * the real launch path the run's retry timers' stop (`stopRetryTimer`) and
- * the session manager's `forgetOldLifeWaits` (b.jg5 SRJ-811, SRJ-715), and a
- * recording stand-in for every other dependency.
+ * the session manager's `forgetOldLifeWaits` (b.jg5 SRJ-811, SRJ-715), the
+ * run's routing's `forget` (`routing.forget`, recorded and forwarded, as
+ * `server.ts` binds it, so a torn-down key's heard set is dropped; b.deo
+ * SRI-307), and a recording stand-in for every other dependency.
  */
 export interface RealLifecycleComposition {
   /** The composition the recorder's `teardown`, `updateInPlace`, `reconnectCredentials` and `bringUp` call. */
@@ -1884,8 +1908,15 @@ export interface ReloadRun {
   session(name: string): SessionEntry | undefined
   /** Every message the routing delivered to the persona's registered sessions, in order. */
   deliveries(name: string): ReloadDelivery[]
-  /** Deliver `event` on the persona's current socket stub (`run.stub(name).socket.deliver`), through the event router and the routing. */
-  deliver(name: string, event: SlackEvent): Promise<void>
+  /**
+   * Deliver `event` on the persona's current socket stub
+   * (`run.stub(name).socket.deliver`), through the event router and the
+   * routing (b.av2 SR-13.1, b.deo SRI-1203). `envelope` is passed to the
+   * stub unchanged: its overrides of the envelope's fields (for example
+   * `is_ext_shared_channel`, an `ENVELOPE_FLAG_FORMS` entry); with none the
+   * envelope carries `is_ext_shared_channel: false`.
+   */
+  deliver(name: string, event: SlackEvent, envelope?: EnvelopeOverrides): Promise<void>
   /** Raise a notice for the persona through the real notifier, as a notice site does; read the Slack calls on `run.stub(name).callLog`. */
   notice(name: string, text: string): Promise<void>
   /**
@@ -1899,10 +1930,23 @@ export interface ReloadRun {
    * Call MCP tool `tool` with `args` as the persona's instance: an in-memory
    * MCP client over `createSessionServer` for its registered session (the
    * real tool handlers, whose posting scope reads the applied persona at
-   * each call), with the run's client lookup. Needs `run.registerSession`
-   * first. No file may be sent (the file guard refuses every path).
+   * each call), with the run's tool deps as server.ts binds them (b.deo
+   * SRI-1203): the client lookup, the channel mode of `run.serverConfig()`,
+   * the run's stored-choice store (`set_channel_delivery` writes through it,
+   * so `h.failChannelDeliveryWrites` fails its write), the routing's heard
+   * set and the applied personas, each read at call time; its
+   * `persona-channel-delivery-set` line goes to `run.logs` in every run.
+   * Needs `run.registerSession` first. No file may be sent (the file guard
+   * refuses every path).
+   *
+   * `session` (b.deo SRI-502): an entry kept from `run.session(name)`; the
+   * call goes through a client over that entry, even after the registry
+   * dropped it or a newer registration replaced it, so the tool resolves
+   * the session it was given. Without it the call goes through the
+   * persona's registered session now. Throws when the entry is matched to
+   * another key. One client per entry, closed by `run.stop()`.
    */
-  callTool(name: string, tool: string, args: Record<string, unknown>): Promise<ReloadToolResult>
+  callTool(name: string, tool: string, args: Record<string, unknown>, session?: SessionEntry): Promise<ReloadToolResult>
   /** Every configuration the controller's `onApplied` was told, in order (one per confirmed apply's step 1). */
   readonly appliedConfigs: readonly PersonaConfig[]
   /** The persona keys of the controller's applied configuration now, in order; undefined before the start applied. */
@@ -2696,7 +2740,15 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       const res = await client.users.info({ user: userId })
       return res.user?.profile?.display_name || userId
     }
-    const noticeStack = makeNotifierStack({ getPersona: getAppliedPersona, clientFor, log, isDryRun: () => dryRun })
+    // As server.ts wires its destination resolver (b.deo SRI-201, SRI-701):
+    // the switch is read from the configuration in effect at each attempt.
+    const noticeStack = makeNotifierStack({
+      getPersona: getAppliedPersona,
+      clientFor,
+      log,
+      isDryRun: () => dryRun,
+      getPersonaConfig: appliedConfig,
+    })
     // As main() builds them (b.jg5 SRJ-1016, SRJ-501, SRJ-508): the run's one
     // set of notice episodes, on the run's fake clock, posting through the
     // run's notifier (each post also recorded in `episodeNotices`), and the
@@ -2736,6 +2788,13 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       notify: (key, text, options) => noticeStack.notifier.notify(key, text, options),
       log,
       dedupeClock: () => connections.clock.now(),
+      // As server.ts wires it (b.av2 SR-4.2 beside b.deo SRI-305, SRI-403,
+      // SRI-1203): the stored choices and their readability, read at each
+      // fungible-mode event from the run's one stored-choice store (the one
+      // `run.channelDelivery` exposes). The holder, not that getter: before
+      // the start loads the store, and after a refused start, it is
+      // undefined, so no stored choice applies and nothing throws.
+      getChannelDelivery: () => channelDeliveryStore,
       // As server.ts wires it: a lost message for a persona that is not up restarts nothing.
       isPersonaUp,
     })
@@ -2990,7 +3049,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
             return connections.manager.replaceRetryTokens(key, tokens)
           },
         },
-        routing: { forget: rec('routing.forget') },
+        // The run's routing's per-key forget, as server.ts binds it, so a
+        // torn-down key's dedupe store and heard set are dropped (b.av2
+        // SR-6.5, b.deo SRI-307).
+        routing: { forget: rec('routing.forget', (key) => routing.forget(key)) },
         // The real tracker's per-key forget, as server.ts binds it, so a key
         // added again starts with no ack-reaction entry.
         forgetAcks: rec('forgetAcks', (key) => forgetPersonaAcks(key)),
@@ -3546,6 +3608,21 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       resolveUserName,
       consumeAck,
       serverPort: 0,
+      // As server.ts binds them (b.deo SRI-201, SRI-502, SRI-1203), each read
+      // at call time over the run's own objects: the channel mode of the
+      // configuration in effect; the run's one stored-choice store (its
+      // holder, undefined before the start loads it, so the tool refuses and
+      // writes nothing; no second store is built, so its writes take the
+      // run's writer path and `h.failChannelDeliveryWrites`); the routing's
+      // heard set; and the applied personas of the configuration in effect.
+      // The tool's `persona-channel-delivery-set` line goes to `run.logs` in
+      // every run (server.ts sends it to `console.error`, the `[slack]`
+      // stream; b.deo SRI-505).
+      getChannelMode: () => channelModeOf(serverConfig()),
+      getChannelDelivery: () => channelDeliveryStore,
+      heardChannels: (key) => routing.heardChannels(key),
+      getAppliedPersonas: () => serverConfig()?.personas ?? [],
+      log,
     }
 
     function registerRunSession(name: string): SessionEntry {
@@ -3560,9 +3637,20 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       return registerSession(cwd, key, makeTransport(`mcp-${key}-${++sessionSeq}`), makeSessionServer(captured))
     }
 
-    async function toolClientFor(name: string): Promise<Client> {
-      const entry = getSessionByPersona(personaKey(name))
+    /**
+     * The tool client over `session` when given (an entry kept from
+     * `run.session(name)`, whether or not the registry holds it now), else
+     * over the persona's registered session now. One client per entry.
+     */
+    async function toolClientFor(name: string, session?: SessionEntry): Promise<Client> {
+      const key = personaKey(name)
+      const entry = session ?? getSessionByPersona(key)
       if (entry === undefined) throw new Error(`reload-harness: no session registered for ${JSON.stringify(name)}`)
+      if (entry.personaKey !== key) {
+        throw new Error(
+          `reload-harness: the session given for ${JSON.stringify(name)} is matched to key ${JSON.stringify(entry.personaKey)}`,
+        )
+      }
       let client = toolClients.get(entry)
       if (client === undefined) {
         const server = createSessionServer(entry, toolDeps)
@@ -3628,14 +3716,14 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           via: n.params.meta['via'],
           content: n.params.content,
         })),
-      async deliver(name, event) {
+      async deliver(name, event, envelope) {
         registryTouched = true
-        await run.stub(name).socket.deliver(event)
+        await run.stub(name).socket.deliver(event, envelope)
       },
       notice: (name, text) => Promise.resolve(noticeStack.notifier.notify(personaKey(name), text)),
       noticeClock: noticeStack.clock,
-      async callTool(name, tool, args) {
-        const client = await toolClientFor(name)
+      async callTool(name, tool, args, session) {
+        const client = await toolClientFor(name, session)
         const result = (await client.callTool({ name: tool, arguments: args })) as {
           isError?: boolean
           content: Array<{ type: string; text?: string }>

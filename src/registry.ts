@@ -19,7 +19,9 @@
  * its roots are matched, and its entry stub is promoted in place so the tool
  * handlers that closed over it read the persona key it is promoted under.
  *
- * Tool scope (b.av2 SR-5.1, b.deo SRI-601; b.av2 SR-3.1): the tools keep
+ * Tool scope (b.av2 SR-5.1, b.deo SRI-501, SRI-601; b.av2 SR-3.1): every
+ * session lists six tools in both modes. The five Slack tools (`reply`,
+ * `react`, `edit_message`, `fetch_messages`, `download_attachment`) keep
  * their names and inputs. Each call resolves the calling session's persona,
  * the channel mode and that persona's Slack client at call time, and posts as
  * the persona with no username or icon override. While its `dm.enabled` is on,
@@ -31,9 +33,19 @@
  * persona, the channel and Slack's error code (b.deo SRI-602,
  * `slackRefusalToolErrorText`).
  *
+ * The sixth tool, `set_channel_delivery` (b.deo SRI-501 to SRI-507), has no
+ * Slack target and makes no Slack call, in or out of dry run. It stores the
+ * persona's channel delivery (`mentions` or `all`) for one channel it heard
+ * in fungible mode, or already holds a choice for, in the one stored-choice
+ * store (`src/channel-delivery.ts`), and the choice applies from the next
+ * event under the loop guard. It resolves the persona at call time as the
+ * other tools do, also refusing a retiring key and a session that is not the
+ * one the registry holds for its key (b.deo SRI-502), then checks SRI-503's rules in
+ * order; in declarative mode every call is refused.
+ *
  * Instructions: `MCP_INSTRUCTIONS` is exported as the exact string every
- * session server sends as its MCP `instructions`, so the shipped-docs audit
- * reads what instances receive.
+ * session server sends as its MCP `instructions`, in both modes (b.deo
+ * SRI-604), so the shipped-docs audit reads what instances receive.
  *
  * Importing this module has no side effects.
  *
@@ -50,19 +62,35 @@ import type { WebClient } from '@slack/web-api'
 import { writeFileSync } from 'fs'
 import { join, resolve } from 'path'
 import {
+  CHANNEL_DELIVERY_FILE_NAME,
+  CHANNEL_DELIVERY_SET_STORED,
+  CHANNEL_DELIVERY_SET_UNREADABLE,
+  CHANNEL_DELIVERY_SET_WRITE_FAILED,
+  channelDeliveryDeclarationOf,
+  SET_CHANNEL_DELIVERY_TOOL,
+  type ChannelDeliverySetInvalidField,
+  type ChannelDeliveryStore,
+} from './channel-delivery.ts'
+import {
   CHANNEL_ID_RE,
   DM_CONTACT_RE,
+  ECHOABLE_KEY_NAME_RE,
   MCP_SERVER_NAME,
   resolveRealPath,
   type ChannelMode,
+  type DeliveryMode,
   type Persona,
   type ReplySettings,
 } from './config.ts'
+import { channelDeliveryFor, type ChannelDeliveryResult } from './delivery-decision.ts'
 import { chunkText, sanitizeFilename } from './lib.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, renderLogMessageText, slackPlatformReason } from './persona-connection-errors.ts'
-import { DM_OPEN_SCOPE, MISSING_SCOPE_ERROR } from './persona-destination.ts'
+import { DM_OPEN_SCOPE, MISSING_SCOPE_ERROR, fungibleDestinationsOf } from './persona-destination.ts'
+import { channelDeliverySetCause, formatPersonaDiagnostic, PERSONA_CHANNEL_DELIVERY_SET } from './persona-diagnostics.ts'
 import { isDryRun } from './tokens.ts'
+
+export { SET_CHANNEL_DELIVERY_TOOL }
 // Peer-PID + sessions.json registry have been deleted (SR-7.1). The
 // agent-director library owns session state.
 
@@ -649,7 +677,44 @@ export interface SessionToolDeps {
    * configuration). Absent: declarative mode.
    */
   getChannelMode?: () => ChannelMode
+  /**
+   * The one stored-choice store `main()` loads (b.deo SRI-403, SRI-502),
+   * read at each `set_channel_delivery` call (production: the server's
+   * module-scope holder). Undefined while no store is bound (before `main()`
+   * loads it): the call is refused and nothing is written. Absent: the same.
+   */
+  getChannelDelivery?(): SessionChannelDeliveryStore | undefined
+  /**
+   * A read-only view of persona `key`'s heard set (b.deo SRI-307, SRI-503),
+   * read at each `set_channel_delivery` call (production: the one routing's
+   * `heardChannels`). Absent: the heard set is empty.
+   */
+  heardChannels?(key: string): ReadonlySet<string>
+  /**
+   * The applied personas of the configuration in effect (b.deo SRI-305,
+   * SRI-504), read at each `set_channel_delivery` call for the loop guard's
+   * input. Absent: only the calling persona.
+   */
+  getAppliedPersonas?(): readonly Persona[]
+  /**
+   * Receives the `persona-channel-delivery-set` line of each accepted
+   * `set_channel_delivery` call (b.deo SRI-505, SRI-901): the `[slack]`
+   * stream of `server.log`, as the routing's `log` receives
+   * `persona-invited-channel` (production: `console.error`). Absent:
+   * `console.error`.
+   */
+  log?: (line: string) => void
 }
+
+/**
+ * What `set_channel_delivery` uses of the stored-choice store (b.deo
+ * SRI-502 to SRI-506): its path, readability, lookups, the retiring keys and
+ * the one write of a choice. `ChannelDeliveryStore` satisfies it as it is.
+ */
+export type SessionChannelDeliveryStore = Pick<
+  ChannelDeliveryStore,
+  'path' | 'readable' | 'storedChoice' | 'storedChannels' | 'set' | 'isRetiring'
+>
 
 // ---------------------------------------------------------------------------
 // Posting scope (b.av2 SR-5.1, b.deo SRI-601)
@@ -798,6 +863,226 @@ export function slackRefusalToolErrorText(
 }
 
 // ---------------------------------------------------------------------------
+// Resolution refusals (b.av2 SR-5.1, b.deo SRI-502)
+// ---------------------------------------------------------------------------
+
+/**
+ * The tool error for a call from a session matched to no persona (b.av2
+ * SR-5.1, b.deo SRI-502), the same for every tool:
+ *
+ *   Tool "<tool>" refused: this session is not matched to a persona.
+ *
+ * Pure.
+ */
+export function sessionNotMatchedRefusal(tool: string): string {
+  return `Tool "${tool}" refused: this session is not matched to a persona.`
+}
+
+/**
+ * The tool error for a call whose persona key is not an applied persona's
+ * (b.av2 SR-5.1, b.deo SRI-502), the same for every tool. `set_channel_delivery`
+ * also gives it for a retiring key and for a session that is not the one the
+ * registry holds for its key:
+ *
+ *   Tool "<tool>" refused: persona key=<key> is not an applied persona.
+ *
+ * Pure.
+ */
+export function personaNotAppliedRefusal(tool: string, key: string): string {
+  return `Tool "${tool}" refused: persona key=${key} is not an applied persona.`
+}
+
+// ---------------------------------------------------------------------------
+// set_channel_delivery (b.deo SRI-501 to SRI-507)
+// ---------------------------------------------------------------------------
+
+/**
+ * The tool's description (b.deo SRI-501): it sets how closely the persona
+ * listens in one channel its Slack app was invited to, between @mentions and
+ * broadcasts only (`mentions`) and every message (`all`); it is called when
+ * someone in that channel asks for it; it works only when the operator has
+ * turned invited channels on.
+ */
+export const SET_CHANNEL_DELIVERY_DESCRIPTION =
+  "Set how closely your persona listens in one channel its Slack app was invited to: mentions (only @mentions of you and @here or @channel broadcasts) or all (every message). " +
+  'Call it when someone in that channel asks for it. ' +
+  'It works only when the operator has turned invited channels on; otherwise every call is refused. ' +
+  'The choice applies from the next message in that channel and is kept across server restarts.'
+
+/** The description of the tool's `channel` input (b.deo SRI-501). */
+export const SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION =
+  'The channel ID (C... or G...) of a channel your persona has heard a message from, or already holds a choice for'
+
+/** The description of the tool's `delivery` input (b.deo SRI-501). */
+export const SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION =
+  '"mentions" (only @mentions of you and @here or @channel broadcasts) or "all" (every message in the channel)'
+
+/** The values the tool's `delivery` input takes, in the order its schema lists them (b.deo SRI-501). */
+const SET_CHANNEL_DELIVERY_VALUES: readonly DeliveryMode[] = ['mentions', 'all']
+
+/** Whether `value` is a value the tool's `delivery` input takes: `"mentions"` or `"all"`. */
+function isChannelDeliveryValue(value: unknown): value is DeliveryMode {
+  return typeof value === 'string' && (SET_CHANNEL_DELIVERY_VALUES as readonly string[]).includes(value)
+}
+
+/**
+ * A channel value a `set_channel_delivery` error may echo (b.deo SRI-503):
+ * a string of 1 to 24 characters from `A-Z0-9`. Any other value is not shown.
+ */
+export const ECHOABLE_CHANNEL_RE = /^[A-Z0-9]{1,24}$/
+
+/**
+ * The tool's refusals (b.deo SRI-503), in the order a call is checked; the
+ * first rule a call breaks gives its tool error:
+ * - `declarative-mode`: the configuration in effect is in declarative mode
+ *   (`channelDeliveryDeclarativeRefusal`);
+ * - `store-unreadable`: the stored-choice file was unreadable at start, or no
+ *   store is bound (`channelDeliveryUnreadableRefusal`);
+ * - `delivery-invalid`: `delivery` is not `"mentions"` or `"all"`, a missing
+ *   value included (`channelDeliveryValueRefusal`);
+ * - `channel-unknown`: the channel is neither in the persona's heard set nor
+ *   among its stored choices (`channelDeliveryChannelRefusal`).
+ * Every one is checked after the resolution refusals (b.deo SRI-502).
+ */
+export const SET_CHANNEL_DELIVERY_REFUSALS = [
+  'declarative-mode',
+  'store-unreadable',
+  'delivery-invalid',
+  'channel-unknown',
+] as const
+
+/** One of `SET_CHANNEL_DELIVERY_REFUSALS`. */
+export type SetChannelDeliveryRefusal = (typeof SET_CHANNEL_DELIVERY_REFUSALS)[number]
+
+/** The lead every `set_channel_delivery` refusal shares: the tool and the persona (`renderPersonaRef`). */
+function channelDeliveryRefusalLead(name: string, key: string): string {
+  return `Tool "${SET_CHANNEL_DELIVERY_TOOL}" refused for persona ${renderPersonaRef(name, key)}`
+}
+
+/**
+ * Rule 1's tool error (b.deo SRI-503): declarative mode.
+ *
+ *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): invited channels are off, and in declarative mode channel delivery is set by the operator in config.json.
+ *
+ * Pure.
+ */
+export function channelDeliveryDeclarativeRefusal(name: string, key: string): string {
+  return (
+    `${channelDeliveryRefusalLead(name, key)}: invited channels are off, and in declarative mode ` +
+    'channel delivery is set by the operator in config.json.'
+  )
+}
+
+/**
+ * Rule 2's tool error (b.deo SRI-503): the stored-choice file is unreadable,
+ * or no store is bound. `path` is the store's path, or
+ * `CHANNEL_DELIVERY_FILE_NAME` when no store is bound.
+ *
+ *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the stored-choice file "<path>" is not readable, so no channel delivery can be stored. To fix: the operator moves the file aside, then restarts the server.
+ *
+ * Pure.
+ */
+export function channelDeliveryUnreadableRefusal(name: string, key: string, path: string): string {
+  return (
+    `${channelDeliveryRefusalLead(name, key)}: the stored-choice file ${JSON.stringify(path)} is not readable, ` +
+    'so no channel delivery can be stored. To fix: the operator moves the file aside, then restarts the server.'
+  )
+}
+
+/**
+ * Rule 3's tool error (b.deo SRI-503): `delivery` is not `"mentions"` or
+ * `"all"`. The value is named, JSON-encoded, only when it is a string
+ * matching `ECHOABLE_KEY_NAME_RE` (`src/config.ts`); otherwise the error
+ * says it is not shown.
+ *
+ *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): delivery "<value>" is not "mentions" or "all".
+ *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): delivery is not "mentions" or "all" (the value given is not shown).
+ *
+ * Pure.
+ */
+export function channelDeliveryValueRefusal(name: string, key: string, value: unknown): string {
+  const allowed = SET_CHANNEL_DELIVERY_VALUES.map((v) => JSON.stringify(v)).join(' or ')
+  const lead = channelDeliveryRefusalLead(name, key)
+  return typeof value === 'string' && ECHOABLE_KEY_NAME_RE.test(value)
+    ? `${lead}: delivery ${JSON.stringify(value)} is not ${allowed}.`
+    : `${lead}: delivery is not ${allowed} (the value given is not shown).`
+}
+
+/**
+ * Rule 4's tool error (b.deo SRI-503): the channel is not known, neither in
+ * the persona's heard set nor among its stored choices. The channel is
+ * named, JSON-encoded, only when it matches `ECHOABLE_CHANNEL_RE`; otherwise
+ * the error says it is not shown.
+ *
+ *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): channel "<channel>" is not known: it is not a channel this persona has heard a message from in fungible mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.
+ *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the channel is not known (the value given is not shown): it is not a channel this persona has heard a message from in fungible mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.
+ *
+ * Pure.
+ */
+export function channelDeliveryChannelRefusal(name: string, key: string, channel: unknown): string {
+  const what = typeof channel === 'string' && ECHOABLE_CHANNEL_RE.test(channel)
+    ? `channel ${JSON.stringify(channel)} is not known`
+    : 'the channel is not known (the value given is not shown)'
+  return (
+    `${channelDeliveryRefusalLead(name, key)}: ${what}: it is not a channel this persona has heard a message from ` +
+    'in fungible mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.'
+  )
+}
+
+/**
+ * The result of an accepted call (b.deo SRI-504): the channel, the stored
+ * choice, and the persona's channel delivery there from the next event,
+ * `result` (`channelDeliveryFor` with the choice just stored). When the loop
+ * guard holds the channel at `mentions`, it says so and that the channel is
+ * another persona's fungible destination.
+ *
+ *   Stored <stored> as your channel delivery for channel <channel>. From the next message in that channel, your channel delivery there is <delivery>.
+ *   Stored <stored> as your channel delivery for channel <channel>. From the next message in that channel, your channel delivery there is mentions: the channel is another persona's fungible destination, where its permission prompts and notices go, so the loop guard holds it at mentions whatever is stored.
+ *
+ * Pure.
+ */
+export function channelDeliverySetResultText(channel: string, stored: DeliveryMode, result: ChannelDeliveryResult): string {
+  const lead = `Stored ${stored} as your channel delivery for channel ${channel}. ` +
+    `From the next message in that channel, your channel delivery there is ${result.delivery}`
+  return result.heldByLoopGuard
+    ? `${lead}: the channel is another persona's fungible destination, where its permission prompts and notices go, ` +
+      `so the loop guard holds it at ${result.delivery} whatever is stored.`
+    : `${lead}.`
+}
+
+/**
+ * The tool error of a failed write (b.deo SRI-404, SRI-506): names the
+ * persona and the file. Memory is unchanged; the store logs its own
+ * `[slack] channel-delivery:` line.
+ *
+ *   Tool "set_channel_delivery" failed for persona "<name>" (key=<key>): the stored-choice file "<path>" could not be written, so the choice was not stored and channel delivery is unchanged.
+ *
+ * Pure.
+ */
+export function channelDeliveryWriteFailedText(name: string, key: string, path: string): string {
+  return (
+    `Tool "${SET_CHANNEL_DELIVERY_TOOL}" failed for persona ${renderPersonaRef(name, key)}: the stored-choice file ` +
+    `${JSON.stringify(path)} could not be written, so the choice was not stored and channel delivery is unchanged.`
+  )
+}
+
+/**
+ * The tool error when the store refuses an input it would not write (its
+ * `invalid` answer, such as a clock that gives no timestamp): nothing is
+ * written and memory is unchanged.
+ *
+ *   Tool "set_channel_delivery" failed for persona "<name>" (key=<key>): the choice was not stored (the store refused its <field>), so channel delivery is unchanged.
+ *
+ * Pure.
+ */
+export function channelDeliveryNotStoredText(name: string, key: string, field: ChannelDeliverySetInvalidField): string {
+  return (
+    `Tool "${SET_CHANNEL_DELIVERY_TOOL}" failed for persona ${renderPersonaRef(name, key)}: the choice was not stored ` +
+    `(the store refused its ${field}), so channel delivery is unchanged.`
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Attachment downloads — where the persona's bot token may go
 // ---------------------------------------------------------------------------
 
@@ -901,7 +1186,11 @@ export const MCP_INSTRUCTIONS = [
   'A message without via is an injected prompt (a scheduled prompt or an /interject message). It needs no reply unless it asks for one.',
   'If the tag has attachment_count, call download_attachment(chat_id, message_id) to fetch them.',
   'Reply with the reply tool — pass chat_id back. Use thread_ts to reply in a thread.',
-  'Where you may act: any channel your persona is configured into, which covers the chat_id of every channel message you receive.',
+  'Where you may act: every channel message you receive comes from a channel you may act in. ' +
+    'With invited channels off, those are the channels your persona is configured into. ' +
+    'With invited channels on, they are any channel your persona\'s Slack app is a member of, and Slack refuses the others.',
+  `${SET_CHANNEL_DELIVERY_TOOL} sets how closely you listen in a channel: mentions (only @mentions of you and @here or @channel broadcasts) or all (every message). ` +
+    'Call it when someone in that channel asks for it. It works only with invited channels on.',
   'When your persona\'s DMs are on, you may also reply in a DM conversation you are part of (a D... chat_id), ' +
     'and use react, edit_message, fetch_messages and download_attachment there. ' +
     'To start a DM, pass a user ID (U... or W...) as reply\'s chat_id: the server opens the conversation, ' +
@@ -1037,6 +1326,22 @@ export function createSessionServer(
             },
           },
           required: ['chat_id', 'message_id'],
+        },
+      },
+      {
+        name: SET_CHANNEL_DELIVERY_TOOL,
+        description: SET_CHANNEL_DELIVERY_DESCRIPTION,
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            channel: { type: 'string', description: SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION },
+            delivery: {
+              type: 'string',
+              enum: [...SET_CHANNEL_DELIVERY_VALUES],
+              description: SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION,
+            },
+          },
+          required: ['channel', 'delivery'],
         },
       },
     ],
@@ -1392,18 +1697,101 @@ export function createSessionServer(
     }
   }
 
+  // -------------------------------------------------------------------------
+  // set_channel_delivery (b.deo SRI-501 to SRI-507; resolution as b.av2
+  // SR-5.1 and SR-6.5 as amended by b.jg5 SRJ-1507, beside b.deo SRI-307 and
+  // SRI-502)
+  //
+  // One synchronous stretch from reading the entry's persona key to the
+  // store's write, with no await, so no confirmed apply's step 1 comes
+  // between the persona resolved and the declaration stored (b.deo SRI-502).
+  // Resolution first: a session matched to no persona, a key that is not an
+  // applied persona's, a retiring key (the store's `isRetiring`), and a
+  // session entry that is not the one the registry holds for its key (dropped
+  // by `dropPersonaSession` or replaced by a newer registration) each get the
+  // other tools' refusal. Then SRI-503's rules, in order. A refused call
+  // stores, writes and logs nothing. An accepted call makes one store write
+  // and logs one `persona-channel-delivery-set` line after it. The tool never
+  // passes `checkPersonaTarget`, never reads a client and never makes a Slack
+  // call; dry run is not consulted, so it stores as outside dry run (b.deo
+  // SRI-507).
+  // -------------------------------------------------------------------------
+
+  function setChannelDelivery(name: string, args: Record<string, unknown>) {
+    const key = entry.personaKey
+    if (!key) return toolError(sessionNotMatchedRefusal(name))
+    const persona = getPersona(key)
+    if (!persona) return toolError(personaNotAppliedRefusal(name, key))
+    const store = deps.getChannelDelivery?.()
+    if (store?.isRetiring(key) === true) return toolError(personaNotAppliedRefusal(name, key))
+    if (getSessionByPersona(key) !== entry) return toolError(personaNotAppliedRefusal(name, key))
+
+    // b.deo SRI-503's rules, in order; the first broken gives the error.
+    const mode: ChannelMode = deps.getChannelMode?.() ?? 'declarative'
+    if (mode !== 'fungible') return toolError(channelDeliveryDeclarativeRefusal(persona.name, key))
+    if (store === undefined || !store.readable) {
+      return toolError(channelDeliveryUnreadableRefusal(persona.name, key, store?.path ?? CHANNEL_DELIVERY_FILE_NAME))
+    }
+    const delivery = args['delivery']
+    if (!isChannelDeliveryValue(delivery)) return toolError(channelDeliveryValueRefusal(persona.name, key, delivery))
+    const channel = args['channel']
+    const known = typeof channel === 'string' && channel !== '' &&
+      ((deps.heardChannels?.(key).has(channel) ?? false) || store.storedChannels(key).includes(channel))
+    if (!known) return toolError(channelDeliveryChannelRefusal(persona.name, key, channel))
+
+    // b.deo SRI-504: one write, with P's declaration from the configuration in effect.
+    const outcome = store.set(key, channel, delivery, channelDeliveryDeclarationOf(persona))
+    switch (outcome.kind) {
+      case CHANNEL_DELIVERY_SET_STORED:
+        break
+      case CHANNEL_DELIVERY_SET_WRITE_FAILED:
+        // b.deo SRI-506: the store logged its own failed-write line; memory is unchanged.
+        return toolError(channelDeliveryWriteFailedText(persona.name, key, outcome.path))
+      case CHANNEL_DELIVERY_SET_UNREADABLE:
+        return toolError(channelDeliveryUnreadableRefusal(persona.name, key, outcome.path))
+      default:
+        return toolError(channelDeliveryNotStoredText(persona.name, key, outcome.field))
+    }
+
+    // P's channel delivery there from the next event (b.deo SRI-305, SRI-504):
+    // the one loop guard over the applied personas' destinations, built as the
+    // routing builds them, with the choice just stored. Rule 1 passed, so the
+    // mode read above is fungible, and the destination rule is given that
+    // switch.
+    const applied = deps.getAppliedPersonas?.() ?? [persona]
+    const result = channelDeliveryFor(key, channel, {
+      fungibleDestinations: fungibleDestinationsOf({ allow_invited_channels: true }, applied),
+      storedChoices: store,
+    })
+    // b.deo SRI-505, SRI-901, SRI-902: one line per accepted call, after the
+    // write, to the `[slack]` stream only.
+    const log = deps.log ?? ((line: string) => console.error(line))
+    log(formatPersonaDiagnostic({
+      class: PERSONA_CHANNEL_DELIVERY_SET,
+      name: persona.name,
+      key,
+      index: persona.index,
+      cause: channelDeliverySetCause(channel, outcome.previous, delivery, result.delivery),
+    }))
+    return { content: [{ type: 'text', text: channelDeliverySetResultText(channel, delivery, result) }] }
+  }
+
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name } = request.params
     const args = (request.params.arguments || {}) as Record<string, any>
+
+    // set_channel_delivery has no Slack target, so it never reaches the
+    // target lookup, the scope check or the dry-run branch (b.deo SRI-502).
+    if (name === SET_CHANNEL_DELIVERY_TOOL) return setChannelDelivery(name, args)
 
     const toolTarget = Object.hasOwn(TOOL_TARGET, name) ? TOOL_TARGET[name] : undefined
     if (!toolTarget) return toolError(`Unknown tool: ${name}`)
 
     // The calling instance's persona, resolved now (not at session creation).
     const key = entry.personaKey
-    if (!key) return toolError(`Tool "${name}" refused: this session is not matched to a persona.`)
+    if (!key) return toolError(sessionNotMatchedRefusal(name))
     const persona = getPersona(key)
-    if (!persona) return toolError(`Tool "${name}" refused: persona key=${key} is not an applied persona.`)
+    if (!persona) return toolError(personaNotAppliedRefusal(name, key))
     // The channel mode, read now with the persona (b.deo SRI-201, SRI-601).
     const mode: ChannelMode = deps.getChannelMode?.() ?? 'declarative'
 
