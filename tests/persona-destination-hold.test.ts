@@ -115,6 +115,8 @@ let stubs: Map<string, StubSlack>
 let clients: Map<string, DestinationSlackClient>
 /** `getPersona`: a missing key is a persona no longer applied. */
 let applied: Map<string, Persona>
+/** The configuration in effect, which the resolver reads at each attempt. */
+let inEffect: DestinationConfig
 let logs: string[]
 /** Each notice failure callback call, less the raw thrown value. */
 let failures: { notice: string; step: string; code: string; first: boolean; held: boolean }[]
@@ -141,6 +143,7 @@ beforeEach(() => {
   stubs = new Map(config.personas.map((p) => [p.key, makeStubSlack({ leakMarker: LEAK_SENTINEL })]))
   clients = new Map(config.personas.map((p) => [p.key, asWebClient(stubs.get(p.key)!.web)]))
   applied = new Map(config.personas.map((p) => [p.key, p]))
+  inEffect = config
   logs = []
   failures = []
   clock = createFakeClock()
@@ -152,7 +155,7 @@ beforeEach(() => {
   const log = (line: string): void => {
     logs.push(line)
   }
-  const real = createPersonaDestinations({ log, getPersonaConfig: () => config })
+  const real = createPersonaDestinations({ log, getPersonaConfig: () => inEffect })
   const destinations: PersonaDestinations = {
     post: (persona, c, message) => {
       if (resolverThrows > 0) {
@@ -1131,6 +1134,8 @@ describe('fungible mode: a destination channel the app is not in is held and ret
       dir,
       { allow_invited_channels: true },
     )
+    // The configuration in effect is the fungible one, so the resolver reads the fungible section.
+    inEffect = config
     F = config.personas[0]!
     stubs.set(F.key, makeStubSlack({ leakMarker: LEAK_SENTINEL }))
     clients.set(F.key, asWebClient(stubs.get(F.key)!.web))

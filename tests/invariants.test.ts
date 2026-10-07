@@ -192,12 +192,7 @@ const PLACEMENT: readonly PlacementRow[] = [
     fields: AUDITED_FIELDS,
   },
   { file: 'persona-routing.ts', part: "the decision's input", regions: [{ argsOf: 'decideDelivery' }], fields: AUDITED_FIELDS },
-  {
-    file: 'persona-destination.ts',
-    part: 'the one destination rule',
-    regions: [{ fn: ONE_DESTINATION_RULE }],
-    fields: ['channels', 'permission_prompts', 'invited', 'sections'],
-  },
+  { file: 'persona-destination.ts', part: 'the one destination rule', regions: [{ fn: ONE_DESTINATION_RULE }], fields: AUDITED_FIELDS },
 ]
 
 /**

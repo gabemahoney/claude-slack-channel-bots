@@ -2830,10 +2830,10 @@ describe('tool list and instructions', () => {
 })
 
 // b.av2 SR-12; b.deo SRI-604: one instructions text for every session, in
-// both channel modes. Key phrases only, each within one line, and the tool
-// named through SET_CHANNEL_DELIVERY_TOOL. The DM text is the DM cases'
-// above; the tool list, the clear-latch check and the content audits are
-// elsewhere.
+// both channel modes, so its elements are checked once, on that text. Key
+// phrases only, each within one line, and the tool named through
+// SET_CHANNEL_DELIVERY_TOOL. The DM text is the DM cases' above; the tool
+// list, the clear-latch check and the content audits are elsewhere.
 describe('session instructions in both channel modes (b.av2 SR-12; b.deo SRI-604)', () => {
   /** `text` matched literally inside a pattern. */
   const literal = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -2856,25 +2856,12 @@ describe('session instructions in both channel modes (b.av2 SR-12; b.deo SRI-604
     expect(fungible).toBe(declarative!)
   })
 
-  test.each<ChannelMode>(['fungible', 'declarative'])(
-    '%s mode: the instructions say where the persona may act, with invited channels off and on',
-    async (mode) => {
-      const instructions = (await instructionsIn(mode)) ?? ''
-
-      expect(instructions).toMatch(/every channel message you receive comes from a channel you may act in/)
-      expect(instructions).toMatch(/invited channels off[^\n]*the channels your persona is configured into/)
-      expect(instructions).toMatch(/invited channels on[^\n]*any channel your persona's Slack app is a member of[^\n]*Slack refuses the others/)
-    },
-  )
-
-  test.each<ChannelMode>(['fungible', 'declarative'])(
-    '%s mode: the instructions say the channel-delivery tool sets how closely the persona listens in a channel, called when someone there asks',
-    async (mode) => {
-      const instructions = (await instructionsIn(mode)) ?? ''
-
-      expect(instructions).toMatch(
-        new RegExp(`${literal(SET_CHANNEL_DELIVERY_TOOL)} sets how closely you listen in a channel[^\\n]*when someone in that channel asks`),
-      )
-    },
-  )
+  test('the text says where the persona may act, with invited channels off and on, and that the channel-delivery tool sets how closely the persona listens in a channel, called when someone there asks', () => {
+    expect(MCP_INSTRUCTIONS).toMatch(/every channel message you receive comes from a channel you may act in/)
+    expect(MCP_INSTRUCTIONS).toMatch(/invited channels off[^\n]*the channels your persona is configured into/)
+    expect(MCP_INSTRUCTIONS).toMatch(/invited channels on[^\n]*any channel your persona's Slack app is a member of[^\n]*Slack refuses the others/)
+    expect(MCP_INSTRUCTIONS).toMatch(
+      new RegExp(`${literal(SET_CHANNEL_DELIVERY_TOOL)} sets how closely you listen in a channel[^\\n]*when someone in that channel asks`),
+    )
+  })
 })

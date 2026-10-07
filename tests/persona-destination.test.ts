@@ -8,8 +8,7 @@
  * its fungible destination (`invited.permission_prompts`, `dm` when absent)
  * in fungible mode; the section not in force is ignored, and the resolver
  * reads the configuration in effect and the applied persona again at each
- * attempt, through its injected configuration or, with none injected, the
- * mode the persona was loaded under. In fungible mode the resolver posts to
+ * attempt. In fungible mode the resolver posts to
  * a channel destination, or opens the DM with `dm.contact` on the persona's
  * own client for a `dm` one (b.deo SRI-702). `destinationSettingOf` is
  * pinned here for each mode, the one pin of the setting names in this work;
@@ -727,10 +726,6 @@ const FUNG_CHANNEL = 'C0FUNG001'
 const RULE_CONTACT = 'U0RULE001'
 const DMS_ON = { enabled: true, contact: RULE_CONTACT }
 
-/** How a resolver learns the mode: injected configuration, or the mode the persona was loaded under. */
-type ResolverPath = 'injected configuration' | 'loaded mode'
-const RESOLVER_PATHS: ResolverPath[] = ['injected configuration', 'loaded mode']
-
 /**
  * The one mode-rule persona, resolved from `spec` as `makeMultiPersonaConfig`
  * resolves it in `mode` (as the loader does, except that a spec field of the
@@ -745,18 +740,15 @@ function personaIn(mode: DestinationConfig, spec: PersonaSpec): Persona {
 }
 
 /**
- * A resolver whose lines go to `sink` and to the suite's leak check: over
- * `getConfig` read at each call, or, on the loaded-mode path, with none
- * injected.
+ * A resolver over the configuration in effect `getConfig`, read at each call,
+ * whose lines go to `sink` and to the suite's leak check.
  */
-function resolverOn(path: ResolverPath, getConfig: () => DestinationConfig, sink: string[] = []): PersonaDestinations {
+function resolverOn(getConfig: () => DestinationConfig, sink: string[] = []): PersonaDestinations {
   const log = (line: string): void => {
     sink.push(line)
     logs.push(line)
   }
-  return path === 'injected configuration'
-    ? createPersonaDestinations({ log, getPersonaConfig: getConfig })
-    : createPersonaDestinations({ log })
+  return createPersonaDestinations({ log, getPersonaConfig: getConfig })
 }
 
 describe('destinationSettingOf: the setting in force, pinned per mode (b.deo SRI-906)', () => {
@@ -774,11 +766,6 @@ interface RuleRow {
   mode: DestinationConfig
   spec: PersonaSpec
   destination: string
-  /**
-   * The persona is in a form the loader gives (no field of the section not in
-   * force set by spec), so the loaded-mode resolver path resolves it too.
-   */
-  loaded: boolean
 }
 
 const DECL_CHANNELS = [{ id: DECL_CHANNEL, delivery: 'all' as const }]
@@ -786,27 +773,27 @@ const DECL_CHANNELS = [{ id: DECL_CHANNEL, delivery: 'all' as const }]
 const RULE_ROWS: [string, RuleRow][] = [
   [
     'declarative mode, permission_prompts "dm": dm',
-    { mode: DECLARATIVE_MODE, spec: { channels: [], dm: DMS_ON, permission_prompts: DM_DESTINATION }, destination: DM_DESTINATION, loaded: true },
+    { mode: DECLARATIVE_MODE, spec: { channels: [], dm: DMS_ON, permission_prompts: DM_DESTINATION }, destination: DM_DESTINATION },
   ],
   [
     'declarative mode, permission_prompts a channel: that channel',
-    { mode: DECLARATIVE_MODE, spec: { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL }, destination: DECL_CHANNEL, loaded: true },
+    { mode: DECLARATIVE_MODE, spec: { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL }, destination: DECL_CHANNEL },
   ],
   [
     'fungible mode, invited.permission_prompts a channel: that channel',
-    { mode: FUNGIBLE_MODE, spec: { invited: { permission_prompts: FUNG_CHANNEL } }, destination: FUNG_CHANNEL, loaded: true },
+    { mode: FUNGIBLE_MODE, spec: { invited: { permission_prompts: FUNG_CHANNEL } }, destination: FUNG_CHANNEL },
   ],
   [
     'fungible mode, invited.permission_prompts an explicit "dm": dm',
-    { mode: FUNGIBLE_MODE, spec: { dm: DMS_ON, invited: { permission_prompts: DM_DESTINATION } }, destination: DM_DESTINATION, loaded: true },
+    { mode: FUNGIBLE_MODE, spec: { dm: DMS_ON, invited: { permission_prompts: DM_DESTINATION } }, destination: DM_DESTINATION },
   ],
   [
     'fungible mode, no invited section: dm by default',
-    { mode: FUNGIBLE_MODE, spec: { dm: DMS_ON }, destination: DM_DESTINATION, loaded: true },
+    { mode: FUNGIBLE_MODE, spec: { dm: DMS_ON }, destination: DM_DESTINATION },
   ],
   [
     'fungible mode, an invited section without permission_prompts: dm by default',
-    { mode: FUNGIBLE_MODE, spec: { dm: DMS_ON, invited: {} }, destination: DM_DESTINATION, loaded: true },
+    { mode: FUNGIBLE_MODE, spec: { dm: DMS_ON, invited: {} }, destination: DM_DESTINATION },
   ],
   [
     'fungible mode ignores a top-level permission_prompts set by spec: the invited.permission_prompts channel',
@@ -814,12 +801,11 @@ const RULE_ROWS: [string, RuleRow][] = [
       mode: FUNGIBLE_MODE,
       spec: { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL, invited: { permission_prompts: FUNG_CHANNEL } },
       destination: FUNG_CHANNEL,
-      loaded: true,
     },
   ],
   [
     'fungible mode ignores a top-level permission_prompts set by spec: dm by default when invited is absent',
-    { mode: FUNGIBLE_MODE, spec: { dm: DMS_ON, channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL }, destination: DM_DESTINATION, loaded: true },
+    { mode: FUNGIBLE_MODE, spec: { dm: DMS_ON, channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL }, destination: DM_DESTINATION },
   ],
   [
     'declarative mode ignores an invited section: the permission_prompts channel',
@@ -827,7 +813,6 @@ const RULE_ROWS: [string, RuleRow][] = [
       mode: DECLARATIVE_MODE,
       spec: { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL, invited: { permission_prompts: FUNG_CHANNEL } },
       destination: DECL_CHANNEL,
-      loaded: true,
     },
   ],
   [
@@ -836,7 +821,6 @@ const RULE_ROWS: [string, RuleRow][] = [
       mode: DECLARATIVE_MODE,
       spec: { channels: [], dm: DMS_ON, permission_prompts: DM_DESTINATION, invited: { permission_prompts: FUNG_CHANNEL } },
       destination: DM_DESTINATION,
-      loaded: true,
     },
   ],
   [
@@ -845,7 +829,6 @@ const RULE_ROWS: [string, RuleRow][] = [
       mode: DECLARATIVE_MODE,
       spec: { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL, invited: { permission_prompts: FUNG_CHANNEL }, fungible_destination: FUNG_CHANNEL },
       destination: DECL_CHANNEL,
-      loaded: false,
     },
   ],
 ]
@@ -855,13 +838,10 @@ describe('the one destination rule per mode (b.deo SRI-701, SRI-702)', () => {
     const p = personaIn(row.mode, row.spec)
 
     expect(personaDestinationOf(row.mode, p)).toBe(row.destination)
-    const paths = RESOLVER_PATHS.filter((path) => row.loaded || path === 'injected configuration')
-    for (const path of paths) {
-      const r = resolverOn(path, () => row.mode)
-      expect(r.destinationOf(p)).toBe(row.destination)
-      expect(r.settingOf!(p)).toBe(destinationSettingOf(row.mode))
-      expect(r.refusalOf(p)).toBeUndefined()
-    }
+    const r = resolverOn(() => row.mode)
+    expect(r.destinationOf(p)).toBe(row.destination)
+    expect(r.settingOf(p)).toBe(destinationSettingOf(row.mode))
+    expect(r.refusalOf(p)).toBeUndefined()
     expect(dmDestinationRefusal(row.mode, p)).toBeUndefined()
   })
 
@@ -880,12 +860,11 @@ describe('the resolver in fungible mode (b.deo SRI-702)', () => {
     ['a defaulted "dm" destination', { dm: DMS_ON }, 'dm'],
     ['a defaulted "dm" destination beside a top-level permission_prompts set by spec', { dm: DMS_ON, channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL }, 'dm'],
   ]
-  const cases = POST_ROWS.flatMap(([label, spec, kind]) => RESOLVER_PATHS.map((path) => [label, path, spec, kind] as const))
 
-  test.each(cases)('%s (%s): the post goes there on the persona\'s own client, with no line', async (_label, path, spec, kind) => {
+  test.each(POST_ROWS)('%s: the post goes there on the persona\'s own client, with no line', async (_label, spec, kind) => {
     const p = personaIn(FUNGIBLE_MODE, spec)
     const own = makeStubSlack({ leakMarker: LEAK_SENTINEL })
-    const r = resolverOn(path, () => FUNGIBLE_MODE)
+    const r = resolverOn(() => FUNGIBLE_MODE)
 
     const result = record(await r.post(p, asWebClient(own.web), { text: 'fungible' }))
 
@@ -902,18 +881,18 @@ describe('the resolver in fungible mode (b.deo SRI-702)', () => {
 })
 
 describe('the destination is resolved again at each attempt (b.deo SRI-701)', () => {
-  test.each(RESOLVER_PATHS)(
-    '%s: swapping the applied persona between posts, declarative-mode form to fungible-mode form and back, moves each next post; no captured value is used',
-    async (path) => {
+  test(
+    'swapping the configuration in effect and the applied persona between posts, declarative-mode form to fungible-mode form and back, moves each next post; no captured value is used',
+    async () => {
       const declForm = personaIn(DECLARATIVE_MODE, { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL, dm: DMS_ON })
       const fungForm = personaIn(FUNGIBLE_MODE, { dm: DMS_ON })
       let config = DECLARATIVE_MODE
       let applied = declForm
       const own = makeStubSlack({ leakMarker: LEAK_SENTINEL })
-      const r = resolverOn(path, () => config)
+      const r = resolverOn(() => config)
       const attempt = async (text: string) => {
         const p = applied
-        const now = { destination: r.destinationOf(p), setting: r.settingOf!(p) }
+        const now = { destination: r.destinationOf(p), setting: r.settingOf(p) }
         return { now, result: record(await r.post(p, asWebClient(own.web), { text })) }
       }
 
@@ -942,17 +921,17 @@ describe('the destination is resolved again at each attempt (b.deo SRI-701)', ()
     },
   )
 
-  test('injected configuration: the switch is read at each call, never when the resolver is built, so the same persona object moves with it', async () => {
+  test('the switch is read at each call, never when the resolver is built, so the same persona object moves with it', async () => {
     // Both sections set, as only a spec can: the switch alone picks the one read.
     const both = personaIn(DECLARATIVE_MODE, { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL, fungible_destination: FUNG_CHANNEL })
     let config = DECLARATIVE_MODE
     const own = makeStubSlack({ leakMarker: LEAK_SENTINEL })
-    const r = resolverOn('injected configuration', () => config)
+    const r = resolverOn(() => config)
 
     record(await r.post(both, asWebClient(own.web), { text: '1' }))
     config = FUNGIBLE_MODE
     expect(r.destinationOf(both)).toBe(FUNG_CHANNEL)
-    expect(r.settingOf!(both)).toBe(destinationSettingOf(FUNGIBLE_MODE))
+    expect(r.settingOf(both)).toBe(destinationSettingOf(FUNGIBLE_MODE))
     record(await r.post(both, asWebClient(own.web), { text: '2' }))
     config = DECLARATIVE_MODE
     record(await r.post(both, asWebClient(own.web), { text: '3' }))
@@ -971,21 +950,19 @@ describe('the resolver\'s "dm" refusal in fungible mode names invited.permission
     ['a defaulted "dm"', {}],
     ['a defaulted "dm" beside a top-level permission_prompts set by spec', { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL }],
   ]
-  const cases = DM_STATES.flatMap(([state, dm, reason]) =>
-    FORMS.flatMap(([form, spec]) => RESOLVER_PATHS.map((path) => [state, form, path, dm, reason, spec] as const)),
-  )
+  const cases = DM_STATES.flatMap(([state, dm, reason]) => FORMS.map(([form, spec]) => [state, form, dm, reason, spec] as const))
 
   test.each(cases)(
-    '%s, %s (%s): refused with no Slack call; the line names the fungible setting and is otherwise the declarative line',
-    async (_state, _form, path, dm, reason, spec) => {
+    '%s, %s: refused with no Slack call; the line names the fungible setting and is otherwise the declarative line',
+    async (_state, _form, dm, reason, spec) => {
       const fungible = personaIn(FUNGIBLE_MODE, { ...spec, dm })
       const declarative = personaIn(DECLARATIVE_MODE, { channels: [], permission_prompts: DM_DESTINATION, dm })
       const fungibleLines: string[] = []
       const declarativeLines: string[] = []
       const fungibleStub = makeStubSlack({ leakMarker: LEAK_SENTINEL })
       const declarativeStub = makeStubSlack({ leakMarker: LEAK_SENTINEL })
-      const fr = resolverOn(path, () => FUNGIBLE_MODE, fungibleLines)
-      const dr = resolverOn(path, () => DECLARATIVE_MODE, declarativeLines)
+      const fr = resolverOn(() => FUNGIBLE_MODE, fungibleLines)
+      const dr = resolverOn(() => DECLARATIVE_MODE, declarativeLines)
 
       expect(fr.refusalOf(fungible)).toBe(reason)
       expect(dmDestinationRefusal(FUNGIBLE_MODE, fungible)).toBe(reason)
