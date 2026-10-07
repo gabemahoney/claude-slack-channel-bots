@@ -142,7 +142,7 @@ function startPoller(
 ): ManualIntervalControl {
   const { post, ...rest } = opts
   stubA.script.post.push(post ?? { kind: 'ok', result: { ts: SLACK_RETURNED_TS } })
-  return startManualPoller({ getClient, clientFor: clients.clientFor, getPersona, ...rest })
+  return startManualPoller({ getClient, clientFor: clients.clientFor, getPersona, getPersonaConfig: () => null, ...rest })
 }
 
 function trailFile(): string {

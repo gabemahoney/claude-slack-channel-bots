@@ -103,7 +103,7 @@ function makeFixture(): void {
   stubs = new Map(config.personas.map((p) => [p.key, makeStubSlack({ leakMarker: LEAK_SENTINEL })]))
   logs = []
   results = []
-  d = createPersonaDestinations({ log: (line) => logs.push(line) })
+  d = createPersonaDestinations({ log: (line) => logs.push(line), getPersonaConfig: () => config })
 }
 
 const stub = (p: Persona): StubSlack => stubs.get(p.key)!

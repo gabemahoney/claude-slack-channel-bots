@@ -607,6 +607,7 @@ describe('Task 6 carry: a click is decided only through the persona whose connec
       getClient: (() => ad) as never,
       clientFor: h.clientFor,
       getPersona: (key) => h.getPersona(key),
+      getPersonaConfig: () => h.config,
       // Both personas were brought up above.
       isPersonaUp: () => true,
     })
@@ -1067,6 +1068,7 @@ describe('SR-7.2: the up listener flushes exactly the persona that came up', () 
     const notifier = createPersonaNotifier({
       getPersona: (key) => h.getPersona(key),
       clientFor: h.clientFor,
+      getPersonaConfig: () => h.config,
       isDryRun: () => false,
       log: (line) => void logs.push(line),
     })

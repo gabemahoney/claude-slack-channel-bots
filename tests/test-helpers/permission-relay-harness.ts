@@ -74,13 +74,16 @@ export function makeManualInterval(): ManualIntervalControl {
   }
 }
 
+/** `Omit` over each member of a union: `PollerDeps` is one (a resolver, or the configuration to build one). */
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never
+
 /**
  * Start the poller on a manual interval (1000 ms unless `deps.intervalMs`
  * says otherwise). Every persona is up unless `deps.isPersonaUp` says
  * otherwise. Returns the interval control.
  */
 export function startManualPoller(
-  deps: Omit<PollerDeps, 'intervalMs' | 'setInterval' | 'clearInterval' | 'isPersonaUp'> & Partial<PollerDeps>,
+  deps: DistributiveOmit<PollerDeps, 'intervalMs' | 'setInterval' | 'clearInterval' | 'isPersonaUp'> & Partial<PollerDeps>,
 ): ManualIntervalControl {
   const ivl = makeManualInterval()
   startPermissionPoller({

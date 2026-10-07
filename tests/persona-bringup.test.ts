@@ -522,6 +522,7 @@ describe('held notices flush per persona when it is up (SR-7.2)', () => {
     const notifier = createPersonaNotifier({
       getPersona: (key) => cfg.personas.find((p) => p.key === key),
       clientFor: createPersonaClientLookup(h.conn.manager, () => cfg),
+      getPersonaConfig: () => cfg,
       isDryRun: () => false,
       log: (line) => void notifierLines.push(line),
     })
@@ -576,6 +577,7 @@ describe('end to end: A\'s connection trouble makes no agent-director call', () 
     const notifier: PersonaNotifier = createPersonaNotifier({
       getPersona: (key) => cfg.personas.find((p) => p.key === key),
       clientFor,
+      getPersonaConfig: () => cfg,
       isDryRun: () => false,
       log: (line) => void consoleLines.push(line),
     })
@@ -857,6 +859,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     const notifier = createPersonaNotifier({
       getPersona: (key) => cfg.personas.find((p) => p.key === key),
       clientFor,
+      getPersonaConfig: () => cfg,
       isDryRun: () => false,
       log: (line) => void notifierLines.push(line),
     })

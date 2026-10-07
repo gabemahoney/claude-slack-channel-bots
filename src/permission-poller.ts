@@ -131,9 +131,9 @@ import {
   describeDmDestinationRefusal,
   destinationSettingFrom,
   safeFailureCode,
-  type DestinationConfig,
   type DestinationSlackClient,
   type PersonaDestinations,
+  type PersonaDestinationsSource,
 } from './persona-destination.ts'
 import {
   createPersonaDestinationHold,
@@ -220,8 +220,23 @@ export type PollerSlackClient = DestinationSlackClient
  * Injection points for the poller. Production callers supply the real Bun
  * setInterval/clearInterval, getClient() and the per-persona client and
  * persona lookups; tests pass stubs.
+ *
+ * `destinations` is the destination resolver (per-persona DM cache) shared
+ * with the notifier. The poller asks it whether a persona's `dm` destination
+ * is refused (`refusalOf`, over the configuration in effect at that attempt)
+ * and which setting names it (`settingOf`, b.deo SRI-906), and builds the
+ * default destination hold over it when `destinationHold` is not given (the
+ * poller posts through the hold, never through this directly); a
+ * `destinationHold` that is given must be built over this same resolver.
+ * When `destinations` is not given, `getPersonaConfig` is
+ * (`PersonaDestinationsSource`): the default is a module-level instance over
+ * it, reading the configuration in effect at each attempt (b.deo SRI-201),
+ * reset by `_resetPollerState`.
  */
-export interface PollerDeps {
+export type PollerDeps = PollerOwnDeps & PersonaDestinationsSource
+
+/** The poller's injection points other than its destination resolver (`PollerDeps`). */
+interface PollerOwnDeps {
   /** Returns the agent-director Client singleton. */
   getClient: () => {
     list: (params: import('agent-director').ListParams) => Promise<import('agent-director').ListResult>
@@ -239,26 +254,6 @@ export interface PollerDeps {
    * validated yet, dry run, unknown key).
    */
   clientFor: (key: string) => PollerSlackClient | undefined
-  /**
-   * The destination resolver (per-persona DM cache) shared with the
-   * notifier. The poller asks it whether a persona's `dm` destination is
-   * refused (`refusalOf`, over the configuration in effect at that attempt)
-   * and which setting names it (`settingOf`, b.deo SRI-906), and builds the
-   * default destination hold over it when `destinationHold` is not given (the
-   * poller posts through the hold, never through this directly); a
-   * `destinationHold` that is given must be built over this same resolver.
-   * Defaults to a module-level instance over `getPersonaConfig`, reset by
-   * `_resetPollerState`.
-   */
-  destinations?: PersonaDestinations
-  /**
-   * The configuration in effect, read at each attempt (b.deo SRI-201). Used
-   * only to build the default resolver when `destinations` is not given (a
-   * given resolver reads its own). Absent: the default resolver takes the
-   * mode the persona of each attempt was loaded under (fungible when it
-   * carries a fungible destination).
-   */
-  getPersonaConfig?: () => DestinationConfig
   /**
    * The destination hold (per-persona episodes and retries) shared with the
    * notifier: a new prompt or stuck-prompt warning is attempted only when it
@@ -576,7 +571,7 @@ function destinationsFor(deps: PollerDeps): PersonaDestinations {
   if (deps.destinations) return deps.destinations
   defaultDestinations ??= createPersonaDestinations({
     log: (line) => logViaDeps(deps, line),
-    ...(deps.getPersonaConfig !== undefined ? { getPersonaConfig: () => deps.getPersonaConfig?.() } : {}),
+    getPersonaConfig: deps.getPersonaConfig,
   })
   return defaultDestinations
 }
