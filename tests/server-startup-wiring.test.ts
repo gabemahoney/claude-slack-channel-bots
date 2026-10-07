@@ -5529,19 +5529,22 @@ describe('server.ts\'s file guard refuses every persona credentials file (b.av2 
     expect(props.get('clientFor')).toBe('clientFor')
   })
 
-  // The 64 KiB cap exempts two reads: the file guard's read of the config
+  // The 64 KiB cap exempts three reads: the file guard's read of the config
   // file, so an oversized config still protects the credentials files it
-  // names (behaviour in tests/config.test.ts), and the start's read of the
+  // names (behaviour in tests/config.test.ts); the start's read of the
   // retired-key record, which only the server writes, so a record grown past
-  // the cap never stops a start (behaviour in tests/retired-keys.test.ts).
-  // Every other reader (the start's config, the last-applied record, the
-  // pending and apply files, the reload tick) must stay capped; this audit
-  // fails if any other call site passes the option, or names it.
-  test('readPersonaConfigBytes is called uncapped only by credentialsFilesToProtect and loadRetiredKeyStore, and nothing else names the option', () => {
+  // the cap never stops a start (behaviour in tests/retired-keys.test.ts);
+  // and the start's read of the stored-choice file (b.deo SRI-403), which
+  // only the server writes, so a file of any size loads. Every other reader
+  // (the start's config, the last-applied record, the pending and apply
+  // files, the reload tick) must stay capped; this audit fails if any other
+  // call site passes the option, or names it.
+  test('readPersonaConfigBytes is called uncapped only by credentialsFilesToProtect, loadRetiredKeyStore and loadChannelDeliveryStore, and nothing else names the option', () => {
     const files = srcFiles().map(([path, source]) => [path, stripComments(source)] as const)
     const UNCAPPED_SITES: ReadonlyArray<[string, RegExp]> = [
       ['src/config.ts', /\bexport\s+function\s+credentialsFilesToProtect\s*\(/],
       ['src/retired-keys.ts', /\bexport\s+function\s+loadRetiredKeyStore\s*\(/],
+      ['src/channel-delivery.ts', /\bexport\s+function\s+loadChannelDeliveryStore\s*\(/],
     ]
     const sitePaths = UNCAPPED_SITES.map(([path]) => path)
     // src/config.ts declares the option; any other file may name it only at its one allowed call.
