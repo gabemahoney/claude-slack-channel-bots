@@ -21,8 +21,8 @@ Live acceptance run for idea b.av2 (personas), built by plan b.ob2. It is one
 ordered run on the finished feature. It starts from a clean install and sets
 up three persona apps in a real test Slack workspace using only the README,
 the setup wizard (`/setup-slack-channel-bots`) and `config.json`. The AC
-coverage table below maps every acceptance criterion that b.av2 SR-14 marks
-as live-verified, b.deo's live-verified criteria (invited channels, b.deo
+coverage table below maps every acceptance criterion that b.av2 SR-14 (as
+amended by b.deo SRI-1501 to SRI-1507) marks as live-verified, b.deo's live-verified criteria (invited channels, b.deo
 SRI-1501 to SRI-1507), and the extra live evidence the run gives, to the
 check that verifies it.
 
@@ -48,7 +48,7 @@ Each row names the numbered check, and where it matters the step, that
 verifies the criterion. Rows labelled `b.deo AC <n>` use b.deo's PRD
 numbering; every other AC number is b.av2's PRD order (1–74).
 
-Live-verified in b.av2 SR-14:
+Live-verified in b.av2 SR-14 (as amended by b.deo SRI-1501 to SRI-1507):
 
 | AC or item | What the run shows | Verified by |
 |---|---|---|
@@ -88,7 +88,7 @@ Live-verified in b.deo (SRI-1501 to SRI-1507):
 | b.deo AC 46 | With the invited-channel switch on, a persona answers a mention in a channel its app was invited to; asked there, it switches the channel to `all`; with the switch off it is silent there; after a kick, Slack refuses its `reply` and `fetch_messages` on the channel; the configuration and the channel are restored | Checks 30 (invite then mention), 31 (the switch to `all`), 32 (switch off), 33 (after a kick) and 34 (restored) |
 | b.deo AC 47 | Every check before Check 30 passes with the switch absent; the only additions are b.deo SRI-106's agent-visible ones, `set_channel_delivery` in the tool list (refused) and the session instructions (SRI-1507) | Every check before Check 30 |
 
-Extra live evidence (unit-verified in SR-14, checked here too):
+Extra live evidence (unit-verified in SR-14 as amended by b.deo SRI-1301 to SRI-1308, checked here too):
 
 | AC or item | What the run shows | Verified by |
 |---|---|---|
@@ -99,7 +99,7 @@ Extra live evidence (unit-verified in SR-14, checked here too):
 | 35 | A DM to a persona with DMs off is dropped with a `persona-dm-dropped` line | Check 15 |
 | 47 | The server starts and serves with the token environment variables unset | Part 1.4 and Check 1; `guard` refuses every start in a shell that has one (Part 1.3) |
 | 57 | A confirmed removal tears down only that persona | Check 27 |
-| Wizard credentials command (b.av2 SR-12, SR-1.4 part) | Tokens are typed only into the terminal command, never shown; the file is written with mode 0600; the wizard refuses a token offered in the chat | Check S1 |
+| Wizard credentials command (b.av2 SR-12 as amended by b.deo SRI-1101 to SRI-1110; b.av2 SR-1.4 part) | Tokens are typed only into the terminal command, never shown; the file is written with mode 0600; the wizard refuses a token offered in the chat | Check S1 |
 | Persona added through the wizard on a running server (E14 sprint demo) | The wizard adds D, explains the pending file and the rename, and D comes up only after the operator confirms | Check 25 (steps 4–7) |
 | Leak check (E13 carry) | No WebSocket `wss://` or `ticket=` URL in any log the run wrote | Check 29a (step 2) |
 | Handshake failure (E13 carry, optional) | A real Socket Mode handshake failure logs no WebSocket `ticket=` URL; the `[slack] persona Socket Mode: …` health lines appear | Check 29b |
@@ -232,8 +232,8 @@ The run's single setup. It verifies AC 14 (the whole persona setup is
 `config.json` plus the credentials files, with no persona-specific code edit),
 AC 47 (no token environment variable is an input) and AC 71 (the first start
 with no record applies the file as it stands; an invalid file doesn't start),
-and the live side of b.av2 SR-12 and SR-1.4 for the setup wizard (the
-credentials command). Checks S1 to S3 record these results; Check 1 finishes
+and the live side of b.av2 SR-12 (as amended by b.deo SRI-1101 to SRI-1110)
+and SR-1.4 for the setup wizard (the credentials command). Checks S1 to S3 record these results; Check 1 finishes
 AC 71.
 
 Every detail the tester needs comes from the README (`$PKG/README.md`, Part
@@ -601,6 +601,9 @@ coordination only, and C of no channel.
 
 ### Check S1: the credentials command in a real terminal (b.av2 SR-12, SR-1.4)
 
+This check covers b.av2 SR-12 as amended by b.deo SRI-1101 to SRI-1110, and
+b.av2 SR-1.4.
+
 Run it during A's wizard run, at step 4.10, after the wizard has declared A in
 `config.json` (4.9). The operator runs the command in a real terminal on the
 test host, never through the wizard's tool.
@@ -825,7 +828,8 @@ The run uses this gesture in Checks 13 and 24 (and Check 24's teardown),
 "Turn A's DMs on", Checks 25 to 27, and Checks 30, 32, 33 and 34. Check 28 leaves its edits unconfirmed
 on purpose. No check moves a persona's `credentials_file` or
 `working_directory`, or changes `claude_config_dir` or `stop_hook_bootstrap`:
-b.av2 SR-14 gives those paths (AC 59, 60 and 61) no live leg.
+b.av2 SR-14 (as amended by b.deo SRI-1507) gives those paths (AC 59, 60 and
+61) no live leg.
 
 ### 2.3 Guarded restart
 
@@ -1034,10 +1038,11 @@ Pass: one row per persona after the cycle, and A answers the new message.
 
 ## Part 4: Bot-to-bot, broadcast and persona-post event capture
 
-These checks verify AC 7, 8, 11 and 18 and b.av2 SR-4.1 (per-persona dedupe),
-SR-4.2 (the delivery decision, including own-post exclusion and no limit on
-bot-to-bot delivery) and SR-4.4 (the `user_id` / `bot_id` and `via` tag
-attributes). They also capture the real Slack event shape of a persona's post.
+These checks verify AC 7, 8, 11 and 18 and b.av2 SR-4.1 as amended by b.deo
+SRI-302 (per-persona dedupe), b.av2 SR-4.2 as amended by b.deo SRI-303 to
+SRI-309 (the delivery decision, including own-post exclusion and no limit on
+bot-to-bot delivery) and b.av2 SR-4.4 as amended by b.deo SRI-306 (the
+`user_id` / `bot_id` and `via` tag attributes). They also capture the real Slack event shape of a persona's post.
 That shape is the evidence behind the delivery module's self-exclusion by bot
 user ID or bot ID, and behind its handling of the `bot_message` subtype.
 
@@ -1056,6 +1061,8 @@ copy its member ID). They replace the placeholders below:
 Check 8 records A's bot ID (`B…`) as `<A_BOT_ID>`.
 
 ### Check 8: persona-post event shape (SR-4.2, the event-shape capture)
+
+This check covers b.av2 SR-4.2 as amended by b.deo SRI-303, SRI-306.
 
 Steps:
 
@@ -1079,7 +1086,7 @@ Record from the RAW line, in the Notes column (IDs are not secrets):
 
 - `user`: present or absent, and its value.
 - `bot_id`: present or absent, and its value. Its value is `<A_BOT_ID>` from here on.
-- `subtype`: its value, or "absent" when no `subtype` key appears in the logged part. A bot post's event JSON is always longer than the prefix, so the RAW line alone can't tell a missing `subtype` from one cut off. A's `own` drop (below) settles it: the delivery module drops an undeliverable subtype as `non-message` before it checks the author (SR-4.2 step 1 in `src/delivery-decision.ts`), so an `own` drop means the subtype was absent or deliverable.
+- `subtype`: its value, or "absent" when no `subtype` key appears in the logged part. A bot post's event JSON is always longer than the prefix, so the RAW line alone can't tell a missing `subtype` from one cut off. A's `own` drop (below) settles it: the delivery module drops an undeliverable subtype as `non-message` before it checks the author (SR-4.2 step 1, as amended by b.deo SRI-303, in `src/delivery-decision.ts`), so an `own` drop means the subtype was absent or deliverable.
 - `app_id` and any `bot_profile` field, if visible within the prefix.
 
 Expected:
@@ -1101,6 +1108,8 @@ line (it holds no token) instead of passing. No server code or logging is
 changed for this check.
 
 ### Check 9: one mention is delivered once (SR-4.1)
+
+This check covers b.av2 SR-4.1 as amended by b.deo SRI-302.
 
 Steps:
 
@@ -1155,8 +1164,9 @@ Pass: A drops its own broadcast, and B, the only other persona in coordination, 
 
 ### Check 12: two personas converse with no limit (AC 11, AC 18, SR-4.2)
 
-This check starts a conversation between two bots. The tester ends it (step
-4); nothing in the server stops it.
+This check covers b.av2 SR-4.2 as amended by b.deo SRI-306. It starts a
+conversation between two bots. The tester ends it (step 4); nothing in the
+server stops it.
 
 Steps:
 
@@ -1203,7 +1213,7 @@ throttle message.
 
 This check verifies AC 12: a persona receive-all in several channels sees
 every message of all of them in one instance. It also shows b.av2 SR-8.6's
-in-place row live: a confirmed `delivery` change keeps the persona's
+in-place row (b.av2 SR-8.6 as amended by b.deo SRI-802, SRI-805) live: a confirmed `delivery` change keeps the persona's
 instance, Slack connection and conversation.
 
 State at the start: the Check 12 exchange has stopped and its stop has been
@@ -1393,13 +1403,13 @@ Pass: a user the server had never seen got answers from A in its channel and fro
 The DM checks verify AC 15, 35, 36 (outbound leg), 37, 38, 40 and 41, and
 AC 17 in passing: the DM sender has no allowlist entry and gets no pairing
 step. They cover b.av2 SR-4.3 (a DM is decided only against the persona whose
-app received it, by its DMs switch) and SR-5.1 (a persona's DM posting
-targets). Check 21 also covers the edited-event dedupe: an edit that adds a
+app received it, by its DMs switch) and SR-5.1 as amended by b.deo SRI-601
+(a persona's DM posting targets). Check 21 also covers the edited-event dedupe: an edit that adds a
 persona's mention wakes it once.
 
 The DM-prompt checks (18, 22 and 23) verify AC 29, 34 and 44 and b.av2 SR-7.1
-(a persona's permission prompts go to its own destination, a channel or the
-DM with its contact) and SR-3.1 (each persona posts under its own app
+as amended by b.deo SRI-701, SRI-702 (a persona's permission prompts go to its
+own destination, a channel or the DM with its contact) and b.av2 SR-3.1 (each persona posts under its own app
 identity). A prompt in a DM is answered with its buttons like a channel
 prompt.
 
@@ -1419,7 +1429,7 @@ The DMs switch per persona, as these checks use it:
 
 Only A changes, and only through a confirmed `config.json` edit, so the setup
 stays config-file only (AC 14). B and C cannot be switched off: a `dm`
-destination, or zero channels, needs DMs on (b.av2 SR-1.5), so the config
+destination, or zero channels, needs DMs on (b.av2 SR-1.5 as amended by b.deo SRI-103, SRI-104), so the config
 would be refused.
 
 Confirm that B and C have DMs on, the operator as `dm.contact` and a `dm`
@@ -1941,11 +1951,12 @@ These checks verify the live legs of AC 19 and AC 22 (a new persona, with a
 freshly created credentials file and config entry, comes up at a confirmed
 apply and posts as itself, with no restart and no change to the server's
 environment) and AC 57 (a confirmed removal tears down only that persona).
-They cover b.av2 SR-14's runtime addition and confirmed removal, and SR-8.5
-and SR-8.6 (the confirmation and the apply), and the E14 demo of adding a
+They cover b.av2 SR-14's runtime addition and confirmed removal (b.av2 SR-14
+as amended by b.deo SRI-1507), and b.av2 SR-8.5 and b.av2 SR-8.6 as amended by
+b.deo SRI-805 (the confirmation and the apply), and the E14 demo of adding a
 persona with the setup wizard on a running server. In passing, they check
-SR-7.2 (reload output never reaches Slack) and SR-10.3 (no token in the
-pending file or the log). The optional Check 26 checks a revoked bot token
+SR-7.2 (reload output never reaches Slack) and b.av2 SR-10.3 as amended by
+b.deo SRI-901 to SRI-906 (no token in the pending file or the log). The optional Check 26 checks a revoked bot token
 live (bug b.ujn) on the disposable persona D.
 
 State at the start: the server Check 24's teardown restarted, with A, B and C
@@ -2190,10 +2201,13 @@ applied configuration comes back with no manual action), the live side of
 AC 70 (an unconfirmed destructive edit survives the restart and stays
 pending) and AC 72 (a credentials change still pending when the server stops
 is applied at the next start: the persona connects with its credentials file
-as it stands). It covers b.av2 SR-14's host reboot and SR-8.7 (every start, a
-start after a reboot included, runs `config.json.last-applied`, and reads the
-credentials files as they stand). In passing, it checks SR-7.2 (reload output
-never reaches Slack) and SR-10.3 (no token in the pending file or the log).
+as it stands). It covers b.av2 SR-14's host reboot (b.av2 SR-14 as
+amended by b.deo SRI-1507) and b.av2 SR-8.7 as amended by b.deo SRI-403,
+SRI-407 (every start, a start after a reboot included, runs
+`config.json.last-applied`, and reads the credentials files as they stand). In
+passing, it checks SR-7.2 (reload output never reaches Slack) and b.av2 SR-10.3
+as amended by b.deo SRI-901 to SRI-906 (no token in the pending file or the
+log).
 
 This is the plan's only reboot. It runs only on the test host and the test
 workspace, never on the production install. The Safety section applies
@@ -2655,7 +2669,8 @@ archived channels included.
 Check 29a verifies AC 20 live (no credential value appears in the config
 file, the record, the pending file, the stored-choice file
 `channel-delivery.json`, any log line the feature produces, or the tool
-results in the persona transcripts, b.av2 SR-10.3) and the first
+results in the persona transcripts, b.av2 SR-10.3 as amended by b.deo SRI-901
+to SRI-906) and the first
 half of the E13 leak check: no WebSocket `wss://` or `ticket=` URL in any
 log. AC 20 is unit-verified; the acceptance run is where a real token could
 leak, so the check counts across everything the run wrote. It is required,
@@ -2674,7 +2689,7 @@ Every count counts matches and never prints one. The leak markers are the
 run's own tokens: `leakcount` (Part 1.3) reads them from the credentials
 files inside bun and prints only counts. `tokcount` counts token-shaped text:
 a Slack prefix followed by a digit. A bare prefix can legitimately appear in
-a log line that names the rule a bad token broke (b.av2 SR-10.3), so bare
+a log line that names the rule a bad token broke (b.av2 SR-10.3 as amended by b.deo SRI-901 to SRI-906), so bare
 prefixes are not counted.
 
 Error messages are logged redacted (`message="…"` fields, for example), so
