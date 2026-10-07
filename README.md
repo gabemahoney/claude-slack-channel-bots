@@ -1221,6 +1221,7 @@ Known limits of the fungible-mode targets:
 
 - CSCB makes no Slack call to learn whether a channel holds the persona's app, is externally shared or is a group DM. So in fungible mode it refuses no post, read, reaction or edit in an externally shared channel that the app belongs to, although fungible mode never delivers a message from such a channel.
 - The same holds in a group DM the app belongs to, except that Slack refuses reads there: the app has no `mpim:history` scope.
+- In fungible mode, `edit_message` on the persona's own earlier post in a channel its Slack app is not in, for example after the app was removed from the channel, is sent to Slack, and Slack accepts it.
 
 On a host whose Claude Code permission settings don't allow the server's tools as a group (an allow rule such as `mcp__slack-channel-router`, rather than one rule per tool such as `mcp__slack-channel-router__reply`), the first `set_channel_delivery` call raises a permission prompt, in either mode (see [Permission Relay](#permission-relay)).
 
