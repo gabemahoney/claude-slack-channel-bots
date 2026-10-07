@@ -24,10 +24,10 @@
 #   HOME, agent-director install and store, and tmux server, all under
 #   SCENARIO_ROOT, with the agent-director shim in front of the binary (see
 #   "fmk mode" below);
-# - shared mode, for every other script (test-5 to test-12): HOME, PATH, the
-#   agent-director store and the tmux server stay the container's, as the
-#   scripts found them, and no shim is installed (test-12 checks where the
-#   hook commands resolve).
+# - shared mode, for every other script (test-5 to test-12, and test-29):
+#   HOME, PATH, the agent-director store and the tmux server stay the
+#   container's, as the scripts found them, and no shim is installed (test-12
+#   checks where the hook commands resolve).
 #
 # What sourcing does, in both modes:
 # - refuses outside a cscb-ci image (above);
@@ -1082,8 +1082,8 @@
 #   violating line written after them (while the trap stopped a server, for
 #   example) fails the run, its FAIL line saying it came after the closing
 #   assertions.
-# Shared-mode scripts (test-5 to test-12) have no closing assertions, no tmux
-# shim and no record.
+# Shared-mode scripts (test-5 to test-12, and test-29) have no closing
+# assertions, no tmux shim and no record.
 #
 # Seeding rules (fmk mode; b.jg5 SRJ-1306, agent-director's handoff rev 15 and
 # rev 17). The harness seeds and relabels sessions from the scenario's own
