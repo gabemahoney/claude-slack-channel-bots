@@ -2,8 +2,11 @@
  * persona-destination.ts — Where a persona's permission prompts and server
  * notices go, and the post there (b.av2 SR-7.1, SR-5.1).
  *
- * A persona's destination is its `permission_prompts` setting: a channel ID,
- * or `dm`. A channel destination is the configured channel. A `dm` destination
+ * A persona's destination comes from one rule, `personaDestinationOf`
+ * (b.av2 SR-7.1, b.deo SRI-701): its `permission_prompts` setting in
+ * declarative mode, its fungible destination (`invited.permission_prompts`,
+ * `dm` by default) in fungible mode; either way a channel ID, or `dm`. A
+ * channel destination is that channel. A `dm` destination
  * is the persona's DM conversation with its `dm.contact`, obtained with
  * `conversations.open` on the persona's own client (Slack returns the existing
  * conversation, or creates one when none exists, so a DM-only persona's first
@@ -160,24 +163,56 @@ interface DmCacheEntry {
 // Pure helpers
 // ---------------------------------------------------------------------------
 
+/** The resolved fields the one destination rule reads. */
+export type PersonaDestinationFields = Pick<Persona, 'permission_prompts' | 'fungible_destination'>
+
 /**
- * Resolve a persona's destination from its `permission_prompts` setting:
- * `dm` for the DM destination, else the channel it names. Pure.
+ * The one destination rule (b.av2 SR-7.1, b.deo SRI-701): a persona's
+ * destination, `dm` or a channel ID, by the channel mode of the
+ * configuration the persona was resolved in. Fungible mode: its fungible
+ * destination (`invited.permission_prompts`, `dm` when that is absent).
+ * Declarative mode: its `permission_prompts`.
+ *
+ * The persona's resolved fields carry that mode: the loader fills
+ * `fungible_destination` in fungible mode only, and `permission_prompts` in
+ * declarative mode only (b.deo SRI-102). Every caller passes the persona it
+ * read from the configuration in effect at that attempt, never a copy held
+ * from earlier, so a confirmed change of the switch or of either destination
+ * setting applies from the next attempt. A persona with neither field (no
+ * loaded configuration resolves one) gets `dm`, which `dmDestinationRefusal`
+ * refuses unless DMs are on with a contact.
+ *
+ * The one place a destination consumer reads `permission_prompts` or
+ * `fungible_destination` (b.deo SRI-202): the resolver below, its DM
+ * refusal, the destination hold, the permission poller and the notifier all
+ * go through it. Pure.
  */
-function resolvePersonaDestination(persona: Pick<Persona, 'permission_prompts'>): PersonaDestination {
-  if (persona.permission_prompts === DM_DESTINATION) return { kind: 'dm' }
-  return { kind: 'channel', channelId: persona.permission_prompts }
+export function personaDestinationOf(persona: PersonaDestinationFields): string {
+  if (persona.fungible_destination !== undefined) return persona.fungible_destination
+  return persona.permission_prompts ?? DM_DESTINATION
+}
+
+/**
+ * Resolve a persona's destination through the one destination rule
+ * (`personaDestinationOf`): `dm` for the DM destination, else the channel it
+ * names. Pure.
+ */
+function resolvePersonaDestination(persona: PersonaDestinationFields): PersonaDestination {
+  const destination = personaDestinationOf(persona)
+  if (destination === DM_DESTINATION) return { kind: 'dm' }
+  return { kind: 'channel', channelId: destination }
 }
 
 /**
  * Why the persona's `dm` destination must not be opened (DMs off, or no
  * contact), or undefined when it may be, or when the destination is a
- * channel. Pure.
+ * channel. The destination comes from the one destination rule
+ * (`personaDestinationOf`, b.deo SRI-701). Pure.
  */
 export function dmDestinationRefusal(
-  persona: Pick<Persona, 'permission_prompts' | 'dm'>,
+  persona: PersonaDestinationFields & Pick<Persona, 'dm'>,
 ): DmDestinationRefusal | undefined {
-  if (persona.permission_prompts !== DM_DESTINATION) return undefined
+  if (personaDestinationOf(persona) !== DM_DESTINATION) return undefined
   if (!persona.dm.enabled) return 'dm_disabled'
   if (!persona.dm.contact) return 'no_dm_contact'
   return undefined

@@ -51,7 +51,10 @@
  * Every attempt resolves the persona, its client and its destination at that
  * moment (`getPersona`, `clientFor`, the resolver), never from a value
  * captured when the notice was held, so a destination or contact changed
- * while a notice waits is honoured. A retry that comes due while the persona
+ * while a notice waits is honoured. Every destination this module names or
+ * compares comes from the one destination rule (`personaDestinationOf`,
+ * b.av2 SR-7.1, b.deo SRI-701) applied to the persona of that attempt;
+ * nothing here reads a destination setting itself. A retry that comes due while the persona
  * has no client (it is not up) keeps it held and waits again, with no line;
  * one whose persona or client lookup throws waits again the same way, with
  * one line per run of such throws (never a restart at once). A persona no
@@ -67,8 +70,8 @@
  *   says the app must be re-installed to gain it.
  * - A failed retry advances the schedule and logs nothing, unless it failed at
  *   a destination no line of the open episode has named yet (the persona's
- *   `permission_prompts` changed in place): then it logs one fresh opening
- *   line for that destination, once per distinct destination per episode.
+ *   destination changed in place): then it logs one fresh opening line for
+ *   that destination, once per distinct destination per episode.
  * - A failure from an attempt that started before the last episode change
  *   (an episode opened or closed since; e.g. the notifier's concurrent flush,
  *   all waiting on one DM open, or a slow post that fails after a retry has
@@ -138,6 +141,7 @@ import {
   type DestinationSlackClient,
   type DestinationStep,
   type PersonaDestinations,
+  personaDestinationOf,
 } from './persona-destination.ts'
 import { PERSONA_DESTINATION_FAILED, formatPersonaDiagnostic } from './persona-diagnostics.ts'
 import { renderPersonaRef } from './persona-identity.ts'
@@ -409,7 +413,7 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
   function settle(entry: HoldEntry, started: number, persona: Persona, result: DestinationPostResult): SettledAs {
     const current = entry.episode !== undefined && started === entry.generation
     if (result.outcome === 'posted') {
-      if (current) closeEpisode(entry, persona.permission_prompts)
+      if (current) closeEpisode(entry, personaDestinationOf(persona))
       return 'posted'
     }
     if (result.outcome === 'refused') return 'refused'
@@ -422,20 +426,21 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
     else {
       // The persona's destination changed in place while the episode is open:
       // name the new destination once, in a fresh opening line.
-      if (!entry.episode.named.has(persona.permission_prompts)) nameDestination(entry, entry.episode, persona, result)
+      if (!entry.episode.named.has(personaDestinationOf(persona))) nameDestination(entry, entry.episode, persona, result)
       scheduleRetry(entry, result)
     }
     return 'destination'
   }
 
   function openEpisode(entry: HoldEntry, persona: Persona, failure: DestinationFailure): void {
+    const destination = personaDestinationOf(persona)
     const episode: OpenEpisode = {
       name: persona.name,
       index: persona.index,
-      destination: persona.permission_prompts,
+      destination,
       step: failure.step,
       code: safeFailureCode(failure.code),
-      named: new Set([persona.permission_prompts]),
+      named: new Set([destination]),
     }
     entry.episode = episode
     entry.generation += 1
@@ -445,12 +450,13 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
 
   /** Copy a failure at a destination not yet named in the open episode into it and log its opening line. */
   function nameDestination(entry: HoldEntry, episode: OpenEpisode, persona: Persona, failure: DestinationFailure): void {
+    const destination = personaDestinationOf(persona)
     episode.name = persona.name
     episode.index = persona.index
-    episode.destination = persona.permission_prompts
+    episode.destination = destination
     episode.step = failure.step
     episode.code = safeFailureCode(failure.code)
-    episode.named.add(persona.permission_prompts)
+    episode.named.add(destination)
     logOpening(entry, episode)
   }
 

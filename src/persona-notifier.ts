@@ -2,11 +2,15 @@
  * persona-notifier.ts — Per-persona server notices (b.av2 SR-7.1, SR-7.2).
  *
  * Every server notice about a persona goes only to that persona's destination
- * (its `permission_prompts` channel, or its DM with `dm.contact`), under its
- * identity: the post goes through the persona's own Web client, as one
- * top-level message with no `thread_ts` and no username or icon override. The
- * destination is resolved, and a DM opened when needed, by the shared
- * destination resolver (`persona-destination.ts`). The notifier adds the
+ * (the channel the one destination rule names, or its DM with `dm.contact`),
+ * under its identity: the post goes through the persona's own Web client, as
+ * one top-level message with no `thread_ts` and no username or icon override.
+ * The destination is resolved, and a DM opened when needed, by the shared
+ * destination resolver (`persona-destination.ts`) through the one destination
+ * rule (`personaDestinationOf`, b.av2 SR-7.1, b.deo SRI-701): its
+ * `permission_prompts` in declarative mode, its fungible destination in
+ * fungible mode. The notifier reads no destination setting itself, the
+ * lost-message notice included. The notifier adds the
  * persona reference to every notice text, so callers pass only the key and
  * the notice body.
  *

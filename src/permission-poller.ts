@@ -13,7 +13,11 @@
  * client (`clientFor`), never to a channel taken from the row: its channel, or
  * its DM with `dm.contact`, opened with `conversations.open` on that client
  * and cached by the destination resolver (`persona-destination.ts`, shared
- * with the per-persona notifier). Each live entry records the conversation
+ * with the per-persona notifier). Which destination that is comes from the
+ * one destination rule (`personaDestinationOf`, b.av2 SR-7.1, b.deo SRI-701),
+ * through the resolver, its DM refusal and the destination hold, with the
+ * persona read at each attempt; the poller reads no destination setting
+ * itself. Each live entry records the conversation
  * the prompt was posted in (the `D…` ID for a DM) and the posting persona;
  * closing updates go there, whatever the persona's destination or DMs switch
  * is now (b.av2 SR-5.1: an update is not a post). Outage state is keyed by

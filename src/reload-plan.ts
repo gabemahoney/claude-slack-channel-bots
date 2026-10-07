@@ -6,7 +6,11 @@
  * one, persona by persona and setting by setting, in the terms of the SR-8.6
  * table: added, removed, destructively modified, modified in place, changed
  * credentials, next-launch changes (own or inherited) and unchanged, plus the
- * changed server-wide settings. The reload detection tick builds it every
+ * changed server-wide settings. A persona's section settings are classified
+ * by the candidate's section in force: a change to the section the
+ * candidate's switch does not select is recorded, with no effect (b.deo
+ * SRI-802, SRI-804), and a change of the switch has a line of its own
+ * (`modeSwitchLine`, b.deo SRI-803). The reload detection tick builds it every
  * pass, and a confirmed apply (`reload-apply.ts`) acts on the plan that pass
  * built from the confirmed bytes, never a second diff, so what is applied is
  * what was previewed.
@@ -38,11 +42,14 @@
  */
 
 import {
+  channelModeOf,
   configReadFailurePredicate,
   PERSONA_TOP_LEVEL_KEYS,
   SERVER_PATH_SETTINGS,
+  type ChannelMode,
   type Persona,
   type PersonaConfig,
+  type PersonaSections,
 } from './config.ts'
 import { isCredentialsBroken, type PersonaBringUpState } from './persona-bringup-controller.ts'
 import type { CredentialsDigest } from './persona-credentials.ts'
@@ -199,11 +206,38 @@ export const DESTRUCTIVE_SETTINGS = ['name', 'credentials_file', 'working_direct
 /** A setting whose change retires the persona and brings it up fresh (SRJ-1511). */
 export type DestructiveSetting = (typeof DESTRUCTIVE_SETTINGS)[number]
 
-/** The settings applied in place, immediately (b.av2 SR-8.6), in the order they are reported. */
-export const IN_PLACE_SETTINGS = ['channels', 'delivery', 'permission_prompts', 'dm.enabled', 'dm.contact'] as const
+/**
+ * The settings applied in place, immediately (b.av2 SR-8.6, b.deo SRI-802),
+ * in the order they are reported. `channels`, `delivery` and
+ * `permission_prompts` are in place when the candidate is in declarative
+ * mode, `invited.permission_prompts` when it is in fungible mode; `dm.*` in
+ * both modes.
+ */
+export const IN_PLACE_SETTINGS = [
+  'channels',
+  'delivery',
+  'permission_prompts',
+  'invited.permission_prompts',
+  'dm.enabled',
+  'dm.contact',
+] as const
 
 /** A setting applied in place. `channels`: the set of channel IDs; `delivery`: a kept channel's mode. */
 export type InPlaceSetting = (typeof IN_PLACE_SETTINGS)[number]
+
+/**
+ * The persona keys whose change is recorded, with no effect, when they
+ * belong to the section the candidate's switch does not select (b.deo
+ * SRI-804): the declarative section's `channels` and `permission_prompts`,
+ * and the fungible section, `invited`. In the order they are reported.
+ */
+export const RECORDED_SECTION_KEYS = ['channels', 'permission_prompts', 'invited'] as const satisfies readonly (keyof PersonaSections)[]
+
+/** A persona key whose change can be recorded (b.deo SRI-804). */
+export type RecordedSectionKey = (typeof RECORDED_SECTION_KEYS)[number]
+
+/** The server-wide setting that picks the channel mode (b.deo SRI-101); it has a preview line of its own (SRI-803). */
+export const MODE_SWITCH_SETTING = 'allow_invited_channels'
 
 /** The settings that take effect at the persona's next launch (b.av2 SR-8.6), in the order they are reported. */
 export const NEXT_LAUNCH_SETTINGS = ['claude_config_dir', 'stop_hook_bootstrap'] as const
@@ -251,6 +285,20 @@ export interface DestructivePersonaChange extends ChangePlanPersonaRef {
 export interface InPlacePersonaChange extends ChangePlanPersonaRef {
   /** The changed settings, in `IN_PLACE_SETTINGS` order. */
   settings: InPlaceSetting[]
+}
+
+/**
+ * A persona present in both configurations whose section not in force (by the
+ * candidate's switch) changed (b.deo SRI-804): the change is recorded and has
+ * no effect until the switch selects that section.
+ */
+export interface RecordedPersonaChange extends ChangePlanPersonaRef {
+  /**
+   * The changed keys, in `RECORDED_SECTION_KEYS` order: `channels` and
+   * `permission_prompts` when the candidate is in fungible mode, `invited`
+   * when it is in declarative mode.
+   */
+  fields: RecordedSectionKey[]
 }
 
 /** A persona whose credentials file, at the same path, has changed content. */
@@ -314,6 +362,17 @@ export interface ServerSettingChange {
    * any other setting.
    */
   inheritedBy?: InheritingPersonaRef[]
+  /**
+   * For the switch (`allow_invited_channels`, b.deo SRI-803) only: the
+   * channel mode the change turns on. Absent for any other setting.
+   */
+  mode?: ChannelMode
+  /**
+   * For the switch only: every persona present in both configurations, in
+   * candidate order, each of which the mode turned on applies to in place.
+   * Absent for any other setting.
+   */
+  personas?: ChangePlanPersonaRef[]
 }
 
 /** The plan of a valid candidate. */
@@ -331,11 +390,25 @@ export interface ValidChangePlan {
   credentials: CredentialsPersonaChange[]
   /** In candidate order. */
   nextLaunch: NextLaunchPersonaChange[]
-  /** Candidate personas present in both with nothing changed, in candidate order. */
+  /**
+   * Candidate personas present in both with nothing changed, or with
+   * recorded changes only (they are not modified), in candidate order.
+   */
   unchanged: ChangePlanPersonaRef[]
+  /**
+   * Candidate personas present in both, not destructively modified, whose
+   * section not in force changed (b.deo SRI-804), in candidate order. Such a
+   * change is recorded only: it counts in no header term, makes no apply
+   * step act and leaves `noEffectiveChange` as it is. A persona can be here
+   * and in another class.
+   */
+  recorded: RecordedPersonaChange[]
   /** In the fixed order of the top-level keys. */
   settings: ServerSettingChange[]
-  /** True exactly when every persona is unchanged and no server-wide setting changed. */
+  /**
+   * True exactly when every persona is unchanged and no server-wide setting
+   * changed; recorded changes do not count (b.deo SRI-804).
+   */
   noEffectiveChange: boolean
   /**
    * The set of effective config directories differs between the applied and
@@ -404,18 +477,65 @@ function samePathWith(facts: ChangePlanFacts): (a: string | undefined, b: string
   return (a, b) => a === b || (a !== undefined && b !== undefined && facts.realPath(a) === facts.realPath(b))
 }
 
-/** The in-place settings that differ between two declarations of one persona. */
-function inPlaceChanges(before: Persona, after: Persona): InPlaceSetting[] {
-  const was = new Map(before.channels.map((c) => [c.id, c.delivery]))
-  const now = new Map(after.channels.map((c) => [c.id, c.delivery]))
+/** Whether one section key's written value differs (b.deo SRI-802): by `JSON.stringify`, never validated or resolved. */
+function sectionKeyChanged(before: Persona, after: Persona, key: RecordedSectionKey): boolean {
+  return JSON.stringify(before.sections[key]) !== JSON.stringify(after.sections[key])
+}
+
+/**
+ * The in-place settings and the recorded keys that differ between two
+ * declarations of one persona (b.av2 SR-8.6, b.deo SRI-802, SRI-804),
+ * classified by the candidate's section in force (`mode`, the candidate's
+ * channel mode):
+ * - when both configurations are in that mode, its section is compared by
+ *   resolved values: the declarative section by the set of channel IDs, a
+ *   kept channel's `delivery` and `permission_prompts`, as b.av2 SR-8.6
+ *   compares them; the fungible section by `fungible_destination`, so an
+ *   absent `invited.permission_prompts` equals `dm`;
+ * - otherwise (the switch changed), its keys are compared as written
+ *   (`sections`), and a changed `channels`, `permission_prompts` or `invited`
+ *   is an in-place change of `channels`, `permission_prompts` or
+ *   `invited.permission_prompts`;
+ * - the keys of the other section are always compared as written, and a
+ *   changed one is recorded, never applied;
+ * - `dm.enabled` and `dm.contact` are compared by resolved value in both
+ *   modes.
+ * So a change of the switch alone modifies no persona (b.deo SRI-203).
+ */
+function personaSectionChanges(
+  before: Persona,
+  after: Persona,
+  mode: ChannelMode,
+  sameMode: boolean,
+): { inPlace: InPlaceSetting[]; recorded: RecordedSectionKey[] } {
   const changed: Record<InPlaceSetting, boolean> = {
-    channels: was.size !== now.size || [...now.keys()].some((id) => !was.has(id)),
-    delivery: [...now].some(([id, delivery]) => was.has(id) && was.get(id) !== delivery),
-    permission_prompts: before.permission_prompts !== after.permission_prompts,
+    channels: false,
+    delivery: false,
+    permission_prompts: false,
+    'invited.permission_prompts': false,
     'dm.enabled': before.dm.enabled !== after.dm.enabled,
     'dm.contact': before.dm.contact !== after.dm.contact,
   }
-  return IN_PLACE_SETTINGS.filter((setting) => changed[setting])
+  let recorded: RecordedSectionKey[]
+  if (mode === 'declarative') {
+    if (sameMode) {
+      const was = new Map(before.channels.map((c) => [c.id, c.delivery]))
+      const now = new Map(after.channels.map((c) => [c.id, c.delivery]))
+      changed.channels = was.size !== now.size || [...now.keys()].some((id) => !was.has(id))
+      changed.delivery = [...now].some(([id, delivery]) => was.has(id) && was.get(id) !== delivery)
+      changed.permission_prompts = before.permission_prompts !== after.permission_prompts
+    } else {
+      changed.channels = sectionKeyChanged(before, after, 'channels')
+      changed.permission_prompts = sectionKeyChanged(before, after, 'permission_prompts')
+    }
+    recorded = sectionKeyChanged(before, after, 'invited') ? ['invited'] : []
+  } else {
+    changed['invited.permission_prompts'] = sameMode
+      ? before.fungible_destination !== after.fungible_destination
+      : sectionKeyChanged(before, after, 'invited')
+    recorded = (['channels', 'permission_prompts'] as const).filter((key) => sectionKeyChanged(before, after, key))
+  }
+  return { inPlace: IN_PLACE_SETTINGS.filter((setting) => changed[setting]), recorded }
 }
 
 /** Two values of one server-wide setting are equal (paths by real path, anything else by JSON value). */
@@ -495,8 +615,9 @@ function configDirsDiffer(applied: PersonaConfig, candidate: PersonaConfig, home
 
 /**
  * Classify `candidate` against the `applied` configuration (b.av2 SR-8.4,
- * SR-8.6). Pure: reads no file, calls no Slack or agent-director API, arms no
- * timer and logs nothing; every I/O-derived fact comes from `facts`.
+ * SR-8.6; b.deo SRI-802 to SRI-804). Pure: reads no file, calls no Slack or
+ * agent-director API, arms no timer and logs nothing; every I/O-derived fact
+ * comes from `facts`.
  *
  * Personas are matched by key, so a `name` change that changes the key is a
  * removal of the old key and an addition of the new one. For a persona
@@ -506,8 +627,14 @@ function configDirsDiffer(applied: PersonaConfig, candidate: PersonaConfig, home
  *   it and brings it up fresh (b.jg5 SRJ-1511). It is not also listed as
  *   modified in place, credentials-changed or next-launch: the new half reads
  *   everything fresh;
- * - modified in place: `channels` (the set of IDs), a kept channel's
- *   `delivery`, `permission_prompts`, `dm.enabled` or `dm.contact` changed;
+ * - modified in place: a setting of the candidate's section in force changed
+ *   (declarative mode: `channels`, the set of IDs, a kept channel's
+ *   `delivery` or `permission_prompts`; fungible mode:
+ *   `invited.permission_prompts`), or `dm.enabled` or `dm.contact` changed,
+ *   compared as `personaSectionChanges` gives it;
+ * - recorded (b.deo SRI-804): a key of the section the candidate's switch
+ *   does not select changed. Recorded only: a persona with no other change
+ *   is unchanged. May come with any class but destructive;
  * - credentials changed: same `credentials_file` by real path, and the
  *   current digest or marker differs from the held one (never in dry run or
  *   with nothing held). May come with in-place changes;
@@ -524,9 +651,11 @@ function configDirsDiffer(applied: PersonaConfig, candidate: PersonaConfig, home
  *
  * Server-wide settings are compared by resolved value, paths by real path. A
  * changed `claude_config_dir` or `stop_hook_bootstrap` lists the personas
- * that inherit the change. `noEffectiveChange` holds when nothing but
- * unchanged personas remains: a whitespace or key-order edit, or a key added
- * with its default value.
+ * that inherit the change. A changed `allow_invited_channels` (absent and
+ * `false` are the same value) carries the mode it turns on and every persona
+ * present in both configurations (b.deo SRI-803). `noEffectiveChange` holds
+ * when nothing but unchanged personas remains: a whitespace or key-order
+ * edit, a key added with its default value, or recorded changes only.
  *
  * `configDirsChanged` tells the apply whether to refresh the agent-director
  * template (SR-8.6 step 5); it is not part of the preview.
@@ -544,6 +673,10 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
   const samePath = samePathWith(facts)
   const appliedByKey = new Map(applied.personas.map((p) => [p.key, p]))
   const nextKeys = new Set(next.personas.map((p) => p.key))
+  // b.deo SRI-802: each persona is classified by the candidate's section in
+  // force, read from the candidate's own switch.
+  const mode = channelModeOf(next)
+  const sameMode = channelModeOf(applied) === mode
 
   const plan: ValidChangePlan = {
     valid: true,
@@ -554,6 +687,7 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
     credentials: [],
     nextLaunch: [],
     unchanged: [],
+    recorded: [],
     settings: [],
     noEffectiveChange: false,
     configDirsChanged: configDirsDiffer(applied, next, facts.home),
@@ -585,11 +719,12 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
       continue
     }
     let changed = false
-    const inPlace = inPlaceChanges(before, persona)
-    if (inPlace.length > 0) {
-      plan.inPlace.push({ ...ref, settings: inPlace })
+    const sections = personaSectionChanges(before, persona, mode, sameMode)
+    if (sections.inPlace.length > 0) {
+      plan.inPlace.push({ ...ref, settings: sections.inPlace })
       changed = true
     }
+    if (sections.recorded.length > 0) plan.recorded.push({ ...ref, fields: sections.recorded })
     if (credentialsChanged(persona.key, persona.credentials_file, facts)) {
       const state = facts.bringUpState?.(persona.key)
       const known = state !== FACT_UNKNOWN
@@ -617,6 +752,13 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
 
   for (const name of SERVER_SETTINGS) {
     if (sameSetting(name, settingOf(applied, name), settingOf(next, name), samePath)) continue
+    if (name === MODE_SWITCH_SETTING) {
+      // b.deo SRI-803: the mode turned on applies in place to every persona
+      // present in both configurations.
+      const personas = next.personas.filter((p) => appliedByKey.has(p.key)).map(refOf)
+      plan.settings.push({ name, mode, personas })
+      continue
+    }
     if (!INHERITED_DEFAULTS.has(name)) {
       plan.settings.push({ name })
       continue
@@ -718,7 +860,7 @@ export const INVALID_PREFIX = 'INVALID:'
 /** End of an invalid candidate's preview. */
 const NOTHING_WILL_BE_APPLIED = 'Nothing will be applied.'
 
-function personaRef(p: ChangePlanPersonaRef): string {
+function personaRef(p: Pick<ChangePlanPersonaRef, 'name' | 'key'>): string {
   return `persona ${renderPersonaRef(p.name, p.key)}`
 }
 
@@ -845,13 +987,61 @@ const CLI_RECORD_AND_SERVER_START_SETTINGS: ReadonlySet<string> = new Set<string
 ])
 
 /**
+ * The switch's preview line (b.deo SRI-803): a change of
+ * `allow_invited_channels` turns `mode` on for every persona, in place at
+ * once, with every instance kept:
+ *
+ *   server-wide setting allow_invited_channels changed: turns fungible mode
+ *   on, applied in place at once, from the next event, tool call, prompt and
+ *   notice, for "alpha" (key=alpha), "bravo" (key=bravo); every instance kept.
+ *
+ * or, when no persona is present in both configurations, `…, prompt and
+ * notice; no persona is affected.` `personas` are the personas present in
+ * both configurations, in candidate order. The one builder of this line: the
+ * preview renders it through this, and tests and scenario texts build it
+ * here. Pure; unescaped (`renderPreviewLines` escapes).
+ */
+export function modeSwitchLine(
+  mode: ChannelMode,
+  personas: readonly Pick<ChangePlanPersonaRef, 'name' | 'key'>[],
+): string {
+  const head =
+    `server-wide setting ${MODE_SWITCH_SETTING} changed: turns ${mode} mode on, applied in place at once, ` +
+    'from the next event, tool call, prompt and notice'
+  if (personas.length === 0) return `${head}; no persona is affected.`
+  return `${head}, for ${personas.map((p) => renderPersonaRef(p.name, p.key)).join(', ')}; every instance kept.`
+}
+
+/**
+ * A recorded change's preview line (b.deo SRI-804): the persona, its changed
+ * keys of the section not in force, and that the change is recorded with no
+ * effect until the switch selects that section:
+ *
+ *   persona "alpha" (key=alpha): channels, permission_prompts changed in the
+ *   declarative section: recorded, with no effect until
+ *   allow_invited_channels selects declarative mode.
+ *
+ * The section is the fungible one when the change names `invited`, else the
+ * declarative one. Pure; unescaped (`renderPreviewLines` escapes).
+ */
+export function recordedLine(p: Pick<RecordedPersonaChange, 'name' | 'key' | 'fields'>): string {
+  const section: ChannelMode = p.fields.includes('invited') ? 'fungible' : 'declarative'
+  return (
+    `${personaRef(p)}: ${p.fields.join(', ')} changed in the ${section} section: recorded, with no effect until ` +
+    `${MODE_SWITCH_SETTING} selects ${section} mode.`
+  )
+}
+
+/**
  * A changed server-wide setting's preview line, worded by who uses the
- * setting: only the CLI (`CLI_RECORD_SETTINGS`), both the CLI and the running
- * server (`CLI_RECORD_AND_SERVER_START_SETTINGS`), or only the server (every
- * other setting: from the next server start or, for an inherited default, at
- * each inheriting persona's next launch). Pure.
+ * setting: the switch (`modeSwitchLine`), only the CLI
+ * (`CLI_RECORD_SETTINGS`), both the CLI and the running server
+ * (`CLI_RECORD_AND_SERVER_START_SETTINGS`), or only the server (every other
+ * setting: from the next server start or, for an inherited default, at each
+ * inheriting persona's next launch). Pure.
  */
 function settingLine(s: ServerSettingChange): string {
+  if (s.name === MODE_SWITCH_SETTING && s.mode !== undefined) return modeSwitchLine(s.mode, s.personas ?? [])
   const prefix = `server-wide setting ${s.name} changed:`
   const recorded = 'once applied, it is recorded'
   if (CLI_RECORD_SETTINGS.has(s.name)) {
@@ -888,13 +1078,16 @@ function inheritedConfigDirWarnings(inheritedBy: readonly InheritingPersonaRef[]
 }
 
 /**
- * The preview's lines (b.av2 SR-8.4), each on one line (control characters
- * escaped). An invalid plan: one `INVALID:` line with the full error and
- * `Nothing will be applied.`, with no counts and no persona lines. A plan
- * with no effect: the title and `no effective change`. Otherwise the header
+ * The preview's lines (b.av2 SR-8.4, b.deo SRI-803, SRI-804), each on one
+ * line (control characters escaped). An invalid plan: one `INVALID:` line
+ * with the full error and `Nothing will be applied.`, with no counts and no
+ * persona lines. A plan with no effect: the title and `no effective change`,
+ * then its recorded lines (`recordedLine`), if any. Otherwise the header
  * (the title and the counts), then the removals, the destructive modifies,
  * the additions, the other affected personas in candidate order (one line
- * each, stating every effect), then the changed server-wide settings.
+ * each, stating every effect), then the recorded lines in candidate order,
+ * then the changed server-wide settings, the switch's line
+ * (`modeSwitchLine`) among them.
  * Personas are named by their JSON-quoted name and key, credentials files by
  * path; no token, credentials content, setting value or digest. Pure and
  * deterministic.
@@ -904,7 +1097,8 @@ export function renderPreviewLines(plan: ChangePlan): string[] {
   if (plan.noEffectiveChange) {
     return [
       `${PENDING_PREVIEW_TITLE} ${NO_EFFECTIVE_CHANGE}: applying it would change no persona and no server-wide setting.`,
-    ]
+      ...plan.recorded.map(recordedLine),
+    ].map(escapeCause)
   }
   const lines = [`${PENDING_PREVIEW_TITLE} ${renderChangePlanCounts(changePlanCounts(plan))}.`]
   lines.push(...plan.removed.map(removedLine))
@@ -922,6 +1116,7 @@ export function renderPreviewLines(plan: ChangePlan): string[] {
     if (line !== undefined) lines.push(line)
   }
 
+  lines.push(...plan.recorded.map(recordedLine))
   lines.push(...plan.settings.map(settingLine))
   return lines.map(escapeCause)
 }

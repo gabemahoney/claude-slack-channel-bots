@@ -1,11 +1,21 @@
 /**
  * test-helpers/persona-config.ts — Shared persona-configuration fixtures
- * (b.av2 SR-13.4).
+ * (b.av2 SR-13.4, b.deo SRI-1203).
  *
  * Builds persona configurations in file form (`PersonaInput`,
  * `PersonaConfigInput`) and resolved form (`PersonaConfig`), and writes a
  * file-form config into a caller-owned directory. The defaults load without
  * error through `loadPersonaConfig`.
+ *
+ * Channel modes (b.deo SRI-101, SRI-102): every builder takes the
+ * `allow_invited_channels` switch through its server-wide overrides and the
+ * `invited` section through its persona overrides or specs. The defaults keep
+ * declarative mode (the switch absent in file form, `false` resolved) with no
+ * `invited` key. The resolved builders fill `fungible_destination` and
+ * `sections` from the values they set, as the loader does in the mode the
+ * switch picks (`channelModeOf`): in fungible mode the resolved `channels` are
+ * empty and `permission_prompts` undefined, and `fungible_destination` is
+ * `invited.permission_prompts`, `dm` when that is absent.
  *
  * Isolation (b.av2 SR-13.2): every default path sits under a base directory,
  * the OS temp directory unless the caller passes its own `mkdtempSync`
@@ -21,21 +31,29 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  channelModeOf,
   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS,
   DEFAULT_REPLY_CHUNK_LIMIT,
   DEFAULT_REPLY_CHUNK_MODE,
+  DM_DESTINATION,
+  type ChannelEntry,
+  type ChannelMode,
   type Persona,
   type PersonaConfig,
   type PersonaConfigInput,
   type PersonaInput,
+  type PersonaInvitedInput,
 } from '../../src/config.ts'
 import { personaKey } from '../../src/persona-identity.ts'
 
 /** Name of the default persona. */
 const DEFAULT_NAME = 'test_bot'
 
-/** Channel the default persona is in and sends permission prompts to. */
+/**
+ * Channel the default persona is in and sends permission prompts to; in
+ * fungible mode, the default persona's fungible destination.
+ */
 const DEFAULT_CHANNEL_ID = 'C0TEST001'
 
 /** File name `writeConfigFile` gives the configuration inside its directory. */
@@ -51,9 +69,57 @@ function defaultPersonaPaths(name: unknown, baseDir: string): { credentials_file
 }
 
 /**
- * One persona entry in file form. Defaults: one `all` channel, prompts to that
- * channel, DMs off, paths under `baseDir` derived from the name. An override
- * set to `undefined` drops the key from the written JSON.
+ * The channel mode a configuration's switch picks, with an absent switch
+ * resolved as the loader resolves it (b.deo SRI-101).
+ */
+function modeOf(allowInvitedChannels: boolean | undefined): ChannelMode {
+  return channelModeOf({ allow_invited_channels: allowInvitedChannels ?? false })
+}
+
+/** The three section keys of a persona entry, as written. */
+interface WrittenSections {
+  channels?: ChannelEntry[]
+  permission_prompts?: string
+  invited?: PersonaInvitedInput
+}
+
+/**
+ * A persona's resolved section fields, from its section keys as written, as
+ * the loader resolves them in `mode` (b.deo SRI-102): declarative mode reads
+ * `channels` and `permission_prompts`; fungible mode reads `invited` only.
+ * `sections` holds the three values as written, each undefined when absent,
+ * in objects of its own as the loader's are. No validation runs.
+ */
+function resolvedSections(
+  written: WrittenSections,
+  mode: ChannelMode,
+): Pick<Persona, 'channels' | 'permission_prompts' | 'fungible_destination' | 'sections'> {
+  const sections = {
+    channels: written.channels?.map((entry) => ({ ...entry })),
+    permission_prompts: written.permission_prompts,
+    invited: written.invited,
+  }
+  if (mode === 'fungible') {
+    return {
+      channels: [],
+      permission_prompts: undefined,
+      fungible_destination: written.invited?.permission_prompts ?? DM_DESTINATION,
+      sections,
+    }
+  }
+  return {
+    channels: written.channels ?? [],
+    permission_prompts: written.permission_prompts,
+    fungible_destination: undefined,
+    sections,
+  }
+}
+
+/**
+ * One persona entry in file form, for declarative mode. Defaults: one `all`
+ * channel, prompts to that channel, DMs off, no `invited`, paths under
+ * `baseDir` derived from the name. An override set to `undefined` drops the
+ * key from the written JSON; an `invited` override adds the fungible section.
  */
 export function makePersona(overrides: Partial<PersonaInput> = {}, baseDir: string = tmpdir()): PersonaInput {
   const name = overrides.name ?? DEFAULT_NAME
@@ -68,34 +134,60 @@ export function makePersona(overrides: Partial<PersonaInput> = {}, baseDir: stri
 }
 
 /**
+ * One persona entry in file form, for fungible mode (b.deo SRI-102,
+ * SRI-1203): no `channels` and no top-level `permission_prompts`, a channel
+ * ID as its fungible destination (`invited.permission_prompts`), DMs off, and
+ * paths under `baseDir` derived from the name as `makePersona` derives them.
+ * Written under a switch set to `true`, it loads. Overrides apply as for
+ * `makePersona`.
+ */
+export function makeFungiblePersona(overrides: Partial<PersonaInput> = {}, baseDir: string = tmpdir()): PersonaInput {
+  const name = overrides.name ?? DEFAULT_NAME
+  return {
+    name,
+    ...defaultPersonaPaths(name, baseDir),
+    dm: { enabled: false },
+    invited: { permission_prompts: DEFAULT_CHANNEL_ID },
+    ...overrides,
+  }
+}
+
+/**
  * A whole configuration in file form: one default persona and no server-wide
  * settings unless overridden, so the cron paths default under the directory
- * the file is written to. Never holds `routes`, `default_route` or
+ * the file is written to. The switch is absent unless overridden; with
+ * `allow_invited_channels: true` the default persona is `makeFungiblePersona`'s,
+ * else `makePersona`'s. Never holds `routes`, `default_route` or
  * `default_dm_session` unless a test adds them.
  */
 export function makePersonaConfigInput(
   overrides: Partial<PersonaConfigInput> = {},
   baseDir: string = tmpdir(),
 ): PersonaConfigInput {
-  return { personas: [makePersona({}, baseDir)], ...overrides }
+  const persona =
+    modeOf(overrides.allow_invited_channels) === 'fungible' ? makeFungiblePersona({}, baseDir) : makePersona({}, baseDir)
+  return { personas: [persona], ...overrides }
 }
 
 /**
  * A resolved configuration, as `loadPersonaConfig` returns it for
  * `makePersonaConfigInput(…, baseDir)` written into `baseDir`, except that
  * `mcp_config_path` also sits under `baseDir` rather than a home directory.
+ * `allow_invited_channels` resolves to `false` unless overridden; the default
+ * persona's `fungible_destination` and `sections` are filled for the mode the
+ * resolved switch picks, as the loader fills them.
  */
 export function makePersonaConfig(overrides: Partial<PersonaConfig> = {}, baseDir: string = tmpdir()): PersonaConfig {
-  const input = makePersona({}, baseDir)
+  const mode = modeOf(overrides.allow_invited_channels)
+  const input = mode === 'fungible' ? makeFungiblePersona({}, baseDir) : makePersona({}, baseDir)
   const persona: Persona = {
     index: 0,
     name: input.name,
     key: personaKey(input.name),
     credentials_file: input.credentials_file,
     working_directory: input.working_directory,
-    channels: input.channels ?? [],
+    ...resolvedSections(input, mode),
     dm: { enabled: false },
-    permission_prompts: input.permission_prompts,
     stop_hook_bootstrap: true,
   }
   return {
@@ -117,16 +209,18 @@ export function makePersonaConfig(overrides: Partial<PersonaConfig> = {}, baseDi
     cron_log_path: join(baseDir, 'cron.log'),
     reply_chunk_limit: DEFAULT_REPLY_CHUNK_LIMIT,
     reply_chunk_mode: DEFAULT_REPLY_CHUNK_MODE,
+    allow_invited_channels: false,
     ...overrides,
   }
 }
 
 /**
  * One persona in `makeMultiPersonaConfig`: any resolved `Persona` field except
- * `index` (always the list position). Omitted fields take the defaults
- * described on `makeMultiPersonaConfig`.
+ * `index` (always the list position), plus `invited`, the fungible section as
+ * written (b.deo SRI-102). Omitted fields take the defaults described on
+ * `makeMultiPersonaConfig`.
  */
-export type PersonaSpec = Partial<Omit<Persona, 'index'>>
+export type PersonaSpec = Partial<Omit<Persona, 'index'>> & { invited?: PersonaInvitedInput }
 
 /**
  * A resolved configuration with one persona per entry of `specs`, in order,
@@ -134,17 +228,28 @@ export type PersonaSpec = Partial<Omit<Persona, 'index'>>
  * Unlike the loader it runs no validation, so a stand-in persona can set
  * `key` to a channel ID directly.
  *
- * Per-persona defaults, for the persona at position `i`:
+ * Per-persona defaults, for the persona at position `i`, in the channel mode
+ * `overrides.allow_invited_channels` picks (declarative when absent):
  * - `name`: `test_bot_<i+1>`; `key`: `personaKey(name)`.
- * - `channels`: one `all` channel `C0TEST<i+1, three digits>` (distinct per
- *   persona); `permission_prompts`: the first channel's ID, or `dm` when the
- *   persona has no channels; `dm`: off.
+ * - Declarative mode: `channels`: one `all` channel `C0TEST<i+1, three
+ *   digits>` (distinct per persona); `permission_prompts`: the first
+ *   channel's ID, or `dm` when the persona has no channels;
+ *   `fungible_destination`: undefined.
+ * - Fungible mode (b.deo SRI-102): `channels` empty and `permission_prompts`
+ *   undefined, as the loader leaves them, unless the spec sets them;
+ *   `fungible_destination`: the spec's `invited.permission_prompts`, else
+ *   `dm`.
+ * - `sections`: the spec's `channels`, `permission_prompts` and `invited` as
+ *   written, with the declarative defaults above counted as written in
+ *   declarative mode; each undefined when absent.
+ * - `dm`: off.
  * - `credentials_file` / `working_directory`: `<baseDir>/personas/<personaKey(name)>/…`.
  *   Nothing is created on disk.
  * - `claude_config_dir`: inherited from `overrides.claude_config_dir` as the
  *   loader does; absent when neither is set. A spec that sets the key to
  *   `undefined` opts out of inheritance.
  * - `stop_hook_bootstrap`: inherited from the resolved top-level value.
+ * A spec's own `fungible_destination` or `sections` replaces the filled one.
  *
  * Throws when two personas share a name or a key, which the loader would reject.
  * Keys where one starts with the other (`dev`, `dev_2`), which the loader also
@@ -159,18 +264,25 @@ export function makeMultiPersonaConfig(
   overrides: Partial<Omit<PersonaConfig, 'personas'>> = {},
 ): PersonaConfig {
   const base = makePersonaConfig(overrides, baseDir)
-  const personas: Persona[] = specs.map((spec, index) => {
+  const mode = modeOf(base.allow_invited_channels)
+  const personas: Persona[] = specs.map(({ invited, ...spec }, index) => {
     const name = spec.name ?? `${DEFAULT_NAME}_${index + 1}`
-    const channels = spec.channels ?? [{ id: `C0TEST${String(index + 1).padStart(3, '0')}`, delivery: 'all' }]
+    let written: WrittenSections
+    if (mode === 'fungible') {
+      written = { channels: spec.channels, permission_prompts: spec.permission_prompts, invited }
+    } else {
+      const channels = spec.channels ?? [{ id: `C0TEST${String(index + 1).padStart(3, '0')}`, delivery: 'all' }]
+      const permissionPrompts = 'permission_prompts' in spec ? spec.permission_prompts : (channels[0]?.id ?? DM_DESTINATION)
+      written = { channels, permission_prompts: permissionPrompts, invited }
+    }
     const claudeConfigDir = 'claude_config_dir' in spec ? spec.claude_config_dir : base.claude_config_dir
     const persona: Persona = {
       index,
       name,
       key: personaKey(name),
       ...defaultPersonaPaths(name, baseDir),
-      channels,
+      ...resolvedSections(written, mode),
       dm: { enabled: false },
-      permission_prompts: channels[0]?.id ?? 'dm',
       stop_hook_bootstrap: base.stop_hook_bootstrap,
       ...spec,
     }
@@ -191,9 +303,12 @@ export function makeMultiPersonaConfig(
 /**
  * A resolved configuration of stand-in personas, each keyed by a channel ID:
  * one persona per entry of `personas`, in insertion order,
- * each named and keyed by its channel ID (the record key), in that one `all`
- * channel with permission prompts there and DMs off. The record value adds
- * or overrides further fields (`working_directory`, `claude_config_dir`, …);
+ * each named and keyed by its channel ID (the record key), with DMs off and
+ * permission prompts sent to that channel: in declarative mode it is in that
+ * one `all` channel with `permission_prompts` set to it; in fungible mode
+ * (`overrides.allow_invited_channels: true`) it is the persona's
+ * `invited.permission_prompts`. The record value adds or overrides further
+ * fields (`working_directory`, `claude_config_dir`, `invited`, …);
  * everything else, including the server-wide `overrides`, is as for
  * `makeMultiPersonaConfig`. Channel IDs begin with a letter, so the record
  * keeps insertion order.
@@ -205,12 +320,14 @@ export function makeStandInPersonaConfig(
   baseDir: string,
   overrides: Partial<Omit<PersonaConfig, 'personas'>> = {},
 ): PersonaConfig {
+  const fungible = modeOf(overrides.allow_invited_channels) === 'fungible'
   return makeMultiPersonaConfig(
-    Object.entries(personas).map(([id, spec]) => ({
+    Object.entries(personas).map(([id, spec]): PersonaSpec => ({
       name: id,
       key: id,
-      channels: [{ id, delivery: 'all' as const }],
-      permission_prompts: id,
+      ...(fungible
+        ? { invited: { permission_prompts: id } }
+        : { channels: [{ id, delivery: 'all' as const }], permission_prompts: id }),
       ...spec,
     })),
     baseDir,

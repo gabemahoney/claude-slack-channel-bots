@@ -731,7 +731,7 @@ describe('runJsonlPersistenceSafeguard — real per-persona notifier', () => {
 
     const aPosts = h.posts(a.key)
     expect(aPosts).toHaveLength(1)
-    expect(aPosts[0]!.channel).toBe(a.permission_prompts)
+    expect(aPosts[0]!.channel).toBe(a.permission_prompts!)
     expect(aPosts[0]!.text).toContain(renderPersonaRef(a.name, a.key))
     expect(aPosts[0]!.text).toContain(fallback)
     expect(h.posts(b.key)).toEqual([])
@@ -789,7 +789,7 @@ describe('runJsonlPersistenceSafeguard — real per-persona notifier', () => {
     // A (channel destination) is unchanged: one post to its channel, no open.
     expect(h.stub(a.key).web.callLog.map((c) => c.method)).toEqual(['chat.postMessage'])
     const aPosts = h.posts(a.key)
-    expect(aPosts).toEqual([{ channel: a.permission_prompts, text: expect.any(String) }])
+    expect(aPosts).toEqual([{ channel: a.permission_prompts!, text: expect.any(String) }])
     // Same notice text for either destination, apart from the persona reference.
     const refA = renderPersonaRef(a.name, a.key)
     expect(dPosts[0]!.text.replace(refD, '<ref>')).toBe(aPosts[0]!.text.replace(refA, '<ref>'))

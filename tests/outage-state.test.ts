@@ -799,7 +799,7 @@ describe('persona-keyed notices', () => {
         refA: renderPersonaRef(a.name, a.key),
         refB: renderPersonaRef(b.name, b.key),
         keyA: a.key,
-        destA: a.permission_prompts,
+        destA: a.permission_prompts!,
         lines: h.logs,
       }
     }

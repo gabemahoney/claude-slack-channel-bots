@@ -1284,6 +1284,8 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         ack_reaction: 'eyes',
         reply_chunk_limit: 12000,
         reply_chunk_mode: 'length',
+        // makePersonaConfigInput gives a switch set to true its fungible-mode persona.
+        allow_invited_channels: true,
       } satisfies Omit<Required<PersonaConfigInput>, 'personas'>
       const underHome = (path: string) => join(home, path.slice(2))
       expect(load(makePersonaConfigInput(values))).toMatchObject({
