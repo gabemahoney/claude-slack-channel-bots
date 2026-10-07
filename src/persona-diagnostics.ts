@@ -1,6 +1,6 @@
 /**
  * persona-diagnostics.ts — Persona diagnostic class labels and the
- * broken-persona log line (b.av2 SR-10.3).
+ * broken-persona log line (b.av2 SR-10.3, with b.deo SRI-901 to SRI-903).
  *
  * Every persona diagnostic line carries exactly one class label. This module
  * owns the closed set of labels and the one formatter that turns a structured
@@ -20,12 +20,18 @@
  *
  * The labels cover credentials refused, Slack unreachable, connection lost
  * and restored, the unclaimed channel and the DM drop, the per-persona start
- * line, the destination failure, the failed credentials change and the
- * unresolvable claude_config_dir.
+ * line, the destination failure, the failed credentials change, the
+ * unresolvable claude_config_dir, and the channel a persona hears in fungible
+ * mode (b.deo SRI-901). The channel causes (b.deo SRI-902, SRI-903) are built
+ * here once: `invitedChannelCause`, `unclaimedChannelCause` for declarative
+ * mode, and `fungibleUnclaimedChannelCause` with its exported reason texts
+ * for fungible mode. None carries message text, a user ID or a token.
  *
  * SPDX-License-Identifier: MIT
  */
 
+import type { DeliveryMode } from './config.ts'
+import type { FungibleChannelType, FungibleRefusal } from './delivery-decision.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 
 // ---------------------------------------------------------------------------
@@ -71,9 +77,13 @@ export const PERSONA_DIRECTORY_MISSING = 'persona-directory-missing'
 export const PERSONA_DIRECTORY_UNUSABLE = 'persona-directory-unusable'
 
 /**
- * A message arrived in a channel that no applied persona lists (b.av2 SR-4.2,
- * SR-10.3). Logged by each receiving persona; the cause names the channel.
- * Not logged when another applied persona lists the channel.
+ * A channel message was not delivered because no persona serves its channel
+ * (b.av2 SR-4.2, SR-10.3; b.deo SRI-303, SRI-903). Declarative mode: a message in a
+ * channel that no applied persona lists, logged by each receiving persona,
+ * and not logged when another applied persona lists the channel
+ * (`unclaimedChannelCause`). Fungible mode: a `message` event refused on the
+ * fungible path, with the reason (`fungibleUnclaimedChannelCause`). The cause
+ * names the channel.
  */
 export const UNCLAIMED_CHANNEL = 'unclaimed-channel'
 
@@ -123,6 +133,16 @@ export const PERSONA_CREDENTIALS_CHANGE_FAILED = 'persona-credentials-change-fai
  */
 export const PERSONA_CONFIG_DIR_UNRESOLVABLE = 'persona-config-dir-unresolvable'
 
+/**
+ * A persona heard a channel in fungible mode (b.deo SRI-307, SRI-902): the
+ * first event in the persona's life that took its fungible path for that
+ * channel, delivered or not. Logged once per persona life and channel, to
+ * `server.log` only. The cause (`invitedChannelCause`) names the channel ID,
+ * `public` or `private`, and the persona's channel delivery there after the
+ * loop guard; the line has no path.
+ */
+export const PERSONA_INVITED_CHANNEL = 'persona-invited-channel'
+
 /** Every persona diagnostic class label, in a fixed order. */
 export const PERSONA_DIAGNOSTIC_CLASSES = [
   PERSONA_START,
@@ -140,6 +160,7 @@ export const PERSONA_DIAGNOSTIC_CLASSES = [
   PERSONA_DESTINATION_FAILED,
   PERSONA_CREDENTIALS_CHANGE_FAILED,
   PERSONA_CONFIG_DIR_UNRESOLVABLE,
+  PERSONA_INVITED_CHANNEL,
 ] as const
 
 /** A persona diagnostic class label (closed set). */
@@ -244,6 +265,77 @@ export function formatCredentialsChangeFailed(failure: CredentialsChangeFailure)
       `the confirmed credentials change cannot be used: ${cause}; ` +
       `${CREDENTIALS_CHANGE_KEPT_TEXT[kept]}, and the change stays pending`,
   })
+}
+
+// ---------------------------------------------------------------------------
+// Channel causes (b.deo SRI-902, SRI-903)
+// ---------------------------------------------------------------------------
+
+/**
+ * The `persona-invited-channel` cause (b.deo SRI-902), formatted through
+ * `formatPersonaDiagnostic` with no path:
+ *
+ *   `hears <public|private> channel <channel> in fungible mode, at channel delivery <mentions|all>`
+ *
+ * `delivery` is the persona's channel delivery after the loop guard. Pure.
+ */
+export function invitedChannelCause(
+  channel: string,
+  channelType: FungibleChannelType,
+  delivery: DeliveryMode,
+): string {
+  return `hears ${channelType} channel ${channel} in fungible mode, at channel delivery ${delivery}`
+}
+
+/**
+ * The declarative-mode `unclaimed-channel` cause (b.av2 SR-10.3, b.deo
+ * SRI-903), formatted through `formatPersonaDiagnostic` with no path:
+ *
+ *   `message in channel <channel> not delivered: no applied persona lists this channel`
+ *
+ * Pure.
+ */
+export function unclaimedChannelCause(channel: string): string {
+  return `message in channel ${channel} not delivered: no applied persona lists this channel`
+}
+
+/** Fungible-mode `unclaimed-channel` reason: the envelope flag is `true` (b.deo SRI-303, SRI-903). */
+export const UNCLAIMED_REASON_EXTERNALLY_SHARED = 'the channel is externally shared'
+
+/** Fungible-mode `unclaimed-channel` reason: the envelope carries no `is_ext_shared_channel` (b.deo SRI-903). */
+export const UNCLAIMED_REASON_FLAG_MISSING = 'the event envelope carries no is_ext_shared_channel flag'
+
+/** Fungible-mode `unclaimed-channel` reason: the envelope's `is_ext_shared_channel` is not a boolean (b.deo SRI-903). */
+export const UNCLAIMED_REASON_FLAG_NOT_BOOLEAN = "the event envelope's is_ext_shared_channel flag is not a boolean"
+
+/** Fungible-mode `unclaimed-channel` reason: the channel ID does not match `CHANNEL_ID_RE` (b.deo SRI-903). */
+export const UNCLAIMED_REASON_CHANNEL_ID_MALFORMED = 'the channel ID is malformed'
+
+/** Fungible-mode `unclaimed-channel` reason: `channel_type` is not `channel` or `group` (b.deo SRI-903). */
+export const UNCLAIMED_REASON_NOT_A_CHANNEL = 'the conversation is not a public or private channel'
+
+/** Each fungible-path refusal's reason text (b.deo SRI-903): a closed mapping, one text per refusal. */
+export const FUNGIBLE_REFUSAL_TEXTS: Readonly<Record<FungibleRefusal, string>> = {
+  'not-a-channel': UNCLAIMED_REASON_NOT_A_CHANNEL,
+  'channel-id-malformed': UNCLAIMED_REASON_CHANNEL_ID_MALFORMED,
+  'flag-missing': UNCLAIMED_REASON_FLAG_MISSING,
+  'flag-not-boolean': UNCLAIMED_REASON_FLAG_NOT_BOOLEAN,
+  'externally-shared': UNCLAIMED_REASON_EXTERNALLY_SHARED,
+}
+
+/**
+ * The fungible-mode `unclaimed-channel` cause (b.deo SRI-903), formatted
+ * through `formatPersonaDiagnostic` with no path:
+ *
+ *   `message in channel <channel> not delivered in fungible mode: <reason>; to serve this channel, use declarative mode with the channel listed`
+ *
+ * `<reason>` is the refusal's text from `FUNGIBLE_REFUSAL_TEXTS`. Pure.
+ */
+export function fungibleUnclaimedChannelCause(channel: string, refusal: FungibleRefusal): string {
+  return (
+    `message in channel ${channel} not delivered in fungible mode: ${FUNGIBLE_REFUSAL_TEXTS[refusal]}; ` +
+    'to serve this channel, use declarative mode with the channel listed'
+  )
 }
 
 /** Control characters (C0, DEL, C1) and the Unicode line/paragraph separators. */

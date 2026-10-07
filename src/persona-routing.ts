@@ -1,16 +1,29 @@
 /**
- * persona-routing.ts — Inbound Slack delivery per persona (b.av2 SR-4.1,
- * SR-4.2, SR-4.3, SR-4.4, SR-10.3 `unclaimed-channel` and `persona-dm-dropped`).
+ * persona-routing.ts — Inbound Slack delivery per persona, in both channel
+ * modes (b.av2 SR-4.1 with b.deo SRI-301 and SRI-302, SR-4.2 with b.deo
+ * SRI-303 to SRI-309, SR-4.3, SR-4.4 with b.deo SRI-306, SR-10.3 `unclaimed-channel`,
+ * `persona-dm-dropped` and, with b.deo SRI-901 to SRI-903,
+ * `persona-invited-channel`).
  *
  * Every `message` and `app_mention` event a persona's connection receives
  * feeds that persona's single pipeline:
  *
- * 1. Intake (`receive`): the event is acked first, before anything else. Then,
- *    for each receiving persona, the archive is written through the archive
- *    seam (unconditionally, before dedupe and any decision) and that persona's
- *    pipeline runs. Each persona's run is isolated: a throw is caught and
- *    logged, naming the persona, and never stops another persona's run.
- * 2. Dedupe (b.av2 SR-4.1): P's own store (`src/inbound-dedupe.ts`), kept
+ * 1. Intake (`receive`; b.av2 SR-4.1, b.deo SRI-301): the event is acked
+ *    first, before anything else. Then, for each receiving persona, the
+ *    archive is written through the archive seam (unconditionally, in both
+ *    modes, before dedupe and any decision) and that persona's pipeline runs
+ *    with the envelope flag the event router passed, unchanged. Each
+ *    persona's run is isolated: a throw is caught and logged, naming the
+ *    persona, and never stops another persona's run.
+ * 2. Mode (b.deo SRI-201, SRI-302): the channel mode is read once for the
+ *    event, through `channelModeOf`, from the configuration in effect as the
+ *    event arrives; no copy is kept across events. In fungible mode an
+ *    `app_mention` (a group-DM one included) ends here, after its archive
+ *    write: no dedupe record, decision, line, dispatch, reaction or report.
+ *    The `message` event carrying the same mention decides, so one @mention
+ *    is delivered once whichever event arrives first. In declarative mode an
+ *    `app_mention` carries on.
+ * 3. Dedupe (b.av2 SR-4.1, b.deo SRI-302): P's own store (`src/inbound-dedupe.ts`), kept
  *    per persona key for the life of this routing instance (so it survives a
  *    reopen of P's connection), records the event's (channel, ts), or
  *    (channel, ts, edited.ts) when the event carries a top-level `edited.ts`
@@ -19,19 +32,40 @@
  *    retention window, such as the second of the `message` / `app_mention`
  *    pair or a Slack redelivery, stops here with no decision, dispatch,
  *    reaction, recovery, post or log line. An event without a channel or ts
- *    is not keyed and carries on.
- * 3. Decision: one call to `decideDelivery` (`src/delivery-decision.ts`, the
- *    only module holding delivery rules) with P's key, bot user ID, bot ID,
- *    channel entries and DMs switch (`dm.enabled`) and the applied personas.
- *    It returns deliver with `via`, or drop with a reason. A DM is decided
- *    only against the persona whose connection received it.
- * 4. Drop logging: a channel no applied persona lists logs one
- *    `unclaimed-channel` line naming the channel and P; a channel another
- *    applied persona lists logs nothing; a DM to P with its DMs switch off
- *    logs one `persona-dm-dropped` line naming P and `dm.enabled`, and makes
- *    no Slack call; any other reason logs one plain line naming the author
- *    ID. No drop line carries message text.
- * 5. Dispatch: the author's label is resolved, then P's session is looked up by
+ *    is not keyed and carries on. A record made under the mode in force
+ *    before a switch change stands.
+ * 4. Decision (b.av2 SR-4.2, b.deo SRI-309): one call to `decideDelivery`
+ *    (`src/delivery-decision.ts`, the only module holding delivery rules)
+ *    with P's key, bot user ID, bot ID, channel entries and DMs switch
+ *    (`dm.enabled`) and the applied personas. In fungible mode it also gets
+ *    the fungible-mode inputs, built at the event: the mode, the envelope
+ *    flag, `CHANNEL_ID_RE`, the stored choices read through
+ *    `getChannelDelivery` (readability and lookup only; the routing never
+ *    writes to the store or drops from it), and each applied persona's
+ *    destination through the one destination rule (`personaDestinationOf`).
+ *    In declarative mode it gets none of them. It returns deliver with
+ *    `via`, or drop with a reason, and says whether the event took the
+ *    fungible path. A DM is decided only against the persona whose
+ *    connection received it.
+ * 5. Audit line (b.deo SRI-307): the first event in P's persona life that
+ *    took P's fungible path for a channel adds the channel to P's heard set
+ *    and logs one `persona-invited-channel` line, before any drop line or
+ *    dispatch, so a `not-mentioned` drop and a lost message log it too.
+ *    Later events from that channel in the same life log none. The heard set
+ *    is kept per persona key beside the dedupe stores, in memory only, and
+ *    read through `heardChannels`; every routing instance starts with empty
+ *    heard sets and a switch change keeps them. Nothing about membership is
+ *    written anywhere (b.deo SRI-304).
+ * 6. Drop logging (b.av2 SR-10.3, b.deo SRI-903): in declarative mode a
+ *    channel no applied persona lists logs one `unclaimed-channel` line
+ *    naming the channel and P, and a channel another applied persona lists
+ *    logs nothing; in fungible mode a `message` event refused on the
+ *    fungible path logs one `unclaimed-channel` line naming the channel, P
+ *    and the reason. A DM to P with its DMs switch off logs one
+ *    `persona-dm-dropped` line naming P and `dm.enabled`, and makes no Slack
+ *    call; any other reason logs one plain line naming the author ID. One
+ *    event logs at most one drop line. No drop line carries message text.
+ * 7. Dispatch: the author's label is resolved, then P's session is looked up by
  *    persona key and its GET stream probed. The message goes as
  *    `notifications/claude/channel` to P's session only, with `chat_id` set
  *    to the source conversation (the channel, or the DM conversation).
@@ -44,12 +78,13 @@
  *    its bot ID. The meta also carries the author's
  *    `user_id` (or, for an author without `user`, its `bot_id`; never both)
  *    and `via`, how the message reached P (b.av2 SR-4.4).
- * 6. Lost message (b.av2 SR-4.6, SR-7.3; b.jg5 SRJ-1011, SRJ-1509): when P
+ * 8. Lost message (b.av2 SR-4.6, SR-7.3; b.jg5 SRJ-1011, SRJ-1509): when P
  *    has no live session, or its session has lost its GET stream, the
  *    message is dropped with no ack reaction or ack-tracker entry, a
  *    human-triggered restart of P is scheduled only in the "starting now"
  *    state, and one lost-message notice naming the sender and the state goes
- *    to P's destination through the injected `notify`. `src/lost-message.ts`
+ *    to P's destination through the injected `notify` (which resolves the
+ *    destination of the mode in force). `src/lost-message.ts`
  *    decides the state, the first that applies, from whether P is up, whether
  *    P is latched (held for a human), whether P is not answering (its
  *    `tmux-unresponsive` condition holds, or its `tmux-unavailable` or
@@ -75,12 +110,21 @@
  * The ack reaction's name comes from the server-wide `ack_reaction` setting
  * (b.av2 SR-1.6); with it absent, no persona reacts or records an entry.
  *
+ * A fungible-path event makes the same Slack calls as any other (b.deo
+ * SRI-304, SRI-309): none is added to learn membership.
+ *
+ * Teardown (b.av2 SR-6.5 as amended by b.jg5 SRJ-1507; b.deo SRI-307): the
+ * persona teardown calls `forget(key)`, which drops the key's dedupe store and
+ * heard set, so a persona torn down and brought back in one server run starts
+ * with empty ones and logs its `persona-invited-channel` lines again.
+ *
  * Side-effect free (b.av2 SR-13.1): importing this module creates no Slack
  * client, reads no token, file or environment variable, starts no timer and
  * logs nothing. Every Slack client, the persona config, the bot identity, the
  * name resolver, the archive writer, the ack-reaction source, the notice sink,
- * the logger and (optionally) the dedupe clock, the up predicate and the
- * lost-message state inputs are injected through `createPersonaRouting`. The
+ * the logger and (optionally) the dedupe clock, the stored choices, the up
+ * predicate and the lost-message state inputs are injected through
+ * `createPersonaRouting`. The
  * session lookup comes from the registry, the restart guards from the restart
  * and backoff modules and the outage flags from the outage state, so tests
  * drive their real state. This module makes no agent-director call itself;
@@ -90,20 +134,36 @@
  */
 
 import type { WebClient } from '@slack/web-api'
-import type { Persona, PersonaConfig, ReplySettings } from './config.ts'
+import {
+  CHANNEL_ID_RE,
+  channelModeOf,
+  type ChannelMode,
+  type Persona,
+  type PersonaConfig,
+  type ReplySettings,
+} from './config.ts'
 import type { SlackBotIdentity } from './persona-slack-validation.ts'
 import {
   decideDelivery,
   stripPersonaMention,
   type DeliverDecision,
+  type DeliveryDecision,
   type DropDecision,
+  type FungibleDecisionInputs,
+  type FungiblePath,
+  type StoredChoices,
 } from './delivery-decision.ts'
+import { personaDestinationOf } from './persona-destination.ts'
 import { hasGetStreamKey, sanitizeFilename } from './lib.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import {
   formatPersonaDiagnostic,
+  fungibleUnclaimedChannelCause,
+  invitedChannelCause,
   PERSONA_DM_DROPPED,
+  PERSONA_INVITED_CHANNEL,
   UNCLAIMED_CHANNEL,
+  unclaimedChannelCause,
 } from './persona-diagnostics.ts'
 import { describeSlackCallFailure, describeThrownValue } from './persona-connection-errors.ts'
 import { createInboundDedupeStore, type InboundDedupeStore } from './inbound-dedupe.ts'
@@ -139,6 +199,12 @@ const UNKNOWN_AUTHOR = 'unknown'
 /** Author shown in a drop line for an event with neither `user` nor `bot_id`. */
 const NO_AUTHOR_PLACEHOLDER = '(none)'
 
+/** The `type` of an `app_mention` event. */
+const APP_MENTION_EVENT_TYPE = 'app_mention'
+
+/** The channel mode in which a persona serves the channels its app is in (b.deo SRI-101). */
+const FUNGIBLE_MODE: ChannelMode = 'fungible'
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -146,8 +212,12 @@ const NO_AUTHOR_PLACEHOLDER = '(none)'
 /** The Slack `ack` handed over with a Socket Mode event. */
 export type SlackAck = () => Promise<void> | void
 
-/** The persona config fields this module reads. */
-export type PersonaRoutingConfig = Pick<PersonaConfig, 'personas' | 'session_restart_delay'>
+/**
+ * The persona config fields this module reads: the personas, the restart
+ * delay, and the `allow_invited_channels` switch, read through
+ * `channelModeOf` at each event (b.deo SRI-201).
+ */
+export type PersonaRoutingConfig = Pick<PersonaConfig, 'personas' | 'session_restart_delay' | 'allow_invited_channels'>
 
 /** Dependencies injected into `createPersonaRouting`. */
 export interface PersonaRoutingDeps {
@@ -187,6 +257,16 @@ export interface PersonaRoutingDeps {
   log(line: string): void
   /** Clock for the per-persona dedupe stores, in milliseconds; defaults to `Date.now`. */
   dedupeClock?: () => number
+  /**
+   * The stored choices (b.deo SRI-305, SRI-403): the store's readability and
+   * its read-only lookup, which the one store `main()` loads
+   * (`src/channel-delivery.ts`) satisfies as it is. Read at each
+   * fungible-mode event, never held across events; the routing never writes
+   * to it or drops from it. Null or undefined (before the store is loaded),
+   * or the dep absent: no stored choice applies, so fungible mode serves
+   * every channel at `mentions`. Not asked in declarative mode.
+   */
+  getChannelDelivery?(): StoredChoices | null | undefined
   /**
    * Whether persona P is up (b.av2 SR-6.4; production: the server's one
    * `isPersonaUp` predicate), asked for a lost message only: a message lost
@@ -294,16 +374,36 @@ export interface PersonaRouting {
    * `personaKeys`: ack it, then archive it and run the pipeline for each
    * receiving persona, each run isolated from the others. Resolves once every
    * run has settled. Never rejects.
+   *
+   * `isExtSharedChannel` is the envelope flag (b.deo SRI-301): the Events API
+   * payload's `is_ext_shared_channel`, exactly as the event router received
+   * it (`true`, `false`, any other value), or undefined when it was absent. A
+   * caller that omits it passes "absent". It is handed unchanged to the
+   * decision for each receiving persona.
    */
-  receive(event: unknown, ack: SlackAck, personaKeys: string | readonly string[]): Promise<void>
+  receive(
+    event: unknown,
+    ack: SlackAck,
+    personaKeys: string | readonly string[],
+    isExtSharedChannel?: unknown,
+  ): Promise<void>
   /**
-   * Drop the persona's inbound dedupe store (b.av2 SR-6.5, a teardown), so a
-   * persona added later with the same key starts with an empty one. Another
-   * event received for the key creates a new store, so the teardown stops the
-   * persona's connection first. Other personas' stores are untouched; logs
-   * nothing. A no-op for an unknown key.
+   * Drop the persona's inbound dedupe store and its heard set (b.av2 SR-6.5
+   * as amended by b.jg5 SRJ-1507, a teardown; b.deo SRI-307), so a persona
+   * added later with the same key starts with empty ones and logs its
+   * `persona-invited-channel` lines again. Another event received for the key
+   * creates a new store, so the teardown stops the persona's connection
+   * first. Other personas' stores and heard sets are untouched; logs nothing.
+   * A no-op for an unknown key.
    */
   forget(key: string): void
+  /**
+   * A snapshot of the persona's heard set (b.deo SRI-307): the channels whose
+   * events took its fungible path in its current persona life. Empty for an
+   * unknown or forgotten key; creates no state. The "heard" half of
+   * `set_channel_delivery`'s known channels.
+   */
+  heardChannels(key: string): ReadonlySet<string>
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +433,13 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   /** Each persona's dedupe store, by persona key; never shared between personas. */
   const dedupeStores = new Map<string, InboundDedupeStore>()
 
+  /**
+   * Each persona's heard set, by persona key (b.deo SRI-307): the channels
+   * whose events took its fungible path in its current persona life. In
+   * memory only; dropped with the dedupe store by `forget`.
+   */
+  const heardSets = new Map<string, Set<string>>()
+
   /** P's dedupe store, created on first use. */
   function dedupeStoreFor(key: string): InboundDedupeStore {
     let store = dedupeStores.get(key)
@@ -349,7 +456,12 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     return persona ? renderPersonaRef(persona.name, persona.key) : `key=${key}`
   }
 
-  async function receive(event: unknown, ack: SlackAck, personaKeys: string | readonly string[]): Promise<void> {
+  async function receive(
+    event: unknown,
+    ack: SlackAck,
+    personaKeys: string | readonly string[],
+    isExtSharedChannel?: unknown,
+  ): Promise<void> {
     try {
       await ack()
     } catch (err) {
@@ -357,11 +469,15 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     }
     if (typeof event !== 'object' || event === null) return
     const keys = typeof personaKeys === 'string' ? [personaKeys] : personaKeys
-    await Promise.all(keys.map((key) => runIsolated(key, event)))
+    await Promise.all(keys.map((key) => runIsolated(key, event, isExtSharedChannel)))
   }
 
-  /** Archive, drop a duplicate silently, else run P's pipeline; never rejects. */
-  async function runIsolated(key: string, event: object): Promise<void> {
+  /**
+   * Archive, then read the mode once for the event; in fungible mode end an
+   * `app_mention` there; drop a duplicate silently; else run P's pipeline.
+   * Never rejects.
+   */
+  async function runIsolated(key: string, event: object, isExtSharedChannel: unknown): Promise<void> {
     try {
       deps.archive(key, event)
     } catch (err) {
@@ -369,14 +485,25 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     }
     try {
       const ev = event as Record<string, unknown>
+      // b.deo SRI-201, SRI-302: the mode in force as this event arrives.
+      const mode = channelModeOf(deps.getPersonaConfig())
+      // b.deo SRI-302: in fungible mode the `message` event carrying the same
+      // mention decides, so an `app_mention` (a group-DM one included) ends
+      // after its archive write, with no dedupe record and no decision.
+      if (mode === FUNGIBLE_MODE && ev['type'] === APP_MENTION_EVENT_TYPE) return
       if (dedupeStoreFor(key).record(ev['channel'], ev['ts'], editedTs(ev)) === 'duplicate') return
-      await runPipeline(key, ev)
+      await runPipeline(key, ev, mode, isExtSharedChannel)
     } catch (err) {
       deps.log(`[slack] persona-routing: error handling event for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
     }
   }
 
-  async function runPipeline(key: string, ev: Record<string, unknown>): Promise<void> {
+  async function runPipeline(
+    key: string,
+    ev: Record<string, unknown>,
+    mode: ChannelMode,
+    isExtSharedChannel: unknown,
+  ): Promise<void> {
     const config = deps.getPersonaConfig()
     const persona = config?.personas.find((p) => p.key === key)
     if (!config || !persona) {
@@ -394,12 +521,62 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
         dmEnabled: persona.dm.enabled,
       },
       config.personas,
+      fungibleInputs(config, mode, isExtSharedChannel),
     )
+    const path = fungiblePathOf(decision)
+    if (path !== undefined) logFirstHeard(persona, String(ev['channel']), path)
     if (decision.action === 'drop') {
       logDrop(persona, ev, decision)
       return
     }
     await dispatch(persona, identity?.botUserId, ev, decision, config)
+  }
+
+  /**
+   * The decision's fungible-mode inputs (b.deo SRI-301, SRI-305, SRI-309),
+   * built only in fungible mode, from the configuration in effect and the
+   * stored choices read now: the mode, the envelope flag as received,
+   * `CHANNEL_ID_RE`, the stored choices, and each applied persona's
+   * destination through the one destination rule. Undefined in declarative
+   * mode, so the decision is declarative mode's and nothing of the fungible
+   * section is read.
+   */
+  function fungibleInputs(
+    config: PersonaRoutingConfig,
+    mode: ChannelMode,
+    isExtSharedChannel: unknown,
+  ): FungibleDecisionInputs | undefined {
+    if (mode !== FUNGIBLE_MODE) return undefined
+    return {
+      mode,
+      isExtSharedChannel,
+      channelIdPattern: CHANNEL_ID_RE,
+      storedChoices: deps.getChannelDelivery?.() ?? undefined,
+      fungibleDestinations: config.personas.map((p) => ({ key: p.key, destination: personaDestinationOf(config, p) })),
+    }
+  }
+
+  /**
+   * b.deo SRI-307: the first event in P's life that took P's fungible path
+   * for `channel` adds it to P's heard set and logs one
+   * `persona-invited-channel` line, before any drop line or dispatch. Later
+   * events from that channel log nothing here.
+   */
+  function logFirstHeard(persona: Persona, channel: string, path: FungiblePath): void {
+    let heard = heardSets.get(persona.key)
+    if (!heard) {
+      heard = new Set()
+      heardSets.set(persona.key, heard)
+    }
+    if (heard.has(channel)) return
+    heard.add(channel)
+    deps.log(formatPersonaDiagnostic({
+      class: PERSONA_INVITED_CHANNEL,
+      name: persona.name,
+      key: persona.key,
+      index: persona.index,
+      cause: invitedChannelCause(channel, path.channelType, path.channelDelivery),
+    }))
   }
 
   function logDrop(persona: Persona, ev: Record<string, unknown>, decision: DropDecision): void {
@@ -413,7 +590,17 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
           name: persona.name,
           key: persona.key,
           index: persona.index,
-          cause: `message in channel ${channel} not delivered: no applied persona lists this channel`,
+          cause: unclaimedChannelCause(channel),
+        }))
+        return
+      case 'fungible-refused':
+        // b.deo SRI-903: one line naming the refusal's reason.
+        deps.log(formatPersonaDiagnostic({
+          class: UNCLAIMED_CHANNEL,
+          name: persona.name,
+          key: persona.key,
+          index: persona.index,
+          cause: fungibleUnclaimedChannelCause(channel, decision.refusal),
         }))
         return
       case 'dm-disabled':
@@ -750,8 +937,15 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     receive,
     forget: (key) => {
       dedupeStores.delete(key)
+      heardSets.delete(key)
     },
+    heardChannels: (key) => new Set(heardSets.get(key)),
   }
+}
+
+/** The fungible-path part of a decision (b.deo SRI-309), or undefined when the event did not take the path. */
+function fungiblePathOf(decision: DeliveryDecision): FungiblePath | undefined {
+  return 'fungible' in decision ? decision.fungible : undefined
 }
 
 // ---------------------------------------------------------------------------

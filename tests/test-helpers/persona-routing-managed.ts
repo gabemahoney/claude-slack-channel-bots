@@ -1,7 +1,8 @@
 /**
  * test-helpers/persona-routing-managed.ts — The real inbound routing module
  * over the real connection manager's seams, built as `src/server.ts` builds
- * it (b.av2 SR-3.1, SR-4.1, SR-4.2 step 2).
+ * it (b.av2 SR-3.1, SR-4.1 with b.deo SRI-301 and SRI-302, SR-4.2 step 2
+ * with b.deo SRI-303 to SRI-309).
  *
  * `makeManagedRouting(h, baseDir, opts?)` takes a connection harness
  * (`makeConnectionHarness`) and builds `createPersonaRouting` with the same
@@ -62,7 +63,9 @@ export function makeManagedRouting(h: ConnectionHarness, baseDir: string, opts: 
   }
   const logs: string[] = []
   const log = (line: string): void => void logs.push(line)
-  const { notifier } = makeNotifierStack({ getPersona: h.getPersona, clientFor: h.clientFor, log })
+  // The notifier reads the same configuration as the routing, so a notice
+  // goes to the destination of the channel mode in force (b.deo SRI-701).
+  const { notifier } = makeNotifierStack({ getPersona: h.getPersona, clientFor: h.clientFor, getPersonaConfig: () => h.config, log })
   const routing = createPersonaRouting({
     getPersonaConfig: () => h.config,
     getBotIdentity: (key) => h.identityFor(key),

@@ -1,6 +1,6 @@
 /**
  * test-helpers/persona-notifier.ts — The real per-persona notifier over stub
- * Slack clients (b.av2 SR-7.2, SR-13.4).
+ * Slack clients (b.av2 SR-7.2, SR-13.4 with b.deo SRI-1203).
  *
  * `makeNotifierHarness(config, opts?)` builds the real `createPersonaNotifier`
  * with one `makeStubSlack` stub per persona of `config`, so a test can assert
