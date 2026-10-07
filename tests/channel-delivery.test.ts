@@ -13,8 +13,8 @@
  *   spells the file name or names its serialiser or parser.
  * - Format (SRI-402): a round trip; the same record always gives the same
  *   bytes; a key with no channels is left out; every refused form, made by
- *   altering the serialiser's output, reads as unreadable through the
- *   store's load.
+ *   altering the serialiser's output (its bytes, for the UTF-8 rule), reads
+ *   as unreadable through the store's load.
  * - The stored-choice helper's contract (tests/test-helpers/channel-delivery.ts).
  * - The read at start (SRI-403, SRI-904): a missing file; a file that cannot
  *   be read, parsed or validated, and the unreadable state it gives for the
@@ -428,6 +428,19 @@ function namesAChoice(line: string, path: string): boolean {
   return DELIVERY_MODES.some((mode) => new RegExp(`\\b${mode}\\b`).test(words))
 }
 
+/**
+ * What breaks "the bytes are parsed only" (b.deo SRI-403) in comment-stripped
+ * `code`: each imported specifier naming a crypto module, and each hashing,
+ * digest or byte-comparison name in its code outside literals. Empty when the
+ * module only parses.
+ */
+function parsedOnlyFindings(code: string): string[] {
+  const imports = importedSpecifiers(code).filter((spec) => /crypto/.test(spec)).map((spec) => `imports ${spec}`)
+  const names = [...maskLiterals(code).matchAll(/\b(?:createHash|createHmac|digest|timingSafeEqual|sha256Hex)\b|\bBuffer\.compare\b|\.equals\s*\(/g)]
+    .map((m) => `names ${m[0]}`)
+  return [...imports, ...names]
+}
+
 // ---------------------------------------------------------------------------
 // S1: fixed values, location, format, refused forms, the helper's contract
 // ---------------------------------------------------------------------------
@@ -576,8 +589,24 @@ describe('the file\'s format (b.deo SRI-402)', () => {
     ['an entry with no channel in `channels`', (doc) => { doc.personas.beta.channels = {} }],
   ]
 
-  test.each(REFUSED)('%s reads as unreadable through the store\'s load: one line, the file left byte-identical', (_label, alter) => {
-    const bytes = altered(alter)
+  // SRI-402's UTF-8 rule, as raw bytes: each would read as the base seeds if
+  // the decoder dropped a byte order mark or replaced a bad byte. The bad
+  // byte sits inside a declaration path, where a replacement character would
+  // still validate.
+  const NOT_UTF8: Array<[string, () => Uint8Array]> = [
+    ['a UTF-8 byte order mark before the record', () => new Uint8Array([0xef, 0xbb, 0xbf, ...seededBytes()])],
+    ['a byte that is not UTF-8 (0xFF) inside a declaration path', () => {
+      const bytes = seededBytes()
+      // The record is ASCII, so the path's text offset is its byte offset.
+      const at = new TextDecoder().decode(bytes).indexOf(root)
+      if (at < 0) throw new Error('the case root is not in the record')
+      bytes[at + 1] = 0xff
+      return bytes
+    }],
+  ]
+
+  test.each([...REFUSED.map(([label, alter]): [string, () => Uint8Array] => [label, () => altered(alter)]), ...NOT_UTF8])('%s reads as unreadable through the store\'s load: one line, the file left byte-identical', (_label, build) => {
+    const bytes = build()
     writeFileSync(filePath(), bytes)
 
     const rig = openRig()
@@ -797,6 +826,8 @@ describe('the read at start (b.deo SRI-403 beside b.av2 SR-8.7; SRI-905)', () =>
     })
 
     expect(child.signal).toBeNull()
+    expect(child.error).toBeUndefined()
+    expect(child.status).toBe(0)
     const out = JSON.parse(child.stdout.trim())
     expect(out).toEqual({
       readable: false,
@@ -822,11 +853,13 @@ describe('the read at start (b.deo SRI-403 beside b.av2 SR-8.7; SRI-905)', () =>
     expectNoLeak(rig)
   })
 
-  test('the file\'s bytes are parsed only: comment-stripped src/channel-delivery.ts imports no hashing module and digests or compares no bytes', () => {
+  test('the file\'s bytes are parsed only: comment-stripped src/channel-delivery.ts imports no hashing module and digests or compares no bytes, and the check fails on altered source', () => {
     const code = stripComments(readFileSync(join(import.meta.dir, '..', 'src', 'channel-delivery.ts'), 'utf-8'))
+    expect(parsedOnlyFindings(code)).toEqual([])
 
-    expect(importedSpecifiers(code).filter((spec) => /crypto/.test(spec))).toEqual([])
-    expect(maskLiterals(code)).not.toMatch(/\b(?:createHash|createHmac|digest|timingSafeEqual|sha256Hex)\b|\bBuffer\.compare\b|\.equals\s*\(/)
+    for (const added of ['import { createHash } from \'node:crypto\'', 'Buffer.compare(a, b)', 'x.equals(y)']) {
+      expect(parsedOnlyFindings(`${code}\n${added}\n`)).not.toEqual([])
+    }
     expectNoLeak(undefined)
   })
 
@@ -1006,7 +1039,6 @@ describe('a failed set leaves memory and the file as they were (b.deo SRI-404, S
   test.each<[string, readonly FsFailure[]]>([
     ['the directory\'s fsync fails', [UNSYNCED]],
     ['the directory\'s open fails', [{ step: 'openSync', call: 2 }]],
-    ['the directory\'s fsync fails, and the write-back\'s directory fsync too', [UNSYNCED, { step: 'fsyncSync', call: 4 }]],
   ])('an unsynced rename (%s): the replaced bytes are written back, memory unchanged, one line', (_label, failures) => {
     writeChannelDeliveryRecord(stateDir, baseSeeds())
     const before = fileBytes()
@@ -1021,8 +1053,51 @@ describe('a failed set leaves memory and the file as they were (b.deo SRI-404, S
     expect(stateEntries()).toEqual([CHANNEL_DELIVERY_FILE_NAME])
     expect(rig.store.record()).toEqual(channelDeliveryRecordOf(baseSeeds()))
     expect(rig.logs).toHaveLength(1)
-    expectWriteFailedLine(rig.logs[0]!, setLine, [rig.thrown[0]!])
+    expect(rig.thrown).toHaveLength(1)
+    expectWriteFailedLine(rig.logs[0]!, setLine, rig.thrown)
     expectNoLeak(rig, { result })
+  })
+
+  test('an unsynced rename whose write-back\'s directory fsync fails too: the bytes written back, memory unchanged, one line reporting the write-back done without its code; the next unsynced set writes back the same bytes', () => {
+    writeChannelDeliveryRecord(stateDir, baseSeeds())
+    const before = fileBytes()
+    const alpha = declarationOf(personaNamed('alpha'))
+    const [head, tail] = lineParts(setLine) as [string, string]
+    const detailOf = (line: string): string => line.slice(head.length, line.length - tail.length)
+    // The store's own line for a write-back that synced, from a store of its own over the same file.
+    const synced = openRig({ failures: [UNSYNCED] })
+    synced.store.set('alpha', C1, 'mentions', alpha)
+    expect(fileBytes()).toEqual(before)
+    const writtenBack = synced.logs[0]!
+    const rig = openRig({ failures: [UNSYNCED, { step: 'fsyncSync', call: 4, code: 'ENOSPC' }] })
+
+    const result = rig.store.set('alpha', C1, 'mentions', alpha)
+
+    expect(result).toEqual({ kind: CHANNEL_DELIVERY_SET_WRITE_FAILED, path: filePath() })
+    expect(rig.writes).toHaveLength(2)
+    expect(rig.writes[1]).toEqual(before!)
+    expect(fileBytes()).toEqual(before)
+    expect(stateEntries()).toEqual([CHANNEL_DELIVERY_FILE_NAME])
+    expect(rig.store.record()).toEqual(channelDeliveryRecordOf(baseSeeds()))
+    expect(rig.thrown.map((err) => err.code)).toEqual(['EIO', 'ENOSPC'])
+    expect(rig.logs).toHaveLength(1)
+    // The line names the first failure's code, then the written-back branch,
+    // extended; the write-back's own code is not in it (its bytes were
+    // restored), so it is not the branch whose putting back failed.
+    expectWriteFailedLine(rig.logs[0]!, setLine, [rig.thrown[0]!])
+    const detail = detailOf(rig.logs[0]!)
+    expect(detail.startsWith(detailOf(writtenBack))).toBe(true)
+    expect(detail.length).toBeGreaterThan(detailOf(writtenBack).length)
+    expect(detail).not.toContain(errnoSuffix(rig.thrown[1]!))
+
+    // The bytes the store believes the file holds are still the original ones.
+    rig.fail(UNSYNCED)
+    expect(rig.store.set('alpha', C1, 'mentions', alpha).kind).toBe(CHANNEL_DELIVERY_SET_WRITE_FAILED)
+    expect(rig.writes).toHaveLength(4)
+    expect(rig.writes[3]).toEqual(before!)
+    expect(fileBytes()).toEqual(before)
+    expect(rig.logs[1]).toBe(writtenBack)
+    expectNoLeak(rig, { result, synced: synced.logs })
   })
 
   test('an unsynced rename over a file that did not exist: the file removed again, nothing in memory, one line', () => {

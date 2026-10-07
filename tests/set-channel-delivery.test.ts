@@ -19,7 +19,8 @@
  * - Accepted calls (SRI-504, SRI-505): the stored record, the result, the
  *   next event decided by it, the same value again, the loop guard, and the
  *   one `persona-channel-delivery-set` line per accepted call (one pin case).
- * - Failed writes (SRI-506, SRI-404's tool side) and dry run (SRI-507).
+ * - Failed writes (SRI-506, SRI-404's tool side), a store that refuses the
+ *   input it would write, and dry run (SRI-507).
  *
  * How the tool is driven: through the reload harness's `run.callTool`
  * (`createSessionServer` over an in-memory MCP client, with each persona's
@@ -27,9 +28,10 @@
  * the configuration in effect, the run's stored-choice store, the routing's
  * heard set and the applied personas). The routing hears channels through
  * `run.deliver`. Listing, and a session `run.callTool` cannot express (one
- * matched to no persona, a store that is not bound), go through a direct
- * client opened here over `createSessionServer`, whose deps carry the mode,
- * the run's bindings where there is a run, and a Slack stub of its own.
+ * matched to no persona, a store that is not bound, a stand-in store that
+ * refuses its input), go through a direct client opened here over
+ * `createSessionServer`, whose deps carry the mode, the run's bindings where
+ * there is a run (or the stand-in store), and a Slack stub of its own.
  *
  * "Every stub's call log empty" is read as: no Web API call is added to any
  * stub's log (every persona's, and the direct client's) during a tool call.
@@ -57,6 +59,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 
 import {
   CHANNEL_DELIVERY_FILE_NAME,
+  CHANNEL_DELIVERY_SET_INVALID,
   channelDeliveryDeclarationOf,
   channelDeliverySetAction,
   channelDeliveryWriteFailedLine,
@@ -84,6 +87,7 @@ import {
   _resetRegistry,
   channelDeliveryChannelRefusal,
   channelDeliveryDeclarativeRefusal,
+  channelDeliveryNotStoredText,
   channelDeliverySetResultText,
   channelDeliveryUnreadableRefusal,
   channelDeliveryValueRefusal,
@@ -208,13 +212,23 @@ afterEach(async () => {
     }
     assertNoLeak(extra, 'set-channel-delivery afterEach')
     h.runs.forEach((run, i) => assertNoLeak(run.captured(extra), `set-channel-delivery afterEach run ${i}`))
+    // The tool posts nothing, and no case's setup posts either (b.deo SRI-505).
+    for (const run of h.runs) expect(run.slackPosts()).toEqual([])
   } finally {
-    for (const client of directClients) await client.close()
-    await h.cleanup()
-    _resetRegistry()
-    consoleSpy.mockRestore()
-    if (savedDryRun === undefined) delete process.env['SLACK_DRY_RUN']
-    else process.env['SLACK_DRY_RUN'] = savedDryRun
+    // Each step runs whatever the one before did: a client that fails to
+    // close or a cleanup that throws leaves no mocked console.error, registry
+    // entry or dry-run flag to a later suite.
+    const closed = await Promise.allSettled(directClients.map((client) => client.close()))
+    try {
+      await h.cleanup()
+    } finally {
+      _resetRegistry()
+      consoleSpy.mockRestore()
+      if (savedDryRun === undefined) delete process.env['SLACK_DRY_RUN']
+      else process.env['SLACK_DRY_RUN'] = savedDryRun
+    }
+    const failed = closed.filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected')
+    if (failed.length > 0) throw new AggregateError(failed.map((outcome) => outcome.reason), 'a direct client did not close')
   }
 })
 
@@ -501,9 +515,25 @@ function setResult(channel: string, stored: DeliveryMode, delivery: DeliveryMode
   return channelDeliverySetResultText(channel, stored, { delivery, heldByLoopGuard })
 }
 
-/** What reached P's session since `from`: each delivery's channel and `via`. */
-function deliveredSince(run: ReloadRun, from: number): Array<[string, string | undefined]> {
-  return run.deliveries(P).slice(from).map((d) => [d.chat_id, d.via])
+/** How many deliveries had reached each persona's session: a checkpoint for `deliveredSince`. */
+type DeliveryCheckpoint = Readonly<Record<string, number>>
+
+/** The deliveries each persona's session holds now. */
+function deliveryCheckpoint(run: ReloadRun): DeliveryCheckpoint {
+  return Object.fromEntries(NAMES.map((name) => [name, run.deliveries(name).length]))
+}
+
+/** The checkpoint before any delivery. */
+const NO_DELIVERIES: DeliveryCheckpoint = Object.fromEntries(NAMES.map((name) => [name, 0]))
+
+/** What reached every persona's session since `from`, by name: each delivery's channel and `via`. */
+function deliveredSince(run: ReloadRun, from: DeliveryCheckpoint): Record<string, Array<[string, string | undefined]>> {
+  return Object.fromEntries(NAMES.map((name) => [name, run.deliveries(name).slice(from[name]).map((d): [string, string | undefined] => [d.chat_id, d.via])]))
+}
+
+/** Every persona's deliveries: `toP` for P, and nothing for Q or R. */
+function onlyToP(toP: Array<[string, string | undefined]>): Record<string, Array<[string, string | undefined]>> {
+  return { [P]: toP, [Q]: [], [R]: [] }
 }
 
 /** An errno-style error with `code`, as the harness's seams throw. */
@@ -782,21 +812,47 @@ describe('rule 1, declarative mode, and rule 2, the store unreadable (b.deo SRI-
     )
   })
 
-  test('the two texts carry what the SRD names: the persona in both; the operator\'s config.json in rule 1; the file and the move-aside-and-restart fix in rule 2', () => {
+  test('the texts carry what the SRD names: the persona in rules 1 to 4; the operator\'s config.json in rule 1; the file and the move-aside-and-restart fix in rule 2; the value not shown, and absent, in rules 3 and 4\'s not-shown forms; the result\'s channel, choice and delivery, with the loop guard and the fungible destination only when held', () => {
     const name = 'Delta Bot'
     const key = personaKey(name)
+    const ref = renderPersonaRef(name, key)
     const path = join(h.stateDir, CHANNEL_DELIVERY_FILE_NAME)
     const declarative = channelDeliveryDeclarativeRefusal(name, key)
     const unreadable = channelDeliveryUnreadableRefusal(name, key, path)
     const [beforePath, afterPath] = unreadable.split(JSON.stringify(path)) as [string, string]
 
-    expect(declarative).toContain(renderPersonaRef(name, key))
+    expect(declarative).toContain(ref)
     expect(declarative).toContain('declarative mode')
     expect(declarative).toContain('operator')
     expect(declarative).toContain(CONFIG_FILE_NAME)
     expect(unreadable.split(JSON.stringify(path))).toHaveLength(2)
-    expect(beforePath).toContain(renderPersonaRef(name, key))
+    expect(beforePath).toContain(ref)
     expect(afterPath).toMatch(/\baside\b.*\brestart/)
+
+    // Rules 3 and 4: the persona in both forms; a value that is not echoable
+    // gives the not-shown form, which says so and holds no part of the value.
+    const notEchoed = [
+      [channelDeliveryValueRefusal, 'all!', 'ALL'],
+      [channelDeliveryChannelRefusal, 'c0lowercase1', NEVER_HEARD],
+    ] as const
+    for (const [refusal, hidden, echoed] of notEchoed) {
+      const notShown = refusal(name, key, hidden)
+      expect(refusal(name, key, echoed)).toContain(ref)
+      expect(notShown).toContain(ref)
+      expect(notShown).toBe(refusal(name, key, undefined))
+      expect(notShown).toMatch(/\bnot shown\b/)
+      expect(notShown.toLowerCase()).not.toContain(hidden.toLowerCase())
+    }
+
+    // The result (SRI-504): the channel, the stored choice and the delivery as
+    // whole words; the held form also names the loop guard and the fungible
+    // destination, the not-held form neither.
+    const word = (text: string, w: string): boolean => new RegExp(`\\b${w}\\b`).test(text)
+    const held = setResult(Q_DEST, 'all', 'mentions', true)
+    const notHeld = setResult(Q_DEST, 'all', 'all', false)
+    expect([Q_DEST, 'all', 'mentions', 'fungible destination', 'loop guard'].map((w) => word(held, w))).toEqual([true, true, true, true, true])
+    expect([Q_DEST, 'all', 'fungible destination', 'loop guard'].map((w) => word(notHeld, w))).toEqual([true, true, false, false])
+    expect(held).not.toBe(notHeld)
   })
 
   // Each row breaks the rules it names and no other; the first one gives the
@@ -970,17 +1026,17 @@ describe('an accepted call (b.deo SRI-504, SRI-404 tool side)', () => {
   test('the choice decides the next event: a plain message is not delivered before, delivered as receive_all after all, and not delivered after mentions', async () => {
     const { run } = await startFungible()
     await hear(run, P, plainMessage(PUBLIC))
-    expect(deliveredSince(run, 0)).toEqual([])
+    expect(deliveredSince(run, NO_DELIVERIES)).toEqual(onlyToP([]))
 
     expectAccepted(await observeSet(run, P, { channel: PUBLIC, delivery: 'all' }), setResult(PUBLIC, 'all', 'all', false), setLine(run, P, PUBLIC, undefined, 'all', 'all'))
-    let from = run.deliveries(P).length
+    let from = deliveryCheckpoint(run)
     await hear(run, P, plainMessage(PUBLIC))
-    expect(deliveredSince(run, from)).toEqual([[PUBLIC, 'receive_all' satisfies Via]])
+    expect(deliveredSince(run, from)).toEqual(onlyToP([[PUBLIC, 'receive_all' satisfies Via]]))
 
     expectAccepted(await observeSet(run, P, { channel: PUBLIC, delivery: 'mentions' }), setResult(PUBLIC, 'mentions', 'mentions', false), setLine(run, P, PUBLIC, 'all', 'mentions', 'mentions'))
-    from = run.deliveries(P).length
+    from = deliveryCheckpoint(run)
     await hear(run, P, plainMessage(PUBLIC))
-    expect(deliveredSince(run, from)).toEqual([])
+    expect(deliveredSince(run, from)).toEqual(onlyToP([]))
   })
 
   test('the value already stored is accepted and written again, with a later set_at', async () => {
@@ -1094,6 +1150,32 @@ describe('a failed write (b.deo SRI-506, SRI-404 tool side)', () => {
     expectOnly(o, { logs: o.activity.logs, writes: [...writes], removes: [...removes] })
   }
 
+  test('a store that refuses the input it would write (its invalid answer, the set_at field): the not-stored tool error, no file, no line, no Slack call', async () => {
+    const config = makeMultiPersonaConfig([{ name: P, invited: { permission_prompts: P_DEST } }], h.root, { allow_invited_channels: true })
+    const persona = config.personas[0]!
+    const entry = registerSession(persona.working_directory, persona.key, fakeTransport(), fakeServer())
+    const sets: unknown[][] = []
+    const store: SessionChannelDeliveryStore = {
+      path: h.channelDeliveryFile,
+      readable: true,
+      storedChoice: (key, channel) => (key === persona.key && channel === SEEDED ? 'mentions' : undefined),
+      storedChannels: (key) => (key === persona.key ? [SEEDED] : []),
+      isRetiring: () => false,
+      set: (...args) => {
+        sets.push(args)
+        return { kind: CHANNEL_DELIVERY_SET_INVALID, field: 'set_at' }
+      },
+    }
+    const direct = await openDirect(entry, { mode: () => 'fungible', personas: () => config.personas, store: () => store })
+
+    expectRefused(
+      await observe(() => direct.call(SET_CHANNEL_DELIVERY_TOOL, { channel: SEEDED, delivery: 'all' }), { direct }),
+      channelDeliveryNotStoredText(persona.name, persona.key, 'set_at'),
+    )
+    expect(sets).toEqual([[persona.key, SEEDED, 'all', channelDeliveryDeclarationOf(persona)]])
+    expect(storedChoiceBytes()).toBeNull()
+  })
+
   test.each<[string, Partial<WriteFailure>, readonly boolean[]]>([
     ['the write fails before the rename', { step: 'renameSync' }, [false]],
     ['the rename is not synced and the write-back succeeds', { step: 'fsyncSync', call: 2 }, [false, true]],
@@ -1113,9 +1195,9 @@ describe('a failed write (b.deo SRI-506, SRI-404 tool side)', () => {
     // Memory unchanged: the next plain message is delivered at all, as before, and
     // a later accepted call's line reports all as the choice before it.
     h.clearChannelDeliveryWriteFailure()
-    const from = run.deliveries(P).length
+    const from = deliveryCheckpoint(run)
     await hear(run, P, plainMessage(PUBLIC))
-    expect(deliveredSince(run, from)).toEqual([[PUBLIC, 'receive_all' satisfies Via]])
+    expect(deliveredSince(run, from)).toEqual(onlyToP([[PUBLIC, 'receive_all' satisfies Via]]))
     expectAccepted(await observeSet(run, P, { channel: PUBLIC, delivery: 'mentions' }), setResult(PUBLIC, 'mentions', 'mentions', false), setLine(run, P, PUBLIC, 'all', 'mentions', 'mentions'))
   })
 
@@ -1158,9 +1240,9 @@ describe('a failed write (b.deo SRI-506, SRI-404 tool side)', () => {
     // later accepted call's line reports none as the choice before it.
     h.clearChannelDeliveryWriteFailure()
     h.clearRemoveFailure()
-    const from = run.deliveries(P).length
+    const from = deliveryCheckpoint(run)
     await hear(run, P, plainMessage(PUBLIC))
-    expect(deliveredSince(run, from)).toEqual([])
+    expect(deliveredSince(run, from)).toEqual(onlyToP([]))
     expectAccepted(await observeSet(run, P, { channel: PUBLIC, delivery: 'mentions' }), setResult(PUBLIC, 'mentions', 'mentions', false), setLine(run, P, PUBLIC, undefined, 'mentions', 'mentions'))
   })
 })
