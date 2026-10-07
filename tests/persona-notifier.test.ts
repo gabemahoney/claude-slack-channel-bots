@@ -1,10 +1,16 @@
 /**
- * persona-notifier.test.ts — Per-persona server notices (b.av2 SR-7.2).
+ * persona-notifier.test.ts — Per-persona server notices (b.av2 SR-7.2; b.deo
+ * SRI-702).
  *
- * Every notice about a persona goes only to that persona's `permission_prompts`
+ * Every notice about a persona goes only to that persona's destination
  * channel, through that persona's own Web client, as one top-level message
  * whose text carries the persona reference built from the persona's stored
- * key. A `dm` destination gets its notices in the persona's DM with its
+ * key: its `permission_prompts` in declarative mode, its fungible destination
+ * (`invited.permission_prompts`, `dm` when absent) in fungible mode (b.deo
+ * SRI-702, beside b.av2 SR-7.1 and SR-7.2), proven for a channel, an explicit
+ * and a defaulted `dm` fungible destination with the resolver reading the
+ * switch at each attempt, as `src/server.ts` wires it. A `dm` destination gets
+ * its notices in the persona's DM with its
  * contact, opened at post time through the shared destination resolver (whose
  * cache and failures `persona-destination.test.ts` proves), dry run posts
  * nothing, notices raised before the persona's client is validated are held
@@ -65,7 +71,7 @@ import { join } from 'node:path'
 
 import type { WebClient } from '@slack/web-api'
 
-import type { Persona } from '../src/config.ts'
+import { DM_DESTINATION, type Persona } from '../src/config.ts'
 import { LATCH_CASE_LEFTOVER, conflictNoticeText } from '../src/conflict-latch.ts'
 import { PERSONA_KILL_SURVIVOR_LABEL } from '../src/kill-failure-alert.ts'
 import type { OutageClass } from '../src/outage-state.ts'
@@ -307,6 +313,84 @@ describe('the persona reference uses the stored key (SR-7.2)', () => {
     expect(s.logs[0]).toStartWith(`[slack] ${head}${renderPersonaRef(p.name, p.key)}`)
     s.hold.cancelAll()
     assertNoLeak({ lines: s.logs, posts: s.allPosts() })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fungible mode: notices at the fungible destination (b.deo SRI-702)
+// ---------------------------------------------------------------------------
+
+describe('fungible mode: notices go to the fungible destination (b.deo SRI-702, beside b.av2 SR-7.1, SR-7.2)', () => {
+  // F's fungible destination is a channel; X names `dm` explicitly; Y has no
+  // `invited` section, so its fungible destination is `dm` by default.
+  const F_DEST = 'C0FUNGNOT1'
+  const X_CONTACT = 'U0XRAYNOT1'
+  const Y_CONTACT = 'U0YANKNOT1'
+
+  let fh: NotifierHarness
+  let F: Persona
+  let X: Persona
+  let Y: Persona
+
+  beforeEach(() => {
+    const config = makeMultiPersonaConfig(
+      [
+        { name: 'Foxtrot Notifier', invited: { permission_prompts: F_DEST } },
+        { name: 'Xray Notifier', dm: { enabled: true, contact: X_CONTACT }, invited: { permission_prompts: DM_DESTINATION } },
+        { name: 'Yankee Notifier', dm: { enabled: true, contact: Y_CONTACT } },
+      ],
+      dir,
+      { allow_invited_channels: true },
+    )
+    ;[F, X, Y] = config.personas as [Persona, Persona, Persona]
+    // The resolver reads the configuration in effect at each attempt, as `src/server.ts` wires it.
+    fh = makeNotifierHarness(config, { leakMarker: LEAK_SENTINEL, getPersonaConfig: () => config })
+  })
+
+  afterEach(() => {
+    try {
+      fh.hold.cancelAll()
+      assertNoLeak({ lines: fh.logs, posts: fh.allPosts() })
+    } finally {
+      fh.cleanup()
+    }
+  })
+
+  const BODY = 'Spawn failure:\n  Error: boom'
+
+  test.each<[string, () => Persona, () => string, () => string | undefined]>([
+    ['a channel fungible destination (F): one top-level post to that channel', () => F, () => F_DEST, () => undefined],
+    ['an explicit "dm" fungible destination (X): the DM with its dm.contact, opened at post time', () => X, () => DM_DESTINATION, () => X_CONTACT],
+    [
+      'a defaulted "dm" fungible destination (Y, no invited section): the DM with its dm.contact, opened at post time',
+      () => Y, () => DM_DESTINATION, () => Y_CONTACT,
+    ],
+  ])('%s, carrying the persona reference, through the persona\'s own client; no other persona\'s stub is called', async (_label, pick, fungibleDestination, contact) => {
+    const self = pick()
+    // Preconditions: the destination is the loader's fungible destination,
+    // and the declarative section is not in force.
+    expect(self.fungible_destination).toBe(fungibleDestination())
+    expect(self.permission_prompts).toBeUndefined()
+    const dmContact = contact()
+    // Nothing is opened before a notice is raised.
+    expect(fh.stub(self.key).callLog).toEqual([])
+
+    await fh.notifier.notify(self.key, BODY)
+
+    const text = formatPersonaNotice(self, BODY)
+    expect(text).toContain(ref(self))
+    const expectedCalls =
+      dmContact === undefined
+        ? [['chat.postMessage', { channel: F_DEST, text }]]
+        : [
+            ['conversations.open', { users: dmContact }],
+            ['chat.postMessage', { channel: stubOpenedDmId(dmContact), text }],
+          ]
+    // One top-level message: no thread_ts, username or icon override.
+    expect(fh.stub(self.key).callLog.map((c) => [c.method, c.args])).toEqual(expectedCalls)
+    for (const other of [F, X, Y].filter((p) => p.key !== self.key)) expect(fh.stub(other.key).callLog).toEqual([])
+    expect(fh.totalPosts()).toBe(1)
+    expect(fh.logs).toEqual([])
   })
 })
 

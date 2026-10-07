@@ -23,6 +23,16 @@
  * only a persona's `delivery: all` channels count, and a zero count is
  * inconclusive when the persona has a `mentions` channel or DMs on.
  *
+ * Archive evidence in fungible mode (b.av2 SR-7.4, b.deo SRI-704): the scope
+ * helper counts no channel and its zero is never attributable, whatever the
+ * persona's resolved `channels` holds; with the mode absent or declarative it
+ * is SR-7.4's. Layer 2, reading the mode from the configuration it is given,
+ * reports a persona whose `delivery: all` channel holds archived messages
+ * since spawn as inconclusive with `FUNGIBLE_MODE_ZERO_REASON`, never lost
+ * (the same fixture in declarative mode is lost); its no-count path keeps its
+ * declarative outcome. The fungible-mode reason is distinct from the
+ * declarative unattributable-zero reason and names fungible mode.
+ *
  * All external effects are dependency-injected — no mock.module, no real /proc
  * reads. Files (archives, symlinks, homes) live only in mkdtempSync dirs
  * removed after each test.
@@ -45,13 +55,15 @@ import {
   makeDefaultArchiveCount,
   personaArchiveEvidenceScope,
   UNATTRIBUTABLE_ZERO_REASON,
+  FUNGIBLE_MODE_ZERO_REASON,
+  unattributableZeroReason,
   type JsonlPersistenceSafeguardDeps,
 } from '../src/jsonl-persistence-check.ts'
 import { resolveJsonlPath } from '../src/cozempic.ts'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { personaConfigDirLabelValue } from '../src/session-manager.ts'
 import { AgentDirectorError, ErrSpawnNotFound } from '../src/agent-director-errors.ts'
-import type { Persona, PersonaConfig } from '../src/config.ts'
+import { channelModeOf, type Persona, type PersonaConfig } from '../src/config.ts'
 import { buildTempArchiveDb, type ArchiveRow } from './test-helpers/archive-db.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
@@ -1150,6 +1162,233 @@ describe('runJsonlPersistenceSafeguard — zero archive count per SR-7.4', () =>
     expect(h.totalPosts()).toBe(0)
     expect(personaLines.filter((l) => l.includes('no archived activity since spawn'))).toHaveLength(1)
     expect(personaLines.filter((l) => l.includes('inconclusive'))).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-7.4, b.deo SRI-704 — archive evidence in fungible mode
+//
+// The persona under test is built under the switch on (or off, for a
+// declarative control) with its resolved `channels` set by spec, which the
+// loader leaves empty in fungible mode, so a case proves those channels are
+// never counted. DMs are off and its fungible destination is a channel
+// (b.deo SRI-104). The channels and rows are the SR-7.4 ones above.
+// ---------------------------------------------------------------------------
+
+/** The persona under test, without its `channels`: DMs off, a channel fungible destination. */
+const FUNGIBLE_EVIDENCE_SPEC: PersonaSpec = {
+  name: LAYER2_SPEC.name,
+  working_directory: LAYER2_SPEC.working_directory,
+  claude_config_dir: CONFIG_DIR,
+  dm: { enabled: false },
+  invited: { permission_prompts: ALL_1 },
+}
+
+/**
+ * `FUNGIBLE_EVIDENCE_SPEC` with `spec` over it, and another persona in OTHER,
+ * in fungible mode (`fungible` true: the switch on) or declarative mode.
+ * Declarative mode sends the persona's notices to its first channel.
+ */
+function modeEvidenceConfig(spec: PersonaSpec, fungible: boolean, dbPath?: string): PersonaConfig {
+  return makeMultiPersonaConfig(
+    [
+      { ...FUNGIBLE_EVIDENCE_SPEC, ...spec },
+      { name: 'Other Bot', working_directory: '/repo/other', channels: [all(OTHER)], invited: { permission_prompts: OTHER } },
+    ],
+    makeTempDir(),
+    { claude_config_dir: CONFIG_DIR, allow_invited_channels: fungible, ...(dbPath ? { message_archive_db: dbPath } : {}) },
+  )
+}
+
+describe('b.deo SRI-704: personaArchiveEvidenceScope in fungible mode (b.av2 SR-7.4)', () => {
+  test.each([
+    {
+      name: 'one `all` channel',
+      spec: { channels: [all(ALL_1)] },
+      declarative: { channelIds: [ALL_1], zeroIsAttributable: true },
+      declarativeCount: 1,
+    },
+    {
+      name: 'two `all` channels',
+      spec: { channels: [all(ALL_1), all(ALL_2)] },
+      declarative: { channelIds: [ALL_1, ALL_2], zeroIsAttributable: true },
+      declarativeCount: 3,
+    },
+    {
+      name: 'an `all` and a `mentions` channel',
+      spec: { channels: [all(ALL_1), mentions(MENT)] },
+      declarative: { channelIds: [ALL_1], zeroIsAttributable: false },
+      declarativeCount: 1,
+    },
+    {
+      name: 'an `all` channel and DMs on',
+      spec: { channels: [all(ALL_2)], dm: { enabled: true } },
+      declarative: { channelIds: [ALL_2], zeroIsAttributable: false },
+      declarativeCount: 2,
+    },
+    {
+      name: 'no channels',
+      spec: { channels: [] },
+      declarative: { channelIds: [], zeroIsAttributable: true },
+      declarativeCount: 0,
+    },
+  ] as Array<{ name: string; spec: PersonaSpec; declarative: { channelIds: string[]; zeroIsAttributable: boolean }; declarativeCount: number }>)(
+    '$name: fungible mode counts no channel and its zero is never attributable; with the mode absent or declarative the scope is SR-7.4\'s',
+    ({ spec, declarative, declarativeCount }) => {
+      const dbPath = makeArchiveDb([...PRE_BOUNDARY, ...EVERYWHERE])
+      const config = modeEvidenceConfig(spec, true)
+      expect(channelModeOf(config)).toBe('fungible')
+      const persona = config.personas[0]!
+      // The resolved `channels` hold the spec's channels, as set.
+      expect(persona.channels).toEqual(spec.channels!)
+
+      const fungibleScope = personaArchiveEvidenceScope(persona, 'fungible')
+      expect(fungibleScope).toEqual({ channelIds: [], zeroIsAttributable: false })
+      expect(personaArchiveEvidenceScope(persona)).toEqual(declarative)
+      expect(personaArchiveEvidenceScope(persona, 'declarative')).toEqual(declarative)
+
+      // The archive holds rows since spawn in every channel; the fungible scope counts none of them.
+      const countSince = makeDefaultArchiveCount({ message_archive_db: dbPath })
+      const ref = renderPersonaRef(persona.name, persona.key)
+      expect(countSince(fungibleScope.channelIds, SPAWN_EPOCH, ref)).toBe(0)
+      expect(countSince(declarative.channelIds, SPAWN_EPOCH, ref)).toBe(declarativeCount)
+      assertNoLeak({ fungibleScope, persona })
+    },
+  )
+})
+
+describe('b.deo SRI-704: runJsonlPersistenceSafeguard in fungible mode (b.av2 SR-7.4)', () => {
+  /** The SRD's persona: one `delivery: all` channel, DMs off. */
+  const SRD_SPEC: PersonaSpec = { channels: [all(ALL_1)] }
+
+  /** The SRD's archive: rows since spawn in the persona's `all` channel and in another persona's channel. */
+  const SRD_ROWS: ArchiveRow[] = [...after(ALL_1, 3), ...after(OTHER, 4)]
+
+  /**
+   * One safeguard pass over `modeEvidenceConfig(SRD_SPEC, fungible)` with a
+   * real temp archive of `rows` and the real per-persona notifier; only the
+   * persona under test has a row (`rowOverrides` over it). `log` is the
+   * test's console capture; the result's `personaLines` are this pass's lines
+   * naming the persona.
+   */
+  async function runMode(
+    fungible: boolean,
+    log: string[],
+    opts: { rows?: ArchiveRow[]; deps?: Partial<JsonlPersistenceSafeguardDeps>; rowOverrides?: Partial<GetResult> } = {},
+  ) {
+    const dbPath = makeArchiveDb([...PRE_BOUNDARY, ...(opts.rows ?? SRD_ROWS)])
+    const config = modeEvidenceConfig(SRD_SPEC, fungible, dbPath)
+    const [persona, other] = config.personas as [Persona, Persona]
+    const h = makeNotifierHarness(config)
+    const errors: Array<{ key: string; message: string }> = []
+    const from = log.length
+    await runJsonlPersistenceSafeguard(config, h.notifier.notify, {
+      readMountinfo: fixture(REALISTIC_MOUNTINFO),
+      statFn: () => false,
+      getRow: async (key) => {
+        if (key === persona.key) return makeRow(opts.rowOverrides ?? {}, persona)
+        throw new ErrSpawnNotFound('get', 'ErrSpawnNotFound', 'x')
+      },
+      recordStartupError: (key, message) => {
+        errors.push({ key, message })
+      },
+      home,
+      ...opts.deps,
+    })
+    const ref = renderPersonaRef(persona.name, persona.key)
+    return { config, persona, other, h, errors, ref, personaLines: log.slice(from).filter((l) => l.includes(ref)) }
+  }
+
+  const inconclusiveLines = (lines: string[]): string[] => lines.filter((l) => l.includes('archive evidence is inconclusive'))
+
+  test('b.deo SRI-704 (AC 41): a `delivery: all` channel with archived messages since spawn, DMs off → inconclusive with the fungible-mode reason, never lost: no record, no notice, one quiet line', async () => {
+    const log = captureErrorLog()
+    const { config, persona, h, errors, personaLines } = await runMode(true, log)
+    expect(channelModeOf(config)).toBe('fungible')
+    expect(persona.channels).toEqual([all(ALL_1)])
+    expect(persona.dm.enabled).toBe(false)
+    expect(persona.fungible_destination).toBe(ALL_1)
+
+    expect(errors).toEqual([])
+    expect(h.totalPosts()).toBe(0)
+    const inconclusive = inconclusiveLines(personaLines)
+    expect(inconclusive).toHaveLength(1)
+    expect(inconclusive[0]).toContain(FUNGIBLE_MODE_ZERO_REASON)
+    expect(personaLines.filter((l) => l.includes(UNATTRIBUTABLE_ZERO_REASON))).toEqual([])
+    expect(personaLines.filter((l) => l.includes('no archived activity since spawn'))).toEqual([])
+    assertNoLeak({ errors, personaLines, posts: h.allPosts(), logs: h.logs })
+  })
+
+  test('b.deo SRI-704: declarative control — the same fixture under the switch off → LOST record and one notice counting its `all` rows', async () => {
+    const log = captureErrorLog()
+    const { config, persona, other, h, errors, personaLines } = await runMode(false, log)
+    expect(channelModeOf(config)).toBe('declarative')
+
+    expect(errors.map((e) => e.key)).toEqual(['jsonl-transcript-lost'])
+    expect(errors[0]!.message).toContain('3 message(s)')
+    const posts = h.posts(persona.key)
+    expect(posts).toHaveLength(1)
+    expect(posts[0]!.channel).toBe(ALL_1)
+    expect(posts[0]!.text).toContain('3 message(s)')
+    expect(h.posts(other.key)).toEqual([])
+    expect(inconclusiveLines(personaLines)).toEqual([])
+    expect(personaLines.filter((l) => l.includes(FUNGIBLE_MODE_ZERO_REASON))).toEqual([])
+    assertNoLeak({ errors, personaLines, posts: h.allPosts(), logs: h.logs })
+  })
+
+  test('b.deo SRI-704: the archive count is asked for no channel, and a count it answers is no evidence: inconclusive with the fungible-mode reason, never lost', async () => {
+    const log = captureErrorLog()
+    const asked: Array<[readonly string[], number, string]> = []
+    const { h, errors, ref, personaLines } = await runMode(true, log, {
+      deps: {
+        archiveCountSince: (ids, since, countRef) => {
+          asked.push([[...ids], since, countRef])
+          return 5
+        },
+      },
+    })
+
+    expect(asked).toEqual([[[], SPAWN_EPOCH, ref]])
+    expect(errors).toEqual([])
+    expect(h.totalPosts()).toBe(0)
+    const inconclusive = inconclusiveLines(personaLines)
+    expect(inconclusive).toHaveLength(1)
+    expect(inconclusive[0]).toContain(FUNGIBLE_MODE_ZERO_REASON)
+    expect(personaLines.filter((l) => l.includes('5 message'))).toEqual([])
+    assertNoLeak({ errors, personaLines, posts: h.allPosts() })
+  })
+
+  test.each<[string, { deps?: Partial<JsonlPersistenceSafeguardDeps>; rowOverrides?: Partial<GetResult> }]>([
+    ['the row\'s started_at is unparseable', { rowOverrides: { started_at: 'not-a-timestamp' } }],
+    ['the archive count answers no count', { deps: { archiveCountSince: () => null } }],
+  ])('b.deo SRI-704: the no-count path (%s) keeps its declarative outcome: one quiet idle line, no record, no notice', async (_label, opts) => {
+    const log = captureErrorLog()
+    const fungible = await runMode(true, log, opts)
+    const declarative = await runMode(false, log, opts)
+
+    expect(fungible.errors).toEqual([])
+    expect(fungible.h.totalPosts()).toBe(0)
+    expect(fungible.personaLines.filter((l) => l.includes('no archived activity since spawn'))).toHaveLength(1)
+    expect(fungible.personaLines.filter((l) => l.includes('inconclusive'))).toEqual([])
+    // The same outcome as the declarative pass over the same fixture.
+    expect(fungible.personaLines).toEqual(declarative.personaLines)
+    expect(fungible.errors).toEqual(declarative.errors)
+    expect(declarative.h.totalPosts()).toBe(0)
+    assertNoLeak({ fungible: fungible.personaLines, declarative: declarative.personaLines })
+  })
+})
+
+describe('b.deo SRI-704: the fungible-mode zero reason (b.av2 SR-7.4)', () => {
+  test('it is distinct from the declarative unattributable-zero reason, names fungible mode, and is the reason in fungible mode only', () => {
+    expect(FUNGIBLE_MODE_ZERO_REASON).not.toBe(UNATTRIBUTABLE_ZERO_REASON)
+    expect(FUNGIBLE_MODE_ZERO_REASON).not.toContain(UNATTRIBUTABLE_ZERO_REASON)
+    expect(UNATTRIBUTABLE_ZERO_REASON).not.toContain(FUNGIBLE_MODE_ZERO_REASON)
+    expect(FUNGIBLE_MODE_ZERO_REASON).toContain('fungible mode')
+    expect(UNATTRIBUTABLE_ZERO_REASON).not.toContain('fungible mode')
+    expect(unattributableZeroReason('fungible')).toBe(FUNGIBLE_MODE_ZERO_REASON)
+    expect(unattributableZeroReason('declarative')).toBe(UNATTRIBUTABLE_ZERO_REASON)
+    expect(unattributableZeroReason()).toBe(UNATTRIBUTABLE_ZERO_REASON)
+    assertNoLeak({ FUNGIBLE_MODE_ZERO_REASON, UNATTRIBUTABLE_ZERO_REASON })
   })
 })
 

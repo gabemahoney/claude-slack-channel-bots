@@ -1,7 +1,7 @@
 /**
  * persona-destination-hold.test.ts — Hold and retry a persona's prompts and
  * notices while its destination fails (b.av2 SR-7.1 failure part, SR-3.2,
- * SR-3.3, SR-10.3).
+ * SR-3.3, SR-10.3; b.deo SRI-702, SRI-906).
  *
  * The hold's policy is proven here once, so the poller and notifier suites
  * need only one representative case each:
@@ -33,7 +33,16 @@
  *   longer applied is dropped with one line; `cancel`/`cancelAll` log one line
  *   per persona that had notices held, and an in-flight attempt then changes
  *   nothing;
- * - payload errors and refusals open no episode; no token reaches a line.
+ * - payload errors and refusals open no episode; no token reaches a line;
+ * - in fungible mode, a fungible destination channel the app is not in
+ *   (`not_in_channel`, `channel_not_found`) holds and retries both prompts
+ *   and notices, entered either way, as any refused destination (b.deo
+ *   SRI-702, beside b.av2 SR-7.1); its opening and cleared lines are what
+ *   `destinationFailedCause` and `destinationClearedCause` build with the
+ *   setting in force (`destinationSettingOf`), naming
+ *   `invited.permission_prompts` beside `destination=<value>`, while each
+ *   cause given the declarative setting is the declarative line unchanged
+ *   (b.deo SRI-906, beside b.av2 SR-10.3).
  *
  * Built over the real destination resolver, one `makeStubSlack` stub per
  * persona (leak marker on) and a fake clock. `afterEach` cancels every
@@ -46,15 +55,27 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import type { Persona } from '../src/config.ts'
+import { DM_DESTINATION, type Persona } from '../src/config.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
-import { createPersonaDestinations, type DestinationSlackClient, type PersonaDestinations } from '../src/persona-destination.ts'
+import {
+  DM_OPEN_SCOPE,
+  createPersonaDestinations,
+  destinationSettingOf,
+  type DestinationConfig,
+  type DestinationSlackClient,
+  type PersonaDestinations,
+} from '../src/persona-destination.ts'
 import {
   MAX_HELD_NOTICES_PER_PERSONA,
   createPersonaDestinationHold,
+  destinationClearedCause,
+  destinationFailedCause,
+  type DestinationFailedAt,
   type HoldNotice,
+  type NamedDestination,
   type PersonaDestinationHold,
 } from '../src/persona-destination-hold.ts'
+import { PERSONA_DESTINATION_FAILED, formatPersonaDiagnostic } from '../src/persona-diagnostics.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
@@ -1082,5 +1103,199 @@ describe('isolation (SR-3.3) and secrecy (SR-10.3)', () => {
 
     await clock.runNext()
     expect(clearedLines()[0]).toContain('(was chat.postMessage error unknown_error)')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A fungible destination channel the app is not in (b.deo SRI-702, SRI-906)
+// ---------------------------------------------------------------------------
+
+/** The configuration in effect in each mode, as `destinationSettingOf` reads it. */
+const FUNGIBLE_MODE: DestinationConfig = { allow_invited_channels: true }
+const DECLARATIVE_MODE: DestinationConfig = { allow_invited_channels: false }
+
+/** One `persona-destination-failed` line for `p`, with `cause`, as the hold formats it. */
+function destinationLine(p: Persona, cause: string): string {
+  return formatPersonaDiagnostic({ class: PERSONA_DESTINATION_FAILED, name: p.name, key: p.key, index: p.index, cause })
+}
+
+describe('fungible mode: a destination channel the app is not in is held and retried (b.deo SRI-702, SRI-906)', () => {
+  /** The fungible destination channel, which the persona's app was never invited to. */
+  const F_CHANNEL = 'C0EPH0001'
+  /** A persona loaded in fungible mode, its destination `invited.permission_prompts` = `F_CHANNEL`. */
+  let F: Persona
+
+  beforeEach(() => {
+    const config = makeMultiPersonaConfig(
+      [{ name: 'Eph Fungible', dm: { enabled: false }, invited: { permission_prompts: F_CHANNEL } }],
+      dir,
+      { allow_invited_channels: true },
+    )
+    F = config.personas[0]!
+    stubs.set(F.key, makeStubSlack({ leakMarker: LEAK_SENTINEL }))
+    clients.set(F.key, asWebClient(stubs.get(F.key)!.web))
+    applied.set(F.key, F)
+  })
+
+  /** Every post on F's client went to the fungible destination channel. */
+  const allAtF = (): boolean => posts(F).every((c) => c.channel === F_CHANNEL)
+
+  /**
+   * The episode logged exactly one opening and one cleared line, each what the
+   * exported cause builds with the fungible setting in force, and each naming
+   * F, the step, the code, `destination=<value>` and the fungible setting.
+   */
+  function expectFungibleEpisodeLines(code: string): void {
+    const setting = destinationSettingOf(FUNGIBLE_MODE)
+    const at: NamedDestination = { setting, destination: F_CHANNEL }
+    const was: DestinationFailedAt = { step: 'chat.postMessage', code }
+    const opening = destinationLine(F, destinationFailedCause(at, was))
+    const cleared = destinationLine(F, destinationClearedCause(at, was))
+
+    expect(logs).toEqual([opening, cleared])
+    expect(startLines()).toEqual([opening])
+    expect(clearedLines()).toEqual([cleared])
+    for (const line of [opening, cleared]) {
+      expect(line).toContain(refOf(F))
+      expect(line).toContain('chat.postMessage')
+      expect(line).toContain(code)
+      expect(line).toContain(`destination=${F_CHANNEL}`)
+      expect(line).toContain(setting)
+    }
+  }
+
+  test.each([['not_in_channel'], ['channel_not_found']])(
+    '%s, entered by a held notice: the notice is retried when due on the fake clock, the re-derived prompt is held meanwhile; one opening line, then one cleared line and the held notices posted in order',
+    async (code) => {
+      stick(F, 'post', code)
+      const attempts = (): number => posts(F).length
+
+      await deliver(F, 'n1')
+      expect(attempts()).toBe(1)
+      expect(hold.view(F.key)).toEqual({ held: true, heldNotices: 1, nextDueAt: 5000 })
+      // The re-derived prompt is held too, and a later notice joins the queue with no attempt.
+      expect(hold.begin(F.key)).toBeUndefined()
+      await deliver(F, 'n2')
+      expect(attempts()).toBe(1)
+      expect(hold.view(F.key).heldNotices).toBe(2)
+
+      await clock.advance(4999)
+      expect(attempts()).toBe(1)
+      await clock.advance(1)
+      expect(attempts()).toBe(2)
+      expect(hold.view(F.key)).toEqual({ held: true, heldNotices: 2, nextDueAt: 15_000 })
+      expect(hold.begin(F.key)).toBeUndefined()
+      await clock.advance(10_000)
+      expect(attempts()).toBe(3)
+      expect(startLines()).toHaveLength(1)
+      expect(failures.map((f) => [f.notice, f.code, f.held])).toEqual([
+        ['n1', code, true],
+        ['n1', code, true],
+        ['n1', code, true],
+      ])
+
+      unstick(F, 'post')
+      await clock.runNext()
+      expect(postedTexts(F)).toEqual(['n1', 'n1', 'n1', 'n1', 'n2'])
+      expect(hold.view(F.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+
+      // Not held now: the re-derived prompt goes straight through.
+      const prompt = hold.begin(F.key)!
+      expect(await prompt.post(F, client(F), { text: 'prompt' })).toMatchObject({ outcome: 'posted', channelId: F_CHANNEL })
+      expect(postedTexts(F).at(-1)).toBe('prompt')
+      expect(allAtF()).toBe(true)
+      expectFungibleEpisodeLines(code)
+      expect(clock.pendingCount()).toBe(0)
+    },
+  )
+
+  test.each([['not_in_channel'], ['channel_not_found']])(
+    '%s, entered by a re-derived prompt: the prompt is refused until due and retried on the fake clock, notices are held behind it; one opening line, then the first success logs one cleared line and posts the held notices in order',
+    async (code) => {
+      stick(F, 'post', code)
+
+      const first = await hold.begin(F.key)!.post(F, client(F), { text: 'prompt' })
+      expect(first).toMatchObject({ outcome: 'failed', step: 'chat.postMessage', code, channelId: F_CHANNEL })
+      expect(hold.view(F.key)).toEqual({ held: true, heldNotices: 0, nextDueAt: 5000 })
+      expect(clock.pendingCount()).toBe(0)
+
+      await clock.advance(4999)
+      expect(hold.begin(F.key)).toBeUndefined()
+      await clock.advance(1)
+      const retry = hold.begin(F.key)!
+      expect(retry).toBeDefined()
+      expect(await retry.post(F, client(F), { text: 'prompt' })).toMatchObject({ outcome: 'failed', code })
+      expect(hold.view(F.key)).toEqual({ held: true, heldNotices: 0, nextDueAt: 15_000 })
+      expect(startLines()).toHaveLength(1)
+
+      await clock.advance(9999)
+      expect(hold.begin(F.key)).toBeUndefined()
+      await clock.advance(1)
+      unstick(F, 'post')
+      const accepted = makeDeferredWebApiCall()
+      stub(F).script.post.push(accepted.outcome)
+      const second = hold.begin(F.key)!
+      const inFlight = second.post(F, client(F), { text: 'prompt' })
+
+      // Notices handed over while the retry is in flight are held, with no attempt and no timer.
+      await deliver(F, 'n1')
+      await deliver(F, 'n2')
+      expect(hold.view(F.key).heldNotices).toBe(2)
+      expect(hold.begin(F.key)).toBeUndefined()
+      expect(postedTexts(F)).toEqual(['prompt', 'prompt', 'prompt'])
+      expect(clock.pendingCount()).toBe(0)
+
+      accepted.settle()
+      expect(await inFlight).toMatchObject({ outcome: 'posted', channelId: F_CHANNEL })
+      await clock.flush()
+
+      expect(clock.now()).toBe(15_000)
+      expect(postedTexts(F)).toEqual(['prompt', 'prompt', 'prompt', 'n1', 'n2'])
+      expect(allAtF()).toBe(true)
+      expect(hold.view(F.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+      expect(failures).toEqual([])
+      expectFungibleEpisodeLines(code)
+      expect(clock.pendingCount()).toBe(0)
+    },
+  )
+
+  test('a fungible "dm" destination whose open lacks im:write: both causes name destination=dm with the fungible setting, and the opening one names the scope', () => {
+    const setting = destinationSettingOf(FUNGIBLE_MODE)
+    const at: NamedDestination = { setting, destination: DM_DESTINATION }
+    const was: DestinationFailedAt = { step: 'conversations.open', code: 'missing_scope' }
+
+    const opening = destinationFailedCause(at, was)
+    const cleared = destinationClearedCause(at, was)
+
+    for (const cause of [opening, cleared]) {
+      expect(cause).toContain(`destination=${DM_DESTINATION}`)
+      expect(cause).toContain(setting)
+      expect(cause).toContain('conversations.open')
+      expect(cause).toContain('missing_scope')
+    }
+    expect(opening).toContain(DM_OPEN_SCOPE)
+    assertNoLeak({ opening, cleared })
+  })
+})
+
+describe('the causes given the declarative setting are the declarative lines (b.deo SRI-906, b.av2 SR-10.3)', () => {
+  test('each cause reproduces the declarative line byte for byte, and C\'s logged episode lines are those', async () => {
+    const at: NamedDestination = { setting: destinationSettingOf(DECLARATIVE_MODE), destination: 'C0CEE0001' }
+    const was: DestinationFailedAt = { step: 'chat.postMessage', code: 'not_in_channel' }
+    const opening =
+      'chat.postMessage failed for destination=C0CEE0001 with error not_in_channel; ' +
+      'holding its permission prompts and notices and retrying with backoff'
+    const cleared =
+      'cleared: destination=C0CEE0001 accepts posts again (was chat.postMessage error not_in_channel); delivering what was held'
+
+    expect(destinationFailedCause(at, was)).toBe(opening)
+    expect(destinationClearedCause(at, was)).toBe(cleared)
+
+    stub(C).script.post.push({ kind: 'platform', error: 'not_in_channel' })
+    await deliver(C, 'n1')
+    await clock.runNext()
+
+    expect(logs).toEqual([destinationLine(C, opening), destinationLine(C, cleared)])
+    expect(postedTexts(C)).toEqual(['n1', 'n1'])
   })
 })

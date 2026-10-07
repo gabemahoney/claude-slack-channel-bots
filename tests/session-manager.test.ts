@@ -379,6 +379,9 @@
  *   - b.av2 SR-7.4 transcript-loss diagnosis: only the persona's
  *     `delivery: all` channels are counted, and a zero count is inconclusive
  *     for a persona with a `mentions` channel or DMs on.
+ *     b.deo SRI-704: in fungible mode no channel is counted and a zero is
+ *     never attributable, so the diagnosis is inconclusive with
+ *     `FUNGIBLE_MODE_ZERO_REASON`, never lost.
  *   - SR-8.6 invariant: every successful spawn call site passes
  *     relay_mode='on'.
  *   - b.svb / b.f2b: every spawn on every launch path carries
@@ -860,7 +863,7 @@ import {
 } from '../src/stop-hook-bootstrap.ts'
 import { makeReplyGuardRecordDir, type ReplyGuardRecordDir } from './test-helpers/reply-guard-record.ts'
 import { installRecordingReplyGuard, observeLaunchCalls, type LaunchCall } from './test-helpers/reply-guard-launch.ts'
-import { UNATTRIBUTABLE_ZERO_REASON, runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
+import { FUNGIBLE_MODE_ZERO_REASON, UNATTRIBUTABLE_ZERO_REASON, runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
 import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src/permission-poller.ts'
 import { makePersonaClients, makeTrailCapture, posts, startManualPoller } from './test-helpers/permission-relay-harness.ts'
 import { resolveJsonlPath } from '../src/cozempic.ts'
@@ -14700,6 +14703,63 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(log).not.toContain('no message archive is configured')
     expect(log).not.toContain('could not be consulted')
     expect(log).not.toContain('started_at is absent or unparseable')
+  })
+
+  // b.av2 SR-7.4, b.deo SRI-704: in fungible mode the diagnosis counts no
+  // channel and a zero is never attributable. The persona's spec-set
+  // `channels` (which the loader leaves empty in fungible mode) list a
+  // `delivery: all` channel holding archived messages since spawn, and its
+  // DMs are off: in declarative mode that is lost (the table's `all`-row
+  // cases); here it is inconclusive with the fungible-mode reason, never lost.
+  test('b.deo SRI-704: fungible mode, a `delivery: all` channel with archived messages since spawn and DMs off → inconclusive with the fungible-mode reason, never lost', async () => {
+    const readLog = captureStartupErrors()
+    const boundary = Date.parse(SR74_STARTED_AT) / 1000
+    const rows = [
+      { ts: boundary - 10, channel: ALL_1 },
+      ...Array.from({ length: 3 }, (_, i) => ({ ts: boundary + 1 + i, channel: ALL_1 })),
+    ]
+    const archive = buildTempArchiveDb(rows, ELSEWHERE)
+    archiveCleanups.push(archive.cleanup)
+    const cfg = makeMultiPersonaConfig(
+      [{
+        name: SR74_NAME,
+        channels: [{ id: ALL_1, delivery: 'all' }],
+        dm: { enabled: false },
+        invited: { permission_prompts: ALL_1 },
+      }],
+      fixtureDir,
+      { message_archive_db: archive.dbPath, allow_invited_channels: true },
+    )
+    const persona = personaOf(cfg, SR74_KEY)
+    expect(persona.channels).toEqual([{ id: ALL_1, delivery: 'all' }])
+    expect(persona.fungible_destination).toBe(ALL_1)
+    installAmnesia({
+      cfg,
+      key: SR74_KEY,
+      getResult: { jsonl_path: '/data/proj/sess-sri704.jsonl', claude_session_id: 'sess-sri704', started_at: SR74_STARTED_AT },
+    })
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(persona, cfg, true)
+    })
+    const log = readLog()
+
+    expect(result).toEqual({ key: SR74_KEY, action: 'fresh-after-inconclusive-amnesia' })
+    expect(onlyStartupEntry(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toContain(FUNGIBLE_MODE_ZERO_REASON)
+    expect(countStartupEntries(log, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)).toBe(0)
+    expect(errLog).toContain(FUNGIBLE_MODE_ZERO_REASON)
+    expect(errLog).not.toContain('transcript never created')
+    expect(errLog).not.toContain('Conversation history was LOST')
+    expect(`${log}${errLog}`).not.toContain(UNATTRIBUTABLE_ZERO_REASON)
+    expect(notices).toHaveLength(1)
+    expect(notices[0]!.key).toBe(SR74_KEY)
+    const text = notices[0]!.text
+    expect(text).toContain('could not determine whether my prior')
+    expect(text).toContain(escapeSlackControlCharacters(FUNGIBLE_MODE_ZERO_REASON))
+    expect(text).not.toContain('has been lost')
+    expect(text).not.toContain('message archive shows')
+    assertNoLeak({ log, errLog, notices })
   })
 
   // Carried from E3 Task 1 review: the locally computed fallback transcript
