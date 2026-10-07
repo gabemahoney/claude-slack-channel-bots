@@ -149,6 +149,7 @@ import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import type { DeliveryMode } from '../src/config.ts'
 import type { FungibleChannelType, FungibleRefusal } from '../src/delivery-decision.ts'
+import { FUNGIBLE_REFUSALS } from '../src/delivery-decision.ts'
 import { channelDeliveryPath } from '../src/channel-delivery.ts'
 import {
   FUNGIBLE_REFUSAL_TEXTS,
@@ -2292,7 +2293,7 @@ function seedStoredAll(stateDir: string, all: Readonly<Record<string, readonly s
 // SRI-302: an `app_mention` in fungible mode ends after its archive write
 // ---------------------------------------------------------------------------
 
-describe('fungible mode: an app_mention never reaches the decision (b.deo SRI-302, SRI-903; AC 7, AC 11)', () => {
+describe('fungible mode: an app_mention never reaches the decision (b.deo SRI-302, SRI-903; b.deo AC 7, b.deo AC 11)', () => {
   test.each(FX_CHANNELS.flatMap(([kind, channel]) => (['app_mention first', 'message first'] as const).map((order) => [kind, channel, order] as const)))(
     'SRI-302 (%s channel %s, %s): with P and Q in the channel and P mentioned, P is delivered exactly once with via=mention, Q nothing, and no unclaimed-channel line is logged',
     async (kind, channel, order) => {
@@ -2318,10 +2319,11 @@ describe('fungible mode: an app_mention never reaches the decision (b.deo SRI-30
   )
 
   test.each<[string, (h: Harness) => SlackEvent]>([
-    ['a lone app_mention of P in a public channel', (h) => makeAppMention({ channel: FX_PUBLIC, text: `${fxMention(h)} hello` })],
-    ['a lone app_mention of P in a private channel', (h) => makeAppMention({ channel: FX_PRIVATE, text: `${fxMention(h)} hello` })],
-    ['a group-DM app_mention of P', (h) => makeAppMention({ channel: FX_GROUP_DM, text: `${fxMention(h)} hello` })],
-  ])('SRI-302: %s, fed on every persona with an ack reaction set and Q without a session, delivers nothing, reacts to nothing, raises no notice, schedules no restart and logs no line', async (_label, build) => {
+    // The channel rows carry the channel type their `message` twin carries, so an app_mention that reached the decision would take the fungible path to P and to Q.
+    ['a lone app_mention of P and Q in a public channel', (h) => makeAppMention({ channel: FX_PUBLIC, channel_type: 'channel', text: `${fxMention(h)} ${fxMention(h, FX_Q)} hello` })],
+    ['a lone app_mention of P and Q in a private channel', (h) => makeAppMention({ channel: FX_PRIVATE, channel_type: 'group', text: `${fxMention(h)} ${fxMention(h, FX_Q)} hello` })],
+    ['a group-DM app_mention of P and Q', (h) => makeAppMention({ channel: FX_GROUP_DM, channel_type: 'mpim', text: `${fxMention(h)} ${fxMention(h, FX_Q)} hello` })],
+  ])('SRI-302: %s, fed on every persona with an ack reaction set and the mentioned Q without a session, delivers nothing, reacts to nothing, raises no notice, schedules no restart and logs no line', async (_label, build) => {
     const h = makeFungibleHarness({ ackReaction: FX_ACK, sessions: [FX_P], restartDelayS: NEVER_FIRE_RESTART_DELAY_S })
     const event = build(h)
 
@@ -2432,10 +2434,10 @@ describe('fungible mode: the mode is read as each event arrives, and a dedupe re
 })
 
 // ---------------------------------------------------------------------------
-// SRI-903: `unclaimed-channel` in both modes (AC 6, AC 9, AC 12)
+// SRI-903: `unclaimed-channel` in both modes (b.deo AC 6, b.deo AC 9, b.deo AC 12)
 // ---------------------------------------------------------------------------
 
-describe('unclaimed-channel lines in both modes (b.deo SRI-903, SRI-301; AC 6, AC 9, AC 12)', () => {
+describe('unclaimed-channel lines in both modes (b.deo SRI-903, SRI-301; b.deo AC 6, b.deo AC 9, b.deo AC 12)', () => {
   const marker = 'ZEBRA6620UNCLAIMED'
 
   test.each<[string, RoutingHarnessOptions, boolean | undefined]>([
@@ -2476,7 +2478,7 @@ describe('unclaimed-channel lines in both modes (b.deo SRI-903, SRI-301; AC 6, A
     ['not-a-channel', UNCLAIMED_REASON_NOT_A_CHANNEL, FX_PUBLIC, (h) => makeChannelMessage({ channel: FX_PUBLIC, channel_type: undefined, text: text(h) }), ENVELOPE_FLAG_FORMS.false],
   ]
 
-  test.each(REASON_ROWS)('SRI-903 fungible pin (%s): one unclaimed-channel line per receiving persona, built with the reason\'s exported text and naming the channel and that persona; no other line, no delivery, no message text', async (refusal, reasonText, channel, build, envelope) => {
+  test.each(REASON_ROWS)('SRI-903 fungible pin (%s): one unclaimed-channel line per receiving persona, built with the reason\'s exported text, naming the channel and that persona and saying declarative mode with the channel listed serves it; no other line, no delivery, no message text', async (refusal, reasonText, channel, build, envelope) => {
     const h = makeFungibleHarness({ ackReaction: FX_ACK })
     const event = build(h)
 
@@ -2487,6 +2489,7 @@ describe('unclaimed-channel lines in both modes (b.deo SRI-903, SRI-301; AC 6, A
       expect(h.logs[i]).toContain(reasonText)
       expect(h.logs[i]).toContain(`channel ${channel} `)
       expect(h.logs[i]).toContain(`personas[${persona.index}] ${renderPersonaRef(persona.name, persona.key)}`)
+      expect(h.logs[i]).toContain('declarative mode with the channel listed')
     })
     expect(deliveries(h, FX_NAMES)).toEqual({ [FX_P]: [], [FX_Q]: [] })
     expect(h.all.map((x) => x.stub.callLog)).toEqual([[], []])
@@ -2501,6 +2504,8 @@ describe('unclaimed-channel lines in both modes (b.deo SRI-903, SRI-301; AC 6, A
 
     expect(h.logs).toEqual(REASON_ROWS.map(([refusal, , channel]) => fungibleUnclaimedLine(h, FX_P, channel, refusal)))
     expect(new Set(h.logs).size).toBe(REASON_ROWS.length)
+    // The reason texts alone are pairwise distinct, whatever channel each line names.
+    expect(new Set(Object.values(FUNGIBLE_REFUSAL_TEXTS)).size).toBe(FUNGIBLE_REFUSALS.length)
     // Each reason's text is the one the closed mapping holds for its refusal.
     expect(REASON_ROWS.map(([refusal]) => FUNGIBLE_REFUSAL_TEXTS[refusal])).toEqual(REASON_ROWS.map(([, reasonText]) => reasonText))
     expect(deliveries(h, FX_NAMES)).toEqual({ [FX_P]: [], [FX_Q]: [] })
@@ -2510,13 +2515,13 @@ describe('unclaimed-channel lines in both modes (b.deo SRI-903, SRI-301; AC 6, A
 
 // ---------------------------------------------------------------------------
 // SRI-307 and SRI-902: the heard set and the `persona-invited-channel` line
-// (AC 13). The teardown's own-key forget is tests/persona-lifecycle.test.ts's.
+// (b.deo AC 13). The teardown's own-key forget is tests/persona-lifecycle.test.ts's.
 // ---------------------------------------------------------------------------
 
-describe('fungible mode: the persona-invited-channel line and the heard set (b.deo SRI-307, SRI-902; AC 13)', () => {
+describe('fungible mode: the persona-invited-channel line and the heard set (b.deo SRI-307, SRI-902; b.deo AC 13)', () => {
   const marker = 'ZEBRA3307INVITED'
 
-  test('SRI-902 pin: P\'s first event in a public and in a private channel each log the line, exactly as the builders give it, naming the persona, the channel, public or private and the delivery, with no message text, user ID or token', async () => {
+  test('SRI-902 pin: P\'s first event in a public and in a private channel each log the line exactly as SRI-902 words it, naming the persona, the channel, public or private and the delivery and saying P hears it in fungible mode, with no message text, user ID or token', async () => {
     const h = makeFungibleHarness()
     const P = h.p(FX_P).persona
     const pub = makeChannelMessage({ channel: FX_PUBLIC, text: `${marker} public` })
@@ -2525,23 +2530,18 @@ describe('fungible mode: the persona-invited-channel line and the heard set (b.d
     await h.receive(pub, [FX_P])
     await h.receive(priv, [FX_P])
 
-    const expected = FX_CHANNELS.map(([kind, channel]) => formatPersonaDiagnostic({
-      class: PERSONA_INVITED_CHANNEL,
-      name: P.name,
-      key: P.key,
-      index: P.index,
-      cause: invitedChannelCause(channel, kind, 'mentions'),
-    }))
+    // SRI-902's one exact text for each line, written once here; every other case builds it through the builders.
+    const expected = [
+      `[slack] ${PERSONA_INVITED_CHANNEL}: personas[${P.index}] ${renderPersonaRef(P.name, P.key)}: hears public channel ${FX_PUBLIC} in fungible mode, at channel delivery mentions`,
+      `[slack] ${PERSONA_INVITED_CHANNEL}: personas[${P.index}] ${renderPersonaRef(P.name, P.key)}: hears private channel ${FX_PRIVATE} in fungible mode, at channel delivery mentions`,
+    ]
     expect(invitedLines(h)).toEqual(expected)
-    FX_CHANNELS.forEach(([kind, channel], i) => {
-      const line = invitedLines(h)[i]!
-      expect(line.startsWith(`[slack] ${PERSONA_INVITED_CHANNEL}: personas[${P.index}] ${renderPersonaRef(P.name, P.key)}: `)).toBe(true)
-      expect(line).toContain(channel)
-      expect(line).toContain(kind)
-      expect(line).toContain('mentions')
+    // The builders give the same text.
+    expect(FX_CHANNELS.map(([kind, channel]) => invitedLine(h, FX_P, channel, kind, 'mentions'))).toEqual(expected)
+    for (const line of invitedLines(h)) {
       expect(line).not.toContain(marker)
       expect(line).not.toContain(pub.user as string)
-    })
+    }
     expect(deliveries(h, FX_NAMES)).toEqual({ [FX_P]: [], [FX_Q]: [] })
     assertNoLeak(captured(h))
   })

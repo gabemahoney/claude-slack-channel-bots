@@ -31,7 +31,7 @@
  *   kill, bound as `main()` binds them), what P holds set through the
  *   harness's real routes, each left-over read through its module's query;
  * - the ack-reaction entries: the real ack tracker's `forgetPersonaAcks`;
- * - the heard set (b.av2 SR-6.5 with b.deo SRI-307, AC 13): the real routing
+ * - the heard set (b.av2 SR-6.5 with b.deo SRI-307, b.deo AC 13): the real routing
  *   in fungible mode (`makeRoutingHarness`), its `forget` as
  *   `routing.forget`, each persona's heard set filled by events through the
  *   routing and read through its own `heardChannels`; the registry and
@@ -1895,8 +1895,9 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(clock.pendingCount()).toBe(0)
   })
 
-  test('b.deo SRI-307 (AC 13): over the real routing in fungible mode, tearing B down empties B\'s heard set and leaves A\'s, holding the same channel, unchanged', async () => {
-    const h = makeRoutingHarness([{ name: NAME_A }, { name: NAME_B }], dir, { mode: 'fungible' })
+  test('b.deo SRI-307 (b.deo AC 13): over the real routing in fungible mode, tearing B down empties B\'s heard set and leaves A\'s, holding the same channel, unchanged', async () => {
+    const clock = createFakeClock()
+    const h = makeRoutingHarness([{ name: NAME_A }, { name: NAME_B }], dir, { mode: 'fungible', dedupeClock: () => clock.now() })
     cleanups.push(resetRoutingState)
     const f = makeFixture({ overrides: { routing: { forget: (key) => h.forget(key) } } })
     const [a, b] = [f.a.key, f.b.key]

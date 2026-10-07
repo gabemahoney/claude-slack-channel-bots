@@ -2,9 +2,9 @@
  * persona-connection-wiring.test.ts — Each persona's connection feeds its own
  * pipeline and click handler, and the server's Slack seams resolve to the
  * persona's own clients (b.av2 SR-3.1 wiring, SR-3.4, SR-4.1 with b.deo
- * SRI-301, SR-7.1, SR-7.2).
+ * SRI-301, SR-7.1 with b.deo SRI-701 to SRI-703, SR-7.2).
  *
- * b.av2 SR-4.1 / b.deo SRI-301 (AC 6): for a `message` and an `app_mention`,
+ * b.av2 SR-4.1 / b.deo SRI-301 (b.deo AC 6): for a `message` and an `app_mention`,
  * the envelope's `is_ext_shared_channel` reaches the routing intake exactly as
  * the envelope carried it in each of its four forms (`false`, `true`, a
  * non-boolean, absent, which arrives as absent), with no other envelope field;
