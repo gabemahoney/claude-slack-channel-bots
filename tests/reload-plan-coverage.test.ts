@@ -1,6 +1,6 @@
 /**
  * reload-plan-coverage.test.ts — Every key the loader accepts has a place in
- * the change plan (b.av2 SR-8.4, SR-8.6).
+ * the change plan (b.av2 SR-8.4, SR-8.6; b.deo SRI-802, SRI-803).
  *
  * `src/reload-plan.ts` hand-lists the persona settings it compares in three
  * classes (`DESTRUCTIVE_SETTINGS`, `IN_PLACE_SETTINGS`,
@@ -10,9 +10,9 @@
  * name, would never be compared: an edit of it would read `no effective
  * change` and the apply would treat it as a no-op. These tests hold the
  * loader's key lists (`PERSONA_ENTRY_KEYS`, `PERSONA_DM_KEYS`,
- * `CHANNEL_ENTRY_KEYS`, `PERSONA_TOP_LEVEL_KEYS` in src/config.ts) against
- * the plan, so adding a key to the loader fails here until the plan
- * classifies it.
+ * `PERSONA_INVITED_KEYS`, `CHANNEL_ENTRY_KEYS`, `PERSONA_TOP_LEVEL_KEYS` in
+ * src/config.ts) against the plan, so adding a key to the loader fails here
+ * until the plan classifies it.
  *
  * The wording of each class's preview line is pinned in
  * tests/reload-preview.test.ts; this file asserts only which class and which
@@ -30,11 +30,13 @@ import { join } from 'node:path'
 
 import {
   CHANNEL_ENTRY_KEYS,
+  channelModeOf,
   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   parsePersonaConfigBytes,
   PERSONA_DM_KEYS,
   PERSONA_ENTRY_KEYS,
+  PERSONA_INVITED_KEYS,
   PERSONA_TOP_LEVEL_KEYS,
   type PersonaConfig,
   type PersonaConfigInput,
@@ -43,7 +45,9 @@ import {
   buildChangePlan,
   DESTRUCTIVE_SETTINGS,
   IN_PLACE_SETTINGS,
+  MODE_SWITCH_SETTING,
   NEXT_LAUNCH_SETTINGS,
+  type ServerSettingChange,
   type ValidChangePlan,
 } from '../src/reload-plan.ts'
 import { makePersona } from './test-helpers/persona-config.ts'
@@ -83,13 +87,14 @@ const UNCOMPARED_PERSONA_FIELDS: readonly string[] = []
 
 /**
  * Every leaf field of a persona entry, named as the plan names its setting:
- * a top-level entry key as itself, a `dm` key as `dm.<key>` and a channel
- * key through `CHANNEL_FIELD_SETTING` (`channels[].<key>` when unmapped, so
- * it matches no class).
+ * a top-level entry key as itself, a `dm` key as `dm.<key>`, an `invited`
+ * key as `invited.<key>` and a channel key through `CHANNEL_FIELD_SETTING`
+ * (`channels[].<key>` when unmapped, so it matches no class).
  */
 function personaLeafSettings(): string[] {
   return PERSONA_ENTRY_KEYS.flatMap((key): string[] => {
     if (key === 'dm') return PERSONA_DM_KEYS.map((k) => `dm.${k}`)
+    if (key === 'invited') return PERSONA_INVITED_KEYS.map((k) => `invited.${k}`)
     if (key === 'channels') return CHANNEL_ENTRY_KEYS.map((k) => CHANNEL_FIELD_SETTING[k] ?? `channels[].${k}`)
     return [key]
   })
@@ -97,11 +102,12 @@ function personaLeafSettings(): string[] {
 
 describe('every persona field the loader accepts is classified', () => {
   // When this fails after a key was added to PERSONA_ENTRY_KEYS,
-  // PERSONA_DM_KEYS or CHANNEL_ENTRY_KEYS: decide what an edit of the new
-  // field does to a running persona (SR-8.6) and add it to exactly one of
+  // PERSONA_DM_KEYS, PERSONA_INVITED_KEYS or CHANNEL_ENTRY_KEYS: decide what
+  // an edit of the new field does to a running persona (b.av2 SR-8.6, b.deo
+  // SRI-802) and add it to exactly one of
   // DESTRUCTIVE_SETTINGS (instance torn down and brought up),
   // IN_PLACE_SETTINGS (applied in place, with its comparison in
-  // inPlaceChanges) or NEXT_LAUNCH_SETTINGS (takes effect at the next
+  // personaSectionChanges) or NEXT_LAUNCH_SETTINGS (takes effect at the next
   // launch), then give it a preview line in tests/reload-preview.test.ts. A
   // new channel-entry key also needs its entry in CHANNEL_FIELD_SETTING. Only
   // a field whose change genuinely has no effect goes in
@@ -130,10 +136,20 @@ describe('every top-level key the loader accepts is compared', () => {
     expect([...defaults].sort()).toEqual([...NEXT_LAUNCH_SETTINGS].sort())
   })
 
-  /** The one persona both configurations hold; it sets no default of its own. */
+  /**
+   * The one persona both configurations hold; it sets no default of its own.
+   * It is valid in both channel modes, so a candidate that changes only
+   * `allow_invited_channels` is valid: its channel fungible destination needs
+   * no DMs, and declarative mode does not read it.
+   */
   function input(top: Record<string, unknown> = {}): PersonaConfigInput {
     const alpha = makePersona(
-      { name: 'alpha', channels: [{ id: 'C0A0001', delivery: 'all' }], permission_prompts: 'C0A0001' },
+      {
+        name: 'alpha',
+        channels: [{ id: 'C0A0001', delivery: 'all' }],
+        permission_prompts: 'C0A0001',
+        invited: { permission_prompts: 'C0A0001' },
+      },
       root,
     )
     return { personas: [alpha], ...top }
@@ -182,11 +198,30 @@ describe('every top-level key the loader accepts is compared', () => {
     ack_reaction: 'eyes',
     reply_chunk_limit: 2000,
     reply_chunk_mode: 'length',
+    allow_invited_channels: true,
   })
 
   test('every server-wide key has a changed value to try', () => {
     expect(Object.keys(CHANGED_VALUES()).sort()).toEqual([...SERVER_WIDE_KEYS].sort())
   })
+
+  /** The one persona, as the plan names it. */
+  const ALPHA_REF = { key: 'alpha', name: 'alpha', index: 0 }
+
+  /**
+   * The setting entry a change of only `key` gives: an inherited default
+   * names the persona that inherits it; the switch names the mode it turns
+   * on and every persona present in both configurations (b.deo SRI-803).
+   */
+  function expectedSetting(key: string): ServerSettingChange {
+    if ((NEXT_LAUNCH_SETTINGS as readonly string[]).includes(key)) return { name: key, inheritedBy: [ALPHA_REF] }
+    if (key === MODE_SWITCH_SETTING) {
+      // The mode the candidate's switch picks.
+      const mode = channelModeOf(parse(input({ [key]: CHANGED_VALUES()[key] })))
+      return { name: key, mode, personas: [ALPHA_REF] }
+    }
+    return { name: key }
+  }
 
   // When this fails for a key: the plan reads each server-wide setting off
   // the resolved config by its top-level name, so the resolver
@@ -195,10 +230,7 @@ describe('every top-level key the loader accepts is compared', () => {
   test.each(SERVER_WIDE_KEYS)('changing only %s is one changed setting', (key) => {
     const result = plan({ [key]: CHANGED_VALUES()[key] })
 
-    const inherited = (NEXT_LAUNCH_SETTINGS as readonly string[]).includes(key)
-    expect(result.settings).toEqual([
-      inherited ? { name: key, inheritedBy: [{ key: 'alpha', name: 'alpha', index: 0 }] } : { name: key },
-    ])
+    expect(result.settings).toEqual([expectedSetting(key)])
     expect(result.noEffectiveChange).toBe(false)
   })
 })

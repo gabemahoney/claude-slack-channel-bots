@@ -9,9 +9,10 @@
  * only against the digest a persona connected, retried or broke with, which
  * the bring-up controller holds; SR-8.6 step 6: the preview reads the
  * bring-up controller's state to tell a persona broken by its credentials
- * from one to reconnect; SR-8.6 step 1: `onApplied` swaps the server's
- * applied config to `configInEffect(<start-time config>, <confirmed>)`, the
- * confirmed persona set over the start-time server-wide values (AC 61, the
+ * from one to reconnect; SR-8.6 step 1 (b.deo SRI-201): `onApplied` swaps
+ * the server's applied config to `configInEffect(<start-time config>,
+ * <confirmed>)`, the confirmed persona set and `allow_invited_channels`
+ * switch over the other start-time server-wide values (AC 61, the
  * server-wide row: nothing in server.ts reads the controller's own applied
  * config, and `configInEffect` itself is tested as a pure function at the end
  * of this file; the ack reaction and reply chunk settings reach the routing
@@ -80,7 +81,8 @@
  * stripped and anchors on content, never on line numbers. It reads no file
  * but src/server.ts (and, for the one name check that the teardown's delete is
  * gone, every src/*.ts file's text), imports only the pure `configInEffect` from
- * src/reload.ts and the pure `replySettingsOf`, constants and types from
+ * src/reload.ts, the switch's setting name `MODE_SWITCH_SETTING` from
+ * src/reload-plan.ts and the pure `replySettingsOf`, constants and types from
  * src/config.ts (and only types from src/persona-notifier.ts,
  * src/persona-lifecycle.ts and src/session-manager.ts), runs no server code,
  * and touches no home
@@ -108,6 +110,7 @@ import {
 } from './test-helpers/source-audit.ts'
 import { makePersonaConfig } from './test-helpers/persona-config.ts'
 import { configInEffect } from '../src/reload.ts'
+import { MODE_SWITCH_SETTING } from '../src/reload-plan.ts'
 import {
   DEFAULT_REPLY_CHUNK_LIMIT,
   MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
@@ -992,16 +995,19 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
   // (at call time, as the AC 58 consumers above, or once at start, as the
   // listener's bind and port). After an apply that holder is exactly what
   // configInEffect makes of the start-time config and the confirmed one, so
-  // no consumer can see a confirmed server-wide value before the next start.
+  // no consumer can see a confirmed server-wide value before the next start,
+  // except the allow_invited_channels switch, the one server-wide setting
+  // applied in place (b.av2 SR-8.6, b.deo SRI-201).
   // The acknowledgement reaction and the reply chunk settings reach their
   // consumers (the routing's ack step and the reply tool) through the one
   // accessor getReplySettings, which reads the same holder at call time
   // (pinned by the last tests of this block).
-  test('configInEffect keeps every server-wide setting of the start-time config and takes only the confirmed persona set', () => {
+  test('configInEffect takes the confirmed persona set and allow_invited_channels switch and keeps every other server-wide setting of the start-time config', () => {
     const startTime = makePersonaConfig({ claude_config_dir: '/start/claude' }, '/start-base')
     const persona = startTime.personas[0]!
-    // Every server-wide setting changed, one added (ack_reaction) and one
-    // dropped (claude_config_dir), and the persona set replaced.
+    // Every server-wide setting changed (the switch turned on among them), one
+    // added (ack_reaction) and one dropped (claude_config_dir), and the
+    // persona set replaced.
     const applied = makePersonaConfig(
       {
         personas: [{ ...persona, key: 'other', name: 'Other', claude_config_dir: '/applied/claude' }],
@@ -1020,6 +1026,7 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
         ack_reaction: 'eyes',
         reply_chunk_limit: 1000,
         reply_chunk_mode: 'length',
+        [MODE_SWITCH_SETTING]: true,
       },
       '/applied-base',
     )
@@ -1032,8 +1039,11 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
 
     const inEffect = configInEffect(startTime, applied)
     expect(Object.keys(inEffect).sort()).toEqual([...serverWide, 'personas'].sort())
+    // The switch from the confirmed config; every other setting from start time.
+    expect(serverWide).toContain(MODE_SWITCH_SETTING)
     for (const key of serverWide) {
-      expect([key, inEffect[key as keyof typeof inEffect]]).toEqual([key, startTime[key as keyof typeof startTime]])
+      const from = key === MODE_SWITCH_SETTING ? applied : startTime
+      expect([key, inEffect[key as keyof typeof inEffect]]).toEqual([key, from[key as keyof typeof from]])
     }
     // A setting the start did not have stays absent until the next start.
     expect('ack_reaction' in inEffect).toBe(false)

@@ -2616,6 +2616,7 @@ describe('expected texts match the package', () => {
       credentials: sized(counts.credentials),
       nextLaunch: [],
       unchanged: [],
+      recorded: [],
       settings: sized(counts.settings),
       noEffectiveChange: false,
       configDirsChanged: false,

@@ -546,8 +546,8 @@ describe('a dm destination with DMs off or no contact is refused (SR-5.1)', () =
   })
 
   test('a channel destination is never refused, whatever its DM settings', () => {
-    expect(dmDestinationRefusal({ ...C, dm: { enabled: false } })).toBeUndefined()
-    expect(dmDestinationRefusal(A)).toBeUndefined()
+    expect(dmDestinationRefusal(undefined, { ...C, dm: { enabled: false } })).toBeUndefined()
+    expect(dmDestinationRefusal(undefined, A)).toBeUndefined()
   })
 
   test('turning DMs off keeps no cached DM in use: the refused persona makes no call even after a successful open', async () => {

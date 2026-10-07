@@ -13,7 +13,12 @@
  * client (`clientFor`), never to a channel taken from the row: its channel, or
  * its DM with `dm.contact`, opened with `conversations.open` on that client
  * and cached by the destination resolver (`persona-destination.ts`, shared
- * with the per-persona notifier). Each live entry records the conversation
+ * with the per-persona notifier). Which destination that is comes from the
+ * one destination rule (`personaDestinationOf`, b.av2 SR-7.1, b.deo SRI-701),
+ * through the resolver, its DM refusal (`refusalOf`) and the destination
+ * hold, with the persona and the configuration in effect read at each attempt
+ * (b.deo SRI-201); the poller reads no destination setting and no switch
+ * itself. Each live entry records the conversation
  * the prompt was posted in (the `D…` ID for a DM) and the posting persona;
  * closing updates go there, whatever the persona's destination or DMs switch
  * is now (b.av2 SR-5.1: an update is not a post). Outage state is keyed by
@@ -117,8 +122,8 @@ import {
   createPersonaDestinations,
   describeDestinationFailure,
   describeDmDestinationRefusal,
-  dmDestinationRefusal,
   safeFailureCode,
+  type DestinationConfig,
   type DestinationSlackClient,
   type PersonaDestinations,
 } from './persona-destination.ts'
@@ -228,13 +233,22 @@ export interface PollerDeps {
   clientFor: (key: string) => PollerSlackClient | undefined
   /**
    * The destination resolver (per-persona DM cache) shared with the
-   * notifier. Used only to build the default destination hold when
-   * `destinationHold` is not given (the poller posts through the hold, never
-   * through this directly); a `destinationHold` that is given must be built
-   * over this same resolver. Defaults to a module-level instance, reset by
-   * `_resetPollerState`.
+   * notifier. The poller asks it whether a persona's `dm` destination is
+   * refused (`refusalOf`, over the configuration in effect at that attempt),
+   * and builds the default destination hold over it when `destinationHold` is
+   * not given (the poller posts through the hold, never through this
+   * directly); a `destinationHold` that is given must be built over this same
+   * resolver. Defaults to a module-level instance over `getPersonaConfig`,
+   * reset by `_resetPollerState`.
    */
   destinations?: PersonaDestinations
+  /**
+   * The configuration in effect, read at each attempt (b.deo SRI-201). Used
+   * only to build the default resolver when `destinations` is not given (a
+   * given resolver reads its own). Absent: no configuration, so declarative
+   * mode (`channelModeOf`).
+   */
+  getPersonaConfig?: () => DestinationConfig
   /**
    * The destination hold (per-persona episodes and retries) shared with the
    * notifier: a new prompt or stuck-prompt warning is attempted only when it
@@ -550,7 +564,10 @@ export { describeAgentDirectorFailure }
 /** The injected destination resolver, else the module-level default. */
 function destinationsFor(deps: PollerDeps): PersonaDestinations {
   if (deps.destinations) return deps.destinations
-  defaultDestinations ??= createPersonaDestinations({ log: (line) => logViaDeps(deps, line) })
+  defaultDestinations ??= createPersonaDestinations({
+    log: (line) => logViaDeps(deps, line),
+    getPersonaConfig: () => deps.getPersonaConfig?.(),
+  })
   return defaultDestinations
 }
 
@@ -1141,7 +1158,7 @@ async function dispatchPermissionPrompt(
   compositeKey: string,
 ): Promise<void> {
   const ref = renderPersonaRef(persona.name, persona.key)
-  const refusal = dmDestinationRefusal(persona)
+  const refusal = destinationsFor(deps).refusalOf(persona)
   if (refusal) {
     logUnpostedOnce(
       deps,

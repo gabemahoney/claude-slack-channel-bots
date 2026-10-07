@@ -1,7 +1,7 @@
 /**
  * reload-preview.test.ts — Tests for the structured change plan and the
- * pending-change preview (b.av2 SR-8.4, SR-8.6, SR-10.3) in
- * src/reload-plan.ts: `buildChangePlan`, `changePlanCounts`,
+ * pending-change preview (b.av2 SR-8.4 and SR-8.6, b.deo SRI-802 to SRI-804;
+ * b.av2 SR-10.3, b.deo SRI-901 to SRI-906) in src/reload-plan.ts: `buildChangePlan`, `changePlanCounts`,
  * `renderChangePlanCounts`, `renderPreviewLines`, `renderPreview`,
  * `renderPreviewLogLines`, `renderInvalidLogLine` and `isCredentialsBroken`,
  * plus the plan's `configDirsChanged` flag (the agent-director template
@@ -18,7 +18,9 @@
  * credentials digests, bring-up states, why an added persona cannot come up)
  * is injected as data. One row per SR-8.6 change kind pins its class, its
  * effect wording, the `DESTRUCTIVE:` prefix exactly when the persona is
- * retired, and its header count. What the detection tick gathers and when
+ * retired, and its header count. Every server-wide setting has a wording
+ * group; the `allow_invited_channels` switch's line is built through
+ * `modeSwitchLine` (b.deo SRI-803). What the detection tick gathers and when
  * it writes and logs the preview is covered in tests/reload.test.ts.
  *
  * The retired lines (b.jg5 SRJ-1510): one case pins a removal's line and a
@@ -42,6 +44,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  channelModeOf,
   MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   parsePersonaConfigBytes,
@@ -67,6 +70,8 @@ import {
   destructiveLine,
   FACT_UNKNOWN,
   isCredentialsBroken,
+  MODE_SWITCH_SETTING,
+  modeSwitchLine,
   renderChangePlanCounts,
   renderInvalidLogLine,
   renderPreview,
@@ -220,7 +225,7 @@ function bravoRotated(extra: { broken?: string[]; problem?: string } = {}): Chan
   })
 }
 
-/** A plan with every class empty, then `overrides`. */
+/** A plan with every class empty (no recorded change included), then `overrides`. */
 function planWith(overrides: Partial<ValidChangePlan>): ValidChangePlan {
   return {
     valid: true,
@@ -231,6 +236,7 @@ function planWith(overrides: Partial<ValidChangePlan>): ValidChangePlan {
     credentials: [],
     nextLaunch: [],
     unchanged: [],
+    recorded: [],
     settings: [],
     noEffectiveChange: false,
     configDirsChanged: false,
@@ -1258,9 +1264,10 @@ describe('server-wide settings', () => {
   })
 
   // Rows: every server-wide setting only the running server reads and no persona
-  // inherits (all but the CLI's two above, the call timeout and the inheritable
-  // claude_config_dir and stop_hook_bootstrap, pinned with their inheritors),
-  // and a changed value (made when the test runs: paths are under its root).
+  // inherits (all but the CLI's two above, the call timeout, the inheritable
+  // claude_config_dir and stop_hook_bootstrap, pinned with their inheritors,
+  // and the switch, with its own line below), and a changed value (made when
+  // the test runs: paths are under its root).
   const NEXT_START_ROWS: Array<[string, () => unknown]> = [
     ['bind', () => '0.0.0.0'],
     ['port', () => 3200],
@@ -1281,7 +1288,7 @@ describe('server-wide settings', () => {
     ['reply_chunk_mode', () => 'length'],
   ]
 
-  test('the next-start rows, the CLI\'s two, the call timeout and the two inheritable defaults are every server-wide setting (a new one needs its wording decided here)', () => {
+  test('the next-start rows, the CLI\'s two, the call timeout, the two inheritable defaults and the switch are every server-wide setting (a new one needs its wording decided here)', () => {
     const covered = [
       ...NEXT_START_ROWS.map(([name]) => name),
       'stop_timeout',
@@ -1289,6 +1296,7 @@ describe('server-wide settings', () => {
       CALL_TIMEOUT,
       'claude_config_dir',
       'stop_hook_bootstrap',
+      MODE_SWITCH_SETTING,
     ]
     expect(covered.sort()).toEqual(PERSONA_TOP_LEVEL_KEYS.filter((k) => k !== 'personas').sort())
   })
@@ -1300,6 +1308,35 @@ describe('server-wide settings', () => {
       planWith({ settings: [{ name }], unchanged: [ref('alpha', 0), ref('bravo', 1), ref('charlie', 2)] }),
     )
     expect(lines).toEqual([header({ settings: 1 }), nextStartLine(name)])
+  })
+
+  // The switch's wording group (b.deo SRI-803): its line comes from
+  // modeSwitchLine. Both configurations give every persona the same channel
+  // fungible destination, which declarative mode does not read, so the
+  // candidate is valid with the switch on and the switch is the only change.
+  test('turning on only allow_invited_channels is one changed setting, with the line modeSwitchLine builds; it changes no persona', () => {
+    const fungibleReady = (c: EditableInput) => {
+      for (const p of c.personas) p.invited = { permission_prompts: p.permission_prompts }
+    }
+    const before = edited(fungibleReady)
+    const after = edited((c) => {
+      fungibleReady(c)
+      c[MODE_SWITCH_SETTING] = true
+    })
+    expect(channelModeOf(after)).not.toBe(channelModeOf(before))
+    const plan = buildChangePlan(before, valid(after), facts())
+    if (!plan.valid) throw new Error('expected a valid plan')
+    const lines = render(plan)
+    const everyone = [ref('alpha', 0), ref('bravo', 1), ref('charlie', 2)]
+
+    expect(plan).toEqual(
+      planWith({
+        settings: [{ name: MODE_SWITCH_SETTING, mode: channelModeOf(after), personas: everyone }],
+        unchanged: everyone,
+      }),
+    )
+    expect(changePlanCounts(plan)).toEqual(counts({ settings: 1 }))
+    expect(lines).toEqual([header({ settings: 1 }), modeSwitchLine(channelModeOf(after), everyone)])
   })
 
   test.each<[string, (c: EditableInput) => void, string[]]>([

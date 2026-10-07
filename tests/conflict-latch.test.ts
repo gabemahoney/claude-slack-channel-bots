@@ -2345,7 +2345,7 @@ describe('the unusable-recorded-name hold: SRJ-1019\'s notice, the record and th
       latchUnusable(run.latch, persona.key, row)
       await Promise.all(sent)
       expect(notifier.posts(persona.key)).toEqual([
-        { channel: persona.permission_prompts, text: formatPersonaNotice(persona, unusableNameNoticeText(persona.key, row.description)) },
+        { channel: persona.permission_prompts!, text: formatPersonaNotice(persona, unusableNameNoticeText(persona.key, row.description)) },
       ])
       expect(notifier.posts(other.key)).toEqual([])
       expect(notifier.clock.pendingCount()).toBe(0)
@@ -4175,7 +4175,7 @@ describe('SRJ-1020\'s notice for a launch start not recorded', () => {
       expect(run.latch.setLaunchStartNotRecorded(persona.key, PENDING)).toBe(CONFLICT_LATCH_SET_LATCHED)
       await Promise.all(sent)
       expect(notifier.posts(persona.key)).toEqual([
-        { channel: persona.permission_prompts, text: formatPersonaNotice(persona, launchStartNotRecordedNoticeText(persona.key)) },
+        { channel: persona.permission_prompts!, text: formatPersonaNotice(persona, launchStartNotRecordedNoticeText(persona.key)) },
       ])
       expect(notifier.posts(other.key)).toEqual([])
       expect(notifier.clock.pendingCount()).toBe(0)

@@ -140,6 +140,8 @@ beforeEach(() => {
       }
       return real.post(persona, c, message)
     },
+    destinationOf: (p) => real.destinationOf(p),
+    refusalOf: (p) => real.refusalOf(p),
     forget: (key) => real.forget(key),
   }
   hold = createPersonaDestinationHold({

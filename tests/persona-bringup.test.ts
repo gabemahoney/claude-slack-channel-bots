@@ -531,7 +531,7 @@ describe('held notices flush per persona when it is up (SR-7.2)', () => {
       (key, status) => h.controller.onConnectionStatus(key, status),
     )
     const postsOf = (key: string) => h.conn.slack.persona(key).calls.postMessage
-    const noticeTo = (persona: Persona, text: string) => ({ channel: persona.permission_prompts, text: formatPersonaNotice(persona, text) })
+    const noticeTo = (persona: Persona, text: string) => ({ channel: persona.permission_prompts!, text: formatPersonaNotice(persona, text) })
 
     // Raised before any bring-up: every notice is held.
     await notifier.notify(a.key, 'first notice for A')
@@ -900,7 +900,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     expect(h.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
     expect(h.retryLaunches).toEqual([a.key])
     expect(postsOf(a.key).slice(cp.aPosts)).toEqual([
-      { channel: a.permission_prompts, text: formatPersonaNotice(a, 'a notice raised during the hold') },
+      { channel: a.permission_prompts!, text: formatPersonaNotice(a, 'a notice raised during the hold') },
     ])
     expect(postsOf(b.key)).toHaveLength(cp.bPosts)
     // A later reconnect of A posts nothing again.

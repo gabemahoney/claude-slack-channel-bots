@@ -874,7 +874,7 @@ describe('kill-failure alert: the alerts layer over every SRJ-1002 context, and 
       const keptRoute = expectedRoute(version, context, true, false)
       expect(h.posts(kept.key)).toEqual(
         keptRoute.destination
-          ? [{ channel: kept.permission_prompts, text: formatPersonaNotice(kept, killFailureAlertText(contentFor(kept.key, decision), keptRoute.closing, true)) }]
+          ? [{ channel: kept.permission_prompts!, text: formatPersonaNotice(kept, killFailureAlertText(contentFor(kept.key, decision), keptRoute.closing, true)) }]
           : [],
       )
       expect(h.posts(removed.key)).toEqual([])

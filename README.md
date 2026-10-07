@@ -190,7 +190,7 @@ export SLACK_DRY_RUN=1
 
 Each bot is a **persona**: one Slack app, one Claude instance with its own working directory, and the channels it is configured into. Create one Slack app per persona (see `slack-app-manifest.yml`); that app gives the persona its own name and avatar in Slack.
 
-The top level holds a required `personas` array and the [server-wide settings](#server-wide-settings). Unknown keys are rejected at every level: the top level, each persona, its `dm` object and each channel entry. Only this persona format is accepted; a configuration written for an earlier major version must be rewritten by hand (see [Upgrading to personas](#upgrading-to-personas)).
+The top level holds a required `personas` array and the [server-wide settings](#server-wide-settings). Unknown keys are rejected at every level: the top level, each persona, its `dm` object, its `invited` object in fungible mode, and each channel entry in declarative mode (see [Load-time rules](#load-time-rules)). Only this persona format is accepted; a configuration written for an earlier major version must be rewritten by hand (see [Upgrading to personas](#upgrading-to-personas)).
 
 The first start of an install applies the file as it stands. After that, the server runs a recorded copy, and an edit changes nothing until you confirm it; a server restart alone doesn't apply it. See [Reload](#reload), and [What a confirmation applies](#what-a-confirmation-applies) for how each kind of change is applied.
 
@@ -204,7 +204,7 @@ Postinstall creates a skeleton with an empty persona list. An empty list is vali
 
 #### Example
 
-A complete `config.json` with three personas:
+A complete `config.json` in declarative mode (`allow_invited_channels` absent), with three personas:
 
 - `planner` receives every message in its home channel `C0123456789` and in the shared channel `C0555555555`. Its permission prompts and notices go to its home channel. It takes no DMs.
 - `reviewer` receives only its @mentions and `@here` / `@channel` broadcasts in the shared channel. It takes DMs, and its prompts and notices go by DM to its contact `U0123456789`. It has its own Claude config directory and turns the [Slack Reply Guard](#slack-reply-guard-stop-hook) off for itself.
@@ -256,6 +256,35 @@ A complete `config.json` with three personas:
 
 Replace the channel IDs, user IDs and paths with your own. Each persona's credentials file must exist with its tokens before that persona can come up (see [Credentials files](#credentials-files)).
 
+#### Example in fungible mode
+
+A complete `config.json` in fungible mode (`allow_invited_channels: true`), with two personas. Neither lists `channels` or a top-level `permission_prompts`: in fungible mode they are not read.
+
+- `triage` serves every public or private channel its Slack app is in that is not externally shared. Its permission prompts and notices go to the channel `C0123456789`, set by `invited.permission_prompts`; the channel needs no listing. It takes no DMs.
+- `concierge` serves every public or private channel its Slack app is in that is not externally shared, and takes DMs. It sets no `invited.permission_prompts`, so its destination is `"dm"` by default: its prompts and notices go by DM to its contact `U0123456789`.
+
+Invite each persona's Slack app to the channels it should serve, and `triage`'s app to its destination channel. Replace the channel ID, user ID and paths with your own.
+
+```json
+{
+  "personas": [
+    {
+      "name": "triage",
+      "credentials_file": "~/.config/cscb/triage-credentials.json",
+      "working_directory": "~/projects/triage",
+      "invited": { "permission_prompts": "C0123456789" }
+    },
+    {
+      "name": "concierge",
+      "credentials_file": "~/.config/cscb/concierge-credentials.json",
+      "working_directory": "~/projects/concierge",
+      "dm": { "enabled": true, "contact": "U0123456789" }
+    }
+  ],
+  "allow_invited_channels": true
+}
+```
+
 #### Persona fields
 
 | Field | Type | Required | Default | Description |
@@ -263,18 +292,19 @@ Replace the channel IDs, user IDs and paths with your own. Each persona's creden
 | `name` | string | yes | — | Any non-empty string; no format rule. See [Persona name and key](#persona-name-and-key). |
 | `credentials_file` | path | yes | — | Path to the persona's [credentials file](#credentials-files). |
 | `working_directory` | path | yes | — | Working directory of the persona's Claude instance. It must exist before the persona can come up. |
-| `channels` | array | yes, unless `dm.enabled` is `true` | none | The channels the persona is in: a list of [channel entries](#channel-entries). See [Channel delivery](#channel-delivery). |
+| `channels` | array | in declarative mode, yes unless `dm.enabled` is `true` | none | Declarative mode only: the channels the persona is in, a list of [channel entries](#channel-entries). See [Channel delivery](#channel-delivery). Not read in fungible mode. |
 | `dm.enabled` | boolean | no | `false` | The persona's DMs switch. See [Direct messages](#direct-messages-dmenabled). |
-| `dm.contact` | string | when `permission_prompts` is `"dm"` | — | A Slack user ID such as `U0123456789`: the person a `"dm"` destination addresses. In Slack, open the person's profile, then **⋮** → **Copy member ID**. |
-| `permission_prompts` | string | yes | — | The persona's **destination**: where its permission prompts and server notices are posted. One of the persona's own channel IDs, or `"dm"`. See [Permission prompts](#permission-prompts). |
+| `dm.contact` | string | when the persona's destination is `"dm"`, in either mode, including fungible mode's default `"dm"` | — | A Slack user ID such as `U0123456789`: the person a `"dm"` destination addresses. In Slack, open the person's profile, then **⋮** → **Copy member ID**. |
+| `permission_prompts` | string | in declarative mode, yes | — | Declarative mode only: the persona's **destination**, where its permission prompts and server notices are posted. One of the persona's own channel IDs, or `"dm"`. See [Permission prompts](#permission-prompts). Not read in fungible mode. |
+| `invited.permission_prompts` | string | no | `"dm"` | Fungible mode only: the persona's **destination**, where its permission prompts and server notices are posted. `"dm"` or a Slack channel ID such as `C0123456789`; the channel needs no listing. Not read in declarative mode. |
 | `claude_config_dir` | path | no | top-level `claude_config_dir` | Claude config directory for this persona. See [Next-launch settings](#next-launch-settings). |
 | `stop_hook_bootstrap` | boolean | no | top-level `stop_hook_bootstrap` | Slack Reply Guard switch for this persona. See [Next-launch settings](#next-launch-settings). |
 
-`dm` is an object holding `enabled` and `contact`: `"dm": { "enabled": true, "contact": "U0123456789" }`. A path is absolute, `~` or starts with `~/`. Paths are never redacted: a log line, preview or error that names a path shows it in full, with `~` expanded.
+`dm` is an object holding `enabled` and `contact`: `"dm": { "enabled": true, "contact": "U0123456789" }`. It applies in both modes. `invited` is an object holding `permission_prompts`: `"invited": { "permission_prompts": "C0123456789" }`. A path is absolute, `~` or starts with `~/`. Paths are never redacted: a log line, preview or error that names a path shows it in full, with `~` expanded.
 
 #### Channel entries
 
-Each entry of `channels` is an object with two required fields:
+Channel entries apply in declarative mode. Each entry of `channels` is an object with two required fields:
 
 | Field | Description |
 |---|---|
@@ -342,7 +372,7 @@ Never put a token in `config.json`, a ticket or a chat.
 
 #### Channel delivery
 
-Each channel entry's `delivery` sets which messages in that channel reach the persona:
+This section applies in declarative mode. Each channel entry's `delivery` sets which messages in that channel reach the persona:
 
 - **`all`**: every message in the channel.
 - **`mentions`**: only messages that @mention the persona directly, and `@here` / `@channel` broadcasts.
@@ -357,17 +387,17 @@ Any number of personas may list the same channel, each with its own `delivery`. 
 - **Off:** DMs to the persona's app are not delivered. The server logs one `persona-dm-dropped` line naming the persona and `dm.enabled`. The persona never opens, reads or posts in a DM.
 - **Group DMs** (DMs with more than one person) are never delivered to any persona, whatever `dm.enabled` says.
 
-A persona with no `channels` must have `dm.enabled` set to `true`.
+In declarative mode, a persona with no `channels` must have `dm.enabled` set to `true`.
 
-`dm.contact` is the person who receives the persona's prompts and notices when `permission_prompts` is `"dm"`. It gates nothing else: it doesn't limit who can DM the persona.
+`dm.contact` is the person who receives the persona's prompts and notices when its destination is `"dm"`: in declarative mode when `permission_prompts` is `"dm"`, and in fungible mode when `invited.permission_prompts` is `"dm"` or unset. In either mode a `"dm"` destination needs `dm.enabled: true` and a `dm.contact`. `dm.contact` gates nothing else: it doesn't limit who can DM the persona.
 
-Starting a DM with a user (a `reply` to a user ID, or a persona whose `permission_prompts` is `"dm"`) needs the `im:write` bot scope, which the shipped `slack-app-manifest.yml` grants. A `"dm"` destination always opens its DM through Slack before it first posts there, even when the DM already exists. For an app created from an earlier manifest, a `"dm"` persona's prompts and notices are not posted, and a `reply` to a user ID fails with `missing_scope`, until the scope is added and the app is re-installed.
+Starting a DM with a user (a `reply` to a user ID, or a persona whose destination is `"dm"`) needs the `im:write` bot scope, which the shipped `slack-app-manifest.yml` grants. A `"dm"` destination always opens its DM through Slack before it first posts there, even when the DM already exists. For an app created from an earlier manifest, a `"dm"` persona's prompts and notices are not posted, and a `reply` to a user ID fails with `missing_scope`, until the scope is added and the app is re-installed.
 
 Receiving DMs and replying in an existing DM (a `D…` ID) work without the scope. The `debug-slack-channel-bots` skill (see [Troubleshooting](#troubleshooting)) has the steps under "A persona can't open a DM".
 
 #### Permission prompts
 
-`permission_prompts` is required. It is the persona's destination: its permission prompts and its server notices, such as lost-message notices and restart-limit warnings, are posted there as the persona.
+This section applies in declarative mode, where `permission_prompts` is required. It is the persona's destination: its permission prompts and its server notices, such as lost-message notices and restart-limit warnings, are posted there as the persona.
 
 - **A channel ID:** one of the persona's own `channels`. Everyone in that channel sees the prompts and notices.
 - **`"dm"`:** a DM from the persona's app to its `dm.contact`. It needs `dm.enabled: true` and a `dm.contact`.
@@ -397,7 +427,7 @@ Use `--console` instead of `--claudeai` for a Console account. When neither the 
 
 #### Server-wide settings
 
-These top-level fields apply to the whole server. A confirmed change to one takes effect at the next server start, with three exceptions. A change to `claude_config_dir` or `stop_hook_bootstrap` takes effect at each inheriting persona's next launch. `stop_timeout` and `exit_timeout` are used only by the CLI, which takes them from the record at once. `agent_director_call_timeout_ms` is used by both: the CLI takes it from the record at once, and the running server uses it from its next start. See [What a confirmation applies](#what-a-confirmation-applies).
+These top-level fields apply to the whole server. A confirmed change to one takes effect at the next server start, with four exceptions. `allow_invited_channels` is the one setting a confirmation applies in place, at once. A change to `claude_config_dir` or `stop_hook_bootstrap` takes effect at each inheriting persona's next launch. `stop_timeout` and `exit_timeout` are used only by the CLI, which takes them from the record at once. `agent_director_call_timeout_ms` is used by both: the CLI takes it from the record at once, and the running server uses it from its next start. See [What a confirmation applies](#what-a-confirmation-applies).
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -423,24 +453,43 @@ These top-level fields apply to the whole server. A confirmed change to one take
 | `ack_reaction` | string | — | Emoji name, without colons (for example `"eyes"`), of the acknowledgement reaction. When set, each persona a message is dispatched to adds the reaction under its own Slack identity once the message has reached its instance, not on receipt, so a message that reaches several personas carries one reaction per persona. A message that isn't dispatched gets no reaction: one lost because the persona's instance is down, or one the persona doesn't receive. Messages sent through `/interject` or cron aren't Slack messages and get none either. A persona's first `reply` in that conversation carrying the message's `message_id` removes that persona's reaction only; other personas' reactions stay until they reply. Absent means no acknowledgement. Must be non-empty when set. |
 | `reply_chunk_limit` | number | `4000` | Maximum characters per posted message: the `reply` tool splits longer text into several messages. Must be a positive integer. |
 | `reply_chunk_mode` | `"length"` \| `"newline"` | `"newline"` | How the `reply` tool splits text longer than `reply_chunk_limit`. `length`: hard split at the limit. `newline`: split at newline boundaries within the limit; a single line longer than the limit is posted whole. |
+| `allow_invited_channels` | boolean | `false` | Picks the channel mode for every persona. Absent or `false` is **declarative mode**: each persona's `channels` and top-level `permission_prompts` are in force, and its `invited` section is not read. `true` is **fungible mode**: each persona's `channels` and top-level `permission_prompts` are not read, and its `invited` section is in force. A confirmed change applies in place at once and keeps every session. Non-boolean values are rejected at load. |
 
 #### Load-time rules
 
-Before it applies `config.json`, the server checks the whole file and reports the first rule it breaks:
+Before it applies `config.json`, the server checks the whole file and reports the first rule it breaks. It checks the server-wide settings first, `allow_invited_channels` among them, before any persona, in either mode: a non-boolean `allow_invited_channels` is rejected naming the setting. The mode that switch picks then sets which rules each persona entry is checked by.
+
+In both modes:
 
 - A persona's name or key equals another persona's name or key.
 - A persona's key starts with another persona's key, such as `dev` and `dev_2` (see [Persona name and key](#persona-name-and-key)).
 - Two personas share a `working_directory` or a `credentials_file`, compared by real path.
+- A `dm.contact` is malformed. User IDs start with `U` or `W`, followed by capital letters and digits only; underscores are not allowed.
+- A path isn't absolute, `~` or `~/…`.
+- A required field is missing, or a key of the top level, a persona entry or `dm` is unknown.
+- A value has the wrong type, isn't an allowed value, or is out of range.
+
+In declarative mode (`allow_invited_channels` absent or `false`):
+
 - `permission_prompts` names a channel that isn't in the persona's `channels`.
 - `permission_prompts` is `"dm"` without `dm.enabled: true` or without a `dm.contact`.
 - A persona has no channels and `dm.enabled` isn't `true`.
 - A persona lists the same channel twice.
-- A channel ID or `dm.contact` is malformed. Channel IDs start with `C` or `G` and user IDs with `U` or `W`, followed by capital letters and digits only; underscores are not allowed.
-- A path isn't absolute, `~` or `~/…`.
-- A required field is missing, or a key is unknown.
-- A value has the wrong type, isn't an allowed value, or is out of range.
+- A channel ID is malformed, or a channel entry has an unknown key. Channel IDs start with `C` or `G`, followed by capital letters and digits only; underscores are not allowed.
 
-For a persona error, the error names the persona (`personas[<i>]`) and the field. Credentials content and whether directories exist are not checked here; they are checked when each persona comes up. At a start with no last-applied record, an error stops the start. On a running server, an error shows as an `INVALID` pending change (see [Reload](#reload)). The `debug-slack-channel-bots` skill (`skills/debug-slack-channel-bots/SKILL.md`) lists every rejection with its cause and fix under "Configuration rejections".
+`invited` is neither checked nor read in declarative mode, so a malformed `invited` loads.
+
+In fungible mode (`allow_invited_channels` is `true`):
+
+- `invited` isn't an object, or holds a key other than `permission_prompts`.
+- `invited.permission_prompts` is neither `"dm"` nor a well-formed channel ID.
+- The persona's destination is `"dm"`, written or by default, without `dm.enabled: true` or without a `dm.contact`. The error names `invited.permission_prompts`, says whether `"dm"` is its default, and names each missing setting.
+
+`channels` and the top-level `permission_prompts` are neither checked nor read in fungible mode, whatever they hold, and `permission_prompts` isn't required. A channel destination needs no listing and no DMs, and a persona with DMs off and a channel destination is valid.
+
+A pending change is judged by the rules of the mode its own switch picks, not by the mode in effect. A change that turns fungible mode on is `INVALID` when a persona's `invited` section breaks the fungible-mode rules; a change that turns it off is `INVALID` when a persona's `channels` or `permission_prompts` breaks the declarative-mode rules.
+
+For a persona error, the error names the persona (`personas[<i>]`) and the field. A value that a format, type, range or allowed-value rule rejects is never shown; a type error names only the JSON type it got. Credentials content and whether directories exist are not checked here; they are checked when each persona comes up. At a start with no last-applied record, an error stops the start. On a running server, an error shows as an `INVALID` pending change (see [Reload](#reload)). The `debug-slack-channel-bots` skill (`skills/debug-slack-channel-bots/SKILL.md`) lists every rejection with its cause and fix under "Configuration rejections".
 
 ---
 
@@ -663,7 +712,7 @@ Each row is one kind of change: what happens once you confirm it, and what happe
 
 | Change | Once confirmed | Live session |
 |---|---|---|
-| `channels`, `delivery`, `permission_prompts`, `dm.enabled` or `dm.contact` changes | Applied in place, immediately: from the next event or post. A changed DM contact is used for the next prompt. | Kept |
+| `channels`, `delivery` or `permission_prompts` changes (in declarative mode), `invited.permission_prompts` changes (in fungible mode), or `dm.enabled` or `dm.contact` changes | Applied in place, immediately: from the next event or post. A changed DM contact is used for the next prompt. | Kept |
 | A credentials file's content changes (same path), such as a rotated token | Only that persona reconnects: the new connection opens, then the old one closes. If the new file can't be used or Slack refuses it, the old connection keeps running, `server.log` shows `persona-credentials-change-failed`, and the change stays pending. If Slack can't be reached, the old connection stays in use while the new one retries. A persona that is retrying (Slack unreachable, its working directory unusable, or held for its `claude_config_dir` by `persona-config-dir-unresolvable`) has no connection and retries with the new content. A persona down because of its credentials comes up on the confirmed change, with no restart; if its new file can't be used, it stays down with its usual line, such as `persona-credentials-invalid`, and nothing stays pending. | Kept |
 | `claude_config_dir` changes (the persona's own or inherited) | Recorded. The persona's next launch uses it and starts a new conversation on the same instance when the directory changed: the conversation is not resumed, nothing is deleted, and the old transcript stays in the old directory. | Kept until the next launch |
 | `stop_hook_bootstrap` changes (the persona's own or inherited) | Recorded. The persona's next launch uses it. | Kept |

@@ -3373,7 +3373,7 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
 
       expect(alerts.raise(raiseInput(key, ordinary(), KILL_FAILURE_CONTEXT_RECOVERY, {}))).toBe('posted')
       await clock.flush()
-      expect(h.posts(key)).toEqual([{ channel: kept.permission_prompts, text: formatPersonaNotice(kept, killFailureAlertText(contentOf(key, ordinary()), KILL_FAILURE_CLOSING_DESTINATION, true)) }])
+      expect(h.posts(key)).toEqual([{ channel: kept.permission_prompts!, text: formatPersonaNotice(kept, killFailureAlertText(contentOf(key, ordinary()), KILL_FAILURE_CLOSING_DESTINATION, true)) }])
 
       await h.duringTeardown(kept, async () => {
         expect(alerts.raise(raiseInput(key, ordinary(), KILL_FAILURE_CONTEXT_RECOVERY, STOP))).toBe('stopped')

@@ -9,8 +9,10 @@
  *   scopes and events, and its comments;
  * - the README's modify-semantics table (SR-12, SR-8.6), held against the
  *   change plan's exported classes in src/reload-plan.ts;
- * - the README persona reference (SR-12): its key tables list exactly the
- *   loader's keys and its complete example loads through the real loader;
+ * - the README persona reference (SR-12, b.deo SRI-1101): its key tables
+ *   list exactly the loader's keys, and its two complete examples, one per
+ *   channel mode, load through the real loader and are complete for their
+ *   mode;
  * - the README's pointers to the setup wizard;
  * - the shipped-text audit (AC 46) over `SHIPPED_TEXTS` (the README, every
  *   file under `skills/`, the whole manifest, the setup wizard's packaged
@@ -207,7 +209,7 @@
  *
  * Reads repo files resolved from this file's location, so the working
  * directory doesn't matter. The one writer is the complete-example load: it
- * writes the example into its own `mkdtempSync` directory, removed after each
+ * writes an example into its own `mkdtempSync` directory, removed after each
  * test, and passes that directory's `home` to the loader, which reads no
  * credentials file. No real HOME, no server, no CLI (SR-13.2).
  */
@@ -227,6 +229,7 @@ import {
   MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   PERSONA_DM_KEYS,
   PERSONA_ENTRY_KEYS,
+  PERSONA_INVITED_KEYS,
   PERSONA_TOP_LEVEL_KEYS,
   SERVER_PATH_SETTINGS,
   loadPersonaConfig,
@@ -404,6 +407,7 @@ import {
   DESTRUCTIVE_PREFIX,
   DESTRUCTIVE_SETTINGS,
   IN_PLACE_SETTINGS,
+  MODE_SWITCH_SETTING,
   NEXT_LAUNCH_SETTINGS,
   type NextLaunchSetting,
   type ValidChangePlan,
@@ -567,6 +571,17 @@ function codeSpans(cell: string): string[] {
 /** The README's persona configuration reference heading and its complete-example heading, DOC-1's interface. */
 const PERSONAS_HEADING = '### Personas (config.json)'
 const EXAMPLE_HEADING = '#### Example'
+/** The heading of the README's second complete example, in fungible mode (b.deo SRI-1101). */
+const FUNGIBLE_EXAMPLE_HEADING = '#### Example in fungible mode'
+
+/**
+ * The persona-entry key holding the fungible section (b.deo SRI-102): read
+ * only in fungible mode, so the declarative example need not carry it.
+ */
+const FUNGIBLE_SECTION_KEY = 'invited' satisfies (typeof PERSONA_ENTRY_KEYS)[number]
+
+/** The fungible section's key naming the persona's destination, `invited.permission_prompts` (b.deo SRI-102). */
+const INVITED_DESTINATION_KEY = 'permission_prompts' satisfies (typeof PERSONA_INVITED_KEYS)[number]
 
 /** Where a section nested in the persona reference comes from, for `requiredSection` failures. */
 const IN_PERSONAS = `README.md, under "${PERSONAS_HEADING}",`
@@ -577,17 +592,18 @@ function personasSection(readme: string): string {
 }
 
 /**
- * The complete example's text: the one fenced block, tagged `json`, directly
- * under `#### Example` inside `### Personas (config.json)`. Throws naming what
- * is missing, and on any other count or tag, so the load case never passes
- * vacuously or on some other JSON block.
+ * A complete example's text: the one fenced block, tagged `json`, directly
+ * under `heading` (`#### Example`, or `#### Example in fungible mode`) inside
+ * `### Personas (config.json)`. Throws naming what is missing, and on any
+ * other count or tag, so the load case never passes vacuously or on some
+ * other JSON block.
  */
-function completeExample(readme: string): string {
-  const example = requiredSection(personasSection(readme), EXAMPLE_HEADING, IN_PERSONAS)
+function completeExample(readme: string, heading: string = EXAMPLE_HEADING): string {
+  const example = requiredSection(personasSection(readme), heading, IN_PERSONAS)
   const { blocks } = splitFences(example)
   if (blocks.length !== 1 || blocks[0].info !== 'json') {
     const found = blocks.map((b) => `\`\`\`${b.info}`).join(', ') || 'none'
-    throw new Error(`"${EXAMPLE_HEADING}" must hold exactly one fenced json block; found: ${found}`)
+    throw new Error(`"${heading}" must hold exactly one fenced json block; found: ${found}`)
   }
   return blocks[0].body
 }
@@ -599,11 +615,17 @@ const MOVED_SERVER_SETTINGS = ['ack_reaction', 'reply_chunk_limit', 'reply_chunk
  * The reference's key tables: each `####` heading under `### Personas
  * (config.json)` with the keys its table must list, one code span per row in
  * the first column, built from the loader's exported key sets: the b.av2
- * SR-1.2 persona-entry keys (the `dm` sub-keys written `dm.<key>`), the SR-1.3
- * channel-entry keys, and the SR-1.1 / SR-1.6 top-level keys but `personas`.
+ * SR-1.2 persona-entry keys (b.deo SRI-102; the `dm` sub-keys written
+ * `dm.<key>`, the `invited` sub-keys `invited.<key>` alike), the SR-1.3
+ * channel-entry keys (b.deo SRI-103), and the SR-1.1 / SR-1.6 top-level keys
+ * but `personas` (b.deo SRI-101: `allow_invited_channels` among them).
  */
 const KEY_TABLES: [heading: string, keys: readonly string[]][] = [
-  ['Persona fields', PERSONA_ENTRY_KEYS.flatMap((key) => (key === 'dm' ? PERSONA_DM_KEYS.map((sub) => `dm.${sub}`) : [key]))],
+  ['Persona fields', PERSONA_ENTRY_KEYS.flatMap((key) => {
+    if (key === 'dm') return PERSONA_DM_KEYS.map((sub) => `dm.${sub}`)
+    if (key === FUNGIBLE_SECTION_KEY) return PERSONA_INVITED_KEYS.map((sub) => `${FUNGIBLE_SECTION_KEY}.${sub}`)
+    return [key]
+  })],
   ['Channel entries', CHANNEL_ENTRY_KEYS],
   ['Server-wide settings', PERSONA_TOP_LEVEL_KEYS.filter((key) => key !== 'personas')],
 ]
@@ -665,10 +687,13 @@ describe('README.md', () => {
      * One entry per change kind the plan classifies (`ValidChangePlan`'s lists),
      * the settings expanded from the plan's exported classes. A new kind in the
      * plan fails the typecheck here until it has a README row; a new setting in
-     * a class needs its name in that class's row.
+     * a class needs its name in that class's row, so the in-place row names
+     * `invited.permission_prompts` too (b.deo SRI-1103). `recorded` is left
+     * out: the recorded-change row and the switch's row are checked by T20's
+     * cases (b.deo SRI-1103, SRI-805).
      */
     const EXPECTED: Record<
-      Exclude<keyof ValidChangePlan, 'valid' | 'noEffectiveChange' | 'configDirsChanged' | 'unchanged'>,
+      Exclude<keyof ValidChangePlan, 'valid' | 'noEffectiveChange' | 'configDirsChanged' | 'unchanged' | 'recorded'>,
       Expected[]
     > = {
       inPlace: [
@@ -746,9 +771,11 @@ describe('README.md', () => {
   })
 
   /**
-   * b.av2 SR-12 / SR-13.5: the README persona reference. Its key tables list
-   * exactly the keys the loader accepts, and its complete example loads
-   * through the server's loader.
+   * b.av2 SR-12 / SR-13.5, b.deo SRI-1101: the README persona reference. Its
+   * key tables list exactly the keys the loader accepts, and each of its two
+   * complete examples (declarative mode under `#### Example`, fungible mode
+   * under `#### Example in fungible mode`) loads through the server's loader
+   * and is complete for its own mode.
    */
   describe('persona configuration reference (SR-12, SR-13.5)', () => {
     test.each(KEY_TABLES)('the "#### %s" table lists exactly the loader\'s keys, one code span per row', (heading, keys) => {
@@ -760,11 +787,12 @@ describe('README.md', () => {
     })
 
     /**
-     * The complete example, written byte for byte into a temp dir and loaded
-     * through the server's loader (default mode, temp home). The loader reads
-     * no credentials file (b.av2 SR-1.5), so none is written.
+     * Each complete example, written byte for byte into a temp dir and loaded
+     * through the server's loader (default loader options, temp home). The
+     * loader reads no credentials file (b.av2 SR-1.5; b.deo SRI-103, SRI-104
+     * in each channel mode), so none is written.
      */
-    describe('complete example through the real loader', () => {
+    describe('complete examples through the real loader', () => {
       let dir: string
 
       beforeEach(() => {
@@ -775,25 +803,26 @@ describe('README.md', () => {
         rmSync(dir, { recursive: true, force: true })
       })
 
-      type RawPersona = Record<string, unknown> & { dm?: Record<string, unknown> }
+      type RawPersona = Record<string, unknown> & { dm?: Record<string, unknown>; invited?: Record<string, unknown> }
       type Example = { raw: { personas: RawPersona[] } & Record<string, unknown>; home: string; config: PersonaConfig }
 
       /**
-       * Write the complete example as `<dir>/state/config.json` and load it
-       * with `<dir>/home` as the home. Returns its parsed value, the home and
-       * the loaded config. The example, the config and any load error are
-       * leak-checked; a load error is rethrown with its message.
+       * Write the complete example under `heading` as
+       * `<dir>/state/config.json` and load it with `<dir>/home` as the home.
+       * Returns its parsed value, the home and the loaded config. The example,
+       * the config and any load error are leak-checked; a load error is
+       * rethrown with its message.
        */
-      function loadExample(): Example {
-        const text = completeExample(readme)
+      function loadExample(heading: string = EXAMPLE_HEADING): Example {
+        const text = completeExample(readme, heading)
         assertNoLeak(text, 'example')
         let raw: Example['raw']
         try {
           raw = JSON.parse(text)
         } catch {
-          throw new Error(`the "${EXAMPLE_HEADING}" json block is not strict JSON`)
+          throw new Error(`the "${heading}" json block is not strict JSON`)
         }
-        if (!Array.isArray(raw.personas)) throw new Error(`the "${EXAMPLE_HEADING}" json block has no personas array`)
+        if (!Array.isArray(raw.personas)) throw new Error(`the "${heading}" json block has no personas array`)
         const home = join(dir, 'home')
         const state = join(dir, 'state')
         mkdirSync(home)
@@ -805,20 +834,22 @@ describe('README.md', () => {
           config = loadPersonaConfig(configPath, home)
         } catch (error) {
           assertNoLeak(error, 'load error')
-          throw new Error(`the complete example does not load: ${error instanceof Error ? error.message : String(error)}`)
+          throw new Error(`the complete example under "${heading}" does not load: ${error instanceof Error ? error.message : String(error)}`)
         }
         assertNoLeak(config, 'loaded config')
         return { raw, home, config }
       }
 
-      test('loads with no error, one resolved persona per entry, in order', () => {
-        const { raw, config } = loadExample()
+      const EXAMPLE_HEADINGS = [EXAMPLE_HEADING, FUNGIBLE_EXAMPLE_HEADING]
+
+      test.each(EXAMPLE_HEADINGS)('the example under "%s" loads with no error, one resolved persona per entry, in order', (heading) => {
+        const { raw, config } = loadExample(heading)
         expect(raw.personas.length).toBeGreaterThanOrEqual(1)
         expect(config.personas.map((p) => p.name)).toEqual(raw.personas.map((p) => p.name as string))
       })
 
-      test('every path in the example resolves under the injected temp home or the temp config dir', () => {
-        const { config } = loadExample()
+      test.each(EXAMPLE_HEADINGS)('every path in the example under "%s" resolves under the injected temp home or the temp config dir', (heading) => {
+        const { config } = loadExample(heading)
         const paths = [
           ...config.personas.flatMap((p) => [p.credentials_file, p.working_directory, p.claude_config_dir]),
           ...SERVER_PATH_SETTINGS.map((setting) => config[setting]),
@@ -826,9 +857,18 @@ describe('README.md', () => {
         expect(paths.filter((path) => !path.startsWith(`${dir}/`))).toEqual([])
       })
 
+      /**
+       * The declarative example (`#### Example`): declarative mode, every key
+       * declarative mode reads, and the declarative shapes below. The
+       * fungible section is not required (b.deo SRI-1101).
+       */
       const COMPLETENESS: [label: string, check: (example: Example) => void][] = [
-        ['every persona-entry key', ({ raw }) => {
-          expect(PERSONA_ENTRY_KEYS.filter((key) => !raw.personas.some((p) => key in p))).toEqual([])
+        ['the switch absent or false (declarative mode)', ({ raw }) => {
+          expect([undefined, false] as unknown[]).toContainEqual(raw[MODE_SWITCH_SETTING])
+        }],
+        ['every persona-entry key declarative mode reads', ({ raw }) => {
+          const read = PERSONA_ENTRY_KEYS.filter((key) => key !== FUNGIBLE_SECTION_KEY)
+          expect(read.filter((key) => !raw.personas.some((p) => key in p))).toEqual([])
         }],
         ['every dm key', ({ raw }) => {
           expect(PERSONA_DM_KEYS.filter((key) => !raw.personas.some((p) => p.dm !== undefined && key in p.dm))).toEqual([])
@@ -861,6 +901,42 @@ describe('README.md', () => {
 
       test.each(COMPLETENESS)('the example is complete: %s', (_label, check) => {
         check(loadExample())
+      })
+
+      /**
+       * The fungible example (`#### Example in fungible mode`, b.deo
+       * SRI-1101): the switch on, a persona with DMs off and a channel
+       * fungible destination, another whose destination is `"dm"` by default
+       * (no `invited.permission_prompts` written), and every key of the
+       * fungible section.
+       */
+      const FUNGIBLE_COMPLETENESS: [label: string, check: (example: Example) => void][] = [
+        ['the switch true (fungible mode)', ({ raw }) => {
+          expect(raw[MODE_SWITCH_SETTING]).toBe(true)
+        }],
+        ['a persona with DMs off and a channel fungible destination', ({ config }) => {
+          const shapes = config.personas.map((p) => ({
+            dm: p.dm.enabled,
+            channelDestination: p.fungible_destination !== undefined && p.fungible_destination !== DM_DESTINATION,
+          }))
+          expect(shapes).toContainEqual({ dm: false, channelDestination: true })
+        }],
+        [`a persona whose destination is "${DM_DESTINATION}" by default, none written`, ({ raw, config }) => {
+          const byDefault = config.personas.filter((p, i) => {
+            const invited = raw.personas[i].invited
+            const written = invited !== undefined && INVITED_DESTINATION_KEY in invited
+            return p.fungible_destination === DM_DESTINATION && !written
+          })
+          expect(byDefault.map((p) => p.name)).not.toEqual([])
+        }],
+        ['every key of the fungible section', ({ raw }) => {
+          const written = (key: string) => raw.personas.some((p) => p.invited !== undefined && key in p.invited)
+          expect(PERSONA_INVITED_KEYS.filter((key) => !written(key))).toEqual([])
+        }],
+      ]
+
+      test.each(FUNGIBLE_COMPLETENESS)('the fungible-mode example is complete: %s', (_label, check) => {
+        check(loadExample(FUNGIBLE_EXAMPLE_HEADING))
       })
     })
   })

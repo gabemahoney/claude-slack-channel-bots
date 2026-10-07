@@ -11,6 +11,14 @@
  * (`describeUnknownKeys`), so a pasted token never reaches an error
  * (b.av2 SR-10.3).
  *
+ * The server-wide switch `allow_invited_channels` picks the channel mode of
+ * every persona (b.deo SRI-101, `channelModeOf`): declarative mode (absent or
+ * `false`) reads each persona's `channels` and top-level
+ * `permission_prompts`; fungible mode (`true`) reads its `invited` section
+ * instead. A configuration's entries are validated by the mode its own
+ * switch picks, and the section not in force is never parsed (b.deo SRI-103
+ * to SRI-105).
+ *
  * The configuration file is `config.json` in the state directory, at the path
  * `resolveServerConfigPath` returns (b.av2 SR-8.7). Which configuration a
  * start runs (the last-applied record or this file) is decided by the reload
@@ -84,8 +92,9 @@ export const MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS = 3_600_000
 export const PRE_PERSONA_KEYS = ['routes', 'default_route', 'default_dm_session'] as const
 
 /**
- * Server-wide top-level keys (b.av2 SR-1.6): the settings the persona shape
- * kept from the pre-persona shape.
+ * Server-wide top-level keys (b.av2 SR-1.6, b.deo SRI-101): the settings the
+ * persona shape kept from the pre-persona shape, and `allow_invited_channels`,
+ * the switch that picks the channel mode for every persona.
  */
 const SHARED_TOP_LEVEL_KEYS = [
   'bind',
@@ -107,6 +116,7 @@ const SHARED_TOP_LEVEL_KEYS = [
   'cron_table_path',
   'cron_log_path',
   'cron_log_max_bytes',
+  'allow_invited_channels',
 ] as const
 
 /**
@@ -158,7 +168,11 @@ export const PERSONA_TOP_LEVEL_KEYS: readonly string[] = [
   ...PERSONA_ONLY_SERVER_KEYS,
 ]
 
-/** Keys allowed in a persona entry (b.av2 SR-1.2). */
+/**
+ * Keys allowed in a persona entry (b.av2 SR-1.2, b.deo SRI-102). `invited` is
+ * a known key in both channel modes, as `channels` and `permission_prompts`
+ * are; which of them is read depends on the mode (`channelModeOf`).
+ */
 export const PERSONA_ENTRY_KEYS: readonly (keyof PersonaInput)[] = [
   'name',
   'credentials_file',
@@ -166,12 +180,31 @@ export const PERSONA_ENTRY_KEYS: readonly (keyof PersonaInput)[] = [
   'channels',
   'dm',
   'permission_prompts',
+  'invited',
   'claude_config_dir',
   'stop_hook_bootstrap',
 ]
 
 /** Keys allowed in a persona's `dm` object (b.av2 SR-1.2). */
 export const PERSONA_DM_KEYS: readonly (keyof PersonaDmInput)[] = ['enabled', 'contact']
+
+/**
+ * Keys allowed in a persona's `invited` object, the fungible section
+ * (b.deo SRI-102). Read only in fungible mode.
+ */
+export const PERSONA_INVITED_KEYS: readonly (keyof PersonaInvitedInput)[] = ['permission_prompts']
+
+/**
+ * The two channel modes (b.deo SRI-101), picked for every persona by the
+ * `allow_invited_channels` switch: `declarative` when it is absent or
+ * `false` (each persona serves its listed `channels`, with its top-level
+ * `permission_prompts` as its destination), `fungible` when it is `true`
+ * (each persona's `invited` section is in force).
+ */
+export const CHANNEL_MODES = ['declarative', 'fungible'] as const
+
+/** A channel mode (b.deo SRI-101). Read through `channelModeOf`. */
+export type ChannelMode = (typeof CHANNEL_MODES)[number]
 
 /** Keys allowed in a channel entry (b.av2 SR-1.3); both are required. */
 export const CHANNEL_ENTRY_KEYS: readonly (keyof ChannelEntryInput)[] = ['id', 'delivery']
@@ -278,6 +311,11 @@ export interface ServerSettingsInput {
    * positive integer (finite, integer, >= 1) — no upper bound.
    */
   cron_log_max_bytes?: number
+  /**
+   * The channel-mode switch (b.deo SRI-101): `true` turns fungible mode on for
+   * every persona; absent or `false` is declarative mode. Must be a boolean.
+   */
+  allow_invited_channels?: boolean
 }
 
 /**
@@ -325,6 +363,11 @@ export interface ServerSettings {
    * with no default: undefined means pruning is disabled.
    */
   cron_log_max_bytes?: number
+  /**
+   * The channel-mode switch (b.deo SRI-101). Defaults to false (declarative
+   * mode); absent and `false` resolve alike. Read through `channelModeOf`.
+   */
+  allow_invited_channels: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -348,11 +391,20 @@ export interface ChannelEntryInput {
 export interface PersonaDmInput {
   /** The DMs switch. Defaults to false. */
   enabled?: boolean
-  /** Slack user ID (`DM_CONTACT_RE`) that receives prompts and notices when `permission_prompts` is `dm`. */
+  /** Slack user ID (`DM_CONTACT_RE`) that receives prompts and notices when the persona's destination is `dm`. */
   contact?: string
 }
 
-/** A persona entry as written in the file (b.av2 SR-1.2). */
+/** A persona's `invited` object as written in the file: the fungible section (b.deo SRI-102). */
+export interface PersonaInvitedInput {
+  /**
+   * The persona's destination in fungible mode: `dm` or a Slack channel ID
+   * (`CHANNEL_ID_RE`). Defaults to `dm`.
+   */
+  permission_prompts?: string
+}
+
+/** A persona entry as written in the file (b.av2 SR-1.2, b.deo SRI-102). */
 export interface PersonaInput {
   /** Persona identity: a non-empty string with no format rule. */
   name: string
@@ -360,11 +412,17 @@ export interface PersonaInput {
   credentials_file: string
   /** The instance's working directory: absolute, `~` or `~/…`. */
   working_directory: string
-  /** Channels the persona is in. Defaults to none. */
+  /** Declarative mode: channels the persona is in. Defaults to none. Not read in fungible mode. */
   channels?: ChannelEntryInput[]
   dm?: PersonaDmInput
-  /** Destination of prompts and notices: `dm` or one of the persona's channel IDs. Required. */
-  permission_prompts: string
+  /**
+   * Declarative mode: destination of prompts and notices, `dm` or one of the
+   * persona's channel IDs; required in declarative mode. Not read in fungible
+   * mode.
+   */
+  permission_prompts?: string
+  /** Fungible mode: the fungible section. Not read in declarative mode. */
+  invited?: PersonaInvitedInput
   /** Per-persona Claude config dir: absolute, `~` or `~/…`. Defaults to the top-level value. */
   claude_config_dir?: string
   /** Per-persona Stop-hook bootstrap flag. Defaults to the top-level value. */
@@ -395,7 +453,19 @@ export interface PersonaDm {
   contact?: string
 }
 
-/** A resolved persona with defaults applied and settings inherited (b.av2 SR-1.2, SR-10.2). */
+/**
+ * The JSON values of a persona entry's `channels`, `permission_prompts` and
+ * `invited` as written, each undefined when absent (b.deo SRI-102). Never
+ * validated or resolved: only the reload plan reads them, to tell whether a
+ * section changed (b.deo SRI-802, SRI-804).
+ */
+export interface PersonaSections {
+  channels: unknown
+  permission_prompts: unknown
+  invited: unknown
+}
+
+/** A resolved persona with defaults applied and settings inherited (b.av2 SR-1.2, SR-10.2; b.deo SRI-102). */
 export interface Persona {
   /** Position of the entry in the file's `personas` array, for `personas[i]` in diagnostics. */
   index: number
@@ -406,11 +476,23 @@ export interface Persona {
   credentials_file: string
   /** Absolute, tilde-expanded path. Not checked for existence at load time. */
   working_directory: string
-  /** Empty when the file lists none. */
+  /** Declarative mode: empty when the file lists none. Fungible mode: always empty, never parsed. */
   channels: ChannelEntry[]
   dm: PersonaDm
-  /** `dm` or one of `channels`' IDs. */
-  permission_prompts: string
+  /**
+   * Declarative mode: `dm` or one of `channels`' IDs. Fungible mode:
+   * undefined, never parsed. Read for a destination only through the one
+   * destination rule (`personaDestinationOf`, b.deo SRI-701).
+   */
+  permission_prompts: string | undefined
+  /**
+   * Fungible mode: the resolved `invited.permission_prompts`, `dm` when it is
+   * absent. Declarative mode: undefined (b.deo SRI-102). Read for a
+   * destination only through the one destination rule.
+   */
+  fungible_destination: string | undefined
+  /** The three section keys as written, in both modes (b.deo SRI-102); read only by the reload plan. */
+  sections: PersonaSections
   /**
    * Effective Claude config dir: the per-persona value, else the top-level
    * value, else absent (Claude's own default applies). Absolute.
@@ -458,6 +540,18 @@ export function agentDirectorCallTimeoutMsOf(config: ServerSettings | null | und
   return config?.agent_director_call_timeout_ms ?? DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS
 }
 
+/**
+ * The channel mode of `config` (b.deo SRI-101, SRI-201): `fungible` when its
+ * `allow_invited_channels` is `true`, else `declarative`. With no
+ * configuration (before the server's start resolves): `declarative`. Every
+ * consumer of the mode reads it through this, from the configuration in
+ * effect when it acts (the reload plan also from the candidate), never from
+ * a copy taken earlier. Pure; does not mutate the input.
+ */
+export function channelModeOf(config: Pick<ServerSettings, 'allow_invited_channels'> | null | undefined): ChannelMode {
+  return config?.allow_invited_channels === true ? 'fungible' : 'declarative'
+}
+
 // ---------------------------------------------------------------------------
 // Pure functions
 // ---------------------------------------------------------------------------
@@ -490,6 +584,9 @@ function applyServerDefaults(input: ServerSettingsInput, configDir: string): Ser
     cron_table_path: input.cron_table_path ?? resolve(configDir, 'crontab'),
     cron_log_path: input.cron_log_path ?? resolve(configDir, 'cron.log'),
     cron_log_max_bytes: input.cron_log_max_bytes,
+    // Only an absent switch takes the default: any other value, `null`
+    // included, is kept so the switch's boolean rule rejects it.
+    allow_invited_channels: input.allow_invited_channels === undefined ? false : input.allow_invited_channels,
   }
 }
 
@@ -985,7 +1082,13 @@ function resolvePersonaServerSettings(
   return settings
 }
 
-/** The server-wide rules in their fixed order, then the persona-only keys. */
+/**
+ * The server-wide rules in their fixed order, then the persona-only keys,
+ * then the channel-mode switch (b.deo SRI-101): a boolean, `null` included
+ * among the rejected values; its error names the setting and never the
+ * value. All of them run before any persona entry is parsed, in either
+ * mode, since the switch decides how the entries are read.
+ */
 function validatePersonaServerSettings(settings: PersonaServerSettings): void {
   const style = PERSONA_RULE_STYLE
   validateServerTimingsAndModes(settings, style)
@@ -995,10 +1098,12 @@ function validatePersonaServerSettings(settings: PersonaServerSettings): void {
   checkOptionalNonEmptyString(settings.ack_reaction, 'ack_reaction', style)
   checkOptionalPositiveInteger(settings.reply_chunk_limit, 'reply_chunk_limit', style)
   checkAllowedValue(settings.reply_chunk_mode, 'reply_chunk_mode', REPLY_CHUNK_MODES, style)
+  checkBoolean(settings.allow_invited_channels, 'allow_invited_channels', style)
 }
 
 // ---------------------------------------------------------------------------
-// Persona loader: persona and channel entries (b.av2 SR-1.2, SR-1.3, SR-1.5)
+// Persona loader: persona and channel entries (b.av2 SR-1.2, SR-1.3, SR-1.5;
+// b.deo SRI-102 to SRI-104)
 // ---------------------------------------------------------------------------
 
 /** Top-level values a persona inherits when its entry omits them (b.av2 SR-1.2, SR-10.2). */
@@ -1040,16 +1145,27 @@ function rejectUnknownEntryKeys(
 }
 
 /**
- * Stage 1 of an entry: the shapes of the `dm` object and the `channels`
- * array and its entries, and unknown keys at every level (key names only,
- * and only those safe to echo: `describeUnknownKeys`).
+ * Stage 1 of an entry: unknown keys of the entry and the shape of the `dm`
+ * object, then the section in force (b.deo SRI-103, SRI-104). Declarative
+ * mode: the shape of the `channels` array and its entries, as b.av2 SR-1.2
+ * and SR-1.3 give it; `invited` is not looked at. Fungible mode: the shape of
+ * the `invited` object; `channels` is not looked at. Unknown keys are
+ * rejected at every level checked (key names only, and only those safe to
+ * echo: `describeUnknownKeys`).
  */
-function checkPersonaEntryShape(entry: Record<string, unknown>, style: RuleStyle): void {
+function checkPersonaEntryShape(entry: Record<string, unknown>, mode: ChannelMode, style: RuleStyle): void {
   rejectUnknownEntryKeys(entry, PERSONA_ENTRY_KEYS, 'the persona entry', style)
   const dm = entry['dm']
   if (dm !== undefined) {
     if (!isJsonObject(dm)) throw ruleError(style, `dm must be a JSON object, got ${jsonTypeName(dm)}.`)
     rejectUnknownEntryKeys(dm, PERSONA_DM_KEYS, 'dm', style)
+  }
+  if (mode === 'fungible') {
+    const invited = entry['invited']
+    if (invited === undefined) return
+    if (!isJsonObject(invited)) throw ruleError(style, `invited must be a JSON object, got ${jsonTypeName(invited)}.`)
+    rejectUnknownEntryKeys(invited, PERSONA_INVITED_KEYS, 'invited', style)
+    return
   }
   const channels = entry['channels']
   if (channels === undefined) return
@@ -1121,16 +1237,57 @@ function parsePermissionPrompts(value: unknown, style: RuleStyle): string {
   throw ruleError(style, `permission_prompts must be "${DM_DESTINATION}" or a Slack channel ID matching ${CHANNEL_ID_RE.source}.`)
 }
 
+/** The setting that names a persona's destination in fungible mode (b.deo SRI-102). */
+const INVITED_PERMISSION_PROMPTS = 'invited.permission_prompts'
+
 /**
- * Stage 3 of an entry: the cross-setting rules of b.av2 SR-1.5. Zero channels
+ * The fungible destination (b.deo SRI-102): `invited.permission_prompts`,
+ * `dm` or a Slack channel ID, or `dm` when `invited` or its key is absent.
+ * The shape of `invited` is already checked in stage 1.
+ */
+function parseFungibleDestination(invited: Record<string, unknown> | undefined, style: RuleStyle): string {
+  const value = invited?.['permission_prompts']
+  if (value === undefined) return DM_DESTINATION
+  if (value === DM_DESTINATION || (typeof value === 'string' && CHANNEL_ID_RE.test(value))) return value
+  throw ruleError(
+    style,
+    `${INVITED_PERMISSION_PROMPTS} must be "${DM_DESTINATION}" or a Slack channel ID matching ${CHANNEL_ID_RE.source}.`,
+  )
+}
+
+/**
+ * Stage 3 of an entry in fungible mode: the fungible destination rule
+ * (b.deo SRI-104). A `dm` destination, written or by default, needs
+ * `dm.contact` set and `dm.enabled` true; the error names
+ * `invited.permission_prompts`, says whether `dm` is its default, and names
+ * each missing setting (both when both are missing). A channel destination
+ * needs no listing and no DMs, and no rule asks for a way to receive.
+ */
+function checkFungibleDestination(destination: string, written: boolean, dm: PersonaDm, style: RuleStyle): void {
+  if (destination !== DM_DESTINATION) return
+  const problems: string[] = []
+  if (dm.contact === undefined) problems.push('dm.contact is not set')
+  if (!dm.enabled) problems.push('dm.enabled is not true')
+  if (problems.length === 0) return
+  const what = written
+    ? `${INVITED_PERMISSION_PROMPTS} is "${DM_DESTINATION}"`
+    : `${INVITED_PERMISSION_PROMPTS} is not set, so it is "${DM_DESTINATION}" by default,`
+  throw ruleError(style, `${what} but ${problems.join(' and ')}.`)
+}
+
+/**
+ * Stage 3 of an entry in declarative mode: the cross-setting rules of b.av2
+ * SR-1.5 (b.deo SRI-103). Zero channels
  * with DMs off comes first: every destination would otherwise fail one of the
  * later rules, so AC 42 could never be reported. Then a channel destination
  * not among `channels`, then a `dm` destination without `dm.contact` or with
  * `dm.enabled` not true (both named when both are wrong). Values named here
  * (channel IDs) have already passed their format rule.
  */
-function checkPersonaCrossSettings(persona: Persona, style: RuleStyle): void {
-  const { permission_prompts: destination, channels, dm } = persona
+function checkPersonaCrossSettings(
+  { destination, channels, dm }: { destination: string; channels: readonly ChannelEntry[]; dm: PersonaDm },
+  style: RuleStyle,
+): void {
   if (channels.length === 0 && !dm.enabled) {
     throw ruleError(
       style,
@@ -1151,10 +1308,20 @@ function checkPersonaCrossSettings(persona: Persona, style: RuleStyle): void {
 }
 
 /**
- * Parse, default and validate one persona entry (b.av2 SR-1.2, SR-1.3 and
- * the per-entry rules of SR-1.5), throwing on the first violation.
+ * The section in force of one persona entry, parsed and checked by the
+ * channel mode (b.deo SRI-103, SRI-104): the resolved `channels`,
+ * `permission_prompts` and `fungible_destination`. The section not in force
+ * is never looked at.
+ */
+type ResolvedSection = Pick<Persona, 'channels' | 'permission_prompts' | 'fungible_destination'>
+
+/**
+ * Parse, default and validate one persona entry by the channel mode `mode`
+ * (b.av2 SR-1.2, SR-1.3 and the per-entry rules of SR-1.5, as b.deo SRI-103
+ * and SRI-104 give them per mode), throwing on the first violation.
  *
- * Check order, so "first violation" is reproducible:
+ * Check order, so "first violation" is reproducible. Declarative mode
+ * (b.deo SRI-103):
  *   0. the entry is a JSON object;
  *   1. shape and unknown keys: persona entry, `dm`, `channels` and each
  *      channel entry (stage 1);
@@ -1167,6 +1334,20 @@ function checkPersonaCrossSettings(persona: Persona, style: RuleStyle): void {
  *      with `dm.enabled` not true, then a destination channel not among
  *      `channels`, then a `dm` destination without `dm.contact` / with
  *      `dm.enabled` not true.
+ * `invited` is neither checked nor read, whatever its type or content.
+ *
+ * Fungible mode (b.deo SRI-104):
+ *   0. the entry is a JSON object;
+ *   1. shape and unknown keys: persona entry, `dm` and `invited` (stage 1);
+ *   2. types and formats, in this order: `name`, `credentials_file`,
+ *      `working_directory`, `claude_config_dir`, `stop_hook_bootstrap`,
+ *      `dm.enabled`, `dm.contact`, `invited.permission_prompts`;
+ *   3. the fungible destination rule (see `checkFungibleDestination`).
+ * `channels` and the top-level `permission_prompts` are neither checked nor
+ * read, whatever their type or content: the resolved `channels` is empty and
+ * `permission_prompts` undefined.
+ *
+ * In both modes `sections` holds the three section keys as written.
  *
  * Errors name `personas[i]` and, when the name is a non-empty string, the
  * persona reference, plus the setting's key path; they never echo a rejected
@@ -1177,13 +1358,14 @@ function parsePersonaEntry(
   raw: unknown,
   index: number,
   inherited: InheritedPersonaSettings,
+  mode: ChannelMode,
   home: string,
 ): Persona {
   if (!isJsonObject(raw)) {
     throw ruleError(PERSONA_RULE_STYLE, `personas[${index}] must be a JSON object, got ${jsonTypeName(raw)}.`)
   }
   const style = personaEntryStyle(raw['name'], index)
-  checkPersonaEntryShape(raw, style)
+  checkPersonaEntryShape(raw, mode, style)
 
   const name = raw['name']
   if (name === undefined) throw ruleError(style, 'name is required.')
@@ -1197,24 +1379,40 @@ function parsePersonaEntry(
       : inherited.claude_config_dir
   const ownStopHook = raw['stop_hook_bootstrap']
   if (ownStopHook !== undefined) checkBoolean(ownStopHook, 'stop_hook_bootstrap', style)
-  const channels = parseChannels((raw['channels'] as Record<string, unknown>[] | undefined) ?? [], style)
-  const dm = parseDm(raw['dm'] as Record<string, unknown> | undefined, style)
-  const permission_prompts = parsePermissionPrompts(raw['permission_prompts'], style)
+  let section: ResolvedSection
+  let dm: PersonaDm
+  if (mode === 'fungible') {
+    dm = parseDm(raw['dm'] as Record<string, unknown> | undefined, style)
+    const invited = raw['invited'] as Record<string, unknown> | undefined
+    const fungible_destination = parseFungibleDestination(invited, style)
+    checkFungibleDestination(fungible_destination, invited?.['permission_prompts'] !== undefined, dm, style)
+    section = { channels: [], permission_prompts: undefined, fungible_destination }
+  } else {
+    const channels = parseChannels((raw['channels'] as Record<string, unknown>[] | undefined) ?? [], style)
+    dm = parseDm(raw['dm'] as Record<string, unknown> | undefined, style)
+    const permission_prompts = parsePermissionPrompts(raw['permission_prompts'], style)
+    checkPersonaCrossSettings({ destination: permission_prompts, channels, dm }, style)
+    section = { channels, permission_prompts, fungible_destination: undefined }
+  }
 
-  const persona: Persona = {
+  return {
     index,
     name,
     key: personaKey(name),
     credentials_file,
     working_directory,
-    channels,
+    channels: section.channels,
     dm,
-    permission_prompts,
+    permission_prompts: section.permission_prompts,
+    fungible_destination: section.fungible_destination,
+    sections: {
+      channels: raw['channels'],
+      permission_prompts: raw['permission_prompts'],
+      invited: raw['invited'],
+    },
     ...(claude_config_dir !== undefined ? { claude_config_dir } : {}),
     stop_hook_bootstrap: (ownStopHook as boolean | undefined) ?? inherited.stop_hook_bootstrap,
   }
-  checkPersonaCrossSettings(persona, style)
-  return persona
 }
 
 // ---------------------------------------------------------------------------
@@ -1486,10 +1684,12 @@ export interface ResolvePersonaConfigOptions {
  *   3. unknown top-level keys (key names only, and only plain setting names:
  *      `describeUnknownKeys`; the SR-4.1 rename message);
  *   4. `personas` present and an array (it may be empty);
- *   5. server-wide settings defaulted and validated (b.av2 SR-1.6);
- *   6. each persona entry in array order (see `parsePersonaEntry`),
- *      inheriting the resolved top-level `claude_config_dir` and
- *      `stop_hook_bootstrap`;
+ *   5. server-wide settings defaulted and validated (b.av2 SR-1.6, b.deo
+ *      SRI-101), the `allow_invited_channels` switch among them;
+ *   6. each persona entry in array order, by the rules of the channel mode
+ *      this configuration's own switch picks (see `parsePersonaEntry`;
+ *      b.deo SRI-103 to SRI-105), inheriting the resolved top-level
+ *      `claude_config_dir` and `stop_hook_bootstrap`;
  *   7. the cross-persona name/key rule (b.av2 SR-1.5, see
  *      `checkUniqueNamesAndKeys`): no name or key equal to another persona's
  *      name or key;
@@ -1502,8 +1702,13 @@ export interface ResolvePersonaConfigOptions {
  *      record mode (`options.record`).
  *
  * Steps 7 to 9 run only after every entry has parsed, so a per-entry
- * violation anywhere is reported before any cross-persona one. Cross-persona
- * errors echo each name involved as written.
+ * violation anywhere is reported before any cross-persona one. They apply
+ * unchanged in both channel modes (b.deo SRI-104). Cross-persona errors echo
+ * each name involved as written.
+ *
+ * Every candidate (a start's configuration or record, a reload tick's
+ * pending configuration) is validated here by the mode its own switch picks,
+ * never by the mode of the configuration in effect (b.deo SRI-105).
  *
  * @param raw        The parsed JSON value of the configuration file.
  * @param configDir  Directory of the configuration file; the cron path defaults sit under it.
@@ -1539,7 +1744,8 @@ export function resolvePersonaConfig(
     claude_config_dir: settings.claude_config_dir,
     stop_hook_bootstrap: settings.stop_hook_bootstrap,
   }
-  const personas = entries.map((entry: unknown, index) => parsePersonaEntry(entry, index, inherited, home))
+  const mode = channelModeOf(settings)
+  const personas = entries.map((entry: unknown, index) => parsePersonaEntry(entry, index, inherited, mode, home))
 
   // Cross-persona rules (b.av2 SR-1.5), only once every entry has parsed so
   // per-entry violations are reported first.

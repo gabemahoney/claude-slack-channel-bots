@@ -522,10 +522,12 @@ export interface ReloadControllerDeps {
   /**
    * Told the configuration a confirmed apply's step 1 made the applied one,
    * right after the record was rewritten and in the same synchronous step as
-   * the controller's own swap (b.av2 SR-8.6). Production reassigns the
-   * server's `personaConfig` to the new persona set with the start-time
-   * server-wide values; the bring-up controller's applied set and the
-   * reply-guard step read it from there. A throw is logged; the apply goes on.
+   * the controller's own swap (b.av2 SR-8.6, b.deo SRI-201). Production
+   * reassigns the server's `personaConfig` to `configInEffect`: the new
+   * persona set and its `allow_invited_channels` switch, with every other
+   * server-wide value kept from start time; the bring-up controller's applied
+   * set, the reply-guard step and every consumer of the channel mode read it
+   * from there. A throw is logged; the apply goes on.
    */
   onApplied?: (config: PersonaConfig) => void
   /**
@@ -556,19 +558,25 @@ export interface ReloadControllerDeps {
 
 /**
  * The configuration the server runs once a confirmed apply's step 1 made
- * `applied` current (b.av2 SR-8.6, the server-wide row): `applied`'s persona
- * set over every server-wide setting of `startTime`, the configuration the
- * server started with. A changed server-wide setting (the listener's `bind`
- * and `port`, the restart delay, `resume_enabled`, the cron paths, …) is
+ * `applied` current (b.av2 SR-8.6, the server-wide row; b.deo SRI-201):
+ * `applied`'s persona set and its `allow_invited_channels` switch over every
+ * other server-wide setting of `startTime`, the configuration the server
+ * started with. A changed server-wide setting (the listener's `bind` and
+ * `port`, the restart delay, `resume_enabled`, the cron paths, …) is
  * recorded by step 1 and takes effect only at the next start, which runs the
- * record. The top-level `claude_config_dir` and `stop_hook_bootstrap` are not
- * held back by this: they act only as inherited defaults, already resolved
- * into each of `applied`'s personas, so an inheriting persona's next launch
- * uses the new value. The one place the server derives what it runs after an
- * apply (the `onApplied` of `main()` in `server.ts`). Pure.
+ * record. The switch is the one exception: it is applied in place at once,
+ * so the channel mode every consumer reads (`channelModeOf`) is the
+ * confirmed one from the next event, tool call, prompt and notice, and it
+ * always matches the mode `applied`'s personas were resolved in. The
+ * top-level `claude_config_dir` and `stop_hook_bootstrap` are not held back
+ * by this either: they act only as inherited defaults, already resolved into
+ * each of `applied`'s personas, so an inheriting persona's next launch uses
+ * the new value. The one place the server derives what it runs after an
+ * apply (the `onApplied` of `main()` in `server.ts`). Pure: neither input is
+ * mutated.
  */
 export function configInEffect(startTime: PersonaConfig, applied: PersonaConfig): PersonaConfig {
-  return { ...startTime, personas: applied.personas }
+  return { ...startTime, allow_invited_channels: applied.allow_invited_channels, personas: applied.personas }
 }
 
 // ---------------------------------------------------------------------------
@@ -1607,7 +1615,15 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
    *   3. swap the applied state and tell `onApplied`.
    * Then the bound steps 2–6 run in order (`applyStepsFor`: none but the
    * template refresh for a no-op, and that only when the config directories
-   * changed), then `reload-applied` or `reload-noop` is logged. Resolves
+   * changed), then `reload-applied` or `reload-noop` is logged. A candidate
+   * whose only changes are recorded ones (the section the switch does not
+   * select) has no effective change: it rewrites the record, swaps the
+   * applied state and logs `reload-noop`, with no lifecycle operation
+   * (b.av2 SR-8.6, b.deo SRI-804, SRI-805). A change of the switch is a
+   * server-wide setting the swap applies in place (`configInEffect`); it puts
+   * no persona in any step, so on its own it runs no teardown, bring-up,
+   * launch, reconnect or in-place operation and every session is kept
+   * (b.deo SRI-203). Resolves
    * whether the applied state changed. Rejects only on a programming error (a
    * plan naming a key its configuration lacks), before anything is written;
    * the tick logs it as a failed pass.

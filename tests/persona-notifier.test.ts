@@ -222,7 +222,7 @@ describe('destination and identity (SR-7.2)', () => {
 
       expect(h.posts(self.key)).toHaveLength(1)
       const [args] = h.posts(self.key)
-      expect(args!.channel).toBe(self.permission_prompts)
+      expect(args!.channel).toBe(self.permission_prompts!)
       // Top-level, persona's own identity: no thread_ts, username or icon override.
       expect(Object.keys(args!).sort()).toEqual(['channel', 'text'])
       expect(h.posts(peer.key)).toHaveLength(0)
@@ -230,7 +230,7 @@ describe('destination and identity (SR-7.2)', () => {
 
       // A second notice goes to the same destination: never to another of its channels.
       await h.notifier.notify(self.key, 'two')
-      expect(h.posts(self.key).map((c) => c.channel)).toEqual([self.permission_prompts, self.permission_prompts])
+      expect(h.posts(self.key).map((c) => c.channel)).toEqual([self.permission_prompts!, self.permission_prompts!])
       expect(h.posts(peer.key)).toHaveLength(0)
     },
   )
@@ -716,8 +716,8 @@ describe('destination failures are held and retried, one line per episode (SR-7.
     async (_label, pick, queue, outcome, step, code, namesImWrite) => {
       const p = pick(f)
       const isDm = p.permission_prompts === 'dm'
-      const destination = isDm ? 'dm' : p.permission_prompts
-      const postedTo = isDm ? stubOpenedDmId(p.dm.contact!) : p.permission_prompts
+      const destination = isDm ? 'dm' : p.permission_prompts!
+      const postedTo = isDm ? stubOpenedDmId(p.dm.contact!) : p.permission_prompts!
       const stub = h.stub(p.key)
       const attempts = () => stub.callLog.filter((c) => c.method === step).length
       h.validate(p.key)
@@ -782,7 +782,7 @@ describe('destination failures are held and retried, one line per episode (SR-7.
     await h.notifier.notify(f.B.key, 'b1')
 
     expect(h.logs).toHaveLength(2)
-    expect(h.logs[0]).toStartWith(episodeStart(f.A, 'chat.postMessage', f.A.permission_prompts, 'not_in_channel'))
+    expect(h.logs[0]).toStartWith(episodeStart(f.A, 'chat.postMessage', f.A.permission_prompts!, 'not_in_channel'))
     expect(h.logs[0]).not.toContain('im:write')
     expect(h.logs[1]).toStartWith(episodeStart(f.D, 'conversations.open', 'dm', 'missing_scope'))
     expect(h.logs[1]).toContain('im:write')
@@ -796,7 +796,7 @@ describe('destination failures are held and retried, one line per episode (SR-7.
     expect(texts(f.A)).toEqual(['a1', 'a1'].map((t) => formatPersonaNotice(f.A, t)))
     expect(h.posts(f.D.key)).toEqual([])
     expect(h.logs).toHaveLength(3)
-    expect(h.logs[2]).toStartWith(clearedStart(f.A, f.A.permission_prompts))
+    expect(h.logs[2]).toStartWith(clearedStart(f.A, f.A.permission_prompts!))
     expect(h.hold.view(f.A.key)).toEqual(NOT_HELD)
     expect(h.hold.view(f.D.key)).toEqual({ held: true, heldNotices: 1, nextDueAt: 15_000 })
 
@@ -932,7 +932,7 @@ describe('failed posts and the failure callback (SR-11 spawn-failure-post class)
     expect(failures[0]!.channelId).toBe(f.A.permission_prompts)
     expect(failures[0]!.error).toBe(thrown)
     expect(h.logs).toHaveLength(1)
-    expect(h.logs[0]).toStartWith(episodeStart(f.A, 'chat.postMessage', f.A.permission_prompts, 'network_error'))
+    expect(h.logs[0]).toStartWith(episodeStart(f.A, 'chat.postMessage', f.A.permission_prompts!, 'network_error'))
 
     web.chat.postMessage = original
     await h.clock.runNext()
@@ -948,7 +948,7 @@ describe('failed posts and the failure callback (SR-11 spawn-failure-post class)
 
 describe('failure log lines (SR-10.3 token-safe)', () => {
   test.each<[string, (x: Fixture) => Persona, string, (x: Fixture) => string]>([
-    ['invalid_blocks on a channel destination', (x) => x.A, 'invalid_blocks', (x) => x.A.permission_prompts],
+    ['invalid_blocks on a channel destination', (x) => x.A, 'invalid_blocks', (x) => x.A.permission_prompts!],
     ['msg_too_long in the opened DM', (x) => x.D, 'msg_too_long', (x) => stubOpenedDmId(x.D.dm.contact!)],
   ])(
     'a post refused for the message itself (%s) is dropped, not held: one per-notice line with the short reason beside the destination and the error\'s message logged redacted, the callback once, no episode; the next notice posts at once',
@@ -1117,7 +1117,7 @@ describe('the persona teardown window: every notice for the key is a log line an
     expectNoSlackCallOrHold()
 
     await h.notifier.notify(f.A.key, 'survivor version', survivor)
-    expect(h.posts(f.A.key)).toEqual([{ channel: f.A.permission_prompts, text: formatPersonaNotice(f.A, 'survivor version') }])
+    expect(h.posts(f.A.key)).toEqual([{ channel: f.A.permission_prompts!, text: formatPersonaNotice(f.A, 'survivor version') }])
     expect(h.startupEntries()).toHaveLength(1)
   })
 
@@ -1150,7 +1150,7 @@ describe('the persona teardown window: every notice for the key is a log line an
     expect(h.logs).toEqual([windowLine(f.A, text, classLabel)])
     expect(h.stub(f.A.key).callLog).toEqual([])
     expect(h.hold.view(f.A.key)).toEqual(NOT_HELD)
-    expect(h.posts(f.B.key)).toEqual([{ channel: f.B.permission_prompts, text: formatPersonaNotice(f.B, text) }])
+    expect(h.posts(f.B.key)).toEqual([{ channel: f.B.permission_prompts!, text: formatPersonaNotice(f.B, text) }])
   })
 
   test('forget in the window drops none of the notices raised in it; a notice queued before the window is dropped by it with its one line, and a flush in the window posts nothing of it', async () => {
@@ -1177,10 +1177,10 @@ describe('the persona teardown window: every notice for the key is a log line an
     for (const p of [f.A, f.B]) h.validate(p.key)
 
     await h.duringTeardown(f.A, () => h.notifier.notify(f.B.key, 'B in A\'s window'))
-    expect(h.posts(f.B.key)).toEqual([{ channel: f.B.permission_prompts, text: formatPersonaNotice(f.B, 'B in A\'s window') }])
+    expect(h.posts(f.B.key)).toEqual([{ channel: f.B.permission_prompts!, text: formatPersonaNotice(f.B, 'B in A\'s window') }])
 
     await h.notifier.notify(f.A.key, 'after')
-    expect(h.posts(f.A.key)).toEqual([{ channel: f.A.permission_prompts, text: formatPersonaNotice(f.A, 'after') }])
+    expect(h.posts(f.A.key)).toEqual([{ channel: f.A.permission_prompts!, text: formatPersonaNotice(f.A, 'after') }])
 
     h.personas.splice(h.personas.indexOf(f.A), 1)
     await h.duringTeardown(f.A, () => undefined)
@@ -1208,7 +1208,7 @@ describe('the persona teardown window: every notice for the key is a log line an
 
     // The mark is spent: the next all-clear of that class is an ordinary notice.
     await h.notifier.notify(f.A.key, 'all clear again', allClear('ad-unreachable'))
-    expect(h.posts(f.A.key)).toEqual([{ channel: newHalf.permission_prompts, text: formatPersonaNotice(newHalf, 'all clear again') }])
+    expect(h.posts(f.A.key)).toEqual([{ channel: newHalf.permission_prompts!, text: formatPersonaNotice(newHalf, 'all clear again') }])
     expect(h.startupEntries()).toHaveLength(2)
   })
 
@@ -1359,7 +1359,7 @@ describe('the persona teardown window: every notice for the key is a log line an
     await h.notifier.notify(f.A.key, onsetText, onset('ad-config-malformed'))
     await h.notifier.notify(f.A.key, 'onset: tmux', onset('tmux-unavailable'))
 
-    expect(h.posts(f.A.key)).toEqual([{ channel: f.A.permission_prompts, text: formatPersonaNotice(f.A, 'onset: tmux') }])
+    expect(h.posts(f.A.key)).toEqual([{ channel: f.A.permission_prompts!, text: formatPersonaNotice(f.A, 'onset: tmux') }])
     expect(h.startupEntries()).toEqual([])
     expect(h.logs).toEqual([mutedOnsetLine(f.A, ['ad-config-malformed'], onsetText)])
     expect(h.logs[0]).toContain('config <tmux> section & more is malformed')
@@ -1422,8 +1422,8 @@ describe('the persona teardown window: every notice for the key is a log line an
     ])
     expect(h.logs).toEqual([windowLine(f.A, 'onset: unreachable'), allClearLine(f.A, 'All clear: ad-unreachable')])
     expect(h.posts(f.A.key)).toEqual([
-      { channel: f.A.permission_prompts, text: formatPersonaNotice(f.A, 'onset: tmux') },
-      { channel: f.A.permission_prompts, text: formatPersonaNotice(f.A, 'All clear: tmux-unavailable') },
+      { channel: f.A.permission_prompts!, text: formatPersonaNotice(f.A, 'onset: tmux') },
+      { channel: f.A.permission_prompts!, text: formatPersonaNotice(f.A, 'All clear: tmux-unavailable') },
     ])
   })
 

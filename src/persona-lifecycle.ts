@@ -203,9 +203,10 @@
  *   6's recovery bring-up. Nothing touches another persona; no
  *   agent-director call.
  *
- * - **in-place update** (SR-8.6, AC 58, apply step 3): a persona whose
- *   `channels`, `delivery`, `permission_prompts` or `dm.*` changed keeps its
- *   instance, Slack connection, Web API client, MCP session, restart,
+ * - **in-place update** (SR-8.6, b.deo SRI-802, AC 58, apply step 3): a
+ *   persona whose `channels`, `delivery`, `permission_prompts` (declarative
+ *   mode), `invited.permission_prompts` (fungible mode) or `dm.*` changed
+ *   keeps its instance, Slack connection, Web API client, MCP session, restart,
  *   backoff, health, outage and retry state, reply-guard record, tracked
  *   prompts and held notices. The new values already took effect at apply
  *   step 1: every consumer (tool scope, delivery decision, destination, DM
@@ -279,8 +280,9 @@
  * the template refresh's one line is `refreshSlackChannelBotTemplate`'s.
  *
  * `<settings>` lists the changed setting groups, comma-separated, in the
- * change plan's order (`channels`, `delivery`, `permission_prompts`,
- * `dm.enabled`, `dm.contact`).
+ * change plan's order (`IN_PLACE_SETTINGS`: `channels`, `delivery`,
+ * `permission_prompts`, `invited.permission_prompts`, `dm.enabled`,
+ * `dm.contact`; b.deo SRI-802).
  *
  * Pure module (b.av2 SR-13.1): nothing is created, read or scheduled at
  * import or at `createPersonaLifecycle`; every dependency is injected, so
