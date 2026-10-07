@@ -20,7 +20,13 @@
  * effect wording, the `DESTRUCTIVE:` prefix exactly when the persona is
  * retired, and its header count. Every server-wide setting has a wording
  * group; the `allow_invited_channels` switch's line is built through
- * `modeSwitchLine` (b.deo SRI-803). What the detection tick gathers and when
+ * `modeSwitchLine` (b.deo SRI-803), with one pin case per direction that
+ * checks the whole line against the builder and each element SRI-803
+ * requires. Across a switch change each persona is classified by the
+ * candidate's section in force (SRI-802); a change to the section not in
+ * force gets the line `recordedLine` builds (SRI-804), checked element by
+ * element in one case and built through the builder everywhere else. What the
+ * detection tick gathers and when
  * it writes and logs the preview is covered in tests/reload.test.ts.
  *
  * The retired lines (b.jg5 SRJ-1510): one case pins a removal's line and a
@@ -45,6 +51,7 @@ import { join } from 'node:path'
 
 import {
   channelModeOf,
+  DM_DESTINATION,
   MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   parsePersonaConfigBytes,
@@ -62,6 +69,7 @@ import {
   PERSONA_DIRECTORY_MISSING,
   PERSONA_SLACK_UNREACHABLE,
 } from '../src/persona-diagnostics.ts'
+import { renderPersonaRef } from '../src/persona-identity.ts'
 import type { PersonaBringUpStep } from '../src/persona-start.ts'
 import {
   buildChangePlan,
@@ -78,6 +86,8 @@ import {
   renderPreviewLines,
   renderPreviewLogLines,
   PENDING_PREVIEW_TITLE,
+  RECORDED_SECTION_KEYS,
+  recordedLine,
   removedLine,
   type AddedPersonaCause,
   type ChangePlan,
@@ -85,12 +95,14 @@ import {
   type ChangePlanCounts,
   type ChangePlanFacts,
   type DestructivePersonaChange,
+  type InPlacePersonaChange,
   type InPlaceSetting,
   type InvalidChangePlan,
   type NextLaunchSetting,
+  type RecordedSectionKey,
   type ValidChangePlan,
 } from '../src/reload-plan.ts'
-import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, makeCredentials } from './test-helpers/credentials.ts'
+import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL, makeCredentials } from './test-helpers/credentials.ts'
 import { makeMultiPersonaConfig, makePersona } from './test-helpers/persona-config.ts'
 
 // ---------------------------------------------------------------------------
@@ -298,6 +310,38 @@ function bravoDestructive(
     ...overrides,
   }
 }
+
+/**
+ * `baseInput()` made valid in both channel modes, each persona's own channel
+ * being its fungible destination (b.deo SRI-104), with the switch at `value`
+ * (absent when undefined), then `mutate` applied; resolved.
+ */
+function switched(value: boolean | undefined, mutate: (c: EditableInput) => void = () => {}): PersonaConfig {
+  return edited((c) => {
+    for (const p of c.personas) p.invited = { permission_prompts: p.permission_prompts }
+    if (value !== undefined) c[MODE_SWITCH_SETTING] = value
+    mutate(c)
+  })
+}
+
+/** The plan of `after` against the applied `before`, rendered. */
+function previewBetween(before: PersonaConfig, after: PersonaConfig): { plan: ValidChangePlan; lines: string[] } {
+  const plan = buildChangePlan(before, valid(after), facts())
+  if (!plan.valid) throw new Error('expected a valid plan')
+  return { plan, lines: render(plan) }
+}
+
+/** The base personas, as the plan names them, in base order. */
+const baseRefs = () => [ref('alpha', 0), ref('bravo', 1), ref('charlie', 2)]
+
+/** The switch's two directions: its value in the applied config and in the candidate, absent when undefined. */
+const SWITCH_DIRECTIONS: [label: string, from: boolean | undefined, to: boolean | undefined][] = [
+  ['declarative to fungible', undefined, true],
+  ['fungible to declarative', true, undefined],
+]
+
+/** A persona's in-place line, built by the renderer from the plan entry the case states. */
+const inPlaceLineOf = (change: InPlacePersonaChange): string => renderPreviewLines(planWith({ inPlace: [change] }))[1]!
 
 // ---------------------------------------------------------------------------
 // Added
@@ -1363,6 +1407,299 @@ describe('server-wide settings', () => {
     expect(plan.settings).toEqual(expected.map((line) => ({ name: /^server-wide setting (\w+) /.exec(line)![1] })))
     expect(changePlanCounts(plan)).toEqual(counts({ settings: expected.length }))
     expect(lines.slice(1)).toEqual(expected)
+  })
+
+  describe("the switch's line, in each direction (b.deo SRI-803)", () => {
+    // The SRD gives this line's elements, not its text: each direction's pin
+    // case checks the whole line against modeSwitchLine and each element
+    // SRI-803 requires; every other case builds the line through modeSwitchLine.
+    test.each(SWITCH_DIRECTIONS)(
+      'pin, %s: the line names the mode turned on, applies in place at once from the next event, tool call, prompt and notice, names every persona in candidate order and no restart',
+      (_label, from, to) => {
+        const before = switched(from)
+        const after = switched(to)
+        const mode = channelModeOf(after)
+        const otherMode = channelModeOf(before)
+        expect(mode).not.toBe(otherMode)
+
+        const { plan, lines } = previewBetween(before, after)
+        const everyone = baseRefs()
+        expect(plan.settings).toEqual([{ name: MODE_SWITCH_SETTING, mode, personas: everyone }])
+        expect(lines).toEqual([header({ settings: 1 }), modeSwitchLine(mode, everyone)])
+
+        const line = lines[1]!
+        // The setting, and the mode it turns on (never the mode it leaves).
+        expect(line).toContain(MODE_SWITCH_SETTING)
+        expect(line).toContain(`${mode} mode`)
+        expect(line).not.toContain(otherMode)
+        // In place, at once, from the next event, tool call, prompt and notice.
+        expect(line).toContain('in place at once')
+        expect(line).toContain('from the next event, tool call, prompt and notice')
+        // Every persona present in both configurations, in candidate order.
+        const at = everyone.map((p) => line.indexOf(renderPersonaRef(p.name, p.key)))
+        expect(at.every((i) => i >= 0)).toBe(true)
+        expect(at).toEqual([...at].sort((a, b) => a - b))
+        // No restart, and not the next-start wording.
+        expect(line).not.toMatch(/restart|server start/i)
+        expect(line).not.toBe(nextStartLine(MODE_SWITCH_SETTING))
+      },
+    )
+
+    test.each(SWITCH_DIRECTIONS)('%s: a candidate that reorders the personas names them in candidate order', (_label, from, to) => {
+      const after = switched(to, (c) => c.personas.reverse())
+      const { plan, lines } = previewBetween(switched(from), after)
+
+      const inCandidateOrder = [ref('charlie', 0), ref('bravo', 1), ref('alpha', 2)]
+      expect(plan.unchanged).toEqual(inCandidateOrder)
+      expect(lines).toEqual([header({ settings: 1 }), modeSwitchLine(channelModeOf(after), inCandidateOrder)])
+    })
+
+    test.each(SWITCH_DIRECTIONS)('%s: a candidate with no persona present in both says no persona is affected', (_label, from, to) => {
+      const delta = persona('delta', 'C0D0001', { invited: { permission_prompts: 'C0D0001' } })
+      const after = switched(to, (c) => (c.personas = [delta]))
+      const { plan, lines } = previewBetween(switched(from), after)
+
+      const mode = channelModeOf(after)
+      expect(plan.settings).toEqual([{ name: MODE_SWITCH_SETTING, mode, personas: [] }])
+      expect(plan.removed).toEqual(baseRefs())
+      expect(plan.added.map((p) => p.key)).toEqual(['delta'])
+      expect(lines[0]).toBe(header({ added: 1, removed: 3, settings: 1 }))
+      expect(lines.at(-1)).toBe(modeSwitchLine(mode, []))
+    })
+
+    test('the header counts the switch among the changed server-wide settings, never as a modified persona', () => {
+      const after = switched(true, (c) => (entry(c, 'bravo').dm = { enabled: false, contact: 'U0B0002' }))
+      const { plan, lines } = previewBetween(switched(undefined), after)
+
+      expect(changePlanCounts(plan)).toEqual(counts({ inPlace: 1, settings: 1 }))
+      expect(lines).toEqual([
+        header({ inPlace: 1, settings: 1 }),
+        inPlaceLineOf({ ...ref('bravo', 1), settings: ['dm.contact'] }),
+        modeSwitchLine(channelModeOf(after), baseRefs()),
+      ])
+    })
+
+    test('beside another changed server-wide setting: both lines, in the fixed key order, the other keeping its next-start wording', () => {
+      const after = switched(true, (c) => (c.bind = '0.0.0.0'))
+      const { plan, lines } = previewBetween(switched(undefined), after)
+
+      const byKey: Array<[string, string]> = [
+        ['bind', nextStartLine('bind')],
+        [MODE_SWITCH_SETTING, modeSwitchLine(channelModeOf(after), baseRefs())],
+      ]
+      byKey.sort(([a], [b]) => PERSONA_TOP_LEVEL_KEYS.indexOf(a) - PERSONA_TOP_LEVEL_KEYS.indexOf(b))
+      expect(plan.settings.map((s) => s.name)).toEqual(byKey.map(([name]) => name))
+      expect(changePlanCounts(plan)).toEqual(counts({ settings: 2 }))
+      expect(lines).toEqual([header({ settings: 2 }), ...byKey.map(([, line]) => line)])
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Sections across a switch change, and recorded changes (b.deo SRI-802, SRI-804)
+// ---------------------------------------------------------------------------
+
+describe('classification across a switch change, the resolved and section comparisons, and the recorded lines (b.deo SRI-802, SRI-804)', () => {
+  /** bravo's DMs on with a contact, so `dm` is a valid fungible destination for it. */
+  const dmOn = (b: PersonaInput): void => {
+    b.dm = { enabled: true, contact: 'U0B0001' }
+  }
+  const noop = (): void => {}
+
+  type CrossModeExpected = { inPlace: InPlaceSetting } | { recorded: RecordedSectionKey }
+
+  /**
+   * bravo's change across a switch change, in `expected`'s class: an in-place
+   * change gives bravo's in-place line, a recorded one the recorded line and
+   * leaves bravo unchanged; either comes with the switch's line.
+   */
+  function expectCrossMode(
+    from: boolean | undefined,
+    to: boolean | undefined,
+    before: (b: PersonaInput) => void,
+    after: (b: PersonaInput) => void,
+    expected: CrossModeExpected,
+  ): void {
+    const candidate = switched(to, (c) => after(entry(c, 'bravo')))
+    const { plan, lines } = previewBetween(
+      switched(from, (c) => before(entry(c, 'bravo'))),
+      candidate,
+    )
+
+    const switchSetting = { name: MODE_SWITCH_SETTING, mode: channelModeOf(candidate), personas: baseRefs() }
+    const switchLine = modeSwitchLine(channelModeOf(candidate), baseRefs())
+    if ('inPlace' in expected) {
+      const change = { ...ref('bravo', 1), settings: [expected.inPlace] }
+      expect(plan).toEqual(
+        planWith({ inPlace: [change], unchanged: [ref('alpha', 0), ref('charlie', 2)], settings: [switchSetting] }),
+      )
+      expect(lines).toEqual([header({ inPlace: 1, settings: 1 }), inPlaceLineOf(change), switchLine])
+    } else {
+      const change = { ...ref('bravo', 1), fields: [expected.recorded] }
+      expect(plan).toEqual(planWith({ recorded: [change], unchanged: baseRefs(), settings: [switchSetting] }))
+      expect(lines).toEqual([header({ settings: 1 }), recordedLine(change), switchLine])
+    }
+  }
+
+  const changeInvited = (b: PersonaInput): void => {
+    b.invited = { permission_prompts: 'C0B0002' }
+  }
+  const addChannel = (b: PersonaInput): void => {
+    b.channels!.push({ id: 'C0B0003', delivery: 'all' })
+  }
+
+  test.each<[string, boolean | undefined, boolean | undefined, (b: PersonaInput) => void, CrossModeExpected]>([
+    ['turned on with invited changed: in place, as invited.permission_prompts', undefined, true, changeInvited, { inPlace: 'invited.permission_prompts' }],
+    ['turned on with channels changed: channels recorded, bravo not modified', undefined, true, addChannel, { recorded: 'channels' }],
+    ['turned off with channels changed: in place', true, undefined, addChannel, { inPlace: 'channels' }],
+    ['turned off with invited changed: invited recorded, bravo not modified', true, undefined, changeInvited, { recorded: 'invited' }],
+  ])('the switch %s', (_label, from, to, mutate, expected) => {
+    expectCrossMode(from, to, noop, mutate, expected)
+  })
+
+  test.each<[string, (b: PersonaInput) => void]>([
+    ['an invited with no permission_prompts', (b) => (b.invited = {})],
+    ['no invited at all', (b) => delete b.invited],
+  ])('fungible mode in both: %s against an explicit "dm" is no change, compared by resolved value', (_label, absent) => {
+    const before = switched(true, (c) => {
+      dmOn(entry(c, 'bravo'))
+      absent(entry(c, 'bravo'))
+    })
+    const after = switched(true, (c) => {
+      dmOn(entry(c, 'bravo'))
+      entry(c, 'bravo').invited = { permission_prompts: DM_DESTINATION }
+    })
+    // As written the section differs; resolved, the destination is the same.
+    expect(JSON.stringify(after.personas[1]!.sections.invited)).not.toBe(JSON.stringify(before.personas[1]!.sections.invited))
+    expect(after.personas[1]!.fungible_destination).toBe(before.personas[1]!.fungible_destination)
+
+    const { plan, lines } = previewBetween(before, after)
+
+    expect(plan).toEqual(planWith({ unchanged: baseRefs(), noEffectiveChange: true }))
+    expect(lines).toEqual([NO_EFFECT_LINE])
+  })
+
+  test.each<[string, boolean | undefined, boolean | undefined, (b: PersonaInput) => void, (b: PersonaInput) => void, InPlaceSetting]>([
+    [
+      'invited going from absent to {} as the switch turns on',
+      undefined,
+      true,
+      (b) => {
+        dmOn(b)
+        delete b.invited
+      },
+      (b) => {
+        dmOn(b)
+        b.invited = {}
+      },
+      'invited.permission_prompts',
+    ],
+    // The same reorder within declarative mode reads no effective change (the channel set is unchanged).
+    ['channels reordered as the switch turns off', true, undefined, noop, (b) => b.channels!.reverse(), 'channels'],
+  ])('a section in force in the candidate only is compared as written, by JSON value: %s is an in-place change', (_label, from, to, before, after, setting) => {
+    expectCrossMode(from, to, before, after, { inPlace: setting })
+  })
+
+  test('the recorded line names the persona and its changed fields, says the change is recorded and has no effect until the switch selects that section', () => {
+    const declarative = channelModeOf(switched(undefined))
+    const fungible = channelModeOf(switched(true))
+    // Rows: the switch in both configurations, bravo's edit, the fields it records, and the section they belong to.
+    const rows: Array<[boolean | undefined, (b: PersonaInput) => void, RecordedSectionKey[], string]> = [
+      [
+        true,
+        (b) => {
+          addChannel(b)
+          b.permission_prompts = 'C0B0002'
+        },
+        ['channels', 'permission_prompts'],
+        declarative,
+      ],
+      [undefined, changeInvited, ['invited'], fungible],
+    ]
+
+    for (const [value, mutate, fields, section] of rows) {
+      const candidate = switched(value, (c) => mutate(entry(c, 'bravo')))
+      const { plan, lines } = previewBetween(switched(value), candidate)
+      const change = { ...ref('bravo', 1), fields }
+
+      expect(plan).toEqual(planWith({ recorded: [change], unchanged: baseRefs(), noEffectiveChange: true }))
+      expect(changePlanCounts(plan)).toEqual(counts({}))
+      expect(lines).toEqual([NO_EFFECT_LINE, recordedLine(change)])
+
+      const line = lines[1]!
+      expect(line).toContain(renderPersonaRef('bravo', 'bravo'))
+      // The changed fields, and no other recorded key, before the switch is named.
+      const head = line.slice(0, line.indexOf(MODE_SWITCH_SETTING))
+      for (const key of RECORDED_SECTION_KEYS) {
+        const named = new RegExp(`\\b${key}\\b`).test(head)
+        expect([key, named]).toEqual([key, fields.includes(key)])
+      }
+      expect(head).toContain('recorded')
+      // No effect until the switch selects that section; the candidate's own mode is not named.
+      const tail = line.slice(line.indexOf('no effect until'))
+      expect(tail).toContain(MODE_SWITCH_SETTING)
+      expect(tail).toContain(section)
+      expect(line).not.toContain(channelModeOf(candidate))
+    }
+  })
+
+  test('a candidate whose only changes are recorded: the no-effective-change preview, then the recorded lines in candidate order', () => {
+    const candidate = switched(true, (c) => {
+      entry(c, 'alpha').channels!.push({ id: 'C0A0002', delivery: 'all' })
+      entry(c, 'charlie').permission_prompts = 'C0C0002'
+      c.personas.reverse()
+    })
+    const { plan, lines } = previewBetween(switched(true), candidate)
+
+    const recorded = [
+      { ...ref('charlie', 0), fields: ['permission_prompts' as const] },
+      { ...ref('alpha', 2), fields: ['channels' as const] },
+    ]
+    expect(plan).toEqual(
+      planWith({ recorded, unchanged: [ref('charlie', 0), ref('bravo', 1), ref('alpha', 2)], noEffectiveChange: true }),
+    )
+    expect(changePlanCounts(plan)).toEqual(counts({}))
+    expect(lines).toEqual([NO_EFFECT_LINE, ...recorded.map(recordedLine)])
+  })
+
+  test('the recorded line sits after every persona line and before every server-wide line, the switch\'s included', () => {
+    const candidate = switched(true, (c) => {
+      c.bind = '0.0.0.0'
+      // alpha comes first in candidate order, yet its recorded line follows bravo's persona line.
+      entry(c, 'alpha').channels!.push({ id: 'C0A0002', delivery: 'all' })
+      changeInvited(entry(c, 'bravo'))
+      c.personas.push(persona('delta', 'C0D0001', { invited: { permission_prompts: 'C0D0001' } }))
+    })
+    const { plan, lines } = previewBetween(switched(undefined), candidate)
+
+    const recorded = { ...ref('alpha', 0), fields: ['channels' as const] }
+    expect(plan.recorded).toEqual([recorded])
+    expect(lines[0]).toBe(header({ added: 1, inPlace: 1, settings: 2 }))
+    // The server-wide lines end the preview; the recorded line comes just before them.
+    const settingsAt = lines.length - plan.settings.length
+    expect(plan.settings.map((s) => s.name)).toContain(MODE_SWITCH_SETTING)
+    expect(lines.slice(settingsAt)).toContain(modeSwitchLine(channelModeOf(candidate), baseRefs()))
+    expect(lines[settingsAt - 1]).toBe(recordedLine(recorded))
+    // Every persona line (the addition and bravo's in-place line) is above it.
+    const personaLines = lines.slice(1, settingsAt - 1)
+    expect(personaLines.map((l) => /\(key=(\w+)\)/.exec(l)?.[1])).toEqual(['delta', 'bravo'])
+    expect(personaLines[1]).toBe(inPlaceLineOf({ ...ref('bravo', 1), settings: ['invited.permission_prompts'] }))
+  })
+
+  test.each<[string, boolean | undefined, (b: PersonaInput) => void, RecordedSectionKey[]]>([
+    ['a channels entry, in fungible mode', true, (b) => (b.channels = [{ id: LEAK_SENTINEL, delivery: 'all' }]), ['channels']],
+    ['an invited value, in declarative mode', undefined, (b) => (b.invited = { permission_prompts: LEAK_SENTINEL }), ['invited']],
+  ])('LEAK_SENTINEL in %s: the recorded line names the field, never the value', (_label, value, mutate, fields) => {
+    const candidate = switched(value, (c) => mutate(entry(c, 'bravo')))
+    // The candidate really carries the sentinel, in the section not in force.
+    expect(() => assertNoLeak(candidate.personas[1]!.sections)).toThrow()
+
+    // `render` ran assertNoLeak over the plan and every rendered form.
+    const { plan, lines } = previewBetween(switched(value), candidate)
+
+    const change = { ...ref('bravo', 1), fields }
+    expect(plan.recorded).toEqual([change])
+    expect(lines).toEqual([NO_EFFECT_LINE, recordedLine(change)])
   })
 })
 

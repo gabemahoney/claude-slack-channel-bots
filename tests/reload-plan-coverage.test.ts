@@ -1,6 +1,6 @@
 /**
  * reload-plan-coverage.test.ts — Every key the loader accepts has a place in
- * the change plan (b.av2 SR-8.4, SR-8.6; b.deo SRI-802, SRI-803).
+ * the change plan (b.av2 SR-8.4, SR-8.6; b.deo SRI-101, SRI-802, SRI-803).
  *
  * `src/reload-plan.ts` hand-lists the persona settings it compares in three
  * classes (`DESTRUCTIVE_SETTINGS`, `IN_PLACE_SETTINGS`,
@@ -13,6 +13,12 @@
  * `PERSONA_INVITED_KEYS`, `CHANNEL_ENTRY_KEYS`, `PERSONA_TOP_LEVEL_KEYS` in
  * src/config.ts) against the plan, so adding a key to the loader fails here
  * until the plan classifies it.
+ *
+ * The plan classifies a persona change by the candidate's section in force
+ * (b.deo SRI-802): the rows below give each class a change lands in when
+ * both configurations are in one mode, show that a change of the switch
+ * alone, in each direction, modifies no persona, and that `false` written for
+ * an absent switch is no change (SRI-101).
  *
  * The wording of each class's preview line is pinned in
  * tests/reload-preview.test.ts; this file asserts only which class and which
@@ -40,6 +46,7 @@ import {
   PERSONA_TOP_LEVEL_KEYS,
   type PersonaConfig,
   type PersonaConfigInput,
+  type PersonaInput,
 } from '../src/config.ts'
 import {
   buildChangePlan,
@@ -47,6 +54,7 @@ import {
   IN_PLACE_SETTINGS,
   MODE_SWITCH_SETTING,
   NEXT_LAUNCH_SETTINGS,
+  RECORDED_SECTION_KEYS,
   type ServerSettingChange,
   type ValidChangePlan,
 } from '../src/reload-plan.ts'
@@ -61,6 +69,33 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(root, { recursive: true, force: true })
 })
+
+/**
+ * The one persona both configurations hold, with `overrides` on its entry; it
+ * sets no default of its own. It is valid in both channel modes, so a
+ * candidate that changes only `allow_invited_channels` is valid: its channel
+ * fungible destination needs no DMs, and declarative mode does not read it.
+ */
+function input(top: Record<string, unknown> = {}, overrides: Partial<PersonaInput> = {}): PersonaConfigInput {
+  const alpha = makePersona(
+    {
+      name: 'alpha',
+      channels: [{ id: 'C0A0001', delivery: 'all' }],
+      permission_prompts: 'C0A0001',
+      invited: { permission_prompts: 'C0A0001' },
+      ...overrides,
+    },
+    root,
+  )
+  return { personas: [alpha], ...top }
+}
+
+function parse(file: PersonaConfigInput): PersonaConfig {
+  return parsePersonaConfigBytes(JSON.stringify(file), join(root, 'config.json'), root, { home: join(root, 'home') })
+}
+
+/** The one persona, as the plan names it. */
+const ALPHA_REF = { key: 'alpha', name: 'alpha', index: 0 }
 
 /** The loader's top-level keys other than `personas`: the server-wide settings. */
 const SERVER_WIDE_KEYS = PERSONA_TOP_LEVEL_KEYS.filter((key) => key !== 'personas')
@@ -136,29 +171,6 @@ describe('every top-level key the loader accepts is compared', () => {
     expect([...defaults].sort()).toEqual([...NEXT_LAUNCH_SETTINGS].sort())
   })
 
-  /**
-   * The one persona both configurations hold; it sets no default of its own.
-   * It is valid in both channel modes, so a candidate that changes only
-   * `allow_invited_channels` is valid: its channel fungible destination needs
-   * no DMs, and declarative mode does not read it.
-   */
-  function input(top: Record<string, unknown> = {}): PersonaConfigInput {
-    const alpha = makePersona(
-      {
-        name: 'alpha',
-        channels: [{ id: 'C0A0001', delivery: 'all' }],
-        permission_prompts: 'C0A0001',
-        invited: { permission_prompts: 'C0A0001' },
-      },
-      root,
-    )
-    return { personas: [alpha], ...top }
-  }
-
-  function parse(file: PersonaConfigInput): PersonaConfig {
-    return parsePersonaConfigBytes(JSON.stringify(file), join(root, 'config.json'), root, { home: join(root, 'home') })
-  }
-
   function plan(top: Record<string, unknown>): ValidChangePlan {
     const result = buildChangePlan(parse(input()), { kind: 'valid', config: parse(input(top)) }, {
       realPath: (p) => p,
@@ -205,9 +217,6 @@ describe('every top-level key the loader accepts is compared', () => {
     expect(Object.keys(CHANGED_VALUES()).sort()).toEqual([...SERVER_WIDE_KEYS].sort())
   })
 
-  /** The one persona, as the plan names it. */
-  const ALPHA_REF = { key: 'alpha', name: 'alpha', index: 0 }
-
   /**
    * The setting entry a change of only `key` gives: an inherited default
    * names the persona that inherits it; the switch names the mode it turns
@@ -232,5 +241,163 @@ describe('every top-level key the loader accepts is compared', () => {
 
     expect(result.settings).toEqual([expectedSetting(key)])
     expect(result.noEffectiveChange).toBe(false)
+  })
+})
+
+/** The plan of the `after` file-form config against the applied `before` one. */
+function planBetween(before: PersonaConfigInput, after: PersonaConfigInput): ValidChangePlan {
+  const result = buildChangePlan(parse(before), { kind: 'valid', config: parse(after) }, {
+    realPath: (p) => p,
+    home: join(root, 'home'),
+  })
+  if (!result.valid) throw new Error(result.error)
+  return result
+}
+
+/** A plan's classes, by persona key: what each row below compares as a whole. */
+interface Classes {
+  added: string[]
+  removed: string[]
+  destructive: [string, readonly string[]][]
+  inPlace: [string, readonly string[]][]
+  /** Own next-launch settings. */
+  nextLaunch: [string, readonly string[]][]
+  recorded: [string, readonly string[]][]
+  unchanged: string[]
+  settings: ServerSettingChange[]
+  noEffectiveChange: boolean
+}
+
+function classesOf(plan: ValidChangePlan): Classes {
+  return {
+    added: plan.added.map((p) => p.key),
+    removed: plan.removed.map((p) => p.key),
+    destructive: plan.destructive.map((p) => [p.key, p.settings]),
+    inPlace: plan.inPlace.map((p) => [p.key, p.settings]),
+    nextLaunch: plan.nextLaunch.map((p) => [p.key, p.own]),
+    recorded: plan.recorded.map((p) => [p.key, p.fields]),
+    unchanged: plan.unchanged.map((p) => p.key),
+    settings: plan.settings,
+    noEffectiveChange: plan.noEffectiveChange,
+  }
+}
+
+/** Classes with every class empty and an effective change, then `c`. */
+function classes(c: Partial<Classes>): Classes {
+  return {
+    added: [],
+    removed: [],
+    destructive: [],
+    inPlace: [],
+    nextLaunch: [],
+    recorded: [],
+    unchanged: [],
+    settings: [],
+    noEffectiveChange: false,
+    ...c,
+  }
+}
+
+/** The top-level settings of each channel mode: the switch absent, and the switch on. */
+const DECLARATIVE_TOP: Record<string, unknown> = {}
+const FUNGIBLE_TOP: Record<string, unknown> = { [MODE_SWITCH_SETTING]: true }
+
+/** The plan class a row lands in, with the `src/` list that class's settings come from. */
+const PLAN_CLASSES = {
+  destructive: DESTRUCTIVE_SETTINGS,
+  inPlace: IN_PLACE_SETTINGS,
+  nextLaunch: NEXT_LAUNCH_SETTINGS,
+  recorded: RECORDED_SECTION_KEYS,
+} as const satisfies Record<string, readonly string[]>
+type PlanClass = keyof typeof PLAN_CLASSES
+
+describe('a persona change is classified by the section in force when both configurations are in one mode (b.deo SRI-802)', () => {
+  // Rows: the mode both configurations are in, alpha's entry before and
+  // after, and the class and setting the change lands in. The declarative
+  // rows of the 0.11.1 classes are in tests/reload-preview.test.ts; here only
+  // the rows each mode adds or changes.
+  test.each<[string, Record<string, unknown>, Partial<PersonaInput>, Partial<PersonaInput>, PlanClass, string]>([
+    ['declarative: an invited change', DECLARATIVE_TOP, {}, { invited: { permission_prompts: 'C0A0002' } }, 'recorded', 'invited'],
+    [
+      'fungible: an invited.permission_prompts change',
+      FUNGIBLE_TOP,
+      {},
+      { invited: { permission_prompts: 'C0A0002' } },
+      'inPlace',
+      'invited.permission_prompts',
+    ],
+    [
+      'fungible: a channels change',
+      FUNGIBLE_TOP,
+      {},
+      { channels: [{ id: 'C0A0001', delivery: 'all' }, { id: 'C0A0002', delivery: 'all' }] },
+      'recorded',
+      'channels',
+    ],
+    ['fungible: a top-level permission_prompts change', FUNGIBLE_TOP, {}, { permission_prompts: 'C0A0002' }, 'recorded', 'permission_prompts'],
+    [
+      'fungible: a dm.enabled change',
+      FUNGIBLE_TOP,
+      { dm: { enabled: false, contact: 'U0A0001' } },
+      { dm: { enabled: true, contact: 'U0A0001' } },
+      'inPlace',
+      'dm.enabled',
+    ],
+    [
+      'fungible: a dm.contact change',
+      FUNGIBLE_TOP,
+      { dm: { enabled: false, contact: 'U0A0001' } },
+      { dm: { enabled: false, contact: 'U0A0002' } },
+      'inPlace',
+      'dm.contact',
+    ],
+    ['fungible: a working_directory change', FUNGIBLE_TOP, {}, { working_directory: '~/moved-work' }, 'destructive', 'working_directory'],
+    ['fungible: a stop_hook_bootstrap change', FUNGIBLE_TOP, {}, { stop_hook_bootstrap: false }, 'nextLaunch', 'stop_hook_bootstrap'],
+  ])('%s lands in its class', (_label, top, before, after, cls, setting) => {
+    expect(PLAN_CLASSES[cls] as readonly string[]).toContain(setting)
+    expect(channelModeOf(parse(input(top, after)))).toBe(channelModeOf(parse(input(top, before))))
+
+    const result = planBetween(input(top, before), input(top, after))
+
+    // A recorded change modifies no persona: alpha is unchanged and the plan has no effect.
+    const recordedOnly = cls === 'recorded'
+    expect(classesOf(result)).toEqual(
+      classes({
+        [cls]: [['alpha', [setting]]],
+        unchanged: recordedOnly ? ['alpha'] : [],
+        noEffectiveChange: recordedOnly,
+      }),
+    )
+  })
+})
+
+describe('a change of the switch alone modifies no persona, in each direction (b.deo SRI-802, SRI-203)', () => {
+  test.each<[string, Record<string, unknown>, Record<string, unknown>]>([
+    ['absent to true', {}, { [MODE_SWITCH_SETTING]: true }],
+    ['false to true', { [MODE_SWITCH_SETTING]: false }, { [MODE_SWITCH_SETTING]: true }],
+    ['true to absent', { [MODE_SWITCH_SETTING]: true }, {}],
+    ['true to false', { [MODE_SWITCH_SETTING]: true }, { [MODE_SWITCH_SETTING]: false }],
+  ])('the switch from %s is one effective changed setting, the switch with its personas', (_label, from, to) => {
+    const mode = channelModeOf(parse(input(to)))
+    expect(mode).not.toBe(channelModeOf(parse(input(from))))
+
+    const result = planBetween(input(from), input(to))
+
+    // No persona is modified, recorded, destructive, added or removed.
+    expect(classesOf(result)).toEqual(
+      classes({
+        unchanged: ['alpha'],
+        settings: [{ name: MODE_SWITCH_SETTING, mode, personas: [ALPHA_REF] }],
+      }),
+    )
+  })
+})
+
+describe('writing false where the switch was absent is no effective change (b.deo SRI-101)', () => {
+  test.each<[string, Record<string, unknown>, Record<string, unknown>]>([
+    ['absent to false', {}, { [MODE_SWITCH_SETTING]: false }],
+    ['false to absent', { [MODE_SWITCH_SETTING]: false }, {}],
+  ])('the switch from %s changes no setting and no persona', (_label, from, to) => {
+    expect(classesOf(planBetween(input(from), input(to)))).toEqual(classes({ unchanged: ['alpha'], noEffectiveChange: true }))
   })
 })
