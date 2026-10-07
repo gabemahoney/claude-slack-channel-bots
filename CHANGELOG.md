@@ -6,6 +6,10 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+---
+
+## 0.12.0 (2026-10-07)
+
 This release adds a second channel mode, fungible mode, beside the declarative mode of 0.11.x. It is not breaking: a 0.11.x configuration loads unchanged and runs in declarative mode.
 
 ### Two channel modes
