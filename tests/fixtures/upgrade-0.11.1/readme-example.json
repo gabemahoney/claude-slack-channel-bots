@@ -1,0 +1,39 @@
+{
+  "personas": [
+    {
+      "name": "planner",
+      "credentials_file": "~/.config/cscb/planner-credentials.json",
+      "working_directory": "~/projects/alpha",
+      "channels": [
+        { "id": "C0123456789", "delivery": "all" },
+        { "id": "C0555555555", "delivery": "all" }
+      ],
+      "permission_prompts": "C0123456789"
+    },
+    {
+      "name": "reviewer",
+      "credentials_file": "~/.config/cscb/reviewer-credentials.json",
+      "working_directory": "~/projects/beta",
+      "channels": [
+        { "id": "C0555555555", "delivery": "mentions" }
+      ],
+      "dm": { "enabled": true, "contact": "U0123456789" },
+      "permission_prompts": "dm",
+      "claude_config_dir": "~/.claude-reviewer",
+      "stop_hook_bootstrap": false
+    },
+    {
+      "name": "helpdesk",
+      "credentials_file": "~/.config/cscb/helpdesk-credentials.json",
+      "working_directory": "~/projects/helpdesk",
+      "dm": { "enabled": true, "contact": "U0987654321" },
+      "permission_prompts": "dm"
+    }
+  ],
+  "port": 3100,
+  "session_restart_delay": 60,
+  "claude_config_dir": "~/.claude-bots",
+  "ack_reaction": "eyes",
+  "reply_chunk_limit": 3000,
+  "reply_chunk_mode": "newline"
+}

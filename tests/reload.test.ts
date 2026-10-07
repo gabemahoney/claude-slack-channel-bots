@@ -49,6 +49,18 @@
  * sentinel), so they run `assertNoLeak` with the name and its key masked
  * (`withoutName`): the rest, credential values included, is still checked.
  *
+ * The channel modes (b.deo SRI-105, SRI-801, SRI-907): a start without a
+ * record, and the tick, judge a configuration by the mode its own switch
+ * picks, so a candidate that turns fungible mode on or off is INVALID when the
+ * section it puts in force breaks that mode's rules, naming the persona and
+ * the setting, and its confirmation applies nothing; a malformed section the
+ * candidate does not put in force leaves it valid. An edit of the switch, or
+ * of `invited.permission_prompts` in fungible mode, is held as a pending
+ * change over many checks with delivery, the reply tool's posting scope,
+ * `set_channel_delivery`'s answer and the notice destination as they were,
+ * until its confirmation. A pasted value in the switch or in
+ * `invited.permission_prompts` reaches no preview, pending file or log line.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -57,15 +69,19 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, symlinkSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
+import { SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'
 import {
+  channelModeOf,
   DEFAULT_PERSONA_CONFIG_FS,
+  parsePersonaConfigBytes,
   prePersonaConversionMessage,
   prefixRelatedKeysReason,
+  type ChannelMode,
   type Persona,
   type PersonaConfigFs,
   type PersonaInput,
 } from '../src/config.ts'
-import { personaTmuxSessionName } from '../src/persona-identity.ts'
+import { personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
 import type { PersonaBringUpOutcome, PersonaCredentialsChangeResult } from '../src/persona-bringup-controller.ts'
 import { CREDENTIALS_UNREADABLE_MARKER } from '../src/persona-credentials.ts'
 import {
@@ -96,7 +112,9 @@ import {
 } from '../src/reload-apply.ts'
 import { composePendingFile, PENDING_FILE_HEADER, reloadFingerprint } from '../src/reload-fingerprint.ts'
 import { createReloadTickDriver } from '../src/reload-timer.ts'
-import { DESTRUCTIVE_PREFIX, DESTRUCTIVE_RETIRED_CLAUSE, REMOVED_RETIRED_CLAUSE } from '../src/reload-plan.ts'
+import { channelDeliveryDeclarativeRefusal, channelDeliverySetResultText } from '../src/registry.ts'
+import { DESTRUCTIVE_PREFIX, DESTRUCTIVE_RETIRED_CLAUSE, MODE_SWITCH_SETTING, REMOVED_RETIRED_CLAUSE } from '../src/reload-plan.ts'
+import { FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
 import { OLD_LIFE_HOLD_LOG_PREFIX, RETIRED_KEYS_LOG_PREFIX } from '../src/retired-keys.ts'
 import {
   APP_TOKEN_PREFIX,
@@ -124,8 +142,9 @@ import {
   type ReloadRun,
   type ReloadRunActivity,
   type ReloadRunOptions,
+  type ReloadToolResult,
 } from './test-helpers/reload-harness.ts'
-import type { StubSlackOptions } from './test-helpers/slack-stub.ts'
+import { makeChannelMessage, mentionText, type StubSlackOptions } from './test-helpers/slack-stub.ts'
 
 const CONFIG_REFUSAL = '[slack] Fatal: configuration error — '
 const RECORD_REFUSAL = '[slack] Fatal: last-applied record error — '
@@ -619,6 +638,132 @@ describe('a start without a record applies the configuration file or refuses', (
     expect(next.writes).toEqual([])
     expect(h.readRecord()).toEqual(configBytes)
     assertNoLeak(next.captured())
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The channel modes at a start and in the reload tick (b.deo SRI-105, SRI-801,
+// SRI-907): shared helpers
+// ---------------------------------------------------------------------------
+
+/** A public channel no persona lists, and one no persona names as a destination. */
+const UNLISTED_CHANNEL = 'C0RLDUNLIST1'
+/** A fungible destination bravo moves to in a held edit, listed and named by no persona. */
+const MOVED_DESTINATION = 'C0RLDMOVED1'
+
+/** The persona's fungible destination (`invited.permission_prompts`): a channel of its own that no persona lists. */
+function invitedDestination(name: string): string {
+  return `C0INV${h.key(name).toUpperCase().replace(/[^A-Z0-9]/g, '')}`
+}
+
+/** The channel `h.persona(name)` lists for the persona (its own `all` channel and its declarative destination). */
+function ownChannel(name: string): string {
+  return h.persona(name).channels![0]!.id
+}
+
+/** A persona with both sections valid: `h.persona(name)` with its own fungible destination, then `overrides`. */
+function bothSections(name: string, overrides: Partial<PersonaInput> = {}): PersonaInput {
+  return h.persona(name, { invited: { permission_prompts: invitedDestination(name) }, ...overrides })
+}
+
+/** The switch as a start writes it for `mode`: absent in declarative mode, `true` in fungible mode. */
+function startSwitch(mode: ChannelMode): Record<string, unknown> {
+  return mode === 'fungible' ? { [MODE_SWITCH_SETTING]: true } : {}
+}
+
+/** The switch as a candidate writes it to turn `mode` on: `true`, or an explicit `false`. */
+function turnOn(mode: ChannelMode): Record<string, unknown> {
+  return { [MODE_SWITCH_SETTING]: mode === 'fungible' }
+}
+
+const OTHER_MODE: Readonly<Record<ChannelMode, ChannelMode>> = { declarative: 'fungible', fungible: 'declarative' }
+
+/** `personas` under the top-level settings `top`, in file form. */
+function configWith(top: Record<string, unknown>, personas: PersonaInput[]): Record<string, unknown> {
+  return { ...top, personas }
+}
+
+/**
+ * The loader's own error for `file` as the configuration file (b.deo
+ * SRI-105): `parsePersonaConfigBytes` over its bytes, as the start and the
+ * tick parse it. Throws when `file` is valid.
+ */
+function loaderErrorFor(file: unknown): string {
+  try {
+    parsePersonaConfigBytes(JSON.stringify(file), h.paths.config, h.dir, { home: h.home })
+  } catch (err) {
+    return (err as Error).message
+  }
+  throw new Error('loaderErrorFor: the configuration is valid')
+}
+
+/** Assert `error` names bravo (`personas[1]` and its `renderPersonaRef`) and `setting`, as every SRI-104 rejection does. */
+function expectNamesBravoAnd(error: string, setting: string): void {
+  expect(error).toContain(`personas[1] ${renderPersonaRef('bravo', h.key('bravo'))}: `)
+  expect(error).toContain(setting)
+}
+
+/**
+ * A running server in `mode`: `personas` materialized and written, under the
+ * switch for `mode`, as both the record and the configuration file
+ * (byte-equal), detection started and the first check run (nothing pending).
+ */
+async function runningIn(
+  mode: ChannelMode,
+  personas: PersonaInput[],
+  opts?: ReloadRunOptions,
+): Promise<{ run: ReloadRun; recordBytes: Buffer }> {
+  h.materialize(...personas)
+  const recordBytes = h.writeRecord(configWith(startSwitch(mode), personas))
+  h.writeConfig(configWith(startSwitch(mode), personas))
+  const run = await h.startDetecting(opts)
+  await run.ticks.tick()
+  expect(h.pendingExists()).toBe(false)
+  expect(channelModeOf(run.serverConfig())).toBe(mode)
+  return { run, recordBytes }
+}
+
+describe('b.deo SRI-105: a start without a record judges the configuration file by the mode its own switch picks', () => {
+  test("a configuration file whose switch is on and whose bravo breaks SRI-104 (no invited, so a dm destination by default, with DMs off) refuses the start, naming bravo and invited.permission_prompts", async () => {
+    // bravo's declarative section is valid: only the fungible rules reject it.
+    const personas = [bothSections('alpha'), h.persona('bravo')]
+    h.materialize(...personas)
+    const file = configWith({ [MODE_SWITCH_SETTING]: true }, personas)
+    const configBytes = h.writeConfig(file)
+    const error = loaderErrorFor(file)
+    expectNamesBravoAnd(error, FUNGIBLE_DESTINATION_SETTING)
+
+    const run = await h.start()
+
+    expectNothingApplied(run)
+    expect(run.outcome.kind === 'refused' && run.outcome.source).toBe('config')
+    expect(run.logs).toEqual([`${CONFIG_REFUSAL}${error}`])
+    expect(run.writes).toEqual([])
+    expect(h.readRecord()).toBeUndefined()
+    expect(h.readConfig()).toEqual(configBytes)
+    assertNoLeak(run.captured())
+  })
+
+  test.each<{ label: string; mode: ChannelMode; bravo: () => PersonaInput }>([
+    { label: 'the switch absent, with the same bravo (its invited never read)', mode: 'declarative', bravo: () => h.persona('bravo') },
+    {
+      label: 'the switch on, with bravo’s channels malformed (never read in fungible mode) and a valid invited',
+      mode: 'fungible',
+      bravo: () => bothSections('bravo', { channels: 'not an array' as unknown as PersonaInput['channels'] }),
+    },
+  ])('a configuration file with $label starts in the mode its switch picks', async ({ mode, bravo }) => {
+    const personas = [bothSections('alpha'), bravo()]
+    h.materialize(...personas)
+    const configBytes = h.writeConfig(configWith(startSwitch(mode), personas))
+
+    const run = await h.start()
+
+    expect(run.outcome.kind === 'applied' && run.outcome.source).toBe('config')
+    expect(h.readRecord()).toEqual(configBytes)
+    expect(channelModeOf(run.serverConfig())).toBe(mode)
+    expect(broughtUp(run)).toEqual(keysOf('alpha', 'bravo'))
+    expect(run.logs.filter((l) => l.startsWith(CONFIG_REFUSAL))).toEqual([])
+    assertNoLeak(run.captured())
   })
 })
 
@@ -1528,6 +1673,334 @@ describe('detection keeps the pending file in step with the config file and appl
     expect(new Set(fingerprints).size).toBe(fingerprints.length)
     expect(run.since(cp).lifecycle).toEqual([])
     expectNoPostNoLeak(run)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Detection: the channel modes (b.deo SRI-105, SRI-801, SRI-907)
+// ---------------------------------------------------------------------------
+
+/**
+ * A candidate the tick must judge INVALID with the loader's `error`: written
+ * over the running server, it is held over many checks as the INVALID
+ * preview with one `reload-invalid` line; its confirmation applies nothing
+ * (no lifecycle operation, the last-applied record byte for byte as it was,
+ * the applied configuration the same object, `onApplied` never told, the mode
+ * in effect still `mode`) and logs one `reload-invalid` line. Every capture is
+ * leak-checked while the pending file exists, and again after the
+ * confirmation.
+ */
+async function expectHeldInvalidAppliesNothing(
+  run: ReloadRun,
+  recordBytes: Buffer,
+  candidate: unknown,
+  error: string,
+  mode: ChannelMode,
+): Promise<void> {
+  const applied = run.controller.applied()
+  const cp = run.checkpoint()
+
+  h.writeConfig(candidate)
+  await run.ticks.ticks(20)
+
+  // Checked first, while the pending file exists: captured() holds it as a written file.
+  assertNoLeak(run.captured())
+  expect(h.pendingLines()).toEqual(invalidPreview(error))
+  expect(run.since(cp)).toEqual(pendingWritten([invalidLogged(error)]))
+  expect(run.logsOf(RELOAD_PREVIEW)).toEqual([])
+
+  const confirmed = run.checkpoint()
+  h.confirm()
+  await run.ticks.tick()
+
+  expect(run.since(confirmed)).toEqual({
+    ...NO_RUN_ACTIVITY,
+    logs: [confirmedInvalidLogged(error)],
+    writes: [{ path: h.paths.pending, ok: true }],
+    removes: [applyRemoved()],
+  })
+  expect(h.readRecord()).toEqual(recordBytes)
+  expect(run.controller.applied()).toBe(applied)
+  expect(run.appliedConfigs).toEqual([])
+  expect(channelModeOf(run.serverConfig())).toBe(mode)
+  expect(h.pendingLines()).toEqual(invalidPreview(error))
+  // The rewritten pending file is checked while it exists.
+  expectNoPostNoLeak(run)
+
+  const later = run.checkpoint()
+  await run.ticks.ticks(5)
+  expect(run.since(later)).toEqual(NO_RUN_ACTIVITY)
+}
+
+/** One SRI-105 row: the running mode, alpha and bravo as started, bravo as the candidate writes it, and the setting the error names. */
+interface ModeTurnRow {
+  label: string
+  from: ChannelMode
+  start: () => PersonaInput[]
+  bravo: (bravo: PersonaInput) => PersonaInput
+  /** The candidate's top-level settings; by default the switch written to turn the other mode on. */
+  top?: Record<string, unknown>
+  setting: string
+}
+
+describe('b.deo SRI-105: the reload tick judges a candidate by the mode its own switch turns on', () => {
+  test.each<ModeTurnRow>([
+    {
+      label: 'turns fungible mode on, the switch the only edit, while bravo has no invited (a dm destination by default) and DMs off',
+      from: 'declarative',
+      start: () => [bothSections('alpha'), h.persona('bravo')],
+      bravo: (bravo) => bravo,
+      setting: FUNGIBLE_DESTINATION_SETTING,
+    },
+    {
+      label: 'turns fungible mode on and sets bravo’s invited.permission_prompts to "dm" with DMs off',
+      from: 'declarative',
+      start: () => [bothSections('alpha'), bothSections('bravo')],
+      bravo: (bravo) => ({ ...bravo, invited: { permission_prompts: 'dm' } }),
+      setting: FUNGIBLE_DESTINATION_SETTING,
+    },
+    {
+      label: 'turns fungible mode off by removing the switch, the only edit, while bravo’s permission_prompts names a channel it does not list',
+      from: 'fungible',
+      start: () => [bothSections('alpha'), bothSections('bravo', { permission_prompts: UNLISTED_CHANNEL })],
+      bravo: (bravo) => bravo,
+      top: {},
+      setting: 'permission_prompts',
+    },
+    {
+      label: 'turns fungible mode off with false and gives bravo’s channel an unknown delivery mode',
+      from: 'fungible',
+      start: () => [bothSections('alpha'), bothSections('bravo')],
+      bravo: (bravo) => ({ ...bravo, channels: [{ id: ownChannel('bravo'), delivery: 'sometimes' as 'all' }] }),
+      setting: 'channels[0].delivery',
+    },
+  ])('a candidate that $label previews INVALID naming bravo and the setting, and its confirmation applies nothing', async ({ from, start, bravo, top, setting }) => {
+    const personas = start()
+    const { run, recordBytes } = await runningIn(from, personas)
+    const candidate = configWith(top ?? turnOn(OTHER_MODE[from]), [personas[0]!, bravo(personas[1]!)])
+    const error = loaderErrorFor(candidate)
+    expectNamesBravoAnd(error, setting)
+
+    await expectHeldInvalidAppliesNothing(run, recordBytes, candidate, error, from)
+  })
+
+  test.each<{ label: string; from: ChannelMode; bravo: (bravo: PersonaInput) => PersonaInput }>([
+    {
+      label: 'turning fungible mode on with bravo’s channels malformed',
+      from: 'declarative',
+      bravo: (bravo) => ({ ...bravo, channels: 'not an array' as unknown as PersonaInput['channels'] }),
+    },
+    {
+      label: 'turning fungible mode off with bravo’s invited malformed',
+      from: 'fungible',
+      bravo: (bravo) => ({ ...bravo, invited: 'not an object' as unknown as PersonaInput['invited'] }),
+    },
+  ])('control: $label (the section the candidate does not put in force) is a valid candidate, and its confirmation turns the mode on', async ({ from, bravo }) => {
+    const personas = [bothSections('alpha'), bothSections('bravo')]
+    const { run } = await runningIn(from, personas)
+    const to = OTHER_MODE[from]
+    const cp = run.checkpoint()
+
+    h.writeConfig(configWith(turnOn(to), [personas[0]!, bravo(personas[1]!)]))
+    await run.ticks.ticks(10)
+
+    expect(run.invalidLines()).toEqual([])
+    expect(h.pendingHeader()).toBe(previewHeader({ settings: 1 }))
+    expect(run.since(cp)).toEqual(pendingWritten())
+    expectNoPostNoLeak(run)
+
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ settings: 1 })])
+    expect(run.invalidLines()).toEqual([])
+    expect(channelModeOf(run.serverConfig())).toBe(to)
+    expect(h.readRecord()).toEqual(h.readConfig())
+    expectNoPostNoLeak(run)
+  })
+})
+
+/** What the routing delivered to bravo for one event, as `{chat_id, via}` (`[]`: not delivered). */
+type Delivered = Array<{ chat_id: string; via: string | undefined }>
+
+/**
+ * What bravo's consumers do now (b.deo SRI-801), probed in this order: the
+ * mode in effect; a mention in the unlisted channel (in fungible mode this
+ * also puts the channel in bravo's heard set); `set_channel_delivery` of
+ * `all` for that channel; a plain message there; a plain message in bravo's
+ * listed channel; the reply tool's posting scope for the unlisted channel
+ * (its refusal, or undefined when it posted); and where a notice posts.
+ */
+interface ConsumersNow {
+  mode: ChannelMode
+  mentionUnlisted: Delivered
+  setChannelDelivery: ReloadToolResult
+  plainUnlisted: Delivered
+  plainOwn: Delivered
+  replyRefusal: string | undefined
+  notice: string[]
+}
+
+/** Probe bravo's consumers (see `ConsumersNow`). Needs bravo's registered session. */
+async function consumersNow(run: ReloadRun): Promise<ConsumersNow> {
+  const deliver = async (event: ReturnType<typeof makeChannelMessage>): Promise<Delivered> => {
+    const from = run.deliveries('bravo').length
+    await run.deliver('bravo', event)
+    return run.deliveries('bravo').slice(from).map(({ chat_id, via }) => ({ chat_id, via }))
+  }
+  const mention = `${mentionText(run.stub('bravo').identity.botUserId)} a probe`
+  const mentionUnlisted = await deliver(makeChannelMessage({ channel: UNLISTED_CHANNEL, text: mention }))
+  const setChannelDelivery = await run.callTool('bravo', SET_CHANNEL_DELIVERY_TOOL, { channel: UNLISTED_CHANNEL, delivery: 'all' })
+  const plainUnlisted = await deliver(makeChannelMessage({ channel: UNLISTED_CHANNEL, text: 'a probe' }))
+  const plainOwn = await deliver(makeChannelMessage({ channel: ownChannel('bravo'), text: 'a probe' }))
+  const reply = await run.callTool('bravo', 'reply', { chat_id: UNLISTED_CHANNEL, text: 'a probe reply' })
+  const from = run.stub('bravo').callLog.length
+  await run.notice('bravo', 'a probe notice')
+  const notice = run.stub('bravo').callLog.slice(from).map((c) => `${c.method} ${(c.args as { channel?: string }).channel ?? ''}`)
+  return {
+    mode: channelModeOf(run.serverConfig()),
+    mentionUnlisted,
+    setChannelDelivery,
+    plainUnlisted,
+    plainOwn,
+    replyRefusal: reply.isError ? reply.text : undefined,
+    notice,
+  }
+}
+
+/** bravo's consumers in declarative mode: its listed channel only, the declarative refusal, the posting-scope refusal and its own channel as destination. */
+function declarativeConsumers(): ConsumersNow {
+  const own = ownChannel('bravo')
+  return {
+    mode: 'declarative',
+    mentionUnlisted: [],
+    setChannelDelivery: { isError: true, text: channelDeliveryDeclarativeRefusal('bravo', h.key('bravo')) },
+    plainUnlisted: [],
+    plainOwn: [{ chat_id: own, via: 'receive_all' }],
+    replyRefusal: expect.stringContaining(JSON.stringify(UNLISTED_CHANNEL)),
+    notice: [`chat.postMessage ${own}`],
+  }
+}
+
+/**
+ * bravo's consumers in fungible mode: the unlisted channel served (at the
+ * stored `all` unless the loop guard holds it at `mentions`), its listed
+ * channel at `mentions`, any channel ID postable, and `destination` (its own
+ * fungible destination by default) for notices.
+ */
+function fungibleConsumers({ destination = invitedDestination('bravo'), heldByLoopGuard = false } = {}): ConsumersNow {
+  const delivery = heldByLoopGuard ? 'mentions' : 'all'
+  return {
+    mode: 'fungible',
+    mentionUnlisted: [{ chat_id: UNLISTED_CHANNEL, via: 'mention' }],
+    setChannelDelivery: { isError: false, text: channelDeliverySetResultText(UNLISTED_CHANNEL, 'all', { delivery, heldByLoopGuard }) },
+    plainUnlisted: heldByLoopGuard ? [] : [{ chat_id: UNLISTED_CHANNEL, via: 'receive_all' }],
+    plainOwn: [],
+    replyRefusal: undefined,
+    notice: [`chat.postMessage ${destination}`],
+  }
+}
+
+describe('b.deo SRI-801: an edit of the switch or of invited is held until confirmation (b.av2 SR-8.3 to SR-8.5)', () => {
+  /**
+   * Each row's `changed`: the one consumer field its edit changes once
+   * confirmed (the mode, the notice destination, or the loop guard's result
+   * for `set_channel_delivery`). The whole consumer state after a switch
+   * change or an in-place `invited` change is pinned in
+   * `tests/reload-apply.test.ts` (b.deo SRI-203, SRI-703, SRI-805).
+   */
+  test.each<{ label: string; from: ChannelMode; candidate: (alpha: PersonaInput, bravo: PersonaInput) => Record<string, unknown>; changed: () => Partial<ConsumersNow> }>([
+    {
+      label: 'the switch turned on',
+      from: 'declarative',
+      candidate: (alpha, bravo) => configWith(turnOn('fungible'), [alpha, bravo]),
+      changed: () => ({ mode: 'fungible' }),
+    },
+    {
+      label: 'the switch turned off',
+      from: 'fungible',
+      candidate: (alpha, bravo) => configWith(turnOn('declarative'), [alpha, bravo]),
+      changed: () => ({ mode: 'declarative' }),
+    },
+    {
+      label: 'bravo’s invited.permission_prompts moved in fungible mode',
+      from: 'fungible',
+      candidate: (alpha, bravo) => configWith(startSwitch('fungible'), [alpha, { ...bravo, invited: { permission_prompts: MOVED_DESTINATION } }]),
+      changed: () => ({ notice: fungibleConsumers({ destination: MOVED_DESTINATION }).notice }),
+    },
+    {
+      label: 'alpha’s invited.permission_prompts moved onto the unlisted channel bravo serves at all, in fungible mode',
+      from: 'fungible',
+      candidate: (alpha, bravo) => configWith(startSwitch('fungible'), [{ ...alpha, invited: { permission_prompts: UNLISTED_CHANNEL } }, bravo]),
+      changed: () => ({ setChannelDelivery: fungibleConsumers({ heldByLoopGuard: true }).setChannelDelivery }),
+    },
+  ])('$label: over many checks the pending file and preview are written, and delivery, posting scope, set_channel_delivery and the notice destination stay as they were until the confirmation', async ({ from, candidate, changed }) => {
+    const personas = [bothSections('alpha'), bothSections('bravo')]
+    const { run, recordBytes } = await runningIn(from, personas, { realLifecycle: true })
+    run.registerSession('alpha')
+    run.registerSession('bravo')
+    const before = await consumersNow(run)
+    expect(before).toEqual(from === 'fungible' ? fungibleConsumers() : declarativeConsumers())
+    const cp = run.checkpoint()
+
+    h.writeConfig(candidate(personas[0]!, personas[1]!))
+    await run.ticks.ticks(25)
+
+    // One pending-file write and one preview emission; no lifecycle operation, no Slack client and no Slack call.
+    expect(run.since(cp)).toEqual(pendingWritten())
+    expect(h.pendingExists()).toBe(true)
+    expect(run.invalidLines()).toEqual([])
+    const held = [await consumersNow(run)]
+    const later = run.checkpoint()
+    await run.ticks.ticks(25)
+    expect(run.since(later)).toEqual(NO_RUN_ACTIVITY)
+    held.push(await consumersNow(run))
+
+    expect(held).toEqual([before, before])
+    expect(h.readRecord()).toEqual(recordBytes)
+    expect(run.appliedConfigs).toEqual([])
+    expect(run.previewEmissionCount()).toBe(1)
+    assertNoLeak(run.captured({ before, held }))
+
+    // The confirmation applies it: the same probes now follow the edit.
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    expect(h.readRecord()).toEqual(h.readConfig())
+    const after = await consumersNow(run)
+    expect(after).not.toEqual(before)
+    expect(before).not.toMatchObject(changed())
+    expect(after).toMatchObject(changed())
+    assertNoLeak(run.captured({ after }))
+  })
+})
+
+describe('b.deo SRI-907: a pasted value in the switch or in invited.permission_prompts reaches no preview, pending file or log line', () => {
+  test.each<{ label: string; from: ChannelMode; candidate: (alpha: PersonaInput, bravo: PersonaInput) => Record<string, unknown>; setting: string; bravoNamed: boolean }>([
+    {
+      label: 'the switch as a string',
+      from: 'declarative',
+      candidate: (alpha, bravo) => configWith({ [MODE_SWITCH_SETTING]: LEAK_SENTINEL }, [alpha, bravo]),
+      setting: MODE_SWITCH_SETTING,
+      bravoNamed: false,
+    },
+    {
+      label: 'bravo’s invited.permission_prompts in fungible mode',
+      from: 'fungible',
+      candidate: (alpha, bravo) => configWith(startSwitch('fungible'), [alpha, { ...bravo, invited: { permission_prompts: LEAK_SENTINEL } }]),
+      setting: FUNGIBLE_DESTINATION_SETTING,
+      bravoNamed: true,
+    },
+  ])('$label holding the sentinel is an INVALID candidate naming the setting only, and its confirmation applies nothing', async ({ from, candidate, setting, bravoNamed }) => {
+    const personas = [bothSections('alpha'), bothSections('bravo')]
+    const { run, recordBytes } = await runningIn(from, personas)
+    const file = candidate(personas[0]!, personas[1]!)
+    const error = loaderErrorFor(file)
+    expect(error).toContain(setting)
+    if (bravoNamed) expectNamesBravoAnd(error, setting)
+
+    await expectHeldInvalidAppliesNothing(run, recordBytes, file, error, from)
   })
 })
 

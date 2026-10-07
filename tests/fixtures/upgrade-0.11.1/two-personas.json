@@ -1,0 +1,30 @@
+{
+  "personas": [
+    {
+      "name": "alpha",
+      "credentials_file": "~/.config/cscb/alpha-credentials.json",
+      "working_directory": "~/projects/alpha",
+      "channels": [
+        { "id": "C0ALPHA0001", "delivery": "all" },
+        { "id": "C0ALPHA0002", "delivery": "mentions" }
+      ],
+      "dm": { "enabled": false },
+      "permission_prompts": "C0ALPHA0001"
+    },
+    {
+      "name": "bravo",
+      "credentials_file": "~/.config/cscb/bravo-credentials.json",
+      "working_directory": "~/projects/bravo",
+      "channels": [
+        { "id": "C0BRAVO0001", "delivery": "mentions" }
+      ],
+      "dm": { "enabled": true, "contact": "U0BRAVO0001" },
+      "permission_prompts": "dm"
+    }
+  ],
+  "bind": "127.0.0.1",
+  "port": 3129,
+  "health_check_interval": 0,
+  "exit_timeout": 5,
+  "mcp_config_path": "~/.config/cscb/mcp.json"
+}
