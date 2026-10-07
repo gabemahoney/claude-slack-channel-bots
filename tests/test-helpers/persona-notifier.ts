@@ -63,7 +63,10 @@
  * `makeNotifierStack(deps)` is the wiring on its own: a destination resolver,
  * the destination hold over it on a fake clock, and the notifier handing
  * notices to that hold, all over the caller's persona and client lookups and
- * one log, as `src/server.ts` builds them. The harness above and the routing
+ * one log, as `src/server.ts` builds them. With `getPersonaConfig`, the
+ * resolver reads the configuration in effect from it at each attempt, so the
+ * one destination rule follows the channel mode (b.deo SRI-201, SRI-701);
+ * without it, declarative mode's destination. The harness above and the routing
  * helpers (tests/test-helpers/persona-routing-harness.ts,
  * tests/test-helpers/persona-routing-managed.ts) build their notifier with it.
  *
@@ -83,7 +86,7 @@ import type { WebClient } from '@slack/web-api'
 
 import type { Persona, PersonaConfig } from '../../src/config.ts'
 import { createPersonaDestinationHold, type PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
-import { createPersonaDestinations, type PersonaDestinations } from '../../src/persona-destination.ts'
+import { createPersonaDestinations, type DestinationConfig, type PersonaDestinations } from '../../src/persona-destination.ts'
 import { renderPersonaRef } from '../../src/persona-identity.ts'
 import {
   PERSONA_TEARDOWN_NOTICE_LABEL,
@@ -121,6 +124,11 @@ export interface NotifierStackDeps {
   getPersona(key: string): Persona | undefined
   /** The persona's Web API client, or undefined when it has none (not validated yet). */
   clientFor(key: string): WebClient | undefined
+  /**
+   * The configuration in effect, handed to the destination resolver and read
+   * at each attempt (b.deo SRI-201). Default: none, so declarative mode.
+   */
+  getPersonaConfig?(): DestinationConfig
   /** The destination hold's clock and timers. Default: a new `createFakeClock()`. */
   clock?: FakeClock
   /** Dry-run flag, read at call time. Default: never dry run. */
@@ -149,7 +157,7 @@ export interface NotifierStack {
 export function makeNotifierStack(deps: NotifierStackDeps): NotifierStack {
   const { getPersona, clientFor, log } = deps
   const clock = deps.clock ?? createFakeClock()
-  const destinations = createPersonaDestinations({ log })
+  const destinations = createPersonaDestinations({ log, getPersonaConfig: () => deps.getPersonaConfig?.() })
   const hold = createPersonaDestinationHold({ destinations, getPersona, clientFor, clock, log })
   const notifier = createPersonaNotifier({
     getPersona,

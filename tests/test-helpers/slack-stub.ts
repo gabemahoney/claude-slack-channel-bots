@@ -1,5 +1,6 @@
 /**
- * test-helpers/slack-stub.ts — Shared Slack stub (b.av2 SR-13.4).
+ * test-helpers/slack-stub.ts — Shared Slack stub (b.av2 SR-13.4, b.deo
+ * SRI-1203).
  *
  * `makeStubSlack(opts)` returns one independent fake Slack for one persona:
  * - Web API stubs (`web`, `createWebClient`) with capture arrays for
@@ -11,7 +12,12 @@
  *   `hasToken`, so printing or comparing a client never shows it;
  * - Socket Mode stubs (`createSocketClient`, `socket`, `sockets`) that register
  *   handlers, deliver events in the `{ event, body, ack }` shape `server.ts`
- *   consumes, record acks, drop on demand and can be started again;
+ *   consumes, record acks, drop on demand and can be started again. The
+ *   envelope (`body`, the Events API payload) carries
+ *   `is_ext_shared_channel: false`, as Slack's does; `deliver`'s envelope
+ *   overrides set it to `true` or a non-boolean, or remove it
+ *   (`ENVELOPE_FLAG_FORMS`), and the per-type and `slack_event` emissions
+ *   carry the same envelope (b.deo SRI-301, SRI-1203);
  * - per-call scripted outcomes for `auth.test`, socket `start()`,
  *   `chat.postMessage`, `chat.update`, `filesUploadV2`, `conversations.history`,
  *   `conversations.replies`, `conversations.info`, `conversations.open`,
@@ -522,10 +528,14 @@ export interface StubSocketClient {
   drop(): void
   /**
    * Deliver an Events API event to the listeners for `event.type` (and
-   * `slack_event`). Resolves once every listener's returned promise settles;
-   * rejects if one rejects, or if the socket is not connected.
+   * `slack_event`), both given the same envelope (`body`). The envelope
+   * carries `is_ext_shared_channel: false` unless `envelope` overrides it:
+   * the overrides are merged over the default envelope, and a key set to
+   * `undefined` is removed, as for `EventOverrides` (b.deo SRI-1203). Resolves
+   * once every listener's returned promise settles; rejects if one rejects,
+   * or if the socket is not connected.
    */
-  deliver(event: SlackEvent): Promise<void>
+  deliver(event: SlackEvent, envelope?: EnvelopeOverrides): Promise<void>
   /** Deliver an `interactive` payload (e.g. a Block Kit click), as `deliver` does. */
   deliverInteractive(payload: Record<string, unknown>): Promise<void>
 }
@@ -1212,18 +1222,22 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
         closeSocket()
       },
 
-      async deliver(event) {
+      async deliver(event, envelope = {}) {
         requireConnected('deliver()')
         const envelopeId = `stub-envelope-${++envelopeSeq}`
         const ack = makeAck(envelopeId)
-        const body = {
-          type: 'event_callback',
-          team_id: identity.teamId,
-          api_app_id: 'A0STUB0001',
-          event,
-          event_id: `Ev0STUB${envelopeSeq}`,
-          event_time: 1700000000,
-        }
+        const body: Record<string, unknown> = mergeDroppingUndefined(
+          {
+            type: 'event_callback',
+            team_id: identity.teamId,
+            api_app_id: 'A0STUB0001',
+            event,
+            event_id: `Ev0STUB${envelopeSeq}`,
+            event_time: 1700000000,
+            [ENVELOPE_FLAG_FIELD]: false,
+          },
+          envelope,
+        )
         const args: StubSocketEventArgs = {
           ack,
           envelope_id: envelopeId,
@@ -1546,8 +1560,50 @@ export type SlackEvent = { type: string } & Record<string, unknown>
 /** Overrides for an event factory; a key set to `undefined` is removed. */
 export type EventOverrides = Readonly<Record<string, unknown>>
 
-/** Default IDs the factories use. Channel IDs start `C`, DM IDs `D`. */
+/**
+ * Overrides for the envelope (`body`) a socket stub's `deliver` sends, merged
+ * over its default; a key set to `undefined` is removed.
+ */
+export type EnvelopeOverrides = Readonly<Record<string, unknown>>
+
+/** The envelope field that marks an event from an externally shared channel. */
+const ENVELOPE_FLAG_FIELD = 'is_ext_shared_channel'
+
+/** A form of the envelope's `is_ext_shared_channel` flag. */
+export type EnvelopeFlagForm = 'false' | 'true' | 'absent' | 'non-boolean'
+
+/**
+ * The four forms of the envelope's `is_ext_shared_channel` flag (b.deo
+ * SRI-301, SRI-303, SRI-1203), as envelope overrides for `deliver` (and the
+ * harnesses' feeds that take them): `false`, the default, as Slack sends it
+ * for a channel that is not externally shared; `true`; `absent`, the field
+ * removed; `non-boolean`, the string `'false'`. The flag value a form gives
+ * is `envelopeFlagOf(ENVELOPE_FLAG_FORMS[form])`. The flag is never put on
+ * the event.
+ */
+export const ENVELOPE_FLAG_FORMS: Readonly<Record<EnvelopeFlagForm, EnvelopeOverrides>> = {
+  false: { [ENVELOPE_FLAG_FIELD]: false },
+  true: { [ENVELOPE_FLAG_FIELD]: true },
+  absent: { [ENVELOPE_FLAG_FIELD]: undefined },
+  'non-boolean': { [ENVELOPE_FLAG_FIELD]: 'false' },
+}
+
+/**
+ * The `is_ext_shared_channel` value an envelope sent with `envelope`
+ * overrides carries: `false` unless the overrides set it, undefined when they
+ * remove it.
+ */
+export function envelopeFlagOf(envelope: EnvelopeOverrides = {}): unknown {
+  return ENVELOPE_FLAG_FIELD in envelope ? envelope[ENVELOPE_FLAG_FIELD] : false
+}
+
+/**
+ * Default IDs the factories use. Public channel IDs start `C`, private
+ * channel and group-DM IDs `G`, DM IDs `D`.
+ */
 const DEFAULT_CHANNEL = 'C0STUB0001'
+const DEFAULT_PRIVATE_CHANNEL = 'G0STUB0001'
+const DEFAULT_GROUP_DM = 'G0STUBMPIM'
 const DEFAULT_DM = 'D0STUB0001'
 const DEFAULT_USER = 'U0STUBUSR1'
 const DEFAULT_TEAM = 'T0STUB0001'
@@ -1596,6 +1652,27 @@ export function userGroupMentionText(groupId: string = DEFAULT_USER_GROUP, label
 export function makeChannelMessage(overrides: EventOverrides = {}): SlackEvent {
   return makeEvent(
     { type: 'message', channel: DEFAULT_CHANNEL, channel_type: 'channel', user: DEFAULT_USER, team: DEFAULT_TEAM, text: 'hello from a channel' },
+    overrides,
+  )
+}
+
+/** A human's message in a private channel (`G…` channel, `channel_type` `group`; b.deo SRI-1203). */
+export function makePrivateChannelMessage(overrides: EventOverrides = {}): SlackEvent {
+  return makeEvent(
+    { type: 'message', channel: DEFAULT_PRIVATE_CHANNEL, channel_type: 'group', user: DEFAULT_USER, team: DEFAULT_TEAM, text: 'hello from a private channel' },
+    overrides,
+  )
+}
+
+/**
+ * A human's message in a group DM (`G…` channel, `channel_type` `mpim`; b.deo
+ * SRI-1203), a different ID from `makePrivateChannelMessage`'s. A group-DM
+ * `app_mention` is `makeAppMention` with a `G…` channel (it carries no
+ * `channel_type`).
+ */
+export function makeGroupDmMessage(overrides: EventOverrides = {}): SlackEvent {
+  return makeEvent(
+    { type: 'message', channel: DEFAULT_GROUP_DM, channel_type: 'mpim', user: DEFAULT_USER, team: DEFAULT_TEAM, text: 'hello from a group DM' },
     overrides,
   )
 }

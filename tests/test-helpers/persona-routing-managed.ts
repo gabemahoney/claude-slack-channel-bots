@@ -62,7 +62,9 @@ export function makeManagedRouting(h: ConnectionHarness, baseDir: string, opts: 
   }
   const logs: string[] = []
   const log = (line: string): void => void logs.push(line)
-  const { notifier } = makeNotifierStack({ getPersona: h.getPersona, clientFor: h.clientFor, log })
+  // The notifier reads the same configuration as the routing, so a notice
+  // goes to the destination of the channel mode in force (b.deo SRI-701).
+  const { notifier } = makeNotifierStack({ getPersona: h.getPersona, clientFor: h.clientFor, getPersonaConfig: () => h.config, log })
   const routing = createPersonaRouting({
     getPersonaConfig: () => h.config,
     getBotIdentity: (key) => h.identityFor(key),

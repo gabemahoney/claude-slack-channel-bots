@@ -755,6 +755,42 @@ running are not affected. See
   arrives without `channel_type`, so it logs `unclaimed-channel` instead (see
   [`unclaimed-channel`](#unclaimed-channel)).
 
+### `persona-invited-channel`
+
+- **State:** the persona is `up`; this is an audit line, not a failure.
+- **Line:** `[slack] persona-invited-channel: personas[<i>] "<name>" (key=<key>): hears <public|private> channel <id> in fungible mode, at channel delivery <mentions|all>`
+- **Meaning:** The persona hears that channel in fungible mode. The line:
+  - is logged only in fungible mode (`allow_invited_channels` is `true`),
+    never in declarative mode;
+  - is logged once per persona life and channel, on the first event from
+    that channel that takes the persona's fungible path (a `message` event
+    in a public or private channel that isn't externally shared), whether
+    the message is delivered or not, and in addition to any drop line for
+    that event. A message that doesn't mention the persona, or one lost
+    because the persona has no live session, logs it too;
+  - is logged by each persona for each channel: two personas in one channel
+    log a line each, and one persona logs a line per channel;
+  - is logged again for a persona torn down and brought back, and afresh
+    after every server start. A confirmed change to `allow_invited_channels`
+    doesn't reset it;
+  - goes only to `server.log`, and carries no message text, user ID or
+    token.
+
+  The delivery shown is the one in force at that first event; a later
+  change to it logs no second line.
+- **Cause:** The persona's Slack app is a member of that public or private
+  channel, the channel isn't externally shared, and `allow_invited_channels`
+  is `true`. The invite alone is enough: Slack sends the app events only from
+  channels it is in, so nothing about membership is stored and no Slack call
+  checks it.
+- **Fix:** None when the persona is expected to hear the channel. To stop the
+  persona hearing it, remove its app from the channel in Slack. The delivery
+  shown is `mentions`, whatever the persona chose for the channel, when the
+  channel is another persona's fungible destination (its
+  `invited.permission_prompts` channel), so two personas can't answer each
+  other in a loop. It is `mentions` too when the persona has no stored
+  choice for the channel, or the stored choices can't be read.
+
 ### `persona-destination-failed`
 
 - **State:** the persona stays `up`; this is about its permission prompts,

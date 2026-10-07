@@ -1,10 +1,40 @@
 /**
  * test-helpers/persona-routing-harness.ts — The real inbound routing module
  * over stub Slack clients, the real registry and the real restart state
- * (b.av2 SR-4.1, SR-4.2 as decided by src/delivery-decision.ts, SR-13.4).
+ * (b.av2 SR-4.1 with b.deo SRI-301 and SRI-302, SR-4.2 with b.deo SRI-303
+ * to SRI-309 as decided by src/delivery-decision.ts, SR-13.4 with b.deo
+ * SRI-1203).
  *
  * `makeRoutingHarness(specs, baseDir, opts?)` builds the real
  * `createPersonaRouting` from src/persona-routing.ts over:
+ * - the applied config (`h.config`), built by `makeMultiPersonaConfig` and
+ *   read by the routing at call time, in the channel mode the `mode` option
+ *   picks through its `allow_invited_channels` switch (b.deo SRI-101,
+ *   SRI-201): declarative with no `invited` section when absent, as in
+ *   0.11.1. `fungibleDestinations` sets, by persona name, the persona's
+ *   `invited.permission_prompts`, so the decision's fungible destinations
+ *   (b.deo SRI-305) and the notifier's destination (SRI-701) come from the
+ *   one configuration. `h.setMode(mode)` replaces `h.config` with the same
+ *   personas built under the other switch, as a confirmed switch change
+ *   applies in place (SRI-203);
+ * - the stored choices (b.deo SRI-305, SRI-403), the routing's
+ *   `getChannelDelivery`, read at call time from `h.channelDelivery`: null
+ *   unless the `channelDelivery` option loads the real store
+ *   (`loadChannelDeliveryStore`, src/channel-delivery.ts) over the caller's
+ *   own temp state directory, or loads it unreadable through the store's
+ *   read seam (the open fails), so the module's own unreadable state and
+ *   line apply. Choices are seeded only with
+ *   tests/test-helpers/channel-delivery.ts's `writeChannelDeliveryRecord`
+ *   before the harness is built; the harness writes no stored-choice file.
+ *   Every write the store makes is recorded, by path, in
+ *   `h.channelDeliveryWrites`, then made durably;
+ * - the envelope flag (b.deo SRI-301): `h.receive` and `h.receiveKeys`
+ *   take envelope overrides as the Slack stub's `deliver` does
+ *   (`ENVELOPE_FLAG_FORMS`), and hand the routing the flag an envelope with
+ *   them carries (`envelopeFlagOf`): `false` by default;
+ * - the heard set and the per-key forget (b.deo SRI-307), read and called
+ *   through the routing's own `heardChannels` and `forget`
+ *   (`h.heardChannels(key)`, `h.forget(key)`);
  * - one `makeStubSlack` stub per persona (leak marker on), handed out through
  *   `makePersonaClients` as the injected `clientFor` (`h.clients.setUnavailable`
  *   takes a persona's client away, as before validation or in dry run);
@@ -30,7 +60,7 @@
  * - the real persona notifier as the injected `notify`, built by
  *   `makeNotifierStack` (tests/test-helpers/persona-notifier.ts) over the
  *   same `clientFor` and stubs and the applied config (`h.config`, read at
- *   call time), never in dry run, so a lost-message notice is a
+ *   call time, its switch included), never in dry run, so a lost-message notice is a
  *   `chat.postMessage` on the persona's own stub at its destination (a
  *   channel, or for `permission_prompts: 'dm'` the DM `conversations.open`
  *   returns). Its destination hold (`h.hold`) runs on a fake clock
@@ -163,7 +193,7 @@
  *   identity reads.
  *
  * Every call builds a new routing, so every harness starts with empty
- * per-persona dedupe stores; `dedupeClock` injects their clock (default
+ * per-persona dedupe stores and heard sets; `dedupeClock` injects their clock (default
  * `Date.now`).
  *
  * The harness calls `initRestart` (and, with `outageState`,
@@ -174,13 +204,14 @@
  * calls `h.hold.cancelAll()` in teardown; the hold's timers are on
  * `h.holdClock`, so nothing fires unless the test moves it.
  *
- * Isolation (b.av2 SR-13.2): every path is under the caller's `baseDir`; no
- * I/O of its own, no timers, no token literal.
+ * Isolation (b.av2 SR-13.2): every path is under the caller's `baseDir`, and
+ * the store's under the caller's state directory, which must be under the
+ * OS temp directory; no I/O of its own, no timers, no token literal.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { Database } from 'bun:sqlite'
 import type { WebClient } from '@slack/web-api'
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -189,7 +220,16 @@ import type { WebStandardStreamableHTTPServerTransport } from '@modelcontextprot
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 
-import { replySettingsOf, type Persona, type PersonaConfig, type ReplySettings } from '../../src/config.ts'
+import {
+  replySettingsOf,
+  type ChannelMode,
+  type Persona,
+  type PersonaConfig,
+  type PersonaConfigFs,
+  type ReplySettings,
+} from '../../src/config.ts'
+import { durableWriteFileSync } from '../../src/atomic-write.ts'
+import { loadChannelDeliveryStore, type ChannelDeliveryStore } from '../../src/channel-delivery.ts'
 import { createPersonaRouting, type PersonaRoutingDeps } from '../../src/persona-routing.ts'
 import { formatPersonaNotice, type PersonaNotifier } from '../../src/persona-notifier.ts'
 import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
@@ -238,7 +278,8 @@ import {
   type SlackMessageEvent,
 } from '../../src/message-archive.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './persona-config.ts'
-import { makeStubSlack, type StubSlack, type StubSlackOptions } from './slack-stub.ts'
+import { envelopeFlagOf, makeStubSlack, type EnvelopeOverrides, type StubSlack, type StubSlackOptions } from './slack-stub.ts'
+import { isRealHome, isUnder, osTempDir } from './host-safe-env.ts'
 import { makePersonaClients, posts, type PersonaClients } from './permission-relay-harness.ts'
 import { LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './credentials.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
@@ -723,6 +764,64 @@ export interface RoutingHarnessOptions {
    * none is made.
    */
   rowRead?: Readonly<Record<string, RowReadAnswer | RowReadScript>>
+  /**
+   * The channel mode `h.config` is built in, through its
+   * `allow_invited_channels` switch (b.deo SRI-101); it replaces a switch in
+   * `overrides`. Absent: the switch as `overrides` sets it, else declarative
+   * mode, as in 0.11.1.
+   */
+  mode?: ChannelMode
+  /**
+   * Per-name fungible destinations (b.deo SRI-102, SRI-305, SRI-701): each
+   * named persona's `invited.permission_prompts` (`"dm"` or a channel ID),
+   * set on its spec, so `h.config` holds it in fungible mode and the
+   * decision's fungible destinations and the notifier read it there. Absent:
+   * a spec's own `invited`, else none (`dm` in fungible mode).
+   */
+  fungibleDestinations?: Readonly<Record<string, string>>
+  /**
+   * Load the stored-choice store the routing reads (`h.channelDelivery`;
+   * b.deo SRI-305, SRI-403) over the caller's state directory (see
+   * `RoutingChannelDeliveryOptions`). Absent: no store, so no stored choice
+   * applies.
+   */
+  channelDelivery?: RoutingChannelDeliveryOptions
+}
+
+/** The stored-choice store a routing harness loads (b.deo SRI-403, SRI-1203). */
+export interface RoutingChannelDeliveryOptions {
+  /**
+   * The caller's own `mkdtempSync` state directory, under the OS temp
+   * directory, holding the stored-choice file (seeded beforehand with
+   * `writeChannelDeliveryRecord`, or none). The harness throws for any other
+   * directory, and writes no file there itself.
+   */
+  stateDir: string
+  /**
+   * Load the store unreadable: its read seam fails the open with `EACCES`,
+   * so the store logs its `channel-delivery-unreadable` line to `h.logs` and
+   * answers no stored choice for the run. The file, if any, is not read.
+   */
+  unreadable?: boolean
+}
+
+/** The errno an unreadable store's open fails with. */
+const UNREADABLE_STORE_CODE = 'EACCES'
+
+/** A read seam whose open fails, so the store is loaded unreadable without touching the file. */
+const UNREADABLE_STORE_FS: Partial<PersonaConfigFs> = {
+  openFile: () => {
+    throw Object.assign(new Error(`${UNREADABLE_STORE_CODE}: permission denied`), { code: UNREADABLE_STORE_CODE })
+  },
+}
+
+/** Throws unless `stateDir` is a directory under the OS temp directory and not the real home. */
+function requireTempStateDir(stateDir: string): void {
+  const dir = resolve(stateDir)
+  const tempDir = osTempDir()
+  if (isRealHome(dir) || dir === tempDir || !isUnder(dir, tempDir)) {
+    throw new Error('makeRoutingHarness: the channelDelivery state directory must be a mkdtempSync directory under the OS temp directory')
+  }
 }
 
 /** One notice the routing raised: the persona key and the body, without the notifier's persona prefix. */
@@ -797,10 +896,39 @@ export interface RoutingHarness {
   restartDelayS: number
   /** Archive writes started through the seam. */
   archiveWrites: Promise<boolean>[]
-  /** Feed one event to the named personas (default: all), with a recording ack unless `ack` is given. */
-  receive(event: unknown, names?: readonly string[], ack?: () => Promise<void> | void): Promise<void>
-  /** Feed one event to raw persona keys, with a recording ack. */
-  receiveKeys(event: unknown, keys: readonly string[]): Promise<void>
+  /**
+   * Feed one event to the named personas (default: all), with a recording ack
+   * unless `ack` is given, and the envelope flag an envelope with `envelope`
+   * overrides carries (b.deo SRI-301; `envelopeFlagOf`, default `false`; one
+   * of `ENVELOPE_FLAG_FORMS` for each form).
+   */
+  receive(
+    event: unknown,
+    names?: readonly string[],
+    ack?: () => Promise<void> | void,
+    envelope?: EnvelopeOverrides,
+  ): Promise<void>
+  /** Feed one event to raw persona keys, with a recording ack and the envelope flag as `receive` gives it. */
+  receiveKeys(event: unknown, keys: readonly string[], envelope?: EnvelopeOverrides): Promise<void>
+  /**
+   * Replace `h.config` with the same personas built under `mode`'s switch
+   * (b.deo SRI-201, SRI-203), as a confirmed switch change applies in place:
+   * the next event is decided in that mode. Edits a case made to `h.config`
+   * are not carried over; `h.p(name).persona` keeps the persona as first built.
+   */
+  setMode(mode: ChannelMode): void
+  /**
+   * The stored choices the routing reads at each fungible-mode event
+   * (`getChannelDelivery`; b.deo SRI-305): the store the `channelDelivery`
+   * option loaded, else null. A case may replace it.
+   */
+  channelDelivery: ChannelDeliveryStore | null
+  /** The path of every write the store made, in order; the routing makes none (b.deo SRI-304). */
+  channelDeliveryWrites: string[]
+  /** Persona `key`'s heard set, through the routing's own `heardChannels` (b.deo SRI-307). */
+  heardChannels(key: string): ReadonlySet<string>
+  /** The routing's own per-key forget, as the persona teardown calls it (b.deo SRI-307). */
+  forget(key: string): void
   /** Keys of the named personas. */
   keys(names: readonly string[]): string[]
   /** Register a (further) session for the named persona in the real registry; a live one is replaced. */
@@ -839,7 +967,24 @@ export function makeRoutingHarness(
   baseDir: string,
   opts: RoutingHarnessOptions = {},
 ): RoutingHarness {
-  const config = makeMultiPersonaConfig(specs, baseDir, opts.overrides)
+  if (opts.channelDelivery !== undefined) requireTempStateDir(opts.channelDelivery.stateDir)
+  // Each persona's fungible destination set on its spec, by the name the
+  // builders give it, so the one configuration holds it (b.deo SRI-1203).
+  const builtNames = makeMultiPersonaConfig(specs, baseDir, opts.overrides).personas.map((p) => p.name)
+  for (const name of Object.keys(opts.fungibleDestinations ?? {})) {
+    if (!builtNames.includes(name)) throw new Error(`no persona ${name}`)
+  }
+  const configSpecs: PersonaSpec[] = specs.map((spec, i) => {
+    const destination = opts.fungibleDestinations?.[builtNames[i]!]
+    return destination === undefined ? spec : { ...spec, invited: { ...spec.invited, permission_prompts: destination } }
+  })
+  /** The configuration under `mode`'s switch, or the switch `overrides` sets when no mode is given. */
+  const configIn = (mode: ChannelMode | undefined): PersonaConfig =>
+    makeMultiPersonaConfig(configSpecs, baseDir, {
+      ...opts.overrides,
+      ...(mode === undefined ? {} : { allow_invited_channels: mode === 'fungible' }),
+    })
+  const config = configIn(opts.mode)
   const handles = config.personas.map((persona): PersonaHandle => ({
     persona,
     stub: makeStubSlack({ leakMarker: LEAK_SENTINEL, ...opts.stubOptions?.[persona.name] }),
@@ -937,7 +1082,12 @@ export function makeRoutingHarness(
   const log = (line: string): void => { h.logs.push(line) }
   const getPersona = (key: string): Persona | undefined => h.config?.personas.find((p) => p.key === key)
   const webClientFor = (key: string) => clients.clientFor(key) as unknown as WebClient | undefined
-  const { notifier, hold, clock: holdClock } = makeNotifierStack({ getPersona, clientFor: webClientFor, log })
+  const { notifier, hold, clock: holdClock } = makeNotifierStack({
+    getPersona,
+    clientFor: webClientFor,
+    getPersonaConfig: () => h.config,
+    log,
+  })
   // The one reply settings source for the inbound ack step and `h.reply`, as server.ts.
   const getReplySettings = (): ReplySettings => ({ ...replySettingsOf(null), ack_reaction: opts.ackReaction })
 
@@ -1009,12 +1159,21 @@ export function makeRoutingHarness(
     retryArmed: keySet(opts.retryArmed ?? config.personas.map((p) => p.name)),
     restartDelayS: opts.restartDelayS ?? FAST_RESTART_DELAY_S,
     archiveWrites: [],
-    receive: (event, names, ack) => routing.receive(
+    receive: (event, names, ack, envelope) => routing.receive(
       event,
       ack ?? (() => { h.order.push('ack') }),
       h.keys(names ?? handles.map((x) => x.persona.name)),
+      envelopeFlagOf(envelope),
     ),
-    receiveKeys: (event, keys) => routing.receive(event, () => { h.order.push('ack') }, keys),
+    receiveKeys: (event, keys, envelope) =>
+      routing.receive(event, () => { h.order.push('ack') }, keys, envelopeFlagOf(envelope)),
+    setMode: (mode) => {
+      h.config = configIn(mode)
+    },
+    channelDelivery: null,
+    channelDeliveryWrites: [],
+    heardChannels: (key) => routing.heardChannels(key),
+    forget: (key) => routing.forget(key),
     keys: (names) => names.map((n) => byName(n).persona.key),
     registerFor: (name, reg) => {
       const session = registerFor(name, reg)
@@ -1062,11 +1221,25 @@ export function makeRoutingHarness(
       if (script.answer === ROW_READ_REJECTS) throw rowReadRejection()
       return script.answer
     }
+  // The stored-choice store (b.deo SRI-403), loaded once as main() loads it,
+  // its lines in `h.logs` and each write recorded before it is made.
+  if (opts.channelDelivery !== undefined) {
+    h.channelDelivery = loadChannelDeliveryStore(opts.channelDelivery.stateDir, {
+      log,
+      ...(opts.channelDelivery.unreadable === true ? { readFs: UNREADABLE_STORE_FS } : {}),
+      write: (path, bytes) => {
+        h.channelDeliveryWrites.push(path)
+        durableWriteFileSync(path, bytes)
+      },
+    })
+  }
   const routing = createPersonaRouting({
     getPersonaConfig: () => {
       h.order.push('config')
       return h.config
     },
+    // As main() binds it (b.deo SRI-305): the one store, read at call time.
+    getChannelDelivery: () => h.channelDelivery,
     getBotIdentity: (key) => {
       h.order.push(`identity:${key}`)
       return byKey(key)?.stub.identity

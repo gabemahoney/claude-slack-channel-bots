@@ -8,10 +8,15 @@
  * on the handler's behalf. `createPersonaEventRouter` builds that handler:
  *
  * - `message` and `app_mention`: one RAW log line carrying the receiving
- *   persona's key, then the event and its `ack` go to the persona-routing
- *   intake (`persona-routing.ts` `receive`) with the receiving persona as the
- *   only receiver. The intake acks first; an event with no body is acked and
- *   dropped there.
+ *   persona's key, then the event, its `ack` and the envelope flag go to the
+ *   persona-routing intake (`persona-routing.ts` `receive`) with the
+ *   receiving persona as the only receiver. The envelope flag (b.av2 SR-4.1,
+ *   b.deo SRI-301) is the `is_ext_shared_channel` field of the listener
+ *   argument's `body` (the Events API payload), passed exactly as received:
+ *   `true`, `false`, any other value, or undefined when there is no body or
+ *   no such field. It is read from the envelope only, never from the event,
+ *   and nothing else of the envelope is passed. The intake acks first; an
+ *   event with no body is acked and dropped there.
  * - `interactive`: the payload is unwrapped (`body`, then `payload`, then the
  *   argument itself); the channel, message `ts` and clicking user are taken
  *   from its envelope; `cscb.block_action.received` is emitted for every
@@ -54,6 +59,9 @@ import {
 /** Characters of the raw event JSON the RAW log line shows (as before personas). */
 const RAW_EVENT_LOG_LENGTH = 300
 
+/** The envelope field that marks an event from an externally shared channel (b.deo SRI-301). */
+const ENVELOPE_FLAG_FIELD = 'is_ext_shared_channel'
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -88,7 +96,7 @@ export function createPersonaEventRouter(deps: PersonaEventRouterDeps): PersonaE
   async function routeInbound(key: string, eventName: string, payload: PersonaSocketEventPayload): Promise<void> {
     const { event, ack } = payload
     deps.log(`[slack] RAW ${eventName} event persona=${key}: ${JSON.stringify(event)?.slice(0, RAW_EVENT_LOG_LENGTH)}`)
-    await deps.routing.receive(event, ack, key)
+    await deps.routing.receive(event, ack, key, envelopeFlagOf(payload))
   }
 
   async function routeInteractive(key: string, payload: PersonaSocketEventPayload): Promise<void> {
@@ -161,4 +169,16 @@ export function createPersonaEventRouter(deps: PersonaEventRouterDeps): PersonaE
       deps.log(`[slack] persona=${key}: ${String(eventName)} event handling failed: ${describeThrownValue(err)}`)
     }
   }
+}
+
+/**
+ * The envelope flag (b.deo SRI-301): the `is_ext_shared_channel` field of the
+ * listener argument's `body`, the Events API payload, exactly as received
+ * (`true`, `false` or any other value). Undefined when there is no body or the
+ * body has no such field. Read from the envelope only, never from the event.
+ */
+function envelopeFlagOf(payload: PersonaSocketEventPayload): unknown {
+  const body: unknown = payload.body
+  if (typeof body !== 'object' || body === null) return undefined
+  return (body as Record<string, unknown>)[ENVELOPE_FLAG_FIELD]
 }
