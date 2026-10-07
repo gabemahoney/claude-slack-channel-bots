@@ -601,7 +601,7 @@ coordination only, and C of no channel.
 
 ### Check S1: the credentials command in a real terminal (b.av2 SR-12, SR-1.4)
 
-This check covers b.av2 SR-12 as amended by b.deo SRI-1101 to SRI-1110, and
+Its heading cites b.av2 SR-12 (as amended by b.deo SRI-1101 to SRI-1110) and
 b.av2 SR-1.4.
 
 Run it during A's wizard run, at step 4.10, after the wizard has declared A in
@@ -1038,9 +1038,10 @@ Pass: one row per persona after the cycle, and A answers the new message.
 
 ## Part 4: Bot-to-bot, broadcast and persona-post event capture
 
-These checks verify AC 7, 8, 11 and 18 and b.av2 SR-4.1 as amended by b.deo
-SRI-302 (per-persona dedupe), b.av2 SR-4.2 as amended by b.deo SRI-303 to
-SRI-309 (the delivery decision, including own-post exclusion and no limit on
+These checks run with the invited-channel switch absent (declarative mode).
+They verify AC 7, 8, 11 and 18 and b.av2 SR-4.1 as amended by b.deo
+SRI-301, SRI-302 (per-persona dedupe), b.av2 SR-4.2 as amended by b.deo
+SRI-308 (the delivery decision, including own-post exclusion and no limit on
 bot-to-bot delivery) and b.av2 SR-4.4 as amended by b.deo SRI-306 (the
 `user_id` / `bot_id` and `via` tag attributes). They also capture the real Slack event shape of a persona's post.
 That shape is the evidence behind the delivery module's self-exclusion by bot
@@ -1062,7 +1063,7 @@ Check 8 records A's bot ID (`B…`) as `<A_BOT_ID>`.
 
 ### Check 8: persona-post event shape (SR-4.2, the event-shape capture)
 
-This check covers b.av2 SR-4.2 as amended by b.deo SRI-303, SRI-306.
+Its heading cites b.av2 SR-4.2 (as amended by b.deo SRI-308).
 
 Steps:
 
@@ -1086,7 +1087,7 @@ Record from the RAW line, in the Notes column (IDs are not secrets):
 
 - `user`: present or absent, and its value.
 - `bot_id`: present or absent, and its value. Its value is `<A_BOT_ID>` from here on.
-- `subtype`: its value, or "absent" when no `subtype` key appears in the logged part. A bot post's event JSON is always longer than the prefix, so the RAW line alone can't tell a missing `subtype` from one cut off. A's `own` drop (below) settles it: the delivery module drops an undeliverable subtype as `non-message` before it checks the author (SR-4.2 step 1, as amended by b.deo SRI-303, in `src/delivery-decision.ts`), so an `own` drop means the subtype was absent or deliverable.
+- `subtype`: its value, or "absent" when no `subtype` key appears in the logged part. A bot post's event JSON is always longer than the prefix, so the RAW line alone can't tell a missing `subtype` from one cut off. A's `own` drop (below) settles it: the delivery module drops an undeliverable subtype as `non-message` before it checks the author (SR-4.2 step 1, as amended by b.deo SRI-308, in `src/delivery-decision.ts`), so an `own` drop means the subtype was absent or deliverable.
 - `app_id` and any `bot_profile` field, if visible within the prefix.
 
 Expected:
@@ -1109,7 +1110,7 @@ changed for this check.
 
 ### Check 9: one mention is delivered once (SR-4.1)
 
-This check covers b.av2 SR-4.1 as amended by b.deo SRI-302.
+Its heading cites b.av2 SR-4.1 (as amended by b.deo SRI-301, SRI-302).
 
 Steps:
 
@@ -1164,7 +1165,7 @@ Pass: A drops its own broadcast, and B, the only other persona in coordination, 
 
 ### Check 12: two personas converse with no limit (AC 11, AC 18, SR-4.2)
 
-This check covers b.av2 SR-4.2 as amended by b.deo SRI-306. It starts a
+Its heading cites b.av2 SR-4.2 (as amended by b.deo SRI-308). It starts a
 conversation between two bots. The tester ends it (step 4); nothing in the
 server stops it.
 
