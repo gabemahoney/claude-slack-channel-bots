@@ -18,10 +18,17 @@
  * through the resolver, its DM refusal (`refusalOf`) and the destination
  * hold, with the persona and the configuration in effect read at each attempt
  * (b.deo SRI-201); the poller reads no destination setting and no switch
- * itself. Each live entry records the conversation
- * the prompt was posted in (the `D…` ID for a DM) and the posting persona;
- * closing updates go there, whatever the persona's destination or DMs switch
- * is now (b.av2 SR-5.1: an update is not a post). Outage state is keyed by
+ * itself. In fungible mode that is the fungible destination (b.deo
+ * SRI-702), and after a confirmed switch change the next prompt goes to the
+ * destination of the mode turned on (b.deo SRI-703). The refusal line of a
+ * `dm` destination names the setting in force, `permission_prompts` or
+ * `invited.permission_prompts`, asked of the resolver
+ * (`destinationSettingFrom`, b.deo SRI-906). Each live entry records the
+ * conversation the prompt was posted in (the `D…` ID for a DM) and the
+ * posting persona; closing updates and clicks go there, whatever the
+ * persona's destination, DMs switch or channel mode is now (b.av2 SR-5.1: an
+ * update is not a post; b.deo SRI-703: a prompt posted before a switch
+ * change stays where it is and stays answerable). Outage state is keyed by
  * the persona key.
  *
  * Behavior per tick:
@@ -122,6 +129,7 @@ import {
   createPersonaDestinations,
   describeDestinationFailure,
   describeDmDestinationRefusal,
+  destinationSettingFrom,
   safeFailureCode,
   type DestinationConfig,
   type DestinationSlackClient,
@@ -234,19 +242,21 @@ export interface PollerDeps {
   /**
    * The destination resolver (per-persona DM cache) shared with the
    * notifier. The poller asks it whether a persona's `dm` destination is
-   * refused (`refusalOf`, over the configuration in effect at that attempt),
-   * and builds the default destination hold over it when `destinationHold` is
-   * not given (the poller posts through the hold, never through this
-   * directly); a `destinationHold` that is given must be built over this same
-   * resolver. Defaults to a module-level instance over `getPersonaConfig`,
-   * reset by `_resetPollerState`.
+   * refused (`refusalOf`, over the configuration in effect at that attempt)
+   * and which setting names it (`settingOf`, b.deo SRI-906), and builds the
+   * default destination hold over it when `destinationHold` is not given (the
+   * poller posts through the hold, never through this directly); a
+   * `destinationHold` that is given must be built over this same resolver.
+   * Defaults to a module-level instance over `getPersonaConfig`, reset by
+   * `_resetPollerState`.
    */
   destinations?: PersonaDestinations
   /**
    * The configuration in effect, read at each attempt (b.deo SRI-201). Used
    * only to build the default resolver when `destinations` is not given (a
-   * given resolver reads its own). Absent: no configuration, so declarative
-   * mode (`channelModeOf`).
+   * given resolver reads its own). Absent: the default resolver takes the
+   * mode the persona of each attempt was loaded under (fungible when it
+   * carries a fungible destination).
    */
   getPersonaConfig?: () => DestinationConfig
   /**
@@ -566,7 +576,7 @@ function destinationsFor(deps: PollerDeps): PersonaDestinations {
   if (deps.destinations) return deps.destinations
   defaultDestinations ??= createPersonaDestinations({
     log: (line) => logViaDeps(deps, line),
-    getPersonaConfig: () => deps.getPersonaConfig?.(),
+    ...(deps.getPersonaConfig !== undefined ? { getPersonaConfig: () => deps.getPersonaConfig?.() } : {}),
   })
   return defaultDestinations
 }
@@ -1158,13 +1168,16 @@ async function dispatchPermissionPrompt(
   compositeKey: string,
 ): Promise<void> {
   const ref = renderPersonaRef(persona.name, persona.key)
-  const refusal = destinationsFor(deps).refusalOf(persona)
+  const destinations = destinationsFor(deps)
+  const refusal = destinations.refusalOf(persona)
   if (refusal) {
+    // Names the destination setting in force, read in the same step as the
+    // refusal (b.av2 SR-7.1, b.deo SRI-906).
     logUnpostedOnce(
       deps,
       compositeKey,
       'destination-refused',
-      `[slack] permission-poller: ${ref} has permission_prompts set to "dm" but ` +
+      `[slack] permission-poller: ${ref} has ${destinationSettingFrom(destinations, persona)} set to "dm" but ` +
         `${describeDmDestinationRefusal(refusal)} — prompt for ${row.claude_instance_id} ` +
         `(request_token=${permission.request_token}) not posted and no DM opened`,
     )

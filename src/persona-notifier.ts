@@ -10,8 +10,10 @@
  * rule (`personaDestinationOf`, b.av2 SR-7.1, b.deo SRI-701) over the
  * configuration in effect at each attempt (b.deo SRI-201): its
  * `permission_prompts` in declarative mode, its fungible destination in
- * fungible mode. The notifier reads no destination setting and no switch
- * itself, the lost-message notice included. The notifier adds the
+ * fungible mode (b.deo SRI-702). The notifier reads no destination setting
+ * and no switch itself, the lost-message notice included, and no notice
+ * carries a destination: one held before a confirmed switch change posts at
+ * the destination of the mode turned on (b.deo SRI-703). The notifier adds the
  * persona reference to every notice text, so callers pass only the key and
  * the notice body.
  *
@@ -248,8 +250,9 @@ export interface PersonaNotifierDeps {
   /**
    * The configuration in effect, read at each attempt (b.deo SRI-201). Used
    * only to build the notifier's own resolver when neither `destinationHold`
-   * nor `destinations` is given (a given resolver reads its own). Absent: no
-   * configuration, so declarative mode (`channelModeOf`).
+   * nor `destinations` is given (a given resolver reads its own). Absent: that
+   * resolver takes the mode the persona of each attempt was loaded under
+   * (fungible when it carries a fungible destination).
    */
   getPersonaConfig?(): DestinationConfig
   /**
@@ -462,7 +465,7 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
   const destinationHold = deps.destinationHold ?? createPersonaDestinationHold({
     destinations: deps.destinations ?? createPersonaDestinations({
       log: deps.log,
-      getPersonaConfig: () => deps.getPersonaConfig?.(),
+      ...(deps.getPersonaConfig !== undefined ? { getPersonaConfig: () => deps.getPersonaConfig?.() } : {}),
     }),
     getPersona: deps.getPersona,
     clientFor: deps.clientFor,

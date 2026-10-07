@@ -646,11 +646,15 @@ export interface PersonaLifecycle {
 
 /**
  * The in-place settings whose change can move the persona's DM destination
- * (b.av2 SR-7.1): its cached DM conversation is forgotten when one changed
- * (Director decision 11; the cache also re-checks the contact on each use).
+ * (b.av2 SR-7.1, b.deo SRI-703): its cached DM conversation is forgotten when
+ * one changed (Director decision 11; the cache also re-checks the contact on
+ * each use).
+ * `permission_prompts` is the destination setting in declarative mode,
+ * `invited.permission_prompts` the one in fungible mode.
  */
-const DM_DESTINATION_SETTINGS: ReadonlySet<InPlaceSetting> = new Set<InPlaceSetting>([
+export const DM_DESTINATION_SETTINGS: ReadonlySet<InPlaceSetting> = new Set<InPlaceSetting>([
   'permission_prompts',
+  'invited.permission_prompts',
   'dm.enabled',
   'dm.contact',
 ])

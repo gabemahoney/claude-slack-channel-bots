@@ -21,9 +21,12 @@
  *     quiet. A row the collision ladder will replace rather than resume (its
  *     `cwd` or `config_dir` label does not match the persona) is only logged.
  *
- * Archive evidence follows b.av2 SR-7.4 (`personaArchiveEvidenceScope`): only
- * the persona's `delivery: all` channels are counted, and a zero count proves
- * nothing when the persona has a `mentions` channel or DMs on. The
+ * Archive evidence follows b.av2 SR-7.4 and b.deo SRI-704
+ * (`personaArchiveEvidenceScope`): in declarative mode only the persona's
+ * `delivery: all` channels are counted, and a zero count proves nothing when
+ * the persona has a `mentions` channel or DMs on; in fungible mode no channel
+ * is counted and a zero count proves nothing, so no lost transcript is ever
+ * reported. Layer 2 reads the mode from the configuration it is given. The
  * session manager's transcript-loss diagnosis uses the same helper and count.
  *
  * Warnings reach Slack only through the persona-keyed notice seam (production:
@@ -41,7 +44,15 @@ import { existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { Database } from 'bun:sqlite'
 import type { GetResult } from 'agent-director'
-import { resolveRealPathStrict, type Persona, type PersonaConfig, type ServerSettings, type StrictRealPathFs } from './config.ts'
+import {
+  channelModeOf,
+  resolveRealPathStrict,
+  type ChannelMode,
+  type Persona,
+  type PersonaConfig,
+  type ServerSettings,
+  type StrictRealPathFs,
+} from './config.ts'
 import { recordStartupError as defaultRecordStartupError } from './startup-errors.ts'
 import { withOutageDetection } from './outage-state.ts'
 import { ErrSpawnNotFound } from './agent-director-errors.ts'
@@ -290,29 +301,42 @@ function classifyJsonlRoots(roots: readonly string[], readMountinfo?: () => stri
 }
 
 // ---------------------------------------------------------------------------
-// Archive evidence (b.av2 SR-7.4)
+// Archive evidence (b.av2 SR-7.4, b.deo SRI-704)
 // ---------------------------------------------------------------------------
 
 /** Which archived messages count as evidence of a persona's activity. */
 export interface PersonaArchiveEvidenceScope {
-  /** IDs of the persona's `delivery: all` channels — the only channels counted. */
+  /**
+   * IDs of the channels counted: in declarative mode the persona's
+   * `delivery: all` channels; in fungible mode none.
+   */
   channelIds: string[]
   /**
-   * Whether a zero count proves the persona was idle. False when the persona
-   * has any `delivery: mentions` channel or `dm.enabled` on: the archive
-   * cannot attribute messages from those to a persona, so zero proves nothing.
+   * Whether a zero count proves the persona was idle. In declarative mode
+   * false when the persona has any `delivery: mentions` channel or
+   * `dm.enabled` on: the archive cannot attribute messages from those to a
+   * persona, so zero proves nothing. In fungible mode always false.
    */
   zeroIsAttributable: boolean
 }
 
 /**
- * A persona's archive-evidence scope (b.av2 SR-7.4). Both the start
- * safeguard's Layer 2 and the session manager's transcript-loss diagnosis
- * classify through this helper, so they agree. Pure.
+ * A persona's archive-evidence scope (b.av2 SR-7.4, b.deo SRI-704) in `mode`
+ * (absent: declarative). Both the start safeguard's Layer 2 and the session
+ * manager's transcript-loss diagnosis classify through this helper, so they
+ * agree.
+ *
+ * In fungible mode a persona serves every channel its app is a member of, so
+ * configuration cannot predict its traffic: the scope counts no channel,
+ * whatever the persona's resolved `channels` holds, and its zero is never
+ * attributable (`FUNGIBLE_MODE_ZERO_REASON`). `channels` is read only in
+ * declarative mode (b.deo SRI-202). Pure.
  */
 export function personaArchiveEvidenceScope(
   persona: Pick<Persona, 'channels' | 'dm'>,
+  mode: ChannelMode = 'declarative',
 ): PersonaArchiveEvidenceScope {
+  if (mode === 'fungible') return { channelIds: [], zeroIsAttributable: false }
   return {
     channelIds: persona.channels.filter((c) => c.delivery === 'all').map((c) => c.id),
     zeroIsAttributable: !persona.dm.enabled && persona.channels.every((c) => c.delivery !== 'mentions'),
@@ -321,12 +345,31 @@ export function personaArchiveEvidenceScope(
 
 /**
  * Why a zero archive count is not evidence for a persona whose zero is not
- * attributable. Shared by Layer 2's log line and the diagnosis reason.
+ * attributable, in declarative mode. Shared by Layer 2's log line and the
+ * diagnosis reason.
  */
 export const UNATTRIBUTABLE_ZERO_REASON =
   'the persona has a `delivery: mentions` channel or DMs on, and the message archive cannot attribute ' +
   'messages from `mentions` channels or DMs to a persona, so 0 archived messages since spawn in its ' +
   '`delivery: all` channels proves nothing'
+
+/**
+ * Why a zero archive count is not evidence in fungible mode (b.deo SRI-704).
+ * Shared by Layer 2's log line and the diagnosis reason.
+ */
+export const FUNGIBLE_MODE_ZERO_REASON =
+  'the server is in fungible mode (`allow_invited_channels` is true), where a persona serves every channel ' +
+  'its app is a member of and the configuration cannot predict its traffic, so no channel is counted and ' +
+  '0 archived messages since spawn proves nothing'
+
+/**
+ * The reason a zero archive count is not evidence in `mode` (absent:
+ * declarative): `FUNGIBLE_MODE_ZERO_REASON` in fungible mode, else
+ * `UNATTRIBUTABLE_ZERO_REASON`. Pure.
+ */
+export function unattributableZeroReason(mode: ChannelMode = 'declarative'): string {
+  return mode === 'fungible' ? FUNGIBLE_MODE_ZERO_REASON : UNATTRIBUTABLE_ZERO_REASON
+}
 
 /**
  * Builds a default archive-count function bound to config.message_archive_db.
@@ -446,6 +489,8 @@ interface Layer2Effects {
   recordError: typeof defaultRecordStartupError
   home: string
   configDirFs: Partial<StrictRealPathFs> | undefined
+  /** The channel mode of the configuration Layer 2 was given (b.deo SRI-704). */
+  mode: ChannelMode
 }
 
 /**
@@ -562,11 +607,16 @@ async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Prom
 
   // Case 5: transcript does not exist anywhere. Distinguish lost vs never-created
   // using the message archive as evidence, counted over the persona's
-  // `delivery: all` channels only (b.av2 SR-7.4).
-  const scope = personaArchiveEvidenceScope(persona)
+  // `delivery: all` channels only in declarative mode (b.av2 SR-7.4), and
+  // over no channel in fungible mode (b.deo SRI-704).
+  const scope = personaArchiveEvidenceScope(persona, fx.mode)
   const startedAtEpoch = rfc3339ToEpochSeconds(row.started_at)
-  const archivedSinceSpawn =
-    startedAtEpoch === null ? null : fx.archiveCountSince(scope.channelIds, startedAtEpoch, ref)
+  const counted = startedAtEpoch === null ? null : fx.archiveCountSince(scope.channelIds, startedAtEpoch, ref)
+  // b.deo SRI-704: in fungible mode no channel is counted, so a count is
+  // never evidence of activity and a lost transcript is never reported: any
+  // count given is a zero, which is not attributable. No count keeps the
+  // no-count outcome.
+  const archivedSinceSpawn = counted !== null && fx.mode === 'fungible' ? 0 : counted
 
   if (archivedSinceSpawn !== null && archivedSinceSpawn > 0) {
     // Conversation provably happened since spawn, yet no transcript survives. LOST.
@@ -586,12 +636,13 @@ async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Prom
   }
 
   // A zero count is not evidence of idleness when the archive cannot see all
-  // of the persona's traffic: handled like unavailable evidence, quietly.
+  // of the persona's traffic (in fungible mode, never): handled like
+  // unavailable evidence, quietly.
   if (archivedSinceSpawn === 0 && !scope.zeroIsAttributable) {
     console.error(
       `[slack] jsonl-persistence-check: ${ref} has no transcript yet ` +
         `(persisted="${persistedPath}", fallback="${fallbackPath}"); archive evidence is inconclusive because ` +
-        `${UNATTRIBUTABLE_ZERO_REASON}; resume will fresh-spawn.`,
+        `${unattributableZeroReason(fx.mode)}; resume will fresh-spawn.`,
     )
     return
   }
@@ -702,7 +753,8 @@ export function runPersonaStorageCheck(
  *   no notice.
  * - Per-persona stale-path / lost-transcript: loud (record + notice to that persona).
  * - Idle-since-spawn persona, or a zero count the archive cannot attribute
- *   (b.av2 SR-7.4): single quiet console line, no loud signal.
+ *   (b.av2 SR-7.4; in fungible mode every count, b.deo SRI-704): single quiet
+ *   console line, no loud signal. The mode is `config`'s.
  * - A row the collision ladder will replace rather than resume: single
  *   quiet console line, no loud signal.
  * - A persona whose claude_config_dir cannot be resolved to a real path (bug
@@ -730,6 +782,7 @@ export async function runJsonlPersistenceSafeguard(
       recordError,
       home,
       configDirFs: deps?.configDirFs,
+      mode: channelModeOf(config),
     }
 
     // Layer 1 — non-persistent storage.

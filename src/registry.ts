@@ -19,12 +19,17 @@
  * its roots are matched, and its entry stub is promoted in place so the tool
  * handlers that closed over it read the persona key it is promoted under.
  *
- * Tool scope (b.av2 SR-5.1, SR-3.1): the tools keep their names and inputs.
- * Each call resolves the calling session's persona and that persona's Slack
- * client at call time, may target only the channels in the persona's current
- * applied configuration and, while its `dm.enabled` is on, its DM
- * conversations and (for `reply`) user IDs (`checkPersonaTarget`), and posts
- * as the persona with no username or icon override.
+ * Tool scope (b.av2 SR-5.1, b.deo SRI-601; b.av2 SR-3.1): the tools keep
+ * their names and inputs. Each call resolves the calling session's persona,
+ * the channel mode and that persona's Slack client at call time, and posts as
+ * the persona with no username or icon override. While its `dm.enabled` is on,
+ * it may target its DM conversations and (for `reply`) user IDs in both modes
+ * (`checkPersonaTarget`). Its channel targets depend on the mode: in
+ * declarative mode only the channels in the persona's current applied
+ * configuration; in fungible mode any channel ID, with Slack enforcing
+ * membership, and Slack's refusal returned as a tool error naming the
+ * persona, the channel and Slack's error code (b.deo SRI-602,
+ * `slackRefusalToolErrorText`).
  *
  * Instructions: `MCP_INSTRUCTIONS` is exported as the exact string every
  * session server sends as its MCP `instructions`, so the shipped-docs audit
@@ -44,7 +49,15 @@ import {
 import type { WebClient } from '@slack/web-api'
 import { writeFileSync } from 'fs'
 import { join, resolve } from 'path'
-import { DM_CONTACT_RE, MCP_SERVER_NAME, resolveRealPath, type Persona, type ReplySettings } from './config.ts'
+import {
+  CHANNEL_ID_RE,
+  DM_CONTACT_RE,
+  MCP_SERVER_NAME,
+  resolveRealPath,
+  type ChannelMode,
+  type Persona,
+  type ReplySettings,
+} from './config.ts'
 import { chunkText, sanitizeFilename } from './lib.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, renderLogMessageText, slackPlatformReason } from './persona-connection-errors.ts'
@@ -629,34 +642,58 @@ export interface SessionToolDeps {
   consumeAck: (personaKey: string, channelId: string, messageTs: string) => boolean
   /** TCP port the MCP HTTP server is listening on (retained for diagnostics). */
   serverPort: number
+  /**
+   * The channel mode of the configuration in effect (b.deo SRI-201,
+   * SRI-601), read on every tool call together with the persona and never
+   * copied at session creation (production: `channelModeOf` over the applied
+   * configuration). Absent: declarative mode.
+   */
+  getChannelMode?: () => ChannelMode
 }
 
 // ---------------------------------------------------------------------------
-// Posting scope (b.av2 SR-5.1)
+// Posting scope (b.av2 SR-5.1, b.deo SRI-601)
 // ---------------------------------------------------------------------------
 
 /** A DM conversation ID. A group DM (`G…`, `mpim`) never matches. */
 const DM_CONVERSATION_ID_RE = /^D[A-Z0-9]+$/
 
 /**
- * What a tool target is, for one persona (b.av2 SR-5.1):
- * - `channel`: the `id` of one of the persona's configured channels;
+ * What a tool target is, for one persona in one channel mode (b.av2 SR-5.1,
+ * b.deo SRI-601):
+ * - `channel`: in declarative mode, the `id` of one of the persona's
+ *   configured channels; in fungible mode, any value matching
+ *   `CHANNEL_ID_RE` (a `C…` or `G…` ID);
  * - `dm`: a DM conversation ID (`D…`);
  * - `user`: a Slack user ID (`U…`/`W…`, the `dm.contact` format);
- * - `other`: anything else (another channel, a group DM, an empty value …).
+ * - `other`: anything else (in declarative mode another channel or a group
+ *   DM; in either mode a malformed ID, an empty value …).
  */
 type PersonaTargetKind = 'channel' | 'dm' | 'user' | 'other'
 
 /**
- * Classify `target` for `persona`. A configured channel wins over the ID
- * shapes. Pure: no Slack call, logging or state.
+ * Classify `target` for `persona` in `mode`. In declarative mode a
+ * configured channel wins over the ID shapes; in fungible mode the persona's
+ * `channels` is never read (b.deo SRI-202) and the channel-ID shape decides.
+ * Pure: no Slack call, logging or state.
  */
-function classifyPersonaTarget(persona: Persona, target: string): PersonaTargetKind {
-  if (target !== '' && persona.channels.some((c) => c.id === target)) return 'channel'
+function classifyPersonaTarget(persona: Persona, target: string, mode: ChannelMode): PersonaTargetKind {
+  if (mode === 'fungible') {
+    if (CHANNEL_ID_RE.test(target)) return 'channel'
+  } else if (target !== '' && persona.channels.some((c) => c.id === target)) {
+    return 'channel'
+  }
   if (DM_CONVERSATION_ID_RE.test(target)) return 'dm'
   if (DM_CONTACT_RE.test(target)) return 'user'
   return 'other'
 }
+
+/**
+ * The reason a fungible-mode refusal of a target that is neither a channel ID
+ * nor a DM target gives (b.deo SRI-601), after `checkPersonaTarget`'s lead
+ * naming the persona and the target.
+ */
+export const FUNGIBLE_TARGET_REFUSAL = 'it is neither a channel ID nor an allowed DM target.'
 
 /**
  * The kind of action a tool takes on its target: `post` posts a new message
@@ -675,32 +712,41 @@ export type PersonaTargetCheck =
   | { allowed: false; message: string }
 
 /**
- * The posting scope of a persona (b.av2 SR-5.1), decided from the persona as
- * applied now (callers pass the persona resolved at call time):
- * - a configured channel is allowed, whatever its delivery mode;
- * - a `D…` conversation is allowed only while `dm.enabled` is on (Slack itself
- *   refuses one the persona's app is not in);
- * - a user ID is allowed only for `post` and only while `dm.enabled` is on,
- *   as `kind: 'user'` (open the DM first); for `act` it is refused whatever
- *   the switch, so no read, edit or reaction ever opens a DM;
- * - everything else is refused.
+ * The posting scope of a persona (b.av2 SR-5.1, b.deo SRI-601), decided from
+ * the persona and the channel mode as applied now (callers pass both,
+ * resolved at call time). `mode` absent is declarative mode.
+ * - Declarative mode: a configured channel is allowed, whatever its delivery
+ *   mode.
+ * - Fungible mode: any target matching `CHANNEL_ID_RE` is allowed, whatever
+ *   any persona lists (Slack enforces membership); the persona's `channels`
+ *   is not read.
+ * - In both modes, a `D…` conversation is allowed only while `dm.enabled` is
+ *   on (Slack itself refuses one the persona's app is not in), and a user ID
+ *   only for `post` and only while `dm.enabled` is on, as `kind: 'user'`
+ *   (open the DM first); for `act` a user ID is refused whatever the switch,
+ *   so no read, edit or reaction ever opens a DM.
+ * - Everything else is refused: in declarative mode as not a configured
+ *   channel, in fungible mode with `FUNGIBLE_TARGET_REFUSAL`.
  * A refusal message names the persona (`renderPersonaRef` with its stored
  * key) and the target. While `dm.enabled` is off, every `D…`/`U…`/`W…`
  * target on any tool gets the DMs-off reason, so the model is never steered
- * to a DM conversation that would be refused too. Pure.
+ * to a DM conversation that would be refused too. Pure: no Slack call.
  */
 export function checkPersonaTarget(
   persona: Persona,
   target: string,
   action: PersonaTargetAction,
+  mode: ChannelMode = 'declarative',
 ): PersonaTargetCheck {
-  const kind = classifyPersonaTarget(persona, target)
+  const kind = classifyPersonaTarget(persona, target, mode)
   const refuse = (why: string): PersonaTargetCheck => ({
     allowed: false,
     message: `Persona ${renderPersonaRef(persona.name, persona.key)} may not target ${JSON.stringify(target)}: ${why}`,
   })
   if (kind === 'channel') return { allowed: true, kind }
-  if (kind === 'other') return refuse(`it is not one of the persona's configured channels.`)
+  if (kind === 'other') {
+    return refuse(mode === 'fungible' ? FUNGIBLE_TARGET_REFUSAL : `it is not one of the persona's configured channels.`)
+  }
   if (!persona.dm.enabled) return refuse(`DMs are off for this persona (dm.enabled is false).`)
   if (kind === 'user' && action !== 'post') {
     return refuse(`this tool needs a conversation ID (a channel ID or a D… DM conversation ID), not a user ID.`)
@@ -724,6 +770,31 @@ const TOOL_TARGET: Readonly<Record<string, { arg: string; action: PersonaTargetA
 /** A CallTool result flagged as a tool error. */
 function toolError(text: string) {
   return { content: [{ type: 'text', text }], isError: true }
+}
+
+/**
+ * The tool error for a failed call on a channel target in fungible mode
+ * (b.deo SRI-602; b.av2 SR-5.1), where Slack enforces membership: it names
+ * the tool, the persona (`renderPersonaRef`), the channel and Slack's error
+ * code (`slackPlatformReason` of the thrown value, e.g. `not_in_channel` or
+ * `channel_not_found`):
+ *
+ *   Tool "<tool>" failed for persona "<name>" (key=<key>) on channel "<channel>": Slack refused the call (<code>).
+ *   Tool "<tool>" failed for persona "<name>" (key=<key>) on channel "<channel>": the tool call failed.
+ *
+ * The second form is for a failure with no platform code (a network or local
+ * failure): no code is named. Only the platform code comes from the thrown
+ * value, so the text carries no token. Pure.
+ */
+export function slackRefusalToolErrorText(
+  tool: string,
+  persona: Pick<Persona, 'name' | 'key'>,
+  channel: string,
+  code: string | undefined,
+): string {
+  const lead = `Tool ${JSON.stringify(tool)} failed for persona ${renderPersonaRef(persona.name, persona.key)} ` +
+    `on channel ${JSON.stringify(channel)}`
+  return code !== undefined && code !== '' ? `${lead}: Slack refused the call (${code}).` : `${lead}: the tool call failed.`
 }
 
 // ---------------------------------------------------------------------------
@@ -972,14 +1043,18 @@ export function createSessionServer(
   }))
 
   // -------------------------------------------------------------------------
-  // Tool execution — persona-scoped (b.av2 SR-5.1, SR-3.1)
+  // Tool execution — persona-scoped (b.av2 SR-5.1, b.deo SRI-601; b.av2
+  // SR-3.1)
   //
-  // Every call resolves the session's persona at call time from the entry
-  // this server closes over, checks the tool's target against the persona's
-  // current channels and DM switch (`checkPersonaTarget`, before the dry-run
+  // Every call resolves the session's persona and the channel mode at call
+  // time (the persona from the entry this server closes over, the mode
+  // through `deps.getChannelMode`, declarative when it is absent), checks the
+  // tool's target against them (`checkPersonaTarget`, before the dry-run
   // branch), and outside dry run makes every Slack call on the persona's own
   // client, with no username or icon override. A refusal is a tool error
-  // (`isError: true`), never a protocol error, and makes no Slack call.
+  // (`isError: true`), never a protocol error, and makes no Slack call. In
+  // fungible mode, a failed call on a channel target returns
+  // `slackRefusalToolErrorText` (b.deo SRI-602).
   //
   // A user-ID target (`reply` only) is opened with `conversations.open` on the
   // persona's client on every call (no cache), and the reply goes to the
@@ -1329,11 +1404,13 @@ export function createSessionServer(
     if (!key) return toolError(`Tool "${name}" refused: this session is not matched to a persona.`)
     const persona = getPersona(key)
     if (!persona) return toolError(`Tool "${name}" refused: persona key=${key} is not an applied persona.`)
+    // The channel mode, read now with the persona (b.deo SRI-201, SRI-601).
+    const mode: ChannelMode = deps.getChannelMode?.() ?? 'declarative'
 
-    // Posting scope, before the dry-run branch (b.av2 SR-5.1).
+    // Posting scope, before the dry-run branch (b.av2 SR-5.1, b.deo SRI-601).
     const rawTarget = args[toolTarget.arg]
     const target = typeof rawTarget === 'string' ? rawTarget : ''
-    const scope = checkPersonaTarget(persona, target, toolTarget.action)
+    const scope = checkPersonaTarget(persona, target, toolTarget.action, mode)
     if (!scope.allowed) return toolError(scope.message)
 
     if (isDryRun()) return dryRunResult(name, args, scope.kind)
@@ -1346,6 +1423,15 @@ export function createSessionServer(
     try {
       return await runTool(name, args, persona, web, scope.kind, dm)
     } catch (err) {
+      // Fungible mode, channel target (b.deo SRI-602): Slack enforces
+      // membership, so its refusal names the persona, the channel and
+      // Slack's error code. The log line stays token-safe.
+      if (mode === 'fungible' && scope.kind === 'channel') {
+        console.error(
+          `[slack] Tool "${name}" failed for persona ${ref} on channel ${JSON.stringify(target)}: ${describeThrownValue(err)}`,
+        )
+        return toolError(slackRefusalToolErrorText(name, persona, target, slackPlatformReason(err)))
+      }
       // A DM target is named, so a refusal of a D… conversation the persona's
       // app is not in (or of the DM opened for a user) says where it failed;
       // for a user target, the conversation opened for it is named too.

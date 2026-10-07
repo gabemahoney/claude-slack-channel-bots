@@ -73,6 +73,7 @@ import {
   type ReplySettings,
   replySettingsOf,
   agentDirectorCallTimeoutMsOf,
+  channelModeOf,
   type ServerSettings,
   MCP_SERVER_NAME,
 } from './config.ts'
@@ -726,6 +727,9 @@ const sessionToolDeps: SessionToolDeps = {
   resolveUserName: resolvePersonaUserName,
   consumeAck,
   serverPort: 0, // updated to actual port in main() before Bun.serve
+  // The channel mode of the configuration in effect, read at each tool call
+  // (b.deo SRI-201, SRI-601).
+  getChannelMode: () => channelModeOf(personaConfig),
 }
 
 // ---------------------------------------------------------------------------
