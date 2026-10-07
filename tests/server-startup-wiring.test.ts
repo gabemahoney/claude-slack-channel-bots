@@ -455,7 +455,7 @@ import type * as SessionManagerModule from '../src/session-manager.ts'
 import type * as LiveRowSequenceModule from '../src/live-row-sequence.ts'
 import type { LiveRowSequenceRegistry, LiveRowSequenceRegistryOptions } from '../src/live-row-sequence.ts'
 import type { LatchRecheckInput, OldLifeHoldEndRetryDeps, OldLifeWaitBindings, PendingRowRuleDepsInput, PendingRowRuleInstall } from '../src/session-manager.ts'
-import type { SessionAdmissionOptions } from '../src/registry.ts'
+import type { SessionAdmissionOptions, SessionToolDeps } from '../src/registry.ts'
 import type { OldLifeHoldSet } from '../src/retired-keys.ts'
 import type { HealthCheckDeps } from '../src/health-check.ts'
 import type * as OutageStateModule from '../src/outage-state.ts'
@@ -5567,6 +5567,54 @@ describe('server.ts\'s file guard refuses every persona credentials file (b.av2 
       const [bodyStart, bodyEnd] = balancedAfter(code, balancedAfter(code, fn, '(', ')')[1], '{', '}')
       expect([path, at > bodyStart && at < bodyEnd]).toEqual([path, true])
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: the session tools read the channel mode at call time
+// (b.deo SRI-201, SRI-601)
+// ---------------------------------------------------------------------------
+
+/** The session tools' channel-mode reader (b.deo SRI-601); renaming it fails the typecheck. */
+const SESSION_TOOLS_CHANNEL_MODE: keyof SessionToolDeps = 'getChannelMode'
+
+describe('the session tools read the channel mode of the configuration in effect at each call (b.deo SRI-201, SRI-601)', () => {
+  // b.deo SRI-601, SRI-201: a tool call's target check reads the mode from the
+  // configuration in effect at that call, and a confirmed change of
+  // allow_invited_channels applies in place, through onApplied's swap of the
+  // applied config holder. This is the call-time wiring pin of plan ruling 4.
+  // The member is optional in SessionToolDeps, so only this audit makes sure
+  // production binds it, and binds it to the holder: a mode taken once at
+  // start (a const or let, a value handed in, a later reassignment of the
+  // member) would keep the start-time mode until the next start.
+  test('sessionToolDeps.getChannelMode is exactly `() => channelModeOf(<applied config holder>)` over the holder onApplied reassigns, and server.ts has no other channelModeOf call and no other getChannelMode', () => {
+    const holder = loadedConfigName(SERVER_CODE)
+    // An arrow with no parameters whose body calls config.ts's channelModeOf
+    // on the holder itself, so each call reads the holder anew.
+    const props = objectProperties(spreadConstObject('sessionToolDeps'))
+    expect(props.get(SESSION_TOOLS_CHANNEL_MODE)).toBe(`() => channelModeOf(${holder})`)
+    expect(importSource(SERVER_CODE, 'channelModeOf')).toBe('./config.ts')
+    expect(indicesOf(/\b(?:function|let|const|var)\s+channelModeOf\b/g, SERVER_CODE)).toEqual([])
+
+    // The holder the arrow closes over is the module-scope one: the tool deps
+    // object is built at module scope, and the holder is declared once (no
+    // shadow), outside main(), and is what onApplied reassigns.
+    const deps = SERVER_CODE.search(/\bconst\s+sessionToolDeps\s*:\s*SessionToolDeps\s*=\s*\{/)
+    expect(deps).toBeGreaterThan(-1)
+    expect(insideMain(deps)).toBe(false)
+    declaredOnce(holder)
+    expect(insideMain(SERVER_CODE.search(new RegExp(`\\blet\\s+${holder}\\b`)))).toBe(false)
+    expect(onlyCallProps('createReloadController').get('onApplied')).toMatch(new RegExp(`(?<![\\w.$])${holder} = configInEffect\\(`))
+
+    // Nothing takes the mode once: the one channelModeOf call is the one in
+    // this member (its import is the only other mention), and the member is
+    // named nowhere else, so nothing reassigns it or binds a second one.
+    const [depsStart, depsEnd] = balancedAfter(SERVER_CODE, deps, '{', '}')
+    const call = onlyCallOf('channelModeOf')
+    expect(call).toBeGreaterThan(depsStart)
+    expect(call).toBeLessThan(depsEnd)
+    expect(indicesOf(/\bchannelModeOf\b/g, SERVER_CODE)).toHaveLength(2)
+    expect(indicesOf(new RegExp(`\\b${SESSION_TOOLS_CHANNEL_MODE}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
   })
 })
 

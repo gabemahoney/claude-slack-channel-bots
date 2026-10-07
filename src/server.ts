@@ -73,6 +73,7 @@ import {
   type ReplySettings,
   replySettingsOf,
   agentDirectorCallTimeoutMsOf,
+  channelModeOf,
   type ServerSettings,
   MCP_SERVER_NAME,
 } from './config.ts'
@@ -384,6 +385,11 @@ import {
 } from './clear-latch.ts'
 import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
 import { configInEffect, createReloadController, reloadFilePaths, type ReloadController } from './reload.ts'
+import {
+  channelDeliveryDeclarationOf,
+  loadChannelDeliveryAtStart,
+  type ChannelDeliveryStore,
+} from './channel-delivery.ts'
 import { createReloadTickDriver } from './reload-timer.ts'
 import { createOldLifeHoldSet, readRetiredKeysAtStart, type OldLifeHoldSet, type RetiredKeyStore } from './retired-keys.ts'
 import { PRODUCTION_SLACK_CLIENT_FACTORY } from './persona-slack-clients.ts'
@@ -726,6 +732,8 @@ const sessionToolDeps: SessionToolDeps = {
   resolveUserName: resolvePersonaUserName,
   consumeAck,
   serverPort: 0, // updated to actual port in main() before Bun.serve
+  // b.deo SRI-201, SRI-601: the channel mode of the configuration in effect, read on every call.
+  getChannelMode: () => channelModeOf(personaConfig),
 }
 
 // ---------------------------------------------------------------------------
@@ -1250,6 +1258,15 @@ let personaConfig: PersonaConfig | null = null
  * Undefined before main() builds it (nothing is built or read at import).
  */
 let reloadController: ReloadController | undefined
+
+/**
+ * The one stored-choice store (`channel-delivery.ts`; b.deo SRI-401,
+ * SRI-403): set once by main(), which loads it after the start resolves its
+ * configuration and before the start bring-up pass, and read at call time by
+ * the reload controller's `channelDelivery` accessor. Undefined before main()
+ * loads it (nothing is read at import).
+ */
+let channelDeliveryStore: ChannelDeliveryStore | undefined
 
 /**
  * The applied persona with this key, read from the current persona config at
@@ -3359,6 +3376,18 @@ export async function main(): Promise<void> {
     // key it records, right after the record and before the last-applied
     // rewrite and the teardown's kill; no pending-row rule run follows.
     stopApprover: (key) => stopDialogApprover(key, APPROVER_STOP_RETIRED_KEY),
+    // b.av2 SR-8.6 as amended by b.jg5 SRJ-1511, beside b.deo SRI-406,
+    // SRI-408 and SRI-502: a confirmed apply's step 1 writes the unwritten
+    // drops of a key it brings up, drops the retired keys' stored choices and
+    // marks the retiring keys through the one stored-choice store, loaded
+    // below after the start resolution, so this reads the holder at call
+    // time. An apply before the load is never expected (detection is armed
+    // only after the start bring-up); it throws, before anything is written,
+    // and the controller logs it.
+    channelDelivery: () => {
+      if (channelDeliveryStore === undefined) throw new Error('a confirmed apply ran before the start loaded the stored-choice store')
+      return channelDeliveryStore
+    },
     lifecycle: {
       // b.jg5 SRJ-205: the pass's launch pool reads
       // `shuttingDown` live before starting each launch, so a shutdown begun
@@ -3418,6 +3447,31 @@ export async function main(): Promise<void> {
   console.error(`[slack] Loaded persona config: ${personaConfig.personas.length} persona(s)`)
   // The start-time applied config (declared before the reload controller).
   appliedConfig = personaConfig
+
+  // b.deo SRI-403, SRI-407 beside b.av2 SR-8.7: the stored-choice file
+  // (channel-delivery.json in the state directory) is read once here, right
+  // after the start resolved the configuration it runs and before the first
+  // await that follows, so no early shutdown return skips it and it comes
+  // before the connection manager, Bun.serve, the PID file, the start sweep
+  // and the start bring-up; behind no branch, so in both modes and in dry run
+  // too. The start rules run right after the read, over the applied personas
+  // and the retired-key store loaded above. Its production writer, delete and
+  // clock are the store's defaults (durableWriteFileSync, durableUnlinkSync,
+  // Date.now). An unreadable file is the store's own state and line, never a
+  // stop. This is the server's only stored-choice store: the reload
+  // controller reaches it through `channelDeliveryStore`, and nothing else
+  // builds one.
+  channelDeliveryStore = loadChannelDeliveryAtStart(
+    STATE_DIR,
+    {
+      applied: appliedConfig.personas.map((persona) => ({
+        key: persona.key,
+        declaration: channelDeliveryDeclarationOf(persona),
+      })),
+      retiredKeys,
+    },
+    { log: (line) => console.error(line) },
+  )
 
   // b.jg5 SRJ-209: agent-director's timing settings. Read once here, after
   // the startup gate has passed and the start has resolved its configuration,

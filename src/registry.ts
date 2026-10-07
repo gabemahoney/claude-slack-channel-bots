@@ -44,7 +44,7 @@ import {
 import type { WebClient } from '@slack/web-api'
 import { writeFileSync } from 'fs'
 import { join, resolve } from 'path'
-import { DM_CONTACT_RE, MCP_SERVER_NAME, resolveRealPath, type Persona, type ReplySettings } from './config.ts'
+import { DM_CONTACT_RE, MCP_SERVER_NAME, resolveRealPath, type ChannelMode, type Persona, type ReplySettings } from './config.ts'
 import { chunkText, sanitizeFilename } from './lib.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, renderLogMessageText, slackPlatformReason } from './persona-connection-errors.ts'
@@ -629,6 +629,8 @@ export interface SessionToolDeps {
   consumeAck: (personaKey: string, channelId: string, messageTs: string) => boolean
   /** TCP port the MCP HTTP server is listening on (retained for diagnostics). */
   serverPort: number
+  /** The channel mode, read on every call; absent means declarative (b.deo SRI-601). */
+  getChannelMode?: () => ChannelMode
 }
 
 // ---------------------------------------------------------------------------

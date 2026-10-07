@@ -36,12 +36,17 @@
  * deleted when nothing is. Its first pass after a start from the record is
  * the SR-8.7 comparison, so an unconfirmed edit stays pending.
  *
- * Confirmation and apply (b.av2 SR-8.5, SR-8.6): each pass first processes
+ * Confirmation and apply (b.av2 SR-8.5, SR-8.6; b.deo SRI-406, SRI-408,
+ * SRI-502, SRI-805): each pass first processes
  * `config.json.apply` (the operator's rename of the pending file), deleting it
  * before anything is applied. A confirmation whose fingerprint matches the
  * pass's applies the bytes and the change plan that pass derived: an invalid
  * candidate logs `reload-invalid` and changes nothing; a valid one runs step
- * 1 (b.jg5 SRJ-1511: record the retired keys of removed personas, a renamed
+ * 1 (b.jg5 SRJ-1511: when a persona it brings up, an added one or a
+ * destructive modify's new half, has an unwritten drop in the stored-choice
+ * store, first write that store's record, a failure of that write failing
+ * the apply with nothing applied, b.deo SRI-408 beside SRJ-804; then record
+ * the retired keys of removed personas, a renamed
  * persona's old key included, and of the old halves of destructive modifies,
  * and the key of each persona it brings up that is held as retired only in
  * memory, durably through the injected retired-key store, a failure of that
@@ -52,13 +57,16 @@
  * are removed again, a key held as retired before the apply staying retired,
  * SRJ-804; once the rewrite succeeded, begin an old-life hold on each
  * removed or destructively modified key's `cscb_<key>` at its old working
- * directory, SRJ-809; then swap the applied state and tell `onApplied`), then steps 2–6
+ * directory, SRJ-809, drop the stored choices of each of those keys, b.deo
+ * SRI-406, and mark each destructive modify's key as retiring, b.deo
+ * SRI-502; then swap the applied state and tell `onApplied`), then steps 2–6
  * of `reload-apply.ts` in order (by default through the
  * lifecycle operations: step 2 tears down each removed persona and the old
  * half of each destructive modify, steps 3 and 4 update in place and
  * reconnect, step 5 refreshes the agent-director template when the config
  * directories changed, and step 6 brings up each added persona and the new
- * half of each destructive modify), and logs
+ * half of each destructive modify; the retiring keys are cleared once step 2
+ * has settled, before step 3 starts), and logs
  * `reload-applied`, or `reload-noop` when nothing effective changed. A
  * mismatched, unreadable or malformed confirmation applies nothing and logs
  * `reload-stale-confirmation`. The pending state is then refreshed against
@@ -67,7 +75,9 @@
  * The controller (`createReloadController`) is built with every dependency
  * injected, as `createCronScheduler` is: the SR-8.1 paths, the durable
  * writer and delete, the server's retired-key store (`retired-keys.ts`,
- * whose writes go through the same writer), the dialog approver stop that
+ * whose writes go through the same writer), an accessor over the server's
+ * stored-choice store (`channel-delivery.ts`, b.deo SRI-406, SRI-408,
+ * SRI-502), which only a confirmed apply calls, the dialog approver stop that
  * step 1 calls for each key it records (b.jg5 SRJ-808), the server's
  * old-life hold set step 1 begins holds in (b.jg5 SRJ-809), the log sink, the
  * lifecycle operations (the start bring-up pass, and the apply's per-step
@@ -95,6 +105,12 @@ import {
   durableWriteFileSync,
   DurableWriteUnsyncedError,
 } from './atomic-write.ts'
+import {
+  CHANNEL_DELIVERY_DROP_RETIRED,
+  CHANNEL_DELIVERY_WRITE_FAILED,
+  type ChannelDeliveryDrop,
+  type ChannelDeliveryStore,
+} from './channel-delivery.ts'
 import {
   configFileReadFailureMessage,
   configReadFailurePredicate,
@@ -142,6 +158,7 @@ import {
   renderStaleConfirmationLogLine,
   runApplySteps,
   type ApplyBringUpOptions,
+  type ApplyStepName,
   type ApplyStepSlots,
   type InPlaceApplyInput,
   type StaleConfirmationReason,
@@ -198,7 +215,8 @@ export { RELOAD_APPLIED, RELOAD_NOOP, RELOAD_STALE_CONFIRMATION } from './reload
  * nothing is applied and the change stays pending. At a confirmed apply the
  * same class names a failed write of the retired-key record at step 1, and
  * a failed rewrite's line says how the retired-key record's restore went
- * (b.jg5 SRJ-804).
+ * (b.jg5 SRJ-804), and a failed write of the stored-choice file before a
+ * bring-up (b.deo SRI-408).
  */
 export const RELOAD_RECORD_WRITE_FAILED = 'reload-record-write-failed'
 
@@ -243,6 +261,27 @@ export function reloadRetiredKeysPutBackFailedClause(path: string): string {
   return (
     `; putting the retired-key record ${JSON.stringify(path)} back to what it held before this apply failed, so the keys this ` +
     'apply recorded stay retired (b.jg5 SRJ-804)'
+  )
+}
+
+/**
+ * The one `reload-record-write-failed` line of a failed write of the
+ * stored-choice file at step 1 (b.deo SRI-408 beside b.jg5 SRJ-804): a key
+ * the confirmed change brings up has an unwritten drop, and writing it before
+ * the bring-up failed, so nothing is applied. Names the stored-choice file at
+ * `channelDeliveryPath` and the last-applied record at `lastAppliedPath`
+ * (each quoted as JSON), and nothing else: no channel, no choice, no token,
+ * no file content and no error code (the store's own `[slack]
+ * channel-delivery:` line carries the code). Pure.
+ *
+ *   [slack] reload-record-write-failed: cannot write the stored-choice file "<path>" before bringing up a persona whose stored choices were dropped; the retired-key record is not written, the last-applied record "<path>" is not rewritten, and the confirmed change is not applied and stays pending (b.deo SRI-408; b.jg5 SRJ-804)
+ */
+export function reloadChannelDeliveryWriteFailedLine(channelDeliveryPath: string, lastAppliedPath: string): string {
+  return (
+    `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the stored-choice file ${JSON.stringify(channelDeliveryPath)} ` +
+    'before bringing up a persona whose stored choices were dropped; the retired-key record is not written, the ' +
+    `last-applied record ${JSON.stringify(lastAppliedPath)} is not rewritten, and the confirmed change is not ` +
+    'applied and stays pending (b.deo SRI-408; b.jg5 SRJ-804)'
   )
 }
 
@@ -448,6 +487,25 @@ export interface ReloadControllerDeps {
    * too, and a test builds it over the writer (and delete) it gives here.
    */
   retiredKeys: RetiredKeyStore
+  /**
+   * The server's stored-choice store (`src/channel-delivery.ts`, b.deo
+   * SRI-401): production passes an accessor over the one store `main()`
+   * loaded after the start resolution, which is why it is an accessor and
+   * not a value. The controller calls it once per confirmed apply, on the
+   * valid-plan path, before step 1's first write, and uses that store for
+   * the whole apply; nothing else calls it (not building the controller,
+   * `resolveStart`, `runStartBringUp`, a detection pass or the preview).
+   * Through it step 1 writes the unwritten drops of a key it brings up before
+   * any other write, and fails closed when that write fails (b.deo SRI-408
+   * beside b.jg5 SRJ-804); drops the stored choices of every key it retires
+   * once the last-applied rewrite has succeeded (b.deo SRI-406); and marks
+   * each destructive modify's key as retiring, clearing it once step 2 has
+   * settled (b.deo SRI-502), all beside b.av2 SR-8.6 as amended by b.jg5
+   * SRJ-1511. In production its writes reach the disk through
+   * `durableWriteFileSync`; a test builds it over the writer seam the
+   * reload harness gives.
+   */
+  channelDelivery: () => ChannelDeliveryStore
   /**
    * Stop the dialog approver running for a key apply step 1 recorded as
    * retired (b.jg5 SRJ-808, SRJ-404: production `stopDialogApprover` with
@@ -1321,6 +1379,12 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
 // Controller
 // ---------------------------------------------------------------------------
 
+/**
+ * Apply step 2, the teardowns: a confirmed apply runs it on its own, then
+ * clears the retiring keys before steps 3–6 (b.deo SRI-502).
+ */
+const TEARDOWNS_STEP: ApplyStepName = 'teardowns'
+
 /** The reload controller handle. */
 export interface ReloadController {
   /**
@@ -1572,6 +1636,61 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     }
   }
 
+  /**
+   * Step 1's first write (b.deo SRI-408 beside b.jg5 SRJ-804): when a key the
+   * plan brings up (`plan.added`, a key-changing rename's new key included,
+   * and `plan.destructive`'s new halves) has an unwritten drop in
+   * `channelDelivery`, write the record the store holds in memory, once.
+   * Answers false only when that write failed (an unsynced rename included);
+   * the store has then logged its own line with the error code. Writes
+   * nothing when no such key has an unwritten drop, or when the store is
+   * unreadable. A successful write carries only drops already in force, so
+   * nothing later in step 1 undoes it.
+   */
+  function writeDropsBeforeBringUp(channelDelivery: ChannelDeliveryStore, plan: ValidChangePlan): boolean {
+    if (!channelDelivery.readable) return true
+    const broughtUp = [...plan.added, ...plan.destructive].map(({ key }) => key)
+    if (!broughtUp.some((key) => channelDelivery.hasUnwrittenDrop(key))) return true
+    return channelDelivery.writeUnwrittenDrops() !== CHANNEL_DELIVERY_WRITE_FAILED
+  }
+
+  /**
+   * Drop the stored choices of every key the apply retires (b.deo SRI-406),
+   * once the last-applied rewrite has succeeded: each removed persona's key
+   * (a key-changing rename's old key included) and each destructive modify's
+   * key, the keys `retiredKeysToRecord` records as `removed` and
+   * `destructive-modify`, in one batch with the retired reason. A failed
+   * write is the store's own line and leaves an unwritten drop; a throw is
+   * logged, never raised: the apply goes on.
+   */
+  function dropRetiredChoices(channelDelivery: ChannelDeliveryStore, plan: ValidChangePlan): void {
+    const batch = [...plan.removed, ...plan.destructive].map(
+      ({ key }): ChannelDeliveryDrop => ({ key, reason: CHANNEL_DELIVERY_DROP_RETIRED }),
+    )
+    if (batch.length === 0) return
+    try {
+      channelDelivery.drop(batch)
+    } catch (err) {
+      deps.log(`[slack] reload: dropping the stored choices of the retired keys failed: ${describeThrownValue(err)} (b.deo SRI-406)`)
+    }
+  }
+
+  /**
+   * Open or close the retiring window of `keys` (b.deo SRI-502): `begin`
+   * marks them as retiring in `channelDelivery`, the end clears them. Memory
+   * only. A throw is logged, never raised: the apply goes on.
+   */
+  function setRetiring(channelDelivery: ChannelDeliveryStore, keys: readonly string[], begin: boolean): void {
+    if (keys.length === 0) return
+    try {
+      if (begin) channelDelivery.beginRetiring(keys)
+      else channelDelivery.endRetiring(keys)
+    } catch (err) {
+      const what = begin ? 'marking' : 'clearing'
+      deps.log(`[slack] reload: ${what} the retiring keys failed: ${describeThrownValue(err)} (b.deo SRI-502)`)
+    }
+  }
+
   /** Tell the server the new applied configuration; a throw is logged, never raised. */
   function notifyApplied(config: PersonaConfig): void {
     try {
@@ -1585,8 +1704,19 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
    * Apply a confirmed candidate (b.av2 SR-8.6): the exact bytes and the plan
    * the tick derived from them, never a second read or diff. An invalid
    * candidate logs one `reload-invalid` line and changes nothing. A valid one
-   * runs step 1 (b.jg5 SRJ-1511) in one synchronous stretch, with no await
-   * between its writes:
+   * runs step 1 (b.jg5 SRJ-1511; b.deo SRI-805) in one synchronous stretch,
+   * with no await between its writes, over the one stored-choice store
+   * `channelDelivery` answers, asked once here, before the first write.
+   * First, when a key the apply brings up (an added persona, a key-changing
+   * rename's new key included, or a destructive modify's new half) has an
+   * unwritten drop, the stored-choice store's record is written (b.deo
+   * SRI-408 beside SRJ-804). When that write fails (an unsynced rename
+   * included), one `reload-record-write-failed` line names the stored-choice
+   * file (`reloadChannelDeliveryWriteFailedLine`) and nothing is applied: no
+   * retired-key record is written, no approver stopped, nothing rewritten,
+   * held, dropped or marked, and the change stays pending. Nothing is written
+   * when no such key has an unwritten drop, or when the store is unreadable.
+   * Then:
    *   1. record the retired keys (`retiredKeysToRecord`, SRJ-803) with one
    *      write of the retired-key store, when there are any: each removed
    *      persona's key (a renamed persona's old key included) as `removed`,
@@ -1611,11 +1741,20 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
    *      included) and each destructive modify's key holds its old life's
    *      working directory (`oldLifeHoldsToBegin`, SRJ-809), before any
    *      teardown's kill; a failed retired-key write above began none
-   *      either;
+   *      either. Then the stored choices of those same keys are dropped in
+   *      one batch with the retired reason (b.deo SRI-406), and each
+   *      destructive modify's key is marked as retiring (b.deo SRI-502), in
+   *      both modes and whether or not the store is readable. A failed drop
+   *      write is the store's own line and never fails the apply; a failed
+   *      stored-choice write, retired-key write or rewrite above drops
+   *      nothing and marks nothing;
    *   3. swap the applied state and tell `onApplied`.
    * Then the bound steps 2–6 run in order (`applyStepsFor`: none but the
    * template refresh for a no-op, and that only when the config directories
-   * changed), then `reload-applied` or `reload-noop` is logged. A candidate
+   * changed): step 2 on its own first, and once it has settled (fulfilled,
+   * rejected, unbound or not run) the retiring keys are cleared, before step
+   * 3 starts (b.deo SRI-502), on every path out of the apply; then steps 3–6.
+   * Then `reload-applied` or `reload-noop` is logged. A candidate
    * whose only changes are recorded ones (the section the switch does not
    * select) has no effective change: it rewrites the record, swaps the
    * applied state and logs `reload-noop`, with no lifecycle operation
@@ -1625,8 +1764,9 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
    * launch, reconnect or in-place operation and every session is kept
    * (b.deo SRI-203). Resolves
    * whether the applied state changed. Rejects only on a programming error (a
-   * plan naming a key its configuration lacks), before anything is written;
-   * the tick logs it as a failed pass.
+   * plan naming a key its configuration lacks, or a `channelDelivery`
+   * accessor with no store to answer), before anything is written; the tick
+   * logs it as a failed pass.
    */
   async function applyConfirmed(state: PendingState): Promise<boolean> {
     const current = appliedState
@@ -1639,9 +1779,20 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     // A valid plan always comes from bytes that were read and parsed.
     if (candidate.kind !== 'valid' || bytes === undefined) return false
     const inputs = applyStepInputs(plan, current.config, candidate.config)
+    const steps = applyStepsFor(plan)
+    // b.deo SRI-406, SRI-408, SRI-502: the one stored-choice store, asked
+    // once per apply, before step 1's first write, and used for the whole
+    // apply.
+    const channelDelivery = deps.channelDelivery()
 
-    // Step 1 (SRJ-1511): record, rewrite and restore in one synchronous
-    // stretch, so no mark, clear or other write of the store comes between.
+    // Step 1 (SRJ-1511; b.deo SRI-805): write, record, rewrite and restore in
+    // one synchronous stretch, so no mark, clear or other write of either
+    // store comes between. b.deo SRI-408 beside SRJ-804: a key brought up
+    // with an unwritten drop has it written first, or nothing is applied.
+    if (!writeDropsBeforeBringUp(channelDelivery, plan)) {
+      deps.log(reloadChannelDeliveryWriteFailedLine(channelDelivery.path, paths.lastApplied))
+      return false
+    }
     const store = deps.retiredKeys
     const batch = retiredKeysToRecord(plan, store)
     const recorded = batch.length === 0 ? undefined : store.record(batch)
@@ -1666,12 +1817,26 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     // holds its old life's working directory from now, before any teardown's
     // kill; a failed write or rewrite above began none.
     beginStepOneHolds(plan, current.config)
-    appliedState = { config: candidate.config, bytes, source: 'config' }
-    notifyApplied(candidate.config)
-
-    await runApplySteps(applySlots, inputs, applyStepsFor(plan), (step, err) =>
-      deps.log(`[slack] reload: apply step ${applyStepNumber(step)} (${step}) failed: ${describeThrownValue(err)}`),
-    )
+    // b.deo SRI-406: the retired keys' stored choices stop applying now, in
+    // the same synchronous stretch; a failed write never fails the apply.
+    dropRetiredChoices(channelDelivery, plan)
+    // b.deo SRI-502: each destructive modify's key is retiring from here
+    // until step 2 has settled, so no call stores a choice for it meanwhile.
+    const retiring = plan.destructive.map(({ key }) => key)
+    setRetiring(channelDelivery, retiring, true)
+    const onStepFailure = (step: ApplyStepName, err: unknown): void =>
+      deps.log(`[slack] reload: apply step ${applyStepNumber(step)} (${step}) failed: ${describeThrownValue(err)}`)
+    try {
+      appliedState = { config: candidate.config, bytes, source: 'config' }
+      notifyApplied(candidate.config)
+      // Step 2 on its own, so the retiring window closes once it has
+      // settled, before step 3 starts; `runApplySteps` keeps its order and
+      // failure isolation across the two calls.
+      await runApplySteps(applySlots, inputs, steps.filter((step) => step === TEARDOWNS_STEP), onStepFailure)
+    } finally {
+      setRetiring(channelDelivery, retiring, false)
+    }
+    await runApplySteps(applySlots, inputs, steps.filter((step) => step !== TEARDOWNS_STEP), onStepFailure)
     deps.log(plan.noEffectiveChange ? renderNoopLogLine(paths.lastApplied) : renderAppliedLogLine(plan, paths.lastApplied))
     return true
   }
