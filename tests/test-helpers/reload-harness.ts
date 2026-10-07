@@ -101,10 +101,14 @@
  *   fsync after the rename. The retired-key store's writes go through the
  *   same writer, so a confirmed apply with a retired key to record makes the
  *   retired-key write first and the last-applied write second (count `call`
- *   accordingly). `h.failRemoves(...)` / `h.clearRemoveFailure()`
- *   do the same for the controller's durable delete (`durableUnlinkSync`
- *   over its own seam, default `unlinkSync`; `{ step: 'fsyncSync' }` fails
- *   the directory fsync after the unlink). The two seams count calls apart.
+ *   accordingly). The stored-choice store's writes go through the same
+ *   writer path but never fail on this seam, which does not count their
+ *   calls: their own seam is `h.failChannelDeliveryWrites` (see the
+ *   stored-choice store, below). `h.failRemoves(...)` /
+ *   `h.clearRemoveFailure()` do the same for the controller's durable
+ *   delete (`durableUnlinkSync` over its own seam, default `unlinkSync`;
+ *   `{ step: 'fsyncSync' }` fails the directory fsync after the unlink).
+ *   Each of the three seams counts its calls apart from the others.
  *   File permissions are never the seam: the suite may run as root;
  * - confirmations (b.av2 SR-8.5): `h.confirm()` is the operator's gesture
  *   exactly, one rename of `paths.pending` to `paths.apply` with no content
@@ -267,7 +271,7 @@
  *   `run.clock`) for the single 5 s cadence case; `run.ticks` is then unused;
  * - `run.controller`: the real `createReloadController` over `h.paths`, the
  *   recorder's ops, the seam writer and remover, the run's retired-key store
- *   (below), `run.ticks`, the dry-run
+ *   and its stored-choice store accessor (below), `run.ticks`, the dry-run
  *   flag, `heldCredentialsDigest` bound to `run.bringUps.credentialsDigest`
  *   (as `server.ts` binds it; `opts.heldCredentialsDigest` wraps that lookup,
  *   e.g. to make it throw so a detection pass fails), `bringUpState` bound
@@ -326,6 +330,37 @@
  *   before its start pass; `run.stop()` resets the install when it is the
  *   run's own, and `h.cleanup()` always does. A run without `realLaunch`
  *   installs none;
+ * - the stored-choice store (b.deo SRI-403, SRI-1203): every run loads one
+ *   store over `h.stateDir` (`loadChannelDeliveryAtStart`) in
+ *   `run.resolveStart()` once the start resolves to an applied
+ *   configuration, as `main()` loads its one store: after the resolution and
+ *   before the start bring-up pass, in both modes and in dry run, with the
+ *   start rules over the applied personas and the run's retired-key store. A
+ *   refused start loads none. The controller gets it as `channelDelivery`,
+ *   an accessor with `main()`'s guard (it throws when an apply runs before
+ *   the load), so a confirmed apply's step 1 writes unwritten drops before a
+ *   bring-up, drops the retired keys' choices and marks the retiring keys
+ *   through it (b.deo SRI-406, SRI-408, SRI-502). `run.channelDelivery` is
+ *   the store; reading it before the start resolved to an applied
+ *   configuration throws. Its lines go to `run.logs` and its times come from
+ *   `run.clock`. Its writes take the run's writer path, so they are in
+ *   `run.writes` in order with the record writes, `opts.beforeWrite` and
+ *   `opts.stopBeforeWrite` see them, `run.captured()` holds the file while it
+ *   exists and `h.serverSideFiles` sweeps it; their failures come from their
+ *   own seam, `h.failChannelDeliveryWrites({ step?, code?, call? })` /
+ *   `h.clearChannelDeliveryWriteFailure()` (`failWrites`' options, its own
+ *   call count; `h.failWrites` never fails a stored-choice write). Its
+ *   deletes go through the run's delete (`run.removes`, `h.failRemoves`).
+ *   The file's path is `channelDeliveryPath(h.stateDir)`
+ *   (`h.channelDeliveryFile`; `h.channelDeliveryWrite(ok?)` is a writer call
+ *   on it as `run.writes` holds it). `h.readChannelDelivery()` reads the
+ *   record through the module's parser (null when there is no file); seed a
+ *   valid record with `writeChannelDeliveryRecord(h.stateDir, entries)` from
+ *   `tests/test-helpers/channel-delivery.ts`, and invalid or unreadable bytes
+ *   with `h.writeChannelDeliveryBytes(bytes)`, which writes exactly those
+ *   bytes outside every seam and record. A later run over the same
+ *   directories (a restart) loads a fresh store from the disk, so its
+ *   retiring keys and unwritten drops start empty;
  * - the old-life holds (b.jg5 SRJ-809): every run builds one hold set, empty
  *   (`createOldLifeHoldSet`, its lines to `run.logs`, as `main()` builds its
  *   one set beside the store), and hands it to the controller as
@@ -400,7 +435,7 @@
  *   the same over any slice, e.g. `run.since(cp).logs`. A `reload-invalid`
  *   line is not an emission;
  * - `run.writes` every call of the controller's writer (path, success), the
- *   retired-key store's included;
+ *   retired-key store's and the stored-choice store's included;
  *   `run.removes` every call of its durable delete as what happened to the
  *   file (`ok`: it is gone; `removed`: this call removed it; `unsynced`: it
  *   was removed but the directory sync failed, so the delete threw although
@@ -582,6 +617,13 @@ import {
   durableWriteFileSync,
   type DurableWriteFs,
 } from '../../src/atomic-write.ts'
+import {
+  channelDeliveryDeclarationOf,
+  channelDeliveryPath,
+  loadChannelDeliveryAtStart,
+  type ChannelDeliveryRecord,
+  type ChannelDeliveryStore,
+} from '../../src/channel-delivery.ts'
 import {
   DM_DESTINATION,
   MAX_RELOAD_FILE_BYTES,
@@ -776,6 +818,7 @@ import {
   type StubCallLog,
   type StubClientOptions,
 } from './agent-director-stub.ts'
+import { readChannelDeliveryRecord } from './channel-delivery.ts'
 import {
   APP_TOKEN_PREFIX,
   BOT_TOKEN_PREFIX,
@@ -1701,8 +1744,8 @@ export interface ReloadRunOptions {
   killLeavesRowLive?: (id: string) => boolean
   /**
    * Called with the path before every call of the controller's writer (the
-   * record, the pending file, the retired-key record), e.g. to observe what
-   * exists when the record is written.
+   * record, the pending file, the retired-key record, the stored-choice
+   * file), e.g. to observe what exists when the record is written.
    */
   beforeWrite?: (path: string) => void
   /**
@@ -1765,7 +1808,7 @@ export interface ReloadRun {
   readonly lifecycle: ReloadLifecycleRecorder
   /** The `[slack]` stream: every line the reload controller, bring-up controller and manager logged, in order. */
   readonly logs: string[]
-  /** Every call of the controller's writer, in order. */
+  /** Every call of the controller's writer, in order: the retired-key store's and the stored-choice store's writes included. */
   readonly writes: readonly ReloadWriteRecord[]
   /** Every call of the controller's durable delete, in order. */
   readonly removes: readonly ReloadRemoveRecord[]
@@ -1781,6 +1824,22 @@ export interface ReloadRun {
    * (`setRetiredKeyStore`) until the run stops (b.jg5 SRJ-805, SRJ-806).
    */
   readonly retiredKeys: RetiredKeyStore
+  /**
+   * The run's one stored-choice store (b.deo SRI-403, SRI-1203):
+   * `loadChannelDeliveryAtStart` over `h.stateDir`, loaded by
+   * `run.resolveStart()` once the start resolves to an applied configuration
+   * (in dry run too), with the start rules over the applied personas and
+   * `run.retiredKeys`, as `main()` loads its one store, and handed to the
+   * controller as `channelDelivery`. Its lines go to `run.logs`; its clock is
+   * `run.clock`; its writes take the run's writer path (in `run.writes`,
+   * seen by `opts.beforeWrite` and `opts.stopBeforeWrite`) over their own
+   * failure seam, `h.failChannelDeliveryWrites`; its deletes go through the
+   * run's delete (`run.removes`, `h.failRemoves`). Reading it before the
+   * start resolved to an applied configuration, or after a refused start,
+   * throws. A later run (a restart) loads a fresh store from the disk, so
+   * its retiring keys and unwritten drops start empty.
+   */
+  readonly channelDelivery: ChannelDeliveryStore
   /**
    * The run's old-life hold set, read-only (`createOldLifeHoldSet`, b.jg5
    * SRJ-809), built empty at the run's start as `main()` builds its one set,
@@ -2111,6 +2170,30 @@ export interface ReloadHarness {
   retiredKeysWrite(ok?: boolean): ReloadRunActivity['writes'][number]
   /** A writer call on the last-applied record (`paths.lastApplied`), as `run.writes` holds it. */
   lastAppliedWrite(ok?: boolean): ReloadRunActivity['writes'][number]
+  /** The stored-choice file's path, `channelDeliveryPath(stateDir)` (b.deo SRI-401, SRI-1203). */
+  readonly channelDeliveryFile: string
+  /**
+   * A writer call on the stored-choice file, as `run.writes` holds it: a
+   * drop's write, the write of unwritten drops before a bring-up, or a
+   * stored choice's write (b.deo SRI-404 to SRI-408, SRI-1203).
+   */
+  channelDeliveryWrite(ok?: boolean): ReloadRunActivity['writes'][number]
+  /**
+   * The stored-choice record as the module's parser reads it
+   * (`readChannelDeliveryRecord` over `h.stateDir`, from
+   * `tests/test-helpers/channel-delivery.ts`), or null when there is no file
+   * (b.deo SRI-1203). Throws when the parser refuses the file. Seed a
+   * valid record with `writeChannelDeliveryRecord(h.stateDir, entries)`
+   * (`tests/test-helpers/channel-delivery.ts`).
+   */
+  readChannelDelivery(): ChannelDeliveryRecord | null
+  /**
+   * Put exactly `bytes` at `h.channelDeliveryFile`, outside every seam and
+   * record (not in `run.writes`, not in `run.captured()`), for an invalid or
+   * unreadable seed (b.deo SRI-403, SRI-1203); returns them. A valid seed
+   * goes through `writeChannelDeliveryRecord` instead.
+   */
+  writeChannelDeliveryBytes(bytes: string | Uint8Array): Buffer
   /** The persona key of `name` (`personaKey`). */
   key(name: string): string
   /** A file-form persona named `name`: its own `all` channel, DMs off, paths under `<root>/personas/<key>/`. */
@@ -2269,6 +2352,18 @@ export interface ReloadHarness {
   failRemoves(failure?: Partial<WriteFailure>): void
   /** Let the controller's durable delete succeed again. */
   clearRemoveFailure(): void
+  /**
+   * Make the stored-choice store's writer fail (default every `openSync`
+   * call, `EIO`) until cleared (b.deo SRI-1203): the same `WriteFailure`
+   * options as `failWrites`, on its own seam, which fails only the store's
+   * writes and counts their calls apart from `failWrites` (whose seam never
+   * fails a stored-choice write). `{ step: 'fsyncSync', call: 2 }` fails the
+   * directory fsync after the rename (an unsynced rename); `{ step:
+   * 'fsyncSync' }` fails the file's fsync first, before any rename.
+   */
+  failChannelDeliveryWrites(failure?: Partial<WriteFailure>): void
+  /** Let the stored-choice store's writer succeed again. */
+  clearChannelDeliveryWriteFailure(): void
   /**
    * Set `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` to distinct sentinel-bearing
    * fakes and record every read of them through `process.env` (a proxy over
@@ -2444,6 +2539,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
 
   const writeSeam = makeFailureSeam('openSync')
   const removeSeam = makeFailureSeam('unlinkSync')
+  /** The stored-choice store's own write-failure seam (b.deo SRI-1203), counted apart from `writeSeam`. */
+  const channelDeliveryWriteSeam = makeFailureSeam('openSync')
 
   /** Runs that reached their `opts.stopBeforeWrite` stop point and were not stopped yet. */
   const runsStoppedBeforeWrite = new Set<ReloadRun>()
@@ -3247,22 +3344,31 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         return DEFAULT_WORKING_DIRECTORY_FS.stat(path)
       },
     }
-    // The run's writer and delete: the controller's, and the retired-key
-    // store's, so both reach the disk through the same seams and records.
-    const write = (path: string, bytes: Uint8Array): void => {
+    // The run's writer path over one failure seam: every writer call is
+    // recorded in `writes`, in order, and passes `opts.beforeWrite` and
+    // `opts.stopBeforeWrite`, whichever seam it goes through.
+    const writerOver = (fs: DurableWriteFs) => (path: string, bytes: Uint8Array): void => {
       if (stopImage === undefined && runOpts.stopBeforeWrite === path) {
         stopImage = diskImage()
         runsStoppedBeforeWrite.add(run)
       }
       runOpts.beforeWrite?.(path)
       try {
-        durableWriteFileSync(path, bytes, writeSeam.fs)
+        durableWriteFileSync(path, bytes, fs)
       } catch (err) {
         writes.push({ path, ok: false })
         throw err
       }
       writes.push({ path, ok: true })
     }
+    // The run's writer and delete: the controller's, and the retired-key
+    // store's, so both reach the disk through the same seams and records.
+    const write = writerOver(writeSeam.fs)
+    // The stored-choice store's writer (b.deo SRI-1203): the same writer
+    // path, over its own failure seam (`h.failChannelDeliveryWrites`), so
+    // `h.failWrites` never fails a stored-choice write and neither seam
+    // counts the other's calls.
+    const writeChannelDelivery = writerOver(channelDeliveryWriteSeam.fs)
     const remove = (path: string): boolean => {
       let removed: boolean
       try {
@@ -3284,10 +3390,45 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     // As main() builds its one set beside the store (b.jg5 SRJ-809): in
     // memory only, so each run (a server start) begins with none.
     const oldLifeHolds = createOldLifeHoldSet({ log })
+    /**
+     * The run's one stored-choice store (b.deo SRI-403, SRI-1203): loaded by
+     * `run.resolveStart()` once the start resolves to an applied
+     * configuration, as `main()` loads its one store; undefined before that
+     * and after a refused start.
+     */
+    let channelDeliveryStore: ChannelDeliveryStore | undefined
+    /**
+     * As `main()` loads it (b.deo SRI-403, SRI-407): right after the start
+     * resolved the configuration it runs and before the start bring-up pass,
+     * behind no branch (both modes, dry run too), the start rules over the
+     * applied personas and the run's retired-key store. Its lines go to
+     * `run.logs`, its clock is `run.clock`, its writes take the run's writer
+     * path over its own failure seam and its deletes the run's delete.
+     */
+    function loadChannelDeliveryForStart(start: PersonaConfig): void {
+      channelDeliveryStore = loadChannelDeliveryAtStart(
+        stateDir,
+        {
+          applied: start.personas.map((persona) => ({
+            key: persona.key,
+            declaration: channelDeliveryDeclarationOf(persona),
+          })),
+          retiredKeys,
+        },
+        { log, write: writeChannelDelivery, remove, now: () => connections.clock.now() },
+      )
+    }
     const approverStops: ReloadApproverStop[] = []
     controller = createReloadController({
       paths,
       retiredKeys,
+      // As main() passes it (b.deo SRI-406, SRI-408, SRI-502): an accessor
+      // over the run's one stored-choice store, with main()'s guard for an
+      // apply before the start loaded it.
+      channelDelivery: () => {
+        if (channelDeliveryStore === undefined) throw new Error('a confirmed apply ran before the start loaded the stored-choice store')
+        return channelDeliveryStore
+      },
       // As main() passes it (b.jg5 SRJ-809): apply step 1 begins its holds in
       // the run's one set, the set a realLaunch run installs for the session
       // manager.
@@ -3447,6 +3588,14 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       writes,
       removes,
       retiredKeys,
+      get channelDelivery() {
+        if (channelDeliveryStore === undefined) {
+          throw new Error(
+            "reload-harness: run.channelDelivery was read before the run's start resolved to an applied configuration (no stored-choice store is loaded yet)",
+          )
+        }
+        return channelDeliveryStore
+      },
       retryTimers:
         retryTimers === undefined
           ? undefined
@@ -3499,6 +3648,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         outcome = controller.resolveStart()
         if (outcome.kind === 'applied') {
           startConfig = outcome.config
+          // One store per run, loaded at main()'s point: after the resolution,
+          // before the template install and the start bring-up pass.
+          if (channelDeliveryStore === undefined) loadChannelDeliveryForStart(outcome.config)
           installTemplateAtStart(outcome.config)
         }
         return outcome
@@ -3854,6 +4006,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     retiredKeysFile: retiredKeysPath(stateDir),
     retiredKeysWrite: (ok = true) => ({ path: retiredKeysPath(stateDir), ok }),
     lastAppliedWrite: (ok = true) => ({ path: paths.lastApplied, ok }),
+    channelDeliveryFile: channelDeliveryPath(stateDir),
+    channelDeliveryWrite: (ok = true) => ({ path: channelDeliveryPath(stateDir), ok }),
+    readChannelDelivery: () => readChannelDeliveryRecord(stateDir),
+    writeChannelDeliveryBytes: (bytes) => writeBytes(channelDeliveryPath(stateDir), bytes),
     key: (name) => personaKey(name),
     persona(name, overrides = {}) {
       let channel = channels.get(name)
@@ -4048,6 +4204,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     clearWriteFailure: () => writeSeam.clear(),
     failRemoves: (failure) => removeSeam.fail(failure),
     clearRemoveFailure: () => removeSeam.clear(),
+    failChannelDeliveryWrites: (failure) => channelDeliveryWriteSeam.fail(failure),
+    clearChannelDeliveryWriteFailure: () => channelDeliveryWriteSeam.clear(),
     poisonTokenEnvironment() {
       if (tokenWatch !== undefined) throw new Error('reload-harness: the token environment is already poisoned')
       const original = process.env

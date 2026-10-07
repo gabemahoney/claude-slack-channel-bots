@@ -455,7 +455,7 @@ import type * as SessionManagerModule from '../src/session-manager.ts'
 import type * as LiveRowSequenceModule from '../src/live-row-sequence.ts'
 import type { LiveRowSequenceRegistry, LiveRowSequenceRegistryOptions } from '../src/live-row-sequence.ts'
 import type { LatchRecheckInput, OldLifeHoldEndRetryDeps, OldLifeWaitBindings, PendingRowRuleDepsInput, PendingRowRuleInstall } from '../src/session-manager.ts'
-import type { SessionAdmissionOptions } from '../src/registry.ts'
+import type { SessionAdmissionOptions, SessionToolDeps } from '../src/registry.ts'
 import type { OldLifeHoldSet } from '../src/retired-keys.ts'
 import type { HealthCheckDeps } from '../src/health-check.ts'
 import type * as OutageStateModule from '../src/outage-state.ts'
@@ -5567,6 +5567,46 @@ describe('server.ts\'s file guard refuses every persona credentials file (b.av2 
       const [bodyStart, bodyEnd] = balancedAfter(code, balancedAfter(code, fn, '(', ')')[1], '{', '}')
       expect([path, at > bodyStart && at < bodyEnd]).toEqual([path, true])
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: the session tools read the channel mode at call time
+// (b.deo SRI-201, SRI-601)
+// ---------------------------------------------------------------------------
+
+/** The session tools' channel-mode reader (b.deo SRI-601); renaming it fails the typecheck. */
+const SESSION_TOOLS_CHANNEL_MODE: keyof SessionToolDeps = 'getChannelMode'
+
+describe('the session tools read the channel mode of the configuration in effect at each call (b.deo SRI-201, SRI-601)', () => {
+  // b.deo SRI-601, SRI-201: a tool call's target check reads the mode from the
+  // configuration in effect at that call. The member is optional in
+  // SessionToolDeps, so only this audit makes sure production binds it, binds
+  // it to the applied config holder, and hands it to the session server: a
+  // mode taken once at start (a const or let, a value handed in, a later
+  // reassignment of the member) or a different deps object would not follow
+  // the configuration in effect.
+  test('sessionToolDeps, built at module scope and passed to createSessionServer, has getChannelMode exactly `() => channelModeOf(<applied config holder>)`, and server.ts names channelModeOf only there and in its import, and getChannelMode only there', () => {
+    const holder = loadedConfigName(SERVER_CODE)
+    // An arrow with no parameters whose body calls config.ts's channelModeOf
+    // on the holder itself, so each call reads the holder anew.
+    const props = objectProperties(spreadConstObject('sessionToolDeps'))
+    expect(props.get(SESSION_TOOLS_CHANNEL_MODE)).toBe(`() => channelModeOf(${holder})`)
+    expect(importSource(SERVER_CODE, 'channelModeOf')).toBe('./config.ts')
+    expect(indicesOf(/\b(?:function|let|const|var)\s+channelModeOf\b/g, SERVER_CODE)).toEqual([])
+
+    // The deps object is built at module scope, so the arrow closes over the
+    // module-scope holder, and it is the object the session server receives.
+    const deps = SERVER_CODE.search(/\bconst\s+sessionToolDeps\s*:\s*SessionToolDeps\s*=\s*\{/)
+    expect(deps).toBeGreaterThan(-1)
+    expect(insideMain(deps)).toBe(false)
+    expect(onlyCallArgs('createSessionServer')[1]).toBe('sessionToolDeps')
+
+    // Nothing takes the mode once: channelModeOf is named only in its import
+    // and this member, and the member is named nowhere else, so nothing
+    // reassigns it or binds a second one.
+    expect(indicesOf(/\bchannelModeOf\b/g, SERVER_CODE)).toHaveLength(2)
+    expect(indicesOf(new RegExp(`\\b${SESSION_TOOLS_CHANNEL_MODE}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
   })
 })
 
