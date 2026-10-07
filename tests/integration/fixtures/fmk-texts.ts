@@ -293,7 +293,11 @@
  *                                                CHANNEL_MODES) on, for the personas named, in
  *                                                order, each keyed by the package's personaKey
  *   channelModeOf <true|false>                   src/config.ts: the name of the mode the switch's
- *                                                value picks
+ *                                                value picks, keyed by MODE_SWITCH_SETTING
+ *   formatPersonaDiagnostic <class> <index> <name> <key> <cause>
+ *                                                src/persona-diagnostics.ts: a persona line with
+ *                                                no path, <class> one of its
+ *                                                PERSONA_DIAGNOSTIC_CLASSES
  *   MODE_SWITCH_SETTING                          src/reload-plan.ts, the switch's key
  *   CHANNEL_DELIVERY_FILE_NAME                   src/channel-delivery.ts, the stored-choice file
  *   CHANNEL_DELIVERY_LOG_PREFIX                  src/channel-delivery.ts, the head of the store's
@@ -3756,7 +3760,11 @@ const channelDeliveryDiagnosticClasses: Entry = {
   },
 }
 
-/** `channelModeOf({ allow_invited_channels: <true|false> })` (config.ts): the name of the mode the switch's value picks. */
+/**
+ * `channelModeOf({ <MODE_SWITCH_SETTING>: <true|false> })` (config.ts): the
+ * name of the mode the switch's value picks, the switch keyed by the
+ * package's MODE_SWITCH_SETTING (reload-plan.ts).
+ */
 const channelModeOfSwitch: Entry = {
   synopsis: '<true|false>',
   async print(args, context) {
@@ -3764,8 +3772,31 @@ const channelModeOfSwitch: Entry = {
     expectArguments(entry, args, ['true|false'])
     const [value] = args
     if (value !== 'true' && value !== 'false') usageFail(`${entry}: the switch's value must be true or false (got '${value}')`)
-    const modeOf = await packageFunction<(config: { allow_invited_channels: boolean }) => unknown>(context, 'config.ts', entry)
-    return builtString(entry, modeOf({ allow_invited_channels: value === 'true' }))
+    const modeOf = await packageFunction<(config: Record<string, boolean>) => unknown>(context, 'config.ts', entry)
+    return builtString(entry, modeOf({ [await packageString(context, 'reload-plan.ts', 'MODE_SWITCH_SETTING')]: value === 'true' }))
+  },
+}
+
+/**
+ * `formatPersonaDiagnostic({ class, index, name, key, cause })`
+ * (persona-diagnostics.ts): a persona line with no path, <class> one of the
+ * package's PERSONA_DIAGNOSTIC_CLASSES and <index> a whole number in decimal.
+ */
+const personaDiagnosticLine: Entry = {
+  synopsis: '<class> <index> <name> <key> <cause>',
+  async print(args, context) {
+    const entry = 'formatPersonaDiagnostic'
+    expectArguments(entry, args, ['class', 'index', 'name', 'key', 'cause'])
+    const [diagnosticClass, index, name, key, cause] = args
+    const classes = await packageExport(context, 'persona-diagnostics.ts', 'PERSONA_DIAGNOSTIC_CLASSES')
+    if (!Array.isArray(classes) || !classes.includes(diagnosticClass)) usageFail(`${entry}: <class> '${diagnosticClass}' is not one of the package's PERSONA_DIAGNOSTIC_CLASSES`)
+    if (!/^(0|[1-9][0-9]{0,8})$/.test(index!)) usageFail(`${entry}: <index> '${index}' is not a whole number in decimal`)
+    const format = await packageFunction<(diagnostic: { class: string; index: number; name: string; key: string; cause: string }) => unknown>(
+      context,
+      'persona-diagnostics.ts',
+      entry,
+    )
+    return builtString(entry, format({ class: diagnosticClass!, index: Number(index), name: name!, key: key!, cause: cause! }))
   },
 }
 
@@ -4006,6 +4037,7 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   CHANNEL_DELIVERY_FILE_NAME: constantEntry('channel-delivery.ts', 'CHANNEL_DELIVERY_FILE_NAME'),
   CHANNEL_DELIVERY_LOG_PREFIX: constantEntry('channel-delivery.ts', 'CHANNEL_DELIVERY_LOG_PREFIX'),
   CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES: channelDeliveryDiagnosticClasses,
+  formatPersonaDiagnostic: personaDiagnosticLine,
 }, argsEntries(ARGS_ENTRIES), fnEntries(FN_ENTRIES))
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */

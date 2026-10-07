@@ -454,11 +454,29 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
     scenario20Values[ref]?.()
   })
 
+  // test-29's lists the printer checks an argument against or prints whole:
+  // each a non-empty array of strings, a class label on one line.
+  const nonEmptyStrings = (value: unknown, oneLine: boolean): void => {
+    expect(Array.isArray(value)).toBe(true)
+    const list = value as readonly unknown[]
+    expect(list.length).toBeGreaterThan(0)
+    expect(list.filter((v) => typeof v !== 'string' || v === '' || (oneLine && v.includes('\n')))).toEqual([])
+  }
+  const test29Values: Readonly<Record<string, () => void>> = {
+    'delivery-decision.ts:FUNGIBLE_REFUSALS:defined': () => nonEmptyStrings(deliveryDecision.FUNGIBLE_REFUSALS, false),
+    'config.ts:CHANNEL_MODES:defined': () => nonEmptyStrings(config.CHANNEL_MODES, false),
+    'config.ts:DELIVERY_MODES:defined': () => nonEmptyStrings(config.DELIVERY_MODES, false),
+    'channel-delivery.ts:CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES:defined': () => nonEmptyStrings(channelDelivery.CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES, true),
+    'persona-diagnostics.ts:PERSONA_DIAGNOSTIC_CLASSES:defined': () => nonEmptyStrings(personaDiagnostics.PERSONA_DIAGNOSTIC_CLASSES, true),
+  }
+
   // test-29's references (test-29-invited-channels.sh, b.deo SRI-1404), each
   // `<file>:<export>:<kind>`: the invited-channel texts it matches, the
-  // switch's key, mode name and class labels its upgrade phase checks no
+  // persona lines' framing, the switch's key (the configuration's and the
+  // mode lookup's), mode name and class labels its upgrade phase checks no
   // line names, and the applied line, tmux session names and relaunch line
-  // it reads beside them.
+  // it reads beside them; with what the scenario reads of the value beyond
+  // its kind, when it reads more.
   test.each([
     'reload-apply.ts:RELOAD_APPLIED:constant',
     'persona-identity.ts:personaKey:function',
@@ -488,11 +506,15 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
     'config.ts:DELIVERY_MODES:defined',
     'config.ts:channelModeOf:function',
     'reload-plan.ts:MODE_SWITCH_SETTING:constant',
+    'reload-plan.ts:MODE_SWITCH_SETTING:string',
     'channel-delivery.ts:CHANNEL_DELIVERY_FILE_NAME:constant',
     'channel-delivery.ts:CHANNEL_DELIVERY_LOG_PREFIX:constant',
     'channel-delivery.ts:CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES:defined',
+    'persona-diagnostics.ts:formatPersonaDiagnostic:function',
+    'persona-diagnostics.ts:PERSONA_DIAGNOSTIC_CLASSES:defined',
   ])("test-29's printer reads %s", (ref) => {
     expect(named.has(ref)).toBe(true)
+    test29Values[ref]?.()
   })
 
   test('every file the printer names is a src/ module this file imports', () => {

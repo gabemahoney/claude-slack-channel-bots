@@ -34,19 +34,21 @@
 #   and nothing is written.
 # - Switch on (SRI-1406): the switch and alpha's `invited.permission_prompts`;
 #   the pending file carries the switch's line; its confirmation applies it
-#   with both sessions kept (no registration or launch line).
+#   with both sessions kept (no registration or launch line, read after a
+#   delivery on each persona's connection, in phase B).
 # - B, fungible mode (SRI-1407 steps 1 to 11): the fungible path, both orders
 #   of a mention's two events, a broadcast, a private channel, the externally
 #   shared, missing and non-boolean flags, a group DM, alpha's own fungible
 #   destination, then set_channel_delivery: stored, refused, held by the loop
-#   guard, and shared delivery.
+#   guard, and shared delivery, exactly once to each persona.
 # - Restart (SRI-1408): a plain stop (the bots keep running) and a live start;
 #   the stored-choice file keeps its bytes; the reconnect's new MCP clients
 #   repeat no call (SRI-1403); the stored choice applies again.
-# - Switch off (SRI-1409): declarative mode again, sessions kept, the stored
-#   choice inert and the file unchanged.
-# - Closing (SRI-1410): no token-like text anywhere; `stop --stop-bots`; the
-#   port closed; the elapsed time on the PASS line.
+# - Switch off (SRI-1409): declarative mode again, sessions kept (read after
+#   a delivery on each persona's connection), the stored choice inert and the
+#   file unchanged.
+# - Closing (SRI-1410): `stop --stop-bots`; the port closed; the Slack stub
+#   stopped; no token-like text anywhere; the elapsed time on the PASS line.
 #
 # Runtime rules (SRI-1401). Every wait polls and returns once its condition
 # holds. Nothing waits on a health tick (off), a restart delay, a dedupe
@@ -60,7 +62,7 @@
 # on the same connection, never after a quiet period. Every push has its own
 # `ts`, but the two events of one mention and the one message pushed to both
 # personas.
-# Measured runtime: 86 s on the cscb-ci image (the PASS line's elapsed time);
+# Measured runtime: 87 s on the cscb-ci image (the PASS line's elapsed time);
 # the target is under about 4 minutes.
 #
 # Texts. Every text src/ exports comes from fixtures/fmk-texts.ts (the one
@@ -196,13 +198,9 @@ done
 STUB_SESSION_MARKER='"summary":"stub-claude session"'
 
 # --- Expected text (fragments quoted from src/ and the fixtures) ----------
-# src/persona-diagnostics.ts formatPersonaDiagnostic: a persona line is
-#   [slack] <class>: personas[<i>] "<name>" (key=<key>): <cause>
-# with the class and the cause from the printer.
-persona_line() {
-    local class="$1" index="$2" ref="$3" cause="$4"
-    printf '[slack] %s: personas[%s] %s: %s\n' "${class}" "${index}" "${ref}" "${cause}"
-}
+# A persona line (src/persona-diagnostics.ts formatPersonaDiagnostic) comes
+# whole from the printer (persona_line, below). Its head, as a fragment: a
+# line of any persona of a class starts `[slack] <class>:`.
 # src/persona-routing.ts logDrop, its plain line (no export): a `not-mentioned`
 # or `group-dm` drop (src/delivery-decision.ts DeliveryDropReason, a type only).
 plain_drop() {
@@ -246,6 +244,17 @@ REFUSAL_FLAG_NOT_BOOLEAN='flag-not-boolean'
 # Call it only in a stand-alone assignment: `V="$(printed …)"`.
 printed() {
     bun "${PRINTER}" "$@" || fail "fmk-texts: $*"
+}
+
+# persona_line <class> <alpha|bravo> <cause>: the persona's line of <class>
+# with <cause> (src/persona-diagnostics.ts formatPersonaDiagnostic, from the
+# printer), keyed by persona_key. Call it as `printed` is called.
+persona_line() {
+    case "$2" in
+        alpha) printed formatPersonaDiagnostic "$1" "${ALPHA_INDEX}" "${ALPHA}" "${ALPHA_KEY}" "$3" ;;
+        bravo) printed formatPersonaDiagnostic "$1" "${BRAVO_INDEX}" "${BRAVO}" "${BRAVO_KEY}" "$3" ;;
+        *) fail "persona_line: '$2' is neither alpha nor bravo" ;;
+    esac
 }
 
 # The server log's mark: its line count now (0 when there is none).
@@ -343,20 +352,17 @@ print(count)
 EOF
 
 # The stub MCP session's request and results records, for SRI-1403's checks
-# (fixtures/stub-mcp-session.ts, "The key" and its line formats):
-#   ids <stub-dir> <requests-prefix> <suffix> <dir>...  every request ID, one per line
-#   skipped <log> <ids-file>                            exit 0 once the log holds a skip
-#                                                       line for every ID of <ids-file>
-#   once <stub-dir> <requests-prefix> <results-prefix> <suffix> <dir>...
-#                                                       exit 0 when every request ID has
-#                                                       exactly one result line
+# (fixtures/stub-mcp-session.ts, its line formats), each file a path resolved
+# once below (REQUESTS_FILE, RESULTS_FILE):
+#   ids <requests-file>...               every request ID, one per line
+#   skipped <log> <ids-file>             exit 0 once the log holds a skip line for
+#                                        every ID of <ids-file>
+#   once (<requests-file> <results-file>)...
+#                                        exit 0 when every request ID has exactly
+#                                        one result line
 STUB_RECORDS="${SCENARIO_ROOT}/stub-records.py"
 cat > "${STUB_RECORDS}" << 'EOF'
-import hashlib, json, os, sys
-
-def record(stub, prefix, suffix, d):
-    key = hashlib.sha256(os.path.realpath(d).encode("utf-8")).hexdigest()
-    return os.path.join(stub, f"{prefix}{key}{suffix}")
+import json, sys
 
 def lines(path):
     try:
@@ -367,9 +373,8 @@ def lines(path):
 
 cmd, *args = sys.argv[1:]
 if cmd == "ids":
-    stub, prefix, suffix, *dirs = args
-    for d in dirs:
-        for req in lines(record(stub, prefix, suffix, d)):
+    for path in args:
+        for req in lines(path):
             print(req["id"])
 elif cmd == "skipped":
     log, ids_file = args
@@ -382,16 +387,17 @@ elif cmd == "skipped":
         sys.exit(1)
     sys.exit(0 if ids and all(f"request {i} has a result line; not run" in text for i in ids) else 1)
 elif cmd == "once":
-    stub, req_prefix, res_prefix, suffix, *dirs = args
+    if not args or len(args) % 2:
+        sys.exit(64)
     bad = 0
-    for d in dirs:
-        ids = [req["id"] for req in lines(record(stub, req_prefix, suffix, d))]
+    for requests, results in zip(args[0::2], args[1::2]):
+        ids = [req["id"] for req in lines(requests)]
         counts = {}
-        for res in lines(record(stub, res_prefix, suffix, d)):
+        for res in lines(results):
             counts[res["id"]] = counts.get(res["id"], 0) + 1
         for i in ids:
             if counts.get(i, 0) != 1:
-                print(f"  | request {i} of {d}: {counts.get(i, 0)} result line(s)", file=sys.stderr)
+                print(f"  | request {i} of {requests}: {counts.get(i, 0)} result line(s)", file=sys.stderr)
                 bad += 1
     sys.exit(1 if bad else 0)
 else:
@@ -424,13 +430,21 @@ expect_deliveries() {
     [[ "${got}" == "${want}" ]] || fail "${step}: ${got} deliveries of $2 ts $3${4:+ via $4} in the delivery record of $1, expected ${want}"
 }
 
-# The stub MCP session's record of a working directory (fixtures/stub-mcp-session.ts
-# "The key"): <prefix> one of the harness's SCENARIO_STUB_*_PREFIX names.
-stub_record_file() {
-    local key
-    key="$(printf '%s' "$(realpath -e -- "$2")" | sha256sum | cut -d ' ' -f 1)"
-    printf '%s/%s%s%s\n' "${SCENARIO_STUB_DIR}" "$1" "${key}" "${SCENARIO_STUB_RECORD_SUFFIX}"
-}
+# The stub MCP session's records of each persona's working directory
+# (fixtures/stub-mcp-session.ts "The key"), each path resolved once here, by
+# working directory: the harness's own key (lib/scenario.sh
+# _scenario_stub_key, the rule stub_session_deliveries and stub_session_call
+# use) under the real path of SCENARIO_STUB_DIR (_scenario_stub_dir). Either
+# helper prints its FAIL line when it cannot resolve or hash a path. Every
+# later read of a record takes these paths.
+declare -A DELIVERIES_FILE=() REQUESTS_FILE=() RESULTS_FILE=()
+STUB_REAL_DIR="$(_scenario_stub_dir "the stub MCP session's records")" || exit 1
+for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
+    record_key="$(_scenario_stub_key "the stub MCP session's records of ${dir}" "${dir}")" || exit 1
+    DELIVERIES_FILE["${dir}"]="${STUB_REAL_DIR}/${SCENARIO_STUB_DELIVERIES_PREFIX}${record_key}${SCENARIO_STUB_RECORD_SUFFIX}"
+    REQUESTS_FILE["${dir}"]="${STUB_REAL_DIR}/${SCENARIO_STUB_REQUESTS_PREFIX}${record_key}${SCENARIO_STUB_RECORD_SUFFIX}"
+    RESULTS_FILE["${dir}"]="${STUB_REAL_DIR}/${SCENARIO_STUB_RESULTS_PREFIX}${record_key}${SCENARIO_STUB_RECORD_SUFFIX}"
+done
 
 # The push wrapper. Each push gets its own `ts` (new_ts, a counter on the
 # script's start time), but the two events of one mention and the one message
@@ -647,7 +661,9 @@ write_persona_config() {
     case "$1" in
         declarative) ;;
         fungible)
-            switch=$'\n  "allow_invited_channels": true,'
+            [[ "${SWITCH_KEY:-}" =~ ^[a-z_]+$ ]] \
+                || fail "write_persona_config: the switch's key '${SWITCH_KEY:-}' is not printed yet, or not a plain key"
+            switch=$'\n  "'"${SWITCH_KEY}"$'": true,'
             invited=$',\n      "invited": { "permission_prompts": "'"${A1}"'" }'
             ;;
         switch-off)
@@ -728,20 +744,27 @@ F2_HEARD_CAUSE="$(printed invitedChannelCause "${F2}" private mentions)"
 F1_SET_CAUSE="$(printed channelDeliverySetCause "${F1}" "${NO_CHOICE}" all all)"
 F1_SET_AGAIN_CAUSE="$(printed channelDeliverySetCause "${F1}" all all all)"
 A1_SET_HELD_CAUSE="$(printed channelDeliverySetCause "${A1}" "${NO_CHOICE}" all mentions)"
-U1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" "${ALPHA_INDEX}" "${ALPHA_REF}" "${U1_CAUSE}")"
-F1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" "${ALPHA_INDEX}" "${ALPHA_REF}" "${F1_CAUSE}")"
-X1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" "${ALPHA_INDEX}" "${ALPHA_REF}" "${X1_CAUSE}")"
-X2_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" "${ALPHA_INDEX}" "${ALPHA_REF}" "${X2_CAUSE}")"
-X3_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" "${ALPHA_INDEX}" "${ALPHA_REF}" "${X3_CAUSE}")"
-ALPHA_HEARS_F1="$(persona_line "${PERSONA_INVITED_CHANNEL}" "${ALPHA_INDEX}" "${ALPHA_REF}" "${F1_HEARD_CAUSE}")"
-ALPHA_HEARS_F1_ALL="$(persona_line "${PERSONA_INVITED_CHANNEL}" "${ALPHA_INDEX}" "${ALPHA_REF}" "${F1_HEARD_ALL_CAUSE}")"
-ALPHA_HEARS_A1="$(persona_line "${PERSONA_INVITED_CHANNEL}" "${ALPHA_INDEX}" "${ALPHA_REF}" "${A1_HEARD_CAUSE}")"
-BRAVO_HEARS_F2="$(persona_line "${PERSONA_INVITED_CHANNEL}" "${BRAVO_INDEX}" "${BRAVO_REF}" "${F2_HEARD_CAUSE}")"
-BRAVO_HEARS_A1="$(persona_line "${PERSONA_INVITED_CHANNEL}" "${BRAVO_INDEX}" "${BRAVO_REF}" "${A1_HEARD_CAUSE}")"
-ALPHA_SET_F1="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" "${ALPHA_INDEX}" "${ALPHA_REF}" "${F1_SET_CAUSE}")"
-ALPHA_SET_F1_AGAIN="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" "${ALPHA_INDEX}" "${ALPHA_REF}" "${F1_SET_AGAIN_CAUSE}")"
-BRAVO_SET_A1="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" "${BRAVO_INDEX}" "${BRAVO_REF}" "${A1_SET_HELD_CAUSE}")"
-BRAVO_SET_F1="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" "${BRAVO_INDEX}" "${BRAVO_REF}" "${F1_SET_CAUSE}")"
+U1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${U1_CAUSE}")"
+F1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${F1_CAUSE}")"
+X1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${X1_CAUSE}")"
+X2_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${X2_CAUSE}")"
+X3_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${X3_CAUSE}")"
+ALPHA_HEARS_F1="$(persona_line "${PERSONA_INVITED_CHANNEL}" alpha "${F1_HEARD_CAUSE}")"
+ALPHA_HEARS_F1_ALL="$(persona_line "${PERSONA_INVITED_CHANNEL}" alpha "${F1_HEARD_ALL_CAUSE}")"
+ALPHA_HEARS_A1="$(persona_line "${PERSONA_INVITED_CHANNEL}" alpha "${A1_HEARD_CAUSE}")"
+BRAVO_HEARS_F2="$(persona_line "${PERSONA_INVITED_CHANNEL}" bravo "${F2_HEARD_CAUSE}")"
+BRAVO_HEARS_A1="$(persona_line "${PERSONA_INVITED_CHANNEL}" bravo "${A1_HEARD_CAUSE}")"
+ALPHA_SET_F1="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" alpha "${F1_SET_CAUSE}")"
+ALPHA_SET_F1_AGAIN="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" alpha "${F1_SET_AGAIN_CAUSE}")"
+BRAVO_SET_A1="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" bravo "${A1_SET_HELD_CAUSE}")"
+BRAVO_SET_F1="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" bravo "${F1_SET_CAUSE}")"
+# alpha's persona-invited-channel head, whatever the cause: its line printed
+# with a marker cause and cut there.
+INVITED_MARKER="${TEST_NAME}-cause-marker"
+ALPHA_INVITED_LINE="$(persona_line "${PERSONA_INVITED_CHANNEL}" alpha "${INVITED_MARKER}")"
+[[ "${ALPHA_INVITED_LINE}" == *"${INVITED_MARKER}" && -n "${ALPHA_INVITED_LINE%"${INVITED_MARKER}"}" ]] \
+    || fail "fmk-texts: formatPersonaDiagnostic does not end in its cause after a head"
+ALPHA_INVITED_HEAD="${ALPHA_INVITED_LINE%"${INVITED_MARKER}"}"
 ALPHA_DECLARATIVE_REFUSAL="$(printed channelDeliveryDeclarativeRefusal "${ALPHA}" "${ALPHA_KEY}")"
 ALPHA_X1_REFUSAL="$(printed channelDeliveryChannelRefusal "${ALPHA}" "${ALPHA_KEY}" "${X1}")"
 BAD_DELIVERY='everything'
@@ -854,18 +877,43 @@ expect_tool "phase A: alpha's set_channel_delivery A1 all" "${ALPHA_DIR}" \
 cmp -s -- "${CONFIG}" "${CONFIG_A_COPY}" || fail "phase A: config.json changed after the refused call"
 check_upgrade_log "phase A after its last control"
 
-# --- Switch on (SRI-1406) ---------------------------------------------------
-ALPHA_LAUNCHES="$(launch_counts "${ALPHA_REF}" "${ALPHA_START}" "${ALPHA_RELAUNCH}")"
-BRAVO_LAUNCHES="$(launch_counts "${BRAVO_REF}" "${BRAVO_START}" "${BRAVO_RELAUNCH}")"
-applied_before="$(count_log "${APPLIED_CLASS}")"
+# --- The mode switch (SRI-1406, SRI-1409) -----------------------------------
+# confirm_switch <fungible|switch-off> <switch-line> <step>: note each
+# persona's registration and launch lines (launch_counts), write the
+# configuration of that shape, wait for the pending file to carry the
+# switch's line, confirm it and wait for its applied line; config.json's
+# last-applied record then holds its bytes.
+confirm_switch() {
+    local shape="$1" line="$2" step="$3" applied_before
+    ALPHA_LAUNCHES="$(launch_counts "${ALPHA_REF}" "${ALPHA_START}" "${ALPHA_RELAUNCH}")"
+    BRAVO_LAUNCHES="$(launch_counts "${BRAVO_REF}" "${BRAVO_START}" "${BRAVO_RELAUNCH}")"
+    applied_before="$(count_log "${APPLIED_CLASS}")"
+    write_persona_config "${shape}"
+    wait_for_file "${PENDING}" "${TICK_WAIT_S}" "${step}: config.json.pending never appeared"
+    wait_until 10 "${step}: the pending file never carried the switch's line" pending_has_line "${line}"
+    check_pending_layout "${step}"
+    mv -f -- "${PENDING}" "${APPLY}"
+    wait_for_count "${APPLIED_CLASS}" $(( applied_before + 1 )) "${APPLY_WAIT_S}" "${step}: the confirmation was never applied"
+    cmp -s -- "${CONFIG}" "${LAST}" || fail "${step}: config.json.last-applied does not hold config.json's bytes"
+}
 
-write_persona_config fungible
-wait_for_file "${PENDING}" "${TICK_WAIT_S}" "switch on: config.json.pending never appeared"
-wait_until 10 "switch on: the pending file never carried the switch's line" pending_has_line "${SWITCH_ON_LINE}"
-check_pending_layout "switch on"
-mv -f -- "${PENDING}" "${APPLY}"
-wait_for_count "${APPLIED_CLASS}" $(( applied_before + 1 )) "${APPLY_WAIT_S}" "switch on: the confirmation was never applied"
-cmp -s -- "${CONFIG}" "${LAST}" || fail "switch on: config.json.last-applied does not hold config.json's bytes"
+# expect_sessions_kept <step> <alpha-channel> <alpha-ts> <bravo-channel> <bravo-ts>:
+# the switch kept both sessions: no registration and no launch line for
+# either persona since confirm_switch noted them. Read after a delivery on
+# each persona's connection made since the confirmation (the message given
+# for each), which this checks is in that persona's delivery record.
+expect_sessions_kept() {
+    local step="$1"
+    delivered "${ALPHA_DIR}" "$2" "$3" || fail "${step}: no delivery of $2 ts $3 to ${ALPHA}, the positive control"
+    delivered "${BRAVO_DIR}" "$4" "$5" || fail "${step}: no delivery of $4 ts $5 to ${BRAVO}, the positive control"
+    [[ "$(launch_counts "${ALPHA_REF}" "${ALPHA_START}" "${ALPHA_RELAUNCH}")" == "${ALPHA_LAUNCHES}" ]] \
+        || fail "${step}: a session registration or launch line for ${ALPHA} after the confirmation"
+    [[ "$(launch_counts "${BRAVO_REF}" "${BRAVO_START}" "${BRAVO_RELAUNCH}")" == "${BRAVO_LAUNCHES}" ]] \
+        || fail "${step}: a session registration or launch line for ${BRAVO} after the confirmation"
+}
+
+# --- Switch on (SRI-1406) ---------------------------------------------------
+confirm_switch fungible "${SWITCH_ON_LINE}" "switch on"
 
 # --- Phase B: fungible mode (SRI-1407) --------------------------------------
 # 1. alpha, public F1 (flag false), plain: no delivery, a not-mentioned line,
@@ -877,12 +925,6 @@ wait_since "${B1_MARK}" "$(plain_drop "${ALPHA_REF}" "${F1}" "${DROP_NOT_MENTION
     "step 1: no not-mentioned line for alpha F1"
 expect_deliveries "step 1: alpha F1 plain" 0 "${ALPHA_DIR}" "${F1}" "${B1_TS}"
 expect_since "${B1_MARK}" "${ALPHA_HEARS_F1}" 1 "step 1: alpha's persona-invited-channel lines for F1"
-# The switch kept both sessions (SRI-1406): no registration and no launch
-# line since the edit, read after step 1's outcome.
-[[ "$(launch_counts "${ALPHA_REF}" "${ALPHA_START}" "${ALPHA_RELAUNCH}")" == "${ALPHA_LAUNCHES}" ]] \
-    || fail "switch on: a session registration or launch line for ${ALPHA} after the confirmation"
-[[ "$(launch_counts "${BRAVO_REF}" "${BRAVO_START}" "${BRAVO_RELAUNCH}")" == "${BRAVO_LAUNCHES}" ]] \
-    || fail "switch on: a session registration or launch line for ${BRAVO} after the confirmation"
 
 # 2. alpha, F1, a mention as app_mention then message: one delivery with
 #    `mention`, no unclaimed-channel line.
@@ -913,6 +955,9 @@ push_message "${BRAVO_LABEL}" "${F2}" group "$(mention_text "${BRAVO_BOT_USER}")
 B4_TS="${PUSH_TS}"
 wait_delivered "step 4: bravo F2 mention" "${BRAVO_DIR}" "${F2}" "${B4_TS}" "${VIA_MENTION}"
 expect_since "${B4_MARK}" "${BRAVO_HEARS_F2}" 1 "step 4: bravo's persona-invited-channel lines for F2"
+# The switch kept both sessions (SRI-1406), read after alpha's step 3
+# broadcast and bravo's step 4 mention, each delivered since the confirmation.
+expect_sessions_kept "switch on" "${F1}" "${B3_HERE_TS}" "${F2}" "${B4_TS}"
 
 # 5. alpha, X1 (flag true), X2 (no flag) and X3 (a flag that is not a
 #    boolean, beyond SRI-1407's two: SRI-1402's non-boolean form), each
@@ -1007,6 +1052,14 @@ push_both "${F1}" channel "$(plain_text)"
 B11_TS="${PUSH_TS}"
 wait_delivered "step 11: alpha F1 plain (shared)" "${ALPHA_DIR}" "${F1}" "${B11_TS}" "${VIA_RECEIVE_ALL_SHARED}"
 wait_delivered "step 11: bravo F1 plain (shared)" "${BRAVO_DIR}" "${F1}" "${B11_TS}" "${VIA_RECEIVE_ALL_SHARED}"
+# A later delivery on each persona's connection (an F1 mention, `mention`),
+# after which the shared message's counts are final: exactly one each.
+push_message "${ALPHA_LABEL}" "${F1}" channel "$(mention_text "${ALPHA_BOT_USER}")"
+wait_delivered "step 11: alpha F1 mention, after the shared message" "${ALPHA_DIR}" "${F1}" "${PUSH_TS}" "${VIA_MENTION}"
+push_message "${BRAVO_LABEL}" "${F1}" channel "$(mention_text "${BRAVO_BOT_USER}")"
+wait_delivered "step 11: bravo F1 mention, after the shared message" "${BRAVO_DIR}" "${F1}" "${PUSH_TS}" "${VIA_MENTION}"
+expect_deliveries "step 11: alpha F1 plain (shared)" 1 "${ALPHA_DIR}" "${F1}" "${B11_TS}"
+expect_deliveries "step 11: bravo F1 plain (shared)" 1 "${BRAVO_DIR}" "${F1}" "${B11_TS}"
 
 # --- Persistence across a restart (SRI-1408, SRI-1403) ----------------------
 STORE_BEFORE_RESTART="${SCENARIO_ROOT}/store-before-restart.json"
@@ -1014,7 +1067,7 @@ cp -- "${STORE_FILE}" "${STORE_BEFORE_RESTART}"
 declare -A DELIVERIES_BEFORE=()
 for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
     DELIVERIES_BEFORE["${dir}"]="${SCENARIO_ROOT}/deliveries-before-restart.$(basename "${dir}")"
-    cp -- "$(stub_record_file "${SCENARIO_STUB_DELIVERIES_PREFIX}" "${dir}")" "${DELIVERIES_BEFORE[${dir}]}"
+    cp -- "${DELIVERIES_FILE[${dir}]}" "${DELIVERIES_BEFORE[${dir}]}"
 done
 completions_before="$(count_log "${STARTUP_COMPLETE}")"
 alpha_connected_before="$(count_log "$(session_connected "${ALPHA_REF}")")"
@@ -1023,9 +1076,8 @@ alpha_sockets_before="$(rec_count event=ws-open label="${ALPHA_LABEL}")"
 bravo_sockets_before="$(rec_count event=ws-open label="${BRAVO_LABEL}")"
 RESTART_MARK="$(log_mark)"
 IDS_BEFORE_RESTART="${SCENARIO_ROOT}/request-ids-before-restart"
-python3 "${STUB_RECORDS}" ids "${SCENARIO_STUB_DIR}" "${SCENARIO_STUB_REQUESTS_PREFIX}" \
-    "${SCENARIO_STUB_RECORD_SUFFIX}" "${ALPHA_DIR}" "${BRAVO_DIR}" > "${IDS_BEFORE_RESTART}" \
-    || fail "restart: could not read the request files"
+python3 "${STUB_RECORDS}" ids "${REQUESTS_FILE[${ALPHA_DIR}]}" "${REQUESTS_FILE[${BRAVO_DIR}]}" \
+    > "${IDS_BEFORE_RESTART}" || fail "restart: could not read the request files"
 [[ -s "${IDS_BEFORE_RESTART}" ]] || fail "restart: no request was made before the restart"
 
 stop_server
@@ -1049,8 +1101,7 @@ wait_until "${RECORD_WAIT_S}" "restart: no new WebSocket for ${BRAVO_LABEL}" \
 cmp -s -- "${STORE_FILE}" "${STORE_BEFORE_RESTART}" || fail "restart: ${STORE_FILE} changed across the restart"
 for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
     cmp -s -n "$(stat -c '%s' "${DELIVERIES_BEFORE[${dir}]}")" -- "${DELIVERIES_BEFORE[${dir}]}" \
-        "$(stub_record_file "${SCENARIO_STUB_DELIVERIES_PREFIX}" "${dir}")" \
-        || fail "restart: the delivery record of ${dir} no longer holds its earlier lines"
+        "${DELIVERIES_FILE[${dir}]}" || fail "restart: the delivery record of ${dir} no longer holds its earlier lines"
 done
 
 # alpha calls the tool for F1 with `all` before any F1 event: accepted as a
@@ -1066,8 +1117,8 @@ expect_since "${RESTART_MARK}" "${ALPHA_SET_F1_AGAIN}" 1 "restart: alpha's perso
 # has more than one result line.
 wait_until "${EVENT_WAIT_S}" "restart: the reconnect's new clients did not skip every request made before the restart" \
     python3 "${STUB_RECORDS}" skipped "${STUB_BIN}/stub-mcp-session.log" "${IDS_BEFORE_RESTART}"
-python3 "${STUB_RECORDS}" once "${SCENARIO_STUB_DIR}" "${SCENARIO_STUB_REQUESTS_PREFIX}" \
-    "${SCENARIO_STUB_RESULTS_PREFIX}" "${SCENARIO_STUB_RECORD_SUFFIX}" "${ALPHA_DIR}" "${BRAVO_DIR}" \
+python3 "${STUB_RECORDS}" once "${REQUESTS_FILE[${ALPHA_DIR}]}" "${RESULTS_FILE[${ALPHA_DIR}]}" \
+    "${REQUESTS_FILE[${BRAVO_DIR}]}" "${RESULTS_FILE[${BRAVO_DIR}]}" \
     || fail "restart: a request ID has no result line, or more than one"
 
 # alpha, F1, plain: delivered `receive_all_shared`; exactly one
@@ -1075,22 +1126,13 @@ python3 "${STUB_RECORDS}" once "${SCENARIO_STUB_DIR}" "${SCENARIO_STUB_REQUESTS_
 push_message "${ALPHA_LABEL}" "${F1}" channel "$(plain_text)"
 wait_delivered "restart: alpha F1 plain" "${ALPHA_DIR}" "${F1}" "${PUSH_TS}" "${VIA_RECEIVE_ALL_SHARED}"
 expect_since "${RESTART_MARK}" "${ALPHA_HEARS_F1_ALL}" 1 "restart: alpha's persona-invited-channel lines for F1 in this run"
-expect_since "${RESTART_MARK}" "$(matcher "[slack] ${PERSONA_INVITED_CHANNEL}: personas[${ALPHA_INDEX}] ${ALPHA_REF}" " ${F1} ")" 1 \
+expect_since "${RESTART_MARK}" "$(matcher "${ALPHA_INVITED_HEAD}" " ${F1} ")" 1 \
     "restart: alpha's persona-invited-channel lines naming F1 in this run"
 
 # --- Switch off (SRI-1409) --------------------------------------------------
 STORE_BEFORE_OFF="${SCENARIO_ROOT}/store-before-off.json"
 cp -- "${STORE_FILE}" "${STORE_BEFORE_OFF}"
-ALPHA_LAUNCHES="$(launch_counts "${ALPHA_REF}" "${ALPHA_START}" "${ALPHA_RELAUNCH}")"
-BRAVO_LAUNCHES="$(launch_counts "${BRAVO_REF}" "${BRAVO_START}" "${BRAVO_RELAUNCH}")"
-applied_before="$(count_log "${APPLIED_CLASS}")"
-
-write_persona_config switch-off
-wait_for_file "${PENDING}" "${TICK_WAIT_S}" "switch off: config.json.pending never appeared"
-wait_until 10 "switch off: the pending file never carried the switch's line" pending_has_line "${SWITCH_OFF_LINE}"
-check_pending_layout "switch off"
-mv -f -- "${PENDING}" "${APPLY}"
-wait_for_count "${APPLIED_CLASS}" $(( applied_before + 1 )) "${APPLY_WAIT_S}" "switch off: the confirmation was never applied"
+confirm_switch switch-off "${SWITCH_OFF_LINE}" "switch off"
 
 # alpha, F1, plain: no delivery, one 0.11.1 unclaimed-channel line.
 OFF_MARK="$(log_mark)"
@@ -1102,27 +1144,33 @@ expect_deliveries "switch off: alpha F1 plain" 0 "${ALPHA_DIR}" "${F1}" "${OFF_F
 
 # alpha, A1, plain: delivered `receive_all`, by its listed entry.
 push_message "${ALPHA_LABEL}" "${A1}" channel "$(plain_text)"
-wait_delivered "switch off: alpha A1 plain" "${ALPHA_DIR}" "${A1}" "${PUSH_TS}" "${VIA_RECEIVE_ALL}"
-# Both sessions kept: no registration and no launch line since the edit,
-# read after the delivery above.
-[[ "$(launch_counts "${ALPHA_REF}" "${ALPHA_START}" "${ALPHA_RELAUNCH}")" == "${ALPHA_LAUNCHES}" ]] \
-    || fail "switch off: a session registration or launch line for ${ALPHA} after the confirmation"
-[[ "$(launch_counts "${BRAVO_REF}" "${BRAVO_START}" "${BRAVO_RELAUNCH}")" == "${BRAVO_LAUNCHES}" ]] \
-    || fail "switch off: a session registration or launch line for ${BRAVO} after the confirmation"
+OFF_A1_TS="${PUSH_TS}"
+wait_delivered "switch off: alpha A1 plain" "${ALPHA_DIR}" "${A1}" "${OFF_A1_TS}" "${VIA_RECEIVE_ALL}"
+
+# bravo, B1, a mention: delivered `mention`, by its listed entry.
+push_message "${BRAVO_LABEL}" "${B1}" channel "$(mention_text "${BRAVO_BOT_USER}")"
+OFF_B1_TS="${PUSH_TS}"
+wait_delivered "switch off: bravo B1 mention" "${BRAVO_DIR}" "${B1}" "${OFF_B1_TS}" "${VIA_MENTION}"
+# Both sessions kept, read after the two deliveries above.
+expect_sessions_kept "switch off" "${A1}" "${OFF_A1_TS}" "${B1}" "${OFF_B1_TS}"
 
 # alpha's call for F1: refused with the declarative text; the file unchanged.
 expect_tool "switch off: alpha's set_channel_delivery F1 all" "${ALPHA_DIR}" "${F1_ALL_ARGS}" true "${ALPHA_DECLARATIVE_REFUSAL}"
 cmp -s -- "${STORE_FILE}" "${STORE_BEFORE_OFF}" || fail "switch off: ${STORE_FILE} changed"
 
 # --- Closing (SRI-1410) -----------------------------------------------------
-# SRI-1410's files: server.log and its rotations, the stub's record, the
-# delivery and results records and the stored-choice file; and, beside them,
-# the request files, the client's log and the stub's output.
+stop_server --stop-bots
+port_closed "${SCENARIO_PORT}" || fail "closing: something still answers on 127.0.0.1:${SCENARIO_PORT}"
+stop_tracked_pid "${STUB_PID}" 10 "the Slack stub did not exit on SIGTERM"
+
+# The token scan, read once every writer has stopped (the files stay until
+# the EXIT trap removes the scratch root). SRI-1410's files: server.log and
+# its rotations, the stub's record, the delivery and results records and the
+# stored-choice file; and, beside them, the request files, the client's log
+# and the stub's output.
 leak_files=("${SLACK_STATE_DIR}"/server.log* "${STUB_RECORD}" "${STORE_FILE}")
 for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
-    leak_files+=("$(stub_record_file "${SCENARIO_STUB_DELIVERIES_PREFIX}" "${dir}")"
-        "$(stub_record_file "${SCENARIO_STUB_RESULTS_PREFIX}" "${dir}")"
-        "$(stub_record_file "${SCENARIO_STUB_REQUESTS_PREFIX}" "${dir}")")
+    leak_files+=("${DELIVERIES_FILE[${dir}]}" "${RESULTS_FILE[${dir}]}" "${REQUESTS_FILE[${dir}]}")
 done
 for file in "${leak_files[@]}"; do
     [[ -f "${file}" ]] || fail "closing: ${file} is missing"
@@ -1130,11 +1178,6 @@ done
 leak_files+=("${STUB_BIN}/stub-mcp-session.log" "${STUB_OUT}")
 n="$(count_token_like "${leak_files[@]}")"
 [[ "${n}" == 0 ]] || fail "closing: ${n} token-like match(es) in server.log, the stub's record, the stub MCP session's records or ${STORE_FILE}"
-
-stop_server --stop-bots
-port_closed "${SCENARIO_PORT}" || fail "closing: something still answers on 127.0.0.1:${SCENARIO_PORT}"
-# The stub is stopped as cleanup only.
-stop_tracked_pid "${STUB_PID}" 10 "the Slack stub did not exit on SIGTERM"
 
 # The tmux sessions and stub-claude's transcripts go in the exit hook
 # (cleanup_launches), which runs on a failure too.
