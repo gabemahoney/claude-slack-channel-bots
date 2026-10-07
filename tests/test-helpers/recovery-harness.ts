@@ -3258,7 +3258,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
    */
   function driver(): LostMessageDriver {
     if (lostMessageDriver !== undefined) return lostMessageDriver
-    const { notifier, hold } = makeNotifierStack({ getPersona: appliedPersona, clientFor: slackClientFor, clock, log })
+    const { notifier, hold } = makeNotifierStack({ getPersona: appliedPersona, clientFor: slackClientFor, getPersonaConfig: appliedConfig, clock, log })
     const routing = createPersonaRouting({
       getPersonaConfig: appliedConfig,
       getBotIdentity: (key) => slackStubs.get(key)?.identity,

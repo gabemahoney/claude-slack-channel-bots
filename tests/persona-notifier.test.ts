@@ -417,7 +417,7 @@ describe('dm-destination notices (SR-7.2)', () => {
     // A resolver shared with another caller (the permission poller, in the
     // server), which has already opened D's DM through its own post.
     const web = h.stub(f.D.key).web as unknown as WebClient
-    const destinations = createPersonaDestinations({ log: (line) => h.logs.push(line) })
+    const destinations = createPersonaDestinations({ log: (line) => h.logs.push(line), getPersonaConfig: () => null })
     expect(await destinations.post(f.D, web, { text: 'prompt' })).toMatchObject({ outcome: 'posted', channelId: dmId() })
     expect(methods(f.D)).toEqual(['conversations.open', 'chat.postMessage'])
     const getPersona = (key: string) => h.personas.find((p) => p.key === key)

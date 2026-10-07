@@ -315,7 +315,7 @@ async function runSeedTick(
     },
   })
   initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
-  const ivl = startManualPoller({ getClient: getClient as never, clientFor: h.clients.clientFor, getPersona: h.getPersona })
+  const ivl = startManualPoller({ getClient: getClient as never, clientFor: h.clients.clientFor, getPersona: h.getPersona, getPersonaConfig: () => null })
   await ivl.tick()
   return ivl.pending
 }

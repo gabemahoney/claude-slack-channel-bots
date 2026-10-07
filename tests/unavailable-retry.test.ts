@@ -1519,6 +1519,7 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
         getClient: () => h.stub.client as unknown as ReturnType<PollerDeps['getClient']>,
         clientFor: () => undefined,
         getPersona: (k) => h.config.personas.find((p) => p.key === k),
+        getPersonaConfig: () => h.config,
         emitTrail: () => {},
         log: (...args) => {
           if (args.map(String).join(' ').includes('get failed')) failed()
@@ -5760,6 +5761,7 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
         getClient: () => h.stub.client as unknown as ReturnType<PollerDeps['getClient']>,
         clientFor: () => undefined,
         getPersona: (k) => h.config.personas.find((p) => p.key === k),
+        getPersonaConfig: () => h.config,
         emitTrail: () => {},
         log: () => {},
       })

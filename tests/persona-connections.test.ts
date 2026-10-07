@@ -6299,6 +6299,7 @@ function makeBringUpFixture(opts: BringUpFixtureOptions = {}): BringUpFixture {
   const notifier = createPersonaNotifier({
     getPersona: key => h.getPersona(key),
     clientFor: key => h.clientFor(key),
+    getPersonaConfig: () => h.config,
     isDryRun: () => dryRun,
     log: line => void notifierLines.push(line),
   })

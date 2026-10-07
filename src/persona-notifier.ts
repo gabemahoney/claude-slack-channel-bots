@@ -139,9 +139,8 @@ import { unescapeSlackControlCharacters } from './slack-text-escape.ts'
 import { describeThrownValue, slackPlatformReason } from './persona-connection-errors.ts'
 import {
   createPersonaDestinations,
-  type DestinationConfig,
   type DestinationFailure,
-  type PersonaDestinations,
+  type PersonaDestinationsSource,
 } from './persona-destination.ts'
 import {
   MAX_HELD_NOTICES_PER_PERSONA,
@@ -235,26 +234,23 @@ export type PersonaStartupErrorRecorder = (classLabel: string, message: string) 
  */
 export type PersonaNotify = (key: string, text: string, options?: PersonaNoticeOptions) => void | Promise<void>
 
-/** Dependencies injected into `createPersonaNotifier`. */
-export interface PersonaNotifierDeps {
+/**
+ * Dependencies injected into `createPersonaNotifier`. `destinations` is the
+ * destination resolver (per-persona DM cache) shared with the permission
+ * poller, used only to build the notifier's own destination hold when
+ * `destinationHold` is not given. When `destinations` is not given,
+ * `getPersonaConfig` is (`PersonaDestinationsSource`): the notifier builds a
+ * resolver of its own over it, reading the configuration in effect at each
+ * attempt (b.deo SRI-201).
+ */
+export type PersonaNotifierDeps = PersonaNotifierOwnDeps & PersonaDestinationsSource
+
+/** The notifier's dependencies other than its destination resolver (`PersonaNotifierDeps`). */
+interface PersonaNotifierOwnDeps {
   /** The applied persona with this key, or undefined when there is none. */
   getPersona(key: string): Persona | undefined
   /** The persona's validated Web client, or undefined while it is not validated. */
   clientFor(key: string): WebClient | undefined
-  /**
-   * The destination resolver (per-persona DM cache) shared with the permission
-   * poller. Used only to build the notifier's own destination hold when
-   * `destinationHold` is not given; defaults to an instance of its own.
-   */
-  destinations?: PersonaDestinations
-  /**
-   * The configuration in effect, read at each attempt (b.deo SRI-201). Used
-   * only to build the notifier's own resolver when neither `destinationHold`
-   * nor `destinations` is given (a given resolver reads its own). Absent: that
-   * resolver takes the mode the persona of each attempt was loaded under
-   * (fungible when it carries a fungible destination).
-   */
-  getPersonaConfig?(): DestinationConfig
   /**
    * The destination hold (per-persona episodes, retries and held notices)
    * shared with the permission poller, which every notice for a validated
@@ -463,10 +459,7 @@ export function notifySafely(
 export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifier {
   const held = new Map<string, HeldNotice[]>()
   const destinationHold = deps.destinationHold ?? createPersonaDestinationHold({
-    destinations: deps.destinations ?? createPersonaDestinations({
-      log: deps.log,
-      ...(deps.getPersonaConfig !== undefined ? { getPersonaConfig: () => deps.getPersonaConfig?.() } : {}),
-    }),
+    destinations: deps.destinations ?? createPersonaDestinations({ log: deps.log, getPersonaConfig: deps.getPersonaConfig }),
     getPersona: deps.getPersona,
     clientFor: deps.clientFor,
     log: deps.log,
