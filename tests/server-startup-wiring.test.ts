@@ -374,6 +374,22 @@
  *   `armRetryTimerIfMissing` does nothing while shutting down and otherwise
  *   asks the same check (`armMissingTmuxUnavailableRetry`) over the same
  *   deps. The routing's call binds exactly its pinned members.
+ * - b.deo SRI-403 beside b.av2 SR-8.7: the stored-choice store's start load
+ *   (`loadChannelDeliveryAtStart`) is called once, in main()'s own statement
+ *   list (so in both modes and in dry run too), after the start resolution
+ *   and the start-time applied config's assignment, and before the first
+ *   await after them, the start sweep, the start bring-up, the PID file, the
+ *   connection manager and `Bun.serve`; it loads over the server state
+ *   directory, the start's applied personas and the one retired-key store,
+ *   with only a log of its own (to console.error). Its result is assigned
+ *   once to the one module-scope holder (`channelDeliveryStore`), which is
+ *   otherwise only read, at call time: by the reload controller's
+ *   `channelDelivery` accessor and by the routing's and the session tools'
+ *   `getChannelDelivery`, each exactly `() => channelDeliveryStore`. The
+ *   session tools also get the routing's heard set, the applied personas of
+ *   the configuration in effect and the server log (b.deo SRI-502, SRI-505).
+ *   No other src file calls the start load, and none but the store module
+ *   calls the store factory.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -400,6 +416,7 @@ import {
   insideMain as insideMainOf,
   loadedConfigName,
   mainBody,
+  maskLiterals,
   objectProperties,
   onlyCallArguments,
   shutdownBody,
@@ -464,8 +481,9 @@ import type * as PersonaConnectionsModule from '../src/persona-connections.ts'
 import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
 import type { PersonaNotifier } from '../src/persona-notifier.ts'
 import type { PersonaConfig } from '../src/config.ts'
-import type { PersonaRoutingDeps } from '../src/persona-routing.ts'
+import type { PersonaRouting, PersonaRoutingDeps } from '../src/persona-routing.ts'
 import type { PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
+import type * as ChannelDeliveryModule from '../src/channel-delivery.ts'
 
 const SRC_DIR = fileURLToPath(new URL('../src/', import.meta.url))
 const SERVER_PATH = join(SRC_DIR, 'server.ts')
@@ -5537,7 +5555,8 @@ describe('server.ts\'s file guard refuses every persona credentials file (b.av2 
   // retired-key record, which only the server writes, so a record grown past
   // the cap never stops a start (behaviour in tests/retired-keys.test.ts);
   // and the start's read of the stored-choice file (b.deo SRI-403), which
-  // only the server writes, so a file of any size loads. Every other reader
+  // only the server writes, so a file of any size loads (behaviour in
+  // tests/channel-delivery.test.ts). Every other reader
   // (the start's config, the last-applied record, the pending and apply
   // files, the reload tick) must stay capped; this audit fails if any other
   // call site passes the option, or names it.
@@ -5609,6 +5628,216 @@ describe('the session tools read the channel mode of the configuration in effect
     // reassigns it or binds a second one.
     expect(indicesOf(/\bchannelModeOf\b/g, SERVER_CODE)).toHaveLength(2)
     expect(indicesOf(new RegExp(`\\b${SESSION_TOOLS_CHANNEL_MODE}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: the stored-choice store's start load and its one holder
+// (b.deo SRI-403 beside b.av2 SR-8.7)
+//
+// What the load does (the read, the unreadable state, the start rules) is
+// driven through the module in tests/channel-delivery.test.ts. What only
+// server.ts holds is where main() loads the store, with what, that it holds
+// the one store in one module-scope holder, and that every reader reads that
+// holder at call time.
+// ---------------------------------------------------------------------------
+
+/** The store's start load and its factory (b.deo SRI-403, SRI-407); typed against the module, so a rename fails the typecheck. */
+const CHANNEL_DELIVERY_START_LOAD: keyof typeof ChannelDeliveryModule = 'loadChannelDeliveryAtStart'
+const CHANNEL_DELIVERY_FACTORY: keyof typeof ChannelDeliveryModule = 'loadChannelDeliveryStore'
+/** The declaration a stored choice is kept under (b.deo SRI-407); typed against the module. */
+const CHANNEL_DELIVERY_DECLARATION_OF: keyof typeof ChannelDeliveryModule = 'channelDeliveryDeclarationOf'
+/** server.ts's one stored-choice holder: private to server.ts, so named by string. */
+const CHANNEL_DELIVERY_HOLDER = 'channelDeliveryStore'
+/** The reload controller's store accessor (b.deo SRI-406, SRI-408); renaming it fails the typecheck. */
+const CONTROLLER_CHANNEL_DELIVERY: keyof ReloadControllerDeps = 'channelDelivery'
+/** The routing's and the session tools' store reader (b.deo SRI-305, SRI-502); renaming either fails the typecheck. */
+const ROUTING_CHANNEL_DELIVERY: keyof PersonaRoutingDeps = 'getChannelDelivery'
+const SESSION_TOOLS_CHANNEL_DELIVERY: keyof SessionToolDeps = 'getChannelDelivery'
+
+/** The offset of the start load's only call in server.ts; fails unless there is exactly one. */
+function channelDeliveryStartLoad(): number {
+  return onlyCallOf(CHANNEL_DELIVERY_START_LOAD)
+}
+
+/**
+ * The start-time applied config (declared before the reload controller): the
+ * one variable assigned exactly `<loaded>` as a statement of its own, in
+ * main()'s own statement list, after the start assignment, and assigned
+ * nothing else and initialized by no declaration. Returns its name and the
+ * offset of that assignment.
+ */
+function startTimeConfig(): { name: string; at: number } {
+  const { loaded, assignAt } = startResolution(SERVER_CODE)
+  const assigns = [...SERVER_CODE.matchAll(new RegExp(`(?<![\\w.$]|(?:let|const|var)\\s+)(\\w+)\\s*=(?![=>])\\s*${loaded}\\s*;?\\s*$`, 'gm'))]
+  expect(assigns.map((m) => m[1])).toHaveLength(1)
+  const name = assigns[0]![1]!
+  const at = assigns[0]!.index!
+  expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+  expect(at).toBeGreaterThan(assignAt)
+  expect(assignmentsTo(name).map(({ value }) => value)).toEqual([loaded])
+  expect(indicesOf(new RegExp(`\\b(?:let|const|var)\\s+${name}\\b\\s*(?:!?\\s*:[^=;\\n]*)?=(?![=>])`, 'g'), SERVER_CODE)).toEqual([])
+  return { name, at }
+}
+
+describe('main() loads the stored-choice store once, behind no branch, after the start resolves and before the first await after it and the start bring-up pass, into the one holder the reload controller reads (b.deo SRI-403 beside b.av2 SR-8.7)', () => {
+  test('imports the start load from the store module, declares it nowhere in server.ts, and its import and one call are its only mentions', () => {
+    expect(importSource(SERVER_CODE, CHANNEL_DELIVERY_START_LOAD)).toBe('./channel-delivery.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${CHANNEL_DELIVERY_START_LOAD}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    expect(indicesOf(new RegExp(`\\b${CHANNEL_DELIVERY_START_LOAD}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
+    channelDeliveryStartLoad()
+  })
+
+  test('the call is the whole right-hand side of an assignment to the holder that is a statement in main()\'s own statement list (behind no branch, so in both modes and in dry run too)', () => {
+    const at = channelDeliveryStartLoad()
+    const assign = SERVER_CODE.slice(0, at).search(new RegExp(`(?<![\\w.$])${CHANNEL_DELIVERY_HOLDER}\\s*=\\s*$`))
+    expect(assign).toBeGreaterThanOrEqual(0)
+    expect(atMainTopLevel(SERVER_CODE, assign)).toBe(true)
+    // Nothing follows the call on its statement (no operand, no member read).
+    const [, argsEnd] = balancedAfter(SERVER_CODE, at, '(', ')')
+    expect(SERVER_CODE.slice(argsEnd + 1)).toMatch(/^\s*;?\s*\n/)
+  })
+
+  test.each<[string, () => number]>([
+    ['the start resolution (<controller>.resolveStart)', () => startResolution(SERVER_CODE).resolveAt],
+    ['the applied config\'s start assignment (<loaded> = <outcome>.config)', () => startResolution(SERVER_CODE).assignAt],
+    ['the start-time applied config\'s assignment (<start-time config> = <loaded>)', () => startTimeConfig().at],
+  ])('loads AFTER %s', (_label, anchor) => {
+    expect(channelDeliveryStartLoad()).toBeGreaterThan(anchor())
+  })
+
+  // The first await after the start resolution and the start-time
+  // assignment: a shutdown begun during it returns from main() early, so a
+  // load after it could be skipped. Text inside literals never counts.
+  const firstAwaitAfterStart = (): number[] => {
+    const after = Math.max(startResolution(SERVER_CODE).assignAt, startTimeConfig().at)
+    return indicesOf(/\bawait\b/g, maskLiterals(SERVER_CODE)).filter((at) => at > after).slice(0, 1)
+  }
+
+  test.each<[string, () => number[]]>([
+    ['the first await after the start resolution and the start-time applied config\'s assignment', firstAwaitAfterStart],
+    ['the start sweep (reconcileOrphans)', () => callsOf('reconcileOrphans')],
+    ['the start bring-up (<controller>.runStartBringUp)', () => [startResolution(SERVER_CODE).bringUpAt]],
+    ['the PID file (writePidFile)', () => callsOf('writePidFile')],
+    ['the connection manager (createPersonaConnectionManager)', () => callsOf('createPersonaConnectionManager')],
+    ['Bun.serve', () => callsOf('Bun\\.serve')],
+  ])('loads BEFORE %s', (_label, anchors) => {
+    const later = anchors()
+    expect(later.length).toBeGreaterThan(0)
+    for (const at of later) expect(channelDeliveryStartLoad()).toBeLessThan(at)
+  })
+
+  test('loads over the server state directory (STATE_DIR), the start\'s applied personas with their declarations, and the one retired-key store, with only a log to console.error, so the store\'s production writer, delete and clock are used', () => {
+    const args = splitTopLevel(callArguments(SERVER_CODE, channelDeliveryStartLoad()))
+    expect(args).toHaveLength(3)
+    expect(args[0]).toBe('STATE_DIR')
+
+    const start = objectProperties(args[1]!)
+    expect([...start.keys()]).toEqual(['applied', 'retiredKeys'])
+    // Each applied persona of the start-time config, by its key and its
+    // declaration (the store module's own builder, imported, not declared).
+    expect(start.get('applied')).toMatch(
+      new RegExp(
+        `^${startTimeConfig().name}\\.personas\\.map\\(\\(?(\\w+)\\)? => \\(\\{ key: \\1\\.key, declaration: ${CHANNEL_DELIVERY_DECLARATION_OF}\\(\\1\\),? \\}\\)\\)$`,
+      ),
+    )
+    expect(importSource(SERVER_CODE, CHANNEL_DELIVERY_DECLARATION_OF)).toBe('./channel-delivery.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${CHANNEL_DELIVERY_DECLARATION_OF}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    // The retired-key store main() bound from the record's start read: the
+    // one store, also the reload controller's `retiredKeys`.
+    const retiredRead = constOf('readRetiredKeysAtStart')
+    const stores = [...SERVER_CODE.matchAll(new RegExp(`\\bconst\\s+(\\w+)(?:\\s*:\\s*\\w+)?\\s*=\\s*${retiredRead}\\s*\\.\\s*store\\b`, 'g'))]
+    expect(stores).toHaveLength(1)
+    expect(start.get('retiredKeys')).toBe(stores[0]![1])
+
+    const deps = objectProperties(args[2]!)
+    expect([...deps.keys()]).toEqual(['log'])
+    expect(deps.get('log')).toMatch(/^\(\s*(\w+)\s*\)\s*=>\s*console\.error\(\s*\1\s*\)$/)
+  })
+
+  test('the holder is declared once, at module scope, with no initializer, and assigned only once, from the start load; every other mention is a call-time read by the reload controller\'s accessor, the routing or the session tools', () => {
+    declaredOnce(CHANNEL_DELIVERY_HOLDER)
+    const decls = indicesOf(new RegExp(`^let\\s+${CHANNEL_DELIVERY_HOLDER}\\s*:\\s*ChannelDeliveryStore\\s*\\|\\s*undefined\\s*$`, 'gm'), SERVER_CODE)
+    expect(decls).toHaveLength(1)
+    expect(insideMain(decls[0]!)).toBe(false)
+
+    const assigned = assignmentsTo(CHANNEL_DELIVERY_HOLDER)
+    expect(assigned.map(({ value }) => value)).toEqual([`${CHANNEL_DELIVERY_START_LOAD}(`])
+    expect(SERVER_CODE.indexOf(CHANNEL_DELIVERY_START_LOAD, assigned[0]!.at)).toBe(channelDeliveryStartLoad())
+    // No compound assignment, update or other write form either.
+    expect(indicesOf(new RegExp(`\\b${CHANNEL_DELIVERY_HOLDER}\\s*(?:\\?\\?|\\|\\||&&|[-+*/%])=|(?:\\+\\+|--)\\s*${CHANNEL_DELIVERY_HOLDER}\\b|\\b${CHANNEL_DELIVERY_HOLDER}\\s*(?:\\+\\+|--)`, 'g'), SERVER_CODE)).toEqual([])
+
+    // Its mentions: the declaration, the assignment, the controller accessor's
+    // check and return, the routing's member and the session tools' member.
+    const named = indicesOf(new RegExp(`\\b${CHANNEL_DELIVERY_HOLDER}\\b`, 'g'), SERVER_CODE)
+    expect(named).toHaveLength(6)
+    expect(withinCall(named, onlyCallOf('createReloadController'))).toBe(2)
+    expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
+    const tools = SERVER_CODE.search(/\bconst\s+sessionToolDeps\s*:\s*SessionToolDeps\s*=\s*\{/)
+    const [toolsStart, toolsEnd] = balancedAfter(SERVER_CODE, tools, '{', '}')
+    expect(named.filter((at) => at > toolsStart && at < toolsEnd)).toHaveLength(1)
+  })
+
+  // The controller's accessor is required and answers a store, so it reads
+  // the holder at each call and throws, before anything is written, if an
+  // apply ever ran before the load.
+  test('the reload controller\'s channelDelivery is an accessor over the holder, read at each call: it throws while the holder is unset and otherwise answers the holder itself', () => {
+    const accessor = onlyCallProps('createReloadController').get(CONTROLLER_CHANNEL_DELIVERY)
+    const H = CHANNEL_DELIVERY_HOLDER
+    expect(accessor).toMatch(
+      new RegExp(`^\\(\\) => \\{ if \\(${H} === undefined\\) throw new Error\\((['"])[^'"]+\\1\\);? return ${H};? \\}$`),
+    )
+  })
+
+  test('one store: no src file other than server.ts calls the start load, and none other than the store module calls the store factory', () => {
+    const callers = (name: string): string[] =>
+      srcFiles()
+        .filter(([, source]) => new RegExp(`(?<![\\w.$]|function\\s+)${name}\\s*\\(`).test(stripComments(source)))
+        .map(([path]) => path)
+        .sort()
+    expect(callers(CHANNEL_DELIVERY_START_LOAD).filter((path) => path !== 'src/channel-delivery.ts')).toEqual(['src/server.ts'])
+    expect(callers(CHANNEL_DELIVERY_FACTORY)).toEqual(['src/channel-delivery.ts'])
+  })
+})
+
+/** set_channel_delivery's call-time inputs (b.deo SRI-502, SRI-505); renaming one fails the typecheck. */
+const SESSION_TOOLS_HEARD: keyof SessionToolDeps = 'heardChannels'
+const SESSION_TOOLS_APPLIED: keyof SessionToolDeps = 'getAppliedPersonas'
+const SESSION_TOOLS_LOG: keyof SessionToolDeps = 'log'
+/** The routing's heard-set read (b.deo SRI-307); renaming it fails the typecheck. */
+const ROUTING_HEARD: keyof PersonaRouting = 'heardChannels'
+
+describe('the routing and the session tools read the one stored-choice store through its holder at each call, and set_channel_delivery\'s other inputs at each call (b.deo SRI-305, SRI-403, SRI-502, SRI-505)', () => {
+  // Every member here is optional in PersonaRoutingDeps or SessionToolDeps,
+  // so a dropped member, or one bound to a copy taken at import (before
+  // main() loads the store), would type-check and pass every behaviour suite
+  // while the routing applied no stored choice and the tool refused every
+  // call or judged the loop guard on a stale persona set. Only this audit
+  // makes sure production binds them, each to a call-time read.
+  test.each<[string, () => string | undefined]>([
+    ['the routing\'s getChannelDelivery', () => onlyCallProps('createPersonaRouting').get(ROUTING_CHANNEL_DELIVERY)],
+    ['the session tools\' getChannelDelivery', () => objectProperties(spreadConstObject('sessionToolDeps')).get(SESSION_TOOLS_CHANNEL_DELIVERY)],
+  ])('%s is exactly `() => channelDeliveryStore`, the holder itself read at each call', (_label, member) => {
+    expect(member()).toBe(`() => ${CHANNEL_DELIVERY_HOLDER}`)
+  })
+
+  test('the session tools\' heardChannels asks the one routing instance for the key at each call, getAppliedPersonas reads the applied config holder\'s personas at each call, and log writes to console.error', () => {
+    const props = objectProperties(spreadConstObject('sessionToolDeps'))
+    const routing = constOf('createPersonaRouting')
+    expect(insideMain(onlyCallOf('createPersonaRouting'))).toBe(false)
+    expect(props.get(SESSION_TOOLS_HEARD)).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${routing}\\.${ROUTING_HEARD}\\(\\1\\)$`))
+    expect(props.get(SESSION_TOOLS_APPLIED)).toBe(`() => ${loadedConfigName(SERVER_CODE)}?.personas ?? []`)
+    expect(props.get(SESSION_TOOLS_LOG)).toMatch(/^\(\s*(\w+)\s*\)\s*=>\s*console\.error\(\s*\1\s*\)$/)
+  })
+
+  // A member set later (`sessionToolDeps.getChannelDelivery = …`) would
+  // replace the call-time read; only the port is set that way.
+  test('nothing replaces these members: getChannelDelivery is named only in the routing\'s call and the session tools\' deps, and server.ts reads or writes none of the session tools\' four members through the object', () => {
+    const named = indicesOf(/\bgetChannelDelivery\b/g, SERVER_CODE)
+    expect(named).toHaveLength(2)
+    expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
+    const members = [SESSION_TOOLS_CHANNEL_DELIVERY, SESSION_TOOLS_HEARD, SESSION_TOOLS_APPLIED, SESSION_TOOLS_LOG].join('|')
+    expect(indicesOf(new RegExp(`\\bsessionToolDeps\\s*(?:\\.\\s*(?:${members})\\b|\\[)`, 'g'), SERVER_CODE)).toEqual([])
   })
 })
 
