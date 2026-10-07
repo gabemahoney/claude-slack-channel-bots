@@ -40,6 +40,18 @@
  *     open is trailed (ok:false, no channel) and nothing posts; a refused
  *     destination (DMs off or no contact) is logged once per request with no
  *     Slack call and no trail event.
+ *   - Fungible mode (b.deo SRI-702, SRI-906, beside b.av2 SR-7.1), in its own
+ *     describe with the switch on and a resolver reading it at each attempt,
+ *     as `src/server.ts` wires it: a prompt for a persona whose fungible
+ *     destination (`invited.permission_prompts`) is a channel posts once to
+ *     that channel, and one whose fungible destination is `dm`, explicit or
+ *     by default, opens the DM with `dm.contact` and posts there, each on the
+ *     persona's own client, no other client asked for or called; the live
+ *     entry records the conversation and the persona key. A `dm` fungible
+ *     destination with DMs off or no contact logs one refusal line per
+ *     request naming the setting in force (from `destinationSettingOf`),
+ *     otherwise the declarative-mode line for the same persona and request,
+ *     with no Slack call.
  *   - Destination failures held and retried (b.av2 SR-7.1, SR-3.2; AC 44),
  *     through a destination hold on a fake clock (`makeHold`): `missing_scope`
  *     on a DM-only persona's first open and `not_in_channel` on a channel
@@ -133,7 +145,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import type { Persona, PersonaConfig } from '../src/config.ts'
+import { DM_DESTINATION, type Persona, type PersonaConfig } from '../src/config.ts'
 import {
   _resetPollerState,
   buildPermissionBlocks,
@@ -150,7 +162,14 @@ import {
   type PollerDeps,
 } from '../src/permission-poller.ts'
 import { _resetTrailFdForTests } from '../src/permission-trail.ts'
-import { createPersonaDestinations, type PersonaDestinations } from '../src/persona-destination.ts'
+import {
+  createPersonaDestinations,
+  describeDmDestinationRefusal,
+  destinationSettingOf,
+  type DestinationConfig,
+  type DmDestinationRefusal,
+  type PersonaDestinations,
+} from '../src/persona-destination.ts'
 import { createPersonaDestinationHold, type PersonaDestinationHold } from '../src/persona-destination-hold.ts'
 import type { PersonaTeardownWindowState } from '../src/persona-notifier.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
@@ -1077,6 +1096,158 @@ describe('poller tick — `dm` destination (b.av2 SR-7.1, SR-5.1)', () => {
     expect(methods(stubD)).toEqual(['conversations.open', 'chat.postMessage'])
     expect(getLivePermission(INSTANCE_D, TOKEN_B)?.channelId).toBe(D_DM)
     expect(refusals()).toHaveLength(2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fungible mode: prompts at the fungible destination (b.deo SRI-702, SRI-906)
+// ---------------------------------------------------------------------------
+
+describe('poller tick — fungible mode: prompts at the fungible destination (b.deo SRI-702, SRI-906, beside b.av2 SR-7.1)', () => {
+  /** The configuration in effect in declarative mode, as the one destination rule reads it. */
+  const DECLARATIVE_MODE: DestinationConfig = { allow_invited_channels: false }
+  /** The configuration in effect in fungible mode, as the one destination rule reads it. */
+  const FUNGIBLE_MODE: DestinationConfig = { allow_invited_channels: true }
+
+  // F's fungible destination is a channel; X names `dm` explicitly; Y has no
+  // `invited` section, so its fungible destination is `dm` by default.
+  const NAME_F = 'Foxtrot Invited'
+  const NAME_X = 'Xray Invited'
+  const NAME_Y = 'Yankee Invited'
+  const F_DEST = 'C0FDEST001'
+  const X_CONTACT = 'U0XCONTACT1'
+  const Y_CONTACT = 'U0YCONTACT1'
+
+  let F: Persona
+  let X: Persona
+  let Y: Persona
+  /** One stub per fungible persona, by key. */
+  let fungibleStubs: Map<string, StubSlack>
+
+  beforeEach(() => {
+    config = makeMultiPersonaConfig(
+      [
+        { name: NAME_F, invited: { permission_prompts: F_DEST } },
+        { name: NAME_X, dm: { enabled: true, contact: X_CONTACT }, invited: { permission_prompts: DM_DESTINATION } },
+        { name: NAME_Y, dm: { enabled: true, contact: Y_CONTACT } },
+      ],
+      personaDir,
+      { allow_invited_channels: true },
+    )
+    ;[F, X, Y] = config.personas as [Persona, Persona, Persona]
+    fungibleStubs = new Map(config.personas.map((p) => [p.key, makeStubSlack({ leakMarker: LEAK_SENTINEL })]))
+    clients = makePersonaClients((key) => fungibleStubs.get(key))
+  })
+
+  /** The other fungible personas' stubs: the only other clients `clients` resolves here. */
+  const otherStubs = (key: string): StubSlack[] => [...fungibleStubs].filter(([k]) => k !== key).map(([, s]) => s)
+
+  /**
+   * One poller over the applied set `applied`, wired as `src/server.ts` wires
+   * it: a destination resolver reading the configuration in effect at each
+   * attempt, and a destination hold over it (on a fake clock). It lists
+   * `persona`'s spawn with one open request (TOKEN_A) and runs `ticks` ticks.
+   */
+  async function runPrompt(applied: PersonaConfig, persona: Persona, ticks: number): Promise<{ logCalls: unknown[][]; trail: TrailCapture }> {
+    config = applied
+    const logCalls: unknown[][] = []
+    const trail = makeTrailCapture()
+    const destinations = createPersonaDestinations({ log: (line) => { logCalls.push([line]) }, getPersonaConfig: () => config })
+    const { hold } = makeHold(logCalls, destinations)
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow(persona)] }),
+      get: async () => getResult([cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })], persona),
+    }), { destinations, destinationHold: hold, log: (...args) => { logCalls.push(args) }, emitTrail: trail.emit })
+    for (let i = 0; i < ticks; i++) await ivl.tick()
+    return { logCalls, trail }
+  }
+
+  test.each<[string, () => Persona, () => string, string[], () => string | undefined]>([
+    ['a channel fungible destination (F): chat.postMessage only, to that channel', () => F, () => F_DEST, ['chat.postMessage'], () => undefined],
+    [
+      'an explicit "dm" fungible destination (X): conversations.open for its dm.contact, then chat.postMessage to the returned D…',
+      () => X, () => DM_DESTINATION, ['conversations.open', 'chat.postMessage'], () => X_CONTACT,
+    ],
+    [
+      'a defaulted "dm" fungible destination (Y, no invited section): conversations.open for its dm.contact, then chat.postMessage to the returned D…',
+      () => Y, () => DM_DESTINATION, ['conversations.open', 'chat.postMessage'], () => Y_CONTACT,
+    ],
+  ])('%s — posted once on the persona\'s own client, no other client asked for or called; the live entry records that conversation and the persona key', async (_label, pick, fungibleDestination, expectedMethods, contact) => {
+    const persona = pick()
+    // Preconditions: the switch is on, the destination is the loader's
+    // fungible destination, and the declarative section is not in force.
+    expect(config.allow_invited_channels).toBe(true)
+    expect(persona.fungible_destination).toBe(fungibleDestination())
+    expect(persona.permission_prompts).toBeUndefined()
+    const stub = fungibleStubs.get(persona.key)!
+    const dmContact = contact()
+    const expectedChannel = dmContact === undefined ? F_DEST : stubOpenedDmId(dmContact)
+    scriptPostTs(stub, POST_TS)
+
+    const { logCalls, trail } = await runPrompt(config, persona, 1)
+
+    expect(methods(stub)).toEqual(expectedMethods)
+    if (dmContact !== undefined) expect(stub.calls.conversationsOpen).toEqual([{ users: dmContact }])
+    expect(posts(stub).map((c) => c.channel)).toEqual([expectedChannel])
+    for (const other of otherStubs(persona.key)) expect(other.callLog).toEqual([])
+    expect(new Set(clients.calls)).toEqual(new Set([persona.key]))
+
+    const actions = (posts(stub)[0].blocks as Array<Record<string, unknown>>).find((b) => b['type'] === 'actions') as
+      { elements: Array<{ action_id: string }> }
+    expect(actions.elements.map((el) => personaKeyFromActionId(el.action_id))).toEqual([persona.key, persona.key])
+    expect(getLivePermission(personaInstanceId(persona.key), TOKEN_A)).toMatchObject({
+      personaKey: persona.key,
+      channelId: expectedChannel,
+      messageTs: POST_TS,
+      handled: false,
+    })
+    expect(chatPosts(trail).map((e) => [e.channel, e['ok']])).toEqual([[expectedChannel, true]])
+    expect(episodeLines(logCalls)).toEqual([])
+    assertNoLeak({ logCalls, trail: trail.events }, 'fungible destination')
+  })
+
+  test.each<[string, () => Persona, Persona['dm'], DmDestinationRefusal]>([
+    ['an explicit "dm" (X) with DMs off', () => X, { enabled: false, contact: X_CONTACT }, 'dm_disabled'],
+    ['an explicit "dm" (X) with no contact', () => X, { enabled: true }, 'no_dm_contact'],
+    ['a defaulted "dm" (Y) with DMs off', () => Y, { enabled: false, contact: Y_CONTACT }, 'dm_disabled'],
+    ['a defaulted "dm" (Y) with no contact', () => Y, { enabled: true }, 'no_dm_contact'],
+  ])('a fungible destination refused, %s (the loader rejects it): one line per open request naming the setting in force, otherwise the declarative line; no Slack call, no live entry, no trail event', async (_label, pick, dm, reason) => {
+    const persona = pick()
+    reconfigure(persona.key, { dm })
+    const fungibleConfig = config
+    const instance = personaInstanceId(persona.key)
+
+    const fungible = await runPrompt(fungibleConfig, persona, 3)
+    expect(slackCalls(...fungibleStubs.values(), stubA, stubB, stubD)).toBe(0)
+    expect(getLivePermission(instance, TOKEN_A)).toBeUndefined()
+    expect(fungible.trail.events).toEqual([])
+
+    // The same persona and request in declarative mode, its `dm` destination
+    // refused for the same reason, on a fresh poller.
+    stopPermissionPoller()
+    _resetPollerState()
+    const declarativeConfig = makeMultiPersonaConfig(
+      [{ name: persona.name, channels: [], dm, permission_prompts: DM_DESTINATION }],
+      personaDir,
+    )
+    const declarative = await runPrompt(declarativeConfig, declarativeConfig.personas[0]!, 3)
+    expect(slackCalls(...fungibleStubs.values(), stubA, stubB, stubD)).toBe(0)
+
+    // Each run logs one line, the refusal, however many ticks pass.
+    expect(fungible.logCalls).toHaveLength(1)
+    expect(declarative.logCalls).toHaveLength(1)
+    const fungibleLine = String(fungible.logCalls[0]![0])
+    const declarativeLine = String(declarative.logCalls[0]![0])
+    const fungibleSetting = destinationSettingOf(FUNGIBLE_MODE)
+    const declarativeSetting = destinationSettingOf(DECLARATIVE_MODE)
+    expect(declarativeLine).toContain(`${renderPersonaRef(persona.name, persona.key)} has ${declarativeSetting} set to "${DM_DESTINATION}" but ${describeDmDestinationRefusal(reason)}`)
+    expect(declarativeLine).toContain(instance)
+    expect(declarativeLine).toContain(TOKEN_A)
+    // The declarative line names its setting once, so the swap below is exact.
+    expect(declarativeLine.split(declarativeSetting)).toHaveLength(2)
+    expect(fungibleLine).toBe(declarativeLine.replace(declarativeSetting, fungibleSetting))
+    expect(fungibleLine).not.toBe(declarativeLine)
+    assertNoLeak({ fungible: fungible.logCalls, declarative: declarative.logCalls }, 'fungible destination refused')
   })
 })
 

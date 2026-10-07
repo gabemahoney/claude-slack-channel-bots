@@ -1,6 +1,21 @@
 /**
  * persona-destination.test.ts — Where a persona's permission prompts and
- * notices go, and the post there (b.av2 SR-7.1, SR-5.1).
+ * notices go, and the post there (b.av2 SR-7.1, SR-5.1, SR-10.3; b.deo
+ * SRI-701, SRI-702, SRI-906).
+ *
+ * One destination rule per mode (b.deo SRI-701, beside b.av2 SR-7.1): a
+ * persona's destination is its `permission_prompts` in declarative mode and
+ * its fungible destination (`invited.permission_prompts`, `dm` when absent)
+ * in fungible mode; the section not in force is ignored, and the resolver
+ * reads the configuration in effect and the applied persona again at each
+ * attempt. In fungible mode the resolver posts to
+ * a channel destination, or opens the DM with `dm.contact` on the persona's
+ * own client for a `dm` one (b.deo SRI-702). `destinationSettingOf` is
+ * pinned here for each mode, the one pin of the setting names in this work;
+ * every other suite builds its expectations through it. The resolver's
+ * refusal of a `dm` destination names the setting in force, and in fungible
+ * mode differs from the declarative line in that name only (b.deo SRI-906,
+ * beside b.av2 SR-10.3).
  *
  * The destination module is proven here once, so the poller and notifier
  * suites need not re-prove it: a channel destination is the configured
@@ -25,20 +40,24 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import type { Persona } from '../src/config.ts'
+import { DM_DESTINATION, type Persona } from '../src/config.ts'
 import {
   NO_CONVERSATION_ID_CODE,
   createPersonaDestinations,
   describeDestinationFailure,
   describeDestinationFailureCause,
+  destinationSettingOf,
   dmDestinationRefusal,
+  personaDestinationOf,
+  type DestinationConfig,
   type DestinationFailure,
   type DestinationSlackClient,
+  type DmDestinationRefusal,
   type PersonaDestinations,
 } from '../src/persona-destination.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
-import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeMultiPersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
 import {
   asWebClient,
   makeDeferredWebApiCall,
@@ -688,4 +707,256 @@ describe('describeDestinationFailureCause (token-safe)', () => {
     expect(cause).not.toContain(BOT_TOKEN_PREFIX)
     assertNoLeak({ cause })
   })
+})
+
+// ---------------------------------------------------------------------------
+// One destination rule per mode (b.deo SRI-701, SRI-702, SRI-906)
+// ---------------------------------------------------------------------------
+
+/** The configuration in effect in declarative mode, as the one destination rule reads it. */
+const DECLARATIVE_MODE: DestinationConfig = { allow_invited_channels: false }
+/** The configuration in effect in fungible mode, as the one destination rule reads it. */
+const FUNGIBLE_MODE: DestinationConfig = { allow_invited_channels: true }
+
+/** A channel named by the declarative section (`permission_prompts`). */
+const DECL_CHANNEL = 'C0DECL001'
+/** A channel named by the fungible section (`invited.permission_prompts`). */
+const FUNG_CHANNEL = 'C0FUNG001'
+/** The DM contact of the mode-rule personas. */
+const RULE_CONTACT = 'U0RULE001'
+const DMS_ON = { enabled: true, contact: RULE_CONTACT }
+
+/**
+ * The one mode-rule persona, resolved from `spec` as `makeMultiPersonaConfig`
+ * resolves it in `mode` (as the loader does, except that a spec field of the
+ * section not in force is set as given), under this test's `dir`. Every mode
+ * builds it with the same name, so lines from both modes name the same persona.
+ */
+function personaIn(mode: DestinationConfig, spec: PersonaSpec): Persona {
+  const config = makeMultiPersonaConfig([{ name: 'Rule Dest', ...spec }], dir, {
+    allow_invited_channels: mode?.allow_invited_channels ?? false,
+  })
+  return config.personas[0]!
+}
+
+/**
+ * A resolver over the configuration in effect `getConfig`, read at each call,
+ * whose lines go to `sink` and to the suite's leak check.
+ */
+function resolverOn(getConfig: () => DestinationConfig, sink: string[] = []): PersonaDestinations {
+  const log = (line: string): void => {
+    sink.push(line)
+    logs.push(line)
+  }
+  return createPersonaDestinations({ log, getPersonaConfig: getConfig })
+}
+
+describe('destinationSettingOf: the setting in force, pinned per mode (b.deo SRI-906)', () => {
+  test('declarative mode names permission_prompts; fungible mode names invited.permission_prompts', () => {
+    expect(destinationSettingOf(DECLARATIVE_MODE)).toBe('permission_prompts')
+    expect(destinationSettingOf(FUNGIBLE_MODE)).toBe('invited.permission_prompts')
+  })
+
+  test('with no configuration in effect (before the start resolves) the setting is the declarative one', () => {
+    for (const none of [undefined, null]) expect(destinationSettingOf(none)).toBe(destinationSettingOf(DECLARATIVE_MODE))
+  })
+})
+
+interface RuleRow {
+  mode: DestinationConfig
+  spec: PersonaSpec
+  destination: string
+}
+
+const DECL_CHANNELS = [{ id: DECL_CHANNEL, delivery: 'all' as const }]
+
+const RULE_ROWS: [string, RuleRow][] = [
+  [
+    'declarative mode, permission_prompts "dm": dm',
+    { mode: DECLARATIVE_MODE, spec: { channels: [], dm: DMS_ON, permission_prompts: DM_DESTINATION }, destination: DM_DESTINATION },
+  ],
+  [
+    'declarative mode, permission_prompts a channel: that channel',
+    { mode: DECLARATIVE_MODE, spec: { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL }, destination: DECL_CHANNEL },
+  ],
+  [
+    'fungible mode, invited.permission_prompts a channel: that channel',
+    { mode: FUNGIBLE_MODE, spec: { invited: { permission_prompts: FUNG_CHANNEL } }, destination: FUNG_CHANNEL },
+  ],
+  [
+    'fungible mode, invited.permission_prompts an explicit "dm": dm',
+    { mode: FUNGIBLE_MODE, spec: { dm: DMS_ON, invited: { permission_prompts: DM_DESTINATION } }, destination: DM_DESTINATION },
+  ],
+  [
+    'fungible mode, no invited section: dm by default',
+    { mode: FUNGIBLE_MODE, spec: { dm: DMS_ON }, destination: DM_DESTINATION },
+  ],
+  [
+    'fungible mode, an invited section without permission_prompts: dm by default',
+    { mode: FUNGIBLE_MODE, spec: { dm: DMS_ON, invited: {} }, destination: DM_DESTINATION },
+  ],
+  [
+    'fungible mode ignores a top-level permission_prompts set by spec: the invited.permission_prompts channel',
+    {
+      mode: FUNGIBLE_MODE,
+      spec: { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL, invited: { permission_prompts: FUNG_CHANNEL } },
+      destination: FUNG_CHANNEL,
+    },
+  ],
+  [
+    'fungible mode ignores a top-level permission_prompts set by spec: dm by default when invited is absent',
+    { mode: FUNGIBLE_MODE, spec: { dm: DMS_ON, channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL }, destination: DM_DESTINATION },
+  ],
+  [
+    'declarative mode ignores an invited section: the permission_prompts channel',
+    {
+      mode: DECLARATIVE_MODE,
+      spec: { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL, invited: { permission_prompts: FUNG_CHANNEL } },
+      destination: DECL_CHANNEL,
+    },
+  ],
+  [
+    'declarative mode ignores an invited section: permission_prompts "dm" stays dm beside an invited channel',
+    {
+      mode: DECLARATIVE_MODE,
+      spec: { channels: [], dm: DMS_ON, permission_prompts: DM_DESTINATION, invited: { permission_prompts: FUNG_CHANNEL } },
+      destination: DM_DESTINATION,
+    },
+  ],
+  [
+    'declarative mode ignores a fungible destination set by spec: the permission_prompts channel',
+    {
+      mode: DECLARATIVE_MODE,
+      spec: { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL, invited: { permission_prompts: FUNG_CHANNEL }, fungible_destination: FUNG_CHANNEL },
+      destination: DECL_CHANNEL,
+    },
+  ],
+]
+
+describe('the one destination rule per mode (b.deo SRI-701, SRI-702)', () => {
+  test.each(RULE_ROWS)('%s', (_label, row) => {
+    const p = personaIn(row.mode, row.spec)
+
+    expect(personaDestinationOf(row.mode, p)).toBe(row.destination)
+    const r = resolverOn(() => row.mode)
+    expect(r.destinationOf(p)).toBe(row.destination)
+    expect(r.settingOf(p)).toBe(destinationSettingOf(row.mode))
+    expect(r.refusalOf(p)).toBeUndefined()
+    expect(dmDestinationRefusal(row.mode, p)).toBeUndefined()
+  })
+
+  test('the declarative-mode rows hold with no configuration in effect too', () => {
+    for (const [, row] of RULE_ROWS.filter(([, r]) => r.mode === DECLARATIVE_MODE)) {
+      const p = personaIn(row.mode, row.spec)
+      for (const none of [undefined, null]) expect(personaDestinationOf(none, p)).toBe(row.destination)
+    }
+  })
+})
+
+describe('the resolver in fungible mode (b.deo SRI-702)', () => {
+  const POST_ROWS: [string, PersonaSpec, 'channel' | 'dm'][] = [
+    ['a channel destination', { dm: DMS_ON, invited: { permission_prompts: FUNG_CHANNEL } }, 'channel'],
+    ['an explicit "dm" destination', { dm: DMS_ON, invited: { permission_prompts: DM_DESTINATION } }, 'dm'],
+    ['a defaulted "dm" destination', { dm: DMS_ON }, 'dm'],
+    ['a defaulted "dm" destination beside a top-level permission_prompts set by spec', { dm: DMS_ON, channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL }, 'dm'],
+  ]
+
+  test.each(POST_ROWS)('%s: the post goes there on the persona\'s own client, with no line', async (_label, spec, kind) => {
+    const p = personaIn(FUNGIBLE_MODE, spec)
+    const own = makeStubSlack({ leakMarker: LEAK_SENTINEL })
+    const r = resolverOn(() => FUNGIBLE_MODE)
+
+    const result = record(await r.post(p, asWebClient(own.web), { text: 'fungible' }))
+
+    const channel = kind === 'channel' ? FUNG_CHANNEL : stubOpenedDmId(RULE_CONTACT)
+    expect(result).toEqual({ outcome: 'posted', channelId: channel, ts: expect.any(String) })
+    expect(own.callLog.map((c) => [c.method, c.args])).toEqual([
+      ...(kind === 'dm' ? [['conversations.open', { users: RULE_CONTACT }]] : []),
+      ['chat.postMessage', { channel, text: 'fungible' }],
+    ])
+    expect(logs).toEqual([])
+  })
+})
+
+describe('the destination is resolved again at each attempt (b.deo SRI-701)', () => {
+  test('the switch is read at each attempt, never when the resolver is built: the same persona moves with it, and its DM is opened once', async () => {
+    // Both sections set, as only a spec can: the switch alone picks the one read.
+    const both = personaIn(DECLARATIVE_MODE, { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL, fungible_destination: DM_DESTINATION, dm: DMS_ON })
+    let config = DECLARATIVE_MODE
+    const own = makeStubSlack({ leakMarker: LEAK_SENTINEL })
+    const r = resolverOn(() => config)
+    const attempt = async (text: string) => {
+      const now = { destination: r.destinationOf(both), setting: r.settingOf(both) }
+      return { now, result: record(await r.post(both, asWebClient(own.web), { text })) }
+    }
+
+    const attempts = []
+    for (const [mode, text] of [[DECLARATIVE_MODE, 'declarative 1'], [FUNGIBLE_MODE, 'fungible 1'], [DECLARATIVE_MODE, 'declarative 2'], [FUNGIBLE_MODE, 'fungible 2']] as const) {
+      config = mode
+      attempts.push(await attempt(text))
+    }
+
+    const dm = stubOpenedDmId(RULE_CONTACT)
+    const declarative = { destination: DECL_CHANNEL, setting: destinationSettingOf(DECLARATIVE_MODE) }
+    const fungible = { destination: DM_DESTINATION, setting: destinationSettingOf(FUNGIBLE_MODE) }
+    expect(attempts.map((a) => a.now)).toEqual([declarative, fungible, declarative, fungible])
+    expect(attempts.map((a) => (a.result as { channelId?: string }).channelId)).toEqual([DECL_CHANNEL, dm, DECL_CHANNEL, dm])
+    expect(own.calls.postMessage.map((c) => [(c as { text: string }).text, (c as { channel: string }).channel])).toEqual([
+      ['declarative 1', DECL_CHANNEL],
+      ['fungible 1', dm],
+      ['declarative 2', DECL_CHANNEL],
+      ['fungible 2', dm],
+    ])
+    expect(own.calls.conversationsOpen).toEqual([{ users: RULE_CONTACT }])
+    expect(logs).toEqual([])
+  })
+})
+
+describe('the resolver\'s "dm" refusal in fungible mode names invited.permission_prompts (b.deo SRI-906, b.av2 SR-5.1, SR-10.3)', () => {
+  const DM_STATES: [string, Persona['dm'], DmDestinationRefusal][] = [
+    ['DMs off', { enabled: false, contact: RULE_CONTACT }, 'dm_disabled'],
+    ['no contact', { enabled: true }, 'no_dm_contact'],
+  ]
+  const FORMS: [string, PersonaSpec][] = [
+    ['an explicit "dm"', { invited: { permission_prompts: DM_DESTINATION } }],
+    ['a defaulted "dm"', {}],
+    ['a defaulted "dm" beside a top-level permission_prompts set by spec', { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL }],
+  ]
+  const cases = DM_STATES.flatMap(([state, dm, reason]) => FORMS.map(([form, spec]) => [state, form, dm, reason, spec] as const))
+
+  test.each(cases)(
+    '%s, %s: refused with no Slack call; the line names the fungible setting and is otherwise the declarative line',
+    async (_state, _form, dm, reason, spec) => {
+      const fungible = personaIn(FUNGIBLE_MODE, { ...spec, dm })
+      const declarative = personaIn(DECLARATIVE_MODE, { channels: [], permission_prompts: DM_DESTINATION, dm })
+      const fungibleLines: string[] = []
+      const declarativeLines: string[] = []
+      const fungibleStub = makeStubSlack({ leakMarker: LEAK_SENTINEL })
+      const declarativeStub = makeStubSlack({ leakMarker: LEAK_SENTINEL })
+      const fr = resolverOn(() => FUNGIBLE_MODE, fungibleLines)
+      const dr = resolverOn(() => DECLARATIVE_MODE, declarativeLines)
+
+      expect(fr.refusalOf(fungible)).toBe(reason)
+      expect(dmDestinationRefusal(FUNGIBLE_MODE, fungible)).toBe(reason)
+      expect(record(await fr.post(fungible, asWebClient(fungibleStub.web), { text: 'x' }))).toEqual({ outcome: 'refused', reason })
+      expect(record(await dr.post(declarative, asWebClient(declarativeStub.web), { text: 'x' }))).toEqual({ outcome: 'refused', reason })
+
+      expect(fungibleStub.callLog).toEqual([])
+      expect(declarativeStub.callLog).toEqual([])
+      expect(fungibleLines).toHaveLength(1)
+      expect(declarativeLines).toHaveLength(1)
+      const [fungibleLine] = fungibleLines as [string]
+      const [declarativeLine] = declarativeLines as [string]
+      const fungibleSetting = destinationSettingOf(FUNGIBLE_MODE)
+      const declarativeSetting = destinationSettingOf(DECLARATIVE_MODE)
+
+      expect(fungibleLine).toContain(`${renderPersonaRef(fungible.name, fungible.key)} has ${fungibleSetting} set to "${DM_DESTINATION}"`)
+      // Never the top-level setting as the setting named.
+      expect(fungibleLine).not.toContain(`has ${declarativeSetting} `)
+      expect(declarativeLine).toContain(`has ${declarativeSetting} set to "${DM_DESTINATION}"`)
+      // The setting name is the only difference.
+      expect(fungibleLine).not.toBe(declarativeLine)
+      expect(fungibleLine).toBe(declarativeLine.replace(`has ${declarativeSetting} `, `has ${fungibleSetting} `))
+    },
+  )
 })
