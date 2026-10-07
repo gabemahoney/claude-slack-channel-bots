@@ -1139,9 +1139,8 @@ describe('poller tick — fungible mode: prompts at the fungible destination (b.
     clients = makePersonaClients((key) => fungibleStubs.get(key))
   })
 
-  /** Every stub of the file but `key`'s: the other fungible personas' and the declarative fixture's A, B and D. */
-  const otherStubs = (key: string): StubSlack[] =>
-    [...[...fungibleStubs].filter(([k]) => k !== key).map(([, s]) => s), stubA, stubB, stubD]
+  /** The other fungible personas' stubs: the only other clients `clients` resolves here. */
+  const otherStubs = (key: string): StubSlack[] => [...fungibleStubs].filter(([k]) => k !== key).map(([, s]) => s)
 
   /**
    * One poller over the applied set `applied`, wired as `src/server.ts` wires

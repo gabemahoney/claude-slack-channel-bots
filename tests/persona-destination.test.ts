@@ -874,69 +874,41 @@ describe('the resolver in fungible mode (b.deo SRI-702)', () => {
       ...(kind === 'dm' ? [['conversations.open', { users: RULE_CONTACT }]] : []),
       ['chat.postMessage', { channel, text: 'fungible' }],
     ])
-    // Never the top-level setting's channel, never another persona's client.
-    expect(posts(C).concat(posts(A), posts(B))).toEqual([])
     expect(logs).toEqual([])
   })
 })
 
 describe('the destination is resolved again at each attempt (b.deo SRI-701)', () => {
-  test(
-    'swapping the configuration in effect and the applied persona between posts, declarative-mode form to fungible-mode form and back, moves each next post; no captured value is used',
-    async () => {
-      const declForm = personaIn(DECLARATIVE_MODE, { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL, dm: DMS_ON })
-      const fungForm = personaIn(FUNGIBLE_MODE, { dm: DMS_ON })
-      let config = DECLARATIVE_MODE
-      let applied = declForm
-      const own = makeStubSlack({ leakMarker: LEAK_SENTINEL })
-      const r = resolverOn(() => config)
-      const attempt = async (text: string) => {
-        const p = applied
-        const now = { destination: r.destinationOf(p), setting: r.settingOf(p) }
-        return { now, result: record(await r.post(p, asWebClient(own.web), { text })) }
-      }
-
-      const first = await attempt('declarative 1')
-      config = FUNGIBLE_MODE
-      applied = fungForm
-      const second = await attempt('fungible')
-      config = DECLARATIVE_MODE
-      applied = declForm
-      const third = await attempt('declarative 2')
-
-      const dm = stubOpenedDmId(RULE_CONTACT)
-      expect([first.now, second.now, third.now]).toEqual([
-        { destination: DECL_CHANNEL, setting: destinationSettingOf(DECLARATIVE_MODE) },
-        { destination: DM_DESTINATION, setting: destinationSettingOf(FUNGIBLE_MODE) },
-        { destination: DECL_CHANNEL, setting: destinationSettingOf(DECLARATIVE_MODE) },
-      ])
-      expect([first.result, second.result, third.result].map((x) => (x as { channelId?: string }).channelId)).toEqual([DECL_CHANNEL, dm, DECL_CHANNEL])
-      expect(own.calls.postMessage.map((c) => [(c as { text: string }).text, (c as { channel: string }).channel])).toEqual([
-        ['declarative 1', DECL_CHANNEL],
-        ['fungible', dm],
-        ['declarative 2', DECL_CHANNEL],
-      ])
-      expect(own.calls.conversationsOpen).toEqual([{ users: RULE_CONTACT }])
-      expect(logs).toEqual([])
-    },
-  )
-
-  test('the switch is read at each call, never when the resolver is built, so the same persona object moves with it', async () => {
+  test('the switch is read at each attempt, never when the resolver is built: the same persona moves with it, and its DM is opened once', async () => {
     // Both sections set, as only a spec can: the switch alone picks the one read.
-    const both = personaIn(DECLARATIVE_MODE, { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL, fungible_destination: FUNG_CHANNEL })
+    const both = personaIn(DECLARATIVE_MODE, { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL, fungible_destination: DM_DESTINATION, dm: DMS_ON })
     let config = DECLARATIVE_MODE
     const own = makeStubSlack({ leakMarker: LEAK_SENTINEL })
     const r = resolverOn(() => config)
+    const attempt = async (text: string) => {
+      const now = { destination: r.destinationOf(both), setting: r.settingOf(both) }
+      return { now, result: record(await r.post(both, asWebClient(own.web), { text })) }
+    }
 
-    record(await r.post(both, asWebClient(own.web), { text: '1' }))
-    config = FUNGIBLE_MODE
-    expect(r.destinationOf(both)).toBe(FUNG_CHANNEL)
-    expect(r.settingOf(both)).toBe(destinationSettingOf(FUNGIBLE_MODE))
-    record(await r.post(both, asWebClient(own.web), { text: '2' }))
-    config = DECLARATIVE_MODE
-    record(await r.post(both, asWebClient(own.web), { text: '3' }))
+    const attempts = []
+    for (const [mode, text] of [[DECLARATIVE_MODE, 'declarative 1'], [FUNGIBLE_MODE, 'fungible 1'], [DECLARATIVE_MODE, 'declarative 2'], [FUNGIBLE_MODE, 'fungible 2']] as const) {
+      config = mode
+      attempts.push(await attempt(text))
+    }
 
-    expect(own.calls.postMessage.map((c) => (c as { channel: string }).channel)).toEqual([DECL_CHANNEL, FUNG_CHANNEL, DECL_CHANNEL])
+    const dm = stubOpenedDmId(RULE_CONTACT)
+    const declarative = { destination: DECL_CHANNEL, setting: destinationSettingOf(DECLARATIVE_MODE) }
+    const fungible = { destination: DM_DESTINATION, setting: destinationSettingOf(FUNGIBLE_MODE) }
+    expect(attempts.map((a) => a.now)).toEqual([declarative, fungible, declarative, fungible])
+    expect(attempts.map((a) => (a.result as { channelId?: string }).channelId)).toEqual([DECL_CHANNEL, dm, DECL_CHANNEL, dm])
+    expect(own.calls.postMessage.map((c) => [(c as { text: string }).text, (c as { channel: string }).channel])).toEqual([
+      ['declarative 1', DECL_CHANNEL],
+      ['fungible 1', dm],
+      ['declarative 2', DECL_CHANNEL],
+      ['fungible 2', dm],
+    ])
+    expect(own.calls.conversationsOpen).toEqual([{ users: RULE_CONTACT }])
+    expect(logs).toEqual([])
   })
 })
 

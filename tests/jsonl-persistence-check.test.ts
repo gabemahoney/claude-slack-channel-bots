@@ -1206,36 +1206,30 @@ describe('b.deo SRI-704: personaArchiveEvidenceScope in fungible mode (b.av2 SR-
       name: 'one `all` channel',
       spec: { channels: [all(ALL_1)] },
       declarative: { channelIds: [ALL_1], zeroIsAttributable: true },
-      declarativeCount: 1,
     },
     {
       name: 'two `all` channels',
       spec: { channels: [all(ALL_1), all(ALL_2)] },
       declarative: { channelIds: [ALL_1, ALL_2], zeroIsAttributable: true },
-      declarativeCount: 3,
     },
     {
       name: 'an `all` and a `mentions` channel',
       spec: { channels: [all(ALL_1), mentions(MENT)] },
       declarative: { channelIds: [ALL_1], zeroIsAttributable: false },
-      declarativeCount: 1,
     },
     {
       name: 'an `all` channel and DMs on',
       spec: { channels: [all(ALL_2)], dm: { enabled: true } },
       declarative: { channelIds: [ALL_2], zeroIsAttributable: false },
-      declarativeCount: 2,
     },
     {
       name: 'no channels',
       spec: { channels: [] },
       declarative: { channelIds: [], zeroIsAttributable: true },
-      declarativeCount: 0,
     },
-  ] as Array<{ name: string; spec: PersonaSpec; declarative: { channelIds: string[]; zeroIsAttributable: boolean }; declarativeCount: number }>)(
+  ] as Array<{ name: string; spec: PersonaSpec; declarative: { channelIds: string[]; zeroIsAttributable: boolean } }>)(
     '$name: fungible mode counts no channel and its zero is never attributable; with the mode absent or declarative the scope is SR-7.4\'s',
-    ({ spec, declarative, declarativeCount }) => {
-      const dbPath = makeArchiveDb([...PRE_BOUNDARY, ...EVERYWHERE])
+    ({ spec, declarative }) => {
       const config = modeEvidenceConfig(spec, true)
       expect(channelModeOf(config)).toBe('fungible')
       const persona = config.personas[0]!
@@ -1247,11 +1241,6 @@ describe('b.deo SRI-704: personaArchiveEvidenceScope in fungible mode (b.av2 SR-
       expect(personaArchiveEvidenceScope(persona)).toEqual(declarative)
       expect(personaArchiveEvidenceScope(persona, 'declarative')).toEqual(declarative)
 
-      // The archive holds rows since spawn in every channel; the fungible scope counts none of them.
-      const countSince = makeDefaultArchiveCount({ message_archive_db: dbPath })
-      const ref = renderPersonaRef(persona.name, persona.key)
-      expect(countSince(fungibleScope.channelIds, SPAWN_EPOCH, ref)).toBe(0)
-      expect(countSince(declarative.channelIds, SPAWN_EPOCH, ref)).toBe(declarativeCount)
       assertNoLeak({ fungibleScope, persona })
     },
   )

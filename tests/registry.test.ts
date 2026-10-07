@@ -1732,9 +1732,17 @@ describe('checkPersonaTarget per channel mode (b.av2 SR-5.1; b.deo SRI-601)', ()
       const check = checkPersonaTarget(persona, target, action, mode)
 
       expect(check).toEqual(scopeCheck(persona, target, expected(dms, action)))
-      if (dmTarget) expect(check).toEqual(checkPersonaTarget(persona, target, action, 'declarative'))
+      if (dmTarget && mode === 'fungible') expect(check).toEqual(checkPersonaTarget(persona, target, action, 'declarative'))
     },
   )
+
+  // b.deo SRI-601 gives the fungible refusal's content, not its text: it says
+  // the target is neither a channel ID nor an allowed DM target. `refusal`
+  // pins the persona and the target around it.
+  test('the fungible refusal says the target is neither a channel ID nor an allowed DM target', () => {
+    expect(FUNGIBLE_TARGET_REFUSAL).toContain('neither a channel ID')
+    expect(FUNGIBLE_TARGET_REFUSAL).toContain('nor an allowed DM target')
+  })
 })
 
 // b.av2 SR-5.1; b.deo SRI-601: the five Slack tools of a fungible-mode
@@ -1935,16 +1943,18 @@ describe('fungible mode never reads the declarative section on the outbound path
       return loadPersonaConfig(writeConfigFile(dir, { allow_invited_channels: true, personas: [persona] }), home)
     }
     const clean = makeFungiblePersona({ name: h.alpha.name }, h.dir)
-    const malformed = load('malformed', {
-      ...clean,
-      channels: [{ id: DM_CONV, delivery: 'sometimes' }, 'not-an-entry', { id: 42 }],
-      permission_prompts: 42,
-    })
+    const malformedChannels = [{ id: DM_CONV, delivery: 'sometimes' }, 'not-an-entry', { id: 42 }]
+    const malformed = load('malformed', { ...clean, channels: malformedChannels, permission_prompts: 42 })
     const plain = load('plain', clean)
     expect(channelModeOf(malformed)).toBe('fungible')
     const withSection = malformed.personas[0]!
     const without = plain.personas[0]!
     expect(withSection.key).toBe(h.alpha.key)
+    // The malformed section reached the loader, as written, and resolved to none.
+    expect(withSection.sections.channels).toEqual(malformedChannels)
+    expect(withSection.sections.permission_prompts).toBe(42)
+    expect(withSection.channels).toEqual([])
+    expect(withSection.permission_prompts).toBeUndefined()
 
     expect(fungibleOutcomes(withSection)).toEqual(fungibleOutcomes(without))
 
@@ -2109,6 +2119,7 @@ describe("Slack's refusals as tool errors in fungible mode (b.av2 SR-5.1; b.deo 
       expect(stubOf(h.beta).callLog).toEqual([])
       const logged = linesNaming(UNCONFIGURED)
       expect(logged).toHaveLength(1)
+      expect(logged[0]).toContain(code)
       expect(logged[0]).toContain(REDACTED_SENTINEL_TAIL)
       assertNoLeak({ result, lines: h.lines })
     },
@@ -2132,8 +2143,16 @@ describe("Slack's refusals as tool errors in fungible mode (b.av2 SR-5.1; b.deo 
       expect(text).not.toContain(libraryText(thrown))
       expect(thrown.original?.code).toBeString()
       expect(text).not.toContain(thrown.original!.code!)
-      expect(linesNaming(UNCONFIGURED)).toHaveLength(1)
-      expect(linesNaming(UNCONFIGURED)[0]).toContain(REDACTED_SENTINEL_TAIL)
+      const logged = linesNaming(UNCONFIGURED)
+      expect(logged).toHaveLength(1)
+      // The safe head of the thrown value's description: its type and the library's code.
+      const safeHead = describeThrownValue(thrown).split(' message=')[0]!
+      const libraryCode = (thrown as { code?: unknown }).code
+      expect(libraryCode).toBeString()
+      expect(safeHead).toStartWith(thrown.constructor.name)
+      expect(safeHead).toContain(`code=${libraryCode}`)
+      expect(logged[0]).toContain(safeHead)
+      expect(logged[0]).toContain(REDACTED_SENTINEL_TAIL)
       assertNoLeak({ result, lines: h.lines })
     },
   )

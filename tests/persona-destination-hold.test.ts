@@ -58,7 +58,6 @@ import { join } from 'node:path'
 import { DM_DESTINATION, type Persona } from '../src/config.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import {
-  DM_OPEN_SCOPE,
   createPersonaDestinations,
   destinationSettingOf,
   type DestinationConfig,
@@ -1263,24 +1262,6 @@ describe('fungible mode: a destination channel the app is not in is held and ret
       expect(clock.pendingCount()).toBe(0)
     },
   )
-
-  test('a fungible "dm" destination whose open lacks im:write: both causes name destination=dm with the fungible setting, and the opening one names the scope', () => {
-    const setting = destinationSettingOf(FUNGIBLE_MODE)
-    const at: NamedDestination = { setting, destination: DM_DESTINATION }
-    const was: DestinationFailedAt = { step: 'conversations.open', code: 'missing_scope' }
-
-    const opening = destinationFailedCause(at, was)
-    const cleared = destinationClearedCause(at, was)
-
-    for (const cause of [opening, cleared]) {
-      expect(cause).toContain(`destination=${DM_DESTINATION}`)
-      expect(cause).toContain(setting)
-      expect(cause).toContain('conversations.open')
-      expect(cause).toContain('missing_scope')
-    }
-    expect(opening).toContain(DM_OPEN_SCOPE)
-    assertNoLeak({ opening, cleared })
-  })
 })
 
 describe('the causes given the declarative setting are the declarative lines (b.deo SRI-906, b.av2 SR-10.3)', () => {

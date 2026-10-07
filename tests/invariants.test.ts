@@ -21,18 +21,25 @@
  *     `src/persona-destination.ts`; the destination hold, the permission
  *     poller, the persona notifier and the lost-message notice read none of
  *     the persona fields, and the hold's destination reads are calls of the
- *     rule.
+ *     rule, made on the resolver it is handed, which it never aliases or
+ *     destructures.
  *
- *   The reader audit parses every `src/` module (comment-stripped, through
- *   `srcModules`) with the TypeScript parser, so a field name in a string, a
- *   template or a comment never counts. A read is a property access, an
- *   optional chain, a string-keyed access or a destructuring (a declaration,
- *   a parameter, an assignment or a `for … of` head); an object literal that
- *   builds the field, a type and a setting name held as a string are no
- *   read. A same-named field of a non-persona object is admitted only by an
- *   exact `ADMITTED_READS` entry (the file, the function, the read and the
- *   reason), and an entry that matches no read fails the audit. Negative
- *   controls pin the matcher and the checks on planted sources.
+ *   The reader audit builds one TypeScript program over every `src/` module's
+ *   own source (no other file is read) and walks it with its type checker,
+ *   so a field name in a string, a template or a comment never counts, and
+ *   every module must parse with no syntactic diagnostic. A read is a
+ *   property access, an optional chain, a keyed access or a destructuring (a
+ *   declaration, a parameter, an assignment or a `for … of` head). A key
+ *   counts when it is a string literal (under any `as`, `satisfies` or
+ *   parentheses) or when the checker gives it a string literal type (a
+ *   constant, imported or not, or a union of literals); a key of type
+ *   `string` is no read. An object literal that builds the field, a type and
+ *   a setting name held as a string are no read. A same-named field of a
+ *   non-persona object is admitted only by an exact `ADMITTED_READS` entry
+ *   (the file, the function, the read, how many times it occurs and the
+ *   reason), and an entry whose count differs from the reads it matches
+ *   fails the audit. Negative controls pin the matcher and the checks on
+ *   planted sources.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -42,8 +49,7 @@ import { readdirSync, readFileSync, statSync } from 'fs'
 import { join } from 'path'
 import type { PermissionRequestInfo } from 'agent-director'
 import ts from 'typescript'
-import { forEachNode } from './test-helpers/ad-value-reads.ts'
-import { srcModules, stripComments } from './test-helpers/source-audit.ts'
+import { forEachNode, isWrapper } from './test-helpers/ad-value-reads.ts'
 
 // ---------------------------------------------------------------------------
 // SR-0.3 — no shellout to agent-director
@@ -147,11 +153,11 @@ const ONE_DESTINATION_RULE = 'personaDestinationOf'
 /** Where `src/config.ts` builds a persona's resolved forms (b.deo SRI-102): building them is no read. */
 const PERSONA_BUILDER = 'parsePersonaEntry'
 
-/** b.deo SRI-102: the only files that read `sections` (the reload plan). */
+/** b.deo SRI-102: the only files that may read `sections` (the reload plan). */
 const SECTIONS_READERS: readonly string[] = ['reload-plan.ts']
 
 /**
- * b.deo SRI-102: the only files that read `fungible_destination`: the one
+ * b.deo SRI-102: the only files that may read `fungible_destination`: the one
  * destination rule, the delivery decision (its exported channel-delivery
  * function included), the routing's input to the decision and the reload
  * plan, and `src/config.ts`, which builds it.
@@ -198,13 +204,15 @@ const PLACEMENT: readonly PlacementRow[] = [
 /**
  * A read of a same-named field of a non-persona object, outside the fixed
  * list (b.deo SRI-202): the file, the functions it lies in (outermost first,
- * joined by ` > `), the read's text and why it is no persona read. Each entry
- * must match a read, or the audit fails.
+ * joined by ` > `), the read's text, how many reads of that text lie there
+ * and why it is no persona read. The reads an entry matches must number
+ * exactly its `count`, or the audit fails.
  */
 interface AdmittedRead {
   readonly file: string
   readonly within: string
   readonly read: string
+  readonly count: number
   readonly reason: string
 }
 
@@ -212,17 +220,18 @@ interface AdmittedRead {
 const STORED_CHOICES_ENTRY = "a persona key's entry of the stored-choice file (b.deo SRI-402): its own `channels` map of stored choices, never a persona's"
 
 const ADMITTED_READS: readonly AdmittedRead[] = [
-  { file: 'channel-delivery.ts', within: 'serializeChannelDelivery', read: 'entry.channels', reason: STORED_CHOICES_ENTRY },
+  { file: 'channel-delivery.ts', within: 'serializeChannelDelivery', read: 'entry.channels', count: 3, reason: STORED_CHOICES_ENTRY },
   {
     file: 'channel-delivery.ts',
     within: 'personaEntryOf',
     read: "value['channels']",
+    count: 1,
     reason: "a persona key's entry of the stored-choice file as parsed from JSON (b.deo SRI-402), checked before it is a record",
   },
-  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > set', read: 'existing?.channels', reason: STORED_CHOICES_ENTRY },
-  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > drop', read: 'entry.channels', reason: STORED_CHOICES_ENTRY },
-  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > storedChoice', read: 'entries.get(key)?.channels', reason: STORED_CHOICES_ENTRY },
-  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > storedChannels', read: 'entries.get(key)?.channels', reason: STORED_CHOICES_ENTRY },
+  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > set', read: 'existing?.channels', count: 2, reason: STORED_CHOICES_ENTRY },
+  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > drop', read: 'entry.channels', count: 1, reason: STORED_CHOICES_ENTRY },
+  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > storedChoice', read: 'entries.get(key)?.channels', count: 1, reason: STORED_CHOICES_ENTRY },
+  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > storedChannels', read: 'entries.get(key)?.channels', count: 1, reason: STORED_CHOICES_ENTRY },
 ]
 
 /** How a field is read. */
@@ -240,23 +249,133 @@ interface FieldRead {
   readonly node: ts.Node
 }
 
-function isAuditedField(name: string | undefined): name is AuditedField {
-  return name !== undefined && (AUDITED_FIELDS as readonly string[]).includes(name)
+function isAuditedField(name: string): name is AuditedField {
+  return (AUDITED_FIELDS as readonly string[]).includes(name)
 }
 
-/** The name a property name or key expression gives, when it is plain (an identifier, a string, a computed string), else undefined. */
-function plainName(node: ts.Node | undefined): string | undefined {
-  if (node === undefined) return undefined
-  if (ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text
-  if (ts.isComputedPropertyName(node)) return plainName(node.expression)
+/** The repository's `src/` directory. */
+const SRC_DIR = join(import.meta.dir, '..', 'src')
+
+/** Every `src/` module's own source, by file name (the parser skips comments itself). */
+function srcSources(): Map<string, string> {
+  const modules = new Map<string, string>()
+  for (const name of readdirSync(SRC_DIR).filter((n) => n.endsWith('.ts')).sort()) {
+    modules.set(name, readFileSync(join(SRC_DIR, name), 'utf-8'))
+  }
+  return modules
+}
+
+/** The audit's program over a set of modules: each module's parsed source, by file name, and the checker. */
+interface AuditProgram {
+  readonly program: ts.Program
+  readonly checker: ts.TypeChecker
+  readonly sources: ReadonlyMap<string, ts.SourceFile>
+}
+
+/** The directory the audit's program holds its modules in: no file outside the modules given is ever read. */
+const AUDIT_ROOT = '/audit/'
+
+const auditPrograms = new WeakMap<ReadonlyMap<string, string>, AuditProgram>()
+
+/**
+ * One TypeScript program over `modules` (file name → source), its relative
+ * imports resolved among them and nothing else loaded (no library, no
+ * package), so the checker gives a constant's literal type across modules.
+ * Built once per map.
+ */
+function auditProgram(modules: ReadonlyMap<string, string>): AuditProgram {
+  const cached = auditPrograms.get(modules)
+  if (cached !== undefined) return cached
+  const files = new Map([...modules].map(([file, code]) => [AUDIT_ROOT + file, code]))
+  const host: ts.CompilerHost = {
+    getSourceFile: (name, target) => {
+      const code = files.get(name)
+      return code === undefined ? undefined : ts.createSourceFile(name, code, target, true, ts.ScriptKind.TS)
+    },
+    getDefaultLibFileName: () => `${AUDIT_ROOT}lib.d.ts`,
+    writeFile: () => {},
+    getCurrentDirectory: () => AUDIT_ROOT,
+    getCanonicalFileName: (name) => name,
+    useCaseSensitiveFileNames: () => true,
+    getNewLine: () => '\n',
+    fileExists: (name) => files.has(name),
+    readFile: (name) => files.get(name),
+    directoryExists: (dir) => AUDIT_ROOT.startsWith(dir.replace(/\/?$/, '/')),
+    getDirectories: () => [],
+  }
+  const program = ts.createProgram({
+    rootNames: [...files.keys()],
+    options: {
+      noLib: true,
+      types: [],
+      noEmit: true,
+      strict: true,
+      target: ts.ScriptTarget.Latest,
+      module: ts.ModuleKind.ESNext,
+      moduleResolution: ts.ModuleResolutionKind.Bundler,
+      allowImportingTsExtensions: true,
+    },
+    host,
+  })
+  const sources = new Map([...modules.keys()].map((file) => [file, program.getSourceFile(AUDIT_ROOT + file)!]))
+  const built = { program, checker: program.getTypeChecker(), sources }
+  auditPrograms.set(modules, built)
+  return built
+}
+
+/** Each syntactic diagnostic of a module in `modules`, as `src/<file>: <message>`. */
+function syntaxFindings(modules: ReadonlyMap<string, string>): string[] {
+  const { program, sources } = auditProgram(modules)
+  return [...sources].flatMap(([file, sf]) =>
+    program.getSyntacticDiagnostics(sf).map((d) => `src/${file}: ${ts.flattenDiagnosticMessageText(d.messageText, ' ')}`),
+  )
+}
+
+/** `node` with every `as`, `satisfies`, `!`, `await` and parentheses around it removed. */
+function unwrapped(node: ts.Expression): ts.Expression {
+  let at = node
+  while (isWrapper(at)) at = at.expression
+  return at
+}
+
+/** The string literal `node` is under its wrappers (`unwrapped`), or undefined. */
+function stringLiteralText(node: ts.Expression): string | undefined {
+  const at = unwrapped(node)
+  return ts.isStringLiteral(at) || ts.isNoSubstitutionTemplateLiteral(at) ? at.text : undefined
+}
+
+/**
+ * The names a key expression gives: its string literal under any wrappers,
+ * else each string literal its type is (a constant, a union of literals).
+ * A key of type `string`, or of any type with no literal, gives none.
+ */
+function keyNames(key: ts.Expression, checker: ts.TypeChecker): string[] {
+  const text = stringLiteralText(key)
+  if (text !== undefined) return [text]
+  const type = checker.getTypeAtLocation(key)
+  return (type.isUnion() ? type.types : [type]).filter((t): t is ts.StringLiteralType => t.isStringLiteral()).map((t) => t.value)
+}
+
+/** The names a property name gives: an identifier's or a string's text, or a computed key's names (`keyNames`). */
+function propertyNames(name: ts.Node | undefined, checker: ts.TypeChecker): string[] {
+  if (name === undefined) return []
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNoSubstitutionTemplateLiteral(name)) return [name.text]
+  if (ts.isComputedPropertyName(name)) return keyNames(name.expression, checker)
+  return []
+}
+
+/** The name a function is declared or bound with: an identifier, a string, or a computed string literal; else undefined. */
+function declaredName(name: ts.Node): string | undefined {
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNoSubstitutionTemplateLiteral(name)) return name.text
+  if (ts.isComputedPropertyName(name)) return stringLiteralText(name.expression)
   return undefined
 }
 
 /** The name a function is declared with or bound to (a variable or a property), or undefined. */
 function boundName(node: ts.Node): string | undefined {
-  if ((ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node)) && node.name !== undefined) return plainName(node.name)
+  if ((ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node)) && node.name !== undefined) return declaredName(node.name)
   if ((ts.isArrowFunction(node) || ts.isFunctionExpression(node)) && (ts.isVariableDeclaration(node.parent) || ts.isPropertyAssignment(node.parent))) {
-    return plainName(node.parent.name)
+    return declaredName(node.parent.name)
   }
   return undefined
 }
@@ -283,48 +402,47 @@ function isAssignmentTarget(node: ts.Expression): boolean {
   return false
 }
 
-/** The field and form `node` reads, when it reads an audited field. */
-function readOf(node: ts.Node): { field: AuditedField; form: ReadForm } | undefined {
-  let name: string | undefined
-  let form: ReadForm
+/** The property names `node` reads, with its form: a property access, a keyed access or a destructuring; else undefined. */
+function readNames(node: ts.Node, checker: ts.TypeChecker): { names: string[]; form: ReadForm } | undefined {
   if (ts.isPropertyAccessExpression(node)) {
-    name = node.name.text
-    form = node.questionDotToken !== undefined ? 'optional property' : 'property'
-  } else if (ts.isElementAccessExpression(node)) {
-    name = ts.isStringLiteral(node.argumentExpression) || ts.isNoSubstitutionTemplateLiteral(node.argumentExpression) ? node.argumentExpression.text : undefined
-    form = node.questionDotToken !== undefined ? 'optional string key' : 'string key'
-  } else if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent)) {
-    name = plainName(node.propertyName ?? node.name)
-    form = 'destructuring'
-  } else if ((ts.isShorthandPropertyAssignment(node) || ts.isPropertyAssignment(node)) && isAssignmentTarget(node.parent)) {
-    name = plainName(node.name)
-    form = 'destructuring'
-  } else {
-    return undefined
+    return { names: [node.name.text], form: node.questionDotToken !== undefined ? 'optional property' : 'property' }
   }
-  return isAuditedField(name) ? { field: name, form } : undefined
+  if (ts.isElementAccessExpression(node)) {
+    return { names: keyNames(node.argumentExpression, checker), form: node.questionDotToken !== undefined ? 'optional string key' : 'string key' }
+  }
+  if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent)) {
+    return { names: propertyNames(node.propertyName ?? node.name, checker), form: 'destructuring' }
+  }
+  if ((ts.isShorthandPropertyAssignment(node) || ts.isPropertyAssignment(node)) && isAssignmentTarget(node.parent)) {
+    return { names: propertyNames(node.name, checker), form: 'destructuring' }
+  }
+  return undefined
 }
 
-/** Parses comment-stripped `code` as the module `file`. */
-function parseModule(file: string, code: string): ts.SourceFile {
-  return ts.createSourceFile(file, code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+/** The audited fields `node` reads, each with the form it is read in. */
+function readsOf(node: ts.Node, checker: ts.TypeChecker): { field: AuditedField; form: ReadForm }[] {
+  const read = readNames(node, checker)
+  if (read === undefined) return []
+  return read.names.filter(isAuditedField).map((field) => ({ field, form: read.form }))
 }
 
-/** Every read of an audited field in `code` (comment-stripped), in source order. */
-function fieldReads(file: string, code: string): FieldRead[] {
-  const sf = parseModule(file, code)
+/** Every read of an audited field in the module `file` of `modules`, in source order. */
+function fieldReads(modules: ReadonlyMap<string, string>, file: string): FieldRead[] {
+  const { checker, sources } = auditProgram(modules)
+  const sf = sources.get(file)
+  if (sf === undefined) throw new Error(`no module src/${file}`)
   const reads: FieldRead[] = []
   forEachNode(sf, (node) => {
-    const read = readOf(node)
-    if (read === undefined) return
-    reads.push({ file, ...read, text: node.getText(sf).replace(/\s+/g, ' '), within: enclosingFunctions(node), node })
+    for (const read of readsOf(node, checker)) {
+      reads.push({ file, ...read, text: node.getText(sf).replace(/\s+/g, ' '), within: enclosingFunctions(node), node })
+    }
   })
   return reads
 }
 
-/** Every read of an audited field across `modules` (file name → comment-stripped code). */
+/** Every read of an audited field across `modules`. */
 function allFieldReads(modules: ReadonlyMap<string, string>): FieldRead[] {
-  return [...modules].flatMap(([file, code]) => fieldReads(file, code))
+  return [...modules.keys()].flatMap((file) => fieldReads(modules, file))
 }
 
 /** A read as a finding: `src/<file>: <form> read of <field> <text> (in <functions>)`. */
@@ -349,16 +467,17 @@ function admits(entry: AdmittedRead, read: FieldRead): boolean {
 
 /**
  * b.deo SRI-202, outside the list: each read in a file not on
- * `fixedReaders` that no entry of `admitted` matches, and each entry that
- * matches no read.
+ * `fixedReaders` that no entry of `admitted` matches, and each entry whose
+ * matched reads do not number exactly its `count`.
  */
 function outsideListFindings(modules: ReadonlyMap<string, string>, fixedReaders: readonly string[], admitted: readonly AdmittedRead[]): string[] {
   const reads = allFieldReads(modules).filter((r) => !fixedReaders.includes(r.file))
   return [
     ...reads.filter((r) => !admitted.some((entry) => admits(entry, r))).map(describeRead),
-    ...admitted
-      .filter((entry) => !reads.some((r) => admits(entry, r)))
-      .map((entry) => `admitted read matches nothing: src/${entry.file} ${entry.read} (in ${entry.within})`),
+    ...admitted.flatMap((entry) => {
+      const matched = reads.filter((r) => admits(entry, r)).length
+      return matched === entry.count ? [] : [`admitted read matches ${matched} reads, not ${entry.count}: src/${entry.file} ${entry.read} (in ${entry.within})`]
+    }),
   ]
 }
 
@@ -367,9 +486,8 @@ function outsideListFindings(modules: ReadonlyMap<string, string>, fixedReaders:
  * finding when none lies in them (the row would hold vacuously).
  */
 function placementFindings(modules: ReadonlyMap<string, string>, row: Omit<PlacementRow, 'part'>): string[] {
-  const code = modules.get(row.file)
-  if (code === undefined) return [`no module src/${row.file}`]
-  const reads = fieldReads(row.file, code).filter((r) => row.fields.includes(r.field))
+  if (!modules.has(row.file)) return [`no module src/${row.file}`]
+  const reads = fieldReads(modules, row.file).filter((r) => row.fields.includes(r.field))
   const inside = reads.filter((r) => row.regions.some((region) => inRegion(r.node, region)))
   return [
     ...reads.filter((r) => !inside.includes(r)).map(describeRead),
@@ -420,29 +538,69 @@ function reachesThroughCalls(sf: ts.SourceFile, from: string, to: string): boole
   return false
 }
 
-/** The methods `code` calls on `receiver` (`<receiver>.<method>(…)`), sorted. */
-function methodsCalledOn(file: string, code: string, receiver: string): string[] {
-  const sf = parseModule(file, code)
+/** The methods `sf` calls on `receiver` (`<receiver>.<method>(…)`, the receiver under any wrappers), sorted. */
+function methodsCalledOn(sf: ts.SourceFile, receiver: string): string[] {
   const methods = new Set<string>()
   forEachNode(sf, (node) => {
-    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.expression.getText(sf) === receiver) {
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && unwrapped(node.expression.expression).getText(sf) === receiver) {
       methods.add(node.expression.name.text)
     }
   })
   return [...methods].sort()
 }
 
-/** A planted module, as the audit sees a `src/` file: comment-stripped. */
-function planted(code: string): string {
-  return stripComments(code)
+/** The expression `node` sits in once the wrappers around it (`isWrapper`) are passed. */
+function outsideWrappers(node: ts.Node): ts.Node {
+  let at = node
+  while (isWrapper(at.parent)) at = at.parent
+  return at
+}
+
+/**
+ * Each place `sf` takes the resolver `receiver` (`<object>.<property>`)
+ * other than to call a method on it: an alias (a variable bound to it, or an
+ * assignment of it) and a destructuring of `<property>`, as
+ * `src/<file>: <kind> <text> (in <functions>)`. Through an alias or a
+ * destructured binding, a call escapes `methodsCalledOn`.
+ */
+function resolverEscapes(file: string, sf: ts.SourceFile, receiver: string): string[] {
+  const property = receiver.slice(receiver.lastIndexOf('.') + 1)
+  const findings: string[] = []
+  const finding = (kind: string, node: ts.Node): void => {
+    findings.push(`src/${file}: ${kind} ${node.getText(sf).replace(/\s+/g, ' ')} (in ${enclosingFunctions(node) || 'module scope'})`)
+  }
+  forEachNode(sf, (node) => {
+    if (ts.isPropertyAccessExpression(node) && node.getText(sf) === receiver) {
+      const at = outsideWrappers(node)
+      const parent = at.parent
+      if (ts.isVariableDeclaration(parent) && parent.initializer === at) finding('alias of the resolver', parent)
+      else if (ts.isBinaryExpression(parent) && parent.right === at && parent.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && parent.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
+        finding('alias of the resolver', parent)
+      }
+    } else if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent) && declaredName(node.propertyName ?? node.name) === property) {
+      finding('destructuring of the resolver', node.parent)
+    } else if ((ts.isShorthandPropertyAssignment(node) || ts.isPropertyAssignment(node)) && isAssignmentTarget(node.parent) && declaredName(node.name) === property) {
+      finding('destructuring of the resolver', node.parent)
+    }
+  })
+  return findings
+}
+
+/** A planted module's source in a program of its own. */
+function plantedSource(code: string): ts.SourceFile {
+  return auditProgram(new Map([['planted.ts', code]])).sources.get('planted.ts')!
+}
+
+/** The reads of a planted module, as field and form. */
+function plantedReads(code: string): { field: AuditedField; form: ReadForm }[] {
+  return fieldReads(new Map([['planted.ts', code]]), 'planted.ts').map((r) => ({ field: r.field, form: r.form }))
 }
 
 describe('b.av2 SR-1.2, b.deo SRI-202: the section not in force is never read', () => {
-  const modules = srcModules()
+  const modules = srcSources()
 
   test('the walk holds every src/ module, and every file the audit names is one', () => {
-    const srcDir = join(import.meta.dir, '..', 'src')
-    const everyTs = (readdirSync(srcDir, { recursive: true }) as string[]).filter((name) => name.endsWith('.ts')).sort()
+    const everyTs = (readdirSync(SRC_DIR, { recursive: true }) as string[]).filter((name) => name.endsWith('.ts')).sort()
     expect([...modules.keys()]).toEqual(everyTs)
     const named = [
       ...FIXED_READERS,
@@ -455,7 +613,11 @@ describe('b.av2 SR-1.2, b.deo SRI-202: the section not in force is never read', 
     expect(named.filter((file) => !modules.has(file))).toEqual([])
   })
 
-  test('outside the fixed list, no src/ file reads a persona field, and every admitted read matches one', () => {
+  test('every src/ module parses with no syntactic diagnostic, so no read is lost to a parse error', () => {
+    expect(syntaxFindings(modules)).toEqual([])
+  })
+
+  test('outside the fixed list, no src/ file reads a persona field, and every admitted read matches its count', () => {
     expect(outsideListFindings(modules, FIXED_READERS, ADMITTED_READS)).toEqual([])
   })
 
@@ -465,7 +627,7 @@ describe('b.av2 SR-1.2, b.deo SRI-202: the section not in force is never read', 
 })
 
 describe('b.deo SRI-102: the readers of sections and fungible_destination', () => {
-  const modules = srcModules()
+  const modules = srcSources()
 
   test('sections is read only by the reload plan', () => {
     expect(readersFindings(modules, 'sections', SECTIONS_READERS)).toEqual([])
@@ -483,30 +645,36 @@ describe('b.deo SRI-102: the readers of sections and fungible_destination', () =
 })
 
 describe('b.av2 SR-7.1, b.deo SRI-701: one destination rule', () => {
-  const modules = srcModules()
+  const modules = srcSources()
+  const { sources } = auditProgram(modules)
 
   test('the rule is declared once, in src/persona-destination.ts, and reads both destination fields', () => {
-    const declared = [...modules].flatMap(([file, code]) => functionsNamed(parseModule(file, code), ONE_DESTINATION_RULE).map(() => file))
+    const declared = [...sources].flatMap(([file, sf]) => functionsNamed(sf, ONE_DESTINATION_RULE).map(() => file))
     expect(declared).toEqual(['persona-destination.ts'])
-    const ruleReads = fieldReads('persona-destination.ts', modules.get('persona-destination.ts')!).filter((r) => inRegion(r.node, { fn: ONE_DESTINATION_RULE }))
+    const ruleReads = fieldReads(modules, 'persona-destination.ts').filter((r) => inRegion(r.node, { fn: ONE_DESTINATION_RULE }))
     expect([...new Set(ruleReads.map((r) => r.field))].sort()).toEqual(['fungible_destination', 'permission_prompts'])
   })
 
   test.each(DESTINATION_CONSUMERS.map((file) => [`src/${file}`, file] as const))('%s reads none of the persona fields', (_label, file) => {
-    expect(fieldReads(file, modules.get(file)!).map(describeRead)).toEqual([])
+    expect(fieldReads(modules, file).map(describeRead)).toEqual([])
   })
 
   test("the hold's destination reads are calls of the rule, through the resolver it is handed", () => {
-    const methods = methodsCalledOn(DESTINATION_HOLD, modules.get(DESTINATION_HOLD)!, HOLD_RESOLVER)
+    const hold = sources.get(DESTINATION_HOLD)!
+    const methods = methodsCalledOn(hold, HOLD_RESOLVER)
     expect(methods).toContain('destinationOf')
     expect(methods).toContain('post')
-    const resolver = parseModule('persona-destination.ts', modules.get('persona-destination.ts')!)
+    const resolver = sources.get('persona-destination.ts')!
     const [factory] = functionsNamed(resolver, RESOLVER_FACTORY)
     expect(factory).toBeDefined()
     for (const method of methods) {
       expect({ method, inFactory: functionsNamed(resolver, method).some((fn) => inRegion(fn, { fn: RESOLVER_FACTORY })) }).toEqual({ method, inFactory: true })
       expect({ method, reachesRule: reachesThroughCalls(resolver, method, ONE_DESTINATION_RULE) }).toEqual({ method, reachesRule: true })
     }
+  })
+
+  test('the hold never aliases or destructures the resolver it is handed', () => {
+    expect(resolverEscapes(DESTINATION_HOLD, sources.get(DESTINATION_HOLD)!, HOLD_RESOLVER)).toEqual([])
   })
 })
 
@@ -517,16 +685,34 @@ describe('b.deo SRI-202: negative controls for the reader audit', () => {
     ['a string-keyed access', "export const f = (p: P) => p['invited']", 'invited', 'string key'],
     ['an optional string-keyed access', 'export const f = (p?: P) => p?.["sections"]', 'sections', 'optional string key'],
     ['a template-keyed access', 'export const f = (p: P) => p[`fungible_destination`]', 'fungible_destination', 'string key'],
+    ['an access keyed by a constant', "const KEY = 'permission_prompts'\nexport const f = (p: P) => p[KEY]", 'permission_prompts', 'string key'],
+    ['an access keyed by an as-const literal', "export const f = (p: P) => p['channels' as const]", 'channels', 'string key'],
+    ['an access keyed by a widened literal', "export const f = (p: P) => p[('invited' as string)]", 'invited', 'string key'],
+    ['an access keyed by a satisfies literal', "export const f = (p: P) => p['sections' satisfies string]", 'sections', 'string key'],
+    ['an access keyed by a union of literals', "export const f = (p: P, k: 'fungible_destination' | 'dm') => p[k]", 'fungible_destination', 'string key'],
     ['a destructuring declaration', 'export function f(p: P) { const { channels } = p; return channels }', 'channels', 'destructuring'],
     ['a renamed destructuring', 'export function f(p: P) { const { invited: section } = p; return section }', 'invited', 'destructuring'],
     ['a string-keyed destructuring', "export function f(p: P) { const { 'sections': s } = p; return s }", 'sections', 'destructuring'],
+    ['a computed string-keyed destructuring', "export function f(p: P) { const { ['channels']: c } = p; return c }", 'channels', 'destructuring'],
+    ['a destructuring keyed by a constant', "const K = 'permission_prompts'\nexport function f(p: P) { const { [K]: v } = p; return v }", 'permission_prompts', 'destructuring'],
+    ['an assignment destructuring keyed by a constant', "const K = 'invited'\nlet v: unknown\nexport function f(p: P) { ({ [K]: v } = p) }", 'invited', 'destructuring'],
     ['a nested destructuring', 'export function f(x: X) { const { persona: { fungible_destination } } = x; return fungible_destination }', 'fungible_destination', 'destructuring'],
     ['a destructured parameter', 'export function f({ permission_prompts }: P) { return permission_prompts }', 'permission_prompts', 'destructuring'],
     ['a destructured arrow parameter', 'export const f = ({ channels }: P) => channels', 'channels', 'destructuring'],
     ['an assignment destructuring', 'let invited: unknown\nexport function f(p: P) { ({ invited } = p) }', 'invited', 'destructuring'],
     ['a for-of destructuring', 'export function f(ps: P[]) { for (const { sections } of ps) void sections }', 'sections', 'destructuring'],
   ] as const)('%s is a read', (_form, code, field, form) => {
-    expect(fieldReads('planted.ts', planted(code)).map((r) => ({ field: r.field, form: r.form }))).toEqual([{ field, form }])
+    expect(plantedReads(code)).toEqual([{ field, form }])
+  })
+
+  test('an access keyed by a constant imported from src/persona-destination.ts is a read', () => {
+    const modules = new Map([
+      ...srcSources(),
+      ['planted.ts', "import { DECLARATIVE_DESTINATION_SETTING } from './persona-destination.ts'\nexport const f = (p: P) => p[DECLARATIVE_DESTINATION_SETTING]"],
+    ])
+    expect(fieldReads(modules, 'planted.ts').map(describeRead)).toEqual([
+      'src/planted.ts: string key read of permission_prompts p[DECLARATIVE_DESTINATION_SETTING] (in f)',
+    ])
   })
 
   test.each([
@@ -536,30 +722,102 @@ describe('b.deo SRI-202: negative controls for the reader audit', () => {
     ['a read inside a line comment', 'export const f = (p: P) => 0 // p.channels, p?.invited'],
     ['a read inside a block comment', "/** p['sections'], const { permission_prompts } = p */\nexport const f = 0"],
     ['an object literal that builds the fields', 'export const f = () => ({ channels: [], permission_prompts: undefined, fungible_destination: undefined })'],
+    ['an object literal that builds a field under a constant key', "const K = 'channels'\nexport const f = () => ({ [K]: [] })"],
     ['a type that names the fields', "export type T = Pick<P, 'channels' | 'invited'> & { sections: P['sections'] }"],
+    ['an access keyed by a string variable named like a field', 'export const f = (p: P, channels: string) => p[channels]'],
+    ['a destructuring keyed by a string variable named like a field', 'export function f(p: P, invited: string) { const { [invited]: v } = p; return v }'],
   ] as const)('%s is no read', (_what, code) => {
-    expect(fieldReads('planted.ts', planted(code))).toEqual([])
+    expect(plantedReads(code)).toEqual([])
+  })
+
+  test('a module that does not parse is a finding', () => {
+    expect(syntaxFindings(new Map([['planted.ts', 'export const f = (p: P) => p.channels)']]))).toEqual(["src/planted.ts: ',' expected."])
+    expect(syntaxFindings(new Map([['planted.ts', 'export const f = (p: P) => p.channels']]))).toEqual([])
   })
 
   test('a read outside the fixed list is a finding, an exact admission clears it, and an admission matching nothing is one', () => {
-    const modules = new Map([['planted.ts', planted('export function f(p: P) { return p.channels }')]])
+    const modules = new Map([['planted.ts', 'export function f(p: P) { return p.channels }']])
     expect(outsideListFindings(modules, FIXED_READERS, [])).toEqual(['src/planted.ts: property read of channels p.channels (in f)'])
-    const exact: AdmittedRead = { file: 'planted.ts', within: 'f', read: 'p.channels', reason: 'planted' }
+    const exact: AdmittedRead = { file: 'planted.ts', within: 'f', read: 'p.channels', count: 1, reason: 'planted' }
     expect(outsideListFindings(modules, FIXED_READERS, [exact])).toEqual([])
     expect(outsideListFindings(modules, FIXED_READERS, [{ ...exact, within: 'g' }])).toEqual([
       'src/planted.ts: property read of channels p.channels (in f)',
-      'admitted read matches nothing: src/planted.ts p.channels (in g)',
+      'admitted read matches 0 reads, not 1: src/planted.ts p.channels (in g)',
     ])
     expect(outsideListFindings(modules, ['planted.ts'], [])).toEqual([])
   })
 
+  test("an admission whose count differs from the reads it matches is a finding", () => {
+    const modules = new Map([['planted.ts', 'export function f(p: P) { return [p.channels, p.channels] }']])
+    const entry: AdmittedRead = { file: 'planted.ts', within: 'f', read: 'p.channels', count: 2, reason: 'planted' }
+    expect(outsideListFindings(modules, FIXED_READERS, [entry])).toEqual([])
+    expect(outsideListFindings(modules, FIXED_READERS, [{ ...entry, count: 1 }])).toEqual(['admitted read matches 2 reads, not 1: src/planted.ts p.channels (in f)'])
+    expect(outsideListFindings(modules, FIXED_READERS, [{ ...entry, count: 3 }])).toEqual(['admitted read matches 2 reads, not 3: src/planted.ts p.channels (in f)'])
+  })
+
   test("a read inside the list but outside its file's part is a finding, and a part with no read is one", () => {
     const row = { file: 'planted.ts', regions: [{ fn: 'scope' }, { argsOf: 'decide' }], fields: AUDITED_FIELDS }
-    const inside = planted('function scope(p: P) { return p.channels }\nexport const g = (p: P) => decide({ channels: p.channels })')
+    const inside = 'function scope(p: P) { return p.channels }\nexport const g = (p: P) => decide({ channels: p.channels })'
     expect(placementFindings(new Map([['planted.ts', inside]]), row)).toEqual([])
-    const outside = planted("function scope(p: P) { return p.channels }\nexport function other(p: P) { return p['invited'] }")
+    const outside = "function scope(p: P) { return p.channels }\nexport function other(p: P) { return p['invited'] }"
     expect(placementFindings(new Map([['planted.ts', outside]]), row)).toEqual(["src/planted.ts: string key read of invited p['invited'] (in other)"])
-    const none = planted('function scope(p: P) { return p.dm }')
+    const none = 'function scope(p: P) { return p.dm }'
     expect(placementFindings(new Map([['planted.ts', none]]), row)).toEqual([`src/planted.ts: no read lies in ${JSON.stringify(row.regions)}`])
+  })
+})
+
+describe('b.av2 SR-7.1, b.deo SRI-701: negative controls for the one-rule checks', () => {
+  const resolver = plantedSource(
+    [
+      'function personaDestinationOf(c: C, p: P) { return p.dm }',
+      'function direct(p: P) { return personaDestinationOf(undefined, p) }',
+      'function viaHelper(p: P) { return helper(p) }',
+      'function helper(p: P) { return personaDestinationOf(undefined, p) }',
+      'function apart(p: P) { return other(p) }',
+      'function other(p: P) { return p.key }',
+      'function loopA(p: P): unknown { return loopB(p) }',
+      'function loopB(p: P): unknown { return loopA(p) }',
+    ].join('\n'),
+  )
+
+  test.each([
+    ['a method that calls the rule', 'direct', true],
+    ['a method that calls the rule through a helper', 'viaHelper', true],
+    ['a method whose helpers never call the rule', 'apart', false],
+    ['a method in a call cycle that never calls the rule', 'loopA', false],
+  ] as const)('reachesThroughCalls: %s gives %p', (_what, from, reaches) => {
+    expect(reachesThroughCalls(resolver, from, ONE_DESTINATION_RULE)).toBe(reaches)
+  })
+
+  test('methodsCalledOn gives the methods called on the resolver only', () => {
+    const hold = plantedSource(
+      [
+        'export function hold(deps: D, other: D, p: P) {',
+        '  deps.destinations.post(p);',
+        '  deps.destinations.destinationOf(p);',
+        '  (deps.destinations as R).forget(p.key);',
+        '  deps.clients.settingOf(p);',
+        '  other.destinations.refusalOf(p);',
+        '}',
+      ].join('\n'),
+    )
+    expect(methodsCalledOn(hold, HOLD_RESOLVER)).toEqual(['destinationOf', 'forget', 'post'])
+  })
+
+  test.each([
+    ['an alias bound to a variable', 'export function hold(deps: D, p: P) { const d = deps.destinations; return d.refusalOf(p) }', 'alias of the resolver d = deps.destinations (in hold)'],
+    ['an alias through a cast', 'export function hold(deps: D, p: P) { const d = (deps.destinations as R); return d.refusalOf(p) }', 'alias of the resolver d = (deps.destinations as R) (in hold)'],
+    ['an alias by assignment', 'let d: R\nexport function hold(deps: D, p: P) { d = deps.destinations; return d.refusalOf(p) }', 'alias of the resolver d = deps.destinations (in hold)'],
+    ['a destructuring declaration', 'export function hold(deps: D, p: P) { const { destinations } = deps; return destinations.refusalOf(p) }', 'destructuring of the resolver { destinations } (in hold)'],
+    ['a renamed destructuring', 'export function hold(deps: D, p: P) { const { destinations: d } = deps; return d.refusalOf(p) }', 'destructuring of the resolver { destinations: d } (in hold)'],
+    ['a destructured parameter', 'export function hold({ destinations }: D, p: P) { return destinations.refusalOf(p) }', 'destructuring of the resolver { destinations } (in hold)'],
+    ['an assignment destructuring', 'let destinations: R\nexport function hold(deps: D, p: P) { ({ destinations } = deps); return destinations.refusalOf(p) }', 'destructuring of the resolver { destinations } (in hold)'],
+  ] as const)('resolverEscapes: %s is a finding', (_what, code, finding) => {
+    expect(resolverEscapes('planted.ts', plantedSource(code), HOLD_RESOLVER)).toEqual([`src/planted.ts: ${finding}`])
+  })
+
+  test('resolverEscapes: method calls on the resolver are no finding', () => {
+    const code = 'export async function hold(deps: D, p: P) { deps.destinations.destinationOf(p); await (deps.destinations).post(p) }'
+    expect(resolverEscapes('planted.ts', plantedSource(code), HOLD_RESOLVER)).toEqual([])
   })
 })
