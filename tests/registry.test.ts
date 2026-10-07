@@ -1662,10 +1662,10 @@ interface ScopeRow {
   dmTarget?: boolean
 }
 
-/** A `D…` conversation's outcome, the same in both modes (b.av2 SR-5.1). */
+/** A `D…` conversation's outcome, the same in both modes (b.av2 SR-5.1 as amended by b.deo SRI-601). */
 const dmConversationOutcome = (dms: boolean): ScopeExpected => (dms ? 'dm' : { why: WHY.dmsOff })
 
-/** A user ID's outcome, the same in both modes (b.av2 SR-5.1). */
+/** A user ID's outcome, the same in both modes (b.av2 SR-5.1 as amended by b.deo SRI-601). */
 const userIdOutcome = (dms: boolean, action: PersonaTargetAction): ScopeExpected =>
   !dms ? { why: WHY.dmsOff } : action === 'post' ? 'user' : { why: WHY.userId }
 

@@ -26,7 +26,7 @@
  * Archive evidence in fungible mode (b.av2 SR-7.4, b.deo SRI-704): the scope
  * helper counts no channel and its zero is never attributable, whatever the
  * persona's resolved `channels` holds; with the mode absent or declarative it
- * is SR-7.4's. Layer 2, reading the mode from the configuration it is given,
+ * is SR-7.4's (as amended by b.deo SRI-704). Layer 2, reading the mode from the configuration it is given,
  * reports a persona whose `delivery: all` channel holds archived messages
  * since spawn as inconclusive with `FUNGIBLE_MODE_ZERO_REASON`, never lost
  * (the same fixture in declarative mode is lost); its no-count path keeps its

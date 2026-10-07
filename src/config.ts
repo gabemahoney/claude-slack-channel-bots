@@ -1148,7 +1148,8 @@ function rejectUnknownEntryKeys(
  * Stage 1 of an entry: unknown keys of the entry and the shape of the `dm`
  * object, then the section in force (b.deo SRI-103, SRI-104). Declarative
  * mode: the shape of the `channels` array and its entries, as b.av2 SR-1.2
- * and SR-1.3 give it; `invited` is not looked at. Fungible mode: the shape of
+ * (as amended by b.deo SRI-102, SRI-202) and SR-1.3 (as amended by b.deo
+ * SRI-103, SRI-104) give it; `invited` is not looked at. Fungible mode: the shape of
  * the `invited` object; `channels` is not looked at. Unknown keys are
  * rejected at every level checked (key names only, and only those safe to
  * echo: `describeUnknownKeys`).

@@ -15,7 +15,7 @@ The top-level setting `allow_invited_channels` picks the channel mode for every 
 - **Declarative mode** (`allow_invited_channels` absent or `false`, the default) serves channels as 0.11.1 does: each persona serves only the channels listed in its `channels`, each at its `delivery`.
 - **Fungible mode** (`allow_invited_channels: true`):
   - `channels` and the top-level `permission_prompts` are not read;
-  - each persona serves every public or private channel its Slack app is a member of that Slack does not mark as externally shared;
+  - each persona serves every public or private channel its Slack app is a member of that Slack marks as not externally shared;
   - a channel is served at `mentions` by default, and at `all` only when the persona's agent stored `all` for it with `set_channel_delivery` (see [Channel delivery in fungible mode](README.md#channel-delivery-in-fungible-mode));
   - each stored choice persists in `channel-delivery.json` in the state directory, beside `config.json`;
   - the persona's permission prompts and notices go to its `invited.permission_prompts`, `"dm"` when it is absent (see [Permission prompts in fungible mode](README.md#permission-prompts-in-fungible-mode));

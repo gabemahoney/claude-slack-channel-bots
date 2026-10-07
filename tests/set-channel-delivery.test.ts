@@ -331,7 +331,7 @@ function storedChoiceBytes(): Buffer | null {
   return existsSync(h.channelDeliveryFile) ? readFileSync(h.channelDeliveryFile) : null
 }
 
-/** The SR-8.1 reload files' bytes (`config.json` among them), each undefined when absent. */
+/** The SR-8.1 (as amended by b.deo SRI-401) reload files' bytes (`config.json` among them), each undefined when absent. */
 function reloadFiles(): Record<string, Buffer | undefined> {
   return { config: h.readConfig(), lastApplied: h.readRecord(), pending: h.readPending(), apply: h.readApply() }
 }

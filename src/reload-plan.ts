@@ -490,7 +490,7 @@ function sectionKeyChanged(before: Persona, after: Persona, key: RecordedSection
  * - when both configurations are in that mode, its section is compared by
  *   resolved values: the declarative section by the set of channel IDs, a
  *   kept channel's `delivery` and `permission_prompts`, as b.av2 SR-8.6
- *   compares them; the fungible section by `fungible_destination`, so an
+ *   (as amended by b.deo SRI-802) compares them; the fungible section by `fungible_destination`, so an
  *   absent `invited.permission_prompts` equals `dm`;
  * - otherwise (the switch changed), its keys are compared as written
  *   (`sections`), and a changed `channels`, `permission_prompts` or `invited`

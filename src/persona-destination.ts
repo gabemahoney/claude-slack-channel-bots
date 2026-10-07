@@ -90,7 +90,7 @@ const CHANNEL_NOT_FOUND_ERROR = 'channel_not_found'
 /** Failure code of a `conversations.open` that succeeded but returned no conversation ID. */
 export const NO_CONVERSATION_ID_CODE = 'no_conversation_id'
 
-/** The setting that names a persona's destination in declarative mode (b.av2 SR-1.2). */
+/** The setting that names a persona's destination in declarative mode (b.av2 SR-1.2 as amended by b.deo SRI-102, SRI-202). */
 export const DECLARATIVE_DESTINATION_SETTING = 'permission_prompts'
 
 /** The setting that names a persona's destination in fungible mode (b.deo SRI-102, SRI-702). */

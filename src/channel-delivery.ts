@@ -587,7 +587,7 @@ export interface ChannelDeliveryAppliedPersona {
 /**
  * The start rules' view of the retired-key record (b.deo SRI-407): whether a
  * key is recorded, and whether it carries the "new life has begun" mark
- * (b.jg5 SRJ-806). A type-only view of the store `main()` loaded, so this
+ * (b.jg5 SRJ-806 as amended by b.deo SRI-407). A type-only view of the store `main()` loaded, so this
  * module never reads `retired-keys.json` itself.
  */
 export type ChannelDeliveryRetiredKeyView = Pick<RetiredKeyStore, 'isRecorded' | 'isMarked'>
@@ -938,9 +938,9 @@ function createChannelDeliveryStore(
       } else if (start.retiredKeys.isRecorded(key) && !start.retiredKeys.isMarked(key)) {
         // SRI-905's closed reasons have no reason of their own for a key the
         // retired-key record holds without its "new life has begun" mark
-        // (b.jg5 SRJ-806); such a key was retired by a confirmed change (or by
-        // the start sweep) whose new life has not begun, so its drop uses
-        // "retired by a confirmed change".
+        // (b.jg5 SRJ-806 as amended by b.deo SRI-407); such a key was retired
+        // by a confirmed change (or by the start sweep) whose new life has not
+        // begun, so its drop uses "retired by a confirmed change".
         batch.push({ key, reason: CHANNEL_DELIVERY_DROP_RETIRED })
       }
     }

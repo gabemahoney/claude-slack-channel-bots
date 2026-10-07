@@ -784,8 +784,9 @@ running are not affected. See
   refused `message` event, logged by the persona that received it, and no
   `persona-invited-channel` line for it. An `app_mention` never logs this
   line in fungible mode: the `message` event carrying the same mention
-  decides. The line's own advice is the one way to serve such a channel:
-  declarative mode, with the channel listed.
+  decides. For every reason but `the channel ID is malformed`, the line's
+  own advice is the one way to serve such a channel: declarative mode, with
+  the channel listed. Neither mode serves a malformed channel ID.
 - **Reasons and fixes:** the conditions are checked in this order, and the
   first that fails is the reason:
 
