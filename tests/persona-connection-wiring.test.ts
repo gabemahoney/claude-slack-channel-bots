@@ -1,7 +1,17 @@
 /**
  * persona-connection-wiring.test.ts — Each persona's connection feeds its own
  * pipeline and click handler, and the server's Slack seams resolve to the
- * persona's own clients (b.av2 SR-3.1 wiring, SR-3.4, SR-4.1, SR-7.1, SR-7.2).
+ * persona's own clients (b.av2 SR-3.1 wiring, SR-3.4, SR-4.1 with b.deo
+ * SRI-301, SR-7.1 with b.deo SRI-701 to SRI-703, SR-7.2).
+ *
+ * b.av2 SR-4.1 / b.deo SRI-301 (b.deo AC 6): for a `message` and an `app_mention`,
+ * the envelope's `is_ext_shared_channel` reaches the routing intake exactly as
+ * the envelope carried it in each of its four forms (`false`, `true`, a
+ * non-boolean, absent, which arrives as absent), with no other envelope field;
+ * a flag set only on the event arrives as absent; and the RAW intake line has
+ * the same text for every form, in its 0.11.1 format, with no envelope field.
+ * How the routing uses the flag is covered in tests/persona-routing.test.ts
+ * and tests/delivery-decision-fungible.test.ts.
  *
  * Code under test (never `src/server.ts`, which is only read as text):
  * - `src/persona-event-router.ts` `createPersonaEventRouter`: the handler the
@@ -107,7 +117,13 @@ import { consumeAck } from '../src/ack-tracker.ts'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import type { PersonaSpec } from './test-helpers/persona-config.ts'
-import { makeAppMention, makeChannelMessage, type SlackEvent } from './test-helpers/slack-stub.ts'
+import {
+  ENVELOPE_FLAG_FORMS,
+  makeAppMention,
+  makeChannelMessage,
+  type EnvelopeFlagForm,
+  type SlackEvent,
+} from './test-helpers/slack-stub.ts'
 import {
   makeTrailCapture,
   posts,
@@ -258,6 +274,31 @@ function recordingIntake(): Pick<PersonaRouting, 'receive'> & { calls: IntakeCal
     calls,
     receive: async (event, ack, key) => {
       calls.push({ event, key })
+      await ack()
+    },
+  }
+}
+
+/** One `receive` call the flag-recording intake saw. */
+interface FlagIntakeCall {
+  event: unknown
+  key: unknown
+  /** The fourth argument, the envelope flag: undefined when absent. */
+  flag: unknown
+  /** How many arguments the call had. */
+  arity: number
+  /** Every argument but the ack, for the no-envelope-field checks. */
+  data: unknown[]
+}
+
+/** An intake that records each call with every argument as given (the envelope flag included) and acks. */
+function flagIntake(): Pick<PersonaRouting, 'receive'> & { calls: FlagIntakeCall[] } {
+  const calls: FlagIntakeCall[] = []
+  return {
+    calls,
+    receive: async (...args: Parameters<PersonaRouting['receive']>) => {
+      const [event, ack, key, flag] = args
+      calls.push({ event, key, flag, arity: args.length, data: args.filter((arg) => arg !== ack) })
       await ack()
     },
   }
@@ -463,6 +504,114 @@ describe('SR-3.1: each connection\'s inbound events reach the intake with its ow
     expect(failed[0]).toStartWith(`[slack] persona=${h.B.key}: interactive action 1 of 1 handling failed: Error`)
     expect(failed[0]).toContain(redactedMessageField('click failed'))
     expect(h.lines.filter((l) => l.includes('event handler failed'))).toEqual([])
+    assertNoLeak({ logs })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-4.1 / b.deo SRI-301: the envelope flag at the intake
+// ---------------------------------------------------------------------------
+
+describe('b.av2 SR-4.1 / b.deo SRI-301: the envelope flag reaches the intake exactly as sent, and the RAW line is unchanged', () => {
+  /** A value carried only by envelope fields, so any of them reaching the intake or the RAW line shows. */
+  const ENVELOPE_MARK = 'EC0WIREENVELOPEONLY'
+  /** Envelope fields beside the flag, as Slack's Events API payload carries them, each holding the mark. */
+  const MARKED_ENVELOPE = { event_context: ENVELOPE_MARK, authorizations: [{ team_id: ENVELOPE_MARK, is_bot: true }] }
+  /** Texts only the envelope holds: the mark, the flag's name and the stub's default envelope values. */
+  const ENVELOPE_ONLY_TEXTS = [ENVELOPE_MARK, 'is_ext_shared_channel', 'event_callback', 'A0STUB0001', 'Ev0STUB']
+
+  type Build = (overrides: Record<string, unknown>) => SlackEvent
+  const EVENTS: [PersonaSocketEventName, Build][] = [
+    ['message', (o) => makeChannelMessage(o)],
+    ['app_mention', (o) => makeAppMention(o)],
+  ]
+  /** Each flag form and the flag value the intake must receive for it (absent arrives as absent). */
+  const FORMS: [EnvelopeFlagForm, unknown][] = [
+    ['false', false],
+    ['true', true],
+    ['non-boolean', 'false'],
+    ['absent', undefined],
+  ]
+
+  /** The intake's data arguments hold no envelope field: no envelope-only text in them. */
+  function expectNoEnvelopeField(call: FlagIntakeCall): void {
+    const text = JSON.stringify(call.data)
+    for (const envelopeText of ENVELOPE_ONLY_TEXTS) expect(text).not.toContain(envelopeText)
+  }
+
+  test.each(EVENTS.flatMap(([eventName, build]) => FORMS.map(([form, flag]) => [eventName, form, flag, build] as const)))(
+    'a `%s` event whose envelope flag is %s reaches the intake once with the event unchanged, the receiving persona\'s key and the flag exactly as sent, and nothing else of the envelope',
+    async (_eventName, form, flag, build) => {
+      const h = harness()
+      await bringUpBoth(h)
+      const intake = flagIntake()
+      const { logs } = plugRouter(h, intake)
+      const event = build({ channel: CS, text: `flag ${form}` })
+      const sent = structuredClone(event)
+
+      await h.stub(h.A).socket.deliver(event, { ...MARKED_ENVELOPE, ...ENVELOPE_FLAG_FORMS[form] })
+
+      expect(intake.calls).toHaveLength(1)
+      const [call] = intake.calls
+      expect(call!.event).toBe(event)
+      expect(call!.event).toEqual(sent)
+      expect(call!.key).toBe(h.A.key)
+      expect(call!.flag).toBe(flag)
+      expect(call!.arity).toBeLessThanOrEqual(4)
+      expectNoEnvelopeField(call!)
+      expect(h.stub(h.A).socket.acks).toHaveLength(1)
+      assertNoLeak({ logs })
+    },
+  )
+
+  test.each(EVENTS)('control: a `%s` event carrying `is_ext_shared_channel: false` on the event, with the envelope\'s flag removed, reaches the intake with the flag absent (read from the envelope only)', async (_eventName, build) => {
+    const h = harness()
+    await bringUpBoth(h)
+    const intake = flagIntake()
+    const { logs } = plugRouter(h, intake)
+    const event = build({ channel: CS, is_ext_shared_channel: false })
+
+    await h.stub(h.A).socket.deliver(event, ENVELOPE_FLAG_FORMS.absent)
+
+    expect(intake.calls).toHaveLength(1)
+    expect(intake.calls[0]!.event).toBe(event)
+    expect(intake.calls[0]!.key).toBe(h.A.key)
+    expect(intake.calls[0]!.flag).toBeUndefined()
+    assertNoLeak({ logs })
+  })
+
+  test.each(EVENTS)('a `%s` listener argument with no envelope (`body`) reaches the intake with the flag absent', async (eventName, build) => {
+    const h = harness()
+    const intake = flagIntake()
+    const { router, logs } = plugRouter(h, intake)
+    const event = build({ channel: CS })
+    const ack = recordingAck()
+
+    await router(h.A.key, eventName, { event, ack: ack.ack })
+
+    expect(intake.calls).toHaveLength(1)
+    expect(intake.calls[0]!.event).toBe(event)
+    expect(intake.calls[0]!.key).toBe(h.A.key)
+    expect(intake.calls[0]!.flag).toBeUndefined()
+    expect(ack.count()).toBe(1)
+    assertNoLeak({ logs })
+  })
+
+  test.each(EVENTS)('the RAW intake line of one `%s` event has the same 0.11.1 text for all four flag forms and holds no envelope field', async (eventName, build) => {
+    const h = harness()
+    await bringUpBoth(h)
+    const { logs } = plugRouter(h, flagIntake())
+    const event = build({ channel: CS, text: 'one event, four envelopes' })
+    const json = JSON.stringify(event)
+    // Short enough that the line's 300-character cut keeps the whole event.
+    expect(json.length).toBeLessThan(300)
+    const expected = `[slack] RAW ${eventName} event persona=${h.A.key}: ${json}`
+
+    for (const [form] of FORMS) await h.stub(h.A).socket.deliver(event, { ...MARKED_ENVELOPE, ...ENVELOPE_FLAG_FORMS[form] })
+
+    const raw = logs.filter((l) => l.startsWith('[slack] RAW '))
+    expect(raw).toEqual(FORMS.map(() => expected))
+    for (const envelopeText of ENVELOPE_ONLY_TEXTS) expect(raw.join('\n')).not.toContain(envelopeText)
     assertNoLeak({ logs })
   })
 })
