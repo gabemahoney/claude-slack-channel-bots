@@ -62,6 +62,20 @@
  *   `realpath -e` (the SCENARIO_ROOT containment check) before they write
  *   there: `write_ad_settings` before its `rm` and its `mkdir`,
  *   `_scenario_stand_in_settings` before its `write_file`.
+ * - scenario.sh's Slack stub and stub MCP session helpers (harness additions,
+ *   b.jg5 SRJ-1306, b.deo SRI-1404), read and never run: `slack_stub_push`,
+ *   `stub_session_deliveries` and `stub_session_call`
+ *   (`IMAGE_GUARDED_STUB_HELPERS`) each run `require_ci_image`, called
+ *   directly, as their first command after their declarations and outside any
+ *   `if`, `||` or subshell, and none runs `require_scenario_home` (they work in
+ *   shared mode, which has no scenario HOME). `/ci` always carries the marker,
+ *   so this pin is the only proof of their refusal. Read with the shell reader
+ *   above, pinned with synthetic violations, then run over the tree, and over
+ *   the tree with one helper's guard removed or moved into an `if`.
+ * - The Slack stub `slack-stub-server.ts` (b.jg5 SRJ-1306, b.deo SRI-1402)
+ *   statically imports only `node:` built-ins, type-only imports included,
+ *   through the image-guarded fixtures' matcher (`nodeOnlyImportFindings`).
+ *   It has no marker check, so it is not one of `IMAGE_GUARDED_TS_PATHS`.
  * - The harness's one agent-director delete (b.jg5 SRJ-1306), over every
  *   file under `tests/integration` (shell or TypeScript, shellcheck's and
  *   bun's config aside): in shell, any command whose first argument after
@@ -1692,6 +1706,10 @@ const IMAGE_GUARD_RULE = {
   realpathCheckFirst: 'realpath-check-before-write',
   /** The image-guarded TypeScript fixtures statically import only `node:` built-ins. */
   driverStaticImport: 'driver-static-import',
+  /** scenario.sh's Slack stub and stub MCP session helpers run `require_ci_image` as their first step after their declarations (b.deo SRI-1404). */
+  helperImageCheckFirst: 'image-check-first-in-helper',
+  /** The Slack stub, which has no marker check, statically imports only `node:` built-ins (b.deo SRI-1402). */
+  stubStaticImport: 'stub-static-import',
 } as const
 
 /**
@@ -2337,6 +2355,27 @@ function isDriverMarkerCheck(statement: ts.Statement, sf: ts.SourceFile): boolea
   return exits
 }
 
+/** The module a top-level statement loads statically: an import's or an `export … from`'s specifier; undefined for any other statement. */
+function staticLoadOf(s: ts.Statement): ts.Expression | undefined {
+  return ts.isImportDeclaration(s) || ts.isExportDeclaration(s) ? s.moduleSpecifier : undefined
+}
+
+/**
+ * The static-import matcher: a finding, naming `rule` and ending with `why`,
+ * for every static import or `export … from` in `sf` (the file `file`) of
+ * anything but a `node:` built-in, type-only included.
+ */
+function nodeOnlyImportFindings(file: string, sf: ts.SourceFile, rule: string, why: string): string[] {
+  const findings: string[] = []
+  for (const s of sf.statements) {
+    const specifier = staticLoadOf(s)
+    if (specifier === undefined) continue
+    const text = stringText(specifier)
+    if (text === undefined || !text.startsWith('node:')) findings.push(`${file}:${finding(sf, s, `${rule}: static import of '${text ?? specifier.getText(sf)}' ${why}`)}`)
+  }
+  return findings
+}
+
 /**
  * The findings for the driver `file`: every static import or `export … from`
  * of anything but a `node:` built-in (it is evaluated before the file's first
@@ -2346,15 +2385,8 @@ function isDriverMarkerCheck(statement: ts.Statement, sf: ts.SourceFile): boolea
 function driverGuardFindings(file: string, source: string): string[] {
   const sf = parse(source, file)
   const at = (node: ts.Node, rule: string, what: string): string => `${file}:${finding(sf, node, `${rule}: ${what}`)}`
-  const loadOf = (s: ts.Statement): ts.Expression | undefined => (ts.isImportDeclaration(s) || ts.isExportDeclaration(s) ? s.moduleSpecifier : undefined)
-  const findings: string[] = []
-  for (const s of sf.statements) {
-    const specifier = loadOf(s)
-    if (specifier === undefined) continue
-    const text = stringText(specifier)
-    if (text === undefined || !text.startsWith('node:')) findings.push(at(s, IMAGE_GUARD_RULE.driverStaticImport, `static import of '${text ?? specifier.getText(sf)}' is evaluated before the ${CI_IMAGE_MARKER} check`))
-  }
-  const first = sf.statements.find((s) => loadOf(s) === undefined)
+  const findings = nodeOnlyImportFindings(file, sf, IMAGE_GUARD_RULE.driverStaticImport, `is evaluated before the ${CI_IMAGE_MARKER} check`)
+  const first = sf.statements.find((s) => staticLoadOf(s) === undefined)
   if (first === undefined) findings.push(`${file}:1: ${IMAGE_GUARD_RULE.markerFirst}: no ${CI_IMAGE_MARKER} check`)
   else if (!isDriverMarkerCheck(first, sf)) findings.push(at(first, IMAGE_GUARD_RULE.markerFirst, `the first step is not the ${CI_IMAGE_MARKER} check that exits non-zero: ${first.getText(sf).split('\n')[0]}`))
   return findings
@@ -3436,5 +3468,166 @@ describe(`${MCP_SESSION_END_HELPER}: both guards before its signal`, () => {
 
     expect(conditional).not.toBe(source)
     expect(signalGuardFindings(conditional, MCP_SESSION_END_HELPER).join('\n')).toContain(`no unconditional ${HOME_GUARD}`)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: the Slack stub and stub MCP session helpers refuse outside the
+// /ci image (harness additions, b.jg5 SRJ-1306, b.deo SRI-1404)
+// ---------------------------------------------------------------------------
+
+/**
+ * scenario.sh's helpers for the Slack stub's pushes and the stub MCP
+ * session's records. They work in both modes, so none runs
+ * `require_scenario_home` (shared mode has no scenario HOME); `/ci` always
+ * carries the marker, so this static pin is the only proof of their refusal.
+ */
+const IMAGE_GUARDED_STUB_HELPERS: readonly string[] = ['slack_stub_push', 'stub_session_deliveries', 'stub_session_call']
+
+/** scenario.sh's guard that refuses outside a cscb-ci image. */
+const IMAGE_GUARD = 'require_ci_image'
+
+/** Whether `command` is unconditional: no reserved word before it, at the start of a logical line or after `;`. */
+function isUnconditional(command: ShellCommand): boolean {
+  return command.keywords.length === 0 && (command.after === '' || command.after === ';')
+}
+
+/**
+ * The image-check findings for `helpers` in the shell file `file`: the first
+ * command of each, after its unconditional declarations (`local …`, a lone
+ * `NAME=…`), is an unconditional `require_ci_image`, called directly. A
+ * command substitution in a declaration runs before it, and so is its first
+ * command. A helper that is not defined is a finding too.
+ */
+function helperImageCheckFindings(file: string, source: string, helpers: readonly string[] = IMAGE_GUARDED_STUB_HELPERS): string[] {
+  const functions = shellFunctions(source)
+  const rule = IMAGE_GUARD_RULE.helperImageCheckFirst
+  const findings: string[] = []
+  for (const helper of helpers) {
+    const body = functions.get(helper)
+    if (body === undefined) {
+      findings.push(`${file}:1: ${rule}: ${helper} is not defined`)
+      continue
+    }
+    const first = body.find((c) => !(isUnconditional(c) && isDeclarationOnly(c)))
+    if (first === undefined) findings.push(`${file}:1: ${rule}: ${helper}: no ${IMAGE_GUARD} after its declarations`)
+    else if (first.name !== IMAGE_GUARD || !isUnconditional(first)) {
+      const shown = [...first.keywords, first.name].filter((w) => w !== '').join(' ')
+      findings.push(`${file}:${first.line}: ${rule}: ${helper}: its first step after its declarations is \`${shown}\`, not an unconditional ${IMAGE_GUARD}`)
+    }
+  }
+  return findings
+}
+
+describe('static audit: the Slack stub and stub MCP session helpers run require_ci_image first (b.jg5 SRJ-1306, b.deo SRI-1404)', () => {
+  const RULE = IMAGE_GUARD_RULE.helperImageCheckFirst
+  const fn = (name: string, ...body: string[]): string => lines(`${name}() {`, ...body, '}')
+  const DECLARATIONS = lines('    local dir="${1:-}" step', '    step="stub_session_deliveries ${dir}"')
+  const STEP = '    jq -c . "${file}"'
+
+  const flagged: [label: string, source: string][] = [
+    ['no guard at all', fn('stub_session_deliveries', DECLARATIONS, STEP)],
+    ['a command before the guard', fn('stub_session_deliveries', DECLARATIONS, '    [[ -d "${dir}" ]] || fail x', `    ${IMAGE_GUARD} "\${step}"`, STEP)],
+    ['a command substitution in a declaration before the guard', fn('stub_session_deliveries', '    local key="$(sha256sum <<< "$1")"', `    ${IMAGE_GUARD} x`, STEP)],
+    ['the guard only after an ||', fn('stub_session_deliveries', DECLARATIONS, `    [[ -e /x ]] || ${IMAGE_GUARD} "\${step}"`, STEP)],
+    ['the guard only in a subshell', fn('stub_session_deliveries', DECLARATIONS, `    ( ${IMAGE_GUARD} "\${step}" )`, STEP)],
+    ['the guard only inside an if', fn('stub_session_deliveries', DECLARATIONS, '    if [[ -n "${STRICT:-}" ]]; then', `        ${IMAGE_GUARD} "\${step}"`, '    fi', STEP)],
+    ['the guard through a private wrapper', fn('stub_session_deliveries', DECLARATIONS, '    _scenario_require_image "${step}"', STEP)],
+  ]
+
+  test.each(flagged)('flags %s, naming the helper, the file and the rule', (_label, source) => {
+    const findings = helperImageCheckFindings('scenario.sh', source, ['stub_session_deliveries'])
+
+    expectNamedFindings(findings, 'scenario.sh', RULE)
+    expect(findings).toContainEqual(expect.stringContaining(`: ${RULE}: stub_session_deliveries`))
+  })
+
+  test('flags a helper that is not defined', () => {
+    expectNamedFindings(helperImageCheckFindings('scenario.sh', fn('other', `    ${IMAGE_GUARD} x`), ['stub_session_call']), 'scenario.sh', RULE)
+  })
+
+  const allowed: [label: string, source: string][] = [
+    ['declarations, then the guard', fn('stub_session_deliveries', DECLARATIONS, `    ${IMAGE_GUARD} "\${step}"`, STEP)],
+    ['the guard with no declarations, after a comment', fn('stub_session_deliveries', '    # The image first.', `    ${IMAGE_GUARD} x`, STEP)],
+    ['the guard after `;` following a declaration', fn('stub_session_deliveries', `    local step=x; ${IMAGE_GUARD} "\${step}"`, STEP)],
+  ]
+
+  test.each(allowed)('allows %s', (_label, source) => {
+    expect(helperImageCheckFindings('scenario.sh', source, ['stub_session_deliveries'])).toEqual([])
+  })
+
+  const source = readFileSync(SCENARIO_PATH, 'utf-8')
+
+  test('the current tree: slack_stub_push, stub_session_deliveries and stub_session_call each run require_ci_image first', () => {
+    expect(helperImageCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), source)).toEqual([])
+  })
+
+  test('the current tree: none of the three runs require_scenario_home, so each works in shared mode', () => {
+    const functions = shellFunctions(source)
+
+    expect(IMAGE_GUARDED_STUB_HELPERS.filter((helper) => (functions.get(helper) ?? []).some((c) => c.name === HOME_GUARD))).toEqual([])
+  })
+
+  test.each(IMAGE_GUARDED_STUB_HELPERS.map((helper) => [helper]))('scenario.sh with %s’s require_ci_image removed is flagged, naming it', (helper) => {
+    const unguarded = source.replace(new RegExp(`(\\n${helper}\\(\\) \\{\\n(?:.*\\n)*?)    ${IMAGE_GUARD} "[^"\\n]*"\\n`), '$1')
+    const findings = helperImageCheckFindings('scenario.sh', unguarded)
+
+    expect(unguarded).not.toBe(source)
+    expectNamedFindings(findings, 'scenario.sh', RULE)
+    expect(findings).toHaveLength(1)
+    expect(findings[0]).toContain(`: ${RULE}: ${helper}: `)
+  })
+
+  test.each(IMAGE_GUARDED_STUB_HELPERS.map((helper) => [helper]))('scenario.sh with %s’s require_ci_image only inside an if is flagged, naming it', (helper) => {
+    const conditional = source.replace(
+      new RegExp(`(\\n${helper}\\(\\) \\{\\n(?:.*\\n)*?)    ${IMAGE_GUARD} ("[^"\\n]*")\\n`),
+      `$1    if [[ -n "\${STRICT:-}" ]]; then\n        ${IMAGE_GUARD} $2\n    fi\n`,
+    )
+    const findings = helperImageCheckFindings('scenario.sh', conditional)
+
+    expect(conditional).not.toBe(source)
+    expect(findings).toHaveLength(1)
+    expect(findings[0]).toContain(`: ${RULE}: ${helper}: its first step after its declarations is \`if [[\``)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: the Slack stub loads only node: built-ins statically
+// (b.jg5 SRJ-1306, b.deo SRI-1402)
+// ---------------------------------------------------------------------------
+
+/**
+ * The loopback Slack stub. It has no marker check, so it is not one of
+ * IMAGE_GUARDED_TS_PATHS; it stays self-contained (Bun and `node:` only), as
+ * the container copies `tests/` without `src/`.
+ */
+const SLACK_STUB_SERVER_PATH = join(INTEGRATION_DIR, 'fixtures', 'slack-stub-server.ts')
+
+/** The Slack stub's static-import findings for `file` (the shared matcher, with its own rule). */
+function stubImportFindings(file: string, source: string): string[] {
+  return nodeOnlyImportFindings(file, parse(source, file), IMAGE_GUARD_RULE.stubStaticImport, 'is not a node: built-in; the stub stays self-contained')
+}
+
+describe('static audit: slack-stub-server.ts statically imports only node: built-ins (b.jg5 SRJ-1306, b.deo SRI-1402)', () => {
+  const source = readFileSync(SLACK_STUB_SERVER_PATH, 'utf-8')
+  /** The stub's source with `line` added after its first `node:` import. */
+  const withImport = (line: string): string => source.replace(/(\nimport [^\n]* from 'node:[^']+'\n)/, `$1${line}\n`)
+
+  test('the current tree: the stub imports only node: built-ins statically', () => {
+    expect(stubImportFindings(relative(REPO_ROOT, SLACK_STUB_SERVER_PATH), source)).toEqual([])
+  })
+
+  test.each([
+    ['a src/ module', "import { parsePersonaConfig } from '../../../src/config.ts'"],
+    ['a test helper, type-only', "import type { FakeSlack } from '../../test-helpers/slack-stub.ts'"],
+    ['a package', "import { WebSocketServer } from 'ws'"],
+    ['a re-export from a package', "export { Client } from '@modelcontextprotocol/sdk/client/index.js'"],
+  ])('the stub with a static import of %s is flagged, naming the file and the rule', (_label, line) => {
+    const changed = withImport(line)
+    const findings = stubImportFindings('slack-stub-server.ts', changed)
+
+    expect(changed).not.toBe(source)
+    expectNamedFindings(findings, 'slack-stub-server.ts', IMAGE_GUARD_RULE.stubStaticImport)
+    expect(findings).toHaveLength(1)
   })
 })

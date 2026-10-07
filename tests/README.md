@@ -180,8 +180,13 @@ why:
   agent-director settings writer (`write_ad_settings`) calls
   `require_ci_image` as its first step, which fails with
   `FAIL: <test>: <step>: refused: /etc/cscb-ci-image is absent …`.
+- The Slack push and stub session helpers (`slack_stub_push`,
+  `stub_session_deliveries`, `stub_session_call`; b.deo SRI-1404) call
+  `require_ci_image` as their first step after their declarations, with the
+  same FAIL line.
 
-The same helpers then call `require_scenario_home`, which refuses unless
+The `scenario.sh` helpers named before the Slack push and stub session
+helpers then call `require_scenario_home`, which refuses unless
 `SCENARIO_ROOT` is a directory and HOME is under it, both as written and by
 real path (a HOME that is a symlink out of `SCENARIO_ROOT` is refused). The
 copy-and-rename every install and swap goes through also refuses a
@@ -191,13 +196,24 @@ their directory with `realpath -e` and refuse one outside `SCENARIO_ROOT`
 before they remove, create or write anything there. No harness step touches the invoking
 user's own `~/.agent-director`.
 
+The Slack push and stub session helpers do not run `require_scenario_home`:
+they work in shared mode, which has no scenario HOME. The image check is
+their guard, with their own `SCENARIO_ROOT` checks: each refuses a
+`SCENARIO_STUB_DIR` or working directory outside `SCENARIO_ROOT`, as written
+and by real path, and none touches HOME (see Scenario helper).
+
 `tests/host-safety.test.ts` reads these files, and never runs them, to check
 that each check comes before the first step it guards (see the
 `host-safety.test.ts` row in `docs/testing-guide.md`). It finds the
 `scenario.sh` functions to hold from the file: every function with a step,
 less the ones its commented `HOME_CHECK_EXEMPT` and `HOME_CHECKED_BY_CALLERS`
 lists name with why; a function in the second list may run only after an
-audited helper's `require_scenario_home`.
+audited helper's `require_scenario_home`. The Slack push and stub session
+helpers make no step in that audit's sense (no `sqlite3`, copy, move,
+install or agent-director run), so it does not hold them and neither list
+names them; a separate pin (`IMAGE_GUARDED_STUB_HELPERS`) checks that each
+runs `require_ci_image` first, outside any `if`, `||` or subshell, and that
+none runs `require_scenario_home`.
 
 ### Layout
 
@@ -558,10 +574,13 @@ tests/
                                    # before it reports in (see Stub worker modes); in `dev-channels`, an optional per-directory delay before the dialog
                                    # (`stub_dialog_delay`); in `linger-on-exit`, SessionEnd on the `/exit` line `pause` types, then a linger until `stub_release`
       stub-mcp-session.ts          # the stub's MCP session client, copied beside the stub in every fmk script: connects to the bot server named by the stub's
-                                   # `--mcp-config` with the package's own MCP SDK and holds the session until the stub ends; refuses to run without the image
-                                   # marker /etc/cscb-ci-image and imports the package only after that check
+                                   # `--mcp-config` with the package's own MCP SDK and holds the session until the stub ends; records every channel notification
+                                   # in a per-directory delivery record and calls the tools the harness writes to a per-directory request file, one result line
+                                   # each (see The stub worker; b.deo SRI-1403); refuses to run without the image marker /etc/cscb-ci-image and imports the
+                                   # package only after that check
       slack-stub-server.ts         # Tests 10 and 12 loopback Slack stub: Web API, apps.connections.open, Socket Mode WebSocket, JSONL record
-                                   # (each `chat.postMessage` text whole, token-redacted)
+                                   # (each `chat.postMessage` text whole, token-redacted); the push control `POST /_push`, which sends one Socket Mode
+                                   # `events_api` envelope over a label's newest open WebSocket (see Slack stub; b.deo SRI-1402)
       phase1-client-check.ts       # run by Test 1 on the installed package, after the client-under-test check
                                    # against the agent-director client the installed package resolves: the client exports SRJ-103's seven classes and the package's re-exports of them are the client's own,
                                    # client-built errors classify by class, the description and predicate helpers hold; refuses to run without the image marker /etc/cscb-ci-image
@@ -1387,6 +1406,57 @@ record under `SCENARIO_ROOT` (0 when it holds none).
 `seq` above `<after-seq>` (default 0), in record order, one JSON string per
 line (`jq -r` gives a post's text back). Each runs `require_ci_image` first
 and refuses a record that is not a file under `SCENARIO_ROOT`.
+
+Slack pushes and the stub session's records (both modes; harness additions,
+b.deo SRI-1404). These three helpers drive an event into CSCB through the
+Slack stub and read what reached the stub worker's MCP session. `scenario.sh`'s
+header gives each one's arguments and output; the formats are under Slack
+stub (the push control) and The stub worker (the session's records and tool
+calls). Two settings feed them:
+
+- `SCENARIO_STUB_DIR`, the directory holding the scenario's stub worker and
+  its copy of `fixtures/stub-mcp-session.ts`, where the client keeps its
+  records. Fmk setup sets it to `SCENARIO_BIN`; a shared-mode script sets it
+  to the directory it copied the stub and the client into. It must be a
+  directory under `SCENARIO_ROOT`, as written and by real path, holding the
+  client as a regular file, not a symlink.
+- `SCENARIO_SLACK_STUB_URL`, the Slack stub's base URL, exactly
+  `http://127.0.0.1:<port>` (no path, no trailing `/`, never port 3100). The
+  script sets it once the stub's ready file exists.
+
+A setting that is unset or bad fails the step at once, with its reason.
+
+- `slack_stub_push [--expect-refused] <label> <event-json> [<flag>]` pushes
+  one `events_api` envelope carrying `<event-json>` (the inner event, a JSON
+  object) over the WebSocket the token label `<label>` opened last, bounded
+  at 10 s (`SCENARIO_SLACK_PUSH_S`). `<flag>` sets the payload's
+  `is_ext_shared_channel`: not given or empty, `false`; `omit`, left out;
+  any other JSON value (`true`, `false`, `"yes"`, `null`, `1`), sent as
+  given; anything else fails. It prints the envelope ID of a sent push, and
+  fails the scenario, naming `<label>` and the stub's reason, when the stub
+  refuses the push or does not answer in time. With `--expect-refused` (a
+  positive control, such as a push to a label with no open WebSocket) it
+  succeeds only on a refusal, printing the stub's reason (`no-open-socket`
+  for that label), and fails when the push is sent or the stub does not
+  answer or gives no reason.
+- `stub_session_deliveries <dir>` prints the delivery record of the working
+  directory `<dir>` (a directory under `SCENARIO_ROOT`, as written and by real
+  path): one JSON object per line, as recorded, in record order, complete
+  lines only. It prints nothing before the first delivery, and only reads.
+- `stub_session_call <dir> <tool> <json-args>` calls the MCP tool `<tool>` (1
+  to 128 letters, digits, `_`, `-` or `.`) with `<json-args>` (a JSON object)
+  over the session of the stub working in `<dir>`. It appends one request
+  line with an ID unique in the scenario to the directory's request file, in
+  one write (at most 4000 bytes, `SCENARIO_STUB_REQUEST_MAX_BYTES`), then
+  polls the results record for that ID for at most 30 s
+  (`SCENARIO_STUB_CALL_S`) and prints the result line as recorded. It fails,
+  naming `<tool>`, the request ID and `<dir>`, when no result line arrives in
+  time; an `isError: true` result is the scenario's to judge, not a failure.
+
+Each refuses outside the `cscb-ci` image (`require_ci_image` is its first
+step; see Image marker) and works in both modes. Each reads and writes only
+under `SCENARIO_ROOT`: `stub_session_call` writes only the request file in
+`SCENARIO_STUB_DIR`, and the other two write nothing.
 
 CSCB's tmux calls (fmk mode; scenario 26; each a harness addition). `cscb_tmux_calls [<fragment>...]` prints the tmux
 shim's `call` lines whose parent is any CSCB process the record holds at the
@@ -2677,6 +2747,69 @@ a mode that has not reported in, without `--mcp-config`, or where the client
 is not beside the stub (Tests 4, 10 and 12, which copy only the stub and run
 with `health_check_interval` 0).
 
+The session's records and tool calls (b.deo SRI-1403). The client's header
+is the full statement; this is the part scenarios rely on. The client keeps
+three files per working directory in the directory holding the client file,
+which for the copy beside the stub is the stub's directory
+(`SCENARIO_STUB_DIR`, `SCENARIO_BIN` in fmk mode). The copy must be a regular
+file, not a symlink: Bun runs a symlinked client from its target's
+directory, and the records would land there.
+
+| File | Written by | One line per |
+|---|---|---|
+| `stub-mcp-deliveries.<key>.jsonl` | the client | `notifications/claude/channel` notification received |
+| `stub-mcp-requests.<key>.jsonl` | the harness (`stub_session_call`) | tool call asked for |
+| `stub-mcp-results.<key>.jsonl` | the client | request answered |
+
+- `<key>` is the lowercase hex SHA-256, all 64 characters, of the working
+  directory's real path, hashed with no trailing newline:
+  `printf '%s' "$(realpath -e -- "${dir}")" | sha256sum | cut -d ' ' -f 1`.
+  Distinct directories get distinct records.
+- A delivery line is `{"content":…,"meta":{…}}`: the notification's params
+  as received, `meta` holding every attribute the server sent (`chat_id`,
+  `message_id`, `user`, `user_id` or `bot_id`, `ts`, `via`, `thread_ts`,
+  whichever are present), in the order received. A key absent from the
+  params is absent from the line; other notifications are not recorded.
+- A request line is `{"id":"<id>","tool":"<tool name>","arguments":{…}}`:
+  `id` and `tool` non-empty strings, `arguments` a JSON object. Request IDs
+  are unique in a scenario, which the harness keeps so; it only appends to
+  the request file, each line in one write.
+- A result line is `{"id":"<id>","isError":<true|false>,"text":"<text>"}`:
+  the tool result's `isError` (`false` when absent) and the `text` of its
+  `text` content items, joined with `\n`. A call that ends without a tool
+  result (an error answer, the SDK's request timeout, a transport failure, or
+  the session ending mid-call) still gets one line,
+  `{"id":"<id>","isError":true,"text":"","error":"<why>"}`, so its ID is
+  answered. The client never retries a request.
+- Once connected, the client reads the request file every 250 ms (a missing
+  file is no requests yet), and only complete lines: an incomplete last line
+  is read again, whole, at a later poll. It calls each request over its
+  session, whatever tool it names, in file order and one at a time: the next
+  call starts only once the previous result line is written.
+- The skip rule. Before it runs any request, the client reads the results
+  record and takes every ID with a result line there as answered; a request
+  whose ID is answered, there or by this client, is not run. So a client
+  started by `/mcp reconnect` never repeats a call an earlier client made.
+- The delivery and results records are only ever appended to, by every
+  client of the working directory, each line in one write. The client writes
+  nothing before it connects, so there is no record for a working directory
+  where no session was opened. Polling ends with the session.
+
+Besides its exit line, the client writes these lines to its log (each
+prefixed `stub-mcp-session[<pid>]:`), and the session keeps running after
+each:
+
+- `could not append a line to <path>: <why>`, for a failed record write;
+- `line <n> of the request file <path> is not a valid request (<why>); skipped`,
+  once per such line, never its text;
+- `request <id> has a result line; not run`, for a skipped request;
+- `could not read the results record <path>; no request runs until it is read`,
+  once, when the results record exists but cannot be read;
+- `could not read the request file <path>: <why>`, when the request file
+  exists but cannot be read, once until a later poll reads it;
+- `the request file <path> is shorter than the part already read; reading it from its start`;
+- `request poll failed: <why>`.
+
 None of the stub's lines or calls is CSCB's: its hooks, its `status` reads
 and its MCP session are children of the stub, never of a CSCB process, so
 `cscb_ad_calls`, `cscb_ad_count` and the closing assertions never count them.
@@ -2703,10 +2836,75 @@ variable for the integration suite only (see Environment Variables in
   `chat.postMessage` line keeps its `text` whole, with token-like text
   redacted (`slack_posts` reads them); every other method's `text` is cut at
   300 characters.
+- It is self-contained: it loads only Bun and `node:` built-ins, never `src/`
+  or a test helper, as the container copies `tests/` without `src/`
+  (`tests/host-safety.test.ts` pins its static imports). It holds no token:
+  its source has no token-like literal, and it never writes or prints a token
+  value (only the token's kind and the first 12 hex digits of its SHA-256) or
+  a control `suffix`.
 - It has no `bun test` suite of its own; Test 10 exercises it end to end,
   Test 0's `slack_stub_record` leg checks the record's text cut and token
   replacement, and Test 20's whole-text checks exercise its
   `chat.postMessage` record.
+
+The push control (b.deo SRI-1402). `POST /_push` sends one Socket Mode
+`events_api` envelope, shaped as Slack's, to a persona's open WebSocket, so a
+scenario can deliver an event to CSCB as Slack would. The stub's header is
+the full statement; `slack_stub_push` (see Scenario helper) is how a scenario
+calls it. The body is one JSON object:
+
+```json
+{"label": "alpha", "event": {"type": "message", "channel": "C…", "channel_type": "channel"}, "envelope": {"is_ext_shared_channel": true}}
+```
+
+- `label` (required, a non-empty string) is a token label of the control in
+  force, matched against the label each WebSocket opened under.
+- `event` (required, a JSON object) is the inner event, sent unchanged as the
+  payload's `event`.
+- `envelope` (optional, an object) may set only the payload's
+  `is_ext_shared_channel`. Every other envelope and payload field is fixed or
+  generated by the stub: `type` `events_api`, `accepts_response_payload`
+  `false`, `retry_attempt` 0, `retry_reason` empty, payload `type`
+  `event_callback`, the stub's own `team_id` and `api_app_id`, `event_time`
+  the push's time in seconds, and an `envelope_id` and `event_id` unique per
+  push.
+- The flag has four cases. No `envelope`, or `{}`, sends it as `false`.
+  `{"is_ext_shared_channel": <value>}` sends the value as given: `true`,
+  `false`, or any non-boolean JSON value (`null`, a string, a number, an
+  object). `{"omit": ["is_ext_shared_channel"]}` leaves it out of the payload.
+- The envelope goes to the label's newest open WebSocket: the one opened last
+  among its sockets open now. A closed or closing socket is never chosen.
+- A push carries no token, and `/_push` reads none.
+
+The answers. A refused push sends nothing.
+
+| Status | Body | When |
+|---|---|---|
+| 200 | `{"ok":true,"envelope_id":"<uuid>","event_id":"Ev…"}` | sent |
+| 400 | `{"ok":false,"error":"<reason>"}` | malformed: `not-json`, `not-an-object`, `unknown-field` (a top-level key other than `label`, `event` and `envelope`), `no-label`, `event-not-object`, `envelope-not-object`, `envelope-field-fixed` (an envelope key other than `is_ext_shared_channel` and `omit`), `omit-invalid` (`omit` not a non-empty list naming only `is_ext_shared_channel`, or given beside it) |
+| 409 | `{"ok":false,"error":"no-open-socket"}` | the label has no open WebSocket |
+| 503 | `{"ok":false,"error":"send-failed"}` | the socket did not accept the send |
+
+Any other method on `/_push` answers 404, as an unknown path does.
+
+The record gains two line kinds:
+
+- `{"event":"push","label","envelope_id","event_type","channel","channel_type","flag","flag_value"}`,
+  once per sent push, written right after the send and so before CSCB's
+  ack. `event_type`, `channel`
+  and `channel_type` are the event's `type`, `channel` and `channel_type`
+  (null when not a string). `flag` is `false`, `true`, `non-boolean` or
+  `absent`, and `flag_value` the JSON text of the flag as sent (`"true"`,
+  `"\"yes\""`, `"null"`, …), null when the flag is left out. The line
+  carries no `event_id`. CSCB's ack is not a `push` line: it is the existing
+  `ws-message` line carrying the push's `envelope_id`.
+- `{"event":"push-refused","label","reason"}`, once per refused push, its
+  `reason` the answer's `error` and its `label` null when the push named
+  none.
+
+Neither line carries the event's text. Every value either copies from a push
+has token-like text replaced by `<token>` and is cut to at most 100
+characters.
 
 A live start also launches each persona through the real agent-director
 under the stub `claude` (see The stub worker), and stops with `--stop-bots`.

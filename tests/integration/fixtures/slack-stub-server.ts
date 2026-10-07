@@ -68,9 +68,61 @@
  *   token's hash, so two tokens get two identities.
  *
  * Other endpoints: `GET /_control` (the labels in force), `GET /_health`,
- * and `POST /upload/<id>` (the upload URL `files.getUploadURLExternal` hands
- * out). Every other Web API method answers `ok: true` with the shape CSCB
- * reads (`chat.postMessage` a `ts`, `conversations.open` a channel ID, …).
+ * `POST /_push` (below), and `POST /upload/<id>` (the upload URL
+ * `files.getUploadURLExternal` hands out). Every other Web API method answers
+ * `ok: true` with the shape CSCB reads (`chat.postMessage` a `ts`,
+ * `conversations.open` a channel ID, …).
+ *
+ * PUSH (`POST /_push`, JSON; b.deo SRI-1402)
+ * ----
+ *   {
+ *     "label": "alpha",
+ *     "event": { "type": "message", "channel": "C…", "channel_type": "channel", … },
+ *     "envelope": { "is_ext_shared_channel": true }
+ *   }
+ *
+ * Sends one Socket Mode `events_api` envelope, shaped as Slack's, over the
+ * label's open WebSocket:
+ *
+ *   {
+ *     "envelope_id": "<uuid>", "type": "events_api",
+ *     "accepts_response_payload": false, "retry_attempt": 0, "retry_reason": "",
+ *     "payload": {
+ *       "type": "event_callback", "team_id": "T0STUBTEAM", "api_app_id": "A0STUBAPP",
+ *       "event": <the push's event, unchanged>,
+ *       "event_id": "Ev…", "event_time": <the push's time, in seconds>,
+ *       "is_ext_shared_channel": false
+ *     }
+ *   }
+ *
+ * - `label` (required, a non-empty string): a label of the control in force,
+ *   matched against the label each WebSocket opened under.
+ * - `event` (required, a JSON object): the inner event as the scenario writes
+ *   it, sent unchanged.
+ * - `envelope` (optional, an object): `is_ext_shared_channel` is the one
+ *   envelope field a push may set. Not given, it is `false`. Given, it is sent
+ *   as given: `true`, `false` or any non-boolean (`null`, a string, a number,
+ *   an object). `"omit": ["is_ext_shared_channel"]` in place of it leaves the
+ *   flag out of the payload. Every other envelope field is fixed or generated
+ *   by the stub: `envelope_id` and `event_id` are unique per push, and
+ *   `team_id` and `api_app_id` are the stub's team and app.
+ * - The push goes to the label's newest open WebSocket: the one opened last
+ *   among its sockets that are open now. A closed or closing socket is never
+ *   chosen.
+ * - A push carries no token, and `/_push` reads none.
+ *
+ * Answers (a refused push sends nothing):
+ *   200 {"ok":true,"envelope_id":"<uuid>","event_id":"Ev…"}   sent
+ *   400 {"ok":false,"error":"<reason>"}   malformed, the reason one of:
+ *       `not-json`; `not-an-object`; `unknown-field` (a top-level key other
+ *       than `label`, `event` and `envelope`); `no-label`; `event-not-object`;
+ *       `envelope-not-object`; `envelope-field-fixed` (an envelope key other
+ *       than `is_ext_shared_channel` and `omit`); `omit-invalid` (`omit` not a
+ *       non-empty list naming only `is_ext_shared_channel`, or given beside it)
+ *   409 {"ok":false,"error":"no-open-socket"}   the label has no open WebSocket
+ *   503 {"ok":false,"error":"send-failed"}      the socket did not accept the send
+ *
+ * Any other method on `/_push` is not found (404), as for any unknown path.
  *
  * RECORD (one JSON object per line, appended synchronously)
  * ------
@@ -80,6 +132,21 @@
  *   {"event":"ws-open"|"ws-close"|"ws-refused"|"ws-message", "label", "ticket", …}
  *   {"event":"control","source":"file"|"http","labels":[…]}  /  "control-error"
  *   {"event":"upload"} / {"event":"stop"}
+ *   {"event":"push","label","envelope_id","event_type","channel","channel_type",
+ *    "flag":"false"|"true"|"non-boolean"|"absent","flag_value"}
+ *   {"event":"push-refused","label","reason"}
+ *
+ * A `push` line is written once per sent push, right after the send and so
+ * before the client's ack, which is the `ws-message` line carrying the
+ * push's `envelope_id`. `event_type`, `channel` and `channel_type` are the
+ * event's `type`, `channel` and `channel_type` (null when not a string).
+ * `flag` tells the four flag cases apart, and `flag_value` is the JSON text
+ * of the flag as sent (`"false"`, `"true"`, `"\"yes\""`, `"null"`, …), null
+ * when the flag is left out. A `push-refused` line is written once per
+ * refused push, its `reason` the answer's `error`, its `label` null when the
+ * push named none. Neither line carries the event's text: every value they
+ * copy from a push has token-like text replaced by `<token>` and is cut to at
+ * most 100 characters.
  *
  * `api` lines also carry `channel`, `user` and `text` when the request has
  * them, and `args_token_like` (whether any argument held token-like text).
@@ -93,7 +160,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { appendFileSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 
 // ---------------------------------------------------------------------------
@@ -295,6 +362,95 @@ function httpStatusOf(answer: string): number | undefined {
   return match === null ? undefined : Number(match[1])
 }
 
+// ---------------------------------------------------------------------------
+// Push control (b.deo SRI-1402)
+// ---------------------------------------------------------------------------
+
+/** The one envelope field a push may set or leave out. */
+const PUSH_FLAG = 'is_ext_shared_channel'
+
+/** The keys a push request may carry, and the keys its `envelope` may carry. */
+const PUSH_KEYS: readonly string[] = ['label', 'event', 'envelope']
+const PUSH_ENVELOPE_KEYS: readonly string[] = [PUSH_FLAG, 'omit']
+
+/** The most characters of a push-supplied value a `push` or `push-refused` line carries. */
+const PUSH_FIELD_MAX = 100
+
+/** `WebSocket.OPEN`: the only ready state a push is sent on. */
+const WS_OPEN = 1
+
+/** Why a push is refused: the answer's `error` and the record line's `reason`. */
+type PushRefusalReason =
+  | 'not-json'
+  | 'not-an-object'
+  | 'unknown-field'
+  | 'no-label'
+  | 'event-not-object'
+  | 'envelope-not-object'
+  | 'envelope-field-fixed'
+  | 'omit-invalid'
+  | 'no-open-socket'
+  | 'send-failed'
+
+/** The HTTP status of each refusal: 400 for a malformed push. */
+const PUSH_REFUSAL_STATUS: Readonly<Record<PushRefusalReason, number>> = {
+  'not-json': 400,
+  'not-an-object': 400,
+  'unknown-field': 400,
+  'no-label': 400,
+  'event-not-object': 400,
+  'envelope-not-object': 400,
+  'envelope-field-fixed': 400,
+  'omit-invalid': 400,
+  'no-open-socket': 409,
+  'send-failed': 503,
+}
+
+/** The flag a push asks for: a value sent as given, or left out. */
+type PushFlag = { sent: true; value: unknown } | { sent: false }
+
+type ParsedPush =
+  | { ok: true; label: string; event: Record<string, unknown>; flag: PushFlag }
+  | { ok: false; label: string | null; reason: PushRefusalReason }
+
+/** Read a `POST /_push` body; a malformed one names its reason and, when it has one, its label. */
+function parsePush(text: string): ParsedPush {
+  let body: unknown
+  try {
+    body = JSON.parse(text)
+  } catch {
+    return { ok: false, label: null, reason: 'not-json' }
+  }
+  if (!isObject(body)) return { ok: false, label: null, reason: 'not-an-object' }
+  const label = typeof body.label === 'string' && body.label !== '' ? body.label : null
+  if (Object.keys(body).some(key => !PUSH_KEYS.includes(key))) return { ok: false, label, reason: 'unknown-field' }
+  if (label === null) return { ok: false, label, reason: 'no-label' }
+  const event = body.event
+  if (!isObject(event)) return { ok: false, label, reason: 'event-not-object' }
+  if (body.envelope === undefined) return { ok: true, label, event, flag: { sent: true, value: false } }
+  const envelope = body.envelope
+  if (!isObject(envelope)) return { ok: false, label, reason: 'envelope-not-object' }
+  if (Object.keys(envelope).some(key => !PUSH_ENVELOPE_KEYS.includes(key))) return { ok: false, label, reason: 'envelope-field-fixed' }
+  if (envelope.omit !== undefined) {
+    const omit = envelope.omit
+    const valid = envelope[PUSH_FLAG] === undefined && Array.isArray(omit) && omit.length > 0 && omit.every(name => name === PUSH_FLAG)
+    return valid ? { ok: true, label, event, flag: { sent: false } } : { ok: false, label, reason: 'omit-invalid' }
+  }
+  return { ok: true, label, event, flag: { sent: true, value: envelope[PUSH_FLAG] === undefined ? false : envelope[PUSH_FLAG] } }
+}
+
+/** A push-supplied string as a record line carries it: token-like text replaced, then cut; null when not a string. */
+function pushFieldText(value: unknown): string | null {
+  return typeof value === 'string' ? value.replace(TOKEN_LIKE_ALL, '<token>').slice(0, PUSH_FIELD_MAX) : null
+}
+
+/** The `push` line's `flag` and `flag_value`: which of the four cases, and the value's JSON text. */
+function pushFlagFields(flag: PushFlag): { flag: 'false' | 'true' | 'non-boolean' | 'absent'; flag_value: string | null } {
+  if (!flag.sent) return { flag: 'absent', flag_value: null }
+  const kind = flag.value === false ? 'false' : flag.value === true ? 'true' : 'non-boolean'
+  return { flag: kind, flag_value: pushFieldText(JSON.stringify(flag.value)) }
+}
+
 /** Read a request's arguments: a form or JSON body, as the Web API client sends them. */
 async function readArgs(req: Request): Promise<Record<string, string>> {
   const text = await req.text()
@@ -330,6 +486,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
   const { recordPath, controlPath } = options
   let seq = 0
   let ticketSeq = 0
+  let pushSeq = 0
   let control: StubControl = options.control ?? {}
   let controlStamp = ''
   const tickets = new Map<string, { label: string; mode: string }>()
@@ -391,6 +548,59 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
     return { label: 'no-token', answers: control.default ?? {} }
   }
 
+  function refusePush(label: string | null, reason: PushRefusalReason): Response {
+    record('push-refused', { label: pushFieldText(label), reason })
+    return Response.json({ ok: false, error: reason }, { status: PUSH_REFUSAL_STATUS[reason] })
+  }
+
+  /** `POST /_push`: one `events_api` envelope over the label's newest open WebSocket (b.deo SRI-1402). */
+  function push(text: string): Response {
+    const parsed = parsePush(text)
+    if (!parsed.ok) return refusePush(parsed.label, parsed.reason)
+    const { label, event, flag } = parsed
+    let target: Bun.ServerWebSocket<ConnData> | undefined
+    for (const ws of sockets) {
+      if (ws.data.label === label && ws.readyState === WS_OPEN) target = ws // insertion order: the last match was opened last
+    }
+    if (target === undefined) return refusePush(label, 'no-open-socket')
+    pushSeq += 1
+    const envelopeId = randomUUID()
+    const eventId = `Ev0STUB${String(pushSeq).padStart(4, '0')}${randomUUID().slice(0, 8).toUpperCase()}`
+    const payload: Record<string, unknown> = {
+      type: 'event_callback',
+      team_id: TEAM_ID,
+      api_app_id: APP_ID,
+      event,
+      event_id: eventId,
+      event_time: Math.floor(Date.now() / 1000),
+    }
+    if (flag.sent) payload[PUSH_FLAG] = flag.value
+    const envelope = {
+      envelope_id: envelopeId,
+      type: 'events_api',
+      accepts_response_payload: false,
+      retry_attempt: 0,
+      retry_reason: '',
+      payload,
+    }
+    let sendStatus: number
+    try {
+      sendStatus = target.send(JSON.stringify(envelope)) // -1 queued under backpressure, 0 dropped, >0 bytes sent
+    } catch {
+      sendStatus = 0
+    }
+    if (sendStatus === 0) return refusePush(label, 'send-failed')
+    record('push', {
+      label: pushFieldText(label),
+      envelope_id: envelopeId,
+      event_type: pushFieldText(event.type),
+      channel: pushFieldText(event.channel),
+      channel_type: pushFieldText(event.channel_type),
+      ...pushFlagFields(flag),
+    })
+    return Response.json({ ok: true, envelope_id: envelopeId, event_id: eventId })
+  }
+
   refreshControl()
 
   const server = Bun.serve<ConnData>({
@@ -413,6 +623,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
           return Response.json({ ok: false, error: reason }, { status: 400 })
         }
       }
+      if (path === '/_push' && req.method === 'POST') return push(await req.text())
 
       if (path.startsWith('/link')) {
         const ticket = url.searchParams.get('ticket') ?? ''
