@@ -1280,9 +1280,14 @@ function getReplySettings(): ReplySettings {
  * The one destination resolver (b.av2 SR-7.1): resolves each persona's
  * destination and caches its DM conversation per persona and contact. Shared
  * by the notifier and the permission poller, so they open a persona's DM
- * once. Side-effect-free to build: an empty cache, no timer, no Slack call.
+ * once. The one destination rule reads the switch from `personaConfig`, the
+ * configuration in effect, at each attempt (b.deo SRI-201, SRI-701).
+ * Side-effect-free to build: an empty cache, no timer, no Slack call.
  */
-const personaDestinations = createPersonaDestinations({ log: (line) => console.error(line) })
+const personaDestinations = createPersonaDestinations({
+  log: (line) => console.error(line),
+  getPersonaConfig: () => personaConfig,
+})
 
 /**
  * The one destination hold (b.av2 SR-7.1): when a post to a persona's
@@ -3323,7 +3328,9 @@ export async function main(): Promise<void> {
   // The applied config at the start (the record's at a start from the
   // record): the server-wide values that hold until the next start, e.g. the
   // restart delay. Set once, below, right after the start resolves, and never
-  // replaced; a confirmed apply replaces only `personaConfig`'s persona set.
+  // replaced; a confirmed apply replaces `personaConfig`'s persona set and its
+  // allow_invited_channels switch, and keeps every other server-wide value
+  // from here (`configInEffect`, b.av2 SR-8.6, b.deo SRI-201).
   // Declared here, before the controller whose onApplied reads it, so that
   // closure never depends on declaration order (no temporal dead zone).
   let appliedConfig!: PersonaConfig
@@ -3381,8 +3388,8 @@ export async function main(): Promise<void> {
     // server-wide setting keeps its start-time value (the next start applies
     // it). Everything that reads the applied set or the channel mode reads
     // `personaConfig` at call time: the bring-up controller's applied set,
-    // the reply-guard step, routing, the notifier, /interject, cron, the
-    // health work list and MCP admission.
+    // the reply-guard step, routing, the destination resolver, the notifier,
+    // /interject, cron, the health work list and MCP admission.
     // An apply before the start resolved is never expected (detection is
     // armed only after the start bring-up); it throws rather than build a
     // config without the start-time values, and the controller logs it.

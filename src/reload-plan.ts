@@ -989,11 +989,14 @@ const CLI_RECORD_AND_SERVER_START_SETTINGS: ReadonlySet<string> = new Set<string
 /**
  * The switch's preview line (b.deo SRI-803): a change of
  * `allow_invited_channels` turns `mode` on for every persona, in place at
- * once, with every instance kept:
+ * once:
  *
  *   server-wide setting allow_invited_channels changed: turns fungible mode
  *   on, applied in place at once, from the next event, tool call, prompt and
- *   notice, for "alpha" (key=alpha), "bravo" (key=bravo); every instance kept.
+ *   notice, for "alpha" (key=alpha), "bravo" (key=bravo).
+ *
+ * The line says nothing of instances: a persona the same change modifies
+ * destructively has its own line saying so.
  *
  * or, when no persona is present in both configurations, `…, prompt and
  * notice; no persona is affected.` `personas` are the personas present in
@@ -1009,7 +1012,7 @@ export function modeSwitchLine(
     `server-wide setting ${MODE_SWITCH_SETTING} changed: turns ${mode} mode on, applied in place at once, ` +
     'from the next event, tool call, prompt and notice'
   if (personas.length === 0) return `${head}; no persona is affected.`
-  return `${head}, for ${personas.map((p) => renderPersonaRef(p.name, p.key)).join(', ')}; every instance kept.`
+  return `${head}, for ${personas.map((p) => renderPersonaRef(p.name, p.key)).join(', ')}.`
 }
 
 /**

@@ -84,6 +84,16 @@ interface WrittenSections {
 }
 
 /**
+ * `value` in an object or array of its own (one level deep), as parsing the
+ * written JSON gives the loader; any other value as it is.
+ */
+function ownCopy<T>(value: T): T {
+  if (Array.isArray(value)) return [...value] as T
+  if (value !== null && typeof value === 'object') return { ...value }
+  return value
+}
+
+/**
  * A persona's resolved section fields, from its section keys as written, as
  * the loader resolves them in `mode` (b.deo SRI-102): declarative mode reads
  * `channels` and `permission_prompts`; fungible mode reads `invited` only.
@@ -97,7 +107,7 @@ function resolvedSections(
   const sections = {
     channels: written.channels?.map((entry) => ({ ...entry })),
     permission_prompts: written.permission_prompts,
-    invited: written.invited,
+    invited: ownCopy(written.invited),
   }
   if (mode === 'fungible') {
     return {

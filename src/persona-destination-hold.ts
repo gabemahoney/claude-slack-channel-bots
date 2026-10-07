@@ -53,8 +53,11 @@
  * captured when the notice was held, so a destination or contact changed
  * while a notice waits is honoured. Every destination this module names or
  * compares comes from the one destination rule (`personaDestinationOf`,
- * b.av2 SR-7.1, b.deo SRI-701) applied to the persona of that attempt;
- * nothing here reads a destination setting itself. A retry that comes due while the persona
+ * b.av2 SR-7.1, b.deo SRI-701) over the configuration in effect, asked of the
+ * resolver (`destinations.destinationOf`) for the persona of that attempt in
+ * the same step as its post (b.deo SRI-201), so a confirmed switch change is
+ * honoured too; nothing here reads a destination setting or the switch
+ * itself. A retry that comes due while the persona
  * has no client (it is not up) keeps it held and waits again, with no line;
  * one whose persona or client lookup throws waits again the same way, with
  * one line per run of such throws (never a restart at once). A persona no
@@ -141,7 +144,6 @@ import {
   type DestinationSlackClient,
   type DestinationStep,
   type PersonaDestinations,
-  personaDestinationOf,
 } from './persona-destination.ts'
 import { PERSONA_DESTINATION_FAILED, formatPersonaDiagnostic } from './persona-diagnostics.ts'
 import { renderPersonaRef } from './persona-identity.ts'
@@ -402,18 +404,35 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
     return entry.episode !== undefined && (entry.inFlight || clock.now() < entry.dueAt)
   }
 
+  /**
+   * The destination an attempt posts to: the one destination rule over the
+   * configuration in effect (`destinations.destinationOf`, b.deo SRI-701),
+   * read in the same synchronous step as the resolver's `post` that follows,
+   * so it names the destination that post resolves.
+   */
+  function attemptDestination(persona: Persona): string {
+    return deps.destinations.destinationOf(persona)
+  }
+
   // -------------------------------------------------------------------------
   // Episodes
   // -------------------------------------------------------------------------
 
   /**
-   * Account one settled attempt that started at generation `started`: open,
-   * advance or close the episode. Returns how the attempt counts.
+   * Account one settled attempt that started at generation `started` and
+   * posted to `destination` (`attemptDestination`): open, advance or close
+   * the episode. Returns how the attempt counts.
    */
-  function settle(entry: HoldEntry, started: number, persona: Persona, result: DestinationPostResult): SettledAs {
+  function settle(
+    entry: HoldEntry,
+    started: number,
+    persona: Persona,
+    destination: string,
+    result: DestinationPostResult,
+  ): SettledAs {
     const current = entry.episode !== undefined && started === entry.generation
     if (result.outcome === 'posted') {
-      if (current) closeEpisode(entry, personaDestinationOf(persona))
+      if (current) closeEpisode(entry, destination)
       return 'posted'
     }
     if (result.outcome === 'refused') return 'refused'
@@ -422,18 +441,17 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
     // failure is older evidence than that change. Log nothing, schedule
     // nothing; the caller re-queues a notice and `ensureProgress` retries it.
     if (started !== entry.generation) return 'destination'
-    if (entry.episode === undefined) openEpisode(entry, persona, result)
+    if (entry.episode === undefined) openEpisode(entry, persona, destination, result)
     else {
       // The persona's destination changed in place while the episode is open:
       // name the new destination once, in a fresh opening line.
-      if (!entry.episode.named.has(personaDestinationOf(persona))) nameDestination(entry, entry.episode, persona, result)
+      if (!entry.episode.named.has(destination)) nameDestination(entry, entry.episode, persona, destination, result)
       scheduleRetry(entry, result)
     }
     return 'destination'
   }
 
-  function openEpisode(entry: HoldEntry, persona: Persona, failure: DestinationFailure): void {
-    const destination = personaDestinationOf(persona)
+  function openEpisode(entry: HoldEntry, persona: Persona, destination: string, failure: DestinationFailure): void {
     const episode: OpenEpisode = {
       name: persona.name,
       index: persona.index,
@@ -449,8 +467,13 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
   }
 
   /** Copy a failure at a destination not yet named in the open episode into it and log its opening line. */
-  function nameDestination(entry: HoldEntry, episode: OpenEpisode, persona: Persona, failure: DestinationFailure): void {
-    const destination = personaDestinationOf(persona)
+  function nameDestination(
+    entry: HoldEntry,
+    episode: OpenEpisode,
+    persona: Persona,
+    destination: string,
+    failure: DestinationFailure,
+  ): void {
     episode.name = persona.name
     episode.index = persona.index
     episode.destination = destination
@@ -618,15 +641,17 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
         const started = entry.generation
         entry.inFlight = true
         entry.attempting = queued
+        let destination: string
         let result: DestinationPostResult
         try {
+          destination = attemptDestination(persona)
           result = await deps.destinations.post(persona, client, queued.notice.message)
         } finally {
           entry.inFlight = false
           entry.attempting = undefined
         }
         if (!isCurrent(entry)) return
-        const settled = settle(entry, started, persona, result)
+        const settled = settle(entry, started, persona, destination, result)
         if (settled === 'destination') {
           noticeFailed(entry, queued, result as DestinationFailure, true)
           return
@@ -675,15 +700,17 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
     }
     return {
       async post(persona, client, message) {
+        let destination: string | undefined
         let result: DestinationPostResult | undefined
         try {
+          destination = attemptDestination(persona)
           result = await deps.destinations.post(persona, client, message)
           return result
         } finally {
           // Settled even when the resolver throws, so the in-flight guard never leaks.
           if (finish() && isCurrent(entry)) {
             try {
-              if (result !== undefined) settle(entry, started, persona, result)
+              if (destination !== undefined && result !== undefined) settle(entry, started, persona, destination, result)
             } finally {
               ensureProgress(entry)
             }
@@ -706,10 +733,11 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
       return
     }
     const started = entry.generation
+    const destination = attemptDestination(persona)
     // Issued before the first `await` for a channel destination (the resolver's guarantee).
     const result = await deps.destinations.post(persona, client, notice.message)
     if (!isCurrent(entry)) return
-    const settled = settle(entry, started, persona, result)
+    const settled = settle(entry, started, persona, destination, result)
     if (settled === 'destination') {
       noticeFailed(entry, queued, result as DestinationFailure, true)
       if (!isCurrent(entry)) return

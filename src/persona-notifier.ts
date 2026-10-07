@@ -7,10 +7,11 @@
  * one top-level message with no `thread_ts` and no username or icon override.
  * The destination is resolved, and a DM opened when needed, by the shared
  * destination resolver (`persona-destination.ts`) through the one destination
- * rule (`personaDestinationOf`, b.av2 SR-7.1, b.deo SRI-701): its
+ * rule (`personaDestinationOf`, b.av2 SR-7.1, b.deo SRI-701) over the
+ * configuration in effect at each attempt (b.deo SRI-201): its
  * `permission_prompts` in declarative mode, its fungible destination in
- * fungible mode. The notifier reads no destination setting itself, the
- * lost-message notice included. The notifier adds the
+ * fungible mode. The notifier reads no destination setting and no switch
+ * itself, the lost-message notice included. The notifier adds the
  * persona reference to every notice text, so callers pass only the key and
  * the notice body.
  *
@@ -136,6 +137,7 @@ import { unescapeSlackControlCharacters } from './slack-text-escape.ts'
 import { describeThrownValue, slackPlatformReason } from './persona-connection-errors.ts'
 import {
   createPersonaDestinations,
+  type DestinationConfig,
   type DestinationFailure,
   type PersonaDestinations,
 } from './persona-destination.ts'
@@ -243,6 +245,13 @@ export interface PersonaNotifierDeps {
    * `destinationHold` is not given; defaults to an instance of its own.
    */
   destinations?: PersonaDestinations
+  /**
+   * The configuration in effect, read at each attempt (b.deo SRI-201). Used
+   * only to build the notifier's own resolver when neither `destinationHold`
+   * nor `destinations` is given (a given resolver reads its own). Absent: no
+   * configuration, so declarative mode (`channelModeOf`).
+   */
+  getPersonaConfig?(): DestinationConfig
   /**
    * The destination hold (per-persona episodes, retries and held notices)
    * shared with the permission poller, which every notice for a validated
@@ -451,7 +460,10 @@ export function notifySafely(
 export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifier {
   const held = new Map<string, HeldNotice[]>()
   const destinationHold = deps.destinationHold ?? createPersonaDestinationHold({
-    destinations: deps.destinations ?? createPersonaDestinations({ log: deps.log }),
+    destinations: deps.destinations ?? createPersonaDestinations({
+      log: deps.log,
+      getPersonaConfig: () => deps.getPersonaConfig?.(),
+    }),
     getPersona: deps.getPersona,
     clientFor: deps.clientFor,
     log: deps.log,

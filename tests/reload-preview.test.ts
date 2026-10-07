@@ -1,7 +1,7 @@
 /**
  * reload-preview.test.ts — Tests for the structured change plan and the
- * pending-change preview (b.av2 SR-8.4, SR-8.6, SR-10.3; b.deo SRI-802 to SRI-804) in
- * src/reload-plan.ts: `buildChangePlan`, `changePlanCounts`,
+ * pending-change preview (b.av2 SR-8.4 and SR-8.6, b.deo SRI-802 to SRI-804;
+ * b.av2 SR-10.3, b.deo SRI-901 to SRI-906) in src/reload-plan.ts: `buildChangePlan`, `changePlanCounts`,
  * `renderChangePlanCounts`, `renderPreviewLines`, `renderPreview`,
  * `renderPreviewLogLines`, `renderInvalidLogLine` and `isCredentialsBroken`,
  * plus the plan's `configDirsChanged` flag (the agent-director template

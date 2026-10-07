@@ -3,9 +3,13 @@
  * notices go, and the post there (b.av2 SR-7.1, SR-5.1).
  *
  * A persona's destination comes from one rule, `personaDestinationOf`
- * (b.av2 SR-7.1, b.deo SRI-701): its `permission_prompts` setting in
- * declarative mode, its fungible destination (`invited.permission_prompts`,
- * `dm` by default) in fungible mode; either way a channel ID, or `dm`. A
+ * (b.av2 SR-7.1, b.deo SRI-701), over the configuration in effect: its
+ * `permission_prompts` setting in declarative mode, its fungible destination
+ * (`invited.permission_prompts`, `dm` by default) in fungible mode; either way
+ * a channel ID, or `dm`. The resolver reads the configuration in effect
+ * through its injected `getPersonaConfig` at each attempt (b.deo SRI-201), and
+ * the destination hold and the permission poller ask the resolver
+ * (`destinationOf`, `refusalOf`), so all of them read the one switch. A
  * channel destination is that channel. A `dm` destination
  * is the persona's DM conversation with its `dm.contact`, obtained with
  * `conversations.open` on the persona's own client (Slack returns the existing
@@ -52,7 +56,7 @@
  */
 
 import type { WebClient } from '@slack/web-api'
-import { DM_DESTINATION, type Persona } from './config.ts'
+import { DM_DESTINATION, channelModeOf, type Persona, type ServerSettings } from './config.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
 
@@ -134,10 +138,25 @@ export interface DestinationMessage {
   blocks?: unknown[]
 }
 
+/**
+ * The part of a configuration the one destination rule reads: its
+ * `allow_invited_channels` switch (`channelModeOf`). Null or undefined when
+ * there is no configuration (before the server's start resolves): declarative
+ * mode.
+ */
+export type DestinationConfig = Pick<ServerSettings, 'allow_invited_channels'> | null | undefined
+
 /** Dependencies injected into `createPersonaDestinations`. */
 export interface PersonaDestinationsDeps {
   /** Writes one log line. */
   log(line: string): void
+  /**
+   * The configuration in effect, read at each attempt (b.deo SRI-201), never
+   * a copy taken earlier: the destination rule takes the switch from it.
+   * Production passes the server's applied configuration. Absent: there is no
+   * configuration, so the rule reads declarative mode (`channelModeOf`).
+   */
+  getPersonaConfig?(): DestinationConfig
 }
 
 /** A destination resolver instance, holding the per-persona DM cache. */
@@ -145,10 +164,24 @@ export interface PersonaDestinations {
   /**
    * Post one message to the persona's destination with `client`: the
    * configured channel, or the DM with `dm.contact` (opened on `client` unless
-   * cached). For a channel destination the post is issued synchronously
-   * (before the first `await`). Never rejects.
+   * cached). The destination is resolved, by the one destination rule over
+   * the configuration in effect, synchronously at the call. For a channel
+   * destination the post is issued synchronously (before the first `await`).
+   * Never rejects.
    */
   post(persona: Persona, client: DestinationSlackClient, message: DestinationMessage): Promise<DestinationPostResult>
+  /**
+   * The persona's destination now (`personaDestinationOf` over the
+   * configuration in effect at this call): what a `post` called at the same
+   * moment posts to.
+   */
+  destinationOf(persona: PersonaDestinationFields): string
+  /**
+   * Why the persona's `dm` destination would be refused now
+   * (`dmDestinationRefusal` over the configuration in effect at this call),
+   * or undefined.
+   */
+  refusalOf(persona: PersonaDestinationFields & Pick<Persona, 'dm'>): DmDestinationRefusal | undefined
   /** Drop the persona's cached DM conversation (and any in-flight open's claim to the cache). */
   forget(personaKey: string): void
 }
@@ -168,37 +201,36 @@ export type PersonaDestinationFields = Pick<Persona, 'permission_prompts' | 'fun
 
 /**
  * The one destination rule (b.av2 SR-7.1, b.deo SRI-701): a persona's
- * destination, `dm` or a channel ID, by the channel mode of the
- * configuration the persona was resolved in. Fungible mode: its fungible
- * destination (`invited.permission_prompts`, `dm` when that is absent).
- * Declarative mode: its `permission_prompts`.
+ * destination, `dm` or a channel ID, by the channel mode of `config`, the
+ * configuration in effect when the caller acts (b.deo SRI-201,
+ * `channelModeOf`). Fungible mode: its fungible destination
+ * (`invited.permission_prompts`, `dm` when that is absent). Declarative mode:
+ * its `permission_prompts` (`dm` when that is absent, which no loaded
+ * declarative configuration resolves).
  *
- * The persona's resolved fields carry that mode: the loader fills
- * `fungible_destination` in fungible mode only, and `permission_prompts` in
- * declarative mode only (b.deo SRI-102). Every caller passes the persona it
- * read from the configuration in effect at that attempt, never a copy held
- * from earlier, so a confirmed change of the switch or of either destination
- * setting applies from the next attempt. A persona with neither field (no
- * loaded configuration resolves one) gets `dm`, which `dmDestinationRefusal`
- * refuses unless DMs are on with a contact.
+ * Every caller passes the configuration in effect and the persona it read
+ * from it at that attempt, never a copy taken at start or held in a closure
+ * or a queued item, so a confirmed change of the switch or of either
+ * destination setting applies from the next attempt. A `dm` destination is
+ * refused by `dmDestinationRefusal` unless DMs are on with a contact.
  *
  * The one place a destination consumer reads `permission_prompts` or
  * `fungible_destination` (b.deo SRI-202): the resolver below, its DM
  * refusal, the destination hold, the permission poller and the notifier all
  * go through it. Pure.
  */
-export function personaDestinationOf(persona: PersonaDestinationFields): string {
-  if (persona.fungible_destination !== undefined) return persona.fungible_destination
+export function personaDestinationOf(config: DestinationConfig, persona: PersonaDestinationFields): string {
+  if (channelModeOf(config) === 'fungible') return persona.fungible_destination ?? DM_DESTINATION
   return persona.permission_prompts ?? DM_DESTINATION
 }
 
 /**
  * Resolve a persona's destination through the one destination rule
- * (`personaDestinationOf`): `dm` for the DM destination, else the channel it
- * names. Pure.
+ * (`personaDestinationOf`) over `config`: `dm` for the DM destination, else
+ * the channel it names. Pure.
  */
-function resolvePersonaDestination(persona: PersonaDestinationFields): PersonaDestination {
-  const destination = personaDestinationOf(persona)
+function resolvePersonaDestination(config: DestinationConfig, persona: PersonaDestinationFields): PersonaDestination {
+  const destination = personaDestinationOf(config, persona)
   if (destination === DM_DESTINATION) return { kind: 'dm' }
   return { kind: 'channel', channelId: destination }
 }
@@ -206,13 +238,14 @@ function resolvePersonaDestination(persona: PersonaDestinationFields): PersonaDe
 /**
  * Why the persona's `dm` destination must not be opened (DMs off, or no
  * contact), or undefined when it may be, or when the destination is a
- * channel. The destination comes from the one destination rule
- * (`personaDestinationOf`, b.deo SRI-701). Pure.
+ * channel. The destination comes from the one destination rule over `config`,
+ * the configuration in effect (`personaDestinationOf`, b.deo SRI-701). Pure.
  */
 export function dmDestinationRefusal(
+  config: DestinationConfig,
   persona: PersonaDestinationFields & Pick<Persona, 'dm'>,
 ): DmDestinationRefusal | undefined {
-  if (personaDestinationOf(persona) !== DM_DESTINATION) return undefined
+  if (personaDestinationOf(config, persona) !== DM_DESTINATION) return undefined
   if (!persona.dm.enabled) return 'dm_disabled'
   if (!persona.dm.contact) return 'no_dm_contact'
   return undefined
@@ -281,12 +314,29 @@ export function safeFailureCode(code: string): string {
 export function createPersonaDestinations(deps: PersonaDestinationsDeps): PersonaDestinations {
   const dmCache = new Map<string, DmCacheEntry>()
 
+  /** The configuration in effect now, read at each call (b.deo SRI-201). */
+  function configInEffect(): DestinationConfig {
+    return deps.getPersonaConfig?.()
+  }
+
+  function destinationOf(persona: PersonaDestinationFields): string {
+    return personaDestinationOf(configInEffect(), persona)
+  }
+
+  function refusalOf(persona: PersonaDestinationFields & Pick<Persona, 'dm'>): DmDestinationRefusal | undefined {
+    return dmDestinationRefusal(configInEffect(), persona)
+  }
+
   /**
    * The persona's cache entry for its DM with its current contact, opening it
    * on `client` unless cached; or the logged refusal. Never throws.
    */
-  function dmEntry(persona: Persona, client: DestinationSlackClient): DmCacheEntry | DestinationRefused {
-    const refusal = dmDestinationRefusal(persona)
+  function dmEntry(
+    config: DestinationConfig,
+    persona: Persona,
+    client: DestinationSlackClient,
+  ): DmCacheEntry | DestinationRefused {
+    const refusal = dmDestinationRefusal(config, persona)
     if (refusal) {
       deps.log(
         `[slack] persona-destination: ${renderPersonaRef(persona.name, persona.key)} has permission_prompts set to ` +
@@ -313,7 +363,9 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
     client: DestinationSlackClient,
     message: DestinationMessage,
   ): Promise<DestinationPostResult> {
-    const destination = resolvePersonaDestination(persona)
+    // One read of the configuration in effect for the whole attempt.
+    const config = configInEffect()
+    const destination = resolvePersonaDestination(config, persona)
     let channelId: string
     // The cache entry the post used, so a stale-conversation failure drops
     // that entry only, never a newer one.
@@ -321,7 +373,7 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
     if (destination.kind === 'channel') {
       channelId = destination.channelId
     } else {
-      const entry = dmEntry(persona, client)
+      const entry = dmEntry(config, persona, client)
       if ('outcome' in entry) return entry
       used = entry
       const opened = await entry.pending
@@ -344,7 +396,7 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
     dmCache.delete(personaKey)
   }
 
-  return { post, forget }
+  return { post, destinationOf, refusalOf, forget }
 }
 
 /** `conversations.open` with one user on the persona's client. Never rejects. */

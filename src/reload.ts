@@ -522,10 +522,12 @@ export interface ReloadControllerDeps {
   /**
    * Told the configuration a confirmed apply's step 1 made the applied one,
    * right after the record was rewritten and in the same synchronous step as
-   * the controller's own swap (b.av2 SR-8.6). Production reassigns the
-   * server's `personaConfig` to the new persona set with the start-time
-   * server-wide values; the bring-up controller's applied set and the
-   * reply-guard step read it from there. A throw is logged; the apply goes on.
+   * the controller's own swap (b.av2 SR-8.6, b.deo SRI-201). Production
+   * reassigns the server's `personaConfig` to `configInEffect`: the new
+   * persona set and its `allow_invited_channels` switch, with every other
+   * server-wide value kept from start time; the bring-up controller's applied
+   * set, the reply-guard step and every consumer of the channel mode read it
+   * from there. A throw is logged; the apply goes on.
    */
   onApplied?: (config: PersonaConfig) => void
   /**
