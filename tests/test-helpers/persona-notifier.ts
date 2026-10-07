@@ -63,9 +63,14 @@
  * `makeNotifierStack(deps)` is the wiring on its own: a destination resolver,
  * the destination hold over it on a fake clock, and the notifier handing
  * notices to that hold, all over the caller's persona and client lookups and
- * one log, as `src/server.ts` builds them. The harness above and the routing
- * helpers (tests/test-helpers/persona-routing-harness.ts,
- * tests/test-helpers/persona-routing-managed.ts) build their notifier with it.
+ * one log. Given `getPersonaConfig`, the resolver reads the switch through it
+ * at each attempt, as `src/server.ts` builds it; without one, the resolver
+ * takes the switch each persona was loaded under (a persona with a fungible
+ * destination resolves in fungible mode, any other in declarative mode).
+ * The harness above and the routing helpers
+ * (tests/test-helpers/persona-routing-harness.ts,
+ * tests/test-helpers/persona-routing-managed.ts) build their notifier with
+ * it; the harness passes its `getPersonaConfig` option through.
  *
  * Isolation (b.av2 SR-13.2): no module-scope state, no real timers, no token
  * literal, and no I/O but the startup-errors entries, written only under the
@@ -83,7 +88,7 @@ import type { WebClient } from '@slack/web-api'
 
 import type { Persona, PersonaConfig } from '../../src/config.ts'
 import { createPersonaDestinationHold, type PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
-import { createPersonaDestinations, type PersonaDestinations } from '../../src/persona-destination.ts'
+import { createPersonaDestinations, type DestinationConfig, type PersonaDestinations } from '../../src/persona-destination.ts'
 import { renderPersonaRef } from '../../src/persona-identity.ts'
 import {
   PERSONA_TEARDOWN_NOTICE_LABEL,
@@ -129,6 +134,12 @@ export interface NotifierStackDeps {
   log(line: string): void
   /** The notifier's startup-errors recorder (b.jg5 SRJ-1003). Default: none installed. */
   recordStartupError?: PersonaStartupErrorRecorder
+  /**
+   * The configuration in effect, read by the destination resolver at each
+   * attempt (b.deo SRI-201), as `src/server.ts` passes it. Default: none, so
+   * the resolver takes the switch each persona was loaded under.
+   */
+  getPersonaConfig?: () => DestinationConfig
 }
 
 /** The notifier and the pieces it was built with. */
@@ -144,12 +155,17 @@ export interface NotifierStack {
 
 /**
  * The real destination resolver, destination hold (on a fake clock, never the
- * real one) and persona notifier, wired as `src/server.ts` wires them.
+ * real one) and persona notifier. The resolver reads the switch through
+ * `deps.getPersonaConfig` when given, as `src/server.ts` wires it, and from
+ * each persona as loaded otherwise.
  */
 export function makeNotifierStack(deps: NotifierStackDeps): NotifierStack {
   const { getPersona, clientFor, log } = deps
   const clock = deps.clock ?? createFakeClock()
-  const destinations = createPersonaDestinations({ log })
+  const destinations = createPersonaDestinations({
+    log,
+    ...(deps.getPersonaConfig !== undefined ? { getPersonaConfig: deps.getPersonaConfig } : {}),
+  })
   const hold = createPersonaDestinationHold({ destinations, getPersona, clientFor, clock, log })
   const notifier = createPersonaNotifier({
     getPersona,
@@ -254,6 +270,11 @@ export interface NotifierHarnessOptions {
    * that one.
    */
   recordStartupError?: PersonaStartupErrorRecorder | null
+  /**
+   * The configuration in effect, passed to `makeNotifierStack`. Default:
+   * none, so the resolver takes the switch each persona was loaded under.
+   */
+  getPersonaConfig?: () => DestinationConfig
 }
 
 export interface NotifierHarness {
@@ -352,6 +373,7 @@ export function makeNotifierHarness(
     isDryRun: () => dryRun,
     log,
     ...(recorder !== undefined ? { recordStartupError: recorder } : {}),
+    ...(opts.getPersonaConfig !== undefined ? { getPersonaConfig: opts.getPersonaConfig } : {}),
   })
 
   function stub(key: string): StubSlack {

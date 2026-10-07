@@ -463,6 +463,7 @@ import {
   type PersonaConfig,
   type StrictRealPathFs,
   MCP_SERVER_NAME,
+  channelModeOf,
   resolveRealPathStrict,
   tryResolveRealPath,
 } from './config.ts'
@@ -1010,10 +1011,10 @@ import {
 } from './ad-settings.ts'
 // Import cycle with jsonl-persistence-check.ts: use these imports only inside functions, never at module top level.
 import {
-  UNATTRIBUTABLE_ZERO_REASON,
   makeDefaultArchiveCount,
   personaArchiveEvidenceScope,
   rfc3339ToEpochSeconds,
+  unattributableZeroReason,
 } from './jsonl-persistence-check.ts'
 import { startupSummaryEnding, type StartupSummaryEndingCounts } from './startup-summary-ending.ts'
 import { realpathSync, statSync } from 'node:fs'
@@ -10405,11 +10406,16 @@ async function diagnoseJsonlMissing(
   const startedAtEpoch = row.started_at ? rfc3339ToEpochSeconds(row.started_at) : null
   // b.av2 SR-7.4: count only the persona's `delivery: all` channels; a zero
   // count is evidence of idleness only when the archive can see all of the
-  // persona's traffic (no `mentions` channel, DMs off).
-  const scope = personaArchiveEvidenceScope(persona)
+  // persona's traffic (no `mentions` channel, DMs off). b.deo SRI-704: in
+  // fungible mode no channel is counted, so the count is 0 and never
+  // attributable, and the diagnosis is never `lost`. The mode is read from
+  // `config`, the configuration in effect at this launch (b.deo SRI-201); no
+  // persona section is read here.
+  const mode = channelModeOf(config)
+  const scope = personaArchiveEvidenceScope(persona, mode)
   const archiveCount = makeDefaultArchiveCount(config)
-  const archivedSinceSpawn =
-    startedAtEpoch === null ? null : archiveCount(scope.channelIds, startedAtEpoch, ref)
+  const counted = startedAtEpoch === null ? null : archiveCount(scope.channelIds, startedAtEpoch, ref)
+  const archivedSinceSpawn = counted !== null && mode === 'fungible' ? 0 : counted
 
   if (archivedSinceSpawn !== null && archivedSinceSpawn > 0) {
     // LOST: conversation provably happened since spawn, yet no transcript
@@ -10455,14 +10461,15 @@ async function diagnoseJsonlMissing(
   //   (c-config) no message_archive_db configured → diagnosis is structurally
   //              impossible; actionable "turn on the archive" hint.
   //   (c-other) archive configured but file-missing / unreadable / query threw.
-  //   (d) b.av2 SR-7.4: a 0 count the archive cannot attribute to the persona.
+  //   (d) b.av2 SR-7.4: a 0 count the archive cannot attribute to the persona;
+  //       in fungible mode every count (b.deo SRI-704, `FUNGIBLE_MODE_ZERO_REASON`).
   let reason: string
   if (startedAtEpoch === null) {
     reason =
       `the row's started_at is absent or unparseable (started_at=${jsonlStartedAtText(row.started_at)}), ` +
       `so "since spawn" could not be bounded and the archive was not consulted`
   } else if (archivedSinceSpawn === 0) {
-    reason = UNATTRIBUTABLE_ZERO_REASON
+    reason = unattributableZeroReason(mode)
   } else if (!config.message_archive_db) {
     reason =
       `no message archive is configured (message_archive_db unset), so there is no evidence source to ` +

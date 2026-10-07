@@ -212,11 +212,13 @@
  *   step 1: every consumer (tool scope, delivery decision, destination, DM
  *   switch, archive evidence) reads the persona's entry from the applied
  *   configuration at each use. What is left is the persona's cached DM
- *   conversation, forgotten when `dm.contact`, `dm.enabled` or
- *   `permission_prompts` changed, so the next DM-destination post opens the
- *   DM for the current contact; then one line naming what changed. A key no
- *   longer applied when the operation runs gets nothing. Makes no Slack or
- *   agent-director call; never rejects. Dry run: the same.
+ *   conversation, forgotten when `dm.contact`, `dm.enabled`,
+ *   `permission_prompts` (declarative mode) or `invited.permission_prompts`
+ *   (fungible mode) changed (b.av2 SR-7.1, b.deo SRI-703), so the next
+ *   DM-destination post opens the DM for the current contact; then one line
+ *   naming what changed. A key no longer applied when the operation runs gets
+ *   nothing. Makes no Slack or agent-director call; never rejects. Dry run:
+ *   the same.
  *
  * - **template refresh** (SR-8.6 step 5): the agent-director template's
  *   memory-read rules rewritten for the applied persona set, its other
@@ -646,11 +648,15 @@ export interface PersonaLifecycle {
 
 /**
  * The in-place settings whose change can move the persona's DM destination
- * (b.av2 SR-7.1): its cached DM conversation is forgotten when one changed
- * (Director decision 11; the cache also re-checks the contact on each use).
+ * (b.av2 SR-7.1, b.deo SRI-703): its cached DM conversation is forgotten when
+ * one changed (Director decision 11; the cache also re-checks the contact on
+ * each use).
+ * `permission_prompts` is the destination setting in declarative mode,
+ * `invited.permission_prompts` the one in fungible mode.
  */
-const DM_DESTINATION_SETTINGS: ReadonlySet<InPlaceSetting> = new Set<InPlaceSetting>([
+export const DM_DESTINATION_SETTINGS: ReadonlySet<InPlaceSetting> = new Set<InPlaceSetting>([
   'permission_prompts',
+  'invited.permission_prompts',
   'dm.enabled',
   'dm.contact',
 ])

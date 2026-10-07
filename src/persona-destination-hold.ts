@@ -1,16 +1,18 @@
 /**
  * persona-destination-hold.ts — Hold and retry a persona's permission prompts
  * and server notices while its destination fails (b.av2 SR-7.1 failure part,
- * SR-3.2, SR-10.3).
+ * SR-3.2, SR-10.3; b.deo SRI-702, SRI-703, SRI-906).
  *
  * A post to a persona's destination (`persona-destination.ts`) can fail: the
  * app was not re-installed with `im:write`, so `conversations.open` answers
- * `missing_scope`; the bot is not in the channel (`not_in_channel`); Slack
- * cannot be reached. Such a failure is a destination failure and opens an
- * episode for the persona. While the episode is open the persona is held:
- * nothing is attempted for it before its next retry is due, on its own SR-3.2
- * schedule (5 s doubling to 300 s, no give-up, never shorter than a
- * `retryAfter` the error carries). Nothing is lost and nothing is spammed.
+ * `missing_scope`; the bot is not in the channel (`not_in_channel`), a
+ * fungible destination channel the app was never invited to included (b.deo
+ * SRI-702); Slack cannot be reached. Such a failure is a destination failure
+ * and opens an episode for the persona. While the episode is open the
+ * persona is held: nothing is attempted for it before its next retry is due,
+ * on its own SR-3.2 schedule (5 s doubling to 300 s, no give-up, never
+ * shorter than a `retryAfter` the error carries). Nothing is lost and nothing
+ * is spammed.
  *
  * Which failures hold the persona:
  * - every failure of the open (`conversations.open`, including an open that
@@ -50,14 +52,18 @@
  *
  * Every attempt resolves the persona, its client and its destination at that
  * moment (`getPersona`, `clientFor`, the resolver), never from a value
- * captured when the notice was held, so a destination or contact changed
- * while a notice waits is honoured. Every destination this module names or
- * compares comes from the one destination rule (`personaDestinationOf`,
- * b.av2 SR-7.1, b.deo SRI-701) over the configuration in effect, asked of the
- * resolver (`destinations.destinationOf`) for the persona of that attempt in
- * the same step as its post (b.deo SRI-201), so a confirmed switch change is
- * honoured too; nothing here reads a destination setting or the switch
- * itself. A retry that comes due while the persona
+ * captured when the notice was held or the episode opened, so a destination
+ * or contact changed while a notice waits is honoured. Every destination this
+ * module names or compares comes from the one destination rule
+ * (`personaDestinationOf`, b.av2 SR-7.1, b.deo SRI-701) over the
+ * configuration in effect, asked of the resolver (`destinations.destinationOf`)
+ * for the persona of that attempt in the same step as its post (b.deo
+ * SRI-201), together with the setting in force that names it
+ * (`destinationSettingFrom`, b.deo SRI-906). So after a confirmed switch
+ * change, which runs no lifecycle operation, held notices are retried at the
+ * destination of the mode in force, as after an in-place change of the
+ * destination setting (b.deo SRI-703); nothing here reads a destination
+ * setting or the switch itself. A retry that comes due while the persona
  * has no client (it is not up) keeps it held and waits again, with no line;
  * one whose persona or client lookup throws waits again the same way, with
  * one line per run of such throws (never a restart at once). A persona no
@@ -66,15 +72,20 @@
  *
  * Episodes:
  * - An episode opens at the first destination failure when none is open, with
- *   one `persona-destination-failed` line (`formatPersonaDiagnostic`) naming
- *   the persona (JSON-quoted name, key beside it, `personas[i]`), the
- *   destination (the channel ID, or `dm`), the failed step and the Slack error
- *   code; for `missing_scope` on the open it names the `im:write` scope and
- *   says the app must be re-installed to gain it.
+ *   one `persona-destination-failed` line (`formatPersonaDiagnostic`, its
+ *   cause `destinationFailedCause`) naming the persona (JSON-quoted name, key
+ *   beside it, `personas[i]`), the destination (`destination=` the channel
+ *   ID, or `dm`; in fungible mode followed by the setting in force,
+ *   `invited.permission_prompts`, b.deo SRI-906), the failed step and the
+ *   Slack error code; for `missing_scope` on the open it names the `im:write`
+ *   scope and says the app must be re-installed to gain it.
  * - A failed retry advances the schedule and logs nothing, unless it failed at
- *   a destination no line of the open episode has named yet (the persona's
- *   destination changed in place): then it logs one fresh opening line for
- *   that destination, once per distinct destination per episode.
+ *   a destination no line of the open episode has named yet: then it logs one
+ *   fresh opening line for that destination, once per distinct destination
+ *   per episode. An episode tracks the destinations it has named by setting
+ *   and value together, so this covers an in-place change of the destination
+ *   setting and a confirmed switch change alike, the latter even when both
+ *   modes' settings hold the same value (b.av2 SR-7.1, b.deo SRI-703).
  * - A failure from an attempt that started before the last episode change
  *   (an episode opened or closed since; e.g. the notifier's concurrent flush,
  *   all waiting on one DM open, or a slow post that fails after a retry has
@@ -85,10 +96,10 @@
  *   that started before the open episode opened changes nothing either: it is
  *   older evidence than the failure that opened the episode.
  * - The first successful retry ends the episode with one cleared line (the
- *   same class label, the cause starting `cleared:`, as the other persona
- *   lines' clears do, naming
- *   the destination that post went to) and resets the schedule; a later
- *   failure opens a new episode and logs again.
+ *   same class label, the cause `destinationClearedCause`, starting
+ *   `cleared:` as the other persona lines' clears do, naming the destination
+ *   that post went to with the setting in force at that post) and resets the
+ *   schedule; a later failure opens a new episode and logs again.
  * - Nothing is logged per attempt. The code is copied only when it is a short
  *   identifier (`safeFailureCode`); nothing else from the thrown value reaches
  *   a line, so no token value can.
@@ -135,12 +146,15 @@ import type { Persona } from './config.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
 import {
+  DECLARATIVE_DESTINATION_SETTING,
   DM_OPEN_SCOPE,
   MISSING_SCOPE_ERROR,
+  destinationSettingFrom,
   safeFailureCode,
   type DestinationFailure,
   type DestinationMessage,
   type DestinationPostResult,
+  type DestinationSetting,
   type DestinationSlackClient,
   type DestinationStep,
   type PersonaDestinations,
@@ -275,6 +289,25 @@ export interface PersonaDestinationHold {
   view(key: string): PersonaDestinationHoldView
 }
 
+/**
+ * A destination as a `persona-destination-failed` line names it (b.deo
+ * SRI-906): the setting in force and its value, both read for the attempt in
+ * the same step as its post.
+ */
+export interface NamedDestination {
+  /** The setting that names the destination in the mode in force (`destinationSettingOf`). */
+  setting: DestinationSetting
+  /** The destination (`personaDestinationOf`): a channel ID, or `dm`. */
+  destination: string
+}
+
+/** The failed step and the Slack error code a `persona-destination-failed` line names. */
+export interface DestinationFailedAt {
+  step: DestinationStep
+  /** The Slack error code; written only when it is a short identifier (`safeFailureCode`). */
+  code: string
+}
+
 /** A timer handle, boxed so any value the clock returns (even `undefined`) is a handle. */
 interface TimerBox {
   handle: unknown
@@ -287,10 +320,15 @@ interface TimerBox {
 interface OpenEpisode {
   name: string
   index: number
-  destination: string
+  /** The destination, with the setting in force, that the episode's latest opening line named. */
+  at: NamedDestination
   step: DestinationStep
   code: string
-  /** Every destination an opening line of this episode has named. */
+  /**
+   * Every destination an opening line of this episode has named, by setting
+   * and value together (`namedKey`), so a switch change that keeps the value
+   * counts as a destination not yet named too (b.deo SRI-703, SRI-906).
+   */
   named: Set<string>
 }
 
@@ -347,19 +385,53 @@ export function isDestinationFailure(failure: Pick<DestinationFailure, 'step' | 
   return failure.step !== 'chat.postMessage' || !MESSAGE_PAYLOAD_ERRORS.has(failure.code)
 }
 
-/** The cause of an episode's opening line. Pure. */
-function openingCause(episode: OpenEpisode): string {
-  const scope = episode.step === 'conversations.open' && episode.code === MISSING_SCOPE_ERROR
+/**
+ * The `destination=` field of a `persona-destination-failed` line (b.av2
+ * SR-10.3, b.deo SRI-906): `destination=<value>`, followed in fungible mode
+ * by the setting in force in parentheses,
+ * `destination=<value> (invited.permission_prompts)`. A declarative-mode
+ * field names no setting, as every such line does in declarative mode. Pure.
+ */
+function destinationField(at: NamedDestination): string {
+  return at.setting === DECLARATIVE_DESTINATION_SETTING
+    ? `destination=${at.destination}`
+    : `destination=${at.destination} (${at.setting})`
+}
+
+/**
+ * The cause of a `persona-destination-failed` opening line (b.av2 SR-7.1,
+ * SR-10.3; b.deo SRI-702, SRI-906): the failed step, the destination with the
+ * setting in force (`destination=<value>`, plus ` (invited.permission_prompts)`
+ * in fungible mode) and the Slack error code, then that the persona's
+ * prompts and notices are held. For `missing_scope` on the open it names the
+ * `im:write` scope and says the app must be re-installed to gain it. A code
+ * that is not a short identifier is written `unknown_error`
+ * (`safeFailureCode`). Pure.
+ */
+export function destinationFailedCause(at: NamedDestination, failure: DestinationFailedAt): string {
+  const code = safeFailureCode(failure.code)
+  const scope = failure.step === 'conversations.open' && code === MISSING_SCOPE_ERROR
     ? ` — the Slack app lacks the ${DM_OPEN_SCOPE} scope: re-install the app with ${DM_OPEN_SCOPE} to grant it`
     : ''
-  return `${episode.step} failed for destination=${episode.destination} with error ${episode.code}${scope}; ` +
+  return `${failure.step} failed for ${destinationField(at)} with error ${code}${scope}; ` +
     'holding its permission prompts and notices and retrying with backoff'
 }
 
-/** The cause of an episode's cleared line, naming the destination that accepted the post. Pure. */
-function clearedCause(episode: OpenEpisode, destination: string): string {
-  return `cleared: destination=${destination} accepts posts again ` +
-    `(was ${episode.step} error ${episode.code}); delivering what was held`
+/**
+ * The cause of a `persona-destination-failed` cleared line (b.av2 SR-7.1,
+ * SR-10.3; b.deo SRI-906): `cleared:`, the destination that accepted the
+ * post with the setting in force at that post (as `destinationFailedCause`
+ * writes it), and the step and code of the failure the episode last named
+ * (`was`). Pure.
+ */
+export function destinationClearedCause(at: NamedDestination, was: DestinationFailedAt): string {
+  return `cleared: ${destinationField(at)} accepts posts again ` +
+    `(was ${was.step} error ${safeFailureCode(was.code)}); delivering what was held`
+}
+
+/** The key under which an episode tracks a named destination: its setting and value together. Pure. */
+function namedKey(at: NamedDestination): string {
+  return `${at.setting}\u0000${at.destination}`
 }
 
 // ---------------------------------------------------------------------------
@@ -405,13 +477,18 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
   }
 
   /**
-   * The destination an attempt posts to: the one destination rule over the
-   * configuration in effect (`destinations.destinationOf`, b.deo SRI-701),
-   * read in the same synchronous step as the resolver's `post` that follows,
-   * so it names the destination that post resolves.
+   * The destination an attempt posts to, with the setting that names it: the
+   * one destination rule over the configuration in effect
+   * (`destinations.destinationOf`, b.deo SRI-701) and the setting in force
+   * (`destinationSettingFrom`, b.deo SRI-906), read in the same synchronous
+   * step as the resolver's `post` that follows, so they name the destination
+   * that post resolves, in the mode in force at that moment.
    */
-  function attemptDestination(persona: Persona): string {
-    return deps.destinations.destinationOf(persona)
+  function attemptDestination(persona: Persona): NamedDestination {
+    return {
+      setting: destinationSettingFrom(deps.destinations, persona),
+      destination: deps.destinations.destinationOf(persona),
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -420,19 +497,19 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
 
   /**
    * Account one settled attempt that started at generation `started` and
-   * posted to `destination` (`attemptDestination`): open, advance or close
-   * the episode. Returns how the attempt counts.
+   * posted to `at` (`attemptDestination`): open, advance or close the
+   * episode. Returns how the attempt counts.
    */
   function settle(
     entry: HoldEntry,
     started: number,
     persona: Persona,
-    destination: string,
+    at: NamedDestination,
     result: DestinationPostResult,
   ): SettledAs {
     const current = entry.episode !== undefined && started === entry.generation
     if (result.outcome === 'posted') {
-      if (current) closeEpisode(entry, destination)
+      if (current) closeEpisode(entry, at)
       return 'posted'
     }
     if (result.outcome === 'refused') return 'refused'
@@ -441,24 +518,27 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
     // failure is older evidence than that change. Log nothing, schedule
     // nothing; the caller re-queues a notice and `ensureProgress` retries it.
     if (started !== entry.generation) return 'destination'
-    if (entry.episode === undefined) openEpisode(entry, persona, destination, result)
+    if (entry.episode === undefined) openEpisode(entry, persona, at, result)
     else {
-      // The persona's destination changed in place while the episode is open:
-      // name the new destination once, in a fresh opening line.
-      if (!entry.episode.named.has(destination)) nameDestination(entry, entry.episode, persona, destination, result)
+      // The destination in force changed while the episode is open: an
+      // in-place change of the destination setting, or a confirmed switch
+      // change that put the other mode's setting in force (b.av2 SR-7.1,
+      // b.deo SRI-703). Name the setting and value now in force once, in a
+      // fresh opening line.
+      if (!entry.episode.named.has(namedKey(at))) nameDestination(entry, entry.episode, persona, at, result)
       scheduleRetry(entry, result)
     }
     return 'destination'
   }
 
-  function openEpisode(entry: HoldEntry, persona: Persona, destination: string, failure: DestinationFailure): void {
+  function openEpisode(entry: HoldEntry, persona: Persona, at: NamedDestination, failure: DestinationFailure): void {
     const episode: OpenEpisode = {
       name: persona.name,
       index: persona.index,
-      destination,
+      at,
       step: failure.step,
       code: safeFailureCode(failure.code),
-      named: new Set([destination]),
+      named: new Set([namedKey(at)]),
     }
     entry.episode = episode
     entry.generation += 1
@@ -471,15 +551,15 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
     entry: HoldEntry,
     episode: OpenEpisode,
     persona: Persona,
-    destination: string,
+    at: NamedDestination,
     failure: DestinationFailure,
   ): void {
     episode.name = persona.name
     episode.index = persona.index
-    episode.destination = destination
+    episode.at = at
     episode.step = failure.step
     episode.code = safeFailureCode(failure.code)
-    episode.named.add(destination)
+    episode.named.add(namedKey(at))
     logOpening(entry, episode)
   }
 
@@ -489,7 +569,7 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
       name: episode.name,
       key: entry.key,
       index: episode.index,
-      cause: openingCause(episode),
+      cause: destinationFailedCause(episode.at, episode),
     }))
   }
 
@@ -500,8 +580,11 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
     clearTimer(entry)
   }
 
-  /** Close the open episode; its cleared line names `destination`, the one the post that ended it went to. */
-  function closeEpisode(entry: HoldEntry, destination: string): void {
+  /**
+   * Close the open episode; its cleared line names `at`, the destination the
+   * post that ended it went to, with the setting in force at that post.
+   */
+  function closeEpisode(entry: HoldEntry, at: NamedDestination): void {
     const episode = entry.episode
     if (episode === undefined) return
     entry.episode = undefined
@@ -514,7 +597,7 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
       name: episode.name,
       key: entry.key,
       index: episode.index,
-      cause: clearedCause(episode, destination),
+      cause: destinationClearedCause(at, episode),
     }))
   }
 
@@ -641,17 +724,17 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
         const started = entry.generation
         entry.inFlight = true
         entry.attempting = queued
-        let destination: string
+        let at: NamedDestination
         let result: DestinationPostResult
         try {
-          destination = attemptDestination(persona)
+          at = attemptDestination(persona)
           result = await deps.destinations.post(persona, client, queued.notice.message)
         } finally {
           entry.inFlight = false
           entry.attempting = undefined
         }
         if (!isCurrent(entry)) return
-        const settled = settle(entry, started, persona, destination, result)
+        const settled = settle(entry, started, persona, at, result)
         if (settled === 'destination') {
           noticeFailed(entry, queued, result as DestinationFailure, true)
           return
@@ -700,17 +783,17 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
     }
     return {
       async post(persona, client, message) {
-        let destination: string | undefined
+        let at: NamedDestination | undefined
         let result: DestinationPostResult | undefined
         try {
-          destination = attemptDestination(persona)
+          at = attemptDestination(persona)
           result = await deps.destinations.post(persona, client, message)
           return result
         } finally {
           // Settled even when the resolver throws, so the in-flight guard never leaks.
           if (finish() && isCurrent(entry)) {
             try {
-              if (destination !== undefined && result !== undefined) settle(entry, started, persona, destination, result)
+              if (at !== undefined && result !== undefined) settle(entry, started, persona, at, result)
             } finally {
               ensureProgress(entry)
             }
@@ -733,11 +816,11 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
       return
     }
     const started = entry.generation
-    const destination = attemptDestination(persona)
+    const at = attemptDestination(persona)
     // Issued before the first `await` for a channel destination (the resolver's guarantee).
     const result = await deps.destinations.post(persona, client, notice.message)
     if (!isCurrent(entry)) return
-    const settled = settle(entry, started, persona, destination, result)
+    const settled = settle(entry, started, persona, at, result)
     if (settled === 'destination') {
       noticeFailed(entry, queued, result as DestinationFailure, true)
       if (!isCurrent(entry)) return
