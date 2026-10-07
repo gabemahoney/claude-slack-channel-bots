@@ -27,7 +27,8 @@
  *   module's declaration builder.
  * - `channelDeliveryRecordOf(entries)`: the record the entries describe, as
  *   the module holds it in memory, to compare with what a store or the reader
- *   answers.
+ *   answers. A seed with no channels is left out, as the module never holds a
+ *   key with no channels.
  *
  * Isolation (b.deo SRI-1204; b.jg5 SRJ-1301): both take the state directory
  * explicitly and never resolve a default one; the writer writes only the
@@ -78,10 +79,16 @@ export function declarationOf(persona: Pick<Persona, 'name' | 'credentials_file'
   return channelDeliveryDeclarationOf(persona)
 }
 
-/** The record `entries` describe, as the module holds it in memory. */
+/**
+ * The record `entries` describe, as the module holds it in memory. A seed
+ * with no channels is left out, as the module never holds a persona key with
+ * no channels: the parser refuses one, the serialiser omits one and a drop
+ * removes the whole key.
+ */
 export function channelDeliveryRecordOf(entries: Readonly<Record<string, ChannelDeliveryPersonaSeed>>): ChannelDeliveryRecord {
   const record = new Map<string, ChannelDeliveryPersonaEntry>()
   for (const [key, seed] of Object.entries(entries)) {
+    if (Object.keys(seed.channels).length === 0) continue
     const channels = new Map<string, ChannelDeliveryChannelEntry>()
     for (const [id, choice] of Object.entries(seed.channels)) {
       channels.set(id, { delivery: choice.delivery, set_at: choice.set_at ?? SAMPLE_SET_AT })
