@@ -7,10 +7,30 @@
  * `ack_reaction: "eyes"`; the Step 6 Role text), and D's entry for Check 25.
  *
  * The runner writes these instead of running the wizard (a deviation the
- * results' Notes record). Pure: IDs in, JSON out.
+ * results' Notes record). Neither the configuration it writes nor D's entry
+ * carries the invited-channel switch or an `invited` section: every check
+ * before Check 30 runs with the switch absent (b.deo SRI-1507).
+ *
+ * Check 30's switch-on edit (`switchOnFilter`, b.deo SRI-1501) is a jq filter
+ * applied to config.json through the plan's confirmed edit. It sets the
+ * switch and gives every persona an `invited.permission_prompts` that keeps
+ * the change valid and keeps the persona's destination where it is: A the
+ * a-home channel, B and C `"dm"`, and D, only when D is still declared, the
+ * d-home channel. A takes a-home, not `"dm"`: its DMs are off after setup and
+ * Check 1, and on with no `dm.contact` after Part 7, so `"dm"` would be
+ * invalid in either state. The filter handles D's presence itself, so one
+ * filter serves both the state setup and Check 1 leave (a targeted run) and
+ * the full run's state after Check 28. It changes nothing else: each
+ * persona's `channels`, top-level `permission_prompts` and `dm` keep their
+ * values. Checks 32 and 33 turn the switch off and on again with an edit of
+ * the switch alone (`switchFilter`). The setting names are copies of
+ * src/'s (the runner loads no other src/ module), pinned by
+ * tests/ci-live-checks.test.ts.
+ *
+ * Pure: IDs in, JSON or a jq filter out.
  */
 
-import { credentialsFileName, personaName, type PersonaLetter } from './personas.ts'
+import { credentialsFileName, personaName, PERSONA_LETTERS, type PersonaLetter } from './personas.ts'
 
 export interface WorkspaceIds {
   teamId: string
@@ -35,13 +55,62 @@ export interface PersonaEntry {
   channels?: { id: string; delivery: 'all' | 'mentions' }[]
   dm?: { enabled: boolean; contact?: string }
   permission_prompts: string
+  /** The fungible section (b.deo SRI-102): only Check 30's edit writes it. */
+  invited?: { permission_prompts: string }
 }
 
 export interface LiveConfig {
   personas: PersonaEntry[]
   ack_reaction: string
   append_system_prompt_file: string
+  /** The invited-channel switch (`SWITCH_KEY`, b.deo SRI-101): only Checks 30, 32 and 33's edits write it. */
+  [SWITCH_KEY]?: boolean
 }
+
+/** The invited-channel switch's key (src/config.ts's `allow_invited_channels`, b.deo SRI-101). */
+export const SWITCH_KEY = 'allow_invited_channels'
+/** The fungible section's key (b.deo SRI-102). */
+export const INVITED_KEY = 'invited'
+/** The fungible section's destination key (src/config.ts's `PERSONA_INVITED_KEYS`). */
+export const INVITED_PERMISSION_PROMPTS_KEY = 'permission_prompts'
+/** The destination value that sends a persona's prompts and notices to its DM with its contact. */
+export const DM_DESTINATION = 'dm'
+
+/** Each persona's `invited.permission_prompts` in Check 30's edit: A a-home, B and C `"dm"`, D d-home. */
+export function invitedDestinationFor(letter: PersonaLetter, ids: WorkspaceIds): string {
+  switch (letter) {
+    case 'a':
+      return ids.aHome
+    case 'b':
+    case 'c':
+      return DM_DESTINATION
+    case 'd':
+      return ids.dHome
+  }
+}
+
+/**
+ * Check 30's switch-on edit as a jq filter over config.json (b.deo SRI-1501):
+ * the switch set to true, and each persona of A to D present in the file
+ * given its `invited.permission_prompts` (`invitedDestinationFor`). A persona
+ * absent from the file (D, after Check 27) gets nothing; every other key is
+ * kept. Pure.
+ */
+export function switchOnFilter(ids: WorkspaceIds): string {
+  const branches = PERSONA_LETTERS.map((l, i) => {
+    const section = JSON.stringify({ [INVITED_PERMISSION_PROMPTS_KEY]: invitedDestinationFor(l, ids) })
+    return `${i === 0 ? 'if' : 'elif'} .name == ${JSON.stringify(personaName(l))} then .${INVITED_KEY} = ${section}`
+  })
+  return `.${SWITCH_KEY} = true | .personas |= map(${branches.join(' ')} else . end)`
+}
+
+/** An edit of the switch alone, as a jq filter (Checks 32 and 33). Pure. */
+export function switchFilter(on: boolean): string {
+  return `.${SWITCH_KEY} = ${on}`
+}
+
+/** A jq expression for the switch's value in a configuration file: `true` or `false` (absent reads as false). */
+export const SWITCH_VALUE_JQ = `(.${SWITCH_KEY} // false)`
 
 function base(letter: PersonaLetter): Pick<PersonaEntry, 'name' | 'credentials_file' | 'working_directory'> {
   return {

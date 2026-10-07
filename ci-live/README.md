@@ -605,9 +605,12 @@ provisioning: `apps.json` keeps the intent and nothing is created. Rerun.
 
 ## Retiring the test apps
 
-Runs leave the four apps and the three channels in place for the next run. To
-retire them, delete each app (its **Basic Information** page, **Delete App**)
-and archive the channels. Then remove `~/.config/cscb-test/apps.json`,
+Runs leave the four apps and the three provisioned channels in place for the
+next run. Each run also creates one public channel for Checks 30–34,
+`cscb-live-invited-<RUN_ID>`, which Check 34 archives, so archived run
+channels build up in the test workspace. To retire the apps, delete each app
+(its **Basic Information** page, **Delete App**) and archive the three
+provisioned channels. Then remove `~/.config/cscb-test/apps.json`,
 `~/.config/cscb-test/credentials/` and
 `~/.config/cscb-test/credentials-staged/`. The next run creates everything
 again when given `--create-apps` (`bun ci-live/run.ts --create-apps`).

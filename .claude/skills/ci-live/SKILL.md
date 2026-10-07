@@ -272,6 +272,14 @@ installed Google Chrome, headless; no browser download):
    "Prompt guard" section (its check, persona and command): a denial fails
    nothing, but it shows a bot Claude's detour.
 
+   After a PASS or a FAIL, also relay Check 33's recorded outcomes from
+   `results.md`: each note in Check 33's row that starts `Check 33 residual:`
+   (one each for `react`, `edit_message on C's earlier post` and
+   `fetch_messages with thread_ts`, saying `accepted`, `refused by Slack
+   (<code>)`, `refused with no Slack code`, `made, with no result` or `not
+   made`), word for word. They are recorded, never judged: every call Slack
+   accepted is a residual the README must state before the release.
+
 ## Maintenance commands
 
 Each takes the real run lock (never while a run is going), runs in the
@@ -329,4 +337,7 @@ Check 14's first-time user is new to this run's server: it is
 transcript already names the account. Checks 16 and 20 judge only what
 follows their first ask. Part 1.5 and Check 25 are done by the runner with config edits
 instead of the wizard (noted in the results). The run leaves the apps and
-channels in place for the next run.
+the three provisioned channels in place for the next run. It also creates
+one public channel of its own for Checks 30–34
+(`cscb-live-invited-<RUN_ID>`), which Check 34 archives, so archived run
+channels build up in the test workspace.

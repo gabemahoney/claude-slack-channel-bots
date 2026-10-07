@@ -1011,6 +1011,17 @@ writes. A clean start's summary ends `0 failed, 0 not brought up, 0 not
 reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held
 on invalid flags, 0 fresh as retired keys`.
 
+Checks 30 to 34 take the other texts they expect from copies: those held
+once in `ci-live/checks/invited-checks.ts` (the switch's preview lines, the
+in-place and recorded lines, the no-effective-change preview and
+`reload-noop` line, the `persona-invited-channel`,
+`persona-channel-delivery-set` and `unclaimed-channel` lines, and Check 33's
+tool-error form), the preview header and `reload-applied` line in
+`ci-live/checks/helpers.ts`, and the setting names in
+`ci-live/lib/live-config.ts`. The runner loads no other `src/` module, so
+each copy names the `src/` builder or constant it copies and is pinned
+against it in `tests/ci-live-checks.test.ts`.
+
 | Check | In `/ci-live` |
 |---|---|
 | Provisioning | A result row of its own (the stages above) |
@@ -1029,9 +1040,10 @@ on invalid flags, 0 fresh as retired keys`.
 | 26 | `SKIPPED (optional)` |
 | 27 | Automated, with step 2's optional prompt. The teardown kills D's row and keeps it: once the teardown's complete line is logged, the runner runs a guarded `agent-director find-missing` in the container (a kill never changes a row's state; find-missing marks the row once its agent process is gone), then expects A's, B's and C's rows unchanged and D's row kept and not live (`ended` or `missing`), with one teardown line for a kill that kept the row. It records whether D's row was there before the removal, which tells Check 28 whether to expect D's kept row |
 | 28 | Automated; the reboot is a container restart (see below). Steps 1, 3 and 5 expect one live row per configured persona, plus D's kept row, not live, when Check 27 found D's row before removing D (whether or not D connected in Check 25), and no row for D otherwise. A persona Slack was unreachable for at the start, up after its bring-up retry and connected within the wait, is a note, not a failure |
-| 29a | Automated. Always runs, also in a dry run and after a blocking failure; adds a host-side scan of the results. It requires a transcript only for each persona this run brought up (A to C in Check 1, D in Check 25) and sent a message to |
+| 30 to 34 | Automated, after Check 28 and before 29a, against persona C (in no channel, DMs on, the test human its contact). Check 30 starts only from the applied, nothing-pending, running state, copies `config.json` to `~/cscb-live/config-before-invited.json` in the container, and turns the switch on with a confirmed config edit that gives every persona an `invited.permission_prompts` keeping its destination where it is (A `a-home`, B and C `"dm"`, D `d-home` when still declared); it expects A's, B's and C's (and D's) in-place lines. The test human then creates the run channel, public and named `cscb-live-invited-<RUN_ID>`, mentions C there, invites C's app and mentions it again. Check 31 asks C in the channel to call `set_channel_delivery` with `all`; Check 32 turns the switch off and waits the full 3-minute reply window; Check 33 turns it on again, kicks C's app and asks C by DM for the calls. Checks 31 and 33 read C's calls from its transcript and follow Check 16's ask rule (at most two asks; no call after two is `SKIPPED (not run: …)`). Check 33's outcomes for `react`, `edit_message` on C's earlier post and `fetch_messages` with `thread_ts` are recorded as notes, never judged, one per call: `Check 33 residual: <call> after the kick: <outcome>`. Check 34 runs whatever 30 to 33 found: it restores the copied bytes through a confirmed edit, kicks C's app if it is still in the channel, archives the channel, and passes only when C is in no channel, archived ones included. Against a silent workspace it passes only as "nothing to restore", when Check 30 copied nothing and created no channel. `--only 30,31,32,33,34` runs them from the state setup and Check 1 leave (A, B and C applied, A's DMs off, no D): the switch-on edit handles either state |
+| 29a | Automated. Always runs, also in a dry run and after a blocking failure; adds a host-side scan of the results. It scans the plan's file list, the stored-choice file `channel-delivery.json` included, and requires a transcript only for each persona this run brought up (A to C in Check 1, D in Check 25) and sent a message to |
 | 29b | `SKIPPED (optional: needs host sudo/iptables)` |
-| Teardown | The personas' tmux panes, the container's own logs and the personas' transcript tails are copied into `container-logs/` (see [Outputs](#outputs)), then the container is removed. The apps and channels stay for the next run |
+| Teardown | The personas' tmux panes, the container's own logs and the personas' transcript tails are copied into `container-logs/` (see [Outputs](#outputs)), then the container is removed. The apps and the three provisioned channels stay for the next run; each run's invited channel is archived by Check 34 |
 | HOST | The host is unchanged (see [Isolation](#isolation-from-the-production-bots)) |
 | Closing secrecy scan | Every output is free of tokens and secrets (see [Secrets](#secrets)) |
 

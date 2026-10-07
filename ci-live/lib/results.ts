@@ -21,10 +21,11 @@ import type { PromptGuardReport } from '../checks/prompt-guard.ts'
 import type { WatchdogReport } from './memory-watchdog.ts'
 import type { Redactor } from './redact.ts'
 
-/** The testplan Results table's check columns, in order. */
+/** The testplan Results table's check columns, in the plan's run order (Part 11's 30–34 before the closing 29a and 29b). */
 export const RESULTS_COLUMNS = [
   'S1', 'S2', 'S3', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17',
-  '18', '19', '20', '21', '22', '23', '24', '25', '26 (optional)', '27', '28 (reboot)', '29a', '29b (optional)',
+  '18', '19', '20', '21', '22', '23', '24', '25', '26 (optional)', '27', '28 (reboot)', '30', '31', '32', '33', '34',
+  '29a', '29b (optional)',
 ] as const
 
 export interface RunSummary {

@@ -12,7 +12,8 @@ import { CHANNEL_CHECKS } from './channel-checks.ts'
 import type { CheckContext } from './context.ts'
 import { DM_CHECKS } from './dm-checks.ts'
 import { Findings, type CheckDef } from './framework.ts'
-import { LIFECYCLE_CHECKS } from './lifecycle-checks.ts'
+import { INVITED_CHECKS } from './invited-checks.ts'
+import { CLOSING_CHECKS, LIFECYCLE_CHECKS } from './lifecycle-checks.ts'
 import { installCheck, preflightCheck, s1Check, s2Check, s3Check, setupCheck } from './setup-checks.ts'
 
 export const teardownCheck: CheckDef<CheckContext> = {
@@ -49,7 +50,12 @@ export const hostCheck: CheckDef<CheckContext> = {
   },
 }
 
-/** The testplan's checks in run order (Parts 1–11). */
+/**
+ * The testplan's checks in run order (Parts 1–12): Part 11's invited-channel
+ * checks (30–34) run after Check 28 and before the closing secrecy check, so
+ * 29a, then the optional 29b, stay last and 29a scans every file the run
+ * writes (b.deo SRI-1501).
+ */
 export const PLAN_CHECKS: CheckDef<CheckContext>[] = [
   preflightCheck,
   installCheck,
@@ -60,6 +66,8 @@ export const PLAN_CHECKS: CheckDef<CheckContext>[] = [
   ...CHANNEL_CHECKS,
   ...DM_CHECKS,
   ...LIFECYCLE_CHECKS,
+  ...INVITED_CHECKS,
+  ...CLOSING_CHECKS,
 ]
 
 /** Run after the plan's checks, in this order, whatever happened before. */

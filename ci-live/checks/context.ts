@@ -101,6 +101,15 @@ export interface SharedState {
   packageVersion?: string
   /** The personas brought up in this run (Check 1: A, B, C; Check 25: D), for Check 29a's transcripts. */
   broughtUp?: PersonaLetter[]
+  /**
+   * Check 30: where in the container it copied config.json before its
+   * switch-on edit; set as soon as the copy exists (Check 34 restores it).
+   */
+  invitedConfigCopy?: string
+  /** Check 30: the public channel it created for the run; set as soon as it exists (Checks 31–34). */
+  invitedChannel?: { id: string; name: string }
+  /** Check 30: the ts of C's answer in that channel (Check 33 asks C to edit it). */
+  invitedCAnswerTs?: string
 }
 
 export interface CheckContext {
