@@ -4831,3 +4831,385 @@ export function stubReservationReader(listing: ReservationListing = reservationL
 // ---------------------------------------------------------------------------
 // 10. Sample sequences (E7)
 // ---------------------------------------------------------------------------
+//
+// The readings builder's sample sequences (b.uqm SR-21.4), for the memory
+// watchdog's tests: a run of n samples, each a stated state of everything a
+// sample reads (b.uqm SR-7.3), and a final-reading entry per shard. Built
+// only from E6's and E1's builders: the cgroup tree (`createCgroupTree`), the
+// `/ci-live` builder (`makeCiLiveHome`, `makeDryRunLock`,
+// `addCiLiveLockHolder`), the fake container interface and the run-directory
+// builder (`makeRunDir`, `writeShardDir`, `resultFileText`). Everything is
+// written under the caller's `mkdtempSync` root; no host cgroup, other
+// process's `/proc`, real `/ci-live` lock or docker is touched.
+//
+// `step()` writes the next sample's state, then moves the fake clock one
+// `SAMPLE_INTERVAL_MS`, so a watchdog started at the clock's time before the
+// first step takes that state as its sample. Figures are given in GiB and
+// written as whole bytes by E6's one rule (`gibToBytes`), or given as exact
+// byte counts (`{ bytes }`), so a case can sit on a line or one byte below.
+//
+// `State.OOMKilled` per sample. The fake container interface answers each
+// state-form read of a container with its next `stateReadings` entry, and a
+// sample makes up to two such reads of a running shard's container: its own
+// state inspect, spawned first, then the inspect of the `/ci-live` re-check's
+// container list, spawned once the list has answered. The builder lays out
+// each container's readings from the whole sequence in that order, the
+// sample's `State.OOMKilled` in the first and the container's own state in
+// the second, so an unreadable `State.OOMKilled` fails only the shard's own
+// inspect, never the listing. A sample whose list fails, or whose inspect of
+// the shard fails, makes no read of that kind.
+
+// Section 11's runner imports (an ES import is hoisted; kept here so this lane writes only under its banner).
+import {
+  CI_CONTAINER_NAME_PREFIX,
+  readResultFile,
+  SAMPLE_INTERVAL_MS,
+  type FinalReading,
+  type OomFinalReading,
+  type WatchdogShard,
+} from '../../scripts/ci-run.ts'
+import type { FakeClock } from './fake-clock.ts'
+
+/** A figure in GiB, written as whole bytes by `gibToBytes`; or an exact byte count. */
+export type SampleFigure = number | { readonly bytes: number }
+
+/** A figure's whole bytes. Throws for exact bytes that are not a whole, non-negative count. */
+export function sampleFigureBytes(figure: SampleFigure): number {
+  if (typeof figure === 'number') return gibToBytes(figure)
+  assertWholeCounts('sampleFigureBytes', { bytes: figure.bytes })
+  return figure.bytes
+}
+
+/** One cgroup file made unreadable at a sample: removed (default), emptied, garbled, a directory, or stripped of one key. */
+export interface SampleUnreadableFile {
+  readonly file: CgroupFileName
+  readonly change?: CgroupFileChange
+}
+
+/** W and its parts at the namespace root at one sample (or after cleanup). */
+export interface SamplePod {
+  /** W, `memory.current` minus `inactive_file`. */
+  readonly workingSet: SampleFigure
+  /** W's anon part (default 0). */
+  readonly anon?: SampleFigure
+  /** W's active page cache (default 0). */
+  readonly activeFile?: SampleFigure
+  /** `inactive_file`, outside W (default 0). */
+  readonly inactiveFile?: SampleFigure
+  /** A root file made unreadable (`memory.current` or `memory.stat`), so W cannot be read. */
+  readonly unreadable?: SampleUnreadableFile
+}
+
+/** A shard's result file at a sample: no file, a directory where it should be (unreadable), or its lines (a malformed or partial one included). */
+export type SampleResultFile = 'absent' | 'unreadable' | readonly ResultEvent[] | ResultFileSpec
+
+/** One running shard at one sample. */
+export interface SampleShard {
+  readonly shard: number
+  /** Its memory, `memory.current` minus `inactive_file` (default 0). */
+  readonly memory?: SampleFigure
+  /** `anon` (default 0). */
+  readonly anon?: SampleFigure
+  /** `file`, its page cache (default: its `inactive_file`). */
+  readonly file?: SampleFigure
+  /** `inactive_file` (default 0). */
+  readonly inactiveFile?: SampleFigure
+  /** `pids.current` (default 0). */
+  readonly pidCount?: number
+  /** `oom_kill` in `memory.events` (default 0). */
+  readonly oomKillCount?: number
+  /** Its own state inspect's `State.OOMKilled` (default: the container's, false); `unreadable` fails that inspect's answer. */
+  readonly oomKilled?: boolean | Unreadable
+  /** `fails`: its own state inspect fails (a docker error). */
+  readonly inspect?: 'fails'
+  /** Its cgroup files made unreadable at this sample. */
+  readonly unreadable?: readonly SampleUnreadableFile[]
+  /** Its result file from this sample on; unchanged when not given. */
+  readonly resultFile?: SampleResultFile
+}
+
+/** A `/ci-live` lock at one sample: held by its constructed runner, or left as the case made it (a FIFO, say). Not named: absent. */
+export type SampleLockState = 'held' | 'untouched'
+
+/** Everything one sample reads. */
+export interface SampleStep {
+  readonly pod: SamplePod
+  /** The shards running at this sample, in the order `runningShards` answers them; none during the build. */
+  readonly shards?: readonly SampleShard[]
+  /** The `/ci-live` locks at this sample; a lock not named is absent. */
+  readonly locks?: {
+    readonly realRun?: SampleLockState
+    readonly dryRun?: SampleLockState
+  }
+  /** `fails`: the `/ci-live` re-check's container list fails. */
+  readonly containerList?: 'fails'
+}
+
+/** A shard's final reading (b.uqm SR-10.6), constructed: E9 takes the real one. */
+export interface SampleFinal {
+  /** `anon` (default 0); unread when `memoryStat` is `unreadable`. */
+  readonly anon?: SampleFigure
+  /** `file` (default 0); unread when `memoryStat` is `unreadable`. */
+  readonly file?: SampleFigure
+  readonly memoryStat?: 'readable' | 'unreadable'
+  /** `oom_kill` (default 0); unread when `memoryEvents` is `unreadable`. */
+  readonly oomKillCount?: number
+  readonly memoryEvents?: 'readable' | 'unreadable'
+  /** `State.OOMKilled` (default false). */
+  readonly oomKilled?: boolean | Unreadable
+  /** The result file at that moment; unchanged when not given. */
+  readonly resultFile?: SampleResultFile
+}
+
+/** A sample sequence to build. */
+export interface SampleSequenceSpec {
+  /** L, the namespace root's `memory.max`. */
+  readonly limit: SampleFigure
+  /** The shards that get a container and a shard subdirectory (default: every shard a step names). */
+  readonly shards?: readonly number[]
+  readonly steps: readonly SampleStep[]
+  /** Each shard's final reading; a shard not listed, or null, has none. */
+  readonly finals?: Readonly<Record<number, SampleFinal | null>>
+}
+
+/** What a sample sequence is built with: the case's fake clock, its spawn recorder on that clock (with its process table) and the fake container interface over it. */
+export interface SampleSequenceFakes {
+  readonly clock: FakeClock
+  readonly recorder: SpawnRecorder
+  readonly docker: FakeDocker
+}
+
+/** Options beside the spec. */
+export interface SampleSequenceOptions {
+  /** The runner's user ID, in the dry-run lock's name (default: test data). */
+  readonly uid?: number
+  /** The run's RUN_ID, for its run directory and container names (default: test data). */
+  readonly runId?: string
+  /** More environment entries (a credential built with `fakeToken`, say). */
+  readonly env?: Readonly<Record<string, string>>
+}
+
+/** A shard's container as built. */
+export interface SampleShardContainer {
+  readonly shard: number
+  readonly name: string
+  readonly id: string
+  /** Its main PID (`State.Pid`). */
+  readonly pid: number
+  readonly cgroupPath: string
+}
+
+/** A built sample sequence. */
+export interface SampleSequence {
+  readonly cgroups: CgroupTree
+  /** The run directory, with a `shard-<k>` subdirectory per shard. */
+  readonly runDir: string
+  /** The constructed account home holding `/ci-live`'s real-run lock directory. */
+  readonly home: string
+  /** The runner's environment: `TMPDIR` naming the dry-run lock's directory, and the caller's entries. */
+  readonly env: Readonly<Record<string, string>>
+  readonly uid: number
+  /** L in bytes. */
+  readonly limitBytes: number
+  /** The real-run lock's path, and the dry-run lock's. */
+  readonly realRunLockPath: string
+  readonly dryRunLockPath: string
+  /** The constructed `/ci-live` runner PIDs each held lock names. */
+  readonly realRunPid: number
+  readonly dryRunPid: number
+  container(shard: number): SampleShardContainer
+  /** The watchdog's `runningShards`: the shards the step being taken names, with their container names. */
+  runningShards(): readonly WatchdogShard[]
+  /** How many steps have been applied. */
+  applied(): number
+  /** Writes the next step's state, then moves the clock one sample interval. */
+  step(): Promise<void>
+  /** Steps through every step not yet applied. */
+  run(): Promise<void>
+  /** Writes W's files as the after-cleanup reading will find them. */
+  afterCleanup(pod: SamplePod): void
+  /** A shard's final reading with its result file, read through the runner's own rule; null when it has none. */
+  final(shard: number): OomFinalReading | null
+}
+
+/** The RUN_ID of a built sequence's run directory and containers when the caller gives none: test data. */
+const SAMPLE_SEQUENCE_RUN_ID = '20261008t120000z-sampseq1'
+/** The runner PID in a built sequence's owner label: test data. */
+const SAMPLE_SEQUENCE_RUNNER_PID = 4242
+/** The runner's user ID when the caller gives none: test data. */
+const SAMPLE_SEQUENCE_UID = 1000
+/** The directory under the root holding the run directory: test data. */
+const SAMPLE_SEQUENCE_TEMP_DIR_NAME = 'run-temp'
+/** The parent of the shard containers' cgroups: test data, unlike Docker's layout, as the runner finds a cgroup only through its PID. */
+const SAMPLE_SEQUENCE_CGROUP_PARENT = '/sample-sequence'
+
+/** A shard's container cgroup files from its sample figures; `memory.current` is its memory plus its `inactive_file`. */
+function sampleContainerBytes(shard: Omit<SampleShard, 'shard'>): ContainerCgroupBytes {
+  const inactiveFileBytes = sampleFigureBytes(shard.inactiveFile ?? 0)
+  return {
+    currentBytes: sampleFigureBytes(shard.memory ?? 0) + inactiveFileBytes,
+    anonBytes: sampleFigureBytes(shard.anon ?? 0),
+    fileBytes: shard.file === undefined ? inactiveFileBytes : sampleFigureBytes(shard.file),
+    inactiveFileBytes,
+    pidCount: shard.pidCount ?? 0,
+    oomKillCount: shard.oomKillCount ?? 0,
+  }
+}
+
+/**
+ * Builds a sample sequence under `root` (a `mkdtempSync` directory): the
+ * namespace root with L, one running container per shard with its cgroup and
+ * a `State.OOMKilled` reading per sample, a run directory with each shard's
+ * subdirectory, `/ci-live`'s real-run lock directory under a constructed home
+ * and its dry-run lock's directory named by `TMPDIR`, each lock's constructed
+ * runner. Nothing of any step is written until `step()` takes it.
+ */
+export function buildSampleSequence(root: string, fakes: SampleSequenceFakes, spec: SampleSequenceSpec, options: SampleSequenceOptions = {}): SampleSequence {
+  const { clock, recorder, docker } = fakes
+  if (recorder.clock !== clock) throw new Error('buildSampleSequence: the spawn recorder must run on the same fake clock')
+  const uid = options.uid ?? SAMPLE_SEQUENCE_UID
+  const runId = options.runId ?? SAMPLE_SEQUENCE_RUN_ID
+  const limitBytes = sampleFigureBytes(spec.limit)
+  const cgroups = createCgroupTree(root)
+  cgroups.writeFile('/', CGROUP_FILE.max, `${limitBytes}\n`)
+
+  const ciLive = makeCiLiveHome(root)
+  const dryRun = makeDryRunLock(root, { uid, spellings: { TMPDIR: 'set' } })
+  const dryRunDir = dryRun.dirs.TMPDIR
+  if (dryRunDir === undefined) throw new Error('buildSampleSequence: the dry-run lock has no directory')
+  const dryRunLockPath = dryRunLockFile(dryRunDir, uid)
+  const realRunPid = addCiLiveLockHolder(recorder.processes, 'runner-by-path')
+  const dryRunPid = addCiLiveLockHolder(recorder.processes, 'runner-by-path')
+  const env: Record<string, string> = { TMPDIR: dryRunDir, ...(options.env ?? {}) }
+
+  const tempDir = join(root, SAMPLE_SEQUENCE_TEMP_DIR_NAME)
+  mkdirSync(tempDir)
+  const runDir = makeRunDir(tempDir, runId)
+
+  const shardNumbers = spec.shards ?? [...new Set(spec.steps.flatMap((step) => (step.shards ?? []).map((entry) => entry.shard)))].sort((a, b) => a - b)
+  const containers = new Map<number, SampleShardContainer>()
+  for (const shard of shardNumbers) {
+    writeShardDir(runDir, { shard })
+    const name = `${CI_CONTAINER_NAME_PREFIX}-${runId}-${SHARD_DIR_PREFIX}${shard}`
+    const cgroupPath = `${SAMPLE_SEQUENCE_CGROUP_PARENT}/${name}`
+    // Each sample: the shard's own inspect (when running and not failing), then the listing's (when the list answers).
+    const stateReadings: FakeStateReading[] = []
+    for (const step of spec.steps) {
+      const entry = step.shards?.find((candidate) => candidate.shard === shard)
+      if (entry !== undefined && entry.inspect !== 'fails') stateReadings.push(entry.oomKilled === undefined ? {} : { oomKilled: entry.oomKilled })
+      if (step.containerList !== 'fails') stateReadings.push({})
+    }
+    stateReadings.push({})
+    const id = docker.addContainer({
+      name,
+      labels: ciShardLabels({ runId, pid: SAMPLE_SEQUENCE_RUNNER_PID }),
+      running: true,
+      memoryBytes: SHARD_MEMORY_CAP_BYTES,
+      stateReadings,
+      process: { cgroup: cgroupMembershipLine(cgroupPath) },
+    })
+    const added = docker.container(id)
+    if (added === null) throw new Error(`buildSampleSequence: the fake lost container ${name}`)
+    cgroups.writeContainer(cgroupPath, sampleContainerBytes({}))
+    containers.set(shard, { shard, name, id, pid: added.pid, cgroupPath })
+  }
+
+  const containerOf = (shard: number): SampleShardContainer => {
+    const container = containers.get(shard)
+    if (container === undefined) throw new Error(`buildSampleSequence: no container for shard ${shard}`)
+    return container
+  }
+
+  /** Removes whatever is at a cgroup file's path (a file, or the directory an `unreadable` change left). */
+  const clearCgroupFile = (cgroupPath: string, file: CgroupFileName): void => {
+    rmSync(cgroups.pathOf(cgroupPath, file), { recursive: true, force: true })
+  }
+
+  const writePodFiles = (pod: SamplePod): void => {
+    clearCgroupFile('/', CGROUP_FILE.current)
+    clearCgroupFile('/', CGROUP_FILE.stat)
+    const inactiveFileBytes = sampleFigureBytes(pod.inactiveFile ?? 0)
+    cgroups.writePod('/', {
+      maxBytes: limitBytes,
+      currentBytes: sampleFigureBytes(pod.workingSet) + inactiveFileBytes,
+      anonBytes: sampleFigureBytes(pod.anon ?? 0),
+      activeFileBytes: sampleFigureBytes(pod.activeFile ?? 0),
+      inactiveFileBytes,
+    })
+    if (pod.unreadable !== undefined) cgroups.change('/', pod.unreadable.file, pod.unreadable.change ?? { kind: 'removed' })
+  }
+
+  const writeResult = (shard: number, state: SampleResultFile): void => {
+    const path = join(runDir, `${SHARD_DIR_PREFIX}${shard}`, RESULT_FILE_NAME)
+    rmSync(path, { recursive: true, force: true })
+    if (state === 'absent') return
+    if (state === 'unreadable') {
+      mkdirSync(path)
+      return
+    }
+    writeFileSync(path, resultFileText(Array.isArray(state) ? { events: state } : (state as ResultFileSpec)))
+  }
+
+  const writeLock = (path: string, pid: number, state: SampleLockState | undefined): void => {
+    if (state === 'untouched') return
+    rmSync(path, { recursive: true, force: true })
+    if (state === 'held') writeFileSync(path, ciLiveLockText(pid))
+  }
+
+  let applied = 0
+  let current: SampleStep | null = null
+
+  async function step(): Promise<void> {
+    const next = spec.steps[applied]
+    if (next === undefined) throw new Error(`buildSampleSequence: all ${spec.steps.length} steps are taken`)
+    writePodFiles(next.pod)
+    for (const entry of next.shards ?? []) {
+      const container = containerOf(entry.shard)
+      for (const file of Object.values(CGROUP_FILE)) if (file !== CGROUP_FILE.max) clearCgroupFile(container.cgroupPath, file)
+      cgroups.writeContainer(container.cgroupPath, sampleContainerBytes(entry))
+      for (const unreadable of entry.unreadable ?? []) cgroups.change(container.cgroupPath, unreadable.file, unreadable.change ?? { kind: 'removed' })
+      if (entry.resultFile !== undefined) writeResult(entry.shard, entry.resultFile)
+      if (entry.inspect === 'fails') docker.fail('container-state', { when: (argv) => argv[argv.length - 1] === container.name })
+    }
+    writeLock(ciLive.realRunLock, realRunPid, next.locks?.realRun)
+    writeLock(dryRunLockPath, dryRunPid, next.locks?.dryRun)
+    if (next.containerList === 'fails') docker.fail('container-list')
+    current = next
+    applied += 1
+    await clock.advance(SAMPLE_INTERVAL_MS)
+  }
+
+  return {
+    cgroups,
+    runDir,
+    home: ciLive.home,
+    env,
+    uid,
+    limitBytes,
+    realRunLockPath: ciLive.realRunLock,
+    dryRunLockPath,
+    realRunPid,
+    dryRunPid,
+    container: containerOf,
+    runningShards: () => (current?.shards ?? []).map((entry) => ({ shard: entry.shard, container: containerOf(entry.shard).name })),
+    applied: () => applied,
+    step,
+    async run() {
+      while (applied < spec.steps.length) await step()
+    },
+    afterCleanup: writePodFiles,
+    final(shard) {
+      const entry = spec.finals?.[shard] ?? null
+      if (entry === null) return null
+      if (entry.resultFile !== undefined) writeResult(shard, entry.resultFile)
+      const statRead = entry.memoryStat !== 'unreadable'
+      const reading: FinalReading = {
+        oomKilled: entry.oomKilled ?? false,
+        oomKillCount: entry.memoryEvents === 'unreadable' ? UNREADABLE_READING : (entry.oomKillCount ?? 0),
+        anonBytes: statRead ? sampleFigureBytes(entry.anon ?? 0) : UNREADABLE_READING,
+        fileBytes: statRead ? sampleFigureBytes(entry.file ?? 0) : UNREADABLE_READING,
+      }
+      return { reading, resultFile: readResultFile(join(runDir, `${SHARD_DIR_PREFIX}${shard}`)) }
+    },
+  }
+}
