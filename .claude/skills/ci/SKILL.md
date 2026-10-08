@@ -621,8 +621,9 @@ cap from measured anon peak: <peak> GiB in shard-<k> (page cache <f> GiB) + 1 Gi
   `partial anon peak (<shards>)` and `unknown anon peak (<shards>)`. A line
   with that suffix is never a reason to change the cap.
 - After a kill, `(page cache <f> GiB)` reads
-  `(killed for out of memory at the cap)`. When no anon memory was read and no
-  shard was killed, the line is
+  `(killed for out of memory at the cap)`; when the peak reading's page cache
+  could not be read, it reads `(page cache unknown)`. When no anon memory was
+  read and no shard was killed, the line is
   `cap from measured anon peak: unknown, no shard's anon memory was read; current cap <c> GiB`,
   then its suffix. A selective run has no cap line.
 - The cap (`SHARD_MEMORY_CAP_BYTES` in `scripts/ci-run.ts`) starts at 2 GiB,
