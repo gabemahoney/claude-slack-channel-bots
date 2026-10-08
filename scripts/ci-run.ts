@@ -757,6 +757,11 @@ export const WRITTEN_FILE_MODE = 0o600
 /** The exit status base for a child a signal ended, as a shell reports it: 128 + the signal number (SIGKILL: 137) (b.uqm SR-5.6). */
 export const SIGNAL_EXIT_STATUS_BASE = 128
 
+// --- Credentials (E2 T3) ---
+
+/** The Anthropic raw key's prefix: while `ANTHROPIC_BASE_URL` is unset, an `ANTHROPIC_API_KEY` not beginning with it is a missing credential (b.uqm SR-15.1). */
+export const RAW_KEY_PREFIX = 'sk-ant-'
+
 // ---------------------------------------------------------------------------
 // 3. Data model (E1)
 // ---------------------------------------------------------------------------
@@ -4991,6 +4996,328 @@ export function effectiveShardCount(requested: number | null, unitCount: number)
   return Math.max(OPTION_RANGE_MIN, Math.min(requested ?? MAX_SHARDS, unitCount))
 }
 
+// --- 7/T3 (E2 T3): stages and credentials ---
+//
+// Validation stage 7, the faults' scripts and shard numbers (b.uqm SR-2.4);
+// stage 8, the credentials (b.uqm SR-15.1); and the stage driver, which takes
+// all eight stages in b.uqm SR-2.6's order and gives either the refusal or the
+// validated run that E4, E8, E12 and E13 build on. Stages 7 and 8 are pure and
+// return their failures in their stage's order; the driver alone reads the
+// worktree, through T1's reader and one read of each script's text. Every
+// reason comes from an exported builder and shows typed values through
+// `shownArgument`, so none holds a line break, and none holds a credential's
+// value.
+
+// Stage 7 (b.uqm SR-2.4; stage 7 of SR-2.6). It judges
+// `Invocation.givenFaults`, every `--inject` value as typed and in argument
+// order, never the normalized faults: a wrong file name normalizes to a real
+// script's number form, de-duplication drops a repeat, and a shard number past
+// 2^53 loses its digits in a `Number`. Each failing occurrence is one failure,
+// a repeat included.
+
+/** A stage-7 failure's kind. */
+export type FaultFailureKind = 'no-such-script' | 'not-in-run' | 'shard-out-of-range'
+
+/** A stage-7 failure: a fault whose script, or one of whose shard numbers, the run cannot act on (b.uqm SR-2.4). */
+export interface FaultFailure extends StageFailure {
+  readonly kind: FaultFailureKind
+  /** The `--inject` option's index in the `/ci` arguments; failures come in this, the argument order. */
+  readonly position: number
+  /** The `--inject` value as typed. */
+  readonly fault: string
+  /** The script or the shard number it names, as typed. */
+  readonly named: string
+}
+
+/** `--inject fail:test-999 names test-999, which is no script: …` (b.uqm SR-2.4), the fault and its script as typed. */
+export function faultScriptMissingReason(fault: string, script: string): string {
+  return `${INJECT_OPTION} ${shownArgument(fault)} names ${shownArgument(script)}, which is no script: a fault's <script> must be a script's number form, test-<n>, or its whole file name in ${INTEGRATION_DIR_PATH}`
+}
+
+/** `--inject fail:test-5 names test-5, which is not one of the run's scripts: …` (b.uqm SR-2.4), the fault and its script as typed. */
+export function faultScriptNotInRunReason(fault: string, script: string): string {
+  return `${INJECT_OPTION} ${shownArgument(fault)} names ${shownArgument(script)}, which is not one of the run's scripts: a fault's <script> must be a script the run runs, one selected, a prerequisite of one, or test-1`
+}
+
+/** `--inject kill:3 names shard 3, which is out of range: …` (b.uqm SR-2.4), the fault and the shard number as typed. */
+export function faultShardOutOfRangeReason(fault: string, shard: string, effectiveShards: number): string {
+  return `${INJECT_OPTION} ${shownArgument(fault)} names shard ${shownArgument(shard)}, which is out of range: a fault's shard must be a whole number from ${OPTION_RANGE_MIN} to the effective N, here ${effectiveShards}`
+}
+
+/** A fault value's operand as typed: the text after its first colon. */
+function faultOperand(value: string): string {
+  return value.slice(value.indexOf(':') + 1)
+}
+
+/**
+ * Whether a shard number, as typed, lies from 1 to `effectiveShards`. A whole
+ * number has no leading zero, so digits longer than the effective N's are
+ * larger than it; only then is `Number` read, so digits past 2^53 never are.
+ */
+function shardDigitsInRange(digits: string, effectiveShards: number): boolean {
+  if (!isWholeNumber(digits) || digits.length > String(effectiveShards).length) return false
+  const shard = Number(digits)
+  return shard >= OPTION_RANGE_MIN && shard <= effectiveShards
+}
+
+/**
+ * Validation stage 7, the faults' scripts and shard numbers (b.uqm SR-2.4,
+ * SR-2.6), over every given fault in argument order. A `fail:` or `timeout:`
+ * whose typed `<script>` names no script of the list (a number form matching
+ * no script's number, a file name no script's whole file name) is one failure;
+ * one naming a script outside the run's scripts is another. A `leak`,
+ * `image-drift` or `kill` shard number outside 1 to the effective N is one
+ * failure per bad number, `leak`'s k before its j. `retag` has no check. Pure.
+ */
+export function checkFaults(
+  given: readonly GivenFault[],
+  scripts: readonly Script[],
+  runScripts: readonly Script[],
+  effectiveShards: number,
+): FaultFailure[] {
+  const inRun = new Set(runScripts.map((script) => script.fileName))
+  const failures: FaultFailure[] = []
+  for (const { position, value, fault } of given) {
+    const operand = faultOperand(value)
+    const fail = (kind: FaultFailureKind, named: string, reason: string): void => {
+      failures.push({ kind, position, fault: value, named, reason })
+    }
+    switch (fault.kind) {
+      case 'fail':
+      case 'timeout': {
+        const script = matchScript(operand, scripts)
+        if (script === null) fail('no-such-script', operand, faultScriptMissingReason(value, operand))
+        else if (!inRun.has(script.fileName)) fail('not-in-run', operand, faultScriptNotInRunReason(value, operand))
+        break
+      }
+      case 'leak':
+      case 'image-drift':
+      case 'kill':
+        for (const shard of fault.kind === 'leak' ? operand.split(',') : [operand]) {
+          if (!shardDigitsInRange(shard, effectiveShards)) fail('shard-out-of-range', shard, faultShardOutOfRangeReason(value, shard, effectiveShards))
+        }
+        break
+      case 'retag':
+        break
+    }
+  }
+  return failures
+}
+
+// Stage 8, the credentials (b.uqm SR-15.1; stage 8 of SR-2.6): `ANTHROPIC_API_KEY`
+// and `GH_TOKEN`, read from the runner's environment. The base-build token is
+// looked up and checked only in step 4 (E8). Nothing here looks a credential
+// up or spawns, and no reason holds a credential's value.
+
+/** A credential step 2 checks (b.uqm SR-15.1). */
+export type CheckedCredential = 'ANTHROPIC_API_KEY' | 'GH_TOKEN'
+
+/** The variables stage 8 reads. */
+const API_KEY_VARIABLE = 'ANTHROPIC_API_KEY'
+const GH_TOKEN_VARIABLE = 'GH_TOKEN'
+const BASE_URL_VARIABLE = 'ANTHROPIC_BASE_URL'
+
+/** A stage-8 failure's kind: a missing credential, or a bad one (b.uqm SR-15.1). */
+export type CredentialFailureKind = 'missing' | 'bad'
+
+/** Why `ANTHROPIC_API_KEY` is a missing credential (b.uqm SR-15.1). */
+export type MissingApiKeyCause = 'unset' | 'empty' | 'not-raw-key'
+
+/** A stage-8 failure: one credential, at most one failure each, `ANTHROPIC_API_KEY` first (b.uqm SR-2.6, SR-15.1). */
+export interface CredentialFailure extends StageFailure {
+  readonly kind: CredentialFailureKind
+  readonly variable: CheckedCredential
+}
+
+/** How a missing-credential reason states each cause. */
+const MISSING_API_KEY_CAUSE_TEXT: Readonly<Record<MissingApiKeyCause, string>> = {
+  unset: 'it is unset',
+  empty: 'it is empty',
+  'not-raw-key': `it does not begin ${RAW_KEY_PREFIX} and ${BASE_URL_VARIABLE} is unset`,
+}
+
+/** `ANTHROPIC_API_KEY is a missing credential (it is unset): …` (b.uqm SR-15.1), naming the variable, the cause and the rule, never the value. */
+export function missingApiKeyReason(cause: MissingApiKeyCause): string {
+  return `${API_KEY_VARIABLE} is a missing credential (${MISSING_API_KEY_CAUSE_TEXT[cause]}): it must be set and not empty, and begin ${RAW_KEY_PREFIX} unless ${BASE_URL_VARIABLE} is set`
+}
+
+/** `GH_TOKEN is a bad credential (it is shorter than 8 characters): …` (b.uqm SR-15.1), naming the variable and the rule, never the value. */
+export function badCredentialReason(variable: CheckedCredential): string {
+  return `${variable} is a bad credential (it is shorter than ${SECRET_MIN_LENGTH} characters): a secret credential that is set and not empty must be at least ${SECRET_MIN_LENGTH} characters long`
+}
+
+/** Whether a set, non-empty secret is shorter than the minimum, counted in characters (code points). */
+function isShortSecret(value: string): boolean {
+  return Array.from(value).length < SECRET_MIN_LENGTH
+}
+
+/** Why `ANTHROPIC_API_KEY` is missing, or null when it is not. An empty `ANTHROPIC_BASE_URL` counts as unset. */
+function missingApiKeyCause(key: string | undefined, baseUrl: string | undefined): MissingApiKeyCause | null {
+  if (key === undefined) return 'unset'
+  if (key === '') return 'empty'
+  const baseUrlSet = baseUrl !== undefined && baseUrl !== ''
+  return !baseUrlSet && !key.startsWith(RAW_KEY_PREFIX) ? 'not-raw-key' : null
+}
+
+/**
+ * Validation stage 8, the credentials (b.uqm SR-15.1, SR-2.6), over the
+ * runner's environment: `ANTHROPIC_API_KEY` missing (unset, empty, or not
+ * beginning `sk-ant-` while `ANTHROPIC_BASE_URL` is unset), else bad (shorter
+ * than the minimum); then `GH_TOKEN` bad when set, not empty and shorter than
+ * the minimum. At most one failure per variable, missing before bad. Pure.
+ */
+export function checkCredentials(env: ChildEnvironmentSource): CredentialFailure[] {
+  const failures: CredentialFailure[] = []
+  const key = env[API_KEY_VARIABLE]
+  const cause = missingApiKeyCause(key, env[BASE_URL_VARIABLE])
+  if (cause !== null) failures.push({ kind: 'missing', variable: API_KEY_VARIABLE, reason: missingApiKeyReason(cause) })
+  else if (key !== undefined && isShortSecret(key)) failures.push({ kind: 'bad', variable: API_KEY_VARIABLE, reason: badCredentialReason(API_KEY_VARIABLE) })
+  const ghToken = env[GH_TOKEN_VARIABLE]
+  if (ghToken !== undefined && ghToken !== '' && isShortSecret(ghToken)) {
+    failures.push({ kind: 'bad', variable: GH_TOKEN_VARIABLE, reason: badCredentialReason(GH_TOKEN_VARIABLE) })
+  }
+  return failures
+}
+
+// The stage driver (b.uqm SR-2.6; step 2 of SR-5.3). Validation stops at the
+// first stage that finds a failure: its first failure is the refusal's
+// summary and each other failure of that stage one detail line, in the
+// stage's order. A worktree read that fails is a refusal too, its one-line
+// read error the summary; a missing `tests/integration` is an empty listing,
+// so stage 4 refuses the missing test-1.
+
+/** A run that passed every validation stage (b.uqm SR-2.6, SR-3.4): what step 2 hands to the rest of the run sequence (E4, E8, E12, E13). */
+export interface ValidatedRun {
+  /** The parsed `/ci` arguments. */
+  readonly invocation: Invocation
+  /** The run's kind (b.uqm SR-2.5, SR-6.2). */
+  readonly kind: RunKind
+  /** The selection: none for a full run, else the selected scripts in canonical order. */
+  readonly selection: ScriptSelection
+  /** The script list: every script in `tests/integration`, in canonical order. */
+  readonly scripts: readonly Script[]
+  /** Each script's direct prerequisites, one entry per script (stage 6). */
+  readonly prerequisites: PrerequisiteMap
+  /** The run's scripts, in canonical order (b.uqm Terms). */
+  readonly runScripts: readonly Script[]
+  /** The run's scheduling units, in order (b.uqm SR-3.4). */
+  readonly units: readonly SchedulingUnit[]
+  /** The requested N: `--shards`' value, else `MAX_SHARDS` (b.uqm SR-3.4). */
+  readonly requestedShards: number
+  /** The effective N (b.uqm SR-3.4). */
+  readonly effectiveShards: number
+}
+
+/** The driver's outcome: the validated run, or the refusal step 2 records. */
+export type RunValidation =
+  | {
+      readonly ok: true
+      readonly validated: ValidatedRun
+    }
+  | {
+      readonly ok: false
+      readonly refusal: Refusal
+    }
+
+/** A failing stage's refusal (b.uqm SR-2.6, SR-5.8): no kind, the first failure's reason as the summary, each other one a detail line in order. */
+export function stageRefusal(failures: readonly StageFailure[]): Refusal {
+  const [first, ...rest] = failures
+  if (first === undefined) throw new Error('stageRefusal: a stage refused with no failure')
+  return buildRefusal(
+    null,
+    first.reason,
+    rest.map((failure) => failure.reason),
+  )
+}
+
+/** The error of a script whose text could not be read, naming its path. */
+export function scriptReadFailedText(path: string, error: string): string {
+  return `reading the script ${shownArgument(path)} failed: ${error}`
+}
+
+/** `tests/integration` listed by T1's reader, a missing directory (or worktree) giving an empty listing; any other failure stays one. */
+function readDiscoveryEntries(worktreeRoot: string): DepRead<readonly IntegrationEntry[]> {
+  const read = readIntegrationEntries(worktreeRoot)
+  if (read.ok) return read
+  try {
+    lstatSync(join(worktreeRoot, INTEGRATION_DIR_PATH))
+  } catch (err) {
+    if (errnoCode(err) === 'ENOENT') return { ok: true, value: [] }
+  }
+  return read
+}
+
+/** Every script's text read once and parsed for stage 6 (b.uqm SR-3.1), in the list's order; the first read that fails ends it. */
+function readPrerequisiteParses(worktreeRoot: string, scripts: readonly Script[]): DepRead<readonly PrerequisiteParse[]> {
+  const dirPath = join(worktreeRoot, INTEGRATION_DIR_PATH)
+  const parses: PrerequisiteParse[] = []
+  for (const script of scripts) {
+    const path = join(dirPath, script.fileName)
+    const text = readTextFile(path)
+    if (!text.ok) return { ok: false, error: scriptReadFailedText(path, text.error) }
+    parses.push(parsePrerequisiteLines(script.fileName, text.value))
+  }
+  return { ok: true, value: parses }
+}
+
+/**
+ * Validation, step 2 of the run sequence (b.uqm SR-2.6, SR-5.3): stage 1, the
+ * arguments (`argumentStage`); the worktree's `tests/integration` read afresh
+ * under `worktreeRoot`; stages 2 to 5 over its entries; stage 6 over every
+ * script's header, in a full or a selective run alike (b.uqm SR-3.1); then the
+ * run's scripts, the units and the effective N; stage 7 against them; stage 8
+ * over `env`. No stage after the first failing one is evaluated. Spawns
+ * nothing and writes nothing.
+ */
+export function validateRun(args: readonly string[], worktreeRoot: string, env: ChildEnvironmentSource): RunValidation {
+  const refused = (refusal: Refusal): RunValidation => ({ ok: false, refusal })
+  const argumentsChecked = argumentStage(args)
+  if (!argumentsChecked.ok) return refused(argumentsChecked.refusal)
+  const invocation = argumentsChecked.invocation
+
+  const entries = readDiscoveryEntries(worktreeRoot)
+  if (!entries.ok) return refused(buildRefusal(null, entries.error))
+  for (const check of [checkScriptNames, checkDuplicateNumbers, checkMissingTest1]) {
+    const failures = check(entries.value)
+    if (failures.length > 0) return refused(stageRefusal(failures))
+  }
+  const scripts = scriptListOf(entries.value)
+
+  const selected = selectScripts(invocation.scripts, scripts)
+  if (!selected.ok) return refused(stageRefusal(selected.failures))
+
+  const parses = readPrerequisiteParses(worktreeRoot, scripts)
+  if (!parses.ok) return refused(buildRefusal(null, parses.error))
+  const headers = checkPrerequisiteHeaders(scripts, parses.value)
+  if (!headers.ok) return refused(stageRefusal(headers.failures))
+
+  const runScripts = runScriptsOf(selected.selection, scripts, headers.prerequisites)
+  const units = schedulingUnits(runScripts, headers.prerequisites)
+  const requestedShards = invocation.shards ?? MAX_SHARDS
+  const effectiveShards = effectiveShardCount(requestedShards, units.length)
+
+  const faultFailures = checkFaults(invocation.givenFaults, scripts, runScripts, effectiveShards)
+  if (faultFailures.length > 0) return refused(stageRefusal(faultFailures))
+
+  const credentialFailures = checkCredentials(env)
+  if (credentialFailures.length > 0) return refused(stageRefusal(credentialFailures))
+
+  return {
+    ok: true,
+    validated: {
+      invocation,
+      kind: runKindOf(invocation),
+      selection: selected.selection,
+      scripts,
+      prerequisites: headers.prerequisites,
+      runScripts,
+      units,
+      requestedShards,
+      effectiveShards,
+    },
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 8. Scheduling (E4)
 // ---------------------------------------------------------------------------
@@ -5157,16 +5484,16 @@ export const STOPPED_AFTER_VALIDATION_TEXT =
 /**
  * The run sequence from step 2 on (b.uqm SR-5.3), once step 1 is done.
  * Answers main's exit status. A refusal is recorded by `recordRefusal` as the
- * run's last act. E2 adds validation stages 2–8 after stage 1; E13 replaces
- * the stop after validation with steps 3–13.
+ * run's last act. Step 2 is E2's `validateRun`, over the worktree at
+ * `deps.worktreeRoot` and the runner's environment; E13 replaces the stop
+ * after validation with steps 3–13.
  */
 export async function runSequence(deps: RunnerDeps, run: RunContext): Promise<number> {
-  // Step 2, validation stage 1: the arguments (b.uqm SR-2.6).
-  const stage = argumentStage(run.args)
-  if (!stage.ok) return recordRefusal(run, stage.refusal)
-  // E2: validation stages 2–8 go here, each refusing through `recordRefusal`;
-  // they read the worktree through `deps.worktreeRoot` (E1 uses no member of
-  // `deps` here).
+  // Step 2: validation stages 1–8, the run's scripts, the units and the
+  // effective N (b.uqm SR-2.6, SR-3.4). It spawns nothing and touches no
+  // docker, lock, cgroup or reservation.
+  const validation = validateRun(run.args, deps.worktreeRoot, deps.env)
+  if (!validation.ok) return recordRefusal(run, validation.refusal)
   // E1's stop after validation. E13 replaces it, from here on, with steps
   // 3–13. Until then a valid invocation touches no docker, lock, cgroup or
   // reservation: it writes one error line to the runner log and exits 1.

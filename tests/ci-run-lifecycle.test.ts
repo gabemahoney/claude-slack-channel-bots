@@ -88,6 +88,7 @@ import {
   parseUtcTimeMs,
   PRUNE_ALREADY_RUNNING_TEXT,
   pruneUntaggedImages,
+  RAW_KEY_PREFIX,
   readContainerInspection,
   readContainerLogs,
   readRunnerLogFirstLine,
@@ -172,8 +173,6 @@ describe('E1: ci-run lifecycle', () => {
   const OWNER: Owner = { runId: RUN_ID, pid: RUNNER_PID }
   const [TEST_ROLE, DRIFT_ROLE, RETAG_ROLE] = RUN_TAG_ROLES
   const MS_PER_MINUTE = 60_000
-  /** Test data, not a runner constant: the raw Anthropic key's prefix (b.uqm SR-15.1), as tests/ci-run-interface.test.ts builds the key. */
-  const RAW_KEY_PREFIX = 'sk-ant-'
 
   let roots: string[] = []
   let recorders: SpawnRecorder[] = []

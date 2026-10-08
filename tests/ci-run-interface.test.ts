@@ -86,6 +86,7 @@ import {
   PRUNE_ALREADY_RUNNING_TEXT,
   PRUNE_RETRIES,
   PRUNE_RETRY_INTERVAL_MS,
+  RAW_KEY_PREFIX,
   REAL_PASSWORD_FILE,
   REDACTION_PLACEHOLDER,
   REFUSAL_EXIT_STATUS,
@@ -790,14 +791,6 @@ describe('canonical order (b.uqm SR-3.3)', () => {
 // Child process environments, the secret set and the token lookup (b.uqm SR-15.4, SR-15.1)
 // ---------------------------------------------------------------------------
 
-/**
- * Test data, not a runner constant: the raw Anthropic key's prefix (b.uqm
- * SR-15.1). The runner exports no constant for it yet; E2 (t1.t6s.sy), which
- * validates credentials, adds one, and this local const is then replaced by
- * that import.
- */
-const RAW_KEY_PREFIX = 'sk-ant-'
-
 /** Fake credentials, each with its own suffix (b.uqm SR-21.2). */
 function credentials(): { rawKey: string; gatewayKey: string; ghToken: string; baseBuildToken: string; tooShort: string; shardKey: string } {
   return {
@@ -1154,6 +1147,8 @@ const CONSTANT_PINS: readonly (readonly [string, unknown, unknown])[] = [
   // No PRD or SRD value: the runner's choice for the files it writes, owner-only.
   ['WRITTEN_FILE_MODE', WRITTEN_FILE_MODE, 0o600],
   ['SIGNAL_EXIT_STATUS_BASE', SIGNAL_EXIT_STATUS_BASE, 128],
+  // Credentials.
+  ['RAW_KEY_PREFIX', RAW_KEY_PREFIX, 'sk-ant-'],
 ]
 
 /** The banner that opens the runner's section 3; every constant this block pins is exported above it. */
