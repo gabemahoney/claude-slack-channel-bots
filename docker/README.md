@@ -794,6 +794,133 @@ Each shard runs its assigned scripts in its own container, started with set
 limits and mounts, normally from the run's pinned test image, and its run
 removes the container only after its final reading.
 
+**Name, labels and image.** Shard k's container is
+`cscb-ci-<RUN_ID>-<PID>-s<k>`. The RUN_ID and the runner's PID together make
+the name unique to its run, so the shards of concurrent runs never share a
+name. Its labels are `cscb-ci=1` and `cscb-ci-owner=<RUN_ID>-<PID>`; a
+container also carries its image's labels, so it holds the owner label from
+its image too.
+
+A shard starts from the run's pinned image ID, never a tag, with
+`--pull never`, so Docker never pulls. The one exception is the shard an
+`image-drift:<k>` fault names: it starts from the drift image when that
+image's build succeeded, and from the pinned ID when it did not (see
+[The run's images and tags](#the-runs-images-and-tags), and the fault in
+[`tests/README.md`](../tests/README.md#fault-injection)).
+
+**Limits.** Every shard's `docker run` sets:
+
+| Flag | Value | Why |
+|---|---|---|
+| `--memory` | The per-shard memory cap, in bytes | Each shard is held to the cap admission counted it at (see [The per-shard memory cap and out-of-memory kills](#the-per-shard-memory-cap-and-out-of-memory-kills) for its value and rules) |
+| `--memory-swap` | The same as `--memory` | No swap above the cap: past it the kernel kills a process inside the container instead of swapping |
+| `--pids-limit` | `2048` | Stops a fork or spawn loop inside one shard long before it reaches the host |
+| `--cpus` | `2` | The CPUs admission reserves per shard (see [Admission: memory, disk and CPU](#admission-memory-disk-and-cpu) for the CPU budget) |
+
+**Isolation.** A shard is on the default network only. No list sets
+`--network`, `--privileged`, or a PID, IPC or network namespace shared with
+the host or another container. No list sets `--rm` either: a shard never
+removes itself, and only the runner removes it, after its final reading.
+
+**Mounts.** Each mount is a `--mount type=bind,...`, never `-v`, so Docker
+never creates a missing source: every source is a file or directory the
+runner made. There are exactly two:
+
+| Source | Target | Mode |
+|---|---|---|
+| The run's tarball | `/tmp/package.tgz`, the path test-1 installs from | Read-only |
+| The shard's subdirectory, `shard-<k>` in the run directory (created 0700 before any docker command) | `/test-results` | Read-write |
+
+Only a `leak:<k>,<j>` fault adds a mount: shard k's subdirectory, read-only,
+at `/leak-shard-<k>` in shard j (see
+[`tests/README.md`](../tests/README.md#fault-injection)).
+
+**Credentials.** The list names `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` and
+`ANTHROPIC_MODEL` by bare name only (`--env <NAME>`), so Docker copies each
+that is set from the runner's environment. No other variable reaches a shard,
+and `GH_TOKEN` never does (see
+[Credential env vars passed to the container](#credential-env-vars-passed-to-the-container)).
+
+Each list is checked for secrets first, then written to the runner log as one
+`docker run: <JSON>` line, then spawned. A list that passes `ANTHROPIC_API_KEY`
+or `GH_TOKEN` as `NAME=value`, or holds a secret value anywhere, is never
+logged or spawned, and its shard fails to start; the refusal names the
+argument's place and the credential's name, never its value.
+
+**Inspection.** Right after a shard starts, the runner reads its inspection
+data: name, image ID, mounts, network, PID and IPC modes, the privileged
+flag, the limits, the labels and the self-removal setting, never its
+environment. A failed read is tried once more 1 s later; when that fails
+too, the shard has no inspection data and keeps the error. A shard that never
+started is not inspected and records `container never started`.
+
+**The final reading.** Before the runner stops or removes a shard's
+container, it takes one final reading of it:
+
+| Part | Read from |
+|---|---|
+| `State.OOMKilled` | Docker's container state |
+| The kill count | `oom_kill` in the container cgroup's `memory.events` |
+| `anon` and `file` | The container cgroup's `memory.stat` |
+
+A part that cannot be read is recorded `unreadable`, with one runner-log line
+`shard-<k>: final reading: <what> unreadable: <error>`. The reading feeds the
+shard's anon peak and out-of-memory status (see
+[The per-shard memory cap and out-of-memory kills](#the-per-shard-memory-cap-and-out-of-memory-kills)).
+
+**Retirement.** A shard ends at its end marker, at its wall-time limit, by a
+`kill:` fault, by a run-level stop (the memory watchdog, the run deadline or
+an interrupt), or when its container exits on its own. Every way follows the
+same order, each step after the one before:
+
+1. The final reading, taken once per shard.
+2. SIGKILL, only while that reading shows the container running, or when
+   whether it runs is unreadable and it did not exit on its own.
+3. Its Docker logs saved as `docker.log` in its subdirectory.
+4. Its removal, never forced.
+
+There is no graceful stop: the in-container runner is the container's PID 1
+and ignores SIGTERM, so SIGTERM is never sent. A failed SIGKILL or log save is
+written to the runner log, and the removal still follows. A shard retired at
+its limit whose `result.txt` already holds its end marker is retired at its
+end marker instead, never as over its limit.
+
+**Why shards stay running after their end marker.** A container's cgroup,
+and with it the kill count and `anon`, exists only while the container runs;
+`State.OOMKilled` lasts until it is removed. So a shard that wrote its end
+marker is left running until its final reading: at the run's next 30 s
+sample at the latest, sooner when a 1 s fault poll or its limit timer finds
+the marker. The cost is up to 30 s of wall time per shard.
+
+**Edge cases.**
+
+- **Exited on its own.** Its cgroup is gone, so its reading takes what can
+  still be read, normally `State.OOMKilled`; the cgroup parts are
+  `unreadable`. It gets no SIGKILL.
+- **Never created.** A shard whose container was never created, or not yet
+  created when a run-level stop came, has no final reading and no docker
+  operation; its `container failed to start` line, or the stop, stands.
+- **Name in use.** Docker refuses the `docker run` because another container
+  holds the name. The shard fails to start, this run created no container
+  for it, and the collision is recorded.
+- **Created but never started.** A failed `docker run` that left a container
+  of this run (found by one inspect by name, through the owner label) is
+  retired like any other: its reading has `State.OOMKilled` and unreadable
+  cgroup parts, then no SIGKILL, `docker.log`, removal. When Docker knows no
+  such container at its reading, the runner logs
+  `shard-<k>: its container failed to start and Docker knows no container <name>: no final reading and nothing to retire`.
+- **Gone at retirement.** A started shard whose container Docker no longer
+  knows keeps an all-`unreadable` reading; its log save and removal count as
+  already done.
+- **Removal fails.** The runner logs
+  `removing container <name> (<id>) failed: <error>`, where ` (<id>)` appears
+  only when the container has an ID (a created-but-never-started container
+  may have none), and the line is listed among the run's cleanup failures.
+
+The only removal without a final reading is a later run's sweep, which
+removes the containers of a run whose runner died (see
+[The admission lock, reservations and the sweep](#the-admission-lock-reservations-and-the-sweep)).
+
 ### The run's images and tags
 
 Each admitted run builds its own test image, marks it with its owner label and

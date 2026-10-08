@@ -11373,6 +11373,919 @@ export async function cleanupRunImages(context: RunImageCleanupContext, state: R
 // 13. Shard containers (E9)
 // ---------------------------------------------------------------------------
 
+// --- 13/T1 (E9 T1): shard names, labels, subdirectories and canaries; the docker run argument list, its secret check and the start ---
+//
+// Everything needed to start one shard container (b.uqm SR-10.1 to SR-10.4,
+// and E9's parts of SR-11.2, SR-11.3 and SR-14.2). The list is built by a pure
+// builder from the run's facts (E13 passes E4's assignment, E8's pinned and
+// drift image IDs and the tarball path, E12's `--fail` names and the
+// normalized faults); E9 itself decides only which shard gets a leak mount and
+// which starts from the drift image. Each list is checked for secrets through
+// `runContainer`'s check slot, which runs before the list is logged, so a
+// refused list is never logged verbatim or spawned. Randomness comes only from
+// `RunnerDeps.randomBytes` (b.uqm SR-1.3).
+//
+// Fixed here:
+// - the image is always given by its ID, never a tag, with `--pull never`, so
+//   Docker never pulls (as `containerCreateArgs` does);
+// - mounts are `--mount type=bind,...`, never `-v`: Docker never creates a
+//   missing source, so every source is a directory or file the runner made;
+// - the image's entrypoint is not overridden: the in-container runner's
+//   arguments follow the image ID as the container's command;
+// - a name in use is read from Docker's own conflict refusal of the
+//   `docker run`, so no listing races the start; a shard so refused has no
+//   container of this run.
+
+/** The mark between the owner and k in a shard container's name, `cscb-ci-<RUN_ID>-<PID>-s<k>` (b.uqm SR-10.1). */
+export const SHARD_CONTAINER_NAME_SHARD_MARK = '-s'
+/** The variables each shard's `docker run` names by bare name, `--env <NAME>`, and no other (b.uqm SR-10.4). */
+export const SHARD_ENV_NAMES = ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL'] as const
+/** The secret credentials by name: never passed to a shard as `NAME=value` (b.uqm SR-10.4, SR-15.1). The base-build token has no variable of its own here; its value is checked like every secret value. */
+export const SECRET_CREDENTIAL_NAMES = ['ANTHROPIC_API_KEY', 'GH_TOKEN'] as const
+/** The in-container runner's option that names a script to fail, as `--fail <file name>` pairs (b.uqm SR-11.2, SR-14.1). */
+export const RUNNER_FAIL_OPTION = '--fail'
+/** The random bytes drawn for one canary: two hex characters each (b.uqm SR-11.3). */
+export const CANARY_BYTES = CANARY_LENGTH / 2
+/** The most draws for one shard's canary before its start fails: a draw that repeats another shard's canary, or that the random source cannot give, is drawn again (b.uqm SR-11.3). */
+export const CANARY_MAX_DRAWS = 16
+/** The text of Docker's refusal of a container name another container holds: `Conflict. The container name "/<name>" is already in use by container "<id>"` (b.uqm SR-13.2 check 8). */
+export const DOCKER_NAME_IN_USE_TEXT = 'is already in use'
+/** A canary: exactly `CANARY_LENGTH` lowercase hexadecimal characters (b.uqm SR-11.2, SR-11.3). */
+const SHARD_CANARY_PATTERN = /^[0-9a-f]+$/
+/** A character that cannot stand inside one field of a `--mount` value (its fields are comma-separated, CSV-quoted). */
+const MOUNT_FIELD_UNSAFE_PATTERN = /[,"\u0000-\u001f\u007f]/
+
+/** Shard k's container name, `cscb-ci-<RUN_ID>-<PID>-s<k>`: two owners never give one name (b.uqm SR-10.1). */
+export function shardContainerName(owner: Owner, shard: number): string {
+  return `${CI_CONTAINER_NAME_PREFIX}-${formatOwner(owner)}${SHARD_CONTAINER_NAME_SHARD_MARK}${shard}`
+}
+
+/** A shard container's two labels, `cscb-ci=1` and `cscb-ci-owner=<RUN_ID>-<PID>`, in that order (b.uqm SR-10.1). */
+export function shardContainerLabels(owner: Owner): DockerLabels {
+  return {
+    [CI_LABEL]: CI_LABEL_VALUE,
+    [OWNER_LABEL]: formatOwner(owner),
+  }
+}
+
+/** Shard k's subdirectory of the run directory, `<run directory>/shard-<k>` (b.uqm SR-5.9). */
+export function shardSubdirectoryPath(runDir: string, shard: number): string {
+  return join(runDir, `${SHARD_DIR_PREFIX}${shard}`)
+}
+
+/**
+ * Creates shard k's subdirectory in the run directory, mode exactly 0700
+ * whatever the umask (b.uqm SR-5.9, SR-11.3): one `mkdir`, never recursive.
+ * A directory already there (not a link) is kept and set to 0700, so a leak
+ * source can be prepared ahead of its own shard's start; anything else at the
+ * path, or any other failure, is a failure on one line. Its path, or the failure.
+ */
+export function prepareShardSubdirectory(runDir: string, shard: number): DepRead<string> {
+  const path = shardSubdirectoryPath(runDir, shard)
+  try {
+    try {
+      mkdirSync(path, { mode: RUN_DIR_MODE })
+    } catch (err) {
+      if (errnoCode(err) !== 'EEXIST') throw err
+      const stats = lstatSync(path)
+      if (!stats.isDirectory() || stats.isSymbolicLink()) return { ok: false, error: `${shownArgument(path)} exists and is not a directory` }
+    }
+    chmodSync(path, RUN_DIR_MODE)
+    return { ok: true, value: path }
+  } catch (err) {
+    return { ok: false, error: dependencyErrorText(err) }
+  }
+}
+
+/** Whether a text is a canary: `CANARY_LENGTH` lowercase hexadecimal characters. */
+function isShardCanary(text: string): boolean {
+  return text.length === CANARY_LENGTH && SHARD_CANARY_PATTERN.test(text)
+}
+
+/** Bytes as lowercase hexadecimal. */
+function lowercaseHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+/**
+ * One shard's canary (b.uqm SR-11.3): `CANARY_BYTES` random bytes from the
+ * injected source as `CANARY_LENGTH` lowercase hex characters, different from
+ * every canary in `taken`. A draw that repeats one, that gives the wrong
+ * number of bytes or that throws is drawn again, at most `CANARY_MAX_DRAWS`
+ * times in all; then a failure on one line.
+ */
+export function drawShardCanary(randomBytes: RunnerDeps['randomBytes'], taken: Iterable<string>): DepRead<string> {
+  const used = new Set(taken)
+  let lastError = 'every draw repeated another shard canary'
+  for (let draw = 0; draw < CANARY_MAX_DRAWS; draw++) {
+    let bytes: Uint8Array
+    try {
+      bytes = randomBytes(CANARY_BYTES)
+    } catch (err) {
+      lastError = `the random source failed: ${dependencyErrorText(err)}`
+      continue
+    }
+    const canary = lowercaseHex(bytes)
+    if (!isShardCanary(canary)) {
+      lastError = `the random source gave ${bytes.length} bytes, not ${CANARY_BYTES}`
+      continue
+    }
+    if (!used.has(canary)) return { ok: true, value: canary }
+  }
+  return { ok: false, error: `no canary could be drawn in ${CANARY_MAX_DRAWS} draws: ${lastError}` }
+}
+
+/** A run's canary source: each draw differs from every canary it gave before, so the shards of one run never share one, whatever order their starts run in. */
+export interface ShardCanaryDrawer {
+  /** A new canary, different from every one drawn before, or a failure on one line. */
+  draw(): DepRead<string>
+  /** Every canary drawn so far, in order. */
+  drawn(): readonly string[]
+}
+
+/** Builds a run's canary source over the injected random source (`RunnerDeps.randomBytes`); E13 builds one per run. */
+export function createShardCanaryDrawer(randomBytes: RunnerDeps['randomBytes']): ShardCanaryDrawer {
+  const drawn: string[] = []
+  return {
+    draw() {
+      const canary = drawShardCanary(randomBytes, drawn)
+      if (canary.ok) drawn.push(canary.value)
+      return canary
+    },
+    drawn: () => [...drawn],
+  }
+}
+
+/**
+ * The image shard k starts from (b.uqm SR-10.2, SR-14.2): the drift image's
+ * ID for the shard `image-drift:<k>` names when its build succeeded
+ * (`driftImageId` not null); the pinned ID for every other shard, and for that
+ * one when the drift build failed or did not run. The fault's not-fired
+ * reason is E12's.
+ */
+export function shardImageId(faults: readonly Fault[], shard: number, pinnedImageId: string, driftImageId: string | null): string {
+  const drifts = faults.some((fault) => fault.kind === 'image-drift' && fault.shard === shard)
+  return drifts && driftImageId !== null ? driftImageId : pinnedImageId
+}
+
+/** Shard j's leak mounts (b.uqm SR-10.3, SR-14.2): for each `leak:<k>,<j>`, shard k's subdirectory, read-only, at `/leak-shard-<k>`, in fault order. None for any other shard. */
+export function shardLeakMounts(faults: readonly Fault[], runDir: string, shard: number): ShardMount[] {
+  const mounts: ShardMount[] = []
+  for (const fault of faults) {
+    if (fault.kind !== 'leak' || fault.targetShard !== shard) continue
+    mounts.push({ source: shardSubdirectoryPath(runDir, fault.sourceShard), target: leakMountTarget(fault.sourceShard), readOnly: true })
+  }
+  return mounts
+}
+
+/** Shard k's mounts (b.uqm SR-10.3): the run's tarball, read-only, at `/tmp/package.tgz`; its own subdirectory at `/test-results`; then its leak mounts. */
+export function shardMounts(faults: readonly Fault[], runDir: string, shard: number, tarballPath: string): ShardMount[] {
+  return [
+    { source: tarballPath, target: INTEGRITY_TARBALL_MOUNT_TARGET, readOnly: true },
+    { source: shardSubdirectoryPath(runDir, shard), target: INTEGRITY_RESULTS_MOUNT_TARGET, readOnly: false },
+    ...shardLeakMounts(faults, runDir, shard),
+  ]
+}
+
+/** Stops the builder: shard k's inputs cannot make a valid list. */
+function refuseShardInput(reason: string): never {
+  throw new Error(reason)
+}
+
+/** A shard number: a whole number of at least 1 (b.uqm SR-11.2). */
+function shardNumberOperand(shard: number): string {
+  if (!Number.isSafeInteger(shard) || shard < 1) refuseShardInput(`not a shard number: ${String(shard)}`)
+  return String(shard)
+}
+
+/**
+ * The in-container runner's arguments, in b.uqm SR-11.2's order: the shard
+ * number, the canary, one `--fail <file name>` pair per given name in the
+ * given order, then the assigned scripts' file names in run order (test-1
+ * first, as E4's assignment holds them). Refuses (throws) arguments the
+ * in-container runner would find malformed: a bad shard number or canary, an
+ * assigned name not of the script form or given twice, or a `--fail` name not
+ * among the assigned scripts or given twice.
+ */
+export function shardRunnerArguments(shard: number, canary: string, failFileNames: readonly string[], assigned: readonly string[]): string[] {
+  const shardText = shardNumberOperand(shard)
+  if (!isShardCanary(canary)) refuseShardInput(`shard-${shardText}'s canary is not ${CANARY_LENGTH} lowercase hexadecimal characters`)
+  if (assigned.length === 0) refuseShardInput(`shard-${shardText} has no assigned script`)
+  for (const [index, fileName] of assigned.entries()) {
+    if (!SCRIPT_FILE_NAME_PATTERN.test(fileName)) refuseShardInput(`shard-${shardText}'s assigned ${shownArgument(fileName)} is not a script file name`)
+    if (assigned.indexOf(fileName) !== index) refuseShardInput(`shard-${shardText} is assigned ${fileName} twice`)
+  }
+  const fails: string[] = []
+  for (const [index, fileName] of failFileNames.entries()) {
+    if (!assigned.includes(fileName)) refuseShardInput(`shard-${shardText}'s ${RUNNER_FAIL_OPTION} ${shownArgument(fileName)} is not among its assigned scripts`)
+    if (failFileNames.indexOf(fileName) !== index) refuseShardInput(`shard-${shardText}'s ${RUNNER_FAIL_OPTION} names ${fileName} twice`)
+    fails.push(RUNNER_FAIL_OPTION, fileName)
+  }
+  return [shardText, canary, ...fails, ...assigned]
+}
+
+/** One bind mount as a `--mount` value: `type=bind,source=<path>,target=<path>`, with `,readonly` when read-only. Refuses a relative path or one a `--mount` field cannot hold. */
+function bindMountValue(mount: ShardMount): string {
+  for (const path of [mount.source, mount.target]) {
+    if (!isAbsolute(path)) refuseShardInput(`a mount path is not absolute: ${shownArgument(path)}`)
+    if (MOUNT_FIELD_UNSAFE_PATTERN.test(path)) refuseShardInput(`a mount path holds a comma, a quote or a control character: ${JSON.stringify(path)}`)
+  }
+  return `type=bind,source=${mount.source},target=${mount.target}${mount.readOnly ? ',readonly' : ''}`
+}
+
+/** What shard k's list is built from: the run's facts as E13 passes them, and its canary. */
+export interface ShardRunPlanInput {
+  readonly owner: Owner
+  /** The run directory, which holds each `shard-<k>` subdirectory. */
+  readonly runDir: string
+  /** k, from 1. */
+  readonly shard: number
+  /** Its assigned scripts' file names in run order, test-1 first (`ShardAssignment.assigned`). */
+  readonly assigned: readonly string[]
+  readonly canary: string
+  /** Its `--fail` file names in order (E12's `shardFailFileNames`, or the fault controller's `failFileNames(k)`). */
+  readonly failFileNames: readonly string[]
+  /** The run's normalized faults (`Invocation.faults`): E9 reads only `leak:` and `image-drift:` from them. */
+  readonly faults: readonly Fault[]
+  /** The pinned image ID (b.uqm SR-9.4). */
+  readonly pinnedImageId: string
+  /** The drift image's ID when its build succeeded; null when it failed or was not built. */
+  readonly driftImageId: string | null
+  /** The run's tarball, an absolute path in `package/` (b.uqm SR-9.1). */
+  readonly tarballPath: string
+}
+
+/** Shard k's list and what it was built from. */
+export interface ShardRunPlan {
+  /** Its container name. */
+  readonly name: string
+  /** The image ID it starts from: the pinned ID, or the drift image's. */
+  readonly imageId: string
+  /** Its mounts, in list order: the tarball, its subdirectory, then its leak mounts. */
+  readonly mounts: readonly ShardMount[]
+  /** The in-container runner's arguments (b.uqm SR-11.2). */
+  readonly runnerArguments: readonly string[]
+  /** The arguments after `docker run --detach`, as `runContainer` takes them. */
+  readonly runArguments: readonly string[]
+}
+
+/**
+ * Shard k's `docker run` arguments after `docker run --detach`, a pure
+ * builder (b.uqm SR-10.1 to SR-10.4, SR-11.2, SR-14.2), in this order:
+ * `--pull never`; `--name` and the two labels; `--memory` and
+ * `--memory-swap` both at the cap in bytes, `--pids-limit`, `--cpus`; the
+ * `--mount`s; `--env` for each of `SHARD_ENV_NAMES`, bare; the image ID; the
+ * in-container runner's arguments. Nothing sets a network (the default only),
+ * `--privileged`, a PID, IPC or network namespace, `--rm`, an entrypoint, an
+ * env file or any other variable. Throws on inputs that cannot make a valid
+ * list (an image that is not an ID, a bad path, name or runner argument).
+ */
+export function shardRunPlan(input: ShardRunPlanInput): ShardRunPlan {
+  const name = dockerOperand(shardContainerName(input.owner, input.shard), 'container name')
+  const imageId = imageIdOperand(shardImageId(input.faults, input.shard, input.pinnedImageId, input.driftImageId))
+  const mounts = shardMounts(input.faults, input.runDir, input.shard, input.tarballPath)
+  const runnerArguments = shardRunnerArguments(input.shard, input.canary, input.failFileNames, input.assigned)
+  const runArguments = [
+    '--pull',
+    'never',
+    '--name',
+    name,
+    ...dockerLabelArguments(shardContainerLabels(input.owner)),
+    '--memory',
+    String(SHARD_MEMORY_CAP_BYTES),
+    '--memory-swap',
+    String(SHARD_MEMORY_CAP_BYTES),
+    '--pids-limit',
+    String(SHARD_PIDS_LIMIT),
+    '--cpus',
+    String(CPUS_PER_SHARD),
+    ...mounts.flatMap((mount) => ['--mount', bindMountValue(mount)]),
+    ...SHARD_ENV_NAMES.flatMap((envName) => ['--env', envName]),
+    imageId,
+    ...runnerArguments,
+  ]
+  return { name, imageId, mounts, runnerArguments, runArguments }
+}
+
+/** Whether an argument passes `name` with a value attached: `name=` anywhere in it (`NAME=…`, `--env=NAME=…`, `-eNAME=…`), erring on the side of refusal. */
+function passesNameWithValue(arg: string, name: string): boolean {
+  return arg.includes(`${name}=`)
+}
+
+/**
+ * The `docker run` argument-list check (b.uqm SR-10.4, SR-15.2): refuses a
+ * list in which any argument passes a secret credential's name
+ * (`SECRET_CREDENTIAL_NAMES`) with a value attached, or holds any secret
+ * value (the run's secret set, `secretCredentialSet`) as a substring. The
+ * reason names the argument's place and the credential's name, never a value.
+ * Empty values are ignored.
+ */
+export function checkShardRunList(argv: readonly string[], secretValues: Iterable<string>): DockerRunListVerdict {
+  const values = [...secretValues].filter((value) => value !== '')
+  for (const [index, arg] of argv.entries()) {
+    const name = SECRET_CREDENTIAL_NAMES.find((credential) => passesNameWithValue(arg, credential))
+    if (name !== undefined) return { ok: false, reason: `the docker run argument list passes ${name} with a value in argument ${index + 1}` }
+    if (values.some((value) => arg.includes(value))) {
+      return { ok: false, reason: `the docker run argument list holds a secret credential's value in argument ${index + 1}` }
+    }
+  }
+  return { ok: true }
+}
+
+/** The check `runContainer` runs on each shard's list before it logs or spawns it: `checkShardRunList` over the run's secret values. */
+export function shardRunListCheck(secretValues: Iterable<string>): DockerRunListCheck {
+  const values = [...secretValues]
+  return (argv) => checkShardRunList(argv, values)
+}
+
+/** Whether a failed `docker run`'s error is Docker's refusal of the container name `name` as already in use. */
+export function isNameInUseError(error: string, name: string): boolean {
+  return error.includes(DOCKER_NAME_IN_USE_TEXT) && error.includes(`"/${name}"`)
+}
+
+/** What the start entry point uses: spawn, the runner's environment (passed unchanged under the child-environment rule, b.uqm SR-15.4), the worktree root as docker's working directory, and the clock. */
+export type ShardStartDeps = Pick<RunnerDeps, 'spawn' | 'env' | 'worktreeRoot' | 'clock'>
+
+/** What one shard's start takes, beyond its dependencies. */
+export interface ShardStartInput {
+  readonly owner: Owner
+  readonly runDir: string
+  /** Its assignment entry: k and its assigned scripts in run order. */
+  readonly assignment: Pick<ShardAssignment, 'shard' | 'assigned'>
+  /** Its `--fail` file names in order (E12). */
+  readonly failFileNames: readonly string[]
+  /** The run's normalized faults. */
+  readonly faults: readonly Fault[]
+  readonly pinnedImageId: string
+  /** The drift image's ID when its build succeeded; null otherwise. */
+  readonly driftImageId: string | null
+  /** The run's tarball, an absolute path in `package/`. */
+  readonly tarballPath: string
+  /** The run's secret credential values (`secretCredentialSet(env, { baseBuildToken })`), for the list check. */
+  readonly secretValues: Iterable<string>
+  /** The run's one canary source (`createShardCanaryDrawer(deps.randomBytes)`). */
+  readonly canaries: ShardCanaryDrawer
+  /** The runner log; `runContainer` writes the checked list to it before the spawn, and must throw when it cannot. */
+  readonly log: RunnerLogSink
+}
+
+/** One shard's start: its facts for `ShardEvidence.start` (and `ShardEvidence.canary` from `start.canary`), and its container. */
+export interface ShardStartResult {
+  /** Started or failed to start, with the image used, the mounts its list carried (leak mounts included), the name-in-use flag and the canary. */
+  readonly start: ShardStart
+  /** Whether this run created a container for the shard: always for a started one; for a failed start, one Docker left created counts. Never for a name in use. */
+  readonly containerCreated: boolean
+  /** The container's name, `cscb-ci-<RUN_ID>-<PID>-s<k>`. */
+  readonly containerName: string
+  /** The started container's full ID; null when it did not start. */
+  readonly containerId: string | null
+  /** Its inspection data (b.uqm SR-10.5), for `ShardEvidence.inspection`: null when it never started, or when both reads failed (13/T2). */
+  readonly inspection: InspectionData | null
+  /** For `ShardEvidence.inspectionError`: null with data; `container never started` when it never started; else the last failed read's error on one line (13/T2). */
+  readonly inspectionError: string | null
+  /** For `ShardEvidence.imageId`: the image ID its inspection data holds; null without data. `start.imageId` is the ID it was started from (13/T2). */
+  readonly imageId: string | null
+}
+
+/**
+ * Whether a failed `docker run` left a container of this run under `name`:
+ * one inspect by name; a container there carrying this run's owner label
+ * counts. When the inspect itself fails, the name was free at the run (no
+ * conflict), so any container under it is this run's: it counts as created,
+ * and retirement finds out.
+ */
+async function failedRunLeftContainer(docker: DockerContext, name: string, owner: Owner): Promise<boolean> {
+  const state = await inspectContainerState(docker, name)
+  if (!state.ok) return true
+  return state.value !== null && state.value.labels[OWNER_LABEL] === formatOwner(owner)
+}
+
+/**
+ * Starts shard k (b.uqm SR-10.1 to SR-10.4), E13's one call per shard in step
+ * 12: draws its canary; creates its subdirectory (and each leak source's) at
+ * 0700 before any docker command; builds its list; and starts it through
+ * `runContainer`, whose check slot refuses a list carrying a secret before it
+ * is logged or spawned. The spawn gets the runner's environment unchanged
+ * (`childEnvironment(deps.env)`), so Docker hands the container only the
+ * three `--env` names. Never throws.
+ *
+ * A failure at any step is a `failed-to-start` with a one-line detail free of
+ * any secret value, and stops there: no docker command follows a failed
+ * preparation or a refused list. A `docker run` that Docker refuses because
+ * the name is in use sets `nameInUse` and creates no container; any other
+ * failed `docker run` is followed by one inspect by name, to record whether
+ * it left a container of this run created.
+ * A started shard's inspection data is captured before it returns (13/T2).
+ */
+export async function startShard(deps: ShardStartDeps, input: ShardStartInput): Promise<ShardStartResult> {
+  const shard = input.assignment.shard
+  const containerName = shardContainerName(input.owner, shard)
+  const imageId = shardImageId(input.faults, shard, input.pinnedImageId, input.driftImageId)
+  const plannedMounts = shardMounts(input.faults, input.runDir, shard, input.tarballPath)
+  const failed = (canary: string, mounts: readonly ShardMount[], detail: string, created = false, nameInUse = false): ShardStartResult => ({
+    start: { kind: 'failed-to-start', shard, imageId, mounts, nameInUse, canary, detail },
+    containerCreated: created,
+    containerName,
+    containerId: null,
+    ...shardInspectionNeverStarted(),
+  })
+
+  const canary = input.canaries.draw()
+  if (!canary.ok) return failed('', plannedMounts, `no canary for shard-${shard}: ${canary.error}`)
+  const leakSources = input.faults.flatMap((fault) => (fault.kind === 'leak' && fault.targetShard === shard ? [fault.sourceShard] : []))
+  for (const toPrepare of [shard, ...leakSources]) {
+    const prepared = prepareShardSubdirectory(input.runDir, toPrepare)
+    if (!prepared.ok) return failed(canary.value, plannedMounts, `the subdirectory ${SHARD_DIR_PREFIX}${toPrepare} could not be created: ${prepared.error}`)
+  }
+
+  let plan: ShardRunPlan
+  try {
+    plan = shardRunPlan({
+      owner: input.owner,
+      runDir: input.runDir,
+      shard,
+      assigned: input.assignment.assigned,
+      canary: canary.value,
+      failFileNames: input.failFileNames,
+      faults: input.faults,
+      pinnedImageId: input.pinnedImageId,
+      driftImageId: input.driftImageId,
+      tarballPath: input.tarballPath,
+    })
+  } catch (err) {
+    return failed(canary.value, plannedMounts, `the docker run argument list could not be built: ${dependencyErrorText(err)}`)
+  }
+
+  const docker: DockerContext = { spawn: deps.spawn, env: childEnvironment(deps.env), cwd: deps.worktreeRoot }
+  const outcome = await runContainer(docker, plan.runArguments, shardRunListCheck(input.secretValues), input.log)
+  if (outcome.kind === 'started') {
+    return {
+      start: { kind: 'started', shard, imageId: plan.imageId, mounts: plan.mounts, nameInUse: false, canary: canary.value, startedAtMs: deps.clock.now() },
+      containerCreated: true,
+      containerName,
+      containerId: outcome.containerId,
+      ...(await captureShardInspection(deps.clock, docker, outcome.containerId)),
+    }
+  }
+  if (outcome.kind === 'refused') return failed(canary.value, plan.mounts, outcome.reason)
+  if (outcome.exitCode === null) return failed(canary.value, plan.mounts, outcome.error)
+  if (isNameInUseError(outcome.error, containerName)) return failed(canary.value, plan.mounts, outcome.error, false, true)
+  return failed(canary.value, plan.mounts, outcome.error, await failedRunLeftContainer(docker, containerName, input.owner))
+}
+
+// --- 13/T2 (E9 T2): inspection capture and the 1 s re-read ---
+//
+// Each started shard's inspection data, read right after its start, inside
+// `startShard`, so no retirement can remove the container first (b.uqm
+// SR-10.5). The read is E1's `readContainerInspection`, whose format selects
+// only SR-10.5's fields: no path here asks Docker for, holds or stores a
+// container's environment. A failed read is read once more,
+// `INSPECTION_REREAD_DELAY_MS` later on the injected clock (never a real
+// sleep); when that fails too, the shard has no data and keeps the last error
+// on one line. A shard whose container never started, one created but not
+// started included, is never inspected and records `container never started`.
+
+/** How many inspection reads a started shard gets at most: one right after its start, and one re-read `INSPECTION_REREAD_DELAY_MS` later when that fails (b.uqm SR-10.5). */
+export const INSPECTION_READ_ATTEMPTS = 2
+
+/** A shard's inspection facts for its evidence (`ShardEvidence.inspection`, `inspectionError`, `imageId`), as `startShard` returns them. */
+export type ShardInspectionCapture = Pick<ShardStartResult, 'inspection' | 'inspectionError' | 'imageId'>
+
+/**
+ * Reads a shard container's selected inspection fields (b.uqm SR-10.5)
+ * through `readContainerInspection`, by its ID or name: the parsed data, or
+ * the failure on one line. Never throws, and never reads the environment.
+ */
+export async function readShardInspection(docker: DockerContext, container: string): Promise<DepRead<InspectionData>> {
+  try {
+    const answer = await readContainerInspection(docker, container)
+    if (answer.ok) return { ok: true, value: answer.value }
+    const error = dependencyErrorText(answer.error)
+    return { ok: false, error: error !== '' ? error : `the inspection read of ${shownArgument(container)} failed with no error text` }
+  } catch (err) {
+    return { ok: false, error: `the inspection read of ${shownArgument(container)} failed: ${dependencyErrorText(err)}` }
+  }
+}
+
+/** The inspection facts of a shard whose container never started (never created, created but not started, or refused): no data, no image ID, and `container never started` (b.uqm SR-10.5, SR-16.1). */
+export function shardInspectionNeverStarted(): ShardInspectionCapture {
+  return { inspection: null, inspectionError: CONTAINER_NEVER_STARTED_TEXT, imageId: null }
+}
+
+/**
+ * Captures a started shard's inspection data (b.uqm SR-10.5): reads at once;
+ * when that read fails, waits `INSPECTION_REREAD_DELAY_MS` on the injected
+ * clock and reads once more, `INSPECTION_READ_ATTEMPTS` reads in all. The
+ * data with `inspectionError` null and `imageId` from the data; or, when every
+ * read failed, null data, a null `imageId` and the last read's error on one
+ * line. A wait the clock cannot schedule ends the capture with the first
+ * error and why. Never throws.
+ */
+export async function captureShardInspection(clock: RunnerClock, docker: DockerContext, container: string): Promise<ShardInspectionCapture> {
+  let lastError = ''
+  for (let attempt = 1; attempt <= INSPECTION_READ_ATTEMPTS; attempt++) {
+    if (attempt > 1) {
+      try {
+        await clockDelay(clock, INSPECTION_REREAD_DELAY_MS)
+      } catch (err) {
+        return { inspection: null, inspectionError: `${lastError}; the re-read could not wait: ${dependencyErrorText(err)}`, imageId: null }
+      }
+    }
+    const read = await readShardInspection(docker, container)
+    if (read.ok) return { inspection: read.value, inspectionError: null, imageId: read.value.imageId }
+    lastError = read.error
+  }
+  return { inspection: null, inspectionError: lastError, imageId: null }
+}
+
+// --- 13/T3 (E9 T3): the final reading and shard retirement ---
+//
+// How a shard is retired, never when: E13 decides when (end markers, E4's
+// limit timer, E12's `kill:`, run-level stops, end-of-run step 1) and calls
+// one run-wide retirer (`createShardRetirer`) per shard (b.uqm SR-10.6,
+// SR-5.7 step 1). Every way a shard ends follows one order, each step after
+// the one before it:
+// 1. the final reading, taken at most once per shard: Docker's state form
+//    (`State.OOMKilled`, whether it runs, its status and exit code) through
+//    `inspectContainerState`, then E6's container figures (`oom_kill`, `anon`,
+//    `file`) from its own cgroup, found through its main PID
+//    (`readContainerFigures`). Each part is recorded on its own, or as
+//    `unreadable`; nothing is interpreted (E7 judges the reading);
+// 2. SIGKILL while that reading shows it running, or when whether it runs is
+//    unreadable and it did not exit on its own (a missed kill would leave a
+//    container holding its memory); never SIGTERM, since the in-container
+//    runner is PID 1 and ignores it. A container that exited on its own, or
+//    that the reading shows not running, gets no SIGKILL;
+// 3. its Docker logs saved whole as `docker.log` in its subdirectory;
+// 4. its removal, never forced.
+// A failed step is written to the runner log, and the next steps still run.
+// A failed removal is also a cleanup failure (b.uqm SR-9.3); a container
+// Docker no longer knows counts as absent, as in E5's sweep, for both the log
+// save and the removal. A shard with no created container (never created, or
+// refused because its name was in use) has no final reading and no
+// retirement: no docker operation is made. A shard whose start failed and
+// whose container Docker does not know at its state read was never created
+// either: it has no final reading, so its `container failed to start` line
+// stands, and its retirement is `no-container` after that one read. A
+// started shard whose container vanished keeps an all-`unreadable` reading. A limit
+// retirement re-checks the result file by E4's end-marker rule first, so a
+// shard holding its end marker is never retired as over its limit (AC 54).
+
+/** Docker's `State.Status` values of a container that has exited, whose `State.ExitCode` is its exit code; a `created` container never ran and has none (b.uqm SR-10.6, SR-12.1). */
+export const EXITED_CONTAINER_STATUSES = ['exited', 'dead'] as const
+
+/** What the final reading and retirement use: spawn, the runner's environment (passed unchanged under the child-environment rule, b.uqm SR-15.4), the worktree root as docker's working directory, the clock (the reading's moment), and the cgroup reads of E6's container figures. */
+export type ShardRetirementDeps = Pick<RunnerDeps, 'spawn' | 'env' | 'worktreeRoot' | 'clock' | 'readCgroupFile' | 'readProcCgroup'>
+
+/** The shard a final reading or retirement is for: its start result as `startShard` returns it. */
+export type RetiredShard = Pick<ShardStartResult, 'start' | 'containerCreated' | 'containerName' | 'containerId'>
+
+/** Why a shard is retired (b.uqm SR-10.6): its end marker, its wall-time limit, a `kill:` fault, a run-level stop (naming which), or its container exited on its own. */
+export type RetirementReason =
+  | {
+      readonly kind: 'end-marker'
+    }
+  | {
+      readonly kind: 'limit'
+    }
+  | {
+      readonly kind: 'kill'
+    }
+  | {
+      readonly kind: 'run-level-stop'
+      readonly by: StopKind
+    }
+  | {
+      readonly kind: 'exited'
+    }
+
+/** A shard's one final reading (b.uqm SR-10.6): E1's four parts, and the container's state at that moment. */
+export interface ShardFinalReading {
+  readonly shard: number
+  /** When it was taken, epoch milliseconds (`ShardTimingRecord.finalReadingAtMs`). */
+  readonly atMs: number
+  /** `State.OOMKilled`, `oom_kill`, `anon` and `file`, each read on its own or `unreadable`. */
+  readonly final: FinalReading
+  /** Docker's `State.Status`; `unreadable` when the state could not be read or Docker knows no such container. */
+  readonly status: Reading<string>
+  /** Whether it was running at its reading: false when Docker knows no such container; `unreadable` when the state could not be read. */
+  readonly running: Reading<boolean>
+  /** `State.ExitCode` when it had exited (`EXITED_CONTAINER_STATUSES`); null while running, when created but never started, or when the state could not be read. */
+  readonly exitCode: number | null
+  /** Each part that could not be read, once, with why; each was written to the runner log. */
+  readonly failedReadings: readonly FailedReading[]
+}
+
+/** The SIGKILL step: sent, not sent (the reading showed it not running, or whether it runs is unreadable and it exited on its own), or failed (logged; never a cleanup failure). */
+export type RetirementKill =
+  | {
+      readonly kind: 'sent'
+    }
+  | {
+      readonly kind: 'not-running'
+    }
+  | {
+      readonly kind: 'failed'
+      readonly error: string
+    }
+
+/** The `docker.log` step: saved at its path, not saved because Docker knows no such container (logged; no file), or failed reading the logs or writing the file (logged). */
+export type RetirementLogSave =
+  | {
+      readonly kind: 'saved'
+      readonly path: string
+    }
+  | {
+      readonly kind: 'absent'
+    }
+  | {
+      readonly kind: 'failed'
+      readonly error: string
+    }
+
+/** The removal step: removed, already gone (no failure), or failed with its cleanup-failure line (logged and listed). */
+export type RetirementRemoval =
+  | {
+      readonly kind: 'removed'
+    }
+  | {
+      readonly kind: 'absent'
+    }
+  | {
+      readonly kind: 'failed'
+      readonly line: string
+    }
+
+/** A shard's retirement (b.uqm SR-10.6): `no-container` for a shard with no created container (no docker operation), or whose start failed and whose container Docker does not know (its state read only); else its reading and each step's outcome. `reason` is the effective reason, settled before any SIGKILL. */
+export type ShardRetirement =
+  | {
+      readonly kind: 'no-container'
+      readonly shard: number
+      readonly requested: RetirementReason
+      readonly reason: RetirementReason
+    }
+  | {
+      readonly kind: 'retired'
+      readonly shard: number
+      readonly requested: RetirementReason
+      readonly reason: RetirementReason
+      readonly reading: ShardFinalReading
+      readonly kill: RetirementKill
+      readonly logSave: RetirementLogSave
+      readonly removal: RetirementRemoval
+    }
+
+/** What a run's retirer works with. */
+export interface ShardRetirementContext {
+  readonly deps: ShardRetirementDeps
+  /** The run directory: each shard's result file and `docker.log` are in its `shard-<k>` subdirectory. */
+  readonly runDir: string
+  /** The runner log; a sink that throws loses only its line. */
+  readonly log: RunnerLogSink
+  /** The run's state: a failed removal's line is pushed to its `cleanupFailures`. */
+  readonly state: Pick<RunState, 'cleanupFailures'>
+}
+
+/** A run's one retirer, keyed by shard number: E13 builds one per run. */
+export interface ShardRetirer {
+  /** The shard's final reading: taken on the first request; every later one, while or after it is taken, gets the same answer with no new read. Null, with no docker operation, for a shard with no created container; null after its state read for a shard whose start failed and whose container Docker does not know. Never rejects. */
+  finalReading(shard: RetiredShard): Promise<ShardFinalReading | null>
+  /** Retires the shard for `reason`, in the fixed order; every later request, whatever its reason, gets the first one's retirement with no operation. Never rejects. */
+  retire(shard: RetiredShard, reason: RetirementReason): Promise<ShardRetirement>
+  /** The shard's final reading once taken; null before, and always null for a shard that has none. */
+  recordedReading(shard: number): ShardFinalReading | null
+  /** The shard's retirement once done; null before. */
+  recordedRetirement(shard: number): ShardRetirement | null
+}
+
+/** Whether a result file as read holds its end marker: a complete `done` line, E4's limit-timer rule over E1's reading rule (b.uqm SR-4.3, SR-11.3). */
+export function resultFileHoldsEndMarker(read: ResultFileRead): boolean {
+  return read.kind === 'events' && read.events.some((event) => event.kind === 'done')
+}
+
+/**
+ * The effective retirement reason (b.uqm SR-10.6, AC 54): a limit retirement
+ * of a shard whose result file (`readResultFile` in its subdirectory) holds
+ * its end marker is an end-marker retirement; every other reason stands. Only
+ * a limit retirement reads the file. Never taken from an exit code.
+ */
+export function settleRetirementReason(runDir: string, shard: number, requested: RetirementReason): RetirementReason {
+  if (requested.kind !== 'limit') return requested
+  return resultFileHoldsEndMarker(readResultFile(shardSubdirectoryPath(runDir, shard))) ? { kind: 'end-marker' } : requested
+}
+
+/** Writes one retirement line to the runner log; a sink that throws loses only this line. */
+function writeRetirementLog(log: RunnerLogSink, line: string): void {
+  try {
+    log(line)
+  } catch {
+    // The step's outcome is still recorded; the log's own failure is not the retirement's.
+  }
+}
+
+/** Whether a failed docker operation is Docker's answer that it knows no such container. */
+function isNoSuchContainer(failure: DockerFailure): boolean {
+  return failure.exitCode !== null && failure.error.includes(DOCKER_NO_SUCH_CONTAINER_TEXT)
+}
+
+/** One docker operation whose throw, if any, becomes a failure on one line. */
+async function settledDockerAnswer<T>(operation: () => Promise<DockerAnswer<T>>): Promise<DockerAnswer<T>> {
+  try {
+    return await operation()
+  } catch (err) {
+    return { ok: false, exitCode: null, error: dependencyErrorText(err) }
+  }
+}
+
+/** E6's container figures, with a throw from a reading dependency failing every figure. */
+function readFinalFigures(deps: ShardRetirementDeps, target: FiguresTarget): Pick<ContainerFigures, 'anonBytes' | 'fileBytes' | 'oomKillCount'> {
+  try {
+    return readContainerFigures(deps, target)
+  } catch (err) {
+    const failed: ReadingResult<number> = { ok: false, what: `${target.name}'s cgroup`, error: dependencyErrorText(err) }
+    return { anonBytes: failed, fileBytes: failed, oomKillCount: failed }
+  }
+}
+
+/** The container a shard's docker operations name: its full ID when it started, else its name. */
+function retiredShardContainer(shard: RetiredShard): string {
+  return shard.containerId ?? shard.containerName
+}
+
+/**
+ * Takes a shard's final reading (b.uqm SR-10.6): one state-form read, then,
+ * only when the state was read, E6's figures from its cgroup (none for a
+ * container with no main process: it exited on its own, or never started).
+ * Null for a shard whose start failed and whose container Docker does not
+ * know: it was never created, so it has no final reading. A failed state read,
+ * or Docker knowing no such container for a started shard, leaves every part
+ * `unreadable`. Never reads the environment; never throws.
+ */
+async function takeFinalReading(deps: ShardRetirementDeps, docker: DockerContext, target: RetiredShard): Promise<ShardFinalReading | null> {
+  const shard = target.start.shard
+  const name = target.containerName
+  const atMs = deps.clock.now()
+  const failedReadings: FailedReading[] = []
+  const unreadable = (what: string, error: string): Unreadable => {
+    if (!failedReadings.some((failed) => failed.what === what && failed.error === error)) failedReadings.push({ shard, what, error })
+    return UNREADABLE_READING
+  }
+  const state = await settledDockerAnswer(() => inspectContainerState(docker, retiredShardContainer(target)))
+  if (state.ok && state.value === null && target.start.kind !== 'started') return null
+  if (!state.ok || state.value === null) {
+    unreadable(`${name}'s state`, state.ok ? `Docker knows no container ${name}` : dependencyErrorText(state.error))
+    const cgroup = unreadable(`${name}'s cgroup`, state.ok ? 'the container does not exist' : 'its state could not be read, so its cgroup cannot be found')
+    return {
+      shard,
+      atMs,
+      final: { oomKilled: UNREADABLE_READING, oomKillCount: cgroup, anonBytes: cgroup, fileBytes: cgroup },
+      status: UNREADABLE_READING,
+      running: state.ok ? false : UNREADABLE_READING,
+      exitCode: null,
+      failedReadings,
+    }
+  }
+  const container = state.value
+  const figures = readFinalFigures(deps, { name, pid: container.pid })
+  const part = (reading: ReadingResult<number>): Reading<number> => (reading.ok ? reading.value : unreadable(reading.what, reading.error))
+  const exited = !container.running && (EXITED_CONTAINER_STATUSES as readonly string[]).includes(container.status)
+  return {
+    shard,
+    atMs,
+    final: { oomKilled: container.oomKilled, oomKillCount: part(figures.oomKillCount), anonBytes: part(figures.anonBytes), fileBytes: part(figures.fileBytes) },
+    status: container.status,
+    running: container.running,
+    exitCode: exited ? container.exitCode : null,
+    failedReadings,
+  }
+}
+
+/** Whether the SIGKILL step sends: the reading shows the container running, or whether it runs is unreadable and the effective reason is not that it exited on its own. */
+export function retirementSendsKill(running: Reading<boolean>, reason: RetirementReason): boolean {
+  return running === true || (running === UNREADABLE_READING && reason.kind !== 'exited')
+}
+
+/** The SIGKILL step (`retirementSendsKill`); a failed kill is logged, never a cleanup failure. */
+async function retirementKill(docker: DockerContext, log: RunnerLogSink, target: RetiredShard, reading: ShardFinalReading, reason: RetirementReason): Promise<RetirementKill> {
+  if (!retirementSendsKill(reading.running, reason)) return { kind: 'not-running' }
+  const killed = await settledDockerAnswer(() => killContainer(docker, retiredShardContainer(target), 'SIGKILL'))
+  if (killed.ok) return { kind: 'sent' }
+  writeRetirementLog(log, `${SHARD_DIR_PREFIX}${target.start.shard}: SIGKILL to container ${target.containerName} failed: ${killed.error}`)
+  return { kind: 'failed', error: killed.error }
+}
+
+/** The `docker.log` step: the container's Docker logs written whole into its subdirectory; Docker knowing no such container is absent (logged, no file). */
+async function retirementLogSave(docker: DockerContext, runDir: string, log: RunnerLogSink, target: RetiredShard): Promise<RetirementLogSave> {
+  const shard = target.start.shard
+  const logs = await settledDockerAnswer(() => readContainerLogs(docker, retiredShardContainer(target)))
+  if (!logs.ok && isNoSuchContainer(logs)) {
+    writeRetirementLog(log, `${SHARD_DIR_PREFIX}${shard}: no ${DOCKER_LOG_FILE_NAME} saved: Docker knows no container ${target.containerName}`)
+    return { kind: 'absent' }
+  }
+  let failure: string
+  if (logs.ok) {
+    const dir = shardSubdirectoryPath(runDir, shard)
+    const written = writeWholeFile(dir, DOCKER_LOG_FILE_NAME, logs.value)
+    if (written.ok) return { kind: 'saved', path: join(dir, DOCKER_LOG_FILE_NAME) }
+    failure = written.error
+  } else {
+    failure = `reading the Docker logs of container ${target.containerName} failed: ${logs.error}`
+  }
+  writeRetirementLog(log, `${SHARD_DIR_PREFIX}${shard}: saving ${DOCKER_LOG_FILE_NAME} failed: ${failure}`)
+  return { kind: 'failed', error: failure }
+}
+
+/** The removal step: never forced; already gone is absent; a failure is logged and listed as a cleanup failure (b.uqm SR-9.3). */
+async function retirementRemoval(docker: DockerContext, context: ShardRetirementContext, target: RetiredShard): Promise<RetirementRemoval> {
+  const removed = await settledDockerAnswer(() => removeContainer(docker, retiredShardContainer(target)))
+  if (removed.ok) return { kind: 'removed' }
+  if (isNoSuchContainer(removed)) return { kind: 'absent' }
+  const id = target.containerId === null ? '' : ` (${target.containerId})`
+  const line = `removing container ${target.containerName}${id} failed: ${removed.error}`
+  writeRetirementLog(context.log, line)
+  context.state.cleanupFailures.push(line)
+  return { kind: 'failed', line }
+}
+
+/**
+ * Builds a run's retirer (b.uqm SR-10.6): one final reading and one
+ * retirement per shard, both kept by shard number, so concurrent and repeated
+ * requests (a limit timer and a run-level stop together) share the first.
+ *
+ * `retire` settles the effective reason first (`settleRetirementReason`),
+ * then: the final reading if not yet taken; SIGKILL while that reading shows
+ * the container running, or when whether it runs is unreadable and the
+ * effective reason is not `exited` (`retirementSendsKill`); `docker.log`
+ * saved; removal. Each step follows the one before; removal follows a failed
+ * SIGKILL or log save. Each failed step and each unreadable part of the
+ * reading is written to the runner log. A shard with no created container
+ * gets no read, no operation and no log line: its retirement is
+ * `no-container`, its reason as requested. A shard whose start failed and
+ * whose container Docker does not know gets its state read only, one log
+ * line, and no final reading: its retirement is `no-container`, its reason
+ * as settled.
+ */
+export function createShardRetirer(context: ShardRetirementContext): ShardRetirer {
+  const docker: DockerContext = { spawn: context.deps.spawn, env: childEnvironment(context.deps.env), cwd: context.deps.worktreeRoot }
+  const readings = new Map<number, Promise<ShardFinalReading | null>>()
+  const takenReadings = new Map<number, ShardFinalReading>()
+  const retirements = new Map<number, Promise<ShardRetirement>>()
+  const doneRetirements = new Map<number, ShardRetirement>()
+
+  function readingOf(target: RetiredShard): Promise<ShardFinalReading | null> {
+    const shard = target.start.shard
+    const pending = readings.get(shard)
+    if (pending !== undefined) return pending
+    const taking = takeFinalReading(context.deps, docker, target).then((reading) => {
+      if (reading === null) {
+        writeRetirementLog(context.log, `${SHARD_DIR_PREFIX}${shard}: its container failed to start and Docker knows no container ${target.containerName}: no final reading and nothing to retire`)
+        return null
+      }
+      takenReadings.set(shard, reading)
+      for (const failed of reading.failedReadings) {
+        writeRetirementLog(context.log, `${SHARD_DIR_PREFIX}${shard}: final reading: ${failed.what} ${UNREADABLE_READING}: ${failed.error}`)
+      }
+      return reading
+    })
+    readings.set(shard, taking)
+    return taking
+  }
+
+  async function performRetirement(target: RetiredShard, requested: RetirementReason): Promise<ShardRetirement> {
+    const shard = target.start.shard
+    if (!target.containerCreated) return { kind: 'no-container', shard, requested, reason: requested }
+    const reason = settleRetirementReason(context.runDir, shard, requested)
+    if (reason.kind !== requested.kind) {
+      writeRetirementLog(context.log, `${SHARD_DIR_PREFIX}${shard}: its ${RESULT_FILE_NAME} holds its end marker, so it is retired at its end marker, not over its limit`)
+    }
+    const reading = await readingOf(target)
+    if (reading === null) return { kind: 'no-container', shard, requested, reason }
+    const kill = await retirementKill(docker, context.log, target, reading, reason)
+    const logSave = await retirementLogSave(docker, context.runDir, context.log, target)
+    const removal = await retirementRemoval(docker, context, target)
+    return { kind: 'retired', shard, requested, reason, reading, kill, logSave, removal }
+  }
+
+  return {
+    finalReading(target) {
+      return target.containerCreated ? readingOf(target) : Promise.resolve(null)
+    },
+    retire(target, reason) {
+      const shard = target.start.shard
+      const pending = retirements.get(shard)
+      if (pending !== undefined) return pending
+      const retiring = performRetirement(target, reason).then((retirement) => {
+        doneRetirements.set(shard, retirement)
+        return retirement
+      })
+      retirements.set(shard, retiring)
+      return retiring
+    },
+    recordedReading: (shard) => takenReadings.get(shard) ?? null,
+    recordedRetirement: (shard) => doneRetirements.get(shard) ?? null,
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 14. Outcomes, verdict and results (E10)
 // ---------------------------------------------------------------------------

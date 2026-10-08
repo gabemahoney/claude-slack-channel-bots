@@ -668,6 +668,732 @@ describe('E1: results.json (b.uqm SR-16.1)', () => {
 // ---------------------------------------------------------------------------
 // E9: shard containers (b.t6s E9)
 // ---------------------------------------------------------------------------
+//
+// E9's region (b.t6s E9 T5; b.uqm SR-10.1 to SR-10.5, and E9's parts of
+// SR-11.2, SR-11.3, SR-14.2 and SR-15.1; AC 11's component half), through
+// section 13's start entry point, `startShard`, run in process:
+// - each shard's `docker run` list as the spawn recorder kept it: its name,
+//   labels, limits, security, image, mounts (the leak mount included) and the
+//   in-container runner's arguments; every list a normal start produces
+//   passes the argument-list check;
+// - preparation: each subdirectory at 0700 before any docker command of its
+//   shard, and a distinct canary per shard;
+// - credentials by bare name only, the key reaching each shard through its
+//   spawn's environment, and the argument-list check's refusals;
+// - inspection capture, its one re-read on the fake clock, the null case and
+//   `container never started`; and the name-in-use record.
+//
+// Each case builds its starts with `e9Rig` (T5.S1's shard-start fixture): the
+// fake container interface over the spawn recorder, a fake clock, a worktree
+// from the worktree builder whose real script names are taken by number, a
+// run directory from the run-directory builder, the run's faults from the
+// runner's own argument parser, an injected random source and a runner log
+// written by the runner's own writer. After each case the region checks that
+// every spawn was answered, no timer is left, and that the run directory (the
+// runner log in it), every docker argument list and every start result pass
+// `assertNoLeak`. The fake container interface models no container
+// environment, so the planted values are the runner's own environment, which
+// Docker hands a shard by the three bare names. This region's imports are
+// namespaces and its helpers live inside its describe, so no name can collide
+// with another region's.
+
+import * as e9 from '../scripts/ci-run.ts'
+import * as e9Credentials from './test-helpers/credentials.ts'
+import * as e9Helpers from './test-helpers/ci-run.ts'
+import * as e9Clock from './test-helpers/fake-clock.ts'
+
+describe('E9: shard containers (b.t6s E9 T5; b.uqm SR-10.1 to SR-10.5)', () => {
+  // --- T5.S1: the shard-start fixture, shared by T5.S2 and T5.S3 ---
+
+  const OWNER: e9.Owner = { runId: RUN_ID, pid: RUNNER_PID }
+  /** Another run's owner, for the disjoint-names case. */
+  const OTHER_OWNER: e9.Owner = { runId: '20261008t120001z-results2', pid: RUNNER_PID + 1 }
+  const PINNED_IMAGE_ID = `sha256:${hexValue('e9-pinned-image', e9.SHA256_HEX_LENGTH)}`
+  const DRIFT_IMAGE_ID = `sha256:${hexValue('e9-drift-image', e9.SHA256_HEX_LENGTH)}`
+  /** The run's credentials, each a `fakeToken` with its own suffix: a raw key, a gateway key, `GH_TOKEN` and the base-build token. */
+  const SECRETS = {
+    key: e9Credentials.fakeToken(e9.RAW_KEY_PREFIX, 'e9-key'),
+    gatewayKey: e9Credentials.fakeToken('', 'e9-gateway'),
+    ghToken: e9Credentials.fakeToken('', 'e9-gh'),
+    baseBuildToken: e9Credentials.fakeToken('', 'e9-base'),
+  }
+  /** Test data: a gateway's base URL and a model, placeholders holding nothing secret. */
+  const BASE_URL = 'https://anthropic-gateway.invalid/v1'
+  const MODEL = 'e9-model-placeholder'
+  /** The runner's environment with a raw key, and with a gateway key; `GH_TOKEN` is set in both. */
+  const RAW_KEY_ENV: Readonly<Record<string, string>> = { ANTHROPIC_API_KEY: SECRETS.key, GH_TOKEN: SECRETS.ghToken }
+  const GATEWAY_ENV: Readonly<Record<string, string>> = {
+    ANTHROPIC_API_KEY: SECRETS.gatewayKey,
+    ANTHROPIC_BASE_URL: BASE_URL,
+    ANTHROPIC_MODEL: MODEL,
+    GH_TOKEN: SECRETS.ghToken,
+  }
+  /** The three variables a shard's list names by bare name (b.uqm SR-10.4). */
+  const SHARD_VARIABLES = ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL']
+  /** Test data: the run's start on the fake clock, and its tarball's file name in `package/` (never read: it need not exist). */
+  const START_MS = Date.UTC(2026, 9, 8, 12, 0, 0)
+  const TARBALL_FILE_NAME = 'claude-slack-channel-bots-e9.tgz'
+  /** `docker run --detach`, E1's head of every list. */
+  const RUN_HEAD = e9.containerRunArgs([])
+
+  /** A runner-log line, with how many spawns the recorder held when it was written. */
+  interface LoggedLine {
+    readonly line: string
+    readonly spawnsBefore: number
+  }
+
+  /** A start's result, and whether its own inputs carried a secret value on purpose (a refused-start case). */
+  interface StartRecord {
+    readonly result: e9.ShardStartResult
+    readonly inputHoldsSecret: boolean
+  }
+
+  interface RigOptions {
+    /** `--inject` values, read by the runner's argument parser. */
+    readonly inject?: readonly string[]
+    /** The drift image: built (its ID is passed) or its build failed (null is passed); by default not built. */
+    readonly drift?: 'built' | 'failed'
+    /** The runner's environment; default `RAW_KEY_ENV`. */
+    readonly env?: Readonly<Record<string, string>>
+    /** The injected random source; default a new value on every draw. */
+    readonly randomBytes?: (count: number) => Uint8Array
+  }
+
+  /** Changes to one start's inputs. */
+  type StartChange = Partial<Omit<e9.ShardStartInput, 'assignment'>>
+
+  interface E9Rig {
+    readonly clock: e9Clock.FakeClock
+    readonly recorder: e9Helpers.SpawnRecorder
+    readonly docker: e9Helpers.FakeDocker
+    readonly runDir: string
+    readonly env: Readonly<Record<string, string>>
+    readonly tarballPath: string
+    /** The run's secret values: `secretCredentialSet` over the environment and the base-build token. */
+    readonly secretValues: ReadonlySet<string>
+    readonly logged: LoggedLine[]
+    readonly starts: StartRecord[]
+    /** Shard k's assigned scripts in run order: test-1, then two scripts of its own, real names taken by number. */
+    assigned(shard: number): string[]
+    shardDir(shard: number): string
+    /** Starts shard k through `startShard`, with the run's inputs and any change. */
+    start(shard: number, change?: StartChange): Promise<e9.ShardStartResult>
+    /** Every `docker run` list spawned, in order. */
+    runs(): (readonly string[])[]
+  }
+
+  let rigs: E9Rig[] = []
+
+  afterEach(() => {
+    const built = rigs
+    rigs = []
+    for (const rig of built) {
+      rig.recorder.assertNoFailures()
+      expect(rig.clock.pending()).toEqual([])
+      e9Credentials.assertNoLeak(
+        {
+          runDir: e9Credentials.writtenFile(rig.runDir),
+          logged: rig.logged.map((entry) => entry.line),
+          argvs: rig.recorder.argvs(),
+          // A start whose inputs carried a value on purpose records it in its mounts; everything else it recorded is checked.
+          results: rig.starts.map(({ result, inputHoldsSecret }) => (inputHoldsSecret ? { ...result, start: { ...result.start, mounts: [] } } : result)),
+        },
+        'E9 starts',
+      )
+    }
+  })
+
+  /** A random source giving the bytes of `seeds[i]`'s hex value on draw i, the last seed repeating; and its draw count. */
+  function seededRandom(seeds: readonly string[]): { readonly randomBytes: (count: number) => Uint8Array; draws(): number } {
+    let draws = 0
+    return {
+      randomBytes: (count) => {
+        const seed = seeds[Math.min(draws, seeds.length - 1)] as string
+        draws += 1
+        return Uint8Array.from(Buffer.from(hexValue(seed, 2 * count), 'hex'))
+      },
+      draws: () => draws,
+    }
+  }
+
+  /** A random source giving a new value on every draw. */
+  function freshRandom(): (count: number) => Uint8Array {
+    let draws = 0
+    return (count) => Uint8Array.from(Buffer.from(hexValue(`e9-random-${draws++}`, 2 * count), 'hex'))
+  }
+
+  /** The canary a seed's bytes give: its hex value, `CANARY_LENGTH` characters. */
+  const canaryOf = (seed: string): string => hexValue(seed, e9.CANARY_LENGTH)
+
+  /** The T5.S1 shard-start fixture (see the region's header). */
+  function e9Rig(options: RigOptions = {}): E9Rig {
+    const parsed = e9.parseCiArguments((options.inject ?? []).flatMap((value) => ['--inject', value]))
+    if (!parsed.ok) throw new Error(`e9Rig: ${parsed.failures.map((failure) => failure.reason).join('; ')}`)
+    const faults = parsed.invocation.faults
+    const clock = e9Clock.createFakeClock({ start: START_MS })
+    const recorder = e9Helpers.createSpawnRecorder({ clock })
+    const docker = e9Helpers.createFakeDocker(recorder)
+    docker.addImage({ id: PINNED_IMAGE_ID })
+    if (options.drift === 'built') docker.addImage({ id: DRIFT_IMAGE_ID })
+    const worktree = e9Helpers.buildWorktree(root)
+    const runDir = makeRunDir(mkdtempSync(join(root, 'e9-tmp-')), RUN_ID)
+    const env = options.env ?? RAW_KEY_ENV
+    const secretValues = e9.secretCredentialSet(env, { baseBuildToken: SECRETS.baseBuildToken })
+    const canaries = e9.createShardCanaryDrawer(options.randomBytes ?? freshRandom())
+    const writer = e9.createRunnerLog(join(runDir, e9.RUNNER_LOG_FILE_NAME), {
+      onAppendError: (error) => {
+        throw new Error(error)
+      },
+    })
+    const logged: LoggedLine[] = []
+    const log: e9.RunnerLogSink = (line) => {
+      logged.push({ line, spawnsBefore: recorder.spawns().length })
+      writer(line)
+    }
+    const deps: e9.ShardStartDeps = { spawn: recorder.spawn, env, worktreeRoot: worktree.root, clock }
+    const names = worktree.scriptFileNames
+    const tarballPath = join(runDir, e9.PACKAGE_DIR_NAME, TARBALL_FILE_NAME)
+    const starts: StartRecord[] = []
+    const assigned = (shard: number): string[] => {
+      const picked = [names[0], names[2 * shard - 1], names[2 * shard]]
+      if (picked.some((name) => name === undefined)) throw new Error(`e9Rig: the worktree has too few scripts for shard ${shard}`)
+      return picked as string[]
+    }
+    const rig: E9Rig = {
+      clock,
+      recorder,
+      docker,
+      runDir,
+      env,
+      tarballPath,
+      secretValues,
+      logged,
+      starts,
+      assigned,
+      shardDir: (shard) => join(runDir, `${e9.SHARD_DIR_PREFIX}${shard}`),
+      async start(shard, change = {}) {
+        const input: e9.ShardStartInput = {
+          owner: OWNER,
+          runDir,
+          assignment: { shard, assigned: assigned(shard) },
+          failFileNames: [],
+          faults,
+          pinnedImageId: PINNED_IMAGE_ID,
+          driftImageId: options.drift === 'built' ? DRIFT_IMAGE_ID : null,
+          tarballPath,
+          secretValues,
+          canaries,
+          log,
+          ...change,
+        }
+        const result = await e9.startShard(deps, input)
+        starts.push({ result, inputHoldsSecret: [...secretValues].some((value) => input.tarballPath.includes(value)) })
+        return result
+      },
+      runs: () => docker.operations('container-run').map((op) => op.argv),
+    }
+    rigs.push(rig)
+    return rig
+  }
+
+  /** Starts shards in the order given, one after another. */
+  async function startAll(rig: E9Rig, shards: readonly number[], change: (shard: number) => StartChange = () => ({})): Promise<e9.ShardStartResult[]> {
+    const results: e9.ShardStartResult[] = []
+    for (const shard of shards) results.push(await rig.start(shard, change(shard)))
+    return results
+  }
+
+  /** The value after each `flag` in a list, in order. */
+  const valuesOf = (argv: readonly string[], flag: string): string[] => argv.flatMap((arg, index) => (arg === flag ? [argv[index + 1] as string] : []))
+  /** The image operand's index: right after the last `--env` pair. */
+  const imageIndex = (argv: readonly string[]): number => argv.lastIndexOf('--env') + 2
+  const imageOf = (argv: readonly string[]): string => argv[imageIndex(argv)] as string
+  /** The in-container runner's arguments: everything after the image operand. */
+  const runnerArgumentsOf = (argv: readonly string[]): string[] => argv.slice(imageIndex(argv) + 1)
+  const nameOf = (argv: readonly string[]): string => valuesOf(argv, '--name')[0] as string
+  /** Docker's `--mount` value for a bind mount. */
+  const bindMount = (source: string, target: string, readOnly: boolean): string => `type=bind,source=${source},target=${target}${readOnly ? ',readonly' : ''}`
+  /** A path's permission bits; null when nothing is there. */
+  const modeOf = (path: string): number | null => (existsSync(path) ? statSync(path).mode & 0o777 : null)
+  /** The recorded spawns of `docker run` lists. */
+  const runSpawns = (rig: E9Rig): e9Helpers.RecordedSpawn[] => rig.recorder.spawns().filter((spawn) => RUN_HEAD.every((arg, index) => spawn.argv[index] === arg))
+  /** Shard k's container name for an owner, as the SRD forms it: `cscb-ci-<RUN_ID>-<PID>-s<k>`. */
+  const expectedName = (owner: e9.Owner, shard: number): string => `${e9.CI_CONTAINER_NAME_PREFIX}-${owner.runId}-${owner.pid}${e9.SHARD_CONTAINER_NAME_SHARD_MARK}${shard}`
+  const ownerLabels = (owner: e9.Owner): string[] => [`${e9.CI_LABEL}=${e9.CI_LABEL_VALUE}`, `${e9.OWNER_LABEL}=${owner.runId}-${owner.pid}`]
+
+  // --- T5.S1: names, limits, security, image, mounts, runner arguments and preparation (SR-10.1 to SR-10.3, SR-11.2, SR-11.3, SR-14.2) ---
+
+  describe('names, preparation and docker run argument lists (SR-10.1 to SR-10.3)', () => {
+    test('shard k is named cscb-ci-<RUN_ID>-<PID>-s<k> and labelled cscb-ci=1 and with its owner; another owner’s shards get other names', async () => {
+      const rig = e9Rig()
+      await startAll(rig, [1, 2, 3])
+      await startAll(rig, [1, 2, 3], () => ({ owner: OTHER_OWNER }))
+
+      const runs = rig.runs()
+      const ours = [1, 2, 3].map((shard) => expectedName(OWNER, shard))
+      const theirs = [1, 2, 3].map((shard) => expectedName(OTHER_OWNER, shard))
+      expect(runs.map(nameOf)).toEqual([...ours, ...theirs])
+      expect(ours.filter((name) => theirs.includes(name))).toEqual([])
+      expect(runs.map((argv) => valuesOf(argv, '--label'))).toEqual([...ours.map(() => ownerLabels(OWNER)), ...theirs.map(() => ownerLabels(OTHER_OWNER))])
+      expect(rig.starts.map(({ result }) => result.containerName)).toEqual([...ours, ...theirs])
+    })
+
+    test('shard 1’s whole list, in order: no pull, its name and labels, its limits, its two mounts, the three variables by bare name, the pinned image ID, then the runner’s arguments', async () => {
+      const rig = e9Rig()
+      const result = await rig.start(1)
+
+      expect(rig.runs()).toEqual([
+        e9.containerRunArgs([
+          '--pull',
+          'never',
+          '--name',
+          expectedName(OWNER, 1),
+          ...ownerLabels(OWNER).flatMap((label) => ['--label', label]),
+          '--memory',
+          String(e9.SHARD_MEMORY_CAP_BYTES),
+          '--memory-swap',
+          String(e9.SHARD_MEMORY_CAP_BYTES),
+          '--pids-limit',
+          String(e9.SHARD_PIDS_LIMIT),
+          '--cpus',
+          String(e9.CPUS_PER_SHARD),
+          '--mount',
+          bindMount(rig.tarballPath, e9.INTEGRITY_TARBALL_MOUNT_TARGET, true),
+          '--mount',
+          bindMount(rig.shardDir(1), e9.INTEGRITY_RESULTS_MOUNT_TARGET, false),
+          ...SHARD_VARIABLES.flatMap((name) => ['--env', name]),
+          PINNED_IMAGE_ID,
+          '1',
+          result.start.canary,
+          ...rig.assigned(1),
+        ]),
+      ])
+      expect(result.start).toMatchObject({ kind: 'started', shard: 1, imageId: PINNED_IMAGE_ID, nameInUse: false })
+    })
+
+    test('limits and security on every shard, leak and drift shards included: memory and memory-swap both at the cap, the PID limit and CPUs from the constants; no host network, privileged flag, shared namespace, self-removal or entrypoint', async () => {
+      const rig = e9Rig({ inject: ['leak:1,3', 'image-drift:2'], drift: 'built' })
+      await startAll(rig, [1, 2, 3])
+
+      const allowedOptions = ['--pull', '--name', '--label', '--memory', '--memory-swap', '--pids-limit', '--cpus', '--mount', '--env']
+      const forbidden = /^(?:--network|--net|--privileged|--pid|--ipc|--uts|--userns|--cgroupns|--rm|--entrypoint|--env-file|--cap-add|--security-opt|--device|-e)(?:=|$)/
+      expect(rig.runs()).toHaveLength(3)
+      for (const argv of rig.runs()) {
+        expect(valuesOf(argv, '--memory')).toEqual([String(e9.SHARD_MEMORY_CAP_BYTES)])
+        expect(valuesOf(argv, '--memory-swap')).toEqual([String(e9.SHARD_MEMORY_CAP_BYTES)])
+        expect(valuesOf(argv, '--pids-limit')).toEqual([String(e9.SHARD_PIDS_LIMIT)])
+        expect(valuesOf(argv, '--cpus')).toEqual([String(e9.CPUS_PER_SHARD)])
+        const options = argv.slice(RUN_HEAD.length, imageIndex(argv)).filter((arg) => arg.startsWith('-'))
+        expect([...new Set(options)]).toEqual(allowedOptions)
+        expect(argv.filter((arg) => forbidden.test(arg))).toEqual([])
+      }
+    })
+
+    test.each([
+      ['no image-drift: fault: every shard from the pinned ID', {}, [PINNED_IMAGE_ID, PINNED_IMAGE_ID, PINNED_IMAGE_ID]],
+      ['image-drift:2 with its build done: shard 2 from the drift image’s ID', { inject: ['image-drift:2'], drift: 'built' as const }, [PINNED_IMAGE_ID, DRIFT_IMAGE_ID, PINNED_IMAGE_ID]],
+      ['image-drift:2 with its build failed: shard 2 from the pinned ID too', { inject: ['image-drift:2'], drift: 'failed' as const }, [PINNED_IMAGE_ID, PINNED_IMAGE_ID, PINNED_IMAGE_ID]],
+    ])('image: %s', async (_what, options: RigOptions, expected) => {
+      const rig = e9Rig(options)
+      const results = await startAll(rig, [1, 2, 3])
+      expect(rig.runs().map(imageOf)).toEqual(expected)
+      expect(results.map((result) => result.start.imageId)).toEqual(expected)
+    })
+
+    test('mounts: exactly the tarball read-only at /tmp/package.tgz and the shard’s subdirectory at /test-results; leak:1,3 adds shard 1’s subdirectory read-only at /leak-shard-1 to shard 3 only', async () => {
+      const rig = e9Rig({ inject: ['leak:1,3'] })
+      const results = await startAll(rig, [1, 2, 3])
+
+      const own = (shard: number): e9.ShardMount[] => [
+        { source: rig.tarballPath, target: e9.INTEGRITY_TARBALL_MOUNT_TARGET, readOnly: true },
+        { source: rig.shardDir(shard), target: e9.INTEGRITY_RESULTS_MOUNT_TARGET, readOnly: false },
+      ]
+      const expected = [own(1), own(2), [...own(3), { source: rig.shardDir(1), target: e9.leakMountTarget(1), readOnly: true }]]
+      expect(rig.runs().map((argv) => valuesOf(argv, '--mount'))).toEqual(expected.map((mounts) => mounts.map((mount) => bindMount(mount.source, mount.target, mount.readOnly))))
+      expect(results.map((result) => result.start.mounts)).toEqual(expected)
+    })
+
+    test('runner arguments: the shard number, the canary, each --fail name as a pair in the given order, then the assigned scripts in run order, test-1 first', async () => {
+      const rig = e9Rig()
+      const assigned = rig.assigned(2)
+      const fails = [assigned[2] as string, assigned[1] as string]
+      const [first, second] = await startAll(rig, [1, 2], (shard) => (shard === 2 ? { failFileNames: fails } : {}))
+
+      expect(assigned[0]).toBe(realScriptFileName(1))
+      expect(rig.runs().map(runnerArgumentsOf)).toEqual([
+        ['1', first?.start.canary, ...rig.assigned(1)],
+        ['2', second?.start.canary, e9.RUNNER_FAIL_OPTION, fails[0], e9.RUNNER_FAIL_OPTION, fails[1], ...assigned],
+      ])
+    })
+
+    test('preparation: each subdirectory is 0700 before its shard’s first docker command, and a leak source’s before the shard that mounts it, though the source has not started', async () => {
+      const rig = e9Rig({ inject: ['leak:1,3'] })
+      const seen: { name: string; modes: (number | null)[] }[] = []
+      rig.docker.answerRuns((runArguments) => {
+        seen.push({ name: nameOf(runArguments), modes: [1, 2, 3].map((shard) => modeOf(rig.shardDir(shard))) })
+        return { kind: 'start' }
+      })
+      await startAll(rig, [3, 1, 2])
+
+      const mode = e9.RUN_DIR_MODE
+      expect(seen).toEqual([
+        { name: expectedName(OWNER, 3), modes: [mode, null, mode] },
+        { name: expectedName(OWNER, 1), modes: [mode, null, mode] },
+        { name: expectedName(OWNER, 2), modes: [mode, mode, mode] },
+      ])
+    })
+
+    test.each([
+      ['its own subdirectory', [] as string[], 2],
+      ['its leak source’s subdirectory', ['leak:1,2'], 1],
+    ])('preparation: when %s cannot be created, the shard fails to start with no docker command', async (_what, inject, blocked) => {
+      const rig = e9Rig({ inject })
+      writeFileSync(rig.shardDir(blocked), '')
+      const result = await rig.start(2)
+
+      expect(rig.recorder.spawns()).toEqual([])
+      expect(result.start.kind).toBe('failed-to-start')
+      const detail = result.start.kind === 'failed-to-start' ? result.start.detail : ''
+      expect(detail).toContain(`${e9.SHARD_DIR_PREFIX}${blocked}`)
+      expect(detail).not.toMatch(/[\r\n]/)
+      expect(result).toMatchObject({ containerCreated: false, containerId: null, inspection: null, inspectionError: e9.CONTAINER_NEVER_STARTED_TEXT })
+    })
+
+    test('canaries: CANARY_LENGTH lowercase hex characters, distinct per shard though the random source repeats a value, each the runner’s second argument', async () => {
+      const random = seededRandom(['e9-canary-a', 'e9-canary-a', 'e9-canary-a', 'e9-canary-b', 'e9-canary-b', 'e9-canary-c'])
+      const rig = e9Rig({ randomBytes: random.randomBytes })
+      const results = await startAll(rig, [1, 2, 3])
+
+      const canaries = results.map((result) => result.start.canary)
+      expect(canaries).toEqual([canaryOf('e9-canary-a'), canaryOf('e9-canary-b'), canaryOf('e9-canary-c')])
+      for (const canary of canaries) expect(canary).toMatch(new RegExp(`^[0-9a-f]{${e9.CANARY_LENGTH}}$`))
+      expect(rig.runs().map((argv) => runnerArgumentsOf(argv)[1])).toEqual(canaries)
+      expect(random.draws()).toBe(6)
+    })
+
+    test('a canary that cannot be drawn: the shard records canary \'\', fails to start, and nothing is prepared or spawned for it', async () => {
+      const random = seededRandom(['e9-canary-same'])
+      const rig = e9Rig({ randomBytes: random.randomBytes })
+      const [first, second] = await startAll(rig, [1, 2])
+
+      expect(first?.start).toMatchObject({ kind: 'started', canary: canaryOf('e9-canary-same') })
+      expect(second?.start).toMatchObject({ kind: 'failed-to-start', shard: 2, canary: '' })
+      expect(random.draws()).toBe(1 + e9.CANARY_MAX_DRAWS)
+      expect(rig.runs().map(nameOf)).toEqual([expectedName(OWNER, 1)])
+      expect(existsSync(rig.shardDir(2))).toBe(false)
+      expect(second).toMatchObject({ containerCreated: false, inspectionError: e9.CONTAINER_NEVER_STARTED_TEXT })
+    })
+
+    test.each([
+      ['no fault', {}, () => ({})],
+      ['leak:1,2', { inject: ['leak:1,2'] }, () => ({})],
+      ['image-drift:2, its build done', { inject: ['image-drift:2'], drift: 'built' as const }, () => ({})],
+      ['image-drift:2, its build failed', { inject: ['image-drift:2'], drift: 'failed' as const }, () => ({})],
+      ['--fail names on shard 2', {}, (rig: E9Rig, shard: number): StartChange => (shard === 2 ? { failFileNames: rig.assigned(2).slice(1) } : {})],
+      ['a gateway key', { env: GATEWAY_ENV }, () => ({})],
+    ])('every list a normal start produces passes the argument-list check: %s', async (_what, options: RigOptions, change) => {
+      const rig = e9Rig(options)
+      const results = await startAll(rig, [1, 2, 3], (shard) => change(rig, shard))
+
+      expect(results.map((result) => result.start.kind)).toEqual(['started', 'started', 'started'])
+      expect(rig.runs()).toHaveLength(3)
+      for (const argv of rig.runs()) expect(e9.checkShardRunList(argv, rig.secretValues)).toEqual({ ok: true })
+    })
+  })
+
+  // --- T5.S2: credentials by bare name and the argument-list check (SR-10.4, SR-15.1) ---
+
+  describe('credentials by bare name and the argument-list check (SR-10.4, SR-15.1)', () => {
+    test('each list names exactly ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL and ANTHROPIC_MODEL by bare name, no other variable and no env file; GH_TOKEN is never named though it is set', async () => {
+      const rig = e9Rig({ env: GATEWAY_ENV })
+      await startAll(rig, [1, 2, 3])
+
+      expect(rig.env.GH_TOKEN).toBe(SECRETS.ghToken)
+      expect(rig.runs()).toHaveLength(3)
+      for (const argv of rig.runs()) {
+        expect(valuesOf(argv, '--env')).toEqual(SHARD_VARIABLES)
+        expect(argv.filter((arg) => /^(?:-e|--env)/.test(arg))).toEqual(SHARD_VARIABLES.map(() => '--env'))
+        expect(argv.filter((arg) => arg.includes('GH_TOKEN'))).toEqual([])
+        expect(argv.filter((arg) => SHARD_VARIABLES.some((name) => arg.includes(`${name}=`)))).toEqual([])
+      }
+    })
+
+    test.each([
+      ['a raw key', RAW_KEY_ENV],
+      ['a gateway key, with its base URL and model', GATEWAY_ENV],
+    ])('the key reaches every shard: each shard’s docker run is spawned with the runner’s environment, %s included', async (_what, env) => {
+      const rig = e9Rig({ env })
+      await startAll(rig, [1, 2, 3])
+
+      const spawns = runSpawns(rig)
+      expect(spawns).toHaveLength(3)
+      for (const spawn of spawns) {
+        expect(spawn.env).toEqual(e9.childEnvironment(env))
+        expect(spawn.env.ANTHROPIC_API_KEY).toBe(env.ANTHROPIC_API_KEY as string)
+      }
+    })
+
+    test('logging: each shard’s list is written to the runner log, as E1’s docker run line, before its spawn is recorded', async () => {
+      const rig = e9Rig()
+      await startAll(rig, [1, 2, 3])
+
+      const runs = rig.runs()
+      const spawns = rig.recorder.spawns()
+      expect(rig.logged.map((entry) => entry.line)).toEqual(runs.map((argv) => e9.dockerRunLogLine(argv)))
+      for (const [index, entry] of rig.logged.entries()) expect(spawns[entry.spawnsBefore]?.argv).toEqual(runs[index] as readonly string[])
+      expect(readFileSync(join(rig.runDir, e9.RUNNER_LOG_FILE_NAME), 'utf-8')).toBe(runs.map((argv) => `${e9.dockerRunLogLine(argv)}\n`).join(''))
+    })
+
+    /** A normal list for shard 1, built by the pure builder, and the run's secret values. */
+    function checkedList(): { argv: string[]; secretValues: ReadonlySet<string> } {
+      const runDir = join(root, 'e9-check-run')
+      const plan = e9.shardRunPlan({
+        owner: OWNER,
+        runDir,
+        shard: 1,
+        assigned: [realScriptFileName(1), realScriptFileName(2)],
+        canary: canaryOf('e9-check-canary'),
+        failFileNames: [],
+        faults: [],
+        pinnedImageId: PINNED_IMAGE_ID,
+        driftImageId: null,
+        tarballPath: join(runDir, e9.PACKAGE_DIR_NAME, TARBALL_FILE_NAME),
+      })
+      return { argv: e9.containerRunArgs(plan.runArguments), secretValues: e9.secretCredentialSet(RAW_KEY_ENV, { baseBuildToken: SECRETS.baseBuildToken }) }
+    }
+
+    test.each([
+      ['the key as ANTHROPIC_API_KEY=<value>', () => ['--env', `ANTHROPIC_API_KEY=${SECRETS.key}`], 1, 'ANTHROPIC_API_KEY'],
+      ['GH_TOKEN as GH_TOKEN=<value>', () => ['--env', `GH_TOKEN=${SECRETS.ghToken}`], 1, 'GH_TOKEN'],
+      ['the base-build token as GH_TOKEN=<value>', () => ['--env', `GH_TOKEN=${SECRETS.baseBuildToken}`], 1, 'GH_TOKEN'],
+      ['the key as --env=ANTHROPIC_API_KEY=<value>', () => [`--env=ANTHROPIC_API_KEY=${SECRETS.key}`], 0, 'ANTHROPIC_API_KEY'],
+      ['GH_TOKEN as -eGH_TOKEN=<value>', () => [`-eGH_TOKEN=${SECRETS.ghToken}`], 0, 'GH_TOKEN'],
+      ['ANTHROPIC_API_KEY= with an empty value', () => ['--env', 'ANTHROPIC_API_KEY='], 1, 'ANTHROPIC_API_KEY'],
+      ['GH_TOKEN= with an empty value', () => ['--env', 'GH_TOKEN='], 1, 'GH_TOKEN'],
+      ['the key’s value inside a label', () => ['--label', `e9-note=${SECRETS.key}`], 1, null],
+      ['GH_TOKEN’s value inside a mount source', () => ['--mount', bindMount(join(root, SECRETS.ghToken), '/e9-mount', true)], 1, null],
+      ['the base-build token’s value inside a label', () => ['--label', `e9-note=${SECRETS.baseBuildToken}`], 1, null],
+    ])('the argument-list check refuses a list with %s, naming the argument and never the value', (_what, inserted, at, name) => {
+      const { argv, secretValues } = checkedList()
+      expect(e9.checkShardRunList(argv, secretValues)).toEqual({ ok: true })
+      const image = imageIndex(argv)
+      const bad = [...argv.slice(0, image), ...inserted(), ...argv.slice(image)]
+
+      const verdict = e9.checkShardRunList(bad, secretValues)
+      expect(verdict.ok).toBe(false)
+      const reason = verdict.ok ? '' : verdict.reason
+      expect(reason).toMatch(new RegExp(`\\bargument ${image + at + 1}$`))
+      if (name !== null) expect(reason).toContain(name)
+      e9Credentials.assertNoLeak(reason, 'refusal reason')
+    })
+
+    test.each([
+      ['the key', () => SECRETS.key],
+      ['GH_TOKEN', () => SECRETS.ghToken],
+      ['the base-build token', () => SECRETS.baseBuildToken],
+    ])('a start whose built list carries %s’s value: no spawn and no runner-log line hold it, that shard fails to start with a value-free detail, and the other shards start', async (_what, value) => {
+      const rig = e9Rig()
+      const planted = join(rig.runDir, e9.PACKAGE_DIR_NAME, `${value()}.tgz`)
+      const results = await startAll(rig, [1, 2, 3], (shard) => (shard === 2 ? { tarballPath: planted } : {}))
+
+      expect(results.map((result) => result.start.kind)).toEqual(['started', 'failed-to-start', 'started'])
+      expect(rig.runs().map(nameOf)).toEqual([expectedName(OWNER, 1), expectedName(OWNER, 3)])
+      expect(rig.recorder.argvs().filter((argv) => argv.some((arg) => arg.includes(value())))).toEqual([])
+      expect(rig.logged.filter((entry) => entry.line.includes(value()))).toEqual([])
+      expect(readFileSync(join(rig.runDir, e9.RUNNER_LOG_FILE_NAME), 'utf-8')).not.toContain(value())
+      const refused = results[1] as e9.ShardStartResult
+      const detail = refused.start.kind === 'failed-to-start' ? refused.start.detail : ''
+      expect(detail).toMatch(/\bargument \d+$/)
+      e9Credentials.assertNoLeak(detail, 'refused start detail')
+      expect(refused).toMatchObject({ containerCreated: false, containerId: null, inspection: null, inspectionError: e9.CONTAINER_NEVER_STARTED_TEXT })
+    })
+  })
+
+  // --- T5.S3: inspection capture, the re-read and the name-in-use record (SR-10.5) ---
+
+  describe('inspection capture, the re-read and the name-in-use record (SR-10.5)', () => {
+    const inspectionReads = (rig: E9Rig): readonly e9Helpers.FakeDockerOperation[] => rig.docker.operations('container-inspection')
+
+    /** Yields until the start's code waits on a timer, or gives up after a bounded number of flushes. */
+    async function untilTimer(clock: e9Clock.FakeClock): Promise<void> {
+      for (let turn = 0; turn < 20 && clock.pendingCount() === 0; turn++) await clock.flush()
+    }
+
+    test('each started shard is inspected by its container ID right after its docker run, before the start returns', async () => {
+      const rig = e9Rig()
+      for (const shard of [1, 2]) {
+        const before = rig.docker.operations().length
+        const result = await rig.start(shard)
+        const ops = rig.docker.operations().slice(before)
+        expect(ops.map((op) => op.kind)).toEqual(['container-run', 'container-inspection'])
+        expect(ops[1]?.refs).toEqual([result.containerId as string])
+        expect(ops[1]?.argv).toEqual(e9.containerInspectionArgs(result.containerId as string))
+      }
+    })
+
+    test('the stored data holds exactly name, image ID, mounts (source, target, read-only), network, PID and IPC modes, privileged, memory, memory-swap, PID and CPU limits, labels and self-removal; imageId is the data’s', async () => {
+      const rig = e9Rig()
+      const inspection: e9Helpers.FakeInspection = {
+        imageId: PINNED_IMAGE_ID,
+        mounts: [
+          { source: rig.tarballPath, target: e9.INTEGRITY_TARBALL_MOUNT_TARGET, rw: false },
+          { source: rig.shardDir(1), target: e9.INTEGRITY_RESULTS_MOUNT_TARGET, rw: true },
+        ],
+        networkMode: 'e9-network-mode',
+        pidMode: 'e9-pid-mode',
+        ipcMode: 'e9-ipc-mode',
+        privileged: true,
+        memoryBytes: e9.SHARD_MEMORY_CAP_BYTES,
+        memorySwapBytes: 2 * e9.SHARD_MEMORY_CAP_BYTES,
+        pidsLimit: e9.SHARD_PIDS_LIMIT,
+        nanoCpus: e9.CPUS_PER_SHARD * 1e9,
+        autoRemove: true,
+      }
+      rig.docker.answerRuns(() => ({ kind: 'start', container: { inspection } }))
+      const result = await rig.start(1)
+
+      expect(result.inspection).toStrictEqual({
+        name: expectedName(OWNER, 1),
+        imageId: PINNED_IMAGE_ID,
+        mounts: [
+          { source: rig.tarballPath, target: e9.INTEGRITY_TARBALL_MOUNT_TARGET, readOnly: true },
+          { source: rig.shardDir(1), target: e9.INTEGRITY_RESULTS_MOUNT_TARGET, readOnly: false },
+        ],
+        networkMode: 'e9-network-mode',
+        pidMode: 'e9-pid-mode',
+        ipcMode: 'e9-ipc-mode',
+        privileged: true,
+        memoryBytes: e9.SHARD_MEMORY_CAP_BYTES,
+        memorySwapBytes: 2 * e9.SHARD_MEMORY_CAP_BYTES,
+        pidsLimit: e9.SHARD_PIDS_LIMIT,
+        nanoCpus: e9.CPUS_PER_SHARD * 1e9,
+        labels: { [e9.CI_LABEL]: e9.CI_LABEL_VALUE, [e9.OWNER_LABEL]: `${OWNER.runId}-${OWNER.pid}` },
+        autoRemove: true,
+      })
+      expect(result.inspectionError).toBeNull()
+      expect(result.imageId).toBe(PINNED_IMAGE_ID)
+    })
+
+    test('the environment is never read: the inspect request selects no environment field, and neither the stored data nor any output holds the planted values', async () => {
+      const planted = { ...RAW_KEY_ENV, E9_PLANTED: e9Credentials.fakeToken('', 'e9-planted') }
+      const rig = e9Rig({ env: planted })
+      const result = await rig.start(1)
+
+      // The planted values are in the environment Docker hands the container its variables from.
+      expect(runSpawns(rig).map((spawn) => spawn.env.E9_PLANTED)).toEqual([planted.E9_PLANTED])
+      const reads = inspectionReads(rig)
+      expect(reads.map((op) => op.argv)).toEqual([e9.containerInspectionArgs(result.containerId as string)])
+      expect(reads.flatMap((op) => op.argv).filter((arg) => /Env/.test(arg))).toEqual([])
+      // The template selects exactly SR-10.5's fields, by Docker's inspect paths: a
+      // wider selection (`{{json .Config}}`, say) would carry the environment.
+      const format = e9.CONTAINER_INSPECTION_FORMAT
+      expect([...format.matchAll(/\{\{json ([^}]+)\}\}/g)].map((match) => match[1]).sort()).toEqual(
+        [
+          '.Name',
+          '.Image',
+          '$m.Source',
+          '$m.Destination',
+          '$m.RW',
+          '.HostConfig.NetworkMode',
+          '.HostConfig.PidMode',
+          '.HostConfig.IpcMode',
+          '.HostConfig.Privileged',
+          '.HostConfig.Memory',
+          '.HostConfig.MemorySwap',
+          '.HostConfig.PidsLimit',
+          '.HostConfig.NanoCpus',
+          '.Config.Labels',
+          '.HostConfig.AutoRemove',
+        ].sort(),
+      )
+      expect([...format.matchAll(/\{\{range [^}]*:= ([^}]+)\}\}/g)].map((match) => match[1])).toEqual(['.Mounts'])
+      expect(result.inspection).not.toBeNull()
+      expect(Object.keys(result.inspection as object).filter((key) => /env/i.test(key))).toEqual([])
+      e9Credentials.assertNoLeak(
+        { inspection: result.inspection, result, runDir: e9Credentials.writtenFile(rig.runDir), argvs: rig.recorder.argvs() },
+        'inspection capture',
+      )
+    })
+
+    test('a read that fails once is read again exactly INSPECTION_REREAD_DELAY_MS later on the fake clock, and its data is stored', async () => {
+      const rig = e9Rig()
+      rig.docker.answerRuns(() => ({ kind: 'start', container: { inspectionFailures: 1 } }))
+      const pending = rig.start(1)
+      await untilTimer(rig.clock)
+
+      expect(inspectionReads(rig)).toHaveLength(1)
+      const firstAt = inspectionReads(rig)[0]?.atMs as number
+      expect(rig.clock.pending().map((timer) => timer.dueAt)).toEqual([firstAt + e9.INSPECTION_REREAD_DELAY_MS])
+      await rig.clock.advance(e9.INSPECTION_REREAD_DELAY_MS - 1)
+      expect(inspectionReads(rig)).toHaveLength(1)
+      await rig.clock.advance(1)
+      const result = await pending
+
+      expect(inspectionReads(rig).map((op) => op.atMs)).toEqual([firstAt, firstAt + e9.INSPECTION_REREAD_DELAY_MS])
+      expect(result.inspectionError).toBeNull()
+      expect(result.inspection?.name).toBe(expectedName(OWNER, 1))
+      expect(result.imageId).toBe(PINNED_IMAGE_ID)
+    })
+
+    test('a read that fails every time: exactly two reads, the second INSPECTION_REREAD_DELAY_MS after the first; no data, and the last error on one line', async () => {
+      const rig = e9Rig()
+      const first = 'Error response from daemon: e9 first inspection failure'
+      const secondLines = ['Error response from daemon: e9 second inspection failure', 'e9 its second line']
+      rig.docker.fail('container-inspection', { stderr: first })
+      rig.docker.fail('container-inspection', { stderr: secondLines.join('\n') })
+      rig.docker.fail('container-inspection', { stderr: 'e9 a third read, never made', times: 'always' })
+      const pending = rig.start(1)
+      await untilTimer(rig.clock)
+      await rig.clock.advance(e9.INSPECTION_REREAD_DELAY_MS)
+      const result = await pending
+      await rig.clock.advance(10 * e9.INSPECTION_REREAD_DELAY_MS)
+
+      const reads = inspectionReads(rig)
+      expect(reads.map((op) => op.atMs - START_MS)).toEqual([0, e9.INSPECTION_REREAD_DELAY_MS])
+      expect(result).toMatchObject({ inspection: null, imageId: null, inspectionError: secondLines.join(' ') })
+      expect(result.start.kind).toBe('started')
+    })
+
+    test.each([
+      ['docker run failed and left no container', (rig: E9Rig) => rig.docker.answerRuns(() => ({ kind: 'fail' })), false],
+      ['docker run failed and left the container created', (rig: E9Rig) => rig.docker.answerRuns(() => ({ kind: 'fail', leavesContainer: true })), true],
+      [
+        'docker run failed and the state read after it failed too',
+        (rig: E9Rig) => {
+          rig.docker.answerRuns(() => ({ kind: 'fail' }))
+          rig.docker.fail('container-state')
+        },
+        true,
+      ],
+    ])('a container that never started is not inspected: %s', async (_what, arrange, created) => {
+      const rig = e9Rig()
+      arrange(rig)
+      const result = await rig.start(1)
+
+      expect(rig.docker.operations().map((op) => op.kind)).toEqual(['container-run', 'container-state'])
+      expect(result.start).toMatchObject({ kind: 'failed-to-start', nameInUse: false })
+      expect(result).toMatchObject({ containerCreated: created, containerId: null, inspection: null, imageId: null, inspectionError: e9.CONTAINER_NEVER_STARTED_TEXT })
+    })
+
+    test.each([
+      ['a container left from before', async (rig: E9Rig) => void rig.docker.addContainer({ name: expectedName(OWNER, 1), running: false })],
+      ['this run’s own earlier start of it', async (rig: E9Rig) => void (await rig.start(1))],
+    ])('name in use: a shard whose name %s holds is recorded as in use, creates no container and is not inspected; a free name is recorded as not in use', async (_what, arrange) => {
+      const rig = e9Rig()
+      await arrange(rig)
+      const free = await rig.start(2)
+      const before = rig.docker.operations().length
+      const held = await rig.start(1)
+
+      expect(free.start).toMatchObject({ kind: 'started', nameInUse: false })
+      expect(held.start).toMatchObject({ kind: 'failed-to-start', nameInUse: true })
+      expect(held).toMatchObject({ containerCreated: false, containerId: null, inspection: null, inspectionError: e9.CONTAINER_NEVER_STARTED_TEXT })
+      expect(rig.docker.operations().slice(before).map((op) => op.kind)).toEqual(['container-run'])
+      const detail = held.start.kind === 'failed-to-start' ? held.start.detail : ''
+      expect(detail).not.toMatch(/[\r\n]/)
+    })
+  })
+})
 
 // ---------------------------------------------------------------------------
 // E10: outcomes, verdict and results (b.t6s E10)
