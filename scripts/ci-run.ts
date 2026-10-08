@@ -8087,7 +8087,7 @@ const ADMISSION_LIMIT_ORDER: readonly AdmissionLimit[] = ['memory', 'disk', 'cpu
 export interface AdmissionRequest {
   /** r: the `--shards` value, or `MAX_SHARDS` when it is not given (E2's `ValidatedRun.requestedShards`). */
   readonly requestedShards: number
-  /** u: the run's scheduling units (E2, b.uqm SR-3.4: `ValidatedRun.units`). */
+  /** u: the count of the run's scheduling units (E2, b.uqm SR-3.4: `ValidatedRun.units.length`). */
   readonly units: number
   /** The effective N (E2, b.uqm SR-3.4): the smaller of r and u, at least 1. */
   readonly effectiveShards: number
