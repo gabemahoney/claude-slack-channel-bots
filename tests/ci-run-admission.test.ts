@@ -1838,11 +1838,10 @@ describe('E5: the sweep of dead runs\' leftovers', () => {
 // root through `TMPDIR`, so no case reads the host's cgroups, a real home's
 // `.config`, `/ci-live`'s real locks or the real `/tmp`. The one child process
 // (the `os.tmpdir()` pin) gets a direct `hostSafeChildEnv` call and a time
-// limit. E6's imports sit here, in its own region; names E1's imports above
-// already bring in are used from there.
+// limit. E6's imports sit here, in its own region; names E1's and E5's imports
+// above already bring in are used from there.
 
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { basename, dirname, relative } from 'node:path'
 import ts from 'typescript'
 
@@ -1860,8 +1859,6 @@ import {
   CI_LIVE_CEILING_SOURCE_TEXT,
   CI_LIVE_CHROME_LIMIT_BYTES,
   CI_LIVE_CONFIG_DIR_SUBPATH,
-  CI_LIVE_CONTAINER_LABEL,
-  CI_LIVE_CONTAINER_LABEL_VALUE,
   CI_LIVE_CONTAINER_MEMORY_BYTES,
   CI_LIVE_CONTAINER_PREFIX,
   CI_LIVE_DIR_NAME,
@@ -1934,7 +1931,6 @@ import {
   type Invocation,
   type MemoryCommitment,
   type ReadingResult,
-  type Refusal,
   type ReservationListing,
   type ResultsDirectoryLister,
   type ShardCountLineInput,
@@ -1949,8 +1945,6 @@ import {
   CGROUP_UNLIMITED,
   ciLiveLockText,
   ciShardLabels,
-  createFakeDocker,
-  createSpawnRecorder,
   failedReservationListing,
   gibToBytes,
   listedReservation,
@@ -1968,14 +1962,10 @@ import {
   type CiLiveHome,
   type CiLiveLockHolder,
   type ContainerGibFigures,
-  type FakeDocker,
   type PodFigures,
-  type SpawnRecorder,
   type StubReservationReader,
 } from './test-helpers/ci-run.ts'
-import { assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
-import { createFakeClock } from './test-helpers/fake-clock.ts'
-import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { fakeToken } from './test-helpers/credentials.ts'
 
 describe('E6: admission readings, /ci-live, commitments, fits and refusals', () => {
   /** Test data: this run's RUN_ID, the runner's user ID, and the host's pod limit L in GiB (the PRD's 64 GiB container cgroup). */

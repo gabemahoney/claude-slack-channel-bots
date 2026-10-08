@@ -5948,12 +5948,6 @@ export function readReservations(lockDir: string, probe: OwnerLivenessProbe): Re
 // no file but dead owners' reservations in the lock directory: never the
 // system temp directory nor any run directory.
 
-// E6's 10/T3 declares these same two constants; whichever lane merges second deletes its copy (E6's is kept).
-/** The label `/ci-live`'s containers carry, as `cscb-live=1`; the sweep never touches such a container (b.uqm SR-6.4). */
-export const CI_LIVE_CONTAINER_LABEL = 'cscb-live'
-/** The `cscb-live` label's value on `/ci-live`'s containers. */
-export const CI_LIVE_CONTAINER_LABEL_VALUE = '1'
-
 /** Writes a cleanup-failure line to the runner log; a sink that throws loses only this line, so no failure is thrown past the caller. */
 function logCleanupFailure(log: RunnerLogSink, line: string): string {
   try {

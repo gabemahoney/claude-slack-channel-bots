@@ -103,7 +103,6 @@ import {
   parseRunTag,
   PRUNE_ALREADY_RUNNING_TEXT,
   RESERVATION_FORMAT_VERSION,
-  reservationFileName,
   RESULT_FILE_NAME,
   RESULTS_FILE_NAME,
   RESULTS_FORMAT_VERSION,
@@ -114,7 +113,6 @@ import {
   RUNNER_LOG_FILE_NAME,
   RUNNER_PATH_SUFFIX,
   SCRIPT_LOG_SUFFIX,
-  serializeReservation,
   serializeResults,
   serializeStatus,
   SHA256_HEX_LENGTH,
@@ -136,7 +134,6 @@ import {
   type DepRead,
   type ImageListFilter,
   type ListedReservation,
-  type Owner,
   type ProcRead,
   type RefusalKind,
   type Reservation,
@@ -146,7 +143,6 @@ import {
   type ReservationReader,
   type ResultEvent,
   type Results,
-  type RunKind,
   type RunnerClock,
   type RunnerDeps,
   type RunStatus,
@@ -194,7 +190,6 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
-  rmSync,
   symlinkSync,
   truncateSync,
   writeFileSync,
@@ -4773,7 +4768,7 @@ export function makeReservation(spec: ReservationSpec): Reservation {
 
 /** A valid reservation as the reservation reader lists it, under its file name, with its owner's liveness. */
 export function listedReservation(spec: ReservationSpec & { readonly ownerAlive: boolean }): ListedReservation {
-  return { fileName: reservationFileName(spec.owner), reservation: makeReservation(spec), ownerAlive: spec.ownerAlive }
+  return { fileName: reservationFileName(spec.owner), reservation: makeReservation(spec), owner: spec.owner, ownerAlive: spec.ownerAlive }
 }
 
 /** A reservation file that cannot be used: a valid one's text with a stated change. */
@@ -4791,7 +4786,7 @@ export function badReservationFile(spec: BadReservationSpec): BadReservationFile
   const text = changedJsonText(reservationText({ owner: spec.owner, shards: spec.shards ?? 1 }), spec.change)
   const parsed = parseReservation(text)
   if (parsed.ok) throw new Error('badReservationFile: the change leaves a reservation the runner parses')
-  return { fileName: reservationFileName(spec.owner), ownerAlive: spec.ownerAlive, reason: parsed.error }
+  return { fileName: reservationFileName(spec.owner), owner: spec.owner, ownerAlive: spec.ownerAlive, reason: parsed.error }
 }
 
 /** A listing that read the lock directory. */
