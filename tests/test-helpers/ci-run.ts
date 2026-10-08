@@ -3273,6 +3273,506 @@ export function makeResultsDir(tempDir: string, spec: ResultsDirSpec): string {
 // ---------------------------------------------------------------------------
 // 8. Lock directory and password file (E5)
 // ---------------------------------------------------------------------------
+//
+// b.uqm SR-21.4's lock directories and password files, for the E5 region of
+// `tests/ci-run-admission.test.ts`. Everything is built under the caller's own
+// `mkdtempSync` root; nothing here reads or writes a real home, the real lock
+// directory or the host's password file, and nothing starts a child process.
+//
+// - **Lock directory** (`buildLockDir`): a constructed account home holding
+//   the runner's lock directory (`admissionLockDir`), a bare lock directory, or
+//   a home without one. In it, as asked: the lock file, its holder record
+//   written in place through the runner's own lock-file primitive
+//   (`openLockFile`, `formatLockHolder`) or that record with one named change,
+//   with or without an exclusive flock held in process on a second descriptor
+//   (which really blocks the runner's take until `release()`);
+//   reservations written through the runner's writer (`writeReservation`), or
+//   a valid one's text with one named change through `writeWholeFile`;
+//   a reservation that vanishes between the runner's listing and its read; and
+//   unrelated entries. Owners named by RUN_ID and liveness are added to the
+//   caller's fake process table (section 2) as a live or gone `/ci` runner.
+// - **Password file** (`passwordFileCases`): one text per b.uqm SR-21.4 case
+//   for any user ID and home, each row labelled by what it is and naming what
+//   the password-file rule gives for it. `writePasswordFile` and
+//   `writeUnreadablePasswordFile` put a text, or an entry that cannot be read
+//   as a file, under the caller's root; `passwordFileReader` is the runner's
+//   `readPasswordFile` dependency over such a path.
+
+// Section 8's runner imports (an ES import is hoisted; kept here so this lane writes only under its banner).
+import {
+  admissionLockDir,
+  admissionLockPath,
+  buildReservation,
+  formatLockHolder,
+  openLockFile,
+  parseLockHolder,
+  RESERVATION_FILE_SUFFIX,
+  reservationFileName,
+  reservationOwnerFromFileName,
+  reservationTempFileName,
+  serializeReservation,
+  writeReservation,
+  type AccountHomeFailure,
+  type Owner,
+  type OwnerLivenessProbe,
+  type RunKind,
+} from '../../scripts/ci-run.ts'
+import { rmSync } from 'node:fs'
+
+// The lock directory (b.uqm SR-6.1, SR-6.2).
+
+/** An owner for the lock directory: by RUN_ID and liveness (a `/ci` runner added to the spec's process table, live or gone, on a PID the table picks), or exactly as given (no process added). */
+export type LockDirOwnerSpec =
+  | {
+      readonly runId: string
+      readonly alive: boolean
+    }
+  | {
+      readonly owner: Owner
+    }
+
+/** A named change to a valid holder record. */
+export type LockRecordChange =
+  /** The valid record cut after its first half. */
+  | 'cut'
+  /** No text at all: an empty lock file. */
+  | 'empty'
+  /** The valid record twice: a second line after the first. */
+  | 'second-line'
+  /** Any other change, named by `what`. */
+  | {
+      readonly what: string
+      readonly edit: (valid: string) => string
+    }
+
+/** The lock file: its holder, its record (valid by default, or with one named change), and whether a flock is held on it. */
+export interface LockFileSpec {
+  readonly holder: LockDirOwnerSpec
+  readonly change?: LockRecordChange
+  /** An exclusive flock held in process on a second descriptor until `release()` (default false). */
+  readonly held?: boolean
+}
+
+/** A named change to a valid reservation file: a JSON change (unparseable, another `version`, another shape), a valid reservation of another owner under this owner's name, or a symbolic link at the name to a missing file. */
+export type ReservationFileChange =
+  | JsonFileChange
+  | {
+      /** The valid reservation of `owner` (written by the runner's serializer) under this owner's file name. */
+      readonly kind: 'owner'
+      readonly owner: Owner
+    }
+  | {
+      /** No file: a symbolic link at the reservation name to a missing file, which the runner reads as not a regular file. */
+      readonly kind: 'dangling-link'
+    }
+
+/** One reservation: its owner, what it records (N default 1, the cap default `SHARD_MEMORY_CAP_BYTES`, kind default `full`), and an optional named change. */
+export interface LockDirReservationSpec {
+  readonly owner: LockDirOwnerSpec
+  readonly shards?: number
+  readonly memoryCapBytes?: number
+  readonly kind?: RunKind
+  readonly change?: ReservationFileChange
+}
+
+/** An entry in the lock directory that is no reservation and not the lock file; each name is checked to be no reservation name. */
+export type UnrelatedEntrySpec =
+  | {
+      /** A plain file (default name `notes.txt`, default text empty). */
+      readonly kind: 'file'
+      readonly name?: string
+      readonly text?: string
+    }
+  | {
+      /** A file named `<stem>` plus the reservation suffix whose stem is no owner (default `not-an-owner`); it holds `owner`'s valid reservation text when one is given, else nothing. */
+      readonly kind: 'json-no-owner'
+      readonly stem?: string
+      readonly owner?: LockDirOwnerSpec
+    }
+  | {
+      /** A leftover temporary file of `owner`'s reservation write (`reservationTempFileName`), holding its valid reservation text. */
+      readonly kind: 'reservation-temp'
+      readonly owner: LockDirOwnerSpec
+    }
+  | {
+      /** A subdirectory (default name `subdir`). */
+      readonly kind: 'directory'
+      readonly name?: string
+    }
+
+/** What to build under the caller's root. */
+export interface LockDirSpec {
+  /** `home` (default): a constructed account home holding the lock directory; `bare`: a lock directory alone; `home-only`: the home without its lock directory (nothing else may be asked), for the runner to create. */
+  readonly layout?: 'home' | 'bare' | 'home-only'
+  /** The home's (or bare lock directory's) entry name under the root; default `account-home` (or `lock-dir`). */
+  readonly name?: string
+  /** The fake process table owners by RUN_ID and liveness are added to. */
+  readonly processes?: FakeProcessTable
+  /** The lock file; none when absent. */
+  readonly lockFile?: LockFileSpec
+  readonly reservations?: readonly LockDirReservationSpec[]
+  /** A reservation that vanishes between the runner's listing and its read (see `VanishingReservation`); its name must sort after one of `reservations`. */
+  readonly vanishing?: LockDirReservationSpec
+  readonly unrelated?: readonly UnrelatedEntrySpec[]
+}
+
+/** One reservation as built. */
+export interface BuiltReservation {
+  readonly owner: Owner
+  readonly fileName: string
+  readonly path: string
+  /** The text written; null for a symbolic link. */
+  readonly text: string | null
+}
+
+/**
+ * A reservation listed by a directory read that is gone when the runner reads
+ * it. The runner lists the lock directory once and then, in file-name order,
+ * reads each reservation-named entry and probes its owner's liveness; so the
+ * wrapped probe's first call (made for an entry sorting before this one)
+ * removes this file, and the runner's read of it then finds nothing.
+ */
+export interface VanishingReservation extends BuiltReservation {
+  /** Removes the file now; later calls do nothing. */
+  vanish(): void
+  /** `inner` with one change: its first call of either member removes the file first. */
+  probe(inner: OwnerLivenessProbe): OwnerLivenessProbe
+}
+
+/** A built lock directory. */
+export interface BuiltLockDir {
+  /** The constructed account home; null for a bare lock directory. */
+  readonly home: string | null
+  /** The lock directory to inject (`RunnerDeps.lockDir`); not created for `home-only`. */
+  readonly lockDir: string
+  /** The lock file's path (`admissionLockPath`), whether or not it was written. */
+  readonly lockPath: string
+  /** The holder the lock file names; null when there is no lock file. */
+  readonly holder: Owner | null
+  /** The record written in the lock file; null when there is none. */
+  readonly lockText: string | null
+  /** Whether a flock is held on the lock file. */
+  readonly held: boolean
+  readonly reservations: readonly BuiltReservation[]
+  readonly vanishing: VanishingReservation | null
+  /** The unrelated entries' paths, in spec order. */
+  readonly unrelated: readonly string[]
+  /** Releases the held flock (call it in `afterEach`); later calls, and calls with none held, do nothing. */
+  release(): void
+}
+
+/** An owner's `Owner`: as given, or a live or gone `/ci` runner added to the table. */
+function lockDirOwner(spec: LockDirOwnerSpec, processes: FakeProcessTable | undefined): Owner {
+  if ('owner' in spec) return spec.owner
+  if (processes === undefined) throw new Error('buildLockDir: an owner given by RUN_ID and liveness needs the spec\'s process table')
+  const pid = processes.add(ciRunnerProcess(spec.runId, { alive: spec.alive }))
+  return { runId: spec.runId, pid }
+}
+
+/** A valid holder record with one named change. Throws when the change leaves a record the runner still reads. */
+function changedLockRecord(valid: string, change: LockRecordChange): string {
+  const text = change === 'cut' ? valid.slice(0, Math.floor(valid.length / 2)) : change === 'empty' ? '' : change === 'second-line' ? `${valid}${valid}` : change.edit(valid)
+  if (parseLockHolder(text) !== null) throw new Error(`buildLockDir: the change ${typeof change === 'string' ? change : change.what} leaves a holder record the runner reads`)
+  return text
+}
+
+/** Writes the lock file's record in place through the runner's own lock-file primitive, then closes it. */
+function writeLockRecord(path: string, text: string): void {
+  const opened = openLockFile(path)
+  if (!opened.ok) throw new Error(`buildLockDir: ${opened.error}`)
+  try {
+    const written = opened.value.writeText(text)
+    if (!written.ok) throw new Error(`buildLockDir: ${written.error}`)
+  } finally {
+    opened.value.release()
+  }
+}
+
+/** Takes an exclusive flock on the lock file on a second descriptor through the runner's primitive, and checks that a fresh descriptor finds it held. Answers its release. */
+function holdLockFile(path: string): () => void {
+  const opened = openLockFile(path)
+  if (!opened.ok) throw new Error(`buildLockDir: ${opened.error}`)
+  const file = opened.value
+  const attempt = file.tryLock()
+  if (attempt.kind !== 'taken') {
+    file.release()
+    throw new Error(`buildLockDir: the flock on ${path} could not be taken: ${attempt.kind === 'error' ? attempt.error : 'already held'}`)
+  }
+  if (probeFlock(path) !== 'held') {
+    file.release()
+    throw new Error(`buildLockDir: the flock on ${path} is not seen as held`)
+  }
+  return () => file.release()
+}
+
+/** Writes one reservation into the lock directory: valid through `writeReservation`, or with one named change. */
+function writeLockDirReservation(lockDir: string, spec: LockDirReservationSpec, processes: FakeProcessTable | undefined): BuiltReservation {
+  const owner = lockDirOwner(spec.owner, processes)
+  const request = { owner, shards: spec.shards ?? 1, memoryCapBytes: spec.memoryCapBytes ?? SHARD_MEMORY_CAP_BYTES, kind: spec.kind ?? ('full' as RunKind) }
+  const fileName = reservationFileName(owner)
+  const path = join(lockDir, fileName)
+  const change = spec.change
+  if (change === undefined) {
+    assertWritten(writeReservation(lockDir, request), 'buildLockDir')
+  } else if (change.kind === 'dangling-link') {
+    symlinkSync(join(lockDir, `${fileName}.missing`), path)
+    return { owner, fileName, path, text: null }
+  } else if (change.kind === 'owner') {
+    if (change.owner.runId === owner.runId && change.owner.pid === owner.pid) throw new Error('buildLockDir: the owner change names the file name\'s own owner')
+    assertWritten(writeWholeFile(lockDir, fileName, serializeReservation(buildReservation({ ...request, owner: change.owner }))), 'buildLockDir')
+  } else {
+    assertWritten(writeWholeFile(lockDir, fileName, changedJsonText(serializeReservation(buildReservation(request)), change)), 'buildLockDir')
+  }
+  return { owner, fileName, path, text: readFileSync(path, 'utf-8') }
+}
+
+/** Writes one unrelated entry and answers its path; throws for a name the runner would read as a reservation or as the lock file. */
+function writeUnrelatedEntry(lockDir: string, spec: UnrelatedEntrySpec, processes: FakeProcessTable | undefined): string {
+  const validText = (owner: Owner): string => serializeReservation(buildReservation({ owner, shards: 1, memoryCapBytes: SHARD_MEMORY_CAP_BYTES, kind: 'full' }))
+  let name: string
+  let text: string | null = null
+  switch (spec.kind) {
+    case 'file':
+      name = spec.name ?? 'notes.txt'
+      text = spec.text ?? ''
+      break
+    case 'json-no-owner':
+      name = `${spec.stem ?? 'not-an-owner'}${RESERVATION_FILE_SUFFIX}`
+      text = spec.owner === undefined ? '' : validText(lockDirOwner(spec.owner, processes))
+      break
+    case 'reservation-temp': {
+      const owner = lockDirOwner(spec.owner, processes)
+      name = reservationTempFileName(owner)
+      text = validText(owner)
+      break
+    }
+    case 'directory':
+      name = spec.name ?? 'subdir'
+      break
+  }
+  assertPlainEntryName(name, 'buildLockDir')
+  const path = join(lockDir, name)
+  if (reservationOwnerFromFileName(name) !== null || path === admissionLockPath(lockDir)) throw new Error(`buildLockDir: ${JSON.stringify(name)} is no unrelated name`)
+  if (text === null) mkdirSync(path)
+  else writeFileSync(path, text, { flag: 'wx' })
+  return path
+}
+
+/**
+ * Builds a lock directory under the caller's own temporary root (b.uqm
+ * SR-21.4): the directories, then the lock file (its record written, then its
+ * flock taken when asked), the reservations, the vanishing reservation and the
+ * unrelated entries, in that order, each owner given by RUN_ID and liveness
+ * added to `spec.processes` in that order too. A held flock blocks the
+ * runner's take until `release()`.
+ */
+export function buildLockDir(root: string, spec: LockDirSpec = {}): BuiltLockDir {
+  if (!isAbsolute(root) || !lstatSync(root).isDirectory()) throw new Error(`buildLockDir: ${root} is not the caller's temporary root`)
+  const layout = spec.layout ?? 'home'
+  const name = spec.name ?? (layout === 'bare' ? 'lock-dir' : 'account-home')
+  assertPlainEntryName(name, 'buildLockDir')
+  const home = layout === 'bare' ? null : join(root, name)
+  const lockDir = home === null ? join(root, name) : admissionLockDir(home)
+  const lockPath = admissionLockPath(lockDir)
+  if (home !== null) mkdirSync(home)
+  if (layout === 'home-only') {
+    if (spec.lockFile !== undefined || spec.reservations !== undefined || spec.vanishing !== undefined || spec.unrelated !== undefined) {
+      throw new Error('buildLockDir: a home without its lock directory holds nothing')
+    }
+  } else {
+    mkdirSync(lockDir, { recursive: true, mode: RUN_DIR_MODE })
+    chmodSync(lockDir, RUN_DIR_MODE)
+  }
+
+  let holder: Owner | null = null
+  let lockText: string | null = null
+  let releaseFlock: (() => void) | null = null
+  if (spec.lockFile !== undefined) {
+    holder = lockDirOwner(spec.lockFile.holder, spec.processes)
+    const valid = formatLockHolder(holder)
+    const parsed = parseLockHolder(valid)
+    if (parsed === null || parsed.runId !== holder.runId || parsed.pid !== holder.pid) throw new Error(`buildLockDir: ${JSON.stringify(valid)} is no holder record`)
+    lockText = spec.lockFile.change === undefined ? valid : changedLockRecord(valid, spec.lockFile.change)
+    writeLockRecord(lockPath, lockText)
+    if (spec.lockFile.held === true) releaseFlock = holdLockFile(lockPath)
+  }
+
+  const reservations = (spec.reservations ?? []).map((reservation) => writeLockDirReservation(lockDir, reservation, spec.processes))
+
+  let vanishing: VanishingReservation | null = null
+  if (spec.vanishing !== undefined) {
+    const built = writeLockDirReservation(lockDir, spec.vanishing, spec.processes)
+    if (!reservations.some((reservation) => reservation.fileName < built.fileName)) {
+      throw new Error(`buildLockDir: the vanishing reservation ${built.fileName} needs a reservation whose name sorts before it, whose read probes an owner first`)
+    }
+    let gone = false
+    const vanish = (): void => {
+      if (gone) return
+      gone = true
+      rmSync(built.path, { force: true })
+    }
+    vanishing = {
+      ...built,
+      vanish,
+      probe: (inner) => ({
+        isPidAlive: (pid) => {
+          vanish()
+          return inner.isPidAlive(pid)
+        },
+        readProcCmdline: (pid) => {
+          vanish()
+          return inner.readProcCmdline(pid)
+        },
+      }),
+    }
+  }
+
+  const unrelated = (spec.unrelated ?? []).map((entry) => writeUnrelatedEntry(lockDir, entry, spec.processes))
+
+  return {
+    home,
+    lockDir,
+    lockPath,
+    holder,
+    lockText,
+    held: releaseFlock !== null,
+    reservations,
+    vanishing,
+    unrelated,
+    release() {
+      const release = releaseFlock
+      releaseFlock = null
+      release?.()
+    },
+  }
+}
+
+// The password file (b.uqm SR-6.1, SR-21.4).
+
+/** The b.uqm SR-21.4 password-file cases, by what the runner's user ID has in the file. */
+export type PasswordFileCase =
+  /** A first matching line that gives the home. */
+  | 'first-match'
+  /** That first matching line, and a later one for the same user ID giving another home. */
+  | 'later-match'
+  /** A first matching line of six fields (its shell dropped), its home still absolute. */
+  | 'fewer-fields'
+  /** A first matching line whose home field is empty. */
+  | 'empty-home'
+  /** A first matching line whose home is relative (the home without its leading slashes). */
+  | 'relative-home'
+  /** A first matching line of six fields, then a valid line for the same user ID giving the home. */
+  | 'later-line-after-malformed'
+  /** Its only line has the user ID with a leading zero. */
+  | 'uid-leading-zero'
+  /** Its only line has the user ID after a space. */
+  | 'uid-leading-space'
+  /** Its only line has the user ID before a space. */
+  | 'uid-trailing-space'
+  /** No line for the user ID at all. */
+  | 'no-line'
+
+/** What the password-file rule finds for a case: the home, no line for the user ID, or a first such line that gives no home. */
+export type PasswordFileFinding = 'home' | Exclude<AccountHomeFailure['kind'], 'unreadable'>
+
+/** One password-file case for a user ID and home. */
+export interface PasswordFileRow {
+  readonly name: PasswordFileCase
+  /** What the case is, for a table's row label. */
+  readonly label: string
+  readonly text: string
+  /** The home the rule gives: the given home, or undefined. */
+  readonly home: string | undefined
+  readonly finding: PasswordFileFinding
+}
+
+/** Test data: the account names, the shell and the other homes' suffixes of the constructed password files. */
+const PASSWORD_ACCOUNT_NAME = 'ci-account'
+const PASSWORD_OTHER_BEFORE_NAME = 'other-before'
+const PASSWORD_OTHER_AFTER_NAME = 'other-after'
+const PASSWORD_SHELL = '/bin/sh'
+const LATER_MATCH_HOME_SUFFIX = '-later'
+
+/** One password-file line: name, password, user ID, group ID, comment, home, shell (passwd(5)). */
+function passwordFields(name: string, uidField: string, gid: number, home: string): string[] {
+  return [name, 'x', uidField, String(gid), '', home, PASSWORD_SHELL]
+}
+
+/**
+ * Every b.uqm SR-21.4 password-file case for `uid` and `home`, by name. Each
+ * text holds, around the case's lines, a line before for the user ID `<uid>0`
+ * (which is not `uid`) and a line after for `uid + 1`, each with its own home.
+ * A malformed case is the first-match line with one named change.
+ */
+export function passwordFileCases(uid: number, home: string): Readonly<Record<PasswordFileCase, PasswordFileRow>> {
+  if (!Number.isSafeInteger(uid) || uid < 0 || !Number.isSafeInteger(uid + 1)) throw new Error(`passwordFileCases: ${uid} is no user ID`)
+  const relativeHome = home.replace(/^\/+/, '')
+  if (!isAbsolute(home) || relativeHome === '' || /[:\n\r]/.test(home)) throw new Error(`passwordFileCases: ${JSON.stringify(home)} is no home a password-file line can give`)
+  const own = String(uid)
+  const valid = passwordFields(PASSWORD_ACCOUNT_NAME, own, uid, home)
+  const line = (fields: readonly string[]): string => fields.join(':')
+  const withField = (index: number, value: string): string[] => valid.map((field, at) => (at === index ? value : field))
+  const sixFields = valid.slice(0, -1)
+  const text = (...lines: string[]): string =>
+    linesText([
+      line(passwordFields(PASSWORD_OTHER_BEFORE_NAME, `${own}0`, uid, `${home}-${PASSWORD_OTHER_BEFORE_NAME}`)),
+      ...lines,
+      line(passwordFields(PASSWORD_OTHER_AFTER_NAME, String(uid + 1), uid, `${home}-${PASSWORD_OTHER_AFTER_NAME}`)),
+    ])
+  // The field positions of passwd(5): the user ID third, the home sixth.
+  const UID_FIELD = 2
+  const HOME_FIELD = 5
+  const rows: readonly Omit<PasswordFileRow, 'home'>[] = [
+    { name: 'first-match', label: 'a first matching line giving the home', text: text(line(valid)), finding: 'home' },
+    {
+      name: 'later-match',
+      label: 'a first matching line, then a later one giving another home',
+      text: text(line(valid), line(withField(HOME_FIELD, `${home}${LATER_MATCH_HOME_SUFFIX}`))),
+      finding: 'home',
+    },
+    { name: 'fewer-fields', label: 'a first matching line of fewer than seven fields', text: text(line(sixFields)), finding: 'no-home' },
+    { name: 'empty-home', label: 'a first matching line with an empty home', text: text(line(withField(HOME_FIELD, ''))), finding: 'no-home' },
+    { name: 'relative-home', label: 'a first matching line with a relative home', text: text(line(withField(HOME_FIELD, relativeHome))), finding: 'no-home' },
+    {
+      name: 'later-line-after-malformed',
+      label: 'a first matching line of fewer than seven fields, then a valid one',
+      text: text(line(sixFields), line(valid)),
+      finding: 'no-home',
+    },
+    { name: 'uid-leading-zero', label: 'a user-ID field with a leading zero', text: text(line(withField(UID_FIELD, `0${own}`))), finding: 'no-entry' },
+    { name: 'uid-leading-space', label: 'a user-ID field with a leading space', text: text(line(withField(UID_FIELD, ` ${own}`))), finding: 'no-entry' },
+    { name: 'uid-trailing-space', label: 'a user-ID field with a trailing space', text: text(line(withField(UID_FIELD, `${own} `))), finding: 'no-entry' },
+    { name: 'no-line', label: 'no line for the user ID', text: text(), finding: 'no-entry' },
+  ]
+  return Object.fromEntries(rows.map((row) => [row.name, { ...row, home: row.finding === 'home' ? home : undefined }])) as Record<PasswordFileCase, PasswordFileRow>
+}
+
+/** Writes a password-file text under the caller's root (default name `passwd`) and answers its path. */
+export function writePasswordFile(root: string, text: string, name = 'passwd'): string {
+  assertPlainEntryName(name, 'writePasswordFile')
+  const path = join(root, name)
+  writeFileSync(path, text, { flag: 'wx' })
+  return path
+}
+
+/** A password file that cannot be read: a directory at its path under the caller's root (default name `passwd-unreadable`), which fails a file read whatever the user, root included. Answers its path. */
+export function writeUnreadablePasswordFile(root: string, name = 'passwd-unreadable'): string {
+  assertPlainEntryName(name, 'writeUnreadablePasswordFile')
+  const path = join(root, name)
+  mkdirSync(path)
+  return path
+}
+
+/** The runner's `readPasswordFile` dependency over a constructed password file: its text, or the read's failure on one line. */
+export function passwordFileReader(path: string): RunnerDeps['readPasswordFile'] {
+  return () => {
+    try {
+      return { ok: true, value: readFileSync(path, 'utf-8') }
+    } catch (err) {
+      return { ok: false, error: (err instanceof Error ? err.message : String(err)).replace(/\s*[\r\n]+\s*/g, ' ').trim() }
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // 9. Cgroups, /ci-live and readings (E6)

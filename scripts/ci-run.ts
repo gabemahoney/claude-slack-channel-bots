@@ -71,6 +71,12 @@ import {
 // E11 T1's evidence reader: listings and entry types that never follow a
 // link. Aliased so another lane's own `node:fs` import cannot collide.
 import { lstatSync as lstatEvidenceEntry, readdirSync as listEvidenceDir } from 'node:fs'
+// E5 T1's admission lock: the account's home, the lock file's descriptor and its holder record.
+import { closeSync, constants as fsConstants, fchmodSync, ftruncateSync, openSync, readSync } from 'node:fs'
+import { isAbsolute } from 'node:path'
+// E5 T2's reservations: the remover. The reader's listing and type check use
+// `lstatSync` and `readdirSync`, imported once by E2 T1's worktree reader (section 7).
+import { unlinkSync } from 'node:fs'
 
 // ---------------------------------------------------------------------------
 // 1. Entry and dependencies (E1)
@@ -946,12 +952,16 @@ export interface Reservation {
 export interface ListedReservation {
   readonly fileName: string
   readonly reservation: Reservation
+  /** Its owner, read from its file name (E5 T2). */
+  readonly owner: Owner
   readonly ownerAlive: boolean
 }
 
 /** A reservation file that cannot be used (b.uqm SR-6.2). */
 export interface BadReservationFile {
   readonly fileName: string
+  /** Its owner, read from its file name (E5 T2). */
+  readonly owner: Owner
   /** Its owner's liveness, read from its file name. */
   readonly ownerAlive: boolean
   readonly reason: string
@@ -5340,6 +5350,942 @@ export function validateRun(args: readonly string[], worktreeRoot: string, env: 
 // ---------------------------------------------------------------------------
 // 9. Lock, reservations and sweep (E5)
 // ---------------------------------------------------------------------------
+
+// --- 9/T1 (E5 T1): the account's home and the admission lock ---
+//
+// Admission happens one run at a time across every worktree, lane and session
+// of the account (b.uqm SR-6.1). The lock is an exclusive `flock(2)` that the
+// runner process itself holds on `admission.lock` in `.config/cscb-ci/` under
+// the account's home, so the kernel frees it when the runner dies, and every
+// worktree finds it at the same path.
+//
+// - The account's home comes from the first password-file line for the
+//   runner's user ID (`accountHomeFrom`, the same rule as the test helper's
+//   `passwdHomeFrom`), read through `RunnerDeps.readPasswordFile`; never from
+//   `$HOME`, `os.homedir()` or `os.userInfo()`. Nothing here reads at import.
+// - The flock is libc's, reached through `bun:ffi`, which is loaded, with
+//   libc, on the first lock attempt. The lock file's descriptor is opened
+//   close-on-exec, so no child holds it.
+// - Take waits at most `LOCK_WAIT_MS` on the injected clock, retrying every
+//   `LOCK_POLL_MS` with the last try at the wait's end exactly, then refuses
+//   naming the holder recorded in the file. Once the flock is taken, the
+//   runner's own `<RUN_ID>-<PID>` is written into the file in place, for
+//   messages only: the flock alone decides who holds the lock.
+// - The lock file is never renamed, replaced or removed: a new inode would let
+//   two runs each hold "the" lock.
+//
+// E13 binds the real lock directory (`admissionLockDir` of the resolved home)
+// at step 6, takes the lock there, and releases it at step 11 and on every
+// refusal and stop that holds it. E6 takes the account's home from E13's
+// composition for `/ci-live`'s real-run lock.
+
+/** The admission lock's file name in the lock directory (b.uqm SR-6.1); never a reservation name. */
+export const LOCK_FILE_NAME = 'admission.lock'
+/** The lock directory below the account's home (b.uqm SR-6.1). */
+export const LOCK_DIR_SUBPATH = '.config/cscb-ci'
+/** How often take retries a busy lock on the injected clock, well under `LOCK_WAIT_MS`; the last try falls at the wait's end exactly. */
+export const LOCK_POLL_MS = 250
+
+/** A password-file entry's fields: at least seven, the user ID third and the home sixth (passwd(5)). */
+const PASSWORD_ENTRY_FIELDS = 7
+const PASSWORD_UID_FIELD = 2
+const PASSWORD_HOME_FIELD = 5
+
+/** The first password-file line whose user-ID field is exactly `uid` in decimal, split into its fields; undefined when there is none. */
+function firstPasswordEntry(passwordText: string, uid: number): readonly string[] | undefined {
+  if (typeof passwordText !== 'string' || !Number.isSafeInteger(uid) || uid < 0) return undefined
+  const wanted = String(uid)
+  for (const line of passwordText.split('\n')) {
+    const fields = line.split(':')
+    if (fields[PASSWORD_UID_FIELD] === wanted) return fields
+  }
+  return undefined
+}
+
+/** The home one password-file entry gives: its sixth field, when the entry has at least seven fields and that field is an absolute path. */
+function passwordEntryHome(fields: readonly string[]): string | undefined {
+  const home = fields[PASSWORD_HOME_FIELD]
+  return fields.length >= PASSWORD_ENTRY_FIELDS && home !== undefined && isAbsolute(home) ? home : undefined
+}
+
+/**
+ * The account's home by the password-file rule (b.uqm SR-6.1, SR-21.5): the
+ * first line whose user-ID field equals `uid` written in decimal decides (a
+ * leading zero or a space does not match); it gives its sixth field when it
+ * has at least seven fields and that field is absolute, else undefined. A
+ * later line for the same user ID is never used. Pure; the same rule as
+ * `passwdHomeFrom` in `tests/test-helpers/host-safe-env.ts`.
+ */
+export function accountHomeFrom(passwordText: string, uid: number): string | undefined {
+  const fields = firstPasswordEntry(passwordText, uid)
+  return fields === undefined ? undefined : passwordEntryHome(fields)
+}
+
+/** Why the account's home could not be found: the password file unreadable, no line for the user ID, or a first such line that gives no home. */
+export type AccountHomeFailure =
+  | {
+      readonly kind: 'unreadable'
+      readonly error: string
+    }
+  | {
+      readonly kind: 'no-entry'
+    }
+  | {
+      readonly kind: 'no-home'
+    }
+
+/** The not-runnable refusal for an account's home that could not be found (kind null), naming the user ID and `/etc/passwd` (b.uqm SR-6.1). */
+export function accountHomeRefusal(uid: number, failure: AccountHomeFailure): Refusal {
+  const cause =
+    failure.kind === 'unreadable'
+      ? `${REAL_PASSWORD_FILE} could not be read: ${dependencyErrorText(failure.error)}`
+      : failure.kind === 'no-entry'
+        ? `${REAL_PASSWORD_FILE} has no line for user ID ${uid}`
+        : `the first line of ${REAL_PASSWORD_FILE} for user ID ${uid} gives no absolute home in its sixth of at least seven fields`
+  return buildRefusal(null, `the account's home for user ID ${uid} could not be found in ${REAL_PASSWORD_FILE}`, [cause])
+}
+
+/** The account's home, or the refusal that it could not be found. */
+export type AccountHomeResolution =
+  | {
+      readonly ok: true
+      readonly home: string
+    }
+  | {
+      readonly ok: false
+      readonly refusal: Refusal
+    }
+
+/** The account's home: the password file read through the injected dependency, by `accountHomeFrom` for the injected user ID (b.uqm SR-6.1). */
+export function resolveAccountHome(deps: Pick<RunnerDeps, 'uid' | 'readPasswordFile'>): AccountHomeResolution {
+  const text = deps.readPasswordFile()
+  if (!text.ok) return { ok: false, refusal: accountHomeRefusal(deps.uid, { kind: 'unreadable', error: text.error }) }
+  const fields = firstPasswordEntry(text.value, deps.uid)
+  if (fields === undefined) return { ok: false, refusal: accountHomeRefusal(deps.uid, { kind: 'no-entry' }) }
+  const home = passwordEntryHome(fields)
+  if (home === undefined) return { ok: false, refusal: accountHomeRefusal(deps.uid, { kind: 'no-home' }) }
+  return { ok: true, home }
+}
+
+/** The lock directory under an account's home, `<home>/.config/cscb-ci` (b.uqm SR-6.1). */
+export function admissionLockDir(accountHome: string): string {
+  return join(accountHome, LOCK_DIR_SUBPATH)
+}
+
+/** The lock file in a lock directory, `<lockDir>/admission.lock` (b.uqm SR-6.1). */
+export function admissionLockPath(lockDir: string): string {
+  return join(lockDir, LOCK_FILE_NAME)
+}
+
+/** The lock file's holder record: the holder's `<RUN_ID>-<PID>` and a line feed. */
+export function formatLockHolder(holder: Owner): string {
+  return `${formatOwner(holder)}\n`
+}
+
+/** The holder a lock file's text records: one `<RUN_ID>-<PID>` line, its line feed optional; null for any other text. */
+export function parseLockHolder(text: string): Owner | null {
+  const line = text.endsWith('\n') ? text.slice(0, -1) : text
+  if (LINE_BREAK_PATTERN.test(line)) return null
+  return parseOwner(line)
+}
+
+/** The busy-lock refusal (b.uqm SR-6.8), kind null, naming the PID and RUN_ID recorded in the lock file; an unknown holder when none could be read. */
+export function busyLockRefusal(holder: Owner | null): Refusal {
+  const named = holder === null ? 'an unknown run holds it' : `run ${holder.runId} (PID ${holder.pid}) holds it`
+  return buildRefusal(null, `the admission lock stayed busy for ${LOCK_WAIT_MS / 1000} s: ${named}`, [
+    'another /ci run is being admitted; try again once its admission is done',
+  ])
+}
+
+/** libc's `flock` operations (`<sys/file.h>`). */
+const LIBC_LOCK_EXCLUSIVE = 2
+const LIBC_LOCK_NON_BLOCKING = 4
+const LIBC_LOCK_UNLOCK = 8
+/** The C library `flock` is loaded from. */
+const LIBC_FILE_NAME = 'libc.so.6'
+/** Linux's `O_CLOEXEC`, which `node:fs` constants do not export: no child inherits the descriptor. */
+const OPEN_CLOSE_ON_EXEC = 0o2000000
+/** How many times one lock try repeats a `flock` a signal interrupted. */
+const FLOCK_INTERRUPTED_TRIES = 3
+/** The most of a lock file's text read for its holder record. */
+const LOCK_RECORD_MAX_BYTES = 4096
+
+/** libc's `flock` and the calling thread's `errno`. */
+interface LibcFlock {
+  flock(fd: number, operation: number): number
+  errno(): number
+}
+
+let libcFlockBinding: LibcFlock | null = null
+
+/** libc's `flock`, with `bun:ffi` and libc loaded on first use, never at import. Throws when libc cannot be loaded. */
+function libcFlock(): LibcFlock {
+  if (libcFlockBinding === null) {
+    const ffi = require('bun:ffi') as typeof import('bun:ffi')
+    const libc = ffi.dlopen(LIBC_FILE_NAME, {
+      flock: { args: [ffi.FFIType.i32, ffi.FFIType.i32], returns: ffi.FFIType.i32 },
+      __errno_location: { args: [], returns: ffi.FFIType.ptr },
+    })
+    libcFlockBinding = {
+      flock: (fd, operation) => libc.symbols.flock(fd, operation),
+      errno: () => {
+        const at = libc.symbols.__errno_location()
+        return at === null ? 0 : ffi.read.i32(at, 0)
+      },
+    }
+  }
+  return libcFlockBinding
+}
+
+/** An errno's name, such as `ENOLCK`, or its number. */
+function errnoName(errno: number): string {
+  const entry = Object.entries(osConstants.errno).find(([, value]) => value === errno)
+  return entry === undefined ? `errno ${errno}` : entry[0]
+}
+
+/** One exclusive, non-blocking flock try: taken; held by another descriptor; or failed for another reason, never reported as held. */
+export type FlockAttempt =
+  | {
+      readonly kind: 'taken'
+    }
+  | {
+      readonly kind: 'held'
+    }
+  | {
+      readonly kind: 'error'
+      readonly error: string
+    }
+
+/** An open lock file: one close-on-exec, read-write descriptor that flocks and records the holder in place. */
+export interface LockFile {
+  readonly path: string
+  /** Whether opening it created the file. */
+  readonly created: boolean
+  /** Tries an exclusive, non-blocking flock on the descriptor. */
+  tryLock(): FlockAttempt
+  /** The file's text (at most 4 KiB of it), read through the descriptor. */
+  readText(): DepRead<string>
+  /** Replaces the file's text in place through the descriptor: same inode, never a rename. */
+  writeText(text: string): DepRead<null>
+  /** Unlocks and closes the descriptor; later calls do nothing, and later tries and reads fail. */
+  release(): void
+}
+
+/** Opens a lock file read-write and close-on-exec, creating it 0600 when missing; throws on failure. */
+function openLockDescriptor(path: string): { fd: number; created: boolean } {
+  const flags = fsConstants.O_RDWR | OPEN_CLOSE_ON_EXEC
+  try {
+    const fd = openSync(path, flags | fsConstants.O_CREAT | fsConstants.O_EXCL, WRITTEN_FILE_MODE)
+    try {
+      fchmodSync(fd, WRITTEN_FILE_MODE)
+    } catch (err) {
+      closeSync(fd)
+      throw err
+    }
+    return { fd, created: true }
+  } catch (err) {
+    if (errnoCode(err) !== 'EEXIST') throw err
+  }
+  return { fd: openSync(path, flags), created: false }
+}
+
+/**
+ * The flock primitive (b.uqm SR-6.1): opens `path` on a descriptor no child
+ * inherits, creating the file 0600 when it is missing (an existing file is
+ * used as it is), or answers why it could not. Locking loads libc on first
+ * use. Two descriptors on one file contend, in one process as in two.
+ */
+export function openLockFile(path: string): DepRead<LockFile> {
+  let opened: { fd: number; created: boolean }
+  try {
+    opened = openLockDescriptor(path)
+  } catch (err) {
+    return { ok: false, error: `the lock file could not be opened: ${dependencyErrorText(err)}` }
+  }
+  let fd: number | null = opened.fd
+  const releasedError = `the lock file is released: ${path}`
+  return {
+    ok: true,
+    value: {
+      path,
+      created: opened.created,
+      tryLock() {
+        if (fd === null) return { kind: 'error', error: releasedError }
+        let libc: LibcFlock
+        try {
+          libc = libcFlock()
+        } catch (err) {
+          return { kind: 'error', error: `flock could not be loaded: ${dependencyErrorText(err)}` }
+        }
+        let errno = 0
+        for (let attempt = 0; attempt < FLOCK_INTERRUPTED_TRIES; attempt++) {
+          if (libc.flock(fd, LIBC_LOCK_EXCLUSIVE | LIBC_LOCK_NON_BLOCKING) === 0) return { kind: 'taken' }
+          errno = libc.errno()
+          if (errno === osConstants.errno.EWOULDBLOCK) return { kind: 'held' }
+          if (errno !== osConstants.errno.EINTR) break
+        }
+        return { kind: 'error', error: `flock failed on ${path}: ${errnoName(errno)}` }
+      },
+      readText() {
+        if (fd === null) return { ok: false, error: releasedError }
+        try {
+          const bytes = new Uint8Array(LOCK_RECORD_MAX_BYTES)
+          const count = readSync(fd, bytes, 0, bytes.length, 0)
+          return { ok: true, value: new TextDecoder().decode(bytes.subarray(0, count)) }
+        } catch (err) {
+          return { ok: false, error: `the lock file could not be read: ${dependencyErrorText(err)}` }
+        }
+      },
+      writeText(text) {
+        if (fd === null) return { ok: false, error: releasedError }
+        try {
+          const bytes = new TextEncoder().encode(text)
+          let written = 0
+          while (written < bytes.length) {
+            const count = writeSync(fd, bytes, written, bytes.length - written, written)
+            if (count <= 0) throw new Error(`no bytes written to ${path}`)
+            written += count
+          }
+          ftruncateSync(fd, bytes.length)
+          return { ok: true, value: null }
+        } catch (err) {
+          return { ok: false, error: `the lock file could not be written: ${dependencyErrorText(err)}` }
+        }
+      },
+      release() {
+        if (fd === null) return
+        const held = fd
+        fd = null
+        // libc is loaded only once a try was made; before that no flock can be held.
+        libcFlockBinding?.flock(held, LIBC_LOCK_UNLOCK)
+        try {
+          closeSync(held)
+        } catch {
+          // Closing frees the flock in any case; there is nothing to report on a release path.
+        }
+      },
+    },
+  }
+}
+
+/** Creates the lock directory 0700 when missing (its missing parents too); an existing one is used as it is. */
+function ensureLockDir(lockDir: string): DepRead<null> {
+  try {
+    const created = mkdirSync(lockDir, { recursive: true, mode: RUN_DIR_MODE })
+    if (created !== undefined) chmodSync(lockDir, RUN_DIR_MODE)
+    return { ok: true, value: null }
+  } catch (err) {
+    return { ok: false, error: `the lock directory could not be created: ${dependencyErrorText(err)}` }
+  }
+}
+
+/** A held admission lock. */
+export interface AdmissionLock {
+  /** The lock file's path. */
+  readonly path: string
+  /** Unlocks and closes; the file stays where it is. A second call does nothing, so refusal and stop paths may call it freely. */
+  release(): void
+}
+
+/**
+ * What take found: the lock taken; busy past the wait, with the recorded
+ * holder (null when unreadable) and the busy-lock refusal; or an error
+ * creating, opening, locking or recording, which is not busy and was never
+ * retried as busy.
+ */
+export type LockTake =
+  | {
+      readonly kind: 'taken'
+      readonly lock: AdmissionLock
+    }
+  | {
+      readonly kind: 'busy'
+      readonly holder: Owner | null
+      readonly refusal: Refusal
+    }
+  | {
+      readonly kind: 'error'
+      readonly error: string
+    }
+
+/** Waits `delayMs` on the injected clock. */
+function clockDelay(clock: RunnerClock, delayMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    clock.setTimeout(resolve, delayMs)
+  })
+}
+
+/**
+ * Takes the admission lock in `lockDir` for `holder` (b.uqm SR-6.1): creates
+ * the directory (0700) and the file (0600) when missing, tries the flock at
+ * once and then every `LOCK_POLL_MS` on `clock` until `LOCK_WAIT_MS` has
+ * passed, the last try at that mark exactly, and once taken records the
+ * holder in the file in place. A free lock is taken with no wait, whatever the
+ * file records. Never resolves rejected.
+ */
+export async function takeAdmissionLock(lockDir: string, holder: Owner, clock: RunnerClock): Promise<LockTake> {
+  const dir = ensureLockDir(lockDir)
+  if (!dir.ok) return { kind: 'error', error: dir.error }
+  const opened = openLockFile(admissionLockPath(lockDir))
+  if (!opened.ok) return { kind: 'error', error: opened.error }
+  const file = opened.value
+  const deadline = clock.now() + LOCK_WAIT_MS
+  for (;;) {
+    const attempt = file.tryLock()
+    if (attempt.kind === 'taken') {
+      const recorded = file.writeText(formatLockHolder(holder))
+      if (!recorded.ok) {
+        file.release()
+        return { kind: 'error', error: recorded.error }
+      }
+      return { kind: 'taken', lock: { path: file.path, release: () => file.release() } }
+    }
+    if (attempt.kind === 'error') {
+      file.release()
+      return { kind: 'error', error: attempt.error }
+    }
+    const left = deadline - clock.now()
+    if (left <= 0) {
+      const text = file.readText()
+      const recordedHolder = text.ok ? parseLockHolder(text.value) : null
+      file.release()
+      return { kind: 'busy', holder: recordedHolder, refusal: busyLockRefusal(recordedHolder) }
+    }
+    await clockDelay(clock, Math.min(LOCK_POLL_MS, left))
+  }
+}
+
+// --- 9/T2 (E5 T2): reservations: write, remove and read ---
+//
+// A reservation is `<RUN_ID>-<PID>.json` in the lock directory (b.uqm SR-6.2).
+// Its names, shape, serializer and parser are E1's (section 5, T3); this
+// sub-banner writes, removes and reads the files. Holding the lock while
+// writing is the caller's duty (E13, step 10). None of these touches any file
+// in the lock directory whose name is not the reservation name in question.
+
+/** What a reservation records for one run: its owner, N, the per-shard cap and the run kind (b.uqm SR-6.2). */
+export interface ReservationRequest {
+  readonly owner: Owner
+  /** N. */
+  readonly shards: number
+  /** The per-shard memory cap in bytes. */
+  readonly memoryCapBytes: number
+  readonly kind: RunKind
+}
+
+/** The reservation a spec gives: memory N × the cap, CPUs `CPUS_PER_SHARD` × N (b.uqm SR-6.2). */
+export function buildReservation(spec: ReservationRequest): Reservation {
+  return {
+    version: RESERVATION_FORMAT_VERSION,
+    runId: spec.owner.runId,
+    pid: spec.owner.pid,
+    shards: spec.shards,
+    memoryBytes: spec.shards * spec.memoryCapBytes,
+    cpus: CPUS_PER_SHARD * spec.shards,
+    kind: spec.kind,
+  }
+}
+
+/**
+ * Writes the owner's reservation into `lockDir` whole (b.uqm SR-6.2): E1's
+ * `writeWholeFile` writes `reservationTempFileName(owner)`, which is never a
+ * reservation name, then renames it to `reservationFileName(owner)`, so the
+ * reservation-named file appears only by the rename. A failure is returned,
+ * never thrown: a spec the serializer refuses writes nothing, and a failed
+ * write leaves no reservation-named file of its own and removes its temporary
+ * file where it can. The caller holds the lock and decides how the run ends.
+ */
+export function writeReservation(lockDir: string, spec: ReservationRequest): WriteResult {
+  const fileName = reservationFileName(spec.owner)
+  let text: string
+  try {
+    text = serializeReservation(buildReservation(spec))
+  } catch (err) {
+    return { ok: false, error: `writing ${join(lockDir, fileName)} failed: ${dependencyErrorText(err)}` }
+  }
+  return writeWholeFile(lockDir, fileName, text)
+}
+
+/** A reservation removal's outcome: removed, already gone (no failure), or failed with its cleanup-failure line (b.uqm SR-9.3). */
+export type ReservationRemoval =
+  | {
+      readonly kind: 'removed'
+    }
+  | {
+      readonly kind: 'absent'
+    }
+  | {
+      readonly kind: 'failed'
+      /** The cleanup-failure line, already written to the runner log; the caller lists it (`RunState.cleanupFailures`). */
+      readonly line: string
+    }
+
+/**
+ * Removes one owner's reservation from `lockDir` (b.uqm SR-6.2): E13's own in
+ * cleanup and refusals, T3's sweep for dead owners. A file already gone is no
+ * failure. Any other failure is written to the runner log and returned as a
+ * cleanup failure, never thrown (b.uqm SR-9.3).
+ */
+export function removeReservation(lockDir: string, owner: Owner, log: RunnerLogSink): ReservationRemoval {
+  const path = join(lockDir, reservationFileName(owner))
+  try {
+    unlinkSync(path)
+    return { kind: 'removed' }
+  } catch (err) {
+    if (errnoCode(err) === 'ENOENT') return { kind: 'absent' }
+    const line = `removing reservation ${path} failed: ${dependencyErrorText(err)}`
+    log(line)
+    return { kind: 'failed', line }
+  }
+}
+
+/** One reservation-named entry as read: valid, bad with its reason, or gone since the listing. */
+type ReservationEntryRead =
+  | {
+      readonly kind: 'valid'
+      readonly reservation: Reservation
+    }
+  | {
+      readonly kind: 'bad'
+      readonly reason: string
+    }
+  | {
+      readonly kind: 'gone'
+    }
+
+/** Reads and parses one reservation-named entry. Only a regular file is read, never through a link; a parsed file whose `runId` and `pid` are not its file name's owner is bad. */
+function readReservationEntry(path: string, owner: Owner): ReservationEntryRead {
+  try {
+    const stats = lstatSync(path, { throwIfNoEntry: false })
+    if (stats === undefined) return { kind: 'gone' }
+    if (!stats.isFile()) return { kind: 'bad', reason: 'not a regular file' }
+  } catch (err) {
+    return { kind: 'bad', reason: dependencyErrorText(err) }
+  }
+  const read = readFileText(path)
+  if (read.kind === 'missing') return { kind: 'gone' }
+  if (read.kind === 'unreadable') return { kind: 'bad', reason: read.error }
+  const parsed = parseReservation(read.text)
+  if (!parsed.ok) return { kind: 'bad', reason: parsed.error }
+  const named = { runId: parsed.value.runId, pid: parsed.value.pid }
+  if (named.runId !== owner.runId || named.pid !== owner.pid) {
+    return { kind: 'bad', reason: `it names the owner ${formatOwner(named)}, not its file name's ${formatOwner(owner)}` }
+  }
+  return { kind: 'valid', reservation: parsed.value }
+}
+
+/**
+ * Reads every reservation in `lockDir` (b.uqm SR-6.2), for T3's sweep and E6's
+ * admission readings; it removes nothing and formats no refusal.
+ * - Only reservation names are read (`reservationOwnerFromFileName`); every
+ *   other entry, `admission.lock` and temporary write names among them, is
+ *   ignored.
+ * - Each entry carries its owner, read from its file name, and that owner's
+ *   liveness (E1's `isOwnerAlive`, b.uqm SR-6.3).
+ * - Valid: parsed by E1's `parseReservation`, naming its file name's owner.
+ *   Bad: not a regular file, unreadable, unparseable, of another version or
+ *   shape, or naming another owner, with its reason on one line.
+ * - An entry gone by the time it is read is absent, with no error.
+ * - A directory that cannot be listed is `{ kind: 'failed', error }`, the
+ *   error on one line; E6 turns it into a failed reading, T3 into a cleanup
+ *   failure.
+ * Both lists are in file-name order.
+ */
+export function readReservations(lockDir: string, probe: OwnerLivenessProbe): ReservationListing {
+  let names: string[]
+  try {
+    names = readdirSync(lockDir)
+  } catch (err) {
+    return { kind: 'failed', error: dependencyErrorText(err) }
+  }
+  const valid: ListedReservation[] = []
+  const bad: BadReservationFile[] = []
+  for (const fileName of names.sort()) {
+    const owner = reservationOwnerFromFileName(fileName)
+    if (owner === null) continue
+    const entry = readReservationEntry(join(lockDir, fileName), owner)
+    if (entry.kind === 'gone') continue
+    const ownerAlive = isOwnerAlive(owner, probe)
+    if (entry.kind === 'valid') valid.push({ fileName, reservation: entry.reservation, owner, ownerAlive })
+    else bad.push({ fileName, owner, ownerAlive, reason: entry.reason })
+  }
+  return { kind: 'listed', valid, bad }
+}
+
+// --- 9/T3 (E5 T3): the sweep and the image-removal primitives ---
+//
+// The image-removal primitives (b.uqm SR-9.3), which E8's cleanup reuses, and
+// the sweep of dead runs' leftovers (b.uqm SR-6.4), which E13 calls at step 7
+// under the lock.
+//
+// Only two kinds of image removal exist, both held here:
+// - `removeRunPrivateTag`: one run-private tag removed by its name, the tag
+//   built from an owner and a role, so it can never be an ID, a digest or a
+//   tag of any other shape;
+// - `removeOwnerUntaggedImages`: a listing of untagged images carrying exactly
+//   one owner label, then, only when it found one, a prune of untagged images
+//   filtered on that label, retried `PRUNE_RETRIES` times `PRUNE_RETRY_INTERVAL_MS`
+//   apart on the injected clock while Docker answers it is already running.
+// Neither forces. Each writes its failure to the runner log and returns the
+// cleanup-failure line (`RunState.cleanupFailures`); none throws, and a runner
+// log sink that throws loses only its line.
+//
+// The sweep lists (`listSweepLeftovers`), selects (`selectSweepLeftovers`,
+// pure) and removes (`sweepLeftovers`) in the fixed order: containers,
+// reservations, tags, untagged images. It never refuses the run, and touches
+// no file but dead owners' reservations in the lock directory: never the
+// system temp directory nor any run directory.
+
+// E6's 10/T3 declares these same two constants; whichever lane merges second deletes its copy (E6's is kept).
+/** The label `/ci-live`'s containers carry, as `cscb-live=1`; the sweep never touches such a container (b.uqm SR-6.4). */
+export const CI_LIVE_CONTAINER_LABEL = 'cscb-live'
+/** The `cscb-live` label's value on `/ci-live`'s containers. */
+export const CI_LIVE_CONTAINER_LABEL_VALUE = '1'
+
+/** Writes a cleanup-failure line to the runner log; a sink that throws loses only this line, so no failure is thrown past the caller. */
+function logCleanupFailure(log: RunnerLogSink, line: string): string {
+  try {
+    log(line)
+  } catch {
+    // The line is still returned and listed; the log's own failure is not the sweep's.
+  }
+  return line
+}
+
+/** A run-private tag removal's outcome: removed, already gone (no failure), or failed with its cleanup-failure line, already logged. */
+export type RunPrivateTagRemoval =
+  | {
+      readonly kind: 'removed'
+    }
+  | {
+      readonly kind: 'absent'
+    }
+  | {
+      readonly kind: 'failed'
+      /** The cleanup-failure line, already written to the runner log; the caller lists it (`RunState.cleanupFailures`). */
+      readonly line: string
+    }
+
+/**
+ * Removes one run-private tag by its name (b.uqm SR-9.3, SR-6.4): the tag
+ * `cscb-ci-run:<RUN_ID>-<PID>-<role>` built from `tag`'s owner and role,
+ * through E1's tag-removal form, never forced. Docker deletes the image with
+ * its last tag when no container uses it (b.uqm SR-23.6). A tag Docker does
+ * not know is absent, not a failure. Any other failure is written to the
+ * runner log as `removing image tag <tag> failed: <error>` and returned.
+ */
+export async function removeRunPrivateTag(docker: DockerContext, tag: RunTag, log: RunnerLogSink): Promise<RunPrivateTagRemoval> {
+  const name = formatRunTag(tag.owner, tag.role)
+  const removed = await removeImageTag(docker, name)
+  if (removed.ok) return { kind: 'removed' }
+  if (removed.exitCode !== null && removed.error.includes(DOCKER_NO_SUCH_IMAGE_TEXT)) return { kind: 'absent' }
+  return { kind: 'failed', line: logCleanupFailure(log, `removing image tag ${name} failed: ${removed.error}`) }
+}
+
+/** The filters of the listing a prune needs: untagged images carrying exactly this owner label value. */
+export function ownerUntaggedImageFilters(ownerLabelValue: string): ImageListFilter[] {
+  return [{ kind: 'dangling' }, { kind: 'label', key: OWNER_LABEL, value: ownerLabelValue }]
+}
+
+/** An owner's untagged-image removal: none found (no prune made), pruned (after `tries` tries), or failed with its cleanup-failure line, already logged. */
+export type OwnerUntaggedImageRemoval =
+  | {
+      readonly kind: 'none-found'
+    }
+  | {
+      readonly kind: 'pruned'
+      /** The prune tries made, 1 to `PRUNE_RETRIES` + 1. */
+      readonly tries: number
+    }
+  | {
+      readonly kind: 'failed'
+      /** The cleanup-failure line, already written to the runner log; the caller lists it (`RunState.cleanupFailures`). */
+      readonly line: string
+    }
+
+/**
+ * Removes the untagged images carrying exactly the owner label
+ * `cscb-ci-owner=<ownerLabelValue>` (b.uqm SR-9.3, SR-6.4); E8 passes its own
+ * owner's `formatOwner` text, the sweep a dead owner's label value as found.
+ * - It lists the untagged images with exactly that label first. When the
+ *   listing finds none, nothing more is done; when it fails, no prune is
+ *   made, and the failure is `listing untagged images labelled
+ *   cscb-ci-owner=<value> failed: <error>`.
+ * - Only after a listing that found one does it prune untagged images
+ *   filtered on that one label (no `--all`; its `--force` only skips the
+ *   prompt). A prune that leaves an image a container uses has not failed.
+ * - A prune Docker refuses as already running is tried again
+ *   `PRUNE_RETRY_INTERVAL_MS` after the refused try, at most `PRUNE_RETRIES`
+ *   times, on `clock`. Only when every try is refused is it a failure:
+ *   `pruning untagged images labelled cscb-ci-owner=<value> failed: refused
+ *   as already running on all <tries> tries: <error>`. Any other prune failure
+ *   is `pruning untagged images labelled cscb-ci-owner=<value> failed: <error>`,
+ *   with no retry.
+ * Every failure is written to the runner log and returned; none is thrown.
+ */
+export async function removeOwnerUntaggedImages(
+  docker: DockerContext,
+  ownerLabelValue: string,
+  clock: RunnerClock,
+  log: RunnerLogSink,
+): Promise<OwnerUntaggedImageRemoval> {
+  const labelText = `${OWNER_LABEL}=${ownerLabelValue}`
+  const listed = await listImages(docker, ownerUntaggedImageFilters(ownerLabelValue))
+  if (!listed.ok) return { kind: 'failed', line: logCleanupFailure(log, `listing untagged images labelled ${labelText} failed: ${listed.error}`) }
+  const found = listed.value.some((image) => image.tags.length === 0 && image.ownerLabel === ownerLabelValue)
+  if (!found) return { kind: 'none-found' }
+  const pruneLine = `pruning untagged images labelled ${labelText} failed`
+  for (let tries = 1; ; tries++) {
+    const outcome = await pruneUntaggedImages(docker, ownerLabelValue)
+    if (outcome.kind === 'done') return { kind: 'pruned', tries }
+    if (outcome.kind === 'failed') return { kind: 'failed', line: logCleanupFailure(log, `${pruneLine}: ${outcome.error}`) }
+    if (tries > PRUNE_RETRIES) {
+      return { kind: 'failed', line: logCleanupFailure(log, `${pruneLine}: refused as already running on all ${tries} tries: ${outcome.error}`) }
+    }
+    await clockDelay(clock, PRUNE_RETRY_INTERVAL_MS)
+  }
+}
+
+/** What the sweep's listings found: every container (stopped ones included) with its labels, the reservations beside the lock, every image carrying a `cscb-ci-run` tag, and every untagged image carrying the owner label. */
+export interface SweepListings {
+  readonly containers: DockerAnswer<readonly ContainerState[]>
+  readonly reservations: ReservationListing
+  readonly runTaggedImages: DockerAnswer<readonly ImageListEntry[]>
+  readonly ownerLabelledUntaggedImages: DockerAnswer<readonly ImageListEntry[]>
+}
+
+/** The filters of the sweep's tag listing: images with a tag in the `cscb-ci-run` repository. */
+export function runTaggedImageFilters(): ImageListFilter[] {
+  return [{ kind: 'reference', pattern: RUN_TAG_REPOSITORY }]
+}
+
+/** The filters of the sweep's untagged-image listing: untagged images carrying the owner label, whatever its value. */
+export function ownerLabelledUntaggedImageFilters(): ImageListFilter[] {
+  return [{ kind: 'dangling' }, { kind: 'label', key: OWNER_LABEL, value: null }]
+}
+
+/**
+ * The sweep's listings (b.uqm SR-6.4), through E1's docker forms and T2's
+ * reservation reader: every container with its labels (`--all`), the
+ * reservations in `lockDir`, every image carrying a `cscb-ci-run` tag, and
+ * every untagged image carrying the owner label. It removes nothing; a failed
+ * listing is answered, not thrown.
+ */
+export async function listSweepLeftovers(docker: DockerContext, lockDir: string, probe: OwnerLivenessProbe): Promise<SweepListings> {
+  const containers = await listContainers(docker)
+  const reservations = readReservations(lockDir, probe)
+  const runTaggedImages = await listImages(docker, runTaggedImageFilters())
+  const ownerLabelledUntaggedImages = await listImages(docker, ownerLabelledUntaggedImageFilters())
+  return { containers, reservations, runTaggedImages, ownerLabelledUntaggedImages }
+}
+
+/** A container the sweep removes: a `cscb-ci=1` container whose owner is dead, or whose owner label is missing or malformed (owner null). */
+export interface SweptContainer {
+  readonly id: string
+  readonly name: string
+  /** Whether it was running when listed: a running one is killed with SIGKILL before its removal. */
+  readonly running: boolean
+  readonly owner: Owner | null
+}
+
+/** A reservation file the sweep removes: valid or bad, its owner (read from its file name) dead. */
+export interface SweptReservation {
+  readonly fileName: string
+  readonly owner: Owner
+}
+
+/** The cleanup-failure line of each failed sweep listing (not yet logged); null for a listing that succeeded. */
+export interface SweepListingFailures {
+  readonly containers: string | null
+  readonly reservations: string | null
+  readonly tags: string | null
+  readonly untaggedImages: string | null
+}
+
+/** What the sweep removes, in its order, and the cleanup-failure lines of its failed listings (not yet logged). A failed listing selects nothing of its kind. */
+export interface SweepPlan {
+  readonly containers: readonly SweptContainer[]
+  readonly reservations: readonly SweptReservation[]
+  /** Dead owners' run-private tags, each once, in tag order. */
+  readonly tags: readonly RunTag[]
+  /** The owner-label values of untagged images whose owner is dead or malformed, each once, in value order. */
+  readonly ownerLabelValues: readonly string[]
+  readonly listingFailures: SweepListingFailures
+}
+
+/**
+ * The sweep's selection (b.uqm SR-6.4, SR-6.3): pure but for liveness, read
+ * through `probe`. It selects:
+ * - `cscb-ci=1` containers whose owner is dead, running or not, a missing or
+ *   malformed owner label counting as dead; never a `cscb-live=1` container
+ *   nor one without `cscb-ci=1`;
+ * - reservations, valid or bad, whose owner is dead, as T2's reader judged it;
+ *   files that are not reservations never appear;
+ * - tags of exactly the run-private shape whose owner is dead; never a tag of
+ *   another shape (`cscb-ci:latest`, `cscb-ci-base:v6`, `cscb-ci-live:latest`,
+ *   `cscb-ci-l5:m5`, a `cscb-ci-run:` tag that does not parse);
+ * - the owner-label values of untagged images whose owner is dead or whose
+ *   label is malformed; never a tagged image nor one without the label.
+ * Nothing of a live owner is ever selected.
+ */
+export function selectSweepLeftovers(listings: SweepListings, probe: OwnerLivenessProbe): SweepPlan {
+  const containers: SweptContainer[] = []
+  if (listings.containers.ok) {
+    for (const container of listings.containers.value) {
+      if (labelValue(container.labels, CI_LIVE_CONTAINER_LABEL) === CI_LIVE_CONTAINER_LABEL_VALUE) continue
+      const judged = containerLabelOwner(container.labels, probe)
+      if (judged.kind !== 'dead') continue
+      containers.push({ id: container.id, name: container.name, running: container.running, owner: judged.owner })
+    }
+  }
+
+  const reservations: SweptReservation[] = []
+  if (listings.reservations.kind === 'listed') {
+    const dead = [...listings.reservations.valid, ...listings.reservations.bad].filter((entry) => !entry.ownerAlive)
+    for (const entry of dead.sort((a, b) => compareText(a.fileName, b.fileName))) reservations.push({ fileName: entry.fileName, owner: entry.owner })
+  }
+
+  const tags = new Map<string, RunTag>()
+  if (listings.runTaggedImages.ok) {
+    for (const image of listings.runTaggedImages.value) {
+      for (const tag of image.tags) {
+        if (tags.has(tag)) continue
+        const parsed = parseRunTag(tag)
+        if (parsed !== null && !isOwnerAlive(parsed.owner, probe)) tags.set(tag, parsed)
+      }
+    }
+  }
+
+  const ownerLabelValues = new Set<string>()
+  if (listings.ownerLabelledUntaggedImages.ok) {
+    for (const image of listings.ownerLabelledUntaggedImages.value) {
+      if (image.tags.length > 0 || image.ownerLabel === null || ownerLabelValues.has(image.ownerLabel)) continue
+      if (imageLabelOwner({ [OWNER_LABEL]: image.ownerLabel }, probe).kind === 'dead') ownerLabelValues.add(image.ownerLabel)
+    }
+  }
+
+  return {
+    containers,
+    reservations,
+    tags: [...tags.keys()].sort(compareText).map((tag) => tags.get(tag)!),
+    ownerLabelValues: [...ownerLabelValues].sort(compareText),
+    listingFailures: {
+      containers: listings.containers.ok ? null : `listing ${CI_LABEL}=${CI_LABEL_VALUE} containers for the sweep failed: ${listings.containers.error}`,
+      reservations: listings.reservations.kind === 'listed' ? null : `listing reservations for the sweep failed: ${listings.reservations.error}`,
+      tags: listings.runTaggedImages.ok ? null : `listing ${RUN_TAG_REPOSITORY} image tags for the sweep failed: ${listings.runTaggedImages.error}`,
+      untaggedImages: listings.ownerLabelledUntaggedImages.ok
+        ? null
+        : `listing untagged images labelled ${OWNER_LABEL} for the sweep failed: ${listings.ownerLabelledUntaggedImages.error}`,
+    },
+  }
+}
+
+/** Code-unit order of two texts. */
+function compareText(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0
+}
+
+/** A swept container's removal: removed, already gone (no failure), or failed with its cleanup-failure line, already logged. */
+export type SweptContainerRemoval =
+  | {
+      readonly kind: 'removed'
+    }
+  | {
+      readonly kind: 'absent'
+    }
+  | {
+      readonly kind: 'failed'
+      readonly line: string
+    }
+
+/**
+ * Removes one swept container (b.uqm SR-6.4): a running one is killed with
+ * SIGKILL first, since E1's removal never forces; the removal is made even
+ * when the kill failed (the container may have stopped meanwhile). A container
+ * Docker no longer knows is absent. A failed removal is written to the runner
+ * log as `removing container <name> (<id>) failed: <error>`, with
+ * ` (its kill failed first: <error>)` added when the kill failed too.
+ */
+export async function removeSweptContainer(docker: DockerContext, container: SweptContainer, log: RunnerLogSink): Promise<SweptContainerRemoval> {
+  let killError: string | null = null
+  if (container.running) {
+    const killed = await killContainer(docker, container.id, 'SIGKILL')
+    if (!killed.ok) {
+      if (killed.exitCode !== null && killed.error.includes(DOCKER_NO_SUCH_CONTAINER_TEXT)) return { kind: 'absent' }
+      killError = killed.error
+    }
+  }
+  const removed = await removeContainer(docker, container.id)
+  if (removed.ok) return { kind: 'removed' }
+  if (removed.exitCode !== null && removed.error.includes(DOCKER_NO_SUCH_CONTAINER_TEXT)) return { kind: 'absent' }
+  const killNote = killError === null ? '' : ` (its kill failed first: ${killError})`
+  return { kind: 'failed', line: logCleanupFailure(log, `removing container ${container.name} (${container.id}) failed: ${removed.error}${killNote}`) }
+}
+
+/** What the sweep needs: the docker context, the lock directory, the liveness probe, the injected clock (for the prune retry) and the runner log. */
+export interface SweepContext {
+  readonly docker: DockerContext
+  readonly lockDir: string
+  readonly probe: OwnerLivenessProbe
+  readonly clock: RunnerClock
+  readonly log: RunnerLogSink
+}
+
+/**
+ * The sweep of dead runs' leftovers (b.uqm SR-6.4), which E13 runs at step 7,
+ * under the lock and before the readings. It lists and selects
+ * (`listSweepLeftovers`, `selectSweepLeftovers`), then removes in this order:
+ * 1. the selected containers (`removeSweptContainer`);
+ * 2. the selected reservation files (T2's `removeReservation`);
+ * 3. the selected tags (`removeRunPrivateTag`);
+ * 4. for each selected owner-label value, its untagged images
+ *    (`removeOwnerUntaggedImages`, with its listing and prune retry).
+ * A failed listing is written to the runner log at its step's place and skips
+ * that step only; a failed removal is written to the log and the sweep goes
+ * on. It answers every cleanup-failure line, in order (`RunState.cleanupFailures`),
+ * and never refuses the run nor throws.
+ */
+export async function sweepLeftovers(context: SweepContext): Promise<readonly string[]> {
+  const { docker, lockDir, probe, clock } = context
+  // T2's remover logs without a guard; this sink makes every log write safe.
+  const log: RunnerLogSink = (line) => {
+    logCleanupFailure(context.log, line)
+  }
+  const failures: string[] = []
+  const listingFailed = (line: string | null): void => {
+    if (line === null) return
+    log(line)
+    failures.push(line)
+  }
+  const listings = await listSweepLeftovers(docker, lockDir, probe)
+  const plan = selectSweepLeftovers(listings, probe)
+
+  listingFailed(plan.listingFailures.containers)
+  for (const container of plan.containers) {
+    const removal = await removeSweptContainer(docker, container, log)
+    if (removal.kind === 'failed') failures.push(removal.line)
+  }
+
+  listingFailed(plan.listingFailures.reservations)
+  for (const reservation of plan.reservations) {
+    const removal = removeReservation(lockDir, reservation.owner, log)
+    if (removal.kind === 'failed') failures.push(removal.line)
+  }
+
+  listingFailed(plan.listingFailures.tags)
+  for (const tag of plan.tags) {
+    const removal = await removeRunPrivateTag(docker, tag, log)
+    if (removal.kind === 'failed') failures.push(removal.line)
+  }
+
+  listingFailed(plan.listingFailures.untaggedImages)
+  for (const value of plan.ownerLabelValues) {
+    const removal = await removeOwnerUntaggedImages(docker, value, clock, log)
+    if (removal.kind === 'failed') failures.push(removal.line)
+  }
+
+  return failures
+}
 
 // ---------------------------------------------------------------------------
 // 10. Admission readings and fit (E6)
