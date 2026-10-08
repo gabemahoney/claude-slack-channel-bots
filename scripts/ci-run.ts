@@ -5297,6 +5297,308 @@ export function memoryCommitments(
   }
 }
 
+// --- 10/T4 (E6 T4): the readings step, the fits, choosing N, the shard-count line ---
+
+/** A percentage's whole: the disk fit compares `× 100` against the disk line's percent, in integers. */
+const PERCENT_WHOLE = 100
+/** The shard-count line's opening word (b.uqm SR-6.7): `shards: <n> of <r>`. */
+const SHARD_COUNT_LINE_PREFIX = 'shards: '
+/** Separates the shard-count line's reasons (b.uqm SR-6.7). */
+const SHARD_COUNT_REASON_SEPARATOR = ', '
+/** The shard-count line's reason for a run that ended before admission chose its N (b.uqm SR-6.7); also its `results.json` `shardCount.reasons` entry. */
+export const ENDED_BEFORE_ADMISSION_REASON = 'ended before admission'
+
+/** The admission readings with the `/ci-live` activity added (b.uqm SR-6.5): every SR-6.5 item, W being the run's "before" reading. */
+export interface FullAdmissionReadings extends AdmissionReadings {
+  /** The active `/ci-live` runs, with the held locks and the lone containers (b.uqm SR-6.6). */
+  readonly ciLive: CiLiveActivity
+}
+
+/** What the readings step answers (b.uqm SR-5.3 step 8): every reading, C with its source, and what admission counts. */
+export interface AdmissionFigures {
+  readonly readings: FullAdmissionReadings
+  /** C, 85% of L or `/ci-live`'s 40 GiB line, with its source (b.uqm SR-7.1). */
+  readonly ceiling: MemoryCeiling
+  /** The memory commitments, the blocking containers and h (b.uqm SR-6.6). */
+  readonly commitments: MemoryCommitments
+}
+
+/**
+ * What the readings step reads through: T2's input, plus the `/ci-live`
+ * detector's reads (environment, user ID, `/proc`) and the account's home for
+ * the real-run lock, which the caller gives (E13 binds E5's account-home lookup).
+ */
+export interface AdmissionStepInput extends AdmissionReadingsInput {
+  readonly deps: AdmissionReadingsInput['deps'] & CiLiveDetectionDeps
+  /** The account's home, holding `/ci-live`'s real-run lock. */
+  readonly home: string
+}
+
+/**
+ * The admission readings step (b.uqm SR-5.3 step 8, SR-6.5), taken under the
+ * lock after the sweep, in SR-6.5's order: W with its parts and L, the run
+ * directory's volume, the containers (listed once), the reservations through
+ * the caller's reader, then the `/ci-live` activity, judged over that same
+ * container listing. The first reading that fails stops the step and is its
+ * answer, `disk` for the volume and `memory` for every other
+ * (`failedReadingRefusal` makes it the refusal). Otherwise it answers every
+ * reading, C with its source, and the commitments, blocking containers and h.
+ * Call it before this run's own reservation exists (see `memoryCommitments`).
+ */
+export async function takeFullAdmissionReadings(input: AdmissionStepInput): Promise<AdmissionReading<AdmissionFigures>> {
+  const taken = await takeAdmissionReadings(input)
+  if (!taken.ok) return taken
+  const { readings, containerListing } = taken.value
+  const ciLive = admissionReading('memory', detectCiLiveActivity(input.deps, input.home, containerListing))
+  if (!ciLive.ok) return ciLive
+  return {
+    ok: true,
+    value: {
+      readings: { ...readings, ciLive: ciLive.value },
+      ceiling: memoryCeiling(readings.podLimitBytes, ciLive.value.runs),
+      commitments: memoryCommitments(readings.containers, readings.reservations, ciLive.value),
+    },
+  }
+}
+
+/** A limit admission judges (b.uqm SR-6.7, SR-6.8), named as its refusal kind. */
+export type AdmissionLimit = Exclude<RefusalKind, null>
+
+/** A limit that depends on N: the memory and CPU fits (b.uqm SR-6.7). */
+export type ShardFitLimit = Extract<AdmissionLimit, 'memory' | 'cpu'>
+
+/** The limits in the order a refusal gives them (b.uqm SR-6.8): memory, disk, CPU. */
+const ADMISSION_LIMIT_ORDER: readonly AdmissionLimit[] = ['memory', 'disk', 'cpu']
+
+/** What the run asks of admission (b.uqm SR-3.4, SR-6.7), from E2's validation (`ValidatedRun`) and E1's arguments. */
+export interface AdmissionRequest {
+  /** r: the `--shards` value, or `MAX_SHARDS` when it is not given (E2's `ValidatedRun.requestedShards`). */
+  readonly requestedShards: number
+  /** u: the run's scheduling units (E2, b.uqm SR-3.4: `ValidatedRun.units`). */
+  readonly units: number
+  /** The effective N (E2, b.uqm SR-3.4): the smaller of r and u, at least 1. */
+  readonly effectiveShards: number
+  /** Neither `--shards` nor `--inject` was given (`canChooseShards`): the run takes the largest N that fits. */
+  readonly canChooseShards: boolean
+  /** The per-shard memory cap, E1's `SHARD_MEMORY_CAP_BYTES`, passed in. */
+  readonly capBytes: number
+}
+
+/** Whether admission may choose the run's N (b.uqm SR-6.7): neither `--shards` nor `--inject` was given. Choosing changes neither its run kind nor its gate eligibility. */
+export function canChooseShards(invocation: Invocation): boolean {
+  return invocation.shards === null && !isInjectedRun(invocation)
+}
+
+/**
+ * f (b.uqm SR-6.7): C − W − the memory commitments − the 1 GiB admission
+ * margin, never below 0, the memory left for shards. Blocking containers count
+ * nothing here; they fail the memory fit on their own.
+ */
+export function freeShardMemoryBytes(figures: AdmissionFigures): number {
+  const free = BigInt(figures.ceiling.bytes) - BigInt(figures.readings.beforeWorkingSet.bytes) - BigInt(figures.commitments.totalBytes) - BigInt(ADMISSION_MARGIN_BYTES)
+  return free > BigInt(0) ? Number(free) : 0
+}
+
+/**
+ * The memory fit at N shards (b.uqm SR-6.7): W + the commitments + N × the cap
+ * + the 1 GiB admission margin ≤ C, compared in whole bytes. Any blocking
+ * container fails it whatever the readings.
+ */
+export function memoryFits(figures: AdmissionFigures, shards: number, capBytes: number): boolean {
+  if (figures.commitments.blocking.length > 0) return false
+  const need = BigInt(figures.readings.beforeWorkingSet.bytes) + BigInt(figures.commitments.totalBytes) + BigInt(shards) * BigInt(capBytes) + BigInt(ADMISSION_MARGIN_BYTES)
+  return need <= BigInt(figures.ceiling.bytes)
+}
+
+/**
+ * The disk fit (b.uqm SR-6.7): (used + the 1 GiB allowance) ÷ (used +
+ * available) < the 85% disk line, compared in integers as (used + allowance)
+ * × 100 < 85 × (used + available). A volume with no bytes fails it.
+ */
+export function diskFits(volume: VolumeReading): boolean {
+  const used = BigInt(volume.usedBytes)
+  const whole = used + BigInt(volume.availableBytes)
+  return (used + BigInt(DISK_CHECK_ALLOWANCE_BYTES)) * BigInt(PERCENT_WHOLE) < BigInt(DISK_LINE_PERCENT) * whole
+}
+
+/** The CPU fit at N shards (b.uqm SR-6.6, SR-6.7): h + 2 × N ≤ the 12 CI CPUs. */
+export function cpuFits(reservedCpus: number, shards: number): boolean {
+  return reservedCpus + CPUS_PER_SHARD * shards <= CI_CPUS
+}
+
+/** The N-dependent limits that fail at N shards, memory then CPU. */
+function shardFitFailures(figures: AdmissionFigures, shards: number, capBytes: number): ShardFitLimit[] {
+  const failed: ShardFitLimit[] = []
+  if (!memoryFits(figures, shards, capBytes)) failed.push('memory')
+  if (!cpuFits(figures.commitments.reservedCpus, shards)) failed.push('cpu')
+  return failed
+}
+
+/** The largest N, from `fromShards` down to 1, that passes both the memory and the CPU fit; null when none does. */
+function largestFittingShards(figures: AdmissionFigures, fromShards: number, capBytes: number): number | null {
+  for (let shards = fromShards; shards >= OPTION_RANGE_MIN; shards--) {
+    if (shardFitFailures(figures, shards, capBytes).length === 0) return shards
+  }
+  return null
+}
+
+/**
+ * Throws unless the request holds whole numbers: an effective N of at least 1,
+ * at most r and at most the larger of 1 and u (b.uqm SR-3.4), and a positive cap.
+ */
+function assertAdmissionRequest(request: AdmissionRequest): void {
+  for (const [name, value] of [['requestedShards', request.requestedShards], ['units', request.units], ['effectiveShards', request.effectiveShards], ['capBytes', request.capBytes]] as const) {
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error(`decideAdmission: ${name} is not a whole number: ${value}`)
+  }
+  if (request.effectiveShards < OPTION_RANGE_MIN) throw new Error(`decideAdmission: effectiveShards is below ${OPTION_RANGE_MIN}: ${request.effectiveShards}`)
+  if (request.effectiveShards > request.requestedShards) throw new Error(`decideAdmission: effectiveShards ${request.effectiveShards} is above requestedShards ${request.requestedShards}`)
+  const unitBound = Math.max(OPTION_RANGE_MIN, request.units)
+  if (request.effectiveShards > unitBound) throw new Error(`decideAdmission: effectiveShards ${request.effectiveShards} is above max(${OPTION_RANGE_MIN}, units) ${unitBound}`)
+  if (request.capBytes === 0) throw new Error('decideAdmission: capBytes is 0')
+}
+
+/** The figures every decision carries, admitted or refused (b.uqm SR-6.7, SR-6.8). */
+export interface AdmissionDecisionFigures {
+  readonly request: AdmissionRequest
+  /** The readings, C with its source, and the commitments. */
+  readonly admission: AdmissionFigures
+  /** f: C − W − commitments − margin, never below 0. */
+  readonly freeBytes: number
+  /** h: the CPUs of the other live `/ci` reservations. */
+  readonly reservedCpus: number
+  /** The largest `--shards` value, at most the effective N, that passes both the memory and the CPU fit now; null when none does. */
+  readonly largestFittingShards: number | null
+  /** Whether the disk fit passed. */
+  readonly diskFits: boolean
+}
+
+/** One reason the shard-count line may give (b.uqm SR-6.7): the scheduling units, memory, CPU. */
+export type ShardCountReason = 'units' | ShardFitLimit
+
+/** What the shard-count line is built from (b.uqm SR-6.7): n, r, u, the reasons that applied, f, C and h. */
+export interface ShardCountLineInput {
+  /** n: the shards admission chose. */
+  readonly shards: number
+  /** r: the requested N. */
+  readonly requestedShards: number
+  /** u: the scheduling units. */
+  readonly units: number
+  /** The reasons that applied, in any order; the line gives them as units, memory, CPU. */
+  readonly reasons: readonly ShardCountReason[]
+  /** f, in bytes. */
+  readonly freeBytes: number
+  /** C, in bytes. */
+  readonly ceilingBytes: number
+  /** h. */
+  readonly reservedCpus: number
+}
+
+/** An admitted run (b.uqm SR-6.7): its N and the shard-count line's data. */
+export interface AdmittedDecision {
+  readonly kind: 'admitted'
+  /** N: the shards admission chose. */
+  readonly shards: number
+  /** The N-dependent limits that fail at N + 1, when N + 1 is at most the effective N; none otherwise. */
+  readonly limitsAtNext: readonly ShardFitLimit[]
+  /** The shard-count line's data: the units reason when the effective N is below r, then `limitsAtNext`. */
+  readonly line: ShardCountLineInput
+  readonly figures: AdmissionDecisionFigures
+}
+
+/** A refused run (b.uqm SR-6.7, SR-6.8): the limits that failed, at the N it was judged at. */
+export interface RefusedDecision {
+  readonly kind: 'refused'
+  /** The N the memory and CPU fits were judged at: 1 for a run that can choose its N, else the effective N. */
+  readonly judgedShards: number
+  /** Each limit that failed, in the order memory, disk, CPU: disk when its fit failed, memory and CPU when they fail at the judged N. Never empty. */
+  readonly failedLimits: readonly AdmissionLimit[]
+  readonly figures: AdmissionDecisionFigures
+}
+
+/** Admission's decision (b.uqm SR-5.3 step 9, SR-6.7). */
+export type AdmissionDecision = AdmittedDecision | RefusedDecision
+
+/**
+ * The disk check, then the memory and CPU fits, choosing N (b.uqm SR-5.3
+ * step 9, SR-6.7). A run that can choose takes the largest N, from the
+ * effective N down to 1, that passes both fits; any other takes exactly the
+ * effective N. The run is refused when the disk fit fails or when no N it may
+ * take passes both fits; the refusal names each failed limit (memory and CPU
+ * judged at 1 for a run that can choose, else at the effective N). Every
+ * decision carries f, h, the largest `--shards` value that fits now, and the
+ * readings. Pure; throws only for a malformed request.
+ */
+export function decideAdmission(admission: AdmissionFigures, request: AdmissionRequest): AdmissionDecision {
+  assertAdmissionRequest(request)
+  const largest = largestFittingShards(admission, request.effectiveShards, request.capBytes)
+  const figures: AdmissionDecisionFigures = {
+    request,
+    admission,
+    freeBytes: freeShardMemoryBytes(admission),
+    reservedCpus: admission.commitments.reservedCpus,
+    largestFittingShards: largest,
+    diskFits: diskFits(admission.readings.volume),
+  }
+  // The search starts at the effective N, so a run that cannot choose fits exactly when the largest is the effective N.
+  const chosen = request.canChooseShards || largest === request.effectiveShards ? largest : null
+  if (!figures.diskFits || chosen === null) {
+    const judgedShards = request.canChooseShards ? OPTION_RANGE_MIN : request.effectiveShards
+    const failed = new Set<AdmissionLimit>(shardFitFailures(admission, judgedShards, request.capBytes))
+    if (!figures.diskFits) failed.add('disk')
+    return { kind: 'refused', judgedShards, failedLimits: ADMISSION_LIMIT_ORDER.filter((limit) => failed.has(limit)), figures }
+  }
+  const limitsAtNext = chosen < request.effectiveShards ? shardFitFailures(admission, chosen + 1, request.capBytes) : []
+  const unitReason: ShardCountReason[] = request.effectiveShards < request.requestedShards ? ['units'] : []
+  return {
+    kind: 'admitted',
+    shards: chosen,
+    limitsAtNext,
+    line: {
+      shards: chosen,
+      requestedShards: request.requestedShards,
+      units: request.units,
+      reasons: [...unitReason, ...limitsAtNext],
+      freeBytes: figures.freeBytes,
+      ceilingBytes: admission.ceiling.bytes,
+      reservedCpus: figures.reservedCpus,
+    },
+    figures,
+  }
+}
+
+/**
+ * The shard-count line's reason texts (b.uqm SR-6.7), in their fixed order:
+ * `<u> scheduling unit(s)`, `memory: <f> GiB free under the <C> GiB ceiling`,
+ * `cpu: <h> of 12 CI CPUs in use`, each given when it applied; none when n is
+ * not below r. GiB figures to one decimal place (`formatGib`). What
+ * `results.json`'s `shardCount.reasons` holds.
+ */
+export function shardCountReasonTexts(input: ShardCountLineInput): string[] {
+  if (input.shards >= input.requestedShards) return []
+  const applied = new Set(input.reasons)
+  const texts: string[] = []
+  if (applied.has('units')) texts.push(`${input.units} scheduling unit(s)`)
+  if (applied.has('memory')) texts.push(`memory: ${formatGib(input.freeBytes)} GiB free under the ${formatGib(input.ceilingBytes)} GiB ceiling`)
+  if (applied.has('cpu')) texts.push(`cpu: ${input.reservedCpus} of ${CI_CPUS} CI CPUs in use`)
+  return texts
+}
+
+/**
+ * The shard-count line (b.uqm SR-6.7): `shards: <n> of <r>`, followed by
+ * ` (<reasons>)` when n is below r, the reasons separated by a comma and a
+ * space in the order units, memory, CPU. E10 and E13 place it.
+ */
+export function formatShardCountLine(input: ShardCountLineInput): string {
+  const head = `${SHARD_COUNT_LINE_PREFIX}${input.shards} of ${input.requestedShards}`
+  const reasons = shardCountReasonTexts(input)
+  return reasons.length === 0 ? head : `${head} (${reasons.join(SHARD_COUNT_REASON_SEPARATOR)})`
+}
+
+/** The shard-count line of a run that ended before admission chose its N, whatever its arguments (b.uqm SR-6.7): `shards: 0 of <r> (ended before admission)`. */
+export function endedBeforeAdmissionShardCountLine(requestedShards: number): string {
+  return `${SHARD_COUNT_LINE_PREFIX}0 of ${requestedShards} (${ENDED_BEFORE_ADMISSION_REASON})`
+}
+
 // ---------------------------------------------------------------------------
 // 11. Memory guard (E7)
 // ---------------------------------------------------------------------------
