@@ -4232,3 +4232,984 @@ describe('E12: faults (b.t6s E12; b.uqm SR-14.1, SR-14.2, SR-14.3)', () => {
 // ---------------------------------------------------------------------------
 // E13: the run's end and the tests/runner.sh source audit (b.t6s E13)
 // ---------------------------------------------------------------------------
+
+// --- E13 T6: the tests/runner.sh and docker/entrypoint.sh source audit ---
+//
+// b.uqm SR-11.1 to SR-11.5, and SR-13.1's first sentence (handed over by
+// E11). Both files run only in a shard container, so no unit test runs them:
+// they are read as text. `e13ShellLines` drops comments and blanks quoted
+// text, `(( … ))` and `[[ … ]]`, so prose and text in a string never count as
+// code. Each problems function returns what is wrong with one file's text:
+// the real tree gives none, and each change planted into the real text is
+// reported by name. Every name and text the runner exports is imported from
+// scripts/ci-run.ts through the `e13` namespace, never typed.
+// `tests/host-safety.test.ts` audits that the marker check comes first; that
+// is not repeated here. E1's region reads the in-shard files (the result-file
+// line forms, and canary.txt, package.sha256 and dependency-fingerprint.txt
+// as their length of lowercase hexadecimal characters and one LF), so only
+// the writing side is audited here. Names in this region start with `e13` or
+// `E13`, so no other region's can collide with them.
+
+import * as e13 from '../scripts/ci-run.ts'
+import * as e13Helpers from './test-helpers/ci-run.ts'
+
+const E13_RUNNER_SH = join(import.meta.dir, 'runner.sh')
+const E13_ENTRYPOINT_SH = join(import.meta.dir, '..', 'docker', 'entrypoint.sh')
+
+/** The runner's exports tests/runner.sh assigns under the same name (b.uqm SR-11.5). */
+const E13_EXPORT_NAMES = [
+  'USAGE_PREFIX',
+  'USAGE_EXIT_STATUS',
+  'RUNNER_FAIL_OPTION',
+  'CANARY_LENGTH',
+  'SHA256_HEX_LENGTH',
+  'SCRIPT_FILE_NAME_PATTERN',
+  'INTEGRITY_TARBALL_MOUNT_TARGET',
+  'INTEGRITY_RESULTS_MOUNT_TARGET',
+  'CANARY_FILE_NAME',
+  'PACKAGE_SHA256_FILE_NAME',
+  'RESULT_FILE_NAME',
+  'DEPENDENCY_FINGERPRINT_FILE_NAME',
+  'SCRIPT_LOG_SUFFIX',
+  'RESULT_WORD_START',
+  'RESULT_WORD_END',
+  'RESULT_WORD_PASS',
+  'RESULT_WORD_FAIL',
+  'RESULT_WORD_NOTRUN',
+  'RESULT_WORD_DONE',
+  'FAIL_PREFIX',
+  'INJECTED_FAILURE_TEXT',
+] as const satisfies readonly (keyof typeof e13)[]
+type E13ExportName = (typeof E13_EXPORT_NAMES)[number]
+
+/** Each export's text as tests/runner.sh must spell it: its value, or a pattern's source. */
+const E13_EXPORTS = Object.fromEntries(
+  E13_EXPORT_NAMES.map((name) => {
+    const value: unknown = e13[name]
+    return [name, value instanceof RegExp ? value.source : String(value)]
+  }),
+) as Readonly<Record<E13ExportName, string>>
+
+/** The exported texts that must appear in tests/runner.sh only in their own assignment. */
+const E13_UNTYPED: readonly E13ExportName[] = [
+  'USAGE_PREFIX',
+  'RUNNER_FAIL_OPTION',
+  'INTEGRITY_TARBALL_MOUNT_TARGET',
+  'INTEGRITY_RESULTS_MOUNT_TARGET',
+  'CANARY_FILE_NAME',
+  'PACKAGE_SHA256_FILE_NAME',
+  'RESULT_FILE_NAME',
+  'DEPENDENCY_FINGERPRINT_FILE_NAME',
+  'FAIL_PREFIX',
+  'INJECTED_FAILURE_TEXT',
+]
+
+/** `${NAME}`: how the shell expands the export-named variable. */
+function e13Ref(name: E13ExportName): string {
+  return `\${${name}}`
+}
+
+/** Commands that write files; any of them in tests/runner.sh is a write outside the in-shard writers. */
+const E13_WRITE_COMMANDS = 'mkdir|touch|cp|mv|tee|ln|install|truncate|dd|rm|chmod|chown'
+/** Commands that run a script. */
+const E13_RUN_COMMANDS = 'bash|sh|source|\\.|exec|eval'
+/** The one way tests/runner.sh runs an assigned script. */
+const E13_RUN = 'bash "${tests_dir}/integration/${name}"'
+/** Where the installed packages sit in the image (b.uqm SR-11.3). */
+const E13_NODE_MODULES = '/test-repo/node_modules'
+
+/** One line of a shell file as the audit reads it. */
+interface E13Line {
+  /** Its 1-based line number. */
+  readonly no: number
+  /** The line without its comment, trimmed. */
+  readonly code: string
+  /** `code` with quoted text and the inside of `(( … ))` and `[[ … ]]` blanked (quotes and brackets kept), at the same offsets. */
+  readonly masked: string
+  /** The function whose definition holds the line, or null at the top level. */
+  readonly fn: string | null
+}
+
+/**
+ * The code lines of a shell file: a `#` that starts a word outside quotes
+ * starts a comment, and quotes carry across lines (a multi-line string). A
+ * function is `name() {` at column 0 through `}` at column 0.
+ */
+function e13ShellLines(source: string): E13Line[] {
+  const out: E13Line[] = []
+  let quote: string | null = null
+  let fn: string | null = null
+  for (const [index, raw] of source.split('\n').entries()) {
+    const quoted = quote !== null
+    let code = ''
+    let masked = ''
+    for (let i = 0; i < raw.length; i++) {
+      const c = raw[i] as string
+      if (quote === null && c === '#' && (i === 0 || /[\s;]/.test(raw[i - 1] as string))) break
+      if (c === '\\' && quote !== "'" && i + 1 < raw.length) {
+        code += raw.slice(i, i + 2)
+        masked += '  '
+        i++
+        continue
+      }
+      if (quote === null && (c === "'" || c === '"')) quote = c
+      else if (c === quote) quote = null
+      else if (quote !== null) {
+        code += c
+        masked += ' '
+        continue
+      }
+      code += c
+      masked += c
+    }
+    const lead = code.length - code.trimStart().length
+    const text = code.trim()
+    const blanked = masked.slice(lead, lead + text.length).replace(/\(\(.*?\)\)|\[\[.*?\]\]/g, (m) => `${m.slice(0, 2)}${' '.repeat(m.length - 4)}${m.slice(-2)}`)
+    if (!quoted && /^[A-Za-z_]\w*\(\)\s*\{$/.test(raw)) fn = raw.slice(0, raw.indexOf('('))
+    if (text !== '') out.push({ no: index + 1, code: text, masked: blanked, fn })
+    if (!quoted && raw === '}') fn = null
+  }
+  return out
+}
+
+/** A command position: a line's start, after `;`, `&`, `|` or `(`, or after `then`, `do`, `else`, `elif`, `if`, `while` or `until`. */
+const E13_COMMAND_POSITION = '(?:^|[;&|(]\\s*|\\b(?:then|do|else|elif|if|while|until)\\s+)'
+
+/** A regex for `words` (an alternation) at a command position, after any `NAME=value` prefixes. Group 1 is the command. */
+function e13CommandAt(words: string): RegExp {
+  return new RegExp(`${E13_COMMAND_POSITION}(?:\\w+=(?:"[^"]*"|'[^']*'|\\S*)\\s+)*(${words})(?=\\s|$)`, 'g')
+}
+
+/** Whether `line` runs one of `words` as a command. */
+function e13Runs(line: E13Line, words: string): boolean {
+  return e13CommandAt(words).test(line.masked)
+}
+
+/** The shell word that starts at or after `at` in `code` (quotes kept). */
+function e13WordAt(code: string, at: number): string {
+  let i = at
+  while (code[i] === ' ') i++
+  const start = i
+  let quote: string | null = null
+  for (; i < code.length; i++) {
+    const c = code[i] as string
+    if (quote !== null) {
+      if (c === quote) quote = null
+    } else if (c === '"' || c === "'") quote = c
+    else if (/[\s;|&)]/.test(c)) break
+  }
+  return code.slice(start, i)
+}
+
+/** The words from `at` in `code` to the end of the command. */
+function e13Words(code: string, at: number): string[] {
+  const words: string[] = []
+  for (let i = at; ; ) {
+    while (code[i] === ' ') i++
+    if (i >= code.length || /[;|&)]/.test(code[i] as string)) return words
+    const word = e13WordAt(code, i)
+    words.push(word)
+    i += word.length
+  }
+}
+
+/** Every call of the command `name` in `lines`, with its argument words. */
+function e13Calls(lines: readonly E13Line[], name: string): { line: E13Line; args: string[] }[] {
+  return lines.flatMap((line) => [...line.masked.matchAll(e13CommandAt(name))].map((m) => ({ line, args: e13Words(line.code, (m.index ?? 0) + m[0].length) })))
+}
+
+/** The argument of the only call of `name` on `line`, or undefined. */
+function e13ArgOn(line: E13Line, name: string): string | undefined {
+  const calls = e13Calls([line], name)
+  return calls.length === 1 ? calls[0]?.args[0] : undefined
+}
+
+/** A double-quoted word's text, or null for any other word. */
+function e13Unquote(word: string | undefined): string | null {
+  const m = /^"([^"]*)"$/.exec(word ?? '')
+  return m === null ? null : (m[1] as string)
+}
+
+/** `text` with each `${NAME}` that `values` holds replaced by its value. */
+function e13Expand(text: string, values: Readonly<Record<string, string>>): string {
+  return text.replace(/\$\{(\w+)\}/g, (whole, name: string) => values[name] ?? whole)
+}
+
+/** Each file write by redirection in `lines`: its line, operator and target word (`>&n` duplications are not writes). */
+function e13Redirects(lines: readonly E13Line[]): { line: E13Line; op: string; target: string }[] {
+  return lines.flatMap((line) =>
+    [...line.masked.matchAll(/\d*(&>>|&>|>>|>\||>)(?!&)/g)].map((m) => ({ line, op: m[1] as string, target: e13WordAt(line.code, (m.index ?? 0) + m[0].length) })),
+  )
+}
+
+/** Whether `line` writes a file itself: a redirection to anything but /dev/null, or a writing command. */
+function e13WritesDirectly(line: E13Line): boolean {
+  return e13Redirects([line]).some((w) => w.target !== '/dev/null') || e13Runs(line, E13_WRITE_COMMANDS)
+}
+
+/** The functions that write a file, directly or through another such function. */
+function e13Writers(lines: readonly E13Line[]): Set<string> {
+  const writers = new Set(lines.filter((l) => l.fn !== null && e13WritesDirectly(l)).map((l) => l.fn as string))
+  for (let added = true; added; ) {
+    added = false
+    for (const l of lines) {
+      if (l.fn !== null && !writers.has(l.fn) && [...writers].some((w) => e13Runs(l, w))) {
+        writers.add(l.fn)
+        added = true
+      }
+    }
+  }
+  return writers
+}
+
+/** The body of function `name`, without its `name() {` and `}` lines. */
+function e13Body(lines: readonly E13Line[], name: string): E13Line[] {
+  return lines.filter((l) => l.fn === name).slice(1, -1)
+}
+
+/** The body of function `name` as its code lines joined by LF. */
+function e13BodyText(lines: readonly E13Line[], name: string): string {
+  return e13Body(lines, name)
+    .map((l) => l.code)
+    .join('\n')
+}
+
+const E13_OPENER = /^(?:if|for|while|until)\b/
+const E13_CLOSER = /^(?:fi|done)\b/
+
+/** `lines[at]` (an `if`, `for` or `while` line) through its closing `fi` or `done`. */
+function e13Block(lines: readonly E13Line[], at: number): E13Line[] {
+  let depth = 0
+  for (let i = at; i < lines.length; i++) {
+    const masked = (lines[i] as E13Line).masked
+    if (E13_OPENER.test(masked)) depth++
+    if (E13_CLOSER.test(masked)) depth--
+    if (depth === 0) return lines.slice(at, i + 1)
+  }
+  throw new Error(`e13Block: line ${lines[at]?.no} is never closed`)
+}
+
+/** The innermost block opener around `lines[at]`, or undefined at depth 0. */
+function e13Enclosing(lines: readonly E13Line[], at: number): E13Line | undefined {
+  let depth = 0
+  for (let i = at - 1; i >= 0; i--) {
+    const masked = (lines[i] as E13Line).masked
+    if (E13_CLOSER.test(masked)) depth++
+    else if (E13_OPENER.test(masked)) {
+      if (depth === 0) return lines[i]
+      depth--
+    }
+  }
+  return undefined
+}
+
+/** Each top-level `NAME=value` assignment's values, in order: a quoted value without its quotes. */
+function e13Assignments(top: readonly E13Line[]): Map<string, string[]> {
+  const out = new Map<string, string[]>()
+  for (const l of top) {
+    const m = /^([A-Za-z_]\w*)=(.*)$/.exec(l.code)
+    if (m === null) continue
+    const raw = m[2] as string
+    const value = /^'[^']*'$|^"[^"]*"$/.test(raw) ? raw.slice(1, -1) : raw
+    out.set(m[1] as string, [...(out.get(m[1] as string) ?? []), value])
+  }
+  return out
+}
+
+/** Each top-level variable's first assigned value. */
+function e13ShellValues(top: readonly E13Line[]): Record<string, string> {
+  return Object.fromEntries([...e13Assignments(top)].map(([name, values]) => [name, values[0] as string]))
+}
+
+/** A `"^…\$"` pattern variable as the shell gives it to `=~`, its `${…}` expanded from the shell's own values. */
+function e13Pattern(top: readonly E13Line[], name: string): string {
+  const shell = e13ShellValues(top)
+  return e13Expand(shell[name] ?? '', shell).replace(/\\\$/g, '$')
+}
+
+/** The run loop: the top-level loop that writes the start lines. */
+function e13RunLoop(top: readonly E13Line[]): E13Line[] | undefined {
+  const start = `"${e13Ref('RESULT_WORD_START')} \${name}"`
+  for (let i = 0; i < top.length; i++) {
+    if (!E13_OPENER.test((top[i] as E13Line).masked)) continue
+    const block = e13Block(top, i)
+    if (/^(?:for|while)\b/.test(block[0]?.code ?? '') && e13Calls(block, 'write_result_line').some((c) => c.args[0] === start)) return block
+    i += block.length - 1
+  }
+  return undefined
+}
+
+/** The runner's own uppercase names: its forms built from the exported names (b.uqm SR-11.2, SR-11.3). */
+const E13_OWN_NAMES = ['SHARD_NUMBER_PATTERN', 'CANARY_PATTERN', 'SHA256_HEX_PATTERN', 'NODE_MODULES_DIR', 'PACKAGE_JSON_PATH_PATTERN']
+
+/** Where the `NAME=value` word that starts at `at` in `masked` ends: at a blank, `;`, `|` or `&` outside quotes and parentheses, or an unmatched `)`. */
+function e13ValueEnd(masked: string, at: number): number {
+  let depth = 0
+  let quote: string | null = null
+  let i = at
+  for (; i < masked.length; i++) {
+    const c = masked[i] as string
+    if (quote !== null) {
+      if (c === quote) quote = null
+    } else if (c === '"' || c === "'") quote = c
+    else if (c === '(') depth++
+    else if (c === ')') {
+      if (depth === 0) break
+      depth--
+    } else if (depth === 0 && /[\s;|&]/.test(c)) break
+  }
+  return i
+}
+
+/**
+ * Each name `lines` assign in the shell running them: a `NAME=value`
+ * statement (not a `NAME=value command` prefix, which sets the name for that
+ * command alone), a `local`, `declare`, `typeset` or `readonly` name, a `for`
+ * loop's name, and each name `read` reads into.
+ */
+function e13AssignedNames(lines: readonly E13Line[]): { line: E13Line; name: string }[] {
+  const out: { line: E13Line; name: string }[] = []
+  for (const line of lines) {
+    for (const m of line.masked.matchAll(new RegExp(`${E13_COMMAND_POSITION}([A-Za-z_]\\w*)(?:\\[[^\\]]*\\])?\\+?=`, 'g'))) {
+      const rest = line.masked.slice(e13ValueEnd(line.masked, (m.index ?? 0) + m[0].length)).trimStart()
+      if (rest === '' || /^[;|&)]/.test(rest)) out.push({ line, name: m[1] as string })
+    }
+    for (const m of line.masked.matchAll(new RegExp(`${E13_COMMAND_POSITION}for\\s+(?:(\\(\\()|([A-Za-z_]\\w*)\\s+in\\b)`, 'g'))) {
+      // Inside `(( … ))` the masked text is blank, so the arithmetic loop's name is read from the code.
+      const name = m[1] === undefined ? m[2] : /^\s*([A-Za-z_]\w*)/.exec(line.code.slice((m.index ?? 0) + m[0].length))?.[1]
+      if (name !== undefined) out.push({ line, name })
+    }
+  }
+  for (const { line, args } of e13Calls(lines, 'local|declare|typeset|readonly')) {
+    for (const word of args) {
+      const name = /^[A-Za-z_]\w*/.exec(word)?.[0]
+      if (name !== undefined) out.push({ line, name })
+    }
+  }
+  for (const { line, args } of e13Calls(lines, 'read')) {
+    for (let i = 0; i < args.length; i++) {
+      const word = args[i] as string
+      if (!word.startsWith('-')) out.push({ line, name: word })
+      else if (/[adinNptu]$/.test(word)) {
+        i++
+        if (word.endsWith('a') && args[i] !== undefined) out.push({ line, name: args[i] as string })
+      }
+    }
+  }
+  return out
+}
+
+/** The argument parse, line by line in order (b.uqm SR-11.2): a line ending `usage ` is the start of a check whose reason follows; any other line is exact. */
+const E13_PARSE = [
+  '(( $# >= 1 )) || usage ',
+  '[[ $1 =~ ${SHARD_NUMBER_PATTERN} ]] || usage ',
+  '(( $# >= 2 )) || usage ',
+  '[[ $2 =~ ${CANARY_PATTERN} ]] || usage ',
+  'canary=$2',
+  'shift 2',
+  'fail_names=()',
+  `while (( $# >= 1 )) && [[ $1 == "${e13Ref('RUNNER_FAIL_OPTION')}" ]]; do`,
+  '(( $# >= 2 )) || usage ',
+  'fail_names+=("$2")',
+  'shift 2',
+  'done',
+  '(( $# >= 1 )) || usage ',
+  'assigned=("$@")',
+  'first_script_position=$(( 3 + 2 * ${#fail_names[@]} ))',
+]
+
+/** Whether `code` is the parse line `step`. */
+function e13IsParseLine(code: string | undefined, step: string): boolean {
+  return step.endsWith('usage ') ? (code ?? '').startsWith(step) : code === step
+}
+
+/**
+ * What is wrong with tests/runner.sh's text (b.uqm SR-11.1, SR-11.2,
+ * SR-11.4, SR-11.5, SR-13.1): its marker refusal, its exported names and
+ * texts, which files it writes, the argument check, which scripts it runs and
+ * its control flow, and where the canary goes. Empty for a text with nothing
+ * wrong.
+ */
+function e13RunnerProblems(source: string): string[] {
+  const problems: string[] = []
+  const lines = e13ShellLines(source)
+  const top = lines.filter((l) => l.fn === null)
+
+  // The marker refusal: E10 reads it from docker.log as a whole line.
+  const marker = lines.findIndex((l) => l.code === 'if [[ ! -e /etc/cscb-ci-image ]]; then')
+  if (marker < 0) problems.push('has no image-marker check')
+  else {
+    const say = lines[marker + 1]?.code
+    const exit = lines[marker + 2]?.code
+    if (say !== `echo "${e13.MARKER_REFUSAL_LINE}" >&2`) problems.push(`the marker refusal does not print MARKER_REFUSAL_LINE alone on stderr: ${say}`)
+    if (exit !== `exit ${e13.MARKER_REFUSAL_EXIT_STATUS}`) problems.push(`the marker refusal does not exit MARKER_REFUSAL_EXIT_STATUS: ${exit}`)
+  }
+
+  // Exported names and texts: the single source (SR-11.5).
+  const assigns = e13Assignments(top)
+  for (const name of E13_EXPORT_NAMES) {
+    const values = assigns.get(name) ?? []
+    if (values.length !== 1) problems.push(`${name} is assigned ${values.length} times at the top level, not once`)
+    else if (values[0] !== E13_EXPORTS[name]) problems.push(`${name} is ${JSON.stringify(values[0])}, not the export's ${JSON.stringify(E13_EXPORTS[name])}`)
+  }
+  for (const name of E13_UNTYPED) {
+    for (const l of lines) {
+      if (l.code.includes(E13_EXPORTS[name]) && !l.code.startsWith(`${name}=`)) problems.push(`types ${JSON.stringify(E13_EXPORTS[name])} instead of ${e13Ref(name)}: ${l.code}`)
+    }
+  }
+  for (const [name, value] of [
+    ['VERDICT_FILE_NAME', e13.VERDICT_FILE_NAME],
+    ['DOCKER_LOG_FILE_NAME', e13.DOCKER_LOG_FILE_NAME],
+  ] as const) {
+    for (const l of lines) if (l.code.includes(value) || l.code.includes(name)) problems.push(`names ${value}, which only the host runner writes: ${l.code}`)
+  }
+
+  // What it writes: only the in-shard files, through their exported names (SR-11.3, SR-11.5).
+  const results = e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')
+  const allowedRedirects = new Set([
+    `write_file > "${results}/$1"`,
+    `write_result_line >> "${results}/${e13Ref('RESULT_FILE_NAME')}"`,
+    `top > "${results}/\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}"`,
+  ])
+  for (const w of e13Redirects(lines)) {
+    if (w.target !== '/dev/null' && !allowedRedirects.has(`${w.line.fn ?? 'top'} ${w.op} ${w.target}`)) problems.push(`writes ${w.target} by ${w.op}, not an in-shard file through its exported name: ${w.line.code}`)
+  }
+  for (const l of lines) for (const m of l.masked.matchAll(e13CommandAt(E13_WRITE_COMMANDS))) problems.push(`writes with ${m[1]}: ${l.code}`)
+  const inShard = new Set([
+    `"${e13Ref('CANARY_FILE_NAME')}"`,
+    `"${e13Ref('PACKAGE_SHA256_FILE_NAME')}"`,
+    `"${e13Ref('DEPENDENCY_FINGERPRINT_FILE_NAME')}"`,
+    `"\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}"`,
+  ])
+  for (const { line, args } of e13Calls(lines, 'write_file')) {
+    if (!inShard.has(args[0] ?? '')) problems.push(`write_file writes ${args[0]}, not an in-shard file through its exported name: ${line.code}`)
+  }
+
+  // The arguments: checked whole before anything is written; a bad one gives one usage line (SR-11.2).
+  const writers = e13Writers(lines)
+  const firstWrite = top.find((l) => e13WritesDirectly(l) || [...writers].some((w) => e13Runs(l, w)))
+  const lastCheck = top.filter((l) => e13Runs(l, 'usage')).at(-1)
+  if (lastCheck === undefined) problems.push('has no argument check')
+  else if (firstWrite !== undefined && firstWrite.no < lastCheck.no) problems.push(`writes before the argument check ends: ${firstWrite.code}`)
+  const usage = e13Body(lines, 'usage').map((l) => l.code)
+  const say = usage[0] ?? ''
+  if (usage.length !== 2 || !say.startsWith(`printf '%s%s\\n' "${e13Ref('USAGE_PREFIX')}" "`) || !say.endsWith('" >&2')) problems.push(`usage does not print one ${e13Ref('USAGE_PREFIX')} line on stderr`)
+  if (usage[1] !== `exit "${e13Ref('USAGE_EXIT_STATUS')}"`) problems.push(`usage does not exit ${e13Ref('USAGE_EXIT_STATUS')}: ${usage[1]}`)
+  const shown = new Set(['$1', '${position}', ...E13_EXPORT_NAMES.map(e13Ref)])
+  for (const [line, text] of [
+    ...e13Calls(top, 'usage').map(({ line, args }) => [line, args[0] ?? ''] as const),
+    ...e13Body(lines, 'usage').map((line) => [line, line.code] as const),
+  ]) {
+    const reason = text.replace(/\$\(\((?:[^()]|\([^()]*\))*\)\)/g, '')
+    for (const m of reason.matchAll(/\$(?:\{[^}]*\}|\w+|[@*#?!-])/g)) {
+      if (!shown.has(m[0]) || (m[0] === '$1' && line.fn !== 'usage')) problems.push(`a usage line shows ${m[0]}, an argument's value: ${line.code}`)
+    }
+  }
+  if (e13Pattern(top, 'SHARD_NUMBER_PATTERN') !== '^[1-9][0-9]*$') problems.push('SHARD_NUMBER_PATTERN is not a whole number of at least 1 with no leading zero')
+  if (e13Pattern(top, 'CANARY_PATTERN') !== `^[0-9a-f]{${e13.CANARY_LENGTH}}$`) problems.push(`CANARY_PATTERN is not ${e13Ref('CANARY_LENGTH')} lowercase hexadecimal characters`)
+  // The shard number, the canary, the --fail pairs and the assigned scripts, each read in turn.
+  const parse = top.findIndex((l) => e13IsParseLine(l.code, E13_PARSE[0] as string))
+  const step = E13_PARSE.findIndex((s, k) => parse < 0 || !e13IsParseLine(top[parse + k]?.code, s))
+  if (step >= 0) {
+    const expected = `${E13_PARSE[step]}${(E13_PARSE[step] as string).endsWith('usage ') ? '…' : ''}`
+    problems.push(`the argument parse's line ${step + 1} is not ${JSON.stringify(expected)}: ${parse < 0 ? 'no parse' : (top[parse + step]?.code ?? 'nothing')}`)
+  }
+  // Each check on the assigned names and the --fail names, in its loop over them.
+  const fail = e13Ref('RUNNER_FAIL_OPTION')
+  for (const [what, check, over] of [
+    [`each assigned name against ${e13Ref('SCRIPT_FILE_NAME_PATTERN')}`, `[[ \${name} =~ ${e13Ref('SCRIPT_FILE_NAME_PATTERN')} ]] || usage `, 'assigned'],
+    ['test-1 first', "if (( index == 0 )) && [[ ${BASH_REMATCH[1]} != '1' ]]; then", 'assigned'],
+    ['each assigned name once', 'is_in "${name}" "${assigned[@]:0:index}" && usage ', 'assigned'],
+    [`each ${fail} name is an assigned script`, 'is_in "${name}" "${assigned[@]}" || usage ', 'fail_names'],
+    [`each ${fail} name once`, 'is_in "${name}" "${fail_names[@]:0:index}" && usage ', 'fail_names'],
+  ] as const) {
+    const at = top.findIndex((l) => l.code.startsWith(check))
+    const opener = at < 0 ? undefined : e13Enclosing(top, at)
+    const walk = opener === undefined ? undefined : top[top.indexOf(opener) + 1]
+    if (opener?.code !== `for (( index = 0; index < \${#${over}[@]}; index++ )); do` || walk?.code !== `name=\${${over}[index]}`) problems.push(`the argument check does not check ${what}`)
+  }
+
+  // Only the assigned scripts run, in order, each through bash (SR-11.1, SR-11.4).
+  const runs = lines.filter((l) => e13Runs(l, E13_RUN_COMMANDS))
+  for (const l of runs) if (!l.code.startsWith(`${E13_RUN} `) && l.code !== E13_RUN) problems.push(`runs a script other than as ${E13_RUN}: ${l.code}`)
+  if (runs.length !== 1) problems.push(`has ${runs.length} script runs, not one`)
+  for (const l of lines) {
+    if (!runs.includes(l) && /\bintegration\b|\$\{?tests_dir\b/.test(l.code)) problems.push(`looks for scripts instead of running only the assigned ones: ${l.code}`)
+  }
+  const assigned = top.filter((l) => /^assigned(?:\[[^\]]*\])?\+?=/.test(l.code)).map((l) => l.code)
+  if (assigned.join('\n') !== 'assigned=("$@")') problems.push(`the assigned scripts are not the arguments after the ${e13Ref('RUNNER_FAIL_OPTION')} pairs: ${assigned.join('; ')}`)
+
+  // At the first failure: notrun lines, then done, then idle (SR-11.4).
+  const loop = e13RunLoop(top)
+  if (loop === undefined) problems.push('has no run loop writing start lines')
+  else {
+    if (loop[0]?.code !== 'for (( index = 0; index < ${#assigned[@]}; index++ )); do' || loop[1]?.code !== 'name=${assigned[index]}') {
+      problems.push('the run loop does not walk the assigned scripts in order')
+    }
+    if (top[top.indexOf(loop[0] as E13Line) - 1]?.code !== 'failed=0') problems.push('the run loop is not just after failed=0')
+    const notrun = ['if (( failed )); then', `write_result_line "${e13Ref('RESULT_WORD_NOTRUN')} \${name}"`, 'continue', 'fi']
+    if (loop.slice(2, 6).map((l) => l.code).join('\n') !== notrun.join('\n')) problems.push('the run loop does not write a notrun line for each script after the first failure')
+    loop.forEach((l, i) => {
+      const line = e13Unquote(e13ArgOn(l, 'write_result_line'))
+      if (line?.startsWith(`${e13Ref('RESULT_WORD_END')} `) && line.includes(` ${e13Ref('RESULT_WORD_FAIL')} `) && (loop[i + 1]?.code !== 'failed=1' || loop[i + 2]?.code !== 'continue')) {
+        problems.push(`a failed script does not stop the run: ${l.code}`)
+      }
+    })
+  }
+  const resultWrites = e13Calls(lines, 'write_result_line')
+  const dones = resultWrites.filter((c) => c.args[0] === `"${e13Ref('RESULT_WORD_DONE')}"`)
+  const done = dones[0]?.line
+  if (dones.length !== 1 || done === undefined || done.fn !== null || loop === undefined || done.no < (loop.at(-1) as E13Line).no || resultWrites.at(-1)?.line !== done) {
+    problems.push('does not write the end marker once, last, after the run loop')
+  } else {
+    const after = top.filter((l) => l.no > done.no)
+    for (const l of after) if (e13Runs(l, 'exit|return|exec')) problems.push(`ends after the end marker: ${l.code}`)
+    const idle = after.findIndex((l) => /^while (?::|true); do$/.test(l.code))
+    const body = idle < 0 ? [] : e13Block(after, idle).slice(1, -1)
+    if (body.length === 0 || !body.every((l) => /^sleep \d+$/.test(l.code))) problems.push('does not stay running, idle, after the end marker')
+    if (!after.some((l, i) => l.code === "trap '' TERM" && i < idle)) problems.push('does not ignore SIGTERM after the end marker')
+  }
+  for (const { line, args } of e13Calls(lines, 'trap')) if (args[0] !== "''") problems.push(`a trap runs a handler: ${line.code}`)
+
+  // The canary goes only to canary.txt; nothing is exported, and no script's environment changes (SR-13.1).
+  const held = lines.filter((l) => /^(?:(?:local|declare|typeset|readonly)\s+(?:-\w+\s+)*)?canary\+?=|\bread\b.*\bcanary\b/.test(l.code))
+  if (held.length !== 1 || held[0]?.code !== 'canary=$2' || held[0].fn !== null) problems.push('the canary is not held once, from argument 2')
+  const canaryWrite = `write_file "${e13Ref('CANARY_FILE_NAME')}" "\${canary}"`
+  const uses = lines.filter((l) => /\$\{?canary\b/.test(l.code))
+  for (const l of uses) if (l.code !== canaryWrite) problems.push(`uses the canary outside its write to ${e13.CANARY_FILE_NAME}: ${l.code}`)
+  if (uses.filter((l) => l.code === canaryWrite).length !== 1) problems.push(`does not write the canary to ${e13.CANARY_FILE_NAME} once`)
+  for (const l of lines) {
+    if (e13Runs(l, 'export|env') || /(?:^|[;&|]\s*)(?:declare|typeset|local|readonly)\s+-\w*x/.test(l.masked) || /(?:^|[;&|]\s*)set\b[^;&|]*\s(?:-\w*a\w*|-o\s+allexport)\b/.test(l.masked)) {
+      problems.push(`exports into a script's environment: ${l.code}`)
+    }
+  }
+  // A name a script may inherit (PATH, HOME, …) is never assigned: only an exported name, the runner's own forms, or a lowercase name.
+  const ownNames = new Set<string>([...E13_EXPORT_NAMES, ...E13_OWN_NAMES])
+  for (const { line, name } of e13AssignedNames(lines)) {
+    if (!ownNames.has(name) && !/^[a-z]/.test(name)) problems.push(`assigns ${name}, which may change a script's environment: ${line.code}`)
+  }
+  // A cd outside a subshell changes the directory each script starts in.
+  for (const l of lines) {
+    for (const m of l.masked.matchAll(e13CommandAt('cd|pushd|popd'))) {
+      const before = l.masked.slice(0, (m.index ?? 0) + m[0].length - (m[1] as string).length)
+      if ((before.match(/\(/g) ?? []).length <= (before.match(/\)/g) ?? []).length) problems.push(`changes the directory a script starts in: ${l.code}`)
+    }
+  }
+  return problems
+}
+
+/**
+ * What is wrong with what tests/runner.sh writes (b.uqm SR-11.3): each
+ * in-shard file's content form, when it is written, and what goes into it.
+ * Empty for a text with nothing wrong.
+ */
+function e13RunnerWriteProblems(source: string): string[] {
+  const problems: string[] = []
+  const lines = e13ShellLines(source)
+  const top = lines.filter((l) => l.fn === null)
+  const loop = e13RunLoop(top) ?? []
+  const results = e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')
+  const fail = e13Ref('RUNNER_FAIL_OPTION')
+
+  // Each file is written whole: its text and one LF, in one write; a result line appended.
+  if (e13BodyText(lines, 'write_file') !== `printf '%s\\n' "$2" > "${results}/$1" || exit 1`) problems.push('write_file does not write its text and one LF in one write')
+  if (e13BodyText(lines, 'write_result_line') !== `printf '%s\\n' "$1" >> "${results}/${e13Ref('RESULT_FILE_NAME')}" || exit 1`) {
+    problems.push(`write_result_line does not append its line and one LF to ${e13.RESULT_FILE_NAME} in one write`)
+  }
+
+  // canary.txt and package.sha256, before the first script runs.
+  for (const [name, value] of [
+    ['CANARY_FILE_NAME', '"${canary}"'],
+    ['PACKAGE_SHA256_FILE_NAME', '"${package_sha256}"'],
+  ] as const) {
+    const writes = e13Calls(lines, 'write_file').filter((c) => c.args[0] === `"${e13Ref(name)}"`)
+    const at = writes[0]?.line
+    if (writes.length !== 1 || writes[0]?.args[1] !== value || at === undefined || at.fn !== null || loop.length === 0 || at.no > (loop[0] as E13Line).no) {
+      problems.push(`${E13_EXPORTS[name]} is not written once, before the first script runs`)
+    }
+  }
+  if (!top.some((l) => l.code.includes(`package_sha256=$(sha256_hex < "${e13Ref('INTEGRITY_TARBALL_MOUNT_TARGET')}")`))) {
+    problems.push(`${e13.PACKAGE_SHA256_FILE_NAME} is not the SHA-256 of ${e13Ref('INTEGRITY_TARBALL_MOUNT_TARGET')}`)
+  }
+  const sha = e13Body(lines, 'sha256_hex').map((l) => l.code)
+  if (!sha.includes('sum=$(sha256sum) || return 1') || !sha.includes('[[ ${sum} =~ ${SHA256_HEX_PATTERN} ]] || return 1')) problems.push("sha256_hex does not give sha256sum's hash only when it matches SHA256_HEX_PATTERN")
+  if (e13Pattern(top, 'SHA256_HEX_PATTERN') !== `^[0-9a-f]{${e13.SHA256_HEX_LENGTH}}$`) problems.push(`SHA256_HEX_PATTERN is not ${e13Ref('SHA256_HEX_LENGTH')} lowercase hexadecimal characters`)
+
+  // Result lines: each of a known form, read back by the runner's own parser.
+  const script = e13Helpers.realScriptFileName(1)
+  const values = { ...e13ShellValues(top), name: script, seconds: e13.formatResultSeconds(1) }
+  const kinds = new Set<string>()
+  // Each result word through its exported name, never typed (SR-11.5).
+  const word = (...names: E13ExportName[]): string => `\\$\\{(?:${names.join('|')})\\}`
+  const zero = e13.formatResultSeconds(0).replace('.', '\\.')
+  const spelled = new RegExp(
+    `^"${word('RESULT_WORD_START', 'RESULT_WORD_END', 'RESULT_WORD_NOTRUN', 'RESULT_WORD_DONE')}(?: \\$\\{name\\}(?: ${word('RESULT_WORD_PASS', 'RESULT_WORD_FAIL')} (?:\\$\\{seconds\\}|${zero}))?)?"$`,
+  )
+  for (const { line, args } of e13Calls(lines, 'write_result_line')) {
+    const text = args.length === 1 ? e13Unquote(args[0]) : null
+    const event = text === null ? null : e13.parseResultLine(e13Expand(text, values))
+    if (event === null) problems.push(`writes a result line of no known form: ${line.code}`)
+    else {
+      kinds.add(event.kind === e13.RESULT_WORD_END ? `${event.kind} … ${event.result}` : event.kind)
+      if (!spelled.test(args[0] as string)) problems.push(`types a result line's words instead of their exported names: ${line.code}`)
+    }
+  }
+  for (const kind of [
+    e13.RESULT_WORD_START,
+    `${e13.RESULT_WORD_END} … ${e13.RESULT_WORD_PASS}`,
+    `${e13.RESULT_WORD_END} … ${e13.RESULT_WORD_FAIL}`,
+    e13.RESULT_WORD_NOTRUN,
+    e13.RESULT_WORD_DONE,
+  ]) {
+    if (!kinds.has(kind)) problems.push(`writes no ${kind} result line`)
+  }
+
+  // An end line's seconds: the script's timed run, three decimals, no leading zero but a lone 0.
+  const seconds = e13Body(lines, 'script_seconds').map((l) => l.code)
+  if (!seconds.includes('(( elapsed_ms >= 0 )) || elapsed_ms=0')) problems.push('script_seconds does not give a negative time as 0')
+  if (!seconds.includes(`printf '%d.%03d\\n' "$(( elapsed_ms / 1000 ))" "$(( elapsed_ms % 1000 ))"`)) problems.push('script_seconds does not print whole seconds with no leading zero, a point and exactly three digits')
+  const at = (code: string): number => loop.findIndex((l) => l.code === code)
+  const run = loop.findIndex((l) => l.code.startsWith(E13_RUN))
+  const timed = [at('started_us=$(now_us)'), run, at('ended_us=$(now_us)'), at('seconds=$(script_seconds "${started_us}" "${ended_us}")')]
+  if (timed.some((i) => i < 0) || timed.some((i, k) => k > 0 && i <= (timed[k - 1] as number))) problems.push("an end line's seconds are not the script's timed run")
+
+  // Each run script's log: its stdout and stderr together, as it runs.
+  const log = `"${results}/\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}"`
+  const logged = lines.filter((l) => l.code.includes(E13_RUN))
+  if (logged.length !== 1 || logged[0]?.code !== `${E13_RUN} > ${log} 2>&1`) problems.push(`a script's log does not take its standard output and standard error as it runs: ${logged.map((l) => l.code).join('; ')}`)
+
+  // A --fail script: start, then end … fail 0.000, and a log of only the injected FAIL line; it is not run.
+  const failIf = at('if is_in "${name}" "${fail_names[@]}"; then')
+  if (failIf < 0) problems.push(`no ${fail} script is recorded failed without running`)
+  else {
+    const block = e13Block(loop, failIf)
+    if (block.some((l) => e13Runs(l, E13_RUN_COMMANDS) || l.code.includes('${tests_dir}')) || (run >= 0 && run < failIf + block.length)) problems.push(`a ${fail} script is run`)
+    const logs = e13Calls(block, 'write_file')
+    const text = logs.length === 1 && logs[0]?.args[0] === `"\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}"` ? e13Unquote(logs[0].args[1]) : null
+    if (text === null || e13Expand(text, values) !== e13.injectedFailureLine(script)) problems.push(`a ${fail} script's log is not only the injected FAIL line`)
+    const ends = e13Calls(block, 'write_result_line')
+    const end = ends.length === 1 ? e13Unquote(ends[0]?.args[0]) : null
+    const expected = { kind: e13.RESULT_WORD_END, fileName: script, result: e13.RESULT_WORD_FAIL, seconds: 0 }
+    if (end === null || JSON.stringify(e13.parseResultLine(e13Expand(end, values))) !== JSON.stringify(expected)) {
+      problems.push(`a ${fail} script's end line is not ${e13.RESULT_WORD_END} <file name> ${e13.RESULT_WORD_FAIL} ${e13.formatResultSeconds(0)}`)
+    }
+    const start = loop.findIndex((l) => e13ArgOn(l, 'write_result_line') === `"${e13Ref('RESULT_WORD_START')} \${name}"`)
+    if (start < 0 || start > failIf) problems.push(`a ${fail} script gets no start line before its end line`)
+  }
+
+  // The dependency fingerprint: only after test-1 passes, over every installed package directory.
+  const taken = lines.filter((l) => l.fn === null && /\bdependency_fingerprint\b/.test(l.masked))
+  const fingerprint = loop.indexOf(taken[0] as E13Line)
+  const pass = loop.findIndex((l) => e13ArgOn(l, 'write_result_line') === `"${e13Ref('RESULT_WORD_END')} \${name} ${e13Ref('RESULT_WORD_PASS')} \${seconds}"`)
+  const status = at('if (( script_status != 0 )); then')
+  if (
+    taken.length !== 1 ||
+    fingerprint < 0 ||
+    status < 0 ||
+    pass < status + e13Block(loop, status).length ||
+    fingerprint < pass ||
+    e13Enclosing(loop, fingerprint)?.code !== 'if (( index == 0 )); then' ||
+    loop[fingerprint + 1]?.code !== `write_file "${e13Ref('DEPENDENCY_FINGERPRINT_FILE_NAME')}" "\${fingerprint}"`
+  ) {
+    problems.push(`${e13.DEPENDENCY_FINGERPRINT_FILE_NAME} is not written only after test-1 passes`)
+  }
+  if (e13BodyText(lines, 'dependency_fingerprint') !== 'package_lines | LC_ALL=C sort -u | sha256_hex') {
+    problems.push('the fingerprint is not the SHA-256 of the package lines sorted bytewise under the C locale with repeats removed')
+  }
+  const walk = e13Body(lines, 'package_lines').map((l) => l.code)
+  if (!walk.includes(`find "\${NODE_MODULES_DIR}" -regextype posix-extended -name '.*' -prune -o -type f -regex "\${PACKAGE_JSON_PATH_PATTERN}" -print0 |`)) {
+    problems.push("the walk does not take each package.json matching PACKAGE_JSON_PATH_PATTERN under NODE_MODULES_DIR, skipping names starting with '.'")
+  }
+  if (!walk.some((l) => l.startsWith(`jq -r '"\\(.name // "")@\\(.version // "")"' "\${package_json}"`))) problems.push('a package line is not <name>@<version>')
+  const shell = e13ShellValues(top)
+  if (shell.NODE_MODULES_DIR !== E13_NODE_MODULES) problems.push(`NODE_MODULES_DIR is ${JSON.stringify(shell.NODE_MODULES_DIR)}, not ${E13_NODE_MODULES}`)
+  let pattern: RegExp | null = null
+  try {
+    pattern = new RegExp(`^(?:${shell.PACKAGE_JSON_PATH_PATTERN ?? ''})$`)
+  } catch {
+    problems.push('PACKAGE_JSON_PATH_PATTERN is not a pattern')
+  }
+  // A package directory sits directly in a node_modules directory, or directly in an @scope directory within one.
+  for (const [dir, isPackage] of [
+    ['pkg', true],
+    ['@scope/pkg', true],
+    ['pkg/node_modules/dep', true],
+    ['pkg/node_modules/@scope/dep', true],
+    ['pkg/lib', false],
+    ['@scope/pkg/lib', false],
+  ] as const) {
+    const path = `${E13_NODE_MODULES}/${dir}/package.json`
+    if (pattern !== null && pattern.test(path) !== isPackage) problems.push(`the walk ${isPackage ? 'misses' : 'takes'} ${path}`)
+  }
+  return problems
+}
+
+/**
+ * What is wrong with docker/entrypoint.sh's text (b.uqm SR-11.1, SR-11.2):
+ * its last step is its one exec, which runs tests/runner.sh as testuser with
+ * every argument it got, unchanged and in order; nothing changes the
+ * arguments; and the results mount is made and handed to testuser before it.
+ */
+function e13EntrypointProblems(source: string): string[] {
+  const problems: string[] = []
+  const lines = e13ShellLines(source)
+  const execs = lines.filter((l) => e13Runs(l, 'exec'))
+  const exec = execs[0]
+  if (execs.length !== 1 || exec === undefined || exec !== lines.at(-1)) problems.push(`its last step is not its one exec: ${execs.map((l) => l.code).join('; ')}`)
+  const passed = exec === undefined ? null : /^exec gosu testuser bash \/tests\/runner\.sh(.*)$/.exec(exec.code)
+  if (passed === null || passed === undefined) problems.push('no exec runs /tests/runner.sh as testuser')
+  else if ((passed[1] as string).trim() !== '"$@"') problems.push(`the exec passes ${JSON.stringify((passed[1] as string).trim())} to tests/runner.sh, not ${JSON.stringify('"$@"')}`)
+  for (const l of lines) if (e13Runs(l, 'shift') || /(?:^|[;&|]\s*)set\s+(?:-\w*\s+)*--/.test(l.masked)) problems.push(`changes its arguments: ${l.code}`)
+  const target = e13.INTEGRITY_RESULTS_MOUNT_TARGET
+  const made = lines.findIndex((l) => l.code === `mkdir -p ${target}`)
+  const owned = lines.findIndex((l) => l.code.startsWith('chown -R testuser:testuser ') && l.code.split(' ').includes(target))
+  if (made < 0 || owned < made || exec === undefined || owned > lines.indexOf(exec)) problems.push(`the ${target} ownership step does not come before the exec`)
+  return problems
+}
+
+/** `text` with `from` replaced by `to` once, checked to change it (a planted row that plants nothing would pass vacuously). */
+function e13Planted(text: string, from: string | RegExp, to: string): string {
+  const out = text.replace(from, () => to)
+  expect(out).not.toBe(text)
+  return out
+}
+
+/** `text` with the line `line` moved to just before the line `before`. */
+function e13Moved(text: string, line: string, before: string): string {
+  return e13Planted(e13Planted(text, `${line}\n`, ''), `${before}\n`, `${line}\n${before}\n`)
+}
+
+describe('E13: tests/runner.sh and docker/entrypoint.sh source audit (b.t6s E13 T6; b.uqm SR-11.1, SR-11.2, SR-11.4, SR-11.5, SR-13.1)', () => {
+  const runner = (): string => readFileSync(E13_RUNNER_SH, 'utf-8')
+  const entrypoint = (): string => readFileSync(E13_ENTRYPOINT_SH, 'utf-8')
+  const canaryWrite = `write_file "${e13Ref('CANARY_FILE_NAME')}" "\${canary}"`
+  const done = `write_result_line "${e13Ref('RESULT_WORD_DONE')}"`
+  /** The real runner's first line starting with `start`, trimmed. */
+  const parseLine = (start: string): string =>
+    runner()
+      .split('\n')
+      .map((l) => l.trim())
+      .find((l) => l.startsWith(start)) ?? ''
+
+  test('the current tests/runner.sh has no problem: its marker refusal, exported texts, writes, argument check, script runs, control flow and canary', () => {
+    expect(e13RunnerProblems(runner())).toEqual([])
+  })
+
+  // Each row plants one change in the real runner; the audit must name it.
+  test.each<[string, (text: string) => string, string]>([
+    [
+      'a renamed in-shard file',
+      (t) => e13Planted(t, `CANARY_FILE_NAME='${e13.CANARY_FILE_NAME}'`, `CANARY_FILE_NAME='${e13.CANARY_FILE_NAME}.bak'`),
+      `CANARY_FILE_NAME is ${JSON.stringify(`${e13.CANARY_FILE_NAME}.bak`)}, not the export's ${JSON.stringify(e13.CANARY_FILE_NAME)}`,
+    ],
+    [
+      'an in-shard file name typed instead of its exported name',
+      (t) => e13Planted(t, `"${e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')}/${e13Ref('RESULT_FILE_NAME')}"`, `"${e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')}/${e13.RESULT_FILE_NAME}"`),
+      `types ${JSON.stringify(e13.RESULT_FILE_NAME)} instead of ${e13Ref('RESULT_FILE_NAME')}: printf '%s\\n' "$1" >> "${e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')}/${e13.RESULT_FILE_NAME}" || exit 1`,
+    ],
+    [
+      'a misspelled result word',
+      (t) => e13Planted(t, `RESULT_WORD_NOTRUN='${e13.RESULT_WORD_NOTRUN}'`, `RESULT_WORD_NOTRUN='${e13.RESULT_WORD_NOTRUN.slice(0, -1)}'`),
+      `RESULT_WORD_NOTRUN is ${JSON.stringify(e13.RESULT_WORD_NOTRUN.slice(0, -1))}, not the export's ${JSON.stringify(e13.RESULT_WORD_NOTRUN)}`,
+    ],
+    [
+      'a verdict.txt write',
+      (t) => e13Planted(t, `${done}\n`, `write_file '${e13.VERDICT_FILE_NAME}' PASS\n${done}\n`),
+      `names ${e13.VERDICT_FILE_NAME}, which only the host runner writes: write_file '${e13.VERDICT_FILE_NAME}' PASS`,
+    ],
+    [
+      'a write by another command',
+      (t) => e13Planted(t, `${canaryWrite}\n`, `mkdir -p "${e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')}/extra"\n${canaryWrite}\n`),
+      `writes with mkdir: mkdir -p "${e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')}/extra"`,
+    ],
+    ['a write before the argument check', (t) => e13Moved(t, canaryWrite, 'fail_names=()'), `writes before the argument check ends: ${canaryWrite}`],
+    [
+      'a different usage status',
+      (t) => e13Planted(t, `USAGE_EXIT_STATUS=${e13.USAGE_EXIT_STATUS}`, `USAGE_EXIT_STATUS=${e13.USAGE_EXIT_STATUS + 1}`),
+      `USAGE_EXIT_STATUS is ${JSON.stringify(String(e13.USAGE_EXIT_STATUS + 1))}, not the export's ${JSON.stringify(String(e13.USAGE_EXIT_STATUS))}`,
+    ],
+    ['a usage exit not through USAGE_EXIT_STATUS', (t) => e13Planted(t, `exit "${e13Ref('USAGE_EXIT_STATUS')}"`, 'exit 1'), `usage does not exit ${e13Ref('USAGE_EXIT_STATUS')}: exit 1`],
+    ['a usage line on stdout', (t) => e13Planted(t, `" >&2\n    exit "${e13Ref('USAGE_EXIT_STATUS')}"`, `"\n    exit "${e13Ref('USAGE_EXIT_STATUS')}"`), `usage does not print one ${e13Ref('USAGE_PREFIX')} line on stderr`],
+    [
+      'a usage line that shows the canary',
+      (t) => e13Planted(t, `lowercase hexadecimal characters"`, `lowercase hexadecimal characters: $2"`),
+      `a usage line shows $2, an argument's value: [[ $2 =~ \${CANARY_PATTERN} ]] || usage "argument 2 is not a canary: ${e13Ref('CANARY_LENGTH')} lowercase hexadecimal characters: $2"`,
+    ],
+    ['a canary check that takes uppercase', (t) => e13Planted(t, 'CANARY_PATTERN="^[0-9a-f]', 'CANARY_PATTERN="^[0-9a-fA-F]'), `CANARY_PATTERN is not ${e13Ref('CANARY_LENGTH')} lowercase hexadecimal characters`],
+    ['a first script that need not be test-1', (t) => e13Planted(t, "[[ ${BASH_REMATCH[1]} != '1' ]]", "[[ ${BASH_REMATCH[1]} == '' ]]"), 'the argument check does not check test-1 first'],
+    [
+      'a marker refusal with a prefix',
+      (t) => e13Planted(t, `echo "${e13.MARKER_REFUSAL_LINE}" >&2`, `echo "error: ${e13.MARKER_REFUSAL_LINE}" >&2`),
+      `the marker refusal does not print MARKER_REFUSAL_LINE alone on stderr: echo "error: ${e13.MARKER_REFUSAL_LINE}" >&2`,
+    ],
+    [
+      'a marker refusal with another status',
+      (t) => e13Planted(t, `>&2\n    exit ${e13.MARKER_REFUSAL_EXIT_STATUS}\n`, '>&2\n    exit 1\n'),
+      'the marker refusal does not exit MARKER_REFUSAL_EXIT_STATUS: exit 1',
+    ],
+    ['a script run with source, not bash', (t) => e13Planted(t, E13_RUN, 'source "${tests_dir}/integration/${name}"'), `runs a script other than as ${E13_RUN}: source "\${tests_dir}/integration/\${name}" > "${e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')}/\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}" 2>&1`],
+    ['scripts found in tests/integration', (t) => e13Planted(t, 'assigned=("$@")', 'assigned=("${tests_dir}"/integration/test-*.sh)'), 'looks for scripts instead of running only the assigned ones: assigned=("${tests_dir}"/integration/test-*.sh)'],
+    [
+      'no stop at the first failure',
+      (t) => e13Planted(t, `${e13Ref('RESULT_WORD_FAIL')} \${seconds}"\n        failed=1\n`, `${e13Ref('RESULT_WORD_FAIL')} \${seconds}"\n`),
+      `a failed script does not stop the run: write_result_line "${e13Ref('RESULT_WORD_END')} \${name} ${e13Ref('RESULT_WORD_FAIL')} \${seconds}"`,
+    ],
+    ['no notrun lines after the first failure', (t) => e13Planted(t, `write_result_line "${e13Ref('RESULT_WORD_NOTRUN')} \${name}"\n`, ':\n'), 'the run loop does not write a notrun line for each script after the first failure'],
+    ['no end marker', (t) => e13Planted(t, `${done}\n`, ''), 'does not write the end marker once, last, after the run loop'],
+    ['an exit after the end marker', (t) => e13Planted(t, /while :; do\n\s*sleep \d+\ndone\n/, 'exit 0\n'), 'ends after the end marker: exit 0'],
+    ['a SIGTERM handler that exits', (t) => e13Planted(t, "trap '' TERM", "trap 'exit 0' TERM"), "a trap runs a handler: trap 'exit 0' TERM"],
+    ['an exported canary', (t) => e13Planted(t, 'canary=$2\n', 'canary=$2\nexport canary\n'), "exports into a script's environment: export canary"],
+    ['a canary declared for export', (t) => e13Planted(t, 'canary=$2\n', 'canary=$2\ndeclare -x canary\n'), "exports into a script's environment: declare -x canary"],
+    [
+      "the canary in a script's environment",
+      (t) => e13Planted(t, `    ${E13_RUN}`, `    CSCB_CANARY="\${canary}" ${E13_RUN}`),
+      `uses the canary outside its write to ${e13.CANARY_FILE_NAME}: CSCB_CANARY="\${canary}" ${E13_RUN} > "${e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')}/\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}" 2>&1`,
+    ],
+    ['no failed=0 before the run loop', (t) => e13Planted(t, 'failed=0\n', ''), 'the run loop is not just after failed=0'],
+    // The argument parse (SR-11.2).
+    ['no shift after the canary', (t) => e13Planted(t, 'canary=$2\nshift 2\n', 'canary=$2\n'), `the argument parse's line 6 is not "shift 2": fail_names=()`],
+    ['a --fail pair read from the option word', (t) => e13Planted(t, 'fail_names+=("$2")', 'fail_names+=("$1")'), `the argument parse's line 10 is not ${JSON.stringify('fail_names+=("$2")')}: fail_names+=("$1")`],
+    ['a --fail loop that shifts one word', (t) => e13Planted(t, 'fail_names+=("$2")\n    shift 2\n', 'fail_names+=("$2")\n    shift 1\n'), `the argument parse's line 11 is not "shift 2": shift 1`],
+    ['no shard-number check', (t) => e13Planted(t, /\n\[\[ \$1 =~ \$\{SHARD_NUMBER_PATTERN\} \]\] \|\| usage [^\n]*\n/, '\n'), `the argument parse's line 2 is not ${JSON.stringify(`${E13_PARSE[1]}…`)}: ${parseLine('(( $# >= 2 ))')}`],
+    ['no missing-canary check', (t) => e13Planted(t, /\n\(\( \$# >= 2 \)\) \|\| usage [^\n]*\n(?=\[\[ \$2)/, '\n'), `the argument parse's line 3 is not ${JSON.stringify(`${E13_PARSE[2]}…`)}: ${parseLine('[[ $2 =~')}`],
+    ['no missing-script check', (t) => e13Planted(t, /\n\(\( \$# >= 1 \)\) \|\| usage [^\n]*\n(?=assigned=)/, '\n'), `the argument parse's line 13 is not ${JSON.stringify(`${E13_PARSE[12]}…`)}: assigned=("$@")`],
+    ['a shard number of 0 taken', (t) => e13Planted(t, "SHARD_NUMBER_PATTERN='^[1-9][0-9]*$'", "SHARD_NUMBER_PATTERN='^[0-9]+$'"), 'SHARD_NUMBER_PATTERN is not a whole number of at least 1 with no leading zero'],
+    ['no duplicate-script check', (t) => e13Planted(t, /\n *is_in "\$\{name\}" "\$\{assigned\[@\]:0:index\}" && usage [^\n]*\n/, '\n'), 'the argument check does not check each assigned name once'],
+    [
+      'no --fail membership check',
+      (t) => e13Planted(t, /\n *is_in "\$\{name\}" "\$\{assigned\[@\]\}" \|\| usage [^\n]*\n/, '\n'),
+      `the argument check does not check each ${e13Ref('RUNNER_FAIL_OPTION')} name is an assigned script`,
+    ],
+    ['no --fail-twice check', (t) => e13Planted(t, /\n *is_in "\$\{name\}" "\$\{fail_names\[@\]:0:index\}" && usage [^\n]*\n/, '\n'), `the argument check does not check each ${e13Ref('RUNNER_FAIL_OPTION')} name once`],
+    // No script's environment changes (SR-13.1).
+    ['allexport among other options', (t) => e13Planted(t, 'set -uo pipefail', 'set -auo pipefail'), "exports into a script's environment: set -auo pipefail"],
+    ['PATH assigned', (t) => e13Planted(t, '\ntests_dir=', '\nPATH=/opt/x:${PATH}\ntests_dir='), "assigns PATH, which may change a script's environment: PATH=/opt/x:${PATH}"],
+    ['HOME assigned', (t) => e13Planted(t, '\ntests_dir=', '\nHOME=/tmp/h\ntests_dir='), "assigns HOME, which may change a script's environment: HOME=/tmp/h"],
+    ['HOME read', (t) => e13Planted(t, '\ntests_dir=', '\nread -r HOME < /dev/null\ntests_dir='), "assigns HOME, which may change a script's environment: read -r HOME < /dev/null"],
+    ['a loop over PATH', (t) => e13Planted(t, '\ntests_dir=', '\nfor PATH in /opt/x; do\n    :\ndone\ntests_dir='), "assigns PATH, which may change a script's environment: for PATH in /opt/x; do"],
+    ['a local PATH', (t) => e13Planted(t, '    local sum\n', '    local sum PATH\n'), "assigns PATH, which may change a script's environment: local sum PATH"],
+    ['a cd', (t) => e13Planted(t, '\ntests_dir=', '\ncd /tmp\ntests_dir='), 'changes the directory a script starts in: cd /tmp'],
+  ])('a runner with %s is reported', (_name, plant, problem) => {
+    expect(e13RunnerProblems(plant(runner()))).toContain(problem)
+  })
+
+  test("E9's shardRunnerArguments gives the order the runner's parse reads: the shard number, the canary, the --fail pairs, then the assigned scripts", () => {
+    const top = e13ShellLines(runner()).filter((l) => l.fn === null)
+    const assigned = [1, 2, 3].map(e13Helpers.realScriptFileName)
+    const fails = [assigned[2] as string, assigned[1] as string]
+    const args = e13.shardRunnerArguments(2, 'a'.repeat(e13.CANARY_LENGTH), fails, assigned)
+    expect(args[0]).toMatch(new RegExp(e13Pattern(top, 'SHARD_NUMBER_PATTERN')))
+    expect(args[1]).toMatch(new RegExp(e13Pattern(top, 'CANARY_PATTERN')))
+    // The runner's 1-based positions: a --fail pair's name at <n> + 2 * index; the first assigned script at <n> + 2 * (the pair count).
+    const failAt = Number(top.map((l) => /^position=\$\(\( (\d+) \+ 2 \* index \)\)$/.exec(l.code)?.[1]).find((n) => n !== undefined))
+    const firstAt = Number(/^first_script_position=\$\(\( (\d+) \+ 2 \* /.exec(top.find((l) => l.code.startsWith('first_script_position='))?.code ?? '')?.[1])
+    fails.forEach((name, index) => {
+      expect(args[failAt + 2 * index - 2]).toBe(e13.RUNNER_FAIL_OPTION)
+      expect(args[failAt + 2 * index - 1]).toBe(name)
+    })
+    expect(args.slice(firstAt + 2 * fails.length - 1)).toEqual(assigned)
+  })
+
+  // Each row adds a step that leaves every script's environment and directory as they were: no problem.
+  test.each<[string, string]>([
+    ['a cd in a command substitution', 'here=$(cd /tmp && pwd)'],
+    ['a cd in a subshell', '(cd /tmp && :)'],
+    ['an uppercase name set for one command only', 'LC_ALL=C sort < /dev/null'],
+  ])('%s is no problem', (_name, line) => {
+    expect(e13RunnerProblems(e13Planted(runner(), `${done}\n`, `${line}\n${done}\n`))).toEqual([])
+  })
+
+  // Each row adds text that names a forbidden step only in a comment or a string: no problem.
+  test.each<[string, string]>([
+    ['a comment naming an export and a write', `# export canary; write_file '${e13.VERDICT_FILE_NAME}' PASS; mkdir -p /x`],
+    ['a trailing comment', `: # export canary > /tmp/x`],
+    ['an echoed text naming them', `echo "export canary > /tmp/x; mkdir -p /x; bash x" >&2`],
+  ])('%s is no problem', (_name, line) => {
+    expect(e13RunnerProblems(e13Planted(runner(), `${done}\n`, `${line}\n${done}\n`))).toEqual([])
+  })
+
+  test('the current docker/entrypoint.sh has no problem: its last step execs tests/runner.sh with "$@" unchanged, after the results mount is handed to testuser', () => {
+    expect(e13EntrypointProblems(entrypoint())).toEqual([])
+  })
+
+  test.each<[string, (text: string) => string, string]>([
+    ['a dropped pass-through', (t) => e13Planted(t, ' "$@"\n', '\n'), 'the exec passes "" to tests/runner.sh, not "\\"$@\\""'],
+    ['an unquoted pass-through', (t) => e13Planted(t, ' "$@"\n', ' $@\n'), 'the exec passes "$@" to tests/runner.sh, not "\\"$@\\""'],
+    ['a shifted pass-through', (t) => e13Planted(t, ' "$@"\n', ' "${@:2}"\n'), 'the exec passes "\\"${@:2}\\"" to tests/runner.sh, not "\\"$@\\""'],
+    ['an added argument', (t) => e13Planted(t, ' "$@"\n', ' --verbose "$@"\n'), 'the exec passes "--verbose \\"$@\\"" to tests/runner.sh, not "\\"$@\\""'],
+    ['a shift before the exec', (t) => e13Planted(t, '\nexec ', '\nshift\nexec '), 'changes its arguments: shift'],
+    ['the ownership step dropped', (t) => e13Planted(t, ` ${e13.INTEGRITY_RESULTS_MOUNT_TARGET} 2>`, ' 2>'), `the ${e13.INTEGRITY_RESULTS_MOUNT_TARGET} ownership step does not come before the exec`],
+  ])('an entrypoint with %s is reported', (_name, plant, problem) => {
+    expect(e13EntrypointProblems(plant(entrypoint()))).toContain(problem)
+  })
+})
+
+describe('E13: what tests/runner.sh writes (b.t6s E13 T6; b.uqm SR-11.3)', () => {
+  const runner = (): string => readFileSync(E13_RUNNER_SH, 'utf-8')
+  const done = `write_result_line "${e13Ref('RESULT_WORD_DONE')}"`
+  const packageWrite = `write_file "${e13Ref('PACKAGE_SHA256_FILE_NAME')}" "\${package_sha256}"`
+  const fingerprintBlock = /\n( *if \(\( index == 0 \)\); then\n[\s\S]*?\n {4}fi\n)/
+  const failLog = `        write_file "\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}" "${e13Ref('FAIL_PREFIX')}`
+  const logOpen = `    : > "${e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')}/\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}" || exit 1`
+
+  test('the current tests/runner.sh writes each in-shard file in its exact form, at its time', () => {
+    expect(e13RunnerWriteProblems(runner())).toEqual([])
+  })
+
+  // Each row plants one change in the real runner; the audit must name it.
+  test.each<[string, (text: string) => string, string]>([
+    ['canary.txt written after the scripts', (t) => e13Moved(t, `write_file "${e13Ref('CANARY_FILE_NAME')}" "\${canary}"`, done), `${e13.CANARY_FILE_NAME} is not written once, before the first script runs`],
+    ['package.sha256 written after the scripts', (t) => e13Planted(e13Planted(t, `    ${packageWrite}\n`, '    :\n'), `${done}\n`, `${packageWrite}\n${done}\n`), `${e13.PACKAGE_SHA256_FILE_NAME} is not written once, before the first script runs`],
+    ['an in-shard file without its final LF', (t) => e13Planted(t, `printf '%s\\n' "$2" >`, `printf '%s' "$2" >`), 'write_file does not write its text and one LF in one write'],
+    ['package.sha256 hashing another file', (t) => e13Planted(t, `sha256_hex < "${e13Ref('INTEGRITY_TARBALL_MOUNT_TARGET')}"`, 'sha256_hex < /tmp/other.tgz'), `${e13.PACKAGE_SHA256_FILE_NAME} is not the SHA-256 of ${e13Ref('INTEGRITY_TARBALL_MOUNT_TARGET')}`],
+    ['a SHA-256 that may hold uppercase', (t) => e13Planted(t, 'SHA256_HEX_PATTERN="^[0-9a-f]', 'SHA256_HEX_PATTERN="^[0-9a-fA-F]'), `SHA256_HEX_PATTERN is not ${e13Ref('SHA256_HEX_LENGTH')} lowercase hexadecimal characters`],
+    ['an unchecked SHA-256', (t) => e13Planted(t, '[[ ${sum} =~ ${SHA256_HEX_PATTERN} ]] || return 1', ':'), "sha256_hex does not give sha256sum's hash only when it matches SHA256_HEX_PATTERN"],
+    [
+      'an end line without its seconds',
+      (t) => e13Planted(t, `${e13Ref('RESULT_WORD_PASS')} \${seconds}"`, `${e13Ref('RESULT_WORD_PASS')}"`),
+      `writes a result line of no known form: write_result_line "${e13Ref('RESULT_WORD_END')} \${name} ${e13Ref('RESULT_WORD_PASS')}"`,
+    ],
+    [
+      'a result word typed',
+      (t) => e13Planted(t, `write_result_line "${e13Ref('RESULT_WORD_NOTRUN')} \${name}"`, `write_result_line "${e13.RESULT_WORD_NOTRUN} \${name}"`),
+      `types a result line's words instead of their exported names: write_result_line "${e13.RESULT_WORD_NOTRUN} \${name}"`,
+    ],
+    ['result lines overwritten, not appended', (t) => e13Planted(t, `"$1" >> "`, `"$1" > "`), `write_result_line does not append its line and one LF to ${e13.RESULT_FILE_NAME} in one write`],
+    ['seconds with two decimals', (t) => e13Planted(t, "'%d.%03d\\n'", "'%d.%02d\\n'"), 'script_seconds does not print whole seconds with no leading zero, a point and exactly three digits'],
+    ['seconds with a leading zero', (t) => e13Planted(t, "'%d.%03d\\n'", "'%02d.%03d\\n'"), 'script_seconds does not print whole seconds with no leading zero, a point and exactly three digits'],
+    ['a negative time kept', (t) => e13Planted(t, '(( elapsed_ms >= 0 )) || elapsed_ms=0', ':'), 'script_seconds does not give a negative time as 0'],
+    ['seconds taken before the run', (t) => e13Moved(t, '    started_us=$(now_us)', '    ended_us=$(now_us)'), "an end line's seconds are not the script's timed run"],
+    ["a log without the script's stderr", (t) => e13Planted(t, '${SCRIPT_LOG_SUFFIX}" 2>&1\n', '${SCRIPT_LOG_SUFFIX}"\n'), `a script's log does not take its standard output and standard error as it runs: ${E13_RUN} > "${e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')}/\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}"`],
+    ['a log written after the run', (t) => e13Planted(t, /^ {4}bash .*$/m, `    output=$(${E13_RUN} 2>&1)`), `a script's log does not take its standard output and standard error as it runs: output=$(${E13_RUN} 2>&1)`],
+    ['a --fail script run', (t) => e13Planted(t, failLog, `        ${E13_RUN}\n${failLog}`), `a ${e13Ref('RUNNER_FAIL_OPTION')} script is run`],
+    ["a --fail script's log text changed", (t) => e13Planted(t, `\${name}: ${e13Ref('INJECTED_FAILURE_TEXT')}`, `\${name} ${e13Ref('INJECTED_FAILURE_TEXT')}`), `a ${e13Ref('RUNNER_FAIL_OPTION')} script's log is not only the injected FAIL line`],
+    [
+      "a --fail script's end with other seconds",
+      (t) => e13Planted(t, `${e13Ref('RESULT_WORD_FAIL')} ${e13.formatResultSeconds(0)}"`, `${e13Ref('RESULT_WORD_FAIL')} ${e13.formatResultSeconds(0.001)}"`),
+      `a ${e13Ref('RUNNER_FAIL_OPTION')} script's end line is not ${e13.RESULT_WORD_END} <file name> ${e13.RESULT_WORD_FAIL} ${e13.formatResultSeconds(0)}`,
+    ],
+    [
+      'a --fail script without its start line',
+      (t) => e13Moved(t, `    write_result_line "${e13Ref('RESULT_WORD_START')} \${name}"`, logOpen),
+      `a ${e13Ref('RUNNER_FAIL_OPTION')} script gets no start line before its end line`,
+    ],
+    ['a fingerprint after any passing script', (t) => e13Planted(t, 'if (( index == 0 )); then', 'if (( index >= 0 )); then'), `${e13.DEPENDENCY_FINGERPRINT_FILE_NAME} is not written only after test-1 passes`],
+    [
+      'a fingerprint before the pass',
+      (t) => {
+        const block = fingerprintBlock.exec(t)?.[1] ?? ''
+        return e13Planted(e13Planted(t, block, ''), '    if (( script_status != 0 )); then\n', `${block}    if (( script_status != 0 )); then\n`)
+      },
+      `${e13.DEPENDENCY_FINGERPRINT_FILE_NAME} is not written only after test-1 passes`,
+    ],
+    ['package lines sorted in the locale', (t) => e13Planted(t, 'LC_ALL=C sort -u', 'sort -u'), 'the fingerprint is not the SHA-256 of the package lines sorted bytewise under the C locale with repeats removed'],
+    ['package lines repeated', (t) => e13Planted(t, 'LC_ALL=C sort -u', 'LC_ALL=C sort'), 'the fingerprint is not the SHA-256 of the package lines sorted bytewise under the C locale with repeats removed'],
+    ["dot-directories walked", (t) => e13Planted(t, "-name '.*' -prune -o ", ''), "the walk does not take each package.json matching PACKAGE_JSON_PATH_PATTERN under NODE_MODULES_DIR, skipping names starting with '.'"],
+    ['scoped packages missed', (t) => e13Planted(t, '(@[^/]+/)?', ''), `the walk misses ${E13_NODE_MODULES}/@scope/pkg/package.json`],
+    ["a package's own subdirectories taken", (t) => e13Planted(t, "(@[^/]+/)?[^/]+/package", "(@[^/]+/)?.+/package"), `the walk takes ${E13_NODE_MODULES}/pkg/lib/package.json`],
+    ['the walk from another root', (t) => e13Planted(t, `NODE_MODULES_DIR='${E13_NODE_MODULES}'`, "NODE_MODULES_DIR='/test-repo'"), `NODE_MODULES_DIR is "/test-repo", not ${E13_NODE_MODULES}`],
+    ['package lines without the version', (t) => e13Planted(t, '@\\(.version // "")', ''), 'a package line is not <name>@<version>'],
+  ])('a runner with %s is reported', (_name, plant, problem) => {
+    expect(e13RunnerWriteProblems(plant(runner()))).toContain(problem)
+  })
+})
