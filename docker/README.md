@@ -617,6 +617,141 @@ untagged images.
 Every shard container runs under one memory cap, and the run records each
 shard's anon peak and its out-of-memory status.
 
+The cap changes only by hand. Every full run records a cap line, but only two
+kinds of run are a source for a new cap, and after delivery only a default
+full run (`/ci` with no arguments) with an out-of-memory kill is a reason to
+raise it.
+
+**The cap.** The cap is one constant, `SHARD_MEMORY_CAP_BYTES` in
+`scripts/ci-run.ts`. It sets each shard container's memory and memory-swap
+limits (see [Shard containers](#shard-containers)) and the memory each shard
+reserves at admission. It starts at 2 GiB, which is also its minimum
+(`MIN_SHARD_MEMORY_CAP_BYTES`).
+
+**Anon peaks.** A shard's anon peak is the highest `anon` across its 30 s
+samples and its final reading (see [Shard containers](#shard-containers)),
+with the page cache (`file`) of the reading that gave it recorded beside it.
+
+| Mark | When | The peak |
+|---|---|---|
+| none (complete) | the final reading read `memory.stat` | the highest over the samples and the final reading |
+| `partial` | a sample read `anon`, but the final reading could not read `memory.stat` or the shard has no final reading | the highest sample |
+| `unknown` | no reading of the shard read `anon` | none |
+
+A shard's peak PIDs is the highest PID count across its samples.
+
+**Page cache does not count.** Page cache normally fills a container up to
+its limit, and the kernel reclaims it as the container needs memory. So a
+shard that reaches the cap without an out-of-memory kill has not failed, and
+page cache can never raise the cap.
+
+**The rule.** Over a run's shards, in whole bytes:
+
+1. Take the highest counted anon peak. A `partial` peak counts; an `unknown`
+   one does not. A shard killed for out of memory counts as the higher of the
+   cap the run used and its recorded peak (the cap used, when its peak is
+   `unknown`).
+2. Add 1 GiB (`CAP_MARGIN_BYTES`).
+3. Round up to a multiple of 0.5 GiB (`CAP_ROUNDING_STEP_BYTES`); a sum
+   already on a multiple stays.
+4. Take at least 2 GiB.
+
+| Highest counted peak | Cap |
+|---|---|
+| 0.40 GiB | 2.0 GiB |
+| 0.83 GiB | 2.0 GiB |
+| 1.50 GiB | 2.5 GiB |
+| 1.51 GiB | 3.0 GiB |
+| a kill at a 2.0 GiB cap, recorded peak 1.2 GiB (counts as 2.0 GiB) | 3.0 GiB |
+
+The 1 GiB margin covers what the peak misses: samples are 30 s apart, so a
+short spike between them is not seen, and memory that is neither anon nor
+reclaimable page cache is not in the peak.
+
+**The cap line.** Every full run's summary holds it, and so does a full
+PASS's timing summary; a selective run has none. It takes one of three forms,
+then its suffix:
+
+| Form | When | Line |
+|---|---|---|
+| Full | the peak came from a shard not killed for out of memory | `cap from measured anon peak: <peak> GiB in shard-<k> (page cache <f> GiB) + 1 GiB margin → <cap> GiB; current cap <c> GiB` |
+| Kill | the peak came from a killed shard | `cap from measured anon peak: <peak> GiB in shard-<k> (killed for out of memory at the cap) + 1 GiB margin → <cap> GiB; current cap <c> GiB` |
+| Unknown | no anon memory was read and no shard was killed | `cap from measured anon peak: unknown, no shard's anon memory was read; current cap <c> GiB` |
+
+- peak and f are rounded up to two decimal places; cap and c are given to
+  one. c is the cap the run used.
+- shard-k is the shard the peak came from, the lowest number on a tie.
+- In the kill form, peak is the killed shard's counted value, the higher of
+  the cap used and its recorded peak, not the recorded peak alone.
+- When the page cache of the reading that gave the peak could not be read,
+  the full form shows `(page cache unknown)` in place of
+  `(page cache <f> GiB)`.
+
+For example, a kill in shard-3 of a default full run at a 2.0 GiB cap:
+
+```text
+cap from measured anon peak: 2.00 GiB in shard-3 (killed for out of memory at the cap) + 1 GiB margin → 3.0 GiB; current cap 2.0 GiB; source after out-of-memory kill in shard-3
+```
+
+**The suffix** says whether the run is a cap source:
+
+| Suffix | Run |
+|---|---|
+| none | a default full run that passed with every anon peak complete: a source |
+| `; source after out-of-memory kill in <shards>` | a default full run with any kill: a source, whatever else applies |
+| `; not a valid cap source: <reasons>` | every other full run: informational, never a reason to change the cap |
+
+The reasons are each of these that applies, in this order, separated by a
+comma and a space: `not a default run`, `run did not pass`,
+`partial anon peak (<shards>)`, `unknown anon peak (<shards>)`. `<shards>`
+lists `shard-<k>` names in shard order, separated by a comma and a space.
+
+**The delivery verification run** is the first default full run, on a
+passing tree with no other CI run active, that admission starts with 5 or 6
+shards. Nobody frees memory by hand for it, and a run started with fewer
+shards is not used.
+
+**How the cap changes.** Always by hand, each time as an ordinary committed
+change to `SHARD_MEMORY_CAP_BYTES`:
+
+- **At delivery, once.** It is set to the higher of the cap the delivery
+  verification run's line gives (a line with no suffix) and the highest cap a
+  kill raised earlier in verification. A verification run with a kill fails;
+  the cap is raised from its line and verification restarts with a new
+  delivery verification run. The cap is never recomputed from a later run.
+- **Afterwards,** it is raised only to the cap given by the line of a default
+  full run with a kill (the `; source after out-of-memory kill in` suffix).
+- **A kill in any other run,** selective, `--shards`, `--shard-timeout` or
+  `--inject`, fails that run, naming the shard, and leaves the cap as it is.
+  Such a full run's suffix begins
+  `; not a valid cap source: not a default run, run did not pass`, and adds
+  any partial or unknown anon peak reasons that apply.
+
+**Out-of-memory kills.** A shard had a kill when any of its readings, a 30 s
+sample or the final one, shows `State.OOMKilled` true or an `oom_kill` count
+above 0. Docker sets `State.OOMKilled` for any process in the container, as
+the kill happens, so it serves both for a running container and for one that
+exited on its own, after its end marker included.
+
+In the final reading, one readable source showing no kill clears a shard that
+no earlier reading showed killed. A shard with no final reading is judged
+from its samples alone, and never gets the unreadable line.
+
+| Line | When |
+|---|---|
+| `FAIL: <file name>: killed for out of memory in shard-<k>` | a kill, with a script in progress at the first reading that showed it |
+| `FAIL: shard-<k>: killed for out of memory` | a kill with no script in progress at that reading, even if every script in the shard passed |
+| `FAIL: shard-<k>: out-of-memory status unreadable` | the final reading could read neither source and no earlier reading showed a kill, even if the shard ended normally with every script passed |
+
+A shard gets at most one of these lines, which takes the place of any other
+end cause of that shard; its scripts' own results stay as recorded. This
+holds in every kind of run: full, selective, `--shards 1`, `--shard-timeout`
+and `--inject`.
+
+Only a default full run's kill makes that run a cap source
+(see the rule and suffix above). How these lines rank among a run's failures
+is in [Verdict file format](../tests/README.md#verdict-file-format).
+
 ### Shard containers
 
 Each shard runs its assigned scripts in its own container, started with set
