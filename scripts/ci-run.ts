@@ -4349,6 +4349,304 @@ export async function pruneUntaggedImages(docker: DockerContext, owner: string):
 // 10. Admission readings and fit (E6)
 // ---------------------------------------------------------------------------
 
+// --- 10/T1 (E6 T1): pod memory, the ceiling, container figures ---
+
+/** The runner's copy of `/ci-live`'s working-set stop line, `HOST_WORKING_SET_LIMIT_BYTES` in `ci-live/lib/memory-watchdog.ts`, 40 GiB; never imported (b.uqm SR-6.6, SR-7.1). */
+export const CI_LIVE_WORKING_SET_LIMIT_BYTES = 40 * GIB_BYTES
+
+/** The cgroup path of the cgroup-namespace root, as `RunnerDeps.readCgroupFile` takes it (b.uqm SR-7.1). */
+const CGROUP_NAMESPACE_ROOT_PATH = '/'
+/** A cgroup's memory limit; `max` when none is set. */
+const CGROUP_MEMORY_MAX_FILE = 'memory.max'
+/** A cgroup's charged memory, page cache included. */
+const CGROUP_MEMORY_CURRENT_FILE = 'memory.current'
+/** A cgroup's memory breakdown, one `<key> <value>` line each. */
+const CGROUP_MEMORY_STAT_FILE = 'memory.stat'
+/** A cgroup's memory events, one `<key> <value>` line each. */
+const CGROUP_MEMORY_EVENTS_FILE = 'memory.events'
+/** A cgroup's process count. */
+const CGROUP_PIDS_CURRENT_FILE = 'pids.current'
+/** `memory.max`'s word for no limit. */
+const CGROUP_NO_LIMIT_WORD = 'max'
+/** `memory.stat`'s inactive page cache, taken off `memory.current` for the working set. */
+const STAT_INACTIVE_FILE_KEY = 'inactive_file'
+/** `memory.stat`'s anonymous memory. */
+const STAT_ANON_KEY = 'anon'
+/** `memory.stat`'s active page cache. */
+const STAT_ACTIVE_FILE_KEY = 'active_file'
+/** `memory.stat`'s whole page cache. */
+const STAT_FILE_KEY = 'file'
+/** `memory.events`' count of out-of-memory kills. */
+const EVENTS_OOM_KILL_KEY = 'oom_kill'
+/** A cgroup file's whole number: decimal digits only. */
+const CGROUP_WHOLE_NUMBER_PATTERN = /^[0-9]+$/
+/** How much of a garbled file's text a failure quotes. */
+const GARBLED_TEXT_QUOTE_LENGTH = 40
+
+/**
+ * One reading (b.uqm SR-6.5, SR-7.3, SR-10.6): its value, or a failure naming
+ * what could not be read and why, each on one line.
+ */
+export type ReadingResult<T> =
+  | {
+      readonly ok: true
+      readonly value: T
+    }
+  | {
+      readonly ok: false
+      /** What could not be read, such as `the pod's memory.max`. */
+      readonly what: string
+      /** Why, on one line. */
+      readonly error: string
+    }
+
+/** The pod's memory (b.uqm SR-7.1): L and W with its parts. */
+export interface PodMemory {
+  /** L: the namespace root's `memory.max`, in bytes. */
+  readonly limitBytes: number
+  /** W with anon and active page cache; the rest is `workingSetRestBytes`. */
+  readonly workingSet: WorkingSetReading
+}
+
+/** Where the ceiling C comes from (b.uqm SR-6.8, SR-7.1, SR-7.4): the pod limit L, or `/ci-live`'s 40 GiB line while the runs it carries are active. */
+export type CeilingSource =
+  | {
+      readonly kind: 'pod-limit'
+      /** L, in bytes. */
+      readonly limitBytes: number
+    }
+  | {
+      readonly kind: 'ci-live'
+      /** The active `/ci-live` runs that lowered C; never empty. */
+      readonly runs: readonly CiLiveRunSeen[]
+    }
+
+/** The ceiling C in whole bytes, with its source (b.uqm SR-7.1). */
+export interface MemoryCeiling {
+  readonly bytes: number
+  readonly source: CeilingSource
+}
+
+/** A container's figures from its own cgroup, each its own reading (b.uqm SR-7.2). */
+export interface ContainerFigures {
+  /** `memory.current` minus `inactive_file`, never below 0. */
+  readonly memoryBytes: ReadingResult<number>
+  /** `anon` from `memory.stat`. */
+  readonly anonBytes: ReadingResult<number>
+  /** `file` from `memory.stat`: its page cache. */
+  readonly fileBytes: ReadingResult<number>
+  /** `pids.current`. */
+  readonly pidCount: ReadingResult<number>
+  /** `oom_kill` from `memory.events`. */
+  readonly oomKillCount: ReadingResult<number>
+}
+
+/** A listed container as admission sees it (b.uqm SR-6.5): its state (name, labels, cap or none) and its current memory. */
+export interface ListedContainer extends ContainerState {
+  /** Its memory, `memory.current` minus `inactive_file` (b.uqm SR-7.2). */
+  readonly currentMemory: ReadingResult<number>
+}
+
+/** The container a figures read is for: its name, for the failure texts, and its main PID (`State.Pid`, 0 when it is not running). */
+export type FiguresTarget = Pick<ContainerState, 'name' | 'pid'>
+
+/** A failed reading, its texts on one line. */
+function readingFailure<T>(what: string, error: string): ReadingResult<T> {
+  return { ok: false, what: dependencyErrorText(what), error: dependencyErrorText(error) }
+}
+
+/** A whole number of bytes from one cgroup file's text, or why it is none. */
+function parseCgroupWholeNumber(text: string): { readonly ok: true; readonly value: number } | { readonly ok: false; readonly error: string } {
+  const trimmed = text.trim()
+  if (trimmed === '') return { ok: false, error: 'the file is empty' }
+  const value = Number(trimmed)
+  if (!CGROUP_WHOLE_NUMBER_PATTERN.test(trimmed) || !Number.isSafeInteger(value)) {
+    return { ok: false, error: `not a whole number: ${JSON.stringify(trimmed.slice(0, GARBLED_TEXT_QUOTE_LENGTH))}` }
+  }
+  return { ok: true, value }
+}
+
+/** One cgroup file's whole text. */
+function readCgroupText(deps: Pick<RunnerDeps, 'readCgroupFile'>, cgroupPath: string, fileName: string, what: string): ReadingResult<string> {
+  const read = deps.readCgroupFile(cgroupPath, fileName)
+  return read.ok ? { ok: true, value: read.value } : readingFailure(what, read.error)
+}
+
+/** One cgroup file holding a whole number. */
+function readCgroupNumber(deps: Pick<RunnerDeps, 'readCgroupFile'>, cgroupPath: string, fileName: string, what: string): ReadingResult<number> {
+  const text = readCgroupText(deps, cgroupPath, fileName, what)
+  if (!text.ok) return text
+  const parsed = parseCgroupWholeNumber(text.value)
+  return parsed.ok ? { ok: true, value: parsed.value } : readingFailure(what, parsed.error)
+}
+
+/** One key's whole number from a flat-keyed cgroup file (`memory.stat`, `memory.events`), already read; `fileWhat` names the file. */
+function keyedCgroupNumber(file: ReadingResult<string>, key: string, fileWhat: string): ReadingResult<number> {
+  if (!file.ok) return file
+  const what = `${key} in ${fileWhat}`
+  for (const line of file.value.split('\n')) {
+    const fields = line.trim().split(/\s+/)
+    if (fields.length !== 2 || fields[0] !== key) continue
+    const parsed = parseCgroupWholeNumber(fields[1] ?? '')
+    return parsed.ok ? { ok: true, value: parsed.value } : readingFailure(what, parsed.error)
+  }
+  return readingFailure(what, `${fileWhat} has no ${key} line`)
+}
+
+/** `memory.current` minus `inactive_file`, never below 0 (b.uqm SR-7.1, SR-7.2). */
+function workingSetBytes(current: ReadingResult<number>, stat: ReadingResult<string>, statWhat: string): ReadingResult<number> {
+  if (!current.ok) return current
+  const inactive = keyedCgroupNumber(stat, STAT_INACTIVE_FILE_KEY, statWhat)
+  if (!inactive.ok) return inactive
+  return { ok: true, value: Math.max(0, current.value - inactive.value) }
+}
+
+/** What a failure names for one of the pod's cgroup files. */
+function podFileWhat(fileName: string): string {
+  return `the pod's ${fileName}`
+}
+
+/**
+ * L: the cgroup-namespace root's `memory.max` in bytes (b.uqm SR-7.1). `max`,
+ * an empty file or text that is not a whole number is a failed reading. Only
+ * the root is read, never a cgroup on the runner's own path.
+ */
+export function readPodLimit(deps: Pick<RunnerDeps, 'readCgroupFile'>): ReadingResult<number> {
+  const what = podFileWhat(CGROUP_MEMORY_MAX_FILE)
+  const text = readCgroupText(deps, CGROUP_NAMESPACE_ROOT_PATH, CGROUP_MEMORY_MAX_FILE, what)
+  if (!text.ok) return text
+  if (text.value.trim() === CGROUP_NO_LIMIT_WORD) return readingFailure(what, `no limit is set (${CGROUP_NO_LIMIT_WORD})`)
+  const parsed = parseCgroupWholeNumber(text.value)
+  return parsed.ok ? { ok: true, value: parsed.value } : readingFailure(what, parsed.error)
+}
+
+/**
+ * W with its parts, from the cgroup-namespace root (b.uqm SR-7.1): W is
+ * `memory.current` minus `inactive_file`, never below 0; its parts are `anon`
+ * and `active_file`. Each missing or garbled file or `memory.stat` key is a
+ * failed reading naming it.
+ */
+export function readPodWorkingSet(deps: Pick<RunnerDeps, 'readCgroupFile'>): ReadingResult<WorkingSetReading> {
+  const statWhat = podFileWhat(CGROUP_MEMORY_STAT_FILE)
+  const current = readCgroupNumber(deps, CGROUP_NAMESPACE_ROOT_PATH, CGROUP_MEMORY_CURRENT_FILE, podFileWhat(CGROUP_MEMORY_CURRENT_FILE))
+  if (!current.ok) return current
+  const stat = readCgroupText(deps, CGROUP_NAMESPACE_ROOT_PATH, CGROUP_MEMORY_STAT_FILE, statWhat)
+  const bytes = workingSetBytes(current, stat, statWhat)
+  if (!bytes.ok) return bytes
+  const anon = keyedCgroupNumber(stat, STAT_ANON_KEY, statWhat)
+  if (!anon.ok) return anon
+  const activeFile = keyedCgroupNumber(stat, STAT_ACTIVE_FILE_KEY, statWhat)
+  if (!activeFile.ok) return activeFile
+  return { ok: true, value: { bytes: bytes.value, anonBytes: anon.value, activeFileBytes: activeFile.value } }
+}
+
+/** L and W with its parts (b.uqm SR-6.5, SR-7.1); the first failed reading, L's first, when any fails. */
+export function readPodMemory(deps: Pick<RunnerDeps, 'readCgroupFile'>): ReadingResult<PodMemory> {
+  const limit = readPodLimit(deps)
+  if (!limit.ok) return limit
+  const workingSet = readPodWorkingSet(deps)
+  if (!workingSet.ok) return workingSet
+  return { ok: true, value: { limitBytes: limit.value, workingSet: workingSet.value } }
+}
+
+/** W's rest: W minus anon and active page cache, never below 0 (b.uqm SR-7.1). */
+export function workingSetRestBytes(reading: WorkingSetReading): number {
+  return Math.max(0, reading.bytes - reading.anonBytes - reading.activeFileBytes)
+}
+
+/** Throws unless `bytes` is a whole number of bytes, 0 or more. */
+function assertWholeBytes(where: string, bytes: number): void {
+  if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error(`${where}: not a whole byte count: ${bytes}`)
+}
+
+/**
+ * The ceiling C in whole bytes, with its source (b.uqm SR-7.1): 85% of L
+ * rounded down; while any `/ci-live` run is active, the lower of that and
+ * `/ci-live`'s 40 GiB line. On a tie the source is the pod limit. Throws for
+ * an L that is not a whole byte count.
+ */
+export function memoryCeiling(limitBytes: number, ciLiveRuns: readonly CiLiveRunSeen[]): MemoryCeiling {
+  assertWholeBytes('memoryCeiling', limitBytes)
+  const podCeiling = Number((BigInt(limitBytes) * BigInt(MEMORY_CEILING_PERCENT)) / BigInt(100))
+  if (ciLiveRuns.length > 0 && CI_LIVE_WORKING_SET_LIMIT_BYTES < podCeiling) {
+    return { bytes: CI_LIVE_WORKING_SET_LIMIT_BYTES, source: { kind: 'ci-live', runs: [...ciLiveRuns] } }
+  }
+  return { bytes: podCeiling, source: { kind: 'pod-limit', limitBytes } }
+}
+
+/**
+ * A whole-byte count in GiB to one decimal place, rounded to the nearest
+ * tenth with a tie rounding up, computed exactly (b.uqm SR-7.4): `54.4`, with
+ * no unit. Throws for a value that is not a whole byte count.
+ */
+export function formatGib(bytes: number): string {
+  assertWholeBytes('formatGib', bytes)
+  const gib = BigInt(GIB_BYTES)
+  const scaled = BigInt(bytes) * BigInt(10)
+  const tenths = scaled / gib + (BigInt(2) * (scaled % gib) >= gib ? BigInt(1) : BigInt(0))
+  return `${tenths / BigInt(10)}.${tenths % BigInt(10)}`
+}
+
+/**
+ * A container's cgroup path below the namespace root, found through its main
+ * process's cgroup v2 membership line (b.uqm SR-7.2), never built from its ID
+ * or the cgroup driver's naming. A main PID of 0, a PID that is gone or a
+ * missing membership line is a failed reading.
+ */
+function locateContainerCgroup(deps: Pick<RunnerDeps, 'readProcCgroup'>, container: FiguresTarget): ReadingResult<string> {
+  const what = `${container.name}'s cgroup`
+  if (container.pid <= 0) return readingFailure(what, `the container is not running (its main PID is ${container.pid})`)
+  const read = deps.readProcCgroup(container.pid)
+  if (read.kind === 'gone') return readingFailure(what, `its main process ${container.pid} is gone`)
+  if (read.kind === 'unreadable') return readingFailure(what, `its main process ${container.pid}'s cgroup: ${read.error}`)
+  const line = read.value.trim()
+  const path = line.startsWith(CGROUP_V2_LINE_PREFIX) ? line.slice(CGROUP_V2_LINE_PREFIX.length) : ''
+  if (!path.startsWith('/')) return readingFailure(what, `its main process ${container.pid} has no cgroup v2 membership line`)
+  return { ok: true, value: path }
+}
+
+/** What a failure names for one of a container's cgroup files. */
+function containerFileWhat(container: FiguresTarget, fileName: string): string {
+  return `${container.name}'s ${fileName}`
+}
+
+/** A container's memory from its located cgroup: `memory.current` minus `inactive_file`, never below 0. */
+function containerMemoryAt(deps: Pick<RunnerDeps, 'readCgroupFile'>, container: FiguresTarget, cgroupPath: string, stat: ReadingResult<string>): ReadingResult<number> {
+  const current = readCgroupNumber(deps, cgroupPath, CGROUP_MEMORY_CURRENT_FILE, containerFileWhat(container, CGROUP_MEMORY_CURRENT_FILE))
+  return workingSetBytes(current, stat, containerFileWhat(container, CGROUP_MEMORY_STAT_FILE))
+}
+
+/**
+ * One container's figures from its own cgroup (b.uqm SR-7.2), found through
+ * its main PID; each figure is its own reading and fails on its own. Never
+ * throws: an exited container or a gone process fails every figure.
+ */
+export function readContainerFigures(deps: Pick<RunnerDeps, 'readCgroupFile' | 'readProcCgroup'>, container: FiguresTarget): ContainerFigures {
+  const cgroup = locateContainerCgroup(deps, container)
+  if (!cgroup.ok) {
+    return { memoryBytes: cgroup, anonBytes: cgroup, fileBytes: cgroup, pidCount: cgroup, oomKillCount: cgroup }
+  }
+  const statWhat = containerFileWhat(container, CGROUP_MEMORY_STAT_FILE)
+  const eventsWhat = containerFileWhat(container, CGROUP_MEMORY_EVENTS_FILE)
+  const stat = readCgroupText(deps, cgroup.value, CGROUP_MEMORY_STAT_FILE, statWhat)
+  const events = readCgroupText(deps, cgroup.value, CGROUP_MEMORY_EVENTS_FILE, eventsWhat)
+  return {
+    memoryBytes: containerMemoryAt(deps, container, cgroup.value, stat),
+    anonBytes: keyedCgroupNumber(stat, STAT_ANON_KEY, statWhat),
+    fileBytes: keyedCgroupNumber(stat, STAT_FILE_KEY, statWhat),
+    pidCount: readCgroupNumber(deps, cgroup.value, CGROUP_PIDS_CURRENT_FILE, containerFileWhat(container, CGROUP_PIDS_CURRENT_FILE)),
+    oomKillCount: keyedCgroupNumber(events, EVENTS_OOM_KILL_KEY, eventsWhat),
+  }
+}
+
+/** One container's current memory alone (b.uqm SR-6.5, SR-7.2): `memory.current` minus `inactive_file` from its own cgroup, never below 0. */
+export function readContainerMemory(deps: Pick<RunnerDeps, 'readCgroupFile' | 'readProcCgroup'>, container: FiguresTarget): ReadingResult<number> {
+  const cgroup = locateContainerCgroup(deps, container)
+  if (!cgroup.ok) return cgroup
+  const stat = readCgroupText(deps, cgroup.value, CGROUP_MEMORY_STAT_FILE, containerFileWhat(container, CGROUP_MEMORY_STAT_FILE))
+  return containerMemoryAt(deps, container, cgroup.value, stat)
+}
+
 // ---------------------------------------------------------------------------
 // 11. Memory guard (E7)
 // ---------------------------------------------------------------------------
