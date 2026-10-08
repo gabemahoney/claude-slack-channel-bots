@@ -75,7 +75,8 @@
  *   behind the plan's `guard`;
  * - the /ci images carry agent-director's release, never a release
  *   candidate. They name one base tag, `BASE_IMAGE`: the `FROM` lines of
- *   `docker/Dockerfile.test` and `docker/Dockerfile.live` and the `/ci` and
+ *   `docker/Dockerfile.test` and `docker/Dockerfile.live`, the `/ci`
+ *   base-build step (`scripts/ci-base-build.sh`) and the `/ci` and
  *   `/ci-live` skills (a planted previous tag is refused). The base
  *   (`docker/Dockerfile.test.base`) reads one file from the repo context, the
  *   client-under-test check (`AD_CLIENT_CHECK_SOURCE`, never
@@ -97,7 +98,7 @@
  *   `sqlite3` and `file` and writes the marker /etc/cscb-ci-image. Each rule
  *   is pinned by a row that plants its breach in the real base text.
  *   `Dockerfile.live` and the three `docker/live` scripts' PATH lines use the
- *   base's default binary directory. The `/ci` skill reads the release from
+ *   base's default binary directory. The `/ci` base-build step reads the release from
  *   the base's `ARG AD_VERSION`, extracts `install.sh` at its tag, passes
  *   only that context, fetches nothing and types no commit; the `/ci-live`
  *   skill downloads the release's linux-amd64 binary into a scratch
@@ -2161,6 +2162,8 @@ describe("the runner's loads from outside ci-live/ (source audit)", () => {
 const REPO = join(import.meta.dir, '..')
 const BASE_DOCKERFILE = join('docker', 'Dockerfile.test.base')
 const CI_SKILL = join('.claude', 'skills', 'ci', 'SKILL.md')
+/** The /ci base-build step: the skill's base-build commands, moved (b.uqm SR-9.2, SR-19.5). */
+const CI_BASE_BUILD_STEP = join('scripts', 'ci-base-build.sh')
 const CI_LIVE_SKILL = join('.claude', 'skills', 'ci-live', 'SKILL.md')
 
 /** The base's one named build context: the directory holding the release's install.sh. */
@@ -2464,7 +2467,7 @@ function baseLayoutProblems(text: string): string[] {
 }
 
 /**
- * What is wrong with a /ci skill text: empty when it reads the release from
+ * What is wrong with a /ci base-build step text: empty when it reads the release from
  * the base's `ARG AD_VERSION` (never typed), extracts install.sh at the
  * release tag `v<AD_VERSION>` as its one `git show`, passes only the install
  * script's named context (no release-candidate context), fetches nothing into
@@ -2562,10 +2565,11 @@ function filesUnder(rel: string): string[] {
   return readdirSync(join(REPO, rel), { withFileTypes: true }).flatMap((e) => e.isDirectory() ? filesUnder(join(rel, e.name)) : [join(rel, e.name)])
 }
 
-/** The image files (docker/, its docs aside), the ci-live/lib modules and the skills (the repo's and the package's). */
+/** The image files (docker/, its docs aside), the /ci base-build step, the ci-live/lib modules and the skills (the repo's and the package's). */
 function rcAuditFiles(): string[] {
   return [
     ...filesUnder('docker').filter((f) => !f.endsWith('.md')),
+    CI_BASE_BUILD_STEP,
     ...filesUnder(join('ci-live', 'lib')),
     ...filesUnder(join('.claude', 'skills')),
     ...filesUnder('skills'),
@@ -2578,7 +2582,15 @@ function rcLayoutAuditFiles(): string[] {
 }
 
 describe('the /ci images (source audit)', () => {
-  const TAGGED = [join('docker', 'Dockerfile.test'), join('docker', 'Dockerfile.live'), BASE_DOCKERFILE, CI_SKILL, CI_LIVE_SKILL]
+  const TAGGED = [
+    join('docker', 'Dockerfile.test'),
+    join('docker', 'Dockerfile.live'),
+    BASE_DOCKERFILE,
+    CI_BASE_BUILD_STEP,
+    // The /ci skill stays while it names a base tag.
+    CI_SKILL,
+    CI_LIVE_SKILL,
+  ]
 
   test.each(TAGGED)('every base-image tag %s names is BASE_IMAGE; a planted previous tag is refused', (rel) => {
     expect(BASE_IMAGE).toMatch(/:v\d+$/)
@@ -2592,10 +2604,10 @@ describe('the /ci images (source audit)', () => {
     expect(dockerInstructions(rel).filter((i) => /^FROM\s/i.test(i))).toEqual([`FROM ${BASE_IMAGE}`])
   })
 
-  test("the /ci skill's BASE_TAG is BASE_IMAGE, and it builds docker/Dockerfile.test.base under that tag", () => {
-    const skill = repoFile(CI_SKILL)
-    expect([...skill.matchAll(/^\s*BASE_TAG=(\S+)/gm)].map((m) => m[1])).toEqual([BASE_IMAGE])
-    expect(skill).toContain('-f docker/Dockerfile.test.base -t "${BASE_TAG}" .')
+  test("the /ci base-build step's BASE_TAG is BASE_IMAGE, and it builds docker/Dockerfile.test.base under that tag", () => {
+    const step = repoFile(CI_BASE_BUILD_STEP)
+    expect([...step.matchAll(/^\s*BASE_TAG=(\S+)/gm)].map((m) => m[1])).toEqual([BASE_IMAGE])
+    expect(step).toContain('-f docker/Dockerfile.test.base -t "${BASE_TAG}" .')
   })
 
   test("the base's layout: the release (CSCB's Phase 1 floor and package.json's pin, a plain release) installed by its own install.sh --from-release with pinned SHA-256s, its binary alone first on PATH and checked, agent-director-admin off PATH, the global client from npm at the pin checked by the client check, and nothing else from the repo or a context (b.jg5 SRJ-201, SRJ-1306)", () => {
@@ -2632,21 +2644,21 @@ describe('the /ci images (source audit)', () => {
     expect(problems.filter((p) => p.includes(problem)).length).toBeGreaterThan(0)
   })
 
-  test("the /ci skill extracts install.sh at the release tag it reads from the base's ARG AD_VERSION, passes only that context, fetches nothing and types no commit; a planted release-candidate context, typed commit or fetch is refused", () => {
-    const skill = repoFile(CI_SKILL)
-    // What the skill's `sed -n 's/^ARG AD_VERSION=//p'` prints: that ARG's default, once.
+  test("the /ci base-build step extracts install.sh at the release tag it reads from the base's ARG AD_VERSION, passes only that context, fetches nothing and types no commit; a planted release-candidate context, typed commit or fetch is refused", () => {
+    const step = repoFile(CI_BASE_BUILD_STEP)
+    // What the step's `sed -n 's/^ARG AD_VERSION=//p'` prints: that ARG's default, once.
     const sedOutput = repoFile(BASE_DOCKERFILE).split('\n').flatMap((l) => l.startsWith('ARG AD_VERSION=') ? [l.slice('ARG AD_VERSION='.length)] : [])
     expect(sedOutput).toEqual([baseImage().args.AD_VERSION!])
-    expect(ciSkillProblems(skill)).toEqual([])
+    expect(ciSkillProblems(step)).toEqual([])
 
     const context = `--build-context ${INSTALL_CONTEXT}=`
-    expect(ciSkillProblems(planted(skill, context, `--build-context agent-director-rc="\${CSCB_AD_RC_DIR}" \\\n       ${context}`))).toEqual(['the build contexts are ["agent-director-rc","agent-director-install"], not only agent-director-install'])
+    expect(ciSkillProblems(planted(step, context, `--build-context agent-director-rc="\${CSCB_AD_RC_DIR}" \\\n    ${context}`))).toEqual(['the build contexts are ["agent-director-rc","agent-director-install"], not only agent-director-install'])
     const commit = baseImage().args.AD_COMMIT!
-    expect(ciSkillProblems(planted(skill, /"\$\{AD_TAG\}:skills\//g, `"${commit}:skills/`))).toEqual([
+    expect(ciSkillProblems(planted(step, /"\$\{AD_TAG\}:skills\//g, `"${commit}:skills/`))).toEqual([
       `install.sh is extracted with ["${commit}:skills/install-agent-director/install.sh"], not at the release tag`,
       `it types the commit(s) ${commit}`,
     ])
-    expect(ciSkillProblems(planted(skill, /^(\s*)(AD_INSTALL_CTX="\$\(mktemp)/m, '$1git -C "${CSCB_AD_SRC_DIR}" fetch --tags\n$1$2'))).toEqual([
+    expect(ciSkillProblems(planted(step, /^(\s*)(AD_INSTALL_CTX="\$\(mktemp)/m, '$1git -C "${CSCB_AD_SRC_DIR}" fetch --tags\n$1$2'))).toEqual([
       'it fetches into agent-director\'s tree: ["git -C \\"${CSCB_AD_SRC_DIR}\\" fetch --tags"]',
     ])
   })
@@ -2662,7 +2674,7 @@ describe('the /ci images (source audit)', () => {
 
   test("no image file, ci-live/lib module or skill pins a release candidate: no release-candidate version, context, directory variable, SHA256SUMS, swap helper or pin, and no commit but the release's AD_COMMIT", () => {
     const files = rcAuditFiles()
-    for (const rel of [BASE_DOCKERFILE, LIVE_DOCKERFILE, AD_CLIENT_CHECK_SOURCE, join('ci-live', 'lib', 'docker.ts'), CI_SKILL, CI_LIVE_SKILL, DEBUG_SKILL_PATH]) expect(files).toContain(rel)
+    for (const rel of [BASE_DOCKERFILE, LIVE_DOCKERFILE, AD_CLIENT_CHECK_SOURCE, join('ci-live', 'lib', 'docker.ts'), CI_BASE_BUILD_STEP, CI_SKILL, CI_LIVE_SKILL, DEBUG_SKILL_PATH]) expect(files).toContain(rel)
     const commit = baseImage().args.AD_COMMIT!
     expect(files.flatMap((rel) => rcPinProblems(repoFile(rel), commit).map((p) => `${rel}: ${p}`))).toEqual([])
   })
