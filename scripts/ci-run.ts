@@ -11520,12 +11520,14 @@ export function createShardCanaryDrawer(randomBytes: RunnerDeps['randomBytes']):
  * The image shard k starts from (b.uqm SR-10.2, SR-14.2): the drift image's
  * ID for the shard `image-drift:<k>` names when its build succeeded
  * (`driftImageId` not null); the pinned ID for every other shard, and for that
- * one when the drift build failed or did not run. The fault's not-fired
- * reason is E12's.
+ * one when the drift build failed or did not run: E8's `shardStartImageId`
+ * rule, the drift shard found from the faults. The fault's not-fired reason
+ * is E12's.
  */
 export function shardImageId(faults: readonly Fault[], shard: number, pinnedImageId: string, driftImageId: string | null): string {
   const drifts = faults.some((fault) => fault.kind === 'image-drift' && fault.shard === shard)
-  return drifts && driftImageId !== null ? driftImageId : pinnedImageId
+  // Never null: the pinned ID is given.
+  return shardStartImageId({ pinnedId: pinnedImageId, driftId: driftImageId }, drifts) ?? pinnedImageId
 }
 
 /** Shard j's leak mounts (b.uqm SR-10.3, SR-14.2): for each `leak:<k>,<j>`, shard k's subdirectory, read-only, at `/leak-shard-<k>`, in fault order. None for any other shard. */
