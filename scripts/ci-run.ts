@@ -8720,6 +8720,457 @@ export function admissionRefusal(
 // 13. Shard containers (E9)
 // ---------------------------------------------------------------------------
 
+// --- 13/T1 (E9 T1): shard names, labels, subdirectories and canaries; the docker run argument list, its secret check and the start ---
+//
+// Everything needed to start one shard container (b.uqm SR-10.1 to SR-10.4,
+// and E9's parts of SR-11.2, SR-11.3 and SR-14.2). The list is built by a pure
+// builder from the run's facts (E13 passes E4's assignment, E8's pinned and
+// drift image IDs and the tarball path, E12's `--fail` names and the
+// normalized faults); E9 itself decides only which shard gets a leak mount and
+// which starts from the drift image. Each list is checked for secrets through
+// `runContainer`'s check slot, which runs before the list is logged, so a
+// refused list is never logged verbatim or spawned. Randomness comes only from
+// `RunnerDeps.randomBytes` (b.uqm SR-1.3).
+//
+// Fixed here:
+// - the image is always given by its ID, never a tag, with `--pull never`, so
+//   Docker never pulls (as `containerCreateArgs` does);
+// - mounts are `--mount type=bind,...`, never `-v`: Docker never creates a
+//   missing source, so every source is a directory or file the runner made;
+// - the image's entrypoint is not overridden: the in-container runner's
+//   arguments follow the image ID as the container's command;
+// - a name in use is read from Docker's own conflict refusal of the
+//   `docker run`, so no listing races the start; a shard so refused has no
+//   container of this run.
+
+/** The mark between the owner and k in a shard container's name, `cscb-ci-<RUN_ID>-<PID>-s<k>` (b.uqm SR-10.1). */
+export const SHARD_CONTAINER_NAME_SHARD_MARK = '-s'
+/** The variables each shard's `docker run` names by bare name, `--env <NAME>`, and no other (b.uqm SR-10.4). */
+export const SHARD_ENV_NAMES = ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL'] as const
+/** The secret credentials by name: never passed to a shard as `NAME=value` (b.uqm SR-10.4, SR-15.1). The base-build token has no variable of its own here; its value is checked like every secret value. */
+export const SECRET_CREDENTIAL_NAMES = ['ANTHROPIC_API_KEY', 'GH_TOKEN'] as const
+/** The in-container runner's option that names a script to fail, as `--fail <file name>` pairs (b.uqm SR-11.2, SR-14.1). */
+export const RUNNER_FAIL_OPTION = '--fail'
+/** The random bytes drawn for one canary: two hex characters each (b.uqm SR-11.3). */
+export const CANARY_BYTES = CANARY_LENGTH / 2
+/** The most draws for one shard's canary before its start fails: a draw that repeats another shard's canary, or that the random source cannot give, is drawn again (b.uqm SR-11.3). */
+export const CANARY_MAX_DRAWS = 16
+/** The text of Docker's refusal of a container name another container holds: `Conflict. The container name "/<name>" is already in use by container "<id>"` (b.uqm SR-13.2 check 8). */
+export const DOCKER_NAME_IN_USE_TEXT = 'is already in use'
+/** A canary: exactly `CANARY_LENGTH` lowercase hexadecimal characters (b.uqm SR-11.2, SR-11.3). */
+const SHARD_CANARY_PATTERN = /^[0-9a-f]+$/
+/** A character that cannot stand inside one field of a `--mount` value (its fields are comma-separated, CSV-quoted). */
+const MOUNT_FIELD_UNSAFE_PATTERN = /[,"\u0000-\u001f\u007f]/
+
+/** Shard k's container name, `cscb-ci-<RUN_ID>-<PID>-s<k>`: two owners never give one name (b.uqm SR-10.1). */
+export function shardContainerName(owner: Owner, shard: number): string {
+  return `${CI_CONTAINER_NAME_PREFIX}-${formatOwner(owner)}${SHARD_CONTAINER_NAME_SHARD_MARK}${shard}`
+}
+
+/** A shard container's two labels, `cscb-ci=1` and `cscb-ci-owner=<RUN_ID>-<PID>`, in that order (b.uqm SR-10.1). */
+export function shardContainerLabels(owner: Owner): DockerLabels {
+  return {
+    [CI_LABEL]: CI_LABEL_VALUE,
+    [OWNER_LABEL]: formatOwner(owner),
+  }
+}
+
+/** Shard k's subdirectory of the run directory, `<run directory>/shard-<k>` (b.uqm SR-5.9). */
+export function shardSubdirectoryPath(runDir: string, shard: number): string {
+  return join(runDir, `${SHARD_DIR_PREFIX}${shard}`)
+}
+
+/**
+ * Creates shard k's subdirectory in the run directory, mode exactly 0700
+ * whatever the umask (b.uqm SR-5.9, SR-11.3): one `mkdir`, never recursive.
+ * A directory already there (not a link) is kept and set to 0700, so a leak
+ * source can be prepared ahead of its own shard's start; anything else at the
+ * path, or any other failure, is a failure on one line. Its path, or the failure.
+ */
+export function prepareShardSubdirectory(runDir: string, shard: number): DepRead<string> {
+  const path = shardSubdirectoryPath(runDir, shard)
+  try {
+    try {
+      mkdirSync(path, { mode: RUN_DIR_MODE })
+    } catch (err) {
+      if (errnoCode(err) !== 'EEXIST') throw err
+      const stats = lstatSync(path)
+      if (!stats.isDirectory() || stats.isSymbolicLink()) return { ok: false, error: `${shownArgument(path)} exists and is not a directory` }
+    }
+    chmodSync(path, RUN_DIR_MODE)
+    return { ok: true, value: path }
+  } catch (err) {
+    return { ok: false, error: dependencyErrorText(err) }
+  }
+}
+
+/** Whether a text is a canary: `CANARY_LENGTH` lowercase hexadecimal characters. */
+function isShardCanary(text: string): boolean {
+  return text.length === CANARY_LENGTH && SHARD_CANARY_PATTERN.test(text)
+}
+
+/** Bytes as lowercase hexadecimal. */
+function lowercaseHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+/**
+ * One shard's canary (b.uqm SR-11.3): `CANARY_BYTES` random bytes from the
+ * injected source as `CANARY_LENGTH` lowercase hex characters, different from
+ * every canary in `taken`. A draw that repeats one, that gives the wrong
+ * number of bytes or that throws is drawn again, at most `CANARY_MAX_DRAWS`
+ * times in all; then a failure on one line.
+ */
+export function drawShardCanary(randomBytes: RunnerDeps['randomBytes'], taken: Iterable<string>): DepRead<string> {
+  const used = new Set(taken)
+  let lastError = 'every draw repeated another shard canary'
+  for (let draw = 0; draw < CANARY_MAX_DRAWS; draw++) {
+    let bytes: Uint8Array
+    try {
+      bytes = randomBytes(CANARY_BYTES)
+    } catch (err) {
+      lastError = `the random source failed: ${dependencyErrorText(err)}`
+      continue
+    }
+    const canary = lowercaseHex(bytes)
+    if (!isShardCanary(canary)) {
+      lastError = `the random source gave ${bytes.length} bytes, not ${CANARY_BYTES}`
+      continue
+    }
+    if (!used.has(canary)) return { ok: true, value: canary }
+  }
+  return { ok: false, error: `no canary could be drawn in ${CANARY_MAX_DRAWS} draws: ${lastError}` }
+}
+
+/** A run's canary source: each draw differs from every canary it gave before, so the shards of one run never share one, whatever order their starts run in. */
+export interface ShardCanaryDrawer {
+  /** A new canary, different from every one drawn before, or a failure on one line. */
+  draw(): DepRead<string>
+  /** Every canary drawn so far, in order. */
+  drawn(): readonly string[]
+}
+
+/** Builds a run's canary source over the injected random source (`RunnerDeps.randomBytes`); E13 builds one per run. */
+export function createShardCanaryDrawer(randomBytes: RunnerDeps['randomBytes']): ShardCanaryDrawer {
+  const drawn: string[] = []
+  return {
+    draw() {
+      const canary = drawShardCanary(randomBytes, drawn)
+      if (canary.ok) drawn.push(canary.value)
+      return canary
+    },
+    drawn: () => [...drawn],
+  }
+}
+
+/**
+ * The image shard k starts from (b.uqm SR-10.2, SR-14.2): the drift image's
+ * ID for the shard `image-drift:<k>` names when its build succeeded
+ * (`driftImageId` not null); the pinned ID for every other shard, and for that
+ * one when the drift build failed or did not run. The fault's not-fired
+ * reason is E12's.
+ */
+export function shardImageId(faults: readonly Fault[], shard: number, pinnedImageId: string, driftImageId: string | null): string {
+  const drifts = faults.some((fault) => fault.kind === 'image-drift' && fault.shard === shard)
+  return drifts && driftImageId !== null ? driftImageId : pinnedImageId
+}
+
+/** Shard j's leak mounts (b.uqm SR-10.3, SR-14.2): for each `leak:<k>,<j>`, shard k's subdirectory, read-only, at `/leak-shard-<k>`, in fault order. None for any other shard. */
+export function shardLeakMounts(faults: readonly Fault[], runDir: string, shard: number): ShardMount[] {
+  const mounts: ShardMount[] = []
+  for (const fault of faults) {
+    if (fault.kind !== 'leak' || fault.targetShard !== shard) continue
+    mounts.push({ source: shardSubdirectoryPath(runDir, fault.sourceShard), target: leakMountTarget(fault.sourceShard), readOnly: true })
+  }
+  return mounts
+}
+
+/** Shard k's mounts (b.uqm SR-10.3): the run's tarball, read-only, at `/tmp/package.tgz`; its own subdirectory at `/test-results`; then its leak mounts. */
+export function shardMounts(faults: readonly Fault[], runDir: string, shard: number, tarballPath: string): ShardMount[] {
+  return [
+    { source: tarballPath, target: INTEGRITY_TARBALL_MOUNT_TARGET, readOnly: true },
+    { source: shardSubdirectoryPath(runDir, shard), target: INTEGRITY_RESULTS_MOUNT_TARGET, readOnly: false },
+    ...shardLeakMounts(faults, runDir, shard),
+  ]
+}
+
+/** Stops the builder: shard k's inputs cannot make a valid list. */
+function refuseShardInput(reason: string): never {
+  throw new Error(reason)
+}
+
+/** A shard number: a whole number of at least 1 (b.uqm SR-11.2). */
+function shardNumberOperand(shard: number): string {
+  if (!Number.isSafeInteger(shard) || shard < 1) refuseShardInput(`not a shard number: ${String(shard)}`)
+  return String(shard)
+}
+
+/**
+ * The in-container runner's arguments, in b.uqm SR-11.2's order: the shard
+ * number, the canary, one `--fail <file name>` pair per given name in the
+ * given order, then the assigned scripts' file names in run order (test-1
+ * first, as E4's assignment holds them). Refuses (throws) arguments the
+ * in-container runner would find malformed: a bad shard number or canary, an
+ * assigned name not of the script form or given twice, or a `--fail` name not
+ * among the assigned scripts or given twice.
+ */
+export function shardRunnerArguments(shard: number, canary: string, failFileNames: readonly string[], assigned: readonly string[]): string[] {
+  const shardText = shardNumberOperand(shard)
+  if (!isShardCanary(canary)) refuseShardInput(`shard-${shardText}'s canary is not ${CANARY_LENGTH} lowercase hexadecimal characters`)
+  if (assigned.length === 0) refuseShardInput(`shard-${shardText} has no assigned script`)
+  for (const [index, fileName] of assigned.entries()) {
+    if (!SCRIPT_FILE_NAME_PATTERN.test(fileName)) refuseShardInput(`shard-${shardText}'s assigned ${shownArgument(fileName)} is not a script file name`)
+    if (assigned.indexOf(fileName) !== index) refuseShardInput(`shard-${shardText} is assigned ${fileName} twice`)
+  }
+  const fails: string[] = []
+  for (const [index, fileName] of failFileNames.entries()) {
+    if (!assigned.includes(fileName)) refuseShardInput(`shard-${shardText}'s ${RUNNER_FAIL_OPTION} ${shownArgument(fileName)} is not among its assigned scripts`)
+    if (failFileNames.indexOf(fileName) !== index) refuseShardInput(`shard-${shardText}'s ${RUNNER_FAIL_OPTION} names ${fileName} twice`)
+    fails.push(RUNNER_FAIL_OPTION, fileName)
+  }
+  return [shardText, canary, ...fails, ...assigned]
+}
+
+/** One bind mount as a `--mount` value: `type=bind,source=<path>,target=<path>`, with `,readonly` when read-only. Refuses a relative path or one a `--mount` field cannot hold. */
+function bindMountValue(mount: ShardMount): string {
+  for (const path of [mount.source, mount.target]) {
+    if (!isAbsolute(path)) refuseShardInput(`a mount path is not absolute: ${shownArgument(path)}`)
+    if (MOUNT_FIELD_UNSAFE_PATTERN.test(path)) refuseShardInput(`a mount path holds a comma, a quote or a control character: ${JSON.stringify(path)}`)
+  }
+  return `type=bind,source=${mount.source},target=${mount.target}${mount.readOnly ? ',readonly' : ''}`
+}
+
+/** What shard k's list is built from: the run's facts as E13 passes them, and its canary. */
+export interface ShardRunPlanInput {
+  readonly owner: Owner
+  /** The run directory, which holds each `shard-<k>` subdirectory. */
+  readonly runDir: string
+  /** k, from 1. */
+  readonly shard: number
+  /** Its assigned scripts' file names in run order, test-1 first (`ShardAssignment.assigned`). */
+  readonly assigned: readonly string[]
+  readonly canary: string
+  /** Its `--fail` file names in order (E12's `shardFailFileNames`, or the fault controller's `failFileNames(k)`). */
+  readonly failFileNames: readonly string[]
+  /** The run's normalized faults (`Invocation.faults`): E9 reads only `leak:` and `image-drift:` from them. */
+  readonly faults: readonly Fault[]
+  /** The pinned image ID (b.uqm SR-9.4). */
+  readonly pinnedImageId: string
+  /** The drift image's ID when its build succeeded; null when it failed or was not built. */
+  readonly driftImageId: string | null
+  /** The run's tarball, an absolute path in `package/` (b.uqm SR-9.1). */
+  readonly tarballPath: string
+}
+
+/** Shard k's list and what it was built from. */
+export interface ShardRunPlan {
+  /** Its container name. */
+  readonly name: string
+  /** The image ID it starts from: the pinned ID, or the drift image's. */
+  readonly imageId: string
+  /** Its mounts, in list order: the tarball, its subdirectory, then its leak mounts. */
+  readonly mounts: readonly ShardMount[]
+  /** The in-container runner's arguments (b.uqm SR-11.2). */
+  readonly runnerArguments: readonly string[]
+  /** The arguments after `docker run --detach`, as `runContainer` takes them. */
+  readonly runArguments: readonly string[]
+}
+
+/**
+ * Shard k's `docker run` arguments after `docker run --detach`, a pure
+ * builder (b.uqm SR-10.1 to SR-10.4, SR-11.2, SR-14.2), in this order:
+ * `--pull never`; `--name` and the two labels; `--memory` and
+ * `--memory-swap` both at the cap in bytes, `--pids-limit`, `--cpus`; the
+ * `--mount`s; `--env` for each of `SHARD_ENV_NAMES`, bare; the image ID; the
+ * in-container runner's arguments. Nothing sets a network (the default only),
+ * `--privileged`, a PID, IPC or network namespace, `--rm`, an entrypoint, an
+ * env file or any other variable. Throws on inputs that cannot make a valid
+ * list (an image that is not an ID, a bad path, name or runner argument).
+ */
+export function shardRunPlan(input: ShardRunPlanInput): ShardRunPlan {
+  const name = dockerOperand(shardContainerName(input.owner, input.shard), 'container name')
+  const imageId = imageIdOperand(shardImageId(input.faults, input.shard, input.pinnedImageId, input.driftImageId))
+  const mounts = shardMounts(input.faults, input.runDir, input.shard, input.tarballPath)
+  const runnerArguments = shardRunnerArguments(input.shard, input.canary, input.failFileNames, input.assigned)
+  const runArguments = [
+    '--pull',
+    'never',
+    '--name',
+    name,
+    ...dockerLabelArguments(shardContainerLabels(input.owner)),
+    '--memory',
+    String(SHARD_MEMORY_CAP_BYTES),
+    '--memory-swap',
+    String(SHARD_MEMORY_CAP_BYTES),
+    '--pids-limit',
+    String(SHARD_PIDS_LIMIT),
+    '--cpus',
+    String(CPUS_PER_SHARD),
+    ...mounts.flatMap((mount) => ['--mount', bindMountValue(mount)]),
+    ...SHARD_ENV_NAMES.flatMap((envName) => ['--env', envName]),
+    imageId,
+    ...runnerArguments,
+  ]
+  return { name, imageId, mounts, runnerArguments, runArguments }
+}
+
+/** Whether an argument passes `name` with a value attached: `name=` anywhere in it (`NAME=…`, `--env=NAME=…`, `-eNAME=…`), erring on the side of refusal. */
+function passesNameWithValue(arg: string, name: string): boolean {
+  return arg.includes(`${name}=`)
+}
+
+/**
+ * The `docker run` argument-list check (b.uqm SR-10.4, SR-15.2): refuses a
+ * list in which any argument passes a secret credential's name
+ * (`SECRET_CREDENTIAL_NAMES`) with a value attached, or holds any secret
+ * value (the run's secret set, `secretCredentialSet`) as a substring. The
+ * reason names the argument's place and the credential's name, never a value.
+ * Empty values are ignored.
+ */
+export function checkShardRunList(argv: readonly string[], secretValues: Iterable<string>): DockerRunListVerdict {
+  const values = [...secretValues].filter((value) => value !== '')
+  for (const [index, arg] of argv.entries()) {
+    const name = SECRET_CREDENTIAL_NAMES.find((credential) => passesNameWithValue(arg, credential))
+    if (name !== undefined) return { ok: false, reason: `the docker run argument list passes ${name} with a value in argument ${index + 1}` }
+    if (values.some((value) => arg.includes(value))) {
+      return { ok: false, reason: `the docker run argument list holds a secret credential's value in argument ${index + 1}` }
+    }
+  }
+  return { ok: true }
+}
+
+/** The check `runContainer` runs on each shard's list before it logs or spawns it: `checkShardRunList` over the run's secret values. */
+export function shardRunListCheck(secretValues: Iterable<string>): DockerRunListCheck {
+  const values = [...secretValues]
+  return (argv) => checkShardRunList(argv, values)
+}
+
+/** Whether a failed `docker run`'s error is Docker's refusal of the container name `name` as already in use. */
+export function isNameInUseError(error: string, name: string): boolean {
+  return error.includes(DOCKER_NAME_IN_USE_TEXT) && error.includes(`"/${name}"`)
+}
+
+/** What the start entry point uses: spawn, the runner's environment (passed unchanged under the child-environment rule, b.uqm SR-15.4), the worktree root as docker's working directory, and the clock. */
+export type ShardStartDeps = Pick<RunnerDeps, 'spawn' | 'env' | 'worktreeRoot' | 'clock'>
+
+/** What one shard's start takes, beyond its dependencies. */
+export interface ShardStartInput {
+  readonly owner: Owner
+  readonly runDir: string
+  /** Its assignment entry: k and its assigned scripts in run order. */
+  readonly assignment: Pick<ShardAssignment, 'shard' | 'assigned'>
+  /** Its `--fail` file names in order (E12). */
+  readonly failFileNames: readonly string[]
+  /** The run's normalized faults. */
+  readonly faults: readonly Fault[]
+  readonly pinnedImageId: string
+  /** The drift image's ID when its build succeeded; null otherwise. */
+  readonly driftImageId: string | null
+  /** The run's tarball, an absolute path in `package/`. */
+  readonly tarballPath: string
+  /** The run's secret credential values (`secretCredentialSet(env, { baseBuildToken })`), for the list check. */
+  readonly secretValues: Iterable<string>
+  /** The run's one canary source (`createShardCanaryDrawer(deps.randomBytes)`). */
+  readonly canaries: ShardCanaryDrawer
+  /** The runner log; `runContainer` writes the checked list to it before the spawn, and must throw when it cannot. */
+  readonly log: RunnerLogSink
+}
+
+/** One shard's start: its facts for `ShardEvidence.start` (and `ShardEvidence.canary` from `start.canary`), and its container. */
+export interface ShardStartResult {
+  /** Started or failed to start, with the image used, the mounts its list carried (leak mounts included), the name-in-use flag and the canary. */
+  readonly start: ShardStart
+  /** Whether this run created a container for the shard: always for a started one; for a failed start, one Docker left created counts. Never for a name in use. */
+  readonly containerCreated: boolean
+  /** The container's name, `cscb-ci-<RUN_ID>-<PID>-s<k>`. */
+  readonly containerName: string
+  /** The started container's full ID; null when it did not start. */
+  readonly containerId: string | null
+}
+
+/**
+ * Whether a failed `docker run` left a container of this run under `name`:
+ * one inspect by name; a container there carrying this run's owner label
+ * counts. When the inspect itself fails, the name was free at the run (no
+ * conflict), so any container under it is this run's: it counts as created,
+ * and retirement finds out.
+ */
+async function failedRunLeftContainer(docker: DockerContext, name: string, owner: Owner): Promise<boolean> {
+  const state = await inspectContainerState(docker, name)
+  if (!state.ok) return true
+  return state.value !== null && state.value.labels[OWNER_LABEL] === formatOwner(owner)
+}
+
+/**
+ * Starts shard k (b.uqm SR-10.1 to SR-10.4), E13's one call per shard in step
+ * 12: draws its canary; creates its subdirectory (and each leak source's) at
+ * 0700 before any docker command; builds its list; and starts it through
+ * `runContainer`, whose check slot refuses a list carrying a secret before it
+ * is logged or spawned. The spawn gets the runner's environment unchanged
+ * (`childEnvironment(deps.env)`), so Docker hands the container only the
+ * three `--env` names. Never throws.
+ *
+ * A failure at any step is a `failed-to-start` with a one-line detail free of
+ * any secret value, and stops there: no docker command follows a failed
+ * preparation or a refused list. A `docker run` that Docker refuses because
+ * the name is in use sets `nameInUse` and creates no container; any other
+ * failed `docker run` is followed by one inspect by name, to record whether
+ * it left a container of this run created.
+ */
+export async function startShard(deps: ShardStartDeps, input: ShardStartInput): Promise<ShardStartResult> {
+  const shard = input.assignment.shard
+  const containerName = shardContainerName(input.owner, shard)
+  const imageId = shardImageId(input.faults, shard, input.pinnedImageId, input.driftImageId)
+  const plannedMounts = shardMounts(input.faults, input.runDir, shard, input.tarballPath)
+  const failed = (canary: string, mounts: readonly ShardMount[], detail: string, created = false, nameInUse = false): ShardStartResult => ({
+    start: { kind: 'failed-to-start', shard, imageId, mounts, nameInUse, canary, detail },
+    containerCreated: created,
+    containerName,
+    containerId: null,
+  })
+
+  const canary = input.canaries.draw()
+  if (!canary.ok) return failed('', plannedMounts, `no canary for shard-${shard}: ${canary.error}`)
+  const leakSources = input.faults.flatMap((fault) => (fault.kind === 'leak' && fault.targetShard === shard ? [fault.sourceShard] : []))
+  for (const toPrepare of [shard, ...leakSources]) {
+    const prepared = prepareShardSubdirectory(input.runDir, toPrepare)
+    if (!prepared.ok) return failed(canary.value, plannedMounts, `the subdirectory ${SHARD_DIR_PREFIX}${toPrepare} could not be created: ${prepared.error}`)
+  }
+
+  let plan: ShardRunPlan
+  try {
+    plan = shardRunPlan({
+      owner: input.owner,
+      runDir: input.runDir,
+      shard,
+      assigned: input.assignment.assigned,
+      canary: canary.value,
+      failFileNames: input.failFileNames,
+      faults: input.faults,
+      pinnedImageId: input.pinnedImageId,
+      driftImageId: input.driftImageId,
+      tarballPath: input.tarballPath,
+    })
+  } catch (err) {
+    return failed(canary.value, plannedMounts, `the docker run argument list could not be built: ${dependencyErrorText(err)}`)
+  }
+
+  const docker: DockerContext = { spawn: deps.spawn, env: childEnvironment(deps.env), cwd: deps.worktreeRoot }
+  const outcome = await runContainer(docker, plan.runArguments, shardRunListCheck(input.secretValues), input.log)
+  if (outcome.kind === 'started') {
+    return {
+      start: { kind: 'started', shard, imageId: plan.imageId, mounts: plan.mounts, nameInUse: false, canary: canary.value, startedAtMs: deps.clock.now() },
+      containerCreated: true,
+      containerName,
+      containerId: outcome.containerId,
+    }
+  }
+  if (outcome.kind === 'refused') return failed(canary.value, plan.mounts, outcome.reason)
+  if (outcome.exitCode === null) return failed(canary.value, plan.mounts, outcome.error)
+  if (isNameInUseError(outcome.error, containerName)) return failed(canary.value, plan.mounts, outcome.error, false, true)
+  return failed(canary.value, plan.mounts, outcome.error, await failedRunLeftContainer(docker, containerName, input.owner))
+}
+
 // ---------------------------------------------------------------------------
 // 14. Outcomes, verdict and results (E10)
 // ---------------------------------------------------------------------------
