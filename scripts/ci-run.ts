@@ -5337,6 +5337,338 @@ export function validateRun(args: readonly string[], worktreeRoot: string, env: 
 // 8. Scheduling (E4)
 // ---------------------------------------------------------------------------
 
+// --- 8/T1 (E4 T1): the duration table, its notes and the assignment ---
+//
+// The duration table's text, handed over unparsed by the image read-back
+// (b.uqm SR-9.4), gives one estimate per script of the pinned image's list
+// (b.uqm SR-4.1). Nothing in it ever drops a script: a bad line is ignored and
+// noted, a script with no entry gets the default, and an unreadable table
+// gives every script the default with one note. The run's units are then
+// placed longest first in the shard with the smallest expected total
+// (b.uqm SR-4.2). Every function here is pure: the result depends only on the
+// inputs' content, never on the order in which lists or lines arrive.
+
+/** The duration table's header line, `script<TAB>seconds` (b.uqm SR-4.1). */
+export const DURATION_TABLE_HEADER = 'script\tseconds'
+
+/**
+ * The duration table as the image read-back hands it to scheduling
+ * (b.uqm SR-4.1, SR-9.4): the file's text, missing, or unreadable with its
+ * error. It is `readFileText`'s answer, so a read of the table copied out of
+ * the pinned image hands over as is. A missing table is no read-back failure.
+ */
+export type DurationTableSource = FileTextRead
+
+/** Why a table line other than the header is ignored (b.uqm SR-4.1). */
+export type DurationLineProblem =
+  | {
+      /** The line holds a carriage return, so it matches no form. */
+      readonly kind: 'carriage-return'
+    }
+  | {
+      readonly kind: 'empty'
+    }
+  | {
+      /** No tab separates the script from its seconds. */
+      readonly kind: 'no-tab'
+    }
+  | {
+      /** The text before the first tab is no number form `test-<n>`. */
+      readonly kind: 'bad-script'
+      readonly script: string
+    }
+  | {
+      /** The text after the first tab is no whole number above 0 and at most `Number.MAX_SAFE_INTEGER`. */
+      readonly kind: 'bad-seconds'
+      readonly seconds: string
+    }
+  | {
+      /** The script is already listed on an earlier line of the table's form. */
+      readonly kind: 'repeated'
+      readonly numberForm: string
+      readonly firstLine: number
+    }
+  | {
+      /** The script is not in the pinned image's list. */
+      readonly kind: 'not-listed'
+      readonly numberForm: string
+    }
+
+/** Every table note's opening words. */
+const DURATION_TABLE_NOTE_PREFIX = `duration table ${DURATION_TABLE_PATH}`
+
+/** The tail of each unreadable-table note: what every script gets instead. */
+const DEFAULT_ESTIMATE_TEXT = `every script gets the default estimate, ${DEFAULT_ESTIMATE_SECONDS} s`
+
+/** The note for a missing table (b.uqm SR-4.1, SR-9.4). */
+export function durationTableMissingNote(): string {
+  return `${DURATION_TABLE_NOTE_PREFIX} is missing: ${DEFAULT_ESTIMATE_TEXT}`
+}
+
+/** The note for a table that cannot be read, its error on one line (b.uqm SR-4.1). */
+export function durationTableReadFailedNote(error: string): string {
+  return `${DURATION_TABLE_NOTE_PREFIX} cannot be read (${dependencyErrorText(error)}): ${DEFAULT_ESTIMATE_TEXT}`
+}
+
+/** The note for a table whose first line is not the header: an empty file and a header holding a carriage return included (b.uqm SR-4.1). */
+export function durationTableWrongHeaderNote(): string {
+  return `${DURATION_TABLE_NOTE_PREFIX} is unreadable: line 1 is not the header ${JSON.stringify(DURATION_TABLE_HEADER)}: ${DEFAULT_ESTIMATE_TEXT}`
+}
+
+/** Why a line is ignored, as its note states it. */
+function durationLineProblemText(problem: DurationLineProblem): string {
+  switch (problem.kind) {
+    case 'carriage-return':
+      return 'it holds a carriage return'
+    case 'empty':
+      return 'it is empty'
+    case 'no-tab':
+      return 'no tab separates the script from its seconds'
+    case 'bad-script':
+      return `${shownArgument(problem.script)} is not a number form test-<n>, n a whole number`
+    case 'bad-seconds':
+      return `seconds ${shownArgument(problem.seconds)} is not a whole number above 0 and at most ${Number.MAX_SAFE_INTEGER}`
+    case 'repeated':
+      return `${problem.numberForm} is already listed on line ${problem.firstLine}`
+    case 'not-listed':
+      return `${problem.numberForm} is not in the test image's script list`
+  }
+}
+
+/** The note for an ignored line, with its 1-based line number and why (b.uqm SR-4.1). */
+export function durationLineIgnoredNote(line: number, problem: DurationLineProblem): string {
+  return `${DURATION_TABLE_NOTE_PREFIX} line ${line} ignored: ${durationLineProblemText(problem)}`
+}
+
+/** The note for a used line out of canonical order: it sorts before the script of an earlier used line, named with that line (b.uqm SR-4.1, SR-3.3). */
+export function durationLineOutOfOrderNote(line: number, numberForm: string, after: string, afterLine: number): string {
+  return `${DURATION_TABLE_NOTE_PREFIX} line ${line} is out of canonical order: ${numberForm} follows ${after} on line ${afterLine}; its entry is used`
+}
+
+/** The duration table parsed against the pinned list (b.uqm SR-4.1). */
+export interface DurationTable {
+  /** Whether the table was read and its first line is the header. */
+  readonly readable: boolean
+  /** One estimate in seconds per script of the pinned list, keyed by file name, in canonical order. */
+  readonly estimates: ReadonlyMap<string, number>
+  /** The table's used entries, seconds keyed by number form, in canonical order: only pinned scripts' entries (T2's block takes them). */
+  readonly entries: ReadonlyMap<string, number>
+  /** The notes: one when the table is unreadable; else one per noted line, in line order. */
+  readonly notes: readonly string[]
+}
+
+/** Splits a table's text into lines at each line feed; a final line feed ends the last line and may be absent (b.uqm SR-4.1). */
+function durationTableLines(text: string): string[] {
+  const lines = text.split('\n')
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop()
+  return lines
+}
+
+/**
+ * A seconds field's value: its digits as a Number when they are a whole number
+ * above 0 that a Number holds exactly (at most `Number.MAX_SAFE_INTEGER`);
+ * else null, so a longer digit string is malformed rather than rounded.
+ */
+function durationSeconds(text: string): number | null {
+  if (!isWholeNumber(text)) return null
+  const seconds = Number(text)
+  return Number.isSafeInteger(seconds) && seconds > 0 ? seconds : null
+}
+
+/** A table line's form: its number form and seconds, or the problem that makes it of no form. */
+function durationLineForm(
+  line: string,
+): { readonly ok: true; readonly numberForm: string; readonly seconds: number } | { readonly ok: false; readonly problem: DurationLineProblem } {
+  if (line.includes('\r')) return { ok: false, problem: { kind: 'carriage-return' } }
+  if (line === '') return { ok: false, problem: { kind: 'empty' } }
+  const tab = line.indexOf('\t')
+  if (tab < 0) return { ok: false, problem: { kind: 'no-tab' } }
+  const script = line.slice(0, tab)
+  const seconds = line.slice(tab + 1)
+  // A number form is built from its digits as typed, so the script text is its own number form.
+  if (!NUMBER_FORM_PATTERN.test(script)) return { ok: false, problem: { kind: 'bad-script', script } }
+  const value = durationSeconds(seconds)
+  if (value === null) return { ok: false, problem: { kind: 'bad-seconds', seconds } }
+  return { ok: true, numberForm: script, seconds: value }
+}
+
+/** The pinned file names in canonical order, each keyed by its number form; throws for a name that is no script file name. */
+function pinnedByNumberForm(pinned: readonly string[]): Map<string, string> {
+  const byNumberForm = new Map<string, string>()
+  for (const fileName of sortCanonical(pinned)) {
+    const numberForm = fileNameNumberForm(fileName)
+    if (numberForm === null) throw new Error(`duration table: pinned name is no script file name: ${JSON.stringify(fileName)}`)
+    byNumberForm.set(numberForm, fileName)
+  }
+  return byNumberForm
+}
+
+/**
+ * Parses the duration table against the pinned image's script list, given as
+ * file names (b.uqm SR-4.1). A missing or unreadable source, or a first line
+ * that is not exactly the header, gives every script the default and one
+ * note. Otherwise each other line is used when it is `test-<n><TAB><seconds>`
+ * (seconds a whole number above 0, at most `Number.MAX_SAFE_INTEGER`), names a script no earlier line of that
+ * form names, and names a pinned script; else it is ignored and noted. A used
+ * line that sorts before an earlier used line is noted too. A pinned script
+ * with no entry gets the default, without a note.
+ */
+export function parseDurationTable(source: DurationTableSource, pinned: readonly string[]): DurationTable {
+  const byNumberForm = pinnedByNumberForm(pinned)
+  const defaults = (note: string): DurationTable => ({
+    readable: false,
+    estimates: new Map([...byNumberForm.values()].map((fileName) => [fileName, DEFAULT_ESTIMATE_SECONDS])),
+    entries: new Map(),
+    notes: [note],
+  })
+  if (source.kind === 'missing') return defaults(durationTableMissingNote())
+  if (source.kind === 'unreadable') return defaults(durationTableReadFailedNote(source.error))
+  const lines = durationTableLines(source.text)
+  if (lines[0] !== DURATION_TABLE_HEADER) return defaults(durationTableWrongHeaderNote())
+
+  const notes: string[] = []
+  /** Each number form listed on a line of the table's form, with that line's number. */
+  const listedOn = new Map<string, number>()
+  const used = new Map<string, number>()
+  /** The used line whose script sorts last so far, for the order note. */
+  let latest: { readonly numberForm: string; readonly line: number } | null = null
+  for (const [index, text] of lines.entries()) {
+    if (index === 0) continue
+    const line = index + 1
+    const form = durationLineForm(text)
+    if (!form.ok) {
+      notes.push(durationLineIgnoredNote(line, form.problem))
+      continue
+    }
+    const firstLine = listedOn.get(form.numberForm)
+    if (firstLine !== undefined) {
+      notes.push(durationLineIgnoredNote(line, { kind: 'repeated', numberForm: form.numberForm, firstLine }))
+      continue
+    }
+    listedOn.set(form.numberForm, line)
+    if (!byNumberForm.has(form.numberForm)) {
+      notes.push(durationLineIgnoredNote(line, { kind: 'not-listed', numberForm: form.numberForm }))
+      continue
+    }
+    used.set(form.numberForm, form.seconds)
+    if (latest !== null && compareCanonical(form.numberForm, latest.numberForm) < 0) {
+      notes.push(durationLineOutOfOrderNote(line, form.numberForm, latest.numberForm, latest.line))
+    } else {
+      latest = { numberForm: form.numberForm, line }
+    }
+  }
+
+  const estimates = new Map<string, number>()
+  const entries = new Map<string, number>()
+  for (const [numberForm, fileName] of byNumberForm) {
+    const seconds = used.get(numberForm)
+    estimates.set(fileName, seconds ?? DEFAULT_ESTIMATE_SECONDS)
+    if (seconds !== undefined) entries.set(numberForm, seconds)
+  }
+  return { readable: true, estimates, entries, notes }
+}
+
+/** The scheduling entry point's inputs (b.uqm SR-4.1, SR-4.2); E13 passes them once, after the read-back. */
+export interface SchedulingInput {
+  /** The pinned image's script list, as file names, test-1 among them. */
+  readonly pinned: readonly string[]
+  /** The pinned image's duration table, unparsed. */
+  readonly table: DurationTableSource
+  /** The run's scheduling units (b.uqm SR-3.4). */
+  readonly units: readonly SchedulingUnit[]
+  /** The invocation: `--shard-timeout` sets every shard's limit (b.uqm SR-4.3). */
+  readonly invocation: Invocation
+  /** The admitted N: at least 1, at most the effective N. */
+  readonly shards: number
+}
+
+/** The scheduling result: the parsed table and the assignment (b.uqm SR-4.1, SR-4.2, SR-4.3). */
+export interface Schedule {
+  /** Whether the table was read and its first line is the header. */
+  readonly readable: boolean
+  /** One estimate in seconds per pinned script, keyed by file name, in canonical order. */
+  readonly estimates: ReadonlyMap<string, number>
+  /** The table's used entries, seconds keyed by number form, in canonical order. */
+  readonly entries: ReadonlyMap<string, number>
+  /** The table notes, in their fixed order. */
+  readonly notes: readonly string[]
+  /** One entry per shard, from shard 1. */
+  readonly assignment: Assignment
+}
+
+/**
+ * Assigns the units to shards by expected duration (b.uqm SR-4.2). Every
+ * shard starts with test-1's estimate; units are taken longest first, ties in
+ * the canonical order of each unit's first script, and each goes to the shard
+ * with the smallest total, the lowest shard number on a tie. Each shard's list
+ * is test-1, then its scripts in canonical order. With no units there is one
+ * shard holding test-1 alone; N is never taken above the number of units.
+ */
+export function assignShards(
+  test1FileName: string,
+  estimates: ReadonlyMap<string, number>,
+  units: readonly SchedulingUnit[],
+  shards: number,
+  shardTimeoutMinutes: number | null,
+): Assignment {
+  if (!Number.isSafeInteger(shards) || shards < OPTION_RANGE_MIN) throw new Error(`assignShards: N is no whole number of at least ${OPTION_RANGE_MIN}: ${shards}`)
+  const estimateOf = (script: Script): number => estimates.get(script.fileName) ?? DEFAULT_ESTIMATE_SECONDS
+  const placed = units
+    .map((unit) => {
+      const scripts = [...unit.scripts].sort((a, b) => compareCanonicalNumbers(a.number, b.number))
+      return { scripts, seconds: scripts.reduce((sum, script) => sum + estimateOf(script), 0) }
+    })
+    .filter((unit) => unit.scripts.length > 0)
+    .sort((a, b) => b.seconds - a.seconds || compareCanonicalNumbers(a.scripts[0].number, b.scripts[0].number))
+
+  const count = effectiveShardCount(shards, placed.length)
+  const test1Seconds = estimates.get(test1FileName) ?? DEFAULT_ESTIMATE_SECONDS
+  const totals: number[] = Array.from({ length: count }, () => test1Seconds)
+  const members: Script[][] = Array.from({ length: count }, () => [])
+  for (const unit of placed) {
+    let target = 0
+    for (let k = 1; k < count; k++) if (totals[k] < totals[target]) target = k
+    totals[target] += unit.seconds
+    members[target].push(...unit.scripts)
+  }
+  return members.map((scripts, index) => ({
+    shard: index + 1,
+    assigned: [test1FileName, ...scripts.sort((a, b) => compareCanonicalNumbers(a.number, b.number)).map((script) => script.fileName)],
+    expectedSeconds: totals[index],
+    limitMinutes: shardLimitMinutes(totals[index], shardTimeoutMinutes),
+  }))
+}
+
+/**
+ * The scheduling entry point (b.uqm SR-4.1, SR-4.2): parses the pinned
+ * image's duration table against its script list, then assigns the run's
+ * units to N shards. Throws when the pinned list holds no test-1, which the
+ * read-back's checks have already refused.
+ */
+export function scheduleRun(input: SchedulingInput): Schedule {
+  const table = parseDurationTable(input.table, input.pinned)
+  const test1 = numberFormOf(FIRST_SCRIPT_NUMBER)
+  const test1FileName = input.pinned.find((fileName) => fileNameNumberForm(fileName) === test1)
+  if (test1FileName === undefined) throw new Error(`scheduleRun: the pinned script list holds no ${test1}`)
+  const assignment = assignShards(test1FileName, table.estimates, input.units, input.shards, input.invocation.shardTimeoutMinutes)
+  return { readable: table.readable, estimates: table.estimates, entries: table.entries, notes: table.notes, assignment }
+}
+
+// --- 8/T2 (E4 T2): shard limits ---
+
+/** Seconds in a minute, derived from E1's millisecond figures. */
+const SECONDS_PER_MINUTE = MS_PER_MINUTE / MS_PER_SECOND
+
+/**
+ * A shard's wall-time limit in exact minutes (b.uqm SR-4.3): 2 × its expected
+ * total + 15 min, at least 30 min; `--shard-timeout`'s minutes, with no floor,
+ * when given. Only messages round it.
+ */
+export function shardLimitMinutes(expectedSeconds: number, shardTimeoutMinutes: number | null): number {
+  if (shardTimeoutMinutes !== null) return shardTimeoutMinutes
+  return Math.max(LIMIT_FLOOR_MINUTES, (LIMIT_FACTOR * expectedSeconds) / SECONDS_PER_MINUTE + LIMIT_ADDEND_MINUTES)
+}
+
 // ---------------------------------------------------------------------------
 // 9. Lock, reservations and sweep (E5)
 // ---------------------------------------------------------------------------
