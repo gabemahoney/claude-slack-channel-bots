@@ -334,6 +334,102 @@ session of the account; each admitted run holds a reservation until its
 cleanup, and a sweep removes the containers, reservations, tags and untagged
 images that dead runs left behind.
 
+- **The lock file.** The lock is `<home>/.config/cscb-ci/admission.lock`,
+  where `<home>` is the account's home. It sits outside every worktree, so
+  every worktree, lane and session of the account shares one admission. The
+  runner creates the directory (0700) and the file (0600) when they are
+  missing, and never moves or removes the file.
+- **The account's home.** The home is the sixth field of the first
+  `/etc/passwd` line for the runner's user ID, never `$HOME`, so a session
+  launched with another HOME finds the same lock. When the password file
+  cannot be read, has no line for the user ID, or that line gives no
+  absolute home, the run is not runnable:
+  `NOT RUN: the account's home for user ID <uid> could not be found in /etc/passwd`,
+  and the next line says which of the three it was.
+- **How the lock is held.** The runner process itself holds an exclusive
+  `flock(2)` on the file, on a descriptor no child inherits, so the kernel
+  frees it when the runner exits, however it exits. Once it holds the flock,
+  the runner writes its own `<RUN_ID>-<PID>` into the file for messages
+  only: the flock alone decides who holds the lock, so a file naming a dead
+  run is taken at once.
+- **How long it is held.** Only through admission: the sweep below, the
+  readings and fits (see
+  [Admission: memory, disk and CPU](#admission-memory-disk-and-cpu)) and the
+  reservation write.
+- **A busy lock.** While another run holds the lock, the runner tries again
+  every 250 ms for at most 30 s, then refuses, naming the RUN_ID and PID the
+  lock file records:
+
+  ```text
+  NOT RUN: the admission lock stayed busy for 30 s: run <RUN_ID> (PID <PID>) holds it
+  another /ci run is being admitted; try again once its admission is done
+  ```
+
+  When the file names no run, the first line ends `an unknown run holds it`.
+  Run `/ci` again once that run's admission is done.
+
+Each admitted run writes a reservation, `<RUN_ID>-<PID>.json` beside the
+lock, while it holds the lock. It is written whole (a temporary file, then a
+rename), with these keys:
+
+| Key | Value |
+|---|---|
+| `version` | `1` |
+| `runId`, `pid` | the run's RUN_ID and PID |
+| `shards` | N |
+| `memoryBytes` | N × the per-shard memory cap |
+| `cpus` | 2 × N |
+| `kind` | `full` or `selective` |
+
+- **Its lifetime.** A reservation lives until its run ends: the run removes
+  it in its cleanup, whatever the outcome, or a later run's sweep removes it
+  once its owner is dead. While its run is still building, admission counts
+  it in full.
+- **A bad reservation.** A reservation-named file that is not a regular
+  file, cannot be read or parsed, is of another version or shape, or names
+  an owner other than its file name's is bad. When its owner (from the file
+  name) is dead, the sweep removes it; when its owner is alive, the run is
+  refused as a failed reading naming the file.
+- **Other files.** Files beside the lock that are not reservations are
+  ignored and kept.
+- **Owners.** An owner `<RUN_ID>-<PID>` is alive only when its PID is a live
+  process whose command line holds an argument ending in `scripts/ci-run.ts`
+  followed immediately by that RUN_ID. Every other owner is dead, a PID
+  reused by another program or another `/ci` run included.
+
+In every run that reaches admission, under the lock and before the readings,
+the sweep removes what dead runs left behind, in this order:
+
+1. containers labelled `cscb-ci=1` whose owner is dead, stopped or running
+   (a running one is killed with SIGKILL first); a missing or malformed
+   owner label counts as dead;
+2. reservations whose owner is dead;
+3. run-private tags whose owner is dead;
+4. untagged images whose owner label names a dead owner, such as a pinned
+   image left untagged after a `retag` fault; a malformed owner label counts
+   as dead.
+
+It removes images only the way a run's own cleanup does, never by ID or
+digest and never forced. [The run's images and tags](#the-runs-images-and-tags)
+gives the tag shape, the owner label and how the images are removed.
+
+The sweep never touches:
+
+- anything whose owner is alive;
+- any `cscb-live=1` container, or any container without `cscb-ci=1`;
+- any other tag shape, such as `cscb-ci:latest`, `cscb-ci-base:v6`,
+  `cscb-ci-live:latest` or a lane tag like `cscb-ci-l5:m5`;
+- an image that still has a tag, or an image with no owner label;
+- any file beside the lock but a dead owner's reservation;
+- the run directories of swept runs, which are kept.
+
+A listing or removal that fails is written to the runner log and listed among
+the run's cleanup failures; a failed listing skips only its own step. The
+sweep never refuses the run, and a later run's sweep tries again. So a runner
+that was killed, or lost at a VM reboot, needs no clean-up by hand: the next
+`/ci` run to reach admission removes its containers, reservation, tags and
+untagged images.
+
 ### The per-shard memory cap and out-of-memory kills
 
 Every shard container runs under one memory cap, and the run records each
