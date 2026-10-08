@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Test 3 (b.set): probe cozempic, stop + restart daemon, verify clean restart.
 # Depends on Tests 1 and 2 having passed (daemon must be running going in).
+# ci-requires: test-2
 #
 # `stop --stop-bots` reads the persona config from the path the server loads
 # and tears down each persona's instance cscb_<key> (b.av2 SR-8.7). Dry run
