@@ -4768,10 +4768,7 @@ const FAILURE_TIERS: Readonly<Record<FailureClass['kind'], number>> = {
   script: 5,
 }
 
-/** The failure classes whose failures carry no shard: run-level, image-build and integrity lines (b.uqm SR-12.4, SR-16.1). */
-const SHARDLESS_FAILURE_KINDS: readonly FailureClass['kind'][] = ['run-level-stop', 'image-build', 'integrity']
-
-/** The failure classes a shard outcome's failures take (T1's `ShardOutcome.failures`). */
+/** The failure classes a shard outcome's failures take (T1's `ShardOutcome.failures`); each carries its shard. */
 const SHARD_OUTCOME_FAILURE_KINDS: readonly FailureClass['kind'][] = ['out-of-memory', 'shard', 'script']
 
 /** A failure's tier in SR-12.4's precedence, 0 highest: run-level stop, image build, integrity, out-of-memory, other `shard-<k>`, script. */
@@ -4785,11 +4782,13 @@ export function failureTier(failure: Failure): number {
  * failures, a `… in shard-<k>` end line among them, in E1's canonical order
  * of their scripts, then by shard number, so test-1's lowest shard comes
  * first. Run-level, image-build and integrity failures compare equal within
- * their tier, so a stable sort keeps their given order.
+ * their tier, whatever shard an integrity failure carries, so a stable sort
+ * keeps their given order (SR-13.2's, for the integrity failures).
  */
 export function compareFailures(a: Failure, b: Failure): number {
   const tier = failureTier(a) - failureTier(b)
   if (tier !== 0) return tier
+  if (!SHARD_OUTCOME_FAILURE_KINDS.includes(a.failureClass.kind)) return 0
   if (a.failureClass.kind === 'script' && b.failureClass.kind === 'script') {
     const order = compareCanonical(a.failureClass.fileName, b.failureClass.fileName)
     if (order !== 0) return order
@@ -4813,7 +4812,7 @@ export interface FailureSources {
   readonly runLevelLine: string | null
   /** The image build failure's line (E8); null for none. */
   readonly imageBuildLine: string | null
-  /** The integrity failures in SR-13.2's order (E11), each classed `integrity` with no shard. */
+  /** The integrity failures in SR-13.2's order (E11), each classed `integrity`, each with its shard number or null; ranking keeps this order exactly. */
   readonly integrityFailures: readonly Failure[]
   /** The shard outcomes (T1). */
   readonly outcomes: readonly ShardOutcome[]
@@ -4826,25 +4825,33 @@ export function otherFailuresOf(sources: FailureSources): Failure[] {
   return [...runLevel, ...imageBuild, ...sources.integrityFailures]
 }
 
-/** Throws unless a failure is of one of the classes its source gives, and carries a shard exactly when its class takes one. */
+/**
+ * Throws unless a failure is of one of the classes its source gives, and
+ * unless an out-of-memory, shard or script failure carries a shard. An
+ * integrity failure carries a shard number or null (E11); run-level and
+ * image-build entries never reach this check, as `runLevelFailure` and
+ * `imageBuildFailure` build them shardless.
+ */
 function checkFailureSource(failure: Failure, kinds: readonly FailureClass['kind'][], source: string): void {
   const kind = failure.failureClass.kind
   if (!kinds.includes(kind)) throw new Error(`rankFailures: ${source} holds a failure classed ${kind}: ${failure.line}`)
-  const takesShard = !SHARDLESS_FAILURE_KINDS.includes(kind)
-  if (takesShard !== (failure.shard !== null)) throw new Error(`rankFailures: a failure classed ${kind} with shard ${failure.shard}: ${failure.line}`)
+  if (SHARD_OUTCOME_FAILURE_KINDS.includes(kind) && failure.shard === null) throw new Error(`rankFailures: a failure classed ${kind} with shard ${failure.shard}: ${failure.line}`)
 }
 
 /**
  * Every failure of the run, ranked by SR-12.4's precedence (b.uqm SR-12.4,
  * SR-16.1 `failures`): the first run-level stop; the image build failure; the
- * integrity failures in their given order; out-of-memory lines by shard
- * number (`out-of-memory status unreadable` with the kill lines); other
- * `shard-<k>` lines by shard number; script failures in canonical order,
- * test-1's by ascending shard. Every failure is kept, each once: a shard's end
- * line is already its only entry for the script in progress, and `notrun` is
- * never one (T1). Run-level, image-build and integrity entries carry no shard;
- * every other entry carries its shard. Throws for an input failure of the
- * wrong class or shard.
+ * integrity failures in exactly their given order (SR-13.2's), never
+ * reordered by shard; out-of-memory lines by shard number (`out-of-memory
+ * status unreadable` with the kill lines); other `shard-<k>` lines by shard
+ * number; script failures in canonical order, test-1's by ascending shard.
+ * Every failure is kept, each once: a shard's end line is already its only
+ * entry for the script in progress, and `notrun` is never one (T1).
+ * Run-level and image-build entries are built shardless by `runLevelFailure`
+ * and `imageBuildFailure`; an integrity entry carries its shard number or
+ * null, as E11 gives it; every other entry carries its shard. Throws for an
+ * input failure of the wrong class, and for an out-of-memory, shard or script
+ * failure without a shard.
  */
 export function rankFailures(sources: FailureSources): Failure[] {
   for (const failure of sources.integrityFailures) checkFailureSource(failure, ['integrity'], 'the integrity failures')
