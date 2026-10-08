@@ -48,6 +48,9 @@ import {
   buildStatus,
   CANARY_FILE_NAME,
   CANARY_LENGTH,
+  CI_LABEL,
+  CI_LABEL_VALUE,
+  CI_LIVE_TEMP_DIR_VARIABLES,
   CI_REQUIRES_KEYWORD,
   compareCanonical,
   CONTAINER_ID_PATTERN,
@@ -62,6 +65,7 @@ import {
   containerRemoveArgs,
   containerRunArgs,
   containerStateInspectArgs,
+  CPUS_PER_SHARD,
   createRunnerLog,
   DEPENDENCY_FINGERPRINT_FILE_NAME,
   derivedImageBuildArgs,
@@ -74,10 +78,12 @@ import {
   DURATION_TABLE_PATH,
   fileNameNumber,
   formatHexRecord,
+  formatOwner,
   formatResultFile,
   formatResultLine,
   formatRunnerLogFirstLine,
   formatRunTag,
+  GIB_BYTES,
   IMAGE_ID_PATTERN,
   IMAGE_INSPECT_FORMAT,
   imageInspectArgs,
@@ -91,9 +97,12 @@ import {
   numberFormOf,
   OWNER_LABEL,
   PACKAGE_SHA256_FILE_NAME,
+  parseReservation,
   parseResultLine,
   parseRunTag,
   PRUNE_ALREADY_RUNNING_TEXT,
+  RESERVATION_FORMAT_VERSION,
+  reservationFileName,
   RESULT_FILE_NAME,
   RESULTS_FILE_NAME,
   RESULTS_FORMAT_VERSION,
@@ -104,6 +113,7 @@ import {
   RUNNER_LOG_FILE_NAME,
   RUNNER_PATH_SUFFIX,
   SCRIPT_LOG_SUFFIX,
+  serializeReservation,
   serializeResults,
   serializeStatus,
   SHA256_HEX_LENGTH,
@@ -121,11 +131,21 @@ import {
   writeStatusFile,
   writeVerdictFile,
   writeWholeFile,
+  type BadReservationFile,
+  type DepRead,
   type ImageListFilter,
+  type ListedReservation,
+  type Owner,
   type ProcRead,
   type RefusalKind,
+  type Reservation,
+  type ReservationListing,
+  type ReservationListingFailure,
+  type ReservationListingRead,
+  type ReservationReader,
   type ResultEvent,
   type Results,
+  type RunKind,
   type RunnerClock,
   type RunnerDeps,
   type RunStatus,
@@ -139,8 +159,25 @@ import {
   type StatusPhase,
   type TrappedSignal,
   type Unreadable,
+  type VolumeReading,
   type WriteResult,
 } from '../../scripts/ci-run.ts'
+// `/ci-live`'s own names and paths, for the `/ci-live` builder (section 9).
+import {
+  CONTAINER_LABEL,
+  CONTAINER_LABEL_KEY,
+  CONTAINER_MEMORY,
+  CONTAINER_OWNER_LABEL_KEY,
+  containerName,
+  isLiveContainerName,
+  parseMemorySize,
+} from '../../ci-live/lib/docker.ts'
+import {
+  CONFIG_DIR_ENV,
+  defaultConfigDir,
+  dryRunLockFile,
+  realRunLockFile,
+} from '../../ci-live/lib/paths.ts'
 // Libc's flock for the lock probe (section 3).
 import { dlopen, FFIType } from 'bun:ffi'
 import { createHash } from 'node:crypto'
@@ -156,6 +193,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  rmSync,
   symlinkSync,
   truncateSync,
   writeFileSync,
@@ -3277,6 +3315,897 @@ export function makeResultsDir(tempDir: string, spec: ResultsDirSpec): string {
 // ---------------------------------------------------------------------------
 // 9. Cgroups, /ci-live and readings (E6)
 // ---------------------------------------------------------------------------
+//
+// Constructed host state for admission (b.uqm SR-21.4), never the host's own
+// (b.uqm SR-21.7). Every file is written below a root the caller made with
+// `mkdtempSync`; nothing here reads `/sys/fs/cgroup`, a real home or `/tmp`.
+//
+// - The cgroup builder (`createCgroupTree`): a directory standing for the
+//   cgroup-namespace root, with the runner's `readCgroupFile` dependency over
+//   it (the real binding's path rule; `/` is the root itself). It writes the
+//   namespace root (`memory.current`, `memory.max`, `memory.stat`), a nested
+//   cgroup on the runner's own path with its own limit, and container cgroups
+//   (`memory.current`, `memory.stat`, `memory.events`, `pids.current`) under
+//   any parent. Any file can be removed, emptied, garbled, made unreadable or
+//   stripped of one key. `addCgroupContainer` adds a container to the fake
+//   container interface (section 4) whose main process carries that cgroup as
+//   its membership line, so the runner finds it as b.uqm SR-7.2 asks: through
+//   `State.Pid`, then that PID's `/proc/<pid>/cgroup` (section 2).
+// - The `/ci-live` builder: `run.lock` in `/ci-live`'s default config
+//   directory under a constructed home, another config directory that a
+//   `CSCB_LIVE_CONFIG_DIR` value names, the dry-run lock in a temporary
+//   directory that a constructed `TMPDIR`, `TMP` or `TEMP` names, each lock's
+//   holder in the process table, and `cscb-live=1` containers named by
+//   `/ci-live`'s own `containerName`. Every path and name comes from
+//   `/ci-live`'s own exports, so the runner's copies are tested against them.
+//   The flock probe is section 3's.
+// - The readings builder (`buildAdmissionReadings`): figures given in GiB and
+//   written in whole bytes by one rule (`gibToBytes`), through the cgroup
+//   builder, the fake container interface and a fake volume dependency
+//   (`createFakeVolume`). Every file can be written again, so a later sample
+//   sequence (E7) reuses the same tree. Beside it, reservation-listing
+//   results for a stub reader, each valid reservation built through the
+//   runner's own serializer and parser.
+//
+// No PRD example figure is preset here: every figure is the caller's.
+
+// --- 9/T6.S1: cgroup trees and container main PIDs ---
+
+/**
+ * The cgroup v2 file names the builders write: test data, the kernel's own
+ * interface, which the runner's reads must match (the runner keeps its own
+ * names in section 10; none is a section 2 constant). `memory.stat` and
+ * `memory.events` are written with more keys than the runner reads, in the
+ * kernel's order, some sharing a prefix with a key it reads (`anon_thp`,
+ * `inactive_anon`, `oom`); `inactive_anon` and `oom` hold a value unlike
+ * `anon`'s and `oom_kill`'s, so a reader must match whole keys.
+ */
+export const CGROUP_FILE = {
+  current: 'memory.current',
+  max: 'memory.max',
+  stat: 'memory.stat',
+  events: 'memory.events',
+  pids: 'pids.current',
+} as const
+
+/** One cgroup file the builders write. */
+export type CgroupFileName = (typeof CGROUP_FILE)[keyof typeof CGROUP_FILE]
+
+/** `memory.max`'s text for no limit: the kernel's word. */
+export const CGROUP_UNLIMITED = 'max'
+
+/** The cgroup v2 line of `/proc/<pid>/cgroup`, `0::<path>`: the kernel's form. */
+const CGROUP_MEMBERSHIP_PREFIX = '0::'
+/** Container cgroups' parent when the caller names none: Docker's cgroupfs layout on this host (b.uqm SR-7.2). Test data. */
+const DEFAULT_CONTAINER_CGROUP_PARENT = '/docker'
+/** What a garbled cgroup file holds when the caller gives no text: no number, and no `key value` line. */
+const GARBLED_CGROUP_TEXT = 'garbled: not a cgroup value\n'
+
+/** A cgroup's membership line, as `/proc/<pid>/cgroup` gives it for a process in it. */
+export function cgroupMembershipLine(cgroupPath: string): string {
+  return `${CGROUP_MEMBERSHIP_PREFIX}${cgroupPath}`
+}
+
+/** The namespace root's, or a nested cgroup's, memory files, in whole bytes. */
+export interface PodCgroupBytes {
+  /** `memory.max`: a byte count, or `max` for no limit. */
+  readonly maxBytes: number | typeof CGROUP_UNLIMITED
+  readonly currentBytes: number
+  /** `anon` in `memory.stat`. */
+  readonly anonBytes: number
+  /** `active_file` in `memory.stat`. */
+  readonly activeFileBytes: number
+  /** `inactive_file` in `memory.stat`. */
+  readonly inactiveFileBytes: number
+}
+
+/** A container cgroup's files, in whole bytes and counts. */
+export interface ContainerCgroupBytes {
+  readonly currentBytes: number
+  /** `anon` in `memory.stat`. */
+  readonly anonBytes: number
+  /** `file` in `memory.stat`: its page cache, active and inactive. */
+  readonly fileBytes: number
+  /** `inactive_file` in `memory.stat`. */
+  readonly inactiveFileBytes: number
+  /** `pids.current`. */
+  readonly pidCount: number
+  /** `oom_kill` in `memory.events`. */
+  readonly oomKillCount: number
+}
+
+/** A named change to one cgroup file. */
+export type CgroupFileChange =
+  | {
+      /** The file is gone. */
+      readonly kind: 'removed'
+    }
+  | {
+      /** The file holds nothing. */
+      readonly kind: 'empty'
+    }
+  | {
+      /** The file holds `text` (default: no number and no `key value` line). */
+      readonly kind: 'garbled'
+      readonly text?: string
+    }
+  | {
+      /** A directory stands where the file was, so every read of it fails, whoever reads it. */
+      readonly kind: 'unreadable'
+    }
+  | {
+      /** A `key value` file (`memory.stat`, `memory.events`) without its line for `key`. */
+      readonly kind: 'without-key'
+      readonly key: string
+    }
+
+/** One read through the tree's `readCgroupFile`. */
+export interface CgroupFileRead {
+  readonly cgroupPath: string
+  readonly fileName: string
+  /** The file read under the tree; null when the arguments were refused. */
+  readonly path: string | null
+  readonly ok: boolean
+}
+
+/** A constructed cgroup-namespace root and everything below it. */
+export interface CgroupTree {
+  /** The directory standing for the namespace root (`/sys/fs/cgroup` in the real binding). */
+  readonly dir: string
+  /** Where a cgroup, or one of its files, lies in the tree. Throws for a path that is not absolute or holds a `.` or `..` segment. */
+  pathOf(cgroupPath: string, fileName?: string): string
+  /** Writes one file of one cgroup, creating the cgroup; answers its path. */
+  writeFile(cgroupPath: string, fileName: string, text: string): string
+  /** Writes `memory.current`, `memory.max` and `memory.stat` of the namespace root (`/`) or of a nested cgroup. */
+  writePod(cgroupPath: string, bytes: PodCgroupBytes): void
+  /** Writes a container cgroup's `memory.current`, `memory.stat`, `memory.events` and `pids.current`. */
+  writeContainer(cgroupPath: string, bytes: ContainerCgroupBytes): void
+  /** Applies one change to one written file. */
+  change(cgroupPath: string, fileName: CgroupFileName, change: CgroupFileChange): void
+  /** The runner's `readCgroupFile` dependency over this tree. */
+  readonly readCgroupFile: RunnerDeps['readCgroupFile']
+  /** Every read made through `readCgroupFile`, in order. */
+  reads(): readonly CgroupFileRead[]
+}
+
+/** Throws unless every value is a whole, non-negative byte count or count. */
+function assertWholeCounts(what: string, values: Readonly<Record<string, number>>): void {
+  for (const [name, value] of Object.entries(values)) {
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${what}: ${name} ${value} is not a whole, non-negative number`)
+  }
+}
+
+/** A `memory.stat` text: the keys the runner reads among others, in the kernel's order. */
+function memoryStatText(stat: { readonly anonBytes: number; readonly fileBytes: number; readonly activeFileBytes: number; readonly inactiveFileBytes: number }): string {
+  const rows: readonly (readonly [string, number])[] = [
+    ['anon', stat.anonBytes],
+    ['file', stat.fileBytes],
+    ['kernel', 0],
+    ['shmem', 0],
+    ['file_mapped', 0],
+    ['anon_thp', 0],
+    // Unlike `anon`, so a reader matching `anon` as a prefix reads the wrong figure.
+    ['inactive_anon', stat.anonBytes + 1],
+    ['active_anon', 0],
+    ['inactive_file', stat.inactiveFileBytes],
+    ['active_file', stat.activeFileBytes],
+    ['unevictable', 0],
+  ]
+  return rows.map(([key, value]) => `${key} ${value}\n`).join('')
+}
+
+/** A `memory.events` text, in the kernel's order. */
+function memoryEventsText(oomKillCount: number): string {
+  const rows: readonly (readonly [string, number])[] = [
+    ['low', 0],
+    ['high', 0],
+    ['max', 0],
+    // Unlike `oom_kill`, so a reader matching `oom` as a prefix of `oom_kill`, or the reverse, reads the wrong figure.
+    ['oom', oomKillCount + 1],
+    ['oom_kill', oomKillCount],
+    ['oom_group_kill', 0],
+  ]
+  return rows.map(([key, value]) => `${key} ${value}\n`).join('')
+}
+
+/** A thrown value's message on one line. */
+function oneLineError(err: unknown): string {
+  const text = err instanceof Error ? err.message : String(err)
+  return text.replace(/\s*[\r\n]+\s*/g, ' ').trim()
+}
+
+/** Whether a cgroup path stays below the namespace root: absolute, with no `.` or `..` segment (the real binding's rule). */
+function isCgroupPathBelowRoot(cgroupPath: string): boolean {
+  return cgroupPath.startsWith('/') && !cgroupPath.split('/').some((segment) => segment === '.' || segment === '..')
+}
+
+/** Whether a name can be one cgroup file's (the real binding's rule). */
+function isCgroupFileName(fileName: string): boolean {
+  return fileName !== '' && !fileName.includes('/') && fileName !== '.' && fileName !== '..'
+}
+
+/**
+ * Builds a cgroup tree in a new directory `dirName` (default `cgroup`) under
+ * `root`, a directory the caller made with `mkdtempSync`. Its
+ * `readCgroupFile` reads `<dir>/<cgroupPath>/<fileName>` and answers a
+ * failure on one line, never a throw, for a missing or unreadable file, as
+ * the real binding does over `/sys/fs/cgroup`.
+ */
+export function createCgroupTree(root: string, options: { readonly dirName?: string } = {}): CgroupTree {
+  const dir = join(root, options.dirName ?? 'cgroup')
+  mkdirSync(dir)
+  const readLog: CgroupFileRead[] = []
+
+  function pathOf(cgroupPath: string, fileName?: string): string {
+    if (!isCgroupPathBelowRoot(cgroupPath)) throw new Error(`cgroup tree: not a cgroup path below the namespace root: ${cgroupPath}`)
+    if (fileName !== undefined && !isCgroupFileName(fileName)) throw new Error(`cgroup tree: not a cgroup file name: ${fileName}`)
+    const segments = cgroupPath.split('/').filter((segment) => segment !== '')
+    return fileName === undefined ? join(dir, ...segments) : join(dir, ...segments, fileName)
+  }
+
+  function writeFile(cgroupPath: string, fileName: string, text: string): string {
+    const path = pathOf(cgroupPath, fileName)
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, text)
+    return path
+  }
+
+  return {
+    dir,
+    pathOf,
+    writeFile,
+    writePod(cgroupPath, bytes) {
+      const { maxBytes, ...counts } = bytes
+      assertWholeCounts(`cgroup tree ${cgroupPath}`, maxBytes === CGROUP_UNLIMITED ? counts : { ...counts, maxBytes })
+      writeFile(cgroupPath, CGROUP_FILE.current, `${bytes.currentBytes}\n`)
+      writeFile(cgroupPath, CGROUP_FILE.max, `${maxBytes}\n`)
+      writeFile(
+        cgroupPath,
+        CGROUP_FILE.stat,
+        memoryStatText({
+          anonBytes: bytes.anonBytes,
+          fileBytes: bytes.activeFileBytes + bytes.inactiveFileBytes,
+          activeFileBytes: bytes.activeFileBytes,
+          inactiveFileBytes: bytes.inactiveFileBytes,
+        }),
+      )
+    },
+    writeContainer(cgroupPath, bytes) {
+      assertWholeCounts(`cgroup tree ${cgroupPath}`, { ...bytes })
+      writeFile(cgroupPath, CGROUP_FILE.current, `${bytes.currentBytes}\n`)
+      writeFile(
+        cgroupPath,
+        CGROUP_FILE.stat,
+        memoryStatText({
+          anonBytes: bytes.anonBytes,
+          fileBytes: bytes.fileBytes,
+          activeFileBytes: Math.max(0, bytes.fileBytes - bytes.inactiveFileBytes),
+          inactiveFileBytes: bytes.inactiveFileBytes,
+        }),
+      )
+      writeFile(cgroupPath, CGROUP_FILE.events, memoryEventsText(bytes.oomKillCount))
+      writeFile(cgroupPath, CGROUP_FILE.pids, `${bytes.pidCount}\n`)
+    },
+    change(cgroupPath, fileName, change) {
+      const path = pathOf(cgroupPath, fileName)
+      if (!existsSync(path)) throw new Error(`cgroup tree: no ${fileName} in ${cgroupPath} to change`)
+      switch (change.kind) {
+        case 'removed':
+          rmSync(path, { recursive: true })
+          break
+        case 'empty':
+          writeFileSync(path, '')
+          break
+        case 'garbled':
+          writeFileSync(path, change.text ?? GARBLED_CGROUP_TEXT)
+          break
+        case 'unreadable':
+          rmSync(path, { recursive: true })
+          mkdirSync(path)
+          break
+        case 'without-key': {
+          const lines = textLines(readFileSync(path, 'utf-8'))
+          const kept = lines.filter((line) => line.split(' ')[0] !== change.key)
+          if (kept.length === lines.length) throw new Error(`cgroup tree: ${fileName} in ${cgroupPath} has no key ${JSON.stringify(change.key)}`)
+          writeFileSync(path, linesText(kept))
+          break
+        }
+      }
+    },
+    readCgroupFile(cgroupPath, fileName) {
+      if (!isCgroupPathBelowRoot(cgroupPath) || !isCgroupFileName(fileName)) {
+        readLog.push({ cgroupPath, fileName, path: null, ok: false })
+        return { ok: false, error: `not a cgroup file below the namespace root: ${cgroupPath} ${fileName}` }
+      }
+      const path = pathOf(cgroupPath, fileName)
+      try {
+        const value = readFileSync(path, 'utf-8')
+        readLog.push({ cgroupPath, fileName, path, ok: true })
+        return { ok: true, value }
+      } catch (err) {
+        readLog.push({ cgroupPath, fileName, path, ok: false })
+        return { ok: false, error: oneLineError(err) }
+      }
+    },
+    reads: () => [...readLog],
+  }
+}
+
+/** A container whose main process lies in a constructed cgroup. */
+export interface CgroupContainerSpec {
+  readonly name: string
+  /** Its labels (with `ciShardLabels` for a `/ci` shard container). */
+  readonly labels?: Readonly<Record<string, string>>
+  /** Its memory cap in bytes; null (default) for none. */
+  readonly memoryCapBytes?: number | null
+  /** Running (default), or stopped: its main PID is then 0. */
+  readonly running?: boolean
+  /** Its cgroup's parent below the namespace root, Docker-like or not (default `/docker`). */
+  readonly parent?: string
+  /** Its whole cgroup path, instead of `<parent>/<id>`. */
+  readonly cgroupPath?: string
+  /** Its cgroup files; null writes none. Default: all 0 while running, none once stopped (Docker removes the cgroup). */
+  readonly figures?: ContainerCgroupBytes | null
+  /** `unreadable`: every state reading answers `State.Pid` unreadable, which fails the whole state inspect (section 4). */
+  readonly mainPid?: 'readable' | 'unreadable'
+  /**
+   * Its main process's `/proc/<pid>/cgroup`: `readable` (default) answers the
+   * cgroup's membership line, `unreadable` cannot be read, and `{ line }`
+   * answers that text instead (say, a cgroup v1 line with no `0::` line).
+   * The cgroup's files are written at its path whichever is chosen.
+   */
+  readonly membership?: 'readable' | 'unreadable' | { readonly line: string }
+  /** Its image, by tag or ID. */
+  readonly image?: string
+}
+
+/** A container added with its cgroup. */
+export interface CgroupContainer {
+  readonly id: string
+  readonly name: string
+  /** Its main PID (`State.Pid`); 0 when stopped. */
+  readonly pid: number
+  readonly cgroupPath: string
+  /** The membership text its main process answers: the cgroup's line, or the caller's `{ line }`. */
+  readonly membershipLine: string
+  /** The files written; null when none were. */
+  readonly figures: ContainerCgroupBytes | null
+}
+
+/** A container cgroup's files at all 0. */
+const ZERO_CONTAINER_CGROUP: ContainerCgroupBytes = { currentBytes: 0, anonBytes: 0, fileBytes: 0, inactiveFileBytes: 0, pidCount: 0, oomKillCount: 0 }
+
+/**
+ * Adds a container to the fake container interface with its cgroup in the
+ * tree. Its main process (section 2's table, through the fake) answers the
+ * cgroup's membership line, and the state inspect answers that process's PID
+ * as `State.Pid`. The cgroup's path is the caller's choice, so a case can put
+ * it under a parent named unlike Docker's layout: the runner must find it
+ * through the PID, never from the container's ID or name.
+ */
+export function addCgroupContainer(docker: FakeDocker, tree: CgroupTree, spec: CgroupContainerSpec): CgroupContainer {
+  const running = spec.running ?? true
+  const id = sha256Hex(`fake cgroup container ${spec.name}`)
+  const cgroupPath = spec.cgroupPath ?? join(spec.parent ?? DEFAULT_CONTAINER_CGROUP_PARENT, id)
+  const membershipLine = typeof spec.membership === 'object' ? spec.membership.line : cgroupMembershipLine(cgroupPath)
+  const figures = spec.figures === undefined ? (running ? ZERO_CONTAINER_CGROUP : null) : spec.figures
+  if (spec.memoryCapBytes != null) assertWholeCounts(`container ${spec.name}`, { memoryCapBytes: spec.memoryCapBytes })
+  docker.addContainer({
+    id,
+    name: spec.name,
+    ...(spec.image === undefined ? {} : { image: spec.image }),
+    labels: { ...(spec.labels ?? {}) },
+    running,
+    memoryBytes: spec.memoryCapBytes ?? 0,
+    ...(spec.mainPid === 'unreadable' ? { stateReadings: [{ pid: UNREADABLE_READING }] } : {}),
+    process: { cgroup: membershipLine, unreadable: spec.membership === 'unreadable' ? ['cgroup'] : [] },
+  })
+  if (figures !== null) tree.writeContainer(cgroupPath, figures)
+  const added = docker.container(id)
+  if (added === null) throw new Error(`addCgroupContainer: the fake lost container ${spec.name}`)
+  return { id, name: added.name, pid: added.pid, cgroupPath, membershipLine, figures }
+}
+
+/** The labels a `/ci` shard container of `owner` carries: `cscb-ci=1` and its owner label (b.uqm SR-10.1). */
+export function ciShardLabels(owner: Owner): Readonly<Record<string, string>> {
+  return { [CI_LABEL]: CI_LABEL_VALUE, [OWNER_LABEL]: formatOwner(owner) }
+}
+
+// --- 9/T6.S2: /ci-live lock files, their holders and cscb-live containers ---
+
+/** The text `/ci-live` writes in a lock file it takes: its runner's PID and a line feed, as `RunLock.acquire` (`ci-live/lib/run-lock.ts`) writes it. */
+export function ciLiveLockText(pid: number): string {
+  return `${pid}\n`
+}
+
+/** A constructed account home with `/ci-live`'s default config directory. */
+export interface CiLiveHome {
+  readonly home: string
+  /** `/ci-live`'s default config directory under it (`defaultConfigDir`). */
+  readonly configDir: string
+  /** Its real-run lock's path (`realRunLockFile`); the file exists only when text was given. */
+  readonly realRunLock: string
+}
+
+/**
+ * Makes `home` under `root` holding `/ci-live`'s default config directory,
+ * with `run.lock` holding `lockText` when given (none when null or absent).
+ * The paths are `/ci-live`'s own (`ci-live/lib/paths.ts`).
+ */
+export function makeCiLiveHome(root: string, lockText?: string | null): CiLiveHome {
+  const home = join(root, 'home')
+  const configDir = defaultConfigDir(home)
+  mkdirSync(configDir, { recursive: true })
+  const realRunLock = realRunLockFile(configDir)
+  if (lockText != null) writeFileSync(realRunLock, lockText)
+  return { home, configDir, realRunLock }
+}
+
+/** Another config directory, named by `CSCB_LIVE_CONFIG_DIR`, with its own `run.lock`. */
+export interface CiLiveConfigOverride {
+  readonly configDir: string
+  /** Its `run.lock`'s path; the file exists only when text was given. */
+  readonly runLock: string
+  /** The environment entry naming it, `CSCB_LIVE_CONFIG_DIR` (`/ci-live`'s `CONFIG_DIR_ENV`). */
+  readonly env: Readonly<Record<string, string>>
+}
+
+/** Makes a config directory under `root` that a `CSCB_LIVE_CONFIG_DIR` value names, with `run.lock` holding `lockText` when given. */
+export function makeCiLiveConfigOverride(root: string, lockText?: string | null): CiLiveConfigOverride {
+  const configDir = join(root, 'cscb-live-config-override')
+  mkdirSync(configDir, { recursive: true })
+  const runLock = realRunLockFile(configDir)
+  if (lockText != null) writeFileSync(runLock, lockText)
+  return { configDir, runLock, env: { [CONFIG_DIR_ENV]: configDir } }
+}
+
+/** One temp-directory variable `/ci-live`'s dry-run lock directory is found from: the runner's `CI_LIVE_TEMP_DIR_VARIABLES`. */
+export type TempDirVariable = (typeof CI_LIVE_TEMP_DIR_VARIABLES)[number]
+
+/** How a temp-directory variable is spelled: unset, empty, its directory, its directory with a trailing slash, or its directory with a doubled slash inside. */
+export type TempDirSpelling = 'unset' | 'empty' | 'set' | 'trailing-slash' | 'repeated-slashes'
+
+/** A dry-run lock and the environment that names its directory. */
+export interface DryRunLockSpec {
+  /** The runner's user ID, in the lock's name. */
+  readonly uid: number
+  /** Each variable's spelling (default `unset`). Each set one names its own directory under the root; at least one must be set. */
+  readonly spellings?: Readonly<Partial<Record<TempDirVariable, TempDirSpelling>>>
+  /** The variable whose directory holds the lock; null (default) for no lock file. */
+  readonly lockIn?: TempDirVariable | null
+  /** The lock's text; needed when `lockIn` is set. */
+  readonly lockText?: string
+}
+
+/** A constructed dry-run lock. */
+export interface DryRunLock {
+  /** Every variable as spelled; an unset one is `undefined`, so spreading this over a base environment unsets it. */
+  readonly env: Readonly<Record<TempDirVariable, string | undefined>>
+  /** The directory each set, non-empty variable names (created). */
+  readonly dirs: Readonly<Partial<Record<TempDirVariable, string>>>
+  /** The lock's path in `lockIn`'s directory (`dryRunLockFile`); null when none was written. */
+  readonly lockPath: string | null
+}
+
+/**
+ * Makes the dry-run lock's directories under `root`, one per set variable,
+ * and the environment naming them. The lock is written only in the directory
+ * of the variable the caller names (`lockIn`), so which variable wins is
+ * left for the runner's rule to decide, never this builder: a case that sets
+ * `TMPDIR` and `TMP` and puts the lock in `TMP`'s directory expects no lock
+ * seen. The lock's name is `/ci-live`'s own (`dryRunLockFile`).
+ *
+ * Throws unless at least one variable names a directory under `root`: with
+ * every one unset or empty, the runner falls back to the host's own `/tmp`
+ * (b.uqm SR-21.7). That fallback is for path pin cases only, which compute
+ * the path and need no builder.
+ */
+export function makeDryRunLock(root: string, spec: DryRunLockSpec): DryRunLock {
+  const env = {} as Record<TempDirVariable, string | undefined>
+  const dirs: Partial<Record<TempDirVariable, string>> = {}
+  for (const variable of CI_LIVE_TEMP_DIR_VARIABLES) {
+    const spelling = spec.spellings?.[variable] ?? 'unset'
+    if (spelling === 'unset' || spelling === 'empty') {
+      env[variable] = spelling === 'unset' ? undefined : ''
+      continue
+    }
+    const dir = join(root, `temp-${variable.toLowerCase()}`)
+    mkdirSync(dir, { recursive: true })
+    dirs[variable] = dir
+    env[variable] = spelling === 'set' ? dir : spelling === 'trailing-slash' ? `${dir}/` : `${dirname(dir)}//${basename(dir)}`
+  }
+  if (Object.keys(dirs).length === 0) {
+    throw new Error("makeDryRunLock: no temp-directory variable names a directory under the root, so the runner would use the host's /tmp")
+  }
+  const lockIn = spec.lockIn ?? null
+  if (lockIn === null) return { env, dirs, lockPath: null }
+  const lockDir = dirs[lockIn]
+  if (lockDir === undefined) throw new Error(`makeDryRunLock: ${lockIn} names no directory, so it cannot hold the lock`)
+  if (spec.lockText === undefined) throw new Error('makeDryRunLock: a lock needs its text')
+  const lockPath = dryRunLockFile(lockDir, spec.uid)
+  writeFileSync(lockPath, spec.lockText)
+  return { env, dirs, lockPath }
+}
+
+/**
+ * What a lock's PID is in the process table: a `/ci-live` runner by its path,
+ * a bare `run.ts` with a working directory in a `ci-live` directory or
+ * elsewhere, a `/ci` runner, another program, or a gone `/ci-live` runner.
+ */
+export type CiLiveLockHolder = 'runner-by-path' | 'bare-runner-in-ci-live' | 'bare-runner-elsewhere' | 'ci-runner' | 'other-program' | 'gone'
+
+/** The RUN_ID of a `/ci` runner holding a `/ci-live` lock: test data. */
+const CI_LIVE_HOLDER_RUN_ID = '20261008t120000z-cilive01'
+/** Another program's command line: test data. */
+const CI_LIVE_OTHER_PROGRAM_ARGV: readonly string[] = ['sleep', '600']
+
+/** Adds a lock's holder to the process table (section 2's builders); answers its PID. */
+export function addCiLiveLockHolder(processes: FakeProcessTable, holder: CiLiveLockHolder, options: { readonly pid?: number } = {}): number {
+  const pidOption = options.pid === undefined ? {} : { pid: options.pid }
+  switch (holder) {
+    case 'runner-by-path':
+      return processes.add(ciLiveRunnerProcess({ ...pidOption, form: 'path' }))
+    case 'bare-runner-in-ci-live':
+      return processes.add(ciLiveRunnerProcess({ ...pidOption, form: 'bare' }))
+    case 'bare-runner-elsewhere': {
+      // The bare form's command line, from the worktree root instead of its `ci-live` directory.
+      const bare = ciLiveRunnerProcess({ ...pidOption, form: 'bare' })
+      return processes.add({ ...bare, cwd: dirname(bare.cwd ?? '/') })
+    }
+    case 'ci-runner':
+      return processes.add(ciRunnerProcess(CI_LIVE_HOLDER_RUN_ID, pidOption))
+    case 'other-program':
+      return processes.add(otherProcess(CI_LIVE_OTHER_PROGRAM_ARGV, pidOption))
+    case 'gone':
+      return processes.add(ciLiveRunnerProcess({ ...pidOption, form: 'path', alive: false }))
+  }
+}
+
+/** A `/ci-live` run ID when the caller gives none: test data, `/ci-live`'s form (lowercase letters and digits). */
+const DEFAULT_CI_LIVE_RUN_ID = '20261008t120000'
+
+/** A `cscb-live=1` container to add. */
+export interface CiLiveContainerSpec {
+  /** The PID its name and owner label carry: a lock's holder, or another. Needed for the `named` form. */
+  readonly ownerPid?: number
+  /** `/ci-live`'s run ID (default test data). */
+  readonly runId?: string
+  /** `named` (default): `/ci-live`'s `containerName(runId, ownerPid)`, with the owner label; `bare`: an older runner's `cscb-live-<run id>`, with no PID and no owner label. */
+  readonly form?: 'named' | 'bare'
+  /** Running (default), or stopped. */
+  readonly running?: boolean
+}
+
+/** A `cscb-live=1` container as added. */
+export interface CiLiveContainer {
+  readonly id: string
+  readonly name: string
+}
+
+/**
+ * Adds a `cscb-live=1` container to the fake container interface, named by
+ * `/ci-live`'s own `containerName` and labelled and capped as `/ci-live`'s
+ * `buildRunArgs` does (`CONTAINER_LABEL`, the owner label, `CONTAINER_MEMORY`),
+ * so a case tests the runner's matching rule against `/ci-live`'s real naming.
+ */
+export function addCiLiveContainer(docker: FakeDocker, spec: CiLiveContainerSpec = {}): CiLiveContainer {
+  const runId = spec.runId ?? DEFAULT_CI_LIVE_RUN_ID
+  const form = spec.form ?? 'named'
+  const labelValue = CONTAINER_LABEL.slice(`${CONTAINER_LABEL_KEY}=`.length)
+  const memoryBytes = parseMemorySize(CONTAINER_MEMORY)
+  if (memoryBytes === null) throw new Error(`addCiLiveContainer: /ci-live's CONTAINER_MEMORY ${CONTAINER_MEMORY} is no size`)
+  let name: string
+  const labels: Record<string, string> = { [CONTAINER_LABEL_KEY]: labelValue }
+  if (form === 'named') {
+    if (spec.ownerPid === undefined) throw new Error('addCiLiveContainer: a named cscb-live container needs its owner PID')
+    name = containerName(runId, spec.ownerPid)
+    labels[CONTAINER_OWNER_LABEL_KEY] = String(spec.ownerPid)
+  } else {
+    // An older runner's name: `containerName`'s with its `-<PID>` ending taken off.
+    const anyPid = 1
+    const withPid = containerName(runId, anyPid)
+    name = withPid.slice(0, -`-${anyPid}`.length)
+  }
+  if (!isLiveContainerName(name)) throw new Error(`addCiLiveContainer: ${name} is no /ci-live container name`)
+  const id = docker.addContainer({ name, labels, running: spec.running ?? true, memoryBytes })
+  return { id, name }
+}
+
+// --- 9/T6.S3: readings in GiB, and reservation-listing results ---
+
+/**
+ * GiB to whole bytes, the readings builder's one rule: the figure times
+ * `GIB_BYTES` (2^30), rounded to the nearest byte, a half byte up
+ * (`Math.round`). Multiplying by a power of two is exact in floating point,
+ * so the only rounding is this one. Each figure is converted on its own, and
+ * a total the builder writes (`memory.current`) is the sum of its converted
+ * parts, so a case computes every expected byte count with this function.
+ * Throws for a figure that is negative, not finite, or too large for whole
+ * bytes.
+ */
+export function gibToBytes(gib: number): number {
+  if (!Number.isFinite(gib) || gib < 0) throw new Error(`gibToBytes: ${gib} is no GiB figure`)
+  const bytes = Math.round(gib * GIB_BYTES)
+  if (!Number.isSafeInteger(bytes)) throw new Error(`gibToBytes: ${gib} GiB is too large for whole bytes`)
+  return bytes
+}
+
+/** The namespace root's (or a nested cgroup's) figures in GiB. */
+export interface PodFigures {
+  /** L, its `memory.max`; `max` for no limit. */
+  readonly limitGib: number | typeof CGROUP_UNLIMITED
+  /** W (default 0): anon, active page cache and the rest. */
+  readonly workingSetGib?: number
+  /** W's anon part (default 0). */
+  readonly anonGib?: number
+  /** W's active page cache (default 0). */
+  readonly activeFileGib?: number
+  /** `inactive_file` (default 0), outside W. */
+  readonly inactiveFileGib?: number
+  /** `memory.current` itself, instead of W plus `inactive_file`: for an `inactive_file` above it, W floored at 0. Not with `workingSetGib`. */
+  readonly currentGib?: number
+}
+
+/** Pod figures in whole bytes, as written. */
+export interface PodBytes extends PodCgroupBytes {
+  /** W as b.uqm SR-7.1 reads it from these files: `memory.current` minus `inactive_file`, floored at 0. */
+  readonly workingSetBytes: number
+  /** W's rest: W minus anon and active page cache, floored at 0. */
+  readonly restBytes: number
+}
+
+/** Converts pod figures to whole bytes by `gibToBytes`. Throws when anon and active page cache exceed a given W. */
+export function podBytes(figures: PodFigures): PodBytes {
+  if (figures.currentGib !== undefined && figures.workingSetGib !== undefined) throw new Error('podBytes: give W or memory.current, not both')
+  const maxBytes = figures.limitGib === CGROUP_UNLIMITED ? CGROUP_UNLIMITED : gibToBytes(figures.limitGib)
+  const anonBytes = gibToBytes(figures.anonGib ?? 0)
+  const activeFileBytes = gibToBytes(figures.activeFileGib ?? 0)
+  const inactiveFileBytes = gibToBytes(figures.inactiveFileGib ?? 0)
+  if (figures.currentGib !== undefined) {
+    const currentBytes = gibToBytes(figures.currentGib)
+    const workingSetBytes = Math.max(0, currentBytes - inactiveFileBytes)
+    return { maxBytes, currentBytes, anonBytes, activeFileBytes, inactiveFileBytes, workingSetBytes, restBytes: Math.max(0, workingSetBytes - anonBytes - activeFileBytes) }
+  }
+  const workingSetBytes = gibToBytes(figures.workingSetGib ?? 0)
+  const restBytes = workingSetBytes - anonBytes - activeFileBytes
+  if (restBytes < 0) throw new Error('podBytes: anon and active page cache exceed W')
+  return { maxBytes, currentBytes: workingSetBytes + inactiveFileBytes, anonBytes, activeFileBytes, inactiveFileBytes, workingSetBytes, restBytes }
+}
+
+/** One container's figures in GiB, with how it is added (as `addCgroupContainer`). */
+export interface ContainerGibFigures extends Omit<CgroupContainerSpec, 'memoryCapBytes' | 'figures'> {
+  /** Its memory cap; null for none. */
+  readonly capGib: number | null
+  /** Its current memory, `memory.current` minus `inactive_file` (default 0). */
+  readonly memoryGib?: number
+  /** `anon` (default 0). */
+  readonly anonGib?: number
+  /** `file` (default: its `inactive_file`). */
+  readonly fileGib?: number
+  /** `inactive_file` (default 0). */
+  readonly inactiveFileGib?: number
+  /** `pids.current` (default 0). */
+  readonly pidCount?: number
+  /** `oom_kill` (default 0). */
+  readonly oomKillCount?: number
+  /** Write no cgroup files (as for a stopped container, whose cgroup is gone). */
+  readonly noCgroup?: boolean
+}
+
+/** A container's cgroup files in whole bytes, by `gibToBytes`: `memory.current` is its memory plus its `inactive_file`. */
+export function containerBytes(figures: ContainerGibFigures): ContainerCgroupBytes {
+  const inactiveFileBytes = gibToBytes(figures.inactiveFileGib ?? 0)
+  return {
+    currentBytes: gibToBytes(figures.memoryGib ?? 0) + inactiveFileBytes,
+    anonBytes: gibToBytes(figures.anonGib ?? 0),
+    fileBytes: figures.fileGib === undefined ? inactiveFileBytes : gibToBytes(figures.fileGib),
+    inactiveFileBytes,
+    pidCount: figures.pidCount ?? 0,
+    oomKillCount: figures.oomKillCount ?? 0,
+  }
+}
+
+/** The volume holding the run directory, in GiB. */
+export interface VolumeFigures {
+  readonly mountPoint: string
+  readonly usedGib: number
+  readonly availableGib: number
+}
+
+/** A volume reading in whole bytes, by `gibToBytes`. */
+export function volumeBytes(figures: VolumeFigures): VolumeReading {
+  return { mountPoint: figures.mountPoint, usedBytes: gibToBytes(figures.usedGib), availableBytes: gibToBytes(figures.availableGib) }
+}
+
+/** What the fake volume dependency answers: a reading, or a failure with its error. */
+export type VolumeAnswer = VolumeReading | { readonly error: string }
+
+/** The runner's `readVolume` dependency over a constructed answer. */
+export interface FakeVolume {
+  readonly readVolume: RunnerDeps['readVolume']
+  /** Answers every later read with this. */
+  set(answer: VolumeAnswer): void
+  /** Every path asked about, in order. */
+  paths(): readonly string[]
+}
+
+/** Builds the fake volume dependency: it answers every path with the one constructed answer, and records the paths. */
+export function createFakeVolume(answer: VolumeAnswer): FakeVolume {
+  let current = answer
+  const asked: string[] = []
+  return {
+    readVolume(path): DepRead<VolumeReading> {
+      asked.push(path)
+      return 'error' in current ? { ok: false, error: current.error } : { ok: true, value: { ...current } }
+    },
+    set(next) {
+      current = next
+    },
+    paths: () => [...asked],
+  }
+}
+
+/** The admission readings to construct, every figure in GiB. */
+export interface AdmissionReadingsSpec {
+  /** The namespace root: L, W and its parts. */
+  readonly pod: PodFigures
+  /** A nested cgroup on the runner's own path, with its own (smaller) limit; the caller puts the runner's process in it with `membershipLine`. */
+  readonly runnerCgroup?: {
+    readonly path: string
+    readonly pod: PodFigures
+  }
+  /** The run directory's volume, or the error its reading fails with. */
+  readonly volume: VolumeFigures | { readonly error: string }
+  /** Containers, each with its cgroup. */
+  readonly containers?: readonly ContainerGibFigures[]
+}
+
+/** Constructed admission readings, with the bytes written. */
+export interface BuiltAdmissionReadings {
+  readonly cgroups: CgroupTree
+  readonly volume: FakeVolume
+  /** The namespace root's bytes. */
+  readonly pod: PodBytes
+  /** The nested cgroup on the runner's own path; null when none. */
+  readonly runnerCgroup: {
+    readonly path: string
+    readonly membershipLine: string
+    readonly pod: PodBytes
+  } | null
+  /** The volume reading answered; null for a failing one. */
+  readonly volumeReading: VolumeReading | null
+  /** The containers, in the order given. */
+  readonly containers: readonly CgroupContainer[]
+  /** The runner's cgroup and volume dependencies over them. */
+  readonly deps: Pick<RunnerDeps, 'readCgroupFile' | 'readVolume'>
+}
+
+/**
+ * Builds admission's readings under `root` (a `mkdtempSync` directory) from
+ * GiB figures: the namespace root and an optional nested cgroup in a new
+ * cgroup tree, each container in the fake container interface with its
+ * cgroup, and the volume answer. Every byte count is `gibToBytes` of its
+ * figure; the answers' bytes are returned for the case's expectations.
+ */
+export function buildAdmissionReadings(root: string, docker: FakeDocker, spec: AdmissionReadingsSpec): BuiltAdmissionReadings {
+  const cgroups = createCgroupTree(root)
+  const pod = podBytes(spec.pod)
+  cgroups.writePod('/', pod)
+  let runnerCgroup: BuiltAdmissionReadings['runnerCgroup'] = null
+  if (spec.runnerCgroup !== undefined) {
+    const nested = podBytes(spec.runnerCgroup.pod)
+    cgroups.writePod(spec.runnerCgroup.path, nested)
+    runnerCgroup = { path: spec.runnerCgroup.path, membershipLine: cgroupMembershipLine(spec.runnerCgroup.path), pod: nested }
+  }
+  const volumeReading = 'error' in spec.volume ? null : volumeBytes(spec.volume)
+  const volume = createFakeVolume('error' in spec.volume ? { error: spec.volume.error } : volumeBytes(spec.volume))
+  const containers = (spec.containers ?? []).map((figures) => {
+    const { capGib, memoryGib: _memory, anonGib: _anon, fileGib: _file, inactiveFileGib: _inactive, pidCount: _pids, oomKillCount: _kills, noCgroup, ...rest } = figures
+    // A stopped container's cgroup is gone, as Docker removes it.
+    const withCgroup = noCgroup !== true && (figures.running ?? true)
+    return addCgroupContainer(docker, cgroups, {
+      ...rest,
+      memoryCapBytes: capGib === null ? null : gibToBytes(capGib),
+      figures: withCgroup ? containerBytes(figures) : null,
+    })
+  })
+  return { cgroups, volume, pod, runnerCgroup, volumeReading, containers, deps: { readCgroupFile: cgroups.readCgroupFile, readVolume: volume.readVolume } }
+}
+
+/** A reservation to build. */
+export interface ReservationSpec {
+  readonly owner: Owner
+  /** N. */
+  readonly shards: number
+  /** Default `full`. */
+  readonly kind?: RunKind
+  /** Default N × the cap (`SHARD_MEMORY_CAP_BYTES`), as a run writes it (b.uqm SR-6.2). */
+  readonly memoryBytes?: number
+  /** Default N × `CPUS_PER_SHARD` (b.uqm SR-6.2). */
+  readonly cpus?: number
+}
+
+/** A reservation's valid file text, through the runner's own serializer. */
+export function reservationText(spec: ReservationSpec): string {
+  return serializeReservation({
+    version: RESERVATION_FORMAT_VERSION,
+    runId: spec.owner.runId,
+    pid: spec.owner.pid,
+    shards: spec.shards,
+    memoryBytes: spec.memoryBytes ?? spec.shards * SHARD_MEMORY_CAP_BYTES,
+    cpus: spec.cpus ?? spec.shards * CPUS_PER_SHARD,
+    kind: spec.kind ?? 'full',
+  })
+}
+
+/** A reservation built through the runner's serializer and read back with its parser; never hand-written. */
+export function makeReservation(spec: ReservationSpec): Reservation {
+  const parsed = parseReservation(reservationText(spec))
+  if (!parsed.ok) throw new Error(`makeReservation: the runner's parser refused its own serializer's text: ${parsed.error}`)
+  return parsed.value
+}
+
+/** A valid reservation as the reservation reader lists it, under its file name, with its owner's liveness. */
+export function listedReservation(spec: ReservationSpec & { readonly ownerAlive: boolean }): ListedReservation {
+  return { fileName: reservationFileName(spec.owner), reservation: makeReservation(spec), ownerAlive: spec.ownerAlive }
+}
+
+/** A reservation file that cannot be used: a valid one's text with a stated change. */
+export interface BadReservationSpec {
+  readonly owner: Owner
+  readonly ownerAlive: boolean
+  /** The change that spoils the valid text; its reason is the runner's parser's. */
+  readonly change: JsonFileChange
+  /** The valid reservation's N before the change (default 1). */
+  readonly shards?: number
+}
+
+/** A bad reservation file as the reader lists it: its file name, its owner's liveness, and the reason the runner's parser gives for the changed text. */
+export function badReservationFile(spec: BadReservationSpec): BadReservationFile {
+  const text = changedJsonText(reservationText({ owner: spec.owner, shards: spec.shards ?? 1 }), spec.change)
+  const parsed = parseReservation(text)
+  if (parsed.ok) throw new Error('badReservationFile: the change leaves a reservation the runner parses')
+  return { fileName: reservationFileName(spec.owner), ownerAlive: spec.ownerAlive, reason: parsed.error }
+}
+
+/** A listing that read the lock directory. */
+export function reservationListing(entries: { readonly valid?: readonly ListedReservation[]; readonly bad?: readonly BadReservationFile[] } = {}): ReservationListingRead {
+  return { kind: 'listed', valid: [...(entries.valid ?? [])], bad: [...(entries.bad ?? [])] }
+}
+
+/** A listing that failed. */
+export function failedReservationListing(error: string): ReservationListingFailure {
+  return { kind: 'failed', error }
+}
+
+/** A stub reservation reader: it answers a constructed listing and records the lock directory of each call. */
+export interface StubReservationReader {
+  /** The reader to pass to the readings step (the runner's `ReservationReader`). */
+  readonly read: ReservationReader
+  /** Answers later reads with this. */
+  set(listing: ReservationListing): void
+  /** How many times it was read. */
+  calls(): number
+  /** Every lock directory it was asked to list, in order. */
+  lockDirs(): readonly string[]
+}
+
+/** Builds a stub reservation reader over a listing (default: none listed). */
+export function stubReservationReader(listing: ReservationListing = reservationListing()): StubReservationReader {
+  let current = listing
+  const asked: string[] = []
+  return {
+    read: (lockDir) => {
+      asked.push(lockDir)
+      return current
+    },
+    set(next) {
+      current = next
+    },
+    calls: () => asked.length,
+    lockDirs: () => [...asked],
+  }
+}
 
 // ---------------------------------------------------------------------------
 // 10. Sample sequences (E7)
