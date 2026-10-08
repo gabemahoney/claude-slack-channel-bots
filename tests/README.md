@@ -3004,6 +3004,83 @@ stdout/stderr where `docker logs` can capture them — never into `verdict.txt`.
   made by reading a pane's text.
 - Retries, fix-it-yourself logic, or self-healing. A test is a strict assertion.
 
+### Fault injection
+
+A fault makes a run fail on purpose, to prove that the runner catches the
+failure. The fault controller is in `scripts/ci-run.ts`, section 16 (Faults).
+Faults are written here in their normalized form: a script is given by its
+number form (`test-23`), and k and j are shard numbers.
+
+**Activation.** Faults come only from `/ci --inject <fault>` arguments. No
+environment variable or file turns one on. `/ci` with no arguments is the gate
+run and never injects, so `/publish` and `/publish-prepare` never see an
+injected result.
+
+Each shard is given, as `--fail <file name>` arguments to `tests/runner.sh`,
+only the `fail:` faults it acts on. No other fault reaches a shard. An injected
+run's verdict carries the `INJECTED (<faults>): …` wrapper, and the verdict
+reader exits 4 for it; see Verdict file format for the wrapper.
+
+Which faults are refused, as bad arguments or as not runnable, is part of
+`/ci`'s argument checks; this subsection covers only faults that were accepted.
+
+**Each fault.** A fault is due until it fires. Its target shard and its
+firing moment are:
+
+| Fault | Target shard | Fires when |
+|---|---|---|
+| `fail:<script>` | The shard the assignment gives the script; shard 1 for test-1 | That shard reaches the script. The script is not run: it is recorded failed with `FAIL: <file name>: injected failure`, its result-file lines being `start <file name>` and `end <file name> fail 0.000`. |
+| `leak:<k>,<j>` | j | Shard j starts with shard k's subdirectory mounted read-only at `/leak-shard-<k>`. |
+| `image-drift:<k>` | k | Shard k starts from the drift image: the pinned image plus a label, so another ID with the same content. Shard k then runs normally, so only the `image-drift` integrity check should fail. |
+| `retag` | None | The run's `-test` tag moves to the retag image, once every shard's start has been attempted. No other tag changes. |
+| `timeout:<script>` | The shard the assignment gives the script; shard 1 for test-1 | The runner first sees the script in progress. It stops that shard as at its limit, with `FAIL: <file name>: wall-time limit of <m> min exceeded in shard-<k>`, m being the elapsed time since the shard's container started, rounded up to whole minutes (at least 1). |
+| `kill:<k>` | k | The runner first sees any script in progress in shard k, test-1 included. It takes that shard's final reading, then stops its container with SIGKILL, and the script fails with the cause `killed`. |
+
+A script is in progress when the shard's result file has its complete `start`
+line, no `end` line for it and no end marker. When a `timeout:` and a `kill:`
+on one shard are first seen at the same reading, the `kill:` fires, whatever
+the order of the `--inject` arguments.
+
+**Polling.** While a `timeout:` or `kill:` aimed at a started shard is still
+due, the runner reads that shard's result file every 1 s
+(`FAULT_POLL_INTERVAL_MS`). That is how even test-1, about 21 s long, is seen
+in progress. The runner never polls for faults otherwise: not in a run without
+them, and not once the shard has ended or the fault has fired.
+
+**A fault that never fires.** Every fault must fire. One that does not fails
+the run with this line, from `fault-fired`, the first integrity check:
+
+```text
+FAIL: integrity: fault-fired: <fault> did not fire (<why>)
+```
+
+`<why>` is one of nine reasons. In them, k is the shard the fault acts on (j
+for `leak:<k>,<j>`):
+
+| Reason | When it applies |
+|---|---|
+| `drift image build failed (exit <code>)` | `image-drift:<k>`: the drift image's build failed, so shard k started from the pinned image. |
+| `retag image build failed (exit <code>)` | `retag`: the retag image's build failed, so no tag moved. |
+| `tag move failed (exit <code>)` | `retag`: the `-test` tag's move failed. |
+| `shard-<k> never started` | The shard's start was attempted and its container did not start. |
+| `shard-<k> started without it` | `leak:` or `image-drift:`: the shard started without the mount or the drift image, with no build having failed. |
+| `shard-<k> ended first` | The shard ended before the fault's moment came: for example, a `kill:` whose shard ended before any script was seen in progress, or a `fail:` whose script the shard never reached. |
+| `shard-<k> reached its wall-time limit first` | The shard reached its wall-time limit before the fault's moment. |
+| `the run was stopped first` | A run-level stop came first, or the run stopped before the shard's start or the tag move was attempted. |
+| `<fault> stopped shard-<k> first` | Another fault stopped the shard first, named in its normalized form: a `timeout:` or `kill:` that fired there, or a `fail:` whose injected failure ended the shard before this fault's moment. |
+
+For example, `kill:2` with `timeout:test-23`, test-23 being in shard 2, kills
+shard 2 while test-1 runs. `timeout:test-23` does not fire, and its line ends
+`(kill:2 stopped shard-2 first)`.
+
+`fault-fired` is skipped on an image build failure, and on a run-level stop
+that comes before the end-of-run sequence starts. The summary names it as
+skipped. A stop during that sequence skips no check.
+
+**Where to look.** The unit cases for each fault, the tie rule, the polls and
+every reason are in the E12 region of `tests/ci-run-results.test.ts`. The live
+proof is the final gate's injected `/ci --inject` runs on the development host.
+
 ### Escape hatch: tests that genuinely need LLM judgment
 
 If a future test cannot be expressed as a deterministic bash assertion (e.g.
