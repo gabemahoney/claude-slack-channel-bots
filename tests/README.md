@@ -3234,13 +3234,23 @@ Every failure is listed, with its shard, in `summary.txt` and in
 
 ### Adding a new test
 
+A script that follows the naming rule (see
+[Script names, prerequisites and canonical order](#script-names-prerequisites-and-canonical-order))
+runs with no other edit: `/ci` finds it in every run, and it runs in whichever
+shard the assignment gives its scheduling unit. Make no runner edit: leave
+`tests/runner.sh`, `scripts/ci-run.ts`, `docker/entrypoint.sh` and the `/ci`
+skill as they are.
+
+There are exactly two optional steps, 4 and 5 below: a prerequisite line and a
+duration-table entry.
+
 1. Write the testplan ticket in `testplans/` (the source of truth — describes
    what is being tested and why, in human prose).
    A self-describing scenario with no ticket (as Test 0 and Tests 5 onwards) skips this
    step: its header comment lists what it checks, and its expected log
    fragments are taken from `src/` in the header or a constants block.
 2. Add `tests/integration/test-N-<short-name>.sh`, with `N` the next unused
-   number. Required shape:
+   number, with no leading zero. Required shape:
    ```bash
    #!/usr/bin/env bash
    set -euo pipefail
@@ -3274,18 +3284,121 @@ Every failure is listed, with its shard, in `summary.txt` and in
    echo "PASS: ${TEST_NAME}"
    ```
 3. Make it executable. The runner picks it up by name and runs every
-   `test-*.sh` through `bash`, so the mode bit is not what makes it run;
-   don't edit `tests/runner.sh`.
-4. Name the script in the Layout above, in the same change, by its whole file
+   `test-*.sh` through `bash`, so the mode bit is not what makes it run.
+4. Optional: when the script depends on state another script leaves, add a
+   `# ci-requires:` line to its header comment block, the `#` lines right
+   after the shebang. Its form, place and refusals are in
+   [Script names, prerequisites and canonical order](#script-names-prerequisites-and-canonical-order).
+5. Optional: add the script's duration-table entry. A script with no entry
+   still runs, with the default estimate of 2400 s; add its entry from the
+   block a later run prints (see [The duration table](#the-duration-table)).
+6. Name the script in the Layout above, in the same change, by its whole file
    name with a one-line comment on what it checks. `tests/shipped-docs.test.ts`
    (b.jg5 SRJ-1112) fails while any `tests/integration/test-*.sh` on disk is
    not named in this README. When a script is removed, record it here by its
    test number and what replaces it, never by its file name: the same check
    fails on a `test-<n>-<name>.sh` this README names that is not on disk (the
-   `test-N-<short-name>.sh` template above names no script).
-5. Run `shellcheck tests/integration/*.sh tests/integration/lib/*.sh tests/runner.sh`
+   `test-N-<short-name>.sh` template above names no script). Delete its line
+   from `tests/ci-durations.tsv` in the same change: the unit suite fails while
+   the table lists a script not on disk.
+7. Run `shellcheck tests/integration/*.sh tests/integration/lib/*.sh tests/runner.sh`
    from the repo root. `tests/integration/.shellcheckrc` lets shellcheck follow
    the helper without `-x`. The suite must stay warning-free.
+
+### The duration table
+
+`tests/ci-durations.tsv` holds each script's expected wall time in seconds.
+The runner uses it to balance the run's scheduling units across shards and to
+set each shard's wall-time limit. Scheduling reads the copy in the run's pinned
+test image.
+
+Every shard starts with test-1's estimate, since test-1 runs first in each,
+and a unit's estimate is the sum of its scripts' estimates. Units are placed
+longest first, each into the shard with the smallest expected total so far.
+Ties between units go by the canonical order of each unit's first script and
+ties between shards to the lowest shard number, so one table, one set of
+scripts and one N always give one assignment.
+
+A shard's limit is 2 × its expected total + 15 min, and at least 30 min,
+counted from its container's start.
+`--shard-timeout <minutes>` sets every shard's limit to its value instead,
+with no floor.
+
+#### Format
+
+The first line is the header `script<TAB>seconds`. Every other line is
+`test-<n><TAB><seconds>`: a script's number form, one tab, then a whole number
+above 0 and at most 9007199254740991, keyed by number form so renaming a
+script's slug keeps its entry. The lines follow canonical order (see
+[Script names, prerequisites and canonical order](#script-names-prerequisites-and-canonical-order)).
+
+Lines are split at LF, and the final LF is optional. A line holding a CR
+matches no form. The file's first lines (the gaps are tabs):
+
+```text
+script	seconds
+test-1	23
+test-2	1
+test-3	21
+```
+
+#### Defaults and notes
+
+No table content ever skips a script. A bad line is ignored and noted, a
+script with no entry gets the default estimate, and an unreadable table gives
+every script the default. Every note begins
+`duration table tests/ci-durations.tsv`, and a note about one line gives its
+line number.
+
+| Case | Effect |
+|---|---|
+| The table is missing or cannot be read, or its first line is not exactly the header (an empty file included) | Every script gets the default estimate, 2400 s, with one note |
+| A malformed line: empty, holding a CR, with no tab, with no number form before the first tab, or with seconds that are not a whole number above 0 or are above the bound | Ignored and noted |
+| A line for a script an earlier well-formed line already lists | Ignored and noted; the first is used |
+| A line for a script not in the test image's script list, such as a removed script | Ignored and noted, and left out of the block |
+| A line whose script sorts before the script of an earlier used line | Used and noted |
+| A script with no entry | The default estimate, 2400 s, with no note |
+
+#### Refreshing the table
+
+Every run that got the pinned test image's script list holds the duration-table
+block in its `summary.txt` and its timing summary. The `/ci` report prints the
+timing summary after a full or selective PASS. A run that never got that list
+has no block, no `slow:` lines and no table notes.
+
+The block follows one introducing line, where `<k>` is the number of block
+lines:
+
+```text
+duration table block, the next <k> lines: paste them as tests/ci-durations.tsv to refresh the table
+```
+
+The block is the header, then at most one line per script in the pinned list,
+in canonical order:
+
+- A script that passed gets this run's time, rounded up to whole seconds and
+  at least 1. test-1 runs in every shard, so it gets its highest time, and
+  only when it passed in every shard.
+- Every other script keeps the entry the run read from the table and used, or
+  has no line when there is none. An ignored line's entry is not carried, nor
+  is any entry of an unreadable table.
+- An entry for a script not in the list is left out.
+
+A selective run's block is therefore safe to paste: the scripts it did not run
+keep their entries.
+
+To refresh, paste the block's lines (not the introducing line) over the whole
+of `tests/ci-durations.tsv` and commit it as an ordinary change; the runner
+never writes the table. `tests/ci-run-schedule.test.ts` checks that the
+committed file parses with no note, so a paste that lost its tabs fails the
+unit suite; it does not check the seconds.
+
+A `slow: <file> took <s> s, estimate <e> s` line names a script whose time was
+more than 1.5 × its estimate (the default for a script with no entry), its
+time rounded up to whole seconds. test-1 is judged once, with its highest
+time. A `slow:` line does not fail the run; only reaching the shard's limit
+does. It means the table is stale: the balance across shards gets worse and
+the limits get tighter, so refresh it.
 
 ### What does NOT belong in a test script
 
