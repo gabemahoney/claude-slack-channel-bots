@@ -1278,6 +1278,8 @@ export interface Sample {
   readonly workingSet: Reading<WorkingSetReading>
   /** The active `/ci-live` runs; empty when none. */
   readonly ciLive: readonly CiLiveRunSeen[]
+  /** The ceiling C in force at this sample, with its source; carried from the previous sample when the `/ci-live` re-check fails (b.uqm SR-7.3, SR-7.4). */
+  readonly ceiling: MemoryCeiling
   readonly shards: readonly ShardSample[]
   readonly failedReadings: readonly FailedReading[]
 }
@@ -8739,6 +8741,896 @@ export function admissionRefusal(
 // ---------------------------------------------------------------------------
 // 11. Memory guard (E7)
 // ---------------------------------------------------------------------------
+
+// --- 11/T1 (E7 T1): the 30 s sampler, failed readings and the stop line ---
+//
+// The memory watchdog (b.uqm SR-7.3, SR-7.4). E13 creates it at run step 10
+// with admission's "before" W, L and the ceiling with its source, and calls
+// `start`. Every `SAMPLE_INTERVAL_MS` it asks `runningShards` which shards
+// run (none during the build), takes one `Sample` and hands it to `onSample`;
+// the first sample whose W reaches the stop line also decides the run-level
+// stop, handed once to `onStop` with its exact line. E13 performs that stop
+// and calls `stop` at end-of-run step 4, which takes the after-cleanup W
+// reading and answers W before, at its peak and after cleanup with the
+// failed-reading counts. Every read goes through the injected dependencies
+// and E1's docker layer, and nothing is read before `start` or after `stop`.
+//
+// Failed readings, by the rule fixed for E7: each value b.uqm SR-7.3 lists
+// that a sample cannot read is one failed reading. The run-level values are W
+// (with its parts) and the `/ci-live` re-check; each running shard's are its
+// memory, anon, page cache, PID count, `State.OOMKilled`, kill count and
+// result file. A value computed from an unreadable file fails with it, so an
+// unreadable container `memory.stat` is three. A result file not yet created
+// is no failure. A shard's count is its own failed sample readings; the run's
+// is every failed sample reading plus a failed after-cleanup W reading. A
+// failed `/ci-live` re-check carries C and its source from the previous
+// sample (at the first, from admission).
+
+/** What each value a sample reads is called in its failed-reading record (`FailedReading.what`) (b.uqm SR-7.3). */
+export const SAMPLE_READING_NAMES = {
+  workingSet: 'working set',
+  workingSetAfterCleanup: 'working set after cleanup',
+  ciLive: '/ci-live activity',
+  memory: 'memory',
+  anon: 'anon',
+  pageCache: 'page cache',
+  pidCount: 'PID count',
+  oomKilled: 'State.OOMKilled',
+  oomKillCount: 'kill count',
+  resultFile: 'result file',
+} as const
+
+/** The per-shard detail of a watchdog line when no shard runs, as during the build (b.uqm SR-7.4). */
+export const NO_SHARDS_RUNNING_TEXT = 'no shards running'
+
+/** The memory watchdog's run-level stop, as E13 records it (b.uqm SR-5.6, SR-7.4). */
+export type MemoryWatchdogStop = Extract<RunLevelStop, { readonly kind: 'memory-watchdog' }>
+
+/** One running shard as E13 reports it at a sample: its number and its container's name or ID. */
+export interface WatchdogShard {
+  readonly shard: number
+  /** Its container's name or ID, as E1's docker layer takes it. */
+  readonly container: string
+}
+
+/** Answers the shards running now; empty during the build. Called once per sample. */
+export type RunningShardsProvider = () => readonly WatchdogShard[]
+
+/** What the watchdog reads through: the clock and timers, the cgroup and `/proc` reads, and the `/ci-live` detector's inputs. */
+export type MemoryWatchdogDeps = Pick<RunnerDeps, 'clock' | 'readCgroupFile' | 'readProcCgroup' | 'env' | 'uid' | 'readProcCmdline' | 'readProcCwd'>
+
+/** What a memory watchdog is built from (b.uqm SR-7.3). */
+export interface MemoryWatchdogOptions {
+  readonly deps: MemoryWatchdogDeps
+  /** E1's docker context: each shard's state inspect and the `/ci-live` container list. */
+  readonly docker: DockerContext
+  /** The account's home, for `/ci-live`'s real-run lock (b.uqm SR-6.6). */
+  readonly home: string
+  /** The run directory: shard k's result file is read from `shard-<k>` by E1's rule (`readResultFile`). */
+  readonly runDir: string
+  /** Admission's "before" W reading with its parts (b.uqm SR-6.5); never read again. */
+  readonly before: WorkingSetReading
+  /** L, admission's pod limit in bytes. */
+  readonly limitBytes: number
+  /** Admission's ceiling C with its source: in force until the first sample's `/ci-live` re-check succeeds. */
+  readonly ceiling: MemoryCeiling
+  readonly runningShards: RunningShardsProvider
+  /** Receives each completed sample, in order (E13's follow loop). A throw or a rejection is logged and changes nothing. */
+  readonly onSample?: (sample: Sample) => void
+  /** Receives the run-level stop, at most once per run, with the sample that decided it; called before that sample's `onSample`. */
+  readonly onStop: (stop: MemoryWatchdogStop, sample: Sample) => void
+  /** The runner log, for a callback's failure or a sample that could not be taken. */
+  readonly log?: RunnerLogSink
+}
+
+/** What stopping the watchdog answers (b.uqm SR-5.7 step 4, SR-7.3). */
+export interface MemoryWatchdogReport {
+  /** W before admission, at its peak over the samples and after cleanup; null where not read. */
+  readonly workingSet: ResultsWorkingSet
+  /** The run's failed-reading count: every failed sample reading, plus a failed after-cleanup W reading. */
+  readonly failedReadings: number
+  /** Each sampled shard's own failed sample readings, 0 for none; a shard never sampled has no entry. */
+  readonly shardFailedReadings: ReadonlyMap<number, number>
+  /** Every failed reading in the order met, the after-cleanup reading's last. */
+  readonly failures: readonly FailedReading[]
+  /** Every sample taken, in order. */
+  readonly samples: readonly Sample[]
+  /** The stop decided, or null. */
+  readonly stop: MemoryWatchdogStop | null
+}
+
+/** The memory watchdog E13 drives (b.uqm SR-5.6, SR-5.7, SR-7.3, SR-7.4). */
+export interface MemoryWatchdog {
+  /** Starts sampling: the first sample one interval from now, then one every interval. A second call, or a call after `stop`, does nothing. */
+  start(): void
+  /**
+   * Stops sampling: cancels the timer, lets a sample already being taken
+   * finish (and be handed on), then reads W once more as the after-cleanup
+   * reading, also when never started. Every call answers the same report.
+   */
+  stop(): Promise<MemoryWatchdogReport>
+  /** Every sample taken so far, in order. */
+  samples(): readonly Sample[]
+  /** The stop decided so far, or null. */
+  stopDecision(): MemoryWatchdogStop | null
+}
+
+/** A result file's state at a sample (b.uqm SR-7.3, SR-10.6): a script in progress, the end marker present, no file yet, unreadable, or none of those (between scripts). */
+export type ShardResultFileState =
+  | {
+      readonly kind: 'in-progress'
+      /** The script with a `start` and no `end` or `notrun`, the last one started if several. */
+      readonly fileName: string
+    }
+  | {
+      readonly kind: 'ended'
+    }
+  | {
+      readonly kind: 'no-file'
+    }
+  | {
+      readonly kind: 'unreadable'
+    }
+  | {
+      readonly kind: 'idle'
+    }
+
+/**
+ * Section 11's one "script in progress" rule, the same as E10's
+ * `shardScriptsOf().inProgress`: a script with a `start` line and no `end` or
+ * `notrun` line anywhere in the file, the last one started if several. With
+ * `assigned`, only those scripts count; null for all. The end marker is the
+ * caller's to judge.
+ */
+function unfinishedScriptOf(events: readonly ResultEvent[], assigned: readonly string[] | null): string | null {
+  const recorded = new Set(events.flatMap((event) => (event.kind === 'end' || event.kind === 'notrun' ? [event.fileName] : [])))
+  const unfinished = events.filter(
+    (event): event is StartEvent => event.kind === 'start' && !recorded.has(event.fileName) && (assigned === null || assigned.includes(event.fileName)),
+  )
+  return unfinished.at(-1)?.fileName ?? null
+}
+
+/** A result file's state (b.uqm SR-7.3): the end marker wins over any unfinished `start`; a script in progress by `unfinishedScriptOf`'s rule. */
+export function shardResultFileState(read: ResultFileRead): ShardResultFileState {
+  if (read.kind === 'missing') return { kind: 'no-file' }
+  if (read.kind === 'unreadable') return { kind: 'unreadable' }
+  if (read.events.some((event) => event.kind === 'done')) return { kind: 'ended' }
+  const inProgress = unfinishedScriptOf(read.events, null)
+  return inProgress === null ? { kind: 'idle' } : { kind: 'in-progress', fileName: inProgress }
+}
+
+/** The stop line in whole bytes: C − 0.5 GiB, never below 0 (b.uqm SR-7.4). */
+export function memoryStopLineBytes(ceiling: MemoryCeiling): number {
+  return Math.max(0, ceiling.bytes - STOP_LINE_OFFSET_BYTES)
+}
+
+/**
+ * The one `/ci-live` run a watchdog line names when several are active, chosen
+ * by `via`, never by position alone: the real-run lock's when held, else the
+ * dry-run lock's, else the first lone `cscb-live=1` container with a PID in
+ * E6's listing order (the order of `runs`, `CiLiveActivity.runs`). Only when no
+ * run has a PID is it the first container, whose name then stands in for the
+ * PID; null for no runs.
+ */
+export function watchdogCiLiveRun(runs: readonly CiLiveRunSeen[]): CiLiveRunSeen | null {
+  const withPid = (via: CiLiveRunSeen['via']): CiLiveRunSeen | undefined => runs.find((run) => run.via === via && run.pid !== null)
+  return withPid('real-run-lock') ?? withPid('dry-run-lock') ?? withPid('container') ?? runs.find((run) => run.via === 'container') ?? runs[0] ?? null
+}
+
+/**
+ * A watchdog line's ceiling source (b.uqm SR-7.4): `85% of the <L> GiB pod
+ * limit`, L to one decimal place, or `/ci-live's 40 GiB line, /ci-live run
+ * <PID> active`, the 40 being E6's copy of `/ci-live`'s line in whole GiB. In
+ * the one case where no active run has a PID, the container's name stands in
+ * its place.
+ */
+export function watchdogCeilingSourceText(ceiling: MemoryCeiling): string {
+  if (ceiling.source.kind === 'pod-limit') return `${MEMORY_CEILING_PERCENT}% of the ${formatGib(ceiling.source.limitBytes)} GiB pod limit`
+  const run = watchdogCiLiveRun(ceiling.source.runs)
+  const named = run === null ? '' : run.pid === null ? run.what : String(run.pid)
+  return `/ci-live's ${Math.round(CI_LIVE_WORKING_SET_LIMIT_BYTES / GIB_BYTES)} GiB line, /ci-live run ${named} active`
+}
+
+/**
+ * A watchdog line's per-shard detail (b.uqm SR-7.4): each running shard in
+ * shard order, `shard-<k> <m> GiB` (m to one decimal place) or `shard-<k>
+ * unreadable`, separated by a comma and a space; `no shards running` for none.
+ */
+export function watchdogShardDetail(shards: readonly Pick<ShardSample, 'shard' | 'memoryBytes'>[]): string {
+  if (shards.length === 0) return NO_SHARDS_RUNNING_TEXT
+  return [...shards]
+    .sort((a, b) => a.shard - b.shard)
+    .map((entry) => `${SHARD_DIR_PREFIX}${entry.shard} ${entry.memoryBytes === UNREADABLE_READING ? UNREADABLE_READING : `${formatGib(entry.memoryBytes)} GiB`}`)
+    .join(', ')
+}
+
+/**
+ * The memory watchdog's exact line (b.uqm SR-7.4): `FAIL: memory watchdog:
+ * pod working set <x> GiB reached the <y> GiB stop line (<ceiling source>;
+ * <per-shard detail>)`, x being W and y the stop line, each to one decimal
+ * place, rounded to the nearest tenth.
+ */
+export function memoryWatchdogLine(workingSetBytes: number, ceiling: MemoryCeiling, shards: readonly Pick<ShardSample, 'shard' | 'memoryBytes'>[]): string {
+  return (
+    `${FAIL_PREFIX}memory watchdog: pod working set ${formatGib(workingSetBytes)} GiB reached the ${formatGib(memoryStopLineBytes(ceiling))} GiB stop line ` +
+    `(${watchdogCeilingSourceText(ceiling)}; ${watchdogShardDetail(shards)})`
+  )
+}
+
+/** The stop a sample decides (b.uqm SR-7.4): its W at or above its own ceiling's stop line, in whole bytes; null for a W below it or unreadable. */
+export function decideMemoryStop(sample: Pick<Sample, 'workingSet' | 'ceiling' | 'shards'>): MemoryWatchdogStop | null {
+  if (sample.workingSet === UNREADABLE_READING) return null
+  if (sample.workingSet.bytes < memoryStopLineBytes(sample.ceiling)) return null
+  return { kind: 'memory-watchdog', line: memoryWatchdogLine(sample.workingSet.bytes, sample.ceiling, sample.shards) }
+}
+
+/** A reading's value, or `unreadable` with one failed reading recorded under the value's name. */
+function sampledValue<T>(reading: ReadingResult<T>, shard: number | null, what: string, failures: FailedReading[]): Reading<T> {
+  if (reading.ok) return reading.value
+  failures.push({ shard, what, error: `${reading.what}: ${reading.error}` })
+  return UNREADABLE_READING
+}
+
+/** Runs a reading that should never throw, a throw turned into a failed reading. */
+async function guardedReading<T>(what: string, read: () => ReadingResult<T> | Promise<ReadingResult<T>>): Promise<ReadingResult<T>> {
+  try {
+    return await read()
+  } catch (err) {
+    return readingFailure(what, dependencyErrorText(err))
+  }
+}
+
+/** What one shard's sample read, and its own failed readings. */
+interface WatchdogShardRead {
+  readonly sample: ShardSample
+  readonly failures: readonly FailedReading[]
+  /** The container's main PID as its state inspect gave it; null when not read. */
+  readonly pid: number | null
+}
+
+/**
+ * One running shard's seven values (b.uqm SR-7.2, SR-7.3): `State.OOMKilled`
+ * and the main PID from E1's state inspect, the cgroup figures from the
+ * container's own cgroup found through that PID (or the last PID read for the
+ * shard when this inspect fails), and the result file by E1's rule.
+ */
+async function readWatchdogShard(options: MemoryWatchdogOptions, target: WatchdogShard, lastPid: number | null): Promise<WatchdogShardRead> {
+  const failures: FailedReading[] = []
+  const names = SAMPLE_READING_NAMES
+  const stateWhat = `${target.container}'s state`
+  const state = await guardedReading<ContainerState>(stateWhat, async () => {
+    const answer = await inspectContainerState(options.docker, target.container)
+    if (!answer.ok) return readingFailure(stateWhat, answer.error)
+    if (answer.value === null) return readingFailure(stateWhat, DOCKER_NO_SUCH_CONTAINER_TEXT)
+    return { ok: true, value: answer.value }
+  })
+  const pid = state.ok ? state.value.pid : lastPid
+  const oomKilled: ReadingResult<boolean> = state.ok ? { ok: true, value: state.value.oomKilled } : state
+  const figures: ContainerFigures =
+    pid === null && !state.ok
+      ? { memoryBytes: state, anonBytes: state, fileBytes: state, pidCount: state, oomKillCount: state }
+      : (() => {
+          try {
+            return readContainerFigures(options.deps, { name: target.container, pid: pid ?? 0 })
+          } catch (err) {
+            const failed = readingFailure<number>(`${target.container}'s cgroup`, dependencyErrorText(err))
+            return { memoryBytes: failed, anonBytes: failed, fileBytes: failed, pidCount: failed, oomKillCount: failed }
+          }
+        })()
+  let resultFile: ResultFileRead
+  try {
+    resultFile = readResultFile(join(options.runDir, `${SHARD_DIR_PREFIX}${target.shard}`))
+  } catch (err) {
+    resultFile = { kind: 'unreadable', error: dependencyErrorText(err) }
+  }
+  // Each failed reading is recorded in b.uqm SR-7.3's order of the values.
+  const sample: ShardSample = {
+    shard: target.shard,
+    memoryBytes: sampledValue(figures.memoryBytes, target.shard, names.memory, failures),
+    anonBytes: sampledValue(figures.anonBytes, target.shard, names.anon, failures),
+    pageCacheBytes: sampledValue(figures.fileBytes, target.shard, names.pageCache, failures),
+    pidCount: sampledValue(figures.pidCount, target.shard, names.pidCount, failures),
+    oomKilled: sampledValue(oomKilled, target.shard, names.oomKilled, failures),
+    oomKillCount: sampledValue(figures.oomKillCount, target.shard, names.oomKillCount, failures),
+    resultFile,
+  }
+  if (resultFile.kind === 'unreadable') failures.push({ shard: target.shard, what: names.resultFile, error: `${RESULT_FILE_NAME}: ${resultFile.error}` })
+  return { sample, failures, pid: state.ok ? state.value.pid : null }
+}
+
+/**
+ * One sample (b.uqm SR-7.3): W, the `/ci-live` re-check (C and its source from
+ * it, or carried from `previous` when it fails) and each running shard's
+ * values, in shard order. A value that cannot be read is `unreadable` and one
+ * failed reading; nothing aborts the sample. `lastPids` holds each shard's
+ * last main PID read, and is updated.
+ */
+async function takeWatchdogSample(
+  options: MemoryWatchdogOptions,
+  previous: Pick<Sample, 'ciLive' | 'ceiling'>,
+  lastPids: Map<number, number>,
+): Promise<Sample> {
+  const atMs = options.deps.clock.now()
+  const names = SAMPLE_READING_NAMES
+  const runFailures: FailedReading[] = []
+  const workingSet = sampledValue(
+    await guardedReading("the pod's working set", () => readPodWorkingSet(options.deps)),
+    null,
+    names.workingSet,
+    runFailures,
+  )
+  const running = [...options.runningShards()].sort((a, b) => a.shard - b.shard)
+  const [activity, ...shardReads] = await Promise.all([
+    guardedReading('the /ci-live activity', () => readCiLiveActivity(options.deps, options.home, options.docker)),
+    ...running.map((target) => readWatchdogShard(options, target, lastPids.get(target.shard) ?? null)),
+  ])
+  let ciLive = previous.ciLive
+  let ceiling = previous.ceiling
+  if (activity.ok) {
+    ciLive = activity.value.runs
+    ceiling = memoryCeiling(options.limitBytes, activity.value.runs)
+  } else {
+    sampledValue(activity, null, names.ciLive, runFailures)
+  }
+  for (const read of shardReads) if (read.pid !== null) lastPids.set(read.sample.shard, read.pid)
+  return {
+    atMs,
+    workingSet,
+    ciLive,
+    ceiling,
+    shards: shardReads.map((read) => read.sample),
+    failedReadings: [...runFailures, ...shardReads.flatMap((read) => read.failures)],
+  }
+}
+
+/** Logs one watchdog failure line; a log that cannot take it loses it, and the watchdog carries on. */
+function logWatchdogFailure(log: RunnerLogSink | undefined, name: string, err: unknown): void {
+  try {
+    log?.(`ci-run: memory watchdog: ${name} failed: ${dependencyErrorText(err)}`)
+  } catch {
+    // Nothing to undo: the line is lost.
+  }
+}
+
+/** Calls one of E13's callbacks; a throw or a rejected promise is logged and changes nothing. */
+function callWatchdogCallback(log: RunnerLogSink | undefined, name: string, call: () => unknown): void {
+  const report = (err: unknown): void => logWatchdogFailure(log, name, err)
+  try {
+    const answer = call()
+    if (answer instanceof Promise) answer.catch(report)
+  } catch (err) {
+    report(err)
+  }
+}
+
+/**
+ * Builds the memory watchdog (b.uqm SR-7.3, SR-7.4); nothing is read and no
+ * timer is set until `start`. Throws for an L that is not a whole byte count.
+ */
+export function createMemoryWatchdog(options: MemoryWatchdogOptions): MemoryWatchdog {
+  assertWholeBytes('createMemoryWatchdog', options.limitBytes)
+  const clock = options.deps.clock
+  const samples: Sample[] = []
+  const failures: FailedReading[] = []
+  const lastPids = new Map<number, number>()
+  let state: 'idle' | 'running' | 'stopped' = 'idle'
+  let timer: unknown = null
+  let sampling: Promise<void> = Promise.resolve()
+  let waiting = false
+  let peak: WorkingSetReading | null = null
+  let decided: MemoryWatchdogStop | null = null
+  let report: Promise<MemoryWatchdogReport> | null = null
+
+  /** Records one sample: kept, its failed readings counted, the peak and the stop decided, then handed on; a throw in the decision is logged and the sample still handed on. */
+  function record(sample: Sample): void {
+    samples.push(sample)
+    failures.push(...sample.failedReadings)
+    if (sample.workingSet !== UNREADABLE_READING && (peak === null || sample.workingSet.bytes > peak.bytes)) peak = sample.workingSet
+    if (decided === null) {
+      let stop: MemoryWatchdogStop | null = null
+      try {
+        stop = decideMemoryStop(sample)
+      } catch (err) {
+        logWatchdogFailure(options.log, 'the stop decision', err)
+      }
+      if (stop !== null) {
+        decided = stop
+        callWatchdogCallback(options.log, 'the stop callback', () => options.onStop(stop, sample))
+      }
+    }
+    const onSample = options.onSample
+    if (onSample !== undefined) callWatchdogCallback(options.log, 'the sample hook', () => onSample(sample))
+  }
+
+  /** Takes and records one sample; never rejects: a throw in taking or in recording it is logged, and later samples go on. */
+  async function sampleOnce(): Promise<void> {
+    // A tick queued behind a slow sample is dropped once stopped; one already being taken finishes.
+    if (state !== 'running') return
+    let sample: Sample
+    try {
+      const previous = samples.at(-1) ?? { ciLive: options.ceiling.source.kind === 'ci-live' ? options.ceiling.source.runs : [], ceiling: options.ceiling }
+      sample = await takeWatchdogSample(options, previous, lastPids)
+    } catch (err) {
+      logWatchdogFailure(options.log, 'a sample', err)
+      return
+    }
+    try {
+      record(sample)
+    } catch (err) {
+      logWatchdogFailure(options.log, 'recording a sample', err)
+    }
+  }
+
+  function tick(): void {
+    timer = null
+    if (state !== 'running') return
+    timer = clock.setTimeout(tick, SAMPLE_INTERVAL_MS)
+    // Samples never overlap: each starts after the one before has finished,
+    // and at most one waits behind a sample still being taken. The next runs
+    // whether the one before resolved or not, so one failure never ends the chain.
+    if (waiting) return
+    waiting = true
+    const next = (): Promise<void> => {
+      waiting = false
+      return sampleOnce()
+    }
+    sampling = sampling.then(next, next)
+  }
+
+  async function finish(): Promise<MemoryWatchdogReport> {
+    // A failed sample never keeps the after-cleanup reading or the counts from being answered.
+    await sampling.catch((err: unknown) => logWatchdogFailure(options.log, 'a sample', err))
+    const afterFailures: FailedReading[] = []
+    const afterRead = await guardedReading("the pod's working set", () => readPodWorkingSet(options.deps))
+    const after = sampledValue(afterRead, null, SAMPLE_READING_NAMES.workingSetAfterCleanup, afterFailures)
+    const all = [...failures, ...afterFailures]
+    const shardFailedReadings = new Map<number, number>()
+    for (const sample of samples) for (const shard of sample.shards) if (!shardFailedReadings.has(shard.shard)) shardFailedReadings.set(shard.shard, 0)
+    for (const failure of failures) {
+      if (failure.shard !== null) shardFailedReadings.set(failure.shard, (shardFailedReadings.get(failure.shard) ?? 0) + 1)
+    }
+    return {
+      workingSet: { before: options.before, peak, after: after === UNREADABLE_READING ? null : after },
+      failedReadings: all.length,
+      shardFailedReadings,
+      failures: all,
+      samples: [...samples],
+      stop: decided,
+    }
+  }
+
+  return {
+    start() {
+      if (state !== 'idle') return
+      state = 'running'
+      timer = clock.setTimeout(tick, SAMPLE_INTERVAL_MS)
+    },
+    stop() {
+      if (report !== null) return report
+      state = 'stopped'
+      if (timer !== null) clock.clearTimeout(timer)
+      timer = null
+      report = finish()
+      return report
+    },
+    samples: () => [...samples],
+    stopDecision: () => decided,
+  }
+}
+
+// --- 11/T2 (E7 T2): anon peaks, peak PIDs, the cap rule and the cap line ---
+//
+// Each shard's anon peak with its mark and its peak PIDs (b.uqm SR-8.2), the
+// cap rule over a run's shards (b.uqm SR-8.3) and the cap line, its suffix and
+// the `results.json` `cap` record (b.uqm SR-8.4, SR-16.1). All pure, in whole
+// bytes. Samples and final readings are read only through E1's types; a
+// shard's kill status is an input (T3's classification), never computed here.
+// The cap is E1's one constant, `SHARD_MEMORY_CAP_BYTES` (b.uqm SR-8.1): the
+// rule and the line take the cap the run used as an input and never read,
+// assign or persist the constant, so nothing here depends on its value. Their
+// result is informational; only a person changes the cap, by hand.
+
+/** A shard's anon peak and peak PIDs, the shard-evidence fields E10 writes to `results.json` (b.uqm SR-8.2, SR-16.1). */
+export type ShardPeaks = Pick<ShardEvidence, 'anonPeak' | 'peakPids'>
+
+/** A reading's whole-byte or whole-count value, or null when it was not read. Throws for a read value that is not whole. */
+function peakReadingValue(where: string, reading: Reading<number>): number | null {
+  if (reading === UNREADABLE_READING) return null
+  assertWholeBytes(where, reading)
+  return reading
+}
+
+/**
+ * One shard's anon peak and peak PIDs (b.uqm SR-8.2), from its samples in the
+ * order taken and its final reading, or null when it has none.
+ *
+ * - The peak is the highest `anon` over the samples and the final reading,
+ *   with the page cache (`file`) of the reading that gave it (null when that
+ *   reading's page cache was unreadable). On equal values the earliest
+ *   reading gives the page cache; the final reading is the latest.
+ * - No reading read `anon`: `unknown`, both byte fields null. That includes a
+ *   shard that never started (no samples, no final reading).
+ * - Otherwise, a final reading whose `memory.stat` was unreadable (its `anon`
+ *   unreadable), or no final reading at all (Epic decision: treated the same),
+ *   marks the peak `partial`; it is then the highest sample.
+ * - Peak PIDs is the highest readable sample PID count, or null when none was
+ *   read; the final reading never supplies it.
+ *
+ * Page cache never affects which reading is the peak, so a shard whose page
+ * cache fills its cap gets no failure here (b.uqm SR-8.1). Throws when the
+ * samples are of more than one shard, or a read value is not whole.
+ */
+export function shardPeaks(samples: readonly ShardSample[], final: FinalReading | null): ShardPeaks {
+  const first = samples[0]
+  if (first !== undefined && samples.some((sample) => sample.shard !== first.shard)) {
+    throw new Error(`shardPeaks: samples of more than one shard: ${[...new Set(samples.map((sample) => sample.shard))].join(', ')}`)
+  }
+  const readings: readonly (readonly [Reading<number>, Reading<number>])[] = [
+    ...samples.map((sample) => [sample.anonBytes, sample.pageCacheBytes] as const),
+    ...(final === null ? [] : [[final.anonBytes, final.fileBytes] as const]),
+  ]
+  let peakBytes: number | null = null
+  let peakPageCacheBytes: number | null = null
+  for (const [anon, pageCache] of readings) {
+    const anonBytes = peakReadingValue('shardPeaks: anon', anon)
+    const pageCacheBytes = peakReadingValue('shardPeaks: page cache', pageCache)
+    if (anonBytes === null || (peakBytes !== null && anonBytes <= peakBytes)) continue
+    peakBytes = anonBytes
+    peakPageCacheBytes = pageCacheBytes
+  }
+  let peakPids: number | null = null
+  for (const sample of samples) {
+    const pids = peakReadingValue('shardPeaks: PID count', sample.pidCount)
+    if (pids !== null && (peakPids === null || pids > peakPids)) peakPids = pids
+  }
+  if (peakBytes === null) return { anonPeak: { bytes: null, pageCacheBytes: null, mark: 'unknown' }, peakPids }
+  const finalStatRead = final !== null && final.anonBytes !== UNREADABLE_READING
+  return { anonPeak: { bytes: peakBytes, pageCacheBytes: peakPageCacheBytes, mark: finalStatRead ? null : 'partial' }, peakPids }
+}
+
+/** One shard as the cap rule and the cap line take it: its anon peak and whether it was killed for out of memory (T3's classification, b.uqm SR-12.2). */
+export interface CapShard {
+  readonly shard: number
+  readonly anonPeak: ResultsAnonPeak
+  /** True only for an out-of-memory kill; an unreadable out-of-memory status is not a kill. */
+  readonly killed: boolean
+}
+
+/** The shard the derived cap came from (b.uqm SR-8.3, SR-8.4). */
+export interface CapSource {
+  /** Its counted value: its anon peak, or for a killed shard the higher of the cap used and its recorded peak. */
+  readonly peakBytes: number
+  /** Its number, the lowest on a tie. */
+  readonly shard: number
+  /** The page cache of the reading that gave its peak; null when the source is a kill, or that page cache was unreadable. */
+  readonly pageCacheBytes: number | null
+  readonly fromKill: boolean
+}
+
+/** The cap rule's result: null for both when no peak is counted and no shard was killed. */
+export interface CapRuleResult {
+  readonly derivedBytes: number | null
+  readonly source: CapSource | null
+}
+
+/**
+ * The cap a counted peak gives (b.uqm SR-8.3), in whole bytes: the peak plus
+ * the 1 GiB margin, rounded up to a multiple of the 0.5 GiB step (a sum
+ * already on one stays), and at least the 2 GiB minimum, each E1's constant.
+ */
+export function derivedCapBytes(peakBytes: number): number {
+  assertWholeBytes('derivedCapBytes', peakBytes)
+  const sum = peakBytes + CAP_MARGIN_BYTES
+  const remainder = sum % CAP_ROUNDING_STEP_BYTES
+  const rounded = remainder === 0 ? sum : sum - remainder + CAP_ROUNDING_STEP_BYTES
+  return Math.max(MIN_SHARD_MEMORY_CAP_BYTES, rounded)
+}
+
+/** Throws unless `peak` is a well-formed anon peak: `unknown` with null bytes and page cache, else whole bytes. */
+function assertAnonPeak(where: string, shard: number, peak: ResultsAnonPeak): void {
+  if (peak.mark === 'unknown') {
+    if (peak.bytes !== null || peak.pageCacheBytes !== null) throw new Error(`${where}: shard-${shard}'s unknown anon peak holds bytes`)
+    return
+  }
+  if (peak.bytes === null) throw new Error(`${where}: shard-${shard}'s ${peak.mark ?? 'complete'} anon peak has no bytes`)
+  assertWholeBytes(where, peak.bytes)
+  if (peak.pageCacheBytes !== null) assertWholeBytes(where, peak.pageCacheBytes)
+}
+
+/** Throws unless the cap used is a whole byte count above 0 and the shards are well formed, each number once. */
+function assertCapInputs(where: string, capUsedBytes: number, shards: readonly CapShard[]): void {
+  assertWholeBytes(where, capUsedBytes)
+  if (capUsedBytes === 0) throw new Error(`${where}: the cap used is 0`)
+  const seen = new Set<number>()
+  for (const shard of shards) {
+    if (!Number.isSafeInteger(shard.shard) || shard.shard < 1) throw new Error(`${where}: not a shard number: ${shard.shard}`)
+    if (seen.has(shard.shard)) throw new Error(`${where}: shard-${shard.shard} given twice`)
+    seen.add(shard.shard)
+    assertAnonPeak(where, shard.shard, shard.anonPeak)
+  }
+}
+
+/**
+ * The cap rule over a run's shards (b.uqm SR-8.3), in whole bytes. Each shard
+ * counts at its anon peak (`partial` counted, `unknown` not); a killed shard
+ * counts at the higher of `capUsedBytes` and its recorded peak (the cap used
+ * when its peak is `unknown`). The highest counted value, the lowest shard
+ * number on a tie, gives `derivedCapBytes`. Page cache never enters it.
+ * `capUsedBytes` is the cap the run used, given by the caller; the rule never
+ * reads the cap constant. Throws for malformed input.
+ */
+export function capRule(capUsedBytes: number, shards: readonly CapShard[]): CapRuleResult {
+  assertCapInputs('capRule', capUsedBytes, shards)
+  let source: CapSource | null = null
+  for (const shard of [...shards].sort((a, b) => a.shard - b.shard)) {
+    const recorded = shard.anonPeak.mark === 'unknown' ? null : shard.anonPeak.bytes
+    let candidate: CapSource
+    if (shard.killed) {
+      candidate = { peakBytes: Math.max(capUsedBytes, recorded ?? 0), shard: shard.shard, pageCacheBytes: null, fromKill: true }
+    } else if (recorded !== null) {
+      candidate = { peakBytes: recorded, shard: shard.shard, pageCacheBytes: shard.anonPeak.pageCacheBytes, fromKill: false }
+    } else {
+      continue
+    }
+    if (source === null || candidate.peakBytes > source.peakBytes) source = candidate
+  }
+  return source === null ? { derivedBytes: null, source: null } : { derivedBytes: derivedCapBytes(source.peakBytes), source }
+}
+
+/** The cap line's opening (b.uqm SR-8.4). */
+export const CAP_LINE_PREFIX = 'cap from measured anon peak: '
+/** The kill form's parenthesis, in place of the page cache (b.uqm SR-8.4). */
+export const CAP_LINE_KILL_TEXT = '(killed for out of memory at the cap)'
+/** The unknown form's text after the prefix (b.uqm SR-8.4). */
+export const CAP_LINE_UNKNOWN_TEXT = "unknown, no shard's anon memory was read"
+/** The full form's page cache when the peak's reading could not read it; b.uqm SR-8.4 gives no text, so this is the runner's. */
+export const CAP_LINE_PAGE_CACHE_UNREAD_TEXT = '(page cache unknown)'
+/** A default full run with any kill: the suffix before its killed shards (b.uqm SR-8.4). */
+export const CAP_SUFFIX_KILL_PREFIX = '; source after out-of-memory kill in '
+/** Every other run that is no source: the suffix before its reasons (b.uqm SR-8.4). */
+export const CAP_SUFFIX_INVALID_PREFIX = '; not a valid cap source: '
+/** The first reason (b.uqm SR-8.4). */
+export const CAP_REASON_NOT_DEFAULT = 'not a default run'
+/** The second reason (b.uqm SR-8.4). */
+export const CAP_REASON_NOT_PASSED = 'run did not pass'
+/** The third reason, before its shards in parentheses (b.uqm SR-8.4). */
+export const CAP_REASON_PARTIAL = 'partial anon peak'
+/** The fourth reason, before its shards in parentheses (b.uqm SR-8.4). */
+export const CAP_REASON_UNKNOWN = 'unknown anon peak'
+/** Between listed reasons, and between listed shards (b.uqm SR-8.4). */
+export const CAP_LIST_SEPARATOR = ', '
+
+/**
+ * A whole-byte count in GiB rounded up to two decimal places, computed
+ * exactly (b.uqm SR-8.4): 1.50 GiB exactly gives `1.50`, one byte more `1.51`.
+ */
+function gibHundredthsUpText(bytes: number): string {
+  assertWholeBytes('gibHundredthsUpText', bytes)
+  const gib = BigInt(GIB_BYTES)
+  const hundredths = (BigInt(bytes) * BigInt(100) + gib - BigInt(1)) / gib
+  return `${hundredths / BigInt(100)}.${(hundredths % BigInt(100)).toString().padStart(2, '0')}`
+}
+
+/** The margin in GiB as the cap line names it, from E1's constant: `1`. */
+function capMarginGibText(): string {
+  return `${CAP_MARGIN_BYTES / GIB_BYTES}`
+}
+
+/** `shard-<j>, shard-<k>`: shard names in shard order. */
+function capShardList(shards: readonly number[]): string {
+  return [...shards].sort((a, b) => a - b).map((shard) => `${SHARD_DIR_PREFIX}${shard}`).join(CAP_LIST_SEPARATOR)
+}
+
+/** Everything the cap line and the `cap` record are built from. */
+export interface CapReportInputs {
+  /** The run's invocation: its kind (`runKindOf`) and whether it is a default full run (`isCapSourceEligible`), E1's. */
+  readonly invocation: Invocation
+  /** Whether the run passed, E10's pass condition (b.uqm SR-12.3). */
+  readonly passed: boolean
+  /** The cap the run used. */
+  readonly capUsedBytes: number
+  /** `capRule(capUsedBytes, shards)`. */
+  readonly rule: CapRuleResult
+  /** Every shard of the run, each with its anon peak and kill status. */
+  readonly shards: readonly CapShard[]
+}
+
+/** The cap line with its suffix, the suffix on its own, and the `cap` record (b.uqm SR-8.4, SR-16.1). */
+export interface CapReport {
+  /** The line followed by its suffix; null for a selective run, which has no cap line. */
+  readonly line: string | null
+  /** The suffix: an empty string for none; null for a selective run. */
+  readonly suffix: string | null
+  readonly record: ResultsCap
+}
+
+/**
+ * The suffix (b.uqm SR-8.4): a default full run with any kill gets only the
+ * kill suffix, naming every killed shard; a passing default full run with
+ * every anon peak complete gets none; any other gets `; not a valid cap
+ * source:` with each reason that applies, in the fixed order.
+ */
+function capSuffix(defaultRun: boolean, passed: boolean, shards: readonly CapShard[]): string {
+  const killed = shards.filter((shard) => shard.killed).map((shard) => shard.shard)
+  if (defaultRun && killed.length > 0) return `${CAP_SUFFIX_KILL_PREFIX}${capShardList(killed)}`
+  const partial = shards.filter((shard) => shard.anonPeak.mark === 'partial').map((shard) => shard.shard)
+  const unknown = shards.filter((shard) => shard.anonPeak.mark === 'unknown').map((shard) => shard.shard)
+  const reasons = [
+    ...(defaultRun ? [] : [CAP_REASON_NOT_DEFAULT]),
+    ...(passed ? [] : [CAP_REASON_NOT_PASSED]),
+    ...(partial.length > 0 ? [`${CAP_REASON_PARTIAL} (${capShardList(partial)})`] : []),
+    ...(unknown.length > 0 ? [`${CAP_REASON_UNKNOWN} (${capShardList(unknown)})`] : []),
+  ]
+  return reasons.length === 0 ? '' : `${CAP_SUFFIX_INVALID_PREFIX}${reasons.join(CAP_LIST_SEPARATOR)}`
+}
+
+/**
+ * The cap line, its suffix and the `results.json` `cap` record (b.uqm SR-8.4,
+ * SR-16.1). A selective run gets no line and a record whose every key but
+ * `usedBytes` is null. A full run gets:
+ * - the full form, `cap from measured anon peak: <peak> GiB in shard-<k>
+ *   (page cache <f> GiB) + 1 GiB margin → <cap> GiB; current cap <c> GiB`,
+ *   peak and f rounded up to two decimals, both caps to one (E6's
+ *   `formatGib`);
+ * - the kill form when the source is a kill, `(killed for out of memory at
+ *   the cap)` in place of the page cache, and `peakPageCacheBytes` null;
+ * - the unknown form when the rule counted nothing, `cap from measured anon
+ *   peak: unknown, no shard's anon memory was read; current cap <c> GiB`,
+ *   with `peakBytes`, `peakShard`, `peakPageCacheBytes` and `derivedBytes`
+ *   null and `peakFromKill` false;
+ * each followed by its suffix. `usedBytes` is the cap used. Throws for
+ * malformed input, or a rule result with a cap but no source or the reverse.
+ */
+export function buildCapReport(inputs: CapReportInputs): CapReport {
+  const { invocation, passed, capUsedBytes, rule, shards } = inputs
+  assertCapInputs('buildCapReport', capUsedBytes, shards)
+  if ((rule.derivedBytes === null) !== (rule.source === null)) throw new Error('buildCapReport: the rule result has a cap without a source, or a source without a cap')
+  if (runKindOf(invocation) === 'selective') {
+    return {
+      line: null,
+      suffix: null,
+      record: { usedBytes: capUsedBytes, peakBytes: null, peakShard: null, peakPageCacheBytes: null, peakFromKill: null, derivedBytes: null, suffix: null },
+    }
+  }
+  const suffix = capSuffix(isCapSourceEligible(invocation), passed, shards)
+  const current = `current cap ${formatGib(capUsedBytes)} GiB`
+  const { source, derivedBytes } = rule
+  if (source === null || derivedBytes === null) {
+    return {
+      line: `${CAP_LINE_PREFIX}${CAP_LINE_UNKNOWN_TEXT}; ${current}${suffix}`,
+      suffix,
+      record: { usedBytes: capUsedBytes, peakBytes: null, peakShard: null, peakPageCacheBytes: null, peakFromKill: false, derivedBytes: null, suffix },
+    }
+  }
+  const pageCacheBytes = source.fromKill ? null : source.pageCacheBytes
+  const parenthesis = source.fromKill
+    ? CAP_LINE_KILL_TEXT
+    : pageCacheBytes === null
+      ? CAP_LINE_PAGE_CACHE_UNREAD_TEXT
+      : `(page cache ${gibHundredthsUpText(pageCacheBytes)} GiB)`
+  const peak = `${gibHundredthsUpText(source.peakBytes)} GiB in ${SHARD_DIR_PREFIX}${source.shard}`
+  return {
+    line: `${CAP_LINE_PREFIX}${peak} ${parenthesis} + ${capMarginGibText()} GiB margin → ${formatGib(derivedBytes)} GiB; ${current}${suffix}`,
+    suffix,
+    record: { usedBytes: capUsedBytes, peakBytes: source.peakBytes, peakShard: source.shard, peakPageCacheBytes: pageCacheBytes, peakFromKill: source.fromKill, derivedBytes, suffix },
+  }
+}
+
+// --- 11/T3 (E7 T3): out-of-memory detection and its failure lines ---
+//
+// b.uqm SR-12.2 over E1's data model only: a shard's samples (`Sample`, each
+// `ShardSample` with its result file) and its final reading (`FinalReading`,
+// with the result file E13 reads at that moment) give one `OomStatus`; that
+// status gives at most one out-of-memory line, which E13 stores as the
+// shard's `ShardEvidence.oomLine`. E10 turns that line into the shard's `end`
+// and its one out-of-memory-class failure (`shardEndFailure`); `oomFailureOf`
+// builds the same failure for any other consumer. Nothing here takes a run
+// kind, so the result is the same in every kind of run.
+
+/** The text of a kill's line, after the file name or the shard (b.uqm SR-12.2). */
+export const OOM_KILLED_TEXT = 'killed for out of memory'
+
+/** The text of an unreadable status's line, after the shard (b.uqm SR-12.2). */
+export const OOM_UNREADABLE_TEXT = 'out-of-memory status unreadable'
+
+/** A shard's out-of-memory status (b.uqm SR-12.2). */
+export type OomStatus =
+  | {
+      readonly kind: 'no-kill'
+    }
+  | {
+      readonly kind: 'killed'
+      /** The assigned script in progress at the first reading that showed the kill; null for none. */
+      readonly inProgress: string | null
+    }
+  | {
+      readonly kind: 'unreadable'
+    }
+
+/** A shard's final reading with its result file as read at that moment (b.uqm SR-10.6; E9 takes the reading, E13 the result file). */
+export interface OomFinalReading {
+  readonly reading: FinalReading
+  readonly resultFile: ResultFileRead
+}
+
+/** Whether one reading shows a kill: `State.OOMKilled` true or a kill count above 0; an unreadable source shows none. */
+function oomReadingShowsKill(oomKilled: Reading<boolean>, oomKillCount: Reading<number>): boolean {
+  return oomKilled === true || (typeof oomKillCount === 'number' && oomKillCount > 0)
+}
+
+/**
+ * The assigned script in progress in a result file as read: an assigned
+ * script with a `start` line but no `end` or `notrun` line, the last one
+ * started if several, named exactly as assigned (`unfinishedScriptOf`'s rule,
+ * shared with `shardResultFileState`). A result file that is missing or
+ * unreadable, or that holds the end marker, has none.
+ */
+export function oomInProgressScript(resultFile: ResultFileRead, assigned: readonly string[]): string | null {
+  if (resultFile.kind !== 'events') return null
+  if (resultFile.events.some((event) => event.kind === 'done')) return null
+  return unfinishedScriptOf(resultFile.events, assigned)
+}
+
+/**
+ * Classifies a shard's out-of-memory status (b.uqm SR-12.2, SR-10.6). Its
+ * samples are read in the order given, which is the order taken; entries for
+ * other shards are ignored. The first reading that shows a kill, a sample's
+ * or the final one, decides `killed`, with the script in progress in that
+ * reading's result file; no later reading clears it. With no kill in the
+ * samples, a final reading with either source readable and showing no kill
+ * gives `no-kill`, and one with neither source readable gives `unreadable`. A
+ * shard with no final reading (its container never created, or not yet
+ * created at a run-level stop) is classified from its samples alone and is
+ * never `unreadable`.
+ */
+export function classifyOom(shard: Pick<ShardEvidence, 'shard' | 'assigned'>, samples: readonly Sample[], final: OomFinalReading | null): OomStatus {
+  for (const sample of samples) {
+    for (const shardSample of sample.shards) {
+      if (shardSample.shard !== shard.shard) continue
+      if (oomReadingShowsKill(shardSample.oomKilled, shardSample.oomKillCount)) {
+        return { kind: 'killed', inProgress: oomInProgressScript(shardSample.resultFile, shard.assigned) }
+      }
+    }
+  }
+  if (final === null) return { kind: 'no-kill' }
+  const { oomKilled, oomKillCount } = final.reading
+  if (oomReadingShowsKill(oomKilled, oomKillCount)) return { kind: 'killed', inProgress: oomInProgressScript(final.resultFile, shard.assigned) }
+  if (oomKilled === UNREADABLE_READING && oomKillCount === UNREADABLE_READING) return { kind: 'unreadable' }
+  return { kind: 'no-kill' }
+}
+
+/** `FAIL: <file name>: killed for out of memory in shard-<k>`: a kill with a script in progress at the first reading that showed it (b.uqm SR-12.2). */
+export function oomKilledScriptLine(fileName: string, shard: number): string {
+  return `${FAIL_PREFIX}${fileName}: ${OOM_KILLED_TEXT} in ${SHARD_DIR_PREFIX}${shard}`
+}
+
+/** `FAIL: shard-<k>: killed for out of memory`: a kill with no script in progress at that reading (b.uqm SR-12.2). */
+export function oomKilledShardLine(shard: number): string {
+  return `${FAIL_PREFIX}${SHARD_DIR_PREFIX}${shard}: ${OOM_KILLED_TEXT}`
+}
+
+/** `FAIL: shard-<k>: out-of-memory status unreadable` (b.uqm SR-12.2). */
+export function oomStatusUnreadableLine(shard: number): string {
+  return `${FAIL_PREFIX}${SHARD_DIR_PREFIX}${shard}: ${OOM_UNREADABLE_TEXT}`
+}
+
+/** A shard's one out-of-memory line for `ShardEvidence.oomLine`; null for `no-kill` (b.uqm SR-12.2). */
+export function oomLineOf(shard: number, status: OomStatus): string | null {
+  switch (status.kind) {
+    case 'no-kill':
+      return null
+    case 'killed':
+      return status.inProgress === null ? oomKilledShardLine(shard) : oomKilledScriptLine(status.inProgress, shard)
+    case 'unreadable':
+      return oomStatusUnreadableLine(shard)
+  }
+}
+
+/** A shard's one out-of-memory failure, classed `out-of-memory` with its shard number in all three forms, as E10's `shardEndFailure` builds it; null for `no-kill` (b.uqm SR-12.2, SR-12.4). */
+export function oomFailureOf(shard: number, status: OomStatus): Failure | null {
+  const line = oomLineOf(shard, status)
+  return line === null ? null : { line, shard, failureClass: { kind: 'out-of-memory' } }
+}
 
 // ---------------------------------------------------------------------------
 // 12. Images (E8)
