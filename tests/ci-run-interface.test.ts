@@ -1238,6 +1238,7 @@ import {
   type ValidatedRun,
 } from '../scripts/ci-run.ts'
 import {
+  createSignalSource,
   duplicateScriptFileName,
   minimalScriptText,
   prerequisiteLineText,
@@ -1245,6 +1246,7 @@ import {
   realScriptNumbers,
   type NonRegularEntry,
   type PrerequisiteLine,
+  type SignalSource,
   type WorktreeOptions,
 } from './test-helpers/ci-run.ts'
 import { writtenFile } from './test-helpers/credentials.ts'
@@ -1378,7 +1380,13 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
     writeFileSync(join(integrationDirOf(worktreeRoot), fileName), text)
   }
 
-  /** Main's world for one refused run: every dependency validation must not reach records its use and throws. */
+  /**
+   * Main's world for one refused run: every dependency validation must not
+   * reach records its use and throws. `signals` is the `onSignal`: main
+   * registers E13 T2's traps right after step 1, before validation, so every
+   * run, a refused one included, registers them, and removes them before it
+   * resolves.
+   */
   interface MainRig {
     readonly deps: RunnerDeps
     readonly recorder: SpawnRecorder
@@ -1386,6 +1394,7 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
     readonly stderr: string[]
     readonly lockDir: string
     readonly runDir: string
+    readonly signals: SignalSource
   }
 
   function mainRig(worktreeRoot: string, env: ChildEnvironmentSource): MainRig {
@@ -1402,6 +1411,7 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
         throw new Error(`${name} must not be called during validation`)
       }
     const lockDir = join(root, 'lock')
+    const signals = createSignalSource({ clock })
     const deps: RunnerDeps = {
       spawn: recorder.spawn,
       env: { ...env, TMPDIR: tempDir },
@@ -1418,13 +1428,13 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
       clock,
       randomBytes: forbidden('randomBytes'),
       sendSignal: forbidden('sendSignal'),
-      onSignal: forbidden('onSignal'),
+      onSignal: signals.onSignal,
       isPidAlive: forbidden('isPidAlive'),
       writeStderr: (text) => {
         stderr.push(text)
       },
     }
-    return { deps, recorder, forbiddenCalls, stderr, lockDir, runDir: runDirPath(deps.env, E2_RUN_ID) }
+    return { deps, recorder, forbiddenCalls, stderr, lockDir, runDir: runDirPath(deps.env, E2_RUN_ID), signals }
   }
 
   /**
@@ -1451,8 +1461,9 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
    * The E2 driver for a refused run: steps 1 and 2 through `main` with injected
    * dependencies over the worktree, arguments and environment. Fails the case
    * unless main exits with the refusal status, `status.json` holds phase
-   * `refused` and the refusal `validateRun` gives, and nothing was spawned;
-   * every output, the run directory included, passes `assertNoLeak`.
+   * `refused` and the refusal `validateRun` gives, nothing was spawned and no
+   * signal trap is left registered; every output, the run directory included,
+   * passes `assertNoLeak`.
    */
   async function refused(worktreeRoot: string, args: readonly string[] = [], env: ChildEnvironmentSource = validEnv()): Promise<RefusedRun> {
     const validation = validateRun(args, worktreeRoot, env)
@@ -1466,6 +1477,7 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
     expect(status?.phase).toBe('refused')
     expect(status?.refusal).toEqual(validation.refusal)
     expect(rig.recorder.spawns()).toEqual([])
+    expect(rig.signals.handlerCount()).toBe(0)
     return { refusal: validation.refusal, rig, logLines: logText.split('\n').slice(0, -1) }
   }
 
@@ -1999,6 +2011,7 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
       expect(rig.recorder.argvs()).toEqual([dockerAnswersArgs()])
       expect(rig.recorder.argvs()).not.toContainEqual(GH_AUTH_TOKEN_ARGV)
       expect(rig.forbiddenCalls).toEqual([])
+      expect(rig.signals.handlerCount()).toBe(0)
       assertNoLeak({ stderr: rig.stderr, runDir: writtenFile(rig.runDir) })
     })
   })

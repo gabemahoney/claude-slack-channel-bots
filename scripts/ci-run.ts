@@ -15332,7 +15332,7 @@ export interface ShardRun {
  * guarded, so a throw is logged and changes nothing.
  */
 export interface RunSequenceHooks {
-  /** Once, before step 3: install the traps and the deadline timer. */
+  /** Once, before step 3: arm the deadline timer and record a signal the traps held during validation. */
   readonly onSequenceStart?: (seq: RunSequence) => void
   /** As each step of steps 3–13 begins, before its stop check (`seq.state.baseImage` holds step 4's outcome from `packing` on). */
   readonly onStep?: (seq: RunSequence, step: RunSequenceStep) => void
@@ -15446,7 +15446,17 @@ export function internalErrorFailureLine(error: string): string {
  * never `PASS` (b.uqm SR-12.5).
  */
 export function internalErrorVerdictLine(invocation: Invocation, scripts: readonly string[], error: string): string {
-  let line = internalErrorFailureLine(error)
+  return shapedFallbackVerdictLine(invocation, scripts, internalErrorFailureLine(error))
+}
+
+/**
+ * A fallback verdict's failure line in the shape the invocation calls for
+ * (b.uqm SR-12.5): E10's `SELECTIVE (<scripts>): ` prefix when it can be
+ * built, then E1's `INJECTED (<faults>): ` wrapper outside it. Never throws
+ * for the selective list: a list that cannot be built leaves the line as it is.
+ */
+function shapedFallbackVerdictLine(invocation: Invocation, scripts: readonly string[], failureLine: string): string {
+  let line = failureLine
   if (isSelectiveRun(invocation)) {
     try {
       line = `${selectiveVerdictPrefix(scripts)}${line}`
@@ -15456,6 +15466,21 @@ export function internalErrorVerdictLine(invocation: Invocation, scripts: readon
   }
   if (isInjectedRun(invocation)) line = `${injectedVerdictPrefix(invocation.faults)}${line}`
   return line
+}
+
+/**
+ * The verdict line written when step 5's composition threw (b.uqm SR-5.6,
+ * SR-12.5): with a run-level stop recorded, that stop's line
+ * (`runLevelStopLine`), which is the run's verdict whatever else failed; else
+ * the internal error's (`internalErrorVerdictLine`). Either in the shape the
+ * invocation calls for. Never `PASS`.
+ */
+function fallbackVerdictLine(seq: Pick<RunSequence, 'validated' | 'runScripts' | 'state'>, err: unknown): string {
+  const invocation = seq.validated.invocation
+  const scripts = seq.runScripts.map((script) => script.fileName)
+  const stop = seq.state.firstStop
+  if (stop !== null) return shapedFallbackVerdictLine(invocation, scripts, runLevelStopLine(stop))
+  return internalErrorVerdictLine(invocation, scripts, dependencyErrorText(err))
 }
 
 /** E1's run state as the run starts: no stop, nothing checked, packed or built (E8's `initialImageState`). */
@@ -15663,29 +15688,29 @@ function writeRunPhase(seq: RunSequence, phase: 'shards' | 'merge'): void {
 export async function recordRunRefusal(seq: RunSequence, refusal: Refusal): Promise<number> {
   seq.refusalBeingRecorded = true
   seq.step = 'refusal'
-  await refusalCleanupStep(seq, 'cancelling the limit timers', () => cancelFollowTimers(seq))
-  await refusalCleanupStep(seq, 'releasing the admission lock', () => releaseAdmissionLock(seq))
-  await refusalCleanupStep(seq, "removing the run's reservation", () => removeRunReservation(seq))
+  await guardedStep(seq, 'cancelling the limit timers', () => cancelFollowTimers(seq))
+  await guardedStep(seq, 'releasing the admission lock', () => releaseAdmissionLock(seq))
+  await guardedStep(seq, "removing the run's reservation", () => removeRunReservation(seq))
   if (seq.readBackStarted) {
-    await refusalCleanupStep(seq, 'removing the read container', async () => {
+    await guardedStep(seq, 'removing the read container', async () => {
       const removal = await removeReadContainerIfPresent(seq.docker, seq.owner, seq.say)
       if (removal.kind === 'failed') seq.state.cleanupFailures.push(removal.line)
     })
   }
-  await refusalCleanupStep(seq, "cleaning up the run's images", async () => {
+  await guardedStep(seq, "cleaning up the run's images", async () => {
     await cleanupRunImages({ docker: seq.docker, owner: seq.owner, clock: seq.deps.clock, log: seq.say }, seq.state)
   })
   const watchdog = seq.watchdog
   if (watchdog !== null) {
-    await refusalCleanupStep(seq, 'stopping the memory watchdog', async () => {
+    await guardedStep(seq, 'stopping the memory watchdog', async () => {
       await watchdog.stop()
     })
   }
   return recordRefusal(seq.run, refusal)
 }
 
-/** One cleanup step of the refusal path: a throw is logged and changes nothing, so the next step and the refusal still come (b.uqm SR-5.8). */
-async function refusalCleanupStep(seq: RunSequence, context: string, step: () => void | Promise<void>): Promise<void> {
+/** One guarded step of the refusal path, `finishRun` or the end of run: a throw is logged and changes nothing, so the next step and the refusal or the verdict still come (b.uqm SR-5.7, SR-5.8). */
+async function guardedStep(seq: RunSequence, context: string, step: () => void | Promise<void>): Promise<void> {
   try {
     await step()
   } catch (err) {
@@ -16121,20 +16146,18 @@ async function stopShards(seq: RunSequence, stop: RunLevelStop): Promise<void> {
   await Promise.all(ends)
 }
 
-/** After steps 3–13: releases the lock if still held (a throw is logged), ends what a stop or an internal error left running, then runs the end of run. */
+/** After steps 3–13: cancels the limit timers and releases the lock if still held, ends what a stop or an internal error left running, then runs the end of run. Each part's throw is logged and the next part still runs, so the run still reaches its end of run. */
 async function finishRun(seq: RunSequence): Promise<number> {
-  cancelFollowTimers(seq)
-  try {
-    releaseAdmissionLock(seq)
-  } catch (err) {
-    sayError(seq, err, 'releasing the admission lock')
-  }
+  await guardedStep(seq, 'cancelling the limit timers', () => cancelFollowTimers(seq))
+  await guardedStep(seq, 'releasing the admission lock', () => releaseAdmissionLock(seq))
   const stop = seq.state.firstStop
   if (stop !== null) {
-    await stopShards(seq, stop)
+    await guardedStep(seq, 'stopping the shards', () => stopShards(seq, stop))
   } else if (seq.internalErrorLine !== null) {
-    seq.controller?.noteRunStop()
-    await Promise.all(seq.shards.filter(isFollowedShard).map((shard) => endShard(seq, shard, { kind: 'kill' }, null)))
+    await guardedStep(seq, 'ending the shards after an internal error', async () => {
+      seq.controller?.noteRunStop()
+      await Promise.all(seq.shards.filter(isFollowedShard).map((shard) => endShard(seq, shard, { kind: 'kill' }, null)))
+    })
   }
   return endOfRun(seq)
 }
@@ -16315,7 +16338,8 @@ interface EndFiles {
  * the anon peaks, the cap rule and the cap line; the ranking and the verdict
  * line; the timing (the total taken now); the shard count; the modes; the
  * value. A throw in the ranking, the verdict line or the assembly is logged
- * and gives `internalErrorVerdictLine`; a throw in the cap pieces is logged
+ * and gives `fallbackVerdictLine` (the recorded stop's line, else the
+ * internal error's); a throw in the cap pieces is logged
  * and gives the unknown cap form.
  */
 function composeEndFiles(seq: RunSequence, integrity: IntegrityChecksResult, report: MemoryWatchdogReport | null): EndFiles {
@@ -16366,7 +16390,7 @@ function composeEndFiles(seq: RunSequence, integrity: IntegrityChecksResult, rep
   } catch (err) {
     sayError(seq, err, 'the verdict line')
     ranked = [...otherFailuresOf(sources), ...outcomes.flatMap((outcome) => outcome.failures)]
-    verdict = internalErrorVerdictLine(invocation, expectedScripts, dependencyErrorText(err))
+    verdict = fallbackVerdictLine(seq, err)
   }
 
   const admission = seq.admission
@@ -16410,7 +16434,7 @@ function composeEndFiles(seq: RunSequence, integrity: IntegrityChecksResult, rep
     return { verdict, results: assemble(verdict) }
   } catch (err) {
     sayError(seq, err, `assembling ${RESULTS_FILE_NAME}`)
-    const fallback = internalErrorVerdictLine(invocation, expectedScripts, dependencyErrorText(err))
+    const fallback = fallbackVerdictLine(seq, err)
     try {
       return { verdict: fallback, results: assemble(fallback) }
     } catch {
@@ -16432,6 +16456,25 @@ function writeEndFiles(seq: RunSequence, files: EndFiles, values: readonly strin
   seq.resultsWritten = true
 }
 
+/** `composeEndFiles`, whose throw is logged and gives `fallbackVerdictLine` (the recorded stop's line, else the internal error's) with no results value, so the verdict is still written (b.uqm SR-5.6, SR-5.7, SR-12.5). */
+function composeEndFilesGuarded(seq: RunSequence, integrity: IntegrityChecksResult, report: MemoryWatchdogReport | null): EndFiles {
+  try {
+    return composeEndFiles(seq, integrity, report)
+  } catch (err) {
+    sayError(seq, err, `composing ${RESULTS_FILE_NAME}, ${SUMMARY_FILE_NAME} and ${VERDICT_FILE_NAME}`)
+    return { verdict: fallbackVerdictLine(seq, err), results: null }
+  }
+}
+
+/** `writeEndFiles`, synchronously, whose throw is logged, so the verdict still follows (b.uqm SR-5.7). */
+function writeEndFilesGuarded(seq: RunSequence, files: EndFiles, values: readonly string[]): void {
+  try {
+    writeEndFiles(seq, files, values)
+  } catch (err) {
+    sayError(seq, err, `writing ${RESULTS_FILE_NAME} and ${SUMMARY_FILE_NAME}`)
+  }
+}
+
 /**
  * The end-of-run sequence (b.uqm SR-5.7), its six steps in order:
  * 1. the phase turns `merge`, the run's last status write; every shard still
@@ -16449,7 +16492,10 @@ function writeEndFiles(seq: RunSequence, files: EndFiles, values: readonly strin
  *    whole (b.uqm SR-5.6).
  * After the rename the runner log is sealed and the exit status is
  * `VERDICT_WRITTEN_EXIT_STATUS`, whatever the verdict. The run directory is
- * never removed.
+ * never removed. A throw in the read container's removal, the controller's
+ * finalize, the reservation's removal, the image cleanup, the watchdog's stop
+ * or the end files' composition or write is logged and the sequence carries
+ * on, so the verdict is still written.
  */
 async function endOfRun(seq: RunSequence): Promise<number> {
   const { deps, run, state } = seq
@@ -16465,10 +16511,17 @@ async function endOfRun(seq: RunSequence): Promise<number> {
   for (const shard of seq.shards) if (shard.start !== null && shard.ending === null) void endShard(seq, shard, remainingReason, null)
   await Promise.all(seq.shards.flatMap((shard) => (shard.ending === null ? [] : [shard.ending])))
   if (seq.readBackStarted) {
-    const removal = await removeReadContainerIfPresent(seq.docker, seq.owner, seq.say)
-    if (removal.kind === 'failed') state.cleanupFailures.push(removal.line)
+    await guardedStep(seq, 'removing the read container', async () => {
+      const removal = await removeReadContainerIfPresent(seq.docker, seq.owner, seq.say)
+      if (removal.kind === 'failed') state.cleanupFailures.push(removal.line)
+    })
   }
-  const firingRecords = seq.controller?.finalize() ?? []
+  let firingRecords: readonly FiringRecord[] = []
+  try {
+    firingRecords = seq.controller?.finalize() ?? []
+  } catch (err) {
+    sayError(seq, err, 'finalizing the fault controller')
+  }
 
   // Step 2: the integrity checks, `secret-scan` last.
   enterEndOfRunStep(seq, 'integrity')
@@ -16477,24 +16530,32 @@ async function endOfRun(seq: RunSequence): Promise<number> {
 
   // Step 3: the reservation, then the run's images.
   enterEndOfRunStep(seq, 'cleanup')
-  removeRunReservation(seq)
-  await cleanupRunImages({ docker: seq.docker, owner: seq.owner, clock: deps.clock, log: seq.say }, state)
+  await guardedStep(seq, "removing the run's reservation", () => removeRunReservation(seq))
+  await guardedStep(seq, "cleaning up the run's images", async () => {
+    await cleanupRunImages({ docker: seq.docker, owner: seq.owner, clock: deps.clock, log: seq.say }, state)
+  })
 
   // Step 4: the watchdog, and W after cleanup.
   enterEndOfRunStep(seq, 'watchdog-stop')
-  const report = seq.watchdog === null ? null : await seq.watchdog.stop()
+  let report: MemoryWatchdogReport | null = null
+  try {
+    report = seq.watchdog === null ? null : await seq.watchdog.stop()
+  } catch (err) {
+    sayError(seq, err, 'stopping the memory watchdog')
+  }
 
-  // Step 5: results.json and summary.txt.
+  // Step 5: results.json and summary.txt. No wait from here to the verdict's
+  // rename, so a stop can arrive only before step 5 or through a hook.
   enterEndOfRunStep(seq, 'results')
-  let files = composeEndFiles(seq, integrity, report)
-  writeEndFiles(seq, files, values)
+  let files = composeEndFilesGuarded(seq, integrity, report)
+  writeEndFilesGuarded(seq, files, values)
   const stopWritten = state.firstStop
 
   // Step 6: verdict.txt, last; the two files again first when a stop came since step 5.
   enterEndOfRunStep(seq, 'verdict')
   if (state.firstStop !== stopWritten) {
-    files = composeEndFiles(seq, integrity, report)
-    writeEndFiles(seq, files, values)
+    files = composeEndFilesGuarded(seq, integrity, report)
+    writeEndFilesGuarded(seq, files, values)
   }
   const written = writeRedactedVerdictFile(run.runDir, files.verdict, values)
   if (!written.ok) {
@@ -16556,6 +16617,263 @@ function runEndOfRunIntegrity(seq: RunSequence, firingRecords: readonly FiringRe
   }
 }
 
+// --- 17/E13.T2 (E13 T2): the run deadline and its timer, the signal traps, the hooks main passes ---
+//
+// The stops themselves are E13.T1's: `recordRunLevelStop` is the one entry
+// (the first stop wins; before the end-of-run sequence it ends any build after
+// recording the stop, tells the fault controller, cancels the limit timers and
+// wakes the follow loop; during it, it changes only the run-level line; after
+// the verdict's rename or while a refusal is being recorded, nothing), and
+// `finishRun`, `stopShards` and `endOfRun` carry a stop to its verdict. This
+// sub-banner adds the two run-level stops that are not E7's:
+// - the run deadline (b.uqm SR-5.5): B = 30 min, plus 60 min once step 4
+//   found the base image missing; start + B until the shards are scheduled,
+//   then start + B + T + 15 min. The status file holds the current deadline at
+//   every write before the switch to `merge` (E3's wait verb reads it); the
+//   deadline then stops changing. It fires on its own timer, armed through the
+//   injected clock in waits of at most 2^31 − 1 ms (E4's `MAX_TIMER_DELAY_MS`);
+// - the traps (b.uqm SR-5.4): SIGINT, SIGTERM and SIGHUP, each an interrupt
+//   with `FAIL: interrupted: <signal>`, registered through `deps.onSignal` only
+//   by the hooks main builds, once the run directory exists (right after step
+//   1), and removed after the run's last act. A signal during validation is
+//   held and recorded once the sequence starts; a validation refusal drops it.
+//   A fresh import registers nothing.
+// Nothing here writes after the verdict or the refusal: a stop then changes
+// nothing, and the end hook only cancels and removes.
+
+/** The signals the runner traps, in the order it registers them (b.uqm SR-5.4). */
+export const TRAPPED_SIGNALS: readonly TrappedSignal[] = ['SIGINT', 'SIGTERM', 'SIGHUP']
+
+/** The run deadline's run-level line (b.uqm SR-5.5): `FAIL: run deadline: <phase> still running at the <m> min deadline`, m the deadline's minutes from the start rounded halves up by E1's one rounding. */
+export function runDeadlineLine(phase: ActiveStatus['phase'], minutes: number): string {
+  return `${FAIL_PREFIX}run deadline: ${phase} still running at the ${roundMinutesHalfUp(minutes)} min deadline`
+}
+
+/** The run deadline's run-level stop, for `recordRunLevelStop`. */
+export function runDeadlineStop(phase: ActiveStatus['phase'], minutes: number): RunLevelStop {
+  return { kind: 'run-deadline', line: runDeadlineLine(phase, minutes) }
+}
+
+/** What the run deadline is computed from (b.uqm SR-5.5). */
+export interface RunDeadlineInput {
+  /** Whether step 4 found the base image missing (E8's `missing` form, `missingAtMs` its moment). */
+  readonly baseMissing: boolean
+  /** T, the run's largest shard limit in whole milliseconds (E4's `Schedule.largestLimitMs`); null before the shards are scheduled. */
+  readonly largestLimitMs: number | null
+}
+
+/** The run deadline as an offset from the runner's start: its exact minutes (the status file's and the line's, before rounding) and its whole milliseconds (the timer's). */
+export interface RunDeadlineOffset {
+  readonly minutes: number
+  readonly ms: number
+}
+
+/**
+ * The run deadline's offset from the start (b.uqm SR-5.5): B is
+ * `BUILD_ALLOWANCE_MINUTES`, plus `BASE_BUILD_ALLOWANCE_MINUTES` once the base
+ * was found missing; until the shards are scheduled the deadline is start + B,
+ * then start + B + T + `MERGE_ALLOWANCE_MINUTES`. The milliseconds are summed
+ * from whole parts, so the timer's moment is exact.
+ */
+export function runDeadlineOffset(input: RunDeadlineInput): RunDeadlineOffset {
+  const allowanceMinutes = BUILD_ALLOWANCE_MINUTES + (input.baseMissing ? BASE_BUILD_ALLOWANCE_MINUTES : 0)
+  if (input.largestLimitMs === null) return { minutes: allowanceMinutes, ms: allowanceMinutes * MS_PER_MINUTE }
+  const fixedMinutes = allowanceMinutes + MERGE_ALLOWANCE_MINUTES
+  return { minutes: fixedMinutes + input.largestLimitMs / MS_PER_MINUTE, ms: fixedMinutes * MS_PER_MINUTE + input.largestLimitMs }
+}
+
+/** The run deadline's input as the run stands (b.uqm SR-5.5). */
+function runDeadlineInputOf(seq: Pick<RunSequence, 'state' | 'schedule'>): RunDeadlineInput {
+  return { baseMissing: seq.state.baseImage?.kind === 'missing', largestLimitMs: seq.schedule?.largestLimitMs ?? null }
+}
+
+/** The status phase as the run stands (b.uqm SR-5.2): `merge` from the start of the end-of-run sequence, else `shards` once scheduled, else `build`. */
+function runStatusPhaseOf(seq: Pick<RunSequence, 'endOfRunStarted' | 'schedule'>): ActiveStatus['phase'] {
+  if (seq.endOfRunStarted) return 'merge'
+  return seq.schedule !== null ? 'shards' : 'build'
+}
+
+/** A one-shot timer armed through the injected clock. */
+interface ClockTimer {
+  /** It never fires after this; idempotent. */
+  cancel(): void
+}
+
+/**
+ * Arms a one-shot timer due at a clock moment: it fires at that moment, on
+ * its own, in waits of at most `MAX_TIMER_DELAY_MS` (E4's limit-timer
+ * technique), so a far moment never fires early; armed after the moment, it
+ * fires on the next timer tick.
+ */
+function armClockTimerAt(clock: RunnerClock, dueAtMs: number, onDue: () => void): ClockTimer {
+  let handle: unknown = null
+  let done = false
+  const arm = (): void => {
+    handle = clock.setTimeout(fire, Math.min(Math.max(0, dueAtMs - clock.now()), MAX_TIMER_DELAY_MS))
+  }
+  function fire(): void {
+    handle = null
+    if (done) return
+    if (clock.now() < dueAtMs) {
+      arm()
+      return
+    }
+    done = true
+    onDue()
+  }
+  arm()
+  return {
+    cancel(): void {
+      done = true
+      if (handle !== null) clock.clearTimeout(handle)
+      handle = null
+    },
+  }
+}
+
+/** The run-level stop hooks main passes to the run sequence, with their own start and end. */
+export interface RunStopHooks extends RunSequenceHooks {
+  /**
+   * Registers SIGINT, SIGTERM and SIGHUP through `deps.onSignal` (b.uqm
+   * SR-5.4); main calls it once step 1 has made the run directory
+   * (`beginRun` returned). Idempotent; registers nothing once disposed. A
+   * registration that throws is written to `log` when given, and the other
+   * signals are still registered.
+   */
+  trap(deps: RunnerDeps, log?: RunnerLogWriter): void
+  /** Cancels the deadline timer and removes every trap; idempotent, writes nothing. Main calls it on every way out, so nothing keeps the process alive. */
+  dispose(): void
+}
+
+/**
+ * The hooks that add the run deadline and the signal traps to a run (b.uqm
+ * SR-5.4, SR-5.5), built by main, one set per run:
+ * - `trap`, once the run directory exists (main calls it right after
+ *   `beginRun`): registers SIGINT, SIGTERM and SIGHUP through
+ *   `deps.onSignal`. A signal once the sequence has started records
+ *   `{kind: 'interrupt', signal}`; one before (during validation) is held
+ *   as pending, the first only, and the sequence's start records it. A
+ *   validation refusal never starts the sequence, so it drops a pending
+ *   signal: the refusal is already being recorded, and a stop then changes
+ *   nothing (b.uqm SR-5.6, SR-5.8);
+ * - at the sequence's start (validation passed): arms the deadline timer at
+ *   start + `BUILD_ALLOWANCE_MINUTES`, the deadline step 1 wrote, registers
+ *   the traps if `trap` was not called, then records the pending signal;
+ * - at the first step after step 4 found the base missing: moves the
+ *   deadline to start + B with the base allowance, writes it in phase `build`
+ *   and re-arms the timer;
+ * - at the scheduling event: moves the deadline to start + B + T + 15 min
+ *   before T1's `shards` write, which carries it, and re-arms the timer;
+ * - at the sequence's end: `dispose`.
+ * When the timer fires it records a run-deadline stop naming the status phase
+ * at that moment; a stop then changes nothing once the verdict is renamed or a
+ * refusal is being recorded (`recordRunLevelStop`). A handler or the timer
+ * never throws: a throw is logged.
+ */
+export function createRunStopHooks(): RunStopHooks {
+  let timer: ClockTimer | null = null
+  const removers: (() => void)[] = []
+  let baseAllowanceApplied = false
+  let disposed = false
+  let trapped = false
+  /** The run sequence once it has started; null before (validation) and for a refused run. */
+  let current: RunSequence | null = null
+  /** The first signal received before the sequence started; recorded at its start. */
+  let pending: TrappedSignal | null = null
+
+  const onTrapped = (received: TrappedSignal): void => {
+    const seq = current
+    if (seq === null) {
+      if (pending === null) pending = received
+      return
+    }
+    try {
+      recordRunLevelStop(seq, { kind: 'interrupt', signal: received })
+    } catch (err) {
+      sayError(seq, err, `the ${received} trap`)
+    }
+  }
+
+  const trap = (deps: RunnerDeps, log?: RunnerLogWriter): void => {
+    if (trapped || disposed) return
+    trapped = true
+    for (const signal of TRAPPED_SIGNALS) {
+      try {
+        removers.push(deps.onSignal(signal, onTrapped))
+      } catch (err) {
+        try {
+          log?.error(err, `trapping ${signal}`)
+        } catch {
+          // The failed append already went to standard error.
+        }
+      }
+    }
+  }
+
+  const armDeadline = (seq: RunSequence, offset: RunDeadlineOffset): void => {
+    timer?.cancel()
+    timer = null
+    if (disposed) return
+    timer = armClockTimerAt(seq.deps.clock, seq.run.basis.startMs + offset.ms, () => {
+      timer = null
+      try {
+        recordRunLevelStop(seq, runDeadlineStop(runStatusPhaseOf(seq), offset.minutes))
+      } catch (err) {
+        sayError(seq, err, 'the run deadline')
+      }
+    })
+  }
+
+  /** Replaces the run's basis with the deadline the run now has, then re-arms the timer; `phase` given, writes it there too (b.uqm SR-5.2). */
+  const moveDeadline = (seq: RunSequence, phase: 'build' | null): void => {
+    const offset = runDeadlineOffset(runDeadlineInputOf(seq))
+    seq.run.basis = { ...seq.run.basis, deadline: statusDeadline(seq.run.basis.startMs, offset.minutes) }
+    if (phase !== null) {
+      const written = writeStatusFile(seq.run.runDir, buildStatus(seq.run.basis, phase))
+      if (!written.ok) seq.say(`ci-run: writing ${STATUS_FILE_NAME} in phase ${phase} failed: ${written.error}`)
+    }
+    armDeadline(seq, offset)
+  }
+
+  const dispose = (): void => {
+    disposed = true
+    pending = null
+    timer?.cancel()
+    timer = null
+    for (const remove of removers.splice(0)) {
+      try {
+        remove()
+      } catch {
+        // A remover that throws leaves nothing more to do; the process exits next.
+      }
+    }
+  }
+
+  return {
+    trap,
+    onSequenceStart: (seq) => {
+      current = seq
+      armDeadline(seq, runDeadlineOffset(runDeadlineInputOf(seq)))
+      trap(seq.deps, seq.run.log)
+      const received = pending
+      pending = null
+      if (received !== null) onTrapped(received)
+    },
+    onStep: (seq) => {
+      if (baseAllowanceApplied || seq.state.baseImage?.kind !== 'missing') return
+      baseAllowanceApplied = true
+      moveDeadline(seq, 'build')
+    },
+    onShardsScheduled: (seq) => {
+      moveDeadline(seq, null)
+    },
+    onSequenceEnd: () => {
+      dispose()
+    },
+    dispose,
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 18. Main entry (E1)
 // ---------------------------------------------------------------------------
@@ -16613,7 +16931,11 @@ export interface MainOptions {
  * - Anything already at the run directory's path: one line on standard error
  *   naming the path, nothing written there, `FAILURE_EXIT_STATUS` (1); so too
  *   when the run directory cannot be created at all.
- * - Otherwise step 1, then `runSequence`: a refusal gives
+ * - Otherwise step 1, then `runSequence` with E13 T2's hooks
+ *   (`createRunStopHooks`: the SIGINT, SIGTERM and SIGHUP traps, registered
+ *   right after step 1, and the run deadline, armed once validation has
+ *   passed; both removed on every way out, so nothing keeps the process
+ *   alive): a refusal gives
  *   `REFUSAL_EXIT_STATUS` (2); a run whose `verdict.txt` was renamed into
  *   place gives `VERDICT_WRITTEN_EXIT_STATUS` (0), whatever the verdict
  *   (E13). Nothing reads either: the reader judges a run by its files.
@@ -16669,10 +16991,13 @@ export async function main(argv: readonly string[], deps: RunnerDeps, options: M
     }),
   )
   let run: RunContext | null = null
+  // The signal traps (E13 T2): registered once the run directory exists; the run deadline once validation has passed; both removed on every way out.
+  const stopHooks = createRunStopHooks()
   try {
     run = beginRun(deps, runId, runDir, args, log)
+    stopHooks.trap(deps, log)
     options.onRunLog?.(log)
-    return await runSequence(deps, run)
+    return await runSequence(deps, run, stopHooks)
   } catch (err) {
     try {
       if (run === null) log(formatRunnerLogFirstLine(runId, deps.pid, args))
@@ -16681,6 +17006,8 @@ export async function main(argv: readonly string[], deps: RunnerDeps, options: M
       // The failed append already went to standard error.
     }
     return FAILURE_EXIT_STATUS
+  } finally {
+    stopHooks.dispose()
   }
 }
 
@@ -16690,7 +17017,8 @@ export async function main(argv: readonly string[], deps: RunnerDeps, options: M
 // dependencies, writes an uncaught exception or rejection to the runner log
 // once the run directory exists (to standard error before that), runs main
 // with the process arguments and exits with its status. Nothing here runs on
-// import; the signal traps are E13's (b.uqm SR-1.3, SR-5.4). Once the refused
+// import; the signal traps are E13's, registered by the hooks main builds,
+// through the `onSignal` this block binds (b.uqm SR-1.3, SR-5.4). Once the refused
 // status or `verdict.txt` is written the runner log is sealed, so an uncaught
 // error after it writes nothing (b.uqm SR-5.7, SR-5.8).
 if (import.meta.main) {
