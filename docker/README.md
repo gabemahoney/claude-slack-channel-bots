@@ -314,6 +314,43 @@ This should complete in seconds, and needs neither build context nor the
 token. `docker history cscb-ci-base:v6` should show the same layer IDs as
 before — proof the source edit didn't invalidate the base.
 
+## /ci: the sharded run
+
+The sharded `/ci` runner is `scripts/ci-run.ts`. It runs the integration
+scripts in up to 6 capped, isolated shards, normally all from one test image
+it builds per run.
+
+### Admission: memory, disk and CPU
+
+A run is admitted only when its own files keep the run directory's volume
+under `/ci`'s disk line, and its shards fit under the memory ceiling and the
+CPUs set aside for CI; otherwise it gets fewer shards, when it may take fewer,
+or a refusal that says why.
+
+### The admission lock, reservations and the sweep
+
+Runs are admitted one at a time under one lock shared by every worktree and
+session of the account; each admitted run holds a reservation until its
+cleanup, and a sweep removes the containers, reservations, tags and untagged
+images that dead runs left behind.
+
+### The per-shard memory cap and out-of-memory kills
+
+Every shard container runs under one memory cap, and the run records each
+shard's anon peak and its out-of-memory status.
+
+### Shard containers
+
+Each shard runs its assigned scripts in its own container, started with set
+limits and mounts, normally from the run's pinned test image, and its run
+removes the container only after its final reading.
+
+### The run's images and tags
+
+Each admitted run builds its own test image, marks it with its owner label and
+a run-private tag, and at its end removes the tags it made and its own untagged
+images.
+
 ## /ci-live: the live Slack acceptance run
 
 `/ci-live` (`bun ci-live/run.ts`) runs the `testplans/b.yko` live acceptance
