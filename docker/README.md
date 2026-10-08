@@ -327,6 +327,188 @@ under `/ci`'s disk line, and its shards fit under the memory ceiling and the
 CPUs set aside for CI; otherwise it gets fewer shards, when it may take fewer,
 or a refusal that says why.
 
+Admission reads the host once, under the admission lock and after the sweep
+(see [The admission lock, reservations and the sweep](#the-admission-lock-reservations-and-the-sweep)).
+Every shard is judged at the per-shard memory cap, 2 GiB to start (see
+[The per-shard memory cap and out-of-memory kills](#the-per-shard-memory-cap-and-out-of-memory-kills)
+for the current cap).
+
+**Pod memory.** Both figures come from the cgroup-namespace root, never from
+a cgroup on the runner's own path:
+
+| Figure | What it is |
+|---|---|
+| L, the pod limit | The root's `memory.max`. A root with no limit (`max`) is a failed reading, and the run is refused |
+| W, the pod working set | The root's `memory.current` minus the `inactive_file` value of its `memory.stat`, never below 0. Messages split it into anon (`anon`), active page cache (`active_file`) and the rest |
+| A container's memory | The same figure from the container's own cgroup, found from the container itself |
+
+The W read here is the run's "before" reading.
+
+**The ceiling.** The ceiling C is 85% of L, in whole bytes rounded down. The
+85% matches the sysadmin monitor's warn line: the monitor checks the same
+cgroup with the same figure, W ÷ L. `/ci` reads no monitor setting; its 85% is
+its own constant.
+
+While a `/ci-live` run is active, C is the lower of that and 40 GiB,
+`/ci-live`'s working-set stop line (see [Memory bounds](#memory-bounds)).
+Shard containers run under the root, so their memory, page cache included,
+is in W; page cache that removed containers leave stays charged to the pod.
+
+**When `/ci-live` counts as active.** A `/ci-live` run is active while either
+of its locks is held (see [One run at a time](#one-run-at-a-time)), or while a
+container labelled `cscb-live=1` runs:
+
+- **The real-run lock:** `run.lock` in `.config/cscb-test` under the
+  account's home, whatever `CSCB_LIVE_CONFIG_DIR` holds.
+- **The dry-run lock:** `cscb-ci-live-dry-run-<uid>.lock` in `/ci-live`'s temp
+  directory: the first of `$TMPDIR`, `$TMP` and `$TEMP` that is set and not
+  empty, else `/tmp`. This is not the rule for `/ci`'s own run directory,
+  which reads `$TMPDIR` alone.
+
+A lock is held only when its file names a PID that is a live `/ci-live`
+runner, by `/ci-live`'s own rule; a dead PID, or a PID that is not a `/ci-live`
+runner, is not counted. `/ci` only reads these files. It never creates,
+writes, renames, removes or locks them, and their content, mode and times stay as they
+were. A lock file that exists but cannot be read, is not a regular file or
+holds more than 64 bytes is a failed reading.
+
+`/ci` counts `/ci-live`, but `/ci-live` does not count `/ci`.
+
+**What admission counts.** Besides W, the memory fit adds these commitments:
+
+| Commitment | Counted as |
+|---|---|
+| Each other live `/ci` reservation | Its memory minus the current memory of its running shard containers, never below 0. A reservation whose runner is dead counts nothing |
+| Each active `/ci-live` run | 13 GiB: its 8 GiB container cap, its 4 GiB Chrome limit and 1 GiB for its runner. Each held lock counts once, its own `cscb-live=1` container included. A `cscb-live=1` container that matches no held lock counts once on its own. A dry run and a real run active together count twice |
+| Each running container labelled `cscb-ci=1` with no live reservation | Its memory cap |
+| Each running `cscb-ci*` container without the `cscb-ci=1` label | Its memory cap |
+
+A container of either of the last two kinds that has no memory cap blocks
+every run: it fails the memory fit whatever the readings, and the refusal
+names it. A `cscb-ci=1` container is picked by its label, whatever its name.
+
+- **Unlabelled:** `blocking every run: container <name>, an uncapped cscb-ci*
+  container; /ci never removes it`.
+- **Labelled:** `blocking every run: container <name>, an uncapped container
+  labelled cscb-ci=1 with no live reservation (owner <RUN_ID>-<PID>); a later
+  /ci run's sweep removes it once its owner is dead` (see
+  [The admission lock, reservations and the sweep](#the-admission-lock-reservations-and-the-sweep)).
+
+The CPU fit counts the CPUs of every other live `/ci` reservation;
+`/ci-live` adds none.
+
+**The three fits.** N is the number of shards being judged:
+
+| Fit | Passes when |
+|---|---|
+| Memory | W + the commitments + N × the cap + the 1 GiB admission margin ≤ C, and no container blocks every run |
+| Disk | (used + 1 GiB) ÷ (used + available) < 85% on the volume holding the run directory. The 1 GiB is an allowance for the run's own files; the 85% is `/ci`'s own disk line |
+| CPU | The other live reservations' CPUs + 2 × N ≤ the 12 CI CPUs |
+
+The disk fit does not depend on N; the memory and CPU fits do.
+
+**Choosing N.** The effective N is the smaller of the requested N and the
+run's scheduling units, at least 1. A run given neither `--shards` nor
+`--inject` takes the largest N, from the effective N down to 1, that passes
+both the memory and the CPU fit. A run given `--shards` or `--inject` takes exactly the
+effective N, or is refused. Either run is refused when the disk fit fails.
+
+The run reports its count in the shard-count line, `shards: <n> of <r>`, r
+being the requested N (6 when `--shards` is not given). When n is below r, the
+reasons that applied follow, in this order, separated by a comma:
+
+| Reason | Given when |
+|---|---|
+| `<u> scheduling unit(s)` | The run has fewer scheduling units than r |
+| `memory: <f> GiB free under the <C> GiB ceiling` | One more shard fails the memory fit. f is C − W − the commitments − the 1 GiB margin, never below 0 |
+| `cpu: <h> of 12 CI CPUs in use` | One more shard fails the CPU fit. h is the CPUs of the other live `/ci` reservations |
+
+A run given `--shards` or `--inject` can show only the scheduling-unit
+reason. For example:
+
+```text
+shards: 6 of 6
+shards: 2 of 4 (2 scheduling unit(s))
+shards: 5 of 6 (memory: 11.1 GiB free under the 54.4 GiB ceiling)
+shards: 0 of 6 (ended before admission)
+```
+
+The last form is for a run that ended before admission chose its N, whatever
+its arguments.
+
+**Refusals.** A refused run's first line names the first limit that failed:
+
+| Kind | First line |
+|---|---|
+| Memory | `NOT RUN: memory: <n> shard(s) need <x> GiB; <f> GiB fits under the <C> GiB ceiling` |
+| Disk | `NOT RUN: disk: <volume> is <p>% used; this run's 1 GiB would take it to <q>%, at or over /ci's 85% disk line` |
+| CPU | `NOT RUN: cpu: <n> shard(s) need <c> CPUs; active /ci runs hold <h> of the 12 CI CPUs` |
+
+When several limits fail, each is given, in the order memory, disk, CPU. The
+first makes the first line; each other follows in the detail lines as
+`<kind>: <summary>`, with its own details. GiB figures are given to one
+decimal place.
+
+n is the effective N for a run given `--shards` or `--inject`. A run that can
+choose its N is judged at 1 shard, the smallest it could take, so its refusal
+says why not even one shard fits. The memory and CPU refusals name the
+largest `--shards` value, at most the effective N, that passes both of those
+fits now (`largest --shards value that fits now: <k>`), or say
+`no --shards value fits now, not even 1`.
+
+The memory refusal also gives the ceiling and its source (85% of L, the
+sysadmin monitor's warn line, or `/ci-live`'s 40 GiB line with the lock or
+container that showed the `/ci-live` run, and its PID), W split into its
+parts, each counted item with its GiB, each blocking container, the margin
+and the cap. The CPU refusal lists each active `/ci` run with its runner PID.
+
+A reading that fails refuses the run before any fit is judged:
+`NOT RUN: disk: could not read <what>: <error>` for the run directory's
+volume, and `NOT RUN: memory: could not read <what>: <error>` for any other
+reading.
+
+**What the figures mean on the development host.** At the 2 GiB starting cap,
+with a 64 GiB pod limit:
+
+- C is 54.4 GiB, so the shards may use 53.4 GiB minus W and the commitments.
+- 6 shards pass the memory fit while W plus the commitments is at most
+  41.4 GiB, and 5 up to 43.4 GiB.
+- While a `/ci-live` run is active, C is 40 GiB and that run counts 13 GiB,
+  so no `/ci` run fits once W is above 24 GiB.
+- A second default full run beside a 6-shard run is refused for CPU: the
+  6-shard run holds all 12 CI CPUs.
+
+**The observed idle working set** is 33–43 GiB, mostly active page cache.
+With nothing else counted, about 42.3 GiB gives a default full run 5 shards
+and refuses `--shards 6`, naming 5 as the largest value that fits; 33.1 GiB
+gives 6. The reading
+varies through the day, and the count with it. While `/ci-live` runs, these
+readings admit no `/ci` run. Load unrelated to `/ci` can push W high enough
+that no run is admitted at all.
+
+**When W is high,** do what the memory refusal's advice says:
+
+1. Finish or kill idle agent-director workers, and confirm their tmux
+   sessions are gone.
+2. Stop the other CI runs or builds the refusal lists.
+3. Re-run `/ci` once the sysadmin monitor's reading is back below its 85%
+   warn line, or once W is back below the ceiling.
+
+Page cache cannot be dropped in this pod; only the kernel reclaims it. A
+smaller `--shards` value, when the refusal names one, may fit now.
+
+**On a disk refusal,** the message lists the `/ci` results directories kept
+in the system temp directory (`$TMPDIR`, else `/tmp`), both the current
+`cscb-ci-<RUN_ID>` form and the legacy `cscb-ci-<digits>-<six letters or digits>`
+form, each with its size, largest first. Remove the results directories and
+other large files on that volume that are not needed, then re-run.
+
+**Docker's storage** is on `/var/lib/docker`, a separate volume, which the
+disk check does not count; the disk refusal notes it. For how a run removes
+its own images, see
+[The run's images and tags](#the-runs-images-and-tags); for its containers,
+see [Shard containers](#shard-containers).
+
 ### The admission lock, reservations and the sweep
 
 Runs are admitted one at a time under one lock shared by every worktree and

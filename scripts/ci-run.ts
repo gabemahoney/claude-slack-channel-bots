@@ -77,6 +77,18 @@ import { isAbsolute } from 'node:path'
 // E5 T2's reservations: the remover. The reader's listing and type check use
 // `lstatSync` and `readdirSync`, imported once by E2 T1's worktree reader (section 7).
 import { unlinkSync } from 'node:fs'
+// E6 T3's /ci-live lock read: read-only, non-blocking, fstat'd, bounded, always closed.
+// Aliased so that no other lane's import of the same names from node:fs collides with these bindings.
+import {
+  closeSync as closeCiLiveLock,
+  constants as ciLiveLockFsConstants,
+  fstatSync as fstatCiLiveLock,
+  openSync as openCiLiveLock,
+  readSync as readCiLiveLock,
+} from 'node:fs'
+// E6 T5's results-directory listing: entries and sizes by lstat, no link followed.
+// Aliased so that no other lane's import of the same names from node:fs collides with these bindings.
+import { lstatSync as lstatResultsEntry, readdirSync as listResultsDir } from 'node:fs'
 
 // ---------------------------------------------------------------------------
 // 1. Entry and dependencies (E1)
@@ -6290,6 +6302,1679 @@ export async function sweepLeftovers(context: SweepContext): Promise<readonly st
 // ---------------------------------------------------------------------------
 // 10. Admission readings and fit (E6)
 // ---------------------------------------------------------------------------
+
+// --- 10/T1 (E6 T1): pod memory, the ceiling, container figures ---
+
+/** The runner's copy of `/ci-live`'s working-set stop line, `HOST_WORKING_SET_LIMIT_BYTES` in `ci-live/lib/memory-watchdog.ts`, 40 GiB; never imported (b.uqm SR-6.6, SR-7.1). */
+export const CI_LIVE_WORKING_SET_LIMIT_BYTES = 40 * GIB_BYTES
+
+/** The cgroup path of the cgroup-namespace root, as `RunnerDeps.readCgroupFile` takes it (b.uqm SR-7.1). */
+const CGROUP_NAMESPACE_ROOT_PATH = '/'
+/** A cgroup's memory limit; `max` when none is set. */
+const CGROUP_MEMORY_MAX_FILE = 'memory.max'
+/** A cgroup's charged memory, page cache included. */
+const CGROUP_MEMORY_CURRENT_FILE = 'memory.current'
+/** A cgroup's memory breakdown, one `<key> <value>` line each. */
+const CGROUP_MEMORY_STAT_FILE = 'memory.stat'
+/** A cgroup's memory events, one `<key> <value>` line each. */
+const CGROUP_MEMORY_EVENTS_FILE = 'memory.events'
+/** A cgroup's process count. */
+const CGROUP_PIDS_CURRENT_FILE = 'pids.current'
+/** `memory.max`'s word for no limit. */
+const CGROUP_NO_LIMIT_WORD = 'max'
+/** `memory.stat`'s inactive page cache, taken off `memory.current` for the working set. */
+const STAT_INACTIVE_FILE_KEY = 'inactive_file'
+/** `memory.stat`'s anonymous memory. */
+const STAT_ANON_KEY = 'anon'
+/** `memory.stat`'s active page cache. */
+const STAT_ACTIVE_FILE_KEY = 'active_file'
+/** `memory.stat`'s whole page cache. */
+const STAT_FILE_KEY = 'file'
+/** `memory.events`' count of out-of-memory kills. */
+const EVENTS_OOM_KILL_KEY = 'oom_kill'
+/** A cgroup file's whole number: decimal digits only. */
+const CGROUP_WHOLE_NUMBER_PATTERN = /^[0-9]+$/
+/** How much of a garbled file's text a failure quotes. */
+const GARBLED_TEXT_QUOTE_LENGTH = 40
+
+/**
+ * One reading (b.uqm SR-6.5, SR-7.3, SR-10.6): its value, or a failure naming
+ * what could not be read and why, each on one line.
+ */
+export type ReadingResult<T> =
+  | {
+      readonly ok: true
+      readonly value: T
+    }
+  | {
+      readonly ok: false
+      /** What could not be read, such as `the pod's memory.max`. */
+      readonly what: string
+      /** Why, on one line. */
+      readonly error: string
+    }
+
+/** The pod's memory (b.uqm SR-7.1): L and W with its parts. */
+export interface PodMemory {
+  /** L: the namespace root's `memory.max`, in bytes. */
+  readonly limitBytes: number
+  /** W with anon and active page cache; the rest is `workingSetRestBytes`. */
+  readonly workingSet: WorkingSetReading
+}
+
+/** Where the ceiling C comes from (b.uqm SR-6.8, SR-7.1, SR-7.4): the pod limit L, or `/ci-live`'s 40 GiB line while the runs it carries are active. */
+export type CeilingSource =
+  | {
+      readonly kind: 'pod-limit'
+      /** L, in bytes. */
+      readonly limitBytes: number
+    }
+  | {
+      readonly kind: 'ci-live'
+      /** The active `/ci-live` runs that lowered C; never empty. */
+      readonly runs: readonly CiLiveRunSeen[]
+    }
+
+/** The ceiling C in whole bytes, with its source (b.uqm SR-7.1). */
+export interface MemoryCeiling {
+  readonly bytes: number
+  readonly source: CeilingSource
+}
+
+/** A container's figures from its own cgroup, each its own reading (b.uqm SR-7.2). */
+export interface ContainerFigures {
+  /** `memory.current` minus `inactive_file`, never below 0. */
+  readonly memoryBytes: ReadingResult<number>
+  /** `anon` from `memory.stat`. */
+  readonly anonBytes: ReadingResult<number>
+  /** `file` from `memory.stat`: its page cache. */
+  readonly fileBytes: ReadingResult<number>
+  /** `pids.current`. */
+  readonly pidCount: ReadingResult<number>
+  /** `oom_kill` from `memory.events`. */
+  readonly oomKillCount: ReadingResult<number>
+}
+
+/** A listed container as admission sees it (b.uqm SR-6.5): its state (name, labels, cap or none) and its current memory. */
+export interface ListedContainer extends ContainerState {
+  /** Its memory, `memory.current` minus `inactive_file` (b.uqm SR-7.2). */
+  readonly currentMemory: ReadingResult<number>
+}
+
+/** The container a figures read is for: its name, for the failure texts, and its main PID (`State.Pid`, 0 when it is not running). */
+export type FiguresTarget = Pick<ContainerState, 'name' | 'pid'>
+
+/** A failed reading, its texts on one line. */
+function readingFailure<T>(what: string, error: string): ReadingResult<T> {
+  return { ok: false, what: dependencyErrorText(what), error: dependencyErrorText(error) }
+}
+
+/** A whole number of bytes from one cgroup file's text, or why it is none. */
+function parseCgroupWholeNumber(text: string): { readonly ok: true; readonly value: number } | { readonly ok: false; readonly error: string } {
+  const trimmed = text.trim()
+  if (trimmed === '') return { ok: false, error: 'the file is empty' }
+  const value = Number(trimmed)
+  if (!CGROUP_WHOLE_NUMBER_PATTERN.test(trimmed) || !Number.isSafeInteger(value)) {
+    return { ok: false, error: `not a whole number: ${JSON.stringify(trimmed.slice(0, GARBLED_TEXT_QUOTE_LENGTH))}` }
+  }
+  return { ok: true, value }
+}
+
+/** One cgroup file's whole text. */
+function readCgroupText(deps: Pick<RunnerDeps, 'readCgroupFile'>, cgroupPath: string, fileName: string, what: string): ReadingResult<string> {
+  const read = deps.readCgroupFile(cgroupPath, fileName)
+  return read.ok ? { ok: true, value: read.value } : readingFailure(what, read.error)
+}
+
+/** One cgroup file holding a whole number. */
+function readCgroupNumber(deps: Pick<RunnerDeps, 'readCgroupFile'>, cgroupPath: string, fileName: string, what: string): ReadingResult<number> {
+  const text = readCgroupText(deps, cgroupPath, fileName, what)
+  if (!text.ok) return text
+  const parsed = parseCgroupWholeNumber(text.value)
+  return parsed.ok ? { ok: true, value: parsed.value } : readingFailure(what, parsed.error)
+}
+
+/** One key's whole number from a flat-keyed cgroup file (`memory.stat`, `memory.events`), already read; `fileWhat` names the file. */
+function keyedCgroupNumber(file: ReadingResult<string>, key: string, fileWhat: string): ReadingResult<number> {
+  if (!file.ok) return file
+  const what = `${key} in ${fileWhat}`
+  for (const line of file.value.split('\n')) {
+    const fields = line.trim().split(/\s+/)
+    if (fields.length !== 2 || fields[0] !== key) continue
+    const parsed = parseCgroupWholeNumber(fields[1] ?? '')
+    return parsed.ok ? { ok: true, value: parsed.value } : readingFailure(what, parsed.error)
+  }
+  return readingFailure(what, `${fileWhat} has no ${key} line`)
+}
+
+/** `memory.current` minus `inactive_file`, never below 0 (b.uqm SR-7.1, SR-7.2). */
+function workingSetBytes(current: ReadingResult<number>, stat: ReadingResult<string>, statWhat: string): ReadingResult<number> {
+  if (!current.ok) return current
+  const inactive = keyedCgroupNumber(stat, STAT_INACTIVE_FILE_KEY, statWhat)
+  if (!inactive.ok) return inactive
+  return { ok: true, value: Math.max(0, current.value - inactive.value) }
+}
+
+/** What a failure names for one of the pod's cgroup files. */
+function podFileWhat(fileName: string): string {
+  return `the pod's ${fileName}`
+}
+
+/**
+ * L: the cgroup-namespace root's `memory.max` in bytes (b.uqm SR-7.1). `max`,
+ * an empty file or text that is not a whole number is a failed reading. Only
+ * the root is read, never a cgroup on the runner's own path.
+ */
+export function readPodLimit(deps: Pick<RunnerDeps, 'readCgroupFile'>): ReadingResult<number> {
+  const what = podFileWhat(CGROUP_MEMORY_MAX_FILE)
+  const text = readCgroupText(deps, CGROUP_NAMESPACE_ROOT_PATH, CGROUP_MEMORY_MAX_FILE, what)
+  if (!text.ok) return text
+  if (text.value.trim() === CGROUP_NO_LIMIT_WORD) return readingFailure(what, `no limit is set (${CGROUP_NO_LIMIT_WORD})`)
+  const parsed = parseCgroupWholeNumber(text.value)
+  return parsed.ok ? { ok: true, value: parsed.value } : readingFailure(what, parsed.error)
+}
+
+/**
+ * W with its parts, from the cgroup-namespace root (b.uqm SR-7.1): W is
+ * `memory.current` minus `inactive_file`, never below 0; its parts are `anon`
+ * and `active_file`. Each missing or garbled file or `memory.stat` key is a
+ * failed reading naming it.
+ */
+export function readPodWorkingSet(deps: Pick<RunnerDeps, 'readCgroupFile'>): ReadingResult<WorkingSetReading> {
+  const statWhat = podFileWhat(CGROUP_MEMORY_STAT_FILE)
+  const current = readCgroupNumber(deps, CGROUP_NAMESPACE_ROOT_PATH, CGROUP_MEMORY_CURRENT_FILE, podFileWhat(CGROUP_MEMORY_CURRENT_FILE))
+  if (!current.ok) return current
+  const stat = readCgroupText(deps, CGROUP_NAMESPACE_ROOT_PATH, CGROUP_MEMORY_STAT_FILE, statWhat)
+  const bytes = workingSetBytes(current, stat, statWhat)
+  if (!bytes.ok) return bytes
+  const anon = keyedCgroupNumber(stat, STAT_ANON_KEY, statWhat)
+  if (!anon.ok) return anon
+  const activeFile = keyedCgroupNumber(stat, STAT_ACTIVE_FILE_KEY, statWhat)
+  if (!activeFile.ok) return activeFile
+  return { ok: true, value: { bytes: bytes.value, anonBytes: anon.value, activeFileBytes: activeFile.value } }
+}
+
+/** L and W with its parts (b.uqm SR-6.5, SR-7.1); the first failed reading, L's first, when any fails. */
+export function readPodMemory(deps: Pick<RunnerDeps, 'readCgroupFile'>): ReadingResult<PodMemory> {
+  const limit = readPodLimit(deps)
+  if (!limit.ok) return limit
+  const workingSet = readPodWorkingSet(deps)
+  if (!workingSet.ok) return workingSet
+  return { ok: true, value: { limitBytes: limit.value, workingSet: workingSet.value } }
+}
+
+/** W's rest: W minus anon and active page cache, never below 0 (b.uqm SR-7.1). */
+export function workingSetRestBytes(reading: WorkingSetReading): number {
+  return Math.max(0, reading.bytes - reading.anonBytes - reading.activeFileBytes)
+}
+
+/** Throws unless `bytes` is a whole number of bytes, 0 or more. */
+function assertWholeBytes(where: string, bytes: number): void {
+  if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error(`${where}: not a whole byte count: ${bytes}`)
+}
+
+/**
+ * The ceiling C in whole bytes, with its source (b.uqm SR-7.1): 85% of L
+ * rounded down; while any `/ci-live` run is active, the lower of that and
+ * `/ci-live`'s 40 GiB line. On a tie the source is the pod limit. Throws for
+ * an L that is not a whole byte count.
+ */
+export function memoryCeiling(limitBytes: number, ciLiveRuns: readonly CiLiveRunSeen[]): MemoryCeiling {
+  assertWholeBytes('memoryCeiling', limitBytes)
+  const podCeiling = Number((BigInt(limitBytes) * BigInt(MEMORY_CEILING_PERCENT)) / BigInt(100))
+  if (ciLiveRuns.length > 0 && CI_LIVE_WORKING_SET_LIMIT_BYTES < podCeiling) {
+    return { bytes: CI_LIVE_WORKING_SET_LIMIT_BYTES, source: { kind: 'ci-live', runs: [...ciLiveRuns] } }
+  }
+  return { bytes: podCeiling, source: { kind: 'pod-limit', limitBytes } }
+}
+
+/**
+ * A whole-byte count in GiB to one decimal place, rounded to the nearest
+ * tenth with a tie rounding up, computed exactly (b.uqm SR-7.4): `54.4`, with
+ * no unit. Throws for a value that is not a whole byte count.
+ */
+export function formatGib(bytes: number): string {
+  assertWholeBytes('formatGib', bytes)
+  const gib = BigInt(GIB_BYTES)
+  const scaled = BigInt(bytes) * BigInt(10)
+  const tenths = scaled / gib + (BigInt(2) * (scaled % gib) >= gib ? BigInt(1) : BigInt(0))
+  return `${tenths / BigInt(10)}.${tenths % BigInt(10)}`
+}
+
+/**
+ * A container's cgroup path below the namespace root, found through its main
+ * process's cgroup v2 membership line (b.uqm SR-7.2), never built from its ID
+ * or the cgroup driver's naming. A main PID of 0, a PID that is gone or a
+ * missing membership line is a failed reading.
+ */
+function locateContainerCgroup(deps: Pick<RunnerDeps, 'readProcCgroup'>, container: FiguresTarget): ReadingResult<string> {
+  const what = `${container.name}'s cgroup`
+  if (container.pid <= 0) return readingFailure(what, `the container is not running (its main PID is ${container.pid})`)
+  const read = deps.readProcCgroup(container.pid)
+  if (read.kind === 'gone') return readingFailure(what, `its main process ${container.pid} is gone`)
+  if (read.kind === 'unreadable') return readingFailure(what, `its main process ${container.pid}'s cgroup: ${read.error}`)
+  const line = read.value.trim()
+  const path = line.startsWith(CGROUP_V2_LINE_PREFIX) ? line.slice(CGROUP_V2_LINE_PREFIX.length) : ''
+  if (!path.startsWith('/')) return readingFailure(what, `its main process ${container.pid} has no cgroup v2 membership line`)
+  return { ok: true, value: path }
+}
+
+/** What a failure names for one of a container's cgroup files. */
+function containerFileWhat(container: FiguresTarget, fileName: string): string {
+  return `${container.name}'s ${fileName}`
+}
+
+/** A container's memory from its located cgroup: `memory.current` minus `inactive_file`, never below 0. */
+function containerMemoryAt(deps: Pick<RunnerDeps, 'readCgroupFile'>, container: FiguresTarget, cgroupPath: string, stat: ReadingResult<string>): ReadingResult<number> {
+  const current = readCgroupNumber(deps, cgroupPath, CGROUP_MEMORY_CURRENT_FILE, containerFileWhat(container, CGROUP_MEMORY_CURRENT_FILE))
+  return workingSetBytes(current, stat, containerFileWhat(container, CGROUP_MEMORY_STAT_FILE))
+}
+
+/**
+ * One container's figures from its own cgroup (b.uqm SR-7.2), found through
+ * its main PID; each figure is its own reading and fails on its own. Never
+ * throws: an exited container or a gone process fails every figure.
+ */
+export function readContainerFigures(deps: Pick<RunnerDeps, 'readCgroupFile' | 'readProcCgroup'>, container: FiguresTarget): ContainerFigures {
+  const cgroup = locateContainerCgroup(deps, container)
+  if (!cgroup.ok) {
+    return { memoryBytes: cgroup, anonBytes: cgroup, fileBytes: cgroup, pidCount: cgroup, oomKillCount: cgroup }
+  }
+  const statWhat = containerFileWhat(container, CGROUP_MEMORY_STAT_FILE)
+  const eventsWhat = containerFileWhat(container, CGROUP_MEMORY_EVENTS_FILE)
+  const stat = readCgroupText(deps, cgroup.value, CGROUP_MEMORY_STAT_FILE, statWhat)
+  const events = readCgroupText(deps, cgroup.value, CGROUP_MEMORY_EVENTS_FILE, eventsWhat)
+  return {
+    memoryBytes: containerMemoryAt(deps, container, cgroup.value, stat),
+    anonBytes: keyedCgroupNumber(stat, STAT_ANON_KEY, statWhat),
+    fileBytes: keyedCgroupNumber(stat, STAT_FILE_KEY, statWhat),
+    pidCount: readCgroupNumber(deps, cgroup.value, CGROUP_PIDS_CURRENT_FILE, containerFileWhat(container, CGROUP_PIDS_CURRENT_FILE)),
+    oomKillCount: keyedCgroupNumber(events, EVENTS_OOM_KILL_KEY, eventsWhat),
+  }
+}
+
+/** One container's current memory alone (b.uqm SR-6.5, SR-7.2): `memory.current` minus `inactive_file` from its own cgroup, never below 0. */
+export function readContainerMemory(deps: Pick<RunnerDeps, 'readCgroupFile' | 'readProcCgroup'>, container: FiguresTarget): ReadingResult<number> {
+  const cgroup = locateContainerCgroup(deps, container)
+  if (!cgroup.ok) return cgroup
+  const stat = readCgroupText(deps, cgroup.value, CGROUP_MEMORY_STAT_FILE, containerFileWhat(container, CGROUP_MEMORY_STAT_FILE))
+  return containerMemoryAt(deps, container, cgroup.value, stat)
+}
+
+// --- 10/T2 (E6 T2): the admission readings ---
+
+/** The name prefix of every `/ci` container admission reads, `cscb-ci*` (b.uqm SR-6.5). `/ci-live`'s containers are named `cscb-live-*`, so they are not among them. */
+export const CI_CONTAINER_NAME_PREFIX = 'cscb-ci'
+
+/** A failed admission reading's refusal kind (b.uqm SR-6.5): `disk` for the run directory's volume, `memory` for every other reading. */
+export type AdmissionReadingKind = 'disk' | 'memory'
+
+/** An admission reading that failed (b.uqm SR-6.5): its refusal kind, what could not be read and why, each text on one line. */
+export interface AdmissionReadingFailure {
+  readonly ok: false
+  readonly kind: AdmissionReadingKind
+  /** What could not be read, such as `the volume holding /tmp/cscb-ci-<RUN_ID>`. */
+  readonly what: string
+  /** Why, on one line. */
+  readonly error: string
+}
+
+/** One admission reading (b.uqm SR-6.5): its value, or a failure that refuses the run. */
+export type AdmissionReading<T> =
+  | {
+      readonly ok: true
+      readonly value: T
+    }
+  | AdmissionReadingFailure
+
+/**
+ * The reservation reader the readings step takes from its caller (b.uqm
+ * SR-6.2, SR-6.5): it lists, parses and classifies the reservations in the
+ * lock directory it is given. E13 binds E5's reader; tests pass a constructed
+ * listing. E6 itself lists, reads and removes no file there.
+ */
+export type ReservationReader = (lockDir: string) => ReservationListing
+
+/**
+ * The admission readings (b.uqm SR-6.5), every one taken. The `/ci-live`
+ * activity (b.uqm SR-6.6) is added beside them when T4 composes the step.
+ */
+export interface AdmissionReadings {
+  /** L: the cgroup-namespace root's `memory.max`, in bytes (b.uqm SR-7.1). */
+  readonly podLimitBytes: number
+  /** W split into anon and active page cache (the rest is `workingSetRestBytes`): the run's "before" reading, which E7 records and the results show (b.uqm SR-6.5). */
+  readonly beforeWorkingSet: WorkingSetReading
+  /** The volume holding the run directory: mount point, used and available bytes. */
+  readonly volume: VolumeReading
+  /** Every running `cscb-ci*` or `cscb-ci=1` container, with labels, cap (null for none) and current memory, in listing order. */
+  readonly containers: readonly ListedContainer[]
+  /** Every valid reservation, live and dead owners alike, each with its owner's liveness, in the reader's order. */
+  readonly reservations: readonly ListedReservation[]
+}
+
+/** What the readings step reads through. */
+export interface AdmissionReadingsInput {
+  /** The cgroup reads (pod memory, container memory) and the volume read. */
+  readonly deps: Pick<RunnerDeps, 'readCgroupFile' | 'readProcCgroup' | 'readVolume'>
+  /** The docker context the container list spawns with. */
+  readonly docker: DockerContext
+  /** The run directory, which step 1 made. */
+  readonly runDir: string
+  /** The admission lock's directory, handed to `readReservations` and named by its failures. */
+  readonly lockDir: string
+  /** The caller's reservation reader. */
+  readonly readReservations: ReservationReader
+}
+
+/** A failed admission reading of a kind, its texts on one line. */
+function admissionReadingFailure(kind: AdmissionReadingKind, what: string, error: string): AdmissionReadingFailure {
+  return { ok: false, kind, what: dependencyErrorText(what), error: dependencyErrorText(error) }
+}
+
+/** A reading as an admission reading of a kind: T1's pod and container readings, and T3's `/ci-live` readings, as `memory`. */
+export function admissionReading<T>(kind: AdmissionReadingKind, reading: ReadingResult<T>): AdmissionReading<T> {
+  return reading.ok ? { ok: true, value: reading.value } : admissionReadingFailure(kind, reading.what, reading.error)
+}
+
+/** Whether a figure is a whole number of bytes, 0 or more. */
+function isWholeByteCount(bytes: number): boolean {
+  return Number.isSafeInteger(bytes) && bytes >= 0
+}
+
+/**
+ * The volume holding the run directory (b.uqm SR-6.5), through the injected
+ * volume read: its mount point, used bytes (size minus free) and available
+ * bytes. A failing read, the mount-point lookup included, or figures that are
+ * not whole byte counts, is a failed reading of kind `disk`.
+ */
+export function readRunVolume(deps: Pick<RunnerDeps, 'readVolume'>, runDir: string): AdmissionReading<VolumeReading> {
+  const what = `the volume holding ${runDir}`
+  const read = deps.readVolume(runDir)
+  if (!read.ok) return admissionReadingFailure('disk', what, read.error)
+  const { mountPoint, usedBytes, availableBytes } = read.value
+  if (mountPoint === '') return admissionReadingFailure('disk', what, 'no mount point was found')
+  if (!isWholeByteCount(usedBytes)) return admissionReadingFailure('disk', what, `used bytes are not a whole byte count: ${usedBytes}`)
+  if (!isWholeByteCount(availableBytes)) return admissionReadingFailure('disk', what, `available bytes are not a whole byte count: ${availableBytes}`)
+  return { ok: true, value: { mountPoint, usedBytes, availableBytes } }
+}
+
+/** Whether admission reads a container (b.uqm SR-6.5): running, and named `cscb-ci*` or labelled `cscb-ci=1`. */
+export function isAdmissionContainer(state: ContainerState): boolean {
+  if (!state.running) return false
+  return state.name.startsWith(CI_CONTAINER_NAME_PREFIX) || state.labels[CI_LABEL] === CI_LABEL_VALUE
+}
+
+/**
+ * Every running `cscb-ci*` or `cscb-ci=1` container (b.uqm SR-6.5) of an
+ * already-listed set (E1's container list, any state), in its order, each with
+ * its labels, its cap (a cap of 0 or none set is null) and its current memory
+ * from T1's reader. A container whose memory cannot be read is a failed reading
+ * naming the container, the first in list order. Kind `memory`. Lists nothing.
+ */
+export function admissionContainersFrom(
+  deps: Pick<RunnerDeps, 'readCgroupFile' | 'readProcCgroup'>,
+  states: readonly ContainerState[],
+): AdmissionReading<readonly ListedContainer[]> {
+  const containers: ListedContainer[] = []
+  for (const state of states) {
+    if (!isAdmissionContainer(state)) continue
+    const currentMemory = readContainerMemory(deps, state)
+    if (!currentMemory.ok) return admissionReading('memory', currentMemory)
+    const memoryCapBytes = state.memoryCapBytes === 0 ? null : state.memoryCapBytes
+    containers.push({ ...state, memoryCapBytes, currentMemory })
+  }
+  return { ok: true, value: containers }
+}
+
+/** E1's container list as an admission reading: a failing list is a failed reading, `the container list`, of kind `memory`. */
+async function listAdmissionContainerStates(docker: DockerContext): Promise<AdmissionReading<readonly ContainerState[]>> {
+  const listed = await listContainers(docker)
+  if (!listed.ok) return admissionReadingFailure('memory', 'the container list', listed.error)
+  return { ok: true, value: listed.value }
+}
+
+/**
+ * The admission containers, listing them itself through E1's container list
+ * (one listing): a failing list is a failed reading naming it; otherwise as
+ * `admissionContainersFrom`. The readings step lists through
+ * `takeAdmissionReadings` instead, which keeps the listing for T4.
+ */
+export async function readAdmissionContainers(
+  deps: Pick<RunnerDeps, 'readCgroupFile' | 'readProcCgroup'>,
+  docker: DockerContext,
+): Promise<AdmissionReading<readonly ListedContainer[]>> {
+  const listed = await listAdmissionContainerStates(docker)
+  if (!listed.ok) return listed
+  return admissionContainersFrom(deps, listed.value)
+}
+
+/**
+ * The reservations as admission takes them (b.uqm SR-6.2, SR-6.5), from the
+ * caller's reader: every valid one, live and dead owners alike, with its
+ * owner's liveness. A bad file whose owner is alive is a failed reading naming
+ * the file and the reason, the first in the reader's order; one whose owner is
+ * dead is skipped (the sweep's case). A listing failure, or a reader that
+ * throws, is a failed reading naming the lock directory. Kind `memory`. No
+ * file is listed, read or removed here.
+ */
+export function readAdmissionReservations(readReservations: ReservationReader, lockDir: string): AdmissionReading<readonly ListedReservation[]> {
+  const what = `the lock directory ${lockDir}`
+  let listing: ReservationListing
+  try {
+    listing = readReservations(lockDir)
+  } catch (err) {
+    return admissionReadingFailure('memory', what, dependencyErrorText(err))
+  }
+  if (listing.kind === 'failed') return admissionReadingFailure('memory', what, listing.error)
+  const liveBad = listing.bad.find((file) => file.ownerAlive)
+  if (liveBad !== undefined) return admissionReadingFailure('memory', `the reservation ${join(lockDir, liveBad.fileName)}`, liveBad.reason)
+  return { ok: true, value: [...listing.valid] }
+}
+
+/**
+ * A failed reading's refusal (b.uqm SR-5.2, SR-6.5): its kind, the summary
+ * `could not read <what>: <error>` on one line and no details, so its first
+ * line is `NOT RUN: disk: could not read …` for the volume and
+ * `NOT RUN: memory: could not read …` for every other reading.
+ */
+export function failedReadingRefusal(failure: AdmissionReadingFailure): Refusal {
+  return buildRefusal(failure.kind, `could not read ${dependencyErrorText(failure.what)}: ${dependencyErrorText(failure.error)}`)
+}
+
+/**
+ * What the readings step answers (b.uqm SR-6.5): the readings, and the one
+ * container listing they were taken from. The listing is not a reading of its
+ * own; T4 hands it to `detectCiLiveActivity`, so admission lists the
+ * containers once and both judge the same snapshot.
+ */
+export interface TakenAdmissionReadings {
+  readonly readings: AdmissionReadings
+  /** E1's container list as the readings took it: every container, in any state, in listing order. */
+  readonly containerListing: readonly ContainerState[]
+}
+
+/**
+ * The admission readings (b.uqm SR-6.5), taken under the lock after the sweep,
+ * in SR-6.5's order: W with its parts and L, the run directory's volume, the
+ * containers (E1's container list, listed exactly once), the reservations.
+ * The first reading that fails stops the step and is its answer;
+ * `failedReadingRefusal` turns it into the run's refusal. On success the
+ * listing comes back beside the readings for T4's `/ci-live` detection.
+ */
+export async function takeAdmissionReadings(input: AdmissionReadingsInput): Promise<AdmissionReading<TakenAdmissionReadings>> {
+  const pod = admissionReading('memory', readPodMemory(input.deps))
+  if (!pod.ok) return pod
+  const volume = readRunVolume(input.deps, input.runDir)
+  if (!volume.ok) return volume
+  const listing = await listAdmissionContainerStates(input.docker)
+  if (!listing.ok) return listing
+  const containers = admissionContainersFrom(input.deps, listing.value)
+  if (!containers.ok) return containers
+  const reservations = readAdmissionReservations(input.readReservations, input.lockDir)
+  if (!reservations.ok) return reservations
+  return {
+    ok: true,
+    value: {
+      readings: {
+        podLimitBytes: pod.value.limitBytes,
+        beforeWorkingSet: pod.value.workingSet,
+        volume: volume.value,
+        containers: containers.value,
+        reservations: reservations.value,
+      },
+      containerListing: listing.value,
+    },
+  }
+}
+
+// --- 10/T3 (E6 T3): /ci-live detection, the runner's copies, the commitments ---
+
+// The runner's own copies of `/ci-live`'s rules and figures (b.uqm SR-6.6,
+// SR-21.5), read from `ci-live/lib/*.ts` and never imported (b.uqm SR-1.3).
+// The tests pin each copy against `/ci-live`'s exports.
+
+/** `/ci-live`'s directory name in the worktree: a bare `run.ts` is its runner only when started there (`isLiveRunnerPid` in `ci-live/lib/run-lock.ts`). */
+export const CI_LIVE_DIR_NAME = 'ci-live'
+/** `/ci-live`'s entry file name (`ci-live/run.ts`). */
+export const CI_LIVE_ENTRY_FILE_NAME = 'run.ts'
+/** `/ci-live`'s default config directory below the account's home (`defaultConfigDir` in `ci-live/lib/paths.ts`); `CSCB_LIVE_CONFIG_DIR` is never consulted. */
+export const CI_LIVE_CONFIG_DIR_SUBPATH = '.config/cscb-test'
+/** The real-run lock's file name in that directory (`realRunLockFile`). */
+export const CI_LIVE_REAL_RUN_LOCK_FILE_NAME = 'run.lock'
+/** The dry-run lock's name before the user ID (`dryRunLockFile`): `cscb-ci-live-dry-run-<uid>.lock`. */
+export const CI_LIVE_DRY_RUN_LOCK_PREFIX = 'cscb-ci-live-dry-run-'
+/** The dry-run lock's name after the user ID. */
+export const CI_LIVE_DRY_RUN_LOCK_SUFFIX = '.lock'
+/** The variables Bun's `os.tmpdir()` reads for `/ci-live`'s temp directory, in order: the first set and not empty wins, else `/tmp` (b.uqm SR-6.6). */
+export const CI_LIVE_TEMP_DIR_VARIABLES = ['TMPDIR', 'TMP', 'TEMP'] as const
+/** The label every `/ci-live` container carries, `cscb-live=1` (`CONTAINER_LABEL_KEY` in `ci-live/lib/docker.ts`). */
+export const CI_LIVE_CONTAINER_LABEL = 'cscb-live'
+/** That label's value. */
+export const CI_LIVE_CONTAINER_LABEL_VALUE = '1'
+/** A `/ci-live` container's name prefix (`CONTAINER_PREFIX`): `cscb-live-<run id>-<owner PID>` (`containerName`). */
+export const CI_LIVE_CONTAINER_PREFIX = 'cscb-live-'
+/** `/ci-live`'s container cap, 8 GiB, as bytes (`CONTAINER_MEMORY`, `8g`, in `ci-live/lib/docker.ts`). */
+export const CI_LIVE_CONTAINER_MEMORY_BYTES = 8 * GIB_BYTES
+/** `/ci-live`'s Chrome limit, 4 GiB, as bytes (`CHROME_PSS_LIMIT_BYTES` in `ci-live/lib/memory-watchdog.ts`). */
+export const CI_LIVE_CHROME_LIMIT_BYTES = 4 * GIB_BYTES
+/** What one active `/ci-live` run counts (b.uqm SR-6.6): its container cap, its Chrome limit and the 1 GiB runner allowance, 13 GiB. */
+export const CI_LIVE_RUN_COMMITMENT_BYTES = CI_LIVE_CONTAINER_MEMORY_BYTES + CI_LIVE_CHROME_LIMIT_BYTES + CI_LIVE_RUNNER_ALLOWANCE_BYTES
+/** The most a `/ci-live` lock read takes, in bytes: a lock holds a PID of at most ten digits and a newline, so a regular file larger than this is a failed reading. The runner's own bound, not a `/ci-live` figure. */
+export const CI_LIVE_LOCK_READ_MAX_BYTES = 64
+
+/** A lock file's text as `lockPid` reads it: one to ten digits, then only optional whitespace. */
+const CI_LIVE_LOCK_PID_PATTERN = /^(\d{1,10})\s*$/
+/** What follows the prefix in a `/ci-live` container's name: `<run id>-<owner PID>`, or an older runner's bare `<run id>` (`LIVE_NAME_SUFFIX_RE`). */
+const CI_LIVE_CONTAINER_NAME_SUFFIX_PATTERN = /^[0-9a-z]{1,32}(-[1-9][0-9]{0,9})?$/
+
+/** `/ci-live`'s default config directory under the account's home (`defaultConfigDir`). The home comes from the caller (E13 binds E5's account-home lookup). */
+export function ciLiveConfigDir(home: string): string {
+  return join(home, CI_LIVE_CONFIG_DIR_SUBPATH)
+}
+
+/** The real-run lock, `run.lock` in `.config/cscb-test` under the account's home, whatever `CSCB_LIVE_CONFIG_DIR` holds (b.uqm SR-6.6). */
+export function ciLiveRealRunLockPath(home: string): string {
+  return join(ciLiveConfigDir(home), CI_LIVE_REAL_RUN_LOCK_FILE_NAME)
+}
+
+/**
+ * `/ci-live`'s temp directory as Bun's `os.tmpdir()` finds it, from the
+ * runner's injected environment (b.uqm SR-6.6): the first of `TMPDIR`, `TMP`
+ * and `TEMP` that is set and not empty, else `/tmp`, with one trailing slash
+ * dropped from any value but `/`. Not the run directory's rule (`systemTempDir`).
+ */
+export function ciLiveTempDir(env: Readonly<Record<string, string | undefined>>): string {
+  let dir: string = DEFAULT_TEMP_DIR
+  for (const variable of CI_LIVE_TEMP_DIR_VARIABLES) {
+    const value = env[variable]
+    if (value !== undefined && value !== '') {
+      dir = value
+      break
+    }
+  }
+  return dir.length > 1 && dir.endsWith('/') ? dir.slice(0, -1) : dir
+}
+
+/** The dry-run lock's name, `cscb-ci-live-dry-run-<uid>.lock`, uid being the runner's user ID. */
+export function ciLiveDryRunLockName(uid: number): string {
+  return `${CI_LIVE_DRY_RUN_LOCK_PREFIX}${uid}${CI_LIVE_DRY_RUN_LOCK_SUFFIX}`
+}
+
+/** The dry-run lock: `/ci-live`'s temp directory and the lock's name joined as `dryRunLockFile` joins them, so repeated slashes collapse. */
+export function ciLiveDryRunLockPath(env: Readonly<Record<string, string | undefined>>, uid: number): string {
+  return join(ciLiveTempDir(env), ciLiveDryRunLockName(uid))
+}
+
+/** The PID a lock file's text names, as `lockPid` reads it: one to ten digits followed only by optional whitespace; anything else, or no text, is null. */
+export function ciLiveLockPid(text: string | null): number | null {
+  const match = CI_LIVE_LOCK_PID_PATTERN.exec(text ?? '')
+  return match ? Number(match[1]) : null
+}
+
+/** The patterns that find a `/ci-live` runner, built from `CI_LIVE_DIR_NAME` and `CI_LIVE_ENTRY_FILE_NAME` as `isLiveRunnerPid`'s literals read. */
+interface CiLiveRunnerPatterns {
+  /** A runner's command line by its path: `ci-live/run.ts`, with either slash, then whitespace or the end. */
+  readonly runnerCmdline: RegExp
+  /** A bare `run.ts` as its own word, a runner only when its working directory is a `ci-live` directory. */
+  readonly bareRunnerCmdline: RegExp
+  /** A working directory that ends in `/ci-live` (either slash). */
+  readonly ciLiveCwd: RegExp
+}
+
+/** Built at first use, never at import (b.uqm SR-1.3). */
+let ciLiveRunnerPatternsBuilt: CiLiveRunnerPatterns | null = null
+
+/** A text as a regular-expression source that matches it literally. */
+function literalPatternSource(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/** The `/ci-live` runner patterns, built once at first use. */
+function ciLiveRunnerPatterns(): CiLiveRunnerPatterns {
+  if (ciLiveRunnerPatternsBuilt === null) {
+    const dir = literalPatternSource(CI_LIVE_DIR_NAME)
+    const entry = literalPatternSource(CI_LIVE_ENTRY_FILE_NAME)
+    ciLiveRunnerPatternsBuilt = {
+      runnerCmdline: new RegExp(`${dir}[/\\\\]${entry}(\\s|$)`),
+      bareRunnerCmdline: new RegExp(`(^|[\\s/\\\\])${entry}(\\s|$)`),
+      ciLiveCwd: new RegExp(`[/\\\\]${dir}$`),
+    }
+  }
+  return ciLiveRunnerPatternsBuilt
+}
+
+/**
+ * Whether a PID is a live `/ci-live` runner, as `isLiveRunnerPid` judges it
+ * from a command line (NULs read as spaces) and a working directory, each
+ * null when it cannot be read. A PID that is not a positive whole number, or
+ * whose command line cannot be read, is none; a command line holding
+ * `ci-live/run.ts` (either slash) followed by whitespace or the end is one; so
+ * is a bare `run.ts` as its own word when the working directory ends in
+ * `/ci-live`.
+ */
+export function isCiLiveRunnerPid(pid: number, readCmdline: (pid: number) => string | null, readCwd: (pid: number) => string | null): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  const cmdline = readCmdline(pid)
+  if (cmdline === null) return false
+  const patterns = ciLiveRunnerPatterns()
+  if (patterns.runnerCmdline.test(cmdline)) return true
+  return patterns.bareRunnerCmdline.test(cmdline) && patterns.ciLiveCwd.test(readCwd(pid) ?? '')
+}
+
+/** The `/proc` reads the `/ci-live` runner test takes. */
+export type CiLiveProcProbe = Pick<RunnerDeps, 'readProcCmdline' | 'readProcCwd'>
+
+/** A command line as `/proc/<pid>/cmdline` holds it, each argument NUL-terminated, with the NULs read as spaces. */
+function ciLiveCommandLineText(args: readonly string[]): string {
+  return args.map((arg) => `${arg} `).join('')
+}
+
+/** Whether a PID is a live `/ci-live` runner, through the injected `/proc` reads; a read that fails is no command line or no working directory. */
+export function isCiLiveRunner(probe: CiLiveProcProbe, pid: number): boolean {
+  return isCiLiveRunnerPid(
+    pid,
+    (p) => {
+      const read = probe.readProcCmdline(p)
+      return read.kind === 'value' ? ciLiveCommandLineText(read.value) : null
+    },
+    (p) => {
+      const read = probe.readProcCwd(p)
+      return read.kind === 'value' ? read.value : null
+    },
+  )
+}
+
+/** The owner PID a `/ci-live` container's name carries (`cscb-live-<run id>-<PID>`, as `containerName` forms it); null for an older runner's bare `cscb-live-<run id>` or a name of another form. */
+export function ciLiveContainerPid(name: string): number | null {
+  if (!name.startsWith(CI_LIVE_CONTAINER_PREFIX)) return null
+  const match = CI_LIVE_CONTAINER_NAME_SUFFIX_PATTERN.exec(name.slice(CI_LIVE_CONTAINER_PREFIX.length))
+  if (match === null || match[1] === undefined) return null
+  return Number(match[1].slice(1))
+}
+
+/** Whether a container is a running `/ci-live` container, labelled `cscb-live=1`. */
+export function isRunningCiLiveContainer(state: ContainerState): boolean {
+  return state.running && labelValue(state.labels, CI_LIVE_CONTAINER_LABEL) === CI_LIVE_CONTAINER_LABEL_VALUE
+}
+
+/** A held `/ci-live` lock (b.uqm SR-6.6): its file names a PID that is a live `/ci-live` runner. */
+export interface CiLiveHeldLock {
+  readonly via: 'real-run-lock' | 'dry-run-lock'
+  /** The lock file's path. */
+  readonly path: string
+  /** The runner PID it names. */
+  readonly pid: number
+  /** Its own containers: each running `cscb-live=1` container whose name carries its PID; usually one or none. */
+  readonly ownContainers: readonly ContainerState[]
+}
+
+/** A running `cscb-live=1` container that matches no held lock: an active run of its own. */
+export interface CiLiveLoneContainer {
+  readonly container: ContainerState
+  /** The PID its name carries; null when it carries none. */
+  readonly pid: number | null
+}
+
+/** The `/ci-live` activity (b.uqm SR-6.6). */
+export interface CiLiveActivity {
+  /** Every active run, as `memoryCeiling` and E7 take them: the held real-run lock, the held dry-run lock, then each lone container in listing order. */
+  readonly runs: readonly CiLiveRunSeen[]
+  /** Each held lock with its own containers. */
+  readonly heldLocks: readonly CiLiveHeldLock[]
+  /** Each running `cscb-live=1` container that matches no held lock. */
+  readonly loneContainers: readonly CiLiveLoneContainer[]
+}
+
+/** What the `/ci-live` detector reads through: the environment and user ID for the dry-run lock, and the `/proc` reads for the runner test. */
+export type CiLiveDetectionDeps = Pick<RunnerDeps, 'env' | 'uid' | 'readProcCmdline' | 'readProcCwd'>
+
+/** Closes a descriptor, a failing close ignored: the read's answer stands either way. */
+function closeQuietly(fd: number): void {
+  try {
+    closeCiLiveLock(fd)
+  } catch {
+    // Nothing to undo: the descriptor was only read.
+  }
+}
+
+/**
+ * A `/ci-live` lock file's text, read so that it cannot hang (b.uqm SR-6.6):
+ * opened read-only and non-blocking (`O_RDONLY | O_NONBLOCK`, never `O_CREAT`
+ * or a write mode), `fstat`ed, and read for at most
+ * `CI_LIVE_LOCK_READ_MAX_BYTES` bytes; the descriptor is always closed. A
+ * path that does not exist is missing. Anything that is not a regular file (a
+ * FIFO, a device, a directory), a regular file larger than the bound, or any
+ * other failure is unreadable. Nothing is written, renamed, removed, created,
+ * locked or touched: the file's content, mode and times stay as they were.
+ */
+export function readCiLiveLockFile(path: string): FileTextRead {
+  let fd: number
+  try {
+    fd = openCiLiveLock(path, ciLiveLockFsConstants.O_RDONLY | ciLiveLockFsConstants.O_NONBLOCK)
+  } catch (err) {
+    if (errnoCode(err) === 'ENOENT') return { kind: 'missing' }
+    return { kind: 'unreadable', error: dependencyErrorText(err) }
+  }
+  try {
+    const stat = fstatCiLiveLock(fd)
+    if (!stat.isFile()) return { kind: 'unreadable', error: 'not a regular file' }
+    if (stat.size > CI_LIVE_LOCK_READ_MAX_BYTES) return { kind: 'unreadable', error: `larger than ${CI_LIVE_LOCK_READ_MAX_BYTES} bytes: ${stat.size} bytes` }
+    const buffer = Buffer.alloc(CI_LIVE_LOCK_READ_MAX_BYTES)
+    let length = 0
+    while (length < buffer.length) {
+      const read = readCiLiveLock(fd, buffer, length, buffer.length - length, null)
+      if (read === 0) break
+      length += read
+    }
+    return { kind: 'text', text: buffer.toString('utf-8', 0, length) }
+  } catch (err) {
+    return { kind: 'unreadable', error: dependencyErrorText(err) }
+  } finally {
+    closeQuietly(fd)
+  }
+}
+
+/**
+ * One lock's holder, read-only (b.uqm SR-6.6): the PID its text names when
+ * that is a live `/ci-live` runner, else null. A missing file is not held; a
+ * file that exists but cannot be read, or is not a regular file within
+ * `CI_LIVE_LOCK_READ_MAX_BYTES`, is a failed reading. The file is only read,
+ * through `readCiLiveLockFile`: never created, written, renamed, removed,
+ * opened for writing or locked, and the read cannot block.
+ */
+function readCiLiveLockHolder(probe: CiLiveProcProbe, path: string, what: string): ReadingResult<number | null> {
+  const read = readCiLiveLockFile(path)
+  if (read.kind === 'missing') return { ok: true, value: null }
+  if (read.kind === 'unreadable') return readingFailure(what, read.error)
+  const pid = ciLiveLockPid(read.text)
+  return { ok: true, value: pid !== null && isCiLiveRunner(probe, pid) ? pid : null }
+}
+
+/**
+ * The active `/ci-live` runs (b.uqm SR-6.6) over an already-listed set of
+ * containers (any state; only running `cscb-live=1` ones count). Each lock is
+ * held when its file names a PID that is a live `/ci-live` runner; each held
+ * lock gets its own containers (the `cscb-live=1` containers whose names carry
+ * its PID), which are not runs of their own; each other running `cscb-live=1`
+ * container is a run of its own. `home` is the account's home, from the
+ * caller. A lock file that exists but cannot be read (or is not a regular
+ * file within `CI_LIVE_LOCK_READ_MAX_BYTES`) is a failed reading. The lock
+ * files are only read, non-blocking (`readCiLiveLockFile`); nothing else
+ * touches them.
+ */
+export function detectCiLiveActivity(deps: CiLiveDetectionDeps, home: string, containers: readonly ContainerState[]): ReadingResult<CiLiveActivity> {
+  const liveContainers = containers.filter(isRunningCiLiveContainer)
+  const locks: readonly { readonly via: CiLiveHeldLock['via']; readonly path: string; readonly what: string }[] = [
+    { via: 'real-run-lock', path: ciLiveRealRunLockPath(home), what: `the /ci-live real-run lock ${ciLiveRealRunLockPath(home)}` },
+    { via: 'dry-run-lock', path: ciLiveDryRunLockPath(deps.env, deps.uid), what: `the /ci-live dry-run lock ${ciLiveDryRunLockPath(deps.env, deps.uid)}` },
+  ]
+  const heldLocks: CiLiveHeldLock[] = []
+  for (const lock of locks) {
+    const holder = readCiLiveLockHolder(deps, lock.path, lock.what)
+    if (!holder.ok) return holder
+    if (holder.value === null) continue
+    const pid = holder.value
+    heldLocks.push({ via: lock.via, path: lock.path, pid, ownContainers: liveContainers.filter((state) => ciLiveContainerPid(state.name) === pid) })
+  }
+  const heldPids = new Set(heldLocks.map((lock) => lock.pid))
+  const loneContainers: CiLiveLoneContainer[] = []
+  for (const container of liveContainers) {
+    const pid = ciLiveContainerPid(container.name)
+    if (pid !== null && heldPids.has(pid)) continue
+    loneContainers.push({ container, pid })
+  }
+  const runs: CiLiveRunSeen[] = [
+    ...heldLocks.map((lock): CiLiveRunSeen => ({ via: lock.via, what: lock.path, pid: lock.pid })),
+    ...loneContainers.map((lone): CiLiveRunSeen => ({ via: 'container', what: lone.container.name, pid: lone.pid })),
+  ]
+  return { ok: true, value: { runs, heldLocks, loneContainers } }
+}
+
+/**
+ * The active `/ci-live` runs (b.uqm SR-6.6), listing the containers itself
+ * through E1's container list: what E7 calls at every sample. A failing list
+ * is a failed reading, `the container list`; otherwise as `detectCiLiveActivity`.
+ */
+export async function readCiLiveActivity(deps: CiLiveDetectionDeps, home: string, docker: DockerContext): Promise<ReadingResult<CiLiveActivity>> {
+  const listed = await listContainers(docker)
+  if (!listed.ok) return readingFailure('the container list', listed.error)
+  return detectCiLiveActivity(deps, home, listed.value)
+}
+
+/** Another live `/ci` run's reservation as counted: its memory minus its running shard containers' current memory, never below 0. */
+export interface ReservationCommitment {
+  readonly kind: 'reservation'
+  /** Its file name beside the lock. */
+  readonly fileName: string
+  /** The reservation: RUN_ID, runner PID, shards, memory, CPUs, full or selective. */
+  readonly reservation: Reservation
+  /** Its owner's running shard containers, matched by the owner label, in listing order. */
+  readonly shardContainers: readonly string[]
+  /** The current memory of those containers that was read; a container whose memory could not be read adds 0. */
+  readonly shardMemoryBytes: number
+  readonly countedBytes: number
+}
+
+/** An active `/ci-live` run as counted: 13 GiB, once per held lock (its own containers included) or per lone container. */
+export interface CiLiveCommitment {
+  readonly kind: 'ci-live'
+  /** The lock or container that showed it, and its PID. */
+  readonly run: CiLiveRunSeen
+  /** A held lock's own containers' names; none for a lone container. */
+  readonly ownContainers: readonly string[]
+  readonly countedBytes: number
+}
+
+/** A running container counted at its cap: labelled `cscb-ci=1` with no live reservation, or an unlabelled `cscb-ci*` one. */
+export interface ContainerCommitment {
+  readonly kind: 'labelled-container' | 'unlabelled-container'
+  readonly name: string
+  /** A labelled container's owner from its owner label; null when that is missing or malformed, and for an unlabelled one. */
+  readonly owner: Owner | null
+  /** Its cap. */
+  readonly countedBytes: number
+}
+
+/** One counted commitment (b.uqm SR-6.6). */
+export type MemoryCommitment = ReservationCommitment | CiLiveCommitment | ContainerCommitment
+
+/** A running container with no memory cap that blocks every run (b.uqm SR-6.6, SR-6.7); admission removes none, and `/ci` never removes an unlabelled one (a labelled one goes in a later run's sweep once its owner is dead, SR-6.4). */
+export interface BlockingContainer {
+  readonly name: string
+  /** Whether it carries `cscb-ci=1` (a labelled one with no live reservation), or is an unlabelled `cscb-ci*` one. */
+  readonly labelled: boolean
+  /** A labelled container's owner from its owner label; null when that is missing or malformed, and for an unlabelled one. */
+  readonly owner: Owner | null
+}
+
+/** What admission counts (b.uqm SR-6.6). */
+export interface MemoryCommitments {
+  /** The sum of every item's counted bytes. */
+  readonly totalBytes: number
+  /** Each counted item in order: the live reservations, the `/ci-live` runs, then the containers counted at their caps, in listing order. */
+  readonly items: readonly MemoryCommitment[]
+  /** The uncapped containers that block every run, named. */
+  readonly blocking: readonly BlockingContainer[]
+  /** h: the CPUs of the live reservations; `/ci-live` adds none. */
+  readonly reservedCpus: number
+}
+
+/** Whether a container's owner label names this reservation's owner. */
+function isReservationShard(state: ContainerState, reservation: Reservation): boolean {
+  const owner = parseOwner(labelValue(state.labels, OWNER_LABEL) ?? '')
+  return owner !== null && owner.runId === reservation.runId && owner.pid === reservation.pid
+}
+
+/**
+ * The memory commitments, the blocking containers and h (b.uqm SR-6.6), from
+ * the listed containers (T1's shape; only running ones count), the valid
+ * reservations with their owners' liveness, and the `/ci-live` activity:
+ *
+ * - each live reservation: its memory minus the current memory of its owner's
+ *   running `cscb-ci=1` containers (matched by the owner label), never below 0;
+ *   a reservation whose owner is dead counts nothing;
+ * - each active `/ci-live` run: 13 GiB, once per held lock with its own
+ *   containers included, and once per lone `cscb-live=1` container;
+ * - each running `cscb-ci=1` container whose owner has no live reservation:
+ *   its cap;
+ * - each running `cscb-ci*` container without `cscb-ci=1`: its cap.
+ *
+ * A container counted at its cap that has none (null or 0) blocks every run
+ * instead: the unlabelled ones as SR-6.6 states, and, as the safe reading, a
+ * labelled one with no live reservation too. h sums the live reservations' CPUs.
+ *
+ * Precondition: call it before this run's own reservation exists (before
+ * steps 8–9 write it), so every live reservation it sees is another run's;
+ * called later, it would count this run against itself.
+ */
+export function memoryCommitments(
+  containers: readonly ListedContainer[],
+  reservations: readonly ListedReservation[],
+  activity: CiLiveActivity,
+): MemoryCommitments {
+  const running = containers.filter((state) => state.running)
+  const live = reservations.filter((listed) => listed.ownerAlive)
+  const items: MemoryCommitment[] = []
+  const blocking: BlockingContainer[] = []
+  for (const listed of live) {
+    const shards = running.filter((state) => labelValue(state.labels, CI_LABEL) === CI_LABEL_VALUE && isReservationShard(state, listed.reservation))
+    const shardMemoryBytes = shards.reduce((sum, state) => sum + (state.currentMemory.ok ? state.currentMemory.value : 0), 0)
+    items.push({
+      kind: 'reservation',
+      fileName: listed.fileName,
+      reservation: listed.reservation,
+      shardContainers: shards.map((state) => state.name),
+      shardMemoryBytes,
+      countedBytes: Math.max(0, listed.reservation.memoryBytes - shardMemoryBytes),
+    })
+  }
+  for (const lock of activity.heldLocks) {
+    items.push({
+      kind: 'ci-live',
+      run: { via: lock.via, what: lock.path, pid: lock.pid },
+      ownContainers: lock.ownContainers.map((state) => state.name),
+      countedBytes: CI_LIVE_RUN_COMMITMENT_BYTES,
+    })
+  }
+  for (const lone of activity.loneContainers) {
+    items.push({ kind: 'ci-live', run: { via: 'container', what: lone.container.name, pid: lone.pid }, ownContainers: [], countedBytes: CI_LIVE_RUN_COMMITMENT_BYTES })
+  }
+  for (const state of running) {
+    const labelled = labelValue(state.labels, CI_LABEL) === CI_LABEL_VALUE
+    if (labelled && live.some((listed) => isReservationShard(state, listed.reservation))) continue
+    if (!labelled && !state.name.startsWith(CI_CONTAINER_NAME_PREFIX)) continue
+    const owner = labelled ? parseOwner(labelValue(state.labels, OWNER_LABEL) ?? '') : null
+    if (state.memoryCapBytes === null || state.memoryCapBytes === 0) {
+      blocking.push({ name: state.name, labelled, owner })
+      continue
+    }
+    items.push({ kind: labelled ? 'labelled-container' : 'unlabelled-container', name: state.name, owner, countedBytes: state.memoryCapBytes })
+  }
+  return {
+    totalBytes: items.reduce((sum, item) => sum + item.countedBytes, 0),
+    items,
+    blocking,
+    reservedCpus: live.reduce((sum, listed) => sum + listed.reservation.cpus, 0),
+  }
+}
+
+// --- 10/T4 (E6 T4): the readings step, the fits, choosing N, the shard-count line ---
+
+/** A percentage's whole: the disk fit compares `× 100` against the disk line's percent, in integers. */
+const PERCENT_WHOLE = 100
+/** The shard-count line's opening word (b.uqm SR-6.7): `shards: <n> of <r>`. */
+const SHARD_COUNT_LINE_PREFIX = 'shards: '
+/** Separates the shard-count line's reasons (b.uqm SR-6.7). */
+const SHARD_COUNT_REASON_SEPARATOR = ', '
+/** The shard-count line's reason for a run that ended before admission chose its N (b.uqm SR-6.7); also its `results.json` `shardCount.reasons` entry. */
+export const ENDED_BEFORE_ADMISSION_REASON = 'ended before admission'
+
+/** The admission readings with the `/ci-live` activity added (b.uqm SR-6.5): every SR-6.5 item, W being the run's "before" reading. */
+export interface FullAdmissionReadings extends AdmissionReadings {
+  /** The active `/ci-live` runs, with the held locks and the lone containers (b.uqm SR-6.6). */
+  readonly ciLive: CiLiveActivity
+}
+
+/** What the readings step answers (b.uqm SR-5.3 step 8): every reading, C with its source, and what admission counts. */
+export interface AdmissionFigures {
+  readonly readings: FullAdmissionReadings
+  /** C, 85% of L or `/ci-live`'s 40 GiB line, with its source (b.uqm SR-7.1). */
+  readonly ceiling: MemoryCeiling
+  /** The memory commitments, the blocking containers and h (b.uqm SR-6.6). */
+  readonly commitments: MemoryCommitments
+}
+
+/**
+ * What the readings step reads through: T2's input, plus the `/ci-live`
+ * detector's reads (environment, user ID, `/proc`) and the account's home for
+ * the real-run lock, which the caller gives (E13 binds E5's account-home lookup).
+ */
+export interface AdmissionStepInput extends AdmissionReadingsInput {
+  readonly deps: AdmissionReadingsInput['deps'] & CiLiveDetectionDeps
+  /** The account's home, holding `/ci-live`'s real-run lock. */
+  readonly home: string
+}
+
+/**
+ * The admission readings step (b.uqm SR-5.3 step 8, SR-6.5), taken under the
+ * lock after the sweep, in SR-6.5's order: W with its parts and L, the run
+ * directory's volume, the containers (listed once), the reservations through
+ * the caller's reader, then the `/ci-live` activity, judged over that same
+ * container listing. The first reading that fails stops the step and is its
+ * answer, `disk` for the volume and `memory` for every other
+ * (`failedReadingRefusal` makes it the refusal). Otherwise it answers every
+ * reading, C with its source, and the commitments, blocking containers and h.
+ * Call it before this run's own reservation exists (see `memoryCommitments`).
+ */
+export async function takeFullAdmissionReadings(input: AdmissionStepInput): Promise<AdmissionReading<AdmissionFigures>> {
+  const taken = await takeAdmissionReadings(input)
+  if (!taken.ok) return taken
+  const { readings, containerListing } = taken.value
+  const ciLive = admissionReading('memory', detectCiLiveActivity(input.deps, input.home, containerListing))
+  if (!ciLive.ok) return ciLive
+  return {
+    ok: true,
+    value: {
+      readings: { ...readings, ciLive: ciLive.value },
+      ceiling: memoryCeiling(readings.podLimitBytes, ciLive.value.runs),
+      commitments: memoryCommitments(readings.containers, readings.reservations, ciLive.value),
+    },
+  }
+}
+
+/** A limit admission judges (b.uqm SR-6.7, SR-6.8), named as its refusal kind. */
+export type AdmissionLimit = Exclude<RefusalKind, null>
+
+/** A limit that depends on N: the memory and CPU fits (b.uqm SR-6.7). */
+export type ShardFitLimit = Extract<AdmissionLimit, 'memory' | 'cpu'>
+
+/** The limits in the order a refusal gives them (b.uqm SR-6.8): memory, disk, CPU. */
+const ADMISSION_LIMIT_ORDER: readonly AdmissionLimit[] = ['memory', 'disk', 'cpu']
+
+/** What the run asks of admission (b.uqm SR-3.4, SR-6.7), from E2's validation (`ValidatedRun`) and E1's arguments. */
+export interface AdmissionRequest {
+  /** r: the `--shards` value, or `MAX_SHARDS` when it is not given (E2's `ValidatedRun.requestedShards`). */
+  readonly requestedShards: number
+  /** u: the run's scheduling units (E2, b.uqm SR-3.4: `ValidatedRun.units`). */
+  readonly units: number
+  /** The effective N (E2, b.uqm SR-3.4): the smaller of r and u, at least 1. */
+  readonly effectiveShards: number
+  /** Neither `--shards` nor `--inject` was given (`canChooseShards`): the run takes the largest N that fits. */
+  readonly canChooseShards: boolean
+  /** The per-shard memory cap, E1's `SHARD_MEMORY_CAP_BYTES`, passed in. */
+  readonly capBytes: number
+}
+
+/** Whether admission may choose the run's N (b.uqm SR-6.7): neither `--shards` nor `--inject` was given. Choosing changes neither its run kind nor its gate eligibility. */
+export function canChooseShards(invocation: Invocation): boolean {
+  return invocation.shards === null && !isInjectedRun(invocation)
+}
+
+/**
+ * f (b.uqm SR-6.7): C − W − the memory commitments − the 1 GiB admission
+ * margin, never below 0, the memory left for shards. Blocking containers count
+ * nothing here; they fail the memory fit on their own.
+ */
+export function freeShardMemoryBytes(figures: AdmissionFigures): number {
+  const free = BigInt(figures.ceiling.bytes) - BigInt(figures.readings.beforeWorkingSet.bytes) - BigInt(figures.commitments.totalBytes) - BigInt(ADMISSION_MARGIN_BYTES)
+  return free > BigInt(0) ? Number(free) : 0
+}
+
+/**
+ * The memory fit at N shards (b.uqm SR-6.7): W + the commitments + N × the cap
+ * + the 1 GiB admission margin ≤ C, compared in whole bytes. Any blocking
+ * container fails it whatever the readings.
+ */
+export function memoryFits(figures: AdmissionFigures, shards: number, capBytes: number): boolean {
+  if (figures.commitments.blocking.length > 0) return false
+  const need = BigInt(figures.readings.beforeWorkingSet.bytes) + BigInt(figures.commitments.totalBytes) + BigInt(shards) * BigInt(capBytes) + BigInt(ADMISSION_MARGIN_BYTES)
+  return need <= BigInt(figures.ceiling.bytes)
+}
+
+/**
+ * The disk fit (b.uqm SR-6.7): (used + the 1 GiB allowance) ÷ (used +
+ * available) < the 85% disk line, compared in integers as (used + allowance)
+ * × 100 < 85 × (used + available). A volume with no bytes fails it.
+ */
+export function diskFits(volume: VolumeReading): boolean {
+  const used = BigInt(volume.usedBytes)
+  const whole = used + BigInt(volume.availableBytes)
+  return (used + BigInt(DISK_CHECK_ALLOWANCE_BYTES)) * BigInt(PERCENT_WHOLE) < BigInt(DISK_LINE_PERCENT) * whole
+}
+
+/** The CPU fit at N shards (b.uqm SR-6.6, SR-6.7): h + 2 × N ≤ the 12 CI CPUs. */
+export function cpuFits(reservedCpus: number, shards: number): boolean {
+  return reservedCpus + CPUS_PER_SHARD * shards <= CI_CPUS
+}
+
+/** The N-dependent limits that fail at N shards, memory then CPU. */
+function shardFitFailures(figures: AdmissionFigures, shards: number, capBytes: number): ShardFitLimit[] {
+  const failed: ShardFitLimit[] = []
+  if (!memoryFits(figures, shards, capBytes)) failed.push('memory')
+  if (!cpuFits(figures.commitments.reservedCpus, shards)) failed.push('cpu')
+  return failed
+}
+
+/** The largest N, from `fromShards` down to 1, that passes both the memory and the CPU fit; null when none does. */
+function largestFittingShards(figures: AdmissionFigures, fromShards: number, capBytes: number): number | null {
+  for (let shards = fromShards; shards >= OPTION_RANGE_MIN; shards--) {
+    if (shardFitFailures(figures, shards, capBytes).length === 0) return shards
+  }
+  return null
+}
+
+/**
+ * Throws unless the request holds whole numbers: an effective N of at least 1,
+ * at most r and at most the larger of 1 and u (b.uqm SR-3.4), and a positive cap.
+ */
+function assertAdmissionRequest(request: AdmissionRequest): void {
+  for (const [name, value] of [['requestedShards', request.requestedShards], ['units', request.units], ['effectiveShards', request.effectiveShards], ['capBytes', request.capBytes]] as const) {
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error(`decideAdmission: ${name} is not a whole number: ${value}`)
+  }
+  if (request.effectiveShards < OPTION_RANGE_MIN) throw new Error(`decideAdmission: effectiveShards is below ${OPTION_RANGE_MIN}: ${request.effectiveShards}`)
+  if (request.effectiveShards > request.requestedShards) throw new Error(`decideAdmission: effectiveShards ${request.effectiveShards} is above requestedShards ${request.requestedShards}`)
+  const unitBound = Math.max(OPTION_RANGE_MIN, request.units)
+  if (request.effectiveShards > unitBound) throw new Error(`decideAdmission: effectiveShards ${request.effectiveShards} is above max(${OPTION_RANGE_MIN}, units) ${unitBound}`)
+  if (request.capBytes === 0) throw new Error('decideAdmission: capBytes is 0')
+}
+
+/** The figures every decision carries, admitted or refused (b.uqm SR-6.7, SR-6.8). */
+export interface AdmissionDecisionFigures {
+  readonly request: AdmissionRequest
+  /** The readings, C with its source, and the commitments. */
+  readonly admission: AdmissionFigures
+  /** f: C − W − commitments − margin, never below 0. */
+  readonly freeBytes: number
+  /** h: the CPUs of the other live `/ci` reservations. */
+  readonly reservedCpus: number
+  /** The largest `--shards` value, at most the effective N, that passes both the memory and the CPU fit now; null when none does. */
+  readonly largestFittingShards: number | null
+  /** Whether the disk fit passed. */
+  readonly diskFits: boolean
+}
+
+/** One reason the shard-count line may give (b.uqm SR-6.7): the scheduling units, memory, CPU. */
+export type ShardCountReason = 'units' | ShardFitLimit
+
+/** What the shard-count line is built from (b.uqm SR-6.7): n, r, u, the reasons that applied, f, C and h. */
+export interface ShardCountLineInput {
+  /** n: the shards admission chose. */
+  readonly shards: number
+  /** r: the requested N. */
+  readonly requestedShards: number
+  /** u: the scheduling units. */
+  readonly units: number
+  /** The reasons that applied, in any order; the line gives them as units, memory, CPU. */
+  readonly reasons: readonly ShardCountReason[]
+  /** f, in bytes. */
+  readonly freeBytes: number
+  /** C, in bytes. */
+  readonly ceilingBytes: number
+  /** h. */
+  readonly reservedCpus: number
+}
+
+/** An admitted run (b.uqm SR-6.7): its N and the shard-count line's data. */
+export interface AdmittedDecision {
+  readonly kind: 'admitted'
+  /** N: the shards admission chose. */
+  readonly shards: number
+  /** The N-dependent limits that fail at N + 1, when N + 1 is at most the effective N; none otherwise. */
+  readonly limitsAtNext: readonly ShardFitLimit[]
+  /** The shard-count line's data: the units reason when the effective N is below r, then `limitsAtNext`. */
+  readonly line: ShardCountLineInput
+  readonly figures: AdmissionDecisionFigures
+}
+
+/** A refused run (b.uqm SR-6.7, SR-6.8): the limits that failed, at the N it was judged at. */
+export interface RefusedDecision {
+  readonly kind: 'refused'
+  /** The N the memory and CPU fits were judged at: 1 for a run that can choose its N, else the effective N. */
+  readonly judgedShards: number
+  /** Each limit that failed, in the order memory, disk, CPU: disk when its fit failed, memory and CPU when they fail at the judged N. Never empty. */
+  readonly failedLimits: readonly AdmissionLimit[]
+  readonly figures: AdmissionDecisionFigures
+  /** The refusal record (T5, b.uqm SR-6.8): `failedLimits`' first gives the kind and summary, each other follows in the details. E13 records it last. */
+  readonly refusal: Refusal
+}
+
+/** Admission's decision (b.uqm SR-5.3 step 9, SR-6.7). */
+export type AdmissionDecision = AdmittedDecision | RefusedDecision
+
+/**
+ * The disk check, then the memory and CPU fits, choosing N (b.uqm SR-5.3
+ * step 9, SR-6.7). A run that can choose takes the largest N, from the
+ * effective N down to 1, that passes both fits; any other takes exactly the
+ * effective N. The run is refused when the disk fit fails or when no N it may
+ * take passes both fits; the refusal names each failed limit (memory and CPU
+ * judged at 1 for a run that can choose, else at the effective N). Every
+ * decision carries f, h, the largest `--shards` value that fits now, and the
+ * readings. A refused decision also carries its refusal record (T5,
+ * `admissionRefusal`); `listResultsDirs` is called only when the disk fit
+ * failed, for the disk message's listing (E13 passes
+ * `() => listResultsDirectories(deps.env)`). Pure apart from that call;
+ * throws only for a malformed request.
+ */
+export function decideAdmission(admission: AdmissionFigures, request: AdmissionRequest, listResultsDirs: ResultsDirectoryLister): AdmissionDecision {
+  assertAdmissionRequest(request)
+  const largest = largestFittingShards(admission, request.effectiveShards, request.capBytes)
+  const figures: AdmissionDecisionFigures = {
+    request,
+    admission,
+    freeBytes: freeShardMemoryBytes(admission),
+    reservedCpus: admission.commitments.reservedCpus,
+    largestFittingShards: largest,
+    diskFits: diskFits(admission.readings.volume),
+  }
+  // The search starts at the effective N, so a run that cannot choose fits exactly when the largest is the effective N.
+  const chosen = request.canChooseShards || largest === request.effectiveShards ? largest : null
+  if (!figures.diskFits || chosen === null) {
+    const judgedShards = request.canChooseShards ? OPTION_RANGE_MIN : request.effectiveShards
+    const failed = new Set<AdmissionLimit>(shardFitFailures(admission, judgedShards, request.capBytes))
+    if (!figures.diskFits) failed.add('disk')
+    const failedLimits = ADMISSION_LIMIT_ORDER.filter((limit) => failed.has(limit))
+    return { kind: 'refused', judgedShards, failedLimits, figures, refusal: admissionRefusal(failedLimits, judgedShards, figures, listResultsDirs) }
+  }
+  const limitsAtNext = chosen < request.effectiveShards ? shardFitFailures(admission, chosen + 1, request.capBytes) : []
+  const unitReason: ShardCountReason[] = request.effectiveShards < request.requestedShards ? ['units'] : []
+  return {
+    kind: 'admitted',
+    shards: chosen,
+    limitsAtNext,
+    line: {
+      shards: chosen,
+      requestedShards: request.requestedShards,
+      units: request.units,
+      reasons: [...unitReason, ...limitsAtNext],
+      freeBytes: figures.freeBytes,
+      ceilingBytes: admission.ceiling.bytes,
+      reservedCpus: figures.reservedCpus,
+    },
+    figures,
+  }
+}
+
+/**
+ * The shard-count line's reason texts (b.uqm SR-6.7), in their fixed order:
+ * `<u> scheduling unit(s)`, `memory: <f> GiB free under the <C> GiB ceiling`,
+ * `cpu: <h> of 12 CI CPUs in use`, each given when it applied; none when n is
+ * not below r. GiB figures to one decimal place (`formatGib`). What
+ * `results.json`'s `shardCount.reasons` holds.
+ */
+export function shardCountReasonTexts(input: ShardCountLineInput): string[] {
+  if (input.shards >= input.requestedShards) return []
+  const applied = new Set(input.reasons)
+  const texts: string[] = []
+  if (applied.has('units')) texts.push(`${input.units} scheduling unit(s)`)
+  if (applied.has('memory')) texts.push(`memory: ${formatGib(input.freeBytes)} GiB free under the ${formatGib(input.ceilingBytes)} GiB ceiling`)
+  if (applied.has('cpu')) texts.push(`cpu: ${input.reservedCpus} of ${CI_CPUS} CI CPUs in use`)
+  return texts
+}
+
+/**
+ * The shard-count line (b.uqm SR-6.7): `shards: <n> of <r>`, followed by
+ * ` (<reasons>)` when n is below r, the reasons separated by a comma and a
+ * space in the order units, memory, CPU. E10 and E13 place it.
+ */
+export function formatShardCountLine(input: ShardCountLineInput): string {
+  const head = `${SHARD_COUNT_LINE_PREFIX}${input.shards} of ${input.requestedShards}`
+  const reasons = shardCountReasonTexts(input)
+  return reasons.length === 0 ? head : `${head} (${reasons.join(SHARD_COUNT_REASON_SEPARATOR)})`
+}
+
+/** The shard-count line of a run that ended before admission chose its N, whatever its arguments (b.uqm SR-6.7): `shards: 0 of <r> (ended before admission)`. */
+export function endedBeforeAdmissionShardCountLine(requestedShards: number): string {
+  return `${SHARD_COUNT_LINE_PREFIX}0 of ${requestedShards} (${ENDED_BEFORE_ADMISSION_REASON})`
+}
+
+// --- 10/T5 (E6 T5): refusal messages ---
+
+/** The memory refusal's advice, its last detail line, exactly as b.uqm SR-6.8 gives it. */
+export const MEMORY_REFUSAL_ADVICE = `what to do: finish or kill idle agent-director workers and confirm their tmux sessions are gone; stop the other CI runs or builds listed; then re-run /ci. Page cache cannot be dropped in this pod and is reclaimed only by the kernel. A re-run is worthwhile once the sysadmin monitor's reading is back below its ${MEMORY_CEILING_PERCENT}% warn line, or once W is back below the ceiling.`
+/** The disk refusal's advice (b.uqm SR-6.8). */
+export const DISK_REFUSAL_ADVICE = 'what to do: remove results directories and other large files that are not needed on that volume, then re-run.'
+/** The disk refusal's last detail line: Docker's storage, which the disk check does not count (b.uqm SR-6.8, SR-19.9). */
+export const DOCKER_STORAGE_NOTE = "Docker's images live on /var/lib/docker, which this check does not count."
+/** The CPU refusal's advice, its last detail line (b.uqm SR-6.8). */
+export const CPU_REFUSAL_ADVICE = 'what to do: wait for or cancel a listed run (signal its runner PID), or re-run with a --shards value that fits.'
+/** The pod-limit ceiling's source, after `85% of the <L> GiB pod limit, ` (b.uqm SR-6.8). */
+export const POD_LIMIT_CEILING_SOURCE_TEXT = "the sysadmin monitor's warn line"
+/** The `/ci-live` ceiling's source, after `40.0 GiB, ` (b.uqm SR-6.8). */
+export const CI_LIVE_CEILING_SOURCE_TEXT = "/ci-live's working-set stop line"
+/** The memory and CPU refusals' detail line when some `--shards` value fits now; the value follows (b.uqm SR-6.7, SR-6.8). */
+export const LARGEST_FITTING_SHARDS_PREFIX = 'largest --shards value that fits now: '
+/** The memory and CPU refusals' detail line when no `--shards` value fits now (b.uqm SR-6.8). */
+export const NO_FITTING_SHARDS_TEXT = 'no --shards value fits now, not even 1'
+/** A legacy results directory's name, `cscb-ci-<digits>-<six letters or digits>`, as the skill of 946be79 made it with `mktemp -d -t cscb-ci-${RUN_ID}-XXXXXX` (b.uqm SR-6.8). */
+export const LEGACY_RESULTS_DIR_PATTERN = /^cscb-ci-[0-9]+-[A-Za-z0-9]{6}$/
+
+/** `cscb-ci*`, the container names admission reads, as the messages write them. */
+const CI_CONTAINER_NAME_GLOB = `${CI_CONTAINER_NAME_PREFIX}*`
+/** `cscb-ci=1`, as the messages write it. */
+const CI_LABEL_TEXT = `${CI_LABEL}=${CI_LABEL_VALUE}`
+
+/** A blocking container's detail line opens with this, then `: container <name>, ` (b.uqm SR-6.8). */
+export const BLOCKING_EVERY_RUN_TEXT = 'blocking every run'
+/** What an unlabelled blocking container is, in its detail line: `an uncapped cscb-ci* container` (b.uqm SR-6.6, SR-6.8). */
+export const UNCAPPED_CI_CONTAINER_TEXT = `an uncapped ${CI_CONTAINER_NAME_GLOB} container`
+/** A labelled container with no live reservation, after `labelled cscb-ci=1 ` in the blocking and counted-container lines (b.uqm SR-6.6). */
+export const NO_LIVE_RESERVATION_TEXT = 'with no live reservation'
+/** What a labelled blocking container is, in its detail line, before ` (owner <RUN_ID>-<PID>)`: `an uncapped container labelled cscb-ci=1 with no live reservation`, with no `cscb-ci*` glob (b.uqm SR-6.6, SR-6.8). */
+export const UNCAPPED_LABELLED_CONTAINER_TEXT = `an uncapped container labelled ${CI_LABEL_TEXT} ${NO_LIVE_RESERVATION_TEXT}`
+/** A labelled container's owner text, inside the parentheses, when its owner label is missing or malformed (b.uqm SR-6.3). */
+export const NO_VALID_OWNER_LABEL_TEXT = 'no valid owner label'
+/** An unlabelled blocking container's detail line ends with this, after `; ` (b.uqm SR-6.6): `/ci` never removes it. */
+export const CI_NEVER_REMOVES_TEXT = '/ci never removes it'
+/** A labelled blocking container's detail line ends with this, after `; `: the sweep removes a labelled container once its owner is dead (b.uqm SR-6.4). */
+export const CI_SWEEP_REMOVES_TEXT = "a later /ci run's sweep removes it once its owner is dead"
+/** The memory refusal's commitments line when nothing is counted, after `counted commitments: 0.0 GiB, ` (b.uqm SR-6.8). */
+export const NOTHING_ELSE_COUNTED_TEXT = 'nothing else is counted'
+/** The CPU refusal's detail line when no other live `/ci` run holds CPUs (b.uqm SR-6.8). */
+export const NO_OTHER_CI_RUN_HOLDS_CPUS_TEXT = 'no other /ci run holds CPUs'
+/** The disk refusal's detail line when the temp directory holds no results directory; the temp directory follows after a space (b.uqm SR-6.8). */
+export const NO_RESULTS_DIRECTORIES_TEXT = 'no /ci results directories in'
+/** The disk refusal's detail line when the temp directory could not be listed: `the /ci results directories in <dir> could not be listed: <error>`. */
+export const RESULTS_LISTING_FAILED_TEXT = 'could not be listed'
+/** A results directory sized only in part: `at least <x> GiB (part of it could not be read: <path>: <code>)`. */
+export const PART_UNREADABLE_TEXT = 'part of it could not be read'
+/** The temp directory of a listing whose lister threw, so the directory it read is not known. */
+export const UNKNOWN_TEMP_DIR_TEXT = '(unknown)'
+
+/** A results directory's name shape (b.uqm SR-6.8): `new` is `cscb-ci-<RUN_ID>` (SR-5.1), `legacy` the 946be79 skill's. */
+export type ResultsDirectoryStyle = 'new' | 'legacy'
+
+/** One `/ci` results directory in the system temp directory, a real directory and not a link (b.uqm SR-6.8). */
+export interface ResultsDirectory {
+  readonly name: string
+  /** The temp directory and its name joined with one `/`, never normalized. */
+  readonly path: string
+  readonly style: ResultsDirectoryStyle
+  /** The apparent sizes (`st.size`) of the regular files under it, at any depth, no link followed; directories and links add nothing. */
+  readonly sizeBytes: number
+  /** Why part of it could not be sized, or why the entry itself could not be `lstat`ed (the first such failure, on one line: `<path>: <errno code>`); null when all of it was sized. `sizeBytes` is then a lower bound. */
+  readonly unreadable: string | null
+}
+
+/** The results directories of the system temp directory, largest first, or why they could not be listed. */
+export type ResultsDirectoryListing =
+  | {
+      readonly ok: true
+      readonly tempDir: string
+      readonly directories: readonly ResultsDirectory[]
+    }
+  | {
+      readonly ok: false
+      readonly tempDir: string
+      /** On one line. */
+      readonly error: string
+    }
+
+/** What the decision calls, only when the disk fit failed, for the disk message's listing. */
+export type ResultsDirectoryLister = () => ResultsDirectoryListing
+
+/** One failed limit's part of an admission refusal (b.uqm SR-6.8): its kind, its summary (after `<kind>: `) and its detail lines. */
+export interface AdmissionRefusalPart {
+  readonly kind: AdmissionLimit
+  readonly summary: string
+  readonly details: readonly string[]
+}
+
+/** A name's results-directory shape: `new` for `cscb-ci-<RUN_ID>`, `legacy` for `cscb-ci-<digits>-<six letters or digits>`, null for any other name (b.uqm SR-6.8). */
+export function resultsDirectoryStyle(name: string): ResultsDirectoryStyle | null {
+  if (!name.startsWith(RUN_DIR_PREFIX)) return null
+  if (isRunId(name.slice(RUN_DIR_PREFIX.length))) return 'new'
+  return LEGACY_RESULTS_DIR_PATTERN.test(name) ? 'legacy' : null
+}
+
+/** Why an entry could not be read, on one line: its path as shown, then the errno code, or the error's text when it has none, so the path is not repeated raw. */
+function unreadableEntryText(path: string, err: unknown): string {
+  return `${shownArgument(path)}: ${errnoCode(err) ?? dependencyErrorText(err)}`
+}
+
+/**
+ * A directory tree's size: the apparent sizes (`st.size`, never blocks) of the
+ * regular files under it, at any depth, by `lstat`, so no link is followed
+ * and directories and links add nothing. An entry that vanishes meanwhile adds
+ * nothing; any other failure is kept (the first) and sizing goes on. Paths
+ * are bytes, so no file name is lost to its encoding, and each is joined with
+ * one `/`, never normalized, as `root` was.
+ */
+function sizeDirectoryTree(root: string): { readonly bytes: number; readonly unreadable: string | null } {
+  const separator = Buffer.from('/')
+  const pending: Buffer[] = [Buffer.from(root)]
+  let bytes = 0
+  let unreadable: string | null = null
+  const note = (path: Buffer, err: unknown): void => {
+    if (unreadable === null && errnoCode(err) !== 'ENOENT') unreadable = unreadableEntryText(path.toString(), err)
+  }
+  for (let dir = pending.pop(); dir !== undefined; dir = pending.pop()) {
+    let names: Buffer[]
+    try {
+      names = listResultsDir(dir, { encoding: 'buffer' })
+    } catch (err) {
+      note(dir, err)
+      continue
+    }
+    for (const name of names) {
+      const path = Buffer.concat([dir, separator, name])
+      try {
+        const stat = lstatResultsEntry(path)
+        if (stat.isFile()) bytes += stat.size
+        else if (stat.isDirectory()) pending.push(path)
+      } catch (err) {
+        note(path, err)
+      }
+    }
+  }
+  return { bytes, unreadable }
+}
+
+/** Largest first; a tie by name, in code-unit order, so the order is stable. */
+function compareResultsDirectories(a: ResultsDirectory, b: ResultsDirectory): number {
+  if (a.sizeBytes !== b.sizeBytes) return b.sizeBytes - a.sizeBytes
+  return a.name < b.name ? -1 : a.name > b.name ? 1 : 0
+}
+
+/**
+ * The `/ci` results directories kept in the system temp directory
+ * (`systemTempDir(env)`, b.uqm SR-5.1, SR-6.8), largest first: every entry
+ * named `cscb-ci-<RUN_ID>` or `cscb-ci-<digits>-<six letters or digits>` that
+ * `lstat` finds to be a directory, so a link or a file of such a name is left
+ * out, each with its size (`sizeDirectoryTree`). Each entry's path is the temp
+ * directory and its name joined with one `/`, never normalized, as
+ * `runDirPath` joins them (`TMPDIR=/a/link/../b` keeps its `..`). An entry
+ * that vanishes before its `lstat` is left out; one whose `lstat` fails
+ * otherwise is kept, 0 bytes with `unreadable` set, so the listing never says
+ * there are none when there may be. A temp directory that cannot be read is a
+ * failed listing, never a throw. Only reads.
+ */
+export function listResultsDirectories(env: Readonly<Record<string, string | undefined>>): ResultsDirectoryListing {
+  const tempDir = systemTempDir(env)
+  let names: string[]
+  try {
+    names = listResultsDir(tempDir)
+  } catch (err) {
+    return { ok: false, tempDir, error: dependencyErrorText(err) }
+  }
+  const parent = tempDir === '/' ? '' : tempDir
+  const directories: ResultsDirectory[] = []
+  for (const name of names) {
+    const style = resultsDirectoryStyle(name)
+    if (style === null) continue
+    const path = `${parent}/${name}`
+    try {
+      if (!lstatResultsEntry(path).isDirectory()) continue
+    } catch (err) {
+      if (errnoCode(err) !== 'ENOENT') directories.push({ name, path, style, sizeBytes: 0, unreadable: unreadableEntryText(path, err) })
+      continue
+    }
+    const size = sizeDirectoryTree(path)
+    directories.push({ name, path, style, sizeBytes: size.bytes, unreadable: size.unreadable })
+  }
+  return { ok: true, tempDir, directories: directories.sort(compareResultsDirectories) }
+}
+
+/**
+ * A share as a percentage to one decimal place, rounded to the nearest tenth
+ * with a tie rounding up, computed exactly (b.uqm SR-6.8): `84.9`, with no
+ * `%`. A whole of 0 bytes reads `100.0`: a volume with no room is full.
+ */
+export function formatPercent(partBytes: number, wholeBytes: number): string {
+  assertWholeBytes('formatPercent', partBytes)
+  assertWholeBytes('formatPercent', wholeBytes)
+  if (wholeBytes === 0) return `${PERCENT_WHOLE}.0`
+  const whole = BigInt(wholeBytes)
+  const scaled = BigInt(partBytes) * BigInt(PERCENT_WHOLE * 10)
+  const tenths = scaled / whole + (BigInt(2) * (scaled % whole) >= whole ? BigInt(1) : BigInt(0))
+  return `${tenths / BigInt(10)}.${tenths % BigInt(10)}`
+}
+
+/** The memory and CPU refusals' largest-value line (b.uqm SR-6.8): `largest --shards value that fits now: 5`, or that none does. */
+export function largestFittingShardsText(largest: number | null): string {
+  return largest === null ? NO_FITTING_SHARDS_TEXT : `${LARGEST_FITTING_SHARDS_PREFIX}${largest}`
+}
+
+/** An active `/ci-live` run named by what showed it and its PID (b.uqm SR-6.8): `the real-run lock <path>, PID 4242`. */
+export function ciLiveRunText(run: CiLiveRunSeen): string {
+  const what = shownArgument(run.what)
+  const shown = run.via === 'real-run-lock' ? `the real-run lock ${what}` : run.via === 'dry-run-lock' ? `the dry-run lock ${what}` : `the container ${what}`
+  return run.pid === null ? `${shown}, with no PID in its name` : `${shown}, PID ${run.pid}`
+}
+
+/**
+ * The ceiling and its source (b.uqm SR-6.8): `ceiling: 54.4 GiB, 85% of the
+ * 64.0 GiB pod limit, the sysadmin monitor's warn line`, or `ceiling: 40.0
+ * GiB, /ci-live's working-set stop line, while a /ci-live run is active: `
+ * and each active run (`ciLiveRunText`), separated by `; `.
+ */
+export function ceilingSourceText(ceiling: MemoryCeiling): string {
+  const head = `ceiling: ${formatGib(ceiling.bytes)} GiB, `
+  if (ceiling.source.kind === 'pod-limit') {
+    return `${head}${MEMORY_CEILING_PERCENT}% of the ${formatGib(ceiling.source.limitBytes)} GiB pod limit, ${POD_LIMIT_CEILING_SOURCE_TEXT}`
+  }
+  const runs = ceiling.source.runs
+  const which = runs.length === 1 ? 'a /ci-live run is' : '/ci-live runs are'
+  return `${head}${CI_LIVE_CEILING_SOURCE_TEXT}, while ${which} active: ${runs.map(ciLiveRunText).join('; ')}`
+}
+
+/** A labelled container's owner, as its counted and blocking lines write it inside parentheses: `owner <RUN_ID>-<PID>`, or `no valid owner label`. */
+function labelledOwnerText(owner: Owner | null): string {
+  return owner === null ? NO_VALID_OWNER_LABEL_TEXT : `owner ${formatOwner(owner)}`
+}
+
+/** One counted commitment's detail line, with its counted GiB (b.uqm SR-6.6, SR-6.8). */
+function commitmentText(item: MemoryCommitment): string {
+  const counted = `${formatGib(item.countedBytes)} GiB`
+  switch (item.kind) {
+    case 'reservation': {
+      const { runId, pid, shards, memoryBytes } = item.reservation
+      return `counted: /ci run ${runId} (runner PID ${pid}, ${shards} shard(s)): ${counted}, its ${formatGib(memoryBytes)} GiB reservation less ${formatGib(item.shardMemoryBytes)} GiB in its running shard containers`
+    }
+    case 'ci-live': {
+      const own = item.ownContainers.length === 0 ? '' : `, its own container(s) ${item.ownContainers.map(shownArgument).join(', ')} included`
+      return `counted: /ci-live run shown by ${ciLiveRunText(item.run)}: ${counted}${own}`
+    }
+    case 'labelled-container':
+      return `counted: container ${shownArgument(item.name)}, labelled ${CI_LABEL_TEXT} ${NO_LIVE_RESERVATION_TEXT} (${labelledOwnerText(item.owner)}): ${counted}, its cap`
+    case 'unlabelled-container':
+      return `counted: container ${shownArgument(item.name)}, an unlabelled ${CI_CONTAINER_NAME_GLOB} container: ${counted}, its cap`
+  }
+}
+
+/**
+ * A blocking container's detail line (b.uqm SR-6.6, SR-6.8), blocking every
+ * run: an unlabelled one as an uncapped `cscb-ci*` container `/ci` never
+ * removes; a labelled one as an uncapped `cscb-ci=1` container with no live
+ * reservation, its owner from its owner label, that a later run's sweep
+ * removes once that owner is dead (SR-6.4).
+ */
+function blockingText(container: BlockingContainer): string {
+  const head = `${BLOCKING_EVERY_RUN_TEXT}: container ${shownArgument(container.name)}`
+  if (!container.labelled) return `${head}, ${UNCAPPED_CI_CONTAINER_TEXT}; ${CI_NEVER_REMOVES_TEXT}`
+  return `${head}, ${UNCAPPED_LABELLED_CONTAINER_TEXT} (${labelledOwnerText(container.owner)}); ${CI_SWEEP_REMOVES_TEXT}`
+}
+
+/**
+ * The memory refusal (b.uqm SR-6.8): `<n> shard(s) need <x> GiB; <f> GiB fits
+ * under the <C> GiB ceiling`, n being the judged N and x n × the cap; then the
+ * ceiling and its source, W split into anon, active page cache and the rest,
+ * the counted commitments with each item's counted GiB, each blocking
+ * container, the admission margin and the cap, the largest `--shards` value
+ * that fits now (or that none does), and the advice.
+ */
+export function memoryRefusalPart(judgedShards: number, figures: AdmissionDecisionFigures): AdmissionRefusalPart {
+  const { admission, request } = figures
+  const w = admission.readings.beforeWorkingSet
+  const { commitments } = admission
+  const counted =
+    commitments.items.length === 0
+      ? [`counted commitments: ${formatGib(0)} GiB, ${NOTHING_ELSE_COUNTED_TEXT}`]
+      : [`counted commitments: ${formatGib(commitments.totalBytes)} GiB`, ...commitments.items.map(commitmentText)]
+  return {
+    kind: 'memory',
+    summary: `${judgedShards} shard(s) need ${formatGib(judgedShards * request.capBytes)} GiB; ${formatGib(figures.freeBytes)} GiB fits under the ${formatGib(admission.ceiling.bytes)} GiB ceiling`,
+    details: [
+      ceilingSourceText(admission.ceiling),
+      `pod working set W: ${formatGib(w.bytes)} GiB (anon ${formatGib(w.anonBytes)} GiB, active page cache ${formatGib(w.activeFileBytes)} GiB, the rest ${formatGib(workingSetRestBytes(w))} GiB)`,
+      ...counted,
+      ...commitments.blocking.map(blockingText),
+      `admission margin: ${formatGib(ADMISSION_MARGIN_BYTES)} GiB; per-shard cap: ${formatGib(request.capBytes)} GiB`,
+      largestFittingShardsText(figures.largestFittingShards),
+      MEMORY_REFUSAL_ADVICE,
+    ],
+  }
+}
+
+/** A results directory's detail line: its path and size, or a lower bound when part of it could not be read. */
+function resultsDirectoryText(dir: ResultsDirectory): string {
+  const size = `${formatGib(dir.sizeBytes)} GiB`
+  const shown = dir.unreadable === null ? size : `at least ${size} (${PART_UNREADABLE_TEXT}: ${dir.unreadable})`
+  return `results directory ${shownArgument(dir.path)}: ${shown}`
+}
+
+/** The listing's detail lines: each results directory, largest first; that there are none; or that the listing could not be read. */
+function resultsListingTexts(listing: ResultsDirectoryListing): string[] {
+  const tempDir = shownArgument(listing.tempDir)
+  if (!listing.ok) return [`the /ci results directories in ${tempDir} ${RESULTS_LISTING_FAILED_TEXT}: ${dependencyErrorText(listing.error)}`]
+  if (listing.directories.length === 0) return [`${NO_RESULTS_DIRECTORIES_TEXT} ${tempDir}`]
+  return listing.directories.map(resultsDirectoryText)
+}
+
+/**
+ * The disk refusal (b.uqm SR-6.8): `<volume> is <p>% used; this run's 1 GiB
+ * would take it to <q>%, at or over /ci's 85% disk line`, p being used ÷
+ * (used + available) and q (used + 1 GiB) ÷ (used + available); then the
+ * volume's used and total GiB, the results directories, largest first, the
+ * advice and the note on Docker's storage.
+ */
+export function diskRefusalPart(volume: VolumeReading, listing: ResultsDirectoryListing): AdmissionRefusalPart {
+  const totalBytes = volume.usedBytes + volume.availableBytes
+  const p = formatPercent(volume.usedBytes, totalBytes)
+  const q = formatPercent(volume.usedBytes + DISK_CHECK_ALLOWANCE_BYTES, totalBytes)
+  const mount = shownArgument(volume.mountPoint)
+  return {
+    kind: 'disk',
+    summary: `${mount} is ${p}% used; this run's ${DISK_CHECK_ALLOWANCE_BYTES / GIB_BYTES} GiB would take it to ${q}%, at or over /ci's ${DISK_LINE_PERCENT}% disk line`,
+    details: [
+      `volume ${mount}: ${formatGib(volume.usedBytes)} GiB used of ${formatGib(totalBytes)} GiB`,
+      ...resultsListingTexts(listing),
+      DISK_REFUSAL_ADVICE,
+      DOCKER_STORAGE_NOTE,
+    ],
+  }
+}
+
+/**
+ * The CPU refusal (b.uqm SR-6.8): `<n> shard(s) need <c> CPUs; active /ci
+ * runs hold <h> of the 12 CI CPUs`, c being 2 × n; then each active run
+ * (RUN_ID, runner PID, shards, CPUs, full or selective), the largest
+ * `--shards` value that fits now (or that none does), and the advice.
+ */
+export function cpuRefusalPart(judgedShards: number, figures: AdmissionDecisionFigures): AdmissionRefusalPart {
+  const runs = figures.admission.commitments.items.flatMap((item) => (item.kind === 'reservation' ? [item.reservation] : []))
+  const runTexts =
+    runs.length === 0
+      ? [NO_OTHER_CI_RUN_HOLDS_CPUS_TEXT]
+      : runs.map((run) => `active /ci run ${run.runId}: runner PID ${run.pid}, ${run.shards} shard(s), ${run.cpus} CPUs, ${run.kind}`)
+  return {
+    kind: 'cpu',
+    summary: `${judgedShards} shard(s) need ${CPUS_PER_SHARD * judgedShards} CPUs; active /ci runs hold ${figures.reservedCpus} of the ${CI_CPUS} CI CPUs`,
+    details: [...runTexts, largestFittingShardsText(figures.largestFittingShards), CPU_REFUSAL_ADVICE],
+  }
+}
+
+/** The results-directory listing for the disk message; a lister that throws is a failed listing, so the refusal is still built. */
+function listResultsDirectoriesSafely(listResultsDirs: ResultsDirectoryLister): ResultsDirectoryListing {
+  try {
+    return listResultsDirs()
+  } catch (err) {
+    return { ok: false, tempDir: UNKNOWN_TEMP_DIR_TEXT, error: dependencyErrorText(err) }
+  }
+}
+
+/**
+ * The admission refusal record (b.uqm SR-5.8, SR-6.8) from the failed limits,
+ * in the order memory, disk, CPU: the first gives the kind and summary and its
+ * details; each other follows in the details as `<kind>: <summary>`, then its
+ * own details. memory and CPU are judged at `judgedShards`. `listResultsDirs`
+ * is called only when disk failed. Throws for an empty list of failed limits.
+ */
+export function admissionRefusal(
+  failedLimits: readonly AdmissionLimit[],
+  judgedShards: number,
+  figures: AdmissionDecisionFigures,
+  listResultsDirs: ResultsDirectoryLister,
+): Refusal {
+  const parts = ADMISSION_LIMIT_ORDER.filter((limit) => failedLimits.includes(limit)).map((limit): AdmissionRefusalPart => {
+    if (limit === 'memory') return memoryRefusalPart(judgedShards, figures)
+    if (limit === 'disk') return diskRefusalPart(figures.admission.readings.volume, listResultsDirectoriesSafely(listResultsDirs))
+    return cpuRefusalPart(judgedShards, figures)
+  })
+  const [first, ...others] = parts
+  if (first === undefined) throw new Error('admissionRefusal: no limit failed')
+  const details = [...first.details, ...others.flatMap((part) => [`${part.kind}: ${part.summary}`, ...part.details])]
+  return buildRefusal(first.kind, first.summary, details)
+}
 
 // ---------------------------------------------------------------------------
 // 11. Memory guard (E7)
