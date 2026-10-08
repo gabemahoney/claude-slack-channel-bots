@@ -18,14 +18,30 @@
  *     PASS with its timing summary, or a refusal (SR-16.3).
  *
  *   bun scripts/ci-verdict.ts wait <RUN_ID> <PID>
- *     Waits at most 90 s for the run to move on, then prints one `wait:` line
- *     (SR-17.5). Exits 10 verdict, 11 refused, 12 gone, 13 grace, 0 running.
+ *     Waits at most 90 s for the run to move on (SR-17.5). It checks the run
+ *     at its start, then every 1 s on its injected clock, and returns at the
+ *     first check at which one of these holds, in this order:
+ *       10 verdict  `verdict.txt` exists (it is never read here)
+ *       11 refused  the status file records a refusal
+ *       12 gone     the runner is gone (SR-6.3)
+ *       13 grace    the grace has ended and the runner is alive
+ *        0 running  the phase differs from the first check's, or the bound
+ *                   is reached
+ *     The deadline is the status file's, or the RUN_ID's time plus 90 min
+ *     while there is none; the grace ends 10 min after it. Before exiting it
+ *     prints one `wait:` line on standard output. It writes, renames,
+ *     removes, signals and spawns nothing.
  *
  *   bun scripts/ci-verdict.ts stop <RUN_ID> <PID>
- *     Stops a runner still alive at grace expiry: SIGTERM, then SIGKILL when
- *     it is alive 30 s later; prints one `stop:` line (SR-17.6). Exits 0 when
- *     the runner was not alive and nothing was sent, 20 after SIGTERM, 21
- *     after SIGTERM then SIGKILL.
+ *     Stops a runner still alive at grace expiry (SR-17.6). It signals only a
+ *     runner alive by SR-6.3, and only its PID, never a process group:
+ *     SIGTERM, then, checking every 1 s on its injected clock, SIGKILL when
+ *     the runner is still alive 30 s after the SIGTERM. A signal that is not
+ *     delivered (no such process, or not permitted) counts as not sent.
+ *     Before exiting it prints one `stop:` line on standard output, naming the
+ *     grace argument for `report`. Exits 0 when nothing was sent (grace
+ *     `none`), 20 after SIGTERM only (`term:<m>`), 21 after SIGTERM then
+ *     SIGKILL (`kill:<m>`). It writes, renames, removes and spawns nothing.
  *
  *   `<PID>` is the runner PID the skill printed, or `-`. `<grace>` is `none`,
  *   `term:<m>` or `kill:<m>`, m a whole number of at least 1. Malformed
@@ -74,6 +90,7 @@ import {
   createRealRunnerDeps,
   FAIL_PREFIX,
   FAILURE_EXIT_STATUS,
+  formatUtcTime,
   injectedVerdictPrefix,
   isInjectedRun,
   isNumberForm,
@@ -92,13 +109,14 @@ import {
   RESULTS_FORMAT_VERSION,
   RUNNER_LOG_FILE_NAME,
   runDirPath,
+  runIdTimeMs,
   secretCredentialSet,
   STATUS_FILE_NAME,
   USAGE_EXIT_STATUS,
   USAGE_PREFIX,
   VERDICT_FILE_NAME,
 } from './ci-run.ts'
-import type { FileTextRead, Invocation, OwnerLivenessProbe, Refusal, RunnerDeps, RunStatus, WriteResult } from './ci-run.ts'
+import type { FileTextRead, Invocation, OwnerLivenessProbe, Refusal, RunnerDeps, RunStatus, SentSignal, StatusPhase, WriteResult } from './ci-run.ts'
 
 // ---------------------------------------------------------------------------
 // 1. Dependencies (E3 T1)
@@ -1027,19 +1045,304 @@ export async function runReport(invocation: ReportInvocation, deps: ReaderDeps):
 // ---------------------------------------------------------------------------
 // 7. The wait verb (E3 T2)
 // ---------------------------------------------------------------------------
+//
+// `wait` (b.uqm SR-17.5) checks the run at its start, then every 1 s on the
+// injected clock, for at most 90 s, and returns the first state that holds.
+// It counts the deadline and the grace from the run's files and the RUN_ID
+// alone, so the skill keeps no count across calls. It only reads: it never
+// writes, renames, removes, signals or spawns, and it only tests whether
+// `verdict.txt` exists, never reading it.
+
+/** The wait verb's states, in the order its checks take them (b.uqm SR-17.5). */
+export const WAIT_STATES = ['verdict', 'refused', 'gone', 'grace', 'running'] as const
+
+/** One of the wait verb's states. */
+export type WaitState = (typeof WAIT_STATES)[number]
+
+/** The wait line's phase while no status file can be read. */
+export const PHASE_NONE = 'none'
+
+/** The status file's phase, or `none` while no status file can be read. */
+export type WaitPhase = StatusPhase | typeof PHASE_NONE
+
+/** Milliseconds in a minute, for the deadline and the grace. */
+const MS_PER_MINUTE = 60_000
+
+/** The run's deadline and grace as the wait and stop verbs count them (b.uqm SR-17.5). */
+export interface RunDeadline {
+  /** The deadline, epoch milliseconds. */
+  readonly deadlineMs: number
+  /** The deadline's minutes from the runner's start: `deadline.minutes`, or 90 while no status file can be read. */
+  readonly minutes: number
+  /** The grace's end, `GRACE_MINUTES` after the deadline, epoch milliseconds. */
+  readonly graceEndsMs: number
+}
+
+/**
+ * The run's deadline (b.uqm SR-17.5): the status file's `deadline.epochSeconds`
+ * and `deadline.minutes` when it can be read, else the RUN_ID's time plus
+ * `NO_STATUS_DEADLINE_MINUTES` and that many minutes. The grace ends
+ * `GRACE_MINUTES` after the deadline. Throws for a `runId` that is no RUN_ID,
+ * which the argument parser never lets through.
+ */
+export function runDeadline(status: RunStatus | null, runId: string): RunDeadline {
+  let deadlineMs: number
+  let minutes: number
+  if (status !== null) {
+    deadlineMs = status.deadline.epochSeconds * MS_PER_SECOND
+    minutes = status.deadline.minutes
+  } else {
+    const startMs = runIdTimeMs(runId)
+    if (startMs === null) throw new Error(`${runId} is not a RUN_ID`)
+    deadlineMs = startMs + NO_STATUS_DEADLINE_MINUTES * MS_PER_MINUTE
+    minutes = NO_STATUS_DEADLINE_MINUTES
+  }
+  return { deadlineMs, minutes, graceEndsMs: deadlineMs + GRACE_MINUTES * MS_PER_MINUTE }
+}
+
+/** What one check of the wait verb reads (b.uqm SR-17.5). */
+export interface WaitReading extends RunDeadline {
+  /** Whether anything lies at `verdict.txt`'s path. */
+  readonly verdictExists: boolean
+  /** The status file's phase, or `none`. */
+  readonly phase: WaitPhase
+  /** Whether the status file records a refusal. */
+  readonly refused: boolean
+  /** The runner's PID (`resolveRunnerPid`); null for none. */
+  readonly pid: number | null
+  /** Whether the runner is alive by b.uqm SR-6.3 (`isRunnerAlive`). */
+  readonly alive: boolean
+  /** The clock at the check, epoch milliseconds. */
+  readonly nowMs: number
+}
+
+/** The members one wait check uses: reads, the liveness probe and the clock. Nothing that writes, removes, signals or spawns. */
+export type WaitCheckDeps = Pick<ReaderDeps, 'env' | 'readRunFile' | 'runPathKind' | 'isPidAlive' | 'readProcCmdline' | 'clock'>
+
+/** One check of the run (b.uqm SR-17.5): whether `verdict.txt` exists, the status file's phase, refusal and deadline, the runner's PID and liveness, and the clock. */
+export function readWaitCheck(runId: string, pidArgument: string, deps: WaitCheckDeps): WaitReading {
+  const runDir = runDirPath(deps.env, runId)
+  const verdictExists = verdictFileExists(deps, runDir)
+  const status = readRunStatus(deps, runDir)
+  const pid = resolveRunnerPid(status, pidArgument)
+  return {
+    verdictExists,
+    phase: status === null ? PHASE_NONE : status.phase,
+    refused: statusRefusal(status) !== null,
+    pid,
+    alive: isRunnerAlive(runId, pid, deps),
+    nowMs: deps.clock.now(),
+    ...runDeadline(status, runId),
+  }
+}
+
+/**
+ * The state one check finds (b.uqm SR-17.5), the first that holds in this
+ * order: `verdict`, `refused`, `gone`, `grace` (the clock at or after the
+ * grace's end, the runner alive), `running` (the phase differs from
+ * `firstPhase`, the one the first check read). Null when none holds; the
+ * bound is the caller's.
+ */
+export function waitStateOf(reading: WaitReading, firstPhase: WaitPhase): WaitState | null {
+  if (reading.verdictExists) return 'verdict'
+  if (reading.refused) return 'refused'
+  if (!reading.alive) return 'gone'
+  if (reading.nowMs >= reading.graceEndsMs) return 'grace'
+  if (reading.phase !== firstPhase) return 'running'
+  return null
+}
+
+/** The wait verb's exit code for a state (b.uqm SR-17.5). */
+export function waitExitCode(state: WaitState): number {
+  switch (state) {
+    case 'verdict':
+      return WAIT_EXIT_VERDICT
+    case 'refused':
+      return WAIT_EXIT_REFUSED
+    case 'gone':
+      return WAIT_EXIT_GONE
+    case 'grace':
+      return WAIT_EXIT_GRACE
+    case 'running':
+      return WAIT_EXIT_RUNNING
+  }
+}
+
+/** A PID as the wait and stop lines print it: the number, or `-` for none. */
+function pidText(pid: number | null): string {
+  return pid === null ? PID_ARGUMENT_NONE : String(pid)
+}
+
+/**
+ * The wait verb's one line (b.uqm SR-17.5):
+ * `wait: <state> phase=<phase|none> pid=<pid|-> runner=<alive|gone> deadline=<UTC time> minutes=<m> grace-ends=<UTC time>`,
+ * the UTC times in the runner's format (`formatUtcTime`).
+ */
+export function waitLine(state: WaitState, reading: Pick<WaitReading, 'phase' | 'pid' | 'alive' | 'deadlineMs' | 'minutes' | 'graceEndsMs'>): string {
+  const runner = reading.alive ? 'alive' : 'gone'
+  return `wait: ${state} phase=${reading.phase} pid=${pidText(reading.pid)} runner=${runner} deadline=${formatUtcTime(reading.deadlineMs)} minutes=${reading.minutes} grace-ends=${formatUtcTime(reading.graceEndsMs)}`
+}
+
+/** Resolves after `delayMs` on the injected clock's timer: the verbs' only way to wait. */
+function pause(clock: ReaderDeps['clock'], delayMs: number): Promise<void> {
+  return new Promise((resolvePause) => {
+    clock.setTimeout(resolvePause, delayMs)
+  })
+}
+
+/** How a wait ended: its state and the check its line reports. */
+export interface WaitResult {
+  readonly state: WaitState
+  readonly reading: WaitReading
+}
+
+/**
+ * Waits for the run to move on (b.uqm SR-17.5), on the injected clock only.
+ * It checks at its start, then `WAIT_CHECK_INTERVAL_MS` after each check
+ * (one `clock.setTimeout` per pause), and returns at the first check at which
+ * a state holds (`waitStateOf`). When a check finds none and the bound
+ * (`WAIT_BOUND_MS` from the start) is reached, it returns `running`; when
+ * less than one interval is left, it pauses for what is left and returns
+ * `running` with that check, never checking more often than every 1 s.
+ */
+export async function waitForRun(runId: string, pidArgument: string, deps: WaitCheckDeps): Promise<WaitResult> {
+  const boundAtMs = deps.clock.now() + WAIT_BOUND_MS
+  let reading = readWaitCheck(runId, pidArgument, deps)
+  const firstPhase = reading.phase
+  for (;;) {
+    const state = waitStateOf(reading, firstPhase)
+    if (state !== null) return { state, reading }
+    const leftMs = boundAtMs - deps.clock.now()
+    if (leftMs <= 0) return { state: 'running', reading }
+    if (leftMs < WAIT_CHECK_INTERVAL_MS) {
+      await pause(deps.clock, leftMs)
+      return { state: 'running', reading }
+    }
+    await pause(deps.clock, WAIT_CHECK_INTERVAL_MS)
+    reading = readWaitCheck(runId, pidArgument, deps)
+  }
+}
+
+/** The wait verb (b.uqm SR-17.5): waits, prints its one line on standard output and answers the state's exit code. */
+export async function runWait(invocation: WaitInvocation, deps: ReaderDeps): Promise<number> {
+  const { state, reading } = await waitForRun(invocation.runId, invocation.pid, deps)
+  printLines(deps, [waitLine(state, reading)])
+  return waitExitCode(state)
+}
 
 // ---------------------------------------------------------------------------
 // 8. The stop verb (E3 T2)
 // ---------------------------------------------------------------------------
+//
+// `stop` (b.uqm SR-17.6) signals only a runner alive by SR-6.3, and only its
+// PID, never a process group: SIGTERM, then SIGKILL when it is still alive
+// 30 s later. A signal that is not delivered (no such process, or not
+// permitted) counts as not sent. It writes, renames, removes and spawns
+// nothing.
+
+/** What the stop verb did (b.uqm SR-17.6). */
+export type StopOutcome =
+  | {
+      /** No signal sent: the PID is none, not alive by SR-6.3, or its SIGTERM was not delivered. */
+      readonly kind: 'not-alive'
+      readonly pid: number | null
+    }
+  | {
+      /** SIGTERM sent; no SIGKILL sent. */
+      readonly kind: 'term'
+      readonly pid: number
+      /** m, the deadline's minutes as the wait line prints them. */
+      readonly minutes: number
+    }
+  | {
+      /** SIGTERM, then SIGKILL 30 s later. */
+      readonly kind: 'kill'
+      readonly pid: number
+      /** m, the deadline's minutes as the wait line prints them. */
+      readonly minutes: number
+    }
+
+/** The grace argument a stop outcome gives the report verb: `none`, `term:<m>` or `kill:<m>`. */
+export function stopGrace(outcome: StopOutcome): Grace {
+  return outcome.kind === 'not-alive' ? { kind: 'none' } : { kind: outcome.kind, minutes: String(outcome.minutes) }
+}
+
+/**
+ * The stop verb's one line (b.uqm SR-17.6), `stop: <what it did>; grace <grace>`:
+ * - `stop: runner <pid|-> not alive, no signal sent; grace none`
+ * - `stop: sent SIGTERM to runner <pid>; grace term:<m>`
+ * - `stop: sent SIGTERM to runner <pid>, then SIGKILL after 30 s; grace kill:<m>`
+ */
+export function stopLine(outcome: StopOutcome): string {
+  const grace = graceText(stopGrace(outcome))
+  switch (outcome.kind) {
+    case 'not-alive':
+      return `stop: runner ${pidText(outcome.pid)} not alive, no signal sent; grace ${grace}`
+    case 'term':
+      return `stop: sent SIGTERM to runner ${outcome.pid}; grace ${grace}`
+    case 'kill':
+      return `stop: sent SIGTERM to runner ${outcome.pid}, then SIGKILL after ${STOP_KILL_AFTER_MS / MS_PER_SECOND} s; grace ${grace}`
+  }
+}
+
+/** The stop verb's exit code for an outcome: 0, 20 or 21 (b.uqm SR-17.6). */
+export function stopExitCode(outcome: StopOutcome): number {
+  switch (outcome.kind) {
+    case 'not-alive':
+      return STOP_EXIT_NOT_ALIVE
+    case 'term':
+      return STOP_EXIT_SENT_SIGTERM
+    case 'kill':
+      return STOP_EXIT_SENT_SIGKILL
+  }
+}
+
+/** The members the stop verb uses: reads, the liveness probe, the clock and the signal. Nothing that writes, removes or spawns. */
+export type StopDeps = Pick<ReaderDeps, 'env' | 'readRunFile' | 'isPidAlive' | 'readProcCmdline' | 'clock' | 'sendSignal'>
+
+/** Sends `signal` to `pid` alone, never to a process group; true only when it was delivered. */
+function signalPid(deps: Pick<ReaderDeps, 'sendSignal'>, pid: number, signal: SentSignal): boolean {
+  return deps.sendSignal({ kind: 'pid', pid }, signal) === 'delivered'
+}
+
+/**
+ * Stops the run's runner (b.uqm SR-17.6). Reads the status file once for the
+ * PID (`resolveRunnerPid`) and m (`runDeadline`). Sends nothing unless that
+ * PID is alive by SR-6.3. Then it sends SIGTERM to the PID; one not delivered
+ * gives `not-alive`. After it, it checks liveness every
+ * `STOP_CHECK_INTERVAL_MS` on the injected clock (the last pause shortened to
+ * end exactly `STOP_KILL_AFTER_MS` after the SIGTERM): a runner found gone,
+ * its PID reused included, gives `term`; one still alive at the check
+ * `STOP_KILL_AFTER_MS` after the SIGTERM gets SIGKILL, `kill` when it is
+ * delivered and `term` when it is not.
+ */
+export async function stopRunner(runId: string, pidArgument: string, deps: StopDeps): Promise<StopOutcome> {
+  const status = readRunStatus(deps, runDirPath(deps.env, runId))
+  const pid = resolveRunnerPid(status, pidArgument)
+  if (pid === null || !isRunnerAlive(runId, pid, deps)) return { kind: 'not-alive', pid }
+  const { minutes } = runDeadline(status, runId)
+  if (!signalPid(deps, pid, 'SIGTERM')) return { kind: 'not-alive', pid }
+  const killAtMs = deps.clock.now() + STOP_KILL_AFTER_MS
+  for (;;) {
+    const leftMs = killAtMs - deps.clock.now()
+    if (leftMs > 0) await pause(deps.clock, Math.min(STOP_CHECK_INTERVAL_MS, leftMs))
+    if (!isRunnerAlive(runId, pid, deps)) return { kind: 'term', pid, minutes }
+    if (deps.clock.now() >= killAtMs) {
+      return signalPid(deps, pid, 'SIGKILL') ? { kind: 'kill', pid, minutes } : { kind: 'term', pid, minutes }
+    }
+  }
+}
+
+/** The stop verb (b.uqm SR-17.6): stops the runner, prints its one line on standard output and answers its exit code. */
+export async function runStop(invocation: StopInvocation, deps: ReaderDeps): Promise<number> {
+  const outcome = await stopRunner(invocation.runId, invocation.pid, deps)
+  printLines(deps, [stopLine(outcome)])
+  return stopExitCode(outcome)
+}
 
 // ---------------------------------------------------------------------------
 // 9. The verb runner and the entry block (E3 T1)
 // ---------------------------------------------------------------------------
-
-/** Until T2 builds them, a well-formed `wait` or `stop` writes this one standard-error line and exits 1. */
-function verbNotBuiltLine(verb: 'wait' | 'stop'): string {
-  return `ci-verdict: the ${verb} verb is not built yet`
-}
 
 /**
  * The reader, driven in process through its dependencies (b.uqm SR-21.1):
@@ -1048,6 +1351,8 @@ function verbNotBuiltLine(verb: 'wait' | 'stop'): string {
  * - Malformed arguments: one `usage: ` line on standard error, nothing on
  *   standard output, `USAGE_EXIT_STATUS` (64), and no other dependency used.
  * - `report`: `runReport`'s code.
+ * - `wait`: `runWait`'s code.
+ * - `stop`: `runStop`'s code.
  * - An error a verb throws: one `ci-verdict: ` line on standard error, 1.
  */
 export async function runVerdictReader(argv: readonly string[], deps: ReaderDeps): Promise<number> {
@@ -1062,10 +1367,9 @@ export async function runVerdictReader(argv: readonly string[], deps: ReaderDeps
       case 'report':
         return await runReport(invocation, deps)
       case 'wait':
+        return await runWait(invocation, deps)
       case 'stop':
-        // T2 replaces this with the wait and stop verbs (sections 7 and 8).
-        stderrLine(deps, verbNotBuiltLine(invocation.verb))
-        return FAILURE_EXIT_STATUS
+        return await runStop(invocation, deps)
     }
   } catch (err) {
     stderrLine(deps, `ci-verdict: ${invocation.verb} failed: ${oneLineError(err)}`)
