@@ -10617,7 +10617,7 @@ export const IMAGE_TESTS_DIR = '/tests'
 /** The read container's name suffix: `cscb-ci-<RUN_ID>-<PID>-read` (b.uqm SR-9.4). */
 export const READ_CONTAINER_NAME_SUFFIX = '-read'
 /** The read container's name prefix, before its owner (b.uqm SR-9.4, SR-10.1). */
-export const READ_CONTAINER_NAME_PREFIX = 'cscb-ci-'
+export const READ_CONTAINER_NAME_PREFIX = `${CI_CONTAINER_NAME_PREFIX}-`
 /** A tar archive's block size: each header is one block, and each entry's data is padded to whole blocks. */
 export const TAR_BLOCK_BYTES = 512
 
