@@ -4373,6 +4373,489 @@ export async function pruneUntaggedImages(docker: DockerContext, owner: string):
 // 16. Faults (E12)
 // ---------------------------------------------------------------------------
 
+// --- 16/T1 (E12 T1): fault targets, the --fail lists, the reason builders and the fault controller ---
+//
+// Faults come only from the parsed `--inject` faults, `Invocation.faults`,
+// normalized and in order (b.uqm SR-2.4, SR-14.1): nothing here reads an
+// environment variable or a file to decide which faults exist, and a
+// controller built from no faults is inert. The controller decides and never
+// acts: it stops nothing, sends no signal, calls no docker and takes no final
+// reading. Each `timeout:` or `kill:` firing is one `FaultDecision`, and each
+// end marker a fault poll finds is one notice, handed to the one handler the
+// driver (E13) supplies; E13 carries them out through E9's retirement. Causes
+// are `ShardCause` values that E10 renders; no cause text is written here.
+// The nine reasons a fault did not fire are written only by the builders
+// below (b.uqm SR-14.3); E11 renders the `fault-fired` line from the records.
+
+/** A `leak:<k>,<j>` fault's mount target in shard j, `/leak-shard-<k>`, where shard k's subdirectory is mounted read-only (b.uqm SR-10.3, SR-14.2). */
+export function leakMountTarget(sourceShard: number): string {
+  return `/leak-shard-${sourceShard}`
+}
+
+/** A shard's name in a reason, `shard-<k>` (b.uqm Terms). */
+function faultShardName(shard: number): string {
+  return `${SHARD_DIR_PREFIX}${shard}`
+}
+
+/** Shard k's subdirectory of the run directory, which holds its result file (b.uqm SR-5.9, SR-11.3). */
+function faultShardDir(runDir: string, shard: number): string {
+  return join(runDir, faultShardName(shard))
+}
+
+/** Where the assignment places a script, by its number form: the lowest-numbered shard holding it, so test-1, in every shard, gives shard 1. */
+function faultScriptPlace(numberForm: string, assignment: Assignment): { readonly shard: number; readonly fileName: string } | null {
+  let place: { readonly shard: number; readonly fileName: string } | null = null
+  for (const entry of assignment) {
+    const fileName = entry.assigned.find((name) => fileNameNumberForm(name) === numberForm)
+    if (fileName !== undefined && (place === null || entry.shard < place.shard)) place = { shard: entry.shard, fileName }
+  }
+  return place
+}
+
+/**
+ * The shard a fault acts on (b.uqm SR-14.2): for `fail:` and `timeout:`, the
+ * shard the assignment gives the script (shard 1 for test-1); for
+ * `leak:<k>,<j>`, j; for `image-drift:<k>` and `kill:<k>`, k. Null for
+ * `retag`, and for a script the assignment does not place.
+ */
+export function faultTargetShard(fault: Fault, assignment: Assignment): number | null {
+  switch (fault.kind) {
+    case 'fail':
+    case 'timeout':
+      return faultScriptPlace(fault.script, assignment)?.shard ?? null
+    case 'leak':
+      return fault.targetShard
+    case 'image-drift':
+    case 'kill':
+      return fault.shard
+    case 'retag':
+      return null
+  }
+}
+
+/**
+ * Shard k's `--fail` list (b.uqm SR-14.1, SR-11.2): the file names of the
+ * `fail:` faults that act on it, in normalized fault order. No other fault,
+ * and no `fail:` aimed at another shard, adds to it.
+ */
+export function shardFailFileNames(faults: readonly Fault[], assignment: Assignment, shard: number): string[] {
+  const fileNames: string[] = []
+  for (const fault of faults) {
+    if (fault.kind !== 'fail') continue
+    const place = faultScriptPlace(fault.script, assignment)
+    if (place !== null && place.shard === shard) fileNames.push(place.fileName)
+  }
+  return fileNames
+}
+
+// The nine reasons a fault did not fire (b.uqm SR-14.3), the only place these
+// texts are written. k is the shard the fault acts on (j for `leak:<k>,<j>`).
+
+/** `image-drift:<k>`'s reason when the drift image's build failed (b.uqm SR-14.2). */
+export function driftBuildFailedReason(exitCode: number): string {
+  return `drift image build failed (exit ${exitCode})`
+}
+
+/** `retag`'s reason when the retag image's build failed (b.uqm SR-14.2). */
+export function retagBuildFailedReason(exitCode: number): string {
+  return `retag image build failed (exit ${exitCode})`
+}
+
+/** `retag`'s reason when the `-test` tag's move failed (b.uqm SR-14.2). */
+export function tagMoveFailedReason(exitCode: number): string {
+  return `tag move failed (exit ${exitCode})`
+}
+
+/** The reason when the fault's shard's start was attempted and its container did not start. */
+export function shardNeverStartedReason(shard: number): string {
+  return `${faultShardName(shard)} never started`
+}
+
+/** A `leak` or `image-drift` fault's reason when its shard started without the mount or the drift image, no build having failed. */
+export function shardStartedWithoutItReason(shard: number): string {
+  return `${faultShardName(shard)} started without it`
+}
+
+/** The reason when the fault's shard ended before the fault's moment came. */
+export function shardEndedFirstReason(shard: number): string {
+  return `${faultShardName(shard)} ended first`
+}
+
+/** The reason when the fault's shard reached its wall-time limit first. */
+export function shardLimitReachedFirstReason(shard: number): string {
+  return `${faultShardName(shard)} reached its wall-time limit first`
+}
+
+/** The reason when a run-level stop came first, or the run stopped before the fault's shard start or the tag move was attempted. */
+export function runStoppedFirstReason(): string {
+  return 'the run was stopped first'
+}
+
+/** The reason when another fault stopped the shard first, naming it in its normalized form (b.uqm SR-14.3). */
+export function faultStoppedShardFirstReason(fault: Fault, shard: number): string {
+  return `${faultText(fault)} stopped ${faultShardName(shard)} first`
+}
+
+/**
+ * A `timeout:` firing's m (b.uqm SR-14.2): the shard's elapsed time since its
+ * container start, rounded up to whole minutes (3 s gives 1, exactly 60 s
+ * gives 1, 60.001 s gives 2), and at least 1. Not SR-4.3's halves-up rounding,
+ * which is for limits.
+ */
+export function faultTimeoutMinutes(elapsedMs: number): number {
+  return Math.max(1, Math.ceil(elapsedMs / MS_PER_MINUTE))
+}
+
+/** What the controller hands its one handler: a `timeout:` or `kill:` firing to carry out, or a fault poll's find of shard k's end marker, so its final reading can be taken now (b.uqm SR-10.6). */
+export type FaultNotice =
+  | {
+      readonly kind: 'decision'
+      readonly decision: FaultDecision
+    }
+  | {
+      readonly kind: 'end-marker'
+      readonly shard: number
+    }
+
+/** The driver's one handler for the controller's notices. */
+export type FaultNoticeHandler = (notice: FaultNotice) => void
+
+/** What a fault controller is built from, and nothing else. */
+export interface FaultControllerOptions {
+  /** The normalized faults in order, `Invocation.faults`: the only source of activation (b.uqm SR-14.1). */
+  readonly faults: readonly Fault[]
+  readonly assignment: Assignment
+  /** The clock and timers (`RunnerDeps.clock`): every fault poll is scheduled through them. */
+  readonly clock: RunnerClock
+  /** The run directory: shard k's result file is read from its `shard-<k>` subdirectory by E1's rule (`readResultFile`). */
+  readonly runDir: string
+  /** Receives every decision and end-marker notice. */
+  readonly handler: FaultNoticeHandler
+}
+
+/**
+ * The fault controller (b.uqm SR-14.1, SR-14.2, SR-14.3). E13 builds it
+ * unconditionally once the shards are scheduled, reports what happens through
+ * the `note*` entry points, and calls `finalize` after every shard's final
+ * reading and retirement, before E11's checks.
+ */
+export interface FaultController {
+  /** Every fault's firing record so far, in normalized fault order. */
+  records(): readonly FiringRecord[]
+  /** Shard k's `--fail` file names (see `shardFailFileNames`). */
+  failFileNames(shard: number): readonly string[]
+  /** A shard's start outcome (E9); a later outcome for the same shard changes nothing. A started shard with a due `timeout:` or `kill:` is polled. */
+  noteShardStart(start: ShardStart): void
+  /** The drift image's build outcome (E8). */
+  noteDriftBuild(outcome: BuildOutcome): void
+  /** The retag image's build outcome (E8). */
+  noteRetagBuild(outcome: BuildOutcome): void
+  /** The `-test` tag's move (E8). */
+  noteTagMove(outcome: TagMoveOutcome): void
+  /** Shard k ended: its end marker found at a sample or a limit check, or its container ended on its own. */
+  noteShardEnded(shard: number): void
+  /** Shard k reached its wall-time limit. */
+  noteShardLimit(shard: number): void
+  /** A run-level stop: every started shard without an end state takes it, and every pending poll is cancelled. */
+  noteRunStop(): void
+  /** Ends the controller: fires each `fail:` whose script its shard reached, gives every still-due fault its reason, and answers every record, in normalized fault order. Idempotent. */
+  finalize(): readonly FiringRecord[]
+}
+
+/** A fault's record while the controller holds it: due until it fires or gets its reason, then never changed. */
+interface FaultSlot {
+  readonly fault: Fault
+  readonly shard: number | null
+  readonly leakSourceShard: number | null
+  state: FiringState
+  reason: string | null
+}
+
+/** How a shard ended, as far as the faults are concerned. */
+type FaultShardEnd =
+  | {
+      readonly kind: 'ended'
+    }
+  | {
+      readonly kind: 'limit'
+    }
+  | {
+      readonly kind: 'run-stopped'
+    }
+  | {
+      readonly kind: 'never-started'
+    }
+  | {
+      readonly kind: 'stopped-by-fault'
+      readonly fault: TimeoutFault | KillFault
+    }
+
+/** A shard whose start was reported: its container start (null when it did not start) and its end state, the first event's (null while it runs). */
+interface FaultShardState {
+  readonly startedAtMs: number | null
+  end: FaultShardEnd | null
+}
+
+/** The number forms of the scripts a result file shows in progress: a complete `start` line, no `end` line and no end marker (b.uqm SR-14.2). A missing or unreadable file shows none. */
+function faultScriptsInProgress(read: ResultFileRead): string[] {
+  if (read.kind !== 'events' || read.events.some((event) => event.kind === 'done')) return []
+  const started = read.events.flatMap((event) => (event.kind === 'start' ? [event.fileName] : []))
+  const ended = new Set(read.events.flatMap((event) => (event.kind === 'end' ? [event.fileName] : [])))
+  return started.filter((fileName) => !ended.has(fileName)).flatMap((fileName) => fileNameNumberForm(fileName) ?? [])
+}
+
+/** The number forms of the scripts a result file holds the given complete line for, `start` or `end`, in file order. */
+function faultScriptsWith(read: ResultFileRead, kind: 'start' | 'end'): string[] {
+  if (read.kind !== 'events') return []
+  return read.events.flatMap((event) => (event.kind === kind ? (fileNameNumberForm(event.fileName) ?? []) : []))
+}
+
+/** Whether a started shard has the `leak:<k>,<j>` mount: shard k's subdirectory, read-only, at `/leak-shard-<k>` (b.uqm SR-10.3). */
+function hasFaultLeakMount(start: ShardStarted, runDir: string, sourceShard: number): boolean {
+  const source = resolve(faultShardDir(runDir, sourceShard))
+  return start.mounts.some((mount) => mount.readOnly && mount.target === leakMountTarget(sourceShard) && resolve(mount.source) === source)
+}
+
+/** Builds the fault controller: one record per fault, each due. With no faults it has no records, schedules no timer, reads no file and never calls its handler. */
+export function createFaultController(options: FaultControllerOptions): FaultController {
+  const { faults, assignment, clock, runDir, handler } = options
+  const slots: FaultSlot[] = faults.map((fault) => ({
+    fault,
+    shard: faultTargetShard(fault, assignment),
+    leakSourceShard: fault.kind === 'leak' ? fault.sourceShard : null,
+    state: 'due',
+    reason: null,
+  }))
+  const shards = new Map<number, FaultShardState>()
+  const polls = new Map<number, unknown>()
+  let driftImageId: string | null = null
+  let runStopped = false
+  let finalized = false
+
+  function markFired(slot: FaultSlot): void {
+    if (slot.state !== 'due') return
+    slot.state = 'fired'
+  }
+
+  function markNotFired(slot: FaultSlot, reason: string): void {
+    if (slot.state !== 'due') return
+    slot.state = 'not-fired'
+    slot.reason = reason
+  }
+
+  function dueSlots(kind: FaultKind, shard: number | null): FaultSlot[] {
+    return slots.filter((slot) => slot.state === 'due' && slot.fault.kind === kind && (shard === null || slot.shard === shard))
+  }
+
+  function readShardResult(shard: number): ResultFileRead {
+    return readResultFile(faultShardDir(runDir, shard))
+  }
+
+  function setEnd(shard: number, end: FaultShardEnd): void {
+    const state = shards.get(shard)
+    if (state === undefined || state.end !== null) return
+    state.end = end
+    cancelPoll(shard)
+  }
+
+  function cancelPoll(shard: number): void {
+    if (!polls.has(shard)) return
+    clock.clearTimeout(polls.get(shard))
+    polls.delete(shard)
+  }
+
+  function cancelAllPolls(): void {
+    for (const shard of [...polls.keys()]) cancelPoll(shard)
+  }
+
+  /** Polls shard k every fault-poll interval while it runs with a `timeout:` or `kill:` aimed at it still due. */
+  function schedulePoll(shard: number): void {
+    if (finalized || runStopped || polls.has(shard)) return
+    const state = shards.get(shard)
+    if (state === undefined || state.startedAtMs === null || state.end !== null) return
+    if (dueSlots('timeout', shard).length === 0 && dueSlots('kill', shard).length === 0) return
+    polls.set(
+      shard,
+      clock.setTimeout(() => poll(shard), FAULT_POLL_INTERVAL_MS),
+    )
+  }
+
+  function poll(shard: number): void {
+    polls.delete(shard)
+    const state = shards.get(shard)
+    if (finalized || state === undefined || state.end !== null) return
+    decide(shard, state, readShardResult(shard))
+    schedulePoll(shard)
+  }
+
+  /**
+   * The decision step for one shard's reading (b.uqm SR-14.2). An end marker
+   * ends the shard and is handed on. Otherwise, with a script in progress, a
+   * due `kill:` fires before any `timeout:`, whatever the argument order
+   * (b.uqm SR-2.2), since its moment is never later; else a due `timeout:`
+   * whose script is in progress fires. A firing stops the shard for good.
+   */
+  function decide(shard: number, state: FaultShardState, read: ResultFileRead): void {
+    if (read.kind === 'events' && read.events.some((event) => event.kind === 'done')) {
+      setEnd(shard, { kind: 'ended' })
+      handler({ kind: 'end-marker', shard })
+      return
+    }
+    const inProgress = faultScriptsInProgress(read)
+    if (inProgress.length === 0 || state.startedAtMs === null) return
+    const kill = dueSlots('kill', shard)[0]
+    if (kill !== undefined && kill.fault.kind === 'kill') {
+      fire(shard, kill, kill.fault, { kind: 'killed', fixedByRunner: true })
+      return
+    }
+    for (const slot of dueSlots('timeout', shard)) {
+      if (slot.fault.kind !== 'timeout' || !inProgress.includes(slot.fault.script)) continue
+      fire(shard, slot, slot.fault, { kind: 'wall-time-limit', minutes: faultTimeoutMinutes(clock.now() - state.startedAtMs), fixedByRunner: true })
+      return
+    }
+  }
+
+  function fire(shard: number, slot: FaultSlot, fault: TimeoutFault | KillFault, cause: ShardCause): void {
+    markFired(slot)
+    setEnd(shard, { kind: 'stopped-by-fault', fault })
+    handler({ kind: 'decision', decision: { shard, fault, cause } })
+  }
+
+  function noteShardStart(start: ShardStart): void {
+    if (finalized || shards.has(start.shard)) return
+    const started = start.kind === 'started' ? start : null
+    shards.set(start.shard, { startedAtMs: started?.startedAtMs ?? null, end: started === null ? { kind: 'never-started' } : null })
+    for (const slot of [...dueSlots('leak', start.shard), ...dueSlots('image-drift', start.shard)]) {
+      if (started === null) {
+        markNotFired(slot, shardNeverStartedReason(start.shard))
+        continue
+      }
+      const withIt =
+        slot.leakSourceShard !== null ? hasFaultLeakMount(started, runDir, slot.leakSourceShard) : driftImageId !== null && started.imageId === driftImageId
+      if (withIt) markFired(slot)
+      else markNotFired(slot, shardStartedWithoutItReason(start.shard))
+    }
+    if (started !== null && runStopped) setEnd(start.shard, { kind: 'run-stopped' })
+    schedulePoll(start.shard)
+  }
+
+  function noteDriftBuild(outcome: BuildOutcome): void {
+    if (outcome.kind === 'built' && driftImageId === null) driftImageId = outcome.imageId
+    if (outcome.kind !== 'failed') return
+    for (const slot of dueSlots('image-drift', null)) markNotFired(slot, driftBuildFailedReason(outcome.exitCode))
+  }
+
+  function noteRetagBuild(outcome: BuildOutcome): void {
+    if (outcome.kind !== 'failed') return
+    for (const slot of dueSlots('retag', null)) markNotFired(slot, retagBuildFailedReason(outcome.exitCode))
+  }
+
+  function noteTagMove(outcome: TagMoveOutcome): void {
+    for (const slot of dueSlots('retag', null)) {
+      if (outcome.kind === 'moved') markFired(slot)
+      else if (outcome.kind === 'failed') markNotFired(slot, tagMoveFailedReason(outcome.exitCode))
+    }
+  }
+
+  function noteRunStop(): void {
+    runStopped = true
+    for (const [shard, state] of shards) if (state.startedAtMs !== null) setEnd(shard, { kind: 'run-stopped' })
+    cancelAllPolls()
+  }
+
+  /** Shard k's result file as finalization reads it: once per shard, and only when needed. */
+  const finalReads = new Map<number, ResultFileRead>()
+  function finalRead(shard: number): ResultFileRead {
+    let read = finalReads.get(shard)
+    if (read === undefined) {
+      read = readShardResult(shard)
+      finalReads.set(shard, read)
+    }
+    return read
+  }
+
+  /**
+   * The fired `fail:` in a shard that ended which stopped it before this
+   * fault's moment could have come, or null: for a `fail:` whose script was not
+   * reached; for a `timeout:` whose script has no `end` line; for a `kill:`
+   * whose shard's first started script is the `fail:` script.
+   */
+  function failStopper(slot: FaultSlot, shard: number): Fault | null {
+    const stopper = slots.find((other) => other.fault.kind === 'fail' && other.state === 'fired' && other.shard === shard)?.fault
+    if (stopper === undefined || stopper.kind !== 'fail') return null
+    switch (slot.fault.kind) {
+      case 'fail':
+        return stopper
+      case 'timeout':
+        return faultScriptsWith(finalRead(shard), 'end').includes(slot.fault.script) ? null : stopper
+      case 'kill':
+        return faultScriptsWith(finalRead(shard), 'start')[0] === stopper.script ? stopper : null
+      default:
+        return null
+    }
+  }
+
+  /** A still-due fault's reason, from its shard's end state; a started shard with none counts as ended (b.uqm SR-14.3). */
+  function reasonFor(slot: FaultSlot): string {
+    const shard = slot.shard
+    const state = shard === null ? undefined : shards.get(shard)
+    if (shard === null || state === undefined) return runStoppedFirstReason()
+    const end = state.end ?? { kind: 'ended' }
+    switch (end.kind) {
+      case 'never-started':
+        return shardNeverStartedReason(shard)
+      case 'stopped-by-fault':
+        return faultStoppedShardFirstReason(end.fault, shard)
+      case 'limit':
+        return shardLimitReachedFirstReason(shard)
+      case 'run-stopped':
+        return runStoppedFirstReason()
+      case 'ended': {
+        const stopper = failStopper(slot, shard)
+        return stopper === null ? shardEndedFirstReason(shard) : faultStoppedShardFirstReason(stopper, shard)
+      }
+    }
+  }
+
+  function records(): readonly FiringRecord[] {
+    return slots.map((slot) => ({
+      fault: slot.fault,
+      shard: slot.shard,
+      leakSourceShard: slot.leakSourceShard,
+      state: slot.state,
+      reason: slot.reason,
+    }))
+  }
+
+  function finalize(): readonly FiringRecord[] {
+    if (finalized) return records()
+    finalized = true
+    cancelAllPolls()
+    // `fail:` fires on its script's complete `start` line in its shard (b.uqm SR-14.2, SR-11.3).
+    for (const slot of dueSlots('fail', null)) {
+      const state = slot.shard === null ? undefined : shards.get(slot.shard)
+      if (slot.shard === null || state === undefined || state.startedAtMs === null || slot.fault.kind !== 'fail') continue
+      if (faultScriptsWith(finalRead(slot.shard), 'start').includes(slot.fault.script)) markFired(slot)
+    }
+    // A reason rests only on end states and fired `fail:` faults, so the order of these does not matter.
+    for (const slot of slots) if (slot.state === 'due') markNotFired(slot, reasonFor(slot))
+    return records()
+  }
+
+  return {
+    records,
+    failFileNames: (shard) => shardFailFileNames(faults, assignment, shard),
+    noteShardStart,
+    noteDriftBuild,
+    noteRetagBuild,
+    noteTagMove,
+    noteShardEnded: (shard) => setEnd(shard, { kind: 'ended' }),
+    noteShardLimit: (shard) => setEnd(shard, { kind: 'limit' }),
+    noteRunStop,
+    finalize,
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 17. Run lifecycle (E1 steps 1–2, E13 the rest)
 // ---------------------------------------------------------------------------

@@ -680,6 +680,796 @@ describe('E1: results.json (b.uqm SR-16.1)', () => {
 // ---------------------------------------------------------------------------
 // E12: faults (b.t6s E12)
 // ---------------------------------------------------------------------------
+//
+// The fault controller (b.uqm SR-14.1, SR-14.2, SR-14.3), run in process.
+// Each case builds one controller with `faultRig`: the faults come from an
+// invocation the runner's argument parser read, the assignment is E1's
+// data-model value, every wait runs on `createFakeClock`, a recording handler
+// keeps every notice, and the result files are real files in a run directory
+// under the case's temp root. After each case the region checks every record
+// and notice with `assertNoLeak` and that no fault poll is left pending.
+// Reasons are compared through the runner's builders; each builder's text is
+// typed once, in its pin case. Nothing here asserts the `fault-fired` line
+// (E11) or a rendered cause (E10).
+
+import {
+  createFaultController,
+  driftBuildFailedReason,
+  FAULT_POLL_INTERVAL_MS,
+  faultStoppedShardFirstReason,
+  faultText,
+  fileNameNumberForm,
+  leakMountTarget,
+  parseCiArguments,
+  parseFault,
+  retagBuildFailedReason,
+  runStoppedFirstReason,
+  SCRIPT_LOG_SUFFIX,
+  shardEndedFirstReason,
+  shardLimitReachedFirstReason,
+  shardNeverStartedReason,
+  shardStartedWithoutItReason,
+  tagMoveFailedReason,
+  type Assignment,
+  type Fault,
+  type FaultController,
+  type FaultNotice,
+  type FiringRecord,
+  type FiringState,
+  type ShardCause,
+  type ShardMount,
+  type ShardStart,
+} from '../scripts/ci-run.ts'
+import { resultFileText, type ResultFileSpec, type ShardDirSpec } from './test-helpers/ci-run.ts'
+import { assertNoLeak } from './test-helpers/credentials.ts'
+import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+
+/** One case's fault controller and everything it was built from. */
+interface FaultRig {
+  readonly controller: FaultController
+  readonly clock: FakeClock
+  readonly runDir: string
+  /** The invocation's normalized faults, in order. */
+  readonly faults: readonly Fault[]
+  /** Every notice the handler was given, in order. */
+  readonly notices: FaultNotice[]
+}
+
+/** The rigs the running case built, checked and dropped after it. */
+let faultRigs: FaultRig[] = []
+
+/** The pinned and drift image IDs the shard starts carry, and the retag image's ID, which differs from both (b.uqm SR-14.2). */
+const FAULT_PINNED_IMAGE_ID = `sha256:${hexValue('fault-pinned', SHA256_HEX_LENGTH)}`
+const FAULT_DRIFT_IMAGE_ID = `sha256:${hexValue('fault-drift', SHA256_HEX_LENGTH)}`
+const FAULT_RETAG_IMAGE_ID = `sha256:${hexValue('fault-retag', SHA256_HEX_LENGTH)}`
+
+/** A `kill:` firing's cause, and a `timeout:` firing's for m minutes (b.uqm SR-12.1, SR-14.2). */
+const FAULT_KILLED_CAUSE: ShardCause = { kind: 'killed', fixedByRunner: true }
+function faultWallTimeCause(minutes: number): ShardCause {
+  return { kind: 'wall-time-limit', minutes, fixedByRunner: true }
+}
+
+/** Script n's number form, from its file name in the repository's listing. */
+function faultNumberForm(n: number): string {
+  return fileNameNumberForm(realScriptFileName(n)) as string
+}
+
+/**
+ * A fault controller over `/ci --inject <each of inject>` and an assignment
+ * of shards 1, 2, … holding the looked-up scripts numbered in `shards`, in
+ * order. Its run directory is new, under the case's temp root; no shard
+ * subdirectory exists until a result file is written.
+ */
+function faultRig(spec: { readonly inject?: readonly string[]; readonly shards: readonly (readonly number[])[] }): FaultRig {
+  const parsed = parseCiArguments((spec.inject ?? []).flatMap((value) => ['--inject', value]))
+  if (!parsed.ok) throw new Error(`faultRig: ${parsed.failures.map((failure) => failure.reason).join('; ')}`)
+  const assignment: Assignment = spec.shards.map((numbers, index) => ({
+    shard: index + 1,
+    assigned: numbers.map((n) => realScriptFileName(n)),
+    expectedSeconds: 60 * numbers.length,
+    limitMinutes: 30,
+  }))
+  const runDir = makeRunDir(mkdtempSync(join(root, 'faults-')), RUN_ID)
+  const clock = createFakeClock()
+  const notices: FaultNotice[] = []
+  const faults = parsed.invocation.faults
+  const controller = createFaultController({ faults, assignment, clock, runDir, handler: (notice) => notices.push(notice) })
+  const rig = { controller, clock, runDir, faults, notices }
+  faultRigs.push(rig)
+  return rig
+}
+
+/** The rig's i-th normalized fault. */
+function faultAt(rig: FaultRig, index: number): Fault {
+  const fault = rig.faults[index]
+  if (fault === undefined) throw new Error(`faultAt: the rig has no fault ${index}`)
+  return fault
+}
+
+function faultShardDir(rig: FaultRig, shard: number): string {
+  return join(rig.runDir, `${SHARD_DIR_PREFIX}${shard}`)
+}
+
+/** Writes shard k's result file: the first write builds its subdirectory with the run-directory builder (with any other files given), a later one replaces the file with the builder's text. */
+function writeFaultResult(
+  rig: FaultRig,
+  shard: number,
+  resultFile: readonly ResultEvent[] | ResultFileSpec,
+  files: Omit<ShardDirSpec, 'shard' | 'resultFile'> = {},
+): void {
+  const shardDir = faultShardDir(rig, shard)
+  if (!existsSync(shardDir)) {
+    writeShardDir(rig.runDir, { ...files, shard, resultFile })
+    return
+  }
+  if (Object.keys(files).length > 0) throw new Error('writeFaultResult: other files are written only with the first result file')
+  writeFileSync(join(shardDir, RESULT_FILE_NAME), resultFileText('events' in resultFile ? resultFile : { events: resultFile }))
+}
+
+/** Shard k's container started, at the clock's time unless given; from the pinned image with no mount unless given. */
+function faultShardStart(
+  rig: FaultRig,
+  shard: number,
+  options: { readonly imageId?: string; readonly mounts?: readonly ShardMount[]; readonly startedAtMs?: number } = {},
+): ShardStart {
+  return {
+    kind: 'started',
+    shard,
+    imageId: options.imageId ?? FAULT_PINNED_IMAGE_ID,
+    mounts: options.mounts ?? [],
+    nameInUse: false,
+    canary: hexValue(`fault-canary-${shard}`, CANARY_LENGTH),
+    startedAtMs: options.startedAtMs ?? rig.clock.now(),
+  }
+}
+
+/** Shard k's container did not start. */
+function faultShardFailedStart(shard: number): ShardStart {
+  return {
+    kind: 'failed-to-start',
+    shard,
+    imageId: FAULT_PINNED_IMAGE_ID,
+    mounts: [],
+    nameInUse: false,
+    canary: hexValue(`fault-canary-${shard}`, CANARY_LENGTH),
+    detail: 'the shard container did not start',
+  }
+}
+
+/** Reports each shard started now. */
+function startFaultShards(rig: FaultRig, ...shards: number[]): void {
+  for (const shard of shards) rig.controller.noteShardStart(faultShardStart(rig, shard))
+}
+
+/** A `leak:1,<j>` mount: shard 1's subdirectory, read-only, at its leak target, with any field changed. */
+function shardOneLeakMount(rig: FaultRig, change: Partial<ShardMount> = {}): ShardMount {
+  return { source: faultShardDir(rig, 1), target: leakMountTarget(1), readOnly: true, ...change }
+}
+
+/** A decision notice for a `timeout:` or `kill:` fault. */
+function faultDecisionNotice(shard: number, fault: Fault, cause: ShardCause): FaultNotice {
+  if (fault.kind !== 'timeout' && fault.kind !== 'kill') throw new Error(`faultDecisionNotice: ${faultText(fault)} is handed no decision`)
+  return { kind: 'decision', decision: { shard, fault, cause } }
+}
+
+/** A record as most cases compare it: its fault's normalized text, its state and its reason. */
+interface FaultOutcome {
+  readonly fault: string
+  readonly state: FiringState
+  readonly reason: string | null
+}
+
+function faultOutcomes(records: readonly FiringRecord[]): FaultOutcome[] {
+  return records.map((record) => ({ fault: faultText(record.fault), state: record.state, reason: record.reason }))
+}
+
+function dueFaultOutcome(fault: Fault): FaultOutcome {
+  return { fault: faultText(fault), state: 'due', reason: null }
+}
+
+function firedFaultOutcome(fault: Fault): FaultOutcome {
+  return { fault: faultText(fault), state: 'fired', reason: null }
+}
+
+function notFiredFaultOutcome(fault: Fault, reason: string): FaultOutcome {
+  return { fault: faultText(fault), state: 'not-fired', reason }
+}
+
+describe('E12: faults (b.t6s E12; b.uqm SR-14.1, SR-14.2, SR-14.3)', () => {
+  afterEach(() => {
+    const rigs = faultRigs
+    faultRigs = []
+    for (const rig of rigs) {
+      assertNoLeak({ records: rig.controller.records(), notices: rig.notices }, 'fault controller')
+      expect(rig.clock.pending()).toEqual([])
+    }
+  })
+
+  describe('activation, target shards and --fail lists (SR-14.1, SR-14.2)', () => {
+    test('with no --inject: no record, no --fail entry, no poll timer and no notice, though a fault-like variable and fault-like files are present', async () => {
+      const names = ['INJECT', 'KILL'] as const
+      const saved = names.map((name) => process.env[name])
+      process.env.INJECT = 'kill:1'
+      process.env.KILL = '1'
+      try {
+        const rig = faultRig({ shards: [[1, 2], [1, 3]] })
+        const [first] = scripts()
+        for (const shard of [1, 2]) {
+          writeFaultResult(rig, shard, [startEvent(first)], { foreignFiles: { [`fail:${faultNumberForm(1)}`]: '', retag: '' } })
+        }
+        writeFileSync(join(rig.runDir, 'kill:1'), '')
+        startFaultShards(rig, 1, 2)
+        await rig.clock.advance(3 * FAULT_POLL_INTERVAL_MS)
+        expect(rig.controller.records()).toEqual([])
+        expect([1, 2].map((shard) => rig.controller.failFileNames(shard))).toEqual([[], []])
+        expect(rig.clock.pending()).toEqual([])
+        expect(rig.clock.firedCount()).toBe(0)
+        expect(rig.notices).toEqual([])
+      } finally {
+        names.forEach((name, index) => {
+          const value = saved[index]
+          if (value === undefined) delete process.env[name]
+          else process.env[name] = value
+        })
+      }
+    })
+
+    // Shards: 1 holds test-1 and test-2, 2 holds test-1 and test-3, 3 holds test-1 and test-4.
+    test.each([
+      ['fail: on test-1, in every shard', 1, null, () => `fail:${faultNumberForm(1)}`],
+      ['timeout: on test-1, in every shard', 1, null, () => `timeout:${faultNumberForm(1)}`],
+      ['fail: on test-3, given by file name', 2, null, () => `fail:${realScriptFileName(3)}`],
+      ['timeout: on test-4', 3, null, () => `timeout:${faultNumberForm(4)}`],
+      ['leak:3,2', 2, 3, () => 'leak:3,2'],
+      ['image-drift:3', 3, null, () => 'image-drift:3'],
+      ['kill:2', 2, null, () => 'kill:2'],
+      ['retag', null, null, () => 'retag'],
+      ['fail: on a script the assignment does not place', null, null, () => `fail:${faultNumberForm(5)}`],
+    ] as [string, number | null, number | null, () => string][])('%s starts due and acts on shard %p (source shard %p)', (_what, shard, leakSourceShard, inject) => {
+      const rig = faultRig({ inject: [inject()], shards: [[1, 2], [1, 3], [1, 4]] })
+      expect(rig.controller.records()).toEqual([{ fault: faultAt(rig, 0), shard, leakSourceShard, state: 'due', reason: null }])
+    })
+
+    test('each shard’s --fail list is exactly the file names of the fail: faults acting on it, in normalized order; no other fault adds one', () => {
+      const rig = faultRig({
+        inject: [
+          `fail:${faultNumberForm(5)}`,
+          `timeout:${faultNumberForm(4)}`,
+          `fail:${realScriptFileName(2)}`,
+          'kill:2',
+          `fail:${faultNumberForm(3)}`,
+          'leak:3,2',
+          'image-drift:1',
+          'retag',
+          `fail:${faultNumberForm(1)}`,
+        ],
+        shards: [[1, 2, 5], [1, 3], [1, 4]],
+      })
+      expect([1, 2, 3, 4].map((shard) => rig.controller.failFileNames(shard))).toEqual([
+        [realScriptFileName(5), realScriptFileName(2), realScriptFileName(1)],
+        [realScriptFileName(3)],
+        [],
+        [],
+      ])
+    })
+  })
+
+  describe('fail: firing and the result lines read back (SR-14.2, SR-11.3)', () => {
+    test('the injected script’s start, end … fail 0.000 and injected-failure log are read back, and finalization records the fail: fired', () => {
+      const rig = faultRig({ inject: [`fail:${faultNumberForm(2)}`], shards: [[1, 2, 3]] })
+      const [first, second, third] = scripts()
+      const events = [startEvent(first), endEvent(first, RESULT_WORD_PASS, 1.5), startEvent(second), endEvent(second, RESULT_WORD_FAIL, 0), notRunEvent(third), DONE_EVENT]
+      startFaultShards(rig, 1)
+      writeFaultResult(rig, 1, events, { scriptLogs: { [second]: `${injectedFailureLine(second)}\n` } })
+      rig.controller.noteShardEnded(1)
+      expect(readResultFile(faultShardDir(rig, 1))).toEqual({ kind: 'events', events })
+      expect(readFileText(join(faultShardDir(rig, 1), `${second}${SCRIPT_LOG_SUFFIX}`))).toEqual({ kind: 'text', text: `${injectedFailureLine(second)}\n` })
+      expect(faultOutcomes(rig.controller.finalize())).toEqual([firedFaultOutcome(faultAt(rig, 0))])
+    })
+
+    test('a start line still being written, with no final line feed, does not fire the fail:', () => {
+      const rig = faultRig({ inject: [`fail:${faultNumberForm(2)}`], shards: [[1, 2]] })
+      const [first, second] = scripts()
+      startFaultShards(rig, 1)
+      writeFaultResult(rig, 1, { events: [startEvent(first), endEvent(first, RESULT_WORD_PASS, 1)], partial: { event: startEvent(second) } })
+      expect(rig.controller.finalize().map((record) => record.state)).toEqual(['not-fired'])
+    })
+
+    test.each([
+      [1, 'fired'],
+      [2, 'not-fired'],
+    ] as [number, FiringState][])('fail:test-1 with its start line in shard %p only is %p: it is read from shard 1 alone', (shardWithLine, state) => {
+      const rig = faultRig({ inject: [`fail:${faultNumberForm(1)}`], shards: [[1, 2], [1, 3]] })
+      startFaultShards(rig, 1, 2)
+      writeFaultResult(rig, shardWithLine, [startEvent(scripts()[0])])
+      expect(rig.controller.finalize().map((record) => record.state)).toEqual([state])
+    })
+
+    test('a second finalization leaves the record as the first left it, though the start line was written since', () => {
+      const rig = faultRig({ inject: [`fail:${faultNumberForm(1)}`], shards: [[1, 2]] })
+      const [first] = scripts()
+      startFaultShards(rig, 1)
+      writeFaultResult(rig, 1, { events: [], partial: { event: startEvent(first) } })
+      const before = rig.controller.finalize()
+      writeFaultResult(rig, 1, [startEvent(first)])
+      expect(rig.controller.finalize()).toEqual(before)
+      expect(before.map((record) => record.state)).toEqual(['not-fired'])
+    })
+  })
+
+  describe('timeout: and kill: decisions, and the fault polls (SR-14.2)', () => {
+    test.each([
+      ['timeout:test-1', () => `timeout:${faultNumberForm(1)}`, faultWallTimeCause(1)],
+      ['kill:1', () => 'kill:1', FAULT_KILLED_CAUSE],
+    ] as [string, () => string, ShardCause][])('AC 51: with test-1 in progress 3 s after shard 1’s container start, %s hands one decision for shard 1 with its cause', async (_what, inject, cause) => {
+      const rig = faultRig({ inject: [inject()], shards: [[1, 2]] })
+      startFaultShards(rig, 1)
+      await rig.clock.advanceTo(3_000 - FAULT_POLL_INTERVAL_MS)
+      expect(rig.notices).toEqual([])
+      writeFaultResult(rig, 1, [startEvent(scripts()[0])])
+      await rig.clock.advanceTo(3_000)
+      expect(rig.clock.now()).toBe(3_000)
+      expect(rig.notices).toEqual([faultDecisionNotice(1, faultAt(rig, 0), cause)])
+      expect(rig.clock.pending()).toEqual([])
+    })
+
+    // The container started `startedBeforeMs` before clock time 0. Its start is reported at `60_000 % FAULT_POLL_INTERVAL_MS`,
+    // so whatever the interval, a poll comes at clock time 60 000, `startedBeforeMs` past a whole minute of the container's run.
+    test.each([
+      ['exactly 1 min', 1, 0],
+      ['1 min and 1 ms', 2, 1],
+    ])('a timeout: on a script after test-1 waits out test-1 and fires at the first poll that sees it in progress; at %s it names m = %p', async (_what, minutes, startedBeforeMs) => {
+      const rig = faultRig({ inject: [`timeout:${faultNumberForm(23)}`], shards: [[1, 23]] })
+      const [first] = scripts()
+      const later = realScriptFileName(23)
+      const startedAtMs = rig.clock.now() - startedBeforeMs
+      await rig.clock.advanceTo(60_000 % FAULT_POLL_INTERVAL_MS)
+      rig.controller.noteShardStart(faultShardStart(rig, 1, { startedAtMs }))
+      writeFaultResult(rig, 1, [startEvent(first)])
+      await rig.clock.advanceTo(60_000 - FAULT_POLL_INTERVAL_MS)
+      expect(rig.notices).toEqual([])
+      writeFaultResult(rig, 1, [startEvent(first), endEvent(first, RESULT_WORD_PASS, 58), startEvent(later)])
+      await rig.clock.advanceTo(60_000)
+      expect(rig.clock.now() - startedAtMs).toBe(60_000 + startedBeforeMs)
+      expect(rig.notices).toEqual([faultDecisionNotice(1, faultAt(rig, 0), faultWallTimeCause(minutes))])
+    })
+
+    test('kill:2 fires at the first poll that sees any script in progress in shard 2; progress in shard 1, which it never reads, fires nothing', async () => {
+      const rig = faultRig({ inject: ['kill:2'], shards: [[1, 2], [1, 3]] })
+      const [first] = scripts()
+      startFaultShards(rig, 1, 2)
+      expect(rig.clock.pendingCount()).toBe(1)
+      writeFaultResult(rig, 1, [startEvent(first)])
+      writeFaultResult(rig, 2, [])
+      await rig.clock.advance(3 * FAULT_POLL_INTERVAL_MS)
+      expect(rig.notices).toEqual([])
+      writeFaultResult(rig, 2, [startEvent(first)])
+      await rig.clock.advance(FAULT_POLL_INTERVAL_MS)
+      expect(rig.notices).toEqual([faultDecisionNotice(2, faultAt(rig, 0), FAULT_KILLED_CAUSE)])
+    })
+
+    test('a decision is handed at most once, and none for a shard a firing already stopped', async () => {
+      const rig = faultRig({ inject: [`timeout:${faultNumberForm(1)}`, `timeout:${faultNumberForm(2)}`], shards: [[1, 2]] })
+      const [first, second] = scripts()
+      startFaultShards(rig, 1)
+      writeFaultResult(rig, 1, [startEvent(first)])
+      await rig.clock.advance(3 * FAULT_POLL_INTERVAL_MS)
+      writeFaultResult(rig, 1, [startEvent(first), endEvent(first, RESULT_WORD_PASS, 3), startEvent(second)])
+      await rig.clock.advance(3 * FAULT_POLL_INTERVAL_MS)
+      expect(rig.notices).toEqual([faultDecisionNotice(1, faultAt(rig, 0), faultWallTimeCause(1))])
+      rig.controller.finalize()
+    })
+
+    test.each([
+      ['a start line still being written', (): ResultFileSpec | null => ({ events: [], partial: { event: startEvent(scripts()[0]) } })],
+      ['a missing result file', (): ResultFileSpec | null => null],
+      ['an unreadable result file', (): ResultFileSpec | null => ({ events: [startEvent(scripts()[0])], malformed: { at: 0, change: 'carriage-return' } })],
+    ])('%s fires nothing and polling goes on', async (_what, resultFile) => {
+      const rig = faultRig({ inject: ['kill:1'], shards: [[1, 2]] })
+      startFaultShards(rig, 1)
+      const spec = resultFile()
+      if (spec !== null) writeFaultResult(rig, 1, spec)
+      await rig.clock.advance(3 * FAULT_POLL_INTERVAL_MS)
+      expect(rig.notices).toEqual([])
+      expect(rig.clock.pendingCount()).toBe(1)
+      writeFaultResult(rig, 1, [startEvent(scripts()[0])])
+      await rig.clock.advance(FAULT_POLL_INTERVAL_MS)
+      expect(rig.notices).toEqual([faultDecisionNotice(1, faultAt(rig, 0), FAULT_KILLED_CAUSE)])
+    })
+
+    test('a poll timer, one interval out, is pending only for a started shard with a due timeout: or kill: aimed at it', async () => {
+      const rig = faultRig({ inject: ['kill:1', 'kill:2'], shards: [[1], [1, 2], [1, 3]] })
+      expect(rig.clock.pending()).toEqual([])
+      rig.controller.noteShardStart(faultShardStart(rig, 3))
+      rig.controller.noteShardStart(faultShardFailedStart(2))
+      expect(rig.clock.pending()).toEqual([])
+      startFaultShards(rig, 1)
+      expect(rig.clock.pending()).toEqual([{ id: expect.any(Number), delayMs: FAULT_POLL_INTERVAL_MS, scheduledAt: 0, dueAt: FAULT_POLL_INTERVAL_MS }])
+      await rig.clock.advance(FAULT_POLL_INTERVAL_MS)
+      expect(rig.clock.pending()).toEqual([
+        { id: expect.any(Number), delayMs: FAULT_POLL_INTERVAL_MS, scheduledAt: FAULT_POLL_INTERVAL_MS, dueAt: 2 * FAULT_POLL_INTERVAL_MS },
+      ])
+      rig.controller.finalize()
+    })
+
+    test('a poll that finds the end marker hands one end-marker notice, exactly once, and polling stops', async () => {
+      const rig = faultRig({ inject: ['kill:1'], shards: [[1, 2]] })
+      const [first, second] = scripts()
+      startFaultShards(rig, 1)
+      writeFaultResult(rig, 1, [startEvent(first), endEvent(first, RESULT_WORD_PASS, 0.5), startEvent(second), endEvent(second, RESULT_WORD_PASS, 0.25), DONE_EVENT])
+      await rig.clock.advance(FAULT_POLL_INTERVAL_MS)
+      expect(rig.notices).toEqual([{ kind: 'end-marker', shard: 1 }])
+      expect(rig.clock.pending()).toEqual([])
+      await rig.clock.advance(3 * FAULT_POLL_INTERVAL_MS)
+      expect(rig.notices).toHaveLength(1)
+    })
+
+    test.each([
+      ['a reported end of shard 1', (controller: FaultController) => controller.noteShardEnded(1), 1],
+      ['shard 1 reaching its limit', (controller: FaultController) => controller.noteShardLimit(1), 1],
+      ['a run-level stop, which leaves no timer', (controller: FaultController) => controller.noteRunStop(), 0],
+    ] as [string, (controller: FaultController) => void, number][])('polling of shard 1 stops at %s', async (_what, stop, pendingAfter) => {
+      const rig = faultRig({ inject: ['kill:1', 'kill:2'], shards: [[1, 2], [1, 3]] })
+      startFaultShards(rig, 1, 2)
+      expect(rig.clock.pendingCount()).toBe(2)
+      stop(rig.controller)
+      expect(rig.clock.pendingCount()).toBe(pendingAfter)
+      writeFaultResult(rig, 1, [startEvent(scripts()[0])])
+      await rig.clock.advance(3 * FAULT_POLL_INTERVAL_MS)
+      expect(rig.notices).toEqual([])
+      rig.controller.finalize()
+    })
+
+    test.each([
+      ['fail:', () => [`fail:${faultNumberForm(1)}`]],
+      ['leak', () => ['leak:2,1']],
+      ['image-drift', () => ['image-drift:1']],
+      ['retag', () => ['retag']],
+      ['all four', () => [`fail:${faultNumberForm(1)}`, 'leak:2,1', 'image-drift:1', 'retag']],
+    ])('a run whose only faults are %s never sets a poll timer', async (_what, inject) => {
+      const rig = faultRig({ inject: inject(), shards: [[1, 2], [1, 3]] })
+      for (const shard of [1, 2]) writeFaultResult(rig, shard, [startEvent(scripts()[0])])
+      startFaultShards(rig, 1, 2)
+      await rig.clock.advance(3 * FAULT_POLL_INTERVAL_MS)
+      expect(rig.clock.firedCount()).toBe(0)
+      expect(rig.clock.pending()).toEqual([])
+      expect(rig.notices).toEqual([])
+      rig.controller.finalize()
+    })
+  })
+
+  describe('leak, image-drift and retag records (SR-14.2, SR-14.3)', () => {
+    test('a leak mount’s target is /leak-shard-<k>', () => {
+      expect(leakMountTarget(3)).toBe('/leak-shard-3')
+    })
+
+    interface FaultEventRow {
+      readonly label: string
+      readonly inject: string
+      readonly act: (rig: FaultRig) => void
+      readonly expected: (fault: Fault) => FaultOutcome
+    }
+    // Shards: 1 holds test-1 and test-2, 2 holds test-1 and test-3.
+    const start = (rig: FaultRig, shard: number, options: Parameters<typeof faultShardStart>[2] = {}): void => rig.controller.noteShardStart(faultShardStart(rig, shard, options))
+    const ROWS: FaultEventRow[] = [
+      { label: 'leak:1,2: shard 2 starts with shard 1’s subdirectory read-only at /leak-shard-1', inject: 'leak:1,2', act: (rig) => start(rig, 2, { mounts: [shardOneLeakMount(rig)] }), expected: firedFaultOutcome },
+      {
+        label: 'leak:1,2: the mount’s source is spelled another way that resolves to shard 1’s subdirectory',
+        inject: 'leak:1,2',
+        act: (rig) => start(rig, 2, { mounts: [shardOneLeakMount(rig, { source: `${faultShardDir(rig, 2)}/../${SHARD_DIR_PREFIX}1/` })] }),
+        expected: firedFaultOutcome,
+      },
+      { label: 'leak:1,2: the mount is read-write', inject: 'leak:1,2', act: (rig) => start(rig, 2, { mounts: [shardOneLeakMount(rig, { readOnly: false })] }), expected: (fault) => notFiredFaultOutcome(fault, shardStartedWithoutItReason(2)) },
+      { label: 'leak:1,2: the mount is at another target', inject: 'leak:1,2', act: (rig) => start(rig, 2, { mounts: [shardOneLeakMount(rig, { target: leakMountTarget(2) })] }), expected: (fault) => notFiredFaultOutcome(fault, shardStartedWithoutItReason(2)) },
+      { label: 'leak:1,2: the mount’s source is shard 2’s own subdirectory', inject: 'leak:1,2', act: (rig) => start(rig, 2, { mounts: [shardOneLeakMount(rig, { source: faultShardDir(rig, 2) })] }), expected: (fault) => notFiredFaultOutcome(fault, shardStartedWithoutItReason(2)) },
+      { label: 'leak:1,2: shard 2 starts with no mount', inject: 'leak:1,2', act: (rig) => start(rig, 2), expected: (fault) => notFiredFaultOutcome(fault, shardStartedWithoutItReason(2)) },
+      { label: 'leak:1,2: shard 2 fails to start', inject: 'leak:1,2', act: (rig) => rig.controller.noteShardStart(faultShardFailedStart(2)), expected: (fault) => notFiredFaultOutcome(fault, shardNeverStartedReason(2)) },
+      { label: 'leak:1,2: only shard 1 starts, carrying the mount', inject: 'leak:1,2', act: (rig) => start(rig, 1, { mounts: [shardOneLeakMount(rig)] }), expected: dueFaultOutcome },
+      {
+        label: 'image-drift:2: shard 2 starts from the drift image',
+        inject: 'image-drift:2',
+        act: (rig) => {
+          rig.controller.noteDriftBuild({ kind: 'built', imageId: FAULT_DRIFT_IMAGE_ID })
+          start(rig, 2, { imageId: FAULT_DRIFT_IMAGE_ID })
+        },
+        expected: firedFaultOutcome,
+      },
+      {
+        label: 'image-drift:2: the drift image is built and shard 2 starts from the pinned ID',
+        inject: 'image-drift:2',
+        act: (rig) => {
+          rig.controller.noteDriftBuild({ kind: 'built', imageId: FAULT_DRIFT_IMAGE_ID })
+          start(rig, 2)
+        },
+        expected: (fault) => notFiredFaultOutcome(fault, shardStartedWithoutItReason(2)),
+      },
+      { label: 'image-drift:2: no drift build is reported and shard 2 starts from the pinned ID', inject: 'image-drift:2', act: (rig) => start(rig, 2), expected: (fault) => notFiredFaultOutcome(fault, shardStartedWithoutItReason(2)) },
+      {
+        label: 'image-drift:2: the drift build fails, then shard 2 starts from the pinned ID',
+        inject: 'image-drift:2',
+        act: (rig) => {
+          rig.controller.noteDriftBuild({ kind: 'failed', exitCode: 7 })
+          start(rig, 2)
+        },
+        expected: (fault) => notFiredFaultOutcome(fault, driftBuildFailedReason(7)),
+      },
+      {
+        label: 'image-drift:2: the drift image is built and shard 2 fails to start',
+        inject: 'image-drift:2',
+        act: (rig) => {
+          rig.controller.noteDriftBuild({ kind: 'built', imageId: FAULT_DRIFT_IMAGE_ID })
+          rig.controller.noteShardStart(faultShardFailedStart(2))
+        },
+        expected: (fault) => notFiredFaultOutcome(fault, shardNeverStartedReason(2)),
+      },
+      {
+        label: 'image-drift:2: only shard 1 starts, from the drift image',
+        inject: 'image-drift:2',
+        act: (rig) => {
+          rig.controller.noteDriftBuild({ kind: 'built', imageId: FAULT_DRIFT_IMAGE_ID })
+          start(rig, 1, { imageId: FAULT_DRIFT_IMAGE_ID })
+        },
+        expected: dueFaultOutcome,
+      },
+      {
+        label: 'retag: the -test tag is moved',
+        inject: 'retag',
+        act: (rig) => {
+          rig.controller.noteRetagBuild({ kind: 'built', imageId: FAULT_RETAG_IMAGE_ID })
+          rig.controller.noteTagMove({ kind: 'moved' })
+        },
+        expected: firedFaultOutcome,
+      },
+      { label: 'retag: the retag build fails', inject: 'retag', act: (rig) => rig.controller.noteRetagBuild({ kind: 'failed', exitCode: 5 }), expected: (fault) => notFiredFaultOutcome(fault, retagBuildFailedReason(5)) },
+      {
+        label: 'retag: the retag image is built and the tag move fails',
+        inject: 'retag',
+        act: (rig) => {
+          rig.controller.noteRetagBuild({ kind: 'built', imageId: FAULT_RETAG_IMAGE_ID })
+          rig.controller.noteTagMove({ kind: 'failed', exitCode: 6 })
+        },
+        expected: (fault) => notFiredFaultOutcome(fault, tagMoveFailedReason(6)),
+      },
+      {
+        label: 'retag: the retag image is built and no tag move is tried',
+        inject: 'retag',
+        act: (rig) => {
+          rig.controller.noteRetagBuild({ kind: 'built', imageId: FAULT_RETAG_IMAGE_ID })
+          rig.controller.noteTagMove({ kind: 'not-tried' })
+        },
+        expected: dueFaultOutcome,
+      },
+    ]
+    test.each(ROWS)('$label', ({ inject, act, expected }) => {
+      const rig = faultRig({ inject: [inject], shards: [[1, 2], [1, 3]] })
+      act(rig)
+      expect(faultOutcomes(rig.controller.records())).toEqual([expected(faultAt(rig, 0))])
+    })
+
+    test('a terminal record never changes, and one fault’s outcome leaves the others’ records as they were', () => {
+      const rig = faultRig({ inject: ['leak:1,2', 'image-drift:2', 'retag'], shards: [[1, 2], [1, 3]] })
+      const [leak, drift, retag] = [faultAt(rig, 0), faultAt(rig, 1), faultAt(rig, 2)]
+      const outcomes = (): FaultOutcome[] => faultOutcomes(rig.controller.records())
+
+      rig.controller.noteDriftBuild({ kind: 'built', imageId: FAULT_DRIFT_IMAGE_ID })
+      start(rig, 2, { imageId: FAULT_DRIFT_IMAGE_ID })
+      const afterStart = [notFiredFaultOutcome(leak, shardStartedWithoutItReason(2)), firedFaultOutcome(drift), dueFaultOutcome(retag)]
+      expect(outcomes()).toEqual(afterStart)
+
+      rig.controller.noteDriftBuild({ kind: 'failed', exitCode: 7 })
+      start(rig, 2, { mounts: [shardOneLeakMount(rig)] })
+      rig.controller.noteRetagBuild({ kind: 'built', imageId: FAULT_RETAG_IMAGE_ID })
+      expect(outcomes()).toEqual(afterStart)
+
+      rig.controller.noteTagMove({ kind: 'moved' })
+      const afterMove = [notFiredFaultOutcome(leak, shardStartedWithoutItReason(2)), firedFaultOutcome(drift), firedFaultOutcome(retag)]
+      expect(outcomes()).toEqual(afterMove)
+
+      rig.controller.noteTagMove({ kind: 'failed', exitCode: 3 })
+      rig.controller.noteRetagBuild({ kind: 'failed', exitCode: 4 })
+      rig.controller.noteRunStop()
+      expect(faultOutcomes(rig.controller.finalize())).toEqual(afterMove)
+    })
+  })
+
+  describe('faults that never fire: reasons, ties, finalization and the reason texts (SR-14.3)', () => {
+    test('AC 55: kill:1 when shard 1 writes its end marker before any script is seen in progress gives shard-1 ended first', async () => {
+      const rig = faultRig({ inject: ['kill:1'], shards: [[1, 2]] })
+      const [first, second] = scripts()
+      startFaultShards(rig, 1)
+      writeFaultResult(rig, 1, [startEvent(first), endEvent(first, RESULT_WORD_PASS, 0.5), startEvent(second), endEvent(second, RESULT_WORD_PASS, 0.25), DONE_EVENT])
+      await rig.clock.advance(FAULT_POLL_INTERVAL_MS)
+      expect(faultOutcomes(rig.controller.finalize())).toEqual([notFiredFaultOutcome(faultAt(rig, 0), shardEndedFirstReason(1))])
+    })
+
+    test('AC 55: fail: on a script left notrun because an earlier script failed gives shard-1 ended first', () => {
+      const rig = faultRig({ inject: [`fail:${faultNumberForm(3)}`], shards: [[1, 2, 3]] })
+      const [first, second, third] = scripts()
+      startFaultShards(rig, 1)
+      writeFaultResult(rig, 1, [startEvent(first), endEvent(first, RESULT_WORD_PASS, 1), startEvent(second), endEvent(second, RESULT_WORD_FAIL, 2), notRunEvent(third), DONE_EVENT])
+      rig.controller.noteShardEnded(1)
+      expect(faultOutcomes(rig.controller.finalize())).toEqual([notFiredFaultOutcome(faultAt(rig, 0), shardEndedFirstReason(1))])
+    })
+
+    test('AC 51: kill:2 fires while test-1 runs, so a timeout: on a later shard-2 script is stopped by it; a timeout: on shard 1 still fires', async () => {
+      const rig = faultRig({ inject: ['kill:2', `timeout:${faultNumberForm(23)}`, `timeout:${faultNumberForm(2)}`], shards: [[1, 2], [1, 23]] })
+      const [kill, laterTimeout, otherTimeout] = [faultAt(rig, 0), faultAt(rig, 1), faultAt(rig, 2)]
+      const [first, second] = scripts()
+      startFaultShards(rig, 1, 2)
+      writeFaultResult(rig, 1, [startEvent(first), endEvent(first, RESULT_WORD_PASS, 0.5), startEvent(second)])
+      writeFaultResult(rig, 2, [startEvent(first)])
+      await rig.clock.advance(FAULT_POLL_INTERVAL_MS)
+      expect(rig.notices).toEqual([faultDecisionNotice(1, otherTimeout, faultWallTimeCause(1)), faultDecisionNotice(2, kill, FAULT_KILLED_CAUSE)])
+      expect(faultOutcomes(rig.controller.finalize())).toEqual([
+        firedFaultOutcome(kill),
+        notFiredFaultOutcome(laterTimeout, faultStoppedShardFirstReason(kill, 2)),
+        firedFaultOutcome(otherTimeout),
+      ])
+    })
+
+    test.each([
+      ['kill:1 given first', () => ['kill:1', `timeout:${faultNumberForm(1)}`]],
+      ['timeout:test-1 given first', () => [`timeout:${faultNumberForm(1)}`, 'kill:1']],
+    ])('a tie of timeout:test-1 and kill:1 (%s): only kill:1 is handed, and timeout:test-1 names it', async (_what, inject) => {
+      const rig = faultRig({ inject: inject(), shards: [[1, 2]] })
+      const kill = rig.faults.find((fault) => fault.kind === 'kill') as Fault
+      startFaultShards(rig, 1)
+      writeFaultResult(rig, 1, [startEvent(scripts()[0])])
+      await rig.clock.advance(FAULT_POLL_INTERVAL_MS)
+      expect(rig.notices).toEqual([faultDecisionNotice(1, kill, FAULT_KILLED_CAUSE)])
+      expect(faultOutcomes(rig.controller.finalize())).toEqual(
+        rig.faults.map((fault) => (fault === kill ? firedFaultOutcome(fault) : notFiredFaultOutcome(fault, faultStoppedShardFirstReason(kill, 1)))),
+      )
+    })
+
+    // Shard 1 holds test-1, test-2 and test-3; its whole result file is written before the first poll.
+    test.each([
+      [
+        'a fired fail:test-2 is named by a timeout: on test-3, after it',
+        () => [`fail:${faultNumberForm(2)}`, `timeout:${faultNumberForm(3)}`],
+        (): ResultEvent[] => {
+          const [first, second, third] = scripts()
+          return [startEvent(first), endEvent(first, RESULT_WORD_PASS, 1), startEvent(second), endEvent(second, RESULT_WORD_FAIL, 0), notRunEvent(third), DONE_EVENT]
+        },
+        (rig: FaultRig) => [firedFaultOutcome(faultAt(rig, 0)), notFiredFaultOutcome(faultAt(rig, 1), faultStoppedShardFirstReason(faultAt(rig, 0), 1))],
+      ],
+      [
+        'a fired fail:test-1 is named by kill:1',
+        () => ['kill:1', `fail:${faultNumberForm(1)}`],
+        (): ResultEvent[] => {
+          const [first, second, third] = scripts()
+          return [startEvent(first), endEvent(first, RESULT_WORD_FAIL, 0), notRunEvent(second), notRunEvent(third), DONE_EVENT]
+        },
+        (rig: FaultRig) => [notFiredFaultOutcome(faultAt(rig, 0), faultStoppedShardFirstReason(faultAt(rig, 1), 1)), firedFaultOutcome(faultAt(rig, 1))],
+      ],
+      [
+        'a timeout: on test-2, which ended before the fail:test-3 script, gives shard-1 ended first',
+        () => [`timeout:${faultNumberForm(2)}`, `fail:${faultNumberForm(3)}`],
+        (): ResultEvent[] => {
+          const [first, second, third] = scripts()
+          return [startEvent(first), endEvent(first, RESULT_WORD_PASS, 1), startEvent(second), endEvent(second, RESULT_WORD_PASS, 1), startEvent(third), endEvent(third, RESULT_WORD_FAIL, 0), DONE_EVENT]
+        },
+        (rig: FaultRig) => [notFiredFaultOutcome(faultAt(rig, 0), shardEndedFirstReason(1)), firedFaultOutcome(faultAt(rig, 1))],
+      ],
+    ] as [string, () => string[], () => ResultEvent[], (rig: FaultRig) => FaultOutcome[]][])('%s', async (_what, inject, events, expected) => {
+      const rig = faultRig({ inject: inject(), shards: [[1, 2, 3]] })
+      startFaultShards(rig, 1)
+      writeFaultResult(rig, 1, events())
+      await rig.clock.advance(FAULT_POLL_INTERVAL_MS)
+      expect(rig.notices).toEqual([{ kind: 'end-marker', shard: 1 }])
+      expect(faultOutcomes(rig.controller.finalize())).toEqual(expected(rig))
+    })
+
+    test('a timeout: that stops shard 1 before the fail: script is reached is named by the fail:', async () => {
+      const rig = faultRig({ inject: [`timeout:${faultNumberForm(2)}`, `fail:${faultNumberForm(3)}`], shards: [[1, 2, 3]] })
+      const [timeout, fail] = [faultAt(rig, 0), faultAt(rig, 1)]
+      const [first, second] = scripts()
+      startFaultShards(rig, 1)
+      writeFaultResult(rig, 1, [startEvent(first), endEvent(first, RESULT_WORD_PASS, 0.5), startEvent(second)])
+      await rig.clock.advance(FAULT_POLL_INTERVAL_MS)
+      expect(rig.notices).toEqual([faultDecisionNotice(1, timeout, faultWallTimeCause(1))])
+      expect(faultOutcomes(rig.controller.finalize())).toEqual([firedFaultOutcome(timeout), notFiredFaultOutcome(fail, faultStoppedShardFirstReason(timeout, 1))])
+    })
+
+    // Shard 1 holds test-1 and test-2.
+    const END_STATES: [string, (rig: FaultRig) => void, () => string][] = [
+      [
+        'shard 1 reaching its limit first',
+        (rig) => {
+          startFaultShards(rig, 1)
+          writeFaultResult(rig, 1, [startEvent(scripts()[0])])
+          rig.controller.noteShardLimit(1)
+        },
+        () => shardLimitReachedFirstReason(1),
+      ],
+      ['shard 1 failing to start', (rig) => rig.controller.noteShardStart(faultShardFailedStart(1)), () => shardNeverStartedReason(1)],
+    ]
+    const SHARD_ONE_FAULTS: [string, () => string][] = [
+      ['fail:test-2', () => `fail:${faultNumberForm(2)}`],
+      ['timeout:test-2', () => `timeout:${faultNumberForm(2)}`],
+      ['kill:1', () => 'kill:1'],
+    ]
+    test.each(END_STATES.flatMap(([state, act, reason]) => SHARD_ONE_FAULTS.map(([fault, inject]) => [fault, state, inject, act, reason] as const)))(
+      '%s is given its reason after %s',
+      async (_fault, _state, inject, act, reason) => {
+        const rig = faultRig({ inject: [inject()], shards: [[1, 2]] })
+        act(rig)
+        await rig.clock.advance(3 * FAULT_POLL_INTERVAL_MS)
+        expect(rig.notices).toEqual([])
+        expect(faultOutcomes(rig.controller.finalize())).toEqual([notFiredFaultOutcome(faultAt(rig, 0), reason())])
+      },
+    )
+
+    test('a run-level stop gives the run was stopped first: to a started shard’s faults, a due retag, a shard never attempted and a shard started after it', () => {
+      const rig = faultRig({
+        inject: ['kill:1', `fail:${faultNumberForm(2)}`, `timeout:${faultNumberForm(3)}`, 'retag', 'kill:3'],
+        shards: [[1, 2], [1, 3], [1, 4]],
+      })
+      startFaultShards(rig, 1)
+      writeFaultResult(rig, 1, [startEvent(scripts()[0])])
+      rig.controller.noteRunStop()
+      startFaultShards(rig, 3)
+      expect(rig.clock.pending()).toEqual([])
+      expect(faultOutcomes(rig.controller.finalize())).toEqual(rig.faults.map((fault) => notFiredFaultOutcome(fault, runStoppedFirstReason())))
+      expect(rig.notices).toEqual([])
+    })
+
+    test('finalization answers a terminal record for every fault, in normalized order and form, and is idempotent', () => {
+      const rig = faultRig({
+        inject: [`fail:${realScriptFileName(2)}`, 'kill:1', `fail:${faultNumberForm(2)}`, 'retag', 'leak:2,1', `timeout:${realScriptFileName(3)}`, 'image-drift:2', 'kill:1'],
+        shards: [[1, 2], [1, 3]],
+      })
+      const records = rig.controller.finalize()
+      expect(records.map((record) => faultText(record.fault))).toEqual([
+        `fail:${faultNumberForm(2)}`,
+        'kill:1',
+        'retag',
+        'leak:2,1',
+        `timeout:${faultNumberForm(3)}`,
+        'image-drift:2',
+      ])
+      expect(records.map(({ shard, leakSourceShard }) => ({ shard, leakSourceShard }))).toEqual([
+        { shard: 1, leakSourceShard: null },
+        { shard: 1, leakSourceShard: null },
+        { shard: null, leakSourceShard: null },
+        { shard: 1, leakSourceShard: 2 },
+        { shard: 2, leakSourceShard: null },
+        { shard: 2, leakSourceShard: null },
+      ])
+      expect(records.map((record) => record.state)).toEqual(Array(records.length).fill('not-fired'))
+      rig.controller.noteTagMove({ kind: 'moved' })
+      startFaultShards(rig, 1, 2)
+      expect(rig.controller.finalize()).toEqual(records)
+      expect(rig.controller.records()).toEqual(records)
+    })
+
+    test('a controller with no faults finalizes to an empty record list', () => {
+      expect(faultRig({ shards: [[1, 2]] }).controller.finalize()).toEqual([])
+    })
+
+    test.each([
+      ['driftBuildFailedReason', 'drift image build failed (exit 3)', () => driftBuildFailedReason(3)],
+      ['retagBuildFailedReason', 'retag image build failed (exit 4)', () => retagBuildFailedReason(4)],
+      ['tagMoveFailedReason', 'tag move failed (exit 125)', () => tagMoveFailedReason(125)],
+      ['shardNeverStartedReason', 'shard-2 never started', () => shardNeverStartedReason(2)],
+      ['shardStartedWithoutItReason', 'shard-3 started without it', () => shardStartedWithoutItReason(3)],
+      ['shardEndedFirstReason', 'shard-4 ended first', () => shardEndedFirstReason(4)],
+      ['shardLimitReachedFirstReason', 'shard-5 reached its wall-time limit first', () => shardLimitReachedFirstReason(5)],
+      ['runStoppedFirstReason', 'the run was stopped first', () => runStoppedFirstReason()],
+      [
+        'faultStoppedShardFirstReason',
+        'kill:2 stopped shard-2 first',
+        () => {
+          const parsed = parseFault('kill:2')
+          if (!parsed.ok) throw new Error(parsed.reason)
+          return faultStoppedShardFirstReason(parsed.fault, 2)
+        },
+      ],
+    ])('pin: %s gives %p', (_builder, text, reason) => {
+      expect(reason()).toBe(text)
+    })
+  })
+})
 
 // ---------------------------------------------------------------------------
 // E13: the run's end and the tests/runner.sh source audit (b.t6s E13)
