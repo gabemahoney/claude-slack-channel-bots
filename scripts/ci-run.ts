@@ -2770,13 +2770,18 @@ export function atomicTempFileName(fileName: string): string {
  * temporary file where it can and leaves the previous file as it was. The
  * status file, the verdict, the reservation and a rewrite of the results and
  * summary all go through it (b.uqm SR-5.2, SR-5.6, SR-5.7, SR-6.2).
+ * A temporary file left by an interrupted write, or a link planted at its
+ * name, is removed first (the link itself, never what it points to), and the
+ * temporary file is then created exclusively, so the file written is always a
+ * new one at `WRITTEN_FILE_MODE` and a link there is never followed.
  * The runner cannot use `src/atomic-write.ts`: SR-1.3 forbids it loading `src/`.
  */
 export function writeWholeFile(dir: string, fileName: string, content: string): WriteResult {
   const target = join(dir, fileName)
   const temp = join(dir, atomicTempFileName(fileName))
   try {
-    writeFileSync(temp, content, { mode: WRITTEN_FILE_MODE })
+    rmSync(temp, { force: true })
+    writeFileSync(temp, content, { mode: WRITTEN_FILE_MODE, flag: 'wx' })
     renameSync(temp, target)
     return { ok: true }
   } catch (err) {
