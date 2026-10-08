@@ -1,7 +1,9 @@
 #!/bin/bash
 # entrypoint.sh — Sets up testuser's Claude config (bot Claudes spawned by the
 # daemon-under-test still consume .claude.json + settings.json), then execs
-# the bash test runner. No tmux, no orchestrator Claude.
+# the bash test runner, passing it every argument this entrypoint got,
+# unchanged and in order (the shard's arguments: b.uqm SR-11.1, SR-11.2).
+# No tmux, no orchestrator Claude.
 set -euo pipefail
 
 TESTUSER_HOME=/home/testuser
@@ -57,4 +59,4 @@ print('Created slack-mcp.json')
 mkdir -p /test-results
 chown -R testuser:testuser "${TESTUSER_HOME}/.claude" "${TESTUSER_HOME}/.claude.json" /test-results 2>/dev/null || true
 
-exec gosu testuser bash /tests/runner.sh
+exec gosu testuser bash /tests/runner.sh "$@"
