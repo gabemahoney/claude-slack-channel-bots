@@ -56,6 +56,21 @@ import { join, resolve } from 'node:path'
 import { appendFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 // E1 T5's step 1: the run directory, created exclusively, mode 0700.
 import { chmodSync, mkdirSync } from 'node:fs'
+// E11 T2's secret-scan: a walk that never follows a link, and each file read
+// in chunks through a descriptor opened without following a link. Aliased so
+// another lane's own `node:fs` import of the same names cannot collide.
+import {
+  closeSync as closeScannedFile,
+  constants as scanFsConstants,
+  fstatSync as statScannedFile,
+  openSync as openScannedFile,
+  readSync as readScannedFile,
+  readdirSync as listScannedDir,
+  type Dirent as ScannedDirEntry,
+} from 'node:fs'
+// E11 T1's evidence reader: listings and entry types that never follow a
+// link. Aliased so another lane's own `node:fs` import cannot collide.
+import { lstatSync as lstatEvidenceEntry, readdirSync as listEvidenceDir } from 'node:fs'
 
 // ---------------------------------------------------------------------------
 // 1. Entry and dependencies (E1)
@@ -4368,6 +4383,1211 @@ export async function pruneUntaggedImages(docker: DockerContext, owner: string):
 // ---------------------------------------------------------------------------
 // 15. Integrity and secret-scan (E11)
 // ---------------------------------------------------------------------------
+
+// --- 15/T1 (E11 T1): integrity checks 1–11, the evidence reader, the evidence rule and the skip rules ---
+//
+// Checks 1–11 of b.uqm SR-13.2. They judge plain inputs in E1's types
+// (`IntegrityInputs`, filled by E13 at step 2 of the end of run, b.uqm
+// SR-5.7) and the run directory as it stands then, read by
+// `readIntegrityEvidence` with E1's readers and never through a link. Nothing
+// here spawns a process or reads a container: isolation is judged only from
+// the inspection data captured at each shard's start and from the shard
+// subdirectories (b.uqm SR-13.1, SR-10.5). `runIntegrityChecks1To11` runs
+// them in order; T2's entry adds check 12, `secret-scan`.
+//
+// Each failure reads `FAIL: integrity: <check>: <detail>` (`integrityFailure`)
+// and is one problem found. A problem about one shard carries that shard's
+// number; a problem about the run directory, a fault, or several shards at
+// once carries null, and its detail names every shard involved. A file in
+// shard j's subdirectory holding shard k's canary, and a mount of shard k's
+// subdirectory in shard j, are problems found in shard j and carry j. A
+// detail names shards, scripts, entries, mount targets or faults; it never
+// holds a credential, a canary, a hash or file content. A name can still
+// spell one: every run canary in a line is masked here, and T2's entry masks
+// every scanned value in every line it returns.
+//
+// Order of the failures: by check, in SR-13.2's order
+// (`INTEGRITY_CHECK_ORDER`). Inside a check, the failures carrying a shard
+// number come first, by shard number, then the null-shard failures; each
+// group keeps the order the check finds them in: faults in their normalized
+// order; a shard's mounts in inspection order, then the mounts it lacks; a
+// shard's entries by path; a shard's assigned scripts in run order, then the
+// scripts it was not assigned in canonical order; null-shard scripts in
+// canonical order.
+//
+// The evidence rule (b.uqm SR-13.1), for checks 5, 10 and 11: a shard's own
+// canary, tarball hash or fingerprint that is missing or malformed fails only
+// when the shard ended normally (E10's `endedNormally`, never recomputed
+// here) and its test-1 passed. Evidence a shard did record that is wrong
+// fails in any shard: another shard's canary, a well-formed hash that differs
+// from the run's, well-formed fingerprints that differ.
+//
+// The skip rules (b.uqm SR-13.1, SR-5.6): see `integritySkippedChecks`. A
+// stopped run is checked from whatever evidence exists, as a finished one is.
+
+/** b.uqm SR-13.2's twelve checks, in order: E10 ranks integrity failures in it (b.uqm SR-12.4). */
+export const INTEGRITY_CHECK_ORDER: readonly IntegrityCheck[] = [
+  'fault-fired',
+  'schedule-coverage',
+  'isolation-mounts',
+  'isolation-config',
+  'results-canary',
+  'results-ownership',
+  'image-drift',
+  'name-collision',
+  'result-coverage',
+  'package-hash',
+  'dependency-set',
+  'secret-scan',
+]
+
+/** The read-only tarball mount's target in a shard, the path test-1 installs from (b.uqm SR-10.3). */
+export const INTEGRITY_TARBALL_MOUNT_TARGET = '/tmp/package.tgz'
+/** The target of a shard's own subdirectory's mount (b.uqm SR-10.3). */
+export const INTEGRITY_RESULTS_MOUNT_TARGET = '/test-results'
+/** `fault-fired`'s reason for a fault that has no firing record: it counts as not fired (b.uqm SR-14.3). */
+export const NO_FIRING_RECORD_REASON = 'no firing record exists'
+/** `fault-fired`'s reason for a fault whose firing record was still due when the checks ran (b.uqm SR-14.3). */
+export const STILL_DUE_FIRING_REASON = 'it was still due when the run ended'
+
+/** A Docker namespace mode shared with the host (b.uqm SR-13.2 check 4). */
+const INTEGRITY_HOST_MODE = 'host'
+/** A Docker namespace mode's prefix when it joins another container's namespace, `container:<id>` (b.uqm SR-13.2 check 4). */
+const INTEGRITY_CONTAINER_MODE_PREFIX = 'container:'
+/** A shard subdirectory's name, `shard-<k>`, k from 1; group 1 is k (b.uqm SR-5.9). */
+const INTEGRITY_SHARD_DIR_PATTERN = /^shard-([1-9][0-9]*)$/
+/** A canary as the runner draws it: 32 lowercase hexadecimal characters (b.uqm SR-11.2). */
+const INTEGRITY_CANARY_PATTERN = /^[0-9a-f]{32}$/
+
+// The inputs (b.uqm SR-13.1, SR-13.2). E13 fills them at step 2 of the end of
+// run from what E8, E9, E10 and E12 recorded; nothing here calls their code.
+
+/** When the run's first run-level stop came, as the skip rules read it (b.uqm SR-5.6, SR-13.1). */
+export type IntegrityStopTime = 'before-end-of-run' | 'during-end-of-run'
+
+/** The run state the skip rules read (b.uqm SR-13.1). */
+export interface IntegrityRunState {
+  /** Whether the shards were scheduled (the status phase reached `shards`, b.uqm SR-5.2). */
+  readonly shardsScheduled: boolean
+  /** Whether the test or base image build failed: an image build failure, never a build a stop ended (b.uqm SR-5.6). */
+  readonly imageBuildFailed: boolean
+  /** When the first run-level stop came: before the end-of-run sequence started (before or after scheduling, as `shardsScheduled` tells), during it, or null for none. */
+  readonly stopTime: IntegrityStopTime | null
+}
+
+/** What checks 1–11 read of one shard: E1's `ShardEvidence` fields, so E13 passes its evidence as it is. Its container started when `start.kind` is `started`. */
+export type IntegrityShard = Pick<ShardEvidence, 'shard' | 'endedNormally' | 'start' | 'canary' | 'inspection'>
+
+/** Everything checks 1–11 judge besides the run directory's files (b.uqm SR-13.2). */
+export interface IntegrityInputs {
+  /** The run directory: the only place the evidence reader reads. */
+  readonly runDir: string
+  /** The run's expected scripts, as file names. */
+  readonly expectedScripts: readonly string[]
+  /** The assignment; null when the shards were never scheduled. */
+  readonly assignment: Assignment | null
+  /** One entry per shard admission chose, started or not. */
+  readonly shards: readonly IntegrityShard[]
+  /** The pinned image ID (E8, `ImageState.pinnedId`). */
+  readonly pinnedImageId: string | null
+  /** The run's tarball hash, 64 lowercase hexadecimal characters (E8); null when none was packed. */
+  readonly packageSha256: string | null
+  /** The tarball's path on the host, in the run directory's `package/` (E8); null when none was packed. */
+  readonly tarballPath: string | null
+  /** The normalized faults, in order (b.uqm SR-2.4). */
+  readonly faults: readonly Fault[]
+  /** E12's firing records, one per normalized fault. */
+  readonly firingRecords: readonly FiringRecord[]
+  readonly runState: IntegrityRunState
+}
+
+/** An integrity failure, `FAIL: integrity: <check>: <detail>`, with its shard or null (b.uqm SR-13.1, SR-12.4). The detail must be one line. */
+export function integrityFailure(check: IntegrityCheck, detail: string, shard: number | null): Failure {
+  return {
+    line: `${FAIL_PREFIX}integrity: ${check}: ${detail}`,
+    shard,
+    failureClass: { kind: 'integrity', check },
+  }
+}
+
+/** Failures in the order inside a check: by shard number, then the null-shard ones, each group in its given order. */
+export function inIntegrityShardOrder(failures: readonly Failure[]): Failure[] {
+  return [...failures].sort((a, b) => (a.shard ?? Number.POSITIVE_INFINITY) - (b.shard ?? Number.POSITIVE_INFINITY))
+}
+
+/** `shard-<k>`: a shard's name in a detail, and its subdirectory's name (b.uqm SR-5.9). */
+function integrityShardName(shard: number): string {
+  return `${SHARD_DIR_PREFIX}${shard}`
+}
+
+/** A shard's assigned scripts in run order; none when the assignment does not hold it. */
+function integrityAssigned(inputs: IntegrityInputs, shard: number): readonly string[] {
+  return inputs.assignment?.find((entry) => entry.shard === shard)?.assigned ?? []
+}
+
+/** The run's shard numbers, in order: every shard admission chose and every shard the assignment holds. */
+export function integrityShardNumbers(inputs: IntegrityInputs): number[] {
+  const numbers = new Set<number>([...inputs.shards.map((s) => s.shard), ...(inputs.assignment ?? []).map((entry) => entry.shard)])
+  return [...numbers].sort((a, b) => a - b)
+}
+
+/** Whether a script name is test-1's. */
+function isTestOneName(name: string): boolean {
+  return scriptNameNumber(name) === 1
+}
+
+// The chunked byte search, shared by `results-canary`'s search (the evidence
+// reader) and T2's `secret-scan`: a file's bytes are read a chunk at a time,
+// each read keeping the previous window's last bytes, so a needle across two
+// reads is found and no file is ever held whole, however large its
+// `docker.log` or script log.
+
+/** How much of a searched file is read at a time. Each read keeps the previous window's last bytes, so a needle across two reads is found. */
+const FILE_SEARCH_CHUNK_BYTES = 1024 * 1024
+
+/** A file's bytes searched: the indices of the needles found in it, or why it could not be read. */
+type FileSearchOutcome =
+  | {
+      readonly kind: 'searched'
+      readonly found: ReadonlySet<number>
+    }
+  | {
+      readonly kind: 'unreadable'
+      readonly error: string
+    }
+
+/**
+ * Searches a file's bytes for the needles, in chunks, so a large file is
+ * searched whole without being held whole. The file is opened without
+ * following a link and without blocking, and anything but a regular file is
+ * unreadable. With `firstOnly` it stops at the first read that finds any
+ * needle; otherwise it reads on until every needle is found or the file ends.
+ * Never throws.
+ */
+function searchFileBytes(path: string, needles: readonly Buffer[], firstOnly: boolean): FileSearchOutcome {
+  let fd: number
+  try {
+    fd = openScannedFile(path, scanFsConstants.O_RDONLY | scanFsConstants.O_NOFOLLOW | scanFsConstants.O_NONBLOCK)
+  } catch (err) {
+    return { kind: 'unreadable', error: dependencyErrorText(err) }
+  }
+  try {
+    if (!statScannedFile(fd).isFile()) return { kind: 'unreadable', error: 'not a regular file' }
+    const overlap = Math.max(0, ...needles.map((needle) => needle.length - 1))
+    const window = Buffer.alloc(overlap + FILE_SEARCH_CHUNK_BYTES)
+    const found = new Set<number>()
+    let kept = 0
+    for (;;) {
+      const read = readScannedFile(fd, window, kept, FILE_SEARCH_CHUNK_BYTES, null)
+      if (read === 0) return { kind: 'searched', found }
+      const filled = window.subarray(0, kept + read)
+      needles.forEach((needle, index) => {
+        if (!found.has(index) && filled.includes(needle)) found.add(index)
+      })
+      if (found.size > 0 && (firstOnly || found.size === needles.length)) return { kind: 'searched', found }
+      kept = Math.min(overlap, filled.length)
+      window.copy(window, 0, filled.length - kept, filled.length)
+    }
+  } catch (err) {
+    return { kind: 'unreadable', error: dependencyErrorText(err) }
+  } finally {
+    try {
+      closeScannedFile(fd)
+    } catch {
+      // The outcome is already decided; a failed close changes nothing.
+    }
+  }
+}
+
+// The evidence reader (b.uqm SR-1.3, SR-11.3, SR-13.2). It reads only under
+// the run directory it is given: listings and entry types by `lstat`, so a
+// link is never followed. In a shard subdirectory it searches every regular
+// file's bytes for the run's canaries with the chunked search, holding no
+// file whole, and keeps text only for the four small in-shard records at the
+// subdirectory's top (`canary.txt`, `package.sha256`,
+// `dependency-fingerprint.txt`, `result.txt`), read with E1's `readFileText`
+// and parsed by E1's rules (`parseHexRecord`, `parseResultFileText`). In the
+// run directory's own listing it reads entry types only. Nothing it meets is
+// an error that stops the checks: a missing, unreadable or malformed thing
+// comes out as what it is.
+
+/** An entry's type, read without following a link. */
+export type EvidenceEntryType = 'file' | 'directory' | 'symlink' | 'other'
+
+/** One entry under a directory the reader lists. */
+export interface EvidenceEntry {
+  /** Its path relative to the listed directory, `/`-separated. */
+  readonly path: string
+  readonly type: EvidenceEntryType
+  /** A record's text, for the four in-shard records at a shard subdirectory's top only; null for every other entry and for a record that could not be read. */
+  readonly text: string | null
+  /** A shard subdirectory's regular file searched whole: the canaries it holds, of those the reader was given; null for every other entry and for a file that could not be searched. */
+  readonly heldCanaries: readonly string[] | null
+  /** Why a regular file could not be searched or its record text read, a directory listed or the entry's type read, on one line; null otherwise. */
+  readonly error: string | null
+}
+
+/** A directory as the reader found it. */
+export type EvidenceListing =
+  | {
+      readonly kind: 'listed'
+      /** Its entries by path: the run directory's top level only; a shard subdirectory's whole tree. */
+      readonly entries: readonly EvidenceEntry[]
+    }
+  | {
+      readonly kind: 'missing'
+    }
+  | {
+      /** Something else is at its path: a link, a file. */
+      readonly kind: 'not-a-directory'
+      readonly type: EvidenceEntryType
+    }
+  | {
+      readonly kind: 'unreadable'
+      readonly error: string
+    }
+
+/** One shard's files as read (b.uqm SR-11.3). */
+export interface ShardFilesEvidence {
+  readonly shard: number
+  /** Its subdirectory, `shard-<k>`, with every entry under it. */
+  readonly dir: EvidenceListing
+  /** `canary.txt`. */
+  readonly canary: HexRecordRead
+  /** `package.sha256`. */
+  readonly packageSha256: HexRecordRead
+  /** `dependency-fingerprint.txt`. */
+  readonly dependencyFingerprint: HexRecordRead
+  /** `result.txt`, under E1's reading rule. */
+  readonly resultFile: ResultFileRead
+  /** Each script's count of `end … pass`, `end … fail` and `notrun` lines in the result file; empty when it could not be read. */
+  readonly resultCounts: ReadonlyMap<string, number>
+  /** Whether the result file holds `end <test-1> pass`. */
+  readonly testOnePassed: boolean
+}
+
+/** The run directory as checks 5, 6 and 9–11 judge it. */
+export interface IntegrityEvidence {
+  /** The run directory's own entries. */
+  readonly runDir: EvidenceListing
+  /** Each of the run's shards, in shard order. */
+  readonly shards: readonly ShardFilesEvidence[]
+}
+
+/** An entry's type by `lstat`, never following a link; or why it could not be read, and whether because nothing is there. */
+function evidenceEntryType(path: string): { readonly type: EvidenceEntryType; readonly error: string | null; readonly missing: boolean } {
+  try {
+    const stats = lstatEvidenceEntry(path)
+    if (stats.isSymbolicLink()) return { type: 'symlink', error: null, missing: false }
+    if (stats.isDirectory()) return { type: 'directory', error: null, missing: false }
+    if (stats.isFile()) return { type: 'file', error: null, missing: false }
+    return { type: 'other', error: null, missing: false }
+  } catch (err) {
+    return { type: 'other', error: dependencyErrorText(err), missing: errnoCode(err) === 'ENOENT' }
+  }
+}
+
+/** A directory's entry names, sorted; or why it could not be listed. */
+function evidenceDirNames(path: string): { readonly ok: true; readonly names: string[] } | { readonly ok: false; readonly error: string } {
+  try {
+    return { ok: true, names: listEvidenceDir(path).sort() }
+  } catch (err) {
+    return { ok: false, error: dependencyErrorText(err) }
+  }
+}
+
+/** The canaries a shard subdirectory's files are searched for, with their bytes, index for index. */
+interface EvidenceSearch {
+  readonly canaries: readonly string[]
+  readonly needles: readonly Buffer[]
+}
+
+/** The in-shard records whose text the reader keeps: each small, and only at a shard subdirectory's top (b.uqm SR-11.3). */
+const EVIDENCE_RECORD_FILE_NAMES: readonly string[] = [CANARY_FILE_NAME, PACKAGE_SHA256_FILE_NAME, DEPENDENCY_FINGERPRINT_FILE_NAME, RESULT_FILE_NAME]
+
+/** A shard subdirectory's regular file read: its bytes searched in chunks for the canaries, and its text kept when it is a record at the top. */
+function readEvidenceFile(path: string, relative: string, search: EvidenceSearch): EvidenceEntry {
+  const searched = searchFileBytes(path, search.needles, false)
+  const heldCanaries = searched.kind === 'searched' ? search.canaries.filter((_, index) => searched.found.has(index)) : null
+  let error = searched.kind === 'unreadable' ? searched.error : null
+  let text: string | null = null
+  if (EVIDENCE_RECORD_FILE_NAMES.includes(relative)) {
+    const read = readFileText(path)
+    if (read.kind === 'text') text = read.text
+    else error ??= read.kind === 'missing' ? 'it vanished while being read' : read.error
+  }
+  return { path: relative, type: 'file', text, heldCanaries, error }
+}
+
+/** One entry read: with `search`, a regular file searched (`readEvidenceFile`) and a directory with its tree; without, its type only. */
+function readEvidenceEntry(dir: string, relative: string, search: EvidenceSearch | null, out: EvidenceEntry[]): void {
+  const path = join(dir, relative)
+  const { type, error } = evidenceEntryType(path)
+  if (error !== null) {
+    out.push({ path: relative, type, text: null, heldCanaries: null, error })
+    return
+  }
+  if (search !== null && type === 'file') {
+    out.push(readEvidenceFile(path, relative, search))
+    return
+  }
+  if (search === null || type !== 'directory') {
+    out.push({ path: relative, type, text: null, heldCanaries: null, error: null })
+    return
+  }
+  const listed = evidenceDirNames(path)
+  out.push({ path: relative, type, text: null, heldCanaries: null, error: listed.ok ? null : listed.error })
+  if (!listed.ok) return
+  for (const name of listed.names) readEvidenceEntry(dir, `${relative}/${name}`, search, out)
+}
+
+/** A directory listed: with `search`, its whole tree with every regular file searched; without, its top-level entries' types only. */
+function readEvidenceListing(path: string, search: EvidenceSearch | null): EvidenceListing {
+  const { type, error, missing } = evidenceEntryType(path)
+  if (missing) return { kind: 'missing' }
+  if (error !== null) return { kind: 'unreadable', error }
+  if (type !== 'directory') return { kind: 'not-a-directory', type }
+  const listed = evidenceDirNames(path)
+  if (!listed.ok) return { kind: 'unreadable', error: listed.error }
+  const entries: EvidenceEntry[] = []
+  for (const name of listed.names) readEvidenceEntry(path, name, search, entries)
+  return { kind: 'listed', entries }
+}
+
+/** A shard file's top-level entry, when its subdirectory was listed and holds one. */
+function topLevelEntry(dir: EvidenceListing, name: string): EvidenceEntry | 'no-entry' | 'no-listing' {
+  if (dir.kind !== 'listed') return dir.kind === 'unreadable' ? 'no-listing' : 'no-entry'
+  return dir.entries.find((entry) => entry.path === name) ?? 'no-entry'
+}
+
+/** An in-shard hex record from its subdirectory's listing, by E1's rule: a value, missing, or malformed (a link or a directory at its name included). */
+function evidenceHexRecord(dir: EvidenceListing, name: string, length: number): HexRecordRead {
+  const entry = topLevelEntry(dir, name)
+  if (entry === 'no-entry') return { kind: 'missing' }
+  if (entry === 'no-listing') return { kind: 'malformed', error: 'its subdirectory could not be listed' }
+  if (entry.type !== 'file') return { kind: 'malformed', error: 'not a regular file' }
+  if (entry.text === null) return { kind: 'malformed', error: entry.error ?? 'it could not be read' }
+  const parsed = parseHexRecord(entry.text, length)
+  return parsed.ok ? { kind: 'value', value: parsed.value } : { kind: 'malformed', error: parsed.error }
+}
+
+/** The result file from its subdirectory's listing, by E1's reading rule: events, missing, or unreadable (a link or a directory at its name included). */
+function evidenceResultFile(dir: EvidenceListing): ResultFileRead {
+  const entry = topLevelEntry(dir, RESULT_FILE_NAME)
+  if (entry === 'no-entry') return { kind: 'missing' }
+  if (entry === 'no-listing') return { kind: 'unreadable', error: 'its subdirectory could not be listed' }
+  if (entry.type !== 'file') return { kind: 'unreadable', error: 'not a regular file' }
+  if (entry.text === null) return { kind: 'unreadable', error: entry.error ?? 'it could not be read' }
+  return parseResultFileText(entry.text)
+}
+
+/** One shard's files read (b.uqm SR-11.3). */
+function readShardFilesEvidence(runDir: string, shard: number, search: EvidenceSearch): ShardFilesEvidence {
+  const dir = readEvidenceListing(join(runDir, integrityShardName(shard)), search)
+  const resultFile = evidenceResultFile(dir)
+  const resultCounts = new Map<string, number>()
+  let testOnePassed = false
+  if (resultFile.kind === 'events') {
+    for (const event of resultFile.events) {
+      if (event.kind !== 'end' && event.kind !== 'notrun') continue
+      resultCounts.set(event.fileName, (resultCounts.get(event.fileName) ?? 0) + 1)
+      if (event.kind === 'end' && event.result === 'pass' && isTestOneName(event.fileName)) testOnePassed = true
+    }
+  }
+  return {
+    shard,
+    dir,
+    canary: evidenceHexRecord(dir, CANARY_FILE_NAME, CANARY_LENGTH),
+    packageSha256: evidenceHexRecord(dir, PACKAGE_SHA256_FILE_NAME, SHA256_HEX_LENGTH),
+    dependencyFingerprint: evidenceHexRecord(dir, DEPENDENCY_FINGERPRINT_FILE_NAME, SHA256_HEX_LENGTH),
+    resultFile,
+    resultCounts,
+    testOnePassed,
+  }
+}
+
+/**
+ * The evidence checks 5, 6 and 9–11 judge, read from the run directory only,
+ * never through a link (b.uqm SR-1.3, SR-13.1): the run directory's entries
+ * with their types; each given shard's subdirectory, every entry under it
+ * with its type, and every regular file's bytes searched in chunks for the
+ * given canaries (no file held whole); and its `canary.txt`,
+ * `package.sha256`, `dependency-fingerprint.txt` and `result.txt` read by
+ * E1's rules, the only texts kept. Empty canaries are ignored; with none,
+ * every file is still read through, so an unreadable one shows. Never throws.
+ */
+export function readIntegrityEvidence(runDir: string, shardNumbers: readonly number[], canaries: readonly string[] = []): IntegrityEvidence {
+  const distinct = [...new Set(canaries)].filter((canary) => canary !== '')
+  const search: EvidenceSearch = { canaries: distinct, needles: distinct.map((canary) => Buffer.from(canary, 'utf8')) }
+  return {
+    runDir: readEvidenceListing(runDir, null),
+    shards: shardNumbers.map((shard) => readShardFilesEvidence(runDir, shard, search)),
+  }
+}
+
+/** Whether a shard owes its own canary, tarball hash and fingerprint: it ended normally and its test-1 passed (b.uqm SR-13.1). */
+function owesOwnEvidence(shard: IntegrityShard | undefined, files: ShardFilesEvidence): boolean {
+  return shard !== undefined && shard.endedNormally && files.testOnePassed
+}
+
+// Checks 1–2: fault-fired and schedule-coverage (b.uqm SR-13.2, SR-14.3).
+
+/**
+ * Check 1, `fault-fired` (b.uqm SR-13.2, SR-14.3): one failure per normalized
+ * fault that did not fire, `<fault> did not fire (<why>)`, in the faults'
+ * order, shard null. `<why>` is E12's reason exactly as written; a fault with
+ * no firing record counts as not fired. A run with no faults gives none.
+ */
+export function checkFaultFired(inputs: IntegrityInputs): Failure[] {
+  const failures: Failure[] = []
+  for (const fault of inputs.faults) {
+    const text = faultText(fault)
+    const records = inputs.firingRecords.filter((record) => faultText(record.fault) === text)
+    if (records.some((record) => record.state === 'fired')) continue
+    const notFired = records.find((record) => record.state === 'not-fired')
+    let why: string
+    if (notFired !== undefined) why = notFired.reason ?? NO_FIRING_RECORD_REASON
+    else why = records.length > 0 ? STILL_DUE_FIRING_REASON : NO_FIRING_RECORD_REASON
+    failures.push(integrityFailure('fault-fired', `${text} did not fire (${why})`, null))
+  }
+  return failures
+}
+
+/** Each script's shards in the assignment, one entry per time it is assigned. */
+function assignedShardsByScript(assignment: Assignment): Map<string, number[]> {
+  const byScript = new Map<string, number[]>()
+  for (const entry of assignment) {
+    for (const name of entry.assigned) byScript.set(name, [...(byScript.get(name) ?? []), entry.shard])
+  }
+  return byScript
+}
+
+/**
+ * Check 2, `schedule-coverage` (b.uqm SR-13.2): test-1 exactly once in every
+ * shard used, every other expected script in exactly one shard, and no
+ * script that is not expected. A problem in one shard carries its number; a
+ * script in no shard or in several carries null and names the shards.
+ */
+export function checkScheduleCoverage(inputs: IntegrityInputs): Failure[] {
+  const assignment = inputs.assignment ?? []
+  const expected = new Set(inputs.expectedScripts)
+  const failures: Failure[] = []
+  const testOne = inputs.expectedScripts.find(isTestOneName) ?? numberFormOf(1)
+  for (const entry of [...assignment].sort((a, b) => a.shard - b.shard)) {
+    const count = entry.assigned.filter((name) => name === testOne).length
+    if (count === 0) failures.push(integrityFailure('schedule-coverage', `${shownArgument(testOne)} is not assigned to ${integrityShardName(entry.shard)}`, entry.shard))
+    if (count > 1) failures.push(integrityFailure('schedule-coverage', `${shownArgument(testOne)} is assigned ${count} times to ${integrityShardName(entry.shard)}`, entry.shard))
+  }
+  const byScript = assignedShardsByScript(assignment)
+  for (const name of sortCanonical([...byScript.keys()].filter((n) => !expected.has(n)))) {
+    const shards = byScript.get(name) ?? []
+    const distinct = [...new Set(shards)].sort((a, b) => a - b)
+    const only = distinct.length === 1 ? (distinct[0] ?? null) : null
+    failures.push(integrityFailure('schedule-coverage', `${shownArgument(name)} is not an expected script but is assigned to ${distinct.map(integrityShardName).join(', ')}`, only))
+  }
+  for (const name of sortCanonical(inputs.expectedScripts.filter((n) => n !== testOne))) {
+    const shards = [...(byScript.get(name) ?? [])].sort((a, b) => a - b)
+    if (shards.length === 0) failures.push(integrityFailure('schedule-coverage', `${shownArgument(name)} is assigned to no shard`, null))
+    if (shards.length > 1) failures.push(integrityFailure('schedule-coverage', `${shownArgument(name)} is assigned more than once: ${shards.map(integrityShardName).join(', ')}`, null))
+  }
+  return inIntegrityShardOrder(failures)
+}
+
+// Checks 3, 4, 7, 8: isolation-mounts, isolation-config, image-drift,
+// name-collision (b.uqm SR-13.2, SR-10.3, SR-10.5). Judged from E9's records
+// only; a shard whose container never started is outside checks 3, 4 and 7.
+
+/** The started shards, in shard order, with their inspection data or null. */
+function startedShards(inputs: IntegrityInputs): { readonly shard: number; readonly inspection: InspectionData | null }[] {
+  return inputs.shards
+    .filter((s) => s.start?.kind === 'started')
+    .map((s) => ({ shard: s.shard, inspection: s.inspection }))
+    .sort((a, b) => a.shard - b.shard)
+}
+
+/** `shard-<k> could not be inspected`: checks 3, 4 and 7 for a started shard without inspection data (b.uqm SR-10.5). */
+function notInspectedFailure(check: 'isolation-mounts' | 'isolation-config' | 'image-drift', shard: number): Failure {
+  return integrityFailure(check, `${integrityShardName(shard)} could not be inspected`, shard)
+}
+
+/** The shard whose subdirectory of this run a mount source is or lies in; null for any other source. */
+function mountedShardDir(source: string, runDir: string): number | null {
+  const base = resolve(runDir)
+  const path = resolve(source)
+  if (!path.startsWith(`${base}/`)) return null
+  const first = path.slice(base.length + 1).split('/')[0] ?? ''
+  const match = INTEGRITY_SHARD_DIR_PATTERN.exec(first)
+  return match?.[1] === undefined ? null : Number(match[1])
+}
+
+/** One shard's `isolation-mounts` failures from its inspected mounts, in mount order, then the mounts it lacks. */
+function shardMountFailures(inputs: IntegrityInputs, shard: number, mounts: readonly ShardMount[]): Failure[] {
+  const name = integrityShardName(shard)
+  const ownDir = resolve(inputs.runDir, name)
+  const tarball = inputs.tarballPath === null ? null : resolve(inputs.tarballPath)
+  const failures: Failure[] = []
+  const fail = (detail: string): void => {
+    failures.push(integrityFailure('isolation-mounts', detail, shard))
+  }
+  let tarballSeen = false
+  let resultsSeen = false
+  for (const mount of mounts) {
+    const source = resolve(mount.source)
+    const other = mountedShardDir(source, inputs.runDir)
+    if (other !== null && other !== shard) {
+      fail(`${name} mounts ${integrityShardName(other)}'s results subdirectory`)
+      continue
+    }
+    if (mount.target === INTEGRITY_RESULTS_MOUNT_TARGET && !resultsSeen) {
+      resultsSeen = true
+      if (source !== ownDir) fail(`${name} mounts something other than its results subdirectory at ${INTEGRITY_RESULTS_MOUNT_TARGET}`)
+      continue
+    }
+    if (mount.target === INTEGRITY_TARBALL_MOUNT_TARGET && !tarballSeen) {
+      tarballSeen = true
+      if (source !== tarball) fail(`${name}'s mount at ${INTEGRITY_TARBALL_MOUNT_TARGET} is not the run's tarball`)
+      if (!mount.readOnly) fail(`${name}'s tarball mount at ${INTEGRITY_TARBALL_MOUNT_TARGET} is not read-only`)
+      continue
+    }
+    fail(`${name} has an extra mount at ${shownArgument(mount.target)}`)
+  }
+  if (!tarballSeen) fail(`${name} has no tarball mount at ${INTEGRITY_TARBALL_MOUNT_TARGET}`)
+  if (!resultsSeen) fail(`${name} has no mount of its results subdirectory at ${INTEGRITY_RESULTS_MOUNT_TARGET}`)
+  return failures
+}
+
+/**
+ * Check 3, `isolation-mounts` (b.uqm SR-13.2, SR-10.3): each started shard
+ * has exactly the run's tarball, read-only, at `/tmp/package.tgz` and its own
+ * subdirectory at `/test-results`. A mount of another shard's subdirectory
+ * gives exactly `shard-<j> mounts shard-<k>'s results subdirectory`, once,
+ * and is not also an extra mount.
+ */
+export function checkIsolationMounts(inputs: IntegrityInputs): Failure[] {
+  const failures: Failure[] = []
+  for (const { shard, inspection } of startedShards(inputs)) {
+    if (inspection === null) failures.push(notInspectedFailure('isolation-mounts', shard))
+    else failures.push(...shardMountFailures(inputs, shard, inspection.mounts))
+  }
+  return failures
+}
+
+/** A namespace mode's sharing: with the host, with another container, or none. */
+function sharedNamespace(mode: string): 'the host' | 'another container' | null {
+  if (mode === INTEGRITY_HOST_MODE) return 'the host'
+  if (mode.startsWith(INTEGRITY_CONTAINER_MODE_PREFIX)) return 'another container'
+  return null
+}
+
+/**
+ * Check 4, `isolation-config` (b.uqm SR-13.2): no started shard uses host
+ * network or privileged mode, or shares a PID, IPC or network namespace with
+ * the host or another container; one failure per forbidden mode.
+ */
+export function checkIsolationConfig(inputs: IntegrityInputs): Failure[] {
+  const failures: Failure[] = []
+  for (const { shard, inspection } of startedShards(inputs)) {
+    if (inspection === null) {
+      failures.push(notInspectedFailure('isolation-config', shard))
+      continue
+    }
+    const name = integrityShardName(shard)
+    const network = sharedNamespace(inspection.networkMode)
+    if (network === 'the host') failures.push(integrityFailure('isolation-config', `${name} uses host network mode`, shard))
+    else if (network !== null) failures.push(integrityFailure('isolation-config', `${name} shares its network namespace with ${network}`, shard))
+    if (inspection.privileged) failures.push(integrityFailure('isolation-config', `${name} runs in privileged mode`, shard))
+    const pid = sharedNamespace(inspection.pidMode)
+    if (pid !== null) failures.push(integrityFailure('isolation-config', `${name} shares its PID namespace with ${pid}`, shard))
+    const ipc = sharedNamespace(inspection.ipcMode)
+    if (ipc !== null) failures.push(integrityFailure('isolation-config', `${name} shares its IPC namespace with ${ipc}`, shard))
+  }
+  return failures
+}
+
+/** Check 7, `image-drift` (b.uqm SR-13.2): every started shard's inspected image ID equals the pinned ID. The detail names no ID. */
+export function checkImageDrift(inputs: IntegrityInputs): Failure[] {
+  const failures: Failure[] = []
+  for (const { shard, inspection } of startedShards(inputs)) {
+    if (inspection === null) failures.push(notInspectedFailure('image-drift', shard))
+    else if (inputs.pinnedImageId === null || inspection.imageId !== inputs.pinnedImageId) {
+      failures.push(integrityFailure('image-drift', `${integrityShardName(shard)}'s image is not the pinned image`, shard))
+    }
+  }
+  return failures
+}
+
+/** Check 8, `name-collision` (b.uqm SR-13.2): no shard's name was in use when it started, per E9's start record. */
+export function checkNameCollision(inputs: IntegrityInputs): Failure[] {
+  return inputs.shards
+    .filter((s) => s.start?.nameInUse === true)
+    .sort((a, b) => a.shard - b.shard)
+    .map((s) => integrityFailure('name-collision', `${integrityShardName(s.shard)}'s container name was already in use when it started`, s.shard))
+}
+
+// Checks 5–6: results-canary and results-ownership (b.uqm SR-13.2, SR-5.9).
+// They read the run directory as it stands at step 2 of the end of run: every
+// `docker.log` saved, no `results.json`, `summary.txt` or `verdict.txt` yet.
+
+/** An entry's type as a detail names it. */
+function evidenceTypeWords(type: EvidenceEntryType): { readonly the: string; readonly a: string } {
+  switch (type) {
+    case 'file':
+      return { the: 'the file', a: 'a regular file' }
+    case 'directory':
+      return { the: 'the directory', a: 'a directory' }
+    case 'symlink':
+      return { the: 'the symbolic link', a: 'a symbolic link' }
+    case 'other':
+      return { the: 'the special file', a: 'a special file' }
+  }
+}
+
+/**
+ * Check 5, `results-canary` (b.uqm SR-13.2, SR-13.1): no file anywhere in a
+ * shard subdirectory holds another shard's canary (naming both shards, and
+ * carrying the shard whose subdirectory holds it), and a shard that ended
+ * normally with test-1 passed has a `canary.txt` holding exactly its canary
+ * and one line feed. Another shard's own canary file is not judged. The
+ * search is the evidence reader's (`readIntegrityEvidence`, given the run's
+ * canaries), each file's bytes in chunks. An entry that could not be read (a
+ * file not searched whole, a directory not listed, an entry whose type could
+ * not be read) cannot be cleared, and fails naming the shard and the entry.
+ * Only shard subdirectories are searched, never the runner log.
+ */
+export function checkResultsCanary(inputs: IntegrityInputs, evidence: IntegrityEvidence): Failure[] {
+  const canaries = inputs.shards.filter((s) => INTEGRITY_CANARY_PATTERN.test(s.canary))
+  const failures: Failure[] = []
+  for (const files of evidence.shards) {
+    const name = integrityShardName(files.shard)
+    const own = inputs.shards.find((s) => s.shard === files.shard)
+    const fail = (detail: string): void => {
+      failures.push(integrityFailure('results-canary', detail, files.shard))
+    }
+    if (files.dir.kind === 'unreadable') fail(`${name}'s results subdirectory could not be read`)
+    if (files.dir.kind === 'listed') {
+      for (const entry of files.dir.entries) {
+        const unread = entry.type === 'file' ? entry.heldCanaries === null : entry.error !== null
+        if (unread) {
+          fail(`${name}'s ${shownArgument(entry.path)} could not be read`)
+          continue
+        }
+        if (entry.heldCanaries === null) continue
+        for (const other of canaries) {
+          if (other.shard === files.shard || other.canary === own?.canary) continue
+          if (entry.heldCanaries.includes(other.canary)) fail(`${name}'s ${shownArgument(entry.path)} holds ${integrityShardName(other.shard)}'s canary`)
+        }
+      }
+    }
+    if (!owesOwnEvidence(own, files)) continue
+    if (files.canary.kind === 'missing') fail(`${name} has no ${CANARY_FILE_NAME}`)
+    else if (files.canary.kind !== 'value' || files.canary.value !== own?.canary) fail(`${name}'s ${CANARY_FILE_NAME} does not hold its canary`)
+  }
+  return inIntegrityShardOrder(failures)
+}
+
+/** The regular files a shard subdirectory may hold: its records, `docker.log` and its assigned scripts' logs (b.uqm SR-13.2 check 6). */
+function ownedShardFileNames(inputs: IntegrityInputs, shard: number): Set<string> {
+  return new Set([
+    CANARY_FILE_NAME,
+    RESULT_FILE_NAME,
+    PACKAGE_SHA256_FILE_NAME,
+    DEPENDENCY_FINGERPRINT_FILE_NAME,
+    DOCKER_LOG_FILE_NAME,
+    ...integrityAssigned(inputs, shard).map((fileName) => `${fileName}${SCRIPT_LOG_SUFFIX}`),
+  ])
+}
+
+/** The run directory's `results-ownership` failures, each shard null. */
+function runDirOwnershipFailures(inputs: IntegrityInputs, runDir: EvidenceListing): Failure[] {
+  if (runDir.kind !== 'listed') return [integrityFailure('results-ownership', 'the run directory could not be listed', null)]
+  const shardDirs = new Set(integrityShardNumbers(inputs).map(integrityShardName))
+  const failures: Failure[] = []
+  for (const entry of runDir.entries) {
+    let expected: EvidenceEntryType | null = null
+    if (entry.path === STATUS_FILE_NAME || entry.path === RUNNER_LOG_FILE_NAME) expected = 'file'
+    if (entry.path === PACKAGE_DIR_NAME || shardDirs.has(entry.path)) expected = 'directory'
+    const shown = shownArgument(entry.path)
+    if (expected === null) {
+      failures.push(integrityFailure('results-ownership', `the run directory holds ${evidenceTypeWords(entry.type).the} ${shown}, which is not one of its entries`, null))
+    } else if (entry.type !== expected) {
+      failures.push(integrityFailure('results-ownership', `the run directory's ${shown} is ${evidenceTypeWords(entry.type).a}, not ${evidenceTypeWords(expected).a}`, null))
+    }
+  }
+  return failures
+}
+
+/**
+ * Check 6, `results-ownership` (b.uqm SR-13.2, SR-5.9): a shard subdirectory
+ * holds only its `canary.txt`, `result.txt`, `package.sha256`,
+ * `dependency-fingerprint.txt`, `docker.log` and the logs of its assigned
+ * scripts, each a regular file; every other entry, a directory or a link
+ * included, fails naming the shard. The run directory holds only
+ * `status.json`, `runner.log`, the directory `package/` (whose contents are
+ * not judged) and the run's shard subdirectories; every other entry fails
+ * naming the run directory.
+ */
+export function checkResultsOwnership(inputs: IntegrityInputs, evidence: IntegrityEvidence): Failure[] {
+  const failures: Failure[] = []
+  for (const files of evidence.shards) {
+    const name = integrityShardName(files.shard)
+    if (files.dir.kind === 'unreadable') failures.push(integrityFailure('results-ownership', `${name}'s results subdirectory could not be listed`, files.shard))
+    if (files.dir.kind !== 'listed') continue
+    const owned = ownedShardFileNames(inputs, files.shard)
+    for (const entry of files.dir.entries) {
+      if (entry.path.includes('/')) continue
+      const shown = shownArgument(entry.path)
+      if (!owned.has(entry.path)) {
+        failures.push(integrityFailure('results-ownership', `${name} holds ${evidenceTypeWords(entry.type).the} ${shown}, which is not one of its files`, files.shard))
+      } else if (entry.type !== 'file') {
+        failures.push(integrityFailure('results-ownership', `${name}'s ${shown} is ${evidenceTypeWords(entry.type).a}, not a regular file`, files.shard))
+      }
+    }
+  }
+  return inIntegrityShardOrder([...failures, ...runDirOwnershipFailures(inputs, evidence.runDir)])
+}
+
+// Checks 9–11: result-coverage, package-hash, dependency-set (b.uqm SR-13.2,
+// SR-13.1).
+
+/**
+ * Check 9, `result-coverage` (b.uqm SR-13.2): in every shard that ended
+ * normally, each assigned script, test-1 included, has exactly one `pass`,
+ * `fail` or `notrun`, and no script has a result there unless assigned there.
+ * Shards that did not end normally are not judged.
+ */
+export function checkResultCoverage(inputs: IntegrityInputs, evidence: IntegrityEvidence): Failure[] {
+  const failures: Failure[] = []
+  for (const shard of [...inputs.shards].filter((s) => s.endedNormally).sort((a, b) => a.shard - b.shard)) {
+    const name = integrityShardName(shard.shard)
+    const fail = (detail: string): void => {
+      failures.push(integrityFailure('result-coverage', detail, shard.shard))
+    }
+    const files = evidence.shards.find((f) => f.shard === shard.shard)
+    if (files === undefined || files.resultFile.kind === 'missing') {
+      fail(`${name} has no ${RESULT_FILE_NAME}`)
+      continue
+    }
+    if (files.resultFile.kind === 'unreadable') {
+      fail(`${name}'s ${RESULT_FILE_NAME} could not be read`)
+      continue
+    }
+    const assigned = [...new Set(integrityAssigned(inputs, shard.shard))]
+    for (const script of assigned) {
+      const count = files.resultCounts.get(script) ?? 0
+      if (count === 0) fail(`${shownArgument(script)} has no result in ${name}`)
+      if (count > 1) fail(`${shownArgument(script)} has ${count} results in ${name}`)
+    }
+    for (const script of sortCanonical([...files.resultCounts.keys()].filter((s) => !assigned.includes(s)))) {
+      fail(`${shownArgument(script)} has a result in ${name}, which it is not assigned to`)
+    }
+  }
+  return failures
+}
+
+/** A record's failures under the evidence rule: a missing or malformed one only when the shard owes it. */
+function ownRecordFailure(record: HexRecordRead, owes: boolean, name: string, fileName: string): string | null {
+  if (!owes || record.kind === 'value') return null
+  return record.kind === 'missing' ? `${name} has no ${fileName}` : `${name}'s ${fileName} is malformed`
+}
+
+/**
+ * Check 10, `package-hash` (b.uqm SR-13.2, SR-13.1): a well-formed recorded
+ * tarball hash that differs from the run's fails in any shard; a missing or
+ * malformed one fails only for a shard that ended normally with test-1
+ * passed. The detail names no hash.
+ */
+export function checkPackageHash(inputs: IntegrityInputs, evidence: IntegrityEvidence): Failure[] {
+  const failures: Failure[] = []
+  for (const files of evidence.shards) {
+    const name = integrityShardName(files.shard)
+    const record = files.packageSha256
+    if (record.kind === 'value' && record.value !== inputs.packageSha256) {
+      failures.push(integrityFailure('package-hash', `${name}'s ${PACKAGE_SHA256_FILE_NAME} differs from the run's tarball hash`, files.shard))
+    }
+    const own = ownRecordFailure(record, owesOwnEvidence(inputs.shards.find((s) => s.shard === files.shard), files), name, PACKAGE_SHA256_FILE_NAME)
+    if (own !== null) failures.push(integrityFailure('package-hash', own, files.shard))
+  }
+  return failures
+}
+
+/**
+ * Check 11, `dependency-set` (b.uqm SR-13.2, SR-13.1): well-formed recorded
+ * fingerprints that are not all the same give one null-shard failure naming
+ * the shards in groups of equal fingerprints, ordered by their lowest shard;
+ * a missing or malformed fingerprint fails only for a shard that ended
+ * normally with test-1 passed (a test-1 that failed in its install wrote
+ * none). The detail names no fingerprint.
+ */
+export function checkDependencySet(inputs: IntegrityInputs, evidence: IntegrityEvidence): Failure[] {
+  const failures: Failure[] = []
+  const groups = new Map<string, number[]>()
+  for (const files of evidence.shards) {
+    const record = files.dependencyFingerprint
+    if (record.kind === 'value') groups.set(record.value, [...(groups.get(record.value) ?? []), files.shard])
+    const name = integrityShardName(files.shard)
+    const own = ownRecordFailure(record, owesOwnEvidence(inputs.shards.find((s) => s.shard === files.shard), files), name, DEPENDENCY_FINGERPRINT_FILE_NAME)
+    if (own !== null) failures.push(integrityFailure('dependency-set', own, files.shard))
+  }
+  if (groups.size > 1) {
+    const shown = [...groups.values()]
+      .map((shards) => [...shards].sort((a, b) => a - b))
+      .sort((a, b) => (a[0] ?? 0) - (b[0] ?? 0))
+      .map((shards) => `(${shards.map(integrityShardName).join(', ')})`)
+    failures.push(integrityFailure('dependency-set', `the dependency fingerprints differ between ${shown.join(', ')}`, null))
+  }
+  return inIntegrityShardOrder(failures)
+}
+
+// The ordered run of checks 1–11, with the skip rules (b.uqm SR-13.1,
+// SR-13.2). T2's entry adds check 12 after them.
+
+/**
+ * The checks a run skips (b.uqm SR-13.1, SR-5.6), in SR-13.2's order:
+ * - `schedule-coverage` when the image build failed, or a run-level stop
+ *   came, before the shards were scheduled;
+ * - `fault-fired` on an image build failure, and on a run-level stop that
+ *   came before the end-of-run sequence started, injected run or not.
+ * A stop during the sequence skips nothing. A skipped check runs nothing,
+ * gives no failure, and is named here; a run with no faults that skips
+ * nothing gets no `fault-fired` failure and no name.
+ */
+export function integritySkippedChecks(state: IntegrityRunState): IntegrityCheck[] {
+  const stoppedBeforeSequence = state.stopTime === 'before-end-of-run'
+  const skipped = new Set<IntegrityCheck>()
+  if (state.imageBuildFailed || (stoppedBeforeSequence && !state.shardsScheduled)) skipped.add('schedule-coverage')
+  if (state.imageBuildFailed || stoppedBeforeSequence) skipped.add('fault-fired')
+  return INTEGRITY_CHECK_ORDER.filter((check) => skipped.has(check))
+}
+
+/** Checks 1–11's outcome: the failures in order, and the checks skipped. */
+export interface IntegrityChecksResult {
+  /** By check in SR-13.2's order; inside a check by shard number, then the null-shard ones. */
+  readonly failures: readonly Failure[]
+  /** The skipped checks' names, in SR-13.2's order. */
+  readonly skippedChecks: readonly IntegrityCheck[]
+}
+
+/** One of checks 1–11 run; `secret-scan` is T2's and gives nothing here. */
+function runOneIntegrityCheck(check: IntegrityCheck, inputs: IntegrityInputs, evidence: IntegrityEvidence): Failure[] {
+  switch (check) {
+    case 'fault-fired':
+      return checkFaultFired(inputs)
+    case 'schedule-coverage':
+      return checkScheduleCoverage(inputs)
+    case 'isolation-mounts':
+      return checkIsolationMounts(inputs)
+    case 'isolation-config':
+      return checkIsolationConfig(inputs)
+    case 'results-canary':
+      return checkResultsCanary(inputs, evidence)
+    case 'results-ownership':
+      return checkResultsOwnership(inputs, evidence)
+    case 'image-drift':
+      return checkImageDrift(inputs)
+    case 'name-collision':
+      return checkNameCollision(inputs)
+    case 'result-coverage':
+      return checkResultCoverage(inputs, evidence)
+    case 'package-hash':
+      return checkPackageHash(inputs, evidence)
+    case 'dependency-set':
+      return checkDependencySet(inputs, evidence)
+    case 'secret-scan':
+      return []
+  }
+}
+
+/** A failure line with every run canary in it masked, so no detail (an entry name, a mount target) ever shows one. */
+function withoutCanaries(failure: Failure, canaries: readonly string[]): Failure {
+  let line = failure.line
+  for (const canary of canaries) line = line.split(canary).join(REDACTION_PLACEHOLDER)
+  return line === failure.line ? failure : { ...failure, line }
+}
+
+/**
+ * Integrity checks 1–11 (b.uqm SR-13.1, SR-13.2): reads the evidence from
+ * the run directory, applies the skip rules, and runs each check not skipped
+ * in SR-13.2's order. Returns the failures by check, inside a check by shard
+ * number then the null-shard ones, and the skipped checks' names. A stopped
+ * run is checked from whatever evidence exists. Spawns nothing, writes
+ * nothing, and never throws on what it reads.
+ */
+export function runIntegrityChecks1To11(inputs: IntegrityInputs): IntegrityChecksResult {
+  const skippedChecks = integritySkippedChecks(inputs.runState)
+  const canaries = inputs.shards.map((s) => s.canary).filter((canary) => INTEGRITY_CANARY_PATTERN.test(canary))
+  const evidence = readIntegrityEvidence(inputs.runDir, integrityShardNumbers(inputs), canaries)
+  const failures: Failure[] = []
+  for (const check of INTEGRITY_CHECK_ORDER) {
+    if (skippedChecks.includes(check)) continue
+    for (const failure of inIntegrityShardOrder(runOneIntegrityCheck(check, inputs, evidence))) failures.push(withoutCanaries(failure, canaries))
+  }
+  return { failures, skippedChecks }
+}
+
+// --- 15/T2 (E11 T2): the scanned values and their masking, the runner log's masking switch-on, secret-scan, the masked end files, the integrity entry ---
+//
+// One masking rule serves three things (b.uqm SR-15.3): `secret-scan`'s
+// match, the runner log's lines from the scan's start, and the end files. It
+// is E1's runner-log pattern (`redactionPattern`), so all three mask alike.
+// The scanned values are E1's secret-credential set (b.uqm SR-15.1), held in
+// memory only: nothing here logs or writes one.
+//
+// From the scan's start nothing writes `status.json` or a shard file, and E13
+// writes the three end files only through this sub-banner's exports
+// (b.uqm SR-5.7, SR-15.3, SR-16.1):
+// - `results.json` and `summary.txt` through E10's writer, given
+//   `createEndFileRedactor(values)`, at end-of-run step 5 and again on the
+//   rewrite after a stop during the sequence (b.uqm SR-5.6);
+// - `verdict.txt` through `writeRedactedVerdictFile`, at step 6.
+//
+// `runIntegrity` is the one integrity entry E13 calls, at end-of-run step 2,
+// after every `docker.log` is saved (b.uqm SR-5.7, SR-13.2). It takes
+// `IntegrityEntryInputs`: T1's `IntegrityInputs` (the run directory, the
+// tarball's path and the rest checks 1–11 judge), the scanned values and the
+// runner-log writer. It runs checks 1–11, then `secret-scan`; the runner
+// log's masking is on from the scan's start, so after checks 1–11 have run.
+// It returns T1's failures in their order, then `secret-scan`'s, every line
+// with every scanned value masked, and T1's skipped names; `secret-scan` is
+// never skipped.
+
+/**
+ * The run's scanned values (b.uqm SR-15.1, SR-15.2): E1's secret-credential
+ * set, so `ANTHROPIC_API_KEY`, `GH_TOKEN` when set and the base-build token
+ * when step 4 looked one up. Never an empty string, and never the value of
+ * `ANTHROPIC_BASE_URL` or `ANTHROPIC_MODEL` as such.
+ */
+export function scannedSecretValues(env: ChildEnvironmentSource, extras: SecretSetExtras = {}): readonly string[] {
+  return [...secretCredentialSet(env, extras)].filter((value) => value !== '')
+}
+
+/** The distinct non-empty values among `values`. */
+function distinctScannedValues(values: Iterable<string>): string[] {
+  return [...new Set(values)].filter((value) => value !== '')
+}
+
+/** A function masking the values in a text, built once for many texts. */
+function scannedValueMasker(values: Iterable<string>): (text: string) => string {
+  const pattern = redactionPattern(distinctScannedValues(values))
+  if (pattern === null) return (text) => text
+  return (text) => text.replace(pattern, REDACTION_PLACEHOLDER)
+}
+
+/**
+ * `text` with every occurrence of every value replaced by `<redacted>`
+ * (b.uqm SR-15.3), in one pass, longer values first, so a value holding
+ * another is masked whole. Empty values are ignored, and a text holding no
+ * value comes back unchanged.
+ */
+export function maskScannedValues(text: string, values: Iterable<string>): string {
+  return scannedValueMasker(values)(text)
+}
+
+/**
+ * Switches on the runner log's masking at `secret-scan`'s start (b.uqm
+ * SR-15.3; contributes to SR-5.4): from then on every line the writer
+ * appends, child-process output and error lines included, holds `<redacted>`
+ * in place of every value, for the rest of the run. Calling it again only
+ * adds values. E1's writer masks each whole line as it appends it, and a
+ * child's output reaches it only as whole lines (the spawn binding joins a
+ * stream's chunks before handing on a line; `childOutput` splits a text at
+ * its line feeds), so a value that arrives in two parts is masked whole.
+ */
+export function switchOnRunnerLogRedaction(log: RunnerLogWriter, values: Iterable<string>): void {
+  log.redactValues(distinctScannedValues(values))
+}
+
+/** One scanned entry's outcome. */
+type ScannedEntryOutcome =
+  | {
+      readonly kind: 'clean' | 'match'
+    }
+  | {
+      readonly kind: 'unreadable'
+      readonly error: string
+    }
+
+/** What the walk found: paths relative to the run directory. */
+interface SecretScanFindings {
+  readonly matches: string[]
+  readonly unreadable: string[]
+}
+
+/**
+ * Searches a file's bytes for any value with T1's chunked search
+ * (`searchFileBytes`), stopping at the first read that finds one, so a large
+ * `docker.log` is searched whole without being held whole. The file is opened
+ * without following a link and without blocking, and anything but a regular
+ * file is unreadable.
+ */
+function scanFileForValues(path: string, needles: readonly Buffer[]): ScannedEntryOutcome {
+  const searched = searchFileBytes(path, needles, true)
+  if (searched.kind === 'unreadable') return searched
+  return searched.found.size > 0 ? { kind: 'match' } : { kind: 'clean' }
+}
+
+/** Searches a symbolic link's own target text for any value; the link is never followed. */
+function scanLinkForValues(path: string, needles: readonly Buffer[]): ScannedEntryOutcome {
+  try {
+    const target = readlinkSync(path, { encoding: 'buffer' })
+    return needles.some((needle) => target.includes(needle)) ? { kind: 'match' } : { kind: 'clean' }
+  } catch (err) {
+    return { kind: 'unreadable', error: dependencyErrorText(err) }
+  }
+}
+
+/** Walks `dir` (`relDir` relative to the run directory, `''` for the run directory) depth first, never following a link, skipping only the file at `skip`. */
+function walkScannedDir(
+  dir: string,
+  relDir: string,
+  skip: string | null,
+  needles: readonly Buffer[],
+  findings: SecretScanFindings,
+  noteUnreadable: (relPath: string, error: string) => void,
+): void {
+  const listed = ((): ScannedDirEntry[] | { readonly error: string } => {
+    try {
+      return listScannedDir(dir, { withFileTypes: true })
+    } catch (err) {
+      return { error: dependencyErrorText(err) }
+    }
+  })()
+  if (!Array.isArray(listed)) {
+    noteUnreadable(relDir === '' ? '.' : relDir, listed.error)
+    return
+  }
+  for (const entry of listed) {
+    const path = join(dir, entry.name)
+    const relPath = relDir === '' ? entry.name : `${relDir}/${entry.name}`
+    if (entry.isDirectory()) {
+      walkScannedDir(path, relPath, skip, needles, findings, noteUnreadable)
+      continue
+    }
+    if (path === skip) continue
+    const outcome = entry.isSymbolicLink() ? scanLinkForValues(path, needles) : scanFileForValues(path, needles)
+    if (outcome.kind === 'match') findings.matches.push(relPath)
+    if (outcome.kind === 'unreadable') noteUnreadable(relPath, outcome.error)
+  }
+}
+
+/** Orders texts by their UTF-8 bytes. */
+function compareUtf8Bytes(a: string, b: string): number {
+  return Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'))
+}
+
+/** Paths in bytewise order, each shown on one line, joined with `, `. */
+function shownScanPaths(paths: readonly string[]): string {
+  return [...paths].sort(compareUtf8Bytes).map(shownArgument).join(', ')
+}
+
+/**
+ * `secret-scan`, integrity check 12 (b.uqm SR-13.2, SR-15.2, SR-15.3).
+ *
+ * It first switches on the runner log's masking (`switchOnRunnerLogRedaction`).
+ * It then reads every file under `runDir` but the tarball at `tarballPath`
+ * (absolute, or relative to `runDir`; null when none was packed), each as it
+ * stands when read, and searches each whole file's bytes for each value. It
+ * never follows a symbolic link; a link's own target text is searched.
+ *
+ * It returns at most two failures, each with shard null (a path is shown as
+ * it is; `runIntegrity` masks every value in every line it returns): first
+ * `FAIL: integrity: secret-scan: <file(s)>`, naming every file
+ * holding a value; then `FAIL: integrity: secret-scan: <path(s)> not
+ * readable`, naming every file or directory it could not read, so nothing is
+ * passed as clean unread. Paths are relative to `runDir`, in bytewise order,
+ * joined with `, `. It writes nothing but one runner-log line for each path
+ * it could not read, through the now-masking writer; a log that throws loses
+ * only its line.
+ */
+export function secretScan(runDir: string, values: Iterable<string>, tarballPath: string | null, log: RunnerLogWriter): Failure[] {
+  const distinct = distinctScannedValues(values)
+  switchOnRunnerLogRedaction(log, distinct)
+  const root = resolve(runDir)
+  const skip = tarballPath === null ? null : resolve(root, tarballPath)
+  const needles = distinct.map((value) => Buffer.from(value, 'utf8'))
+  const findings: SecretScanFindings = { matches: [], unreadable: [] }
+  walkScannedDir(root, '', skip, needles, findings, (relPath, error) => {
+    findings.unreadable.push(relPath)
+    try {
+      log(`secret-scan: could not read ${shownArgument(relPath)}: ${error}`)
+    } catch {
+      // The log's own failure loses this line only; the failure still names the path.
+    }
+  })
+  const failures: Failure[] = []
+  if (findings.matches.length > 0) failures.push(integrityFailure('secret-scan', shownScanPaths(findings.matches), null))
+  if (findings.unreadable.length > 0) failures.push(integrityFailure('secret-scan', `${shownScanPaths(findings.unreadable)} not readable`, null))
+  return failures
+}
+
+/** What the integrity entry takes: checks 1–11's inputs, plus the scanned values and the runner-log writer `secret-scan` switches to masking. */
+export interface IntegrityEntryInputs extends IntegrityInputs {
+  /** The run's scanned values (`scannedSecretValues`). */
+  readonly values: readonly string[]
+  /** The runner-log writer; it masks every value from the scan's start. */
+  readonly log: RunnerLogWriter
+}
+
+/**
+ * The integrity entry E13 calls at end-of-run step 2 (b.uqm SR-5.7,
+ * SR-13.2): checks 1–11 (`runIntegrityChecks1To11`), then `secret-scan` over
+ * `inputs.runDir` without `inputs.tarballPath`, which first switches on the
+ * runner log's masking. Returns checks 1–11's failures in their order, then
+ * any `secret-scan` failures, and checks 1–11's skipped names. `secret-scan`
+ * is never skipped and never among them, on any outcome. Every returned
+ * line, checks 1–12 alike, has every scanned value masked
+ * (`maskScannedValues`), so an entry named after a value never shows it
+ * (b.uqm SR-15.3); each failure's shard and class are kept as they are.
+ */
+export function runIntegrity(inputs: IntegrityEntryInputs): IntegrityChecksResult {
+  const checks = runIntegrityChecks1To11(inputs)
+  const scanFailures = secretScan(inputs.runDir, inputs.values, inputs.tarballPath, inputs.log)
+  const mask = scannedValueMasker(inputs.values)
+  const masked = (failure: Failure): Failure => {
+    const line = mask(failure.line)
+    return line === failure.line ? failure : { ...failure, line }
+  }
+  return {
+    failures: [...checks.failures, ...scanFailures].map(masked),
+    skippedChecks: checks.skippedChecks.filter((check) => check !== 'secret-scan'),
+  }
+}
+
+/** Masks the values in the end files' content (b.uqm SR-15.3, SR-16.1); E13 hands it to E10's `results.json` and `summary.txt` writer. */
+export interface EndFileRedactor {
+  /** The results object with every string in it masked, `verdict` and object keys included; numbers, booleans and nulls are unchanged. */
+  results(results: Results): Results
+  /** The summary text, masked. */
+  summary(text: string): string
+}
+
+/** `value` with every string in it, object keys included, passed through `mask`. */
+function maskEveryString(value: unknown, mask: (text: string) => string): unknown {
+  if (typeof value === 'string') return mask(value)
+  if (Array.isArray(value)) return value.map((item) => maskEveryString(item, mask))
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [mask(key), maskEveryString(item, mask)]))
+  }
+  return value
+}
+
+/**
+ * The redactor for `results.json` and `summary.txt` (b.uqm SR-15.3, SR-16.1):
+ * every occurrence of every value becomes `<redacted>`. The masked results
+ * object keeps its shape, so it still serializes and parses through E1's
+ * `serializeResults` and `parseResults`.
+ */
+export function createEndFileRedactor(values: Iterable<string>): EndFileRedactor {
+  const mask = scannedValueMasker(values)
+  return {
+    results: (results: Results): Results => maskEveryString(results, mask) as Results,
+    summary: mask,
+  }
+}
+
+/** Writes `verdict.txt` (b.uqm SR-5.7, SR-15.3): the line masked, then E1's atomic whole-file verdict write, which refuses a line break. */
+export function writeRedactedVerdictFile(runDir: string, line: string, values: Iterable<string>): WriteResult {
+  return writeVerdictFile(runDir, maskScannedValues(line, values))
+}
 
 // ---------------------------------------------------------------------------
 // 16. Faults (E12)

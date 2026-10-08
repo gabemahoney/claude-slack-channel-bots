@@ -3085,17 +3085,23 @@ proof is the final gate's injected `/ci --inject` runs on the development host.
 
 If a future test cannot be expressed as a deterministic bash assertion (e.g.
 "did the bot's reply on Slack actually answer the question"), do NOT
-reintroduce an in-container orchestrator Claude. Instead:
+reintroduce an in-container orchestrator Claude. The container stays a
+deterministic bash harness.
 
-1. Have the in-container bash test write the artifact to inspect (a transcript,
-   a generated file) under `/test-results/`.
-2. Let the test exit `PASS` after the artifact is produced.
-3. In `.claude/skills/ci/SKILL.md`, after the container exits and the verdict
-   is read, add a host-side step that shells out to `claude -p "<judgment
-   prompt referencing the artifact>"` and parses its single-line reply.
+Until a runner change gives it an owned place, a test must not write its
+artifact (a transcript, a generated file) under `/test-results/`. That path is
+the shard's own subdirectory of the run directory, and the artifact is not one
+of the files `results-ownership` allows there, so the run fails with a
+`FAIL: integrity: results-ownership: …` line.
 
-The container stays a deterministic bash harness; LLM judgment runs on the
-host, once, with no tmux, no orchestrator session, and no permission prompts.
+Do not add a judgment step to `.claude/skills/ci/SKILL.md` either. The `/ci`
+skill holds no logic.
+
+Such a test first needs a runner change in `scripts/ci-run.ts`. That change
+gives the artifact an owned place in the shard subdirectory, so
+`results-ownership` accepts it. The same change runs the judgment step in the
+host runner, once, with no tmux, no orchestrator session and no permission
+prompts. The judgment step never goes in the skill.
 
 ## Live acceptance plan
 
