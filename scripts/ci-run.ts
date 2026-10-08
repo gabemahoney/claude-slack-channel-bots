@@ -4922,12 +4922,6 @@ export const CI_LIVE_LOCK_READ_MAX_BYTES = 64
 
 /** A lock file's text as `lockPid` reads it: one to ten digits, then only optional whitespace. */
 const CI_LIVE_LOCK_PID_PATTERN = /^(\d{1,10})\s*$/
-/** A `/ci-live` runner's command line by its path: `ci-live/run.ts`, with either slash, then whitespace or the end. */
-const CI_LIVE_RUNNER_CMDLINE_PATTERN = /ci-live[/\\]run\.ts(\s|$)/
-/** A bare `run.ts` as its own word, a runner only when its working directory is a `ci-live` directory. */
-const CI_LIVE_BARE_RUNNER_CMDLINE_PATTERN = /(^|[\s/\\])run\.ts(\s|$)/
-/** A working directory that ends in `/ci-live` (either slash). */
-const CI_LIVE_DIR_CWD_PATTERN = /[/\\]ci-live$/
 /** What follows the prefix in a `/ci-live` container's name: `<run id>-<owner PID>`, or an older runner's bare `<run id>` (`LIVE_NAME_SUFFIX_RE`). */
 const CI_LIVE_CONTAINER_NAME_SUFFIX_PATTERN = /^[0-9a-z]{1,32}(-[1-9][0-9]{0,9})?$/
 
@@ -4975,6 +4969,38 @@ export function ciLiveLockPid(text: string | null): number | null {
   return match ? Number(match[1]) : null
 }
 
+/** The patterns that find a `/ci-live` runner, built from `CI_LIVE_DIR_NAME` and `CI_LIVE_ENTRY_FILE_NAME` as `isLiveRunnerPid`'s literals read. */
+interface CiLiveRunnerPatterns {
+  /** A runner's command line by its path: `ci-live/run.ts`, with either slash, then whitespace or the end. */
+  readonly runnerCmdline: RegExp
+  /** A bare `run.ts` as its own word, a runner only when its working directory is a `ci-live` directory. */
+  readonly bareRunnerCmdline: RegExp
+  /** A working directory that ends in `/ci-live` (either slash). */
+  readonly ciLiveCwd: RegExp
+}
+
+/** Built at first use, never at import (b.uqm SR-1.3). */
+let ciLiveRunnerPatternsBuilt: CiLiveRunnerPatterns | null = null
+
+/** A text as a regular-expression source that matches it literally. */
+function literalPatternSource(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/** The `/ci-live` runner patterns, built once at first use. */
+function ciLiveRunnerPatterns(): CiLiveRunnerPatterns {
+  if (ciLiveRunnerPatternsBuilt === null) {
+    const dir = literalPatternSource(CI_LIVE_DIR_NAME)
+    const entry = literalPatternSource(CI_LIVE_ENTRY_FILE_NAME)
+    ciLiveRunnerPatternsBuilt = {
+      runnerCmdline: new RegExp(`${dir}[/\\\\]${entry}(\\s|$)`),
+      bareRunnerCmdline: new RegExp(`(^|[\\s/\\\\])${entry}(\\s|$)`),
+      ciLiveCwd: new RegExp(`[/\\\\]${dir}$`),
+    }
+  }
+  return ciLiveRunnerPatternsBuilt
+}
+
 /**
  * Whether a PID is a live `/ci-live` runner, as `isLiveRunnerPid` judges it
  * from a command line (NULs read as spaces) and a working directory, each
@@ -4988,8 +5014,9 @@ export function isCiLiveRunnerPid(pid: number, readCmdline: (pid: number) => str
   if (!Number.isInteger(pid) || pid <= 0) return false
   const cmdline = readCmdline(pid)
   if (cmdline === null) return false
-  if (CI_LIVE_RUNNER_CMDLINE_PATTERN.test(cmdline)) return true
-  return CI_LIVE_BARE_RUNNER_CMDLINE_PATTERN.test(cmdline) && CI_LIVE_DIR_CWD_PATTERN.test(readCwd(pid) ?? '')
+  const patterns = ciLiveRunnerPatterns()
+  if (patterns.runnerCmdline.test(cmdline)) return true
+  return patterns.bareRunnerCmdline.test(cmdline) && patterns.ciLiveCwd.test(readCwd(pid) ?? '')
 }
 
 /** The `/proc` reads the `/ci-live` runner test takes. */
@@ -5209,11 +5236,13 @@ export interface ContainerCommitment {
 /** One counted commitment (b.uqm SR-6.6). */
 export type MemoryCommitment = ReservationCommitment | CiLiveCommitment | ContainerCommitment
 
-/** A running container with no memory cap that blocks every run (b.uqm SR-6.6, SR-6.7); never removed. */
+/** A running container with no memory cap that blocks every run (b.uqm SR-6.6, SR-6.7); admission removes none, and `/ci` never removes an unlabelled one (a labelled one goes in a later run's sweep once its owner is dead, SR-6.4). */
 export interface BlockingContainer {
   readonly name: string
   /** Whether it carries `cscb-ci=1` (a labelled one with no live reservation), or is an unlabelled `cscb-ci*` one. */
   readonly labelled: boolean
+  /** A labelled container's owner from its owner label; null when that is missing or malformed, and for an unlabelled one. */
+  readonly owner: Owner | null
 }
 
 /** What admission counts (b.uqm SR-6.6). */
@@ -5292,11 +5321,11 @@ export function memoryCommitments(
     const labelled = labelValue(state.labels, CI_LABEL) === CI_LABEL_VALUE
     if (labelled && live.some((listed) => isReservationShard(state, listed.reservation))) continue
     if (!labelled && !state.name.startsWith(CI_CONTAINER_NAME_PREFIX)) continue
+    const owner = labelled ? parseOwner(labelValue(state.labels, OWNER_LABEL) ?? '') : null
     if (state.memoryCapBytes === null || state.memoryCapBytes === 0) {
-      blocking.push({ name: state.name, labelled })
+      blocking.push({ name: state.name, labelled, owner })
       continue
     }
-    const owner = labelled ? parseOwner(labelValue(state.labels, OWNER_LABEL) ?? '') : null
     items.push({ kind: labelled ? 'labelled-container' : 'unlabelled-container', name: state.name, owner, countedBytes: state.memoryCapBytes })
   }
   return {
@@ -5644,12 +5673,18 @@ const CI_LABEL_TEXT = `${CI_LABEL}=${CI_LABEL_VALUE}`
 
 /** A blocking container's detail line opens with this, then `: container <name>, ` (b.uqm SR-6.8). */
 export const BLOCKING_EVERY_RUN_TEXT = 'blocking every run'
-/** What a blocking container is, in its detail line: `an uncapped cscb-ci* container` (b.uqm SR-6.6, SR-6.8). */
+/** What an unlabelled blocking container is, in its detail line: `an uncapped cscb-ci* container` (b.uqm SR-6.6, SR-6.8). */
 export const UNCAPPED_CI_CONTAINER_TEXT = `an uncapped ${CI_CONTAINER_NAME_GLOB} container`
 /** A labelled container with no live reservation, after `labelled cscb-ci=1 ` in the blocking and counted-container lines (b.uqm SR-6.6). */
 export const NO_LIVE_RESERVATION_TEXT = 'with no live reservation'
-/** A blocking container's detail line ends with this, after `; ` (b.uqm SR-6.6): `/ci` never removes it. */
+/** What a labelled blocking container is, in its detail line, before ` (owner <RUN_ID>-<PID>)`: `an uncapped container labelled cscb-ci=1 with no live reservation`, with no `cscb-ci*` glob (b.uqm SR-6.6, SR-6.8). */
+export const UNCAPPED_LABELLED_CONTAINER_TEXT = `an uncapped container labelled ${CI_LABEL_TEXT} ${NO_LIVE_RESERVATION_TEXT}`
+/** A labelled container's owner text, inside the parentheses, when its owner label is missing or malformed (b.uqm SR-6.3). */
+export const NO_VALID_OWNER_LABEL_TEXT = 'no valid owner label'
+/** An unlabelled blocking container's detail line ends with this, after `; ` (b.uqm SR-6.6): `/ci` never removes it. */
 export const CI_NEVER_REMOVES_TEXT = '/ci never removes it'
+/** A labelled blocking container's detail line ends with this, after `; `: the sweep removes a labelled container once its owner is dead (b.uqm SR-6.4). */
+export const CI_SWEEP_REMOVES_TEXT = "a later /ci run's sweep removes it once its owner is dead"
 /** The memory refusal's commitments line when nothing is counted, after `counted commitments: 0.0 GiB, ` (b.uqm SR-6.8). */
 export const NOTHING_ELSE_COUNTED_TEXT = 'nothing else is counted'
 /** The CPU refusal's detail line when no other live `/ci` run holds CPUs (b.uqm SR-6.8). */
@@ -5840,6 +5875,11 @@ export function ceilingSourceText(ceiling: MemoryCeiling): string {
   return `${head}${CI_LIVE_CEILING_SOURCE_TEXT}, while ${which} active: ${runs.map(ciLiveRunText).join('; ')}`
 }
 
+/** A labelled container's owner, as its counted and blocking lines write it inside parentheses: `owner <RUN_ID>-<PID>`, or `no valid owner label`. */
+function labelledOwnerText(owner: Owner | null): string {
+  return owner === null ? NO_VALID_OWNER_LABEL_TEXT : `owner ${formatOwner(owner)}`
+}
+
 /** One counted commitment's detail line, with its counted GiB (b.uqm SR-6.6, SR-6.8). */
 function commitmentText(item: MemoryCommitment): string {
   const counted = `${formatGib(item.countedBytes)} GiB`
@@ -5852,19 +5892,24 @@ function commitmentText(item: MemoryCommitment): string {
       const own = item.ownContainers.length === 0 ? '' : `, its own container(s) ${item.ownContainers.map(shownArgument).join(', ')} included`
       return `counted: /ci-live run shown by ${ciLiveRunText(item.run)}: ${counted}${own}`
     }
-    case 'labelled-container': {
-      const owner = item.owner === null ? 'no valid owner label' : `owner ${formatOwner(item.owner)}`
-      return `counted: container ${shownArgument(item.name)}, labelled ${CI_LABEL_TEXT} ${NO_LIVE_RESERVATION_TEXT} (${owner}): ${counted}, its cap`
-    }
+    case 'labelled-container':
+      return `counted: container ${shownArgument(item.name)}, labelled ${CI_LABEL_TEXT} ${NO_LIVE_RESERVATION_TEXT} (${labelledOwnerText(item.owner)}): ${counted}, its cap`
     case 'unlabelled-container':
       return `counted: container ${shownArgument(item.name)}, an unlabelled ${CI_CONTAINER_NAME_GLOB} container: ${counted}, its cap`
   }
 }
 
-/** A blocking container's detail line (b.uqm SR-6.6, SR-6.8): named as an uncapped `cscb-ci*` container blocking every run, never removed. */
+/**
+ * A blocking container's detail line (b.uqm SR-6.6, SR-6.8), blocking every
+ * run: an unlabelled one as an uncapped `cscb-ci*` container `/ci` never
+ * removes; a labelled one as an uncapped `cscb-ci=1` container with no live
+ * reservation, its owner from its owner label, that a later run's sweep
+ * removes once that owner is dead (SR-6.4).
+ */
 function blockingText(container: BlockingContainer): string {
-  const labelled = container.labelled ? `, labelled ${CI_LABEL_TEXT} ${NO_LIVE_RESERVATION_TEXT}` : ''
-  return `${BLOCKING_EVERY_RUN_TEXT}: container ${shownArgument(container.name)}, ${UNCAPPED_CI_CONTAINER_TEXT}${labelled}; ${CI_NEVER_REMOVES_TEXT}`
+  const head = `${BLOCKING_EVERY_RUN_TEXT}: container ${shownArgument(container.name)}`
+  if (!container.labelled) return `${head}, ${UNCAPPED_CI_CONTAINER_TEXT}; ${CI_NEVER_REMOVES_TEXT}`
+  return `${head}, ${UNCAPPED_LABELLED_CONTAINER_TEXT} (${labelledOwnerText(container.owner)}); ${CI_SWEEP_REMOVES_TEXT}`
 }
 
 /**
