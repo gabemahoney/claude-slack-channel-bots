@@ -5390,3 +5390,1995 @@ describe('E9: the final reading and shard retirement (b.t6s E9 T4; b.uqm SR-10.6
 // ===========================================================================
 // E13 (t1.t6s.vd): the run sequence end to end, stops and the end of run; E13 adds its cases here
 // ===========================================================================
+//
+// E13 T5 (b.uqm SR-5.3 to SR-5.9; AC 14's second half, AC 21, AC 33, AC 36,
+// AC 37's interrupt half, AC 74's runner half): the composition itself. Every
+// case runs the runner's `main` in process to its end over one constructed
+// host (`e13Host`): a `mkdtempSync` root removed in `afterEach` holding the
+// system temp directory, the account home with its lock directory (E5's
+// builder; `RunnerDeps.lockDir` points at it) and the password file; one fake
+// clock, spawn recorder, process table, fake container interface, signal
+// recorder, cgroup tree and volume (E6's readings builder). A run on it
+// (`host.run`) has its own worktree of real script names, its own signal
+// source and a container plan per shard: what it writes into its
+// subdirectory, and when, through the runner's own formatters. Time moves
+// only on the fake clock (`e13Settle`). The components' own rules are E1–E12's;
+// these cases assert only order, phases, what the composition records and what
+// it leaves. The region's imports are namespaces or `e13`-prefixed aliases.
+
+import { createHash as e13CreateHash } from 'node:crypto'
+import * as e13Fs from 'node:fs'
+import { tmpdir as e13Tmpdir } from 'node:os'
+import * as e13Path from 'node:path'
+import * as e13 from '../scripts/ci-run.ts'
+import * as e13Helper from './test-helpers/ci-run.ts'
+import * as e13Credentials from './test-helpers/credentials.ts'
+import * as e13Clock from './test-helpers/fake-clock.ts'
+import { treeSnapshot as e13TreeSnapshot } from './test-helpers/tree-snapshot.ts'
+
+describe('E13: the composed run (b.t6s E13 T5; b.uqm SR-5.3 to SR-5.9)', () => {
+  type ResultEvent = e13.ResultEvent
+  type Results = e13.Results
+  type RunStatus = e13.RunStatus
+
+  /** Test data: two RUN_IDs of SR-5.1's form and their runners' PIDs. */
+  const RUN_ID = '20261008t140000z-e13run01'
+  const RUN_PID = 6161
+  const OTHER_RUN_ID = '20261008t140000z-e13run02'
+  const OTHER_PID = 6262
+  /** Test data: the fake clock's start, the runner's start. */
+  const START_MS = Date.UTC(2026, 9, 8, 14, 0, 0)
+  /** Test data: the runner's user ID. */
+  const UID = 1000
+  const MS_PER_MINUTE = 60_000
+  /** The run's secret values, each a `fakeToken` with its own suffix. */
+  const SECRETS = {
+    key: e13Credentials.fakeToken(e13.RAW_KEY_PREFIX, 'e13-key'),
+    ghToken: e13Credentials.fakeToken('', 'e13-gh'),
+    baseBuildToken: e13Credentials.fakeToken('', 'e13-base'),
+  } as const
+  /** Test data: how long `npm pack`, the test build and a shard's container take on the fake clock. */
+  const PACK_MS = 7_000
+  const BUILD_MS = 20_000
+  const SHARD_RUN_MS = 45_000
+  /** Test data: the tarball `npm pack` writes. */
+  const TARBALL_NAME = `e13-package-1.0.0${e13.PACKAGE_TARBALL_SUFFIX}`
+  const TARBALL_BYTES = Uint8Array.from({ length: 512 }, (_, i) => (i * 13) % 256)
+  const TARBALL_SHA256 = e13CreateHash('sha256').update(TARBALL_BYTES).digest('hex')
+  /** Test data: each shard's dependency fingerprint, the same in every shard. */
+  const FINGERPRINT = e13Helper.hexValue('e13-fingerprint', e13.SHA256_HEX_LENGTH)
+  /** Test data: a script's seconds in a result line. */
+  const SCRIPT_SECONDS = 12.5
+  /** The default worktree: the repository's scripts 1 to 7 by their real names, each estimated at 60 s, so each shard's limit is the floor. */
+  const SCRIPT_NUMBERS = [1, 2, 3, 4, 5, 6, 7]
+  const E13_MAX_STEPS = 20_000
+
+  // --- T5.S1: the composed-run factory ---
+
+  /** One thing that happened on the host, in order: a spawn (a docker operation's kind, or any other program) or a dependency read. */
+  interface E13Event {
+    readonly runId: string
+    readonly atMs: number
+    readonly what: string
+    readonly argv: readonly string[] | null
+    /** Whether the admission lock's flock was held as it happened. */
+    readonly lockHeld: boolean
+    /** The reservation files in the lock directory as it happened. */
+    readonly reservations: readonly string[]
+    /** The lock file's holder record as it happened; null when there is no lock file. */
+    readonly lockRecord: string | null
+    /** The CPUs every reservation in the lock directory holds together, as it happened. */
+    readonly reservedCpus: number
+    /** The spawning run's status phase as it happened; null before its status file exists. */
+    readonly phase: e13.StatusPhase | null
+  }
+
+  /** A timer the runner armed through its clock. */
+  interface E13RunnerTimer {
+    readonly handle: unknown
+    readonly delayMs: number
+    readonly atMs: number
+  }
+
+  /** Dependency failures a case switches on while a run goes. */
+  interface E13Faults {
+    /** `clock.setTimeout` throws for a delay this accepts. */
+    setTimeout: ((delayMs: number) => boolean) | null
+    /** `clock.clearTimeout` throws for a timer this accepts. */
+    clearTimeout: ((timer: E13RunnerTimer) => boolean) | null
+    /** `clock.now` throws this many more times. */
+    nowThrows: number
+  }
+
+  /** What a shard's container does, from its start. */
+  interface E13ShardPlan {
+    /** Result-file events written at its start (a script in progress). */
+    readonly inProgress?: (assigned: readonly string[]) => readonly ResultEvent[]
+    /** When it writes its finished result file and evidence and exits; null: it never ends on its own. Default `SHARD_RUN_MS`. */
+    readonly endsAfterMs?: number | null
+    /** Its finished result file's events; default a pass for each assigned script, then the end marker. */
+    readonly finished?: (assigned: readonly string[]) => readonly ResultEvent[]
+    /** A script log's text; default one line naming it. */
+    readonly scriptLog?: (fileName: string) => string
+    /** Its `docker run` fails, leaving its container created, as Docker does. */
+    readonly failsToStart?: boolean
+  }
+
+  interface E13RunOptions {
+    readonly runId?: string
+    readonly pid?: number
+    readonly args?: readonly string[]
+    /** Default: scripts `SCRIPT_NUMBERS`, each estimated at 60 s. */
+    readonly worktree?: e13Helper.WorktreeOptions
+    /** Step 4 finds the base image missing; its prerequisites pass and the base-build step answers `baseBuildStep`. */
+    readonly baseMissing?: boolean
+    readonly baseBuildStep?: e13Helper.SpawnAnswer
+    /** Replaces `npm pack`'s answer (default: writes the tarball after `PACK_MS`). */
+    readonly npmPack?: e13Helper.SpawnAnswer
+    /** The test build's program (default: built after `buildMs`, its ID the pinned image's). */
+    readonly testBuild?: e13Helper.FakeBuildProgram
+    /** How long the default test build takes; default `BUILD_MS`. */
+    readonly buildMs?: number
+    readonly shard?: (k: number) => E13ShardPlan
+    /** The password file's text; default the first-match case for the host's home. */
+    readonly passwordText?: string
+    /** Over the default environment; a variable set to undefined is left out. */
+    readonly env?: Readonly<Record<string, string | undefined>>
+    /** The pinned image's `/tests` archive; default the worktree's. */
+    readonly pinnedArchive?: (worktree: e13Helper.BuiltWorktree) => Uint8Array
+    /** How long a shard's `docker run` takes to answer, by its assigned scripts; default 0. */
+    readonly dockerRunDelayMs?: (assigned: readonly string[]) => number
+    /** Dependencies over the defaults. */
+    readonly deps?: Partial<Pick<e13.RunnerDeps, 'readVolume' | 'readPasswordFile'>>
+    /** Called after each event of this run is recorded. */
+    readonly onEvent?: (event: E13Event, run: E13Run) => void
+  }
+
+  /** One run on the host. */
+  interface E13Run {
+    readonly runId: string
+    readonly pid: number
+    readonly owner: e13.Owner
+    readonly runDir: string
+    readonly worktree: e13Helper.BuiltWorktree
+    readonly deps: e13.RunnerDeps
+    readonly source: e13Helper.SignalSource
+    readonly stderr: string[]
+    readonly tarballPath: string
+    /** Every distinct `status.json` text seen, in order (read at each spawn, dependency read and clock step). */
+    readonly statuses: string[]
+    /** Each shard's container start on the clock, by k. */
+    readonly shardStarts: Map<number, number>
+    /** Each shard's assigned scripts as its `docker run` gave them, by k. */
+    readonly assigned: Map<number, readonly string[]>
+    /** Every timer the runner armed through its clock, in order. */
+    readonly timers: E13RunnerTimer[]
+    readonly faults: E13Faults
+    /** The runner's timers still pending on the clock. */
+    pendingRunnerTimers(): E13RunnerTimer[]
+    /** Runs `main` for this run. */
+    main(options?: e13.MainOptions): Promise<number>
+    /**
+     * Runs the run as `main` does (step 1, the traps, then `runSequence` with
+     * `createRunStopHooks()` and the hooks removed on every way out), with
+     * `extra`'s hooks called after the stop hooks' own (before them at the
+     * sequence's end), so a case can act as an end-of-run step begins. Main
+     * itself takes no hooks; every other case runs `main`.
+     */
+    sequence(extra: e13.RunSequenceHooks): Promise<number>
+    /** Reads `status.json` and keeps it when it changed. */
+    observe(): void
+    /** `results.json`, parsed by the runner's parser; null when absent. */
+    results(): Results | null
+    verdict(): string | null
+    logLines(): string[]
+    status(): RunStatus | null
+  }
+
+  interface E13Host {
+    readonly root: string
+    readonly tempDir: string
+    readonly home: string
+    readonly lockDir: string
+    readonly lockPath: string
+    readonly adSourceDir: string
+    readonly clock: e13Clock.FakeClock
+    readonly recorder: e13Helper.SpawnRecorder
+    readonly docker: e13Helper.FakeDocker
+    readonly signals: e13Helper.SignalRecorder
+    readonly readings: e13Helper.BuiltAdmissionReadings
+    readonly lockBuild: e13Helper.BuiltLockDir
+    readonly timeline: E13Event[]
+    run(options?: E13RunOptions): E13Run
+  }
+
+  interface E13HostOptions {
+    readonly lockDir?: Omit<e13Helper.LockDirSpec, 'processes'>
+    readonly pod?: e13Helper.PodFigures
+    readonly volume?: e13Helper.VolumeFigures | { readonly error: string }
+  }
+
+  let e13Roots: string[] = []
+  let e13Hosts: E13Host[] = []
+
+  afterEach(() => {
+    const hosts = e13Hosts
+    e13Hosts = []
+    try {
+      for (const host of hosts) host.lockBuild.release()
+      for (const host of hosts) host.recorder.assertNoFailures()
+    } finally {
+      for (const root of e13Roots) e13Fs.rmSync(root, { recursive: true, force: true })
+      e13Roots = []
+    }
+  })
+
+  /** The pod by default: L 64 GiB, W 6 GiB; room for six shards. */
+  const DEFAULT_POD: e13Helper.PodFigures = { limitGib: 64, workingSetGib: 6, anonGib: 3, activeFileGib: 2 }
+
+  function e13DurationTable(numbers: readonly number[]): e13Helper.DurationTableSpec {
+    return { kind: 'rows', header: e13.DURATION_TABLE_HEADER, rows: numbers.map((n) => ({ script: n, seconds: 60 })) }
+  }
+
+  /** What an image built from `worktree` holds under `/tests`, as archive entries; without the script `omit` when given. */
+  function e13TestsArchive(worktree: e13Helper.BuiltWorktree, omit: string | null = null): Uint8Array {
+    const testsEntry = e13.IMAGE_TESTS_DIR.slice(1)
+    const entries: Record<string, string | Uint8Array> = { [`${testsEntry}/`]: '', [`${e13.INTEGRATION_DIR_PATH}/`]: '' }
+    for (const fileName of e13Fs.readdirSync(worktree.integrationDir).sort()) {
+      if (fileName === omit) continue
+      entries[`${e13.INTEGRATION_DIR_PATH}/${fileName}`] = e13Fs.readFileSync(e13Path.join(worktree.integrationDir, fileName))
+    }
+    if (e13Fs.existsSync(worktree.durationTablePath)) entries[e13.DURATION_TABLE_PATH] = e13Fs.readFileSync(worktree.durationTablePath)
+    return e13Helper.buildTarArchive(entries)
+  }
+
+  /** A passing result file: a start and a passing end for each assigned script, then the end marker. */
+  function e13PassEvents(assigned: readonly string[]): ResultEvent[] {
+    return [
+      ...assigned.flatMap((fileName): ResultEvent[] => [
+        { kind: e13.RESULT_WORD_START, fileName },
+        { kind: e13.RESULT_WORD_END, fileName, result: e13.RESULT_WORD_PASS, seconds: SCRIPT_SECONDS },
+      ]),
+      { kind: e13.RESULT_WORD_DONE },
+    ]
+  }
+
+  /** Builds a host (see `E13Host`). */
+  function e13Host(options: E13HostOptions = {}): E13Host {
+    const root = e13Fs.mkdtempSync(e13Path.join(e13Tmpdir(), 'ci-run-lifecycle-e13-'))
+    e13Roots.push(root)
+    const tempDir = e13Path.join(root, 'tmp')
+    const adSourceDir = e13Path.join(root, 'agent-director-src')
+    e13Fs.mkdirSync(tempDir)
+    e13Fs.mkdirSync(adSourceDir)
+    const clock = e13Clock.createFakeClock({ start: START_MS, flushTurns: 400 })
+    const recorder = e13Helper.createSpawnRecorder({ clock, root })
+    const docker = e13Helper.createFakeDocker(recorder)
+    const signals = e13Helper.createSignalRecorder({ processes: recorder.processes, clock })
+    const lockBuild = e13Helper.buildLockDir(root, { ...options.lockDir, processes: recorder.processes })
+    const home = lockBuild.home
+    if (home === null) throw new Error('e13Host: the lock directory needs its home')
+    const readings = e13Helper.buildAdmissionReadings(root, docker, {
+      pod: options.pod ?? DEFAULT_POD,
+      volume: options.volume ?? { mountPoint: tempDir, usedGib: 20, availableGib: 180 },
+    })
+    const timeline: E13Event[] = []
+    const runs: E13Run[] = []
+    docker.answerRuns((runArguments) => {
+      const at = runArguments.findIndex((arg) => e13.IMAGE_ID_PATTERN.test(arg))
+      const k = Number(runArguments[at + 1])
+      const owner = runs.find((run) => runArguments.includes(e13.shardContainerName(run.owner, k)))
+      if (owner === undefined) throw new Error(`e13Host: no run owns ${JSON.stringify(runArguments)}`)
+      return shardAnswers.get(owner.runId)!(runArguments.slice(at + 1))
+    })
+    const shardAnswers = new Map<string, (runnerArguments: readonly string[]) => e13Helper.FakeRunAnswer>()
+    const host: E13Host = {
+      root,
+      tempDir,
+      home,
+      lockDir: lockBuild.lockDir,
+      lockPath: lockBuild.lockPath,
+      adSourceDir,
+      clock,
+      recorder,
+      docker,
+      signals,
+      readings,
+      lockBuild,
+      timeline,
+      run(runOptions = {}) {
+        const run = e13NewRun(host, runOptions, (runId, answer) => shardAnswers.set(runId, answer))
+        runs.push(run)
+        return run
+      },
+    }
+    e13Hosts.push(host)
+    return host
+  }
+
+  /** The lock file's flock and holder record, and the reservations, as they stand. */
+  function e13LockState(host: E13Host): Pick<E13Event, 'lockHeld' | 'reservations' | 'lockRecord' | 'reservedCpus'> {
+    const exists = e13Fs.existsSync(host.lockPath)
+    const reservations = e13Fs.existsSync(host.lockDir) ? e13Fs.readdirSync(host.lockDir).filter((name) => e13.isReservationFileName(name)).sort() : []
+    let reservedCpus = 0
+    for (const name of reservations) {
+      const parsed = e13.parseReservation(e13Fs.readFileSync(e13Path.join(host.lockDir, name), 'utf-8'))
+      if (parsed.ok) reservedCpus += parsed.value.cpus
+    }
+    return {
+      lockHeld: exists && e13Helper.probeFlock(host.lockPath) === 'held',
+      lockRecord: exists ? e13Fs.readFileSync(host.lockPath, 'utf-8') : null,
+      reservations,
+      reservedCpus,
+    }
+  }
+
+  function e13NewRun(host: E13Host, options: E13RunOptions, registerShards: (runId: string, answer: (runnerArguments: readonly string[]) => e13Helper.FakeRunAnswer) => void): E13Run {
+    const runId = options.runId ?? RUN_ID
+    const pid = options.pid ?? RUN_PID
+    const owner: e13.Owner = { runId, pid }
+    const args = options.args ?? []
+    const worktree = e13Helper.buildWorktree(host.root, options.worktree ?? { scripts: SCRIPT_NUMBERS.map((n) => e13Helper.realScriptFileName(n)), durationTable: e13DurationTable(SCRIPT_NUMBERS) })
+    const runDir = e13.runDirPath({ TMPDIR: host.tempDir }, runId)
+    const packageDir = e13Path.join(runDir, e13.PACKAGE_DIR_NAME)
+    const tarballPath = e13Path.join(packageDir, TARBALL_NAME)
+    const given: Record<string, string | undefined> = {
+      TMPDIR: host.tempDir,
+      HOME: host.home,
+      ANTHROPIC_API_KEY: SECRETS.key,
+      GH_TOKEN: SECRETS.ghToken,
+      [e13.AD_SOURCE_DIR_VARIABLE]: host.adSourceDir,
+      ...options.env,
+    }
+    const env: Record<string, string> = {}
+    for (const [name, value] of Object.entries(given)) if (value !== undefined) env[name] = value
+    const source = e13Helper.createSignalSource({ clock: host.clock })
+    const stderr: string[] = []
+    const statuses: string[] = []
+    const shardStarts = new Map<number, number>()
+    const assignedOf = new Map<number, readonly string[]>()
+    const timers: E13RunnerTimer[] = []
+    const faults: E13Faults = { setTimeout: null, clearTimeout: null, nowThrows: 0 }
+    const passwordPath = e13Helper.writePasswordFile(host.root, options.passwordText ?? e13Helper.passwordFileCases(UID, host.home)['first-match'].text, `passwd-${runId}`)
+    host.recorder.processes.add(e13Helper.ciRunnerProcess(runId, { pid, worktreeRoot: worktree.root }))
+
+    // The images: the base (unless missing) and the pinned image the test build reports, its /tests the worktree's.
+    const baseImage = e13.readBaseImageName(worktree.root)
+    if (!baseImage.ok) throw new Error('e13Run: the worktree names no base image')
+    if (options.baseMissing !== true && host.docker.image(baseImage.name) === null) host.docker.addImage({ tags: [baseImage.name] })
+    const pinnedId = `sha256:${e13Helper.hexValue(`e13-pinned-${runId}`, e13.SHA256_HEX_LENGTH)}`
+    const archive = options.pinnedArchive?.(worktree) ?? e13TestsArchive(worktree)
+    const testTag = e13.formatRunTag(owner, 'test')
+    /** The test build's image comes into being as its build is spawned (the fake then tags it, or leaves it untagged when the build fails). */
+    const addPinnedImage = (request: e13.SpawnRequest): void => {
+      const testBuild = request.ownProcessGroup && request.stdin === undefined && request.argv.includes(testTag)
+      if (testBuild && host.docker.image(pinnedId) === null) {
+        host.docker.addImage({ id: pinnedId, labels: { [e13.OWNER_LABEL]: e13.formatOwner(owner) }, archives: { [e13.IMAGE_TESTS_DIR]: archive } })
+      }
+    }
+    host.docker.programBuild(options.testBuild ?? { kind: 'built', imageId: pinnedId, durationMs: options.buildMs ?? BUILD_MS }, { tag: testTag })
+
+    // npm pack, and a missing base's prerequisites and base-build step.
+    host.recorder.answer(
+      e13.npmPackArgs(packageDir),
+      options.npmPack ?? {
+        delayMs: PACK_MS,
+        stdout: `${TARBALL_NAME}\n`,
+        sideEffect: (files) => {
+          files.writeFile(tarballPath, TARBALL_BYTES)
+        },
+      },
+    )
+    if (options.baseMissing === true) {
+      const adVersion = e13Fs.readFileSync(worktree.baseDockerfilePath, 'utf-8').split('\n').find((line) => line.startsWith(e13.AD_VERSION_ARG_PREFIX))?.slice(e13.AD_VERSION_ARG_PREFIX.length) ?? ''
+      const adTag = `${e13.AD_TAG_PREFIX}${adVersion}`
+      host.recorder.answer(e13.adTagCheckArgs(host.adSourceDir, adTag), {})
+      host.recorder.answer(e13.adInstallScriptReadArgs(host.adSourceDir, adTag), { stdout: '#!/usr/bin/env bash\n' })
+      host.recorder.answerWhen(
+        (request) => request.argv.join(' ') === e13.GH_AUTH_TOKEN_ARGV.join(' ') && request.env.GH_CONFIG_DIR === e13.ghPersonalConfigDir(env),
+        { stdout: `${SECRETS.baseBuildToken}\n` },
+      )
+      host.recorder.answer(e13.baseBuildStepArgs(worktree.root), options.baseBuildStep ?? { delayMs: BUILD_MS })
+    }
+
+    // Each shard's container: its plan, from the runner arguments its `docker run` carries.
+    const invocation = e13.parseCiArguments(args)
+    const runFaults = invocation.ok ? invocation.invocation.faults : []
+    const runnerArgumentsOf = (runArguments: readonly string[]): readonly string[] => runArguments.slice(runArguments.findIndex((arg) => e13.IMAGE_ID_PATTERN.test(arg)) + 1)
+    const assignedIn = (runnerArguments: readonly string[]): string[] => {
+      const rest = runnerArguments.slice(2)
+      return rest.filter((arg, i) => arg !== e13.RUNNER_FAIL_OPTION && rest[i - 1] !== e13.RUNNER_FAIL_OPTION)
+    }
+    registerShards(runId, (runnerArguments) => {
+      const k = Number(runnerArguments[0])
+      const canary = runnerArguments[1]!
+      const assigned = assignedIn(runnerArguments)
+      const plan = options.shard?.(k) ?? {}
+      if (plan.failsToStart === true) return { kind: 'fail', leavesContainer: true }
+      const name = e13.shardContainerName(owner, k)
+      const shardDir = e13.shardSubdirectoryPath(runDir, k)
+      const cgroupPath = `/docker/e13-${e13.formatOwner(owner)}-s${k}`
+      host.readings.cgroups.writeContainer(cgroupPath, { currentBytes: 300_000_000 + k, anonBytes: 200_000_000 + k, fileBytes: 50_000_000, inactiveFileBytes: 10_000_000, pidCount: 20 + k, oomKillCount: 0 })
+      shardStarts.set(k, host.clock.now())
+      assignedOf.set(k, assigned)
+      const write = (fileName: string, text: string): void => e13Fs.writeFileSync(e13Path.join(shardDir, fileName), text)
+      const inProgress = plan.inProgress?.(assigned) ?? []
+      if (inProgress.length > 0) write(e13.RESULT_FILE_NAME, e13Helper.resultFileText({ events: inProgress }))
+      const endsAfterMs = plan.endsAfterMs === undefined ? SHARD_RUN_MS : plan.endsAfterMs
+      if (endsAfterMs !== null) {
+        host.clock.setTimeout(() => {
+          if (host.docker.container(name)?.running !== true) return
+          write(e13.CANARY_FILE_NAME, e13Helper.hexRecordText(canary, e13.CANARY_LENGTH))
+          write(e13.PACKAGE_SHA256_FILE_NAME, e13Helper.hexRecordText(TARBALL_SHA256, e13.SHA256_HEX_LENGTH))
+          write(e13.DEPENDENCY_FINGERPRINT_FILE_NAME, e13Helper.hexRecordText(FINGERPRINT, e13.SHA256_HEX_LENGTH))
+          for (const fileName of assigned) write(`${fileName}${e13.SCRIPT_LOG_SUFFIX}`, plan.scriptLog?.(fileName) ?? `${fileName}: the script's output\n`)
+          write(e13.RESULT_FILE_NAME, e13Helper.resultFileText({ events: plan.finished?.(assigned) ?? e13PassEvents(assigned) }))
+          host.docker.exitContainer(name, { exitCode: 0 })
+        }, endsAfterMs)
+      }
+      const mounts = e13.shardMounts(runFaults, runDir, k, tarballPath).map((mount) => ({ source: mount.source, target: mount.target, rw: !mount.readOnly }))
+      return {
+        kind: 'start',
+        container: {
+          process: { cgroup: e13Helper.cgroupMembershipLine(cgroupPath) },
+          logs: { stdout: `${e13.SHARD_DIR_PREFIX}${k}: the container's output\n` },
+          inspection: { mounts, pidsLimit: e13.SHARD_PIDS_LIMIT, nanoCpus: e13.CPUS_PER_SHARD * 1e9 },
+        },
+      }
+    })
+
+    let draws = 0
+    const record = (what: string, argv: readonly string[] | null): void => {
+      run.observe()
+      const event: E13Event = { runId, atMs: host.clock.now(), what, argv, ...e13LockState(host), phase: e13.readStatusFile(runDir)?.phase ?? null }
+      host.timeline.push(event)
+      options.onEvent?.(event, run)
+    }
+    const processDeps = host.recorder.processes.deps()
+    const clock: e13.RunnerClock = {
+      now: () => {
+        if (faults.nowThrows > 0) {
+          faults.nowThrows -= 1
+          throw new Error('e13 clock read failure')
+        }
+        return host.clock.now()
+      },
+      setTimeout: (callback, delayMs) => {
+        if (faults.setTimeout?.(delayMs) === true) throw new Error('e13 timer failure')
+        const handle = host.clock.setTimeout(callback, delayMs)
+        timers.push({ handle, delayMs, atMs: host.clock.now() })
+        return handle
+      },
+      clearTimeout: (handle) => {
+        const timer = timers.find((armed) => armed.handle === handle)
+        if (timer !== undefined && faults.clearTimeout?.(timer) === true) throw new Error('e13 timer cancel failure')
+        host.clock.clearTimeout(handle)
+      },
+    }
+    const runHead = e13.containerRunArgs([])
+    const forward = (request: e13.SpawnRequest): ReturnType<e13.SpawnFn> => {
+      run.observe()
+      addPinnedImage(request)
+      const opsBefore = host.docker.operations().length
+      const spawned = host.recorder.spawn(request)
+      const op = host.docker.operations()[opsBefore]
+      record(request.argv[0] === e13.DOCKER_PROGRAM && op !== undefined ? op.kind : request.argv[0]!, request.argv)
+      return spawned
+    }
+    const spawn: e13.SpawnFn = (request) => {
+      const isRun = options.dockerRunDelayMs !== undefined && runHead.every((arg, i) => request.argv[i] === arg)
+      const delay = isRun ? options.dockerRunDelayMs!(assignedIn(runnerArgumentsOf(request.argv))) : 0
+      if (delay <= 0) return forward(request)
+      // This shard's `docker run` answers `delay` later: it reaches the fake container interface then.
+      const result = new Promise<e13.SpawnResult>((resolve) => {
+        host.clock.setTimeout(() => {
+          void forward(request).result.then(resolve)
+        }, delay)
+      })
+      return { pid: null, processGroup: null, result }
+    }
+    const deps: e13.RunnerDeps = {
+      spawn,
+      env,
+      pid,
+      uid: UID,
+      worktreeRoot: worktree.root,
+      lockDir: host.lockDir,
+      readPasswordFile: () => {
+        record('password', null)
+        return (options.deps?.readPasswordFile ?? e13Helper.passwordFileReader(passwordPath))()
+      },
+      readCgroupFile: host.readings.cgroups.readCgroupFile,
+      readProcCmdline: processDeps.readProcCmdline,
+      readProcCwd: processDeps.readProcCwd,
+      readProcCgroup: processDeps.readProcCgroup,
+      readVolume: (path) => {
+        record('volume', null)
+        return (options.deps?.readVolume ?? host.readings.volume.readVolume)(path)
+      },
+      clock,
+      randomBytes: (count) => {
+        draws += 1
+        return Uint8Array.from({ length: count }, (_, i) => (draws * 37 + i * 11 + pid) & 0xff)
+      },
+      sendSignal: host.signals.sendSignal,
+      onSignal: source.onSignal,
+      isPidAlive: processDeps.isPidAlive,
+      writeStderr: (text) => {
+        stderr.push(text)
+      },
+    }
+
+    const readText = (name: string): string | null => {
+      const path = e13Path.join(runDir, name)
+      return e13Fs.existsSync(path) ? e13Fs.readFileSync(path, 'utf-8') : null
+    }
+    const run: E13Run = {
+      runId,
+      pid,
+      owner,
+      runDir,
+      worktree,
+      deps,
+      source,
+      stderr,
+      tarballPath,
+      statuses,
+      shardStarts,
+      assigned: assignedOf,
+      timers,
+      faults,
+      pendingRunnerTimers() {
+        const pending = new Set(host.clock.pending().map((timer) => timer.id))
+        return timers.filter((timer) => pending.has((timer.handle as e13Clock.FakeTimerHandle).id))
+      },
+      main: (mainOptions) => e13.main([runId, ...args], deps, mainOptions),
+      async sequence(extra) {
+        const created = e13.createRunDirectory(runDir)
+        if (created.kind !== 'created') throw new Error(`e13Run: the run directory was not created: ${created.kind}`)
+        const log = e13.createSealableRunnerLog(e13.createRunnerLog(e13Path.join(runDir, e13.RUNNER_LOG_FILE_NAME)))
+        const stopHooks = e13.createRunStopHooks()
+        try {
+          const context = e13.beginRun(deps, runId, runDir, args, log)
+          stopHooks.trap(deps, log)
+          return await e13.runSequence(deps, context, {
+            onSequenceStart: (seq) => {
+              stopHooks.onSequenceStart?.(seq)
+              extra.onSequenceStart?.(seq)
+            },
+            onStep: (seq, step) => {
+              stopHooks.onStep?.(seq, step)
+              extra.onStep?.(seq, step)
+            },
+            onShardsScheduled: (seq, schedule) => {
+              stopHooks.onShardsScheduled?.(seq, schedule)
+              extra.onShardsScheduled?.(seq, schedule)
+            },
+            onEndOfRunStep: (seq, step) => {
+              stopHooks.onEndOfRunStep?.(seq, step)
+              extra.onEndOfRunStep?.(seq, step)
+            },
+            onSequenceEnd: (seq, exitStatus) => {
+              extra.onSequenceEnd?.(seq, exitStatus)
+              stopHooks.onSequenceEnd?.(seq, exitStatus)
+            },
+          })
+        } finally {
+          stopHooks.dispose()
+        }
+      },
+      observe() {
+        const text = readText(e13.STATUS_FILE_NAME)
+        if (text !== null && statuses.at(-1) !== text) statuses.push(text)
+      },
+      results() {
+        const text = readText(e13.RESULTS_FILE_NAME)
+        if (text === null) return null
+        const parsed = e13.parseResults(text)
+        if (!parsed.ok) throw new Error(`e13Run: results.json does not parse: ${parsed.error}`)
+        return parsed.value
+      },
+      verdict() {
+        const text = readText(e13.VERDICT_FILE_NAME)
+        return text === null ? null : text.replace(/\n$/, '')
+      },
+      logLines() {
+        const text = readText(e13.RUNNER_LOG_FILE_NAME) ?? ''
+        return text === '' ? [] : text.replace(/\n$/, '').split('\n')
+      },
+      status: () => e13.readStatusFile(runDir),
+    }
+    return run
+  }
+
+  /** Moves the fake clock, one timer at a time, until every run's `main` has resolved; answers their exit statuses. */
+  async function e13Settle(host: E13Host, runs: readonly E13Run[], exits: readonly Promise<number>[]): Promise<number[]> {
+    const done: (number | undefined)[] = exits.map(() => undefined)
+    exits.forEach((exit, i) => {
+      void exit.then((status) => {
+        done[i] = status
+      })
+    })
+    for (let step = 0; step < E13_MAX_STEPS; step++) {
+      await host.clock.flush()
+      for (const run of runs) run.observe()
+      if (done.every((status) => status !== undefined)) return done as number[]
+      if (host.clock.pendingCount() === 0) throw new Error('e13Settle: no run has ended and no timer is pending')
+      await host.clock.runNext()
+    }
+    throw new Error('e13Settle: the runs did not end')
+  }
+
+  /** Runs one run's `main` to its end; answers its exit status. */
+  async function e13RunToEnd(host: E13Host, run: E13Run, options?: e13.MainOptions): Promise<number> {
+    const [exit] = await e13Settle(host, [run], [run.main(options)])
+    return exit!
+  }
+
+  /**
+   * That nothing changes after a run's last act: no runner timer pending, no
+   * trap registered, each trapped signal reaching no handler, and an hour on
+   * the run directory byte-identical (modes and change times included) with no
+   * new event.
+   */
+  async function e13ExpectNothingAfter(host: E13Host, run: E13Run): Promise<void> {
+    const before = e13TreeSnapshot(run.runDir, { extended: true })
+    const events = host.timeline.length
+    expect(run.pendingRunnerTimers()).toEqual([])
+    expect(run.source.handlerCount()).toBe(0)
+    for (const signal of e13.TRAPPED_SIGNALS) expect(run.source.deliver(signal)).toBe(0)
+    await host.clock.advance(60 * MS_PER_MINUTE)
+    expect(e13TreeSnapshot(run.runDir, { extended: true })).toEqual(before)
+    expect(host.timeline.length).toBe(events)
+  }
+
+  /** Every output a run produced, for `assertNoLeak`: its run directory's files, standard error, and the host's timeline. */
+  function e13Outputs(host: E13Host, run: E13Run): unknown {
+    return { runDir: e13Credentials.writtenFile(run.runDir), stderr: run.stderr, timeline: host.timeline }
+  }
+
+  /** Moves the fake clock, timer by timer, up to `toMs` (every timer due by then fires), while the runs go on. */
+  async function e13AdvanceTo(host: E13Host, runs: readonly E13Run[], toMs: number): Promise<void> {
+    for (let step = 0; step < E13_MAX_STEPS; step++) {
+      await host.clock.flush()
+      for (const run of runs) run.observe()
+      const next = host.clock.pending()[0]
+      if (next === undefined || next.dueAt > toMs) break
+      await host.clock.runNext()
+    }
+    if (host.clock.now() < toMs) await host.clock.advanceTo(toMs)
+    for (const run of runs) run.observe()
+  }
+
+  /** A run's events, in order. */
+  function e13EventsOf(host: E13Host, run: E13Run): E13Event[] {
+    return host.timeline.filter((event) => event.runId === run.runId)
+  }
+
+  /** What each of a run's events was, in order. */
+  function e13Whats(host: E13Host, run: E13Run): string[] {
+    return e13EventsOf(host, run).map((event) => event.what)
+  }
+
+  /** A list with each run of equal neighbours made one. */
+  function e13Collapsed<T>(values: readonly T[]): T[] {
+    return values.filter((value, i) => i === 0 || values[i - 1] !== value)
+  }
+
+  /** The index of the first event at or after `from` that is `what`; -1 for none. */
+  function e13IndexOf(events: readonly E13Event[], what: string, from = 0): number {
+    return events.findIndex((event, i) => i >= from && event.what === what)
+  }
+
+  /** The index of the last event that is `what`; -1 for none. */
+  function e13LastIndexOf(events: readonly E13Event[], what: string): number {
+    for (let i = events.length - 1; i >= 0; i--) if (events[i]!.what === what) return i
+    return -1
+  }
+
+  /** Every status the run wrote, as seen, parsed by the runner's parser. */
+  function e13StatusesOf(run: E13Run): RunStatus[] {
+    return run.statuses.map((text) => {
+      const parsed = e13.parseStatus(text)
+      if (!parsed.ok) throw new Error(`e13StatusesOf: status.json does not parse: ${parsed.error}`)
+      return parsed.value
+    })
+  }
+
+  /** The status the runner writes for this run in `phase` with the deadline `minutes` from the start. */
+  function e13Status(run: E13Run, phase: 'build' | 'shards' | 'merge', minutes: number): RunStatus {
+    return e13.buildStatus({ runId: run.runId, pid: run.pid, startMs: START_MS, deadline: e13.statusDeadline(START_MS, minutes) }, phase)
+  }
+
+  /** T, the run's largest shard limit in whole milliseconds, from its results' assignment. */
+  function e13LargestLimitMs(results: Results, shardTimeoutMinutes: number | null = null): number {
+    return Math.max(...results.shards.map((shard) => e13.shardLimitMs(shard.expectedSeconds, shardTimeoutMinutes)))
+  }
+
+  /** The deadline's minutes from the start: B (with the base allowance when missing), then B + T + 15 once scheduled. */
+  function e13DeadlineMinutes(baseMissing: boolean, largestLimitMs: number | null): number {
+    return e13.runDeadlineOffset({ baseMissing, largestLimitMs }).minutes
+  }
+
+  /**
+   * The events whose argument lists name shard k's container: by name, or by
+   * the ID its start's inspection read named. That inspection is the first
+   * after its `docker run` and before the next shard's; a shard that failed to
+   * start has none, so it is found by name only.
+   */
+  function e13ShardEvents(host: E13Host, run: E13Run, k: number): E13Event[] {
+    const events = e13EventsOf(host, run)
+    const name = e13.shardContainerName(run.owner, k)
+    const runAt = events.findIndex((event) => event.what === 'container-run' && event.argv?.includes(name) === true)
+    const startRead = runAt < 0 ? undefined : events.slice(runAt + 1).find((event) => event.what === 'container-inspection' || event.what === 'container-run')
+    const id = startRead?.what === 'container-inspection' ? (startRead.argv?.at(-1) ?? null) : null
+    return events.filter((event) => event.argv !== null && (event.argv.includes(name) || (id !== null && event.argv.includes(id))))
+  }
+
+  /** The docker operations a sample makes: the container list (two commands), then one state inspect per running shard. */
+  function e13SampleTimes(host: E13Host, run: E13Run): number[] {
+    const events = e13EventsOf(host, run)
+    const firstRun = e13IndexOf(events, 'container-run')
+    return e13Collapsed(events.filter((event, i) => i > firstRun && event.what === 'container-list').map((event) => event.atMs))
+  }
+
+  // -------------------------------------------------------------------------
+  // T5.S1: the sequence, phases, run directory and measurements
+  // -------------------------------------------------------------------------
+
+  describe('the sequence, phases, run directory and measurements (SR-5.2, SR-5.3, SR-5.9, SR-4.4)', () => {
+    /** Steps 3–12 of a default full run with its base present, up to the shard starts, as the fake records them. */
+    const STEPS_3_TO_12: readonly (readonly string[])[] = [
+      ['version'], // step 3: docker answers
+      ['image-inspect'], // step 4: the base image
+      ['npm'], // step 5: packing
+      ['password'], // step 6: the account's home, then the lock
+      ['container-list', 'image-list', 'image-list'], // step 7: the sweep
+      ['volume', 'container-list'], // step 8: the readings
+      ['image-build'], // step 12: the test build
+      ['container-create', 'container-copy', 'container-remove', 'container-remove'], // the read-back, then the read container's removal
+    ]
+    const SHARD_STARTS = Array.from({ length: e13.MAX_SHARDS }, () => ['container-run', 'container-inspection']).flat()
+
+    test('a passing default full run takes steps 3–13 in SR-5.3\'s order: the lock held from the sweep through the readings, the reservation from step 10, the lock free at the build; exit 0', async () => {
+      const host = e13Host()
+      const run = host.run()
+      expect(await e13RunToEnd(host, run)).toBe(e13.VERDICT_WRITTEN_EXIT_STATUS)
+
+      const events = e13EventsOf(host, run)
+      const before = STEPS_3_TO_12.flat()
+      expect(events.slice(0, before.length + SHARD_STARTS.length).map((event) => event.what)).toEqual([...before, ...SHARD_STARTS])
+      const at = (what: string, from = 0): E13Event => events[e13IndexOf(events, what, from)]!
+      const sweep = e13IndexOf(events, 'container-list')
+      const readings = e13IndexOf(events, 'container-list', sweep + 1)
+      const ownReservation = [e13.reservationFileName(run.owner)]
+      // Lock: not held before step 6's take; held, in this run's name, from the sweep through the readings; free from the build on.
+      expect(events.slice(0, sweep).every((event) => !event.lockHeld)).toBe(true)
+      expect(events.slice(sweep, readings + 1).every((event) => event.lockHeld && event.lockRecord === e13.formatLockHolder(run.owner) && event.reservations.length === 0)).toBe(true)
+      expect(events.slice(readings + 1).every((event) => !event.lockHeld)).toBe(true)
+      // Reservation and watchdog (step 10) before the lock's release (step 11): the reservation is there at the build, and the first sample comes 30 s after the readings.
+      expect(at('image-build').reservations).toEqual(ownReservation)
+      expect(e13SampleTimes(host, run)[0]).toBe(events[readings]!.atMs + e13.SAMPLE_INTERVAL_MS)
+      // The follow loop, then the end of run: every shard retired, the read container removed, the reservation gone by the image cleanup.
+      const lastRetirement = e13LastIndexOf(events, 'container-logs')
+      expect(events.slice(lastRetirement + 1).map((event) => event.what)).toEqual([...Array<string>(e13.MAX_SHARDS).fill('container-remove'), 'container-remove', 'image-remove', 'image-list'])
+      expect(at('image-remove').reservations).toEqual([])
+      expect(run.verdict()).toBe(e13.PASS_VERDICT)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test.each([
+      [
+        'a missing base: its prerequisites read at step 4, the base-build step after the lock\'s release and before the test build',
+        { baseMissing: true },
+        (events: readonly E13Event[]) => {
+          const step = e13IndexOf(events, 'bash')
+          expect(events.slice(0, e13IndexOf(events, 'npm')).map((event) => event.what)).toEqual(['version', 'image-inspect', 'git', 'git', 'gh'])
+          expect(events.slice(step - 2, step + 2).map((event) => event.what)).toEqual(['container-list', 'image-inspect', 'bash', 'image-build'])
+          expect([events[step]!.lockHeld, events[step]!.reservations.length]).toEqual([false, 1])
+        },
+      ],
+      [
+        'image-drift: and retag: the fault images after the read-back and before any shard start, the tag moved after every start was attempted',
+        { args: ['--inject', e13.faultText({ kind: 'image-drift', shard: 2 }), '--inject', e13.faultText({ kind: 'retag' })] },
+        (events: readonly E13Event[]) => {
+          const readBackEnd = e13IndexOf(events, 'container-remove', e13IndexOf(events, 'container-copy')) + 1
+          const firstStart = e13IndexOf(events, 'container-run')
+          const checkedBuild = ['image-inspect', 'image-build', 'image-inspect']
+          expect(events.slice(readBackEnd + 1, firstStart).map((event) => event.what)).toEqual([...checkedBuild, ...checkedBuild])
+          const lastStart = e13LastIndexOf(events, 'container-run')
+          expect(events.slice(lastStart + 1, lastStart + 3).map((event) => event.what)).toEqual(['container-inspection', 'image-tag'])
+        },
+      ],
+    ] satisfies [string, E13RunOptions, (events: readonly E13Event[]) => void][])('%s', async (_what, options, expectOrder) => {
+      const host = e13Host()
+      const run = host.run(options)
+      expect(await e13RunToEnd(host, run)).toBe(e13.VERDICT_WRITTEN_EXIT_STATUS)
+      expectOrder(e13EventsOf(host, run))
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('phases: build until scheduling, shards from the scheduling write, merge from the end of run; each status written holds the deadline then in force', async () => {
+      const host = e13Host()
+      const run = host.run()
+      await e13RunToEnd(host, run)
+      const results = run.results()!
+      const scheduled = e13DeadlineMinutes(false, e13LargestLimitMs(results))
+      expect(e13StatusesOf(run)).toEqual([e13Status(run, 'build', e13.BUILD_ALLOWANCE_MINUTES), e13Status(run, 'shards', scheduled), e13Status(run, 'merge', scheduled)])
+      const events = e13EventsOf(host, run)
+      expect(e13Collapsed(events.map((event) => event.phase))).toEqual(['build', 'shards', 'merge'])
+      // The first event in phase shards is the first shard start; merge begins after the follow loop's last retirement.
+      expect(events.find((event) => event.phase === 'shards')?.what).toBe('container-run')
+      expect(events.findIndex((event) => event.phase === 'merge')).toBe(e13LastIndexOf(events, 'container-logs') + e13.MAX_SHARDS + 1)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('a run whose test image build failed goes from build to merge and stays there through its checks, results and cleanup', async () => {
+      const host = e13Host()
+      const run = host.run({ testBuild: { kind: 'failed', durationMs: BUILD_MS } })
+      expect(await e13RunToEnd(host, run)).toBe(e13.VERDICT_WRITTEN_EXIT_STATUS)
+      expect(e13StatusesOf(run)).toEqual([e13Status(run, 'build', e13.BUILD_ALLOWANCE_MINUTES), e13Status(run, 'merge', e13.BUILD_ALLOWANCE_MINUTES)])
+      const events = e13EventsOf(host, run)
+      const build = e13IndexOf(events, 'image-build')
+      expect(events.slice(build + 1).length).toBeGreaterThan(0)
+      expect(events.slice(build + 1).every((event) => event.phase === 'merge')).toBe(true)
+      expect(run.verdict()).toBe(e13.testImageBuildFailedLine(1))
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    /** Each shard's finished result file in the script-failure row: shard 2's second script fails. */
+    const failingShard = (k: number): E13ShardPlan =>
+      k !== 2
+        ? {}
+        : {
+            finished: (assigned) => [
+              ...e13PassEvents(assigned.slice(0, 1)).slice(0, -1),
+              { kind: e13.RESULT_WORD_START, fileName: assigned[1]! },
+              { kind: e13.RESULT_WORD_END, fileName: assigned[1]!, result: e13.RESULT_WORD_FAIL, seconds: SCRIPT_SECONDS },
+              { kind: e13.RESULT_WORD_DONE },
+            ],
+          }
+
+    const DIRECTORY_ROWS: [string, E13RunOptions][] = [
+      ['a pass', {}],
+      ['a script failure', { shard: failingShard }],
+    ]
+    test.each(DIRECTORY_ROWS)('after %s the run directory holds only SR-5.9\'s entries, with their modes, and no temporary file', async (_what, options) => {
+      const host = e13Host()
+      const run = host.run(options)
+      await e13RunToEnd(host, run)
+      const shardDirs = Array.from({ length: e13.MAX_SHARDS }, (_, i) => `${e13.SHARD_DIR_PREFIX}${i + 1}`)
+      const files = [e13.RESULTS_FILE_NAME, e13.RUNNER_LOG_FILE_NAME, e13.STATUS_FILE_NAME, e13.SUMMARY_FILE_NAME, e13.VERDICT_FILE_NAME]
+      expect(e13Fs.readdirSync(run.runDir).sort()).toEqual([e13.PACKAGE_DIR_NAME, ...files, ...shardDirs].sort())
+      const mode = (path: string): number => e13Fs.lstatSync(path).mode & 0o7777
+      const at = (...names: string[]): string => e13Path.join(run.runDir, ...names)
+      expect(mode(run.runDir)).toBe(e13.RUN_DIR_MODE)
+      expect(mode(at(e13.PACKAGE_DIR_NAME))).toBe(e13.PACKAGE_DIR_MODE)
+      expect(e13Fs.readdirSync(at(e13.PACKAGE_DIR_NAME))).toEqual([TARBALL_NAME])
+      expect(mode(run.tarballPath)).toBe(e13.PACKAGE_TARBALL_MODE)
+      for (const dir of shardDirs) expect(mode(at(dir))).toBe(e13.RUN_DIR_MODE)
+      for (const file of files) expect(mode(at(file))).toBe(e13.WRITTEN_FILE_MODE)
+      for (const dir of shardDirs) expect(e13Fs.readdirSync(at(dir))).toContain(e13.DOCKER_LOG_FILE_NAME)
+      if (options.shard !== undefined) expect(run.verdict()).not.toBe(e13.PASS_VERDICT)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test.each([
+      ['present: the base-build time is 0', false],
+      ['missing: the base-build step\'s own run', true],
+    ])('measurements with the base %s; the build from packing to the pin, each shard from its start to its final reading, the total to the verdict', async (_what, baseMissing) => {
+      const host = e13Host()
+      const run = host.run({ baseMissing })
+      await e13RunToEnd(host, run)
+      const verdictAtMs = host.clock.now()
+      const events = e13EventsOf(host, run)
+      const at = (what: string): number => events[e13IndexOf(events, what)]!.atMs
+      const results = run.results()!
+      expect(results.timing).toEqual({
+        buildSeconds: (at('container-create') - at('npm')) / 1000,
+        baseBuildSeconds: baseMissing ? (at('image-build') - at('bash')) / 1000 : 0,
+        totalSeconds: (verdictAtMs - START_MS) / 1000,
+      })
+      for (const shard of results.shards) {
+        const finalReading = e13ShardEvents(host, run, shard.shard).find((event) => event.what === 'container-logs')!.atMs
+        expect(shard.seconds).toBe((finalReading - run.shardStarts.get(shard.shard)!) / 1000)
+      }
+      expect(run.status()?.startedAt).toBe(new Date(START_MS).toISOString().replace(/\.000Z$/, 'Z'))
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // T5.S2: the follow loop's wiring (SR-4.3, SR-7.3, SR-10.6, SR-14.2)
+  // -------------------------------------------------------------------------
+
+  describe('the follow loop\'s wiring: samples, end markers, limit timers and faults (SR-4.3, SR-7.3, SR-10.6, SR-14.2)', () => {
+    /** The times of the watchdog's samples: each container listing after the readings'. */
+    function sampleTimes(host: E13Host, run: E13Run): number[] {
+      const events = e13EventsOf(host, run)
+      const readings = e13IndexOf(events, 'container-list', e13IndexOf(events, 'container-list') + 1)
+      return e13Collapsed(events.filter((event, i) => i > readings && event.what === 'container-list').map((event) => event.atMs))
+    }
+
+    /** When shard k's final reading was taken: its retirement's log save, at the same moment. */
+    function finalReadingAt(host: E13Host, run: E13Run, k: number): number {
+      return e13ShardEvents(host, run, k).find((event) => event.what === 'container-logs')!.atMs
+    }
+
+    test('samples come every 30 s from the reservation, the build included (no shard read then), until end-of-run step 4 stops them; no 1 s poll without a due timeout: or kill:', async () => {
+      const host = e13Host()
+      const longBuildMs = 2 * e13.SAMPLE_INTERVAL_MS + 10_000
+      const run = host.run({ buildMs: longBuildMs })
+      await e13RunToEnd(host, run)
+      const events = e13EventsOf(host, run)
+      const reservedAt = events[e13IndexOf(events, 'image-build')]!.atMs
+      const times = sampleTimes(host, run)
+      expect(times).toEqual(times.map((_, i) => reservedAt + (i + 1) * e13.SAMPLE_INTERVAL_MS))
+      // The samples during the build list the containers and read no shard.
+      const buildEnd = reservedAt + longBuildMs
+      const duringBuild = events.filter((event) => event.atMs > reservedAt && event.atMs < buildEnd)
+      expect(e13Collapsed(duringBuild.map((event) => event.what))).toEqual(['container-list'])
+      // The last sample is the one that found the end markers; the end of run ran at that moment and stopped the watchdog.
+      expect(times.at(-1)).toBe(host.clock.now())
+      expect(run.pendingRunnerTimers()).toEqual([])
+      expect(run.timers.filter((timer) => timer.delayMs === e13.FAULT_POLL_INTERVAL_MS)).toEqual([])
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('an end marker written between samples gets its final reading at the next sample; with a timeout: due, the 1 s poll finds it at once', async () => {
+      const host = e13Host()
+      const timeoutScript = e13.numberFormOf(2)
+      const run = host.run({ args: ['--inject', e13.faultText({ kind: 'timeout', script: timeoutScript })] })
+      await e13RunToEnd(host, run)
+      const polled = [...run.assigned].find(([, assigned]) => assigned.includes(e13Helper.realScriptFileName(2)))![0]
+      const times = sampleTimes(host, run)
+      for (const k of run.shardStarts.keys()) {
+        const endedAt = run.shardStarts.get(k)! + SHARD_RUN_MS
+        if (k === polled) {
+          expect(finalReadingAt(host, run, k)).toBe(endedAt)
+        } else {
+          expect(finalReadingAt(host, run, k)).toBe(times.find((time) => time >= endedAt)!)
+        }
+      }
+      expect(run.timers.filter((timer) => timer.delayMs === e13.FAULT_POLL_INTERVAL_MS).length).toBe(SHARD_RUN_MS / e13.FAULT_POLL_INTERVAL_MS)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('a limit fires at its own moment between samples and retires that shard with its limit cause; an earlier shard\'s timer was cancelled; the end of run starts once the last shard ended', async () => {
+      const host = e13Host()
+      // Two units: test-1 with test-2 (limit at the floor) and test-1 with test-3, whose estimate gives it the longer limit.
+      const seconds: Readonly<Record<number, number>> = { 1: 60, 2: 60, 3: 1200 }
+      const run = host.run({
+        worktree: {
+          scripts: [1, 2, 3].map((n) => e13Helper.realScriptFileName(n)),
+          durationTable: { kind: 'rows', header: e13.DURATION_TABLE_HEADER, rows: [1, 2, 3].map((n) => ({ script: n, seconds: seconds[n]! })) },
+        },
+        shard: (k) => (k === 1 ? { endsAfterMs: null } : {}),
+      })
+      const exit = run.main()
+      await e13AdvanceTo(host, [run], START_MS + 10 * MS_PER_MINUTE)
+      /** Shard k's limit from its assigned scripts' estimates (E4's rule), and the timer the runner armed with it at its start. */
+      const limitMs = (k: number): number => e13.shardLimitMs(run.assigned.get(k)!.reduce((sum, fileName) => sum + seconds[e13.fileNameNumber(fileName)!]!, 0), null)
+      const limitTimer = (k: number): E13RunnerTimer | undefined => run.timers.find((timer) => timer.atMs === run.shardStarts.get(k) && timer.delayMs === limitMs(k))
+      expect(limitMs(1)).toBeGreaterThan(limitMs(2))
+      // At 10 min shard 2 has ended (end marker): its limit timer is no longer pending; shard 1's still is.
+      expect(e13ShardEvents(host, run, 2).some((event) => event.what === 'container-remove')).toBe(true)
+      expect(run.pendingRunnerTimers()).toContain(limitTimer(1)!)
+      expect(run.pendingRunnerTimers()).not.toContain(limitTimer(2)!)
+      await e13Settle(host, [run], [exit])
+
+      const results = run.results()!
+      const killedAt = run.shardStarts.get(1)! + limitMs(1)
+      const shard1 = e13ShardEvents(host, run, 1)
+      expect(shard1.find((event) => event.what === 'container-kill')?.atMs).toBe(killedAt)
+      expect(sampleTimes(host, run)).not.toContain(killedAt)
+      expect(results.shards[0]!.end).toContain(e13.shardCauseText(e13.wallTimeLimitCause(results.shards[0]!.limitMinutes)))
+      expect(results.shards[1]!.end).toBe(e13.NORMAL_SHARD_END)
+      // The end of run began at the last shard's retirement, the merge switch being its first act.
+      const events = e13EventsOf(host, run)
+      expect(events.find((event) => event.phase === 'merge')?.atMs).toBe(killedAt)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('a kill: decision is carried out through retirement once a script is in progress, its cause fixed first; a leak: and an image-drift: are recorded fired at their shards\' starts', async () => {
+      const host = e13Host()
+      const run = host.run({
+        args: ['--inject', e13.faultText({ kind: 'kill', shard: 2 }), '--inject', e13.faultText({ kind: 'leak', sourceShard: 1, targetShard: 3 }), '--inject', e13.faultText({ kind: 'image-drift', shard: 4 })],
+        shard: (k) => (k === 2 ? { inProgress: (assigned) => [{ kind: e13.RESULT_WORD_START, fileName: assigned[0]! }], endsAfterMs: null } : {}),
+      })
+      await e13RunToEnd(host, run)
+      const results = run.results()!
+      const shard2 = e13ShardEvents(host, run, 2)
+      expect(shard2.find((event) => event.what === 'container-kill')?.atMs).toBe(run.shardStarts.get(2)! + e13.FAULT_POLL_INTERVAL_MS)
+      expect(results.shards[1]!.end).toContain(e13.shardCauseText({ kind: 'killed', fixedByRunner: true }))
+      const faultFired = e13.integrityFailure('fault-fired', '', null).line
+      expect(results.failures.filter((failure) => failure.line.startsWith(faultFired))).toEqual([])
+      expect(results.skippedChecks).not.toContain('fault-fired')
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // T5.S3: AC 21, two admissions at the same moment (SR-5.3 steps 6–11, SR-6.7)
+  // -------------------------------------------------------------------------
+
+  describe('AC 21: two default full runs admitted at the same moment against one lock and one set of reservations (SR-6.1, SR-6.2, SR-6.7)', () => {
+    /** Test data: a RUN_ID for a lock file's dead holder. */
+    const DEAD_HOLDER_RUN_ID = '20261008t130000z-e13dead1'
+
+    test.each([
+      ['no lock file yet', {}],
+      ['a lock file naming a dead holder, no flock held', { lockFile: { holder: { runId: DEAD_HOLDER_RUN_ID, alive: false } } }],
+    ] satisfies [string, Omit<e13Helper.LockDirSpec, 'processes'>][])('with %s: exactly one is admitted with 6 shards, the other refused naming it; never both under the lock; the reservations never past the CPUs; the lock free at every build', async (_what, lockDir) => {
+      const host = e13Host({ lockDir })
+      const first = host.run({ runId: RUN_ID, pid: RUN_PID })
+      const second = host.run({ runId: OTHER_RUN_ID, pid: OTHER_PID })
+      const exits = await e13Settle(host, [first, second], [first.main(), second.main()])
+
+      const refusedAt = [first, second].findIndex((run) => run.status()?.phase === 'refused')
+      expect(refusedAt).toBeGreaterThanOrEqual(0)
+      const refused = [first, second][refusedAt]!
+      const admitted = [first, second][1 - refusedAt]!
+      expect(exits[refusedAt]).toBe(e13.REFUSAL_EXIT_STATUS)
+      expect(exits[1 - refusedAt]).toBe(e13.VERDICT_WRITTEN_EXIT_STATUS)
+      expect(admitted.results()?.shardCount.admitted).toBe(e13.MAX_SHARDS)
+      expect(admitted.verdict()).toBe(e13.PASS_VERDICT)
+
+      // The refusal: CPU, its lines as E6's message gives them, one naming the admitted run by RUN_ID and runner PID.
+      const refusal = refused.status()?.refusal
+      expect(refusal?.kind).toBe('cpu')
+      expect(refusal?.details.some((line) => line.includes(admitted.runId) && line.includes(String(admitted.pid)))).toBe(true)
+      expect(refused.logLines().slice(-1 - refusal!.details.length)).toEqual([e13.refusalLine(refusal!), ...refusal!.details])
+      expect(refused.verdict()).toBeNull()
+
+      // The lock: every moment it was held, it was held in one run's name; the admitted run's turn, then the refused one's.
+      const holders = e13Collapsed(host.timeline.filter((event) => event.lockHeld).map((event) => event.lockRecord))
+      expect(holders).toEqual([e13.formatLockHolder(admitted.owner), e13.formatLockHolder(refused.owner)])
+      // The reservations: at most the 12 CI CPUs at any moment; the admitted run's alone when the refused run read them.
+      expect(Math.max(...host.timeline.map((event) => event.reservedCpus))).toBe(e13.MAX_SHARDS * e13.CPUS_PER_SHARD)
+      expect(e13.MAX_SHARDS * e13.CPUS_PER_SHARD).toBeLessThanOrEqual(e13.CI_CPUS)
+      const refusedEvents = e13EventsOf(host, refused)
+      expect(refusedEvents[e13LastIndexOf(refusedEvents, 'container-list')]!.reservations).toEqual([e13.reservationFileName(admitted.owner)])
+      // Released before either run's first build; the refused run built nothing.
+      const builds = host.timeline.filter((event) => event.what === 'image-build')
+      expect(builds.map((event) => [event.runId, event.lockHeld])).toEqual([[admitted.runId, false]])
+      expect(e13LockState(host).lockHeld).toBe(false)
+      for (const run of [first, second]) e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // T5.S4: refusals before and after the build (SR-5.8, AC 14's second half)
+  // -------------------------------------------------------------------------
+
+  describe('refusals before and after the build (SR-5.3, SR-5.8; AC 14)', () => {
+    /** Test data: docker's error when its daemon does not answer. */
+    const DOCKER_DOWN_ERROR = 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?'
+    /** Test data: npm's last error line. */
+    const NPM_ERROR_LINE = 'npm error e13 pack failure (test data)'
+    /** Test data: the volume read's error. */
+    const VOLUME_ERROR = 'e13 volume read failure (test data)'
+    /** Each step's events, as the passing run makes them: a refusal at a step leaves exactly the events up to it. */
+    const UP_TO = {
+      dockerCheck: ['version'],
+      baseCheck: ['version', 'image-inspect'],
+      packing: ['version', 'image-inspect', 'npm'],
+      lock: ['version', 'image-inspect', 'npm', 'password'],
+      readings: ['version', 'image-inspect', 'npm', 'password', 'container-list', 'image-list', 'image-list', 'volume'],
+      admission: ['version', 'image-inspect', 'npm', 'password', 'container-list', 'image-list', 'image-list', 'volume', 'container-list'],
+    } as const
+
+    /** One refusal before the build: how the host and run are made, the events up to it, and the refusal (computed by the runner's own builders, or only its kind, the rest read from the run's own files). */
+    interface BeforeBuildRow {
+      readonly host?: E13HostOptions
+      readonly run?: (host: E13Host) => E13RunOptions
+      readonly events: readonly string[]
+      readonly refusal: (host: E13Host, run: E13Run) => e13.Refusal | e13.RefusalKind
+      /** The lock is held by someone else throughout. */
+      readonly lockHeldByOther?: boolean
+      /** `package/` exists: packing started. */
+      readonly packed?: boolean
+      readonly setup?: (host: E13Host) => void
+    }
+
+    const passwordText = (host: E13Host, which: e13Helper.PasswordFileCase): string => e13Helper.passwordFileCases(UID, host.home)[which].text
+    const BEFORE_BUILD: readonly (readonly [string, BeforeBuildRow])[] = [
+      ['step 3: docker not answering', { setup: (host) => host.docker.fail('version', { stderr: DOCKER_DOWN_ERROR }), events: UP_TO.dockerCheck, refusal: () => e13.dockerDownRefusal(DOCKER_DOWN_ERROR) }],
+      [
+        'step 4: a missing base without its build\'s prerequisites',
+        {
+          run: () => ({ baseMissing: true, env: { [e13.AD_SOURCE_DIR_VARIABLE]: undefined } }),
+          events: UP_TO.baseCheck,
+          refusal: (_host, run) => {
+            const image = e13.readBaseImageName(run.worktree.root)
+            const adVersion = e13Fs.readFileSync(run.worktree.baseDockerfilePath, 'utf-8').split('\n').find((line) => line.startsWith(e13.AD_VERSION_ARG_PREFIX))!.slice(e13.AD_VERSION_ARG_PREFIX.length)
+            return e13.buildRefusal(null, e13.adSourceDirUnsetReason(image.ok ? image.name : '', `${e13.AD_TAG_PREFIX}${adVersion}`))
+          },
+        },
+      ],
+      [
+        'step 5: npm pack failing',
+        { run: () => ({ npmPack: { exitCode: 1, stderr: `npm error code E13\n${NPM_ERROR_LINE}\n` } }), events: UP_TO.packing, packed: true, refusal: () => e13.buildRefusal(null, e13.npmPackFailedReason(1, NPM_ERROR_LINE)) },
+      ],
+      [
+        'step 6: no password-file entry for the user ID',
+        {
+          run: (host) => ({ passwordText: passwordText(host, 'no-line') }),
+          events: UP_TO.lock,
+          packed: true,
+          refusal: (host) => {
+            const resolved = e13.resolveAccountHome({ uid: UID, readPasswordFile: () => ({ ok: true, value: passwordText(host, 'no-line') }) })
+            if (resolved.ok) throw new Error('the no-line case resolved a home')
+            return resolved.refusal
+          },
+        },
+      ],
+      [
+        'step 6: the lock still busy after the 30 s wait',
+        {
+          host: { lockDir: { lockFile: { holder: { runId: OTHER_RUN_ID, alive: true }, held: true } } },
+          events: UP_TO.lock,
+          packed: true,
+          lockHeldByOther: true,
+          refusal: (host) => e13.busyLockRefusal(host.lockBuild.holder),
+        },
+      ],
+      [
+        'step 8: the volume reading failing',
+        {
+          host: { volume: { error: VOLUME_ERROR } },
+          events: UP_TO.readings,
+          packed: true,
+          refusal: (host, run) => {
+            const reading = e13.readRunVolume({ readVolume: host.readings.volume.readVolume }, run.runDir)
+            if (reading.ok) throw new Error('the failing volume was read')
+            return e13.failedReadingRefusal(reading)
+          },
+        },
+      ],
+      ['step 9: the disk', { host: { volume: { mountPoint: '/e13-volume', usedGib: 199, availableGib: 1 } }, events: UP_TO.admission, packed: true, refusal: () => 'disk' }],
+      ['step 9: memory', { host: { pod: { limitGib: 64, workingSetGib: 52, anonGib: 30, activeFileGib: 10 } }, events: UP_TO.admission, packed: true, refusal: () => 'memory' }],
+      [
+        'step 9: CPU, another live run holding the 12 CI CPUs',
+        { host: { lockDir: { reservations: [{ owner: { runId: OTHER_RUN_ID, alive: true }, shards: e13.MAX_SHARDS }] } }, events: UP_TO.admission, packed: true, refusal: () => 'cpu' },
+      ],
+    ]
+
+    test.each(BEFORE_BUILD)('%s: no later step, nothing held or reserved, no build, listing or prune; the refused status written last, no verdict or results', async (_what, row) => {
+      const host = e13Host(row.host)
+      row.setup?.(host)
+      const run = host.run(row.run?.(host))
+      expect(await e13RunToEnd(host, run)).toBe(e13.REFUSAL_EXIT_STATUS)
+      expect(e13Whats(host, run)).toEqual([...row.events])
+      const expected = row.refusal(host, run)
+      const status = run.status()
+      expect(status?.phase).toBe('refused')
+      if (typeof expected === 'string' || expected === null) expect(status?.refusal?.kind).toBe(expected)
+      else expect(status?.refusal).toEqual({ kind: expected.kind, summary: expected.summary, details: expected.details })
+      const refusal = status!.refusal!
+      expect(run.logLines().slice(-1 - refusal.details.length)).toEqual([e13.refusalLine(refusal), ...refusal.details])
+      expect(e13LockState(host).lockHeld).toBe(row.lockHeldByOther === true)
+      expect(e13LockState(host).reservations).not.toContain(e13.reservationFileName(run.owner))
+      expect(e13Fs.readdirSync(run.runDir).sort()).toEqual([...(row.packed === true ? [e13.PACKAGE_DIR_NAME] : []), e13.RUNNER_LOG_FILE_NAME, e13.STATUS_FILE_NAME].sort())
+      await e13ExpectNothingAfter(host, run)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    /** The script the image lacks in the read-back difference row. */
+    const MISSING_FROM_IMAGE = e13Helper.realScriptFileName(7)
+    const AFTER_BUILD: readonly (readonly [string, E13RunOptions, (host: E13Host) => void])[] = [
+      ['the read-back finding a difference (a script missing from the image)', { pinnedArchive: (worktree) => e13TestsArchive(worktree, MISSING_FROM_IMAGE) }, () => undefined],
+      ['the read-back failing outright (its copy-out failing)', {}, (host) => host.docker.fail('container-copy')],
+    ]
+
+    test.each(AFTER_BUILD)('%s: the reservation released, the read container removed, then the image cleanup, the watchdog stopped; no shard starts; the refusal last', async (what, options, setup) => {
+      const host = e13Host()
+      setup(host)
+      const run = host.run(options)
+      expect(await e13RunToEnd(host, run)).toBe(e13.REFUSAL_EXIT_STATUS)
+      const events = e13EventsOf(host, run)
+      const copy = e13IndexOf(events, 'container-copy')
+      // After the copy-out: the read-back's own removal, the refusal path's (finding it absent), the test tag, the untagged listing; nothing more.
+      expect(events.slice(copy + 1).map((event) => event.what)).toEqual(['container-remove', 'container-remove', 'image-remove', 'image-list'])
+      expect(events.slice(copy + 2).every((event) => event.reservations.length === 0 && !event.lockHeld)).toBe(true)
+      expect(events.some((event) => event.what === 'container-run')).toBe(false)
+      const refusal = run.status()?.refusal
+      expect(run.status()?.phase).toBe('refused')
+      expect(refusal?.kind).toBeNull()
+      if (what.includes('difference')) expect(refusal?.summary).toContain(MISSING_FROM_IMAGE)
+      expect(run.logLines().slice(-1 - refusal!.details.length)).toEqual([e13.refusalLine(refusal!), ...refusal!.details])
+      expect(host.docker.images().some((image) => image.labels[e13.OWNER_LABEL] === e13.formatOwner(run.owner))).toBe(false)
+      await e13ExpectNothingAfter(host, run)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('an interrupt delivered while the read-back\'s refusal is being recorded changes nothing: status.json, runner.log and the events byte-identical to a twin run without it; no stop is logged, and nothing follows', async () => {
+      const host = e13Host()
+      host.docker.fail('container-copy')
+      let delivered = 0
+      const run = host.run({
+        onEvent: (event, self) => {
+          if (event.what === 'image-remove') delivered = self.source.deliver('SIGINT')
+        },
+      })
+      expect(await e13RunToEnd(host, run)).toBe(e13.REFUSAL_EXIT_STATUS)
+      expect(delivered).toBe(1)
+      // The twin: its own host, the same RUN_ID and PID, the same copy-out failure, no interrupt.
+      const twinHost = e13Host()
+      twinHost.docker.fail('container-copy')
+      const twin = twinHost.run()
+      expect(await e13RunToEnd(twinHost, twin)).toBe(e13.REFUSAL_EXIT_STATUS)
+      expect([twin.runId, twin.pid]).toEqual([run.runId, run.pid])
+      const read = (of: E13Run, name: string): string => e13Fs.readFileSync(e13Path.join(of.runDir, name), 'utf-8')
+      /** Text with its run's `mkdtemp` directories (the worktree, then the host's root) made placeholders, so the two hosts' paths compare equal. */
+      const placeheld = (of: E13Host, ran: E13Run, text: string): string => text.replaceAll(ran.worktree.root, '<worktree>').replaceAll(of.root, '<host root>')
+      expect(e13Fs.readdirSync(run.runDir).sort()).toEqual(e13Fs.readdirSync(twin.runDir).sort())
+      expect(read(run, e13.STATUS_FILE_NAME)).toBe(read(twin, e13.STATUS_FILE_NAME))
+      expect(placeheld(host, run, read(run, e13.RUNNER_LOG_FILE_NAME))).toBe(placeheld(twinHost, twin, read(twin, e13.RUNNER_LOG_FILE_NAME)))
+      expect(placeheld(host, run, JSON.stringify(e13EventsOf(host, run)))).toBe(placeheld(twinHost, twin, JSON.stringify(e13EventsOf(twinHost, twin))))
+      const refusal = run.status()?.refusal
+      expect(run.status()?.phase).toBe('refused')
+      expect(refusal?.kind).toBeNull()
+      expect(run.logLines().some((line) => line.includes(e13.runLevelStopLine({ kind: 'interrupt', signal: 'SIGINT' })))).toBe(false)
+      expect(run.logLines().slice(-1 - refusal!.details.length)).toEqual([e13.refusalLine(refusal!), ...refusal!.details])
+      expect(e13Whats(host, run).slice(e13IndexOf(e13EventsOf(host, run), 'image-remove'))).toEqual(['image-remove', 'image-list'])
+      await e13ExpectNothingAfter(host, run)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // T5.S5: the run deadline and its timer (SR-5.5, AC 36)
+  // -------------------------------------------------------------------------
+
+  describe('the run deadline and its timer (SR-5.5, AC 36)', () => {
+    /** The process group the runner gave a spawn of `what`, and every signal sent to that group. */
+    function groupSignals(host: E13Host, run: E13Run, what: string): { readonly processGroup: number; readonly signals: readonly e13Helper.RecordedSignal[] } {
+      const event = e13EventsOf(host, run).find((candidate) => candidate.what === what)!
+      const spawn = host.recorder.spawns().find((candidate) => candidate.argv.join('\0') === event.argv!.join('\0'))!
+      const processGroup = spawn.processGroup!
+      return { processGroup, signals: host.signals.signals().filter((signal) => signal.target.kind === 'group' && signal.target.processGroup === processGroup) }
+    }
+
+    test.each([
+      ['a test build still running at start + B: the `build` form at the 30 min deadline', {}, 'image-build', false],
+      ['a missing base\'s build-base step still running at start + B + 60 min: B became 90 min, written in phase build at once', { baseMissing: true, baseBuildStep: { untilSignalled: true } }, 'bash', true],
+    ] satisfies [string, E13RunOptions, string, boolean][])('%s; the build\'s group gets SIGKILL at that exact moment', async (_what, options, build, baseMissing) => {
+      const host = e13Host()
+      const run = host.run({ ...options, testBuild: { kind: 'hangs' } })
+      await e13RunToEnd(host, run)
+      const minutes = e13DeadlineMinutes(baseMissing, null)
+      expect(minutes).toBe(e13.BUILD_ALLOWANCE_MINUTES + (baseMissing ? e13.BASE_BUILD_ALLOWANCE_MINUTES : 0))
+      const statuses = [e13Status(run, 'build', e13.BUILD_ALLOWANCE_MINUTES), ...(baseMissing ? [e13Status(run, 'build', minutes)] : []), e13Status(run, 'merge', minutes)]
+      expect(e13StatusesOf(run)).toEqual(statuses)
+      expect(run.verdict()).toBe(e13.runDeadlineLine('build', minutes))
+      expect(run.verdict()).toBe(e13.runLevelStopLine(e13.runDeadlineStop('build', minutes)))
+      const { signals } = groupSignals(host, run, build)
+      expect(signals.map((signal) => [signal.signal, signal.atMs])).toEqual([['SIGKILL', START_MS + minutes * MS_PER_MINUTE]])
+      expect(e13SampleTimes(host, run)).not.toContain(START_MS + minutes * MS_PER_MINUTE)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('pin (PRD AC 36\'s example, typed here only): a shard still running past start + B + T + 15 min with T = 93.4 min gives the `shards` form, the 138.4 min deadline printed as 138', async () => {
+      const host = e13Host()
+      // test-1 with test-2: 2352 s expected, so a limit of 93.4 min (T); test-1 with test-3 at the floor.
+      const seconds: Readonly<Record<number, number>> = { 1: 52, 2: 2300, 3: 60 }
+      const late = e13Helper.realScriptFileName(2)
+      const run = host.run({
+        worktree: { scripts: [1, 2, 3].map((n) => e13Helper.realScriptFileName(n)), durationTable: { kind: 'rows', header: e13.DURATION_TABLE_HEADER, rows: [1, 2, 3].map((n) => ({ script: n, seconds: seconds[n]! })) } },
+        // Its `docker run` answers 50 min in, after B + 15, so its limit comes after the deadline.
+        dockerRunDelayMs: (assigned) => (assigned.includes(late) ? 50 * MS_PER_MINUTE : 0),
+        shard: (k) => (k === 1 ? { endsAfterMs: null } : {}),
+      })
+      await e13RunToEnd(host, run)
+      const results = run.results()!
+      expect(e13LargestLimitMs(results)).toBe(93.4 * MS_PER_MINUTE)
+      const minutes = e13DeadlineMinutes(false, e13LargestLimitMs(results))
+      expect(minutes).toBeCloseTo(138.4, 10)
+      expect(run.verdict()).toBe('FAIL: run deadline: shards still running at the 138 min deadline')
+      expect(run.verdict()).toBe(e13.runDeadlineLine('shards', minutes))
+      expect(e13StatusesOf(run)).toEqual([e13Status(run, 'build', e13.BUILD_ALLOWANCE_MINUTES), e13Status(run, 'shards', minutes), e13Status(run, 'merge', minutes)])
+      expect(e13StatusesOf(run)[1]!.deadline.minutes).toBe(138)
+      const deadlineAt = START_MS + e13.runDeadlineOffset({ baseMissing: false, largestLimitMs: e13LargestLimitMs(results) }).ms
+      expect(e13ShardEvents(host, run, 1).find((event) => event.what === 'container-kill')?.atMs).toBe(deadlineAt)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('a run whose end of run started before its shards were scheduled keeps start + B: the deadline passing during its image cleanup gives the `merge` form', async () => {
+      const host = e13Host()
+      host.docker.setPruneDuration(40 * MS_PER_MINUTE)
+      const run = host.run({ testBuild: { kind: 'failed', durationMs: BUILD_MS } })
+      await e13RunToEnd(host, run)
+      expect(e13StatusesOf(run)).toEqual([e13Status(run, 'build', e13.BUILD_ALLOWANCE_MINUTES), e13Status(run, 'merge', e13.BUILD_ALLOWANCE_MINUTES)])
+      expect(run.verdict()).toBe(e13.runDeadlineLine('merge', e13.BUILD_ALLOWANCE_MINUTES))
+      const prune = e13EventsOf(host, run).find((event) => event.what === 'image-prune')!
+      expect(prune.atMs).toBeLessThan(START_MS + e13.BUILD_ALLOWANCE_MINUTES * MS_PER_MINUTE)
+      expect(run.results()?.failures.map((failure) => failure.line)).toContain(e13.testImageBuildFailedLine(1))
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('a deadline more than 2^31 − 1 ms away fires at its exact moment, never early: the timer is re-armed in steps, each within the runtime maximum and shorter than the wait, one at a time', async () => {
+      // The stop hooks over a run-state record with only what the deadline reads and a stop writes, on a bare fake clock: a composed
+      // run would have its watchdog sample every 30 s for the 25 days such a deadline lies away.
+      /** The runtime's largest timer delay, 2^31 − 1 ms: a runtime fact, not a runner constant. */
+      const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
+      const clock = e13Clock.createFakeClock({ start: START_MS })
+      const source = e13Helper.createSignalSource({ clock })
+      const armed: E13RunnerTimer[] = []
+      const lines: string[] = []
+      const state = e13.createInitialRunState()
+      const seq = {
+        deps: {
+          clock: {
+            now: () => clock.now(),
+            setTimeout: (callback: () => void, delayMs: number) => {
+              const handle = clock.setTimeout(callback, delayMs)
+              armed.push({ handle, delayMs, atMs: clock.now() })
+              return handle
+            },
+            clearTimeout: (handle: unknown) => clock.clearTimeout(handle),
+          },
+          onSignal: source.onSignal,
+        },
+        run: { basis: { runId: RUN_ID, pid: RUN_PID, startMs: START_MS, deadline: e13.statusDeadline(START_MS, e13.BUILD_ALLOWANCE_MINUTES) } },
+        state,
+        say: (line: string) => {
+          lines.push(line)
+        },
+        schedule: null as { readonly largestLimitMs: number } | null,
+        shards: [],
+        waiters: [],
+        controller: null,
+        endOfRunStarted: false,
+        refusalBeingRecorded: false,
+        verdictRenamed: false,
+        firstStopTiming: null,
+      }
+      const hooks = e13.createRunStopHooks()
+      const sequence = seq as unknown as e13.RunSequence
+      hooks.onSequenceStart?.(sequence)
+      const largestLimitMs = 2 ** 31 + 12_345
+      seq.schedule = { largestLimitMs }
+      const scheduledFrom = armed.length
+      hooks.onShardsScheduled?.(sequence, seq.schedule as unknown as e13.Schedule)
+      const offset = e13.runDeadlineOffset({ baseMissing: false, largestLimitMs })
+      const dueAt = START_MS + offset.ms
+      expect(offset.ms).toBeGreaterThan(MAX_TIMER_DELAY_MS)
+      /** The runner's timers still pending on the clock. */
+      const pendingArmed = (): E13RunnerTimer[] => {
+        const pending = new Set(clock.pending().map((timer) => timer.id))
+        return armed.filter((timer) => pending.has((timer.handle as e13Clock.FakeTimerHandle).id))
+      }
+      while (state.firstStop === null) {
+        expect(clock.now()).toBeLessThan(dueAt)
+        const pending = pendingArmed()
+        expect(pending.length).toBeLessThanOrEqual(1)
+        for (const timer of pending) expect(timer.delayMs).toBeLessThanOrEqual(MAX_TIMER_DELAY_MS)
+        expect(await clock.runNext()).toBeGreaterThan(0)
+      }
+      expect(clock.now()).toBe(dueAt)
+      expect(state.firstStop).toEqual(e13.runDeadlineStop('shards', offset.minutes))
+      expect(seq.run.basis.deadline).toEqual(e13.statusDeadline(START_MS, offset.minutes))
+      const steps = armed.slice(scheduledFrom)
+      expect(steps.length).toBeGreaterThan(1)
+      for (const step of steps) expect(step.delayMs).toBeLessThanOrEqual(MAX_TIMER_DELAY_MS)
+      for (const step of steps) expect(step.delayMs).toBeLessThan(dueAt - step.atMs + 1)
+      expect(steps[0]!.delayMs).toBeLessThan(offset.ms)
+      expect(lines).toHaveLength(1)
+      expect(lines[0]!.endsWith(e13.runDeadlineLine('shards', offset.minutes))).toBe(true)
+      hooks.dispose()
+      expect(source.handlerCount()).toBe(0)
+      expect(clock.pendingCount()).toBe(0)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // T5.S6: stops before the end of run (SR-5.4, SR-5.6, SR-10.6; AC 33, AC 37)
+  // -------------------------------------------------------------------------
+
+  describe('stops before the end of run: traps, the first stop, builds\' process groups, AC 33 and AC 37 (SR-5.4, SR-5.6, SR-10.6)', () => {
+    const interrupt = (signal: e13.TrappedSignal): e13.RunLevelStop => ({ kind: 'interrupt', signal })
+    /** The pod with W above the stop line: 60 of its 64 GiB limit in use. */
+    const HIGH_POD: e13Helper.PodFigures = { limitGib: 64, workingSetGib: 60, anonGib: 40, activeFileGib: 10 }
+
+    /** Rewrites the pod's cgroup files to `pod` at `atMs`, so the next sample reads it. */
+    function podAt(host: E13Host, pod: e13Helper.PodFigures, atMs: number): void {
+      host.clock.setTimeout(() => host.readings.cgroups.writePod('/', e13Helper.podBytes(pod)), atMs - host.clock.now())
+    }
+
+    /** The memory watchdog's line for the high pod, with no shard running (E7's builder). */
+    function watchdogLineWithNoShards(): string {
+      const bytes = e13Helper.podBytes(HIGH_POD)
+      const limit = e13Helper.podBytes(DEFAULT_POD).maxBytes as number
+      return e13.memoryWatchdogLine(bytes.workingSetBytes, e13.memoryCeiling(limit, []), [])
+    }
+
+    /** That every shard the stop found running had its final reading before its SIGKILL, and every shard not ended has the stop's cause. */
+    function expectShardsStopped(host: E13Host, run: E13Run, stop: e13.RunLevelStop, notEnded: readonly number[]): void {
+      const results = run.results()!
+      for (const k of notEnded) {
+        expect(results.shards[k - 1]!.end).toContain(e13.shardCauseText(e13.stoppedCauseOf(stop)))
+        const whats = e13ShardEvents(host, run, k).map((event) => event.what)
+        if (run.shardStarts.has(k)) expect(whats.indexOf('container-state')).toBeLessThan(whats.indexOf('container-kill'))
+      }
+    }
+
+    test.each(e13.TRAPPED_SIGNALS.map((signal) => [signal]))('%s during the shards ends the run with FAIL: interrupted: <signal>: each running shard read, then killed, with the stop\'s cause; the end of run from step 1; the traps removed', async (signal) => {
+      const host = e13Host()
+      const run = host.run({ shard: () => ({ endsAfterMs: null }) })
+      run.source.deliverAt(signal, START_MS + 40_000)
+      expect(await e13RunToEnd(host, run)).toBe(e13.VERDICT_WRITTEN_EXIT_STATUS)
+      expect(run.verdict()).toBe(e13.runLevelStopLine(interrupt(signal)))
+      expectShardsStopped(host, run, interrupt(signal), [1, 2, 3, 4, 5, 6])
+      expect(run.status()?.phase).toBe('merge')
+      expect(run.results()?.failures[0]?.line).toBe(run.verdict()!)
+      await e13ExpectNothingAfter(host, run)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test.each([
+      ['a valid run: the held signal is recorded once the sequence starts, so no step runs', [] as string[]],
+      ['an invalid run: the validation refusal drops it', ['--shards', '7']],
+    ])('a signal delivered during validation, with %s', async (what, args) => {
+      const host = e13Host()
+      const run = host.run({ args })
+      const exit = await e13RunToEnd(host, run, { onRunLog: () => void run.source.deliver('SIGTERM') })
+      expect(run.source.delivered().map((delivery) => delivery.handlers)).toEqual([1])
+      expect(e13Whats(host, run)).toEqual([])
+      if (what.startsWith('a valid')) {
+        expect(exit).toBe(e13.VERDICT_WRITTEN_EXIT_STATUS)
+        expect(run.verdict()).toBe(e13.runLevelStopLine(interrupt('SIGTERM')))
+        expect(run.results()?.shardCount.reasons).toEqual([e13.ENDED_BEFORE_ADMISSION_REASON])
+      } else {
+        expect(exit).toBe(e13.REFUSAL_EXIT_STATUS)
+        expect(run.status()?.refusal).toEqual({ kind: null, summary: e13.outOfRangeReason('--shards', '7'), details: [] })
+        expect(run.logLines().some((line) => line.includes(e13.runLevelStopLine(interrupt('SIGTERM'))))).toBe(false)
+      }
+      await e13ExpectNothingAfter(host, run)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    /** One first stop and how it is made, then a second stop delivered during the end of run's image cleanup. */
+    const FIRST_STOPS: readonly (readonly [string, E13RunOptions, (host: E13Host, run: E13Run) => void, () => string])[] = [
+      ['an interrupt', { shard: () => ({ endsAfterMs: null }) }, (_host, run) => run.source.deliverAt('SIGINT', START_MS + 40_000), () => e13.runLevelStopLine(interrupt('SIGINT'))],
+      ['the run deadline', { testBuild: { kind: 'hangs' } }, () => undefined, () => e13.runDeadlineLine('build', e13.BUILD_ALLOWANCE_MINUTES)],
+      ['the memory watchdog', { testBuild: { kind: 'hangs' } }, (host) => podAt(host, HIGH_POD, START_MS + 10_000), watchdogLineWithNoShards],
+    ]
+
+    test.each(FIRST_STOPS)('the first stop wins: %s first; an interrupt during the end of run changes nothing and logs nothing', async (_what, options, makeFirst, firstLine) => {
+      const host = e13Host()
+      let second = -1
+      const run = host.run({
+        ...options,
+        onEvent: (event, self) => {
+          if (event.what === 'image-remove') second = self.source.deliver('SIGHUP')
+        },
+      })
+      makeFirst(host, run)
+      await e13RunToEnd(host, run)
+      expect(second).toBe(1)
+      expect(run.verdict()).toBe(firstLine())
+      const stopLines = run.logLines().filter((line) => line.endsWith(firstLine()) || line.endsWith(e13.runLevelStopLine(interrupt('SIGHUP'))))
+      expect(stopLines).toHaveLength(1)
+      expect(stopLines[0]!.endsWith(firstLine())).toBe(true)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('a stop during admission, the lock held: the lock released, no reservation, the run ended through the end of run in phase merge, `shards: 0 of 6 (ended before admission)`', async () => {
+      const host = e13Host()
+      const run = host.run({
+        onEvent: (event, self) => {
+          if (event.what === 'container-list' && event.lockHeld && self.source.delivered().length === 0) self.source.deliver('SIGTERM')
+        },
+      })
+      expect(await e13RunToEnd(host, run)).toBe(e13.VERDICT_WRITTEN_EXIT_STATUS)
+      // The sweep in progress ends; no reading follows.
+      expect(e13Whats(host, run)).toEqual(['version', 'image-inspect', 'npm', 'password', 'container-list', 'image-list', 'image-list'])
+      expect(e13LockState(host)).toEqual({ lockHeld: false, lockRecord: e13.formatLockHolder(run.owner), reservations: [], reservedCpus: 0 })
+      expect(host.timeline.every((event) => event.reservations.length === 0)).toBe(true)
+      expect(e13StatusesOf(run).map((status) => status.phase)).toEqual(['build', 'merge'])
+      expect(run.verdict()).toBe(e13.runLevelStopLine(interrupt('SIGTERM')))
+      const results = run.results()!
+      expect([results.shardCount.admitted, results.shardCount.started, results.shardCount.reasons]).toEqual([0, 0, [e13.ENDED_BEFORE_ADMISSION_REASON]])
+      expect(e13Fs.readFileSync(e13Path.join(run.runDir, e13.SUMMARY_FILE_NAME), 'utf-8')).toContain(e13.endedBeforeAdmissionShardCountLine(e13.MAX_SHARDS))
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('every build, the base-build step, the test build and the drift and retag builds, is spawned in a process group of its own', async () => {
+      const host = e13Host()
+      const run = host.run({ baseMissing: true, args: ['--inject', e13.faultText({ kind: 'image-drift', shard: 1 }), '--inject', e13.faultText({ kind: 'retag' })] })
+      await e13RunToEnd(host, run)
+      const builds = e13EventsOf(host, run).filter((event) => event.what === 'bash' || event.what === 'image-build')
+      expect(builds.map((event) => event.what)).toEqual(['bash', 'image-build', 'image-build', 'image-build'])
+      for (const event of builds) {
+        const spawn = host.recorder.spawns().find((candidate) => candidate.argv.join('\0') === event.argv!.join('\0'))!
+        expect([spawn.ownProcessGroup, spawn.processGroup]).toEqual([true, spawn.pid])
+      }
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test.each([
+      ['the base-build step', { baseMissing: true, baseBuildStep: { untilSignalled: true } }, 'bash'],
+      ['the test build', { testBuild: { kind: 'hangs' } }, 'image-build'],
+    ] satisfies [string, E13RunOptions, string][])('a stop during %s sends SIGKILL to its whole process group, writes no image-build failure, and cleanup leaves no run tag or untagged image', async (_what, options, build) => {
+      const host = e13Host()
+      const run = host.run({
+        ...options,
+        onEvent: (event, self) => {
+          if (event.what === build) self.source.deliverAt('SIGINT', event.atMs + 5_000)
+        },
+      })
+      await e13RunToEnd(host, run)
+      const event = e13EventsOf(host, run).find((candidate) => candidate.what === build)!
+      const spawn = host.recorder.spawns().find((candidate) => candidate.argv.join('\0') === event.argv!.join('\0'))!
+      expect(host.signals.signals().map((signal) => [signal.target, signal.signal, signal.atMs])).toEqual([[{ kind: 'group', processGroup: spawn.processGroup! }, 'SIGKILL', event.atMs + 5_000]])
+      expect(run.verdict()).toBe(e13.runLevelStopLine(interrupt('SIGINT')))
+      const killed = e13Helper.signalExitStatus('SIGKILL')
+      const lines = [...run.results()!.failures.map((failure) => failure.line), ...run.logLines()]
+      expect(lines.filter((line) => line.includes(e13.baseImageBuildFailedLine(killed)) || line.includes(e13.testImageBuildFailedLine(killed)))).toEqual([])
+      expect(host.docker.images().filter((image) => image.labels[e13.OWNER_LABEL] === e13.formatOwner(run.owner) || image.tags.some((tag) => e13.parseRunTag(tag) !== null))).toEqual([])
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('a stop during the shard starts: the running shards read before SIGKILL, a shard not yet created takes the stop\'s cause too', async () => {
+      const host = e13Host()
+      // Shard 5's `docker run` answers a minute late; the interrupt comes meanwhile, so shard 6 is never created.
+      const delayed = e13Helper.realScriptFileName(6)
+      const run = host.run({ shard: () => ({ endsAfterMs: null }), dockerRunDelayMs: (assigned) => (assigned.includes(delayed) ? MS_PER_MINUTE : 0) })
+      run.source.deliverAt('SIGINT', START_MS + 40_000)
+      await e13RunToEnd(host, run)
+      const notCreated = [1, 2, 3, 4, 5, 6].filter((k) => !run.shardStarts.has(k))
+      expect(notCreated).toHaveLength(1)
+      expect(run.results()!.shards[notCreated[0]! - 1]!.seconds).toBeNull()
+      expectShardsStopped(host, run, interrupt('SIGINT'), [1, 2, 3, 4, 5, 6])
+      expect(host.docker.containers().filter((container) => container.labels[e13.OWNER_LABEL] === e13.formatOwner(run.owner))).toEqual([])
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('AC 33 during the shards: the watchdog\'s line is the verdict, naming the shards; every shard removed and the reservation released', async () => {
+      const host = e13Host()
+      const run = host.run({ shard: () => ({ endsAfterMs: null }) })
+      podAt(host, HIGH_POD, START_MS + 50_000)
+      await e13RunToEnd(host, run)
+      const noShards = watchdogLineWithNoShards()
+      const verdict = run.verdict()!
+      expect(verdict.startsWith(noShards.slice(0, -e13.NO_SHARDS_RUNNING_TEXT.length - 1))).toBe(true)
+      for (let k = 1; k <= e13.MAX_SHARDS; k++) expect(verdict).toContain(`${e13.SHARD_DIR_PREFIX}${k}`)
+      expect(run.logLines().filter((line) => line.endsWith(verdict))).toHaveLength(1)
+      expectShardsStopped(host, run, { kind: 'memory-watchdog', line: verdict }, [1, 2, 3, 4, 5, 6])
+      expect(host.docker.containers()).toEqual([])
+      expect(e13LockState(host).reservations).toEqual([])
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('AC 33 during the build: the line says no shards running; schedule-coverage and fault-fired are skipped and named in the summary', async () => {
+      const host = e13Host()
+      const run = host.run({ testBuild: { kind: 'hangs' } })
+      podAt(host, HIGH_POD, START_MS + 10_000)
+      await e13RunToEnd(host, run)
+      expect(run.verdict()).toBe(watchdogLineWithNoShards())
+      expect(run.verdict()!.endsWith(`${e13.NO_SHARDS_RUNNING_TEXT})`)).toBe(true)
+      const skipped: e13.IntegrityCheck[] = ['fault-fired', 'schedule-coverage']
+      const results = run.results()!
+      for (const check of skipped) expect(results.skippedChecks).toContain(check)
+      const summary = e13Fs.readFileSync(e13Path.join(run.runDir, e13.SUMMARY_FILE_NAME), 'utf-8')
+      for (const check of skipped) expect(summary).toContain(check)
+      expect(e13LockState(host).reservations).toEqual([])
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('AC 37: SIGINT with test-23 in progress: FAIL: interrupted: SIGINT, test-23 stopped by interrupt in its shard, and no container-exited cause from the stop\'s SIGKILL', async () => {
+      const host = e13Host()
+      const testOne = e13Helper.realScriptFileName(1)
+      const test23 = e13Helper.realScriptFileName(23)
+      const run = host.run({
+        worktree: { scripts: [testOne, test23], durationTable: e13DurationTable([1, 23]) },
+        shard: () => ({
+          inProgress: () => [
+            { kind: e13.RESULT_WORD_START, fileName: testOne },
+            { kind: e13.RESULT_WORD_END, fileName: testOne, result: e13.RESULT_WORD_PASS, seconds: SCRIPT_SECONDS },
+            { kind: e13.RESULT_WORD_START, fileName: test23 },
+          ],
+          endsAfterMs: null,
+        }),
+      })
+      run.source.deliverAt('SIGINT', START_MS + 60_000)
+      await e13RunToEnd(host, run)
+      expect(run.verdict()).toBe(e13.runLevelStopLine(interrupt('SIGINT')))
+      const stopped = e13.scriptEndLine(test23, 1, e13.stoppedCauseOf(interrupt('SIGINT')))
+      const results = run.results()!
+      expect(results.shards[0]!.end).toBe(stopped)
+      expect(results.failures.map((failure) => failure.line)).toContain(stopped)
+      const exited = e13.containerExitedCauseText(e13Helper.signalExitStatus('SIGKILL'))
+      expect(JSON.stringify(results).includes(exited)).toBe(false)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // T5.S7: stops during the end of run and after the verdict (SR-5.6, SR-5.7)
+  // -------------------------------------------------------------------------
+
+  describe('stops during the end of run and after the verdict (SR-5.6, SR-5.7)', () => {
+    const SIGINT_STOP: e13.RunLevelStop = { kind: 'interrupt', signal: 'SIGINT' }
+    const END_OF_RUN_STEPS: readonly e13.EndOfRunStep[] = ['final-readings', 'integrity', 'cleanup', 'watchdog-stop', 'results', 'verdict']
+
+    /** The shard whose container fails to start, so step 1 retires it (its created container) with the stop already recorded or landing. */
+    const FAILS_TO_START = 3
+
+    test.each(END_OF_RUN_STEPS.map((step, i) => [i + 1, step] as const))('an interrupt as end-of-run step %i (%s) begins: the sequence carries on, no cause changes (the shard that failed to start keeps its start failure), no check is skipped, status.json stays as written at the merge switch, and the stop line is the verdict and a listed failure', async (_n, target) => {
+      const host = e13Host()
+      const run = host.run({ shard: (k) => (k === FAILS_TO_START ? { failsToStart: true } : {}) })
+      const entered: e13.EndOfRunStep[] = []
+      let atVerdictStep: { results: string; summary: string } | null = null
+      const read = (name: string): string => e13Fs.readFileSync(e13Path.join(run.runDir, name), 'utf-8')
+      const [exit] = await e13Settle(host, [run], [
+        run.sequence({
+          onEndOfRunStep: (_seq, step) => {
+            entered.push(step)
+            if (step === 'verdict') atVerdictStep = { results: read(e13.RESULTS_FILE_NAME), summary: read(e13.SUMMARY_FILE_NAME) }
+            if (step === target) expect(run.source.deliver('SIGINT')).toBe(1)
+          },
+        }),
+      ])
+      expect(exit).toBe(e13.VERDICT_WRITTEN_EXIT_STATUS)
+      expect(entered).toEqual([...END_OF_RUN_STEPS])
+      const line = e13.runLevelStopLine(SIGINT_STOP)
+      expect(run.verdict()).toBe(line)
+      const results = run.results()!
+      expect(results.verdict).toBe(line)
+      expect(results.failures).toContainEqual({ line, shard: null })
+      expect(e13Fs.readFileSync(e13Path.join(run.runDir, e13.SUMMARY_FILE_NAME), 'utf-8')).toContain(line)
+      const ends = results.shards.map((shard) => shard.end)
+      expect(ends.filter((_end, i) => i !== FAILS_TO_START - 1)).toEqual(Array<string>(e13.MAX_SHARDS - 1).fill(e13.NORMAL_SHARD_END))
+      expect(ends[FAILS_TO_START - 1]).toContain(e13.containerFailedToStartCauseText(''))
+      expect(ends[FAILS_TO_START - 1]).not.toContain(e13.shardCauseText(e13.stoppedCauseOf(SIGINT_STOP)))
+      expect(run.shardStarts.has(FAILS_TO_START)).toBe(false)
+      expect(results.skippedChecks).toEqual([])
+      // No restart: one merge write, each shard retired once, the images cleaned once.
+      expect(e13StatusesOf(run).map((status) => status.phase)).toEqual(['build', 'shards', 'merge'])
+      expect(e13Fs.readFileSync(e13Path.join(run.runDir, e13.STATUS_FILE_NAME), 'utf-8')).toBe(run.statuses.at(-1)!)
+      for (let k = 1; k <= e13.MAX_SHARDS; k++) expect(e13ShardEvents(host, run, k).filter((event) => event.what === 'container-remove')).toHaveLength(1)
+      expect(e13Whats(host, run).filter((what) => what === 'image-remove')).toHaveLength(1)
+      // A stop after step 5 wrote both files: they were written again before the verdict, now with the stop line.
+      if (target === 'verdict') {
+        const before = atVerdictStep as { results: string; summary: string } | null
+        expect(before?.results).toContain(e13.containerFailedToStartCauseText(''))
+        expect(before?.results).not.toContain(line)
+        expect(before?.summary).not.toContain(line)
+      }
+      await e13ExpectNothingAfter(host, run)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('an interrupt after the verdict\'s rename changes nothing: every file byte-identical and no operation follows', async () => {
+      const host = e13Host()
+      const run = host.run()
+      let atEnd: ReturnType<typeof e13TreeSnapshot> | null = null
+      let events = -1
+      const [exit] = await e13Settle(host, [run], [
+        run.sequence({
+          onSequenceEnd: () => {
+            atEnd = e13TreeSnapshot(run.runDir, { extended: true })
+            events = host.timeline.length
+            expect(run.source.deliver('SIGINT')).toBe(1)
+          },
+        }),
+      ])
+      expect(exit).toBe(e13.VERDICT_WRITTEN_EXIT_STATUS)
+      expect(run.verdict()).toBe(e13.PASS_VERDICT)
+      expect(e13TreeSnapshot(run.runDir, { extended: true })).toEqual(atEnd!)
+      expect(host.timeline.length).toBe(events)
+      expect(run.logLines().some((line) => line.includes(e13.runLevelStopLine(SIGINT_STOP)))).toBe(false)
+      await e13ExpectNothingAfter(host, run)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // T5.S8: the end-of-run order, the writers, AC 74's runner half, cleanup on every outcome (SR-5.7, SR-16.3)
+  // -------------------------------------------------------------------------
+
+  /** This run's leftovers on the host: its containers, the images carrying its run-private tags or its owner label, and its reservation. */
+  function e13Leftovers(host: E13Host, run: E13Run): { containers: string[]; images: string[]; reservations: string[] } {
+    const owner = e13.formatOwner(run.owner)
+    return {
+      containers: host.docker.containers().filter((container) => container.labels[e13.OWNER_LABEL] === owner).map((container) => container.name),
+      images: host.docker
+        .images()
+        .filter((image) => image.labels[e13.OWNER_LABEL] === owner || image.tags.some((tag) => e13.parseRunTag(tag) !== null && e13.formatOwner(e13.parseRunTag(tag)!.owner) === owner))
+        .map((image) => image.id),
+      reservations: e13LockState(host).reservations.filter((name) => name === e13.reservationFileName(run.owner)),
+    }
+  }
+
+  const NO_LEFTOVERS = { containers: [], images: [], reservations: [] }
+
+  describe('the end of run: its order, its writers, AC 74\'s runner half and cleanup on every outcome (SR-5.7, SR-15.3, SR-16.3)', () => {
+    test('the six steps in order, from one timeline: merge and the remaining shards retired, the read container removed; the checks once every docker.log exists; the reservation, then the images; the watchdog stopped and W read once more; the end files; the verdict last', async () => {
+      const host = e13Host()
+      const run = host.run({ shard: (k) => (k === 3 ? { failsToStart: true } : {}) })
+      const exists = (name: string): boolean => e13Fs.existsSync(e13Path.join(run.runDir, name))
+      const rootReads = (): number => host.readings.cgroups.reads().filter((read) => read.cgroupPath === '/').length
+      const snapshots: Record<string, unknown>[] = []
+      const take = (step: string): void => {
+        const shardDirs = [1, 2, 3, 4, 5, 6].map((k) => e13.shardSubdirectoryPath(run.runDir, k))
+        snapshots.push({
+          step,
+          phase: run.status()?.phase,
+          containers: e13Leftovers(host, run).containers.length,
+          readContainer: host.docker.container(e13.readContainerName(run.owner)) !== null,
+          dockerLogs: shardDirs.filter((dir) => e13Fs.existsSync(e13Path.join(dir, e13.DOCKER_LOG_FILE_NAME))).length,
+          reservation: e13Leftovers(host, run).reservations.length,
+          images: e13Leftovers(host, run).images.length > 0,
+          files: [e13.RESULTS_FILE_NAME, e13.SUMMARY_FILE_NAME, e13.VERDICT_FILE_NAME].filter(exists),
+          rootReads: rootReads(),
+          samples: host.timeline.filter((event) => event.what === 'container-list').length,
+        })
+      }
+      const [exit] = await e13Settle(host, [run], [run.sequence({ onEndOfRunStep: (_seq, step) => take(step) })])
+      take('end')
+      expect(exit).toBe(e13.VERDICT_WRITTEN_EXIT_STATUS)
+      const [finalReadings, integrity, cleanup, watchdogStop, results, verdict, end] = snapshots as Record<string, unknown>[]
+      // Step 1 found shard 3's created container still there; by step 2 the phase is merge, every container is gone, every docker.log saved.
+      expect(finalReadings).toMatchObject({ step: 'final-readings', phase: 'shards', containers: 1, readContainer: false, reservation: 1, images: true })
+      expect(integrity).toMatchObject({ step: 'integrity', phase: 'merge', containers: 0, dockerLogs: e13.MAX_SHARDS, reservation: 1, images: true, files: [] })
+      // Step 3: the reservation, then the images; step 4 finds both gone.
+      expect(cleanup).toMatchObject({ step: 'cleanup', reservation: 1, images: true })
+      expect(watchdogStop).toMatchObject({ step: 'watchdog-stop', reservation: 0, images: false, files: [] })
+      // Step 4: no sample after it, one more W reading (its files read once each).
+      expect(results).toMatchObject({ step: 'results', samples: (watchdogStop as { samples: number }).samples, files: [] })
+      expect((results as { rootReads: number }).rootReads).toBeGreaterThan((watchdogStop as { rootReads: number }).rootReads)
+      expect(end).toMatchObject({ rootReads: (results as { rootReads: number }).rootReads })
+      // Steps 5 and 6: the end files, then the verdict last.
+      expect(verdict).toMatchObject({ step: 'verdict', files: [e13.RESULTS_FILE_NAME, e13.SUMMARY_FILE_NAME] })
+      expect(end).toMatchObject({ step: 'end', files: [e13.RESULTS_FILE_NAME, e13.SUMMARY_FILE_NAME, e13.VERDICT_FILE_NAME] })
+      expect(run.results()?.workingSet.after).not.toBeNull()
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('the wiring: the controller finalized before the checks, so an injected fail: counts as fired; a planted key makes secret-scan the verdict, and no value reaches results.json, summary.txt, verdict.txt or the runner log', async () => {
+      const host = e13Host()
+      const fault: e13.Fault = { kind: 'fail', script: e13.numberFormOf(2) }
+      const run = host.run({
+        args: ['--inject', e13.faultText(fault)],
+        shard: (k) => (k === 2 ? { scriptLog: (fileName) => `${fileName}: printed ${SECRETS.key} by mistake\n` } : {}),
+      })
+      await e13RunToEnd(host, run)
+      const results = run.results()!
+      expect(run.verdict()!.startsWith(`${e13.injectedVerdictPrefix([fault])}${e13.integrityFailure('secret-scan', '', null).line}`)).toBe(true)
+      expect(results.failures.some((failure) => failure.line.includes(e13.STILL_DUE_FIRING_REASON))).toBe(false)
+      expect(results.failures.some((failure) => failure.line.startsWith(e13.integrityFailure('fault-fired', '', null).line))).toBe(false)
+      const file = (name: string): e13Credentials.WrittenFile => e13Credentials.writtenFile(e13Path.join(run.runDir, name))
+      e13Credentials.assertNoLeak({
+        results: file(e13.RESULTS_FILE_NAME),
+        summary: file(e13.SUMMARY_FILE_NAME),
+        verdict: file(e13.VERDICT_FILE_NAME),
+        log: file(e13.RUNNER_LOG_FILE_NAME),
+        status: file(e13.STATUS_FILE_NAME),
+        stderr: run.stderr,
+      })
+    })
+
+    test('after the verdict nothing is written: no temporary file is left, the run directory stays, and an hour later it is unchanged', async () => {
+      const host = e13Host()
+      const run = host.run()
+      await e13RunToEnd(host, run)
+      const names = [e13.STATUS_FILE_NAME, e13.RESULTS_FILE_NAME, e13.SUMMARY_FILE_NAME, e13.VERDICT_FILE_NAME]
+      const entries = e13Fs.readdirSync(run.runDir)
+      for (const name of names) expect(entries).not.toContain(e13.atomicTempFileName(name))
+      await e13ExpectNothingAfter(host, run)
+      expect(e13Fs.lstatSync(run.runDir).isDirectory()).toBe(true)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    /** Each failing shard plan of the script-failure row: shard 1 ends with its second script failed. */
+    const scriptFailure = (k: number): E13ShardPlan =>
+      k === 1
+        ? {
+            finished: (assigned) => [
+              ...e13PassEvents(assigned.slice(0, 1)).slice(0, -1),
+              { kind: e13.RESULT_WORD_START, fileName: assigned[1]! },
+              { kind: e13.RESULT_WORD_END, fileName: assigned[1]!, result: e13.RESULT_WORD_FAIL, seconds: SCRIPT_SECONDS },
+              { kind: e13.RESULT_WORD_DONE },
+            ],
+          }
+        : {}
+    const OUTCOMES: readonly (readonly [string, E13RunOptions, (host: E13Host, run: E13Run) => void])[] = [
+      ['a pass', {}, () => undefined],
+      ['a script failure', { shard: scriptFailure }, () => undefined],
+      ['an image-build failure', { testBuild: { kind: 'failed', durationMs: BUILD_MS } }, () => undefined],
+      ['an interrupted run', { shard: () => ({ endsAfterMs: null }) }, (_host, run) => run.source.deliverAt('SIGTERM', START_MS + 40_000)],
+      [
+        'a watchdog stop',
+        { shard: () => ({ endsAfterMs: null }) },
+        (host) => host.clock.setTimeout(() => host.readings.cgroups.writePod('/', e13Helper.podBytes({ limitGib: 64, workingSetGib: 60, anonGib: 40, activeFileGib: 10 })), 50_000),
+      ],
+    ]
+
+    test.each(OUTCOMES)('%s releases the reservation and leaves no container, run-private tag or owner-labelled image', async (_what, options, arrange) => {
+      const host = e13Host()
+      const run = host.run(options)
+      arrange(host, run)
+      expect(await e13RunToEnd(host, run)).toBe(e13.VERDICT_WRITTEN_EXIT_STATUS)
+      expect(e13Leftovers(host, run)).toEqual(NO_LEFTOVERS)
+      expect(run.verdict()).toBe(run.results()!.verdict)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Internal errors and guarded steps (b.uqm SR-5.7, SR-5.8, SR-12.5)
+  // -------------------------------------------------------------------------
+
+  describe('internal errors and guarded steps: every way out ends in the verdict or the refusal (SR-5.7, SR-5.8, SR-12.5)', () => {
+    /** Test data: the message of a dependency that throws. */
+    const THROWN = 'e13 dependency failure (thrown)'
+    const throwing = (): never => {
+      throw new Error(THROWN)
+    }
+
+    /** The run's verdict for an internal error: E10's line over the run's own scripts. */
+    function internalErrorVerdict(run: E13Run, error: string): string {
+      const parsed = e13.parseCiArguments([])
+      if (!parsed.ok) throw new Error('no arguments did not parse')
+      return e13.internalErrorVerdictLine(parsed.invocation, run.worktree.scriptFileNames, error)
+    }
+
+    test.each([
+      ['the account\'s home lookup (step 6, before the lock)', { readPasswordFile: throwing }, ['version', 'image-inspect', 'npm', 'password'], false],
+      ['the readings (step 8, under the lock)', { readVolume: throwing }, ['version', 'image-inspect', 'npm', 'password', 'container-list', 'image-list', 'image-list', 'volume'], true],
+    ] satisfies [string, E13RunOptions['deps'], string[], boolean][])('a throw in %s goes through the end of run: phase merge, `shards: 0 of 6 (ended before admission)`, the internal-error verdict, exit 0, the lock released, nothing left behind', async (_what, deps, events, locked) => {
+      const host = e13Host()
+      const run = host.run({ deps })
+      expect(await e13RunToEnd(host, run)).toBe(e13.VERDICT_WRITTEN_EXIT_STATUS)
+      expect(e13Whats(host, run)).toEqual(events)
+      expect(e13StatusesOf(run).map((status) => status.phase)).toEqual(['build', 'merge'])
+      expect(run.verdict()).toBe(internalErrorVerdict(run, THROWN))
+      const results = run.results()!
+      expect([results.shardCount.admitted, results.shardCount.reasons]).toEqual([0, [e13.ENDED_BEFORE_ADMISSION_REASON]])
+      expect(e13Fs.readFileSync(e13Path.join(run.runDir, e13.SUMMARY_FILE_NAME), 'utf-8')).toContain(e13.endedBeforeAdmissionShardCountLine(e13.MAX_SHARDS))
+      expect(run.logLines().some((line) => line.includes(THROWN))).toBe(true)
+      expect(e13LockState(host).lockHeld).toBe(false)
+      expect(e13LockState(host).lockRecord).toBe(locked ? e13.formatLockHolder(run.owner) : null)
+      expect(e13Leftovers(host, run)).toEqual(NO_LEFTOVERS)
+      await e13ExpectNothingAfter(host, run)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('a throw after the reservation with a shard running (its limit timer failing to arm) goes through the end of run: that shard read, then killed; no later shard started; the reservation released, the watchdog stopped, the internal-error verdict, exit 0', async () => {
+      const host = e13Host()
+      const failure = 'e13 timer failure'
+      let firstRun: E13Event | null = null
+      const run = host.run({
+        shard: () => ({ endsAfterMs: null }),
+        onEvent: (event, self) => {
+          if (event.what !== 'container-run' || firstRun !== null) return
+          firstRun = event
+          // The first shard has started: its limit timer (its scripts at the default table's 60 s each), the next timer of that delay, fails to arm (once).
+          const limitMs = e13.shardLimitMs(self.assigned.get(1)!.length * 60, null)
+          let thrown = false
+          self.faults.setTimeout = (delayMs) => {
+            if (thrown || delayMs !== limitMs) return false
+            thrown = true
+            return true
+          }
+        },
+      })
+      expect(await e13RunToEnd(host, run)).toBe(e13.VERDICT_WRITTEN_EXIT_STATUS)
+      // The reservation was written and shard 1 the only one started when the throw came.
+      const started = firstRun as E13Event | null
+      expect(started?.reservations).toEqual([e13.reservationFileName(run.owner)])
+      expect([...run.shardStarts.keys()]).toEqual([1])
+      expect(e13StatusesOf(run).map((status) => status.phase)).toEqual(['build', 'shards', 'merge'])
+      expect(run.verdict()).toBe(internalErrorVerdict(run, failure))
+      expect(run.logLines().some((line) => line.includes(failure))).toBe(true)
+      // The running shard: its final reading (state inspect) before its SIGKILL, then removed.
+      const whats = e13ShardEvents(host, run, 1).map((event) => event.what)
+      expect(whats.indexOf('container-state')).toBeGreaterThan(-1)
+      expect(whats.indexOf('container-state')).toBeLessThan(whats.indexOf('container-kill'))
+      expect(whats.indexOf('container-kill')).toBeLessThan(whats.lastIndexOf('container-remove'))
+      // Retired by the internal-error path, before the end of run (whose step 1 would retire it otherwise).
+      const killRetirement = `${e13.SHARD_DIR_PREFIX}1: retired (kill)`
+      expect(run.logLines().filter((line) => line.endsWith(killRetirement))).toHaveLength(1)
+      const results = run.results()!
+      expect(results.shardCount.admitted).toBe(e13.MAX_SHARDS)
+      expect(results.shardCount.started).toBe(1)
+      expect(e13Leftovers(host, run)).toEqual(NO_LEFTOVERS)
+      expect(e13LockState(host).lockHeld).toBe(false)
+      // The watchdog stopped: no runner timer pending.
+      expect(run.pendingRunnerTimers()).toEqual([])
+      await e13ExpectNothingAfter(host, run)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    /** An untagged image carrying the run's owner label, as a build leaves layers, so the image cleanup lists and prunes. */
+    function addOwnerLayer(host: E13Host, owner: e13.Owner): void {
+      host.docker.addImage({ labels: { [e13.OWNER_LABEL]: e13.formatOwner(owner) } })
+    }
+
+    /** Makes the run's own prune find another one running, so it waits to retry, and its clock fail that wait. */
+    function failPruneRetry(host: E13Host, run: E13Run): void {
+      host.docker.startOtherPrune({ durationMs: MS_PER_MINUTE, owner: 'e13-no-image-has-this-owner' })
+      run.faults.setTimeout = (delayMs) => delayMs === e13.PRUNE_RETRY_INTERVAL_MS
+    }
+
+    test('a throw in one step of the refusal path is logged, the later steps still run, and the refusal is still recorded last', async () => {
+      const host = e13Host()
+      host.docker.fail('container-copy')
+      const run = host.run({
+        onEvent: (event, self) => {
+          if (event.what === 'container-copy') {
+            addOwnerLayer(host, self.owner)
+            failPruneRetry(host, self)
+          }
+        },
+      })
+      expect(await e13RunToEnd(host, run)).toBe(e13.REFUSAL_EXIT_STATUS)
+      const events = e13EventsOf(host, run)
+      expect(events.slice(e13IndexOf(events, 'container-copy') + 1).map((event) => event.what)).toEqual(['container-remove', 'container-remove', 'image-remove', 'image-list', 'image-inspect', 'image-prune'])
+      const refusal = run.status()!.refusal!
+      const lines = run.logLines()
+      expect(lines.findIndex((line) => line.includes('e13 timer failure'))).toBeGreaterThan(-1)
+      expect(lines.slice(-1 - refusal.details.length)).toEqual([e13.refusalLine(refusal), ...refusal.details])
+      // The watchdog's stop, after the failed step: its timer gone, no sample after.
+      expect(run.pendingRunnerTimers()).toEqual([])
+      expect(run.source.handlerCount()).toBe(0)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test.each([
+      [
+        'the end of run\'s image cleanup throws',
+        (host: E13Host, run: E13Run): e13.RunSequenceHooks => {
+          addOwnerLayer(host, run.owner)
+          return { onEndOfRunStep: (_seq, step) => (step === 'cleanup' ? failPruneRetry(host, run) : undefined) }
+        },
+        (run: E13Run) => run.results()!.verdict,
+        'e13 timer failure',
+      ],
+      [
+        'the watchdog\'s stop throws',
+        (_host: E13Host, run: E13Run): e13.RunSequenceHooks => ({
+          onEndOfRunStep: (_seq, step) => {
+            if (step === 'watchdog-stop') run.faults.clearTimeout = (timer) => timer.delayMs === e13.SAMPLE_INTERVAL_MS
+          },
+        }),
+        (run: E13Run) => run.results()!.verdict,
+        'e13 timer cancel failure',
+      ],
+      [
+        'the end files\' composition throws, no stop recorded: the internal-error verdict',
+        (_host: E13Host, run: E13Run): e13.RunSequenceHooks => ({
+          onEndOfRunStep: (_seq, step) => {
+            if (step === 'results') run.faults.nowThrows = 1
+          },
+        }),
+        (run: E13Run) => internalErrorVerdict(run, 'e13 clock read failure'),
+        'e13 clock read failure',
+      ],
+      [
+        'the end files\' composition throws after an interrupt: the fallback verdict names the stop',
+        (_host: E13Host, run: E13Run): e13.RunSequenceHooks => {
+          run.source.deliverAt('SIGINT', START_MS + 40_000)
+          return {
+            onEndOfRunStep: (_seq, step) => {
+              if (step === 'results') run.faults.nowThrows = 1
+            },
+          }
+        },
+        () => e13.runLevelStopLine({ kind: 'interrupt', signal: 'SIGINT' }),
+        'e13 clock read failure',
+      ],
+    ] satisfies [string, (host: E13Host, run: E13Run) => e13.RunSequenceHooks, (run: E13Run) => string, string][])('%s: the throw is logged and verdict.txt is still written, exit 0', async (_what, arrange, verdict, logged) => {
+      const host = e13Host()
+      const run = host.run()
+      const [exit] = await e13Settle(host, [run], [run.sequence(arrange(host, run))])
+      expect(exit).toBe(e13.VERDICT_WRITTEN_EXIT_STATUS)
+      expect(run.verdict()).toBe(verdict(run))
+      expect(run.logLines().some((line) => line.includes(logged))).toBe(true)
+      expect(run.source.handlerCount()).toBe(0)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+  })
+})
