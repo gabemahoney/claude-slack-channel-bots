@@ -348,8 +348,8 @@ export const RESULTS_LINE_PREFIX = 'results: '
 
 /** Milliseconds in a second, for the texts that give a bound in seconds. */
 const MS_PER_SECOND = 1_000
-/** The least `<PID>` and the least m of `<grace>`. */
-const LEAST_POSITIVE_WHOLE_NUMBER = 1
+/** The least `<PID>` and the least m of `<grace>` (b.uqm SR-17.1). */
+export const LEAST_PID_AND_GRACE_MINUTES = 1
 /** test-1's number: every shard runs it, so every selective verdict's list holds it (b.uqm SR-12.5, SR-17.2). */
 const EVERY_SHARD_SCRIPT_NUMBER = 1
 
@@ -464,7 +464,7 @@ function shownArgument(arg: string): string {
 
 /** Whether `text` is a whole number (the runner's rule) of at least 1: `<PID>`'s number and `<grace>`'s m. */
 function isPositiveWholeNumber(text: string): boolean {
-  return isWholeNumber(text) && Number(text) >= LEAST_POSITIVE_WHOLE_NUMBER
+  return isWholeNumber(text) && Number(text) >= LEAST_PID_AND_GRACE_MINUTES
 }
 
 /** Whether `text` is a well-formed `<PID>`: `-`, or a whole number of at least 1 (no sign, no leading zero). */
@@ -511,9 +511,9 @@ export function usageProblemText(problem: UsageProblem): string {
     case 'bad-run-id':
       return `<RUN_ID> ${shownArgument(problem.arg)} is not a RUN_ID: a RUN_ID is <YYYYMMDD>t<HHMMSS>z-<suffix>, a real UTC moment, then 8 lowercase letters or digits`
     case 'bad-pid':
-      return `<PID> ${shownArgument(problem.arg)} is malformed: <PID> must be ${PID_ARGUMENT_NONE} or a whole number of at least ${LEAST_POSITIVE_WHOLE_NUMBER}`
+      return `<PID> ${shownArgument(problem.arg)} is malformed: <PID> must be ${PID_ARGUMENT_NONE} or a whole number of at least ${LEAST_PID_AND_GRACE_MINUTES}`
     case 'bad-grace':
-      return `<grace> ${shownArgument(problem.arg)} is malformed: <grace> must be ${GRACE_NONE}, ${GRACE_TERM_PREFIX}<m> or ${GRACE_KILL_PREFIX}<m>, m a whole number of at least ${LEAST_POSITIVE_WHOLE_NUMBER}`
+      return `<grace> ${shownArgument(problem.arg)} is malformed: <grace> must be ${GRACE_NONE}, ${GRACE_TERM_PREFIX}<m> or ${GRACE_KILL_PREFIX}<m>, m a whole number of at least ${LEAST_PID_AND_GRACE_MINUTES}`
     case 'extra':
       return `${shownArgument(problem.arg)} is an extra argument: ${problem.verb} takes only <RUN_ID> <PID>`
   }
@@ -941,7 +941,7 @@ function runnerDiedReport(input: ReportInput, mask: RunFileMask): ReportDecision
  * run directory's path. Removal is allowed only after rows 1, 4 and 6, and
  * not when a PASS's timing summary cannot be read.
  */
-export function decideReport(input: ReportInput, mask: RunFileMask = NO_MASK): ReportDecision {
+export function decideReport(input: ReportInput, mask: RunFileMask): ReportDecision {
   const { files, judgement, grace } = input
   const refusal = statusRefusal(files.status)
   const verdictPresent = files.verdict.kind !== 'absent'

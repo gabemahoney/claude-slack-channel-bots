@@ -92,6 +92,7 @@ import {
   OWNER_LABEL,
   PACKAGE_SHA256_FILE_NAME,
   parseResultLine,
+  parseResults,
   parseRunTag,
   PRUNE_ALREADY_RUNNING_TEXT,
   RESULT_FILE_NAME,
@@ -3269,6 +3270,131 @@ export function makeResultsDir(tempDir: string, spec: ResultsDirSpec): string {
 // ---------------------------------------------------------------------------
 // 7. Reader additions (E3)
 // ---------------------------------------------------------------------------
+//
+// The run-directory cases the verdict reader (`scripts/ci-verdict.ts`) needs
+// beyond section 6's (b.uqm SR-21.4): a symbolic link inside a run directory
+// that points out of it (the removal of b.uqm SR-16.3 must remove the link,
+// never its target), and a results file whose `version` and `timingSummary`
+// are valid while its other keys depart from b.uqm SR-16.1's shape (the
+// reader reads only those two keys, SR-17.3), and something other than a
+// directory at the run-directory path (a regular file, or a symbolic link to
+// a run directory elsewhere: no run directory, never removed, SR-17.3,
+// SR-16.3). Each starts from a valid run directory or file and makes one
+// stated change; section 6's builders are used read-only. Later E3 Subtasks
+// add any further reader case here.
+
+/** Whether `path` lies strictly below `dir`, judged on the resolved paths. */
+function isBelowPath(path: string, dir: string): boolean {
+  const base = resolve(dir)
+  return resolve(path).startsWith(base.endsWith(sep) ? base : `${base}${sep}`)
+}
+
+/**
+ * Plants a symbolic link named `name` (test data, default `link-out`) inside
+ * the run directory, pointing at `target`, a path outside it the caller made
+ * (a directory or a file elsewhere under the case's own root). The stated
+ * change: one link added to a valid run directory. Answers the link's path.
+ * Throws when `target` lies inside the run directory, when it does not exist
+ * (so a leak check of the root never meets a dangling link), or when `name`
+ * is not one plain entry name.
+ */
+export function linkOutOfRunDir(runDir: string, target: string, name = 'link-out'): string {
+  if (resolve(target) === resolve(runDir) || isBelowPath(target, runDir)) throw new Error(`linkOutOfRunDir: ${target} is not outside ${runDir}`)
+  if (!existsSync(target)) throw new Error(`linkOutOfRunDir: ${target} does not exist`)
+  assertPlainEntryName(name, 'linkOutOfRunDir')
+  const link = join(runDir, name)
+  symlinkSync(target, link)
+  return link
+}
+
+/** The keys `results.json` keeps valid in an off-shape file: the two the reader reads (b.uqm SR-16.1, SR-17.3). */
+const READER_RESULTS_KEYS: readonly (keyof Results)[] = ['version', 'timingSummary']
+
+/** A key b.uqm SR-16.1 does not have, added by the off-shape change: test data. */
+const FOREIGN_RESULTS_KEY = 'unexpectedKey'
+
+/**
+ * `results.json`'s valid text (`serializeResults`) with one stated change:
+ * every key but `version` and `timingSummary` departs from b.uqm SR-16.1's
+ * shape. Of the others, the first is removed, the second given a value of
+ * the wrong type (a string), and a foreign key is added; `version` and
+ * `timingSummary` keep their valid values. Throws unless the runner's strict
+ * parser then refuses the text while those two keys still read back as
+ * written, so the case stays what it claims.
+ */
+export function offShapeResultsText(results: Results): string {
+  const valid = serializeResults(results)
+  const others = Object.keys(JSON.parse(valid) as Record<string, unknown>).filter((key) => !READER_RESULTS_KEYS.includes(key as keyof Results))
+  const [dropped, retyped] = others
+  if (dropped === undefined || retyped === undefined) throw new Error('offShapeResultsText: results.json has too few other keys to change')
+  const text = changedJsonText(valid, {
+    kind: 'edit',
+    what: `every key but ${READER_RESULTS_KEYS.join(' and ')} off shape: ${dropped} removed, ${retyped} retyped, ${FOREIGN_RESULTS_KEY} added`,
+    edit: (validText) => {
+      const object = JSON.parse(validText) as Record<string, unknown>
+      delete object[dropped]
+      object[retyped] = String(object[retyped])
+      object[FOREIGN_RESULTS_KEY] = true
+      return `${JSON.stringify(object, null, 2)}\n`
+    },
+  })
+  if (parseResults(text).ok) throw new Error('offShapeResultsText: the runner still reads the changed file as valid')
+  const read = JSON.parse(text) as Record<string, unknown>
+  for (const key of READER_RESULTS_KEYS) {
+    if (JSON.stringify(read[key]) !== JSON.stringify(results[key])) throw new Error(`offShapeResultsText: ${key} changed`)
+  }
+  return text
+}
+
+/** Writes `offShapeResultsText(results)` as the run directory's `results.json`, through the runner's whole-file writer. Answers its path. */
+export function writeOffShapeResults(runDir: string, results: Results): string {
+  assertWritten(writeWholeFile(runDir, RESULTS_FILE_NAME, offShapeResultsText(results)), 'writeOffShapeResults')
+  return join(runDir, RESULTS_FILE_NAME)
+}
+
+/** What `plantNonDirectoryAtRunDir` puts at the run-directory path: a regular file, or a symbolic link to a valid run directory built from `run` in `elsewhere`. */
+export type NonDirectoryAtRunDir =
+  | { readonly kind: 'file' }
+  | {
+      readonly kind: 'link'
+      /** A directory this creates, outside the run directory's parent. */
+      readonly elsewhere: string
+      readonly run: RunDirectorySpec
+    }
+
+/** Whether anything, a dangling symbolic link included, is at `path`. */
+function entryAt(path: string): boolean {
+  try {
+    lstatSync(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Plants what is not a run directory at the run-directory path `runDir`
+ * (the reader counts it as no run directory and never removes it, b.uqm
+ * SR-17.3, SR-16.3): a regular file (test data), or a symbolic link to a
+ * valid run directory that section 6's `buildRunDirectory` builds from
+ * `at.run` in `at.elsewhere`. The stated change: one entry that is not a
+ * directory where the run directory would be. Answers the directory holding
+ * what must stay untouched: `at.elsewhere` for a link, `runDir`'s parent for
+ * a file. Throws when anything is already at `runDir`, or when `at.elsewhere`
+ * is `runDir`'s parent or lies below it.
+ */
+export function plantNonDirectoryAtRunDir(runDir: string, at: NonDirectoryAtRunDir): string {
+  if (entryAt(runDir)) throw new Error(`plantNonDirectoryAtRunDir: ${runDir} already exists`)
+  const parent = dirname(runDir)
+  if (at.kind === 'file') {
+    writeFileSync(runDir, 'not a run directory\n')
+    return parent
+  }
+  if (resolve(at.elsewhere) === resolve(parent) || isBelowPath(at.elsewhere, parent)) throw new Error(`plantNonDirectoryAtRunDir: ${at.elsewhere} is not outside ${parent}`)
+  mkdirSync(at.elsewhere)
+  symlinkSync(buildRunDirectory(at.elsewhere, at.run), runDir)
+  return at.elsewhere
+}
 
 // ---------------------------------------------------------------------------
 // 8. Lock directory and password file (E5)
