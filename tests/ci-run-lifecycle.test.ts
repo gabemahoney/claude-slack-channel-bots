@@ -3232,7 +3232,6 @@ describe('E8: the run\'s images and tags (b.uqm SR-9, SR-19.9, SR-14.2)', () => 
       DURATION_TABLE_PATH,
       IMAGE_TESTS_DIR,
       imageAddedScriptReason,
-      imageDurationTableMissingText,
       imageDurationTableNotRegularText,
       imageMissingScriptReason,
       imageNotRegularEntryReason,
@@ -3257,6 +3256,7 @@ describe('E8: the run\'s images and tags (b.uqm SR-9, SR-19.9, SR-14.2)', () => 
     const { buildTarArchive, durationTableText, minimalScriptText, realScriptFileName } = e8Helper
     type PrerequisiteLine = e8Helper.PrerequisiteLine
     type ReadBackOutcome = e8Runner.ReadBackOutcome
+    type DurationTableSource = e8Runner.DurationTableSource
     type OperationKind = e8Helper.FakeDockerOperationKind
 
     /** Test data: the duration table, a carriage return on its second line and no final line feed, so a text handed on unchanged is visibly so. */
@@ -3449,22 +3449,22 @@ describe('E8: the run\'s images and tags (b.uqm SR-9, SR-19.9, SR-14.2)', () => 
       e8AssertNoLeak(readBackOutputs(rig, outcome))
     })
 
-    /** Tables the read-back reports unreadable, which is no failure: the image's archive, and the unreadable reason. */
-    const UNREADABLE_TABLES: readonly (readonly [string, (rig: E8Rig) => Uint8Array, string])[] = [
-      ['no /tests/ci-durations.tsv', (rig) => e8dTar(withRecord(worktreeRecords(rig), DURATION_TABLE_PATH)), imageDurationTableMissingText()],
+    /** Tables scheduling finds unreadable, which is no read-back failure: the image's archive, and the table as E4's scheduling input takes it. */
+    const UNREADABLE_TABLES: readonly (readonly [string, (rig: E8Rig) => Uint8Array, DurationTableSource])[] = [
+      ['no /tests/ci-durations.tsv', (rig) => e8dTar(withRecord(worktreeRecords(rig), DURATION_TABLE_PATH)), { kind: 'missing' }],
       [
         'a symbolic link at /tests/ci-durations.tsv',
         (rig) => e8dTar(withRecord(worktreeRecords(rig), DURATION_TABLE_PATH, { name: DURATION_TABLE_PATH, type: '2', linkName: 'integration' })),
-        imageDurationTableNotRegularText('symlink'),
+        { kind: 'unreadable', error: imageDurationTableNotRegularText('symlink') },
       ],
       [
         'a directory at /tests/ci-durations.tsv',
         (rig) => e8dTar(withRecord(worktreeRecords(rig), DURATION_TABLE_PATH, { name: `${DURATION_TABLE_PATH}/`, type: '5' })),
-        imageDurationTableNotRegularText('directory'),
+        { kind: 'unreadable', error: imageDurationTableNotRegularText('directory') },
       ],
     ]
 
-    test.each(UNREADABLE_TABLES)('an image with %s is no failure: the table is reported unreadable to scheduling', async (_what, archiveOf, reason) => {
+    test.each(UNREADABLE_TABLES)('an image with %s is no failure: the table is handed to scheduling as missing or unreadable', async (_what, archiveOf, durationTable) => {
       const rig = makeReadBackRig()
       const validated = rig.validate()
       const pinnedId = addPinnedImage(rig, archiveOf(rig))
@@ -3472,7 +3472,7 @@ describe('E8: the run\'s images and tags (b.uqm SR-9, SR-19.9, SR-14.2)', () => 
 
       expect(outcome).toEqual({
         ok: true,
-        readBack: { scripts: validated.scripts, prerequisites: validated.prerequisites, runScripts: validated.runScripts, durationTable: { kind: 'unreadable', reason } },
+        readBack: { scripts: validated.scripts, prerequisites: validated.prerequisites, runScripts: validated.runScripts, durationTable },
         cleanupFailure: null,
       })
       expectOneReadContainer(rig, pinnedId)

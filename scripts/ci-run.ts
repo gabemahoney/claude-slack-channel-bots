@@ -9712,8 +9712,9 @@ export async function moveTestTagToRetagImage(context: RunImagesContext, state: 
 //   is the refusal's reason.
 // - `readBackPinnedImage` is both, the one call E13 makes after the build. On
 //   success it hands on `ImageReadBack`: the image's script list (the run's
-//   scripts in a full run from here on), and its duration table's text or
-//   `unreadable` (`ImageDurationTable`), which E13 passes to E4's scheduling.
+//   scripts in a full run from here on), and its duration table's text,
+//   `missing` or `unreadable` (E4's `DurationTableSource`), which E13 passes
+//   to E4's scheduling as is.
 // - `removeReadContainerIfPresent` is E13's removal at end-of-run step 1 and
 //   in a refusal's cleanup (b.uqm SR-5.7, SR-5.8).
 // No function here throws, and none records a refusal: E13 records it and
@@ -10002,26 +10003,14 @@ export function readTarArchive(archive: Uint8Array): DepRead<readonly TarEntry[]
 
 // The image's contents, from the archive of `/tests`.
 
-/** The image's duration table for E4's scheduling input: its text, or unreadable with why (b.uqm SR-4.1). A missing table is no read-back failure (b.uqm SR-9.4). */
-export type ImageDurationTable =
-  | {
-      readonly kind: 'text'
-      /** The file's whole text, decoded as UTF-8; E4 parses it. */
-      readonly text: string
-    }
-  | {
-      readonly kind: 'unreadable'
-      /** Why, on one line, for E4's note. */
-      readonly reason: string
-    }
-
 /** What the read-back found in the pinned image. */
 export interface ImageContents {
   /** Every `test-*.sh` entry directly in the image's `/tests/integration`, with its kind, in bytewise name order: the shape E2's checks take. */
   readonly entries: readonly IntegrationEntry[]
   /** The text of each regular `test-*.sh` entry, by its name, for E2's prerequisite-line parser. */
   readonly scriptTexts: ReadonlyMap<string, string>
-  readonly durationTable: ImageDurationTable
+  /** The image's duration table as E4's scheduling input takes it: its UTF-8 text, missing, or unreadable with why. A missing table is no read-back failure (b.uqm SR-4.1, SR-9.4). */
+  readonly durationTable: DurationTableSource
 }
 
 /** How a reason names an entry's kind. */
@@ -10040,11 +10029,6 @@ export function readBackArchiveUnreadableText(error: string): string {
 /** `/tests/integration could not be listed from the archive of /tests: <why>` */
 export function readBackIntegrationUnlistableText(why: string): string {
   return `${IMAGE_INTEGRATION_DIR_TEXT} could not be listed from the archive of ${IMAGE_TESTS_DIR}: ${why}`
-}
-
-/** `the test image has no /tests/ci-durations.tsv`: the table is unreadable, which is no failure (b.uqm SR-4.1, SR-9.4). */
-export function imageDurationTableMissingText(): string {
-  return `the test image has no ${IMAGE_DURATION_TABLE_TEXT}`
 }
 
 /** `the test image's /tests/ci-durations.tsv is a symbolic link, not a regular file`: the table is unreadable (b.uqm SR-4.1). */
@@ -10074,11 +10058,11 @@ function tarDirectoryChildren(latest: ReadonlyMap<string, TarEntry>, dir: string
   return { ok: true, value: children }
 }
 
-/** The duration table's entry judged: its text, or unreadable (missing or not a regular file). */
-function imageDurationTableOf(latest: ReadonlyMap<string, TarEntry>): ImageDurationTable {
+/** The duration table's entry judged: its text, missing, or unreadable (not a regular file). */
+function imageDurationTableOf(latest: ReadonlyMap<string, TarEntry>): DurationTableSource {
   const table = latest.get(DURATION_TABLE_PATH)
-  if (table === undefined) return { kind: 'unreadable', reason: imageDurationTableMissingText() }
-  if (table.kind !== 'regular') return { kind: 'unreadable', reason: imageDurationTableNotRegularText(table.kind) }
+  if (table === undefined) return { kind: 'missing' }
+  if (table.kind !== 'regular') return { kind: 'unreadable', error: imageDurationTableNotRegularText(table.kind) }
   return { kind: 'text', text: utf8Text(table.content) }
 }
 
@@ -10315,8 +10299,8 @@ export interface ImageReadBack {
   readonly prerequisites: PrerequisiteMap
   /** The run's scripts from here on: the image's list in a full run; the selected scripts with their prerequisites and test-1 in a selective run. */
   readonly runScripts: readonly Script[]
-  /** The duration table for E4's scheduling input: its text unchanged, or unreadable. */
-  readonly durationTable: ImageDurationTable
+  /** The duration table for E4's scheduling input: its text unchanged, missing, or unreadable. */
+  readonly durationTable: DurationTableSource
 }
 
 /** The comparison's outcome: the hand-off to scheduling, or the refusal naming every difference. */
