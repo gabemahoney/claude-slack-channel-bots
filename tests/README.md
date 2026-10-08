@@ -975,6 +975,137 @@ match its config, and the start pass reconnects both personas. The sweep reaches
 store: an fmk script's rows are in its own store, which no other script's
 start sees.
 
+### Script names, prerequisites and canonical order
+
+`/ci` finds its scripts afresh in every run: they are the regular files in
+`tests/integration` whose names match `test-*.sh`. A new script that follows
+the naming rule runs with no other edit.
+
+Each is named `test-<n>-<slug>.sh`: n a whole number in decimal digits (`0`
+included, with no leading zero) and slug one or more lowercase letters, digits
+and hyphens. `test-<n>` is the script's number form; the whole name is its
+file name. Each of these makes every run `NOT RUN`, and no entry is skipped
+silently:
+
+| Problem | The refusal names |
+|---|---|
+| A `test-*.sh` file that breaks the naming rule, such as `test-5.sh`, `test-x-y.sh` or a number written with a leading zero | the file |
+| A `test-*.sh` entry that is not a regular file: a symbolic link (judged as the link itself, never followed), a directory or any other type | the entry |
+| Two or more scripts with one number | every file with that number |
+| No script numbered 1, a missing `tests/integration` included | test-1 |
+
+A script names the scripts it needs on one prerequisite line: `#`, optional
+spaces or tabs, then `ci-requires:` in lowercase, then the names, separated by
+spaces or tabs, each a number form or a whole file name. Any other spelling,
+such as `# CI-Requires:`, is an ordinary comment that declares nothing:
+
+```bash
+# ci-requires: <script> [<script>]...
+```
+
+The line counts only when its `#` is the line's first character and it sits in
+the header comment block. That block is the consecutive lines whose first
+character is `#` after the first line (the shebang), up to the first line
+whose first character is not `#`, such as a blank line or an indented comment.
+Anywhere else the line is refused (see the table below).
+
+A script with no prerequisite line needs only test-1. Naming test-1 is allowed
+and ignored, in any script's line. Today only
+`tests/integration/test-3-cozempic-restart.sh` has one:
+`# ci-requires: test-2`.
+
+Every script's header is checked in every run, full or selective. Each of
+these makes the run `NOT RUN`:
+
+| Header refusal | The refusal names |
+|---|---|
+| A word that names no script | the declaring script and the word |
+| A prerequisite line with nothing after the colon | the script |
+| A cycle | the scripts in it |
+| A prerequisite that sorts after its dependent in canonical order | both scripts |
+| A second prerequisite line, or one outside the header comment block (indented, below the block, or on the first line) | the script |
+
+A cycle is a group of two or more scripts each reachable from every other
+through prerequisite links, or a script other than test-1 that names itself.
+Each cycle is one refusal, and the links inside it give no ordering refusal.
+test-1's place first in every shard is no link, so a test-1 line naming
+another script is the ordering refusal, naming both, never a cycle.
+
+Canonical order is test-1; then test-2, test-3 and test-4, each when present;
+then every other script by ascending number, so test-0 follows test-4 and
+test-9 comes before test-12. In a shard, test-1 runs first and the shard's
+other scripts follow in canonical order, so every prerequisite runs before
+its dependents.
+
+Shards are filled with scheduling units. test-1 is in no unit, since it runs
+first in every shard. The units are the connected groups of the run's other
+scripts, joined by their prerequisite links; a script with no link is a unit
+of its own.
+
+A unit goes whole into one shard, and each of its scripts runs once there. On
+the current tree test-2 and test-3 form one unit, so the 29 scripts give 27
+units.
+
+The requested N is the `--shards` value, else 6. The effective N is the
+smaller of the requested N and the number of units, but at least 1, so
+`/ci test-1` runs one shard. The run uses the effective N, or the smaller N
+admission picks for a run with neither `--shards` nor `--inject`.
+
+These checks run in the worktree, before the docker check, the base-image
+check, packing, the admission lock or any build, in this order: the
+arguments, the script names, duplicate numbers, a missing test-1, the
+selection (see Selective runs), the prerequisite lines, the faults and the
+credentials.
+
+The first stage that finds a failure ends validation: its first failure is
+the refusal's `NOT RUN: <reason>` line, and each other failure of that stage
+follows as one detail line. Within a stage the failures come in this order:
+
+- arguments, selection and faults: argument order
+- script names: bytewise file-name order
+- duplicate numbers: ascending number
+- header refusals: the declaring script's canonical order, then the header
+  refusal table's order; a cycle counts as declared by its first script in
+  canonical order
+- credentials: `ANTHROPIC_API_KEY` before `GH_TOKEN`
+
+### Selective runs
+
+Any SCRIPT argument makes the run selective; with none, it is a full run.
+A SCRIPT is a number form (`test-3`) or a whole file name
+(`test-3-cozempic-restart.sh`).
+
+A number form matches only the script with
+exactly that number, so `test-2` never matches `test-20`. A script named more
+than once, in either form or both, runs once.
+
+A SCRIPT that matches no script, such as `test-999`, makes the run `NOT RUN`
+naming it, before the admission lock or any build. When several match
+nothing, the first is the refusal and the others follow as detail lines, in
+argument order.
+
+The run's scripts are the selected scripts, their declared prerequisites
+(added automatically, and transitively), and test-1, which is always added.
+They run in canonical order. `/ci test-3` runs test-1, test-2 and test-3, in
+that order, in one shard: test-2 and test-3 are one unit.
+
+A selective run uses the same validation, units and effective N as a full
+run, counted over the run's scripts, so `/ci test-1` (no unit) and
+`/ci test-2` (one unit) each run one shard. Every script's prerequisite line
+is still checked, not only those of the run's scripts. See Script names,
+prerequisites and canonical order above for the prerequisite line and
+canonical order.
+
+A `fail:` or `timeout:` fault must name an existing script (a number form, or
+some script's whole file name) that is one of the run's scripts. Otherwise the
+run is refused, naming the fault and the script:
+`/ci --inject fail:test-5 test-3` is refused, since test-5 is not one of the
+run's scripts. A `leak`, `image-drift` or `kill` shard number must lie from 1
+to the effective N, so `/ci --inject kill:2 test-3` is refused too.
+
+A selective run is never a gate result. Its verdict shape is in Verdict file
+format below.
+
 ### Scenario helper
 
 `tests/integration/lib/scenario.sh` is sourced by Test 0 and Tests 5
