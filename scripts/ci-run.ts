@@ -4767,7 +4767,7 @@ export async function takeAdmissionLock(lockDir: string, holder: Owner, clock: R
 // in the lock directory whose name is not the reservation name in question.
 
 /** What a reservation records for one run: its owner, N, the per-shard cap and the run kind (b.uqm SR-6.2). */
-export interface ReservationSpec {
+export interface ReservationRequest {
   readonly owner: Owner
   /** N. */
   readonly shards: number
@@ -4777,7 +4777,7 @@ export interface ReservationSpec {
 }
 
 /** The reservation a spec gives: memory N × the cap, CPUs `CPUS_PER_SHARD` × N (b.uqm SR-6.2). */
-export function buildReservation(spec: ReservationSpec): Reservation {
+export function buildReservation(spec: ReservationRequest): Reservation {
   return {
     version: RESERVATION_FORMAT_VERSION,
     runId: spec.owner.runId,
@@ -4798,7 +4798,7 @@ export function buildReservation(spec: ReservationSpec): Reservation {
  * write leaves no reservation-named file of its own and removes its temporary
  * file where it can. The caller holds the lock and decides how the run ends.
  */
-export function writeReservation(lockDir: string, spec: ReservationSpec): WriteResult {
+export function writeReservation(lockDir: string, spec: ReservationRequest): WriteResult {
   const fileName = reservationFileName(spec.owner)
   let text: string
   try {
@@ -4913,6 +4913,381 @@ export function readReservations(lockDir: string, probe: OwnerLivenessProbe): Re
     else bad.push({ fileName, owner, ownerAlive, reason: entry.reason })
   }
   return { kind: 'listed', valid, bad }
+}
+
+// --- 9/T3 (E5 T3): the sweep and the image-removal primitives ---
+//
+// The image-removal primitives (b.uqm SR-9.3), which E8's cleanup reuses, and
+// the sweep of dead runs' leftovers (b.uqm SR-6.4), which E13 calls at step 7
+// under the lock.
+//
+// Only two kinds of image removal exist, both held here:
+// - `removeRunPrivateTag`: one run-private tag removed by its name, the tag
+//   built from an owner and a role, so it can never be an ID, a digest or a
+//   tag of any other shape;
+// - `removeOwnerUntaggedImages`: a listing of untagged images carrying exactly
+//   one owner label, then, only when it found one, a prune of untagged images
+//   filtered on that label, retried `PRUNE_RETRIES` times `PRUNE_RETRY_INTERVAL_MS`
+//   apart on the injected clock while Docker answers it is already running.
+// Neither forces. Each writes its failure to the runner log and returns the
+// cleanup-failure line (`RunState.cleanupFailures`); none throws, and a runner
+// log sink that throws loses only its line.
+//
+// The sweep lists (`listSweepLeftovers`), selects (`selectSweepLeftovers`,
+// pure) and removes (`sweepLeftovers`) in the fixed order: containers,
+// reservations, tags, untagged images. It never refuses the run, and touches
+// no file but dead owners' reservations in the lock directory: never the
+// system temp directory nor any run directory.
+
+// E6's 10/T3 declares these same two constants; whichever lane merges second deletes its copy (E6's is kept).
+/** The label `/ci-live`'s containers carry, as `cscb-live=1`; the sweep never touches such a container (b.uqm SR-6.4). */
+export const CI_LIVE_CONTAINER_LABEL = 'cscb-live'
+/** The `cscb-live` label's value on `/ci-live`'s containers. */
+export const CI_LIVE_CONTAINER_LABEL_VALUE = '1'
+
+/** Writes a cleanup-failure line to the runner log; a sink that throws loses only this line, so no failure is thrown past the caller. */
+function logCleanupFailure(log: RunnerLogSink, line: string): string {
+  try {
+    log(line)
+  } catch {
+    // The line is still returned and listed; the log's own failure is not the sweep's.
+  }
+  return line
+}
+
+/** A run-private tag removal's outcome: removed, already gone (no failure), or failed with its cleanup-failure line, already logged. */
+export type RunPrivateTagRemoval =
+  | {
+      readonly kind: 'removed'
+    }
+  | {
+      readonly kind: 'absent'
+    }
+  | {
+      readonly kind: 'failed'
+      /** The cleanup-failure line, already written to the runner log; the caller lists it (`RunState.cleanupFailures`). */
+      readonly line: string
+    }
+
+/**
+ * Removes one run-private tag by its name (b.uqm SR-9.3, SR-6.4): the tag
+ * `cscb-ci-run:<RUN_ID>-<PID>-<role>` built from `tag`'s owner and role,
+ * through E1's tag-removal form, never forced. Docker deletes the image with
+ * its last tag when no container uses it (b.uqm SR-23.6). A tag Docker does
+ * not know is absent, not a failure. Any other failure is written to the
+ * runner log as `removing image tag <tag> failed: <error>` and returned.
+ */
+export async function removeRunPrivateTag(docker: DockerContext, tag: RunTag, log: RunnerLogSink): Promise<RunPrivateTagRemoval> {
+  const name = formatRunTag(tag.owner, tag.role)
+  const removed = await removeImageTag(docker, name)
+  if (removed.ok) return { kind: 'removed' }
+  if (removed.exitCode !== null && removed.error.includes(DOCKER_NO_SUCH_IMAGE_TEXT)) return { kind: 'absent' }
+  return { kind: 'failed', line: logCleanupFailure(log, `removing image tag ${name} failed: ${removed.error}`) }
+}
+
+/** The filters of the listing a prune needs: untagged images carrying exactly this owner label value. */
+export function ownerUntaggedImageFilters(ownerLabelValue: string): ImageListFilter[] {
+  return [{ kind: 'dangling' }, { kind: 'label', key: OWNER_LABEL, value: ownerLabelValue }]
+}
+
+/** An owner's untagged-image removal: none found (no prune made), pruned (after `tries` tries), or failed with its cleanup-failure line, already logged. */
+export type OwnerUntaggedImageRemoval =
+  | {
+      readonly kind: 'none-found'
+    }
+  | {
+      readonly kind: 'pruned'
+      /** The prune tries made, 1 to `PRUNE_RETRIES` + 1. */
+      readonly tries: number
+    }
+  | {
+      readonly kind: 'failed'
+      /** The cleanup-failure line, already written to the runner log; the caller lists it (`RunState.cleanupFailures`). */
+      readonly line: string
+    }
+
+/**
+ * Removes the untagged images carrying exactly the owner label
+ * `cscb-ci-owner=<ownerLabelValue>` (b.uqm SR-9.3, SR-6.4); E8 passes its own
+ * owner's `formatOwner` text, the sweep a dead owner's label value as found.
+ * - It lists the untagged images with exactly that label first. When the
+ *   listing finds none, nothing more is done; when it fails, no prune is
+ *   made, and the failure is `listing untagged images labelled
+ *   cscb-ci-owner=<value> failed: <error>`.
+ * - Only after a listing that found one does it prune untagged images
+ *   filtered on that one label (no `--all`; its `--force` only skips the
+ *   prompt). A prune that leaves an image a container uses has not failed.
+ * - A prune Docker refuses as already running is tried again
+ *   `PRUNE_RETRY_INTERVAL_MS` after the refused try, at most `PRUNE_RETRIES`
+ *   times, on `clock`. Only when every try is refused is it a failure:
+ *   `pruning untagged images labelled cscb-ci-owner=<value> failed: refused
+ *   as already running on all <tries> tries: <error>`. Any other prune failure
+ *   is `pruning untagged images labelled cscb-ci-owner=<value> failed: <error>`,
+ *   with no retry.
+ * Every failure is written to the runner log and returned; none is thrown.
+ */
+export async function removeOwnerUntaggedImages(
+  docker: DockerContext,
+  ownerLabelValue: string,
+  clock: RunnerClock,
+  log: RunnerLogSink,
+): Promise<OwnerUntaggedImageRemoval> {
+  const labelText = `${OWNER_LABEL}=${ownerLabelValue}`
+  const listed = await listImages(docker, ownerUntaggedImageFilters(ownerLabelValue))
+  if (!listed.ok) return { kind: 'failed', line: logCleanupFailure(log, `listing untagged images labelled ${labelText} failed: ${listed.error}`) }
+  const found = listed.value.some((image) => image.tags.length === 0 && image.ownerLabel === ownerLabelValue)
+  if (!found) return { kind: 'none-found' }
+  const pruneLine = `pruning untagged images labelled ${labelText} failed`
+  for (let tries = 1; ; tries++) {
+    const outcome = await pruneUntaggedImages(docker, ownerLabelValue)
+    if (outcome.kind === 'done') return { kind: 'pruned', tries }
+    if (outcome.kind === 'failed') return { kind: 'failed', line: logCleanupFailure(log, `${pruneLine}: ${outcome.error}`) }
+    if (tries > PRUNE_RETRIES) {
+      return { kind: 'failed', line: logCleanupFailure(log, `${pruneLine}: refused as already running on all ${tries} tries: ${outcome.error}`) }
+    }
+    await clockDelay(clock, PRUNE_RETRY_INTERVAL_MS)
+  }
+}
+
+/** What the sweep's listings found: every container (stopped ones included) with its labels, the reservations beside the lock, every image carrying a `cscb-ci-run` tag, and every untagged image carrying the owner label. */
+export interface SweepListings {
+  readonly containers: DockerAnswer<readonly ContainerState[]>
+  readonly reservations: ReservationListing
+  readonly runTaggedImages: DockerAnswer<readonly ImageListEntry[]>
+  readonly ownerLabelledUntaggedImages: DockerAnswer<readonly ImageListEntry[]>
+}
+
+/** The filters of the sweep's tag listing: images with a tag in the `cscb-ci-run` repository. */
+export function runTaggedImageFilters(): ImageListFilter[] {
+  return [{ kind: 'reference', pattern: RUN_TAG_REPOSITORY }]
+}
+
+/** The filters of the sweep's untagged-image listing: untagged images carrying the owner label, whatever its value. */
+export function ownerLabelledUntaggedImageFilters(): ImageListFilter[] {
+  return [{ kind: 'dangling' }, { kind: 'label', key: OWNER_LABEL, value: null }]
+}
+
+/**
+ * The sweep's listings (b.uqm SR-6.4), through E1's docker forms and T2's
+ * reservation reader: every container with its labels (`--all`), the
+ * reservations in `lockDir`, every image carrying a `cscb-ci-run` tag, and
+ * every untagged image carrying the owner label. It removes nothing; a failed
+ * listing is answered, not thrown.
+ */
+export async function listSweepLeftovers(docker: DockerContext, lockDir: string, probe: OwnerLivenessProbe): Promise<SweepListings> {
+  const containers = await listContainers(docker)
+  const reservations = readReservations(lockDir, probe)
+  const runTaggedImages = await listImages(docker, runTaggedImageFilters())
+  const ownerLabelledUntaggedImages = await listImages(docker, ownerLabelledUntaggedImageFilters())
+  return { containers, reservations, runTaggedImages, ownerLabelledUntaggedImages }
+}
+
+/** A container the sweep removes: a `cscb-ci=1` container whose owner is dead, or whose owner label is missing or malformed (owner null). */
+export interface SweptContainer {
+  readonly id: string
+  readonly name: string
+  /** Whether it was running when listed: a running one is killed with SIGKILL before its removal. */
+  readonly running: boolean
+  readonly owner: Owner | null
+}
+
+/** A reservation file the sweep removes: valid or bad, its owner (read from its file name) dead. */
+export interface SweptReservation {
+  readonly fileName: string
+  readonly owner: Owner
+}
+
+/** The cleanup-failure line of each failed sweep listing (not yet logged); null for a listing that succeeded. */
+export interface SweepListingFailures {
+  readonly containers: string | null
+  readonly reservations: string | null
+  readonly tags: string | null
+  readonly untaggedImages: string | null
+}
+
+/** What the sweep removes, in its order, and the cleanup-failure lines of its failed listings (not yet logged). A failed listing selects nothing of its kind. */
+export interface SweepPlan {
+  readonly containers: readonly SweptContainer[]
+  readonly reservations: readonly SweptReservation[]
+  /** Dead owners' run-private tags, each once, in tag order. */
+  readonly tags: readonly RunTag[]
+  /** The owner-label values of untagged images whose owner is dead or malformed, each once, in value order. */
+  readonly ownerLabelValues: readonly string[]
+  readonly listingFailures: SweepListingFailures
+}
+
+/**
+ * The sweep's selection (b.uqm SR-6.4, SR-6.3): pure but for liveness, read
+ * through `probe`. It selects:
+ * - `cscb-ci=1` containers whose owner is dead, running or not, a missing or
+ *   malformed owner label counting as dead; never a `cscb-live=1` container
+ *   nor one without `cscb-ci=1`;
+ * - reservations, valid or bad, whose owner is dead, as T2's reader judged it;
+ *   files that are not reservations never appear;
+ * - tags of exactly the run-private shape whose owner is dead; never a tag of
+ *   another shape (`cscb-ci:latest`, `cscb-ci-base:v6`, `cscb-ci-live:latest`,
+ *   `cscb-ci-l5:m5`, a `cscb-ci-run:` tag that does not parse);
+ * - the owner-label values of untagged images whose owner is dead or whose
+ *   label is malformed; never a tagged image nor one without the label.
+ * Nothing of a live owner is ever selected.
+ */
+export function selectSweepLeftovers(listings: SweepListings, probe: OwnerLivenessProbe): SweepPlan {
+  const containers: SweptContainer[] = []
+  if (listings.containers.ok) {
+    for (const container of listings.containers.value) {
+      if (labelValue(container.labels, CI_LIVE_CONTAINER_LABEL) === CI_LIVE_CONTAINER_LABEL_VALUE) continue
+      const judged = containerLabelOwner(container.labels, probe)
+      if (judged.kind !== 'dead') continue
+      containers.push({ id: container.id, name: container.name, running: container.running, owner: judged.owner })
+    }
+  }
+
+  const reservations: SweptReservation[] = []
+  if (listings.reservations.kind === 'listed') {
+    const dead = [...listings.reservations.valid, ...listings.reservations.bad].filter((entry) => !entry.ownerAlive)
+    for (const entry of dead.sort((a, b) => compareText(a.fileName, b.fileName))) reservations.push({ fileName: entry.fileName, owner: entry.owner })
+  }
+
+  const tags = new Map<string, RunTag>()
+  if (listings.runTaggedImages.ok) {
+    for (const image of listings.runTaggedImages.value) {
+      for (const tag of image.tags) {
+        if (tags.has(tag)) continue
+        const parsed = parseRunTag(tag)
+        if (parsed !== null && !isOwnerAlive(parsed.owner, probe)) tags.set(tag, parsed)
+      }
+    }
+  }
+
+  const ownerLabelValues = new Set<string>()
+  if (listings.ownerLabelledUntaggedImages.ok) {
+    for (const image of listings.ownerLabelledUntaggedImages.value) {
+      if (image.tags.length > 0 || image.ownerLabel === null || ownerLabelValues.has(image.ownerLabel)) continue
+      if (imageLabelOwner({ [OWNER_LABEL]: image.ownerLabel }, probe).kind === 'dead') ownerLabelValues.add(image.ownerLabel)
+    }
+  }
+
+  return {
+    containers,
+    reservations,
+    tags: [...tags.keys()].sort(compareText).map((tag) => tags.get(tag)!),
+    ownerLabelValues: [...ownerLabelValues].sort(compareText),
+    listingFailures: {
+      containers: listings.containers.ok ? null : `listing ${CI_LABEL}=${CI_LABEL_VALUE} containers for the sweep failed: ${listings.containers.error}`,
+      reservations: listings.reservations.kind === 'listed' ? null : `listing reservations for the sweep failed: ${listings.reservations.error}`,
+      tags: listings.runTaggedImages.ok ? null : `listing ${RUN_TAG_REPOSITORY} image tags for the sweep failed: ${listings.runTaggedImages.error}`,
+      untaggedImages: listings.ownerLabelledUntaggedImages.ok
+        ? null
+        : `listing untagged images labelled ${OWNER_LABEL} for the sweep failed: ${listings.ownerLabelledUntaggedImages.error}`,
+    },
+  }
+}
+
+/** Code-unit order of two texts. */
+function compareText(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0
+}
+
+/** A swept container's removal: removed, already gone (no failure), or failed with its cleanup-failure line, already logged. */
+export type SweptContainerRemoval =
+  | {
+      readonly kind: 'removed'
+    }
+  | {
+      readonly kind: 'absent'
+    }
+  | {
+      readonly kind: 'failed'
+      readonly line: string
+    }
+
+/**
+ * Removes one swept container (b.uqm SR-6.4): a running one is killed with
+ * SIGKILL first, since E1's removal never forces; the removal is made even
+ * when the kill failed (the container may have stopped meanwhile). A container
+ * Docker no longer knows is absent. A failed removal is written to the runner
+ * log as `removing container <name> (<id>) failed: <error>`, with
+ * ` (its kill failed first: <error>)` added when the kill failed too.
+ */
+export async function removeSweptContainer(docker: DockerContext, container: SweptContainer, log: RunnerLogSink): Promise<SweptContainerRemoval> {
+  let killError: string | null = null
+  if (container.running) {
+    const killed = await killContainer(docker, container.id, 'SIGKILL')
+    if (!killed.ok) {
+      if (killed.exitCode !== null && killed.error.includes(DOCKER_NO_SUCH_CONTAINER_TEXT)) return { kind: 'absent' }
+      killError = killed.error
+    }
+  }
+  const removed = await removeContainer(docker, container.id)
+  if (removed.ok) return { kind: 'removed' }
+  if (removed.exitCode !== null && removed.error.includes(DOCKER_NO_SUCH_CONTAINER_TEXT)) return { kind: 'absent' }
+  const killNote = killError === null ? '' : ` (its kill failed first: ${killError})`
+  return { kind: 'failed', line: logCleanupFailure(log, `removing container ${container.name} (${container.id}) failed: ${removed.error}${killNote}`) }
+}
+
+/** What the sweep needs: the docker context, the lock directory, the liveness probe, the injected clock (for the prune retry) and the runner log. */
+export interface SweepContext {
+  readonly docker: DockerContext
+  readonly lockDir: string
+  readonly probe: OwnerLivenessProbe
+  readonly clock: RunnerClock
+  readonly log: RunnerLogSink
+}
+
+/**
+ * The sweep of dead runs' leftovers (b.uqm SR-6.4), which E13 runs at step 7,
+ * under the lock and before the readings. It lists and selects
+ * (`listSweepLeftovers`, `selectSweepLeftovers`), then removes in this order:
+ * 1. the selected containers (`removeSweptContainer`);
+ * 2. the selected reservation files (T2's `removeReservation`);
+ * 3. the selected tags (`removeRunPrivateTag`);
+ * 4. for each selected owner-label value, its untagged images
+ *    (`removeOwnerUntaggedImages`, with its listing and prune retry).
+ * A failed listing is written to the runner log at its step's place and skips
+ * that step only; a failed removal is written to the log and the sweep goes
+ * on. It answers every cleanup-failure line, in order (`RunState.cleanupFailures`),
+ * and never refuses the run nor throws.
+ */
+export async function sweepLeftovers(context: SweepContext): Promise<readonly string[]> {
+  const { docker, lockDir, probe, clock } = context
+  // T2's remover logs without a guard; this sink makes every log write safe.
+  const log: RunnerLogSink = (line) => {
+    logCleanupFailure(context.log, line)
+  }
+  const failures: string[] = []
+  const listingFailed = (line: string | null): void => {
+    if (line === null) return
+    log(line)
+    failures.push(line)
+  }
+  const listings = await listSweepLeftovers(docker, lockDir, probe)
+  const plan = selectSweepLeftovers(listings, probe)
+
+  listingFailed(plan.listingFailures.containers)
+  for (const container of plan.containers) {
+    const removal = await removeSweptContainer(docker, container, log)
+    if (removal.kind === 'failed') failures.push(removal.line)
+  }
+
+  listingFailed(plan.listingFailures.reservations)
+  for (const reservation of plan.reservations) {
+    const removal = removeReservation(lockDir, reservation.owner, log)
+    if (removal.kind === 'failed') failures.push(removal.line)
+  }
+
+  listingFailed(plan.listingFailures.tags)
+  for (const tag of plan.tags) {
+    const removal = await removeRunPrivateTag(docker, tag, log)
+    if (removal.kind === 'failed') failures.push(removal.line)
+  }
+
+  listingFailed(plan.listingFailures.untaggedImages)
+  for (const value of plan.ownerLabelValues) {
+    const removal = await removeOwnerUntaggedImages(docker, value, clock, log)
+    if (removal.kind === 'failed') failures.push(removal.line)
+  }
+
+  return failures
 }
 
 // ---------------------------------------------------------------------------
