@@ -1215,6 +1215,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
         [`${variable} the root, /`, { [variable]: 'root' }],
       ]),
       [`${TMPDIR_VAR} with repeated slashes, inside and trailing`, { [TMPDIR_VAR]: 'repeated-slashes' }],
+      [`${TMP_VAR} with repeated slashes, inside and trailing`, { [TMP_VAR]: 'repeated-slashes' }],
       [`${TEMP_VAR} with repeated slashes, inside and trailing`, { [TEMP_VAR]: 'repeated-slashes' }],
       [`${TMPDIR_VAR} first: all three set`, { [TMPDIR_VAR]: 'set', [TMP_VAR]: 'set', [TEMP_VAR]: 'set' }],
       [`${TMPDIR_VAR} first: the root before a set ${TMP_VAR}`, { [TMPDIR_VAR]: 'root', [TMP_VAR]: 'set' }],
