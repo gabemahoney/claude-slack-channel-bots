@@ -54,6 +54,8 @@ import { constants as osConstants } from 'node:os'
 import { join, resolve } from 'node:path'
 // E1 T3's file writes: whole-file replacement and the runner log.
 import { appendFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+// E1 T5's step 1: the run directory, created exclusively, mode 0700.
+import { chmodSync, mkdirSync } from 'node:fs'
 
 // ---------------------------------------------------------------------------
 // 1. Entry and dependencies (E1)
@@ -226,8 +228,6 @@ const REAL_PROC_ROOT = '/proc'
 const REAL_MOUNTINFO_FILE = '/proc/self/mountinfo'
 /** The exit status `SpawnResult` gives a child that could not be started (its PID null), as a shell gives one it cannot find; the spawn recorder imitates it (b.uqm SR-21.4). */
 export const SPAWN_FAILED_EXIT_STATUS = 127
-/** The exit status base for a child a signal ended, as a shell reports it (SIGKILL: 137). */
-const SIGNAL_EXIT_STATUS_BASE = 128
 /** The cgroup v2 membership line's prefix in `/proc/<pid>/cgroup`. */
 const CGROUP_V2_LINE_PREFIX = '0::'
 
@@ -698,6 +698,8 @@ export const RUNNER_PATH_SUFFIX = 'scripts/ci-run.ts'
 export const USAGE_EXIT_STATUS = 64
 /** The exit status of a refused run. The SRD gives none and nothing reads it: the reader judges a run by its files (b.uqm SR-5.8). */
 export const REFUSAL_EXIT_STATUS = 2
+/** The exit status of a runner that finds something at its run directory's path, meets an error, or (until E13) stops after validation (b.uqm SR-5.1, SR-5.4). */
+export const FAILURE_EXIT_STATUS = 1
 
 // --- Name patterns ---
 
@@ -732,6 +734,28 @@ export const GH_PERSONAL_CONFIG_SUBPATH = '.config/gh-personal'
 export const DOCKER_NO_SUCH_IMAGE_TEXT = 'No such image'
 /** The text in Docker's answer to a container inspect naming a container it does not have: the container is gone (b.uqm SR-6.4, SR-6.5). */
 export const DOCKER_NO_SUCH_CONTAINER_TEXT = 'No such container'
+
+// --- Worktree paths and the prerequisite keyword (E1 T7) ---
+
+/** The directory holding the scripts, relative to the worktree root (b.uqm Terms, SR-2.3). */
+export const INTEGRATION_DIR_PATH = 'tests/integration'
+/** The duration table, relative to the worktree root (b.uqm SR-4.1). */
+export const DURATION_TABLE_PATH = 'tests/ci-durations.tsv'
+/** The test image's Dockerfile, relative to the worktree root; its `FROM` line names the base image (b.uqm SR-9.2, SR-9.3). */
+export const TEST_DOCKERFILE_PATH = 'docker/Dockerfile.test'
+/** The base image's Dockerfile, relative to the worktree root; it sets `ARG AD_VERSION` (b.uqm SR-9.2). */
+export const BASE_DOCKERFILE_PATH = 'docker/Dockerfile.test.base'
+/** A prerequisite line's keyword, lowercase, after the `#` and its optional spaces or tabs: the bare keyword, not a `# ci-requires:` prefix (b.uqm SR-3.1). */
+export const CI_REQUIRES_KEYWORD = 'ci-requires:'
+
+// --- Modes and child exits (E1 T3, T5) ---
+
+/** The mode of the run directory and of each shard directory, owner-only (b.uqm SR-5.1, SR-5.9). */
+export const RUN_DIR_MODE = 0o700
+/** The mode of a file the runner writes whole or appends to, when it creates it, owner-only (b.uqm SR-5.1). */
+export const WRITTEN_FILE_MODE = 0o600
+/** The exit status base for a child a signal ended, as a shell reports it: 128 + the signal number (SIGKILL: 137) (b.uqm SR-5.6). */
+export const SIGNAL_EXIT_STATUS_BASE = 128
 
 // ---------------------------------------------------------------------------
 // 3. Data model (E1)
@@ -2700,9 +2724,6 @@ export function parseRunTag(tag: string): RunTag | null {
 
 // --- 5/T3 (E1 T3): reservation and results formats, verdict write, result-file reading, in-shard records, runner log ---
 
-/** The mode of a file the runner writes whole or appends to, when it creates it. */
-const WRITTEN_FILE_MODE = 0o600
-
 /** A write's outcome: done, or failed with its error on one line. */
 export type WriteResult =
   | {
@@ -4353,6 +4374,147 @@ export async function pruneUntaggedImages(docker: DockerContext, owner: string):
 
 // --- 17/T5 (E1 T5): run-sequence steps 1–2: the run directory, the status file, the log's first line, the argument stage ---
 
+/** A run from the end of step 1 on: the run directory exists and holds the status file and the runner log's first line. */
+export interface RunContext {
+  readonly runId: string
+  /** The run directory, as `runDirPath` derives it from the injected environment (b.uqm SR-5.1). */
+  readonly runDir: string
+  /** The `/ci` arguments as given (b.uqm SR-2.1). */
+  readonly args: readonly string[]
+  /** The runner log: everything the run reports goes through it (b.uqm SR-5.4). */
+  readonly log: RunnerLogWriter
+  /** What every status write of the run shares; E13 replaces it when the deadline moves (b.uqm SR-5.5). */
+  basis: StatusBasis
+}
+
+/** The `usage: ` line of a runner whose first argument is missing or is not a RUN_ID, naming the argument (b.uqm SR-5.1). */
+export function usageLine(firstArgument: string | undefined): string {
+  const why = firstArgument === undefined ? 'the RUN_ID is missing' : `${shownArgument(firstArgument)} is not a RUN_ID`
+  return `${USAGE_PREFIX}bun ${RUNNER_PATH_SUFFIX} <RUN_ID> [/ci arguments]: ${why}: a RUN_ID is <YYYYMMDD>t<HHMMSS>z-<suffix>, a real UTC moment, then 8 lowercase letters or digits`
+}
+
+/** The line of a runner that finds something already at its run directory's path, naming the path (b.uqm SR-5.1). */
+export function existingPathLine(path: string): string {
+  return `ci-run: ${shownArgument(path)} already exists: a run directory is never reused; launch the run again with a new RUN_ID`
+}
+
+/** The line of a runner whose run directory could not be created for any other reason, naming the path. */
+export function runDirectoryFailedLine(path: string, error: string): string {
+  return `ci-run: creating the run directory ${shownArgument(path)} failed: ${error}`
+}
+
+/** What creating the run directory found: created, something already at the path, or another failure on one line. */
+export type RunDirectoryCreation =
+  | {
+      readonly kind: 'created'
+    }
+  | {
+      readonly kind: 'exists'
+    }
+  | {
+      readonly kind: 'failed'
+      readonly error: string
+    }
+
+/**
+ * Creates the run directory exclusively (b.uqm SR-5.1): one `mkdir`, never
+ * recursive, which fails when anything is at the path (a file, a directory or
+ * a symlink, dangling or not) and never follows or replaces it, so nothing is
+ * written there.
+ */
+export function createRunDirectory(path: string): RunDirectoryCreation {
+  try {
+    mkdirSync(path, { mode: RUN_DIR_MODE })
+    return { kind: 'created' }
+  } catch (err) {
+    return errnoCode(err) === 'EEXIST' ? { kind: 'exists' } : { kind: 'failed', error: dependencyErrorText(err) }
+  }
+}
+
+/**
+ * The rest of run-sequence step 1 once `createRunDirectory` has created the
+ * run directory (b.uqm SR-5.1, SR-5.3, SR-5.4): sets its mode to exactly 0700,
+ * whatever the umask took from `mkdir`'s; takes the run's start from the
+ * clock; writes the status file in phase `build` with the deadline at start + B
+ * (b.uqm SR-5.2, SR-5.5); then writes the runner log's first line. Throws on a
+ * failure, before the first line is written; main then writes the first line
+ * and the error to the log (b.uqm SR-5.4).
+ */
+export function beginRun(deps: RunnerDeps, runId: string, runDir: string, args: readonly string[], log: RunnerLogWriter): RunContext {
+  chmodSync(runDir, RUN_DIR_MODE)
+  const startMs = deps.clock.now()
+  const basis: StatusBasis = {
+    runId,
+    pid: deps.pid,
+    startMs,
+    deadline: statusDeadline(startMs, BUILD_ALLOWANCE_MINUTES),
+  }
+  const written = writeStatusFile(runDir, buildStatus(basis, 'build'))
+  if (!written.ok) throw new Error(written.error)
+  log(formatRunnerLogFirstLine(runId, deps.pid, args))
+  return { runId, runDir, args, log, basis }
+}
+
+/** Validation stage 1's outcome: the invocation, or the refusal its bad arguments give. */
+export type ArgumentStage =
+  | {
+      readonly ok: true
+      readonly invocation: Invocation
+    }
+  | {
+      readonly ok: false
+      readonly refusal: Refusal
+    }
+
+/**
+ * Validation stage 1, the arguments (b.uqm SR-2.2, SR-2.4, SR-2.6): the first
+ * bad argument's reason is the refusal's summary, and each other bad
+ * argument's reason follows as one detail line, in argument order. The
+ * refusal has no kind (b.uqm SR-5.8).
+ */
+export function argumentStage(args: readonly string[]): ArgumentStage {
+  const parsed = parseCiArguments(args)
+  if (parsed.ok) return { ok: true, invocation: parsed.invocation }
+  const [first, ...rest] = parsed.failures
+  if (first === undefined) throw new Error('argumentStage: the arguments were refused with no bad argument')
+  return {
+    ok: false,
+    refusal: buildRefusal(
+      null,
+      first.reason,
+      rest.map((failure) => failure.reason),
+    ),
+  }
+}
+
+/**
+ * The error text of a valid invocation, which stops after validation until
+ * E13 builds the rest of the run sequence. It is written as one `error: `
+ * line, never a `NOT RUN: ` line; E13 removes it with the stop.
+ */
+export const STOPPED_AFTER_VALIDATION_TEXT =
+  'the run stops after validation: steps 3 to 13 of the run sequence are not built yet, so nothing was checked, packed, locked, reserved or built'
+
+/**
+ * The run sequence from step 2 on (b.uqm SR-5.3), once step 1 is done.
+ * Answers main's exit status. A refusal is recorded by `recordRefusal` as the
+ * run's last act. E2 adds validation stages 2–8 after stage 1; E13 replaces
+ * the stop after validation with steps 3–13.
+ */
+export async function runSequence(deps: RunnerDeps, run: RunContext): Promise<number> {
+  // Step 2, validation stage 1: the arguments (b.uqm SR-2.6).
+  const stage = argumentStage(run.args)
+  if (!stage.ok) return recordRefusal(run, stage.refusal)
+  // E2: validation stages 2–8 go here, each refusing through `recordRefusal`;
+  // they read the worktree through `deps.worktreeRoot` (E1 uses no member of
+  // `deps` here).
+  // E1's stop after validation. E13 replaces it, from here on, with steps
+  // 3–13. Until then a valid invocation touches no docker, lock, cgroup or
+  // reservation: it writes one error line to the runner log and exits 1.
+  run.log.error(STOPPED_AFTER_VALIDATION_TEXT)
+  return FAILURE_EXIT_STATUS
+}
+
 // --- 17/E13: the rest of the run sequence, stops and the end of run ---
 
 // ---------------------------------------------------------------------------
@@ -4361,9 +4523,121 @@ export async function pruneUntaggedImages(docker: DockerContext, owner: string):
 
 // --- 18/T5 (E1 T5): main, the refusal recorder and error capture ---
 
+/**
+ * Records a refusal as the run's last act (b.uqm SR-5.8): writes its
+ * `NOT RUN: <reason>` line and each detail line to the runner log, then
+ * replaces the status file with phase `refused` and the refusal. Nothing is
+ * written after it. Answers the exit status main returns: `REFUSAL_EXIT_STATUS`,
+ * or `FAILURE_EXIT_STATUS` when the status write failed, its error then in the
+ * log. A caller first releases the lock and its reservation and removes the
+ * containers, tags and images the run made (E5, E8, E13). Validation stage 1
+ * calls it here, E2's stages 2–8 and E13's refusals likewise.
+ */
+export function recordRefusal(run: RunContext, refusal: Refusal): number {
+  run.log(refusalLine(refusal))
+  for (const detail of refusal.details) run.log(detail)
+  const written = writeStatusFile(run.runDir, buildRefusedStatus(run.basis, refusal))
+  if (written.ok) return REFUSAL_EXIT_STATUS
+  run.log.error(written.error, 'recording the refusal')
+  return FAILURE_EXIT_STATUS
+}
+
+/** What main tells its caller as it runs. */
+export interface MainOptions {
+  /** Told the runner log once step 1 has written its first line, so the entry block writes an uncaught error there (b.uqm SR-5.4). */
+  readonly onRunLog?: (log: RunnerLogWriter) => void
+}
+
+/**
+ * The runner (b.uqm SR-5.1, SR-5.3, SR-5.4), driven in process through its
+ * dependencies. `argv` is the RUN_ID, then the `/ci` arguments as given.
+ * Resolves with the exit status and never rejects; only the entry block
+ * exits the process.
+ *
+ * - A first argument that is missing or not a RUN_ID: one `usage: ` line on
+ *   standard error, nothing created, `USAGE_EXIT_STATUS` (64).
+ * - Anything already at the run directory's path: one line on standard error
+ *   naming the path, nothing written there, `FAILURE_EXIT_STATUS` (1); so too
+ *   when the run directory cannot be created at all.
+ * - Otherwise step 1, then `runSequence`: a refusal gives
+ *   `REFUSAL_EXIT_STATUS` (2); until E13 a valid invocation gives 1.
+ * - Any error met once the run directory exists is written to the runner log
+ *   (after its first line) before main resolves with 1.
+ */
+export async function main(argv: readonly string[], deps: RunnerDeps, options: MainOptions = {}): Promise<number> {
+  const stderrLine = (line: string): void => {
+    try {
+      deps.writeStderr(`${line}\n`)
+    } catch {
+      // Standard error is the last place left to report to.
+    }
+  }
+  const [runId, ...args] = argv
+  if (runId === undefined || !isRunId(runId)) {
+    stderrLine(usageLine(runId))
+    return USAGE_EXIT_STATUS
+  }
+  let runDir: string
+  let created: RunDirectoryCreation
+  try {
+    runDir = runDirPath(deps.env, runId)
+    created = createRunDirectory(runDir)
+  } catch (err) {
+    stderrLine(`ci-run: ${dependencyErrorText(err)}`)
+    return FAILURE_EXIT_STATUS
+  }
+  if (created.kind === 'exists') {
+    stderrLine(existingPathLine(runDir))
+    return FAILURE_EXIT_STATUS
+  }
+  if (created.kind === 'failed') {
+    stderrLine(runDirectoryFailedLine(runDir, created.error))
+    return FAILURE_EXIT_STATUS
+  }
+  const logPath = join(runDir, RUNNER_LOG_FILE_NAME)
+  const log = createRunnerLog(logPath, {
+    onAppendError: (error) => stderrLine(`ci-run: appending to ${shownArgument(logPath)} failed: ${error}`),
+  })
+  let run: RunContext | null = null
+  try {
+    run = beginRun(deps, runId, runDir, args, log)
+    options.onRunLog?.(log)
+    return await runSequence(deps, run)
+  } catch (err) {
+    if (run === null) log(formatRunnerLogFirstLine(runId, deps.pid, args))
+    log.error(err)
+    return FAILURE_EXIT_STATUS
+  }
+}
+
 // The one main-module entry block: the only top-level statement that is not
 // a declaration, import or export, and the last thing in the file, so every
-// declaration it reaches is already initialised. T5 builds the real
-// dependencies here with `createRealRunnerDeps`, runs main and exits.
+// declaration it reaches is already initialised. It binds the real
+// dependencies, writes an uncaught exception or rejection to the runner log
+// once the run directory exists (to standard error before that), runs main
+// with the process arguments and exits with its status. Nothing here runs on
+// import; the signal traps are E13's (b.uqm SR-1.3, SR-5.4).
 if (import.meta.main) {
+  let runLog: RunnerLogWriter | null = null
+  const fail: (err: unknown, origin: string) => never = (err, origin) => {
+    if (runLog !== null) runLog.error(err, origin)
+    else writeSync(2, `ci-run: ${origin}: ${dependencyErrorText(err)}\n`)
+    process.exit(FAILURE_EXIT_STATUS)
+  }
+  process.on('uncaughtException', (err) => fail(err, 'uncaught exception'))
+  process.on('unhandledRejection', (reason) => fail(reason, 'unhandled rejection'))
+  let deps: RunnerDeps
+  try {
+    deps = createRealRunnerDeps()
+  } catch (err) {
+    fail(err, 'binding the dependencies')
+  }
+  main(process.argv.slice(2), deps, {
+    onRunLog: (log) => {
+      runLog = log
+    },
+  }).then(
+    (status) => process.exit(status),
+    (err: unknown) => fail(err, 'main'),
+  )
 }
