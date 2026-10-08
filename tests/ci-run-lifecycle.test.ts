@@ -1400,6 +1400,3189 @@ describe('E1: ci-run lifecycle', () => {
 // ===========================================================================
 // E8 (t1.t6s.7t): the run's images and tags; E8 adds its cases here
 // ===========================================================================
+//
+// b.uqm SR-9.1 to SR-9.4, SR-19.9 and the E8 part of SR-14.2; AC 27, AC 44.
+// The cases compose E8's functions directly (section 12 of
+// `scripts/ci-run.ts`), in the order E13 will compose them: there is no run
+// sequence before E13. Every case starts from `makeE8Rig`, which wires a
+// constructed worktree, a run directory, the spawn recorder, the fake
+// container interface, the signal recorder and a fake clock into the runner's
+// dependencies, under one `mkdtempSync` root removed in `afterEach`. Non-docker
+// children (npm, git, gh, the base-build step) are answered through the rig's
+// `answer*` helpers; docker through the fake. A run-level stop is the run
+// state's stop record set directly (`rig.recordStop()`), never a signal from
+// the signal source. Credentials are `fakeToken` values. This region's
+// imports are a namespace or aliased with `e8`, so no other region's import can
+// collide with them.
+
+// --- E8 shared setup (T6.S1) ---
+
+import { createHash as e8CreateHash } from 'node:crypto'
+import * as e8Fs from 'node:fs'
+import { tmpdir as e8Tmpdir } from 'node:os'
+import * as e8Path from 'node:path'
+import * as e8Runner from '../scripts/ci-run.ts'
+import * as e8Helper from './test-helpers/ci-run.ts'
+import { assertNoLeak as e8AssertNoLeak, fakeToken as e8FakeToken, writtenFile as e8WrittenFile } from './test-helpers/credentials.ts'
+import { createFakeClock as e8CreateFakeClock, type FakeClock as E8FakeClock } from './test-helpers/fake-clock.ts'
+import { treeSnapshot as e8TreeSnapshot } from './test-helpers/tree-snapshot.ts'
+import { hostSafeChildEnv as e8bHostSafeChildEnv, resolveToolDir as e8bResolveToolDir } from './test-helpers/host-safe-env.ts'
+
+describe('E8: the run\'s images and tags (b.uqm SR-9, SR-19.9, SR-14.2)', () => {
+  type BaseBuildDeps = e8Runner.BaseBuildDeps
+  type DockerContext = e8Runner.DockerContext
+  type Owner = e8Runner.Owner
+  type ReadBackContext = e8Runner.ReadBackContext
+  type RunImagesContext = e8Runner.RunImagesContext
+  type RunLevelStop = e8Runner.RunLevelStop
+  type RunnerLogSink = e8Runner.RunnerLogSink
+  type RunState = e8Runner.RunState
+  type ValidatedRun = e8Runner.ValidatedRun
+  type BuiltWorktree = e8Helper.BuiltWorktree
+  type FakeDocker = e8Helper.FakeDocker
+  type SignalRecorder = e8Helper.SignalRecorder
+  type SpawnAnswer = e8Helper.SpawnAnswer
+  type SpawnRecorder = e8Helper.SpawnRecorder
+  type WorktreeOptions = e8Helper.WorktreeOptions
+
+  const {
+    AD_TAG_PREFIX,
+    AD_VERSION_ARG_PREFIX,
+    adInstallScriptReadArgs,
+    adTagCheckArgs,
+    baseBuildStepArgs,
+    buildRefusal,
+    GH_AUTH_TOKEN_ARGV,
+    ghPersonalConfigDir,
+    initialImageState,
+    NPM_PROGRAM,
+    npmPackArgs,
+    npmPackFailedReason,
+    npmPackNoTarballReason,
+    PACKAGE_DIR_MODE,
+    PACKAGE_DIR_NAME,
+    PACKAGE_TARBALL_MODE,
+    PACKAGE_TARBALL_SUFFIX,
+    packageDirFailedReason,
+    packPackage,
+    RAW_KEY_PREFIX,
+    refusalLine,
+    SHA256_HEX_LENGTH,
+    SPAWN_FAILED_EXIT_STATUS,
+    validateRun,
+  } = e8Runner
+  const { buildWorktree, createFakeDocker, createSignalRecorder, createSpawnRecorder, makeRunDir } = e8Helper
+
+  /** Test data: the run's RUN_ID, of SR-5.1's form. */
+  const E8_RUN_ID = '20261008t130000z-e8run001'
+  /** Test data: the runner's PID. */
+  const E8_RUNNER_PID = 5151
+  /** Test data: the fake clock's start. */
+  const E8_START_MS = Date.UTC(2026, 9, 8, 13, 0, 0)
+  /** The run's owner, `<RUN_ID>-<PID>`: its owner label and run-private tags. */
+  const E8_OWNER: Owner = { runId: E8_RUN_ID, pid: E8_RUNNER_PID }
+  /** The run's secret values, each a `fakeToken` with its own suffix: the key and `GH_TOKEN` in the runner's environment, and the base-build token `gh auth token` answers by default. */
+  const E8_SECRETS = {
+    key: e8FakeToken(RAW_KEY_PREFIX, 'e8-key'),
+    ghToken: e8FakeToken('', 'e8-gh'),
+    baseBuildToken: e8FakeToken('', 'e8-base'),
+  } as const
+  /** Test data: a run-level stop for `rig.recordStop()`, as E13's stop path records one. */
+  const E8_STOP: RunLevelStop = { kind: 'interrupt', signal: 'SIGTERM' }
+  /** Test data: the tarball's file name as `npm pack` names it (`<name>-<version>.tgz`). */
+  const E8_TARBALL_NAME = `e8-test-package-1.2.3${PACKAGE_TARBALL_SUFFIX}`
+  /** Test data: the tarball's bytes, every byte value, so the digest is over binary content. */
+  const E8_TARBALL_BYTES = Uint8Array.from({ length: 1024 }, (_, i) => (i * 7) % 256)
+  /** Test data: what `git show <tag>:install.sh` prints by default. */
+  const E8_INSTALL_SCRIPT_TEXT = '#!/usr/bin/env bash\n# agent-director install script (test data)\n'
+  /** Where `npmPackArgs` puts its destination, read from the builder rather than typed. */
+  const NPM_PACK_DESTINATION_AT = npmPackArgs('<destination>').indexOf('<destination>')
+
+  /** How the scripted `npm pack` behaves (`rig.answerNpmPack`). Default: exit 0, writes `E8_TARBALL_BYTES` as `E8_TARBALL_NAME` into the destination its call names, and prints that name. */
+  interface NpmPackScript {
+    /** The tarball's bytes. */
+    readonly bytes?: string | Uint8Array
+    /** The file name it prints by default and writes at by default. */
+    readonly fileName?: string
+    /** What it leaves at `at`: the tarball (default), nothing, a directory, or a symbolic link to a tarball outside the destination. */
+    readonly writes?: 'tarball' | 'nothing' | 'directory' | 'symlink'
+    /** Where it writes, relative to the destination its call names; default `fileName`. */
+    readonly at?: string
+    /** Its standard output; default `<fileName>\n`. */
+    readonly stdout?: string
+    readonly stderr?: string
+    /** Default 0. */
+    readonly exitCode?: number
+    /** It could not be started: its standard error this text, its exit status `SPAWN_FAILED_EXIT_STATUS`; nothing written. */
+    readonly notStarted?: string
+  }
+
+  /** What a scripted `npm pack` writes when it writes the tarball. */
+  interface NpmPackPlan {
+    /** `<package dir>/<fileName>`. */
+    readonly tarballPath: string
+    readonly bytes: Uint8Array
+  }
+
+  interface E8RigOptions {
+    /** `buildWorktree`'s options; default the repository's real scripts and Dockerfile lines. */
+    readonly worktree?: WorktreeOptions
+    /** Over the default environment (`rig.env`); a variable set to undefined is left out. */
+    readonly env?: Readonly<Record<string, string | undefined>>
+  }
+
+  /** One E8 case's world. */
+  interface E8Rig {
+    /** The case's `mkdtempSync` root, removed in `afterEach`; the spawn recorder's side-effect root. */
+    readonly root: string
+    /** The constructed system temp directory, the environment's `TMPDIR`. */
+    readonly tempDir: string
+    readonly worktree: BuiltWorktree
+    /** `worktree.root`: the runner's `worktreeRoot`, every child's working directory. */
+    readonly worktreeRoot: string
+    /** The run directory, made 0700 in `tempDir` as step 1 makes it (`makeRunDir`). */
+    readonly runDir: string
+    /** `<runDir>/package`, not made: step 5 makes it. */
+    readonly packageDir: string
+    /** The environment's default `CSCB_AD_SRC_DIR`: an empty directory under the root. */
+    readonly adSourceDir: string
+    readonly clock: E8FakeClock
+    /** Records every spawn; `assertNoFailures()` is checked in `afterEach`. */
+    readonly recorder: SpawnRecorder
+    /** The fake container interface over `recorder`, answering every docker form. */
+    readonly docker: FakeDocker
+    /** The runner's `sendSignal`, delivering through `recorder.processes`. */
+    readonly signals: SignalRecorder
+    /** The runner's environment, with its unset variables left out: `TMPDIR`, `HOME`, `ANTHROPIC_API_KEY`, `GH_TOKEN`, `CSCB_AD_SRC_DIR`, then `options.env`. Holds secrets: never pass it to `assertNoLeak`. */
+    readonly env: Readonly<Record<string, string>>
+    readonly owner: Owner
+    /** Every line written to `log`, in order. */
+    readonly logLines: string[]
+    /** The runner-log sink every step gets: it appends to `logLines`, writing no file, so the run directory's snapshot stays the step's own. */
+    readonly log: RunnerLogSink
+    /** A fresh run state: every field empty, `images` from `initialImageState()`. */
+    readonly state: RunState
+    /** Steps 4, 5 and 12's dependencies: `spawn`, `env`, `worktreeRoot`, `clock`, `sendSignal` (also a `PackageDeps` and a `BaseImageDeps`). */
+    readonly deps: BaseBuildDeps
+    /** The docker context: `recorder.spawn`, the environment as children get it, the worktree root. */
+    readonly dockerContext: DockerContext
+    /** E8 T2's context, also cleanup's (`RunImageCleanupContext`): `dockerContext`, `signals.sendSignal`, `owner`, `clock`, `log`. */
+    readonly imagesContext: RunImagesContext
+    /** The read-back's context for a pinned ID: `dockerContext`, `owner`, `log`. */
+    readBackContext(pinnedId: string): ReadBackContext
+    /** E2's validation of the worktree with these `/ci` arguments (default none) and the rig's environment; throws on a refusal. */
+    validate(args?: readonly string[]): ValidatedRun
+    /** Sets the run state's stop record (`E8_STOP` by default), as E13's stop path does; a stop already recorded is kept. */
+    recordStop(stop?: RunLevelStop): void
+    /** Replaces the worktree's `docker/Dockerfile.test` with this text (FROM forms `buildWorktree` cannot make). */
+    writeTestDockerfile(text: string): void
+    /** The base image the worktree's `docker/Dockerfile.test` names now: its first `FROM` line's image, read by the test, not the runner. */
+    baseImageName(): string
+    /** `v<AD_VERSION>`, from the worktree's `docker/Dockerfile.test.base` as it is now; throws when it sets none. */
+    adTag(): string
+    /** Adds the base image (`baseImageName()`) to the fake; answers its ID. */
+    addBaseImage(): string
+    /** Scripts the next `npm pack` into `packageDir` (once); answers where its tarball is and its bytes. */
+    answerNpmPack(script?: NpmPackScript): NpmPackPlan
+    /** Scripts the tag check `git -C <adSourceDir> rev-parse … refs/tags/<adTag()>` (default: exit 0). */
+    answerAdTagCheck(answer?: SpawnAnswer): void
+    /** Scripts `git -C <adSourceDir> show <adTag()>:<install.sh>` (default: exit 0, `E8_INSTALL_SCRIPT_TEXT`). */
+    answerInstallScriptRead(answer?: SpawnAnswer): void
+    /** Scripts `gh auth token`: `personal` answers the lookup with `GH_CONFIG_DIR` at `<HOME>/.config/gh-personal`, `plain` the one without; one left out is unscripted, so its spawn fails loudly. */
+    answerGhToken(answers: { readonly personal?: SpawnAnswer; readonly plain?: SpawnAnswer }): void
+    /** Scripts every prerequisite check of a missing base to pass: the tag, `install.sh`, and the personal `gh auth token` printing `token` (default `E8_SECRETS.baseBuildToken`); `null`: both lookups exit 1, no token. */
+    answerPrerequisites(token?: string | null): void
+    /** Scripts `bash <worktree>/scripts/ci-base-build.sh` (default: exit 0 at once). */
+    answerBaseBuildStep(answer?: SpawnAnswer): void
+  }
+
+  let e8Roots: string[] = []
+  let e8Recorders: SpawnRecorder[] = []
+
+  afterEach(() => {
+    const built = e8Recorders
+    e8Recorders = []
+    for (const root of e8Roots) e8Fs.rmSync(root, { recursive: true, force: true })
+    e8Roots = []
+    for (const recorder of built) recorder.assertNoFailures()
+  })
+
+  /** Whether two argument lists are the same. */
+  function sameArgv(a: readonly string[], b: readonly string[]): boolean {
+    return a.length === b.length && a.every((arg, i) => arg === b[i])
+  }
+
+  /** A new E8 rig under a new `mkdtempSync` root (see `E8Rig`). */
+  function makeE8Rig(options: E8RigOptions = {}): E8Rig {
+    const root = e8Fs.mkdtempSync(e8Path.join(e8Tmpdir(), 'ci-run-lifecycle-e8-'))
+    e8Roots.push(root)
+    const tempDir = e8Path.join(root, 'tmp')
+    const home = e8Path.join(root, 'home')
+    const adSourceDir = e8Path.join(root, 'agent-director-src')
+    for (const dir of [tempDir, home, adSourceDir]) e8Fs.mkdirSync(dir)
+    const worktree = buildWorktree(root, options.worktree)
+    const worktreeRoot = worktree.root
+    const runDir = makeRunDir(tempDir, E8_RUN_ID)
+    const packageDir = e8Path.join(runDir, PACKAGE_DIR_NAME)
+
+    const clock = e8CreateFakeClock({ start: E8_START_MS })
+    const recorder = createSpawnRecorder({ clock, root })
+    e8Recorders.push(recorder)
+    const docker = createFakeDocker(recorder)
+    const signals = createSignalRecorder({ processes: recorder.processes, clock })
+
+    const given: Record<string, string | undefined> = {
+      TMPDIR: tempDir,
+      HOME: home,
+      ANTHROPIC_API_KEY: E8_SECRETS.key,
+      GH_TOKEN: E8_SECRETS.ghToken,
+      CSCB_AD_SRC_DIR: adSourceDir,
+      ...options.env,
+    }
+    const env: Record<string, string> = {}
+    for (const [name, value] of Object.entries(given)) if (value !== undefined) env[name] = value
+
+    const logLines: string[] = []
+    const log: RunnerLogSink = (line) => {
+      logLines.push(line)
+    }
+    const state: RunState = {
+      firstStop: null,
+      baseImage: null,
+      baseBuildToken: null,
+      packingStartedAtMs: null,
+      tarballPath: null,
+      packageSha256: null,
+      baseBuildStep: null,
+      baseBuildRun: null,
+      cleanupFailures: [],
+      images: initialImageState(),
+      imageBuildInProgress: null,
+    }
+    const deps: BaseBuildDeps = { spawn: recorder.spawn, env, worktreeRoot, clock, sendSignal: signals.sendSignal }
+    const dockerContext: DockerContext = { spawn: recorder.spawn, env: { ...env }, cwd: worktreeRoot }
+    const imagesContext: RunImagesContext = { docker: dockerContext, sendSignal: signals.sendSignal, owner: E8_OWNER, clock, log }
+
+    const baseImageName = (): string => {
+      const text = e8Fs.readFileSync(worktree.testDockerfilePath, 'utf-8')
+      const from = /^FROM\s+(\S+)/m.exec(text)
+      if (from === null) throw new Error('makeE8Rig: the worktree\'s docker/Dockerfile.test has no FROM line')
+      return from[1]!
+    }
+    const adTag = (): string => {
+      const text = e8Fs.readFileSync(worktree.baseDockerfilePath, 'utf-8')
+      const line = text.split('\n').find((candidate) => candidate.startsWith(AD_VERSION_ARG_PREFIX))
+      const version = line?.slice(AD_VERSION_ARG_PREFIX.length) ?? ''
+      if (version === '') throw new Error('makeE8Rig: the worktree\'s docker/Dockerfile.test.base sets no AD_VERSION')
+      return `${AD_TAG_PREFIX}${version}`
+    }
+    const answerGhToken = (answers: { readonly personal?: SpawnAnswer; readonly plain?: SpawnAnswer }): void => {
+      const isLookup = (argv: readonly string[]): boolean => sameArgv(argv, GH_AUTH_TOKEN_ARGV)
+      if (answers.personal !== undefined) recorder.answerWhen((r) => isLookup(r.argv) && r.env.GH_CONFIG_DIR === ghPersonalConfigDir(env), answers.personal)
+      if (answers.plain !== undefined) recorder.answerWhen((r) => isLookup(r.argv) && r.env.GH_CONFIG_DIR === undefined, answers.plain)
+    }
+
+    return {
+      root,
+      tempDir,
+      worktree,
+      worktreeRoot,
+      runDir,
+      packageDir,
+      adSourceDir,
+      clock,
+      recorder,
+      docker,
+      signals,
+      env,
+      owner: E8_OWNER,
+      logLines,
+      log,
+      state,
+      deps,
+      dockerContext,
+      imagesContext,
+      readBackContext: (pinnedId) => ({ docker: dockerContext, owner: E8_OWNER, pinnedId, log }),
+      validate(args = []) {
+        const validation = validateRun(args, worktreeRoot, env)
+        if (!validation.ok) throw new Error(`makeE8Rig: validation refused: ${refusalLine(validation.refusal)}`)
+        return validation.validated
+      },
+      recordStop(stop = E8_STOP) {
+        if (state.firstStop === null) state.firstStop = stop
+      },
+      writeTestDockerfile(text) {
+        e8Fs.writeFileSync(worktree.testDockerfilePath, text)
+      },
+      baseImageName,
+      adTag,
+      addBaseImage: () => docker.addImage({ tags: [baseImageName()] }),
+      answerNpmPack(script = {}) {
+        const fileName = script.fileName ?? E8_TARBALL_NAME
+        const bytes = typeof script.bytes === 'string' ? new TextEncoder().encode(script.bytes) : (script.bytes ?? E8_TARBALL_BYTES)
+        const at = script.at ?? fileName
+        const writes = script.writes ?? 'tarball'
+        const answer: SpawnAnswer =
+          script.notStarted !== undefined
+            ? { notStarted: script.notStarted }
+            : {
+                exitCode: script.exitCode ?? 0,
+                stdout: script.stdout ?? `${fileName}\n`,
+                ...(script.stderr === undefined ? {} : { stderr: script.stderr }),
+                // Fires at the spawn; the runner looks for the tarball only after the result.
+                sideEffect: (files, request) => {
+                  const path = e8Path.join(request.argv[NPM_PACK_DESTINATION_AT]!, at)
+                  if (writes === 'tarball') files.writeFile(path, bytes)
+                  else if (writes === 'directory') files.makeDirectory(path)
+                  else if (writes === 'symlink') {
+                    const target = files.writeFile(e8Path.join(files.root, `outside-${fileName}`), bytes)
+                    files.makeDirectory(e8Path.dirname(path))
+                    e8Fs.symlinkSync(target, path)
+                  }
+                },
+              }
+        recorder.answer(npmPackArgs(packageDir), answer, { times: 1 })
+        return { tarballPath: e8Path.join(packageDir, fileName), bytes }
+      },
+      answerAdTagCheck(answer = {}) {
+        recorder.answer(adTagCheckArgs(adSourceDir, adTag()), answer)
+      },
+      answerInstallScriptRead(answer = { stdout: E8_INSTALL_SCRIPT_TEXT }) {
+        recorder.answer(adInstallScriptReadArgs(adSourceDir, adTag()), answer)
+      },
+      answerGhToken,
+      answerPrerequisites(token = E8_SECRETS.baseBuildToken) {
+        recorder.answer(adTagCheckArgs(adSourceDir, adTag()), {})
+        recorder.answer(adInstallScriptReadArgs(adSourceDir, adTag()), { stdout: E8_INSTALL_SCRIPT_TEXT })
+        if (token === null) answerGhToken({ personal: { exitCode: 1 }, plain: { exitCode: 1 } })
+        else answerGhToken({ personal: { stdout: `${token}\n` } })
+      },
+      answerBaseBuildStep(answer = {}) {
+        recorder.answer(baseBuildStepArgs(worktreeRoot), answer)
+      },
+    }
+  }
+
+  // --- E8 package (T6.S1) ---
+
+  describe('step 5: the package (SR-9.1)', () => {
+    /** Each output a package case checks for a leak: the stage, the run state, the runner log and every file under the run directory. */
+    function packageOutputs(rig: E8Rig, stage: unknown): unknown {
+      return { stage, state: rig.state, logLines: rig.logLines, runDir: e8WrittenFile(rig.runDir) }
+    }
+
+    test('PACKAGE_TARBALL_MODE is 0444, read-only for all (SR-21.5 pin)', () => {
+      expect(PACKAGE_TARBALL_MODE).toBe(0o444)
+    })
+
+    test('npm pack is spawned once, in the worktree, with the runner\'s environment unchanged and the run\'s package/ (0700) as destination', async () => {
+      const rig = makeE8Rig()
+      rig.answerNpmPack()
+      const stage = await packPackage(rig.deps, rig.runDir, rig.state)
+      expect(stage.ok).toBe(true)
+
+      const destination = e8Path.join(rig.runDir, PACKAGE_DIR_NAME)
+      const spawns = rig.recorder.spawns()
+      expect(spawns.map((s) => ({ argv: s.argv, cwd: s.cwd, env: s.env, ownProcessGroup: s.ownProcessGroup, stdin: s.stdin }))).toEqual([
+        { argv: npmPackArgs(destination), cwd: rig.worktreeRoot, env: rig.env, ownProcessGroup: false, stdin: null },
+      ])
+      const [argv] = rig.recorder.argvs()
+      expect(argv?.[0]).toBe(NPM_PROGRAM)
+      expect(argv).toContain(destination)
+      // npm's own flag: lifecycle scripts skipped, so packing runs no package script in the worktree.
+      expect(argv).toContain('--ignore-scripts')
+      expect(e8Fs.lstatSync(destination).mode & 0o7777).toBe(PACKAGE_DIR_MODE)
+      expect(rig.state.packingStartedAtMs).toBe(E8_START_MS)
+      expect(rig.docker.operations()).toEqual([])
+      expect(rig.logLines).toEqual([])
+      e8AssertNoLeak(packageOutputs(rig, stage))
+    })
+
+    test('the tarball npm names is left under package/, mode 0444, its bytes unchanged and its recorded SHA-256 the digest of those bytes', async () => {
+      const rig = makeE8Rig()
+      const plan = rig.answerNpmPack()
+      const stage = await packPackage(rig.deps, rig.runDir, rig.state)
+
+      const digest = e8CreateHash('sha256').update(plan.bytes).digest('hex')
+      expect(digest).toHaveLength(SHA256_HEX_LENGTH)
+      expect(plan.tarballPath).toBe(e8Path.join(rig.runDir, PACKAGE_DIR_NAME, E8_TARBALL_NAME))
+      expect(stage).toEqual({ ok: true, packed: { tarballPath: plan.tarballPath, packageSha256: digest } })
+      expect([rig.state.tarballPath, rig.state.packageSha256]).toEqual([plan.tarballPath, digest])
+      expect(e8Fs.readdirSync(rig.packageDir)).toEqual([E8_TARBALL_NAME])
+      expect(e8Fs.lstatSync(plan.tarballPath).isFile()).toBe(true)
+      expect(e8Fs.lstatSync(plan.tarballPath).mode & 0o7777).toBe(PACKAGE_TARBALL_MODE)
+      expect([...e8Fs.readFileSync(plan.tarballPath)]).toEqual([...plan.bytes])
+      e8AssertNoLeak(packageOutputs(rig, stage))
+    })
+
+    test('packing writes nothing into the worktree: its snapshot, with the option, is the same before and after', async () => {
+      const rig = makeE8Rig()
+      rig.answerNpmPack()
+      const before = e8TreeSnapshot(rig.worktreeRoot, { extended: true })
+      const stage = await packPackage(rig.deps, rig.runDir, rig.state)
+      expect(stage.ok).toBe(true)
+      expect(e8TreeSnapshot(rig.worktreeRoot, { extended: true })).toEqual(before)
+      e8AssertNoLeak({ stage, logLines: rig.logLines })
+    })
+
+    /** Test data: npm's error output, its last line the one a refusal names. */
+    const NPM_ERROR_LINE = 'npm error JSON.parse Invalid package.json: Unexpected end of JSON input'
+    const NPM_ERROR_OUTPUT = `npm error code EJSONPARSE\n${NPM_ERROR_LINE}\n`
+    /** Test data: why npm could not be started. */
+    const NPM_NOT_STARTED = 'spawn npm ENOENT'
+
+    /** One failure form: the scripted `npm pack`; the refusal's reason, from the runner's builder over the row's own data; and that data, each piece of which the reason must hold. */
+    const FAILURES: readonly (readonly [string, NpmPackScript, (rig: E8Rig) => { readonly reason: string; readonly names: readonly string[] }])[] = [
+      ['a non-zero exit with error output', { exitCode: 1, stdout: '', stderr: NPM_ERROR_OUTPUT, writes: 'nothing' }, () => ({ reason: npmPackFailedReason(1, NPM_ERROR_LINE), names: ['1', NPM_ERROR_LINE] })],
+      ['a non-zero exit with no error output', { exitCode: 254, stdout: '', writes: 'nothing' }, () => ({ reason: npmPackFailedReason(254, null), names: ['254'] })],
+      ['a non-zero exit after writing and naming a tarball', { exitCode: 1, stderr: NPM_ERROR_OUTPUT }, () => ({ reason: npmPackFailedReason(1, NPM_ERROR_LINE), names: ['1', NPM_ERROR_LINE] })],
+      [
+        'an npm that could not be started',
+        { notStarted: NPM_NOT_STARTED },
+        () => ({ reason: npmPackFailedReason(SPAWN_FAILED_EXIT_STATUS, NPM_NOT_STARTED), names: [String(SPAWN_FAILED_EXIT_STATUS), NPM_NOT_STARTED] }),
+      ],
+      ['exit 0 with no output and no tarball', { stdout: '', writes: 'nothing' }, (rig) => ({ reason: npmPackNoTarballReason(rig.packageDir), names: [rig.packageDir] })],
+      ['exit 0 naming a tarball it did not write', { writes: 'nothing' }, (rig) => ({ reason: npmPackNoTarballReason(rig.packageDir), names: [rig.packageDir] })],
+      ['exit 0 naming a written file that is not a .tgz', { fileName: 'e8-test-package-1.2.3.tar' }, (rig) => ({ reason: npmPackNoTarballReason(rig.packageDir), names: [rig.packageDir] })],
+      [
+        'exit 0 naming a tarball outside package/ by a path',
+        { at: `../${E8_TARBALL_NAME}`, stdout: `../${E8_TARBALL_NAME}\n` },
+        (rig) => ({ reason: npmPackNoTarballReason(rig.packageDir), names: [rig.packageDir] }),
+      ],
+      ['exit 0 naming a directory', { writes: 'directory' }, (rig) => ({ reason: npmPackNoTarballReason(rig.packageDir), names: [rig.packageDir] })],
+      ['exit 0 naming a symbolic link to a tarball', { writes: 'symlink' }, (rig) => ({ reason: npmPackNoTarballReason(rig.packageDir), names: [rig.packageDir] })],
+    ]
+
+    test.each(FAILURES)('%s is a not-runnable refusal naming it, with no packageSha256', async (_what, script, expected) => {
+      const rig = makeE8Rig()
+      rig.answerNpmPack(script)
+      const stage = await packPackage(rig.deps, rig.runDir, rig.state)
+      const { reason, names } = expected(rig)
+      expect(stage).toEqual({ ok: false, refusal: buildRefusal(null, reason) })
+      if (!stage.ok) {
+        expect(stage.refusal.kind).toBeNull()
+        for (const name of names) expect(refusalLine(stage.refusal)).toContain(name)
+      }
+      expect([rig.state.tarballPath, rig.state.packageSha256]).toEqual([null, null])
+      expect(rig.state.packingStartedAtMs).toBe(E8_START_MS)
+      expect(rig.recorder.argvs()).toEqual([npmPackArgs(rig.packageDir)])
+      e8AssertNoLeak(packageOutputs(rig, stage))
+    })
+
+    test('a package/ already in the run directory is a refusal naming it, and npm pack is never spawned', async () => {
+      const rig = makeE8Rig()
+      e8Fs.mkdirSync(rig.packageDir)
+      const stage = await packPackage(rig.deps, rig.runDir, rig.state)
+      expect(stage.ok).toBe(false)
+      if (!stage.ok) {
+        expect(stage.refusal.kind).toBeNull()
+        expect(stage.refusal.summary.startsWith(packageDirFailedReason(rig.packageDir, ''))).toBe(true)
+      }
+      expect([rig.state.tarballPath, rig.state.packageSha256]).toEqual([null, null])
+      expect(rig.recorder.spawns()).toEqual([])
+      e8AssertNoLeak(packageOutputs(rig, stage))
+    })
+  })
+
+  // --- E8 base image: step 4, the step file, step 12 (T6.S2-S4) ---
+
+  describe('the base image: step 4, the base-build step and step 12 (SR-9.2)', () => {
+    const {
+      AD_INSTALL_SCRIPT_PATH,
+      AD_SOURCE_DIR_VARIABLE,
+      adInstallScriptUnreadableReason,
+      adSourceDirUnsetReason,
+      adTagMissingReason,
+      adVersionMissingReason,
+      BASE_BUILD_STEP_PATH,
+      BASE_DOCKERFILE_PATH,
+      baseBuildTokenBadReason,
+      baseBuiltMeanwhileLine,
+      baseImageBuildFailedLine,
+      baseRecheckFailedLine,
+      checkBaseImage,
+      DOCKER_PROGRAM,
+      GIT_PROGRAM,
+      imageBuildFailure,
+      runBaseBuild,
+      SECRET_MIN_LENGTH,
+      secretCredentialSet,
+      TEST_DOCKERFILE_PATH,
+      testDockerfileFromCountReason,
+      testDockerfileFromNameReason,
+      testDockerfileUnreadableReason,
+    } = e8Runner
+
+    /** A marker standing for a value the test cannot know (an operating-system or daemon error), to split a runner text built around it. */
+    const E8B_MARK = '<e8b-mark>'
+    /** Test data: a base image other than the repository's. */
+    const E8B_OTHER_BASE = 'e8b-other-base:v99'
+    /** Test data: git's error line on a failed read. */
+    const E8B_GIT_ERROR = 'fatal: e8b test error: no such object'
+
+    /** That `actual` is the runner text `built` (made with `E8B_MARK` for the unknown part) around some non-empty value. */
+    function expectFramed(actual: string, built: string): void {
+      const [head, tail, ...rest] = built.split(E8B_MARK)
+      expect(rest).toEqual([])
+      expect(actual.startsWith(head!)).toBe(true)
+      expect(actual.endsWith(tail!)).toBe(true)
+      expect(actual.length).toBeGreaterThan(head!.length + tail!.length)
+    }
+
+    /** Every spawn that is not docker, in order: the git checks, the token lookups and the base-build step. */
+    function nonDockerArgvs(rig: E8Rig): (readonly string[])[] {
+      return rig.recorder.argvs().filter((argv) => argv[0] !== DOCKER_PROGRAM)
+    }
+
+    /** Every docker operation as its kind and the refs it names. */
+    function dockerOperationRefs(rig: E8Rig): { readonly kind: string; readonly refs: readonly string[] }[] {
+      return rig.docker.operations().map((op) => ({ kind: op.kind, refs: op.refs }))
+    }
+
+    /** The two read-only git checks of a missing base, as the runner builds them. */
+    function gitChecks(rig: E8Rig): (readonly string[])[] {
+      return [adTagCheckArgs(rig.adSourceDir, rig.adTag()), adInstallScriptReadArgs(rig.adSourceDir, rig.adTag())]
+    }
+
+    describe('step 4: the base image\'s name, existence and prerequisites (SR-9.2, SR-15.1)', () => {
+      const FROM_FORMS: readonly (readonly [string, string])[] = [
+        ['a FROM naming another tag', `FROM ${E8B_OTHER_BASE}\n`],
+        ['a FROM with a flag and a stage name', `FROM --platform=linux/amd64 ${E8B_OTHER_BASE} AS test\n`],
+        ['a lower-case from continued onto the next line, after a comment', `# the base\nfrom \\\n  ${E8B_OTHER_BASE}\n`],
+      ]
+
+      test.each(FROM_FORMS)('%s: the image it names is the one inspected, and found present', async (_form, text) => {
+        const rig = makeE8Rig()
+        rig.writeTestDockerfile(text)
+        rig.docker.addImage({ tags: [E8B_OTHER_BASE] })
+        const stage = await checkBaseImage(rig.deps, rig.state)
+        expect(stage).toEqual({ ok: true, check: { kind: 'present', image: E8B_OTHER_BASE }, baseBuildToken: null, secrets: secretCredentialSet(rig.env) })
+        expect(dockerOperationRefs(rig)).toEqual([{ kind: 'image-inspect', refs: [E8B_OTHER_BASE] }])
+        e8AssertNoLeak({ stage: { ...stage, secrets: null }, logLines: rig.logLines })
+      })
+
+      test('with the base present the spawn record shows only the existence query: no prerequisite check and no token lookup', async () => {
+        const rig = makeE8Rig()
+        rig.addBaseImage()
+        const before = e8TreeSnapshot(rig.worktreeRoot, { extended: true })
+        const stage = await checkBaseImage(rig.deps, rig.state)
+        const image = rig.baseImageName()
+        expect(stage.ok).toBe(true)
+        expect(rig.state.baseImage).toEqual({ kind: 'present', image })
+        expect(rig.state.baseBuildToken).toBeNull()
+        expect(rig.recorder.spawns()).toHaveLength(1)
+        expect(dockerOperationRefs(rig)).toEqual([{ kind: 'image-inspect', refs: [image] }])
+        expect(nonDockerArgvs(rig)).toEqual([])
+        expect(e8TreeSnapshot(rig.worktreeRoot, { extended: true })).toEqual(before)
+        expect(rig.logLines).toEqual([])
+        expect(stage.ok && stage.secrets).toEqual(secretCredentialSet(rig.env))
+        e8AssertNoLeak({ stage: { ...stage, secrets: null }, logLines: rig.logLines })
+      })
+
+      /** Test data: a daemon's one-line error for a failed existence query. */
+      const E8B_INSPECT_ERROR = 'Error response from daemon: e8b base inspect failure (test data)'
+      /** Test data: why docker could not be started. */
+      const E8B_DOCKER_NOT_STARTED = 'spawn docker ENOENT'
+
+      /** One failed existence query: how it fails, and the error text the refusal must hold. */
+      const FAILED_EXISTENCE_QUERIES: readonly (readonly [string, (rig: E8Rig) => void, string])[] = [
+        ['docker exits non-zero', (rig) => rig.docker.fail('image-inspect', { stderr: `${E8B_INSPECT_ERROR}\n` }), E8B_INSPECT_ERROR],
+        ['docker cannot be started', (rig) => rig.recorder.answer(e8Runner.imageInspectArgs([rig.baseImageName()]), { notStarted: E8B_DOCKER_NOT_STARTED }), E8B_DOCKER_NOT_STARTED],
+      ]
+
+      test.each(FAILED_EXISTENCE_QUERIES)('an existence query where %s refuses as not runnable, naming the base and the error; no outcome is recorded and no prerequisite check or token lookup is spawned', async (_what, arrange, error) => {
+        const rig = makeE8Rig()
+        arrange(rig)
+        const image = rig.baseImageName()
+        const before = e8TreeSnapshot(rig.worktreeRoot, { extended: true })
+        const stage = await checkBaseImage(rig.deps, rig.state)
+
+        expect(stage.ok).toBe(false)
+        if (!stage.ok) {
+          expect([stage.refusal.kind, stage.refusal.details]).toEqual([null, []])
+          expectFramed(stage.refusal.summary, e8Runner.baseImageCheckFailedReason(image, E8B_MARK))
+          expect(stage.refusal.summary).toContain(error)
+          expect(refusalLine(stage.refusal)).toContain(image)
+        }
+        expect([rig.state.baseImage, rig.state.baseBuildToken]).toEqual([null, null])
+        expect(rig.recorder.argvs()).toEqual([e8Runner.imageInspectArgs([image])])
+        expect(nonDockerArgvs(rig)).toEqual([])
+        expect(e8TreeSnapshot(rig.worktreeRoot, { extended: true })).toEqual(before)
+        expect(rig.logLines).toEqual([])
+        e8AssertNoLeak({ stage, logLines: rig.logLines })
+      })
+
+      /** One bad `docker/Dockerfile.test`: how to make it, and the reason, from the runner's builder (`E8B_MARK` for an operating-system error). */
+      const BAD_TEST_DOCKERFILES: readonly (readonly [string, E8RigOptions, ((rig: E8Rig) => void) | null, string])[] = [
+        ['a missing docker/Dockerfile.test', { worktree: { dockerfiles: { test: 'absent' } } }, null, testDockerfileUnreadableReason(E8B_MARK)],
+        ['a docker/Dockerfile.test that is a directory', { worktree: { dockerfiles: { test: 'absent' } } }, (rig) => e8Fs.mkdirSync(rig.worktree.testDockerfilePath), testDockerfileUnreadableReason(E8B_MARK)],
+        ['no FROM instruction', {}, (rig) => rig.writeTestDockerfile('# no base\nRUN true\n'), testDockerfileFromCountReason(0)],
+        ['two FROM instructions', {}, (rig) => rig.writeTestDockerfile(`FROM ${E8B_OTHER_BASE}\nFROM ${E8B_OTHER_BASE}-2\n`), testDockerfileFromCountReason(2)],
+        ['a FROM naming the image by a variable', {}, (rig) => rig.writeTestDockerfile('FROM ${E8B_BASE}\n'), testDockerfileFromNameReason('FROM ${E8B_BASE}')],
+        ['a FROM naming no image', {}, (rig) => rig.writeTestDockerfile('FROM\n'), testDockerfileFromNameReason('FROM')],
+      ]
+
+      test.each(BAD_TEST_DOCKERFILES)('%s refuses as not runnable, naming docker/Dockerfile.test, and spawns nothing', async (_form, options, setup, reason) => {
+        const rig = makeE8Rig(options)
+        setup?.(rig)
+        const stage = await checkBaseImage(rig.deps, rig.state)
+        expect(stage.ok).toBe(false)
+        if (!stage.ok) {
+          expect(stage.refusal.kind).toBeNull()
+          expect(stage.refusal.details).toEqual([])
+          if (reason.includes(E8B_MARK)) expectFramed(stage.refusal.summary, reason)
+          else expect(stage.refusal).toEqual(buildRefusal(null, reason))
+          expect(refusalLine(stage.refusal)).toContain(TEST_DOCKERFILE_PATH)
+        }
+        expect(rig.recorder.spawns()).toEqual([])
+        expect(rig.state.baseImage).toBeNull()
+        e8AssertNoLeak({ stage, logLines: rig.logLines })
+      })
+
+      /** A short base-build token, cut from a `fakeToken` value: one character under the minimum. */
+      const SHORT_TOKEN = e8FakeToken('', 'e8b-short').slice(0, SECRET_MIN_LENGTH - 1)
+
+      /** One failing prerequisite of a missing base: the rig, its scripted checks, the reason (runner builder), what it must name, and the non-docker spawns up to it. */
+      interface FailingPrerequisite {
+        readonly options?: E8RigOptions
+        readonly script: (rig: E8Rig) => void
+        readonly reason: (rig: E8Rig, image: string) => string
+        readonly names: (rig: E8Rig) => readonly string[]
+        readonly spawned: (rig: E8Rig) => readonly (readonly string[])[]
+      }
+
+      const AD_VERSION_NAMES = (): readonly string[] => [BASE_DOCKERFILE_PATH, AD_VERSION_ARG_PREFIX.slice(0, -1)]
+      /** Rewrites the base Dockerfile's `ARG AD_VERSION=<version>` line, its version kept, into a form Docker accepts but the step's `sed -n 's/^ARG AD_VERSION=//p'` does not read. */
+      function rewriteAdVersionLine(rig: E8Rig, form: (line: string) => string): void {
+        const lines = e8Fs.readFileSync(rig.worktree.baseDockerfilePath, 'utf-8').split('\n')
+        const at = lines.findIndex((line) => line.startsWith(AD_VERSION_ARG_PREFIX))
+        if (at < 0 || lines[at] === AD_VERSION_ARG_PREFIX) throw new Error('rewriteAdVersionLine: the base Dockerfile sets no ARG AD_VERSION=<version>')
+        lines[at] = form(lines[at]!)
+        e8Fs.writeFileSync(rig.worktree.baseDockerfilePath, lines.join('\n'))
+      }
+      /** A row whose base Dockerfile sets `AD_VERSION` only in a form the step does not read: refused as no `ARG AD_VERSION`, before any git spawn. */
+      const unreadAdVersion = (form: (line: string) => string): FailingPrerequisite => ({
+        script: (rig) => rewriteAdVersionLine(rig, form),
+        reason: (_rig, image) => adVersionMissingReason(image, null),
+        names: AD_VERSION_NAMES,
+        spawned: () => [],
+      })
+      const FAILING_PREREQUISITES: readonly (readonly [string, FailingPrerequisite])[] = [
+        ['ARG AD_VERSION= indented (Docker reads it; the step\'s sed does not)', unreadAdVersion((line) => `  ${line}`)],
+        ['a lower-case arg AD_VERSION= (Docker reads it; the step\'s sed does not)', unreadAdVersion((line) => `arg${line.slice('ARG'.length)}`)],
+        ['ARG AD_VERSION empty', { options: { worktree: { dockerfiles: { adVersion: 'empty' } } }, script: () => undefined, reason: (_rig, image) => adVersionMissingReason(image, null), names: AD_VERSION_NAMES, spawned: () => [] }],
+        ['ARG AD_VERSION absent', { options: { worktree: { dockerfiles: { adVersion: 'absent' } } }, script: () => undefined, reason: (_rig, image) => adVersionMissingReason(image, null), names: AD_VERSION_NAMES, spawned: () => [] }],
+        ['docker/Dockerfile.test.base missing', { options: { worktree: { dockerfiles: { base: 'absent' } } }, script: () => undefined, reason: (_rig, image) => adVersionMissingReason(image, null), names: AD_VERSION_NAMES, spawned: () => [] }],
+        [
+          'CSCB_AD_SRC_DIR unset',
+          { options: { env: { CSCB_AD_SRC_DIR: undefined } }, script: () => undefined, reason: (rig, image) => adSourceDirUnsetReason(image, rig.adTag()), names: (rig) => [AD_SOURCE_DIR_VARIABLE, rig.adTag()], spawned: () => [] },
+        ],
+        [
+          'CSCB_AD_SRC_DIR empty',
+          { options: { env: { CSCB_AD_SRC_DIR: '' } }, script: () => undefined, reason: (rig, image) => adSourceDirUnsetReason(image, rig.adTag()), names: (rig) => [AD_SOURCE_DIR_VARIABLE, rig.adTag()], spawned: () => [] },
+        ],
+        [
+          'no tag v<AD_VERSION> in the checkout',
+          {
+            script: (rig) => rig.answerAdTagCheck({ exitCode: 1, stderr: `${E8B_GIT_ERROR}\n` }),
+            reason: (rig, image) => adTagMissingReason(image, rig.adSourceDir, rig.adTag(), E8B_GIT_ERROR),
+            names: (rig) => [AD_SOURCE_DIR_VARIABLE, rig.adSourceDir, rig.adTag(), E8B_GIT_ERROR],
+            spawned: (rig) => gitChecks(rig).slice(0, 1),
+          },
+        ],
+        [
+          'install.sh unreadable at that tag',
+          {
+            script: (rig) => {
+              rig.answerAdTagCheck()
+              rig.answerInstallScriptRead({ exitCode: 128, stderr: `${E8B_GIT_ERROR}\n` })
+            },
+            reason: (rig, image) => adInstallScriptUnreadableReason(image, rig.adSourceDir, rig.adTag(), E8B_GIT_ERROR),
+            names: (rig) => [AD_INSTALL_SCRIPT_PATH, rig.adSourceDir, rig.adTag(), E8B_GIT_ERROR],
+            spawned: gitChecks,
+          },
+        ],
+        [
+          'a base-build token shorter than the minimum',
+          {
+            script: (rig) => rig.answerPrerequisites(SHORT_TOKEN),
+            reason: (_rig, image) => baseBuildTokenBadReason(image),
+            names: () => [GH_AUTH_TOKEN_ARGV.join(' '), String(SECRET_MIN_LENGTH)],
+            spawned: (rig) => [...gitChecks(rig), GH_AUTH_TOKEN_ARGV],
+          },
+        ],
+      ]
+
+      test.each(FAILING_PREREQUISITES)('a missing base with %s refuses as not runnable, naming the check; git only reads, and the worktree is unchanged', async (_check, row) => {
+        const rig = makeE8Rig(row.options)
+        row.script(rig)
+        const image = rig.baseImageName()
+        const worktreeBefore = e8TreeSnapshot(rig.worktreeRoot, { extended: true })
+        const sourceBefore = e8TreeSnapshot(rig.adSourceDir, { extended: true })
+        const stage = await checkBaseImage(rig.deps, rig.state)
+
+        expect(stage).toEqual({ ok: false, refusal: buildRefusal(null, row.reason(rig, image)) })
+        if (!stage.ok) for (const name of [image, ...row.names(rig)]) expect(refusalLine(stage.refusal)).toContain(name)
+        expect(rig.state.baseImage).toEqual({ kind: 'missing', image, missingAtMs: E8_START_MS })
+        expect(dockerOperationRefs(rig)).toEqual([{ kind: 'image-inspect', refs: [image] }])
+        expect(nonDockerArgvs(rig)).toEqual(row.spawned(rig).map((argv) => [...argv]))
+        for (const argv of nonDockerArgvs(rig).filter((a) => a[0] === GIT_PROGRAM)) for (const word of ['fetch', 'pull', 'clone']) expect(argv).not.toContain(word)
+        expect(e8TreeSnapshot(rig.worktreeRoot, { extended: true })).toEqual(worktreeBefore)
+        expect(e8TreeSnapshot(rig.adSourceDir, { extended: true })).toEqual(sourceBefore)
+        const outputs = { stage, logLines: rig.logLines }
+        e8AssertNoLeak(outputs)
+        expect(JSON.stringify(outputs)).not.toContain(SHORT_TOKEN)
+      })
+
+      test('a short token is recorded in the run state, though it refuses (SR-15.1)', async () => {
+        const rig = makeE8Rig()
+        rig.answerPrerequisites(SHORT_TOKEN)
+        expect((await checkBaseImage(rig.deps, rig.state)).ok).toBe(false)
+        expect(rig.state.baseBuildToken).toBe(SHORT_TOKEN)
+      })
+
+      const EMPTY_TOKEN_RESULTS: readonly (readonly [string, (rig: E8Rig) => void, number])[] = [
+        ['both lookups fail', (rig) => rig.answerPrerequisites(null), 2],
+        [
+          'both lookups print nothing',
+          (rig) => {
+            rig.answerAdTagCheck()
+            rig.answerInstallScriptRead()
+            rig.answerGhToken({ personal: { stdout: '' }, plain: { stdout: '\n' } })
+          },
+          2,
+        ],
+      ]
+
+      test.each(EMPTY_TOKEN_RESULTS)('an empty token result (%s) does not refuse, and adds no secret', async (_form, script, lookups) => {
+        const rig = makeE8Rig()
+        script(rig)
+        const stage = await checkBaseImage(rig.deps, rig.state)
+        expect(stage).toEqual({ ok: true, check: { kind: 'missing', image: rig.baseImageName(), missingAtMs: E8_START_MS }, baseBuildToken: null, secrets: secretCredentialSet(rig.env) })
+        expect(rig.state.baseBuildToken).toBeNull()
+        expect(nonDockerArgvs(rig).filter((argv) => sameArgv(argv, GH_AUTH_TOKEN_ARGV))).toHaveLength(lookups)
+        e8AssertNoLeak({ stage: { ...stage, secrets: null }, logLines: rig.logLines })
+      })
+
+      test('a token of exactly SECRET_MIN_LENGTH characters does not refuse', async () => {
+        const token = e8FakeToken('', 'e8b-edge').slice(0, SECRET_MIN_LENGTH)
+        const rig = makeE8Rig()
+        rig.answerPrerequisites(token)
+        const stage = await checkBaseImage(rig.deps, rig.state)
+        expect(stage.ok).toBe(true)
+        expect(rig.state.baseBuildToken).toBe(token)
+      })
+
+      test('with every check passing there is no refusal: "missing" is recorded with its fake-clock moment, and the found token joins the secret set', async () => {
+        const rig = makeE8Rig()
+        rig.answerPrerequisites()
+        const advancedMs = 4321
+        await rig.clock.advance(advancedMs)
+        const image = rig.baseImageName()
+        const worktreeBefore = e8TreeSnapshot(rig.worktreeRoot, { extended: true })
+        const sourceBefore = e8TreeSnapshot(rig.adSourceDir, { extended: true })
+        const stage = await checkBaseImage(rig.deps, rig.state)
+
+        const check = { kind: 'missing', image, missingAtMs: E8_START_MS + advancedMs } as const
+        const secrets = secretCredentialSet(rig.env, { baseBuildToken: E8_SECRETS.baseBuildToken })
+        expect(stage).toEqual({ ok: true, check, baseBuildToken: E8_SECRETS.baseBuildToken, secrets })
+        expect([...secrets].sort()).toEqual([E8_SECRETS.key, E8_SECRETS.ghToken, E8_SECRETS.baseBuildToken].sort())
+        expect(rig.state.baseImage).toEqual(check)
+        expect(rig.state.baseBuildToken).toBe(E8_SECRETS.baseBuildToken)
+
+        // Only the existence query, the two read-only git checks and one token lookup; every git child in the worktree with the runner's environment.
+        expect(dockerOperationRefs(rig)).toEqual([{ kind: 'image-inspect', refs: [image] }])
+        expect(nonDockerArgvs(rig)).toEqual([...gitChecks(rig), GH_AUTH_TOKEN_ARGV].map((argv) => [...argv]))
+        const gitSpawns = rig.recorder.spawns().filter((s) => s.argv[0] === GIT_PROGRAM)
+        expect(gitSpawns.map((s) => ({ cwd: s.cwd, env: s.env, ownProcessGroup: s.ownProcessGroup, stdin: s.stdin }))).toEqual(
+          gitSpawns.map(() => ({ cwd: rig.worktreeRoot, env: rig.env, ownProcessGroup: false, stdin: null })),
+        )
+        for (const s of gitSpawns) for (const word of ['fetch', 'pull', 'clone']) expect(s.argv).not.toContain(word)
+        expect(e8TreeSnapshot(rig.worktreeRoot, { extended: true })).toEqual(worktreeBefore)
+        expect(e8TreeSnapshot(rig.adSourceDir, { extended: true })).toEqual(sourceBefore)
+        expect(rig.logLines).toEqual([])
+        e8AssertNoLeak({ check: stage.ok ? stage.check : null, logLines: rig.logLines })
+      })
+    })
+
+    describe('the base-build step, scripts/ci-base-build.sh: its content and exit contract (SR-9.2 step audit)', () => {
+      /** The repository's root: the real step is read and run from here. */
+      const E8B_REPO_ROOT = e8Path.join(import.meta.dir, '..')
+      /** The real step, the subject. */
+      const STEP_PATH = e8Path.join(E8B_REPO_ROOT, BASE_BUILD_STEP_PATH)
+      const STEP_TEXT = e8Fs.readFileSync(STEP_PATH, 'utf-8')
+      /** Test data: the /ci skill, whose base-build commands the step moved. */
+      const CI_SKILL_PATH = '.claude/skills/ci/SKILL.md'
+      /** Test data: the test image the skill built after the base, untagged (`-t cscb-ci`); no runner export names it. */
+      const LEGACY_TEST_IMAGE = 'cscb-ci:latest'
+      /** The time limit of each child (the step, or git reading the skill). */
+      const E8B_CHILD_LIMIT_MS = 10_000
+      /** Above the child's limit, so the limit, not the test runner, ends a stuck child. */
+      const E8B_CASE_TIMEOUT_MS = 30_000
+      /** The plain tools the step runs by name, linked into the stub directory. */
+      const STEP_PLAIN_TOOLS = ['sed', 'mktemp', 'rm']
+      /** The name prefix of the step's install-script context directory, from its own `mktemp -d` line. */
+      const CONTEXT_PREFIX = /mktemp -d "\$\{TMPDIR:-\/tmp\}\/([a-z-]+)X+"/.exec(STEP_TEXT)?.[1] ?? ''
+
+      /** A tool's absolute path on the test run's PATH. */
+      function toolPath(tool: string): string {
+        const dir = e8bResolveToolDir(tool)
+        if (dir === undefined) throw new Error(`${tool} is not on PATH`)
+        return e8Path.join(dir, tool)
+      }
+
+      /** A shell text's commands: comment lines and trailing ` # ` comments left out, lines continued by a final `\` joined. */
+      function shellCommands(text: string): string[] {
+        const commands: string[] = []
+        let pending = ''
+        for (const raw of text.split('\n')) {
+          if (raw.trim().startsWith('#')) continue
+          const line = raw.replace(/\s+#\s.*$/, '')
+          if (/\\\s*$/.test(line)) {
+            pending += `${line.replace(/\\\s*$/, '')} `
+            continue
+          }
+          const command = `${pending}${line}`.trim()
+          pending = ''
+          if (command !== '') commands.push(command)
+        }
+        if (pending.trim() !== '') commands.push(pending.trim())
+        return commands
+      }
+
+      /** What is wrong with a base-build step text (SR-9.2): empty when its first line is a shebang, it runs exactly one docker build, of `docker/Dockerfile.test.base`, no image inspect, and never names `cscb-ci:latest`. */
+      function baseBuildStepProblems(text: string): string[] {
+        const problems: string[] = []
+        if (!text.startsWith('#!')) problems.push('the first line is not a shebang')
+        const commands = shellCommands(text)
+        const builds = commands.filter((command) => /\bdocker\s+(?:image\s+|buildx\s+)?build\b/.test(command))
+        if (builds.length !== 1) problems.push(`it runs ${builds.length} docker builds, not one`)
+        for (const build of builds) {
+          const file = /\s(?:-f|--file)[\s=]+"?([^\s"]+)"?/.exec(build)?.[1] ?? null
+          if (file !== BASE_DOCKERFILE_PATH) problems.push(`a docker build builds ${file ?? 'no -f file'}, not ${BASE_DOCKERFILE_PATH}`)
+        }
+        if (commands.some((command) => /\bdocker\s+(?:image\s+)?inspect\b/.test(command))) problems.push('it runs docker image inspect')
+        if (commands.some((command) => /(?<![\w.-])cscb-ci(?::latest)?(?![\w:.-])/.test(command))) problems.push(`it names ${LEGACY_TEST_IMAGE}`)
+        return problems
+      }
+
+      /** The step with `line` added after its `BASE_TAG=` line, or at its end. */
+      function planted(line: string, where: 'after-base-tag' | 'end'): string {
+        if (where === 'end') return `${STEP_TEXT.replace(/\n*$/, '\n')}${line}\n`
+        return STEP_TEXT.replace(/^(BASE_TAG=.*\n)/m, `$1${line}\n`)
+      }
+
+      test('the content audit passes on the real step: a shebang first, one docker build, of docker/Dockerfile.test.base, no image inspect, no docker/Dockerfile.test build and no cscb-ci:latest', () => {
+        expect(STEP_TEXT.split('\n')[0]).toMatch(/^#!/)
+        expect(baseBuildStepProblems(STEP_TEXT)).toEqual([])
+      })
+
+      const PLANTS: readonly (readonly [string, () => string, readonly string[]])[] = [
+        ['a second docker build', () => planted(`docker build -f ${BASE_DOCKERFILE_PATH} -t "\${BASE_TAG}" .`, 'end'), ['it runs 2 docker builds, not one']],
+        ['a docker image inspect', () => planted('docker image inspect "${BASE_TAG}" >/dev/null 2>&1 || true', 'after-base-tag'), ['it runs docker image inspect']],
+        ['a cscb-ci:latest', () => planted(`docker tag "\${BASE_TAG}" ${LEGACY_TEST_IMAGE}`, 'end'), [`it names ${LEGACY_TEST_IMAGE}`]],
+        ['a build of docker/Dockerfile.test in place of the base\'s', () => STEP_TEXT.replace(`-f ${BASE_DOCKERFILE_PATH} `, `-f ${TEST_DOCKERFILE_PATH} `), [`a docker build builds ${TEST_DOCKERFILE_PATH}, not ${BASE_DOCKERFILE_PATH}`]],
+        ['no shebang', () => STEP_TEXT.slice(STEP_TEXT.indexOf('\n') + 1), ['the first line is not a shebang']],
+      ]
+
+      test.each(PLANTS)('the content audit refuses %s planted in the real step', (_plant, plant, problems) => {
+        const text = plant()
+        expect(text).not.toBe(STEP_TEXT)
+        expect(baseBuildStepProblems(text)).toEqual([...problems])
+      })
+
+      test('every line but the shebang, header and note is the /ci skill\'s base-build line at the commit the header names, byte for byte, less the three-space list indent; only the guard, its fi and the test-image build are left out', () => {
+        const commit = /commands at ([0-9a-f]{7,40})\b/.exec(STEP_TEXT)?.[1]
+        // Test data: SR-9.2 fixes the commit the step's lines were moved from.
+        expect(commit).toBe('946be79')
+        const rig = makeE8Rig()
+        const home = rig.env.HOME
+        if (home === undefined) throw new Error('the rig has no HOME')
+        // A read-only object lookup in this checkout's history, under the rig's HOME, the system git configuration kept out.
+        const shown = Bun.spawnSync({
+          cmd: [toolPath('git'), 'show', `${commit}:${CI_SKILL_PATH}`],
+          cwd: E8B_REPO_ROOT,
+          env: e8bHostSafeChildEnv(home, { tools: ['git'], extras: { GIT_CONFIG_NOSYSTEM: '1' } }),
+          stdin: 'ignore',
+          stdout: 'pipe',
+          stderr: 'pipe',
+          timeout: E8B_CHILD_LIMIT_MS,
+        })
+        expect(shown.exitedDueToTimeout ?? false).toBe(false)
+        expect(shown.exitCode, `git could not read ${CI_SKILL_PATH} at ${commit} (a shallow clone?)`).toBe(0)
+        const skillLines = shown.stdout.toString().split('\n')
+
+        // The skill's bash block holding BASE_TAG.
+        const tagAt = skillLines.findIndex((line) => /^\s*BASE_TAG=/.test(line))
+        expect(tagAt).toBeGreaterThan(0)
+        const open = tagAt - 1 - [...skillLines.slice(0, tagAt)].reverse().findIndex((line) => line.trim().startsWith('```'))
+        const close = skillLines.findIndex((line, i) => i > tagAt && line.trim().startsWith('```'))
+        expect([open < tagAt && skillLines[open]?.trim().startsWith('```') === true, close > tagAt]).toEqual([true, true])
+        const block = skillLines.slice(open + 1, close)
+        for (const line of block) expect(line.startsWith('   ')).toBe(true)
+
+        const guardAt = block.findIndex((line) => line.includes('docker image inspect'))
+        const guardIndent = /^\s*/.exec(block[guardAt]!)![0]
+        const fiAt = block.findIndex((line, i) => i > guardAt && line === `${guardIndent}fi`)
+        expect([guardAt > 0, fiAt > guardAt]).toEqual([true, true])
+        const leftOut = block.filter((_line, i) => i === guardAt || i >= fiAt)
+        expect(leftOut).toHaveLength(3)
+        expect(leftOut[2]).toContain(`docker build -f ${TEST_DOCKERFILE_PATH} `)
+        const moved = block.filter((_line, i) => i !== guardAt && i < fiAt).map((line) => line.slice(3))
+
+        // The step's own lines: the shebang, its header and its note, every one a comment at column 0.
+        const stepLines = STEP_TEXT.replace(/\n$/, '').split('\n')
+        expect(stepLines.filter((line) => !line.startsWith('#'))).toEqual(moved)
+      })
+
+      /** How the stubs behave in one run of the step. */
+      interface StepStubs {
+        /** The rig's options (the worktree's base Dockerfile, `CSCB_AD_SRC_DIR`). */
+        readonly options?: E8RigOptions
+        /** Leave `CSCB_AD_SRC_DIR` out of the step's environment. */
+        readonly noSourceDir?: boolean
+        /** The stub git's tag-check exit (default 0). */
+        readonly tagExit?: number
+        /** The stub git's `show` exit (default 0); non-zero: it writes `E8B_GIT_ERROR` to standard error. */
+        readonly showExit?: number
+        /** The stub docker's exit (default 0). */
+        readonly dockerExit?: number
+      }
+
+      /** One run of the step under bash in a child. */
+      interface StepRun {
+        readonly rig: E8Rig
+        readonly exitCode: number
+        readonly stdout: string
+        readonly stderr: string
+        /** Each stub call, as its tab-separated fields: the program and its arguments (docker also logs its context, token and PATH lines). */
+        readonly calls: readonly (readonly string[])[]
+        /** The token the stub gh printed. */
+        readonly token: string
+      }
+
+      /** Test data: the install script the stub git extracts, on one line. */
+      const STUB_INSTALL_TEXT = 'e8b install script (test data)'
+
+      /** A stub program: `bash` lines under a shebang naming the test run's bash, written 0755. */
+      function writeStub(dir: string, name: string, lines: readonly string[]): void {
+        e8Fs.writeFileSync(e8Path.join(dir, name), `#!${toolPath('bash')}\n${lines.join('\n')}\n`, { mode: 0o755 })
+      }
+
+      /** The record line every stub writes first: its name and arguments, tab-separated. */
+      const RECORD_CALL = (name: string): string => `{ printf "%s" "${name}"; printf "\\t%s" "$@"; printf "\\n"; } >> "$E8B_STUB_LOG"`
+
+      /**
+       * Runs the real step under bash in a child: a direct `hostSafeChildEnv`
+       * call with no tool, its PATH only a stub directory under the rig's root
+       * (stub docker, git and gh; links to sed, mktemp and rm), TMPDIR and
+       * `CSCB_AD_SRC_DIR` under the root, the rig's worktree as working
+       * directory, and a time limit. No real docker, git or gh is reached.
+       */
+      function runStep(stubs: StepStubs = {}): StepRun {
+        const rig = makeE8Rig(stubs.options)
+        const home = rig.env.HOME
+        if (home === undefined) throw new Error('the rig has no HOME')
+        const stubDir = e8Path.join(rig.root, 'e8b-stub-bin')
+        e8Fs.mkdirSync(stubDir)
+        for (const tool of STEP_PLAIN_TOOLS) e8Fs.symlinkSync(toolPath(tool), e8Path.join(stubDir, tool))
+        const callLog = e8Path.join(rig.root, 'e8b-stub-calls.log')
+        e8Fs.writeFileSync(callLog, '')
+        const token = e8FakeToken('', 'e8b-gh-stub')
+
+        writeStub(stubDir, 'docker', [
+          RECORD_CALL('docker'),
+          'ctx=""',
+          'for arg in "$@"; do case "$arg" in agent-director-install=*) ctx="${arg#agent-director-install=}" ;; esac; done',
+          'if [ -n "$ctx" ] && [ -f "$ctx/install.sh" ]; then printf "context\\t%s\\t%s\\n" "$ctx" "$(< "$ctx/install.sh")" >> "$E8B_STUB_LOG"; fi',
+          'if [ "${GH_TOKEN-}" = "$E8B_GH_TOKEN" ]; then printf "gh-token\\tsame\\n" >> "$E8B_STUB_LOG"; else printf "gh-token\\tother\\n" >> "$E8B_STUB_LOG"; fi',
+          'printf "path\\t%s\\n" "$PATH" >> "$E8B_STUB_LOG"',
+          'exit "$E8B_DOCKER_EXIT"',
+        ])
+        writeStub(stubDir, 'git', [
+          RECORD_CALL('git'),
+          'case "$3" in',
+          '  rev-parse) exit "$E8B_GIT_TAG_EXIT" ;;',
+          '  show) if [ "$E8B_GIT_SHOW_EXIT" != 0 ]; then printf "%s\\n" "$E8B_GIT_ERROR" >&2; exit "$E8B_GIT_SHOW_EXIT"; fi; printf "%s\\n" "$E8B_INSTALL_TEXT" ;;',
+          '  *) exit 99 ;;',
+          'esac',
+        ])
+        writeStub(stubDir, 'gh', [
+          '{ printf "gh"; printf "\\t%s" "$@"; printf "\\tGH_CONFIG_DIR=%s" "${GH_CONFIG_DIR-<unset>}"; printf "\\n"; } >> "$E8B_STUB_LOG"',
+          'printf "%s\\n" "$E8B_GH_TOKEN"',
+        ])
+
+        const extras: Record<string, string> = {
+          TMPDIR: rig.tempDir,
+          E8B_STUB_LOG: callLog,
+          E8B_GIT_TAG_EXIT: String(stubs.tagExit ?? 0),
+          E8B_GIT_SHOW_EXIT: String(stubs.showExit ?? 0),
+          E8B_GIT_ERROR,
+          E8B_INSTALL_TEXT: STUB_INSTALL_TEXT,
+          E8B_DOCKER_EXIT: String(stubs.dockerExit ?? 0),
+          E8B_GH_TOKEN: token,
+        }
+        if (stubs.noSourceDir !== true) extras[AD_SOURCE_DIR_VARIABLE] = rig.adSourceDir
+
+        const child = Bun.spawnSync({
+          cmd: [toolPath('bash'), STEP_PATH],
+          cwd: rig.worktreeRoot,
+          env: e8bHostSafeChildEnv(home, { tools: [], pathDirs: [stubDir], extras }),
+          stdin: 'ignore',
+          stdout: 'pipe',
+          stderr: 'pipe',
+          timeout: E8B_CHILD_LIMIT_MS,
+        })
+        expect(child.exitedDueToTimeout ?? false).toBe(false)
+        expect(child.signalCode ?? null).toBeNull()
+        const calls = e8Fs.readFileSync(callLog, 'utf-8').split('\n').filter((line) => line !== '').map((line) => line.split('\t'))
+        return { rig, exitCode: child.exitCode, stdout: child.stdout.toString(), stderr: child.stderr.toString(), calls, token }
+      }
+
+      /** The calls of one stub program. */
+      function callsOf(run: StepRun, name: string): (readonly string[])[] {
+        return run.calls.filter((call) => call[0] === name)
+      }
+
+      /** The step's install-script context directories left under the rig's TMPDIR. */
+      function contextsLeft(run: StepRun): string[] {
+        return e8Fs.readdirSync(run.rig.tempDir).filter((name) => name.startsWith(CONTEXT_PREFIX))
+      }
+
+      /** That a run reached no docker build, left no context directory and printed no secret. */
+      function expectNoBuildNoContextNoLeak(run: StepRun): void {
+        expect(callsOf(run, DOCKER_PROGRAM)).toEqual([])
+        expect(contextsLeft(run)).toEqual([])
+        e8AssertNoLeak({ stdout: run.stdout, stderr: run.stderr })
+      }
+
+      /** The step's own `non-runnable:` lines, in order, as written in it (`${NAME}` unexpanded). */
+      const NON_RUNNABLE_LINES = [...STEP_TEXT.matchAll(/^\s*echo "(non-runnable: [^"]*)" >&2$/gm)].map((m) => m[1]!)
+
+      /** A `non-runnable:` line with its `${NAME}` references expanded from `values`. */
+      function expanded(line: string, values: Readonly<Record<string, string>>): string {
+        return line.replace(/\$\{([A-Z_]+)\}/g, (_ref, name: string) => {
+          const value = values[name]
+          if (value === undefined) throw new Error(`no value for \${${name}}`)
+          return value
+        })
+      }
+
+      test('success exits 0 after exactly one docker build, of docker/Dockerfile.test.base; never an image inspect; git only reads, as the runner reads; the context directory is gone and the token is not printed', () => {
+        const run = runStep()
+        const { rig } = run
+        const home = rig.env.HOME ?? ''
+        expect(run.exitCode).toBe(0)
+        expect(run.stderr).toBe('')
+
+        const dockerCalls = callsOf(run, DOCKER_PROGRAM)
+        expect(dockerCalls).toHaveLength(1)
+        const build = dockerCalls[0]!
+        expect(build[1]).toBe('build')
+        expect(build[build.indexOf('-f') + 1]).toBe(BASE_DOCKERFILE_PATH)
+        expect(build.some((arg) => arg === 'inspect')).toBe(false)
+        expect(build.join(' ')).not.toContain(run.token)
+
+        // The step's git children are the runner's own step-4 forms, and only those.
+        expect(callsOf(run, GIT_PROGRAM)).toEqual(gitChecks(rig).map((argv) => [...argv]))
+        expect(callsOf(run, 'gh')).toEqual([[...GH_AUTH_TOKEN_ARGV, `GH_CONFIG_DIR=${ghPersonalConfigDir({ HOME: home })}`]])
+
+        // The build got the extracted install script's context under TMPDIR, and the token only in its environment.
+        const [context] = run.calls.filter((call) => call[0] === 'context')
+        expect(context?.[2]).toBe(STUB_INSTALL_TEXT)
+        expect(e8Path.dirname(context?.[1] ?? '')).toBe(rig.tempDir)
+        expect(e8Path.basename(context?.[1] ?? '').startsWith(CONTEXT_PREFIX)).toBe(true)
+        expect(run.calls.filter((call) => call[0] === 'gh-token')).toEqual([['gh-token', 'same']])
+        // The child's PATH is the stub directory alone.
+        expect(run.calls.filter((call) => call[0] === 'path')).toEqual([['path', e8Path.join(rig.root, 'e8b-stub-bin')]])
+
+        expect(CONTEXT_PREFIX).not.toBe('')
+        expect(contextsLeft(run)).toEqual([])
+        e8AssertNoLeak({ stdout: run.stdout, stderr: run.stderr })
+      }, E8B_CASE_TIMEOUT_MS)
+
+      /** One of the step's own checks failing: how, which of its `non-runnable:` lines it gives, and the git calls before it. */
+      const OWN_CHECKS: readonly (readonly [string, StepStubs, number, (run: StepRun) => readonly (readonly string[])[]])[] = [
+        ['docker/Dockerfile.test.base sets no ARG AD_VERSION', { options: { worktree: { dockerfiles: { adVersion: 'absent' } } } }, 0, () => []],
+        ['CSCB_AD_SRC_DIR is unset', { noSourceDir: true }, 1, () => []],
+        ['the checkout has no tag v<AD_VERSION>', { tagExit: 1 }, 2, (run) => gitChecks(run.rig).slice(0, 1)],
+        ['install.sh cannot be extracted at that tag', { showExit: 128 }, 3, (run) => gitChecks(run.rig)],
+      ]
+
+      test.each(OWN_CHECKS)('%s: exit 1 after its own non-runnable: line, no docker build and no context directory left', (_check, stubs, lineAt, gitCalls) => {
+        // One case per non-runnable line of the step's own.
+        expect(NON_RUNNABLE_LINES).toHaveLength(OWN_CHECKS.length)
+        const run = runStep(stubs)
+        const values: Record<string, string> = { CSCB_AD_SRC_DIR: run.rig.adSourceDir }
+        if (lineAt > 0) values.AD_TAG = run.rig.adTag()
+        expect(run.exitCode).toBe(1)
+        expect(run.stdout).toBe('')
+        const stderrLines = run.stderr.split('\n').filter((line) => line !== '')
+        expect(stderrLines.at(-1)).toBe(expanded(NON_RUNNABLE_LINES[lineAt]!, values))
+        expect(stderrLines.filter((line) => line.startsWith('non-runnable:'))).toHaveLength(1)
+        expect(callsOf(run, GIT_PROGRAM)).toEqual(gitCalls(run).map((argv) => [...argv]))
+        expect(callsOf(run, 'gh')).toEqual([])
+        expectNoBuildNoContextNoLeak(run)
+      }, E8B_CASE_TIMEOUT_MS)
+
+      test('a failing build exits with that build\'s own status, after removing the context directory', () => {
+        const status = 17
+        const run = runStep({ dockerExit: status })
+        expect(run.exitCode).toBe(status)
+        expect(run.stderr.split('\n').filter((line) => line.startsWith('non-runnable:'))).toEqual([])
+        expect(callsOf(run, DOCKER_PROGRAM)).toHaveLength(1)
+        expect(run.calls.filter((call) => call[0] === 'context')).toHaveLength(1)
+        expect(contextsLeft(run)).toEqual([])
+        e8AssertNoLeak({ stdout: run.stdout, stderr: run.stderr })
+      }, E8B_CASE_TIMEOUT_MS)
+    })
+
+    describe('step 12: the re-check and the base-build step (SR-9.2)', () => {
+      /** Test data: how long the scripted step runs, on the fake clock. */
+      const STEP_MS = 90_000
+      /** Test data: the step's output, as a quiet build prints it. */
+      const STEP_EARLY_LINE = '#1 [internal] load build definition from Dockerfile.test.base'
+      const STEP_STDOUT_LINE = `sha256:${'e8'.repeat(32)}`
+      const STEP_STDERR_LINE = 'ERROR: failed to solve: e8b test failure'
+
+      /** Step 4 on the rig, every prerequisite passing: the base found missing. */
+      async function missingAtStep4(rig: E8Rig): Promise<string> {
+        rig.answerPrerequisites()
+        const stage = await checkBaseImage(rig.deps, rig.state)
+        expect(stage.ok && stage.check.kind).toBe('missing')
+        return rig.baseImageName()
+      }
+
+      /** The spawns of the base-build step. */
+      function stepSpawns(rig: E8Rig): e8Helper.RecordedSpawn[] {
+        return rig.recorder.spawns().filter((s) => sameArgv(s.argv, baseBuildStepArgs(rig.worktreeRoot)))
+      }
+
+      test('missing at step 4 and still missing at the re-check: the step is spawned once, in its own process group, in the worktree, with the runner\'s environment, its output in the runner log and its start and end on the fake clock', async () => {
+        const rig = makeE8Rig()
+        const image = await missingAtStep4(rig)
+        const startOffsetMs = 60_000
+        await rig.clock.advance(startOffsetMs)
+        const startedAtMs = E8_START_MS + startOffsetMs
+        rig.answerBaseBuildStep({ delayMs: STEP_MS, earlyLines: [STEP_EARLY_LINE], stdout: `${STEP_STDOUT_LINE}\n` })
+
+        const running = runBaseBuild(rig.deps, rig.state, rig.log)
+        await rig.clock.flush()
+        const [spawned] = stepSpawns(rig)
+        expect(spawned).toBeDefined()
+        expect(rig.state.baseBuildStep?.pid).toBe(spawned!.pid)
+        expect(rig.state.baseBuildRun).toEqual({ startedAtMs, endedAtMs: null })
+        await rig.clock.advance(STEP_MS)
+        const stage = await running
+
+        const run = { startedAtMs, endedAtMs: startedAtMs + STEP_MS }
+        expect(stage).toEqual({ kind: 'built', run })
+        expect(rig.state.baseBuildRun).toEqual(run)
+        expect(rig.state.baseBuildStep).toBeNull()
+        expect(stepSpawns(rig).map((s) => ({ argv: s.argv, cwd: s.cwd, env: s.env, ownProcessGroup: s.ownProcessGroup, atMs: s.atMs }))).toEqual([
+          { argv: baseBuildStepArgs(rig.worktreeRoot), cwd: rig.worktreeRoot, env: rig.env, ownProcessGroup: true, atMs: startedAtMs },
+        ])
+        expect(spawned!.processGroup).toBe(spawned!.pid)
+        // The existence query at step 4 and the re-check: both of the base, nothing else from docker.
+        expect(dockerOperationRefs(rig)).toEqual([
+          { kind: 'image-inspect', refs: [image] },
+          { kind: 'image-inspect', refs: [image] },
+        ])
+        expect(rig.logLines).toEqual([STEP_EARLY_LINE, STEP_STDOUT_LINE])
+        e8AssertNoLeak({ stage, logLines: rig.logLines })
+      })
+
+      test('missing at step 4, then built by another run before the re-check: the step is not spawned and no base-build run is recorded', async () => {
+        const rig = makeE8Rig()
+        const image = await missingAtStep4(rig)
+        rig.addBaseImage()
+        const stage = await runBaseBuild(rig.deps, rig.state, rig.log)
+        expect(stage).toEqual({ kind: 'not-run', why: 'present-at-recheck' })
+        expect(stepSpawns(rig)).toEqual([])
+        expect([rig.state.baseBuildRun, rig.state.baseBuildStep]).toEqual([null, null])
+        expect(dockerOperationRefs(rig)).toEqual([
+          { kind: 'image-inspect', refs: [image] },
+          { kind: 'image-inspect', refs: [image] },
+        ])
+        expect(rig.logLines).toEqual([baseBuiltMeanwhileLine(image)])
+        e8AssertNoLeak({ stage, logLines: rig.logLines })
+      })
+
+      test('present at step 4: no re-check inspection and no step', async () => {
+        const rig = makeE8Rig()
+        rig.addBaseImage()
+        const check = await checkBaseImage(rig.deps, rig.state)
+        expect(check.ok).toBe(true)
+        const stage = await runBaseBuild(rig.deps, rig.state, rig.log)
+        expect(stage).toEqual({ kind: 'not-run', why: 'present-at-step-4' })
+        expect(dockerOperationRefs(rig)).toEqual([{ kind: 'image-inspect', refs: [rig.baseImageName()] }])
+        expect(rig.recorder.spawns()).toHaveLength(1)
+        expect([rig.state.baseBuildRun, rig.state.baseBuildStep]).toEqual([null, null])
+        expect(rig.logLines).toEqual([])
+        e8AssertNoLeak({ check: { ...check, secrets: null }, stage, logLines: rig.logLines })
+      })
+
+      test('a re-check that fails is logged, and the step runs: its own build answers for the base', async () => {
+        const rig = makeE8Rig()
+        const image = await missingAtStep4(rig)
+        rig.docker.fail('image-inspect')
+        rig.answerBaseBuildStep()
+        const stage = await runBaseBuild(rig.deps, rig.state, rig.log)
+        expect(stage).toEqual({ kind: 'built', run: { startedAtMs: E8_START_MS, endedAtMs: E8_START_MS } })
+        expect(stepSpawns(rig)).toHaveLength(1)
+        expect(rig.logLines).toHaveLength(1)
+        expectFramed(rig.logLines[0]!, baseRecheckFailedLine(image, E8B_MARK))
+        e8AssertNoLeak({ stage, logLines: rig.logLines })
+      })
+
+      test('a stop recorded before the step starts: the step is not spawned', async () => {
+        const rig = makeE8Rig()
+        await missingAtStep4(rig)
+        rig.recordStop()
+        const stage = await runBaseBuild(rig.deps, rig.state, rig.log)
+        expect(stage).toEqual({ kind: 'not-run', why: 'stop-recorded' })
+        expect(stepSpawns(rig)).toEqual([])
+        expect(rig.state.baseBuildRun).toBeNull()
+        e8AssertNoLeak({ stage, logLines: rig.logLines })
+      })
+
+      test.each([1, 17])('a step exiting %d fails with the exact image-build line naming that code; its output is in the runner log', async (code) => {
+        const rig = makeE8Rig()
+        await missingAtStep4(rig)
+        rig.answerBaseBuildStep({ exitCode: code, stderr: `${STEP_STDERR_LINE}\n` })
+        const stage = await runBaseBuild(rig.deps, rig.state, rig.log)
+        const run = { startedAtMs: E8_START_MS, endedAtMs: E8_START_MS }
+        expect(stage).toEqual({ kind: 'failed', run, exitCode: code, failure: imageBuildFailure(baseImageBuildFailedLine(code)) })
+        if (stage.kind === 'failed') {
+          expect(stage.failure.line).toBe(baseImageBuildFailedLine(code))
+          expect(stage.failure.line).toContain(`(exit ${code})`)
+        }
+        expect(stepSpawns(rig)).toHaveLength(1)
+        expect(rig.state.baseBuildStep).toBeNull()
+        expect(rig.logLines).toEqual([STEP_STDERR_LINE])
+        e8AssertNoLeak({ stage, logLines: rig.logLines })
+      })
+    })
+  })
+
+  // --- E8 test, drift and retag images (T6.S5-S6) ---
+
+  describe('step 12: the test image, the drift and retag images and the tag move (SR-9.3, SR-14.2)', () => {
+    type BuildOutcome = e8Runner.BuildOutcome
+    type Fault = e8Runner.Fault
+    type FaultController = e8Runner.FaultController
+    type FaultLabelValue = e8Runner.FaultLabelValue
+    type RecordedSpawn = e8Helper.RecordedSpawn
+    type TestTagReading = e8Runner.TestTagReading
+
+    /** Test data: how long a timed build lasts on the fake clock. */
+    const E8C_BUILD_MS = 10_000
+    /** Test data: the image ID a programmed test build prints. */
+    const E8C_PRINTED_ID = `sha256:${e8CreateHash('sha256').update('e8c printed test image').digest('hex')}`
+    /** Test data: a daemon's one-line error for a failed image inspect. */
+    const E8C_INSPECT_ERROR = 'Error response from daemon: e8c image inspect failure (test data)'
+    /** Test data: a daemon's one-line error for a failed tag move. */
+    const E8C_TAG_ERROR = 'Error response from daemon: e8c image tag failure (test data)'
+    /** Test data: why docker could not be started. */
+    const E8C_DOCKER_NOT_STARTED = 'spawn docker ENOENT'
+    /** Test data: the exit status of a failed drift or retag build, apart from `FAILURE_EXIT_STATUS` and the fake's default. */
+    const E8C_FAULT_BUILD_EXIT = 4
+    /** Test data: the exit status of a failed tag move. */
+    const E8C_TAG_EXIT = 3
+    /** The `--inject` values that need a fault image: one per role. */
+    const E8C_FAULT_IMAGE_VALUES = ['image-drift:1', 'retag'] as const
+
+    /** The run's `-test` tag. */
+    const testTag = (): string => e8Runner.formatRunTag(E8_OWNER, 'test')
+    /** The owner label's value, `<RUN_ID>-<PID>`. */
+    const ownerValue = (): string => e8Runner.formatOwner(E8_OWNER)
+
+    /** The test build as the runner should spawn it for this rig. */
+    function testBuildSpec(rig: E8Rig): e8Runner.TestImageBuildSpec {
+      return { dockerfilePath: e8Runner.TEST_DOCKERFILE_PATH, contextDir: rig.worktreeRoot, labels: { [e8Runner.OWNER_LABEL]: ownerValue() }, tag: testTag() }
+    }
+
+    /** A fault image's build as the runner should spawn it: FROM the `-test` tag, the owner and fault labels, its role's tag. */
+    function faultBuildSpec(role: FaultLabelValue): e8Runner.DerivedImageBuildSpec {
+      return { from: testTag(), labels: { [e8Runner.OWNER_LABEL]: ownerValue(), [e8Runner.FAULT_LABEL]: role }, tag: e8Runner.formatRunTag(E8_OWNER, role) }
+    }
+
+    /** The normalized faults of `/ci --inject <value>...`, through E2's validation as E13 hands them on. */
+    function faultsOf(rig: E8Rig, values: readonly string[]): readonly Fault[] {
+      return rig.validate(values.flatMap((value) => ['--inject', value])).invocation.faults
+    }
+
+    /** The one fault image role a single `--inject` value needs, from the runner. */
+    function roleOf(rig: E8Rig, value: string): FaultLabelValue {
+      const roles = e8Runner.faultImageRoles(faultsOf(rig, [value]))
+      expect(roles).toHaveLength(1)
+      return roles[0]!
+    }
+
+    /** T6.S5's pinned-image setup: builds the test image through the runner and answers the pinned ID. */
+    async function pinTestImage(rig: E8Rig): Promise<string> {
+      const report = await e8Runner.buildTestImage(rig.imagesContext, rig.state)
+      expect(report.failure).toBeNull()
+      const pinnedId = rig.state.images.pinnedId
+      if (pinnedId === null) throw new Error('pinTestImage: the test image was not pinned')
+      return pinnedId
+    }
+
+    /** A text's lines, without the empty piece after a final line feed. */
+    function linesOf(text: string): string[] {
+      const lines = text.split('\n')
+      if (lines.at(-1) === '') lines.pop()
+      return lines
+    }
+
+    /** The lines a build wrote, as its result holds them: standard output, then standard error. */
+    async function buildOutputLines(spawn: RecordedSpawn): Promise<string[]> {
+      const result = await spawn.result
+      return [...linesOf(new TextDecoder().decode(result.stdout)), ...linesOf(result.stderr)]
+    }
+
+    /** E12's real controller over these faults (no assignment is needed for drift and retag). */
+    function controllerFor(rig: E8Rig, faults: readonly Fault[]): FaultController {
+      return e8Runner.createFaultController({ faults, assignment: [], clock: rig.clock, runDir: rig.runDir, handler: () => undefined })
+    }
+
+    /** Hands a fault image's outcome to the controller as E13 does. */
+    function noteFaultBuild(controller: FaultController, role: FaultLabelValue, outcome: BuildOutcome): void {
+      if (role === 'drift') controller.noteDriftBuild(outcome)
+      else controller.noteRetagBuild(outcome)
+    }
+
+    /** The firing record of the fault a role serves. */
+    function recordFor(controller: FaultController, role: FaultLabelValue): e8Runner.FiringRecord {
+      const kind = role === 'drift' ? 'image-drift' : 'retag'
+      const found = controller.records().find((record) => record.fault.kind === kind)
+      if (found === undefined) throw new Error(`recordFor: no ${kind} fault`)
+      return found
+    }
+
+    /** E12's reason for a role's failed build, from its exported builder. */
+    function buildFailedReason(role: FaultLabelValue, exitCode: number): string {
+      return role === 'drift' ? e8Runner.driftBuildFailedReason(exitCode) : e8Runner.retagBuildFailedReason(exitCode)
+    }
+
+    /** A role's recorded image ID. */
+    function roleId(rig: E8Rig, role: FaultLabelValue): string | null {
+      return role === 'drift' ? rig.state.images.driftId : rig.state.images.retagId
+    }
+
+    /** Every image's tags, by ID. */
+    function tagsById(rig: E8Rig): Record<string, readonly string[]> {
+      return Object.fromEntries(rig.docker.images().map((image) => [image.id, image.tags]))
+    }
+
+    /** Every output an image case checks for a leak. */
+    function imageOutputs(rig: E8Rig, result: unknown): unknown {
+      return { result, state: rig.state, logLines: rig.logLines, images: rig.docker.images(), operations: rig.docker.operations(), runDir: e8WrittenFile(rig.runDir) }
+    }
+
+    describe('the test image: build and pin (SR-9.3)', () => {
+      test('the test build is spawned once from docker/Dockerfile.test with the worktree as context, in its own process group, its output in the runner log, carrying exactly the run\'s owner label', async () => {
+        const rig = makeE8Rig()
+        const report = await e8Runner.buildTestImage(rig.imagesContext, rig.state)
+        expect(report.outcome.kind).toBe('built')
+
+        const spawns = rig.recorder.spawns()
+        expect(spawns).toHaveLength(1)
+        const [spawn] = spawns
+        expect(spawn!.argv).toEqual(e8Runner.testImageBuildArgs(testBuildSpec(rig)))
+        expect(spawn!.argv).toContain(e8Runner.TEST_DOCKERFILE_PATH)
+        expect(spawn!.argv.at(-1)).toBe(rig.worktreeRoot)
+        expect(spawn!.cwd).toBe(rig.worktreeRoot)
+        expect(spawn!.stdin).toBeNull()
+        expect(spawn!.ownProcessGroup).toBe(true)
+        expect(spawn!.processGroup).not.toBeNull()
+        expect(spawn!.processGroup).toBe(spawn!.pid)
+        expect(rig.docker.operations('image-build').map((op) => op.processGroup)).toEqual([spawn!.processGroup])
+
+        const pinnedId = rig.state.images.pinnedId!
+        expect(rig.docker.image(pinnedId)?.labels).toEqual({ [e8Runner.OWNER_LABEL]: ownerValue() })
+        const output = await buildOutputLines(spawn!)
+        expect(output.some((line) => line.includes(pinnedId))).toBe(true)
+        expect(rig.logLines).toEqual(output)
+        expect(rig.state.imageBuildInProgress).toBeNull()
+        expect(rig.state.images.buildsStarted).toEqual({ test: true, drift: false, retag: false })
+        e8AssertNoLeak(imageOutputs(rig, report))
+      })
+
+      test('the pinned ID is the ID the build printed, at the clock\'s moment the build ended, while a tag lookup would answer a decoy; no lookup or listing is made', async () => {
+        const rig = makeE8Rig()
+        rig.docker.programBuild({ kind: 'built', imageId: E8C_PRINTED_ID, durationMs: E8C_BUILD_MS }, { role: 'test' })
+        // As soon as the build has printed its ID (the fake has tagged its image), the -test tag moves to a decoy with the run's owner label.
+        let decoyId: string | null = null
+        const log: e8Runner.RunnerLogSink = (line) => {
+          rig.log(line)
+          if (decoyId === null && line.includes(E8C_PRINTED_ID)) decoyId = rig.docker.addImage({ tags: [testTag()], labels: { [e8Runner.OWNER_LABEL]: ownerValue() } })
+        }
+        const building = e8Runner.buildTestImage({ ...rig.imagesContext, log }, rig.state)
+        await rig.clock.advance(E8C_BUILD_MS)
+        const report = await building
+
+        expect(report).toEqual({ outcome: { kind: 'built', imageId: E8C_PRINTED_ID }, failure: null })
+        expect(decoyId).not.toBeNull()
+        expect(decoyId).not.toBe(E8C_PRINTED_ID)
+        expect(rig.docker.image(testTag())?.id).toBe(decoyId!)
+        expect(rig.state.images.pinnedId).toBe(E8C_PRINTED_ID)
+        expect(rig.state.images.pinnedAtMs).toBe(E8_START_MS + E8C_BUILD_MS)
+        expect(rig.state.images.builds.test).toEqual({ kind: 'built', imageId: E8C_PRINTED_ID })
+        expect(rig.docker.operations().map((op) => op.kind)).toEqual(['image-build'])
+        e8AssertNoLeak(imageOutputs(rig, report))
+      })
+
+      test.each([[[] as string[]], [['kill:1']]])('with faults %j the run\'s only tag is -test, on the pinned image; no fault image is built and the tag move spawns nothing', async (values) => {
+        const rig = makeE8Rig()
+        const baseId = rig.addBaseImage()
+        const before = tagsById(rig)
+        const faults = faultsOf(rig, values)
+        expect(e8Runner.faultImageRoles(faults)).toEqual([])
+
+        const pinnedId = await pinTestImage(rig)
+        const outcomes = await e8Runner.buildFaultImages(rig.imagesContext, rig.state, faults)
+        expect(outcomes).toEqual({ drift: { kind: 'not-built' }, retag: { kind: 'not-built' } })
+        const spawned = rig.recorder.spawns().length
+        expect(await e8Runner.moveTestTagToRetagImage(rig.imagesContext, rig.state)).toEqual({ kind: 'not-tried' })
+        expect(rig.recorder.spawns()).toHaveLength(spawned)
+
+        expect(tagsById(rig)).toEqual({ ...before, [pinnedId]: [testTag()] })
+        expect(rig.docker.image(baseId)?.tags).toEqual(before[baseId])
+        expect(rig.docker.operations().map((op) => op.kind)).toEqual(['image-build'])
+        const images = rig.state.images
+        expect([images.driftId, images.retagId, images.retagMoved]).toEqual([null, null, false])
+        expect([images.builds.drift, images.builds.retag]).toEqual([{ kind: 'not-built' }, { kind: 'not-built' }])
+        expect(images.buildsStarted).toEqual({ test: true, drift: false, retag: false })
+        expect(images.tagsMade).toEqual({ test: true, drift: false, retag: false })
+        e8AssertNoLeak(imageOutputs(rig, outcomes))
+      })
+
+      /** One failed test build: how it fails, its exit status, and whether it was spawned and made its tag. */
+      const TEST_BUILD_FAILURES: readonly (readonly [string, (rig: E8Rig) => void, number, { readonly started: boolean; readonly tagMade: boolean }])[] = [
+        ['a non-zero exit', (rig) => rig.docker.programBuild({ kind: 'failed', exitCode: 2 }, { role: 'test' }), 2, { started: true, tagMade: false }],
+        [
+          'docker not started',
+          (rig) => rig.recorder.answer(e8Runner.testImageBuildArgs(testBuildSpec(rig)), { notStarted: E8C_DOCKER_NOT_STARTED }),
+          SPAWN_FAILED_EXIT_STATUS,
+          { started: false, tagMade: false },
+        ],
+        // The fake always prints an ID for a built image, so this one answers the build's argument list directly: exit 0, no ID in its output.
+        ['exit 0 with no image ID in its output', (rig) => rig.recorder.answer(e8Runner.testImageBuildArgs(testBuildSpec(rig)), { stderr: '#1 DONE 0.0s\n' }), 0, { started: true, tagMade: true }],
+      ]
+
+      test.each(TEST_BUILD_FAILURES)('a test build with %s is the image build failure line with its exit status, and nothing is pinned', async (_what, arrange, exitCode, expected) => {
+        const rig = makeE8Rig()
+        arrange(rig)
+        const report = await e8Runner.buildTestImage(rig.imagesContext, rig.state)
+
+        const line = e8Runner.testImageBuildFailedLine(exitCode)
+        expect(report).toEqual({ outcome: { kind: 'failed', exitCode }, failure: e8Runner.imageBuildFailure(line) })
+        expect(report.failure?.line).toBe(line)
+        expect(line.startsWith(e8Runner.FAIL_PREFIX)).toBe(true)
+        expect(line).toContain(String(exitCode))
+        const images = rig.state.images
+        expect([images.pinnedId, images.pinnedAtMs]).toEqual([null, null])
+        expect(images.builds.test).toEqual({ kind: 'failed', exitCode })
+        expect(images.buildsStarted.test).toBe(expected.started)
+        expect(images.tagsMade.test).toBe(expected.tagMade)
+        expect(rig.state.imageBuildInProgress).toBeNull()
+        expect(rig.recorder.spawns()).toHaveLength(1)
+        e8AssertNoLeak(imageOutputs(rig, report))
+      })
+
+      test('once the stop record is set no build starts: the test build and both fault builds are not-built and the tag move not-tried', async () => {
+        const rig = makeE8Rig()
+        rig.recordStop()
+        const faults = faultsOf(rig, E8C_FAULT_IMAGE_VALUES)
+        expect(await e8Runner.buildTestImage(rig.imagesContext, rig.state)).toEqual({ outcome: { kind: 'not-built' }, failure: null })
+        expect(await e8Runner.buildFaultImages(rig.imagesContext, rig.state, faults)).toEqual({ drift: { kind: 'not-built' }, retag: { kind: 'not-built' } })
+        expect(await e8Runner.moveTestTagToRetagImage(rig.imagesContext, rig.state)).toEqual({ kind: 'not-tried' })
+        expect(rig.recorder.spawns()).toEqual([])
+        expect(rig.state.images).toEqual(initialImageState())
+        e8AssertNoLeak(imageOutputs(rig, null))
+      })
+
+      test('a stop recorded after the retag image is built leaves the drift build not-built and the tag move not-tried, spawning nothing more', async () => {
+        const rig = makeE8Rig()
+        await pinTestImage(rig)
+        expect((await e8Runner.buildFaultImage(rig.imagesContext, rig.state, roleOf(rig, 'retag'))).kind).toBe('built')
+        const retagId = rig.state.images.retagId
+        expect(retagId).not.toBeNull()
+        const spawned = rig.recorder.spawns().length
+        rig.recordStop()
+
+        expect(await e8Runner.buildFaultImage(rig.imagesContext, rig.state, roleOf(rig, 'image-drift:1'))).toEqual({ kind: 'not-built' })
+        expect(await e8Runner.moveTestTagToRetagImage(rig.imagesContext, rig.state)).toEqual({ kind: 'not-tried' })
+        expect(rig.recorder.spawns()).toHaveLength(spawned)
+        expect(rig.docker.image(testTag())?.id).toBe(rig.state.images.pinnedId!)
+        expect([rig.state.images.builds.drift, rig.state.images.retagMoved]).toEqual([{ kind: 'not-built' }, false])
+        e8AssertNoLeak(imageOutputs(rig, null))
+      })
+    })
+
+    describe('the drift and retag images (SR-14.2)', () => {
+      test.each(E8C_FAULT_IMAGE_VALUES.map((value) => [value] as const))('with %s its image is built FROM the -test tag in its own process group, labelled with the owner and its fault value, tagged by its role, its ID from its own output', async (value) => {
+        const rig = makeE8Rig()
+        const pinnedId = await pinTestImage(rig)
+        const role = roleOf(rig, value)
+        const logStart = rig.logLines.length
+        const opStart = rig.docker.operations().length
+        const outcomes = await e8Runner.buildFaultImages(rig.imagesContext, rig.state, faultsOf(rig, [value]))
+
+        const spawn = rig.recorder.spawns().find((s) => s.argv.includes(e8Runner.formatRunTag(E8_OWNER, role)))!
+        const spec = faultBuildSpec(role)
+        expect(spawn.argv).toEqual(e8Runner.derivedImageBuildArgs(spec))
+        expect(spawn.stdin).toBe(e8Runner.derivedImageDockerfile(spec))
+        expect(spawn.stdin).toContain(testTag())
+        expect(spawn.stdin).not.toContain(pinnedId)
+        expect(spawn.ownProcessGroup).toBe(true)
+        expect(spawn.processGroup).not.toBeNull()
+        expect(spawn.processGroup).toBe(spawn.pid)
+
+        const output = await buildOutputLines(spawn)
+        const printed = output.flatMap((line) => e8Runner.BUILD_IMAGE_ID_PATTERN.exec(line)?.[1] ?? [])
+        expect(printed).toHaveLength(1)
+        const builtId = printed[0]!
+        expect(outcomes[role]).toEqual({ kind: 'built', imageId: builtId })
+        expect(roleId(rig, role)).toBe(builtId)
+        expect(builtId).not.toBe(pinnedId)
+        expect(rig.docker.image(builtId)).toEqual({
+          id: builtId,
+          tags: [e8Runner.formatRunTag(E8_OWNER, role)],
+          labels: { [e8Runner.OWNER_LABEL]: ownerValue(), [e8Runner.FAULT_LABEL]: role },
+        })
+        expect(rig.docker.image(pinnedId)?.tags).toEqual([testTag()])
+        expect(rig.logLines.slice(logStart)).toEqual(output)
+
+        const checks = rig.docker.operations().slice(opStart)
+        expect(checks.map((op) => op.kind)).toEqual(['image-inspect', 'image-build', 'image-inspect'])
+        expect(checks.map((op) => op.refs)).toEqual([[testTag()], [e8Runner.formatRunTag(E8_OWNER, role)], [testTag()]])
+        const other = e8Runner.FAULT_LABEL_VALUES.find((candidate) => candidate !== role)!
+        expect(outcomes[other]).toEqual({ kind: 'not-built' })
+        expect(rig.state.images.buildsStarted[role]).toBe(true)
+        expect(rig.state.images.tagsMade[role]).toBe(true)
+        expect(e8Runner.shardStartImageId(rig.state.images, true)).toBe(role === 'drift' ? builtId : pinnedId)
+        expect(e8Runner.shardStartImageId(rig.state.images, false)).toBe(pinnedId)
+        e8AssertNoLeak(imageOutputs(rig, outcomes))
+      })
+
+      test('with image-drift and retag both, drift is built first, then retag, and the pinned, drift and retag IDs all differ as the fake reports them', async () => {
+        const rig = makeE8Rig()
+        const pinnedId = await pinTestImage(rig)
+        const faults = faultsOf(rig, ['retag', 'image-drift:1'])
+        const outcomes = await e8Runner.buildFaultImages(rig.imagesContext, rig.state, faults)
+
+        const driftTag = e8Runner.formatRunTag(E8_OWNER, 'drift')
+        const retagTag = e8Runner.formatRunTag(E8_OWNER, 'retag')
+        expect(rig.docker.operations('image-build').map((op) => op.refs)).toEqual([[testTag()], [driftTag], [retagTag]])
+        const driftId = rig.state.images.driftId!
+        const retagId = rig.state.images.retagId!
+        expect(outcomes).toEqual({ drift: { kind: 'built', imageId: driftId }, retag: { kind: 'built', imageId: retagId } })
+        expect([rig.docker.image(testTag())?.id, rig.docker.image(driftTag)?.id, rig.docker.image(retagTag)?.id]).toEqual([pinnedId, driftId, retagId])
+        expect(new Set([pinnedId, driftId, retagId]).size).toBe(3)
+        expect(rig.docker.image(driftId)?.labels[e8Runner.FAULT_LABEL]).toBe('drift')
+        expect(rig.docker.image(retagId)?.labels[e8Runner.FAULT_LABEL]).toBe('retag')
+        expect(rig.state.images.tagsMade).toEqual({ test: true, drift: true, retag: true })
+        e8AssertNoLeak(imageOutputs(rig, outcomes))
+      })
+
+      /** One failed fault build: how it fails, and its exit status and whether it was spawned. */
+      const FAULT_BUILD_FAILURES: readonly (readonly [string, (rig: E8Rig, role: FaultLabelValue) => void, number, boolean])[] = [
+        ['a non-zero exit', (rig, role) => rig.docker.programBuild({ kind: 'failed', exitCode: E8C_FAULT_BUILD_EXIT }, { role }), E8C_FAULT_BUILD_EXIT, true],
+        [
+          'docker not started',
+          (rig, role) => rig.recorder.answer(e8Runner.derivedImageBuildArgs(faultBuildSpec(role)), { notStarted: E8C_DOCKER_NOT_STARTED }),
+          SPAWN_FAILED_EXIT_STATUS,
+          false,
+        ],
+      ]
+      const FAULT_BUILD_FAILURE_ROWS = E8C_FAULT_IMAGE_VALUES.flatMap((value) => FAULT_BUILD_FAILURES.map(([what, arrange, exitCode, started]) => [value, what, arrange, exitCode, started] as const))
+
+      test.each(FAULT_BUILD_FAILURE_ROWS)('with %s, a build with %s records its failed outcome; E12\'s reason names its exit status; no ID is recorded and no tag is moved', async (value, _what, arrange, exitCode, started) => {
+        const rig = makeE8Rig()
+        const pinnedId = await pinTestImage(rig)
+        const faults = faultsOf(rig, [value])
+        const role = roleOf(rig, value)
+        arrange(rig, role)
+        const outcomes = await e8Runner.buildFaultImages(rig.imagesContext, rig.state, faults)
+
+        expect(outcomes[role]).toEqual({ kind: 'failed', exitCode })
+        expect(rig.state.images.builds[role]).toEqual({ kind: 'failed', exitCode })
+        expect(roleId(rig, role)).toBeNull()
+        expect(rig.state.images.buildsStarted[role]).toBe(started)
+        expect(rig.state.images.tagsMade[role]).toBe(false)
+        expect(rig.state.imageBuildInProgress).toBeNull()
+        expect(rig.docker.image(e8Runner.formatRunTag(E8_OWNER, role))).toBeNull()
+        expect(e8Runner.shardStartImageId(rig.state.images, true)).toBe(pinnedId)
+
+        const controller = controllerFor(rig, faults)
+        noteFaultBuild(controller, role, outcomes[role])
+        const spawned = rig.recorder.spawns().length
+        const move = await e8Runner.moveTestTagToRetagImage(rig.imagesContext, rig.state)
+        expect(move).toEqual({ kind: 'not-tried' })
+        controller.noteTagMove(move)
+        expect(rig.recorder.spawns()).toHaveLength(spawned)
+        expect(rig.docker.operations('image-tag')).toEqual([])
+        expect(rig.docker.image(testTag())?.id).toBe(pinnedId)
+        const record = recordFor(controller, role)
+        expect([record.state, record.reason]).toEqual(['not-fired', buildFailedReason(role, exitCode)])
+        expect(record.reason).toContain(String(exitCode))
+        e8AssertNoLeak(imageOutputs(rig, { outcomes, records: controller.records() }))
+      })
+
+      /** One way the before-check finds the `-test` tag not naming the pinned ID: arranges it and answers the pinned ID and the reading. */
+      const BEFORE_CHECK_MISMATCHES: readonly (readonly [string, (rig: E8Rig) => Promise<{ readonly pinnedId: string; readonly reading: TestTagReading }>])[] = [
+        [
+          'naming another image',
+          async (rig) => {
+            const pinnedId = await pinTestImage(rig)
+            const decoyId = rig.docker.addImage({ tags: [testTag()], labels: { [e8Runner.OWNER_LABEL]: ownerValue() } })
+            return { pinnedId, reading: { kind: 'image', imageId: decoyId } }
+          },
+        ],
+        [
+          'naming no image',
+          async (rig) => {
+            const pinnedId = rig.docker.addImage({ labels: { [e8Runner.OWNER_LABEL]: ownerValue() } })
+            rig.state.images = { ...initialImageState(), pinnedId }
+            return { pinnedId, reading: { kind: 'missing' } }
+          },
+        ],
+        [
+          'that cannot be read',
+          async (rig) => {
+            const pinnedId = await pinTestImage(rig)
+            rig.docker.fail('image-inspect', { stderr: E8C_INSPECT_ERROR })
+            return { pinnedId, reading: { kind: 'unreadable', error: E8C_INSPECT_ERROR } }
+          },
+        ],
+      ]
+      const BEFORE_CHECK_ROWS = E8C_FAULT_IMAGE_VALUES.flatMap((value) => BEFORE_CHECK_MISMATCHES.map(([what, arrange]) => [value, what, arrange] as const))
+
+      test.each(BEFORE_CHECK_ROWS)('with %s, a -test tag %s before the build starts no build: a failed outcome, one log line, no tag made', async (value, _what, arrange) => {
+        const rig = makeE8Rig()
+        const { pinnedId, reading } = await arrange(rig)
+        const role = roleOf(rig, value)
+        const logStart = rig.logLines.length
+        const spawnStart = rig.recorder.spawns().length
+        const outcome = await e8Runner.buildFaultImage(rig.imagesContext, rig.state, role)
+
+        expect(outcome).toEqual({ kind: 'failed', exitCode: e8Runner.FAILURE_EXIT_STATUS })
+        expect(rig.recorder.argvs().slice(spawnStart)).toEqual([e8Runner.imageInspectArgs([testTag()])])
+        expect(rig.docker.operations('image-build').map((op) => op.refs)).not.toContainEqual([e8Runner.formatRunTag(E8_OWNER, role)])
+        expect(rig.logLines.slice(logStart)).toEqual([e8Runner.testTagCheckFailedLine(role, 'before', testTag(), pinnedId, reading)])
+        expect(rig.state.images.builds[role]).toEqual(outcome)
+        expect(roleId(rig, role)).toBeNull()
+        expect(rig.state.images.buildsStarted[role]).toBe(false)
+        expect(rig.state.images.tagsMade[role]).toBe(false)
+
+        const controller = controllerFor(rig, faultsOf(rig, [value]))
+        noteFaultBuild(controller, role, outcome)
+        expect(recordFor(controller, role).reason).toBe(buildFailedReason(role, e8Runner.FAILURE_EXIT_STATUS))
+        e8AssertNoLeak(imageOutputs(rig, { outcome, records: controller.records() }))
+      })
+
+      /** One way the after-check finds the `-test` tag not naming the pinned ID, arranged from a fake-clock timer while the build runs; answers the reading. */
+      const AFTER_CHECK_MISMATCHES: readonly (readonly [string, (rig: E8Rig) => () => TestTagReading])[] = [
+        [
+          'moved to another image',
+          (rig) => {
+            let decoyId: string | null = null
+            rig.clock.setTimeout(() => {
+              decoyId = rig.docker.addImage({ tags: [testTag()] })
+            }, E8C_BUILD_MS / 2)
+            return () => ({ kind: 'image', imageId: decoyId! })
+          },
+        ],
+        [
+          'that cannot be read',
+          (rig) => {
+            rig.clock.setTimeout(() => rig.docker.fail('image-inspect', { stderr: E8C_INSPECT_ERROR }), E8C_BUILD_MS / 2)
+            return () => ({ kind: 'unreadable', error: E8C_INSPECT_ERROR })
+          },
+        ],
+      ]
+      const AFTER_CHECK_ROWS = E8C_FAULT_IMAGE_VALUES.flatMap((value) => AFTER_CHECK_MISMATCHES.map(([what, arrange]) => [value, what, arrange] as const))
+
+      test.each(AFTER_CHECK_ROWS)('with %s, a -test tag %s during the build fails it after: its image is built and tagged but its ID not used, one log line', async (value, _what, arrange) => {
+        const rig = makeE8Rig()
+        const pinnedId = await pinTestImage(rig)
+        const role = roleOf(rig, value)
+        rig.docker.programBuild({ kind: 'built', durationMs: E8C_BUILD_MS }, { role })
+        const readingOf = arrange(rig)
+        const logStart = rig.logLines.length
+        const opStart = rig.docker.operations().length
+        const building = e8Runner.buildFaultImage(rig.imagesContext, rig.state, role)
+        await rig.clock.advance(E8C_BUILD_MS)
+        const outcome = await building
+
+        expect(outcome).toEqual({ kind: 'failed', exitCode: e8Runner.FAILURE_EXIT_STATUS })
+        expect(rig.docker.operations().slice(opStart).map((op) => op.kind)).toEqual(['image-inspect', 'image-build', 'image-inspect'])
+        const built = rig.docker.image(e8Runner.formatRunTag(E8_OWNER, role))
+        expect(built).not.toBeNull()
+        expect(built?.id).not.toBe(pinnedId)
+        expect(built?.labels[e8Runner.FAULT_LABEL]).toBe(role)
+        const checkLine = e8Runner.testTagCheckFailedLine(role, 'after', testTag(), pinnedId, readingOf())
+        const logged = rig.logLines.slice(logStart)
+        expect(logged.at(-1)).toBe(checkLine)
+        expect(logged.filter((line) => line === checkLine)).toHaveLength(1)
+        expect(rig.state.images.builds[role]).toEqual(outcome)
+        expect(roleId(rig, role)).toBeNull()
+        expect(rig.state.images.buildsStarted[role]).toBe(true)
+        expect(rig.state.images.tagsMade[role]).toBe(true)
+        expect(rig.state.imageBuildInProgress).toBeNull()
+        expect(e8Runner.shardStartImageId(rig.state.images, true)).toBe(pinnedId)
+        expect(await e8Runner.moveTestTagToRetagImage(rig.imagesContext, rig.state)).toEqual({ kind: 'not-tried' })
+        expect(rig.docker.operations('image-tag')).toEqual([])
+
+        const controller = controllerFor(rig, faultsOf(rig, [value]))
+        noteFaultBuild(controller, role, outcome)
+        expect(recordFor(controller, role).reason).toBe(buildFailedReason(role, e8Runner.FAILURE_EXIT_STATUS))
+        e8AssertNoLeak(imageOutputs(rig, { outcome, records: controller.records() }))
+      })
+    })
+
+    describe('the tag move (SR-14.2)', () => {
+      /** Pins the test image and builds the drift and retag images, with the base image and an unrelated image in the fake too; answers the pinned and retag IDs and the faults. */
+      async function buildForMove(rig: E8Rig): Promise<{ readonly pinnedId: string; readonly retagId: string; readonly faults: readonly Fault[] }> {
+        rig.addBaseImage()
+        rig.docker.addImage({ tags: ['e8c-unrelated:latest'] })
+        const pinnedId = await pinTestImage(rig)
+        const faults = faultsOf(rig, E8C_FAULT_IMAGE_VALUES)
+        await e8Runner.buildFaultImages(rig.imagesContext, rig.state, faults)
+        const retagId = rig.state.images.retagId
+        if (retagId === null) throw new Error('buildForMove: no retag image')
+        return { pinnedId, retagId, faults }
+      }
+
+      test('the move takes -test onto the retag image\'s ID with one docker image tag, changes no other tag and sets retagMoved; E12 records retag fired', async () => {
+        const rig = makeE8Rig()
+        const { pinnedId, retagId, faults } = await buildForMove(rig)
+        const before = tagsById(rig)
+        const spawnStart = rig.recorder.spawns().length
+        const logStart = rig.logLines.length
+        const moved = await e8Runner.moveTestTagToRetagImage(rig.imagesContext, rig.state)
+
+        expect(moved).toEqual({ kind: 'moved' })
+        expect(rig.state.images.retagMoved).toBe(true)
+        expect(rig.recorder.argvs().slice(spawnStart)).toEqual([e8Runner.imageTagArgs(retagId, testTag())])
+        expect(rig.docker.operations('image-tag').map((op) => op.refs)).toEqual([[retagId, testTag()]])
+        expect(rig.docker.image(testTag())?.id).toBe(retagId)
+        const expected = Object.fromEntries(
+          Object.entries(before).map(([id, tags]) => [id, [...tags.filter((tag) => tag !== testTag()), ...(id === retagId ? [testTag()] : [])]]),
+        )
+        expect(tagsById(rig)).toEqual(expected)
+        expect(rig.docker.image(pinnedId)?.tags).toEqual([])
+        expect(rig.logLines.slice(logStart)).toEqual([])
+
+        const controller = controllerFor(rig, faults)
+        controller.noteRetagBuild(rig.state.images.builds.retag)
+        controller.noteTagMove(moved)
+        expect([recordFor(controller, 'retag').state, recordFor(controller, 'retag').reason]).toEqual(['fired', null])
+        e8AssertNoLeak(imageOutputs(rig, { moved, records: controller.records() }))
+      })
+
+      /** One failed move: how it fails, its exit status and its error text. */
+      const MOVE_FAILURES: readonly (readonly [string, (rig: E8Rig, retagId: string) => void, number, string])[] = [
+        ['docker exits non-zero', (rig) => rig.docker.fail('image-tag', { exitCode: E8C_TAG_EXIT, stderr: E8C_TAG_ERROR }), E8C_TAG_EXIT, E8C_TAG_ERROR],
+        [
+          'docker not started',
+          (rig, retagId) => rig.recorder.answer(e8Runner.imageTagArgs(retagId, testTag()), { notStarted: E8C_DOCKER_NOT_STARTED }),
+          SPAWN_FAILED_EXIT_STATUS,
+          E8C_DOCKER_NOT_STARTED,
+        ],
+      ]
+
+      test.each(MOVE_FAILURES)('a move where %s is a failed outcome with its exit status, one log line, retagMoved false and every tag unchanged; E12\'s reason names the status', async (_what, arrange, exitCode, error) => {
+        const rig = makeE8Rig()
+        const { pinnedId, retagId, faults } = await buildForMove(rig)
+        arrange(rig, retagId)
+        const before = tagsById(rig)
+        const logStart = rig.logLines.length
+        const moved = await e8Runner.moveTestTagToRetagImage(rig.imagesContext, rig.state)
+
+        expect(moved).toEqual({ kind: 'failed', exitCode })
+        expect(rig.state.images.retagMoved).toBe(false)
+        expect(rig.logLines.slice(logStart)).toEqual([e8Runner.tagMoveFailedLogLine(testTag(), retagId, exitCode, error)])
+        expect(tagsById(rig)).toEqual(before)
+        expect(rig.docker.image(testTag())?.id).toBe(pinnedId)
+
+        const controller = controllerFor(rig, faults)
+        controller.noteRetagBuild(rig.state.images.builds.retag)
+        controller.noteTagMove(moved)
+        const record = recordFor(controller, 'retag')
+        expect([record.state, record.reason]).toEqual(['not-fired', e8Runner.tagMoveFailedReason(exitCode)])
+        expect(record.reason).toContain(String(exitCode))
+        e8AssertNoLeak(imageOutputs(rig, { moved, records: controller.records() }))
+      })
+    })
+  })
+
+  // --- E8 read-back (T6.S7) ---
+
+  describe('step 12: reading the pinned image back (SR-9.4; AC 27, AC 44)', () => {
+    const {
+      CI_LABEL,
+      CI_LABEL_VALUE,
+      containerCopyOutArgs,
+      containerCreateArgs,
+      containerRemoveArgs,
+      DOCKER_NO_SUCH_IMAGE_TEXT,
+      DURATION_TABLE_PATH,
+      IMAGE_TESTS_DIR,
+      imageAddedScriptReason,
+      imageDurationTableMissingText,
+      imageDurationTableNotRegularText,
+      imageMissingScriptReason,
+      imageNotRegularEntryReason,
+      imagePrerequisiteDifferenceReason,
+      INTEGRATION_DIR_PATH,
+      NOT_RUN_PREFIX,
+      numberFormOf,
+      OWNER_LABEL,
+      parsePrerequisiteLines,
+      readBackArchiveUnreadableText,
+      readBackFailedReason,
+      readBackIntegrationUnlistableText,
+      readBackPinnedImage,
+      readContainerCopyFailedText,
+      readContainerCreateFailedText,
+      readContainerLabels,
+      readContainerName,
+      readContainerRemovalFailedText,
+      removeReadContainerIfPresent,
+      TAR_BLOCK_BYTES,
+    } = e8Runner
+    const { buildTarArchive, durationTableText, minimalScriptText, realScriptFileName } = e8Helper
+    type PrerequisiteLine = e8Helper.PrerequisiteLine
+    type ReadBackOutcome = e8Runner.ReadBackOutcome
+    type OperationKind = e8Helper.FakeDockerOperationKind
+
+    /** Test data: the duration table, a carriage return on its second line and no final line feed, so a text handed on unchanged is visibly so. */
+    const E8D_TABLE_TEXT = durationTableText({
+      kind: 'rows',
+      header: null,
+      rows: [
+        { script: 1, seconds: 40 },
+        { script: 3, seconds: 95 },
+      ],
+      carriageReturns: [2],
+      finalNewline: false,
+    })
+    /** The archive's name for the image's `/tests`: `docker container cp <c>:/tests -` names its entries `tests/...`. */
+    const E8D_TESTS_ENTRY = IMAGE_TESTS_DIR.slice(1)
+    /** Test data: a pinned ID of the right form that no image of the fake has: the image is gone. */
+    const E8D_GONE_IMAGE_ID = `sha256:${'e8d0'.repeat(16)}`
+    /** The read container's operations when its create succeeds: one create, one copy-out of `/tests`, one removal. */
+    const READ_KINDS: readonly OperationKind[] = ['container-create', 'container-copy', 'container-remove']
+
+    /** A rig whose worktree carries the region's duration table and these prerequisite lines by script number, without the scripts numbered `without`. */
+    function makeReadBackRig(prerequisites: Readonly<Record<number, readonly PrerequisiteLine[]>> = {}, without: readonly number[] = []): E8Rig {
+      return makeE8Rig({ worktree: { prerequisites, without, durationTable: { kind: 'text', text: E8D_TABLE_TEXT } } })
+    }
+
+    /** What an image built from the rig's worktree holds under `/tests`, as `buildTarArchive` entries: `tests/`, `tests/integration/`, every script with its worktree bytes, and the duration table when the worktree has one. */
+    function worktreeTestsEntries(rig: E8Rig): Record<string, string | Uint8Array> {
+      const entries: Record<string, string | Uint8Array> = { [`${E8D_TESTS_ENTRY}/`]: '', [`${INTEGRATION_DIR_PATH}/`]: '' }
+      for (const fileName of e8Fs.readdirSync(rig.worktree.integrationDir).sort()) {
+        entries[`${INTEGRATION_DIR_PATH}/${fileName}`] = e8Fs.readFileSync(e8Path.join(rig.worktree.integrationDir, fileName))
+      }
+      if (e8Fs.existsSync(rig.worktree.durationTablePath)) entries[DURATION_TABLE_PATH] = e8Fs.readFileSync(rig.worktree.durationTablePath)
+      return entries
+    }
+
+    /** Adds an image whose `/tests` copies out as `archive`; answers its ID, the pinned ID to read back. */
+    function addPinnedImage(rig: E8Rig, archive: Uint8Array): string {
+      return rig.docker.addImage({ archives: { [IMAGE_TESTS_DIR]: archive } })
+    }
+
+    /** Adds an image identical to the rig's worktree, as `buildTarArchive` writes it; answers its ID. */
+    function pinWorktreeImage(rig: E8Rig): string {
+      return addPinnedImage(rig, buildTarArchive(worktreeTestsEntries(rig)))
+    }
+
+    /** Script `n`'s entry name in the archive, its real file name looked up by number. */
+    function inImage(n: number): string {
+      return `${INTEGRATION_DIR_PATH}/${realScriptFileName(n)}`
+    }
+
+    // Archive forms `buildTarArchive` does not make (PAX and GNU headers, name
+    // prefixes, base-256 numbers, links and special files) are written here,
+    // header field by header field (POSIX ustar's places, which GNU shares).
+
+    /** One raw tar header and its data. */
+    interface E8dTarRecord {
+      readonly name: string
+      /** The type flag: `0` regular, `1` hard link, `2` symbolic link, `5` directory, `6` FIFO, `x` PAX, `g` PAX global, `L` GNU long name. */
+      readonly type: string
+      readonly data?: string | Uint8Array
+      readonly linkName?: string
+      /** The POSIX name prefix field. */
+      readonly prefix?: string
+      /** GNU's magic, `ustar  `, instead of POSIX's `ustar` and `00`. */
+      readonly gnu?: boolean
+      /** The size field's 12 bytes as given, instead of the data's length in octal. */
+      readonly sizeField?: string | Uint8Array
+    }
+
+    const e8dEncoder = new TextEncoder()
+    const e8dBytes = (value: string | Uint8Array = ''): Uint8Array => (typeof value === 'string' ? e8dEncoder.encode(value) : value)
+
+    /** A header block for `record`, its checksum summed over its bytes with the checksum field as spaces. */
+    function e8dTarHeader(record: E8dTarRecord, size: number): Uint8Array {
+      const header = new Uint8Array(TAR_BLOCK_BYTES)
+      const put = (offset: number, value: string | Uint8Array): void => header.set(e8dBytes(value), offset)
+      put(0, record.name)
+      put(100, '0000644\0')
+      put(108, '0000000\0')
+      put(116, '0000000\0')
+      put(124, record.sizeField ?? `${size.toString(8).padStart(11, '0')}\0`)
+      put(136, '00000000000\0')
+      put(148, '        ')
+      put(156, record.type)
+      put(157, record.linkName ?? '')
+      put(257, record.gnu === true ? 'ustar  \0' : 'ustar\0' + '00')
+      put(345, record.prefix ?? '')
+      put(148, `${header.reduce((sum, byte) => sum + byte, 0).toString(8).padStart(6, '0')}\0 `)
+      return header
+    }
+
+    /** A tar archive of `records` in order, each data padded to whole blocks, ended by two zero blocks. */
+    function e8dTar(records: readonly E8dTarRecord[]): Uint8Array {
+      const blocks: Uint8Array[] = []
+      for (const record of records) {
+        const data = e8dBytes(record.data)
+        blocks.push(e8dTarHeader(record, data.length), data, new Uint8Array((TAR_BLOCK_BYTES - (data.length % TAR_BLOCK_BYTES)) % TAR_BLOCK_BYTES))
+      }
+      blocks.push(new Uint8Array(2 * TAR_BLOCK_BYTES))
+      return new Uint8Array(Buffer.concat(blocks))
+    }
+
+    /** PAX records, `<length> <key>=<value>\n` each, the length counting the whole record in bytes. */
+    function e8dPaxData(records: Readonly<Record<string, string>>): string {
+      return Object.entries(records)
+        .map(([key, value]) => {
+          const body = e8dEncoder.encode(` ${key}=${value}\n`).length
+          let length = body + 1
+          while (`${length}`.length + body !== length) length = `${length}`.length + body
+          return `${length} ${key}=${value}\n`
+        })
+        .join('')
+    }
+
+    /** The worktree's `/tests` as raw records: directories `5`, files `0`, in `worktreeTestsEntries`' order. */
+    function worktreeRecords(rig: E8Rig): E8dTarRecord[] {
+      return Object.entries(worktreeTestsEntries(rig)).map(([name, data]): E8dTarRecord => (name.endsWith('/') ? { name, type: '5' } : { name, type: '0', data }))
+    }
+
+    /** `records` with the one named `name` replaced by `replacement` (none: left out); throws when none is named so. */
+    function withRecord(records: readonly E8dTarRecord[], name: string, ...replacement: E8dTarRecord[]): E8dTarRecord[] {
+      if (!records.some((record) => record.name === name)) throw new Error(`withRecord: no record named ${name}`)
+      return records.flatMap((record) => (record.name === name ? replacement : [record]))
+    }
+
+    /** A regular script record for real script `n` with these prerequisite lines, as the worktree builder writes one. */
+    function scriptRecord(n: number, lines: readonly PrerequisiteLine[] = []): E8dTarRecord {
+      return { name: inImage(n), type: '0', data: minimalScriptText(realScriptFileName(n), lines) }
+    }
+
+    /** The argument lists of a read container whose create succeeded: its create from the pinned ID with exactly its two labels, its copy-out of `/tests` and its removal, all by its name. */
+    function readContainerArgvs(rig: E8Rig, pinnedId: string): string[][] {
+      const name = readContainerName(rig.owner)
+      return [containerCreateArgs(name, readContainerLabels(rig.owner), pinnedId), containerCopyOutArgs(name, IMAGE_TESTS_DIR), containerRemoveArgs(name)]
+    }
+
+    /** AC 27: the read-back spawned exactly one create, the copy-out and the removal, nothing started or run, and no container is left. */
+    function expectOneReadContainer(rig: E8Rig, pinnedId: string): void {
+      expect(rig.recorder.argvs()).toEqual(readContainerArgvs(rig, pinnedId))
+      expect(rig.docker.operations().map((op) => op.kind)).toEqual([...READ_KINDS])
+      expect(rig.docker.containers()).toEqual([])
+    }
+
+    /** Each output a read-back case checks for a leak: the outcome, the runner log and every file under the run directory. */
+    function readBackOutputs(rig: E8Rig, outcome: unknown): unknown {
+      return { outcome, logLines: rig.logLines, runDir: e8WrittenFile(rig.runDir) }
+    }
+
+    /** The outcome of an image identical to the worktree: its list, prerequisites and run scripts are the validated ones, its table text unchanged. */
+    function matchingOutcome(validated: ValidatedRun): ReadBackOutcome {
+      return {
+        ok: true,
+        readBack: { scripts: validated.scripts, prerequisites: validated.prerequisites, runScripts: validated.runScripts, durationTable: { kind: 'text', text: E8D_TABLE_TEXT } },
+        cleanupFailure: null,
+      }
+    }
+
+    test('the read container\'s name is cscb-ci-<RUN_ID>-<PID>-read, its labels exactly cscb-ci=1 and the owner, and the copied path /tests (SR-9.4 pin)', () => {
+      expect(readContainerName(E8_OWNER)).toBe(`cscb-ci-${E8_RUN_ID}-${E8_RUNNER_PID}-read`)
+      expect(readContainerLabels(E8_OWNER)).toEqual({ [CI_LABEL]: CI_LABEL_VALUE, [OWNER_LABEL]: `${E8_RUN_ID}-${E8_RUNNER_PID}` })
+      expect(IMAGE_TESTS_DIR).toBe('/tests')
+    })
+
+    test('AC 27: an image identical to the worktree is read through one never-started container, removed before the read-back returns; its list, prerequisites and table text are handed on unchanged and nothing is written', async () => {
+      const rig = makeReadBackRig({ 3: [{ names: [2] }] })
+      const validated = rig.validate()
+      const pinnedId = pinWorktreeImage(rig)
+      const before = e8TreeSnapshot(rig.root, { extended: true })
+
+      const outcome = await readBackPinnedImage(rig.readBackContext(pinnedId), validated)
+
+      expect(outcome).toEqual(matchingOutcome(validated))
+      expect(validated.prerequisites.get(realScriptFileName(3))).toEqual([realScriptFileName(2)])
+      expectOneReadContainer(rig, pinnedId)
+      expect(e8TreeSnapshot(rig.root, { extended: true })).toEqual(before)
+      expect(rig.logLines).toEqual([])
+      e8AssertNoLeak(readBackOutputs(rig, outcome))
+    })
+
+    test('in a selective run, the run\'s scripts are taken from the image\'s list: the selected script, its prerequisites and test-1', async () => {
+      const rig = makeReadBackRig({ 3: [{ names: [2] }] })
+      const validated = rig.validate([numberFormOf(3)])
+      const outcome = await readBackPinnedImage(rig.readBackContext(pinWorktreeImage(rig)), validated)
+
+      expect(outcome).toEqual(matchingOutcome(validated))
+      if (outcome.ok) {
+        expect(outcome.readBack.runScripts.map((script) => script.fileName)).toEqual([1, 2, 3].map(realScriptFileName))
+        expect(outcome.readBack.scripts).toEqual(validated.scripts)
+      }
+      e8AssertNoLeak(readBackOutputs(rig, outcome))
+    })
+
+    /** Tables the read-back reports unreadable, which is no failure: the image's archive, and the unreadable reason. */
+    const UNREADABLE_TABLES: readonly (readonly [string, (rig: E8Rig) => Uint8Array, string])[] = [
+      ['no /tests/ci-durations.tsv', (rig) => e8dTar(withRecord(worktreeRecords(rig), DURATION_TABLE_PATH)), imageDurationTableMissingText()],
+      [
+        'a symbolic link at /tests/ci-durations.tsv',
+        (rig) => e8dTar(withRecord(worktreeRecords(rig), DURATION_TABLE_PATH, { name: DURATION_TABLE_PATH, type: '2', linkName: 'integration' })),
+        imageDurationTableNotRegularText('symlink'),
+      ],
+      [
+        'a directory at /tests/ci-durations.tsv',
+        (rig) => e8dTar(withRecord(worktreeRecords(rig), DURATION_TABLE_PATH, { name: `${DURATION_TABLE_PATH}/`, type: '5' })),
+        imageDurationTableNotRegularText('directory'),
+      ],
+    ]
+
+    test.each(UNREADABLE_TABLES)('an image with %s is no failure: the table is reported unreadable to scheduling', async (_what, archiveOf, reason) => {
+      const rig = makeReadBackRig()
+      const validated = rig.validate()
+      const pinnedId = addPinnedImage(rig, archiveOf(rig))
+      const outcome = await readBackPinnedImage(rig.readBackContext(pinnedId), validated)
+
+      expect(outcome).toEqual({
+        ok: true,
+        readBack: { scripts: validated.scripts, prerequisites: validated.prerequisites, runScripts: validated.runScripts, durationTable: { kind: 'unreadable', reason } },
+        cleanupFailure: null,
+      })
+      expectOneReadContainer(rig, pinnedId)
+      expect(rig.logLines).toEqual([])
+      e8AssertNoLeak(readBackOutputs(rig, outcome))
+    })
+
+    /** One difference between the image and the worktree: the worktree's prerequisite lines and left-out numbers, the image's records from the worktree's, and the one reason expected. */
+    interface DifferenceRow {
+      readonly prerequisites?: Readonly<Record<number, readonly PrerequisiteLine[]>>
+      readonly without?: readonly number[]
+      readonly image: (records: readonly E8dTarRecord[]) => readonly E8dTarRecord[]
+      readonly reason: (validated: ValidatedRun) => string
+      /** What the reason must name besides the script. */
+      readonly names?: readonly number[]
+    }
+
+    /** Script `n`'s prerequisite difference (default script 3), built by the runner's own reason builder over E2's parse of the image's text. */
+    function prerequisiteReason(validated: ValidatedRun, imageLines: readonly PrerequisiteLine[], n = 3): string {
+      const fileName = realScriptFileName(n)
+      const reason = imagePrerequisiteDifferenceReason(
+        fileName,
+        validated.prerequisites.get(fileName) ?? [],
+        parsePrerequisiteLines(fileName, minimalScriptText(fileName, imageLines)),
+        validated.scripts,
+      )
+      if (reason === null) throw new Error('prerequisiteReason: the lines do not differ')
+      return reason
+    }
+
+    const DIFFERENCES: readonly (readonly [string, DifferenceRow])[] = [
+      ['a script the image lacks', { image: (records) => withRecord(records, inImage(7)), reason: () => imageMissingScriptReason(realScriptFileName(7)) }],
+      ['a regular script the worktree lacks', { without: [7], image: (records) => [...records, scriptRecord(7)], reason: () => imageAddedScriptReason(realScriptFileName(7)) }],
+      [
+        'a script that is a symbolic link in the image',
+        {
+          image: (records) => withRecord(records, inImage(7), { name: inImage(7), type: '2', linkName: realScriptFileName(1) }),
+          reason: () => imageNotRegularEntryReason(realScriptFileName(7), 'symlink'),
+        },
+      ],
+      [
+        'a script that is a directory in the image',
+        { image: (records) => withRecord(records, inImage(7), { name: `${inImage(7)}/`, type: '5' }), reason: () => imageNotRegularEntryReason(realScriptFileName(7), 'directory') },
+      ],
+      [
+        'a script that is a FIFO in the image',
+        { image: (records) => withRecord(records, inImage(7), { name: inImage(7), type: '6' }), reason: () => imageNotRegularEntryReason(realScriptFileName(7), 'other') },
+      ],
+      [
+        'a changed prerequisite line',
+        {
+          prerequisites: { 3: [{ names: [2] }] },
+          image: (records) => withRecord(records, inImage(3), scriptRecord(3, [{ names: [4] }])),
+          reason: (validated) => prerequisiteReason(validated, [{ names: [4] }]),
+          names: [2, 4],
+        },
+      ],
+      [
+        'an added prerequisite line',
+        {
+          image: (records) => withRecord(records, inImage(3), scriptRecord(3, [{ names: [2] }])),
+          reason: (validated) => prerequisiteReason(validated, [{ names: [2] }]),
+          names: [2],
+        },
+      ],
+      [
+        'a removed prerequisite line',
+        {
+          prerequisites: { 3: [{ names: [2] }] },
+          image: (records) => withRecord(records, inImage(3), scriptRecord(3)),
+          reason: (validated) => prerequisiteReason(validated, []),
+          names: [2],
+        },
+      ],
+      [
+        'a prerequisite line naming no script of the list',
+        {
+          image: (records) => withRecord(records, inImage(3), scriptRecord(3, [{ names: [numberFormOf(999)] }])),
+          reason: (validated) => prerequisiteReason(validated, [{ names: [numberFormOf(999)] }]),
+        },
+      ],
+      [
+        'a second prerequisite line',
+        {
+          prerequisites: { 3: [{ names: [2] }] },
+          image: (records) => withRecord(records, inImage(3), scriptRecord(3, [{ names: [2] }, { names: [2] }])),
+          reason: (validated) => prerequisiteReason(validated, [{ names: [2] }, { names: [2] }]),
+        },
+      ],
+    ]
+
+    test.each(DIFFERENCES)('AC 44: %s refuses as not runnable, naming it, with the read container still removed', async (_what, row) => {
+      const rig = makeReadBackRig(row.prerequisites, row.without)
+      const validated = rig.validate()
+      const pinnedId = addPinnedImage(rig, e8dTar(row.image(worktreeRecords(rig))))
+      const before = e8TreeSnapshot(rig.root, { extended: true })
+
+      const outcome = await readBackPinnedImage(rig.readBackContext(pinnedId), validated)
+
+      expect(outcome).toEqual({ ok: false, refusal: buildRefusal(null, row.reason(validated)), cleanupFailure: null })
+      if (!outcome.ok) {
+        expect(refusalLine(outcome.refusal)).toBe(`${NOT_RUN_PREFIX}${outcome.refusal.summary}`)
+        for (const n of row.names ?? []) expect(outcome.refusal.summary).toContain(realScriptFileName(n))
+      }
+      expectOneReadContainer(rig, pinnedId)
+      expect(e8TreeSnapshot(rig.root, { extended: true })).toEqual(before)
+      expect(rig.logLines).toEqual([])
+      e8AssertNoLeak(readBackOutputs(rig, outcome))
+    })
+
+    test('AC 44: every difference is named, one per line, in the stated order: missing (canonical), added (bytewise), not regular (bytewise), prerequisite lines (canonical)', async () => {
+      // Canonical and bytewise orders disagree on each pair: 2 < 10 but "test-10" < "test-2", and so on.
+      const rig = makeReadBackRig({ 3: [{ names: [2] }], 21: [{ names: [20] }] }, [5, 29])
+      const validated = rig.validate()
+      let records = worktreeRecords(rig)
+      records = withRecord(records, inImage(10))
+      records = withRecord(records, inImage(2))
+      records = withRecord(records, inImage(12), { name: inImage(12), type: '2', linkName: realScriptFileName(1) })
+      records = withRecord(records, inImage(4), { name: `${inImage(4)}/`, type: '5' })
+      records = withRecord(records, inImage(3), scriptRecord(3))
+      records = withRecord(records, inImage(21), scriptRecord(21, [{ names: [19] }]))
+      records = [...records, scriptRecord(5), scriptRecord(29)]
+      const pinnedId = addPinnedImage(rig, e8dTar(records))
+
+      const outcome = await readBackPinnedImage(rig.readBackContext(pinnedId), validated)
+
+      const reasons = [
+        imageMissingScriptReason(realScriptFileName(2)),
+        imageMissingScriptReason(realScriptFileName(10)),
+        imageAddedScriptReason(realScriptFileName(29)),
+        imageAddedScriptReason(realScriptFileName(5)),
+        imageNotRegularEntryReason(realScriptFileName(12), 'symlink'),
+        imageNotRegularEntryReason(realScriptFileName(4), 'directory'),
+        prerequisiteReason(validated, []),
+        prerequisiteReason(validated, [{ names: [19] }], 21),
+      ]
+      expect(outcome).toEqual({ ok: false, refusal: buildRefusal(null, reasons[0]!, reasons.slice(1)), cleanupFailure: null })
+      expect(new Set(reasons).size).toBe(reasons.length)
+      expectOneReadContainer(rig, pinnedId)
+      e8AssertNoLeak(readBackOutputs(rig, outcome))
+    })
+
+    /** Image lines for script 5 that give exactly the worktree's `requires 2 and 4`: no difference. */
+    const SAME_PREREQUISITES: readonly (readonly [string, readonly PrerequisiteLine[]])[] = [
+      ['the names in another order', [{ names: [4, 2] }]],
+      ['file names for number forms', [{ names: [realScriptFileName(2), realScriptFileName(4)] }]],
+      ['an added test-1, which is ignored', [{ names: [2, 4, 1] }]],
+      ['the line as the header block\'s first line, tab-separated', [{ names: [2, 4], placement: 'second-line', separator: '\t' }]],
+    ]
+
+    test.each(SAME_PREREQUISITES)('an image line with %s is no difference: the prerequisites compare as resolved sets', async (_what, lines) => {
+      const rig = makeReadBackRig({ 5: [{ names: [2, 4] }] })
+      const validated = rig.validate()
+      const pinnedId = addPinnedImage(rig, e8dTar(withRecord(worktreeRecords(rig), inImage(5), scriptRecord(5, lines))))
+      const outcome = await readBackPinnedImage(rig.readBackContext(pinnedId), validated)
+      expect(outcome).toEqual(matchingOutcome(validated))
+      expectOneReadContainer(rig, pinnedId)
+      e8AssertNoLeak(readBackOutputs(rig, outcome))
+    })
+
+    /** Script 5's worktree text, which requires script 4, so a form that lost its content would differ. */
+    const scriptFiveText = (): string => minimalScriptText(realScriptFileName(5), [{ names: [4] }])
+    /** The base-256 form of a size: the flag byte, then the value big-endian. */
+    const base256Size = (size: number): Uint8Array => {
+      const field = new Uint8Array(12)
+      field[0] = 0x80
+      for (let at = 11, rest = size; rest > 0; at -= 1, rest = Math.floor(rest / 256)) field[at] = rest % 256
+      return field
+    }
+
+    /** Archive forms Docker's tar writer (Go's archive/tar) or other archivers may give, each read exactly as the plain ustar archive is. */
+    const ARCHIVE_FORMS: readonly (readonly [string, (records: readonly E8dTarRecord[]) => readonly E8dTarRecord[]])[] = [
+      ['names starting with ./', (records) => records.map((record) => ({ ...record, name: `./${record.name}` }))],
+      ['no directory entries, the directories implied by the files', (records) => records.filter((record) => record.type !== '5')],
+      [
+        'names split into the ustar prefix field',
+        (records) =>
+          records.map((record) => {
+            const cut = record.name.lastIndexOf('/', record.name.length - 2)
+            return cut < 0 ? record : { ...record, prefix: record.name.slice(0, cut), name: record.name.slice(cut + 1) }
+          }),
+      ],
+      ['GNU headers', (records) => records.map((record) => ({ ...record, gnu: true }))],
+      [
+        'a GNU long-name header before a script',
+        (records) =>
+          withRecord(records, inImage(5), { name: '././@LongLink', type: 'L', data: `${inImage(5)}\0`, gnu: true }, { name: 'e8d-truncated-name', type: '0', data: scriptFiveText(), gnu: true }),
+      ],
+      [
+        'a PAX path header before a script',
+        (records) => withRecord(records, inImage(5), { name: 'PaxHeaders/e8d', type: 'x', data: e8dPaxData({ path: inImage(5) }) }, { name: 'e8d-placeholder', type: '0', data: scriptFiveText() }),
+      ],
+      [
+        'a PAX size record over a zero size field',
+        (records) =>
+          withRecord(
+            records,
+            DURATION_TABLE_PATH,
+            { name: 'PaxHeaders/e8d', type: 'x', data: e8dPaxData({ size: `${e8dBytes(E8D_TABLE_TEXT).length}` }) },
+            { name: DURATION_TABLE_PATH, type: '0', data: E8D_TABLE_TEXT, sizeField: `${'0'.repeat(11)}\0` },
+          ),
+      ],
+      ['a PAX global header first', (records) => [{ name: 'pax_global_header', type: 'g', data: e8dPaxData({ comment: 'e8d' }) }, ...records]],
+      ['a base-256 size field', (records) => withRecord(records, DURATION_TABLE_PATH, { name: DURATION_TABLE_PATH, type: '0', data: E8D_TABLE_TEXT, sizeField: base256Size(e8dBytes(E8D_TABLE_TEXT).length) })],
+      [
+        'a script that is a hard link to a regular file before it',
+        (records) => [
+          { name: `${E8D_TESTS_ENTRY}/e8d-link-target`, type: '0', data: scriptFiveText() },
+          ...withRecord(records, inImage(5), { name: inImage(5), type: '1', linkName: `${E8D_TESTS_ENTRY}/e8d-link-target` }),
+        ],
+      ],
+      ['a script named twice, first as a symbolic link: the last entry wins', (records) => [{ name: inImage(5), type: '2', linkName: realScriptFileName(1) }, ...records]],
+    ]
+
+    test.each(ARCHIVE_FORMS)('an archive with %s reads as the plain ustar archive does: no difference', async (_what, form) => {
+      const rig = makeReadBackRig({ 5: [{ names: [4] }] })
+      const validated = rig.validate()
+      const pinnedId = addPinnedImage(rig, e8dTar(form(worktreeRecords(rig))))
+      const outcome = await readBackPinnedImage(rig.readBackContext(pinnedId), validated)
+      expect(outcome).toEqual(matchingOutcome(validated))
+      expect(validated.prerequisites.get(realScriptFileName(5))).toEqual([realScriptFileName(4)])
+      e8AssertNoLeak(readBackOutputs(rig, outcome))
+    })
+
+    /** What an outright failure's reason must be: whole, or (when the error is the reader's or Docker's own text) its start from the runner's builders over an empty error, with more after it. */
+    type FailureReason = { readonly whole: string } | { readonly startsWith: string; readonly holds?: string }
+
+    /** One outright failure: the fake's arrangement (answering the pinned ID), the reason, and the docker operations spawned. */
+    interface OutrightFailureRow {
+      readonly arrange: (rig: E8Rig) => string
+      readonly reason: (name: string, pinnedId: string) => FailureReason
+      readonly kinds: readonly OperationKind[]
+    }
+
+    /** Test data: a daemon error over two lines, which a refusal holds on one. */
+    const E8D_TWO_LINE_ERROR = 'Error response from daemon: e8d failure\n  on a second line'
+    const E8D_ONE_LINE_ERROR = 'Error response from daemon: e8d failure on a second line'
+    const unreadableArchive = (): FailureReason => ({ startsWith: readBackFailedReason(readBackArchiveUnreadableText('')) })
+    const unlistable = (): FailureReason => ({ startsWith: readBackFailedReason(readBackIntegrationUnlistableText('')) })
+    const copyFailed = (name: string): FailureReason => ({ startsWith: readBackFailedReason(readContainerCopyFailedText(name, '')) })
+    const pinRecords = (records: (rig: E8Rig) => readonly E8dTarRecord[]) => (rig: E8Rig) => addPinnedImage(rig, e8dTar(records(rig)))
+    const pinBytes = (bytes: (rig: E8Rig) => Uint8Array) => (rig: E8Rig) => addPinnedImage(rig, bytes(rig))
+    const tableAndTests = (rig: E8Rig): E8dTarRecord[] => worktreeRecords(rig).filter((record) => !record.name.startsWith(`${INTEGRATION_DIR_PATH}/`))
+
+    const OUTRIGHT_FAILURES: readonly (readonly [string, OutrightFailureRow])[] = [
+      [
+        'a pinned ID that is not an image ID (nothing spawned)',
+        { arrange: () => 'cscb-ci-e8d:latest', reason: (name, id) => ({ startsWith: readBackFailedReason(readContainerCreateFailedText(name, id, '')) }), kinds: [] },
+      ],
+      [
+        'a create that fails because the pinned image is gone',
+        {
+          arrange: () => E8D_GONE_IMAGE_ID,
+          reason: (name, id) => ({ startsWith: readBackFailedReason(readContainerCreateFailedText(name, id, '')), holds: DOCKER_NO_SUCH_IMAGE_TEXT }),
+          kinds: ['container-create'],
+        },
+      ],
+      [
+        'a create that fails with a two-line error',
+        {
+          arrange: (rig) => {
+            rig.docker.fail('container-create', { stderr: E8D_TWO_LINE_ERROR })
+            return pinWorktreeImage(rig)
+          },
+          reason: (name, id) => ({ whole: readBackFailedReason(readContainerCreateFailedText(name, id, E8D_ONE_LINE_ERROR)) }),
+          kinds: ['container-create'],
+        },
+      ],
+      [
+        'a create that exits 0 without a container ID (the container removed if present)',
+        {
+          arrange: (rig) => {
+            rig.docker.fail('container-create', { exitCode: 0, stderr: '' })
+            return pinWorktreeImage(rig)
+          },
+          reason: (name, id) => ({ startsWith: readBackFailedReason(readContainerCreateFailedText(name, id, '')) }),
+          kinds: ['container-create', 'container-remove'],
+        },
+      ],
+      [
+        'a copy that fails with a two-line error',
+        {
+          arrange: (rig) => {
+            rig.docker.fail('container-copy', { stderr: E8D_TWO_LINE_ERROR })
+            return pinWorktreeImage(rig)
+          },
+          reason: (name) => ({ whole: readBackFailedReason(readContainerCopyFailedText(name, E8D_ONE_LINE_ERROR)) }),
+          kinds: READ_KINDS,
+        },
+      ],
+      ['an image with no /tests to copy (never taken for a missing table)', { arrange: (rig) => rig.docker.addImage(), reason: copyFailed, kinds: READ_KINDS }],
+      ['a copy that exits 0 with no archive', { arrange: pinBytes(() => new Uint8Array(0)), reason: copyFailed, kinds: READ_KINDS }],
+      [
+        'an archive whose first header fails its checksum',
+        {
+          arrange: pinBytes((rig) => {
+            const archive = e8dTar(worktreeRecords(rig))
+            archive[1] = archive[1]! + 1
+            return archive
+          }),
+          reason: unreadableArchive,
+          kinds: READ_KINDS,
+        },
+      ],
+      ['an archive that ends inside a header block', { arrange: pinBytes((rig) => e8dTar(worktreeRecords(rig)).subarray(0, TAR_BLOCK_BYTES + 100)), reason: unreadableArchive, kinds: READ_KINDS }],
+      [
+        'an archive whose entry data runs past its end',
+        { arrange: pinBytes(() => e8dTar([{ name: inImage(1), type: '0', data: 'x'.repeat(TAR_BLOCK_BYTES + 88) }]).subarray(0, 2 * TAR_BLOCK_BYTES)), reason: unreadableArchive, kinds: READ_KINDS },
+      ],
+      [
+        'an archive with a size field that is no number',
+        { arrange: pinRecords((rig) => [{ name: inImage(1), type: '0', data: 'x', sizeField: '0000000zzzz\0' }, ...worktreeRecords(rig)]), reason: unreadableArchive, kinds: READ_KINDS },
+      ],
+      [
+        'an archive with a malformed PAX record',
+        { arrange: pinRecords((rig) => [{ name: 'PaxHeaders/e8d', type: 'x', data: 'not a record\n' }, ...worktreeRecords(rig)]), reason: unreadableArchive, kinds: READ_KINDS },
+      ],
+      [
+        'an archive with a PAX size that is not a whole number',
+        { arrange: pinRecords((rig) => [{ name: 'PaxHeaders/e8d', type: 'x', data: e8dPaxData({ size: '12.5' }) }, ...worktreeRecords(rig)]), reason: unreadableArchive, kinds: READ_KINDS },
+      ],
+      [
+        'an archive with a hard link naming no regular file before it',
+        {
+          arrange: pinRecords((rig) => withRecord(worktreeRecords(rig), inImage(5), { name: inImage(5), type: '1', linkName: `${E8D_TESTS_ENTRY}/e8d-nowhere` })),
+          reason: unreadableArchive,
+          kinds: READ_KINDS,
+        },
+      ],
+      ['an empty archive: no tests/integration to list', { arrange: pinRecords(() => []), reason: unlistable, kinds: READ_KINDS }],
+      ['an archive holding /tests without tests/integration', { arrange: pinRecords(tableAndTests), reason: unlistable, kinds: READ_KINDS }],
+      [
+        'an archive whose tests/integration is a regular file',
+        { arrange: pinRecords((rig) => [...tableAndTests(rig), { name: INTEGRATION_DIR_PATH, type: '0', data: 'x' }]), reason: unlistable, kinds: READ_KINDS },
+      ],
+      [
+        'an archive whose tests/integration is a symbolic link',
+        { arrange: pinRecords((rig) => [...tableAndTests(rig), { name: INTEGRATION_DIR_PATH, type: '2', linkName: E8D_TESTS_ENTRY }]), reason: unlistable, kinds: READ_KINDS },
+      ],
+    ]
+
+    test.each(OUTRIGHT_FAILURES)('%s refuses with NOT RUN: test image read-back failed: <error>, on one line', async (_what, row) => {
+      const rig = makeReadBackRig()
+      const validated = rig.validate()
+      const pinnedId = row.arrange(rig)
+      const before = e8TreeSnapshot(rig.root, { extended: true })
+
+      const outcome = await readBackPinnedImage(rig.readBackContext(pinnedId), validated)
+
+      expect(outcome.ok).toBe(false)
+      if (!outcome.ok) {
+        const { refusal } = outcome
+        expect([refusal.kind, refusal.details, outcome.cleanupFailure]).toEqual([null, [], null])
+        const line = refusalLine(refusal)
+        expect(line).toBe(`${NOT_RUN_PREFIX}${refusal.summary}`)
+        expect(line).not.toMatch(/[\r\n]/)
+        const expected = row.reason(readContainerName(rig.owner), pinnedId)
+        if ('whole' in expected) expect(refusal.summary).toBe(expected.whole)
+        else {
+          expect(refusal.summary.startsWith(expected.startsWith)).toBe(true)
+          expect(refusal.summary.length).toBeGreaterThan(expected.startsWith.length)
+          if (expected.holds !== undefined) expect(refusal.summary).toContain(expected.holds)
+        }
+      }
+      expect(rig.docker.operations().map((op) => op.kind)).toEqual([...row.kinds])
+      expect(rig.docker.operations('container-create').every((op) => op.refs[0] === readContainerName(rig.owner))).toBe(true)
+      expect(rig.docker.containers()).toEqual([])
+      expect(e8TreeSnapshot(rig.root, { extended: true })).toEqual(before)
+      expect(rig.logLines).toEqual([])
+      e8AssertNoLeak(readBackOutputs(rig, outcome))
+    })
+
+    test.each([
+      ['an image that matches', false],
+      ['a copy that fails', true],
+    ] as const)('a failed read-container removal after %s is a cleanup failure, logged once, never the refusal', async (_what, copyFails) => {
+      const rig = makeReadBackRig()
+      const validated = rig.validate()
+      const pinnedId = pinWorktreeImage(rig)
+      const name = readContainerName(rig.owner)
+      if (copyFails) rig.docker.fail('container-copy', { stderr: 'Error response from daemon: e8d copy failure' })
+      rig.docker.fail('container-remove', { stderr: E8D_TWO_LINE_ERROR })
+
+      const outcome = await readBackPinnedImage(rig.readBackContext(pinnedId), validated)
+
+      const cleanupFailure = readContainerRemovalFailedText(name, E8D_ONE_LINE_ERROR)
+      if (copyFails) {
+        expect(outcome).toEqual({
+          ok: false,
+          refusal: buildRefusal(null, readBackFailedReason(readContainerCopyFailedText(name, 'Error response from daemon: e8d copy failure'))),
+          cleanupFailure,
+        })
+      } else expect(outcome).toEqual({ ...matchingOutcome(validated), cleanupFailure })
+      expect(rig.logLines).toEqual([cleanupFailure])
+      expect(rig.recorder.argvs()).toEqual(readContainerArgvs(rig, pinnedId))
+      e8AssertNoLeak(readBackOutputs(rig, outcome))
+    })
+
+    test.each([
+      ['present: it is removed by name', true, false],
+      ['already gone: no failure, nothing logged', false, false],
+      ['present and docker refuses its removal: a cleanup failure, logged once', true, true],
+    ] as const)('removing the read container if present (E13\'s end-of-run step 1), when it is %s', async (_what, present, refused) => {
+      const rig = makeReadBackRig()
+      const name = readContainerName(rig.owner)
+      if (present) rig.docker.addContainer({ name, labels: readContainerLabels(rig.owner), running: false })
+      if (refused) rig.docker.fail('container-remove', { stderr: E8D_TWO_LINE_ERROR })
+
+      const removal = await removeReadContainerIfPresent(rig.dockerContext, rig.owner, rig.log)
+
+      const line = readContainerRemovalFailedText(name, E8D_ONE_LINE_ERROR)
+      expect(removal).toEqual(refused ? { kind: 'failed', line } : { kind: present ? 'removed' : 'absent' })
+      expect(rig.logLines).toEqual(refused ? [line] : [])
+      expect(rig.recorder.argvs()).toEqual([containerRemoveArgs(name)])
+      expect(rig.docker.containers().map((container) => container.name)).toEqual(refused ? [name] : [])
+      e8AssertNoLeak({ removal, logLines: rig.logLines })
+    })
+  })
+
+
+  // --- E8 cleanup and the removal-path test (T6.S8) ---
+
+  describe('image cleanup and the removal-path test (SR-9.3, SR-19.9)', () => {
+    const {
+      buildFaultImages,
+      buildTestImage,
+      checkBaseImage,
+      CLEANUP_TAG_ORDER,
+      cleanupRunImages,
+      DOCKER_PROGRAM,
+      FAIL_PREFIX,
+      formatOwner,
+      formatRunTag,
+      IMAGE_TESTS_DIR,
+      imageListArgs,
+      imagePruneArgs,
+      imageTagRemovalArgs,
+      INTEGRATION_DIR_PATH,
+      moveTestTagToRetagImage,
+      NOT_RUN_PREFIX,
+      OWNER_LABEL,
+      PRUNE_ALREADY_RUNNING_TEXT,
+      PRUNE_RETRIES,
+      PRUNE_RETRY_INTERVAL_MS,
+      readBackPinnedImage,
+      RUN_TAG_ROLES,
+      runBaseBuild,
+      runImageCleanupPlan,
+    } = e8Runner
+    type Fault = e8Runner.Fault
+    type ReadBackOutcome = e8Runner.ReadBackOutcome
+    type RunImageCleanupReport = e8Runner.RunImageCleanupReport
+    type RunTagRole = e8Runner.RunTagRole
+    type FakeDockerOperation = e8Helper.FakeDockerOperation
+
+    /** The run's owner label value, `<RUN_ID>-<PID>`. */
+    const OWNER_VALUE = formatOwner(E8_OWNER)
+    /** The run's own run-private tag of a role. */
+    const tagOf = (role: RunTagRole): string => formatRunTag(E8_OWNER, role)
+    /** Test data: the pinned image's ID, fixed so two rigs' cleanup commands can be compared. */
+    const PINNED_ID = `sha256:${e8CreateHash('sha256').update('e8 cleanup: the pinned image').digest('hex')}`
+    /** Test data: another run on the host, with its own owner and tags. */
+    const OTHER_OWNER: Owner = { runId: '20261008t120000z-other001', pid: 6262 }
+    /** Test data: a lane tag a person or `/ci-live` put on the same image. */
+    const LANE_TAG = 'cscb-ci-l4:latest'
+    const RETAG: Fault = { kind: 'retag' }
+    const DRIFT: Fault = { kind: 'image-drift', shard: 1 }
+    /** The filters of the listing cleanup must make, typed from the requirement (untagged, exactly the run's owner label), not taken from the runner's helper. */
+    const OWN_UNTAGGED_LISTING = imageListArgs([
+      { kind: 'dangling' },
+      { kind: 'label', key: OWNER_LABEL, value: OWNER_VALUE },
+    ])
+    /** Another run's prune lasting this long refuses the run's first two tries; the third, two intervals in, finds the slot free. */
+    const PRUNE_BUSY_FOR_TWO_TRIES_MS = PRUNE_RETRY_INTERVAL_MS + PRUNE_RETRY_INTERVAL_MS / 2
+    /** Another run's prune lasting this long outlasts every try the run makes. */
+    const PRUNE_BUSY_FOR_EVERY_TRY_MS = PRUNE_RETRY_INTERVAL_MS * (PRUNE_RETRIES + 1)
+
+    /** Settles `work` on the rig's fake clock: one event-loop turn lets every pending continuation run, then the next timer fires, until it settles. */
+    async function onClock<T>(rig: E8Rig, work: Promise<T>): Promise<T> {
+      const box: { outcome: { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown } | null } = { outcome: null }
+      work.then(
+        (value) => {
+          box.outcome = { ok: true, value }
+        },
+        (error: unknown) => {
+          box.outcome = { ok: false, error }
+        },
+      )
+      for (;;) {
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        const outcome = box.outcome
+        if (outcome !== null) {
+          if (outcome.ok) return outcome.value
+          throw outcome.error
+        }
+        if (rig.clock.pendingCount() === 0) throw new Error('the work waits on nothing the fake clock holds')
+        await rig.clock.runNext()
+      }
+    }
+
+    /** What `/tests` holds in the pinned image: the worktree's scripts (`matching`), all but the last (`differing`), or no archive, so the copy-out fails (`none`). */
+    type PinnedArchive = 'matching' | 'differing' | 'none'
+
+    /** Adds the image the test build will report (`PINNED_ID`, the owner label, `/tests` as `archive` says, and any foreign tags) and programs the next test build to report it. */
+    function preparePinnedImage(rig: E8Rig, archive: PinnedArchive = 'matching', foreignTags: readonly string[] = []): void {
+      const names = archive === 'differing' ? rig.worktree.scriptFileNames.slice(0, -1) : rig.worktree.scriptFileNames
+      const entries = Object.fromEntries(names.map((name) => [`${INTEGRATION_DIR_PATH}/${name}`, e8Fs.readFileSync(e8Path.join(rig.worktree.integrationDir, name))]))
+      rig.docker.addImage({
+        id: PINNED_ID,
+        tags: foreignTags,
+        labels: { [OWNER_LABEL]: OWNER_VALUE },
+        ...(archive === 'none' ? {} : { archives: { [IMAGE_TESTS_DIR]: e8Helper.buildTarArchive(entries) } }),
+      })
+      rig.docker.programBuild({ kind: 'built', imageId: PINNED_ID }, { role: 'test' })
+    }
+
+    /** Step 12 up to the read-back: the test build (pinned to `PINNED_ID`), then the read-back against the worktree. */
+    async function buildAndReadBack(rig: E8Rig, archive: PinnedArchive = 'matching', foreignTags: readonly string[] = []): Promise<ReadBackOutcome> {
+      preparePinnedImage(rig, archive, foreignTags)
+      const built = await buildTestImage(rig.imagesContext, rig.state)
+      expect(built.outcome).toEqual({ kind: 'built', imageId: PINNED_ID })
+      return readBackPinnedImage(rig.readBackContext(PINNED_ID), rig.validate())
+    }
+
+    /** A passing run's images: the build and a matching read-back. */
+    async function passingRun(rig: E8Rig, foreignTags: readonly string[] = []): Promise<unknown> {
+      const read = await buildAndReadBack(rig, 'matching', foreignTags)
+      expect(read.ok).toBe(true)
+      return read
+    }
+
+    /** A `retag` run: the build, the read-back, the retag build and the tag move (failed when `moveFails`). */
+    async function retagRun(rig: E8Rig, moveFails = false, foreignTags: readonly string[] = []): Promise<unknown> {
+      const read = await buildAndReadBack(rig, 'matching', foreignTags)
+      expect(read.ok).toBe(true)
+      const faults = await buildFaultImages(rig.imagesContext, rig.state, [RETAG])
+      expect(faults.retag.kind).toBe('built')
+      if (moveFails) rig.docker.fail('image-tag')
+      const move = await moveTestTagToRetagImage(rig.imagesContext, rig.state)
+      expect(move.kind).toBe(moveFails ? 'failed' : 'moved')
+      return { read, faults, move }
+    }
+
+    /** Ends the build `start` spawns as E13's stop path would: the stop record set, then the build's process killed (SIGKILL), its result awaited. */
+    async function stopDuringBuild<T>(rig: E8Rig, start: () => Promise<T>): Promise<T> {
+      const pending = start()
+      for (let turns = 0; rig.state.imageBuildInProgress === null && turns < 10; turns++) await rig.clock.flush()
+      const build = rig.state.imageBuildInProgress
+      expect(build?.pid).toEqual(expect.any(Number))
+      rig.recordStop()
+      rig.recorder.processes.makeGone(build!.pid!, 'SIGKILL')
+      return pending
+    }
+
+    /** One path of b.uqm SR-9.3's list through E8's steps, in E13's order, and what cleanup must then do. */
+    interface RemovalPath {
+      readonly name: string
+      /** Drives the run's image steps up to cleanup; answers what the run hands its verdict or refusal, which cleanup must leave unchanged. */
+      readonly drive: (rig: E8Rig) => Promise<unknown>
+      /** Set just before cleanup: failures on demand, another run's prune, a stop timer. */
+      readonly beforeCleanup?: (rig: E8Rig) => void
+      /** The run's tags cleanup removes, by role, in order. */
+      readonly tags: readonly RunTagRole[]
+      /** Whether cleanup lists the run's untagged images. */
+      readonly lists: boolean
+      /** The prunes cleanup spawns (each try counts). */
+      readonly prunes: number
+      /** The cleanup failures it lists. */
+      readonly failures: number
+    }
+
+    /** Takes the prune slot with another run's prune lasting `durationMs` on the fake clock. */
+    const otherRunPrune = (durationMs: number) => (rig: E8Rig): void => {
+      expect(rig.docker.startOtherPrune({ durationMs, owner: formatOwner(OTHER_OWNER) })).toBe(true)
+    }
+
+    /** Test data: how long a derived build whose after-check fails runs on the fake clock. */
+    const AFTER_CHECK_BUILD_MS = 10_000
+
+    /**
+     * A passing run, then the `fault`'s derived build, which exits 0 and makes
+     * its tag while the `-test` tag turns unreadable halfway through, so the
+     * after-check fails it: its outcome failed, its tag made.
+     */
+    const afterCheckFailedRun = (fault: Fault) => async (rig: E8Rig): Promise<unknown> => {
+      const role: RunTagRole = fault.kind === 'retag' ? 'retag' : 'drift'
+      await passingRun(rig)
+      rig.docker.programBuild({ kind: 'built', durationMs: AFTER_CHECK_BUILD_MS }, { role })
+      rig.clock.setTimeout(() => rig.docker.fail('image-inspect', { stderr: 'Error response from daemon: e8 after-check failure (test data)' }), AFTER_CHECK_BUILD_MS / 2)
+      const faults = await buildFaultImages(rig.imagesContext, rig.state, [fault])
+      expect(faults[role].kind).toBe('failed')
+      expect(rig.state.images.tagsMade[role]).toBe(true)
+      expect(rig.docker.image(tagOf(role))).not.toBeNull()
+      const move = await moveTestTagToRetagImage(rig.imagesContext, rig.state)
+      expect(move).toEqual({ kind: 'not-tried' })
+      return { faults, move }
+    }
+
+    const REMOVAL_PATHS: readonly RemovalPath[] = [
+      { name: 'a pass', drive: (rig) => passingRun(rig), tags: ['test'], lists: true, prunes: 0, failures: 0 },
+      { name: 'retag with the tag move done', drive: (rig) => retagRun(rig), tags: ['retag', 'test'], lists: true, prunes: 1, failures: 0 },
+      { name: 'retag with the tag move failed', drive: (rig) => retagRun(rig, true), tags: ['retag', 'test'], lists: true, prunes: 0, failures: 0 },
+      {
+        name: 'a failed drift build',
+        drive: async (rig) => {
+          await passingRun(rig)
+          rig.docker.programBuild({ kind: 'failed' }, { role: 'drift' })
+          const faults = await buildFaultImages(rig.imagesContext, rig.state, [DRIFT])
+          expect(faults.drift.kind).toBe('failed')
+          return faults
+        },
+        tags: ['test'],
+        lists: true,
+        prunes: 0,
+        failures: 0,
+      },
+      {
+        name: 'a failed retag build',
+        drive: async (rig) => {
+          await passingRun(rig)
+          rig.docker.programBuild({ kind: 'failed' }, { role: 'retag' })
+          const faults = await buildFaultImages(rig.imagesContext, rig.state, [RETAG])
+          expect(faults.retag.kind).toBe('failed')
+          const move = await moveTestTagToRetagImage(rig.imagesContext, rig.state)
+          expect(move).toEqual({ kind: 'not-tried' })
+          return { faults, move }
+        },
+        tags: ['test'],
+        lists: true,
+        prunes: 0,
+        failures: 0,
+      },
+      { name: 'a drift build failed by its after-check', drive: afterCheckFailedRun(DRIFT), tags: ['drift', 'test'], lists: true, prunes: 0, failures: 0 },
+      { name: 'a retag build failed by its after-check', drive: afterCheckFailedRun(RETAG), tags: ['retag', 'test'], lists: true, prunes: 0, failures: 0 },
+      {
+        name: 'a failed test build',
+        drive: async (rig) => {
+          rig.docker.programBuild({ kind: 'failed' }, { role: 'test' })
+          const report = await buildTestImage(rig.imagesContext, rig.state)
+          expect(report.failure?.line.startsWith(FAIL_PREFIX)).toBe(true)
+          return report
+        },
+        tags: [],
+        lists: true,
+        prunes: 0,
+        failures: 0,
+      },
+      {
+        name: 'a test build that could not be spawned',
+        drive: async (rig) => {
+          const buildTag = tagOf('test')
+          rig.recorder.answerWhen((request) => request.ownProcessGroup && request.argv.includes(buildTag), { notStarted: 'spawn docker ENOENT' })
+          const report = await buildTestImage(rig.imagesContext, rig.state)
+          expect(report.outcome.kind).toBe('failed')
+          return report
+        },
+        tags: [],
+        lists: false,
+        prunes: 0,
+        failures: 0,
+      },
+      {
+        name: 'a refusal before the build (step 4)',
+        drive: async (rig) => {
+          rig.answerAdTagCheck({ exitCode: 128, stderr: 'fatal: Needed a single revision\n' })
+          const stage = await checkBaseImage(rig.deps, rig.state)
+          expect(stage.ok).toBe(false)
+          return stage
+        },
+        tags: [],
+        lists: false,
+        prunes: 0,
+        failures: 0,
+      },
+      {
+        name: 'a failed base build',
+        drive: async (rig) => {
+          rig.answerPrerequisites()
+          expect((await checkBaseImage(rig.deps, rig.state)).ok).toBe(true)
+          rig.answerBaseBuildStep({ exitCode: 1 })
+          const stage = await runBaseBuild(rig.deps, rig.state, rig.log)
+          expect(stage.kind).toBe('failed')
+          return stage
+        },
+        tags: [],
+        lists: false,
+        prunes: 0,
+        failures: 0,
+      },
+      {
+        name: 'a refusal after the build: a read-back difference',
+        drive: async (rig) => {
+          const read = await buildAndReadBack(rig, 'differing')
+          expect(read.ok).toBe(false)
+          return read
+        },
+        tags: ['test'],
+        lists: true,
+        prunes: 0,
+        failures: 0,
+      },
+      {
+        name: 'a refusal after the build: a read-back failure',
+        drive: async (rig) => {
+          const read = await buildAndReadBack(rig, 'none')
+          expect(read.ok).toBe(false)
+          if (!read.ok) expect(e8Runner.refusalLine(read.refusal).startsWith(NOT_RUN_PREFIX)).toBe(true)
+          return read
+        },
+        tags: ['test'],
+        lists: true,
+        prunes: 0,
+        failures: 0,
+      },
+      {
+        name: 'a stop before the test build',
+        drive: async (rig) => {
+          rig.recordStop()
+          const report = await buildTestImage(rig.imagesContext, rig.state)
+          expect(report.outcome).toEqual({ kind: 'not-built' })
+          return report
+        },
+        tags: [],
+        lists: false,
+        prunes: 0,
+        failures: 0,
+      },
+      {
+        name: 'a stop during the test build',
+        drive: async (rig) => {
+          rig.docker.programBuild({ kind: 'hangs' }, { role: 'test' })
+          const report = await stopDuringBuild(rig, () => buildTestImage(rig.imagesContext, rig.state))
+          expect(report.outcome).toEqual({ kind: 'stopped' })
+          return report
+        },
+        tags: ['test'],
+        lists: true,
+        prunes: 0,
+        failures: 0,
+      },
+      {
+        name: 'a stop during the drift build',
+        drive: async (rig) => {
+          await passingRun(rig)
+          rig.docker.programBuild({ kind: 'hangs' }, { role: 'drift' })
+          const faults = await stopDuringBuild(rig, () => buildFaultImages(rig.imagesContext, rig.state, [DRIFT, RETAG]))
+          expect(faults).toEqual({ drift: { kind: 'stopped' }, retag: { kind: 'not-built' } })
+          return faults
+        },
+        tags: ['drift', 'test'],
+        lists: true,
+        prunes: 0,
+        failures: 0,
+      },
+      {
+        name: 'a stop during cleanup, while a prune waits to retry',
+        drive: (rig) => retagRun(rig),
+        beforeCleanup: (rig) => {
+          otherRunPrune(PRUNE_BUSY_FOR_TWO_TRIES_MS)(rig)
+          rig.clock.setTimeout(() => rig.recordStop(), PRUNE_RETRY_INTERVAL_MS / 2)
+        },
+        tags: ['retag', 'test'],
+        lists: true,
+        prunes: 3,
+        failures: 0,
+      },
+      {
+        name: 'failed tag removals',
+        drive: (rig) => retagRun(rig),
+        beforeCleanup: (rig) => rig.docker.fail('image-remove', { times: 'always', stderr: 'Error response from daemon: fake removal failure' }),
+        tags: ['retag', 'test'],
+        lists: true,
+        prunes: 1,
+        failures: 2,
+      },
+      {
+        name: 'a failed listing',
+        drive: (rig) => retagRun(rig),
+        beforeCleanup: (rig) => rig.docker.fail('image-list'),
+        tags: ['retag', 'test'],
+        lists: true,
+        prunes: 0,
+        failures: 1,
+      },
+      {
+        name: 'a prune refused as already running on some tries',
+        drive: (rig) => retagRun(rig),
+        beforeCleanup: otherRunPrune(PRUNE_BUSY_FOR_TWO_TRIES_MS),
+        tags: ['retag', 'test'],
+        lists: true,
+        prunes: 3,
+        failures: 0,
+      },
+      {
+        name: 'a prune refused as already running on every try',
+        drive: (rig) => retagRun(rig),
+        beforeCleanup: otherRunPrune(PRUNE_BUSY_FOR_EVERY_TRY_MS),
+        tags: ['retag', 'test'],
+        lists: true,
+        prunes: PRUNE_RETRIES + 1,
+        failures: 1,
+      },
+    ]
+
+    /** A path by its name. */
+    function removalPath(name: string): RemovalPath {
+      const path = REMOVAL_PATHS.find((candidate) => candidate.name === name)
+      if (path === undefined) throw new Error(`no removal path named ${name}`)
+      return path
+    }
+
+    /** What one path's cleanup did. */
+    interface CleanedPath {
+      readonly rig: E8Rig
+      readonly outcome: unknown
+      readonly report: RunImageCleanupReport
+      /** The runner's docker operations cleanup made. */
+      readonly cleanupOps: readonly FakeDockerOperation[]
+    }
+
+    /**
+     * Runs a path, then cleanup, on the fake clock. Checks that cleanup left
+     * what the run hands its verdict or refusal, and the image-state record,
+     * unchanged; that its runner-log lines are exactly its failure lines, each
+     * also in `state.cleanupFailures`; and that no output leaks a secret.
+     */
+    async function cleanPath(path: RemovalPath, rig: E8Rig = makeE8Rig()): Promise<CleanedPath> {
+      const outcome = await onClock(rig, path.drive(rig))
+      const handedOn = structuredClone(outcome)
+      const images = structuredClone(rig.state.images)
+      path.beforeCleanup?.(rig)
+      const opsMark = rig.docker.operations().length
+      const logMark = rig.logLines.length
+      const report = await onClock(rig, cleanupRunImages(rig.imagesContext, rig.state))
+      const cleanupOps = rig.docker.operations().slice(opsMark).filter((op) => op.source === 'runner')
+
+      expect(outcome).toEqual(handedOn)
+      expect(rig.state.images).toEqual(images)
+      expect(rig.state.cleanupFailures).toEqual([...report.failures])
+      expect(rig.logLines.slice(logMark)).toEqual([...report.failures])
+      for (const line of report.failures) expect(line.startsWith(FAIL_PREFIX) || line.startsWith(NOT_RUN_PREFIX)).toBe(false)
+      e8AssertNoLeak({ outcome, report, logLines: rig.logLines, cleanupFailures: rig.state.cleanupFailures, images: rig.state.images, argvs: rig.recorder.argvs() })
+      return { rig, outcome, report, cleanupOps }
+    }
+
+    /** The image IDs a listing printed. */
+    async function listedIds(result: Promise<e8Runner.SpawnResult>): Promise<{ readonly exitCode: number; readonly ids: readonly string[] }> {
+      const done = await result
+      return { exitCode: done.exitCode, ids: new TextDecoder().decode(done.stdout).split('\n').filter((line) => line !== '') }
+    }
+
+    /**
+     * The removal-path rules over every docker command the run spawned, read
+     * from the spawn recorder and the fake's operation log (b.uqm SR-9.3):
+     * - every image removal is `docker image rm <tag>` naming one of the run's
+     *   own run-private tags (no ID, no digest, no force);
+     * - every prune is the prune form on exactly the run's owner label, after a
+     *   listing of untagged images with exactly that label that found one;
+     * - no other command removes an image: Docker's own removal words are
+     *   checked on every docker argument list the recorder holds, started or
+     *   not, so a new removal form fails here.
+     */
+    async function assertRemovalRules(rig: E8Rig): Promise<void> {
+      const ownTags = RUN_TAG_ROLES.map(tagOf)
+      // Docker's CLI words for removing images, whatever form the runner might build.
+      const removesImages = (argv: readonly string[]): boolean => {
+        const [, command, sub] = argv
+        return command === 'rmi' || (command === 'image' && ['rm', 'remove', 'prune'].includes(sub ?? '')) || (['system', 'builder'].includes(command ?? '') && sub === 'prune')
+      }
+      // A force flag in any form: `-f`, a short-flag cluster holding f, `--force` or `--force=<value>`.
+      const isForceFlag = (arg: string): boolean => /^(?:-[A-Za-z]*f[A-Za-z]*|--force(?:=.*)?)$/.test(arg)
+      for (const argv of rig.recorder.argvs().filter((a) => a[0] === DOCKER_PROGRAM && removesImages(a))) {
+        if (argv[2] === 'prune') {
+          // The prune form's `--force` only skips Docker's prompt; it is pinned whole, with no `--all`.
+          expect([...argv]).toEqual(imagePruneArgs(OWNER_VALUE))
+          for (const all of ['--all', '-a']) expect(argv).not.toContain(all)
+          continue
+        }
+        expect(argv.filter(isForceFlag)).toEqual([])
+        expect(ownTags.some((tag) => sameArgv(argv, imageTagRemovalArgs(tag)))).toBe(true)
+      }
+      const started = rig.recorder.spawns().filter((spawn) => spawn.argv[0] === DOCKER_PROGRAM && spawn.pid !== null)
+      const ops = rig.docker.operations().filter((op) => op.source === 'runner')
+      expect(ops.map((op) => op.argv)).toEqual(started.map((spawn) => spawn.argv))
+      for (const [at, op] of ops.entries()) {
+        if (!removesImages(op.argv)) {
+          expect(['image-remove', 'image-prune']).not.toContain(op.kind)
+          continue
+        }
+        if (op.kind === 'image-remove') {
+          expect(op.removalBy).toBe('tag')
+          expect(ownTags).toContain(op.refs[0])
+          expect(op.argv).toEqual(imageTagRemovalArgs(op.refs[0]!))
+          continue
+        }
+        expect(op.kind).toBe('image-prune')
+        expect(op.argv).toEqual(imagePruneArgs(OWNER_VALUE))
+        const listingAt = ops.slice(0, at).reduce((last, earlier, i) => (earlier.kind === 'image-list' ? i : last), -1)
+        expect(listingAt).toBeGreaterThanOrEqual(0)
+        expect(ops[listingAt]!.argv).toEqual(OWN_UNTAGGED_LISTING)
+        const listed = await listedIds(started[listingAt]!.result)
+        expect(listed.exitCode).toBe(0)
+        expect(listed.ids.length).toBeGreaterThan(0)
+      }
+    }
+
+    test.each(REMOVAL_PATHS.map((path) => [path.name, path] as const))(
+      'the removal-path test, %s: every image removal is a run-private tag by name, or an owner-filtered prune after a listing that found one',
+      async (_name, path) => {
+        const { rig, report, cleanupOps } = await cleanPath(path)
+        await assertRemovalRules(rig)
+        expect(cleanupOps.filter((op) => op.kind === 'image-remove').map((op) => op.refs[0])).toEqual(path.tags.map(tagOf))
+        expect(cleanupOps.filter((op) => op.kind === 'image-list')).toHaveLength(path.lists ? 1 : 0)
+        expect(cleanupOps.filter((op) => op.kind === 'image-prune')).toHaveLength(path.prunes)
+        expect(report.untagged === null).toBe(!path.lists)
+        expect(report.failures).toHaveLength(path.failures)
+        if (!path.lists) expect(cleanupOps).toEqual([])
+      },
+    )
+
+    test('the paths that spawn no test, drift or retag build (a refusal before the build, a failed base build, a stop before it, a build not spawned) make no tag removal, no listing and no prune at any point', async () => {
+      for (const name of ['a refusal before the build (step 4)', 'a failed base build', 'a stop before the test build', 'a test build that could not be spawned']) {
+        const { rig, report } = await cleanPath(removalPath(name))
+        expect(report).toEqual({ tags: [], untagged: null, failures: [] })
+        expect(rig.docker.operations().filter((op) => ['image-remove', 'image-list', 'image-prune'].includes(op.kind))).toEqual([])
+      }
+      expect(runImageCleanupPlan(initialImageState())).toEqual({ tagRoles: [], listUntagged: false })
+    })
+
+    test('the tags are removed -drift, -retag, -test, each once by its name; then the pinned image left untagged is pruned and none of the run\'s images remains', async () => {
+      expect(CLEANUP_TAG_ORDER).toEqual(['drift', 'retag', 'test'])
+      const { rig, report, cleanupOps } = await cleanPath({
+        name: 'drift and retag, the move done',
+        drive: async (rig) => {
+          await passingRun(rig)
+          const faults = await buildFaultImages(rig.imagesContext, rig.state, [DRIFT, RETAG])
+          expect([faults.drift.kind, faults.retag.kind]).toEqual(['built', 'built'])
+          expect(await moveTestTagToRetagImage(rig.imagesContext, rig.state)).toEqual({ kind: 'moved' })
+          return faults
+        },
+        tags: ['drift', 'retag', 'test'],
+        lists: true,
+        prunes: 1,
+        failures: 0,
+      })
+      await assertRemovalRules(rig)
+      const tags = [tagOf('drift'), tagOf('retag'), tagOf('test')]
+      expect(cleanupOps.filter((op) => op.kind === 'image-remove').map((op) => op.argv)).toEqual(tags.map((tag) => imageTagRemovalArgs(tag)))
+      expect(report.tags).toEqual((['drift', 'retag', 'test'] as const).map((role) => ({ role, removal: { kind: 'removed' as const } })))
+      expect(report.untagged).toEqual({ kind: 'pruned', tries: 1 })
+      const prune = cleanupOps.find((op) => op.kind === 'image-prune')
+      expect(prune?.deleted).toEqual([PINNED_ID])
+      expect(rig.docker.images()).toEqual([])
+    })
+
+    test('the listing is of untagged images with exactly the run\'s owner label: another run\'s and an unlabelled untagged image are neither listed nor pruned', async () => {
+      const rig = makeE8Rig()
+      const others = [
+        rig.docker.addImage({ labels: { [OWNER_LABEL]: formatOwner(OTHER_OWNER) } }),
+        rig.docker.addImage({ labels: { [OWNER_LABEL]: `${OWNER_VALUE}0` } }),
+        rig.docker.addImage(),
+      ]
+      const { cleanupOps } = await cleanPath(removalPath('retag with the tag move done'), rig)
+      await assertRemovalRules(rig)
+      const listings = cleanupOps.filter((op) => op.kind === 'image-list')
+      expect(listings.map((op) => op.argv)).toEqual([OWN_UNTAGGED_LISTING])
+      const listingSpawn = rig.recorder.spawns().filter((spawn) => sameArgv(spawn.argv, OWN_UNTAGGED_LISTING))
+      expect(listingSpawn).toHaveLength(1)
+      expect((await listedIds(listingSpawn[0]!.result)).ids).toEqual([PINNED_ID])
+      expect(cleanupOps.filter((op) => op.kind === 'image-prune').map((op) => op.deleted)).toEqual([[PINNED_ID]])
+      for (const id of others) expect(rig.docker.image(id)).not.toBeNull()
+    })
+
+    test('a listing that finds no untagged image of the run is followed by no prune', async () => {
+      const { rig, report, cleanupOps } = await cleanPath(removalPath('a pass'))
+      expect(cleanupOps.map((op) => op.kind)).toEqual(['image-remove', 'image-list'])
+      expect(report).toEqual({ tags: [{ role: 'test', removal: { kind: 'removed' } }], untagged: { kind: 'none-found' }, failures: [] })
+      expect(rig.docker.image(PINNED_ID)).toBeNull()
+    })
+
+    test('a prune that leaves the run\'s untagged image because a container still uses it is no cleanup failure', async () => {
+      const path = removalPath('retag with the tag move done')
+      const rig = makeE8Rig()
+      const { report, cleanupOps } = await cleanPath(
+        {
+          ...path,
+          drive: async (r) => {
+            const handed = await path.drive(r)
+            r.docker.addContainer({ name: 'e8-not-a-run-container', image: PINNED_ID, running: false })
+            return handed
+          },
+        },
+        rig,
+      )
+      const prunes = cleanupOps.filter((op) => op.kind === 'image-prune')
+      expect(prunes.map((op) => [op.exitCode, op.deleted])).toEqual([[0, []]])
+      expect(report.untagged).toEqual({ kind: 'pruned', tries: 1 })
+      expect(report.failures).toEqual([])
+      expect(rig.docker.image(PINNED_ID)?.tags).toEqual([])
+    })
+
+    test('a failed tag removal is logged and listed as a cleanup failure, and cleanup goes on to the next tag, the listing and the prune', async () => {
+      const failing = tagOf('retag')
+      const stderr = 'Error response from daemon: fake removal failure of the retag tag'
+      const { rig, report, cleanupOps } = await cleanPath({
+        ...removalPath('retag with the tag move done'),
+        beforeCleanup: (r) => r.docker.fail('image-remove', { stderr, when: (argv) => argv.includes(failing) }),
+      })
+      await assertRemovalRules(rig)
+      expect(cleanupOps.map((op) => [op.kind, op.exitCode])).toEqual([
+        ['image-remove', 1],
+        ['image-remove', 0],
+        ['image-list', 0],
+        ['image-inspect', 0],
+        ['image-prune', 0],
+      ])
+      expect(report.tags.map((tag) => tag.removal.kind)).toEqual(['failed', 'removed'])
+      expect(report.failures).toHaveLength(1)
+      expect(report.failures[0]).toContain(failing)
+      expect(report.failures[0]).toContain(stderr)
+      expect(rig.docker.image(failing)).not.toBeNull()
+    })
+
+    test('a removal Docker answers "No such image" for (a tag a stopped build never made) is no failure', async () => {
+      const { report } = await cleanPath(removalPath('a stop during the test build'))
+      expect(report).toEqual({ tags: [{ role: 'test', removal: { kind: 'absent' } }], untagged: { kind: 'none-found' }, failures: [] })
+    })
+
+    test.each([
+      ['drift', 'a drift build failed by its after-check'],
+      ['retag', 'a retag build failed by its after-check'],
+    ] as const)('a %s build that exited 0 but failed its after-check still has its tag removed by name, before -test, and its image is gone', async (role, pathName) => {
+      const { rig, report, cleanupOps } = await cleanPath(removalPath(pathName))
+      expect(rig.state.images.builds[role]).toEqual({ kind: 'failed', exitCode: e8Runner.FAILURE_EXIT_STATUS })
+      expect(cleanupOps.filter((op) => op.kind === 'image-remove').map((op) => op.argv)).toEqual([imageTagRemovalArgs(tagOf(role)), imageTagRemovalArgs(tagOf('test'))])
+      expect(report.tags).toEqual([
+        { role, removal: { kind: 'removed' } },
+        { role: 'test', removal: { kind: 'removed' } },
+      ])
+      expect(report.failures).toEqual([])
+      expect(rig.docker.image(tagOf(role))).toBeNull()
+      expect(rig.docker.images().filter((image) => image.labels[OWNER_LABEL] === OWNER_VALUE)).toEqual([])
+    })
+
+    test.each([
+      ['refused on the first two tries', PRUNE_BUSY_FOR_TWO_TRIES_MS, 3, false],
+      ['refused on every try', PRUNE_BUSY_FOR_EVERY_TRY_MS, PRUNE_RETRIES + 1, true],
+    ] as const)('a prune %s is tried again PRUNE_RETRY_INTERVAL_MS apart on the fake clock, at most PRUNE_RETRIES times, and fails only when every try was refused', async (_what, busyMs, tries, fails) => {
+      expect(PRUNE_RETRIES).toBeGreaterThanOrEqual(2)
+      const { rig, report, cleanupOps } = await cleanPath({ ...removalPath('retag with the tag move done'), beforeCleanup: otherRunPrune(busyMs) })
+      const prunes = cleanupOps.filter((op) => op.kind === 'image-prune')
+      expect(prunes).toHaveLength(tries)
+      expect(prunes.length).toBeLessThanOrEqual(PRUNE_RETRIES + 1)
+      expect(prunes.slice(1).map((op, i) => op.atMs - prunes[i]!.atMs)).toEqual(Array.from({ length: tries - 1 }, () => PRUNE_RETRY_INTERVAL_MS))
+      expect(prunes.slice(0, -1).every((op) => op.exitCode === 1)).toBe(true)
+      expect(prunes.at(-1)!.exitCode).toBe(fails ? 1 : 0)
+      if (fails) {
+        expect(report.untagged?.kind).toBe('failed')
+        expect(report.failures).toHaveLength(1)
+        expect(report.failures[0]).toContain(PRUNE_ALREADY_RUNNING_TEXT)
+        expect(report.failures[0]).toContain(OWNER_VALUE)
+        expect(rig.docker.image(PINNED_ID)).not.toBeNull()
+      } else {
+        expect(report).toEqual({
+          tags: [
+            { role: 'retag', removal: { kind: 'removed' } },
+            { role: 'test', removal: { kind: 'removed' } },
+          ],
+          untagged: { kind: 'pruned', tries },
+          failures: [],
+        })
+        expect(rig.docker.image(PINNED_ID)).toBeNull()
+      }
+    })
+
+    test('a stop recorded during cleanup changes none of its commands: they match the same path without the stop, each tag removed at most once', async () => {
+      const stopped = await cleanPath(removalPath('a stop during cleanup, while a prune waits to retry'))
+      const unstopped = await cleanPath(removalPath('a prune refused as already running on some tries'))
+      expect(stopped.rig.state.firstStop).not.toBeNull()
+      expect(unstopped.rig.state.firstStop).toBeNull()
+      const commands = (cleaned: CleanedPath): unknown[] => cleaned.cleanupOps.map((op) => [op.argv, op.atMs - cleaned.cleanupOps[0]!.atMs, op.exitCode])
+      expect(commands(stopped)).toEqual(commands(unstopped))
+      expect(stopped.report).toEqual(unstopped.report)
+      const removed = stopped.cleanupOps.filter((op) => op.kind === 'image-remove').map((op) => op.refs[0])
+      expect(new Set(removed).size).toBe(removed.length)
+      await assertRemovalRules(stopped.rig)
+    })
+
+    /** Test data: foreign tags on the pinned ID, which cleanup must leave: a lane tag, and another run's `-test` tag. */
+    const FOREIGN_TAGS = [
+      ['a lane tag', LANE_TAG],
+      ['another run\'s -test tag', formatRunTag(OTHER_OWNER, 'test')],
+    ] as const
+
+    test.each(FOREIGN_TAGS.flatMap(([what, tag]) => [
+      [what, tag, 'a pass'],
+      [what, tag, 'retag with the tag move done'],
+    ] as const))('%s (%s) on the pinned ID survives cleanup of %s, with the image', async (_what, foreignTag, pathName) => {
+      const path = removalPath(pathName)
+      const drive = pathName === 'a pass' ? (r: E8Rig) => passingRun(r, [foreignTag]) : (r: E8Rig) => retagRun(r, false, [foreignTag])
+      const { rig, cleanupOps } = await cleanPath({ ...path, drive })
+      await assertRemovalRules(rig)
+      expect(cleanupOps.some((op) => op.refs.includes(foreignTag))).toBe(false)
+      expect(cleanupOps.filter((op) => op.kind === 'image-prune')).toEqual([])
+      const image = rig.docker.image(foreignTag)
+      expect(image?.id).toBe(PINNED_ID)
+      expect(image?.tags).toEqual([foreignTag])
+    })
+  })
+})
 
 // ===========================================================================
 // E9 (t1.t6s.5x): shard containers; E9 adds its cases here
