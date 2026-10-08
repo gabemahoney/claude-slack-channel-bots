@@ -12,10 +12,13 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   context it reads one file, `docker/ad-client-check.sh`, and no
   `package.json`. What it holds is in
   [What the base holds](#what-the-base-holds).
-- **`cscb-ci:latest`** (built from `docker/Dockerfile.test`, `FROM cscb-ci-base:v6`)
-  — adds `docker/entrypoint.sh`, `tests/`, `testplans/`, the `testuser` account,
-  and the `ENTRYPOINT`. Built on every `/ci` run; should complete in under 10 s
-  on a warm base.
+- **The run's test image** (built from `docker/Dockerfile.test`,
+  `FROM cscb-ci-base:v6`) — adds `docker/entrypoint.sh`, `tests/`,
+  `testplans/`, the `testuser` account, and the `ENTRYPOINT`. Each `/ci` run
+  builds its own, once, with the owner label `cscb-ci-owner=<RUN_ID>-<PID>`,
+  tags it only `cscb-ci-run:<RUN_ID>-<PID>-test`, and removes it at the run's
+  end (see [The run's images and tags](#the-runs-images-and-tags)). The build
+  should complete in under 10 s on a warm base.
 - **`cscb-ci-live:latest`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v6`)
   — the `/ci-live` image (see [/ci-live](#ci-live-the-live-slack-acceptance-run)
   below). It adds Claude Code at a pinned version with auto-update off, the
@@ -27,10 +30,13 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   The package under test is not in the image; the runner mounts its tarball.
   Built on every `/ci-live` run.
 
-`/ci` detects whether `cscb-ci-base:v6` exists locally; if absent, it builds the
-base first, then builds `cscb-ci`. The base build is a one-time per-host cost
-per version tag. `/ci-live` does not build the base: it stops (exit 2) and asks
-for one `/ci` run when the base is missing.
+`/ci` builds the base only when the tag that `docker/Dockerfile.test`'s `FROM`
+line names is missing locally, through the base-build step
+`scripts/ci-base-build.sh`; then it builds the run's own test image. The base
+build is a one-time per-host cost per version tag. `/ci` builds no
+`cscb-ci:latest`, and leaves one that already exists alone. `/ci-live` does
+not build the base: it stops (exit 2) and asks for one `/ci` run when the base
+is missing.
 
 The images carry agent-director `0.11.0`, the release pinned in
 `docker/Dockerfile.test.base` (`AD_VERSION`, `AD_COMMIT`): its binaries from
@@ -162,9 +168,11 @@ it stop with an `ERROR:` line naming the missing context.
   `ad-client-check.sh --client`.
 
 `CSCB_AD_SRC_DIR` is not read when the base already exists. `/ci` stops as
-not runnable when it must build the base and the variable is unset, the
-checkout has no tag `v<AD_VERSION>`, or the script cannot be extracted at
-that tag. Nothing from the checkout is copied into the repo.
+not runnable when it must build the base and `docker/Dockerfile.test.base`
+sets no `ARG AD_VERSION`, the variable is unset, the checkout has no tag
+`v<AD_VERSION>`, the script cannot be extracted at
+that tag, or the base-build token, when one is found, is shorter than 8
+characters. Nothing from the checkout is copied into the repo.
 
 ## The base build's GitHub token
 
@@ -212,8 +220,9 @@ rm -rf "$AD_INSTALL_CTX"
 ## Image marker
 
 Only the `cscb-ci` images carry `/etc/cscb-ci-image`, written by the base
-build (so `cscb-ci` and `cscb-ci-live` have it too). `tests/runner.sh` checks
-for it first and, when it is absent, prints one line on stderr and exits 2,
+build (so the run's test image and `cscb-ci-live` have it too).
+`tests/runner.sh` checks for it first and, when it is absent, prints one line
+on stderr and exits 2,
 so the runner never runs outside a `cscb-ci` image. `ad-client-check.sh`
 checks for it the same way and exits 3. Every integration script, the fmk
 driver and stub-session fixtures, `fixtures/phase1-client-check.ts`, and every
@@ -250,28 +259,43 @@ bump. There is **no** automatic version derivation — bump it manually in
 every place that names it:
 
 1. The `FROM` line in `docker/Dockerfile.test`.
-2. The `BASE_TAG` variable in `.claude/skills/ci/SKILL.md`, and the tag in
-   its non-runnable conditions.
+2. The `BASE_TAG` variable in `scripts/ci-base-build.sh`, the base-build
+   step, and the tag wherever `.claude/skills/ci/SKILL.md` names it.
 3. The `FROM` line in `docker/Dockerfile.live`.
 4. `BASE_IMAGE` in `ci-live/lib/docker.ts`.
 5. The tag in `.claude/skills/ci-live/SKILL.md` (twice) and in
    `ci-live/README.md`'s "Where you start".
-6. The header comment of `docker/Dockerfile.test.base`.
-7. This file: the image list above, the `/ci` paragraph after it, the hand
-   build command, the `docker history` check, and the commands under the
-   two "Verifying" sections below.
+6. The header comment of `docker/Dockerfile.test.base`. The same edit
+   rewords that file's three mentions of the `/ci` skill as the base build's
+   caller to name the base-build step, `scripts/ci-base-build.sh`: its
+   header's build command ("Built once per host by the /ci skill"), its note
+   on the BuildKit secret ("see the /ci skill") and its note on the install
+   context ("the /ci skill fills it").
+7. This file: the image list above, the hand build command, the
+   `docker history` check, the commands under the two "Verifying" sections
+   below, and the tags the sweep never touches under
+   [/ci: the sharded run](#ci-the-sharded-run).
 
 The source audit in `tests/ci-live-docker.test.ts` fails when a tag in
 `docker/Dockerfile.test`, `docker/Dockerfile.live`,
-`docker/Dockerfile.test.base` or either skill differs from `BASE_IMAGE`. The
-release is set in one place only, the Dockerfile's `ARG AD_VERSION`: the
-`/ci` skill and the hand build above read it from there (with `sed`) to
+`docker/Dockerfile.test.base`, `scripts/ci-base-build.sh` or either skill
+differs from `BASE_IMAGE`, and when the base-build step has other than one
+`BASE_TAG` or does not build `docker/Dockerfile.test.base` under it. The
+`/ci` skill stays among those files only while it names a base tag.
+
+The release is set in one place only, the Dockerfile's `ARG AD_VERSION`. The
+base-build step and the hand build above read it from there (with `sed`) to
 name the tag `install.sh` is taken from, and the `/ci-live` skill reads it
 and `ARG AD_SHA256` the same way to stage the release binary. None types a
 version, commit or SHA-256 of its own, so a new release is a change to the
-Dockerfile alone (its pins and the tag bump). The source audit fails when a
-skill types a commit, and when an image file, a `ci-live/lib` module or a
-skill pins a release candidate.
+Dockerfile alone (its pins and the tag bump).
+
+The source audit fails when the base-build step reads the release other than
+from `ARG AD_VERSION`, extracts `install.sh` other than at the release tag,
+passes a context other than `agent-director-install`, fetches into
+agent-director's tree or types a commit. It fails too when the `/ci-live`
+skill types a commit, and when an image file, the base-build step, a
+`ci-live/lib` module or a skill pins a release candidate.
 
 Common reasons to bump: a new agent-director release, a change of the 0.10.0
 pins, a change to `docker/ad-client-check.sh`, bumping the bun
@@ -284,35 +308,47 @@ still name it keep using it.
 
 ## Verifying the cold-cache path
 
-To simulate a fresh host:
+To simulate a fresh host, remove the base tag by its name, and nothing else:
 
-```bash
-docker rmi cscb-ci-base:v6 cscb-ci:latest 2>/dev/null
+```sh
+docker rmi cscb-ci-base:v6
 /ci   # with CSCB_AD_SRC_DIR set; or run the hand build above
 ```
 
 The first build should take minutes (apt + bun + nodejs + pip + npm pack +
-the release's install and checks). Time it; if it exceeds the Claude Code Bash
-tool's 10-minute timeout, raise an issue.
+the release's install and checks). Time it against the run deadline's 60 min
+base allowance (`BASE_BUILD_ALLOWANCE_MINUTES` in `scripts/ci-run.ts`), the
+time the deadline adds when the runner finds the base missing; if the base
+build comes near it, raise an issue.
 
 ## Verifying warm-cache parity
 
 After a `/ci` run, confirm the base layers are intact:
 
-```bash
+```sh
 docker history cscb-ci-base:v6
 ```
 
 Then edit a comment in (e.g.) `tests/integration/test-1-install-startup.sh`
-and re-run the build:
+and build the test image under a tag of its own, `cscb-ci-warm:<epoch seconds>`,
+computed once and reused below (never `cscb-ci:latest`):
 
-```bash
-docker build -f docker/Dockerfile.test -t cscb-ci .
+```sh
+WARM_TAG="cscb-ci-warm:$(date +%s)"
+docker build -f docker/Dockerfile.test -t "$WARM_TAG" .
 ```
 
 This should complete in seconds, and needs neither build context nor the
 token. `docker history cscb-ci-base:v6` should show the same layer IDs as
-before — proof the source edit didn't invalidate the base.
+before — proof the source edit didn't invalidate the base. Then remove the
+tag by its name:
+
+```sh
+docker rmi "$WARM_TAG"
+```
+
+Removing the tag deletes the image only when no other tag and no container
+uses it. The procedure never removes an image by its ID.
 
 ## /ci: the sharded run
 
@@ -628,6 +664,135 @@ removes the container only after its final reading.
 Each admitted run builds its own test image, marks it with its owner label and
 a run-private tag, and at its end removes the tags it made and its own untagged
 images.
+
+- **Run-private tags.** A run's tags have the shape
+  `cscb-ci-run:<RUN_ID>-<PID>-<role>`, and no other tag shape is run-private:
+
+  | Role | Tag | Image | Built for |
+  |---|---|---|---|
+  | `test` | `cscb-ci-run:<RUN_ID>-<PID>-test` | The run's test image, the pinned image | Every run that reaches the build |
+  | `drift` | `cscb-ci-run:<RUN_ID>-<PID>-drift` | The drift image | A run with the `image-drift` fault |
+  | `retag` | `cscb-ci-run:<RUN_ID>-<PID>-retag` | The retag image | A run with the `retag` fault |
+
+  The test image is tagged only `-test`. The `retag` fault moves `-test` onto
+  the retag image once every shard's start has been tried, which leaves the
+  pinned image untagged.
+- **The owner label.** Each of the run's images carries
+  `cscb-ci-owner=<RUN_ID>-<PID>`. It is a label, not a tag: it changes no
+  layer and no file, but it gives the run's build an image ID of its own, so
+  no build without that exact label (a lane's image of the same tree, another
+  run's test image) has the pinned ID. The drift and retag images keep the
+  owner label and add the fault label, `cscb-ci-fault=drift` or
+  `cscb-ci-fault=retag`.
+- **Pinning.** After admission, the runner builds the test image once, from
+  `docker/Dockerfile.test` with the worktree as context, its output in the
+  runner log, and pins it by the ID that build printed, never by a tag
+  lookup. Shards start from the pinned ID (the `image-drift` fault's shard
+  from the drift image), so a build or retag from any worktree meanwhile
+  cannot change their image. The drift and retag images are built `FROM`
+  the run's `-test` tag, since BuildKit does not accept an
+  image ID there; the runner checks that the tag names the pinned ID before
+  and after each of those builds.
+- **Read-back.** Before any shard starts, the runner reads the script list,
+  each script's prerequisite line and the duration table back from the pinned
+  image without starting a container. It creates one container,
+  `cscb-ci-<RUN_ID>-<PID>-read`, labelled `cscb-ci=1` and with the owner
+  label, never starts it, copies `/tests` out of it into memory and removes it
+  by name. A script list or prerequisite line that differs from the
+  worktree's refuses the run, naming each difference; a read-back that fails
+  outright is `NOT RUN: test image read-back failed: <error>`. A missing
+  duration table is no failure.
+
+#### Image cleanup
+
+After the run's containers are gone, whatever the outcome, a refusal
+included, cleanup:
+
+1. removes the tags the run made, each by its name, in the order `-drift`,
+   `-retag`, `-test`; a tag already gone is no failure;
+2. lists the run's own untagged images, those with its exact owner label:
+
+   ```sh
+   docker image ls --no-trunc --quiet --filter dangling=true --filter "label=cscb-ci-owner=<RUN_ID>-<PID>"
+   ```
+
+3. only when that listing found one, prunes them:
+
+   ```sh
+   docker image prune --force --filter "label=cscb-ci-owner=<RUN_ID>-<PID>"
+   ```
+
+Removing the tags normally deletes the run's images, so the listing finds
+nothing and no prune is made. Normally only after `retag` fired does it find
+the pinned image that the moved tag left untagged. The prune's `--force` only
+skips its confirmation prompt.
+
+- **The prune retry.** Docker runs one image prune at a time. A prune refused
+  with `a prune operation is already running` is tried 3 times more, 1 s
+  apart (`PRUNE_RETRIES`, `PRUNE_RETRY_INTERVAL_MS` in `scripts/ci-run.ts`),
+  and fails only when its last try is refused too.
+- **No build, no removal.** A run that started no test, drift or retag build
+  lists nothing and prunes nothing, so it removes no image. Every refusal
+  before the build is such a run; the base build does not count.
+- **Failures.** A removal or listing that fails is written to the runner log
+  and listed among the run's cleanup failures (`cleanupFailures` in
+  `results.json`, and the summary); a failed listing makes no prune. A
+  failure never changes the verdict or a refusal. A later run's sweep removes
+  the leftovers once their owner is dead.
+
+The sweep removes dead runs' run-private tags and owner-labelled untagged
+images the same way: tags by their names, untagged images only through a
+prune filtered on one dead owner's exact label, after a listing that found
+one. Its order and scope are in
+[The admission lock, reservations and the sweep](#the-admission-lock-reservations-and-the-sweep).
+
+#### What is never removed
+
+No image is ever removed by its ID or digest, and no removal is forced. The
+only image removals are a tag removal naming one run-private tag and a prune
+filtered on one exact owner label. Docker deletes an image only when its last
+tag goes and no container, even a stopped one, uses it.
+
+Cleanup and the sweep never touch:
+
+- `cscb-ci:latest`, the base tag (the one `docker/Dockerfile.test`'s `FROM`
+  line names) or `cscb-ci-live:latest`;
+- lane tags, such as `cscb-ci-l5:m5`, or the `cscb-ci-warm:*` tags of
+  [Verifying warm-cache parity](#verifying-warm-cache-parity);
+- any image that still has a tag, any image without an owner label, a live
+  owner's tags, and, for cleanup, any other owner's;
+- an image that a foreign tag or a container holds, even one that shares the
+  pinned ID: removing the run's tag leaves the image and the foreign tag in
+  place.
+
+#### When an image build fails
+
+| Line | Means |
+|---|---|
+| `FAIL: image build: base image build failed (exit <code>)` | `scripts/ci-base-build.sh` exited non-zero: 1 after one of its own `non-runnable:` lines, otherwise the base build's own status |
+| `FAIL: image build: test image build failed (exit <code>)` | The test image's build failed; its output is in the runner log |
+
+A build that a stop ended gets neither line.
+
+The base-build step runs only when the runner's check before the admission
+lock found the base missing (its checks are in
+[How the base gets the release](#how-the-base-gets-the-release)) and a check
+just before the step still finds it missing; a base another run built
+meanwhile is used as it is. A re-check that fails is logged, and the step
+runs anyway; its own build answers for the base.
+
+The base build keeps `--progress=quiet`, so the runner log holds only what
+that mode prints, not the failing step's `ERROR:` line. To see why it
+failed, rerun the hand build in
+[The base build's GitHub token](#the-base-builds-github-token) with
+`--progress=plain` in place of `--progress=quiet`.
+
+#### Interrupted base builds
+
+A base build that a stop ended can leave its build context behind: a
+`cscb-ci-ad-install-*` directory in the system temp directory (`$TMPDIR`,
+else `/tmp`), holding only the extracted `install.sh`. It is safe to remove
+once no base build is running.
 
 ## /ci-live: the live Slack acceptance run
 

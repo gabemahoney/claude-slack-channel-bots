@@ -89,6 +89,10 @@ import {
 // E6 T5's results-directory listing: entries and sizes by lstat, no link followed.
 // Aliased so that no other lane's import of the same names from node:fs collides with these bindings.
 import { lstatSync as lstatResultsEntry, readdirSync as listResultsDir } from 'node:fs'
+// E8 T1's package: the tarball's SHA-256, and its directory entry read without
+// following a link. Aliased so another lane's own imports cannot collide.
+import { createHash as createPackageHash } from 'node:crypto'
+import { lstatSync as lstatPackageEntry } from 'node:fs'
 
 // ---------------------------------------------------------------------------
 // 1. Entry and dependencies (E1)
@@ -1353,8 +1357,26 @@ export type RunLevelStop =
 export interface RunState {
   /** The first run-level stop; later ones change nothing (b.uqm SR-5.6). */
   firstStop: RunLevelStop | null
+  /** Step 4's base-image outcome (E8 T1): present, or missing with the clock moment it was found missing, which the deadline's 60 min counts from (b.uqm SR-9.2, SR-5.5); null until step 4 has found it. */
+  baseImage: BaseImageCheck | null
+  /** The base-build token step 4 found (E8 T1), a secret credential (b.uqm SR-15.1); null when step 4 looked none up (the base present) or found none. */
+  baseBuildToken: string | null
+  /** The clock moment packing started (E8 T1), where the build time starts (b.uqm SR-4.4); null until step 5 starts. */
+  packingStartedAtMs: number | null
+  /** The tarball's path in `package/` (E8 T1, b.uqm SR-9.1); null when nothing was packed. */
+  tarballPath: string | null
+  /** The tarball's SHA-256 in 64 lowercase hex (E8 T1, b.uqm SR-9.1, SR-16.1); null when nothing was packed. */
+  packageSha256: string | null
+  /** The base-build step while it runs (E8 T1); null otherwise. E13's stop path ends it through `end()` (SIGKILL to its process group) after recording the stop (b.uqm SR-5.6). */
+  baseBuildStep: BaseBuildStep | null
+  /** The base-build step's run on the clock (E8 T1, b.uqm SR-4.4); null when it did not run, its end null while it runs. */
+  baseBuildRun: BaseBuildRun | null
   /** Each cleanup failure's line (b.uqm SR-9.3). */
   readonly cleanupFailures: string[]
+  /** The run's image-state record (E8 T2): replaced whole by E8's build and tag-move functions as each step starts and ends (b.uqm SR-9.3, SR-14.2). */
+  images: ImageState
+  /** The test, drift or retag build in progress (E8 T2); null when none runs. E13's stop path ends it through `end()` (SIGKILL to its process group) after recording the stop (b.uqm SR-5.6). */
+  imageBuildInProgress: ImageBuild | null
 }
 
 // --- Images ---
@@ -1410,6 +1432,12 @@ export interface ImageState {
   readonly builds: RoleBuildOutcomes
   /** True only when the `retag` fault moved the `-test` tag. */
   readonly retagMoved: boolean
+  /** The clock moment (epoch ms) the pinned ID became known; null until then (E8 T2; E4 and E13 end the build time here). */
+  readonly pinnedAtMs: number | null
+  /** Per role, whether its build was spawned (E8 T2): cleanup lists and prunes the run's untagged images only when one was (b.uqm SR-9.3). */
+  readonly buildsStarted: Readonly<Record<RunTagRole, boolean>>
+  /** Per role, whether its build made, or may have made, its run-private tag, so cleanup removes that tag by name; false when it failed on its own and made none (E8 T2's tag rule, at `imageBuildEnd`). */
+  readonly tagsMade: Readonly<Record<RunTagRole, boolean>>
 }
 
 // --- results.json (b.uqm SR-16.1) ---
@@ -8715,6 +8743,1755 @@ export function admissionRefusal(
 // ---------------------------------------------------------------------------
 // 12. Images (E8)
 // ---------------------------------------------------------------------------
+
+// --- 12/T1 (E8 T1): the package, the base image's checks and the base-build step ---
+//
+// Step 4 (b.uqm SR-5.3, SR-9.2). The base image is the image that
+// `docker/Dockerfile.test`'s one FROM instruction names: the runner types no
+// base tag. Its existence is one image inspect of that one name through E1's
+// docker layer, never an image listing. Only when it is missing are the base
+// build's prerequisites checked, in SR-9.2's order, each read-only, the first
+// failure refusing the run (no kind) with a reason that names the check and
+// holds no secret value: `ARG AD_VERSION`, read as the base-build step reads it;
+// `CSCB_AD_SRC_DIR`; the release tag in that checkout; `install.sh` at that tag
+// (read into memory only, nothing written, nothing fetched); and the
+// base-build token, looked up only here, through E1's lookup, as the step
+// finds it (b.uqm SR-15.1). The outcome and the token go into the run state.
+//
+// Step 5 (b.uqm SR-9.1, SR-5.9). `npm pack` runs in the worktree, writing only
+// into the run-private `package/` (0700) of the run directory; the tarball it
+// names in its own output is made 0444 and hashed. Its lifecycle scripts are
+// skipped (`--ignore-scripts`), so packing writes nothing into the worktree.
+//
+// Step 12 (b.uqm SR-9.2, SR-5.6). The base-build step,
+// `scripts/ci-base-build.sh`, runs only when step 4 found the base missing and
+// a re-check just before still finds it missing; in a process group of its
+// own, in the worktree, with the runner's environment, its output lines in the
+// runner log through E1's writer (so E11's redaction applies). Its handle is
+// `RunState.baseBuildStep` while it runs. A non-zero exit gives
+// `FAIL: image build: base image build failed (exit <code>)`, unless its handle
+// ended it or the run's stop record (`RunState.firstStop`) is set when it ends.
+//
+// Every child (docker, git, gh, npm and the step) gets the runner's environment
+// unchanged through the child-environment rule (b.uqm SR-15.4), the token
+// lookup's own `GH_CONFIG_DIR` aside.
+
+/** The base-build step, relative to the worktree root: the `/ci` skill's base-build commands at 946be79, moved unchanged (b.uqm SR-9.2, SR-19.5). */
+export const BASE_BUILD_STEP_PATH = 'scripts/ci-base-build.sh'
+/** The shell the base-build step runs under, as its `#!/usr/bin/env bash` line names it, looked up on the child environment's `PATH`. */
+export const BASE_BUILD_STEP_SHELL = 'bash'
+/** The base Dockerfile's line prefix the base-build step reads `AD_VERSION` from, as its `sed -n 's/^ARG AD_VERSION=//p'` does (b.uqm SR-9.2). */
+export const AD_VERSION_ARG_PREFIX = 'ARG AD_VERSION='
+/** The variable that names the agent-director source checkout the base build extracts `install.sh` from (b.uqm SR-9.2). */
+export const AD_SOURCE_DIR_VARIABLE = 'CSCB_AD_SRC_DIR'
+/** The agent-director release tag's prefix: the tag is `v<AD_VERSION>` (b.uqm SR-9.2). */
+export const AD_TAG_PREFIX = 'v'
+/** The install script, relative to the agent-director checkout, read at the release tag (b.uqm SR-9.2). */
+export const AD_INSTALL_SCRIPT_PATH = 'skills/install-agent-director/install.sh'
+/** The program step 4's read-only checks of the agent-director checkout run. */
+export const GIT_PROGRAM = 'git'
+/** The program step 5 packs with (b.uqm SR-9.1). */
+export const NPM_PROGRAM = 'npm'
+/** The mode of `package/`, owner-only like the run directory (b.uqm SR-5.9). */
+export const PACKAGE_DIR_MODE = RUN_DIR_MODE
+/** The tarball's mode once packed: read-only for all (b.uqm SR-5.9, SR-9.1). */
+export const PACKAGE_TARBALL_MODE = 0o444
+/** The suffix of the tarball's file name in `npm pack`'s output. */
+export const PACKAGE_TARBALL_SUFFIX = '.tgz'
+
+/** A FROM instruction, its keyword in any case. */
+const DOCKERFILE_FROM_INSTRUCTION = /^FROM(\s|$)/i
+/** A line that continues on the next: it ends with the default escape, `\`. */
+const DOCKERFILE_CONTINUATION = /\\[ \t]*$/
+
+/** A text's last non-empty line, on one line; null when it has none. */
+function lastTextLine(text: string): string | null {
+  const lines = text
+    .split('\n')
+    .map((line) => dockerOneLine(line))
+    .filter((line) => line !== '')
+  return lines.at(-1) ?? null
+}
+
+// Step 4: the base image's name, its existence and the base build's prerequisites.
+
+/** The reason of a `docker/Dockerfile.test` that could not be read (b.uqm SR-9.2). */
+export function testDockerfileUnreadableReason(error: string): string {
+  return `${TEST_DOCKERFILE_PATH} could not be read (${error}): the base image is the one its FROM instruction names`
+}
+
+/** The reason of a `docker/Dockerfile.test` with no FROM instruction or several (b.uqm SR-9.2). */
+export function testDockerfileFromCountReason(count: number): string {
+  const found = count === 0 ? 'no FROM instruction' : `${count} FROM instructions`
+  return `${TEST_DOCKERFILE_PATH} has ${found}: the base image is the one its one FROM instruction names`
+}
+
+/** The reason of a `docker/Dockerfile.test` whose one FROM instruction names no image by a fixed name (b.uqm SR-9.2). */
+export function testDockerfileFromNameReason(instruction: string): string {
+  return `${TEST_DOCKERFILE_PATH}'s FROM instruction names no base image by a fixed name: ${shownArgument(instruction)}`
+}
+
+/** The reason of an existence query that failed (b.uqm SR-9.2). */
+export function baseImageCheckFailedReason(image: string, error: string): string {
+  return `checking whether the base image ${shownArgument(image)} exists failed: ${error}`
+}
+
+/** The reason of a missing base whose base Dockerfile sets no `ARG AD_VERSION`, or could not be read for it (b.uqm SR-9.2). */
+export function adVersionMissingReason(image: string, readError: string | null): string {
+  const missing = `the base image ${shownArgument(image)} is missing and`
+  if (readError !== null) return `${missing} ${BASE_DOCKERFILE_PATH} could not be read for its ARG AD_VERSION (${readError}): the base build reads its agent-director release there`
+  return `${missing} ${BASE_DOCKERFILE_PATH} sets no ARG AD_VERSION: the base build reads its agent-director release there`
+}
+
+/** The reason of a missing base with `CSCB_AD_SRC_DIR` unset or empty (b.uqm SR-9.2). */
+export function adSourceDirUnsetReason(image: string, adTag: string): string {
+  return `the base image ${shownArgument(image)} is missing and ${AD_SOURCE_DIR_VARIABLE} is unset or empty: set it to a checkout of agent-director's source tree holding the tag ${shownArgument(adTag)}`
+}
+
+/** The reason of a missing base whose `CSCB_AD_SRC_DIR` checkout has no release tag (b.uqm SR-9.2); `gitError` is git's last error line, when it gave one. */
+export function adTagMissingReason(image: string, sourceDir: string, adTag: string, gitError: string | null): string {
+  const why = gitError === null ? '' : ` (git: ${gitError})`
+  return `the base image ${shownArgument(image)} is missing and ${AD_SOURCE_DIR_VARIABLE} (${shownArgument(sourceDir)}) has no tag ${shownArgument(adTag)}${why}: set ${AD_SOURCE_DIR_VARIABLE} to a checkout of agent-director's source tree holding that tag (/ci fetches nothing into it)`
+}
+
+/** The reason of a missing base whose install script cannot be read at the release tag (b.uqm SR-9.2); `gitError` is git's last error line, when it gave one. */
+export function adInstallScriptUnreadableReason(image: string, sourceDir: string, adTag: string, gitError: string | null): string {
+  const why = gitError === null ? '' : ` (git: ${gitError})`
+  return `the base image ${shownArgument(image)} is missing and ${AD_INSTALL_SCRIPT_PATH} could not be read at ${shownArgument(adTag)} from ${AD_SOURCE_DIR_VARIABLE} (${shownArgument(sourceDir)})${why}: set ${AD_SOURCE_DIR_VARIABLE} to a checkout of agent-director's source tree holding that tag`
+}
+
+/** The reason of a missing base whose base-build token is too short, a bad credential (b.uqm SR-15.1); it never holds the value. */
+export function baseBuildTokenBadReason(image: string): string {
+  return `the base image ${shownArgument(image)} is missing and the base-build token (gh auth token) is a bad credential (it is shorter than ${SECRET_MIN_LENGTH} characters): a secret credential that is set and not empty must be at least ${SECRET_MIN_LENGTH} characters long`
+}
+
+/** A Dockerfile's instructions: lines continued by a final `\` joined, comment lines (also inside a continuation) and blank lines left out. */
+function dockerfileInstructions(text: string): string[] {
+  const instructions: string[] = []
+  let pending: string | null = null
+  for (const raw of text.split('\n')) {
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw
+    const trimmed = line.trim()
+    if (trimmed.startsWith('#')) continue
+    if (pending === null && trimmed === '') continue
+    const continues = DOCKERFILE_CONTINUATION.test(line)
+    const body = continues ? line.replace(DOCKERFILE_CONTINUATION, '') : line
+    pending = pending === null ? body : `${pending} ${body}`
+    if (!continues) {
+      instructions.push(pending.trim())
+      pending = null
+    }
+  }
+  if (pending !== null && pending.trim() !== '') instructions.push(pending.trim())
+  return instructions
+}
+
+/** A base image's name, or why there is none. */
+export type BaseImageNameRead =
+  | {
+      readonly ok: true
+      readonly name: string
+    }
+  | {
+      readonly ok: false
+      /** The refusal's reason, naming `docker/Dockerfile.test`. */
+      readonly reason: string
+    }
+
+/**
+ * The base image's name from `docker/Dockerfile.test`'s text (b.uqm SR-9.2):
+ * the image its one FROM instruction names, after any `--<flag>` and before an
+ * optional `AS <stage>`. No FROM instruction, several, or one naming no image
+ * by a fixed name (none, a `$` variable, or other words) gives a reason
+ * naming the file. Pure.
+ */
+export function baseImageNameOf(text: string): BaseImageNameRead {
+  const froms = dockerfileInstructions(text).filter((instruction) => DOCKERFILE_FROM_INSTRUCTION.test(instruction))
+  const [from, ...others] = froms
+  if (from === undefined || others.length > 0) return { ok: false, reason: testDockerfileFromCountReason(froms.length) }
+  const words = from.split(/\s+/).slice(1)
+  while (words[0]?.startsWith('--') === true) words.shift()
+  const [name, ...rest] = words
+  const restIsStage = rest.length === 0 || (rest.length === 2 && rest[0]?.toLowerCase() === 'as')
+  if (name === undefined || name.includes('$') || !restIsStage) return { ok: false, reason: testDockerfileFromNameReason(from) }
+  return { ok: true, name }
+}
+
+/** The worktree's base image name, read from `docker/Dockerfile.test` under `worktreeRoot` (b.uqm SR-9.2). */
+export function readBaseImageName(worktreeRoot: string): BaseImageNameRead {
+  const read = readFileText(join(worktreeRoot, TEST_DOCKERFILE_PATH))
+  if (read.kind === 'missing') return { ok: false, reason: testDockerfileUnreadableReason('it does not exist') }
+  if (read.kind === 'unreadable') return { ok: false, reason: testDockerfileUnreadableReason(read.error) }
+  return baseImageNameOf(read.text)
+}
+
+/**
+ * `AD_VERSION` as the base-build step reads it from the base Dockerfile's
+ * text (b.uqm SR-9.2): the remainder of every line beginning exactly
+ * `ARG AD_VERSION=`, joined by line feeds, trailing line feeds dropped, as
+ * `"$(sed -n 's/^ARG AD_VERSION=//p' …)"` gives it. Empty when no such line
+ * holds a value. Pure.
+ */
+export function adVersionAsStepReads(text: string): string {
+  return text
+    .split('\n')
+    .filter((line) => line.startsWith(AD_VERSION_ARG_PREFIX))
+    .map((line) => line.slice(AD_VERSION_ARG_PREFIX.length))
+    .join('\n')
+    .replace(/\n+$/, '')
+}
+
+/** `git -C <checkout> rev-parse --verify --quiet refs/tags/<tag>`: the base-build step's own tag check, read-only. */
+export function adTagCheckArgs(sourceDir: string, adTag: string): string[] {
+  return [GIT_PROGRAM, '-C', sourceDir, 'rev-parse', '--verify', '--quiet', `refs/tags/${adTag}`]
+}
+
+/** `git -C <checkout> show <tag>:skills/install-agent-director/install.sh`: the base-build step's own extraction, its output read into memory only. */
+export function adInstallScriptReadArgs(sourceDir: string, adTag: string): string[] {
+  return [GIT_PROGRAM, '-C', sourceDir, 'show', `${adTag}:${AD_INSTALL_SCRIPT_PATH}`]
+}
+
+/** Step 4's base-image outcome (b.uqm SR-9.2, SR-5.5). */
+export type BaseImageCheck =
+  | {
+      readonly kind: 'present'
+      /** The base image's name, from `docker/Dockerfile.test`'s FROM instruction. */
+      readonly image: string
+    }
+  | {
+      readonly kind: 'missing'
+      readonly image: string
+      /** The clock moment its existence query answered "missing": the deadline's 60 min count from here (b.uqm SR-5.5). */
+      readonly missingAtMs: number
+    }
+
+/** Step 4's outcome: the base checked (and, when missing, its prerequisites), or the refusal it gives. */
+export type BaseImageStage =
+  | {
+      readonly ok: true
+      readonly check: BaseImageCheck
+      /** The base-build token found; null when the base is present (no lookup) or none was found. */
+      readonly baseBuildToken: string | null
+      /** The run's secret credentials so far: the environment's, plus the token when one was found (`secretCredentialSet`, b.uqm SR-15.1). */
+      readonly secrets: ReadonlySet<string>
+    }
+  | {
+      readonly ok: false
+      /** No kind; one reason naming the failed check (b.uqm SR-5.8). */
+      readonly refusal: Refusal
+    }
+
+/** What step 4 acts through. */
+export type BaseImageDeps = Pick<RunnerDeps, 'spawn' | 'env' | 'worktreeRoot' | 'clock'>
+
+/** The run-state fields step 4 records. */
+export type BaseImageRunState = Pick<RunState, 'baseImage' | 'baseBuildToken'>
+
+/** The docker context of steps 4 and 12: the spawn dependency, the runner's environment as children get it, the worktree root. */
+function baseImageDockerContext(deps: Pick<RunnerDeps, 'spawn' | 'env' | 'worktreeRoot'>): DockerContext {
+  return { spawn: deps.spawn, env: childEnvironment(deps.env), cwd: deps.worktreeRoot }
+}
+
+/** Runs one read-only git command in the worktree with the runner's environment; a spawn that throws is a git that could not start. */
+async function runReadOnlyGit(deps: Pick<RunnerDeps, 'spawn' | 'env' | 'worktreeRoot'>, argv: readonly string[]): Promise<SpawnResult> {
+  const failed = (why: string): SpawnResult => ({ exitCode: SPAWN_FAILED_EXIT_STATUS, stdout: new Uint8Array(0), stderr: why })
+  try {
+    return await deps.spawn({ argv, env: childEnvironment(deps.env), cwd: deps.worktreeRoot, ownProcessGroup: false }).result.catch((err: unknown) =>
+      failed(`${GIT_PROGRAM} failed: ${dependencyErrorText(err)}`),
+    )
+  } catch (err) {
+    return failed(`could not start ${GIT_PROGRAM}: ${dependencyErrorText(err)}`)
+  }
+}
+
+/** Whether a found secret is shorter than the minimum, counted in characters (code points), as E2's check counts (b.uqm SR-15.1). */
+function isShortBaseBuildToken(token: string): boolean {
+  return Array.from(token).length < SECRET_MIN_LENGTH
+}
+
+/**
+ * The base build's prerequisites, for a missing base (b.uqm SR-9.2), in
+ * order, the first failure ending the checks: `ARG AD_VERSION`; then
+ * `CSCB_AD_SRC_DIR`; its tag `v<AD_VERSION>`; `install.sh` at that tag; then
+ * the base-build token, whose found value is recorded in the run state even
+ * when it is too short. Writes nothing and fetches nothing.
+ */
+async function checkBaseBuildPrerequisites(deps: BaseImageDeps, state: BaseImageRunState, image: string): Promise<{ readonly ok: true; readonly token: string | null } | { readonly ok: false; readonly reason: string }> {
+  const baseText = readFileText(join(deps.worktreeRoot, BASE_DOCKERFILE_PATH))
+  const adVersion = baseText.kind === 'text' ? adVersionAsStepReads(baseText.text) : ''
+  if (adVersion === '') return { ok: false, reason: adVersionMissingReason(image, baseText.kind === 'unreadable' ? baseText.error : null) }
+  const adTag = `${AD_TAG_PREFIX}${adVersion}`
+
+  const sourceDir = deps.env[AD_SOURCE_DIR_VARIABLE]
+  if (sourceDir === undefined || sourceDir === '') return { ok: false, reason: adSourceDirUnsetReason(image, adTag) }
+
+  const tag = await runReadOnlyGit(deps, adTagCheckArgs(sourceDir, adTag))
+  if (tag.exitCode !== 0) return { ok: false, reason: adTagMissingReason(image, sourceDir, adTag, lastTextLine(tag.stderr)) }
+
+  const script = await runReadOnlyGit(deps, adInstallScriptReadArgs(sourceDir, adTag))
+  if (script.exitCode !== 0) return { ok: false, reason: adInstallScriptUnreadableReason(image, sourceDir, adTag, lastTextLine(script.stderr)) }
+
+  const token = await lookUpBaseBuildToken(deps.spawn, deps.env, deps.worktreeRoot)
+  state.baseBuildToken = token
+  if (token !== null && isShortBaseBuildToken(token)) return { ok: false, reason: baseBuildTokenBadReason(image) }
+  return { ok: true, token }
+}
+
+/**
+ * Step 4 of the run sequence (b.uqm SR-5.3, SR-9.2): reads the base image's
+ * name from `docker/Dockerfile.test`, queries its existence (one image
+ * inspect of that name) and records the outcome in `state.baseImage`, with
+ * the clock moment when it is missing. With the base present it spawns
+ * nothing more: no git, no gh, no token lookup. With it missing it checks the
+ * base build's prerequisites read-only and records a found base-build token
+ * in `state.baseBuildToken`. A failed check is a refusal with no kind, its
+ * one reason naming the check; E13 records it. Never throws.
+ */
+export async function checkBaseImage(deps: BaseImageDeps, state: BaseImageRunState): Promise<BaseImageStage> {
+  const refused = (reason: string): BaseImageStage => ({ ok: false, refusal: buildRefusal(null, reason) })
+  const name = readBaseImageName(deps.worktreeRoot)
+  if (!name.ok) return refused(name.reason)
+  const image = name.name
+
+  const found = await inspectImage(baseImageDockerContext(deps), image)
+  if (!found.ok) return refused(baseImageCheckFailedReason(image, found.error))
+  if (found.value !== null) {
+    const check: BaseImageCheck = { kind: 'present', image }
+    state.baseImage = check
+    return { ok: true, check, baseBuildToken: null, secrets: secretCredentialSet(deps.env) }
+  }
+  const check: BaseImageCheck = { kind: 'missing', image, missingAtMs: deps.clock.now() }
+  state.baseImage = check
+
+  const prerequisites = await checkBaseBuildPrerequisites(deps, state, image)
+  if (!prerequisites.ok) return refused(prerequisites.reason)
+  return { ok: true, check, baseBuildToken: prerequisites.token, secrets: secretCredentialSet(deps.env, { baseBuildToken: prerequisites.token }) }
+}
+
+// Step 5: the package.
+
+/** `npm pack --ignore-scripts --pack-destination <dir>`: the package packed into `dir`, its lifecycle scripts skipped (b.uqm SR-9.1). */
+export function npmPackArgs(destination: string): string[] {
+  return [NPM_PROGRAM, 'pack', '--ignore-scripts', '--pack-destination', destination]
+}
+
+/** The run's `package/` directory (b.uqm SR-5.9). */
+export function packageDirPath(runDir: string): string {
+  return join(runDir, PACKAGE_DIR_NAME)
+}
+
+/** The tarball's file name from `npm pack`'s standard output: its last non-empty line, trimmed, when it is a plain file name ending `.tgz`; else null. */
+export function packedTarballName(stdout: string): string | null {
+  const name = lastTextLine(stdout)
+  if (name === null || !name.endsWith(PACKAGE_TARBALL_SUFFIX) || name.includes('/') || name.includes('\0')) return null
+  return name
+}
+
+/** The reason of a `package/` that could not be made (b.uqm SR-9.1). */
+export function packageDirFailedReason(path: string, error: string): string {
+  return `packing failed: creating ${shownArgument(path)} failed: ${error}`
+}
+
+/** The reason of an `npm pack` that exited non-zero (b.uqm SR-9.1); `error` is its last error line, when it gave one. */
+export function npmPackFailedReason(exitCode: number, error: string | null): string {
+  return `npm pack failed (exit ${exitCode}): ${error ?? 'no error output'}: run npm install in the worktree, then run /ci again`
+}
+
+/** The reason of an `npm pack` whose output named no tarball it wrote into `package/` (b.uqm SR-9.1). */
+export function npmPackNoTarballReason(packageDir: string): string {
+  return `npm pack failed: its output named no tarball that it wrote into ${shownArgument(packageDir)}`
+}
+
+/** The reason of a tarball that could not be made read-only or hashed (b.uqm SR-9.1). */
+export function packageTarballFailedReason(path: string, error: string): string {
+  return `packing failed: making ${shownArgument(path)} read-only and hashing it failed: ${error}`
+}
+
+/** A packed tarball (b.uqm SR-9.1). */
+export interface PackedPackage {
+  /** Its path, in `package/` of the run directory. */
+  readonly tarballPath: string
+  /** The SHA-256 of its bytes, 64 lowercase hex. */
+  readonly packageSha256: string
+}
+
+/** Step 5's outcome: the packed tarball, or the refusal it gives. */
+export type PackageStage =
+  | {
+      readonly ok: true
+      readonly packed: PackedPackage
+    }
+  | {
+      readonly ok: false
+      /** No kind; one reason naming the failure (b.uqm SR-5.8). */
+      readonly refusal: Refusal
+    }
+
+/** What step 5 acts through. */
+export type PackageDeps = Pick<RunnerDeps, 'spawn' | 'env' | 'worktreeRoot' | 'clock'>
+
+/** The run-state fields step 5 records. */
+export type PackageRunState = Pick<RunState, 'packingStartedAtMs' | 'tarballPath' | 'packageSha256'>
+
+/**
+ * Step 5 of the run sequence (b.uqm SR-9.1, SR-5.9): records the clock moment
+ * packing starts (`state.packingStartedAtMs`, the build time's start), makes
+ * `package/` in `runDir` (0700, exclusively), runs `npm pack` through the
+ * spawn dependency in the worktree with the runner's environment, writing
+ * into `package/`, takes the tarball's name from its own output, makes the
+ * tarball 0444 and records its path and SHA-256 (`state.tarballPath`,
+ * `state.packageSha256`). Any failure is a refusal with no kind, naming it,
+ * and leaves no `packageSha256`. Writes nothing into the worktree. Never throws.
+ */
+export async function packPackage(deps: PackageDeps, runDir: string, state: PackageRunState): Promise<PackageStage> {
+  const refused = (reason: string): PackageStage => ({ ok: false, refusal: buildRefusal(null, reason) })
+  state.packingStartedAtMs = deps.clock.now()
+  const packageDir = packageDirPath(runDir)
+  try {
+    mkdirSync(packageDir, { mode: PACKAGE_DIR_MODE })
+    chmodSync(packageDir, PACKAGE_DIR_MODE)
+  } catch (err) {
+    return refused(packageDirFailedReason(packageDir, dependencyErrorText(err)))
+  }
+
+  let packed: SpawnResult
+  try {
+    packed = await deps.spawn({ argv: npmPackArgs(packageDir), env: childEnvironment(deps.env), cwd: deps.worktreeRoot, ownProcessGroup: false }).result
+  } catch (err) {
+    packed = { exitCode: SPAWN_FAILED_EXIT_STATUS, stdout: new Uint8Array(0), stderr: `could not start ${NPM_PROGRAM}: ${dependencyErrorText(err)}` }
+  }
+  if (packed.exitCode !== 0) return refused(npmPackFailedReason(packed.exitCode, lastTextLine(packed.stderr)))
+  const name = packedTarballName(new TextDecoder().decode(packed.stdout))
+  if (name === null) return refused(npmPackNoTarballReason(packageDir))
+  const tarballPath = join(packageDir, name)
+  try {
+    if (!lstatPackageEntry(tarballPath).isFile()) return refused(npmPackNoTarballReason(packageDir))
+  } catch {
+    return refused(npmPackNoTarballReason(packageDir))
+  }
+
+  let packageSha256: string
+  try {
+    chmodSync(tarballPath, PACKAGE_TARBALL_MODE)
+    packageSha256 = createPackageHash('sha256').update(readFileSync(tarballPath)).digest('hex')
+  } catch (err) {
+    return refused(packageTarballFailedReason(tarballPath, dependencyErrorText(err)))
+  }
+  state.tarballPath = tarballPath
+  state.packageSha256 = packageSha256
+  return { ok: true, packed: { tarballPath, packageSha256 } }
+}
+
+// Step 12: the re-check and the base-build step.
+
+/** `bash <worktree root>/scripts/ci-base-build.sh`: the base-build step's argument list (b.uqm SR-9.2). */
+export function baseBuildStepArgs(worktreeRoot: string): string[] {
+  return [BASE_BUILD_STEP_SHELL, join(worktreeRoot, BASE_BUILD_STEP_PATH)]
+}
+
+/** `FAIL: image build: base image build failed (exit <code>)` (b.uqm SR-9.2); E10's `imageBuildFailure` classes it `image-build`. */
+export function baseImageBuildFailedLine(exitCode: number): string {
+  return `${FAIL_PREFIX}image build: base image build failed (exit ${exitCode})`
+}
+
+/** The runner-log line of a base-build step that could not be started; its exit status is then `SPAWN_FAILED_EXIT_STATUS`. */
+export function baseBuildStepNotStartedLine(why: string): string {
+  return `base-build step: ${BASE_BUILD_STEP_PATH} could not be started: ${dockerOneLine(why)}`
+}
+
+/** The runner-log line of a base the re-check found present: another run built it meanwhile, and it is used as it is (b.uqm SR-9.2). */
+export function baseBuiltMeanwhileLine(image: string): string {
+  return `base-build step: the base image ${shownArgument(image)} is present now, built meanwhile: the step does not run`
+}
+
+/** The runner-log line of a re-check that failed: the step runs, and its own build answers for the base (b.uqm SR-9.2). */
+export function baseRecheckFailedLine(image: string, error: string): string {
+  return `base-build step: checking again whether the base image ${shownArgument(image)} exists failed: ${error}: the step runs`
+}
+
+/** How the base-build step ended. */
+export interface BaseBuildStepExit {
+  /** Its exit status: 128 + the signal's number when a signal ended it; `SPAWN_FAILED_EXIT_STATUS` when it could not be started. */
+  readonly exitCode: number
+  /** Whether `end()` was called before it settled (b.uqm SR-5.6). */
+  readonly endedByHandle: boolean
+}
+
+/** The base-build step, started in a process group of its own. */
+export interface BaseBuildStep {
+  /** Its PID; null when it could not be started. */
+  readonly pid: number | null
+  /** Its process group; null when it could not be started. */
+  readonly processGroup: number | null
+  /** Ends it: SIGKILL to its whole process group, so its `docker build` ends with it (b.uqm SR-5.6). Once it has settled it signals nothing and answers `no-such-process`, so a reused group ID is never signalled. */
+  end(): SignalOutcome
+  /** Settles once it has ended; never rejects. */
+  readonly result: Promise<BaseBuildStepExit>
+}
+
+/** The base-build step's run on the clock (b.uqm SR-4.4). */
+export interface BaseBuildRun {
+  /** The clock moment before its spawn. */
+  readonly startedAtMs: number
+  /** The clock moment it settled; null while it runs. */
+  readonly endedAtMs: number | null
+}
+
+/** Why step 12 did not run the base-build step. */
+export type BaseBuildSkip = 'present-at-step-4' | 'present-at-recheck' | 'stop-recorded'
+
+/** Step 12's base-build outcome (b.uqm SR-9.2, SR-5.6). */
+export type BaseBuildStage =
+  | {
+      /** The step did not run: no base-build run, its time 0 (b.uqm SR-4.4). */
+      readonly kind: 'not-run'
+      readonly why: BaseBuildSkip
+    }
+  | {
+      readonly kind: 'built'
+      readonly run: BaseBuildRun
+    }
+  | {
+      /** A non-zero exit no stop caused. */
+      readonly kind: 'failed'
+      readonly run: BaseBuildRun
+      readonly exitCode: number
+      /** `imageBuildFailure(baseImageBuildFailedLine(exitCode))`. */
+      readonly failure: Failure
+    }
+  | {
+      /** A non-zero exit after its handle ended it, or while the stop record was set: no image build failure (b.uqm SR-5.6). */
+      readonly kind: 'stopped'
+      readonly run: BaseBuildRun
+      readonly exitCode: number
+    }
+
+/** What step 12's base build acts through. */
+export type BaseBuildDeps = BaseImageDeps & Pick<RunnerDeps, 'sendSignal'>
+
+/** The run-state fields step 12's base build reads and records. */
+export type BaseBuildRunState = Pick<RunState, 'firstStop' | 'baseImage' | 'baseBuildStep' | 'baseBuildRun'>
+
+/** Writes one line to the runner log; a log that throws loses that line only. */
+function logBaseBuildLine(log: RunnerLogSink, line: string): void {
+  try {
+    log(line)
+  } catch {
+    // The log's own failure loses this line only; the step goes on.
+  }
+}
+
+/**
+ * Starts the base-build step (b.uqm SR-9.2, SR-5.6): `bash
+ * scripts/ci-base-build.sh` in a process group of its own, in the worktree,
+ * with the runner's environment; each line of its standard output and error
+ * goes to `log` as it arrives (a log that throws loses that line only). A step
+ * that cannot be started settles at once with `SPAWN_FAILED_EXIT_STATUS`, why
+ * written to `log`.
+ */
+export function startBaseBuildStep(deps: BaseBuildDeps, log: RunnerLogSink): BaseBuildStep {
+  const notStarted = (why: string): BaseBuildStep => {
+    logBaseBuildLine(log, baseBuildStepNotStartedLine(why))
+    return { pid: null, processGroup: null, end: () => 'no-such-process', result: Promise.resolve({ exitCode: SPAWN_FAILED_EXIT_STATUS, endedByHandle: false }) }
+  }
+  let child: SpawnedChild
+  try {
+    child = deps.spawn({
+      argv: baseBuildStepArgs(deps.worktreeRoot),
+      env: childEnvironment(deps.env),
+      cwd: deps.worktreeRoot,
+      ownProcessGroup: true,
+      onOutputLine: (line) => logBaseBuildLine(log, line),
+    })
+  } catch (err) {
+    return notStarted(dependencyErrorText(err))
+  }
+  if (child.pid === null) {
+    const result = child.result.then(
+      (done): BaseBuildStepExit => {
+        logBaseBuildLine(log, baseBuildStepNotStartedLine(done.stderr))
+        return { exitCode: done.exitCode, endedByHandle: false }
+      },
+      (err: unknown): BaseBuildStepExit => {
+        logBaseBuildLine(log, baseBuildStepNotStartedLine(dependencyErrorText(err)))
+        return { exitCode: SPAWN_FAILED_EXIT_STATUS, endedByHandle: false }
+      },
+    )
+    return { pid: null, processGroup: null, end: () => 'no-such-process', result }
+  }
+  const processGroup = child.processGroup
+  let settled = false
+  let endedByHandle = false
+  const end = (): SignalOutcome => {
+    if (settled) return 'no-such-process'
+    endedByHandle = true
+    return processGroup === null ? 'no-such-process' : deps.sendSignal({ kind: 'group', processGroup }, 'SIGKILL')
+  }
+  const result = child.result.then(
+    (done): BaseBuildStepExit => {
+      settled = true
+      return { exitCode: done.exitCode, endedByHandle }
+    },
+    (): BaseBuildStepExit => {
+      settled = true
+      return { exitCode: SPAWN_FAILED_EXIT_STATUS, endedByHandle }
+    },
+  )
+  return { pid: child.pid, processGroup, end, result }
+}
+
+/**
+ * Step 12's base build (b.uqm SR-9.2, SR-5.6, SR-4.4). When step 4 found the
+ * base present it checks nothing and runs nothing. When step 4 found it
+ * missing it queries its existence once more: present now (another run built
+ * it), the step does not run and the base is used as it is; still missing, or
+ * a re-check that failed (logged), it starts the step, unless the run's stop
+ * record is set by then. While the step runs its handle is
+ * `state.baseBuildStep`, for E13's stop path, and `state.baseBuildRun` holds
+ * its start; once it ends the handle is cleared and its end recorded. Exit 0
+ * is `built`; another exit is `stopped` when the handle ended it or the stop
+ * record is set as it ends, else `failed` with
+ * `FAIL: image build: base image build failed (exit <code>)` as an
+ * `image-build` failure. Throws only when step 4 recorded no outcome.
+ */
+export async function runBaseBuild(deps: BaseBuildDeps, state: BaseBuildRunState, log: RunnerLogSink): Promise<BaseBuildStage> {
+  const base = state.baseImage
+  if (base === null) throw new Error('runBaseBuild: step 4 recorded no base-image outcome')
+  if (base.kind === 'present') return { kind: 'not-run', why: 'present-at-step-4' }
+
+  const again = await inspectImage(baseImageDockerContext(deps), base.image)
+  if (again.ok && again.value !== null) {
+    logBaseBuildLine(log, baseBuiltMeanwhileLine(base.image))
+    return { kind: 'not-run', why: 'present-at-recheck' }
+  }
+  if (!again.ok) logBaseBuildLine(log, baseRecheckFailedLine(base.image, again.error))
+  if (state.firstStop !== null) return { kind: 'not-run', why: 'stop-recorded' }
+
+  const startedAtMs = deps.clock.now()
+  state.baseBuildRun = { startedAtMs, endedAtMs: null }
+  const step = startBaseBuildStep(deps, log)
+  state.baseBuildStep = step
+  const exit = await step.result
+  if (state.baseBuildStep === step) state.baseBuildStep = null
+  const run: BaseBuildRun = { startedAtMs, endedAtMs: deps.clock.now() }
+  state.baseBuildRun = run
+
+  if (exit.exitCode === 0) return { kind: 'built', run }
+  if (exit.endedByHandle || state.firstStop !== null) return { kind: 'stopped', run, exitCode: exit.exitCode }
+  return { kind: 'failed', run, exitCode: exit.exitCode, failure: imageBuildFailure(baseImageBuildFailedLine(exit.exitCode)) }
+}
+
+// --- 12/T2 (E8 T2): the test image's build and pin, the drift and retag images, the tag move ---
+//
+// The run's own images (b.uqm SR-9.3, SR-14.2). Every build goes through E1's
+// docker layer (section 6): in a process group of its own (b.uqm SR-5.6), its
+// output lines to the runner log, its image ID taken from its own output and
+// never from a tag lookup or an image listing. Nothing is written into the run
+// directory or the worktree (b.uqm SR-5.9). Each step replaces the run's
+// image-state record (`RunState.images`) whole as it starts and as it ends, and
+// a running build is `RunState.imageBuildInProgress`, which E13's stop path
+// ends (`end()`, SIGKILL to its group) after it records the stop. A step never
+// starts a build once the stop record (`RunState.firstStop`) is set.
+//
+// The tag rule, for T4's cleanup (`ImageState.tagsMade`). A role's tag counts
+// as made, and cleanup removes it by its name, when its build:
+// - was built (exit 0, with the ID its output reported);
+// - exited 0 with no readable ID: Docker tagged it, though the role's outcome
+//   is a failed build (exit 0);
+// - was ended by a stop, or ended while the stop record was set: it may have
+//   tagged before the SIGKILL;
+// - is a drift or retag build whose after-check failed: built and tagged, its
+//   ID not used.
+// A build that failed on its own (a non-zero exit, no stop recorded), one
+// whose spawn failed, and one never started (its before-check failed, or a
+// stop came first) made no tag. `ImageState.buildsStarted` is true for each
+// role whose build was spawned: a run that spawned none lists and prunes
+// nothing (b.uqm SR-9.3).
+//
+// Hand-offs. The test build's failure comes back as an `image-build` failure
+// (E10's `imageBuildFailure`). A drift or retag build's outcome is a
+// `BuildOutcome`, recorded in `ImageState.builds` and returned: E13 passes it to
+// E12's `noteDriftBuild` / `noteRetagBuild`, which write the reason. The tag
+// move returns a `TagMoveOutcome` for E12's `noteTagMove`. This section writes
+// no reason text of its own.
+
+/** A role's outcome while its build has not been started. */
+const NOT_BUILT: BuildOutcome = { kind: 'not-built' }
+
+/** The fault each fault image serves (b.uqm SR-14.2). */
+const FAULT_IMAGE_FAULT_KINDS: Readonly<Record<FaultLabelValue, FaultKind>> = { drift: 'image-drift', retag: 'retag' }
+
+/** What E8's image steps act through. */
+export interface RunImagesContext {
+  /** The docker context; its `cwd` is the worktree root, the test build's context, against which `TEST_DOCKERFILE_PATH` is read. */
+  readonly docker: DockerContext
+  /** `RunnerDeps.sendSignal`: each build's `end()` signals its group through it. */
+  readonly sendSignal: DockerSignalSender
+  /** The run's owner, `<RUN_ID>-<PID>`: its owner label and its run-private tags. */
+  readonly owner: Owner
+  /** The clock: the moment the pinned ID becomes known. */
+  readonly clock: RunnerClock
+  /** The runner log: build output, a tag check's mismatch, a tag move's failure. */
+  readonly log: RunnerLogSink
+}
+
+/** The run's image-state record before anything is built. E13 puts it in `RunState.images` when it makes the run state. */
+export function initialImageState(): ImageState {
+  return {
+    pinnedId: null,
+    driftId: null,
+    retagId: null,
+    builds: { test: NOT_BUILT, drift: NOT_BUILT, retag: NOT_BUILT },
+    retagMoved: false,
+    pinnedAtMs: null,
+    buildsStarted: { test: false, drift: false, retag: false },
+    tagsMade: { test: false, drift: false, retag: false },
+  }
+}
+
+/** The test image build's failure line (b.uqm SR-9.3); E10's `imageBuildFailure` classes it `image-build`. */
+export function testImageBuildFailedLine(exitCode: number): string {
+  return `${FAIL_PREFIX}image build: test image build failed (exit ${exitCode})`
+}
+
+/** What a build's end means for its role: its outcome, and whether it made its tag (the tag rule above). */
+export interface RoleBuildEnd {
+  readonly outcome: BuildOutcome
+  readonly tagMade: boolean
+}
+
+/**
+ * A build's result as its role's outcome (b.uqm SR-5.6, SR-9.3, SR-14.2).
+ * `spawned`: its process was started (`ImageBuild.pid` not null). `stopped`:
+ * the stop record is set as it ends.
+ * - built: `built`, with its ID; tag made.
+ * - ended through its handle, or failed while `stopped`: `stopped` (no image
+ *   build failure, no reason); tag made when spawned.
+ * - exit 0 with no readable ID: `failed` with exit 0; tag made.
+ * - nothing spawned (exit status null): `failed` with `SPAWN_FAILED_EXIT_STATUS`; no tag.
+ * - any other exit: `failed` with it; no tag.
+ */
+export function imageBuildEnd(result: ImageBuildResult, spawned: boolean, stopped: boolean): RoleBuildEnd {
+  if (result.kind === 'built') return { outcome: { kind: 'built', imageId: result.imageId }, tagMade: true }
+  if (result.kind === 'ended' || stopped) return { outcome: { kind: 'stopped' }, tagMade: spawned }
+  if (result.exitCode === null) return { outcome: { kind: 'failed', exitCode: SPAWN_FAILED_EXIT_STATUS }, tagMade: false }
+  return { outcome: { kind: 'failed', exitCode: result.exitCode }, tagMade: result.exitCode === 0 }
+}
+
+/** Writes one line to the runner log; a log that throws loses that line only. */
+function logImageLine(log: RunnerLogSink, line: string): void {
+  try {
+    log(line)
+  } catch {
+    // The log's own failure loses this line only; the step goes on.
+  }
+}
+
+/** The record with one role's build outcome and tag flag replaced; a drift or retag role's ID is its built ID, else null. */
+function withRoleBuildEnd(images: ImageState, role: RunTagRole, end: RoleBuildEnd): ImageState {
+  const imageId = end.outcome.kind === 'built' ? end.outcome.imageId : null
+  return {
+    ...images,
+    ...(role === 'drift' ? { driftId: imageId } : role === 'retag' ? { retagId: imageId } : {}),
+    builds: { ...images.builds, [role]: end.outcome },
+    tagsMade: { ...images.tagsMade, [role]: end.tagMade },
+  }
+}
+
+/** Runs one started build to its end: the role marked started when it was spawned, the build exposed as in progress meanwhile, its result mapped by `imageBuildEnd` against the stop record as it ends. */
+async function awaitRoleBuild(state: RunState, role: RunTagRole, build: ImageBuild): Promise<RoleBuildEnd> {
+  const spawned = build.pid !== null
+  if (spawned) state.images = { ...state.images, buildsStarted: { ...state.images.buildsStarted, [role]: true } }
+  state.imageBuildInProgress = build
+  const result = await build.result
+  if (state.imageBuildInProgress === build) state.imageBuildInProgress = null
+  return imageBuildEnd(result, spawned, state.firstStop !== null)
+}
+
+/** The test build's report: its outcome, and its failure for the verdict. */
+export interface TestImageBuildReport {
+  readonly outcome: BuildOutcome
+  /** `imageBuildFailure(testImageBuildFailedLine(code))` for a `failed` outcome; null when built, stopped or not started. */
+  readonly failure: Failure | null
+}
+
+/**
+ * Builds the test image once (b.uqm SR-9.3): from `docker/Dockerfile.test`
+ * with the worktree as context, labelled exactly `cscb-ci-owner=<RUN_ID>-<PID>`,
+ * tagged only `cscb-ci-run:<RUN_ID>-<PID>-test`. On success the pinned ID is
+ * the ID the build reported, recorded with the clock's moment. A failure the
+ * stop record does not cover is `FAIL: image build: test image build failed
+ * (exit <code>)`; exit 0 with no readable ID is one too, with exit 0. Once a
+ * stop is recorded it starts nothing and answers `not-built`.
+ */
+export async function buildTestImage(context: RunImagesContext, state: RunState): Promise<TestImageBuildReport> {
+  if (state.firstStop !== null) return { outcome: NOT_BUILT, failure: null }
+  const { docker, sendSignal, owner, clock, log } = context
+  const build = startTestImageBuild(
+    docker,
+    sendSignal,
+    { dockerfilePath: TEST_DOCKERFILE_PATH, contextDir: docker.cwd, labels: { [OWNER_LABEL]: formatOwner(owner) }, tag: formatRunTag(owner, 'test') },
+    log,
+  )
+  const end = await awaitRoleBuild(state, 'test', build)
+  const pinned = end.outcome.kind === 'built' ? { pinnedId: end.outcome.imageId, pinnedAtMs: clock.now() } : {}
+  state.images = { ...withRoleBuildEnd(state.images, 'test', end), ...pinned }
+  const failure = end.outcome.kind === 'failed' ? imageBuildFailure(testImageBuildFailedLine(end.outcome.exitCode)) : null
+  return { outcome: end.outcome, failure }
+}
+
+/** When a derived build's check of the `-test` tag is made. */
+export type TestTagCheckMoment = 'before' | 'after'
+
+/** What the run's `-test` tag was found to name at a check. */
+export type TestTagReading =
+  | {
+      readonly kind: 'image'
+      readonly imageId: string
+    }
+  | {
+      readonly kind: 'missing'
+    }
+  | {
+      readonly kind: 'unreadable'
+      readonly error: string
+    }
+
+/**
+ * The runner-log line of a drift or retag build's failed check of the run's
+ * `-test` tag: the tag, what it named (or why it could not be read), the
+ * pinned ID it should name, and what follows: before the build, the build is
+ * not started; after it, its image is not used. The role's outcome is a failed
+ * build with `FAILURE_EXIT_STATUS`, a check having no exit status of its own.
+ */
+export function testTagCheckFailedLine(role: FaultLabelValue, moment: TestTagCheckMoment, tag: string, pinnedId: string, reading: TestTagReading): string {
+  const consequence = moment === 'before' ? 'the build is not started' : 'its image is not used'
+  const found =
+    reading.kind === 'image'
+      ? `${tag} named ${reading.imageId} ${moment} the build`
+      : reading.kind === 'missing'
+        ? `${tag} named no image ${moment} the build`
+        : `${tag} could not be read ${moment} the build (${reading.error})`
+  return `${role} image build: ${found}, not the pinned image ${pinnedId}: ${consequence}`
+}
+
+/** Reads the run's `-test` tag: true when it names the pinned ID; otherwise writes the check's line and answers false. */
+async function testTagNamesPinnedId(context: RunImagesContext, role: FaultLabelValue, moment: TestTagCheckMoment, pinnedId: string): Promise<boolean> {
+  const tag = formatRunTag(context.owner, 'test')
+  const read = await inspectImage(context.docker, tag)
+  if (read.ok && read.value?.id === pinnedId) return true
+  const reading: TestTagReading = !read.ok
+    ? { kind: 'unreadable', error: read.error }
+    : read.value === null
+      ? { kind: 'missing' }
+      : { kind: 'image', imageId: read.value.id }
+  logImageLine(context.log, testTagCheckFailedLine(role, moment, tag, pinnedId, reading))
+  return false
+}
+
+/** Records a fault image's end and answers its outcome. */
+function recordFaultImage(state: RunState, role: FaultLabelValue, end: RoleBuildEnd): BuildOutcome {
+  state.images = withRoleBuildEnd(state.images, role, end)
+  return end.outcome
+}
+
+/**
+ * Builds one fault image (b.uqm SR-14.2): the drift image (`cscb-ci-fault=drift`,
+ * tagged `-drift`) or the retag image (`cscb-ci-fault=retag`, tagged `-retag`),
+ * each keeping the owner label. BuildKit does not accept `FROM sha256:<id>`,
+ * so it builds FROM the run's `-test` tag, and reads that tag before and after
+ * the build (`inspectImage`): it must name the pinned ID both times.
+ * - Before: a failed read, a missing tag or another ID starts no build; the
+ *   outcome is `failed` with `FAILURE_EXIT_STATUS` and no tag made.
+ * - After: a failed read or another ID makes the outcome `failed` with
+ *   `FAILURE_EXIT_STATUS`; the built ID is not recorded (shard k then starts
+ *   from the pinned ID), and the tag counts as made.
+ * Each failed check writes one runner-log line (`testTagCheckFailedLine`). A
+ * failure while the stop record is set is `stopped`. Without a pinned ID, or
+ * once a stop is recorded, it starts nothing and answers `not-built`. The
+ * outcome is recorded in `ImageState.builds` and, when built, `driftId` or
+ * `retagId`; E13 hands it to E12's controller.
+ */
+export async function buildFaultImage(context: RunImagesContext, state: RunState, role: FaultLabelValue): Promise<BuildOutcome> {
+  const pinnedId = state.images.pinnedId
+  if (pinnedId === null || state.firstStop !== null) return NOT_BUILT
+  const checkFailed: RoleBuildEnd = { outcome: { kind: 'failed', exitCode: FAILURE_EXIT_STATUS }, tagMade: false }
+  const before = await testTagNamesPinnedId(context, role, 'before', pinnedId)
+  if (state.firstStop !== null) return NOT_BUILT
+  if (!before) return recordFaultImage(state, role, checkFailed)
+  const { docker, sendSignal, owner, log } = context
+  const build = startDerivedImageBuild(
+    docker,
+    sendSignal,
+    { from: formatRunTag(owner, 'test'), labels: { [OWNER_LABEL]: formatOwner(owner), [FAULT_LABEL]: role }, tag: formatRunTag(owner, role) },
+    log,
+  )
+  const end = await awaitRoleBuild(state, role, build)
+  if (end.outcome.kind !== 'built') return recordFaultImage(state, role, end)
+  const after = await testTagNamesPinnedId(context, role, 'after', pinnedId)
+  if (after) return recordFaultImage(state, role, end)
+  const outcome: BuildOutcome = state.firstStop !== null ? { kind: 'stopped' } : checkFailed.outcome
+  return recordFaultImage(state, role, { outcome, tagMade: true })
+}
+
+/** The fault images the normalized faults need (b.uqm SR-14.2): `drift` for any `image-drift:<k>`, `retag` for `retag`, each at most once, drift first. */
+export function faultImageRoles(faults: readonly Fault[]): FaultLabelValue[] {
+  return FAULT_LABEL_VALUES.filter((role) => faults.some((fault) => fault.kind === FAULT_IMAGE_FAULT_KINDS[role]))
+}
+
+/**
+ * Builds the fault images the normalized faults need, one after the other,
+ * drift first (`faultImageRoles`, `buildFaultImage`); a role not needed is
+ * `not-built` and spawns nothing. E13 calls it in step 12 after the read-back
+ * and hands `drift` to `noteDriftBuild`, `retag` to `noteRetagBuild`.
+ */
+export async function buildFaultImages(context: RunImagesContext, state: RunState, faults: readonly Fault[]): Promise<Readonly<Record<FaultLabelValue, BuildOutcome>>> {
+  const outcomes: Record<FaultLabelValue, BuildOutcome> = { drift: NOT_BUILT, retag: NOT_BUILT }
+  for (const role of faultImageRoles(faults)) outcomes[role] = await buildFaultImage(context, state, role)
+  return outcomes
+}
+
+/** The image a shard starts from (b.uqm SR-14.2): for the `image-drift` shard, the drift image's ID when its build gave one, else the pinned ID; null before the pin. */
+export function shardStartImageId(images: Pick<ImageState, 'pinnedId' | 'driftId'>, driftShard: boolean): string | null {
+  return driftShard && images.driftId !== null ? images.driftId : images.pinnedId
+}
+
+/** The runner-log line of a failed tag move (b.uqm SR-14.2): the tag, the retag image's ID, the exit status and the error. */
+export function tagMoveFailedLogLine(tag: string, retagId: string, exitCode: number, error: string): string {
+  return `retag: moving ${tag} to ${retagId} failed (exit ${exitCode}): ${error}`
+}
+
+/**
+ * Moves the run's `-test` tag to the retag image (b.uqm SR-14.2), which E13
+ * calls once every shard's start has been attempted: one `docker image tag
+ * <retag ID> cscb-ci-run:<RUN_ID>-<PID>-test`, and no other tag changes.
+ * - No retag image, or a stop recorded: nothing spawned, `not-tried`.
+ * - Moved: `ImageState.retagMoved` set, `moved`.
+ * - Failed: one runner-log line, `retagMoved` left false, `failed` with its
+ *   exit status (`SPAWN_FAILED_EXIT_STATUS` when nothing was spawned).
+ * E13 hands the outcome to E12's `noteTagMove`, which records the firing or
+ * `tag move failed (exit <code>)`.
+ */
+export async function moveTestTagToRetagImage(context: RunImagesContext, state: RunState): Promise<TagMoveOutcome> {
+  const retagId = state.images.retagId
+  if (retagId === null || state.firstStop !== null) return { kind: 'not-tried' }
+  const tag = formatRunTag(context.owner, 'test')
+  const moved = await tagImage(context.docker, retagId, tag)
+  if (moved.ok) {
+    state.images = { ...state.images, retagMoved: true }
+    return { kind: 'moved' }
+  }
+  const exitCode = moved.exitCode ?? SPAWN_FAILED_EXIT_STATUS
+  logImageLine(context.log, tagMoveFailedLogLine(tag, retagId, exitCode, moved.error))
+  return { kind: 'failed', exitCode }
+}
+
+// --- 12/T3 (E8 T3): reading the pinned image back ---
+//
+// After the test build, the runner reads the script list, every script's
+// prerequisite line and the duration table back from the pinned image, and
+// schedules from them (b.uqm SR-9.4). Reading starts no container:
+// - `readPinnedImage` creates one container, `cscb-ci-<RUN_ID>-<PID>-read`,
+//   from the pinned ID with exactly `cscb-ci=1` and the owner label, and
+//   never starts it. It copies `/tests` out once, as a tar archive on the
+//   child's standard output, and removes the container by name right after.
+//   Only then does it read the archive, in memory. `/tests` holds both
+//   `integration/` and `ci-durations.tsv`, so a missing table is judged from
+//   the archive's entry list, never from docker's error text, and a failed
+//   copy is never taken for a missing table. Nothing is written into the run
+//   directory or the worktree.
+// - `readTarArchive` is the in-memory archive reader (b.uqm SR-1.3 keeps it in
+//   this file): POSIX ustar, GNU (long names and links, base-256 numbers) and
+//   PAX (`path`, `linkpath`, `size`) headers; regular files, hard links
+//   (judged as the regular file they name, as `lstat` judges one),
+//   directories, symbolic links (never followed) and every other type.
+// - `compareImageWithWorktree` compares the image with E2's validated run,
+//   through E2's parser (`parsePrerequisiteLines`), its word resolution and
+//   its checker (`checkPrerequisiteHeaders`), so the image is read exactly as
+//   the worktree was. Its differences come in one stated order, and the first
+//   is the refusal's reason.
+// - `readBackPinnedImage` is both, the one call E13 makes after the build. On
+//   success it hands on `ImageReadBack`: the image's script list (the run's
+//   scripts in a full run from here on), and its duration table's text or
+//   `unreadable` (`ImageDurationTable`), which E13 passes to E4's scheduling.
+// - `removeReadContainerIfPresent` is E13's removal at end-of-run step 1 and
+//   in a refusal's cleanup (b.uqm SR-5.7, SR-5.8).
+// No function here throws, and none records a refusal: E13 records it and
+// performs its cleanup.
+
+/** The image directory `docker/Dockerfile.test` copies the worktree's `tests` to. One copy-out of it holds the scripts and the duration table (b.uqm SR-9.4). */
+export const IMAGE_TESTS_DIR = '/tests'
+/** The read container's name suffix: `cscb-ci-<RUN_ID>-<PID>-read` (b.uqm SR-9.4). */
+export const READ_CONTAINER_NAME_SUFFIX = '-read'
+/** The read container's name prefix, before its owner (b.uqm SR-9.4, SR-10.1). */
+export const READ_CONTAINER_NAME_PREFIX = 'cscb-ci-'
+/** A tar archive's block size: each header is one block, and each entry's data is padded to whole blocks. */
+export const TAR_BLOCK_BYTES = 512
+
+/** The image's scripts directory as reasons name it. `docker/Dockerfile.test` copies `tests` to `/tests`, so it is the worktree path made absolute. */
+const IMAGE_INTEGRATION_DIR_TEXT = `/${INTEGRATION_DIR_PATH}`
+/** The image's duration table as reasons name it. */
+const IMAGE_DURATION_TABLE_TEXT = `/${DURATION_TABLE_PATH}`
+
+/** One header field's place in a tar header block (POSIX ustar; GNU tar shares these places). */
+interface TarField {
+  readonly offset: number
+  readonly length: number
+}
+
+const TAR_NAME_FIELD: TarField = { offset: 0, length: 100 }
+const TAR_SIZE_FIELD: TarField = { offset: 124, length: 12 }
+const TAR_CHECKSUM_FIELD: TarField = { offset: 148, length: 8 }
+const TAR_TYPEFLAG_OFFSET = 156
+const TAR_LINKNAME_FIELD: TarField = { offset: 157, length: 100 }
+const TAR_MAGIC_FIELD: TarField = { offset: 257, length: 6 }
+const TAR_PREFIX_FIELD: TarField = { offset: 345, length: 155 }
+/** POSIX ustar's magic, `ustar` and a NUL. Only it carries a name prefix: GNU's `ustar ` uses that place for other fields. */
+const TAR_USTAR_MAGIC = 'ustar\0'
+/** A numeric field whose first byte has this bit set is GNU's base-256 form. */
+const TAR_BASE256_FLAG = 0x80
+/** In the base-256 form, this bit of the first byte marks a negative number. */
+const TAR_BASE256_NEGATIVE = 0x40
+/** The first byte's value bits in the base-256 form. */
+const TAR_BASE256_FIRST_BYTE_MASK = 0x3f
+/** Each further byte of the base-256 form. */
+const TAR_BASE256_RADIX = 256
+/** The byte the checksum field counts as while the checksum is summed: a space. */
+const TAR_CHECKSUM_FILL_BYTE = 0x20
+/** A byte above this is negative when the checksum is summed as signed bytes, as old archivers did. */
+const TAR_SIGNED_BYTE_MAX = 0x7f
+
+/** Type flags: a regular file (`0`, NUL in old archives, `7` contiguous). */
+const TAR_REGULAR_TYPES: readonly string[] = ['0', '\0', '7']
+/** Type flags: a directory (`5`, GNU's dump directory `D`). */
+const TAR_DIRECTORY_TYPES: readonly string[] = ['5', 'D']
+const TAR_HARD_LINK_TYPE = '1'
+const TAR_SYMLINK_TYPE = '2'
+/** A PAX header for the next entry. */
+const TAR_PAX_TYPE = 'x'
+/** A PAX global header: it names no entry, and its records are not used. */
+const TAR_PAX_GLOBAL_TYPE = 'g'
+/** GNU's long name for the next entry. */
+const TAR_GNU_LONG_NAME_TYPE = 'L'
+/** GNU's long link name for the next entry. */
+const TAR_GNU_LONG_LINK_TYPE = 'K'
+/** Header types that describe the next entry, or nothing, rather than an entry of their own. */
+const TAR_META_TYPES: readonly string[] = [TAR_PAX_TYPE, TAR_PAX_GLOBAL_TYPE, TAR_GNU_LONG_NAME_TYPE, TAR_GNU_LONG_LINK_TYPE]
+/** The byte after a PAX record's length: a space. */
+const PAX_LENGTH_END_BYTE = 0x20
+/** The byte that ends a PAX record: a line feed. */
+const PAX_RECORD_END_BYTE = 0x0a
+/** A PAX record's length: decimal digits with no leading zero. */
+const PAX_LENGTH_PATTERN = /^[1-9][0-9]*$/
+/** A PAX `size` value: decimal digits. */
+const PAX_SIZE_PATTERN = /^[0-9]+$/
+/** An octal numeric field's digits, once its padding is dropped. */
+const TAR_OCTAL_PATTERN = /^[0-7]+$/
+/** An octal numeric field's padding: spaces and NULs at either end. */
+const TAR_OCTAL_PADDING_PATTERN = /^[ \0]+|[ \0]+$/g
+
+/** One entry of a tar archive, read in memory. */
+export interface TarEntry {
+  /** Its path in the archive, without a leading `/` or `./`, a trailing `/` or empty and `.` segments. */
+  readonly name: string
+  /** Its kind, judged on the entry itself: a symbolic link is never followed; a hard link is the regular file it names. */
+  readonly kind: IntegrationEntryKind
+  /** A regular file's content (a hard link's: the file it names); empty for every other kind. */
+  readonly content: Uint8Array
+}
+
+/** A header block, read. */
+interface TarHeader {
+  readonly type: string
+  readonly name: string
+  readonly linkName: string
+  readonly size: number
+}
+
+/** What the PAX and GNU headers before an entry set for it. */
+interface TarOverrides {
+  readonly path: string | null
+  readonly linkPath: string | null
+  readonly size: number | null
+}
+
+const NO_TAR_OVERRIDES: TarOverrides = { path: null, linkPath: null, size: null }
+
+/** Bytes decoded as UTF-8, as `readFileSync(path, 'utf-8')` decodes a file: a byte-order mark is kept, an invalid sequence replaced. */
+function utf8Text(bytes: Uint8Array): string {
+  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('utf8')
+}
+
+/** Bytes up to their first NUL, decoded as UTF-8. */
+function nulTerminatedText(bytes: Uint8Array): string {
+  const end = bytes.indexOf(0)
+  return utf8Text(end < 0 ? bytes : bytes.subarray(0, end))
+}
+
+function tarFieldBytes(header: Uint8Array, field: TarField): Uint8Array {
+  return header.subarray(field.offset, field.offset + field.length)
+}
+
+/**
+ * A numeric field: octal digits padded with spaces or NULs (all padding: 0),
+ * or GNU's base-256 form for a large value. Null when it is malformed,
+ * negative or past 2^53.
+ */
+function tarFieldNumber(header: Uint8Array, field: TarField): number | null {
+  const bytes = tarFieldBytes(header, field)
+  if ((bytes[0] & TAR_BASE256_FLAG) !== 0) {
+    if ((bytes[0] & TAR_BASE256_NEGATIVE) !== 0) return null
+    let value = 0
+    for (const [index, byte] of bytes.entries()) value = value * TAR_BASE256_RADIX + (index === 0 ? byte & TAR_BASE256_FIRST_BYTE_MASK : byte)
+    return Number.isSafeInteger(value) ? value : null
+  }
+  const digits = String.fromCharCode(...bytes).replace(TAR_OCTAL_PADDING_PATTERN, '')
+  if (digits === '') return 0
+  if (!TAR_OCTAL_PATTERN.test(digits)) return null
+  const value = parseInt(digits, 8)
+  return Number.isSafeInteger(value) ? value : null
+}
+
+/** Whether a header's stored checksum matches its bytes, summed as unsigned or as signed bytes, the checksum field counted as spaces. */
+function tarChecksumMatches(header: Uint8Array): boolean {
+  const stored = tarFieldNumber(header, TAR_CHECKSUM_FIELD)
+  if (stored === null) return false
+  const fieldEnd = TAR_CHECKSUM_FIELD.offset + TAR_CHECKSUM_FIELD.length
+  let unsigned = 0
+  let signed = 0
+  for (const [index, byte] of header.entries()) {
+    const counted = index >= TAR_CHECKSUM_FIELD.offset && index < fieldEnd ? TAR_CHECKSUM_FILL_BYTE : byte
+    unsigned += counted
+    signed += counted > TAR_SIGNED_BYTE_MAX ? counted - TAR_BASE256_RADIX : counted
+  }
+  return stored === unsigned || stored === signed
+}
+
+/** Reads one header block, which starts at byte `offset` of the archive. */
+function readTarHeader(header: Uint8Array, offset: number): DepRead<TarHeader> {
+  if (!tarChecksumMatches(header)) return { ok: false, error: `the header at byte ${offset} fails its checksum` }
+  const size = tarFieldNumber(header, TAR_SIZE_FIELD)
+  if (size === null) return { ok: false, error: `the header at byte ${offset} holds no valid size` }
+  const name = nulTerminatedText(tarFieldBytes(header, TAR_NAME_FIELD))
+  const magic = String.fromCharCode(...tarFieldBytes(header, TAR_MAGIC_FIELD))
+  const prefix = magic === TAR_USTAR_MAGIC ? nulTerminatedText(tarFieldBytes(header, TAR_PREFIX_FIELD)) : ''
+  return {
+    ok: true,
+    value: {
+      type: String.fromCharCode(header[TAR_TYPEFLAG_OFFSET]),
+      name: prefix === '' ? name : `${prefix}/${name}`,
+      linkName: nulTerminatedText(tarFieldBytes(header, TAR_LINKNAME_FIELD)),
+      size,
+    },
+  }
+}
+
+/** A PAX header's records, `<length> <key>=<value>\n` each, the length counting the whole record in bytes. */
+function parsePaxRecords(data: Uint8Array): DepRead<ReadonlyMap<string, string>> {
+  const records = new Map<string, string>()
+  for (let at = 0; at < data.length; ) {
+    const space = data.indexOf(PAX_LENGTH_END_BYTE, at)
+    const lengthText = space < 0 ? '' : utf8Text(data.subarray(at, space))
+    const end = at + Number(lengthText)
+    if (!PAX_LENGTH_PATTERN.test(lengthText) || end <= space || end > data.length || data[end - 1] !== PAX_RECORD_END_BYTE) {
+      return { ok: false, error: `a PAX header holds a malformed record at byte ${at} of its data` }
+    }
+    const record = utf8Text(data.subarray(space + 1, end - 1))
+    const equals = record.indexOf('=')
+    if (equals <= 0) return { ok: false, error: `a PAX header holds a record with no key at byte ${at} of its data` }
+    records.set(record.slice(0, equals), record.slice(equals + 1))
+    at = end
+  }
+  return { ok: true, value: records }
+}
+
+/** The overrides a PAX header sets for the next entry: its `path`, `linkpath` and `size`. Other records change nothing here. */
+function paxOverrides(data: Uint8Array, current: TarOverrides): DepRead<TarOverrides> {
+  const records = parsePaxRecords(data)
+  if (!records.ok) return records
+  const sizeText = records.value.get('size')
+  const size = sizeText === undefined ? current.size : Number(sizeText)
+  if (sizeText !== undefined && (!PAX_SIZE_PATTERN.test(sizeText) || !Number.isSafeInteger(size))) {
+    return { ok: false, error: `a PAX header holds a size that is not a whole number: ${shownArgument(sizeText)}` }
+  }
+  return {
+    ok: true,
+    value: { path: records.value.get('path') ?? current.path, linkPath: records.value.get('linkpath') ?? current.linkPath, size },
+  }
+}
+
+/** An archive path as an entry name: no empty or `.` segment, so `./tests/x`, `/tests/x` and `tests/x/` are all `tests/x`. */
+function tarEntryPath(raw: string): string {
+  return raw
+    .split('/')
+    .filter((segment) => segment !== '' && segment !== '.')
+    .join('/')
+}
+
+/** One entry from its header, its data, and the regular files read so far (a hard link names one of them). */
+function tarEntryOf(header: TarHeader, overrides: TarOverrides, data: Uint8Array, regularContent: ReadonlyMap<string, Uint8Array>): DepRead<TarEntry> {
+  const rawName = overrides.path ?? header.name
+  const name = tarEntryPath(rawName)
+  const none = data.subarray(0, 0)
+  const regular = TAR_REGULAR_TYPES.includes(header.type)
+  if (TAR_DIRECTORY_TYPES.includes(header.type) || (regular && rawName.endsWith('/'))) return { ok: true, value: { name, kind: 'directory', content: none } }
+  if (regular) return { ok: true, value: { name, kind: 'regular', content: data } }
+  if (header.type === TAR_SYMLINK_TYPE) return { ok: true, value: { name, kind: 'symlink', content: none } }
+  if (header.type !== TAR_HARD_LINK_TYPE) return { ok: true, value: { name, kind: 'other', content: none } }
+  const linkName = overrides.linkPath ?? header.linkName
+  const target = regularContent.get(tarEntryPath(linkName))
+  if (target === undefined) {
+    return { ok: false, error: `the hard link ${shownArgument(name)} names ${shownArgument(linkName)}, which is no regular file before it in the archive` }
+  }
+  return { ok: true, value: { name, kind: 'regular', content: target } }
+}
+
+/** What one header and its data give: the overrides for the next entry, and the entry it is, if any. */
+interface TarStep {
+  readonly overrides: TarOverrides
+  readonly entry: TarEntry | null
+}
+
+/** Takes one header and its data: a PAX or GNU header sets overrides for the next entry; any other header is an entry, and clears them. */
+function takeTarHeader(header: TarHeader, data: Uint8Array, overrides: TarOverrides, regularContent: Map<string, Uint8Array>): DepRead<TarStep> {
+  if (header.type === TAR_PAX_TYPE) {
+    const next = paxOverrides(data, overrides)
+    return next.ok ? { ok: true, value: { overrides: next.value, entry: null } } : next
+  }
+  if (header.type === TAR_PAX_GLOBAL_TYPE) return { ok: true, value: { overrides, entry: null } }
+  if (header.type === TAR_GNU_LONG_NAME_TYPE) return { ok: true, value: { overrides: { ...overrides, path: nulTerminatedText(data) }, entry: null } }
+  if (header.type === TAR_GNU_LONG_LINK_TYPE) return { ok: true, value: { overrides: { ...overrides, linkPath: nulTerminatedText(data) }, entry: null } }
+  const entry = tarEntryOf(header, overrides, data, regularContent)
+  if (!entry.ok) return entry
+  if (entry.value.kind === 'regular') regularContent.set(entry.value.name, entry.value.content)
+  else regularContent.delete(entry.value.name)
+  return { ok: true, value: { overrides: NO_TAR_OVERRIDES, entry: entry.value } }
+}
+
+/**
+ * Reads a tar archive in memory, as `docker container cp <container>:<path> -`
+ * writes one (Go's archive/tar: ustar, PAX or GNU headers), and answers its
+ * entries in archive order, or why it cannot be read, on one line. Every
+ * header's checksum is checked. The archive ends at its first all-zero block,
+ * or exactly at its last entry's padded data; a header or data that runs past
+ * the end, a bad number, a malformed PAX record and a hard link naming no
+ * regular file before it are failures. Entry contents are views into
+ * `archive`, never copied, and nothing is written anywhere.
+ */
+export function readTarArchive(archive: Uint8Array): DepRead<readonly TarEntry[]> {
+  const entries: TarEntry[] = []
+  const regularContent = new Map<string, Uint8Array>()
+  let overrides = NO_TAR_OVERRIDES
+  for (let offset = 0; offset < archive.length; ) {
+    if (offset + TAR_BLOCK_BYTES > archive.length) return { ok: false, error: `it ends inside the header block at byte ${offset}` }
+    const block = archive.subarray(offset, offset + TAR_BLOCK_BYTES)
+    if (block.every((byte) => byte === 0)) return { ok: true, value: entries }
+    const header = readTarHeader(block, offset)
+    if (!header.ok) return header
+    const size = TAR_META_TYPES.includes(header.value.type) ? header.value.size : (overrides.size ?? header.value.size)
+    const dataStart = offset + TAR_BLOCK_BYTES
+    if (dataStart + size > archive.length) return { ok: false, error: `the data of the entry at byte ${offset} runs past the archive's end` }
+    const step = takeTarHeader(header.value, archive.subarray(dataStart, dataStart + size), overrides, regularContent)
+    if (!step.ok) return step
+    overrides = step.value.overrides
+    if (step.value.entry !== null) entries.push(step.value.entry)
+    offset = dataStart + Math.ceil(size / TAR_BLOCK_BYTES) * TAR_BLOCK_BYTES
+  }
+  return { ok: true, value: entries }
+}
+
+// The image's contents, from the archive of `/tests`.
+
+/** The image's duration table for E4's scheduling input: its text, or unreadable with why (b.uqm SR-4.1). A missing table is no read-back failure (b.uqm SR-9.4). */
+export type ImageDurationTable =
+  | {
+      readonly kind: 'text'
+      /** The file's whole text, decoded as UTF-8; E4 parses it. */
+      readonly text: string
+    }
+  | {
+      readonly kind: 'unreadable'
+      /** Why, on one line, for E4's note. */
+      readonly reason: string
+    }
+
+/** What the read-back found in the pinned image. */
+export interface ImageContents {
+  /** Every `test-*.sh` entry directly in the image's `/tests/integration`, with its kind, in bytewise name order: the shape E2's checks take. */
+  readonly entries: readonly IntegrationEntry[]
+  /** The text of each regular `test-*.sh` entry, by its name, for E2's prerequisite-line parser. */
+  readonly scriptTexts: ReadonlyMap<string, string>
+  readonly durationTable: ImageDurationTable
+}
+
+/** How a reason names an entry's kind. */
+const TAR_KIND_TEXT: Readonly<Record<IntegrationEntryKind, string>> = {
+  regular: 'a regular file',
+  symlink: 'a symbolic link',
+  directory: 'a directory',
+  other: 'a special file',
+}
+
+/** `the archive of /tests could not be read: <error>` */
+export function readBackArchiveUnreadableText(error: string): string {
+  return `the archive of ${IMAGE_TESTS_DIR} could not be read: ${error}`
+}
+
+/** `/tests/integration could not be listed from the archive of /tests: <why>` */
+export function readBackIntegrationUnlistableText(why: string): string {
+  return `${IMAGE_INTEGRATION_DIR_TEXT} could not be listed from the archive of ${IMAGE_TESTS_DIR}: ${why}`
+}
+
+/** `the test image has no /tests/ci-durations.tsv`: the table is unreadable, which is no failure (b.uqm SR-4.1, SR-9.4). */
+export function imageDurationTableMissingText(): string {
+  return `the test image has no ${IMAGE_DURATION_TABLE_TEXT}`
+}
+
+/** `the test image's /tests/ci-durations.tsv is a symbolic link, not a regular file`: the table is unreadable (b.uqm SR-4.1). */
+export function imageDurationTableNotRegularText(kind: Exclude<IntegrationEntryKind, 'regular'>): string {
+  return `the test image's ${IMAGE_DURATION_TABLE_TEXT} is ${TAR_KIND_TEXT[kind]}, not a regular file`
+}
+
+/** Each entry by its name, the last of a repeated name winning, as extracting the archive would leave it. */
+function latestTarEntries(entries: readonly TarEntry[]): Map<string, TarEntry> {
+  return new Map(entries.map((entry) => [entry.name, entry] as const))
+}
+
+/** The names directly in `dir` with their kinds; a name only implied by a deeper entry is a directory. A failure when `dir` cannot be listed: no such directory, or not a directory. */
+function tarDirectoryChildren(latest: ReadonlyMap<string, TarEntry>, dir: string): DepRead<Map<string, IntegrationEntryKind>> {
+  const own = latest.get(dir)
+  if (own !== undefined && own.kind !== 'directory') return { ok: false, error: `it is ${TAR_KIND_TEXT[own.kind]}, not a directory` }
+  const prefix = `${dir}/`
+  const children = new Map<string, IntegrationEntryKind>()
+  for (const [name, entry] of latest) {
+    if (!name.startsWith(prefix)) continue
+    const rest = name.slice(prefix.length)
+    const slash = rest.indexOf('/')
+    if (slash < 0) children.set(rest, entry.kind)
+    else if (!children.has(rest.slice(0, slash))) children.set(rest.slice(0, slash), 'directory')
+  }
+  if (own === undefined && children.size === 0) return { ok: false, error: `the archive holds no ${INTEGRATION_DIR_PATH} directory` }
+  return { ok: true, value: children }
+}
+
+/** The duration table's entry judged: its text, or unreadable (missing or not a regular file). */
+function imageDurationTableOf(latest: ReadonlyMap<string, TarEntry>): ImageDurationTable {
+  const table = latest.get(DURATION_TABLE_PATH)
+  if (table === undefined) return { kind: 'unreadable', reason: imageDurationTableMissingText() }
+  if (table.kind !== 'regular') return { kind: 'unreadable', reason: imageDurationTableNotRegularText(table.kind) }
+  return { kind: 'text', text: utf8Text(table.content) }
+}
+
+/**
+ * The image's contents from the archive of `/tests` (whose entries are named
+ * `tests/...`): every `test-*.sh` entry of `tests/integration` with its kind,
+ * each regular one's text, and the duration table. Fails, on one line, when
+ * the archive cannot be read or `tests/integration` cannot be listed from it.
+ */
+export function imageContentsOf(archive: Uint8Array): DepRead<ImageContents> {
+  const read = readTarArchive(archive)
+  if (!read.ok) return { ok: false, error: readBackArchiveUnreadableText(read.error) }
+  const latest = latestTarEntries(read.value)
+  const children = tarDirectoryChildren(latest, INTEGRATION_DIR_PATH)
+  if (!children.ok) return { ok: false, error: readBackIntegrationUnlistableText(children.error) }
+  const entries: IntegrationEntry[] = []
+  const scriptTexts = new Map<string, string>()
+  for (const [name, kind] of children.value) {
+    if (!matchesScriptGlob(name)) continue
+    entries.push({ name, kind })
+    const content = latest.get(`${INTEGRATION_DIR_PATH}/${name}`)?.content
+    if (kind === 'regular' && content !== undefined) scriptTexts.set(name, utf8Text(content))
+  }
+  entries.sort((a, b) => compareBytewise(a.name, b.name))
+  return { ok: true, value: { entries, scriptTexts, durationTable: imageDurationTableOf(latest) } }
+}
+
+// The read container, the copy-out and the removal (b.uqm SR-9.4, SR-5.7).
+
+/** The read container's name, `cscb-ci-<RUN_ID>-<PID>-read` (b.uqm SR-9.4). */
+export function readContainerName(owner: Owner): string {
+  return `${READ_CONTAINER_NAME_PREFIX}${formatOwner(owner)}${READ_CONTAINER_NAME_SUFFIX}`
+}
+
+/** The read container's labels, exactly `cscb-ci=1` and the owner label (b.uqm SR-9.4). */
+export function readContainerLabels(owner: Owner): DockerLabels {
+  return { [CI_LABEL]: CI_LABEL_VALUE, [OWNER_LABEL]: formatOwner(owner) }
+}
+
+/** `test image read-back failed: <error>`: the reason of an outright read-back failure, after `NOT RUN: ` (b.uqm SR-9.4). */
+export function readBackFailedReason(error: string): string {
+  return `test image read-back failed: ${error}`
+}
+
+/** `creating the read container <name> from <image> failed: <error>` (the image being gone included). */
+export function readContainerCreateFailedText(name: string, image: string, error: string): string {
+  return `creating the read container ${name} from ${shownArgument(image)} failed: ${error}`
+}
+
+/** `copying /tests out of <name> failed: <error>` */
+export function readContainerCopyFailedText(name: string, error: string): string {
+  return `copying ${IMAGE_TESTS_DIR} out of ${name} failed: ${error}`
+}
+
+/** `removing the read container <name> failed: <error>`: a cleanup failure (b.uqm SR-9.3). */
+export function readContainerRemovalFailedText(name: string, error: string): string {
+  return `removing the read container ${name} failed: ${error}`
+}
+
+/** The read container's removal: removed, already gone (no failure), or failed with its cleanup-failure line, already logged. */
+export type ReadContainerRemoval = SweptContainerRemoval
+
+/**
+ * Removes the run's read container, `cscb-ci-<RUN_ID>-<PID>-read`, by its
+ * name when it is present, never forced (it is never started). Docker not
+ * knowing it is `absent`, no failure. Any other failure is written to the
+ * runner log as `removing the read container <name> failed: <error>` and
+ * returned for `RunState.cleanupFailures`. E13 calls it at end-of-run step 1
+ * and in a refusal's cleanup (b.uqm SR-5.7, SR-5.8); `readPinnedImage` calls
+ * it right after its copy-out.
+ */
+export async function removeReadContainerIfPresent(docker: DockerContext, owner: Owner, log: RunnerLogSink): Promise<ReadContainerRemoval> {
+  const name = readContainerName(owner)
+  const removed = await removeContainer(docker, name)
+  if (removed.ok) return { kind: 'removed' }
+  if (removed.exitCode !== null && removed.error.includes(DOCKER_NO_SUCH_CONTAINER_TEXT)) return { kind: 'absent' }
+  return { kind: 'failed', line: logCleanupFailure(log, readContainerRemovalFailedText(name, removed.error)) }
+}
+
+/** What the read-back needs: the docker context, the run's owner, the pinned image ID its own build printed, and the runner log. */
+export interface ReadBackContext {
+  readonly docker: DockerContext
+  readonly owner: Owner
+  /** The pinned ID, `sha256:<64 hex>` (b.uqm SR-9.3). */
+  readonly pinnedId: string
+  readonly log: RunnerLogSink
+}
+
+/** The read's outcome: the image's contents, or the outright failure's refusal; either way the read container's removal failure line, if its removal failed (already logged). */
+export type PinnedImageRead =
+  | {
+      readonly ok: true
+      readonly contents: ImageContents
+      readonly cleanupFailure: string | null
+    }
+  | {
+      readonly ok: false
+      readonly refusal: Refusal
+      readonly cleanupFailure: string | null
+    }
+
+/** The refusal of an outright failure, `NOT RUN: test image read-back failed: <error>`, the error on one line. */
+function readBackFailure(error: string, cleanupFailure: string | null): PinnedImageRead {
+  return { ok: false, refusal: buildRefusal(null, readBackFailedReason(dockerOneLine(error))), cleanupFailure }
+}
+
+/**
+ * Reads the pinned image back without starting a container (b.uqm SR-9.4):
+ * 1. creates `cscb-ci-<RUN_ID>-<PID>-read` from the pinned ID, labelled
+ *    exactly `cscb-ci=1` and the owner label; it is never started;
+ * 2. copies `/tests` out of it, by name, as an archive on standard output,
+ *    held in memory only;
+ * 3. removes it by name, whatever the copy gave;
+ * 4. reads the archive (`imageContentsOf`).
+ * Outright failures refuse with `NOT RUN: test image read-back failed:
+ * <error>`: a pinned ID that is not an image ID (nothing spawned), the create
+ * failing (the image being gone included), the copy failing, the archive
+ * unreadable, and `tests/integration` unlistable from it. A create that
+ * exited 0 without a container ID may have left the container, so it is
+ * removed if present. A missing duration table is no failure. Writes
+ * nothing; a removal failure is logged and returned, never a refusal.
+ */
+export async function readPinnedImage(context: ReadBackContext): Promise<PinnedImageRead> {
+  const { docker, owner, pinnedId, log } = context
+  const name = readContainerName(owner)
+  if (!IMAGE_ID_PATTERN.test(pinnedId)) return readBackFailure(readContainerCreateFailedText(name, pinnedId, 'it is not an image ID'), null)
+  const created = await createContainer(docker, name, readContainerLabels(owner), pinnedId)
+  if (!created.ok) {
+    const removal = created.exitCode === 0 ? await removeReadContainerIfPresent(docker, owner, log) : null
+    return readBackFailure(readContainerCreateFailedText(name, pinnedId, created.error), removal?.kind === 'failed' ? removal.line : null)
+  }
+  const copied = await copyOutOfContainer(docker, name, IMAGE_TESTS_DIR)
+  const removal = await removeReadContainerIfPresent(docker, owner, log)
+  const cleanupFailure = removal.kind === 'failed' ? removal.line : null
+  if (!copied.ok) return readBackFailure(readContainerCopyFailedText(name, copied.error), cleanupFailure)
+  const contents = imageContentsOf(copied.value)
+  if (!contents.ok) return readBackFailure(contents.error, cleanupFailure)
+  return { ok: true, contents: contents.value, cleanupFailure }
+}
+
+// The comparison with the worktree's validated lists, and the hand-off to
+// scheduling (b.uqm SR-9.4). Pure.
+
+/** `the test image's /tests/integration lacks <file>, which the worktree's tests/integration holds` */
+export function imageMissingScriptReason(fileName: string): string {
+  return `the test image's ${IMAGE_INTEGRATION_DIR_TEXT} lacks ${shownArgument(fileName)}, which the worktree's ${INTEGRATION_DIR_PATH} holds`
+}
+
+/** `the test image's /tests/integration holds <name>, which the worktree's tests/integration does not` */
+export function imageAddedScriptReason(name: string): string {
+  return `the test image's ${IMAGE_INTEGRATION_DIR_TEXT} holds ${shownArgument(name)}, which the worktree's ${INTEGRATION_DIR_PATH} does not`
+}
+
+/** `<name> in the test image's /tests/integration is a symbolic link, not a regular file` */
+export function imageNotRegularEntryReason(name: string, kind: Exclude<IntegrationEntryKind, 'regular'>): string {
+  return `${shownArgument(name)} in the test image's ${IMAGE_INTEGRATION_DIR_TEXT} is ${TAR_KIND_TEXT[kind]}, not a regular file`
+}
+
+/** What a script requires, as a difference names it: `requires a and b`, or `requires no script`. */
+function requiresText(names: readonly string[]): string {
+  return names.length === 0 ? 'requires no script' : `requires ${joinedNames(names.map(shownArgument))}`
+}
+
+/** The image's prerequisite line as a difference names it, from E2's resolution of it. */
+function imageRequiresText(header: ResolvedHeader): string {
+  const unknown = header.unknownNames.map(shownArgument)
+  let text = header.namesNoScript
+    ? `has a ${PREREQUISITE_LINE_TEXT} line that names no script`
+    : requiresText([...sortCanonical(header.links), ...header.unknownNames])
+  if (unknown.length > 0) text += ` (${joinedNames(unknown)} ${unknown.length === 1 ? 'is no script' : 'are no scripts'})`
+  if (header.extra === 'second' || header.extra === 'both') text += `, and has a second ${PREREQUISITE_LINE_TEXT} line`
+  if (header.extra === 'outside' || header.extra === 'both') text += `, and has a ${PREREQUISITE_LINE_TEXT} line outside its header comment block`
+  return text
+}
+
+/**
+ * One script's prerequisite difference, or null when the image's line gives
+ * exactly the worktree's validated prerequisites: `<file>'s prerequisite line
+ * differs in the test image: in the worktree it requires <names>; in the image
+ * it <what its line gives>`. The image's text is parsed by E2's parser and its
+ * words resolved by E2's rule against the worktree's script list. A line that
+ * names an unknown name or no script, a second line or one outside the header
+ * block, and a changed set of prerequisites each differ (test-1 is ignored, as
+ * in the worktree).
+ */
+export function imagePrerequisiteDifferenceReason(
+  fileName: string,
+  worktreePrerequisites: readonly string[],
+  parse: PrerequisiteParse,
+  scripts: readonly Script[],
+): string | null {
+  const header = resolveHeader(parse, scripts)
+  const links = sortCanonical(header.links)
+  const worktree = sortCanonical(worktreePrerequisites)
+  const sameLinks = links.length === worktree.length && links.every((link, index) => link === worktree[index])
+  if (sameLinks && header.unknownNames.length === 0 && !header.namesNoScript && header.extra === null) return null
+  return `${shownArgument(fileName)}'s prerequisite line differs in the test image: in the worktree it ${requiresText(worktree)}; in the image it ${imageRequiresText(header)}`
+}
+
+/**
+ * Every difference between the pinned image and the worktree's validated
+ * lists (b.uqm SR-9.4), one reason each, in this order:
+ * 1. each validated script the image's `/tests/integration` lacks (no entry
+ *    of that name), in canonical order;
+ * 2. each regular `test-*.sh` file the image holds that is not a validated
+ *    script, in bytewise name order;
+ * 3. each `test-*.sh` entry of the image that is not a regular file, in
+ *    bytewise name order;
+ * 4. each script held by both whose prerequisite line differs
+ *    (`imagePrerequisiteDifferenceReason`), in canonical order.
+ * An image identical to the worktree has none. Pure.
+ */
+export function imageDifferences(validated: ValidatedRun, contents: ImageContents, parses: ReadonlyMap<string, PrerequisiteParse>): string[] {
+  const byName = new Map(contents.entries.map((entry) => [entry.name, entry] as const))
+  const validatedNames = new Set(validated.scripts.map((script) => script.fileName))
+  const entries = [...contents.entries].sort((a, b) => compareBytewise(a.name, b.name))
+  const differences = validated.scripts.filter((script) => !byName.has(script.fileName)).map((script) => imageMissingScriptReason(script.fileName))
+  for (const entry of entries) if (entry.kind === 'regular' && !validatedNames.has(entry.name)) differences.push(imageAddedScriptReason(entry.name))
+  for (const entry of entries) if (entry.kind !== 'regular') differences.push(imageNotRegularEntryReason(entry.name, entry.kind))
+  for (const script of validated.scripts) {
+    const parse = parses.get(script.fileName)
+    if (byName.get(script.fileName)?.kind !== 'regular' || parse === undefined) continue
+    const difference = imagePrerequisiteDifferenceReason(script.fileName, validated.prerequisites.get(script.fileName) ?? [], parse, validated.scripts)
+    if (difference !== null) differences.push(difference)
+  }
+  return differences
+}
+
+/** What scheduling and the shards work from once the image matches the worktree (b.uqm SR-9.4). */
+export interface ImageReadBack {
+  /** The pinned image's script list, in canonical order (b.uqm Terms). */
+  readonly scripts: readonly Script[]
+  /** The image's prerequisites, from E2's checker over the image's lines: the worktree's, since they match. */
+  readonly prerequisites: PrerequisiteMap
+  /** The run's scripts from here on: the image's list in a full run; the selected scripts with their prerequisites and test-1 in a selective run. */
+  readonly runScripts: readonly Script[]
+  /** The duration table for E4's scheduling input: its text unchanged, or unreadable. */
+  readonly durationTable: ImageDurationTable
+}
+
+/** The comparison's outcome: the hand-off to scheduling, or the refusal naming every difference. */
+export type ImageComparison =
+  | {
+      readonly ok: true
+      readonly readBack: ImageReadBack
+    }
+  | {
+      readonly ok: false
+      readonly refusal: Refusal
+    }
+
+/**
+ * Compares the image's contents with the worktree's validated run (b.uqm
+ * SR-9.4). Every regular `test-*.sh` text is parsed once by E2's parser. Any
+ * difference refuses with no kind: the first difference (in
+ * `imageDifferences`' order) is the reason, and each other one follows as one
+ * detail line. With none, the image's script list (`scriptListOf`) and E2's
+ * checker over the image's lines (`checkPrerequisiteHeaders`) give the
+ * hand-off, with the run's scripts by E2's `runScriptsOf`. Pure.
+ */
+export function compareImageWithWorktree(validated: ValidatedRun, contents: ImageContents): ImageComparison {
+  const parses = new Map<string, PrerequisiteParse>()
+  for (const [name, text] of contents.scriptTexts) parses.set(name, parsePrerequisiteLines(name, text))
+  const differences = imageDifferences(validated, contents, parses)
+  if (differences.length > 0) return { ok: false, refusal: buildRefusal(null, differences[0], differences.slice(1)) }
+  const scripts = scriptListOf(contents.entries)
+  const headers = checkPrerequisiteHeaders(
+    scripts,
+    scripts.flatMap((script) => parses.get(script.fileName) ?? []),
+  )
+  // With no difference the image's lines resolve exactly as the worktree's did, so this holds; it gives the image's own map.
+  if (!headers.ok) return { ok: false, refusal: stageRefusal(headers.failures) }
+  return {
+    ok: true,
+    readBack: {
+      scripts,
+      prerequisites: headers.prerequisites,
+      runScripts: runScriptsOf(validated.selection, scripts, headers.prerequisites),
+      durationTable: contents.durationTable,
+    },
+  }
+}
+
+/** The read-back's outcome for E13: the hand-off, or the refusal (an outright failure or the differences); either way the read container's removal failure line, if any (already logged), for `RunState.cleanupFailures`. */
+export type ReadBackOutcome =
+  | {
+      readonly ok: true
+      readonly readBack: ImageReadBack
+      readonly cleanupFailure: string | null
+    }
+  | {
+      readonly ok: false
+      readonly refusal: Refusal
+      readonly cleanupFailure: string | null
+    }
+
+/**
+ * The read-back E13 runs after the test build and before any shard starts
+ * (b.uqm SR-5.3 step 12, SR-9.4): `readPinnedImage`, then
+ * `compareImageWithWorktree` against step 2's validated run. The read
+ * container is gone (or its removal failure returned) before it answers. E13
+ * records a refusal and performs its cleanup; on success it makes
+ * `readBack.runScripts` the run's scripts and passes `readBack.durationTable`
+ * to E4's scheduling.
+ */
+export async function readBackPinnedImage(context: ReadBackContext, validated: ValidatedRun): Promise<ReadBackOutcome> {
+  const read = await readPinnedImage(context)
+  if (!read.ok) return read
+  const compared = compareImageWithWorktree(validated, read.contents)
+  if (!compared.ok) return { ok: false, refusal: compared.refusal, cleanupFailure: read.cleanupFailure }
+  return { ok: true, readBack: compared.readBack, cleanupFailure: read.cleanupFailure }
+}
+
+// --- 12/T4 (E8 T4): the run's image cleanup ---
+//
+// The run's image cleanup (b.uqm SR-9.3, SR-19.9), which E13 calls once, after
+// the run's containers are gone: at end-of-run step 3 (b.uqm SR-5.7) and on a
+// refusal (b.uqm SR-5.8). It is composed only of E5's two image-removal
+// primitives (9/T3), so this section has no image-removal form of its own:
+// - `removeRunPrivateTag`, once per tag the run made, in the order `-drift`,
+//   `-retag`, `-test`, each by its name;
+// - then `removeOwnerUntaggedImages` on the run's own exact owner label, which
+//   lists the run's untagged images and prunes only when the listing found
+//   one, retrying a prune refused as already running.
+// What it removes follows T2's image-state record (`RunState.images`), read once
+// as cleanup starts: a role's tag is removed when `ImageState.tagsMade` says
+// the build made, or may have made, it (T2's tag rule), or, for `-test`, when
+// the `retag` fault moved it. A run that spawned no test, drift or retag build
+// (`ImageState.buildsStarted`; the base build does not count) spawns no tag
+// removal, no listing and no prune.
+//
+// Every failure E5 reports is already written to the runner log; cleanup
+// appends its line to `RunState.cleanupFailures` and goes on. Cleanup never
+// throws, never refuses, writes no verdict line and never reads the stop record
+// (`RunState.firstStop`): a stop recorded while it runs changes none of its
+// commands (b.uqm SR-5.6).
+
+/** The order cleanup removes the run's tags in (b.uqm SR-9.3): `-drift`, `-retag`, `-test`. */
+export const CLEANUP_TAG_ORDER: readonly RunTagRole[] = ['drift', 'retag', 'test']
+
+/** What cleanup acts through: T2's context without its signal sender, since cleanup ends no build. */
+export type RunImageCleanupContext = Pick<RunImagesContext, 'docker' | 'owner' | 'clock' | 'log'>
+
+/** Cleanup's plan, read from the image-state record: the roles whose tags it removes, in order, and whether it lists (and, on a find, prunes) the run's untagged images. */
+export interface RunImageCleanupPlan {
+  readonly tagRoles: readonly RunTagRole[]
+  readonly listUntagged: boolean
+}
+
+/**
+ * Cleanup's plan from T2's image-state record (b.uqm SR-9.3); pure.
+ * - No test, drift or retag build spawned: no tag, no listing.
+ * - Otherwise: the roles in `CLEANUP_TAG_ORDER` whose tag the run made
+ *   (`tagsMade`), `-test` also when the `retag` fault moved it; and a listing.
+ */
+export function runImageCleanupPlan(images: Pick<ImageState, 'buildsStarted' | 'tagsMade' | 'retagMoved'>): RunImageCleanupPlan {
+  if (!RUN_TAG_ROLES.some((role) => images.buildsStarted[role])) return { tagRoles: [], listUntagged: false }
+  const tagRoles = CLEANUP_TAG_ORDER.filter((role) => images.tagsMade[role] || (role === 'test' && images.retagMoved))
+  return { tagRoles, listUntagged: true }
+}
+
+/** One tag removal cleanup made: its role and E5's outcome. */
+export interface CleanupTagRemoval {
+  readonly role: RunTagRole
+  readonly removal: RunPrivateTagRemoval
+}
+
+/** What cleanup did: each tag removal in order, the untagged-image removal (null when the plan made no listing), and every cleanup-failure line in order. */
+export interface RunImageCleanupReport {
+  readonly tags: readonly CleanupTagRemoval[]
+  readonly untagged: OwnerUntaggedImageRemoval | null
+  /** The lines appended to `RunState.cleanupFailures`, already in the runner log. */
+  readonly failures: readonly string[]
+}
+
+/**
+ * Removes the run's own images (b.uqm SR-9.3, SR-19.9), after its containers
+ * are gone, by `runImageCleanupPlan(state.images)`:
+ * 1. each planned tag by its name (`removeRunPrivateTag`), `-drift`, `-retag`,
+ *    `-test`; an absent tag is no failure;
+ * 2. when planned, the untagged images carrying exactly the run's owner label
+ *    (`removeOwnerUntaggedImages` on `formatOwner(owner)`): listed first,
+ *    pruned only when the listing found one, a prune refused as already
+ *    running retried by E5; a failed listing makes no prune.
+ * Every failure line (already logged by E5) is appended to
+ * `state.cleanupFailures` as it arises, and cleanup goes on. Nothing is removed
+ * by an ID or a digest, nothing is forced. It reads no stop record and changes
+ * neither the verdict nor a refusal.
+ */
+export async function cleanupRunImages(context: RunImageCleanupContext, state: RunState): Promise<RunImageCleanupReport> {
+  const { docker, owner, clock, log } = context
+  const plan = runImageCleanupPlan(state.images)
+  const failures: string[] = []
+  const listFailure = (line: string): void => {
+    failures.push(line)
+    state.cleanupFailures.push(line)
+  }
+
+  const tags: CleanupTagRemoval[] = []
+  for (const role of plan.tagRoles) {
+    const removal = await removeRunPrivateTag(docker, { owner, role }, log)
+    if (removal.kind === 'failed') listFailure(removal.line)
+    tags.push({ role, removal })
+  }
+
+  let untagged: OwnerUntaggedImageRemoval | null = null
+  if (plan.listUntagged) {
+    untagged = await removeOwnerUntaggedImages(docker, formatOwner(owner), clock, log)
+    if (untagged.kind === 'failed') listFailure(untagged.line)
+  }
+
+  return { tags, untagged, failures }
+}
 
 // ---------------------------------------------------------------------------
 // 13. Shard containers (E9)
