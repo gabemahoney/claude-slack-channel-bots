@@ -1188,3 +1188,981 @@ describe('constants (b.uqm SR-21.5)', () => {
 // ===========================================================================
 // E2 region
 // ===========================================================================
+//
+// Validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-3.4,
+// SR-15.1; stage 7 of SR-2.4), PRD AC 15's validation half, AC 40 and AC 69.
+// Each case builds its worktree under its own `mkdtempSync` root with E1's
+// worktree builder; texts the builder has no variant for (CRLF line ends, a
+// prerequisite line on line 1, an uppercase keyword, an unlistable directory,
+// an unreadable script) are written by this region's own factories, and a
+// FIFO by the shared `makeFifo`. Every refusal case also shows its reasons
+// name their values (`expectNamed`), so a reason builder that dropped an
+// argument fails even though both sides of the `toEqual` use it. Runs are
+// driven in process: a valid run through the exported `validateRun`, a
+// refused one through `main` with injected dependencies, its refusal read
+// back from `status.json`.
+
+// The E2 region's own imports: the names the file's first import block does not hold.
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import {
+  badCredentialReason,
+  badScriptNameReason,
+  duplicateNumberReason,
+  emptyPrerequisiteLineReason,
+  extraPrerequisiteLineReason,
+  faultScriptMissingReason,
+  faultScriptNotInRunReason,
+  faultShardOutOfRangeReason,
+  integrationReadFailedText,
+  main,
+  matchesScriptGlob,
+  missingApiKeyReason,
+  missingTest1Reason,
+  notRegularEntryReason,
+  numberFormOf,
+  prerequisiteCycleReason,
+  prerequisiteOrderReason,
+  readStatusFile,
+  runDirPath,
+  scriptReadFailedText,
+  unknownPrerequisiteReason,
+  unmatchedScriptReason,
+  validateRun,
+  type ExtraPrerequisiteLines,
+  type MissingApiKeyCause,
+  type Refusal,
+  type RunnerDeps,
+  type Script,
+  type ValidatedRun,
+} from '../scripts/ci-run.ts'
+import {
+  duplicateScriptFileName,
+  minimalScriptText,
+  prerequisiteLineText,
+  realScriptFileNames,
+  realScriptNumbers,
+  type NonRegularEntry,
+  type PrerequisiteLine,
+  type WorktreeOptions,
+} from './test-helpers/ci-run.ts'
+import { writtenFile } from './test-helpers/credentials.ts'
+import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
+import { treeSnapshot } from './test-helpers/tree-snapshot.ts'
+
+/** Test data: the RUN_ID of every driven run, each in its own temp directory. */
+const E2_RUN_ID = '20261008t120000z-e2valid1'
+/** Test data: the runner's PID and user. */
+const E2_RUNNER_PID = 4343
+const E2_RUNNER_UID = 1000
+/** Test data: the runner's start. */
+const E2_START_MS = Date.UTC(2026, 9, 8, 12, 0, 0)
+
+/** The file names of real scripts `ns`, looked up by number in the repository's listing. */
+function files(...ns: readonly number[]): string[] {
+  return ns.map(scriptFile)
+}
+
+function namesOf(scripts: readonly Script[]): string[] {
+  return scripts.map((script) => script.fileName)
+}
+
+/** Each unit's file names, units in order. */
+function unitsOf(run: ValidatedRun): string[][] {
+  return run.units.map((unit) => namesOf(unit.scripts))
+}
+
+/** The refusal a stage's failures give (b.uqm SR-2.6): kind null, the first reason the summary, each other one a detail line. */
+function stageRefusalOf(reasons: readonly string[]): Refusal {
+  const [summary, ...details] = reasons
+  if (summary === undefined) throw new Error('stageRefusalOf: no reason')
+  return { kind: null, summary, details }
+}
+
+/** A refusal's reasons in order: its summary, then each detail line. */
+function reasonLinesOf(refusal: Refusal): string[] {
+  return [refusal.summary, ...refusal.details]
+}
+
+/**
+ * Asserts the refusal's reason lines name their values, line `i` holding each
+ * of `named[i]`: a reason builder that dropped an argument would still give the
+ * same refusal on both sides of a `toEqual`, so each case shows its values here.
+ */
+function expectNamed(refusal: Refusal, named: readonly (readonly string[])[]): void {
+  const lines = reasonLinesOf(refusal)
+  expect(lines.length).toBe(named.length)
+  named.forEach((values, i) => {
+    for (const value of values) expect(lines[i]).toContain(value)
+  })
+}
+
+/** A valid script file name for a number the repository does not use, with `slug`: for entries no real script may have. */
+function unusedNumberFileName(slug: string): string {
+  return `${numberFormOf(Math.max(...realScriptNumbers()) + 1)}-${slug}.sh`
+}
+
+/** A file name with a real script's number form and a slug no script has (`test-3-wrong.sh`). */
+function wrongSlugFileName(n: number): string {
+  return `${numberForm(n)}-wrong.sh`
+}
+
+/** Lines as a file's text, each ended by a line feed. */
+function textOf(lines: readonly string[]): string {
+  return lines.map((line) => `${line}\n`).join('')
+}
+
+/** The shebang every built script starts with. */
+function shebangOf(fileName: string): string {
+  return minimalScriptText(fileName).split('\n')[0]
+}
+
+/** A thrown error's message: the text a runner read failure carries, taken from the same call made here. */
+function errorMessageOf(read: () => unknown): string {
+  try {
+    read()
+  } catch (err) {
+    return (err as Error).message
+  }
+  throw new Error('errorMessageOf: the read did not fail')
+}
+
+/** Fake credentials for a valid run (b.uqm SR-21.2). */
+function validEnv(): ChildEnvironmentSource {
+  return { ANTHROPIC_API_KEY: fakeToken(RAW_KEY_PREFIX, 'raw'), GH_TOKEN: fakeToken('', 'gh') }
+}
+
+/** A key that does not begin with the raw-key prefix: valid only with `ANTHROPIC_BASE_URL` set. */
+function gatewayKey(): string {
+  return fakeToken('gw-', 'gateway')
+}
+
+/** A secret cut from a built fake to `length` characters. */
+function secretOfLength(suffix: string, length: number): string {
+  return fakeToken('', suffix).slice(0, length)
+}
+
+const isRoot = process.getuid?.() === 0
+
+describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-3.4, SR-15.1)', () => {
+  let root: string
+  let recorders: SpawnRecorder[] = []
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'ci-run-interface-e2-'))
+    recorders = []
+  })
+
+  afterEach(() => {
+    const built = recorders
+    recorders = []
+    try {
+      for (const recorder of built) recorder.assertNoFailures()
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  /** A worktree built under the case's root. */
+  function worktree(options: WorktreeOptions = {}): string {
+    return buildWorktree(root, options).root
+  }
+
+  function integrationDirOf(worktreeRoot: string): string {
+    return join(worktreeRoot, INTEGRATION_DIR_PATH)
+  }
+
+  /** Replaces one script's text with `text`. */
+  function writeScript(worktreeRoot: string, fileName: string, text: string): void {
+    writeFileSync(join(integrationDirOf(worktreeRoot), fileName), text)
+  }
+
+  /** Main's world for one refused run: every dependency validation must not reach records its use and throws. */
+  interface MainRig {
+    readonly deps: RunnerDeps
+    readonly recorder: SpawnRecorder
+    readonly forbiddenCalls: string[]
+    readonly stderr: string[]
+    readonly lockDir: string
+    readonly runDir: string
+  }
+
+  function mainRig(worktreeRoot: string, env: ChildEnvironmentSource): MainRig {
+    const tempDir = mkdtempSync(join(root, 'tmp-'))
+    const clock = createFakeClock({ start: E2_START_MS })
+    const recorder = createSpawnRecorder({ clock })
+    recorders.push(recorder)
+    const forbiddenCalls: string[] = []
+    const stderr: string[] = []
+    const forbidden =
+      (name: string) =>
+      (): never => {
+        forbiddenCalls.push(name)
+        throw new Error(`${name} must not be called during validation`)
+      }
+    const lockDir = join(root, 'lock')
+    const deps: RunnerDeps = {
+      spawn: recorder.spawn,
+      env: { ...env, TMPDIR: tempDir },
+      pid: E2_RUNNER_PID,
+      uid: E2_RUNNER_UID,
+      worktreeRoot,
+      lockDir,
+      readPasswordFile: forbidden('readPasswordFile'),
+      readCgroupFile: forbidden('readCgroupFile'),
+      readProcCmdline: forbidden('readProcCmdline'),
+      readProcCwd: forbidden('readProcCwd'),
+      readProcCgroup: forbidden('readProcCgroup'),
+      readVolume: forbidden('readVolume'),
+      clock,
+      randomBytes: forbidden('randomBytes'),
+      sendSignal: forbidden('sendSignal'),
+      onSignal: forbidden('onSignal'),
+      isPidAlive: forbidden('isPidAlive'),
+      writeStderr: (text) => {
+        stderr.push(text)
+      },
+    }
+    return { deps, recorder, forbiddenCalls, stderr, lockDir, runDir: runDirPath(deps.env, E2_RUN_ID) }
+  }
+
+  /**
+   * The exported validated result of a run that passes every stage; fails the
+   * case when it is refused, or when the result (its prerequisite map's entries
+   * included) fails `assertNoLeak`.
+   */
+  function validated(worktreeRoot: string, args: readonly string[] = [], env: ChildEnvironmentSource = validEnv()): ValidatedRun {
+    const validation = validateRun(args, worktreeRoot, env)
+    if (!validation.ok) throw new Error(`refused: ${JSON.stringify(validation.refusal)}`)
+    assertNoLeak({ validation, prerequisites: [...validation.validated.prerequisites] })
+    return validation.validated
+  }
+
+  /** A refused run as main records it. */
+  interface RefusedRun {
+    readonly refusal: Refusal
+    readonly rig: MainRig
+    /** The runner log's lines. */
+    readonly logLines: readonly string[]
+  }
+
+  /**
+   * The E2 driver for a refused run: steps 1 and 2 through `main` with injected
+   * dependencies over the worktree, arguments and environment. Fails the case
+   * unless main exits with the refusal status, `status.json` holds phase
+   * `refused` and the refusal `validateRun` gives, and nothing was spawned;
+   * every output, the run directory included, passes `assertNoLeak`.
+   */
+  async function refused(worktreeRoot: string, args: readonly string[] = [], env: ChildEnvironmentSource = validEnv()): Promise<RefusedRun> {
+    const validation = validateRun(args, worktreeRoot, env)
+    if (validation.ok) throw new Error(`validated: ${JSON.stringify(namesOf(validation.validated.runScripts))}`)
+    const rig = mainRig(worktreeRoot, env)
+    const exit = await main([E2_RUN_ID, ...args], rig.deps)
+    const status = readStatusFile(rig.runDir)
+    const logText = readFileSync(join(rig.runDir, RUNNER_LOG_FILE_NAME), 'utf-8')
+    assertNoLeak({ validation, status, stderr: rig.stderr, runDir: writtenFile(rig.runDir) })
+    expect(exit).toBe(REFUSAL_EXIT_STATUS)
+    expect(status?.phase).toBe('refused')
+    expect(status?.refusal).toEqual(validation.refusal)
+    expect(rig.recorder.spawns()).toEqual([])
+    return { refusal: validation.refusal, rig, logLines: logText.split('\n').slice(0, -1) }
+  }
+
+  /**
+   * Asserts no output of a refused run holds a credential value of `env`, a
+   * value cut too short to hold the whole leak sentinel included (which
+   * `assertNoLeak` alone would miss): each refusal names the variable, never its value.
+   */
+  function expectNoValueShown(run: RefusedRun, env: ChildEnvironmentSource): void {
+    const outputs = [
+      JSON.stringify(run.refusal),
+      readFileSync(join(run.rig.runDir, STATUS_FILE_NAME), 'utf-8'),
+      readFileSync(join(run.rig.runDir, RUNNER_LOG_FILE_NAME), 'utf-8'),
+      ...run.rig.stderr,
+    ]
+    for (const value of [env.ANTHROPIC_API_KEY, env.GH_TOKEN]) {
+      if (value === undefined || value === '') continue
+      for (const output of outputs) expect(output).not.toContain(value)
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // T5.S1: discovery, naming, duplicate numbers and a missing test-1 (SR-2.3; stages 2–4)
+  // -------------------------------------------------------------------------
+
+  describe('discovery, naming, duplicate numbers and a missing test-1 (b.uqm SR-2.3)', () => {
+    test('only regular files matching test-*.sh are scripts: other files, directories and links in tests/integration are ignored', () => {
+      const wt = worktree({
+        extraScripts: ['helper.sh', 'notes.txt', 'xtest-3.sh'],
+        nonRegular: [
+          { kind: 'directory', name: 'lib' },
+          { kind: 'symlink', name: 'latest.sh', target: scriptFile(2) },
+        ],
+      })
+
+      expect(namesOf(validated(wt).scripts)).toEqual(realScriptFileNames())
+    })
+
+    test('a newly added, validly named script is found by the next run with no other edit; test-0 is a valid number', () => {
+      const wt = worktree()
+      const added = unusedNumberFileName('added')
+      expect(namesOf(validated(wt).scripts)).toEqual(realScriptFileNames())
+
+      writeScript(wt, added, minimalScriptText(added))
+
+      expect(namesOf(validated(wt).scripts)).toEqual([...realScriptFileNames(), added])
+      expect(namesOf(validated(wt, [added]).runScripts)).toEqual([scriptFile(1), added])
+      expect(namesOf(validated(wt, [numberForm(0)]).runScripts)).toEqual(files(1, 0))
+    })
+
+    test.each(['test-5.sh', 'test-05-x.sh', 'test-x-y.sh'])('%s breaks the naming rule: the run is refused naming it', async (name) => {
+      const { refusal } = await refused(worktree({ extraScripts: [name] }))
+
+      expect(refusal).toEqual(stageRefusalOf([badScriptNameReason(name)]))
+      expect(refusal.summary).toContain(name)
+    })
+
+    const NON_REGULAR_ROWS: readonly (readonly [string, () => NonRegularEntry])[] = [
+      ['a symbolic link to a valid script, judged as the link and never followed', () => ({ kind: 'symlink', name: unusedNumberFileName('link'), target: scriptFile(2) })],
+      ['a dangling symbolic link', () => ({ kind: 'symlink', name: unusedNumberFileName('dangling'), target: unusedNumberFileName('nowhere') })],
+      ['a directory named test-*.sh', () => ({ kind: 'directory', name: unusedNumberFileName('dir') })],
+    ]
+
+    test.each(NON_REGULAR_ROWS)('%s is refused, naming the entry', async (_label, entry) => {
+      const nonRegular = entry()
+      const { refusal } = await refused(worktree({ nonRegular: [nonRegular] }))
+
+      expect(refusal).toEqual(stageRefusalOf([notRegularEntryReason(nonRegular.name, nonRegular.kind)]))
+      expect(refusal.summary).toContain(nonRegular.name)
+    })
+
+    test.skipIf(!mkfifoAvailable())(
+      'a FIFO named test-*.sh is refused naming it as a special file; the runner only lstats it, never opening it (skipped where mkfifo is unavailable)',
+      async () => {
+        const wt = worktree()
+        const name = unusedNumberFileName('fifo')
+        makeFifo(join(integrationDirOf(wt), name))
+
+        const { refusal } = await refused(wt)
+
+        expect(refusal).toEqual(stageRefusalOf([notRegularEntryReason(name, 'other')]))
+        expect(refusal.summary).toContain(name)
+        for (const kind of ['symlink', 'directory'] as const) expect(refusal.summary).not.toBe(notRegularEntryReason(name, kind))
+      },
+    )
+
+    test('two scripts with one number are refused, naming both files', async () => {
+      // A duplicate's name is the real name with `-duplicate` before `.sh`, so it sorts first bytewise (`-` before `.`).
+      const { refusal } = await refused(worktree({ extraScripts: [duplicateScriptFileName(5)] }))
+
+      expect(refusal).toEqual(stageRefusalOf([duplicateNumberReason(numberForm(5), [duplicateScriptFileName(5), scriptFile(5)])]))
+      expectNamed(refusal, [[duplicateScriptFileName(5), scriptFile(5), numberForm(5)]])
+    })
+
+    test.each([
+      ['a worktree with no test-1', (wt: string) => rmSync(join(integrationDirOf(wt), scriptFile(1)))],
+      ['a worktree with no tests/integration', (wt: string) => rmSync(integrationDirOf(wt), { recursive: true })],
+    ] as const)('%s is refused, naming the missing test-1', async (_label, remove) => {
+      const wt = worktree()
+      remove(wt)
+
+      const { refusal } = await refused(wt)
+
+      expect(refusal).toEqual(stageRefusalOf([missingTest1Reason()]))
+      expectNamed(refusal, [[numberForm(1), INTEGRATION_DIR_PATH]])
+    })
+
+    test('a tests/integration that exists but cannot be listed is refused with the read failure, naming the directory', async () => {
+      const wt = worktree()
+      const dir = integrationDirOf(wt)
+      rmSync(dir, { recursive: true })
+      writeFileSync(dir, '')
+
+      const { refusal } = await refused(wt)
+
+      expect(refusal).toEqual(stageRefusalOf([integrationReadFailedText(dir, errorMessageOf(() => readdirSync(dir, { encoding: 'buffer' })))]))
+    })
+
+    test.skipIf(isRoot)('a script that cannot be read is refused with the read failure, naming its path (skipped as root, which reads any file)', async () => {
+      const wt = worktree()
+      const path = join(integrationDirOf(wt), scriptFile(5))
+      chmodSync(path, 0)
+      try {
+        const { refusal } = await refused(wt)
+
+        expect(refusal).toEqual(stageRefusalOf([scriptReadFailedText(path, errorMessageOf(() => readFileSync(path, 'utf-8')))]))
+      } finally {
+        chmodSync(path, 0o644)
+      }
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // T5.S2: the selection stage and the run's scripts (SR-2.3; stage 5)
+  // -------------------------------------------------------------------------
+
+  describe("the selection and the run's scripts (b.uqm SR-2.3, Terms)", () => {
+    test('a number form matches only exactly that number: test-2 selects test-2, never test-20', () => {
+      expect(realScriptNumbers()).toContain(20)
+
+      const run = validated(worktree(), [numberForm(2)])
+
+      expect(run.selection.kind === 'selective' ? namesOf(run.selection.selected) : null).toEqual(files(2))
+      expect(namesOf(run.runScripts)).toEqual(files(1, 2))
+    })
+
+    test.each([
+      ['a whole file name', () => [scriptFile(5)]],
+      ['the number form twice', () => [numberForm(5), numberForm(5)]],
+      ['the file name twice', () => [scriptFile(5), scriptFile(5)]],
+      ['both forms', () => [scriptFile(5), numberForm(5)]],
+    ] as const)('a script selected by %s runs once', (_label, args) => {
+      const run = validated(worktree(), args())
+
+      expect(run.selection.kind === 'selective' ? namesOf(run.selection.selected) : null).toEqual(files(5))
+      expect(namesOf(run.runScripts)).toEqual(files(1, 5))
+    })
+
+    // Each row's SCRIPTs, each matching nothing, and the text each one's reason shows it as (an empty one quoted).
+    test.each([
+      ['test-999', () => ['test-999'], () => ['test-999']],
+      ['a well-formed file name no script has', () => [wrongSlugFileName(5)], () => [wrongSlugFileName(5)]],
+      ['an empty SCRIPT', () => [''], () => [JSON.stringify('')]],
+      ['test-999 twice: one failure per occurrence', () => ['test-999', 'test-999'], () => ['test-999', 'test-999']],
+    ] as const)('a SCRIPT matching nothing is refused naming it as given: %s', async (_label, args, shown) => {
+      const { refusal } = await refused(worktree(), args())
+
+      expect(refusal).toEqual(stageRefusalOf(args().map((arg) => unmatchedScriptReason(arg))))
+      expectNamed(refusal, shown().map((value) => [value]))
+    })
+
+    test("the run's scripts are the selected ones, their prerequisites followed through a chain of three, and test-1", () => {
+      const wt = worktree({ prerequisites: { 7: [{ names: [6] }], 6: [{ names: [5] }] } })
+
+      expect(namesOf(validated(wt, [numberForm(7)]).runScripts)).toEqual(files(1, 5, 6, 7))
+      expect(namesOf(validated(wt, [scriptFile(6), numberForm(10)]).runScripts)).toEqual(files(1, 5, 6, 10))
+    })
+
+    test("a full run's scripts are every script", () => {
+      const run = validated(worktree())
+
+      expect(run.selection).toEqual({ kind: 'full' })
+      expect(namesOf(run.runScripts)).toEqual(realScriptFileNames())
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // T5.S3: prerequisite lines and header refusals (SR-3.1, SR-3.2; stage 6)
+  // -------------------------------------------------------------------------
+
+  describe('prerequisite lines and header refusals (b.uqm SR-3.1, SR-3.2)', () => {
+    const ACCEPTED_LINE_ROWS: readonly (readonly [string, () => PrerequisiteLine, readonly number[]])[] = [
+      ['spaces between # and the keyword', () => ({ names: [5], afterHash: '   ' }), [5]],
+      ['tabs between # and the keyword', () => ({ names: [5], afterHash: '\t\t' }), [5]],
+      ['nothing between # and the keyword', () => ({ names: [5], afterHash: '' }), [5]],
+      ['names separated by mixed spaces and tabs, with trailing whitespace', () => ({ names: [5, 4], separator: ' \t ', trailing: ' \t' }), [4, 5]],
+      ['names given as whole file names', () => ({ names: [scriptFile(5), scriptFile(4)] }), [4, 5]],
+      ['one script named in both forms', () => ({ names: [numberForm(5), scriptFile(5)] }), [5]],
+      ['the line as the second line, right after the shebang', () => ({ names: [5], placement: 'second-line' }), [5]],
+    ]
+
+    test.each(ACCEPTED_LINE_ROWS)("test-6's line with %s is read", (_label, line, prerequisites) => {
+      const run = validated(worktree({ prerequisites: { 6: [line()] } }))
+
+      expect(run.prerequisites.get(scriptFile(6))).toEqual(files(...prerequisites))
+    })
+
+    test('an uppercase keyword is not a prerequisite line', () => {
+      const wt = worktree()
+      writeScript(wt, scriptFile(6), textOf([shebangOf(scriptFile(6)), `# ${CI_REQUIRES_KEYWORD.toUpperCase()} ${numberForm(5)}`, 'true']))
+
+      expect(validated(wt).prerequisites.get(scriptFile(6))).toEqual([])
+    })
+
+    test('test-1 named in any script, test-1 itself included, is ignored; test-0 may name test-4, which comes first in canonical order', () => {
+      const run = validated(worktree({ prerequisites: { 1: [{ names: [1] }], 6: [{ names: [1] }], 0: [{ names: [4] }] } }))
+
+      expect(run.prerequisites.get(scriptFile(1))).toEqual([])
+      expect(run.prerequisites.get(scriptFile(6))).toEqual([])
+      expect(run.prerequisites.get(scriptFile(0))).toEqual(files(4))
+    })
+
+    const MISPLACED_ROWS: readonly (readonly [string, readonly PrerequisiteLine[], ExtraPrerequisiteLines])[] = [
+      ['a line below the header block', [{ names: [5], placement: 'below-header' }], 'outside'],
+      ['an indented line', [{ names: [5], placement: 'indented' }], 'outside'],
+      ['a tab-indented line', [{ names: [5], placement: 'indented', indent: '\t' }], 'outside'],
+      ['a second line in the header block', [{ names: [5] }, { names: [4] }], 'second'],
+      ['a second line and one below the header block', [{ names: [5] }, { names: [4] }, { names: [4], placement: 'below-header' }], 'both'],
+    ]
+
+    test.each(MISPLACED_ROWS)('%s is refused, naming the script', async (_label, lines, extra) => {
+      const { refusal } = await refused(worktree({ prerequisites: { 6: lines } }))
+
+      expect(refusal).toEqual(stageRefusalOf([extraPrerequisiteLineReason(scriptFile(6), extra)]))
+      expectNamed(refusal, [[scriptFile(6)]])
+    })
+
+    test('a prerequisite line on line 1 is outside the header block, which follows the first line', async () => {
+      const wt = worktree()
+      writeScript(wt, scriptFile(6), textOf([prerequisiteLineText({ names: [5] }), '# a script whose first line is a prerequisite line', 'true']))
+
+      const { refusal } = await refused(wt)
+
+      expect(refusal).toEqual(stageRefusalOf([extraPrerequisiteLineReason(scriptFile(6), 'outside')]))
+      expectNamed(refusal, [[scriptFile(6)]])
+    })
+
+    test.each([
+      ['an unknown name, naming the script and the name', [{ names: ['test-999'] }], () => [unknownPrerequisiteReason(scriptFile(6), 'test-999')], () => [[scriptFile(6), 'test-999']]],
+      ['an unknown name beside a known one', [{ names: [5, 'test-999'] }], () => [unknownPrerequisiteReason(scriptFile(6), 'test-999')], () => [[scriptFile(6), 'test-999']]],
+      [
+        'the same unknown name twice in one line: one failure',
+        [{ names: ['test-999', 'test-999'] }],
+        () => [unknownPrerequisiteReason(scriptFile(6), 'test-999')],
+        () => [[scriptFile(6), 'test-999']],
+      ],
+      ['an empty line, naming the script', [{ names: [] }], () => [emptyPrerequisiteLineReason(scriptFile(6))], () => [[scriptFile(6)]]],
+    ] as const)('%s is refused', async (_label, lines, reasons, named) => {
+      const { refusal } = await refused(worktree({ prerequisites: { 6: lines } }))
+
+      expect(refusal).toEqual(stageRefusalOf(reasons()))
+      expectNamed(refusal, named())
+    })
+
+    test("a CRLF script's test-2 followed by a carriage return is an unknown name, shown on one line", async () => {
+      const wt = worktree()
+      writeScript(wt, scriptFile(3), minimalScriptText(scriptFile(3), [{ names: [2] }]).replace(/\n/g, '\r\n'))
+
+      const { refusal } = await refused(wt)
+
+      expect(refusal).toEqual(stageRefusalOf([unknownPrerequisiteReason(scriptFile(3), `${numberForm(2)}\r`)]))
+      expectNamed(refusal, [[scriptFile(3), numberForm(2)]])
+      expect(refusal.summary).not.toMatch(/[\r\n]/)
+    })
+
+    const CYCLE_ROWS: readonly (readonly [string, Readonly<Record<number, readonly PrerequisiteLine[]>>, readonly (readonly number[])[]])[] = [
+      ['two scripts', { 5: [{ names: [6] }], 6: [{ names: [5] }] }, [[5, 6]]],
+      ['three scripts', { 5: [{ names: [7] }], 6: [{ names: [5] }], 7: [{ names: [6] }] }, [[5, 6, 7]]],
+      ['a script other than test-1 naming itself', { 6: [{ names: [6] }] }, [[6]]],
+      ['two disjoint cycles, two refusals', { 5: [{ names: [6] }], 6: [{ names: [5] }], 7: [{ names: [8] }], 8: [{ names: [7] }] }, [[5, 6], [7, 8]]],
+    ]
+
+    test.each(CYCLE_ROWS)('a cycle of %s is one refusal per cycle naming its scripts, and its links add no ordering refusal', async (_label, prerequisites, cycles) => {
+      const { refusal } = await refused(worktree({ prerequisites }))
+
+      expect(refusal).toEqual(stageRefusalOf(cycles.map((cycle) => prerequisiteCycleReason(files(...cycle)))))
+      expectNamed(refusal, cycles.map((cycle) => files(...cycle)))
+    })
+
+    test.each([
+      ['test-5 naming test-6', { 5: [{ names: [6] }] }, [5, 6]],
+      ['test-4 naming test-0, which follows test-4 in canonical order though numerically first', { 4: [{ names: [0] }] }, [4, 0]],
+      ["test-1 naming test-5 while test-5 names test-1: an ordering refusal, never a cycle", { 1: [{ names: [5] }], 5: [{ names: [1] }] }, [1, 5]],
+    ] as const)('a prerequisite that sorts after its dependent is refused naming both: %s', async (_label, prerequisites, [dependent, prerequisite]) => {
+      const { refusal } = await refused(worktree({ prerequisites }))
+
+      expect(refusal).toEqual(stageRefusalOf([prerequisiteOrderReason(scriptFile(dependent), scriptFile(prerequisite))]))
+      expectNamed(refusal, [[scriptFile(dependent), scriptFile(prerequisite)]])
+    })
+
+    test('/ci test-1 is refused for a cycle between two other scripts, outside its selection', async () => {
+      const wt = worktree({ prerequisites: { 5: [{ names: [6] }], 6: [{ names: [5] }] } })
+
+      const { refusal } = await refused(wt, [numberForm(1)])
+
+      expect(refusal).toEqual(stageRefusalOf([prerequisiteCycleReason(files(5, 6))]))
+      expectNamed(refusal, [files(5, 6)])
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // T5.S4: scheduling units, the effective N and the current tree (SR-3.4, SR-3.5)
+  // -------------------------------------------------------------------------
+
+  describe('scheduling units, the effective N and the current tree (b.uqm SR-3.4, SR-3.5)', () => {
+    const UNIT_ROWS: readonly (readonly [string, Readonly<Record<number, readonly PrerequisiteLine[]>>, () => readonly string[], () => readonly (readonly number[])[]])[] = [
+      [
+        'scripts with no link are one unit each, and test-1 is in none',
+        {},
+        () => [],
+        () => realScriptNumbers().filter((n) => n !== 1).map((n) => [n]),
+      ],
+      ['a chain of three forms one unit in canonical order', { 7: [{ names: [6] }], 6: [{ names: [5] }] }, () => [numberForm(7)], () => [[5, 6, 7]]],
+      ['two scripts sharing a prerequisite form one unit holding it once', { 6: [{ names: [5] }], 7: [{ names: [5] }] }, () => [numberForm(7), numberForm(6)], () => [[5, 6, 7]]],
+      [
+        "a selective run's units cover only the run's scripts",
+        { 7: [{ names: [6] }], 6: [{ names: [5] }], 9: [{ names: [8] }] },
+        () => [numberForm(10), numberForm(7)],
+        () => [[5, 6, 7], [10]],
+      ],
+    ]
+
+    test.each(UNIT_ROWS)('%s', (_label, prerequisites, args, units) => {
+      expect(unitsOf(validated(worktree({ prerequisites }), args()))).toEqual(units().map((unit) => files(...unit)))
+    })
+
+    test.each([
+      // PRD AC 15: `/ci test-1` gets an effective N of 1, the lowest N.
+      ['/ci test-1: no units, so the lowest N', () => [numberForm(1)], () => ({ requested: MAX_SHARDS, units: 0, effective: OPTION_RANGE_MIN })],
+      // PRD AC 15: the inputs of `shards: 2 of 4 (2 scheduling unit(s))`.
+      ['--shards 4 over 2 units: the unit count', () => ['--shards', '4', numberForm(5), numberForm(6)], () => ({ requested: 4, units: 2, effective: 2 })],
+      ['--shards 2 over 3 units: the requested N', () => ['--shards', '2', numberForm(5), numberForm(6), numberForm(7)], () => ({ requested: 2, units: 3, effective: 2 })],
+      ['a default run over many units: the default', () => [], () => ({ requested: MAX_SHARDS, units: realScriptNumbers().length - 1, effective: MAX_SHARDS })],
+    ] as const)('the effective N is the smaller of the requested N and the unit count, at least the lowest N: %s', (_label, args, expected) => {
+      const run = validated(worktree(), args())
+
+      expect({ requested: run.requestedShards, units: run.units.length, effective: run.effectiveShards }).toEqual(expected())
+    })
+
+    test('the current tree, copied from the repository, passes every stage: 29 scripts, 27 units, test-2 and test-3 in one unit', () => {
+      const source = join(REPO_ROOT, INTEGRATION_DIR_PATH)
+      const entries = readdirSync(source, { withFileTypes: true }).filter((entry) => matchesScriptGlob(entry.name))
+      expect(entries.filter((entry) => !entry.isFile()).map((entry) => entry.name)).toEqual([])
+      const copy = join(mkdtempSync(join(root, 'current-tree-')), INTEGRATION_DIR_PATH)
+      mkdirSync(copy, { recursive: true })
+      for (const entry of entries) writeFileSync(join(copy, entry.name), readFileSync(join(source, entry.name)))
+
+      const run = validated(join(copy, '..', '..'))
+
+      expect(run.scripts.length).toBe(29)
+      expect(run.units.length).toBe(27)
+      expect(unitsOf(run).filter((unit) => unit.length > 1)).toEqual([files(2, 3)])
+      expect(run.prerequisites.get(scriptFile(3))).toEqual(files(2))
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // T5.S5: stage 7, the faults' scripts and shard numbers (SR-2.4)
+  // -------------------------------------------------------------------------
+
+  describe("stage 7: the faults' scripts and shard numbers (b.uqm SR-2.4)", () => {
+    /** A fault-script failure: its reason builder, the fault as typed and its script as typed. */
+    type FaultScriptFailure = readonly [typeof faultScriptMissingReason, string, string]
+
+    const FAULT_SCRIPT_ROWS: readonly (readonly [string, () => readonly string[], () => readonly FaultScriptFailure[]])[] = [
+      ['fail: naming test-999', () => ['--inject', 'fail:test-999'], () => [[faultScriptMissingReason, 'fail:test-999', 'test-999']]],
+      ['timeout: naming test-999', () => ['--inject', 'timeout:test-999'], () => [[faultScriptMissingReason, 'timeout:test-999', 'test-999']]],
+      [
+        "a real script's number with a wrong slug",
+        () => ['--inject', `fail:${wrongSlugFileName(3)}`],
+        () => [[faultScriptMissingReason, `fail:${wrongSlugFileName(3)}`, wrongSlugFileName(3)]],
+      ],
+      [
+        "the wrong slug given second, after the same script's correct form",
+        () => ['--inject', `timeout:${scriptFile(3)}`, '--inject', `timeout:${wrongSlugFileName(3)}`],
+        () => [[faultScriptMissingReason, `timeout:${wrongSlugFileName(3)}`, wrongSlugFileName(3)]],
+      ],
+      [
+        'the same failing fault given twice: one failure per occurrence',
+        () => ['--inject', 'fail:test-999', '--inject', 'fail:test-999'],
+        () => [
+          [faultScriptMissingReason, 'fail:test-999', 'test-999'],
+          [faultScriptMissingReason, 'fail:test-999', 'test-999'],
+        ],
+      ],
+      [
+        "an existing script outside the selective run's scripts",
+        () => [numberForm(5), '--inject', `fail:${numberForm(6)}`],
+        () => [[faultScriptNotInRunReason, `fail:${numberForm(6)}`, numberForm(6)]],
+      ],
+    ]
+
+    test.each(FAULT_SCRIPT_ROWS)('%s is refused, naming the fault and the script as typed', async (_label, args, failures) => {
+      const { refusal } = await refused(worktree(), args())
+
+      expect(refusal).toEqual(stageRefusalOf(failures().map(([reason, fault, script]) => reason(fault, script))))
+      expectNamed(refusal, failures().map(([, fault]) => [fault]))
+      // Each line names the script apart from the fault holding it.
+      reasonLinesOf(refusal).forEach((line, i) => expect(line.replace(failures()[i]![1], '')).toContain(failures()[i]![2]))
+    })
+
+    test('fail: naming test-1 and timeout: naming a prerequisite the run added transitively are accepted', () => {
+      const wt = worktree({ prerequisites: { 7: [{ names: [6] }], 6: [{ names: [5] }] } })
+
+      const run = validated(wt, [numberForm(7), '--inject', `fail:${numberForm(1)}`, '--inject', `timeout:${scriptFile(5)}`])
+
+      expect(namesOf(run.runScripts)).toEqual(files(1, 5, 6, 7))
+    })
+
+    /** Each row's fault as typed, its out-of-range shard number as typed and the effective N. */
+    const SHARD_ROWS: readonly (readonly [string, () => readonly string[], () => readonly [string, string, number]])[] = [
+      ['--shards 3 --inject kill:4', () => ['--shards', '3', '--inject', 'kill:4'], () => ['kill:4', '4', 3]],
+      ['test-2 --inject kill:2, effective N 1', () => [numberForm(2), '--inject', 'kill:2'], () => ['kill:2', '2', 1]],
+      ['kill:0', () => ['--inject', 'kill:0'], () => ['kill:0', '0', MAX_SHARDS]],
+      ['image-drift above the effective N', () => ['--shards', '2', '--inject', 'image-drift:3'], () => ['image-drift:3', '3', 2]],
+      ['a leak whose second number alone is out of range', () => ['--shards', '2', '--inject', 'leak:1,3'], () => ['leak:1,3', '3', 2]],
+      ['a shard number past 2^53, named by its typed digits', () => ['--inject', `kill:${HUGE_DIGITS}`], () => [`kill:${HUGE_DIGITS}`, HUGE_DIGITS, MAX_SHARDS]],
+      [
+        'kill:3 with the maximum N requested over 2 units: the effective N, not the requested N',
+        () => ['--shards', String(MAX_SHARDS), numberForm(5), numberForm(6), '--inject', 'kill:3'],
+        () => ['kill:3', '3', 2],
+      ],
+    ]
+
+    test.each(SHARD_ROWS)('a shard number outside 1 to the effective N is refused, naming the fault, the number and the effective N: %s', async (_label, args, failure) => {
+      const [fault, shard, effective] = failure()
+      const { refusal } = await refused(worktree(), args())
+
+      expect(refusal).toEqual(stageRefusalOf([faultShardOutOfRangeReason(fault, shard, effective)]))
+      expectNamed(refusal, [[fault]])
+      // The shard number is named apart from the fault holding it, and the effective N apart from both.
+      const afterFault = refusal.summary.replace(fault, '')
+      expect(afterFault).toContain(shard)
+      expect(afterFault.replace(shard, '')).toContain(String(effective))
+    })
+
+    test('shard numbers equal to the effective N are accepted, and retag passes stage 7', () => {
+      const run = validated(worktree(), ['--shards', '3', '--inject', 'kill:3', '--inject', 'image-drift:3', '--inject', 'leak:3,1', '--inject', 'retag'])
+
+      expect(run.effectiveShards).toBe(3)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // T5.S6: the step-2 credentials (SR-15.1; stage 8)
+  // -------------------------------------------------------------------------
+
+  describe('the step-2 credentials (b.uqm SR-15.1)', () => {
+    /** The variable a missing credential names. */
+    const API_KEY_NAME = 'ANTHROPIC_API_KEY'
+
+    const MISSING_ROWS: readonly (readonly [string, () => ChildEnvironmentSource, MissingApiKeyCause])[] = [
+      ['unset', () => ({ GH_TOKEN: fakeToken('', 'gh') }), 'unset'],
+      ['empty', () => ({ ANTHROPIC_API_KEY: '', GH_TOKEN: fakeToken('', 'gh') }), 'empty'],
+      ['a key not beginning with the raw-key prefix while ANTHROPIC_BASE_URL is unset', () => ({ ANTHROPIC_API_KEY: gatewayKey(), GH_TOKEN: fakeToken('', 'gh') }), 'not-raw-key'],
+      ['the same key with ANTHROPIC_BASE_URL empty, which counts as unset', () => ({ ANTHROPIC_API_KEY: gatewayKey(), ANTHROPIC_BASE_URL: '', GH_TOKEN: fakeToken('', 'gh') }), 'not-raw-key'],
+      [
+        'a key both missing and too short: one missing-credential failure only',
+        () => ({ ANTHROPIC_API_KEY: secretOfLength('short', SECRET_MIN_LENGTH - 1), GH_TOKEN: fakeToken('', 'gh') }),
+        'not-raw-key',
+      ],
+    ]
+
+    test.each(MISSING_ROWS)('ANTHROPIC_API_KEY %s is a missing credential, naming the variable', async (_label, env, cause) => {
+      const run = await refused(worktree(), [], env())
+
+      expect(run.refusal).toEqual(stageRefusalOf([missingApiKeyReason(cause)]))
+      expectNamed(run.refusal, [[API_KEY_NAME]])
+      expectNoValueShown(run, env())
+    })
+
+    const BAD_ROWS: readonly (readonly [string, () => ChildEnvironmentSource, 'ANTHROPIC_API_KEY' | 'GH_TOKEN'])[] = [
+      [
+        'ANTHROPIC_API_KEY one character below the minimum',
+        () => ({ ANTHROPIC_API_KEY: secretOfLength('short', SECRET_MIN_LENGTH - 1), ANTHROPIC_BASE_URL: GATEWAY_URL, GH_TOKEN: fakeToken('', 'gh') }),
+        'ANTHROPIC_API_KEY',
+      ],
+      [
+        'ANTHROPIC_API_KEY one code point below the minimum, one of them astral, so as long as the minimum in UTF-16 units',
+        () => ({ ANTHROPIC_API_KEY: `${secretOfLength('astral', SECRET_MIN_LENGTH - 2)}\u{1F511}`, ANTHROPIC_BASE_URL: GATEWAY_URL, GH_TOKEN: fakeToken('', 'gh') }),
+        'ANTHROPIC_API_KEY',
+      ],
+      ['GH_TOKEN one character below the minimum', () => ({ ANTHROPIC_API_KEY: fakeToken(RAW_KEY_PREFIX, 'raw'), GH_TOKEN: secretOfLength('short', SECRET_MIN_LENGTH - 1) }), 'GH_TOKEN'],
+    ]
+
+    test.each(BAD_ROWS)('%s is a bad credential, naming the variable', async (_label, env, variable) => {
+      const run = await refused(worktree(), [], env())
+
+      expect(run.refusal).toEqual(stageRefusalOf([badCredentialReason(variable)]))
+      expectNamed(run.refusal, [[variable]])
+      expectNoValueShown(run, env())
+    })
+
+    test.each([
+      ['a key not beginning with the raw-key prefix with ANTHROPIC_BASE_URL set', () => ({ ANTHROPIC_API_KEY: gatewayKey(), ANTHROPIC_BASE_URL: GATEWAY_URL, GH_TOKEN: fakeToken('', 'gh') })],
+      [
+        'both secrets exactly at the minimum',
+        () => ({ ANTHROPIC_API_KEY: secretOfLength('minimum', SECRET_MIN_LENGTH), ANTHROPIC_BASE_URL: GATEWAY_URL, GH_TOKEN: secretOfLength('minimum', SECRET_MIN_LENGTH) }),
+      ],
+      ['a raw key exactly at the minimum', () => ({ ANTHROPIC_API_KEY: `${RAW_KEY_PREFIX}${fakeToken('', 'raw')}`.slice(0, SECRET_MIN_LENGTH) })],
+      ['GH_TOKEN unset', () => ({ ANTHROPIC_API_KEY: fakeToken(RAW_KEY_PREFIX, 'raw') })],
+      ['GH_TOKEN empty', () => ({ ANTHROPIC_API_KEY: fakeToken(RAW_KEY_PREFIX, 'raw'), GH_TOKEN: '' })],
+    ] as const)('%s passes stage 8', (_label, env) => {
+      expect(validated(worktree(), [], env()).effectiveShards).toBe(MAX_SHARDS)
+    })
+
+    test('a run that passes every stage, GH_TOKEN unset, spawns no gh auth token lookup and no other child during validation', async () => {
+      const wt = worktree()
+      const env: ChildEnvironmentSource = { ANTHROPIC_API_KEY: gatewayKey(), ANTHROPIC_BASE_URL: GATEWAY_URL }
+      expect(validated(wt, [], env).effectiveShards).toBe(MAX_SHARDS)
+      const rig = mainRig(wt, env)
+
+      const exit = await main([E2_RUN_ID], rig.deps)
+
+      expect(exit).not.toBe(REFUSAL_EXIT_STATUS)
+      expect(readStatusFile(rig.runDir)?.phase).not.toBe('refused')
+      expect(rig.recorder.spawns()).toEqual([])
+      expect(rig.forbiddenCalls).toEqual([])
+      assertNoLeak({ stderr: rig.stderr, runDir: writtenFile(rig.runDir) })
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // T5.S7: stage order, detail-line order and the recorded refusal (SR-2.6, SR-5.3 step 2)
+  // -------------------------------------------------------------------------
+
+  describe('stage order, detail-line order and the recorded refusal (b.uqm SR-2.6, SR-5.3)', () => {
+    /** A cycle between test-5 and test-6. */
+    const CYCLE_5_6: Readonly<Record<number, readonly PrerequisiteLine[]>> = { 5: [{ names: [6] }], 6: [{ names: [5] }] }
+
+    /** One run whose worktree, arguments and environment give failures; the refusal's reasons in order. */
+    interface StageRow {
+      readonly label: string
+      readonly options: () => WorktreeOptions
+      readonly args: () => readonly string[]
+      readonly env?: () => ChildEnvironmentSource
+      readonly reasons: () => readonly string[]
+    }
+
+    /** Each adjacent pair of stages failing together: only the earlier stage's refusal is recorded. */
+    const STAGE_ORDER_ROWS: readonly StageRow[] = [
+      {
+        label: 'arguments before names (fail: and timeout: naming test-5, with a script file named test-5.sh)',
+        options: () => ({ extraScripts: [`${numberForm(5)}.sh`] }),
+        args: () => ['--inject', `fail:${numberForm(5)}`, '--inject', `timeout:${numberForm(5)}`],
+        reasons: () => [failTimeoutConflictReason(`fail:${numberForm(5)}`, `timeout:${numberForm(5)}`, numberForm(5))],
+      },
+      {
+        label: 'names before duplicates',
+        options: () => ({ extraScripts: [`${numberForm(5)}.sh`, duplicateScriptFileName(6)] }),
+        args: () => [],
+        reasons: () => [badScriptNameReason(`${numberForm(5)}.sh`)],
+      },
+      {
+        label: 'duplicates before a missing test-1',
+        options: () => ({ without: [1], extraScripts: [duplicateScriptFileName(6)] }),
+        args: () => [],
+        reasons: () => [duplicateNumberReason(numberForm(6), [duplicateScriptFileName(6), scriptFile(6)])],
+      },
+      {
+        label: 'a missing test-1 before the selection',
+        options: () => ({ without: [1] }),
+        args: () => ['test-999'],
+        reasons: () => [missingTest1Reason()],
+      },
+      {
+        label: 'the selection before the headers',
+        options: () => ({ prerequisites: CYCLE_5_6 }),
+        args: () => ['test-999'],
+        reasons: () => [unmatchedScriptReason('test-999')],
+      },
+      {
+        label: 'the headers before the faults',
+        options: () => ({ prerequisites: CYCLE_5_6 }),
+        args: () => ['--inject', 'kill:0'],
+        reasons: () => [prerequisiteCycleReason(files(5, 6))],
+      },
+      {
+        label: 'the faults before the credentials',
+        options: () => ({}),
+        args: () => ['--inject', 'kill:0'],
+        env: () => ({}),
+        reasons: () => [faultShardOutOfRangeReason('kill:0', '0', MAX_SHARDS)],
+      },
+    ]
+
+    test.each([...STAGE_ORDER_ROWS])('$label: only the earlier stage is reported', async ({ options, args, env, reasons }) => {
+      expect((await refused(worktree(options()), args(), env?.())).refusal).toEqual(stageRefusalOf(reasons()))
+    })
+
+    /** One refusal per stage, each with several failures given in an order other than the stage's: the reasons in the stage's order. */
+    const DETAIL_ORDER_ROWS: readonly StageRow[] = [
+      {
+        label: 'stage 1, the arguments: argument order',
+        options: () => ({}),
+        args: () => ['--verbose', '--shards', BELOW_RANGE],
+        reasons: () => [unknownOptionReason('--verbose'), outOfRangeReason('--shards', BELOW_RANGE)],
+      },
+      {
+        label: 'stage 2, the names: bytewise file-name order, both kinds interleaved',
+        options: () => ({ extraScripts: ['test-x-y.sh', 'test-05-x.sh', 'test-5.sh'], nonRegular: [{ kind: 'directory', name: `${numberForm(6)}-dir.sh` }] }),
+        args: () => [],
+        reasons: () => [
+          badScriptNameReason('test-05-x.sh'),
+          badScriptNameReason('test-5.sh'),
+          notRegularEntryReason(`${numberForm(6)}-dir.sh`, 'directory'),
+          badScriptNameReason('test-x-y.sh'),
+        ],
+      },
+      {
+        label: 'stage 3, duplicates: ascending number, not bytewise',
+        options: () => ({ extraScripts: [duplicateScriptFileName(20), duplicateScriptFileName(6), duplicateScriptFileName(10)] }),
+        args: () => [],
+        reasons: () => [6, 10, 20].map((n) => duplicateNumberReason(numberForm(n), [duplicateScriptFileName(n), scriptFile(n)])),
+      },
+      {
+        label: 'stage 4, a missing test-1',
+        options: () => ({ without: [1] }),
+        args: () => [],
+        reasons: () => [missingTest1Reason()],
+      },
+      {
+        label: 'stage 5, the selection: argument order',
+        options: () => ({}),
+        args: () => ['test-999', wrongSlugFileName(5), 'test-998'],
+        reasons: () => [unmatchedScriptReason('test-999'), unmatchedScriptReason(wrongSlugFileName(5)), unmatchedScriptReason('test-998')],
+      },
+      {
+        label: "stage 6, the headers: the declaring script's canonical order, then b.uqm SR-3.2's order, a cycle declared by its first script",
+        options: () => ({
+          prerequisites: {
+            3: [{ names: [7, 'test-996'] }],
+            7: [{ names: [3] }],
+            0: [{ names: ['test-997'] }],
+            5: [{ names: ['test-999', 8] }, { names: [4] }],
+            6: [{ names: [] }],
+          },
+        }),
+        args: () => [],
+        reasons: () => [
+          unknownPrerequisiteReason(scriptFile(3), 'test-996'),
+          prerequisiteCycleReason(files(3, 7)),
+          unknownPrerequisiteReason(scriptFile(0), 'test-997'),
+          unknownPrerequisiteReason(scriptFile(5), 'test-999'),
+          prerequisiteOrderReason(scriptFile(5), scriptFile(8)),
+          extraPrerequisiteLineReason(scriptFile(5), 'second'),
+          emptyPrerequisiteLineReason(scriptFile(6)),
+        ],
+      },
+      {
+        label: "stage 7, the faults: argument order, a leak's k before its j",
+        options: () => ({}),
+        args: () => ['--inject', 'fail:test-999', '--shards', '2', '--inject', 'leak:4,3', '--inject', 'kill:5'],
+        reasons: () => [
+          faultScriptMissingReason('fail:test-999', 'test-999'),
+          faultShardOutOfRangeReason('leak:4,3', '4', 2),
+          faultShardOutOfRangeReason('leak:4,3', '3', 2),
+          faultShardOutOfRangeReason('kill:5', '5', 2),
+        ],
+      },
+      {
+        label: 'stage 8, the credentials: ANTHROPIC_API_KEY before GH_TOKEN',
+        options: () => ({}),
+        args: () => [],
+        env: () => ({ GH_TOKEN: secretOfLength('short', SECRET_MIN_LENGTH - 1) }),
+        reasons: () => [missingApiKeyReason('unset'), badCredentialReason('GH_TOKEN')],
+      },
+    ]
+
+    test.each([...DETAIL_ORDER_ROWS])(
+      '$label; main records it as the last act, touching nothing else',
+      async ({ options, args, env, reasons }) => {
+        const wt = worktree(options())
+        const before = treeSnapshot(wt, { extended: true })
+
+        const runEnv = env?.() ?? validEnv()
+
+        const run = await refused(wt, args(), runEnv)
+
+        expect(run.refusal).toEqual(stageRefusalOf(reasons()))
+        expectNoValueShown(run, runEnv)
+        for (const line of reasonLinesOf(run.refusal)) expect(line).not.toMatch(/[\r\n]/)
+        expect(run.logLines.slice(1)).toEqual([`${NOT_RUN_PREFIX}${run.refusal.summary}`, ...run.refusal.details])
+        expect(readdirSync(run.rig.runDir).sort()).toEqual([RUNNER_LOG_FILE_NAME, STATUS_FILE_NAME].sort())
+        expect(run.rig.forbiddenCalls).toEqual([])
+        expect(run.rig.stderr).toEqual([])
+        expect(existsSync(run.rig.lockDir)).toBe(false)
+        expect(treeSnapshot(wt, { extended: true })).toEqual(before)
+      },
+    )
+  })
+})
