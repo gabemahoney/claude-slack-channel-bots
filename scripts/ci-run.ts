@@ -6307,6 +6307,1108 @@ export async function sweepLeftovers(context: SweepContext): Promise<readonly st
 // 14. Outcomes, verdict and results (E10)
 // ---------------------------------------------------------------------------
 
+// --- 14/T1 (E10 T1): shard subdirectories into script results, shard outcomes, cause texts and end lines, the pass condition ---
+//
+// E10's first layer, which T2 (the verdict) and T3 (`results.json` and the
+// summary) build on: each shard's subdirectory becomes per-script results
+// (b.uqm SR-11.3, with SR-12.4's script-line rule), each shard gets exactly one
+// outcome with its cause and end line (b.uqm SR-12.1, SR-3.6), and the run's
+// pass condition is decided (b.uqm SR-12.3). Every decision is a pure function
+// over E1's data model; the `read*` functions only gather a shard
+// subdirectory's `result.txt`, script logs and `docker.log` through E1's
+// readers (`readResultFile`, `readFileText`) and hand them to the decisions.
+
+// Script results from a shard subdirectory (b.uqm SR-11.3, SR-12.4).
+
+/** The fallback failure line's fixed text, verbatim from `tests/runner.sh` at 946be79 (b.uqm SR-12.4). */
+export const NO_FAIL_LINE_TEXT = 'exited non-zero without explicit FAIL line'
+
+/** A failing script's line when its log holds no line beginning `FAIL:` or cannot be read: `FAIL: <file name>: exited non-zero without explicit FAIL line` (b.uqm SR-12.4). */
+export function noFailLineFallback(fileName: string): string {
+  return `${FAIL_PREFIX}${fileName}: ${NO_FAIL_LINE_TEXT}`
+}
+
+/**
+ * The first line of a script log that begins `FAIL:`, verbatim and without its
+ * line feed; null when no line does (b.uqm SR-12.4). The log is split at line
+ * feeds and a last line without one counts, as `tests/runner.sh` at 946be79
+ * selects with `grep -m1 '^FAIL:'`. A line with any text before `FAIL:` is
+ * never taken, and nothing is re-prefixed.
+ */
+export function firstFailLine(logText: string): string | null {
+  const lineStart = FAIL_PREFIX.trimEnd()
+  return logText.split('\n').find((line) => line.startsWith(lineStart)) ?? null
+}
+
+/** A failing script's line from its log as read: its first FAIL line, else the fallback; a missing or unreadable log gives the fallback. */
+export function scriptFailLineOf(fileName: string, log: FileTextRead): string {
+  const line = log.kind === 'text' ? firstFailLine(log.text) : null
+  return line ?? noFailLineFallback(fileName)
+}
+
+/** A script's log in its shard subdirectory, `<file name>.log` (b.uqm SR-11.3). */
+export function shardScriptLogPath(shardDir: string, fileName: string): string {
+  return join(shardDir, `${fileName}${SCRIPT_LOG_SUFFIX}`)
+}
+
+/** One assigned script as its shard's result file records it (b.uqm SR-11.3). */
+export interface RecordedScript {
+  readonly fileName: string
+  /** Its first recorded result (`end` or `notrun`); null when the file records none for it. */
+  readonly result: ScriptResult | 'notrun' | null
+  /** Its wall time from its `end` line; null without one. */
+  readonly seconds: number | null
+  /** For a `fail`: its log's first FAIL line, or the fallback; null otherwise. */
+  readonly failLine: string | null
+}
+
+/** A shard's result file turned into its assigned scripts' records: missing, unreadable (E1's reading rule), or readable. */
+export type ShardScriptsRead =
+  | {
+      readonly kind: 'missing'
+    }
+  | {
+      readonly kind: 'unreadable'
+      readonly error: string
+    }
+  | {
+      readonly kind: 'readable'
+      /** Whether the file holds the end marker line. */
+      readonly endMarker: boolean
+      /** One per assigned script, in run order. */
+      readonly scripts: readonly RecordedScript[]
+      /** The assigned script with `start` but no `end` (nor `notrun`), the last one started if several; null for none. */
+      readonly inProgress: string | null
+    }
+
+/**
+ * A shard's assigned scripts from its result file as E1 read it (b.uqm
+ * SR-11.3). `scriptLog` gives a script's log as read; it is asked only for
+ * scripts recorded `fail`. Events naming a script not assigned to the shard
+ * are left out (b.uqm SR-13.2's `result-coverage` is E11's); a script's first
+ * `end` or `notrun` is its record.
+ */
+export function shardScriptsOf(resultFile: ResultFileRead, assigned: readonly string[], scriptLog: (fileName: string) => FileTextRead): ShardScriptsRead {
+  if (resultFile.kind === 'missing') return { kind: 'missing' }
+  if (resultFile.kind === 'unreadable') return { kind: 'unreadable', error: resultFile.error }
+  const records = new Map<string, EndEvent | NotRunEvent>()
+  const startOrder: string[] = []
+  let endMarker = false
+  for (const event of resultFile.events) {
+    if (event.kind === 'done') endMarker = true
+    else if (event.kind === 'start') startOrder.push(event.fileName)
+    else if (!records.has(event.fileName)) records.set(event.fileName, event)
+  }
+  const unfinished = startOrder.filter((fileName) => assigned.includes(fileName) && !records.has(fileName))
+  const scripts = assigned.map((fileName): RecordedScript => {
+    const record = records.get(fileName)
+    if (record === undefined) return { fileName, result: null, seconds: null, failLine: null }
+    if (record.kind === 'notrun') return { fileName, result: 'notrun', seconds: null, failLine: null }
+    const failLine = record.result === 'fail' ? scriptFailLineOf(fileName, scriptLog(fileName)) : null
+    return { fileName, result: record.result, seconds: record.seconds, failLine }
+  })
+  return { kind: 'readable', endMarker, scripts, inProgress: unfinished.at(-1) ?? null }
+}
+
+/** Reads a shard subdirectory's `result.txt` and the logs of its failing scripts into its assigned scripts' records (b.uqm SR-11.3, SR-12.4). */
+export function readShardScripts(shardDir: string, assigned: readonly string[]): ShardScriptsRead {
+  return shardScriptsOf(readResultFile(shardDir), assigned, (fileName) => readFileText(shardScriptLogPath(shardDir, fileName)))
+}
+
+// Cause texts and end lines (b.uqm SR-12.1). E4 and E12 record causes as
+// `ShardCause` values; these builders are the only writers of their texts.
+
+/** `wall-time limit of <m> min exceeded`, m whole minutes the caller has already rounded (b.uqm SR-4.3, SR-12.1). Throws for any other m. */
+export function wallTimeLimitCauseText(minutes: number): string {
+  if (!Number.isSafeInteger(minutes) || minutes < 0) throw new Error(`wallTimeLimitCauseText: not whole minutes: ${minutes}`)
+  return `wall-time limit of ${minutes} min exceeded`
+}
+
+/** `killed`: a `kill:` fault (b.uqm SR-12.1, SR-14.2). */
+export function killedCauseText(): string {
+  return 'killed'
+}
+
+/** The words each run-level stop names itself with in `stopped by <stop>`. */
+const STOPPED_BY_WORDS: Readonly<Record<StopKind, string>> = {
+  interrupt: 'interrupt',
+  'memory-watchdog': 'memory watchdog',
+  'run-deadline': 'run deadline',
+}
+
+/** `stopped by interrupt`, `stopped by memory watchdog` or `stopped by run deadline` (b.uqm SR-5.6, SR-12.1). */
+export function stoppedCauseText(by: StopKind): string {
+  return `stopped by ${STOPPED_BY_WORDS[by]}`
+}
+
+/** `container exited <code>` (b.uqm SR-12.1). Throws for a code that is no integer. */
+export function containerExitedCauseText(code: number): string {
+  if (!Number.isSafeInteger(code)) throw new Error(`containerExitedCauseText: not an exit code: ${code}`)
+  return `container exited ${code}`
+}
+
+/** `container failed to start: <detail>`, the detail on one line (b.uqm SR-10.6, SR-12.1). */
+export function containerFailedToStartCauseText(detail: string): string {
+  return `container failed to start: ${dependencyErrorText(detail)}`
+}
+
+/** `image marker missing` (b.uqm SR-12.1). */
+export function imageMarkerMissingCauseText(): string {
+  return 'image marker missing'
+}
+
+/** `result file unreadable` (b.uqm SR-11.3, SR-12.1). */
+export function resultFileUnreadableCauseText(): string {
+  return 'result file unreadable'
+}
+
+/** `no result file` (b.uqm SR-12.1). */
+export function noResultFileCauseText(): string {
+  return 'no result file'
+}
+
+/** A shard cause's text, through its builder (b.uqm SR-12.1). */
+export function shardCauseText(cause: ShardCause): string {
+  switch (cause.kind) {
+    case 'wall-time-limit':
+      return wallTimeLimitCauseText(cause.minutes)
+    case 'container-exited':
+      return containerExitedCauseText(cause.code)
+    case 'killed':
+      return killedCauseText()
+    case 'stopped':
+      return stoppedCauseText(cause.by)
+    case 'failed-to-start':
+      return containerFailedToStartCauseText(cause.detail)
+    case 'image-marker-missing':
+      return imageMarkerMissingCauseText()
+    case 'no-result-file':
+      return noResultFileCauseText()
+    case 'result-file-unreadable':
+      return resultFileUnreadableCauseText()
+  }
+}
+
+/**
+ * Whether a cause may take the script form of the end line (b.uqm SR-12.1):
+ * only `wall-time limit of <m> min exceeded`, `container exited <code>`,
+ * `killed` and `stopped by <stop>` do. Every other cause (`container failed to
+ * start`, `image marker missing`, `result file unreadable`, `no result file`)
+ * always takes the shard form, even with a script in progress.
+ */
+export function causeTakesScriptEndLine(cause: ShardCause): boolean {
+  switch (cause.kind) {
+    case 'wall-time-limit':
+    case 'container-exited':
+    case 'killed':
+    case 'stopped':
+      return true
+    case 'failed-to-start':
+    case 'image-marker-missing':
+    case 'no-result-file':
+    case 'result-file-unreadable':
+      return false
+  }
+}
+
+/** A shard's end line when a script was in progress and the cause takes the script form (`causeTakesScriptEndLine`), `FAIL: <file name>: <cause> in shard-<k>`, ranked as that script's failure (b.uqm SR-12.1). */
+export function scriptEndLine(fileName: string, shard: number, cause: ShardCause): string {
+  return `${FAIL_PREFIX}${fileName}: ${shardCauseText(cause)} in ${SHARD_DIR_PREFIX}${shard}`
+}
+
+/** A shard's end line otherwise, `FAIL: shard-<k>: <cause>` (b.uqm SR-12.1). */
+export function shardEndLine(shard: number, cause: ShardCause): string {
+  return `${FAIL_PREFIX}${SHARD_DIR_PREFIX}${shard}: ${shardCauseText(cause)}`
+}
+
+/** `results.json`'s `end` for a shard that ended normally with no out-of-memory line (b.uqm SR-16.1). */
+export const NORMAL_SHARD_END = 'normal'
+
+// Shard outcomes (b.uqm SR-12.1, SR-12.2's replacement rule, SR-3.6).
+
+/** The shard evidence an outcome is decided from: the fields E4, E7, E9, E12 and E13 fill (b.uqm SR-12.1). */
+export type ShardOutcomeEvidence = Pick<ShardEvidence, 'shard' | 'assigned' | 'start' | 'fixedCause' | 'exitCode' | 'oomLine'>
+
+/** One shard's outcome: its `results.json` `endedNormally`, `end` and `scripts` entries, and its failures (b.uqm SR-12.1, SR-16.1). */
+export interface ShardOutcome {
+  readonly shard: number
+  /** Its result file is readable and holds the end marker, whatever exit or recorded stop followed. */
+  readonly endedNormally: boolean
+  /** The cause SR-12.1's precedence chose; null for a shard that ended normally. */
+  readonly cause: ShardCause | null
+  /** Its out-of-memory line, else its end line, else `normal`. */
+  readonly end: string
+  /** The failure its `end` line is, classed `out-of-memory`, `script` (a script in progress, with a cause that takes the script form) or `shard`; null when `end` is `normal`. */
+  readonly endFailure: Failure | null
+  /** One per assigned script, in run order. */
+  readonly scripts: readonly ResultsScript[]
+  /** Every failure of the shard: `endFailure` when present, then each script recorded `fail` with its failLine, in run order. A `notrun` is never one. */
+  readonly failures: readonly Failure[]
+}
+
+/** Whether a Docker log's text holds the marker refusal line as a whole line (b.uqm SR-11.2, SR-12.1). */
+export function holdsMarkerRefusalLine(dockerLogText: string): boolean {
+  return dockerLogText.split('\n').includes(MARKER_REFUSAL_LINE)
+}
+
+/** Whether a shard subdirectory's saved Docker logs hold the marker refusal line; a missing or unreadable `docker.log` does not. */
+export function dockerLogHoldsMarkerRefusal(shardDir: string): boolean {
+  const read = readFileText(join(shardDir, DOCKER_LOG_FILE_NAME))
+  return read.kind === 'text' && holdsMarkerRefusalLine(read.text)
+}
+
+/** A shard ended normally: its result file is readable and holds the end marker (b.uqm SR-12.1, SR-11.4). */
+export function shardEndedNormally(scripts: ShardScriptsRead): boolean {
+  return scripts.kind === 'readable' && scripts.endMarker
+}
+
+/**
+ * The cause of a shard that did not end normally, the first that applies
+ * (b.uqm SR-12.1): (1) the cause the runner fixed itself, `fixedCause` (for a
+ * shard never created, E13 records the run-level stop's cause there, b.uqm
+ * SR-5.6); (2) `container failed to start`;
+ * (3) `image marker missing`, only for an exit of 2 with the marker refusal
+ * line in its saved Docker logs; (4) `container exited <code>`; (5) `result
+ * file unreadable`; (6) `no result file`, which is also the cause when none of
+ * the others applies. A runner-made stop's cause is always its recorded one,
+ * never the exit code that stop produced.
+ */
+export function shardCauseOf(evidence: ShardOutcomeEvidence, scripts: ShardScriptsRead, markerRefused: boolean): ShardCause {
+  if (evidence.fixedCause !== null) return evidence.fixedCause
+  if (evidence.start?.kind === 'failed-to-start') return { kind: 'failed-to-start', detail: evidence.start.detail, fixedByRunner: false }
+  if (evidence.exitCode === MARKER_REFUSAL_EXIT_STATUS && markerRefused) return { kind: 'image-marker-missing', fixedByRunner: false }
+  if (evidence.exitCode !== null) return { kind: 'container-exited', code: evidence.exitCode, fixedByRunner: false }
+  if (scripts.kind === 'unreadable') return { kind: 'result-file-unreadable', fixedByRunner: false }
+  return { kind: 'no-result-file', fixedByRunner: false }
+}
+
+/**
+ * A shard's end failure: its out-of-memory line when it has one, else its end
+ * line when it did not end normally, else none (b.uqm SR-12.1, SR-12.2). The
+ * end line takes the script form, classed `script`, only with a script in
+ * progress and a cause that `causeTakesScriptEndLine` allows; otherwise it
+ * takes the shard form, classed `shard`.
+ */
+function shardEndFailure(evidence: ShardOutcomeEvidence, cause: ShardCause | null, inProgress: string | null): Failure | null {
+  const shard = evidence.shard
+  if (evidence.oomLine !== null) return { line: evidence.oomLine, shard, failureClass: { kind: 'out-of-memory' } }
+  if (cause === null) return null
+  if (inProgress !== null && causeTakesScriptEndLine(cause)) return { line: scriptEndLine(inProgress, shard, cause), shard, failureClass: { kind: 'script', fileName: inProgress } }
+  return { line: shardEndLine(shard, cause), shard, failureClass: { kind: 'shard' } }
+}
+
+/**
+ * Decides one shard's outcome (b.uqm SR-12.1, SR-3.6). A shard that ended
+ * normally has no cause, and its end is its out-of-memory line or `normal`.
+ * Any other shard gets the cause `shardCauseOf` chooses, and its end line is
+ * `FAIL: <file name>: <cause> in shard-<k>` when its readable result file has
+ * a script in progress and the cause takes the script form
+ * (`causeTakesScriptEndLine`), else `FAIL: shard-<k>: <cause>`; an
+ * out-of-memory line takes the place of either. Each assigned script without
+ * a result is `notrun`; the script in progress at an abnormal end is `fail`
+ * with no seconds, its failLine the shard's end, whichever form it takes (its
+ * failure is the end failure, never a second one); every other result stays
+ * as recorded.
+ */
+export function decideShardOutcome(evidence: ShardOutcomeEvidence, scripts: ShardScriptsRead, markerRefused: boolean): ShardOutcome {
+  const endedNormally = shardEndedNormally(scripts)
+  const cause = endedNormally ? null : shardCauseOf(evidence, scripts, markerRefused)
+  const records = scripts.kind === 'readable' ? scripts.scripts : []
+  const inProgress = !endedNormally && scripts.kind === 'readable' ? scripts.inProgress : null
+  const endFailure = shardEndFailure(evidence, cause, inProgress)
+  const shard = evidence.shard
+  const results = evidence.assigned.map((fileName): ResultsScript => {
+    if (fileName === inProgress) return { script: fileName, shard, result: 'fail', seconds: null, failLine: endFailure?.line ?? null }
+    const record = records.find((recorded) => recorded.fileName === fileName)
+    if (record === undefined || record.result === null || record.result === 'notrun') return { script: fileName, shard, result: 'notrun', seconds: null, failLine: null }
+    return { script: fileName, shard, result: record.result, seconds: record.seconds, failLine: record.failLine }
+  })
+  const scriptFailures = results.flatMap((result): Failure[] =>
+    result.result === 'fail' && result.script !== inProgress && result.failLine !== null
+      ? [{ line: result.failLine, shard, failureClass: { kind: 'script', fileName: result.script } }]
+      : [],
+  )
+  return {
+    shard,
+    endedNormally,
+    cause,
+    end: endFailure?.line ?? NORMAL_SHARD_END,
+    endFailure,
+    scripts: results,
+    failures: endFailure === null ? scriptFailures : [endFailure, ...scriptFailures],
+  }
+}
+
+/**
+ * Reads a shard's subdirectory and decides its outcome: `result.txt` and the
+ * failing scripts' logs through `readShardScripts`, and `docker.log` only when
+ * the container exited 2. A shard never created takes its cause only from
+ * `fixedCause`, where E13 records the run-level stop's cause (b.uqm SR-5.6).
+ */
+export function readShardOutcome(evidence: ShardOutcomeEvidence, shardDir: string): ShardOutcome {
+  const scripts = readShardScripts(shardDir, evidence.assigned)
+  const markerRefused = evidence.exitCode === MARKER_REFUSAL_EXIT_STATUS && dockerLogHoldsMarkerRefusal(shardDir)
+  return decideShardOutcome(evidence, scripts, markerRefused)
+}
+
+// The pass condition (b.uqm SR-12.3, SR-3.6).
+
+/** test-1's number: the script every shard runs first (b.uqm SR-3.3, SR-3.4). */
+const EVERY_SHARD_SCRIPT_NUMBER = 1
+
+/** What the pass condition is decided over. Cleanup failures are never an input (b.uqm SR-9.3). */
+export interface PassInputs {
+  /** The run's expected scripts, file names, test-1 included. */
+  readonly expectedScripts: readonly string[]
+  /** The shards used, by number. */
+  readonly shardsUsed: readonly number[]
+  /** The shard outcomes. */
+  readonly outcomes: readonly ShardOutcome[]
+  /** Every other failure: the first run-level line, an image build line, the integrity failures. */
+  readonly otherFailures: readonly Failure[]
+}
+
+/**
+ * Whether the run passes (b.uqm SR-12.3): no failure line exists (no other
+ * failure, and no shard has a script line, an end line or an out-of-memory
+ * line); no script entry is `notrun`; test-1 passed in every shard used; and
+ * every other expected script passed. Expected scripts without test-1 never
+ * pass. A dependent recorded `notrun` after its prerequisite failed adds no
+ * failure line of its own: the prerequisite's is the only one (b.uqm SR-3.6),
+ * and the `notrun` alone already fails the run.
+ */
+export function runPasses(inputs: PassInputs): boolean {
+  if (inputs.otherFailures.length > 0) return false
+  if (inputs.outcomes.some((outcome) => outcome.failures.length > 0)) return false
+  const entries = inputs.outcomes.flatMap((outcome) => outcome.scripts)
+  if (entries.some((entry) => entry.result === 'notrun')) return false
+  const passedIn = (fileName: string, shard: number | null): boolean =>
+    entries.some((entry) => entry.script === fileName && entry.result === 'pass' && (shard === null || entry.shard === shard))
+  const testOne = inputs.expectedScripts.find((fileName) => fileNameNumber(fileName) === EVERY_SHARD_SCRIPT_NUMBER)
+  if (testOne === undefined) return false
+  if (!inputs.shardsUsed.every((shard) => passedIn(testOne, shard))) return false
+  return inputs.expectedScripts.every((fileName) => passedIn(fileName, null))
+}
+
+// --- 14/T2 (E10 T2): the failure ranking, the verdict line, its SELECTIVE prefix and the double guard ---
+//
+// Every failure of the run ranked into one list by b.uqm SR-12.4's precedence,
+// and the one verdict line built from it in the shape the invocation calls for
+// (b.uqm SR-12.5, SR-19.6). Pure functions over E1's data model and T1's
+// outcomes. Which run-level stop came first, and writing `verdict.txt`, are
+// E13's.
+
+// The failure ranking (b.uqm SR-12.4).
+
+/** Each failure class's tier in SR-12.4's precedence, highest first; within a tier the order is `compareFailures`'. */
+const FAILURE_TIERS: Readonly<Record<FailureClass['kind'], number>> = {
+  'run-level-stop': 0,
+  'image-build': 1,
+  integrity: 2,
+  'out-of-memory': 3,
+  shard: 4,
+  script: 5,
+}
+
+/** The failure classes a shard outcome's failures take (T1's `ShardOutcome.failures`); each carries its shard. */
+const SHARD_OUTCOME_FAILURE_KINDS: readonly FailureClass['kind'][] = ['out-of-memory', 'shard', 'script']
+
+/** A failure's tier in SR-12.4's precedence, 0 highest: run-level stop, image build, integrity, out-of-memory, other `shard-<k>`, script. */
+export function failureTier(failure: Failure): number {
+  return FAILURE_TIERS[failure.failureClass.kind]
+}
+
+/**
+ * Compares two failures in SR-12.4's precedence (b.uqm SR-12.4): by tier
+ * first; out-of-memory and other `shard-<k>` lines by shard number; script
+ * failures, a `… in shard-<k>` end line among them, in E1's canonical order
+ * of their scripts, then by shard number, so test-1's lowest shard comes
+ * first. Run-level, image-build and integrity failures compare equal within
+ * their tier, whatever shard an integrity failure carries, so a stable sort
+ * keeps their given order (SR-13.2's, for the integrity failures).
+ */
+export function compareFailures(a: Failure, b: Failure): number {
+  const tier = failureTier(a) - failureTier(b)
+  if (tier !== 0) return tier
+  if (!SHARD_OUTCOME_FAILURE_KINDS.includes(a.failureClass.kind)) return 0
+  if (a.failureClass.kind === 'script' && b.failureClass.kind === 'script') {
+    const order = compareCanonical(a.failureClass.fileName, b.failureClass.fileName)
+    if (order !== 0) return order
+  }
+  return (a.shard ?? 0) - (b.shard ?? 0)
+}
+
+/** The first run-level stop's line as a failure, classed `run-level-stop`, with no shard (b.uqm SR-5.6, SR-12.4). */
+export function runLevelFailure(line: string): Failure {
+  return { line, shard: null, failureClass: { kind: 'run-level-stop' } }
+}
+
+/** The image build failure's line as a failure, classed `image-build`, with no shard (b.uqm SR-9.3, SR-12.4). */
+export function imageBuildFailure(line: string): Failure {
+  return { line, shard: null, failureClass: { kind: 'image-build' } }
+}
+
+/** Every failure source of a run, each from the Epic that owns it (b.uqm SR-12.4). */
+export interface FailureSources {
+  /** The first run-level stop's line (E13); null for none. */
+  readonly runLevelLine: string | null
+  /** The image build failure's line (E8); null for none. */
+  readonly imageBuildLine: string | null
+  /** The integrity failures in SR-13.2's order (E11), each classed `integrity`, each with its shard number or null; ranking keeps this order exactly. */
+  readonly integrityFailures: readonly Failure[]
+  /** The shard outcomes (T1). */
+  readonly outcomes: readonly ShardOutcome[]
+}
+
+/** The failures outside the shard outcomes, in tier order: the run-level line, the image build line, then the integrity failures as given. These are `PassInputs.otherFailures`. */
+export function otherFailuresOf(sources: FailureSources): Failure[] {
+  const runLevel = sources.runLevelLine === null ? [] : [runLevelFailure(sources.runLevelLine)]
+  const imageBuild = sources.imageBuildLine === null ? [] : [imageBuildFailure(sources.imageBuildLine)]
+  return [...runLevel, ...imageBuild, ...sources.integrityFailures]
+}
+
+/**
+ * Throws unless a failure is of one of the classes its source gives, and
+ * unless an out-of-memory, shard or script failure carries a shard. An
+ * integrity failure carries a shard number or null (E11); run-level and
+ * image-build entries never reach this check, as `runLevelFailure` and
+ * `imageBuildFailure` build them shardless.
+ */
+function checkFailureSource(failure: Failure, kinds: readonly FailureClass['kind'][], source: string): void {
+  const kind = failure.failureClass.kind
+  if (!kinds.includes(kind)) throw new Error(`rankFailures: ${source} holds a failure classed ${kind}: ${failure.line}`)
+  if (SHARD_OUTCOME_FAILURE_KINDS.includes(kind) && failure.shard === null) throw new Error(`rankFailures: a failure classed ${kind} with shard ${failure.shard}: ${failure.line}`)
+}
+
+/**
+ * Every failure of the run, ranked by SR-12.4's precedence (b.uqm SR-12.4,
+ * SR-16.1 `failures`): the first run-level stop; the image build failure; the
+ * integrity failures in exactly their given order (SR-13.2's), never
+ * reordered by shard; out-of-memory lines by shard number (`out-of-memory
+ * status unreadable` with the kill lines); other `shard-<k>` lines by shard
+ * number; script failures in canonical order, test-1's by ascending shard.
+ * Every failure is kept, each once: a shard's end line is already its only
+ * entry for the script in progress, and `notrun` is never one (T1).
+ * Run-level and image-build entries are built shardless by `runLevelFailure`
+ * and `imageBuildFailure`; an integrity entry carries its shard number or
+ * null, as E11 gives it; every other entry carries its shard. Throws for an
+ * input failure of the wrong class, and for an out-of-memory, shard or script
+ * failure without a shard.
+ */
+export function rankFailures(sources: FailureSources): Failure[] {
+  for (const failure of sources.integrityFailures) checkFailureSource(failure, ['integrity'], 'the integrity failures')
+  const shardFailures = sources.outcomes.flatMap((outcome) => outcome.failures)
+  for (const failure of shardFailures) checkFailureSource(failure, SHARD_OUTCOME_FAILURE_KINDS, 'a shard outcome')
+  return [...otherFailuresOf(sources), ...shardFailures].sort(compareFailures)
+}
+
+// The verdict line (b.uqm SR-12.5, SR-19.6).
+
+/** The verdict of a passing full run without `--inject`, and the word a passing selective or injected run's verdict ends with (b.uqm SR-12.5, SR-17.2). */
+export const PASS_VERDICT = 'PASS'
+
+/**
+ * The `SELECTIVE (<scripts>)` list (b.uqm SR-12.5, SR-17.2): the run's
+ * scripts, file names or number forms, as number forms in canonical order,
+ * separated by single spaces. Throws for a name that is neither form, for two
+ * names of one number, and for a list without test-1.
+ */
+export function selectiveScriptsText(scripts: readonly string[]): string {
+  const numberForms = scripts.map((name) => {
+    const form = classifyScriptName(name)
+    if (form.kind === 'neither') throw new Error(`selectiveScriptsText: not a script name: ${name}`)
+    return form.numberForm
+  })
+  const duplicate = numberForms.find((numberForm, index) => numberForms.indexOf(numberForm) !== index)
+  if (duplicate !== undefined) throw new Error(`selectiveScriptsText: ${duplicate} given twice`)
+  const testOne = numberFormOf(EVERY_SHARD_SCRIPT_NUMBER)
+  if (!numberForms.includes(testOne)) throw new Error(`selectiveScriptsText: the scripts do not hold ${testOne}`)
+  return sortCanonical(numberForms).join(' ')
+}
+
+/** The selective verdict's prefix, `SELECTIVE (<scripts>): ` (b.uqm SR-12.5, SR-17.2); throws as `selectiveScriptsText` does. */
+export function selectiveVerdictPrefix(scripts: readonly string[]): string {
+  return `SELECTIVE (${selectiveScriptsText(scripts)}): `
+}
+
+/**
+ * Throws unless every script the invocation selects is in the run's scripts,
+ * compared by number form, so the `SELECTIVE` list always holds every
+ * selected script (b.uqm SR-17.2). Throws for a selected name that is neither
+ * form; a name in `scripts` that is neither form is `selectiveScriptsText`'s
+ * to reject.
+ */
+function checkSelectedScriptsListed(selected: readonly string[], scripts: readonly string[]): void {
+  const listed = new Set(scripts.flatMap((name) => {
+    const form = classifyScriptName(name)
+    return form.kind === 'neither' ? [] : [form.numberForm]
+  }))
+  for (const name of selected) {
+    const form = classifyScriptName(name)
+    if (form.kind === 'neither') throw new Error(`buildVerdictLine: the invocation selects a name that is not a script: ${name}`)
+    if (!listed.has(form.numberForm)) throw new Error(`buildVerdictLine: the scripts do not hold the selected ${form.numberForm}`)
+  }
+}
+
+/** What the verdict line is built from (b.uqm SR-12.5). */
+export interface VerdictInputs {
+  /** The invocation: its run kind, gate eligibility and normalized faults decide the shape (E1's rules). */
+  readonly invocation: Invocation
+  /**
+   * The run's resolved, de-duplicated expected scripts, file names or number
+   * forms: the selection, every prerequisite and test-1 (b.uqm SR-17.2). Used
+   * only for a selective run, whose `SELECTIVE` list it is; it must hold
+   * test-1 and every script the invocation selects.
+   */
+  readonly scripts: readonly string[]
+  /** The pass condition, `runPasses`. */
+  readonly passed: boolean
+  /** Every failure, ranked, `rankFailures`. */
+  readonly ranked: readonly Failure[]
+}
+
+/**
+ * The run's verdict line, one line without a line feed (b.uqm SR-12.5,
+ * SR-19.6): `PASS` when the run passes, else the top-ranked failure's line
+ * verbatim (a CRLF script line keeps its `\r`); then, for a selective run, the
+ * `SELECTIVE (<scripts>): ` prefix; then, for an injected run, the
+ * `INJECTED (<faults>): ` wrapper outside it. A full run without `--inject`
+ * keeps today's shape: `PASS`, the failing script's first `FAIL:` line, or the
+ * fallback line.
+ *
+ * The double guard: every input that does not make sense is an internal error
+ * that throws, never a verdict. A passing run with a failure line, a failing
+ * run with no failure line, a top line that does not begin `FAIL:` or holds a
+ * line feed, a selective run whose scripts lack test-1 or a selected script,
+ * and a result of exactly `PASS` for a run that may not gate all throw.
+ */
+export function buildVerdictLine(inputs: VerdictInputs): string {
+  const { invocation, ranked } = inputs
+  let line: string
+  if (inputs.passed) {
+    if (ranked.length > 0) throw new Error(`buildVerdictLine: a passing run with ${ranked.length} failure line(s)`)
+    line = PASS_VERDICT
+  } else {
+    const top = ranked[0]
+    if (top === undefined) throw new Error('buildVerdictLine: a failing run with no failure line')
+    if (!top.line.startsWith(FAIL_PREFIX.trimEnd())) throw new Error(`buildVerdictLine: the top failure line does not begin FAIL: ${top.line}`)
+    if (top.line.includes('\n')) throw new Error('buildVerdictLine: the top failure line holds a line feed')
+    line = top.line
+  }
+  if (isSelectiveRun(invocation)) {
+    const prefix = selectiveVerdictPrefix(inputs.scripts)
+    checkSelectedScriptsListed(invocation.scripts, inputs.scripts)
+    line = `${prefix}${line}`
+  }
+  if (isInjectedRun(invocation)) line = `${injectedVerdictPrefix(invocation.faults)}${line}`
+  if (line === PASS_VERDICT && !isGateEligible(invocation)) throw new Error('buildVerdictLine: exactly PASS for a run that may not gate')
+  return line
+}
+
+// --- 14/T3 (E10 T3): the timing summary, the results.json value, summary.txt and their one redacted writer ---
+//
+// The run's record (b.uqm SR-16.1, SR-16.2): the timing summary placed in its
+// fixed order from the lines other Epics produce, the `results.json` value
+// with every key filled by its rule, the human-readable `summary.txt` rendered
+// from that value, and the one writer of both files, which applies the
+// injected redactor (E11's) to all their content and replaces each whole
+// through a temporary file in the run directory and a rename (b.uqm SR-5.6,
+// SR-5.7 step 5, SR-15.3). E13 calls the writer at end-of-run step 5 and again
+// on a stop during the end-of-run sequence. The assembler takes the verdict
+// line and the ranked failures (T2) as given.
+
+// The timing summary (b.uqm SR-16.2, SR-8.4).
+
+/** Each line break a given timing line may hold: CRLF, LF or CR. */
+const GIVEN_LINE_BREAK_PATTERN = /\r\n|\r|\n/
+
+/** The timing summary's line groups, each as its owning Epic gives it; T3 only places them (b.uqm SR-16.2). */
+export interface TimingSummaryGroups {
+  /** The shard-count line (E6, b.uqm SR-6.7); every run has one. */
+  readonly shardCountLine: string
+  /** The build time with its base-build part, each shard's time and the total (E4, b.uqm SR-4.4). */
+  readonly runTimes: readonly string[]
+  /** Each script's time (E4, b.uqm SR-4.4). */
+  readonly scriptTimes: readonly string[]
+  /** The duration-table block under its introducing line, its real tab characters kept (E4, b.uqm SR-4.4). */
+  readonly durationTableBlock: readonly string[]
+  /** The `slow:` lines (E4, b.uqm SR-4.4). */
+  readonly slowLines: readonly string[]
+  /** The table notes (E4). */
+  readonly tableNotes: readonly string[]
+  /**
+   * The cap line with its suffix (E7, b.uqm SR-8.4), placed only in a full
+   * run. A full run always passes one (SR-8.4's `unknown` form covers a run
+   * with no readings); null only for a selective run, which gets no cap line.
+   */
+  readonly capLine: string | null
+}
+
+/** A given text's lines: split at every line break, an empty line dropped, so a trailing line break or an empty text adds no blank line. Tabs and every other character stay. */
+function givenLines(text: string): string[] {
+  return text.split(GIVEN_LINE_BREAK_PATTERN).filter((line) => line !== '')
+}
+
+/**
+ * The timing summary in print order (b.uqm SR-16.2): the shard-count line;
+ * the build time with its base-build part, each shard's time and the total;
+ * each script's time; the duration-table block, the `slow:` lines and the
+ * table notes; and, for a full run (injected or not), the cap line, which a
+ * selective run never gets (b.uqm SR-8.4). An empty group, or a null cap
+ * line, adds no line. Every element is one line: a given text holding line breaks is split
+ * into its lines, and no element is empty or holds a line break.
+ */
+export function assembleTimingSummary(groups: TimingSummaryGroups, runKind: RunKind): string[] {
+  const ordered: readonly (string | null)[] = [
+    groups.shardCountLine,
+    ...groups.runTimes,
+    ...groups.scriptTimes,
+    ...groups.durationTableBlock,
+    ...groups.slowLines,
+    ...groups.tableNotes,
+    runKind === 'full' ? groups.capLine : null,
+  ]
+  return ordered.flatMap((text) => (text === null ? [] : givenLines(text)))
+}
+
+// The results.json value (b.uqm SR-16.1).
+
+/** `inspectionError` for a shard whose container never started: never created, or failed to start (b.uqm SR-16.1). */
+export const CONTAINER_NEVER_STARTED_TEXT = 'container never started'
+
+/** `inspectionError` for a started shard with no inspection data and no failed read recorded, such as one whose read a stop prevented. */
+export const INSPECTION_NOT_READ_TEXT = 'inspection data not read'
+
+/**
+ * The shard evidence a `shards` entry takes as it is (b.uqm SR-16.1): E4's
+ * assignment figures, E7's readings, E9's start, image and inspection (its
+ * `inspectionError` being the last failed read's error as recorded, any
+ * form), and E11's in-shard records. A `ShardEvidence` is one.
+ */
+export type ResultsShardEvidence = Pick<
+  ShardEvidence,
+  | 'shard'
+  | 'assigned'
+  | 'expectedSeconds'
+  | 'limitMinutes'
+  | 'seconds'
+  | 'anonPeak'
+  | 'peakPids'
+  | 'final'
+  | 'failedReadings'
+  | 'packageSha256'
+  | 'dependencyFingerprint'
+  | 'imageId'
+  | 'inspection'
+  | 'inspectionError'
+  | 'start'
+>
+
+/** One shard: its evidence and its outcome (T1), both of the same shard. */
+export interface ResultsShardInput {
+  readonly evidence: ResultsShardEvidence
+  readonly outcome: ShardOutcome
+}
+
+/** The modes `modes` records, as read: permission bits (a full `st_mode` is accepted; only its low twelve bits count). */
+export interface RunModes {
+  /** The run directory's. */
+  readonly runDir: number
+  /** The tarball's; null when no tarball was packed. */
+  readonly tarball: number | null
+  /** Each shard subdirectory's name to its mode. */
+  readonly shardDirs: Readonly<Record<string, number>>
+}
+
+/** Everything `results.json` is assembled from, each value from the Epic that owns it (b.uqm SR-16.1). */
+export interface ResultsInputs {
+  readonly runId: string
+  /** The runner's PID. */
+  readonly pid: number
+  /** The invocation: `args`, the run kind and the normalized faults (E1). */
+  readonly invocation: Invocation
+  /** The run's tarball hash (E8); null when no tarball was packed. */
+  readonly packageSha256: string | null
+  /** The run's images (E8). */
+  readonly images: Pick<ImageState, 'pinnedId' | 'driftId' | 'retagId' | 'retagMoved'>
+  /** The verdict line (T2), as given; the writer redacts it. */
+  readonly verdict: string
+  /** One per shard, in any order; written in shard order. */
+  readonly shards: readonly ResultsShardInput[]
+  /** E6's figures. */
+  readonly shardCount: ResultsShardCount
+  /** E7's figures; in a selective run every key but `usedBytes` is written null. */
+  readonly cap: ResultsCap
+  /** E7's working-set readings. */
+  readonly workingSet: ResultsWorkingSet
+  /** The run's failed-reading count (E7). */
+  readonly failedReadings: number
+  /** The modes as read (E13). */
+  readonly modes: RunModes
+  /** Every failure, ranked (T2's `rankFailures`); cleanup failures are never among them. */
+  readonly failures: readonly Failure[]
+  /** The skipped checks (E11). */
+  readonly skippedChecks: readonly IntegrityCheck[]
+  /** Each cleanup failure's line (E8, b.uqm SR-9.3). */
+  readonly cleanupFailures: readonly string[]
+  /** The build, base-build and total times (E13). */
+  readonly timing: ResultsTiming
+  /** The timing summary's groups, placed by `assembleTimingSummary`. */
+  readonly timingGroups: TimingSummaryGroups
+}
+
+/** A mode as `modes` writes it: its permission bits as a four-digit octal string, 0700 as `"0700"` (b.uqm SR-16.1). Throws for a value that is no mode. */
+export function octalModeText(mode: number): string {
+  if (!Number.isSafeInteger(mode) || mode < 0) throw new Error(`octalModeText: not a mode: ${mode}`)
+  return (mode & 0o7777).toString(8).padStart(4, '0')
+}
+
+/**
+ * A shard's `inspectionError` (b.uqm SR-16.1, SR-10.5): null when it has
+ * inspection data; `container never started` for a shard never created or
+ * that failed to start; otherwise the last failed read's error on one line,
+ * or `INSPECTION_NOT_READ_TEXT` when no failed read was recorded.
+ */
+export function inspectionErrorOf(evidence: Pick<ShardEvidence, 'start' | 'inspection' | 'inspectionError'>): string | null {
+  if (evidence.inspection !== null) return null
+  if (evidence.start?.kind !== 'started') return CONTAINER_NEVER_STARTED_TEXT
+  const error = evidence.inspectionError === null ? '' : dependencyErrorText(evidence.inspectionError)
+  return error === '' ? INSPECTION_NOT_READ_TEXT : error
+}
+
+/** Inspection data with exactly b.uqm SR-10.5's fields. */
+function resultsInspectionOf(inspection: InspectionData): InspectionData {
+  return {
+    name: inspection.name,
+    imageId: inspection.imageId,
+    mounts: inspection.mounts.map((mount) => ({ source: mount.source, target: mount.target, readOnly: mount.readOnly })),
+    networkMode: inspection.networkMode,
+    pidMode: inspection.pidMode,
+    ipcMode: inspection.ipcMode,
+    privileged: inspection.privileged,
+    memoryBytes: inspection.memoryBytes,
+    memorySwapBytes: inspection.memorySwapBytes,
+    pidsLimit: inspection.pidsLimit,
+    nanoCpus: inspection.nanoCpus,
+    labels: { ...inspection.labels },
+    autoRemove: inspection.autoRemove,
+  }
+}
+
+/** One `shards` entry, exactly its keys: the evidence's figures, the outcome's `endedNormally` and `end`, and `inspectionError` by its rule (b.uqm SR-16.1). Throws when the evidence and the outcome are of different shards. */
+function resultsShardOf(input: ResultsShardInput): ResultsShard {
+  const { evidence, outcome } = input
+  if (outcome.shard !== evidence.shard) throw new Error(`assembleResults: shard-${evidence.shard}'s evidence paired with shard-${outcome.shard}'s outcome`)
+  return {
+    shard: evidence.shard,
+    assigned: [...evidence.assigned],
+    expectedSeconds: evidence.expectedSeconds,
+    limitMinutes: evidence.limitMinutes,
+    endedNormally: outcome.endedNormally,
+    end: outcome.end,
+    seconds: evidence.seconds,
+    anonPeak: { bytes: evidence.anonPeak.bytes, pageCacheBytes: evidence.anonPeak.pageCacheBytes, mark: evidence.anonPeak.mark },
+    peakPids: evidence.peakPids,
+    final: { oomKilled: evidence.final.oomKilled, oomKillCount: evidence.final.oomKillCount },
+    failedReadings: evidence.failedReadings,
+    packageSha256: evidence.packageSha256,
+    dependencyFingerprint: evidence.dependencyFingerprint,
+    imageId: evidence.imageId,
+    inspection: evidence.inspection === null ? null : resultsInspectionOf(evidence.inspection),
+    inspectionError: inspectionErrorOf(evidence),
+  }
+}
+
+/** `cap`, exactly its keys; in a selective run every key but `usedBytes` is null (b.uqm SR-16.1, SR-8.4). */
+function resultsCapOf(cap: ResultsCap, runKind: RunKind): ResultsCap {
+  const full = runKind === 'full'
+  return {
+    usedBytes: cap.usedBytes,
+    peakBytes: full ? cap.peakBytes : null,
+    peakShard: full ? cap.peakShard : null,
+    peakPageCacheBytes: full ? cap.peakPageCacheBytes : null,
+    peakFromKill: full ? cap.peakFromKill : null,
+    derivedBytes: full ? cap.derivedBytes : null,
+    suffix: full ? cap.suffix : null,
+  }
+}
+
+/** A working-set reading, exactly its keys, or null when not read. */
+function resultsWorkingSetReadingOf(reading: WorkingSetReading | null): WorkingSetReading | null {
+  return reading === null ? null : { bytes: reading.bytes, anonBytes: reading.anonBytes, activeFileBytes: reading.activeFileBytes }
+}
+
+/** `modes`: each mode as a four-digit octal string (b.uqm SR-16.1). */
+function resultsModesOf(modes: RunModes): ResultsModes {
+  return {
+    runDir: octalModeText(modes.runDir),
+    tarball: modes.tarball === null ? null : octalModeText(modes.tarball),
+    shardDirs: Object.fromEntries(Object.entries(modes.shardDirs).map(([name, mode]) => [name, octalModeText(mode)])),
+  }
+}
+
+/**
+ * The `results.json` value, every key of b.uqm SR-16.1 filled by its rule and
+ * nothing more: `version` 1; the images' IDs; the verdict line as given;
+ * `invocation` with `args` as given, `selective` and the normalized faults'
+ * texts; `scripts`, one per assigned script per shard (test-1 once per shard),
+ * in shard order then run order, from T1's outcomes; `shards` in shard order,
+ * with T1's `endedNormally` and `end` and `inspectionError` by its rule; `cap`
+ * nulled but `usedBytes` in a selective run; `modes` as four-digit octal
+ * strings; `failures` the ranked list as given, each its `line` and `shard`;
+ * and `timingSummary` from `assembleTimingSummary`. Redaction is the writer's.
+ * Serialize it with E1's `serializeResults`, which throws for a value off its
+ * shape (a count that is no whole number, say). Throws when a shard's evidence
+ * and outcome are of different shards, or a mode is no mode.
+ */
+export function assembleResults(inputs: ResultsInputs): Results {
+  const runKind = runKindOf(inputs.invocation)
+  const shards = [...inputs.shards].sort((a, b) => a.evidence.shard - b.evidence.shard)
+  return {
+    version: RESULTS_FORMAT_VERSION,
+    runId: inputs.runId,
+    pid: inputs.pid,
+    packageSha256: inputs.packageSha256,
+    images: { pinned: inputs.images.pinnedId, drift: inputs.images.driftId, retag: inputs.images.retagId, retagMoved: inputs.images.retagMoved },
+    verdict: inputs.verdict,
+    invocation: { args: [...inputs.invocation.args], selective: runKind === 'selective', faults: inputs.invocation.faults.map(faultText) },
+    scripts: shards.flatMap(({ outcome }) =>
+      outcome.scripts.map((entry) => ({ script: entry.script, shard: entry.shard, result: entry.result, seconds: entry.seconds, failLine: entry.failLine })),
+    ),
+    shards: shards.map(resultsShardOf),
+    shardCount: {
+      requested: inputs.shardCount.requested,
+      effective: inputs.shardCount.effective,
+      admitted: inputs.shardCount.admitted,
+      started: inputs.shardCount.started,
+      reasons: [...inputs.shardCount.reasons],
+    },
+    cap: resultsCapOf(inputs.cap, runKind),
+    workingSet: {
+      before: resultsWorkingSetReadingOf(inputs.workingSet.before),
+      peak: resultsWorkingSetReadingOf(inputs.workingSet.peak),
+      after: resultsWorkingSetReadingOf(inputs.workingSet.after),
+    },
+    failedReadings: inputs.failedReadings,
+    modes: resultsModesOf(inputs.modes),
+    failures: inputs.failures.map((failure) => ({ line: failure.line, shard: failure.shard })),
+    skippedChecks: [...inputs.skippedChecks],
+    cleanupFailures: [...inputs.cleanupFailures],
+    timing: { buildSeconds: inputs.timing.buildSeconds, baseBuildSeconds: inputs.timing.baseBuildSeconds, totalSeconds: inputs.timing.totalSeconds },
+    timingSummary: assembleTimingSummary(inputs.timingGroups, runKind),
+  }
+}
+
+// summary.txt (b.uqm SR-16.2, SR-12.4, SR-13.1, SR-7.3, SR-8.4, SR-9.3).
+
+/** How the summary shows an absent value. */
+const SUMMARY_NONE = 'none'
+
+/** The line that introduces the timing-summary lines, which follow it verbatim. */
+export const SUMMARY_TIMING_HEADING = 'timing summary:'
+
+/** The indent of a listed item in the summary. */
+const SUMMARY_INDENT = '  '
+
+/** A value, or `none` for null. */
+function shownOrNone(value: string | number | null): string {
+  return value === null ? SUMMARY_NONE : String(value)
+}
+
+/** A list joined by a comma and a space, or `none` when empty. */
+function listOrNone(items: readonly string[]): string {
+  return items.length === 0 ? SUMMARY_NONE : items.join(', ')
+}
+
+/** `yes` or `no`. */
+function yesNo(value: boolean): string {
+  return value ? 'yes' : 'no'
+}
+
+/** A byte count as whole bytes, with its GiB to two decimal places. */
+function bytesText(bytes: number): string {
+  return `${bytes} bytes (${(bytes / GIB_BYTES).toFixed(2)} GiB)`
+}
+
+/** A byte count, or `none` for null. */
+function bytesOrNone(bytes: number | null): string {
+  return bytes === null ? SUMMARY_NONE : bytesText(bytes)
+}
+
+/** Seconds, or `none` for null. */
+function secondsOrNone(seconds: number | null): string {
+  return seconds === null ? SUMMARY_NONE : `${seconds} s`
+}
+
+/** A working-set reading with its parts, or `not read`. */
+function workingSetText(reading: WorkingSetReading | null): string {
+  if (reading === null) return 'not read'
+  return `${bytesText(reading.bytes)}, anon ${bytesText(reading.anonBytes)}, active page cache ${bytesText(reading.activeFileBytes)}`
+}
+
+/** Shard subdirectory names in shard order: `shard-2` before `shard-10`. */
+function compareShardDirNames(a: string, b: string): number {
+  return a.localeCompare(b, 'en', { numeric: true })
+}
+
+/** The summary's opening lines: the run, the verdict, the invocation, the package and the images. */
+function summaryHeadLines(results: Results): string[] {
+  const { images, invocation } = results
+  return [
+    `/ci run ${results.runId}, runner pid ${results.pid}, results format version ${results.version}`,
+    `verdict: ${results.verdict}`,
+    `invocation: /ci${invocation.args.map((arg) => ` ${shellQuoted(arg)}`).join('')}`,
+    `run kind: ${invocation.selective ? 'selective' : 'full'}`,
+    `faults: ${listOrNone(invocation.faults)}`,
+    `package sha256: ${shownOrNone(results.packageSha256)}`,
+    `images: pinned ${shownOrNone(images.pinned)}, drift ${shownOrNone(images.drift)}, retag ${shownOrNone(images.retag)}; retag moved the -test tag: ${yesNo(images.retagMoved)}`,
+  ]
+}
+
+/** Every failure with its shard (b.uqm SR-12.4), the skipped checks (b.uqm SR-13.1) and the cleanup failures (b.uqm SR-9.3). */
+function summaryProblemLines(results: Results): string[] {
+  return [
+    `failures: ${results.failures.length}`,
+    ...results.failures.map((failure) => `${SUMMARY_INDENT}${failure.shard === null ? 'run' : `${SHARD_DIR_PREFIX}${failure.shard}`}: ${failure.line}`),
+    `skipped checks: ${listOrNone(results.skippedChecks)}`,
+    `cleanup failures: ${results.cleanupFailures.length}`,
+    ...results.cleanupFailures.map((line) => `${SUMMARY_INDENT}${line}`),
+  ]
+}
+
+/** One shard's lines: every `shards` value but `inspection` and `failedReadings` (which the failed-readings line gives). */
+function summaryShardLines(shard: ResultsShard): string[] {
+  const item = `${SUMMARY_INDENT}${SUMMARY_INDENT}`
+  const peak = shard.anonPeak
+  const mark = peak.mark === null ? '' : `, ${peak.mark}`
+  return [
+    `${SUMMARY_INDENT}${SHARD_DIR_PREFIX}${shard.shard}:`,
+    `${item}assigned: ${listOrNone(shard.assigned)}`,
+    `${item}expected time: ${shard.expectedSeconds} s; wall-time limit: ${shard.limitMinutes} min`,
+    `${item}ended normally: ${yesNo(shard.endedNormally)}`,
+    `${item}end: ${shard.end}`,
+    `${item}wall time: ${secondsOrNone(shard.seconds)}`,
+    `${item}anon peak: ${bytesOrNone(peak.bytes)}, page cache ${bytesOrNone(peak.pageCacheBytes)}${mark}`,
+    `${item}peak PIDs: ${shownOrNone(shard.peakPids)}`,
+    `${item}final reading: OOM killed ${String(shard.final.oomKilled)}, kill count ${String(shard.final.oomKillCount)}`,
+    `${item}package sha256: ${shownOrNone(shard.packageSha256)}`,
+    `${item}dependency fingerprint: ${shownOrNone(shard.dependencyFingerprint)}`,
+    `${item}image: ${shownOrNone(shard.imageId)}`,
+    `${item}inspection error: ${shownOrNone(shard.inspectionError)}`,
+  ]
+}
+
+/** One line per `scripts` entry, in its order. */
+function summaryScriptLines(results: Results): string[] {
+  return [
+    `scripts: ${results.scripts.length}`,
+    ...results.scripts.map((entry) => {
+      const failLine = entry.failLine === null ? '' : `; ${entry.failLine}`
+      return `${SUMMARY_INDENT}${SHARD_DIR_PREFIX}${entry.shard} ${entry.script}: ${entry.result}, ${entry.seconds === null ? 'no time' : `${entry.seconds} s`}${failLine}`
+    }),
+  ]
+}
+
+/** The run-wide figures: shard count, cap, working set, failed readings (run and per shard, b.uqm SR-7.3), modes and timing. */
+function summaryRunFigureLines(results: Results): string[] {
+  const { shardCount, cap, workingSet, modes, timing } = results
+  const peakFromKill = cap.peakFromKill === null ? SUMMARY_NONE : yesNo(cap.peakFromKill)
+  const suffix = cap.suffix === null || cap.suffix === '' ? SUMMARY_NONE : JSON.stringify(cap.suffix)
+  const shardReadings = results.shards.map((shard) => `${SHARD_DIR_PREFIX}${shard.shard} ${shard.failedReadings}`)
+  const shardModes = Object.keys(modes.shardDirs)
+    .sort(compareShardDirNames)
+    .map((name) => `${name} ${modes.shardDirs[name]}`)
+  return [
+    `shard count: requested ${shardCount.requested}, effective ${shardCount.effective}, admitted ${shardCount.admitted}, started ${shardCount.started}; reasons: ${listOrNone(shardCount.reasons)}`,
+    `cap: used ${bytesText(cap.usedBytes)}; peak ${bytesOrNone(cap.peakBytes)} in ${cap.peakShard === null ? SUMMARY_NONE : `${SHARD_DIR_PREFIX}${cap.peakShard}`}; peak page cache ${bytesOrNone(cap.peakPageCacheBytes)}; peak from a kill: ${peakFromKill}; derived ${bytesOrNone(cap.derivedBytes)}; suffix: ${suffix}`,
+    `working set: before ${workingSetText(workingSet.before)}; peak ${workingSetText(workingSet.peak)}; after ${workingSetText(workingSet.after)}`,
+    `failed readings: run ${results.failedReadings}; ${listOrNone(shardReadings)}`,
+    `modes: run directory ${modes.runDir}; tarball ${shownOrNone(modes.tarball)}; shard subdirectories ${listOrNone(shardModes)}`,
+    `timing: build ${timing.buildSeconds} s (base build ${timing.baseBuildSeconds} s); total ${timing.totalSeconds} s`,
+  ]
+}
+
+/**
+ * `summary.txt`'s text (b.uqm SR-16.2): every value of the results file but
+ * the shards' `inspection` data, one item per line, in a fixed layout, so the
+ * same results always give the same text. It lists each failure with its
+ * shard (`run` for none), each skipped check, each cleanup failure and the
+ * failed-reading counts for the run and each shard, and ends with
+ * `SUMMARY_TIMING_HEADING` followed by the timing-summary lines verbatim and
+ * unindented (the shard-count line, the duration-table block with its tabs
+ * and, in a full run, the cap line). Redaction is the writer's.
+ */
+export function renderSummary(results: Results): string {
+  const lines = [
+    ...summaryHeadLines(results),
+    ...summaryProblemLines(results),
+    `shard records: ${results.shards.length}`,
+    ...results.shards.flatMap(summaryShardLines),
+    ...summaryScriptLines(results),
+    ...summaryRunFigureLines(results),
+    SUMMARY_TIMING_HEADING,
+    ...results.timingSummary,
+  ]
+  return `${lines.join('\n')}\n`
+}
+
+// The one writer of results.json and summary.txt (b.uqm SR-5.6, SR-5.7, SR-15.3).
+
+/**
+ * The redactor the writer applies (E11's, passed in by E13; b.uqm SR-15.3):
+ * `results` returns the results with every scanned value replaced by
+ * `<redacted>` and their shape kept; `text` does the same in a text.
+ */
+export interface ResultsRedactor {
+  readonly results: (results: Results) => Results
+  readonly text: (text: string) => string
+}
+
+/** Each file's write outcome. */
+export interface ResultsFilesWrite {
+  /** `results.json`'s. */
+  readonly results: WriteResult
+  /** `summary.txt`'s. */
+  readonly summary: WriteResult
+}
+
+/** Builds a file's content and replaces the file whole with it; a content builder that throws writes nothing and fails with its error on one line. */
+function writeBuiltFile(runDir: string, fileName: string, build: () => string): WriteResult {
+  let content: string
+  try {
+    content = build()
+  } catch (err) {
+    return { ok: false, error: `building ${fileName} failed: ${dependencyErrorText(err)}` }
+  }
+  return writeWholeFile(runDir, fileName, content)
+}
+
+/**
+ * Writes `results.json` and then `summary.txt` in the run directory, each
+ * whole through E1's `writeWholeFile` (a temporary `.<name>.tmp` in the run
+ * directory, then a rename), so a second call replaces both whole (b.uqm
+ * SR-5.6, SR-5.7 step 5). The redactor is applied first to the results value,
+ * the verdict included; `results.json` is that value through E1's
+ * `serializeResults`, and `summary.txt` is `renderSummary` of it with the text
+ * redactor applied on top (b.uqm SR-15.3). Nothing unredacted is ever
+ * written: a redactor that throws fails both files and writes neither. A
+ * results value off E1's shape fails `results.json` only, and the summary is
+ * still written. Never throws; each outcome is reported.
+ */
+export function writeResultsFiles(runDir: string, results: Results, redactor: ResultsRedactor): ResultsFilesWrite {
+  let redacted: Results
+  try {
+    redacted = redactor.results(results)
+  } catch (err) {
+    const failed: WriteResult = { ok: false, error: `redacting the results failed: ${dependencyErrorText(err)}` }
+    return { results: failed, summary: failed }
+  }
+  return {
+    results: writeBuiltFile(runDir, RESULTS_FILE_NAME, () => serializeResults(redacted)),
+    summary: writeBuiltFile(runDir, SUMMARY_FILE_NAME, () => redactor.text(renderSummary(redacted))),
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 15. Integrity and secret-scan (E11)
 // ---------------------------------------------------------------------------

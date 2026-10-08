@@ -672,6 +672,1115 @@ describe('E1: results.json (b.uqm SR-16.1)', () => {
 // ---------------------------------------------------------------------------
 // E10: outcomes, verdict and results (b.t6s E10)
 // ---------------------------------------------------------------------------
+//
+// E10's region (b.t6s E10 T4; b.uqm SR-3.6, SR-12.1, SR-12.3, SR-12.4,
+// SR-12.5, SR-16.1, SR-16.2, SR-19.6), through section 14's exports:
+// - shard outcomes: the end marker decides, the causes' precedence, the two
+//   end-line forms, an out-of-memory line in place of any end line, and the
+//   scripts each shard records;
+// - a failing prerequisite and the pass condition;
+// - each script's line, the failure ranking and the chosen line;
+// - the verdict's shapes, the double guard and N = 1;
+// - `results.json`'s value and the one redacted writer of it and
+//   `summary.txt`; the summary and the timing summary.
+//
+// The other Epics' lines (run-level, image build, integrity, out-of-memory,
+// timing, cap and shard-count lines) are constructed, opaque inputs whose
+// wording is never asserted. Each cause text and each line form is pinned
+// once against the SRD's wording; every other expected line comes from
+// section 14's builders. Script names come from the repository's listing.
+// The region's imports are namespaces and its helpers live inside its
+// describe, so no name can collide with another region's.
+
+import * as e10 from '../scripts/ci-run.ts'
+import * as e10Credentials from './test-helpers/credentials.ts'
+import * as e10Helpers from './test-helpers/ci-run.ts'
+
+describe('E10: outcomes, verdict and results (b.t6s E10 T4)', () => {
+  // --- Factories and the file-name lookup (T4.S1; extended by T4.S2–T4.S6) ---
+
+  /** The repository's real file name for script number n, looked up when a case runs. */
+  const script = (n: number): string => realScriptFileName(n)
+  /** Script number n's number form, `test-<n>`, through E1's builder. */
+  const numberForm = (n: number): string => e10.numberFormOf(n)
+  /** A fault's normalized text, through E1's builder. */
+  const faultTextOf = (fault: e10.Fault): string => e10.faultText(fault)
+
+  /** A script that ran to its end: its `start` and `end` lines. */
+  const ran = (fileName: string, result: ScriptResult = RESULT_WORD_PASS, seconds = 1.5): ResultEvent[] => [startEvent(fileName), endEvent(fileName, result, seconds)]
+
+  const pinnedId = (): string => `sha256:${hexValue('e10-pinned', SHA256_HEX_LENGTH)}`
+
+  const startCommon = (shard: number) => ({ shard, imageId: pinnedId(), mounts: [], nameInUse: false, canary: hexValue(`e10-canary-${shard}`, CANARY_LENGTH) })
+  const started = (shard: number): e10.ShardStart => ({ kind: 'started', ...startCommon(shard), startedAtMs: 0 })
+  const failedStart = (shard: number, detail: string): e10.ShardStart => ({ kind: 'failed-to-start', ...startCommon(shard), detail })
+
+  const wallTime = (minutes = 30): e10.ShardCause => ({ kind: 'wall-time-limit', minutes, fixedByRunner: true })
+  const killed = (): e10.ShardCause => ({ kind: 'killed', fixedByRunner: true })
+  const stoppedBy = (by: e10.StopKind): e10.ShardCause => ({ kind: 'stopped', by, fixedByRunner: true })
+  const exitedWith = (code: number): e10.ShardCause => ({ kind: 'container-exited', code, fixedByRunner: false })
+  const failedToStart = (detail: string): e10.ShardCause => ({ kind: 'failed-to-start', detail, fixedByRunner: false })
+  const MARKER_MISSING: e10.ShardCause = { kind: 'image-marker-missing', fixedByRunner: false }
+  const NO_RESULT_FILE: e10.ShardCause = { kind: 'no-result-file', fixedByRunner: false }
+  const RESULT_FILE_UNREADABLE: e10.ShardCause = { kind: 'result-file-unreadable', fixedByRunner: false }
+
+  /** Every cause the runner fixes itself before a stop it makes (b.uqm SR-12.1). */
+  const RUNNER_FIXED_CAUSES: [string, e10.ShardCause][] = [
+    ['its wall-time limit', wallTime()],
+    ['a kill: fault', killed()],
+    ['an interrupt', stoppedBy('interrupt')],
+    ['the memory watchdog', stoppedBy('memory-watchdog')],
+    ['the run deadline', stoppedBy('run-deadline')],
+  ]
+
+  // Constructed lines of other Epics: opaque, distinct, each beginning FAIL:.
+  const RUN_LEVEL_LINE = `${FAIL_PREFIX}constructed run-level stop line`
+  const IMAGE_BUILD_LINE = `${FAIL_PREFIX}constructed image build line`
+  /** An integrity failure, with its shard number or null as E11 gives it; its check name only satisfies the type, and no case relies on it. */
+  const integrityFailure = (n: number, check: e10.IntegrityCheck, shard: number | null = null): e10.Failure => ({ line: `${FAIL_PREFIX}constructed integrity line ${n}`, shard, failureClass: { kind: 'integrity', check } })
+  const oomShardLine = (shard: number): string => `${FAIL_PREFIX}${SHARD_DIR_PREFIX}${shard}: constructed out-of-memory kill line`
+  const oomScriptLine = (fileName: string, shard: number): string => `${FAIL_PREFIX}${fileName}: constructed out-of-memory kill line in ${SHARD_DIR_PREFIX}${shard}`
+  const oomUnreadableLine = (shard: number): string => `${FAIL_PREFIX}${SHARD_DIR_PREFIX}${shard}: constructed out-of-memory status unreadable line`
+  /** The FAIL line a constructed script log holds, distinct per script and shard. */
+  const scriptFailLine = (fileName: string, shard: number): string => `${FAIL_PREFIX}${fileName}: constructed failure, shard ${shard}`
+
+  /** Inspection data with recognizable values, for the summary's no-inspection case. */
+  function inspectionData(shard: number): e10.InspectionData {
+    return {
+      name: `e10-inspection-name-${hexValue(`e10-name-${shard}`, 12)}`,
+      imageId: pinnedId(),
+      mounts: [{ source: join(root, `e10-mount-source-${hexValue(`e10-mount-${shard}`, 12)}`), target: '/results', readOnly: false }],
+      networkMode: 'none',
+      pidMode: '',
+      ipcMode: 'private',
+      privileged: false,
+      memoryBytes: SHARD_MEMORY_CAP_BYTES,
+      memorySwapBytes: SHARD_MEMORY_CAP_BYTES,
+      pidsLimit: SHARD_PIDS_LIMIT,
+      nanoCpus: CPUS_PER_SHARD * 1e9,
+      labels: { [CI_LABEL]: CI_LABEL_VALUE, 'e10-inspection-label': hexValue(`e10-label-${shard}`, 16) },
+      autoRemove: false,
+    }
+  }
+
+  type EvidenceChange = Partial<Omit<e10.ShardEvidence, 'shard'>>
+
+  /** A shard's whole evidence: by default started, assigned test-1 to test-3, with no recorded cause, exit or out-of-memory line; and a stated change. */
+  function evidenceOf(shard: number, change: EvidenceChange = {}): e10.ShardEvidence {
+    return {
+      shard,
+      assigned: [script(1), script(2), script(3)],
+      expectedSeconds: 600,
+      limitMinutes: 30,
+      endedNormally: false,
+      end: e10.NORMAL_SHARD_END,
+      seconds: 61.5,
+      anonPeak: { bytes: 1_073_741_824, pageCacheBytes: 268_435_456, mark: null },
+      peakPids: 40,
+      final: { oomKilled: false, oomKillCount: 0 },
+      failedReadings: 0,
+      packageSha256: hexValue('e10-package', SHA256_HEX_LENGTH),
+      dependencyFingerprint: hexValue('e10-fingerprint', SHA256_HEX_LENGTH),
+      imageId: pinnedId(),
+      inspection: null,
+      inspectionError: null,
+      start: started(shard),
+      canary: hexValue(`e10-canary-${shard}`, CANARY_LENGTH),
+      resultFile: { kind: 'missing' },
+      fixedCause: null,
+      exitCode: null,
+      oomLine: null,
+      ...change,
+    }
+  }
+
+  type ShardDirContent = Omit<e10Helpers.ShardDirSpec, 'shard'>
+
+  /** A shard's outcome read from its subdirectory, built by E1's run-directory builder; null content: the subdirectory was never made. */
+  function outcomeOnDisk(evidence: e10.ShardEvidence, content: ShardDirContent | null): e10.ShardOutcome {
+    const runDir = newRunDir()
+    const shardDir = content === null ? join(runDir, `${SHARD_DIR_PREFIX}${evidence.shard}`) : writeShardDir(runDir, { ...content, shard: evidence.shard })
+    return e10.readShardOutcome(evidence, shardDir)
+  }
+
+  /** A shard in memory: its evidence, its result file's events (none: no result file) and its script logs by file name. */
+  interface ShardSpec {
+    readonly evidence: e10.ShardEvidence
+    readonly events?: readonly ResultEvent[]
+    readonly logs?: Readonly<Record<string, string>>
+  }
+
+  /** Every assigned script passed and the end marker was written. */
+  const passingShard = (shard: number, assigned: readonly string[], change: EvidenceChange = {}): ShardSpec => ({
+    evidence: evidenceOf(shard, { ...change, assigned }),
+    events: [...assigned.flatMap((fileName) => ran(fileName)), DONE_EVENT],
+  })
+
+  /** The shard stopped at `failing`'s failure (its log holds `scriptFailLine`), recorded the rest `notrun` and wrote the end marker. */
+  function failingShard(shard: number, assigned: readonly string[], failing: string, change: EvidenceChange = {}): ShardSpec {
+    const at = assigned.indexOf(failing)
+    if (at < 0) throw new Error(`failingShard: ${failing} is not assigned`)
+    return {
+      evidence: evidenceOf(shard, { ...change, assigned }),
+      events: [...assigned.slice(0, at).flatMap((fileName) => ran(fileName)), ...ran(failing, RESULT_WORD_FAIL), ...assigned.slice(at + 1).map((fileName) => notRunEvent(fileName)), DONE_EVENT],
+      logs: { [failing]: `constructed output\n${scriptFailLine(failing, shard)}\n` },
+    }
+  }
+
+  /** The runner stopped the shard with `inProgress` running, its cause recorded first. */
+  function stoppedShard(shard: number, assigned: readonly string[], inProgress: string, cause: e10.ShardCause, change: EvidenceChange = {}): ShardSpec {
+    const at = assigned.indexOf(inProgress)
+    if (at < 0) throw new Error(`stoppedShard: ${inProgress} is not assigned`)
+    return { evidence: evidenceOf(shard, { ...change, assigned, fixedCause: cause }), events: [...assigned.slice(0, at).flatMap((fileName) => ran(fileName)), startEvent(inProgress)] }
+  }
+
+  /** No result file, and the container exited on its own: a shard line. */
+  const exitedShard = (shard: number, assigned: readonly string[], code = 1): ShardSpec => ({ evidence: evidenceOf(shard, { assigned, exitCode: code }) })
+
+  function outcomeOf(spec: ShardSpec): e10.ShardOutcome {
+    const read: e10.ResultFileRead = spec.events === undefined ? { kind: 'missing' } : { kind: 'events', events: spec.events }
+    const scripts = e10.shardScriptsOf(read, spec.evidence.assigned, (fileName): e10.FileTextRead => {
+      const text = spec.logs?.[fileName]
+      return text === undefined ? { kind: 'missing' } : { kind: 'text', text }
+    })
+    return e10.decideShardOutcome(spec.evidence, scripts, false)
+  }
+
+  /** The invocation of `/ci <args>`, through E1's parser. */
+  function invocationOf(args: readonly string[]): e10.Invocation {
+    const parsed = e10.parseCiArguments(args)
+    if (!parsed.ok) throw new Error(`invocationOf: ${parsed.failures.map((failure) => failure.reason).join('; ')}`)
+    return parsed.invocation
+  }
+
+  /** A run's context: its `/ci` arguments, its shards, its expected scripts (default: every assigned one) and the other Epics' lines. */
+  interface RunSpec {
+    readonly args?: readonly string[]
+    readonly shards: readonly ShardSpec[]
+    readonly expected?: readonly string[]
+    readonly runLevelLine?: string
+    readonly imageBuildLine?: string
+    readonly integrity?: readonly e10.Failure[]
+  }
+
+  interface DecidedRun {
+    readonly invocation: e10.Invocation
+    readonly outcomes: readonly e10.ShardOutcome[]
+    readonly shardInputs: readonly e10.ResultsShardInput[]
+    readonly ranked: readonly e10.Failure[]
+    readonly passed: boolean
+    readonly expected: readonly string[]
+  }
+
+  /** Decides every shard's outcome, ranks every failure and decides the pass condition, through section 14. */
+  function decideRun(spec: RunSpec): DecidedRun {
+    const invocation = invocationOf(spec.args ?? [])
+    const outcomes = spec.shards.map(outcomeOf)
+    const expected = spec.expected ?? [...new Set(spec.shards.flatMap((shard) => shard.evidence.assigned))]
+    const sources: e10.FailureSources = { runLevelLine: spec.runLevelLine ?? null, imageBuildLine: spec.imageBuildLine ?? null, integrityFailures: spec.integrity ?? [], outcomes }
+    return {
+      invocation,
+      outcomes,
+      shardInputs: spec.shards.map((shard, index) => ({ evidence: shard.evidence, outcome: outcomes[index] as e10.ShardOutcome })),
+      ranked: e10.rankFailures(sources),
+      passed: e10.runPasses({ expectedScripts: expected, shardsUsed: outcomes.map((outcome) => outcome.shard), outcomes, otherFailures: e10.otherFailuresOf(sources) }),
+      expected,
+    }
+  }
+
+  const verdictOf = (run: DecidedRun): string => e10.buildVerdictLine({ invocation: run.invocation, scripts: run.expected, passed: run.passed, ranked: run.ranked })
+  const linesOf = (failures: readonly e10.Failure[]): string[] => failures.map((failure) => failure.line)
+
+  /** The timing summary's groups, recognizable lines whose wording is never asserted; the duration-table block holds real tabs. */
+  function timingGroups(change: Partial<e10.TimingSummaryGroups> = {}): e10.TimingSummaryGroups {
+    return {
+      shardCountLine: 'constructed shard-count line',
+      runTimes: ['constructed build time line', 'constructed shard time line', 'constructed total time line'],
+      scriptTimes: ['constructed script time line 1', 'constructed script time line 2'],
+      durationTableBlock: ['constructed block intro line', 'constructed\tblock\trow'],
+      slowLines: ['constructed slow line'],
+      tableNotes: ['constructed table note'],
+      capLine: 'constructed cap line',
+      ...change,
+    }
+  }
+
+  /** Everything `results.json` is assembled from, for a decided run, with recognizable figures; and a stated change. */
+  function resultsInputsOf(run: DecidedRun, change: Partial<e10.ResultsInputs> = {}): e10.ResultsInputs {
+    return {
+      runId: RUN_ID,
+      pid: RUNNER_PID,
+      invocation: run.invocation,
+      packageSha256: hexValue('e10-package', SHA256_HEX_LENGTH),
+      images: { pinnedId: pinnedId(), driftId: null, retagId: null, retagMoved: false },
+      verdict: verdictOf(run),
+      shards: run.shardInputs,
+      shardCount: { requested: 5, effective: 4, admitted: 3, started: 3, reasons: ['constructed shard-count reason'] },
+      cap: { usedBytes: 12_884_901_888, peakBytes: 9_663_676_416, peakShard: 2, peakPageCacheBytes: 1_288_490_188, peakFromKill: false, derivedBytes: 11_811_160_064, suffix: 'constructed cap suffix' },
+      workingSet: { before: { bytes: 31_000_000_001, anonBytes: 21_000_000_001, activeFileBytes: 10_000_000_001 }, peak: { bytes: 41_000_000_002, anonBytes: 30_000_000_002, activeFileBytes: 11_000_000_002 }, after: null },
+      failedReadings: 7,
+      modes: { runDir: e10.RUN_DIR_MODE, tarball: 0o444, shardDirs: Object.fromEntries(run.outcomes.map((outcome) => [`${SHARD_DIR_PREFIX}${outcome.shard}`, e10.RUN_DIR_MODE])) },
+      failures: run.ranked,
+      skippedChecks: ['schedule-coverage'],
+      cleanupFailures: ['constructed cleanup failure line'],
+      timing: { buildSeconds: 61.25, baseBuildSeconds: 12.5, totalSeconds: 905.75 },
+      timingGroups: timingGroups(),
+      ...change,
+    }
+  }
+
+  /**
+   * A three-shard full run, given out of shard order: shard 3 stopped at its
+   * limit with test-5 in progress; shard 1 stopped at test-2's failure (with
+   * inspection data); shard 2 passed but has an out-of-memory line; and one
+   * integrity failure.
+   */
+  function standardRunSpec(): RunSpec {
+    const [t1, t2, t3, t4, t5] = [1, 2, 3, 4, 5].map(script) as [string, string, string, string, string]
+    return {
+      args: ['--shards', '3'],
+      integrity: [integrityFailure(1, 'results-canary')],
+      shards: [
+        stoppedShard(3, [t1, t5], t5, wallTime(), { final: { oomKilled: UNREADABLE_READING, oomKillCount: UNREADABLE_READING }, failedReadings: 5, anonPeak: { bytes: null, pageCacheBytes: null, mark: 'unknown' } }),
+        failingShard(1, [t1, t2, t3], t2, { inspection: inspectionData(1), seconds: 333.25 }),
+        passingShard(2, [t1, t4], { oomLine: oomShardLine(2), failedReadings: 3, inspectionError: 'constructed inspect error\nits second line', anonPeak: { bytes: 2_147_483_648, pageCacheBytes: 536_870_912, mark: 'partial' }, peakPids: 77 }),
+      ],
+    }
+  }
+
+  const identityRedactor: e10.ResultsRedactor = { results: (results) => results, text: (text) => text }
+
+  /** Writes the run's files through the one writer, asserting both writes succeed, and answers their paths. */
+  function writeBoth(runDir: string, results: Results, redactor: e10.ResultsRedactor = identityRedactor): { results: string; summary: string } {
+    expect(e10.writeResultsFiles(runDir, results, redactor)).toEqual({ results: { ok: true }, summary: { ok: true } })
+    return { results: join(runDir, e10.RESULTS_FILE_NAME), summary: join(runDir, e10.SUMMARY_FILE_NAME) }
+  }
+
+  /** `results.json` read back through E1's strict parser. */
+  function parsedResults(path: string): Results {
+    const parsed = parseResults(readFileSync(path, 'utf-8'))
+    if (!parsed.ok) throw new Error(`parsedResults: ${path} does not parse`)
+    return parsed.value
+  }
+
+  /** The standard run's `results.json` value, with a stated change to its inputs. */
+  const assembled = (change: Partial<e10.ResultsInputs> = {}): Results => e10.assembleResults(resultsInputsOf(decideRun(standardRunSpec()), change))
+
+  /** A redactor, built here (E11 owns the real one), masking `values` in the results and `values` plus `textOnly` in the summary text. */
+  function maskingRedactor(values: readonly string[], textOnly: readonly string[] = []): e10.ResultsRedactor {
+    const masked = (text: string, all: readonly string[]): string => all.reduce((out, value) => out.replaceAll(value, e10.REDACTION_PLACEHOLDER), text)
+    const deep = (value: unknown): unknown => {
+      if (typeof value === 'string') return masked(value, values)
+      if (Array.isArray(value)) return value.map(deep)
+      if (value !== null && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, inner]) => [key, deep(inner)]))
+      return value
+    }
+    return { results: (results) => deep(results) as Results, text: (text) => masked(text, [...values, ...textOnly]) }
+  }
+
+  /** A leaf's place in a results value: its keys and array indexes from the top. */
+  type LeafPath = readonly (string | number)[]
+
+  /** Every leaf of a results value (string, number, boolean or null) with its path, `inspection` data left out. */
+  function leavesOf(results: Results): { path: LeafPath; value: unknown }[] {
+    const leaves: { path: LeafPath; value: unknown }[] = []
+    const walk = (value: unknown, path: LeafPath): void => {
+      if (path[path.length - 1] === 'inspection') return
+      if (Array.isArray(value)) value.forEach((inner, index) => walk(inner, [...path, index]))
+      else if (value !== null && typeof value === 'object') for (const [key, inner] of Object.entries(value)) walk(inner, [...path, key])
+      else leaves.push({ path, value })
+    }
+    walk(results, [])
+    return leaves
+  }
+
+  /** The first of the seven-digit numbers `distinctiveResults` gives. */
+  const DISTINCT_NUMBER_BASE = 7_300_000
+
+  /**
+   * A results value with every string and number but the `inspection` data
+   * replaced by its own value: numbers by seven-digit numbers, strings by
+   * fixed-width marks, none inside another or inside the summary's own text.
+   * A value found in the summary can then only have come from its own place,
+   * and the verdict differs from every failure line. Only for rendering: the
+   * value no longer satisfies E1's shape.
+   */
+  function distinctiveResults(results: Results): Results {
+    let next = 0
+    const remap = (value: unknown, key: string | number | null): unknown => {
+      if (key === 'inspection') return value
+      if (typeof value === 'number') return DISTINCT_NUMBER_BASE + next++
+      if (typeof value === 'string') return `e10-shown-${String(next++).padStart(4, '0')}`
+      if (Array.isArray(value)) return value.map((inner, index) => remap(inner, index))
+      if (value !== null && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([innerKey, inner]) => [innerKey, remap(inner, innerKey)]))
+      return value
+    }
+    return remap(results, null) as Results
+  }
+
+  /** A copy of a results value with the boolean at `path` flipped. */
+  function withFlipped(results: Results, path: LeafPath): Results {
+    type Node = Record<string | number, unknown>
+    const copy = structuredClone(results)
+    const parent = path.slice(0, -1).reduce<Node>((at, key) => at[key] as Node, copy as unknown as Node)
+    const last = path[path.length - 1] as string | number
+    parent[last] = !parent[last]
+    return copy
+  }
+
+  // --- T4.S1: shard outcomes and the precedence of their causes (b.uqm SR-12.1) ---
+
+  describe('E10: shard outcomes and their causes (b.uqm SR-12.1)', () => {
+    test.each([
+      ['a wall-time limit', wallTime(93), 'wall-time limit of 93 min exceeded'],
+      ['an exit', exitedWith(137), 'container exited 137'],
+      ['a kill: fault', killed(), 'killed'],
+      ['an interrupt', stoppedBy('interrupt'), 'stopped by interrupt'],
+      ['the memory watchdog', stoppedBy('memory-watchdog'), 'stopped by memory watchdog'],
+      ['the run deadline', stoppedBy('run-deadline'), 'stopped by run deadline'],
+      ['a failed start', failedToStart('constructed start error'), 'container failed to start: constructed start error'],
+      ['a missing image marker', MARKER_MISSING, 'image marker missing'],
+      ['a missing result file', NO_RESULT_FILE, 'no result file'],
+      ['an unreadable result file', RESULT_FILE_UNREADABLE, 'result file unreadable'],
+    ] as [string, e10.ShardCause, string][])('pin: the cause text of %s is SR-12.1’s wording', (_what, cause, text) => {
+      expect(e10.shardCauseText(cause)).toBe(text)
+    })
+
+    test('pin: the end-line forms are SR-12.1’s, and a normal end is "normal" (SR-16.1)', () => {
+      const fileName = script(23)
+      expect(e10.scriptEndLine(fileName, 2, killed())).toBe(`FAIL: ${fileName}: killed in shard-2`)
+      expect(e10.shardEndLine(2, killed())).toBe('FAIL: shard-2: killed')
+      expect(e10.NORMAL_SHARD_END).toBe('normal')
+    })
+
+    test.each([
+      ['an exit 0', { exitCode: 0 }],
+      ['an exit 1', { exitCode: 1 }],
+      ['an exit 137', { exitCode: 137 }],
+      ['a recorded interrupt stop and exit 137', { exitCode: 137, fixedCause: stoppedBy('interrupt') }],
+      ['a recorded wall-time limit with the container still running', { fixedCause: wallTime() }],
+    ] as [string, EvidenceChange][])('a readable result file holding the end marker ended normally, with no cause and no failure, after %s', (_what, change) => {
+      const evidence = evidenceOf(1, change)
+      const outcome = outcomeOnDisk(evidence, { resultFile: [...evidence.assigned.flatMap((fileName) => ran(fileName)), DONE_EVENT] })
+      expect(outcome).toMatchObject({ endedNormally: true, cause: null, end: e10.NORMAL_SHARD_END, endFailure: null, failures: [] })
+      expect(outcome.scripts.map((entry) => entry.result)).toEqual(evidence.assigned.map(() => RESULT_WORD_PASS))
+    })
+
+    test.each([
+      ['its wall-time limit', { fixedCause: wallTime() }, wallTime()],
+      ['an exit on its own', { exitCode: 1 }, exitedWith(1)],
+      ['a kill: fault', { fixedCause: killed() }, killed()],
+      ['an interrupt', { fixedCause: stoppedBy('interrupt') }, stoppedBy('interrupt')],
+      ['the memory watchdog', { fixedCause: stoppedBy('memory-watchdog') }, stoppedBy('memory-watchdog')],
+      ['the run deadline', { fixedCause: stoppedBy('run-deadline') }, stoppedBy('run-deadline')],
+    ] as [string, EvidenceChange, e10.ShardCause][])('an end by %s with a script in progress takes the script form, ranked as that script’s failure', (_what, change, cause) => {
+      const evidence = evidenceOf(2, change)
+      const [first, second] = evidence.assigned
+      const outcome = outcomeOnDisk(evidence, { resultFile: [...ran(first), startEvent(second)] })
+      const line = e10.scriptEndLine(second, 2, cause)
+      expect(e10.causeTakesScriptEndLine(cause)).toBe(true)
+      expect(outcome.cause).toEqual(cause)
+      expect(outcome.end).toBe(line)
+      expect(outcome.endFailure).toEqual({ line, shard: 2, failureClass: { kind: 'script', fileName: second } })
+    })
+
+    test.each([
+      ['its wall-time limit, no script in progress', { fixedCause: wallTime() }, (assigned: readonly string[]) => ({ resultFile: ran(assigned[0] as string) }), wallTime()],
+      ['an exit on its own, no result file', { exitCode: 1 }, () => ({}), exitedWith(1)],
+      ['a kill: fault, an empty result file', { fixedCause: killed() }, () => ({ resultFile: [] }), killed()],
+      ['an interrupt, no result file', { fixedCause: stoppedBy('interrupt') }, () => ({}), stoppedBy('interrupt')],
+      ['the memory watchdog, no result file', { fixedCause: stoppedBy('memory-watchdog') }, () => ({}), stoppedBy('memory-watchdog')],
+      ['the run deadline, no result file', { fixedCause: stoppedBy('run-deadline') }, () => ({}), stoppedBy('run-deadline')],
+      ['a failed start whose detail spans lines', { start: failedStart(3, 'constructed start error\n  its second line\r\n') }, null, failedToStart('constructed start error\n  its second line\r\n')],
+      ['no result file and no other cause', {}, () => ({}), NO_RESULT_FILE],
+      ['an unreadable result file', {}, (assigned: readonly string[]) => ({ resultFile: { events: ran(assigned[0] as string), malformed: { at: 1, change: 'carriage-return' as const } } }), RESULT_FILE_UNREADABLE],
+    ] as [string, EvidenceChange, ((assigned: readonly string[]) => ShardDirContent) | null, e10.ShardCause][])(
+      'an end by %s takes the shard form, FAIL: shard-<k>: <cause>, on one line',
+      (_what, change, content, cause) => {
+        const evidence = evidenceOf(3, change)
+        const outcome = outcomeOnDisk(evidence, content === null ? null : content(evidence.assigned))
+        const line = e10.shardEndLine(3, cause)
+        expect(outcome.cause).toEqual(cause)
+        expect(outcome.end).toBe(line)
+        expect(line).not.toMatch(/[\r\n]/)
+        expect(outcome.endFailure).toEqual({ line, shard: 3, failureClass: { kind: 'shard' } })
+      },
+    )
+
+    test('a failed start’s multi-line detail is written on one line', () => {
+      expect(e10.shardEndLine(3, failedToStart('constructed start error\n  its second line\r\n'))).toBe(e10.shardEndLine(3, failedToStart('constructed start error its second line')))
+    })
+
+    test('a cause that never takes the script form gives the shard form even with a script in progress, and that script is fail with the shard line', () => {
+      const evidence = evidenceOf(4, { exitCode: e10.MARKER_REFUSAL_EXIT_STATUS })
+      const [first, second, third] = evidence.assigned
+      const outcome = outcomeOnDisk(evidence, { resultFile: [startEvent(first)], dockerLog: `${e10.MARKER_REFUSAL_LINE}\n` })
+      const line = e10.shardEndLine(4, MARKER_MISSING)
+      expect(e10.causeTakesScriptEndLine(MARKER_MISSING)).toBe(false)
+      expect(outcome.end).toBe(line)
+      expect(outcome.scripts).toEqual([
+        { script: first, shard: 4, result: RESULT_WORD_FAIL, seconds: null, failLine: line },
+        { script: second, shard: 4, result: RESULT_WORD_NOTRUN, seconds: null, failLine: null },
+        { script: third, shard: 4, result: RESULT_WORD_NOTRUN, seconds: null, failLine: null },
+      ])
+      expect(outcome.failures).toEqual([{ line, shard: 4, failureClass: { kind: 'shard' } }])
+    })
+
+    // SR-12.1's precedence, one case per adjacent pair with both causes
+    // present, each end in the shard form. (5) and (6) cannot both hold, a
+    // result file being either unreadable or missing.
+    test.each([
+      ['(1) a cause the runner fixed over (2) a failed start', { fixedCause: stoppedBy('interrupt'), start: failedStart(1, 'constructed start error') }, null, stoppedBy('interrupt')],
+      ['(2) a failed start over (3) a missing image marker', { start: failedStart(1, 'constructed start error'), exitCode: e10.MARKER_REFUSAL_EXIT_STATUS }, () => ({ dockerLog: `${e10.MARKER_REFUSAL_LINE}\n` }), failedToStart('constructed start error')],
+      ['(3) a missing image marker over (4) its exit 2', { exitCode: e10.MARKER_REFUSAL_EXIT_STATUS }, () => ({ dockerLog: `${e10.MARKER_REFUSAL_LINE}\n` }), MARKER_MISSING],
+      ['(4) an exit over (5) an unreadable result file', { exitCode: 1 }, () => ({ resultFile: { events: [DONE_EVENT], malformed: { at: 0, change: 'uppercase-word' as const } } }), exitedWith(1)],
+    ] as [string, EvidenceChange, (() => ShardDirContent) | null, e10.ShardCause][])('precedence: %s', (_what, change, content, cause) => {
+      const outcome = outcomeOnDisk(evidenceOf(1, change), content === null ? null : content())
+      expect(outcome.cause).toEqual(cause)
+      expect(outcome.end).toBe(e10.shardEndLine(1, cause))
+    })
+
+    test.each(RUNNER_FIXED_CAUSES)('a stop by %s followed by exit 137 keeps its recorded cause: no line says container exited 137 (AC 37)', (_what, cause) => {
+      const evidence = evidenceOf(2, { fixedCause: cause, exitCode: 137 })
+      const [first, second] = evidence.assigned
+      const outcome = outcomeOnDisk(evidence, { resultFile: [...ran(first), startEvent(second)] })
+      expect(outcome.cause).toEqual(cause)
+      expect(outcome.end).toBe(e10.scriptEndLine(second, 2, cause))
+      const lines = [outcome.end, ...outcome.scripts.map((entry) => entry.failLine ?? ''), ...linesOf(outcome.failures)]
+      expect(lines.filter((line) => line.includes(e10.containerExitedCauseText(137)))).toEqual([])
+    })
+
+    test.each([
+      ['exit 2 with Docker logs that lack the line', e10.MARKER_REFUSAL_EXIT_STATUS, () => 'constructed docker output\n', exitedWith(e10.MARKER_REFUSAL_EXIT_STATUS)],
+      ['exit 2 with the line only inside another line', e10.MARKER_REFUSAL_EXIT_STATUS, () => `prefix ${e10.MARKER_REFUSAL_LINE}\n`, exitedWith(e10.MARKER_REFUSAL_EXIT_STATUS)],
+      ['exit 2 with no saved Docker logs', e10.MARKER_REFUSAL_EXIT_STATUS, () => undefined, exitedWith(e10.MARKER_REFUSAL_EXIT_STATUS)],
+      ['exit 1 with the line in its Docker logs', 1, () => `${e10.MARKER_REFUSAL_LINE}\n`, exitedWith(1)],
+    ] as [string, number, () => string | undefined, e10.ShardCause][])('image marker missing needs exit 2 and the marker refusal line: %s gives container exited', (_what, exitCode, dockerLog, cause) => {
+      const log = dockerLog()
+      const outcome = outcomeOnDisk(evidenceOf(1, { exitCode }), log === undefined ? {} : { dockerLog: log })
+      expect(outcome.cause).toEqual(cause)
+      expect(outcome.end).toBe(e10.shardEndLine(1, cause))
+    })
+
+    test('a shard never created after a run-level stop takes that stop’s cause, recorded for it, and every assigned script is notrun', () => {
+      const cause = stoppedBy('run-deadline')
+      const evidence = evidenceOf(5, { start: null, fixedCause: cause })
+      const outcome = outcomeOnDisk(evidence, null)
+      expect(outcome).toMatchObject({ endedNormally: false, cause, end: e10.shardEndLine(5, cause) })
+      expect(outcome.scripts.map((entry) => [entry.script, entry.result])).toEqual(evidence.assigned.map((fileName) => [fileName, RESULT_WORD_NOTRUN]))
+      expect(outcome.failures).toEqual([{ line: e10.shardEndLine(5, cause), shard: 5, failureClass: { kind: 'shard' } }])
+    })
+
+    test.each([
+      ['a shard that ended normally with every script passed', {}, (assigned: readonly string[]) => ({ resultFile: [...assigned.flatMap((fileName) => ran(fileName)), DONE_EVENT] }), true],
+      ['a shard stopped with a script in progress', { fixedCause: stoppedBy('interrupt') }, (assigned: readonly string[]) => ({ resultFile: [...ran(assigned[0] as string), startEvent(assigned[1] as string)] }), false],
+      ['a shard with no result file that exited', { exitCode: 137 }, () => ({}), false],
+    ] as [string, EvidenceChange, (assigned: readonly string[]) => ShardDirContent, boolean][])('an out-of-memory line takes the place of any end line: %s', (_what, change, content, endedNormally) => {
+      const oomLine = oomShardLine(6)
+      const evidence = evidenceOf(6, { ...change, oomLine })
+      const outcome = outcomeOnDisk(evidence, content(evidence.assigned))
+      expect(outcome.endedNormally).toBe(endedNormally)
+      expect(outcome.end).toBe(oomLine)
+      expect(outcome.failures).toEqual([{ line: oomLine, shard: 6, failureClass: { kind: 'out-of-memory' } }])
+      expect(outcome.endFailure).toEqual(outcome.failures[0] as e10.Failure)
+    })
+
+    test('an assigned script without a result is notrun; the script in progress is fail with no seconds and the end line, its only failure', () => {
+      const evidence = evidenceOf(2, { fixedCause: killed() })
+      const [first, second, third] = evidence.assigned
+      const outcome = outcomeOnDisk(evidence, { resultFile: [...ran(first, RESULT_WORD_PASS, 21.347), startEvent(second)] })
+      const line = e10.scriptEndLine(second, 2, killed())
+      expect(outcome.scripts).toEqual([
+        { script: first, shard: 2, result: RESULT_WORD_PASS, seconds: 21.347, failLine: null },
+        { script: second, shard: 2, result: RESULT_WORD_FAIL, seconds: null, failLine: line },
+        { script: third, shard: 2, result: RESULT_WORD_NOTRUN, seconds: null, failLine: null },
+      ])
+      expect(linesOf(outcome.failures)).toEqual([line])
+    })
+  })
+
+  // --- T4.S2: a failing prerequisite and the pass condition (b.uqm SR-3.6, SR-12.3) ---
+
+  describe('E10: a failing prerequisite and the pass condition (b.uqm SR-3.6, SR-12.3)', () => {
+    test('a failing prerequisite: test-3 is notrun after test-2 fails, the only failure is test-2’s line, the run fails, and the verdict is test-2’s line', () => {
+      const [t1, t2, t3] = [script(1), script(2), script(3)]
+      const evidence = evidenceOf(1, { assigned: [t1, t2, t3] })
+      const line = scriptFailLine(t2, 1)
+      const outcome = outcomeOnDisk(evidence, { resultFile: [...ran(t1), ...ran(t2, RESULT_WORD_FAIL), notRunEvent(t3), DONE_EVENT], scriptLogs: { [t2]: `${line}\n` } })
+      expect(outcome).toMatchObject({ endedNormally: true, end: e10.NORMAL_SHARD_END })
+      expect(outcome.scripts.map((entry) => [entry.script, entry.result, entry.failLine])).toEqual([
+        [t1, RESULT_WORD_PASS, null],
+        [t2, RESULT_WORD_FAIL, line],
+        [t3, RESULT_WORD_NOTRUN, null],
+      ])
+      const sources: e10.FailureSources = { runLevelLine: null, imageBuildLine: null, integrityFailures: [], outcomes: [outcome] }
+      const ranked = e10.rankFailures(sources)
+      expect(ranked).toEqual([{ line, shard: 1, failureClass: { kind: 'script', fileName: t2 } }])
+      const passed = e10.runPasses({ expectedScripts: [t1, t2, t3], shardsUsed: [1], outcomes: [outcome], otherFailures: [] })
+      expect(passed).toBe(false)
+      expect(e10.buildVerdictLine({ invocation: invocationOf([]), scripts: [], passed, ranked })).toBe(line)
+    })
+
+    test.each([
+      ['every expected script passed, test-1 in every shard used', (): RunSpec => ({ shards: [passingShard(1, [script(1), script(2)]), passingShard(2, [script(1), script(3)])] })],
+      ['a selective run, with no result for any script outside its expected list', (): RunSpec => ({ args: [numberForm(23)], shards: [passingShard(1, [script(1), script(23)])] })],
+    ])('the run passes: %s', (_what, spec) => {
+      expect(decideRun(spec()).passed).toBe(true)
+    })
+
+    test.each([
+      ['test-1 has no pass in one shard used', (): RunSpec => ({ shards: [passingShard(1, [script(1), script(2)]), passingShard(2, [script(3)])] })],
+      ['an expected script is notrun', (): RunSpec => ({ shards: [{ evidence: evidenceOf(1), events: [...ran(script(1)), ...ran(script(2)), notRunEvent(script(3)), DONE_EVENT] }] })],
+      ['an expected script has no result anywhere', (): RunSpec => ({ shards: [passingShard(1, [script(1), script(2)])], expected: [script(1), script(2), script(3)] })],
+      ['an all-pass shard has an out-of-memory line', (): RunSpec => ({ shards: [passingShard(1, [script(1), script(2)], { oomLine: oomShardLine(1) })] })],
+      ['an all-pass shard has a shard line', (): RunSpec => ({ shards: [{ evidence: evidenceOf(1, { fixedCause: stoppedBy('run-deadline') }), events: [...ran(script(1)), ...ran(script(2)), ...ran(script(3))] }] })],
+      ['an integrity line is given while every script passed', (): RunSpec => ({ shards: [passingShard(1, [script(1), script(2)])], integrity: [integrityFailure(1, 'package-hash')] })],
+      ['an image build line is given while every script passed', (): RunSpec => ({ shards: [passingShard(1, [script(1), script(2)])], imageBuildLine: IMAGE_BUILD_LINE })],
+      ['a run-level line is given while every script passed', (): RunSpec => ({ shards: [passingShard(1, [script(1), script(2)])], runLevelLine: RUN_LEVEL_LINE })],
+      ['the expected scripts lack test-1', (): RunSpec => ({ shards: [passingShard(1, [script(1), script(2)])], expected: [script(2)] })],
+    ])('the run fails: %s', (_what, spec) => {
+      expect(decideRun(spec()).passed).toBe(false)
+    })
+  })
+
+  // --- T4.S3: each script's line, the ranking and the chosen line (b.uqm SR-12.4) ---
+
+  describe('E10: the failure ranking and the chosen line (b.uqm SR-12.4)', () => {
+    test('pin: the fallback line is SR-12.4’s wording', () => {
+      const fileName = script(2)
+      expect(e10.noFailLineFallback(fileName)).toBe(`FAIL: ${fileName}: exited non-zero without explicit FAIL line`)
+    })
+
+    test.each([
+      ['the first FAIL: line wins over later ones', (f: string) => `setup\n${FAIL_PREFIX}${f}: the first\n${FAIL_PREFIX}${f}: the second\n`, (f: string) => `${FAIL_PREFIX}${f}: the first`],
+      ['a line with text before FAIL: is not taken', (f: string) => `note ${FAIL_PREFIX}${f}: quoted\n  ${FAIL_PREFIX}${f}: indented\n${FAIL_PREFIX}${f}: the real one\n`, (f: string) => `${FAIL_PREFIX}${f}: the real one`],
+      ['the line is kept unchanged, spaces and tabs included', (f: string) => `${FAIL_PREFIX}${f}:  two  spaces\tand a tab \n`, (f: string) => `${FAIL_PREFIX}${f}:  two  spaces\tand a tab `],
+      ['a last line without its line feed counts', (f: string) => `output\n${FAIL_PREFIX}${f}: no line feed`, (f: string) => `${FAIL_PREFIX}${f}: no line feed`],
+      ['FAIL: with no space after it is still a FAIL line, kept verbatim', (f: string) => `${FAIL_PREFIX.trimEnd()}${f}\n`, (f: string) => `${FAIL_PREFIX.trimEnd()}${f}`],
+      ['a log with no FAIL: line gives the fallback', (_f: string) => 'only output\nfail: in lower case\n', (f: string) => e10.noFailLineFallback(f)],
+      ['an empty log gives the fallback', (_f: string) => '', (f: string) => e10.noFailLineFallback(f)],
+      ['a missing log gives the fallback', (_f: string) => undefined, (f: string) => e10.noFailLineFallback(f)],
+    ] as [string, (fileName: string) => string | undefined, (fileName: string) => string][])('a failing script’s line: %s', (_what, log, expected) => {
+      const [t1, t2, t3] = [script(1), script(2), script(3)]
+      const text = log(t2)
+      const outcome = outcomeOnDisk(evidenceOf(1), { resultFile: [...ran(t1), ...ran(t2, RESULT_WORD_FAIL), notRunEvent(t3), DONE_EVENT], ...(text === undefined ? {} : { scriptLogs: { [t2]: text } }) })
+      expect(outcome.scripts[1]?.failLine).toBe(expected(t2))
+      expect(linesOf(outcome.failures)).toEqual([expected(t2)])
+    })
+
+    test.each([
+      ['the run-level line over the image build line', (): RunSpec => ({ shards: [passingShard(1, [script(1)])], runLevelLine: RUN_LEVEL_LINE, imageBuildLine: IMAGE_BUILD_LINE }), () => [RUN_LEVEL_LINE, IMAGE_BUILD_LINE]],
+      ['the image build line over an integrity line', (): RunSpec => ({ shards: [passingShard(1, [script(1)])], imageBuildLine: IMAGE_BUILD_LINE, integrity: [integrityFailure(1, 'secret-scan')] }), () => [IMAGE_BUILD_LINE, integrityFailure(1, 'secret-scan').line]],
+      ['an integrity line over an out-of-memory line', (): RunSpec => ({ shards: [passingShard(1, [script(1)], { oomLine: oomShardLine(1) })], integrity: [integrityFailure(1, 'secret-scan')] }), () => [integrityFailure(1, 'secret-scan').line, oomShardLine(1)]],
+      ['an out-of-memory line over a lower shard’s shard line', (): RunSpec => ({ shards: [exitedShard(1, [script(1)]), passingShard(2, [script(1)], { oomLine: oomShardLine(2) })] }), () => [oomShardLine(2), e10.shardEndLine(1, exitedWith(1))]],
+      ['a shard line over a lower shard’s script failure', (): RunSpec => ({ shards: [failingShard(1, [script(1), script(2)], script(2)), exitedShard(2, [script(1)])] }), () => [e10.shardEndLine(2, exitedWith(1)), scriptFailLine(script(2), 1)]],
+    ])('the ladder: %s, and the chosen line is the higher', (_what, spec, expected) => {
+      const run = decideRun(spec())
+      expect(linesOf(run.ranked)).toEqual(expected())
+      expect(verdictOf(run)).toBe(expected()[0] as string)
+    })
+
+    test.each([
+      [
+        'integrity lines keep their given order',
+        (): RunSpec => ({ shards: [passingShard(1, [script(1)])], integrity: [integrityFailure(3, 'secret-scan'), integrityFailure(1, 'fault-fired'), integrityFailure(2, 'package-hash')] }),
+        () => [3, 1, 2].map((n) => `${FAIL_PREFIX}constructed integrity line ${n}`),
+      ],
+      [
+        'integrity lines with mixed shards keep their given order, not sorted by shard',
+        (): RunSpec => ({ shards: [passingShard(1, [script(1)])], integrity: [integrityFailure(3, 'secret-scan', 3), integrityFailure(1, 'fault-fired', null), integrityFailure(2, 'package-hash', 1)] }),
+        () => [3, 1, 2].map((n) => `${FAIL_PREFIX}constructed integrity line ${n}`),
+      ],
+      ['out-of-memory lines go by shard number', (): RunSpec => ({ shards: [passingShard(3, [script(1)], { oomLine: oomShardLine(3) }), passingShard(1, [script(1)], { oomLine: oomShardLine(1) })] }), () => [oomShardLine(1), oomShardLine(3)]],
+      ['shard lines go by shard number', (): RunSpec => ({ shards: [exitedShard(3, [script(1)]), exitedShard(2, [script(1)])] }), () => [e10.shardEndLine(2, exitedWith(1)), e10.shardEndLine(3, exitedWith(1))]],
+      ['script failures go in canonical order, so test-0’s ranks after test-4’s', (): RunSpec => ({ shards: [failingShard(1, [script(1), script(0)], script(0)), failingShard(2, [script(1), script(4)], script(4))] }), () => [scriptFailLine(script(4), 2), scriptFailLine(script(0), 1)]],
+      ['a test-1 failure in two shards gives the lower shard’s line first', (): RunSpec => ({ shards: [failingShard(3, [script(1), script(2)], script(1)), failingShard(2, [script(1), script(3)], script(1))] }), () => [scriptFailLine(script(1), 2), scriptFailLine(script(1), 3)]],
+      [
+        'a script end line ranks among script failures by its script',
+        (): RunSpec => ({ shards: [stoppedShard(1, [script(1), script(5)], script(5), stoppedBy('interrupt')), failingShard(2, [script(1), script(3)], script(3))] }),
+        () => [scriptFailLine(script(3), 2), e10.scriptEndLine(script(5), 1, stoppedBy('interrupt'))],
+      ],
+    ])('within a tier: %s', (_what, spec, expected) => {
+      expect(linesOf(decideRun(spec()).ranked)).toEqual(expected())
+    })
+
+    test.each([
+      ['the shard form', (): ShardSpec => passingShard(3, [script(1), script(5)], { oomLine: oomShardLine(3) }), () => oomShardLine(3)],
+      ['the script form', (): ShardSpec => ({ evidence: evidenceOf(3, { assigned: [script(1), script(5)], exitCode: 137, oomLine: oomScriptLine(script(5), 3) }), events: [...ran(script(1)), startEvent(script(5))] }), () => oomScriptLine(script(5), 3)],
+    ])('AC 52: an out-of-memory kill line in %s outranks another shard’s shard line and another shard’s test-1 failure', (_what, killedShard, killLine) => {
+      const run = decideRun({ shards: [failingShard(1, [script(1), script(2)], script(1)), exitedShard(2, [script(1)]), killedShard()] })
+      expect(linesOf(run.ranked)).toEqual([killLine(), e10.shardEndLine(2, exitedWith(1)), scriptFailLine(script(1), 1)])
+      expect(verdictOf(run)).toBe(killLine())
+    })
+
+    test('AC 53: out-of-memory status unreadable ranks with the kill lines by shard number, over shard lines and script failures', () => {
+      const run = decideRun({
+        shards: [
+          failingShard(4, [script(1), script(2)], script(2)),
+          passingShard(3, [script(1)], { oomLine: oomShardLine(3) }),
+          exitedShard(5, [script(1)]),
+          passingShard(2, [script(1)], { oomLine: oomUnreadableLine(2) }),
+          passingShard(1, [script(1)], { oomLine: oomShardLine(1) }),
+        ],
+      })
+      expect(linesOf(run.ranked)).toEqual([oomShardLine(1), oomUnreadableLine(2), oomShardLine(3), e10.shardEndLine(5, exitedWith(1)), scriptFailLine(script(2), 4)])
+    })
+
+    test('AC 67, verdict half: a test-1 whose log’s first FAIL: line reports an install failure, with no fingerprint recorded, gives that line', () => {
+      const [t1, t2] = [script(1), script(2)]
+      const installLine = `${FAIL_PREFIX}${t1}: constructed package install failure`
+      const evidence = evidenceOf(1, { assigned: [t1, t2], dependencyFingerprint: null })
+      const outcome = outcomeOnDisk(evidence, {
+        resultFile: [...ran(t1, RESULT_WORD_FAIL), notRunEvent(t2), DONE_EVENT],
+        scriptLogs: { [t1]: `constructed install output\n${installLine}\n${FAIL_PREFIX}${t1}: a later line\n` },
+      })
+      const ranked = e10.rankFailures({ runLevelLine: null, imageBuildLine: null, integrityFailures: [], outcomes: [outcome] })
+      const passed = e10.runPasses({ expectedScripts: [t1, t2], shardsUsed: [1], outcomes: [outcome], otherFailures: [] })
+      expect(e10.buildVerdictLine({ invocation: invocationOf([]), scripts: [], passed, ranked })).toBe(installLine)
+    })
+
+    test('AC 37, ranking: the run-level interrupt line outranks every … stopped by interrupt in shard-<k> line', () => {
+      const interrupt = stoppedBy('interrupt')
+      const run = decideRun({
+        runLevelLine: RUN_LEVEL_LINE,
+        shards: [stoppedShard(2, [script(1), script(23)], script(23), interrupt), stoppedShard(1, [script(1), script(2)], script(2), interrupt)],
+      })
+      expect(linesOf(run.ranked)).toEqual([RUN_LEVEL_LINE, e10.scriptEndLine(script(2), 1, interrupt), e10.scriptEndLine(script(23), 2, interrupt)])
+      expect(verdictOf(run)).toBe(RUN_LEVEL_LINE)
+    })
+
+    test('every failure is kept in the ranked list, once, each with its shard or null', () => {
+      const run = decideRun({
+        runLevelLine: RUN_LEVEL_LINE,
+        imageBuildLine: IMAGE_BUILD_LINE,
+        integrity: [integrityFailure(2, 'secret-scan'), integrityFailure(1, 'fault-fired')],
+        shards: [
+          stoppedShard(4, [script(1), script(3)], script(3), wallTime()),
+          failingShard(3, [script(1), script(2)], script(2)),
+          exitedShard(2, [script(1)]),
+          passingShard(1, [script(1)], { oomLine: oomShardLine(1) }),
+        ],
+      })
+      expect(run.ranked.map((failure) => ({ line: failure.line, shard: failure.shard }))).toEqual([
+        { line: RUN_LEVEL_LINE, shard: null },
+        { line: IMAGE_BUILD_LINE, shard: null },
+        { line: integrityFailure(2, 'secret-scan').line, shard: null },
+        { line: integrityFailure(1, 'fault-fired').line, shard: null },
+        { line: oomShardLine(1), shard: 1 },
+        { line: e10.shardEndLine(2, exitedWith(1)), shard: 2 },
+        { line: scriptFailLine(script(2), 3), shard: 3 },
+        { line: e10.scriptEndLine(script(3), 4, wallTime()), shard: 4 },
+      ])
+    })
+
+    test('an integrity failure carrying a shard number keeps it, and still ranks over a lower shard’s out-of-memory line', () => {
+      const run = decideRun({ shards: [passingShard(1, [script(1)], { oomLine: oomShardLine(1) })], integrity: [integrityFailure(1, 'results-canary', 2)] })
+      expect(run.ranked.map((failure) => ({ line: failure.line, shard: failure.shard }))).toEqual([
+        { line: integrityFailure(1, 'results-canary').line, shard: 2 },
+        { line: oomShardLine(1), shard: 1 },
+      ])
+    })
+
+    test.each([
+      ['a failure of the wrong class, run-level stop, in the integrity list', (): Partial<e10.FailureSources> => ({ integrityFailures: [{ line: RUN_LEVEL_LINE, shard: 1, failureClass: { kind: 'run-level-stop' } }] })],
+      ['a failure of the wrong class, image build, in the integrity list', (): Partial<e10.FailureSources> => ({ integrityFailures: [{ line: IMAGE_BUILD_LINE, shard: 1, failureClass: { kind: 'image-build' } }] })],
+      ['a failure of the wrong class, run-level stop, in a shard outcome', (outcome: e10.ShardOutcome): Partial<e10.FailureSources> => ({ outcomes: [{ ...outcome, failures: [{ line: RUN_LEVEL_LINE, shard: 1, failureClass: { kind: 'run-level-stop' } }] }] })],
+      ['a failure of the wrong class, image build, in a shard outcome', (outcome: e10.ShardOutcome): Partial<e10.FailureSources> => ({ outcomes: [{ ...outcome, failures: [{ line: IMAGE_BUILD_LINE, shard: 1, failureClass: { kind: 'image-build' } }] }] })],
+      ['a script failure with no shard in a shard outcome', (outcome: e10.ShardOutcome): Partial<e10.FailureSources> => ({ outcomes: [{ ...outcome, failures: [{ line: scriptFailLine(script(1), 1), shard: null, failureClass: { kind: 'script', fileName: script(1) } }] }] })],
+      ['an out-of-memory failure with no shard in a shard outcome', (outcome: e10.ShardOutcome): Partial<e10.FailureSources> => ({ outcomes: [{ ...outcome, failures: [{ line: oomShardLine(1), shard: null, failureClass: { kind: 'out-of-memory' } }] }] })],
+    ] as [string, (outcome: e10.ShardOutcome) => Partial<e10.FailureSources>][])('rankFailures throws for %s', (_what, change) => {
+      const outcome = decideRun({ shards: [passingShard(1, [script(1)])] }).outcomes[0] as e10.ShardOutcome
+      const sources: e10.FailureSources = { runLevelLine: null, imageBuildLine: null, integrityFailures: [], outcomes: [outcome], ...change(outcome) }
+      expect(() => e10.rankFailures(sources)).toThrow()
+    })
+  })
+
+  // --- T4.S4: verdict shapes, the double guard and N = 1 (b.uqm SR-12.5, SR-19.6) ---
+
+  describe('E10: verdict shapes, the double guard and N = 1 (b.uqm SR-12.5, SR-19.6)', () => {
+    test('pin: the passing verdict is PASS and the selective prefix is SR-12.5’s', () => {
+      expect(e10.PASS_VERDICT).toBe('PASS')
+      expect(e10.selectiveVerdictPrefix([script(1)])).toBe('SELECTIVE (test-1): ')
+    })
+
+    test.each([
+      ['no arguments', () => []],
+      ['--shards', () => ['--shards', '3']],
+      ['--shard-timeout', () => ['--shard-timeout', '90']],
+      ['--shards and --shard-timeout', () => ['--shard-timeout', '90', '--shards', '1']],
+    ])('a passing full run without --inject (%s) writes exactly PASS', (_what, args) => {
+      const run = decideRun({ args: args(), shards: [passingShard(1, [script(1), script(2)]), passingShard(2, [script(1), script(3)])] })
+      expect(verdictOf(run)).toBe(e10.PASS_VERDICT)
+    })
+
+    test.each([
+      ['its script’s FAIL: line', (f: string) => ({ [f]: `${scriptFailLine(f, 2)}\n` }), (f: string) => scriptFailLine(f, 2)],
+      ['the fallback line', (_f: string) => ({}), (f: string) => e10.noFailLineFallback(f)],
+    ])('a failing full run without --inject writes %s exactly (SR-19.6)', (_what, logs, expected) => {
+      const failing = failingShard(2, [script(1), script(3)], script(3))
+      const run = decideRun({ args: ['--shards', '2'], shards: [passingShard(1, [script(1), script(2)]), { ...failing, logs: logs(script(3)) }] })
+      expect(verdictOf(run)).toBe(expected(script(3)))
+    })
+
+    /** The prefix of a selective run of the given script numbers: number forms in canonical order. */
+    const selectivePrefixOf = (numbers: readonly number[]): string => `SELECTIVE (${numbers.map(numberForm).join(' ')}): `
+
+    test.each([
+      ['a selective run', () => [numberForm(3)], () => selectivePrefixOf([1, 3])],
+      ['a selective run with --shards 1', () => ['--shards', '1', numberForm(3)], () => selectivePrefixOf([1, 3])],
+      ['an injected full run', () => ['--inject', faultTextOf({ kind: 'retag' })], () => e10.injectedVerdictPrefix([{ kind: 'retag' }])],
+      ['an injected full run with --shards', () => ['--shards', '2', '--inject', faultTextOf({ kind: 'kill', shard: 2 })], () => e10.injectedVerdictPrefix([{ kind: 'kill', shard: 2 }])],
+      ['an injected selective run', () => ['--inject', faultTextOf({ kind: 'kill', shard: 1 }), script(3)], () => `${e10.injectedVerdictPrefix([{ kind: 'kill', shard: 1 }])}${selectivePrefixOf([1, 3])}`],
+    ])('the double guard: %s that passes never writes exactly PASS, only its prefix before PASS', (_what, args, prefix) => {
+      const run = decideRun({ args: args(), shards: [passingShard(1, [script(1), script(3)])] })
+      expect(run.passed).toBe(true)
+      expect(e10.isGateEligible(run.invocation)).toBe(false)
+      expect(verdictOf(run)).not.toBe(e10.PASS_VERDICT)
+      expect(verdictOf(run)).toBe(`${prefix()}${e10.PASS_VERDICT}`)
+    })
+
+    test.each([
+      ['a passing run with a failure line', () => ({ invocation: invocationOf([]), scripts: [], passed: true, ranked: [e10.runLevelFailure(RUN_LEVEL_LINE)] })],
+      ['a failing run with no failure line', () => ({ invocation: invocationOf([]), scripts: [], passed: false, ranked: [] })],
+      ['a top line that does not begin FAIL:', () => ({ invocation: invocationOf([]), scripts: [], passed: false, ranked: [e10.runLevelFailure('constructed line without the prefix')] })],
+      ['a top line holding a line feed', () => ({ invocation: invocationOf([]), scripts: [], passed: false, ranked: [e10.runLevelFailure(`${RUN_LEVEL_LINE}\nsecond line`)] })],
+      ['a selective run whose scripts lack test-1', () => ({ invocation: invocationOf([numberForm(3)]), scripts: [script(3)], passed: false, ranked: [e10.runLevelFailure(RUN_LEVEL_LINE)] })],
+      ['a selective run whose scripts lack a selected script', () => ({ invocation: invocationOf([numberForm(3), numberForm(5)]), scripts: [script(1), script(3)], passed: false, ranked: [e10.runLevelFailure(RUN_LEVEL_LINE)] })],
+    ] as [string, () => e10.VerdictInputs][])('the double guard: %s is an internal error, never a verdict', (_what, inputs) => {
+      expect(() => e10.buildVerdictLine(inputs())).toThrow()
+    })
+
+    test('the selective list is the run’s scripts as number forms in canonical order, test-1 and prerequisites included, however given', () => {
+      // test-3 selected (as a number form) with test-0 (as a file name) listed after it; test-2 a prerequisite; test-1 resolved last.
+      const run = decideRun({
+        args: [numberForm(3), script(0)],
+        shards: [passingShard(1, [script(1), script(2), script(3)]), passingShard(2, [script(1), script(0)])],
+        expected: [script(3), script(0), script(2), script(1)],
+      })
+      expect(verdictOf(run)).toBe(`${selectivePrefixOf([1, 2, 3, 0])}${e10.PASS_VERDICT}`)
+    })
+
+    test.each([
+      ['a script’s FAIL: line', (): RunSpec => ({ args: [numberForm(3)], shards: [failingShard(1, [script(1), script(3)], script(3))] }), [1, 3], () => scriptFailLine(script(3), 1)],
+      ['the run-level line', (): RunSpec => ({ args: [numberForm(3)], shards: [passingShard(1, [script(1), script(3)])], runLevelLine: RUN_LEVEL_LINE }), [1, 3], () => RUN_LEVEL_LINE],
+      [
+        'AC 52: /ci test-23 whose shard has an out-of-memory line',
+        (): RunSpec => ({ args: [numberForm(23)], shards: [passingShard(1, [script(1), script(23)], { oomLine: oomShardLine(1) })] }),
+        [1, 23],
+        () => oomShardLine(1),
+      ],
+    ] as [string, () => RunSpec, number[], () => string][])('a failing selective run writes SELECTIVE (<scripts>): <its line>: %s', (_what, spec, numbers, line) => {
+      expect(verdictOf(decideRun(spec()))).toBe(`${selectivePrefixOf(numbers)}${line()}`)
+    })
+
+    test.each([
+      ['over a full run’s line', () => ['--inject', faultTextOf({ kind: 'fail', script: numberForm(3) })], () => scriptFailLine(script(3), 1)],
+      ['over a selective run’s line', () => ['--inject', faultTextOf({ kind: 'fail', script: numberForm(3) }), script(3)], () => `${selectivePrefixOf([1, 3])}${scriptFailLine(script(3), 1)}`],
+    ])('an injected run writes INJECTED (<faults>): %s', (_what, args, inner) => {
+      const run = decideRun({ args: args(), shards: [failingShard(1, [script(1), script(3)], script(3))] })
+      expect(verdictOf(run)).toBe(`${e10.injectedVerdictPrefix(run.invocation.faults)}${inner()}`)
+    })
+
+    test.each([
+      ['a full run', () => [] as string[], () => ''],
+      ['a selective run', () => [script(5), numberForm(3)], () => selectivePrefixOf([1, 3, 5])],
+    ])('N = 1: %s whose mid-order script fails, later ones notrun, writes that script’s line as a serial run does', (_what, args, prefix) => {
+      const given = args()
+      const assigned = given.length === 0 ? e10Helpers.realScriptFileNames() : [script(1), script(3), script(5)]
+      const failing = assigned[Math.floor(assigned.length / 2)] as string
+      const run = decideRun({ args: ['--shards', '1', ...given], shards: [failingShard(1, assigned, failing)] })
+      const at = assigned.indexOf(failing)
+      expect((run.outcomes[0] as e10.ShardOutcome).scripts.map((entry) => entry.result)).toEqual(
+        assigned.map((_name, index) => (index < at ? RESULT_WORD_PASS : index === at ? RESULT_WORD_FAIL : RESULT_WORD_NOTRUN)),
+      )
+      expect(verdictOf(run)).toBe(`${prefix()}${scriptFailLine(failing, 1)}`)
+    })
+  })
+
+  // --- T4.S5: results.json and the writer (b.uqm SR-16.1) ---
+
+  describe('E10: results.json and its writer (b.uqm SR-16.1)', () => {
+    const sortedKeys = (object: object): string[] => Object.keys(object).sort()
+
+    test('the top level holds exactly SR-16.1’s keys', () => {
+      expect(sortedKeys(assembled())).toEqual(
+        ['version', 'runId', 'pid', 'packageSha256', 'images', 'verdict', 'invocation', 'scripts', 'shards', 'shardCount', 'cap', 'workingSet', 'failedReadings', 'modes', 'failures', 'skippedChecks', 'cleanupFailures', 'timing', 'timingSummary'].sort(),
+      )
+    })
+
+    test.each([
+      ['images', (r: Results) => [r.images], ['pinned', 'drift', 'retag', 'retagMoved']],
+      ['invocation', (r: Results) => [r.invocation], ['args', 'selective', 'faults']],
+      ['each scripts[] entry', (r: Results) => r.scripts, ['script', 'shard', 'result', 'seconds', 'failLine']],
+      [
+        'each shards[] entry',
+        (r: Results) => r.shards,
+        ['shard', 'assigned', 'expectedSeconds', 'limitMinutes', 'endedNormally', 'end', 'seconds', 'anonPeak', 'peakPids', 'final', 'failedReadings', 'packageSha256', 'dependencyFingerprint', 'imageId', 'inspection', 'inspectionError'],
+      ],
+      ['each anonPeak', (r: Results) => r.shards.map((shard) => shard.anonPeak), ['bytes', 'pageCacheBytes', 'mark']],
+      ['each final', (r: Results) => r.shards.map((shard) => shard.final), ['oomKilled', 'oomKillCount']],
+      ['shardCount', (r: Results) => [r.shardCount], ['requested', 'effective', 'admitted', 'started', 'reasons']],
+      ['cap', (r: Results) => [r.cap], ['usedBytes', 'peakBytes', 'peakShard', 'peakPageCacheBytes', 'peakFromKill', 'derivedBytes', 'suffix']],
+      ['workingSet', (r: Results) => [r.workingSet], ['before', 'peak', 'after']],
+      ['each working-set reading', (r: Results) => [r.workingSet.before, r.workingSet.peak].filter((reading) => reading !== null), ['bytes', 'anonBytes', 'activeFileBytes']],
+      ['modes', (r: Results) => [r.modes], ['runDir', 'tarball', 'shardDirs']],
+      ['each failures[] entry', (r: Results) => r.failures, ['line', 'shard']],
+      ['timing', (r: Results) => [r.timing], ['buildSeconds', 'baseBuildSeconds', 'totalSeconds']],
+    ] as [string, (results: Results) => object[], string[]][])('%s holds exactly its SR-16.1 keys, whatever else its input carried', (_what, pick, keys) => {
+      const objects = pick(assembled())
+      expect(objects.length).toBeGreaterThan(0)
+      for (const object of objects) expect(sortedKeys(object)).toEqual([...keys].sort())
+    })
+
+    test.each([
+      ['packageSha256 is the tarball’s hash', () => ({}), (r: Results) => r.packageSha256, () => hexValue('e10-package', SHA256_HEX_LENGTH)],
+      ['packageSha256 is null when no tarball was packed', () => ({ packageSha256: null }), (r: Results) => r.packageSha256, () => null],
+      ['an image the run did not build is null', () => ({}), (r: Results) => r.images, () => ({ pinned: pinnedId(), drift: null, retag: null, retagMoved: false })],
+      [
+        'every image built and retagMoved as given',
+        () => ({ images: { pinnedId: pinnedId(), driftId: 'sha256:e10-drift', retagId: 'sha256:e10-retag', retagMoved: true } }),
+        (r: Results) => r.images,
+        () => ({ pinned: pinnedId(), drift: 'sha256:e10-drift', retag: 'sha256:e10-retag', retagMoved: true }),
+      ],
+      [
+        'invocation: args as given, not selective, the normalized faults in order',
+        () => ({ invocation: invocationOf(['--inject', faultTextOf({ kind: 'retag' }), '--shards', '2', '--inject', faultTextOf({ kind: 'fail', script: script(3) }), '--inject', faultTextOf({ kind: 'retag' })]) }),
+        (r: Results) => r.invocation,
+        () => ({
+          args: ['--inject', faultTextOf({ kind: 'retag' }), '--shards', '2', '--inject', faultTextOf({ kind: 'fail', script: script(3) }), '--inject', faultTextOf({ kind: 'retag' })],
+          selective: false,
+          faults: [faultTextOf({ kind: 'retag' }), faultTextOf({ kind: 'fail', script: numberForm(3) })],
+        }),
+      ],
+      ['a full run’s cap is written as given', () => ({}), (r: Results) => r.cap, () => resultsInputsOf(decideRun(standardRunSpec())).cap],
+      [
+        'a selective run’s cap is null but for usedBytes',
+        () => ({ invocation: invocationOf([numberForm(2)]) }),
+        (r: Results) => [r.invocation.selective, r.cap],
+        () => [true, { ...resultsInputsOf(decideRun(standardRunSpec())).cap, peakBytes: null, peakShard: null, peakPageCacheBytes: null, peakFromKill: null, derivedBytes: null, suffix: null }],
+      ],
+    ] as [string, () => Partial<e10.ResultsInputs>, (results: Results) => unknown, () => unknown][])('%s', (_what, change, pick, expected) => {
+      expect(pick(assembled(change()))).toEqual(expected())
+    })
+
+    test('scripts: shard order, then run order, test-1 once per shard, each with seconds and failLine or null; the script in progress is fail with no seconds and its end line', () => {
+      const [t1, t2, t3, t4, t5] = [1, 2, 3, 4, 5].map(script) as [string, string, string, string, string]
+      expect(assembled().scripts).toEqual([
+        { script: t1, shard: 1, result: RESULT_WORD_PASS, seconds: 1.5, failLine: null },
+        { script: t2, shard: 1, result: RESULT_WORD_FAIL, seconds: 1.5, failLine: scriptFailLine(t2, 1) },
+        { script: t3, shard: 1, result: RESULT_WORD_NOTRUN, seconds: null, failLine: null },
+        { script: t1, shard: 2, result: RESULT_WORD_PASS, seconds: 1.5, failLine: null },
+        { script: t4, shard: 2, result: RESULT_WORD_PASS, seconds: 1.5, failLine: null },
+        { script: t1, shard: 3, result: RESULT_WORD_PASS, seconds: 1.5, failLine: null },
+        { script: t5, shard: 3, result: RESULT_WORD_FAIL, seconds: null, failLine: e10.scriptEndLine(t5, 3, wallTime()) },
+      ])
+    })
+
+    test('shards, in shard order: end is "normal" after a failing script, the out-of-memory line on a shard that ended normally, else the end line; inspectionError by its rule', () => {
+      expect(assembled().shards.map((shard) => [shard.shard, shard.endedNormally, shard.end, shard.inspectionError])).toEqual([
+        [1, true, e10.NORMAL_SHARD_END, null],
+        [2, true, oomShardLine(2), 'constructed inspect error its second line'],
+        [3, false, e10.scriptEndLine(script(5), 3, wallTime()), e10.INSPECTION_NOT_READ_TEXT],
+      ])
+    })
+
+    test.each([
+      ['a shard with inspection data: null', () => ({ start: started(1), inspection: inspectionData(1), inspectionError: 'constructed inspect error' }), () => null],
+      ['a shard never created: container never started', () => ({ start: null, inspection: null, inspectionError: null }), () => 'container never started'],
+      ['a shard that failed to start: container never started', () => ({ start: failedStart(1, 'constructed start error'), inspection: null, inspectionError: 'constructed inspect error' }), () => e10.CONTAINER_NEVER_STARTED_TEXT],
+      ['a started shard whose read failed: the error, on one line', () => ({ start: started(1), inspection: null, inspectionError: 'constructed inspect error\r\n  its second line' }), () => 'constructed inspect error its second line'],
+      ['a started shard with no failed read recorded', () => ({ start: started(1), inspection: null, inspectionError: null }), () => e10.INSPECTION_NOT_READ_TEXT],
+    ] as [string, () => Pick<e10.ShardEvidence, 'start' | 'inspection' | 'inspectionError'>, () => string | null][])('inspectionError for %s', (_what, evidence, expected) => {
+      expect(e10.inspectionErrorOf(evidence())).toBe(expected())
+    })
+
+    test.each([
+      ['a packed tarball', 0o444, '0444'],
+      ['no tarball', null, null],
+    ] as [string, number | null, string | null][])('modes are four-digit octal strings such as "0700", from the full modes read: %s', (_what, tarballMode, tarballText) => {
+      const runDir = newRunDir()
+      const shardDir = writeShardDir(runDir, { shard: 1 })
+      const tarball = join(root, 'e10-package.tgz')
+      writeFileSync(tarball, '')
+      if (tarballMode !== null) chmodSync(tarball, tarballMode)
+      const modes = { runDir: statSync(runDir).mode, tarball: tarballMode === null ? null : statSync(tarball).mode, shardDirs: { [`${SHARD_DIR_PREFIX}1`]: statSync(shardDir).mode } }
+      expect(assembled({ modes }).modes).toEqual({ runDir: '0700', tarball: tarballText, shardDirs: { [`${SHARD_DIR_PREFIX}1`]: '0700' } })
+    })
+
+    test('failures is the ranked list as given, each line with its shard; a cleanup failure appears only in cleanupFailures', () => {
+      const run = decideRun(standardRunSpec())
+      const results = e10.assembleResults(resultsInputsOf(run))
+      expect(results.failures).toEqual(run.ranked.map((failure) => ({ line: failure.line, shard: failure.shard })))
+      expect(results.failures).toEqual([
+        { line: integrityFailure(1, 'results-canary').line, shard: null },
+        { line: oomShardLine(2), shard: 2 },
+        { line: scriptFailLine(script(2), 1), shard: 1 },
+        { line: e10.scriptEndLine(script(5), 3, wallTime()), shard: 3 },
+      ])
+      expect(results.cleanupFailures).toEqual(['constructed cleanup failure line'])
+      expect(results.failures.map((failure) => failure.line)).not.toContain('constructed cleanup failure line')
+    })
+
+    test('the writer applies the redactor it is given: a fake token in the verdict and a failure line is written <redacted> in both files', () => {
+      const token = e10Credentials.fakeToken(e10Credentials.BOT_TOKEN_PREFIX, 'e10-results')
+      const [t1, t2] = [script(1), script(2)]
+      const leakyLine = `${FAIL_PREFIX}${t2}: constructed failure quoting ${token}`
+      const results = e10.assembleResults(resultsInputsOf(decideRun({ shards: [{ ...failingShard(1, [t1, t2], t2), logs: { [t2]: `${leakyLine}\n` } }] })))
+      expect(results.verdict).toBe(leakyLine)
+      expect(() => e10Credentials.assertNoLeak(results)).toThrow()
+      const runDir = newRunDir()
+      // The summary text redactor alone also masks the cleanup failure line, so the summary shows it applied.
+      const paths = writeBoth(runDir, results, maskingRedactor([token], ['constructed cleanup failure line']))
+
+      const masked = leakyLine.replaceAll(token, e10.REDACTION_PLACEHOLDER)
+      const parsed = parsedResults(paths.results)
+      expect([parsed.verdict, parsed.failures[0]?.line]).toEqual([masked, masked])
+      expect(parsed.cleanupFailures).toEqual(['constructed cleanup failure line'])
+      const summary = readFileSync(paths.summary, 'utf-8')
+      expect(summary).toContain(masked)
+      expect(summary).not.toContain('constructed cleanup failure line')
+      expect(readdirSync(runDir).sort()).toEqual([e10.RESULTS_FILE_NAME, e10.SUMMARY_FILE_NAME].sort())
+      e10Credentials.assertNoLeak({ results: e10Credentials.writtenFile(paths.results), summary: e10Credentials.writtenFile(paths.summary) })
+    })
+
+    test('a second call replaces both files whole, each through a rename, leaving no temporary file', () => {
+      const runDir = newRunDir()
+      const paths = writeBoth(runDir, assembled())
+      const before = [statSync(paths.results).ino, statSync(paths.summary).ino]
+      const second = assembled({ verdict: RUN_LEVEL_LINE, cleanupFailures: [] })
+      writeBoth(runDir, second)
+      expect(readFileSync(paths.results, 'utf-8')).toBe(serializeResults(second))
+      expect(readFileSync(paths.summary, 'utf-8')).toBe(e10.renderSummary(second))
+      expect(statSync(paths.results).ino).not.toBe(before[0])
+      expect(statSync(paths.summary).ino).not.toBe(before[1])
+      expect(readdirSync(runDir).sort()).toEqual([e10.RESULTS_FILE_NAME, e10.SUMMARY_FILE_NAME].sort())
+      e10Credentials.assertNoLeak({ results: e10Credentials.writtenFile(paths.results), summary: e10Credentials.writtenFile(paths.summary) })
+    })
+
+    test('a redactor that throws fails both files and writes neither, so nothing unredacted is written', () => {
+      const runDir = newRunDir()
+      const throwing: e10.ResultsRedactor = {
+        results: () => {
+          throw new Error('constructed redactor failure')
+        },
+        text: (text) => text,
+      }
+      const written = e10.writeResultsFiles(runDir, assembled(), throwing)
+      expect([written.results.ok, written.summary.ok]).toEqual([false, false])
+      expect(readdirSync(runDir)).toEqual([])
+    })
+  })
+
+  // --- T4.S6: summary.txt and the timing summary (b.uqm SR-16.2) ---
+
+  describe('E10: summary.txt and the timing summary (b.uqm SR-16.2)', () => {
+    test.each([
+      ['a full run, the cap line last', () => [] as string[], (groups: e10.TimingSummaryGroups) => [groups.capLine as string]],
+      ['an injected full run, which keeps the cap line', () => ['--inject', faultTextOf({ kind: 'retag' })], (groups: e10.TimingSummaryGroups) => [groups.capLine as string]],
+      ['a selective run, which has no cap line', () => [numberForm(3)], () => []],
+    ])('the timing summary’s groups come in SR-16.2’s order: %s', (_what, args, capLines) => {
+      const groups = timingGroups()
+      expect(e10.assembleTimingSummary(groups, e10.runKindOf(invocationOf(args())))).toEqual([
+        groups.shardCountLine,
+        ...groups.runTimes,
+        ...groups.scriptTimes,
+        ...groups.durationTableBlock,
+        ...groups.slowLines,
+        ...groups.tableNotes,
+        ...capLines(groups),
+      ])
+    })
+
+    test('empty groups and empty lines leave no blank line, a given text holding line breaks is split into its lines, and tabs survive', () => {
+      const groups = timingGroups({ runTimes: [], scriptTimes: ['constructed script line a\r\nconstructed script line b\n'], durationTableBlock: ['constructed\tblock\trow\n', ''], slowLines: [], tableNotes: ['\n'] })
+      expect(e10.assembleTimingSummary(groups, e10.runKindOf(invocationOf([])))).toEqual([
+        groups.shardCountLine,
+        'constructed script line a',
+        'constructed script line b',
+        'constructed\tblock\trow',
+        groups.capLine as string,
+      ])
+    })
+
+    test('results.json’s timingSummary is the summary’s timing lines one for one, verbatim, with the duration-table block of a failing full run', () => {
+      const results = assembled()
+      expect(results.verdict.startsWith(FAIL_PREFIX)).toBe(true)
+      const paths = writeBoth(newRunDir(), results)
+      const parsed = parsedResults(paths.results)
+      const summaryLines = readFileSync(paths.summary, 'utf-8').split('\n')
+      const heading = summaryLines.indexOf(e10.SUMMARY_TIMING_HEADING)
+      expect(heading).toBeGreaterThan(0)
+      expect(summaryLines.slice(heading + 1, -1)).toEqual([...parsed.timingSummary])
+      expect(parsed.timingSummary).toEqual(e10.assembleTimingSummary(timingGroups(), e10.runKindOf(invocationOf([]))))
+      expect(parsed.timingSummary).toContain('constructed\tblock\trow')
+      e10Credentials.assertNoLeak({ summary: e10Credentials.writtenFile(paths.summary) })
+    })
+
+    test('the summary shows every string and number of the results but the inspection data, each from its own place: the verdict, each failure with its shard, every shard figure and the failed-reading counts of the run and each shard', () => {
+      const results = distinctiveResults(assembled())
+      expect(results.failures.map((failure) => failure.line)).not.toContain(results.verdict)
+      const shown = leavesOf(results).filter(({ value }) => typeof value === 'string' || typeof value === 'number')
+      const shownPaths = shown.map(({ path }) => path.join('.'))
+      const shardFigures = results.shards.flatMap((_shard, index) => ['expectedSeconds', 'limitMinutes', 'peakPids', 'failedReadings'].map((key) => `shards.${index}.${key}`))
+      expect(shownPaths).toEqual(expect.arrayContaining(['verdict', 'failedReadings', 'skippedChecks.0', 'cleanupFailures.0', ...shardFigures]))
+      const summary = e10.renderSummary(results)
+      expect(shown.filter(({ value }) => !summary.includes(String(value))).map(({ path }) => path.join('.'))).toEqual([])
+      const failuresWithShards = results.failures.map((failure) => (failure.shard === null ? failure.line : `${SHARD_DIR_PREFIX}${failure.shard}: ${failure.line}`))
+      expect(failuresWithShards.filter((text) => !summary.includes(text))).toEqual([])
+    })
+
+    test('each yes-or-no value is shown on its own line, a shard’s among that shard’s lines: flipping it changes exactly that one line', () => {
+      const results = distinctiveResults(assembled())
+      const before = e10.renderSummary(results).split('\n')
+      const flags = leavesOf(results).filter(({ value }) => typeof value === 'boolean')
+      const flagPaths = flags.map(({ path }) => path.join('.'))
+      expect(flagPaths).toEqual(expect.arrayContaining(['invocation.selective', 'images.retagMoved', 'cap.peakFromKill', ...results.shards.map((_shard, index) => `shards.${index}.endedNormally`), 'shards.0.final.oomKilled']))
+      // A shard's lines: from the first to the last summary line holding one of its own values and no other shard's.
+      const shardValues = results.shards.map((_shard, index) =>
+        leavesOf(results)
+          .filter(({ path, value }) => path[0] === 'shards' && path[1] === index && (typeof value === 'string' || typeof value === 'number'))
+          .map(({ value }) => String(value)),
+      )
+      const holds = (line: string, index: number): boolean => (shardValues[index] as string[]).some((value) => line.includes(value))
+      const shardSpans = shardValues.map((_values, index) => {
+        const own = before.flatMap((line, at) => (holds(line, index) && shardValues.every((_other, other) => other === index || !holds(line, other)) ? [at] : []))
+        return [Math.min(...own), Math.max(...own)] as const
+      })
+      const placed = flags.map(({ path }) => {
+        const after = e10.renderSummary(withFlipped(results, path)).split('\n')
+        const changed = before.flatMap((line, at) => (line === after[at] ? [] : [at]))
+        const inShards = shardSpans.flatMap(([first, last], index) => (changed.length === 1 && (changed[0] as number) >= first && (changed[0] as number) <= last ? [index] : []))
+        return { path: path.join('.'), lineCount: after.length, changedLines: changed.length, inShards: inShards as (string | number)[] }
+      })
+      expect(placed).toEqual(flags.map(({ path }) => ({ path: path.join('.'), lineCount: before.length, changedLines: 1, inShards: path[0] === 'shards' ? [path[1]] : [] })))
+    })
+
+    test('the summary holds no inspection field: no container name, mount source or label', () => {
+      const results = assembled()
+      const inspection = results.shards[0]?.inspection ?? null
+      expect(inspection).not.toBeNull()
+      const fields = inspection === null ? [] : [inspection.name, ...inspection.mounts.map((mount) => mount.source), ...Object.entries(inspection.labels).filter(([key]) => key !== CI_LABEL).flat()]
+      expect(fields.length).toBeGreaterThan(2)
+      const summary = e10.renderSummary(results)
+      expect(fields.filter((field) => summary.includes(field))).toEqual([])
+    })
+
+    test('AC 37, summary half: test-23 in progress at an interrupt is listed as its … stopped by interrupt in shard-<k> line with its shard, beside the run-level line', () => {
+      const interrupt = stoppedBy('interrupt')
+      const t23 = script(23)
+      const run = decideRun({ runLevelLine: RUN_LEVEL_LINE, shards: [stoppedShard(1, [script(1), script(2)], script(2), interrupt), stoppedShard(2, [script(1), t23], t23, interrupt)] })
+      const results = e10.assembleResults(resultsInputsOf(run))
+      const paths = writeBoth(newRunDir(), results)
+      const summary = readFileSync(paths.summary, 'utf-8')
+      const t23Line = e10.scriptEndLine(t23, 2, interrupt)
+      expect(results.verdict).toBe(RUN_LEVEL_LINE)
+      expect(results.failures).toContainEqual({ line: t23Line, shard: 2 })
+      expect(summary).toContain(`${SHARD_DIR_PREFIX}2: ${t23Line}`)
+      expect(results.failures[0]).toEqual({ line: RUN_LEVEL_LINE, shard: null })
+      e10Credentials.assertNoLeak({ summary: e10Credentials.writtenFile(paths.summary) })
+    })
+  })
+})
 
 // ---------------------------------------------------------------------------
 // E11: integrity and secret-scan (b.t6s E11)

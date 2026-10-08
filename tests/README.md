@@ -3061,14 +3061,176 @@ event, `stub_session_deliveries` shows what reached the persona, and
 
 ### Verdict file format
 
-`tests/runner.sh` writes exactly one line to `/test-results/verdict.txt`:
+The host runner (`scripts/ci-run.ts`) writes `verdict.txt` in the run
+directory, `cscb-ci-<RUN_ID>` under the system temp directory (`$TMPDIR`,
+else `/tmp`). It writes it last, through a temporary file in the run
+directory and a rename, and writes nothing after it. No shard writes one: the
+in-container runner writes only its shard's files.
 
-- `PASS` — every test exited 0.
-- `FAIL: <test-script>: <description>` — first failed test's first `FAIL:` line.
+The verdict reader (`scripts/ci-verdict.ts`) is the only code that reads it,
+and it reads only the first line. That line is the whole verdict: one line,
+not JSON, no decoration, no embedded newline. Detail goes elsewhere: the
+runner log (`runner.log`), each shard's `docker.log` in its `shard-<k>`
+subdirectory, `summary.txt` and `results.json`. The verdict, the summary and
+the results file are written with every secret value replaced by
+`<redacted>`.
 
-`/ci` reads only the first line of this file. It is not JSON, has no
-decoration, and never contains embedded newlines. Multi-line diagnostics go to
-stdout/stderr where `docker logs` can capture them — never into `verdict.txt`.
+A refused run writes no verdict: it records its refusal in its status file
+instead, and the reader reports it as `NOT RUN: <reason>`. The reader alone
+turns a verdict into `/ci`'s report and exit code; the `/ci` skill
+(`.claude/skills/ci/SKILL.md`) documents them.
+
+#### The pass condition and the four shapes
+
+A run passes only when every expected script passed (test-1 in every shard
+used, every other expected script once) and nothing else failed: no failure
+line of any kind below, out-of-memory lines included, and no script `notrun`.
+
+| Run | Verdict |
+|---|---|
+| Full, without `--inject` | `PASS`, or a line beginning `FAIL: ` |
+| Selective (a SCRIPT argument) | `SELECTIVE (<scripts>): PASS` or `SELECTIVE (<scripts>): <FAIL line>` |
+| Injected (an `--inject`) | `INJECTED (<faults>): ` followed by the line the run would otherwise write |
+| Selective and injected | `INJECTED (<faults>): SELECTIVE (<scripts>): …` |
+
+`<scripts>` is the run's scripts as number forms (`test-<n>`) in canonical
+order, separated by single spaces: the selection, its prerequisites (taken
+transitively) and test-1. `<faults>` is the run's normalized faults, in
+order, separated by single spaces.
+
+The double guard: only a full run without `--inject` can write exactly
+`PASS`. The runner treats any other `PASS`, or any input that does not add up
+(a passing run with a failure line, a failing run with none, a top line not
+beginning `FAIL:`), as an internal error, never a verdict. The reader in turn
+rejects `PASS` from a selective or injected invocation.
+
+A full run without `--inject` writes exactly `PASS` or a line beginning
+`FAIL: `. When that line is a failing script's, it is still the script's first
+`FAIL:` line or the fallback line below. With one shard (N = 1) the run
+keeps the serial order, stops at its first failure and writes the verdict a
+serial run writes.
+
+#### Script lines
+
+- A failing script's line is the first line of its log that begins `FAIL:`,
+  verbatim and never re-prefixed.
+- With no such line, or no readable log, it is
+  `FAIL: <file name>: exited non-zero without explicit FAIL line`.
+- A failing prerequisite is charged to itself; its dependents in that shard
+  are `notrun` and add no line of their own. The run fails.
+- A shard stops at its own first failing script; the other shards run on. A
+  script a shard did not reach is `notrun`, never passed, and fails the run.
+
+#### Shard end lines
+
+A shard ended normally when its `result.txt` can be read and holds the end
+marker, whether its container was still running at its final reading or had
+exited after the marker. The exit code of such a container is never a cause.
+
+Any other shard gets one cause, the first of these that applies:
+
+| # | Cause | When |
+|---|---|---|
+| 1 | `wall-time limit of <m> min exceeded`, `killed`, `stopped by interrupt`, `stopped by memory watchdog` or `stopped by run deadline` | the runner fixed the cause itself, before the stop it made: its limit, a fault, or a run-level stop |
+| 2 | `container failed to start: <detail>` | the container could not be started |
+| 3 | `image marker missing` | the container exited 2 and its Docker logs hold the marker refusal line |
+| 4 | `container exited <code>` | the container exited on its own |
+| 5 | `result file unreadable` | `result.txt` cannot be read, or holds a malformed line |
+| 6 | `no result file` | none of the others applies |
+
+A stop the runner makes has its cause fixed before it stops the container;
+it is never read from the exit code that stop produced. A shard not yet
+created when a run-level stop occurs takes that stop's cause.
+
+The end line takes one of two forms:
+
+- `FAIL: <file name>: <cause> in shard-<k>`, when `result.txt` shows a script
+  started but not ended and the cause is the wall-time limit, `killed`, a
+  `stopped by …` cause or `container exited <code>`. It is that script's
+  failure.
+- `FAIL: shard-<k>: <cause>` otherwise, a failure charged to the shard's
+  pseudo-slot rather than to a script. `container failed to start`,
+  `image marker missing`, `result file unreadable` and `no result file`
+  always take this form.
+
+Each assigned script without a result is `notrun`.
+
+#### Out-of-memory lines
+
+A shard had a kill when any of its readings shows one. Its line is:
+
+- `FAIL: <file name>: killed for out of memory in shard-<k>`, when a script
+  was in progress at the first reading that showed the kill;
+- `FAIL: shard-<k>: killed for out of memory` otherwise, even if every script
+  in it passed;
+- `FAIL: shard-<k>: out-of-memory status unreadable`, when the final reading
+  could read neither source and no earlier reading showed a kill, even for a
+  shard that ended normally with every script passed.
+
+A shard gets at most one out-of-memory line, which takes the place of any
+other end line of that shard; its scripts' own results stay as recorded. The
+cap and how it is set are in `docker/README.md`.
+
+#### Integrity failures
+
+`FAIL: integrity: <check>: <detail>`, the detail naming the shard(s) or the
+run directory. The checks run in this order: `fault-fired` (injected runs
+only), `schedule-coverage`, `isolation-mounts`, `isolation-config`,
+`results-canary`, `results-ownership`, `image-drift`, `name-collision`,
+`result-coverage`, `package-hash`, `dependency-set`, `secret-scan`.
+
+- `isolation-mounts`, `isolation-config` and `image-drift` fail for a started
+  shard with no inspection data, with the detail
+  `shard-<k> could not be inspected`.
+- A `secret-scan` line names the file(s) only, never the value.
+- Missing evidence from a shard that ended abnormally, or whose test-1 failed
+  or did not finish, is no integrity failure; that shard's own line stands.
+- `schedule-coverage` is skipped when the run stopped, or its build failed,
+  before the shards were scheduled. `fault-fired` is skipped on an image build
+  failure and on a run-level stop before the end-of-run sequence. The summary
+  names each skipped check.
+
+#### Run-level stops
+
+- `FAIL: interrupted: <signal>`, the signal being `SIGINT`, `SIGTERM` or
+  `SIGHUP`.
+- `FAIL: run deadline: <phase> still running at the <m> min deadline`, the
+  phase being `build`, `shards` or `merge`, and m the deadline's minutes from
+  the start, rounded to the nearest whole minute, halves up.
+- `FAIL: memory watchdog: pod working set <x> GiB reached the <y> GiB stop line (<ceiling source>; <per-shard detail>)`.
+  x is the pod working set at the sample that reached the stop line, and y
+  is that stop line (the ceiling less 0.5 GiB), each to one decimal place.
+  The ceiling source reads `85% of the <L> GiB pod limit` or
+  `/ci-live's 40 GiB line, /ci-live run <PID> active`; the per-shard detail
+  gives each running shard's memory (`shard-1 1.1 GiB, shard-2 0.8 GiB`) or
+  reads `no shards running`.
+
+The first stop decides the run-level line; later ones change nothing. A stop
+before the end-of-run sequence gives every shard that had not ended, started
+or not, the cause `stopped by interrupt`, `stopped by memory watchdog` or
+`stopped by run deadline`. A stop during that sequence changes no shard's
+cause; its line still becomes the verdict.
+
+#### Image build lines
+
+- `FAIL: image build: base image build failed (exit <code>)`
+- `FAIL: image build: test image build failed (exit <code>)`
+
+A build that a run-level stop ended writes neither: the stop's line stands.
+
+#### Which line is the verdict
+
+Every failure is listed, with its shard, in `summary.txt` and in
+`results.json`'s `failures`. The verdict takes the highest-ranked one:
+
+| Tier | Failures | Order within the tier |
+|---|---|---|
+| 1 | the first run-level stop | one at most |
+| 2 | an image build failure | one at most |
+| 3 | integrity failures, each with its shard where the check names one | SR-13.2's check order (listed above) |
+| 4 | out-of-memory lines, both kill forms and `out-of-memory status unreadable` | by shard number |
+| 5 | other `FAIL: shard-<k>: <cause>` lines | by shard number |
+| 6 | script failures, `… in shard-<k>` end lines included except the out-of-memory form (tier 4) | canonical order; test-1's by lowest shard number |
 
 ### Adding a new test
 
