@@ -1404,6 +1404,793 @@ describe('E1: ci-run lifecycle', () => {
 // ===========================================================================
 // E9 (t1.t6s.5x): shard containers; E9 adds its cases here
 // ===========================================================================
+//
+// E9 T4 (b.uqm SR-10.6, AC 54): what a shard's one final reading records, and
+// the order of the docker operations that retire it, for every way a shard
+// ends. Each shard is started through section 13's start entry point
+// (`startShard`) over the fake container interface, its cgroup written by E6's
+// cgroup builder and found through its main process in the process table; it
+// is then read and retired through the run's retirer (`createShardRetirer`).
+// The order is proved from the fake's operation log alone, and each cgroup
+// read is placed in it by the number of operations made before it. Run-level
+// stops are driven as retirement reasons only (performing a stop is E13's).
+// The start's own argument list, credentials, inspection capture and refusals
+// are T5's, in tests/ci-run-results.test.ts. The region's imports are
+// namespaces and its helpers live inside its describe, so no name can collide
+// with another region's.
+
+import * as e9 from '../scripts/ci-run.ts'
+import * as e9Helpers from './test-helpers/ci-run.ts'
+import * as e9Credentials from './test-helpers/credentials.ts'
+import * as e9Clock from './test-helpers/fake-clock.ts'
+
+describe('E9: the final reading and shard retirement (b.t6s E9 T4; b.uqm SR-10.6, AC 54)', () => {
+  /** Test data: a RUN_ID of SR-5.1's form, and the runner's PID. */
+  const RUN_ID = '20261008t120000z-e9retire'
+  const OWNER: e9.Owner = { runId: RUN_ID, pid: 5150 }
+  /** The fake clock's start. */
+  const START_MS = Date.UTC(2026, 9, 8, 12, 0, 0)
+  /** How long after its start a shard is read or retired, on the fake clock. */
+  const READ_AFTER_MS = 90_000
+  /** The run's secret credential: a sentinel-bearing fake, in the runner's environment and secret set only. */
+  const API_KEY = e9Credentials.fakeToken(e9.RAW_KEY_PREFIX, 'e9-anthropic-key')
+  /** The one signal retirement may send. */
+  const SIGKILL: e9.SentSignal = 'SIGKILL'
+
+  // --- T4.S1: the local retirement fixture (shared by T4.S1 and T4.S2) ---
+
+  /** Shard k's cgroup files: distinct per shard, and every figure the reading takes non-zero. */
+  function figuresOf(shard: number): e9Helpers.ContainerCgroupBytes {
+    return {
+      currentBytes: 900_000_000 + shard,
+      anonBytes: 600_000_000 + shard * 1_000,
+      fileBytes: 200_000_000 + shard * 1_000,
+      inactiveFileBytes: 50_000_000,
+      pidCount: 30 + shard,
+      oomKillCount: shard + 1,
+    }
+  }
+
+  /** Shard k's Docker logs, as the fake gives them. */
+  function logsOf(shard: number): { readonly stdout: string; readonly stderr: string } {
+    return { stdout: `shard ${shard} container standard output\n`, stderr: `shard ${shard} container standard error\n` }
+  }
+
+  /** Assigned script 1's `start` and `end` lines, its real file name from the repository's listing. */
+  function ranEvents(): e9.ResultEvent[] {
+    const fileName = e9Helpers.realScriptFileName(1)
+    return [
+      { kind: e9.RESULT_WORD_START, fileName },
+      { kind: e9.RESULT_WORD_END, fileName, result: e9.RESULT_WORD_PASS, seconds: 12.5 },
+    ]
+  }
+  const DONE_EVENT: e9.ResultEvent = { kind: e9.RESULT_WORD_DONE }
+
+  interface StartOptions {
+    /** How its `docker run` answers: started (default), failed leaving the container created, or failed leaving none. */
+    readonly run?: 'start' | 'fail-created' | 'fail-none'
+    /** Fields of the started container over the fake's defaults. */
+    readonly container?: Partial<e9Helpers.FakeContainerSpec>
+    /** Its main process's `/proc/<pid>/cgroup` cannot be read. */
+    readonly membershipUnreadable?: boolean
+    /** The run's secret set also holds its container name, so the start's list check refuses its list. */
+    readonly secretIsName?: boolean
+  }
+
+  /** A shard as the fixture started it. */
+  interface StartedShard {
+    readonly shard: number
+    readonly result: e9.ShardStartResult
+    readonly name: string
+    /** What the retirer's docker operations name: its full ID when it started, else its name. */
+    readonly ref: string
+    readonly cgroupPath: string
+    readonly figures: e9Helpers.ContainerCgroupBytes
+    /** Its Docker logs as `docker.log` should hold them. */
+    readonly dockerLog: string
+    readonly shardDir: string
+    readonly dockerLogPath: string
+  }
+
+  interface RetirementRig {
+    readonly clock: e9Clock.FakeClock
+    readonly recorder: e9Helpers.SpawnRecorder
+    readonly docker: e9Helpers.FakeDocker
+    readonly tree: e9Helpers.CgroupTree
+    readonly root: string
+    readonly runDir: string
+    /** Every runner-log line, the start's and the retirer's. */
+    readonly lines: string[]
+    readonly state: { readonly cleanupFailures: string[] }
+    readonly retirer: e9.ShardRetirer
+    /** For each cgroup read the retirer made, how many docker operations had been made before it. */
+    readonly opsAtCgroupRead: number[]
+    start(shard: number, options?: StartOptions): Promise<StartedShard>
+    /** Writes the shard's `result.txt` through the result-file builder. */
+    writeResult(started: StartedShard, spec: e9Helpers.ResultFileSpec): void
+  }
+
+  let roots: string[] = []
+  let recorders: e9Helpers.SpawnRecorder[] = []
+  let rigs: RetirementRig[] = []
+
+  afterEach(() => {
+    const built = recorders
+    const checked = rigs
+    recorders = []
+    rigs = []
+    try {
+      // Everything each run logged, recorded and wrote, failure paths included, holds no credential.
+      for (const rig of checked) {
+        const shards = [1, 2, 3]
+        e9Credentials.assertNoLeak(
+          {
+            lines: rig.lines,
+            cleanupFailures: rig.state.cleanupFailures,
+            readings: shards.map((shard) => rig.retirer.recordedReading(shard)),
+            retirements: shards.map((shard) => rig.retirer.recordedRetirement(shard)),
+            runDir: e9Credentials.writtenFile(rig.runDir),
+          },
+          'e9 run',
+        )
+      }
+    } finally {
+      for (const root of roots) rmSync(root, { recursive: true, force: true })
+      roots = []
+    }
+    for (const recorder of built) recorder.assertNoFailures()
+  })
+
+  /**
+   * A run with no shard yet: a constructed root, a fake clock, a spawn
+   * recorder with the fake container interface, a cgroup tree, a run
+   * directory, a runner log collected in order, the run's state, one canary
+   * source and one retirer. The runner's environment holds the fake key;
+   * `afterEach` leak-checks what the run logged, recorded and wrote.
+   */
+  function newRig(): RetirementRig {
+    const root = mkdtempSync(join(tmpdir(), 'ci-run-lifecycle-e9-'))
+    roots.push(root)
+    const clock = e9Clock.createFakeClock({ start: START_MS })
+    const recorder = e9Helpers.createSpawnRecorder({ clock, root })
+    recorders.push(recorder)
+    const docker = e9Helpers.createFakeDocker(recorder)
+    const tree = e9Helpers.createCgroupTree(root)
+    const imageId = docker.addImage()
+    const runDir = e9Helpers.makeRunDir(root, RUN_ID)
+    const lines: string[] = []
+    const log: e9.RunnerLogSink = (line) => {
+      lines.push(line)
+    }
+    const state = { cleanupFailures: [] as string[] }
+    const env = { ANTHROPIC_API_KEY: API_KEY }
+    let draws = 0
+    const canaries = e9.createShardCanaryDrawer((count) => {
+      draws += 1
+      return Uint8Array.from({ length: count }, (_, index) => (draws * 37 + index) & 0xff)
+    })
+    const runAnswers = new Map<string, e9Helpers.FakeRunAnswer>()
+    docker.answerRuns((runArguments) => {
+      for (const [name, answer] of runAnswers) if (runArguments.includes(name)) return answer
+      throw new Error(`no run answer for ${JSON.stringify(runArguments)}`)
+    })
+    const opsAtCgroupRead: number[] = []
+    const retirer = e9.createShardRetirer({
+      deps: {
+        spawn: recorder.spawn,
+        env,
+        worktreeRoot: root,
+        clock,
+        readCgroupFile: (cgroupPath, fileName) => {
+          opsAtCgroupRead.push(docker.operations().length)
+          return tree.readCgroupFile(cgroupPath, fileName)
+        },
+        readProcCgroup: recorder.processes.deps().readProcCgroup,
+      },
+      runDir,
+      log,
+      state,
+    })
+
+    async function start(shard: number, options: StartOptions = {}): Promise<StartedShard> {
+      const name = e9.shardContainerName(OWNER, shard)
+      const cgroupPath = `/docker/e9-shard-${shard}`
+      const figures = figuresOf(shard)
+      const logs = logsOf(shard)
+      const run = options.run ?? 'start'
+      const unreadable: e9Helpers.ProcEntry[] = options.membershipUnreadable === true ? ['cgroup'] : []
+      const process = { cgroup: e9Helpers.cgroupMembershipLine(cgroupPath), unreadable }
+      runAnswers.set(name, run === 'start' ? { kind: 'start', container: { process, logs, ...options.container } } : { kind: 'fail', leavesContainer: run === 'fail-created' })
+      if (run === 'start') tree.writeContainer(cgroupPath, figures)
+      const result = await e9.startShard(
+        { spawn: recorder.spawn, env, worktreeRoot: root, clock },
+        {
+          owner: OWNER,
+          runDir,
+          assignment: { shard, assigned: [e9Helpers.realScriptFileName(1)] },
+          failFileNames: [],
+          faults: [],
+          pinnedImageId: imageId,
+          driftImageId: null,
+          tarballPath: join(root, 'package', 'cscb-ci.tgz'),
+          secretValues: options.secretIsName === true ? [API_KEY, name] : [API_KEY],
+          canaries,
+          log,
+        },
+      )
+      const shardDir = e9.shardSubdirectoryPath(runDir, shard)
+      return {
+        shard,
+        result,
+        name,
+        ref: result.containerId ?? name,
+        cgroupPath,
+        figures,
+        dockerLog: run === 'start' ? `${logs.stdout}${logs.stderr}` : '',
+        shardDir,
+        dockerLogPath: join(shardDir, e9.DOCKER_LOG_FILE_NAME),
+      }
+    }
+
+    const rig: RetirementRig = {
+      clock,
+      recorder,
+      docker,
+      tree,
+      root,
+      runDir,
+      lines,
+      state,
+      retirer,
+      opsAtCgroupRead,
+      start,
+      writeResult(started, spec) {
+        writeFileSync(join(started.shardDir, e9.RESULT_FILE_NAME), e9Helpers.resultFileText(spec))
+      },
+    }
+    rigs.push(rig)
+    return rig
+  }
+
+  /** A docker operation as an order assertion compares it. */
+  interface OperationSummary {
+    readonly kind: e9Helpers.FakeDockerOperationKind
+    readonly refs: readonly string[]
+    readonly signal: e9.SentSignal | null
+  }
+
+  function summaryOf(ops: readonly e9Helpers.FakeDockerOperation[]): OperationSummary[] {
+    return ops.map((op) => ({ kind: op.kind, refs: op.refs, signal: op.signal }))
+  }
+
+  /** b.uqm SR-10.6's order on `ref`: its state read (the final reading), SIGKILL only when `killed`, its logs, its removal. */
+  function retirementOrder(ref: string, killed: boolean): OperationSummary[] {
+    return [
+      { kind: 'container-state', refs: [ref], signal: null },
+      ...(killed ? [{ kind: 'container-kill' as const, refs: [ref], signal: SIGKILL }] : []),
+      { kind: 'container-logs', refs: [ref], signal: null },
+      { kind: 'container-remove', refs: [ref], signal: null },
+    ]
+  }
+
+  type Retired = Extract<e9.ShardRetirement, { readonly kind: 'retired' }>
+
+  function retiredOf(retirement: e9.ShardRetirement): Retired {
+    if (retirement.kind !== 'retired') throw new Error(`shard-${retirement.shard} was not retired: ${retirement.kind}`)
+    return retirement
+  }
+
+  /** A started shard after `READ_AFTER_MS`, with the operation and log-line counts before what follows. */
+  async function startedShard(rig: RetirementRig, shard: number, options: StartOptions = {}): Promise<StartedShard> {
+    const started = await rig.start(shard, options)
+    expect(started.result.start.kind).toBe('started')
+    expect(started.result.containerCreated).toBe(true)
+    await rig.clock.advance(READ_AFTER_MS)
+    return started
+  }
+
+  /** The reading of a running shard whose every part was read. */
+  function fullReading(started: StartedShard, oomKilled: boolean, status: string): e9.ShardFinalReading {
+    return {
+      shard: started.shard,
+      atMs: START_MS + READ_AFTER_MS,
+      final: { oomKilled, oomKillCount: started.figures.oomKillCount, anonBytes: started.figures.anonBytes, fileBytes: started.figures.fileBytes },
+      status,
+      running: true,
+      exitCode: null,
+      failedReadings: [],
+    }
+  }
+
+  /** Each failed reading has exactly one runner-log line, naming what failed, why, and `unreadable`. */
+  function expectOneLinePerFailedReading(reading: e9.ShardFinalReading, lines: readonly string[]): void {
+    expect(lines).toHaveLength(reading.failedReadings.length)
+    reading.failedReadings.forEach((failed, index) => {
+      const line = lines[index] ?? ''
+      expect(line.startsWith(`${e9.SHARD_DIR_PREFIX}${reading.shard}:`)).toBe(true)
+      expect(line).toContain(failed.what)
+      expect(line).toContain(failed.error)
+      expect(line).toContain(e9.UNREADABLE_READING)
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // T4.S1: what one final reading records (b.uqm SR-10.6)
+  // -------------------------------------------------------------------------
+
+  describe('the final reading (SR-10.6)', () => {
+    test.each([false, true])('a running shard\'s reading records State.OOMKilled %p, the kill count, anon and file as constructed, and writes no line', async (oomKilled) => {
+      const rig = newRig()
+      const started = await startedShard(rig, 1, { container: { oomKilled } })
+      const status = rig.docker.container(started.ref)?.status
+      const opsFrom = rig.docker.operations().length
+      const linesFrom = rig.lines.length
+
+      const reading = await rig.retirer.finalReading(started.result)
+
+      expect(reading).toEqual(fullReading(started, oomKilled, status ?? ''))
+      expect(rig.retirer.recordedReading(1)).toEqual(reading)
+      expect(summaryOf(rig.docker.operations().slice(opsFrom))).toEqual([{ kind: 'container-state', refs: [started.ref], signal: null }])
+      expect(rig.opsAtCgroupRead.length).toBeGreaterThan(0)
+      expect(rig.lines.slice(linesFrom)).toEqual([])
+    })
+
+    const STAT = e9Helpers.CGROUP_FILE.stat
+    const EVENTS = e9Helpers.CGROUP_FILE.events
+    type Part = 'oomKillCount' | 'anonBytes' | 'fileBytes'
+    test.each([
+      // The failed readings: one per failed file read, or one per key a readable file lacks.
+      ['memory.events removed', EVENTS, { kind: 'removed' }, ['oomKillCount'], 1],
+      ['memory.events garbled', EVENTS, { kind: 'garbled' }, ['oomKillCount'], 1],
+      ['memory.events without its oom_kill line', EVENTS, { kind: 'without-key', key: 'oom_kill' }, ['oomKillCount'], 1],
+      ['memory.stat removed', STAT, { kind: 'removed' }, ['anonBytes', 'fileBytes'], 1],
+      ['memory.stat garbled', STAT, { kind: 'garbled' }, ['anonBytes', 'fileBytes'], 2],
+      ['memory.stat without its anon line', STAT, { kind: 'without-key', key: 'anon' }, ['anonBytes'], 1],
+      ['memory.stat without its file line', STAT, { kind: 'without-key', key: 'file' }, ['fileBytes'], 1],
+    ] satisfies [string, e9Helpers.CgroupFileName, e9Helpers.CgroupFileChange, Part[], number][])('%s: only the parts it holds are unreadable, the others keep their values', async (_what, fileName, change, parts, failures) => {
+      const rig = newRig()
+      const started = await startedShard(rig, 1, { container: { oomKilled: true } })
+      const status = rig.docker.container(started.ref)?.status ?? ''
+      rig.tree.change(started.cgroupPath, fileName, change)
+      const linesFrom = rig.lines.length
+
+      const reading = await rig.retirer.finalReading(started.result)
+
+      const full = fullReading(started, true, status)
+      const final = { ...full.final }
+      for (const part of parts) final[part] = e9.UNREADABLE_READING
+      expect(reading).toEqual({ ...full, final, failedReadings: expect.any(Array) })
+      if (reading === null) throw new Error('no reading')
+      expect(reading.failedReadings).toHaveLength(failures)
+      for (const failed of reading.failedReadings) {
+        expect(failed.shard).toBe(1)
+        expect(failed.what).toContain(started.name)
+        expect(failed.what).toContain(fileName)
+      }
+      expectOneLinePerFailedReading(reading, rig.lines.slice(linesFrom))
+    })
+
+    test('its main process\'s cgroup membership unreadable: the three cgroup parts are unreadable, State.OOMKilled keeps its value', async () => {
+      const rig = newRig()
+      const started = await startedShard(rig, 1, { container: { oomKilled: true }, membershipUnreadable: true })
+      const status = rig.docker.container(started.ref)?.status ?? ''
+      const linesFrom = rig.lines.length
+
+      const reading = await rig.retirer.finalReading(started.result)
+
+      const full = fullReading(started, true, status)
+      expect(reading).toEqual({
+        ...full,
+        final: { oomKilled: true, oomKillCount: e9.UNREADABLE_READING, anonBytes: e9.UNREADABLE_READING, fileBytes: e9.UNREADABLE_READING },
+        failedReadings: [{ shard: 1, what: expect.stringContaining(started.name), error: expect.any(String) }],
+      })
+      if (reading === null) throw new Error('no reading')
+      expect(rig.tree.reads()).toEqual([])
+      expectOneLinePerFailedReading(reading, rig.lines.slice(linesFrom))
+    })
+
+    test.each([
+      ['Docker fails the state read', 'daemon'],
+      ['Docker answers State.OOMKilled in a form the layer cannot parse', 'unparseable'],
+    ] as const)('%s: every part, the status and whether it runs are unreadable, and no cgroup file is read', async (_what, how) => {
+      const rig = newRig()
+      const started = await startedShard(rig, 1, how === 'unparseable' ? { container: { stateReadings: [{ oomKilled: e9.UNREADABLE_READING }] } } : {})
+      if (how === 'daemon') rig.docker.fail('container-state')
+      const linesFrom = rig.lines.length
+
+      const reading = await rig.retirer.finalReading(started.result)
+
+      expect(reading).toEqual({
+        shard: 1,
+        atMs: START_MS + READ_AFTER_MS,
+        final: { oomKilled: e9.UNREADABLE_READING, oomKillCount: e9.UNREADABLE_READING, anonBytes: e9.UNREADABLE_READING, fileBytes: e9.UNREADABLE_READING },
+        status: e9.UNREADABLE_READING,
+        running: e9.UNREADABLE_READING,
+        exitCode: null,
+        failedReadings: [
+          { shard: 1, what: expect.stringContaining(started.name), error: expect.any(String) },
+          { shard: 1, what: expect.stringContaining(started.name), error: expect.any(String) },
+        ],
+      })
+      if (reading === null) throw new Error('no reading')
+      expect(rig.opsAtCgroupRead).toEqual([])
+      expectOneLinePerFailedReading(reading, rig.lines.slice(linesFrom))
+    })
+
+    test.each([
+      ['after its end marker', true, 0, false],
+      ['without its end marker', false, 3, true],
+    ])('a container that exited on its own %s: State.OOMKilled and the exit code are recorded, the cgroup parts are unreadable, and nothing throws', async (_what, marker, exitCode, oomKilled) => {
+      const rig = newRig()
+      const started = await startedShard(rig, 1)
+      rig.writeResult(started, { events: marker ? [...ranEvents(), DONE_EVENT] : ranEvents().slice(0, 1) })
+      rig.docker.exitContainer(started.ref, { exitCode, oomKilled })
+      const status = rig.docker.container(started.ref)?.status ?? ''
+      const linesFrom = rig.lines.length
+
+      const reading = await rig.retirer.finalReading(started.result)
+
+      expect(reading).toEqual({
+        shard: 1,
+        atMs: START_MS + READ_AFTER_MS,
+        final: { oomKilled, oomKillCount: e9.UNREADABLE_READING, anonBytes: e9.UNREADABLE_READING, fileBytes: e9.UNREADABLE_READING },
+        status,
+        running: false,
+        exitCode,
+        failedReadings: [{ shard: 1, what: expect.stringContaining(started.name), error: expect.any(String) }],
+      })
+      expect(e9.EXITED_CONTAINER_STATUSES as readonly string[]).toContain(status)
+      if (reading === null) throw new Error('no reading')
+      expect(rig.opsAtCgroupRead).toEqual([])
+      expectOneLinePerFailedReading(reading, rig.lines.slice(linesFrom))
+    })
+
+    test('asking twice, one after the other, gives the first reading and makes no new read', async () => {
+      const rig = newRig()
+      const started = await startedShard(rig, 1)
+      expect(rig.retirer.recordedReading(1)).toBeNull()
+      const first = await rig.retirer.finalReading(started.result)
+      const opsAfter = rig.docker.operations().length
+      const readsAfter = rig.tree.reads().length
+      const linesAfter = rig.lines.length
+      await rig.clock.advance(READ_AFTER_MS)
+
+      const second = await rig.retirer.finalReading(started.result)
+
+      expect(second).toBe(first)
+      expect(rig.retirer.recordedReading(1)).toBe(first)
+      expect(rig.docker.operations()).toHaveLength(opsAfter)
+      expect(rig.tree.reads()).toHaveLength(readsAfter)
+      expect(rig.lines).toHaveLength(linesAfter)
+    })
+
+    test('asking twice at once makes one state read and gives both requests the same reading', async () => {
+      const rig = newRig()
+      const started = await startedShard(rig, 1)
+      const opsFrom = rig.docker.operations().length
+
+      const [first, second] = await Promise.all([rig.retirer.finalReading(started.result), rig.retirer.finalReading(started.result)])
+
+      expect(second).toBe(first)
+      expect(summaryOf(rig.docker.operations().slice(opsFrom))).toEqual([{ kind: 'container-state', refs: [started.ref], signal: null }])
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // T4.S2: the retirement order for every way a shard ends (AC 54)
+  // -------------------------------------------------------------------------
+
+  describe('the retirement order (SR-10.6, AC 54)', () => {
+    type Ending = 'running' | 'exited' | 'created'
+    test.each([
+      ['its end marker written, its container still running', 'running', true, { kind: 'end-marker' }],
+      ['its wall-time limit', 'running', false, { kind: 'limit' }],
+      ['a kill:<k> fault', 'running', false, { kind: 'kill' }],
+      ['an interrupt', 'running', false, { kind: 'run-level-stop', by: 'interrupt' }],
+      ['the memory watchdog', 'running', false, { kind: 'run-level-stop', by: 'memory-watchdog' }],
+      ['the run deadline', 'running', false, { kind: 'run-level-stop', by: 'run-deadline' }],
+      ['its container exiting on its own after its end marker', 'exited', true, { kind: 'exited' }],
+      ['its container exiting on its own without its end marker', 'exited', false, { kind: 'exited' }],
+      ['a container created but never started, at a run-level stop', 'created', false, { kind: 'run-level-stop', by: 'interrupt' }],
+    ] satisfies [string, Ending, boolean, e9.RetirementReason][])('%s: the final reading, SIGKILL only while it runs, docker.log, then removal', async (_what, ending, marker, reason) => {
+      const rig = newRig()
+      const started = await rig.start(1, ending === 'created' ? { run: 'fail-created' } : {})
+      expect(started.result.containerCreated).toBe(true)
+      expect(started.result.start.kind).toBe(ending === 'created' ? 'failed-to-start' : 'started')
+      if (marker) rig.writeResult(started, { events: [...ranEvents(), DONE_EVENT] })
+      if (ending === 'exited') rig.docker.exitContainer(started.ref, { exitCode: 0 })
+      await rig.clock.advance(READ_AFTER_MS)
+      const opsFrom = rig.docker.operations().length
+      const running = ending === 'running'
+
+      const retirement = await rig.retirer.retire(started.result, reason)
+
+      const ops = rig.docker.operations().slice(opsFrom)
+      expect(summaryOf(ops)).toEqual(retirementOrder(started.ref, running))
+      expect(ops.flatMap((op) => (op.signal === null ? [] : [op.signal]))).toEqual(running ? [SIGKILL] : [])
+      // The reading's cgroup reads came right after its state read, before any later step.
+      expect([...new Set(rig.opsAtCgroupRead)]).toEqual(running ? [opsFrom + 1] : [])
+      const reading = rig.retirer.recordedReading(1)
+      if (reading === null) throw new Error('no reading recorded')
+      expect(reading.running).toBe(running)
+      expect(retirement).toEqual({
+        kind: 'retired',
+        shard: 1,
+        requested: reason,
+        reason,
+        reading,
+        kill: { kind: running ? 'sent' : 'not-running' },
+        logSave: { kind: 'saved', path: started.dockerLogPath },
+        removal: { kind: 'removed' },
+      })
+      expect(rig.retirer.recordedRetirement(1)).toBe(retirement)
+      expect(readFileSync(started.dockerLogPath, 'utf-8')).toBe(started.dockerLog)
+      expect(rig.docker.container(started.ref)).toBeNull()
+      expect(rig.state.cleanupFailures).toEqual([])
+    })
+
+    test('shards retired at once each get their own reading before their own removal, and nothing but SIGKILL is sent', async () => {
+      const rig = newRig()
+      const shards = [await rig.start(1), await rig.start(2), await rig.start(3)]
+      rig.docker.exitContainer(shards[1]!.ref, { exitCode: 1 })
+      const reasons: e9.RetirementReason[] = [{ kind: 'limit' }, { kind: 'exited' }, { kind: 'run-level-stop', by: 'memory-watchdog' }]
+      const opsFrom = rig.docker.operations().length
+
+      await Promise.all(shards.map((started, index) => rig.retirer.retire(started.result, reasons[index]!)))
+
+      const ops = rig.docker.operations().slice(opsFrom)
+      expect(ops.every((op) => op.signal === null || op.signal === SIGKILL)).toBe(true)
+      shards.forEach((started, index) => {
+        const own = ops.filter((op) => op.refs.includes(started.ref))
+        expect(summaryOf(own)).toEqual(retirementOrder(started.ref, index !== 1))
+        expect(readFileSync(started.dockerLogPath, 'utf-8')).toBe(started.dockerLog)
+        expect(rig.retirer.recordedReading(started.shard)?.shard).toBe(started.shard)
+      })
+      expect(ops).toHaveLength(11)
+    })
+
+    test.each([
+      ['a complete done line: retired at its end marker, with a runner-log line', { events: [...ranEvents(), DONE_EVENT] }, { kind: 'end-marker' }],
+      ['a done line still being written, without its line feed: still a limit retirement', { events: ranEvents(), partial: { event: DONE_EVENT } }, { kind: 'limit' }],
+    ] satisfies [string, e9Helpers.ResultFileSpec, e9.RetirementReason][])('a limit retirement of a shard whose result file holds %s', async (_what, resultFile, effective) => {
+      const rig = newRig()
+      const started = await startedShard(rig, 1)
+      rig.writeResult(started, resultFile)
+      const opsFrom = rig.docker.operations().length
+      const linesFrom = rig.lines.length
+
+      const retirement = retiredOf(await rig.retirer.retire(started.result, { kind: 'limit' }))
+
+      expect(retirement.requested).toEqual({ kind: 'limit' })
+      expect(retirement.reason).toEqual(effective)
+      expect(retiredOf(rig.retirer.recordedRetirement(1) ?? retirement).reason).toEqual(effective)
+      expect(summaryOf(rig.docker.operations().slice(opsFrom))).toEqual(retirementOrder(started.ref, true))
+      const markerLines = rig.lines.slice(linesFrom).filter((line) => line.startsWith(`${e9.SHARD_DIR_PREFIX}1:`) && line.includes(e9.RESULT_FILE_NAME))
+      expect(markerLines).toHaveLength(effective.kind === 'end-marker' ? 1 : 0)
+    })
+
+    test.each([
+      ['a docker run that failed and left no container', { run: 'fail-none' }, 'none'],
+      ['a docker run argument list the secret check refused', { secretIsName: true }, 'none'],
+      ['a docker run refused because another container holds its name', {}, 'holder'],
+    ] satisfies [string, StartOptions, 'none' | 'holder'][])('%s: no container, no reading, no docker operation and no runner-log line', async (_what, options, holder) => {
+      const rig = newRig()
+      const name = e9.shardContainerName(OWNER, 1)
+      if (holder === 'holder') rig.docker.addContainer({ name, running: false })
+      const started = await rig.start(1, options)
+      expect(started.result.containerCreated).toBe(false)
+      expect(started.result.start.nameInUse).toBe(holder === 'holder')
+      const opsFrom = rig.docker.operations().length
+      const linesFrom = rig.lines.length
+      const reason: e9.RetirementReason = { kind: 'run-level-stop', by: 'memory-watchdog' }
+
+      const retirement = await rig.retirer.retire(started.result, reason)
+      const reading = await rig.retirer.finalReading(started.result)
+
+      expect(retirement).toEqual({ kind: 'no-container', shard: 1, requested: reason, reason })
+      expect(reading).toBeNull()
+      expect(rig.retirer.recordedReading(1)).toBeNull()
+      expect(rig.retirer.recordedRetirement(1)).toBe(retirement)
+      expect(rig.docker.operations().slice(opsFrom)).toEqual([])
+      expect(rig.lines.slice(linesFrom)).toEqual([])
+      expect(existsSync(started.dockerLogPath)).toBe(false)
+      if (holder === 'holder') expect(rig.docker.container(name)).not.toBeNull()
+    })
+
+    test('a failed start whose container Docker does not know: one state read, one runner-log line, no reading and nothing retired', async () => {
+      const rig = newRig()
+      // The start's own check of what its failed run left fails, so the container counts as created.
+      rig.docker.fail('container-state')
+      const started = await rig.start(1, { run: 'fail-none' })
+      expect(started.result.containerCreated).toBe(true)
+      const opsFrom = rig.docker.operations().length
+      const linesFrom = rig.lines.length
+
+      const retirement = await rig.retirer.retire(started.result, { kind: 'limit' })
+      const reading = await rig.retirer.finalReading(started.result)
+
+      expect(retirement).toEqual({ kind: 'no-container', shard: 1, requested: { kind: 'limit' }, reason: { kind: 'limit' } })
+      expect(reading).toBeNull()
+      expect(rig.retirer.recordedReading(1)).toBeNull()
+      expect(summaryOf(rig.docker.operations().slice(opsFrom))).toEqual([{ kind: 'container-state', refs: [started.name], signal: null }])
+      const lines = rig.lines.slice(linesFrom)
+      expect(lines).toHaveLength(1)
+      expect(lines[0]?.startsWith(`${e9.SHARD_DIR_PREFIX}1:`)).toBe(true)
+      expect(lines[0]).toContain(started.name)
+      expect(existsSync(started.dockerLogPath)).toBe(false)
+    })
+
+    test('a started shard whose container vanished: an all-unreadable reading, not running, no SIGKILL, no docker.log and nothing to remove', async () => {
+      const rig = newRig()
+      const started = await startedShard(rig, 1)
+      rig.docker.exitContainer(started.ref, { exitCode: 0 })
+      // Removed by another client, through the same fake.
+      const removed = await e9.removeContainer({ spawn: rig.recorder.spawn, env: {}, cwd: rig.root }, started.ref)
+      expect(removed.ok).toBe(true)
+      const opsFrom = rig.docker.operations().length
+      const linesFrom = rig.lines.length
+
+      const retirement = retiredOf(await rig.retirer.retire(started.result, { kind: 'kill' }))
+
+      expect(retirement.reading).toEqual({
+        shard: 1,
+        atMs: START_MS + READ_AFTER_MS,
+        final: { oomKilled: e9.UNREADABLE_READING, oomKillCount: e9.UNREADABLE_READING, anonBytes: e9.UNREADABLE_READING, fileBytes: e9.UNREADABLE_READING },
+        status: e9.UNREADABLE_READING,
+        running: false,
+        exitCode: null,
+        failedReadings: [
+          { shard: 1, what: expect.stringContaining(started.name), error: expect.any(String) },
+          { shard: 1, what: expect.stringContaining(started.name), error: expect.any(String) },
+        ],
+      })
+      expect(retirement.kill).toEqual({ kind: 'not-running' })
+      expect(retirement.logSave).toEqual({ kind: 'absent' })
+      expect(retirement.removal).toEqual({ kind: 'absent' })
+      expect(summaryOf(rig.docker.operations().slice(opsFrom))).toEqual(retirementOrder(started.ref, false))
+      expect(existsSync(started.dockerLogPath)).toBe(false)
+      expect(rig.state.cleanupFailures).toEqual([])
+      const lines = rig.lines.slice(linesFrom)
+      // One line per failed reading, then the absent docker.log's.
+      expect(lines).toHaveLength(retirement.reading.failedReadings.length + 1)
+      expect(lines.at(-1)).toContain(e9.DOCKER_LOG_FILE_NAME)
+      expect(lines.at(-1)).toContain(started.name)
+    })
+
+    test.each([
+      ['a limit retirement of a running container: SIGKILL sent', 'running', { kind: 'limit' }, true],
+      ['a run-level stop of a running container: SIGKILL sent', 'running', { kind: 'run-level-stop', by: 'run-deadline' }, true],
+      ['an exit on its own: no SIGKILL', 'exited', { kind: 'exited' }, false],
+    ] satisfies [string, 'running' | 'exited', e9.RetirementReason, boolean][])('whether it runs unreadable, %s', async (_what, ending, reason, killed) => {
+      const rig = newRig()
+      const started = await startedShard(rig, 1)
+      if (ending === 'exited') rig.docker.exitContainer(started.ref, { exitCode: 0 })
+      rig.docker.fail('container-state')
+      const opsFrom = rig.docker.operations().length
+
+      const retirement = retiredOf(await rig.retirer.retire(started.result, reason))
+
+      expect(retirement.reading.running).toBe(e9.UNREADABLE_READING)
+      expect(retirement.kill).toEqual({ kind: killed ? 'sent' : 'not-running' })
+      expect(summaryOf(rig.docker.operations().slice(opsFrom))).toEqual(retirementOrder(started.ref, killed))
+      expect(retirement.removal).toEqual({ kind: 'removed' })
+    })
+
+    test('a failed removal is written to the runner log and listed as a cleanup failure', async () => {
+      const rig = newRig()
+      const started = await startedShard(rig, 1)
+      const refusal = 'Error response from daemon: constructed removal refusal'
+      rig.docker.fail('container-remove', { stderr: refusal })
+      const opsFrom = rig.docker.operations().length
+      const linesFrom = rig.lines.length
+
+      const retirement = retiredOf(await rig.retirer.retire(started.result, { kind: 'limit' }))
+
+      expect(summaryOf(rig.docker.operations().slice(opsFrom))).toEqual(retirementOrder(started.ref, true))
+      if (retirement.removal.kind !== 'failed') throw new Error(`removal: ${retirement.removal.kind}`)
+      const { line } = retirement.removal
+      expect(line).toContain(started.name)
+      expect(line).toContain(started.ref)
+      expect(line).toContain(refusal)
+      expect(rig.lines.slice(linesFrom)).toEqual([line])
+      expect(rig.state.cleanupFailures).toEqual([line])
+      expect(retirement.logSave).toEqual({ kind: 'saved', path: started.dockerLogPath })
+    })
+
+    test.each([
+      ['Docker fails to give its logs', 'logs'],
+      ['docker.log cannot be written', 'write'],
+    ] as const)('a failed log save (%s) is written to the runner log, and its removal still follows', async (_what, how) => {
+      const rig = newRig()
+      const started = await startedShard(rig, 1)
+      if (how === 'logs') rig.docker.fail('container-logs')
+      else mkdirSync(started.dockerLogPath)
+      const opsFrom = rig.docker.operations().length
+      const linesFrom = rig.lines.length
+
+      const retirement = retiredOf(await rig.retirer.retire(started.result, { kind: 'kill' }))
+
+      expect(summaryOf(rig.docker.operations().slice(opsFrom))).toEqual(retirementOrder(started.ref, true))
+      expect(retirement.logSave.kind).toBe('failed')
+      expect(retirement.removal).toEqual({ kind: 'removed' })
+      expect(rig.docker.container(started.ref)).toBeNull()
+      const lines = rig.lines.slice(linesFrom)
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toContain(e9.DOCKER_LOG_FILE_NAME)
+      expect(rig.state.cleanupFailures).toEqual([])
+      if (how === 'logs') expect(existsSync(started.dockerLogPath)).toBe(false)
+    })
+
+    test('a failed SIGKILL is written to the runner log but is no cleanup failure, and its removal still follows', async () => {
+      const rig = newRig()
+      const started = await startedShard(rig, 1)
+      rig.docker.fail('container-kill')
+      const opsFrom = rig.docker.operations().length
+      const linesFrom = rig.lines.length
+
+      const retirement = retiredOf(await rig.retirer.retire(started.result, { kind: 'run-level-stop', by: 'interrupt' }))
+
+      expect(summaryOf(rig.docker.operations().slice(opsFrom))).toEqual(retirementOrder(started.ref, true))
+      expect(retirement.kill.kind).toBe('failed')
+      expect(retirement.logSave).toEqual({ kind: 'saved', path: started.dockerLogPath })
+      // Still running, so Docker refuses the unforced removal: that, not the kill, is the cleanup failure.
+      if (retirement.removal.kind !== 'failed') throw new Error(`removal: ${retirement.removal.kind}`)
+      expect(rig.state.cleanupFailures).toEqual([retirement.removal.line])
+      const lines = rig.lines.slice(linesFrom)
+      expect(lines).toHaveLength(2)
+      expect(lines[0]).toContain(started.name)
+      expect(lines[0]).not.toBe(retirement.removal.line)
+      expect(lines[1]).toBe(retirement.removal.line)
+    })
+
+    test('retiring a shard again, for another reason, gives the first retirement and makes no operation', async () => {
+      const rig = newRig()
+      const started = await startedShard(rig, 1)
+      const first = await rig.retirer.retire(started.result, { kind: 'limit' })
+      const opsAfter = rig.docker.operations().length
+      const linesAfter = rig.lines.length
+
+      const again = await rig.retirer.retire(started.result, { kind: 'run-level-stop', by: 'interrupt' })
+      const reading = await rig.retirer.finalReading(started.result)
+
+      expect(again).toBe(first)
+      expect(reading).toBe(retiredOf(first).reading)
+      expect(rig.docker.operations()).toHaveLength(opsAfter)
+      expect(rig.lines).toHaveLength(linesAfter)
+    })
+
+    test('a limit retirement, a run-level stop and a reading request at once share one reading and one set of operations', async () => {
+      const rig = newRig()
+      const started = await startedShard(rig, 1)
+      const opsFrom = rig.docker.operations().length
+
+      const [byLimit, byStop, reading] = await Promise.all([
+        rig.retirer.retire(started.result, { kind: 'limit' }),
+        rig.retirer.retire(started.result, { kind: 'run-level-stop', by: 'run-deadline' }),
+        rig.retirer.finalReading(started.result),
+      ])
+
+      expect(byStop).toBe(byLimit)
+      expect(retiredOf(byLimit).reason).toEqual({ kind: 'limit' })
+      expect(reading).not.toBeNull()
+      expect(retiredOf(byLimit).reading).toBe(reading as e9.ShardFinalReading)
+      expect(summaryOf(rig.docker.operations().slice(opsFrom))).toEqual(retirementOrder(started.ref, true))
+    })
+
+    test('a reading taken before the retirement is the retirement\'s reading: Docker\'s state is read once', async () => {
+      const rig = newRig()
+      const started = await startedShard(rig, 1)
+      const opsFrom = rig.docker.operations().length
+      const reading = await rig.retirer.finalReading(started.result)
+
+      const retirement = retiredOf(await rig.retirer.retire(started.result, { kind: 'kill' }))
+
+      expect(reading).not.toBeNull()
+      expect(retirement.reading).toBe(reading as e9.ShardFinalReading)
+      expect(summaryOf(rig.docker.operations().slice(opsFrom))).toEqual(retirementOrder(started.ref, true))
+    })
+  })
+})
 
 // ===========================================================================
 // E13 (t1.t6s.vd): the run sequence end to end, stops and the end of run; E13 adds its cases here
