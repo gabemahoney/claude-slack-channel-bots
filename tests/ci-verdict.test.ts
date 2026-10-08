@@ -822,7 +822,7 @@ interface PidCase {
 
 /** Plants the case's run directory with a verdict, so wait returns at its first check, and the status file when given. */
 function plantVerdictRun(h: VerbHarness, status?: RunDirectorySpec['status']): void {
-  h.buildRun({ status, verdict: reader.PASS_VERDICT })
+  h.buildRun({ status, verdict: runner.PASS_VERDICT })
 }
 
 /** The `key=value` fields of wait's line. */
@@ -1035,49 +1035,49 @@ function firstLineRows(group: string, ciArgs: () => readonly string[], rows: Rea
 
 /** Exactly `PASS`. */
 function passLine(): string {
-  return reader.PASS_VERDICT
+  return runner.PASS_VERDICT
 }
 
 const FIRST_LINE_ROWS: readonly FirstLineRow[] = [
   ...firstLineRows('full, no injection', () => [], [
     [true, 'exactly PASS', passLine],
     [true, 'a line beginning FAIL: ', failLine],
-    [false, 'a SELECTIVE (…) line', () => selectiveLine(canonicalList(), reader.PASS_VERDICT)],
-    [false, 'an INJECTED (…) line', () => injectedLine(normalizedFaults(), reader.PASS_VERDICT)],
-    [false, 'an empty first line, PASS on the second', () => ({ line: '', change: { kind: 'second-line', line: reader.PASS_VERDICT } })],
-    [false, 'PASS in another case', () => reader.PASS_VERDICT.toLowerCase()],
-    [false, 'PASS with a trailing space', () => `${reader.PASS_VERDICT} `],
-    [false, 'PASS with trailing text', () => `${reader.PASS_VERDICT}: all`],
+    [false, 'a SELECTIVE (…) line', () => selectiveLine(canonicalList(), runner.PASS_VERDICT)],
+    [false, 'an INJECTED (…) line', () => injectedLine(normalizedFaults(), runner.PASS_VERDICT)],
+    [false, 'an empty first line, PASS on the second', () => ({ line: '', change: { kind: 'second-line', line: runner.PASS_VERDICT } })],
+    [false, 'PASS in another case', () => runner.PASS_VERDICT.toLowerCase()],
+    [false, 'PASS with a trailing space', () => `${runner.PASS_VERDICT} `],
+    [false, 'PASS with trailing text', () => `${runner.PASS_VERDICT}: all`],
   ]),
   ...firstLineRows('selection, no injection', selectedNumberForms, [
-    [true, 'test-1 and every selected script in canonical order', () => selectiveLine(canonicalList(), reader.PASS_VERDICT)],
+    [true, 'test-1 and every selected script in canonical order', () => selectiveLine(canonicalList(), runner.PASS_VERDICT)],
     [true, 'the same with an added prerequisite', () => selectiveLine(canonicalList([runner.numberFormOf(PREREQUISITE_NUMBER)]), failLine())],
     [false, 'exactly PASS (AC 72)', passLine],
-    [false, 'a list missing test-1', () => selectiveLine(offList(canonicalList().filter((entry) => entry !== runner.numberFormOf(EVERY_SHARD_NUMBER))), reader.PASS_VERDICT)],
-    [false, 'a list missing a selected script', () => selectiveLine(offList(canonicalList().filter((entry) => entry !== runner.numberFormOf(SELECTED_NUMBERS[1]))), reader.PASS_VERDICT)],
-    [false, 'a list in ascending number order, not canonical order', () => selectiveLine(offList([...canonicalList()].sort(byNumber)), reader.PASS_VERDICT)],
-    [false, 'an entry repeated', () => selectiveLine(offList([...canonicalList(), ...canonicalList().slice(-1)]), reader.PASS_VERDICT)],
-    [false, 'an entry that is a file name, not a number form', () => selectiveLine(offList(canonicalList().map((entry) => (entry === runner.numberFormOf(SELECTED_NUMBERS[0]) ? realScriptFileName(SELECTED_NUMBERS[0]) : entry))), reader.PASS_VERDICT)],
-    [false, 'doubled spaces', () => selectiveLine(canonicalList(), reader.PASS_VERDICT, reader.SCRIPT_LIST_SEPARATOR.repeat(2))],
+    [false, 'a list missing test-1', () => selectiveLine(offList(canonicalList().filter((entry) => entry !== runner.numberFormOf(EVERY_SHARD_NUMBER))), runner.PASS_VERDICT)],
+    [false, 'a list missing a selected script', () => selectiveLine(offList(canonicalList().filter((entry) => entry !== runner.numberFormOf(SELECTED_NUMBERS[1]))), runner.PASS_VERDICT)],
+    [false, 'a list in ascending number order, not canonical order', () => selectiveLine(offList([...canonicalList()].sort(byNumber)), runner.PASS_VERDICT)],
+    [false, 'an entry repeated', () => selectiveLine(offList([...canonicalList(), ...canonicalList().slice(-1)]), runner.PASS_VERDICT)],
+    [false, 'an entry that is a file name, not a number form', () => selectiveLine(offList(canonicalList().map((entry) => (entry === runner.numberFormOf(SELECTED_NUMBERS[0]) ? realScriptFileName(SELECTED_NUMBERS[0]) : entry))), runner.PASS_VERDICT)],
+    [false, 'doubled spaces', () => selectiveLine(canonicalList(), runner.PASS_VERDICT, reader.SCRIPT_LIST_SEPARATOR.repeat(2))],
   ]),
-  ...firstLineRows('selection given as file names, no injection', selectedFileNames, [[true, 'the canonical list of number forms', () => selectiveLine(canonicalList(), reader.PASS_VERDICT)]]),
+  ...firstLineRows('selection given as file names, no injection', selectedFileNames, [[true, 'the canonical list of number forms', () => selectiveLine(canonicalList(), runner.PASS_VERDICT)]]),
   ...firstLineRows('selection with a script named twice, no injection', () => [...selectedNumberForms(), ...selectedFileNames().slice(0, 1)], [
-    [true, 'each entry once', () => selectiveLine(canonicalList(), reader.PASS_VERDICT)],
+    [true, 'each entry once', () => selectiveLine(canonicalList(), runner.PASS_VERDICT)],
   ]),
   ...firstLineRows('full, injection', injectArgs, [
-    [true, 'INJECTED (<normalized faults>): wrapping a valid full line', () => injectedLine(normalizedFaults(), reader.PASS_VERDICT)],
+    [true, 'INJECTED (<normalized faults>): wrapping a valid full line', () => injectedLine(normalizedFaults(), runner.PASS_VERDICT)],
     [false, 'exactly PASS (AC 72)', passLine],
-    [false, 'other faults', () => injectedLine([{ kind: 'retag' }], reader.PASS_VERDICT)],
-    [false, 'the same faults in another order', () => injectedLine([...normalizedFaults()].reverse(), reader.PASS_VERDICT)],
-    [false, 'a missing fault', () => injectedLine(normalizedFaults().slice(1), reader.PASS_VERDICT)],
-    [false, 'a repeated fault shown twice', () => injectedLine(givenFaults().map((given) => given.fault), reader.PASS_VERDICT)],
-    [false, 'a file-name script shown as given, not in number form', () => injectedLine([{ kind: 'fail', script: realScriptFileName(SELECTED_NUMBERS[0]) }, ...normalizedFaults().slice(1)], reader.PASS_VERDICT)],
+    [false, 'other faults', () => injectedLine([{ kind: 'retag' }], runner.PASS_VERDICT)],
+    [false, 'the same faults in another order', () => injectedLine([...normalizedFaults()].reverse(), runner.PASS_VERDICT)],
+    [false, 'a missing fault', () => injectedLine(normalizedFaults().slice(1), runner.PASS_VERDICT)],
+    [false, 'a repeated fault shown twice', () => injectedLine(givenFaults().map((given) => given.fault), runner.PASS_VERDICT)],
+    [false, 'a file-name script shown as given, not in number form', () => injectedLine([{ kind: 'fail', script: realScriptFileName(SELECTED_NUMBERS[0]) }, ...normalizedFaults().slice(1)], runner.PASS_VERDICT)],
     [false, 'a missing wrapper', failLine],
   ]),
   ...firstLineRows('selection, injection', () => [...selectedNumberForms(), ...injectArgs()], [
     [true, 'INJECTED (<normalized faults>): wrapping a valid selective line', () => injectedLine(normalizedFaults(), selectiveLine(canonicalList(), failLine()))],
     [false, 'exactly PASS (AC 72)', passLine],
-    [false, 'a missing wrapper', () => selectiveLine(canonicalList(), reader.PASS_VERDICT)],
+    [false, 'a missing wrapper', () => selectiveLine(canonicalList(), runner.PASS_VERDICT)],
   ]),
   ...firstLineRows('an unknown option the runner refuses', () => refusedArgs(REFUSED_CI_ARGS), [
     [false, 'exactly PASS', passLine],
@@ -1085,11 +1085,11 @@ const FIRST_LINE_ROWS: readonly FirstLineRow[] = [
   ]),
   ...firstLineRows('fail and timeout naming one script, which the runner refuses', () => refusedArgs(['--inject', `fail:${runner.numberFormOf(SELECTED_NUMBERS[0])}`, '--inject', `timeout:${runner.numberFormOf(SELECTED_NUMBERS[0])}`]), [
     [false, 'exactly PASS', passLine],
-    [false, 'its faults wrapping PASS', () => injectedLine([{ kind: 'fail', script: runner.numberFormOf(SELECTED_NUMBERS[0]) }, { kind: 'timeout', script: runner.numberFormOf(SELECTED_NUMBERS[0]) }], reader.PASS_VERDICT)],
+    [false, 'its faults wrapping PASS', () => injectedLine([{ kind: 'fail', script: runner.numberFormOf(SELECTED_NUMBERS[0]) }, { kind: 'timeout', script: runner.numberFormOf(SELECTED_NUMBERS[0]) }], runner.PASS_VERDICT)],
   ]),
   ...firstLineRows('a SCRIPT that is neither a number form nor a file name', neitherScriptArgs, [
     [false, 'exactly PASS', passLine],
-    [false, 'a SELECTIVE line listing test-1', () => selectiveLine([runner.numberFormOf(EVERY_SHARD_NUMBER)], reader.PASS_VERDICT)],
+    [false, 'a SELECTIVE line listing test-1', () => selectiveLine([runner.numberFormOf(EVERY_SHARD_NUMBER)], runner.PASS_VERDICT)],
   ]),
 ]
 
@@ -1148,7 +1148,7 @@ function reportSummaryResults(): { readonly runId: string; readonly pid: number;
 
 /** A full PASS's run files: a running status, the timing summary and `PASS`. */
 function fullPassFiles(h: VerbHarness): ReportRunFiles {
-  return { status: reportRunningStatus(h), results: reportSummaryResults(), verdict: reader.PASS_VERDICT }
+  return { status: reportRunningStatus(h), results: reportSummaryResults(), verdict: runner.PASS_VERDICT }
 }
 
 /** `selectiveLine` with the list test-1 and `numbers` (ascending, above 1) as number forms. */
@@ -1457,7 +1457,7 @@ const PRECEDENCE_ROWS: ReadonlyArray<readonly [string, PrecedenceRow]> = [
     {
       ciArgs: () => [],
       grace: GRACE_NONE,
-      files: (h) => ({ status: reportRefusedStatus(h, null, 'a refusal summary'), verdict: reader.PASS_VERDICT }),
+      files: (h) => ({ status: reportRefusedStatus(h, null, 'a refusal summary'), verdict: runner.PASS_VERDICT }),
       report: (runDir) => [reader.RUNNER_DIED_TEXT, reader.resultsLine(runDir)],
       exitCode: () => reader.REPORT_EXIT_FAIL,
     },
@@ -1510,11 +1510,11 @@ const GRACE_LINE_ROWS: ReadonlyArray<readonly [string, string, number | null, st
 
 /** The PASS forms whose timing summary may not be read: the `/ci` arguments, the verdict, the PASS line and exit code. */
 const PASS_FORMS: ReadonlyArray<readonly [string, () => readonly string[], () => string, () => string, () => number]> = [
-  ['full PASS', () => [], () => reader.PASS_VERDICT, () => reader.FULL_PASS_TEXT, () => reader.REPORT_EXIT_FULL_PASS],
+  ['full PASS', () => [], () => runner.PASS_VERDICT, () => reader.FULL_PASS_TEXT, () => reader.REPORT_EXIT_FULL_PASS],
   [
     'selective PASS',
     () => [runner.numberFormOf(23)],
-    () => selectiveVerdictLine([23], reader.PASS_VERDICT),
+    () => selectiveVerdictLine([23], runner.PASS_VERDICT),
     () => reader.selectivePassLine([1, 23].map((n) => runner.numberFormOf(n)).join(reader.SCRIPT_LIST_SEPARATOR)),
     () => reader.REPORT_EXIT_SELECTIVE_PASS,
   ],
@@ -1573,7 +1573,7 @@ describe('outcomes and report lines (b.uqm SR-17.3)', () => {
 
   test('runner died: an invalid first line (an empty verdict.txt) gives the report with its results line', async () => {
     const h = verbHarness()
-    h.buildRun({ status: reportRunningStatus(h), verdict: { line: reader.PASS_VERDICT, change: { kind: 'empty' } } })
+    h.buildRun({ status: reportRunningStatus(h), verdict: { line: runner.PASS_VERDICT, change: { kind: 'empty' } } })
 
     const result = await h.run(reportArgv(REPORTED_PID))
 
@@ -1659,7 +1659,7 @@ describe('outcomes and report lines (b.uqm SR-17.3)', () => {
 
   test('a results file whose other keys depart from the shape still prints its timing summary', async () => {
     const h = verbHarness()
-    const runDir = h.buildRun({ status: reportRunningStatus(h), verdict: reader.PASS_VERDICT })
+    const runDir = h.buildRun({ status: reportRunningStatus(h), verdict: runner.PASS_VERDICT })
     writeOffShapeResults(runDir, makeResults({ runId: RUN_ID, pid: REPORTED_PID, timingSummary: reportTimingSummary() }, runDir))
 
     const result = await h.run(reportArgv(REPORTED_PID))
@@ -1746,7 +1746,7 @@ function runnerRun(spec: { readonly phase: runner.StatusPhase | null; readonly a
   const pid = h.addRunner({ alive: spec.alive ?? true })
   const runDir = h.buildRun({
     status: spec.phase === null ? undefined : statusIn(h, pid, spec.phase),
-    verdict: spec.verdict === true ? reader.PASS_VERDICT : undefined,
+    verdict: spec.verdict === true ? runner.PASS_VERDICT : undefined,
   })
   return { h, pid, runDir }
 }
@@ -1805,7 +1805,7 @@ describe('the wait verb (b.uqm SR-17.5)', () => {
   })
 
   test.each([
-    ['a verdict file appears', 'shards', ((run) => runner.writeVerdictFile(run.runDir, reader.PASS_VERDICT)) as RunChange, 'verdict', WAIT_EXIT_VERDICT, 'shards', true],
+    ['a verdict file appears', 'shards', ((run) => runner.writeVerdictFile(run.runDir, runner.PASS_VERDICT)) as RunChange, 'verdict', WAIT_EXIT_VERDICT, 'shards', true],
     ['a refusal is recorded', 'shards', writeStatusPhase('refused'), 'refused', WAIT_EXIT_REFUSED, 'refused', true],
     ['the runner dies', 'shards', ((run) => run.h.processes.makeGone(run.pid)) as RunChange, 'gone', WAIT_EXIT_GONE, 'shards', false],
     ['the phase moves from shards to merge', 'shards', writeStatusPhase('merge'), 'running', WAIT_EXIT_RUNNING, 'merge', true],
@@ -2079,7 +2079,7 @@ const PLANTED_TEXT_KINDS: ReadonlyArray<readonly [string, (h: VerbHarness, text:
     'a timing-summary line',
     (h, text) => {
       const plain = reportTimingSummary()[0] ?? ''
-      const runDir = h.buildRun({ status: reportRunningStatus(h), results: { runId: RUN_ID, pid: REPORTED_PID, timingSummary: [plain, text] }, verdict: reader.PASS_VERDICT })
+      const runDir = h.buildRun({ status: reportRunningStatus(h), results: { runId: RUN_ID, pid: REPORTED_PID, timingSummary: [plain, text] }, verdict: runner.PASS_VERDICT })
       return { ciArgs: [], planted: [join(runDir, runner.RESULTS_FILE_NAME)], report: (_dir, masked) => [reader.FULL_PASS_TEXT, plain, masked] }
     },
   ],
@@ -2114,7 +2114,7 @@ interface RetentionRun {
 /** The outcomes after which the run directory is removed (b.uqm SR-16.3). */
 const REMOVED_ROWS: ReadonlyArray<readonly [string, RetentionRun]> = [
   ['a full PASS', { files: fullPassFiles }],
-  ['a selective PASS', { ciArgs: () => [runner.numberFormOf(23)], files: (h) => ({ ...fullPassFiles(h), verdict: selectiveVerdictLine([23], reader.PASS_VERDICT) }) }],
+  ['a selective PASS', { ciArgs: () => [runner.numberFormOf(23)], files: (h) => ({ ...fullPassFiles(h), verdict: selectiveVerdictLine([23], runner.PASS_VERDICT) }) }],
   ['a refusal', { files: (h) => ({ status: reportRefusedStatus(h, null, 'a refusal summary', ['a detail']) }) }],
 ]
 
@@ -2122,11 +2122,11 @@ const REMOVED_ROWS: ReadonlyArray<readonly [string, RetentionRun]> = [
 const KEPT_ROWS: ReadonlyArray<readonly [string, RetentionRun]> = [
   ['a full FAIL', { files: (h) => ({ status: reportRunningStatus(h), verdict: `${runner.FAIL_PREFIX}a failure` }) }],
   ['a selective FAIL', { ciArgs: () => [runner.numberFormOf(23)], files: (h) => ({ status: reportRunningStatus(h), verdict: selectiveVerdictLine([23], `${runner.FAIL_PREFIX}a failure`) }) }],
-  ['an injected PASS', { ciArgs: () => ['--inject', 'kill:1'], files: (h) => ({ ...fullPassFiles(h), verdict: injectedVerdictLine(['--inject', 'kill:1'], reader.PASS_VERDICT) }) }],
+  ['an injected PASS', { ciArgs: () => ['--inject', 'kill:1'], files: (h) => ({ ...fullPassFiles(h), verdict: injectedVerdictLine(['--inject', 'kill:1'], runner.PASS_VERDICT) }) }],
   ['a runner-died report: no verdict', { files: (h) => ({ status: reportRunningStatus(h), runnerLog: { pid: REPORTED_PID, lineCount: 3 } }) }],
   ['a runner-died report: a signalled grace over a full PASS', { grace: KILL_GRACE, files: fullPassFiles }],
-  ['an invalid verdict (an empty verdict.txt)', { files: (h) => ({ status: reportRunningStatus(h), verdict: { line: reader.PASS_VERDICT, change: { kind: 'empty' } } }) }],
-  ['a PASS whose timing summary cannot be read (no results file)', { files: (h) => ({ status: reportRunningStatus(h), verdict: reader.PASS_VERDICT }) }],
+  ['an invalid verdict (an empty verdict.txt)', { files: (h) => ({ status: reportRunningStatus(h), verdict: { line: runner.PASS_VERDICT, change: { kind: 'empty' } } }) }],
+  ['a PASS whose timing summary cannot be read (no results file)', { files: (h) => ({ status: reportRunningStatus(h), verdict: runner.PASS_VERDICT }) }],
 ]
 
 /** Runs `report` over a retention case's run. */
@@ -2227,7 +2227,7 @@ describe('retention (b.uqm SR-16.3, the reader half of PRD AC 74)', () => {
   test('the removal takes only that run directory: a sibling run directory, an unrelated file and the targets of links out of it are untouched, the links removed as links', async () => {
     const h = verbHarness()
     const runDir = h.buildRun(fullPassFiles(h))
-    const sibling = h.buildRun({ runId: OTHER_RUN_ID, status: h.status({ runId: OTHER_RUN_ID, pid: OTHER_PID_ARGUMENT, phase: 'merge' }), verdict: reader.PASS_VERDICT })
+    const sibling = h.buildRun({ runId: OTHER_RUN_ID, status: h.status({ runId: OTHER_RUN_ID, pid: OTHER_PID_ARGUMENT, phase: 'merge' }), verdict: runner.PASS_VERDICT })
     const unrelated = join(h.tempDir, 'unrelated.txt')
     writeFileSync(unrelated, 'not a run directory\n')
     const outside = join(h.root, 'outside')

@@ -102,6 +102,7 @@ import {
   numberFormOf,
   parseCiArguments,
   parseStatus,
+  PASS_VERDICT,
   readFileText,
   REDACTION_PLACEHOLDER,
   refusalLine,
@@ -324,8 +325,6 @@ export const GRACE_KILL_PREFIX = 'kill:'
 
 // --- Verdict shapes (b.uqm SR-12.5, SR-17.2) ---
 
-/** A passing verdict, and a full uninjected run's whole first line when it passes. */
-export const PASS_VERDICT = 'PASS'
 /** A selective verdict's opening, before its script list: `SELECTIVE (`. */
 export const SELECTIVE_VERDICT_OPEN = 'SELECTIVE ('
 /** What closes a `SELECTIVE (` or `INJECTED (` wrapper's list: `): `. */
