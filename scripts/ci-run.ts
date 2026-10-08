@@ -4337,6 +4337,660 @@ export async function pruneUntaggedImages(docker: DockerContext, owner: string):
 // 7. Validation (E2)
 // ---------------------------------------------------------------------------
 
+// --- 7/T1 (E2 T1): discovery and selection ---
+//
+// Validation stages 2 to 5 (b.uqm SR-2.3, SR-2.6) and the run's scripts
+// (b.uqm Terms). One reader, `readIntegrationEntries`, lists the worktree's
+// `tests/integration`; every check after it is pure and takes an entry list,
+// so E8 can feed the pinned image's listing to the same rules. Each check
+// returns its stage's failures already in that stage's detail-line order
+// (b.uqm SR-2.6): the stage driver (T3) makes the first one the refusal's
+// reason and each other one a detail line. Every reason comes from an
+// exported builder and shows names through `shownArgument`, so none holds a
+// line break.
+
+// E2 T1's worktree reader: entry kinds by lstat, never following a link.
+import { lstatSync, readdirSync } from 'node:fs'
+
+/** The `test-*.sh` glob's fixed head and tail (b.uqm Terms). */
+const SCRIPT_GLOB_PREFIX = 'test-'
+const SCRIPT_GLOB_SUFFIX = '.sh'
+
+/** The glob as reasons show it, `test-*.sh`. */
+const SCRIPT_GLOB_TEXT = `${SCRIPT_GLOB_PREFIX}*${SCRIPT_GLOB_SUFFIX}`
+
+/** The naming rule as reasons state it (b.uqm SR-2.2, SR-2.3). */
+const SCRIPT_NAME_RULE_TEXT =
+  'a script is named test-<n>-<slug>.sh, n a whole number (0 included, no leading zero) and slug one or more lowercase letters, digits and hyphens'
+
+/** test-1's number: every shard runs test-1 first (b.uqm SR-2.3, SR-3.3). */
+const FIRST_SCRIPT_NUMBER = 1
+
+/** Whether an entry name matches the `test-*.sh` glob: `test-`, then any text (none included), then `.sh`. */
+export function matchesScriptGlob(name: string): boolean {
+  return (
+    name.length >= SCRIPT_GLOB_PREFIX.length + SCRIPT_GLOB_SUFFIX.length &&
+    name.startsWith(SCRIPT_GLOB_PREFIX) &&
+    name.endsWith(SCRIPT_GLOB_SUFFIX)
+  )
+}
+
+/** Compares two names by their UTF-8 bytes: the order of stage 2's failures and of the reader's entries (b.uqm SR-2.6). */
+export function compareBytewise(a: string, b: string): number {
+  return Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'))
+}
+
+// The reader (b.uqm SR-2.3): the one filesystem read of discovery.
+
+/** A `tests/integration` entry's kind, judged on the entry itself: a symbolic link is a link whatever its target, and is never followed (b.uqm SR-2.3). */
+export type IntegrationEntryKind = 'regular' | 'symlink' | 'directory' | 'other'
+
+/** One `tests/integration` entry whose name matches `test-*.sh` (b.uqm SR-2.3). The checks below take lists of these. */
+export interface IntegrationEntry {
+  /** Its name, decoded as UTF-8. */
+  readonly name: string
+  readonly kind: IntegrationEntryKind
+}
+
+/** The error of a worktree whose `tests/integration` could not be listed, naming the directory. */
+export function integrationReadFailedText(dirPath: string, error: string): string {
+  return `reading the scripts in ${shownArgument(dirPath)} failed: ${error}`
+}
+
+/**
+ * Lists the worktree's `tests/integration` afresh (b.uqm SR-2.3): every entry
+ * whose name matches `test-*.sh`, with its kind from `lstat`, so a symbolic
+ * link shows as a link, dangling or not. Entries come in bytewise name order.
+ * Names are read as bytes, so an entry whose name is not valid UTF-8 is still
+ * judged by its own `lstat` (and then refused by its name). Nothing is cached:
+ * every call reads the directory again. A failure to list the directory or to
+ * judge an entry fails the whole read, with `integrationReadFailedText`.
+ * Callers pass `RunnerDeps.worktreeRoot`.
+ */
+export function readIntegrationEntries(worktreeRoot: string): DepRead<readonly IntegrationEntry[]> {
+  const dirPath = join(worktreeRoot, INTEGRATION_DIR_PATH)
+  const dirPrefix = Buffer.from(`${dirPath}/`, 'utf8')
+  try {
+    const entries: IntegrationEntry[] = []
+    for (const rawName of readdirSync(dirPath, { encoding: 'buffer' })) {
+      const name = rawName.toString('utf8')
+      if (!matchesScriptGlob(name)) continue
+      const stats = lstatSync(Buffer.concat([dirPrefix, rawName]))
+      const kind: IntegrationEntryKind = stats.isFile()
+        ? 'regular'
+        : stats.isSymbolicLink()
+          ? 'symlink'
+          : stats.isDirectory()
+            ? 'directory'
+            : 'other'
+      entries.push({ name, kind })
+    }
+    return { ok: true, value: entries.sort((a, b) => compareBytewise(a.name, b.name)) }
+  } catch (err) {
+    return { ok: false, error: integrationReadFailedText(dirPath, dependencyErrorText(err)) }
+  }
+}
+
+// Stage failures and their reasons (b.uqm SR-2.3, SR-2.6). Tests import
+// every reason from these builders and never type it (b.uqm SR-21.4).
+
+/** One failure of a validation stage (b.uqm SR-2.6): its reason, the refusal's text after `NOT RUN: `, on one line. */
+export interface StageFailure {
+  readonly reason: string
+}
+
+/** A stage-2 failure: an entry that is not a regular file, or a regular file that breaks the naming rule. */
+export interface NameFailure extends StageFailure {
+  /** The entry's name. */
+  readonly name: string
+}
+
+/** A stage-3 failure: one number that two or more scripts hold. */
+export interface DuplicateNumberFailure extends StageFailure {
+  /** The number form they share. */
+  readonly numberForm: string
+  /** Every file with that number, in bytewise order. */
+  readonly fileNames: readonly string[]
+}
+
+/** A stage-5 failure: a SCRIPT argument that matches no script. */
+export interface SelectionFailure extends StageFailure {
+  /** The SCRIPT argument as given. */
+  readonly argument: string
+  /** Its index among the SCRIPT arguments (`Invocation.scripts`); failures come in this, the argument order. */
+  readonly scriptIndex: number
+}
+
+/** How a reason names each kind of entry that is not a regular file. */
+const NOT_REGULAR_KIND_TEXT: Readonly<Record<Exclude<IntegrationEntryKind, 'regular'>, string>> = {
+  symlink: 'a symbolic link',
+  directory: 'a directory',
+  other: 'a special file',
+}
+
+/** Names joined for a reason: `a and b`, `a, b and c`. */
+function joinedNames(names: readonly string[]): string {
+  if (names.length <= 1) return names.join('')
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`
+}
+
+/** `test-9-x.sh in tests/integration is a symbolic link, not a regular file: ...` (b.uqm SR-2.3): an entry is never skipped silently. */
+export function notRegularEntryReason(name: string, kind: Exclude<IntegrationEntryKind, 'regular'>): string {
+  return `${shownArgument(name)} in ${INTEGRATION_DIR_PATH} is ${NOT_REGULAR_KIND_TEXT[kind]}, not a regular file: every ${SCRIPT_GLOB_TEXT} entry there must be a regular file, and none is skipped`
+}
+
+/** `test-05-x.sh in tests/integration breaks the naming rule: a script is named test-<n>-<slug>.sh, ...` (b.uqm SR-2.3). */
+export function badScriptNameReason(name: string): string {
+  return `${shownArgument(name)} in ${INTEGRATION_DIR_PATH} breaks the naming rule: ${SCRIPT_NAME_RULE_TEXT}`
+}
+
+/** `test-5-a.sh and test-5-b.sh in tests/integration are both test-5: no two scripts may share a number` (b.uqm SR-2.3), naming every file with the number. */
+export function duplicateNumberReason(numberForm: string, fileNames: readonly string[]): string {
+  const quantifier = fileNames.length === 2 ? 'both' : 'all'
+  return `${joinedNames(fileNames.map(shownArgument))} in ${INTEGRATION_DIR_PATH} are ${quantifier} ${numberForm}: no two scripts may share a number`
+}
+
+/** `test-1 is missing: tests/integration has no script numbered 1, and every shard runs it first` (b.uqm SR-2.3). */
+export function missingTest1Reason(): string {
+  return `${numberFormOf(FIRST_SCRIPT_NUMBER)} is missing: ${INTEGRATION_DIR_PATH} has no script numbered ${FIRST_SCRIPT_NUMBER}, and every shard runs it first`
+}
+
+/** `test-999 matches no script: a SCRIPT is a script's number form, test-<n>, or its whole file name in tests/integration` (b.uqm SR-2.3). */
+export function unmatchedScriptReason(argument: string): string {
+  return `${shownArgument(argument)} matches no script: a SCRIPT is a script's number form, test-<n>, or its whole file name in ${INTEGRATION_DIR_PATH}`
+}
+
+// Stages 2 to 4 and the script list. Pure: each takes an entry list (only
+// `test-*.sh` entries, as `readIntegrationEntries` gives them) in any order.
+
+/** The entries that are scripts (regular files with valid names), in the list's order. */
+function namedScripts(entries: readonly IntegrationEntry[]): Script[] {
+  const scripts: Script[] = []
+  for (const entry of entries) {
+    if (entry.kind !== 'regular') continue
+    const number = fileNameNumber(entry.name)
+    const numberForm = fileNameNumberForm(entry.name)
+    if (number === null || numberForm === null) continue
+    scripts.push({ fileName: entry.name, number, numberForm })
+  }
+  return scripts
+}
+
+/** A new list of the scripts in canonical order (b.uqm SR-3.3). */
+function sortScriptsCanonical(scripts: readonly Script[]): Script[] {
+  return [...scripts].sort((a, b) => compareCanonicalNumbers(a.number, b.number))
+}
+
+/** A new list of the entries in bytewise name order. */
+function sortEntriesBytewise(entries: readonly IntegrationEntry[]): IntegrationEntry[] {
+  return [...entries].sort((a, b) => compareBytewise(a.name, b.name))
+}
+
+/** Compares two number forms by their numbers, read exactly from their digits (a whole number has no leading zero), so numbers past 2^53 still compare right. */
+function compareNumberForms(a: string, b: string): number {
+  const da = a.slice(SCRIPT_GLOB_PREFIX.length)
+  const db = b.slice(SCRIPT_GLOB_PREFIX.length)
+  if (da.length !== db.length) return da.length - db.length
+  return da < db ? -1 : da > db ? 1 : 0
+}
+
+/**
+ * Validation stage 2, the script names (b.uqm SR-2.3, SR-2.6): one failure
+ * per entry that is not a regular file and per regular file that breaks the
+ * naming rule, the two kinds interleaved in bytewise file-name order.
+ */
+export function checkScriptNames(entries: readonly IntegrationEntry[]): NameFailure[] {
+  const failures: NameFailure[] = []
+  for (const entry of sortEntriesBytewise(entries)) {
+    if (entry.kind !== 'regular') failures.push({ name: entry.name, reason: notRegularEntryReason(entry.name, entry.kind) })
+    else if (!isScriptFileName(entry.name)) failures.push({ name: entry.name, reason: badScriptNameReason(entry.name) })
+  }
+  return failures
+}
+
+/**
+ * Validation stage 3, duplicate numbers (b.uqm SR-2.3, SR-2.6): one failure
+ * per number that two or more scripts hold, naming every such file in
+ * bytewise order, by ascending number. Numbers are compared by their exact
+ * digits. Entries stage 2 refuses are not scripts and are not counted.
+ */
+export function checkDuplicateNumbers(entries: readonly IntegrationEntry[]): DuplicateNumberFailure[] {
+  const fileNamesByForm = new Map<string, string[]>()
+  for (const script of namedScripts(sortEntriesBytewise(entries))) {
+    const fileNames = fileNamesByForm.get(script.numberForm)
+    if (fileNames === undefined) fileNamesByForm.set(script.numberForm, [script.fileName])
+    else fileNames.push(script.fileName)
+  }
+  return [...fileNamesByForm]
+    .filter(([, fileNames]) => fileNames.length > 1)
+    .sort(([a], [b]) => compareNumberForms(a, b))
+    .map(([numberForm, fileNames]) => ({ numberForm, fileNames, reason: duplicateNumberReason(numberForm, fileNames) }))
+}
+
+/** Validation stage 4, a missing test-1 (b.uqm SR-2.3, SR-2.6): one failure when no script is numbered 1, else none. */
+export function checkMissingTest1(entries: readonly IntegrationEntry[]): StageFailure[] {
+  const test1 = numberFormOf(FIRST_SCRIPT_NUMBER)
+  return namedScripts(entries).some((script) => script.numberForm === test1) ? [] : [{ reason: missingTest1Reason() }]
+}
+
+/**
+ * The scripts of an entry list that passes stages 2 to 4 (b.uqm Terms): file
+ * name, number and number form, in canonical order (b.uqm SR-3.3), so test-0
+ * follows test-4. Entries that are not scripts are left out.
+ */
+export function scriptListOf(entries: readonly IntegrationEntry[]): Script[] {
+  return sortScriptsCanonical(namedScripts(sortEntriesBytewise(entries)))
+}
+
+// Stage 5, the selection, and the run's scripts (b.uqm SR-2.3, Terms).
+
+/** A run's selection: none for a full run, else the selected scripts, each once, in canonical order. */
+export type ScriptSelection =
+  | {
+      readonly kind: 'full'
+    }
+  | {
+      readonly kind: 'selective'
+      readonly selected: readonly Script[]
+    }
+
+/** Validation stage 5's outcome: the selection, or the SCRIPT arguments that match no script, in argument order. */
+export type SelectionStage =
+  | {
+      readonly ok: true
+      readonly selection: ScriptSelection
+    }
+  | {
+      readonly ok: false
+      readonly failures: readonly SelectionFailure[]
+    }
+
+/**
+ * The script a SCRIPT argument names, or null (b.uqm SR-2.3): a number form
+ * matches only the script with exactly that number (`test-2` never matches
+ * test-20), a file name only that whole file name, and anything else nothing.
+ */
+export function matchScript(argument: string, scripts: readonly Script[]): Script | null {
+  const form = classifyScriptName(argument)
+  if (form.kind === 'number-form') return scripts.find((script) => script.numberForm === form.numberForm) ?? null
+  if (form.kind === 'file-name') return scripts.find((script) => script.fileName === argument) ?? null
+  return null
+}
+
+/**
+ * Validation stage 5, the selection (b.uqm SR-2.3, SR-2.6), over the SCRIPT
+ * arguments in argument order (`Invocation.scripts`) and the script list. No
+ * SCRIPT argument is a full run. Each SCRIPT argument that matches no script
+ * is one failure naming it as given, in argument order. A script named more
+ * than once, in either form or both, is selected once.
+ */
+export function selectScripts(scriptArguments: readonly string[], scripts: readonly Script[]): SelectionStage {
+  if (scriptArguments.length === 0) return { ok: true, selection: { kind: 'full' } }
+  const selected = new Map<string, Script>()
+  const failures: SelectionFailure[] = []
+  for (const [scriptIndex, argument] of scriptArguments.entries()) {
+    const script = matchScript(argument, scripts)
+    if (script === null) failures.push({ argument, scriptIndex, reason: unmatchedScriptReason(argument) })
+    else selected.set(script.fileName, script)
+  }
+  if (failures.length > 0) return { ok: false, failures }
+  return { ok: true, selection: { kind: 'selective', selected: sortScriptsCanonical([...selected.values()]) } }
+}
+
+/**
+ * Each script's declared prerequisites (b.uqm SR-3.1, SR-3.4), keyed by the
+ * declaring script's file name; each value is its direct prerequisites' file
+ * names. Stage 6 (7/T2) builds it with one entry per script, test-1 excluded
+ * from the values, in canonical order. Readers also accept a script that is
+ * absent (no prerequisites) and a test-1 value (which changes nothing).
+ */
+export type PrerequisiteMap = ReadonlyMap<string, readonly string[]>
+
+/**
+ * The run's scripts (b.uqm Terms), in canonical order (b.uqm SR-3.3): for a
+ * full run, every script of the list; for a selective run, the selected
+ * scripts, their prerequisites followed transitively through `prerequisites`,
+ * and test-1. Throws when a prerequisite names no script of the list, which
+ * stage 6 refuses before this is asked.
+ */
+export function runScriptsOf(selection: ScriptSelection, scripts: readonly Script[], prerequisites: PrerequisiteMap): Script[] {
+  if (selection.kind === 'full') return sortScriptsCanonical(scripts)
+  const byFileName = new Map(scripts.map((script) => [script.fileName, script] as const))
+  const included = new Map<string, Script>()
+  const pending: Script[] = [...selection.selected]
+  for (let script = pending.pop(); script !== undefined; script = pending.pop()) {
+    if (included.has(script.fileName)) continue
+    included.set(script.fileName, script)
+    for (const name of prerequisites.get(script.fileName) ?? []) {
+      const prerequisite = byFileName.get(name)
+      if (prerequisite === undefined) {
+        throw new Error(`runScriptsOf: ${shownArgument(script.fileName)} needs ${shownArgument(name)}, which is not one of the scripts`)
+      }
+      pending.push(prerequisite)
+    }
+  }
+  const test1 = scripts.find((script) => script.numberForm === numberFormOf(FIRST_SCRIPT_NUMBER))
+  if (test1 !== undefined) included.set(test1.fileName, test1)
+  return sortScriptsCanonical([...included.values()])
+}
+
+// --- 7/T2 (E2 T2): prerequisite headers and units ---
+
+// The `# ci-requires:` line (b.uqm SR-3.1). The parser is pure: it takes a
+// script's file name and text and reads nothing, so E8's read-back runs the
+// same parser over the image's script texts.
+
+/** A prerequisite line as a reason names it, `# ci-requires:`. */
+const PREREQUISITE_LINE_TEXT = `# ${CI_REQUIRES_KEYWORD}`
+/** The first character of every line in a script's header comment block (b.uqm SR-3.1). */
+const COMMENT_MARK = '#'
+/** Optional spaces or tabs at the start of a text. */
+const LEADING_BLANKS_PATTERN = /^[ \t]*/
+/** One or more spaces or tabs, which separate a prerequisite line's words. */
+const PREREQUISITE_WORD_SEPARATOR = /[ \t]+/
+
+/** One prerequisite line found in a script's text (b.uqm SR-3.1). */
+export interface PrerequisiteLine {
+  /** Its line number in the script, from 1. */
+  readonly lineNumber: number
+  /** Its words after the colon, in order; none when it names no script. */
+  readonly words: readonly string[]
+}
+
+/** One script's prerequisite lines, parsed (b.uqm SR-3.1). */
+export interface PrerequisiteParse {
+  /** The script's file name. */
+  readonly fileName: string
+  /** The counted line: the first prerequisite line inside the header comment block (so its `#` is the line's first character); null when there is none. Only it supplies names. */
+  readonly counted: PrerequisiteLine | null
+  /** Every further prerequisite line inside the header comment block, in line order. */
+  readonly secondLines: readonly PrerequisiteLine[]
+  /** Every prerequisite line outside the header comment block, in line order: below it, with a first character other than `#`, or on the first line. */
+  readonly outsideLines: readonly PrerequisiteLine[]
+}
+
+/**
+ * The words after the keyword when `line` is a prerequisite line: optional
+ * leading spaces or tabs, `#`, optional spaces or tabs, then `ci-requires:` in
+ * lowercase. Words are split on runs of spaces or tabs, so trailing spaces and
+ * tabs give no word. Null for any other line.
+ */
+function prerequisiteLineWords(line: string): string[] | null {
+  const unindented = line.replace(LEADING_BLANKS_PATTERN, '')
+  if (!unindented.startsWith(COMMENT_MARK)) return null
+  const afterMark = unindented.slice(COMMENT_MARK.length).replace(LEADING_BLANKS_PATTERN, '')
+  if (!afterMark.startsWith(CI_REQUIRES_KEYWORD)) return null
+  return afterMark
+    .slice(CI_REQUIRES_KEYWORD.length)
+    .split(PREREQUISITE_WORD_SEPARATOR)
+    .filter((word) => word !== '')
+}
+
+/**
+ * The index one past the header comment block: the block is the consecutive
+ * lines whose first character is `#` after the first line (the shebang), up to
+ * the first line whose first character is not `#` (b.uqm SR-3.1).
+ */
+function headerBlockEnd(lines: readonly string[]): number {
+  let end = 1
+  while (end < lines.length && lines[end].startsWith(COMMENT_MARK)) end += 1
+  return end
+}
+
+/**
+ * Parses one script's prerequisite lines from its text (b.uqm SR-3.1). Pure:
+ * it takes the text, never a path, and reads nothing. A prerequisite line on
+ * the first line is outside the header block, which follows the first line.
+ */
+export function parsePrerequisiteLines(fileName: string, text: string): PrerequisiteParse {
+  const lines = text.split('\n')
+  const headerEnd = headerBlockEnd(lines)
+  let counted: PrerequisiteLine | null = null
+  const secondLines: PrerequisiteLine[] = []
+  const outsideLines: PrerequisiteLine[] = []
+  for (let index = 0; index < lines.length; index += 1) {
+    const words = prerequisiteLineWords(lines[index])
+    if (words === null) continue
+    const found: PrerequisiteLine = { lineNumber: index + 1, words }
+    if (index === 0 || index >= headerEnd) outsideLines.push(found)
+    else if (counted === null) counted = found
+    else secondLines.push(found)
+  }
+  return { fileName, counted, secondLines, outsideLines }
+}
+
+// Header refusals (b.uqm SR-3.1, SR-3.2; stage 6 of SR-2.6). Every script's
+// header is checked in every run, full or selective. Every reason comes from
+// an exported builder below, so tests import the text rather than type it.
+// The map stage 6 returns is T1's `PrerequisiteMap`, with one entry per
+// script: its direct prerequisites' file names, test-1 excluded, in canonical
+// order (empty for a script with none).
+
+/** A header refusal's kind (b.uqm SR-3.2), listed in the order one script's failures come in. */
+export type HeaderFailureKind = 'unknown-name' | 'no-script-named' | 'cycle' | 'ordering' | 'extra-line'
+
+/** A stage-6 failure: one header refusal (b.uqm SR-3.2). */
+export interface HeaderFailure extends StageFailure {
+  /** Its kind. */
+  readonly kind: HeaderFailureKind
+  /** The declaring script's file name; for a cycle, its first script in canonical order. */
+  readonly script: string
+}
+
+/** Stage 6's outcome: the prerequisite map when every header is valid, else every failure in b.uqm SR-2.6's header order. */
+export type HeaderCheck =
+  | {
+      readonly ok: true
+      readonly prerequisites: PrerequisiteMap
+    }
+  | {
+      readonly ok: false
+      readonly failures: readonly HeaderFailure[]
+    }
+
+/** Which extra prerequisite lines one script holds besides its counted line (b.uqm SR-3.2). */
+export type ExtraPrerequisiteLines = 'second' | 'outside' | 'both'
+
+/** The rule a cycle breaks. */
+const CYCLE_RULE_TEXT = 'a script may not require itself, directly or through other scripts'
+
+/** `test-3-x.sh requires test-99, which is no script: …` (b.uqm SR-3.2). */
+export function unknownPrerequisiteReason(script: string, name: string): string {
+  return `${shownArgument(script)} requires ${shownArgument(name)}, which is no script: each word of a ${PREREQUISITE_LINE_TEXT} line must be a script's number form or whole file name`
+}
+
+/** `test-3-x.sh has a # ci-requires: line that names no script: …` (b.uqm SR-3.2). */
+export function emptyPrerequisiteLineReason(script: string): string {
+  return `${shownArgument(script)} has a ${PREREQUISITE_LINE_TEXT} line that names no script: a ${PREREQUISITE_LINE_TEXT} line must name at least one script`
+}
+
+/** A cycle, its scripts in canonical order: `test-5-x.sh requires itself: …` for one, `test-2-a.sh and test-3-b.sh form a prerequisite cycle: …` for more (b.uqm SR-3.2). */
+export function prerequisiteCycleReason(scripts: readonly string[]): string {
+  const names = joinedNames(scripts.map(shownArgument))
+  const subject = scripts.length === 1 ? `${names} requires itself` : `${names} form a prerequisite cycle`
+  return `${subject}: ${CYCLE_RULE_TEXT}`
+}
+
+/** `test-2-a.sh requires test-7-b.sh, which sorts after it: …` (b.uqm SR-3.2). */
+export function prerequisiteOrderReason(dependent: string, prerequisite: string): string {
+  return `${shownArgument(dependent)} requires ${shownArgument(prerequisite)}, which sorts after it: a prerequisite must come before its dependent in canonical order`
+}
+
+/** `test-3-x.sh has a second # ci-requires: line: a script may hold one prerequisite line, inside its header comment block` (b.uqm SR-3.2). */
+export function extraPrerequisiteLineReason(script: string, extra: ExtraPrerequisiteLines): string {
+  const what =
+    extra === 'second'
+      ? `a second ${PREREQUISITE_LINE_TEXT} line`
+      : extra === 'outside'
+        ? `a ${PREREQUISITE_LINE_TEXT} line outside its header comment block`
+        : `a second ${PREREQUISITE_LINE_TEXT} line and one outside its header comment block`
+  return `${shownArgument(script)} has ${what}: a script may hold one prerequisite line, inside its header comment block`
+}
+
+/** Whether a script is test-1. */
+function isTest1(script: Script): boolean {
+  return script.numberForm === numberFormOf(FIRST_SCRIPT_NUMBER)
+}
+
+/** One script's counted line resolved: its unknown names and its links, each in word order and once. */
+interface ResolvedHeader {
+  /** The words naming no script. */
+  readonly unknownNames: readonly string[]
+  /** The file names of the scripts it names, test-1 excluded. */
+  readonly links: readonly string[]
+  /** Whether it has a counted line with no words. */
+  readonly namesNoScript: boolean
+  /** Its extra lines, if any. */
+  readonly extra: ExtraPrerequisiteLines | null
+}
+
+/** Resolves one script's parse against the script list (b.uqm SR-3.1, SR-3.2). Extra lines supply no links. */
+function resolveHeader(parse: PrerequisiteParse | undefined, scripts: readonly Script[]): ResolvedHeader {
+  const unknownNames: string[] = []
+  const links: string[] = []
+  for (const word of parse?.counted?.words ?? []) {
+    const named = matchScript(word, scripts)
+    if (named === null) {
+      if (!unknownNames.includes(word)) unknownNames.push(word)
+    } else if (!isTest1(named) && !links.includes(named.fileName)) {
+      links.push(named.fileName)
+    }
+  }
+  const second = (parse?.secondLines.length ?? 0) > 0
+  const outside = (parse?.outsideLines.length ?? 0) > 0
+  return {
+    unknownNames,
+    links,
+    namesNoScript: parse?.counted?.words.length === 0,
+    extra: second && outside ? 'both' : second ? 'second' : outside ? 'outside' : null,
+  }
+}
+
+/** Every name reachable from `start` along `edges` in one or more steps; `start` itself only when a path leads back to it. */
+function reachableFrom(start: string, edges: ReadonlyMap<string, readonly string[]>): Set<string> {
+  const reached = new Set<string>()
+  const pending = [...(edges.get(start) ?? [])]
+  for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
+    if (reached.has(next)) continue
+    reached.add(next)
+    pending.push(...(edges.get(next) ?? []))
+  }
+  return reached
+}
+
+/**
+ * The cycles of the link graph (b.uqm SR-3.2), each its file names in
+ * canonical order, listed by their first script in canonical order: a group of
+ * two or more scripts each reachable from every other, or a script naming
+ * itself. test-1 is in none, since links to it are ignored.
+ */
+function prerequisiteCycles(ordered: readonly Script[], links: ReadonlyMap<string, readonly string[]>): string[][] {
+  const reach = new Map(ordered.map((script) => [script.fileName, reachableFrom(script.fileName, links)]))
+  const reaches = (from: string, to: string): boolean => reach.get(from)?.has(to) ?? false
+  const placed = new Set<string>()
+  const cycles: string[][] = []
+  for (const { fileName } of ordered) {
+    if (placed.has(fileName) || !reaches(fileName, fileName)) continue
+    const members = ordered
+      .map((script) => script.fileName)
+      .filter((other) => other === fileName || (reaches(fileName, other) && reaches(other, fileName)))
+    for (const member of members) placed.add(member)
+    cycles.push(members)
+  }
+  return cycles
+}
+
+/** One script's failures in b.uqm SR-3.2's order: unknown names, a line naming no script, the cycle it declares first, ordering, extra lines. */
+function scriptHeaderFailures(
+  script: Script,
+  header: ResolvedHeader,
+  declaredCycle: readonly string[] | undefined,
+  cycleOf: ReadonlyMap<string, readonly string[]>,
+): HeaderFailure[] {
+  const fileName = script.fileName
+  const failures: HeaderFailure[] = header.unknownNames.map((name) => ({
+    kind: 'unknown-name',
+    script: fileName,
+    reason: unknownPrerequisiteReason(fileName, name),
+  }))
+  if (header.namesNoScript) failures.push({ kind: 'no-script-named', script: fileName, reason: emptyPrerequisiteLineReason(fileName) })
+  if (declaredCycle !== undefined) failures.push({ kind: 'cycle', script: fileName, reason: prerequisiteCycleReason(declaredCycle) })
+  const ownCycle = cycleOf.get(fileName) ?? []
+  for (const prerequisite of header.links) {
+    if (ownCycle.includes(prerequisite)) continue
+    if (compareCanonical(prerequisite, fileName) <= 0) continue
+    failures.push({ kind: 'ordering', script: fileName, reason: prerequisiteOrderReason(fileName, prerequisite) })
+  }
+  if (header.extra !== null) failures.push({ kind: 'extra-line', script: fileName, reason: extraPrerequisiteLineReason(fileName, header.extra) })
+  return failures
+}
+
+/**
+ * Stage 6 of b.uqm SR-2.6: checks every script's prerequisite lines (b.uqm
+ * SR-3.1, SR-3.2). Takes the script list and each script's parse (a script
+ * without one has no prerequisite line), and gives either every failure, by
+ * the declaring script's canonical order and then SR-3.2's order (several of
+ * one kind in the line's word order), or the prerequisite map. Pure.
+ */
+export function checkPrerequisiteHeaders(scripts: readonly Script[], parses: readonly PrerequisiteParse[]): HeaderCheck {
+  const ordered = sortScriptsCanonical(scripts)
+  const parseOf = new Map(parses.map((parse) => [parse.fileName, parse]))
+  const resolved = ordered.map((script) => ({ script, header: resolveHeader(parseOf.get(script.fileName), ordered) }))
+  const links = new Map(resolved.map(({ script, header }) => [script.fileName, header.links]))
+  const cycles = prerequisiteCycles(ordered, links)
+  const cycleOf = new Map(cycles.flatMap((cycle) => cycle.map((member) => [member, cycle] as const)))
+  const declaredCycles = new Map(cycles.map((cycle) => [cycle[0], cycle] as const))
+  const failures = resolved.flatMap(({ script, header }) =>
+    scriptHeaderFailures(script, header, declaredCycles.get(script.fileName), cycleOf),
+  )
+  if (failures.length > 0) return { ok: false, failures }
+  const prerequisites = new Map(resolved.map(({ script, header }) => [script.fileName, sortCanonical(header.links)]))
+  return { ok: true, prerequisites }
+}
+
+// Scheduling units and the effective N (b.uqm SR-3.4), found in the worktree
+// before admission. E4's assignment takes the units in their order, and stage
+// 7 checks fault shard numbers against the effective N.
+
+/**
+ * The scheduling units of the run's scripts (b.uqm SR-3.4): the connected
+ * groups of the graph whose nodes are the run's scripts other than test-1 and
+ * whose edges are the prerequisite links among them; a script with no link is
+ * a unit of its own. Units come in the canonical order of their first scripts,
+ * and each unit's scripts in canonical order. test-1 alone gives no unit. Pure.
+ */
+export function schedulingUnits(runScripts: readonly Script[], prerequisites: PrerequisiteMap): SchedulingUnit[] {
+  const members = sortScriptsCanonical(runScripts.filter((script) => !isTest1(script)))
+  const neighbours = new Map(members.map((script) => [script.fileName, [] as string[]]))
+  for (const { fileName } of members) {
+    for (const prerequisite of prerequisites.get(fileName) ?? []) {
+      const theirs = neighbours.get(prerequisite)
+      if (theirs === undefined || prerequisite === fileName) continue
+      neighbours.get(fileName)?.push(prerequisite)
+      theirs.push(fileName)
+    }
+  }
+  const placed = new Set<string>()
+  const units: SchedulingUnit[] = []
+  for (const { fileName } of members) {
+    if (placed.has(fileName)) continue
+    const group = reachableFrom(fileName, neighbours)
+    group.add(fileName)
+    for (const member of group) placed.add(member)
+    units.push({ scripts: members.filter((script) => group.has(script.fileName)) })
+  }
+  return units
+}
+
+/**
+ * The effective N (b.uqm SR-3.4): the smaller of the requested N (`--shards`'
+ * value, else `MAX_SHARDS`) and the number of units, but at least the lowest
+ * N, 1, so a run of test-1 alone runs one shard.
+ */
+export function effectiveShardCount(requested: number | null, unitCount: number): number {
+  return Math.max(OPTION_RANGE_MIN, Math.min(requested ?? MAX_SHARDS, unitCount))
+}
+
 // ---------------------------------------------------------------------------
 // 8. Scheduling (E4)
 // ---------------------------------------------------------------------------
