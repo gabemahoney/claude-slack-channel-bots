@@ -1207,6 +1207,8 @@ import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import {
   badCredentialReason,
   badScriptNameReason,
+  dockerAnswersArgs,
+  dockerDownRefusal,
   duplicateNumberReason,
   emptyPrerequisiteLineReason,
   extraPrerequisiteLineReason,
@@ -1985,12 +1987,17 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
       const env: ChildEnvironmentSource = { ANTHROPIC_API_KEY: gatewayKey(), ANTHROPIC_BASE_URL: GATEWAY_URL }
       expect(validated(wt, [], env).effectiveShards).toBe(MAX_SHARDS)
       const rig = mainRig(wt, env)
+      // The valid run goes on to step 3 (E13); docker answering down refuses it there, so its first child is
+      // step 3's docker check and every child before that one is validation's.
+      const dockerDown = 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?'
+      rig.recorder.answer(dockerAnswersArgs(), { exitCode: 1, stderr: dockerDown }, { times: 1 })
 
       const exit = await main([E2_RUN_ID], rig.deps)
 
-      expect(exit).not.toBe(REFUSAL_EXIT_STATUS)
-      expect(readStatusFile(rig.runDir)?.phase).not.toBe('refused')
-      expect(rig.recorder.spawns()).toEqual([])
+      expect(exit).toBe(REFUSAL_EXIT_STATUS)
+      expect(readStatusFile(rig.runDir)?.refusal).toEqual(dockerDownRefusal(dockerDown))
+      expect(rig.recorder.argvs()).toEqual([dockerAnswersArgs()])
+      expect(rig.recorder.argvs()).not.toContainEqual(GH_AUTH_TOKEN_ARGV)
       expect(rig.forbiddenCalls).toEqual([])
       assertNoLeak({ stderr: rig.stderr, runDir: writtenFile(rig.runDir) })
     })

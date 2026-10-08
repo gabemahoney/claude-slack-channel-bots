@@ -64,6 +64,7 @@ import {
   derivedImageDockerfile,
   DOCKER_RUN_LOG_PREFIX,
   dockerAnswersArgs,
+  dockerDownRefusal,
   dockerRunLogLine,
   existingPathLine,
   FAILURE_EXIT_STATUS,
@@ -110,7 +111,6 @@ import {
   STATUS_FILE_NAME,
   STATUS_FORMAT_VERSION,
   statusDeadline,
-  STOPPED_AFTER_VALIDATION_TEXT,
   startDerivedImageBuild,
   startTestImageBuild,
   tagImage,
@@ -460,15 +460,22 @@ describe('E1: ci-run lifecycle', () => {
       return { root, tempDir, lockDir, clock, recorder, docker, signals, source, forbiddenCalls, stderr, deps }
     }
 
-    /** What a case must find untouched: no spawn, no docker operation, no signal sent or trapped, no forbidden dependency, no lock directory. */
-    function expectNothingElseTouched(rig: MainRig): void {
-      expect(rig.recorder.spawns()).toEqual([])
-      expect(rig.docker.operations()).toEqual([])
+    /**
+     * What a case must find untouched: no spawn, no docker operation, no signal sent or trapped, no forbidden
+     * dependency, no lock directory. A valid run goes on to step 3 (E13), so a case that lets one through names
+     * the lists it may spawn in `spawned`, each also the fake's one docker operation for it.
+     */
+    function expectNothingElseTouched(rig: MainRig, spawned: readonly (readonly string[])[] = []): void {
+      expect(rig.recorder.argvs()).toEqual(spawned)
+      expect(rig.docker.operations().map((operation) => operation.argv)).toEqual([...spawned])
       expect(rig.signals.signals()).toEqual([])
       expect(rig.source.handlerCount()).toBe(0)
       expect(rig.forbiddenCalls).toEqual([])
       expect(existsSync(rig.lockDir)).toBe(false)
     }
+
+    /** Test data: docker's error when its daemon does not answer, so a valid run is refused at step 3. */
+    const DOCKER_DOWN_ERROR = 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?'
 
     function logLines(runDir: string): string[] {
       const text = readFileSync(join(runDir, RUNNER_LOG_FILE_NAME), 'utf-8')
@@ -598,18 +605,20 @@ describe('E1: ci-run lifecycle', () => {
     })
 
     test.each([
-      ['no arguments', [] as string[]],
-      ['option words', ['--shards', '7']],
-      ['spaces and quotes', ['--shards', '7', 'two words', "it's", '"quoted"', `a'b"c`]],
-      ['an empty argument and shell characters', ['', '$HOME', '*', 'a;b', '`x`']],
-      ['control characters', ['tab\there', 'line\nbreak', 'back\\slash']],
-    ])('the log\'s first line names the RUN_ID, the PID and the /ci arguments as given (%s), and reads back exactly', async (_what, args) => {
+      // The one valid invocation: it goes on to step 3, where docker answering down refuses it.
+      ['no arguments', [] as string[], [dockerAnswersArgs()]],
+      ['option words', ['--shards', '7'], []],
+      ['spaces and quotes', ['--shards', '7', 'two words', "it's", '"quoted"', `a'b"c`], []],
+      ['an empty argument and shell characters', ['', '$HOME', '*', 'a;b', '`x`'], []],
+      ['control characters', ['tab\there', 'line\nbreak', 'back\\slash'], []],
+    ])('the log\'s first line names the RUN_ID, the PID and the /ci arguments as given (%s), and reads back exactly', async (_what, args, spawned) => {
       const rig = makeMainRig()
+      rig.docker.fail('version', { stderr: DOCKER_DOWN_ERROR })
       await main([RUN_ID, ...args], rig.deps)
       const runDir = runDirPath(rig.deps.env, RUN_ID)
       expect(logLines(runDir)[0]).toBe(formatRunnerLogFirstLine(RUN_ID, RUNNER_PID, args))
       expect(readRunnerLogFirstLine(runDir)).toEqual({ runId: RUN_ID, pid: RUNNER_PID, args })
-      expectNothingElseTouched(rig)
+      expectNothingElseTouched(rig, spawned)
       assertNoLeak({ stderr: rig.stderr, runDir: writtenFile(runDir) })
     })
 
@@ -639,15 +648,18 @@ describe('E1: ci-run lifecycle', () => {
     test.each([
       ['no arguments', [] as string[]],
       ['--shards 2', ['--shards', '2']],
-    ])('a valid invocation (%s) on a valid tree stops after validation: one error line, exit 1, nothing spawned, signalled or locked', async (_what, args) => {
+    ])('a valid invocation (%s) on a valid tree goes on to step 3: docker answering down is refused there as the run\'s last act, only `docker version` spawned, nothing signalled or locked', async (_what, args) => {
       const rig = makeMainRig()
-      expect(await main([RUN_ID, ...args], rig.deps)).toBe(FAILURE_EXIT_STATUS)
+      rig.docker.fail('version', { stderr: DOCKER_DOWN_ERROR })
+      expect(await main([RUN_ID, ...args], rig.deps)).toBe(REFUSAL_EXIT_STATUS)
       const runDir = runDirPath(rig.deps.env, RUN_ID)
-      expect(logLines(runDir)).toEqual([formatRunnerLogFirstLine(RUN_ID, RUNNER_PID, args), `error: ${STOPPED_AFTER_VALIDATION_TEXT}`])
+      const basis = { runId: RUN_ID, pid: RUNNER_PID, startMs: START_MS, deadline: statusDeadline(START_MS, BUILD_ALLOWANCE_MINUTES) }
+      const refusal = dockerDownRefusal(DOCKER_DOWN_ERROR)
+      expect(logLines(runDir)).toEqual([formatRunnerLogFirstLine(RUN_ID, RUNNER_PID, args), refusalLine(refusal)])
       expect(readdirSync(runDir).sort()).toEqual([RUNNER_LOG_FILE_NAME, STATUS_FILE_NAME].sort())
-      expect(readStatusFile(runDir)?.phase).toBe('build')
+      expect(readStatusFile(runDir)).toEqual(buildRefusedStatus(basis, refusal))
       expect(rig.stderr).toEqual([])
-      expectNothingElseTouched(rig)
+      expectNothingElseTouched(rig, [dockerAnswersArgs()])
       assertNoLeak({ stderr: rig.stderr, runDir: writtenFile(runDir) })
     })
 

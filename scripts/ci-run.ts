@@ -93,6 +93,9 @@ import { lstatSync as lstatResultsEntry, readdirSync as listResultsDir } from 'n
 // following a link. Aliased so another lane's own imports cannot collide.
 import { createHash as createPackageHash } from 'node:crypto'
 import { lstatSync as lstatPackageEntry } from 'node:fs'
+// E13 T1's run-directory modes for `results.json`: entries read without
+// following a link. Aliased so another lane's own imports cannot collide.
+import { lstatSync as lstatRunDirEntry, readdirSync as listRunDirEntries } from 'node:fs'
 
 // ---------------------------------------------------------------------------
 // 1. Entry and dependencies (E1)
@@ -735,7 +738,7 @@ export const RUNNER_PATH_SUFFIX = 'scripts/ci-run.ts'
 export const USAGE_EXIT_STATUS = 64
 /** The exit status of a refused run. The SRD gives none and nothing reads it: the reader judges a run by its files (b.uqm SR-5.8). */
 export const REFUSAL_EXIT_STATUS = 2
-/** The exit status of a runner that finds something at its run directory's path, meets an error, or (until E13) stops after validation (b.uqm SR-5.1, SR-5.4). */
+/** The exit status of a runner that finds something at its run directory's path, or meets an error before it could write its verdict or record a refusal (b.uqm SR-5.1, SR-5.4). */
 export const FAILURE_EXIT_STATUS = 1
 
 // --- Name patterns ---
@@ -15210,34 +15213,1348 @@ export function argumentStage(args: readonly string[]): ArgumentStage {
 }
 
 /**
- * The error text of a valid invocation, which stops after validation until
- * E13 builds the rest of the run sequence. It is written as one `error: `
- * line, never a `NOT RUN: ` line; E13 removes it with the stop.
- */
-export const STOPPED_AFTER_VALIDATION_TEXT =
-  'the run stops after validation: steps 3 to 13 of the run sequence are not built yet, so nothing was checked, packed, locked, reserved or built'
-
-/**
  * The run sequence from step 2 on (b.uqm SR-5.3), once step 1 is done.
  * Answers main's exit status. A refusal is recorded by `recordRefusal` as the
  * run's last act. Step 2 is E2's `validateRun`, over the worktree at
- * `deps.worktreeRoot` and the runner's environment; E13 replaces the stop
- * after validation with steps 3–13.
+ * `deps.worktreeRoot` and the runner's environment; a valid run goes on to
+ * steps 3–13, E13's `runAfterValidation`, with the validated run and the
+ * hooks given (E13 T2's stops, deadline and traps).
  */
-export async function runSequence(deps: RunnerDeps, run: RunContext): Promise<number> {
+export async function runSequence(deps: RunnerDeps, run: RunContext, hooks: RunSequenceHooks = {}): Promise<number> {
   // Step 2: validation stages 1–8, the run's scripts, the units and the
   // effective N (b.uqm SR-2.6, SR-3.4). It spawns nothing and touches no
   // docker, lock, cgroup or reservation.
   const validation = validateRun(run.args, deps.worktreeRoot, deps.env)
   if (!validation.ok) return recordRefusal(run, validation.refusal)
-  // E1's stop after validation. E13 replaces it, from here on, with steps
-  // 3–13. Until then a valid invocation touches no docker, lock, cgroup or
-  // reservation: it writes one error line to the runner log and exits 1.
-  run.log.error(STOPPED_AFTER_VALIDATION_TEXT)
-  return FAILURE_EXIT_STATUS
+  // Steps 3–13 (E13).
+  return runAfterValidation(deps, run, validation.validated, hooks)
 }
 
 // --- 17/E13: the rest of the run sequence, stops and the end of run ---
+
+// --- 17/E13.T1 (E13 T1): steps 3–13, the one refusal path, the follow loop, the end of run and the run directory's contents ---
+//
+// The run sequence after validation (b.uqm SR-5.3), composed from E2–E12:
+// - steps 3–11 (`admitRun`): the docker check, the base-image check, packing,
+//   then under the admission lock the sweep, the readings, the fits choosing
+//   N, the reservation and the watchdog's start, and the lock's release;
+// - step 12 (`buildAndStartShards`): the base build when still missing, the
+//   test build and pin, the read-back, scheduling (the phase turns `shards`),
+//   the drift and retag builds, every shard's start, then the tag move;
+// - step 13 (`followShards`): the wiring between the three timer sources that
+//   own their own timers (E7's 30 s samples, E4's limit timers, E12's 1 s
+//   polls), ending each shard through E9's final reading and retirement, until
+//   every started shard has ended;
+// - the end of run (`endOfRun`, b.uqm SR-5.7), in its six named steps, with
+//   E10's writer for `results.json` and `summary.txt` and E11's verdict
+//   writer for `verdict.txt`, last;
+// - the one refusal path (`recordRunRefusal`, b.uqm SR-5.8).
+//
+// One record holds the run's state (`RunSequence`): E1's `RunState` (with
+// E8's fields and the first run-level stop), and E13's own: the step and the
+// end-of-run step in progress, the lock and reservation held, admission's N
+// and figures, the schedule, each shard's record, the watchdog, the fault
+// controller, the image-build failure, when the first stop came, and the
+// three end flags (results written, refusal being recorded, verdict renamed).
+// E13 T2 builds the stops, the deadline and the traps on it: it records a
+// run-level stop only through `recordRunLevelStop`, which every step checks
+// for (`enterStep`), and it hooks in through `RunSequenceHooks`.
+//
+// The run directory's contents (b.uqm SR-5.9): this sub-banner writes nothing
+// into the run directory itself but through its components: the status file,
+// `results.json`, `summary.txt` and `verdict.txt` each through E1's
+// `writeWholeFile` (a `.<name>.tmp` renamed into place), `package/` with its
+// 0444 tarball (E8), and the 0700 shard subdirectories (E9). E8 takes the
+// build's image ID from its output and reads the pinned image back in memory,
+// so no image-ID or read-back file is ever written there.
+
+/** The exit status of a run whose `verdict.txt` was renamed into place, whatever its verdict (b.uqm SR-5.7). Nothing reads it: the reader judges a run by its files. */
+export const VERDICT_WRITTEN_EXIT_STATUS = 0
+
+/** The run sequence's step in progress after validation (b.uqm SR-5.3 steps 3–13), or the refusal being recorded. */
+export type RunSequenceStep =
+  | 'docker-check'
+  | 'base-image-check'
+  | 'packing'
+  | 'lock'
+  | 'sweep'
+  | 'readings'
+  | 'admission'
+  | 'reservation'
+  | 'lock-release'
+  | 'base-build'
+  | 'test-build'
+  | 'read-back'
+  | 'scheduling'
+  | 'fault-builds'
+  | 'shard-starts'
+  | 'tag-move'
+  | 'follow'
+  | 'end-of-run'
+  | 'refusal'
+
+/** The end-of-run step in progress (b.uqm SR-5.7), each named after what it does. */
+export type EndOfRunStep = 'final-readings' | 'integrity' | 'cleanup' | 'watchdog-stop' | 'results' | 'verdict'
+
+/** When the first run-level stop came (b.uqm SR-5.6, SR-13.1): before the shards were scheduled, after that but before the end-of-run sequence, or during it. */
+export type RunStopTiming = 'before-scheduling' | 'after-scheduling' | 'during-end-of-run'
+
+/** One scheduled shard as the run follows it. */
+export interface ShardRun {
+  /** Its assignment entry (E4): k, its scripts, its expected total and its limit in exact minutes. */
+  readonly assignment: ShardAssignment
+  /** Its limit in whole milliseconds, what its limit timer is armed with (E4's `Schedule.limitsMs`). */
+  readonly limitMs: number
+  /** Its start result (E9), a failed start included; null while its start has not been attempted. */
+  start: ShardStartResult | null
+  /** Its limit timer while armed (E4). */
+  limitTimer: LimitTimer | null
+  /** Its end in progress or done: final reading, result file, cause, retirement; null until it ends. */
+  ending: Promise<void> | null
+  /** Whether its end is done. */
+  ended: boolean
+  /** Its final reading (E9); null when it has none. */
+  finalReading: ShardFinalReading | null
+  /** Whether the final reading was taken (asked for); a shard that never started has none to take. */
+  finalReadingTaken: boolean
+  /** Its result file as read right after its final reading (E4's and E7's records). */
+  resultFileAtFinalReading: ResultFileRead | null
+  /** The cause the runner fixed before a stop it made (b.uqm SR-12.1); never set for a failed start. */
+  fixedCause: ShardCause | null
+  /** The run-level stop that fixed its cause, when one did. */
+  fixedByStop: StopKind | null
+  /** Its retirement (E9) once done. */
+  retirement: ShardRetirement | null
+}
+
+/**
+ * The hooks E13 T2 (stops, the deadline, the traps) fills; each is called
+ * guarded, so a throw is logged and changes nothing.
+ */
+export interface RunSequenceHooks {
+  /** Once, before step 3: install the traps and the deadline timer. */
+  readonly onSequenceStart?: (seq: RunSequence) => void
+  /** As each step of steps 3–13 begins, before its stop check (`seq.state.baseImage` holds step 4's outcome from `packing` on). */
+  readonly onStep?: (seq: RunSequence, step: RunSequenceStep) => void
+  /** The scheduling event: the shards are scheduled and T known, right before the status write that turns the phase `shards`; `run.basis` may be replaced here (b.uqm SR-5.5). */
+  readonly onShardsScheduled?: (seq: RunSequence, schedule: Schedule) => void
+  /** As each end-of-run step begins (b.uqm SR-5.7). */
+  readonly onEndOfRunStep?: (seq: RunSequence, step: EndOfRunStep) => void
+  /** Once, after the run's last act (the verdict's rename or the refusal's record), with the exit status: remove the traps, cancel the deadline. It must write nothing. */
+  readonly onSequenceEnd?: (seq: RunSequence, exitStatus: number) => void
+}
+
+/** The run's state after validation (b.uqm SR-5.3), the one record every step and E13 T2's stops read. */
+export interface RunSequence {
+  readonly deps: RunnerDeps
+  readonly run: RunContext
+  /** Step 2's validated run (E2). */
+  readonly validated: ValidatedRun
+  /** `<RUN_ID>-<PID>`. */
+  readonly owner: Owner
+  /** Every docker command's context: the spawn, the runner's environment as children get it, the worktree root. */
+  readonly docker: DockerContext
+  /** E1's run state: the first run-level stop, and E8's base-image, package, build and image records with the cleanup failures. */
+  readonly state: RunState
+  readonly hooks: RunSequenceHooks
+  /** The runner log for the run's own lines: a line that cannot be appended is dropped, never thrown. */
+  readonly say: RunnerLogSink
+  /** The run's one canary source (E9). */
+  readonly canaries: ShardCanaryDrawer
+  /** The run's one retirer (E9). */
+  readonly retirer: ShardRetirer
+  /** The step in progress. */
+  step: RunSequenceStep
+  /** The end-of-run step in progress; null before the sequence starts. */
+  endOfRunStep: EndOfRunStep | null
+  /** Whether the end-of-run sequence has started (b.uqm SR-5.6). */
+  endOfRunStarted: boolean
+  /** The account's home, once step 6 found it (E5). */
+  home: string | null
+  /** The lock directory, once step 6 bound it (E5). */
+  lockDir: string | null
+  /** The admission lock while held (E5). */
+  lock: AdmissionLock | null
+  /** Whether the run's reservation is written and not yet removed (E5). */
+  reservationHeld: boolean
+  /** Step 8's readings (E6); null before. */
+  figures: AdmissionFigures | null
+  /** Step 9's decision (E6): N, the shard-count data; null before. */
+  admission: AdmittedDecision | null
+  /** The memory watchdog once started at step 10 (E7). */
+  watchdog: MemoryWatchdog | null
+  /** Whether the read-back was started, so a read container may exist (E8). */
+  readBackStarted: boolean
+  /** The run's scripts: the worktree's until the read-back, then the pinned image's (b.uqm Terms). */
+  runScripts: readonly Script[]
+  /** The schedule once the shards are scheduled (E4); null before. */
+  schedule: Schedule | null
+  /** One record per scheduled shard, in shard order; none before scheduling. */
+  shards: ShardRun[]
+  /** The fault controller once the shards are scheduled (E12). */
+  controller: FaultController | null
+  /** The test or base image build's failure, not one a stop ended (E8). */
+  imageBuildFailure: Failure | null
+  /** An internal error's failure line, when one ended steps 3–13 (`internalErrorFailureLine`). */
+  internalErrorLine: string | null
+  /** When the first run-level stop came; null for none. */
+  firstStopTiming: RunStopTiming | null
+  /** Whether `results.json` and `summary.txt` have been written (b.uqm SR-5.6's rewrite rule). */
+  resultsWritten: boolean
+  /** Whether a refusal is being recorded: from then on a stop changes nothing (b.uqm SR-5.6, SR-5.8). */
+  refusalBeingRecorded: boolean
+  /** Whether `verdict.txt` has been renamed into place: from then on nothing changes or is written (b.uqm SR-5.7). */
+  verdictRenamed: boolean
+  /** Who waits for the follow loop's next change. */
+  readonly waiters: (() => void)[]
+}
+
+/** The docker-down refusal (b.uqm SR-5.3 step 3, SR-5.8): `NOT RUN: docker does not answer: <error>`, kind null, the failing docker command's message on one line. The one formatter of this text: the skill quotes it and the tests import it. */
+export function dockerDownRefusal(error: string): Refusal {
+  return buildRefusal(null, `docker does not answer: ${dependencyErrorText(error)}`)
+}
+
+/** The refusal of an admission lock that could not be taken for a reason other than its being busy (b.uqm SR-6.1, SR-5.8): kind null, naming the lock file and the error on one line. */
+export function lockTakeFailedRefusal(lockDir: string, error: string): Refusal {
+  return buildRefusal(null, `the admission lock ${shownArgument(admissionLockPath(lockDir))} could not be taken: ${dependencyErrorText(error)}`)
+}
+
+/** The refusal of a reservation that could not be written at step 10, before it exists (b.uqm SR-6.2, SR-5.8): kind null, the error on one line. */
+export function reservationWriteFailedRefusal(error: string): Refusal {
+  return buildRefusal(null, `the run's reservation could not be written: ${dependencyErrorText(error)}`)
+}
+
+/** A run-level stop's line, the run's verdict line (b.uqm SR-5.4, SR-5.6): `FAIL: interrupted: <signal>` for an interrupt; the watchdog's and the deadline's lines as they carry them. */
+export function runLevelStopLine(stop: RunLevelStop): string {
+  return stop.kind === 'interrupt' ? `${FAIL_PREFIX}interrupted: ${stop.signal}` : stop.line
+}
+
+/** The cause a run-level stop fixes for a shard it stops (b.uqm SR-12.1): `stopped by <stop>`. */
+export function stoppedCauseOf(stop: RunLevelStop): StoppedCause {
+  return { kind: 'stopped', by: stop.kind, fixedByRunner: true }
+}
+
+/** The failure line of an internal error that ended steps 3–13 or the end files' assembly; it fails the run and is never `PASS`. */
+export function internalErrorFailureLine(error: string): string {
+  return `${FAIL_PREFIX}ci-run: internal error: ${dependencyErrorText(error)}`
+}
+
+/**
+ * The verdict line written when E10's verdict line or ranking threw: the
+ * internal error's failure line, in the shape the invocation calls for
+ * (`SELECTIVE (<scripts>): ` when it can be built, `INJECTED (<faults>): `),
+ * never `PASS` (b.uqm SR-12.5).
+ */
+export function internalErrorVerdictLine(invocation: Invocation, scripts: readonly string[], error: string): string {
+  let line = internalErrorFailureLine(error)
+  if (isSelectiveRun(invocation)) {
+    try {
+      line = `${selectiveVerdictPrefix(scripts)}${line}`
+    } catch {
+      // The list cannot be built; the reader then reports the line as it is.
+    }
+  }
+  if (isInjectedRun(invocation)) line = `${injectedVerdictPrefix(invocation.faults)}${line}`
+  return line
+}
+
+/** E1's run state as the run starts: no stop, nothing checked, packed or built (E8's `initialImageState`). */
+export function createInitialRunState(): RunState {
+  return {
+    firstStop: null,
+    baseImage: null,
+    baseBuildToken: null,
+    packingStartedAtMs: null,
+    tarballPath: null,
+    packageSha256: null,
+    baseBuildStep: null,
+    baseBuildRun: null,
+    cleanupFailures: [],
+    images: initialImageState(),
+    imageBuildInProgress: null,
+  }
+}
+
+/** A runner log that can be sealed: once sealed every write is dropped, so nothing is written after the run's last act (b.uqm SR-5.7, SR-5.8). */
+export interface SealableRunnerLog extends RunnerLogWriter {
+  /** Drops every later write. */
+  seal(): void
+  /** Whether it is sealed. */
+  isSealed(): boolean
+}
+
+/** Wraps a runner-log writer so it can be sealed; main builds the run's log with it. */
+export function createSealableRunnerLog(inner: RunnerLogWriter): SealableRunnerLog {
+  let sealed = false
+  const write = (line: string): void => {
+    if (!sealed) inner(line)
+  }
+  return Object.assign(write, {
+    path: inner.path,
+    childOutput: (text: string): void => {
+      if (!sealed) inner.childOutput(text)
+    },
+    error: (err: unknown, context?: string): void => {
+      if (!sealed) inner.error(err, context)
+    },
+    redactValues: (values: Iterable<string>): void => inner.redactValues(values),
+    seal: (): void => {
+      sealed = true
+    },
+    isSealed: (): boolean => sealed,
+  })
+}
+
+/** Seals a runner log built by `createSealableRunnerLog`; any other writer is left as it is. */
+export function sealRunnerLog(log: RunnerLogWriter): void {
+  const sealable = log as Partial<SealableRunnerLog>
+  if (typeof sealable.seal === 'function') sealable.seal()
+}
+
+/** Writes an error to the runner log; an append that fails is dropped (it already went to standard error). */
+function sayError(seq: Pick<RunSequence, 'run'>, err: unknown, context: string): void {
+  try {
+    seq.run.log.error(err, context)
+  } catch {
+    // The failed append already went to standard error.
+  }
+}
+
+/** Calls one of E13 T2's hooks; a throw is logged and changes nothing. */
+function callRunHook(seq: RunSequence, name: string, call: () => void): void {
+  try {
+    call()
+  } catch (err) {
+    sayError(seq, err, `the ${name} hook`)
+  }
+}
+
+/** Builds the run's state record after validation. */
+function createRunSequence(deps: RunnerDeps, run: RunContext, validated: ValidatedRun, hooks: RunSequenceHooks): RunSequence {
+  const say: RunnerLogSink = (line) => {
+    try {
+      run.log(line)
+    } catch {
+      // The failed append already went to standard error.
+    }
+  }
+  const state = createInitialRunState()
+  return {
+    deps,
+    run,
+    validated,
+    owner: { runId: run.runId, pid: deps.pid },
+    docker: { spawn: deps.spawn, env: childEnvironment(deps.env), cwd: deps.worktreeRoot },
+    state,
+    hooks,
+    say,
+    canaries: createShardCanaryDrawer(deps.randomBytes),
+    retirer: createShardRetirer({ deps, runDir: run.runDir, log: say, state }),
+    step: 'docker-check',
+    endOfRunStep: null,
+    endOfRunStarted: false,
+    home: null,
+    lockDir: null,
+    lock: null,
+    reservationHeld: false,
+    figures: null,
+    admission: null,
+    watchdog: null,
+    readBackStarted: false,
+    runScripts: validated.runScripts,
+    schedule: null,
+    shards: [],
+    controller: null,
+    imageBuildFailure: null,
+    internalErrorLine: null,
+    firstStopTiming: null,
+    resultsWritten: false,
+    refusalBeingRecorded: false,
+    verdictRenamed: false,
+    waiters: [],
+  }
+}
+
+/** Wakes whoever waits on the follow loop (a shard's end, a stop). */
+function wakeRunSequence(seq: RunSequence): void {
+  for (const waiter of seq.waiters.splice(0)) waiter()
+}
+
+/** Whether a run-level stop has been recorded: the check between steps (b.uqm SR-5.6). */
+export function runStopRecorded(seq: Pick<RunSequence, 'state'>): boolean {
+  return seq.state.firstStop !== null
+}
+
+/** Begins a step: records it, tells E13 T2's hook, and answers whether a run-level stop has been recorded, so the step must not start. */
+function enterStep(seq: RunSequence, step: RunSequenceStep): boolean {
+  seq.step = step
+  const onStep = seq.hooks.onStep
+  if (onStep !== undefined) callRunHook(seq, 'step', () => onStep(seq, step))
+  return runStopRecorded(seq)
+}
+
+/** Begins an end-of-run step: records it and tells E13 T2's hook. */
+function enterEndOfRunStep(seq: RunSequence, step: EndOfRunStep): void {
+  seq.endOfRunStep = step
+  const onEndOfRunStep = seq.hooks.onEndOfRunStep
+  if (onEndOfRunStep !== undefined) callRunHook(seq, 'end-of-run step', () => onEndOfRunStep(seq, step))
+}
+
+/** Releases the admission lock when the run holds it (b.uqm SR-6.1). */
+function releaseAdmissionLock(seq: RunSequence): void {
+  const lock = seq.lock
+  seq.lock = null
+  lock?.release()
+}
+
+/** Cancels every follow-loop timer the run armed: the limit timers (E4). E12's polls end with each shard's end, the stop, or `finalize`. */
+function cancelFollowTimers(seq: RunSequence): void {
+  for (const shard of seq.shards) {
+    shard.limitTimer?.cancel()
+    shard.limitTimer = null
+  }
+}
+
+/**
+ * Records a run-level stop (b.uqm SR-5.6): the first one decides the run's
+ * line; a later one, one after the verdict's rename, or one while a refusal is
+ * being recorded changes nothing (answers false). Recorded before the
+ * end-of-run sequence, it ends any build in progress (SIGKILL to its process
+ * group, after the stop is recorded, so E8 reads the build as stopped), tells
+ * the fault controller, cancels the limit timers and wakes the follow loop;
+ * every step's check then turns the run to the end-of-run sequence, which takes
+ * the final readings and fixes the causes. During the sequence it changes only
+ * the run-level line, which step 5 or 6 writes. E13 T2's traps, deadline and
+ * E7's watchdog record stops only through this.
+ */
+export function recordRunLevelStop(seq: RunSequence, stop: RunLevelStop): boolean {
+  if (seq.refusalBeingRecorded || seq.verdictRenamed || seq.state.firstStop !== null) return false
+  seq.state.firstStop = stop
+  seq.firstStopTiming = seq.endOfRunStarted ? 'during-end-of-run' : seq.schedule !== null ? 'after-scheduling' : 'before-scheduling'
+  seq.say(`ci-run: run-level stop: ${runLevelStopLine(stop)}`)
+  if (!seq.endOfRunStarted) {
+    seq.state.baseBuildStep?.end()
+    seq.state.imageBuildInProgress?.end()
+    seq.controller?.noteRunStop()
+    cancelFollowTimers(seq)
+  }
+  wakeRunSequence(seq)
+  return true
+}
+
+/** Writes the status file in phase `shards` or `merge` from the run's current basis; a failed write is logged (b.uqm SR-5.2). */
+function writeRunPhase(seq: RunSequence, phase: 'shards' | 'merge'): void {
+  const written = writeStatusFile(seq.run.runDir, buildStatus(seq.run.basis, phase))
+  if (!written.ok) seq.say(`ci-run: writing ${STATUS_FILE_NAME} in phase ${phase} failed: ${written.error}`)
+}
+
+/**
+ * The one refusal path (b.uqm SR-5.8): marks the refusal as being recorded
+ * (so a stop from now on changes nothing), releases the lock if held, removes
+ * the reservation if written, removes the read container when the read-back
+ * started (E8), runs E8's image cleanup (which lists and prunes nothing when
+ * no test, drift or retag build started), stops the watchdog when it runs,
+ * then records the refusal through E1's recorder as the run's last act, which
+ * seals the runner log. Every cleanup failure is already in the runner log
+ * and never changes the refusal; a cleanup step that throws is logged and the
+ * next one still runs, so the refusal is always recorded. Answers E1's refusal
+ * exit status.
+ */
+export async function recordRunRefusal(seq: RunSequence, refusal: Refusal): Promise<number> {
+  seq.refusalBeingRecorded = true
+  seq.step = 'refusal'
+  await refusalCleanupStep(seq, 'cancelling the limit timers', () => cancelFollowTimers(seq))
+  await refusalCleanupStep(seq, 'releasing the admission lock', () => releaseAdmissionLock(seq))
+  await refusalCleanupStep(seq, "removing the run's reservation", () => removeRunReservation(seq))
+  if (seq.readBackStarted) {
+    await refusalCleanupStep(seq, 'removing the read container', async () => {
+      const removal = await removeReadContainerIfPresent(seq.docker, seq.owner, seq.say)
+      if (removal.kind === 'failed') seq.state.cleanupFailures.push(removal.line)
+    })
+  }
+  await refusalCleanupStep(seq, "cleaning up the run's images", async () => {
+    await cleanupRunImages({ docker: seq.docker, owner: seq.owner, clock: seq.deps.clock, log: seq.say }, seq.state)
+  })
+  const watchdog = seq.watchdog
+  if (watchdog !== null) {
+    await refusalCleanupStep(seq, 'stopping the memory watchdog', async () => {
+      await watchdog.stop()
+    })
+  }
+  return recordRefusal(seq.run, refusal)
+}
+
+/** One cleanup step of the refusal path: a throw is logged and changes nothing, so the next step and the refusal still come (b.uqm SR-5.8). */
+async function refusalCleanupStep(seq: RunSequence, context: string, step: () => void | Promise<void>): Promise<void> {
+  try {
+    await step()
+  } catch (err) {
+    sayError(seq, err, context)
+  }
+}
+
+/** Removes the run's reservation when written (E5); a failure is already logged and is listed as a cleanup failure (b.uqm SR-9.3). */
+function removeRunReservation(seq: RunSequence): void {
+  if (!seq.reservationHeld || seq.lockDir === null) return
+  seq.reservationHeld = false
+  const removal = removeReservation(seq.lockDir, seq.owner, seq.say)
+  if (removal.kind === 'failed') seq.state.cleanupFailures.push(removal.line)
+}
+
+/** What a part of the sequence ended with: go on, go to the end of run, or a recorded refusal with its exit status. */
+type SequencePartOutcome =
+  | {
+      readonly kind: 'go-on'
+    }
+  | {
+      readonly kind: 'end-of-run'
+    }
+  | {
+      readonly kind: 'refused'
+      readonly exitStatus: number
+    }
+
+const GO_ON: SequencePartOutcome = { kind: 'go-on' }
+const TO_END_OF_RUN: SequencePartOutcome = { kind: 'end-of-run' }
+
+/** A refusal, unless a run-level stop came first: then the stop decides, and the run goes to its end of run (b.uqm SR-5.6). */
+async function refuseUnlessStopped(seq: RunSequence, refusal: Refusal): Promise<SequencePartOutcome> {
+  if (runStopRecorded(seq)) return TO_END_OF_RUN
+  return { kind: 'refused', exitStatus: await recordRunRefusal(seq, refusal) }
+}
+
+/** What admission asks for (b.uqm SR-3.4, SR-6.7), from the validated run and E1's cap. */
+function admissionRequestOf(validated: ValidatedRun): AdmissionRequest {
+  return {
+    requestedShards: validated.requestedShards,
+    units: validated.units.length,
+    effectiveShards: validated.effectiveShards,
+    canChooseShards: canChooseShards(validated.invocation),
+    capBytes: SHARD_MEMORY_CAP_BYTES,
+  }
+}
+
+/**
+ * Steps 3–11 (b.uqm SR-5.3), in order, each refusal through the one refusal
+ * path: the docker check; the base-image check (E8); packing (E8); the
+ * account's home, the lock directory and the lock (E5; a failed home lookup
+ * refuses here, and nothing reads the password file earlier); the sweep under
+ * the lock (E5), its cleanup failures kept for the results; the readings
+ * (E6, with E5's reservation reader); the disk, memory and CPU fits choosing N
+ * (E6); the reservation (E5), then the watchdog's start (E7); the lock's
+ * release. A stop recorded meanwhile sends the run to its end of run.
+ */
+async function admitRun(seq: RunSequence): Promise<SequencePartOutcome> {
+  const { deps, run, validated } = seq
+  // Step 3: docker answers.
+  if (enterStep(seq, 'docker-check')) return TO_END_OF_RUN
+  const answer = await checkDockerAnswers(seq.docker)
+  if (!answer.ok) return refuseUnlessStopped(seq, dockerDownRefusal(answer.error))
+  // Step 4: the base image, and its build's prerequisites when it is missing.
+  if (enterStep(seq, 'base-image-check')) return TO_END_OF_RUN
+  const base = await checkBaseImage(deps, seq.state)
+  if (!base.ok) return refuseUnlessStopped(seq, base.refusal)
+  // Step 5: packing.
+  if (enterStep(seq, 'packing')) return TO_END_OF_RUN
+  const packed = await packPackage(deps, run.runDir, seq.state)
+  if (!packed.ok) return refuseUnlessStopped(seq, packed.refusal)
+  // Step 6: the account's home, the lock directory, the lock.
+  if (enterStep(seq, 'lock')) return TO_END_OF_RUN
+  const home = resolveAccountHome(deps)
+  if (!home.ok) return refuseUnlessStopped(seq, home.refusal)
+  seq.home = home.home
+  const lockDir = deps.lockDir ?? admissionLockDir(home.home)
+  seq.lockDir = lockDir
+  const take = await takeAdmissionLock(lockDir, seq.owner, deps.clock)
+  if (take.kind === 'busy') return refuseUnlessStopped(seq, take.refusal)
+  if (take.kind === 'error') return refuseUnlessStopped(seq, lockTakeFailedRefusal(lockDir, take.error))
+  seq.lock = take.lock
+  // Step 7: the sweep, under the lock.
+  if (enterStep(seq, 'sweep')) return TO_END_OF_RUN
+  seq.state.cleanupFailures.push(...(await sweepLeftovers({ docker: seq.docker, lockDir, probe: deps, clock: deps.clock, log: seq.say })))
+  // Step 8: the readings, under the lock.
+  if (enterStep(seq, 'readings')) return TO_END_OF_RUN
+  const readings = await takeFullAdmissionReadings({
+    deps,
+    docker: seq.docker,
+    runDir: run.runDir,
+    lockDir,
+    readReservations: (dir) => readReservations(dir, deps),
+    home: home.home,
+  })
+  if (!readings.ok) return refuseUnlessStopped(seq, failedReadingRefusal(readings))
+  const figures = readings.value
+  seq.figures = figures
+  // Step 9: the disk check, then the memory and CPU fits, choosing N.
+  if (enterStep(seq, 'admission')) return TO_END_OF_RUN
+  const decision = decideAdmission(figures, admissionRequestOf(validated), () => listResultsDirectories(deps.env))
+  if (decision.kind === 'refused') return refuseUnlessStopped(seq, decision.refusal)
+  seq.admission = decision
+  // Step 10: the reservation, then the watchdog.
+  if (enterStep(seq, 'reservation')) return TO_END_OF_RUN
+  const reserved = writeReservation(lockDir, { owner: seq.owner, shards: decision.shards, memoryCapBytes: SHARD_MEMORY_CAP_BYTES, kind: validated.kind })
+  if (!reserved.ok) return refuseUnlessStopped(seq, reservationWriteFailedRefusal(reserved.error))
+  seq.reservationHeld = true
+  const watchdog = createMemoryWatchdog({
+    deps,
+    docker: seq.docker,
+    home: home.home,
+    runDir: run.runDir,
+    before: figures.readings.beforeWorkingSet,
+    limitBytes: figures.readings.podLimitBytes,
+    ceiling: figures.ceiling,
+    runningShards: () => runningShardsOf(seq),
+    onSample: (sample) => followSample(seq, sample),
+    onStop: (stop) => {
+      recordRunLevelStop(seq, stop)
+    },
+    log: seq.say,
+  })
+  seq.watchdog = watchdog
+  watchdog.start()
+  // Step 11: the lock's release.
+  enterStep(seq, 'lock-release')
+  releaseAdmissionLock(seq)
+  return GO_ON
+}
+
+/** E8's image steps' context. */
+function runImagesContextOf(seq: RunSequence): RunImagesContext {
+  return { docker: seq.docker, sendSignal: seq.deps.sendSignal, owner: seq.owner, clock: seq.deps.clock, log: seq.say }
+}
+
+/**
+ * Step 12 (b.uqm SR-5.3), in order: the base build (E8) only when step 4
+ * found the base missing and the re-check still does; the test build and pin
+ * (E8); the read-back (E8), whose refusal goes through the refusal path, and
+ * the read container's removal; scheduling (E4) once, with the pinned image's
+ * list, its duration table, the units, the invocation and the admitted N, which
+ * turns the phase `shards` (E13 T2's hook first) and builds the fault
+ * controller (E12); the drift and retag builds the faults need (E8), told to
+ * the controller before any start; each shard's start (E9), told to the
+ * controller, its limit timer armed; once every start was attempted, the tag
+ * move (E8), told to the controller whatever it gave. An image-build failure
+ * no stop caused skips the rest and goes to the end of run, the phase staying
+ * `build`.
+ */
+async function buildAndStartShards(seq: RunSequence): Promise<SequencePartOutcome> {
+  const { deps, run, validated } = seq
+  const invocation = validated.invocation
+  const images = runImagesContextOf(seq)
+  // The base build, when still missing.
+  if (enterStep(seq, 'base-build')) return TO_END_OF_RUN
+  const baseBuild = await runBaseBuild(deps, seq.state, seq.say)
+  if (baseBuild.kind === 'failed') {
+    seq.imageBuildFailure = baseBuild.failure
+    return TO_END_OF_RUN
+  }
+  // The test build and its pin.
+  if (enterStep(seq, 'test-build')) return TO_END_OF_RUN
+  const testBuild = await buildTestImage(images, seq.state)
+  if (testBuild.failure !== null) {
+    seq.imageBuildFailure = testBuild.failure
+    return TO_END_OF_RUN
+  }
+  const pinnedId = seq.state.images.pinnedId
+  if (pinnedId === null) {
+    if (!runStopRecorded(seq)) seq.internalErrorLine = internalErrorFailureLine(`the test build ended ${testBuild.outcome.kind} with no pinned image and no stop`)
+    return TO_END_OF_RUN
+  }
+  // The read-back, then the read container's removal.
+  if (enterStep(seq, 'read-back')) return TO_END_OF_RUN
+  seq.readBackStarted = true
+  const read = await readBackPinnedImage({ docker: seq.docker, owner: seq.owner, pinnedId, log: seq.say }, validated)
+  if (read.cleanupFailure !== null) seq.state.cleanupFailures.push(read.cleanupFailure)
+  if (!read.ok) return refuseUnlessStopped(seq, read.refusal)
+  const readRemoval = await removeReadContainerIfPresent(seq.docker, seq.owner, seq.say)
+  if (readRemoval.kind === 'failed') seq.state.cleanupFailures.push(readRemoval.line)
+  seq.runScripts = read.readBack.runScripts
+  // Scheduling: the phase turns `shards`.
+  if (enterStep(seq, 'scheduling')) return TO_END_OF_RUN
+  const admission = seq.admission
+  if (admission === null) throw new Error('step 12 reached with no admission decision')
+  const schedule = scheduleRun({
+    pinned: read.readBack.scripts.map((script) => script.fileName),
+    table: read.readBack.durationTable,
+    units: validated.units,
+    invocation,
+    shards: admission.shards,
+  })
+  seq.schedule = schedule
+  seq.shards = schedule.assignment.map((assignment) => ({
+    assignment,
+    limitMs: schedule.limitsMs.get(assignment.shard) ?? shardLimitMs(assignment.expectedSeconds, invocation.shardTimeoutMinutes),
+    start: null,
+    limitTimer: null,
+    ending: null,
+    ended: false,
+    finalReading: null,
+    finalReadingTaken: false,
+    resultFileAtFinalReading: null,
+    fixedCause: null,
+    fixedByStop: null,
+    retirement: null,
+  }))
+  const onShardsScheduled = seq.hooks.onShardsScheduled
+  if (onShardsScheduled !== undefined) callRunHook(seq, 'shards-scheduled', () => onShardsScheduled(seq, schedule))
+  writeRunPhase(seq, 'shards')
+  const controller = createFaultController({
+    faults: invocation.faults,
+    assignment: schedule.assignment,
+    clock: deps.clock,
+    runDir: run.runDir,
+    handler: (notice) => onFaultNotice(seq, notice),
+  })
+  seq.controller = controller
+  // The drift and retag builds, told to the controller before any start.
+  if (enterStep(seq, 'fault-builds')) return TO_END_OF_RUN
+  const faultBuilds = await buildFaultImages(images, seq.state, invocation.faults)
+  controller.noteDriftBuild(faultBuilds.drift)
+  controller.noteRetagBuild(faultBuilds.retag)
+  // The shard starts.
+  if (enterStep(seq, 'shard-starts')) return TO_END_OF_RUN
+  const tarballPath = seq.state.tarballPath
+  if (tarballPath === null) throw new Error('step 12 reached with no tarball')
+  const secretValues = secretCredentialSet(deps.env, { baseBuildToken: seq.state.baseBuildToken })
+  for (const shard of seq.shards) {
+    if (runStopRecorded(seq)) break
+    await startOneShard(seq, shard, pinnedId, tarballPath, secretValues)
+  }
+  // The tag move, once every start was attempted; `not-tried` when no retag image or a stop.
+  enterStep(seq, 'tag-move')
+  controller.noteTagMove(await moveTestTagToRetagImage(images, seq.state))
+  return runStopRecorded(seq) ? TO_END_OF_RUN : GO_ON
+}
+
+/** Starts one shard (E9), tells the controller (E12), and arms its limit timer (E4) at its container's start. */
+async function startOneShard(seq: RunSequence, shard: ShardRun, pinnedId: string, tarballPath: string, secretValues: ReadonlySet<string>): Promise<void> {
+  const k = shard.assignment.shard
+  const controller = seq.controller
+  const result = await startShard(seq.deps, {
+    owner: seq.owner,
+    runDir: seq.run.runDir,
+    assignment: shard.assignment,
+    failFileNames: controller?.failFileNames(k) ?? [],
+    faults: seq.validated.invocation.faults,
+    pinnedImageId: pinnedId,
+    driftImageId: seq.state.images.driftId,
+    tarballPath,
+    secretValues,
+    canaries: seq.canaries,
+    // The run log itself, whose sink throws when it cannot append, so no unlogged list is spawned (b.uqm SR-10.4).
+    log: seq.run.log,
+  })
+  shard.start = result
+  controller?.noteShardStart(result.start)
+  if (result.start.kind === 'started' && !runStopRecorded(seq) && !seq.endOfRunStarted) {
+    shard.limitTimer = armShardLimitTimer({
+      clock: seq.deps.clock,
+      runDir: seq.run.runDir,
+      shard: k,
+      startedAtMs: result.start.startedAtMs,
+      limitMs: shard.limitMs,
+      onFire: (outcome) => onShardLimit(seq, shard, outcome),
+    })
+  }
+  wakeRunSequence(seq)
+}
+
+/** The shard record of shard k; undefined for none. */
+function shardRunOf(seq: RunSequence, k: number): ShardRun | undefined {
+  return seq.shards.find((shard) => shard.assignment.shard === k)
+}
+
+/** Whether a shard started and has not begun to end: the shards the follow loop follows and the watchdog samples. */
+function isFollowedShard(shard: ShardRun): shard is ShardRun & { start: ShardStartResult } {
+  return shard.start !== null && shard.start.start.kind === 'started' && shard.ending === null
+}
+
+/** The running shards the watchdog samples (E7): started, not yet ending; none once the end-of-run sequence starts. */
+function runningShardsOf(seq: RunSequence): WatchdogShard[] {
+  if (seq.endOfRunStarted) return []
+  return seq.shards.filter(isFollowedShard).map((shard) => ({ shard: shard.assignment.shard, container: shard.start.containerId ?? shard.start.containerName }))
+}
+
+/**
+ * Ends one shard (b.uqm SR-10.6), once, in E9's order: its limit timer
+ * cancelled; its final reading; its result file read; its cause fixed; its
+ * retirement (SIGKILL while running, `docker.log`, removal) for the reason
+ * given. A cause is fixed only for a started shard with none yet, and not when
+ * the result file read after the final reading holds the end marker (it ended
+ * normally) or the reading shows its container exited on its own (no stop is
+ * made; it is then retired as exited). Never rejects; wakes the follow loop
+ * when done.
+ */
+function endShard(seq: RunSequence, shard: ShardRun, requested: RetirementReason, cause: ShardCause | null, by: StopKind | null = null): Promise<void> {
+  if (shard.ending !== null) return shard.ending
+  const target = shard.start
+  if (target === null) return Promise.resolve()
+  shard.limitTimer?.cancel()
+  shard.limitTimer = null
+  const k = shard.assignment.shard
+  shard.ending = (async () => {
+    shard.finalReadingTaken = true
+    const reading = await seq.retirer.finalReading(target)
+    shard.finalReading = reading
+    shard.resultFileAtFinalReading = readResultFile(shardSubdirectoryPath(seq.run.runDir, k))
+    let reason = requested
+    if (cause !== null && target.start.kind === 'started' && shard.fixedCause === null) {
+      const endedNormally = resultFileHoldsEndMarker(shard.resultFileAtFinalReading)
+      const exitedOnItsOwn = reading !== null && reading.running === false && reading.exitCode !== null
+      if (exitedOnItsOwn && !endedNormally) reason = { kind: 'exited' }
+      else if (!endedNormally) {
+        shard.fixedCause = cause
+        shard.fixedByStop = by
+      }
+    }
+    shard.retirement = await seq.retirer.retire(target, reason)
+    seq.say(`${SHARD_DIR_PREFIX}${k}: retired (${shard.retirement.reason.kind})`)
+  })()
+    .catch((err: unknown) => sayError(seq, err, `ending ${SHARD_DIR_PREFIX}${k}`))
+    .finally(() => {
+      shard.ended = true
+      wakeRunSequence(seq)
+    })
+  return shard.ending
+}
+
+/** E4's limit timer fired (b.uqm SR-4.3): its end marker found, a final reading now; else over its limit, its cause fixed (`wall-time limit of <m> min exceeded`) before the stop. Never throws. */
+function onShardLimit(seq: RunSequence, shard: ShardRun, outcome: LimitTimerOutcome): void {
+  try {
+    shard.limitTimer = null
+    if (seq.endOfRunStarted || shard.ending !== null) return
+    if (outcome.kind === 'ended') {
+      seq.controller?.noteShardEnded(outcome.shard)
+      void endShard(seq, shard, { kind: 'end-marker' }, null)
+      return
+    }
+    seq.controller?.noteShardLimit(outcome.shard)
+    void endShard(seq, shard, { kind: 'limit' }, wallTimeLimitCause(shard.assignment.limitMinutes))
+  } catch (err) {
+    sayError(seq, err, `${SHARD_DIR_PREFIX}${shard.assignment.shard}'s limit timer`)
+  }
+}
+
+/** E12's one notice handler (b.uqm SR-14.2): a `timeout:` stops its shard as at its limit, a `kill:` with SIGKILL, each with the decided cause fixed first; a poll's end marker takes the final reading now. Runs inside a timer callback, so it never throws. */
+function onFaultNotice(seq: RunSequence, notice: FaultNotice): void {
+  try {
+    if (seq.endOfRunStarted) return
+    const k = notice.kind === 'end-marker' ? notice.shard : notice.decision.shard
+    const shard = shardRunOf(seq, k)
+    if (shard === undefined || !isFollowedShard(shard)) return
+    if (notice.kind === 'end-marker') {
+      void endShard(seq, shard, { kind: 'end-marker' }, null)
+      return
+    }
+    const reason: RetirementReason = notice.decision.fault.kind === 'kill' ? { kind: 'kill' } : { kind: 'limit' }
+    void endShard(seq, shard, reason, notice.decision.cause)
+  } catch (err) {
+    sayError(seq, err, 'the fault notice handler')
+  }
+}
+
+/** E7's per-sample hook (b.uqm SR-7.3, SR-10.6): a running shard whose result file holds its end marker gets its final reading now; one whose cgroup could not be read is checked for having exited on its own. */
+function followSample(seq: RunSequence, sample: Sample): void {
+  if (seq.endOfRunStarted) return
+  for (const shardSample of sample.shards) {
+    const shard = shardRunOf(seq, shardSample.shard)
+    if (shard === undefined || !isFollowedShard(shard)) continue
+    if (resultFileHoldsEndMarker(shardSample.resultFile)) {
+      seq.controller?.noteShardEnded(shardSample.shard)
+      void endShard(seq, shard, { kind: 'end-marker' }, null)
+    } else if (shardSample.memoryBytes === UNREADABLE_READING) {
+      void endShardIfExited(seq, shard)
+    }
+  }
+}
+
+/** Ends a shard whose container exited on its own, or is gone, as found by one state inspect (b.uqm SR-10.6, SR-12.1); its cause is then read from its exit, never fixed. Never rejects. */
+async function endShardIfExited(seq: RunSequence, shard: ShardRun & { start: ShardStartResult }): Promise<void> {
+  try {
+    const state = await inspectContainerState(seq.docker, shard.start.containerId ?? shard.start.containerName)
+    if (!state.ok || (state.value !== null && state.value.running)) return
+    if (seq.endOfRunStarted || shard.ending !== null) return
+    seq.controller?.noteShardEnded(shard.assignment.shard)
+    await endShard(seq, shard, { kind: 'exited' }, null)
+  } catch (err) {
+    sayError(seq, err, `checking whether ${SHARD_DIR_PREFIX}${shard.assignment.shard} exited`)
+  }
+}
+
+/**
+ * Step 13, the follow loop (b.uqm SR-5.3, SR-10.6): waits, on no timer of its
+ * own, until every started shard has ended or a run-level stop is recorded.
+ * The three timer sources end the shards: E7's samples (an end marker, or a
+ * container that exited), E4's limit timers, and E12's 1 s polls while a
+ * `timeout:` or `kill:` is due.
+ */
+async function followShards(seq: RunSequence): Promise<void> {
+  enterStep(seq, 'follow')
+  for (;;) {
+    if (runStopRecorded(seq)) return
+    if (!seq.shards.some((shard) => shard.start !== null && shard.start.start.kind === 'started' && !shard.ended)) return
+    await new Promise<void>((resolve) => {
+      seq.waiters.push(resolve)
+    })
+  }
+}
+
+/**
+ * A run-level stop before the end-of-run sequence (b.uqm SR-5.6): every
+ * running shard gets its final reading and is retired with its cause fixed as
+ * `stopped by <stop>`; a shard not yet created takes that cause too; a shard
+ * that failed to start keeps its own (end-of-run step 1 retires it).
+ */
+async function stopShards(seq: RunSequence, stop: RunLevelStop): Promise<void> {
+  const cause = stoppedCauseOf(stop)
+  const ends: Promise<void>[] = []
+  for (const shard of seq.shards) {
+    if (shard.ending !== null) {
+      ends.push(shard.ending)
+    } else if (shard.start === null) {
+      shard.fixedCause = cause
+      shard.fixedByStop = stop.kind
+    } else if (shard.start.start.kind === 'started') {
+      ends.push(endShard(seq, shard, { kind: 'run-level-stop', by: stop.kind }, cause, stop.kind))
+    }
+  }
+  await Promise.all(ends)
+}
+
+/** After steps 3–13: releases the lock if still held (a throw is logged), ends what a stop or an internal error left running, then runs the end of run. */
+async function finishRun(seq: RunSequence): Promise<number> {
+  cancelFollowTimers(seq)
+  try {
+    releaseAdmissionLock(seq)
+  } catch (err) {
+    sayError(seq, err, 'releasing the admission lock')
+  }
+  const stop = seq.state.firstStop
+  if (stop !== null) {
+    await stopShards(seq, stop)
+  } else if (seq.internalErrorLine !== null) {
+    seq.controller?.noteRunStop()
+    await Promise.all(seq.shards.filter(isFollowedShard).map((shard) => endShard(seq, shard, { kind: 'kill' }, null)))
+  }
+  return endOfRun(seq)
+}
+
+/**
+ * The run sequence after validation (b.uqm SR-5.3): steps 3–11, step 12,
+ * step 13, then the end of run; or a refusal. Answers main's exit status:
+ * `VERDICT_WRITTEN_EXIT_STATUS` once `verdict.txt` is renamed into place,
+ * E1's refusal status after a recorded refusal. An internal error in steps
+ * 3–13 is logged and the run still ends through the end of run, which
+ * retires its shards and cleans up, its verdict that error's failure line.
+ * The lock is released on every way out.
+ */
+export async function runAfterValidation(deps: RunnerDeps, run: RunContext, validated: ValidatedRun, hooks: RunSequenceHooks = {}): Promise<number> {
+  const seq = createRunSequence(deps, run, validated, hooks)
+  const onSequenceStart = hooks.onSequenceStart
+  if (onSequenceStart !== undefined) callRunHook(seq, 'sequence-start', () => onSequenceStart(seq))
+  let exitStatus: number
+  try {
+    exitStatus = await runSteps(seq)
+  } finally {
+    releaseAdmissionLock(seq)
+  }
+  const onSequenceEnd = hooks.onSequenceEnd
+  if (onSequenceEnd !== undefined) callRunHook(seq, 'sequence-end', () => onSequenceEnd(seq, exitStatus))
+  return exitStatus
+}
+
+/**
+ * Steps 3–13 and the end of run, or a refusal. An internal error in steps
+ * 3–13 is logged, sets the run's internal-error line and goes through
+ * `finishRun`, as a stop does; one thrown while a refusal is being recorded
+ * (only by E1's recorder, the refusal path guarding its cleanup) is thrown on.
+ */
+async function runSteps(seq: RunSequence): Promise<number> {
+  try {
+    const admitted = await admitRun(seq)
+    if (admitted.kind === 'refused') return admitted.exitStatus
+    if (admitted.kind === 'go-on') {
+      const started = await buildAndStartShards(seq)
+      if (started.kind === 'refused') return started.exitStatus
+      if (started.kind === 'go-on') await followShards(seq)
+    }
+  } catch (err) {
+    sayError(seq, err, `step ${seq.step}`)
+    if (seq.refusalBeingRecorded) throw err
+    seq.internalErrorLine = internalErrorFailureLine(dependencyErrorText(err))
+  }
+  return finishRun(seq)
+}
+
+// The end of run (b.uqm SR-5.7).
+
+/** One shard's evidence before its outcome: everything but `endedNormally` and `end`. */
+type ShardEvidenceBase = Omit<ShardEvidence, 'endedNormally' | 'end'>
+
+/** One shard's evidence, outcome and out-of-memory status as step 5 builds them. */
+interface ShardEnd {
+  readonly evidence: ShardEvidence
+  readonly outcome: ShardOutcome
+  readonly oom: OomStatus
+}
+
+/** A hex record's value, or null when missing or malformed. */
+function hexRecordValue(read: HexRecordRead): string | null {
+  return read.kind === 'value' ? read.value : null
+}
+
+/** A shard's anon peak and peak PIDs (E7); a throw is logged and gives an unknown peak. */
+function shardPeaksOf(seq: RunSequence, k: number, samples: readonly ShardSample[], final: FinalReading | null): ShardPeaks {
+  try {
+    return shardPeaks(samples, final)
+  } catch (err) {
+    sayError(seq, err, `${SHARD_DIR_PREFIX}${k}'s anon peak`)
+    return { anonPeak: { bytes: null, pageCacheBytes: null, mark: 'unknown' }, peakPids: null }
+  }
+}
+
+/**
+ * One shard's evidence (E9's start and reading, E7's peaks and out-of-memory
+ * line, E4's seconds, E11's in-shard records, the fixed cause) and its
+ * outcome (E10), read from its subdirectory, which is final after end-of-run
+ * step 1. Its failed readings are its samples' (0 when never sampled) plus its
+ * final reading's.
+ */
+function shardEndOf(seq: RunSequence, shard: ShardRun, samples: readonly Sample[], report: MemoryWatchdogReport | null, timing: TimingValues): ShardEnd {
+  const k = shard.assignment.shard
+  const dir = shardSubdirectoryPath(seq.run.runDir, k)
+  const reading = shard.finalReading
+  const resultFile = shard.resultFileAtFinalReading ?? readResultFile(dir)
+  const oom = classifyOom({ shard: k, assigned: shard.assignment.assigned }, samples, reading === null ? null : { reading: reading.final, resultFile })
+  const peaks = shardPeaksOf(
+    seq,
+    k,
+    samples.flatMap((sample) => sample.shards.filter((shardSample) => shardSample.shard === k)),
+    reading?.final ?? null,
+  )
+  const start = shard.start
+  const base: ShardEvidenceBase = {
+    shard: k,
+    assigned: shard.assignment.assigned,
+    expectedSeconds: shard.assignment.expectedSeconds,
+    limitMinutes: shard.assignment.limitMinutes,
+    seconds: timing.shards.find((entry) => entry.shard === k)?.seconds ?? null,
+    anonPeak: peaks.anonPeak,
+    peakPids: peaks.peakPids,
+    final: { oomKilled: reading?.final.oomKilled ?? UNREADABLE_READING, oomKillCount: reading?.final.oomKillCount ?? UNREADABLE_READING },
+    failedReadings: (report?.shardFailedReadings.get(k) ?? 0) + (reading?.failedReadings.length ?? 0),
+    packageSha256: hexRecordValue(readHexRecord(join(dir, PACKAGE_SHA256_FILE_NAME), SHA256_HEX_LENGTH)),
+    dependencyFingerprint: hexRecordValue(readHexRecord(join(dir, DEPENDENCY_FINGERPRINT_FILE_NAME), SHA256_HEX_LENGTH)),
+    imageId: start?.imageId ?? null,
+    inspection: start?.inspection ?? null,
+    inspectionError: start?.inspectionError ?? null,
+    start: start?.start ?? null,
+    canary: start?.start.canary ?? '',
+    resultFile,
+    fixedCause: shard.fixedCause,
+    exitCode: reading?.exitCode ?? null,
+    oomLine: oomLineOf(k, oom),
+  }
+  const outcome = readShardOutcome(base, dir)
+  return { evidence: { ...base, endedNormally: outcome.endedNormally, end: outcome.end }, outcome, oom }
+}
+
+/** The modes `results.json` records (b.uqm SR-16.1, SR-5.9): the run directory's, the tarball's, and each `shard-<k>` directory's, read without following a link. */
+function readRunModes(runDir: string, tarballPath: string | null): RunModes {
+  const runDirMode = lstatRunDirEntry(runDir).mode
+  let tarball: number | null = null
+  if (tarballPath !== null) {
+    try {
+      tarball = lstatRunDirEntry(tarballPath).mode
+    } catch {
+      tarball = null
+    }
+  }
+  const shardDirs: Record<string, number> = {}
+  const names = listRunDirEntries(runDir)
+    .filter((name) => INTEGRITY_SHARD_DIR_PATTERN.test(name))
+    .sort((a, b) => Number(a.slice(SHARD_DIR_PREFIX.length)) - Number(b.slice(SHARD_DIR_PREFIX.length)))
+  for (const name of names) {
+    try {
+      const entry = lstatRunDirEntry(join(runDir, name))
+      if (entry.isDirectory()) shardDirs[name] = entry.mode
+    } catch {
+      // A directory gone or unreadable is not recorded.
+    }
+  }
+  return { runDir: runDirMode, tarball, shardDirs }
+}
+
+/** The cap line and record (E7, b.uqm SR-8.3, SR-8.4); a throw is logged, and the unknown form is tried before giving up (null). */
+function capReportOf(seq: RunSequence, passed: boolean, shards: readonly CapShard[]): CapReport | null {
+  const invocation = seq.validated.invocation
+  try {
+    return buildCapReport({ invocation, passed, capUsedBytes: SHARD_MEMORY_CAP_BYTES, rule: capRule(SHARD_MEMORY_CAP_BYTES, shards), shards })
+  } catch (err) {
+    sayError(seq, err, 'the cap rule')
+  }
+  try {
+    const unknown = shards.map((shard): CapShard => ({ shard: shard.shard, anonPeak: { bytes: null, pageCacheBytes: null, mark: 'unknown' }, killed: shard.killed }))
+    return buildCapReport({ invocation, passed, capUsedBytes: SHARD_MEMORY_CAP_BYTES, rule: { derivedBytes: null, source: null }, shards: unknown })
+  } catch (err) {
+    sayError(seq, err, 'the cap line')
+    return null
+  }
+}
+
+/** What step 5 composes: the verdict line and the results value (null when it could not be assembled). */
+interface EndFiles {
+  readonly verdict: string
+  readonly results: Results | null
+}
+
+/**
+ * Composes the verdict line and `results.json`'s value (b.uqm SR-5.7 step 5),
+ * in E7's and E10's order: each shard's evidence and out-of-memory status;
+ * the outcomes; the pass condition over the same failures the ranking sees;
+ * the anon peaks, the cap rule and the cap line; the ranking and the verdict
+ * line; the timing (the total taken now); the shard count; the modes; the
+ * value. A throw in the ranking, the verdict line or the assembly is logged
+ * and gives `internalErrorVerdictLine`; a throw in the cap pieces is logged
+ * and gives the unknown cap form.
+ */
+function composeEndFiles(seq: RunSequence, integrity: IntegrityChecksResult, report: MemoryWatchdogReport | null): EndFiles {
+  const { deps, run, validated, state } = seq
+  const invocation = validated.invocation
+  const expectedScripts = seq.runScripts.map((script) => script.fileName)
+  const samples = report?.samples ?? seq.watchdog?.samples() ?? []
+  const record: TimingRecord = {
+    runnerStartAtMs: run.basis.startMs,
+    packingStartAtMs: state.packingStartedAtMs,
+    baseBuild: state.baseBuildRun,
+    pinnedKnownAtMs: state.images.pinnedAtMs,
+    shards: seq.shards.map((shard) => ({
+      shard: shard.assignment.shard,
+      startedAtMs: shard.start?.start.kind === 'started' ? shard.start.start.startedAtMs : null,
+      finalReadingAtMs: shard.finalReading?.atMs ?? null,
+      resultFile: shard.resultFileAtFinalReading ?? readResultFile(shardSubdirectoryPath(run.runDir, shard.assignment.shard)),
+    })),
+    verdictAtMs: deps.clock.now(),
+  }
+  const timing = timingReport(record, seq.schedule)
+  const ends = seq.shards.map((shard) => shardEndOf(seq, shard, samples, report, timing.values))
+  const outcomes = ends.map((end) => end.outcome)
+  const firstStop = state.firstStop
+  const sources: FailureSources = {
+    runLevelLine: firstStop !== null ? runLevelStopLine(firstStop) : seq.internalErrorLine,
+    imageBuildLine: seq.imageBuildFailure?.line ?? null,
+    integrityFailures: integrity.failures,
+    outcomes,
+  }
+  const passed = runPasses({
+    expectedScripts,
+    shardsUsed: seq.shards.map((shard) => shard.assignment.shard),
+    outcomes,
+    otherFailures: otherFailuresOf(sources),
+  })
+  const cap = capReportOf(
+    seq,
+    passed,
+    ends.map((end) => ({ shard: end.evidence.shard, anonPeak: end.evidence.anonPeak, killed: end.oom.kind === 'killed' })),
+  )
+
+  let ranked: readonly Failure[]
+  let verdict: string
+  try {
+    ranked = rankFailures(sources)
+    verdict = buildVerdictLine({ invocation, scripts: expectedScripts, passed, ranked })
+  } catch (err) {
+    sayError(seq, err, 'the verdict line')
+    ranked = [...otherFailuresOf(sources), ...outcomes.flatMap((outcome) => outcome.failures)]
+    verdict = internalErrorVerdictLine(invocation, expectedScripts, dependencyErrorText(err))
+  }
+
+  const admission = seq.admission
+  const shardCountLine = admission !== null ? formatShardCountLine(admission.line) : endedBeforeAdmissionShardCountLine(validated.requestedShards)
+  const finalFailedReadings = seq.shards.reduce((sum, shard) => sum + (shard.finalReading?.failedReadings.length ?? 0), 0)
+  const assemble = (line: string): Results =>
+    assembleResults({
+      runId: run.runId,
+      pid: deps.pid,
+      invocation,
+      packageSha256: state.packageSha256,
+      images: state.images,
+      verdict: line,
+      shards: ends.map((end) => ({ evidence: end.evidence, outcome: end.outcome })),
+      shardCount: {
+        requested: validated.requestedShards,
+        effective: validated.effectiveShards,
+        admitted: admission?.shards ?? 0,
+        started: seq.shards.filter((shard) => shard.start?.start.kind === 'started').length,
+        reasons: admission !== null ? shardCountReasonTexts(admission.line) : [ENDED_BEFORE_ADMISSION_REASON],
+      },
+      cap: cap?.record ?? { usedBytes: SHARD_MEMORY_CAP_BYTES, peakBytes: null, peakShard: null, peakPageCacheBytes: null, peakFromKill: null, derivedBytes: null, suffix: null },
+      workingSet: report?.workingSet ?? { before: seq.figures?.readings.beforeWorkingSet ?? null, peak: null, after: null },
+      failedReadings: (report?.failedReadings ?? 0) + finalFailedReadings,
+      modes: readRunModes(run.runDir, state.tarballPath),
+      failures: ranked,
+      skippedChecks: integrity.skippedChecks,
+      cleanupFailures: state.cleanupFailures,
+      timing: timing.values.timing,
+      timingGroups: {
+        shardCountLine,
+        runTimes: timing.timingLines,
+        scriptTimes: timing.scriptLines,
+        durationTableBlock: timing.blockLines,
+        slowLines: timing.slowLines,
+        tableNotes: timing.notes,
+        capLine: cap?.line ?? null,
+      },
+    })
+  try {
+    return { verdict, results: assemble(verdict) }
+  } catch (err) {
+    sayError(seq, err, `assembling ${RESULTS_FILE_NAME}`)
+    const fallback = internalErrorVerdictLine(invocation, expectedScripts, dependencyErrorText(err))
+    try {
+      return { verdict: fallback, results: assemble(fallback) }
+    } catch {
+      return { verdict: fallback, results: null }
+    }
+  }
+}
+
+/** Writes `results.json` and `summary.txt` through E10's one writer with E11's redactor (b.uqm SR-5.7 step 5, SR-15.3), each outcome's failure logged. */
+function writeEndFiles(seq: RunSequence, files: EndFiles, values: readonly string[]): void {
+  if (files.results === null) {
+    seq.say(`ci-run: ${RESULTS_FILE_NAME} and ${SUMMARY_FILE_NAME} were not written: their value could not be assembled`)
+    return
+  }
+  const redactor = createEndFileRedactor(values)
+  const written = writeResultsFiles(seq.run.runDir, files.results, { results: (results) => redactor.results(results), text: (text) => redactor.summary(text) })
+  if (!written.results.ok) seq.say(`ci-run: writing ${RESULTS_FILE_NAME} failed: ${written.results.error}`)
+  if (!written.summary.ok) seq.say(`ci-run: writing ${SUMMARY_FILE_NAME} failed: ${written.summary.error}`)
+  seq.resultsWritten = true
+}
+
+/**
+ * The end-of-run sequence (b.uqm SR-5.7), its six steps in order:
+ * 1. the phase turns `merge`, the run's last status write; every shard still
+ *    present is retired through E9 (final reading if not yet taken, SIGKILL
+ *    while running, `docker.log`, removal); the read container is removed
+ *    (E8); the fault controller is finalized (E12);
+ * 2. E11's integrity entry, checks 1–11 then `secret-scan`, which switches the
+ *    runner log's masking on;
+ * 3. the reservation released (E5), then the run's images removed (E8);
+ * 4. the watchdog stopped, W read after cleanup (E7);
+ * 5. `results.json` and `summary.txt`, through E10's writer with E11's
+ *    redactor;
+ * 6. `verdict.txt`, through E11's verdict writer, last; when a run-level stop
+ *    came after step 5's composition, both files are first written again,
+ *    whole (b.uqm SR-5.6).
+ * After the rename the runner log is sealed and the exit status is
+ * `VERDICT_WRITTEN_EXIT_STATUS`, whatever the verdict. The run directory is
+ * never removed.
+ */
+async function endOfRun(seq: RunSequence): Promise<number> {
+  const { deps, run, state } = seq
+  seq.endOfRunStarted = true
+  seq.step = 'end-of-run'
+  cancelFollowTimers(seq)
+
+  // Step 1: the phase, the remaining shards, the read container, the faults' records.
+  enterEndOfRunStep(seq, 'final-readings')
+  writeRunPhase(seq, 'merge')
+  const stop = state.firstStop
+  const remainingReason: RetirementReason = stop !== null ? { kind: 'run-level-stop', by: stop.kind } : { kind: 'exited' }
+  for (const shard of seq.shards) if (shard.start !== null && shard.ending === null) void endShard(seq, shard, remainingReason, null)
+  await Promise.all(seq.shards.flatMap((shard) => (shard.ending === null ? [] : [shard.ending])))
+  if (seq.readBackStarted) {
+    const removal = await removeReadContainerIfPresent(seq.docker, seq.owner, seq.say)
+    if (removal.kind === 'failed') state.cleanupFailures.push(removal.line)
+  }
+  const firingRecords = seq.controller?.finalize() ?? []
+
+  // Step 2: the integrity checks, `secret-scan` last.
+  enterEndOfRunStep(seq, 'integrity')
+  const values = scannedSecretValues(deps.env, { baseBuildToken: state.baseBuildToken })
+  const integrity = runEndOfRunIntegrity(seq, firingRecords, values)
+
+  // Step 3: the reservation, then the run's images.
+  enterEndOfRunStep(seq, 'cleanup')
+  removeRunReservation(seq)
+  await cleanupRunImages({ docker: seq.docker, owner: seq.owner, clock: deps.clock, log: seq.say }, state)
+
+  // Step 4: the watchdog, and W after cleanup.
+  enterEndOfRunStep(seq, 'watchdog-stop')
+  const report = seq.watchdog === null ? null : await seq.watchdog.stop()
+
+  // Step 5: results.json and summary.txt.
+  enterEndOfRunStep(seq, 'results')
+  let files = composeEndFiles(seq, integrity, report)
+  writeEndFiles(seq, files, values)
+  const stopWritten = state.firstStop
+
+  // Step 6: verdict.txt, last; the two files again first when a stop came since step 5.
+  enterEndOfRunStep(seq, 'verdict')
+  if (state.firstStop !== stopWritten) {
+    files = composeEndFiles(seq, integrity, report)
+    writeEndFiles(seq, files, values)
+  }
+  const written = writeRedactedVerdictFile(run.runDir, files.verdict, values)
+  if (!written.ok) {
+    sayError(seq, written.error, `writing ${VERDICT_FILE_NAME}`)
+    return FAILURE_EXIT_STATUS
+  }
+  seq.verdictRenamed = true
+  sealRunnerLog(run.log)
+  return VERDICT_WRITTEN_EXIT_STATUS
+}
+
+/**
+ * End-of-run step 2 (b.uqm SR-5.7, SR-13): E11's one entry, with the shards'
+ * evidence (`endedNormally` from E10's reading of each shard's subdirectory,
+ * final after step 1), E12's firing records and the run state its skip rules
+ * read. A throw is logged, the log's masking still switched on, and the run
+ * fails with one `secret-scan` failure saying the checks could not run.
+ */
+function runEndOfRunIntegrity(seq: RunSequence, firingRecords: readonly FiringRecord[], values: readonly string[]): IntegrityChecksResult {
+  const { run, state } = seq
+  const shards: IntegrityShard[] = seq.shards.map((shard) => {
+    const k = shard.assignment.shard
+    return {
+      shard: k,
+      endedNormally: shardEndedNormally(readShardScripts(shardSubdirectoryPath(run.runDir, k), shard.assignment.assigned)),
+      start: shard.start?.start ?? null,
+      canary: shard.start?.start.canary ?? '',
+      inspection: shard.start?.inspection ?? null,
+    }
+  })
+  const stopTime: IntegrityStopTime | null =
+    seq.firstStopTiming === null ? null : seq.firstStopTiming === 'during-end-of-run' ? 'during-end-of-run' : 'before-end-of-run'
+  try {
+    return runIntegrity({
+      runDir: run.runDir,
+      expectedScripts: seq.runScripts.map((script) => script.fileName),
+      assignment: seq.schedule?.assignment ?? null,
+      shards,
+      pinnedImageId: state.images.pinnedId,
+      packageSha256: state.packageSha256,
+      tarballPath: state.tarballPath,
+      faults: seq.validated.invocation.faults,
+      firingRecords,
+      runState: { shardsScheduled: seq.schedule !== null, imageBuildFailed: seq.imageBuildFailure !== null, stopTime },
+      values,
+      log: run.log,
+    })
+  } catch (err) {
+    try {
+      switchOnRunnerLogRedaction(run.log, values)
+    } catch {
+      // Masking is the log's own; nothing more to do.
+    }
+    sayError(seq, err, 'the integrity checks')
+    return {
+      failures: [integrityFailure('secret-scan', maskScannedValues(`the integrity checks could not run: ${dependencyErrorText(err)}`, values), null)],
+      skippedChecks: [],
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // 18. Main entry (E1)
@@ -15253,14 +16570,29 @@ export async function runSequence(deps: RunnerDeps, run: RunContext): Promise<nu
  * or `FAILURE_EXIT_STATUS` when the status write failed, its error then in the
  * log. A caller first releases the lock and its reservation and removes the
  * containers, tags and images the run made (E5, E8, E13). Validation stage 1
- * calls it here, E2's stages 2–8 and E13's refusals likewise.
+ * calls it here, E2's stages 2–8 and E13's refusals likewise. A log line
+ * that cannot be appended (the runner log's sink throws, E13) never keeps the
+ * refused status from being written, and once the status write is done the
+ * log is sealed (`sealRunnerLog`), so nothing, an uncaught error included, is
+ * written after it.
  */
 export function recordRefusal(run: RunContext, refusal: Refusal): number {
-  run.log(refusalLine(refusal))
-  for (const detail of refusal.details) run.log(detail)
+  const logLine = (write: () => void): void => {
+    try {
+      write()
+    } catch {
+      // The failed append already went to standard error; the refusal is still recorded.
+    }
+  }
+  logLine(() => run.log(refusalLine(refusal)))
+  for (const detail of refusal.details) logLine(() => run.log(detail))
   const written = writeStatusFile(run.runDir, buildRefusedStatus(run.basis, refusal))
-  if (written.ok) return REFUSAL_EXIT_STATUS
-  run.log.error(written.error, 'recording the refusal')
+  if (written.ok) {
+    sealRunnerLog(run.log)
+    return REFUSAL_EXIT_STATUS
+  }
+  logLine(() => run.log.error(written.error, 'recording the refusal'))
+  sealRunnerLog(run.log)
   return FAILURE_EXIT_STATUS
 }
 
@@ -15282,9 +16614,18 @@ export interface MainOptions {
  *   naming the path, nothing written there, `FAILURE_EXIT_STATUS` (1); so too
  *   when the run directory cannot be created at all.
  * - Otherwise step 1, then `runSequence`: a refusal gives
- *   `REFUSAL_EXIT_STATUS` (2); until E13 a valid invocation gives 1.
+ *   `REFUSAL_EXIT_STATUS` (2); a run whose `verdict.txt` was renamed into
+ *   place gives `VERDICT_WRITTEN_EXIT_STATUS` (0), whatever the verdict
+ *   (E13). Nothing reads either: the reader judges a run by its files.
  * - Any error met once the run directory exists is written to the runner log
  *   (after its first line) before main resolves with 1.
+ *
+ * The runner log is sealable (E13, `createSealableRunnerLog`): the refusal
+ * recorder and the verdict write seal it, so nothing is written after the
+ * run's last act. A failed append is reported on standard error and then
+ * thrown by the log's sink, so `runContainer` never spawns a `docker run` list
+ * it could not log (b.uqm SR-10.4); the run's own lines go through guarded
+ * writers that drop such a throw.
  */
 export async function main(argv: readonly string[], deps: RunnerDeps, options: MainOptions = {}): Promise<number> {
   const stderrLine = (line: string): void => {
@@ -15317,17 +16658,28 @@ export async function main(argv: readonly string[], deps: RunnerDeps, options: M
     return FAILURE_EXIT_STATUS
   }
   const logPath = join(runDir, RUNNER_LOG_FILE_NAME)
-  const log = createRunnerLog(logPath, {
-    onAppendError: (error) => stderrLine(`ci-run: appending to ${shownArgument(logPath)} failed: ${error}`),
-  })
+  const log = createSealableRunnerLog(
+    createRunnerLog(logPath, {
+      // Reported, then rethrown: a sink that cannot append throws (b.uqm SR-10.4).
+      onAppendError: (error) => {
+        const line = `ci-run: appending to ${shownArgument(logPath)} failed: ${error}`
+        stderrLine(line)
+        throw new Error(line)
+      },
+    }),
+  )
   let run: RunContext | null = null
   try {
     run = beginRun(deps, runId, runDir, args, log)
     options.onRunLog?.(log)
     return await runSequence(deps, run)
   } catch (err) {
-    if (run === null) log(formatRunnerLogFirstLine(runId, deps.pid, args))
-    log.error(err)
+    try {
+      if (run === null) log(formatRunnerLogFirstLine(runId, deps.pid, args))
+      log.error(err)
+    } catch {
+      // The failed append already went to standard error.
+    }
     return FAILURE_EXIT_STATUS
   }
 }
@@ -15338,12 +16690,18 @@ export async function main(argv: readonly string[], deps: RunnerDeps, options: M
 // dependencies, writes an uncaught exception or rejection to the runner log
 // once the run directory exists (to standard error before that), runs main
 // with the process arguments and exits with its status. Nothing here runs on
-// import; the signal traps are E13's (b.uqm SR-1.3, SR-5.4).
+// import; the signal traps are E13's (b.uqm SR-1.3, SR-5.4). Once the refused
+// status or `verdict.txt` is written the runner log is sealed, so an uncaught
+// error after it writes nothing (b.uqm SR-5.7, SR-5.8).
 if (import.meta.main) {
   let runLog: RunnerLogWriter | null = null
   const fail: (err: unknown, origin: string) => never = (err, origin) => {
-    if (runLog !== null) runLog.error(err, origin)
-    else writeSync(2, `ci-run: ${origin}: ${dependencyErrorText(err)}\n`)
+    try {
+      if (runLog !== null) runLog.error(err, origin)
+      else writeSync(2, `ci-run: ${origin}: ${dependencyErrorText(err)}\n`)
+    } catch {
+      // Nowhere left to report to; the exit still follows.
+    }
     process.exit(FAILURE_EXIT_STATUS)
   }
   process.on('uncaughtException', (err) => fail(err, 'uncaught exception'))
