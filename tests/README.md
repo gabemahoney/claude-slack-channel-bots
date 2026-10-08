@@ -5,7 +5,7 @@
 | Kind | Where | Run by |
 |---|---|---|
 | Unit suite | `tests/*.test.ts`, `tests/integration/session-leader.test.ts` | `bun test`, on a dev box |
-| Docker integration suite | `tests/integration/test-*.sh`, `tests/runner.sh`, `docker/` | `/ci`, inside the `cscb-ci` image |
+| Docker integration suite | `tests/integration/test-*.sh`, `tests/runner.sh`, `tests/ci-durations.tsv`, `docker/` | `/ci`: the host runner `scripts/ci-run.ts` builds the run's own test image (a run-private tag, pinned by its image ID) and runs the scripts in up to 6 shard containers from it |
 | Live acceptance plan | `testplans/b.yko/b.yko.md` | an operator, by hand, on a test host and test Slack workspace; or `/ci-live` (`ci-live/`), in a throwaway container against the test workspace |
 
 Conventions for unit tests are in `docs/testing-guide.md`; this file covers how
@@ -126,15 +126,25 @@ start the server in dry run. Test 4, Test 0, Tests 10, 12 and 29 and every
 fmk scenario leave dry run: Test 4 runs its driver, which spawns under a stub
 `claude` and starts no server, and the others start a live server, against
 the loopback Slack stub.
-`/ci` packs
-the package, builds the image from `docker/Dockerfile.test` (on the base in
-`docker/Dockerfile.test.base`, see `docker/README.md`) and runs `tests/runner.sh` inside it. The verdict is
-`PASS` or `FAIL`.
 
-The scripts run only in that container, never on a dev box or a host with a
-real CSCB install: they write to `~/.claude/channels/slack/`, start a server
+The `/ci` skill (`.claude/skills/ci/SKILL.md`) launches the host runner,
+`scripts/ci-run.ts`, detached, and polls it with the verdict reader,
+`scripts/ci-verdict.ts`. The runner packs the package, then builds the run's
+own test image from `docker/Dockerfile.test` (on the base in
+`docker/Dockerfile.test.base`, see `docker/README.md`) and pins it by its
+image ID. It admits N shards, up to 6, and starts one shard container per
+shard from that image, each running `tests/runner.sh` with its assigned
+scripts (see Sharding).
+
+When every shard has ended, the runner merges the shards' results into one
+verdict. The verdict reader reports it, and its exit code is `/ci`'s: see
+Verdict file format for the verdict's shapes, and the skill for the report.
+
+The scripts run only in a shard container, never on a dev box or a host with
+a real CSCB install: they write to `~/.claude/channels/slack/`, start a server
 and spawn instances. If docker is not available, report the integration run
-as not done rather than running a script directly.
+as not done rather than running a script directly; `/ci` itself refuses such
+a run as `NOT RUN: docker does not answer: <error>`.
 
 A check that needs a real agent-director spawn belongs here, never in the
 unit suite, which spawns no real Claude process: Test 12 checks the hook
@@ -148,8 +158,10 @@ only skip.
 for it before their first other step and, when it is absent, refuse and say
 why:
 
-- `tests/runner.sh`: its first step. It prints one line to stderr and exits 2
-  before it creates a directory, writes a verdict or runs a test.
+- `tests/runner.sh`: its first step. It prints one line to stderr and exits
+  2 before it reads its arguments, writes any in-shard file or runs a
+  script. The runner never writes a verdict, with or without the marker: the
+  host runner writes it.
 - Every `test-*.sh`: a script that sources `lib/scenario.sh` gets the
   helper's check, its first step, which prints
   `FAIL: <test>: refused: /etc/cscb-ci-image is absent …` and exits 1 before
@@ -238,7 +250,7 @@ tests/
                                    # (agent-director's exec-form `command` read verbatim, CSCB's shell-form Stop hook by its first word); agent-director's run the user's agent-director install,
                                    # the reply guard runs the installed package's script
     test-0-fmk-harness-self-check.sh
-                                   # SRJ-1306 (as amended by b.deo SRI-1402 to SRI-1404), fmk mode: the harness's self-check, run after Test 4 and before every fmk scenario. Its legs show the scenario's own HOME,
+                                   # SRJ-1306 (as amended by b.deo SRI-1402 to SRI-1404), fmk mode: the harness's self-check, run once, after Test 4 in canonical order, in the one shard that holds it. Its legs show the scenario's own HOME,
                                    # TMUX_TMPDIR and PATH (no agent-director on it, the stub as `claude`, bun kept); the release behind the shim at the standard path, and its agent-director-admin behind the shim at the admin path;
                                    # a harness call logged with its argv and the scenario shell as parent; the client's version probe through the shim; a spawn on the
                                    # scenario's own tmux server; `ad_store_id` and `ad_store_edit` on the scenario's store; the shim a regular file carrying its marker
@@ -594,23 +606,29 @@ tests/
     .shellcheckrc                  # lets shellcheck follow `source lib/scenario.sh` without -x
     bunfig.toml                    # loads the host-safety preload guard for a bun test started here
     session-leader.test.ts         # bun test, not run by runner.sh
-  runner.sh                        # sequential runner (Tests 1-4, then discovery), writes /test-results/verdict.txt
+  ci-durations.tsv                 # the duration table: each script's expected seconds, by number form; balances the shards and sets their limits
+                                   # (see The duration table)
+  runner.sh                        # the per-shard in-container runner: takes the shard number, the canary, the `--fail` pairs and the assigned scripts,
+                                   # runs only those, writes the in-shard files and no verdict, then waits after its end marker until the host runner
+                                   # kills its container (see The in-container runner and the in-shard files)
   README.md
 docker/
   Dockerfile.test.base             # source-independent base image (see docker/README.md)
   ad-client-check.sh               # the client-under-test check (check only), copied into the base (see docker/README.md)
   Dockerfile.test                  # top image: the tests and the packed package
-  entrypoint.sh                    # sets up testuser's Claude config, then runs tests/runner.sh
+  entrypoint.sh                    # sets up testuser's Claude config, then passes its arguments unchanged to tests/runner.sh
 ```
 
-`tests/runner.sh` runs Tests 1 to 4 first, in that order, then every other
-`tests/integration/test-*.sh` it finds, in version order (`sort -V`, so
-`test-5` runs before `test-10`, and `test-0-fmk-harness-self-check.sh` runs
-right after Test 4 and before every fmk scenario). A new scenario script needs no runner edit,
-but this layout names every `tests/integration/test-*.sh` on disk and no
-other script: `tests/shipped-docs.test.ts` fails on a script it does not name
-and on a `test-<n>-<name>.sh` it names that is not on disk (see Adding a new
-test).
+A run's scripts run in canonical order: test-1; then test-2, test-3 and
+test-4, each when present; then every other script by ascending number, so
+`test-0-fmk-harness-self-check.sh` follows Test 4 and test-9 comes before
+test-12. Each shard runs test-1 first, then its assigned scripts in that
+order (see Script names, prerequisites and canonical order, and Sharding).
+
+A new scenario script needs no runner edit, but this layout names every
+`tests/integration/test-*.sh` on disk and no other script:
+`tests/shipped-docs.test.ts` fails on a script it does not name and on a
+`test-<n>-<name>.sh` it names that is not on disk (see Adding a new test).
 
 There is no Test 11. It is retired, with its driver: CSCB makes no tmux call
 of its own (b.jg5 SRJ-601), and fmk scenarios 3 and 17 replace it (b.jg5
@@ -935,45 +953,186 @@ a config or credentials file from the host:
   a one-persona config in memory and spawns under a stub `claude`.
 - Test 0 and Tests 5 onwards each write their own config into their own
   scratch state dir (see Scenario helper), never the shared one. Tests 5 to
-  12 and Test 29 run in the container's shared HOME; Test 0 and every fmk
-  scenario run in their own HOME. Test 0, Tests 10, 12 and 29 and the fmk
-  scenarios are the scenarios outside dry run (see Slack stub).
+  12 and Test 29 run in their shard container's shared HOME; Test 0 and
+  every fmk scenario run in their own HOME. Test 0, Tests 10, 12 and 29 and
+  the fmk scenarios are the scenarios outside dry run (see Slack stub).
 
 ### Execution model
 
-`docker/entrypoint.sh` runs `tests/runner.sh` as `testuser`. The runner runs
-the scripts in its order (see Layout) in one container, so state one script
-leaves (the installed package, the running daemon, its PID file and server
-log) is consumed by the scripts after it: Test 1 installs the package, checks
-the agent-director client it resolves (`ad-client-check.sh --package`, then
-`fixtures/phase1-client-check.ts`) and starts the daemon, Tests 2 and 3 use that daemon, Test 4 uses the installed package. The
-runner stops at the first failure and runs nothing after it.
+Each shard is a container of its own, started from the run's pinned test
+image. `docker/entrypoint.sh` sets up testuser's Claude config, then runs
+`tests/runner.sh` as `testuser` with the arguments the host runner gives that
+shard (see The in-container runner and the in-shard files). The runner runs
+only the shard's assigned scripts: test-1 first, then the others in
+canonical order.
+
+State one script leaves (the installed package, the running daemon, its PID
+file and server log) is used only by later scripts in the same shard. Test 1
+installs the package in every shard, checks the agent-director client it
+resolves (`ad-client-check.sh --package`, then
+`fixtures/phase1-client-check.ts`) and starts the daemon. Tests 2 and 3 share
+a shard, as one scheduling unit (Test 3's `# ci-requires: test-2`), and use
+that daemon; Test 4 uses the shard's installed package.
+
+The runner stops its shard at the shard's first failing script and runs
+nothing after it there. The other shards run on to their own ends.
 
 Test 0 and Tests 5 onwards depend only on Test 1's install. Each runs any
 server it starts in its own state dir on its own port, and stops it before it
-exits, so their order among themselves does not matter. Tests 5 to 12 and
-Test 29 run in the helper's shared mode: they share the container's one HOME, one agent-director
-store and one tmux server, with no shim, which is why their persona names are
-unique per script. Every fmk script (Test 0 and each script whose name
-carries `-fmk-`) runs with its own HOME, agent-director install and store,
-and tmux server, all under its `SCENARIO_ROOT` (see Scenario helper), and
-shares none of them with another script.
+exits, so neither their order nor their shard matters. Tests 5 to 12 and
+Test 29 run in the helper's shared mode: they share their shard container's
+one HOME, one agent-director store and one tmux server, with no shim, and
+only with the other shared-mode scripts of that shard; their persona names
+are unique per script all the same. Every fmk script (Test 0 and each script
+whose name carries `-fmk-`) runs with its own HOME, agent-director install
+and store, and tmux server, all under its `SCENARIO_ROOT` (see Scenario
+helper), and shares none of them with another script.
 
 Test 10's live start runs the server's start sweep (`reconcileOrphans`,
-`src/session-manager.ts`) over the shared store. The sweep kills each live
-`service=cscb` agent-director row whose persona is not in Test 10's own
+`src/session-manager.ts`) over its shard's shared store. The sweep kills each
+live `service=cscb` agent-director row whose persona is not in Test 10's own
 config (and each live row with a foreign instance ID or another working
 directory, and each live row with no persona label), deletes no row, and
 records the key of every row whose persona is absent as retired. A finished
-row is never killed. So every row an earlier script left behind stays in the
-store after Test 10's start, and Test 12's live start does the same to Test
-10's rows. Test 29's first live start does the same to the rows of Tests 10
-and 12 and every earlier shared-mode script, so those rows stay too; its
-second live start, after a plain `stop` with both workers running, keeps
-Test 29's own two rows, whose persona, instance ID and working directory
-match its config, and the start pass reconnects both personas. The sweep reaches only the shared
-store: an fmk script's rows are in its own store, which no other script's
-start sees.
+row is never killed. So every row an earlier script in the same shard left
+behind stays in the store after Test 10's start, and Test 12's live start
+does the same to Test 10's rows when the two share a shard. Test 29's first
+live start does the same to the rows of every earlier shared-mode script in
+its shard, Tests 10 and 12 among them when they are there, so those rows stay
+too; its second live start, after a plain `stop` with both workers running,
+keeps Test 29's own two rows, whose persona, instance ID and working
+directory match its config, and the start pass reconnects both personas. The
+sweep reaches only its shard's shared store: an fmk script's rows are in its
+own store, which no other script's start sees, and no shard sees another
+shard's store.
+
+### Sharding
+
+`/ci` runs the run's scripts in N shards, up to 6. The effective N is found
+in the worktree (see Script names, prerequisites and canonical order).
+Admission then takes exactly that N for a run with `--shards` or
+`--inject`, or, for a run with neither, the largest N up to it that fits the
+host's memory and CPU (see `docker/README.md`'s `## /ci: the sharded run`).
+
+- **test-1 first, in every shard.** Every shard installs the package for
+  itself; test-1 belongs to no scheduling unit.
+- **Whole units, balanced.** Every other script goes into exactly one shard,
+  inside its scheduling unit, and a unit is never split. Units are placed
+  longest first into the shard with the smallest expected total, from the
+  duration table (see Script names, prerequisites and canonical order, and
+  The duration table).
+- **Per-shard limits.** Each shard has its own wall-time limit (see The
+  duration table), and its container its own memory cap, PID limit and CPU
+  limit (see `docker/README.md`'s `### Shard containers` and
+  `### The per-shard memory cap and out-of-memory kills`).
+- **Nothing shared.** A shard sees only its own results subdirectory,
+  `shard-<k>` of the run directory, mounted at `/test-results`, and the
+  run's tarball, read-only. It shares no HOME, agent-director store, tmux
+  server or daemon with another shard, and writes no file another shard
+  sees.
+- **Failures stay in their shard.** A shard stops at its own first failing
+  script; one shard's failure, limit or out-of-memory kill never stops
+  another. Only a run-level stop (an interrupt, the run deadline or the
+  memory watchdog), or an internal error of the host runner, stops every
+  shard.
+- **One merged verdict.** When every shard has ended, the host runner reads
+  each shard's files, runs the integrity checks and writes one verdict for
+  the run (see Verdict file format). With `--shards 1` the run keeps the
+  serial order and stops at its first failure.
+
+### The in-container runner and the in-shard files
+
+`tests/runner.sh` runs inside one shard container, as the container's PID 1
+(through `docker/entrypoint.sh`'s `exec`). Its first step is the image-marker
+check (see Image marker). It then takes its arguments, in this order:
+
+```text
+tests/runner.sh <shard number> <canary> [--fail <file name>]... <file name>...
+```
+
+| Argument | Form |
+|---|---|
+| `<shard number>` | k, a whole number of at least 1, with no leading zero |
+| `<canary>` | 32 lowercase hexadecimal characters, drawn at random for each shard by the host runner |
+| `--fail <file name>` | zero or more pairs: an assigned script to record failed without running it (the `fail:` fault; see Fault injection) |
+| `<file name>...` | the assigned scripts' file names, `test-<n>-<slug>.sh`, in run order, test-1 first, each once |
+
+Malformed arguments (one missing or not of its form, a first script that is
+not test-1, a script named twice, a `--fail` naming a file that is not an
+assigned script or naming one twice) print one line on stderr beginning
+`usage: ` and exit 64. Nothing is written.
+
+It runs only its assigned scripts, in the given order, each through `bash`.
+In its shard's subdirectory, `shard-<k>` of the run directory
+`cscb-ci-<RUN_ID>` in the system temp directory (`$TMPDIR`, else `/tmp`),
+mounted at `/test-results`, it writes these files and nothing else:
+
+| File | Content | Written |
+|---|---|---|
+| `canary.txt` | the canary and one LF | before any script runs |
+| `package.sha256` | the SHA-256 of `/tmp/package.tgz`, 64 lowercase hexadecimal characters and one LF | before any script runs |
+| `result.txt` | one line per event, below | each line flushed whole as it is written |
+| `<file name>.log` | the script's combined stdout and stderr | as the script runs, for each script with a result other than `notrun` |
+| `dependency-fingerprint.txt` | the SHA-256, 64 lowercase hexadecimal characters and one LF, of one `<name>@<version>` line per installed package directory under `/test-repo/node_modules`, sorted bytewise with repeats removed | after test-1 passes |
+
+`result.txt`'s lines, each ending in an LF, fields separated by single
+spaces:
+
+```text
+start <file name>
+end <file name> pass <s.mmm>
+end <file name> fail <s.mmm>
+notrun <file name>
+done
+```
+
+`start` comes before each script and `end` after it, with the script's wall
+time in seconds: digits with no leading zero but a lone `0`, a point, and
+exactly three digits. `notrun` is written for each assigned script not
+reached, and the end marker `done` comes last.
+
+A script named by `--fail` is not run. Its lines are `start <file name>` and
+`end <file name> fail 0.000`, and its log holds only
+`FAIL: <file name>: injected failure`.
+
+At its first failing script the runner runs nothing more: it writes the
+`notrun` lines, then `done`. It never writes `verdict.txt`; the host runner
+writes the verdict at the end of the run.
+
+After `done` the runner stays running, idle, and ignores SIGTERM until the
+host runner kills its container. The container's cgroup, which holds the
+kill count and anon memory the final reading needs, exists only while the
+container runs, so the shard is kept alive until that final reading. A
+container that exits after `done` all the same still ended normally. The
+host runner then saves the container's Docker logs as `docker.log` in the
+same subdirectory.
+
+**Where to look after a FAIL.** The verdict reader removes the run directory
+only after a full or selective PASS, or a refusal. It keeps every other run's
+directory, a FAIL's included, and its `results:` line names it.
+Start with `summary.txt`, which lists every failure with its shard, then the
+failing shard's `shard-<k>/result.txt`, the failing script's
+`shard-<k>/<file name>.log` and `shard-<k>/docker.log`; `runner.log` holds
+the host runner's own steps. Remove the directory by hand once inspected.
+
+### Known-flaky scripts
+
+A script listed here is a known flake. A mismatch between two runs on one
+tree (a default full run and a `--shards 1` run, or the same two runs given
+one `--inject fail:<script>`) is a flake only when a selective run of that
+script alone, repeated three times, both passes and fails at least once. The
+script is then listed here and left out of the parity comparisons of the
+delivery verification, and a default full run that fails only on a listed
+script does not break the three consecutive passing runs the wall-time
+criterion asks for. Any other mismatch, and any other FAIL, fails that
+verification.
+
+A listing changes nothing in `/ci` itself: a listed script still runs in
+every run, and its failure still fails that run.
+
+| Script | Symptom |
+|---|---|
+| test-4 (`test-4-resume-dialog.sh`) | Seen once in five serial runs. The driver's `resume` meets agent-director's "still stopping" refusal within its stopping window, while the first life's worker is still exiting, and the script fails with `phase2 spawnForPersona returned failed`. A re-run passed |
 
 ### Script names, prerequisites and canonical order
 
@@ -3076,9 +3235,19 @@ the results file are written with every secret value replaced by
 `<redacted>`.
 
 A refused run writes no verdict: it records its refusal in its status file
-instead, and the reader reports it as `NOT RUN: <reason>`. The reader alone
-turns a verdict into `/ci`'s report and exit code; the `/ci` skill
-(`.claude/skills/ci/SKILL.md`) documents them.
+instead, and the reader reports it as `NOT RUN: <reason>`. Besides the
+validation refusals above and admission's refusals (see `docker/README.md`),
+these three come from the run's own steps, each ending in the error on one
+line (the skill's refusal table lists every refusal, the base-image, packing
+and read-back ones included, with what to do):
+
+- `NOT RUN: docker does not answer: <error>`, before anything is built;
+- `NOT RUN: the admission lock <path> could not be taken: <error>`, for a
+  failure other than the lock being busy;
+- `NOT RUN: the run's reservation could not be written: <error>`.
+
+The reader alone turns a verdict into `/ci`'s report and exit code; the `/ci`
+skill (`.claude/skills/ci/SKILL.md`) documents them.
 
 #### The pass condition and the four shapes
 
@@ -3101,8 +3270,11 @@ order, separated by single spaces.
 The double guard: only a full run without `--inject` can write exactly
 `PASS`. The runner treats any other `PASS`, or any input that does not add up
 (a passing run with a failure line, a failing run with none, a top line not
-beginning `FAIL:`), as an internal error, never a verdict. The reader in turn
-rejects `PASS` from a selective or injected invocation.
+beginning `FAIL:`), as an internal error, never a `PASS`: the verdict is then
+the first run-level stop's line when one was recorded, else
+`FAIL: ci-run: internal error: <error>` (see Run-level stops), in the run's
+selective or injected shape. The reader in turn rejects `PASS` from a
+selective or injected invocation.
 
 A full run without `--inject` writes exactly `PASS` or a line beginning
 `FAIL: `. When that line is a failing script's, it is still the script's first
@@ -3182,7 +3354,15 @@ only), `schedule-coverage`, `isolation-mounts`, `isolation-config`,
 - `isolation-mounts`, `isolation-config` and `image-drift` fail for a started
   shard with no inspection data, with the detail
   `shard-<k> could not be inspected`.
-- A `secret-scan` line names the file(s) only, never the value.
+- A `secret-scan` line names the file(s) only, never the value. It takes one
+  of three forms: `FAIL: integrity: secret-scan: <file(s)>`, naming every
+  file that holds a secret value;
+  `FAIL: integrity: secret-scan: <path(s)> not readable`, naming every file
+  or directory the scan could not read, so nothing unread passes as clean;
+  and
+  `FAIL: integrity: secret-scan: the integrity checks could not run: <error>`,
+  when the checks themselves failed. The first two can both appear, in that
+  order; the third stands alone.
 - Missing evidence from a shard that ended abnormally, or whose test-1 failed
   or did not finish, is no integrity failure; that shard's own line stands.
 - `schedule-coverage` is skipped when the run stopped, or its build failed,
@@ -3201,15 +3381,24 @@ only), `schedule-coverage`, `isolation-mounts`, `isolation-config`,
   x is the pod working set at the sample that reached the stop line, and y
   is that stop line (the ceiling less 0.5 GiB), each to one decimal place.
   The ceiling source reads `85% of the <L> GiB pod limit` or
-  `/ci-live's 40 GiB line, /ci-live run <PID> active`; the per-shard detail
-  gives each running shard's memory (`shard-1 1.1 GiB, shard-2 0.8 GiB`) or
-  reads `no shards running`.
+  `/ci-live's 40 GiB line, /ci-live run <PID> active`. When no active
+  `/ci-live` run has a PID, the name of what showed the run, normally its
+  `cscb-live=1` container, stands in for the PID. The per-shard detail gives
+  each running shard's memory in shard order
+  (`shard-1 1.1 GiB, shard-2 unreadable`) or reads `no shards running`.
 
 The first stop decides the run-level line; later ones change nothing. A stop
 before the end-of-run sequence gives every shard that had not ended, started
 or not, the cause `stopped by interrupt`, `stopped by memory watchdog` or
 `stopped by run deadline`. A stop during that sequence changes no shard's
 cause; its line still becomes the verdict.
+
+An error of the runner's own after the run started, in its steps or while it
+composes the end files, is no stop but takes the same place:
+`FAIL: ci-run: internal error: <error>`, the error on one line. The runner
+ends the shards, runs the end of run and keeps the run directory and
+`runner.log`; report it as a runner bug. A recorded run-level stop wins over
+it, whenever it came.
 
 #### Image build lines
 
@@ -3225,7 +3414,7 @@ Every failure is listed, with its shard, in `summary.txt` and in
 
 | Tier | Failures | Order within the tier |
 |---|---|---|
-| 1 | the first run-level stop | one at most |
+| 1 | the first run-level stop, else an internal error | one at most |
 | 2 | an image build failure | one at most |
 | 3 | integrity failures, each with its shard where the check names one | SR-13.2's check order (listed above) |
 | 4 | out-of-memory lines, both kill forms and `out-of-memory status unreadable` | by shard number |

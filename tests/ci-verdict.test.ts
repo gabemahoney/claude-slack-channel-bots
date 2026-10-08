@@ -2291,3 +2291,413 @@ describe('retention (b.uqm SR-16.3, the reader half of PRD AC 74)', () => {
 // ===========================================================================
 // E13 (t1.t6s.vd): the audit of the /ci skill (b.uqm SR-18.3); E13 adds its cases here
 // ===========================================================================
+//
+// The audit of `.claude/skills/ci/SKILL.md` (b.uqm SR-18.2, SR-18.3; b.t6s E13
+// T7.S1). `e13SkillProblems(text)` returns what is wrong with the skill's
+// text: the committed skill gives none, and each change planted into its real
+// text is reported by name. Every exit code, limit, bound and fixed text it
+// checks is the reader's or the runner's export, never typed. Only SR-17.1's
+// argument forms are typed, from the SRD: `READER_USAGE_TEXT` writes
+// `[/ci arguments]` where SR-17.1 writes `[<the /ci arguments>]`, and the
+// skill is held to SR-17.1.
+//
+// A command is a line of a fenced shell block. "Finishing a run by hand" runs
+// its commands as inline code, so there each inline code span holding
+// whitespace is checked for `sleep`, `timeout` and `verdict.txt` too. The
+// skill names those three in its other prose and headings on purpose, so
+// nothing else there counts as a command. The skill's base tag and
+// release-candidate names are tests/ci-live-docker.test.ts's checks, and
+// `BEES_MCP_URL` and `host.docker.internal` tests/bees-mcp-removed.test.ts's;
+// the 40-hex commit is checked here. Names in this region start with `e13` or
+// `E13`.
+
+import { findSection, flat, splitFences } from './test-helpers/markdown.ts'
+
+/** The skill, from the repository root. */
+const E13_SKILL_PATH = join('.claude', 'skills', 'ci', 'SKILL.md')
+
+/** The committed skill's text, read when a case runs. */
+function e13Skill(): string {
+  return readFileSync(join(REPO_ROOT, E13_SKILL_PATH), 'utf-8')
+}
+
+/** Milliseconds in a second: the skill gives the reader's bounds in seconds. */
+const E13_MS_PER_SECOND = 1_000
+
+/** A bound in milliseconds, in the seconds the skill writes. */
+function e13Seconds(ms: number): number {
+  return ms / E13_MS_PER_SECOND
+}
+
+/** The `/ci` arguments' placeholder, as SR-17.1 and the skill's procedure write it. */
+const E13_CI_ARGUMENTS = '<the /ci arguments>'
+
+/** Each verb's arguments as SR-17.1 gives them (test data from the SRD, not `READER_USAGE_TEXT`). */
+const E13_SR_17_1_ARGUMENTS: Readonly<Record<reader.ReaderVerb, string>> = {
+  report: `<RUN_ID> <PID> <grace> [${E13_CI_ARGUMENTS}]`,
+  wait: '<RUN_ID> <PID>',
+  stop: '<RUN_ID> <PID>',
+}
+
+/** A verb's command line as SR-17.1 gives it. */
+function e13VerbLine(verb: reader.ReaderVerb): string {
+  return `${reader.READER_COMMAND} ${verb} ${E13_SR_17_1_ARGUMENTS[verb]}`
+}
+
+/** A verb as the procedure runs it: SR-17.1's line, with the `/ci` arguments given rather than optional. */
+function e13VerbCall(verb: reader.ReaderVerb): string {
+  return e13VerbLine(verb).replace(`[${E13_CI_ARGUMENTS}]`, E13_CI_ARGUMENTS)
+}
+
+/** The hand-finishing heading's title, as both `verdict reader failed:` lines name it. */
+const E13_HAND_TITLE = /"([^"]+)" says$/.exec(WAIT_READER_FAILED_TEXT)?.[1] ?? ''
+
+/** The launch's runner command up to its redirections: detached by `setsid`, the RUN_ID first, the `/ci` arguments after (b.uqm SR-18.2). */
+const E13_LAUNCH = `setsid bun ${RUNNER_PATH_SUFFIX} "\${RUN_ID}" ${E13_CI_ARGUMENTS}`
+
+/** A PID and minutes no skill text holds, put back as `<pid>` and `<m>` in the stop line. */
+const E13_STOP_PID = 987_654_321
+const E13_STOP_MINUTES = 123_456
+
+/** The info words of a fenced block whose lines are commands; an untagged block counts. */
+const E13_SHELL_INFOS = ['sh', 'bash', 'shell', '']
+
+/** `codes` in ascending order, as the skill lists them: `0, 10, 11, 12 and 13`. */
+function e13List(codes: readonly number[], last: 'and' | 'or'): string {
+  const sorted = [...codes].sort((a, b) => a - b).map(String)
+  return `${sorted.slice(0, -1).join(', ')} ${last} ${sorted.at(-1)}`
+}
+
+/** The stop table's rows as the reader's stop line and exit codes give them, `<pid>` and `<m>` in place: `<what it did>`, exit and `<grace>`. */
+function e13StopRows(): { what: string; exit: number; grace: string }[] {
+  const outcomes: reader.StopOutcome[] = [
+    { kind: 'not-alive', pid: E13_STOP_PID },
+    { kind: 'term', pid: E13_STOP_PID, minutes: E13_STOP_MINUTES },
+    { kind: 'kill', pid: E13_STOP_PID, minutes: E13_STOP_MINUTES },
+  ]
+  return outcomes.map((outcome) => {
+    const grace = reader.graceText(reader.stopGrace(outcome))
+    const line = reader.stopLine(outcome)
+    return {
+      what: line.slice(line.indexOf(' ') + 1, line.lastIndexOf(`; grace ${grace}`)).replaceAll(String(E13_STOP_PID), '<pid>'),
+      exit: reader.stopExitCode(outcome),
+      grace: grace.replace(String(E13_STOP_MINUTES), '<m>'),
+    }
+  })
+}
+
+/** Every command line of `text`'s fenced shell blocks, trimmed; blank and comment lines left out. */
+function e13Commands(text: string): string[] {
+  return splitFences(text)
+    .blocks.filter((b) => E13_SHELL_INFOS.includes(b.info))
+    .flatMap((b) => b.body.split('\n').map((l) => l.trim()))
+    .filter((l) => l !== '' && !l.startsWith('#'))
+}
+
+/** The inline code spans of `section`'s prose that hold whitespace, so may be commands; one span may cross a line wrap. */
+function e13Spans(section: string): string[] {
+  return [...flat(splitFences(section).prose).matchAll(/`([^`]+)`/g)].map((m) => (m[1] as string).trim()).filter((s) => /\s/.test(s))
+}
+
+/** Whether `line` runs `command`: any shell word equal to it, so after a keyword (`do`, `then`), `{` or `!` as well as at a command's start. */
+function e13Runs(line: string, command: string): boolean {
+  return new RegExp(`(?:^|[\\s;&|(\`{!])${command}(?=[\\s;)&|]|$)`).test(line)
+}
+
+/** The cells of every body row of `text`'s Markdown tables (the rows after a divider row). */
+function e13TableRows(text: string): string[][] {
+  const rows: string[][] = []
+  let inBody = false
+  for (const line of text.split('\n').map((l) => l.trim())) {
+    if (!line.startsWith('|')) inBody = false
+    else if (/^\|[\s:|-]+\|$/.test(line)) inBody = true
+    else if (inBody) rows.push(line.slice(1, -1).split('|').map((c) => c.trim()))
+  }
+  return rows
+}
+
+/** Which of the launch line's standard input, output and error are not on `/dev/null`, so stay on the Bash call's streams. */
+function e13StreamsLeft(line: string): string[] {
+  const out = /\s1?>\s*\/dev\/null(?=\s|$)/.exec(line)
+  const merged = /\s2>&1(?=\s|$)/.exec(line)
+  const left: string[] = []
+  if (!/\s0?<\s*\/dev\/null(?=\s|$)/.test(line)) left.push('standard input')
+  if (out === null) left.push('standard output')
+  if (!/\s2>\s*\/dev\/null(?=\s|$)/.test(line) && !(out !== null && merged !== null && merged.index > out.index)) left.push('standard error')
+  return left
+}
+
+/** What is wrong with the launch step's commands (b.uqm SR-18.2): detached, its streams on none of the call's, job control off, and the RUN_ID, PID and run directory printed. */
+function e13LaunchProblems(lines: readonly string[]): string[] {
+  const at = lines.findIndex((l) => l.includes(`bun ${RUNNER_PATH_SUFFIX} `))
+  if (at < 0) return [`the launch does not run bun ${RUNNER_PATH_SUFFIX}`]
+  const line = lines[at] as string
+  const problems: string[] = []
+  if (!line.startsWith(`${E13_LAUNCH} `)) problems.push(`the launch does not start ${E13_LAUNCH}: ${line}`)
+  if (!/\s&$/.test(line)) problems.push(`the launch does not run the runner in the background: ${line}`)
+  const left = e13StreamsLeft(line)
+  if (left.length > 0) problems.push(`the launch leaves ${left.join(' and ')} on the Bash call's streams: ${line}`)
+  if (!lines.slice(0, at).includes('set +m')) problems.push('the launch does not turn job control off (set +m) before it starts the runner')
+  if (lines[at + 1] !== 'RUNNER_PID=$!') problems.push('the launch does not take the runner PID from $! just after it starts the runner')
+  const echoes = lines.filter((l) => l.startsWith('echo '))
+  const printed: [string, string][] = [
+    ['the RUN_ID', '${RUN_ID}'],
+    [`the runner PID, or ${reader.PID_ARGUMENT_NONE} when there is none`, `\${RUNNER_PID:-${reader.PID_ARGUMENT_NONE}}`],
+    ['the run directory', '${RUN_DIR}'],
+  ]
+  for (const [what, ref] of printed) if (!echoes.some((e) => e.includes(ref))) problems.push(`the launch does not print ${what}: ${ref}`)
+  if (!lines.some((l) => l.startsWith('RUN_DIR=') && l.includes(`/${RUN_DIR_PREFIX}\${RUN_ID}"`))) problems.push(`the launch's run directory is not ${RUN_DIR_PREFIX}<RUN_ID>`)
+  return problems
+}
+
+/** What is wrong with the skill's text (b.uqm SR-18.2, SR-18.3); none for the committed skill. */
+function e13SkillProblems(text: string): string[] {
+  const problems: string[] = []
+  const blocks = splitFences(text).blocks
+  const commands = e13Commands(text)
+  const stopRows = e13StopRows()
+
+  // The three verbs as SR-17.1 gives them, and each wait and stop exit beside its state.
+  const verbsHeading = "## The verdict reader's verbs"
+  const verbs = findSection(text, verbsHeading)
+  if (verbs === undefined) problems.push(`has no "${verbsHeading}" heading`)
+  else {
+    const lines = splitFences(verbs)
+      .blocks.filter((b) => b.info === 'text')
+      .flatMap((b) => b.body.split('\n').map((l) => l.trim()))
+    for (const verb of reader.READER_VERBS) if (!lines.includes(e13VerbLine(verb))) problems.push(`the verbs block does not name the ${verb} verb as SR-17.1 gives it: ${e13VerbLine(verb)}`)
+    const rows = e13TableRows(verbs)
+    for (const state of reader.WAIT_STATES) {
+      const row = rows.find((r) => r[0] === `\`${state}\``)
+      const exit = String(reader.waitExitCode(state))
+      if (row === undefined) problems.push(`the wait table has no ${state} row`)
+      else if (row[1] !== exit) problems.push(`the wait table gives ${state} exit ${row[1]}, not ${exit}`)
+    }
+    for (const want of stopRows) {
+      const row = rows.find((r) => r[2] === `\`${want.grace}\``)
+      if (row === undefined) problems.push(`the stop table has no ${want.grace} row`)
+      else {
+        if (row[1] !== String(want.exit)) problems.push(`the stop table gives ${want.grace} exit ${row[1]}, not ${want.exit}`)
+        if (row[0] !== `\`${want.what}\``) problems.push(`the stop table's ${want.grace} row says ${row[0]}, not the stop line's \`${want.what}\``)
+      }
+    }
+  }
+
+  // What the skill does after each wait exit.
+  const poll = findSection(text, /^### .*\bPoll$/)
+  if (poll === undefined) problems.push('has no Poll step')
+  else {
+    const rows = e13TableRows(poll)
+    const exits = [String(WAIT_EXIT_RUNNING), e13List([WAIT_EXIT_VERDICT, WAIT_EXIT_REFUSED, WAIT_EXIT_GONE], 'or'), String(WAIT_EXIT_GRACE)]
+    const found = rows.slice(0, exits.length).map((r) => r[0])
+    if (JSON.stringify(found) !== JSON.stringify(exits)) problems.push(`the poll table's exits are ${JSON.stringify(found)}, not ${JSON.stringify(exits)}`)
+    else if (!(rows[1]?.[1] ?? '').includes(`\`${GRACE_NONE}\``)) problems.push(`the poll table's ${exits[1]} row does not give the grace ${GRACE_NONE}`)
+  }
+
+  // The limits, the known and unknown exits and the bounds, each from the reader's constants.
+  const waitCodes = reader.WAIT_STATES.map(reader.waitExitCode)
+  const reportCodes = [reader.REPORT_EXIT_FULL_PASS, reader.REPORT_EXIT_FAIL, reader.REPORT_EXIT_NOT_RUN, reader.REPORT_EXIT_SELECTIVE_PASS, reader.REPORT_EXIT_INJECTED]
+  const [none, term, kill] = stopRows as [(typeof stopRows)[number], (typeof stopRows)[number], (typeof stopRows)[number]]
+  const phrases: [string, string][] = [
+    ['the limit of unknown wait exits', `After ${UNKNOWN_WAIT_EXIT_LIMIT} unknown exits in a row`],
+    ['the limit of stop calls', `at most ${STOP_CALL_LIMIT} stop calls in all`],
+    ['the unknown wait exits', `a wait exit other than ${e13List(waitCodes, 'and')}`],
+    ['the unknown stop exits', `a stop exit other than ${e13List(stopRows.map((r) => r.exit), 'and')}`],
+    ['the grace after each stop exit', `\`${none.grace}\` after exit ${none.exit}, \`${term.grace}\` after ${term.exit}, \`${kill.grace}\` after ${kill.exit}`],
+    ['the report exits', `exits with its code: ${e13List(reportCodes, 'or')}`],
+    ['the usage exit as unknown', `counts a wait or stop exit of ${runner.USAGE_EXIT_STATUS} as unknown`],
+    ["the wait's bound and checks", `waits at most ${e13Seconds(WAIT_BOUND_MS)} s for the run to move on, checking every ${e13Seconds(WAIT_CHECK_INTERVAL_MS)} s`],
+    ['the deadline while no status file can be read', `the RUN_ID's time plus ${NO_STATUS_DEADLINE_MINUTES} min`],
+    ['the grace', `The grace ends ${GRACE_MINUTES} min after the deadline`],
+    ["the stop's SIGKILL", `SIGKILL when the runner is still alive ${e13Seconds(STOP_KILL_AFTER_MS)} s later`],
+    ["a wait call's time", `a wait returns within ${e13Seconds(WAIT_BOUND_MS)} s plus its start-up`],
+    ["a stop call's time", `a stop returns within ${e13Seconds(STOP_KILL_AFTER_MS)} s plus its start-up`],
+  ]
+  const all = flat(text)
+  for (const [what, phrase] of phrases) if (!all.includes(phrase)) problems.push(`does not state ${what}: ${phrase}`)
+
+  // Both `verdict reader failed:` lines, each a block of its own.
+  const failed: [string, string][] = [
+    ['wait', WAIT_READER_FAILED_TEXT],
+    ['stop', STOP_READER_FAILED_TEXT],
+  ]
+  for (const [verb, line] of failed) if (!blocks.some((b) => b.info === 'text' && b.body.trim() === line)) problems.push(`does not hold the ${verb} verb's verdict reader failed: line as a block of its own: ${line}`)
+
+  // Finishing a run by hand.
+  const handHeading = `## ${E13_HAND_TITLE}`
+  const hand = findSection(text, handHeading)
+  if (hand === undefined) problems.push(`has no "${handHeading}" heading`)
+  else {
+    const handText = flat(hand)
+    for (const verb of reader.READER_VERBS) if (!handText.includes(`\`${e13VerbCall(verb)}\``)) problems.push(`"${E13_HAND_TITLE}" does not run the ${verb} verb as SR-17.1 gives it: ${e13VerbCall(verb)}`)
+    const until = `until it exits ${e13List([WAIT_EXIT_VERDICT, WAIT_EXIT_REFUSED, WAIT_EXIT_GONE, WAIT_EXIT_GRACE], 'or')}`
+    if (!handText.includes(until)) problems.push(`"${E13_HAND_TITLE}" does not wait ${until}`)
+  }
+
+  // The launch.
+  const launch = findSection(text, /^### .*\bLaunch$/)
+  if (launch === undefined) problems.push('has no Launch step')
+  else problems.push(...e13LaunchProblems(e13Commands(launch)))
+
+  // The commands, the hand-finishing spans among them: no sleep or timeout, no verdict.txt, and the reader run only as SR-17.1 gives it.
+  for (const line of [...commands, ...(hand === undefined ? [] : e13Spans(hand))]) {
+    for (const command of ['sleep', 'timeout']) if (e13Runs(line, command)) problems.push(`a command runs ${command}: ${line}`)
+    if (line.includes(runner.VERDICT_FILE_NAME)) problems.push(`a command names ${runner.VERDICT_FILE_NAME}, which only the reader reads: ${line}`)
+  }
+  for (const line of commands) {
+    const at = line.indexOf(`${reader.READER_COMMAND} `)
+    const call = at < 0 ? undefined : (line.slice(at).split(';')[0] as string).trim()
+    if (call !== undefined && !reader.READER_VERBS.some((verb) => call === e13VerbCall(verb))) problems.push(`a command runs the reader other than as SR-17.1 gives it: ${call}`)
+  }
+  for (const verb of reader.READER_VERBS) if (!commands.some((l) => l.includes(e13VerbCall(verb)))) problems.push(`no command runs the ${verb} verb`)
+
+  // No 40-hex commit.
+  for (const hex of text.match(/(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])/g) ?? []) problems.push(`holds a 40-hex commit: ${hex}`)
+
+  return problems
+}
+
+/** `text` with `from` replaced by `to` once, checked to change it (a planted row that plants nothing would pass vacuously). */
+function e13Planted(text: string, from: string | RegExp, to: string): string {
+  const out = text.replace(from, () => to)
+  expect(out).not.toBe(text)
+  return out
+}
+
+/** A 40-hex commit for the planted row. */
+const E13_COMMIT = '0123456789abcdef'.repeat(3).slice(0, 40)
+
+describe('E13: the /ci skill audit (b.uqm SR-18.2, SR-18.3; b.t6s E13 T7.S1)', () => {
+  test('the committed skill has no problem: its verbs, exit tables, limits, bounds, failure lines, hand-finishing heading, launch and commands match the reader', () => {
+    expect(E13_HAND_TITLE).not.toBe('')
+    expect(STOP_READER_FAILED_TEXT.endsWith(`"${E13_HAND_TITLE}" says`)).toBe(true)
+    expect(e13SkillProblems(e13Skill())).toEqual([])
+  })
+
+  const waitExits = [String(WAIT_EXIT_RUNNING), e13List([WAIT_EXIT_VERDICT, WAIT_EXIT_REFUSED, WAIT_EXIT_GONE], 'or')]
+  const kill = (): { what: string; grace: string } => e13StopRows()[2] as { what: string; grace: string }
+  const killAfter = ` after ${e13Seconds(STOP_KILL_AFTER_MS)} s`
+  const waitCall = `${e13VerbCall('wait')}; echo`
+  const reportCall = `${e13VerbCall('report')}; echo`
+  const verdictRead = `head -n 1 "/tmp/${RUN_DIR_PREFIX}<RUN_ID>/${runner.VERDICT_FILE_NAME}"`
+  const handExits = [WAIT_EXIT_VERDICT, WAIT_EXIT_REFUSED, WAIT_EXIT_GONE, WAIT_EXIT_GRACE]
+
+  // Each row plants one change in the committed skill; the audit must name it.
+  test.each<[string, (text: string) => string, () => string | string[]]>([
+    ['dropped stop verb', (t) => e13Planted(t, `${e13VerbLine('stop')}\n`, ''), () => `the verbs block does not name the stop verb as SR-17.1 gives it: ${e13VerbLine('stop')}`],
+    [
+      "report verb in READER_USAGE_TEXT's form",
+      (t) => e13Planted(t, `[${E13_CI_ARGUMENTS}]`, '[/ci arguments]'),
+      () => `the verbs block does not name the report verb as SR-17.1 gives it: ${e13VerbLine('report')}`,
+    ],
+    [
+      'changed wait exit',
+      (t) => e13Planted(t, `| \`gone\` | ${WAIT_EXIT_GONE} |`, `| \`gone\` | ${WAIT_EXIT_GONE + 2} |`),
+      () => `the wait table gives gone exit ${WAIT_EXIT_GONE + 2}, not ${WAIT_EXIT_GONE}`,
+    ],
+    [
+      'changed stop exit',
+      (t) => e13Planted(t, `| ${STOP_EXIT_SENT_SIGTERM} | \`${reader.GRACE_TERM_PREFIX}<m>\` |`, `| ${STOP_EXIT_SENT_SIGTERM + 2} | \`${reader.GRACE_TERM_PREFIX}<m>\` |`),
+      () => `the stop table gives ${reader.GRACE_TERM_PREFIX}<m> exit ${STOP_EXIT_SENT_SIGTERM + 2}, not ${STOP_EXIT_SENT_SIGTERM}`,
+    ],
+    [
+      'stop row that differs from the stop line',
+      (t) => e13Planted(t, `${killAfter}\` |`, '` |'),
+      () => `the stop table's ${kill().grace} row says \`${kill().what.replace(killAfter, '')}\`, not the stop line's \`${kill().what}\``,
+    ],
+    [
+      'changed poll exit',
+      (t) => e13Planted(t, new RegExp(`^\\| ${WAIT_EXIT_GRACE} \\|`, 'm'), `| ${WAIT_EXIT_GRACE + 1} |`),
+      () => `the poll table's exits are ${JSON.stringify([...waitExits, String(WAIT_EXIT_GRACE + 1)])}, not ${JSON.stringify([...waitExits, String(WAIT_EXIT_GRACE)])}`,
+    ],
+    [
+      'raised unknown-exit limit',
+      (t) => e13Planted(t, `After ${UNKNOWN_WAIT_EXIT_LIMIT} unknown exits in a row`, `After ${UNKNOWN_WAIT_EXIT_LIMIT + 1} unknown exits in a row`),
+      () => `does not state the limit of unknown wait exits: After ${UNKNOWN_WAIT_EXIT_LIMIT} unknown exits in a row`,
+    ],
+    [
+      'raised stop-call limit',
+      (t) => e13Planted(t, `at most ${STOP_CALL_LIMIT} stop calls in all`, `at most ${STOP_CALL_LIMIT + 2} stop calls in all`),
+      () => `does not state the limit of stop calls: at most ${STOP_CALL_LIMIT} stop calls in all`,
+    ],
+    [
+      'changed usage exit',
+      (t) => e13Planted(t, `exit of ${runner.USAGE_EXIT_STATUS} as unknown`, `exit of ${runner.USAGE_EXIT_STATUS + 1} as unknown`),
+      () => `does not state the usage exit as unknown: counts a wait or stop exit of ${runner.USAGE_EXIT_STATUS} as unknown`,
+    ],
+    [
+      'changed wait bound',
+      (t) => e13Planted(t, `waits at most ${e13Seconds(WAIT_BOUND_MS)} s`, `waits at most ${e13Seconds(WAIT_BOUND_MS) + 30} s`),
+      () =>
+        `does not state the wait's bound and checks: waits at most ${e13Seconds(WAIT_BOUND_MS)} s for the run to move on, checking every ${e13Seconds(WAIT_CHECK_INTERVAL_MS)} s`,
+    ],
+    [
+      'changed wait failure line',
+      (t) => e13Planted(t, WAIT_READER_FAILED_TEXT, WAIT_READER_FAILED_TEXT.replace('may still be running', 'is still running')),
+      () => `does not hold the wait verb's verdict reader failed: line as a block of its own: ${WAIT_READER_FAILED_TEXT}`,
+    ],
+    [
+      'changed stop failure line',
+      (t) => e13Planted(t, STOP_READER_FAILED_TEXT, STOP_READER_FAILED_TEXT.replace(`stop exited <code>`, 'stop failed <code>')),
+      () => `does not hold the stop verb's verdict reader failed: line as a block of its own: ${STOP_READER_FAILED_TEXT}`,
+    ],
+    ['renamed hand-finishing heading', (t) => e13Planted(t, `## ${E13_HAND_TITLE}\n`, '## Finishing a run manually\n'), () => `has no "## ${E13_HAND_TITLE}" heading`],
+    [
+      'hand finishing that stops waiting before the grace',
+      (t) => e13Planted(t, `until it exits ${e13List(handExits, 'or')}`, `until it exits ${e13List(handExits.slice(0, -1), 'or')}`),
+      () => `"${E13_HAND_TITLE}" does not wait until it exits ${e13List(handExits, 'or')}`,
+    ],
+    ['sleep command', (t) => e13Planted(t, waitCall, `sleep 30\n${waitCall}`), () => 'a command runs sleep: sleep 30'],
+    ['timeout command', (t) => e13Planted(t, waitCall, `timeout 120 ${waitCall}`), () => `a command runs timeout: timeout 120 ${waitCall} "wait exit: $?"`],
+    [
+      'sleep after a shell keyword',
+      (t) => e13Planted(t, `${waitCall} "wait exit: $?"`, `until ${e13VerbCall('wait')}; do sleep 5; done`),
+      () => `a command runs sleep: until ${e13VerbCall('wait')}; do sleep 5; done`,
+    ],
+    [
+      'sleep in a hand-finishing span',
+      (t) => e13Planted(t, 'Run it again after an', 'Run `sleep 60`, then run it again after an'),
+      () => 'a command runs sleep: sleep 60',
+    ],
+    [
+      'verdict.txt read',
+      (t) => e13Planted(t, reportCall, `${verdictRead}\n${reportCall}`),
+      () => `a command names ${runner.VERDICT_FILE_NAME}, which only the reader reads: ${verdictRead}`,
+    ],
+    [
+      "launch on the call's streams",
+      (t) => e13Planted(t, ' >/dev/null 2>&1 &\n', ' &\n'),
+      () => `the launch leaves standard output and standard error on the Bash call's streams: ${E13_LAUNCH} </dev/null &`,
+    ],
+    [
+      'launch in the calling session',
+      (t) => e13Planted(t, `setsid bun ${RUNNER_PATH_SUFFIX}`, `bun ${RUNNER_PATH_SUFFIX}`),
+      () => `the launch does not start ${E13_LAUNCH}: ${E13_LAUNCH.replace('setsid ', '')} </dev/null >/dev/null 2>&1 &`,
+    ],
+    [
+      'launch in the foreground',
+      (t) => e13Planted(t, ' 2>&1 &\n', ' 2>&1\n'),
+      () => `the launch does not run the runner in the background: ${E13_LAUNCH} </dev/null >/dev/null 2>&1`,
+    ],
+    ['launch with job control on', (t) => e13Planted(t, 'set +m\n', ''), () => 'the launch does not turn job control off (set +m) before it starts the runner'],
+    ['launch with no PID from $!', (t) => e13Planted(t, 'RUNNER_PID=$!\n', ''), () => 'the launch does not take the runner PID from $! just after it starts the runner'],
+    [
+      'poll wait with no PID',
+      (t) => e13Planted(t, waitCall, `${e13VerbCall('wait').replace(' <PID>', '')}; echo`),
+      () => [`a command runs the reader other than as SR-17.1 gives it: ${e13VerbCall('wait').replace(' <PID>', '')}`, 'no command runs the wait verb'],
+    ],
+    [
+      'poll table with no grace',
+      (t) => e13Planted(t, `The grace is \`${GRACE_NONE}\`; go to step 4`, 'Go to step 4'),
+      () => `the poll table's ${e13List([WAIT_EXIT_VERDICT, WAIT_EXIT_REFUSED, WAIT_EXIT_GONE], 'or')} row does not give the grace ${GRACE_NONE}`,
+    ],
+    [
+      'printed PID with no fallback',
+      (t) => e13Planted(t, `\${RUNNER_PID:-${reader.PID_ARGUMENT_NONE}}`, '${RUNNER_PID}'),
+      () => `the launch does not print the runner PID, or ${reader.PID_ARGUMENT_NONE} when there is none: \${RUNNER_PID:-${reader.PID_ARGUMENT_NONE}}`,
+    ],
+    ['commit', (t) => `${t}\nBuilt from commit ${E13_COMMIT}.\n`, () => `holds a 40-hex commit: ${E13_COMMIT}`],
+  ])('a planted %s is reported', (_label, plant, problem) => {
+    expect(e13SkillProblems(plant(e13Skill()))).toEqual([problem()].flat())
+  })
+})

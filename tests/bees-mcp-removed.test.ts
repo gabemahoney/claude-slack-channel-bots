@@ -5,8 +5,11 @@
  * shipping artifacts. Each test is a simple grep that would fail before the
  * fix and pass after it.
  *
- *   1. .claude/skills/ci/SKILL.md must NOT contain BEES_MCP_URL or
- *      host.docker.internal (dropped from docker run invocation).
+ *   1. The /ci code must NOT contain BEES_MCP_URL or host.docker.internal
+ *      (dropped from the docker run invocation). b.w7w guarded the skill;
+ *      b.uqm SR-20.2 extends both guards to the three scripts behind it, so
+ *      they cover .claude/skills/ci/SKILL.md, scripts/ci-run.ts,
+ *      scripts/ci-base-build.sh and scripts/ci-verdict.ts.
  *   2. docker/Dockerfile.test must NOT contain `bees-md[serve]`
  *      (serve extras dropped along with MCP).
  *
@@ -30,18 +33,23 @@ function read(relPath: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// b.w7w — no BEES_MCP_URL / host.docker.internal in /ci SKILL.md
+// b.w7w, b.uqm SR-20.2 — no BEES_MCP_URL / host.docker.internal in /ci code
 // ---------------------------------------------------------------------------
 
-describe('b.w7w: ci SKILL.md has no bees MCP env vars or add-host', () => {
-  test('BEES_MCP_URL is absent from .claude/skills/ci/SKILL.md', () => {
-    const ciSkill = read('.claude/skills/ci/SKILL.md')
-    expect(ciSkill).not.toContain('BEES_MCP_URL')
-  })
+const CI_FILES = [
+  '.claude/skills/ci/SKILL.md',
+  'scripts/ci-run.ts',
+  'scripts/ci-base-build.sh',
+  'scripts/ci-verdict.ts',
+]
 
-  test('host.docker.internal is absent from .claude/skills/ci/SKILL.md', () => {
-    const ciSkill = read('.claude/skills/ci/SKILL.md')
-    expect(ciSkill).not.toContain('host.docker.internal')
+const GUARDS = CI_FILES.flatMap((file) =>
+  ['BEES_MCP_URL', 'host.docker.internal'].map((needle) => [needle, file]),
+)
+
+describe('b.w7w, b.uqm SR-20.2: /ci code has no bees MCP env vars or add-host', () => {
+  test.each(GUARDS)('%s is absent from %s', (needle, file) => {
+    expect(read(file)).not.toContain(needle)
   })
 })
 
