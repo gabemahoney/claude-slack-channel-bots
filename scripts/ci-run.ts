@@ -9086,6 +9086,12 @@ export interface ShardStartResult {
   readonly containerName: string
   /** The started container's full ID; null when it did not start. */
   readonly containerId: string | null
+  /** Its inspection data (b.uqm SR-10.5), for `ShardEvidence.inspection`: null when it never started, or when both reads failed (13/T2). */
+  readonly inspection: InspectionData | null
+  /** For `ShardEvidence.inspectionError`: null with data; `container never started` when it never started; else the last failed read's error on one line (13/T2). */
+  readonly inspectionError: string | null
+  /** For `ShardEvidence.imageId`: the image ID its inspection data holds; null without data. `start.imageId` is the ID it was started from (13/T2). */
+  readonly imageId: string | null
 }
 
 /**
@@ -9116,6 +9122,7 @@ async function failedRunLeftContainer(docker: DockerContext, name: string, owner
  * the name is in use sets `nameInUse` and creates no container; any other
  * failed `docker run` is followed by one inspect by name, to record whether
  * it left a container of this run created.
+ * A started shard's inspection data is captured before it returns (13/T2).
  */
 export async function startShard(deps: ShardStartDeps, input: ShardStartInput): Promise<ShardStartResult> {
   const shard = input.assignment.shard
@@ -9127,6 +9134,7 @@ export async function startShard(deps: ShardStartDeps, input: ShardStartInput): 
     containerCreated: created,
     containerName,
     containerId: null,
+    ...shardInspectionNeverStarted(),
   })
 
   const canary = input.canaries.draw()
@@ -9163,12 +9171,466 @@ export async function startShard(deps: ShardStartDeps, input: ShardStartInput): 
       containerCreated: true,
       containerName,
       containerId: outcome.containerId,
+      ...(await captureShardInspection(deps.clock, docker, outcome.containerId)),
     }
   }
   if (outcome.kind === 'refused') return failed(canary.value, plan.mounts, outcome.reason)
   if (outcome.exitCode === null) return failed(canary.value, plan.mounts, outcome.error)
   if (isNameInUseError(outcome.error, containerName)) return failed(canary.value, plan.mounts, outcome.error, false, true)
   return failed(canary.value, plan.mounts, outcome.error, await failedRunLeftContainer(docker, containerName, input.owner))
+}
+
+// --- 13/T2 (E9 T2): inspection capture and the 1 s re-read ---
+//
+// Each started shard's inspection data, read right after its start, inside
+// `startShard`, so no retirement can remove the container first (b.uqm
+// SR-10.5). The read is E1's `readContainerInspection`, whose format selects
+// only SR-10.5's fields: no path here asks Docker for, holds or stores a
+// container's environment. A failed read is read once more,
+// `INSPECTION_REREAD_DELAY_MS` later on the injected clock (never a real
+// sleep); when that fails too, the shard has no data and keeps the last error
+// on one line. A shard whose container never started, one created but not
+// started included, is never inspected and records `container never started`.
+
+/** How many inspection reads a started shard gets at most: one right after its start, and one re-read `INSPECTION_REREAD_DELAY_MS` later when that fails (b.uqm SR-10.5). */
+export const INSPECTION_READ_ATTEMPTS = 2
+
+/** A shard's inspection facts for its evidence (`ShardEvidence.inspection`, `inspectionError`, `imageId`), as `startShard` returns them. */
+export type ShardInspectionCapture = Pick<ShardStartResult, 'inspection' | 'inspectionError' | 'imageId'>
+
+/**
+ * Reads a shard container's selected inspection fields (b.uqm SR-10.5)
+ * through `readContainerInspection`, by its ID or name: the parsed data, or
+ * the failure on one line. Never throws, and never reads the environment.
+ */
+export async function readShardInspection(docker: DockerContext, container: string): Promise<DepRead<InspectionData>> {
+  try {
+    const answer = await readContainerInspection(docker, container)
+    if (answer.ok) return { ok: true, value: answer.value }
+    const error = dependencyErrorText(answer.error)
+    return { ok: false, error: error !== '' ? error : `the inspection read of ${shownArgument(container)} failed with no error text` }
+  } catch (err) {
+    return { ok: false, error: `the inspection read of ${shownArgument(container)} failed: ${dependencyErrorText(err)}` }
+  }
+}
+
+/** The inspection facts of a shard whose container never started (never created, created but not started, or refused): no data, no image ID, and `container never started` (b.uqm SR-10.5, SR-16.1). */
+export function shardInspectionNeverStarted(): ShardInspectionCapture {
+  return { inspection: null, inspectionError: CONTAINER_NEVER_STARTED_TEXT, imageId: null }
+}
+
+/**
+ * Captures a started shard's inspection data (b.uqm SR-10.5): reads at once;
+ * when that read fails, waits `INSPECTION_REREAD_DELAY_MS` on the injected
+ * clock and reads once more, `INSPECTION_READ_ATTEMPTS` reads in all. The
+ * data with `inspectionError` null and `imageId` from the data; or, when every
+ * read failed, null data, a null `imageId` and the last read's error on one
+ * line. A wait the clock cannot schedule ends the capture with the first
+ * error and why. Never throws.
+ */
+export async function captureShardInspection(clock: RunnerClock, docker: DockerContext, container: string): Promise<ShardInspectionCapture> {
+  let lastError = ''
+  for (let attempt = 1; attempt <= INSPECTION_READ_ATTEMPTS; attempt++) {
+    if (attempt > 1) {
+      try {
+        await clockDelay(clock, INSPECTION_REREAD_DELAY_MS)
+      } catch (err) {
+        return { inspection: null, inspectionError: `${lastError}; the re-read could not wait: ${dependencyErrorText(err)}`, imageId: null }
+      }
+    }
+    const read = await readShardInspection(docker, container)
+    if (read.ok) return { inspection: read.value, inspectionError: null, imageId: read.value.imageId }
+    lastError = read.error
+  }
+  return { inspection: null, inspectionError: lastError, imageId: null }
+}
+
+// --- 13/T3 (E9 T3): the final reading and shard retirement ---
+//
+// How a shard is retired, never when: E13 decides when (end markers, E4's
+// limit timer, E12's `kill:`, run-level stops, end-of-run step 1) and calls
+// one run-wide retirer (`createShardRetirer`) per shard (b.uqm SR-10.6,
+// SR-5.7 step 1). Every way a shard ends follows one order, each step after
+// the one before it:
+// 1. the final reading, taken at most once per shard: Docker's state form
+//    (`State.OOMKilled`, whether it runs, its status and exit code) through
+//    `inspectContainerState`, then E6's container figures (`oom_kill`, `anon`,
+//    `file`) from its own cgroup, found through its main PID
+//    (`readContainerFigures`). Each part is recorded on its own, or as
+//    `unreadable`; nothing is interpreted (E7 judges the reading);
+// 2. SIGKILL while that reading shows it running, or when whether it runs is
+//    unreadable and it did not exit on its own (a missed kill would leave a
+//    container holding its memory); never SIGTERM, since the in-container
+//    runner is PID 1 and ignores it. A container that exited on its own, or
+//    that the reading shows not running, gets no SIGKILL;
+// 3. its Docker logs saved whole as `docker.log` in its subdirectory;
+// 4. its removal, never forced.
+// A failed step is written to the runner log, and the next steps still run.
+// A failed removal is also a cleanup failure (b.uqm SR-9.3); a container
+// Docker no longer knows counts as absent, as in E5's sweep, for both the log
+// save and the removal. A shard with no created container (never created, or
+// refused because its name was in use) has no final reading and no
+// retirement: no docker operation is made. A shard whose start failed and
+// whose container Docker does not know at its state read was never created
+// either: it has no final reading, so its `container failed to start` line
+// stands, and its retirement is `no-container` after that one read. A
+// started shard whose container vanished keeps an all-`unreadable` reading. A limit
+// retirement re-checks the result file by E4's end-marker rule first, so a
+// shard holding its end marker is never retired as over its limit (AC 54).
+
+/** Docker's `State.Status` values of a container that has exited, whose `State.ExitCode` is its exit code; a `created` container never ran and has none (b.uqm SR-10.6, SR-12.1). */
+export const EXITED_CONTAINER_STATUSES = ['exited', 'dead'] as const
+
+/** What the final reading and retirement use: spawn, the runner's environment (passed unchanged under the child-environment rule, b.uqm SR-15.4), the worktree root as docker's working directory, the clock (the reading's moment), and the cgroup reads of E6's container figures. */
+export type ShardRetirementDeps = Pick<RunnerDeps, 'spawn' | 'env' | 'worktreeRoot' | 'clock' | 'readCgroupFile' | 'readProcCgroup'>
+
+/** The shard a final reading or retirement is for: its start result as `startShard` returns it. */
+export type RetiredShard = Pick<ShardStartResult, 'start' | 'containerCreated' | 'containerName' | 'containerId'>
+
+/** Why a shard is retired (b.uqm SR-10.6): its end marker, its wall-time limit, a `kill:` fault, a run-level stop (naming which), or its container exited on its own. */
+export type RetirementReason =
+  | {
+      readonly kind: 'end-marker'
+    }
+  | {
+      readonly kind: 'limit'
+    }
+  | {
+      readonly kind: 'kill'
+    }
+  | {
+      readonly kind: 'run-level-stop'
+      readonly by: StopKind
+    }
+  | {
+      readonly kind: 'exited'
+    }
+
+/** A shard's one final reading (b.uqm SR-10.6): E1's four parts, and the container's state at that moment. */
+export interface ShardFinalReading {
+  readonly shard: number
+  /** When it was taken, epoch milliseconds (`ShardTimingRecord.finalReadingAtMs`). */
+  readonly atMs: number
+  /** `State.OOMKilled`, `oom_kill`, `anon` and `file`, each read on its own or `unreadable`. */
+  readonly final: FinalReading
+  /** Docker's `State.Status`; `unreadable` when the state could not be read or Docker knows no such container. */
+  readonly status: Reading<string>
+  /** Whether it was running at its reading: false when Docker knows no such container; `unreadable` when the state could not be read. */
+  readonly running: Reading<boolean>
+  /** `State.ExitCode` when it had exited (`EXITED_CONTAINER_STATUSES`); null while running, when created but never started, or when the state could not be read. */
+  readonly exitCode: number | null
+  /** Each part that could not be read, once, with why; each was written to the runner log. */
+  readonly failedReadings: readonly FailedReading[]
+}
+
+/** The SIGKILL step: sent, not sent (the reading showed it not running, or whether it runs is unreadable and it exited on its own), or failed (logged; never a cleanup failure). */
+export type RetirementKill =
+  | {
+      readonly kind: 'sent'
+    }
+  | {
+      readonly kind: 'not-running'
+    }
+  | {
+      readonly kind: 'failed'
+      readonly error: string
+    }
+
+/** The `docker.log` step: saved at its path, not saved because Docker knows no such container (logged; no file), or failed reading the logs or writing the file (logged). */
+export type RetirementLogSave =
+  | {
+      readonly kind: 'saved'
+      readonly path: string
+    }
+  | {
+      readonly kind: 'absent'
+    }
+  | {
+      readonly kind: 'failed'
+      readonly error: string
+    }
+
+/** The removal step: removed, already gone (no failure), or failed with its cleanup-failure line (logged and listed). */
+export type RetirementRemoval =
+  | {
+      readonly kind: 'removed'
+    }
+  | {
+      readonly kind: 'absent'
+    }
+  | {
+      readonly kind: 'failed'
+      readonly line: string
+    }
+
+/** A shard's retirement (b.uqm SR-10.6): `no-container` for a shard with no created container (no docker operation), or whose start failed and whose container Docker does not know (its state read only); else its reading and each step's outcome. `reason` is the effective reason, settled before any SIGKILL. */
+export type ShardRetirement =
+  | {
+      readonly kind: 'no-container'
+      readonly shard: number
+      readonly requested: RetirementReason
+      readonly reason: RetirementReason
+    }
+  | {
+      readonly kind: 'retired'
+      readonly shard: number
+      readonly requested: RetirementReason
+      readonly reason: RetirementReason
+      readonly reading: ShardFinalReading
+      readonly kill: RetirementKill
+      readonly logSave: RetirementLogSave
+      readonly removal: RetirementRemoval
+    }
+
+/** What a run's retirer works with. */
+export interface ShardRetirementContext {
+  readonly deps: ShardRetirementDeps
+  /** The run directory: each shard's result file and `docker.log` are in its `shard-<k>` subdirectory. */
+  readonly runDir: string
+  /** The runner log; a sink that throws loses only its line. */
+  readonly log: RunnerLogSink
+  /** The run's state: a failed removal's line is pushed to its `cleanupFailures`. */
+  readonly state: Pick<RunState, 'cleanupFailures'>
+}
+
+/** A run's one retirer, keyed by shard number: E13 builds one per run. */
+export interface ShardRetirer {
+  /** The shard's final reading: taken on the first request; every later one, while or after it is taken, gets the same answer with no new read. Null, with no docker operation, for a shard with no created container; null after its state read for a shard whose start failed and whose container Docker does not know. Never rejects. */
+  finalReading(shard: RetiredShard): Promise<ShardFinalReading | null>
+  /** Retires the shard for `reason`, in the fixed order; every later request, whatever its reason, gets the first one's retirement with no operation. Never rejects. */
+  retire(shard: RetiredShard, reason: RetirementReason): Promise<ShardRetirement>
+  /** The shard's final reading once taken; null before, and always null for a shard that has none. */
+  recordedReading(shard: number): ShardFinalReading | null
+  /** The shard's retirement once done; null before. */
+  recordedRetirement(shard: number): ShardRetirement | null
+}
+
+/** Whether a result file as read holds its end marker: a complete `done` line, E4's limit-timer rule over E1's reading rule (b.uqm SR-4.3, SR-11.3). */
+export function resultFileHoldsEndMarker(read: ResultFileRead): boolean {
+  return read.kind === 'events' && read.events.some((event) => event.kind === 'done')
+}
+
+/**
+ * The effective retirement reason (b.uqm SR-10.6, AC 54): a limit retirement
+ * of a shard whose result file (`readResultFile` in its subdirectory) holds
+ * its end marker is an end-marker retirement; every other reason stands. Only
+ * a limit retirement reads the file. Never taken from an exit code.
+ */
+export function settleRetirementReason(runDir: string, shard: number, requested: RetirementReason): RetirementReason {
+  if (requested.kind !== 'limit') return requested
+  return resultFileHoldsEndMarker(readResultFile(shardSubdirectoryPath(runDir, shard))) ? { kind: 'end-marker' } : requested
+}
+
+/** Writes one retirement line to the runner log; a sink that throws loses only this line. */
+function writeRetirementLog(log: RunnerLogSink, line: string): void {
+  try {
+    log(line)
+  } catch {
+    // The step's outcome is still recorded; the log's own failure is not the retirement's.
+  }
+}
+
+/** Whether a failed docker operation is Docker's answer that it knows no such container. */
+function isNoSuchContainer(failure: DockerFailure): boolean {
+  return failure.exitCode !== null && failure.error.includes(DOCKER_NO_SUCH_CONTAINER_TEXT)
+}
+
+/** One docker operation whose throw, if any, becomes a failure on one line. */
+async function settledDockerAnswer<T>(operation: () => Promise<DockerAnswer<T>>): Promise<DockerAnswer<T>> {
+  try {
+    return await operation()
+  } catch (err) {
+    return { ok: false, exitCode: null, error: dependencyErrorText(err) }
+  }
+}
+
+/** E6's container figures, with a throw from a reading dependency failing every figure. */
+function readFinalFigures(deps: ShardRetirementDeps, target: FiguresTarget): Pick<ContainerFigures, 'anonBytes' | 'fileBytes' | 'oomKillCount'> {
+  try {
+    return readContainerFigures(deps, target)
+  } catch (err) {
+    const failed: ReadingResult<number> = { ok: false, what: `${target.name}'s cgroup`, error: dependencyErrorText(err) }
+    return { anonBytes: failed, fileBytes: failed, oomKillCount: failed }
+  }
+}
+
+/** The container a shard's docker operations name: its full ID when it started, else its name. */
+function retiredShardContainer(shard: RetiredShard): string {
+  return shard.containerId ?? shard.containerName
+}
+
+/**
+ * Takes a shard's final reading (b.uqm SR-10.6): one state-form read, then,
+ * only when the state was read, E6's figures from its cgroup (none for a
+ * container with no main process: it exited on its own, or never started).
+ * Null for a shard whose start failed and whose container Docker does not
+ * know: it was never created, so it has no final reading. A failed state read,
+ * or Docker knowing no such container for a started shard, leaves every part
+ * `unreadable`. Never reads the environment; never throws.
+ */
+async function takeFinalReading(deps: ShardRetirementDeps, docker: DockerContext, target: RetiredShard): Promise<ShardFinalReading | null> {
+  const shard = target.start.shard
+  const name = target.containerName
+  const atMs = deps.clock.now()
+  const failedReadings: FailedReading[] = []
+  const unreadable = (what: string, error: string): Unreadable => {
+    if (!failedReadings.some((failed) => failed.what === what && failed.error === error)) failedReadings.push({ shard, what, error })
+    return UNREADABLE_READING
+  }
+  const state = await settledDockerAnswer(() => inspectContainerState(docker, retiredShardContainer(target)))
+  if (state.ok && state.value === null && target.start.kind !== 'started') return null
+  if (!state.ok || state.value === null) {
+    unreadable(`${name}'s state`, state.ok ? `Docker knows no container ${name}` : dependencyErrorText(state.error))
+    const cgroup = unreadable(`${name}'s cgroup`, state.ok ? 'the container does not exist' : 'its state could not be read, so its cgroup cannot be found')
+    return {
+      shard,
+      atMs,
+      final: { oomKilled: UNREADABLE_READING, oomKillCount: cgroup, anonBytes: cgroup, fileBytes: cgroup },
+      status: UNREADABLE_READING,
+      running: state.ok ? false : UNREADABLE_READING,
+      exitCode: null,
+      failedReadings,
+    }
+  }
+  const container = state.value
+  const figures = readFinalFigures(deps, { name, pid: container.pid })
+  const part = (reading: ReadingResult<number>): Reading<number> => (reading.ok ? reading.value : unreadable(reading.what, reading.error))
+  const exited = !container.running && (EXITED_CONTAINER_STATUSES as readonly string[]).includes(container.status)
+  return {
+    shard,
+    atMs,
+    final: { oomKilled: container.oomKilled, oomKillCount: part(figures.oomKillCount), anonBytes: part(figures.anonBytes), fileBytes: part(figures.fileBytes) },
+    status: container.status,
+    running: container.running,
+    exitCode: exited ? container.exitCode : null,
+    failedReadings,
+  }
+}
+
+/** Whether the SIGKILL step sends: the reading shows the container running, or whether it runs is unreadable and the effective reason is not that it exited on its own. */
+export function retirementSendsKill(running: Reading<boolean>, reason: RetirementReason): boolean {
+  return running === true || (running === UNREADABLE_READING && reason.kind !== 'exited')
+}
+
+/** The SIGKILL step (`retirementSendsKill`); a failed kill is logged, never a cleanup failure. */
+async function retirementKill(docker: DockerContext, log: RunnerLogSink, target: RetiredShard, reading: ShardFinalReading, reason: RetirementReason): Promise<RetirementKill> {
+  if (!retirementSendsKill(reading.running, reason)) return { kind: 'not-running' }
+  const killed = await settledDockerAnswer(() => killContainer(docker, retiredShardContainer(target), 'SIGKILL'))
+  if (killed.ok) return { kind: 'sent' }
+  writeRetirementLog(log, `${SHARD_DIR_PREFIX}${target.start.shard}: SIGKILL to container ${target.containerName} failed: ${killed.error}`)
+  return { kind: 'failed', error: killed.error }
+}
+
+/** The `docker.log` step: the container's Docker logs written whole into its subdirectory; Docker knowing no such container is absent (logged, no file). */
+async function retirementLogSave(docker: DockerContext, runDir: string, log: RunnerLogSink, target: RetiredShard): Promise<RetirementLogSave> {
+  const shard = target.start.shard
+  const logs = await settledDockerAnswer(() => readContainerLogs(docker, retiredShardContainer(target)))
+  if (!logs.ok && isNoSuchContainer(logs)) {
+    writeRetirementLog(log, `${SHARD_DIR_PREFIX}${shard}: no ${DOCKER_LOG_FILE_NAME} saved: Docker knows no container ${target.containerName}`)
+    return { kind: 'absent' }
+  }
+  let failure: string
+  if (logs.ok) {
+    const dir = shardSubdirectoryPath(runDir, shard)
+    const written = writeWholeFile(dir, DOCKER_LOG_FILE_NAME, logs.value)
+    if (written.ok) return { kind: 'saved', path: join(dir, DOCKER_LOG_FILE_NAME) }
+    failure = written.error
+  } else {
+    failure = `reading the Docker logs of container ${target.containerName} failed: ${logs.error}`
+  }
+  writeRetirementLog(log, `${SHARD_DIR_PREFIX}${shard}: saving ${DOCKER_LOG_FILE_NAME} failed: ${failure}`)
+  return { kind: 'failed', error: failure }
+}
+
+/** The removal step: never forced; already gone is absent; a failure is logged and listed as a cleanup failure (b.uqm SR-9.3). */
+async function retirementRemoval(docker: DockerContext, context: ShardRetirementContext, target: RetiredShard): Promise<RetirementRemoval> {
+  const removed = await settledDockerAnswer(() => removeContainer(docker, retiredShardContainer(target)))
+  if (removed.ok) return { kind: 'removed' }
+  if (isNoSuchContainer(removed)) return { kind: 'absent' }
+  const id = target.containerId === null ? '' : ` (${target.containerId})`
+  const line = `removing container ${target.containerName}${id} failed: ${removed.error}`
+  writeRetirementLog(context.log, line)
+  context.state.cleanupFailures.push(line)
+  return { kind: 'failed', line }
+}
+
+/**
+ * Builds a run's retirer (b.uqm SR-10.6): one final reading and one
+ * retirement per shard, both kept by shard number, so concurrent and repeated
+ * requests (a limit timer and a run-level stop together) share the first.
+ *
+ * `retire` settles the effective reason first (`settleRetirementReason`),
+ * then: the final reading if not yet taken; SIGKILL while that reading shows
+ * the container running, or when whether it runs is unreadable and the
+ * effective reason is not `exited` (`retirementSendsKill`); `docker.log`
+ * saved; removal. Each step follows the one before; removal follows a failed
+ * SIGKILL or log save. Each failed step and each unreadable part of the
+ * reading is written to the runner log. A shard with no created container
+ * gets no read, no operation and no log line: its retirement is
+ * `no-container`, its reason as requested. A shard whose start failed and
+ * whose container Docker does not know gets its state read only, one log
+ * line, and no final reading: its retirement is `no-container`, its reason
+ * as settled.
+ */
+export function createShardRetirer(context: ShardRetirementContext): ShardRetirer {
+  const docker: DockerContext = { spawn: context.deps.spawn, env: childEnvironment(context.deps.env), cwd: context.deps.worktreeRoot }
+  const readings = new Map<number, Promise<ShardFinalReading | null>>()
+  const takenReadings = new Map<number, ShardFinalReading>()
+  const retirements = new Map<number, Promise<ShardRetirement>>()
+  const doneRetirements = new Map<number, ShardRetirement>()
+
+  function readingOf(target: RetiredShard): Promise<ShardFinalReading | null> {
+    const shard = target.start.shard
+    const pending = readings.get(shard)
+    if (pending !== undefined) return pending
+    const taking = takeFinalReading(context.deps, docker, target).then((reading) => {
+      if (reading === null) {
+        writeRetirementLog(context.log, `${SHARD_DIR_PREFIX}${shard}: its container failed to start and Docker knows no container ${target.containerName}: no final reading and nothing to retire`)
+        return null
+      }
+      takenReadings.set(shard, reading)
+      for (const failed of reading.failedReadings) {
+        writeRetirementLog(context.log, `${SHARD_DIR_PREFIX}${shard}: final reading: ${failed.what} ${UNREADABLE_READING}: ${failed.error}`)
+      }
+      return reading
+    })
+    readings.set(shard, taking)
+    return taking
+  }
+
+  async function performRetirement(target: RetiredShard, requested: RetirementReason): Promise<ShardRetirement> {
+    const shard = target.start.shard
+    if (!target.containerCreated) return { kind: 'no-container', shard, requested, reason: requested }
+    const reason = settleRetirementReason(context.runDir, shard, requested)
+    if (reason.kind !== requested.kind) {
+      writeRetirementLog(context.log, `${SHARD_DIR_PREFIX}${shard}: its ${RESULT_FILE_NAME} holds its end marker, so it is retired at its end marker, not over its limit`)
+    }
+    const reading = await readingOf(target)
+    if (reading === null) return { kind: 'no-container', shard, requested, reason }
+    const kill = await retirementKill(docker, context.log, target, reading, reason)
+    const logSave = await retirementLogSave(docker, context.runDir, context.log, target)
+    const removal = await retirementRemoval(docker, context, target)
+    return { kind: 'retired', shard, requested, reason, reading, kill, logSave, removal }
+  }
+
+  return {
+    finalReading(target) {
+      return target.containerCreated ? readingOf(target) : Promise.resolve(null)
+    },
+    retire(target, reason) {
+      const shard = target.start.shard
+      const pending = retirements.get(shard)
+      if (pending !== undefined) return pending
+      const retiring = performRetirement(target, reason).then((retirement) => {
+        doneRetirements.set(shard, retirement)
+        return retirement
+      })
+      retirements.set(shard, retiring)
+      return retiring
+    },
+    recordedReading: (shard) => takenReadings.get(shard) ?? null,
+    recordedRetirement: (shard) => doneRetirements.get(shard) ?? null,
+  }
 }
 
 // ---------------------------------------------------------------------------
