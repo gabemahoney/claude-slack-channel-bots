@@ -21,6 +21,15 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 - **To repair a link that points into a deleted checkout,** run `bun src/postinstall.ts` from the package directory of a global install of the published package (`~/.bun/install/global/node_modules/claude-slack-channel-bots`). It replaces the dangling link with one into that install.
 - **Remove a dangling `~/.claude/skills/claude-slack-channels-config` link by hand.** An older checkout's postinstall may have left this link to the retired skill pointing into a checkout you have since deleted. postinstall removes that link only when it points into its own package, so the repair above leaves it. If `ls -l ~/.claude/skills/claude-slack-channels-config` shows a link into a deleted checkout, run `rm ~/.claude/skills/claude-slack-channels-config`.
 
+### A clean exit relaunches in about 3 seconds
+
+A persona whose session ends cleanly (an `agent-director pause`, which types `/exit`, or any other `/exit`) is now relaunched about 3 s after its session disconnects. Before, it waited the full `session_restart_delay` (60 s by default), and a message sent to it meanwhile was lost with a `restarting` notice.
+
+- **A crash still waits the full delay.** A session agent-director reads `missing` (a crash or a kill), or has no row for, still waits `session_restart_delay`. Failed launches still back off, doubling up to 15 minutes, and stop after 5 in a row.
+- **At most one fast relaunch per `session_restart_delay`.** A restart within that time of the persona's last fast relaunch waits the full delay, so a session that exits right after every launch is not relaunched every few seconds.
+- **`session_restart_delay` set to `0` still turns auto-restart off,** clean exits included.
+- **Three new `server.log` lines,** each ending in `(b.4vm)`: `[slack] Session for persona=<key> ended cleanly`, `[slack] Clean-exit check for persona=<key>` and `[slack] No clean-exit check for persona=<key>`. See "Session not restarting after crash" under [Troubleshooting](README.md#troubleshooting) in the README.
+
 ---
 
 ## 0.12.0 (2026-10-07)
