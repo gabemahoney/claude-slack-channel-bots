@@ -561,6 +561,10 @@ describe('slack-app-manifest.yml', () => {
     expect(manifest.oauth_config.scopes.bot).toContain('im:write')
   })
 
+  test('bug b.jpc: the bot scopes include channels:read and groups:read, so conversations.info resolves a channel name', () => {
+    expect(manifest.oauth_config.scopes.bot).toEqual(expect.arrayContaining(['channels:read', 'groups:read']))
+  })
+
   test('SR-4.3: message.im stays subscribed and message.mpim is not (group DMs unsubscribed)', () => {
     const events = manifest.settings.event_subscriptions.bot_events
     expect(events).toContain('message.im')
@@ -572,10 +576,12 @@ describe('slack-app-manifest.yml', () => {
       [
         'app_mentions:read',
         'channels:history',
+        'channels:read',
         'chat:write',
         'files:read',
         'files:write',
         'groups:history',
+        'groups:read',
         'im:history',
         'im:write',
         'reactions:write',
@@ -609,7 +615,10 @@ describe('slack-app-manifest.yml', () => {
     ['the bot_token key', /\bbot_token\b/],
     ['the app_token key', /\bapp_token\b/],
     ['im:write', /\bim:write\b/],
+    ['channels:read', /\bchannels:read\b/],
+    ['groups:read', /\bgroups:read\b/],
     ['re-installing existing apps', /\bre-?install/i],
+    ['the Reinstall to Workspace button', /Reinstall\s+to\s+Workspace/],
   ])('SR-12: the comments name %s', (_label, pattern) => {
     expect(comments).toMatch(pattern)
   })

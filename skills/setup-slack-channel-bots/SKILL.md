@@ -266,9 +266,12 @@ Tell the operator where both tokens are. Don't ask for them: they go into the
 terminal command in 5.10.
 
 **Reusing an existing app** for this persona: an app created from an earlier
-manifest lacks the `im:write` scope and must gain it and be re-installed. Point
-to the debugging skill's entry "A persona can't open a DM: re-install its app
-to gain `im:write`" (`skills/debug-slack-channel-bots/SKILL.md`) for the steps.
+manifest can lack the `im:write`, `channels:read` and `groups:read` scopes and
+must gain them and be re-installed. Point to the debugging skill's entries "A
+persona can't open a DM: re-install its app to gain `im:write`" and "The
+message archive shows channel IDs: re-install each app to gain
+`channels:read` and `groups:read`"
+(`skills/debug-slack-channel-bots/SKILL.md`) for the steps.
 An app already used by another persona can't be reused.
 
 #### 5.3 Credentials file path

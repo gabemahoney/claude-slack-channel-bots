@@ -6,6 +6,30 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+### Two new Slack bot scopes: `channels:read` and `groups:read`
+
+`slack-app-manifest.yml` now asks for `channels:read` (public channels) and `groups:read` (private channels). The message archive (`message_archive_db`) needs them to look up a channel's name from its ID. Without them, Slack refuses the lookup with `missing_scope`, and the archive stores the channel ID where the name should be. Nothing is logged.
+
+- **Add both scopes to each persona's Slack app, then re-install it.** An app created from an earlier manifest keeps its old scopes, and its bot token gains the new ones only at a re-install. At api.slack.com/apps, add `channels:read` and `groups:read` under OAuth & Permissions → Bot Token Scopes, or under `oauth_config.scopes.bot` in the app's own manifest. Then click **Reinstall to Workspace** under OAuth & Permissions. Pasting the shipped manifest over the app's own resets the app's name and bot display name. The `debug-slack-channel-bots` skill has the steps under "The message archive shows channel IDs".
+- **Until then, the archive stores channel IDs.** Rows already written keep the ID; nothing rewrites them.
+- **A running server may keep storing the ID for up to 24 hours.** It caches each channel's name for 24 hours, and a failed lookup is cached as the ID. A channel looked up before the re-install keeps getting its ID until those 24 hours pass, the server restarts, or the persona gets a new Slack client, which starts its lookups over (for example when a confirmed change to its credentials file reconnects it). A channel not looked up yet gets its name at once.
+
+### The debugging skill link no longer points into a checkout
+
+- **Only an installed package links the `debug-slack-channel-bots` skill.** postinstall now manages the links in `~/.claude/skills/` only when the package lies inside a `node_modules` directory with no `.git` entry at its root, as a global install does, and `CI` is not set. Before, a `bun install` in a repo checkout or git worktree pointed the link into that checkout, and the skill was gone for every Claude Code session on the host once the checkout was deleted.
+- **An install from a checkout leaves `~/.claude/skills/` alone.** This includes [an install from a local worktree](README.md#installing-from-a-local-worktree) with `scripts/install-local.sh`. postinstall still writes the missing config files, and logs `skipped: <home>/.claude/skills (skill links left alone: <reason>)`.
+- **To repair a link that points into a deleted checkout,** run `bun src/postinstall.ts` from the package directory of a global install of the published package (`~/.bun/install/global/node_modules/claude-slack-channel-bots`). It replaces the dangling link with one into that install.
+- **Remove a dangling `~/.claude/skills/claude-slack-channels-config` link by hand.** An older checkout's postinstall may have left this link to the retired skill pointing into a checkout you have since deleted. postinstall removes that link only when it points into its own package, so the repair above leaves it. If `ls -l ~/.claude/skills/claude-slack-channels-config` shows a link into a deleted checkout, run `rm ~/.claude/skills/claude-slack-channels-config`.
+
+### A clean exit relaunches in about 3 seconds
+
+A persona whose session ends cleanly (an `agent-director pause`, which types `/exit`, or any other `/exit`) is now relaunched about 3 s after its session disconnects. Before, it waited the full `session_restart_delay` (60 s by default), and a message sent to it meanwhile was lost with a `restarting` notice.
+
+- **A crash still waits the full delay.** A session agent-director reads `missing` (a crash or a kill), or has no row for, still waits `session_restart_delay`. Failed launches still back off, doubling up to 15 minutes, and stop after 5 in a row.
+- **At most one fast relaunch per `session_restart_delay`.** A restart within that time of the persona's last fast relaunch waits the full delay, so a session that exits right after every launch is not relaunched every few seconds.
+- **`session_restart_delay` set to `0` still turns auto-restart off,** clean exits included.
+- **Three new `server.log` lines,** each ending in `(b.4vm)`: `[slack] Session for persona=<key> ended cleanly`, `[slack] Clean-exit check for persona=<key>` and `[slack] No clean-exit check for persona=<key>`. See "Session not restarting after crash" under [Troubleshooting](README.md#troubleshooting) in the README.
+
 ---
 
 ## 0.12.0 (2026-10-07)

@@ -9,12 +9,26 @@
  * access-control file of earlier releases is neither created nor touched
  * (b.av2 SR-10.1).
  *
- * Links the debugging skill (debug-slack-channel-bots) into
- * ~/.claude/skills/, replacing only a symbolic link that points elsewhere
- * (dangling included); a real directory or regular file at that name is left
- * in place with a `skipped:` line. Removes the link it created in earlier releases for
- * the retired claude-slack-channels-config skill: only a symbolic link whose
- * target resolves to this package's own skills/claude-slack-channels-config
+ * Skill links are managed only for an installed copy of the package (b.669):
+ * its root (the directory above src/) holds no .git entry and lies inside a
+ * node_modules directory (a global install such as
+ * ~/.bun/install/global/node_modules/claude-slack-channel-bots), and CI is
+ * not set (any value but empty, 0 or false). A `bun install` in a repo
+ * checkout or git worktree (a .git directory or file at the root, outside
+ * node_modules) or a CI run leaves ~/.claude/skills/ untouched (not even
+ * created), with one `skipped:` line saying why, so the user-wide link never
+ * points into a checkout that may later be deleted. The config.json and
+ * slack-mcp.json skeletons are written either way. The decision is
+ * path-based: Bun sets no npm_config_global for a global install.
+ * `PostinstallOptions.linkSkills` overrides it ({@link skillLinkSkipReason}).
+ *
+ * For an installed copy, it links the debugging skill
+ * (debug-slack-channel-bots) into ~/.claude/skills/, replacing only a
+ * symbolic link that points elsewhere (dangling included); a real directory
+ * or regular file at that name is left in place with a `skipped:` line. It
+ * removes the link it created in earlier releases for the retired
+ * claude-slack-channels-config skill: only a symbolic link whose target
+ * resolves to this package's own skills/claude-slack-channels-config
  * (existing or dangling). A real directory, a regular file or a link to any
  * other path at that name is left untouched.
  *
@@ -35,7 +49,7 @@
 
 import { existsSync, lstatSync, mkdirSync, writeFileSync, symlinkSync, readlinkSync, unlinkSync, renameSync } from 'fs'
 import { homedir } from 'os'
-import { dirname, join, resolve } from 'path'
+import { dirname, join, resolve, sep } from 'path'
 import { MCP_SERVER_NAME, resolveServerStateDir } from './config.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import type { InstallCheckResult } from './install-check.ts'
@@ -45,6 +59,15 @@ const LINKED_SKILLS = ['debug-slack-channel-bots']
 
 /** The retired skill whose link from earlier releases postinstall removes. */
 const RETIRED_SKILL = 'claude-slack-channels-config'
+
+/** This copy of the package's root: the directory above src/. */
+const DEFAULT_PACKAGE_DIR = resolve(dirname(import.meta.filename), '..')
+
+/** The directory an installed package lies inside. */
+const NODE_MODULES_DIR = 'node_modules'
+
+/** CI values (trimmed, lower-cased) that mean "not a CI run"; any other value means one. */
+const CI_OFF_VALUES: ReadonlySet<string> = new Set(['', '0', 'false'])
 
 // ---------------------------------------------------------------------------
 // Types
@@ -62,6 +85,20 @@ export interface PostinstallOptions {
    * `~/.claude/skills/`.
    */
   homeDir?: string
+  /**
+   * Override the package root (defaults to this copy's, the directory above
+   * src/): the skills are linked from its skills/ directory, and
+   * {@link skillLinkSkipReason} judges it.
+   */
+  packageDir?: string
+  /**
+   * Override whether the skill links are managed: true links them, false
+   * skips them, whatever {@link skillLinkSkipReason} says. Unset: that
+   * function decides.
+   */
+  linkSkills?: boolean
+  /** The environment the CI check reads (defaults to process.env); only CI is read. */
+  env?: NodeJS.ProcessEnv
 }
 
 /** The link's target, resolved against the link's own directory; undefined when `path` is not a symbolic link. */
@@ -84,44 +121,37 @@ function entryExists(path: string): boolean {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Core function
-// ---------------------------------------------------------------------------
+/** True when `env` marks a CI run: CI set to anything but empty, 0 or false (case-insensitive). */
+function isCiRun(env: NodeJS.ProcessEnv): boolean {
+  const value = env.CI
+  return value !== undefined && !CI_OFF_VALUES.has(value.trim().toLowerCase())
+}
 
-export function runPostinstall(options: PostinstallOptions = {}): void {
-  // The server's state directory (resolveServerStateDir): an empty
-  // SLACK_STATE_DIR means unset, and a relative one resolves the same way.
-  const home = (): string => options.homeDir ?? homedir()
-  const stateDir = options.stateDir ?? resolveServerStateDir(options.homeDir)
+/**
+ * Why postinstall must leave the skill links in ~/.claude/skills/ alone for
+ * the package rooted at `packageDir`, or undefined when it manages them
+ * (b.669). The first rule that applies wins:
+ * - a .git entry (directory, worktree file or link) at the root: a repo
+ *   checkout or git worktree, not an installed package;
+ * - the root does not lie inside a node_modules directory: not an installed
+ *   package (a global install lives under `<global dir>/node_modules/`);
+ * - `env` marks a CI run ({@link isCiRun}).
+ */
+function skillLinkSkipReason(packageDir: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const root = resolve(packageDir)
+  if (entryExists(join(root, '.git'))) return `${root} is a git checkout, not an installed package`
+  if (!root.split(sep).includes(NODE_MODULES_DIR)) return `${root} is not inside a ${NODE_MODULES_DIR} directory`
+  if (isCiRun(env)) return 'CI is set'
+  return undefined
+}
 
-  const mcpConfigPath =
-    options.mcpConfigPath ?? join(home(), '.claude', 'slack-mcp.json')
-
-  // Ensure directories exist
-  mkdirSync(stateDir, { recursive: true })
-  mkdirSync(dirname(mcpConfigPath), { recursive: true })
-
-  // config.json — migrate from routing.json if needed
-  const configPath = join(stateDir, 'config.json')
-  const legacyPath = join(stateDir, 'routing.json')
-  if (existsSync(legacyPath) && !existsSync(configPath)) {
-    renameSync(legacyPath, configPath)
-    console.log(`Migrated routing.json → config.json`)
-  }
-
-  // Create the empty persona skeleton if neither old nor new file exists
-  if (existsSync(configPath)) {
-    console.log(`skipped: ${configPath}`)
-  } else {
-    writeFileSync(configPath, JSON.stringify({ personas: [] }, null, 2) + '\n')
-    console.log(`created: ${configPath}`)
-  }
-
-  // Symlink skills into ~/.claude/skills/
-  const skillsTarget = join(home(), '.claude', 'skills')
+/**
+ * Links {@link LINKED_SKILLS} from `packageSkillsDir` into `skillsTarget` and
+ * removes the retired skill's link when this package created it.
+ */
+function manageSkillLinks(skillsTarget: string, packageSkillsDir: string): void {
   mkdirSync(skillsTarget, { recursive: true })
 
-  const packageSkillsDir = resolve(dirname(import.meta.filename), '..', 'skills')
   for (const name of LINKED_SKILLS) {
     const src = join(packageSkillsDir, name)
     const dest = join(skillsTarget, name)
@@ -163,6 +193,52 @@ export function runPostinstall(options: PostinstallOptions = {}): void {
     } else {
       console.log(`skipped: ${retiredDest} (not created by postinstall; left in place)`)
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Core function
+// ---------------------------------------------------------------------------
+
+export function runPostinstall(options: PostinstallOptions = {}): void {
+  // The server's state directory (resolveServerStateDir): an empty
+  // SLACK_STATE_DIR means unset, and a relative one resolves the same way.
+  const home = (): string => options.homeDir ?? homedir()
+  const stateDir = options.stateDir ?? resolveServerStateDir(options.homeDir)
+
+  const mcpConfigPath =
+    options.mcpConfigPath ?? join(home(), '.claude', 'slack-mcp.json')
+
+  // Ensure directories exist
+  mkdirSync(stateDir, { recursive: true })
+  mkdirSync(dirname(mcpConfigPath), { recursive: true })
+
+  // config.json — migrate from routing.json if needed
+  const configPath = join(stateDir, 'config.json')
+  const legacyPath = join(stateDir, 'routing.json')
+  if (existsSync(legacyPath) && !existsSync(configPath)) {
+    renameSync(legacyPath, configPath)
+    console.log(`Migrated routing.json → config.json`)
+  }
+
+  // Create the empty persona skeleton if neither old nor new file exists
+  if (existsSync(configPath)) {
+    console.log(`skipped: ${configPath}`)
+  } else {
+    writeFileSync(configPath, JSON.stringify({ personas: [] }, null, 2) + '\n')
+    console.log(`created: ${configPath}`)
+  }
+
+  // Skill links in ~/.claude/skills/: only for an installed copy of the package
+  const skillsTarget = join(home(), '.claude', 'skills')
+  const packageDir = resolve(options.packageDir ?? DEFAULT_PACKAGE_DIR)
+  let skipReason: string | undefined
+  if (options.linkSkills === undefined) skipReason = skillLinkSkipReason(packageDir, options.env)
+  else if (!options.linkSkills) skipReason = 'the linkSkills option is false'
+  if (skipReason === undefined) {
+    manageSkillLinks(skillsTarget, join(packageDir, 'skills'))
+  } else {
+    console.log(`skipped: ${skillsTarget} (skill links left alone: ${skipReason})`)
   }
 
   // slack-mcp.json

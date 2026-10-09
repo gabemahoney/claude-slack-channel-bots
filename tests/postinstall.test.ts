@@ -10,6 +10,17 @@
  * Cases that leave `stateDir` unset control SLACK_STATE_DIR in-process and
  * restore it (and the working directory) in afterEach.
  *
+ * Skill links (b.669): the default package root is this checkout, which
+ * postinstall's detection never links from, so the link cases force linking
+ * with `linkSkills: true` (`makeSandbox().opts`). The detection cases leave
+ * `linkSkills` unset and pass `packageDir` (a package copy under the sandbox
+ * root) and `env` explicitly; the one that reads process.env sets CI and
+ * restores it in afterEach. Exception: the cases about the default package
+ * root (the homeDir case and the run-from-this-checkout regression case)
+ * pass neither, so the run judges this checkout; the detection rejects a
+ * checkout for its .git entry or for lying outside node_modules before it
+ * reads CI, so the host's CI does not change their result.
+ *
  * The agent-director probe (b.jg5 SRJ-121) is driven in process with an
  * injected install check (`deps.runInstallCheck`) answering canned results
  * from `tests/test-helpers/install-check-fixtures.ts`, so no case runs the
@@ -37,7 +48,7 @@ import {
   writeFileSync,
 } from 'fs'
 import { tmpdir } from 'os'
-import { join, relative } from 'path'
+import { dirname, join, relative } from 'path'
 import { fileURLToPath } from 'url'
 import {
   runAgentDirectorPostinstallProbe,
@@ -73,6 +84,8 @@ import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 
 /** The package's own skills directory, which postinstall links from. */
 const PACKAGE_SKILLS = fileURLToPath(new URL('../skills', import.meta.url))
+/** This checkout's root: postinstall's default package root. */
+const PACKAGE_ROOT = dirname(PACKAGE_SKILLS)
 const DEBUG_SKILL = 'debug-slack-channel-bots'
 const RETIRED_SKILL = 'claude-slack-channels-config'
 /** Where postinstall's link for the retired skill pointed (the directory is gone). */
@@ -82,10 +95,12 @@ const isRoot = process.getuid?.() === 0
 
 let tempDirs: string[] = []
 let savedStateDirEnv: string | undefined
+let savedCiEnv: string | undefined
 let savedCwd: string
 
 beforeEach(() => {
   savedStateDirEnv = process.env.SLACK_STATE_DIR
+  savedCiEnv = process.env.CI
   savedCwd = process.cwd()
 })
 
@@ -93,6 +108,8 @@ afterEach(() => {
   process.chdir(savedCwd)
   if (savedStateDirEnv === undefined) delete process.env.SLACK_STATE_DIR
   else process.env.SLACK_STATE_DIR = savedStateDirEnv
+  if (savedCiEnv === undefined) delete process.env.CI
+  else process.env.CI = savedCiEnv
   for (const d of tempDirs) {
     try { rmSync(d, { recursive: true, force: true }) } catch { /* ignore */ }
   }
@@ -114,7 +131,9 @@ interface Sandbox {
   skillsDir: string
   stateDir: string
   mcpConfigPath: string
-  /** Full options: nothing resolves outside `root`. */
+  /** The home, state dir and MCP path only: the skill-link detection decides (b.669). */
+  paths: PostinstallOptions
+  /** `paths` plus `linkSkills: true`, so the skills link from this checkout. */
   opts: PostinstallOptions
 }
 
@@ -123,14 +142,27 @@ function makeSandbox(): Sandbox {
   const home = join(root, 'home')
   const stateDir = join(root, 'state')
   const mcpConfigPath = join(root, 'mcp', 'slack-mcp.json')
+  const paths: PostinstallOptions = { homeDir: home, stateDir, mcpConfigPath }
   return {
     root,
     home,
     skillsDir: join(home, '.claude', 'skills'),
     stateDir,
     mcpConfigPath,
-    opts: { homeDir: home, stateDir, mcpConfigPath },
+    paths,
+    opts: { ...paths, linkSkills: true },
   }
+}
+
+/** A path segment list for an installed copy, as `bun add -g` lays one out. */
+const INSTALLED_COPY = ['global', 'node_modules', 'claude-slack-channel-bots']
+
+/** A copy of the package at `<sandbox root>/<segments>` holding the debug skill; returns its root. */
+function makePackageCopy(s: Sandbox, segments: string[]): string {
+  const root = join(s.root, ...segments)
+  mkdirSync(join(root, 'skills', DEBUG_SKILL), { recursive: true })
+  writeFileSync(join(root, 'skills', DEBUG_SKILL, 'SKILL.md'), 'installed skill\n')
+  return root
 }
 
 /** runPostinstall(opts) with its console.log lines captured; refuses options with no temp home. */
@@ -391,7 +423,7 @@ describe('homeDir — the base of every default', () => {
   test.each([
     ['unset', undefined],
     ['empty (counts as unset)', ''],
-  ])('with only homeDir and SLACK_STATE_DIR %s, a fresh run writes exactly the state, MCP config and skill link under that home', (_label, envValue) => {
+  ])('with only homeDir and SLACK_STATE_DIR %s, a fresh run writes exactly the state and MCP config under that home, and no skills directory: the default package root is this checkout (b.669)', (_label, envValue) => {
     const s = makeSandbox()
     if (envValue === undefined) delete process.env.SLACK_STATE_DIR
     else process.env.SLACK_STATE_DIR = envValue
@@ -404,8 +436,6 @@ describe('homeDir — the base of every default', () => {
       join('home', '.claude', 'channels'),
       join('home', '.claude', 'channels', 'slack'),
       join('home', '.claude', 'channels', 'slack', 'config.json'),
-      join('home', '.claude', 'skills'),
-      join('home', '.claude', 'skills', DEBUG_SKILL),
       join('home', '.claude', 'slack-mcp.json'),
     ])
     expect(readJson(join(s.home, '.claude', 'channels', 'slack', 'config.json'))).toEqual({ personas: [] })
@@ -655,6 +685,121 @@ describe('skill links — the retired claude-slack-channels-config link', () => 
     // (through `redactSlackLogText`), then frames.
     for (const w of warnings) expect(w).toMatch(/: \w*Error code=(E[A-Z]+) message="\1: [^"]*"/)
     expect(existsSync(s.mcpConfigPath)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Skill links: managed only for an installed copy of the package (b.669)
+// ---------------------------------------------------------------------------
+
+describe('skill links — managed only for an installed copy (b.669)', () => {
+  /** The one line a run that leaves the skill links alone prints about them. */
+  const skipLine = (s: Sandbox, reason: string): string => `skipped: ${s.skillsDir} (skill links left alone: ${reason})`
+
+  /** Lines that report a link made or removed, or a failure to. */
+  const linkActivity = (lines: string[]): string[] =>
+    lines.filter((l) => l.startsWith('linked:') || l.startsWith('removed:') || l.startsWith('warning:'))
+
+  test('a run from this checkout (a repo clone or git worktree) leaves an existing link into the installed copy and the retired skill\'s link into this checkout untouched, with one skipped line naming the checkout', () => {
+    const s = makeSandbox()
+    const installedSkill = join(makePackageCopy(s, INSTALLED_COPY), 'skills', DEBUG_SKILL)
+    mkdirSync(s.skillsDir, { recursive: true })
+    const dest = join(s.skillsDir, DEBUG_SKILL)
+    symlinkSync(installedSkill, dest)
+    const before = lstatSync(dest)
+    // Names this checkout's retired skill path: a run that managed the links here would remove it.
+    const retired = join(s.skillsDir, RETIRED_SKILL)
+    symlinkSync(RETIRED_PACKAGE_PATH, retired)
+    const retiredBefore = lstatSync(retired)
+
+    const lines = postinstall(s.paths)
+
+    expectLink(dest, installedSkill)
+    expect(lstatSync(dest).ino).toBe(before.ino)
+    expectLink(retired, RETIRED_PACKAGE_PATH)
+    expect(lstatSync(retired).ino).toBe(retiredBefore.ino)
+    expect(readdirSync(s.skillsDir).sort()).toEqual([RETIRED_SKILL, DEBUG_SKILL])
+    const skipped = lines.filter((l) => l.startsWith('skipped:'))
+    expect(skipped).toHaveLength(1)
+    // A clone or worktree has a .git entry; a tree without one still lies outside node_modules.
+    expect([
+      skipLine(s, `${PACKAGE_ROOT} is a git checkout, not an installed package`),
+      skipLine(s, `${PACKAGE_ROOT} is not inside a node_modules directory`),
+    ]).toContain(skipped[0])
+    expect(linkActivity(lines)).toEqual([])
+    expect(readJson(join(s.stateDir, 'config.json'))).toEqual({ personas: [] })
+    expect(existsSync(s.mcpConfigPath)).toBe(true)
+  })
+
+  test('an installed copy (inside node_modules, no .git, CI unset) links its own skill, replacing a dangling link into a removed worktree', () => {
+    const s = makeSandbox()
+    const installed = makePackageCopy(s, INSTALLED_COPY)
+    mkdirSync(s.skillsDir, { recursive: true })
+    const dest = join(s.skillsDir, DEBUG_SKILL)
+    symlinkSync(join(s.root, 'b_xyz', 'skills', DEBUG_SKILL), dest)
+
+    const lines = postinstall({ ...s.paths, packageDir: installed, env: {} })
+
+    const src = join(installed, 'skills', DEBUG_SKILL)
+    expectLink(dest, src)
+    expect(statSync(join(dest, 'SKILL.md')).isFile()).toBe(true)
+    expect(lines).toContain(`linked: ${dest} -> ${src}`)
+    expect(lines.filter((l) => l.startsWith('skipped:'))).toEqual([])
+  })
+
+  test.each(['', '0', 'false', ' False '])('an installed copy with CI=%j (not a CI run) links its skill', (ci) => {
+    const s = makeSandbox()
+    const installed = makePackageCopy(s, INSTALLED_COPY)
+
+    postinstall({ ...s.paths, packageDir: installed, env: { CI: ci } })
+
+    expectLink(join(s.skillsDir, DEBUG_SKILL), join(installed, 'skills', DEBUG_SKILL))
+  })
+
+  test.each<[string, (s: Sandbox) => PostinstallOptions & { reason: string }]>([
+    ['a .git directory at the root, even inside node_modules (a clone)', (s) => {
+      const packageDir = makePackageCopy(s, INSTALLED_COPY)
+      mkdirSync(join(packageDir, '.git'))
+      return { packageDir, reason: `${packageDir} is a git checkout, not an installed package` }
+    }],
+    ['a .git file at the root, even inside node_modules (a git worktree)', (s) => {
+      const packageDir = makePackageCopy(s, INSTALLED_COPY)
+      writeFileSync(join(packageDir, '.git'), `gitdir: ${join(s.root, 'repo', '.git', 'worktrees', 'b_xyz')}\n`)
+      return { packageDir, reason: `${packageDir} is a git checkout, not an installed package` }
+    }],
+    ['a root outside any node_modules directory', (s) => {
+      const packageDir = makePackageCopy(s, ['checkout'])
+      return { packageDir, reason: `${packageDir} is not inside a node_modules directory` }
+    }],
+    ['a root under a directory whose name only contains node_modules', (s) => {
+      const packageDir = makePackageCopy(s, ['not_node_modules', 'claude-slack-channel-bots'])
+      return { packageDir, reason: `${packageDir} is not inside a node_modules directory` }
+    }],
+    ['an installed copy with CI=true', (s) => ({ packageDir: makePackageCopy(s, INSTALLED_COPY), env: { CI: 'true' }, reason: 'CI is set' })],
+    ['an installed copy with CI=1', (s) => ({ packageDir: makePackageCopy(s, INSTALLED_COPY), env: { CI: '1' }, reason: 'CI is set' })],
+    ['an installed copy with the linkSkills option false', (s) => ({ packageDir: makePackageCopy(s, INSTALLED_COPY), linkSkills: false, reason: 'the linkSkills option is false' })],
+  ])('%s: no skills directory is created, one skipped line gives the reason, and the config files are still written', (_label, make) => {
+    const s = makeSandbox()
+    const { reason, ...opts } = make(s)
+
+    const lines = postinstall({ ...s.paths, env: {}, ...opts })
+
+    expect(existsSync(s.skillsDir)).toBe(false)
+    expect(lines.filter((l) => l.startsWith('skipped:'))).toEqual([skipLine(s, reason)])
+    expect(linkActivity(lines)).toEqual([])
+    expect(readJson(join(s.stateDir, 'config.json'))).toEqual({ personas: [] })
+    expect(existsSync(s.mcpConfigPath)).toBe(true)
+  })
+
+  test('without an env option, the CI check reads process.env', () => {
+    const s = makeSandbox()
+    const packageDir = makePackageCopy(s, INSTALLED_COPY)
+    process.env.CI = 'true'
+
+    const lines = postinstall({ ...s.paths, packageDir })
+
+    expect(existsSync(s.skillsDir)).toBe(false)
+    expect(lines.filter((l) => l.startsWith('skipped:'))).toEqual([skipLine(s, 'CI is set')])
   })
 })
 

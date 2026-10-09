@@ -494,6 +494,8 @@ checks use them.
      bun pm -g trust claude-slack-channel-bots
      ```
 
+     Bun runs this install's postinstall in the worktree itself, a git checkout, so it writes the config skeletons but leaves `~/.claude/skills/` alone (b.669): it neither links `debug-slack-channel-bots` nor removes the retired skill's link. Record the time of the install in the results; Check 14 step 1 judges the skill link against it.
+
    Then, for either source:
 
    ```sh
@@ -523,7 +525,7 @@ checks use them.
 Expected:
 
 - `PKG=` names the package root, a directory holding `README.md`, `slack-app-manifest.yml` and `skills/`.
-- `ls -A "$S"` prints only `config.json`, and `jq` prints `{"personas":[]}`: postinstall wrote the skeleton with an empty `personas` array and no `access.json`. Check 14 step 1 checks the rest of what postinstall left (no `access.json`, the `debug-slack-channel-bots` skill link, no retired skill link).
+- `ls -A "$S"` prints only `config.json`, and `jq` prints `{"personas":[]}`: postinstall wrote the skeleton with an empty `personas` array and no `access.json`. Check 14 step 1 checks the rest of what postinstall left (no `access.json`; for a published prerelease, the `debug-slack-channel-bots` skill link and no retired skill link; for a local worktree, no new link into the worktree).
 - The checksum file has one line per package file.
 - `SKILL.md` is found under the link.
 
@@ -1325,8 +1327,9 @@ never seen gets answers from a persona in a channel and by DM,
 with no allowlist and no pairing step. It covers b.av2 SR-10.1 (the server
 neither reads nor writes `access.json`, and a stale one is ignored and left
 in place) and SR-10.2's access rows, and checks what postinstall left on the
-test host: no `access.json`, a `debug-slack-channel-bots` skill link, and no
-`claude-slack-channels-config` link.
+test host: no `access.json`, and, for a published prerelease, a
+`debug-slack-channel-bots` skill link and no `claude-slack-channels-config`
+link (a local worktree's postinstall leaves `~/.claude/skills/` alone, b.669).
 
 State at the start: the applied set is A, B and C as the wizard wrote them
 (A mentions-only in coordination again after Check 13, B's DMs on), and
@@ -1388,13 +1391,13 @@ Steps:
 
 Expected:
 
-- Step 1: `ls -l "$S/access.json"` reports that the file does not exist: this build's postinstall created none. A file there whose modification time is older than the install of the build under test was left by an earlier release; record that in Notes (the postinstall leg of this line is then not judged). A newer one fails this check. The first `ls -ld` shows `debug-slack-channel-bots` as a symbolic link (`l` in the mode), and the comparison prints `SKILL_LINK_OK`: the link and `$PKG/skills/debug-slack-channel-bots` resolve (`readlink -f`, both sides) to the same path, so a global install path that goes through a symbolic link does not fail this line. `SKILL.md` exists under the link. `ls -ld` reports that `claude-slack-channels-config` does not exist. If it does exist, record in Notes what it is: postinstall removes it only when it is a symbolic link to `$PKG/skills/claude-slack-channels-config`, and leaves anything else at that name. Only such a link fails this check.
+- Step 1: `ls -l "$S/access.json"` reports that the file does not exist: this build's postinstall created none. A file there whose modification time is older than the install of the build under test was left by an earlier release; record that in Notes (the postinstall leg of this line is then not judged). A newer one fails this check. For a published prerelease, the first `ls -ld` shows `debug-slack-channel-bots` as a symbolic link (`l` in the mode), and the comparison prints `SKILL_LINK_OK`: the link and `$PKG/skills/debug-slack-channel-bots` resolve (`readlink -f`, both sides) to the same path, so a global install path that goes through a symbolic link does not fail this line. `SKILL.md` exists under the link. `ls -ld` reports that `claude-slack-channels-config` does not exist. If it does exist, record in Notes what it is: postinstall removes it only when it is a symbolic link to `$PKG/skills/claude-slack-channels-config`, and leaves anything else at that name. Only such a link fails this check. For a local worktree, those skill-link lines do not apply: the install's postinstall left `~/.claude/skills/` alone (Part 1.4 step 2), so whatever stands at either name predates the install. Record in Notes what the two `ls -ld` and the comparison print. Only a `debug-slack-channel-bots` link that prints `SKILL_LINK_OK` (it resolves into the worktree) and whose time in the first `ls -ld` is later than the install recorded in Part 1.4 step 2 fails this check: this build's postinstall made it.
 - Step 5: A answers "open-channel" in A-home under A's name and avatar.
 - Step 6: B answers "open-dm" in the DM under B's name and avatar.
 - Step 7: `tags a <TS_CH>` prints exactly one tag, with `chat_id="<A_HOME_CHANNEL_ID>"`, `via="receive_all"` and `user_id="<FIRST_TIME_USER_ID>"`. `tags b <TS_DM>` prints exactly one, with `chat_id="<B_NEW_DM_ID>"`, `via="dm"` and `user_id="<FIRST_TIME_USER_ID>"`. The last `replies a` line has `chat_id=<A_HOME_CHANNEL_ID>` and the last `replies b` line has `chat_id=<B_NEW_DM_ID>`, each with `error=false` and a result containing `Sent`. The `grep` prints nothing. `stale file unchanged` is printed, and the count of `.corrupt.` files is `0`.
 - At no point does the first-time user get a pairing code, an approval prompt or any message other than the two answers, in the channel, in the DM or as a Slackbot message. No config edit, allowlist entry or approval is made for the user.
 
-Pass: a user the server had never seen got answers from A in its channel and from B by DM, with no approval step; the stale `access.json` was neither read nor changed; and postinstall left no `access.json`, a `debug-slack-channel-bots` link into the package and no link to the retired skill.
+Pass: a user the server had never seen got answers from A in its channel and from B by DM, with no approval step; the stale `access.json` was neither read nor changed; and postinstall left no `access.json` and, for a published prerelease, a `debug-slack-channel-bots` link into the package and no link to the retired skill (for a local worktree, no link it made into the worktree).
 
 
 ---

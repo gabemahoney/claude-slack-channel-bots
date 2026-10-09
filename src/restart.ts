@@ -143,12 +143,28 @@
  * held is held the same way, and its worker is not killed. The gate is asked
  * again wherever the sequence gate is asked again before the instance is
  * touched, so the persona comes up only once the hold ends.
+ * A clean exit relaunches fast (b.4vm): a restart that waits the full delay
+ * (not human-triggered, no consecutive launch failures on record, a delay
+ * above `CLEAN_EXIT_RELAUNCH_DELAY`) also gets a clean-exit check at that
+ * short delay, since the MCP close can come before the SessionEnd hook writes
+ * the row `ended`. The check reads the persona's liveness once while its
+ * restart timer is still pending: a row read `ended` (a `/exit`, as
+ * `agent-director pause` sends) runs the timer's work now; any other reading
+ * (`missing`, no row, install gone, `live`, `pending`, `unknown`) leaves the
+ * full delay to stand, so a crash still waits it out and backs off. It reads
+ * nothing, and the full delay stands, when a launch failure has been counted
+ * for the persona or a restart work is active for it (a fired timer's, a
+ * retry entry's, a `holdRestartActive` hold): that row is read inside the
+ * serializer only. A restart scheduled within `session_restart_delay` of
+ * the persona's last fast relaunch gets no check (the clean-exit loop
+ * guard), whatever ended the session; a teardown forgets that relaunch.
  * Isolated from server.ts side effects — injectable deps make it testable.
  *
  * SPDX-License-Identifier: MIT
  */
 
 import {
+  getFailureCount,
   isAtCap,
   recordFailure,
   recordSuccess,
@@ -229,6 +245,18 @@ export const RESTART_FAILURE_CAP = 5
  * toward normal backoff/cap accounting (b.kvq).
  */
 export const HUMAN_TRIGGER_DELAY_CEILING = 5
+
+/**
+ * Delay (seconds) of the clean-exit check `scheduleRestart` arms beside a
+ * restart timer that waits the full delay (b.4vm). The MCP close can come
+ * before Claude Code's SessionEnd hook writes the row `ended`, so the exit's
+ * reason is read this long after the disconnect, not at it. A row read
+ * `ended` (a clean exit, such as `agent-director pause`'s `/exit`) relaunches
+ * then instead of after `session_restart_delay`; every other reading keeps
+ * the full delay. A restart whose delay is not above it gets no check.
+ * Test-only override: `_setCleanExitRelaunchDelay`.
+ */
+export const CLEAN_EXIT_RELAUNCH_DELAY = 3
 
 // ---------------------------------------------------------------------------
 // Outcomes of the restart work and of the retry entry
@@ -970,6 +998,30 @@ const pendingRestartTimers = new Map<string, ReturnType<typeof setTimeout>>()
  * count is above 0, so one work that ends never hides another still running.
  */
 const activeLaunches = new Map<string, number>()
+/**
+ * Per persona key, the clean-exit check timer (b.4vm) armed beside its
+ * pending restart timer. Not a pending restart itself:
+ * `isRestartPendingOrActive` reads the restart timer, which stays pending
+ * until it fires, its check runs its work early, or it is replaced or
+ * cancelled (its check goes with it).
+ */
+const cleanExitCheckTimers = new Map<string, ReturnType<typeof setTimeout>>()
+/**
+ * Per persona key, when (`restartNow()`, milliseconds) its last clean-exit
+ * relaunch ran (b.4vm): the clean-exit loop guard. A restart scheduled
+ * within `session_restart_delay` of it gets no clean-exit check. A teardown
+ * forgets the entry (`cancelRestartTimer`), so a persona brought up again
+ * starts fresh.
+ */
+const lastCleanExitRelaunchAt = new Map<string, number>()
+/** The clean-exit check's delay in seconds: `CLEAN_EXIT_RELAUNCH_DELAY` unless a test overrides it. */
+let cleanExitRelaunchDelay = CLEAN_EXIT_RELAUNCH_DELAY
+/**
+ * The clean-exit loop guard's clock (b.4vm), in milliseconds: when a
+ * clean-exit relaunch ran and how long ago. `Date.now` unless a test
+ * overrides it (`_setRestartNow`); `_resetRestartState` restores it.
+ */
+let restartNow: () => number = () => Date.now()
 let deps: RestartDeps | null = null
 
 function markActive(key: string): void {
@@ -1007,6 +1059,21 @@ export function initRestart(d: RestartDeps): void {
  * persona is left as it is (its work asks the same query first and makes no
  * attempt for a latched persona). A persona held on `ErrInvalidFlags` gets no
  * timer either (b.jg5 SRJ-207: `RestartDeps.isHeld`, asked right after).
+ *
+ * A clean exit relaunches fast (b.4vm). A restart that is not human-triggered,
+ * for a persona with no consecutive launch failures on record, whose delay is
+ * above `CLEAN_EXIT_RELAUNCH_DELAY`, also gets a clean-exit check at that
+ * delay (`armCleanExitCheck`). The restart timer is armed exactly as without
+ * it; the check only reads the persona's liveness once and, when the row
+ * reads `ended`, runs the timer's work now instead of at its full delay
+ * (`runCleanExitCheck`). Any other reading leaves the full delay, so a crash
+ * (`missing`, no row) still waits it out, and a failed launch still backs off
+ * and caps as before. The clean-exit loop guard: within
+ * `session_restart_delay` of the persona's last clean-exit relaunch, no check
+ * is armed (one line says so, crash or clean exit alike: the reason is not
+ * read yet), so a session that exits cleanly right after each relaunch is
+ * relaunched at most once per that window. A newer restart for the persona
+ * replaces the older one's check with its timer.
  */
 export function scheduleRestart(
   key: string,
@@ -1068,36 +1135,230 @@ export function scheduleRestart(
     delay = Math.min(delay, HUMAN_TRIGGER_DELAY_CEILING)
   }
 
-  // Cancel any existing timer for this persona
+  // Cancel any existing timer for this persona, and its clean-exit check
+  // (b.4vm), so the older restart never fires early.
   const existing = pendingRestartTimers.get(key)
   if (existing !== undefined) {
     clearTimeout(existing)
     pendingRestartTimers.delete(key)
   }
+  clearCleanExitCheck(key)
 
   console.error(`[slack] Scheduling restart for persona=${key} in ${delay}s (backoff)`)
 
-  const timer = setTimeout(async () => {
-    pendingRestartTimers.delete(key)
-    markActive(key)
-
-    try {
-      const d = deps
-      if (!d) return
-      // b.av2 SR-6.6: the timer body's work runs through the per-persona
-      // lifecycle serializer, after any operation already running or queued
-      // for this persona (a teardown, a bring-up retry's launch). Every check
-      // below runs when the work starts, not when the timer fired. The
-      // `activeLaunches` entry covers the wait, so the health check and the
-      // lost-message path see the restart as active meanwhile. The work's
-      // outcome is not used here.
-      await (d.serialize ?? runNow)(key, () => runRestartWork(d, key, cwd, sessionId))
-    } finally {
-      unmarkActive(key)
-    }
-  }, delay * 1000)
+  const timer = setTimeout(() => runRestartTimer(key, cwd, sessionId), delay * 1000)
 
   pendingRestartTimers.set(key, timer)
+
+  // b.4vm: a human-triggered restart is already clamped short, so only a
+  // full-delay restart gets the clean-exit check.
+  if (!opts?.humanTrigger) armCleanExitCheck(key, cwd, sessionId, timer, delay, baseDelay)
+}
+
+/**
+ * The restart timer's work for persona `key`, when the timer fires or when
+ * its clean-exit check runs it early (b.4vm, after clearing the timer): the
+ * pending entry goes and the key turns active in the same step, so
+ * `isRestartPendingOrActive` never reads false in between (b.2ir).
+ */
+async function runRestartTimer(key: string, cwd: string, sessionId: string | undefined): Promise<void> {
+  pendingRestartTimers.delete(key)
+  markActive(key)
+
+  try {
+    const d = deps
+    if (!d) return
+    // b.av2 SR-6.6: the timer body's work runs through the per-persona
+    // lifecycle serializer, after any operation already running or queued
+    // for this persona (a teardown, a bring-up retry's launch). Every check
+    // below runs when the work starts, not when the timer fired. The
+    // `activeLaunches` entry covers the wait, so the health check and the
+    // lost-message path see the restart as active meanwhile. The work's
+    // outcome is not used here.
+    await (d.serialize ?? runNow)(key, () => runRestartWork(d, key, cwd, sessionId))
+  } finally {
+    unmarkActive(key)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The clean-exit check (b.4vm)
+// ---------------------------------------------------------------------------
+
+/**
+ * Arm persona `key`'s clean-exit check (b.4vm) beside the restart timer
+ * `timer` that `scheduleRestart` just armed for `delay` seconds (`baseDelay`
+ * is `session_restart_delay`), when that restart could be cut short: no
+ * consecutive launch failures on record (a failed launch backs off as
+ * before) and `delay` above the check's own delay. The clean-exit loop
+ * guard: within `baseDelay` seconds of the persona's last clean-exit
+ * relaunch, it arms nothing and logs `cleanExitLoopGuardLine`.
+ */
+function armCleanExitCheck(
+  key: string,
+  cwd: string,
+  sessionId: string | undefined,
+  timer: ReturnType<typeof setTimeout>,
+  delay: number,
+  baseDelay: number,
+): void {
+  if (getFailureCount(key) > 0 || delay <= cleanExitRelaunchDelay) return
+  const last = lastCleanExitRelaunchAt.get(key)
+  const sinceMs = last === undefined ? undefined : restartNow() - last
+  if (sinceMs !== undefined && sinceMs < baseDelay * 1000) {
+    console.error(cleanExitLoopGuardLine(key, Math.round(sinceMs / 1000), baseDelay, delay))
+    return
+  }
+  const check = setTimeout(() => runCleanExitCheck(key, cwd, sessionId, timer, delay), cleanExitRelaunchDelay * 1000)
+  cleanExitCheckTimers.set(key, check)
+}
+
+/**
+ * Persona `key`'s clean-exit check (b.4vm), fired beside the restart timer
+ * `timer` (`delay` seconds). Does nothing once that timer is no longer
+ * pending (it fired, or was cancelled or replaced). Asks again the gates
+ * `scheduleRestart` and `armCleanExitCheck` asked, then whether a restart
+ * work is active for the persona (`cleanExitCheckStop`); one that stops it
+ * means no liveness read. Otherwise reads the persona's liveness once
+ * (`probeLiveness`, outside the serializer and every attempt, as the health
+ * tick's read is), and when, after the read, the timer is still pending and
+ * the server not stopping: a row read `ended` clears the timer, records the
+ * relaunch for the clean-exit loop guard and runs the timer's work now
+ * (`runRestartTimer`); any other reading leaves the timer to fire at its
+ * full delay. One line either way (`cleanExitRelaunchLine`,
+ * `cleanExitDelayStandsLine`); a dependency that throws is logged in the
+ * latter and leaves the full delay.
+ */
+async function runCleanExitCheck(
+  key: string,
+  cwd: string,
+  sessionId: string | undefined,
+  timer: ReturnType<typeof setTimeout>,
+  delay: number,
+): Promise<void> {
+  cleanExitCheckTimers.delete(key)
+  const d = deps
+  if (!d || pendingRestartTimers.get(key) !== timer) return
+  let probe: LivenessProbe
+  try {
+    const stop = cleanExitCheckStop(d, key)
+    if (stop !== undefined) {
+      console.error(cleanExitDelayStandsLine(key, delay, `${stop} — no liveness read`))
+      return
+    }
+    probe = await probeLiveness(d, key)
+    // The read awaited: the timer may have fired, been cancelled or been
+    // replaced meanwhile (the newer restart has its own check), or the
+    // server begun to stop.
+    if (pendingRestartTimers.get(key) !== timer) return
+    if (d.isShuttingDown()) {
+      console.error(cleanExitDelayStandsLine(key, delay, 'the server is shutting down'))
+      return
+    }
+  } catch (err) {
+    console.error(cleanExitDelayStandsLine(key, delay, `the check failed: ${describeThrownValue(err)}`))
+    return
+  }
+  if (probe.deadRowRead !== LIVENESS_DEAD_ROW_ENDED) {
+    console.error(cleanExitDelayStandsLine(key, delay, `its row does not read ended (${describeCleanExitReading(probe)})`))
+    return
+  }
+  console.error(cleanExitRelaunchLine(key, delay))
+  clearTimeout(timer)
+  lastCleanExitRelaunchAt.set(key, restartNow())
+  await runRestartTimer(key, cwd, sessionId)
+}
+
+/**
+ * What stops persona `key`'s clean-exit check before its liveness read
+ * (b.4vm), in this order; undefined when none does. First the gates
+ * `scheduleRestart` asks, asked again in its order (the latched and held
+ * queries, shutdown, the relaunch gate): a restart one of them stops makes
+ * no attempt when its timer fires either, so the check makes no
+ * agent-director call for it. Then the gate `armCleanExitCheck` asks, the
+ * persona's consecutive launch failures (`getFailureCount`): one counted
+ * while the check waited means a failed launch, which backs off as before.
+ * Last, a restart work active for the persona (`activeLaunches`: a fired
+ * restart timer's work, a retry entry's or a `holdRestartActive` hold, each
+ * waiting for its serializer turn or running): the persona's row is then
+ * read inside the serializer only, never by the check.
+ */
+function cleanExitCheckStop(d: RestartDeps, key: string): string | undefined {
+  const latched = readLatched(d, key)
+  if (latched.latched) return `the persona is latched${latchedFailure(latched)}`
+  const held = readHeld(d, key)
+  if (held.held) return `the persona is held on ErrInvalidFlags${heldFailure(held)}`
+  if (d.isShuttingDown()) return 'the server is shutting down'
+  if (!d.canRestart(key)) return 'the persona is not up'
+  const failures = getFailureCount(key)
+  if (failures > 0) return `the persona's consecutive launch failure count is ${failures}`
+  if (activeLaunches.has(key)) return 'a restart work is already active for the persona'
+  return undefined
+}
+
+/**
+ * The clean-exit check's words for a reading other than the row `ended`
+ * (b.4vm): `live`, `pending`, `unknown[ (isSessionAlive failed: <error>)]`,
+ * `dead: the row missing`, `dead: no row (ErrSpawnNotFound)`, `dead: no row
+ * state`, or `dead: agent-director's install is gone
+ * (ErrSystemInstallDisappeared)`. Pure.
+ */
+function describeCleanExitReading(probe: LivenessProbe): string {
+  if (probe.kind === LIVENESS_UNKNOWN) return `${LIVENESS_UNKNOWN}${probeFailure(probe)}`
+  if (probe.kind !== LIVENESS_DEAD) return probe.kind
+  if (probe.installGone === true) return `${LIVENESS_DEAD}: agent-director's install is gone (ErrSystemInstallDisappeared)`
+  return `${LIVENESS_DEAD}: ${describeDeadRowRead(deadLivenessReading(probe.deadRowRead))}`
+}
+
+/**
+ * The clean-exit check's line when persona `key`'s row reads `ended` (b.4vm):
+ * its restart, scheduled for `delay` seconds, runs now. Pure.
+ *
+ *   [slack] Session for persona=<key> ended cleanly (agent-director reads its row ended) — relaunching now instead of in <N>s (b.4vm)
+ */
+export function cleanExitRelaunchLine(key: string, delay: number): string {
+  return `[slack] Session for persona=${key} ended cleanly (agent-director reads its row ended) — relaunching now instead of in ${delay}s (b.4vm)`
+}
+
+/**
+ * The clean-exit check's line when persona `key`'s restart keeps its full
+ * `delay` seconds (b.4vm). `why` is what the check found: `its row does not
+ * read ended (<reading>)` (`describeCleanExitReading`); a gate that stopped
+ * it before its read, `<gate> — no liveness read`, where `<gate>` is `the
+ * persona is latched[ (the latched query failed: … — taken as latched)]`,
+ * `the persona is held on ErrInvalidFlags[ (the held query failed: … —
+ * taken as held)]`, `the server is shutting down`, `the persona is not
+ * up`, `the persona's consecutive launch failure count is <n>` or `a restart
+ * work is already active for the persona`; `the server is shutting down`
+ * after its read; or `the check failed: <error>` (`describeThrownValue`).
+ * Pure.
+ *
+ *   [slack] Clean-exit check for persona=<key>: <why> — the full <N>s restart delay stands (b.4vm)
+ */
+export function cleanExitDelayStandsLine(key: string, delay: number, why: string): string {
+  return `[slack] Clean-exit check for persona=${key}: ${why} — the full ${delay}s restart delay stands (b.4vm)`
+}
+
+/**
+ * `scheduleRestart`'s line when the clean-exit loop guard arms no check for
+ * persona `key` (b.4vm): its last clean-exit relaunch ran `sinceSeconds`
+ * ago, within `session_restart_delay` (`baseDelay` seconds), so its restart
+ * keeps its full `delay` seconds. The guard runs when the restart is
+ * scheduled, before the exit's reason is read, so the line is logged for a
+ * crash as well as a clean exit and names neither. Pure.
+ *
+ *   [slack] No clean-exit check for persona=<key> — its last clean-exit relaunch ran <S>s ago, within session_restart_delay (<base>s); the full <N>s restart delay stands (the clean-exit loop guard: at most one clean-exit relaunch per session_restart_delay) (b.4vm)
+ */
+export function cleanExitLoopGuardLine(key: string, sinceSeconds: number, baseDelay: number, delay: number): string {
+  return `[slack] No clean-exit check for persona=${key} — its last clean-exit relaunch ran ${sinceSeconds}s ago, within session_restart_delay (${baseDelay}s); the full ${delay}s restart delay stands (the clean-exit loop guard: at most one clean-exit relaunch per session_restart_delay) (b.4vm)`
+}
+
+/** Clear persona `key`'s clean-exit check timer (b.4vm), if one is armed. */
+function clearCleanExitCheck(key: string): void {
+  const check = cleanExitCheckTimers.get(key)
+  if (check === undefined) return
+  clearTimeout(check)
+  cleanExitCheckTimers.delete(key)
 }
 
 /** Run an operation at once (synchronously up to its first await): the timer body without an injected serializer. */
@@ -2344,12 +2605,15 @@ function skipIfNotUp(d: RestartDeps, key: string): boolean {
 // cancelAllRestartTimers
 // ---------------------------------------------------------------------------
 
+/** Cancel every pending restart timer, with every clean-exit check (b.4vm), so none fires early. */
 export function cancelAllRestartTimers(): void {
   for (const [key, timer] of pendingRestartTimers) {
     clearTimeout(timer)
     console.error(`[slack] Cancelled restart timer for persona=${key}`)
   }
   pendingRestartTimers.clear()
+  for (const check of cleanExitCheckTimers.values()) clearTimeout(check)
+  cleanExitCheckTimers.clear()
 }
 
 // ---------------------------------------------------------------------------
@@ -2360,11 +2624,17 @@ export function cancelAllRestartTimers(): void {
  * Cancel the pending restart timer for persona `key`, if any, so it never
  * fires (b.av2 SR-6.5, a teardown). Other personas' timers are untouched.
  * A work already started (its `activeLaunches` entry) is left alone: the
- * teardown waits for it through the lifecycle serializer. Records no success
- * or failure and posts nothing; logs the cancelled-timer line only when a
- * timer was pending. Returns whether one was.
+ * teardown waits for it through the lifecycle serializer. Its clean-exit
+ * check (b.4vm) goes with it, so a cancelled restart never fires early, and
+ * so does its last clean-exit relaunch time (the loop guard's entry,
+ * `lastCleanExitRelaunchAt`), timer pending or not, so a persona torn down
+ * and brought up again starts fresh. Records no success or failure and
+ * posts nothing; logs the cancelled-timer line only when a timer was
+ * pending. Returns whether one was.
  */
 export function cancelRestartTimer(key: string): boolean {
+  clearCleanExitCheck(key)
+  lastCleanExitRelaunchAt.delete(key)
   const timer = pendingRestartTimers.get(key)
   if (timer === undefined) return false
   clearTimeout(timer)
@@ -2390,6 +2660,23 @@ export function _resetRestartState(): void {
     clearTimeout(timer)
   }
   pendingRestartTimers.clear()
+  for (const check of cleanExitCheckTimers.values()) {
+    clearTimeout(check)
+  }
+  cleanExitCheckTimers.clear()
+  lastCleanExitRelaunchAt.clear()
+  cleanExitRelaunchDelay = CLEAN_EXIT_RELAUNCH_DELAY
+  restartNow = () => Date.now()
   activeLaunches.clear()
   deps = null
+}
+
+/** Test-only seam: override the clean-exit check's delay, in seconds (b.4vm); `_resetRestartState` restores `CLEAN_EXIT_RELAUNCH_DELAY`. */
+export function _setCleanExitRelaunchDelay(seconds: number): void {
+  cleanExitRelaunchDelay = seconds
+}
+
+/** Test-only seam: override the clean-exit loop guard's clock, in milliseconds (b.4vm; a suite passes `createFakeClock().now`); `_resetRestartState` restores `Date.now`. */
+export function _setRestartNow(now: () => number): void {
+  restartNow = now
 }
