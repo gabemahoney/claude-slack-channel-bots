@@ -204,6 +204,9 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    **Permission prompts or notices don't arrive?** Look for a
    [`persona-destination-failed`](#persona-destination-failed) line for the
    persona.
+   **The message archive stores channel IDs where channel names should be?**
+   See
+   [The message archive shows channel IDs](#the-message-archive-shows-channel-ids-re-install-each-app-to-gain-channelsread-and-groupsread).
 7. **A persona isn't reminded to reply in Slack, or is reminded after being
    opted out?** See
    [A persona isn't reminded to reply](#a-persona-isnt-reminded-to-reply-or-is-reminded-after-opting-out).
@@ -3580,6 +3583,50 @@ registers again with its history. If the new token is refused too, a new
   [Checking a credentials file's shape](#checking-a-credentials-files-shape)
   confirms the file without showing the token. Never ask for, read, print or
   compare a token value in the chat.
+
+---
+
+## The message archive shows channel IDs: re-install each app to gain `channels:read` and `groups:read`
+
+- **Symptom:** with `message_archive_db` set, archived rows carry the channel
+  ID (`C…` or `G…`) in `channel_name` where the channel's name should be,
+  while sender names resolve. Nothing is logged, and every persona keeps
+  serving: only the archive is affected.
+- **Cause:** the archive looks a channel's name up with `conversations.info`,
+  through the Slack app of the persona that received the message. That call
+  needs the `channels:read` bot scope for a public channel and `groups:read`
+  for a private one. An app created, or last installed, from a manifest
+  without them gets `missing_scope`, and the archive stores the channel ID
+  instead.
+- **Every app:** a message received by several personas is stored once, by
+  whichever persona's write comes first, so one app without the scopes can
+  still store a shared channel by ID. Apply the fix to every persona's app.
+- **Fix,** in each app's settings at api.slack.com/apps:
+  1. Add the `channels:read` and `groups:read` bot scopes, either as
+     `- channels:read` and `- groups:read` under `oauth_config.scopes.bot` in
+     the app's own manifest, or under OAuth & Permissions → Bot Token Scopes.
+     Do not paste the shipped `slack-app-manifest.yml` over the app's
+     manifest: that resets the app's name and bot display name to the shipped
+     defaults.
+  2. Click **Reinstall to Workspace** under OAuth & Permissions (Slack
+     prompts for it after a scope change). Until then, the app's bot token
+     keeps its old scopes.
+  3. Check the bot token as **The bot token after the re-install** says under
+     [A persona can't open a DM](#a-persona-cant-open-a-dm-re-install-its-app-to-gain-imwrite).
+- **When names come back:** a running server keeps each channel's name for
+  24 hours, per persona, and a failed lookup is kept as the channel ID. A
+  channel looked up before the re-install keeps getting its ID until those 24
+  hours pass, the persona's lookups start over, or the server is restarted
+  (only on the operator's say-so). A persona's lookups start over when it
+  gets a new Slack client, for example when a confirmed change to its
+  credentials file reconnects it (step 3, if the bot token changed). A
+  channel not looked up yet gets its name at once. Rows already written keep
+  the ID: nothing rewrites them.
+- **DM rows keep their ID, whatever the scopes:** a row from a DM keeps the
+  DM's `D…` ID in `channel_name`, because a DM has no name. A row from a group
+  DM keeps its ID too: looking up a group DM's name needs `mpim:read`, which
+  the shipped manifest does not ask for. Neither is a sign of this problem,
+  and a re-install does not change them.
 
 ---
 

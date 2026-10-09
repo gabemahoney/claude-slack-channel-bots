@@ -22,6 +22,16 @@
 # an earlier version of this manifest must have `im:write` added and then be
 # re-installed to gain it. Until then, opening a DM fails with `missing_scope`.
 #
+# It also grants the `channels:read` (public channels) and `groups:read`
+# (private channels) bot scopes, which a persona needs to look up a channel's
+# name from its ID (`conversations.info`) and to list its channels
+# (`conversations.list`). An app created from an earlier version of this
+# manifest must have `channels:read` and `groups:read` added and then be
+# re-installed ("Reinstall to Workspace" under OAuth & Permissions) to gain
+# them: until then, its bot token keeps its old scopes, both calls fail with
+# `missing_scope`, and the message archive records the channel ID where the
+# channel name should be.
+#
 # Group DMs are deliberately not subscribed: do not add a group-DM event.
 
 _metadata:
@@ -47,6 +57,7 @@ oauth_config:
       - chat:write
       - reactions:write
       - channels:history
+      - channels:read
       - im:history
       - im:write
       - files:read
@@ -54,6 +65,7 @@ oauth_config:
       - users:read
       - app_mentions:read
       - groups:history
+      - groups:read
 
 settings:
   event_subscriptions:

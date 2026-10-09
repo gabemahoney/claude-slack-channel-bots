@@ -6,6 +6,14 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+### Two new Slack bot scopes: `channels:read` and `groups:read`
+
+`slack-app-manifest.yml` now asks for `channels:read` (public channels) and `groups:read` (private channels). The message archive (`message_archive_db`) needs them to look up a channel's name from its ID. Without them, Slack refuses the lookup with `missing_scope`, and the archive stores the channel ID where the name should be. Nothing is logged.
+
+- **Add both scopes to each persona's Slack app, then re-install it.** An app created from an earlier manifest keeps its old scopes, and its bot token gains the new ones only at a re-install. At api.slack.com/apps, add `channels:read` and `groups:read` under OAuth & Permissions → Bot Token Scopes, or under `oauth_config.scopes.bot` in the app's own manifest. Then click **Reinstall to Workspace** under OAuth & Permissions. Pasting the shipped manifest over the app's own resets the app's name and bot display name. The `debug-slack-channel-bots` skill has the steps under "The message archive shows channel IDs".
+- **Until then, the archive stores channel IDs.** Rows already written keep the ID; nothing rewrites them.
+- **A running server may keep storing the ID for up to 24 hours.** It caches each channel's name for 24 hours, and a failed lookup is cached as the ID. A channel looked up before the re-install keeps getting its ID until those 24 hours pass, the server restarts, or the persona gets a new Slack client, which starts its lookups over (for example when a confirmed change to its credentials file reconnects it). A channel not looked up yet gets its name at once.
+
 ---
 
 ## 0.12.0 (2026-10-07)
