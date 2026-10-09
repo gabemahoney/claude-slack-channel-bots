@@ -35,7 +35,12 @@ import {
 import { tmpdir } from 'os'
 import { join } from 'path'
 
-import { createCronScheduler, type SchedulerClock } from '../src/cron-scheduler.ts'
+import {
+  createCronScheduler,
+  crontableReloadedLine,
+  noPersonaListWarning,
+  type SchedulerClock,
+} from '../src/cron-scheduler.ts'
 import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
 import { createCronLog } from '../src/cron-log.ts'
 import type { CronSchedule } from '../src/crontable.ts'
@@ -173,6 +178,13 @@ const kindOf = (kind: string): LogLine[] => readLog().filter((l) => l.kind === k
 const reloadLines = (): LogLine[] =>
   kindOf('info').filter((l) => l.detail.startsWith('crontable reloaded,'))
 
+/** The 1-based line number of `rawLine` in the crontable as currently written. */
+function fileLineNumberOf(rawLine: string): number {
+  const index = readFileSync(cronTablePath, 'utf-8').split('\n').indexOf(rawLine)
+  if (index < 0) throw new Error(`line not in the crontable: ${rawLine}`)
+  return index + 1
+}
+
 /** Build a scheduler wired to a real cron-log against the temp files. */
 function build(clock: ManualClock, dispatcher: CronDispatcher) {
   return createCronScheduler({
@@ -214,7 +226,7 @@ describe('cron-scheduler reload — crontable edits between ticks', () => {
 
     expect(dispatcher.paths()).toEqual(['/p/a.md', '/p/a.md', '/p/b.md'])
     expect(reloadLines()).toHaveLength(1)
-    expect(reloadLines()[0]!.detail).toBe('crontable reloaded, 2 schedules')
+    expect(reloadLines()[0]!.detail).toBe(crontableReloadedLine(2, 0))
   })
 
   test('a line REMOVED between ticks never fires again', async () => {
@@ -336,6 +348,63 @@ describe('cron-scheduler reload — unparseable content', () => {
 })
 
 // ===========================================================================
+// A line with no persona list (b.n4n) — warned once per load, counted on the
+// reload line
+// ===========================================================================
+
+describe('cron-scheduler reload — line with no persona list', () => {
+  test('a reload that ADDS one warns once naming it and counts it, unchanged ticks stay quiet, each later load states the count again', async () => {
+    const clock = makeClock(START)
+    const { dispatcher, scheduler } = startWith(clock, line(everyMinute, '/p/a.md'))
+
+    await scheduler.tick()
+    expect(kindOf('warn')).toEqual([])
+
+    const noPersonas = `${everyMinute} /p/grooming.md`
+    writeTable(clock, line(everyMinute, '/p/a.md'), noPersonas)
+    clock.advanceMinutes(1)
+    await scheduler.tick()
+
+    const expectedWarn: LogLine = {
+      identity: 'cscb-cron:grooming',
+      channel: '-',
+      kind: 'warn',
+      detail: noPersonaListWarning(fileLineNumberOf(noPersonas), '/p/grooming.md'),
+    }
+    expect(kindOf('warn')).toEqual([expectedWarn])
+    expect(reloadLines().map((l) => l.detail)).toEqual([crontableReloadedLine(2, 1)])
+    // The warn changes no dispatch: the line is still handed to the dispatcher.
+    expect(dispatcher.paths()).toEqual(['/p/a.md', '/p/a.md', '/p/grooming.md'])
+
+    // Two ticks with the file UNCHANGED: no re-parse, so no second warn and no
+    // second reload line.
+    for (const _ of [1, 2]) {
+      clock.advanceMinutes(1)
+      await scheduler.tick()
+    }
+    expect(kindOf('warn')).toEqual([expectedWarn])
+    expect(reloadLines()).toHaveLength(1)
+
+    // An edit that keeps the line is a new load: it is warned again. An edit
+    // that drops it warns nothing and states 0 undeliverable.
+    writeTable(clock, line(everyMinute, '/p/a.md'), noPersonas, line(everyMinute, '/p/b.md'))
+    clock.advanceMinutes(1)
+    await scheduler.tick()
+    expect(kindOf('warn')).toEqual([expectedWarn, expectedWarn])
+
+    writeTable(clock, line(everyMinute, '/p/a.md'))
+    clock.advanceMinutes(1)
+    await scheduler.tick()
+    expect(kindOf('warn')).toHaveLength(2)
+    expect(reloadLines().map((l) => l.detail)).toEqual([
+      crontableReloadedLine(2, 1),
+      crontableReloadedLine(3, 1),
+      crontableReloadedLine(1, 0),
+    ])
+  })
+})
+
+// ===========================================================================
 // Non-ENOENT read failure — keep the current schedules (PM-required case)
 // ===========================================================================
 
@@ -438,13 +507,13 @@ describe('cron-scheduler reload — crontable deleted mid-run', () => {
     const created = kindOf('info').filter((l) => l.detail.includes('re-created'))
     expect(created).toHaveLength(1)
     expect(created[0]!.detail).toBe(`crontable re-created at ${cronTablePath} after deletion`)
-    expect(reloadLines().map((l) => l.detail)).toEqual(['crontable reloaded, 0 schedules'])
+    expect(reloadLines().map((l) => l.detail)).toEqual([crontableReloadedLine(0, 0)])
     // Still zero fires, and the vanish warn did not repeat across the passes.
     expect(dispatcher.paths()).toEqual(['/p/a.md'])
     expect(kindOf('warn')).toHaveLength(1)
   })
 
-  test('EEXIST race: a file restored before the re-create pass is left byte-intact and its schedules fire', async () => {
+  test('EEXIST race: a file restored before the re-create pass is left byte-intact, its schedules fire, and its line with no persona list is warned and counted', async () => {
     const clock = makeClock(START)
     const { dispatcher, scheduler } = startWith(clock, line(everyMinute, '/p/a.md'))
 
@@ -456,7 +525,8 @@ describe('cron-scheduler reload — crontable deleted mid-run', () => {
 
     // Someone else restores the file BEFORE the scheduler's re-create pass — the
     // bootstrap's exclusive create loses the race with EEXIST.
-    const restored = CRONTABLE_TEMPLATE_HEADER + line(everyMinute, '/p/restored.md') + '\n'
+    const noPersonas = `${everyMinute} /p/grooming.md`
+    const restored = CRONTABLE_TEMPLATE_HEADER + line(everyMinute, '/p/restored.md') + '\n' + noPersonas + '\n'
     writeFileSync(cronTablePath, restored)
     touch(clock)
 
@@ -468,8 +538,18 @@ describe('cron-scheduler reload — crontable deleted mid-run', () => {
     // No re-create INFO — nothing was created.
     expect(kindOf('info').filter((l) => l.detail.includes('re-created'))).toHaveLength(0)
     // The restored content loaded and fired.
-    expect(dispatcher.paths()).toEqual(['/p/a.md', '/p/restored.md'])
-    expect(reloadLines().map((l) => l.detail)).toEqual(['crontable reloaded, 1 schedules'])
+    expect(dispatcher.paths()).toEqual(['/p/a.md', '/p/restored.md', '/p/grooming.md'])
+    // This load warns the no-persona-list line once (after the one vanish
+    // warn above), and the re-create pass's reload line counts it.
+    expect(kindOf('warn').slice(1)).toEqual([
+      {
+        identity: 'cscb-cron:grooming',
+        channel: '-',
+        kind: 'warn',
+        detail: noPersonaListWarning(fileLineNumberOf(noPersonas), '/p/grooming.md'),
+      },
+    ])
+    expect(reloadLines().map((l) => l.detail)).toEqual([crontableReloadedLine(2, 1)])
   })
 
   test('a PERSISTENT re-create failure (parent directory gone) stays silent: still ONE warn, no re-create, nothing fires', async () => {

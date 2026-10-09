@@ -30,6 +30,13 @@
  * it via the bootstrap. Errors are latched so a persistent condition warns once,
  * not once a minute.
  *
+ * Undeliverable lines (b.n4n): a line with no persona list (the all-bots form)
+ * loads and matches, but all-bots fan-out is not built, so it can never be
+ * delivered in this version. Every load (start() and each reload) writes one
+ * WARN per such line, and both load lines carry the undeliverable count, so the
+ * gap shows at load time and not only as the dispatcher's fire-time
+ * fanout-deferred record. An unchanged file is not reloaded, so it stays quiet.
+ *
  * At-most-once is a LOGGED ASSERTION, not the mechanism (decision 8): the
  * minute-aligned single-pass loop already makes a double-fire structurally
  * impossible; the Map<schedule instance, epoch minute> exists only to catch a
@@ -156,6 +163,68 @@ interface CompiledSchedule {
 }
 
 // ---------------------------------------------------------------------------
+// Undeliverable lines and the load log lines (b.n4n)
+// ---------------------------------------------------------------------------
+
+/**
+ * The README section that documents the crontable line format. The no-persona-
+ * list warning points there, not at the file's own comment header: the server
+ * never rewrites an existing crontable (cron-bootstrap.ts), so a crontable
+ * created by an older version keeps an out-of-date header for good.
+ */
+const CRONTABLE_FORMAT_README_SECTION = 'Crontable format'
+
+/**
+ * True for a schedule that can never be delivered in this version: a line with
+ * no persona list (the all-bots form). It parses, loads and matches, but
+ * all-bots fan-out is not built, so the dispatcher logs each of its fires
+ * `fanout-deferred` and drops it.
+ */
+function isUndeliverable(schedule: CronSchedule): boolean {
+  return schedule.targets.kind === 'all-bots'
+}
+
+/** How many loaded schedules are undeliverable (see isUndeliverable). */
+function countUndeliverable(entries: readonly CompiledSchedule[]): number {
+  return entries.filter((entry) => isUndeliverable(entry.schedule)).length
+}
+
+/**
+ * The WARN text for one crontable line with no persona list, written once per
+ * load (at start() and at each reload, never on an unchanged tick). It carries
+ * the whole message on its own, whatever the file's header says.
+ */
+export function noPersonaListWarning(lineNumber: number, promptPath: string): string {
+  return (
+    `line=${lineNumber} prompt=${promptPath} undeliverable: this crontable line names no personas, ` +
+    `so it will never be delivered in this version (all-bots fan-out is not built: each fire is ` +
+    `logged fanout-deferred and dropped). Add a persona list (persona names or keys, comma-separated, ` +
+    `after the prompt path) to deliver it. The README section "${CRONTABLE_FORMAT_README_SECTION}" is ` +
+    `the reference for the line format; a crontable created by an older version may carry an ` +
+    `out-of-date header.`
+  )
+}
+
+/** start()'s one started marker (the PD-4 outage-window marker). */
+export function schedulerStartedLine(loaded: number, undeliverable: number): string {
+  return `scheduler started, ${loaded} schedules loaded${undeliverableSuffix(undeliverable)}`
+}
+
+/** The tick reload's INFO line (never written by start()). */
+export function crontableReloadedLine(loaded: number, undeliverable: number): string {
+  return `crontable reloaded, ${loaded} schedules${undeliverableSuffix(undeliverable)}`
+}
+
+/**
+ * The undeliverable count both load lines carry. Written even when it is 0, so
+ * every load states it and the schedule count can never pass off a line that
+ * will never deliver as a healthy one.
+ */
+function undeliverableSuffix(undeliverable: number): string {
+  return `, ${undeliverable} undeliverable (no persona list)`
+}
+
+// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
@@ -243,10 +312,16 @@ export function createCronScheduler(deps: CronSchedulerDeps): CronScheduler {
    * ticks — and NEVER on a failed read (which also leaves `compiled` untouched,
    * so a mid-run read failure keeps the current schedules firing).
    *
+   * It is also the ONLY place a line with no persona list is warned about
+   * (one WARN per such line per load, as with parse errors), and it returns
+   * the undeliverable count for the callers' load lines (b.n4n).
+   *
    * It deliberately does NOT log the "crontable reloaded" INFO: that line
    * belongs to the tick-reload caller only, so start() never emits it.
    */
-  function loadAndSwap(stat: Stats): { ok: true; count: number } | { ok: false; missing: boolean; cause: string } {
+  function loadAndSwap(
+    stat: Stats,
+  ): { ok: true; count: number; undeliverable: number } | { ok: false; missing: boolean; cause: string } {
     let text: string
     try {
       text = readFileSync(cronTablePath, 'utf-8')
@@ -284,8 +359,22 @@ export function createCronScheduler(deps: CronSchedulerDeps): CronScheduler {
         )
       }
     }
+    // Each loaded line with no persona list → one WARN naming it (identity in
+    // the identity field, target '-'): it loads and matches but can never be
+    // delivered in this version. Emitted once per load, like parse errors, so
+    // an unchanged file stays quiet. The fire-time fanout-deferred record is
+    // the dispatcher's and is unchanged.
+    for (const { schedule } of next) {
+      if (!isUndeliverable(schedule)) continue
+      cronLog.warn(
+        clock.now().toISOString(),
+        noPersonaListWarning(schedule.lineNumber, schedule.promptPath),
+        schedule.identity,
+      )
+    }
+
     compiled = next
-    return { ok: true, count: compiled.length }
+    return { ok: true, count: compiled.length, undeliverable: countUndeliverable(compiled) }
   }
 
   // -------------------------------------------------------------------------
@@ -334,10 +423,11 @@ export function createCronScheduler(deps: CronSchedulerDeps): CronScheduler {
         )
       }
 
-      // (3) Exactly ONE started marker (PD-4 outage-window marker).
+      // (3) Exactly ONE started marker (PD-4 outage-window marker), with the
+      // count of loaded lines that can never be delivered (b.n4n).
       cronLog.info(
         clock.now().toISOString(),
-        `scheduler started, ${compiled.length} schedules loaded`,
+        schedulerStartedLine(compiled.length, countUndeliverable(compiled)),
       )
 
       // (4) Arm the tick.
@@ -426,7 +516,7 @@ export function createCronScheduler(deps: CronSchedulerDeps): CronScheduler {
       return
     }
     readErrorLatched = false
-    cronLog.info(clock.now().toISOString(), `crontable reloaded, ${loaded.count} schedules`)
+    cronLog.info(clock.now().toISOString(), crontableReloadedLine(loaded.count, loaded.undeliverable))
   }
 
   /**
@@ -486,7 +576,7 @@ export function createCronScheduler(deps: CronSchedulerDeps): CronScheduler {
     }
     vanished = false
     readErrorLatched = false
-    cronLog.info(clock.now().toISOString(), `crontable reloaded, ${loaded.count} schedules`)
+    cronLog.info(clock.now().toISOString(), crontableReloadedLine(loaded.count, loaded.undeliverable))
   }
 
   // -------------------------------------------------------------------------

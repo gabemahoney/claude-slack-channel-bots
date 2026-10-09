@@ -30,6 +30,15 @@ A persona whose session ends cleanly (an `agent-director pause`, which types `/e
 - **`session_restart_delay` set to `0` still turns auto-restart off,** clean exits included.
 - **Three new `server.log` lines,** each ending in `(b.4vm)`: `[slack] Session for persona=<key> ended cleanly`, `[slack] Clean-exit check for persona=<key>` and `[slack] No clean-exit check for persona=<key>`. See "Session not restarting after crash" under [Troubleshooting](README.md#troubleshooting) in the README.
 
+### A crontable line with no persona list is warned at load
+
+A crontable line with no persona list is never delivered: all-bots delivery is not built. Before, the only sign was a `fanout-deferred` line in `cron.log` each time it fired.
+
+- **Each load now warns about it.** At start and after each edit to the crontable, `cron.log` gets one `warn` line per such line, with `line=<n> prompt=<path> undeliverable:` and how to fix it. An unchanged crontable is not reloaded, so the warning is not repeated each minute.
+- **The load lines now count them.** They read `scheduler started, N schedules loaded, M undeliverable (no persona list)` and `crontable reloaded, N schedules, M undeliverable (no persona list)`, with `M` written even when it is 0. Update anything that matches the whole old line.
+- **Add a persona list to each line the warning names.** Run `grep undeliverable ~/.claude/channels/slack/cron.log` (the default `cron_log_path`) to list them. See [The cron log](README.md#the-cron-log).
+- **Replace an old crontable header by hand.** The server never rewrites an existing crontable, so a crontable created by an earlier release keeps its header. A header from before 0.11.0 says that leaving out the target list reaches all bots. Replace its comment block with the header in [Crontable format](README.md#crontable-format).
+
 ---
 
 ## 0.12.0 (2026-10-07)

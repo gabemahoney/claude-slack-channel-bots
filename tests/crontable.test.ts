@@ -78,6 +78,7 @@ describe('valid lines', () => {
     expect(s.targets).toEqual({ kind: 'explicit', targets: ['alpha', 'beta_1234abcd'] })
     // Raw line preserved verbatim (downstream at-most-once keys on it).
     expect(s.rawLine).toBe(line)
+    expect(s.lineNumber).toBe(1)
   })
 
   test('single explicit target parses to a one-element list', () => {
@@ -160,13 +161,26 @@ describe('silently skipped lines', () => {
     expect(errors).toEqual([])
   })
 
-  test('comment/blank lines do not shift line numbers of real errors', () => {
-    const text = ['# header', '', 'bogus line', '   ', makeLine()].join('\n')
+  test('comment/blank lines do not shift line numbers of real errors or schedules', () => {
+    const text = [
+      '# header',
+      '',
+      'bogus line',
+      '   ',
+      makeLine({ path: '~/a.md' }),
+      '# note',
+      makeLine({ path: '~/b.md' }),
+    ].join('\n')
     const { schedules, errors } = parseCrontable(text)
-    expect(schedules).toHaveLength(1)
     expect(errors).toHaveLength(1)
     // 'bogus line' is the 3rd source line (1-based).
     expect(errors[0]!.lineNumber).toBe(3)
+    // The schedules are the 5th and 7th source lines: every line counts, not
+    // only the data lines (the scheduler's load warning names this number).
+    expect(schedules.map((s) => [s.promptPath, s.lineNumber])).toEqual([
+      ['~/a.md', 5],
+      ['~/b.md', 7],
+    ])
   })
 })
 
@@ -263,12 +277,14 @@ describe('bad-line classes', () => {
 // ---------------------------------------------------------------------------
 
 describe('duplicate lines', () => {
-  test('two identical lines both produce schedule records', () => {
+  test('two identical lines both produce schedule records, equal but for their line numbers', () => {
     const line = makeLine()
     const { schedules, errors } = parseCrontable([line, line].join('\n'))
     expect(errors).toEqual([])
     expect(schedules).toHaveLength(2)
-    expect(schedules[0]).toEqual(schedules[1]!)
+    const [{ lineNumber: first, ...a }, { lineNumber: second, ...b }] = schedules as [CronSchedule, CronSchedule]
+    expect(a).toEqual(b)
+    expect([first, second]).toEqual([1, 2])
   })
 })
 

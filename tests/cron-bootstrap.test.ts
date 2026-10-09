@@ -9,6 +9,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { CRONTABLE_TEMPLATE_HEADER, ensureCrontableExists } from '../src/cron-bootstrap.ts'
+import { noPersonaListWarning } from '../src/cron-scheduler.ts'
 import { parseCrontable } from '../src/crontable.ts'
 
 // ---------------------------------------------------------------------------
@@ -112,10 +113,17 @@ describe('ensureCrontableExists — non-EEXIST fs error', () => {
 /** Shape of a Slack channel, group or DM ID (e.g. C0123ABC), which the header must not use as a target. */
 const SLACK_ID_SHAPE = /\b[CDG][A-Z0-9]{6,}\b/
 
-/** The header's example data lines: the line after each `# Example` line, uncommented. */
-function headerExampleLines(): string[] {
+/** The header's examples: each `# Example` label line and the data line after it, uncommented. */
+function headerExamples(): Array<{ label: string; line: string }> {
   const lines = CRONTABLE_TEMPLATE_HEADER.split('\n')
-  return lines.flatMap((l, i) => (l.startsWith('# Example') ? [lines[i + 1]!.replace(/^#\s*/, '')] : []))
+  return lines.flatMap((l, i) =>
+    l.startsWith('# Example') ? [{ label: l, line: lines[i + 1]!.replace(/^#\s*/, '') }] : [],
+  )
+}
+
+/** The header's example data lines. */
+function headerExampleLines(): string[] {
+  return headerExamples().map((e) => e.line)
 }
 
 describe('CRONTABLE_TEMPLATE_HEADER — parser integration', () => {
@@ -135,6 +143,18 @@ describe('CRONTABLE_TEMPLATE_HEADER — parser integration', () => {
     const targets = explicit.kind === 'explicit' ? explicit.targets : []
     expect(targets.length).toBeGreaterThan(1)
     for (const t of targets) expect(t).not.toMatch(SLACK_ID_SHAPE)
+  })
+
+  test('token 7 carries the caveat that a line with no persona list is not delivered yet', () => {
+    expect(CRONTABLE_TEMPLATE_HEADER).toContain('All-bots fan-out is not delivered yet')
+  })
+
+  test('no example presents a line with no persona list as delivered: each such example is labelled NOT delivered yet (b.n4n)', () => {
+    const undelivered = headerExamples().filter(
+      (e) => parseCrontable(e.line).schedules[0]?.targets.kind === 'all-bots',
+    )
+    expect(undelivered).not.toEqual([])
+    for (const e of undelivered) expect(e.label).toContain('NOT delivered yet')
   })
 
   test('mentions CSCB_PERSONA for self-targeting', () => {
@@ -186,6 +206,17 @@ describe('README / CRONTABLE_TEMPLATE_HEADER drift guard', () => {
 
   test('Scheduled Prompts H2 section is present (fact assertions are scoped to it)', () => {
     expect(schedStart).toBeGreaterThanOrEqual(0)
+  })
+
+  test('the README section the no-persona-list warning names is a heading in the Scheduled Prompts section (b.n4n)', () => {
+    // The warning points there because an old crontable's own header may be
+    // out of date; a renamed heading would leave it pointing at nothing.
+    const section = /README section "([^"]+)"/.exec(noPersonaListWarning(1, '/p/a.md'))?.[1]
+    expect(section).toBeDefined()
+    const headings = SCHEDULED_SECTION.split('\n')
+      .filter((l) => /^#{2,6} /.test(l))
+      .map((l) => l.replace(/^#+ /, ''))
+    expect(headings).toContain(section!)
   })
 })
 

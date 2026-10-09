@@ -64,7 +64,7 @@ export const CRONTABLE_TEMPLATE_HEADER = `# CSCB crontable — scheduled prompts
 # Example (every day at 09:00, run grooming-tick.md, target two personas):
 #   0 9 * * * /home/horde/prompts/grooming-tick.md planner,reviewer
 #
-# Example (every hour on the hour, run standup.md, target all bots):
+# Example (every hour, run standup.md, no persona list — NOT delivered yet):
 #   0 * * * * /home/horde/prompts/standup.md
 `
 

@@ -75,6 +75,8 @@ export interface CronSchedule {
   targets: CronTargets
   /** The raw line text, verbatim (downstream at-most-once keying depends on it). */
   rawLine: string
+  /** 1-based line number in the source text (the scheduler's load warnings name it). */
+  lineNumber: number
 }
 
 /** A single bad line that could not be parsed. */
@@ -192,6 +194,7 @@ function parseLine(rawLine: string, lineNumber: number): LineOutcome {
       promptPath,
       targets,
       rawLine,
+      lineNumber,
     },
   }
 }

@@ -1331,7 +1331,7 @@ On first boot the server auto-creates the crontable with this self-documenting h
 # Example (every day at 09:00, run grooming-tick.md, target two personas):
 #   0 9 * * * /home/horde/prompts/grooming-tick.md planner,reviewer
 #
-# Example (every hour on the hour, run standup.md, target all bots):
+# Example (every hour, run standup.md, no persona list — NOT delivered yet):
 #   0 * * * * /home/horde/prompts/standup.md
 ```
 
@@ -1346,7 +1346,7 @@ Rules:
 - **Exactly 5 cron fields** (minute hour day-of-month month day-of-week). Croner's 6-field (seconds-precision) and `@macro` forms are **not** supported.
 - **Name each persona by its name or its key.** A persona named twice — by name, by key, or both — receives the prompt once.
 - **Use the key for a name with whitespace or a comma.** Such a name cannot be written in a crontable line.
-- **Omit the persona list to target ALL bots** — the omission itself is the all-bots form. (All-bots delivery is currently deferred — see [Delivery semantics](#delivery-semantics).)
+- **Give every line a persona list.** A line with no persona list is the all-bots form, and all-bots delivery is not built yet: the line loads, but each load logs a `warn` naming it and each fire is dropped (see [The cron log](#the-cron-log)).
 - **No `*` wildcard in the persona position.** A literal `*` where a persona belongs is a parse error, not "all personas".
 - **Prompt paths cannot contain spaces.** A path with spaces is unrepresentable; the extra tokens make the line a parse error and it is skipped.
 - **`#` comments and blank lines are allowed** and ignored.
@@ -1362,7 +1362,7 @@ Here the 6th field (`1`) is taken as the prompt path and the real path (`~/promp
 
 **Upgrading a crontable that names channels.** The server never rewrites an existing crontable, so channel-ID targets are not converted. Once your config defines personas, a Slack channel ID no longer names a bot, so edit each such line to a persona name or key; until you do, the target logs `unknown-persona`.
 
-An existing crontable also keeps its old comment header, which still tells bots to write channel IDs. Replace that comment block by hand with the header shown above.
+An existing crontable also keeps its old comment header, which still tells bots to write channel IDs and to leave out the target list to reach all bots. Replace that comment block by hand with the header shown above. This section is the reference for the line format, whatever a crontable's own header says.
 
 ### Path resolution
 
@@ -1390,18 +1390,32 @@ The `outcome` field of each line is one of these classes:
 | `prompt-missing` | The prompt file did not exist at fire time. | Create the file or correct its path in the crontable. |
 | `prompt-unreadable` | The prompt file existed but could not be read (see the `errno`). | Fix file permissions or the path. |
 | `prompt-oversize` | The prompt exceeds the 32KB `/interject` cap and was skipped, never truncated. | Shorten the prompt file. |
-| `parse-error` | The crontable line could not be parsed. | Fix the line — see the crontable header for the format. |
+| `parse-error` | The crontable line could not be parsed. | Fix the line — see [Crontable format](#crontable-format). |
 | `http-error` | The localhost POST hit an unexpected HTTP status or a network failure. | Check that the server is listening on loopback (see the `bind` note below) and inspect the `errno`/`status` in the line. |
-| `fanout-deferred` | A line with no persona list (all-bots) was matched but not delivered. | None — all-bots fan-out is not yet enabled; give the line an explicit persona to deliver it today. |
+| `fanout-deferred` | A line with no persona list (all-bots) was matched but not delivered. | Add a persona list to the line — all-bots delivery is not built yet. |
+
+Each load of the crontable, at start and after each edit, writes one line with its counts. At start it is `scheduler started, N schedules loaded, M undeliverable (no persona list)`; after an edit it is `crontable reloaded, N schedules, M undeliverable (no persona list)`. `M` counts the lines that will never be delivered, and it is written even when it is 0.
+
+Each load also writes one `warn` line for each line with no persona list, naming its line number in the file and its prompt path:
+
+```text
+2026-10-09T15:12:00.002Z cscb-cron:grooming - warn line=34 prompt=/home/horde/prompts/grooming.md undeliverable: this crontable line names no personas, so it will never be delivered in this version …
+```
+
+Add a persona list to that line. The warning comes back at every start and every edit until you do; an unchanged crontable is not reloaded, so it is not repeated each minute. To list them in the cron log at its default location:
+
+```sh
+grep undeliverable ~/.claude/channels/slack/cron.log
+```
 
 ### Delivery semantics
 
 - **No retry.** A failed fire is logged and dropped — never queued or re-sent. A persona that is not up, or has no live session, fails every fire until it is up and its session is running again; the server does not queue the missed prompts.
-- **Missed fires are skipped, not caught up.** While the server is down, no scheduled prompts fire, and they are not replayed on restart. The `scheduler started, N schedules loaded` line in the cron log marks when scheduling resumed, bounding the outage window.
+- **Missed fires are skipped, not caught up.** While the server is down, no scheduled prompts fire, and they are not replayed on restart. The `scheduler started, N schedules loaded, M undeliverable (no persona list)` line in the cron log marks when scheduling resumed, bounding the outage window.
 - **Edits take effect within a minute — no restart.** The scheduler checks the crontable fresh on every tick, so an edit by hand or a line appended by a bot starts (or stops) firing within about a minute. The server is never restarted for a schedule change.
 - **Deleting the crontable stops all schedules.** Nothing fires from that moment, a WARN appears in the cron log, and the server re-creates the file empty (with its header) within about two minutes — detection and re-creation happen on separate once-a-minute passes, so the re-create lands up to two tick boundaries after the deletion. Add lines back and they schedule on the next check.
 - **Server-local time.** Cron expressions are evaluated in the server's local timezone.
-- **Lines without a persona list are deferred.** A line with no persona list is currently matched but logged `fanout-deferred` and not delivered. Give a line an explicit persona to have it fire.
+- **A line without a persona list is never delivered.** Each load logs a `warn` naming it and counts it undeliverable; each time it matches, it is logged `fanout-deferred` and dropped. Give the line a persona list to have it fire.
 - **`bind` must include loopback.** The scheduler delivers via `127.0.0.1`, so a `bind` set to a single non-loopback interface makes every fire fail with `http-error`. Use the default `127.0.0.1` or `0.0.0.0`.
 
 ### Bot self-scheduling

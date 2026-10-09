@@ -220,6 +220,7 @@ function explicitSchedule(
     promptPath,
     targets: { kind: 'explicit', targets },
     rawLine: `* * * * * ${promptPath} ${targets.join(',')}`,
+    lineNumber: 1,
   }
 }
 
@@ -230,6 +231,7 @@ function allBotsSchedule(promptPath: string, identity = 'cscb-cron:test'): CronS
     promptPath,
     targets: { kind: 'all-bots' },
     rawLine: `* * * * * ${promptPath}`,
+    lineNumber: 1,
   }
 }
 
