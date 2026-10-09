@@ -1361,8 +1361,8 @@ const OUTCOME_ROWS: ReadonlyArray<readonly [string, OutcomeRow]> = [
     {
       ciArgs: [],
       files: (h) => ({ status: reportRunningStatus(h) }),
-      verdict: 'FAIL: test-23-fmk-latch-recheck.sh: wall-time limit of 84 min exceeded in shard-2',
-      typedLines: (runDir) => ['FAIL: test-23-fmk-latch-recheck.sh: wall-time limit of 84 min exceeded in shard-2', `results: ${runDir}`],
+      verdict: `FAIL: ${realScriptFileName(23)}: wall-time limit of 84 min exceeded in shard-2`,
+      typedLines: (runDir) => [`FAIL: ${realScriptFileName(23)}: wall-time limit of 84 min exceeded in shard-2`, `results: ${runDir}`],
       typedExit: 1,
       builtLines: (runDir, verdict) => [verdict, reader.resultsLine(runDir)],
       exportedExit: reader.REPORT_EXIT_FAIL,
@@ -2004,15 +2004,13 @@ describe('the stop verb (b.uqm SR-17.6)', () => {
 // outcome block's; this block asserts masking, removal and their order. Its
 // run files and expected lines come from that block's helpers.
 
-/** Test data, not a reader constant: the raw Anthropic key's prefix (b.uqm SR-15.1), as tests/ci-run-interface.test.ts holds it. */
-const READER_RAW_KEY_PREFIX = 'sk-ant-'
 /** A gateway's URL beside a gateway key: test data. */
 const READER_GATEWAY_URL = 'https://gateway.example.invalid'
 
 /** The secret values the redaction cases plant, each from `fakeToken` with its own suffix (b.uqm SR-21.2), and one cut too short from a built one. */
 function readerSecrets(): { rawKey: string; gatewayKey: string; ghToken: string; baseBuildToken: string; tooShort: string } {
   return {
-    rawKey: fakeToken(READER_RAW_KEY_PREFIX, 'raw'),
+    rawKey: fakeToken(runner.RAW_KEY_PREFIX, 'raw'),
     gatewayKey: fakeToken('gw-', 'gateway'),
     ghToken: fakeToken('', 'gh'),
     baseBuildToken: fakeToken('', 'base-build'),

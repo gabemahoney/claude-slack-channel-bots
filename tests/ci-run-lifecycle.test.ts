@@ -1337,12 +1337,6 @@ describe('E1: ci-run lifecycle', () => {
       return line.split(':')
     }
 
-    /** Waits, by the wall clock, until the file system's coarse timestamps have moved past `path`'s change time, so a later change shows as a new ctime. */
-    function pastTimestampGranularity(path: string): void {
-      const ctimeMs = lstatSync(path).ctimeMs
-      while (Date.now() <= ctimeMs + 25) Bun.sleepSync(5)
-    }
-
     test('a permission change shows with the option', () => {
       const { tree, file } = makeTree()
       const before = treeSnapshot(tree, { extended: true })
@@ -1353,14 +1347,16 @@ describe('E1: ci-run lifecycle', () => {
     })
 
     test('a change-time change, content and modification time kept, shows with the option', () => {
+      // No wall-clock wait for the file system's coarse timestamps: the
+      // field is checked against the entry's own change time on each side.
       const { tree, file } = makeTree()
-      pastTimestampGranularity(file)
       const before = fieldsOf(treeSnapshot(tree, { extended: true }), 'a.txt')
+      expect(before[5]).toBe(String(lstatSync(file).ctimeMs))
       const other = join(dirname(tree), 'extra-link')
       linkSync(file, other)
       unlinkSync(other)
       const after = fieldsOf(treeSnapshot(tree, { extended: true }), 'a.txt')
-      expect(after[5]).not.toBe(before[5])
+      expect(after[5]).toBe(String(lstatSync(file).ctimeMs))
       expect([...after.slice(0, 5), after[6]]).toEqual([...before.slice(0, 5), before[6]])
     })
 

@@ -2595,6 +2595,7 @@ describe('E11: integrity checks and secret-scan (b.uqm SR-13, SR-15.2, SR-15.3)'
     NO_FIRING_RECORD_REASON,
     numberFormOf,
     PACKAGE_DIR_NAME,
+    RAW_KEY_PREFIX,
     REDACTION_PLACEHOLDER,
     RUNNER_LOG_FILE_NAME,
     runIntegrity,
@@ -2608,13 +2609,6 @@ describe('E11: integrity checks and secret-scan (b.uqm SR-13, SR-15.2, SR-15.3)'
   } = e11Runner
   const { createSpawnRecorder, makeStatus, realScriptNumbers, writeRunnerLog, writeStatus } = e11Helper
 
-  /**
-   * Test data, not a runner constant: the raw Anthropic key's prefix (b.uqm
-   * SR-15.1), as the E1 tests build the key. Temporary: the runner exports no
-   * constant for it yet; E2 (t1.t6s.sy) adds the export `RAW_KEY_PREFIX`, and
-   * this local const is replaced by that import at merge.
-   */
-  const RAW_KEY_PREFIX = 'sk-ant-'
   /** The run's secret values, each a `fakeToken` with its own suffix: the key, `GH_TOKEN` and the base-build token. */
   const SECRETS = {
     key: e11FakeToken(RAW_KEY_PREFIX, 'key'),
