@@ -159,7 +159,8 @@ you to reinstall by hand.
    non-`-g` form errors with `No package.json was found`. `bun pm -g trust` adds
    the package to `trustedDependencies` in the global manifest and runs the
    blocked postinstall, which scaffolds `~/.claude/channels/slack/config.json`
-   and `~/.claude/slack-mcp.json`. Without this step, a later `start` fails
+   and `~/.claude/slack-mcp.json` and links the `debug-slack-channel-bots`
+   skill into `~/.claude/skills/`. Without this step, a later `start` fails
    with the cryptic `missing prerequisite: config.json`.
 
    Re-run the same two commands into a second file and diff:
@@ -305,6 +306,15 @@ not touch the running daemon).
 
    (The `-g` flag targets the global install; the non-`-g` form errors with
    `No package.json was found` when run from an arbitrary directory.)
+
+   The `file:` postinstall runs in the checkout itself, so it scaffolds only
+   missing config files and leaves `~/.claude/skills/` alone (b.669): the
+   `debug-slack-channel-bots` link keeps pointing into
+   `~/.bun/install/global/node_modules/claude-slack-channel-bots/`, where the
+   registry install linked it. Under the `file:` install that global package
+   resolves into the checkout, so the link reads the checkout's copy of the
+   skill until the registry install is back; delete or move the checkout in
+   the meantime and the skill breaks along with the binary.
 
    You can confirm the global manifest is back to the `file:` shape by checking
    that `~/.bun/install/global/package.json` pins

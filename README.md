@@ -1167,6 +1167,8 @@ To install the version of CSCB sitting in your working copy (so the globally-lin
 
 `bun install -g .` (and the equivalent `bun install -g <local-path>`) is broken on Bun 1.3.13 — it inserts an invalid empty-string dependency key into `~/.bun/install/global/package.json` and then any subsequent global op fails with `error: Package "@" has a dependency loop` (upstream: [oven-sh/bun#24207](https://github.com/oven-sh/bun/issues/24207)). The script uses `bun add -g file:<abs-path>` instead, and pre-emptively strips any empty-string entry a prior `bun install -g .` may have already left behind.
 
+Bun runs this install's postinstall in the worktree itself, a git checkout, so the postinstall writes the skeleton config files but leaves `~/.claude/skills/` alone: it makes no new link into the worktree, and a link already there keeps pointing where it did. While this install is in place, though, the global package `~/.bun/install/global/node_modules/claude-slack-channel-bots` resolves into your worktree, so a `debug-slack-channel-bots` link into it, as an install of the published package makes, reads the worktree's copy of the skill until you reinstall the published package ([Quick Start](#quick-start)).
+
 ### Direct invocation for development
 
 Skip the CLI and run the server directly with Bun for development or debugging:
@@ -1662,7 +1664,7 @@ grep -E '\(key=<key>\)|persona=<key>\b' ~/.claude/channels/slack/server.log
 
 While a persona is down, its Claude instance keeps running and keeps its history, but the server doesn't serve it until the persona is up.
 
-The `debug-slack-channel-bots` skill has an entry for every persona log class, every `config.json` rejection and each recovery step. It ships in the package at `skills/debug-slack-channel-bots/SKILL.md`, and postinstall links it into `~/.claude/skills/debug-slack-channel-bots`; a copied directory or file already at that path is left in place, and postinstall logs `skipped: <path> (not a link; …)` — remove it and re-run postinstall to get the link. Invoke `/debug-slack-channel-bots` from Claude Code.
+The `debug-slack-channel-bots` skill has an entry for every persona log class, every `config.json` rejection and each recovery step. It ships in the package at `skills/debug-slack-channel-bots/SKILL.md`, and the postinstall of an installed package (a global install) links it into `~/.claude/skills/debug-slack-channel-bots`; a copied directory or file already at that path is left in place, and postinstall logs `skipped: <path> (not a link; …)` — remove it and re-run postinstall to get the link. A postinstall run in a git checkout or worktree (including [an install from a local worktree](#installing-from-a-local-worktree)), outside a `node_modules` directory or with `CI` set leaves `~/.claude/skills/` alone and logs `skipped: <home>/.claude/skills (skill links left alone: <reason>)`. Invoke `/debug-slack-channel-bots` from Claude Code.
 
 **A persona's instance waits at a startup prompt**
 After each launch of a persona's instance (a start, a restart, a resume or a confirmed change's bring-up), the server watches it through agent-director while it starts. It does the same after a launch that timed out, once it finds that launch's instance still starting (see "A persona's instance is still starting" below). When Claude Code's folder-trust or development-channels prompt shows, the server presses Enter to accept it. It types nothing else, and nothing at all when neither prompt shows; the server runs no tmux command for this.
