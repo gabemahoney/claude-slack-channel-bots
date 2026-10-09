@@ -57,9 +57,11 @@ Install a development tree's dependencies with lifecycle scripts disabled:
 bun install --ignore-scripts
 ```
 
-CSCB's own `postinstall` is for an operator's install: it links the
-debugging skill into `~/.claude/skills/` under the real HOME and may write
-skeleton files under `~/.claude/channels/slack/`. With scripts disabled,
+CSCB's own `postinstall` is for an operator's install. Run in a development
+tree, it leaves `~/.claude/skills/` alone (a checkout, or any tree outside a
+`node_modules` directory, is not an installed package; b.669), but it still
+writes skeleton files under the real HOME (`~/.claude/channels/slack/config.json`
+and `~/.claude/slack-mcp.json`) when they are missing. With scripts disabled,
 `scripts/fixup-bun-cache.ts` (the other half of `postinstall`, which restores
 files bun's extraction dropped from `node_modules/`) does not run either; run
 `bun scripts/fixup-bun-cache.ts` by hand from the repo root when a dependency

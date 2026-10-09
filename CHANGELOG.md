@@ -14,6 +14,13 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 - **Until then, the archive stores channel IDs.** Rows already written keep the ID; nothing rewrites them.
 - **A running server may keep storing the ID for up to 24 hours.** It caches each channel's name for 24 hours, and a failed lookup is cached as the ID. A channel looked up before the re-install keeps getting its ID until those 24 hours pass, the server restarts, or the persona gets a new Slack client, which starts its lookups over (for example when a confirmed change to its credentials file reconnects it). A channel not looked up yet gets its name at once.
 
+### The debugging skill link no longer points into a checkout
+
+- **Only an installed package links the `debug-slack-channel-bots` skill.** postinstall now manages the links in `~/.claude/skills/` only when the package lies inside a `node_modules` directory with no `.git` entry at its root, as a global install does, and `CI` is not set. Before, a `bun install` in a repo checkout or git worktree pointed the link into that checkout, and the skill was gone for every Claude Code session on the host once the checkout was deleted.
+- **An install from a checkout leaves `~/.claude/skills/` alone.** This includes [an install from a local worktree](README.md#installing-from-a-local-worktree) with `scripts/install-local.sh`. postinstall still writes the missing config files, and logs `skipped: <home>/.claude/skills (skill links left alone: <reason>)`.
+- **To repair a link that points into a deleted checkout,** run `bun src/postinstall.ts` from the package directory of a global install of the published package (`~/.bun/install/global/node_modules/claude-slack-channel-bots`). It replaces the dangling link with one into that install.
+- **Remove a dangling `~/.claude/skills/claude-slack-channels-config` link by hand.** An older checkout's postinstall may have left this link to the retired skill pointing into a checkout you have since deleted. postinstall removes that link only when it points into its own package, so the repair above leaves it. If `ls -l ~/.claude/skills/claude-slack-channels-config` shows a link into a deleted checkout, run `rm ~/.claude/skills/claude-slack-channels-config`.
+
 ---
 
 ## 0.12.0 (2026-10-07)
