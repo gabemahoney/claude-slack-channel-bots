@@ -29,7 +29,13 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
-import { createCronScheduler, type SchedulerClock } from '../src/cron-scheduler.ts'
+import {
+  createCronScheduler,
+  crontableReloadedLine,
+  noPersonaListWarning,
+  schedulerStartedLine,
+  type SchedulerClock,
+} from '../src/cron-scheduler.ts'
 import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
 import { createCronLog, type CronLog, type CronLogRecord } from '../src/cron-log.ts'
 import type { CronSchedule } from '../src/crontable.ts'
@@ -177,6 +183,36 @@ function readLog(): string[] {
   }
 }
 
+/** One cron-log line split into its five fields (layout of cron-log.ts). */
+interface LogRecord {
+  identity: string
+  target: string
+  kind: string
+  detail: string
+}
+
+/** The cron log's lines as records, the timestamp dropped. */
+function logRecords(): LogRecord[] {
+  return readLog().map((l) => {
+    const f = l.split(' ')
+    return { identity: f[1]!, target: f[2]!, kind: f[3]!, detail: f.slice(4).join(' ') }
+  })
+}
+
+/** The detail text of every started marker in the cron log. */
+function startedMarkers(): string[] {
+  return logRecords()
+    .filter((r) => r.kind === 'info' && r.detail.startsWith('scheduler started,'))
+    .map((r) => r.detail)
+}
+
+/** The 1-based line number of `rawLine` in the crontable as written. */
+function fileLineNumberOf(rawLine: string): number {
+  const index = readFileSync(cronTablePath, 'utf-8').split('\n').indexOf(rawLine)
+  if (index < 0) throw new Error(`line not in the crontable: ${rawLine}`)
+  return index + 1
+}
+
 /** Build a scheduler wired to a real cron-log against the temp file. */
 function build(clock: ManualClock, dispatcher: CronDispatcher, cronLog?: CronLog) {
   return createCronScheduler({
@@ -207,12 +243,10 @@ describe('cron-scheduler — start()', () => {
     expect(created).toHaveLength(1)
     expect(created[0]).toContain(cronTablePath)
 
-    const started = log.filter((l) => l.includes('scheduler started,'))
-    expect(started).toHaveLength(1)
-    expect(started[0]).toContain('scheduler started, 0 schedules loaded')
+    expect(startedMarkers()).toEqual([schedulerStartedLine(0, 0)])
   })
 
-  test('exactly one "scheduler started, N schedules loaded" marker with N = loaded count', () => {
+  test('only lines with a persona list → no warn, and exactly one started marker: N loaded, 0 undeliverable', () => {
     const start = new Date('2026-06-15T10:30:00')
     writeCrontable(
       line(matchAt(start), '/p/a.md', 'C1'),
@@ -221,9 +255,35 @@ describe('cron-scheduler — start()', () => {
     const clock = makeClock(start)
     build(clock, makeDispatcher()).start()
 
-    const started = readLog().filter((l) => l.includes('scheduler started,'))
-    expect(started).toHaveLength(1)
-    expect(started[0]).toContain('scheduler started, 2 schedules loaded')
+    expect(startedMarkers()).toEqual([schedulerStartedLine(2, 0)])
+    expect(logRecords().filter((r) => r.kind === 'warn')).toEqual([])
+  })
+
+  test('each line with no persona list → its own warn naming its line number and prompt, and the started marker counts them undeliverable (b.n4n)', () => {
+    const start = new Date('2026-06-15T10:30:00')
+    const standup = line(everyMinute, '/p/standup.md')
+    const grooming = line(everyMinute, '/p/grooming.md')
+    writeCrontable(standup, line(everyMinute, '/p/a.md', 'planner'), grooming)
+    build(makeClock(start), makeDispatcher()).start()
+
+    // One warn per line, in crontable order. Each line number counts the
+    // file's header lines: it is where the line sits in the file the operator
+    // edits. Not repeating on unchanged ticks is cron-scheduler-reload.test.ts's.
+    expect(logRecords().filter((r) => r.kind === 'warn')).toEqual([
+      {
+        identity: 'cscb-cron:standup',
+        target: '-',
+        kind: 'warn',
+        detail: noPersonaListWarning(fileLineNumberOf(standup), '/p/standup.md'),
+      },
+      {
+        identity: 'cscb-cron:grooming',
+        target: '-',
+        kind: 'warn',
+        detail: noPersonaListWarning(fileLineNumberOf(grooming), '/p/grooming.md'),
+      },
+    ])
+    expect(startedMarkers()).toEqual([schedulerStartedLine(3, 2)])
   })
 
   test('parse errors → parse-error outcome lines with identity/channel "-"', () => {
@@ -243,7 +303,7 @@ describe('cron-scheduler — start()', () => {
     expect(fields[2]).toBe('-') // channel
     expect(fields[3]).toBe('parse-error')
     // Only the one good schedule loaded.
-    expect(readLog().some((l) => l.includes('scheduler started, 1 schedules loaded'))).toBe(true)
+    expect(startedMarkers()).toEqual([schedulerStartedLine(1, 0)])
   })
 
   test('start() is what gates dispatch: no timer is armed before it (the tick() seam itself is ungated)', async () => {
@@ -301,7 +361,30 @@ describe('cron-scheduler — start()', () => {
       clock,
     })
     expect(() => scheduler.start()).not.toThrow()
-    expect(readLog().some((l) => l.includes('scheduler started, 0 schedules loaded'))).toBe(true)
+    expect(startedMarkers()).toEqual([schedulerStartedLine(0, 0)])
+  })
+})
+
+// ===========================================================================
+// Load-line wording (b.n4n) — pinned once here; the start and reload cases
+// compare the logged lines with these builders.
+// ===========================================================================
+
+describe('cron-scheduler — load-line wording', () => {
+  test('the started and reloaded lines state the undeliverable count, 0 included', () => {
+    expect(schedulerStartedLine(2, 1)).toBe('scheduler started, 2 schedules loaded, 1 undeliverable (no persona list)')
+    expect(schedulerStartedLine(0, 0)).toBe('scheduler started, 0 schedules loaded, 0 undeliverable (no persona list)')
+    expect(crontableReloadedLine(2, 2)).toBe('crontable reloaded, 2 schedules, 2 undeliverable (no persona list)')
+  })
+
+  test('the no-persona-list warning leads with line= and prompt=, says the line is never delivered, and says how to fix it', () => {
+    const text = noPersonaListWarning(34, '/x/prompts/grooming.md')
+    expect(text).toStartWith('line=34 prompt=/x/prompts/grooming.md undeliverable: ')
+    expect(text).toContain('names no personas')
+    expect(text).toContain('never be delivered in this version')
+    expect(text).toContain('Add a persona list')
+    // The section it names is checked against the README in cron-bootstrap.test.ts.
+    expect(text).toMatch(/README section "[^"]+"/)
   })
 })
 
