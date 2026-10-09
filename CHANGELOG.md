@@ -39,6 +39,12 @@ A crontable line with no persona list is never delivered: all-bots delivery is n
 - **Add a persona list to each line the warning names.** Run `grep undeliverable ~/.claude/channels/slack/cron.log` (the default `cron_log_path`) to list them. See [The cron log](README.md#the-cron-log).
 - **Replace an old crontable header by hand.** The server never rewrites an existing crontable, so a crontable created by an earlier release keeps its header. A header from before 0.11.0 says that leaving out the target list reaches all bots. Replace its comment block with the header in [Crontable format](README.md#crontable-format).
 
+### A long permission prompt is cut to fit, and one failing prompt no longer stops the poll
+
+- **A long tool input is cut.** A permission prompt's tool input is cut to fit Slack's 3000-character section limit and followed by `… (truncated, <shown> of <total> chars shown)`; another tool's JSON keeps its 500-character cap, now with the same marker. Before, a Bash command over about 3000 characters made Slack reject the prompt, and the server posted it and logged the failure again at every poll until the request closed. See [Permission Relay](README.md#permission-relay).
+- **A prompt Slack rejects is not posted again.** When Slack rejects a prompt's message (`invalid_blocks`, `msg_too_long`, …), the next poll posts a short prompt in its place, naming the tool, with the same Allow and Deny buttons. If Slack rejects that too, nothing more is posted for the request. Each is logged once in `server.log` as a `[slack] permission-poller: chat.postMessage failed for <instance> token=<token>` line.
+- **One failing prompt no longer stops the poll.** A failure on one request, one instance's row or one prompt's closing update is logged once, and the poll goes on with the rest. Before, it ended the poll at that point, skipping the rows after it and the check for closed requests, and logged an unhandled rejection at every poll while it lasted. The new `server.log` lines start `[slack] permission-poller: prompt for <instance>`, `[slack] permission-poller: spawn <instance> failed`, `[slack] permission-poller: closing prompt for <instance>` and `[slack] permission-poller: tick failed`. Each is a bug to report; the `debug-slack-channel-bots` skill has them under "Other lines you may see".
+
 ---
 
 ## 0.12.0 (2026-10-07)

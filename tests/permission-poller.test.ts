@@ -27,11 +27,17 @@
  *     again, nothing is re-posted.
  *   - Slack failures (prompt post, wedge warning, closure update) are
  *     scripted on the stub, the error class in the trail, nothing leaks
- *     (b.av2 SR-10.3). A closure update failure, or a prompt failing on its
- *     own message (`invalid_blocks`, `msg_too_long`), logs one token-safe
- *     line per attempt with the platform reason; a destination failure of a
- *     prompt or wedge warning logs one `persona-destination-failed` line per
- *     episode instead.
+ *     (b.av2 SR-10.3). A closure update failure logs one token-safe line per
+ *     attempt with the platform reason, and a prompt failing on its own
+ *     message (`invalid_blocks`, `msg_too_long`) one line per request; a
+ *     destination failure of a prompt or wedge warning logs one
+ *     `persona-destination-failed` line per episode instead.
+ *   - The prompt's size (b.zmq): Bash's command and Edit's or Write's
+ *     file_path are cut to Slack's section-text limit, another input's JSON
+ *     to the JSON summary's cap, each with a marker giving the shown and
+ *     total counts; a long tool name is cut, ending `…`, in the text and the
+ *     header; no cut splits a surrogate pair. A 10 000-character Bash
+ *     command posts once across ticks, within the limit (AC).
  *   - `dm` destination (b.av2 SR-7.1; AC 29, 34, 44): `conversations.open`
  *     for `dm.contact` then `chat.postMessage` to the returned `D…`, both on
  *     the persona's own client, with no identity override; the live entry and
@@ -64,12 +70,15 @@
  *     naming it. A held persona never holds another; a request closed
  *     while held is never posted or updated; a stuck-prompt warning joins the
  *     episode and a held tick leaves its throttle alone; a payload error is
- *     not held and is tried again next tick. A due retry whose attempt ends
- *     early (the warning finding no client) or throws (a row the builder
- *     rejects, a throwing trail emitter or logger; run in a child process,
- *     as the throw rejects the tick) never leaves the persona held: its next
- *     prompt or warning posts. A token-shaped Slack error reaches the trail
- *     and the episode line as `unknown_error`.
+ *     not held and its message never posted again (b.zmq): the next tick
+ *     posts the short prompt naming the tool and the error, tracked so it
+ *     closes; a short prompt rejected too makes two posts in all and nothing
+ *     tracked. A due retry whose attempt ends early (the warning finding no
+ *     client) or throws (a row the builder rejects, a throwing trail emitter
+ *     or logger, a whole tick that throws; run in a child process that counts
+ *     unhandled rejections, of which there are none) never leaves the persona
+ *     held: its next prompt or warning posts. A token-shaped Slack error
+ *     reaches the trail and the episode line as `unknown_error`.
  *   - Closing updates after DMs are turned off, the destination changes or
  *     `dm.contact` changes in place with the cached DM forgotten (AC 36,
  *     b.av2 SR-5.1): one `chat.update` on the recorded conversation and ts,
@@ -132,11 +141,27 @@
  *     wedge count are held (not closed, dropped, re-posted or re-armed) and
  *     reconciled once it is up; the skip is logged once per episode.
  *   - A teardown's drop (`forgetPersonaPrompts`, b.av2 SR-6.5): B's tracked
- *     prompts (by key or `cscb_<key>`), not-posted records, stuck-prompt
- *     count and not-up skip episode are dropped with no Slack call, trail
- *     event or closing update, A's are kept; one line only when prompts were
- *     dropped; a leftover row labelled for B after B left the applied set
- *     posts and tracks nothing.
+ *     prompts (by key or `cscb_<key>`), not-posted, payload-rejection and
+ *     failure records (b.zmq), stuck-prompt count and not-up skip episode are
+ *     dropped with no Slack call, trail event or closing update, A's are
+ *     kept; one line only when prompts were dropped; a leftover row labelled
+ *     for B after B left the applied set posts and tracks nothing.
+ *   - One failure stays with its row, request or closed entry (b.zmq): a
+ *     tick whose first row throws (a request the builder rejects, or a `get`
+ *     result that is not a list) still posts rows 2 and 3 and runs the
+ *     closed-request check (AC); a throwing request is logged once while
+ *     open, the row's other requests posting; a throwing row counts as not
+ *     read (its tracked prompt and its stuck-prompt count kept, so the
+ *     warning trips on schedule), logged once while it keeps failing; a
+ *     whole tick that throws is logged once until a tick completes; a closed
+ *     entry whose closing throws is kept, logged once token-safely, and the
+ *     other closed entry updates. A prompt posted whose success trail event
+ *     throws is tracked (posted once) and logged once, and its closing
+ *     failure is still logged once, through its own record. A payload
+ *     rejection is recorded before its line, so a logger throwing on that
+ *     line still leaves the short prompt to post next. Each line is
+ *     asserted with its text from its builder (b.jg5 SRJ-1014), whose
+ *     literal texts one `pin:` case holds.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -148,7 +173,17 @@ import { join } from 'path'
 import { DM_DESTINATION, type Persona, type PersonaConfig } from '../src/config.ts'
 import {
   _resetPollerState,
+  PROMPT_JSON_SUMMARY_MAX,
+  PROMPT_TOOL_NAME_MAX,
+  SLACK_SECTION_TEXT_MAX,
+  buildClosingFailedLine,
+  buildFallbackPermissionBlocks,
+  buildFallbackPromptRejectedLine,
   buildPermissionBlocks,
+  buildPromptFailedLine,
+  buildPromptRejectedLine,
+  buildSpawnFailedLine,
+  buildTickFailedLine,
   buildWedgeWarningBody,
   buildWedgeWarningText,
   dropPermission,
@@ -162,6 +197,7 @@ import {
   type PollerDeps,
 } from '../src/permission-poller.ts'
 import { _resetTrailFdForTests } from '../src/permission-trail.ts'
+import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import {
   createPersonaDestinations,
   describeDmDestinationRefusal,
@@ -211,6 +247,7 @@ import {
   slackCalls,
   startManualPoller,
   updates,
+  type CapturedTrailEvent,
   type ManualIntervalControl,
   type PersonaClients,
   type TrailCapture,
@@ -386,6 +423,19 @@ const chatPosts = (trail: TrailCapture) => trail.events.filter((e) => e.event ==
 const logLines = (logCalls: unknown[][], fragment: string) =>
   logCalls.filter((args) => String(args[0]).includes(fragment))
 
+// The fixed text of b.zmq's failure and payload-rejection lines, taken from
+// their builders (b.jg5 SRJ-1014): each builder's line with an empty
+// description (or failure tail). A line it writes is that text, then its
+// description, so it starts with it. The literal texts are pinned once, in
+// the `pin:` case below.
+const promptFailedLead = (instance: string, token: string) => buildPromptFailedLine(instance, token, '')
+const spawnFailedLead = (instance: string) => buildSpawnFailedLine(instance, '')
+const promptRejectedLead = (instance: string, token: string) =>
+  buildPromptRejectedLine('chat.postMessage', instance, token, '')
+const shortPromptRejectedLead = (instance: string, token: string) =>
+  buildFallbackPromptRejectedLine('chat.postMessage', instance, token, '')
+const TICK_FAILED_LEAD = buildTickFailedLine('')
+
 /**
  * A failed Slack call (b.av2 SR-10.3): exactly one log line carries
  * `fragment`; it names the platform reason for a platform error (and none for
@@ -515,6 +565,109 @@ describe('buildPermissionBlocks (SR-2.2 action_id shape with request_token)', ()
     const actions = blocks[1] as { elements: Array<{ action_id: string }> }
     expect(actions.elements[0].action_id).toBe(`perm_allow_${INSTANCE_A}_${TOKEN_A}`)
     expect(actions.elements[1].action_id).toBe(`perm_deny_${INSTANCE_A}_${TOKEN_A}`)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The prompt's size: Slack's section-text limit (b.zmq)
+// ---------------------------------------------------------------------------
+
+/** The text of a prompt's section block (its first block). */
+const sectionText = (blocks: unknown): string => (blocks as Array<{ text: { text: string } }>)[0]!.text.text
+
+/** A UTF-16 surrogate without its partner: not valid text for Slack. */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+
+/**
+ * `text` is a cut prompt section within Slack's limit: the header for `tool`,
+ * the start of `content` in backticks, then the marker giving how many of
+ * its characters are shown out of all of them. Returns the shown count.
+ */
+function expectCut(text: string, tool: string, content: string): number {
+  expect(text.length).toBeLessThanOrEqual(SLACK_SECTION_TEXT_MAX)
+  const match = /^([\s\S]*)` … \(truncated, (\d+) of (\d+) chars shown\)$/.exec(text)
+  expect(match).not.toBeNull()
+  const [, body, shown, total] = match!
+  expect(Number(total)).toBe(content.length)
+  expect(body).toBe(`🤖🛠️ *${tool}*\n\`${content.slice(0, Number(shown))}`)
+  return Number(shown)
+}
+
+describe('the prompt\'s section stays within Slack\'s section-text limit, with a marker when cut (b.zmq)', () => {
+  test('a short input is shown whole with no marker: Bash\'s command, or the JSON of another tool\'s input', () => {
+    expect(sectionText(buildPermissionBlocks('Bash', { command: 'ls /tmp' }, INSTANCE_A, TOKEN_A))).toBe('🤖🛠️ *Bash*\n`ls /tmp`')
+    expect(sectionText(buildPermissionBlocks('Read', { file_path: '/tmp/a' }, INSTANCE_A, TOKEN_A))).toBe('🤖🛠️ *Read*\n`{"file_path":"/tmp/a"}`')
+  })
+
+  test.each([
+    ['Bash', 'command'],
+    ['Edit', 'file_path'],
+    ['Write', 'file_path'],
+  ])('%s\'s %s of 10 000 characters is cut to the limit, not to the JSON summary\'s cap: the section fills it to within the marker\'s width', (tool, field) => {
+    const value = `/${'v'.repeat(9_999)}`
+    const text = sectionText(buildPermissionBlocks(tool, { [field]: value }, INSTANCE_A, TOKEN_A))
+    expectCut(text, tool, value)
+    // The marker at its widest, both counts as wide as the total: what the cut leaves room for.
+    const widestMarker = ` … (truncated, ${value.length} of ${value.length} chars shown)`
+    expect(text.length).toBeGreaterThan(SLACK_SECTION_TEXT_MAX - widestMarker.length)
+  })
+
+  test.each<[string, string, Record<string, unknown>]>([
+    ['a tool other than Bash, Edit and Write', 'Read', { file_path: 'y'.repeat(5_000) }],
+    ['Bash with no command', 'Bash', { description: 'y'.repeat(5_000) }],
+  ])('%s: the input\'s JSON is cut to the JSON summary\'s cap, with the marker', (_label, tool, input) => {
+    const json = JSON.stringify(input)
+    expect(expectCut(sectionText(buildPermissionBlocks(tool, input, INSTANCE_A, TOKEN_A)), tool, json)).toBe(PROMPT_JSON_SUMMARY_MAX)
+  })
+
+  test('a cut never splits a surrogate pair, in the command or in the tool name', () => {
+    const command = '😀'.repeat(2_000)
+    const text = sectionText(buildPermissionBlocks('Bash', { command }, INSTANCE_A, TOKEN_A))
+    expectCut(text, 'Bash', command)
+    expect(LONE_SURROGATE.test(text)).toBe(false)
+
+    const named = sectionText(buildPermissionBlocks('😀'.repeat(PROMPT_TOOL_NAME_MAX), { command: 'ls' }, INSTANCE_A, TOKEN_A))
+    expect(LONE_SURROGATE.test(named)).toBe(false)
+    const name = /^🤖🛠️ \*(.*)\*\n`\{"command":"ls"\}`$/s.exec(named)![1]!
+    expect(name.length).toBeLessThanOrEqual(PROMPT_TOOL_NAME_MAX)
+    expect(name).toMatch(/^(?:😀)+…$/u)
+  })
+
+  test('pin: the short prompt names the tool and Slack\'s error, and carries the full prompt\'s Allow and Deny buttons', () => {
+    const short = buildFallbackPermissionBlocks('Bash', 'invalid_blocks', INSTANCE_A, TOKEN_A)
+    expect(sectionText(short)).toBe('🤖🛠️ *Bash*\n_The tool input is not shown: Slack rejected the full prompt (invalid_blocks)._')
+    expect(short[1]).toEqual(buildPermissionBlocks('Bash', { command: 'ls' }, INSTANCE_A, TOKEN_A)[1])
+  })
+
+  test('AC: a 10 000-character Bash command posts once across several ticks, tracked, its section within the limit with the marker', async () => {
+    const command = `echo ${'x'.repeat(9_995)}`
+    scriptPostTs(stubA, POST_TS)
+    const trail = makeTrailCapture()
+    const logCalls: unknown[][] = []
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => getResult([cannedPermissionRequest({ request_token: TOKEN_A, tool_input: JSON.stringify({ command }) })]),
+    }), { emitTrail: trail.emit, log: (...args) => { logCalls.push(args) } })
+    for (let n = 0; n < 3; n++) await ivl.tick()
+
+    expect(posts(stubA)).toHaveLength(1)
+    expectCut(sectionText(posts(stubA)[0]!.blocks), 'Bash', command)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ channelId: A_DEST, messageTs: POST_TS })
+    expect(chatPosts(trail).map((e) => e['ok'])).toEqual([true])
+    expect(rowDecisions(trail, 'already_tracked')).toHaveLength(2)
+    expect(logCalls).toEqual([])
+  })
+
+  test('a tool name over the cap is cut, ending …, in the posted text and in the section\'s header', async () => {
+    const shownName = `${'T'.repeat(PROMPT_TOOL_NAME_MAX - 1)}…`
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => getResult([cannedPermissionRequest({ request_token: TOKEN_A, tool_name: 'T'.repeat(1_000) })]),
+    }))
+    await ivl.tick()
+
+    expect(posts(stubA).map((c) => c.text)).toEqual([`🤖🛠️ permission request: ${shownName}`])
+    expect(sectionText(posts(stubA)[0]!.blocks)).toBe(`🤖🛠️ *${shownName}*\n\`{"command":"ls /tmp"}\``)
   })
 })
 
@@ -1734,31 +1887,32 @@ describe('poller tick — a destination failure holds the persona\'s prompts and
     expect(clearedLines(logCalls)).toHaveLength(1)
   })
 
-  test.each(['invalid_blocks', 'msg_too_long'])('a prompt whose post fails with %s (the message, not the destination) is not held: one per-attempt log line and trail event, tried again on the next tick with no backoff; no persona-destination-failed line; the persona\'s other prompts and notices still post', async (error) => {
-    // A's posts, in order: TOKEN_A fails, TOKEN_B posts (same tick), the
-    // notice posts, TOKEN_A fails again (next tick), TOKEN_A posts.
+  test.each(['invalid_blocks', 'msg_too_long'])('a prompt whose post fails with %s (the message, not the destination) is not held and its message is never posted again: one log line and trail event; the next tick posts the short prompt naming the tool and the error, with the same text and buttons, tracked so its request closes with an update; no persona-destination-failed line; the persona\'s other prompts and notices still post', async (error) => {
+    // A's posts, in order: TOKEN_A's prompt fails, TOKEN_B's posts (same
+    // tick), the notice posts, TOKEN_A's short prompt posts (next tick).
     stubA.script.post.push(
       { kind: 'platform', error },
       { kind: 'ok', result: { ts: POST_TS_2 } },
       { kind: 'ok', result: { ts: 'TSNOTICE' } },
-      { kind: 'platform', error },
       { kind: 'ok', result: { ts: POST_TS } },
     )
     const trail = makeTrailCapture()
     const logCalls: unknown[][] = []
     const { hold } = makeHold(logCalls)
+    let rows = [request(TOKEN_A, 1), request(TOKEN_B, 2)]
     const ivl = startPoller(() => ({
       list: async () => ({ spawns: [checkPermRow(A)] }),
-      get: async () => getResult([request(TOKEN_A, 1), request(TOKEN_B, 2)], A),
+      get: async () => getResult(rows, A),
+      getPermission: allowAll,
     }), { emitTrail: trail.emit, log: (...args) => { logCalls.push(args) }, destinationHold: hold })
-    const failureLines = () => logLines(logCalls, `chat.postMessage failed for ${INSTANCE_A}`)
+    const failure = promptRejectedLead(INSTANCE_A, TOKEN_A)
 
-    // Tick 1: TOKEN_A fails, logged and trailed per attempt; TOKEN_B, after it, posts.
+    // Tick 1: TOKEN_A's prompt fails, logged and trailed; TOKEN_B's, after it, posts.
     await ivl.tick()
     expect(posts(stubA).map((c) => c.channel)).toEqual([A_DEST, A_DEST])
     expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
     expect(getLivePermission(INSTANCE_A, TOKEN_B)).toMatchObject({ channelId: A_DEST, messageTs: POST_TS_2 })
-    expectTokenSafeFailure(logCalls, trail, `chat.postMessage failed for ${INSTANCE_A}`, { kind: 'platform', error })
+    expectTokenSafeFailure(logCalls, trail, failure, { kind: 'platform', error })
     expect(hold.view(KEY_A)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
 
     // A notice for A goes out at once.
@@ -1769,61 +1923,118 @@ describe('poller tick — a destination failure holds the persona\'s prompts and
       [A_DEST, 'a notice'],
     ])
 
-    // Tick 2, no time passed: TOKEN_A is tried again at once and fails again.
+    // Tick 2, no time passed: TOKEN_A's short prompt posts, with the full
+    // prompt's text and buttons, and is tracked.
     await ivl.tick()
     expect(posts(stubA)).toHaveLength(4)
-    expect(failureLines()).toHaveLength(2)
-    expect(String(failureLines()[1][0])).toContain(`(reason=${error})`)
-
-    // Tick 3: it posts.
-    await ivl.tick()
-    expect(posts(stubA)).toHaveLength(5)
+    const [full, , , short] = posts(stubA)
+    expect(short!.channel).toBe(A_DEST)
+    expect(short!.text).toBe(full!.text!)
+    expect(short!.blocks).toEqual(buildFallbackPermissionBlocks('Bash', error, INSTANCE_A, TOKEN_A))
+    expect((short!.blocks as unknown[])[1]).toEqual((full!.blocks as unknown[])[1])
     expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ channelId: A_DEST, messageTs: POST_TS })
 
+    // Tick 3: nothing more is posted. Then the request closes: one update, on the short prompt.
+    await ivl.tick()
+    expect(posts(stubA)).toHaveLength(4)
+    rows = [request(TOKEN_B, 2)]
+    await ivl.tick()
+    expect(updates(stubA).map((c) => [c.channel, c.ts])).toEqual([[A_DEST, POST_TS]])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+
+    expect(logLines(logCalls, failure)).toHaveLength(1)
+    expect(pollerFailureLines(logCalls)).toHaveLength(1)
     expect(chatPosts(trail).filter((e) => e.request_token === TOKEN_A).map((e) => [e['ok'], e['error']])).toEqual([
-      [false, error],
       [false, error],
       [true, undefined],
     ])
-    expect(rowDecisions(trail, 'post_attempted').filter((e) => e.request_token === TOKEN_A)).toHaveLength(3)
+    expect(rowDecisions(trail, 'post_attempted').filter((e) => e.request_token === TOKEN_A)).toHaveLength(2)
     expect(episodeLines(logCalls)).toEqual([])
     assertNoLeak({ logCalls, trail: trail.events }, 'payload error')
+  })
+
+  test('a short prompt Slack rejects too: exactly two posts, the full prompt and the short one, each logged and trailed once; nothing tracked or posted while the request stays open; once no longer observed it is forgotten, so if listed again its full prompt is tried', async () => {
+    stubA.script.post.push(
+      { kind: 'platform', error: 'invalid_blocks' },
+      { kind: 'platform', error: 'msg_too_long' },
+      { kind: 'ok', result: { ts: POST_TS } },
+    )
+    const trail = makeTrailCapture()
+    const logCalls: unknown[][] = []
+    const { hold } = makeHold(logCalls)
+    let rows = [request(TOKEN_A, 1)]
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow(A)] }),
+      get: async () => getResult(rows, A),
+    }), { emitTrail: trail.emit, log: (...args) => { logCalls.push(args) }, destinationHold: hold })
+    for (let n = 0; n < 4; n++) await ivl.tick()
+
+    expect(posts(stubA)).toHaveLength(2)
+    expect(posts(stubA)[1]!.blocks).toEqual(buildFallbackPermissionBlocks('Bash', 'invalid_blocks', INSTANCE_A, TOKEN_A))
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    const lines = pollerFailureLines(logCalls).map((args) => String(args[0]))
+    expect(lines).toHaveLength(2)
+    expect(lines[0]).toStartWith(promptRejectedLead(INSTANCE_A, TOKEN_A))
+    expect(lines[0]).toContain('(reason=invalid_blocks)')
+    expect(lines[1]).toStartWith(shortPromptRejectedLead(INSTANCE_A, TOKEN_A))
+    expect(lines[1]).toContain('(reason=msg_too_long)')
+    expect(chatPosts(trail).map((e) => [e['ok'], e['error']])).toEqual([[false, 'invalid_blocks'], [false, 'msg_too_long']])
+    expect(rowDecisions(trail, 'post_attempted')).toHaveLength(2)
+    expect(hold.view(KEY_A).held).toBe(false)
+
+    rows = []
+    await ivl.tick()
+    rows = [request(TOKEN_A, 1)]
+    await ivl.tick()
+    expect(posts(stubA)).toHaveLength(3)
+    expect(posts(stubA)[2]!.blocks).toEqual(posts(stubA)[0]!.blocks)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ channelId: A_DEST, messageTs: POST_TS })
+    expect(episodeLines(logCalls)).toEqual([])
+    assertNoLeak({ logCalls, trail: trail.events }, 'short prompt rejected')
   })
 })
 
 // ---------------------------------------------------------------------------
-// A throw inside a tick while a persona's retry is due (b.av2 SR-7.1)
+// A throw inside a tick while a persona's retry is due (b.av2 SR-7.1, b.zmq)
 // ---------------------------------------------------------------------------
 
 /**
- * The poller's tick has no catch: a row the prompt builder rejects, or a
- * throwing trail emitter or logger, ends the tick at that row and rejects the
- * interval's fire-and-forget promise (in production, the server's
- * `unhandledRejection` handler logs it). `bun test` fails any test that leaves
- * an unhandled rejection, so these cases run in a child `bun` process
- * (`runInFakeHome`, temp HOME and state dir, no token variables) that counts
- * the rejections itself and prints one `RESULT::` JSON line.
+ * A throw inside a tick (a row the prompt builder rejects, a throwing trail
+ * emitter or logger, a listing that is not a list) is caught in the poller
+ * (b.zmq): the interval's fire-and-forget promise never rejects. These cases
+ * prove that where it would show: in a child `bun` process (`runInFakeHome`,
+ * temp HOME and state dir, no token variables) that counts unhandled
+ * rejections with its own listener, captures `console.error` (where a failure
+ * line goes when the logger throws on it) and prints one `RESULT::` JSON line.
+ * `bun test` fails any test that leaves an unhandled rejection, so a
+ * regression shows here as a count, not as a stray error.
  *
- * The child starts the real poller on a manual interval over the real hold
- * (fake clock, one tick per virtual second), the real resolver and one
- * `makeStubSlack` stub per persona, A (destination A_DEST) and B (B_DEST). A's
- * first prompt fails `not_in_channel` at t=0 and opens its episode (retry due
- * at 5 s). Scenarios:
+ * The child starts the real poller on a manual interval (an injected
+ * `setInterval`) over the real hold (fake clock, one tick per virtual second),
+ * the real resolver and one `makeStubSlack` stub per persona, A (destination
+ * A_DEST) and B (B_DEST). A's first prompt fails `not_in_channel` at t=0 and
+ * opens its episode (retry due at 5 s). Scenarios:
  * - `bad-instance`, `empty-token`: at t=5 s the listing is a row the builder
  *   rejects (an instance ID without the `cscb_` prefix, or an empty
  *   `request_token`) for A, then B's row.
  * - `trail-throws`: at t=5 s A's valid row, then B's; the trail emitter throws
  *   once, on A's `post_attempted` row decision (after the attempt is begun).
+ * - `tick-throws`: at t=5 s the listing's `spawns` is not a list, so the whole
+ *   tick throws.
+ * - `throwingLog`: the logger also throws on every line written during the
+ *   t=5 s tick (the failure line among them).
  * - `wedge-log-throws`: A's request closes and its spawn stays wedged; at the
  *   trip (t=90 s, the retry due) the logger throws once, on the "wedged" line
  *   written after the warning's attempt is begun.
  *
- * Neither a rejected row nor a throw after the attempt is begun may leave the
- * persona held with no timer: at t=6 s A's valid prompt posts on the retry
- * still due (and B's with it), or for the wedge the warning posts at the next
- * throttle window (t=120 s).
+ * No rejection at any point. A throw on A's row or request leaves B's row in
+ * the same tick to post; a whole-tick throw posts nothing that tick. Neither a
+ * rejected row nor a throw after the attempt is begun may leave the persona
+ * held with no timer: at t=6 s A's valid prompt posts on the retry still due
+ * (and B's with it, unless already posted), or for the wedge the warning posts
+ * at the next throttle window (t=120 s).
  */
-describe('poller tick — a throw while a persona\'s retry is due leaves it retrying (b.av2 SR-7.1)', () => {
+describe('poller tick — a throw while a persona\'s retry is due leaves it retrying, with no unhandled rejection (b.av2 SR-7.1, b.zmq)', () => {
   const POLLER_PATH = join(import.meta.dir, '..', 'src', 'permission-poller.ts')
   const REPO_ROOT = join(import.meta.dir, '..')
 
@@ -1841,6 +2052,8 @@ describe('poller tick — a throw while a persona\'s retry is due leaves it retr
 
     const rejections = []
     process.on('unhandledRejection', (err) => { rejections.push(String(err && err.message ? err.message : err)) })
+    const consoleLines = []
+    console.error = (...args) => { consoleLines.push(args.map(String).join(' ')) }
     initOutageState({ getClient: () => ({}), notify: () => {} })
 
     const config = makeMultiPersonaConfig([
@@ -1854,12 +2067,14 @@ describe('poller tick — a throw while a persona\'s retry is due leaves it retr
     const clock = createFakeClock()
     const lines = []
     let throwOnWedgedLine = false
+    let throwOnEveryLine = false
     const log = (...args) => {
       const line = args.map(String).join(' ')
       if (throwOnWedgedLine && line.includes('wedged in check_permission')) {
         throwOnWedgedLine = false
         throw new Error('injected: log write failed')
       }
+      if (throwOnEveryLine) throw new Error('injected: log write failed')
       lines.push(line)
     }
     const destinations = createPersonaDestinations({ log, getPersonaConfig: () => config })
@@ -1937,12 +2152,17 @@ describe('poller tick — a throw while a persona\'s retry is due leaves it retr
       } else if (input.scenario === 'empty-token') {
         spawns = [row(A), row(B)]
         open = { [instanceA]: [request('', 1)], [instanceB]: [request(input.tokenB, 2)] }
+      } else if (input.scenario === 'tick-throws') {
+        spawns = {}
+        open = { [instanceA]: [request(input.tokenA, 1)], [instanceB]: [request(input.tokenB, 2)] }
       } else {
         spawns = [row(A), row(B)]
         open = { [instanceA]: [request(input.tokenA, 1)], [instanceB]: [request(input.tokenB, 2)] }
         throwOnPostAttempted = true
       }
+      throwOnEveryLine = input.throwingLog === true
       await tickAt(5000)
+      throwOnEveryLine = false
       result.threw = snapshot()
       spawns = [row(A), row(B)]
       open = { [instanceA]: [request(input.tokenA, 1)], [instanceB]: [request(input.tokenB, 2)] }
@@ -1950,6 +2170,8 @@ describe('poller tick — a throw while a persona\'s retry is due leaves it retr
       result.after = snapshot()
     }
     result.rejectionMessages = rejections
+    result.lines = lines
+    result.consoleLines = consoleLines
     mod.stopPermissionPoller()
     process.stdout.write('RESULT::' + JSON.stringify(result) + '\\n')
   `
@@ -1967,9 +2189,13 @@ describe('poller tick — a throw while a persona\'s retry is due leaves it retr
     beforeTrip?: Snapshot
     beforeWindow?: Snapshot
     rejectionMessages: string[]
+    /** Every line the child's logger took. */
+    lines: string[]
+    /** Every `console.error` call's text. */
+    consoleLines: string[]
   }
 
-  function runScenario(scenario: string): ChildResult {
+  function runScenario(scenario: string, throwingLog = false): ChildResult {
     const home = mkdtempSync(join(tmpdir(), 'poller-throw-home-'))
     try {
       const res = runInFakeHome({
@@ -1977,6 +2203,7 @@ describe('poller tick — a throw while a persona\'s retry is due leaves it retr
         call: CHILD,
         input: {
           scenario,
+          throwingLog,
           root: REPO_ROOT,
           personaDir,
           nameA: NAME_A,
@@ -2002,30 +2229,66 @@ describe('poller tick — a throw while a persona\'s retry is due leaves it retr
     }
   }
 
-  test.each<[string, string, string]>([
-    ['a row whose instance ID lacks the cscb_ prefix (the builder rejects it)', 'bad-instance', 'must start with \'cscb_\''],
-    ['a row with an empty request_token (the builder rejects it)', 'empty-token', 'request_token must be a non-empty string'],
-    ['a trail emitter that throws on the post_attempted row decision, after the attempt is begun', 'trail-throws', 'injected: trail write failed'],
-  ])('at A\'s due retry, %s: the tick ends at that row with one rejection and B\'s row after it waits; on the next tick A\'s prompt posts on the retry still due and B\'s posts', (_label, scenario, message) => {
-    const r = runScenario(scenario)
+  test.each<{ label: string; scenario: string; throwingLog: boolean; line: string; message: string; bPostsAtThrow: number }>([
+    {
+      label: 'a row whose instance ID lacks the cscb_ prefix (the builder rejects it)',
+      scenario: 'bad-instance', throwingLog: false, line: promptFailedLead('no_prefix_instance', TOKEN_A),
+      message: 'must start with \'cscb_\'', bPostsAtThrow: 1,
+    },
+    {
+      label: 'a row with an empty request_token (the builder rejects it)',
+      scenario: 'empty-token', throwingLog: false, line: promptFailedLead(INSTANCE_A, ''),
+      message: 'request_token must be a non-empty string', bPostsAtThrow: 1,
+    },
+    {
+      label: 'a trail emitter that throws on the post_attempted row decision, after the attempt is begun',
+      scenario: 'trail-throws', throwingLog: false, line: promptFailedLead(INSTANCE_A, TOKEN_A),
+      message: 'injected: trail write failed', bPostsAtThrow: 1,
+    },
+    {
+      label: 'a listing whose spawns is not a list (the whole tick throws)',
+      scenario: 'tick-throws', throwingLog: false, line: TICK_FAILED_LEAD, message: 'TypeError', bPostsAtThrow: 0,
+    },
+    {
+      label: 'a row the builder rejects, with a logger that throws on its failure line',
+      scenario: 'bad-instance', throwingLog: true, line: promptFailedLead('no_prefix_instance', TOKEN_A),
+      message: 'must start with \'cscb_\'', bPostsAtThrow: 1,
+    },
+    {
+      label: 'a whole tick that throws, with a logger that throws on its failure line',
+      scenario: 'tick-throws', throwingLog: true, line: TICK_FAILED_LEAD, message: 'TypeError', bPostsAtThrow: 0,
+    },
+  ])('at A\'s due retry, $label: no unhandled rejection; one failure line (on console.error when the logger throws); B\'s row in the same tick posts unless the whole tick threw; on the next tick A\'s prompt posts on the retry still due', ({ scenario, throwingLog, line, message, bPostsAtThrow }) => {
+    const r = runScenario(scenario, throwingLog)
     // t=0: A's prompt failed and opened its episode.
     expect(r.opened).toMatchObject({ rejections: 0, postsA: 1, postsB: 0, liveA: false, heldA: true })
-    // t=5 s: one rejection; nothing posted, B's later row included.
-    expect(r.threw).toMatchObject({ rejections: 1, postsA: 1, postsB: 0, liveA: false, liveB: false, heldA: true })
-    expect(r.rejectionMessages).toHaveLength(1)
-    expect(r.rejectionMessages[0]).toContain(message)
-    // t=6 s: A is not wedged — its prompt posts and clears the episode; B posts too.
-    expect(r.after).toMatchObject({ rejections: 1, postsA: 2, postsB: 1, liveA: true, liveB: true, heldA: false })
+    // t=5 s: no rejection; A posts nothing, B's row after it posts unless the whole tick threw.
+    expect(r.threw).toMatchObject({
+      rejections: 0, postsA: 1, postsB: bPostsAtThrow, liveA: false, liveB: bPostsAtThrow === 1, heldA: true,
+    })
+    expect(r.rejectionMessages).toEqual([])
+    const [logged, toConsole] = throwingLog ? [r.consoleLines, r.lines] : [r.lines, r.consoleLines]
+    const failureLines = logged.filter((l) => l.startsWith(line))
+    expect(failureLines).toHaveLength(1)
+    expect(failureLines[0]!.slice(line.length)).toContain(message)
+    expect(toConsole.filter((l) => l.startsWith(line))).toEqual([])
+    if (!throwingLog) expect(r.consoleLines).toEqual([])
+    // t=6 s: A is not wedged — its prompt posts and clears the episode; B's is posted once.
+    expect(r.after).toMatchObject({ rejections: 0, postsA: 2, postsB: 1, liveA: true, liveB: true, heldA: false })
   }, 60_000)
 
-  test('at A\'s due retry, a logger that throws on the stuck-prompt "wedged" line (after the warning\'s attempt is begun): one rejection and no warning; the warning posts at the next throttle window and clears the episode', () => {
+  test('at A\'s due retry, a logger that throws on the stuck-prompt "wedged" line (after the warning\'s attempt is begun): no rejection, one failure line for A\'s spawn and no warning; the warning posts at the next throttle window and clears the episode', () => {
     const r = runScenario('wedge-log-throws')
     expect(r.opened).toMatchObject({ rejections: 0, postsA: 1, heldA: true })
     expect(r.beforeTrip).toMatchObject({ rejections: 0, postsA: 1, warnings: 0, heldA: true })
-    expect(r.threw).toMatchObject({ rejections: 1, postsA: 1, warnings: 0, heldA: true })
-    expect(r.rejectionMessages).toEqual(['injected: log write failed'])
-    expect(r.beforeWindow).toMatchObject({ rejections: 1, warnings: 0, heldA: true })
-    expect(r.after).toMatchObject({ rejections: 1, postsA: 2, warnings: 1, heldA: false })
+    expect(r.threw).toMatchObject({ rejections: 0, postsA: 1, warnings: 0, heldA: true })
+    expect(r.rejectionMessages).toEqual([])
+    const failureLines = r.lines.filter((l) => l.startsWith(spawnFailedLead(INSTANCE_A)))
+    expect(failureLines).toHaveLength(1)
+    expect(failureLines[0]!.slice(spawnFailedLead(INSTANCE_A).length)).toContain('injected: log write failed')
+    expect(r.beforeWindow).toMatchObject({ rejections: 0, warnings: 0, heldA: true })
+    expect(r.after).toMatchObject({ rejections: 0, postsA: 2, warnings: 1, heldA: false })
+    expect(r.consoleLines).toEqual([])
   }, 60_000)
 })
 
@@ -3929,7 +4192,7 @@ describe('b.fae F4 — wedge detector', () => {
 
 // ---------------------------------------------------------------------------
 // A persona that is not up (b.av2 SR-6.4, SR-7.2); the scenario is shared
-// with the teardown drop below
+// with the teardown drop and the per-row isolation cases below
 // ---------------------------------------------------------------------------
 
 const K = wedgeTripTicks(1000)
@@ -3951,9 +4214,10 @@ const NOT_UP: Array<[string, PersonaConnectionStatus | undefined, boolean]> = [
  * start with, each with a mutable set of open requests, and the production
  * up predicate over a per-persona connection status and bring-up outcome.
  * `down(key, variant?)` puts a persona in a `NOT_UP` state, `up(key)`
- * brings it up.
+ * brings it up. `trailFault`, when it returns an error for an event, makes
+ * the trail emitter throw it instead of capturing the event (b.zmq).
  */
-function makeNotUpScenario() {
+function makeNotUpScenario(trailFault: (event: CapturedTrailEvent) => Error | undefined = () => undefined) {
   const statuses = new Map<string, PersonaConnectionStatus | undefined>([[KEY_A, UP], [KEY_B, UP], [KEY_D, UP]])
   const outcomeUp = new Set<string>([KEY_A, KEY_B, KEY_D])
   const isPersonaUp = createPersonaUpPredicate({ status: (key) => statuses.get(key) }, { isUp: (key) => outcomeUp.has(key) })
@@ -3975,7 +4239,15 @@ function makeNotUpScenario() {
       getPermissionCalls.push(params.request_token)
       return cannedGetPermissionResponse({ request_token: params.request_token, decision: 'allow', decision_reason: null })
     },
-  }), { isPersonaUp, emitTrail: trail.emit, log: (...args) => { logCalls.push(args) } })
+  }), {
+    isPersonaUp,
+    emitTrail: (event) => {
+      const fault = trailFault(event)
+      if (fault) throw fault
+      trail.emit(event)
+    },
+    log: (...args) => { logCalls.push(args) },
+  })
   return {
     ivl,
     open,
@@ -4006,6 +4278,10 @@ function makeNotUpScenario() {
 
 const requestA = () => cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })
 const requestB = () => cannedPermissionRequest({ request_token: TOKEN_B, request_id: 2 })
+/** A request the prompt builder rejects: its `request_token` is empty, so handling it throws (b.zmq). */
+const rejectedRequest = () => cannedPermissionRequest({ request_token: '', request_id: 9 })
+/** A `get` result's `permission_requests` that is not a list: handling its row throws (b.zmq). */
+const NOT_A_LIST = {} as unknown as PermissionRequestRow[]
 const allUpdates = () => updates(stubA).length + updates(stubB).length + updates(stubD).length
 const trailFor = (trail: TrailCapture, instanceId: string) =>
   trail.events.filter((e) => e['claude_instance_id'] === instanceId)
@@ -4274,6 +4550,53 @@ describe('forgetPersonaPrompts — a teardown drops one persona\'s poller state 
     expect(slackCalls(stubA, stubB, stubD)).toBe(0)
   })
 
+  test('drops B\'s payload-rejection record (b.zmq): B\'s next attempt posts its full prompt again, while A\'s, rejected the same way, posts the short prompt', async () => {
+    const s = makeNotUpScenario()
+    s.open.set(INSTANCE_A, [requestA()])
+    s.open.set(INSTANCE_B, [requestB()])
+    stubA.script.post.push({ kind: 'platform', error: 'invalid_blocks' })
+    stubB.script.post.push({ kind: 'platform', error: 'invalid_blocks' })
+    await s.drive(1)
+    expect(posts(stubA)).toHaveLength(1)
+    expect(posts(stubB)).toHaveLength(1)
+
+    expect(forgetPersonaPrompts(KEY_B)).toBe(0)
+    await s.drive(1)
+
+    expect(posts(stubA)[1]!.blocks).toEqual(buildFallbackPermissionBlocks('Bash', 'invalid_blocks', INSTANCE_A, TOKEN_A))
+    expect(posts(stubB)[1]!.blocks).toEqual(posts(stubB)[0]!.blocks)
+    expect(droppedLines(s.logCalls)).toEqual([])
+  })
+
+  test.each<[string, () => PermissionRequestRow[], (instance: string) => string]>([
+    [
+      'a request\'s failure record (the prompt builder rejects its empty request_token)',
+      () => [rejectedRequest()],
+      (instance) => promptFailedLead(instance, ''),
+    ],
+    [
+      'a row\'s failure record (its permission_requests is not a list)',
+      () => NOT_A_LIST,
+      spawnFailedLead,
+    ],
+  ])('drops B\'s %s (b.zmq): the next tick logs B\'s failure line again, while A\'s, failing the same way, stays logged once', async (_label, open, line) => {
+    const s = makeNotUpScenario()
+    s.open.set(INSTANCE_A, open())
+    s.open.set(INSTANCE_B, open())
+    await s.drive(2)
+    expect(logLines(s.logCalls, line(INSTANCE_A))).toHaveLength(1)
+    expect(logLines(s.logCalls, line(INSTANCE_B))).toHaveLength(1)
+
+    expect(forgetPersonaPrompts(KEY_B)).toBe(0)
+    await s.drive(1)
+
+    expect(logLines(s.logCalls, line(INSTANCE_B))).toHaveLength(2)
+    expect(logLines(s.logCalls, line(INSTANCE_A))).toHaveLength(1)
+    expect(droppedLines(s.logCalls)).toEqual([])
+    expect(slackCalls(stubA, stubB, stubD)).toBe(0)
+    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'failure record dropped')
+  })
+
   test('drops B\'s stuck-prompt count: B needs K fresh empty ticks to warn, while A\'s count, reached before the drop, trips on schedule', async () => {
     const s = makeNotUpScenario()
     await s.drive(K - 1)
@@ -4345,5 +4668,272 @@ describe('forgetPersonaPrompts — a teardown drops one persona\'s poller state 
     expect(updates(stubA).map((c) => [c.channel, c.ts])).toEqual([[A_DEST, aFirstTs]])
     expect(slackCalls(stubB, stubD)).toBe(1)
     assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'leftover row')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// One failure stays with its row, request or closed entry (b.zmq)
+// ---------------------------------------------------------------------------
+
+describe('pin: the b.zmq failure and payload-rejection lines, as the debugging skill quotes them (b.jg5 SRJ-1014)', () => {
+  test.each<[string, string, string]>([
+    [
+      'a request\'s prompt failed',
+      buildPromptFailedLine('<instance>', '<token>', '<description>'),
+      '[slack] permission-poller: prompt for <instance> (request_token=<token>) failed — the tick goes on; a later tick tries it again unless it was posted: <description>',
+    ],
+    [
+      'a row failed',
+      buildSpawnFailedLine('<instance>', '<description>'),
+      '[slack] permission-poller: spawn <instance> failed — the tick goes on, its tracked prompts and stuck-prompt state kept as if not read this tick: <description>',
+    ],
+    [
+      'a closing failed',
+      buildClosingFailedLine('<instance>', '<token>', '<description>'),
+      '[slack] permission-poller: closing prompt for <instance> token=<token> failed — kept for the next tick, the tick goes on: <description>',
+    ],
+    [
+      'the full prompt\'s message was rejected',
+      buildPromptRejectedLine('chat.postMessage', '<instance>', '<token>', ' (reason=<code>): …'),
+      '[slack] permission-poller: chat.postMessage failed for <instance> token=<token> (the prompt\'s message was rejected; a short prompt naming the tool is posted instead) (reason=<code>): …',
+    ],
+    [
+      'the short prompt\'s message was rejected too',
+      buildFallbackPromptRejectedLine('chat.postMessage', '<instance>', '<token>', ' (reason=<code>): …'),
+      '[slack] permission-poller: chat.postMessage failed for <instance> token=<token> (the short prompt\'s message was rejected too; nothing more is posted for this request) (reason=<code>): …',
+    ],
+    [
+      'a tick failed',
+      buildTickFailedLine('<description>'),
+      '[slack] permission-poller: tick failed — the rest of it skipped: <description>',
+    ],
+  ])('%s', (_label, built, pinned) => {
+    expect(built).toBe(pinned)
+  })
+})
+
+describe('poller tick — a throw on one row, request or closed entry is caught there, logged once, and the tick goes on (b.zmq)', () => {
+  /** A trail write failure carrying fake tokens: its line must hold the redacted message only. */
+  const trailWriteError = (label: string) =>
+    Object.assign(new Error(`trail write failed ${sentinelInMessage(label)}`), { detail: LEAK_SENTINEL })
+  /** The redacted form of `trailWriteError`'s message in a line (`describeThrownValue`). */
+  const REDACTED_TRAIL_WRITE = `Error message="trail write failed ${REDACTED_SENTINEL_TAIL}"`
+  /** The success trail event of `token`'s prompt: `cscb.chat_post.attempted` with `ok: true`. */
+  const isPostedEvent = (e: CapturedTrailEvent, token: string) =>
+    e.event === 'cscb.chat_post.attempted' && e['ok'] === true && e['request_token'] === token
+
+  test.each<[string, () => PermissionRequestRow[], string, string]>([
+    ['one of its requests is one the prompt builder rejects (an empty request_token)', () => [rejectedRequest()], promptFailedLead(INSTANCE_A, ''), 'request_token must be a non-empty string'],
+    ['its get result\'s permission_requests is not a list', () => NOT_A_LIST, spawnFailedLead(INSTANCE_A), 'TypeError'],
+  ])('AC: the tick\'s first row throws (%s): rows 2 and 3 post through their own clients and the closed-request check runs, so a prompt closed that tick gets its update; one line names the row', async (_label, aOpen, line, message) => {
+    const s = makeNotUpScenario()
+    scriptPostTs(stubB, POST_TS, POST_TS_2)
+    s.open.set(INSTANCE_B, [requestA()])
+    await s.ivl.tick()
+    expect(getLivePermission(INSTANCE_B, TOKEN_A)).toMatchObject({ channelId: B_DEST, messageTs: POST_TS })
+
+    // Listed in order: A's row, B's (its TOKEN_A closed, TOKEN_B new), D's.
+    s.listed.add(D)
+    s.open.set(INSTANCE_A, aOpen())
+    s.open.set(INSTANCE_B, [requestB()])
+    s.open.set(INSTANCE_D, [requestA()])
+    await s.ivl.tick()
+
+    expect(posts(stubB).map((c) => c.channel)).toEqual([B_DEST, B_DEST])
+    expect(getLivePermission(INSTANCE_B, TOKEN_B)).toMatchObject({ channelId: B_DEST, messageTs: POST_TS_2 })
+    expect(methods(stubD)).toEqual(['conversations.open', 'chat.postMessage'])
+    expect(getLivePermission(INSTANCE_D, TOKEN_A)).toMatchObject({ personaKey: KEY_D, channelId: D_DM })
+    expect(s.getPermissionCalls).toEqual([TOKEN_A])
+    expect(updates(stubB).map((c) => [c.channel, c.ts])).toEqual([[B_DEST, POST_TS]])
+    expect(getLivePermission(INSTANCE_B, TOKEN_A)).toBeUndefined()
+    expect(slackCalls(stubA)).toBe(0)
+    const lines = logLines(s.logCalls, line)
+    expect(lines).toHaveLength(1)
+    expect(String(lines[0]![0]).slice(line.length)).toContain(message)
+    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'first row throws')
+  })
+
+  test('a request that throws is logged once while it stays open, and the row\'s request after it posts; once no longer observed it is forgotten, so it logs again if listed again', async () => {
+    const s = makeNotUpScenario()
+    s.listed.delete(B)
+    s.open.set(INSTANCE_A, [rejectedRequest(), requestB()])
+    await s.drive(3)
+    expect(posts(stubA).map((c) => c.channel)).toEqual([A_DEST])
+    expect(getLivePermission(INSTANCE_A, TOKEN_B)).toMatchObject({ channelId: A_DEST })
+    expect(logLines(s.logCalls, promptFailedLead(INSTANCE_A, ''))).toHaveLength(1)
+
+    s.open.set(INSTANCE_A, [requestB()])
+    await s.drive(1)
+    s.open.set(INSTANCE_A, [rejectedRequest(), requestB()])
+    await s.drive(2)
+    expect(logLines(s.logCalls, promptFailedLead(INSTANCE_A, ''))).toHaveLength(2)
+    expect(posts(stubA)).toHaveLength(1)
+    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'request throws')
+  })
+
+  test('a row that throws counts as not read: its tracked prompt is neither closed nor posted again while it fails; its line is logged once while it keeps failing, and again after a tick it does not', async () => {
+    const s = makeNotUpScenario()
+    s.listed.delete(B)
+    s.open.set(INSTANCE_A, [requestA()])
+    await s.drive(1)
+    const entry = getLivePermission(INSTANCE_A, TOKEN_A)
+    expect(entry).toMatchObject({ channelId: A_DEST })
+
+    s.open.set(INSTANCE_A, NOT_A_LIST)
+    await s.drive(3)
+    expect(logLines(s.logCalls, spawnFailedLead(INSTANCE_A))).toHaveLength(1)
+    expect(s.getPermissionCalls).toEqual([])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toEqual(entry)
+
+    s.open.set(INSTANCE_A, [requestA()])
+    await s.drive(1)
+    s.open.set(INSTANCE_A, NOT_A_LIST)
+    await s.drive(1)
+    expect(logLines(s.logCalls, spawnFailedLead(INSTANCE_A))).toHaveLength(2)
+    expect(posts(stubA)).toHaveLength(1)
+    expect(updates(stubA)).toEqual([])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toEqual(entry)
+    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'row throws')
+  })
+
+  test('a row that throws keeps its stuck-prompt count: the tick it throws neither counts toward the warning nor resets it, so the warning trips on the next empty tick, on schedule', async () => {
+    const s = makeNotUpScenario()
+    s.listed.delete(B)
+    await s.drive(K - 1)
+    expect(wedgeWarnings()).toEqual([])
+
+    s.open.set(INSTANCE_A, NOT_A_LIST)
+    await s.drive(1)
+    expect(logLines(s.logCalls, spawnFailedLead(INSTANCE_A))).toHaveLength(1)
+    expect(wedgeWarnings()).toEqual([])
+
+    s.open.set(INSTANCE_A, [])
+    await s.drive(1)
+    expect(wedgeWarnings().map((c) => c.channel)).toEqual([A_DEST])
+    expect(slackCalls(stubB, stubD)).toBe(0)
+    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'row throws, wedge count kept')
+  })
+
+  test('a tick that throws past these catches (its listing\'s spawns is not a list) is logged once until a tick runs to its end; the next good tick posts', async () => {
+    let spawns: unknown = {}
+    const logCalls: unknown[][] = []
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: spawns as ReturnType<typeof checkPermRow>[] }),
+      get: async () => getResult([requestA()]),
+    }), { emitTrail: makeTrailCapture().emit, log: (...args) => { logCalls.push(args) } })
+    const tickLines = () => logLines(logCalls, TICK_FAILED_LEAD)
+    for (let n = 0; n < 3; n++) await ivl.tick()
+    expect(tickLines()).toHaveLength(1)
+    expect(String(tickLines()[0]![0]).slice(TICK_FAILED_LEAD.length)).toContain('TypeError')
+
+    spawns = [checkPermRow()]
+    await ivl.tick()
+    expect(posts(stubA).map((c) => c.channel)).toEqual([A_DEST])
+    spawns = {}
+    await ivl.tick()
+    await ivl.tick()
+    expect(tickLines()).toHaveLength(2)
+    assertNoLeak({ logCalls }, 'tick throws')
+  })
+
+  test('a closed entry whose closing throws is kept for the next tick and logged once, token-safely, while the other closed entry gets its update; once the throw stops it closes', async () => {
+    let failClosing = true
+    const thrown = trailWriteError('closing')
+    const s = makeNotUpScenario((e) =>
+      failClosing && e['action'] === 'reconciled_closed' && e['request_token'] === TOKEN_A ? thrown : undefined)
+    s.listed.delete(B)
+    scriptPostTs(stubA, POST_TS, POST_TS_2)
+    s.open.set(INSTANCE_A, [requestA(), requestB()])
+    await s.drive(1)
+
+    // Both requests close; TOKEN_A's closing throws on two ticks.
+    s.open.set(INSTANCE_A, [])
+    await s.drive(2)
+    expect(updates(stubA).map((c) => [c.channel, c.ts])).toEqual([[A_DEST, POST_TS_2]])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ messageTs: POST_TS })
+    expect(getLivePermission(INSTANCE_A, TOKEN_B)).toBeUndefined()
+    const lines = logLines(s.logCalls, buildClosingFailedLine(INSTANCE_A, TOKEN_A, ''))
+    expect(lines).toEqual([[buildClosingFailedLine(INSTANCE_A, TOKEN_A, describeThrownValue(thrown))]])
+    expect(String(lines[0]![0])).toContain(REDACTED_TRAIL_WRITE)
+
+    failClosing = false
+    await s.drive(1)
+    expect(updates(stubA).map((c) => [c.channel, c.ts])).toEqual([[A_DEST, POST_TS_2], [A_DEST, POST_TS]])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    expect(s.getPermissionCalls).toEqual([TOKEN_A, TOKEN_B, TOKEN_A, TOKEN_A])
+    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'closing throws')
+  })
+
+  test('a prompt that posts but whose success trail event throws is tracked all the same and logged once: over three ticks one post, a live entry and one prompt-failure line', async () => {
+    const thrown = trailWriteError('posted')
+    const s = makeNotUpScenario((e) => (isPostedEvent(e, TOKEN_A) ? thrown : undefined))
+    s.listed.delete(B)
+    scriptPostTs(stubA, POST_TS)
+    s.open.set(INSTANCE_A, [requestA()])
+    await s.drive(3)
+
+    expect(posts(stubA).map((c) => c.channel)).toEqual([A_DEST])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ personaKey: KEY_A, channelId: A_DEST, messageTs: POST_TS })
+    expect(rowDecisions(s.trail, 'already_tracked')).toHaveLength(2)
+    const lines = logLines(s.logCalls, promptFailedLead(INSTANCE_A, TOKEN_A))
+    expect(lines).toEqual([[buildPromptFailedLine(INSTANCE_A, TOKEN_A, describeThrownValue(thrown))]])
+    expect(String(lines[0]![0])).toContain(REDACTED_TRAIL_WRITE)
+    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'posted trail throws')
+  })
+
+  test('a closing failure is logged through its own record: a request whose success trail event threw (its prompt-failure line logged, its record kept while it is tracked) still logs its closing failure once when its closing throws, and closes once the throw stops', async () => {
+    let failClosing = true
+    const thrown = trailWriteError('posted and closing')
+    const s = makeNotUpScenario((e) =>
+      isPostedEvent(e, TOKEN_A) || (failClosing && e['action'] === 'reconciled_closed' && e['request_token'] === TOKEN_A)
+        ? thrown
+        : undefined)
+    s.listed.delete(B)
+    scriptPostTs(stubA, POST_TS)
+    s.open.set(INSTANCE_A, [requestA()])
+    await s.drive(1)
+    expect(logLines(s.logCalls, promptFailedLead(INSTANCE_A, TOKEN_A))).toHaveLength(1)
+
+    // The request closes; its closing throws on two ticks.
+    s.open.set(INSTANCE_A, [])
+    await s.drive(2)
+    expect(updates(stubA)).toEqual([])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ channelId: A_DEST, messageTs: POST_TS })
+    expect(logLines(s.logCalls, buildClosingFailedLine(INSTANCE_A, TOKEN_A, ''))).toEqual([
+      [buildClosingFailedLine(INSTANCE_A, TOKEN_A, describeThrownValue(thrown))],
+    ])
+
+    failClosing = false
+    await s.drive(1)
+    expect(updates(stubA).map((c) => [c.channel, c.ts])).toEqual([[A_DEST, POST_TS]])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    expect(logLines(s.logCalls, promptFailedLead(INSTANCE_A, TOKEN_A))).toHaveLength(1)
+    expect(posts(stubA)).toHaveLength(1)
+    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'posted and closing trail throws')
+  })
+
+  test('a payload rejection is recorded before its line: a logger that throws on that line cannot bring the rejected message back; the next tick posts the short prompt, and the throw is logged once as the request\'s failure', async () => {
+    stubA.script.post.push({ kind: 'platform', error: 'invalid_blocks' }, { kind: 'ok', result: { ts: POST_TS } })
+    const thrown = new Error('injected: log write failed')
+    const logCalls: unknown[][] = []
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => getResult([requestA()]),
+    }), {
+      emitTrail: makeTrailCapture().emit,
+      log: (...args) => {
+        if (String(args[0]).startsWith(promptRejectedLead(INSTANCE_A, TOKEN_A))) throw thrown
+        logCalls.push(args)
+      },
+    })
+    for (let n = 0; n < 3; n++) await ivl.tick()
+
+    expect(posts(stubA)).toHaveLength(2)
+    expect(posts(stubA)[1]!.blocks).toEqual(buildFallbackPermissionBlocks('Bash', 'invalid_blocks', INSTANCE_A, TOKEN_A))
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ channelId: A_DEST, messageTs: POST_TS })
+    expect(logLines(logCalls, promptFailedLead(INSTANCE_A, TOKEN_A))).toEqual([
+      [buildPromptFailedLine(INSTANCE_A, TOKEN_A, describeThrownValue(thrown))],
+    ])
+    assertNoLeak({ logCalls }, 'payload line throws')
   })
 })
