@@ -81,8 +81,11 @@
 #      server. The resumed stub shows its starting screen for DIALOG_DELAY_S.
 #   5. During the hold:
 #      - [harness] a harness `get` reads `pending`, the same
-#        claude_session_id and a launch_started_at that parses, and P's pane
-#        shows neither approver needle;
+#        claude_session_id and a launch_started_at that parses, and neither
+#        P's pane nor the stub's record of the dialogs it printed
+#        (`stub_shown_dialogs`, keyed by the pane's process: the resumed
+#        stub's own, not the bring-up stub's, which showed a dialog) holds
+#        either approver needle;
 #      - fixtures/fmk-driver.ts forces one `resume` of P (through
 #        `cscb_run`, a CSCB process): its outcome line names
 #        ErrSpawnNotResumable, `called=true` and `counted=false`, and it is
@@ -91,19 +94,25 @@
 #        that holds neither the no-notifier line for P
 #        (src/session-manager.ts sendPersonaNotice) nor the driver's own
 #        outage-notice line for P;
-#      - the row still reads `pending` and the pane still shows neither
-#        needle once the driver has returned;
-#      - health ticks run: in the hold, from its first read to the last pane
-#        read with no needle (D seconds), the bot server's `status` reads of
-#        P whose next call of P's row (`status` or `read-pane`) is not a
-#        `read-pane` (an approver lap reads status, then the pane; a tick
-#        reads status only) number at least ⌊D / HEALTH_TICK_S⌋ - 1 (see
-#        Waits).
-#   6. [harness] The pane is read until it shows the dev-channels needle (the
-#      delay's end), then the row is read until it leaves `pending`: it reads
-#      `waiting` with the same claude_session_id. The last pane read with no
-#      needle is the one after the forced resume when the first read of this
-#      step already shows the dialog.
+#      - the row still reads `pending`, and the pane and the record still
+#        hold neither needle, once the driver has returned;
+#      - health ticks run: in the hold, from its first read to its last read
+#        of the pane and the record with no needle (D seconds; step 6), the
+#        bot server's `status` reads of P whose next call of P's row
+#        (`status` or `read-pane`) is not a `read-pane` (an approver lap
+#        reads status, then the pane; a tick reads status only) number at
+#        least ⌊D / HEALTH_TICK_S⌋ - 1 (see Waits).
+#   6. [harness] The pane, then the stub's record, is read every
+#      SCENARIO_POLL_S until either holds the dev-channels needle (the
+#      delay's end). The stub clears an answered dialog from its pane, so a
+#      pane read alone can miss a dialog shown and answered between two reads
+#      (under parallel /ci load it did; b.fyq); the record keeps every dialog
+#      the stub printed. Each read's time is taken before both of its reads,
+#      so the last read with no needle in either is a time before the dialog
+#      showed; it is the one after the forced resume when the first read of
+#      this step already finds the dialog. Then the row is read until it
+#      leaves `pending`: it reads `waiting` with the same claude_session_id,
+#      and the record then holds the dev-channels dialog.
 #   7. Checks over the leg, counting only shim lines whose parent is the bot
 #      server (or, for the forced call, the driver):
 #      - exactly one `resume` of P by the bot server, and no `spawn`
@@ -127,7 +136,8 @@
 # Outcomes the SRD leaves open are recorded in the script's output, not
 # asserted (ruling S8): what scheduled the restart, the driver's `latched`,
 # `class` and `action`, the hold's status and pane-read counts beside the
-# tick reads' count, and every post across the leg.
+# tick reads' count, whether the pane still showed the dialog at the step-6
+# read that found it, and every post across the leg.
 #
 # The launch-timeout legs (`leg_launch_timeouts`), in run order, with
 # `health_check_interval` 0 (ruling S3: no tick is needed). Three personas,
@@ -375,7 +385,7 @@
 # - Scenario 5's tick reads: health ticks fire every HEALTH_TICK_S, so a
 #   hold of D seconds holds at least ⌊D / HEALTH_TICK_S⌋ tick instants, each
 #   reading P's status once; one is allowed lost at the window's end (a tick
-#   whose read lands just after its last pane read with no needle). An
+#   whose read lands just after the hold's last read with no needle). An
 #   approver lap's status read is followed by its `read-pane`, so among the
 #   status reads not followed by a `read-pane` each tick read adds exactly
 #   one (when it falls between a lap's two reads, the lap's status read is
@@ -859,11 +869,13 @@ has_session() {
     "${SCENARIO_REAL_TMUX}" has-session -t "=$1" 2> /dev/null
 }
 
-# expect_no_needle <step> <file>: fail when <file> holds either approver needle.
+# expect_no_needle <step> <file> [<what>]: fail when <file> (<what>: P's pane
+# by default) holds either approver needle.
 expect_no_needle() {
-    local needle
+    local needle what="P's pane"
+    (( $# < 3 )) || what="$3"
     for needle in "${DEV_NEEDLE}" "${TRUST_NEEDLE}"; do
-        ! grep -qF -- "${needle}" "$2" || fail "$1: P's pane holds the approver needle '${needle}' during the delay"
+        ! grep -qF -- "${needle}" "$2" || fail "$1: ${what} holds the approver needle '${needle}' during the delay"
     done
 }
 
@@ -1192,6 +1204,7 @@ leg_launch_pending() {
     local step="scenario 5" creds work connected sid session sentinel_at resume_line resume_at
     local hold_at hold_log0 hold_log1 posts0 launch_ms drv_out drv_err drv_rc=0 drv_at drv_end drv_s
     local drv_line drv_pid outcome=() lines=() line verb launches=0 pane="${SCENARIO_ROOT}/p-pane.txt"
+    local shown="${SCENARIO_ROOT}/p-shown-dialogs.txt" on_pane
     local deadline last_clear="" dialog_at="" live_at statuses panes ticks want_ticks n first_send first_read hits
     local restart_lines
 
@@ -1277,10 +1290,16 @@ EOF
         || fail "${step}: the bot server resumed ${P_ID} before the sentinel"
     echo "${TEST_NAME}: ${step}: the bot server's calls of ${P_ID} from the sentinel to the resume (recorded, not asserted): $(server_calls "" "${sentinel_at}" "${resume_at}" | cut -f6 | tr '\n' ';')"
 
-    # The pane: present, and showing neither needle.
+    # The pane: present, and showing neither needle; nor does the stub's
+    # record of the dialogs it printed. The record is keyed by the pane's
+    # process, so it is the resumed stub's own, empty until its dialog shows
+    # (the bring-up stub, which showed one, kept its record under its own
+    # process); step 6's record reads are of this one.
     wait_until "${SESSION_WAIT_S}" "${step}: no tmux session ${session} for the held row" has_session "${session}"
     pane_capture "${step}" "${session}" "${pane}"
     expect_no_needle "${step}: at the hold's first read" "${pane}"
+    stub_shown_dialogs "${session}" > "${shown}" || fail "${step}: could not read the stub's record of the dialogs P's pane showed"
+    expect_no_needle "${step}: at the hold's first read" "${shown}" "the stub's record of P's dialogs"
 
     # The forced resume (fixtures/fmk-driver.ts, a CSCB process).
     drv_out="${SCENARIO_ROOT}/fmk-driver-resume.out"
@@ -1337,31 +1356,46 @@ EOF
     read_row "${step}: after the forced resume"
     [[ "${ROW_STATE}" == pending && "${ROW_SID}" == "${sid}" ]] \
         || fail "${step}: after the forced resume the row reads ${ROW_STATE} (${ROW_SID}), not still pending: the delay ended too soon"
-    # This capture, with no needle, is the hold's first known clear read: the
-    # delay's end is bounded below from it even when the loop below finds
-    # the dialog at its first read.
+    # This read of the pane, then of the stub's record, with no needle in
+    # either, is the hold's first known clear read: the delay's end is
+    # bounded below from it even when the loop below finds the dialog at its
+    # first read.
     last_clear="$(now_s)"
     pane_capture "${step}" "${session}" "${pane}"
-    if grep -qF -- "${DEV_NEEDLE}" "${pane}"; then
+    stub_shown_dialogs "${session}" > "${shown}" || fail "${step}: could not read the stub's record of the dialogs P's pane showed"
+    if grep -qF -- "${DEV_NEEDLE}" "${pane}" "${shown}"; then
         fail "${step}: the dialog showed before the forced resume returned (${drv_s}s): the hold did not cover it"
     fi
     expect_no_needle "${step}: after the forced resume" "${pane}"
+    expect_no_needle "${step}: after the forced resume" "${shown}" "the stub's record of P's dialogs"
 
-    # Step 6 [harness]: read the pane until the dialog shows (the delay's end).
+    # Step 6 [harness]: read the pane, then the stub's record, until either
+    # holds the dialog (the delay's end). The stub clears an answered dialog
+    # from its pane, so a pane read alone can miss a dialog shown and
+    # answered between two reads (b.fyq); the record keeps it. Each read's
+    # time is taken before both of its reads, and the pane is read first: the
+    # stub writes the record before it reads the Enter that clears the pane,
+    # so a pane with no needle and then a record with none mean the dialog
+    # had not shown at that time, and last_clear stays a time before it.
     deadline=$(( $(_scenario_now_ms) + DIALOG_WAIT_S * 1000 ))
     while :; do
         line="$(now_s)"
         pane_capture "${step}" "${session}" "${pane}"
-        if grep -qF -- "${DEV_NEEDLE}" "${pane}"; then
+        stub_shown_dialogs "${session}" > "${shown}" || fail "${step}: could not read the stub's record of the dialogs P's pane showed"
+        if grep -qF -- "${DEV_NEEDLE}" "${pane}" "${shown}"; then
             dialog_at="${line}"
             break
         fi
         expect_no_needle "${step}: before the dialog" "${pane}"
+        expect_no_needle "${step}: before the dialog" "${shown}" "the stub's record of P's dialogs"
         last_clear="${line}"
-        (( $(_scenario_now_ms) < deadline )) || fail "${step}: P's pane never showed the dev-channels dialog within ${DIALOG_WAIT_S}s"
+        (( $(_scenario_now_ms) < deadline )) \
+            || fail "${step}: P's pane never showed the dev-channels dialog within ${DIALOG_WAIT_S}s (neither the pane nor the stub's record holds it)"
         sleep "${SCENARIO_POLL_S}"
     done
-    echo "${TEST_NAME}: ${step}: the dialog showed between $(seconds_between "${hold_at}" "${last_clear}")s and $(seconds_between "${hold_at}" "${dialog_at}")s after the hold's first read"
+    on_pane=no
+    grep -qF -- "${DEV_NEEDLE}" "${pane}" && on_pane=yes
+    echo "${TEST_NAME}: ${step}: the dialog showed between $(seconds_between "${hold_at}" "${last_clear}")s and $(seconds_between "${hold_at}" "${dialog_at}")s after the hold's first read (still on the pane at the read that found it, recorded: ${on_pane})"
     awk -v s="$(seconds_between "${hold_at}" "${last_clear}")" -v t="${HEALTH_TICK_S}" 'BEGIN { exit !(s >= t) }' \
         || fail "${step}: the hold lasted less than one health tick interval (${HEALTH_TICK_S}s)"
     awk -v a="${drv_end}" -v b="${last_clear}" 'BEGIN { exit !(a <= b) }' \
@@ -1374,6 +1408,11 @@ EOF
     [[ "${ROW_STATE}" == waiting ]] || fail "${step}: the row left pending for ${ROW_STATE}, not waiting"
     [[ "${ROW_SID}" == "${sid}" ]] || fail "${step}: the waiting row's claude_session_id is '${ROW_SID}', not the kept ${sid}"
     hold_log1="$(line_count "${SLACK_STATE_DIR}/server.log")"
+    # The dialog showed on the resumed stub's pane: its record holds it (the
+    # stub writes the record before it reads the Enter that answers it).
+    stub_shown_dialogs "${session}" > "${shown}" || fail "${step}: could not read the stub's record of the dialogs P's pane showed"
+    grep -qF -- "${DEV_NEEDLE}" "${shown}" \
+        || fail "${step}: the row reads waiting, but the resumed stub's record holds no dev-channels dialog"
 
     # Step 7: the checks. Health ticks ran in the hold: the bot server's
     # status reads of P whose next call of P's row (status or read-pane) is
