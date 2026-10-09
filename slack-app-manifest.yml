@@ -32,6 +32,13 @@
 # `missing_scope`, and the message archive records the channel ID where the
 # channel name should be.
 #
+# It also grants the `lists:read` and `lists:write` bot scopes, which a persona
+# needs to read and write a Slack List it has been given access to, such as a
+# list shared by all bots. CSCB itself makes no Lists call. An app created from
+# an earlier version of this manifest must have `lists:read` and `lists:write`
+# added and then be re-installed to gain them. Until then, every Lists call
+# fails with `missing_scope`.
+#
 # Group DMs are deliberately not subscribed: do not add a group-DM event.
 
 _metadata:
@@ -66,6 +73,8 @@ oauth_config:
       - app_mentions:read
       - groups:history
       - groups:read
+      - lists:read
+      - lists:write
 
 settings:
   event_subscriptions:
