@@ -565,6 +565,16 @@ describe('slack-app-manifest.yml', () => {
     expect(manifest.oauth_config.scopes.bot).toEqual(expect.arrayContaining(['channels:read', 'groups:read']))
   })
 
+  test('bug b.am4: the bot scopes include lists:read and lists:write, so a bot can use the shared Slack List', () => {
+    expect(manifest.oauth_config.scopes.bot).toEqual(expect.arrayContaining(['lists:read', 'lists:write']))
+  })
+
+  test('bug b.am4: the README names lists:read and lists:write and the re-install', () => {
+    const readme = readRepoFile('README.md')
+    expect(readme).toContain('`lists:read` and `lists:write` bot scopes')
+    expect(readme).toMatch(/earlier manifest must have both scopes added and be re-installed/)
+  })
+
   test('SR-4.3: message.im stays subscribed and message.mpim is not (group DMs unsubscribed)', () => {
     const events = manifest.settings.event_subscriptions.bot_events
     expect(events).toContain('message.im')
@@ -584,6 +594,8 @@ describe('slack-app-manifest.yml', () => {
         'groups:read',
         'im:history',
         'im:write',
+        'lists:read',
+        'lists:write',
         'reactions:write',
         'users:read',
       ].sort(),

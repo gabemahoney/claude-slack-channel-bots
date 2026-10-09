@@ -370,6 +370,8 @@ To rotate a persona's tokens, run the credentials command for it again (see the 
 
 Never put a token in `config.json`, a ticket or a chat.
 
+The shipped `slack-app-manifest.yml` also grants the `lists:read` and `lists:write` bot scopes, so a bot can read and write, with its own bot token, a Slack List it has been given access to, such as one list shared by all bots. CSCB itself makes no Lists call. An app created from an earlier manifest must have both scopes added and be re-installed; until then, every Lists call fails with `missing_scope`.
+
 #### Channel delivery
 
 This section applies in declarative mode; for fungible mode, see [Channel delivery in fungible mode](#channel-delivery-in-fungible-mode). Each channel entry's `delivery` sets which messages in that channel reach the persona:

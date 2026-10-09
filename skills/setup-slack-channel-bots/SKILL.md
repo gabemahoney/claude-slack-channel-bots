@@ -271,7 +271,9 @@ must gain them and be re-installed. Point to the debugging skill's entries "A
 persona can't open a DM: re-install its app to gain `im:write`" and "The
 message archive shows channel IDs: re-install each app to gain
 `channels:read` and `groups:read`"
-(`skills/debug-slack-channel-bots/SKILL.md`) for the steps.
+(`skills/debug-slack-channel-bots/SKILL.md`) for the steps. It can also lack
+the `lists:read` and `lists:write` scopes, which a bot needs to use a Slack
+List: add both the same way, then re-install.
 An app already used by another persona can't be reused.
 
 #### 5.3 Credentials file path
