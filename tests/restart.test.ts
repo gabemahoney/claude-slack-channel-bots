@@ -22,6 +22,12 @@ import {
   pendingDeferralFailedLine,
   restartRetryCapSkippedLine,
   restartRetrySkippedLine,
+  _setCleanExitRelaunchDelay,
+  _setRestartNow,
+  CLEAN_EXIT_RELAUNCH_DELAY,
+  cleanExitDelayStandsLine,
+  cleanExitLoopGuardLine,
+  cleanExitRelaunchLine,
   RESTART_FAILURE_CAP,
   RESTART_OUTCOME_ALREADY_CONNECTED,
   RESTART_OUTCOME_CAPPED,
@@ -230,7 +236,7 @@ import {
   type UnavailableForm,
 } from './test-helpers/agent-director-stub.ts'
 import type { Client } from 'agent-director'
-import type { FindMissingParams, KillParams, ReadPaneParams, ResumeParams, SendKeysParams, SpawnParams, SpawnResult, StatusParams } from 'agent-director'
+import type { FindMissingParams, KillParams, ReadPaneParams, ResumeParams, SendKeysParams, SpawnParams, SpawnResult, StatusParams, StatusResult } from 'agent-director'
 import { configDirLabelValue, personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
@@ -1601,6 +1607,349 @@ describe('backoff integration (SR-29.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// b.4vm: a clean exit relaunches fast. Beside a full-delay restart timer,
+// `scheduleRestart` arms a clean-exit check that reads the persona's liveness
+// once: a row read `ended` (agent-director pause's `/exit`) runs the restart
+// then; any other reading, a launch failure on record, a gate that stops it,
+// a cancel, or a fast relaunch within session_restart_delay (the loop guard)
+// leaves the full delay. The restart timers stay real (Bun's fake timers do
+// not fake setTimeout): a full delay of LONG_S never fires during a case, and
+// the check is shortened with `_setCleanExitRelaunchDelay` and waited for in
+// real time (WAIT_MS), as the file does for its restart timers. The loop
+// guard's clock is a fake one (`_setRestartNow`), stepped past the window
+// with no wait. `_resetRestartState` restores both.
+// ---------------------------------------------------------------------------
+
+describe('b.4vm: a clean exit relaunches at the clean-exit check, not after session_restart_delay', () => {
+  const KEY = 'clean_exit_bot'
+  const OTHER = 'clean_exit_other_bot'
+  const CWD = '/cwd/clean'
+  const CHECK_S = 0.01  // the check fires well within WAIT_MS
+  const LONG_S = 60     // session_restart_delay's default: never fires during a case, below the backoff ceiling
+  let errLines: string[]
+  let origConsoleError: typeof console.error
+
+  beforeEach(() => {
+    errLines = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+    _setCleanExitRelaunchDelay(CHECK_S)
+  })
+
+  afterEach(() => {
+    cancelAllRestartTimers()
+    console.error = origConsoleError
+  })
+
+  /** Every clean-exit line logged (relaunch, delay stands, loop guard): each ends `(b.4vm)`. */
+  const cleanExitLines = (): string[] => errLines.filter((l) => l.endsWith('(b.4vm)'))
+
+  // The literal pins of the clean-exit lines; each `why` the stands line
+  // carries is pinned in the tables below, against the whole line.
+  test('the clean-exit lines as logged, and the check\'s delay: CLEAN_EXIT_RELAUNCH_DELAY is 3 s', () => {
+    expect(CLEAN_EXIT_RELAUNCH_DELAY).toBe(3)
+    expect(cleanExitRelaunchLine(KEY, 60)).toBe(
+      `[slack] Session for persona=${KEY} ended cleanly (agent-director reads its row ended) — relaunching now instead of in 60s (b.4vm)`,
+    )
+    expect(cleanExitDelayStandsLine(KEY, 60, 'its row does not read ended (dead: the row missing)')).toBe(
+      `[slack] Clean-exit check for persona=${KEY}: its row does not read ended (dead: the row missing) — the full 60s restart delay stands (b.4vm)`,
+    )
+    expect(cleanExitLoopGuardLine(KEY, 12, 60, 120)).toBe(
+      `[slack] No clean-exit check for persona=${KEY} — its last clean-exit relaunch ran 12s ago, within session_restart_delay (60s); the full 120s restart delay stands (the clean-exit loop guard: at most one clean-exit relaunch per session_restart_delay) (b.4vm)`,
+    )
+  })
+
+  test('a row read ended at the check relaunches then, not after session_restart_delay: one launch, no kill, nothing counted', async () => {
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_DEAD_ENDED, restartDelay: LONG_S })
+    initRestart(deps)
+
+    scheduleRestart(KEY, CWD, 'sid-1')
+    expect(deps.isSessionAliveCalls).toEqual([])   // nothing is read at the disconnect itself
+    await Bun.sleep(WAIT_MS)
+
+    // The check's read, then the restart work's own probe.
+    expect(deps.isSessionAliveCalls).toEqual([KEY, KEY])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([{ key: KEY, cwd: CWD, sessionId: 'sid-1' }])
+    expect(cleanExitLines()).toEqual([cleanExitRelaunchLine(KEY, LONG_S)])
+    expect(getFailureCount(KEY)).toBe(0)
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+  })
+
+  test('two back-to-back full-delay restarts (the MCP close, then a health tick) with the row read ended: the newer replaces the older with its check — two reads (one check, one work probe) and one launch', async () => {
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_DEAD_ENDED, restartDelay: LONG_S })
+    initRestart(deps)
+
+    scheduleRestart(KEY, CWD)
+    scheduleRestart(KEY, CWD)
+    await Bun.sleep(WAIT_MS)
+
+    expect(deps.isSessionAliveCalls).toEqual([KEY, KEY])
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([KEY])
+    expect(cleanExitLines()).toEqual([cleanExitRelaunchLine(KEY, LONG_S)])
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+  })
+
+  // A crash (`missing`, no row) and every other reading but `ended`: the check
+  // reads once and leaves the restart timer pending at its full delay (what
+  // that timer's work does when it fires is pinned by the rest of the file).
+  test.each<[string, LivenessReading, string]>([
+    ['missing (a crash or kill)', LIVENESS_READING_DEAD_MISSING, 'its row does not read ended (dead: the row missing)'],
+    ['no row (ErrSpawnNotFound; a crash)', LIVENESS_READING_DEAD_NO_ROW, 'its row does not read ended (dead: no row (ErrSpawnNotFound))'],
+    ['dead from ErrSystemInstallDisappeared', LIVENESS_READING_DEAD_INSTALL_GONE, 'its row does not read ended (dead: agent-director\'s install is gone (ErrSystemInstallDisappeared))'],
+    ['dead with no row state', LIVENESS_READING_DEAD, 'its row does not read ended (dead: no row state)'],
+    ['live', LIVENESS_READING_LIVE, 'its row does not read ended (live)'],
+    ['pending', LIVENESS_READING_PENDING, 'its row does not read ended (pending)'],
+    ['unknown', LIVENESS_READING_UNKNOWN, 'its row does not read ended (unknown)'],
+  ])('a reading of %s at the check leaves the full delay: one read, no kill, reconnect or launch, one line naming the reading, the restart still pending', async (_label, reading, why) => {
+    const deps = makeDeps({ isSessionAliveResult: reading, restartDelay: LONG_S })
+    initRestart(deps)
+
+    scheduleRestart(KEY, CWD)
+    await Bun.sleep(WAIT_MS)
+
+    expect(deps.isSessionAliveCalls).toEqual([KEY])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(cleanExitLines()).toEqual([cleanExitDelayStandsLine(KEY, LONG_S, why)])
+    expect(isRestartPendingOrActive(KEY)).toBe(true)
+  })
+
+  // AC 20 (b.av2 SR-10.3), as in the scheduleRestart block's table: a probe
+  // that throws at the check is logged as its description (type, safe code,
+  // message through `redactSlackLogText`, frames), never the error itself.
+  test('AC 20: isSessionAlive throws at the check with an error carrying fake tokens — one stands line naming its type, code and redacted message; the full delay stands; nothing leaks', async () => {
+    const thrown = Object.assign(new Error(`isSessionAlive refused (${sentinelInMessage('msg')})`), {
+      code: 'EIO',
+      detail: fakeToken(APP_TOKEN_PREFIX, 'detail'),
+      note: LEAK_SENTINEL,
+    })
+    const deps = makeDeps({ restartDelay: LONG_S })
+    deps.isSessionAlive = async (key) => { deps.isSessionAliveCalls.push(key); throw thrown }
+    initRestart(deps)
+    // Every console.error argument kept unformatted (errors whole).
+    const errArgs: unknown[][] = []
+    console.error = (...args: unknown[]) => { errArgs.push(args) }
+
+    scheduleRestart(KEY, CWD)
+    await Bun.sleep(WAIT_MS)
+
+    const lines = errArgs.filter((args) => String(args[0]).endsWith('(b.4vm)'))
+    expect(lines).toEqual([[
+      cleanExitDelayStandsLine(KEY, LONG_S, `its row does not read ended (unknown (isSessionAlive failed: ${describeThrownValue(thrown)}))`),
+    ]])
+    expect(String(lines[0]![0])).toStartWith(
+      `[slack] Clean-exit check for persona=${KEY}: its row does not read ended (unknown (isSessionAlive failed: Error code=EIO message="isSessionAlive refused (${REDACTED_SENTINEL_TAIL})" at `,
+    )
+    expect(deps.isSessionAliveCalls).toEqual([KEY])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(isRestartPendingOrActive(KEY)).toBe(true)
+    assertNoLeak({ errArgs })
+  })
+
+  test('a fast relaunch that fails counts; each later restart (a failure on record) gets no check and waits its doubled delay, and the cap stops it at RESTART_FAILURE_CAP', async () => {
+    // The first restart waits LONG_S, so only its check can launch it. The
+    // later ones back off from a small base; every such delay is above the
+    // check's own, so only the failure on record keeps the check off.
+    const CHECK = 0.002
+    const BASE = 0.002
+    const laterDelays = Array.from({ length: RESTART_FAILURE_CAP - 1 }, (_, i) => BASE * Math.pow(2, i + 1))
+    expect(Math.min(...laterDelays)).toBeGreaterThan(CHECK)
+    _setCleanExitRelaunchDelay(CHECK)
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_DEAD_ENDED, restartDelay: LONG_S, launchSessionResult: false })
+    initRestart(deps)
+
+    scheduleRestart(KEY, CWD)
+    await Bun.sleep(WAIT_MS)
+    expect(deps.launchSessionCalls).toHaveLength(1)
+    expect(getFailureCount(KEY)).toBe(1)
+
+    deps.getRestartDelay = () => BASE
+    for (const delay of laterDelays) {
+      scheduleRestart(KEY, CWD)
+      await Bun.sleep(delay * 1000 + CAP_MARGIN_MS)
+    }
+
+    expect(errLines.filter((l) => l.startsWith(`[slack] Scheduling restart for persona=${KEY} `))).toEqual(
+      [LONG_S, ...laterDelays].map((delay) => `[slack] Scheduling restart for persona=${KEY} in ${delay}s (backoff)`),
+    )
+    // The first restart's check relaunched it; no later restart got a check.
+    expect(cleanExitLines()).toEqual([cleanExitRelaunchLine(KEY, LONG_S)])
+    // One check read, on the first restart only; every restart's work read once.
+    expect(deps.isSessionAliveCalls).toHaveLength(RESTART_FAILURE_CAP + 1)
+    expect(deps.launchSessionCalls).toHaveLength(RESTART_FAILURE_CAP)
+    expect(getFailureCount(KEY)).toBe(RESTART_FAILURE_CAP)
+    expect(deps.onCapReachedCalls).toEqual([KEY])
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+  })
+
+  test('loop guard: a restart within session_restart_delay of the last fast relaunch gets no check and keeps the full delay; another persona\'s guard is its own; at the window\'s end a clean exit relaunches fast again', async () => {
+    const clock = createFakeClock()
+    _setRestartNow(clock.now)
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_DEAD_ENDED, restartDelay: LONG_S })
+    initRestart(deps)
+    const launched = () => deps.launchSessionCalls.map((c) => c.key)
+    const guardLine = (since: number) => cleanExitLoopGuardLine(KEY, since, LONG_S, LONG_S)
+
+    scheduleRestart(KEY, CWD)
+    await Bun.sleep(WAIT_MS)
+    expect(launched()).toEqual([KEY])                // the first fast relaunch, at virtual time 0
+
+    // The relaunched session exits again 1 s later; OTHER exits cleanly beside it.
+    await clock.advance(1_000)
+    scheduleRestart(KEY, CWD)
+    scheduleRestart(OTHER, CWD)
+    await Bun.sleep(WAIT_MS)
+
+    // KEY's restart read nothing and keeps its full delay; OTHER's guard is its own.
+    expect(deps.isSessionAliveCalls).toEqual([KEY, KEY, OTHER, OTHER])
+    expect(launched()).toEqual([KEY, OTHER])
+    expect(isRestartPendingOrActive(KEY)).toBe(true)
+    expect(cleanExitLines()).toEqual([cleanExitRelaunchLine(KEY, LONG_S), guardLine(1), cleanExitRelaunchLine(OTHER, LONG_S)])
+
+    // 1 s before the window ends: still no check.
+    await clock.advanceTo(LONG_S * 1000 - 1_000)
+    scheduleRestart(KEY, CWD)
+    await Bun.sleep(WAIT_MS)
+    expect(deps.isSessionAliveCalls).toHaveLength(4)
+    expect(launched()).toEqual([KEY, OTHER])
+    expect(cleanExitLines().slice(3)).toEqual([guardLine(LONG_S - 1)])
+
+    // At the window's end, a clean exit relaunches fast again.
+    await clock.advanceTo(LONG_S * 1000)
+    scheduleRestart(KEY, CWD)
+    await Bun.sleep(WAIT_MS)
+    expect(launched()).toEqual([KEY, OTHER, KEY])
+    expect(cleanExitLines().slice(4)).toEqual([cleanExitRelaunchLine(KEY, LONG_S)])
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+  })
+
+  test('a teardown (cancelRestartTimer) forgets the last fast relaunch: a restart inside the window after it still gets its check and relaunches fast', async () => {
+    const clock = createFakeClock()
+    _setRestartNow(clock.now)
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_DEAD_ENDED, restartDelay: LONG_S })
+    initRestart(deps)
+
+    scheduleRestart(KEY, CWD)
+    await Bun.sleep(WAIT_MS)
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([KEY])
+
+    await clock.advance(1_000)
+    expect(cancelRestartTimer(KEY)).toBe(false)     // no timer pending: the relaunch already ran
+    scheduleRestart(KEY, CWD)
+    await Bun.sleep(WAIT_MS)
+
+    expect(deps.isSessionAliveCalls).toEqual([KEY, KEY, KEY, KEY])
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([KEY, KEY])
+    expect(cleanExitLines()).toEqual([cleanExitRelaunchLine(KEY, LONG_S), cleanExitRelaunchLine(KEY, LONG_S)])
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+  })
+
+  test('the check\'s relaunch runs through the persona\'s serializer: while an earlier operation holds the persona\'s turn its work is submitted and waits, the persona counting as pending or active, and it launches only once released', async () => {
+    const serializer = createPersonaSerializer()
+    const submitted: string[] = []
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_DEAD_ENDED, restartDelay: LONG_S })
+    deps.serialize = (key, op) => { submitted.push(key); return serializer.run(key, op) }
+    initRestart(deps)
+
+    // An earlier operation for the persona (a teardown, a bring-up retry's launch) holds its turn.
+    let releaseEarlier!: () => void
+    const earlier = serializer.run(KEY, () => new Promise<void>((res) => { releaseEarlier = res }))
+
+    scheduleRestart(KEY, CWD)
+    await Bun.sleep(WAIT_MS)
+
+    // The check read the row (outside the serializer) and submitted the work, which waits.
+    expect(cleanExitLines()).toEqual([cleanExitRelaunchLine(KEY, LONG_S)])
+    expect(submitted).toEqual([KEY])
+    expect(deps.isSessionAliveCalls).toEqual([KEY])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(isRestartPendingOrActive(KEY)).toBe(true)
+
+    releaseEarlier()
+    await earlier
+    await serializer.whenIdle(KEY)
+    await Bun.sleep(1)                               // the timer body releases its active marker
+
+    expect(deps.isSessionAliveCalls).toEqual([KEY, KEY])
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([KEY])
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+  })
+
+  test.each<[string, () => void, boolean]>([
+    ['cancelRestartTimer (a teardown)', () => { cancelRestartTimer(KEY) }, false],
+    ['cancelAllRestartTimers', () => { cancelAllRestartTimers() }, false],
+    ['a newer human-triggered scheduleRestart, which gets no check', () => { scheduleRestart(KEY, CWD, undefined, { humanTrigger: true }) }, true],
+  ])('%s clears the check with the timer: no read and no launch at the check', async (_label, cancel, pending) => {
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_DEAD_ENDED, restartDelay: LONG_S })
+    initRestart(deps)
+
+    scheduleRestart(KEY, CWD)
+    cancel()
+    await Bun.sleep(WAIT_MS)
+
+    expect(deps.isSessionAliveCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(isRestartPendingOrActive(KEY)).toBe(pending)
+  })
+
+  // What stops the check before its read, set between the schedule and the
+  // check. `change` answers a release for a hold it took.
+  const GATE_ERROR = new Error('gate failed')
+  test.each<[string, (deps: ReturnType<typeof makeDeps>) => (() => void) | void, string]>([
+    ['the persona latched', (deps) => { deps.isLatched = () => true }, 'the persona is latched — no liveness read'],
+    ['the persona held on ErrInvalidFlags', (deps) => { deps.isHeld = () => true }, 'the persona is held on ErrInvalidFlags — no liveness read'],
+    ['the server shutting down', (deps) => { deps.isShuttingDown = () => true }, 'the server is shutting down — no liveness read'],
+    ['the persona no longer up', (deps) => { deps.canRestart = () => false }, 'the persona is not up — no liveness read'],
+    ['a launch failure counted while the check waited', () => { recordFailure(KEY) }, 'the persona\'s consecutive launch failure count is 1 — no liveness read'],
+    ['a restart work active for the persona (a holdRestartActive hold)', () => holdRestartActive(KEY), 'a restart work is already active for the persona — no liveness read'],
+    ['the relaunch gate throwing', (deps) => { deps.canRestart = () => { throw GATE_ERROR } }, `the check failed: ${describeThrownValue(GATE_ERROR)}`],
+  ])('%s at the check: no liveness read, one line naming the stop, the full delay stands', async (_label, change, why) => {
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_DEAD_ENDED, restartDelay: LONG_S })
+    initRestart(deps)
+
+    scheduleRestart(KEY, CWD)
+    const release = change(deps)
+    await Bun.sleep(WAIT_MS)
+
+    expect(deps.isSessionAliveCalls).toEqual([])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(cleanExitLines()).toEqual([cleanExitDelayStandsLine(KEY, LONG_S, why)])
+    expect(isRestartPendingOrActive(KEY)).toBe(true)
+    release?.()
+  })
+
+  test.each<[string, 'cancel' | 'shutdown']>([
+    ['the restart is cancelled', 'cancel'],
+    ['the server begins to stop', 'shutdown'],
+  ])('the check\'s read answers ended after %s meanwhile: no launch', async (_label, change) => {
+    let shuttingDown = false
+    const read = Promise.withResolvers<LivenessReading>()
+    const deps = makeDeps({ restartDelay: LONG_S })
+    deps.isShuttingDown = () => shuttingDown
+    deps.isSessionAlive = (key) => { deps.isSessionAliveCalls.push(key); return read.promise }
+    initRestart(deps)
+
+    scheduleRestart(KEY, CWD)
+    await Bun.sleep(WAIT_MS)                         // the check fired; its read is held
+    expect(deps.isSessionAliveCalls).toEqual([KEY])
+
+    if (change === 'cancel') cancelRestartTimer(KEY)
+    else shuttingDown = true
+    read.resolve(LIVENESS_READING_DEAD_ENDED)
+    await Bun.sleep(1)
+
+    expect(deps.launchSessionCalls).toEqual([])
+    // A cancelled restart ends the check silently; a shutdown is named.
+    expect(cleanExitLines()).toEqual(change === 'shutdown' ? [cleanExitDelayStandsLine(KEY, LONG_S, 'the server is shutting down')] : [])
+    expect(isRestartPendingOrActive(KEY)).toBe(change === 'shutdown')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // The not-up guard (b.av2 SR-6.3, SR-6.4): a persona that is not up (broken,
 // or retrying its bring-up) keeps its agent-director row and its running
 // instance. `RestartDeps.canRestart` is asked when a restart is scheduled
@@ -1878,6 +2227,8 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
   let deleteCalls: StubDeleteParams[]
   let spawnCalls: SpawnParams[]
   let findMissingCalls: FindMissingParams[]
+  /** The stub's `status` answer per call; a case may replace it. */
+  let rowStatus: (p: StatusParams) => StatusResult | Error
   let errLines: string[]
   let origConsoleError: typeof console.error
 
@@ -1886,7 +2237,8 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'restart-notup-'))
-    config = makeMultiPersonaConfig([{ name: 'alpha_bot' }, { name: 'beta_bot' }], dir)
+    // A 1 ms poll, so a launch through the real adapter polls its row in 1 ms steps.
+    config = makeMultiPersonaConfig([{ name: 'alpha_bot' }, { name: 'beta_bot' }], dir, { agent_director_poll_interval_ms: 1 })
     ;[a, b] = config.personas as [Persona, Persona]
     statuses = new Map([[a.key, UP], [b.key, UP]])
     outcomesUp = new Set([a.key, b.key])
@@ -1905,8 +2257,9 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
 
     // A's row is gone (a restart would kill and relaunch it); B's is live and
     // idle (a restart reconnects it).
+    rowStatus = (p) => (p.claude_instance_id === personaInstanceId(a.key) ? errSpawnNotFound() : { state: 'waiting' })
     const stub = makeStubClient({
-      statusFn: (p) => (p.claude_instance_id === personaInstanceId(a.key) ? errSpawnNotFound() : { state: 'waiting' }),
+      statusFn: (p) => rowStatus(p),
       statusCalls,
       sendKeysCalls,
       killCalls,
@@ -1921,13 +2274,16 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
     _resetFindMissingMemo()
   })
 
-  afterEach(() => {
-    console.error = origConsoleError
+  afterEach(async () => {
     cancelAllRestartTimers()
+    console.error = origConsoleError
+    await stopApproversAndForgetLaunches()
     resetClientForTests()
     _resetOutageState()
     setSessionNotifier(undefined)
     _resetFindMissingMemo()
+    _resetSpawnHomeDir()
+    _resetDialogReadyTimeoutMs()
     rmSync(dir, { recursive: true, force: true })
   })
 
@@ -2069,6 +2425,54 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
     expect(callsFor(statusCalls, b)).toHaveLength(2)
     expect(callsFor(sendKeysCalls, b)).toHaveLength(1)
     expect(getFailureCount(b.key)).toBe(0)
+  })
+
+  // b.4vm: the clean-exit check asks the relaunch gate again before its
+  // liveness read, so a key that left the applied set while its full-delay
+  // restart waited gets no read and no launch from the check.
+  test('b.4vm, SR-8.6: both rows read ended; A leaves the applied set before the clean-exit checks fire — A gets no status, kill or spawn call and keeps its full delay; B, still applied, relaunches at its check through the real launch adapter', async () => {
+    const LONG_S = 60
+    const instanceOf = (p: Persona) => personaInstanceId(p.key)
+    const idsFor = <T extends { claude_instance_id?: unknown }>(list: T[], p: Persona): T[] =>
+      list.filter((c) => c.claude_instance_id === instanceOf(p))
+    // Each row reads ended (a clean exit) until its persona is spawned again.
+    rowStatus = (p) => (spawnCalls.some((s) => s.claude_instance_id === p.claude_instance_id) ? { state: 'waiting' } : { state: 'ended' })
+    mkdirSync(b.working_directory, { recursive: true })
+    _setSpawnHomeDir(dir)
+    _setDialogReadyTimeoutMs(200)
+    _setCleanExitRelaunchDelay(0.01)
+    const deps = makeRealDeps()
+    deps.getRestartDelay = () => LONG_S
+    initRestart(deps)
+
+    scheduleRestart(a.key, a.working_directory)
+    scheduleRestart(b.key, b.working_directory)
+    // Step 1 of a confirmed apply removes A; its connection and outcome stay up.
+    applied.delete(a.key)
+    // A bounded 1 ms poll for B's launch through the real spawnForPersona.
+    const deadline = Date.now() + 2_000
+    while (isRestartPendingOrActive(b.key) && Date.now() < deadline) await Bun.sleep(1)
+
+    // A: nothing reached agent-director; the gate refused it at the check, and its full delay stands.
+    expect(idsFor(statusCalls, a)).toEqual([])
+    expect(idsFor(sendKeysCalls, a)).toEqual([])
+    expect(idsFor(killCalls, a)).toEqual([])
+    expect(idsFor(spawnCalls, a)).toEqual([])
+    expect(deleteCalls).toEqual([])
+    expect(gateLines).toEqual([removedLine(a.key)])
+    expect(errLines.filter((l) => l.startsWith(`[slack] Clean-exit check for persona=${a.key}:`))).toEqual([
+      cleanExitDelayStandsLine(a.key, LONG_S, 'the persona is not up — no liveness read'),
+    ])
+    expect(isRestartPendingOrActive(a.key)).toBe(true)
+    expect(getFailureCount(a.key)).toBe(0)
+
+    // B: read ended at its check and relaunched then, with no kill.
+    expect(errLines).toContain(cleanExitRelaunchLine(b.key, LONG_S))
+    expect(idsFor(killCalls, b)).toEqual([])
+    expect(idsFor(spawnCalls, b)).toHaveLength(1)
+    expect(isRestartPendingOrActive(b.key)).toBe(false)
+    expect(getFailureCount(b.key)).toBe(0)
+    expect(capCalls).toEqual([])
   })
 })
 
