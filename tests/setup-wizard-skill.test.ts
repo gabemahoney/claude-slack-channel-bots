@@ -710,6 +710,8 @@ describe('setup wizard: cross-references resolve', () => {
     '### `persona-credentials-refused`',
     // b.deo SRI-1109: named by quoted title in "Channels" and "How the change takes effect".
     '## A persona is silent in a channel its app was invited to',
+    // bug b.jpc: named by quoted title in "Reusing an existing app".
+    '## The message archive shows channel IDs: re-install each app to gain `channels:read` and `groups:read`',
   ])('the debugging-skill entry the wizard points to exists: %s', (heading) => {
     const title = heading.replace(/^#+ /, '')
     expect(flat(skill).includes(title.replace(/^`(.*)`$/, '$1'))).toBe(true)
