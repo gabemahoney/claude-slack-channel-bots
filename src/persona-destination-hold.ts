@@ -26,8 +26,9 @@
  * - A payload error is not a destination failure (`isDestinationFailure`): it
  *   neither opens nor extends an episode and never holds the persona's other
  *   prompts and notices. The item follows its per-item handling: a prompt is
- *   logged by the poller and tried again on its next tick; a notice is handed
- *   to its failure callback and dropped (it would fail the same way again).
+ *   logged once by the poller and never posted again as it was (its next
+ *   attempt posts a short prompt in its place, b.zmq); a notice is handed to
+ *   its failure callback and dropped (it would fail the same way again).
  * - A refusal (a `dm` destination with DMs off or no contact, which the loader
  *   rejects) makes no Slack call and is not a failure; the resolver logs it.
  *

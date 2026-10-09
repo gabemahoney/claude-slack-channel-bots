@@ -1448,6 +1448,8 @@ Flow:
 4. The operator clicks Allow / Deny in Slack, in the channel or the DM; the buttons work the same in both. CSCB resolves the click through the same persona: it calls `client.decide({ claude_instance_id, decision, request_token })` and, as that persona, updates the message to "*Permission* — Allowed" or "*Permission* — Denied by operator".
 5. If a tracked prompt closes for any reason other than a Slack click, the next poller tick replaces the buttons with the verdict: "⏱ *Permission* — Timed out", "🪦 *Permission* — Session ended", "*Permission* — Allowed", "*Permission* — Denied by operator", or "*Permission* — Denied (closed)" when the reason is unknown.
 
+The prompt names the tool and shows its input: Bash's command, Edit's or Write's file path, or for any other tool the input as JSON, up to 500 characters. An input too long for Slack's 3000-character limit on a message section is cut to fit and followed by `… (truncated, <shown> of <total> chars shown)`; the rest is not shown in Slack.
+
 While a persona is not up (broken or retrying), its instance keeps running but its permission prompts are not posted and its already-posted prompts are left as they are. They appear, or get their verdict, on the first poll after the persona comes up.
 
 If Slack refuses a post to the persona's destination, see "A permission prompt or notice doesn't arrive" under [Troubleshooting](#troubleshooting).
