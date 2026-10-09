@@ -110,6 +110,8 @@ integrity failures) and which one wins are in
 The procedure has exactly four kinds of Bash call: the launch, a wait, a stop
 and a report. Shell variables do not survive from one Bash call to the next,
 so carry the printed RUN_ID and PID into each later command as literal text.
+When the CI credentials are kept under `CI_ANTHROPIC_*`, the launch's runner
+line and every reader call carry the prefix [Credentials](#credentials) gives.
 
 ### 1. Launch
 
@@ -504,8 +506,15 @@ image read-back refuses after the build.
 | A fault refusal: an unknown or out-of-run script, or a shard number outside 1 to the effective N | Name a script of the run, or a shard from 1 to the effective N |
 | A missing or bad credential | See [Credentials](#credentials) |
 | `NOT RUN: docker does not answer: <error>` | Start Docker, check that `docker info` answers, then re-run |
+| `NOT RUN: docker/Dockerfile.test could not be read (<error>): the base image is the one its FROM instruction names` | Restore `docker/Dockerfile.test`, or fix what the error names (its permissions, the volume), then re-run |
+| `NOT RUN: docker/Dockerfile.test has no FROM instruction: …` or `NOT RUN: docker/Dockerfile.test has <n> FROM instructions: …` | Give `docker/Dockerfile.test` exactly one `FROM` instruction, naming the base image, then re-run |
+| `NOT RUN: docker/Dockerfile.test's FROM instruction names no base image by a fixed name: <instruction>` | Make the `FROM` instruction name the base image by a fixed name: no `$` variable, and nothing after the name but an optional `AS <stage>`. Then re-run |
+| `NOT RUN: checking whether the base image <image> exists failed: <error>` | Docker did not answer the image query: check that `docker info` answers and fix what the error names, then re-run |
 | A base-image prerequisite missing | See [The base image](#the-base-image) |
+| `NOT RUN: packing failed: creating <path> failed: <error>` | Fix what the error names (the run directory's volume, its free space or permissions), then re-run |
 | `npm pack failed (exit <code>): …` | Run `npm install` in the worktree, then re-run |
+| `NOT RUN: npm pack failed: its output named no tarball that it wrote into <path>` | Run `npm pack --dry-run` in the worktree and check that it ends with a `.tgz` file name; run `npm install`, then re-run |
+| `NOT RUN: packing failed: making <path> read-only and hashing it failed: <error>` | Fix what the error names (the run directory's volume, its free space or permissions), then re-run |
 | The admission lock busy: `NOT RUN: the admission lock stayed busy for 30 s: run <RUN_ID> (PID <PID>) holds it` | Another run is being admitted; re-run once its admission is done |
 | `NOT RUN: the admission lock <path> could not be taken: <error>` | Fix what the error names (the lock file's directory under the account's home, its permissions, the volume), then re-run |
 | A reading that fails: `NOT RUN: memory: could not read <what>: <error>` or `NOT RUN: disk: could not read <what>: <error>`, an unreadable reservation of a live run included | Fix what the line names (a cgroup file, the volume, docker, the reservation), then re-run |
@@ -558,6 +567,40 @@ environment. Pass the credentials on the spawn command:
 
 For a gateway credential, add
 `--extra-env ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL}" --extra-env ANTHROPIC_MODEL="${ANTHROPIC_MODEL}"`.
+
+These are the names the worker's own Claude Code reads too. Passed this way,
+they move the worker's own session onto the CI key, and for a gateway
+credential onto its gateway and model as well. Use this route only when that
+is wanted.
+
+To keep the worker's own session on its own credentials, pass the CI
+credentials under other names instead: `CI_ANTHROPIC_API_KEY`, and for a
+gateway credential `CI_ANTHROPIC_BASE_URL` and `CI_ANTHROPIC_MODEL`
+(`--extra-env CI_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}"`, and so on). The
+runner and the reader read only the `ANTHROPIC_*` names, so set those from
+the `CI_ANTHROPIC_*` values on each command, never by exporting them in the
+worker's shell. Prefix the launch's runner line and every reader call: each
+wait, each stop and the report. The reader needs the values as well as the
+runner: the report replaces each secret value of its own environment with
+`<redacted>`, so it can mask only the key it was given. The wait and the stop
+read no credential; they take the prefix too so that every reader call has
+the same form. The prefix is:
+
+```sh
+ANTHROPIC_API_KEY="${CI_ANTHROPIC_API_KEY}" ANTHROPIC_BASE_URL="${CI_ANTHROPIC_BASE_URL}" ANTHROPIC_MODEL="${CI_ANTHROPIC_MODEL}"
+```
+
+- **The launch.** Put the prefix, then a space, at the start of the line that
+  begins `setsid bun scripts/ci-run.ts`. The other lines of the launch are
+  unchanged.
+- **Each reader call.** Put the prefix, then a space, before
+  `bun scripts/ci-verdict.ts` in every wait, every stop and the report. The
+  `; echo` after the call is unchanged.
+- **A raw key.** Leave out the `ANTHROPIC_BASE_URL` and `ANTHROPIC_MODEL`
+  assignments.
+- **By hand.** Finishing a run by hand (see
+  [Finishing a run by hand](#finishing-a-run-by-hand)) takes the same prefix on
+  each reader call.
 
 ### The base image
 

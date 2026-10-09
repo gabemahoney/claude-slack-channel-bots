@@ -3240,8 +3240,9 @@ A refused run writes no verdict: it records its refusal in its status file
 instead, and the reader reports it as `NOT RUN: <reason>`. Besides the
 validation refusals above and admission's refusals (see `docker/README.md`),
 these three come from the run's own steps, each ending in the error on one
-line (the skill's refusal table lists every refusal, the base-image, packing
-and read-back ones included, with what to do):
+line (the skill's refusal table, in `.claude/skills/ci/SKILL.md`, says what to
+do for each kind of refusal, the base-image, packing and read-back ones
+included):
 
 - `NOT RUN: docker does not answer: <error>`, before anything is built;
 - `NOT RUN: the admission lock <path> could not be taken: <error>`, for a
