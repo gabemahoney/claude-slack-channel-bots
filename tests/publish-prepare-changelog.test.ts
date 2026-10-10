@@ -30,6 +30,15 @@
  * rollback's code; one fixture case makes the rollback's own `git checkout`
  * fail and checks the SR-3.2 diagnostic, its place after the failing step's,
  * and the exit code the entry describes.
+ *
+ * Bug b.1ba: the rollback ran `git checkout -- …`, which restores from the
+ * index. When the SR-5.1 release commit failed (exit 30) after `git add` had
+ * staged the bump, it restored nothing, though the diagnostic said the tree
+ * was rolled back. It now checks out from HEAD, restoring the tree and the
+ * index. Two fixture cases fail SR-5.1 with the bump staged (a repo-local
+ * pre-commit hook that fails, and a stub `git` whose `add` stages the files,
+ * then fails), record what was staged when the step failed, and check exit 30
+ * and a repo back at HEAD; the header case pins the rollback's command.
  */
 
 import { afterEach, describe, expect, test } from 'bun:test'
@@ -63,6 +72,9 @@ const FIXTURE_USER_EMAIL = 'test@example.invalid'
 
 /** Keeps the host's system git configuration out, as the temp HOME keeps the global one out. */
 const FIXTURE_GIT_EXTRAS: Readonly<Record<string, string>> = Object.freeze({ GIT_CONFIG_NOSYSTEM: '1' })
+
+/** The SR-3.2 rollback's command: from HEAD, so it restores the index as well as the tree (b.1ba). */
+const ROLLBACK_CHECKOUT = 'git checkout HEAD -- package.json bun.lock CHANGELOG.md'
 
 const RUN_TIMEOUT_MS = 20_000
 const TEST_TIMEOUT_MS = 30_000
@@ -103,6 +115,8 @@ interface Fixture {
   bin: string
   /** Where the stub `bun` records CHANGELOG.md as it was when the pack ran. */
   changelogAtPack: string
+  /** Where a failing SR-5.1 step records the paths staged when it failed. */
+  stagedAtFailure: string
 }
 
 interface FixtureOptions {
@@ -110,6 +124,12 @@ interface FixtureOptions {
   /** `fail-locked` also leaves a `.git/index.lock`, so the rollback's `git checkout` fails too. */
   pack?: 'ok' | 'fail' | 'fail-locked'
   date?: 'ok' | 'fail'
+  /**
+   * `commit-fails` installs a repo-local pre-commit hook that fails;
+   * `add-fails` puts a stub `git` first on PATH whose `add` stages the files,
+   * then fails. Both record the staged paths first.
+   */
+  release?: 'ok' | 'add-fails' | 'commit-fails'
 }
 
 const roots: string[] = []
@@ -131,11 +151,11 @@ function writeExec(path: string, lines: string[]): void {
   chmodSync(path, 0o755)
 }
 
-/** The real `date`, run by the stub at the fixed instant. */
-function realDate(): string {
-  const dir = resolveToolDir('date')
-  if (dir === undefined) throw new Error('date is not on PATH')
-  return join(dir, 'date')
+/** A system tool's real path, for a stub that runs it (`date` at the fixed instant, `git` around a failing `add`). */
+function realTool(name: string): string {
+  const dir = resolveToolDir(name)
+  if (dir === undefined) throw new Error(`${name} is not on PATH`)
+  return join(dir, name)
 }
 
 /**
@@ -152,6 +172,7 @@ function makeFixture(opts: FixtureOptions): Fixture {
     repo: join(root, 'repo'),
     bin: join(root, 'bin'),
     changelogAtPack: join(root, 'record', 'changelog-at-pack.md'),
+    stagedAtFailure: join(root, 'record', 'staged-at-failure.txt'),
   }
   for (const dir of [fx.home, join(fx.repo, 'scripts'), fx.bin, join(root, 'record'), join(root, 'pack', 'package')]) {
     mkdirSync(dir, { recursive: true })
@@ -184,8 +205,21 @@ function makeFixture(opts: FixtureOptions): Fixture {
   ])
   writeExec(join(fx.bin, 'date'), [
     '#!/usr/bin/env bash',
-    opts.date === 'fail' ? 'exit 1' : `exec ${JSON.stringify(realDate())} -d ${INSTANT} "$@"`,
+    opts.date === 'fail' ? 'exit 1' : `exec ${JSON.stringify(realTool('date'))} -d ${INSTANT} "$@"`,
   ])
+  /** git's arguments that record the staged paths. */
+  const recordStaged = `diff --cached --name-only > ${JSON.stringify(fx.stagedAtFailure)}`
+  if (opts.release === 'add-fails') {
+    const realGit = JSON.stringify(realTool('git'))
+    writeExec(join(fx.bin, 'git'), [
+      '#!/usr/bin/env bash',
+      `[ "$1" = add ] || exec ${realGit} "$@"`,
+      `${realGit} "$@" || exit 1`,
+      `${realGit} ${recordStaged}`,
+      'echo "stub git: add failed" >&2',
+      'exit 1',
+    ])
+  }
 
   git(fx, 'init', '-q')
   git(fx, 'config', 'user.name', FIXTURE_USER_NAME)
@@ -193,6 +227,11 @@ function makeFixture(opts: FixtureOptions): Fixture {
   git(fx, 'config', 'commit.gpgsign', 'false')
   git(fx, 'add', '-A')
   git(fx, 'commit', '-q', '-m', 'init')
+  if (opts.release === 'commit-fails') {
+    // After the fixture's own commit, so only the release commit meets it.
+    mkdirSync(join(fx.repo, '.git', 'hooks'), { recursive: true })
+    writeExec(join(fx.repo, '.git', 'hooks', 'pre-commit'), ['#!/usr/bin/env bash', `git ${recordStaged}`, 'echo "stub hook: pre-commit failed" >&2', 'exit 1'])
+  }
   return fx
 }
 
@@ -284,6 +323,35 @@ describe('b.689: a failure at or after the CHANGELOG.md rewrite rolls it back', 
 })
 
 // ---------------------------------------------------------------------------
+// A failed release commit, with the bump staged (b.1ba)
+// ---------------------------------------------------------------------------
+
+describe('b.1ba: a failed SR-5.1 release commit rolls the bump back out of the tree and the index', () => {
+  const CASES: [string, FixtureOptions['release'], string][] = [
+    ["'git commit' (its pre-commit hook fails)", 'commit-fails', `SR-5.1 (release commit): 'git commit -m "Release v${NEXT_VERSION}"' did not succeed`],
+    ["'git add' (it stages the files, then fails)", 'add-fails', "SR-5.1 (release commit): 'git add package.json bun.lock CHANGELOG.md' did not succeed"],
+  ]
+
+  test.each(CASES)(
+    '%s: exit 30, and the repo is back at HEAD with nothing staged, as the diagnostic says',
+    (_, release, diagnostic) => {
+      const fx = makeFixture({ changelog: unreleasedChangelog('## Unreleased'), release })
+      const head = git(fx, 'rev-parse', 'HEAD')
+      const { code, stderr } = runPrepare(fx)
+      expect(code).toBe(30)
+      expect(stderr).toContain(diagnostic)
+      expect(stderr).toContain('Working tree and index have been rolled back to HEAD')
+      expect(stderr).not.toContain('SR-3.2 (rollback)')
+      expect(stderr).not.toContain('SR-99.0')
+      // The step failed with the bump staged, so the clean index below is the rollback's doing.
+      expect(readFileSync(fx.stagedAtFailure, 'utf-8').split('\n').filter(Boolean)).toEqual(['CHANGELOG.md', 'package.json'])
+      expectRolledBack(fx, head)
+    },
+    TEST_TIMEOUT_MS,
+  )
+})
+
+// ---------------------------------------------------------------------------
 // The SR-3.2 rollback's own failure (b.42j)
 // ---------------------------------------------------------------------------
 
@@ -295,7 +363,7 @@ describe("b.42j: the SR-3.2 rollback's own checkout fails", () => {
       const { code, stderr } = runPrepare(fx)
       expect(code).toBe(21)
       expect(stderr).toContain('SR-4.1 (pack)')
-      expect(stderr).toContain("SR-3.2 (rollback): 'git checkout -- package.json bun.lock CHANGELOG.md' failed")
+      expect(stderr).toContain(`SR-3.2 (rollback): '${ROLLBACK_CHECKOUT}' failed`)
       // The failing step's own line first, then the rollback's.
       expect(stderr.indexOf('SR-4.1 (pack)')).toBeLessThan(stderr.indexOf('SR-3.2 (rollback)'))
       expect(stderr).not.toContain('SR-99.0')
@@ -315,11 +383,11 @@ describe("b.42j: publish-prepare.sh's exit-code header documents the SR-3.2 roll
   const script = readFileSync(PREPARE_SCRIPT, 'utf-8')
   const entries = headerEntries(shellHeader(script), 'SR-3.2')
   /** The `git checkout` the rollback runs. */
-  const checkout = /^rollback_working_tree\(\) \{\n[\s\S]*?\bif ! (git checkout -- [^;\n]+); then/m.exec(script)?.[1]
+  const checkout = /^rollback_working_tree\(\) \{\n[\s\S]*?\bif ! (git checkout [^;\n]+); then/m.exec(script)?.[1]
 
-  test('one SR-3.2 entry, with no exit code of its own, naming the checkout of all three files', () => {
+  test('one SR-3.2 entry, with no exit code of its own, naming the checkout of all three files from HEAD', () => {
     expect(entries.map((entry) => entry.code)).toEqual([null])
-    expect(checkout).toBe('git checkout -- package.json bun.lock CHANGELOG.md')
+    expect(checkout).toBe(ROLLBACK_CHECKOUT)
     expect(joinCommentLines(entries[0]!.text)).toContain(`'${checkout}'`)
   })
 

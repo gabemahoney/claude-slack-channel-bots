@@ -9,10 +9,14 @@
 # locally, and writes a manifest file at .publish-state.json that
 # publish-promote.sh consumes.
 #
-# Nothing here pushes to origin or publishes to npm. Every failure path either
-# rolls the working tree back to HEAD (when the failure is before SR-5.1
-# commit) or leaves the local commit in place with explicit operator-recovery
-# prose on stderr (when the failure is at SR-5.1 tag, after the commit landed).
+# Nothing here pushes to origin or publishes to npm. A failure before the bump
+# (argument, location, preflight) leaves the working tree untouched. Every
+# failure from the SR-3.1 bump up to and including a failed SR-5.1 'git add'
+# or 'git commit' rolls package.json, bun.lock and CHANGELOG.md back to HEAD in
+# both the working tree and the index (SR-3.2), so nothing is left staged or
+# committed. A failure after the commit landed (SR-5.1 tag, SR-8.1 manifest)
+# leaves the local commit (and, at SR-8.1, the tag) in place with explicit
+# operator-recovery prose on stderr.
 #
 # Operator-side rollback after a successful prepare (e.g. if smoke looks fine
 # but the operator changes their mind before promote):
@@ -48,11 +52,12 @@
 #                heading, OR its rewrite to the release's heading failed
 #   --  SR-3.2  rollback, no exit code of its own. Runs on the 20, 21, 22, 23
 #                and 30 failures (and any other non-zero smoke-check.sh exit):
-#                'git checkout -- package.json bun.lock CHANGELOG.md' restores
-#                those files from the index: HEAD's copies, except when 'git
-#                commit' fails (30) after 'git add' staged the bump, where it
-#                changes nothing. If that checkout itself fails it prints its
-#                own SR-3.2 diagnostic; the exit code is still the failing step's
+#                'git checkout HEAD -- package.json bun.lock CHANGELOG.md'
+#                restores those files to HEAD's copies in the working tree and
+#                the index alike, so after a failed 'git add' or 'git commit'
+#                it also unstages whatever of the bump 'git add' had staged.
+#                If that checkout itself fails it prints its own SR-3.2
+#                diagnostic; the exit code is still the failing step's
 #   21  SR-4.1  bun pm pack failed or tarball internal version mismatch
 #   22  SR-4.2  scratch install failed (from smoke-check.sh)
 #   23  SR-4.3  bin smoke contract failed (from smoke-check.sh)
@@ -117,11 +122,15 @@ cleanup() {
 trap '_rc=$?; _cmd="${BASH_COMMAND}"; cleanup; if [ $_rc -ne 0 ] && [ "${SR_GUARDED_EXIT:-0}" != "1" ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $_rc at command: $_cmd. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
 
 rollback_working_tree() {
-  # SR-3.2: restore package.json, bun.lock and CHANGELOG.md to HEAD. If git
-  # checkout itself errors, surface that — silently swallowing it would leave
-  # the working tree in a half-bumped state with no diagnostic.
-  if ! git checkout -- package.json bun.lock CHANGELOG.md; then
-    echo "SR-3.2 (rollback): 'git checkout -- package.json bun.lock CHANGELOG.md' failed. Working tree may still contain the bumped version or the rewritten CHANGELOG.md heading. Run 'git status' to inspect, then 'git checkout -- package.json bun.lock CHANGELOG.md' manually." >&2
+  # SR-3.2: restore package.json, bun.lock and CHANGELOG.md to HEAD, in the
+  # working tree and the index. Checking out from HEAD, not from the index,
+  # matters on the exit-30 paths: there 'git add' has already staged all or
+  # part of the bump, so a checkout from the index would restore nothing. If
+  # git checkout itself errors, surface that — silently swallowing it would
+  # leave the working tree or the index in a half-bumped state with no
+  # diagnostic.
+  if ! git checkout HEAD -- package.json bun.lock CHANGELOG.md; then
+    echo "SR-3.2 (rollback): 'git checkout HEAD -- package.json bun.lock CHANGELOG.md' failed. Working tree may still contain the bumped version or the rewritten CHANGELOG.md heading, and after a failed 'git add' or 'git commit' the index may still have them staged. Run 'git status' to inspect, then 'git checkout HEAD -- package.json bun.lock CHANGELOG.md' manually." >&2
   fi
 }
 
@@ -228,13 +237,13 @@ fi
 
 # SR-5.1 — release commit + annotated tag (no push yet)
 if ! git add package.json bun.lock CHANGELOG.md; then
-  echo "SR-5.1 (release commit): 'git add package.json bun.lock CHANGELOG.md' did not succeed. Working tree has been rolled back. Inspect git status, then rerun '/publish prepare ${BUMP_KIND}'." >&2
+  echo "SR-5.1 (release commit): 'git add package.json bun.lock CHANGELOG.md' did not succeed. Working tree and index have been rolled back to HEAD (package.json, bun.lock and CHANGELOG.md restored, and anything 'git add' staged unstaged; nothing is committed). Inspect git status, then rerun '/publish prepare ${BUMP_KIND}'." >&2
   rollback_working_tree
   sr_exit 30
 fi
 
 if ! git commit -m "Release v${NEXT_VERSION}" > /dev/null; then
-  echo "SR-5.1 (release commit): 'git commit -m \"Release v${NEXT_VERSION}\"' did not succeed. Working tree has been rolled back (nothing is committed). Inspect git status (a pre-commit hook may have failed), then rerun '/publish prepare ${BUMP_KIND}'." >&2
+  echo "SR-5.1 (release commit): 'git commit -m \"Release v${NEXT_VERSION}\"' did not succeed. Working tree and index have been rolled back to HEAD (package.json, bun.lock and CHANGELOG.md restored and unstaged; nothing is committed). Inspect git status (a pre-commit hook may have failed), then rerun '/publish prepare ${BUMP_KIND}'." >&2
   rollback_working_tree
   sr_exit 30
 fi
