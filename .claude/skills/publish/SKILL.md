@@ -12,7 +12,7 @@ Cut a release of `claude-slack-channel-bots` end-to-end. This skill is the **con
 
 The two halves are also individually invocable:
 
-- **`/publish prepare <bump>`** — reversible half: bump, pack, smoke, commit + tag locally, write `.publish-state.json`. Nothing reaches origin or npm. Free to rerun until prepare feels right.
+- **`/publish prepare <bump>`** — reversible half: bump, version `CHANGELOG.md`, pack, smoke, commit + tag locally, write `.publish-state.json`. Nothing reaches origin or npm. Free to rerun until prepare feels right.
 - **`/publish promote`** — irreversible-but-short half: read manifest, verify state, push commit, npm publish, push tag, poll registry, sanitize globals, reinstall, verify. Idempotent on retry where possible.
 
 Use the two-step path when you want a checkpoint between "this release is ready" and "this release is published." Use `/publish <bump>` for the happy-path one-shot.
@@ -27,7 +27,7 @@ Three guards are **warn-only** and have never had exit codes of their own — **
 
 The LLM driving /publish MUST NOT, in response to any SR-X.Y diagnostic:
 
-- Execute side-effecting commands outside the skill's own scripts. No manual `git push`, `git pull`, `git reset`, `git tag`, `npm publish`, `npm login`, `bun install -g`, no manual edits to `package.json`, `bun.lock`, the global package.json, `.publish-state.json`, or any config file. This applies even when the failure prose *names* the command — the named command is for the operator, not the LLM.
+- Execute side-effecting commands outside the skill's own scripts. No manual `git push`, `git pull`, `git reset`, `git tag`, `npm publish`, `npm login`, `bun install -g`, no manual edits to `package.json`, `bun.lock`, `CHANGELOG.md`, the global package.json, `.publish-state.json`, or any config file. This applies even when the failure prose *names* the command — the named command is for the operator, not the LLM.
 - Invoke /publish (or /publish prepare, or /publish promote) a second time within a session without first either (a) the operator fixing the precondition that the failure prose names, or (b) filing a bee against the skill and waiting for human guidance. The LLM must not "try again to see if it works now" or rerun any /publish variant after performing its own out-of-band fix.
 - Paraphrase, omit, soften, or "interpret around" an SR-X.Y diagnostic. Report it verbatim to the orchestrator/operator. On a **fatal** guard (the script exited non-zero) that means report verbatim **and stop**. On a **warn-only** guard (SR-7.0, SR-7.4b, SR-7.5, with the script still running or exited 0) it means report verbatim **and continue** — do not abort the procedure, do not describe the release as failed, and still relay the success summary if the script exits 0. Either way the LLM performs none of the remediation the diagnostic names.
 
@@ -74,7 +74,7 @@ Prepare-phase exit codes (script: `scripts/publish-prepare.sh`):
 | 15   | SR-2.5 | host's agent-director check failed: no binary found, OR its version cannot be read, OR it is below the installed agent-director client's minimum, OR that minimum cannot be read, OR `scripts/ad-version-check.ts` did not run to completion. Every SR-2.5 diagnostic names the README section "Switching over to agent-director Phase 1". A binary at or above the client's minimum but below CSCB's Phase 1 floor does not fail: it passes with an `SR-2.5 (preflight) NOTE` | operator: follow the diagnostic's operator recovery; the host's agent-director is changed only by the README section "Switching over to agent-director Phase 1"; then rerun /publish. When the client's minimum cannot be read or the check did not run to completion, the operator assesses before any rerun |
 | 16   | SR-2.6 | stranded finished work: a finished ticket's fix is neither on `main` nor explicitly closed, OR an unmerged branch references a finished ticket (audit exit 1) | operator: land the fix or explicitly close the ticket (stated reason — no-repro/won't-fix/not-a-bug/by design/works as intended/superseded/abandoned/satisfied-by-other-work, with a pointer — or an anchored `## +closed:out-of-repo <path>` / `## +closed:docs-only` heading); merge or delete the branch; then rerun /publish |
 | 17   | SR-2.6 | the finished-work audit could not run — it could not locate the hives / a git repo / a `main` ref from this checkout (audit exit 2 or other). NOT stranded work; a setup failure. Release still blocked (fail closed). | operator: rerun /publish from the canonical checkout that sits beside the Bugs/Plans/Ideas hives (the main working clone), not a throwaway/`/tmp` clone |
-| 20   | SR-3.1 | `npm version <bump>` failed | working tree rolled back; operator investigates |
+| 20   | SR-3.1 | `npm version <bump>` failed, OR `CHANGELOG.md` has no `## Unreleased` heading, OR its rewrite to the release's heading failed (`date -u` or `node` failed); the two `CHANGELOG.md` failures print `SR-3.1 (changelog)` | working tree rolled back (`package.json`, `bun.lock` and `CHANGELOG.md`); operator investigates, then reruns /publish; with no `## Unreleased` heading, operator puts this release's notes under an `## Unreleased` heading as `CHANGELOG.md`'s first `##` entry, commits that to main, then reruns /publish |
 | 21   | SR-4.1 | `bun pm pack` failed or tarball internal version mismatch | working tree rolled back; operator investigates |
 | 22   | SR-4.2 | scratch install failed or installed version mismatch | working tree rolled back; operator inspects bun install / tarball layout |
 | 23   | SR-4.3 | smoke contract violated | working tree rolled back; operator updates `src/cli.ts` or the smoke contract |
@@ -109,7 +109,7 @@ The LLM's response on any non-zero exit is the same: relay the script's stderr v
 
 ## File pointers
 
-- `scripts/publish-prepare.sh` — reversible half (preflight + bump + pack + smoke + commit + tag + manifest)
+- `scripts/publish-prepare.sh` — reversible half (preflight + bump + `CHANGELOG.md` heading + pack + smoke + commit + tag + manifest)
 - `scripts/publish-promote.sh` — irreversible half (push commit + publish + push tag + poll + sanitize + reinstall + verify)
 - `scripts/preflight.sh` — invoked by `publish-prepare.sh` (SR-2.1–SR-2.6)
 - `scripts/ad-version-check.ts` — the host agent-director check that `preflight.sh` runs for SR-2.5 (pass, pass with the `SR-2.5 (preflight) NOTE`, or exit 15)

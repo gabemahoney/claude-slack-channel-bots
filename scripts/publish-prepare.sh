@@ -2,9 +2,12 @@
 #
 # /publish prepare — the reversible half of a release.
 #
-# Runs preflight, bumps the version, packs the tarball, runs the smoke check,
-# commits the release commit and annotated tag locally, and writes a manifest
-# file at .publish-state.json that publish-promote.sh consumes.
+# Runs preflight, bumps the version, turns CHANGELOG.md's "## Unreleased" entry
+# into the release's "## <version> (<UTC date>)" entry under a fresh empty
+# "## Unreleased" one, packs the tarball, runs the smoke check, commits the
+# release commit (package.json, bun.lock, CHANGELOG.md) and annotated tag
+# locally, and writes a manifest file at .publish-state.json that
+# publish-promote.sh consumes.
 #
 # Nothing here pushes to origin or publishes to npm. Every failure path either
 # rolls the working tree back to HEAD (when the failure is before SR-5.1
@@ -41,7 +44,8 @@
 #                hives / a git repo / a 'main' ref from this checkout) — a setup
 #                failure, NOT stranded work. FAIL CLOSED: release still blocked.
 #                Recovery: rerun from the canonical checkout beside the hives.
-#   20  SR-3.1  npm version bump failed
+#   20  SR-3.1  npm version bump failed, OR CHANGELOG.md has no '## Unreleased'
+#                heading, OR its rewrite to the release's heading failed
 #   21  SR-4.1  bun pm pack failed or tarball internal version mismatch
 #   22  SR-4.2  scratch install failed (from smoke-check.sh)
 #   23  SR-4.3  bin smoke contract failed (from smoke-check.sh)
@@ -106,11 +110,11 @@ cleanup() {
 trap '_rc=$?; _cmd="${BASH_COMMAND}"; cleanup; if [ $_rc -ne 0 ] && [ "${SR_GUARDED_EXIT:-0}" != "1" ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $_rc at command: $_cmd. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
 
 rollback_working_tree() {
-  # SR-3.2: restore package.json and bun.lock to HEAD. If git checkout itself
-  # errors, surface that — silently swallowing it would leave the working tree
-  # in a half-bumped state with no diagnostic.
-  if ! git checkout -- package.json bun.lock; then
-    echo "SR-3.2 (rollback): 'git checkout -- package.json bun.lock' failed. Working tree may still contain the bumped version. Run 'git status' to inspect, then 'git checkout -- package.json bun.lock' manually." >&2
+  # SR-3.2: restore package.json, bun.lock and CHANGELOG.md to HEAD. If git
+  # checkout itself errors, surface that — silently swallowing it would leave
+  # the working tree in a half-bumped state with no diagnostic.
+  if ! git checkout -- package.json bun.lock CHANGELOG.md; then
+    echo "SR-3.2 (rollback): 'git checkout -- package.json bun.lock CHANGELOG.md' failed. Working tree may still contain the bumped version or the rewritten CHANGELOG.md heading. Run 'git status' to inspect, then 'git checkout -- package.json bun.lock CHANGELOG.md' manually." >&2
   fi
 }
 
@@ -134,7 +138,43 @@ esac
 
 # SR-3.1 — bump (no commit; npm version --no-git-tag-version)
 if ! npm version "${BUMP_KIND}" --no-git-tag-version > /dev/null; then
-  echo "SR-3.1 (bump): 'npm version ${BUMP_KIND} --no-git-tag-version' did not apply. Working tree has been rolled back (package.json + bun.lock restored). Investigate the npm error above, then rerun '/publish prepare ${BUMP_KIND}'." >&2
+  echo "SR-3.1 (bump): 'npm version ${BUMP_KIND} --no-git-tag-version' did not apply. Working tree has been rolled back (package.json, bun.lock and CHANGELOG.md restored). Investigate the npm error above, then rerun '/publish prepare ${BUMP_KIND}'." >&2
+  rollback_working_tree
+  sr_exit 20
+fi
+
+# SR-3.1 — CHANGELOG.md. The first "## Unreleased" heading (bare, or with a
+# trailing note such as "## Unreleased (next patch version)") becomes
+# "## <next_version> (<date>)", so the notes under it are now this release's
+# entry, and a fresh empty "## Unreleased" entry goes above it, set off by the
+# file's "---" rule. The date is today's UTC date, as the manifest's
+# prepared_at is UTC. This runs before SR-4.1, so every later failure rolls it
+# back with package.json, and the release commit and tag carry the new heading.
+# The node step sets exit code 64 when the file has no "## Unreleased" heading.
+CHANGELOG_EXIT=0
+if ! RELEASE_DATE="$(date -u +%Y-%m-%d)" || [ -z "${RELEASE_DATE}" ]; then
+  CHANGELOG_EXIT=1
+else
+  node -e '
+    const fs = require("fs");
+    const [version, date] = process.argv.slice(1);
+    const text = fs.readFileSync("CHANGELOG.md", "utf8");
+    const unreleased = /^## Unreleased(?:[ \t].*)?$/m;
+    if (!unreleased.test(text)) {
+      process.exitCode = 64;
+    } else {
+      fs.writeFileSync("CHANGELOG.md", text.replace(unreleased, () => "## Unreleased\n\n---\n\n## " + version + " (" + date + ")"));
+    }
+  ' "${NEXT_VERSION}" "${RELEASE_DATE}" || CHANGELOG_EXIT=$?
+fi
+
+if [ "${CHANGELOG_EXIT}" = "64" ]; then
+  echo "SR-3.1 (changelog): CHANGELOG.md has no '## Unreleased' heading, so there is no entry to turn into the ${NEXT_VERSION} release notes. Working tree has been rolled back (package.json, bun.lock and CHANGELOG.md restored). Put this release's notes under an '## Unreleased' heading as the file's first '##' entry, commit that to main, then rerun '/publish prepare ${BUMP_KIND}'." >&2
+  rollback_working_tree
+  sr_exit 20
+fi
+if [ "${CHANGELOG_EXIT}" != "0" ]; then
+  echo "SR-3.1 (changelog): could not rewrite CHANGELOG.md's '## Unreleased' heading to '## ${NEXT_VERSION} (${RELEASE_DATE:-<UTC date>})' ('date -u' or node failed). Working tree has been rolled back (package.json, bun.lock and CHANGELOG.md restored). Investigate the error above, then rerun '/publish prepare ${BUMP_KIND}'." >&2
   rollback_working_tree
   sr_exit 20
 fi
@@ -180,8 +220,8 @@ if [ "${SMOKE_EXIT}" != "0" ]; then
 fi
 
 # SR-5.1 — release commit + annotated tag (no push yet)
-if ! git add package.json bun.lock; then
-  echo "SR-5.1 (release commit): 'git add package.json bun.lock' did not succeed. Working tree has been rolled back. Inspect git status, then rerun '/publish prepare ${BUMP_KIND}'." >&2
+if ! git add package.json bun.lock CHANGELOG.md; then
+  echo "SR-5.1 (release commit): 'git add package.json bun.lock CHANGELOG.md' did not succeed. Working tree has been rolled back. Inspect git status, then rerun '/publish prepare ${BUMP_KIND}'." >&2
   rollback_working_tree
   sr_exit 30
 fi

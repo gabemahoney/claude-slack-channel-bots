@@ -54,12 +54,14 @@ every SR-X.Y release gate (clean tree, tests, typecheck, npm auth, next-version
 availability, finished-work audit, and the `/ci` Docker suite).
 
 Release notes live in `CHANGELOG.md` at the repo root, under an "Unreleased"
-heading until the release is cut. `/publish` does not read that file: the
-release commit and the annotated `v<version>` tag `/publish prepare` creates
-both stay `Release v<version>`. Once the release is published, rename its
-"Unreleased" heading to the version and publish date by hand, as in
-`## 0.11.0 (2026-10-06)`. `CHANGELOG.md` is not in `package.json`'s `files`,
-so the npm tarball does not carry it.
+heading until the release is cut. `/publish prepare` versions them: it turns
+the first `## Unreleased` heading into the version and today's UTC date, as in
+`## 0.11.0 (2026-10-06)`, adds a fresh empty `## Unreleased` entry above it,
+and commits the file in the release commit. Do not rename the heading by hand.
+With no `## Unreleased` heading, prepare stops at `SR-3.1 (changelog)` (exit
+20) and rolls back. The release commit and the annotated `v<version>` tag
+messages stay `Release v<version>`. `CHANGELOG.md` is not in `package.json`'s
+`files`, so the npm tarball does not carry it.
 
 > **Version note.** `/publish prepare` does **not** publish the in-tree
 > `package.json` version as it stands — it runs `npm version <kind>` against it,
@@ -81,8 +83,8 @@ Or the one-shot alias:
 /publish <kind>
 ```
 
-`/publish prepare` bumps, packs, smoke-tests the tarball, and commits + tags
-locally — nothing reaches origin or npm, so it is free to rerun. `/publish
+`/publish prepare` bumps, versions `CHANGELOG.md`, packs, smoke-tests the
+tarball, and commits + tags locally — nothing reaches origin or npm, so it is free to rerun. `/publish
 promote` pushes the commit, runs `npm publish`, pushes the tag, polls the
 registry until `<version>` is visible, then sanitizes the global manifest and
 reinstalls (see Phase 2 — promote already does the registry reinstall for you).

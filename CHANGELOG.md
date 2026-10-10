@@ -1,10 +1,14 @@
 # Changelog
 
-Release notes for `claude-slack-channel-bots`. The version number and date of each release are set when it is published.
+Release notes for `claude-slack-channel-bots`. The version number and date of each release are set by `/publish prepare` in the release commit.
 
 ---
 
 ## Unreleased
+
+---
+
+## 0.13.0 (2026-10-10)
 
 ### Two new Slack bot scopes: `channels:read` and `groups:read`
 
