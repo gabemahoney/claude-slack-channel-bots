@@ -39,10 +39,19 @@
  * pre-commit hook that fails, and a stub `git` whose `add` stages the files,
  * then fails), record what was staged when the step failed, and check exit 30
  * and a repo back at HEAD; the header case pins the rollback's command.
+ *
+ * Bug b.pwg: both SR-8.1 (exit 90) diagnostics say the tarball is still on
+ * disk, but the exit cleanup deleted it. It is now kept once the release tag
+ * lands. Two fixture cases fail SR-8.1 after the tag (a stub `sha1sum` that
+ * fails, and a directory where `.publish-state.json` would be written) and
+ * check exit 90 and the tarball at the path the diagnostic names; one fails
+ * the SR-5.1 tag (it already exists) and checks exit 31 and the tarball gone,
+ * as that diagnostic says. The success case checks the tarball is kept for
+ * promote.
  */
 
 import { afterEach, describe, expect, test } from 'bun:test'
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { execFileSync, spawnSync } from 'node:child_process'
@@ -56,6 +65,7 @@ const PREPARE_SCRIPT = join(REPO_ROOT, 'scripts', 'publish-prepare.sh')
 const BUMP = 'minor'
 const FROM_VERSION = '0.13.0'
 const NEXT_VERSION = '0.14.0'
+const TARBALL_NAME = `claude-slack-channel-bots-${NEXT_VERSION}.tgz`
 
 /** The stub `date`'s instant: 2026-01-02 in UTC, already 2026-01-03 in the fixture's time zone. */
 const INSTANT = '2026-01-02T23:30:00Z'
@@ -127,9 +137,16 @@ interface FixtureOptions {
   /**
    * `commit-fails` installs a repo-local pre-commit hook that fails;
    * `add-fails` puts a stub `git` first on PATH whose `add` stages the files,
-   * then fails. Both record the staged paths first.
+   * then fails. Both record the staged paths first. `tag-fails` tags the
+   * fixture's commit `v<next version>`, so the release tag already exists.
    */
-  release?: 'ok' | 'add-fails' | 'commit-fails'
+  release?: 'ok' | 'add-fails' | 'commit-fails' | 'tag-fails'
+  /**
+   * SR-8.1, after the release tag: `sha1-fails` puts a failing stub `sha1sum`
+   * first on PATH; `write-fails` leaves a directory where `.publish-state.json`
+   * is written.
+   */
+  manifest?: 'ok' | 'sha1-fails' | 'write-fails'
 }
 
 const roots: string[] = []
@@ -200,7 +217,7 @@ function makeFixture(opts: FixtureOptions): Fixture {
       ? [...(opts.pack === 'fail-locked' ? [': > .git/index.lock'] : []), 'echo "stub bun: pack failed" >&2', 'exit 1']
       : [
           `cp package.json ${JSON.stringify(join(root, 'pack', 'package'))}/`,
-          `tar -czf claude-slack-channel-bots-${NEXT_VERSION}.tgz -C ${JSON.stringify(join(root, 'pack'))} package`,
+          `tar -czf ${TARBALL_NAME} -C ${JSON.stringify(join(root, 'pack'))} package`,
         ]),
   ])
   writeExec(join(fx.bin, 'date'), [
@@ -220,6 +237,13 @@ function makeFixture(opts: FixtureOptions): Fixture {
       'exit 1',
     ])
   }
+  if (opts.manifest === 'sha1-fails') {
+    writeExec(join(fx.bin, 'sha1sum'), ['#!/usr/bin/env bash', 'echo "stub sha1sum: failed" >&2', 'exit 1'])
+  }
+  if (opts.manifest === 'write-fails') {
+    // Ignored, as the manifest is, so nothing else in the run sees it.
+    mkdirSync(join(fx.repo, '.publish-state.json'))
+  }
 
   git(fx, 'init', '-q')
   git(fx, 'config', 'user.name', FIXTURE_USER_NAME)
@@ -232,8 +256,12 @@ function makeFixture(opts: FixtureOptions): Fixture {
     mkdirSync(join(fx.repo, '.git', 'hooks'), { recursive: true })
     writeExec(join(fx.repo, '.git', 'hooks', 'pre-commit'), ['#!/usr/bin/env bash', `git ${recordStaged}`, 'echo "stub hook: pre-commit failed" >&2', 'exit 1'])
   }
+  if (opts.release === 'tag-fails') git(fx, 'tag', `v${NEXT_VERSION}`)
   return fx
 }
+
+/** The tarball's path as the script names it: under the repo's real path, which `git rev-parse --show-toplevel` gives. */
+const tarballPath = (fx: Fixture): string => join(realpathSync(fx.repo), TARBALL_NAME)
 
 /** Run the fixture's copy of the script with the stubs first on PATH. */
 function runPrepare(fx: Fixture): { code: number; stderr: string } {
@@ -274,7 +302,8 @@ describe('b.689: prepare turns the unreleased entry into the release entry', () 
       expect(git(fx, 'rev-parse', `v${NEXT_VERSION}^{commit}`)).toBe(git(fx, 'rev-parse', 'HEAD'))
       // Rewritten before SR-4.1, so every failure from the pack on rolls it back.
       expect(readFileSync(fx.changelogAtPack, 'utf-8')).toBe(RELEASED_CHANGELOG)
-      // The tarball and the manifest are ignored, as in the real repo.
+      // The tarball is kept for promote (b.pwg); it and the manifest are ignored, as in the real repo.
+      expect(existsSync(tarballPath(fx))).toBe(true)
       expect(git(fx, 'status', '--porcelain')).toBe('')
     },
     TEST_TIMEOUT_MS,
@@ -346,6 +375,46 @@ describe('b.1ba: a failed SR-5.1 release commit rolls the bump back out of the t
       // The step failed with the bump staged, so the clean index below is the rollback's doing.
       expect(readFileSync(fx.stagedAtFailure, 'utf-8').split('\n').filter(Boolean)).toEqual(['CHANGELOG.md', 'package.json'])
       expectRolledBack(fx, head)
+    },
+    TEST_TIMEOUT_MS,
+  )
+})
+
+// ---------------------------------------------------------------------------
+// The tarball after a failure once the release commit landed (b.pwg)
+// ---------------------------------------------------------------------------
+
+describe('b.pwg: after a failure past the release commit, the tarball is on disk exactly when the diagnostic says so', () => {
+  const MANIFEST_FAILURES: [string, FixtureOptions['manifest'], string][] = [
+    ['sha1sum fails', 'sha1-fails', 'SR-8.1 (manifest write): could not compute sha1 of'],
+    ['.publish-state.json cannot be written', 'write-fails', 'SR-8.1 (manifest write): could not write .publish-state.json.'],
+  ]
+
+  test.each(MANIFEST_FAILURES)(
+    'SR-8.1, %s: exit 90, and the tarball is on disk at the path the diagnostic names',
+    (_, manifest, diagnostic) => {
+      const fx = makeFixture({ changelog: unreleasedChangelog('## Unreleased'), manifest })
+      const { code, stderr } = runPrepare(fx)
+      expect(code).toBe(90)
+      expect(stderr).toContain(diagnostic)
+      expect(stderr).toContain(`the tarball is on disk at ${tarballPath(fx)};`)
+      expect(stderr).not.toContain('SR-99.0')
+      expect(existsSync(tarballPath(fx))).toBe(true)
+    },
+    TEST_TIMEOUT_MS,
+  )
+
+  test(
+    'the SR-5.1 tag fails (it already exists): exit 31, and cleanup removed the packed tarball, as the diagnostic says',
+    () => {
+      const fx = makeFixture({ changelog: unreleasedChangelog('## Unreleased'), release: 'tag-fails' })
+      const { code, stderr } = runPrepare(fx)
+      // Exit 31 comes after the pack and the tarball check, so the tarball existed.
+      expect(code).toBe(31)
+      expect(stderr).toContain(`SR-5.1 (release tag): 'git tag -a v${NEXT_VERSION}' did not succeed`)
+      expect(stderr).toContain('no tarball is preserved on disk (cleanup removed it)')
+      expect(stderr).not.toContain('SR-99.0')
+      expect(existsSync(tarballPath(fx))).toBe(false)
     },
     TEST_TIMEOUT_MS,
   )

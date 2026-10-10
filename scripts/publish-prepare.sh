@@ -15,8 +15,9 @@
 # or 'git commit' rolls package.json, bun.lock and CHANGELOG.md back to HEAD in
 # both the working tree and the index (SR-3.2), so nothing is left staged or
 # committed. A failure after the commit landed (SR-5.1 tag, SR-8.1 manifest)
-# leaves the local commit (and, at SR-8.1, the tag) in place with explicit
-# operator-recovery prose on stderr.
+# leaves the local commit (and, at SR-8.1, the tag and the tarball) in place
+# with explicit operator-recovery prose on stderr. Every failure before the tag
+# landed, the SR-5.1 tag failure included, removes the tarball.
 #
 # Operator-side rollback after a successful prepare (e.g. if smoke looks fine
 # but the operator changes their mind before promote):
@@ -105,9 +106,11 @@ fi
 cd "${REPO_ROOT}"
 
 # Cleanup wired before any state-mutating step.
-# On successful prepare, TARBALL is cleared so the tarball is preserved for
-# publish-promote.sh to consume. On any failure path, the trap removes the
-# tarball as part of returning to a clean state.
+# On any failure before the release tag lands (exit 31 included), the trap
+# removes the tarball as part of returning to a clean state. Once the release
+# commit and tag exist, TARBALL is cleared, so the tarball is preserved from
+# there on: on exit 90 (SR-8.1), whose recovery prose points the operator at
+# it, and on a successful prepare, for publish-promote.sh to consume.
 TARBALL=""
 cleanup() {
   if [ -n "${TARBALL}" ] && [ -f "${TARBALL}" ]; then
@@ -115,7 +118,7 @@ cleanup() {
   fi
 }
 # Composite EXIT trap: capture rc + BASH_COMMAND before cleanup mutates them,
-# run cleanup (drop any preserved tarball on failure paths), then fire the
+# run cleanup (drop the tarball while TARBALL is still set), then fire the
 # SR-99.0 backstop if the script is exiting non-zero. Replaces the top-of-script
 # SR-99-only trap so the backstop coverage persists past this point.
 # shellcheck disable=SC2154
@@ -254,6 +257,10 @@ if ! git tag -a "${TAG_NAME}" -m "Release v${NEXT_VERSION}"; then
   sr_exit 31
 fi
 
+# The release commit and tag exist — preserve the tarball with them from here
+# on, so an SR-8.1 failure (exit 90) leaves it on disk as its recovery prose says.
+TARBALL=""
+
 COMMIT_SHA="$(git rev-parse HEAD)"
 if ! TARBALL_SHA1="$(sha1sum "${TARBALL_ABS}" | awk '{print $1}')" || [ -z "${TARBALL_SHA1}" ]; then
   echo "SR-8.1 (manifest write): could not compute sha1 of ${TARBALL_ABS} (sha1sum or awk failed, or produced no output). State: the release commit + annotated tag are on the local main branch; the tarball is on disk at ${TARBALL_ABS}; nothing has been pushed; .publish-state.json was NOT written. Operator recovery (the LLM driving /publish prepare MUST NOT execute these commands itself): have the operator inspect the tarball ('ls -l ${TARBALL_ABS}' and 'file ${TARBALL_ABS}') and confirm sha1sum is functional, then roll back with 'git reset --hard origin/main && git tag -d ${TAG_NAME} && rm -f ${TARBALL_ABS}' and rerun '/publish prepare ${BUMP_KIND}'." >&2
@@ -289,8 +296,8 @@ if ! jq -n \
   sr_exit 90
 fi
 
-# Successful prepare — preserve the tarball for publish-promote.sh.
-TARBALL=""
+# Successful prepare — the tarball (preserved since the tag landed) is left for
+# publish-promote.sh.
 
 cat <<EOF
 
