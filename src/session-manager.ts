@@ -798,6 +798,7 @@ import {
   LIVE_ROW_LAUNCH_ANSWER_LAUNCHED,
   LIVE_ROW_LAUNCH_REUSE,
   LIVE_ROW_LAUNCH_SUCCESS_ACTIONS,
+  LIVE_ROW_NOT_LAUNCHED_CAPPED,
   LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED,
   LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE,
   LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_LATCHED,
@@ -900,12 +901,15 @@ import {
   RESTART_OUTCOME_COUNTED_FAILURE,
   RESTART_OUTCOME_LAUNCHED,
   RESTART_OUTCOME_RECONNECTED,
+  LAUNCH_RESUMED_UNREPORTED,
   holdRestartActive,
   recordLaunchResultOutsideRestartWork,
   runRestartRetryInTurn,
   runRestartWorkInTurn,
+  type LaunchSessionResult,
   type RestartRetryOutcome,
 } from './restart.ts'
+import { isAtCap } from './backoff.ts'
 import {
   AGENT_DIRECTOR_DEAD_STATES,
   AGENT_DIRECTOR_LIVE_STATES,
@@ -2825,7 +2829,9 @@ function ownRowActGoes(key: string, at: OwnRowReadSite): boolean {
  * A row read `waiting`, `working`, `ask_user` or `check_permission` ends the
  * persona's stuck-launch episode silently (`endStuckLaunchEpisodeOnRead`;
  * b.jg5 SRJ-1016); `pending`, `ended`, `missing`, no row and a failed read
- * do not.
+ * do not. The same live states settle the persona's resumed launch as
+ * reported in, and `ended`, `missing` or no row as ended before it
+ * (`settleResumeOnRead`, b.4q8).
  *
  * When `at.actGoes` answers that the caller has stopped once the `get`
  * settles (`ownRowActGoes`; b.jg5 SRJ-714), nothing below is acted on: no
@@ -2877,6 +2883,8 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
     if (isAdErrorInstance(err, ErrSpawnNotFound)) {
       // b.jg5 SRJ-704, SRJ-1016: the row is gone; the kill-failure episode ends.
       endKillFailureEpisodeOnRead(key, { thrown: err })
+      // b.4q8: a resumed launch whose row is gone ended before reporting in.
+      settleResumeOnRead(key, { thrown: err }, at)
       // b.jg5 SRJ-809: no row ends an old-life hold on it.
       noteOldLifeRowRead(personaInstanceId(key), { kind: OLD_LIFE_ROW_READ_NO_ROW }, oldLifeReadName(at))
       // b.jg5 SRJ-310 rule 3: no row is no longer this launch's row.
@@ -2897,6 +2905,9 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
   endKillFailureEpisodeOnRead(key, { state: row.state })
   // b.jg5 SRJ-1016: a row read live out of `pending` ends the stuck-launch episode.
   endStuckLaunchEpisodeOnRead(key, row.state)
+  // b.4q8: a row read live out of `pending` reported in; one read finished
+  // ended its resumed launch before it did.
+  settleResumeOnRead(key, { state: row.state }, at)
   // b.jg5 SRJ-809: a row read `ended` or `missing` ends an old-life hold on
   // it, and a live one's `cwd` becomes the held directory.
   noteOldLifeRowRead(personaInstanceId(key), { kind: OLD_LIFE_ROW_READ_STATE, state: row.state, cwd: row.cwd }, oldLifeReadName(at))
@@ -3166,6 +3177,9 @@ export type OwnRowStatusAnswer =
  *     (`endStuckLaunchEpisodeOnRead`; b.jg5 SRJ-1016), whoever made the
  *     call, the liveness and reconnect adapters included; `pending`,
  *     `ended`, `missing`, `ErrSpawnNotFound` and a failed read do not.
+ *   - The same live states settle the persona's resumed launch as reported
+ *     in, and `ended`, `missing` or `ErrSpawnNotFound` as ended before it
+ *     (`settleResumeOnRead`, b.4q8), whoever made the call.
  *   - While the persona holds a "this launch's row" record (b.jg5 SRJ-407),
  *     the answer applies SRJ-310's third end rule to it
  *     (`checkThisLaunchRowOnRead`), so every own-row `status` the server
@@ -3186,6 +3200,9 @@ export function applyOwnRowStatusStep(key: string, answer: OwnRowStatusAnswer, a
     // b.jg5 SRJ-1016: a row read live out of `pending` ends the stuck-launch
     // episode, whoever made the call.
     if (!('thrown' in answer)) endStuckLaunchEpisodeOnRead(key, answer.result.state)
+    // b.4q8: a row read live out of `pending` reported in; one read finished,
+    // or gone, ended its resumed launch before it did; whoever made the call.
+    settleResumeOnRead(key, 'thrown' in answer ? { thrown: answer.thrown } : { state: answer.result.state }, at)
     // b.jg5 SRJ-809: a row read `ended` or `missing`, or gone, ends an
     // old-life hold on it, whoever made the call.
     noteOldLifeStatusAnswer(key, answer, at)
@@ -9412,7 +9429,11 @@ const KILL_RETRY_READ_WHAT = 'status read between kill tries'
  *     `options.keepGoing` when given) ends the tries with no further kill
  *     once the persona is latched, torn down or not up, or the server is
  *     shutting down (or the caller's check answers false);
- *   - only a seed read live gets the tries; any other kill is one try.
+ *   - only a seed read live gets the tries; any other kill is one try;
+ *   - the persona's resumed launch not yet settled is held out of the
+ *     resumed-launch rule while the tries run, and forgotten with nothing
+ *     counted once they ended it (`withResumeHeldForOwnKill`, b.4q8): CSCB's
+ *     own kill is no failed resume.
  * Then, when the tries ended in a failure that no stop ended and the caller's
  * own keep-going check, when given, still answers true (`callerKeepsGoing`),
  * its outcome is reported once (`reportDeferredUnavailable`, with the kill's
@@ -9428,17 +9449,20 @@ const KILL_RETRY_READ_WHAT = 'status read between kill tries'
  */
 export async function retryPersonaKill(key: string, options: PersonaKillRetryOptions): Promise<KillRetryResult> {
   const call = adKillCall(options.rowReadLive)
-  const result = await runKillRetry({
-    instanceId: personaInstanceId(key),
-    kill: () =>
-      killPersonaInstance(key, { context: KILL_CONTEXT_ATTEMPT, rowReadLive: options.rowReadLive, deferUnavailableReport: true }),
-    read: () => readPersonaKillRow(key, options.site, options.ref),
-    wait: options.clock,
-    lastRead: options.lastRead,
-    keepGoing: () => personaKillKeepsGoing(key) && (options.keepGoing === undefined || options.keepGoing() === true),
-    log: (line) => console.error(line),
-    logPrefix: `[slack] ${options.site}`,
-  })
+  // b.4q8: CSCB's own kill of the persona's row is no failed resume.
+  const result = await withResumeHeldForOwnKill(key, () =>
+    runKillRetry({
+      instanceId: personaInstanceId(key),
+      kill: () =>
+        killPersonaInstance(key, { context: KILL_CONTEXT_ATTEMPT, rowReadLive: options.rowReadLive, deferUnavailableReport: true }),
+      read: () => readPersonaKillRow(key, options.site, options.ref),
+      wait: options.clock,
+      lastRead: options.lastRead,
+      keepGoing: () => personaKillKeepsGoing(key) && (options.keepGoing === undefined || options.keepGoing() === true),
+      log: (line) => console.error(line),
+      logPrefix: `[slack] ${options.site}`,
+    }),
+  )
   if (result.outcome.kind === KILL_OUTCOME_NOT_KILLED && !killRetryStopped(result) && callerKeepsGoing(options)) {
     reportDeferredUnavailable(key, result.outcome.error, call)
   }
@@ -11134,6 +11158,14 @@ function plainSpawnCollisionAtLadder(run: LadderRun, what: string): Promise<Spaw
  * These two are the handler's only sites: a refused `resume` is not retried
  * anywhere else.
  *
+ * b.4q8: no `resume` is made once the persona's last
+ * `UNREPORTED_RESUME_FALLBACK_AFTER` resumes in a row ended before their row
+ * reported in (`settleResumeOnRead`): one line
+ * (`unreportedResumeFallbackLine`), then one reuse spawn of the same id
+ * through the replace step's finished-row branch (`reuseFinishedRow`), with
+ * nothing deleted, after the retired-key, `resume_enabled` and `config_dir`
+ * steps.
+ *
  * `opts.lastRead` is the row state the caller last read, which the replace
  * step decides on (b.jg5 SRJ-707): the `ended`/`missing` branch's collision
  * `get` (a finished row); a dead-session path's (`reconcileMissingFirst`)
@@ -11384,6 +11416,20 @@ async function resumeOrFreshSpawn(
     return replaceAtResumeSite(run, lastRead, CONFIG_DIR_MISMATCH_WHY, deadEvidence)
   }
 
+  // b.4q8: a transcript whose last resumes in a row all ended before their
+  // row reported in is not resumed again: one line, then the reuse spawn of
+  // the same id brings the persona up fresh, through the replace step's
+  // finished-row branch (a collision re-runs get-then-act once, SRJ-112).
+  // Nothing is deleted. A reuse that does not succeed leaves the run as it
+  // is, so the next attempt makes the reuse again, not a resume.
+  const endedInARow = resumesEndedUnreported.get(key) ?? 0
+  if (endedInARow >= UNREPORTED_RESUME_FALLBACK_AFTER) {
+    console.error(unreportedResumeFallbackLine(ref, endedInARow))
+    return reuseFinishedRow(run, UNREPORTED_RESUME_REUSE_WHAT, () =>
+      reuseSpawnForPersona(persona, config, { isStartup, lastRead, trustPatchRan: true, retiredAtStart: run.retiredAtStart }),
+    )
+  }
+
   // resume_enabled: attempt resume
   console.error(`[slack] spawnForPersona: attempting resume for ${ref}`)
   return resumeAtSite<SpawnPersonaResult>({
@@ -11561,7 +11607,9 @@ interface ResumeSite<R> {
  * class), its outcome decided by class, never by an error's name:
  *   - success: one line, the after-launch step (`afterLaunchSucceeded`: the
  *     `pre_trust` line and the dialog approver on the row, which reads
- *     `pending` until its session reports in, b.jg5 SRJ-402), `resumed`;
+ *     `pending` until its session reports in, b.jg5 SRJ-402, and the record
+ *     of the resumed launch, counted once its row reports in or ends before
+ *     it does, b.4q8), `resumed`;
  *   - `ErrNoSessionId`, `ErrJsonlNeverWritten`, `ErrJsonlMissing`: the
  *     site's no-transcript row (`site.noTranscript`, SRJ-707, SRJ-712);
  *   - `ErrSpawnNotResumable`: the site's not-resumable step
@@ -11618,6 +11666,267 @@ async function resumeAtSite<R>(site: ResumeSite<R>): Promise<SpawnPersonaResult 
     const notResumed = await resumeFailedAt(persona, err, isStartup, ref, lastRead)
     return site.marksDirectoryCounted ? withDirectoryCounted(notResumed, err) : notResumed
   }
+}
+
+// ---------------------------------------------------------------------------
+// A resumed launch counts once its row reports in (b.4q8)
+// ---------------------------------------------------------------------------
+
+/**
+ * How many resumes of a persona's transcript in a row may end before their
+ * row reports in before the collision ladder stops resuming it and brings the
+ * persona up fresh (b.4q8). agent-director's `resume` only checks that the
+ * transcript file exists, and Claude Code exits before SessionStart on one
+ * that holds no conversation it can load (empty, not JSON, metadata only), so
+ * every resume of it returns success and then ends. The persona's row holds
+ * one transcript from one fresh launch to the next, so the resumes counted
+ * here, with no fresh launch and no report-in between them, are of one
+ * transcript.
+ */
+export const UNREPORTED_RESUME_FALLBACK_AFTER = 2
+
+/**
+ * A resumed launch of a persona whose result waits on its row (b.4q8).
+ * `counted`: a counting site handed the result to the record
+ * (`countResumeWhenSettled`), so it is counted once a read settles it.
+ * `reportedIn`: how a read settled it (true: its row reported in; false: it
+ * ended before reporting in); absent while unsettled. `ownKills`: CSCB's own
+ * kills of its row running now (`withResumeHeldForOwnKill`); while above 0,
+ * no read settles it as ended.
+ */
+interface UnreportedResume {
+  counted: boolean
+  reportedIn?: boolean
+  ownKills: number
+}
+
+/**
+ * Each persona's resumed launch whose result waits on its row (b.4q8): set by
+ * the after-launch step of a `resume` (`noteLaunchForResumeCount`), settled by
+ * the first shared own-row read that reads the row live out of `pending` or
+ * finished (`settleResumeOnRead`), and counted once it is both settled and
+ * handed over (`countSettledResume`). Forgotten at the count, at the next
+ * launch call that returned success, when CSCB's own kill of its row ended it
+ * unsettled (`withResumeHeldForOwnKill`), at the persona's teardown
+ * (`forgetLaunchCalls`) and by `_resetInFlightLaunches`.
+ */
+const unreportedResumes = new Map<string, UnreportedResume>()
+
+/**
+ * Per persona key, how many of its resumes in a row ended before their row
+ * reported in (b.4q8), which the collision ladder compares with
+ * `UNREPORTED_RESUME_FALLBACK_AFTER` before a `resume`. Forgotten when a read
+ * finds the row live out of `pending`, at a plain or reuse spawn's success (a
+ * fresh life, on a new transcript), at the persona's teardown
+ * (`forgetLaunchCalls`) and by `_resetInFlightLaunches`.
+ */
+const resumesEndedUnreported = new Map<string, number>()
+
+/**
+ * The state `settleResumeOnRead` names for a read that found no row
+ * (`ErrSpawnNotFound`), in `resumeEndedUnreportedLine`'s `state=`: one grep
+ * token, as the latch's (`describeLatchRowState`) and the old-life hold's
+ * (`OLD_LIFE_ROW_READ_NO_ROW`) are.
+ */
+export const RESUME_READ_NO_ROW = 'no-row'
+
+/**
+ * The after-launch step's note of persona `key`'s launch call that returned
+ * success, by `verb` (b.4q8): a `resume` starts the record of its result,
+ * which waits on its row; a plain or reuse spawn starts a fresh life, on a new
+ * transcript, so the persona's record and its run of resumes that ended
+ * before reporting in are forgotten. Silent; never throws.
+ */
+function noteLaunchForResumeCount(key: string, verb: LaunchVerb): void {
+  if (verb === LAUNCH_VERB_RESUME) {
+    unreportedResumes.set(key, { counted: false, ownKills: 0 })
+    return
+  }
+  unreportedResumes.delete(key)
+  resumesEndedUnreported.delete(key)
+}
+
+/**
+ * Run `kill`, one of CSCB's own kills of persona `key`'s row (its bounded
+ * retry: the restart path's, the stuck-launch abort's and the live-row
+ * sequence's, `retryPersonaKill`; an old-life wait's of a persona's own
+ * `cscb_<key>` row), with the persona's resumed launch held out of the
+ * resumed-launch rule (b.4q8). Such a kill ends the launch, which is not a
+ * failed resume, as the teardown's kill does not fail one
+ * (`forgetLaunchCalls`):
+ *   - a record not settled yet is held while the kill runs, so no read in the
+ *     meantime (a read between the kill's tries, the health tick's, an
+ *     approver's lap) settles it as ended; a read of the row reported in
+ *     still settles it so;
+ *   - once the kill ended the launch (a success form, `killLetsNextStepRun`),
+ *     a record still held and still unsettled is forgotten with nothing
+ *     counted, so the reads after the kill (the live-row sequence's) settle
+ *     nothing either;
+ *   - a kill that did not end it (try-later, stopped, `ErrTmuxKillFailed`,
+ *     latched) leaves the record as it was, so the launch is still counted
+ *     when a later read settles it.
+ * A record settled before the kill, and a record a new launch set during it,
+ * are left alone. The persona's run of resumes that ended before reporting in
+ * is neither reset nor grown by the kill. Answers `kill`'s answer; never
+ * throws more than `kill` does.
+ */
+async function withResumeHeldForOwnKill<R extends { readonly outcome: unknown }>(key: string, kill: () => Promise<R>): Promise<R> {
+  const held = unreportedResumes.get(key)
+  if (held === undefined || held.reportedIn !== undefined) return kill()
+  held.ownKills++
+  let ended = false
+  try {
+    const result = await kill()
+    ended = killLetsNextStepRun(result.outcome)
+    return result
+  } finally {
+    held.ownKills--
+    if (ended && held.reportedIn === undefined && unreportedResumes.get(key) === held) unreportedResumes.delete(key)
+  }
+}
+
+/**
+ * Hand persona `key`'s resumed launch's result to its record, in place of
+ * counting it now (b.4q8): the restart path's `launchSession` and
+ * `countLaunchOutsideRestartWork` call it for a `resumed` result. A record a
+ * read settled already is counted at once; an unsettled one is counted when a
+ * read settles it. With no record, or one already handed over, nothing.
+ * Never throws.
+ */
+function countResumeWhenSettled(key: string): void {
+  const record = unreportedResumes.get(key)
+  if (record === undefined || record.counted) return
+  record.counted = true
+  if (record.reportedIn !== undefined) countSettledResume(key, record.reportedIn)
+}
+
+/**
+ * The counted line of persona `key`'s resumed launch whose row ended before
+ * reporting in (b.4q8), logged by the failure count
+ * (`recordLaunchResultOutsideRestartWork`). Pure.
+ *
+ *   [slack] Resumed launch failed for persona=<key>: its row ended before reporting in — counted (b.4q8)
+ */
+export function resumedLaunchFailedLine(key: string): string {
+  return `[slack] Resumed launch failed for persona=${key}: its row ended before reporting in — counted (b.4q8)`
+}
+
+/**
+ * The line when counting persona `ref`'s settled resumed launch threw
+ * (b.4q8); `failure` is the thrown value as `describeThrownValue` renders it
+ * (redacted). A count throws when its cap notice (`onCapReached`) does, and
+ * `countLaunchFailure` calls that only after it has recorded the failure,
+ * logged the counted line (`resumedLaunchFailedLine`) and set the cap latch:
+ * the failure stays counted, and no later cap notice is sent in that
+ * episode. Pure.
+ *
+ *   [slack] counting the resumed launch of <ref> failed: <failure> (b.4q8)
+ */
+export function resumeCountFailedLine(ref: string, failure: string): string {
+  return `[slack] counting the resumed launch of ${ref} failed: ${failure} (b.4q8)`
+}
+
+/**
+ * Count persona `key`'s resumed launch once, settled and handed over (b.4q8):
+ * its record is forgotten, then a report-in is a success and an end before it
+ * a counted launch failure (`recordLaunchResultOutsideRestartWork`, the cap
+ * notice at the cap), with its line (`resumedLaunchFailedLine`); a count that
+ * throws (a throwing cap notice, after the failure is recorded and the cap
+ * latch set) logs `resumeCountFailedLine`. Never throws.
+ */
+function countSettledResume(key: string, reportedIn: boolean): void {
+  unreportedResumes.delete(key)
+  try {
+    recordLaunchResultOutsideRestartWork(key, reportedIn, resumedLaunchFailedLine(key))
+  } catch (err) {
+    console.error(resumeCountFailedLine(keyRef(key), describeThrownValue(err)))
+  }
+}
+
+/**
+ * The line of a read `at` that found persona `ref`'s resumed launch ended
+ * before its row reported in (b.4q8), with the state it read (`ended`,
+ * `missing` or `no-row`, `RESUME_READ_NO_ROW`) and how many resumes in a row
+ * have now ended so:
+ *
+ *   [slack] <site>: <what> for <ref>: its resumed launch ended before reporting in (state=<state>) — <n> resume(s) in a row ended so; at <N> the ladder makes a reuse spawn in place of a resume (b.4q8)
+ */
+export function resumeEndedUnreportedLine(at: OwnRowReadSite, ref: string, state: string, endedInARow: number): string {
+  return (
+    `[slack] ${at.site}: ${at.what} for ${ref}: its resumed launch ended before reporting in (state=${state}) — ` +
+    `${endedInARow} resume(s) in a row ended so; at ${UNREPORTED_RESUME_FALLBACK_AFTER} the ladder makes a reuse spawn in place of a resume (b.4q8)`
+  )
+}
+
+/**
+ * The resumed-launch rule (b.4q8), applied by the shared own-row reads
+ * (`readPersonaOwnRow`'s `get`, and the own-row `status` step,
+ * `applyOwnRowStatusStep`, which every own-row `status` goes through: the
+ * approver's laps, the retry's row read, the liveness and reconnect
+ * adapters, the live-row sequence's reads) to persona `key`'s row. On the
+ * read's answer:
+ *   - a live state other than `pending`: the row reported in, so the
+ *     persona's run of resumes that ended before reporting in is forgotten,
+ *     and its resumed launch waiting on the row settles as reported in;
+ *   - `ended`, `missing` or no row (`ErrSpawnNotFound`): its resumed launch
+ *     waiting on the row settles as ended before reporting in, the run grows
+ *     by one, and one line is logged (`resumeEndedUnreportedLine`);
+ *   - `pending`, a state CSCB does not know and any other failed read:
+ *     nothing.
+ * While CSCB's own kill of the row runs (`withResumeHeldForOwnKill`), a
+ * finished row or no row settles nothing: the run is not grown and no line
+ * is logged.
+ * A record handed over already is counted at once (`countSettledResume`);
+ * any other is kept, settled, for its hand-over (`countResumeWhenSettled`).
+ * A record settled already is left as it is. What the read answers never
+ * changes. Never throws.
+ */
+function settleResumeOnRead(key: string, answer: { readonly state: unknown } | { readonly thrown: unknown }, at: OwnRowReadSite): void {
+  try {
+    let state: string
+    if ('thrown' in answer) {
+      if (!isAdErrorInstance(answer.thrown, ErrSpawnNotFound)) return
+      state = RESUME_READ_NO_ROW
+    } else {
+      if (typeof answer.state !== 'string') return
+      state = answer.state
+    }
+    const reportedIn = state !== AGENT_DIRECTOR_PENDING_STATE && AGENT_DIRECTOR_LIVE_STATES.has(state)
+    if (!reportedIn && state !== RESUME_READ_NO_ROW && !AGENT_DIRECTOR_DEAD_STATES.has(state)) return
+    if (reportedIn) resumesEndedUnreported.delete(key)
+    const record = unreportedResumes.get(key)
+    if (record === undefined || record.reportedIn !== undefined) return
+    // CSCB's own kill of the row runs: a finished row is that kill's end, no
+    // failed resume (`withResumeHeldForOwnKill`).
+    if (!reportedIn && record.ownKills > 0) return
+    record.reportedIn = reportedIn
+    if (!reportedIn) {
+      const endedInARow = (resumesEndedUnreported.get(key) ?? 0) + 1
+      resumesEndedUnreported.set(key, endedInARow)
+      console.error(resumeEndedUnreportedLine(at, at.ref ?? keyRef(key), state, endedInARow))
+    }
+    if (record.counted) countSettledResume(key, reportedIn)
+  } catch {
+    /* the rule never changes what the read answers */
+  }
+}
+
+/** What the lines of the reuse spawn the collision ladder makes in place of a resume call it (b.4q8). */
+const UNREPORTED_RESUME_REUSE_WHAT = 'reuse spawn in place of a resume'
+
+/**
+ * The collision ladder's one line when it brings persona `ref` up fresh in
+ * place of a `resume` (b.4q8): its last `endedInARow` resumes in a row
+ * (`UNREPORTED_RESUME_FALLBACK_AFTER` or more) ended before their row
+ * reported in.
+ *
+ *   [slack] spawnForPersona: <ref>: its last <n> resumes in a row ended before reporting in — not resuming its transcript again: a reuse spawn of the same id brings it up fresh, without its conversation; nothing is deleted (b.4q8)
+ */
+export function unreportedResumeFallbackLine(ref: string, endedInARow: number): string {
+  return (
+    `${LADDER_LOG_HEAD} ${ref}: its last ${endedInARow} resumes in a row ended before reporting in — ` +
+    'not resuming its transcript again: a reuse spawn of the same id brings it up fresh, without its conversation; nothing is deleted (b.4q8)'
+  )
 }
 
 /**
@@ -12513,6 +12822,12 @@ export interface StuckLaunchAbortKillOptions {
  * No delete and no launch follows any answer here. No new `getClient()`
  * site: every call goes through `withOutageDetection` inside the shared
  * entries. Never throws or rejects.
+ *
+ * b.4q8: the bounded retry holds the persona's resumed launch out of the
+ * resumed-launch rule while it runs (`withResumeHeldForOwnKill`): the abort's
+ * own kill ends that launch, which is no failed resume, so a kill that ended
+ * it forgets its record with nothing counted, and one that did not leaves the
+ * record for a later read.
  */
 export async function abortKillOwnStuckLaunch(
   key: string,
@@ -13580,8 +13895,9 @@ export function launchCallWindowOf(key: string): LaunchCallWindowRecord | undefi
 /**
  * Forget persona `key`'s launch-call window, its "this launch's row"
  * record (b.jg5 SRJ-407, SRJ-310), its record of a launch whose
- * `send-keys` answered `ErrSpawnNotInteractive` and its record of CSCB's own
- * launch (b.jg5 SRJ-412), as its teardown does
+ * `send-keys` answered `ErrSpawnNotInteractive`, its record of CSCB's own
+ * launch (b.jg5 SRJ-412), and its resumed launch's record and its run of
+ * resumes that ended before reporting in (b.4q8), as its teardown does
  * (`killPersonaInstanceForTeardown`, which runs once the persona's launch in
  * flight has settled). Silent; never throws.
  */
@@ -13590,6 +13906,10 @@ export function forgetLaunchCalls(key: string): void {
   thisLaunchRows.delete(key)
   notInteractiveLaunches.delete(key)
   ownLaunches.delete(key)
+  // b.4q8: the teardown's kill ends any resumed launch, which is not a
+  // failed one, and a persona brought up again starts a fresh run.
+  unreportedResumes.delete(key)
+  resumesEndedUnreported.delete(key)
 }
 
 /**
@@ -13925,8 +14245,9 @@ const inFlightLaunches = new Map<string, Promise<SpawnPersonaResult>>()
  * Test-only seam: forget every in-flight launch (and, b.f2b, every cancel of
  * a wait one had not started), every launch call's window, every "this
  * launch's row" record (b.jg5 SRJ-407), every record of a launch whose
- * `send-keys` answered `ErrSpawnNotInteractive` and every record of CSCB's
- * own launch (b.jg5 SRJ-412); cancel, wake and forget every running wait for
+ * `send-keys` answered `ErrSpawnNotInteractive`, every record of CSCB's
+ * own launch (b.jg5 SRJ-412), and every resumed launch's record and run of
+ * resumes that ended before reporting in (b.4q8); cancel, wake and forget every running wait for
  * a `working` row, as `cancelWorkingRowWait` does but without its log line, so
  * the wait types nothing more and returns `cancelled` instead of polling on
  * to its deadline; and stop and forget every dialog approver
@@ -13939,6 +14260,8 @@ export function _resetInFlightLaunches(): void {
   thisLaunchRows.clear()
   notInteractiveLaunches.clear()
   ownLaunches.clear()
+  unreportedResumes.clear()
+  resumesEndedUnreported.clear()
   for (const wait of workingRowWaits.values()) {
     wait.cancelled = true
     wait.wake()
@@ -14318,7 +14641,10 @@ function renderPreTrustValue(value: unknown): string {
  * pending-only mode (`armPendingOnly` is no full-mode cause).
  * The client returns the parsed reply as is, so a `null` or missing result
  * is read as one with no `pre_trust` field. Nothing here or after it reads
- * the `pre_trust` value. Never throws.
+ * the `pre_trust` value. First of all, before the approver's first read, the
+ * launch is noted for the resumed-launch rule (`noteLaunchForResumeCount`,
+ * b.4q8): a `resume`'s result waits on its row; a spawn's starts a fresh
+ * life. Never throws.
  */
 function afterLaunchSucceeded(
   key: string,
@@ -14327,6 +14653,7 @@ function afterLaunchSucceeded(
   verb: LaunchVerb,
   launched: SpawnResult | ResumeResult,
 ): void {
+  noteLaunchForResumeCount(key, verb)
   console.error(preTrustLogLine(ref, verb, launched?.pre_trust))
   armPendingRowWatch(key, ref)
   try {
@@ -15616,9 +15943,19 @@ function stopSequenceOnLatch(event: ConflictLatchSetEvent): void {
  *
  *   [slack] live-row-sequence: <ref>: its key is retired, so the sequence carries the retired-key flag and ends in a reuse spawn, never a resume (b.jg5 SRJ-805, SRJ-705)
  *
+ * A request with no `belowCapAtStart` is forwarded with whether the persona
+ * is below the restart cap now (b.4q8), read before anything else here, which
+ * the step-6 launch compares against (`sequenceLaunchAttempt`): a sequence
+ * started below the cap makes no launch once a read took the persona to it,
+ * and one started at the cap (a restart's re-attempt at the cap handing off)
+ * still launches.
+ *
  * Never throws.
  */
 export function startLiveRowSequence(request: LiveRowSequenceRequest): LiveRowSequenceStartEntryAnswer {
+  // b.4q8: read before the sequence's first step, as the restart work reads
+  // its own (`skipIfCapReachedDuringWork`).
+  const belowCapAtStart = request.belowCapAtStart ?? !isAtCap(request.key, RESTART_FAILURE_CAP)
   const ref = request.ref ?? `persona=${request.key}`
   if (heldResult(request.key, ref, LIVE_ROW_SEQUENCE_START_SITE) !== undefined) {
     return LIVE_ROW_START_HELD
@@ -15632,7 +15969,7 @@ export function startLiveRowSequence(request: LiveRowSequenceRequest): LiveRowSe
   // decision that reaches a sequence completed with no refusal, so the latch
   // clears before the sequence, which stops for a latched persona, begins.
   if (holdsLatchRecheckPermit(request.key)) clearLatchBeforeOutcome(request.key)
-  const answer = registry.start(retiredKeyRequest(request, ref))
+  const answer = registry.start({ ...retiredKeyRequest(request, ref), belowCapAtStart })
   // b.jg5 SRJ-811: a request that ends in a launch refused because an
   // old-life wait runs on its id arms its persona's retry timer.
   if (answer === LIVE_ROW_START_ALREADY_RUNNING && request.launches && registry.isNoLaunchRunning(request.instanceId)) {
@@ -16150,9 +16487,15 @@ export interface LiveRowSequenceLaunchRequest {
    * compares against at its success. Absent: read just before the reuse's call.
    */
   readonly retiredAtStart?: RetiredKeyAttemptStart
+  /**
+   * Whether the persona was below the restart cap when the sequence started
+   * (the request's `belowCapAtStart`, b.4q8). True: the entry makes no call
+   * when the persona is at the cap now. False or absent: no cap check.
+   */
+  readonly belowCapAtStart?: boolean
 }
 
-/** The entry's answer when it made no launch: a reuse collision, a collision of the plain spawn after `resume`'s `ErrSpawnNotFound`, `ErrSpawnNotResumable`, the sequence stopped. */
+/** The entry's answer when it made no launch: a reuse collision, a collision of the plain spawn after `resume`'s `ErrSpawnNotFound`, `ErrSpawnNotResumable`, the sequence stopped, the persona reached the restart cap while the sequence ran (b.4q8). */
 export interface LiveRowSequenceNotLaunched {
   readonly key: string
   readonly action: typeof LIVE_ROW_OUTCOME_NOT_LAUNCHED
@@ -16180,7 +16523,16 @@ export type LiveRowSequenceLaunchEntryResult = SpawnPersonaResult | LiveRowSeque
  *     paths (`spawnForPersona`): it is the sequence's own launch, made from
  *     inside it, and never passes through that gate;
  *   - the latched gate, the held gate (b.jg5 SRJ-207: a persona held on
- *     `ErrInvalidFlags` answers `held` with no call), the old-life gate
+ *     `ErrInvalidFlags` answers `held` with no call), the restart cap (b.4q8:
+ *     a persona below the cap when its sequence started
+ *     (`request.belowCapAtStart`) and at it now gets no call, one line,
+ *     `sequenceLaunchAtCapLine`, and the not-launched answer `capped`, so
+ *     the sequence ends without its launch with nothing counted or armed: a
+ *     read of its row, the sequence's own included, counted its resumed
+ *     launch as failed and reached the cap; a persona already at the cap
+ *     when its sequence started, a restart's re-attempt at the cap, is
+ *     launched, as `skipIfCapReachedDuringWork` lets that restart's own
+ *     launch run), the old-life gate
  *     (b.jg5 SRJ-810, SRJ-1502: a hold other than one on the persona's own
  *     row on its working directory answers `sequence-waiting` with no call,
  *     through the hold step `oldLifeHoldStep`, so the sequence ends without
@@ -16337,6 +16689,18 @@ function sequenceLaunchCounted(result: SpawnPersonaResult): boolean {
 /** The site the sequence-launch entry's held line names. */
 const LIVE_ROW_SEQUENCE_LAUNCH_SITE = 'launchForLiveRowSequence'
 
+/**
+ * The sequence-launch entry's line when persona `ref` reached the restart cap
+ * while its sequence ran (b.4q8): below the cap when the sequence started and
+ * at it now, so no agent-director call, nothing counted or armed, and the
+ * sequence ends without its launch (`capped`). Pure.
+ *
+ *   [slack] live-row-sequence: not launching <ref> — the persona reached the restart cap while its sequence ran; no agent-director call, nothing counted or armed; the sequence ends without its launch (b.4q8)
+ */
+export function sequenceLaunchAtCapLine(ref: string): string {
+  return `${LIVE_ROW_SEQUENCE_LOG_PREFIX} not launching ${ref} — the persona reached the restart cap while its sequence ran; no agent-director call, nothing counted or armed; the sequence ends without its launch (b.4q8)`
+}
+
 /** The sequence launch's gates, then its call as a launch attempt for the persona, then its count. Never throws. */
 async function sequenceLaunchAttempt(
   persona: Persona,
@@ -16353,6 +16717,15 @@ async function sequenceLaunchAttempt(
   // b.jg5 SRJ-207: a persona held on ErrInvalidFlags gets no launch.
   const held = heldResult(key, ref, LIVE_ROW_SEQUENCE_LAUNCH_SITE)
   if (held !== undefined) return held
+  // b.4q8: nor does a persona that reached the restart cap while its
+  // sequence ran. A read of P's row (the sequence's own `get` included) can
+  // count P's resumed launch as failed, its row ended before reporting in,
+  // and reach the cap; no launch may follow it. A P already at the cap when
+  // its sequence started (a restart's re-attempt at the cap) is launched.
+  if (request.belowCapAtStart === true && isAtCap(key, RESTART_FAILURE_CAP)) {
+    console.error(sequenceLaunchAtCapLine(ref))
+    return { key, action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_CAPPED }
+  }
   // b.jg5 SRJ-810, SRJ-1502: nor is P launched into a working directory an
   // old life that may still run holds (a hold on P's own row excepted: the
   // sequence's own reads have ended it by now); the hold step records P as
@@ -16393,10 +16766,17 @@ async function sequenceLaunchAttempt(
  * a success; a `failed` result that is not stopping and is marked
  * `countedClass` (LAUNCH FAILURE or DIRECTORY) records one counted launch
  * failure (the cap notice at the cap); any other `failed` result and a
- * retrying, latched, held or deferred result record nothing. `head` heads
- * the line logged if counting throws. Never throws.
+ * retrying, latched, held or deferred result record nothing. A `resumed`
+ * result is not counted now: it is handed to its record
+ * (`countResumeWhenSettled`, b.4q8), counted once its row reports in or ends
+ * before it does. `head` heads the line logged if counting throws. Never
+ * throws.
  */
 function countLaunchOutsideRestartWork(key: string, ref: string, result: SpawnPersonaResult, head: string): void {
+  if (result.action === 'resumed') {
+    countResumeWhenSettled(key)
+    return
+  }
   const succeeded = LIVE_ROW_LAUNCH_SUCCESS_ACTIONS.has(result.action)
   if (!succeeded && !sequenceLaunchCounted(result)) return
   try {
@@ -16650,7 +17030,7 @@ export function buildLiveRowSequenceDeps(input: LiveRowSequenceDepsInput): LiveR
         configDirMatches: !comparison.configDirResolved || comparison.configDirMatches === true,
       }
     },
-    launch: async (key, kind, lastRead, ref, stop, retiredAtStart) => {
+    launch: async (key, kind, lastRead, ref, stop, retiredAtStart, belowCapAtStart) => {
       const found = applied(key)
       if (found === undefined) {
         console.error(
@@ -16663,6 +17043,7 @@ export function buildLiveRowSequenceDeps(input: LiveRowSequenceDepsInput): LiveR
         lastRead: latchRowStateOfSequenceRead(lastRead),
         stop,
         retiredAtStart,
+        belowCapAtStart,
       })
       return result.action === LIVE_ROW_OUTCOME_NOT_LAUNCHED
         ? { kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: result.reason }
@@ -17145,7 +17526,9 @@ const OLD_LIFE_WAIT_KILL_LOG_PREFIX = `[slack] ${OLD_LIFE_WAIT_SITE}`
  *     64), each stop naming its own cause (`oldLifeWaitStopCause`); and its hold-end query ends the tries as a success when the hold
  *     ends between tries or during a try whose UNAVAILABLE outcome would
  *     stand, or the sequence was stopped for the hold's end, even with a new
- *     hold begun on the id since (SRJ-702; option A);
+ *     hold begun on the id since (SRJ-702; option A); a kill of the old key's
+ *     own `cscb_<key>` row holds that persona's resumed launch out of the
+ *     resumed-launch rule while it runs (`withResumeHeldForOwnKill`, b.4q8);
  *   - the launch start: the sequence's own reader (`src/pending-row.ts`), so
  *     a `pending` row with no launch start under a key no configured persona
  *     uses gets no wait for G and latches nothing (SRJ-408);
@@ -17204,19 +17587,22 @@ export function buildOldLifeWaitDeps(input: OldLifeWaitDepsInput): LiveRowSequen
             ? KILL_RETRY_SEED_LIVE_UNREAD
             : killRetrySeedOfState(options.lastReadState)
       const call = adKillCall(killRetrySeedIsLive(seed))
-      const result = await runKillRetry({
-        instanceId,
-        kill: () => tryOldLifeKill(target, record, call),
-        read: () => readOldLifeKillRow(target, record, options.ref),
-        wait: options.wait,
-        lastRead: seed,
-        keepGoing: options.keepGoing,
-        // SRJ-702, SRJ-811 (option A): the hold's end ends the tries as a
-        // success, a stop for it included when a new hold has begun on the id.
-        holdEnded: () => options.stoppedForHoldEnd?.() === true || oldLifeHoldEnded(instanceId),
-        log: (line) => console.error(line),
-        logPrefix: `${OLD_LIFE_WAIT_KILL_LOG_PREFIX} for ${options.ref}`,
-      })
+      const retry = (): Promise<KillRetryResult> =>
+        runKillRetry({
+          instanceId,
+          kill: () => tryOldLifeKill(target, record, call),
+          read: () => readOldLifeKillRow(target, record, options.ref),
+          wait: options.wait,
+          lastRead: seed,
+          keepGoing: options.keepGoing,
+          // SRJ-702, SRJ-811 (option A): the hold's end ends the tries as a
+          // success, a stop for it included when a new hold has begun on the id.
+          holdEnded: () => options.stoppedForHoldEnd?.() === true || oldLifeHoldEnded(instanceId),
+          log: (line) => console.error(line),
+          logPrefix: `${OLD_LIFE_WAIT_KILL_LOG_PREFIX} for ${options.ref}`,
+        })
+      // b.4q8: CSCB's own kill of a persona's own row is no failed resume of it.
+      const result = personaInstanceId(oldKey) === instanceId ? await withResumeHeldForOwnKill(oldKey, retry) : await retry()
       record.lastKill = result
       return result
     },
@@ -19845,7 +20231,12 @@ function createLaunchPool(
  * same gate before any kill or reconnect; this check covers a flip in
  * between.
  *
- * Returns true on any non-failed action (spawned / fresh-retired / resumed /
+ * Returns `LAUNCH_RESUMED_UNREPORTED` for `resumed` (b.4q8): the launch's
+ * result is handed to its record (`countResumeWhenSettled`), counted once its
+ * row reports in (a success) or ends before it does (a counted failure), so
+ * restart.ts records nothing for it now.
+ *
+ * Returns true on any other non-failed action (spawned / fresh-retired /
  * reconnected / not-reconnected / no-op; b.jg5 SRJ-806: a retired key's reuse
  * that began its new life is a success as `spawned` is; b.f2b: `not-reconnected` counts as it did when it
  * was reported as `reconnected`, so SR-25.1 counting is unchanged), false on
@@ -19882,7 +20273,7 @@ export async function launchSession(
   key: string,
   config: PersonaConfig,
   options?: { canLaunch?: (key: string) => boolean; deadEvidence?: CarriedDeadEvidence },
-): Promise<boolean | 'skipped' | 'refused'> {
+): Promise<LaunchSessionResult> {
   if (options?.canLaunch && !options.canLaunch(key)) return 'skipped'
   const persona = config.personas.find((p) => p.key === key)
   if (!persona) return false
@@ -19906,6 +20297,12 @@ export async function launchSession(
   // `sequenceWaitingCause`), records nothing and is a refusal at a retry,
   // which re-arms the timer (SRJ-302).
   if (result.action === SPAWN_ACTION_RETRYING || result.action === 'sequence-waiting') return 'refused'
+  // b.4q8: a resumed launch is no success until its row reports in: its
+  // record counts it then, or as a failure when the row ends before it does.
+  if (result.action === 'resumed') {
+    countResumeWhenSettled(key)
+    return LAUNCH_RESUMED_UNREPORTED
+  }
   return result.action !== 'failed'
 }
 

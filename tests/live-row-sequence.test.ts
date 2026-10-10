@@ -134,7 +134,7 @@ import {
   LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE,
 } from '../src/ad-error-class.ts'
 import type { GetResult } from 'agent-director'
-import { getFailureCount } from '../src/backoff.ts'
+import { getFailureCount, recordFailure } from '../src/backoff.ts'
 import { killOutcomeOf, type KillFailureClass } from '../src/checked-kill.ts'
 import {
   KILL_FAILURE_CLOSING_DESTINATION,
@@ -168,6 +168,7 @@ import {
   LIVE_ROW_LAUNCH_REASON_RETIRED_KEY,
   LIVE_ROW_LAUNCH_RESUME,
   LIVE_ROW_LAUNCH_REUSE,
+  LIVE_ROW_NOT_LAUNCHED_CAPPED,
   LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED,
   LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE,
   LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_PENDING,
@@ -256,6 +257,7 @@ import {
   _resetNow,
   _setNow,
   APPROVER_STOP_CAP,
+  DIALOG_SLOW_POLL_INTERVAL_MS,
   isLaunchInFlight,
   launchCallWindowOf,
   launchSession,
@@ -1933,6 +1935,35 @@ describe('the launch\'s end: the outcome carries the launch\'s result, and the e
     expectEndArmed(h, outcome, UNAVAILABLE_RETRY_CAUSE_COLLISION)
   })
 
+  // b.4q8: the sequence's launch entry answers `capped` with no call when P is
+  // at the restart cap (a read of P's row may have counted P's resumed launch
+  // as failed and reached it); the cap stopped P's retry timer, so the end
+  // arms nothing.
+  test('a launch dependency answering not launched (capped): the sequence ends without its launch, with nothing armed and nothing counted; its one end line says capped', async () => {
+    const { h, p, q } = build()
+    h.script({ getResult: personaRow(h, p, { state: ENDED }) })
+    const stop = createLiveRowSequenceStop()
+
+    const outcome = await runWithDeps(h, p, stop, {
+      launch: async () => ({ kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_CAPPED }),
+    })
+
+    expect(outcome).toEqual({
+      kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED,
+      launchKind: LIVE_ROW_LAUNCH_REUSE,
+      notLaunched: LIVE_ROW_NOT_LAUNCHED_CAPPED,
+      runs: 1,
+      kills: 1,
+      judgedRuns: 1,
+    })
+    const endLine = liveRowSequenceEndLine(`persona=${p}`, outcome)
+    expect(endLine).toContain(`: not launched (reuse; ${LIVE_ROW_NOT_LAUNCHED_CAPPED}) — runs=1 kills=1 judged=1; ${NO_ARM_SAID} (b.jg5 `)
+    expect(h.lines.filter((line) => line === endLine)).toHaveLength(1)
+    expect([h.triggers, h.controller.armedKeys()]).toEqual([[], []])
+    expect([getFailureCount(p), getFailureCount(q), h.notices]).toEqual([0, 0, []])
+    expect(h.stub.calls.spawnCalls).toEqual([])
+  })
+
   test.each([
     ['before any stop: the sequence ends internal-error with P\'s timer armed', false],
     ['after a stop for teardown: the failure is dropped too, and the sequence ends stopped with nothing armed', true],
@@ -2781,6 +2812,33 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
     await h.runApproverToStop(p)
   })
 
+  // b.4q8: step 6's resume is handed to its record at the sequence's end and
+  // counted once a read settles it, not as a success at the end.
+  // P starts with one failure on record, so a success counted at the end
+  // (which would reset it to 0) is told apart from nothing counted (still 1).
+  test('step 6\'s resume whose row ends before reporting in (b.4q8): launched, and nothing counted while its row reads pending (neither a success nor a failure); the approver\'s lap that reads it missing counts one launch failure', async () => {
+    const { h, p } = build({ approverCapMs: 2 * DIALOG_SLOW_POLL_INTERVAL_MS })
+    let ended = false
+    const id = personaInstanceId(p)
+    h.script({
+      getResult: personaRow(h, p, { state: ENDED, claude_session_id: SESSION_ID }),
+      statusFn: (params) => (params.claude_instance_id === id && h.stub.calls.resumeCalls.length > 0 ? cannedStatusResult({ state: ended ? MISSING : PENDING }) : undefined),
+    })
+    recordFailure(p)
+
+    expect(await h.runSequence(p, { lastReadState: LIVE, keepsConversation: true })).toMatchObject({
+      kind: LIVE_ROW_OUTCOME_LAUNCHED,
+      launchKind: LIVE_ROW_LAUNCH_RESUME,
+      result: { key: p, action: 'resumed' },
+    })
+    await h.settle()
+    expect([getFailureCount(p), h.approverRunning(p)]).toEqual([1, true])
+
+    ended = true
+    await h.runApproverToStop(p)
+    expect([getFailureCount(p), h.capReached, h.notices]).toEqual([2, [], []])
+  })
+
   // b.jg5 SRJ-111, SRJ-705, SRJ-713 (hatch note E23): the plain spawn after
   // step 6's ErrSpawnNotFound colliding runs no get-then-act inside the
   // sequence; the sequence ends without its launch and the retry it arms is
@@ -2806,8 +2864,17 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
     expectEndArmed(h, outcome, UNAVAILABLE_RETRY_CAUSE_COLLISION)
 
     // The retry: the row reads ended with its session id; the ladder's plain
-    // first spawn collides, its collision get reads the row and resumes it.
-    h.script({ spawnError: undefined, spawnQueue: [cannedErr(errInstanceIdCollision())], resumeError: undefined, statusResult: cannedStatusResult({ state: ENDED }) })
+    // first spawn collides, its collision get reads the row and resumes it,
+    // and the resumed row reports in (waiting), so no failure is counted for
+    // the resume (b.4q8).
+    const id = personaInstanceId(p)
+    h.script({
+      spawnError: undefined,
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      resumeError: undefined,
+      statusResult: cannedStatusResult({ state: ENDED }),
+      statusFn: (params) => (params.claude_instance_id === id && h.stub.calls.resumeCalls.length > 1 ? cannedStatusResult({ state: LIVE }) : undefined),
+    })
     const retryOrder = recordCallOrder(h)
     await retryNow(h, p)
 

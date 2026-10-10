@@ -56,6 +56,7 @@ import { dirname, isAbsolute, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { type Persona, type PersonaConfig, type PersonaInput, resolvePersonaConfig } from '../src/config.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
+import { LAUNCH_RESUMED_UNREPORTED, type LaunchSessionResult } from '../src/restart.ts'
 import {
   deleteReplyGuardRecord,
   readReplyGuardRecord,
@@ -1284,10 +1285,14 @@ describe('AC 59: a confirmed stop_hook_bootstrap or claude_config_dir change rea
     return run.since(cp).lifecycle.map((r) => (r.key === TEMPLATE_REFRESH_KEY ? r.op : `${r.op} ${nameOf.get(r.key) ?? r.key}`))
   }
 
-  /** The persona's next launch: its instance has ended, and the restart path launches it again. */
-  async function nextLaunch(run: ReloadRun, persona: PersonaInput): Promise<void> {
+  /**
+   * The persona's next launch: its instance has ended, and the restart path
+   * launches it again, answering `answer`: resumed-unreported for a resume
+   * (counted once its row reports in, b.4q8), true for a reuse spawn.
+   */
+  async function nextLaunch(run: ReloadRun, persona: PersonaInput, answer: LaunchSessionResult = LAUNCH_RESUMED_UNREPORTED): Promise<void> {
     h.seedRow(persona, { state: 'ended' })
-    expect(await run.relaunch(persona.name)).toBe(true)
+    expect(await run.relaunch(persona.name)).toBe(answer)
   }
 
   /** The persona's spawns and resumes that succeeded (an optimistic spawn that met the row is not one), as `<verb> <CLAUDE_CONFIG_DIR>`. */
@@ -1456,7 +1461,7 @@ describe('AC 59: a confirmed stop_hook_bootstrap or claude_config_dir change rea
       expect(hookIn(d2)).toEqual([])
 
       // A's next launch: a fresh spawn with D2 (the row's config_dir label is D1's).
-      await nextLaunch(run, aMoved)
+      await nextLaunch(run, aMoved, true)
       expect(launchesOf(run, a)).toEqual([`spawn ${d1}`, `spawn ${d2}`])
       expect(h.readReplyGuardRecord(a.name)).toBe('true')
       expect(hookIn(d2)).toEqual(installed())

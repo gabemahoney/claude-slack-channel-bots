@@ -503,7 +503,14 @@ export interface RestartDeps {
    * check, or the server is stopping), which counts as neither a success nor
    * a failure. `'refused'`: the launch answered `retrying` (b.jg5 SRJ-1015:
    * its retry timer was armed for it, SRJ-301, so the timer owns the
-   * persona) or `sequence-waiting`; it counts as neither either (SRJ-302). `deadEvidence`: the verdict an
+   * persona) or `sequence-waiting`; it counts as neither either (SRJ-302).
+   * `LAUNCH_RESUMED_UNREPORTED`: the launch resumed the persona's row
+   * (`resumed`, b.4q8), which has not reported in yet; the work records
+   * nothing for it and answers launched, and the session manager counts it
+   * once a shared own-row read settles it: a report-in as a success, the row
+   * ended, missing or gone before it as one counted failure
+   * (`recordLaunchResultOutsideRestartWork`). `true`: any other success,
+   * recorded at once; `false`: a counted failure. `deadEvidence`: the verdict an
    * escalate-dead answer carried (`ReconnectEscalateDead`, b.jg5 SRJ-611),
    * passed on unchanged to the relaunch after it, which carries it into the
    * ladder, unless a read voided it (a re-probe that read the row `ended`,
@@ -981,11 +988,22 @@ export function killNotSucceededLine(key: string, described: string, latched: bo
 }
 
 /**
+ * What a restart's launch answers when it resumed the persona's row (b.4q8):
+ * launched, but not counted yet. The row reads `pending` until its session
+ * reports in, and a resume whose Claude Code exits before that (a transcript
+ * it cannot load) is no success: the session manager counts the launch once
+ * its row reports in (a success) or ends before it does (a counted failure),
+ * through `recordLaunchResultOutsideRestartWork`.
+ */
+export const LAUNCH_RESUMED_UNREPORTED = 'resumed-unreported'
+
+/**
  * What a restart's launch answers: true launched, false a counted failure,
  * `'skipped'` declined and `'refused'` handed to the retry timer, neither of
- * which is counted.
+ * which is counted, and `LAUNCH_RESUMED_UNREPORTED` resumed, counted once its
+ * row reports in or ends (b.4q8).
  */
-export type LaunchSessionResult = boolean | 'skipped' | 'refused'
+export type LaunchSessionResult = boolean | 'skipped' | 'refused' | typeof LAUNCH_RESUMED_UNREPORTED
 
 // ---------------------------------------------------------------------------
 // Module-scoped state
@@ -1392,9 +1410,11 @@ async function runNow<T>(_key: string, operation: () => T | Promise<T>): Promise
  * this retry waited its turn, although the retry timer checked the cap before
  * calling) it answers `RESTART_OUTCOME_CAPPED` with no agent-director call,
  * nothing counted and no notice (the cap notice went out with the failure
- * that reached the cap). Asking it here is enough: failures are counted only
- * inside the restart work, which the serializer runs one at a time per
- * persona, so the cap cannot be reached while this retry's own work runs.
+ * that reached the cap). Failures are otherwise counted inside the restart
+ * work, which the serializer runs one at a time per persona; a read in this
+ * retry's own work that counts the persona's resumed launch as failed (its
+ * row ended before reporting in, b.4q8) and takes it to the cap stops the
+ * work before its kill and its launch (`skipIfCapReachedDuringWork`).
  * Otherwise the restart work runs, as one recovery attempt, with today's
  * accounting, and its outcome is answered. It bypasses only the restart delay
  * and the restart timer: `getRestartDelay` is never read (it runs with delay
@@ -1619,7 +1639,11 @@ function launchInFlight(key: string, isInFlight: (key: string) => boolean): bool
  * the adapter's that made no call (b.jg5 SRJ-110, SRJ-701);
  * any other answer ends the work with `RESTART_OUTCOME_LATCHED` (a CONFLICT or
  * an UNUSABLE NAME) or `RESTART_OUTCOME_REFUSED`: no launch, nothing counted. The restart cap is not
- * asked here (the retry entry asks it before this work). The whole work is
+ * asked before the work (the retry entry asks it before this work), but a
+ * persona that was below the cap when the work began and reached it during
+ * the work's reads (b.4q8: a read that counted its resumed launch as failed,
+ * its row ended before reporting in) gets no kill and no launch: the work
+ * answers `RESTART_OUTCOME_CAPPED` (`skipIfCapReachedDuringWork`). The whole work is
  * one recovery attempt for the persona (b.jg5 SRJ-301). Answers what it did (`RestartWorkOutcome`).
  */
 async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionId: string | undefined): Promise<RestartWorkOutcome> {
@@ -1641,6 +1665,9 @@ async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionI
 
 /** The steps of `runRestartWork`, inside its recovery attempt. */
 async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessionId: string | undefined): Promise<RestartWorkOutcome> {
+  // b.4q8: read before any of the work's reads, for the cap check before its
+  // kill and its launch (`skipIfCapReachedDuringWork`).
+  const belowCapAtStart = !isAtCap(key, RESTART_FAILURE_CAP)
   if (d.isShuttingDown()) {
     console.error(`[slack] Skipping restart — server is shutting down (persona=${key})`)
     return RESTART_OUTCOME_SHUTTING_DOWN
@@ -1860,10 +1887,15 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   if (skipIfSequenceRunning(d, key, 'before its kill')) return RESTART_OUTCOME_SEQUENCE_WAITING
   // b.jg5 SRJ-810: a held persona's worker is not killed.
   if (skipIfHeldForOldLife(d, key, 'before its kill')) return RESTART_OUTCOME_SEQUENCE_WAITING
+  // b.4q8: a read in this work may have counted the persona's resumed launch
+  // as failed (its row ended before reporting in) and taken it to the cap;
+  // asked again before the kill and before the launch.
+  if (skipIfCapReachedDuringWork(key, belowCapAtStart, 'before its kill')) return RESTART_OUTCOME_CAPPED
   const decided = await killBeforeRelaunch(d, key, cwd, deadRead, escalation)
   if (decided.kind === KILL_DECISION_STOP) return decided.outcome
   if (skipIfSequenceRunning(d, key, 'before its launch')) return RESTART_OUTCOME_SEQUENCE_WAITING
   if (skipIfHeldForOldLife(d, key, 'before its launch')) return RESTART_OUTCOME_SEQUENCE_WAITING
+  if (skipIfCapReachedDuringWork(key, belowCapAtStart, 'before its launch')) return RESTART_OUTCOME_CAPPED
 
   const { deadEvidence } = decided
   let ok: LaunchSessionResult
@@ -1926,6 +1958,15 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     return RESTART_OUTCOME_REFUSED
   }
 
+  if (ok === LAUNCH_RESUMED_UNREPORTED) {
+    // b.4q8: the launch resumed the persona's row, which has not reported in
+    // yet. Nothing is recorded now: the session manager counts the launch
+    // once its row reports in (a success, which resets the failure count and
+    // cap latch) or ends before it does (a counted failure, so a resume that
+    // dies at load each time reaches the backoff and the cap).
+    return RESTART_OUTCOME_LAUNCHED
+  }
+
   if (ok) {
     // Successful launch — reset consecutive-failure counter and cap latch.
     recordSuccess(key)
@@ -1970,23 +2011,25 @@ function countLaunchFailure(
  * back through the restart work's `launchSession` (the live-row sequence's
  * final launch, `launchForLiveRowSequence`, and a latch re-check's own retry,
  * both in `src/session-manager.ts`; b.jg5 SRJ-112, SRJ-113, SRJ-506,
- * SRJ-602), as the restart work records its own launch's:
+ * SRJ-602; and a resumed launch, counted once its row reports in or ends
+ * before it does, b.4q8), as the restart work records its own launch's:
  * a success (`launched` true) resets the persona's failure count and cap
- * latch; a counted failure is recorded, with the cap notice through the
- * installed restart dependencies' `onCapReached` once per episode (none when
- * `initRestart` has not run). The caller decides which results count (a
- * retrying, stopping, latched, held or deferred launch records nothing). Answers
- * `launched`, `counted-failure` or `capped`.
+ * latch; a counted failure is recorded, logging `failedLine`, with the cap
+ * notice through the installed restart dependencies' `onCapReached` once per
+ * episode (none when `initRestart` has not run). The caller decides which
+ * results count (a retrying, stopping, latched, held or deferred launch
+ * records nothing). Answers `launched`, `counted-failure` or `capped`.
  */
 export function recordLaunchResultOutsideRestartWork(
   key: string,
   launched: boolean,
+  failedLine = `[slack] Launch failed for persona=${key} — counted (b.jg5 SRJ-112, SRJ-113, SRJ-602)`,
 ): typeof RESTART_OUTCOME_LAUNCHED | typeof RESTART_OUTCOME_CAPPED | typeof RESTART_OUTCOME_COUNTED_FAILURE {
   if (launched) {
     recordSuccess(key)
     return RESTART_OUTCOME_LAUNCHED
   }
-  return countLaunchFailure(deps, key, `[slack] Launch failed for persona=${key} — counted (b.jg5 SRJ-112, SRJ-113, SRJ-602)`)
+  return countLaunchFailure(deps, key, failedLine)
 }
 
 /** `KillDecision`'s kind when the launch must not follow: the work answers `outcome`. */
@@ -2517,6 +2560,39 @@ function skipIfHeld(d: RestartDeps, key: string, askedAgain?: string): boolean {
       : `[slack] Restart for persona=${key} goes no further ${askedAgain} — the persona is held on ErrInvalidFlags${heldFailure(reading)}; nothing more is called for it, nothing recorded (b.jg5 SRJ-207)`,
   )
   return true
+}
+
+/**
+ * The restart work's cap check after its reads (b.4q8): true, with one line
+ * (`restartCapReachedLine`), when persona `key` was below the restart cap
+ * when the work began (`belowCapAtStart`) and is at it now, so the caller
+ * answers `RESTART_OUTCOME_CAPPED` with nothing more killed, launched or
+ * counted. A shared own-row read in the work (its liveness probe, the
+ * `pending` deferral's reads, the reconnect adapter's, the re-probe; not one
+ * made while the work's own kill runs, which settles nothing as ended)
+ * can settle the persona's resumed launch as ended before reporting
+ * in, a counted failure (`recordLaunchResultOutsideRestartWork`) that may
+ * reach the cap, whose notice says automatic restarts are suspended and
+ * whose stop ends the persona's retry timer; no launch may follow it. A
+ * persona already at the cap when the work began (an explicit
+ * `scheduleRestart` re-attempt, which the cap does not stop) is not stopped
+ * here. `when` names the step: `before its kill`, `before its launch`.
+ */
+function skipIfCapReachedDuringWork(key: string, belowCapAtStart: boolean, when: string): boolean {
+  if (!belowCapAtStart || !isAtCap(key, RESTART_FAILURE_CAP)) return false
+  console.error(restartCapReachedLine(key, when))
+  return true
+}
+
+/**
+ * The restart work's line when persona `key` reached the restart cap while
+ * the work ran (b.4q8, `skipIfCapReachedDuringWork`): the work goes no
+ * further from `when` (`before its kill`, `before its launch`). Pure.
+ *
+ *   [slack] Restart for persona=<key> goes no further <when> — the persona reached the restart cap while this restart ran; nothing more is killed or launched for it (b.4q8)
+ */
+export function restartCapReachedLine(key: string, when: string): string {
+  return `[slack] Restart for persona=${key} goes no further ${when} — the persona reached the restart cap while this restart ran; nothing more is killed or launched for it (b.4q8)`
 }
 
 /**

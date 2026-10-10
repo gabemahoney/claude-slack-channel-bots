@@ -279,6 +279,15 @@ export interface LiveRowSequenceRequest {
    * (SRJ-806). Absent: the launch reads the store just before its reuse call.
    */
   readonly retiredAtStart?: RetiredKeyAttemptStart
+  /**
+   * Whether P was below the restart cap when the sequence started (b.4q8; the
+   * start entry's own read, `startLiveRowSequence`), handed to step 6's launch,
+   * which makes no call when P was below it then and is at it now: a read of
+   * P's row while the sequence ran counted P's resumed launch as failed and
+   * reached the cap. A P at the cap when its sequence started (a restart's
+   * re-attempt at the cap) is still launched. Absent: no cap check at step 6.
+   */
+  readonly belowCapAtStart?: boolean
   /** Whether the sequence ends in a launch; false only for an old-life wait's steps (the no-launch form). */
   readonly launches: boolean
   /** The kill-failure alert's context, one of `src/kill-failure-alert.ts`'s. */
@@ -511,6 +520,16 @@ export const LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED = 'not-applied'
  * once the sequence is stopped).
  */
 export const LIVE_ROW_NOT_LAUNCHED_STOPPED = 'stopped'
+/**
+ * Not launched: P reached the restart cap while the sequence ran (b.4q8): it
+ * was below the cap when the sequence started (the request's
+ * `belowCapAtStart`) and is at it at step 6. A read of P's row (the
+ * sequence's own included) can count P's resumed launch as failed, its row
+ * ended before reporting in, and that count can reach the cap, whose notice
+ * says automatic restarts are suspended and whose stop ends P's retry timer.
+ * Nothing is counted; the end arms nothing.
+ */
+export const LIVE_ROW_NOT_LAUNCHED_CAPPED = 'capped'
 
 /** Why step 6 made no launch. */
 export type LiveRowSequenceNotLaunchedReason =
@@ -521,13 +540,15 @@ export type LiveRowSequenceNotLaunchedReason =
   | typeof LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_LATCHED
   | typeof LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED
   | typeof LIVE_ROW_NOT_LAUNCHED_STOPPED
+  | typeof LIVE_ROW_NOT_LAUNCHED_CAPPED
 
 /** The launch call answered. */
 export const LIVE_ROW_LAUNCH_ANSWER_LAUNCHED = 'launched'
 
 /**
  * The launch results that are a success: the session manager's launch result
- * actions that leave P's session running (`launchSession` maps each to true).
+ * actions that leave P's session running (`launchSession` maps each to true,
+ * but `resumed`, whose count waits until its row reports in, b.4q8).
  * Every other answer of a launch call (`failed`, `deferred`, `latched`,
  * `held`) ends the sequence without its launch. `fresh-retired` is the
  * session manager's `SPAWN_ACTION_FRESH_RETIRED`: a reuse spawn for a
@@ -864,7 +885,7 @@ export interface LiveRowSequenceDeps {
    * sequence's stop signal goes with it: a launch that waits for another
    * launch of P to settle makes no call once the signal is set (SRJ-706).
    * The sequence always passes it, and the request's `retiredAtStart`
-   * (SRJ-806) as it is.
+   * (SRJ-806) and `belowCapAtStart` (b.4q8) as they are.
    */
   launch(
     key: string,
@@ -873,6 +894,7 @@ export interface LiveRowSequenceDeps {
     ref: string,
     stop?: LiveRowSequenceStopSignal,
     retiredAtStart?: RetiredKeyAttemptStart,
+    belowCapAtStart?: boolean,
   ): Promise<LiveRowSequenceLaunchAnswer>
   /** Arm P's retry timer with the cause; never counted. */
   armRetry(key: string, cause: LiveRowSequenceArmCause): void
@@ -1349,7 +1371,9 @@ export async function runLiveRowSequence(
    * `resume`'s `ErrSpawnNotFound`, arm the collision cause (SRJ-112,
    * SRJ-111, SRJ-705); a `resume`'s `ErrSpawnNotResumable` whose re-read found a lost
    * race arms the lost-race cause, and one whose re-read found the row
-   * `pending` the other-end cause (SRJ-710).
+   * `pending` the other-end cause (SRJ-710). A step 6 that made no launch
+   * because P reached the restart cap while the sequence ran arms nothing
+   * (b.4q8): the cap stopped P's retry timer.
    */
   const armCauseFor = (body: OutcomeBody): LiveRowSequenceArmCause | undefined => {
     if (!request.launches) return undefined
@@ -1372,6 +1396,8 @@ export async function runLiveRowSequence(
         if (body.notLaunched === LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE) {
           return latchedNow() ? undefined : LIVE_ROW_ARM_LOST_RACE
         }
+        // b.4q8: at the restart cap P's retry timer is stopped; nothing is armed.
+        if (body.notLaunched === LIVE_ROW_NOT_LAUNCHED_CAPPED) return undefined
         break
       case LIVE_ROW_OUTCOME_ROW_FINISHED:
       case LIVE_ROW_OUTCOME_STOPPED:
@@ -1571,7 +1597,7 @@ export async function runLiveRowSequence(
       persona: facts,
     })
     log(liveRowSequenceLaunchLine(ref, decision))
-    const answer = await deps.launch(key, decision.kind, lastRead, ref, stop, request.retiredAtStart)
+    const answer = await deps.launch(key, decision.kind, lastRead, ref, stop, request.retiredAtStart, request.belowCapAtStart)
     const droppedBy = dropStop()
     if (droppedBy !== undefined) {
       // SRJ-706: the launch ran to its end; its result is dropped.

@@ -22,7 +22,11 @@
  * itself never clears it. It also resets the persona's slow-recovery count
  * (b.jg5 SRJ-610).
  * A persona with a restart pending or active, or at the cap, is skipped
- * before any read. A persona with a no-attempt reason (`noAttemptReason`:
+ * before any read. The cap is asked again right after the liveness read
+ * (b.4q8): that read can settle the persona's resumed launch as ended before
+ * reporting in, a counted failure that may reach the cap, and a persona it
+ * took to the cap is skipped the same way, with nothing scheduled.
+ * A persona with a no-attempt reason (`noAttemptReason`:
  * it is latched, b.jg5 SRJ-502; it is held on `ErrInvalidFlags`, b.jg5
  * SRJ-207; work in flight for it; or its `tmux-unavailable` outage raised;
  * b.jg5 SRJ-315, SRJ-311) is still read: the working-directory check runs, and its
@@ -236,6 +240,9 @@ export interface HealthCheckDeps {
    * in src/persona-routing.ts, which checks the cap itself).
    * Recovery for such a persona comes from a server restart, which clears the
    * in-process backoff/cap state on boot.
+   * Asked before any read and again right after the tick's liveness read
+   * (b.4q8: that read may count a resumed launch that ended before reporting
+   * in, reaching the cap); either answer of true skips the persona.
    */
   isAtCap(key: string): boolean
   statRoute(cwd: string): Promise<boolean>
@@ -349,6 +356,17 @@ function noAttemptReason(d: HealthCheckDeps, key: string): NoAttemptReason | nul
   if (d.isLaunchInFlight?.(key) === true) return 'in-flight'
   if (getOutageFlags(key).has('tmux-unavailable')) return 'tmux-unavailable'
   return null
+}
+
+/**
+ * The tick's skip line for persona `key` at the restart cap (SR-25.3/25.4):
+ * logged when the cap is met before the persona's reads, and when the tick's
+ * own liveness read took it to the cap (b.4q8). Pure.
+ *
+ *   [slack] health-check: persona=<key> is at cap — skipping tick (SR-25.3/25.4)
+ */
+export function healthCheckAtCapSkipLine(key: string): string {
+  return `[slack] health-check: persona=${key} is at cap — skipping tick (SR-25.3/25.4)`
 }
 
 /**
@@ -502,7 +520,7 @@ async function runHealthCheckTick(): Promise<void> {
           // observation starts a fresh consecutive count rather than inheriting
           // a streak carried across the cap window.
           disconnectedStreak.delete(key)
-          console.error(`[slack] health-check: persona=${key} is at cap — skipping tick (SR-25.3/25.4)`)
+          console.error(healthCheckAtCapSkipLine(key))
           continue
         }
 
@@ -543,6 +561,16 @@ async function runHealthCheckTick(): Promise<void> {
         // no-attempt reason is asked again after the read, so the tick
         // schedules nothing for it.
         if (reason !== 'latched' && latchedAfterRead(deps, key)) reason = 'latched'
+        // b.4q8: the read may have settled the persona's resumed launch as
+        // ended before reporting in, a counted failure that can reach the cap
+        // (with its cap notice, its retry timer stopped). The cap is asked
+        // again, so a persona the read took to the cap is skipped as one met
+        // at the cap above is: no restart is scheduled for it.
+        if (deps.isAtCap(key)) {
+          disconnectedStreak.delete(key)
+          console.error(healthCheckAtCapSkipLine(key))
+          continue
+        }
         const holdOff = reason !== null
         if (reading === LIVENESS_UNKNOWN) {
           disconnectedStreak.delete(key)

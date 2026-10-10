@@ -60,6 +60,7 @@ import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync, readFileSync,
 import { tmpdir } from 'node:os'
 import type { PersonaInput } from '../src/config.ts'
 import { PERSONA_KEY_MAX_LENGTH, personaKey } from '../src/persona-identity.ts'
+import { LAUNCH_RESUMED_UNREPORTED } from '../src/restart.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
@@ -1110,10 +1111,10 @@ describe('slack-reply-guard.sh — AC 59: records left by a confirmed reload (b.
     expect(run.since(cp).lifecycle).toEqual([])
   }
 
-  /** The persona's next launch: its instance has ended, and the restart path resumes it. */
+  /** The persona's next launch: its instance has ended, and the restart path resumes it (counted once its row reports in, b.4q8). */
   async function nextLaunch(run: ReloadRun, persona: PersonaInput): Promise<void> {
     h.seedRow(persona, { state: 'ended' })
-    expect(await run.relaunch(persona.name)).toBe(true)
+    expect(await run.relaunch(persona.name)).toBe(LAUNCH_RESUMED_UNREPORTED)
   }
 
   /** The real guard for `persona` over the harness's record directory. */

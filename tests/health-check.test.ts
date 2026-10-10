@@ -16,6 +16,7 @@ import {
   _runHealthCheckTickForTest,
   buildPersonaWorkList,
   forgetDisconnectedStreak,
+  healthCheckAtCapSkipLine,
   type HealthCheckDeps,
 } from '../src/health-check.ts'
 import {
@@ -709,6 +710,23 @@ describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
     expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }])
   })
 
+  // b.4q8: the tick's own liveness read can count the persona's resumed
+  // launch as failed (its row ended before reporting in) and reach the cap;
+  // the cap is asked again right after the read.
+  test('b.4q8: a dead persona below the cap before the read and at it right after: the read is made, then the persona is skipped with one at-cap line and no scheduleRestart', async () => {
+    const deps = makeDeps({
+      atCapSequence: [false, true],
+      isSessionAliveResult: LIVENESS_READING_DEAD,  // would trigger restart if not capped
+      maxTicks: 1,
+    })
+
+    const lines = await capturingErrors(() => runTicks(deps, 1))
+
+    expect(deps.isSessionAliveCalls).toEqual([KEY])
+    expect(deps.scheduleRestartCalls).toEqual([])
+    expect(lines).toEqual([healthCheckAtCapSkipLine(KEY)])
+  })
+
   // -------------------------------------------------------------------------
   // Cap-guard: mixed personas — capped persona skipped, live persona processed
   // -------------------------------------------------------------------------
@@ -971,14 +989,16 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
   test('11. streak cleared on cap-skip: a pre-cap disconnected tick does NOT carry across the cap window', async () => {
     // Analogous to test 10 for the isAtCap skip. The cap skip also clears the
     // streak, so a fresh uncapped observation starts a new consecutive count.
-    //   tick1: cap=false → !connected → streak=1 (connected call 1)
-    //   tick2: cap=true  → SKIP (streak cleared; no connected probe)
-    //   tick3: cap=false → !connected → fresh streak=1 (call 2)
-    //   tick4: cap=false → !connected → streak=2 → FIRE (call 3)
+    // A tick that reaches the liveness read asks the cap twice, before the
+    // read and right after it (b.4q8); a tick capped before the read, once.
+    //   tick1: cap=false, false → !connected → streak=1 (connected call 1)
+    //   tick2: cap=true         → SKIP (streak cleared; no connected probe)
+    //   tick3: cap=false, false → !connected → fresh streak=1 (call 2)
+    //   tick4: cap=false, false → !connected → streak=2 → FIRE (call 3)
     const deps = makeDeps({
       isSessionAliveResult: LIVENESS_READING_LIVE,
       isSessionConnectedResult: false,
-      atCapSequence: [false, true, false, false],  // last (false) repeats
+      atCapSequence: [false, false, true, false],  // last (false) repeats
     })
     initHealthCheck(deps)
 
@@ -988,6 +1008,29 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     // Two fresh post-cap observations were required — the pre-cap streak of 1
     // was cleared by the cap skip rather than carried across.
     expect(deps.scheduleRestartAtConnectedCount).toEqual([3])
+  })
+
+  test('11b. b.4q8: streak cleared on a cap-skip after the read: a tick whose own liveness read took the persona to the cap does NOT carry a pre-cap streak across', async () => {
+    // As test 11, but the cap is met by the cap asked right after tick 2's
+    // read (the read counted the persona's resumed launch as failed).
+    //   tick1: cap=false, false → !connected → streak=1 (connected call 1)
+    //   tick2: cap=false, true  → read made, then SKIP (streak cleared; no connected probe)
+    //   tick3: cap=false, false → !connected → fresh streak=1 (call 2)
+    //   tick4: cap=false, false → !connected → streak=2 → FIRE (call 3)
+    const deps = makeDeps({
+      isSessionAliveResult: LIVENESS_READING_LIVE,
+      isSessionConnectedResult: false,
+      atCapSequence: [false, false, false, true, false],  // last (false) repeats
+    })
+
+    const lines = await capturingErrors(() => runTicks(deps, 4))
+
+    expect(deps.isSessionAliveCalls).toEqual([KEY, KEY, KEY, KEY])
+    expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }])
+    // Two fresh observations after the skip were required: the pre-cap streak
+    // of 1 was cleared by the skip after the read rather than carried across.
+    expect(deps.scheduleRestartAtConnectedCount).toEqual([3])
+    expect(lines.filter((line) => line === healthCheckAtCapSkipLine(KEY))).toHaveLength(1)
   })
 
   test('12. streak cleared on not-up skip: a persona the relaunch gate leaves out of a tick\'s work list does NOT carry its disconnected streak back in (b.av2 SR-6.4)', async () => {
@@ -2941,9 +2984,10 @@ describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', 
     const { calls, tick } = startSteppedTicks(() => buildPersonaWorkList(h.config!, canRelaunch))
     for (let i = 0; i < 3; i++) await tick()
 
-    // Only the up persona reached any tick step, once per tick.
+    // Only the up persona reached any tick step, once per tick (the cap
+    // twice: before the read and right after it, b.4q8).
     expect(calls.pending).toEqual([up.key, up.key, up.key])
-    expect(calls.atCap).toEqual([up.key, up.key, up.key])
+    expect(calls.atCap).toEqual([up.key, up.key, up.key, up.key, up.key, up.key])
     expect(calls.stat).toEqual([up.working_directory, up.working_directory, up.working_directory])
     expect(calls.alive).toEqual([up.key, up.key, up.key])
     expect(calls.scheduled).toEqual([up.key, up.key, up.key])
@@ -3006,10 +3050,12 @@ describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', 
     expect(notices).toEqual([{ key: up.key, text: ONSET_TEMPLATES['cwd-unreachable'](up.working_directory) }])
     expect(calls.scheduled).toEqual([up.key, up.key])
 
-    // At the restart cap the tick skips it, as for any capped persona.
+    // At the restart cap the tick skips it, as for any capped persona: one ask
+    // of the cap, before any read (each earlier tick asked twice, before the
+    // read and right after it, b.4q8).
     capped = true
     await tick()
-    expect(calls.atCap).toEqual([up.key, up.key, up.key])
+    expect(calls.atCap).toEqual([up.key, up.key, up.key, up.key, up.key])
     expect(calls.stat).toHaveLength(2)
     expect(calls.scheduled).toEqual([up.key, up.key])
 
