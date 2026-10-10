@@ -23,6 +23,13 @@
  * - `date` is the real `date` at a fixed instant (or fails).
  * The repo has no remote and the script pushes nothing: nothing reaches npm,
  * a registry or origin.
+ *
+ * Bug b.42j: the rollback (SR-3.2) had no entry in the script's exit-code
+ * header. The header cases read the real script as text, through
+ * `tests/test-helpers/shell-header.ts`, and check the entry against the
+ * rollback's code; one fixture case makes the rollback's own `git checkout`
+ * fail and checks the SR-3.2 diagnostic, its place after the failing step's,
+ * and the exit code the entry describes.
  */
 
 import { afterEach, describe, expect, test } from 'bun:test'
@@ -31,6 +38,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { hostSafeChildEnv, resolveToolDir } from './test-helpers/host-safe-env.ts'
+import { headerEntries, headerExitCodes, joinCommentLines, shellCode, shellHeader } from './test-helpers/shell-header.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
 /** The script under test, copied into each fixture repo's `scripts/`, where it finds the stub preflight and smoke check. */
@@ -99,7 +107,8 @@ interface Fixture {
 
 interface FixtureOptions {
   changelog: string
-  pack?: 'ok' | 'fail'
+  /** `fail-locked` also leaves a `.git/index.lock`, so the rollback's `git checkout` fails too. */
+  pack?: 'ok' | 'fail' | 'fail-locked'
   date?: 'ok' | 'fail'
 }
 
@@ -166,8 +175,8 @@ function makeFixture(opts: FixtureOptions): Fixture {
     '#!/usr/bin/env bash',
     '[ "$*" = "pm pack" ] || exit 1',
     `cp CHANGELOG.md ${JSON.stringify(fx.changelogAtPack)}`,
-    ...(opts.pack === 'fail'
-      ? ['echo "stub bun: pack failed" >&2', 'exit 1']
+    ...(opts.pack === 'fail' || opts.pack === 'fail-locked'
+      ? [...(opts.pack === 'fail-locked' ? [': > .git/index.lock'] : []), 'echo "stub bun: pack failed" >&2', 'exit 1']
       : [
           `cp package.json ${JSON.stringify(join(root, 'pack', 'package'))}/`,
           `tar -czf claude-slack-channel-bots-${NEXT_VERSION}.tgz -C ${JSON.stringify(join(root, 'pack'))} package`,
@@ -272,4 +281,62 @@ describe('b.689: a failure at or after the CHANGELOG.md rewrite rolls it back', 
     },
     TEST_TIMEOUT_MS,
   )
+})
+
+// ---------------------------------------------------------------------------
+// The SR-3.2 rollback's own failure (b.42j)
+// ---------------------------------------------------------------------------
+
+describe("b.42j: the SR-3.2 rollback's own checkout fails", () => {
+  test(
+    "after a pack failure: the SR-3.2 diagnostic follows the pack's, and the exit code is still the pack's 21",
+    () => {
+      const fx = makeFixture({ changelog: unreleasedChangelog('## Unreleased'), pack: 'fail-locked' })
+      const { code, stderr } = runPrepare(fx)
+      expect(code).toBe(21)
+      expect(stderr).toContain('SR-4.1 (pack)')
+      expect(stderr).toContain("SR-3.2 (rollback): 'git checkout -- package.json bun.lock CHANGELOG.md' failed")
+      // The failing step's own line first, then the rollback's.
+      expect(stderr.indexOf('SR-4.1 (pack)')).toBeLessThan(stderr.indexOf('SR-3.2 (rollback)'))
+      expect(stderr).not.toContain('SR-99.0')
+      // Nothing was restored, as the diagnostic warns.
+      expect(readFileSync(join(fx.repo, 'package.json'), 'utf-8')).toBe(packageJson(NEXT_VERSION))
+      expect(readFileSync(join(fx.repo, 'CHANGELOG.md'), 'utf-8')).toBe(RELEASED_CHANGELOG)
+    },
+    TEST_TIMEOUT_MS,
+  )
+})
+
+// ---------------------------------------------------------------------------
+// The exit-code header documents the SR-3.2 rollback (b.42j)
+// ---------------------------------------------------------------------------
+
+describe("b.42j: publish-prepare.sh's exit-code header documents the SR-3.2 rollback", () => {
+  const script = readFileSync(PREPARE_SCRIPT, 'utf-8')
+  const entries = headerEntries(shellHeader(script), 'SR-3.2')
+  /** The `git checkout` the rollback runs. */
+  const checkout = /^rollback_working_tree\(\) \{\n[\s\S]*?\bif ! (git checkout -- [^;\n]+); then/m.exec(script)?.[1]
+
+  test('one SR-3.2 entry, with no exit code of its own, naming the checkout of all three files', () => {
+    expect(entries.map((entry) => entry.code)).toEqual([null])
+    expect(checkout).toBe('git checkout -- package.json bun.lock CHANGELOG.md')
+    expect(joinCommentLines(entries[0]!.text)).toContain(`'${checkout}'`)
+  })
+
+  test('the failures the entry says SR-3.2 runs on are exactly the exits that call the rollback', () => {
+    expect(entries).toHaveLength(1)
+    const smokeCodes = headerExitCodes(shellHeader(readFileSync(join(REPO_ROOT, 'scripts', 'smoke-check.sh'), 'utf-8'))).filter((c) => c !== 0)
+    const code = shellCode(script).split('\n').filter((line) => line.trim() !== '')
+    const rolledBack = new Set<number>()
+    code.forEach((line, i) => {
+      const exit = /^\s*sr_exit\s+(\S+)/.exec(line)?.[1]
+      if (exit === undefined || code[i - 1]?.trim() !== 'rollback_working_tree') return
+      // The smoke check's own exit code is passed through.
+      for (const c of exit === '"${SMOKE_EXIT}"' ? smokeCodes : [Number(exit)]) rolledBack.add(c)
+    })
+    const named = new Set([...joinCommentLines(entries[0]!.text).matchAll(/\b\d{2}\b/g)].map((m) => Number(m[0])))
+    const sorted = (s: Set<number>): number[] => [...s].sort((a, b) => a - b)
+    expect(sorted(rolledBack)).toEqual([20, 21, 22, 23, 30])
+    expect(sorted(named)).toEqual(sorted(rolledBack))
+  })
 })

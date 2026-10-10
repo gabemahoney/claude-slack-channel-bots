@@ -68,6 +68,7 @@ import {
 } from './test-helpers/agent-director-versions.ts'
 import { cannedFailureResult, STALE_VERSION } from './test-helpers/install-check-fixtures.ts'
 import { flat, requiredSection, splitFences } from './test-helpers/markdown.ts'
+import { headerEntries, shellCode, shellHeader, type HeaderEntry } from './test-helpers/shell-header.ts'
 import { INSTALL_OR_REMOVAL_FORMS, UPGRADE_FORMS, type ForbiddenForm } from './test-helpers/upgrade-forms.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
@@ -217,21 +218,9 @@ describe('scripts/ad-version-check.ts', () => {
 // scripts/preflight.sh and scripts/publish-prepare.sh, read as text
 // ---------------------------------------------------------------------------
 
-/** `text` without its comment lines (the shebang included). */
-function shellCode(text: string): string {
-  return text.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n')
-}
-
-/** The script's leading comment block. */
-function shellHeader(text: string): string {
-  const lines = text.split('\n')
-  return lines.slice(0, lines.findIndex((line) => !/^\s*#/.test(line))).join('\n')
-}
-
-/** The header's SR-2.5 exit-code entry: its code and its text, continuation lines included. */
-function headerEntry(text: string): { code: number; text: string } | undefined {
-  const m = /^#\s+(\d+)\s+SR-2\.5\b.*(?:\n#\s+(?!\d)\S.*)*/m.exec(shellHeader(text))
-  return m ? { code: Number(m[1]), text: m[0] } : undefined
+/** The header's first numbered SR-2.5 exit-code entry: its code and its text, continuation lines included. */
+function headerEntry(text: string): HeaderEntry | undefined {
+  return headerEntries(shellHeader(text), 'SR-2.5').find((entry) => entry.code !== null)
 }
 
 /** SR-2.5's block: from its `# SR-2.5` comment to the `# SR-2.6` comment. */

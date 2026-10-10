@@ -432,7 +432,7 @@ fi
 if [ -n "${SR70_ON_PATH}" ] && cscb_is_outside_prefix "${SR70_RESOLVED}" "${GLOBAL_DIR}"; then
   {
     echo ""
-    echo "SR-7.0 (pre-install shadow check): WARNING — 'claude-slack-channel-bots' currently resolves from OUTSIDE the prefix promote is about to install into. The new install will land correctly, but this stale copy will keep winning on PATH until it is removed, and SR-7.4 below will fail the release because of it."
+    echo "SR-7.0 (pre-install shadow check): WARNING — 'claude-slack-channel-bots' currently resolves from OUTSIDE the prefix promote is about to install into. The new install will land correctly. If this copy is still what resolves on PATH after that install, SR-7.4 below will exit 72 — AFTER the release has published (the version is on npm, the commit and tag are on origin), so that exit neither undoes nor blocks the release. The fix is to remove the shadowing copy, as the report below describes."
     cscb_shadow_report "${SR70_ON_PATH}" "${SR70_RESOLVED}"
   } >&2
 fi

@@ -46,6 +46,13 @@
 #                Recovery: rerun from the canonical checkout beside the hives.
 #   20  SR-3.1  npm version bump failed, OR CHANGELOG.md has no '## Unreleased'
 #                heading, OR its rewrite to the release's heading failed
+#   --  SR-3.2  rollback, no exit code of its own. Runs on the 20, 21, 22, 23
+#                and 30 failures (and any other non-zero smoke-check.sh exit):
+#                'git checkout -- package.json bun.lock CHANGELOG.md' restores
+#                those files from the index: HEAD's copies, except when 'git
+#                commit' fails (30) after 'git add' staged the bump, where it
+#                changes nothing. If that checkout itself fails it prints its
+#                own SR-3.2 diagnostic; the exit code is still the failing step's
 #   21  SR-4.1  bun pm pack failed or tarball internal version mismatch
 #   22  SR-4.2  scratch install failed (from smoke-check.sh)
 #   23  SR-4.3  bin smoke contract failed (from smoke-check.sh)
