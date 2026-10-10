@@ -39,6 +39,17 @@ A crontable line with no persona list is never delivered: all-bots delivery is n
 - **Add a persona list to each line the warning names.** Run `grep undeliverable ~/.claude/channels/slack/cron.log` (the default `cron_log_path`) to list them. See [The cron log](README.md#the-cron-log).
 - **Replace an old crontable header by hand.** The server never rewrites an existing crontable, so a crontable created by an earlier release keeps its header. A header from before 0.11.0 says that leaving out the target list reaches all bots. Replace its comment block with the header in [Crontable format](README.md#crontable-format).
 
+### `cron_log_max_bytes` now caps the cron log
+
+`cron_log_max_bytes` was accepted but did nothing: the cron log grew without limit whatever it said. It is now enforced.
+
+- **With the key set, the oldest lines are dropped.** Once a line takes the cron log past `cron_log_max_bytes`, the server drops the log's oldest whole lines until it fits. The newest line is always kept. Nothing is rotated, so dropped lines are gone. See [The cron log](README.md#the-cron-log).
+- **A log already over the cap is pruned when the next line is written to it.** If `config.json` sets the key and you want the older lines, copy `cron.log` before you start this release.
+- **Without the key, nothing changes.** The log only grows, as before.
+- **A mode set on `cron.log` by hand is not kept.** A prune writes the log as a new file with the default mode.
+- **Don't rotate, move or delete `cron.log` yourself; set the key instead.** After a move or delete, the server keeps writing to the old file until that file passes the cap, then reopens `cron_log_path`. Without the key, it keeps writing to the old file until it restarts.
+- **Each failed prune logs one `[slack] cron-log: prune failed` line in `server.log`**; the cron-log line itself is still written. The `debug-slack-channel-bots` skill has it under "Other lines you may see".
+
 ### A long permission prompt is cut to fit, and one failing prompt no longer stops the poll
 
 - **A long tool input is cut.** A permission prompt's tool input is cut to fit Slack's 3000-character section limit and followed by `… (truncated, <shown> of <total> chars shown)`; another tool's JSON keeps its 500-character cap, now with the same marker. Before, a Bash command over about 3000 characters made Slack reject the prompt, and the server posted it and logged the failure again at every poll until the request closed. See [Permission Relay](README.md#permission-relay).

@@ -4444,7 +4444,7 @@ export async function main(): Promise<void> {
   // scheduler.start() also owns the crontable bootstrap (the sole ensure-exists
   // caller) and is failure-isolated internally.
   try {
-    const cronLog = createCronLog(personaConfig.cron_log_path)
+    const cronLog = createCronLog(personaConfig.cron_log_path, { maxBytes: personaConfig.cron_log_max_bytes })
     // Prefer the ACTUAL bound port (covers port-0 configs); fall back to the
     // requested port only if Bun leaves it undefined (never expected once the
     // server is listening).

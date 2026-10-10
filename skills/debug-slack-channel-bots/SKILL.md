@@ -260,6 +260,19 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
     `cron-migrate:` lines or a `failed to create crontable` line, or you're
     not sure which crontable the server reads?** See
     [The crontable's location and its move at start](#the-crontables-location-and-its-move-at-start).
+14. **Old lines are missing from the cron log, or `server.log` has a
+    `[slack] cron-log: prune failed` line?** With `cron_log_max_bytes` set,
+    the server keeps the cron log within that many bytes by dropping its
+    oldest lines, so old fires vanish from it by design. See the
+    `cron-log: prune failed` row under
+    [Other lines you may see](#other-lines-you-may-see).
+    **New lines are missing after the cron log was rotated, moved or
+    deleted?** The server keeps writing to the file it opened until that
+    file passes the cap, then reopens `cron_log_path`: after a move the
+    lines are in the moved file, after a delete they are lost. Without
+    `cron_log_max_bytes`, the server writes to that file until the server
+    restarts. Don't rotate the cron log yourself; set `cron_log_max_bytes`
+    instead.
 
 ---
 
@@ -4482,6 +4495,7 @@ agent-director get --claude-instance-id <id>
 | `[slack] clean_restart: agent-director answers — starting server after the failed teardown` (`clean_restart.log`) | The check answered, so `clean_restart` starts the server even though a persona could not be stopped. Read `server.log` for the new start. |
 | `[slack] server.port: could not write <path>; clear-latch cannot reach this server until it restarts: <error>` | At start the server could not record its PID and port in `server.port` beside its PID file (for example, the state directory isn't writable or is full). The server runs normally, but a hold cannot be cleared by hand on it until it restarts. Check the state directory's permissions and free space; the record is written again at the next start. |
 | `[<time>] [startup-errors] WARNING: could not write to <path>: <error>` (terminal) | The command could not record one of its entries in `startup-errors.log` at `<path>`. The print, `server.log` and the exit status are unchanged. Check the state directory's permissions and free space. |
+| `[slack] cron-log: prune failed identity=<identity> outcome=<outcome> — the line is written, the log is not pruned: <description>` | With `cron_log_max_bytes` set, the server drops the cron log's oldest whole lines after each line that takes it past that many bytes. The newest line is always kept and nothing is rotated, so old lines missing from the cron log are expected. This line means one such prune failed. The cron-log line it names (`<identity>` is its schedule or `-`, `<outcome>` its outcome class or line kind) is in the log and nothing was lost, but the log stays over the cap until a later line prunes it. A prune writes a temporary file in the cron log's directory (the symlink target's, when `cron_log_path` is a symlink) and renames it over the log: check that directory's free space and that the server's user can create files in it. A changed `cron_log_max_bytes` takes effect at the next server start. |
 | `[slack] persona "<name>" (key=<key>): up after its bring-up retry (directory\|Slack) — launching` | A retrying persona came up and is launched from its retry. Normal recovery. |
 | `[slack] spawnForPersona: "<name>" (key=<key>) row cwd=<dir> differs from working_directory=<dir> (state=<state>) — replacing the row by a reuse spawn of the same id; nothing is deleted` | At a start or relaunch the persona's agent-director row was in another directory than its `working_directory`, so it can't be kept: the persona starts a new conversation on the same instance, and the old row stays as an earlier life. The `replacing the row of` line below follows. Nothing. |
 | `[slack] spawnForPersona: resume_enabled=false for "<name>" (key=<key>) — not resuming; replacing its row by a reuse spawn of the same id` | `resume_enabled` is `false`, so the persona starts a new conversation on the same instance instead of resuming; the old row stays as an earlier life. The `replacing the row of` line below follows. Nothing. |
