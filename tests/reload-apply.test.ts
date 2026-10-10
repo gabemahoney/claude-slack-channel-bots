@@ -208,6 +208,7 @@ import {
 import { configDirLabelValue, personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { DESTRUCTIVE_SETTINGS, type DestructiveSetting, type InPlaceSetting, MODE_SWITCH_SETTING } from '../src/reload-plan.ts'
 import { renderNoopLogLine } from '../src/reload-apply.ts'
+import { LAUNCH_RESUMED_UNREPORTED, type LaunchSessionResult } from '../src/restart.ts'
 import { destinationSettingOf, FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
 import { destinationClearedCause, destinationFailedCause, type DestinationFailedAt } from '../src/persona-destination-hold.ts'
 import { handlePermissionClick } from '../src/permission-click-handler.ts'
@@ -1351,7 +1352,8 @@ describe('AC 70: after a failed rewrite, the persona it would have retired resum
 
     h.seedRow(personas[1]!, { state: 'ended' })
     const from = run.composition!.instanceCallsOf('bravo').length
-    expect(await run.relaunch('bravo')).toBe(true)
+    // b.4q8: a resume is counted once its row reports in.
+    expect(await run.relaunch('bravo')).toBe(LAUNCH_RESUMED_UNREPORTED)
 
     expect(instanceCallsSince(run, 'bravo', from)).toEqual(['spawn ErrInstanceIdCollision', 'resume ok'])
     expect(h.rowOf('bravo')?.state).toBe('waiting')
@@ -4894,6 +4896,8 @@ describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no sess
     change: () => Partial<PersonaInput>
     refresh: boolean
     nextLaunch: string[]
+    /** What the next launch answers: true for a reuse spawn, resumed-unreported for a resume (counted once its row reports in, b.4q8). */
+    answer: LaunchSessionResult
     record: string
     /** The `config_dir` label the next launch must carry; default the strict label of the new directory. */
     label?: () => string
@@ -4907,6 +4911,7 @@ describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no sess
       refresh: true,
       // From an `ended` row labelled with the old directory: replaced by a reuse of the same id with the new one, nothing deleted.
       nextLaunch: ['spawn ErrInstanceIdCollision', 'reuse-spawn ok'],
+      answer: true,
       record: 'true',
     },
     {
@@ -4915,6 +4920,7 @@ describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no sess
       change: () => ({ claude_config_dir: join(configDirLink('bravo-parent-link', h.configDir('bravo-parent')), 'fresh', 'nested') }),
       refresh: true,
       nextLaunch: ['spawn ErrInstanceIdCollision', 'reuse-spawn ok'],
+      answer: true,
       record: 'true',
       // The nearest existing ancestor's real path (the link's target) plus the rest, never the path as written.
       label: () => configDirLabelValue(join(h.configDir('bravo-parent'), 'fresh', 'nested'), h.home),
@@ -4927,9 +4933,10 @@ describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no sess
       refresh: false,
       // The row's label still matches: resumed.
       nextLaunch: ['spawn ErrInstanceIdCollision', 'resume ok'],
+      answer: LAUNCH_RESUMED_UNREPORTED,
       record: 'false',
     },
-  ])("AC 59: bravo's own $what changed records no teardown, bring-up or reconnect and no agent-director instance call, keeps its connection, MCP session, row and reply-guard record; its next launch uses the new value, and running alpha is unaffected (real launch)", async ({ setting, change, refresh, nextLaunch, record, label: expectedLabel, uncreated }) => {
+  ])("AC 59: bravo's own $what changed records no teardown, bring-up or reconnect and no agent-director instance call, keeps its connection, MCP session, row and reply-guard record; its next launch uses the new value, and running alpha is unaffected (real launch)", async ({ setting, change, refresh, nextLaunch, answer, record, label: expectedLabel, uncreated }) => {
     const { run, personas } = await running(['alpha', 'bravo'], { ...REAL_LAUNCH, sessions: true })
     const [alpha, bravo] = personas
     const bravoKey = h.key('bravo')
@@ -4973,8 +4980,8 @@ describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no sess
     h.seedRow(bravo!, { state: 'ended' })
     const bravoInstanceCalls = run.composition!.instanceCallsOf('bravo').length
     const next = run.checkpoint()
-    expect(await run.relaunch('bravo')).toBe(true)
-    expect(run.since(next).lifecycle).toEqual([{ op: 'launch', key: bravoKey, via: 'restart', restart: true }])
+    expect(await run.relaunch('bravo')).toBe(answer)
+    expect(run.since(next).lifecycle).toEqual([{ op: 'launch', key: bravoKey, via: 'restart', restart: answer }])
     expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(nextLaunch)
     const label = expectedLabel?.() ?? personaConfigDirLabelValue(edited.claude_config_dir, h.home)
     expect(lastSpawnOf(run, 'bravo')).toMatchObject({ claudeConfigDir: edited.claude_config_dir, configDirLabel: label })
@@ -5156,6 +5163,9 @@ describe('AC 61: a changed inherited default leaves every instance undisturbed a
     /** Each inheriting persona's next launch, and charlie's. */
     inheritorLaunch: string[]
     ownLaunch: string[]
+    /** What those launches answer: true for a reuse spawn, resumed-unreported for a resume (counted once its row reports in, b.4q8). */
+    inheritorAnswer: LaunchSessionResult
+    ownAnswer: LaunchSessionResult
     /** What each persona's next launch used: its spawn's config directory and its reply-guard record. */
     launched: (name: string) => { claudeConfigDir: string | undefined; record: string | undefined }
   }>([
@@ -5168,6 +5178,8 @@ describe('AC 61: a changed inherited default leaves every instance undisturbed a
       refresh: true,
       inheritorLaunch: ['spawn ErrInstanceIdCollision', 'reuse-spawn ok'],
       ownLaunch: ['spawn ErrInstanceIdCollision', 'resume ok'],
+      inheritorAnswer: true,
+      ownAnswer: LAUNCH_RESUMED_UNREPORTED,
       launched: (name) => ({ claudeConfigDir: name === 'charlie' ? ownConfigDir('charlie') : h.configDir('default-new'), record: 'true' }),
     },
     {
@@ -5179,9 +5191,11 @@ describe('AC 61: a changed inherited default leaves every instance undisturbed a
       refresh: false,
       inheritorLaunch: ['spawn ErrInstanceIdCollision', 'resume ok'],
       ownLaunch: ['spawn ErrInstanceIdCollision', 'resume ok'],
+      inheritorAnswer: LAUNCH_RESUMED_UNREPORTED,
+      ownAnswer: LAUNCH_RESUMED_UNREPORTED,
       launched: (name) => ({ claudeConfigDir: ownConfigDir(name), record: name === 'charlie' ? 'true' : 'false' }),
     },
-  ])('AC 61: the top-level $setting changed, inherited by alpha and bravo and overridden by charlie, is previewed as one line listing exactly alpha and bravo, records no teardown, bring-up or reconnect, and each inheritor\'s next launch uses the new default while charlie\'s keeps its own (real launch)', async ({ setting, before, after, inherit, own, refresh, inheritorLaunch, ownLaunch, launched }) => {
+  ])('AC 61: the top-level $setting changed, inherited by alpha and bravo and overridden by charlie, is previewed as one line listing exactly alpha and bravo, records no teardown, bring-up or reconnect, and each inheritor\'s next launch uses the new default while charlie\'s keeps its own (real launch)', async ({ setting, before, after, inherit, own, refresh, inheritorLaunch, ownLaunch, inheritorAnswer, ownAnswer, launched }) => {
     const names = ['alpha', 'bravo', 'charlie']
     const { run, personas } = await running([['alpha', inherit], ['bravo', inherit], ['charlie', own]], { ...REAL_LAUNCH, top: before() })
     const snapshot = () =>
@@ -5212,7 +5226,7 @@ describe('AC 61: a changed inherited default leaves every instance undisturbed a
     for (const persona of personas) h.seedRow(persona, { state: 'ended' })
     for (const name of names) {
       const from = run.composition!.instanceCallsOf(name).length
-      expect(await run.relaunch(name)).toBe(true)
+      expect(await run.relaunch(name)).toBe(name === 'charlie' ? ownAnswer : inheritorAnswer)
       expect(instanceCallsSince(run, name, from)).toEqual(name === 'charlie' ? ownLaunch : inheritorLaunch)
       const { claudeConfigDir, record } = launched(name)
       expect(lastSpawnOf(run, name)?.claudeConfigDir).toBe(claudeConfigDir)
@@ -6756,7 +6770,8 @@ describe('b.deo SRI-410, SRI-403: the stored choice across restarts, relaunches 
     expect(await probe(restarted, 'bravo', OTHER_CHANNEL, 'plain')).toEqual([])
     // A relaunch of bravo keeps the stored choice.
     h.seedRow(personas[1]!, { state: 'ended' })
-    expect(await restarted.relaunch('bravo')).toBe(true)
+    // b.4q8: a resume is counted once its row reports in.
+    expect(await restarted.relaunch('bravo')).toBe(LAUNCH_RESUMED_UNREPORTED)
     expect(await probe(restarted, 'bravo', EXTRA_CHANNEL, 'plain')).toEqual([{ chat_id: EXTRA_CHANNEL, via: 'receive_all' }])
     expect(storedOnDisk('bravo')).toEqual({ [EXTRA_CHANNEL]: 'all', [OTHER_CHANNEL]: 'mentions' })
     expect(restarted.deliveries('alpha')).toEqual([])

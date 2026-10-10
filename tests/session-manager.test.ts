@@ -780,6 +780,7 @@ import {
   isLiveRowSequenceRunning,
   launchForLiveRowSequence,
   LIVE_ROW_START_NOT_INSTALLED,
+  sequenceLaunchAtCapLine,
   startLiveRowSequence,
   stopLiveRowSequence,
   JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS,
@@ -824,6 +825,7 @@ import {
   LIVE_ROW_LAUNCH_REASON_RETIRED_KEY,
   LIVE_ROW_LAUNCH_RESUME,
   LIVE_ROW_LAUNCH_REUSE,
+  LIVE_ROW_NOT_LAUNCHED_CAPPED,
   LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED,
   LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE,
   LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION,
@@ -1078,7 +1080,7 @@ import {
 } from '../src/agent-director-errors.ts'
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { UNUSABLE_RECORDED_NAME_PHRASE } from '../src/ad-description-phrases.ts'
-import { RESTART_FAILURE_CAP, RESTART_OUTCOME_LAUNCHED, RESTART_OUTCOME_REFUSED, runRestartRetry, type LaunchSessionResult } from '../src/restart.ts'
+import { LAUNCH_RESUMED_UNREPORTED, RESTART_FAILURE_CAP, RESTART_OUTCOME_LAUNCHED, RESTART_OUTCOME_REFUSED, runRestartRetry, type LaunchSessionResult } from '../src/restart.ts'
 import {
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_CONFLICT,
@@ -3461,7 +3463,8 @@ describe('pre-launch trust patch (b.av2 SR-6.2)', () => {
     ['restart launchSession adapter, resume of an ended row', {
       install: (cfg, calls) => installResumeEntry('ended', personaRow(cfg, 'C'), calls),
       launch: (cfg) => launchSession('C', cfg),
-      expected: true,
+      // b.4q8: counted once its row reports in.
+      expected: LAUNCH_RESUMED_UNREPORTED,
       events: ['patch', 'spawn', 'resume'],
     }],
     ['the reuse spawn after resume ErrJsonlMissing and its diagnosis (b.jg5 SRJ-712)', {
@@ -4152,7 +4155,7 @@ describe('prompt suggestions off on every launch (b.svb, b.f2b)', () => {
     ['restart relaunch (launchSession), resume of an ended row', {
       install: (cfg, calls) => installResumeEntry('ended', personaRow(cfg, 'C'), calls),
       launch: (cfg) => launchSession('C', cfg),
-      expected: true, spawns: 1, resumes: 1,
+      expected: LAUNCH_RESUMED_UNREPORTED, spawns: 1, resumes: 1,
     }],
     ['resume_enabled false: a reuse spawn of the same id', {
       config: { resume_enabled: false },
@@ -7242,7 +7245,8 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
         result = await launchSession(GUARD_KEY, f.cfg)
       })
 
-      expect(result).toBe(true)
+      // b.4q8: a resume is counted once its row reports in.
+      expect(result).toBe(LAUNCH_RESUMED_UNREPORTED)
       expect(after.resumeCalls.map((r) => r.claude_instance_id)).toEqual([GUARD_INSTANCE])
       expect(after.deleteCalls).toEqual([])
       expect(after.spawnCalls).toHaveLength(1)
@@ -25899,6 +25903,84 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
 })
 
 // ---------------------------------------------------------------------------
+// b.4q8: the restart cap at the live-row sequence's step-6 launch, on
+// `makeRecoveryHarness`. A read of P's row while its sequence runs (the
+// sequence's own `get` included) can count P's resumed launch as failed, its
+// row ended before reporting in, and reach the cap. The start entry
+// (`startLiveRowSequence`) forwards whether P was below the cap when the
+// sequence started, read there unless the request carries it; the launch
+// entry (`launchForLiveRowSequence`) makes no call for a P below the cap
+// then and at it now, and launches a P that was at the cap already (a
+// restart's re-attempt at the cap handing off). A start request is read
+// whole from a recording registry (`recordSequenceStarts`), so no sequence
+// runs; the sequence's own run to `capped` is tests/restart.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('b.4q8: the live-row sequence\'s start entry forwards whether P was below the restart cap, and its launch entry makes no call for a P that reached the cap since', () => {
+  afterEach(() => {
+    expectNoDeleteOrIncludeFinished(srj105Harness)
+    srj105AfterEach()
+  })
+
+  /** What the sequence last read before its launch: the row `ended`. */
+  const LAST_READ = latchRowStateRead(LIVENESS_DEAD_ROW_ENDED)
+
+  test.each<[string, number, boolean | undefined, boolean]>([
+    ['P one failure below the cap, the request carrying no reading: forwarded as below the cap (true)', RESTART_FAILURE_CAP - 1, undefined, true],
+    ['P at the cap, the request carrying no reading: forwarded as at the cap (false)', RESTART_FAILURE_CAP, undefined, false],
+    ['P at the cap, the request carrying true: forwarded as it came (true)', RESTART_FAILURE_CAP, true, true],
+    ['P below the cap, the request carrying false: forwarded as it came (false)', 0, false, false],
+  ])('the start entry, %s, with the rest of the request as given; nothing counted', (_label, failures, given, forwarded) => {
+    const { h, p } = srj105Build()
+    for (let i = 0; i < failures; i++) recordFailure(p)
+    const starts = recordSequenceStarts()
+    const request: LiveRowSequenceRequest = {
+      ...h.sequenceRequest(p, { lastReadState: 'waiting' }),
+      ref: renderPersonaRef(p, p),
+      ...(given === undefined ? {} : { belowCapAtStart: given }),
+    }
+
+    expect(startLiveRowSequence(request)).toBe(LIVE_ROW_START_STARTED)
+
+    // The entry's other addition: the store's reading at the attempt's start, P not recorded (b.jg5 SRJ-806).
+    expect(starts).toEqual([{ ...request, retiredAtStart: { recorded: false, marked: false, generation: undefined }, belowCapAtStart: forwarded }])
+    expect(starts[0]!.belowCapAtStart).toBe(forwarded)
+    expect(getFailureCount(p)).toBe(failures)
+  })
+
+  test('the launch entry for P at the cap, below it when its sequence started: not launched (capped), with no agent-director call and one line; nothing counted, armed or posted, and nothing registered as in flight', async () => {
+    const { h, p } = srj105Build()
+    for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(p)
+
+    expect(await launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_REUSE, lastRead: LAST_READ, belowCapAtStart: true })).toEqual({
+      key: p,
+      action: LIVE_ROW_OUTCOME_NOT_LAUNCHED,
+      reason: LIVE_ROW_NOT_LAUNCHED_CAPPED,
+    })
+
+    expect([h.stub.callCount(), isLaunchInFlight(p)]).toEqual([0, false])
+    expect(h.errors.filter((line) => line.startsWith(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} not launching `))).toEqual([sequenceLaunchAtCapLine(renderPersonaRef(p, p))])
+    expect([getFailureCount(p), h.triggers, h.controller.isArmed(p), h.notices, h.capReached]).toEqual([RESTART_FAILURE_CAP, [], false, [], []])
+  })
+
+  test.each<[string, number, boolean | undefined]>([
+    ['P at the cap, at it when its sequence started too (a restart\'s re-attempt at the cap)', RESTART_FAILURE_CAP, false],
+    ['P at the cap, the request carrying no reading', RESTART_FAILURE_CAP, undefined],
+    ['P one failure below the cap, below it when its sequence started', RESTART_FAILURE_CAP - 1, true],
+  ])('the launch entry for %s: launched by its one reuse spawn, with no at-cap line; the success resets the count', async (_label, failures, belowCapAtStart) => {
+    const { h, p } = srj105Build()
+    for (let i = 0; i < failures; i++) recordFailure(p)
+
+    expect(await launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_REUSE, lastRead: LAST_READ, belowCapAtStart })).toEqual({ key: p, action: 'spawned' })
+
+    expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
+    expect(h.errors.filter((line) => line === sequenceLaunchAtCapLine(renderPersonaRef(p, p)))).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
+    await h.runApproverToStop(p)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // b.jg5 SRJ-602 (HO C1, AC 77) and SRJ-711 (AC 57), on `makeRecoveryHarness`
 // (both settings 0).
 //
@@ -28285,9 +28367,11 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
 
   /**
    * The sequence request a retired key's old life read `state` starts: the
-   * retired-key flag, the conversation not kept, context `recovery`, and the
+   * retired-key flag, the conversation not kept, context `recovery`, the
    * ladder's retired-key reading at its start (`retiredAtStart`; by default a
-   * key recorded once since the store loaded, with no mark).
+   * key recorded once since the store loaded, with no mark), and the start
+   * entry's reading that P is below the restart cap (b.4q8; no case here
+   * records a failure).
    */
   function retiredSequenceRequest(
     h: RecoveryHarness,
@@ -28295,7 +28379,11 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     state: string,
     retiredAtStart: RetiredKeyAttemptStart = RECORDED_ONCE_AT_START,
   ): LiveRowSequenceRequest {
-    return { ...h.sequenceRequest(key, { lastReadState: state, retiredKey: true, retiredAtStart }), ref: renderPersonaRef(harnessPersona(h, key).name, key) }
+    return {
+      ...h.sequenceRequest(key, { lastReadState: state, retiredKey: true, retiredAtStart }),
+      ref: renderPersonaRef(harnessPersona(h, key).name, key),
+      belowCapAtStart: true,
+    }
   }
 
   /** Whether `key`'s mark is set in the running store, in the record file and in a store loaded anew over the same directory. */
@@ -28787,7 +28875,8 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
 
     expect(startLiveRowSequence(request)).toBe(LIVE_ROW_START_STARTED)
 
-    expect(starts).toEqual([{ ...request, retiredKey: flagged || forced, retiredAtStart: forwarded }])
+    // b.4q8: the entry also adds its reading that P is below the restart cap.
+    expect(starts).toEqual([{ ...request, retiredKey: flagged || forced, retiredAtStart: forwarded, belowCapAtStart: true }])
     expect(starts[0]!.retiredAtStart).toStrictEqual(forwarded)
     const forcedLine = `${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${ref}: its key is retired, so the sequence carries the retired-key flag and ends in a reuse spawn, never a resume (b.jg5 SRJ-805, SRJ-705)`
     expect(h.errors.filter((line) => line.startsWith(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} `))).toEqual(forced ? [forcedLine] : [])
@@ -32088,8 +32177,10 @@ describe('b.jg5 SRJ-412, SRJ-705: the abort\'s live-row sequence start (startStu
         retiredKey: false,
         launches: true,
         alertContext: KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT,
-        // The start entry's own addition: the store's reading of the key at the attempt's start.
+        // The start entry's own additions: the store's reading of the key at the attempt's start,
+        // and its reading that P is below the restart cap (b.4q8).
         retiredAtStart: expect.anything(),
+        belowCapAtStart: true,
       },
     ])
   })
@@ -32808,7 +32899,12 @@ describe('b.jg5 SRJ-506: a re-check retry\'s definite answer is counted by its c
     recordFailure(p)
     recordFailure(p)
     latchForRecheck(h, p, site.latch, site.recorded)
-    h.script(site.script(h, p))
+    // b.4q8: a resume counts once its row reports in, so P's row reads waiting after it.
+    const id = personaInstanceId(p)
+    h.script({
+      ...site.script(h, p),
+      statusFn: (params) => (params.claude_instance_id === id && h.stub.calls.resumeCalls.length > 0 ? cannedStatusResult({ state: 'waiting' }) : undefined),
+    })
 
     await h.advanceToRecheck()
 

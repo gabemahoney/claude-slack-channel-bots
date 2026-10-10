@@ -65,6 +65,9 @@ import {
   reprobeUnknownLine,
   pendingDeferralGoneLine,
   restartOldLifeHeldLine,
+  LAUNCH_RESUMED_UNREPORTED,
+  recordLaunchResultOutsideRestartWork,
+  restartCapReachedLine,
   type KillSessionResult,
   type RestartPendingDeferralAnswer,
   type LaunchSessionResult,
@@ -82,7 +85,8 @@ import {
   isAtCap,
   recordFailure,
 } from '../src/backoff.ts'
-import { _buildIsSessionAliveAdapter, _buildKillSessionAdapter, _buildReconnectSessionAdapter, deferPendingRow, deferringPendingRowLine } from '../src/server.ts'
+import { _buildIsSessionAliveAdapter, _buildKillSessionAdapter, _buildReconnectSessionAdapter, deferPendingRow, deferringPendingRowLine, LIVENESS_STATUS_SITE } from '../src/server.ts'
+import { _resetHealthCheckState, _runHealthCheckTickForTest, healthCheckAtCapSkipLine, initHealthCheck } from '../src/health-check.ts'
 import {
   KILL_OUTCOME_KILLED,
   KILL_OUTCOME_NOT_KILLED,
@@ -97,6 +101,7 @@ import {
   killOutcomeOf,
   type KillOutcome,
 } from '../src/checked-kill.ts'
+import { KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import { createPersonaRelaunchGate } from '../src/persona-start.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import { createPersonaSerializer, type PersonaSerialize } from '../src/persona-serializer.ts'
@@ -147,6 +152,23 @@ import {
   ROW_REREAD_FINISHED,
   spawnNotResumableLine,
   uncoveredPendingRowLine,
+  APPROVER_LOG_SITE,
+  APPROVER_STATUS_READ_WHAT,
+  DIALOG_SLOW_POLL_INTERVAL_MS,
+  RESUME_READ_NO_ROW,
+  UNREPORTED_RESUME_FALLBACK_AFTER,
+  applyOwnRowStatusStep,
+  forgetLaunchCalls,
+  readPersonaOwnRow,
+  resumeCountFailedLine,
+  resumeEndedUnreportedLine,
+  resumedLaunchFailedLine,
+  unreportedResumeFallbackLine,
+  abortKillOwnStuckLaunch,
+  sequenceLaunchAtCapLine,
+  startStuckLaunchAbortSequence,
+  stopApproverForStuckLaunchAbort,
+  type OwnRowReadSite,
   type PersonaRowReread,
   type CarriedDeadEvidence,
   type DeadEvidenceSource,
@@ -157,10 +179,23 @@ import {
   LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION,
   LIVE_ROW_LAUNCH_RESUME,
   LIVE_ROW_LAUNCH_REUSE,
+  LIVE_ROW_NOT_LAUNCHED_CAPPED,
+  LIVE_ROW_OUTCOME_ABORTED,
   LIVE_ROW_OUTCOME_LAUNCHED,
+  LIVE_ROW_OUTCOME_NOT_LAUNCHED,
+  LIVE_ROW_OUTCOME_STOPPED,
+  LIVE_ROW_SEQUENCE_ENTRY_GET,
+  LIVE_ROW_SEQUENCE_SITE,
   liveRowSequenceStartLine,
 } from '../src/live-row-sequence.ts'
-import { PENDING_ROW_REASON_CWD_MISMATCH } from '../src/pending-row.ts'
+import {
+  PENDING_ROW_REASON_CWD_MISMATCH,
+  STUCK_LAUNCH_ABORT_KILL_FAILED,
+  STUCK_LAUNCH_ABORT_KILL_STOPPED,
+  STUCK_LAUNCH_ABORT_KILL_SUCCEEDED,
+  STUCK_LAUNCH_ABORT_KILL_TRY_LATER,
+  STUCK_LAUNCH_ABORT_SEQUENCE_STARTED,
+} from '../src/pending-row.ts'
 import { KILL_FAILURE_ROUTE_NOT_CONFIGURED, KILL_FAILURE_VERSION_ORDINARY, PERSONA_KILL_FAILED_LABEL } from '../src/kill-failure-alert.ts'
 import {
   conflictNoticeText,
@@ -193,6 +228,7 @@ import { AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_UNCLASSIFIED, CSCB_UNKNOWN_E
 import {
   cannedErr,
   cannedOk,
+  cannedSpawnResult,
   cannedFindMissing,
   cannedGetResult,
   cannedStatusResult,
@@ -246,6 +282,7 @@ import type { Persona, PersonaConfig } from '../src/config.ts'
 import {
   createUnavailableRetryController,
   UNAVAILABLE_RETRY_BASE_S,
+  UNAVAILABLE_RETRY_CAUSE_COLLISION,
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_LOST_RACE,
   UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
@@ -282,15 +319,18 @@ import {
   makeRecoveryHarness,
   ordinaryAlertContent,
   personaCallCounts,
+  personaOf,
   personaRow,
   reuseSpawnOf,
   startupEntriesOf,
   retryNow,
   rowReadsUntilSpawn,
   type RecoveryHarness,
+  type RecoveryHarnessOptions,
   type RecoveryStubScript,
 } from './test-helpers/recovery-harness.ts'
 import { DEAD_EVIDENCE_OF } from './test-helpers/dead-evidence.ts'
+import { beginApplyHold } from './test-helpers/old-life.ts'
 import {
   NO_LAUNCH_START_FORMS,
   NO_LAUNCH_START_FORM_NAMES,
@@ -1291,6 +1331,40 @@ describe('backoff integration (SR-29.3)', () => {
 
     // onCapReached did NOT re-fire during this recovery (new deps, no calls)
     expect(recoveringDeps.onCapReachedCalls).toHaveLength(0)
+  })
+
+  // b.4q8: the restart work stops at the cap only for a persona that reached
+  // it during the work (a read that counted its resumed launch as failed,
+  // its row ended before reporting in); the probe's stand-in makes that count
+  // through the session manager's count (`recordLaunchResultOutsideRestartWork`).
+  test('(3b) b.4q8: a post-cap scheduleRestart re-attempt whose liveness read counts one more failure still kills and launches (the persona was at the cap when the work began), with no cap-reached line; the launch\'s success resets the count', async () => {
+    const KEY = 'cap_then_read_bot'
+    for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(KEY)
+    // ErrSystemInstallDisappeared: the one `dead` reading a kill follows.
+    const deps = makeDeps({ restartDelay: CAP_BASE_DELAY_S, isSessionAliveResult: LIVENESS_READING_DEAD_INSTALL_GONE })
+    const probe = deps.isSessionAlive
+    deps.isSessionAlive = async (key) => {
+      const reading = await probe(key)
+      recordLaunchResultOutsideRestartWork(key, false, resumedLaunchFailedLine(key))
+      return reading
+    }
+    const { outcomes, tick } = awaitRuns(deps)
+    initRestart(deps)
+    const lines: string[] = []
+    const saved = console.error
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+    try {
+      await tick(KEY, '/cwd/test')
+    } finally {
+      console.error = saved
+    }
+
+    expect(outcomes).toEqual([RESTART_OUTCOME_LAUNCHED])
+    expect(deps.killSessionCalls).toEqual([KEY])
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([KEY])
+    expect(countedLinesOf(lines, KEY)).toHaveLength(1)
+    expect(lines.filter((l) => l === restartCapReachedLine(KEY, 'before its kill') || l === restartCapReachedLine(KEY, 'before its launch'))).toEqual([])
+    expect(getFailureCount(KEY)).toBe(0)
   })
 
   // -------------------------------------------------------------------------
@@ -3635,8 +3709,10 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
    * `waiting`, its reconnect's `send-keys` answers `ladderSendKeys`, its
    * `resume` answers ErrSpawnNotResumable once and its re-read finds the row
    * `waiting`; every later `get` reads it `ended` with a session id, and
-   * every later `status` reads it `missing`. `runs` counts the find-missing
-   * runs made, held ones included.
+   * every later `status` reads it `missing` until a second `resume` (the
+   * sequence's) succeeds, whose row then reports in (`waiting`, so no
+   * failure is counted for the resumed launch, b.4q8). `runs` counts the
+   * find-missing runs made, held ones included.
    */
   function buildInstallGoneReprobe(ladderSendKeys: Error, runs: () => number = () => 0) {
     const h = (harness = makeRecoveryHarness({ alertThresholdMs: false }))
@@ -3652,6 +3728,7 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
       getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' }, persona, h.home),
       statusFn: () => {
         if (calls.findMissingCalls.length + runs() === 0) return cannedStatusResult({ state: 'working' })
+        if (calls.resumeCalls.length > 1) return cannedStatusResult({ state: 'waiting' })
         if (reprobed) return cannedStatusResult({ state: LIVENESS_DEAD_ROW_MISSING })
         reprobed = true
         return errSystemInstallDisappeared('status')
@@ -3683,8 +3760,9 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
     expect(h.stub.calls.killCalls).toHaveLength(2)
     expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }, { claude_instance_id: personaInstanceId(p) }])
     expect(h.stub.calls.spawnCalls).toHaveLength(1)
-    expect([getFailureCount(p), h.notices]).toEqual([0, []])
+    // b.4q8: the resumed row reports in (waiting), so no failure is counted for it.
     await h.settle()
+    expect([getFailureCount(p), h.notices]).toEqual([0, []])
   })
 
   test('AC 59: the same relaunch whose reconnect\'s send-keys answers ErrSpawnNotInteractive → the carried verdict is void, its line naming that answer; ErrSpawnNotResumable with a re-read of waiting is a lost race: no sequence, no kill after the restart path\'s own, P armed with the lost-race cause, nothing counted', async () => {
@@ -4771,7 +4849,8 @@ describe('restart: the reply-guard record holds the effective value before the r
     // b.jg5 SRJ-110, SRJ-314: no kill for a row just read `ended`.
     expect(deps.killSessionCalls).toEqual([])
     expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([a.key])
-    expect(results).toEqual([true])
+    // b.4q8: a resume answers resumed-unreported; its row reads waiting, so no failure is counted for it.
+    expect(results).toEqual([LAUNCH_RESUMED_UNREPORTED])
     expect(events).toEqual(['guard', 'spawn', 'undo', 'guard', 'resume'])
     expect(seen.map((s) => s.call)).toEqual(['spawn', 'resume'])
     for (const snap of seen) expect(snap).toEqual({ call: snap.call, record: 'false', launchedWith: configDir })
@@ -5894,6 +5973,7 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
   // accounting. The count starts at 1.
   test.each<[string, LaunchSessionResult, RestartRetryOutcome, number]>([
     ['the launch succeeds → launched, a success recorded', true, RESTART_OUTCOME_LAUNCHED, 0],
+    ['the launch resumed a row that has not reported in (b.4q8) → launched, nothing recorded: the count unchanged', LAUNCH_RESUMED_UNREPORTED, RESTART_OUTCOME_LAUNCHED, 1],
     ['the launch fails → counted-failure, recordFailure once', false, RESTART_OUTCOME_COUNTED_FAILURE, 2],
     ['the launch answers UNAVAILABLE → refused, the count unchanged', 'refused', RESTART_OUTCOME_REFUSED, 1],
     ['the launch is declined by its own gate → launch-skipped, the count unchanged', 'skipped', RESTART_OUTCOME_LAUNCH_SKIPPED, 1],
@@ -5939,6 +6019,49 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
     expect(deps.killSessionCalls).toEqual([])
     expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([P, P])
     expect(errLines.filter((l) => l === capSkipLine(P))).toHaveLength(1)
+  })
+
+  // b.4q8: a read inside the work can count P's resumed launch as failed (its
+  // row ended before reporting in) and take P to the cap. Each stand-in here
+  // makes that count where the work's own read would, through the session
+  // manager's count (`recordLaunchResultOutsideRestartWork`, with the cap
+  // notice at the cap): the liveness probe, or the kill's reads between its
+  // tries. The probe reads `ErrSystemInstallDisappeared`, the one `dead`
+  // reading a kill follows. A persona already at the cap when the work began
+  // is the backoff integration's (3b).
+  /** The work's cap-reached lines among the captured ones, at either step. */
+  const capReachedLines = (): string[] => errLines.filter((l) => l === restartCapReachedLine(P, 'before its kill') || l === restartCapReachedLine(P, 'before its launch'))
+  /** A read's count of P's resumed launch as failed. */
+  const countResumeFailedAtRead = (): void => { recordLaunchResultOutsideRestartWork(P, false, resumedLaunchFailedLine(P)) }
+
+  test.each<[string, 'before its kill' | 'before its launch', string[]]>([
+    ['the liveness probe\'s read', 'before its kill', []],
+    ['the kill\'s read', 'before its launch', [P]],
+  ])('b.4q8: %s takes P from one below the cap to it → capped, with its one cap notice and one line; nothing more killed, launched or counted', async (_label, when, kills) => {
+    for (let i = 1; i < RESTART_FAILURE_CAP; i++) recordFailure(P)
+    const deps = retryDeps({
+      isSessionAliveResult: LIVENESS_READING_DEAD_INSTALL_GONE,
+      killSession: async () => {
+        if (when === 'before its launch') countResumeFailedAtRead()
+        return KILL_SUCCEEDED
+      },
+    })
+    const probe = deps.isSessionAlive
+    deps.isSessionAlive = async (key) => {
+      const reading = await probe(key)
+      if (when === 'before its kill') countResumeFailedAtRead()
+      return reading
+    }
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_CAPPED)
+
+    expect(deps.killSessionCalls).toEqual(kills)
+    expect(deps.launchSessionCalls).toEqual([])
+    expect([getFailureCount(P), deps.onCapReachedCalls]).toEqual([RESTART_FAILURE_CAP, [P]])
+    expect(capReachedLines()).toEqual([restartCapReachedLine(P, when)])
+    expect(countedLinesOf(errLines, P)).toHaveLength(1)
+    expect(isRestartPendingOrActive(P)).toBe(false)
   })
 
   test('cap re-check: a retry for P already at RESTART_FAILURE_CAP answers capped after the in-flight check, with no shutdown or not-up check, no probe, reconnect, kill or launch, nothing counted, no notice, and one skip line', async () => {
@@ -9847,5 +9970,826 @@ describe('b.jg5 SRJ-506: runRestartRetryInTurn is the retry entry\'s gates and w
     expect(isRestartPendingOrActive(P)).toBe(true)
     second()
     expect(isRestartPendingOrActive(P)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.4q8: a resumed launch counts once its row reports in
+//
+// agent-director's `resume` checks only that the transcript file exists, and
+// Claude Code exits before SessionStart on a transcript it cannot load, so
+// such a resume succeeds and its row goes `missing` without ever reporting
+// in; once counted as a success, it was resumed again forever. A resumed
+// launch is now counted once a read settles it: a live state other than
+// `pending` is a success, `ended`, `missing` or no row a counted launch
+// failure, and after `UNREPORTED_RESUME_FALLBACK_AFTER` resumes in a row that
+// ended so, the collision ladder makes a reuse spawn of the same id in place
+// of a resume.
+// ---------------------------------------------------------------------------
+
+/** The approver's readiness read of persona `ref`'s row, where its first lap settles a resumed launch. */
+function approverRead(ref: string): OwnRowReadSite {
+  return { site: APPROVER_LOG_SITE, what: APPROVER_STATUS_READ_WHAT, ref }
+}
+
+/**
+ * The lines among `lines` a read logged for persona `ref`'s resumed launch
+ * that ended before reporting in (`resumeEndedUnreportedLine`), whatever the
+ * read, the state or the count (each an open part, the count written as the
+ * hole).
+ */
+function resumeEndedLinesOf(lines: readonly string[], ref: string): string[] {
+  const [head, , forRef, , tail] = lineParts((hole) =>
+    resumeEndedUnreportedLine({ site: hole, what: hole }, ref, hole, hole as unknown as number),
+  ) as [string, string, string, string, string]
+  return lines.filter((line) => line.startsWith(head) && line.includes(forRef) && line.endsWith(tail))
+}
+
+/** The ladder's fallback lines among `lines` for persona `ref` (`unreportedResumeFallbackLine`), whatever the count. */
+function resumeFallbackLinesOf(lines: readonly string[], ref: string): string[] {
+  const [head, tail] = lineParts((hole) => unreportedResumeFallbackLine(ref, hole as unknown as number)) as [string, string]
+  return lines.filter((line) => line.startsWith(head) && line.endsWith(tail))
+}
+
+/** The counted lines among `lines` of persona `key`'s resumed launches that ended before reporting in (`resumedLaunchFailedLine`). */
+function countedLinesOf(lines: readonly string[], key: string): string[] {
+  return lines.filter((line) => line === resumedLaunchFailedLine(key))
+}
+
+// On the recovery harness (`buildResumeLoop`): each persona's row reads
+// `missing` with a session id, its plain spawn collides and its `resume`
+// succeeds; after its nth `resume` the row reads what `afterResume(n)` gives
+// (at every read: the approver's laps, the next run's probe and collision
+// `get`), and once a reuse spawn of its id has succeeded it reads `waiting`
+// (a fresh life, on a new transcript). Each launch is awaited and settled,
+// so the approver's first lap has read the row before the next launch. The
+// approver waits for the launch it follows to settle, and the restart path's
+// `launchSession` hands its `resumed` result over as that launch settles, so
+// every read here comes after the hand-over; the next describe lands one
+// before it.
+describe('b.4q8: a resumed launch counts once its row reports in, and resumes that end before reporting in fall back to a reuse spawn', () => {
+  let harness: RecoveryHarness | undefined
+
+  afterEach(() => {
+    const h = harness
+    harness = undefined
+    if (h === undefined) return
+    try {
+      // Nothing is deleted, whatever the fallback did.
+      expect(h.stub.calls.deleteCalls).toEqual([])
+      assertNoLeak(h.captured())
+    } finally {
+      h.cleanup()
+    }
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  const N = UNREPORTED_RESUME_FALLBACK_AFTER
+  /** The counts 1 to N: one per resume of a run that ends in the fallback. */
+  const RUN = Array.from({ length: N }, (_, i) => i + 1)
+  const MISSING = LIVENESS_DEAD_ROW_MISSING
+
+  /** What a persona's row reads after its nth `resume`: a state, or an error every read of it answers. */
+  type AfterResume = (n: number) => StatusResult['state'] | Error
+
+  interface ResumeLoop {
+    readonly h: RecoveryHarness
+    /** The first persona's key and the second's. */
+    readonly p: string
+    readonly q: string
+    readonly refOf: (key: string) => string
+    readonly cwdOf: (key: string) => string
+  }
+
+  /**
+   * The harness with each persona's row scripted as the comment above says;
+   * a persona's first `reuseFailures.length` reuse spawns answer those
+   * errors, in order, and every later one succeeds.
+   */
+  function buildResumeLoop(
+    afterResume: AfterResume,
+    options: { readonly reuseFailures?: readonly Error[]; readonly harness?: RecoveryHarnessOptions } = {},
+  ): ResumeLoop {
+    const h = (harness = makeRecoveryHarness({ alertThresholdMs: false, ...options.harness }))
+    const calls = h.stub.calls
+    const keyOf = new Map(h.keys.map((key) => [personaInstanceId(key), key] as const))
+    const reuseFailures = new Map<string, Error[]>(h.keys.map((key) => [personaInstanceId(key), [...(options.reuseFailures ?? [])]]))
+    const freshLives = new Set<string>()
+    const rowOf = (id: string): StatusResult['state'] | Error => {
+      if (freshLives.has(id)) return 'waiting'
+      const resumes = calls.resumeCalls.filter((call) => call.claude_instance_id === id).length
+      return resumes === 0 ? MISSING : afterResume(resumes)
+    }
+    h.script({
+      spawnFn: (params) => {
+        const id = params.claude_instance_id ?? ''
+        if (!keyOf.has(id)) return undefined
+        if (params.reuse_finished !== true) return errInstanceIdCollision()
+        const failure = reuseFailures.get(id)!.shift()
+        if (failure !== undefined) return failure
+        freshLives.add(id)
+        return cannedSpawnResult(id, 'ok')
+      },
+      getFn: (params) => {
+        const key = keyOf.get(params.claude_instance_id)
+        if (key === undefined) return undefined
+        const row = rowOf(params.claude_instance_id)
+        return row instanceof Error ? row : personaRow(h, key, { state: row, claude_session_id: 'a-session-id' })
+      },
+      statusFn: (params) => {
+        if (!keyOf.has(params.claude_instance_id)) return undefined
+        const row = rowOf(params.claude_instance_id)
+        return row instanceof Error ? row : cannedStatusResult({ state: row })
+      },
+    })
+    return {
+      h,
+      p: h.keys[0]!,
+      q: h.keys[1]!,
+      refOf: (key) => renderPersonaRef(personaOf(h, key).name, key),
+      cwdOf: (key) => personaOf(h, key).working_directory,
+    }
+  }
+
+  /** One restart-path run for `key` (`runRestartRetry`), settled; answers its outcome. */
+  async function restartRun(loop: ResumeLoop, key: string): Promise<RestartRetryOutcome> {
+    const outcome = await runRestartRetry(key, loop.cwdOf(key), isLaunchInFlight)
+    await loop.h.settle()
+    return outcome
+  }
+
+  /** How P is launched in a loop case: its launch, settled, and what each launch answers (a resume first, then the fallback). */
+  interface LoopEntry {
+    readonly launch: (loop: ResumeLoop) => Promise<unknown>
+    readonly answers: (p: string) => readonly unknown[]
+    /** P's failure count after each launch. */
+    readonly counts: readonly number[]
+    /** How many counted lines (`resumedLaunchFailedLine`) P's launches log in all. */
+    readonly countedLines: number
+  }
+
+  const LOOP_ENTRIES: ReadonlyArray<readonly [string, LoopEntry]> = [
+    ['the restart path (runRestartRetry), which counts each such resume as one launch failure, with its counted line, the reuse spawn\'s success resetting the count', {
+      launch: (loop) => restartRun(loop, loop.p),
+      answers: () => [...RUN, 0].map(() => RESTART_OUTCOME_LAUNCHED),
+      counts: [...RUN, 0],
+      countedLines: N,
+    }],
+    ['the start pass (spawnForPersona), whose resumes count toward the fallback but never as launch failures, with no counted line', {
+      launch: async (loop) => {
+        const result = await loop.h.launch(loop.p)
+        await loop.h.settle()
+        return result
+      },
+      answers: (p) => [...RUN.map(() => ({ key: p, action: 'resumed' })), { key: p, action: 'spawned' }],
+      counts: [...RUN, 0].map(() => 0),
+      countedLines: 0,
+    }],
+  ]
+
+  // The regression (the silent loop): the resumes went on, about every 90 s at default timings.
+  test.each(LOOP_ENTRIES)('the silent resume loop ends, through %s: after UNREPORTED_RESUME_FALLBACK_AFTER resumes whose row went missing before reporting in, the next launch is one reuse spawn of the same id, never a resume, with one fallback line; each such resume logs one line with its run\'s count; nothing deleted or posted, Q untouched', async (_label, entry) => {
+    const loop = buildResumeLoop(() => MISSING)
+    const { h, p, q } = loop
+    const ref = loop.refOf(p)
+    const answers: unknown[] = []
+    const counts: number[] = []
+
+    for (let launch = 0; launch <= N; launch++) {
+      answers.push(await entry.launch(loop))
+      counts.push(getFailureCount(p))
+    }
+
+    expect(answers).toEqual([...entry.answers(p)])
+    expect(counts).toEqual([...entry.counts])
+    expect(countedLinesOf(h.errors, p)).toHaveLength(entry.countedLines)
+    expect(h.stub.calls.resumeCalls).toEqual(RUN.map(() => ({ claude_instance_id: personaInstanceId(p) })))
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    expect(resumeEndedLinesOf(h.errors, ref)).toEqual(RUN.map((n) => resumeEndedUnreportedLine(approverRead(ref), ref, MISSING, n)))
+    expect(resumeFallbackLinesOf(h.errors, ref)).toEqual([unreportedResumeFallbackLine(ref, N)])
+    expect([h.notices, h.episodeNotices, h.capReached]).toEqual([[], [], []])
+    expect(personaCallCounts(h, q)).toEqual({})
+  })
+
+  test('a resume whose row reports in between counts as a success and ends the run: a resume that ends before reporting in after it is the first of a new run, so the next launch still resumes, and the fallback comes only after UNREPORTED_RESUME_FALLBACK_AFTER in a row', async () => {
+    // Resume 2's session reports in, then exits later (a crash after reporting in).
+    let crashedAfterReportingIn = false
+    const loop = buildResumeLoop((n) => (n === 2 && !crashedAfterReportingIn ? 'waiting' : MISSING))
+    const { h, p } = loop
+    const ref = loop.refOf(p)
+    const counts: number[] = []
+    const run = async (): Promise<void> => {
+      expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
+      counts.push(getFailureCount(p))
+    }
+
+    await run()
+    await run()
+    crashedAfterReportingIn = true
+    for (let i = 0; i < N; i++) await run()
+    expect(h.reuseSpawns()).toEqual([])
+    await run()
+
+    expect(counts).toEqual([1, 0, ...RUN, 0])
+    // One counted line per resume that ended before reporting in; none for the one that reported in.
+    expect(countedLinesOf(h.errors, p)).toHaveLength(1 + N)
+    expect(h.stub.calls.resumeCalls).toHaveLength(2 + N)
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    expect(resumeEndedLinesOf(h.errors, ref)).toEqual([1, ...RUN].map((n) => resumeEndedUnreportedLine(approverRead(ref), ref, MISSING, n)))
+    expect(resumeFallbackLinesOf(h.errors, ref)).toEqual([unreportedResumeFallbackLine(ref, N)])
+  })
+
+  /** A fallback reuse spawn that does not succeed: its answers, the run's outcome, P's count after it, and whether P's timer is armed with the collision cause. */
+  const FAILED_REUSES: ReadonlyArray<readonly [string, readonly Error[], RestartRetryOutcome, number, boolean]> = [
+    ['collides with a live row twice (its one re-run of get-then-act included): refused, nothing counted, the collision cause armed', [errInstanceIdCollision(), errInstanceIdCollision()], RESTART_OUTCOME_REFUSED, N, true],
+    ['fails to launch (ErrTmuxSessionCreate): one counted launch failure', [errTmuxSessionCreate('spawn')], RESTART_OUTCOME_COUNTED_FAILURE, N + 1, false],
+  ]
+
+  test.each(FAILED_REUSES)('a fallback reuse spawn that %s: the run of resumes stays, so the next launch is a reuse spawn again, never a resume, and its success resets the count', async (_label, failures, outcome, count, collisionArmed) => {
+    const loop = buildResumeLoop(() => MISSING, { reuseFailures: failures })
+    const { h, p } = loop
+    const ref = loop.refOf(p)
+    for (let i = 0; i < N; i++) expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+    expect(await restartRun(loop, p)).toBe(outcome)
+
+    expect(getFailureCount(p)).toBe(count)
+    expect(h.reuseSpawns()).toHaveLength(failures.length)
+    // One fallback line for each reuse spawn: the re-run of get-then-act decides again.
+    expect(resumeFallbackLinesOf(h.errors, ref)).toHaveLength(failures.length)
+    expect(h.triggers.some((t) => t.key === p && t.kind === UNAVAILABLE_RETRY_CAUSE_COLLISION)).toBe(collisionArmed)
+
+    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+    expect(h.stub.calls.resumeCalls).toHaveLength(N)
+    expect(h.reuseSpawns()).toEqual([...failures, undefined].map(() => reuseSpawnOf(h, p)))
+    expect(resumeFallbackLinesOf(h.errors, ref)).toEqual([...failures, undefined].map(() => unreportedResumeFallbackLine(ref, N)))
+    expect(getFailureCount(p)).toBe(0)
+  })
+
+  test('a resume handed over before its row reports in: the restart run answers launched and counts nothing while the row reads pending; the approver\'s lap that reads it waiting counts one success, resetting the failure on record, with no line of an ended resume', async () => {
+    let reportedIn = false
+    const loop = buildResumeLoop(() => (reportedIn ? 'waiting' : AGENT_DIRECTOR_PENDING_STATE), { harness: { approverCapMs: 2 * DIALOG_SLOW_POLL_INTERVAL_MS } })
+    const { h, p } = loop
+    recordFailure(p)
+
+    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+    // Handed over, with its row still pending: not counted yet.
+    expect([getFailureCount(p), h.approverRunning(p)]).toEqual([1, true])
+    reportedIn = true
+    await h.runApproverToStop(p)
+    expect(getFailureCount(p)).toBe(0)
+    expect(resumeEndedLinesOf(h.errors, loop.refOf(p))).toEqual([])
+    expect(h.capReached).toEqual([])
+  })
+
+  test('a resume that ends before reporting in with P one failure below the cap is counted to the cap: the cap notice fires once, and a later read of its ended row counts nothing more', async () => {
+    const loop = buildResumeLoop(() => MISSING)
+    const { h, p } = loop
+    const ref = loop.refOf(p)
+    for (let i = 1; i < RESTART_FAILURE_CAP; i++) recordFailure(p)
+
+    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+    expect([getFailureCount(p), h.capReached]).toEqual([RESTART_FAILURE_CAP, [p]])
+    await readPersonaOwnRow(p, { site: 'restart.test', what: 'a later read', ref })
+    expect([getFailureCount(p), h.capReached]).toEqual([RESTART_FAILURE_CAP, [p]])
+    expect(resumeEndedLinesOf(h.errors, ref)).toEqual([resumeEndedUnreportedLine(approverRead(ref), ref, MISSING, 1)])
+    expect(countedLinesOf(h.errors, p)).toHaveLength(1)
+  })
+
+  test('a resume whose row is gone at the read (ErrSpawnNotFound) ended before reporting in: one line naming no row, one counted launch failure', async () => {
+    const loop = buildResumeLoop(() => errSpawnNotFound())
+    const { p } = loop
+    const ref = loop.refOf(p)
+
+    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+    expect(getFailureCount(p)).toBe(1)
+    expect(resumeEndedLinesOf(loop.h.errors, ref)).toEqual([resumeEndedUnreportedLine(approverRead(ref), ref, RESUME_READ_NO_ROW, 1)])
+    expect(countedLinesOf(loop.h.errors, p)).toHaveLength(1)
+  })
+
+  test('the teardown\'s forget (forgetLaunchCalls) drops P\'s run of resumes that ended before reporting in, and only P\'s: P\'s next launch resumes again, the first of a new run, while Q\'s is the fallback reuse spawn', async () => {
+    const loop = buildResumeLoop(() => MISSING)
+    const { h, p, q } = loop
+    for (const key of [p, q]) for (let i = 0; i < N; i++) expect(await restartRun(loop, key)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+    forgetLaunchCalls(p)
+    for (const key of [p, q]) expect(await restartRun(loop, key)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+    const resumesOf = (key: string): number => h.stub.calls.resumeCalls.filter((call) => call.claude_instance_id === personaInstanceId(key)).length
+    expect([resumesOf(p), resumesOf(q)]).toEqual([N + 1, N])
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, q)])
+    expect(resumeFallbackLinesOf(h.errors, loop.refOf(p))).toEqual([])
+    expect(resumeFallbackLinesOf(h.errors, loop.refOf(q))).toEqual([unreportedResumeFallbackLine(loop.refOf(q), N)])
+    expect(resumeEndedLinesOf(h.errors, loop.refOf(p)).at(-1)).toBe(resumeEndedUnreportedLine(approverRead(loop.refOf(p)), loop.refOf(p), MISSING, 1))
+  })
+
+  test('the teardown\'s forget (forgetLaunchCalls) drops P\'s resumed launch still waiting on its row, and only P\'s: once both rows end, P\'s read logs and counts nothing, while Q\'s counts one launch failure', async () => {
+    let ended = false
+    const loop = buildResumeLoop(() => (ended ? MISSING : AGENT_DIRECTOR_PENDING_STATE))
+    const { h, p, q } = loop
+    for (const key of [p, q]) expect(await restartRun(loop, key)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+    // P's teardown: its approver stopped, then its launch records forgotten.
+    h.teardown(p)
+    await _whenDialogApproverStopped(p)
+    forgetLaunchCalls(p)
+    ended = true
+    for (const key of [p, q]) await readPersonaOwnRow(key, { site: 'restart.test', what: 'a read after the rows ended', ref: loop.refOf(key) })
+
+    expect([getFailureCount(p), getFailureCount(q)]).toEqual([0, 1])
+    expect(resumeEndedLinesOf(h.errors, loop.refOf(p))).toEqual([])
+    expect(resumeEndedLinesOf(h.errors, loop.refOf(q))).toHaveLength(1)
+  })
+
+  /**
+   * P with `failures` failures on record and a resume a restart run handed
+   * over while its row reads `pending` (the approver's first lap read it so):
+   * nothing counted for it yet. `setRow` sets what P's row reads from then on.
+   */
+  async function handedOverPending(failures: number): Promise<{ readonly loop: ResumeLoop; readonly setRow: (row: StatusResult['state'] | Error) => void }> {
+    let row: StatusResult['state'] | Error = AGENT_DIRECTOR_PENDING_STATE
+    const loop = buildResumeLoop(() => row)
+    for (let i = 0; i < failures; i++) recordFailure(loop.p)
+    expect(await restartRun(loop, loop.p)).toBe(RESTART_OUTCOME_LAUNCHED)
+    expect(getFailureCount(loop.p)).toBe(failures)
+    return { loop, setRow: (next) => { row = next } }
+  }
+
+  /**
+   * One health tick body over persona `key` alone (`_runHealthCheckTickForTest`),
+   * its liveness read the production adapter over the harness's configuration
+   * and its cap query the real one, as `main()` binds them; never connected.
+   * Resolves with the keys it scheduled a restart for.
+   */
+  async function healthTick(loop: ResumeLoop, key: string): Promise<string[]> {
+    const scheduled: string[] = []
+    initHealthCheck({
+      getPersonas: () => ({ [key]: loop.cwdOf(key) }),
+      isShuttingDown: () => false,
+      isSessionAlive: _buildIsSessionAliveAdapter(() => loop.h.config),
+      isSessionConnected: () => false,
+      hasSessionStream: () => false,
+      isRestartPendingOrActive,
+      isLaunchInFlight,
+      isAtCap: (k) => isAtCap(k, RESTART_FAILURE_CAP),
+      statRoute: async () => true,
+      scheduleRestart: (k) => void scheduled.push(k),
+    })
+    try {
+      await _runHealthCheckTickForTest()
+    } finally {
+      _resetHealthCheckState()
+    }
+    return scheduled
+  }
+
+  /** A read of the row of P's handed-over resume that ends it before reporting in: what the row reads, and the state its line names. */
+  const ENDED_READS: ReadonlyArray<readonly [string, () => StatusResult['state'] | Error, string]> = [
+    ['missing', () => MISSING, MISSING],
+    ['gone (ErrSpawnNotFound)', () => errSpawnNotFound(), RESUME_READ_NO_ROW],
+  ]
+
+  // A read inside a restart run, or the health tick's, can take P to the cap
+  // (its handed-over resume ended before reporting in, a counted failure):
+  // nothing more is killed, launched or scheduled for P.
+  test.each(ENDED_READS)('the restart path\'s run (runRestartRetry, which a full-mode retry calls) whose liveness probe reads the row of P\'s handed-over resume %s, with P one failure below the cap: the probe counts it to the cap (one cap notice, one counted line) and the run answers capped before its kill, with one line: no kill and no launch call', async (_label, read, state) => {
+    const { loop, setRow } = await handedOverPending(RESTART_FAILURE_CAP - 1)
+    const { h, p } = loop
+    const before = personaCallCounts(h, p)
+    setRow(read())
+
+    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_CAPPED)
+
+    // The probe's status only: no kill, spawn, get or resume.
+    expect(callCountsSince(personaCallCounts(h, p), before)).toEqual({ statusCalls: 1 })
+    expect([getFailureCount(p), h.capReached, h.notices.filter((n) => n.key === p).length]).toEqual([RESTART_FAILURE_CAP, [p], 1])
+    expect(countedLinesOf(h.errors, p)).toHaveLength(1)
+    expect(resumeEndedLinesOf(h.errors, `persona=${p}`)).toEqual([resumeEndedUnreportedLine(LIVENESS_STATUS_SITE, `persona=${p}`, state, 1)])
+    expect(h.errors.filter((line) => line === restartCapReachedLine(p, 'before its kill') || line === restartCapReachedLine(p, 'before its launch'))).toEqual([restartCapReachedLine(p, 'before its kill')])
+  })
+
+  test.each(ENDED_READS)('a health tick whose liveness read finds the row of P\'s handed-over resume %s, with P one failure below the cap: the read counts it to the cap (one cap notice, one counted line), and the tick skips P with one at-cap line: no restart scheduled', async (_label, read) => {
+    const { loop, setRow } = await handedOverPending(RESTART_FAILURE_CAP - 1)
+    const { h, p } = loop
+    setRow(read())
+
+    expect(await healthTick(loop, p)).toEqual([])
+
+    expect([getFailureCount(p), h.capReached, h.notices.filter((n) => n.key === p).length]).toEqual([RESTART_FAILURE_CAP, [p], 1])
+    expect(countedLinesOf(h.errors, p)).toHaveLength(1)
+    expect(h.errors.filter((line) => line === healthCheckAtCapSkipLine(p))).toHaveLength(1)
+  })
+
+  // The sequence enters at step 2, its `get`, as the stuck-launch abort's
+  // does: a step-1 kill is CSCB's own kill of the row, which ends P's resumed
+  // launch with nothing counted (the own-kill cases below).
+  test.each(ENDED_READS)('the live-row sequence entered at step 2, P one failure below the cap when it started, whose get reads the row of P\'s handed-over resume %s: the get counts it to the cap, and step 6 makes no launch call: not launched (capped), one line, nothing more counted or armed', async (_label, read, state) => {
+    const { loop, setRow } = await handedOverPending(RESTART_FAILURE_CAP - 1)
+    const { h, p } = loop
+    setRow(read())
+    const before = personaCallCounts(h, p)
+
+    expect(await h.runSequence(p, { lastReadState: AGENT_DIRECTOR_PENDING_STATE, entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET })).toMatchObject({
+      kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED,
+      launchKind: LIVE_ROW_LAUNCH_REUSE,
+      notLaunched: LIVE_ROW_NOT_LAUNCHED_CAPPED,
+    })
+
+    const since = callCountsSince(personaCallCounts(h, p), before)
+    // No kill and no launch call: no spawn and no resume.
+    expect([since.killCalls ?? 0, since.spawnCalls ?? 0, since.resumeCalls ?? 0]).toEqual([0, 0, 0])
+    expect([getFailureCount(p), h.capReached, h.notices.filter((n) => n.key === p).length]).toEqual([RESTART_FAILURE_CAP, [p], 1])
+    expect(countedLinesOf(h.errors, p)).toHaveLength(1)
+    // The sequence's own get settled it.
+    expect(resumeEndedLinesOf(h.errors, `persona=${p}`)).toEqual([resumeEndedUnreportedLine({ site: LIVE_ROW_SEQUENCE_SITE, what: 'get' }, `persona=${p}`, state, 1)])
+    expect(h.errors.filter((line) => line === sequenceLaunchAtCapLine(loop.refOf(p)))).toHaveLength(1)
+    expect(h.controller.armedKeys()).toEqual([])
+  })
+
+  // Its counterpart: a sequence that began with P at the cap (a restart's
+  // re-attempt at the cap handing off) is launched, as that restart's own
+  // launch would be, though a read in it counts one more failure.
+  test('the live-row sequence entered at step 2 with P already at the cap when it started, whose get reads the row of P\'s handed-over resume missing and counts one more failure: step 6 still launches its one reuse spawn, with no at-cap line and no second cap notice, and the launch\'s success resets the count', async () => {
+    const { loop, setRow } = await handedOverPending(RESTART_FAILURE_CAP - 1)
+    const { h, p } = loop
+    // P reaches the cap before the sequence starts: one more counted launch failure, with its one cap notice.
+    recordLaunchResultOutsideRestartWork(p, false)
+    expect([getFailureCount(p), h.capReached]).toEqual([RESTART_FAILURE_CAP, [p]])
+    setRow(MISSING)
+
+    expect(await h.runSequence(p, { lastReadState: AGENT_DIRECTOR_PENDING_STATE, entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET })).toMatchObject({
+      kind: LIVE_ROW_OUTCOME_LAUNCHED,
+      launchKind: LIVE_ROW_LAUNCH_REUSE,
+      result: { key: p, action: 'spawned' },
+    })
+
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect(h.errors.filter((line) => line === sequenceLaunchAtCapLine(loop.refOf(p)))).toEqual([])
+    // The get counted the resume (past the cap, so no second notice); the reuse's success then reset the count.
+    expect(resumeEndedLinesOf(h.errors, `persona=${p}`)).toEqual([resumeEndedUnreportedLine({ site: LIVE_ROW_SEQUENCE_SITE, what: 'get' }, `persona=${p}`, MISSING, 1)])
+    expect(countedLinesOf(h.errors, p)).toHaveLength(1)
+    expect([getFailureCount(p), h.capReached]).toEqual([0, [p]])
+    await h.runApproverToStop(p)
+  })
+
+  /** A read of the row of P's handed-over resume that settles nothing: a failed read, or a state CSCB does not know. */
+  const UNSETTLING_READS: ReadonlyArray<readonly [string, () => StatusResult['state'] | Error]> = [
+    ['answers UNAVAILABLE (ErrCallTimeout)', () => errCallTimeout('status')],
+    ['answers UNAVAILABLE (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('status')],
+    ['reads a state CSCB does not know', () => 'not-a-known-state' as StatusResult['state']],
+  ]
+
+  test.each(UNSETTLING_READS)('a read of the row of P\'s handed-over resume that %s (a liveness status and an own-row get) leaves it unsettled: nothing counted and no line of an ended resume; a later read of waiting counts the resume as a success, resetting P\'s failure on record', async (_label, read) => {
+    const { loop, setRow } = await handedOverPending(1)
+    const { h, p } = loop
+    const ref = loop.refOf(p)
+    const isSessionAlive = _buildIsSessionAliveAdapter(() => h.config)
+    setRow(read())
+
+    await isSessionAlive(p)
+    await readPersonaOwnRow(p, { site: 'restart.test', what: 'a get of the row', ref })
+
+    expect(getFailureCount(p)).toBe(1)
+    expect([...resumeEndedLinesOf(h.errors, ref), ...resumeEndedLinesOf(h.errors, `persona=${p}`)]).toEqual([])
+    expect(countedLinesOf(h.errors, p)).toEqual([])
+
+    setRow('waiting')
+    await isSessionAlive(p)
+
+    expect(getFailureCount(p)).toBe(0)
+    expect([...resumeEndedLinesOf(h.errors, ref), ...resumeEndedLinesOf(h.errors, `persona=${p}`)]).toEqual([])
+    expect(h.capReached).toEqual([])
+  })
+
+  test('a count of P\'s resumed launch that throws (its cap notice, at the cap, fails) logs one line naming the failure, redacted: the failure stays recorded with its counted line, and the run is not disturbed', async () => {
+    const err = Object.assign(new Error(`the cap notice broke (${sentinelInMessage('cap')})`), { detail: LEAK_SENTINEL })
+    const loop = buildResumeLoop(() => MISSING, { harness: { restartDeps: { onCapReached: () => { throw err } } } })
+    const { h, p } = loop
+    for (let i = 1; i < RESTART_FAILURE_CAP; i++) recordFailure(p)
+
+    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+    const failed = resumeCountFailedLine(`persona=${p}`, describeThrownValue(err))
+    expect(failed).toContain(`message="the cap notice broke (${REDACTED_SENTINEL_TAIL})"`)
+    expect(h.errors.filter((line) => line === failed)).toHaveLength(1)
+    // The failure was recorded, with its counted line, before the cap notice threw.
+    expect(getFailureCount(p)).toBe(RESTART_FAILURE_CAP)
+    expect(countedLinesOf(h.errors, p)).toHaveLength(1)
+    expect(resumeEndedLinesOf(h.errors, loop.refOf(p))).toEqual([resumeEndedUnreportedLine(approverRead(loop.refOf(p)), loop.refOf(p), MISSING, 1)])
+  })
+
+  // The stuck-launch abort (b.jg5 SRJ-412), in its production order: the
+  // approver stopped for it, its one checked kill, then its live-row
+  // sequence, which keeps the conversation. The abort's own kill ends P's
+  // resumed launch, which is no failed resume.
+  test.each<[string, RecoveryStubScript, KillOutcome]>([
+    ['meets ErrTmuxUnresponsive once and its read between tries finds the row missing', { killQueue: [cannedErr(errTmuxUnresponsive('kill'))] }, { kind: KILL_OUTCOME_ROW_FINISHED, read: KILL_ROW_FINISHED_MISSING }],
+    ['succeeds at once and the sequence\'s step-2 get finds the row missing', { killResult: cannedKillResult(true) }, KILL_SUCCEEDED],
+  ])('the stuck-launch abort of P\'s handed-over resume still pending, whose kill %s: no line of an ended resume, nothing counted and P\'s run of 1 kept; the sequence\'s own resume then starts a new record, which ends as the second of the run and is counted', async (_label, killScript, killed) => {
+    let pendingRow: StatusResult['state'] = AGENT_DIRECTOR_PENDING_STATE
+    // Resume 1 ends before reporting in (a run of 1); resume 2 reads pending
+    // until the abort; resume 3, the sequence's, ends before reporting in.
+    const loop = buildResumeLoop((n) => (n === 2 ? pendingRow : MISSING))
+    const { h, p } = loop
+    const ref = loop.refOf(p)
+    const endedLine = (n: number): string => resumeEndedUnreportedLine(approverRead(ref), ref, MISSING, n)
+    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
+    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
+    expect([getFailureCount(p), h.stub.calls.resumeCalls.length]).toEqual([1, 2])
+
+    h.script(killScript)
+    pendingRow = MISSING
+    await stopApproverForStuckLaunchAbort(p)
+    expect(await h.drive(abortKillOwnStuckLaunch(p, ref, { clock: h.killRetryClock }))).toMatchObject({ kind: STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, description: describeKillOutcome(killed) })
+    expect([getFailureCount(p), countedLinesOf(h.errors, p).length]).toEqual([1, 1])
+
+    expect(startStuckLaunchAbortSequence(p, ref)).toEqual({ kind: STUCK_LAUNCH_ABORT_SEQUENCE_STARTED })
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, result: { key: p, action: 'resumed' } })
+    await h.settle()
+
+    // Neither the abort's reads nor the sequence's settled resume 2: its only
+    // lines are resume 1's and resume 3's. Resume 3 ended before reporting
+    // in as the second of the run (kept at 1 by the abort, neither reset nor
+    // grown) and is counted.
+    expect(h.stub.calls.resumeCalls).toHaveLength(3)
+    expect([...resumeEndedLinesOf(h.errors, ref), ...resumeEndedLinesOf(h.errors, `persona=${p}`)]).toEqual([endedLine(1), endedLine(2)])
+    expect([getFailureCount(p), countedLinesOf(h.errors, p).length]).toEqual([2, 2])
+  })
+
+  /** Run `act` as the stub's first `kill` is called, before that kill goes on. */
+  function onFirstKill(h: RecoveryHarness, act: () => unknown): void {
+    const kill = h.stub.client.kill.bind(h.stub.client)
+    let done = false
+    h.stub.client.kill = async (params) => {
+      if (!done) {
+        done = true
+        await act()
+      }
+      return kill(params)
+    }
+  }
+
+  /** A read of P's row after CSCB's own kill of it, through the shared own-row read. */
+  const readAfterKill = (ref: string): OwnRowReadSite => ({ site: 'restart.test', what: 'a read after the kill', ref })
+
+  // A live-row sequence's step-1 kill of P's row is CSCB's own kill as well
+  // (here a sequence that keeps the conversation, started on the row of P's
+  // handed-over resume still pending, whose approver still runs): the row
+  // reads missing from that kill's first try on.
+  test.each<[string, RecoveryStubScript]>([
+    ['meets ErrTmuxUnresponsive once and its read between tries finds the row missing', { killQueue: [cannedErr(errTmuxUnresponsive('kill'))] }],
+    ['succeeds at once and the sequence\'s step-2 get finds the row missing', { killResult: cannedKillResult(true) }],
+  ])('a live-row sequence\'s step-1 kill of the row of P\'s handed-over resume still pending, which %s: no line of an ended resume, nothing counted and P\'s run of 1 kept; the sequence\'s own resume then ends as the second of the run and is counted', async (_label, killScript) => {
+    let pendingRow: StatusResult['state'] = AGENT_DIRECTOR_PENDING_STATE
+    // Resume 1 ends before reporting in (a run of 1); resume 2 reads pending
+    // until the sequence's kill; resume 3, the sequence's, ends before reporting in.
+    const loop = buildResumeLoop((n) => (n === 2 ? pendingRow : MISSING))
+    const { h, p } = loop
+    const ref = loop.refOf(p)
+    const endedLine = (n: number): string => resumeEndedUnreportedLine(approverRead(ref), ref, MISSING, n)
+    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
+    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
+    expect([getFailureCount(p), h.stub.calls.resumeCalls.length]).toEqual([1, 2])
+    h.script(killScript)
+    onFirstKill(h, () => {
+      pendingRow = MISSING
+    })
+
+    expect(await h.runSequence(p, { lastReadState: AGENT_DIRECTOR_PENDING_STATE, keepsConversation: true })).toMatchObject({
+      kind: LIVE_ROW_OUTCOME_LAUNCHED,
+      launchKind: LIVE_ROW_LAUNCH_RESUME,
+      result: { key: p, action: 'resumed' },
+    })
+    await h.settle()
+
+    expect(h.stub.calls.killCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.resumeCalls).toHaveLength(3)
+    // Neither the kill's reads nor the sequence's get settled resume 2.
+    expect([...resumeEndedLinesOf(h.errors, ref), ...resumeEndedLinesOf(h.errors, `persona=${p}`)]).toEqual([endedLine(1), endedLine(2)])
+    expect([getFailureCount(p), countedLinesOf(h.errors, p).length]).toEqual([2, 2])
+  })
+
+  /**
+   * CSCB's own kill of the row of P's handed-over resume, still pending: the
+   * stuck-launch abort's (P's approver stopped for it first, its production
+   * order), answering its kind; or a live-row sequence's step-1 kill (the
+   * conversation not kept), answering the sequence's outcome kind.
+   */
+  const OWN_KILLS: ReadonlyArray<readonly [string, 'abort' | 'sequence', (loop: ResumeLoop) => Promise<string>]> = [
+    ['the stuck-launch abort\'s kill', 'abort', async ({ h, p, refOf }) => {
+      await stopApproverForStuckLaunchAbort(p)
+      return (await h.drive(abortKillOwnStuckLaunch(p, refOf(p), { clock: h.killRetryClock }))).kind
+    }],
+    ['a live-row sequence\'s step-1 kill', 'sequence', async ({ h, p }) => (await h.runSequence(p, { lastReadState: AGENT_DIRECTOR_PENDING_STATE })).kind],
+  ]
+
+  /**
+   * A kill that does not end P's resumed launch, its row reading pending
+   * throughout: how it is arranged, how many kill calls it makes, and what the
+   * abort and the sequence answer.
+   */
+  const KILLS_NOT_ENDING: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => void, number, { readonly abort: string; readonly sequence: string }]> = [
+    ['answers ENVIRONMENT (ErrTmuxNotAvailable) at its one try', (h) => h.script({ killError: errTmuxNotAvailable(undefined, 'kill') }), 1, { abort: STUCK_LAUNCH_ABORT_KILL_TRY_LATER, sequence: LIVE_ROW_OUTCOME_ABORTED }],
+    ['answers ErrTmuxKillFailed at each of its tries', (h) => h.script({ killError: errTmuxKillFailed() }), KILL_RETRY_TRIES, { abort: STUCK_LAUNCH_ABORT_KILL_FAILED, sequence: LIVE_ROW_OUTCOME_ABORTED }],
+    ['is stopped: ErrTmuxUnresponsive, P no longer up when its first try returns', (h, p) => {
+      h.script({ killError: errTmuxUnresponsive('kill') })
+      const kill = h.stub.client.kill.bind(h.stub.client)
+      h.stub.client.kill = async (params) => {
+        try {
+          return await kill(params)
+        } finally {
+          h.setUp(p, false)
+        }
+      }
+    }, 1, { abort: STUCK_LAUNCH_ABORT_KILL_STOPPED, sequence: LIVE_ROW_OUTCOME_STOPPED }],
+  ]
+
+  test.each(OWN_KILLS.flatMap(([who, kind, run]) => KILLS_NOT_ENDING.map(([how, arrange, kills, answers]) => [who, how, kind, run, arrange, kills, answers] as const)))(
+    '%s of the row of P\'s handed-over resume still pending, which %s, does not end the launch: its record is kept, nothing counted at the kill; a later read of the row missing counts exactly one launch failure, with one line',
+    async (_who, _how, kind, run, arrange, kills, answers) => {
+      const { loop, setRow } = await handedOverPending(1)
+      const { h, p } = loop
+      const ref = loop.refOf(p)
+      arrange(h, p)
+      const before = personaCallCounts(h, p)
+
+      expect(await run(loop)).toBe(answers[kind])
+
+      // Its kills only: no get, spawn or resume after them.
+      const since = callCountsSince(personaCallCounts(h, p), before)
+      expect([since.killCalls, since.getCalls ?? 0, since.spawnCalls ?? 0, since.resumeCalls ?? 0]).toEqual([kills, 0, 0, 0])
+      expect([getFailureCount(p), countedLinesOf(h.errors, p), resumeEndedLinesOf(h.errors, ref), resumeEndedLinesOf(h.errors, `persona=${p}`)]).toEqual([1, [], [], []])
+
+      setRow(MISSING)
+      await readPersonaOwnRow(p, readAfterKill(ref))
+
+      expect(getFailureCount(p)).toBe(2)
+      expect(countedLinesOf(h.errors, p)).toHaveLength(1)
+      expect([...resumeEndedLinesOf(h.errors, ref), ...resumeEndedLinesOf(h.errors, `persona=${p}`)]).toEqual([resumeEndedUnreportedLine(readAfterKill(ref), ref, MISSING, 1)])
+    },
+  )
+
+  // A read from another path (a health tick's liveness read) while the
+  // abort's kill of the row runs: a finished row is that kill's own end, so
+  // it settles nothing, whatever the kill then answers; a row read reported
+  // in is still the resume's success.
+  test.each<[string, StatusResult['state'], RecoveryStubScript, number, number]>([
+    ['reads missing, and the kill then succeeds: nothing settled at the read, and the kill drops the record, so a later read of missing counts nothing', MISSING, { killResult: cannedKillResult(true) }, 1, 1],
+    ['reads missing, and the kill then answers ENVIRONMENT: nothing settled at the read, and the record is kept, so a later read of missing counts one launch failure', MISSING, { killError: errTmuxNotAvailable(undefined, 'kill') }, 1, 2],
+    ['reads waiting: the resume counted as a success at the read, resetting P\'s failure on record, and nothing more after the kill', 'waiting', { killResult: cannedKillResult(true) }, 0, 0],
+  ])('a liveness read while the stuck-launch abort\'s kill of the row of P\'s handed-over resume runs, which %s', async (_label, state, killScript, atRead, after) => {
+    const { loop, setRow } = await handedOverPending(1)
+    const { h, p } = loop
+    const ref = loop.refOf(p)
+    const isSessionAlive = _buildIsSessionAliveAdapter(() => h.config)
+    const countsAtRead: number[] = []
+    h.script(killScript)
+    onFirstKill(h, async () => {
+      setRow(state)
+      await isSessionAlive(p)
+      countsAtRead.push(getFailureCount(p))
+    })
+    await stopApproverForStuckLaunchAbort(p)
+
+    await h.drive(abortKillOwnStuckLaunch(p, ref, { clock: h.killRetryClock }))
+
+    expect(countsAtRead).toEqual([atRead])
+    expect(resumeEndedLinesOf(h.errors, `persona=${p}`)).toEqual([])
+    setRow(MISSING)
+    await readPersonaOwnRow(p, readAfterKill(ref))
+
+    expect(getFailureCount(p)).toBe(after)
+    // The failures counted after the read: only by the later read, and only of a record the kill kept.
+    const counted = after - atRead
+    expect(countedLinesOf(h.errors, p)).toHaveLength(counted)
+    expect(resumeEndedLinesOf(h.errors, ref)).toEqual(counted === 1 ? [resumeEndedUnreportedLine(readAfterKill(ref), ref, MISSING, 1)] : [])
+    expect(h.capReached).toEqual([])
+  })
+
+  // An old-life wait's kill (b.jg5 SRJ-811) of a persona's own `cscb_<key>`
+  // row holds that persona's resumed launch, as the persona's own kills do;
+  // a wait's kill of another persona's row holds nothing of P's. Each wait
+  // is on apply step 1's hold of that persona's own row.
+  test.each<[string, (loop: ResumeLoop) => string, number]>([
+    ['P\'s own row: the read settles nothing, and the kill, which ends P\'s launch, drops its record, so a later read counts nothing', (loop) => loop.p, 0],
+    ['Q\'s own row: the read settles P\'s resume as ended before reporting in, one counted launch failure, and a later read counts nothing more', (loop) => loop.q, 1],
+  ])('a liveness read of P\'s row (its handed-over resume) while an old-life wait kills %s', async (_label, heldKey, counted) => {
+    const { loop, setRow } = await handedOverPending(1)
+    const { h, p } = loop
+    const ref = loop.refOf(p)
+    const id = personaInstanceId(heldKey(loop))
+    const isSessionAlive = _buildIsSessionAliveAdapter(() => h.config)
+    const countsAtRead: number[] = []
+    onFirstKill(h, async () => {
+      setRow(MISSING)
+      await isSessionAlive(p)
+      countsAtRead.push(getFailureCount(p))
+    })
+    beginApplyHold(h, heldKey(loop))
+
+    await h.runOldLifeWait(id)
+
+    expect(h.stub.calls.killCalls[0]).toEqual({ claude_instance_id: id })
+    expect(countsAtRead).toEqual([1 + counted])
+    await readPersonaOwnRow(p, readAfterKill(ref))
+    expect(getFailureCount(p)).toBe(1 + counted)
+    expect(countedLinesOf(h.errors, p)).toHaveLength(counted)
+    expect([...resumeEndedLinesOf(h.errors, ref), ...resumeEndedLinesOf(h.errors, `persona=${p}`)]).toEqual(
+      counted === 1 ? [resumeEndedUnreportedLine(LIVENESS_STATUS_SITE, `persona=${p}`, MISSING, 1)] : [],
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.4q8: a read that settles a resumed launch before the launch caller hands
+// it over
+//
+// In process, every read above comes after the hand-over: the approver waits
+// for the launch it follows to settle. A read made elsewhere (a health tick,
+// a retry) can land first, between the resume's after-launch step, which
+// makes its record, and the restart path's `launchSession`, which hands it
+// over as it returns. The after-launch step's pending-only arm is its one
+// call out in that window, so the case's outage trigger sink applies one
+// own-row `status` answer there (`applyOwnRowStatusStep`, the step every
+// own-row `status` goes through) and notes P's failure count at that read.
+// One persona, its own claude_config_dir; its optimistic spawn collides with
+// its `ended` row, which it resumes, and every `status` reads `state`.
+// ---------------------------------------------------------------------------
+
+describe('b.4q8: a read that settles a resumed launch before its hand-over: nothing counted at the read, counted once at the hand-over', () => {
+  let dir: string
+  let errLines: string[]
+  let origConsoleError: typeof console.error
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'restart-resume-read-first-'))
+    errLines = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+    setSessionNotifier(() => {})
+    _resetInFlightLaunches()
+    _setSpawnHomeDir(dir)
+    _setDialogReadyTimeoutMs(200)
+  })
+
+  afterEach(async () => {
+    await stopApproversAndForgetLaunches()
+    console.error = origConsoleError
+    resetClientForTests()
+    _resetOutageState()
+    setSessionNotifier(undefined)
+    _resetSpawnHomeDir()
+    _resetDialogReadyTimeoutMs()
+    rmSync(dir, { recursive: true, force: true })
+    assertNoLeak({ errLines })
+  })
+
+  /** The read the case lands before the hand-over. */
+  const EARLY_READ = { site: 'restart.test', what: 'a status read before the hand-over' } as const
+
+  test.each<[string, StatusResult['state'], number, number]>([
+    ['waiting (reported in)', 'waiting', 1, 0],
+    ['missing (ended before reporting in)', LIVENESS_DEAD_ROW_MISSING, 0, 1],
+  ])('the row read %s first: P\'s failure count is unchanged at that read, and the launch is counted once, at the hand-over; the approver\'s read after it counts nothing more', async (_label, state, before, after) => {
+    const configDir = join(dir, 'claude-config')
+    mkdirSync(configDir)
+    const config = makeMultiPersonaConfig([{ name: 'Alpha Desk', claude_config_dir: configDir }], dir, { agent_director_poll_interval_ms: 1 })
+    const [a] = config.personas as [Persona]
+    mkdirSync(a.working_directory, { recursive: true })
+    const ref = renderPersonaRef(a.name, a.key)
+    const at = { ...EARLY_READ, ref }
+    const stub = makeStubClient({
+      spawnQueue: [cannedErr<SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' }, a, dir),
+      statusResult: cannedStatusResult({ state }),
+    })
+    const countsAtRead: number[] = []
+    initOutageState({
+      notify: () => {},
+      getClient: () => stub as unknown as Client,
+      triggerSink: {
+        arm: () => true,
+        armPendingOnly: (key) => {
+          applyOwnRowStatusStep(key, { result: cannedStatusResult({ state }) }, at)
+          countsAtRead.push(getFailureCount(key))
+        },
+      },
+    })
+    setClientForTests(stub as unknown as Client)
+    for (let i = 0; i < before; i++) recordFailure(a.key)
+
+    expect(await launchPersonaSession(a.key, config)).toBe(LAUNCH_RESUMED_UNREPORTED)
+
+    expect(countsAtRead).toEqual([before])
+    expect(getFailureCount(a.key)).toBe(after)
+    await _whenDialogApproverStopped(a.key)
+    expect(getFailureCount(a.key)).toBe(after)
+    expect(resumeEndedLinesOf(errLines, ref)).toEqual(after === 1 ? [resumeEndedUnreportedLine(at, ref, state, 1)] : [])
+    expect(countedLinesOf(errLines, a.key)).toHaveLength(after)
   })
 })

@@ -4967,6 +4967,8 @@ describe('b.jg5 SRJ-805: the reconnect adapter starts the live-row sequence for 
         retiredKey: true,
         // The start entry's reading of P when the request came: recorded once, no mark (b.jg5 SRJ-806).
         retiredAtStart: { recorded: true, marked: false, generation: 1 },
+        // And its reading that P is below the restart cap (b.4q8).
+        belowCapAtStart: true,
         launches: true,
         alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
       },
@@ -5034,7 +5036,9 @@ function appliedLookupOf(h: RecoveryHarness): (key: string) => Persona | undefin
  * The one start request the pending-row step makes for persona `key`'s row
  * read `pending` and not covered (b.jg5 SRJ-411): seeded `pending`, entry at
  * step 1, the conversation not kept, ending in a launch, alert context
- * `recovery`, with `fields`' retired-key flag and the start entry's reading.
+ * `recovery`, with `fields`' retired-key flag and the start entry's reading,
+ * and the start entry's reading that the persona is below the restart cap
+ * (b.4q8; no case here records a failure).
  */
 function pendingRowStartRequest(
   h: RecoveryHarness,
@@ -5049,6 +5053,7 @@ function pendingRowStartRequest(
     entryStep: LIVE_ROW_SEQUENCE_ENTRY_KILL,
     keepsConversation: false,
     ...fields,
+    belowCapAtStart: true,
     launches: true,
     alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
   }
@@ -5508,6 +5513,8 @@ describe('b.jg5 SRJ-810: the reconnect adapter starts the live-row sequence for 
         retiredKey: false,
         // The start entry's reading of P when the request came: not recorded (b.jg5 SRJ-806).
         retiredAtStart: { recorded: false, marked: false, generation: undefined },
+        // And its reading that P is below the restart cap (b.4q8).
+        belowCapAtStart: true,
         launches: true,
         alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
       },

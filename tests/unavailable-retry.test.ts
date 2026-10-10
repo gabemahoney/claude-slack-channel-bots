@@ -9032,8 +9032,14 @@ describe('unavailable retry: the collision ladder\'s second reuse collision, its
     expect([h.notices, h.episodeNotices, h.startupErrors()]).toEqual([[], [], []])
     expectUntouched(h, other)
 
-    // The retry's decision reads the row finished: its relaunch's spawn collides, its get reads the row ended, and its resume succeeds.
-    h.script({ statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }), spawnQueue: [cannedErr(errInstanceIdCollision())] })
+    // The retry's decision reads the row finished: its relaunch's spawn collides, its get reads the row ended, and its resume succeeds:
+    // its row reports in (waiting), so no failure is counted for the resumed launch (b.4q8).
+    const id = personaInstanceId(key)
+    h.script({
+      statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }),
+      statusFn: (params) => (params.claude_instance_id === id && h.stub.calls.resumeCalls.length > 1 ? cannedStatusResult({ state: 'waiting' }) : undefined),
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+    })
     await retryNow(h, key)
 
     expect(h.attempts).toEqual([expect.objectContaining({ key, retry: 1, mode: UNAVAILABLE_RETRY_MODE_FULL, causes: [UNAVAILABLE_RETRY_CAUSE_LOST_RACE] })])
