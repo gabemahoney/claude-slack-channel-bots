@@ -13,19 +13,28 @@
  * These assertions FAIL if the scheduler start call is dropped or reordered
  * before Bun.serve(), if the shutdown-path stop call disappears, if the cron
  * wiring runs before main() has an applied config, or if it stops reading the
- * applied config (its log and table paths, and the dispatcher's target
- * resolution). The applied config is the one `<loaded> = <outcome>.config`
- * after the reload controller's start resolution (the last-applied record, or
- * the config file when there is none); a refused start exits before that
- * assignment (pinned, with the start's assignment rule, in
- * tests/server-startup-wiring.test.ts).
+ * applied config (its log and table paths, the log's `cron_log_max_bytes` cap,
+ * and the dispatcher's target resolution). The applied config is the one
+ * `<loaded> = <outcome>.config` after the reload controller's start resolution
+ * (the last-applied record, or the config file when there is none); a refused
+ * start exits before that assignment (pinned, with the start's assignment
+ * rule, in tests/server-startup-wiring.test.ts).
  *
  * SPDX-License-Identifier: MIT
  */
 
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
-import { callArguments, indicesOf, shutdownBody, startResolution, stripComments } from './test-helpers/source-audit.ts'
+import {
+  callArguments,
+  indicesOf,
+  objectProperties,
+  onlyCallArguments,
+  shutdownBody,
+  splitTopLevel,
+  startResolution,
+  stripComments,
+} from './test-helpers/source-audit.ts'
 
 /** server.ts with every comment removed (see stripComments). */
 const SERVER_CODE = stripComments(readFileSync(new URL('../src/server.ts', import.meta.url), 'utf-8'))
@@ -82,6 +91,18 @@ describe('server.ts wires the cron scheduler', () => {
     expect(callArguments(SERVER_CODE, SERVER_CODE.search(/\bcreateCronDispatcher\s*\(/))).toMatch(
       new RegExp(`\\bresolveTarget\\s*:[^,]*\\bresolvePersonaTarget\\s*\\(\\s*${loaded}\\s*,`),
     )
+  })
+
+  test('builds the one cron log with the applied cron_log_max_bytes as its cap and the default rewrite (b.p4i)', () => {
+    // E5: the cap the loader validated reaches the writer (an absent key
+    // passes `undefined`: append-only), and production never swaps the
+    // prune's durable rewrite for the test seam.
+    const { loaded } = startResolution(SERVER_CODE)
+    const [path, options, ...rest] = splitTopLevel(onlyCallArguments(SERVER_CODE, 'createCronLog'))
+    expect(rest).toEqual([])
+    expect(path).toBe(`${loaded}.cron_log_path`)
+    expect(options).toBeDefined()
+    expect(Object.fromEntries(objectProperties(options!))).toEqual({ maxBytes: `${loaded}.cron_log_max_bytes` })
   })
 
   test('stops the scheduler inside the shutdown() function body', () => {

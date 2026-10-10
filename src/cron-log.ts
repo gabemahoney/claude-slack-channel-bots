@@ -1,26 +1,39 @@
 /**
- * cron-log.ts — Dedicated append-only cron-fire log (R1/R2 on b.grx,
- * PD-3/PD-4 on b.he5). Records every cron fire outcome — success and failure —
- * as one greppable, human-triageable plain-text line in the file at
- * `cron_log_path`. This module is the single owner of appends to that file.
+ * cron-log.ts — Dedicated cron-fire log (R1/R2 on b.grx, PD-3/PD-4/PD-5 on
+ * b.he5). Records every cron fire outcome — success and failure — as one
+ * greppable, human-triageable plain-text line in the file at
+ * `cron_log_path`, and keeps that file under `cron_log_max_bytes` when the key
+ * is set. This module is the single owner of appends to (and prunes of) that
+ * file.
  *
  * Two halves:
  *
- *   PURE HALF — record types + line formatting, no I/O, importable without
- *   side effects (crontable.ts purity precedent). Deliberately plain text, not
+ *   PURE HALF — record types + line formatting + the prune's cut
+ *   (`cronLogPruneOffset`), no I/O, importable without side effects
+ *   (crontable.ts purity precedent). Deliberately plain text, not
  *   JSONL (the permission-trail.ts precedent): human triage is the point
  *   (`grep no-session cron.log` must yield readable lines). Do NOT "fix" this
  *   back to JSONL.
  *
- *   I/O HALF — `createCronLog(path)` returns a writer handle whose single
- *   internal append function is the only code path that touches the file
- *   (E5's future whole-line pruning choke point). Lazy-open append-mode fd,
- *   mkdir parent on first open (allowed — the log is server-owned output;
- *   D-Q1's no-mkdir rule is crontable-only). Appends never throw into the
- *   caller: on failure one `[slack] cron-log`-prefixed console.error, then the
- *   fd is dropped so the next append retries the open (self-healing — a
- *   deliberate improvement over permission-trail.ts, which keeps its fd).
- *   Append-only: no pruning, no rotation, no size checks, no read-back.
+ *   I/O HALF — `createCronLog(path, { maxBytes })` returns a writer handle
+ *   whose single internal append function is the only code path that touches
+ *   the file, and the choke point E5's whole-line pruning hangs off.
+ *   Lazy-open append-mode fd, mkdir parent on first open (allowed — the log is
+ *   server-owned output; D-Q1's no-mkdir rule is crontable-only). Appends
+ *   never throw into the caller: on failure one `[slack] cron-log`-prefixed
+ *   console.error, then the fd is dropped so the next append retries the open
+ *   (self-healing — a deliberate improvement over permission-trail.ts, which
+ *   keeps its fd).
+ *
+ *   Size cap (E5, `cron_log_max_bytes`, PD-5). With no `maxBytes` the log is
+ *   append-only: no size check, no read-back, no rewrite. With one, each
+ *   successful append is followed by one `fstat` of the fd; only when the file
+ *   is over the cap is it read back and rewritten without its OLDEST whole
+ *   lines, until what is kept fits the cap (`cronLogPruneOffset`). It is never
+ *   cut mid-line, never emptied, and the line just written is always kept: a
+ *   cap smaller than that line keeps that line alone. No rotation — a rotated
+ *   file would break the single size-on-disk cap. Only this log is pruned;
+ *   the crontable is never touched here.
  *
  * Line layout (five space-delimited fields; one record = one physical line):
  *   <ISO-8601 UTC ms timestamp> <identity|-> <target|-> <outcome> <detail>
@@ -35,8 +48,12 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { closeSync, mkdirSync, openSync, writeSync } from 'node:fs'
+import { closeSync, fstatSync, mkdirSync, openSync, readFileSync, realpathSync, statSync, writeSync } from 'node:fs'
+import type { Stats } from 'node:fs'
 import { dirname } from 'node:path'
+
+import { DurableWriteUnsyncedError, durableWriteFileSync } from './atomic-write.ts'
+import { describeThrownValueWithoutStack } from './persona-connection-errors.ts'
 
 // ---------------------------------------------------------------------------
 // Pure half — record types
@@ -253,13 +270,45 @@ export function formatWarnLine(
 }
 
 // ---------------------------------------------------------------------------
+// Pure half — whole-line prune (E5)
+// ---------------------------------------------------------------------------
+
+/** The byte that ends every record (`\n`). */
+const NEWLINE = 0x0a
+
+/**
+ * Where to cut the cron log's `bytes` so what is kept fits `maxBytes` (E5,
+ * PD-5): the offset of the first byte to KEEP; 0 means drop nothing. Only
+ * whole lines are dropped, oldest first: the cut is the earliest line start
+ * (0, or just after a `\n`) that leaves at most `maxBytes` bytes, so the kept
+ * bytes never start mid-line and are never empty. The newest line (the last
+ * one — the line just written) is never dropped: when it alone is larger
+ * than `maxBytes` (a cap smaller than one line), the cut is its start and it
+ * is kept by itself, and when it is the whole file the answer is 0 (nothing
+ * to rewrite, so no thrash). One pass over the bytes, no loop to converge.
+ * Pure; never throws.
+ */
+export function cronLogPruneOffset(bytes: Uint8Array, maxBytes: number): number {
+  const end = bytes.length
+  if (!(end > maxBytes)) return 0
+  // The newest line starts just after the last `\n` before its own
+  // terminator (or at 0 when there is none).
+  const newestStart = end < 2 ? 0 : bytes.lastIndexOf(NEWLINE, end - 2) + 1
+  // At least `end - maxBytes` bytes must go: the earliest line start at or
+  // after that offset follows the first `\n` at or after the byte before it.
+  const firstNewline = bytes.indexOf(NEWLINE, end - maxBytes - 1)
+  const cut = firstNewline === -1 ? newestStart : firstNewline + 1
+  return Math.min(cut, newestStart)
+}
+
+// ---------------------------------------------------------------------------
 // I/O half — writer handle
 // ---------------------------------------------------------------------------
 
 /**
  * Writer handle returned by `createCronLog`. All four append methods funnel
- * through one internal append function (the E5 pruning choke point) — they
- * differ only in which pure formatter builds the line.
+ * through one internal append function (the choke point E5's pruning hangs
+ * off) — they differ only in which pure formatter builds the line.
  */
 export interface CronLog {
   /** Append one outcome record. */
@@ -273,10 +322,30 @@ export interface CronLog {
 }
 
 /**
+ * The prune's rewrite: replaces `path` with exactly `bytes`, atomically and
+ * durably (`durableWriteFileSync` in production). Throws on failure: a
+ * `DurableWriteUnsyncedError` when the bytes reached `path` but its directory
+ * could not be synced, any other error when `path` was left unchanged.
+ */
+export type CronLogWriter = (path: string, bytes: Uint8Array) => void
+
+/** Options of {@link createCronLog}. */
+export interface CronLogOptions {
+  /**
+   * The size cap in bytes (`cron_log_max_bytes`, a positive integer the config
+   * loader validated). Absent: append-only, exactly as before E5 — no size
+   * check, no read-back, no rewrite.
+   */
+  maxBytes?: number
+  /** The prune's rewrite; `durableWriteFileSync` by default. A seam for tests to observe or fail it. */
+  write?: CronLogWriter
+}
+
+/**
  * Create a cron-log writer bound to `path`. Lazy-opens an append-mode fd on
  * first write, creating the parent directory (recursive) at that point. All
  * writes route through one internal `append` — the single code path that
- * touches the file and the choke point E5 will hang pruning off.
+ * touches the file, and the one that prunes it when `options.maxBytes` is set.
  *
  * Appends never throw into the caller. On a write/open failure: exactly one
  * `[slack] cron-log`-prefixed console.error carrying the schedule identity and
@@ -284,14 +353,60 @@ export interface CronLog {
  * dropped (closed best-effort, set null) so the NEXT append retries the open —
  * self-healing, a deliberate improvement over permission-trail.ts which keeps
  * its fd across failures.
+ *
+ * Pruning (E5, PD-5), only with `maxBytes`: after each successful append, one
+ * `fstat` of the fd. Only when the file is over the cap is it read back, and
+ * only while `path` still names the fd's file (same device and inode): when
+ * `path` was replaced or removed while the server runs (log rotation, a move,
+ * an editor's save), the fd is dropped without an error line and nothing is
+ * pruned, so the next append reopens `path` and the cap follows it. The
+ * bytes to keep are chosen by `cronLogPruneOffset` (oldest whole lines
+ * dropped, the newest line always kept) and written over the log's real path
+ * through `write` — `durableWriteFileSync`: a uniquely named temp file beside
+ * the log, fsync, rename, directory fsync — so a reader sees the old log or
+ * the pruned one, never a partial or empty file, even after a crash. The real
+ * path is written so a symlinked `cron_log_path` keeps pointing at the log
+ * instead of being replaced by a regular file. The fd still points at the
+ * replaced file, so it is dropped and the next append reopens `path`. A
+ * rename whose directory could not be synced (`DurableWriteUnsyncedError`)
+ * counts as done: the pruned log is in place, and a crash that undoes the
+ * rename only brings back the longer log, which the next append prunes again.
+ *
+ * A prune never throws into the caller and never loses the line just written
+ * (it is on disk before the prune starts). On a prune failure: exactly one
+ * `[slack] cron-log: prune failed` console.error carrying the identity and
+ * outcome of the line just written, the fd is dropped so the next append
+ * reopens `path`, and the log stays over the cap until a later append prunes
+ * it.
+ *
+ * Race tolerance: the read-back and the rename are not atomic with respect to
+ * any OTHER writer. A line appended through another fd between the read and
+ * the rename is lost with the replaced file, and that other fd goes on writing
+ * into the replaced file until it is reopened. The scheduler is the log's
+ * single writer (one handle per server, synchronous appends), so this is
+ * belt-and-braces; a log tolerates losing such a line.
  */
-export function createCronLog(path: string): CronLog {
+export function createCronLog(path: string, options: CronLogOptions = {}): CronLog {
+  const { maxBytes } = options
+  const write = options.write ?? durableWriteFileSync
   let fd: number | null = null
+
+  /** Close the fd (best effort) and forget it, so the next append reopens `path`. */
+  function dropFd(): void {
+    if (fd === null) return
+    try {
+      closeSync(fd)
+    } catch {
+      /* best-effort close */
+    }
+    fd = null
+  }
 
   /**
    * The single choke point. `identity`/`outcome` are carried only for the
-   * failure log line. Synchronous `writeSync` (per permission-trail.ts /
-   * logging.ts) so lines are whole and never interleaved.
+   * failure log lines. Synchronous `writeSync` (per permission-trail.ts /
+   * logging.ts) so lines are whole and never interleaved. The line is written
+   * BEFORE any prune, so a prune can never lose it.
    */
   function append(line: string, identity: string, outcome: string): void {
     try {
@@ -306,14 +421,69 @@ export function createCronLog(path: string): CronLog {
         err,
       )
       // Drop the fd so the next append retries the open (self-heal).
-      if (fd !== null) {
-        try {
-          closeSync(fd)
-        } catch {
-          /* best-effort close */
-        }
-        fd = null
+      dropFd()
+      return
+    }
+    if (maxBytes !== undefined) pruneOverCap(maxBytes, identity, outcome)
+  }
+
+  /**
+   * Prune the log back under `cap` when the append just made left it over
+   * (see `createCronLog`). Never throws; on failure one console.error and the
+   * fd is dropped.
+   */
+  function pruneOverCap(cap: number, identity: string, outcome: string): void {
+    if (fd === null) return
+    try {
+      const held = fstatSync(fd)
+      if (held.size <= cap) return
+      // The size above is the fd's file, but the read and the rewrite below go
+      // to `path`. When `path` was replaced or removed while the server runs
+      // (logrotate `create`, `mv cron.log x && touch cron.log`, an editor's
+      // save), the fd still appends to the old file: kept, it would grow that
+      // file without bound while `path` stays under the cap, and re-read
+      // `path` on every append. Not a failure (no error line): drop the fd so
+      // the next append reopens `path`, and prune nothing now.
+      let target: string
+      let atPath: Stats
+      try {
+        target = realpathSync(path)
+        atPath = statSync(target)
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException | null)?.code !== 'ENOENT') throw err
+        dropFd()
+        return
       }
+      if (atPath.dev !== held.dev || atPath.ino !== held.ino) {
+        dropFd()
+        return
+      }
+      const bytes = readFileSync(target)
+      const cut = cronLogPruneOffset(bytes, cap)
+      if (cut === 0) {
+        // Nothing to drop, nothing to rewrite. Either the newest line is the
+        // whole file (a cap smaller than one line: keep the fd), or what
+        // `path` holds is already within the cap although the fd's file was
+        // over it: `path` was replaced after the check above (or truncated in
+        // place), so drop the fd — at worst one needless reopen.
+        if (bytes.length <= cap) dropFd()
+        return
+      }
+      try {
+        write(target, bytes.subarray(cut))
+      } catch (err) {
+        // Renamed but unsynced: the pruned log is in place (see above).
+        if (!(err instanceof DurableWriteUnsyncedError)) throw err
+      } finally {
+        // The fd points at the file the rename replaced (or, after a failed
+        // write, at the unchanged log): reopen on the next append either way.
+        dropFd()
+      }
+    } catch (err) {
+      console.error(
+        `[slack] cron-log: prune failed identity=${identity} outcome=${outcome} — the line is written, the log is not pruned: ${describeThrownValueWithoutStack(err)}`,
+      )
+      dropFd()
     }
   }
 

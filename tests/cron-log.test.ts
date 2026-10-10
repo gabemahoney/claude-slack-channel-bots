@@ -3,26 +3,48 @@
  * (src/cron-log.ts). Covers the pure formatters (five-field layout, all nine
  * outcome classes, detail tokens, newline escaping) and the I/O half
  * (createCronLog: append accumulation, unwritable-path resilience, self-heal,
- * whole-line rapid appends).
+ * whole-line rapid appends) and the `cron_log_max_bytes` cap (b.p4i, E5): the
+ * pure cut (`cronLogPruneOffset`) and the prune after each append — oldest
+ * whole lines dropped, the newest always kept, no prune with the key absent, a
+ * failed rewrite losing no line, a symlinked log path kept a symlink, a log
+ * path moved away or removed while the log is open followed by the cap.
  *
  * Isolation: every test gets a fresh mkdtempSync temp dir (rmSync recursive
  * force in afterEach), matching tests/pid.test.ts. No live cron log, crontable,
  * config, or path outside the temp dir is touched. console.error is spied by
- * reassignment (no mock.module — the pretest gate forbids top-level use).
+ * reassignment (no mock.module — the pretest gate forbids top-level use). The
+ * prune's rewrite is observed or failed through `createCronLog`'s `write` seam.
  *
  * SPDX-License-Identifier: MIT
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { DurableWriteUnsyncedError, durableWriteFileSync } from '../src/atomic-write.ts'
 import {
   createCronLog,
+  cronLogPruneOffset,
   formatOutcomeLine,
   formatSummaryLine,
   formatInfoLine,
   formatWarnLine,
+  type CronLog,
+  type CronLogWriter,
   type CronOutcome,
   type CronLogRecord,
   type CronLogDetail,
@@ -106,6 +128,54 @@ function makeFileParentObstruction(name: string): { fileParent: string; badPath:
   const fileParent = join(tempDir, name)
   writeFileSync(fileParent, 'x')
   return { fileParent, badPath: join(fileParent, 'cron.log') }
+}
+
+/** The fire record of schedule `sched-<i>`; its detail text varies, so line lengths vary too. */
+function fireRecord(i: number): CronLogRecord {
+  return makeRecord({ identity: `sched-${i}`, detail: makeDetail({ text: 'x'.repeat(i % 7) }) })
+}
+
+/** The physical (newline-terminated) line the writer puts down for `fireRecord(i)`. */
+function fireLine(i: number): string {
+  return `${formatOutcomeLine(fireRecord(i))}\n`
+}
+
+/** Append fires `from` … `from + count - 1` through `log`; returns their physical lines, oldest first. */
+function appendFires(log: CronLog, count: number, from = 0): string[] {
+  const lines: string[] = []
+  for (let i = from; i < from + count; i++) {
+    log.outcome(fireRecord(i))
+    lines.push(fireLine(i))
+  }
+  return lines
+}
+
+/**
+ * What a prune to `cap` must leave of `lines` (each newline-terminated, oldest
+ * first): the longest run of the NEWEST whole lines that fits in `cap` bytes,
+ * and never less than the newest line (E5). Built independently of the code
+ * under test, as the oracle the pure and I/O cases compare with.
+ */
+function newestWithin(lines: readonly string[], cap: number): string {
+  let kept = lines[lines.length - 1]!
+  for (let i = lines.length - 2; i >= 0; i--) {
+    const longer = lines[i]! + kept
+    if (Buffer.byteLength(longer) > cap) break
+    kept = longer
+  }
+  return kept
+}
+
+/** A `write` seam that records each rewrite's byte count, then does the real durable rewrite. */
+function recordingWriter(): { write: CronLogWriter; rewrites: number[] } {
+  const rewrites: number[] = []
+  return {
+    rewrites,
+    write: (path, bytes) => {
+      rewrites.push(bytes.length)
+      durableWriteFileSync(path, bytes)
+    },
+  }
 }
 
 const OUTCOME_CLASSES = [
@@ -557,5 +627,196 @@ describe('rapid sequential appends', () => {
       expect(f[1]).toBe(`sched-${i}`)
       expect(f[3]).toBe('delivered')
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// cron_log_max_bytes — the pure cut (b.p4i, E5)
+// ---------------------------------------------------------------------------
+
+describe('cronLogPruneOffset — where a prune cuts the log', () => {
+  /** The text a prune of `text` to `cap` keeps: everything from the offset on. */
+  function kept(text: string, cap: number): string {
+    const bytes = new TextEncoder().encode(text)
+    return new TextDecoder().decode(bytes.subarray(cronLogPruneOffset(bytes, cap)))
+  }
+
+  test.each<[string, string, number, string]>([
+    ['a log exactly at the cap is left whole', 'aa\nbb\n', 6, 'aa\nbb\n'],
+    ['one byte over the cap drops the oldest line', 'aa\nbb\n', 5, 'bb\n'],
+    ['a single line over the cap is left whole (nothing to rewrite)', 'abcdef\n', 3, 'abcdef\n'],
+    ['cap 1 keeps only the newest of several lines', 'a\nbb\nccc\n', 1, 'ccc\n'],
+    ['cap 1 on a one-line log keeps that line', 'a\n', 1, 'a\n'],
+    ['a newest line larger than the cap is kept alone, never cut', 'aaaa\nbbbbbbbb\n', 4, 'bbbbbbbb\n'],
+    // 'éé\n' is 5 bytes but 3 characters: a cap counted in characters would keep all 5 characters.
+    ['the cap counts bytes, and the cut lands only after a newline', 'éé\nx\n', 5, 'x\n'],
+  ])('%s', (_label, text, cap, expected) => {
+    expect(kept(text, cap)).toBe(expected)
+  })
+
+  test('at every cap, the cut keeps the longest run of newest whole lines that fits, never less than the newest line', () => {
+    const lines = ['first line\n', 'b\n', 'the third line\n', 'dd\n', 'the newest line\n']
+    const text = lines.join('')
+    for (let cap = 1; cap <= Buffer.byteLength(text) + 1; cap++) {
+      expect([cap, kept(text, cap)]).toEqual([cap, newestWithin(lines, cap)])
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// cron_log_max_bytes — the prune after each append (b.p4i, E5)
+// ---------------------------------------------------------------------------
+
+describe('cron_log_max_bytes — whole-line pruning of the log', () => {
+  const CAP = 1024
+
+  /**
+   * Append fires `from` … `from + count - 1` through `log`, checking after each
+   * one that the file at the log path is within `cap`; returns their lines.
+   */
+  function appendWithinCap(log: CronLog, cap: number, count: number, from: number): string[] {
+    const lines: string[] = []
+    for (let i = from; i < from + count; i++) {
+      lines.push(...appendFires(log, 1, i))
+      expect(statSync(logPath).size).toBeLessThanOrEqual(cap)
+    }
+    return lines
+  }
+
+  /**
+   * A log holding fires 0–3 under a cap of exactly their size: nothing pruned
+   * yet, so its fd is still open, and the next append takes the file past the cap.
+   */
+  function openLogAtCap(): { log: CronLog; cap: number; before: string[] } {
+    const before = Array.from({ length: 4 }, (_, i) => fireLine(i))
+    const cap = Buffer.byteLength(before.join(''))
+    const log = createCronLog(logPath, { maxBytes: cap })
+    appendFires(log, before.length)
+    return { log, cap, before }
+  }
+
+  test('REGRESSION (b.p4i): with a 1 KB cap, appends past it leave the file within the cap — oldest whole lines gone, newest intact, no partial head', () => {
+    const log = createCronLog(logPath, { maxBytes: CAP })
+    const written = appendWithinCap(log, CAP, 60, 0)
+    expect(Buffer.byteLength(written.join(''))).toBeGreaterThan(2 * CAP)
+    // Exactly the newest whole lines that fit: the head is a whole line, the
+    // oldest are gone, the last line is the one just written, and no more was
+    // dropped than the cap needs.
+    expect(readFileSync(logPath, 'utf-8')).toBe(newestWithin(written, CAP))
+    expect(readLines()).not.toContain(formatOutcomeLine(fireRecord(0)))
+    expect(readLines().at(-1)).toBe(formatOutcomeLine(fireRecord(59)))
+  })
+
+  test('with the key absent, the same appends grow the file past the cap untouched and never rewrite it', () => {
+    const { write, rewrites } = recordingWriter()
+    // The server passes `maxBytes: undefined` when the key is absent.
+    const log = createCronLog(logPath, { maxBytes: undefined, write })
+    const written = appendFires(log, 60)
+    expect(statSync(logPath).size).toBeGreaterThan(2 * CAP)
+    expect(readFileSync(logPath, 'utf-8')).toBe(written.join(''))
+    expect(rewrites).toEqual([])
+  })
+
+  test('a log already past the cap when the key is set is pruned at the first append', () => {
+    const older = Array.from({ length: 60 }, (_, i) => fireLine(i))
+    writeFileSync(logPath, older.join(''))
+    const log = createCronLog(logPath, { maxBytes: CAP })
+    const newest = appendFires(log, 1, 60)
+    expect(readFileSync(logPath, 'utf-8')).toBe(newestWithin([...older, ...newest], CAP))
+  })
+
+  test('a cap smaller than one line keeps only the newest line, with one rewrite per later append and none for the first', () => {
+    const { write, rewrites } = recordingWriter()
+    const log = createCronLog(logPath, { maxBytes: 1, write })
+    const written: string[] = []
+    for (let i = 0; i < 5; i++) {
+      written.push(...appendFires(log, 1, i))
+      expect(readFileSync(logPath, 'utf-8')).toBe(written[i]!)
+    }
+    // The first append leaves the newest line as the whole file: nothing to
+    // rewrite. Each later one rewrites the file to its own line, once.
+    expect(rewrites).toEqual(written.slice(1).map((line) => Buffer.byteLength(line)))
+  })
+
+  test('a failed prune rewrite loses no line, never throws and logs one prune-failed line; the next append prunes', () => {
+    let failing = true
+    const write: CronLogWriter = (path, bytes) => {
+      if (failing) throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' })
+      durableWriteFileSync(path, bytes)
+    }
+    // The second append takes the file one byte over the cap.
+    const cap = Buffer.byteLength(fireLine(0) + fireLine(1)) - 1
+    const log = createCronLog(logPath, { maxBytes: cap, write })
+    const written = appendFires(log, 1)
+    expect(() => written.push(...appendFires(log, 1, 1))).not.toThrow()
+
+    expect(readFileSync(logPath, 'utf-8')).toBe(written.join(''))
+    expect(errorCalls).toEqual([
+      '[slack] cron-log: prune failed identity=sched-1 outcome=delivered — the line is written, the log is not pruned: Error code=ENOSPC message="no space left on device"',
+    ])
+
+    failing = false
+    written.push(...appendFires(log, 1, 2))
+    expect(readFileSync(logPath, 'utf-8')).toBe(newestWithin(written, cap))
+    expect(errorCalls).toHaveLength(1)
+  })
+
+  test('a rewrite that renamed but could not sync its directory counts as done: no error line, and later lines land in the pruned log', () => {
+    const write: CronLogWriter = (path, bytes) => {
+      durableWriteFileSync(path, bytes)
+      throw new DurableWriteUnsyncedError(path, Object.assign(new Error('i/o error'), { code: 'EIO' }))
+    }
+    const log = createCronLog(logPath, { maxBytes: 200, write })
+    const written = appendFires(log, 10)
+    expect(readFileSync(logPath, 'utf-8')).toBe(newestWithin(written, 200))
+    expect(errorCalls).toEqual([])
+  })
+
+  test('a symlinked cron_log_path stays a symlink after a prune, and its target holds the pruned log', () => {
+    const realDir = join(tempDir, 'real')
+    mkdirSync(realDir)
+    const realPath = join(realDir, 'cron.log')
+    writeFileSync(realPath, '')
+    symlinkSync(realPath, logPath)
+
+    const log = createCronLog(logPath, { maxBytes: 200 })
+    const written = appendFires(log, 10)
+
+    expect(lstatSync(logPath).isSymbolicLink()).toBe(true)
+    expect(readlinkSync(logPath)).toBe(realPath)
+    expect(readFileSync(realPath, 'utf-8')).toBe(newestWithin(written, 200))
+    // The rewrite's temporary file was made beside the target and is gone.
+    expect(readdirSync(realDir)).toEqual(['cron.log'])
+  })
+
+  test('REGRESSION (b.p4i): a log path replaced while the log is open (moved away, an empty file made in its place) — the moved file stops growing, later lines land at the path within the cap, no error line', () => {
+    const { log, cap, before } = openLogAtCap()
+    const movedPath = join(tempDir, 'cron.log.1')
+    renameSync(logPath, movedPath)
+    writeFileSync(logPath, '')
+
+    // The open fd still names the moved file: the next line lands there and
+    // takes it past the cap. The path names another file, so the fd is
+    // dropped instead of the path being pruned, and later appends reopen it.
+    const intoMoved = appendFires(log, 1, before.length)
+    const intoPath = appendWithinCap(log, cap, 20, before.length + 1)
+
+    expect(readFileSync(movedPath, 'utf-8')).toBe([...before, ...intoMoved].join(''))
+    expect(readFileSync(logPath, 'utf-8')).toBe(newestWithin(intoPath, cap))
+    expect(errorCalls).toEqual([])
+  })
+
+  test('REGRESSION (b.p4i): a log path removed while the log is open — a later append recreates it, the cap holds, no error line', () => {
+    const { log, cap, before } = openLogAtCap()
+    rmSync(logPath)
+
+    // The open fd still names the removed file: the next line lands there and
+    // takes it past the cap. The path is gone, which is no prune failure: the
+    // fd is dropped, and the append after it recreates the path.
+    appendFires(log, 1, before.length)
+    const intoPath = appendWithinCap(log, cap, 20, before.length + 1)
+
+    expect(readFileSync(logPath, 'utf-8')).toBe(newestWithin(intoPath, cap))
+    expect(errorCalls).toEqual([])
   })
 })
