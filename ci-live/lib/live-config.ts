@@ -7,7 +7,10 @@
  * `ack_reaction: "eyes"`; the Step 6 Role text), and D's entry for Check 25.
  *
  * The runner writes these instead of running the wizard (a deviation the
- * results' Notes record). Neither the configuration it writes nor D's entry
+ * results' Notes record). The configuration also names the container's
+ * crontable (`cron_table_path`, `CONTAINER_CRON_TABLE_PATH`), which the
+ * wizard leaves out: the default (`~/.config/cscb/crontab`, bug b.avm) is on
+ * the read-only credentials mount. Neither the configuration it writes nor D's entry
  * carries the invited-channel switch or an `invited` section: every check
  * before Check 30 runs with the switch absent (b.deo SRI-1507).
  *
@@ -44,6 +47,18 @@ export interface WorkspaceIds {
 export const CONTAINER_STATE_DIR = '/home/testuser/.claude/channels/slack'
 export const SYSTEM_PROMPT_PATH = `${CONTAINER_STATE_DIR}/system-prompt.md`
 
+/**
+ * The container's crontable, named in config.json (`cron_table_path`) in the
+ * state directory, where every run before bug b.avm had it. A deviation from
+ * the wizard's answers, which leave the key out: the default would be
+ * `~/.config/cscb/crontab` (b.avm), and the container's `~/.config/cscb` is
+ * the runner's read-only mount of the credentials directory, so the
+ * scheduler could not create it there. The state directory exists before
+ * the first start (the runner writes config.json in it), as a written path
+ * needs (the server never makes its directory, D-Q1).
+ */
+export const CONTAINER_CRON_TABLE_PATH = `${CONTAINER_STATE_DIR}/crontab`
+
 /** The Role text the plan's Part 1.5 table gives for Step 6. */
 export const ROLE_TEXT =
   'You are a test persona in an acceptance run. Answer every Slack message with the reply tool, briefly, and do what it asks.'
@@ -63,6 +78,8 @@ export interface LiveConfig {
   personas: PersonaEntry[]
   ack_reaction: string
   append_system_prompt_file: string
+  /** The container's crontable (`CONTAINER_CRON_TABLE_PATH`): not a wizard answer. */
+  cron_table_path: string
   /** The invited-channel switch (`SWITCH_KEY`, b.deo SRI-101): only Checks 30, 32 and 33's edits write it. */
   [SWITCH_KEY]?: boolean
 }
@@ -150,12 +167,13 @@ export function personaEntryFor(letter: PersonaLetter, ids: WorkspaceIds): Perso
   }
 }
 
-/** config.json after the three wizard runs of Part 1.5. */
+/** config.json after the three wizard runs of Part 1.5, with the container's crontable (`CONTAINER_CRON_TABLE_PATH`). */
 export function buildLiveConfig(ids: WorkspaceIds): LiveConfig {
   return {
     personas: (['a', 'b', 'c'] as const).map((l) => personaEntryFor(l, ids)),
     ack_reaction: 'eyes',
     append_system_prompt_file: SYSTEM_PROMPT_PATH,
+    cron_table_path: CONTAINER_CRON_TABLE_PATH,
   }
 }
 

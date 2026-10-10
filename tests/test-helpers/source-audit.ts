@@ -450,6 +450,53 @@ export function startResolution(code: string): StartResolution {
   return { controller, outcome, loaded, createAt, resolveAt, assignAt, bringUpAt }
 }
 
+/** The start's crontable override in `main()` (see `cronTableStartOverride`). */
+export interface CronTableStartOverride {
+  /** The variable holding the crontable the start runs on. */
+  path: string
+  /** Offset of the block's `if`. */
+  at: number
+  /** Offset of `<loaded> = { ...<loaded>, cron_table_path: <path> }`. */
+  loadedAt: number
+  /** The start-time config the block assigns `<loaded>` to. */
+  startTime: string
+  /** Offset of `<start-time> = <loaded>`. */
+  startTimeAt: number
+}
+
+/**
+ * Bug b.avm: the start path's one assignment of the applied config besides
+ * `<loaded> = <outcome>.config` (see `startResolution`). When the start's
+ * crontable preparation failed before the file reached its default location,
+ * the start runs on the old path: a copy of the outcome's config with only
+ * `cron_table_path` replaced (never a re-read of the file), mirrored into the
+ * start-time config:
+ *
+ *     if (<path> !== <loaded>.cron_table_path) {
+ *       <loaded> = { ...<loaded>, cron_table_path: <path> }
+ *       <start-time> = <loaded>
+ *     }
+ *
+ * It only locates the block: it throws unless it appears exactly once in
+ * `code`. Where it sits and what `<path>` is are pinned in
+ * tests/cron-scheduler-wiring.test.ts.
+ */
+export function cronTableStartOverride(code: string): CronTableStartOverride {
+  const { loaded } = startResolution(code)
+  const block = onlyMatch(
+    code,
+    new RegExp(
+      `(?<![\\w.$])if\\s*\\(\\s*(\\w+)\\s*!==\\s*${loaded}\\s*\\.\\s*cron_table_path\\s*\\)\\s*\\{\\s*` +
+        `(${loaded}\\s*=\\s*\\{\\s*\\.\\.\\.\\s*${loaded}\\s*,\\s*cron_table_path\\s*:\\s*\\1\\s*,?\\s*\\}\\s*;?\\s*)` +
+        `(\\w+)\\s*=\\s*${loaded}\\s*;?\\s*\\}`,
+      'g',
+    ),
+    `if (<path> !== ${loaded}.cron_table_path) { ${loaded} = { ...${loaded}, cron_table_path: <path> }; <start-time> = ${loaded} }`,
+  )
+  const loadedAt = block.index! + block[0].indexOf(block[2]!)
+  return { path: block[1]!, at: block.index!, loadedAt, startTime: block[3]!, startTimeAt: loadedAt + block[2]!.length }
+}
+
 /**
  * The variable `main()` sets to the applied persona config: the one
  * `<name> = <outcome>.config` after `<outcome> = <controller>.resolveStart()`

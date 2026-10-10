@@ -391,7 +391,10 @@ export interface ReloadLifecycleOps {
    * The start bring-up pass over the whole applied set: every persona's
    * bring-up and, for each persona that is up, its launch. Resolves once
    * every persona has an outcome (production: `startupSessionManager` over
-   * the bring-up controller).
+   * the bring-up controller, launching over `configInEffect` of the server's
+   * start-time configuration and `applied`, so its server-wide values, the
+   * crontable the start runs on included, are the ones every later launch
+   * uses).
    */
   startBringUp(applied: PersonaConfig): Promise<unknown>
   /**
@@ -629,9 +632,15 @@ export interface ReloadControllerDeps {
  * top-level `claude_config_dir` and `stop_hook_bootstrap` are not held back
  * by this either: they act only as inherited defaults, already resolved into
  * each of `applied`'s personas, so an inheriting persona's next launch uses
- * the new value. The one place the server derives what it runs after an
- * apply (the `onApplied` of `main()` in `server.ts`). Pure: neither input is
- * mutated.
+ * the new value. The one place the server derives what it runs from an
+ * applied configuration: after an apply (the `onApplied` of `main()` in
+ * `server.ts`), and for the start bring-up pass (its `startBringUp`), whose
+ * `startTime` is the server's start-time configuration. That one can differ
+ * from the controller's applied configuration in `cron_table_path` alone,
+ * when the start runs on the old crontable (bug b.avm,
+ * `cronTablePathForStart`); the controller's configuration is left as
+ * resolved, so the change detection compares `config.json` with it and
+ * never sees that difference. Pure: neither input is mutated.
  */
 export function configInEffect(startTime: PersonaConfig, applied: PersonaConfig): PersonaConfig {
   return { ...startTime, allow_invited_channels: applied.allow_invited_channels, personas: applied.personas }

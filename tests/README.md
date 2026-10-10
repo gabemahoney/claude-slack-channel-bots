@@ -45,7 +45,8 @@ preload runs before it.
 
 The guard loads before any test file. It first checks the home the run was
 launched with (see When the guard refuses to start, below). It then points
-HOME and `SLACK_STATE_DIR` at a fresh temp directory, drops every PATH
+HOME, `SLACK_STATE_DIR` and `XDG_CONFIG_HOME` at a fresh temp directory
+(`XDG_CONFIG_HOME` decides where the crontable's default lies), drops every PATH
 directory that holds an `agent-director` binary and unsets `TMUX` and
 `CLAUDE_CONFIG_DIR`. The rules tests follow on top of it are in
 `docs/testing-guide.md`. The tests also build their own temp homes and fake
@@ -71,8 +72,9 @@ is missing files.
 
 Bun fixes `os.homedir()` to the HOME `bun test` was launched with, and the
 guard cannot change it. `src/` code that calls `homedir()` directly (the state
-directory default, the Claude config directory, the default transcript root,
-`~` expansion, the start gate's `state.db` path) resolves against that
+directory default, the crontable's default under `~/.config/cscb`, the Claude
+config directory, the default transcript root, `~` expansion, the start gate's
+`state.db` path) resolves against that
 launch-time home for the whole run. So the guard refuses to start when that
 home could reach your real Claude, Slack or agent-director state. It prints
 one line and exits with code 78, before any test file loads and before it
@@ -93,7 +95,7 @@ this order and reports the first that applies:
 | `launch-home-temp-dir-is-root` | with no `/etc/passwd` entry for your account, is checked against a temp directory (`TMPDIR`, else `/tmp`) that is `/`, symlinks resolved: every path lies under `/`, so the temp-directory rules below would accept any home |
 | `launch-home-not-under-temp-dir` | with no `/etc/passwd` entry for your account, does not lie strictly under the temp directory (`TMPDIR`, else `/tmp`), symlinks resolved; the temp directory itself is refused |
 | `launch-home-holds-slack-state` | has anything at `.claude/channels/slack` |
-| `launch-home-derived-path-in-real-home` | has a path the code derives from the home (`.claude`, `.claude/channels/slack`, `.claude/projects`, `.claude/skills`, `.claude/slack-mcp.json`, `.agent-director` or a file under it) that leads into your home directory through a symlink, a dangling one included |
+| `launch-home-derived-path-in-real-home` | has a path the code derives from the home (`.claude`, `.claude/channels/slack`, `.claude/projects`, `.claude/skills`, `.claude/slack-mcp.json`, `.agent-director` or a file under it, `.config`, `.config/cscb` or `.config/cscb/crontab`) that leads into your home directory through a symlink, a dangling one included |
 | `launch-home-derived-path-not-under-temp-dir` | with no `/etc/passwd` entry for your account, has one of those paths leading out of the temp directory |
 | `launch-home-holds-agent-director` | has `.agent-director` or the standard agent-director install path |
 
@@ -119,7 +121,8 @@ outside your home, or unset it to use `/tmp`, then launch again. Do the same
 for `launch-home-temp-dir-is-root`, when `TMPDIR` resolves to `/`. Never reuse a
 real or long-lived home, and never work around the guard. Started with a new
 scratch HOME, every `homedir()` path lands in `$S`, never in the real
-`~/.claude/`, `~/.claude/channels/slack/` or `~/.agent-director/`.
+`~/.claude/`, `~/.claude/channels/slack/`, `~/.config/cscb/` or
+`~/.agent-director/`.
 
 ## Docker integration suite
 

@@ -47,12 +47,15 @@
  * 4. computes the redirected variables with the shared, side-effect-free
  *    `preloadRedirectedEnv(process.env, home, tmuxTmpDir)` (see its doc in
  *    `host-safe-env.ts`: `HOME`, the cleaned `PATH`, `TMUX_TMPDIR`,
- *    `SLACK_STATE_DIR` under the new HOME; `TMUX`, `TMUX_PANE` and
- *    `CLAUDE_CONFIG_DIR` unset) and applies it to `process.env`: each of
- *    `PRELOAD_ENV_NAMES` is set to its value or deleted when it has none.
- *    Nothing else in `process.env` is touched. `SLACK_STATE_DIR` is set
- *    rather than unset because the state-directory resolvers in `src/` fall
- *    back to `os.homedir()` (the launch-time HOME) when it is unset.
+ *    `SLACK_STATE_DIR` and `XDG_CONFIG_HOME` under the new HOME; `TMUX`,
+ *    `TMUX_PANE` and `CLAUDE_CONFIG_DIR` unset) and applies it to
+ *    `process.env`: each of `PRELOAD_ENV_NAMES` is set to its value or
+ *    deleted when it has none. Nothing else in `process.env` is touched.
+ *    `SLACK_STATE_DIR` and `XDG_CONFIG_HOME` are set rather than unset
+ *    because the state-directory resolvers and the crontable's default in
+ *    `src/` fall back to `os.homedir()` (the launch-time HOME) when they are
+ *    unset, and an inherited `XDG_CONFIG_HOME` would put that default in the
+ *    operator's own configuration directory (bug b.avm).
  *    `CLAUDE_CONFIG_DIR` is unset because it names a Claude configuration
  *    directory (a run started from a bot's session can inherit its
  *    persona's) that Claude Code, a hook or any code honouring it would read

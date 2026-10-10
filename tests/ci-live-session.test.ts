@@ -50,7 +50,16 @@ import {
   notYetOnTransient,
   tsAfter,
 } from '../ci-live/lib/human-session.ts'
-import { buildLiveConfig, personaEntryFor, renderConfig, ROLE_TEXT, systemPromptFromTemplate } from '../ci-live/lib/live-config.ts'
+import { CONTAINER_CREDENTIALS_DIR, CONTAINER_HOME } from '../ci-live/lib/docker.ts'
+import {
+  buildLiveConfig,
+  CONTAINER_CRON_TABLE_PATH,
+  CONTAINER_STATE_DIR,
+  personaEntryFor,
+  renderConfig,
+  ROLE_TEXT,
+  systemPromptFromTemplate,
+} from '../ci-live/lib/live-config.ts'
 import { SlackTransportError, type SlackParams, type SlackResponse } from '../ci-live/lib/slack-api.ts'
 import { waitFor } from '../ci-live/lib/wait.ts'
 import { virtualClock } from './test-helpers/ci-live.ts'
@@ -265,6 +274,25 @@ describe('the live config', () => {
       ['persona_c', true],
     ])
     assertNoLeak(renderConfig(config))
+  })
+
+  // Bug b.avm: the default crontable, ~/.config/cscb/crontab, lies in the
+  // container's read-only mount of the credentials directory, where the
+  // scheduler could not create it; the runner's config names one in the state
+  // directory instead, which the loader keeps as written (not flagged as a
+  // default, so the start prepares and moves nothing).
+  test('names the container\'s crontable in the state directory, outside the read-only credentials mount the default would fall in', () => {
+    const config = buildLiveConfig(DRY_RUN_IDS)
+    expect(config.cron_table_path).toBe(CONTAINER_CRON_TABLE_PATH)
+    expect(CONTAINER_CRON_TABLE_PATH).toBe(`${CONTAINER_STATE_DIR}/crontab`)
+    const loadInContainer = (c: unknown) =>
+      parsePersonaConfigBytes(renderConfig(c), `${CONTAINER_STATE_DIR}/config.json`, CONTAINER_STATE_DIR, { home: CONTAINER_HOME, env: {} })
+    const loaded = loadInContainer(config)
+    expect([loaded.cron_table_path, loaded.cron_table_path_defaulted]).toEqual([CONTAINER_CRON_TABLE_PATH, false])
+    expect(loaded.cron_table_path.startsWith(`${CONTAINER_CREDENTIALS_DIR}/`)).toBe(false)
+    // Without the key, the default would sit inside the read-only mount.
+    const { cron_table_path: _written, ...withoutKey } = config
+    expect(loadInContainer(withoutKey).cron_table_path).toBe(`${CONTAINER_CREDENTIALS_DIR}/crontab`)
   })
 
   test("D's entry for Check 25 loads beside them", () => {

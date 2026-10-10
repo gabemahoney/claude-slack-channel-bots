@@ -181,8 +181,11 @@ export function makePersonaConfigInput(
 
 /**
  * A resolved configuration, as `loadPersonaConfig` returns it for
- * `makePersonaConfigInput(…, baseDir)` written into `baseDir`, except that
- * `mcp_config_path` also sits under `baseDir` rather than a home directory.
+ * `makePersonaConfigInput(…, baseDir)` written into `baseDir` with
+ * `SLACK_STATE_DIR` set (as the preload guard sets it, so `cron_table_path`
+ * defaults beside the config, not under `$XDG_CONFIG_HOME/cscb`, bug b.avm),
+ * except that `mcp_config_path` also sits under `baseDir` rather than a home
+ * directory.
  * `allow_invited_channels` resolves to `false` unless overridden; the default
  * persona's `fungible_destination` and `sections` are filled for the mode the
  * resolved switch picks, as the loader fills them.
@@ -216,6 +219,8 @@ export function makePersonaConfig(overrides: Partial<PersonaConfig> = {}, baseDi
     agent_director_poll_interval_ms: DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS,
     agent_director_call_timeout_ms: DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
     cron_table_path: join(baseDir, 'crontab'),
+    // As the loader sets it (bug b.avm): true unless cron_table_path was written.
+    cron_table_path_defaulted: overrides.cron_table_path === undefined,
     cron_log_path: join(baseDir, 'cron.log'),
     reply_chunk_limit: DEFAULT_REPLY_CHUNK_LIMIT,
     reply_chunk_mode: DEFAULT_REPLY_CHUNK_MODE,
