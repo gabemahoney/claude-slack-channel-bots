@@ -14,6 +14,12 @@
  *   - SR-7.4's outside-prefix arm emits the same report and still exits 72.
  *   - SR-7.4b closes the fresh-prefix trust gap (AC-7), non-fatally.
  *
+ * Bug b.42j: SR-7.0's warning said SR-7.4 "will fail the release". SR-7.4 runs
+ * after the release has published, so the warning now says SR-7.4 will exit 72
+ * AFTER the release has published and that the fix is to remove the shadowing
+ * copy, and the cases below run SR-7.0 and then SR-7.4 on the same layout to
+ * check the warning against what SR-7.4 does.
+ *
  * Tests follow the extraction pattern of publish-promote-sr61-poll-window.test.ts
  * and publish-promote-bun-g-cwd.test.ts: the load-bearing blocks are lifted
  * VERBATIM from the script at test time (so they cannot drift) and spliced into
@@ -40,6 +46,7 @@ import {
   mkdirSync,
   rmSync,
   readdirSync,
+  realpathSync,
   symlinkSync,
   chmodSync,
 } from 'node:fs'
@@ -121,6 +128,8 @@ function extractSection(script: string, startMatch: RegExp, boundaryMatch: RegEx
 
 let HELPERS: string
 let SR70: string
+/** SR-7.4 from its banner through the outside-prefix arm: the PATH lookup, `readlink -f` and the arm. */
+let SR74: string
 let SR74_ARM: string
 let SR74B: string
 
@@ -128,11 +137,14 @@ beforeAll(() => {
   const script = readPromote()
   HELPERS = extractSection(script, /^# Phase 7 prefix resolution/, /^# SR-7\.0 — /)
   SR70 = extractSection(script, /^# SR-7\.0 — /, /^# SR-7\.2 — /)
+  SR74 = extractSection(script, /^# SR-7\.4 — /, /^INSTALLED_PKG_JSON=/)
   SR74_ARM = extractSection(script, /^case "\$\{RESOLVED_BIN\}" in/, /^INSTALLED_PKG_JSON=/)
   SR74B = extractSection(script, /^# SR-7\.4b — /, /^# SR-7\.5 — /)
   // Sanity: we captured the pieces under test, not empty slices.
   expect(HELPERS).toContain('cscb_shadow_report()')
   expect(SR70).toContain('cscb_is_outside_prefix')
+  expect(SR74).toContain('command -v claude-slack-channel-bots')
+  expect(SR74).toContain(SR74_ARM)
   expect(SR74_ARM).toContain('sr_exit 72')
   expect(SR74B).toContain('trustedDependencies')
 })
@@ -526,6 +538,93 @@ describe('b.r6x: SR-7.4 outside-prefix arm reports the shadow and still exits 72
     expect(r.code).toBe(0)
     expect(r.stderr).toBe('')
   })
+})
+
+// ---------------------------------------------------------------------------
+// SR-7.0's warning states what SR-7.4 then does (b.42j)
+// ---------------------------------------------------------------------------
+//
+// Each row runs SR-7.0 on the layout as promote finds it, makes the change the
+// SR-7.2 / SR-7.3 install makes to the canonical prefix, then runs SR-7.4 from
+// its PATH lookup on the same tree, so the warning is checked against what
+// SR-7.4 really does. The warning is the same in both rows, and conditional:
+// the farm in the canonical prefix's own bin is replaced by the install, so
+// SR-7.4 passes there.
+
+interface WarningLayout {
+  layout: string
+  /** Builds the tree promote finds; returns its PATH dirs and the install's change to it. */
+  build: (home: string) => { pathDirs: string[]; install: () => void }
+  sr74Exit: number
+}
+
+const WARNING_LAYOUTS: WarningLayout[] = [
+  {
+    layout: 'a second bun prefix behind a ~/.local/bin shim (b.r6x)',
+    build: (home) => {
+      makePrefixInstall(join(home, '.bun'))
+      link(join(home, '.local/bin', PKG), makePrefixInstall(join(home, '.cache/.bun')))
+      // The canonical prefix already holds the install; SR-7.2 never touches the shim.
+      return { pathDirs: [join(home, '.local/bin'), join(home, '.bun/bin')], install: () => {} }
+    },
+    sr74Exit: 72,
+  },
+  {
+    layout: "an install-local.sh farm in the canonical prefix's own bin",
+    build: (home) => {
+      mkdirSync(join(home, '.bun/install/global'), { recursive: true })
+      const bin = join(home, '.bun/bin', PKG)
+      link(bin, makeRepoCli(home))
+      return {
+        pathDirs: [join(home, '.bun/bin')],
+        install: () => {
+          rmSync(bin)
+          makePrefixInstall(join(home, '.bun'))
+        },
+      }
+    },
+    sr74Exit: 0,
+  },
+]
+
+describe('b.42j: the SR-7.0 warning states what SR-7.4 then does', () => {
+  test.each(WARNING_LAYOUTS)(
+    '$layout: the warning says SR-7.4 exits 72 after the release has published and the fix is to remove the shadowing copy, and SR-7.4 then exits $sr74Exit',
+    ({ build, sr74Exit }) => {
+      // Real path: SR-7.4's arm compares `readlink -f` output with GLOBAL_DIR as written.
+      const home = realpathSync(makeHome())
+      const { pathDirs, install } = build(home)
+
+      const sr70 = runSr70(home, { pathDirs })
+      expect(sr70.code).toBe(0)
+      const warning = sr70.stderr
+        .split('\n')
+        .find((l) => l.startsWith('SR-7.0 (pre-install shadow check): WARNING'))
+      expect(warning).toContain('SR-7.4 below will exit 72')
+      expect(warning).toContain('AFTER the release has published')
+      expect(warning).not.toContain('fail the release')
+      expect(warning).toContain('If this copy is still what resolves on PATH after that install')
+      expect(warning).toContain('remove the shadowing copy')
+
+      install()
+      const sr74 = runBash(
+        [
+          'set -euo pipefail',
+          'sr_exit() { exit "$1"; }',
+          'NEXT_VERSION=9.9.9',
+          `MANIFEST=${JSON.stringify(join(home, '.publish-state.json'))}`,
+          HELPERS,
+          SR74,
+          'exit 0',
+        ].join('\n'),
+        home,
+        { tools: SHADOW_TOOLS, pathDirs },
+      )
+      expect(sr74.code).toBe(sr74Exit)
+      // Exit 72 comes with SR-7.4's own statement that the release is out, as the warning said.
+      expect(sr74.stderr.includes('the release IS published')).toBe(sr74Exit === 72)
+    },
+  )
 })
 
 // ---------------------------------------------------------------------------

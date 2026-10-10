@@ -82,6 +82,8 @@ Prepare-phase exit codes (script: `scripts/publish-prepare.sh`):
 | 31   | SR-5.1 | `git tag` failed | commit IS on local `main`, NOT pushed; operator: `git reset --hard HEAD~1` then rerun /publish |
 | 90   | SR-8.1 | `.publish-state.json` write failed | commit + tag + tarball exist locally; operator: roll back per stderr prose, then rerun /publish |
 
+SR-3.2 (rollback) has no exit code of its own. On the 20, 21, 22, 23 and 30 failures (and any other non-zero exit from `smoke-check.sh`), prepare runs `git checkout -- package.json bun.lock CHANGELOG.md` before it exits. That restores the three files from the index: HEAD's copies, except after a failed `git commit` (30), where `git add` has already staged the bump and the checkout changes nothing. It never runs on a preflight code, 31 or 90. If the checkout itself fails, stderr carries an `SR-3.2 (rollback)` line after the failing step's own diagnostic, and the exit code is still the failing step's: the working tree may still hold the bumped version or the rewritten `CHANGELOG.md` heading, even though the step's own line says it was rolled back. Recovery owner is the operator: run `git status`, then `git checkout -- package.json bun.lock CHANGELOG.md` by hand, then follow the failing step's row above. The LLM relays both lines verbatim and stops; it runs neither command.
+
 Promote-phase exit codes (script: `scripts/publish-promote.sh`):
 
 | Code | SR | Failure | Recovery owner |
@@ -92,6 +94,7 @@ Promote-phase exit codes (script: `scripts/publish-promote.sh`):
 | 51   | SR-5.3 | `npm publish` failed, OR version exists on npm with mismatched dist.shasum | commit IS on origin/main; manifest preserved; operator fixes and reruns /publish promote, OR follows content-drift recovery in stderr |
 | 52   | SR-5.4 | `git push origin <tag>` failed | npm has release; only tag missing; operator pushes tag manually + deletes manifest. Do NOT rerun /publish promote unless tag still confirmed missing. |
 | 60   | SR-6.1 | registry did not surface new version within 10 minutes | release succeeded; propagation lag; operator confirms + reinstalls manually + deletes manifest. Do NOT rerun /publish promote. |
+| 70   | SR-7.1 | `scripts/sanitize-global.sh` exited non-zero (belt-and-suspenders — sanitize itself also enforces exit 0 always) | release IS published; local global `package.json` may still contain bun-1.3.13 poison; manifest preserved; operator inspects `${BUN_INSTALL:-$HOME/.bun}/install/global/package.json`, removes empty-string and pre-existing `claude-slack-channel-bots` entries manually, then reruns `bun install -g` + `clean_restart`, then deletes the manifest. Do NOT rerun /publish promote. |
 | 71   | SR-7.3 | post-publish `bun install -g` failed | release IS published; manifest preserved; operator reruns install manually + deletes manifest. Do NOT rerun /publish promote. |
 | 72   | SR-7.4 | post-publish verification failed | release IS published; manifest preserved; operator follows stderr recovery. Do NOT rerun /publish promote. |
 
@@ -103,7 +106,7 @@ Any script — backstop:
 |------|----|---------|----------------|
 | any (inherited from the failing command) | SR-99.0 (uncaught) | script died at an **unguarded** site — a `set -e` failure with no SR wrapper — so no per-step SR-X.Y diagnostic was printed. State indeterminate; report and pause. | operator: report the SR-99.0 trap output verbatim so the unguarded site can be wrapped; do NOT rerun /publish |
 
-SR-99.0 is a backstop, not an exit code of its own: the EXIT trap keeps whatever code the failing command produced and only fires when the exit did *not* come from a guarded SR path. Each script raises a one-way flag (`sr_exit`) immediately before every deliberate `exit`, so a guarded failure prints exactly one SR-X.Y block. **SR-99.0 and a per-step SR-X.Y diagnostic never appear together** — if you see SR-99.0, the site genuinely had no wrapper.
+SR-99.0 is a backstop, not an exit code of its own: the EXIT trap keeps whatever code the failing command produced and only fires when the exit did *not* come from a guarded SR path. Each script raises a one-way flag (`sr_exit`) immediately before every deliberate `exit`, so a guarded failure prints exactly one SR-X.Y block (a failed SR-3.2 rollback is a second failure, with its own block after the failing step's). **SR-99.0 and a per-step SR-X.Y diagnostic never appear together** — if you see SR-99.0, the site genuinely had no wrapper.
 
 The LLM's response on any non-zero exit is the same: relay the script's stderr verbatim, identify the recovery owner from the table above, and stop. The LLM is never the recovery owner.
 
