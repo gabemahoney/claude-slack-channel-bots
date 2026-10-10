@@ -493,12 +493,22 @@ export function hostSafeChildEnv(home: string, options: HostSafeChildEnvOptions 
 // ---------------------------------------------------------------------------
 
 /** The variables the preload guard sets or unsets, and nothing else. */
-export const PRELOAD_ENV_NAMES = Object.freeze(['HOME', 'PATH', 'TMUX', 'TMUX_PANE', 'TMUX_TMPDIR', 'SLACK_STATE_DIR', 'CLAUDE_CONFIG_DIR'] as const)
+export const PRELOAD_ENV_NAMES = Object.freeze(['HOME', 'PATH', 'TMUX', 'TMUX_PANE', 'TMUX_TMPDIR', 'SLACK_STATE_DIR', 'CLAUDE_CONFIG_DIR', 'XDG_CONFIG_HOME'] as const)
 
 export type PreloadEnvName = (typeof PRELOAD_ENV_NAMES)[number]
 
 /** Where the preload guard points `SLACK_STATE_DIR`, relative to the new HOME: the server's default state directory. */
 export const PRELOAD_STATE_DIR_PATH = join('.claude', 'channels', 'slack')
+
+/**
+ * The XDG configuration directory under a home, relative to it: where
+ * `XDG_CONFIG_HOME` points by default, and where the preload guard points it
+ * under the new HOME. `src/` puts the crontable's default under it (bug b.avm).
+ */
+export const XDG_CONFIG_DIR = '.config'
+
+/** CSCB's directory under the XDG configuration directory, relative to a home: the crontable's default directory (bug b.avm). */
+export const CSCB_XDG_CONFIG_PATH = join(XDG_CONFIG_DIR, 'cscb')
 
 /** The preload guard's variables; a missing name is unset. */
 export type PreloadEnv = { [Name in PreloadEnvName]?: string }
@@ -522,7 +532,12 @@ export type PreloadEnvSource = Readonly<PreloadEnv> | Readonly<NodeJS.ProcessEnv
  * - `TMUX_TMPDIR`: `tmuxTmpDir`;
  * - `SLACK_STATE_DIR`: `<home>/PRELOAD_STATE_DIR_PATH`
  *   (`<home>/.claude/channels/slack`), the server's default state directory
- *   under the new HOME.
+ *   under the new HOME;
+ * - `XDG_CONFIG_HOME`: `<home>/XDG_CONFIG_DIR` (`<home>/.config`). An
+ *   inherited one (the operator's own `~/.config`, say) would put the
+ *   crontable's default (`$XDG_CONFIG_HOME/cscb/crontab` with
+ *   `SLACK_STATE_DIR` unset, bug b.avm) in the real home; unset, it would
+ *   fall back to the launch-time home.
  * `TMUX`, `TMUX_PANE` and `CLAUDE_CONFIG_DIR` are absent (unset):
  * `CLAUDE_CONFIG_DIR` names a Claude configuration directory (a run started
  * from a bot's session can inherit its persona's), and Claude Code, a hook
@@ -536,6 +551,7 @@ export function preloadRedirectedEnv(inherited: PreloadEnvSource, home: string, 
     PATH: dirs.length === 0 ? EMPTY_CHILD_PATH : dirs.join(delimiter),
     TMUX_TMPDIR: tmuxTmpDir,
     SLACK_STATE_DIR: join(home, PRELOAD_STATE_DIR_PATH),
+    XDG_CONFIG_HOME: join(home, XDG_CONFIG_DIR),
   }
 }
 
@@ -556,6 +572,8 @@ export const PRELOAD_CHECK = Object.freeze({
   tmuxTmpDirNotProcess: 'tmux-tmpdir-not-process',
   stateDirUnset: 'state-dir-unset',
   stateDirNotUnderHome: 'state-dir-not-under-home',
+  xdgConfigHomeUnset: 'xdg-config-home-unset',
+  xdgConfigHomeNotUnderHome: 'xdg-config-home-not-under-home',
 } as const)
 
 export type PreloadCheckFailure = (typeof PRELOAD_CHECK)[keyof typeof PRELOAD_CHECK]
@@ -574,7 +592,10 @@ export type PreloadCheckFailure = (typeof PRELOAD_CHECK)[keyof typeof PRELOAD_CH
  * (`childTmuxTmpDir()`). `SLACK_STATE_DIR` must be set and non-empty (unset,
  * the state-directory resolvers fall back to the launch-time home) and the
  * directory it names (made absolute, as the resolvers do) must lie strictly
- * under HOME. Only `lstat`s (none under the real home: a HOME that is or lies
+ * under HOME. `XDG_CONFIG_HOME` must be set and non-empty (unset, the
+ * crontable's default falls back to the launch-time home) and an absolute
+ * path strictly under HOME (`src/` ignores a relative one, falling back the
+ * same way). Only `lstat`s (none under the real home: a HOME that is or lies
  * under it fails before any): it starts no process.
  */
 export function preloadCheckFailures(env: PreloadEnvSource): PreloadCheckFailure[] {
@@ -621,6 +642,14 @@ export function preloadCheckFailures(env: PreloadEnvSource): PreloadCheckFailure
       failures.push(PRELOAD_CHECK.stateDirNotUnderHome)
     }
   }
+  const xdgConfigHome = env.XDG_CONFIG_HOME
+  if (xdgConfigHome === undefined || xdgConfigHome === '') failures.push(PRELOAD_CHECK.xdgConfigHomeUnset)
+  else {
+    const resolved = resolve(xdgConfigHome)
+    if (!isAbsolute(xdgConfigHome) || home === undefined || !isAbsolute(home) || resolved === resolve(home) || !isUnder(resolved, resolve(home))) {
+      failures.push(PRELOAD_CHECK.xdgConfigHomeNotUnderHome)
+    }
+  }
   return failures
 }
 
@@ -648,7 +677,11 @@ export const CLAUDE_DIR = '.claude'
  *   `mcp_config_path`;
  * - `.agent-director` and, under it, `state.db` (the start gate's same-user
  *   probe and the client's store), `config.toml` (agent-director's settings
- *   file) and `bin/agent-director` (`AGENT_DIRECTOR_INSTALL_PATH`).
+ *   file) and `bin/agent-director` (`AGENT_DIRECTOR_INSTALL_PATH`);
+ * - `.config` (`resolveXdgConfigHome` with `XDG_CONFIG_HOME` unset or
+ *   relative) and, under it, `cscb` and `cscb/crontab`: the crontable's
+ *   default with `SLACK_STATE_DIR` unset, whose directory the start creates
+ *   and into which it moves a crontable left at the old default (bug b.avm).
  */
 export const LAUNCH_HOME_DERIVED_PATHS: readonly string[] = Object.freeze([
   CLAUDE_DIR,
@@ -660,6 +693,9 @@ export const LAUNCH_HOME_DERIVED_PATHS: readonly string[] = Object.freeze([
   join(AGENT_DIRECTOR_INSTALL_DIR, 'state.db'),
   join(AGENT_DIRECTOR_INSTALL_DIR, 'config.toml'),
   AGENT_DIRECTOR_INSTALL_PATH,
+  XDG_CONFIG_DIR,
+  CSCB_XDG_CONFIG_PATH,
+  join(CSCB_XDG_CONFIG_PATH, 'crontab'),
 ])
 
 /** Why the preload guard refuses to start (`launchHomeRefusal`). */

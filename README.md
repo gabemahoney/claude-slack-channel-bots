@@ -166,7 +166,8 @@ Runtime options are read from environment variables. None of them is required. S
 
 | Variable | Description |
 |---|---|
-| `SLACK_STATE_DIR` | Override the directory where `config.json` and runtime state are stored. Defaults to `~/.claude/channels/slack`. |
+| `SLACK_STATE_DIR` | Override the directory where `config.json` and runtime state are stored. Defaults to `~/.claude/channels/slack`. When it is set, the crontable's default moves there too (see `cron_table_path` under [Server-wide settings](#server-wide-settings)). |
+| `XDG_CONFIG_HOME` | The standard XDG configuration directory. With `SLACK_STATE_DIR` unset and `XDG_CONFIG_HOME` an absolute path, the crontable defaults to `$XDG_CONFIG_HOME/cscb/crontab` instead of `~/.config/cscb/crontab`. An empty or relative value is ignored. |
 | `SLACK_DRY_RUN` | Set to `1` (or `true` / `yes`) to start the server without Slack. No credentials file is read and no Slack call is made. Each persona runs with a placeholder identity (`U000DRY_<key>`), and MCP tool calls (`reply`, `react`, etc.) and server notices are logged instead of sent. Useful for integration testing. |
 | `CSCB_LOG_MAX_BYTES` | Rotate `server.log` / `clean_restart.log` when the active file reaches this many bytes. Defaults to `10485760` (10 MiB). Values `<= 0` or non-numeric are ignored. |
 | `CSCB_LOG_KEEP` | Number of rotated generations to retain (`server.log.1` … `server.log.N`). Defaults to `5`. Set to `0` to keep none (the log is truncated instead of rolled). Values `< 0` or non-numeric are ignored. |
@@ -449,8 +450,8 @@ These top-level fields apply to the whole server. A confirmed change to one take
 | `agent_director_poll_interval_ms` | number | `1000` | Poll interval (ms) for the agent-director permission relay tick. Must be a positive integer in `[200, 3_600_000]`. Replaces the pre-rename `claude_director_poll_interval_ms` — the old name is rejected at startup. |
 | `agent_director_call_timeout_ms` | number | `60000` | How long (ms) CSCB waits on each agent-director call it makes for its personas, in the server and in `stop --stop-bots` and `clean_restart`. Must be an integer in `[1000, 3_600_000]`; out-of-range values are rejected at load. It should be greater than the need that agent-director's timing settings give; see [Sizing the agent-director call timeout](#sizing-the-agent-director-call-timeout). |
 | `stop_hook_bootstrap` | boolean | `true` | Default for every persona: whether the persona gets the Slack Reply Guard reminder (see [Slack Reply Guard (Stop hook)](#slack-reply-guard-stop-hook)). The value applies per persona, from the persona's first launch after the change is applied (see [Reload](#reload)). A persona's own `stop_hook_bootstrap` overrides this value. Non-boolean values are rejected at startup. |
-| `cron_table_path` | string | `<config dir>/crontab` | Path to the crontable for the built-in cron scheduler (`cscb_cron`). Defaults to `crontab` in the directory of the loaded `config.json`. `~` is expanded like other path keys. The resolved path is exported into every managed session as `CSCB_CRONTABLE_PATH` so bots can find the crontable and self-schedule (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)). Must be a non-empty string when set. |
-| `cron_log_path` | string | `<config dir>/cron.log` | Path to the `cscb_cron` log file. Defaults to `cron.log` in the directory of the loaded `config.json`. `~` is expanded like other path keys. Must be a non-empty string when set. |
+| `cron_table_path` | string | `~/.config/cscb/crontab` | Path to the crontable for the built-in cron scheduler (`cscb_cron`). When absent, it is `~/.config/cscb/crontab` (`$XDG_CONFIG_HOME/cscb/crontab` when `XDG_CONFIG_HOME` is an absolute path), outside `~/.claude`, so a bot's edit is not a write under `~/.claude`, which Claude Code asks the user to approve. With `SLACK_STATE_DIR` set, the default is `crontab` in the directory of the loaded `config.json` instead. A path you set is used as written, with `~` expanded like other path keys, even when it names `~/.config/cscb/crontab`: the server never creates its directory or moves a crontable to it. The resolved path is exported into every managed session as `CSCB_CRONTABLE_PATH` so bots can find the crontable and self-schedule (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)). Must be a non-empty string when set. |
+| `cron_log_path` | string | `<config dir>/cron.log` | Path to the `cscb_cron` log file. Defaults to `cron.log` in the directory of the loaded `config.json`, wherever the crontable is. `~` is expanded like other path keys. Must be a non-empty string when set. |
 | `cron_log_max_bytes` | number | — | Size cap in bytes for the cron log. Must be a positive integer when set. Cron-log pruning is disabled when absent. |
 | `ack_reaction` | string | — | Emoji name, without colons (for example `"eyes"`), of the acknowledgement reaction. When set, each persona a message is dispatched to adds the reaction under its own Slack identity once the message has reached its instance, not on receipt, so a message that reaches several personas carries one reaction per persona. A message that isn't dispatched gets no reaction: one lost because the persona's instance is down, or one the persona doesn't receive. Messages sent through `/interject` or cron aren't Slack messages and get none either. A persona's first `reply` in that conversation carrying the message's `message_id` removes that persona's reaction only; other personas' reactions stay until they reply. Absent means no acknowledgement. Must be non-empty when set. |
 | `reply_chunk_limit` | number | `4000` | Maximum characters per posted message: the `reply` tool splits longer text into several messages. Must be a positive integer. |
@@ -1291,11 +1292,17 @@ The server fires scheduled prompts into personas once per minute, reading them f
 
 ### The crontable
 
-Schedules live in the crontable file at `cron_table_path` (default `<config dir>/crontab`, where `<config dir>` is the directory of your loaded `config.json`; override it with the `cron_table_path` key in `config.json`). The server creates the file on first boot if it is absent, with a self-documenting comment header describing the line format. See [Crontable format](#crontable-format) below for the full reference. With the default config location the crontable is at `~/.claude/channels/slack/crontab`:
+Schedules live in the crontable file at `cron_table_path`. Without that key the crontable is at `~/.config/cscb/crontab` (`$XDG_CONFIG_HOME/cscb/crontab` when `XDG_CONFIG_HOME` is an absolute path), outside `~/.claude`, so a bot appending a schedule doesn't trigger Claude Code's approval prompt for writes under `~/.claude`. With `SLACK_STATE_DIR` set, the default is `crontab` beside `config.json` in that directory. Set `cron_table_path` in `config.json` to put it anywhere else (see [Server-wide settings](#server-wide-settings)).
 
 ```sh
-cat ~/.claude/channels/slack/crontab
+cat ~/.config/cscb/crontab
 ```
+
+At start the server creates the default crontable's directory. It creates the file on first boot if it is absent, with a self-documenting comment header describing the line format. See [Crontable format](#crontable-format) below for the full reference. For a `cron_table_path` you set, the directory must already exist.
+
+If the server starts with the default and finds a crontable at `crontab` beside `config.json` (`~/.claude/channels/slack/crontab`), it moves that file to the default location, its lines unchanged. It leaves a symbolic link to the new file at the old path, so a resumed session whose `CSCB_CRONTABLE_PATH` still names the old path appends to the same file. A `prompts/` directory beside the old crontable moves with it and leaves a link at its old name, so relative prompt paths keep naming the same files.
+
+If both paths hold a crontable, the server uses the one at the default location and logs a warning. Nothing is moved when `config.json` sets `cron_table_path`, even to `~/.config/cscb/crontab`. The `debug-slack-channel-bots` skill covers each line the move logs.
 
 ### Crontable format
 
@@ -1371,7 +1378,7 @@ An existing crontable also keeps its old comment header, which still tells bots 
 The prompt-file path resolves as follows:
 
 - A leading `~` expands to the home directory.
-- A **relative** path resolves against the **crontable's own directory** — not `$HOME`. This is a deliberate divergence from system cron's convention, so you can keep a `prompts/` directory alongside the crontable and reference it as `prompts/standup.md`.
+- A **relative** path resolves against the **crontable's own directory** — not `$HOME`. This is a deliberate divergence from system cron's convention, so you can keep a `prompts/` directory alongside the crontable and reference it as `prompts/standup.md`. With the default location that directory is `~/.config/cscb/prompts/`.
 - An **absolute** path is used as-is.
 
 ### How fires appear
@@ -1380,7 +1387,7 @@ A scheduled fire reaches only the target persona's instance, as an `/interject` 
 
 ### The cron log
 
-Every fire outcome is recorded in the cron log at `cron_log_path` (default `<config dir>/cron.log`; override with the `cron_log_path` key). Each attempt writes one line per persona targeted (showing the target as first written in the crontable), plus a per-fire summary line carrying `delivered=N failed=M` counts. The log is plain text, so `grep no-session cron.log` yields readable lines.
+Every fire outcome is recorded in the cron log at `cron_log_path` (default `<config dir>/cron.log`, beside `config.json` wherever the crontable is; override with the `cron_log_path` key). Each attempt writes one line per persona targeted (showing the target as first written in the crontable), plus a per-fire summary line carrying `delivered=N failed=M` counts. The log is plain text, so `grep no-session cron.log` yields readable lines.
 
 The `outcome` field of each line is one of these classes:
 

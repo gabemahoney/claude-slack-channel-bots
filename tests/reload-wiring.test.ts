@@ -97,6 +97,7 @@ import {
   atMainTopLevel,
   balancedAfter,
   callsOf,
+  cronTableStartOverride,
   importSource,
   indicesOf,
   insideMain,
@@ -292,20 +293,22 @@ describe('server.ts wires the reload detection tick (b.av2 SR-8.2)', () => {
     const { loaded, assignAt, createAt } = startResolution(SERVER_CODE)
     // The spread is the start-time config: declared once, inside main(),
     // before the controller whose onApplied closes over it (no temporal dead
-    // zone), and assigned once, from the holder, after the start resolution
-    // set it and before detection is armed (the only point after which
-    // onApplied can run).
+    // zone), and assigned from the holder after the start resolution set it,
+    // again only by the start's crontable override (bug b.avm), both before
+    // detection is armed (the only point after which onApplied can run).
     const startTime = startTimeConfig()
     const decls = [...SERVER_CODE.matchAll(new RegExp(`\\b(?:let|const|var)\\s+${startTime}\\b[^\\n]*`, 'g'))]
     expect(decls.map((d) => d[0].trim())).toEqual([`let ${startTime}!: PersonaConfig`])
     expect(insideMain(SERVER_CODE, decls[0]!.index!)).toBe(true)
     expect(decls[0]!.index!).toBeLessThan(createAt)
     const assignments = [...SERVER_CODE.matchAll(new RegExp(`(?<![\\w.$])${startTime}\\s*=(?![=>])\\s*([^\\n;]*)`, 'g'))]
-    expect(assignments.map((a) => a[1]!.trim())).toEqual([loaded])
+    expect(assignments.map((a) => a[1]!.trim())).toEqual([loaded, loaded])
+    const override = cronTableStartOverride(SERVER_CODE)
+    expect([override.startTime, assignments[1]!.index!]).toEqual([startTime, override.startTimeAt])
     const at = assignments[0]!.index!
     expect(insideMain(SERVER_CODE, at)).toBe(true)
     expect(at).toBeGreaterThan(assignAt)
-    expect(at).toBeLessThan(onlyMethodCall('startDetection').at)
+    for (const { index } of assignments) expect(index!).toBeLessThan(onlyMethodCall('startDetection').at)
     // The swap is reload.ts's configInEffect (tested as a pure function
     // below), not a local stand-in of the same name.
     expect(importSource(SERVER_CODE, 'configInEffect')).toBe('./reload.ts')
@@ -1027,6 +1030,7 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
         reply_chunk_limit: 1000,
         reply_chunk_mode: 'length',
         [MODE_SWITCH_SETTING]: true,
+        cron_table_path_defaulted: false,
       },
       '/applied-base',
     )
@@ -1056,16 +1060,30 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
     expect(inEffect).not.toBe(applied)
   })
 
-  test('the applied config holder is written only by the start and by onApplied\'s configInEffect, and nothing reads the reload controller\'s own applied config', () => {
+  test('the applied config holder is written only by the start (its crontable override included, bug b.avm) and by onApplied\'s configInEffect, and nothing reads the reload controller\'s own applied config or writes into it', () => {
     const { loaded, outcome, assignAt } = startResolution(SERVER_CODE)
     const writes = [...SERVER_CODE.matchAll(new RegExp(`(?<![\\w.$])${loaded}\\s*(?:[-+*/|&?]{1,2})?=(?![=>])\\s*([^\\n;]*)`, 'g'))]
     const startTime = startTimeConfig()
     const param = (controllerProps().get('onApplied') ?? '').match(/^\(?\s*(\w+)/)![1]!
-    expect(writes.map((w) => w[1]!.trim()).sort()).toEqual([`${outcome}.config`, `configInEffect(${startTime}, ${param})`].sort())
+    const override = cronTableStartOverride(SERVER_CODE)
+    // The override copies the start's config with only the crontable the start runs on replaced.
+    const overrideValue = `{ ...${loaded}, cron_table_path: ${override.path} }`
+    expect(writes.map((w) => w[1]!.trim()).sort()).toEqual([`${outcome}.config`, `configInEffect(${startTime}, ${param})`, overrideValue].sort())
     expect(writes.find((w) => w[1]!.trim() === `${outcome}.config`)!.index).toBe(assignAt)
+    expect(writes.find((w) => w[1]!.trim() === overrideValue)!.index).toBe(override.loadedAt)
     // The controller's applied() carries a confirmed change's server-wide
     // values; a consumer bound to it would apply them at once.
     expect(indicesOf(/\.\s*applied\s*\(/g, SERVER_CODE)).toEqual([])
+    // Bug b.avm: the start's config is the controller's own object until a
+    // whole-value write replaces the holder, so a member write through it (the
+    // crontable fallback set in place, say) would change the config detection
+    // compares config.json with, and the fallback alone would be a pending change.
+    const members = '(?:\\s*!?\\.\\s*[\\w$]+|\\s*\\[[^\\]]*\\])+'
+    for (const config of [loaded, startTime, `${outcome}\\s*\\.\\s*config`]) {
+      const memberWrite = `(?<![\\w.$])${config}${members}\\s*(?:\\*\\*|<<|>>>?|&&|\\|\\||\\?\\?|[-+*/%&|^])?=(?![=>])`
+      const mutation = `\\bObject\\s*\\.\\s*(?:assign|defineProperty|defineProperties)\\s*\\(\\s*${config}\\s*[,)]|\\bdelete\\s+${config}\\b`
+      expect([config, indicesOf(new RegExp(`${memberWrite}|${mutation}`, 'g'), SERVER_CODE)]).toEqual([config, []])
+    }
   })
 
   // E13 carry: the ack reaction and the reply chunking must not follow a

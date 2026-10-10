@@ -1768,7 +1768,7 @@ against it in `tests/ci-live-checks.test.ts`.
 |---|---|
 | Provisioning | A result row of its own (the stages above) |
 | Pre-flight, Part 1.4 install | Automated in the container. The install is `bun install -g --ignore-scripts` of the tarball, then `bun pm -g trust`; then `ad-client-check.sh --package "$PKG"` checks the agent-director client the installed package resolves, changing nothing (see [The client under test](#the-client-under-test)), before the package checksums Check S2 compares against |
-| Part 1.5 setup | The runner writes `config.json` and the system prompt as the wizard's answers would (a deviation noted in the results) |
+| Part 1.5 setup | The runner writes `config.json` and the system prompt as the wizard's answers would (a deviation noted in the results). `config.json` also sets `cron_table_path` to `/home/testuser/.claude/channels/slack/crontab`, in the state directory (`CONTAINER_CRON_TABLE_PATH` in `ci-live/lib/live-config.ts`), which the wizard leaves out: the default, `~/.config/cscb/crontab`, lies in the read-only credentials mount, where the scheduler could not create it. A path set in `config.json` is used as written, so the server moves nothing at start |
 | S1 | `SKIPPED (manual only: the wizard chat)` |
 | S2, S3 | Automated, also in a dry run |
 | 1 to 6, 8 to 11, 13 | Automated |

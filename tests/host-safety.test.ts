@@ -93,8 +93,8 @@
  *   on dirty inherited environments (a `PATH` directory holding an
  *   `agent-director` file or dangling symlink, duplicate, empty, relative and
  *   `.` entries, `TMUX` / `TMUX_PANE` / `CLAUDE_CONFIG_DIR` set, a foreign
- *   `TMUX_TMPDIR`, a stray `SLACK_STATE_DIR` or HOME), each output asserted
- *   exactly and passing the check.
+ *   `TMUX_TMPDIR`, a stray `SLACK_STATE_DIR`, `XDG_CONFIG_HOME` or HOME),
+ *   each output asserted exactly and passing the check.
  * - A non-normalized `TMPDIR` (`/tmp//`, `/tmp/.`, `/tmp/../tmp`), in a
  *   `bun` child started with it: `osTempDir()` normalizes it, and
  *   `TMUX_TMPDIR` reuse, the check and the redirect still hold.
@@ -158,6 +158,7 @@ import {
   type PreloadCheckFailure,
   type PreloadEnv,
   RESERVED_CHILD_ENV_NAMES,
+  XDG_CONFIG_DIR,
   childTmuxTmpDir,
   hostSafeChildEnv,
   inheritedChildTmuxTmpDir,
@@ -3083,10 +3084,11 @@ function preloadTempHome(): string {
 /**
  * An environment the check passes, as the preload builds it: a new prefixed
  * HOME, a clean absolute PATH, no TMUX / TMUX_PANE, this process's
- * `TMUX_TMPDIR` and a state directory under the new HOME.
+ * `TMUX_TMPDIR`, and a state directory and an XDG configuration directory
+ * under the new HOME.
  */
 function preloadEnv(home: string = preloadTempHome()): PreloadEnv {
-  return { HOME: home, PATH: dirUnder('bin'), TMUX_TMPDIR: childTmuxTmpDir(), SLACK_STATE_DIR: join(home, 'state') }
+  return { HOME: home, PATH: dirUnder('bin'), TMUX_TMPDIR: childTmuxTmpDir(), SLACK_STATE_DIR: join(home, 'state'), XDG_CONFIG_HOME: join(home, 'xdg') }
 }
 
 describe('preload check', () => {
@@ -3172,6 +3174,19 @@ describe('preload check', () => {
       return { ...preloadEnv(home), SLACK_STATE_DIR: `${home}-state` }
     }],
     ['SLACK_STATE_DIR is relative', PRELOAD_CHECK.stateDirNotUnderHome, () => ({ ...preloadEnv(), SLACK_STATE_DIR: 'state' })],
+    ['XDG_CONFIG_HOME is unset (the crontable default would fall back to the launch-time home)', PRELOAD_CHECK.xdgConfigHomeUnset, () => preloadEnvWithout('XDG_CONFIG_HOME')],
+    ['XDG_CONFIG_HOME is empty', PRELOAD_CHECK.xdgConfigHomeUnset, () => ({ ...preloadEnv(), XDG_CONFIG_HOME: '' })],
+    ['XDG_CONFIG_HOME is under the home the run started with (an inherited ~/.config)', PRELOAD_CHECK.xdgConfigHomeNotUnderHome, () => ({ ...preloadEnv(), XDG_CONFIG_HOME: join(homedir(), XDG_CONFIG_DIR) })],
+    ['XDG_CONFIG_HOME is outside HOME', PRELOAD_CHECK.xdgConfigHomeNotUnderHome, () => ({ ...preloadEnv(), XDG_CONFIG_HOME: dirUnder('xdg') })],
+    ['XDG_CONFIG_HOME is HOME itself', PRELOAD_CHECK.xdgConfigHomeNotUnderHome, () => {
+      const home = preloadTempHome()
+      return { ...preloadEnv(home), XDG_CONFIG_HOME: home }
+    }],
+    ['XDG_CONFIG_HOME starts with HOME but leaves it through ..', PRELOAD_CHECK.xdgConfigHomeNotUnderHome, () => {
+      const home = preloadTempHome()
+      return { ...preloadEnv(home), XDG_CONFIG_HOME: `${home}${sep}..${sep}xdg` }
+    }],
+    ['XDG_CONFIG_HOME is relative (src/ ignores it and falls back to the launch-time home)', PRELOAD_CHECK.xdgConfigHomeNotUnderHome, () => ({ ...preloadEnv(), XDG_CONFIG_HOME: 'xdg' })],
   ]
 
   test.each(failing)('fails when %s (%s)', (_label, failure, build) => {
@@ -3191,12 +3206,14 @@ describe('preload check', () => {
     expect(preloadCheckFailures({ ...env, PATH: EMPTY_CHILD_PATH })).toEqual([])
     // Any state directory strictly under HOME passes, however deep.
     expect(preloadCheckFailures({ ...env, SLACK_STATE_DIR: join(home, 'a', 'b', 'state') })).toEqual([])
+    // So does any XDG configuration directory strictly under HOME.
+    expect(preloadCheckFailures({ ...env, XDG_CONFIG_HOME: join(home, 'a', 'b', XDG_CONFIG_DIR) })).toEqual([])
   })
 
   test('each clean-environment row fails for its own reason alone', () => {
-    // The TMUX, CLAUDE_CONFIG_DIR, TMUX_TMPDIR and SLACK_STATE_DIR rows start
-    // from preloadEnv(), so each must report exactly its failure and nothing
-    // about HOME or PATH.
+    // The TMUX, CLAUDE_CONFIG_DIR, TMUX_TMPDIR, SLACK_STATE_DIR and
+    // XDG_CONFIG_HOME rows start from preloadEnv(), so each must report
+    // exactly its failure and nothing about HOME or PATH.
     const fromCleanEnv = new Set<PreloadCheckFailure>([
       PRELOAD_CHECK.tmuxSet,
       PRELOAD_CHECK.tmuxPaneSet,
@@ -3205,6 +3222,8 @@ describe('preload check', () => {
       PRELOAD_CHECK.tmuxTmpDirNotProcess,
       PRELOAD_CHECK.stateDirUnset,
       PRELOAD_CHECK.stateDirNotUnderHome,
+      PRELOAD_CHECK.xdgConfigHomeUnset,
+      PRELOAD_CHECK.xdgConfigHomeNotUnderHome,
     ])
     const own = failing.filter(([, failure]) => fromCleanEnv.has(failure))
     expect(new Set(own.map(([, failure]) => failure))).toEqual(fromCleanEnv)
@@ -3285,6 +3304,10 @@ describe('preload redirect (preloadRedirectedEnv)', () => {
       const a = dirUnder('a')
       return { inherited: { PATH: a, SLACK_STATE_DIR: dirUnder('stray-state') }, expectedPath: a }
     }],
+    ['an inherited XDG_CONFIG_HOME is replaced by .config under the new HOME', () => {
+      const a = dirUnder('a')
+      return { inherited: { PATH: a, XDG_CONFIG_HOME: dirUnder('operator-config') }, expectedPath: a }
+    }],
     ['a stray HOME is replaced by the new HOME', () => {
       const a = dirUnder('a')
       return { inherited: { PATH: a, HOME: dirUnder('stray-home') }, expectedPath: a }
@@ -3300,6 +3323,7 @@ describe('preload redirect (preloadRedirectedEnv)', () => {
           TMUX_TMPDIR: dirUnder('foreign-tmux'),
           SLACK_STATE_DIR: dirUnder('stray-state'),
           CLAUDE_CONFIG_DIR: dirUnder('persona-claude'),
+          XDG_CONFIG_HOME: dirUnder('operator-config'),
         },
         expectedPath: path(a, b),
       }
@@ -3319,6 +3343,7 @@ describe('preload redirect (preloadRedirectedEnv)', () => {
       PATH: expectedPath,
       TMUX_TMPDIR: fenced,
       SLACK_STATE_DIR: join(home, PRELOAD_STATE_DIR_PATH),
+      XDG_CONFIG_HOME: join(home, XDG_CONFIG_DIR),
     })
     // What the redirect produces is what the shared check accepts.
     expect(preloadCheckFailures(redirected)).toEqual([])
@@ -3332,6 +3357,7 @@ describe('preload redirect (preloadRedirectedEnv)', () => {
       TMUX_TMPDIR: dirUnder('foreign-tmux'),
       SLACK_STATE_DIR: dirUnder('stray-state'),
       CLAUDE_CONFIG_DIR: dirUnder('persona-claude'),
+      XDG_CONFIG_HOME: dirUnder('operator-config'),
     }
     const inheritedBefore = { ...inherited }
     const processBefore = Object.fromEntries(PRELOAD_ENV_NAMES.map((name) => [name, process.env[name]]))
@@ -3366,7 +3392,7 @@ describe('a non-normalized OS temp directory (TMPDIR)', () => {
     outsideRoot.push(inherited)
     const home = preloadTempHome()
     const bin = dirUnder('bin')
-    const checkEnv = { HOME: home, PATH: bin, SLACK_STATE_DIR: join(home, 'state') }
+    const checkEnv = { HOME: home, PATH: bin, SLACK_STATE_DIR: join(home, 'state'), XDG_CONFIG_HOME: join(home, XDG_CONFIG_DIR) }
     const dirtyEnv = { PATH: ['.', bin, ''].join(delimiter), TMUX: `${join(root, 'tmux-socket')},1,0`, TMUX_PANE: '%0' }
     const script = `
       const { tmpdir } = await import('node:os');
@@ -3410,9 +3436,9 @@ describe('un-injected gate checks (after the preload check)', () => {
     // The gate calls below run only when this passes: with this HOME and PATH
     // the client's discovery finds no candidate, so it throws
     // ErrSystemInstallNotFound before its version probe could start a process.
-    // TMUX, TMUX_PANE, CLAUDE_CONFIG_DIR, TMUX_TMPDIR and SLACK_STATE_DIR are
-    // what the preload set; nothing else in the run pins them.
-    expect(Object.keys(env)).toEqual(['HOME', 'PATH', 'TMUX', 'TMUX_PANE', 'TMUX_TMPDIR', 'SLACK_STATE_DIR', 'CLAUDE_CONFIG_DIR'])
+    // TMUX, TMUX_PANE, CLAUDE_CONFIG_DIR, TMUX_TMPDIR, SLACK_STATE_DIR and
+    // XDG_CONFIG_HOME are what the preload set; nothing else in the run pins them.
+    expect(Object.keys(env)).toEqual(['HOME', 'PATH', 'TMUX', 'TMUX_PANE', 'TMUX_TMPDIR', 'SLACK_STATE_DIR', 'CLAUDE_CONFIG_DIR', 'XDG_CONFIG_HOME'])
     expect(preloadCheckFailures(env)).toEqual([])
 
     const gate = await runStartupGate()

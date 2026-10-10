@@ -899,7 +899,8 @@ import {
   sentinelInMessage,
   writtenFile,
 } from './test-helpers/credentials.ts'
-import { MCP_SERVER_NAME, type Persona, type PersonaConfig, resolveRealPath } from '../src/config.ts'
+import { MCP_SERVER_NAME, legacyCronTablePath, type Persona, type PersonaConfig, resolvePersonaConfig, resolveRealPath } from '../src/config.ts'
+import { configInEffect } from '../src/reload.ts'
 import {
   PERSONA_INSTANCE_ID_PREFIX,
   PROMPT_SUGGESTION_OFF_ENV,
@@ -988,7 +989,7 @@ import {
   STUB_TMUX_SOCKET_PATH,
   withRestoreSentence,
 } from './test-helpers/agent-director-stub.ts'
-import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeMultiPersonaConfig, makePersonaConfigInput, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 import {
   KILL_OUTCOME_KILLED,
   KILL_OUTCOME_NOT_KILLED,
@@ -2236,6 +2237,44 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
       CSCB_CRONTABLE_PATH: '/srv/resolved/absolute/crontable.md',
       CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
     })
+  })
+
+  // Bug b.avm: bots self-schedule by appending to CSCB_CRONTABLE_PATH, so it
+  // must name the default outside ~/.claude (no permission prompt per write).
+  test('a config loaded with no cron_table_path and SLACK_STATE_DIR unset spawns with CSCB_CRONTABLE_PATH the new default, <home>/.config/cscb/crontab', async () => {
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({ spawnCalls })
+    const home = useSpawnHome()
+    const stateDir = fixtureSubdir(join('home', '.claude', 'channels', 'slack'))
+    const cfg = resolvePersonaConfig(makePersonaConfigInput({}, fixtureDir), stateDir, home, { env: {} })
+
+    await spawnForPersona(cfg.personas[0]!, cfg)
+
+    const crontab = spawnCalls[0].extra_env?.['CSCB_CRONTABLE_PATH']
+    expect(crontab).toBe(join(home, '.config', 'cscb', 'crontab'))
+    expect(crontab).toBe(cfg.cron_table_path)
+    expect(crontab!.startsWith(join(home, '.claude'))).toBe(false)
+  })
+
+  // Bug b.avm: a start whose crontable move failed runs on the old path, which
+  // main() sets in its start-time config only (cronTablePathForStart); the
+  // reload controller's applied config keeps the default, as config.json
+  // does. The start pass launches over configInEffect of the two, so its
+  // spawns name the file the scheduler reads, whose schedules are still there.
+  test('after a failed crontable move, the start pass over configInEffect(<start-time>, <controller applied>) spawns with CSCB_CRONTABLE_PATH the legacy path', async () => {
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({ spawnCalls })
+    const home = useSpawnHome()
+    const stateDir = fixtureSubdir(join('home', '.claude', 'channels', 'slack'))
+    const controllerApplied = resolvePersonaConfig(makePersonaConfigInput({}, fixtureDir), stateDir, home, { env: {} })
+    expect(controllerApplied.cron_table_path).toBe(join(home, '.config', 'cscb', 'crontab'))
+    const legacy = legacyCronTablePath(stateDir)
+    const startTime: PersonaConfig = { ...controllerApplied, cron_table_path: legacy }
+
+    await startupSessionManager(configInEffect(startTime, controllerApplied), { concurrency: 1 })
+
+    expect(spawnCalls).toHaveLength(1)
+    expect(spawnCalls[0].extra_env?.['CSCB_CRONTABLE_PATH']).toBe(legacy)
   })
 
   test('extra_env carries the crontable path alongside a per-persona claude_config_dir', async () => {

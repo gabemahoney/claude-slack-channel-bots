@@ -192,8 +192,12 @@ export interface CronDispatcher {
  * chosen so a prompt can colocate with its crontable as `prompts/foo.md` and
  * stay stable regardless of who runs the server or from where. E6's crontable
  * format reference must carry this rationale forward.
+ *
+ * The base is the directory of `cronTablePath` as given, never of its real
+ * path. Exported so the start's crontable migration (`cron-table-migration.ts`,
+ * bug b.avm) checks each moved line with this same rule.
  */
-function resolvePromptPath(promptPath: string, cronTablePath: string): string {
+export function resolvePromptPath(promptPath: string, cronTablePath: string): string {
   const expanded = expandTilde(promptPath)
   if (isAbsolute(expanded)) return expanded
   // `~` already handled above; anything still relative anchors to the

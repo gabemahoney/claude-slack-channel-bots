@@ -13,6 +13,16 @@
  * A pre-existing file (any content, from a human or another bot) is left
  * untouched byte-for-byte; the losing side of a create race swallows EEXIST.
  *
+ * The parent directory is the caller's: for the default location (bug b.avm,
+ * `~/.config/cscb/` unless `XDG_CONFIG_HOME` says otherwise), used when
+ * config.json leaves `cron_table_path` out, the start's
+ * `prepareDefaultCronTable` (cron-table-migration.ts) creates it before the
+ * scheduler starts, and nothing creates the directory of a `cron_table_path`
+ * the operator wrote, even one naming the default's file. That preparation
+ * may also move a crontable left at the old default, by linking and renaming
+ * names (or, across file systems, by an exact copy of its bytes); it never
+ * writes or rewrites a line.
+ *
  * The line format documented in the template header below is the format the
  * pure parser in ./crontable.ts accepts; keep the two in agreement.
  *

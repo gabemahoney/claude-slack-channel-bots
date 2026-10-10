@@ -51,8 +51,9 @@
  * - This run: `launchTimeHomes()` holds `os.homedir()`, and the
  *   `homedir()`-derived defaults in `src/` (the server state directory with
  *   `SLACK_STATE_DIR` unset, the Claude config directory, the default JSONL
- *   transcript root, `~`, the start gate's `state.db` path, agent-director's
- *   store path) resolve under it and outside the account's passwd home (with
+ *   transcript root, `~`, the crontable's default with `SLACK_STATE_DIR` and
+ *   `XDG_CONFIG_HOME` unset, the start gate's `state.db` path,
+ *   agent-director's store path) resolve under it and outside the account's passwd home (with
  *   no passwd entry, strictly under the OS temp directory). This run was
  *   accepted by the guard, so that is where every `homedir()` call in it
  *   lands.
@@ -120,7 +121,7 @@ import { makePersonaConfig } from './test-helpers/persona-config.ts'
 import { treeSnapshot } from './test-helpers/tree-snapshot.ts'
 import { DEFAULT_STORE_PATH } from '../src/agent-director-client.ts'
 import { DEFAULT_STATE_DB_PATH } from '../src/agent-director-startup.ts'
-import { resolveServerStateDir } from '../src/config.ts'
+import { resolveDefaultCronTablePath, resolveServerStateDir } from '../src/config.ts'
 import { resolveJsonlRoots } from '../src/jsonl-persistence-check.ts'
 import { expandTilde, resolveClaudeConfigDir } from '../src/persona-identity.ts'
 
@@ -151,6 +152,9 @@ const LINKABLE_DERIVED_PATHS: string[] = [
   join(AGENT_DIRECTOR_INSTALL_DIR, 'state.db'),
   join(AGENT_DIRECTOR_INSTALL_DIR, 'config.toml'),
   AGENT_DIRECTOR_INSTALL_PATH,
+  '.config',
+  join('.config', 'cscb'),
+  join('.config', 'cscb', 'crontab'),
 ]
 
 let root: string
@@ -713,6 +717,7 @@ describe('this run: launch-time homes and the homedir()-derived defaults', () =>
       return roots[0]!
     }],
     ["expandTilde('~')", () => expandTilde('~')],
+    ['resolveDefaultCronTablePath() with SLACK_STATE_DIR and XDG_CONFIG_HOME unset (the crontable default, bug b.avm)', () => resolveDefaultCronTablePath(resolveServerStateDir(undefined, {}), undefined, {})],
     ['DEFAULT_STATE_DB_PATH (the start gate’s state.db path)', () => DEFAULT_STATE_DB_PATH],
     ['DEFAULT_STORE_PATH expanded', () => expandTilde(DEFAULT_STORE_PATH)],
   ]

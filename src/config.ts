@@ -59,6 +59,21 @@ export const STATE_DIR_ENV = 'SLACK_STATE_DIR'
 /** The configuration file's name inside the state directory (b.av2 SR-1.1). */
 export const CONFIG_FILE_NAME = 'config.json'
 
+/**
+ * The XDG Base Directory variable naming the user's configuration directory
+ * (`~/.config` when unset). The default crontable sits under it (bug b.avm).
+ */
+export const XDG_CONFIG_HOME_ENV = 'XDG_CONFIG_HOME'
+
+/** CSCB's own directory under the XDG configuration directory (bug b.avm). */
+export const CSCB_XDG_DIR_NAME = 'cscb'
+
+/** The crontable's file name, in its default directory and beside `config.json` alike. */
+export const CRON_TABLE_FILE_NAME = 'crontab'
+
+/** The cron log's file name beside `config.json` (`cron_log_path`'s default). */
+export const CRON_LOG_FILE_NAME = 'cron.log'
+
 export const MCP_SERVER_NAME = 'slack-channel-router'
 export const ALLOWED_PRESCRIPTIONS = ['gentle', 'standard', 'aggressive']
 export const ALLOWED_SYSTEM_PROMPT_MODES = ['append', 'none']
@@ -294,9 +309,12 @@ export interface ServerSettingsInput {
   agent_director_call_timeout_ms?: number
   /**
    * Path to the cscb_cron crontable file (b.he5 PD-5). Optional: when omitted,
-   * defaults to `<config dir>/crontab`, where `<config dir>` is the directory
-   * of the config file actually loaded. `~` is expanded and the path resolved
-   * to absolute. Config carries only this pointer, never schedules.
+   * defaults to `resolveDefaultCronTablePath` (bug b.avm): with
+   * `SLACK_STATE_DIR` unset, `$XDG_CONFIG_HOME/cscb/crontab`
+   * (`~/.config/cscb/crontab`), outside `~/.claude`; with it set,
+   * `<config dir>/crontab`, where `<config dir>` is the directory of the
+   * config file actually loaded. `~` is expanded and the path resolved to
+   * absolute. Config carries only this pointer, never schedules.
    */
   cron_table_path?: string
   /**
@@ -350,9 +368,20 @@ export interface ServerSettings {
   agent_director_call_timeout_ms: number
   /**
    * Absolute path to the cscb_cron crontable file (b.he5 PD-5). Always present:
-   * defaults to `<config dir>/crontab` when omitted from input.
+   * defaults to `resolveDefaultCronTablePath` when omitted from input (bug b.avm).
    */
   cron_table_path: string
+  /**
+   * Whether the loaded configuration left `cron_table_path` out (absent or
+   * `null`), so `cron_table_path` holds the default the loader filled in
+   * (bug b.avm). Not a configuration key: the loader sets it, true or false,
+   * on every configuration it resolves. The start's crontable preparation
+   * (`prepareDefaultCronTable`, cron-table-migration.ts) acts only when it is
+   * true, so a `cron_table_path` the operator wrote, even one naming the
+   * default's file, is never prepared or moved (D-Q1). Absent (a
+   * configuration built by hand) reads as false.
+   */
+  cron_table_path_defaulted?: boolean
   /**
    * Absolute path to the cscb_cron log file (b.he5 PD-5). Always present:
    * defaults to `<config dir>/cron.log` when omitted from input.
@@ -558,10 +587,11 @@ export function channelModeOf(config: Pick<ServerSettings, 'allow_invited_channe
 
 /**
  * Fill in the defaults of the server-wide settings (b.av2 SR-1.6). Paths are returned as given (defaults unexpanded, except
- * the cron paths, which are absolute under `configDir`); `resolveServerPaths`
- * expands them. Does not mutate the input.
+ * the cron paths, which are absolute: the crontable's is `cronTableDefault`,
+ * and the cron log's is under `configDir`); `resolveServerPaths` expands
+ * them. Does not mutate the input.
  */
-function applyServerDefaults(input: ServerSettingsInput, configDir: string): ServerSettings {
+function applyServerDefaults(input: ServerSettingsInput, configDir: string, cronTableDefault: string): ServerSettings {
   return {
     bind: input.bind ?? '127.0.0.1',
     port: input.port ?? 3100,
@@ -581,8 +611,10 @@ function applyServerDefaults(input: ServerSettingsInput, configDir: string): Ser
       input.agent_director_poll_interval_ms ?? DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS,
     agent_director_call_timeout_ms:
       input.agent_director_call_timeout_ms ?? DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
-    cron_table_path: input.cron_table_path ?? resolve(configDir, 'crontab'),
-    cron_log_path: input.cron_log_path ?? resolve(configDir, 'cron.log'),
+    cron_table_path: input.cron_table_path ?? cronTableDefault,
+    // Bug b.avm: exactly when the line above filled in the default.
+    cron_table_path_defaulted: input.cron_table_path === undefined || input.cron_table_path === null,
+    cron_log_path: input.cron_log_path ?? resolve(configDir, CRON_LOG_FILE_NAME),
     cron_log_max_bytes: input.cron_log_max_bytes,
     // Only an absent switch takes the default: any other value, `null`
     // included, is kept so the switch's boolean rule rejects it.
@@ -1053,15 +1085,18 @@ type PersonaServerSettings = Omit<PersonaConfig, 'personas'>
 /**
  * Default, resolve and validate the server-wide settings of a persona-shape
  * object with today's rules (b.av2 SR-1.6): top-level paths keep today's
- * resolution (not the persona path rule), with `~` expanded under `home`,
- * and the cron path defaults sit under `configDir`. Adds the persona-only
- * `ack_reaction`, `reply_chunk_limit` and `reply_chunk_mode`. Errors name the
- * key and the rule, never the rejected value.
+ * resolution (not the persona path rule), with `~` expanded under `home`;
+ * the crontable's default is `resolveDefaultCronTablePath` over `configDir`,
+ * `home` and `env` (bug b.avm), and the cron log's sits under `configDir`.
+ * Adds the persona-only `ack_reaction`, `reply_chunk_limit` and
+ * `reply_chunk_mode`. Errors name the key and the rule, never the rejected
+ * value.
  */
 function resolvePersonaServerSettings(
   parsed: Record<string, unknown>,
   configDir: string,
   home: string,
+  env: NodeJS.ProcessEnv,
 ): PersonaServerSettings {
   for (const key of UNCHECKED_TOP_LEVEL_PATH_KEYS) {
     const value = parsed[key]
@@ -1070,7 +1105,7 @@ function resolvePersonaServerSettings(
     }
   }
   const input = parsed as Partial<PersonaConfigInput>
-  const withDefaults = applyServerDefaults(input, configDir)
+  const withDefaults = applyServerDefaults(input, configDir, resolveDefaultCronTablePath(configDir, home, env))
   const settings: PersonaServerSettings = {
     ...withDefaults,
     ...resolveServerPaths(withDefaults, home),
@@ -1664,6 +1699,12 @@ export interface ResolvePersonaConfigOptions {
    * unchanged. Default false.
    */
   record?: boolean
+  /**
+   * The environment the crontable's default reads `SLACK_STATE_DIR` and
+   * `XDG_CONFIG_HOME` from (`resolveDefaultCronTablePath`, bug b.avm).
+   * Defaults to `process.env`, read at call time only.
+   */
+  env?: NodeJS.ProcessEnv
 }
 
 // ---------------------------------------------------------------------------
@@ -1712,10 +1753,12 @@ export interface ResolvePersonaConfigOptions {
  * never by the mode of the configuration in effect (b.deo SRI-105).
  *
  * @param raw        The parsed JSON value of the configuration file.
- * @param configDir  Directory of the configuration file; the cron path defaults sit under it.
+ * @param configDir  Directory of the configuration file; the cron log's default sits under it, and
+ *   the crontable's when `SLACK_STATE_DIR` is set (`resolveDefaultCronTablePath`).
  * @param home       Home directory for every `~` (persona and top-level paths and the
- *   `mcp_config_path` default). Defaults to the OS home, read at call time only.
- * @param options    Record mode; see `ResolvePersonaConfigOptions`.
+ *   `mcp_config_path` default) and for the crontable's default. Defaults to the OS home,
+ *   read at call time only.
+ * @param options    Record mode and the environment; see `ResolvePersonaConfigOptions`.
  */
 export function resolvePersonaConfig(
   raw: unknown,
@@ -1740,7 +1783,7 @@ export function resolvePersonaConfig(
     throw ruleError(style, `personas must be an array, got ${jsonTypeName(entries)}.`)
   }
 
-  const settings = resolvePersonaServerSettings(raw, configDir, home)
+  const settings = resolvePersonaServerSettings(raw, configDir, home, options.env ?? process.env)
   const inherited: InheritedPersonaSettings = {
     claude_config_dir: settings.claude_config_dir,
     stop_hook_bootstrap: settings.stop_hook_bootstrap,
@@ -1773,6 +1816,71 @@ export function resolveServerStateDir(home?: string, env: NodeJS.ProcessEnv = pr
   const fromEnv = env[STATE_DIR_ENV]
   if (fromEnv) return resolve(fromEnv)
   return join(home ?? homedir(), '.claude', 'channels', 'slack')
+}
+
+/** Whether `SLACK_STATE_DIR` moves the state directory: set and non-empty, as `resolveServerStateDir` reads it. */
+function isStateDirOverridden(env: NodeJS.ProcessEnv): boolean {
+  return Boolean(env[STATE_DIR_ENV])
+}
+
+/**
+ * The user's XDG configuration directory: `XDG_CONFIG_HOME` when it is an
+ * absolute path, otherwise `<home>/.config`. An empty or relative value is
+ * ignored, as the XDG Base Directory specification says. Read at call time.
+ *
+ * @param home  Home directory; defaults to the OS home, read only when needed.
+ * @param env   Environment to read `XDG_CONFIG_HOME` from; defaults to `process.env`.
+ */
+export function resolveXdgConfigHome(home?: string, env: NodeJS.ProcessEnv = process.env): string {
+  const fromEnv = env[XDG_CONFIG_HOME_ENV]
+  if (fromEnv !== undefined && isAbsolute(fromEnv)) return resolve(fromEnv)
+  return join(home ?? homedir(), '.config')
+}
+
+/**
+ * The crontable's pre-b.avm default: `crontab` beside the loaded
+ * `config.json`, so under `~/.claude/channels/slack/` for a default install.
+ * The start's migration moves a crontable found here to the new default
+ * (`src/cron-table-migration.ts`).
+ *
+ * @param configDir  Directory of the configuration file.
+ */
+export function legacyCronTablePath(configDir: string): string {
+  return resolve(configDir, CRON_TABLE_FILE_NAME)
+}
+
+/**
+ * The crontable's default path, used when `cron_table_path` is absent (bug
+ * b.avm). The one definition of the default: the loader and the start's
+ * migration both use it.
+ *
+ * - `SLACK_STATE_DIR` unset (a default install, whose state directory is
+ *   under `~/.claude`): `<XDG config dir>/cscb/crontab`
+ *   (`resolveXdgConfigHome`), so `~/.config/cscb/crontab` unless
+ *   `XDG_CONFIG_HOME` names another directory. Bots edit the crontable
+ *   often, and Claude Code asks the user before every write under
+ *   `.claude`, so the default sits outside it.
+ * - `SLACK_STATE_DIR` set: `<config dir>/crontab`
+ *   (`legacyCronTablePath`), as before. The variable already moves the
+ *   state out of `~/.claude`, and it isolates an install (a second server,
+ *   a test or CI run), so its schedules stay with the rest of its state and
+ *   never share the per-user default.
+ *
+ * Touches no file; reads `process.env` only when `env` is absent and the OS
+ * home only when `home` is absent and needed.
+ *
+ * @param configDir  Directory of the configuration file.
+ * @param home       Home directory; defaults to the OS home, read only when needed.
+ * @param env        Environment to read `SLACK_STATE_DIR` and `XDG_CONFIG_HOME` from;
+ *   defaults to `process.env`.
+ */
+export function resolveDefaultCronTablePath(
+  configDir: string,
+  home?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  if (isStateDirOverridden(env)) return legacyCronTablePath(configDir)
+  return resolve(resolveXdgConfigHome(home, env), CSCB_XDG_DIR_NAME, CRON_TABLE_FILE_NAME)
 }
 
 /**
@@ -1973,8 +2081,9 @@ function malformedJsonMessage(text: string, source: string): string {
  *
  * @param bytes      The configuration's bytes, or its text.
  * @param source     The path to name in errors; used only as a label.
- * @param configDir  Directory of the configuration file; the cron path defaults sit under it.
- * @param options    `home` for `~`, and record mode (`ResolvePersonaConfigOptions`).
+ * @param configDir  Directory of the configuration file; the cron path defaults derive from it
+ *   (`resolvePersonaConfig`).
+ * @param options    `home` for `~`, record mode and the environment (`ResolvePersonaConfigOptions`).
  */
 export function parsePersonaConfigBytes(
   bytes: Uint8Array | string,
@@ -1992,7 +2101,7 @@ export function parsePersonaConfigBytes(
   }
 
   try {
-    return resolvePersonaConfig(parsed, configDir, options.home, { record: options.record })
+    return resolvePersonaConfig(parsed, configDir, options.home, { record: options.record, env: options.env })
   } catch (err) {
     const cause = err instanceof Error ? err.message : String(err)
     throw new Error(`loadPersonaConfig: invalid persona config in "${source}": ${cause}`)
