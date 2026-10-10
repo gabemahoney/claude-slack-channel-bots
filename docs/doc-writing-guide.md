@@ -26,7 +26,7 @@
 
 ### Release notes (CHANGELOG.md)
 - Target audience: operators upgrading from an earlier release
-- Covers: what's new and breaking changes, one `##` entry per release. The next release's notes go under one "Unreleased" heading, the file's first `##` entry, until the release is cut; a published release's heading is its version and publish date, as in `## 0.11.0 (2026-10-06)`
+- Covers: what's new and breaking changes, one `##` entry per release. The next release's notes go under one "Unreleased" heading, the file's first `##` entry, until the release is cut; a published release's heading is its version and release date, as in `## 0.11.0 (2026-10-06)`
 - The coupled switch-over and rollback runbooks, copied from the README, sit in the 0.11.0 entry, the release that introduced them. A later runbook change is made in that copy in place, and the "Unreleased" entry says what changed
 - No "Upgrade steps" section: the two runbooks are the upgrade and its way back. No operator text (the README, the three skills, `docs/architecture.md`, `docs/engineering-guide.md`, the CHANGELOG) has a heading of that title or a link to one
 - The README's two runbook sections are the maintained copy. Change the README first, then the CHANGELOG copy: each copy opens with one line naming its README section as the maintained copy, by a `README.md#` link, and otherwise matches the README section word for word, headings included. A same-file link to a runbook heading stays a same-file link to the copy's own heading; only a link to a README section the CHANGELOG does not carry is written as a `README.md#` link. Like the README, a copy says "the Slack token environment variables" and never names one
@@ -35,7 +35,8 @@
 - A new command, file, log label or start-summary count a release note introduces is written as a code span, spelled as `src/` writes it
 - Every link resolves: a same-file anchor to a CHANGELOG heading, a repository link to an existing file and heading
 - `tests/shipped-docs.test.ts` checks some of these rules through `OPERATOR_TEXTS` (see the testing guide's Shipped-Description Audit): one "Unreleased" entry, first; no "Upgrade steps" heading or link; the breaking note's parts; the keep-until-rollback sentence and no delete instruction for the retired file; each runbook copy's maintained-copy line, its word-for-word match and no named token variable; and every link resolving. The code-span rule is checked only for the names the hatch notes introduce (`HATCH_NOTE_NAMES`); the rest are kept by review
-- Not in the npm tarball (not in `package.json`'s `files`), and `/publish` does not read it
+- Not in the npm tarball (not in `package.json`'s `files`)
+- Never rename the "Unreleased" heading by hand: `/publish prepare` does it in the release commit, turning the first `## Unreleased` heading into `## <version> (<UTC date>)` under a fresh empty `## Unreleased` entry, set off by a `---` rule. Prepare stops (`SR-3.1 (changelog)`, exit 20) when the file has no `## Unreleased` heading, so keep one first even when it holds no notes
 
 ### Architecture docs (Internal, docs/architecture.md)
 - Target audience: developers working on the codebase

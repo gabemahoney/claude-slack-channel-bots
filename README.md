@@ -2512,10 +2512,10 @@ Before any side-effecting step runs, `/publish` enforces eight fail-fast gates. 
 
 After all gates pass, the skill, in this order:
 
-1. Bumps `package.json` and `bun.lock` to `<next-version>` (no commit, no tag yet).
+1. Bumps `package.json` and `bun.lock` to `<next-version>` (no commit, no tag yet), and turns `CHANGELOG.md`'s `## Unreleased` heading into `## <next-version> (<UTC date>)` under a fresh empty `## Unreleased` entry. With no `## Unreleased` heading, the release stops here and the working tree is rolled back.
 2. Packs the release tarball with `bun pm pack` and verifies its internal version matches.
 3. Scratch-installs the tarball into a temp `BUN_INSTALL` and runs the bin smoke check (non-zero exit + `Usage:` in stderr). Any failure here rolls back the working tree and aborts — no commit, no push, no publish.
-4. Creates the `Release v<version>` commit and the annotated `v<version>` tag locally.
+4. Creates the `Release v<version>` commit (`package.json`, `bun.lock` and `CHANGELOG.md`) and the annotated `v<version>` tag locally.
 5. Pushes the release commit to `origin/main`.
 6. Publishes the smoke-tested tarball with `npm publish <tarball-path>` (the smoke-tested artifact bytes — not a repack from CWD).
 7. Pushes the `v<version>` tag to `origin`, bringing GitHub and npm into agreement.
