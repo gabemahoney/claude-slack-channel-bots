@@ -6,6 +6,10 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+---
+
+## 0.15.0 (2026-10-11)
+
 ### The README is now install and the happy path; the reference moved to `docs/`
 
 The README keeps Quick Start, the prerequisites, a first configuration and the everyday commands. Everything else moved, under the same section titles, to pages under `docs/` that ship in the package: [Configuration](docs/configuration.md), [Server settings](docs/server-settings.md), [Channel modes](docs/channel-modes.md), [Reload](docs/reload.md), [CLI Reference](docs/cli.md), [What a bot can do](docs/bots.md), [Scheduled Prompts](docs/scheduled-prompts.md), [agent-director](docs/agent-director.md), [Troubleshooting](docs/troubleshooting.md) and [Migration](docs/migration.md).
