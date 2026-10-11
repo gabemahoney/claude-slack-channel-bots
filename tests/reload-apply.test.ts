@@ -5428,6 +5428,8 @@ describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-1
     await applyConfig(run, personas, { fresh_system_prompt: false })
 
     expect(run.since(cp).lifecycle).toEqual([])
+    expect(run.since(cp).slackCalls).toEqual([])
+    expect(run.since(cp).slackBuilds).toBe(0)
     expect(templateCalls(run)).toEqual([])
     const applied = run.logsOf(RELOAD_APPLIED)
     expect(applied).toHaveLength(1)

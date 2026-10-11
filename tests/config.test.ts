@@ -1394,19 +1394,9 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         ['an array holding the leak sentinel', [LEAK_SENTINEL]],
       ]
 
-      test.each(REJECTED)('%s is rejected, naming the setting and no persona (SR-1.2)', (_label, value) => {
-        const message = loadError(withFresh(value))
-        expect(message).toContain('fresh_system_prompt')
-        expect(message).not.toContain('personas[')
-      })
-
-      test('every rejected value gives the same error, so none of them is echoed (SR-1.2)', () => {
-        const messages = new Set(REJECTED.map(([, value]) => loadError(withFresh(value))))
-        expect(messages.size).toBe(1)
-      })
-
-      test('a rejected value gives the full message (SR-1.2)', () => {
-        expect(loadError(withFresh('true'))).toBe(
+      // The same full message for every value: it names the setting, no persona, and never echoes the value (SR-1.2).
+      test.each(REJECTED)('%s is rejected with the full message, naming the setting and no persona (SR-1.2)', (_label, value) => {
+        expect(loadError(withFresh(value))).toBe(
           `loadPersonaConfig: invalid persona config in "${join(dir, 'config.json')}": Persona config validation error: ` +
             'fresh_system_prompt must be a boolean.',
         )
