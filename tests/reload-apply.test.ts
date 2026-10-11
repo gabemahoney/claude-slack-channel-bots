@@ -5415,6 +5415,44 @@ describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-1
     expectNoPostNoLeak(run)
   })
 
+  // b.b1j SR-1.3, SR-2.3, SR-3: fresh_system_prompt is a start-time server-wide
+  // setting. A confirmed change of only it is recorded; the running server keeps
+  // `true` and the template it installed (the pair); the next start runs `false`.
+  test("a confirmed change of only fresh_system_prompt to false is recorded and makes no template call or lifecycle operation: the running server keeps true and the installed pair, and the next start installs the template without it (b.b1j SR-1.3, SR-2.3, SR-3; real composition)", async () => {
+    const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true })
+    const installed = run.composition!.installedTemplate!
+    expect(installed.claude_args!.slice(-2)).toEqual(['--system-prompt-snapshot', 'off'])
+    expect(run.serverConfig()!.fresh_system_prompt).toBe(true)
+    const cp = run.checkpoint()
+
+    await applyConfig(run, personas, { fresh_system_prompt: false })
+
+    expect(run.since(cp).lifecycle).toEqual([])
+    expect(templateCalls(run)).toEqual([])
+    const applied = run.logsOf(RELOAD_APPLIED)
+    expect(applied).toHaveLength(1)
+    expect(applied[0]).toContain('server-wide settings: 1 changed')
+    expect(run.logsOf(RELOAD_NOOP)).toEqual([])
+    // The running server keeps its start-time value and the template as installed ...
+    expect(run.composition!.installedTemplate).toEqual(installed)
+    expect(run.composition!.installedTemplate!.claude_args!.slice(-2)).toEqual(['--system-prompt-snapshot', 'off'])
+    expect(run.serverConfig()!.fresh_system_prompt).toBe(true)
+    // ... and the record holds the change.
+    expect(JSON.parse(h.readRecord()!.toString('utf-8')).fresh_system_prompt).toBe(false)
+    expect(run.appliedConfigs.at(-1)!.fresh_system_prompt).toBe(false)
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+
+    await run.stop()
+    const restarted = await h.start({ realLifecycle: true })
+
+    expect(restarted.serverConfig()!.fresh_system_prompt).toBe(false)
+    const restartedTemplate = restarted.composition!.installedTemplate!
+    expect(restartedTemplate.claude_args).not.toContain('--system-prompt-snapshot')
+    expect(restartedTemplate.claude_args).toEqual(installed.claude_args!.slice(0, -2))
+    expectNoPostNoLeak(restarted)
+  })
+
   test.each<{ label: string; err: () => Error }>([
     { label: 'a typed agent-director error', err: () => errTemplateMalformed() },
     // Its message holds a fake token: only a token-free rendering of it may be logged.

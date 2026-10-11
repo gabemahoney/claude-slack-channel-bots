@@ -136,6 +136,11 @@ export function deriveMemoryReadAllowRules(personaConfig: PersonaConfig, home: s
  * Conditionally appends `--append-system-prompt-file <path>` when
  * `system_prompt_mode === 'append'` and the path is R_OK-readable. An
  * unreadable path produces a single stderr warning and the flag is omitted.
+ *
+ * Then appends `--system-prompt-snapshot off` (b.b1j SR-2) unless
+ * `fresh_system_prompt` is exactly `false`; a configuration without the field
+ * gets the pair. It does not depend on `system_prompt_mode`, on the append
+ * file probe or on dry run, and is always the last two elements.
  */
 export function buildTemplateParams(
   personaConfig: PersonaConfig,
@@ -163,6 +168,13 @@ export function buildTemplateParams(
         `[slack] template: append_system_prompt_file not readable, omitting flag: ${filePath}`,
       )
     }
+  }
+
+  // b.b1j SR-2: last, whatever the append-file decision above was, so a
+  // resumed or restarted bot reloads the current system prompt file and
+  // CLAUDE.md. Only a `fresh_system_prompt` of exactly `false` leaves it out.
+  if (personaConfig.fresh_system_prompt !== false) {
+    claude_args.push('--system-prompt-snapshot', 'off')
   }
 
   return {

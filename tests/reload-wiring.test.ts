@@ -1024,6 +1024,7 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
         system_prompt_mode: 'replace',
         resume_enabled: false,
         stop_hook_bootstrap: false,
+        fresh_system_prompt: false, // b.b1j SR-1.3: the start's true is kept
         agent_director_poll_interval_ms: 12_345,
         agent_director_call_timeout_ms: MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
         ack_reaction: 'eyes',

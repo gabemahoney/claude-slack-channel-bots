@@ -10,6 +10,9 @@
  *     b.av2 SR-6.2), never a config-dir root.
  *   - --append-system-prompt-file is appended when the file is readable,
  *     and omitted (with a stderr warning) when accessSync throws.
+ *   - `--system-prompt-snapshot off` (b.b1j SR-2) is the last two arguments
+ *     unless fresh_system_prompt is false, whatever the append-file decision;
+ *     the refresh keeps the boot install's arguments in both directions.
  *   - installSlackChannelBotTemplate() calls client.makeTemplate(...) with
  *     exactly the buildTemplateParams shape, and propagates the result.
  *   - Rejections from client.makeTemplate(...) — typed AgentDirectorError
@@ -71,9 +74,11 @@ function memoryRule(dir: string): string {
 
 describe('buildTemplateParams (SR-3.1)', () => {
   test('produces the canonical SR-3.1 shape with overwrite=true', () => {
+    // fresh_system_prompt: false keeps the SR-3.1 array without the b.b1j pair, which its own block pins.
     const cfg = makePersonaConfig({
       mcp_config_path: '/abs/mcp.json',
       system_prompt_mode: 'none',
+      fresh_system_prompt: false,
     }, baseDir)
     const params = buildTemplateParams(cfg)
     expect(params.name).toBe('slack-channel-bot')
@@ -234,6 +239,65 @@ describe('buildTemplateParams: --append-system-prompt-file (SR-3.1)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// buildTemplateParams — the snapshot pair (b.b1j SR-2)
+// ---------------------------------------------------------------------------
+
+describe('buildTemplateParams: --system-prompt-snapshot off (b.b1j SR-2)', () => {
+  const BASE = ['--dangerously-load-development-channels', 'server:slack-channel-router', '--mcp-config', '/abs/mcp.json']
+  const PAIR = ['--system-prompt-snapshot', 'off']
+  const FILE = '/etc/cscb/extra.md'
+
+  // The four SR-2.1 append-flag cases. `args` is today's array for the case;
+  // the pair is the only thing the setting adds to it.
+  type Row = [
+    label: string,
+    overrides: Partial<PersonaConfig>,
+    readable: boolean,
+    args: string[],
+    warnings: number,
+    probed: boolean,
+  ]
+  const rows: Row[] = [
+    ['"none"', { system_prompt_mode: 'none', append_system_prompt_file: FILE }, true, BASE, 0, false],
+    ['"append" with a readable file', { system_prompt_mode: 'append', append_system_prompt_file: FILE }, true,
+      [...BASE, '--append-system-prompt-file', FILE], 0, true],
+    ['"append" with an unreadable file', { system_prompt_mode: 'append', append_system_prompt_file: FILE }, false, BASE, 1, true],
+    ['"append" with no file', { system_prompt_mode: 'append' }, true, BASE, 0, false],
+  ]
+
+  // 'absent' is a configuration without the field, as an older caller builds one.
+  const settings = [
+    ['absent', undefined, true],
+    ['true', true, true],
+    ['false', false, false],
+  ] as const
+
+  test.each(rows.flatMap(([label, ...rest]) => settings.map(([setting, value, pair]) => [label, setting, value, pair, ...rest] as const)))(
+    '%s, fresh_system_prompt %s: the SR-2.1 array, with the pair last only when the setting is not false',
+    (_label, _setting, value, pair, overrides, readable, args, warnings, probed) => {
+      const cfg = makePersonaConfig({ mcp_config_path: '/abs/mcp.json', ...overrides }, baseDir)
+      if (value === undefined) delete (cfg as Partial<PersonaConfig>).fresh_system_prompt
+      else cfg.fresh_system_prompt = value
+      const logged: string[] = []
+      let accessSyncCalls = 0
+      const params = buildTemplateParams(cfg, {
+        accessSync: () => { accessSyncCalls++; if (!readable) throw new Error('EACCES') },
+        stderrWrite: (msg) => logged.push(msg),
+      })
+      expect(params.claude_args).toEqual(pair ? [...args, ...PAIR] : args)
+      // The pair is the same single occurrence at the end, and the probe and its warning are the setting's no-ops.
+      expect(params.claude_args!.filter((a) => a === '--system-prompt-snapshot')).toHaveLength(pair ? 1 : 0)
+      expect(accessSyncCalls).toBe(probed ? 1 : 0)
+      expect(logged).toHaveLength(warnings)
+      if (warnings > 0) {
+        expect(logged[0]).toContain('not readable')
+        expect(logged[0]).toContain(FILE)
+      }
+    },
+  )
+})
+
+// ---------------------------------------------------------------------------
 // installSlackChannelBotTemplate — SR-3.2
 // ---------------------------------------------------------------------------
 
@@ -247,6 +311,7 @@ describe('installSlackChannelBotTemplate (SR-3.2)', () => {
     const cfg = makePersonaConfig({
       mcp_config_path: '/abs/mcp.json',
       system_prompt_mode: 'none',
+      fresh_system_prompt: false,
     }, baseDir)
     const result = await installSlackChannelBotTemplate(cfg, {
       getClient: () => stub,
@@ -285,6 +350,35 @@ describe('installSlackChannelBotTemplate (SR-3.2)', () => {
     expect(makeTemplateCalls.length).toBe(1)
     expect(result.params).toEqual(makeTemplateCalls[0])
     expect(result.params.claude_args).toContain('--append-system-prompt-file')
+  })
+
+  // b.b1j SR-2.3: the default configuration installs the pair, last, and the
+  // params makeTemplate received are the ones the install resolves with.
+  test('with fresh_system_prompt on, installs the pair last and resolves with the exact params passed to makeTemplate', async () => {
+    const makeTemplateCalls: MakeTemplateParams[] = []
+    const cfg = makePersonaConfig({
+      mcp_config_path: '/abs/mcp.json',
+      system_prompt_mode: 'append',
+      append_system_prompt_file: '/etc/cscb/extra.md',
+    }, baseDir)
+    const result = await installSlackChannelBotTemplate(cfg, {
+      getClient: () => makeStubClient({ makeTemplateCalls }),
+      accessSync: () => { /* readable */ },
+      recordStartupError: () => { throw new Error('should not record on success') },
+      exit: () => { throw new Error('should not exit on success') },
+    })
+    expect(makeTemplateCalls.length).toBe(1)
+    expect(result.params).toEqual(makeTemplateCalls[0])
+    expect(makeTemplateCalls[0]!.claude_args).toEqual([
+      '--dangerously-load-development-channels',
+      'server:slack-channel-router',
+      '--mcp-config',
+      '/abs/mcp.json',
+      '--append-system-prompt-file',
+      '/etc/cscb/extra.md',
+      '--system-prompt-snapshot',
+      'off',
+    ])
   })
 
   test('typed AgentDirectorError → records ad-template-install + exits', async () => {
@@ -418,12 +512,12 @@ describe('refreshSlackChannelBotTemplate (b.av2 SR-8.6 step 5)', () => {
   ]
   const serverWideRows: ServerWideRow[] = [
     ['start installed the append flag; the applied config turns system prompts off and moves the MCP config',
-      (b) => [{ mcp_config_path: join(b, 'boot-mcp.json'), system_prompt_mode: 'append', append_system_prompt_file: join(b, 'boot-append.md') }, true],
+      (b) => [{ mcp_config_path: join(b, 'boot-mcp.json'), system_prompt_mode: 'append', append_system_prompt_file: join(b, 'boot-append.md'), fresh_system_prompt: false }, true],
       (b) => ({ mcp_config_path: join(b, 'applied-mcp.json'), system_prompt_mode: 'none', append_system_prompt_file: join(b, 'applied-append.md') }),
       (b) => ['--dangerously-load-development-channels', 'server:slack-channel-router', '--mcp-config', join(b, 'boot-mcp.json'),
         '--append-system-prompt-file', join(b, 'boot-append.md')]],
     ['start omitted an unreadable append file; the applied config names a readable one (not probed again)',
-      (b) => [{ mcp_config_path: join(b, 'boot-mcp.json'), system_prompt_mode: 'append', append_system_prompt_file: join(b, 'boot-append.md') }, false],
+      (b) => [{ mcp_config_path: join(b, 'boot-mcp.json'), system_prompt_mode: 'append', append_system_prompt_file: join(b, 'boot-append.md'), fresh_system_prompt: false }, false],
       (b) => ({ mcp_config_path: join(b, 'applied-mcp.json'), system_prompt_mode: 'append', append_system_prompt_file: join(b, 'applied-append.md') }),
       (b) => ['--dangerously-load-development-channels', 'server:slack-channel-router', '--mcp-config', join(b, 'boot-mcp.json')]],
   ]
@@ -450,6 +544,29 @@ describe('refreshSlackChannelBotTemplate (b.av2 SR-8.6 step 5)', () => {
     expect(result).toEqual({ kind: 'refreshed', path: REFRESHED_PATH })
     expect(logs).toEqual([refreshedLine(2)])
     assertNoLeak({ logs, calls, result })
+  })
+
+  // b.b1j SR-2.3: a start-time-only setting. The refresh keeps the boot
+  // install's claude_args exactly, whichever way the applied config moved it.
+  test.each([
+    ['start on, applied off: the pair is kept', true, false, true],
+    ['start off, applied on: no pair is added', false, true, false],
+  ])('%s', async (_label, bootValue, appliedValue, hasPair) => {
+    const serverWide = { mcp_config_path: '/abs/mcp.json', system_prompt_mode: 'none' as const }
+    const installed = await bootInstall(
+      makeMultiPersonaConfig([{ name: 'A Bot' }], baseDir, { ...serverWide, fresh_system_prompt: bootValue }),
+    )
+    expect(installed.claude_args!.slice(-2)).toEqual(hasPair ? ['--system-prompt-snapshot', 'off'] : ['--mcp-config', '/abs/mcp.json'])
+
+    const { result, calls } = await refresh(
+      makeMultiPersonaConfig([{ name: 'A Bot' }], baseDir, { ...serverWide, fresh_system_prompt: appliedValue }),
+      installed,
+    )
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.claude_args).toEqual(installed.claude_args)
+    expect(calls[0]!.claude_args!.filter((a) => a === '--system-prompt-snapshot')).toHaveLength(hasPair ? 1 : 0)
+    expect(result).toEqual({ kind: 'refreshed', path: REFRESHED_PATH })
   })
 
   // The comparison that decides whether to refresh is the change plan's

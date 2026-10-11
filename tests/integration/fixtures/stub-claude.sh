@@ -12,6 +12,17 @@
 # `claude --version` (or `-v`) prints `2.1.280 (Claude Code)` and exits 0, the
 # version line of the Claude Code agent-director states as its minimum.
 #
+# LAUNCH ARGUMENTS
+# ----------------
+# Every launch (not a `--version` call) appends one line, its argument list, to
+# the file `stub-claude-launch-args` beside the stub (the directory of the path
+# the stub was run by). Each argument is shell-quoted (`printf %q`) and the
+# words are separated by one space, so an argument holding spaces or newlines
+# (the `--settings` JSON) stays one word, and a pair such as
+# `--system-prompt-snapshot off` reads as two adjacent plain words. The line is
+# written under flock in one append, so concurrent stubs do not interleave.
+# Test 4 reads it; other stub users ignore it.
+#
 # MODES
 # -----
 # The stub's working directory, by its resolved real path, chooses its mode.
@@ -344,6 +355,19 @@ MODE_LINGER_ON_EXIT=linger-on-exit
 STUB_DIR="${BASH_SOURCE[0]%/*}"
 [[ "${STUB_DIR}" == "${BASH_SOURCE[0]}" ]] && STUB_DIR=.
 STUB_MODES_FILE="${STUB_DIR}/stub-claude-modes"
+
+# The record of every launch's argument list (not a `--version` call, which
+# exited above): one line per launch appended to `stub-claude-launch-args`
+# beside the stub. Each argument is shell-quoted (`printf %q`), so an argument
+# with spaces or newlines (the `--settings` JSON) stays one word on the one
+# line, and the line is written under flock in one append, so concurrent stubs
+# do not interleave. A failed write is reported on standard error and changes
+# nothing else.
+STUB_LAUNCH_ARGS_FILE="${STUB_DIR}/stub-claude-launch-args"
+launch_args_line=""
+printf -v launch_args_line '%q ' "$@"
+{ /usr/bin/flock -x 9 && printf '%s\n' "${launch_args_line% }" >&9; } 9>> "${STUB_LAUNCH_ARGS_FILE}" 2> /dev/null \
+    || printf 'stub-claude[%s]: could not record the launch arguments in %s\n' "$$" "${STUB_LAUNCH_ARGS_FILE}" >&2
 
 MODE="${MODE_DEV_CHANNELS}"
 if [[ -f "${STUB_MODES_FILE}" ]]; then
