@@ -1206,7 +1206,7 @@ describe('main() migrates the state directory before anything reads or writes it
     for (const at of later) expect(migrationCall()).toBeLessThan(at)
   })
 
-  test('the stop records the migration\'s error class and message in the OLD directory\'s startup-errors.log, then exits 1 (no state-directory file is touched first)', () => {
+  test('the stop records the migration\'s error class and message in startupErrorDir (resolveCliStateDir before the move: where the CLI and the daemon\'s log look, not the stopping step\'s legacy directory), then exits 1 (no state-directory file is touched first)', () => {
     const ifAt = indicesOf(/\bif\s*\(\s*stateDirMigration\.paths\s*!==\s*undefined\b/g, SERVER_CODE)
     expect(ifAt).toHaveLength(1)
     expect(ifAt[0]!).toBeGreaterThan(migrationCall())
@@ -1219,7 +1219,7 @@ describe('main() migrates the state directory before anything reads or writes it
     const args = splitTopLevel(onlyCallArguments(body, 'recordStartupError'))
     expect(args[0]).toBe('STATE_MIGRATE_STARTUP_ERROR_CLASS')
     expect(args[1]).toBe('stateDirStopMessage(stateDirMigration.paths, stateDirMigration.outcome)')
-    expect(args[3]!.replace(/\s+/g, ' ')).toBe('{ logDir: stateDirMigration.paths.legacyDir }')
+    expect(args[3]!.replace(/\s+/g, ' ')).toBe('{ logDir: stateDirMigration.startupErrorDir }')
     const exits = indicesOf(/\bprocess\.exit\s*\(\s*1\s*\)/g, body)
     expect(exits).toHaveLength(1)
     expect(record[0]!).toBeLessThan(exits[0]!)

@@ -11,7 +11,7 @@ set -u
 TEST_HOST='@TEST_HOST@'   # the container's hostname
 PHASE="${1:?usage: bash ~/cscb-live-preflight.sh setup|check1}"
 export PATH="/opt/agent-director/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin"
-STATE="$HOME/.config/cscb"
+STATE="$HOME/.config/claude-slack-channel-bots"
 fail() { echo "PRE-FLIGHT FAILED: $*" >&2; exit 1; }
 
 [ "$(uname -s)" = Linux ] || fail "this host is not Linux"

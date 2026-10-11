@@ -75,7 +75,7 @@ const CI_OFF_VALUES: ReadonlySet<string> = new Set(['', '0', 'false'])
 // ---------------------------------------------------------------------------
 
 export interface PostinstallOptions {
-  /** Override the state directory (defaults to the server's: a non-empty SLACK_STATE_DIR, else ~/.config/cscb/ (or the old ~/.claude directory until the server has moved it)) */
+  /** Override the state directory (defaults to the server's: a non-empty SLACK_STATE_DIR, else ~/.config/claude-slack-channel-bots/ (or the old ~/.config/cscb or ~/.claude directory until the server has moved it)) */
   stateDir?: string
   /** Override the MCP config path (defaults to ~/.claude/slack-mcp.json) */
   mcpConfigPath?: string

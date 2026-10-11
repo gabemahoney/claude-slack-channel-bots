@@ -183,7 +183,7 @@ export function makePersonaConfigInput(
  * A resolved configuration, as `loadPersonaConfig` returns it for
  * `makePersonaConfigInput(…, baseDir)` written into `baseDir` with
  * `SLACK_STATE_DIR` set (as the preload guard sets it, so `cron_table_path`
- * defaults beside the config, not under `$XDG_CONFIG_HOME/cscb`, bug b.avm),
+ * defaults beside the config, not under `$XDG_CONFIG_HOME/claude-slack-channel-bots`, bug b.avm),
  * except that `mcp_config_path` also sits under `baseDir` rather than a home
  * directory.
  * `allow_invited_channels` resolves to `false` unless overridden; the default

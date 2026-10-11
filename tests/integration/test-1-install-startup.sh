@@ -29,7 +29,7 @@ fi
 set -euo pipefail
 
 TEST_NAME="test-1-install-startup"
-STATE_DIR="${HOME}/.config/cscb"
+STATE_DIR="${HOME}/.config/claude-slack-channel-bots"
 LOG="${STATE_DIR}/server.log"
 PID_FILE="${STATE_DIR}/server.pid"
 CLI="./node_modules/.bin/claude-slack-channel-bots"
@@ -126,7 +126,7 @@ cat > "${STATE_DIR}/config.json" << 'EOF'
   "personas": [
     {
       "name": "alpha",
-      "credentials_file": "~/.config/cscb/credentials-alpha.json",
+      "credentials_file": "~/.config/claude-slack-channel-bots/credentials-alpha.json",
       "working_directory": "/tmp/test-repo-a",
       "channels": [
         { "id": "C0TEST1", "delivery": "all" },
@@ -136,7 +136,7 @@ cat > "${STATE_DIR}/config.json" << 'EOF'
     },
     {
       "name": "bravo",
-      "credentials_file": "~/.config/cscb/credentials-bravo.json",
+      "credentials_file": "~/.config/claude-slack-channel-bots/credentials-bravo.json",
       "working_directory": "/tmp/test-repo-b",
       "dm": { "enabled": true, "contact": "U0TEST1" },
       "permission_prompts": "dm"

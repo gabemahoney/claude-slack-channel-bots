@@ -4,7 +4,7 @@
  *
  * One JSON object per newline-terminated line in
  *   <SLACK_STATE_DIR>/permission-trail.jsonl
- * (default: ~/.config/cscb/permission-trail.jsonl, `resolveServerStateDir` in config.ts).
+ * (default: ~/.config/claude-slack-channel-bots/permission-trail.jsonl, `resolveServerStateDir` in config.ts).
  *
  * Public API:
  *   - TrailEvent                  — enforced line schema

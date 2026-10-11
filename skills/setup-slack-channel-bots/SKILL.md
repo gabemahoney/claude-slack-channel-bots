@@ -78,20 +78,21 @@ and point the operator at those pages in the package's GitHub repository.
 ### Step 2 — State directory and config.json
 
 The state directory is `SLACK_STATE_DIR` when it is set and non-empty, else
-`~/.config/cscb` (`$XDG_CONFIG_HOME/cscb` when the shell's `XDG_CONFIG_HOME`
+`~/.config/claude-slack-channel-bots` (`$XDG_CONFIG_HOME/claude-slack-channel-bots` when the shell's `XDG_CONFIG_HOME`
 is an absolute path):
 
 ```bash
-STATE_DIR="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
+STATE_DIR="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}"
 ls -l "$STATE_DIR/config.json" 2>/dev/null || echo "NOT_FOUND"
 ```
 
 - **Missing, with `SLACK_STATE_DIR` unset and a `config.json` in
-  `~/.config/cscb`:** the host kept its state there under an
-  earlier release and its server has not started since the upgrade, which
-  moves it. Don't create a configuration in the new folder. Tell the operator
-  to run `claude-slack-channel-bots stop` (it finds the old directory), then
-  `claude-slack-channel-bots start`, and offer to continue afterwards.
+  `~/.config/cscb` or `~/.claude/channels/slack`:** the host kept its state
+  there under an earlier release and its server has not started since the
+  upgrade, which moves it to the new folder. Don't create a configuration in
+  the new folder. Tell the operator to run `claude-slack-channel-bots stop` (it
+  finds the old directory), then `claude-slack-channel-bots start`, and offer to
+  continue afterwards.
 - **Missing:** postinstall writes a skeleton with an empty `personas` array.
   Ask the operator to run `bun src/postinstall.ts` from the package root, or to
   re-run the install's `bun pm -g trust claude-slack-channel-bots` step (README
@@ -110,7 +111,7 @@ Before any edit, record whether a server is running and whether the
 last-applied record exists. Steps 4 and 10 use both.
 
 ```bash
-STATE_DIR="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
+STATE_DIR="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}"
 if [ -f "$STATE_DIR/server.pid" ] && kill -0 "$(cat "$STATE_DIR/server.pid")" 2>/dev/null; then
   echo "server: running"
 else
@@ -138,7 +139,7 @@ See `docs/channel-modes.md`.
 Find the switch in the last-applied record and in `config.json`:
 
 ```bash
-STATE_DIR="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
+STATE_DIR="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}"
 for f in config.json.last-applied config.json; do
   [ -f "$STATE_DIR/$f" ] && echo "$f: allow_invited_channels=$(jq '.allow_invited_channels' "$STATE_DIR/$f")"
 done
@@ -286,7 +287,7 @@ An app already used by another persona can't be reused.
 #### 5.3 Credentials file path
 
 Agree the `credentials_file` path: absolute or starting with `~/`, one file
-per persona. Suggest `~/.config/cscb/<key>-credentials.json`. Use the
+per persona. Suggest `~/.config/claude-slack-channel-bots/<key>-credentials.json`. Use the
 persona's key when the name is its own key (5.1); otherwise use a lower-case
 form of the name with only `a-z`, `0-9` and `_`, as keys have. Reject a path
 another persona already uses. The operator writes the file in 5.10, once the
@@ -559,7 +560,7 @@ Explain the case that matches Step 3. Link to `docs/reload.md`.
   confirms by renaming `config.json.pending` to `config.json.apply`:
 
   ```bash
-  cd "${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
+  cd "${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}"
   mv config.json.pending config.json.apply
   ```
 

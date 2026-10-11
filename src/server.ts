@@ -3262,10 +3262,11 @@ async function escalateRowWithNoPane(
 // ---------------------------------------------------------------------------
 
 export async function main(): Promise<void> {
-  // Bug b.fc4: the state directory's default sits outside ~/.claude
-  // ($XDG_CONFIG_HOME/cscb, ~/.config/cscb), where Claude Code does not ask
-  // before a write. On an existing host the old default's files move there,
-  // and the old directory becomes a symbolic link to the new one
+  // Bugs b.fc4, b.smv: the state directory's default sits outside ~/.claude
+  // ($XDG_CONFIG_HOME/claude-slack-channel-bots, ~/.config/claude-slack-channel-bots),
+  // where Claude Code does not ask before a write. On an existing host the old
+  // defaults' files (~/.claude/channels/slack, ~/.config/cscb) move there,
+  // and each old directory becomes a symbolic link to the new one
   // (state-dir-migration.ts says what happens to each entry, and why it is
   // not done by the CLI or postinstall). First of all: before the directory
   // is made, and so before anything reads or writes it (the PID check, the
@@ -3273,15 +3274,20 @@ export async function main(): Promise<void> {
   // the logs, the permission trail). With SLACK_STATE_DIR set it does nothing.
   // It never throws; a start it cannot make safe (an old server still running
   // on the old directory, a step that failed) stops here with the reason in
-  // startup-errors.log (written to the old directory, where an operator of
-  // the old release looks) and on stderr, and moves nothing it has not placed.
+  // startup-errors.log and on stderr, and moves nothing it has not placed.
+  // The log goes to the directory the CLI and the daemon's server.log use
+  // (resolveCliStateDir, computed by the migration before it moves anything):
+  // the directory that holds the configuration, not the legacy directory of
+  // the step that stopped (on a 0.14.0 host the configuration is in
+  // ~/.claude/channels/slack while the stopping step is ~/.config/cscb, which
+  // holds only the crontable and prompts/).
   const stateDirMigration = migrateStateDirAtStart({ log: (line) => console.error(line) })
   if (stateDirMigration.paths !== undefined && stateDirMigrationStopsStart(stateDirMigration.outcome)) {
     recordStartupError(
       STATE_MIGRATE_STARTUP_ERROR_CLASS,
       stateDirStopMessage(stateDirMigration.paths, stateDirMigration.outcome),
       undefined,
-      { logDir: stateDirMigration.paths.legacyDir },
+      { logDir: stateDirMigration.startupErrorDir },
     )
     process.exit(1)
   }

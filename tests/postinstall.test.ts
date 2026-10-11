@@ -9,7 +9,7 @@
  * `mkdtempSync` root, removed in afterEach. No call falls back to the OS home.
  * Cases that leave `stateDir` unset control SLACK_STATE_DIR in-process and
  * restore it (and the working directory) in afterEach. The default state
- * directory (`<home>/.config/cscb`, b.fc4) is chosen from the case's own `env`
+ * directory (`<home>/.config/claude-slack-channel-bots`, b.fc4) is chosen from the case's own `env`
  * option, never from the run's environment, so it lies under the case's home.
  *
  * Skill links (b.669): the default package root is this checkout, which
@@ -436,10 +436,10 @@ describe('homeDir — the base of every default', () => {
       join('home', '.claude'),
       join('home', '.claude', 'slack-mcp.json'),
       join('home', '.config'),
-      join('home', '.config', 'cscb'),
-      join('home', '.config', 'cscb', 'config.json'),
+      join('home', '.config', 'claude-slack-channel-bots'),
+      join('home', '.config', 'claude-slack-channel-bots', 'config.json'),
     ])
-    expect(readJson(join(s.home, '.config', 'cscb', 'config.json'))).toEqual({ personas: [] })
+    expect(readJson(join(s.home, '.config', 'claude-slack-channel-bots', 'config.json'))).toEqual({ personas: [] })
     expect(readJson(join(s.home, '.claude', 'slack-mcp.json'))).toHaveProperty(['mcpServers', MCP_SERVER_NAME])
   })
 })
@@ -448,22 +448,22 @@ describe('homeDir — the base of every default', () => {
 // The default state directory, and the window before the server moves the old one (b.fc4)
 // ---------------------------------------------------------------------------
 
-describe('default state directory (b.fc4)', () => {
+describe('default state directory (b.fc4, b.smv)', () => {
   /** A real config.json, so a skeleton overwriting it, or sitting beside the wrong one, shows. */
   const REAL_CONFIG = '{"personas":[{"name":"keep"}]}\n'
 
   /** A sandbox, plus its old and new state directories and the options of a run with SLACK_STATE_DIR and XDG_CONFIG_HOME unset. */
   function makeDefaultSandbox(): { s: Sandbox; legacyDir: string; newDir: string; run: PostinstallOptions } {
     const s = makeSandbox()
-    return { s, legacyDir: join(s.home, '.claude', 'channels', 'slack'), newDir: join(s.home, '.config', 'cscb'), run: { homeDir: s.home, env: {} } }
+    return { s, legacyDir: join(s.home, '.claude', 'channels', 'slack'), newDir: join(s.home, '.config', 'claude-slack-channel-bots'), run: { homeDir: s.home, env: {} } }
   }
 
-  test('an absolute XDG_CONFIG_HOME moves the default to $XDG_CONFIG_HOME/cscb', () => {
+  test('an absolute XDG_CONFIG_HOME moves the default to $XDG_CONFIG_HOME/claude-slack-channel-bots', () => {
     const { s } = makeDefaultSandbox()
 
     postinstall({ homeDir: s.home, env: { XDG_CONFIG_HOME: join(s.root, 'xdg') } })
 
-    expect(readJson(join(s.root, 'xdg', 'cscb', 'config.json'))).toEqual({ personas: [] })
+    expect(readJson(join(s.root, 'xdg', 'claude-slack-channel-bots', 'config.json'))).toEqual({ personas: [] })
     expect(existsSync(join(s.home, '.config'))).toBe(false)
   })
 
@@ -517,6 +517,44 @@ describe('default state directory (b.fc4)', () => {
     expect(lines).toContain(`skipped: ${join(newDir, 'config.json')}`)
     expect(readFileSync(join(newDir, 'config.json'), 'utf-8')).toBe(REAL_CONFIG)
     expect(lstatSync(legacyDir).isSymbolicLink()).toBe(true)
+  })
+
+  // Bug b.smv: the default folder is named after the package; 0.14.0 and 0.15.0 used ~/.config/cscb.
+  test('a 0.15.0 host (a real ~/.config/cscb holding the configuration, the old directory a link to it): ~/.config/cscb is the state directory, the new folder is not made', () => {
+    const { s, legacyDir, newDir, run } = makeDefaultSandbox()
+    const legacyXdgDir = join(s.home, '.config', 'cscb')
+    mkdirSync(legacyXdgDir, { recursive: true })
+    writeFileSync(join(legacyXdgDir, 'config.json'), REAL_CONFIG)
+    writeFileSync(join(legacyXdgDir, 'crontab'), '0 9 * * * prompts/a.md planner\n')
+    mkdirSync(dirname(legacyDir), { recursive: true })
+    symlinkSync(legacyXdgDir, legacyDir)
+
+    const lines = postinstall(run)
+
+    expect(lines).toContain(`skipped: ${join(legacyXdgDir, 'config.json')}`)
+    expect(readFileSync(join(legacyXdgDir, 'config.json'), 'utf-8')).toBe(REAL_CONFIG)
+    expect(readdirSync(legacyXdgDir).sort()).toEqual(['config.json', 'crontab'])
+    expect(existsSync(newDir)).toBe(false)
+    expect(lstatSync(legacyDir).isSymbolicLink()).toBe(true)
+  })
+
+  test('a 0.14.0 host (the configuration in the old directory, ~/.config/cscb holding only the crontab and prompts): the old directory is used, neither ~/.config/cscb nor the new folder gets a config.json', () => {
+    const { s, legacyDir, newDir, run } = makeDefaultSandbox()
+    const legacyXdgDir = join(s.home, '.config', 'cscb')
+    mkdirSync(join(legacyXdgDir, 'prompts'), { recursive: true })
+    writeFileSync(join(legacyXdgDir, 'crontab'), '0 9 * * * prompts/a.md planner\n')
+    writeFileSync(join(legacyXdgDir, 'prompts', 'a.md'), 'do it\n')
+    mkdirSync(legacyDir, { recursive: true })
+    writeFileSync(join(legacyDir, 'config.json'), REAL_CONFIG)
+    symlinkSync(join(legacyXdgDir, 'crontab'), join(legacyDir, 'crontab'))
+    symlinkSync(join(legacyXdgDir, 'prompts'), join(legacyDir, 'prompts'))
+
+    const lines = postinstall(run)
+
+    expect(lines).toContain(`skipped: ${join(legacyDir, 'config.json')}`)
+    expect(readFileSync(join(legacyDir, 'config.json'), 'utf-8')).toBe(REAL_CONFIG)
+    expect(readdirSync(legacyXdgDir).sort()).toEqual(['crontab', 'prompts'])
+    expect(existsSync(newDir)).toBe(false)
   })
 
   test('an old directory holding no config and no pid file is not used: the skeleton goes to the new directory', () => {

@@ -5268,12 +5268,12 @@ describe('credentials <persona>', () => {
   })
 
   test('a ~/ credentials_file reaches the script expanded under the home directory, as the loader expands it', async () => {
-    writeConfigFile(stateDir, makePersonaConfigInput({ personas: [makePersona({ name: OPS_NAME, credentials_file: '~/.config/cscb/ops.json' }, root)] }, root))
+    writeConfigFile(stateDir, makePersonaConfigInput({ personas: [makePersona({ name: OPS_NAME, credentials_file: '~/.config/claude-slack-channel-bots/ops.json' }, root)] }, root))
     const b = makeDeps()
 
     await expect(createCli(b.deps).credentials([OPS_NAME])).rejects.toBeInstanceOf(ExitError)
 
-    expect(b.credentialsRuns).toEqual([join(root, '.config', 'cscb', 'ops.json')])
+    expect(b.credentialsRuns).toEqual([join(root, '.config', 'claude-slack-channel-bots', 'ops.json')])
     expect(b.exitCodes).toEqual([0])
   })
 

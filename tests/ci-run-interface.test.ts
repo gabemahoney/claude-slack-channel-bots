@@ -1827,7 +1827,7 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
       expect({ requested: run.requestedShards, units: run.units.length, effective: run.effectiveShards }).toEqual(expected())
     })
 
-    test('the current tree, copied from the repository, passes every stage: 29 scripts, 27 units, test-2 and test-3 in one unit', () => {
+    test('the current tree, copied from the repository, passes every stage: 30 scripts, 28 units, test-2 and test-3 in one unit', () => {
       const source = join(REPO_ROOT, INTEGRATION_DIR_PATH)
       const entries = readdirSync(source, { withFileTypes: true }).filter((entry) => matchesScriptGlob(entry.name))
       expect(entries.filter((entry) => !entry.isFile()).map((entry) => entry.name)).toEqual([])
@@ -1837,8 +1837,8 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
 
       const run = validated(join(copy, '..', '..'))
 
-      expect(run.scripts.length).toBe(29)
-      expect(run.units.length).toBe(27)
+      expect(run.scripts.length).toBe(30)
+      expect(run.units.length).toBe(28)
       expect(unitsOf(run).filter((unit) => unit.length > 1)).toEqual([files(2, 3)])
       expect(run.prerequisites.get(scriptFile(3))).toEqual(files(2))
     })

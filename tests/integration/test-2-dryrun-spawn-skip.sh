@@ -12,8 +12,8 @@ fi
 set -euo pipefail
 
 TEST_NAME="test-2-dryrun-spawn-skip"
-LOG="${HOME}/.config/cscb/server.log"
-PID_FILE="${HOME}/.config/cscb/server.pid"
+LOG="${HOME}/.config/claude-slack-channel-bots/server.log"
+PID_FILE="${HOME}/.config/claude-slack-channel-bots/server.pid"
 INTERJECT_URL="http://127.0.0.1:3100/interject"
 
 fail() {

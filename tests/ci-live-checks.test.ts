@@ -940,8 +940,15 @@ describe('host-state', () => {
       ['agent-director', '--store-path', hostStorePath('/home/tester'), 'list', '--label', 'service=cscb'],
       ['tmux', 'ls', '-F', '#{session_name}'],
     ])
-    // b.fc4: the new default's config.json, then the old default's (a host not yet moved); only reads.
-    expect([p.read, p.ports]).toEqual([['/home/tester/.config/cscb/config.json', '/home/tester/.claude/channels/slack/config.json'], [3100]])
+    // b.fc4, b.smv: the new default's config.json, then 0.14.0's and 0.15.0's, then the oldest (a host not yet moved); only reads.
+    expect([p.read, p.ports]).toEqual([
+      [
+        '/home/tester/.config/claude-slack-channel-bots/config.json',
+        '/home/tester/.config/cscb/config.json',
+        '/home/tester/.claude/channels/slack/config.json',
+      ],
+      [3100],
+    ])
     expect(snap).toEqual({
       adRows: ['cscb_prod_a'],
       tmuxSessions: ['slack_bot_prod_a'],
@@ -951,11 +958,13 @@ describe('host-state', () => {
   })
 
   test.each([
-    ['only the new default has a config', { '/h/.config/cscb/config.json': 'new' }, 'new'],
-    ['only the old default has a config (a host not yet moved)', { '/h/.claude/channels/slack/config.json': 'old' }, 'old'],
-    ['both have one, the new default wins', { '/h/.config/cscb/config.json': 'new', '/h/.claude/channels/slack/config.json': 'old' }, 'new'],
+    ['only the new default has a config', { '/h/.config/claude-slack-channel-bots/config.json': 'new' }, 'new'],
+    ['only the 0.14.0/0.15.0 default has a config (a host not yet moved)', { '/h/.config/cscb/config.json': 'mid' }, 'mid'],
+    ['only the oldest default has a config (a host not yet moved)', { '/h/.claude/channels/slack/config.json': 'old' }, 'old'],
+    ['all three have one, the new default wins', { '/h/.config/claude-slack-channel-bots/config.json': 'new', '/h/.config/cscb/config.json': 'mid', '/h/.claude/channels/slack/config.json': 'old' }, 'new'],
+    ['the 0.14.0/0.15.0 and the oldest have one, the 0.14.0/0.15.0 default wins', { '/h/.config/cscb/config.json': 'mid', '/h/.claude/channels/slack/config.json': 'old' }, 'mid'],
     ['neither has one', {}, null],
-  ])('snapshotHost hashes the config in the new default state directory, else the old: %s', async (_what, files, hashed) => {
+  ])('snapshotHost hashes the config in the new default state directory, else the older defaults in order: %s', async (_what, files, hashed) => {
     const { deps } = probe({ stdout: '{"spawns":[]}' }, { stdout: '' }, null)
     const snap = await snapshotHost({ ...deps, readFile: (path: string) => (path in files ? Buffer.from(files[path as keyof typeof files]!) : null) }, '/h')
     expect(snap.configSha256).toBe(hashed === null ? 'absent' : createHash('sha256').update(hashed).digest('hex'))
@@ -2905,7 +2914,7 @@ interface ReloadWorld {
  * first. `scripts` is every script run.
  */
 function reloadContainer(home: string, world: ReloadWorld, answers: ReadonlyArray<readonly [string, Reply]> = []) {
-  const state = join(home, '.config', 'cscb')
+  const state = join(home, '.config', 'claude-slack-channel-bots')
   const copyFile = join(home, CONFIG_COPY.replace(/^~\//, ''))
   const files: Record<string, () => string | null> = {
     [CONFIG_COPY]: () => world.copy,
@@ -4509,7 +4518,7 @@ describe("tags and tagstext over a transcript (the container's helpers and the p
     })
 
     test('it reads every rotated server.log* and every transcript of every persona, and nothing else; priorContact counts what names the whole ID', async () => {
-      const state = join(home, '.config', 'cscb')
+      const state = join(home, '.config', 'claude-slack-channel-bots')
       mkdirSync(state, { recursive: true })
       const current = `[slack] Dispatching to persona "persona_c" (key=persona_c) chat_id=${DRY_RUN_IDS.aHome} user=${SECOND_ID}`
       const rotated = `[slack] dropped message user=${SECOND_ID} channel=C0DRYOTHER`

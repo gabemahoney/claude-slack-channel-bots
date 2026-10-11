@@ -2242,7 +2242,7 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
 
   // Bug b.avm: bots self-schedule by appending to CSCB_CRONTABLE_PATH, so it
   // must name the default outside ~/.claude (no permission prompt per write).
-  test('a config loaded with no cron_table_path and SLACK_STATE_DIR unset spawns with CSCB_CRONTABLE_PATH the new default, <home>/.config/cscb/crontab', async () => {
+  test('a config loaded with no cron_table_path and SLACK_STATE_DIR unset spawns with CSCB_CRONTABLE_PATH the new default, <home>/.config/claude-slack-channel-bots/crontab', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     installStub({ spawnCalls })
     const home = useSpawnHome()
@@ -2252,7 +2252,7 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
     await spawnForPersona(cfg.personas[0]!, cfg)
 
     const crontab = spawnCalls[0].extra_env?.['CSCB_CRONTABLE_PATH']
-    expect(crontab).toBe(join(home, '.config', 'cscb', 'crontab'))
+    expect(crontab).toBe(join(home, '.config', 'claude-slack-channel-bots', 'crontab'))
     expect(crontab).toBe(cfg.cron_table_path)
     expect(crontab!.startsWith(join(home, '.claude'))).toBe(false)
   })

@@ -104,6 +104,7 @@ import {
   LAUNCH_HOME_REFUSAL,
   LAUNCH_HOME_REFUSED_EXIT_CODE,
   LEGACY_STATE_DIR_PATH,
+  LEGACY_XDG_STATE_DIR_PATH,
   LIVE_LAUNCH_HOME_PROBE,
   type LaunchHomeProbe,
   type LaunchHomeRefusal,
@@ -142,8 +143,9 @@ const R = LAUNCH_HOME_REFUSAL
 /**
  * The paths under a home that `src/` and the agent-director client derive
  * from `homedir()`, written out here so that one dropped from
- * `LAUNCH_HOME_DERIVED_PATHS` fails its live row. All but the two default
- * state directories (`.config/cscb` and the old `.claude/channels/slack`) and
+ * `LAUNCH_HOME_DERIVED_PATHS` fails its live row. All but the three default
+ * state directories (`.config/claude-slack-channel-bots`, `.config/cscb` of
+ * 0.14.0 and 0.15.0, and the old `.claude/channels/slack`) and
  * what lies under them: their mere presence is its own rule, so a link at or
  * under them is `holdsSlackState` (rows of the live table).
  */
@@ -242,6 +244,7 @@ describe('launchHomeRefusal (recording fake probe)', () => {
   const T_HOME = join(TEMP, 'scratch-home')
   const SLACK = join(HOME, PRELOAD_STATE_DIR_PATH)
   const LEGACY_SLACK = join(HOME, LEGACY_STATE_DIR_PATH)
+  const LEGACY_XDG_SLACK = join(HOME, LEGACY_XDG_STATE_DIR_PATH)
   const CLAUDE = join(HOME, CLAUDE_DIR)
   const AD_DIR = join(HOME, AGENT_DIRECTOR_INSTALL_DIR)
   const AD_BIN = join(HOME, AGENT_DIRECTOR_INSTALL_PATH)
@@ -335,7 +338,8 @@ describe('launchHomeRefusal (recording fake probe)', () => {
       exists: [SLACK],
       links: { [HOME]: REAL },
     }, true],
-    ['a home holding Slack state (the default state directory, .config/cscb)', R.holdsSlackState, HOME, REAL, { exists: [SLACK] }, true],
+    ['a home holding Slack state (the default state directory, .config/claude-slack-channel-bots)', R.holdsSlackState, HOME, REAL, { exists: [SLACK] }, true],
+    ['a home holding Slack state at the 0.14.0 and 0.15.0 default, .config/cscb', R.holdsSlackState, HOME, REAL, { exists: [LEGACY_XDG_SLACK] }, true],
     ['a home holding Slack state at the old default, .claude/channels/slack', R.holdsSlackState, HOME, REAL, { exists: [LEGACY_SLACK] }, true],
     ['a home holding Slack state and an install, whose .claude leads into the real home (the Slack-state rule wins)', R.holdsSlackState, HOME, REAL, {
       exists: [SLACK, AD_DIR],

@@ -269,7 +269,7 @@ import {
 
 // ---------------------------------------------------------------------------
 // SLACK_STATE_DIR isolation — any default emitTrail in the poller would
-// otherwise land on the operator's real ~/.config/cscb/.
+// otherwise land on the operator's real ~/.config/claude-slack-channel-bots/.
 // ---------------------------------------------------------------------------
 
 let trailTempDir: string

@@ -214,7 +214,7 @@ function hostEnv(): Record<string, string | undefined> {
     LANG: '',
     SLACK_BOT_TOKEN: fakeToken(BOT_TOKEN_PREFIX, 'prod-bot'),
     SLACK_APP_TOKEN: fakeToken(APP_TOKEN_PREFIX, 'prod-app'),
-    SLACK_STATE_DIR: `${HOME}/.config/cscb`,
+    SLACK_STATE_DIR: `${HOME}/.config/claude-slack-channel-bots`,
     ANTHROPIC_API_KEY: `worker-own-${LEAK_SENTINEL}`,
     ANTHROPIC_BASE_URL: 'https://worker.invalid',
     CI_ANTHROPIC_API_KEY: GATEWAY_KEY,

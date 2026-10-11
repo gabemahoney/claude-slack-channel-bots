@@ -1,18 +1,51 @@
 /**
  * state-dir-migration.ts — The move of the server's state directory from its
- * old default, under `~/.claude`, to its new one, `<XDG config home>/cscb`
- * (bug b.fc4), and the state directory the commands that run before that move
- * must act on.
+ * old defaults to its current one, `<XDG config home>/claude-slack-channel-bots`
+ * (bugs b.fc4, b.smv), and the state directory the commands that run before
+ * that move must act on.
  *
- * Before b.fc4 the state directory defaulted to `slack` under
- * `~/.claude/channels` (the "legacy directory", `legacyServerStateDir`). Claude
- * Code asks the user before every write under `~/.claude`, and allow rules
- * cannot turn that off, so every unattended change of `config.json`,
- * `config.json.pending` / `.apply`, `channel-delivery.json` and the rest
- * stalled on a permission prompt. The default now sits outside it
- * (`resolveServerStateDir`, `config.ts`: `~/.config/cscb`, or
- * `$XDG_CONFIG_HOME/cscb`), in the folder the crontable and `prompts/` already
- * moved to in b.avm.
+ * Three locations have been the default:
+ *
+ * - L1, `legacyServerStateDir`: `slack` under `~/.claude/channels`, up to 0.13.
+ *   Claude Code asks the user before every write under `~/.claude`, and allow
+ *   rules cannot turn that off, so every unattended change of `config.json`,
+ *   `config.json.pending` / `.apply`, `channel-delivery.json` and the rest
+ *   stalled on a permission prompt (b.fc4).
+ * - L2, `legacyXdgStateDir`: `<XDG config home>/cscb`. 0.14.0 (b.avm) put only
+ *   the crontable and `prompts/` there, leaving links to them in L1; 0.15.0
+ *   (b.fc4) made it the whole state directory, with L1 a symbolic link to it.
+ *   "cscb" is an acronym that could clash with another app, so the folder is
+ *   named after the package instead (b.smv).
+ * - N, `resolveServerStateDir` (`config.ts`): `~/.config/claude-slack-channel-bots`,
+ *   or `$XDG_CONFIG_HOME/claude-slack-channel-bots`.
+ *
+ * The server's start migrates L2 first, then L1 (the newer location first; the
+ * rest of this header describes one such step, `prepareStateDir`, with the
+ * legacy directory `L` being L2 and then L1; `migrateStateDirAtStart` runs
+ * them). Every starting point ends at N:
+ *
+ * - L1 a directory only (0.13 and earlier): L1 is renamed to N, L1 is a link to N.
+ * - L1 a directory and a partial L2 (0.14.0): L2 is renamed to N and L2 is a link
+ *   to N; then L1 is merged into N (L1's links to L2's crontab and prompts
+ *   resolve into N and are redundant), and L1 is a link to N.
+ * - A full L2 and L1 a link to it (0.15.0): L2 is renamed to N and L2 is a link to
+ *   N; L1, still a link to L2, now reaches N (`already-migrated`) and is then
+ *   repointed straight at N (below), as 0.14.0's L1 is.
+ * - N only, with or without the links (a rerun): nothing to do.
+ *
+ * L1 a symbolic link whose absolute target is exactly L2 (b.fc4 made it) is
+ * repointed at N once L2 reaches N, after both steps ended without a stop
+ * (`repointLinkViaLegacyXdg`): a temporary link beside L1 is renamed over it,
+ * one atomic step. Without it, an operator who removes `~/.config/cscb` (the
+ * name may clash with another app) would leave L1 dangling. Any other link at
+ * L1 is the operator's own and is left alone. Failing to repoint is a WARN
+ * only (the data is at N), never a stop.
+ *
+ * A server of an old release running on either directory stops the start
+ * before anything moves (`legacy-server-running`), so one running on L1 does
+ * not find L2 renamed under it. The first step whose outcome stops the start
+ * ends the run. A step that left L2 `pending` (a conflict) skips L1 when L1 is
+ * a link to L2 (the one WARN covers it).
  *
  * `prepareStateDir` runs once per start, first in `main()`: before the state
  * directory is made, and so before anything reads or writes it (the PID check,
@@ -94,8 +127,13 @@
  *   cannot be made): `failed`, and the start stops with the failure's line.
  *   Every step leaves things whole (the source stays until the destination is
  *   in place), so nothing is lost and a later start continues; the fix is
- *   stated in the line. Failing to remove a leftover or to place the final
- *   link is only a WARN (`pending`): the data is at `N`.
+ *   stated in the line. The line advises `SLACK_STATE_DIR=<L>` to keep the old
+ *   location only when `L` holds a configuration (0.14.0's L2 holds only the
+ *   crontable and `prompts/`: the server would refuse to start on it), and
+ *   the server records the stop in `resolveCliStateDir`'s directory, computed
+ *   before the move, where the CLI and the daemon's log look. Failing to
+ *   remove a leftover or to place the final link is only a WARN (`pending`):
+ *   the data is at `N`.
  *
  * The line for the move sorts of entries names the entries by file name only;
  * nothing logged carries file contents.
@@ -112,14 +150,16 @@
  * start on the new default, while the real configuration, and perhaps a
  * running old server, is still in `L`. Moving files from there while an old
  * server may be running is unsafe, so they do not migrate; `resolveCliStateDir`
- * returns `L` whenever `L/server.pid` is a regular file naming a live process
+ * returns a legacy directory (L2 before L1: the newer one wins) whenever its
+ * `server.pid` is a regular file naming a live process
  * (whatever `N` holds, so `stop` and `clean_restart` reach the old server and
  * the legacy-server-running line's advice to run `stop` works), and otherwise
- * while `L` is a directory (a real one, or a link to another directory, an
- * operator's arrangement) holding a configuration (or a PID file) and `N`
- * holds no configuration, so they find the config and the PID file the old
- * server uses and postinstall does not write an empty skeleton into `N`. Once
- * the server has migrated, `L` is a link to `N`, and they use `N`.
+ * the first legacy directory that is a directory (a real one, or a link to
+ * another directory, an operator's arrangement) holding a configuration (or a
+ * PID file) while `N` holds no configuration, so they find the config and the
+ * PID file the old server uses and postinstall does not write an empty
+ * skeleton into `N`. Once the server has migrated, each legacy directory is a
+ * link to `N`, and they use `N`.
  *
  * File system access goes through `StateDirMigrationFs`, which tests override
  * in part; paths and the log come from the caller, so tests run it under a
@@ -151,7 +191,7 @@ import { randomBytes } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 
-import { CONFIG_FILE_NAME, isStateDirOverridden, resolveServerStateDir } from './config.ts'
+import { CONFIG_FILE_NAME, isStateDirOverridden, resolveServerStateDir, resolveXdgConfigHome } from './config.ts'
 import { isProcessRunning } from './pid.ts'
 import { describeThrownValueWithoutStack } from './persona-connection-errors.ts'
 
@@ -207,22 +247,55 @@ export function legacyServerStateDir(home?: string): string {
   return join(home ?? homedir(), '.claude', 'channels', 'slack')
 }
 
+/** The directory name under the XDG configuration directory that 0.14.0 and 0.15.0 used (bug b.smv renamed it). */
+export const LEGACY_XDG_DIR_NAME = 'cscb'
+
+/**
+ * The state directory 0.14.0 and 0.15.0 used: `cscb` under the XDG
+ * configuration directory (`resolveXdgConfigHome`), so `~/.config/cscb` unless
+ * `XDG_CONFIG_HOME` names another directory. Pure.
+ *
+ * @param home  Home directory; defaults to the OS home, read only when needed.
+ * @param env   Environment to read `XDG_CONFIG_HOME` from; defaults to `process.env`.
+ */
+export function legacyXdgStateDir(home?: string, env: NodeJS.ProcessEnv = process.env): string {
+  return join(resolveXdgConfigHome(home, env), LEGACY_XDG_DIR_NAME)
+}
+
 /** The two directories the migration compares, each absolute. */
 export interface StateDirPaths {
-  /** The old default (`legacyServerStateDir`). */
+  /** The old default being moved (`legacyServerStateDir` or `legacyXdgStateDir`). */
   legacyDir: string
   /** The new default (`resolveServerStateDir`). */
   newDir: string
+  /**
+   * Set when `legacyDir` already sits outside `~/.claude` (`legacyXdgStateDir`): only the folder's name changes, so
+   * the information lines do not claim a move out of `~/.claude`.
+   */
+  legacyIsXdg?: boolean
 }
 
 /**
- * The directories to migrate between, or undefined when `SLACK_STATE_DIR` is
- * set and non-empty (the variable names the state directory, so there is
- * nothing to move). Pure: touches no file.
+ * The directories to migrate between for the old default under `~/.claude`
+ * (L1), or undefined when `SLACK_STATE_DIR` is set and non-empty (the variable
+ * names the state directory, so there is nothing to move). Pure: touches no
+ * file.
  */
 export function stateDirPaths(home?: string, env: NodeJS.ProcessEnv = process.env): StateDirPaths | undefined {
   if (isStateDirOverridden(env)) return undefined
   return { legacyDir: legacyServerStateDir(home), newDir: resolveServerStateDir(home, env) }
+}
+
+/**
+ * Every migration step the start runs, in order: L2 (`legacyXdgStateDir`) to
+ * the new directory, then L1 (`legacyServerStateDir`) to it (the newer
+ * location first). Undefined when `SLACK_STATE_DIR` is set and non-empty.
+ * Pure: touches no file.
+ */
+export function stateDirMigrationSteps(home?: string, env: NodeJS.ProcessEnv = process.env): StateDirPaths[] | undefined {
+  const l1 = stateDirPaths(home, env)
+  if (l1 === undefined) return undefined
+  return [{ legacyDir: legacyXdgStateDir(home, env), newDir: l1.newDir, legacyIsXdg: true }, l1]
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +415,12 @@ export type StateDirMigrationOutcome =
       cause: string
       failures: { name: string; cause: string }[]
       newDirExists?: boolean
+      /**
+       * Set to false only when the legacy directory of the failed step certainly holds no configuration, so
+       * `SLACK_STATE_DIR=<it>` is not advised (`stateDirFailedLine`): a 0.14.0 host's L2 holds only the crontable
+       * and `prompts/`, and the server would refuse to start on it. Unset counts as holding one.
+       */
+      legacyHoldsConfig?: boolean
     }
 
 /** Whether the start must stop on this outcome (a refused start, never a guess). */
@@ -358,21 +437,26 @@ function entriesText(entries: readonly string[]): string {
 }
 
 /** The information line when the whole directory was renamed. */
-export function stateDirRenamedLine(legacyDir: string, newDir: string): string {
+export function stateDirRenamedLine(legacyDir: string, newDir: string, legacyIsXdg = false): string {
+  const why = legacyIsXdg
+    ? `its new default location, named after the package`
+    : `its new default location outside ~/.claude, where Claude Code does not ask before a write`
   return (
-    `${STATE_MIGRATE_LOG_PREFIX} moved the state directory from ${legacyDir} to ${newDir}, its new default ` +
-    `location outside ~/.claude, where Claude Code does not ask before a write. ${legacyDir} is now a symbolic ` +
-    `link to it, so a session, script or configuration path that still names the old directory reaches the same files.`
+    `${STATE_MIGRATE_LOG_PREFIX} moved the state directory from ${legacyDir} to ${newDir}, ${why}. ${legacyDir} is now a ` +
+    `symbolic link to it, so a session, script or configuration path that still names the old directory reaches the same files.`
   )
 }
 
 /** The information line when the entries were merged into the existing new directory. */
-export function stateDirMergedLine(legacyDir: string, newDir: string, entries: readonly string[]): string {
+export function stateDirMergedLine(legacyDir: string, newDir: string, entries: readonly string[], legacyIsXdg = false): string {
   const moved = entries.length === 0 ? 'nothing needed to move' : `moved ${entriesText(entries)}`
+  const why = legacyIsXdg
+    ? `named after the package`
+    : `outside ~/.claude, where Claude Code does not ask before a write`
   return (
-    `${STATE_MIGRATE_LOG_PREFIX} the state directory's new default location is ${newDir}, outside ~/.claude, where ` +
-    `Claude Code does not ask before a write; ${moved} from ${legacyDir}. ${legacyDir} is now a symbolic link to ` +
-    `${newDir}, so a session, script or configuration path that still names the old directory reaches the same files.`
+    `${STATE_MIGRATE_LOG_PREFIX} the state directory's new default location is ${newDir}, ${why}; ${moved} from ` +
+    `${legacyDir}. ${legacyDir} is now a symbolic link to ${newDir}, so a session, script or configuration path that ` +
+    `still names the old directory reaches the same files.`
   )
 }
 
@@ -430,7 +514,10 @@ export function stateDirLegacyServerRunningLine(legacyDir: string, newDir: strin
  * The stop line when a step failed. `newDirExists` is whether `newDir` is
  * there: `mv <legacy> <new>` is the hand-fix only when it is not (with `newDir`
  * a directory, mv puts the old one inside it as `<new>/<name>`), otherwise
- * the entries left in `legacyDir` are moved one at a time.
+ * the entries left in `legacyDir` are moved one at a time. `legacyHoldsConfig`
+ * is whether `legacyDir` holds a configuration: only then is
+ * `SLACK_STATE_DIR=<legacyDir>` advised (a legacy directory with no
+ * configuration, such as 0.14.0's L2, would make the server refuse to start).
  */
 export function stateDirFailedLine(
   legacyDir: string,
@@ -439,6 +526,7 @@ export function stateDirFailedLine(
   cause: string,
   failures: readonly { name: string; cause: string }[],
   newDirExists = false,
+  legacyHoldsConfig = true,
 ): string {
   const what =
     step === 'mkdir'
@@ -449,11 +537,11 @@ export function stateDirFailedLine(
   const byHand = newDirExists
     ? `move each entry still in ${legacyDir} that is not in ${newDir} by hand (mv ${legacyDir}/<name> ${newDir}/<name>)`
     : `move it by hand (mv ${legacyDir} ${newDir} && ln -s ${newDir} ${legacyDir})`
+  const keepOld = legacyHoldsConfig ? `, or set SLACK_STATE_DIR=${legacyDir} to keep the old location` : ''
   return (
     `${STATE_MIGRATE_LOG_PREFIX} could not move the state directory from ${legacyDir} to its new default location ` +
     `${newDir}: ${what}${step === 'move' ? '' : ` (${cause})`}. Nothing was lost: what did not move is still in ` +
-    `${legacyDir}. Fix the cause and start again, or ${byHand}, or set SLACK_STATE_DIR=${legacyDir} to keep the old ` +
-    `location.`
+    `${legacyDir}. Fix the cause and start again, or ${byHand}${keepOld}.`
   )
 }
 
@@ -463,7 +551,7 @@ export function stateDirStopMessage(paths: StateDirPaths, outcome: StateDirMigra
     return stateDirLegacyServerRunningLine(paths.legacyDir, paths.newDir, outcome.pid)
   }
   if (outcome.kind === 'failed') {
-    return stateDirFailedLine(paths.legacyDir, paths.newDir, outcome.step, outcome.cause, outcome.failures, outcome.newDirExists)
+    return stateDirFailedLine(paths.legacyDir, paths.newDir, outcome.step, outcome.cause, outcome.failures, outcome.newDirExists, outcome.legacyHoldsConfig)
   }
   return `${STATE_MIGRATE_LOG_PREFIX} the state directory migration stopped the start.`
 }
@@ -476,6 +564,23 @@ export function stateDirLinkFailedLine(legacyDir: string, newDir: string, cause:
     `reach it. The server itself uses ${newDir} and does not depend on the old name, and a later start does not ` +
     `restore the link. To restore it, make sure nothing is left at ${legacyDir} (if it is a directory, it should ` +
     `hold nothing that is not at ${newDir}), then run: ln -s ${newDir} ${legacyDir}`
+  )
+}
+
+/** The information line when L1, a link to L2 (0.15.0), was repointed straight at the new directory. */
+export function stateDirRepointedLine(legacyServerDir: string, legacyXdgDir: string, newDir: string): string {
+  return (
+    `${STATE_MIGRATE_LOG_PREFIX} ${legacyServerDir} was a symbolic link to ${legacyXdgDir}, which is now a link to ` +
+    `${newDir}; it is now a symbolic link to ${newDir} itself, so removing ${legacyXdgDir} does not leave it dangling.`
+  )
+}
+
+/** The WARN when L1 could not be repointed (the data is at the new directory, and L1 still reaches it through L2). */
+export function stateDirRepointFailedLine(legacyServerDir: string, legacyXdgDir: string, newDir: string, cause: string): string {
+  return (
+    `${STATE_MIGRATE_WARN_PREFIX} the state directory is at ${newDir}, which is in use, but ${legacyServerDir} could not be ` +
+    `repointed from ${legacyXdgDir} to it: ${cause}. It still reaches ${newDir} through ${legacyXdgDir}, so do not ` +
+    `remove ${legacyXdgDir} until it is repointed (ln -sfn ${newDir} ${legacyServerDir}). The server itself uses ${newDir}.`
   )
 }
 
@@ -505,6 +610,15 @@ function realpathOrUndefined(fs: StateDirMigrationFs, path: string): string | un
   } catch {
     return undefined
   }
+}
+
+/**
+ * `path` with the symbolic links in its directory part resolved (the name itself is not followed), or `path` as is
+ * when the directory cannot be resolved. Two paths that name one entry through different directory links are equal.
+ */
+function canonicalPath(fs: StateDirMigrationFs, path: string): string {
+  const parent = realpathOrUndefined(fs, dirname(path))
+  return parent === undefined ? path : join(parent, basename(path))
 }
 
 /** Remove a name this module made under a temporary name; one that cannot be removed is left. */
@@ -572,7 +686,8 @@ function absoluteLinkTarget(fs: StateDirMigrationFs, path: string): string {
 function compareSymlinkEntry(fs: StateDirMigrationFs, src: string, dst: string, dstStat: StateEntryStat | undefined): EntryVerdict {
   const target = absoluteLinkTarget(fs, src)
   const dstIsLink = dstStat?.isSymbolicLink() === true
-  if (target === dst) {
+  // `canonicalPath`: a 0.14.0 `L1/crontab` -> `L2/crontab` names `N/crontab` once `L2` is a link to `N`.
+  if (target === dst || canonicalPath(fs, target) === canonicalPath(fs, dst)) {
     // Two links naming each other hold no data: neither is dropped.
     return dstIsLink && absoluteLinkTarget(fs, dst) === src ? 'conflict' : 'redundant'
   }
@@ -871,8 +986,9 @@ function runningLegacyServer(fs: StateDirMigrationFs, paths: StateDirPaths, deps
 function mergeEntries(fs: StateDirMigrationFs, paths: StateDirPaths, log: (line: string) => void): StateDirMigrationOutcome {
   if (!fs.stat(paths.newDir).isDirectory()) {
     const cause = `${paths.newDir} exists and is not a directory`
-    log(stateDirFailedLine(paths.legacyDir, paths.newDir, 'mkdir', cause, [], true))
-    return { kind: 'failed', step: 'mkdir', cause, failures: [], newDirExists: true }
+    const noConfig = legacyLacksConfiguration(fs, paths.legacyDir)
+    log(stateDirFailedLine(paths.legacyDir, paths.newDir, 'mkdir', cause, [], true, !noConfig))
+    return { kind: 'failed', step: 'mkdir', cause, failures: [], newDirExists: true, ...(noConfig ? { legacyHoldsConfig: false } : {}) }
   }
   const moved: string[] = []
   const redundant: string[] = []
@@ -894,9 +1010,10 @@ function mergeEntries(fs: StateDirMigrationFs, paths: StateDirPaths, log: (line:
     }
   }
   if (failures.length > 0) {
-    const line = stateDirFailedLine(paths.legacyDir, paths.newDir, 'move', '', failures, true)
+    const noConfig = legacyLacksConfiguration(fs, paths.legacyDir)
+    const line = stateDirFailedLine(paths.legacyDir, paths.newDir, 'move', '', failures, true, !noConfig)
     log(line)
-    return { kind: 'failed', step: 'move', cause: line, failures, newDirExists: true }
+    return { kind: 'failed', step: 'move', cause: line, failures, newDirExists: true, ...(noConfig ? { legacyHoldsConfig: false } : {}) }
   }
   if (conflicts.length > 0) {
     log(stateDirPendingLine(paths.legacyDir, paths.newDir, moved, conflicts, []))
@@ -920,7 +1037,7 @@ function mergeEntries(fs: StateDirMigrationFs, paths: StateDirPaths, log: (line:
   if (!replaceLegacyDirWithLink(fs, paths, log)) {
     return { kind: 'pending', entries: moved, conflicts: [], leftover: [] }
   }
-  log(stateDirMergedLine(paths.legacyDir, paths.newDir, moved))
+  log(stateDirMergedLine(paths.legacyDir, paths.newDir, moved, paths.legacyIsXdg === true))
   return { kind: 'moved', via: 'merge', entries: moved }
 }
 
@@ -962,8 +1079,9 @@ function migrate(fs: StateDirMigrationFs, paths: StateDirPaths, deps: StateDirMi
       fs.mkdirp(dirname(paths.newDir))
     } catch (err) {
       const cause = describeThrownValueWithoutStack(err)
-      log(stateDirFailedLine(paths.legacyDir, paths.newDir, 'mkdir', cause, []))
-      return { kind: 'failed', step: 'mkdir', cause, failures: [], newDirExists: false }
+      const noConfig = legacyLacksConfiguration(fs, paths.legacyDir)
+      log(stateDirFailedLine(paths.legacyDir, paths.newDir, 'mkdir', cause, [], false, !noConfig))
+      return { kind: 'failed', step: 'mkdir', cause, failures: [], newDirExists: false, ...(noConfig ? { legacyHoldsConfig: false } : {}) }
     }
     try {
       fs.rename(paths.legacyDir, paths.newDir)
@@ -975,12 +1093,21 @@ function migrate(fs: StateDirMigrationFs, paths: StateDirPaths, deps: StateDirMi
         log(stateDirLinkFailedLine(paths.legacyDir, paths.newDir, describeThrownValueWithoutStack(err)))
         return { kind: 'pending', entries: [], conflicts: [], leftover: [] }
       }
-      log(stateDirRenamedLine(paths.legacyDir, paths.newDir))
+      log(stateDirRenamedLine(paths.legacyDir, paths.newDir, paths.legacyIsXdg === true))
       return { kind: 'moved', via: 'rename', entries: [] }
     } catch (err) {
       if (errnoCode(err) !== 'EXDEV') {
         const cause = describeThrownValueWithoutStack(err)
-        const line = stateDirFailedLine(paths.legacyDir, paths.newDir, 'move', cause, [{ name: basename(paths.legacyDir), cause }])
+        const noConfig = legacyLacksConfiguration(fs, paths.legacyDir)
+        const line = stateDirFailedLine(
+          paths.legacyDir,
+          paths.newDir,
+          'move',
+          cause,
+          [{ name: basename(paths.legacyDir), cause }],
+          false,
+          !noConfig,
+        )
         log(line)
         return {
           kind: 'failed',
@@ -988,6 +1115,7 @@ function migrate(fs: StateDirMigrationFs, paths: StateDirPaths, deps: StateDirMi
           cause: line,
           failures: [{ name: basename(paths.legacyDir), cause }],
           newDirExists: false,
+          ...(noConfig ? { legacyHoldsConfig: false } : {}),
         }
       }
     }
@@ -996,8 +1124,9 @@ function migrate(fs: StateDirMigrationFs, paths: StateDirPaths, deps: StateDirMi
       fs.mkdirp(paths.newDir)
     } catch (err) {
       const cause = describeThrownValueWithoutStack(err)
-      log(stateDirFailedLine(paths.legacyDir, paths.newDir, 'mkdir', cause, []))
-      return { kind: 'failed', step: 'mkdir', cause, failures: [], newDirExists: false }
+      const noConfig = legacyLacksConfiguration(fs, paths.legacyDir)
+      log(stateDirFailedLine(paths.legacyDir, paths.newDir, 'mkdir', cause, [], false, !noConfig))
+      return { kind: 'failed', step: 'mkdir', cause, failures: [], newDirExists: false, ...(noConfig ? { legacyHoldsConfig: false } : {}) }
     }
   }
   return mergeEntries(fs, paths, log)
@@ -1025,29 +1154,184 @@ export function prepareStateDir(paths: StateDirPaths, deps: StateDirMigrationDep
     } catch {
       // Cannot be looked at: present.
     }
-    deps.log(stateDirFailedLine(paths.legacyDir, paths.newDir, 'unexpected', cause, [], newDirExists))
-    return { kind: 'failed', step: 'unexpected', cause, failures: [], newDirExists }
+    const noConfig = legacyLacksConfiguration(fs, paths.legacyDir)
+    deps.log(stateDirFailedLine(paths.legacyDir, paths.newDir, 'unexpected', cause, [], newDirExists, !noConfig))
+    return { kind: 'failed', step: 'unexpected', cause, failures: [], newDirExists, ...(noConfig ? { legacyHoldsConfig: false } : {}) }
+  }
+}
+
+/** How much an outcome tells the start, for choosing the one of several steps to report (higher wins; ties go to the later step). */
+const OUTCOME_RANK: Readonly<Record<StateDirMigrationOutcome['kind'], number>> = {
+  overridden: 0,
+  'no-legacy': 0,
+  'already-migrated': 1,
+  'legacy-unusable': 2,
+  moved: 3,
+  pending: 4,
+  'legacy-server-running': 5,
+  failed: 5,
+}
+
+/**
+ * The PID of an old server running on the legacy directory of `paths`, with
+ * the gating `migrate` applies: nothing for an absent or dangling name, a
+ * name that is not a directory, or one that already reaches the new directory.
+ * Never throws (an entry that cannot be looked at counts as no server: the
+ * step itself reports the failure).
+ */
+function runningServerOnStepDir(fs: StateDirMigrationFs, paths: StateDirPaths, deps: StateDirMigrationDeps): number | undefined {
+  try {
+    const legacy = lstatIfPresent(fs, paths.legacyDir)
+    if (legacy === undefined) return undefined
+    const real = realpathOrUndefined(fs, paths.legacyDir)
+    if (real === undefined) return undefined // dangling
+    if (real === realpathOrUndefined(fs, paths.newDir)) return undefined // migrated, or the reverse link
+    if (!legacy.isSymbolicLink() && !legacy.isDirectory()) return undefined
+    return runningLegacyServer(fs, paths, deps)
+  } catch {
+    return undefined
   }
 }
 
 /**
- * The server start's call: the directories from the environment
- * (`stateDirPaths`), `overridden` when `SLACK_STATE_DIR` is set, else
- * `prepareStateDir`.
+ * The server start's call: the steps from the environment
+ * (`stateDirMigrationSteps`), `overridden` when `SLACK_STATE_DIR` is set.
+ * Otherwise, in this order:
+ *
+ * 1. Every legacy directory is looked at for a running old server before
+ *    anything moves (`legacy-server-running`, with the steps' paths of the
+ *    directory it runs on): a server on L1 must not find L2 renamed under it.
+ * 2. L2 (`legacyXdgStateDir`) is prepared (`prepareStateDir`), then L1
+ *    (`legacyServerStateDir`); the first outcome that stops the start ends
+ *    the run and is returned with the paths of its step, so the caller's line
+ *    names the directory that caused it. L1 is skipped when L2 is `pending` and
+ *    L1 is a link to L2 (0.15.0): the WARN already says what to do.
+ *
+ * The result also carries `startupErrorDir`, `resolveCliStateDir` computed
+ * before anything moved: where the caller records a stop's startup error (the
+ * directory that holds the configuration, which the CLI and the daemon's log
+ * use, and not the stopping step's legacy directory: 0.14.0's L2 holds only
+ * the crontable and `prompts/`).
+ *
+ * After the steps ended without a stop, an L1 that is a link to L2 is repointed
+ * at N (`repointLinkViaLegacyXdg`).
+ *
+ * Without a stop the outcome reported is the most telling of the steps
+ * (pending, moved, legacy-unusable, already-migrated, no-legacy; the later step
+ * on a tie), with its step's paths. The caller only needs to know whether a
+ * directory moved (`moved`, `pending`): the server's log is then repointed.
  */
 export function migrateStateDirAtStart(
   deps: StateDirMigrationDeps,
   home?: string,
   env: NodeJS.ProcessEnv = process.env,
-): { paths: StateDirPaths | undefined; outcome: StateDirMigrationOutcome } {
-  const paths = stateDirPaths(home, env)
-  if (paths === undefined) return { paths, outcome: { kind: 'overridden' } }
-  return { paths, outcome: prepareStateDir(paths, deps) }
+): { paths: StateDirPaths | undefined; outcome: StateDirMigrationOutcome; startupErrorDir: string } {
+  const startupErrorDir = resolveCliStateDir(home, env, deps.fs, deps.isProcessRunning)
+  const steps = stateDirMigrationSteps(home, env)
+  if (steps === undefined) return { paths: undefined, outcome: { kind: 'overridden' }, startupErrorDir }
+  const fs: StateDirMigrationFs = { ...NODE_STATE_DIR_MIGRATION_FS, ...deps.fs }
+  for (const step of steps) {
+    const pid = runningServerOnStepDir(fs, step, deps)
+    if (pid !== undefined) {
+      return { paths: step, outcome: { kind: 'legacy-server-running', pid }, startupErrorDir: stopLogDir(fs, startupErrorDir, step) }
+    }
+  }
+  let reported: { paths: StateDirPaths; outcome: StateDirMigrationOutcome } | undefined
+  for (const step of steps) {
+    if (reported?.outcome.kind === 'pending' && linksToDirectory(fs, step.legacyDir, reported.paths.legacyDir)) continue
+    const outcome = prepareStateDir(step, deps)
+    if (stateDirMigrationStopsStart(outcome)) return { paths: step, outcome, startupErrorDir: stopLogDir(fs, startupErrorDir, step) }
+    if (reported === undefined || OUTCOME_RANK[outcome.kind] >= OUTCOME_RANK[reported.outcome.kind]) reported = { paths: step, outcome }
+  }
+  repointLinkViaLegacyXdg(fs, steps[1].legacyDir, steps[0].legacyDir, steps[0].newDir, deps.log)
+  return { ...(reported ?? { paths: steps[steps.length - 1], outcome: { kind: 'no-legacy' } as StateDirMigrationOutcome }), startupErrorDir }
+}
+
+/**
+ * Where a stop's startup error is recorded: `startupErrorDir` when it exists, else the stopping step's legacy
+ * directory. `resolveCliStateDir` can name N while N is not there (no legacy directory holds the configuration or a
+ * PID file, so it falls back to the default); recording an error there would make N, as a directory, before the
+ * stop line's own hand-fix (`mv <legacy> <N> && ln -s <N> <legacy>`) runs, and the next start would merge instead
+ * of moving. Never throws.
+ */
+function stopLogDir(fs: StateDirMigrationFs, startupErrorDir: string, step: StateDirPaths): string {
+  try {
+    return lstatIfPresent(fs, startupErrorDir) === undefined ? step.legacyDir : startupErrorDir
+  } catch {
+    return startupErrorDir
+  }
+}
+
+/**
+ * After a 0.15.0 upgrade L1 is a link to L2 (b.fc4 made it), and L2 is now a
+ * link to N. An operator may delete `~/.config/cscb` (the point of the rename
+ * is that the name may clash with another app), which would leave L1
+ * dangling, so L1 is repointed straight at N, as 0.14.0's is: a temporary
+ * link beside L1, renamed over it in one step. Only when the chain is exactly
+ * the one the migration makes: L1 a link whose absolute target is L2, L2 a
+ * link whose absolute target is N (not a directory, and not a link elsewhere
+ * that merely reaches N's data: deleting it must lose nothing), and L1 itself
+ * reaching N. Any other layout is the operator's own and stays. An absent L1
+ * (a fresh install) or L2 is silent. A failure is only a WARN (the data is at N). Never
+ * throws.
+ */
+function repointLinkViaLegacyXdg(
+  fs: StateDirMigrationFs,
+  legacyServerDir: string,
+  legacyXdgDir: string,
+  newDir: string,
+  log: (line: string) => void,
+): void {
+  let swap: string | undefined
+  try {
+    if (!fs.lstat(legacyServerDir).isSymbolicLink()) return
+    if (absoluteLinkTarget(fs, legacyServerDir) !== legacyXdgDir) return
+    if (!fs.lstat(legacyXdgDir).isSymbolicLink()) return
+    if (absoluteLinkTarget(fs, legacyXdgDir) !== newDir) return
+    const newReal = realpathOrUndefined(fs, newDir)
+    if (newReal === undefined || realpathOrUndefined(fs, legacyServerDir) !== newReal) return
+    swap = tempNameBeside(legacyServerDir)
+    fs.symlink(newDir, swap)
+    fs.rename(swap, legacyServerDir)
+    log(stateDirRepointedLine(legacyServerDir, legacyXdgDir, newDir))
+  } catch (err) {
+    // Absent (nothing to repoint) is not a failure; any other error is a WARN.
+    if (swap !== undefined) removeTemporary(fs, swap)
+    if (swap !== undefined || !ABSENT_CODES.has(errnoCode(err) ?? '')) {
+      log(stateDirRepointFailedLine(legacyServerDir, legacyXdgDir, newDir, describeThrownValueWithoutStack(err)))
+    }
+  }
+}
+
+/** Whether `path` is a symbolic link that reaches the directory `target` (a directory of its own is not). */
+function linksToDirectory(fs: StateDirMigrationFs, path: string, target: string): boolean {
+  try {
+    if (!fs.lstat(path).isSymbolicLink()) return false
+    const real = realpathOrUndefined(fs, path)
+    return real !== undefined && real === realpathOrUndefined(fs, target)
+  } catch {
+    return false
+  }
 }
 
 // ---------------------------------------------------------------------------
 // The state directory for commands other than the server's start
 // ---------------------------------------------------------------------------
+
+/**
+ * Whether `dir` certainly holds no configuration: neither marker is there (absent, not merely unreadable). Decides
+ * that `SLACK_STATE_DIR=<dir>` is not advised in a failure line.
+ */
+function legacyLacksConfiguration(fs: StateDirMigrationFs, dir: string): boolean {
+  return CONFIG_MARKER_NAMES.every((name) => {
+    try {
+      fs.stat(join(dir, name))
+      return false
+    } catch (err) {
+      return ABSENT_CODES.has(errnoCode(err) ?? '')
+    }
+  })
+}
 
 /** Whether `dir` holds a configuration or the last-applied record, links followed. */
 function holdsConfiguration(fs: StateDirMigrationFs, dir: string): boolean {
@@ -1063,8 +1347,9 @@ function holdsConfiguration(fs: StateDirMigrationFs, dir: string): boolean {
 
 /**
  * The state directory for everything but the server's start: the new default
- * (`resolveServerStateDir`), except, with `SLACK_STATE_DIR` unset and the legacy
- * directory `L` a directory other than the new one `N` (a real directory, or a
+ * (`resolveServerStateDir`, `N`), except, with `SLACK_STATE_DIR` unset and a
+ * legacy directory `L` (L2, `legacyXdgStateDir`, before L1, `legacyServerStateDir`:
+ * the newer location wins) a directory other than `N` (a real directory, or a
  * link to another directory, an operator's arrangement):
  *
  * - `L` when `L/server.pid` is a regular file naming a live process (the test
@@ -1072,8 +1357,10 @@ function holdsConfiguration(fs: StateDirMigrationFs, dir: string): boolean {
  *   `N/config.json` since the upgrade, and `stop` and `clean_restart` must
  *   still reach the old server, which is also what the start's
  *   legacy-server-running line tells the operator to run.
- * - else `L` when it holds a configuration (or a PID file) and `N` holds no
- *   configuration.
+ * - else the first `L` that holds a configuration (or a PID file) while `N`
+ *   holds no configuration. 0.14.0's L2 holds only a crontable and `prompts/`,
+ *   so on that host L1 is chosen; 0.15.0's L2 holds the configuration (L1 is a
+ *   link to it), so L2 is.
  *
  * That is the window between an upgrade and the server's first start on the new
  * default: the real configuration, and any running old server's PID file and
@@ -1101,17 +1388,31 @@ export function resolveCliStateDir(
   const stateDir = resolveServerStateDir(home, env)
   if (isStateDirOverridden(env)) return stateDir
   const real: StateDirMigrationFs = { ...NODE_STATE_DIR_MIGRATION_FS, ...fs }
-  const legacyDir = legacyServerStateDir(home)
+  // The candidates: a legacy name that is a directory (links followed) other than `N`. Absent, dangling, a file,
+  // migrated (a link to `N`, or the reverse link) or one that cannot be looked at is the new default's business.
+  const candidates: StateDirPaths[] = []
+  for (const legacyDir of [legacyXdgStateDir(home, env), legacyServerStateDir(home)]) {
+    try {
+      real.lstat(legacyDir) // throws when absent or unreadable
+      const legacyReal = realpathOrUndefined(real, legacyDir)
+      if (legacyReal === undefined) continue // a dangling link
+      if (!real.stat(legacyDir).isDirectory()) continue // a file
+      if (legacyReal === realpathOrUndefined(real, stateDir)) continue // migrated (or the reverse link): one directory
+      candidates.push({ legacyDir, newDir: stateDir })
+    } catch {
+      // Cannot be looked at: not a candidate.
+    }
+  }
+  for (const paths of candidates) {
+    if (runningLegacyServer(real, paths, { log: () => {}, isProcessRunning: isRunning }) !== undefined) return paths.legacyDir
+  }
   try {
-    real.lstat(legacyDir) // throws when absent or unreadable: the new default
-    const legacyReal = realpathOrUndefined(real, legacyDir)
-    if (legacyReal === undefined) return stateDir // a dangling link
-    if (!real.stat(legacyDir).isDirectory()) return stateDir // a file
-    if (legacyReal === realpathOrUndefined(real, stateDir)) return stateDir // migrated (or the reverse link): one directory
-    const paths: StateDirPaths = { legacyDir, newDir: stateDir }
-    if (runningLegacyServer(real, paths, { log: () => {}, isProcessRunning: isRunning }) !== undefined) return legacyDir
-    const legacyHolds = holdsConfiguration(real, legacyDir) || lstatIfPresent(real, join(legacyDir, PID_FILE_NAME)) !== undefined
-    if (legacyHolds && !holdsConfiguration(real, stateDir)) return legacyDir
+    if (!holdsConfiguration(real, stateDir)) {
+      for (const { legacyDir } of candidates) {
+        const legacyHolds = holdsConfiguration(real, legacyDir) || lstatIfPresent(real, join(legacyDir, PID_FILE_NAME)) !== undefined
+        if (legacyHolds) return legacyDir
+      }
+    }
   } catch {
     // Cannot be looked at: the new default.
   }

@@ -159,7 +159,7 @@ restart resumes.
 Read this section before every run.
 
 - **Operator-run only**, on a **test Slack workspace**. Never on a workspace that production bots serve.
-- **Never on the production install.** Use a dedicated host or VM whose HOME holds no production CSCB state (`~/.config/cscb/`, or `~/.claude/channels/slack/` from an earlier release) and no production `~/.agent-director`. The start sweep kills every live `service=cscb` agent-director row that names no configured persona (it keeps the row), so a test server sharing `~/.agent-director` with a production CSCB would kill the production bots. A dedicated OS user is acceptable only on a host that runs no production CSCB at all: only one CSCB server runs per host (they would both need port 3100).
+- **Never on the production install.** Use a dedicated host or VM whose HOME holds no production CSCB state (`~/.config/claude-slack-channel-bots/`, or `~/.config/cscb/` or `~/.claude/channels/slack/` from an earlier release) and no production `~/.agent-director`. The start sweep kills every live `service=cscb` agent-director row that names no configured persona (it keeps the row), so a test server sharing `~/.agent-director` with a production CSCB would kill the production bots. A dedicated OS user is acceptable only on a host that runs no production CSCB at all: only one CSCB server runs per host (they would both need port 3100).
 - **Never through `/ci` or `/release-test`.** Only the operator runs this plan, by hand, or starts `/ci-live`, which runs it in a throwaway container.
 - **Never type or paste a token** into a chat (the wizard's included), this ticket, the results table, a log or a shell command line. Tokens go only into the wizard's credentials command, at its hidden prompts, in the operator's own terminal (Check S1). Every token check in this plan counts matches and never prints one.
 - **A Linux host with bash.** The plan's commands need GNU/Linux and an interactive bash shell: they read `/proc/<pid>/environ`, and use `stat -c`, `sha256sum`, `history -a`, bash arrays, `jq`, `script`, `tmux` and a user crontab `@reboot` line. Only the optional Check 29b needs `sudo`, `iptables` and `systemd-run`. The pre-flight checks the rest.
@@ -178,7 +178,7 @@ cat > ~/cscb-live-preflight.sh <<'EOF'
 set -u
 TEST_HOST='<TEST_HOST>'   # the test host's name, exactly as `hostname` prints it
 PHASE="${1:?usage: bash ~/cscb-live-preflight.sh setup|check1}"
-STATE="$HOME/.config/cscb"
+STATE="$HOME/.config/claude-slack-channel-bots"
 fail() { echo "PRE-FLIGHT FAILED: $*" >&2; exit 1; }
 
 [ "$(uname -s)" = Linux ] || fail "this host is not Linux"
@@ -307,7 +307,7 @@ cat > ~/cscb-live-helpers.sh <<'EOF'
 # b.yko shell helpers. Load in every shell: source ~/cscb-live-helpers.sh
 TEST_HOST='<TEST_HOST>'   # the test host's name, exactly as `hostname` prints it
 TEST_USER='<TEST_USER>'   # the test host's user, exactly as `whoami` prints it
-S=~/.config/cscb
+S=~/.config/claude-slack-channel-bots
 LOG="$S/server.log"
 TRAIL="$S/permission-trail.jsonl"
 
@@ -433,12 +433,12 @@ showpending() {
 }
 
 # leakcount FILE...: per file, how many times any token held in a persona
-# credentials file under ~/.config/cscb/ occurs in it. The tokens are the
+# credentials file under ~/.config/claude-slack-channel-bots/ occurs in it. The tokens are the
 # run's leak markers; they are read inside bun and never printed.
 leakcount() {
   bun -e '
     const fs = require("fs")
-    const dir = process.env.HOME + "/.config/cscb"
+    const dir = process.env.HOME + "/.config/claude-slack-channel-bots"
     const tokens = []
     for (const f of fs.readdirSync(dir)) {
       if (!f.endsWith("-credentials.json")) continue
@@ -558,7 +558,7 @@ a terminal. Give these answers:
 |---|---|---|---|
 | 4.1 name | `persona_a` | `persona_b` | `persona_c` |
 | 4.2 app name, bot display name, avatar | "CSCB Test A", with its own avatar | "CSCB Test B", with an avatar unlike A's | "CSCB Test C", with an avatar unlike A's and B's |
-| 4.3 `credentials_file` path | `~/.config/cscb/persona_a-credentials.json` | `~/.config/cscb/persona_b-credentials.json` | `~/.config/cscb/persona_c-credentials.json` |
+| 4.3 `credentials_file` path | `~/.config/claude-slack-channel-bots/persona_a-credentials.json` | `~/.config/claude-slack-channel-bots/persona_b-credentials.json` | `~/.config/claude-slack-channel-bots/persona_c-credentials.json` |
 | 4.4 `working_directory` | `~/cscb-live/a` | `~/cscb-live/b` | `~/cscb-live/c` |
 | 4.5 channels, `delivery`, invites | A-home `all`, coordination `mentions`; invite A to both | coordination `mentions`; invite B there | none; invite C nowhere |
 | 4.6 `dm.enabled`, `dm.contact` | DMs off | DMs on, contact `<OPERATOR_USER_ID>` | DMs on, contact `<OPERATOR_USER_ID>` |
@@ -583,7 +583,7 @@ jq -c '.personas[] | {name, channels, dm, permission_prompts}' "$S/config.json"
 jq -r '.personas[] | [.name, .credentials_file, .working_directory] | @tsv' "$S/config.json"
 jq -c '[.personas[] | keys - ["name","credentials_file","working_directory","channels","dm","permission_prompts"]]' "$S/config.json"
 jq -c '{ack_reaction, session_restart_delay, append_system_prompt_file}' "$S/config.json"
-ls -lL ~/.config/cscb/
+ls -lL ~/.config/claude-slack-channel-bots/
 ```
 
 Expected:
@@ -625,7 +625,7 @@ Steps:
 
    ```sh
    source ~/cscb-live-helpers.sh
-   ls -lL ~/.config/cscb/persona_a-credentials.json
+   ls -lL ~/.config/claude-slack-channel-bots/persona_a-credentials.json
    history -a
    tokcount ~/cscb-live/creds-a.typescript                      # the terminal output
    tokcount "${HISTFILE:-$HOME/.bash_history}"                   # the shell history
@@ -639,7 +639,7 @@ Expected:
 
 - Step 1: the wizard declines, says a token never goes into the chat, and points to the credentials command, which the operator runs in their own terminal. It doesn't ask for the token.
 - Step 2: the wizard shows the command as one fenced line, `claude-slack-channel-bots credentials persona_a`, whole on the 80-column screen.
-- Step 3: the command first prints `Credentials file of persona "persona_a" (key=persona_a): <home>/.config/cscb/persona_a-credentials.json`. Neither token is shown while it is typed or pasted. The terminal then shows `bot_token: ok (auth.test)`, `app_token: ok (apps.connections.open)` and `Wrote <home>/.config/cscb/persona_a-credentials.json with mode 0600. bot_token and app_token both validated.`
+- Step 3: the command first prints `Credentials file of persona "persona_a" (key=persona_a): <home>/.config/claude-slack-channel-bots/persona_a-credentials.json`. Neither token is shown while it is typed or pasted. The terminal then shows `bot_token: ok (auth.test)`, `app_token: ok (apps.connections.open)` and `Wrote <home>/.config/claude-slack-channel-bots/persona_a-credentials.json with mode 0600. bot_token and app_token both validated.`
 - Step 4: the wizard checks the file only with `ls -lL` and never opens it.
 - Step 5: `ls -lL` shows `-rw-------` (mode 0600). The three `tokcount` counts are each `0`. The bare-prefix count is not zero, and that is expected: the wizard's text and the command's own prefix checks contain `xoxb-` and `xapp-`, so only a prefix followed by a digit, the shape of a real token, counts as a leak.
 
@@ -663,7 +663,7 @@ source ~/cscb-live-helpers.sh
 ls -A "$S"
 ( cd "$PKG" && sha256sum -c --quiet ~/cscb-live/pkg-before.sha256 ) && echo 'package unchanged'
 ( cd "$PKG" && find . -path ./.git -prune -o -type f -print | wc -l ); wc -l < ~/cscb-live/pkg-before.sha256
-ls -A ~/.config/cscb/
+ls -A ~/.config/claude-slack-channel-bots/
 tokcount "$S/config.json"      # must print 0
 env | cut -d= -f1 | grep -cE '^SLACK_(BOT|APP)_TOKEN$'   # must print 0
 ```
@@ -672,7 +672,7 @@ Expected:
 
 - `ls -A "$S"` prints only `config.json` and the system-prompt file the wizard wrote in Step 6.
 - `package unchanged` is printed, and both counts are equal: no file of the installed package was edited, added or removed.
-- `~/.config/cscb/` holds only the three credentials files.
+- `~/.config/claude-slack-channel-bots/` holds only the three credentials files.
 - Both counts print `0`: `config.json` holds no token, and no token variable is set.
 
 Apart from the README's install steps (the package install and the setup
@@ -2017,7 +2017,7 @@ Steps:
    |---|---|
    | 4.1 name | `persona_d` |
    | 4.2 app name, bot display name, avatar | "CSCB Test D", with an avatar unlike A's, B's and C's |
-   | 4.3 `credentials_file` path | `~/.config/cscb/persona_d-credentials.json` |
+   | 4.3 `credentials_file` path | `~/.config/claude-slack-channel-bots/persona_d-credentials.json` |
    | 4.4 `working_directory` | `~/cscb-live/d` |
    | 4.5 channels, `delivery`, invite | D-home `mentions`; invite D there |
    | 4.6 `dm.enabled`, `dm.contact` | DMs on, contact `<OPERATOR_USER_ID>` |
@@ -2063,7 +2063,7 @@ Steps:
 Expected:
 
 - Step 1: the environment count prints `0`, and the list has exactly three rows, `cscb_persona_a`, `cscb_persona_b` and `cscb_persona_c`.
-- Step 4: the wizard's Step 3 reports `server: running`, `record: present` and `pending change: none`. The wizard declares D in `config.json` before it gives the credentials command, and says the preview reads `cannot come up: credentials file does not exist` until the file is written. The credentials command prints `Credentials file of persona "persona_d" (key=persona_d): <home>/.config/cscb/persona_d-credentials.json`, both `ok` lines and `Wrote <home>/.config/cscb/persona_d-credentials.json with mode 0600. …`, and `ls -lL` shows `-rw-------`; the Check S1 counts are `0`. Its Step 9 explains that the server writes `config.json.pending`, a preview of the change, and that the operator confirms by renaming it to `config.json.apply`, after which the server applies it without a restart and logs `reload-applied`. The wizard doesn't rename the file itself.
+- Step 4: the wizard's Step 3 reports `server: running`, `record: present` and `pending change: none`. The wizard declares D in `config.json` before it gives the credentials command, and says the preview reads `cannot come up: credentials file does not exist` until the file is written. The credentials command prints `Credentials file of persona "persona_d" (key=persona_d): <home>/.config/claude-slack-channel-bots/persona_d-credentials.json`, both `ok` lines and `Wrote <home>/.config/claude-slack-channel-bots/persona_d-credentials.json with mode 0600. …`, and `ls -lL` shows `-rw-------`; the Check S1 counts are `0`. Its Step 9 explains that the server writes `config.json.pending`, a preview of the change, and that the operator confirms by renaming it to `config.json.apply`, after which the server applies it without a restart and logs `reload-applied`. The wizard doesn't rename the file itself.
 - Step 5: after its two header lines and a blank line, the pending file's preview is `A configuration change is pending; nothing has been applied. personas: 1 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed.` and `persona "persona_d" (key=persona_d) is added: it will be brought up and launched.` `ls` reports that `config.json.apply` does not exist. The `reload-(preview|invalid)` grep prints two previews, each line prefixed `[slack] reload-preview: ` and each first line ending ` (preview in "<path of config.json>.pending")`: first, logged once the wizard declared D, the same header and `persona "persona_d" (key=persona_d) is added but cannot come up: credentials file does not exist.`; then, logged once the credentials file was written, the same two lines as the pending file. The `(key=persona_d)` grep prints nothing: apart from the preview, no line names D, so D is not brought up before the confirmation. All three counts print `0`. Nothing about the pending change appears in Slack.
 - If the pending file's second line still reads `is added but cannot come up: …` instead, fix the cause it names (the credentials file or the working directory) and wait for the preview to change before confirming. Record that in Notes.
 - Step 7 prints exactly one `[slack] reload-applied: applied the confirmed configuration change without a restart (personas: 1 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed); the last-applied record "<path of config.json>.last-applied" now holds it` line, and for D exactly one each of:
@@ -2121,10 +2121,10 @@ Steps:
 
 Expected:
 
-- Step 4: exactly one `[slack] persona-credentials-refused: personas[3] "persona_d" (key=persona_d) path="<home>/.config/cscb/persona_d-credentials.json": bot_token refused by a Web API call (<method>): Slack error <code>` line, where `<method>` is the refused call (for example `chat.postMessage`) and `<code>` is one of `invalid_auth`, `token_revoked`, `account_inactive` or `not_authed`. `instance running` is printed and the list still has D's row, `cscb_persona_d`: the instance keeps running. The last `replies d` line has `error=true`. No token-shaped text is in the line.
+- Step 4: exactly one `[slack] persona-credentials-refused: personas[3] "persona_d" (key=persona_d) path="<home>/.config/claude-slack-channel-bots/persona_d-credentials.json": bot_token refused by a Web API call (<method>): Slack error <code>` line, where `<method>` is the refused call (for example `chat.postMessage`) and `<code>` is one of `invalid_auth`, `token_revoked`, `account_inactive` or `not_authed`. `instance running` is printed and the list still has D's row, `cscb_persona_d`: the instance keeps running. The last `replies d` line has `error=true`. No token-shaped text is in the line.
 - If Slack closed D's Socket Mode connection first and the refusal line instead names `the Socket Mode open` or `auth.test`, record that in Notes: the Web API path (b.ujn) was not exercised.
 - Step 5: the restart's start logs `[slack] persona "persona_d" (key=persona_d) not brought up: …` and a summary ending `0 failed, 1 not brought up, 0 not reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held on invalid flags, 0 fresh as retired keys`, and A, B and C connect as usual. Each refusal reads `[slack] Session refused: persona "persona_d" (key=persona_d) is not up (…) — not registered; its instance is kept and may register once the persona is up`. Record both counts in Notes. A count that keeps climbing at a steady rate (a refusal every few seconds for the whole five minutes) is the unbounded loop the E5 carry describes: file a bug with the counts, and the check still passes on the other items.
-- Step 7: the preview is `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 1 with changed credentials; server-wide settings: 0 changed.` and `persona "persona_d" (key=persona_d): credentials file "<home>/.config/cscb/persona_d-credentials.json" changed: it is broken by its credentials now, so it will be brought up.` After the rename, one `[slack] reload-applied: …` line with the same counts, and D's `Session connected` line. D replies "restored" in D-home under D's own name and avatar.
+- Step 7: the preview is `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 1 with changed credentials; server-wide settings: 0 changed.` and `persona "persona_d" (key=persona_d): credentials file "<home>/.config/claude-slack-channel-bots/persona_d-credentials.json" changed: it is broken by its credentials now, so it will be brought up.` After the rename, one `[slack] reload-applied: …` line with the same counts, and D's `Session connected` line. D replies "restored" in D-home under D's own name and avatar.
 
 Pass: the first refused Web API call marked D credentials-broken with one
 `persona-credentials-refused` line naming the call, D's instance kept
@@ -2366,7 +2366,7 @@ Steps:
 Expected:
 
 - Step 1: `test host` and `recorded` are printed. `ls` reports that `config.json.pending` does not exist. The record names `persona_a`, `persona_b` and `persona_c`. The list has one live row per configured persona, `cscb_persona_a`, `cscb_persona_b` and `cscb_persona_c`, each carrying its persona's label, plus, when Check 27's step 1 list had a `cscb_persona_d` row (live or not, whether or not D connected in Check 25), D's kept row `cscb_persona_d`, not live (state `ended` or `missing`): Check 27's teardown killed it and kept it. When that list had no row for D, the list has no row for D. It has no other row.
-- Step 2: the credentials command prints both `ok` lines and `Wrote <home>/.config/cscb/persona_b-credentials.json with mode 0600. …`. After its two header lines and a blank line, the pending file's preview is `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 1 with changed credentials; server-wide settings: 0 changed.` and `persona "persona_b" (key=persona_b): credentials file "<home>/.config/cscb/persona_b-credentials.json" changed: a new connection opens, then the old one closes, instance kept.` The preview names B and the file path and no token, and the `tokcount` prints `0`. The log has the same two lines, prefixed `[slack] reload-preview: `, and no `persona-start`, `Session disconnected`, `persona teardown` or `reload-applied` line: nothing was applied. B replies "still-here" in coordination under its own name and avatar: B keeps serving on its current connection.
+- Step 2: the credentials command prints both `ok` lines and `Wrote <home>/.config/claude-slack-channel-bots/persona_b-credentials.json with mode 0600. …`. After its two header lines and a blank line, the pending file's preview is `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 1 with changed credentials; server-wide settings: 0 changed.` and `persona "persona_b" (key=persona_b): credentials file "<home>/.config/claude-slack-channel-bots/persona_b-credentials.json" changed: a new connection opens, then the old one closes, instance kept.` The preview names B and the file path and no token, and the `tokcount` prints `0`. The log has the same two lines, prefixed `[slack] reload-preview: `, and no `persona-start`, `Session disconnected`, `persona teardown` or `reload-applied` line: nothing was applied. B replies "still-here" in coordination under its own name and avatar: B keeps serving on its current connection.
 - Step 3: `config.json.pending` has exactly one `DESTRUCTIVE:` line, `DESTRUCTIVE: persona "persona_c" (key=persona_c) is removed: the persona will be retired: its session stopped and never resumed.`, and B's credentials line after it. Its first line's counts read `personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 1 with changed credentials; server-wide settings: 0 changed`. The log has exactly one `[slack] reload-preview:` line with that `DESTRUCTIVE:` line, not repeated over the six checks. There is no `persona-start` or `Session disconnected` line, and the list has the same rows as at step 1, C's row still live and D's kept row (if any) still not live: nothing was applied.
 - Step 5: `running` is printed. The log has one `[slack] Starting from the last-applied record "<path of config.json>.last-applied"` line and no `No last-applied record` line. It has `[slack] Loaded persona config: 3 persona(s)` and one `[slack] persona-start: personas[<i>] "<name>" (key=<key>): bring-up starting` line for each of `persona_a`, `persona_b` and `persona_c`. It has one `[slack] startupSessionManager: complete — 3 persona(s): …` line ending `0 failed, 0 not brought up, 0 not reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held on invalid flags, 0 fresh as retired keys`, and no failure line, none for B included: B connected with its credentials file as it stands, the `cscb-live-rotated` token. It has at least one `[slack] Session connected: persona "persona_b" (key=persona_b)` line. The list has exactly one live row for each of the three personas, C included, plus D's kept row, not live, when step 1 had it, and no other row. Record the summary line's resumed and fresh counts in Notes. One exception, a transient the server recovers from: when Slack was unreachable for a persona at the start, the summary counts it in `not brought up` and the log has its `persona-slack-unreachable` line (and its `cleared:` line). If that persona then logs `[slack] persona "<name>" (key=<key>): up after its bring-up retry (Slack) — launching` and its `Session connected` line appears within the wait, the summary may end `0 failed, <n> not brought up, 0 not reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held on invalid flags, 0 fresh as retired keys`, `<n>` being the number of such personas, and their `persona-slack-unreachable` lines up to that retry are not failure lines. Record it in Notes. Any other failure line, or a persona that doesn't connect, still fails this step.
 - Step 6: `config.json.pending` is present again. Its first line's counts read `personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed`, it has C's `DESTRUCTIVE:` line, and nothing names `persona_b` (the count prints `0`): the start applied B's credentials change, so it is no longer pending, while the unconfirmed removal of C still is. The log has exactly one `[slack] reload-preview:` line with that `DESTRUCTIVE:` line since the reboot: the first check after the start found the edit and logged it once. `cmp` reports that the files differ, and the record still names all three personas.
@@ -2938,7 +2938,7 @@ results, and also when the run stopped early.
    ```sh
    rm -f ~/cscb-live-helpers.sh ~/cscb-live/pkg-before.sha256 ~/cscb-live/creds-*.typescript ~/cscb-live/boot-start.log
    rm -rf ~/cscb-live/scratch-state.*
-   if guard; then rm ~/.config/cscb/persona_*-credentials.json; fi   # only when the test apps are retired
+   if guard; then rm ~/.config/claude-slack-channel-bots/persona_*-credentials.json; fi   # only when the test apps are retired
    ```
 
 6. In the test workspace, either leave the four test apps ("CSCB Test A" to "CSCB Test D") and the channels in place for a rerun, or delete the apps (each app's **Basic Information** → **Delete App**) and archive A-home, coordination and D-home. Record which in Notes. Each run's own `<RUN_CHANNEL_NAME>` channel is already archived by Check 34; if the run stopped before Check 34 archived it, remove C's app from it and archive it now.

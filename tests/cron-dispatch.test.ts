@@ -17,7 +17,7 @@
  * config, so name→key resolution and dedupe run exactly as in production.
  *
  * No top-level mock.module (a pretest gate forbids it); no mocks at all. No
- * real sleeps. No import of server.ts; never touches ~/.config/cscb/
+ * real sleeps. No import of server.ts; never touches ~/.config/claude-slack-channel-bots/
  * or any real channel ID; never POSTs anywhere but a port-0 test server.
  *
  * SPDX-License-Identifier: MIT

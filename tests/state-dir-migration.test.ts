@@ -1,9 +1,10 @@
 /**
  * state-dir-migration.test.ts — The move of the server's state directory from
- * its old default, `~/.claude/channels/slack`, to the new one,
- * `<XDG config home>/cscb` (bug b.fc4): `prepareStateDir`,
- * `migrateStateDirAtStart`, `resolveCliStateDir` and `resolveCliConfigPath`
- * (src/state-dir-migration.ts).
+ * its old defaults, `~/.claude/channels/slack` (up to 0.13) and
+ * `<XDG config home>/cscb` (0.14.0, 0.15.0), to the new one,
+ * `<XDG config home>/claude-slack-channel-bots` (bugs b.fc4, b.smv):
+ * `prepareStateDir`, `migrateStateDirAtStart`, `resolveCliStateDir` and
+ * `resolveCliConfigPath` (src/state-dir-migration.ts).
  *
  * Claude Code asks the user before every write under `~/.claude`, so every
  * unattended change of the runtime configuration stalled on a permission
@@ -50,6 +51,19 @@
  *   `resolveCliConfigPath`): `L` while an old server runs on it (whatever `N`
  *   holds), or while it is a directory (real, or a link elsewhere) holding a
  *   configuration (or a PID file) and `N` holds no configuration; reads only.
+ * - Bug b.smv (the last sections of the file): the start from every
+ *   release's layout, each seeded the way that release left a host (up to
+ *   0.13: only `L1`; 0.14.0: `L1` plus a partial `L2` with b.avm's links, in
+ *   the variants b.avm left; 0.15.0: a full `L2` and `L1` a link to it), under
+ *   both XDG locations, with a rerun and `startupErrorDir` (where a stop is
+ *   recorded; for a stop with `N` absent it is the stopping step's directory,
+ *   so `N` is never made by the log); L1 repointed straight at `N` after a
+ *   0.15.0 move (left alone unless L1 is a link to L2, L2 a link to N, and
+ *   L1 really reaches N; silent when L1 is absent; a failure to repoint a
+ *   WARN only); and, under `~/.config` only, a conflict at `N`, an old server on
+ *   `L1` or `L2`, `SLACK_STATE_DIR`, the multi-step outcome reporting, the
+ *   failure line's `SLACK_STATE_DIR` advice (left out for a legacy directory
+ *   with no configuration); and `resolveCliStateDir` over the same layouts.
  *
  * Isolation: every case works under its own `mkdtempSync` root, removed in
  * `afterEach`, a fake home with the legacy directory under
@@ -84,13 +98,16 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve, sep } from 'node:path'
+import { dirname, join, relative as relativePath, resolve, sep } from 'node:path'
 
+import { describeThrownValueWithoutStack } from '../src/persona-connection-errors.ts'
 import {
+  LEGACY_XDG_DIR_NAME,
   STATE_MIGRATE_LOG_PREFIX,
   STATE_MIGRATE_WARN_PREFIX,
   NODE_STATE_DIR_MIGRATION_FS,
   legacyServerStateDir,
+  legacyXdgStateDir,
   migrateStateDirAtStart,
   prepareStateDir,
   resolveCliConfigPath,
@@ -100,9 +117,12 @@ import {
   stateDirLegacyUnusableLine,
   stateDirMergedLine,
   stateDirMigrationStopsStart,
+  stateDirMigrationSteps,
   stateDirPaths,
   stateDirPendingLine,
   stateDirRenamedLine,
+  stateDirRepointFailedLine,
+  stateDirRepointedLine,
   stateDirStopMessage,
   type StateDirMigrationDeps,
   type StateDirMigrationFs,
@@ -138,7 +158,7 @@ beforeEach(() => {
   home = join(root, 'home')
   mkdirSync(home, { recursive: true })
   legacyDir = legacyServerStateDir(home)
-  newDir = join(home, '.config', 'cscb')
+  newDir = join(home, '.config', 'claude-slack-channel-bots')
   paths = { legacyDir, newDir }
   lines = []
 })
@@ -223,7 +243,7 @@ describe('stateDirPaths and migrateStateDirAtStart: which directories, and when 
   test('the default install: L under ~/.claude/channels, N under ~/.config', () => {
     expect(stateDirPaths(home, {})).toEqual({
       legacyDir: join(home, '.claude', 'channels', 'slack'),
-      newDir: join(home, '.config', 'cscb'),
+      newDir: join(home, '.config', 'claude-slack-channel-bots'),
     })
   })
 
@@ -235,9 +255,12 @@ describe('stateDirPaths and migrateStateDirAtStart: which directories, and when 
     expect(stateDirPaths(home, { SLACK_STATE_DIR: '' })).toEqual({ legacyDir, newDir })
   })
 
-  test('SLACK_STATE_DIR set: overridden, nothing logged, L and N untouched, and a PID file in L is not even read', () => {
+  test('SLACK_STATE_DIR set: overridden, nothing logged, L1, L2 and N untouched, and a PID file in either is not even read', () => {
     put(legacyDir, 'config.json', LEGACY_CONFIG)
     put(legacyDir, 'server.pid', '4242')
+    const l2 = legacyXdgStateDir(home, {})
+    put(l2, 'config.json', NEW_CONFIG)
+    put(l2, 'server.pid', '4243')
     const before = treeSnapshot(root)
     let asked = false
 
@@ -253,33 +276,10 @@ describe('stateDirPaths and migrateStateDirAtStart: which directories, and when 
       { SLACK_STATE_DIR: join(root, 'chosen') },
     )
 
-    expect(result).toEqual({ paths: undefined, outcome: { kind: 'overridden' } })
+    expect(result).toEqual({ paths: undefined, outcome: { kind: 'overridden' }, startupErrorDir: join(root, 'chosen') })
     expect(lines).toEqual([])
     expect(asked).toBe(false)
     expect(treeSnapshot(root)).toEqual(before)
-    expect(existsSync(newDir)).toBe(false)
-  })
-
-  test('no SLACK_STATE_DIR: the directories of the environment are migrated', () => {
-    put(legacyDir, 'config.json', LEGACY_CONFIG)
-
-    const result = migrateStateDirAtStart({ log: (line) => lines.push(line) }, home, {})
-
-    expect(result.paths).toEqual(paths)
-    expect(result.outcome).toEqual({ kind: 'moved', via: 'rename', entries: [] })
-    expect(readFileSync(join(newDir, 'config.json'))).toEqual(LEGACY_CONFIG)
-  })
-
-  test('XDG_CONFIG_HOME set: L moves to <XDG_CONFIG_HOME>/cscb', () => {
-    const xdgNew = join(root, 'xdg', 'cscb')
-    put(legacyDir, 'config.json', LEGACY_CONFIG)
-
-    const result = migrateStateDirAtStart({ log: (line) => lines.push(line) }, home, { XDG_CONFIG_HOME: join(root, 'xdg') })
-
-    expect(result.paths).toEqual({ legacyDir, newDir: xdgNew })
-    expect(result.outcome).toEqual({ kind: 'moved', via: 'rename', entries: [] })
-    expect(readFileSync(join(xdgNew, 'config.json'))).toEqual(LEGACY_CONFIG)
-    expect(readlinkSync(legacyDir)).toBe(xdgNew)
     expect(existsSync(newDir)).toBe(false)
   })
 })
@@ -2090,7 +2090,7 @@ describe('resolveCliStateDir and resolveCliConfigPath: the directory a command a
   })
 
   test('XDG_CONFIG_HOME set: N is under it, and L still wins while it holds the only configuration', () => {
-    const xdgNew = join(root, 'xdg', 'cscb')
+    const xdgNew = join(root, 'xdg', 'claude-slack-channel-bots')
     put(legacyDir, 'config.json', LEGACY_CONFIG)
     expect(resolveCliStateDir(home, { XDG_CONFIG_HOME: join(root, 'xdg') })).toBe(legacyDir)
 
@@ -2173,5 +2173,1107 @@ describe('resolveCliStateDir and resolveCliConfigPath: the directory a command a
 
     expect(resolveCliStateDir(home, {})).toBe(newDir)
     expect(readFileSync(resolveCliConfigPath(home, {}))).toEqual(LEGACY_CONFIG)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Bug b.smv: the names, and the start from every release's layout
+// ---------------------------------------------------------------------------
+
+/** The three directories of a host: `L1` (up to 0.13), `L2` (0.14.0, 0.15.0) and `N`, with the environment that names them. */
+interface Layout {
+  l1: string
+  l2: string
+  n: string
+  env: NodeJS.ProcessEnv
+}
+
+/** The layout under `<home>/.config` (`xdg` undefined) or under an `XDG_CONFIG_HOME` of `xdg`. */
+function layoutFor(xdg?: string): Layout {
+  const config = xdg ?? join(home, '.config')
+  return {
+    l1: legacyServerStateDir(home),
+    l2: join(config, 'cscb'),
+    n: join(config, 'claude-slack-channel-bots'),
+    env: xdg === undefined ? {} : { XDG_CONFIG_HOME: xdg },
+  }
+}
+
+const CRONTAB_TEXT = '0 9 * * * prompts/daily.md planner\n'
+const PROMPT_TEXT = 'do the daily thing\n'
+
+/** What every release's server wrote into its state directory besides the crontab and `prompts/`. */
+const SERVER_FILES: Readonly<Record<string, string | Buffer>> = {
+  'config.json': LEGACY_CONFIG,
+  'config.json.last-applied': '{"last":"applied"}\n',
+  'channel-delivery.json': '{"C0AAA":1}\n',
+  'server.log': 'a line\n',
+  'system-prompt.md': 'be brief\n',
+}
+
+function putServerFiles(dir: string): void {
+  for (const [name, content] of Object.entries(SERVER_FILES)) put(dir, name, content)
+}
+
+/** Up to 0.13: the whole state directory is `L1`; nothing exists at `~/.config`. */
+function seedUpTo013(l: Layout): void {
+  putServerFiles(l.l1)
+}
+
+/**
+ * What b.avm (0.14.0) left, besides `L1` holding the server's files:
+ * - `plain`: the crontab and `prompts/` are real in `L2`, and `L1/crontab` and `L1/prompts` are symbolic links into them;
+ * - `crontab-deleted`: the operator deleted `L2/crontab` since, so the link at `L1/crontab` dangles;
+ * - `no-crontab-links`: `L2/crontab` was made by the cron bootstrap, with no link at `L1/crontab` (`L1/prompts` still links);
+ * - `exdev`: `prompts/` could not move across file systems, so it is real in `L1` and `L2/prompts` links to it
+ *   (the fallback `N/prompts` -> `L/prompts` of the migration's own header);
+ * - `crontab-outside`: the operator keeps the crontab in a file of their own, and both `L1/crontab` and `L2/crontab`
+ *   link to it.
+ */
+type Seed0140Variant = 'plain' | 'crontab-deleted' | 'no-crontab-links' | 'exdev' | 'crontab-outside'
+
+/** The operator's own crontab file of the `crontab-outside` variant, outside every state directory. */
+function outsideCrontab(): string {
+  return join(root, 'operator', 'crontab')
+}
+
+function seed0140(l: Layout, variant: Seed0140Variant = 'plain'): void {
+  putServerFiles(l.l1)
+  if (variant === 'crontab-outside') {
+    put(dirname(outsideCrontab()), 'crontab', CRONTAB_TEXT)
+    mkdirSync(l.l2, { recursive: true })
+    symlinkSync(outsideCrontab(), join(l.l2, 'crontab'))
+    symlinkSync(outsideCrontab(), join(l.l1, 'crontab'))
+  } else {
+    put(l.l2, 'crontab', CRONTAB_TEXT)
+    if (variant !== 'no-crontab-links') symlinkSync(join(l.l2, 'crontab'), join(l.l1, 'crontab'))
+  }
+  if (variant === 'exdev') {
+    put(join(l.l1, 'prompts'), 'daily.md', PROMPT_TEXT)
+    symlinkSync(join(l.l1, 'prompts'), join(l.l2, 'prompts'))
+  } else {
+    put(join(l.l2, 'prompts'), 'daily.md', PROMPT_TEXT)
+    symlinkSync(join(l.l2, 'prompts'), join(l.l1, 'prompts'))
+  }
+  if (variant === 'crontab-deleted') unlinkSync(join(l.l2, 'crontab'))
+}
+
+/** 0.15.0 (b.fc4): the whole state directory is `L2`, and `L1` is a symbolic link to it. */
+function seed0150(l: Layout): void {
+  putServerFiles(l.l2)
+  put(l.l2, 'crontab', CRONTAB_TEXT)
+  put(join(l.l2, 'prompts'), 'daily.md', PROMPT_TEXT)
+  mkdirSync(dirname(l.l1), { recursive: true })
+  symlinkSync(l.l2, l.l1)
+}
+
+/** The start for `l`, collecting its lines (an old server's PID is 4242, never the test's own). */
+function startFor(l: Layout, deps: Partial<StateDirMigrationDeps> = {}): ReturnType<typeof migrateStateDirAtStart> {
+  return migrateStateDirAtStart({ log: (line) => lines.push(line), isProcessRunning: () => false, ownPid: 1, ...deps }, home, l.env)
+}
+
+/** An old server of PID 4242 is running; no other process is. */
+const SERVER_4242: Partial<StateDirMigrationDeps> = { isProcessRunning: (pid) => pid === 4242, ownPid: 1 }
+
+/** The lines that are WARNs. */
+function warnings(): string[] {
+  return lines.filter((line) => line.startsWith(STATE_MIGRATE_WARN_PREFIX))
+}
+
+/**
+ * What `N` holds once every file moved: the server's files, the crontab and `prompts/` (each unless `has` says the
+ * release never had it; `'linked'` is a crontab that stays a link to the operator's own file), each real.
+ */
+function expectEverythingAtN(l: Layout, has: { crontab: boolean | 'linked'; prompts: boolean } = { crontab: true, prompts: true }): void {
+  for (const [name, content] of Object.entries(SERVER_FILES)) {
+    expect(isLink(join(l.n, name))).toBe(false)
+    expect(readFileSync(join(l.n, name))).toEqual(Buffer.from(content))
+  }
+  if (has.prompts) {
+    expect(isLink(join(l.n, 'prompts'))).toBe(false)
+    expect(readFileSync(join(l.n, 'prompts', 'daily.md'), 'utf-8')).toBe(PROMPT_TEXT)
+  }
+  if (has.crontab) {
+    expect(isLink(join(l.n, 'crontab'))).toBe(has.crontab === 'linked')
+    expect(readFileSync(join(l.n, 'crontab'), 'utf-8')).toBe(CRONTAB_TEXT)
+  }
+  expect(names(l.n)).toEqual([...Object.keys(SERVER_FILES), ...(has.crontab ? ['crontab'] : []), ...(has.prompts ? ['prompts'] : [])].sort())
+  expectNoTemporaries(l.n)
+}
+
+/** With an absolute `XDG_CONFIG_HOME` nothing is made under `<home>/.config`. */
+function expectHomeConfigUntouched(l: Layout): void {
+  if (l.env.XDG_CONFIG_HOME === undefined) return
+  expect(l.n).toBe(join(l.env.XDG_CONFIG_HOME, 'claude-slack-channel-bots'))
+  expect(existsSync(join(home, '.config'))).toBe(false)
+}
+
+/** The names `L1` holds that move into `N` in the 0.14.0 merge: the server's files (the links are redundant). */
+const MERGED_FROM_L1 = Object.keys(SERVER_FILES).sort()
+
+describe('b.smv: the names (legacyXdgStateDir, stateDirMigrationSteps, the default state directory)', () => {
+  test("the directory 0.14.0 and 0.15.0 used is still 'cscb', for the migration to find", () => {
+    expect(LEGACY_XDG_DIR_NAME).toBe('cscb')
+    expect(legacyXdgStateDir(home, {})).toBe(join(home, '.config', 'cscb'))
+  })
+
+  test.each([
+    ['XDG_CONFIG_HOME absolute', { XDG_CONFIG_HOME: '/xdg/conf' }, '/xdg/conf/cscb'],
+    ['XDG_CONFIG_HOME empty (ignored)', { XDG_CONFIG_HOME: '' }, '$HOME/.config/cscb'],
+    ['XDG_CONFIG_HOME relative (ignored)', { XDG_CONFIG_HOME: 'rel/conf' }, '$HOME/.config/cscb'],
+    ['SLACK_STATE_DIR set (it does not move the old default)', { SLACK_STATE_DIR: '/chosen' }, '$HOME/.config/cscb'],
+  ])('legacyXdgStateDir: %s', (_label, env, expected) => {
+    expect(legacyXdgStateDir(home, env)).toBe(expected.replace('$HOME', home))
+  })
+
+  test('the steps: L2 to N (marked as outside the move from ~/.claude), then L1 to N', () => {
+    expect(stateDirMigrationSteps(home, {})).toEqual([
+      { legacyDir: join(home, '.config', 'cscb'), newDir, legacyIsXdg: true },
+      { legacyDir: legacyServerStateDir(home), newDir },
+    ])
+  })
+
+  test('the steps with an absolute XDG_CONFIG_HOME: L2 and N under it, L1 still under ~/.claude', () => {
+    const xdg = join(root, 'xdg')
+
+    expect(stateDirMigrationSteps(home, { XDG_CONFIG_HOME: xdg })).toEqual([
+      { legacyDir: join(xdg, 'cscb'), newDir: join(xdg, 'claude-slack-channel-bots'), legacyIsXdg: true },
+      { legacyDir: legacyServerStateDir(home), newDir: join(xdg, 'claude-slack-channel-bots') },
+    ])
+  })
+
+  test('the steps with SLACK_STATE_DIR set: none; empty counts as unset', () => {
+    expect(stateDirMigrationSteps(home, { SLACK_STATE_DIR: join(root, 'chosen') })).toBeUndefined()
+    expect(stateDirMigrationSteps(home, { SLACK_STATE_DIR: '' })).toHaveLength(2)
+  })
+
+  test('the information lines for a move that only renames the folder name the package, not ~/.claude', () => {
+    const l2 = join(home, '.config', 'cscb')
+    const renamed = stateDirRenamedLine(l2, newDir, true)
+    const merged = stateDirMergedLine(l2, newDir, ['crontab'], true)
+
+    for (const line of [renamed, merged]) {
+      expect(line.startsWith(STATE_MIGRATE_LOG_PREFIX)).toBe(true)
+      expect(line).toContain('named after the package')
+      expect(line).not.toContain('outside ~/.claude')
+      expect(line).toContain(`${l2} is now a`)
+    }
+    expect(merged).toContain('moved "crontab" from')
+  })
+
+  test('the information lines for the move out of ~/.claude (the default) still say so', () => {
+    expect(stateDirRenamedLine(legacyDir, newDir)).toContain('outside ~/.claude')
+    expect(stateDirMergedLine(legacyDir, newDir, [])).toContain('outside ~/.claude')
+    expect(stateDirRenamedLine(legacyDir, newDir)).toBe(stateDirRenamedLine(legacyDir, newDir, false))
+  })
+
+  test('the repoint lines name L1, L2 and N; the WARN says how to repoint by hand', () => {
+    const l1 = legacyServerStateDir(home)
+    const l2 = join(home, '.config', 'cscb')
+    const done = stateDirRepointedLine(l1, l2, newDir)
+    const failed = stateDirRepointFailedLine(l1, l2, newDir, 'EACCES')
+
+    expect(done.startsWith(STATE_MIGRATE_LOG_PREFIX)).toBe(true)
+    expect(done).toContain(`${l1} was a symbolic link to ${l2}`)
+    expect(done).toContain(`${newDir} itself`)
+    expect(failed.startsWith(STATE_MIGRATE_WARN_PREFIX)).toBe(true)
+    expect(failed).toContain('EACCES')
+    expect(failed).toContain(`ln -sfn ${newDir} ${l1}`)
+  })
+
+  describe('stateDirFailedLine and the SLACK_STATE_DIR advice', () => {
+    const failure = [{ name: 'prompts', cause: 'EACCES' }]
+
+    test('a legacy directory that holds a configuration (the default): the line advises SLACK_STATE_DIR=<it>', () => {
+      expect(stateDirFailedLine(legacyDir, newDir, 'move', '', failure, true)).toContain(`set SLACK_STATE_DIR=${legacyDir} to keep the old location`)
+      expect(stateDirFailedLine(legacyDir, newDir, 'move', '', failure, true, true)).toBe(stateDirFailedLine(legacyDir, newDir, 'move', '', failure, true))
+    })
+
+    test('one that holds none: the same line without the advice, and still ending with the hand-fix', () => {
+      const withAdvice = stateDirFailedLine(legacyDir, newDir, 'move', '', failure, true, true)
+      const without = stateDirFailedLine(legacyDir, newDir, 'move', '', failure, true, false)
+
+      expect(without).not.toContain('SLACK_STATE_DIR')
+      expect(without).toBe(withAdvice.replace(`, or set SLACK_STATE_DIR=${legacyDir} to keep the old location`, ''))
+      expect(without.endsWith(`(mv ${legacyDir}/<name> ${newDir}/<name>).`)).toBe(true)
+    })
+
+    test.each([
+      ['crontab and prompts only (0.14.0\'s L2)', (): void => {
+        put(legacyDir, 'crontab', CRONTAB_TEXT)
+        put(join(legacyDir, 'prompts'), 'daily.md', PROMPT_TEXT)
+      }, false],
+      ['a config.json', (): void => void put(legacyDir, 'config.json', LEGACY_CONFIG), true],
+      ['only the last-applied record', (): void => void put(legacyDir, 'config.json.last-applied', '{}'), true],
+      ['a config.json link that dangles (holds nothing)', (): void => {
+        mkdirSync(legacyDir, { recursive: true })
+        symlinkSync(join(root, 'gone'), join(legacyDir, 'config.json'))
+      }, false],
+    ])('a failed step on a legacy directory with %s: legacyHoldsConfig is %p', (_label, seed, holds) => {
+      seed()
+
+      const outcome = run({
+        rename: () => {
+          throw errno('EACCES')
+        },
+      })
+
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind !== 'failed') return
+      expect(outcome.legacyHoldsConfig).toBe(holds ? undefined : false)
+      expect(stateDirStopMessage(paths, outcome).includes(`SLACK_STATE_DIR=${legacyDir}`)).toBe(holds)
+    })
+  })
+})
+
+describe.each([
+  ['~/.config (XDG_CONFIG_HOME unset)', (): Layout => layoutFor()],
+  ['an absolute XDG_CONFIG_HOME', (): Layout => layoutFor(join(root, 'xdg'))],
+])('b.smv: the start, with %s, from the layout each release left', (_where, makeLayout) => {
+  let l: Layout
+  beforeEach(() => {
+    l = makeLayout()
+  })
+
+  test('up to 0.13 (only L1): L1 is renamed to N and L1 is a link to it; L2 is not made', () => {
+    seedUpTo013(l)
+
+    const result = startFor(l)
+
+    expect(result).toEqual({
+      paths: { legacyDir: l.l1, newDir: l.n },
+      outcome: { kind: 'moved', via: 'rename', entries: [] },
+      startupErrorDir: l.l1,
+    })
+    expect(lines).toEqual([stateDirRenamedLine(l.l1, l.n)])
+    expectEverythingAtN(l, { crontab: false, prompts: false })
+    expect(readlinkSync(l.l1)).toBe(l.n)
+    expect(existsSync(l.l2)).toBe(false)
+    expect(lstatSync(l.n).isDirectory()).toBe(true)
+    expectHomeConfigUntouched(l)
+  })
+
+  test('0.14.0 (L1 and a partial L2 with the crontab and prompts links): L2 is renamed to N, then L1 is merged; both are links to N', () => {
+    seed0140(l)
+
+    const result = startFor(l)
+
+    expect(result).toEqual({
+      paths: { legacyDir: l.l1, newDir: l.n },
+      outcome: { kind: 'moved', via: 'merge', entries: MERGED_FROM_L1 },
+      startupErrorDir: l.l1,
+    })
+    expect(lines).toEqual([stateDirRenamedLine(l.l2, l.n, true), stateDirMergedLine(l.l1, l.n, MERGED_FROM_L1)])
+    expectEverythingAtN(l)
+    expect(readlinkSync(l.l2)).toBe(l.n)
+    expect(readlinkSync(l.l1)).toBe(l.n)
+    // The old names still reach the files (a downgrade, a script that names them).
+    expect(readFileSync(join(l.l1, 'crontab'), 'utf-8')).toBe(CRONTAB_TEXT)
+    expect(readFileSync(join(l.l1, 'prompts', 'daily.md'), 'utf-8')).toBe(PROMPT_TEXT)
+    expect(readFileSync(join(l.l2, 'config.json'))).toEqual(LEGACY_CONFIG)
+    expectNoTemporaries(dirname(l.l1))
+    expectNoTemporaries(dirname(l.l2))
+    expectHomeConfigUntouched(l)
+  })
+
+  test('0.14.0 with the crontab deleted (L1/crontab dangles): the link is dropped, never made a self-loop at N, the rest moves', () => {
+    seed0140(l, 'crontab-deleted')
+
+    const result = startFor(l)
+
+    expect(result.outcome).toEqual({ kind: 'moved', via: 'merge', entries: MERGED_FROM_L1 })
+    expect(lines).toEqual([stateDirRenamedLine(l.l2, l.n, true), stateDirMergedLine(l.l1, l.n, MERGED_FROM_L1)])
+    expectEverythingAtN(l, { crontab: false, prompts: true })
+    expect(() => lstatSync(join(l.n, 'crontab'))).toThrow()
+    expect(readlinkSync(l.l2)).toBe(l.n)
+    expect(readlinkSync(l.l1)).toBe(l.n)
+    // The deleted crontab stays deleted: no entry at any of the three names.
+    expect(existsSync(join(l.l1, 'crontab'))).toBe(false)
+    expect(existsSync(join(l.l2, 'crontab'))).toBe(false)
+  })
+
+  test.each<[string, Seed0140Variant, { crontab: boolean | 'linked'; prompts: boolean }]>([
+    ['no crontab links in L1 (L2/crontab made by the cron bootstrap)', 'no-crontab-links', { crontab: true, prompts: true }],
+    ["the cross-file-system fallback (L2/prompts a link to L1's real prompts/)", 'exdev', { crontab: true, prompts: true }],
+    ['L1/crontab and L2/crontab both links to one file outside (the crontab stays that link)', 'crontab-outside', { crontab: 'linked', prompts: true }],
+  ])('0.14.0, %s: everything ends at N, both old names link to it, no WARN, and a second start changes nothing', (_label, variant, has) => {
+    seed0140(l, variant)
+
+    const result = startFor(l)
+
+    expect(result.outcome.kind).toBe('moved')
+    expect(stateDirMigrationStopsStart(result.outcome)).toBe(false)
+    expect(warnings()).toEqual([])
+    expect(lines.length).toBeGreaterThanOrEqual(1)
+    expectEverythingAtN(l, has)
+    expect(readlinkSync(l.l2)).toBe(l.n)
+    expect(readlinkSync(l.l1)).toBe(l.n)
+    expect(readFileSync(join(l.l1, 'crontab'), 'utf-8')).toBe(CRONTAB_TEXT)
+    expect(readFileSync(join(l.l2, 'prompts', 'daily.md'), 'utf-8')).toBe(PROMPT_TEXT)
+    expectNoTemporaries(dirname(l.l1))
+    expectNoTemporaries(dirname(l.l2))
+    if (variant === 'crontab-outside') expect(readlinkSync(join(l.n, 'crontab'))).toBe(outsideCrontab())
+    expectHomeConfigUntouched(l)
+
+    lines.length = 0
+    const before = treeSnapshot(root)
+    expect(startFor(l).outcome).toEqual({ kind: 'already-migrated' })
+    expect(lines).toEqual([])
+    expect(treeSnapshot(root)).toEqual(before)
+  })
+
+  test('0.15.0 (a full L2, L1 a link to it): L2 is renamed to N, then L1 is repointed straight at N; both are links to N', () => {
+    seed0150(l)
+
+    const result = startFor(l)
+
+    expect(result).toEqual({
+      paths: { legacyDir: l.l2, newDir: l.n, legacyIsXdg: true },
+      outcome: { kind: 'moved', via: 'rename', entries: [] },
+      startupErrorDir: l.l2,
+    })
+    expect(lines).toEqual([stateDirRenamedLine(l.l2, l.n, true), stateDirRepointedLine(l.l1, l.l2, l.n)])
+    expectEverythingAtN(l)
+    expect(readlinkSync(l.l2)).toBe(l.n)
+    // L1 no longer goes through L2, so removing ~/.config/cscb leaves it intact.
+    expect(readlinkSync(l.l1)).toBe(l.n)
+    expect(readFileSync(join(l.l1, 'config.json'))).toEqual(LEGACY_CONFIG)
+    expectNoTemporaries(dirname(l.l1))
+    expectHomeConfigUntouched(l)
+
+    rmSync(l.l2)
+    expect(readFileSync(join(l.l1, 'config.json'))).toEqual(LEGACY_CONFIG)
+  })
+
+  test.each([
+    ['up to 0.13', (): void => seedUpTo013(l)],
+    ['0.14.0', (): void => seed0140(l)],
+    ['0.14.0 with the crontab deleted', (): void => seed0140(l, 'crontab-deleted')],
+    ['0.15.0', (): void => seed0150(l)],
+  ])('%s, a second start: already-migrated, nothing logged, nothing changed', (_label, seed) => {
+    seed()
+    expect(startFor(l).outcome.kind).toBe('moved')
+    lines.length = 0
+    const before = treeSnapshot(root)
+
+    const second = startFor(l)
+
+    expect(second.outcome).toEqual({ kind: 'already-migrated' })
+    expect(stateDirMigrationStopsStart(second.outcome)).toBe(false)
+    expect(second.startupErrorDir).toBe(l.n)
+    expect(lines).toEqual([])
+    expect(treeSnapshot(root)).toEqual(before)
+  })
+
+  test('an L1 link that is not exactly a link to L2 (here through another link) is the operator\'s own and stays, though it reaches N', () => {
+    seed0150(l)
+    const mine = join(root, 'operator-link')
+    unlinkSync(l.l1)
+    symlinkSync(l.l2, mine)
+    symlinkSync(mine, l.l1)
+
+    const result = startFor(l)
+
+    expect(result.outcome.kind).toBe('moved')
+    expect(lines).toEqual([stateDirRenamedLine(l.l2, l.n, true)])
+    expect(readlinkSync(l.l1)).toBe(mine)
+    expect(realpathSync(l.l1)).toBe(realpathSync(l.n))
+  })
+
+  test('L1 a link to a directory of the operator\'s own: it stays a link to it, with the WARN, and is never repointed', () => {
+    put(l.l2, 'config.json', NEW_CONFIG)
+    const mine = join(root, 'operator-state')
+    put(mine, 'config.json', LEGACY_CONFIG)
+    mkdirSync(dirname(l.l1), { recursive: true })
+    symlinkSync(mine, l.l1)
+
+    const result = startFor(l)
+
+    expect(result.outcome.kind).toBe('moved')
+    expect(lines).toEqual([stateDirRenamedLine(l.l2, l.n, true), stateDirLegacyUnusableLine(l.l1, l.n, 'link-elsewhere', mine)])
+    expect(readlinkSync(l.l1)).toBe(mine)
+    expect(readFileSync(join(mine, 'config.json'))).toEqual(LEGACY_CONFIG)
+  })
+
+  /** No line of the start is the repoint's, and L1 is still the link `target` it was. */
+  function expectL1NotRepointed(target: string): void {
+    expect(lines).not.toContain(stateDirRepointedLine(l.l1, l.l2, l.n))
+    expect(lines.filter((line) => line.includes('repoint'))).toEqual([])
+    expect(readlinkSync(l.l1)).toBe(target)
+    expectNoTemporaries(dirname(l.l1))
+  }
+
+  describe('an L1 link that is not exactly the chain the migration makes (L1 -> L2 -> N) is never repointed', () => {
+    test('the reverse setup (L2 a real directory, N a link to L2, L1 a link to L2): no repoint, no line, L2 stays the directory', () => {
+      put(l.l2, 'config.json', LEGACY_CONFIG)
+      symlinkSync(l.l2, l.n)
+      mkdirSync(dirname(l.l1), { recursive: true })
+      symlinkSync(l.l2, l.l1)
+      const before = treeSnapshot(root)
+
+      const result = startFor(l)
+
+      expect(stateDirMigrationStopsStart(result.outcome)).toBe(false)
+      expect(lines).toEqual([])
+      expectL1NotRepointed(l.l2)
+      expect(isLink(l.l2)).toBe(false)
+      expect(readlinkSync(l.n)).toBe(l.l2)
+      expect(treeSnapshot(root)).toEqual(before)
+    })
+
+    test("L2 and N both links to a directory of the operator's own, L1 a link to L2: no repoint (L2 is not a link to N)", () => {
+      const mine = join(root, 'operator-state')
+      put(mine, 'config.json', LEGACY_CONFIG)
+      mkdirSync(dirname(l.l2), { recursive: true })
+      symlinkSync(mine, l.l2)
+      symlinkSync(mine, l.n)
+      mkdirSync(dirname(l.l1), { recursive: true })
+      symlinkSync(l.l2, l.l1)
+
+      const result = startFor(l)
+
+      expect(stateDirMigrationStopsStart(result.outcome)).toBe(false)
+      expectL1NotRepointed(l.l2)
+      expect(realpathSync(l.l1)).toBe(realpathSync(l.n))
+      expect(readlinkSync(l.l2)).toBe(mine)
+      expect(readlinkSync(l.n)).toBe(mine)
+      expect(readFileSync(join(mine, 'config.json'))).toEqual(LEGACY_CONFIG)
+    })
+
+    test('L2 a link that reaches N through another link (not exactly N), L1 a link to L2: no repoint though the real paths match', () => {
+      putServerFiles(l.n)
+      const hop = join(root, 'operator-link')
+      symlinkSync(l.n, hop)
+      mkdirSync(dirname(l.l2), { recursive: true })
+      symlinkSync(hop, l.l2)
+      mkdirSync(dirname(l.l1), { recursive: true })
+      symlinkSync(l.l2, l.l1)
+      expect(realpathSync(l.l1)).toBe(realpathSync(l.n))
+
+      startFor(l)
+
+      expectL1NotRepointed(l.l2)
+      expect(readlinkSync(l.l2)).toBe(hop)
+    })
+
+    test('L1, L2 and N all links in a chain and N absent (nothing for L1 to reach): no repoint, no temporary link made', () => {
+      mkdirSync(dirname(l.l2), { recursive: true })
+      symlinkSync(l.n, l.l2)
+      mkdirSync(dirname(l.l1), { recursive: true })
+      symlinkSync(l.l2, l.l1)
+
+      const result = startFor(l)
+
+      expect(result.outcome).toEqual({ kind: 'no-legacy' })
+      expect(lines).toEqual([])
+      expectL1NotRepointed(l.l2)
+      expect(existsSync(l.n)).toBe(false)
+    })
+
+    test('L1 names L2 only on the page, but really reaches another directory (a symbolic link in its path): no repoint', () => {
+      // `~/.claude` is the operator's link to a directory elsewhere, and L1 is a relative link that, resolved
+      // lexically from its own directory, names L2, but, resolved by the file system through that link, is a
+      // directory of its own beside the operator's.
+      // The operator's directory is three levels down, so the relative link cannot climb out of the scratch root.
+      const operatorClaude = join(root, 'x', 'y', 'claude')
+      mkdirSync(join(operatorClaude, 'channels'), { recursive: true })
+      symlinkSync(operatorClaude, join(home, '.claude'))
+      const relative = relativePath(dirname(l.l1), l.l2)
+      symlinkSync(relative, l.l1)
+      const reached = resolve(operatorClaude, 'channels', relative)
+      expect(reached).not.toBe(l.l2)
+      put(reached, 'config.json', LEGACY_CONFIG)
+      putServerFiles(l.n)
+      symlinkSync(l.n, l.l2)
+      expect(realpathSync(l.l1)).not.toBe(realpathSync(l.n))
+
+      startFor(l)
+
+      expectL1NotRepointed(relative)
+      expect(readFileSync(join(reached, 'config.json'))).toEqual(LEGACY_CONFIG)
+    })
+  })
+
+  test('0.15.0 on a host that never had L1 (a fresh install of 0.15.0: only L2): L2 is renamed to N, L1 stays absent, nothing else is logged, and a second start changes nothing', () => {
+    putServerFiles(l.l2)
+    put(l.l2, 'crontab', CRONTAB_TEXT)
+    put(join(l.l2, 'prompts'), 'daily.md', PROMPT_TEXT)
+
+    const result = startFor(l)
+
+    expect(result).toEqual({
+      paths: { legacyDir: l.l2, newDir: l.n, legacyIsXdg: true },
+      outcome: { kind: 'moved', via: 'rename', entries: [] },
+      startupErrorDir: l.l2,
+    })
+    expect(lines).toEqual([stateDirRenamedLine(l.l2, l.n, true)])
+    expect(warnings()).toEqual([])
+    expectEverythingAtN(l)
+    expect(readlinkSync(l.l2)).toBe(l.n)
+    expect(() => lstatSync(l.l1)).toThrow()
+    expect(existsSync(dirname(l.l1))).toBe(false)
+    expectNoTemporaries(dirname(l.l2))
+    expectHomeConfigUntouched(l)
+
+    lines.length = 0
+    const before = treeSnapshot(root)
+    const second = startFor(l)
+
+    expect(second.outcome).toEqual({ kind: 'already-migrated' })
+    expect(lines).toEqual([])
+    expect(treeSnapshot(root)).toEqual(before)
+    expect(() => lstatSync(l.l1)).toThrow()
+  })
+
+  describe('a failure to repoint L1 (the data is at N): one WARN, the outcome unchanged, never a stop', () => {
+    const injections: [string, (l1: string, err: NodeJS.ErrnoException) => Partial<StateDirMigrationFs>][] = [
+      [
+        'the temporary link beside L1 cannot be made',
+        (l1, err) => ({
+          symlink: (target, path) => {
+            if (TEMP_NAME.test(path) && dirname(path) === dirname(l1)) throw err
+            symlinkSync(target, path)
+          },
+        }),
+      ],
+      [
+        'the rename of the temporary link over L1 fails',
+        (l1, err) => ({
+          rename: (from, to) => {
+            if (to === l1 && TEMP_NAME.test(from)) throw err
+            renameSync(from, to)
+          },
+        }),
+      ],
+    ]
+
+    test.each(injections)('%s: L1 still reaches N through L2, no temporary name is left, and the next start repoints it', (_label, inject) => {
+      seed0150(l)
+      const err = errno('EACCES')
+
+      const result = startFor(l, { fs: inject(l.l1, err) })
+
+      expect(result.outcome).toEqual({ kind: 'moved', via: 'rename', entries: [] })
+      expect(stateDirMigrationStopsStart(result.outcome)).toBe(false)
+      expect(lines).toEqual([stateDirRenamedLine(l.l2, l.n, true), stateDirRepointFailedLine(l.l1, l.l2, l.n, describeThrownValueWithoutStack(err))])
+      expect(readlinkSync(l.l2)).toBe(l.n)
+      expect(readlinkSync(l.l1)).toBe(l.l2)
+      expect(realpathSync(l.l1)).toBe(realpathSync(l.n))
+      expectEverythingAtN(l)
+      expectNoTemporaries(dirname(l.l1))
+
+      lines.length = 0
+      startFor(l)
+
+      expect(lines).toEqual([stateDirRepointedLine(l.l1, l.l2, l.n)])
+      expect(readlinkSync(l.l1)).toBe(l.n)
+    })
+  })
+
+  test('nothing anywhere: no-legacy, nothing logged, nothing made', () => {
+    mkdirSync(home, { recursive: true })
+    const before = treeSnapshot(root)
+
+    const result = startFor(l)
+
+    expect(result.outcome).toEqual({ kind: 'no-legacy' })
+    expect(result.startupErrorDir).toBe(l.n)
+    expect(lines).toEqual([])
+    expect(treeSnapshot(root)).toEqual(before)
+  })
+})
+
+describe('b.smv: the start, with ~/.config, in the other situations', () => {
+  let l: Layout
+  beforeEach(() => {
+    l = layoutFor()
+  })
+
+  test('N alone (a fresh install of this release, no old names): no-legacy, nothing logged, nothing changed', () => {
+    put(l.n, 'config.json', NEW_CONFIG)
+    const before = treeSnapshot(root)
+
+    const result = startFor(l)
+
+    expect(result.outcome).toEqual({ kind: 'no-legacy' })
+    expect(result.startupErrorDir).toBe(l.n)
+    expect(lines).toEqual([])
+    expect(treeSnapshot(root)).toEqual(before)
+  })
+
+  describe('a server of an older release running (the start stops before anything moves)', () => {
+    test('0.14.0 server on L1, with L2 partial: legacy-server-running on L1; L2 is not renamed under it', () => {
+      seed0140(l)
+      put(l.l1, 'server.pid', '4242\n')
+      const before = treeSnapshot(root)
+
+      const result = startFor(l, SERVER_4242)
+
+      expect(result).toEqual({
+        paths: { legacyDir: l.l1, newDir: l.n },
+        outcome: { kind: 'legacy-server-running', pid: 4242 },
+        startupErrorDir: l.l1,
+      })
+      expect(stateDirMigrationStopsStart(result.outcome)).toBe(true)
+      expect(stateDirStopMessage(result.paths!, result.outcome)).toBe(stateDirLegacyServerRunningLine(l.l1, l.n, 4242))
+      expect(lines).toEqual([])
+      expect(treeSnapshot(root)).toEqual(before)
+      expect(isLink(l.l2)).toBe(false)
+      expect(existsSync(l.n)).toBe(false)
+    })
+
+    test('0.13 server on L1: legacy-server-running on L1, nothing moved', () => {
+      seedUpTo013(l)
+      put(l.l1, 'server.pid', '4242\n')
+      const before = treeSnapshot(root)
+
+      const result = startFor(l, SERVER_4242)
+
+      expect(result).toEqual({
+        paths: { legacyDir: l.l1, newDir: l.n },
+        outcome: { kind: 'legacy-server-running', pid: 4242 },
+        startupErrorDir: l.l1,
+      })
+      expect(treeSnapshot(root)).toEqual(before)
+    })
+
+    test('0.15.0 server on L2 (L1 a link to it): legacy-server-running on L2, nothing moved, L1 not repointed', () => {
+      seed0150(l)
+      put(l.l2, 'server.pid', '4242\n')
+      const before = treeSnapshot(root)
+
+      const result = startFor(l, SERVER_4242)
+
+      expect(result).toEqual({
+        paths: { legacyDir: l.l2, newDir: l.n, legacyIsXdg: true },
+        outcome: { kind: 'legacy-server-running', pid: 4242 },
+        startupErrorDir: l.l2,
+      })
+      expect(stateDirStopMessage(result.paths!, result.outcome)).toBe(stateDirLegacyServerRunningLine(l.l2, l.n, 4242))
+      expect(treeSnapshot(root)).toEqual(before)
+      expect(isLink(l.l2)).toBe(false)
+      expect(readlinkSync(l.l1)).toBe(l.l2)
+      expect(existsSync(l.n)).toBe(false)
+    })
+
+    test('an old server on L1 with N absent and nothing else there: startupErrorDir is the running step\'s directory, and N is never made', () => {
+      put(l.l1, 'server.pid', '4242\n')
+
+      const result = startFor(l, SERVER_4242)
+
+      expect(result.outcome).toEqual({ kind: 'legacy-server-running', pid: 4242 })
+      expect(result.paths).toEqual({ legacyDir: l.l1, newDir: l.n })
+      expect(result.startupErrorDir).toBe(result.paths!.legacyDir)
+      expect(existsSync(l.n)).toBe(false)
+    })
+
+    test.each([
+      ['0.14.0', (): void => seed0140(l), (): string => l.l1],
+      ['0.15.0', (): void => seed0150(l), (): string => l.l2],
+    ])('%s: a stale PID does not stop the start, and the move goes through', (_label, seed, pidDir) => {
+      seed()
+      put(pidDir(), 'server.pid', '4242\n')
+
+      const result = startFor(l)
+
+      expect(result.outcome.kind).toBe('moved')
+      expect(readlinkSync(l.l2)).toBe(l.n)
+    })
+  })
+
+  describe('a conflict at N (the new location wins, nothing is overwritten, one WARN)', () => {
+    test('0.15.0 with a different config.json already at N: one WARN naming L2, pending, L1 skipped; the next start repeats it and, once settled, finishes and repoints L1', () => {
+      seed0150(l)
+      put(l.n, 'config.json', NEW_CONFIG)
+
+      const result = startFor(l)
+
+      expect(result.paths).toEqual({ legacyDir: l.l2, newDir: l.n, legacyIsXdg: true })
+      expect(result.outcome.kind).toBe('pending')
+      if (result.outcome.kind !== 'pending') return
+      expect(result.outcome.conflicts).toEqual(['config.json'])
+      expect(stateDirMigrationStopsStart(result.outcome)).toBe(false)
+      expect(lines).toHaveLength(1)
+      expect(lines[0]!.startsWith(STATE_MIGRATE_WARN_PREFIX)).toBe(true)
+      expect(lines[0]).toContain(`"config.json" exists both in ${l.l2} and in ${l.n} with different contents`)
+      // Nothing overwritten: N's config wins, L2's own is untouched, and neither old name was replaced
+      // (L1 is not repointed while L2 does not reach N).
+      expect(readFileSync(join(l.n, 'config.json'))).toEqual(NEW_CONFIG)
+      expect(readFileSync(join(l.l2, 'config.json'))).toEqual(LEGACY_CONFIG)
+      expect(isLink(l.l2)).toBe(false)
+      expect(readlinkSync(l.l1)).toBe(l.l2)
+
+      lines.length = 0
+      const before = treeSnapshot(root)
+      expect(startFor(l).outcome.kind).toBe('pending')
+      expect(lines).toHaveLength(1)
+      expect(treeSnapshot(root)).toEqual(before)
+
+      // The operator settled it: the old file is removed, the next start finishes.
+      lines.length = 0
+      unlinkSync(join(l.l2, 'config.json'))
+      expect(startFor(l).outcome.kind).toBe('moved')
+      expect(readlinkSync(l.l2)).toBe(l.n)
+      expect(readlinkSync(l.l1)).toBe(l.n)
+      expect(readFileSync(join(l.n, 'config.json'))).toEqual(NEW_CONFIG)
+      // Everything else moved when it was pending (its old names are links), so the finish moves nothing.
+      expect(lines).toEqual([stateDirMergedLine(l.l2, l.n, [], true), stateDirRepointedLine(l.l1, l.l2, l.n)])
+    })
+
+    test('0.14.0 with a different config.json already at N: L2 merges (crontab, prompts), then one WARN naming L1, which stays a directory', () => {
+      seed0140(l)
+      put(l.n, 'config.json', NEW_CONFIG)
+
+      const result = startFor(l)
+
+      expect(result.paths).toEqual({ legacyDir: l.l1, newDir: l.n })
+      expect(result.outcome.kind).toBe('pending')
+      if (result.outcome.kind !== 'pending') return
+      expect(result.outcome.conflicts).toEqual(['config.json'])
+      expect(lines).toHaveLength(2)
+      expect(lines[0]).toBe(stateDirMergedLine(l.l2, l.n, ['crontab', 'prompts'], true))
+      expect(lines[1]!.startsWith(STATE_MIGRATE_WARN_PREFIX)).toBe(true)
+      expect(lines[1]).toContain(`"config.json" exists both in ${l.l1} and in ${l.n} with different contents`)
+      expect(readFileSync(join(l.n, 'config.json'))).toEqual(NEW_CONFIG)
+      expect(readFileSync(join(l.l1, 'config.json'))).toEqual(LEGACY_CONFIG)
+      expect(isLink(l.l1)).toBe(false)
+      expect(readlinkSync(l.l2)).toBe(l.n)
+      expect(readFileSync(join(l.n, 'crontab'), 'utf-8')).toBe(CRONTAB_TEXT)
+    })
+
+    test('up to 0.13 with a different config.json already at N: one WARN naming L1, L2 never made', () => {
+      seedUpTo013(l)
+      put(l.n, 'config.json', NEW_CONFIG)
+
+      const result = startFor(l)
+
+      expect(result.outcome.kind).toBe('pending')
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toContain(`"config.json" exists both in ${l.l1} and in ${l.n}`)
+      expect(readFileSync(join(l.n, 'config.json'))).toEqual(NEW_CONFIG)
+      expect(readFileSync(join(l.l1, 'config.json'))).toEqual(LEGACY_CONFIG)
+      expect(existsSync(l.l2)).toBe(false)
+    })
+  })
+
+  describe('the outcome of several steps', () => {
+    test('the first step that stops the start ends the run, with the paths of that step: L2 failing leaves L1 alone', () => {
+      seed0140(l)
+      const l1Before = treeSnapshot(l.l1)
+
+      const result = startFor(l, { fs: { rename: renameFailingFrom(l.l2, 'EACCES') } })
+
+      expect(result.outcome.kind).toBe('failed')
+      expect(stateDirMigrationStopsStart(result.outcome)).toBe(true)
+      expect(result.paths).toEqual({ legacyDir: l.l2, newDir: l.n, legacyIsXdg: true })
+      expect(stateDirStopMessage(result.paths!, result.outcome)).toContain(l.l2)
+      expect(isLink(l.l1)).toBe(false)
+      expect(treeSnapshot(l.l1)).toEqual(l1Before)
+      expect(isLink(l.l2)).toBe(false)
+    })
+
+    test("0.14.0, L2 failing: the stop is recorded in L1 (startupErrorDir, where the config is), not in L2, and the line does not advise SLACK_STATE_DIR=<L2>", () => {
+      seed0140(l)
+
+      const result = startFor(l, { fs: { rename: renameFailingFrom(l.l2, 'EACCES') } })
+
+      expect(result.outcome.kind).toBe('failed')
+      expect(result.paths!.legacyDir).toBe(l.l2)
+      expect(result.startupErrorDir).toBe(l.l1)
+      expect(result.startupErrorDir).not.toBe(result.paths!.legacyDir)
+      expect(result.outcome).toMatchObject({ legacyHoldsConfig: false })
+      const message = stateDirStopMessage(result.paths!, result.outcome)
+      expect(message).toContain(`could not move the state directory from ${l.l2}`)
+      expect(message).not.toContain('SLACK_STATE_DIR')
+    })
+
+    test('0.15.0, L2 failing: L2 holds the configuration, so it is where the stop is recorded and the line advises SLACK_STATE_DIR=<L2>', () => {
+      seed0150(l)
+
+      const result = startFor(l, { fs: { rename: renameFailingFrom(l.l2, 'EACCES') } })
+
+      expect(result.outcome.kind).toBe('failed')
+      expect(result.startupErrorDir).toBe(l.l2)
+      expect(result.outcome).not.toHaveProperty('legacyHoldsConfig')
+      expect(stateDirStopMessage(result.paths!, result.outcome)).toContain(`SLACK_STATE_DIR=${l.l2}`)
+      expect(readlinkSync(l.l1)).toBe(l.l2)
+    })
+
+    test('a stop with N absent and no configuration anywhere (L1 holds only server.log): the stop is recorded in L1, and N is never made', () => {
+      put(l.l1, 'server.log', 'a line\n')
+      // The command-line resolution alone would name N, which is not there.
+      expect(resolveCliStateDir(home, l.env)).toBe(l.n)
+
+      const result = startFor(l, { fs: { rename: renameFailingFrom(l.l1, 'EACCES') } })
+
+      expect(result.outcome.kind).toBe('failed')
+      expect(stateDirMigrationStopsStart(result.outcome)).toBe(true)
+      expect(result.paths).toEqual({ legacyDir: l.l1, newDir: l.n })
+      expect(result.startupErrorDir).toBe(result.paths!.legacyDir)
+      expect(result.startupErrorDir).toBe(l.l1)
+      expect(existsSync(l.n)).toBe(false)
+      expect(isLink(l.l1)).toBe(false)
+      expect(names(l.l1)).toEqual(['server.log'])
+    })
+
+    test('a stop with N present and holding the configuration: the stop is recorded in N, as before', () => {
+      put(l.n, 'config.json', NEW_CONFIG)
+      put(l.l1, 'server.log', 'a line\n')
+
+      const result = startFor(l, {
+        fs: {
+          link: (existing, created) => {
+            if (existing === join(l.l1, 'server.log')) throw errno('EACCES')
+            linkSync(existing, created)
+          },
+        },
+      })
+
+      expect(result.outcome.kind).toBe('failed')
+      expect(result.paths).toEqual({ legacyDir: l.l1, newDir: l.n })
+      expect(result.startupErrorDir).toBe(l.n)
+      expect(result.startupErrorDir).not.toBe(result.paths!.legacyDir)
+      expect(readFileSync(join(l.n, 'config.json'))).toEqual(NEW_CONFIG)
+    })
+
+    test('a stop in L2 with N absent and L2 holding only the crontab: the stop is recorded in L2, and N is never made', () => {
+      put(l.l2, 'crontab', CRONTAB_TEXT)
+
+      const result = startFor(l, { fs: { rename: renameFailingFrom(l.l2, 'EACCES') } })
+
+      expect(result.outcome.kind).toBe('failed')
+      expect(result.paths).toEqual({ legacyDir: l.l2, newDir: l.n, legacyIsXdg: true })
+      expect(result.startupErrorDir).toBe(l.l2)
+      expect(existsSync(l.n)).toBe(false)
+    })
+
+    test("L1 failing after L2 moved: the failure is returned with L1's paths, L2 stays moved, L1 keeps what did not move, and the advice names L1 (it holds the config)", () => {
+      seed0140(l)
+
+      const result = startFor(l, {
+        fs: {
+          link: (existing, created) => {
+            if (existing === join(l.l1, 'config.json')) throw errno('EACCES')
+            linkSync(existing, created)
+          },
+        },
+      })
+
+      expect(result.outcome.kind).toBe('failed')
+      expect(stateDirMigrationStopsStart(result.outcome)).toBe(true)
+      expect(result.paths).toEqual({ legacyDir: l.l1, newDir: l.n })
+      // Computed before anything moved: L1, as the CLI and the daemon's log find it until the move is done.
+      expect(result.startupErrorDir).toBe(l.l1)
+      const message = stateDirStopMessage(result.paths!, result.outcome)
+      expect(message).toContain(`could not move the state directory from ${l.l1}`)
+      expect(message).toContain(`SLACK_STATE_DIR=${l.l1}`)
+      expect(readlinkSync(l.l2)).toBe(l.n)
+      expect(isLink(l.l1)).toBe(false)
+      expect(readFileSync(join(l.l1, 'config.json'))).toEqual(LEGACY_CONFIG)
+    })
+
+    test("L2 a file (unusable) and L1 a directory: the WARN for L2 and the move of L1; moved is what is reported, with L1's paths", () => {
+      seedUpTo013(l)
+      put(dirname(l.l2), 'cscb', 'a file')
+
+      const result = startFor(l)
+
+      expect(result).toEqual({
+        paths: { legacyDir: l.l1, newDir: l.n },
+        outcome: { kind: 'moved', via: 'rename', entries: [] },
+        startupErrorDir: l.l1,
+      })
+      expect(lines).toHaveLength(2)
+      expect(lines[0]!.startsWith(STATE_MIGRATE_WARN_PREFIX)).toBe(true)
+      expect(lines[0]).toContain(l.l2)
+      expect(lines[1]).toBe(stateDirRenamedLine(l.l1, l.n))
+      expect(readFileSync(l.l2, 'utf-8')).toBe('a file')
+    })
+
+    test('L2 pending and L1 a directory of its own (not a link to L2): L1 is still prepared, and pending is what is reported, with L1\'s paths', () => {
+      seed0140(l)
+      // A different crontab at N: L2's crontab conflicts, so L2 stays a directory; its prompts/ moves.
+      const otherCrontab = '0 0 * * * prompts/other.md other\n'
+      put(l.n, 'crontab', otherCrontab)
+
+      const result = startFor(l)
+
+      expect(result.paths).toEqual({ legacyDir: l.l1, newDir: l.n })
+      expect(result.outcome).toEqual({ kind: 'pending', entries: MERGED_FROM_L1, conflicts: ['crontab'], leftover: [] })
+      expect(stateDirMigrationStopsStart(result.outcome)).toBe(false)
+      expect(lines).toEqual([
+        stateDirPendingLine(l.l2, l.n, ['prompts'], ['crontab'], []),
+        stateDirPendingLine(l.l1, l.n, MERGED_FROM_L1, ['crontab'], []),
+      ])
+      // N's crontab wins; both old crontabs are untouched and L2 and L1 stay directories.
+      expect(readFileSync(join(l.n, 'crontab'), 'utf-8')).toBe(otherCrontab)
+      expect(readFileSync(join(l.l2, 'crontab'), 'utf-8')).toBe(CRONTAB_TEXT)
+      expect(isLink(l.l2)).toBe(false)
+      expect(isLink(l.l1)).toBe(false)
+      // The server's files reached N through L1's step.
+      for (const [name, content] of Object.entries(SERVER_FILES)) expect(readFileSync(join(l.n, name))).toEqual(Buffer.from(content))
+      expect(isLink(join(l.n, 'prompts'))).toBe(false)
+      expect(readFileSync(join(l.n, 'prompts', 'daily.md'), 'utf-8')).toBe(PROMPT_TEXT)
+      // What is left in L1: the old names of what moved (links to N's files) and the crontab link of the conflict.
+      expect(names(l.l1)).toEqual([...Object.keys(SERVER_FILES), 'crontab', 'prompts'].sort())
+      for (const name of Object.keys(SERVER_FILES)) expect(readlinkSync(join(l.l1, name))).toBe(join(l.n, name))
+      expect(readFileSync(join(l.l1, 'crontab'), 'utf-8')).toBe(CRONTAB_TEXT)
+    })
+  })
+})
+
+describe('b.smv: resolveCliStateDir before the start moved anything (L2 before L1, N once moved)', () => {
+  /** Every layout the table seeds, with the directory a command acts on before and after the start. */
+  const layouts: [string, (l: Layout) => void, (l: Layout) => string][] = [
+    ['up to 0.13', (l) => seedUpTo013(l), (l) => l.l1],
+    ['0.14.0 (L2 holds only the crontab and prompts)', (l) => seed0140(l), (l) => l.l1],
+    ['0.14.0 with the crontab deleted', (l) => seed0140(l, 'crontab-deleted'), (l) => l.l1],
+    ['0.15.0 (L2 holds the configuration, L1 links to it)', (l) => seed0150(l), (l) => l.l2],
+  ]
+
+  describe.each([
+    ['~/.config', (): Layout => layoutFor()],
+    ['an absolute XDG_CONFIG_HOME', (): Layout => layoutFor(join(root, 'xdg'))],
+  ])('with %s', (_where, makeLayout) => {
+    test.each(layouts)('%s: the directory holding the configuration, reads only; N once the start moved it', (_label, seed, before) => {
+      const l = makeLayout()
+      seed(l)
+      const snapshot = treeSnapshot(root)
+
+      expect(resolveCliStateDir(home, l.env)).toBe(before(l))
+      expect(resolveCliConfigPath(home, l.env)).toBe(join(before(l), 'config.json'))
+      expect(treeSnapshot(root)).toEqual(snapshot)
+
+      expect(startFor(l).outcome.kind).toBe('moved')
+
+      expect(resolveCliStateDir(home, l.env)).toBe(l.n)
+      expect(resolveCliConfigPath(home, l.env)).toBe(join(l.n, 'config.json'))
+    })
+  })
+
+  test('L2 before L1: with both real directories holding a configuration and N none, L2 wins', () => {
+    const l = layoutFor()
+    put(l.l1, 'config.json', LEGACY_CONFIG)
+    put(l.l2, 'config.json', NEW_CONFIG)
+
+    expect(resolveCliStateDir(home, {})).toBe(l.l2)
+  })
+
+  test('L2 holding only a PID file counts as holding the server (as for L1): L2', () => {
+    const l = layoutFor()
+    put(l.l2, 'server.pid', '4242')
+    put(l.l1, 'config.json', LEGACY_CONFIG)
+
+    expect(resolveCliStateDir(home, {})).toBe(l.l2)
+  })
+
+  test('N holding a configuration: N, whatever L2 and L1 hold (no old server running)', () => {
+    const l = layoutFor()
+    put(l.l1, 'config.json', LEGACY_CONFIG)
+    put(l.l2, 'config.json', NEW_CONFIG)
+    put(l.n, 'config.json', '{"n":1}')
+
+    expect(resolveCliStateDir(home, {})).toBe(l.n)
+  })
+
+  test.each([
+    ['a dangling link', (l: Layout): void => {
+      mkdirSync(dirname(l.l2), { recursive: true })
+      symlinkSync(join(root, 'gone'), l.l2)
+    }],
+    ['a file', (l: Layout): void => {
+      put(dirname(l.l2), 'cscb', 'a file')
+    }],
+    ['an empty directory', (l: Layout): void => {
+      mkdirSync(l.l2, { recursive: true })
+    }],
+  ])('L2 %s is no candidate: L1, which holds the configuration', (_label, makeL2) => {
+    const l = layoutFor()
+    makeL2(l)
+    put(l.l1, 'config.json', LEGACY_CONFIG)
+
+    expect(resolveCliStateDir(home, {})).toBe(l.l1)
+  })
+
+  test('L2 a link to N (migrated), L1 a link to L2: N', () => {
+    const l = layoutFor()
+    put(l.n, 'config.json', NEW_CONFIG)
+    mkdirSync(dirname(l.l1), { recursive: true })
+    symlinkSync(l.n, l.l2)
+    symlinkSync(l.l2, l.l1)
+
+    expect(resolveCliStateDir(home, {})).toBe(l.n)
+  })
+
+  test('SLACK_STATE_DIR set: that directory, whatever the three hold', () => {
+    const l = layoutFor()
+    seed0140(l)
+    const chosen = join(root, 'chosen')
+
+    expect(resolveCliStateDir(home, { SLACK_STATE_DIR: chosen })).toBe(chosen)
+  })
+
+  describe('an old server running', () => {
+    test('on L1 (0.14.0), whatever N and L2 hold: L1, so stop and clean_restart reach it', () => {
+      const l = layoutFor()
+      seed0140(l)
+      put(l.l1, 'server.pid', '4242')
+      put(l.n, 'config.json', NEW_CONFIG)
+      const before = treeSnapshot(root)
+
+      expect(resolveCliStateDir(home, {}, undefined, (pid) => pid === 4242)).toBe(l.l1)
+      expect(treeSnapshot(root)).toEqual(before)
+    })
+
+    test('on L2 (0.15.0), whatever N holds: L2', () => {
+      const l = layoutFor()
+      seed0150(l)
+      put(l.l2, 'server.pid', '4242')
+      put(l.n, 'config.json', NEW_CONFIG)
+
+      expect(resolveCliStateDir(home, {}, undefined, (pid) => pid === 4242)).toBe(l.l2)
+    })
+
+    test('on L1 while L2 holds the configuration too: L1, the live server wins over L2 coming first', () => {
+      const l = layoutFor()
+      put(l.l1, 'server.pid', '4242')
+      put(l.l1, 'config.json', LEGACY_CONFIG)
+      put(l.l2, 'config.json', NEW_CONFIG)
+
+      expect(resolveCliStateDir(home, {}, undefined, (pid) => pid === 4242)).toBe(l.l1)
+    })
+
+    test('a stale PID: the configuration decides (0.15.0: N holds one, so N)', () => {
+      const l = layoutFor()
+      seed0150(l)
+      put(l.l2, 'server.pid', '4242')
+      put(l.n, 'config.json', NEW_CONFIG)
+
+      expect(resolveCliStateDir(home, {}, undefined, () => false)).toBe(l.n)
+    })
+
+    test('on the migrated directory (L2 and L1 links to N): N', () => {
+      const l = layoutFor()
+      put(l.n, 'server.pid', '4242')
+      put(l.n, 'config.json', NEW_CONFIG)
+      mkdirSync(dirname(l.l1), { recursive: true })
+      symlinkSync(l.n, l.l2)
+      symlinkSync(l.n, l.l1)
+
+      expect(resolveCliStateDir(home, {}, undefined, () => true)).toBe(l.n)
+    })
+  })
+
+  test('L2 and L1 that cannot be looked at: N', () => {
+    const l = layoutFor()
+    seed0150(l)
+
+    expect(
+      resolveCliStateDir(home, {}, {
+        lstat: () => {
+          throw errno('EACCES')
+        },
+      }),
+    ).toBe(l.n)
   })
 })

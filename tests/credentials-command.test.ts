@@ -534,8 +534,8 @@ describe('credentials command: success', () => {
   })
 
   test('a ~/ path is expanded under HOME', () => {
-    const path = join(sb.home, '.config', 'cscb', 'p.json')
-    const run = runCommand(sb, '~/.config/cscb/p.json', lines(bot, app))
+    const path = join(sb.home, '.config', 'claude-slack-channel-bots', 'p.json')
+    const run = runCommand(sb, '~/.config/claude-slack-channel-bots/p.json', lines(bot, app))
     expectWritten(run, path)
   })
 
@@ -837,8 +837,8 @@ describe("credentials command: the wizard's line, through the real CLI", () => {
   ])(
     '%s: the CLI names the persona and its file, runs the script with bash for that path, and the file is written; no token on any command line',
     (_label, name, line) => {
-      const path = join(sb.home, '.config', 'cscb', 'p-credentials.json')
-      const stateDir = declare(name, '~/.config/cscb/p-credentials.json')
+      const path = join(sb.home, '.config', 'claude-slack-channel-bots', 'p-credentials.json')
+      const stateDir = declare(name, '~/.config/claude-slack-channel-bots/p-credentials.json')
       const run = runPasted(line, stateDir, lines(bot, app))
 
       expectSafe(run)
@@ -862,7 +862,7 @@ describe("credentials command: the wizard's line, through the real CLI", () => {
   test(
     'a persona config.json does not declare: exit 1 naming the declared ones, before any prompt; no script, no Slack call, no file',
     () => {
-      const path = join(sb.home, '.config', 'cscb', 'p-credentials.json')
+      const path = join(sb.home, '.config', 'claude-slack-channel-bots', 'p-credentials.json')
       const stateDir = declare('persona_p', path)
       const run = runPasted(lineFor('persona_q'), stateDir, lines(bot, app))
 

@@ -4,10 +4,10 @@ The server fires scheduled prompts into personas once per minute, reading them f
 
 ## The crontable
 
-Schedules live in the crontable file at `cron_table_path`. Without that key the crontable is `crontab` in the state directory, `~/.config/cscb/crontab` by default, outside `~/.claude`, so a bot appending a schedule doesn't trigger Claude Code's approval prompt for writes under `~/.claude`. Set `cron_table_path` in `config.json` to put it anywhere else (see [Server-wide settings](server-settings.md#server-wide-settings)).
+Schedules live in the crontable file at `cron_table_path`. Without that key the crontable is `crontab` in the state directory, `~/.config/claude-slack-channel-bots/crontab` by default, outside `~/.claude`, so a bot appending a schedule doesn't trigger Claude Code's approval prompt for writes under `~/.claude`. Set `cron_table_path` in `config.json` to put it anywhere else (see [Server-wide settings](server-settings.md#server-wide-settings)).
 
 ```sh
-cat ~/.config/cscb/crontab
+cat ~/.config/claude-slack-channel-bots/crontab
 ```
 
 At start the server creates the state directory. It creates the crontable on first boot if it is absent, with a self-documenting comment header describing the line format. See [Crontable format](#crontable-format) below for the full reference. For a `cron_table_path` you set, the directory must already exist.
@@ -86,7 +86,7 @@ An existing crontable also keeps its old comment header, which still tells bots 
 The prompt-file path resolves as follows:
 
 - A leading `~` expands to the home directory.
-- A **relative** path resolves against the **crontable's own directory** — not `$HOME`. This is a deliberate divergence from system cron's convention, so you can keep a `prompts/` directory alongside the crontable and reference it as `prompts/standup.md`. With the default location that directory is `~/.config/cscb/prompts/`.
+- A **relative** path resolves against the **crontable's own directory** — not `$HOME`. This is a deliberate divergence from system cron's convention, so you can keep a `prompts/` directory alongside the crontable and reference it as `prompts/standup.md`. With the default location that directory is `~/.config/claude-slack-channel-bots/prompts/`.
 - An **absolute** path is used as-is.
 
 ## How fires appear
@@ -124,7 +124,7 @@ Each load also writes one `warn` line for each line with no persona list, naming
 Add a persona list to that line. The warning comes back at every start and every edit until you do; an unchanged crontable is not reloaded, so it is not repeated each minute. To list them in the cron log at its default location:
 
 ```sh
-grep undeliverable ~/.config/cscb/cron.log
+grep undeliverable ~/.config/claude-slack-channel-bots/cron.log
 ```
 
 ## Delivery semantics

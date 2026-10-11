@@ -16,7 +16,7 @@
 TEST_HOST='@TEST_HOST@'   # the container's hostname
 TEST_USER='testuser'
 export PATH="/opt/agent-director/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin"
-S=~/.config/cscb
+S=~/.config/claude-slack-channel-bots
 LOG="$S/server.log"
 TRAIL="$S/permission-trail.jsonl"
 
