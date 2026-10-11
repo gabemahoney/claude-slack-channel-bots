@@ -386,18 +386,6 @@ export interface ServerSettings {
    */
   cron_table_path: string
   /**
-   * Whether the loaded configuration left `cron_table_path` out (absent or
-   * `null`), so `cron_table_path` holds the default the loader filled in
-   * (bug b.avm). Not a configuration key: the loader sets it, true or false,
-   * on every configuration it resolves. The start's crontable preparation
-   * (`prepareDefaultCronTable`, cron-table-migration.ts; since b.fc4 the
-   * default is the legacy path for every install, so it is dormant) acts only when it is
-   * true, so a `cron_table_path` the operator wrote, even one naming the
-   * default's file, is never prepared or moved (D-Q1). Absent (a
-   * configuration built by hand) reads as false.
-   */
-  cron_table_path_defaulted?: boolean
-  /**
    * Absolute path to the cscb_cron log file (b.he5 PD-5). Always present:
    * defaults to `<config dir>/cron.log` when omitted from input.
    */
@@ -630,8 +618,6 @@ function applyServerDefaults(input: ServerSettingsInput, configDir: string, cron
     agent_director_call_timeout_ms:
       input.agent_director_call_timeout_ms ?? DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
     cron_table_path: input.cron_table_path ?? cronTableDefault,
-    // Bug b.avm: exactly when the line above filled in the default.
-    cron_table_path_defaulted: input.cron_table_path === undefined || input.cron_table_path === null,
     cron_log_path: input.cron_log_path ?? resolve(configDir, CRON_LOG_FILE_NAME),
     cron_log_max_bytes: input.cron_log_max_bytes,
     // Only an absent switch takes the default: any other value, `null`
@@ -1872,33 +1858,16 @@ export function resolveXdgConfigHome(home?: string, env: NodeJS.ProcessEnv = pro
 }
 
 /**
- * The crontable's pre-b.avm default: `crontab` beside the loaded
- * `config.json`, in the state directory. Before b.fc4 a default install's
- * state directory was under `~/.claude`, so this was the path b.avm's
- * migration (`src/cron-table-migration.ts`) moved a crontable away from. Now
- * the default state directory is the crontable's default folder too, so for a
- * default install the two are one path, and the state directory's own
- * migration (`src/state-dir-migration.ts`) moves the legacy crontable with
- * the rest of the old directory.
- *
- * @param configDir  Directory of the configuration file.
- */
-export function legacyCronTablePath(configDir: string): string {
-  return resolve(configDir, CRON_TABLE_FILE_NAME)
-}
-
-/**
  * The crontable's default path, used when `cron_table_path` is absent (bugs
- * b.avm, b.fc4). The one definition of the default: the loader and the start's
- * migration both use it.
+ * b.avm, b.fc4). The one definition of the default, used by the loader.
  *
  * - `SLACK_STATE_DIR` unset (a default install): `<XDG config dir>/cscb/crontab`
  *   (`resolveXdgConfigHome`), so `~/.config/cscb/crontab` unless
  *   `XDG_CONFIG_HOME` names another directory: the default state directory
  *   (`resolveServerStateDir`), outside `~/.claude`, which Claude Code asks
  *   the user about before every write.
- * - `SLACK_STATE_DIR` set: `<config dir>/crontab`
- *   (`legacyCronTablePath`), as before. The variable isolates an install (a
+ * - `SLACK_STATE_DIR` set: `<config dir>/crontab`, beside the loaded
+ *   `config.json`, in the state directory. The variable isolates an install (a
  *   second server, a test or CI run), so its schedules stay with the rest of
  *   its state and never share the per-user default.
  *
@@ -1915,7 +1884,7 @@ export function resolveDefaultCronTablePath(
   home?: string,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  if (isStateDirOverridden(env)) return legacyCronTablePath(configDir)
+  if (isStateDirOverridden(env)) return resolve(configDir, CRON_TABLE_FILE_NAME)
   return resolve(resolveServerStateDir(home, env), CRON_TABLE_FILE_NAME)
 }
 

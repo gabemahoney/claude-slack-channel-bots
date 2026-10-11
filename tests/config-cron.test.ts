@@ -198,28 +198,24 @@ describe('crontable default outside ~/.claude (bug b.avm)', () => {
     expect(resolveDefaultCronTablePath(configDir, home, {})).toBe(join(home, '.config', 'cscb', 'crontab'))
   })
 
-  test('the loader: no cron_table_path and SLACK_STATE_DIR unset → <home>/.config/cscb/crontab, outside ~/.claude, flagged as filled in; the cron log stays beside config.json', () => {
+  test('the loader: no cron_table_path and SLACK_STATE_DIR unset → <home>/.config/cscb/crontab, outside ~/.claude; the cron log stays beside config.json', () => {
     const configDir = stateDirUnder(home)
     const result = resolvePersonaConfig(makeInput(), configDir, home, { env: {} })
     expect(result.cron_table_path).toBe(join(home, '.config', 'cscb', 'crontab'))
     expect(result.cron_table_path.startsWith(join(home, '.claude'))).toBe(false)
-    expect(result.cron_table_path_defaulted).toBe(true)
     expect(result.cron_log_path).toBe(join(configDir, 'cron.log'))
   })
 
-  // cron_table_path_defaulted is what the start's crontable preparation acts
-  // on: only a default the loader filled in is prepared or moved, never a path
-  // the operator wrote, even the default's own file (D-Q1).
-  test.each<[string, (h: string) => Record<string, unknown>, NodeJS.ProcessEnv, (h: string) => string, boolean]>([
-    ['null → the default, flagged as filled in', () => ({ cron_table_path: null }), {}, (h) => join(h, '.config', 'cscb', 'crontab'), true],
-    ['absent with SLACK_STATE_DIR set → <config dir>/crontab, flagged as filled in', () => ({}), { SLACK_STATE_DIR: '/srv/state' }, (h) => join(configDirUnder(h), 'crontab'), true],
-    ["written as the default's own file (~ expanded) → that path, not flagged", () => ({ cron_table_path: '~/.config/cscb/crontab' }), {}, (h) => join(h, '.config', 'cscb', 'crontab'), false],
-    ["written as the default's own file (absolute) → that path, not flagged", (h) => ({ cron_table_path: join(h, '.config', 'cscb', 'crontab') }), {}, (h) => join(h, '.config', 'cscb', 'crontab'), false],
-    ['written as another path → used verbatim (~ expanded under the home), not flagged', () => ({ cron_table_path: '~/cron/table' }), {}, (h) => join(h, 'cron', 'table'), false],
-    ['written as an absolute path → used verbatim whatever XDG_CONFIG_HOME says, not flagged', () => ({ cron_table_path: '/etc/cron/table' }), { XDG_CONFIG_HOME: '/xdg/conf' }, () => '/etc/cron/table', false],
-  ])('the loader: cron_table_path %s', (_label, keys, env, expected, defaulted) => {
+  test.each<[string, (h: string) => Record<string, unknown>, NodeJS.ProcessEnv, (h: string) => string]>([
+    ['null → the default', () => ({ cron_table_path: null }), {}, (h) => join(h, '.config', 'cscb', 'crontab')],
+    ['absent with SLACK_STATE_DIR set → <config dir>/crontab', () => ({}), { SLACK_STATE_DIR: '/srv/state' }, (h) => join(configDirUnder(h), 'crontab')],
+    ["written as the default's own file (~ expanded) → that path", () => ({ cron_table_path: '~/.config/cscb/crontab' }), {}, (h) => join(h, '.config', 'cscb', 'crontab')],
+    ["written as the default's own file (absolute) → that path", (h) => ({ cron_table_path: join(h, '.config', 'cscb', 'crontab') }), {}, (h) => join(h, '.config', 'cscb', 'crontab')],
+    ['written as another path → used verbatim (~ expanded under the home)', () => ({ cron_table_path: '~/cron/table' }), {}, (h) => join(h, 'cron', 'table')],
+    ['written as an absolute path → used verbatim whatever XDG_CONFIG_HOME says', () => ({ cron_table_path: '/etc/cron/table' }), { XDG_CONFIG_HOME: '/xdg/conf' }, () => '/etc/cron/table'],
+  ])('the loader: cron_table_path %s', (_label, keys, env, expected) => {
     const result = resolvePersonaConfig(makeInput(keys(home)), configDirUnder(home), home, { env })
-    expect([result.cron_table_path, result.cron_table_path_defaulted]).toEqual([expected(home), defaulted])
+    expect(result.cron_table_path).toBe(expected(home))
   })
 
   test('the loader: XDG_CONFIG_HOME is honoured from the environment it is given', () => {

@@ -280,8 +280,7 @@ describe('the live config', () => {
   // crontable; the read-only credentials mount is its sibling
   // (~/.config/cscb-credentials), never the directory the server writes to.
   // The runner's config still names the crontable (the path the default would
-  // give), which the loader keeps as written (not flagged as a default, so the
-  // start prepares and moves nothing).
+  // give), which the loader keeps as written.
   test('names the container\'s crontable in the state directory, outside the read-only credentials mount, which is not the state directory or inside it', () => {
     const config = buildLiveConfig(DRY_RUN_IDS)
     expect(config.cron_table_path).toBe(CONTAINER_CRON_TABLE_PATH)
@@ -289,16 +288,16 @@ describe('the live config', () => {
     const loadInContainer = (c: unknown) =>
       parsePersonaConfigBytes(renderConfig(c), `${CONTAINER_STATE_DIR}/config.json`, CONTAINER_STATE_DIR, { home: CONTAINER_HOME, env: {} })
     const loaded = loadInContainer(config)
-    expect([loaded.cron_table_path, loaded.cron_table_path_defaulted]).toEqual([CONTAINER_CRON_TABLE_PATH, false])
+    expect(loaded.cron_table_path).toBe(CONTAINER_CRON_TABLE_PATH)
     expect(loaded.cron_table_path.startsWith(`${CONTAINER_CREDENTIALS_DIR}/`)).toBe(false)
     // The mount is a sibling of the state directory, so nothing the server writes lies in it.
     expect(CONTAINER_CREDENTIALS_DIR).not.toBe(CONTAINER_STATE_DIR)
     expect(CONTAINER_CREDENTIALS_DIR.startsWith(`${CONTAINER_STATE_DIR}/`)).toBe(false)
     expect(CONTAINER_STATE_DIR.startsWith(`${CONTAINER_CREDENTIALS_DIR}/`)).toBe(false)
-    // Without the key, the default is the same path, outside the mount, and is flagged as the default.
+    // Without the key, the default is the same path, outside the mount.
     const { cron_table_path: _written, ...withoutKey } = config
     const defaulted = loadInContainer(withoutKey)
-    expect([defaulted.cron_table_path, defaulted.cron_table_path_defaulted]).toEqual([CONTAINER_CRON_TABLE_PATH, true])
+    expect(defaulted.cron_table_path).toBe(CONTAINER_CRON_TABLE_PATH)
   })
 
   test("D's entry for Check 25 loads beside them", () => {

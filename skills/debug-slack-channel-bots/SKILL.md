@@ -20,7 +20,7 @@ how to read and confirm a pending configuration change
 (`config.json.pending`), both channel modes (declarative and fungible, set by
 `allow_invited_channels`), the stored-choice file
 (`channel-delivery.json`), where the state directory is and how a start moves
-it out of `~/.claude`, and where the crontable is.
+it out of `~/.claude`.
 
 One broken persona never stops the server. Every healthy persona keeps serving,
 and nothing about a broken persona is posted to Slack under any identity. The
@@ -79,7 +79,7 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
 - NEVER move, delete, relink or rewrite a crontable or its `prompts`
   directory, at its location or at the old path beside `config.json`, without
   the operator's say-so. Reading and listing them is fine (see
-  [The crontable's location and its move at start](#the-crontables-location-and-its-move-at-start)).
+  [The crontable](../../README.md#the-crontable)).
 
 ---
 
@@ -264,10 +264,11 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
     **An agent's `set_channel_delivery` call was refused or failed?** The
     refusals, in the order they are checked, and the failed write are under
     [`persona-channel-delivery-set`](#persona-channel-delivery-set).
-13. **Scheduled prompts stopped firing after an upgrade, `server.log` has
-    `cron-migrate:` lines or a `failed to create crontable` line, or you're
-    not sure which crontable the server reads?** See
-    [The crontable's location and its move at start](#the-crontables-location-and-its-move-at-start).
+13. **Scheduled prompts stopped firing, `server.log` has a `failed to create
+    crontable` line, or you're not sure which crontable the server reads?** See
+    [The crontable](../../README.md#the-crontable). A crontable left in the old
+    `~/.claude/channels/slack` moves with the state directory (see
+    [The state directory's location and its move at start](#the-state-directorys-location-and-its-move-at-start)).
 14. **Old lines are missing from the cron log, or `server.log` has a
     `[slack] cron-log: prune failed` line?** With `cron_log_max_bytes` set,
     the server keeps the cron log within that many bytes by dropping its
@@ -6688,78 +6689,6 @@ is left (the table below), or the old server is still running.
 | `[slack] state-migrate: a server is still running on the old state directory <old> (PID <pid>). … Stop that server (claude-slack-channel-bots stop), then start again.` | `<old>/server.pid` (through the link, when `<old>` links to another directory) names a live process: a server of the old release is running. The start refused (exit 1), because moving its files from under it would split its state, and the check for a second server would not see its PID file at `<new>`. | Run `claude-slack-channel-bots stop` (it finds the old directory), confirm the old server is gone, then `start`. With the operator's say-so only. |
 | `[slack] state-migrate: could not move the state directory from <old> to its new default location <new>: could not create <new> (<cause>)`, or `could not move "<name>" (<cause>)`, or `could not look at an entry (<cause>)`. `Nothing was lost: what did not move is still in <old>. …` | A step failed (permissions, a full disk, a read-only file system, a file in the way of `<new>`). The start refused (exit 1). Every step keeps the source until the destination is in place, so a start that stops is safe to repeat. | Have the operator fix the cause and start again, or set `SLACK_STATE_DIR=<old>` in the server's environment to keep the old location. The line also gives a hand-fix that depends on `<new>`. With `<new>` absent: `move it by hand (mv <old> <new> && ln -s <new> <old>)`. With `<new>` present: `move each entry still in <old> that is not in <new> by hand (mv <old>/<name> <new>/<name>)`, because `mv "<old>" "<new>"` onto an existing directory would put the old one inside it. |
 | `[slack] Warning: state-migrate: the state directory is at <new>, which is in use, but <old> could not be replaced with a symbolic link to it: <cause>. … To restore it, … run: ln -s <new> <old>` | The data is at `<new>` and the server uses it, but the old name is not a link: a session or script that names `<old>` does not reach it. A later start does not restore the link. | With the operator's say-so: make sure nothing is left at `<old>` (a directory there should hold nothing that is not at `<new>`), then run the `ln -s` the line gives. |
-
-## The crontable's location and its move at start
-
-Scheduled prompts are read from the crontable (see
-[Scheduled Prompts](../../README.md#scheduled-prompts-cscb_cron)). The server
-reads it from the first of these that applies:
-
-- `cron_table_path`, when `config.json` sets it: the path as written, with `~`
-  expanded, whatever it names (`~/.config/cscb/crontab` included). The server
-  never creates its directory and never moves a crontable to it.
-- Otherwise `crontab` in the state directory: `~/.config/cscb/crontab`,
-  `$XDG_CONFIG_HOME/cscb/crontab` when the server's `XDG_CONFIG_HOME` is an
-  absolute path (an empty or relative one is ignored), or `crontab` beside
-  `config.json` when `SLACK_STATE_DIR` is set.
-
-The cron log, `cron.log`, stays in the state directory in every case (unless
-`cron_log_path` is set). The location is fixed at start: a confirmed change to
-`cron_table_path` takes effect at the next start. A bot finds the crontable
-through `CSCB_CRONTABLE_PATH`, set when its session was spawned. A resumed
-session keeps the value of its spawn, so a bot spawned by an earlier release
-still names its old path, `~/.claude/channels/slack/crontab`. That path
-resolves, through the link the state directory's move leaves at
-`~/.claude/channels/slack`, to the crontable the scheduler reads.
-
-The crontable and its `prompts` directory are entries of the state directory,
-so they move with it (see
-[The state directory's location and its move at start](#the-state-directorys-location-and-its-move-at-start)).
-Relative prompt paths keep resolving, because the two move together. An
-earlier release moved the crontable out of `~/.claude` to `~/.config/cscb/crontab`
-at its start and logged `cron-migrate:` lines. The current release does not
-(the default crontable already lies in the state directory), so the
-`cron-migrate:` lines in the table below appear only in a log written by that
-earlier release. The state directory's move treats a crontable present in both
-places as a conflict (the `state-migrate:` conflict row above).
-
-Look, read-only, with the server's environment (it may differ from your
-shell's; with a relative `XDG_CONFIG_HOME`, use `$HOME/.config`):
-
-```sh
-STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
-ls -ld "$STATE/crontab" "$STATE/prompts" "$HOME/.claude/channels/slack" 2>&1
-grep -h -F 'cron-migrate:' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
-grep -h -F 'cron-scheduler:' "$STATE"/server.log 2>/dev/null | tail -n 5
-```
-
-If `crontab` or `prompts` shows as a link into the state directory, an earlier
-release's move left it there; the state directory's move removes such links
-when it merges. A plain file at the old `crontab` next to a different one in
-the state directory is the conflict the table above describes.
-
-The `cron-migrate:` lines an earlier release wrote, and what to do about them
-(`<old>` is the crontable's former path under `~/.claude`, `<new>` its
-location outside it):
-
-| Line | Meaning | What to do |
-|---|---|---|
-| `[slack] cron-migrate: moved the crontable from <old> to <new>, its new default location outside ~/.claude; its lines are unchanged. <old> is now a symbolic link to it, so a session whose CSCB_CRONTABLE_PATH still names the old path writes the same file.` | The start moved the crontable, or finished a move an earlier start left with one file under both names (a hard link). Later starts find `<old>` linking to `<new>` and log nothing. | Nothing. |
-| `[slack] cron-migrate: <old> is a symbolic link to <target>; <new>, the crontable's new default location, now links to the same file, and <old> is left as it is.` | The old path was already a link to a crontable elsewhere, so the new path now links to that same file. | Nothing. |
-| `[slack] cron-migrate: moved <old dir>/prompts to <new dir>/prompts, beside the crontable, so relative prompt paths such as prompts/<file> name the same files as before the move. <old dir>/prompts is now a symbolic link to it.` | Relative prompt paths resolve against the crontable's own directory, so the move took the old `prompts/` directory beside the new crontable, outside `~/.claude`, and left a link at its old name. A path through either name finds the same file. | Nothing. |
-| `[slack] cron-migrate: linked <new dir>/prompts to <target dir>, so relative prompt paths such as prompts/<file> name the same files as before the move.` | `<old dir>/prompts` was itself a symbolic link to `<target dir>`, so the new name now links to that same directory, and the old link is left as it is. | Nothing. |
-| `[slack] Warning: cron-migrate: a crontable exists both at <new>, its default location, and at <old>, the old one. Using <new>; <old> is left untouched and its lines are not scheduled. …` | Both paths hold a crontable, and they are not one file. The server reads `<new>`; a line only in `<old>` never fires. Usually an editor or `sed -i` saved `<old>` by replacing the file, which replaced the link, or a crontable was put at `<new>` before the move. It is logged at every start until fixed. | With the operator's say-so: compare the two (`diff "<new>" "<old>"`), copy the lines still wanted into `<new>`, then replace `<old>` with a link: `ln -sfn "<new>" "<old>"`. From then on, edit `<new>`, or append to either path with `>>`. |
-| `[slack] Warning: cron-migrate: <old> is not a regular file, so nothing was moved to <new>, the crontable's default location.` | The old path holds a directory, a FIFO or a link to one. Nothing moved; the scheduler uses `<new>`, creating it empty if it is absent. | Have the operator look at what is at `<old>` and copy any schedules it holds into `<new>`. |
-| `[slack] Warning: cron-migrate: could not create <dir>, the crontable's default directory: <error>. Nothing was moved. This start runs on <old>, the old location: …` | The directory could not be made (permissions, a file in its place, a read-only disk). Nothing changed. This start's scheduler reads `<old>` (creating it, with its header, if it is absent), and the sessions it launches get `<old>` as `CSCB_CRONTABLE_PATH`, so its schedules keep firing. Every start logs this line until the directory can be made. | Have the operator fix the cause and create the directory (`mkdir -p "<dir>"`); the next start moves the crontable. Or set `cron_table_path` in `config.json` and confirm it, which takes effect at the next start. |
-| `[slack] Warning: cron-migrate: could not move the crontable from <old> to <new>: <error>. Nothing was moved. This start runs on <old>, the old location: …` | The file could not be put at the new path (permissions, a full disk, or a file system at `<new>` that takes no hard links), or a path could not be looked at. Nothing changed, `<new>` was not created, and this start runs on `<old>`, so its schedules keep firing. The next start tries again; on a file system without hard links, every start fails the same way. | With the operator's say-so, fix the cause and let the next start move it, or move it by hand as the line says: `mv "<old>" "<new>" && ln -s "<new>" "<old>"`. Or set `cron_table_path` to `<old>` and confirm it (next start). |
-| `[slack] Warning: cron-migrate: could not move the crontable from <old> to <new>: it changed while it was being copied, so the copy was discarded. Nothing was moved. …` | A hard link could not be made (`<new>` on another file system, say), so the move copies the file, and `<old>` changed during the copy (a bot appended a line, say). The copy was removed before it was placed, so no line is lost, and this start runs on `<old>`. | Nothing: the next start tries again. |
-| `[slack] Warning: cron-migrate: moved the crontable to <new>, which is in use, but could not replace <old> with a symbolic link to it: <error>. Both names are the same file for now, so a line appended at either is scheduled; the next start tries the link again.` | The file is at `<new>` as a hard link, so both names are one file, and this start runs on `<new>`. | Nothing urgent: fix the cause (usually the old directory's permissions); the next start finishes the link and logs the `moved` line. Until then, append only; an editor that replaces `<old>` splits the two. |
-| `[slack] Warning: cron-migrate: moved the crontable to <new>, which is in use, but could not replace <old> with a symbolic link to it: <error>. <old> is a separate copy: a line appended there is not scheduled. …` | The file was copied, because a hard link could not be made (`<new>` on another file system, say), and `<old>` stayed a separate copy. This start runs on `<new>`. A bot whose `CSCB_CRONTABLE_PATH` names `<old>` appends where nothing reads. | With the operator's say-so, copy any line appended to `<old>` since into `<new>`, then `ln -sfn "<new>" "<old>"`. |
-| `[slack] Warning: cron-migrate: could not move <old dir>/prompts to <new dir>/prompts: <error>. Nothing was moved or linked, so a crontable line whose prompt path starts with prompts/ no longer finds its prompt. …` | The crontable moved (or was linked), but its `prompts/` directory could not. Those lines fire `prompt-missing` in `cron.log`, and each gets the relative-prompt WARN at the end of this table. A later start that finds the crontable already moved does not try again. | With the operator's say-so, move it by hand as the line says: `mv "<old dir>/prompts" "<new dir>/prompts" && ln -s "<new dir>/prompts" "<old dir>/prompts"`. Or write each such line's absolute prompt path. |
-| `[slack] Warning: cron-migrate: moved <old dir>/prompts to <new dir>/prompts, but could not leave a symbolic link at <old dir>/prompts: <error>. Relative prompt paths such as prompts/<file> name the same files as before; a prompt path naming the old directory no longer finds its prompt. …` | The directory moved beside the new crontable, but nothing is left at its old name. A crontable line, or a bot, that names a prompt by its absolute path under `<old dir>/prompts` no longer finds it; no WARN names those lines. | Have the operator make the link, as the line says: `ln -s "<new dir>/prompts" "<old dir>/prompts"`. |
-| `[slack] Warning: cron-migrate: could not move <old dir>/prompts to <new dir>/prompts, which is on another file system: <error>. Linked <new dir>/prompts to <old dir>/prompts instead, so relative prompt paths such as prompts/<file> name the same files as before the move; a prompt file written through either name still lands in <old dir>/prompts, under ~/.claude. …` | The two folders are on different file systems, so the directory stayed where it was and the new name links to it. Prompts resolve as before, but a bot that writes a prompt file still writes under `~/.claude`, which Claude Code asks the user to approve. | Nothing is broken. To move the directory out of `~/.claude`, with the operator's say-so, run what the line ends with: `rm "<new dir>/prompts" && mv "<old dir>/prompts" "<new dir>/prompts" && ln -s "<new dir>/prompts" "<old dir>/prompts"`. |
-| `[slack] Warning: cron-migrate: could not link <new dir>/prompts to <target dir>: <error>. A crontable line whose prompt path starts with prompts/ no longer finds its prompt; write its absolute path.` | The new name could not be made. `<target dir>` is the directory `<old dir>/prompts` links to, or `<old dir>/prompts` itself when it could not move to another file system. Those lines fire `prompt-missing` in `cron.log`. | Have the operator make the link (`ln -s "<target dir>" "<new dir>/prompts"`) or write each such line's absolute prompt path. |
-| `[slack] Warning: cron-migrate: crontable line <n>: the relative prompt path <path> named <before> before the move and now names <after>, which does not exist, so it fires prompt-missing. Write the absolute path <before> in that line.` | A relative prompt path that named a file beside the old crontable names nothing beside the new one (a prompt kept beside the crontable itself, or under a `prompts/` that was not carried). The line is never rewritten. Logged only by the start that moves or links the crontable or finishes its move (one whose old path could not become a link included), so look for it in older `server.log` generations too. | Have the operator write `<before>` in line `<n>` in place of `<path>`. |
 
 ---
 

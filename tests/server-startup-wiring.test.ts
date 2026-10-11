@@ -411,7 +411,6 @@ import {
   atMainTopLevel,
   balancedAfter,
   callArguments,
-  cronTableStartOverride,
   importSource,
   indicesOf,
   insideMain as insideMainOf,
@@ -835,11 +834,6 @@ function assignmentsTo(name: string): Array<{ at: number; value: string }> {
     .map((m) => ({ at: m.index!, value: m[1]!.trim() }))
 }
 
-/** Bug b.avm: the start's crontable override in server.ts (see `cronTableStartOverride`). */
-function cronTableOverride(): ReturnType<typeof cronTableStartOverride> {
-  return cronTableStartOverride(SERVER_CODE)
-}
-
 /** Whether `offset` lies inside main()'s body in server.ts. */
 function insideMain(offset: number): boolean {
   return insideMainOf(SERVER_CODE, offset)
@@ -1012,7 +1006,7 @@ describe('main() resolves the start through the reload controller and exits on a
     expect(onlyCallProps('createReloadController').get('paths')).toBe('reloadFilePaths(CONFIG_PATH)')
   })
 
-  test('a refused start exits 1 right after the resolution, before the applied config is set; on the start path the outcome\'s config is the only applied config (bar its copy with the crontable the start runs on, bug b.avm), and nothing re-reads the config file into it', () => {
+  test('a refused start exits 1 right after the resolution, before the applied config is set; on the start path the outcome\'s config is the only applied config, and nothing re-reads the config file into it', () => {
     const { controller, outcome, loaded, resolveAt, assignAt, bringUpAt } = startResolution(SERVER_CODE)
     // `const <outcome> = <controller>.resolveStart()`, then the refusal exit as
     // the whole `if`, then `<loaded> = <outcome>.config`: nothing in between.
@@ -1024,12 +1018,11 @@ describe('main() resolves the start through the reload controller and exits on a
     )
     expect(indicesOf(sequence, SERVER_CODE)).toHaveLength(1)
     // The start path, from the resolution to the start bring-up request (where
-    // every start pass reads the applied config), assigns it from the outcome,
-    // and again only with the crontable the start runs on (cronTableOverride,
-    // a copy of it with cron_table_path replaced). A later assignment outside
-    // that window (a confirmed apply, E12/E13) is not the start's.
+    // every start pass reads the applied config), assigns it from the outcome
+    // once. A later assignment outside that window (a confirmed apply,
+    // E12/E13) is not the start's.
     const assigns = assignmentsTo(loaded)
-    expect(assigns.filter(({ at }) => at > resolveAt && at < bringUpAt).map(({ at }) => at)).toEqual([assignAt, cronTableOverride().loadedAt])
+    expect(assigns.filter(({ at }) => at > resolveAt && at < bringUpAt).map(({ at }) => at)).toEqual([assignAt])
     // No assignment anywhere reads the config file (the import test above
     // also bans every config loader from server.ts).
     for (const { value } of assigns) {
@@ -1707,19 +1700,17 @@ describe('main() runs the call-timeout start step once, after the startup gate, 
   })
 
   // The start-time applied config: the variable set from the start outcome's
-  // config, again only with the crontable the start runs on (bug b.avm), and
-  // never replaced after (a confirmed apply replaces the applied persona set,
+  // config, never replaced after (a confirmed apply replaces the applied persona set,
   // `<loaded>`, not it). So the step takes the configuration the start
   // resolved, never a loader, the file or a literal.
-  test('passes one argument, the start-time applied config: a variable whose every assignment is `= <loaded>` (the start-time one and the crontable override\'s), after the start assignment and before the step, and which no declaration initializes', () => {
+  test('passes one argument, the start-time applied config: a variable whose one assignment is `= <loaded>`, after the start assignment and before the step, and which no declaration initializes', () => {
     const { loaded, assignAt } = startResolution(SERVER_CODE)
     const args = splitTopLevel(callArguments(SERVER_CODE, stepCall()))
     expect(args).toHaveLength(1)
     const config = args[0]!
     expect(config).toMatch(/^[A-Za-z_$][\w$]*$/)
     const assigns = assignmentsTo(config)
-    expect(assigns.map(({ value }) => value)).toEqual([loaded, loaded])
-    expect([config, assigns[1]!.at]).toEqual([cronTableOverride().startTime, cronTableOverride().startTimeAt])
+    expect(assigns.map(({ value }) => value)).toEqual([loaded])
     expect(assigns[0]!.at).toBeGreaterThan(assignAt)
     for (const { at } of assigns) expect(at).toBeLessThan(stepCall())
     expect(indicesOf(new RegExp(`\\b(?:let|const|var)\\s+${config}\\b\\s*(?:!?\\s*:[^=;\\n]*)?=(?![=>])`, 'g'), SERVER_CODE)).toEqual([])
@@ -1867,7 +1858,7 @@ describe('main() reads the retired-key record once, behind no branch, after the 
 // ---------------------------------------------------------------------------
 
 describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona config through the bring-up controller, which shutdown cancels (SR-6.1, SR-6.4)', () => {
-  test('is the reload controller\'s start bring-up: it launches over configInEffect(<start-time config>, <the applied config the controller supplies>), as its bring-up the bring-up controller, and as its shutdown query a live read of `shuttingDown` (b.jg5 SRJ-205, bug b.avm)', () => {
+  test('is the reload controller\'s start bring-up: it launches over configInEffect(<start-time config>, <the applied config the controller supplies>), as its bring-up the bring-up controller, and as its shutdown query a live read of `shuttingDown` (b.jg5 SRJ-205)', () => {
     // The only startupSessionManager call is returned by the controller's
     // lifecycle `startBringUp`, right after a guard that throws while the
     // start-time config is unset. Its first argument is configInEffect of the
@@ -1875,9 +1866,8 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
     // persona set (the record's at a start from the record) over the
     // start-time server-wide values, as every later launch reads them. Bug
     // b.avm: a start that fell back to the old crontable sets that path in the
-    // start-time config only (cronTableStartOverride), so the controller's
-    // config as a whole would export the default as CSCB_CRONTABLE_PATH. Never
-    // the module-level config or a config read again from the file. main()
+    // start-time config only, so the controller's config as a whole is never
+    // the one a launch reads. Never the module-level config or a config read again from the file. main()
     // requests the pass with no argument, so the controller supplies the config.
     const { createAt, bringUpAt, controller } = startResolution(SERVER_CODE)
     const startTime = startTimeConfig().name
@@ -2269,16 +2259,14 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
     expect(delay).not.toBeNull()
     // The start-time config: declared once, inside main(), before the reload
     // controller (whose onApplied also reads it), and assigned from the loaded
-    // config after the start resolution set it, again only by the crontable
-    // override (bug b.avm, cronTableOverride).
+    // config after the start resolution set it.
     const startTime = delay![1]!
     const decls = [...SERVER_CODE.matchAll(new RegExp(`\\b(?:let|const|var)\\s+${startTime}\\b[^\\n]*`, 'g'))]
     expect(decls.map((d) => d[0].trim())).toEqual([`let ${startTime}!: PersonaConfig`])
     expect(insideMain(decls[0]!.index!)).toBe(true)
     expect(decls[0]!.index!).toBeLessThan(createAt)
     const assignments = assignmentsTo(startTime)
-    expect(assignments.map((a) => a.value)).toEqual([loaded, loaded])
-    expect([startTime, assignments[1]!.at]).toEqual([cronTableOverride().startTime, cronTableOverride().startTimeAt])
+    expect(assignments.map((a) => a.value)).toEqual([loaded])
     expect(insideMain(assignments[0]!.at)).toBe(true)
     expect(assignments[0]!.at).toBeGreaterThan(assignAt)
   })
@@ -5789,25 +5777,18 @@ function channelDeliveryStartLoad(): number {
  * The start-time applied config (declared before the reload controller): the
  * one variable assigned exactly `<loaded>` as a statement of its own, in
  * main()'s own statement list, after the start assignment, and assigned
- * nothing else (bar the crontable override's same `= <loaded>`, bug b.avm,
- * `cronTableOverride`) and initialized by no declaration. Returns its name
+ * nothing else and initialized by no declaration. Returns its name
  * and the offset of that assignment.
  */
 function startTimeConfig(): { name: string; at: number } {
   const { loaded, assignAt } = startResolution(SERVER_CODE)
-  const override = cronTableOverride()
   const assigns = [...SERVER_CODE.matchAll(new RegExp(`(?<![\\w.$]|(?:let|const|var)\\s+)(\\w+)\\s*=(?![=>])\\s*${loaded}\\s*;?\\s*$`, 'gm'))]
-    .filter((m) => m.index !== override.startTimeAt)
   expect(assigns.map((m) => m[1])).toHaveLength(1)
   const name = assigns[0]![1]!
   const at = assigns[0]!.index!
   expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
   expect(at).toBeGreaterThan(assignAt)
-  expect(name).toBe(override.startTime)
-  expect(assignmentsTo(name).map(({ at: where, value }) => [where, value])).toEqual([
-    [at, loaded],
-    [override.startTimeAt, loaded],
-  ])
+  expect(assignmentsTo(name).map(({ at: where, value }) => [where, value])).toEqual([[at, loaded]])
   expect(indicesOf(new RegExp(`\\b(?:let|const|var)\\s+${name}\\b\\s*(?:!?\\s*:[^=;\\n]*)?=(?![=>])`, 'g'), SERVER_CODE)).toEqual([])
   return { name, at }
 }

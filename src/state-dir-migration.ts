@@ -100,13 +100,11 @@
  * The line for the move sorts of entries names the entries by file name only;
  * nothing logged carries file contents.
  *
- * b.avm's crontable migration (`cron-table-migration.ts`) is subsumed for the
- * default install: the crontable and `prompts/` are entries of `L` like the
- * rest, so they move with it, relative prompt paths keep resolving (both move
- * together), and `CSCB_CRONTABLE_PATH` of a session launched before the
- * upgrade (`L/crontab`) resolves through the link. Its start-time call stays
- * in `main()` but is dormant: the default crontable now lies in the state
- * directory, so its default and legacy paths are the same path.
+ * The crontable and `prompts/` are entries of `L` like the rest, so they move
+ * with it, relative prompt paths keep resolving (both move together), and
+ * `CSCB_CRONTABLE_PATH` of a session launched before the upgrade (`L/crontab`)
+ * resolves through the link. The default crontable lies in the state
+ * directory, so no separate crontable move exists.
  *
  * Commands other than the server's start (`cscb stop`,
  * `clean_restart`, `clear-latch`, `credentials`, and postinstall, which npm

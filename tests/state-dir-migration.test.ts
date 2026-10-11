@@ -790,7 +790,7 @@ describe('prepareStateDir: a server of the old release running on L', () => {
       expect(lines).toEqual([])
     })
 
-    test.each([
+    test.each<[string, string | undefined, Partial<StateDirMigrationDeps>]>([
       ['a stale PID (no such process)', String(LIVE_PID), { isProcessRunning: () => false, ownPid: 1 }],
       ["the process's own PID", String(LIVE_PID), { isProcessRunning: () => true, ownPid: LIVE_PID }],
       ['text that is not a number', 'not-a-pid', { isProcessRunning: () => true, ownPid: 1 }],
