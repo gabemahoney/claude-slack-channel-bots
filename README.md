@@ -1,6 +1,6 @@
 # Claude Slack Channel Bots
 
-A single HTTP MCP server that runs several independent Claude Code bots, called personas. Each persona has its own Slack app and identity (name and avatar) and one Claude Code instance with its own working directory. It is reachable by direct message when its `dm.enabled` is `true`, and in the Slack channels the server's channel mode gives it: in declarative mode, the default, the channels it is configured into; in fungible mode, every public or private channel its Slack app is invited to that is not externally shared (see [Channel modes](docs/configuration.md#channel-modes)). The server holds one Slack Socket Mode connection per persona and delivers each message to the persona whose app received it. Each persona's tool calls act as that persona: in declarative mode only in the channels it is configured into, in fungible mode in any channel ID it names, where the call goes to Slack, which decides; and in its direct messages when its `dm.enabled` is `true`.
+A single HTTP MCP server that runs several independent Claude Code bots, called personas. Each persona has its own Slack app and identity (name and avatar) and one Claude Code instance with its own working directory. It is reachable by direct message when its `dm.enabled` is `true`, and in the Slack channels the server's channel mode gives it: in declarative mode, the default, the channels it is configured into; in fungible mode, every public or private channel its Slack app is invited to that is not externally shared (see [Channel modes](docs/channel-modes.md#channel-modes)). The server holds one Slack Socket Mode connection per persona and delivers each message to the persona whose app received it. Each persona's tool calls act as that persona: in declarative mode only in the channels it is configured into, in fungible mode in any channel ID it names, where the call goes to Slack, which decides; and in its direct messages when its `dm.enabled` is `true`.
 
 ---
 
@@ -92,7 +92,7 @@ If the host is unsupported, the system-installed `agent-director` itself will re
 - `channels` lists the channels the persona is in, each with `delivery` `"all"` (every message) or `"mentions"` (only @mentions and `@here` / `@channel`). Invite the persona's Slack app to each one.
 - `permission_prompts` is where the persona's permission prompts and notices go: one of its channels, or `"dm"` with a `dm` section.
 
-Replace the channel ID and paths with your own. [Configuration](docs/configuration.md) has every field, more examples and fungible mode.
+Replace the channel ID and paths with your own. [Configuration](docs/configuration.md) has every persona field and a complete example; [Channel modes](docs/channel-modes.md) covers fungible mode.
 
 ---
 
@@ -127,7 +127,9 @@ The server applies it without a restart. Lines that start `DESTRUCTIVE:` name pe
 
 | Page | Read it to |
 |---|---|
-| [Configuration](docs/configuration.md) | Write `config.json`: every persona field, server-wide setting, environment variable, and the two channel modes |
+| [Configuration](docs/configuration.md) | Write `config.json`: every persona field, credentials files and the load-time rules |
+| [Server settings](docs/server-settings.md) | Set the server-wide settings, environment variables and `slack-mcp.json` |
+| [Channel modes](docs/channel-modes.md) | Choose declarative or fungible mode, and see who can reach a persona in fungible mode |
 | [Reload](docs/reload.md) | Change the configuration of a running server and read its preview |
 | [CLI Reference](docs/cli.md) | Look up a command's behaviour, output and exit codes |
 | [What a bot can do](docs/bots.md) | Learn the bots' tools, how messages reach them, `/interject`, the permission relay and the Slack Reply Guard |

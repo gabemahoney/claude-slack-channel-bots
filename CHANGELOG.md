@@ -8,8 +8,9 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ### The README is now install and the happy path; the reference moved to `docs/`
 
-The README keeps Quick Start, the prerequisites, a first configuration and the everyday commands. Everything else moved, unchanged and under the same section titles, to pages under `docs/` that ship in the package: [Configuration](docs/configuration.md), [Reload](docs/reload.md), [CLI Reference](docs/cli.md), [What a bot can do](docs/bots.md), [Scheduled Prompts](docs/scheduled-prompts.md), [agent-director](docs/agent-director.md), [Troubleshooting](docs/troubleshooting.md) and [Migration](docs/migration.md).
+The README keeps Quick Start, the prerequisites, a first configuration and the everyday commands. Everything else moved, under the same section titles, to pages under `docs/` that ship in the package: [Configuration](docs/configuration.md), [Server settings](docs/server-settings.md), [Channel modes](docs/channel-modes.md), [Reload](docs/reload.md), [CLI Reference](docs/cli.md), [What a bot can do](docs/bots.md), [Scheduled Prompts](docs/scheduled-prompts.md), [agent-director](docs/agent-director.md), [Troubleshooting](docs/troubleshooting.md) and [Migration](docs/migration.md).
 
+- **The full troubleshooting entries, startup-error classes, CLI teardown failures and Slack Reply Guard internals are in the `debug-slack-channel-bots` skill.** `docs/troubleshooting.md` lists each symptom with its fix and links to its entry; the full `config.json` load-time rules are in the skill's "The load-time rules".
 - **The switch-over and rollback runbooks are in `docs/migration.md`.** The startup gate's refusals, `bun run install-check`, the *agent-director unreachable* notice and the `agent_director_call_timeout_ms` warning now name `docs/migration.md` where they named the README, with the same section titles.
 - **The crontable warning names `docs/scheduled-prompts.md`.** A line with no persona list is now logged with a pointer to the section "Crontable format" in `docs/scheduled-prompts.md`.
 
@@ -19,7 +20,7 @@ The README keeps Quick Start, the prerequisites, a first configuration and the e
 
 ### A restarted or resumed bot now loads the current system prompt
 
-The new server-wide setting `fresh_system_prompt` defaults to `true`, which adds `--system-prompt-snapshot off` to every bot's launch arguments. A restarted or resumed bot then loads the current system prompt file and `CLAUDE.md` and keeps its conversation. See `fresh_system_prompt` under [Server-wide settings](docs/configuration.md#server-wide-settings).
+The new server-wide setting `fresh_system_prompt` defaults to `true`, which adds `--system-prompt-snapshot off` to every bot's launch arguments. A restarted or resumed bot then loads the current system prompt file and `CLAUDE.md` and keeps its conversation. See `fresh_system_prompt` under [Server-wide settings](docs/server-settings.md#server-wide-settings).
 
 - **Give each existing bot one fresh start after installing.** A bot started before the upgrade keeps its old launch arguments on every resume, `clean_restart` included, until it starts a new conversation. That start loses the bot's conversation once.
 - **On a Claude Code without `--system-prompt-snapshot`, set `fresh_system_prompt` to `false`.** The setting takes effect at the next server start.
@@ -111,18 +112,18 @@ This release adds a second channel mode, fungible mode, beside the declarative m
 
 ### Two channel modes
 
-The top-level setting `allow_invited_channels` picks the channel mode for every persona at once. See [Channel modes](docs/configuration.md#channel-modes) and [What each mode serves](docs/configuration.md#what-each-mode-serves).
+The top-level setting `allow_invited_channels` picks the channel mode for every persona at once. See [Channel modes](docs/channel-modes.md#channel-modes) and [What each mode serves](docs/channel-modes.md#what-each-mode-serves).
 
 - **Declarative mode** (`allow_invited_channels` absent or `false`, the default) serves channels as 0.11.1 does: each persona serves only the channels listed in its `channels`, each at its `delivery`.
 - **Fungible mode** (`allow_invited_channels: true`):
   - `channels` and the top-level `permission_prompts` are not read;
   - each persona serves every public or private channel its Slack app is a member of that Slack marks as not externally shared;
-  - a channel is served at `mentions` by default, and at `all` only when the persona's agent stored `all` for it with `set_channel_delivery` (see [Channel delivery in fungible mode](docs/configuration.md#channel-delivery-in-fungible-mode));
+  - a channel is served at `mentions` by default, and at `all` only when the persona's agent stored `all` for it with `set_channel_delivery` (see [Channel delivery in fungible mode](docs/channel-modes.md#channel-delivery-in-fungible-mode));
   - each stored choice persists in `channel-delivery.json` in the state directory, beside `config.json`;
-  - the persona's permission prompts and notices go to its `invited.permission_prompts`, `"dm"` when it is absent (see [Permission prompts in fungible mode](docs/configuration.md#permission-prompts-in-fungible-mode));
+  - the persona's permission prompts and notices go to its `invited.permission_prompts`, `"dm"` when it is absent (see [Permission prompts in fungible mode](docs/channel-modes.md#permission-prompts-in-fungible-mode));
   - Slack enforces channel membership for the persona's outbound calls.
-- **The switch changes through a pending change and its confirmation,** with no restart, in either direction. See [Turning fungible mode on or off](docs/configuration.md#turning-fungible-mode-on-or-off).
-- **Before turning fungible mode on,** read [Who can reach a persona in fungible mode](docs/bots.md#who-can-reach-a-persona-in-fungible-mode): an invite then changes who can reach a persona's worker.
+- **The switch changes through a pending change and its confirmation,** with no restart, in either direction. See [Turning fungible mode on or off](docs/channel-modes.md#turning-fungible-mode-on-or-off).
+- **Before turning fungible mode on,** read [Who can reach a persona in fungible mode](docs/channel-modes.md#who-can-reach-a-persona-in-fungible-mode): an invite then changes who can reach a persona's worker.
 
 ### Upgrading from 0.11.x
 
@@ -188,7 +189,7 @@ This release replaces the single-bot setup with **personas**, and runs them on a
 - **No persona's key may start with another persona's key.** A configuration with such a pair, such as `dev` and `dev_2` or `horde` and `horde_admin`, is rejected: it stops a first start, and on a running server it is an `INVALID` pending change. The error names both personas and suggests a new name for the one with the shorter key, such as `horde_main`. The reason: tmux matches a session target by prefix unless it is written with `=`, so a human's tmux command without `=` for one persona (for example `tmux attach -t slack_bot_dev`) could reach another persona's session. If you name the personas after the channels your bots served, check the names for such pairs. See [Persona name and key](docs/configuration.md#persona-name-and-key).
 - **Tokens come only from credentials files.** Slack tokens are no longer read from environment variables. Create one credentials file per persona with the wizard's [credentials command](skills/setup-slack-channel-bots/SKILL.md#credentials-command) (`claude-slack-channel-bots credentials <persona>`). Switch-over step 1 keeps a copy of the Slack token environment variables the old CSCB uses, for rollback; remove them from the host's environment only after that, as [Upgrading to personas](docs/migration.md#upgrading-to-personas) says.
 - **One Slack app per persona.** An existing app can serve one persona; create another app for each additional persona. Re-install the existing app from the current `slack-app-manifest.yml` so it gains the `im:write` scope.
-- **The access-control file is retired.** Who can reach a persona is decided only by its `channels`, each channel's `delivery` and its `dm.enabled` switch. The allowlist and pairing flow are gone, and the server never reads the file. Keep `access.json` until rollback is no longer wanted, because the previous CSCB reads it. Set the acknowledgement reaction and reply splitting in `config.json` instead (see [Server-wide settings](docs/configuration.md#server-wide-settings)).
+- **The access-control file is retired.** Who can reach a persona is decided only by its `channels`, each channel's `delivery` and its `dm.enabled` switch. The allowlist and pairing flow are gone, and the server never reads the file. Keep `access.json` until rollback is no longer wanted, because the previous CSCB reads it. Set the acknowledgement reaction and reply splitting in `config.json` instead (see [Server-wide settings](docs/server-settings.md#server-wide-settings)).
 - **Crontable lines that name channels no longer match.** Such a target matches no persona and is logged `unknown-persona` each time it fires. Rewrite each target as a persona's name or key.
 - **Each bot starts fresh once.** Bot instances created before the upgrade are never resumed, so each persona starts once without its prior conversation. Their agent-director rows are kept, never deleted. The switch-over runbook stops the old bots and ends their leftover sessions before the new CSCB first starts (see [Switching over to agent-director Phase 1](#switching-over-to-agent-director-phase-1)); a start that still finds one running ends it with a checked kill and keeps its row.
 - **`/interject` requests name a persona.** A request must carry `persona` (a persona's name or key). A body that names only a `channel` is refused with 400. A successful response is `{ "ok": true, "persona": "<name>" }`; it no longer holds `channel` or `cwd`. Update every script that calls `/interject`, including host crontab `curl` lines, to send `persona`. See [Interject](docs/bots.md#interject).

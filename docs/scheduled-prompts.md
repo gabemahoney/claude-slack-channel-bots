@@ -4,7 +4,7 @@ The server fires scheduled prompts into personas once per minute, reading them f
 
 ## The crontable
 
-Schedules live in the crontable file at `cron_table_path`. Without that key the crontable is at `~/.config/cscb/crontab` (`$XDG_CONFIG_HOME/cscb/crontab` when `XDG_CONFIG_HOME` is an absolute path), outside `~/.claude`, so a bot appending a schedule doesn't trigger Claude Code's approval prompt for writes under `~/.claude`. With `SLACK_STATE_DIR` set, the default is `crontab` beside `config.json` in that directory. Set `cron_table_path` in `config.json` to put it anywhere else (see [Server-wide settings](configuration.md#server-wide-settings)).
+Schedules live in the crontable file at `cron_table_path`. Without that key the crontable is at `~/.config/cscb/crontab` (`$XDG_CONFIG_HOME/cscb/crontab` when `XDG_CONFIG_HOME` is an absolute path), outside `~/.claude`, so a bot appending a schedule doesn't trigger Claude Code's approval prompt for writes under `~/.claude`. With `SLACK_STATE_DIR` set, the default is `crontab` beside `config.json` in that directory. Set `cron_table_path` in `config.json` to put it anywhere else (see [Server-wide settings](server-settings.md#server-wide-settings)).
 
 ```sh
 cat ~/.config/cscb/crontab

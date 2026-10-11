@@ -66,12 +66,12 @@ done
 ```
 
 The directory printed is the package root: it holds `README.md`, `docs/`,
-`slack-app-manifest.yml` and `skills/`. Read `docs/configuration.md`'s
-`## Personas (config.json)` section (its subsections are the persona
-reference) and its `## Channel modes` section, and `docs/reload.md`, and use
-them as the authority for every
-later step. If the package isn't found, continue with this skill and point the
-operator at those two pages in the package's GitHub repository.
+`slack-app-manifest.yml` and `skills/`. Read `docs/configuration.md`
+(the persona reference), `docs/server-settings.md`, `docs/channel-modes.md`
+and `docs/reload.md`, and the debug skill's `### The load-time rules`
+(`skills/debug-slack-channel-bots/SKILL.md`), and use them as the authority
+for every later step. If the package isn't found, continue with this skill
+and point the operator at those pages in the package's GitHub repository.
 
 ---
 
@@ -126,7 +126,7 @@ channels and sets each one's `delivery`; in fungible mode, inviting a
 persona's app to a channel decides who can reach the persona there, and the
 persona's agent then sets each channel's delivery with `set_channel_delivery`.
 Suggest declarative mode: the operator keeps choosing each persona's audience.
-See `docs/configuration.md`'s `## Channel modes`.
+See `docs/channel-modes.md`.
 
 Find the switch in the last-applied record and in `config.json`:
 
@@ -143,8 +143,8 @@ mode in force is the record's when the record exists (Step 3), otherwise
 
 - **A fresh install** (no last-applied record and no persona in
   `config.json`): explain both modes, suggest declarative mode, and ask which
-  one. For fungible mode, have the operator read `docs/bots.md`'s
-  `### Who can reach a persona in fungible mode` first, then add
+  one. For fungible mode, have the operator read `docs/channel-modes.md`'s
+  `## Who can reach a persona in fungible mode` first, then add
   `"allow_invited_channels": true` to `config.json`, keeping every other
   field. For declarative mode, write nothing.
 - **An existing install:** state the mode in force and ask only whether to
@@ -168,7 +168,7 @@ section the mode turned on needs:
   contact may keep the default destination, `"dm"`, with no `invited`. Leave
   each persona's `channels` and `permission_prompts` in place: fungible mode
   doesn't read them, and declarative mode uses them again if the switch is
-  turned off. See `docs/configuration.md`'s `### Permission prompts in fungible mode`.
+  turned off. See `docs/channel-modes.md`'s `## Permission prompts in fungible mode`.
 - **Turning fungible mode off** (remove `allow_invited_channels`, or set it to
   `false`): every persona needs a top-level `permission_prompts`, and
   `channels` unless its `dm.enabled` is `true`, valid by the declarative-mode
@@ -178,7 +178,7 @@ section the mode turned on needs:
   doesn't read it.
 
 Then check every persona against the load-time rules of the mode in force
-after the edit, in `docs/configuration.md`'s `### Load-time rules`: the rules for both
+after the edit, in the debug skill's `### The load-time rules`: the rules for both
 modes, plus the declarative-mode rules when the switch is off, or the
 fungible-mode rules when it is on. A pending change is judged by the rules of
 the mode its own switch picks, so a persona that passes only the other mode's
@@ -198,7 +198,7 @@ to review, for each persona's app:
   grep -h -F unclaimed-channel "$STATE_DIR"/server.log.* "$STATE_DIR"/server.log 2>/dev/null
   ```
 
-and to read `docs/bots.md`'s `### Who can reach a persona in fungible mode`, since
+and to read `docs/channel-modes.md`'s `## Who can reach a persona in fungible mode`, since
 an invite then changes who can reach a persona's worker. Step 10 says how the
 switch takes effect.
 
@@ -317,7 +317,7 @@ In declarative mode, a persona may have no channels only when its DMs are on
 `channels` and no `delivery` to collect. It serves every public or private
 channel its app is invited to that is not externally shared, each at
 `mentions` unless its agent stores `all` for it with `set_channel_delivery`.
-Group DMs are never served. See `docs/configuration.md`'s `### What each mode serves`.
+Group DMs are never served. See `docs/channel-modes.md`'s `## What each mode serves`.
 
 In either mode, tell the operator to invite the persona's app to each channel
 the persona should serve, in that channel:
@@ -363,7 +363,7 @@ top-level `permission_prompts` is not read:
 - `"dm"`, the default when `invited` is left out, which needs
   `dm.enabled: true` and a `dm.contact` (5.6).
 
-Everyone in a destination channel sees the prompts and notices. See `docs/configuration.md`'s `### Permission prompts in fungible mode`.
+Everyone in a destination channel sees the prompts and notices. See `docs/channel-modes.md`'s `## Permission prompts in fungible mode`.
 
 #### 5.8 Optional next-launch settings
 
@@ -415,7 +415,7 @@ top-level `permission_prompts`, for example:
 Add `"dm": { "enabled": true, "contact": "<user ID>" }` and the 5.8 settings
 only when chosen. In declarative mode, leave `channels` out of a DM-only
 persona; in fungible mode, leave `invited` out when the destination is the
-default `"dm"`. Check the entry against `docs/configuration.md`'s `### Load-time rules`
+default `"dm"`. Check the entry against the debug skill's `### The load-time rules`
 for the mode in force after Step 4, together with the personas already in the
 file. In both modes:
 
@@ -465,7 +465,7 @@ it (Step 10). Then ask whether to add another persona.
 
 Only if the operator asks, set top-level settings such as `ack_reaction`,
 `reply_chunk_limit`, `reply_chunk_mode`, `port` or `session_restart_delay`.
-`docs/configuration.md`'s `### Server-wide settings` table lists each field, its type and
+`docs/server-settings.md`'s `## Server-wide settings` table lists each field, its type and
 default. Write only the fields the operator sets.
 
 The channel-mode switch, `allow_invited_channels`, is a server-wide setting
@@ -576,7 +576,7 @@ event, tool call, prompt and notice, with no restart, and every session is
 kept. Its preview line reads `server-wide setting allow_invited_channels
 changed: turns <mode> mode on, applied in place at once, from the next event,
 tool call, prompt and notice, for …`, naming the mode it turns on and every
-persona it affects. See `docs/configuration.md`'s `### Turning fungible mode on or off`.
+persona it affects. See `docs/channel-modes.md`'s `## Turning fungible mode on or off`.
 
 A change to another server-wide setting, such as `port`, is recorded when
 confirmed and takes effect at the next server start (`docs/reload.md` `## When next-launch and server-wide

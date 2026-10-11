@@ -117,7 +117,7 @@ If the file can't be read or parsed, or a `[tmux]` value is one agent-director r
 
 ### Sizing the agent-director call timeout
 
-`agent_director_call_timeout_ms` (default `60000`, an integer in `[1000, 3_600_000]`; see [Server-wide settings](configuration.md#server-wide-settings)) is how long CSCB waits on each agent-director call it makes for its personas:
+`agent_director_call_timeout_ms` (default `60000`, an integer in `[1000, 3_600_000]`; see [Server-wide settings](server-settings.md#server-wide-settings)) is how long CSCB waits on each agent-director call it makes for its personas:
 
 - **The server** uses the value from the configuration its start runs: the last-applied record, else `config.json`.
 - **`stop --stop-bots` and `clean_restart`** use the value from the last-applied record, else `config.json`. When `stop --stop-bots` can't read that configuration, it uses the default `60000`.

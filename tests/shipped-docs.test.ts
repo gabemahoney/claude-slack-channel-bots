@@ -515,6 +515,8 @@ function readRepoFile(relPath: string): string {
  * section reads it from the page that now holds it.
  */
 const CONFIGURATION_DOC = 'docs/configuration.md'
+const SERVER_SETTINGS_DOC = 'docs/server-settings.md'
+const CHANNEL_MODES_DOC = 'docs/channel-modes.md'
 const RELOAD_DOC = 'docs/reload.md'
 const CLI_DOC = 'docs/cli.md'
 const BOTS_DOC = 'docs/bots.md'
@@ -526,6 +528,8 @@ const RUNBOOK_DOC = PHASE1_RUNBOOK_DOC
 const USER_DOC_FILES = [
   'README.md',
   CONFIGURATION_DOC,
+  SERVER_SETTINGS_DOC,
+  CHANNEL_MODES_DOC,
   RELOAD_DOC,
   CLI_DOC,
   BOTS_DOC,
@@ -723,8 +727,8 @@ function codeSpans(cell: string): string[] {
 /** The persona configuration reference heading (in `CONFIGURATION_DOC`) and its complete-example heading, DOC-1's interface. */
 const PERSONAS_HEADING = '## Personas (config.json)'
 const EXAMPLE_HEADING = '### Example'
-/** The heading of the reference's second complete example, in fungible mode (b.deo SRI-1101). */
-const FUNGIBLE_EXAMPLE_HEADING = '### Example in fungible mode'
+/** The heading of the second complete example, in fungible mode (b.deo SRI-1101), a section of `CHANNEL_MODES_DOC`. */
+const FUNGIBLE_EXAMPLE_HEADING = '## Example in fungible mode'
 
 /**
  * The persona-entry key holding the fungible section (b.deo SRI-102): read
@@ -745,13 +749,16 @@ function personasSection(text: string): string {
 
 /**
  * A complete example's text: the one fenced block, tagged `json`, directly
- * under `heading` (`#### Example`, or `#### Example in fungible mode`) inside
- * `### Personas (config.json)`. Throws naming what is missing, and on any
- * other count or tag, so the load case never passes vacuously or on some
- * other JSON block.
+ * under `heading`: `### Example` inside `## Personas (config.json)` of
+ * `configuration` (`CONFIGURATION_DOC`), or `## Example in fungible mode` in
+ * `CHANNEL_MODES_DOC`. Throws naming what is missing, and on any other count
+ * or tag, so the load case never passes vacuously or on some other JSON block.
  */
-function completeExample(readme: string, heading: string = EXAMPLE_HEADING): string {
-  const example = requiredSection(personasSection(readme), heading, IN_PERSONAS)
+function completeExample(configuration: string, heading: string = EXAMPLE_HEADING): string {
+  const example =
+    heading === FUNGIBLE_EXAMPLE_HEADING
+      ? requiredSection(readRepoFile(CHANNEL_MODES_DOC), heading, CHANNEL_MODES_DOC)
+      : requiredSection(personasSection(configuration), heading, IN_PERSONAS)
   const { blocks } = splitFences(example)
   if (blocks.length !== 1 || blocks[0].info !== 'json') {
     const found = blocks.map((b) => `\`\`\`${b.info}`).join(', ') || 'none'
@@ -764,13 +771,14 @@ function completeExample(readme: string, heading: string = EXAMPLE_HEADING): str
 const MOVED_SERVER_SETTINGS = ['ack_reaction', 'reply_chunk_limit', 'reply_chunk_mode']
 
 /**
- * The reference's key tables: each `####` heading under `### Personas
- * (config.json)` with the keys its table must list, one code span per row in
- * the first column, built from the loader's exported key sets: the b.av2
- * SR-1.2 persona-entry keys (b.deo SRI-102; the `dm` sub-keys written
- * `dm.<key>`, the `invited` sub-keys `invited.<key>` alike), the SR-1.3
- * channel-entry keys (b.deo SRI-103), and the SR-1.1 / SR-1.6 top-level keys
- * but `personas` (b.deo SRI-101: `allow_invited_channels` among them).
+ * The reference's key tables: each heading with the keys its table must list,
+ * one code span per row in the first column, built from the loader's exported
+ * key sets: the b.av2 SR-1.2 persona-entry keys (b.deo SRI-102; the `dm`
+ * sub-keys written `dm.<key>`, the `invited` sub-keys `invited.<key>` alike)
+ * and the SR-1.3 channel-entry keys (b.deo SRI-103), each a `###` under
+ * `## Personas (config.json)` in `CONFIGURATION_DOC`; and the SR-1.1 / SR-1.6
+ * top-level keys but `personas` (b.deo SRI-101: `allow_invited_channels`
+ * among them), the `## Server-wide settings` table of `SERVER_SETTINGS_DOC`.
  */
 const KEY_TABLES: [heading: string, keys: readonly string[]][] = [
   ['Persona fields', PERSONA_ENTRY_KEYS.flatMap((key) => {
@@ -1046,13 +1054,20 @@ describe('README.md', () => {
   /**
    * b.av2 SR-12 / SR-13.5, b.deo SRI-1101: the README persona reference. Its
    * key tables list exactly the keys the loader accepts, and each of its two
-   * complete examples (declarative mode under `#### Example`, fungible mode
-   * under `#### Example in fungible mode`) loads through the server's loader
+   * complete examples (declarative mode under `### Example` in the persona
+   * reference, fungible mode under `## Example in fungible mode` in
+   * `CHANNEL_MODES_DOC`) loads through the server's loader
    * and is complete for its own mode.
    */
   describe('persona configuration reference (SR-12, SR-13.5)', () => {
-    test.each(KEY_TABLES)('the "### %s" table lists exactly the loader\'s keys, one code span per row', (heading, keys) => {
-      const table = firstTable(requiredSection(personasSection(configuration), `### ${heading}`, IN_PERSONAS))
+    /** The section holding the `heading` key table: the server-wide table in `SERVER_SETTINGS_DOC`, the others in the persona reference. */
+    const keyTableSection = (heading: string): string =>
+      heading === 'Server-wide settings'
+        ? requiredSection(readRepoFile(SERVER_SETTINGS_DOC), `## ${heading}`, SERVER_SETTINGS_DOC)
+        : requiredSection(personasSection(configuration), `### ${heading}`, IN_PERSONAS)
+
+    test.each(KEY_TABLES)('the "%s" table lists exactly the loader\'s keys, one code span per row', (heading, keys) => {
+      const table = firstTable(keyTableSection(heading))
       expect(table.header[0]).toBe('Field')
       const firstCells = table.rows.map(([cell]) => cell)
       expect(firstCells.filter((cell) => !/^`[^`]+`$/.test(cell))).toEqual([])
@@ -1131,7 +1146,7 @@ describe('README.md', () => {
       })
 
       /**
-       * The declarative example (`#### Example`): declarative mode, every key
+       * The declarative example (`### Example`): declarative mode, every key
        * declarative mode reads, and the declarative shapes below. The
        * fungible section is not required (b.deo SRI-1101).
        */
@@ -1177,7 +1192,7 @@ describe('README.md', () => {
       })
 
       /**
-       * The fungible example (`#### Example in fungible mode`, b.deo
+       * The fungible example (`## Example in fungible mode`, b.deo
        * SRI-1101): the switch on, a persona with DMs off and a channel
        * fungible destination, another whose destination is `"dm"` by default
        * (no `invited.permission_prompts` written), and every key of the
@@ -1430,6 +1445,23 @@ const OPERATOR_TEXTS: [name: string, read: () => string][] = [
  */
 function userDocsText(): string {
   return USER_DOC_FILES.map((doc) => operatorText(doc)).join('\n')
+}
+
+/** The name the user docs and the debugging skill go by when read as one text (`referenceText`). */
+const REFERENCE_NAME = 'the user docs and the debugging skill'
+
+/**
+ * The user docs (`userDocsText`) followed by the debugging skill, as one
+ * text. The user docs keep the common case and point to the skill for the
+ * detail: the startup-error list (`SKILL_STARTUP_ERRORS_HEADING`), each
+ * troubleshooting entry in full (`SYMPTOM_REFERENCE_HEADING`) and the
+ * load-time rules (`SKILL_LOAD_TIME_RULES_HEADING`) live in the skill, so a
+ * check on one of those passages reads it there, with its links as the skill
+ * writes them (`../../docs/…`). The user docs come first, so a heading both
+ * hold is found in the user docs.
+ */
+function referenceText(): string {
+  return `${userDocsText()}\n${operatorText(DEBUG_SKILL_FILE)}`
 }
 
 /** One operator text by its name; throws naming a name `OPERATOR_TEXTS` lacks. */
@@ -1834,7 +1866,7 @@ describe(`AC 46: forbidden-term audit (README, skills, manifest, MCP instruction
     [SR_1_7_EXCEPTION.file, '`[slack] persona-routing: ', "E14 decision 12: the server's real log prefix"],
     [SR_1_7_EXCEPTION.file, 'routinely', 'whole words: "routine" is not "routes"'],
     [RUNBOOK_DOC, 'remove any token environment variables you exported for the previous version', "E14 decision 12's upgrade wording: variables are banned by name and export form"],
-    [CONFIGURATION_DOC, 'slack-channel-router', 'the MCP server name; no route term matches it'],
+    [SERVER_SETTINGS_DOC, 'slack-channel-router', 'the MCP server name; no route term matches it'],
     [CREDENTIALS_SCRIPT, 'header = "Authorization: Bearer %s"', "the credentials script's curl config line, read from curl's stdin, not a command-line argument"],
     [WIZARD_FILE, /^allowed-tools:.*$/m, 'skill frontmatter: a tool list, not an allowlist'],
   ]
@@ -2228,6 +2260,19 @@ const REFUSAL_LABELS: string[] = [AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_TOO_O
 
 const STARTUP_ERRORS_HEADING = '## Startup errors'
 
+/** The debugging skill's list of every `startup-errors.log` class, which docs/troubleshooting.md's short "Startup errors" section points to. */
+const SKILL_STARTUP_ERRORS_HEADING = '## Startup errors (`startup-errors.log`)'
+
+/** The debugging skill's section holding each docs/troubleshooting.md entry in full, one `### Symptom: <title>` each. */
+const SYMPTOM_REFERENCE_HEADING = '## Symptom reference'
+const SYMPTOM_PREFIX = '### Symptom: '
+
+/** The debugging skill's full load-time rules, under "## Configuration rejections"; docs/configuration.md keeps a summary. */
+const SKILL_LOAD_TIME_RULES_HEADING = '### The load-time rules'
+
+/** A link from the debugging skill to the runbook doc, as the skill writes it (`../../docs/migration.md`). */
+const SKILL_RUNBOOK_LINK = relative(dirname('skills/debug-slack-channel-bots/SKILL.md'), PHASE1_RUNBOOK_DOC)
+
 /** The debugging skill's section holding the refusal entries, which its triage points to. */
 const REFUSAL_SECTION_TITLE = 'The server refuses the agent-director binary at start'
 
@@ -2295,12 +2340,11 @@ const REINSTALL_FORM: string = (() => {
 
 describe('the agent-director refusal classes name the switch-over runbook (b.jg5 SRJ-208)', () => {
   const debugSkill = operatorText(DEBUG_SKILL_FILE)
-  const troubleshooting = operatorText(TROUBLESHOOTING_DOC)
   const runbooks = operatorText(RUNBOOK_DOC)
   const runbookAnchor = headingSlug(PHASE1_RUNBOOK_SECTION_TITLE)
   const debugEntry = (label: string) => flat(requiredSection(debugSkill, classHeading(label), DEBUG_SKILL_FILE))
   const readmeItem = (label: string) =>
-    labelItem(requiredSection(troubleshooting, STARTUP_ERRORS_HEADING, TROUBLESHOOTING_DOC), label, `${TROUBLESHOOTING_DOC} "${STARTUP_ERRORS_HEADING}"`)
+    labelItem(requiredSection(debugSkill, SKILL_STARTUP_ERRORS_HEADING, DEBUG_SKILL_FILE), label, `${DEBUG_SKILL_FILE} "${SKILL_STARTUP_ERRORS_HEADING}"`)
 
   describe(DEBUG_SKILL_FILE, () => {
     test.each(REFUSAL_LABELS)('has a `###` entry headed by `%s`', (label) => {
@@ -2353,7 +2397,7 @@ describe('the agent-director refusal classes name the switch-over runbook (b.jg5
     })
   })
 
-  describe(`${TROUBLESHOOTING_DOC} "${STARTUP_ERRORS_HEADING}"`, () => {
+  describe(`${DEBUG_SKILL_FILE} "${SKILL_STARTUP_ERRORS_HEADING}"`, () => {
     test.each(REFUSAL_LABELS)('the `%s` line names the runbook section by its title', (label) => {
       expect(readmeItem(label)).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
     })
@@ -4360,6 +4404,8 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
       expect(OPERATOR_TEXTS.map(([name]) => name)).toEqual([
         'README.md',
         'docs/configuration.md',
+        'docs/server-settings.md',
+        'docs/channel-modes.md',
         'docs/reload.md',
         'docs/cli.md',
         'docs/bots.md',
@@ -4974,8 +5020,8 @@ const AD_VERSION_CHECK_SCRIPT = 'scripts/ad-version-check.ts'
 
 /** The README's list item for `label` under `heading`, a nested item (`  - \`label\``) read as a top-level one. */
 function readmeLabelItem(heading: string, label: string, readme: string): string {
-  const section = requiredSection(readme, heading, USER_DOCS_NAME).replace(/^ {2}(?=- `)/gm, '')
-  return labelItem(section, label, `${USER_DOCS_NAME} "${heading}"`)
+  const section = requiredSection(readme, heading, REFERENCE_NAME).replace(/^ {2}(?=- `)/gm, '')
+  return labelItem(section, label, `${REFERENCE_NAME} "${heading}"`)
 }
 
 /**
@@ -4992,14 +5038,14 @@ const README_REMEDY_ITEMS: readonly [heading: string, label: string, required: r
   [INSTALL_CHECK_HEADING, AD_SYSTEM_INSTALL_TOO_OLD, [PHASE1_RUNBOOK_SECTION_TITLE]],
   [INSTALL_CHECK_HEADING, AD_SYSTEM_INSTALL_UNREACHABLE, [PHASE1_RUNBOOK_SECTION_TITLE]],
   [INSTALL_CHECK_HEADING, AD_VERSION_FLOOR_UNREADABLE, [PHASE1_RUNBOOK_SECTION_TITLE]],
-  [STARTUP_ERRORS_HEADING, AD_SYSTEM_INSTALL_NOT_FOUND, [PHASE1_RUNBOOK_SECTION_TITLE]],
-  [STARTUP_ERRORS_HEADING, AD_SYSTEM_INSTALL_UNREACHABLE, [PHASE1_RUNBOOK_SECTION_TITLE]],
-  [STARTUP_ERRORS_HEADING, AD_VERSION_FLOOR_UNREADABLE, [PHASE1_RUNBOOK_SECTION_TITLE]],
-  [STARTUP_ERRORS_HEADING, AD_SHIM_CATALOG_INCOMPLETE, [vocab('unknownErrorName'), 'be misclassified']],
+  [SKILL_STARTUP_ERRORS_HEADING, AD_SYSTEM_INSTALL_NOT_FOUND, [PHASE1_RUNBOOK_SECTION_TITLE]],
+  [SKILL_STARTUP_ERRORS_HEADING, AD_SYSTEM_INSTALL_UNREACHABLE, [PHASE1_RUNBOOK_SECTION_TITLE]],
+  [SKILL_STARTUP_ERRORS_HEADING, AD_VERSION_FLOOR_UNREADABLE, [PHASE1_RUNBOOK_SECTION_TITLE]],
+  [SKILL_STARTUP_ERRORS_HEADING, AD_SHIM_CATALOG_INCOMPLETE, [vocab('unknownErrorName'), 'be misclassified']],
 ]
 
 /** A remedy item's problems: what it lacks and each upgrade form it carries (the re-install row included). */
-function remedyItemProblems(heading: string, label: string, required: readonly string[], readme: string = userDocsText()): string[] {
+function remedyItemProblems(heading: string, label: string, required: readonly string[], readme: string = referenceText()): string[] {
   const item = readmeLabelItem(heading, label, readme)
   return [...lacking(item, required), ...upgradeFormsIn(item)]
 }
@@ -5012,14 +5058,19 @@ function remedyItemProblems(heading: string, label: string, required: readonly s
  * that step's heading in the section; it names no publishing-host block, by
  * its quoted heading or a link to it.
  */
-function startupNotFoundItemProblems(readme: string = userDocsText()): string[] {
-  const item = readmeLabelItem(STARTUP_ERRORS_HEADING, AD_SYSTEM_INSTALL_NOT_FOUND, readme)
+function startupNotFoundItemProblems(readme: string = referenceText()): string[] {
+  const item = readmeLabelItem(SKILL_STARTUP_ERRORS_HEADING, AD_SYSTEM_INSTALL_NOT_FOUND, readme)
   const carrier = readRunbookCarrier(USER_DOCS_NAME, readme, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
   const step1 = headingAt(readme, carrier.stepAnchors[0])
   const runbook = sectionRange(readme, SWITCH_OVER_HEADING)
-  const blockNames = [`"${PUBLISHING_HOST_BLOCK_HEADING}"`, `(#${headingSlug(PUBLISHING_HOST_BLOCK_HEADING)})`, `(${RUNBOOK_FROM_DOCS}#${headingSlug(PUBLISHING_HOST_BLOCK_HEADING)})`]
+  const blockNames = [
+    `"${PUBLISHING_HOST_BLOCK_HEADING}"`,
+    `(#${headingSlug(PUBLISHING_HOST_BLOCK_HEADING)})`,
+    `(${RUNBOOK_FROM_DOCS}#${headingSlug(PUBLISHING_HOST_BLOCK_HEADING)})`,
+    `(${SKILL_RUNBOOK_LINK}#${headingSlug(PUBLISHING_HOST_BLOCK_HEADING)})`,
+  ]
   return [
-    ...lacking(item, [`(${RUNBOOK_FROM_DOCS}#${carrier.stepAnchors[0]})`]),
+    ...lacking(item, [`(${SKILL_RUNBOOK_LINK}#${carrier.stepAnchors[0]})`]),
     ...(step1 !== undefined && stepNumberOf(step1.title) === 1 && runbook !== undefined && step1.line > runbook.start && step1.line < runbook.end
       ? []
       : [`#${carrier.stepAnchors[0]} resolves to no step 1 heading inside "${SWITCH_OVER_HEADING}"`]),
@@ -5038,7 +5089,7 @@ const NEVER_REMOVE_THE_FILE = 'never remove or recreate the file'
  * exactly one does.
  */
 function sameUserItem(readme: string): string {
-  const lines = requiredSection(readme, STARTUP_ERRORS_HEADING, USER_DOCS_NAME).split('\n')
+  const lines = requiredSection(readme, SKILL_STARTUP_ERRORS_HEADING, REFERENCE_NAME).split('\n')
   const items = lines
     .flatMap((line, i) => (line.startsWith('- `') ? [i] : []))
     .map((start) => {
@@ -5046,12 +5097,12 @@ function sameUserItem(readme: string): string {
       return flat(lines.slice(start, end < 0 ? undefined : end).join('\n'))
     })
     .filter((item) => item.includes(`${code(DEFAULT_STORE_PATH)} is owned by a different UID`))
-  if (items.length !== 1) throw new Error(`${USER_DOCS_NAME} "${STARTUP_ERRORS_HEADING}": ${items.length} class items say ${DEFAULT_STORE_PATH} is owned by a different UID, expected 1`)
+  if (items.length !== 1) throw new Error(`${REFERENCE_NAME} "${SKILL_STARTUP_ERRORS_HEADING}": ${items.length} class items say ${DEFAULT_STORE_PATH} is owned by a different UID, expected 1`)
   return items[0]
 }
 
 /** The same-user item's problems (the E2-gate ruling): run as the file's owner, the runbook section, no re-install and no removal but the ruling's own words. */
-function sameUserProblems(readme: string = userDocsText()): string[] {
+function sameUserProblems(readme: string = referenceText()): string[] {
   const item = sameUserItem(readme)
   const rest = item.split(NEVER_REMOVE_THE_FILE).join('')
   return [
@@ -5089,9 +5140,9 @@ const AD_VERSION_CLAIM = /\bagent-director`?[^.|]{0,40}?\d+\.\d+\.\d+/g
  * "≥ 0.8.0" and install check's `0.7.0` floor are gone), and the
  * `resume_enabled` row names no agent-director version.
  */
-function noMemoryProblems(readme: string = userDocsText()): string[] {
-  const units = textUnits(requiredSection(readme, TROUBLESHOOTING_HEADING, USER_DOCS_NAME)).filter((unit) => ci('**Bots come back with no memory').test(unit))
-  if (units.length !== 1) return [`${units.length} Troubleshooting units open with "Bots come back with no memory", expected 1`]
+function noMemoryProblems(readme: string = referenceText()): string[] {
+  const units = troubleshootingEntries(readme).filter((entry) => entry.title.startsWith('**Bots come back with no memory')).map((entry) => `${entry.title} ${entry.text}`)
+  if (units.length !== 1) return [`${units.length} troubleshooting entries open with "Bots come back with no memory", expected 1`]
   const rows = readme.split('\n').filter((line) => line.startsWith('| `resume_enabled` |'))
   return [
     ...lacking(units[0], [code(AD_BELOW_PHASE1_FLOOR)]),
@@ -5148,11 +5199,11 @@ describe("E36 T2: the README's install and startup texts point to the runbook an
     expect(block !== undefined && runbook !== undefined && block.start > runbook.start && block.end <= runbook.end).toBe(true)
   })
 
-  test(`"${STARTUP_ERRORS_HEADING.slice('## '.length)}": the startup gate's not-found item links switch-over step 1, which resolves, and names no "${PUBLISHING_HOST_BLOCK_HEADING}" block (it runs on a bot host)`, () => {
+  test(`"${SKILL_STARTUP_ERRORS_HEADING.slice('## '.length)}": the startup gate's not-found item links switch-over step 1, which resolves, and names no "${PUBLISHING_HOST_BLOCK_HEADING}" block (it runs on a bot host)`, () => {
     expect(startupNotFoundItemProblems()).toEqual([])
   })
 
-  test(`the ${STARTUP_ERRORS_HEADING.slice(3)} item for a state DB owned by another user: run as its owner, never remove or recreate it, the runbook section, no re-install`, () => {
+  test(`the ${SKILL_STARTUP_ERRORS_HEADING.slice(3)} item for a state DB owned by another user: run as its owner, never remove or recreate it, the runbook section, no re-install`, () => {
     expect(sameUserProblems()).toEqual([])
   })
 
@@ -5170,13 +5221,13 @@ describe("E36 T2: the README's install and startup texts point to the runbook an
   })
 
   describe('self-checks (each edits an in-memory README back to the wording this Task replaced)', () => {
-    const readme = () => userDocsText()
+    const readme = () => referenceText()
 
     test.each([
       [INSTALL_CHECK_HEADING, AD_SYSTEM_INSTALL_NOT_FOUND, 'Install AD and retry.', /The message points to the block [^\n]*?no agent-director\./],
       [INSTALL_CHECK_HEADING, AD_VERSION_FLOOR_UNREADABLE, 'The remediation is to check or reinstall the `agent-director` npm package.', /The message says to check the `agent-director` npm package [^\n]*?Phase 1"\./],
-      [STARTUP_ERRORS_HEADING, AD_SYSTEM_INSTALL_UNREACHABLE, 'Diagnose with the install-cscb skill or re-install agent-director.', /says to diagnose with the install-cscb skill, names the docs\/migration\.md section "[^"]*"/],
-      [STARTUP_ERRORS_HEADING, AD_SHIM_CATALOG_INCOMPLETE, 'Envelopes with these names would surface as the base AgentDirectorError.', /errors with these names would arrive as `ErrUnknownErrorName` and be misclassified/],
+      [SKILL_STARTUP_ERRORS_HEADING, AD_SYSTEM_INSTALL_UNREACHABLE, 'Diagnose with the install-cscb skill or re-install agent-director.', /says to diagnose with the install-cscb skill, names the docs\/migration\.md section "[^"]*"/],
+      [SKILL_STARTUP_ERRORS_HEADING, AD_SHIM_CATALOG_INCOMPLETE, 'Envelopes with these names would surface as the base AgentDirectorError.', /errors with these names would arrive as `ErrUnknownErrorName` and be misclassified/],
     ] as const)('README.md "%s": the `%s` item fails with "%s"', (heading, label, old, current) => {
       const text = readme()
       const edited = text.replace(current, old)
@@ -5188,16 +5239,16 @@ describe("E36 T2: the README's install and startup texts point to the runbook an
     test(`the startup gate's not-found item fails with the publishing-host pointer back, and with its step 1 link dropped or broken`, () => {
       const text = readme()
       const current = /(^- `ad-system-install-not-found` — `Client\.create\(\)`[^\n]*?)The startup gate runs on a bot host,[^\n]*?differs from the workers'\./m
-      const blockLink = `["${PUBLISHING_HOST_BLOCK_HEADING}"](${RUNBOOK_FROM_DOCS}#${headingSlug(PUBLISHING_HOST_BLOCK_HEADING)})`
+      const blockLink = `["${PUBLISHING_HOST_BLOCK_HEADING}"](${SKILL_RUNBOOK_LINK}#${headingSlug(PUBLISHING_HOST_BLOCK_HEADING)})`
       const old = text.replace(current, `$1The message points to the block ${blockLink} in the ${RUNBOOK_DOC} section "${PHASE1_RUNBOOK_SECTION_TITLE}", which covers a host with no agent-director.`)
       expect(old).not.toBe(text)
-      expect(startupNotFoundItemProblems(old)).toEqual(expect.arrayContaining([`names the publishing-host block: "${PUBLISHING_HOST_BLOCK_HEADING}"`, `lacks (${RUNBOOK_FROM_DOCS}#${readRunbookCarrier(USER_DOCS_NAME, text, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT).stepAnchors[0]})`]))
+      expect(startupNotFoundItemProblems(old)).toEqual(expect.arrayContaining([`names the publishing-host block: "${PUBLISHING_HOST_BLOCK_HEADING}"`, `lacks (${SKILL_RUNBOOK_LINK}#${readRunbookCarrier(USER_DOCS_NAME, text, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT).stepAnchors[0]})`]))
       const step1 = readRunbookCarrier(USER_DOCS_NAME, text, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT).stepAnchors[0]
       const lines = text.split('\n')
       const at = lines.findIndex((line) => line.startsWith(`- \`${AD_SYSTEM_INSTALL_NOT_FOUND}\` — \`Client.create()\``))
       expect(at).toBeGreaterThanOrEqual(0)
-      const broken = [...lines.slice(0, at), lines[at].replaceAll(`(${RUNBOOK_FROM_DOCS}#${step1})`, `(${RUNBOOK_FROM_DOCS}#no-such-step)`), ...lines.slice(at + 1)].join('\n')
-      expect(startupNotFoundItemProblems(broken)).toEqual([`lacks (${RUNBOOK_FROM_DOCS}#${step1})`])
+      const broken = [...lines.slice(0, at), lines[at].replaceAll(`(${SKILL_RUNBOOK_LINK}#${step1})`, `(${SKILL_RUNBOOK_LINK}#no-such-step)`), ...lines.slice(at + 1)].join('\n')
+      expect(startupNotFoundItemProblems(broken)).toEqual([`lacks (${SKILL_RUNBOOK_LINK}#${step1})`])
       // A heading of the same title before the runbook takes the anchor, so the link no longer reaches step 1.
       const shadowed = `## ${headingAt(text, step1)?.title}\n\n${text}`
       expect(startupNotFoundItemProblems(shadowed)).toEqual([`#${step1} resolves to no step 1 heading inside "${SWITCH_OVER_HEADING}"`])
@@ -5212,7 +5263,7 @@ describe("E36 T2: the README's install and startup texts point to the runbook an
 
     test("the Troubleshooting paragraph fails with b.ob2's version advice back", () => {
       const text = readme()
-      const edited = text.replace(/(\*\*Bots come back with no memory[^\n]*\n)[^\n]*/, `$1If it comes back amnesiac, confirm the system-installed \`agent-director\` is **≥ ${HISTORICAL_VERSIONS.resumeRecoveryMinimum}** (\`agent-director version\`). Its client floor is \`${CLIENT_MIN_VERSION}\`, so install-check passes on a \`${HISTORICAL_VERSIONS.oldInstallCheckSeries}\` binary.`)
+      const edited = text.replace(/(### Symptom: Bots come back with no memory[^\n]*\n\n)[^\n]*/, `$1If it comes back amnesiac, confirm the system-installed \`agent-director\` is **≥ ${HISTORICAL_VERSIONS.resumeRecoveryMinimum}** (\`agent-director version\`). Its client floor is \`${CLIENT_MIN_VERSION}\`, so install-check passes on a \`${HISTORICAL_VERSIONS.oldInstallCheckSeries}\` binary.`)
       expect(edited).not.toBe(text)
       expect(noMemoryProblems(edited)).not.toEqual([])
     })
@@ -5260,11 +5311,12 @@ const STALE_AUTO_RESTART_CLAIM: readonly [label: string, pattern: RegExp][] = [
   ['will not restart or come back on its own', /\b(?:will not|won't|does not|doesn't|never|cannot|can't)\s+(?:be\s+)?(?:restart|come back|recover)\w*/gi],
 ]
 
-/** The README's `auto-restart disabled` row in its lost-message recovery table; throws unless there is exactly one. */
+/** The troubleshooting entry's `auto-restart disabled` row in its lost-message recovery table ("Session not restarting after crash", in full in the debugging skill's symptom reference); throws unless there is exactly one. */
 function readmeAutoRestartRow(): string {
   const lead = `| \`${lostMessageStateLabel('auto-restart-disabled')}\` |`
-  const rows = userDocsText().split('\n').filter((line) => line.startsWith(lead))
-  if (rows.length !== 1) throw new Error(`${USER_DOCS_NAME} has ${rows.length} rows starting ${lead}`)
+  const entry = requiredSection(operatorText(DEBUG_SKILL_FILE), `${SYMPTOM_PREFIX}Session not restarting after crash`, DEBUG_SKILL_FILE)
+  const rows = entry.split('\n').filter((line) => line.startsWith(lead))
+  if (rows.length !== 1) throw new Error(`${DEBUG_SKILL_FILE} "${SYMPTOM_PREFIX}Session not restarting after crash" has ${rows.length} rows starting ${lead}`)
   return rows[0]
 }
 
@@ -5279,7 +5331,7 @@ function debugSkillAutoRestartEntry(): string {
 
 describe("E8: the README's and debugging skill's `auto-restart disabled` text keeps not saying the persona will not restart on its own (b.jg5 SRJ-1011)", () => {
   test.each([
-    ['README.md: the lost-message recovery row', readmeAutoRestartRow],
+    [`${DEBUG_SKILL_FILE}: the troubleshooting entry's lost-message recovery row`, readmeAutoRestartRow],
     [`${DEBUG_SKILL_FILE}: the lost-message entry's state`, debugSkillAutoRestartEntry],
   ] as const)('%s', (_label, passage) => {
     const text = passage()
@@ -6073,11 +6125,16 @@ const TROUBLESHOOTING_NOTICES: readonly [source: string, title: () => string][] 
   ['unclassifiedErrorAlertText', () => noticeTitle(unclassifiedErrorAlertText({ reportedName: undefined, message: '' }))],
 ]
 
-/** The README Troubleshooting section's entries: each bold title line (`**…**` alone on its line) with its text up to the next, flattened. Pure. */
-function troubleshootingEntries(readme: string): { title: string; text: string }[] {
+/**
+ * The troubleshooting entries in full: each `### Symptom: <title>` under the
+ * debugging skill's `SYMPTOM_REFERENCE_HEADING` in `text` (`referenceText`),
+ * its title written as docs/troubleshooting.md's index writes it
+ * (`**<title>**`) and its text up to the next, flattened. Pure.
+ */
+function troubleshootingEntries(text: string): { title: string; text: string }[] {
   const entries: { title: string; lines: string[] }[] = []
-  for (const line of requiredSection(readme, TROUBLESHOOTING_HEADING, USER_DOCS_NAME).split('\n')) {
-    if (/^\*\*.+\*\*\s*$/.test(line)) entries.push({ title: line.trim(), lines: [] })
+  for (const line of requiredSection(text, SYMPTOM_REFERENCE_HEADING, REFERENCE_NAME).split('\n')) {
+    if (line.startsWith(SYMPTOM_PREFIX)) entries.push({ title: `**${line.slice(SYMPTOM_PREFIX.length).trim()}**`, lines: [] })
     else entries.at(-1)?.lines.push(line)
   }
   return entries.map(({ title, lines }) => ({ title, text: flat(lines.join('\n')).trim() }))
@@ -6086,7 +6143,7 @@ function troubleshootingEntries(readme: string): { title: string; text: string }
 /** The one Troubleshooting entry whose title holds `titlePart`, its title and text flattened; throws unless exactly one does. */
 function troubleshootingEntry(readme: string, titlePart: string): string {
   const entries = troubleshootingEntries(readme).filter((entry) => entry.title.includes(titlePart))
-  if (entries.length !== 1) throw new Error(`${USER_DOCS_NAME} "${TROUBLESHOOTING_HEADING}": ${entries.length} entries' titles hold "${titlePart}", expected 1`)
+  if (entries.length !== 1) throw new Error(`${REFERENCE_NAME} "${SYMPTOM_REFERENCE_HEADING}": ${entries.length} entries' titles hold "${titlePart}", expected 1`)
   return `${entries[0].title} ${entries[0].text}`
 }
 
@@ -6318,7 +6375,7 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
   [`the *${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}* entry: the re-check ${LATCH_RECHECK_WORDS} (SRJ-505), how a hold ends, clear-latch, and "Operator actions" for a human only`, entryOf(troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')), [
     ci(`**The server's own check.** ${LATCH_RECHECK_WORDS}`),
     ci('**How a hold ends.**'),
-    docLink(TROUBLESHOOTING_DOC, CLI_DOC, headingSlug(CLEAR_LATCH_CLI_HEADING.replace(/^#+ /, ''))),
+    docLink(DEBUG_SKILL_FILE, CLI_DOC, headingSlug(CLEAR_LATCH_CLI_HEADING.replace(/^#+ /, ''))),
     vocab('operatorActions'),
     ci('for a human only'),
   ]],
@@ -6364,7 +6421,7 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
   [`Server-wide settings: agent_director_call_timeout_ms, default ${DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, range [${MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, ${MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS}]`, (readme) => readme.split('\n').find((line) => line.startsWith(`| ${code('agent_director_call_timeout_ms')} |`)) ?? '', [
     `| number | ${code(String(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS))} |`,
     `[${MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, ${underscored(MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS)}]`,
-    docLink(CONFIGURATION_DOC, AGENT_DIRECTOR_DOC, headingSlug(CALL_TIMEOUT_SIZING_HEADING.replace(/^#+ /, ''))),
+    docLink(SERVER_SETTINGS_DOC, AGENT_DIRECTOR_DOC, headingSlug(CALL_TIMEOUT_SIZING_HEADING.replace(/^#+ /, ''))),
   ]],
 
   // The fresh system prompt switch, under "Configuration" (b.b1j SR-6.1, SR-5.6).
@@ -6421,7 +6478,7 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
   // The *Still not answering* read-only check (E19; SRJ-1101).
   [`the *${troubleshootingNoticeTitle('tmuxUnresponsiveAlertText')()}* check: the one-line read-pane through agent-director, its caveats in the debugging skill`, entryOf(troubleshootingNoticeTitle('tmuxUnresponsiveOnsetText')), [
     code(`agent-director read-pane --claude-instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key> --n-lines 1`),
-    docLink(TROUBLESHOOTING_DOC, DEBUG_SKILL_FILE, headingSlug('Listing instances')),
+    docLink(DEBUG_SKILL_FILE, DEBUG_SKILL_FILE, headingSlug('Listing instances')),
     ci("take ownership from agent-director's row, never from the pane"),
   ]],
 ]
@@ -6473,7 +6530,7 @@ const SRJ_1013_CLASSES: readonly string[] = [
 
 /** Whether README "Startup errors" has a list item opening with `label` as a code span, alone or among other labels (`- \`a\` and \`b\` — …`). */
 function readmeListsClass(readme: string, label: string): boolean {
-  const section = requiredSection(readme, STARTUP_ERRORS_HEADING, USER_DOCS_NAME)
+  const section = requiredSection(readme, SKILL_STARTUP_ERRORS_HEADING, REFERENCE_NAME)
   return new RegExp(`^\\s*- (?:\`[^\`]+\`(?:,| and| or)\\s+)*\`${escapeRegExp(label)}\``, 'm').test(section)
 }
 
@@ -6510,10 +6567,10 @@ const START_AGAIN = ci('start the server again')
 
 /** A README refusal item's problems: it names the refusal block by a link that resolves and step 10 by its link, and says no "start the server again". */
 function readmeRefusalItemProblems(label: string, readme: string): string[] {
-  const item = readmeLabelItem(STARTUP_ERRORS_HEADING, label, readme)
+  const item = readmeLabelItem(SKILL_STARTUP_ERRORS_HEADING, label, readme)
   const carrier = readRunbookCarrier(USER_DOCS_NAME, readme, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
   return [
-    ...lacking(item, [`["${REFUSAL_BLOCK_HEADING}"]${docLink(TROUBLESHOOTING_DOC, RUNBOOK_DOC, headingSlug(REFUSAL_BLOCK_HEADING))}`, docLink(TROUBLESHOOTING_DOC, RUNBOOK_DOC, carrier.stepAnchors[9])]),
+    ...lacking(item, [`["${REFUSAL_BLOCK_HEADING}"]${docLink(DEBUG_SKILL_FILE, RUNBOOK_DOC, headingSlug(REFUSAL_BLOCK_HEADING))}`, docLink(DEBUG_SKILL_FILE, RUNBOOK_DOC, carrier.stepAnchors[9])]),
     ...(START_AGAIN.test(item) ? [`says "start the server again": ${item}`] : []),
     ...(headingAt(readme, headingSlug(REFUSAL_BLOCK_HEADING))?.title === REFUSAL_BLOCK_HEADING ? [] : [`no heading "${REFUSAL_BLOCK_HEADING}" for the link`]),
   ]
@@ -6521,8 +6578,8 @@ function readmeRefusalItemProblems(label: string, readme: string): string[] {
 
 /** README "Startup errors"' paragraph on a stop by the runtime re-check (SRJ-205): its one unit opening "**Found while the server was running.**". */
 function readmeRuntimeParagraph(readme: string): string {
-  const units = textUnits(requiredSection(readme, STARTUP_ERRORS_HEADING, USER_DOCS_NAME)).filter((unit) => unit.startsWith(`**${RUNTIME_STOP_HEADING.slice('### '.length)}.**`))
-  if (units.length !== 1) throw new Error(`${USER_DOCS_NAME} "${STARTUP_ERRORS_HEADING}": ${units.length} units open with the runtime-stop lead, expected 1`)
+  const units = textUnits(requiredSection(readme, SKILL_STARTUP_ERRORS_HEADING, REFERENCE_NAME)).filter((unit) => unit.startsWith(`**${RUNTIME_STOP_HEADING.slice('### '.length)}.**`))
+  if (units.length !== 1) throw new Error(`${REFERENCE_NAME} "${SKILL_STARTUP_ERRORS_HEADING}": ${units.length} units open with the runtime-stop lead, expected 1`)
   return units[0]
 }
 
@@ -6530,7 +6587,8 @@ function readmeRuntimeParagraph(readme: string): string {
 function readmeRuntimeParagraphProblems(readme: string, skill: string = operatorText(DEBUG_SKILL_FILE)): string[] {
   const paragraph = readmeRuntimeParagraph(readme)
   const anchor = headingSlug(RUNTIME_STOP_HEADING.slice('### '.length))
-  const linked = markdownLinks(paragraph).filter((link) => link.path === relative(dirname(TROUBLESHOOTING_DOC), DEBUG_SKILL_FILE) && link.anchor === anchor)
+  // The paragraph sits in the debugging skill, so its link to the skill's own section is a same-file link.
+  const linked = markdownLinks(paragraph).filter((link) => link.path === '' && link.anchor === anchor)
   const index = headingAnchors(skill).indexOf(anchor)
   const parent = sectionRange(skill, `## ${REFUSAL_SECTION_TITLE}`)
   const line = index < 0 ? -1 : headings(skill)[index].line
@@ -7016,8 +7074,43 @@ function migrationCronProblems(readme: string): string[] {
   ]
 }
 
+/**
+ * docs/troubleshooting.md is the index of the debugging skill's symptom
+ * reference: each bold title on the page names one `### Symptom: <title>`
+ * entry and links it, and each entry has its title on the page, so neither
+ * side can gain or lose an entry alone. Returns each problem. Pure.
+ */
+function troubleshootingIndexProblems(index: string, skill: string): string[] {
+  const titles = requiredSection(index, TROUBLESHOOTING_HEADING, TROUBLESHOOTING_DOC).split('\n').filter((line) => /^\*\*.+\*\*\s*$/.test(line)).map((line) => line.trim().slice(2, -2))
+  const entries = troubleshootingEntries(skill).map((entry) => entry.title.slice(2, -2))
+  const skillLink = relative(dirname(TROUBLESHOOTING_DOC), DEBUG_SKILL_FILE)
+  const links = markdownLinks(index).filter((link) => link.path === skillLink).map((link) => link.anchor)
+  return [
+    ...titles.filter((title) => !entries.includes(title)).map((title) => `the index names "${title}", which has no symptom entry`),
+    ...entries.filter((title) => !titles.includes(title)).map((title) => `the symptom entry "${title}" is not on the index`),
+    ...entries.filter((title) => !links.includes(headingSlug(`Symptom: ${title}`))).map((title) => `the index does not link the symptom entry "${title}"`),
+  ]
+}
+
+describe(`${TROUBLESHOOTING_DOC} indexes the debugging skill's "${SYMPTOM_REFERENCE_HEADING.slice(3)}"`, () => {
+  test('each bold title names one symptom entry and links it, and each symptom entry is on the page', () => {
+    expect(troubleshootingEntries(operatorText(DEBUG_SKILL_FILE)).length).toBeGreaterThan(30)
+    expect(troubleshootingIndexProblems(operatorText(TROUBLESHOOTING_DOC), operatorText(DEBUG_SKILL_FILE))).toEqual([])
+  })
+
+  test('self-check: an entry added to the skill alone, or a title dropped from the page, is reported', () => {
+    const index = operatorText(TROUBLESHOOTING_DOC)
+    const skill = operatorText(DEBUG_SKILL_FILE)
+    const added = skill.replace(SYMPTOM_REFERENCE_HEADING, `${SYMPTOM_REFERENCE_HEADING}\n\n${SYMPTOM_PREFIX}A new symptom\n\nText.\n`)
+    expect(troubleshootingIndexProblems(index, added)).toEqual(['the symptom entry "A new symptom" is not on the index', 'the index does not link the symptom entry "A new symptom"'])
+    const dropped = index.replace(/^\*\*config\.json not found\*\*\n/m, '')
+    expect(dropped).not.toBe(index)
+    expect(troubleshootingIndexProblems(dropped, skill)).toEqual(['the symptom entry "config.json not found" is not on the index'])
+  })
+})
+
 describe('E36 T4: the README describes the build (b.jg5 SRJ-1103; AC 78, AC 79)', () => {
-  const readme = () => userDocsText()
+  const readme = () => referenceText()
 
   test.each(README_SRJ_1103_ROWS)('%s', (element, passage, required) => {
     expect({ element, problems: docRowProblems(passage, required, readme()) }).toEqual({ element, problems: [] })
@@ -7028,7 +7121,7 @@ describe('E36 T4: the README describes the build (b.jg5 SRJ-1103; AC 78, AC 79)'
     expect(entries.map((entry) => entry.title)).toHaveLength(1)
   })
 
-  test.each(SRJ_1013_CLASSES.map((label) => [label] as const))(`"${STARTUP_ERRORS_HEADING}" lists the SRJ-1013 class %s`, (label) => {
+  test.each(SRJ_1013_CLASSES.map((label) => [label] as const))(`"${SKILL_STARTUP_ERRORS_HEADING}" lists the SRJ-1013 class %s`, (label) => {
     expect(readmeListsClass(readme(), label)).toBe(true)
   })
 
@@ -7044,11 +7137,11 @@ describe('E36 T4: the README describes the build (b.jg5 SRJ-1103; AC 78, AC 79)'
     expect(migrationCronProblems(readme())).toEqual([])
   })
 
-  test.each(REFUSAL_LABELS)(`"${STARTUP_ERRORS_HEADING}": the \`%s\` item points to the "${REFUSAL_BLOCK_HEADING}" block and step 10, never "start the server again" (E2 gate; SRJ-1108)`, (label) => {
+  test.each(REFUSAL_LABELS)(`"${SKILL_STARTUP_ERRORS_HEADING}": the \`%s\` item points to the "${REFUSAL_BLOCK_HEADING}" block and step 10, never "start the server again" (E2 gate; SRJ-1108)`, (label) => {
     expect(readmeRefusalItemProblems(label, readme())).toEqual([])
   })
 
-  test(`"${STARTUP_ERRORS_HEADING}": the runtime-stop paragraph links the debugging skill's "${RUNTIME_STOP_HEADING.slice('### '.length)}" (SRJ-1104; hatch A3)`, () => {
+  test(`"${SKILL_STARTUP_ERRORS_HEADING}": the runtime-stop paragraph links the debugging skill's "${RUNTIME_STOP_HEADING.slice('### '.length)}" (SRJ-1104; hatch A3)`, () => {
     expect(readmeRuntimeParagraphProblems(readme())).toEqual([])
   })
 
@@ -7130,7 +7223,7 @@ describe('E36 T4: the README describes the build (b.jg5 SRJ-1103; AC 78, AC 79)'
 
     test('a notice title renamed in "Troubleshooting" is no longer found', () => {
       const [, title] = TROUBLESHOOTING_NOTICES[0]
-      const edited = readme().replace(`**A persona posts a *${title()}*`, '**A persona posts a *Unreachable*')
+      const edited = readme().replace(`${SYMPTOM_PREFIX}A persona posts a *${title()}*`, `${SYMPTOM_PREFIX}A persona posts a *Unreachable*`)
       expect(edited).not.toBe(readme())
       expect(troubleshootingEntries(edited).filter((entry) => entry.title.includes(`*${title()}*`))).toHaveLength(0)
     })
@@ -7434,24 +7527,23 @@ describe(`E39 T5: ${TESTS_README_FILE} names every integration script and keeps 
 // complete examples and the in-place row; these pin the rest.
 // ---------------------------------------------------------------------------
 
-/** The README's channel-modes section and its four subsections, in order (b.deo SRI-1102). */
-const CHANNEL_MODES_HEADING = '## Channel modes'
-const WHAT_EACH_MODE_SERVES_HEADING = '### What each mode serves'
-const TURNING_FUNGIBLE_HEADING = '### Turning fungible mode on or off'
-const FUNGIBLE_DELIVERY_HEADING = '### Channel delivery in fungible mode'
-const FUNGIBLE_PROMPTS_HEADING = '### Permission prompts in fungible mode'
-const CHANNEL_MODES_SUBSECTIONS = [WHAT_EACH_MODE_SERVES_HEADING, TURNING_FUNGIBLE_HEADING, FUNGIBLE_DELIVERY_HEADING, FUNGIBLE_PROMPTS_HEADING] as const
-
-/** The security subsection, inside the receiving section after its bullet list (b.deo SRI-1104). */
-const WHO_CAN_REACH_HEADING = '### Who can reach a persona in fungible mode'
+/** The channel-modes page (`CHANNEL_MODES_DOC`, b.deo SRI-1102), the page after the server settings. */
+const CHANNEL_MODES_HEADING = '# Channel modes'
+const SERVER_SETTINGS_HEADING = '# Server settings'
+const WHAT_EACH_MODE_SERVES_HEADING = '## What each mode serves'
+/** The security subsection (b.deo SRI-1104), read before turning fungible mode on, so right after what each mode serves. */
+const WHO_CAN_REACH_HEADING = '## Who can reach a persona in fungible mode'
+const TURNING_FUNGIBLE_HEADING = '## Turning fungible mode on or off'
+const FUNGIBLE_DELIVERY_HEADING = '## Channel delivery in fungible mode'
+const FUNGIBLE_PROMPTS_HEADING = '## Permission prompts in fungible mode'
+/** The page's sections, in order: the four of b.deo SRI-1102, the security section and the fungible-mode example. */
+const CHANNEL_MODES_SUBSECTIONS = [WHAT_EACH_MODE_SERVES_HEADING, WHO_CAN_REACH_HEADING, TURNING_FUNGIBLE_HEADING, FUNGIBLE_DELIVERY_HEADING, FUNGIBLE_PROMPTS_HEADING, FUNGIBLE_EXAMPLE_HEADING] as const
 
 /** The downgrade section, under `## Migration` right after "Upgrading to personas" (b.deo SRI-1105). */
 const DOWNGRADE_HEADING = '### Downgrading to an earlier release'
 
 /** Other README headings the rows read. */
 const RELOAD_HEADING = '# Reload'
-/** The configuration reference's section before `## Channel modes`, its last. */
-const MCP_CONFIG_HEADING = '## MCP Server Config (slack-mcp.json)'
 const TOOLS_HEADING = '## Tools'
 const README_TITLE_HEADING = '# Claude Slack Channel Bots'
 
@@ -7638,7 +7730,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
   ]],
 
   // SRI-1101, the configuration sections T1's cases do not read (T20 S3).
-  [`Server-wide settings: the opening paragraph names ${MODE_SWITCH_SETTING} as the one setting a confirmation applies in place`, unitOf(USER_DOCS_NAME, '### Server-wide settings', 'These top-level fields apply'), [
+  [`Server-wide settings: the opening paragraph names ${MODE_SWITCH_SETTING} as the one setting a confirmation applies in place`, unitOf(USER_DOCS_NAME, '## Server-wide settings', 'These top-level fields apply'), [
     ci('A confirmed change to one takes effect at the next server start'),
     ci(`${SWITCH} is the one setting a confirmation applies in place, at once`),
   ]],
@@ -7665,31 +7757,31 @@ const README_DEO_ROWS: readonly DocRow[] = [
   ['Permission prompts: applies in declarative mode', readmeSection('### Permission prompts'), [
     ci(`This section applies in declarative mode, where ${code(PROMPTS_KEY)} is required`),
   ]],
-  ['Load-time rules: the switch is checked before any persona, and a non-boolean value is rejected naming it', readmeSection('### Load-time rules'), [
+  ['Load-time rules: the switch is checked before any persona, and a non-boolean value is rejected naming it', sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
     ci(`It checks the server-wide settings first, ${SWITCH} among them, before any persona, in either mode`),
     ci(`a non-boolean ${SWITCH} is rejected naming the setting`),
   ]],
-  [`Load-time rules: in declarative mode ${FUNGIBLE_SECTION_KEY} is neither checked nor read`, readmeSection('### Load-time rules'), [
+  [`Load-time rules: in declarative mode ${FUNGIBLE_SECTION_KEY} is neither checked nor read`, sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
     ci(`${code(FUNGIBLE_SECTION_KEY)} is neither checked nor read in declarative mode`),
   ]],
-  [`Load-time rules: in fungible mode ${CHANNELS_KEY} and the top-level ${PROMPTS_KEY} are neither checked nor read`, readmeSection('### Load-time rules'), [
+  [`Load-time rules: in fungible mode ${CHANNELS_KEY} and the top-level ${PROMPTS_KEY} are neither checked nor read`, sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
     ci(`${code(CHANNELS_KEY)} and the top-level ${code(PROMPTS_KEY)} are neither checked nor read in fungible mode`),
   ]],
-  [`Load-time rules: in fungible mode ${FUNGIBLE_SECTION_KEY} is an object holding only ${INVITED_DESTINATION_KEY}, "${DM_DESTINATION}" or a channel ID`, readmeSection('### Load-time rules'), [
+  [`Load-time rules: in fungible mode ${FUNGIBLE_SECTION_KEY} is an object holding only ${INVITED_DESTINATION_KEY}, "${DM_DESTINATION}" or a channel ID`, sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
     ci(`${code(FUNGIBLE_SECTION_KEY)} isn't an object, or holds a key other than ${code(INVITED_DESTINATION_KEY)}`),
     ci(`${code(INVITED_DESTINATION)} is neither ${DM_VALUE} nor a well-formed channel ID`),
   ]],
-  [`Load-time rules: in fungible mode a "${DM_DESTINATION}" destination, written or by default, needs ${DM_ENABLED} true and a ${DM_CONTACT}`, readmeSection('### Load-time rules'), [
+  [`Load-time rules: in fungible mode a "${DM_DESTINATION}" destination, written or by default, needs ${DM_ENABLED} true and a ${DM_CONTACT}`, sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
     ci(`The persona's destination is ${DM_VALUE}, written or by default, without ${code(`${DM_ENABLED}: true`)} or without a ${code(DM_CONTACT)}`),
   ]],
-  ['Load-time rules: in fungible mode a channel destination needs no listing and no DMs', readmeSection('### Load-time rules'), [
+  ['Load-time rules: in fungible mode a channel destination needs no listing and no DMs', sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
     ci('A channel destination needs no listing and no DMs'),
   ]],
-  ['Load-time rules: the cross-persona rules apply in both modes', readmeSection('### Load-time rules'), [
+  ['Load-time rules: the cross-persona rules apply in both modes', sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
     ci("In both modes: - A persona's name or key equals another persona's name or key. - A persona's key starts with another persona's key"),
     ci(`Two personas share a ${code('working_directory' satisfies (typeof PERSONA_ENTRY_KEYS)[number])} or a ${code('credentials_file' satisfies (typeof PERSONA_ENTRY_KEYS)[number])}, compared by real path`),
   ]],
-  ['Load-time rules: a change is judged by the mode it turns on, INVALID in each direction', readmeSection('### Load-time rules'), [
+  ['Load-time rules: a change is judged by the mode it turns on, INVALID in each direction', sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
     ci('A pending change is judged by the rules of the mode its own switch picks, not by the mode in effect'),
     ci(`A change that turns fungible mode on is ${INVALID} when a persona's ${code(FUNGIBLE_SECTION_KEY)} section breaks the fungible-mode rules`),
     ci(`a change that turns it off is ${INVALID} when a persona's ${code(CHANNELS_KEY)} or ${code(PROMPTS_KEY)} breaks the declarative-mode rules`),
@@ -7774,7 +7866,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci(tool === 'reply' ? "in declarative mode one of the persona's configured channels; in fungible mode any channel ID" : 'a configured channel in declarative mode; any channel ID in fungible mode'),
   ]]),
   [`Tools: the ${SET_CHANNEL_DELIVERY_TOOL} row, exactly one`, toolRowOf(SET_CHANNEL_DELIVERY_TOOL), [
-    docLink(BOTS_DOC, CONFIGURATION_DOC, anchorLink(FUNGIBLE_DELIVERY_HEADING).slice(2, -1)),
+    docLink(BOTS_DOC, CHANNEL_MODES_DOC, anchorLink(FUNGIBLE_DELIVERY_HEADING).slice(2, -1)),
     ci(`Two inputs: ${code('channel')}, a channel ID, and ${code(DELIVERY_KEY)}, ${code(MENTIONS)} or ${code(ALL)}`),
     ci('It works only in fungible mode: every call is refused in declarative mode'),
     ci(`and while ${code(CHANNEL_DELIVERY_FILE_NAME)} is unreadable`),
@@ -7797,7 +7889,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci("On a host whose Claude Code permission settings don't allow the server's tools as a group"),
     ci(`the first ${TOOL} call raises a permission prompt, in either mode`),
   ]],
-  [`Startup errors: the ${JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS} item gives the fungible-mode reason (FUNGIBLE_MODE_ZERO_REASON, SRI-704)`, (readme) => readmeLabelItem(STARTUP_ERRORS_HEADING, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, readme), [
+  [`Startup errors: the ${JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS} item gives the fungible-mode reason (FUNGIBLE_MODE_ZERO_REASON, SRI-704)`, (readme) => readmeLabelItem(SKILL_STARTUP_ERRORS_HEADING, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, readme), [
     fungibleZeroReasonQuoted,
     ci('so the archive counts no channel and a zero count proves nothing'),
   ]],
@@ -7974,35 +8066,38 @@ function placementProblems(readme: string, p: Placement): string[] {
 }
 
 /**
- * The headings b.deo SRI-1102, SRI-1104 and SRI-1105 add, as T17 placed
- * them: `## Channel modes` between `## Configuration` and `## Reload`, its
- * four subsections in order inside it, the security subsection inside the
- * receiving section after its "Anyone in the workspace" bullet, and the
- * downgrade section a `###` of its own (the "Upgrading to personas" cases
- * read that section alone) right after "Upgrading to personas".
+ * The headings b.deo SRI-1102, SRI-1104 and SRI-1105 add, where the user docs
+ * place them: `# Channel modes`, its own page (`CHANNEL_MODES_DOC`), between
+ * the server settings and Reload in the docs' order, with its sections in
+ * order inside it (the security section right after "What each mode serves",
+ * the fungible-mode example last), and the downgrade section a `###` of its
+ * own (the "Upgrading to personas" cases read that section alone) right after
+ * "Upgrading to personas".
  */
 const README_DEO_PLACEMENTS: readonly Placement[] = [
-  { heading: CHANNEL_MODES_HEADING, parent: CONFIGURATION_HEADING, previous: MCP_CONFIG_HEADING, next: RELOAD_HEADING },
+  { heading: CHANNEL_MODES_HEADING, previous: SERVER_SETTINGS_HEADING, next: RELOAD_HEADING },
   ...CHANNEL_MODES_SUBSECTIONS.map((heading, i): Placement => ({
     heading,
     parent: CHANNEL_MODES_HEADING,
     previous: i === 0 ? CHANNEL_MODES_HEADING : CHANNEL_MODES_SUBSECTIONS[i - 1],
   })),
-  { heading: WHO_CAN_REACH_HEADING, parent: RECEIVING_HEADING, previous: RECEIVING_HEADING, after: /^- \*\*Anyone in the workspace can reach a persona,\*\*/ },
   { heading: DOWNGRADE_HEADING, parent: MIGRATION_HEADING, previous: `### ${UPGRADING_TITLE}` },
 ]
 
-/** Each declarative-scoped configuration section and the `## Channel modes` subsection its pointer must link (b.deo SRI-1101). */
+/** Each declarative-scoped configuration section and the channel-modes page's section its pointer must link (b.deo SRI-1101). */
 const DECLARATIVE_POINTERS: readonly [section: string, target: string][] = [
   ['### Channel entries', WHAT_EACH_MODE_SERVES_HEADING],
   ['### Channel delivery', FUNGIBLE_DELIVERY_HEADING],
   ['### Permission prompts', FUNGIBLE_PROMPTS_HEADING],
 ]
 
-/** The pointer from `section` to `target`'s problems: no same-file link to its anchor, or the anchor resolving to no heading, another heading, or one outside `## Channel modes`. Pure. */
+/** The pointer path from the persona reference to the channel-modes page, as `CONFIGURATION_DOC` writes it (`channel-modes.md`). */
+const CHANNEL_MODES_FROM_CONFIGURATION = relative(dirname(CONFIGURATION_DOC), CHANNEL_MODES_DOC)
+
+/** The pointer from `section` (in `CONFIGURATION_DOC`) to `target`'s problems: no link to its anchor on the channel-modes page, or the anchor resolving to no heading, another heading, or one outside `# Channel modes`. Pure. */
 function pointerProblems(readme: string, section: string, target: string): string[] {
   const anchor = anchorLink(target).slice(2, -1)
-  const problems = markdownLinks(requiredSection(readme, section, USER_DOCS_NAME)).some((link) => link.path === '' && link.anchor === anchor) ? [] : [`no link to #${anchor}`]
+  const problems = markdownLinks(requiredSection(readme, section, USER_DOCS_NAME)).some((link) => link.path === CHANNEL_MODES_FROM_CONFIGURATION && link.anchor === anchor) ? [] : [`no link to #${anchor}`]
   const heading = headingAt(readme, anchor)
   if (heading?.text !== target) problems.push(`#${anchor} resolves to ${heading === undefined ? 'no heading' : `"${heading.text}"`}`)
   const modes = sectionRange(readme, CHANNEL_MODES_HEADING)
@@ -8032,7 +8127,7 @@ function withLineEdited(readme: string, match: (line: string) => boolean, edit: 
 }
 
 describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to SRI-1105; AC 42)', () => {
-  const readme = () => userDocsText()
+  const readme = () => referenceText()
 
   describe('headings', () => {
     test.each(README_DEO_PLACEMENTS.map((p) => [p.heading, p] as const))('"%s" appears once, where T17 placed it', (_heading, placement) => {
@@ -8081,7 +8176,7 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
 
     test.each(DECLARATIVE_POINTERS)('self-check: "%s" with its link to "%s" dropped, or that heading renamed, fails', (section, target) => {
       const anchor = anchorLink(target).slice(2, -1)
-      const unlinked = readme().replaceAll(`](#${anchor})`, ']')
+      const unlinked = readme().replaceAll(`](${CHANNEL_MODES_FROM_CONFIGURATION}#${anchor})`, ']')
       expect(unlinked).not.toBe(readme())
       expect(pointerProblems(unlinked, section, target)).toEqual([`no link to #${anchor}`])
       const renamed = withLineEdited(readme(), (line) => line === target, (line) => `${line} again`)
@@ -8208,13 +8303,13 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
 
   describe('troubleshooting entries (SRI-1105)', () => {
     test.each([SILENT_INVITED_TITLE, RECEIVES_EVERYTHING_TITLE, UNCLAIMED_ENTRY_TITLE])('self-check: a second entry titled "%s" fails its rows', (title) => {
-      const edited = withLineEdited(readme(), (line) => line.trim() === `**${title}**`, (line) => `${line}\n\n${line}`)
+      const edited = withLineEdited(readme(), (line) => line.trim() === `${SYMPTOM_PREFIX}${title}`, (line) => `${line}\n\n${line}`)
       const rows = README_DEO_ROWS.filter(([element]) => element.startsWith(`"${title}"`))
       expect(rows.length).toBeGreaterThan(0)
       for (const [element, passage, required] of rows) {
         expect({ element, problems: docRowProblems(passage, required, edited) }).toEqual({
           element,
-          problems: [`${USER_DOCS_NAME} "${TROUBLESHOOTING_HEADING}": 2 entries' titles hold "**${title}**", expected 1`],
+          problems: [`${REFERENCE_NAME} "${SYMPTOM_REFERENCE_HEADING}": 2 entries' titles hold "**${title}**", expected 1`],
         })
       }
     })
@@ -8275,9 +8370,9 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
     })
 
     test('self-check: a linked heading renamed is reported, in its own page and from another page', () => {
-      const configuration = operatorText(CONFIGURATION_DOC)
-      const edited = withLineEdited(configuration, (line) => line === WHAT_EACH_MODE_SERVES_HEADING, (line) => `${line} again`)
-      expect(brokenReadmeAnchors(edited)).toContain(`#${headingSlug(WHAT_EACH_MODE_SERVES_HEADING.slice(4))}`)
+      const channelModes = operatorText(CHANNEL_MODES_DOC)
+      const edited = withLineEdited(channelModes, (line) => line === WHO_CAN_REACH_HEADING, (line) => `${line} again`)
+      expect(brokenReadmeAnchors(edited)).toContain(`#${headingSlug(WHO_CAN_REACH_HEADING.replace(/^#+ /, ''))}`)
       expect(brokenRepoLinks('README.md', `See [modes](${CONFIGURATION_DOC}#no-such-heading).`).broken).toEqual([
         `README.md -> ${CONFIGURATION_DOC}#no-such-heading (no such heading in ${CONFIGURATION_DOC})`,
       ])
