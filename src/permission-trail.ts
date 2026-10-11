@@ -4,7 +4,7 @@
  *
  * One JSON object per newline-terminated line in
  *   <SLACK_STATE_DIR>/permission-trail.jsonl
- * (default: ~/.claude/channels/slack/permission-trail.jsonl).
+ * (default: ~/.config/cscb/permission-trail.jsonl, `resolveServerStateDir` in config.ts).
  *
  * Public API:
  *   - TrailEvent                  — enforced line schema
@@ -20,8 +20,9 @@
  */
 
 import { mkdirSync, openSync, writeSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join } from 'node:path'
+
+import { resolveServerStateDir } from './config.ts'
 
 // ---------------------------------------------------------------------------
 // Line schema
@@ -158,13 +159,8 @@ export type AdDecideResponseClass = CanonicalAdDecideResponseClass | (string & {
 
 const TRAIL_FILENAME = 'permission-trail.jsonl'
 
-function resolveStateDir(): string {
-  const fromEnv = process.env['SLACK_STATE_DIR']
-  return fromEnv ? resolve(fromEnv) : join(homedir(), '.claude', 'channels', 'slack')
-}
-
 function resolveTrailPath(): string {
-  return join(resolveStateDir(), TRAIL_FILENAME)
+  return join(resolveServerStateDir(), TRAIL_FILENAME)
 }
 
 // ---------------------------------------------------------------------------

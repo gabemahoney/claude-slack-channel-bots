@@ -159,7 +159,7 @@ restart resumes.
 Read this section before every run.
 
 - **Operator-run only**, on a **test Slack workspace**. Never on a workspace that production bots serve.
-- **Never on the production install.** Use a dedicated host or VM whose HOME holds no production CSCB state (`~/.claude/channels/slack/`) and no production `~/.agent-director`. The start sweep kills every live `service=cscb` agent-director row that names no configured persona (it keeps the row), so a test server sharing `~/.agent-director` with a production CSCB would kill the production bots. A dedicated OS user is acceptable only on a host that runs no production CSCB at all: only one CSCB server runs per host (they would both need port 3100).
+- **Never on the production install.** Use a dedicated host or VM whose HOME holds no production CSCB state (`~/.config/cscb/`, or `~/.claude/channels/slack/` from an earlier release) and no production `~/.agent-director`. The start sweep kills every live `service=cscb` agent-director row that names no configured persona (it keeps the row), so a test server sharing `~/.agent-director` with a production CSCB would kill the production bots. A dedicated OS user is acceptable only on a host that runs no production CSCB at all: only one CSCB server runs per host (they would both need port 3100).
 - **Never through `/ci` or `/release-test`.** Only the operator runs this plan, by hand, or starts `/ci-live`, which runs it in a throwaway container.
 - **Never type or paste a token** into a chat (the wizard's included), this ticket, the results table, a log or a shell command line. Tokens go only into the wizard's credentials command, at its hidden prompts, in the operator's own terminal (Check S1). Every token check in this plan counts matches and never prints one.
 - **A Linux host with bash.** The plan's commands need GNU/Linux and an interactive bash shell: they read `/proc/<pid>/environ`, and use `stat -c`, `sha256sum`, `history -a`, bash arrays, `jq`, `script`, `tmux` and a user crontab `@reboot` line. Only the optional Check 29b needs `sudo`, `iptables` and `systemd-run`. The pre-flight checks the rest.
@@ -178,7 +178,7 @@ cat > ~/cscb-live-preflight.sh <<'EOF'
 set -u
 TEST_HOST='<TEST_HOST>'   # the test host's name, exactly as `hostname` prints it
 PHASE="${1:?usage: bash ~/cscb-live-preflight.sh setup|check1}"
-STATE="$HOME/.claude/channels/slack"
+STATE="$HOME/.config/cscb"
 fail() { echo "PRE-FLIGHT FAILED: $*" >&2; exit 1; }
 
 [ "$(uname -s)" = Linux ] || fail "this host is not Linux"
@@ -307,7 +307,7 @@ cat > ~/cscb-live-helpers.sh <<'EOF'
 # b.yko shell helpers. Load in every shell: source ~/cscb-live-helpers.sh
 TEST_HOST='<TEST_HOST>'   # the test host's name, exactly as `hostname` prints it
 TEST_USER='<TEST_USER>'   # the test host's user, exactly as `whoami` prints it
-S=~/.claude/channels/slack
+S=~/.config/cscb
 LOG="$S/server.log"
 TRAIL="$S/permission-trail.jsonl"
 

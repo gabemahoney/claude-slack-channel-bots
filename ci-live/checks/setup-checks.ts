@@ -143,7 +143,7 @@ export const setupCheck: CheckDef<CheckContext> = {
     f.expect(extra === '[[],[],[]]', 'a persona has a key beyond the Part 1.5 set')
     const top = (await lines(ctx, `jq -c '{ack_reaction, session_restart_delay, append_system_prompt_file}' "$S/config.json"`))[0]
     f.expect(top === `{"ack_reaction":"eyes","session_restart_delay":null,"append_system_prompt_file":"${SYSTEM_PROMPT_PATH}"}`, 'the server-wide settings are not the Part 1.5 ones')
-    const creds = await lines(ctx, 'ls -lL ~/.config/cscb/')
+    const creds = await lines(ctx, 'ls -lL ~/.config/cscb-credentials/')
     for (const l of ['a', 'b', 'c']) {
       const line = creds.find((x) => x.endsWith(`persona_${l}-credentials.json`)) ?? ''
       f.expect(line.startsWith('-rw-------'), `persona_${l}-credentials.json is missing or not -rw-------`)
@@ -177,10 +177,10 @@ export const s2Check: CheckDef<CheckContext> = {
     const counts = await lines(ctx, '( cd "$PKG" && find . -path ./.git -prune -o -type f -print | wc -l ); wc -l < ~/cscb-live/pkg-before.sha256')
     f.add(`package files now/before: ${counts.join('/')}`)
     f.expect(counts.length === 2 && counts[0] === counts[1], 'the package gained or lost files')
-    const creds = (await lines(ctx, 'ls -A ~/.config/cscb/')).sort()
+    const creds = (await lines(ctx, 'ls -A ~/.config/cscb-credentials/')).sort()
     f.expect(
       JSON.stringify(creds) === JSON.stringify(['persona_a-credentials.json', 'persona_b-credentials.json', 'persona_c-credentials.json']),
-      `~/.config/cscb/ holds ${creds.join(', ')}`,
+      `~/.config/cscb-credentials/ holds ${creds.join(', ')}`,
     )
     const tok = (await lines(ctx, 'tokcount "$S/config.json"'))[0]
     f.expect(tok === '0', `token-shaped lines in config.json: ${tok}`)

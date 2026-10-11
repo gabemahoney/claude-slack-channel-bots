@@ -8,7 +8,9 @@
  * `<home>/.claude/skills`), the state dir and the MCP config path under one
  * `mkdtempSync` root, removed in afterEach. No call falls back to the OS home.
  * Cases that leave `stateDir` unset control SLACK_STATE_DIR in-process and
- * restore it (and the working directory) in afterEach.
+ * restore it (and the working directory) in afterEach. The default state
+ * directory (`<home>/.config/cscb`, b.fc4) is chosen from the case's own `env`
+ * option, never from the run's environment, so it lies under the case's home.
  *
  * Skill links (b.669): the default package root is this checkout, which
  * postinstall's detection never links from, so the link cases force linking
@@ -425,21 +427,107 @@ describe('homeDir — the base of every default', () => {
     ['empty (counts as unset)', ''],
   ])('with only homeDir and SLACK_STATE_DIR %s, a fresh run writes exactly the state and MCP config under that home, and no skills directory: the default package root is this checkout (b.669)', (_label, envValue) => {
     const s = makeSandbox()
-    if (envValue === undefined) delete process.env.SLACK_STATE_DIR
-    else process.env.SLACK_STATE_DIR = envValue
 
-    postinstall({ homeDir: s.home })
+    postinstall({ homeDir: s.home, env: envValue === undefined ? {} : { SLACK_STATE_DIR: envValue } })
 
+    // b.fc4: the default state directory is outside ~/.claude.
     expect(listTree(s.root)).toEqual([
       'home',
       join('home', '.claude'),
-      join('home', '.claude', 'channels'),
-      join('home', '.claude', 'channels', 'slack'),
-      join('home', '.claude', 'channels', 'slack', 'config.json'),
       join('home', '.claude', 'slack-mcp.json'),
+      join('home', '.config'),
+      join('home', '.config', 'cscb'),
+      join('home', '.config', 'cscb', 'config.json'),
     ])
-    expect(readJson(join(s.home, '.claude', 'channels', 'slack', 'config.json'))).toEqual({ personas: [] })
+    expect(readJson(join(s.home, '.config', 'cscb', 'config.json'))).toEqual({ personas: [] })
     expect(readJson(join(s.home, '.claude', 'slack-mcp.json'))).toHaveProperty(['mcpServers', MCP_SERVER_NAME])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The default state directory, and the window before the server moves the old one (b.fc4)
+// ---------------------------------------------------------------------------
+
+describe('default state directory (b.fc4)', () => {
+  /** A real config.json, so a skeleton overwriting it, or sitting beside the wrong one, shows. */
+  const REAL_CONFIG = '{"personas":[{"name":"keep"}]}\n'
+
+  /** A sandbox, plus its old and new state directories and the options of a run with SLACK_STATE_DIR and XDG_CONFIG_HOME unset. */
+  function makeDefaultSandbox(): { s: Sandbox; legacyDir: string; newDir: string; run: PostinstallOptions } {
+    const s = makeSandbox()
+    return { s, legacyDir: join(s.home, '.claude', 'channels', 'slack'), newDir: join(s.home, '.config', 'cscb'), run: { homeDir: s.home, env: {} } }
+  }
+
+  test('an absolute XDG_CONFIG_HOME moves the default to $XDG_CONFIG_HOME/cscb', () => {
+    const { s } = makeDefaultSandbox()
+
+    postinstall({ homeDir: s.home, env: { XDG_CONFIG_HOME: join(s.root, 'xdg') } })
+
+    expect(readJson(join(s.root, 'xdg', 'cscb', 'config.json'))).toEqual({ personas: [] })
+    expect(existsSync(join(s.home, '.config'))).toBe(false)
+  })
+
+  test('the old directory holds a config.json and the new one none: the old one is the state directory, no skeleton is written into the new folder', () => {
+    const { s, legacyDir, newDir, run } = makeDefaultSandbox()
+    mkdirSync(legacyDir, { recursive: true })
+    writeFileSync(join(legacyDir, 'config.json'), REAL_CONFIG)
+
+    const lines = postinstall(run)
+
+    expect(lines).toContain(`skipped: ${join(legacyDir, 'config.json')}`)
+    expect(readFileSync(join(legacyDir, 'config.json'), 'utf-8')).toBe(REAL_CONFIG)
+    expect(readdirSync(legacyDir)).toEqual(['config.json'])
+    expect(existsSync(newDir)).toBe(false)
+  })
+
+  test('the old directory holds only a server.pid (a running old server) and the new one no config: the old directory is used, the new folder is not made', () => {
+    const { s, legacyDir, newDir, run } = makeDefaultSandbox()
+    mkdirSync(legacyDir, { recursive: true })
+    writeFileSync(join(legacyDir, 'server.pid'), '12345\n')
+
+    postinstall(run)
+
+    expect(readJson(join(legacyDir, 'config.json'))).toEqual({ personas: [] })
+    expect(existsSync(newDir)).toBe(false)
+  })
+
+  test('the new directory holds a config.json: it is used and the old directory is left as it was', () => {
+    const { s, legacyDir, newDir, run } = makeDefaultSandbox()
+    mkdirSync(legacyDir, { recursive: true })
+    writeFileSync(join(legacyDir, 'config.json'), '{"personas":[]}\n')
+    mkdirSync(newDir, { recursive: true })
+    writeFileSync(join(newDir, 'config.json'), REAL_CONFIG)
+
+    const lines = postinstall(run)
+
+    expect(lines).toContain(`skipped: ${join(newDir, 'config.json')}`)
+    expect(readFileSync(join(newDir, 'config.json'), 'utf-8')).toBe(REAL_CONFIG)
+    expect(readFileSync(join(legacyDir, 'config.json'), 'utf-8')).toBe('{"personas":[]}\n')
+  })
+
+  test('the old directory is a symbolic link to the new one (already moved): the new directory is used', () => {
+    const { s, legacyDir, newDir, run } = makeDefaultSandbox()
+    mkdirSync(newDir, { recursive: true })
+    writeFileSync(join(newDir, 'config.json'), REAL_CONFIG)
+    mkdirSync(dirname(legacyDir), { recursive: true })
+    symlinkSync(newDir, legacyDir)
+
+    const lines = postinstall(run)
+
+    expect(lines).toContain(`skipped: ${join(newDir, 'config.json')}`)
+    expect(readFileSync(join(newDir, 'config.json'), 'utf-8')).toBe(REAL_CONFIG)
+    expect(lstatSync(legacyDir).isSymbolicLink()).toBe(true)
+  })
+
+  test('an old directory holding no config and no pid file is not used: the skeleton goes to the new directory', () => {
+    const { s, legacyDir, newDir, run } = makeDefaultSandbox()
+    mkdirSync(legacyDir, { recursive: true })
+    writeFileSync(join(legacyDir, 'server.log'), 'a line\n')
+
+    postinstall(run)
+
+    expect(readJson(join(newDir, 'config.json'))).toEqual({ personas: [] })
+    expect(readdirSync(legacyDir)).toEqual(['server.log'])
   })
 })
 
@@ -458,6 +546,7 @@ describe('SLACK_STATE_DIR env override', () => {
     expect(readdirSync(envStateDir)).toEqual(['config.json'])
     expect(readJson(join(envStateDir, 'config.json'))).toEqual({ personas: [] })
     expect(existsSync(join(s.home, '.claude', 'channels'))).toBe(false)
+    expect(existsSync(join(s.home, '.config'))).toBe(false)
   })
 
   test('a relative SLACK_STATE_DIR resolves against the working directory, as the server resolves it', () => {

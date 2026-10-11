@@ -214,7 +214,7 @@ export const check25: CheckDef<CheckContext> = {
 
     // The wizard's two effects: D's credentials file appears, then D's entry is declared.
     ctx.creds.moveDIntoMount()
-    const mode = (await lines(ctx, 'ls -lL ~/.config/cscb/persona_d-credentials.json'))[0] ?? ''
+    const mode = (await lines(ctx, 'ls -lL ~/.config/cscb-credentials/persona_d-credentials.json'))[0] ?? ''
     f.expect(mode.startsWith('-rw-------'), "D's credentials file is not -rw------- in the container")
     const editAt = nowTs(ctx)
     const entry = JSON.stringify(personaEntryFor('d', ids))
@@ -404,7 +404,7 @@ export const check28: CheckDef<CheckContext> = {
     await ctx.creds.rewriteBAppToken(newToken)
     ctx.creds.setBAppTokenName(newName)
     f.note(`Check 28: B's new app-level token is named ${newName} (the run id keeps reruns from colliding); the older one (${oldName}) is revoked in step 7`)
-    const credsLine = `persona "persona_b" (key=persona_b): credentials file "${CONTAINER_HOME}/.config/cscb/persona_b-credentials.json" changed: a new connection opens, then the old one closes, instance kept.`
+    const credsLine = `persona "persona_b" (key=persona_b): credentials file "${CONTAINER_HOME}/.config/cscb-credentials/persona_b-credentials.json" changed: a new connection opens, then the old one closes, instance kept.`
     const p2 = await waitPending(ctx)
     if (f.expect(p2 !== null, 'step 2: no pending file for the credentials change')) {
       checkPreview(f, p2!, [previewHeader({ credentials: 1 }), credsLine])

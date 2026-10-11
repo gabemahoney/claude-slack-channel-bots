@@ -57,7 +57,7 @@
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
 
 import type { WebClient } from '@slack/web-api'
-import { dirname, join, resolve } from 'path'
+import { join, resolve } from 'path'
 import { fileURLToPath } from 'url'
 import { mkdirSync, promises as fsPromises } from 'fs'
 
@@ -65,8 +65,6 @@ import { assertSendable as libAssertSendable } from './lib.ts'
 import {
   expandTilde,
   credentialsFilesToProtect,
-  legacyCronTablePath,
-  resolveDefaultCronTablePath,
   resolveRealPath,
   resolveServerConfigPath,
   resolveServerStateDir,
@@ -386,7 +384,13 @@ import {
   writeServerPortRecord,
 } from './clear-latch.ts'
 import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
-import { cronTablePathForStart, prepareDefaultCronTable, type CronTablePaths } from './cron-table-migration.ts'
+import { repointLogging } from './logging.ts'
+import {
+  migrateStateDirAtStart,
+  STATE_MIGRATE_STARTUP_ERROR_CLASS,
+  stateDirMigrationStopsStart,
+  stateDirStopMessage,
+} from './state-dir-migration.ts'
 import { configInEffect, createReloadController, reloadFilePaths, type ReloadController } from './reload.ts'
 import {
   channelDeliveryDeclarationOf,
@@ -3258,10 +3262,44 @@ async function escalateRowWithNoPane(
 // ---------------------------------------------------------------------------
 
 export async function main(): Promise<void> {
+  // Bug b.fc4: the state directory's default sits outside ~/.claude
+  // ($XDG_CONFIG_HOME/cscb, ~/.config/cscb), where Claude Code does not ask
+  // before a write. On an existing host the old default's files move there,
+  // and the old directory becomes a symbolic link to the new one
+  // (state-dir-migration.ts says what happens to each entry, and why it is
+  // not done by the CLI or postinstall). First of all: before the directory
+  // is made, and so before anything reads or writes it (the PID check, the
+  // retired keys, the last-applied record, config.json, channel-delivery.json,
+  // the logs, the permission trail). With SLACK_STATE_DIR set it does nothing.
+  // It never throws; a start it cannot make safe (an old server still running
+  // on the old directory, a step that failed) stops here with the reason in
+  // startup-errors.log (written to the old directory, where an operator of
+  // the old release looks) and on stderr, and moves nothing it has not placed.
+  const stateDirMigration = migrateStateDirAtStart({ log: (line) => console.error(line) })
+  if (stateDirMigration.paths !== undefined && stateDirMigrationStopsStart(stateDirMigration.outcome)) {
+    recordStartupError(
+      STATE_MIGRATE_STARTUP_ERROR_CLASS,
+      stateDirStopMessage(stateDirMigration.paths, stateDirMigration.outcome),
+      undefined,
+      { logDir: stateDirMigration.paths.legacyDir },
+    )
+    process.exit(1)
+  }
+
   // The state and inbox directories, before any file in the state directory
   // is read or written (nothing is created at import).
   mkdirSync(STATE_DIR, { recursive: true })
   mkdirSync(INBOX_DIR, { recursive: true })
+
+  // The CLI's daemon redirected the console to the server log at the path it
+  // chose before this move: in the old directory. After a move that is a name
+  // in the old directory (a link, per file while the move is pending), and a
+  // rotation would rename the link and reopen a file there. Log to the new
+  // directory's file from here on (the same file). Where nothing moved, or the
+  // old directory is not ours to move (legacy-unusable), the log stays where
+  // the CLI reads a startup failure from.
+  const migrationKind = stateDirMigration.outcome.kind
+  if (migrationKind === 'moved' || migrationKind === 'pending') repointLogging(join(STATE_DIR, 'server.log'))
 
   // b.av2 SR-3.3: one persona's stray rejection must not take the process
   // down. Installed once, before any persona connects; never at import.
@@ -3367,9 +3405,7 @@ export async function main(): Promise<void> {
   //
   // The applied config at the start (the record's at a start from the
   // record): the server-wide values that hold until the next start, e.g. the
-  // restart delay. Set below, right after the start resolves, and set again
-  // before the start's first await only when the start runs on the old
-  // crontable (bug b.avm: the copy with that cron_table_path); never replaced
+  // restart delay. Set below, right after the start resolves; never replaced
   // after that. A confirmed apply replaces `personaConfig`'s persona set and
   // its allow_invited_channels switch, and keeps every other server-wide value
   // from here (`configInEffect`, b.av2 SR-8.6, b.deo SRI-201); the start
@@ -3420,18 +3456,13 @@ export async function main(): Promise<void> {
       // `shuttingDown` live before starting each launch, so a shutdown begun
       // during the pass (a version re-check's stop included) starts no
       // queued launch and changes no agent-director row.
-      // Bug b.avm: the pass launches over the server's configuration in
-      // effect, as every later launch does: the controller's applied persona
-      // set and switch over appliedConfig's start-time server-wide settings
-      // (configInEffect), never over the controller's configuration as a
-      // whole. That one is the record's configuration as resolved, which
-      // detection compares config.json against, so it keeps the default
-      // crontable; appliedConfig holds the crontable this start runs on
-      // (cronTablePathForStart, below), so a start that fell back to the old
-      // crontable exports that path as CSCB_CRONTABLE_PATH here too. The pass
-      // runs only after the start resolved, so appliedConfig is set; a call
-      // before that throws rather than launch without the start-time values,
-      // and main() logs it.
+      // The pass launches over the server's configuration in effect, as every
+      // later launch does: the controller's applied persona set and switch over
+      // appliedConfig's start-time server-wide settings (configInEffect), never
+      // over the controller's configuration as a whole. The pass runs only
+      // after the start resolved, so appliedConfig is set; a call before that
+      // throws rather than launch without the start-time values, and main()
+      // logs it.
       startBringUp: (applied) => {
         if (appliedConfig === undefined) throw new Error('the start bring-up ran before the start resolved its configuration')
         return startupSessionManager(configInEffect(appliedConfig, applied), { bringUp: personaBringUps, isShuttingDown: () => shuttingDown })
@@ -3514,48 +3545,6 @@ export async function main(): Promise<void> {
     },
     { log: (line) => console.error(line) },
   )
-
-  // Bug b.avm: the crontable's default sits outside ~/.claude
-  // ($XDG_CONFIG_HOME/cscb/crontab when SLACK_STATE_DIR is unset). When the
-  // start-time configuration left cron_table_path out (the loader's
-  // cron_table_path_defaulted; a path the operator wrote, even the default's,
-  // is never prepared, D-Q1), the default's directory is created and a
-  // crontable left at the old default (<config dir>/crontab) moves there,
-  // leaving a symbolic link at the old path for sessions whose
-  // CSCB_CRONTABLE_PATH still names it. Once per start, here: after the start
-  // resolved its configuration and before the first await, the start sweep,
-  // the start bring-up (so before any launch takes the path into its
-  // environment) and the scheduler's bootstrap; behind no branch, so in dry
-  // run too. Its paths come from the same resolvers the loader used. It
-  // never throws: each failure is one logged line, and the start goes on.
-  // When a step failed before the file was in place at the new path, this
-  // start runs on the old path (cronTablePathForStart; the failure's WARN
-  // says so): it replaces cron_table_path in personaConfig and appliedConfig
-  // alike. The scheduler and dispatcher read personaConfig; the start
-  // bring-up launches over configInEffect(appliedConfig, <the controller's
-  // applied config>) (the lifecycle's startBringUp, above); every later
-  // launch (a restart, a retry, an apply's bring-up) reads personaConfig,
-  // which a confirmed apply rebuilds with configInEffect, keeping
-  // appliedConfig's path. So every one of them names the file whose
-  // schedules are still there, and the scheduler's bootstrap never creates
-  // an empty crontable at the new path beside it. The reload controller's
-  // applied configuration is left as resolved, still naming the default as
-  // config.json does, so detection sees no cron_table_path change and no
-  // pending change arises from the fallback alone.
-  const cronTablePaths: CronTablePaths = {
-    inEffect: personaConfig.cron_table_path,
-    defaulted: personaConfig.cron_table_path_defaulted === true,
-    defaultPath: resolveDefaultCronTablePath(dirname(CONFIG_PATH)),
-    legacyPath: legacyCronTablePath(dirname(CONFIG_PATH)),
-  }
-  const cronTableForStart = cronTablePathForStart(
-    cronTablePaths,
-    prepareDefaultCronTable(cronTablePaths, { log: (line) => console.error(line) }),
-  )
-  if (cronTableForStart !== personaConfig.cron_table_path) {
-    personaConfig = { ...personaConfig, cron_table_path: cronTableForStart }
-    appliedConfig = personaConfig
-  }
 
   // b.jg5 SRJ-209: agent-director's timing settings. Read once here, after
   // the startup gate has passed and the start has resolved its configuration,

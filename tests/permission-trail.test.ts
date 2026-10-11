@@ -2,7 +2,8 @@
  * permission-trail.test.ts — Single-emitter correctness tests for
  * src/permission-trail.ts. Covers schema serialization, RFC 3339 sub-second
  * `ts` formatting, append semantics, first-write directory creation, and
- * SLACK_STATE_DIR env override.
+ * SLACK_STATE_DIR env override, and the default location (b.fc4: under the XDG
+ * configuration directory, not under ~/.claude).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -11,6 +12,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import {
   _resetTrailFdForTests,
   emitTrail,
@@ -236,5 +238,43 @@ describe('emitTrail — SLACK_STATE_DIR override', () => {
     expect(existsSync(trailFile())).toBe(true)
     // And the per-test temp dir is what was honored — not the homedir default.
     expect(trailFile().startsWith(tempDir)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The default location (b.fc4)
+// ---------------------------------------------------------------------------
+
+describe('emitTrail — the default state directory (b.fc4)', () => {
+  const TRAIL_SRC = join(import.meta.dir, '..', 'src', 'permission-trail.ts')
+
+  /** `emitTrail` in a child with the fake home as its HOME, SLACK_STATE_DIR unset, and `env` more. */
+  function emitInFakeHome(home: string, opts: { env?: Record<string, string> }): void {
+    const res = runInFakeHome({
+      modulePath: TRAIL_SRC,
+      call: 'mod.emitTrail(input)',
+      input: makeEmitTrailInput({ event: 'cscb.default.dir' }),
+      home,
+      ...opts,
+    })
+    expect(res.observedHomedir).toBe(home)
+    expect(res.status).toBe(0)
+  }
+
+  test('SLACK_STATE_DIR unset: the trail is <home>/.config/cscb/permission-trail.jsonl, and nothing is made under ~/.claude', () => {
+    emitInFakeHome(tempDir, {})
+
+    const lines = readFileSync(join(tempDir, '.config', 'cscb', 'permission-trail.jsonl'), 'utf-8').split('\n').filter(l => l.length > 0)
+    expect(lines.map(l => (JSON.parse(l) as { event: string }).event)).toEqual(['cscb.default.dir'])
+    expect(existsSync(join(tempDir, '.claude'))).toBe(false)
+  })
+
+  test('SLACK_STATE_DIR unset and an absolute XDG_CONFIG_HOME: the trail is under <XDG_CONFIG_HOME>/cscb', () => {
+    const xdg = join(tempDir, 'xdg')
+
+    emitInFakeHome(tempDir, { env: { XDG_CONFIG_HOME: xdg } })
+
+    expect(existsSync(join(xdg, 'cscb', 'permission-trail.jsonl'))).toBe(true)
+    expect(existsSync(join(tempDir, '.config'))).toBe(false)
   })
 })

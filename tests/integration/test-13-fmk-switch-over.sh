@@ -20,12 +20,21 @@
 #   global install under SCENARIO_ROOT), with agent-director's 0.10.0 client
 #   (the image's tarball), never swapped. Its CLI there is the old CLI; the
 #   CLI the build under test later has at the same path is the new one.
-# - Its pre-persona config.json (two routed channels) sits in the state
-#   directory both packages read by default, $HOME/.claude/channels/slack
-#   (exported as SLACK_STATE_DIR), with the host's other files the runbook
-#   names: a crontable targeting channels, an `/interject` caller file naming
-#   channels, access.json, and the Slack token variables (fake tokens, from
-#   `fake_token`, in a file never sourced). These are fixtures (ruling Q13).
+# - Its pre-persona config.json (two routed channels) sits where a real
+#   pre-upgrade host has it, in the old state directory
+#   $HOME/.claude/channels/slack, the only place the old package reads
+#   config.json from: its CLI ignores SLACK_STATE_DIR for config.json and always
+#   reads $HOME/.claude/channels/slack/config.json. The same directory holds
+#   the host's other state files the runbook names: a crontable targeting
+#   channels and access.json (credentials files land there too, at step 7). The
+#   `/interject` caller file naming channels and the Slack token variables (fake
+#   tokens, from `fake_token`, in a file never sourced) sit under SCENARIO_ROOT's
+#   host directory. These are fixtures (ruling Q13). SLACK_STATE_DIR is
+#   never exported (the scenario's harness helpers read it as a plain shell
+#   variable naming the directory in use), so no CSCB process, old or new,
+#   sees it. The build under test's default state directory is
+#   $HOME/.config/cscb since b.fc4; it migrates the old directory there, once, at
+#   its first start (step 10), and leaves a symbolic link at the old name.
 # - `seed_prepersona_fleet` seeds one row per routed channel on 0.10.0, named
 #   and labelled as the old package does (instance id
 #   `cscb_<name>_<channel id>`, session `slack_bot_<name>_<channel id>`,
@@ -103,8 +112,8 @@
 #       version.
 #   2   the autostart substitution.
 #   3   the old package's own `stop --stop-bots` through the old CLI (a CSCB
-#       process, the tmux shim first on its PATH), reading the pre-persona
-#       config.json: exit 0, one teardown outcome per routed channel, its
+#       process, the tmux shim first on its PATH, no SLACK_STATE_DIR), reading
+#       the pre-persona config.json from the old state directory: exit 0, one teardown outcome per routed channel, its
 #       agent-director calls through the shim with 0.10.0 behind it.
 #   4   `agent-director find-missing`, then at most 5 minutes (the runbook's
 #       bound) for every service=cscb row to read ended or missing; each
@@ -117,7 +126,8 @@
 #       client checked with the image's check (ad-client-check.sh --package); nothing started; the persona
 #       configuration put in place as config.json; each persona's credentials
 #       file written by the new CLI's `credentials`; the crontable targets and
-#       `/interject` callers rewritten to name personas; the new install check
+#       `/interject` callers rewritten to name personas (all of it in the old
+#       state directory, which the new CLI still uses until the first start); the new install check
 #       passing on the still-installed 0.10.0 with its Phase 1 note.
 #   8   the go-ahead, confirmed as still standing in the switch-over log (none
 #       fails the run there: "no go") and recorded; the harness's stop of
@@ -153,7 +163,14 @@
 #       server's first read-pane of it after its spawn to the server's first
 #       send-keys of it, by their shim lines) shows the row; how many samples
 #       showed each row pending, and how many fell inside that stretch, are
-#       recorded. The post-install check is recorded in the switch-over log,
+#       recorded. Before the start, the old state directory is a real directory
+#       and the new default one does not exist; after it, the build under test
+#       has moved the old directory whole to $HOME/.config/cscb: config.json,
+#       crontable, access.json, the credentials files, server.pid and server.log
+#       are there, $HOME/.claude/channels/slack is a symbolic link to it, and
+#       server.log carries the state-migrate line for the whole-directory
+#       rename once. From there the script reads the new directory (legs B and
+#       C included). The post-install check is recorded in the switch-over log,
 #       as the runbook says, and nowhere else. Then leg A's checks.
 #   11  the expire and prompt-wording substitutions.
 #
@@ -413,8 +430,25 @@ STAGED_PKG="${STAGING_DIR}/package"
 # the installed one from step 8.
 RUNBOOK_PKG="${STAGED_PKG}"
 
-# The state directory both packages read by default.
-STATE_DIR="${HOME}/.claude/channels/slack"
+# The two state directories. The old 0.10.0 package keeps everything, config.json
+# included, in OLD_STATE_DIR, and its CLI reads config.json from there whatever
+# SLACK_STATE_DIR says (it is never exported here anyway). The build under test
+# defaults to NEW_STATE_DIR since b.fc4 and, at its first start (step 10), moves
+# OLD_STATE_DIR there and leaves a symbolic link at the old name. Until that
+# start the scenario's files are in OLD_STATE_DIR and NEW_STATE_DIR does not
+# exist; from it, the files are in NEW_STATE_DIR.
+OLD_STATE_DIR="${HOME}/.claude/channels/slack"
+NEW_STATE_DIR="${HOME}/.config/cscb"
+
+# The harness helpers (server_pid, count_log, run_start, start_server,
+# stop_server, write_config, cscb_run) read the shell variable SLACK_STATE_DIR
+# as the directory in use. It is kept as an unexported shell variable, so no
+# CSCB process (the old CLI, the new CLI, the server) inherits it: a customer
+# sets none, and an exported one would stop the new release migrating.
+use_state_dir() {
+    SLACK_STATE_DIR="$1"
+    export -n SLACK_STATE_DIR
+}
 
 # The routed channels, their Slack names (the old package reads them from
 # Slack, never from config.json) and the persona each becomes.
@@ -945,11 +979,16 @@ samples_inside_pending() {
 # Setup: the pre-persona 0.10.0 starting point
 # ---------------------------------------------------------------------------
 
-mkdir -p "${HOST_DIR}" "${COPIES_DIR}" "${STATE_DIR}" "${STAGING_DIR}" "${BUN_CACHE}" \
+mkdir -p "${HOST_DIR}" "${COPIES_DIR}" "${OLD_STATE_DIR}" "${STAGING_DIR}" "${BUN_CACHE}" \
     || fail "setup: could not create the scenario's directories"
 : > "${SWITCH_LOG}" || fail "setup: could not create ${SWITCH_LOG}"
 : > "${SUBSTITUTIONS}" || fail "setup: could not create ${SUBSTITUTIONS}"
-export SLACK_STATE_DIR="${STATE_DIR}"
+# The scenario sourced lib/scenario.sh, which exports SLACK_STATE_DIR (the
+# scenario's own state directory, under SCENARIO_ROOT); neither it nor an
+# XDG_CONFIG_HOME may reach the CSCB processes. The state is in the old directory.
+unset XDG_CONFIG_HOME
+use_state_dir "${OLD_STATE_DIR}"
+[[ ! -e "${NEW_STATE_DIR}" ]] || fail "setup: ${NEW_STATE_DIR} exists before the new release's first start"
 
 # The operator's go-ahead for the switch-over on this container: the harness,
 # playing the operator, records it in the switch-over log before step 1,
@@ -1030,7 +1069,7 @@ printf 'Summarize the builds.\n' | write_file "${HOST_DIR}/prompt-builds.md"
     echo "# The host's scheduled prompts."
     echo "0 0 1 1 * ${HOST_DIR}/prompt-daily.md ${CHANNELS[0]}"
     echo "30 0 1 1 * ${HOST_DIR}/prompt-builds.md ${CHANNELS[1]},${CHANNELS[0]}"
-} | write_file "${STATE_DIR}/crontab"
+} | write_file "${OLD_STATE_DIR}/crontab"
 {
     echo '#!/bin/sh'
     echo "# The host's /interject callers."
@@ -1041,7 +1080,7 @@ printf 'Summarize the builds.\n' | write_file "${HOST_DIR}/prompt-builds.md"
 } | write_file "${INTERJECT_CALLERS}" 0755
 jq -n --arg a "${CHANNELS[0]}" --arg b "${CHANNELS[1]}" \
     '{dmPolicy: "pairing", allowFrom: [], channels: {($a): {requireMention: false, allowFrom: []}, ($b): {requireMention: false, allowFrom: []}}, pending: {}}' \
-    | write_file "${STATE_DIR}/access.json" 0600
+    | write_file "${OLD_STATE_DIR}/access.json" 0600
 printf 'SLACK_BOT_TOKEN=%s\nSLACK_APP_TOKEN=%s\n' "$(fake_token bot "${SCENARIO_TAG}old")" "$(fake_token app "${SCENARIO_TAG}old")" \
     | write_file "${TOKEN_VARS}" 0600
 
@@ -1050,7 +1089,7 @@ fleet_args=()
 for cid in "${CHANNELS[@]}"; do
     fleet_args+=("${cid}=${SLACK_NAME[${cid}]}")
 done
-seed_prepersona_fleet "${STATE_DIR}/config.json" "${fleet_args[@]}" > "${SCENARIO_ROOT}/fleet.out"
+seed_prepersona_fleet "${OLD_STATE_DIR}/config.json" "${fleet_args[@]}" > "${SCENARIO_ROOT}/fleet.out"
 i=0
 while read -r cid id session sid pane; do
     [[ "${cid}" == "${CHANNELS[i]}" ]] || fail "setup: the fleet's row ${i} is for channel ${cid}, not ${CHANNELS[i]}"
@@ -1175,7 +1214,7 @@ for cid in "${CHANNELS[@]}"; do
     name="${PERSONA_OF[${cid}]}"
     mkdir -p "${SCENARIO_ROOT}/claude-config/${name}" || fail "step 1: could not create ${name}'s Claude config directory"
     personas="$(jq -c --arg n "${name}" --arg cid "${cid}" --arg w "${CWD_OF[${cid}]}" \
-        --arg creds "${STATE_DIR}/credentials-${name}.json" --arg cfg "${SCENARIO_ROOT}/claude-config/${name}" \
+        --arg creds "${OLD_STATE_DIR}/credentials-${name}.json" --arg cfg "${SCENARIO_ROOT}/claude-config/${name}" \
         '. + [{name: $n, credentials_file: $creds, working_directory: $w, claude_config_dir: $cfg,
                channels: [{id: $cid, delivery: "all"}], permission_prompts: $cid}]' <<< "${personas}")"
 done
@@ -1202,7 +1241,7 @@ record "slack_bot_ sessions no row names: ${unnamed[*]:-none}"
 (( ${#unnamed[@]} == 0 )) || fail "step 1: slack_bot_ session(s) no row names: ${unnamed[*]}"
 
 # Copies for rollback, with the old CSCB's exact version beside them.
-for f in "${STATE_DIR}/config.json" "${STATE_DIR}/crontab" "${INTERJECT_CALLERS}" "${STATE_DIR}/access.json" "${TOKEN_VARS}"; do
+for f in "${OLD_STATE_DIR}/config.json" "${OLD_STATE_DIR}/crontab" "${INTERJECT_CALLERS}" "${OLD_STATE_DIR}/access.json" "${TOKEN_VARS}"; do
     [[ -f "${f}" ]] || fail "step 1: ${f} is missing"
     cp -p -- "${f}" "${COPIES_DIR}/" || fail "step 1: could not copy ${f} to ${COPIES_DIR}"
 done
@@ -1355,7 +1394,7 @@ EOF
 } | write_file "${SLACK_CURL_DIR}/curl" 0755
 for cid in "${CHANNELS[@]}"; do
     name="${PERSONA_OF[${cid}]}"
-    creds="${STATE_DIR}/credentials-${name}.json"
+    creds="${OLD_STATE_DIR}/credentials-${name}.json"
     bot="$(fake_token bot "${TOKEN_LABEL[${cid}]}")"
     app="$(fake_token app "${TOKEN_LABEL[${cid}]}")"
     rc=0
@@ -1374,13 +1413,13 @@ runbook_substitute 7 slack-fixtures "the credentials command validates the fake 
 
 # The crontable targets and the /interject callers name personas.
 for cid in "${CHANNELS[@]}"; do
-    sed -i -e "s/\(^\|[ ,]\)${cid}\([ ,]\|\$\)/\1${PERSONA_OF[${cid}]}\2/g" "${STATE_DIR}/crontab" \
+    sed -i -e "s/\(^\|[ ,]\)${cid}\([ ,]\|\$\)/\1${PERSONA_OF[${cid}]}\2/g" "${OLD_STATE_DIR}/crontab" \
         || fail "step 7: could not rewrite the crontable"
     sed -i -e "s/\"channel\": \"${cid}\"/\"persona\": \"${PERSONA_OF[${cid}]}\"/g" "${INTERJECT_CALLERS}" \
         || fail "step 7: could not rewrite the /interject callers"
 done
 for cid in "${CHANNELS[@]}"; do
-    ! grep -qF -- "${cid}" "${STATE_DIR}/crontab" || fail "step 7: the crontable still targets channel ${cid}"
+    ! grep -qF -- "${cid}" "${OLD_STATE_DIR}/crontab" || fail "step 7: the crontable still targets channel ${cid}"
     ! grep -qF -- "${cid}" "${INTERJECT_CALLERS}" || fail "step 7: an /interject caller still names channel ${cid}"
 done
 [[ "$(grep -c '"persona": ' "${INTERJECT_CALLERS}")" == "${#CHANNELS[@]}" ]] \
@@ -1453,10 +1492,10 @@ record "agent-director ${got} (${REL_COMMIT}); ${count} agent-director process(e
 read_settings "${CSCB_PKG_DIR}" "${SCENARIO_ROOT}/settings-step8"
 check_windows "step 8"
 NEED_MS="${SETTINGS[call_timeout_need_ms]}"
-current="$(jq -r '.agent_director_call_timeout_ms' "${STATE_DIR}/config.json")"
+current="$(jq -r '.agent_director_call_timeout_ms' "${OLD_STATE_DIR}/config.json")"
 if (( current <= NEED_MS )); then
     raised=$(( NEED_MS + CALL_TIMEOUT_HEADROOM_MS ))
-    jq --argjson v "${raised}" '.agent_director_call_timeout_ms = $v' "${STATE_DIR}/config.json" > "${SCENARIO_ROOT}/config.raised.json" \
+    jq --argjson v "${raised}" '.agent_director_call_timeout_ms = $v' "${OLD_STATE_DIR}/config.json" > "${SCENARIO_ROOT}/config.raised.json" \
         || fail "step 8: could not raise agent_director_call_timeout_ms"
     write_config < "${SCENARIO_ROOT}/config.raised.json"
     record "the need grew to ${NEED_MS} ms: agent_director_call_timeout_ms raised from ${current} to ${raised} in config.json"
@@ -1502,6 +1541,19 @@ for cid in "${CHANNELS[@]}"; do
     # src/persona-identity.ts personaInstanceId.
     PERSONA_IDS+=("cscb_$(persona_key "${name}")")
 done
+# Before the first start of the new release, the state is where the old package
+# left it: the old directory is a real directory holding the persona
+# configuration and the rest, and the new default directory does not exist yet.
+# Nothing in steps 1 to 9 may have created it, or the start would merge
+# entries instead of moving the directory.
+[[ -d "${OLD_STATE_DIR}" && ! -L "${OLD_STATE_DIR}" ]] \
+    || fail "step 10: ${OLD_STATE_DIR} is not a real directory before the first start"
+[[ -f "${OLD_STATE_DIR}/config.json" ]] || fail "step 10: ${OLD_STATE_DIR}/config.json is missing before the first start"
+[[ ! -e "${NEW_STATE_DIR}" && ! -L "${NEW_STATE_DIR}" ]] \
+    || fail "step 10: ${NEW_STATE_DIR} exists before the first start"
+# From here the harness reads the directory the new release works in (still
+# not exported: the release finds it as a customer's does).
+use_state_dir "${NEW_STATE_DIR}"
 LEG_A_AD_FROM="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
 LEG_A_TRAIL_FROM="$(line_count "${AD_TRAIL}")"
 LEG_A_RECORD_FROM="$(line_count "${SLACK_RECORD}")"
@@ -1512,6 +1564,32 @@ track_pid "${pending_sampler_pid}"
 leg_a_start_us="$(now_us)"
 start_server --live
 record "the new CSCB started (bot server PID ${SERVER_PID})"
+
+# The first start migrated the state directory: the old directory moved, whole,
+# to the new default, and a symbolic link to it stays at the old name. The
+# configuration, crontable, access.json and each persona's credentials file
+# came along, and the server's pid file and log are in the new directory.
+for f in config.json crontab access.json server.pid server.log; do
+    [[ -f "${NEW_STATE_DIR}/${f}" ]] || fail "step 10: ${NEW_STATE_DIR}/${f} does not exist after the first start"
+done
+for cid in "${CHANNELS[@]}"; do
+    f="credentials-${PERSONA_OF[${cid}]}.json"
+    [[ -f "${NEW_STATE_DIR}/${f}" ]] || fail "step 10: ${NEW_STATE_DIR}/${f} does not exist after the first start"
+done
+[[ -d "${NEW_STATE_DIR}" && ! -L "${NEW_STATE_DIR}" ]] || fail "step 10: ${NEW_STATE_DIR} is not a real directory"
+[[ -L "${OLD_STATE_DIR}" ]] || fail "step 10: ${OLD_STATE_DIR} is not a symbolic link after the first start"
+got="$(readlink -- "${OLD_STATE_DIR}")"
+[[ "${got}" == "${NEW_STATE_DIR}" ]] \
+    || fail "step 10: ${OLD_STATE_DIR} links to '${got}', not ${NEW_STATE_DIR}"
+[[ "$(server_pid)" == "${SERVER_PID}" ]] || fail "step 10: ${NEW_STATE_DIR}/server.pid does not name the bot server (PID ${SERVER_PID})"
+# The line is src/state-dir-migration.ts stateDirRenamedLine's text.
+renamed_line="[slack] state-migrate: moved the state directory from ${OLD_STATE_DIR} to ${NEW_STATE_DIR}, its new default location outside ~/.claude, where Claude Code does not ask before a write. ${OLD_STATE_DIR} is now a symbolic link to it, so a session, script or configuration path that still names the old directory reaches the same files."
+n="$(grep -cF -- "${renamed_line}" "${NEW_STATE_DIR}/server.log" || true)"
+if [[ "${n}" != 1 ]]; then
+    sed 's/^/  | /' "${NEW_STATE_DIR}/server.log" >&2
+    fail "step 10: ${NEW_STATE_DIR}/server.log carries ${n} whole-directory rename line(s) of the state migration, not one"
+fi
+record "the first start moved ${OLD_STATE_DIR} to ${NEW_STATE_DIR} (a symbolic link stays at the old name); the configuration, crontable, access.json and credentials files are there, and so are server.pid and server.log"
 runbook_substitute 10 autostart-skipped "the container has no host autostart for CSCB to re-enable"
 
 leg_a_deadline_us=$(( leg_a_start_us + LEG_A_WAIT_S * 1000000 ))
@@ -1700,7 +1778,7 @@ runbook_substitute 11 prompt-wording-skipped "the orchestrator prompt's hold-unt
 # config.json sets it.
 LEG_B_STOPPING_S="$(recorded_setting "${STEP1_SETTINGS}" tmux.stopping_window_seconds)"
 LEG_B_GRACE_MS="$(recorded_setting "${STEP1_SETTINGS}" grace_ms)"
-LEG_B_TICK_S="$(jq -r '.health_check_interval // empty' "${STATE_DIR}/config.json")"
+LEG_B_TICK_S="$(jq -r '.health_check_interval // empty' "${NEW_STATE_DIR}/config.json")"
 [[ "${LEG_B_TICK_S}" =~ ^[1-9][0-9]*$ ]] || fail "leg B: config.json sets no health_check_interval ('${LEG_B_TICK_S}')"
 LEG_B_WAIT_S=$(( LEG_B_STOPPING_S + LEG_B_TICK_S + (LEG_B_GRACE_MS + 999) / 1000 ))
 record "leg B bound: ${LEG_B_WAIT_S}s = the stopping window ${LEG_B_STOPPING_S}s + one health tick ${LEG_B_TICK_S}s + G ${LEG_B_GRACE_MS}ms"
@@ -1737,8 +1815,8 @@ LEG_B_OUT="${SCENARIO_ROOT}/clean-restart.out"
 # teardownBoundMs, at config.json's agent_director_call_timeout_ms and
 # exit_timeout), the harness's bound on the CLI's `stop` for the server's
 # stop, and the CLI's daemon startup wait.
-leg_b_call_ms="$(jq -r '.agent_director_call_timeout_ms // empty' "${STATE_DIR}/config.json")"
-leg_b_exit_s="$(jq -r '.exit_timeout // empty' "${STATE_DIR}/config.json")"
+leg_b_call_ms="$(jq -r '.agent_director_call_timeout_ms // empty' "${NEW_STATE_DIR}/config.json")"
+leg_b_exit_s="$(jq -r '.exit_timeout // empty' "${NEW_STATE_DIR}/config.json")"
 [[ "${leg_b_call_ms}" =~ ^[1-9][0-9]*$ && "${leg_b_exit_s}" =~ ^[1-9][0-9]*$ ]] \
     || fail "leg B: config.json sets no agent_director_call_timeout_ms ('${leg_b_call_ms}') or exit_timeout ('${leg_b_exit_s}')"
 leg_b_cli_ms="$(cd / && TEARDOWN_MODULE="${CSCB_PKG_DIR}/src/cli-teardown.ts" CALL_MS="${leg_b_call_ms}" EXIT_S="${leg_b_exit_s}" bun --no-install -e \

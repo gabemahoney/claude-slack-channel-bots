@@ -99,14 +99,17 @@ import {
   AGENT_DIRECTOR_INSTALL_DIR,
   AGENT_DIRECTOR_INSTALL_PATH,
   CLAUDE_DIR,
+  DEFAULT_STATE_DIR_PATHS,
   LAUNCH_HOME_DERIVED_PATHS,
   LAUNCH_HOME_REFUSAL,
   LAUNCH_HOME_REFUSED_EXIT_CODE,
+  LEGACY_STATE_DIR_PATH,
   LIVE_LAUNCH_HOME_PROBE,
   type LaunchHomeProbe,
   type LaunchHomeRefusal,
   PRELOAD_HOME_PREFIX,
   PRELOAD_STATE_DIR_PATH,
+  XDG_CONFIG_DIR,
   hostSafeChildEnv,
   isUnder,
   launchHomeRefusal,
@@ -139,9 +142,10 @@ const R = LAUNCH_HOME_REFUSAL
 /**
  * The paths under a home that `src/` and the agent-director client derive
  * from `homedir()`, written out here so that one dropped from
- * `LAUNCH_HOME_DERIVED_PATHS` fails its live row. All but the Slack state
- * directory, whose mere presence is its own rule (its symlinked-parent case
- * is a row of the live table).
+ * `LAUNCH_HOME_DERIVED_PATHS` fails its live row. All but the two default
+ * state directories (`.config/cscb` and the old `.claude/channels/slack`) and
+ * what lies under them: their mere presence is its own rule, so a link at or
+ * under them is `holdsSlackState` (rows of the live table).
  */
 const LINKABLE_DERIVED_PATHS: string[] = [
   CLAUDE_DIR,
@@ -153,8 +157,6 @@ const LINKABLE_DERIVED_PATHS: string[] = [
   join(AGENT_DIRECTOR_INSTALL_DIR, 'config.toml'),
   AGENT_DIRECTOR_INSTALL_PATH,
   '.config',
-  join('.config', 'cscb'),
-  join('.config', 'cscb', 'crontab'),
 ]
 
 let root: string
@@ -239,10 +241,12 @@ describe('launchHomeRefusal (recording fake probe)', () => {
   /** A launch home strictly under the temp directory, for the rows with no passwd home. */
   const T_HOME = join(TEMP, 'scratch-home')
   const SLACK = join(HOME, PRELOAD_STATE_DIR_PATH)
+  const LEGACY_SLACK = join(HOME, LEGACY_STATE_DIR_PATH)
   const CLAUDE = join(HOME, CLAUDE_DIR)
   const AD_DIR = join(HOME, AGENT_DIRECTOR_INSTALL_DIR)
   const AD_BIN = join(HOME, AGENT_DIRECTOR_INSTALL_PATH)
   const T_SLACK = join(T_HOME, PRELOAD_STATE_DIR_PATH)
+  const T_LEGACY_SLACK = join(T_HOME, LEGACY_STATE_DIR_PATH)
   const T_CLAUDE = join(T_HOME, CLAUDE_DIR)
   const T_AD_DIR = join(T_HOME, AGENT_DIRECTOR_INSTALL_DIR)
 
@@ -290,7 +294,7 @@ describe('launchHomeRefusal (recording fake probe)', () => {
     const known = passwd !== undefined && isAbsolute(passwd)
     return new Set([
       `canonical ${launchHome}`,
-      `exists ${join(launchHome, PRELOAD_STATE_DIR_PATH)}`,
+      ...DEFAULT_STATE_DIR_PATHS.map((path) => `exists ${join(launchHome, path)}`),
       ...LAUNCH_HOME_DERIVED_PATHS.map((path) => `canonical ${join(launchHome, path)}`),
       `exists ${join(launchHome, AGENT_DIRECTOR_INSTALL_DIR)}`,
       `exists ${join(launchHome, AGENT_DIRECTOR_INSTALL_PATH)}`,
@@ -331,7 +335,8 @@ describe('launchHomeRefusal (recording fake probe)', () => {
       exists: [SLACK],
       links: { [HOME]: REAL },
     }, true],
-    ['a home holding Slack state', R.holdsSlackState, HOME, REAL, { exists: [SLACK] }, true],
+    ['a home holding Slack state (the default state directory, .config/cscb)', R.holdsSlackState, HOME, REAL, { exists: [SLACK] }, true],
+    ['a home holding Slack state at the old default, .claude/channels/slack', R.holdsSlackState, HOME, REAL, { exists: [LEGACY_SLACK] }, true],
     ['a home holding Slack state and an install, whose .claude leads into the real home (the Slack-state rule wins)', R.holdsSlackState, HOME, REAL, {
       exists: [SLACK, AD_DIR],
       links: { [CLAUDE]: join(REAL, CLAUDE_DIR) },
@@ -381,6 +386,7 @@ describe('launchHomeRefusal (recording fake probe)', () => {
       links: { [T_CLAUDE]: join(TEMP, 'claude') },
     }, true],
     ['a home under the temp directory holding Slack state, with no passwd home', R.holdsSlackState, T_HOME, undefined, { exists: [T_SLACK] }, true],
+    ['a home under the temp directory holding Slack state at the old default, with no passwd home', R.holdsSlackState, T_HOME, undefined, { exists: [T_LEGACY_SLACK] }, true],
     ['a home under the temp directory holding Slack state, whose .claude leads out of it, with no passwd home (the Slack-state rule wins)', R.holdsSlackState, T_HOME, undefined, {
       exists: [T_SLACK],
       links: { [T_CLAUDE]: '/data/claude' },
@@ -459,10 +465,10 @@ describe('launchHomeRefusal (recording fake probe)', () => {
 // ---------------------------------------------------------------------------
 
 describe('launchHomeRefusal with LIVE_LAUNCH_HOME_PROBE (fixtures under the root, a fake real home)', () => {
-  /** A fake real home under the root, shaped like an operator's: it holds `.claude/channels/slack`. */
+  /** A fake real home under the root, shaped like an operator's: it holds both default state directories. */
   function fakeRealHome(): string {
     const real = dirUnder('real')
-    mkdirSync(join(real, PRELOAD_STATE_DIR_PATH), { recursive: true })
+    for (const path of DEFAULT_STATE_DIR_PATHS) mkdirSync(join(real, path), { recursive: true })
     return real
   }
 
@@ -489,9 +495,14 @@ describe('launchHomeRefusal with LIVE_LAUNCH_HOME_PROBE (fixtures under the root
     ['a home whose .claude/channels is a symlink to the fake real home’s, which holds Slack state', R.holdsSlackState, (real) => ({
       launchHome: homeWithLink(join(CLAUDE_DIR, 'channels'), join(real, CLAUDE_DIR, 'channels')),
     })],
-    ['a home holding a dangling .claude/channels/slack symlink', R.holdsSlackState, () => ({
-      launchHome: homeWithLink(PRELOAD_STATE_DIR_PATH, join(root, 'no-such-state')),
+    ['a home whose .config is a symlink to the fake real home’s .config, which holds Slack state', R.holdsSlackState, (real) => ({
+      launchHome: homeWithLink(XDG_CONFIG_DIR, join(real, XDG_CONFIG_DIR)),
     })],
+    ...DEFAULT_STATE_DIR_PATHS.map((path): LiveRow => [
+      `a home holding a dangling ${path} symlink`,
+      R.holdsSlackState,
+      () => ({ launchHome: homeWithLink(path, join(root, 'no-such-state')) }),
+    ]),
     ['a home whose .claude is a symlink to a directory in the fake real home', R.derivedPathInRealHome, () => ({
       launchHome: homeWithLink(CLAUDE_DIR, dirUnder('real/claude-copy')),
     })],
@@ -564,11 +575,15 @@ describe('launchHomeRefusal with LIVE_LAUNCH_HOME_PROBE (fixtures under the root
     ['an empty home under the root', undefined, () => dirUnder('home')],
     ['the OS temp directory itself', R.notUnderTempDir, () => osTempDir()],
     ['a dangling symlink to a path outside the OS temp directory', R.notUnderTempDir, () => linkUnder('home-link', join(outsideTemp(), 'home'))],
-    ['a home holding Slack state', R.holdsSlackState, () => {
-      const home = dirUnder('home')
-      dirUnder(join('home', PRELOAD_STATE_DIR_PATH))
-      return home
-    }],
+    ...DEFAULT_STATE_DIR_PATHS.map((path): [string, LaunchHomeRefusal, () => string] => [
+      `a home holding Slack state at ${path}`,
+      R.holdsSlackState,
+      () => {
+        const home = dirUnder('home')
+        dirUnder(join('home', path))
+        return home
+      },
+    ]),
     ['a home whose .claude is a dangling symlink outside the OS temp directory', R.derivedPathNotUnderTempDir, () => homeWithLink(CLAUDE_DIR, join(outsideTemp(), CLAUDE_DIR))],
     ['a home whose .claude/projects is a symlink to the OS temp directory itself', R.derivedPathNotUnderTempDir, () => homeWithLink(join(CLAUDE_DIR, 'projects'), osTempDir())],
     ['a home holding a .agent-director directory', R.holdsAgentDirector, () => {
@@ -671,9 +686,10 @@ describe('the preload guard in a bun test child', () => {
     return stderr.split('\n').filter((line) => line !== '' && !line.endsWith(`${basename(fixture)}:`))
   }
 
-  test.each(START_DIRS)('started from %s with a fake home holding .claude/channels/slack: refuses with its exit code and one line, loads no test file, changes nothing under the home and makes no directory', (_label, cwd) => {
+  describe.each([...DEFAULT_STATE_DIR_PATHS])('with a fake home holding %s', (stateDirPath) => {
+  test.each(START_DIRS)('started from %s: refuses with its exit code and one line, loads no test file, changes nothing under the home and makes no directory', (_label, cwd) => {
     const { ownTmp, home } = childTmpAndHome()
-    writeFileSync(join(dirUnder(join('tmp', 'home', PRELOAD_STATE_DIR_PATH)), 'server.log'), '')
+    writeFileSync(join(dirUnder(join('tmp', 'home', stateDirPath)), 'server.log'), '')
     const before = treeSnapshot(home)
 
     const run = runFixture(cwd, home, ownTmp)
@@ -684,6 +700,7 @@ describe('the preload guard in a bun test child', () => {
     expect(treeSnapshot(home)).toEqual(before)
     // Neither the preload HOME nor a fenced TMUX_TMPDIR was made beside the fake home.
     expect(readdirSync(ownTmp)).toEqual([basename(home)])
+  })
   })
 
   test.each(START_DIRS)('started from %s with an empty fake home: loads the fixture with homedir() the fake home and HOME the preload’s own', (_label, cwd) => {

@@ -22,10 +22,10 @@ CSCB install or against a real HOME. Script: `tests/integration/test-2-dryrun-sp
 ### Prerequisites
 The server from Test 1 must be running with its two-persona config (`alpha`
 and `bravo`). Check it is still alive using the daemon's own PID file (CSCB
-writes it to `~/.claude/channels/slack/server.pid` from inside the forked
+writes it to `~/.config/cscb/server.pid` from inside the forked
 child — `/tmp/server.pid` is not used):
 ```bash
-kill -0 $(cat ~/.claude/channels/slack/server.pid 2>/dev/null) 2>/dev/null && echo "server running" || echo "server not running"
+kill -0 $(cat ~/.config/cscb/server.pid 2>/dev/null) 2>/dev/null && echo "server running" || echo "server not running"
 ```
 If not running, fail this test.
 
@@ -37,7 +37,7 @@ both personas, and that the spawn was skipped for each one, the zero-channel
 persona `bravo` included. The log names each persona as `"<name>" (key=<key>)`.
 Match the strings literally (`grep -F`):
 ```bash
-LOG=~/.claude/channels/slack/server.log
+LOG=~/.config/cscb/server.log
 grep -F '[slack] Loaded persona config: 2 persona(s)' "$LOG"
 grep -F '[slack] startupSessionManager: 2 persona(s)' "$LOG"
 grep -F '[slack] dry-run: skipping spawn for "alpha" (key=alpha) cwd=/tmp/test-repo-a' "$LOG"
@@ -76,10 +76,10 @@ interject_status alpha             # expect 503: known persona, no connected ses
 ```
 
 ### Pass criteria
-- `~/.claude/channels/slack/server.log` contains `[slack] Loaded persona config: 2 persona(s)`
-- `~/.claude/channels/slack/server.log` contains `[slack] startupSessionManager: 2 persona(s)`
-- `~/.claude/channels/slack/server.log` contains `[slack] dry-run: skipping spawn for "alpha" (key=alpha) cwd=/tmp/test-repo-a`
-- `~/.claude/channels/slack/server.log` contains `[slack] dry-run: skipping spawn for "bravo" (key=bravo) cwd=/tmp/test-repo-b`
-- The last `~/.claude/channels/slack/server.log` line containing `[slack] startupSessionManager: complete — 2 persona(s):` contains `2 no-op`, `0 failed` and `0 not brought up`, each after `:` or `,` and followed by `,` or the end of the line
+- `~/.config/cscb/server.log` contains `[slack] Loaded persona config: 2 persona(s)`
+- `~/.config/cscb/server.log` contains `[slack] startupSessionManager: 2 persona(s)`
+- `~/.config/cscb/server.log` contains `[slack] dry-run: skipping spawn for "alpha" (key=alpha) cwd=/tmp/test-repo-a`
+- `~/.config/cscb/server.log` contains `[slack] dry-run: skipping spawn for "bravo" (key=bravo) cwd=/tmp/test-repo-b`
+- The last `~/.config/cscb/server.log` line containing `[slack] startupSessionManager: complete — 2 persona(s):` contains `2 no-op`, `0 failed` and `0 not brought up`, each after `:` or `,` and followed by `,` or the end of the line
 - `/interject` with `"persona": "no_such_persona"` returns 404
 - `/interject` with `"persona": "alpha"` returns 503

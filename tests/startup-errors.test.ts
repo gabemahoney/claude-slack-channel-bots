@@ -930,3 +930,38 @@ describe('b.jg5 SRJ-702, SRJ-704, SRJ-1013 (AC 64): a stopped kill retry posts n
     },
   )
 })
+
+// ---------------------------------------------------------------------------
+// The default log directory (b.fc4)
+// ---------------------------------------------------------------------------
+
+describe('recordStartupError without a logDir writes under the server\'s state directory (b.fc4)', () => {
+  /** `recordStartupError` with no `logDir` in a child with the fake home, SLACK_STATE_DIR unset, and `env` more. */
+  function recordWithoutLogDir(opts: { env?: Record<string, string> }): void {
+    const res = runInFakeHome({
+      modulePath: STARTUP_ERRORS_SRC,
+      call: 'mod.recordStartupError(input.classLabel, input.message, undefined, input.options)',
+      input: { classLabel: CLI_TEARDOWN_FAILED_LABEL, message: MESSAGE, options: { omitStderr: true } },
+      home,
+      ...opts,
+    })
+    expect(res.observedHomedir).toBe(home)
+    expect(res.status).toBe(0)
+  }
+
+  test('SLACK_STATE_DIR unset: <home>/.config/cscb/startup-errors.log, and nothing under ~/.claude', () => {
+    recordWithoutLogDir({})
+
+    expectEntry(linesOf(readFileSync(join(home, '.config', 'cscb', LOG_NAME), 'utf-8')).at(0))
+    expect(existsSync(join(home, '.claude'))).toBe(false)
+  })
+
+  test('SLACK_STATE_DIR unset and an absolute XDG_CONFIG_HOME: <XDG_CONFIG_HOME>/cscb/startup-errors.log, and nothing under <home>/.config', () => {
+    const xdg = join(root, 'xdg')
+
+    recordWithoutLogDir({ env: { XDG_CONFIG_HOME: xdg } })
+
+    expectEntry(linesOf(readFileSync(join(xdg, 'cscb', LOG_NAME), 'utf-8')).at(0))
+    expect(existsSync(join(home, '.config'))).toBe(false)
+  })
+})

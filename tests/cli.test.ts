@@ -1177,11 +1177,12 @@ describe('shared config path (SR-8.7)', () => {
     writeConfigFile(stateDir, { [PRE_PERSONA_KEY]: { cwd: join(root, 'work') } })
   }
 
-  test('production deps resolve the state dir, config path and loader with the server functions (static)', () => {
+  test('production deps resolve the state dir and config path with the CLI resolvers (b.fc4) and the loader with the server function (static)', () => {
     const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
     const props = objectProperties(code.slice(code.indexOf('const realDeps: CliDeps =')))
-    expect(props.get('resolveStateDir')).toBe('() => resolveServerStateDir()')
-    expect(props.get('resolveConfigPath')).toBe('() => resolveServerConfigPath()')
+    // b.fc4: the CLI resolves through the fallback that keeps a command on the old directory until the server has moved it.
+    expect(props.get('resolveStateDir')).toBe('() => resolveCliStateDir()')
+    expect(props.get('resolveConfigPath')).toBe('() => resolveCliConfigPath()')
     expect(props.get('loadConfig')).toBe('(path) => readAppliedPersonaConfig(path)')
     expect(code).toMatch(/import\s*\{[^}]*\breadAppliedPersonaConfig\b[^}]*\}\s*from\s*'\.\/reload\.ts'/)
   })
@@ -1992,6 +1993,32 @@ describe('start — daemon startup wait', () => {
     expect(stderr).toContain(`[slack] Server starting in background (PID ${DAEMON_PID})`)
     expect(b.exitTimes[0]).toBeGreaterThanOrEqual(200)
     expect(b.exitTimes[0]).toBeLessThan(200 + 2 * DAEMON_STARTUP_POLL_MS)
+  })
+
+  // b.fc4: the CLI chose its state directory (`stateDir`, the old one between an
+  // upgrade and the first start) before the daemon moved it; the daemon then
+  // writes its PID where the server's state directory is, and the parent
+  // polls that file too.
+  test("daemon writes its PID in the server's state directory, not the one the CLI chose: exit 0 with the starting-in-background line, before the bound", async () => {
+    const serverDir = join(root, 'server-state')
+    mkdirSync(serverDir)
+    const savedStateDir = process.env.SLACK_STATE_DIR
+    process.env.SLACK_STATE_DIR = serverDir
+    try {
+      const b = makeDeps({
+        daemon: ({ child, clock }) => { clock.setTimeout(() => writeFileSync(join(serverDir, 'server.pid'), `${child.pid}\n`), 200) },
+      })
+
+      await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
+
+      expect(existsSync(pidPath)).toBe(false)
+      expect(b.exitCodes).toEqual([0])
+      expect(stderr).toContain(`[slack] Server starting in background (PID ${DAEMON_PID})`)
+      expect(b.exitTimes[0]).toBeLessThan(200 + 2 * DAEMON_STARTUP_POLL_MS)
+    } finally {
+      if (savedStateDir === undefined) delete process.env.SLACK_STATE_DIR
+      else process.env.SLACK_STATE_DIR = savedStateDir
+    }
   })
 
   test('neither exit nor PID within the bound: exit 0 with the still-starting line, daemon never signalled', async () => {
@@ -4177,12 +4204,12 @@ describe('the teardown\'s report and where each line goes (b.jg5 SRJ-907, SRJ-90
     const mainBlock = code.slice(...balancedAfter(code, main[0]!, '{', '}'))
     const props = objectProperties(mainBlock.slice(mainBlock.indexOf('const realDeps: CliDeps =')))
     expect(props.get('appendServerLogLine')).toMatch(
-      /^\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*=>\s*appendLogLine\(\s*join\(\s*resolveServerStateDir\(\)\s*,\s*'server\.log'\s*\)\s*,\s*\1\s*,\s*\2\s*\)$/,
+      /^\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*=>\s*appendLogLine\(\s*join\(\s*resolveCliStateDir\(\)\s*,\s*'server\.log'\s*\)\s*,\s*\1\s*,\s*\2\s*\)$/,
     )
     const record = props.get('recordStartupErrorEntry')
     expect(record).toMatch(/^\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*=>\s*recordStartupError\(\s*\1\s*,\s*\2\s*,\s*undefined\s*,\s*\{[^}]*\}\s*\)$/)
     const options = objectProperties(record!.slice(record!.lastIndexOf('{')))
-    expect([...options].sort()).toEqual([['logDir', 'resolveServerStateDir()'], ['omitStderr', 'true']])
+    expect([...options].sort()).toEqual([['logDir', 'resolveCliStateDir()'], ['omitStderr', 'true']])
   })
 })
 

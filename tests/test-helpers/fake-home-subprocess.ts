@@ -12,7 +12,7 @@
  *   HOME is the fake home, PATH holds only the directories of
  *   `FAKE_HOME_CHILD_TOOLS` (checked to hold no agent-director entry),
  *   TMUX_TMPDIR is the helper's per-process temp dir, and SLACK_STATE_DIR
- *   and the JSON input are its extras. Nothing else from the parent env is
+ *   (when given), `env` and the JSON input are its extras. Nothing else from the parent env is
  *   passed on, so the Slack token variables and any other ambient credential
  *   never reach the child.
  * - A home that is the real home (`isRealHome`: the account's passwd home or
@@ -51,8 +51,15 @@ export interface FakeHomeRunOptions {
   input: unknown
   /** Launch-time HOME for the child: the test's own temp dir. */
   home: string
-  /** SLACK_STATE_DIR for the child: where startup-errors.log lands. */
-  stateDir: string
+  /**
+   * SLACK_STATE_DIR for the child: where startup-errors.log lands. Leave it
+   * out to start the child with SLACK_STATE_DIR unset, so the server's default
+   * state directory (`$XDG_CONFIG_HOME/cscb`, else `<home>/.config/cscb`, bug
+   * b.fc4) is under the fake home.
+   */
+  stateDir?: string
+  /** More variables for the child (`XDG_CONFIG_HOME`, say); never SLACK_STATE_DIR or the helper's input. */
+  env?: Record<string, string>
   /** Bound on the child run in ms; defaults to FAKE_HOME_SUBPROCESS_TIMEOUT_MS. */
   timeoutMs?: number
 }
@@ -80,7 +87,11 @@ export function runInFakeHome(opts: FakeHomeRunOptions): FakeHomeRunResult {
   const res = spawnSync('bun', ['-e', script], {
     env: hostSafeChildEnv(opts.home, {
       tools: FAKE_HOME_CHILD_TOOLS,
-      extras: { SLACK_STATE_DIR: opts.stateDir, FAKE_HOME_INPUT_JSON: JSON.stringify(opts.input) },
+      extras: {
+        ...opts.env,
+        ...(opts.stateDir === undefined ? {} : { SLACK_STATE_DIR: opts.stateDir }),
+        FAKE_HOME_INPUT_JSON: JSON.stringify(opts.input),
+      },
     }),
     encoding: 'utf-8',
     timeout: timeoutMs,

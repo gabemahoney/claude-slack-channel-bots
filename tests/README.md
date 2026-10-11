@@ -46,7 +46,7 @@ preload runs before it.
 The guard loads before any test file. It first checks the home the run was
 launched with (see When the guard refuses to start, below). It then points
 HOME, `SLACK_STATE_DIR` and `XDG_CONFIG_HOME` at a fresh temp directory
-(`XDG_CONFIG_HOME` decides where the crontable's default lies), drops every PATH
+(`XDG_CONFIG_HOME` decides where the state directory's default, and so the crontable's, lies), drops every PATH
 directory that holds an `agent-director` binary and unsets `TMUX` and
 `CLAUDE_CONFIG_DIR`. The rules tests follow on top of it are in
 `docs/testing-guide.md`. The tests also build their own temp homes and fake
@@ -61,7 +61,7 @@ bun install --ignore-scripts
 CSCB's own `postinstall` is for an operator's install. Run in a development
 tree, it leaves `~/.claude/skills/` alone (a checkout, or any tree outside a
 `node_modules` directory, is not an installed package; b.669), but it still
-writes skeleton files under the real HOME (`~/.claude/channels/slack/config.json`
+writes skeleton files under the real HOME (`~/.config/cscb/config.json`
 and `~/.claude/slack-mcp.json`) when they are missing. With scripts disabled,
 `scripts/fixup-bun-cache.ts` (the other half of `postinstall`, which restores
 files bun's extraction dropped from `node_modules/`) does not run either; run
@@ -72,7 +72,7 @@ is missing files.
 
 Bun fixes `os.homedir()` to the HOME `bun test` was launched with, and the
 guard cannot change it. `src/` code that calls `homedir()` directly (the state
-directory default, the crontable's default under `~/.config/cscb`, the Claude
+directory default (`~/.config/cscb`, or under `XDG_CONFIG_HOME`), the Claude
 config directory, the default transcript root, `~` expansion, the start gate's
 `state.db` path) resolves against that
 launch-time home for the whole run. So the guard refuses to start when that
@@ -94,7 +94,7 @@ this order and reports the first that applies:
 | `launch-home-in-real-home` | is your home directory (your `/etc/passwd` entry) or lies under it, symlinks resolved |
 | `launch-home-temp-dir-is-root` | with no `/etc/passwd` entry for your account, is checked against a temp directory (`TMPDIR`, else `/tmp`) that is `/`, symlinks resolved: every path lies under `/`, so the temp-directory rules below would accept any home |
 | `launch-home-not-under-temp-dir` | with no `/etc/passwd` entry for your account, does not lie strictly under the temp directory (`TMPDIR`, else `/tmp`), symlinks resolved; the temp directory itself is refused |
-| `launch-home-holds-slack-state` | has anything at `.claude/channels/slack` |
+| `launch-home-holds-slack-state` | has anything at `.config/cscb` (the state directory's default) or `.claude/channels/slack` (its old one) |
 | `launch-home-derived-path-in-real-home` | has a path the code derives from the home (`.claude`, `.claude/channels/slack`, `.claude/projects`, `.claude/skills`, `.claude/slack-mcp.json`, `.agent-director` or a file under it, `.config`, `.config/cscb` or `.config/cscb/crontab`) that leads into your home directory through a symlink, a dangling one included |
 | `launch-home-derived-path-not-under-temp-dir` | with no `/etc/passwd` entry for your account, has one of those paths leading out of the temp directory |
 | `launch-home-holds-agent-director` | has `.agent-director` or the standard agent-director install path |
@@ -121,7 +121,7 @@ outside your home, or unset it to use `/tmp`, then launch again. Do the same
 for `launch-home-temp-dir-is-root`, when `TMPDIR` resolves to `/`. Never reuse a
 real or long-lived home, and never work around the guard. Started with a new
 scratch HOME, every `homedir()` path lands in `$S`, never in the real
-`~/.claude/`, `~/.claude/channels/slack/`, `~/.config/cscb/` or
+`~/.claude/`, `~/.claude/channels/slack/` (the old state directory), `~/.config/cscb/` or
 `~/.agent-director/`.
 
 ## Docker integration suite
@@ -146,7 +146,7 @@ verdict. The verdict reader reports it, and its exit code is `/ci`'s: see
 Verdict file format for the verdict's shapes, and the skill for the report.
 
 The scripts run only in a shard container, never on a dev box or a host with
-a real CSCB install: they write to `~/.claude/channels/slack/`, start a server
+a real CSCB install: they write to `~/.config/cscb/`, start a server
 and spawn instances. If docker is not available, report the integration run
 as not done rather than running a script directly; `/ci` itself refuses such
 a run as `NOT RUN: docker does not answer: <error>`.
@@ -696,7 +696,7 @@ shim, with no store until 0.10.0's first `spawn`. Setup then:
   client (checked file for file). Its CLI there is the old CLI, and the build
   under test later takes the same install path;
 - writes the pre-persona `config.json` (two routed channels) to
-  `$HOME/.claude/channels/slack`, with the host's other files the runbook
+  `$HOME/.config/cscb`, with the host's other files the runbook
   names: a crontable targeting channels, an `/interject` caller file naming
   channels, `access.json` and the Slack token variables (fake tokens, in a
   file never sourced);
@@ -946,7 +946,7 @@ a config or credentials file from the host:
 - Instances are persona-keyed (`cscb_<key>`); `stop --stop-bots` names each
   persona it tears down.
 - Tests 1 to 3 share one config, written by Test 1 to
-  `~/.claude/channels/slack/config.json`: `alpha` (two channels, both
+  `~/.config/cscb/config.json`: `alpha` (two channels, both
   `delivery: all`, prompts to the first) and `bravo` (no channels, DMs on,
   prompts to `dm`). Test 2 checks the loaded persona count and the
   per-persona spawn skips against it.
@@ -1292,7 +1292,7 @@ Sourcing it, in both modes:
   printer and the drivers read;
 - makes a scratch root (`SCENARIO_ROOT`, `mktemp -d` under `/tmp`) and a
   first state dir under it, exported as `SLACK_STATE_DIR`, so a scenario never
-  touches `~/.claude/channels/slack/` or another script's state, and its first
+  touches `~/.config/cscb/` or another script's state, and its first
   `start` finds no `config.json.last-applied`;
 - picks a free loopback port (`SCENARIO_PORT`, 20000 to 29999, never 3100,
   which Tests 1 to 3's server keeps) for the scenario's config to name;

@@ -137,7 +137,7 @@ import {
 
 // ---------------------------------------------------------------------------
 // SLACK_STATE_DIR isolation — default emitTrail in the click handler would
-// otherwise land on the operator's real ~/.claude/channels/slack/.
+// otherwise land on the operator's real ~/.config/cscb/.
 // ---------------------------------------------------------------------------
 
 let trailTempDir: string

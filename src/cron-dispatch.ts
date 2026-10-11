@@ -194,8 +194,7 @@ export interface CronDispatcher {
  * format reference must carry this rationale forward.
  *
  * The base is the directory of `cronTablePath` as given, never of its real
- * path. Exported so the start's crontable migration (`cron-table-migration.ts`,
- * bug b.avm) checks each moved line with this same rule.
+ * path.
  */
 export function resolvePromptPath(promptPath: string, cronTablePath: string): string {
   const expanded = expandTilde(promptPath)

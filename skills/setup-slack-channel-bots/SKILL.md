@@ -78,13 +78,20 @@ operator at the README on the package's GitHub page.
 ### Step 2 — State directory and config.json
 
 The state directory is `SLACK_STATE_DIR` when it is set and non-empty, else
-`~/.claude/channels/slack`:
+`~/.config/cscb` (`$XDG_CONFIG_HOME/cscb` when the shell's `XDG_CONFIG_HOME`
+is an absolute path):
 
 ```bash
-STATE_DIR="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+STATE_DIR="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
 ls -l "$STATE_DIR/config.json" 2>/dev/null || echo "NOT_FOUND"
 ```
 
+- **Missing, with `SLACK_STATE_DIR` unset and a `config.json` in
+  `~/.claude/channels/slack`:** the host kept its state there under an
+  earlier release and its server has not started since the upgrade, which
+  moves it. Don't create a configuration in the new folder. Tell the operator
+  to run `claude-slack-channel-bots stop` (it finds the old directory), then
+  `claude-slack-channel-bots start`, and offer to continue afterwards.
 - **Missing:** postinstall writes a skeleton with an empty `personas` array.
   Ask the operator to run `bun src/postinstall.ts` from the package root, or to
   re-run the install's `bun pm -g trust claude-slack-channel-bots` step (README
@@ -103,7 +110,7 @@ Before any edit, record whether a server is running and whether the
 last-applied record exists. Steps 4 and 10 use both.
 
 ```bash
-STATE_DIR="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+STATE_DIR="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
 if [ -f "$STATE_DIR/server.pid" ] && kill -0 "$(cat "$STATE_DIR/server.pid")" 2>/dev/null; then
   echo "server: running"
 else
@@ -131,7 +138,7 @@ See the README's `## Channel modes`.
 Find the switch in the last-applied record and in `config.json`:
 
 ```bash
-STATE_DIR="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+STATE_DIR="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
 for f in config.json.last-applied config.json; do
   [ -f "$STATE_DIR/$f" ] && echo "$f: allow_invited_channels=$(jq '.allow_invited_channels' "$STATE_DIR/$f")"
 done
@@ -553,7 +560,7 @@ Explain the case that matches Step 3. Link to the README's `## Reload` section.
   confirms by renaming `config.json.pending` to `config.json.apply`:
 
   ```bash
-  cd "${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+  cd "${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
   mv config.json.pending config.json.apply
   ```
 

@@ -30,7 +30,7 @@
  * Isolation (b.av2 SR-13.2): every path is under the OS temp directory or the
  * `parentDir` the caller passes (the test's own `mkdtempSync` directory). The
  * helper never reads `SLACK_STATE_DIR` or `HOME` and never resolves
- * `~/.claude/channels/slack`. `cleanup()` removes everything it created and
+ * `~/.config/cscb` (or the old `~/.claude/channels/slack`). `cleanup()` removes everything it created and
  * nothing else; call it in `afterEach` or `finally`.
  *
  * SPDX-License-Identifier: MIT

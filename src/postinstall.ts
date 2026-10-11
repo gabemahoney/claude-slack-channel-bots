@@ -50,7 +50,8 @@
 import { existsSync, lstatSync, mkdirSync, writeFileSync, symlinkSync, readlinkSync, unlinkSync, renameSync } from 'fs'
 import { homedir } from 'os'
 import { dirname, join, resolve, sep } from 'path'
-import { MCP_SERVER_NAME, resolveServerStateDir } from './config.ts'
+import { MCP_SERVER_NAME } from './config.ts'
+import { resolveCliStateDir } from './state-dir-migration.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import type { InstallCheckResult } from './install-check.ts'
 
@@ -74,7 +75,7 @@ const CI_OFF_VALUES: ReadonlySet<string> = new Set(['', '0', 'false'])
 // ---------------------------------------------------------------------------
 
 export interface PostinstallOptions {
-  /** Override the state directory (defaults to the server's: a non-empty SLACK_STATE_DIR, else ~/.claude/channels/slack/) */
+  /** Override the state directory (defaults to the server's: a non-empty SLACK_STATE_DIR, else ~/.config/cscb/ (or the old ~/.claude directory until the server has moved it)) */
   stateDir?: string
   /** Override the MCP config path (defaults to ~/.claude/slack-mcp.json) */
   mcpConfigPath?: string
@@ -97,7 +98,10 @@ export interface PostinstallOptions {
    * function decides.
    */
   linkSkills?: boolean
-  /** The environment the CI check reads (defaults to process.env); only CI is read. */
+  /**
+   * The environment read for the CI check and for the state directory
+   * (`SLACK_STATE_DIR`, `XDG_CONFIG_HOME`); defaults to process.env.
+   */
   env?: NodeJS.ProcessEnv
 }
 
@@ -201,10 +205,14 @@ function manageSkillLinks(skillsTarget: string, packageSkillsDir: string): void 
 // ---------------------------------------------------------------------------
 
 export function runPostinstall(options: PostinstallOptions = {}): void {
-  // The server's state directory (resolveServerStateDir): an empty
-  // SLACK_STATE_DIR means unset, and a relative one resolves the same way.
+  // The server's state directory: an empty SLACK_STATE_DIR means unset, and a
+  // relative one resolves the same way. Bug b.fc4: npm runs this on an upgrade,
+  // before the server restarts and moves its old state directory to the new
+  // default; while the configuration is still in the old one, that is the
+  // directory used (resolveCliStateDir), so no empty skeleton config.json is
+  // written into the new folder, where the move would find it in conflict.
   const home = (): string => options.homeDir ?? homedir()
-  const stateDir = options.stateDir ?? resolveServerStateDir(options.homeDir)
+  const stateDir = options.stateDir ?? resolveCliStateDir(options.homeDir, options.env ?? process.env)
 
   const mcpConfigPath =
     options.mcpConfigPath ?? join(home(), '.claude', 'slack-mcp.json')

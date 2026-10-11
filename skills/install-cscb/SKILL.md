@@ -20,7 +20,7 @@ names the README's switch-over runbook instead of running anything.
 ## When to invoke
 
 Invoke this skill when CSCB's startup gate emits one of these class labels
-in `~/.claude/channels/slack/startup-errors.log`:
+in `~/.config/cscb/startup-errors.log`:
 
 - `ad-system-install-not-found`
 - `ad-system-install-too-old`
@@ -274,7 +274,7 @@ service=cscb` lists them once the server is running.
 - This skill runs no install of the agent-director client. The client,
   `agent-director@0.11.0`, comes installed with CSCB.
 - This skill does not touch the persona configuration
-  (`~/.claude/channels/slack/config.json`), the persona credentials
+  (`~/.config/cscb/config.json`), the persona credentials
   files or the reload files beside the configuration. It only acts on
   the system-wide `agent-director` install.
 - The skill is callable repeatedly; each invocation re-runs Step 1

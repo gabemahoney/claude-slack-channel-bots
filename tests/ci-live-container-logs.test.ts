@@ -364,8 +364,8 @@ describe('the files copied', () => {
 
   test("the state dir is the helpers' $S under the test user's home, boot-start.log is where the entrypoint's boot start logs, and agent-director's dir is that home's ~/.agent-director, the store CSCB pins", () => {
     const helpers = readFileSync(join(REPO, 'docker', 'live', 'cscb-live-helpers.sh'), 'utf-8')
-    expect(helpers).toContain('\nS=~/.claude/channels/slack\n')
-    expect(CONTAINER_STATE_DIR).toBe(`${CONTAINER_HOME}/.claude/channels/slack`)
+    expect(helpers).toContain('\nS=~/.config/cscb\n')
+    expect(CONTAINER_STATE_DIR).toBe(`${CONTAINER_HOME}/.config/cscb`)
     // The boot start runs as the test user, so its $HOME is CONTAINER_HOME.
     const entrypoint = readFileSync(join(REPO, 'docker', 'live', 'entrypoint.sh'), 'utf-8')
     expect(entrypoint).toContain('claude-slack-channel-bots start >> "$HOME/cscb-live/boot-start.log" 2>&1')
@@ -746,8 +746,8 @@ describe('collectContainerLogs', () => {
     put(root, BOOT_START, `boot start ${SECRET}\n`)
     put(root, AD('errors.log'), '')
     put(root, AD('ad-trail.jsonl'), '{"event":"ad.spawn"}\n')
-    symlinkSync(hostPath(root, `${CONTAINER_HOME}/.config/cscb/persona_a-credentials.json`), hostPath(root, STATE('server.log.2')))
-    put(root, `${CONTAINER_HOME}/.config/cscb/persona_a-credentials.json`, `{"bot_token":"${BOT}"}\n`)
+    symlinkSync(hostPath(root, `${CONTAINER_HOME}/.config/cscb-credentials/persona_a-credentials.json`), hostPath(root, STATE('server.log.2')))
+    put(root, `${CONTAINER_HOME}/.config/cscb-credentials/persona_a-credentials.json`, `{"bot_token":"${BOT}"}\n`)
   }
 
   test('copies each file redacted (boot-start.log included), notes the cut, the missing and the skipped file, and writes index.txt last', async () => {

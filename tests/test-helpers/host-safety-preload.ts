@@ -23,7 +23,7 @@
  *    `launchHomeRefusal(launchHome, passwdHome(), LIVE_LAUNCH_HOME_PROBE)`
  *    decides (see its doc in `host-safe-env.ts`: a home that is not
  *    absolute; the real home or a path under it; a home holding
- *    `.claude/channels/slack`; a home one of whose `homedir()`-derived paths,
+ *    `.config/cscb` or `.claude/channels/slack`; a home one of whose `homedir()`-derived paths,
  *    `LAUNCH_HOME_DERIVED_PATHS`, resolves through a symlink into the real
  *    home; a home holding an agent-director install; and, when the account
  *    has no `/etc/passwd` entry, a home or derived path that does not resolve
