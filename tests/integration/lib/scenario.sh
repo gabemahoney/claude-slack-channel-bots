@@ -24,10 +24,12 @@
 #   HOME, agent-director install and store, and tmux server, all under
 #   SCENARIO_ROOT, with the agent-director shim in front of the binary (see
 #   "fmk mode" below);
-# - shared mode, for every other script (test-5 to test-12, and test-29):
+# - shared mode, for every other script (test-5 to test-12, test-29 and test-30):
 #   HOME, PATH, the agent-director store and the tmux server stay the
 #   container's, as the scripts found them, and no shim is installed (test-12
-#   checks where the hook commands resolve).
+#   checks where the hook commands resolve). The exception is test-30, which
+#   swaps HOME per layout (a fresh directory under SCENARIO_ROOT for each) and
+#   links the container's `$HOME/.agent-director` into it.
 #
 # What sourcing does, in both modes:
 # - refuses outside a cscb-ci image (above);
@@ -38,7 +40,7 @@
 # - makes the scenario's scratch root (SCENARIO_ROOT, `mktemp -d` under /tmp,
 #   exported, so every process the scenario starts carries it in its
 #   environment) and a first state dir under it, exported as SLACK_STATE_DIR,
-#   so the scenario never touches the default state dir (~/.config/cscb) or another
+#   so the scenario never touches the default state dir (~/.config/claude-slack-channel-bots) or another
 #   script's state (a fresh state dir has no config.json.last-applied);
 # - in fmk mode, sets up the scenario's HOME, tmux, PATH and agent-director
 #   install (see "fmk mode");
@@ -1082,7 +1084,7 @@
 #   violating line written after them (while the trap stopped a server, for
 #   example) fails the run, its FAIL line saying it came after the closing
 #   assertions.
-# Shared-mode scripts (test-5 to test-12, and test-29) have no closing
+# Shared-mode scripts (test-5 to test-12, test-29 and test-30) have no closing
 # assertions, no tmux shim and no record.
 #
 # Seeding rules (fmk mode; b.jg5 SRJ-1306, agent-director's handoff rev 15 and

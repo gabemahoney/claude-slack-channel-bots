@@ -31,7 +31,7 @@ Read this before turning fungible mode on. Each persona's Claude worker runs wit
 The audit lines in `server.log` are `persona-invited-channel`, logged the first time a persona hears a channel in fungible mode (naming the channel, `public` or `private`, and its channel delivery), and `persona-channel-delivery-set`, logged for each stored `set_channel_delivery` choice. The debugging skill explains both ([`persona-invited-channel`](../skills/debug-slack-channel-bots/SKILL.md#persona-invited-channel), [`persona-channel-delivery-set`](../skills/debug-slack-channel-bots/SKILL.md#persona-channel-delivery-set)). To list them:
 
 ```sh
-grep -E 'persona-(invited-channel|channel-delivery-set)' ~/.config/cscb/server.log*
+grep -E 'persona-(invited-channel|channel-delivery-set)' ~/.config/claude-slack-channel-bots/server.log*
 ```
 
 A persona logs a channel's `persona-invited-channel` line only once until the server restarts or the persona is brought up fresh, so on a long-running server, log rotation can discard a channel's only audit line (see [Server log rotation](troubleshooting.md#server-log-rotation)). After a restart, the first event from each channel a persona hears in fungible mode logs its line again.
@@ -51,7 +51,7 @@ The switch changes through a confirmed edit, like every other setting:
 Before you turn it on, review each persona's app's channel memberships in Slack, private channels included: each one becomes a channel the persona serves. Past `unclaimed-channel` lines in `server.log` show channels whose messages reached a persona's app with no persona serving them:
 
 ```sh
-grep unclaimed-channel ~/.config/cscb/server.log*
+grep unclaimed-channel ~/.config/claude-slack-channel-bots/server.log*
 ```
 
 **Turning it off.** The change is checked by the declarative rules, so each persona needs a valid declarative section: a persona whose `channels` or `permission_prompts` breaks a declarative-mode rule makes the change `INVALID` (see [Load-time rules](configuration.md#load-time-rules)). From the next event, each persona serves its listed channels again, each at its `delivery`. Turning it off changes no stored choice on disk: the choices stop applying, and they apply again when fungible mode is turned back on.
@@ -89,13 +89,13 @@ Invite each persona's Slack app to the channels it should serve, and `triage`'s 
   "personas": [
     {
       "name": "triage",
-      "credentials_file": "~/.config/cscb/triage-credentials.json",
+      "credentials_file": "~/.config/claude-slack-channel-bots/triage-credentials.json",
       "working_directory": "~/projects/triage",
       "invited": { "permission_prompts": "C0123456789" }
     },
     {
       "name": "concierge",
-      "credentials_file": "~/.config/cscb/concierge-credentials.json",
+      "credentials_file": "~/.config/claude-slack-channel-bots/concierge-credentials.json",
       "working_directory": "~/projects/concierge",
       "dm": { "enabled": true, "contact": "U0123456789" }
     }

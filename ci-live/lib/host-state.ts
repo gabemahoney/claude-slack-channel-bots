@@ -4,9 +4,9 @@
  * - the host's `service=cscb` agent-director rows (instance IDs);
  * - the host's `slack_bot_*` / `cscb_*` tmux sessions;
  * - the PID listening on host port 3100 (read from /proc, nothing connects);
- * - the sha256 of the host's `~/.config/cscb/config.json` (bug b.fc4; a host whose
- *   server has not yet moved its state directory still has it in the old
- *   default, `hostConfigPaths`).
+ * - the sha256 of the host's `~/.config/claude-slack-channel-bots/config.json` (bug
+ *   b.smv; a host whose server has not yet moved its state directory still has
+ *   it in an old default, `hostConfigPaths`).
  *
  * Only reads: `agent-director list`, `tmux ls`, /proc and a file hash. Never
  * a start, stop, kill, connect or write. The probes read the state the
@@ -120,12 +120,18 @@ export const TMUX_NO_SERVER_RE = /no server running|error connecting to .*\(No s
 
 /**
  * The host's config.json, in the order read: the state directory's default
- * (`~/.config/cscb`, bug b.fc4), then the old default's (the `slack` directory
- * in `.claude/channels` under the home), which a host keeps until its server's first start on the
- * new default has moved it (the old one is then a link to the new one).
+ * (`~/.config/claude-slack-channel-bots`, bug b.smv), then the one 0.14.0 and
+ * 0.15.0 used (`~/.config/cscb`), then the oldest (the `slack` directory in
+ * `.claude/channels` under the home), which a host keeps until its server's
+ * first start on the new default has moved it (each old one is then a link to
+ * the new one).
  */
 export function hostConfigPaths(home: string): string[] {
-  return [join(home, '.config', 'cscb', 'config.json'), join(home, '.claude', 'channels', 'slack', 'config.json')]
+  return [
+    join(home, '.config', 'claude-slack-channel-bots', 'config.json'),
+    join(home, '.config', 'cscb', 'config.json'),
+    join(home, '.claude', 'channels', 'slack', 'config.json'),
+  ]
 }
 
 export async function snapshotHost(deps: HostProbeDeps, home: string): Promise<HostSnapshot> {

@@ -2633,16 +2633,16 @@ describe('resolveServerConfigPath / resolveServerStateDir (b.av2 SR-1.1)', () =>
   test.each([
     ['SLACK_STATE_DIR unset', {}],
     ['SLACK_STATE_DIR empty', { SLACK_STATE_DIR: '' }],
-  ])('%s gives <home>/.config/cscb/config.json under the injected home, outside ~/.claude', (_label, env) => {
-    expect(resolveServerStateDir(home, env)).toBe(join(home, '.config', 'cscb'))
-    expect(resolveServerConfigPath(home, env)).toBe(join(home, '.config', 'cscb', 'config.json'))
+  ])('%s gives <home>/.config/claude-slack-channel-bots/config.json under the injected home, outside ~/.claude', (_label, env) => {
+    expect(resolveServerStateDir(home, env)).toBe(join(home, '.config', 'claude-slack-channel-bots'))
+    expect(resolveServerConfigPath(home, env)).toBe(join(home, '.config', 'claude-slack-channel-bots', 'config.json'))
     expect(resolveServerStateDir(home, env).startsWith(join(home, '.claude'))).toBe(false)
   })
 
   test.each<[string, NodeJS.ProcessEnv, string]>([
-    ['SLACK_STATE_DIR unset: an absolute XDG_CONFIG_HOME is honoured', { XDG_CONFIG_HOME: '/xdg/conf' }, '/xdg/conf/cscb'],
-    ['SLACK_STATE_DIR unset: an empty XDG_CONFIG_HOME is ignored', { XDG_CONFIG_HOME: '' }, '$HOME/.config/cscb'],
-    ['SLACK_STATE_DIR unset: a relative XDG_CONFIG_HOME is ignored', { XDG_CONFIG_HOME: 'rel/conf' }, '$HOME/.config/cscb'],
+    ['SLACK_STATE_DIR unset: an absolute XDG_CONFIG_HOME is honoured', { XDG_CONFIG_HOME: '/xdg/conf' }, '/xdg/conf/claude-slack-channel-bots'],
+    ['SLACK_STATE_DIR unset: an empty XDG_CONFIG_HOME is ignored', { XDG_CONFIG_HOME: '' }, '$HOME/.config/claude-slack-channel-bots'],
+    ['SLACK_STATE_DIR unset: a relative XDG_CONFIG_HOME is ignored', { XDG_CONFIG_HOME: 'rel/conf' }, '$HOME/.config/claude-slack-channel-bots'],
     ['SLACK_STATE_DIR wins over XDG_CONFIG_HOME', { SLACK_STATE_DIR: '/srv/state', XDG_CONFIG_HOME: '/xdg/conf' }, '/srv/state'],
   ])('%s', (_label, env, expected) => {
     expect(resolveServerStateDir(home, env)).toBe(expected.replace('$HOME', home))
@@ -2658,9 +2658,9 @@ describe('resolveServerConfigPath / resolveServerStateDir (b.av2 SR-1.1)', () =>
     expect(resolveServerConfigPath(home)).toBe(join(second, 'config.json'))
     delete process.env['SLACK_STATE_DIR']
     delete process.env['XDG_CONFIG_HOME']
-    expect(resolveServerConfigPath(home)).toBe(join(home, '.config', 'cscb', 'config.json'))
+    expect(resolveServerConfigPath(home)).toBe(join(home, '.config', 'claude-slack-channel-bots', 'config.json'))
     process.env['XDG_CONFIG_HOME'] = join(dir, 'xdg')
-    expect(resolveServerConfigPath(home)).toBe(join(dir, 'xdg', 'cscb', 'config.json'))
+    expect(resolveServerConfigPath(home)).toBe(join(dir, 'xdg', 'claude-slack-channel-bots', 'config.json'))
   })
 })
 

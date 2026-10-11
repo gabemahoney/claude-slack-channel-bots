@@ -239,7 +239,7 @@ has_anti_marker() {
 #
 # A deliberate, greppable heading that a ticket carries when its fix landed in a
 # file OUTSIDE this repository (e.g. `~/startup/start-all.sh`, the bots' append
-# system prompt at `~/.config/cscb/system-prompt.md`), so no commit on
+# system prompt at `~/.config/claude-slack-channel-bots/system-prompt.md`), so no commit on
 # main can ever land it. The heading NAMES the out-of-repo artifact:
 #
 #     ## +closed:out-of-repo ~/startup/start-all.sh

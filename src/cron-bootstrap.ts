@@ -14,7 +14,7 @@
  * untouched byte-for-byte; the losing side of a create race swallows EEXIST.
  *
  * The parent directory is the caller's: for the default location (the state
- * directory, `~/.config/cscb/` unless `XDG_CONFIG_HOME` or `SLACK_STATE_DIR`
+ * directory, `~/.config/claude-slack-channel-bots/` unless `XDG_CONFIG_HOME` or `SLACK_STATE_DIR`
  * says otherwise), holds `config.json`, so it exists before the scheduler
  * starts, and nothing creates the directory of a `cron_table_path` the
  * operator wrote.

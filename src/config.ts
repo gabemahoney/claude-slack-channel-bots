@@ -66,8 +66,12 @@ export const CONFIG_FILE_NAME = 'config.json'
  */
 export const XDG_CONFIG_HOME_ENV = 'XDG_CONFIG_HOME'
 
-/** CSCB's own directory under the XDG configuration directory: the default state directory (bugs b.fc4, b.avm). */
-export const CSCB_XDG_DIR_NAME = 'cscb'
+/**
+ * CSCB's own directory under the XDG configuration directory: the default state directory (bugs b.fc4, b.avm,
+ * b.smv). Named after the package; releases 0.14.0 and 0.15.0 used `cscb`, an acronym that could clash with another
+ * app (`LEGACY_XDG_DIR_NAME` in `state-dir-migration.ts`).
+ */
+export const CSCB_XDG_DIR_NAME = 'claude-slack-channel-bots'
 
 /** The crontable's file name, in its default directory and beside `config.json` alike. */
 export const CRON_TABLE_FILE_NAME = 'crontab'
@@ -319,8 +323,8 @@ export interface ServerSettingsInput {
   /**
    * Path to the cscb_cron crontable file (b.he5 PD-5). Optional: when omitted,
    * defaults to `resolveDefaultCronTablePath` (bug b.avm): with
-   * `SLACK_STATE_DIR` unset, `$XDG_CONFIG_HOME/cscb/crontab`
-   * (`~/.config/cscb/crontab`), outside `~/.claude`; with it set,
+   * `SLACK_STATE_DIR` unset, `$XDG_CONFIG_HOME/claude-slack-channel-bots/crontab`
+   * (`~/.config/claude-slack-channel-bots/crontab`), outside `~/.claude`; with it set,
    * `<config dir>/crontab`, where `<config dir>` is the directory of the
    * config file actually loaded. `~` is expanded and the path resolved to
    * absolute. Config carries only this pointer, never schedules.
@@ -1812,16 +1816,17 @@ export function resolvePersonaConfig(
 /**
  * The server's state directory, the one definition of the default (bug
  * b.fc4): `SLACK_STATE_DIR` (made absolute) when it is set and non-empty,
- * otherwise `<XDG config dir>/cscb` (`resolveXdgConfigHome`), so
- * `~/.config/cscb` unless `XDG_CONFIG_HOME` names another directory.
+ * otherwise `<XDG config dir>/claude-slack-channel-bots` (`resolveXdgConfigHome`), so
+ * `~/.config/claude-slack-channel-bots` unless `XDG_CONFIG_HOME` names another directory.
  * `config.json`, its `.pending`, `.apply` and `.last-applied` files,
  * `channel-delivery.json`, the logs, the PID file and the crontable all live
  * here. The default sits outside `~/.claude` because
  * Claude Code asks the user before every write under `.claude`, which stalled
- * every unattended configuration change by an agent. Every earlier release
- * kept it in the `slack` directory under `~/.claude/channels`;
+ * every unattended configuration change by an agent. Releases up to 0.13
+ * kept it in the `slack` directory under `~/.claude/channels`, and 0.14.0 and
+ * 0.15.0 in `<XDG config dir>/cscb`;
  * `src/state-dir-migration.ts` moves an existing one at the server's start
- * and leaves a symbolic link at the old name. The variable and the home
+ * and leaves a symbolic link at each old name. The variable and the home
  * directory are read at call time, never at import.
  *
  * Pure: touches no file. A command that runs before the server's first start
@@ -1861,8 +1866,8 @@ export function resolveXdgConfigHome(home?: string, env: NodeJS.ProcessEnv = pro
  * The crontable's default path, used when `cron_table_path` is absent (bugs
  * b.avm, b.fc4). The one definition of the default, used by the loader.
  *
- * - `SLACK_STATE_DIR` unset (a default install): `<XDG config dir>/cscb/crontab`
- *   (`resolveXdgConfigHome`), so `~/.config/cscb/crontab` unless
+ * - `SLACK_STATE_DIR` unset (a default install): `<XDG config dir>/claude-slack-channel-bots/crontab`
+ *   (`resolveXdgConfigHome`), so `~/.config/claude-slack-channel-bots/crontab` unless
  *   `XDG_CONFIG_HOME` names another directory: the default state directory
  *   (`resolveServerStateDir`), outside `~/.claude`, which Claude Code asks
  *   the user about before every write.
@@ -1891,7 +1896,7 @@ export function resolveDefaultCronTablePath(
 /**
  * The configuration file the server loads (b.av2 SR-1.1): `config.json` in
  * the state directory (`resolveServerStateDir`). With `SLACK_STATE_DIR` unset
- * this is `~/.config/cscb/config.json`. The one definition of the
+ * this is `~/.config/claude-slack-channel-bots/config.json`. The one definition of the
  * location: the server and the CLI both use it. Computed at call time.
  *
  * @param home  Home directory; defaults to the OS home, read only when needed.

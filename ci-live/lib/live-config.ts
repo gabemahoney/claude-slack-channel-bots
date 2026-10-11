@@ -10,7 +10,7 @@
  * results' Notes record). The configuration also names the container's
  * crontable (`cron_table_path`, `CONTAINER_CRON_TABLE_PATH`), which the
  * wizard leaves out: the path is the default's (bug b.fc4: the state
- * directory, `~/.config/cscb`, now holds the crontable), written out so the
+ * directory, `~/.config/claude-slack-channel-bots`, now holds the crontable), written out so the
  * start's default-crontable preparation is not in play. Neither the configuration it writes nor D's entry
  * carries the invited-channel switch or an `invited` section: every check
  * before Check 30 runs with the switch absent (b.deo SRI-1507).
@@ -45,12 +45,12 @@ export interface WorkspaceIds {
 }
 
 /**
- * The container's state directory (the default, `~/.config/cscb` since bug
- * b.fc4; no SLACK_STATE_DIR). The runner's read-only credentials mount is a
+ * The container's state directory (the default, `~/.config/claude-slack-channel-bots`
+ * since bug b.smv; no SLACK_STATE_DIR). The runner's read-only credentials mount is a
  * sibling directory, `CONTAINER_CREDENTIALS_DIR` (`~/.config/cscb-credentials`),
  * so the server can write here.
  */
-export const CONTAINER_STATE_DIR = '/home/testuser/.config/cscb'
+export const CONTAINER_STATE_DIR = '/home/testuser/.config/claude-slack-channel-bots'
 export const SYSTEM_PROMPT_PATH = `${CONTAINER_STATE_DIR}/system-prompt.md`
 
 /**

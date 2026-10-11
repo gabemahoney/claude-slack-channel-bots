@@ -514,17 +514,19 @@ fi
 # release broke when it did not. Paths honor SLACK_STATE_DIR (the same override
 # src/postinstall.ts reads), so this block is drivable against a temp state dir.
 #
-# The state dir is the server's (b.fc4: ${XDG_CONFIG_HOME:-~/.config}/cscb, outside
-# ~/.claude where Claude Code asks before every write), chosen the way
+# The state dir is the server's (b.smv: ${XDG_CONFIG_HOME:-~/.config}/claude-slack-channel-bots,
+# outside ~/.claude where Claude Code asks before every write), chosen the way
 # src/state-dir-migration.ts's resolveCliStateDir does: until the daemon's first
-# start on the new default has moved the old directory (~/.claude/channels/slack,
-# which then becomes a link to the new one), the old directory is the one that
-# holds the real config.json and the running old daemon's server.pid, and this
-# script runs right after the npm install, before any bounce. So: the old
-# directory while a live old server's PID file is in it (whatever the new one
-# holds), or while it is a directory (real, or a link to another directory)
-# holding config.json (or its last-applied record, or a PID file) and the new
-# one holds neither, else the new one. SLACK_STATE_DIR wins.
+# start on the new default has moved the old directories (${XDG_CONFIG_HOME:-~/.config}/cscb,
+# which 0.14.0 and 0.15.0 used, and ~/.claude/channels/slack, which 0.13 and
+# earlier used; each then becomes a link to the new one), an old directory is
+# the one that holds the real config.json and the running old daemon's
+# server.pid, and this script runs right after the npm install, before any
+# bounce. So: an old directory while a live old server's PID file is in it
+# (whatever the new one holds), or while it is a directory (real, or a link to
+# another directory) holding config.json (or its last-applied record, or a PID
+# file) and the new one holds neither, else the new one. The newer old
+# directory (cscb) is looked at before the older one. SLACK_STATE_DIR wins.
 resolve_state_dir() {
   if [ -n "${SLACK_STATE_DIR:-}" ]; then
     printf '%s\n' "${SLACK_STATE_DIR}"
@@ -535,39 +537,47 @@ resolve_state_dir() {
     /*) ;;
     *) xdg="${HOME}/.config" ;;
   esac
-  local new_dir="${xdg}/cscb"
-  local old_dir="${HOME}/.claude/channels/slack"
+  local new_dir="${xdg}/claude-slack-channel-bots"
+  local old_dirs=("${xdg}/cscb" "${HOME}/.claude/channels/slack")
+  local old_dir old_pid
+  local -a live_old_dirs=()
   # Neither a directory of its own nor the new one (absent, a file, migrated:
-  # a link to the new directory, or the reverse link): the new directory.
-  if [ ! -d "${old_dir}" ] || [ "${old_dir}" -ef "${new_dir}" ]; then
-    printf '%s\n' "${new_dir}"
-    return 0
-  fi
-  # An old server running on it (server.pid a regular file naming a live
-  # process): the old directory, whatever the new one holds. Mirrors
+  # a link to the new directory, or the reverse link) is not an old directory.
+  for old_dir in "${old_dirs[@]}"; do
+    if [ -d "${old_dir}" ] && ! [ "${old_dir}" -ef "${new_dir}" ]; then
+      live_old_dirs+=("${old_dir}")
+    fi
+  done
+  # An old server running on one (server.pid a regular file naming a live
+  # process): that old directory, whatever the new one holds. Mirrors
   # runningLegacyServer in src/state-dir-migration.ts.
-  local old_pid=""
-  if [ -f "${old_dir}/server.pid" ] && [ ! -L "${old_dir}/server.pid" ]; then
-    read -r old_pid < "${old_dir}/server.pid" 2>/dev/null || true
-    case "${old_pid}" in
-      ''|*[!0-9]*) ;;
-      *)
-        if kill -0 "${old_pid}" 2>/dev/null; then
-          printf '%s\n' "${old_dir}"
-          return 0
-        fi
-        ;;
-    esac
+  for old_dir in ${live_old_dirs[@]+"${live_old_dirs[@]}"}; do
+    old_pid=""
+    if [ -f "${old_dir}/server.pid" ] && [ ! -L "${old_dir}/server.pid" ]; then
+      read -r old_pid < "${old_dir}/server.pid" 2>/dev/null || true
+      case "${old_pid}" in
+        ''|*[!0-9]*) ;;
+        *)
+          if kill -0 "${old_pid}" 2>/dev/null; then
+            printf '%s\n' "${old_dir}"
+            return 0
+          fi
+          ;;
+      esac
+    fi
+  done
+  # Else the first old directory while it holds a configuration (config.json
+  # or its last-applied record, as CONFIG_MARKER_NAMES) or a PID file and the
+  # new one holds no configuration.
+  if [ ! -e "${new_dir}/config.json" ] && [ ! -e "${new_dir}/config.json.last-applied" ]; then
+    for old_dir in ${live_old_dirs[@]+"${live_old_dirs[@]}"}; do
+      if [ -e "${old_dir}/config.json" ] || [ -e "${old_dir}/config.json.last-applied" ] || [ -e "${old_dir}/server.pid" ] || [ -L "${old_dir}/server.pid" ]; then
+        printf '%s\n' "${old_dir}"
+        return 0
+      fi
+    done
   fi
-  # Else the old directory while it holds a configuration (config.json or its
-  # last-applied record, as CONFIG_MARKER_NAMES) or a PID file and the new one
-  # holds no configuration.
-  if { [ -e "${old_dir}/config.json" ] || [ -e "${old_dir}/config.json.last-applied" ] || [ -e "${old_dir}/server.pid" ] || [ -L "${old_dir}/server.pid" ]; } \
-    && [ ! -e "${new_dir}/config.json" ] && [ ! -e "${new_dir}/config.json.last-applied" ]; then
-    printf '%s\n' "${old_dir}"
-  else
-    printf '%s\n' "${new_dir}"
-  fi
+  printf '%s\n' "${new_dir}"
 }
 SR74B_STATE_DIR="$(resolve_state_dir)"
 SR74B_MCP_CONFIG="${HOME}/.claude/slack-mcp.json"

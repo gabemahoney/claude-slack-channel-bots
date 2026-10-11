@@ -11,7 +11,7 @@
  *
  * <stateDir> resolution (`resolveServerStateDir`, config.ts, the one definition):
  *   SLACK_STATE_DIR env var → resolve(SLACK_STATE_DIR)
- *   fallback                → <XDG config home>/cscb (~/.config/cscb/)
+ *   fallback                → <XDG config home>/claude-slack-channel-bots (~/.config/claude-slack-channel-bots/)
  *
  * Never throws. Never calls process.exit. Falls back to stderr-only on disk
  * failure and emits a one-line warning.

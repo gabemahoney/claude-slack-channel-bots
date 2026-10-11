@@ -33,8 +33,12 @@
 #   never exported (the scenario's harness helpers read it as a plain shell
 #   variable naming the directory in use), so no CSCB process, old or new,
 #   sees it. The build under test's default state directory is
-#   $HOME/.config/cscb since b.fc4; it migrates the old directory there, once, at
-#   its first start (step 10), and leaves a symbolic link at the old name.
+#   $HOME/.config/claude-slack-channel-bots since b.smv; it migrates the old
+#   directory there, once, at its first start (step 10), and leaves a symbolic
+#   link at the old name. The state is laid out the way a real host of 0.13 or
+#   earlier has it, all of it in $HOME/.claude/channels/slack (a real
+#   directory), with neither $HOME/.config/cscb nor the new directory made
+#   beforehand. The 0.14.0 and 0.15.0 layouts are test-30's.
 # - `seed_prepersona_fleet` seeds one row per routed channel on 0.10.0, named
 #   and labelled as the old package does (instance id
 #   `cscb_<name>_<channel id>`, session `slack_bot_<name>_<channel id>`,
@@ -165,13 +169,15 @@
 #       showed each row pending, and how many fell inside that stretch, are
 #       recorded. Before the start, the old state directory is a real directory
 #       and the new default one does not exist; after it, the build under test
-#       has moved the old directory whole to $HOME/.config/cscb: config.json,
-#       crontable, access.json, the credentials files, server.pid and server.log
-#       are there, $HOME/.claude/channels/slack is a symbolic link to it, and
+#       has moved the old directory whole to
+#       $HOME/.config/claude-slack-channel-bots: config.json, crontable,
+#       access.json, the credentials files, server.pid and server.log are
+#       there, $HOME/.claude/channels/slack is a symbolic link to it, and
 #       server.log carries the state-migrate line for the whole-directory
-#       rename once. From there the script reads the new directory (legs B and
-#       C included). The post-install check is recorded in the switch-over log,
-#       as the runbook says, and nowhere else. Then leg A's checks.
+#       rename once and no state-migrate warning. From there the script reads
+#       the new directory (legs B and C included). The post-install check is
+#       recorded in the switch-over log, as the runbook says, and nowhere else.
+#       Then leg A's checks.
 #   11  the expire and prompt-wording substitutions.
 #
 # Leg A's checks (SRJ-1402, AC 12), each its own `fail` naming the persona or
@@ -433,12 +439,14 @@ RUNBOOK_PKG="${STAGED_PKG}"
 # The two state directories. The old 0.10.0 package keeps everything, config.json
 # included, in OLD_STATE_DIR, and its CLI reads config.json from there whatever
 # SLACK_STATE_DIR says (it is never exported here anyway). The build under test
-# defaults to NEW_STATE_DIR since b.fc4 and, at its first start (step 10), moves
+# defaults to NEW_STATE_DIR since b.smv and, at its first start (step 10), moves
 # OLD_STATE_DIR there and leaves a symbolic link at the old name. Until that
-# start the scenario's files are in OLD_STATE_DIR and NEW_STATE_DIR does not
-# exist; from it, the files are in NEW_STATE_DIR.
+# start the scenario's files are in OLD_STATE_DIR and neither NEW_STATE_DIR nor
+# LEGACY_XDG_DIR (0.14.0 and 0.15.0's default, which a 0.13 host never had)
+# exists; from it, the files are in NEW_STATE_DIR.
 OLD_STATE_DIR="${HOME}/.claude/channels/slack"
-NEW_STATE_DIR="${HOME}/.config/cscb"
+LEGACY_XDG_DIR="${HOME}/.config/cscb"
+NEW_STATE_DIR="${HOME}/.config/claude-slack-channel-bots"
 
 # The harness helpers (server_pid, count_log, run_start, start_server,
 # stop_server, write_config, cscb_run) read the shell variable SLACK_STATE_DIR
@@ -1541,16 +1549,18 @@ for cid in "${CHANNELS[@]}"; do
     # src/persona-identity.ts personaInstanceId.
     PERSONA_IDS+=("cscb_$(persona_key "${name}")")
 done
-# Before the first start of the new release, the state is where the old package
-# left it: the old directory is a real directory holding the persona
-# configuration and the rest, and the new default directory does not exist yet.
-# Nothing in steps 1 to 9 may have created it, or the start would merge
-# entries instead of moving the directory.
-[[ -d "${OLD_STATE_DIR}" && ! -L "${OLD_STATE_DIR}" ]] \
-    || fail "step 10: ${OLD_STATE_DIR} is not a real directory before the first start"
+# Before the first start of the new release, the state is where the old release
+# left it (a 0.13-or-earlier layout: the one real directory under ~/.claude),
+# and the new default directory does not exist. Nothing in steps 1 to 9 may
+# have created it, or the start would merge entries instead of moving the
+# directory.
 [[ -f "${OLD_STATE_DIR}/config.json" ]] || fail "step 10: ${OLD_STATE_DIR}/config.json is missing before the first start"
 [[ ! -e "${NEW_STATE_DIR}" && ! -L "${NEW_STATE_DIR}" ]] \
     || fail "step 10: ${NEW_STATE_DIR} exists before the first start"
+[[ -d "${OLD_STATE_DIR}" && ! -L "${OLD_STATE_DIR}" ]] \
+    || fail "step 10: ${OLD_STATE_DIR} is not a real directory before the first start"
+[[ ! -e "${LEGACY_XDG_DIR}" && ! -L "${LEGACY_XDG_DIR}" ]] \
+    || fail "step 10: ${LEGACY_XDG_DIR} exists before the first start"
 # From here the harness reads the directory the new release works in (still
 # not exported: the release finds it as a customer's does).
 use_state_dir "${NEW_STATE_DIR}"
@@ -1565,10 +1575,10 @@ leg_a_start_us="$(now_us)"
 start_server --live
 record "the new CSCB started (bot server PID ${SERVER_PID})"
 
-# The first start migrated the state directory: the old directory moved, whole,
-# to the new default, and a symbolic link to it stays at the old name. The
-# configuration, crontable, access.json and each persona's credentials file
-# came along, and the server's pid file and log are in the new directory.
+# The first start migrated the state directory to the new default, and a
+# symbolic link to it stays at each old name. The configuration, crontable,
+# access.json and each persona's credentials file came along, and the server's
+# pid file and log are in the new directory.
 for f in config.json crontab access.json server.pid server.log; do
     [[ -f "${NEW_STATE_DIR}/${f}" ]] || fail "step 10: ${NEW_STATE_DIR}/${f} does not exist after the first start"
 done
@@ -1577,19 +1587,34 @@ for cid in "${CHANNELS[@]}"; do
     [[ -f "${NEW_STATE_DIR}/${f}" ]] || fail "step 10: ${NEW_STATE_DIR}/${f} does not exist after the first start"
 done
 [[ -d "${NEW_STATE_DIR}" && ! -L "${NEW_STATE_DIR}" ]] || fail "step 10: ${NEW_STATE_DIR} is not a real directory"
-[[ -L "${OLD_STATE_DIR}" ]] || fail "step 10: ${OLD_STATE_DIR} is not a symbolic link after the first start"
-got="$(readlink -- "${OLD_STATE_DIR}")"
-[[ "${got}" == "${NEW_STATE_DIR}" ]] \
-    || fail "step 10: ${OLD_STATE_DIR} links to '${got}', not ${NEW_STATE_DIR}"
+[[ ! -L "${NEW_STATE_DIR}/crontab" ]] || fail "step 10: ${NEW_STATE_DIR}/crontab is a symbolic link, not the file"
+for f in "${NEW_STATE_DIR}/config.json" "${NEW_STATE_DIR}/crontab"; do
+    [[ -s "${f}" ]] || fail "step 10: ${f} is empty after the first start"
+done
+# L1 is the one old name, a link to the new directory; L2 was never made.
+[[ "$(readlink -- "${OLD_STATE_DIR}")" == "${NEW_STATE_DIR}" ]] \
+    || fail "step 10: ${OLD_STATE_DIR} is not a symbolic link to ${NEW_STATE_DIR} after the first start (it links to '$(readlink -- "${OLD_STATE_DIR}" || true)')"
+[[ ! -e "${LEGACY_XDG_DIR}" && ! -L "${LEGACY_XDG_DIR}" ]] \
+    || fail "step 10: ${LEGACY_XDG_DIR} exists after the first start"
+# The old name reaches the new directory's files.
+[[ "$(readlink -f -- "${OLD_STATE_DIR}")" == "$(readlink -f -- "${NEW_STATE_DIR}")" ]] \
+    || fail "step 10: ${OLD_STATE_DIR} does not reach ${NEW_STATE_DIR} after the first start"
+cmp -s -- "${OLD_STATE_DIR}/config.json" "${NEW_STATE_DIR}/config.json" \
+    || fail "step 10: ${OLD_STATE_DIR}/config.json is not ${NEW_STATE_DIR}/config.json"
 [[ "$(server_pid)" == "${SERVER_PID}" ]] || fail "step 10: ${NEW_STATE_DIR}/server.pid does not name the bot server (PID ${SERVER_PID})"
-# The line is src/state-dir-migration.ts stateDirRenamedLine's text.
+# The line is src/state-dir-migration.ts stateDirRenamedLine's text: the move
+# out of ~/.claude. Test-30 covers the 0.14.0 and 0.15.0 layouts.
 renamed_line="[slack] state-migrate: moved the state directory from ${OLD_STATE_DIR} to ${NEW_STATE_DIR}, its new default location outside ~/.claude, where Claude Code does not ask before a write. ${OLD_STATE_DIR} is now a symbolic link to it, so a session, script or configuration path that still names the old directory reaches the same files."
 n="$(grep -cF -- "${renamed_line}" "${NEW_STATE_DIR}/server.log" || true)"
 if [[ "${n}" != 1 ]]; then
     sed 's/^/  | /' "${NEW_STATE_DIR}/server.log" >&2
-    fail "step 10: ${NEW_STATE_DIR}/server.log carries ${n} whole-directory rename line(s) of the state migration, not one"
+    fail "step 10: ${NEW_STATE_DIR}/server.log carries ${n} whole-directory rename line(s) from ${OLD_STATE_DIR}, not one"
 fi
-record "the first start moved ${OLD_STATE_DIR} to ${NEW_STATE_DIR} (a symbolic link stays at the old name); the configuration, crontable, access.json and credentials files are there, and so are server.pid and server.log"
+merged_lines="$(grep -cF -- "[slack] state-migrate: the state directory's new default location is ${NEW_STATE_DIR}, " "${NEW_STATE_DIR}/server.log" || true)"
+[[ "${merged_lines}" == 0 ]] || fail "step 10: ${NEW_STATE_DIR}/server.log carries ${merged_lines} merge line(s), where one rename moves it all"
+warns="$(grep -cF -- "[slack] Warning: state-migrate:" "${NEW_STATE_DIR}/server.log" || true)"
+[[ "${warns}" == 0 ]] || fail "step 10: ${NEW_STATE_DIR}/server.log carries ${warns} state-migrate warning(s) (a conflict or a leftover)"
+record "the first start moved the state to ${NEW_STATE_DIR} (a symbolic link stays at the old name); the configuration, crontable, access.json and credentials files are there, and so are server.pid and server.log"
 runbook_substitute 10 autostart-skipped "the container has no host autostart for CSCB to re-enable"
 
 leg_a_deadline_us=$(( leg_a_start_us + LEG_A_WAIT_S * 1000000 ))

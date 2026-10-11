@@ -505,8 +505,15 @@ export type PreloadEnvName = (typeof PRELOAD_ENV_NAMES)[number]
  */
 export const XDG_CONFIG_DIR = '.config'
 
-/** CSCB's directory under the XDG configuration directory, relative to a home: the server's default state directory (bug b.fc4). */
-export const CSCB_XDG_CONFIG_PATH = join(XDG_CONFIG_DIR, 'cscb')
+/** CSCB's directory under the XDG configuration directory, relative to a home: the server's default state directory (bugs b.fc4, b.smv). */
+export const CSCB_XDG_CONFIG_PATH = join(XDG_CONFIG_DIR, 'claude-slack-channel-bots')
+
+/**
+ * The directory under the XDG configuration directory that 0.14.0 and 0.15.0 used (bug b.smv renamed it), relative to
+ * a home. The server moves what it holds to the new default at start and leaves a symbolic link behind, and the CLI
+ * still reads it while it holds the only config; a run must reach neither (`holdsSlackState`).
+ */
+export const LEGACY_XDG_STATE_DIR_PATH = join(XDG_CONFIG_DIR, 'cscb')
 
 /** Where the preload guard points `SLACK_STATE_DIR`, relative to the new HOME: the server's default state directory (`CSCB_XDG_CONFIG_PATH`). */
 export const PRELOAD_STATE_DIR_PATH = CSCB_XDG_CONFIG_PATH
@@ -519,8 +526,8 @@ export const PRELOAD_STATE_DIR_PATH = CSCB_XDG_CONFIG_PATH
  */
 export const LEGACY_STATE_DIR_PATH = join('.claude', 'channels', 'slack')
 
-/** Both default state directories, relative to a home: the ones a launch-time home must not hold (`holdsSlackState`). */
-export const DEFAULT_STATE_DIR_PATHS: readonly string[] = Object.freeze([PRELOAD_STATE_DIR_PATH, LEGACY_STATE_DIR_PATH])
+/** Every default state directory a release has used, relative to a home: the ones a launch-time home must not hold (`holdsSlackState`). */
+export const DEFAULT_STATE_DIR_PATHS: readonly string[] = Object.freeze([PRELOAD_STATE_DIR_PATH, LEGACY_XDG_STATE_DIR_PATH, LEGACY_STATE_DIR_PATH])
 
 /** The preload guard's variables; a missing name is unset. */
 export type PreloadEnv = { [Name in PreloadEnvName]?: string }
@@ -543,11 +550,11 @@ export type PreloadEnvSource = Readonly<PreloadEnv> | Readonly<NodeJS.ProcessEnv
  *   included); `EMPTY_CHILD_PATH` when no entry is left;
  * - `TMUX_TMPDIR`: `tmuxTmpDir`;
  * - `SLACK_STATE_DIR`: `<home>/PRELOAD_STATE_DIR_PATH`
- *   (`<home>/.config/cscb`), the server's default state directory under the
+ *   (`<home>/.config/claude-slack-channel-bots`), the server's default state directory under the
  *   new HOME;
  * - `XDG_CONFIG_HOME`: `<home>/XDG_CONFIG_DIR` (`<home>/.config`). An
  *   inherited one (the operator's own `~/.config`, say) would put the
- *   server's default state directory (`$XDG_CONFIG_HOME/cscb` with
+ *   server's default state directory (`$XDG_CONFIG_HOME/claude-slack-channel-bots` with
  *   `SLACK_STATE_DIR` unset, bug b.fc4) in the real home; unset, it would
  *   fall back to the launch-time home.
  * `TMUX`, `TMUX_PANE` and `CLAUDE_CONFIG_DIR` are absent (unset):
@@ -691,10 +698,12 @@ export const CLAUDE_DIR = '.claude'
  *   probe and the client's store), `config.toml` (agent-director's settings
  *   file) and `bin/agent-director` (`AGENT_DIRECTOR_INSTALL_PATH`);
  * - `.config` (`resolveXdgConfigHome` with `XDG_CONFIG_HOME` unset or
- *   relative) and, under it, `cscb` and `cscb/crontab`: the server's default
- *   state directory with `SLACK_STATE_DIR` unset (`PRELOAD_STATE_DIR_PATH`),
- *   which the start creates and into which it moves the old default's files
- *   (bug b.fc4), and the crontable in it.
+ *   relative) and, under it, `claude-slack-channel-bots` and its `crontab`:
+ *   the server's default state directory with `SLACK_STATE_DIR` unset
+ *   (`PRELOAD_STATE_DIR_PATH`), which the start creates and into which it
+ *   moves the old defaults' files (bugs b.fc4, b.smv), and the crontable in
+ *   it; and `cscb` (`LEGACY_XDG_STATE_DIR_PATH`), the directory 0.14.0 and
+ *   0.15.0 used.
  */
 export const LAUNCH_HOME_DERIVED_PATHS: readonly string[] = Object.freeze([
   CLAUDE_DIR,
@@ -709,6 +718,7 @@ export const LAUNCH_HOME_DERIVED_PATHS: readonly string[] = Object.freeze([
   XDG_CONFIG_DIR,
   CSCB_XDG_CONFIG_PATH,
   join(CSCB_XDG_CONFIG_PATH, 'crontab'),
+  LEGACY_XDG_STATE_DIR_PATH,
 ])
 
 /** Why the preload guard refuses to start (`launchHomeRefusal`). */
@@ -831,8 +841,10 @@ export function launchTimeHomes(): string[] {
  *   `holdsSlackState` or `holdsAgentDirector`;
  * - `notUnderTempDir` (passwd home unknown): `launchHome` does not resolve
  *   to a path strictly under the temp directory;
- * - `holdsSlackState`: anything exists at `<launchHome>/.config/cscb`
- *   (`PRELOAD_STATE_DIR_PATH`, the server's default state directory) or at
+ * - `holdsSlackState`: anything exists at
+ *   `<launchHome>/.config/claude-slack-channel-bots` (`PRELOAD_STATE_DIR_PATH`,
+ *   the server's default state directory), at `<launchHome>/.config/cscb`
+ *   (`LEGACY_XDG_STATE_DIR_PATH`, its default in 0.14.0 and 0.15.0) or at
  *   `<launchHome>/.claude/channels/slack` (`LEGACY_STATE_DIR_PATH`, its
  *   default before bug b.fc4), a dangling symlink or an entry that cannot be
  *   looked at included;

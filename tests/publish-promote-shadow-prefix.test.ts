@@ -660,18 +660,30 @@ interface Sr74bOpts {
   artifacts?: boolean | { config: boolean; mcp: boolean }
   /** Write a leftover file with this name into the state dir (not an artifact). */
   leftover?: string
-  /** Point SLACK_STATE_DIR at a temp state dir instead of the default (~/.config/cscb, bug b.fc4). */
+  /** Point SLACK_STATE_DIR at a temp state dir instead of the default (~/.config/claude-slack-channel-bots, bug b.fc4). */
   stateDirOverride?: boolean
   /**
    * Where the run's state dir is, with SLACK_STATE_DIR unset: `default` is
-   * ~/.config/cscb; `xdg` is $XDG_CONFIG_HOME/cscb for an absolute
+   * ~/.config/claude-slack-channel-bots; `xdg` is $XDG_CONFIG_HOME/claude-slack-channel-bots for an absolute
    * XDG_CONFIG_HOME; `legacy` is the old default, ~/.claude/channels/slack, a
    * host whose server has not yet moved it. `stateDir` in the run is that
-   * directory (and `artifacts` are written there).
+   * directory (and `artifacts` are written there). The 0.14 and 0.15 default,
+   * ~/.config/cscb, is a directory beside it: `cscbFiles`, `cscbLivePid`,
+   * `legacyLinkToCscb` (b.smv).
    */
   layout?: 'default' | 'xdg' | 'legacy'
   /** Files written into the old default directory (a real directory) next to wherever `layout` puts the state dir; not for `layout: 'legacy'`. */
   legacyFiles?: string[]
+  /** Files written into ~/.config/cscb, the 0.14 and 0.15 default (a real directory), next to wherever `layout` puts the state dir. */
+  cscbFiles?: string[]
+  /** Write ~/.config/cscb/server.pid holding the PID of a process that is alive (this one). */
+  cscbLivePid?: boolean
+  /** Make the old default name, ~/.claude/channels/slack, a symbolic link to ~/.config/cscb (the 0.15.0 layout), creating ~/.config/cscb. */
+  legacyLinkToCscb?: boolean
+  /** Write ~/.claude/channels/slack/server.pid holding the PID of a process that is alive (this one). */
+  legacyLivePid?: boolean
+  /** Make ~/.config/cscb a symbolic link to the state dir (a host the daemon has already moved), creating the state dir. */
+  cscbLinkToStateDir?: boolean
   /** Make the old default name a symbolic link to the state dir (a host the daemon has already moved), creating the state dir. */
   legacyLinkToStateDir?: boolean
   /** Exit code of the stub `bun`. */
@@ -711,10 +723,10 @@ function runSr74b(opts: Sr74bOpts = {}): Sr74bRun {
   const stateDir = opts.stateDirOverride
     ? join(home, 'state')
     : opts.layout === 'xdg'
-      ? join(xdgHome, 'cscb')
+      ? join(xdgHome, 'claude-slack-channel-bots')
       : opts.layout === 'legacy'
         ? join(home, '.claude/channels/slack')
-        : join(home, '.config/cscb')
+        : join(home, '.config/claude-slack-channel-bots')
   const mcpConfig = join(home, '.claude/slack-mcp.json')
   const artifacts =
     typeof opts.artifacts === 'object'
@@ -736,6 +748,29 @@ function runSr74b(opts: Sr74bOpts = {}): Sr74bRun {
     const legacyDir = join(home, '.claude/channels/slack')
     mkdirSync(legacyDir, { recursive: true })
     writeFileSync(join(legacyDir, name), '{}\n')
+  }
+  for (const name of opts.cscbFiles ?? []) {
+    const cscbDir = join(home, '.config/cscb')
+    mkdirSync(cscbDir, { recursive: true })
+    writeFileSync(join(cscbDir, name), '{}\n')
+  }
+  if (opts.cscbLivePid) {
+    mkdirSync(join(home, '.config/cscb'), { recursive: true })
+    writeFileSync(join(home, '.config/cscb/server.pid'), `${process.pid}\n`)
+  }
+  if (opts.legacyLivePid) {
+    mkdirSync(join(home, '.claude/channels/slack'), { recursive: true })
+    writeFileSync(join(home, '.claude/channels/slack/server.pid'), `${process.pid}\n`)
+  }
+  if (opts.legacyLinkToCscb) {
+    mkdirSync(join(home, '.config/cscb'), { recursive: true })
+    mkdirSync(join(home, '.claude/channels'), { recursive: true })
+    symlinkSync(join(home, '.config/cscb'), join(home, '.claude/channels/slack'))
+  }
+  if (opts.cscbLinkToStateDir) {
+    mkdirSync(stateDir, { recursive: true })
+    mkdirSync(join(home, '.config'), { recursive: true })
+    symlinkSync(stateDir, join(home, '.config/cscb'))
   }
   if (opts.legacyLinkToStateDir) {
     mkdirSync(stateDir, { recursive: true })
@@ -807,9 +842,11 @@ describe('b.fc4: SR-8.1 reads the daemon PID file from the state dir the CLI wou
   const NO_DAEMON = 'no daemon currently running'
 
   test.each([
-    { where: 'the default, ~/.config/cscb', file: (home: string) => join(home, '.config/cscb/server.pid'), extras: () => ({}) },
-    { where: 'an absolute XDG_CONFIG_HOME', file: (home: string) => join(home, 'xdg-config/cscb/server.pid'), extras: (home: string) => ({ XDG_CONFIG_HOME: join(home, 'xdg-config') }) },
+    { where: 'the default, ~/.config/claude-slack-channel-bots', file: (home: string) => join(home, '.config/claude-slack-channel-bots/server.pid'), extras: () => ({}) },
+    { where: 'an absolute XDG_CONFIG_HOME', file: (home: string) => join(home, 'xdg-config/claude-slack-channel-bots/server.pid'), extras: (home: string) => ({ XDG_CONFIG_HOME: join(home, 'xdg-config') }) },
     { where: 'SLACK_STATE_DIR', file: (home: string) => join(home, 'state/server.pid'), extras: (home: string) => ({ SLACK_STATE_DIR: join(home, 'state') }) },
+    { where: 'the 0.14/0.15 default, ~/.config/cscb (a host not yet moved; a real directory holding the PID file)', file: (home: string) => join(home, '.config/cscb/server.pid'), extras: () => ({}) },
+    { where: 'the 0.14/0.15 default under an absolute XDG_CONFIG_HOME, $XDG_CONFIG_HOME/cscb', file: (home: string) => join(home, 'xdg-config/cscb/server.pid'), extras: (home: string) => ({ XDG_CONFIG_HOME: join(home, 'xdg-config') }) },
     { where: 'the old directory of a host not yet moved (a real directory holding the PID file)', file: (home: string) => join(home, '.claude/channels/slack/server.pid'), extras: () => ({}) },
   ])('a live PID in $where: the daemon is reported running', ({ file, extras }) => {
     const r = runDaemonNote({ pidFile: file, pid: ALIVE, extras })
@@ -821,7 +858,7 @@ describe('b.fc4: SR-8.1 reads the daemon PID file from the state dir the CLI wou
   test('no PID file: no daemon, and the line names the new default\'s PID file', () => {
     const r = runDaemonNote({})
     expect(r.stderr).toContain(NO_DAEMON)
-    expect(r.stderr).toContain(`PID file ${join(r.home, '.config/cscb/server.pid')} is missing`)
+    expect(r.stderr).toContain(`PID file ${join(r.home, '.config/claude-slack-channel-bots/server.pid')} is missing`)
   })
 
   /** A PID no process holds: the first from the top of the usual range that `kill -0` reports as missing. */
@@ -837,8 +874,8 @@ describe('b.fc4: SR-8.1 reads the daemon PID file from the state dir the CLI wou
 
   const OLD_PID_FILE = (home: string) => join(home, '.claude/channels/slack/server.pid')
   const NEW_HOLDS_CONFIG = (home: string) => {
-    mkdirSync(join(home, '.config/cscb'), { recursive: true })
-    writeFileSync(join(home, '.config/cscb/config.json'), '{}\n')
+    mkdirSync(join(home, '.config/claude-slack-channel-bots'), { recursive: true })
+    writeFileSync(join(home, '.config/claude-slack-channel-bots/config.json'), '{}\n')
   }
 
   // The old server's PID file is where the CLI's `stop` looks whatever the new
@@ -849,10 +886,21 @@ describe('b.fc4: SR-8.1 reads the daemon PID file from the state dir the CLI wou
     expect(r.stderr).not.toContain(NO_DAEMON)
   })
 
+  test('a live PID in ~/.config/cscb is seen even when the new directory holds a config.json', () => {
+    const r = runDaemonNote({ pidFile: (home) => join(home, '.config/cscb/server.pid'), pid: ALIVE, setup: NEW_HOLDS_CONFIG })
+    expect(r.stderr).toContain(`the daemon at PID ${ALIVE} is still running`)
+    expect(r.stderr).not.toContain(NO_DAEMON)
+  })
+
+  test('a dead PID in ~/.config/cscb is not the daemon', () => {
+    const r = runDaemonNote({ pidFile: (home) => join(home, '.config/cscb/server.pid'), pid: deadPid(), setup: NEW_HOLDS_CONFIG })
+    expect(r.stderr).toContain(NO_DAEMON)
+  })
+
   test('a dead PID in the old directory is not the daemon: with a config.json in the new directory, the new default is used', () => {
     const r = runDaemonNote({ pidFile: OLD_PID_FILE, pid: deadPid(), setup: NEW_HOLDS_CONFIG })
     expect(r.stderr).toContain(NO_DAEMON)
-    expect(r.stderr).toContain(`PID file ${join(r.home, '.config/cscb/server.pid')} is missing`)
+    expect(r.stderr).toContain(`PID file ${join(r.home, '.config/claude-slack-channel-bots/server.pid')} is missing`)
   })
 
   test('a PID file in the old directory that is a symbolic link is not the daemon, whatever it points at', () => {
@@ -945,29 +993,29 @@ describe('b.r6x: SR-7.4b closes the fresh-prefix postinstall trust gap', () => {
     expect(missing.stderr).toContain(join(missing.stateDir, 'config.json'))
     expect(missing.stderr).not.toContain('access.json')
     // The default locations are not consulted when the override is set.
-    expect(missing.stderr).not.toContain(join(missing.home, '.config/cscb'))
+    expect(missing.stderr).not.toContain(join(missing.home, '.config/claude-slack-channel-bots'))
     expect(missing.stderr).not.toContain(join(missing.home, '.claude/channels/slack'))
   })
 
   // b.fc4: the state dir is the CLI's choice (src/state-dir-migration.ts
-  // resolveCliStateDir): the new default, ~/.config/cscb, unless the old one
+  // resolveCliStateDir): the new default, ~/.config/claude-slack-channel-bots, unless the old one
   // is still a real directory holding config.json or server.pid while the new
   // one holds no config.json (the promote runs before the daemon's first start
   // on the new default has moved it).
-  test('the default state dir is ~/.config/cscb, under none of ~/.claude', () => {
+  test('the default state dir is ~/.config/claude-slack-channel-bots, under none of ~/.claude', () => {
     const missing = runSr74b({ manifest: 'trusted', artifacts: { config: false, mcp: true } })
-    expect(missing.stateDir).toBe(join(missing.home, '.config/cscb'))
-    expect(missing.stderr).toContain(join(missing.home, '.config/cscb/config.json'))
+    expect(missing.stateDir).toBe(join(missing.home, '.config/claude-slack-channel-bots'))
+    expect(missing.stderr).toContain(join(missing.home, '.config/claude-slack-channel-bots/config.json'))
     expect(missing.stderr).not.toContain(join(missing.home, '.claude/channels/slack'))
   })
 
-  test('an absolute XDG_CONFIG_HOME moves the default to $XDG_CONFIG_HOME/cscb', () => {
+  test('an absolute XDG_CONFIG_HOME moves the default to $XDG_CONFIG_HOME/claude-slack-channel-bots', () => {
     const present = runSr74b({ manifest: 'trusted', artifacts: true, layout: 'xdg' })
-    expect(present.stateDir).toBe(join(present.home, 'xdg-config/cscb'))
+    expect(present.stateDir).toBe(join(present.home, 'xdg-config/claude-slack-channel-bots'))
     expect(present.stderr).toBe('')
     const missing = runSr74b({ manifest: 'trusted', artifacts: { config: false, mcp: true }, layout: 'xdg' })
     expect(missing.stderr).toContain(join(missing.stateDir, 'config.json'))
-    expect(missing.stderr).not.toContain(join(missing.home, '.config/cscb'))
+    expect(missing.stderr).not.toContain(join(missing.home, '.config/claude-slack-channel-bots'))
   })
 
   test.each<{ why: string; files: string[]; warnsOld: boolean }>([
@@ -980,7 +1028,7 @@ describe('b.r6x: SR-7.4b closes the fresh-prefix postinstall trust gap', () => {
     // The old directory's config.json is the one looked for: present (silence) or named as missing.
     expect(r.stderr.includes(join(r.home, '.claude/channels/slack/config.json'))).toBe(warnsOld)
     expect(r.stderr === '').toBe(!warnsOld)
-    expect(r.stderr).not.toContain(join(r.home, '.config/cscb'))
+    expect(r.stderr).not.toContain(join(r.home, '.config/claude-slack-channel-bots'))
     expect(existsSync(join(r.home, '.config'))).toBe(false)
   })
 
@@ -991,13 +1039,13 @@ describe('b.r6x: SR-7.4b closes the fresh-prefix postinstall trust gap', () => {
       leftover: 'config.json.last-applied',
       legacyFiles: ['config.json'],
     })
-    expect(r.stderr).toContain(join(r.home, '.config/cscb/config.json'))
+    expect(r.stderr).toContain(join(r.home, '.config/claude-slack-channel-bots/config.json'))
     expect(r.stderr).not.toContain('.claude/channels/slack')
   })
 
   test('an old directory holding only a log is not used: the new default is looked at', () => {
     const r = runSr74b({ manifest: 'trusted', artifacts: { config: false, mcp: true }, legacyFiles: ['server.log'] })
-    expect(r.stderr).toContain(join(r.home, '.config/cscb/config.json'))
+    expect(r.stderr).toContain(join(r.home, '.config/claude-slack-channel-bots/config.json'))
     expect(r.stderr).not.toContain('.claude/channels/slack')
   })
 
@@ -1020,6 +1068,123 @@ describe('b.r6x: SR-7.4b closes the fresh-prefix postinstall trust gap', () => {
     expect(r.code).toBe(0)
     expect(r.stderr).toContain(join(r.stateDir, 'config.json'))
     expect(r.stderr).not.toContain('.claude/channels/slack')
+  })
+
+  // b.smv: 0.14 and 0.15 kept the state in ~/.config/cscb; the new default is
+  // ~/.config/claude-slack-channel-bots. A promote that runs before the new
+  // server's first start has moved it finds the state under the old name.
+  describe('b.smv: ~/.config/cscb, the 0.14 and 0.15 default, is an old directory too', () => {
+    const CSCB = (r: Sr74bRun) => join(r.home, '.config/cscb')
+    const L1 = (r: Sr74bRun) => join(r.home, '.claude/channels/slack')
+
+    test('a real ~/.config/cscb holding config.json (0.15.0, not yet moved) is the one looked at: silence, and nothing made', () => {
+      const r = runSr74b({ manifest: 'trusted', artifacts: { config: false, mcp: true }, cscbFiles: ['config.json'] })
+      expect(r.code).toBe(0)
+      expect(r.stderr).toBe('')
+      expect(existsSync(join(r.home, '.config/claude-slack-channel-bots'))).toBe(false)
+    })
+
+    test.each<{ why: string; files: string[] }>([
+      { why: 'only server.pid', files: ['server.pid'] },
+      { why: 'only config.json.last-applied', files: ['config.json.last-applied'] },
+    ])('~/.config/cscb holding $why: its config.json is named as missing, not the new default\'s', ({ files }) => {
+      const r = runSr74b({ manifest: 'trusted', artifacts: { config: false, mcp: true }, cscbFiles: files })
+      expect(r.stderr).toContain(join(CSCB(r), 'config.json'))
+      expect(r.stderr).not.toContain('claude-slack-channel-bots/config.json')
+      expect(r.stderr).not.toContain('.claude/channels/slack')
+    })
+
+    test('~/.config/cscb is looked at before ~/.claude/channels/slack when both hold state', () => {
+      const r = runSr74b({
+        manifest: 'trusted',
+        artifacts: { config: false, mcp: true },
+        cscbFiles: ['server.pid'],
+        legacyFiles: ['config.json'],
+      })
+      expect(r.stderr).toContain(join(CSCB(r), 'config.json'))
+      expect(r.stderr).not.toContain(L1(r))
+    })
+
+    test('~/.config/cscb holding only a log is not used: ~/.claude/channels/slack, holding config.json (0.14.0 partial), is', () => {
+      const r = runSr74b({
+        manifest: 'trusted',
+        artifacts: { config: false, mcp: true },
+        cscbFiles: ['server.log'],
+        legacyFiles: ['config.json'],
+      })
+      expect(r.stderr).toBe('')
+    })
+
+    test('~/.config/cscb holding only a log, with nothing old holding state: the new default is looked at', () => {
+      const r = runSr74b({ manifest: 'trusted', artifacts: { config: false, mcp: true }, cscbFiles: ['server.log'] })
+      expect(r.stderr).toContain(join(r.home, '.config/claude-slack-channel-bots/config.json'))
+      expect(r.stderr).not.toContain(CSCB(r))
+    })
+
+    test('0.15.0 layout (~/.claude/channels/slack a link to ~/.config/cscb): the real ~/.config/cscb is looked at, once', () => {
+      const r = runSr74b({
+        manifest: 'trusted',
+        artifacts: { config: false, mcp: true },
+        cscbFiles: ['server.pid'],
+        legacyLinkToCscb: true,
+      })
+      expect(r.stderr).toContain(join(CSCB(r), 'config.json'))
+      expect(r.stderr).not.toContain(join(L1(r), 'config.json'))
+    })
+
+    test('0.15.0 layout with a config.json: silence', () => {
+      const r = runSr74b({
+        manifest: 'trusted',
+        artifacts: { config: false, mcp: true },
+        cscbFiles: ['config.json'],
+        legacyLinkToCscb: true,
+      })
+      expect(r.stderr).toBe('')
+    })
+
+    test('~/.config/cscb as a symlink to the new directory (already moved) is not an old directory: the new one is looked at', () => {
+      const r = runSr74b({
+        manifest: 'trusted',
+        artifacts: { config: false, mcp: true },
+        leftover: 'server.pid',
+        cscbLinkToStateDir: true,
+      })
+      expect(r.stderr).toContain(join(r.stateDir, 'config.json'))
+      expect(r.stderr).not.toContain(join(r.home, '.config/cscb/'))
+    })
+
+    test('a new directory holding config.json wins over ~/.config/cscb holding a PID file', () => {
+      const r = runSr74b({ manifest: 'trusted', artifacts: true, cscbFiles: ['server.pid'] })
+      expect(r.stderr).toBe('')
+    })
+
+    test('a live old server on ~/.config/cscb wins whatever the new directory holds', () => {
+      const r = runSr74b({ manifest: 'trusted', artifacts: true, cscbLivePid: true })
+      expect(r.stderr).toContain(join(CSCB(r), 'config.json'))
+      expect(r.stderr).not.toContain(join(r.stateDir, 'config.json'))
+    })
+
+    test('a live old server on ~/.claude/channels/slack (the later directory) wins over ~/.config/cscb holding config.json', () => {
+      const r = runSr74b({
+        manifest: 'trusted',
+        artifacts: { config: false, mcp: true },
+        legacyLivePid: true,
+        cscbFiles: ['config.json'],
+      })
+      expect(r.stderr).toContain(join(L1(r), 'config.json'))
+      expect(r.stderr).not.toContain(join(CSCB(r), 'config.json'))
+    })
+
+    test('an absolute XDG_CONFIG_HOME: ${XDG_CONFIG_HOME}/cscb is not looked at when it is absent, and no ~/.config/cscb is consulted', () => {
+      const r = runSr74b({
+        manifest: 'trusted',
+        artifacts: { config: false, mcp: true },
+        layout: 'xdg',
+        cscbFiles: ['config.json'],
+      })
+      expect(r.stderr).toContain(join(r.home, 'xdg-config/claude-slack-channel-bots/config.json'))
+      expect(r.stderr).not.toContain(join(r.home, '.config/cscb'))
+    })
   })
 
   test('a failing `bun pm -g trust` is tolerated: still exit 0', () => {

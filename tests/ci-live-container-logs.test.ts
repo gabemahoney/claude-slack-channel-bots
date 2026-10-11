@@ -364,8 +364,8 @@ describe('the files copied', () => {
 
   test("the state dir is the helpers' $S under the test user's home, boot-start.log is where the entrypoint's boot start logs, and agent-director's dir is that home's ~/.agent-director, the store CSCB pins", () => {
     const helpers = readFileSync(join(REPO, 'docker', 'live', 'cscb-live-helpers.sh'), 'utf-8')
-    expect(helpers).toContain('\nS=~/.config/cscb\n')
-    expect(CONTAINER_STATE_DIR).toBe(`${CONTAINER_HOME}/.config/cscb`)
+    expect(helpers).toContain('\nS=~/.config/claude-slack-channel-bots\n')
+    expect(CONTAINER_STATE_DIR).toBe(`${CONTAINER_HOME}/.config/claude-slack-channel-bots`)
     // The boot start runs as the test user, so its $HOME is CONTAINER_HOME.
     const entrypoint = readFileSync(join(REPO, 'docker', 'live', 'entrypoint.sh'), 'utf-8')
     expect(entrypoint).toContain('claude-slack-channel-bots start >> "$HOME/cscb-live/boot-start.log" 2>&1')

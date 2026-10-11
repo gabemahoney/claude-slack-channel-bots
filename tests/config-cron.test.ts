@@ -174,43 +174,43 @@ describe('cron config keys — defaults track loaded config dir', () => {
 
 describe('crontable default outside ~/.claude (bug b.avm)', () => {
   /** A default install's state directory under the case's home (b.fc4: outside ~/.claude). */
-  const stateDirUnder = (h: string): string => join(h, '.config', 'cscb')
+  const stateDirUnder = (h: string): string => join(h, '.config', 'claude-slack-channel-bots')
   /** A configuration directory that is not the default state directory, so a crontable beside it is told from the default. */
   const configDirUnder = (h: string): string => join(h, 'cfg')
 
   test.each<[string, NodeJS.ProcessEnv, (h: string) => string]>([
-    ['SLACK_STATE_DIR and XDG_CONFIG_HOME unset → <home>/.config/cscb/crontab', {}, (h) => join(h, '.config', 'cscb', 'crontab')],
-    ['SLACK_STATE_DIR empty counts as unset', { SLACK_STATE_DIR: '' }, (h) => join(h, '.config', 'cscb', 'crontab')],
-    ['XDG_CONFIG_HOME absolute → $XDG_CONFIG_HOME/cscb/crontab', { XDG_CONFIG_HOME: '/xdg/conf/' }, () => '/xdg/conf/cscb/crontab'],
-    ['XDG_CONFIG_HOME empty is ignored', { XDG_CONFIG_HOME: '' }, (h) => join(h, '.config', 'cscb', 'crontab')],
-    ['XDG_CONFIG_HOME relative is ignored', { XDG_CONFIG_HOME: 'rel/conf' }, (h) => join(h, '.config', 'cscb', 'crontab')],
+    ['SLACK_STATE_DIR and XDG_CONFIG_HOME unset → <home>/.config/claude-slack-channel-bots/crontab', {}, (h) => join(h, '.config', 'claude-slack-channel-bots', 'crontab')],
+    ['SLACK_STATE_DIR empty counts as unset', { SLACK_STATE_DIR: '' }, (h) => join(h, '.config', 'claude-slack-channel-bots', 'crontab')],
+    ['XDG_CONFIG_HOME absolute → $XDG_CONFIG_HOME/claude-slack-channel-bots/crontab', { XDG_CONFIG_HOME: '/xdg/conf/' }, () => '/xdg/conf/claude-slack-channel-bots/crontab'],
+    ['XDG_CONFIG_HOME empty is ignored', { XDG_CONFIG_HOME: '' }, (h) => join(h, '.config', 'claude-slack-channel-bots', 'crontab')],
+    ['XDG_CONFIG_HOME relative is ignored', { XDG_CONFIG_HOME: 'rel/conf' }, (h) => join(h, '.config', 'claude-slack-channel-bots', 'crontab')],
     ['SLACK_STATE_DIR set → <config dir>/crontab, beside the state directory\'s config.json, whatever XDG_CONFIG_HOME says',{ SLACK_STATE_DIR: '/srv/state', XDG_CONFIG_HOME: '/xdg/conf' }, (h) => join(configDirUnder(h), 'crontab')],
   ])('resolveDefaultCronTablePath: %s', (_label, env, expected) => {
     expect(resolveDefaultCronTablePath(configDirUnder(home), home, env)).toBe(expected(home))
   })
 
-  test('over the server\'s own config path: SLACK_STATE_DIR set → <state dir>/crontab; unset → the default state dir, <home>/.config/cscb, outside ~/.claude', () => {
+  test('over the server\'s own config path: SLACK_STATE_DIR set → <state dir>/crontab; unset → the default state dir, <home>/.config/claude-slack-channel-bots, outside ~/.claude', () => {
     const stateEnv = { SLACK_STATE_DIR: join(home, 'state') }
     expect(resolveDefaultCronTablePath(dirname(resolveServerConfigPath(home, stateEnv)), home, stateEnv)).toBe(join(home, 'state', 'crontab'))
     const configDir = dirname(resolveServerConfigPath(home, {}))
     expect(configDir).toBe(stateDirUnder(home))
     expect(configDir.startsWith(join(home, '.claude'))).toBe(false)
-    expect(resolveDefaultCronTablePath(configDir, home, {})).toBe(join(home, '.config', 'cscb', 'crontab'))
+    expect(resolveDefaultCronTablePath(configDir, home, {})).toBe(join(home, '.config', 'claude-slack-channel-bots', 'crontab'))
   })
 
-  test('the loader: no cron_table_path and SLACK_STATE_DIR unset → <home>/.config/cscb/crontab, outside ~/.claude; the cron log stays beside config.json', () => {
+  test('the loader: no cron_table_path and SLACK_STATE_DIR unset → <home>/.config/claude-slack-channel-bots/crontab, outside ~/.claude; the cron log stays beside config.json', () => {
     const configDir = stateDirUnder(home)
     const result = resolvePersonaConfig(makeInput(), configDir, home, { env: {} })
-    expect(result.cron_table_path).toBe(join(home, '.config', 'cscb', 'crontab'))
+    expect(result.cron_table_path).toBe(join(home, '.config', 'claude-slack-channel-bots', 'crontab'))
     expect(result.cron_table_path.startsWith(join(home, '.claude'))).toBe(false)
     expect(result.cron_log_path).toBe(join(configDir, 'cron.log'))
   })
 
   test.each<[string, (h: string) => Record<string, unknown>, NodeJS.ProcessEnv, (h: string) => string]>([
-    ['null → the default', () => ({ cron_table_path: null }), {}, (h) => join(h, '.config', 'cscb', 'crontab')],
+    ['null → the default', () => ({ cron_table_path: null }), {}, (h) => join(h, '.config', 'claude-slack-channel-bots', 'crontab')],
     ['absent with SLACK_STATE_DIR set → <config dir>/crontab', () => ({}), { SLACK_STATE_DIR: '/srv/state' }, (h) => join(configDirUnder(h), 'crontab')],
-    ["written as the default's own file (~ expanded) → that path", () => ({ cron_table_path: '~/.config/cscb/crontab' }), {}, (h) => join(h, '.config', 'cscb', 'crontab')],
-    ["written as the default's own file (absolute) → that path", (h) => ({ cron_table_path: join(h, '.config', 'cscb', 'crontab') }), {}, (h) => join(h, '.config', 'cscb', 'crontab')],
+    ["written as the default's own file (~ expanded) → that path", () => ({ cron_table_path: '~/.config/claude-slack-channel-bots/crontab' }), {}, (h) => join(h, '.config', 'claude-slack-channel-bots', 'crontab')],
+    ["written as the default's own file (absolute) → that path", (h) => ({ cron_table_path: join(h, '.config', 'claude-slack-channel-bots', 'crontab') }), {}, (h) => join(h, '.config', 'claude-slack-channel-bots', 'crontab')],
     ['written as another path → used verbatim (~ expanded under the home)', () => ({ cron_table_path: '~/cron/table' }), {}, (h) => join(h, 'cron', 'table')],
     ['written as an absolute path → used verbatim whatever XDG_CONFIG_HOME says', () => ({ cron_table_path: '/etc/cron/table' }), { XDG_CONFIG_HOME: '/xdg/conf' }, () => '/etc/cron/table'],
   ])('the loader: cron_table_path %s', (_label, keys, env, expected) => {
@@ -220,22 +220,22 @@ describe('crontable default outside ~/.claude (bug b.avm)', () => {
 
   test('the loader: XDG_CONFIG_HOME is honoured from the environment it is given', () => {
     const result = parsePersonaConfigBytes(JSON.stringify(makeInput()), 'config.json', stateDirUnder(home), { home, env: { XDG_CONFIG_HOME: join(home, 'xdg') } })
-    expect(result.cron_table_path).toBe(join(home, 'xdg', 'cscb', 'crontab'))
+    expect(result.cron_table_path).toBe(join(home, 'xdg', 'claude-slack-channel-bots', 'crontab'))
   })
 
-  test('the default home is the OS home, read at call time: under a fake launch-time home it is <fake home>/.config/cscb/crontab', () => {
+  test('the default home is the OS home, read at call time: under a fake launch-time home it is <fake home>/.config/claude-slack-channel-bots/crontab', () => {
     const fakeHome = mkdtempSync(join(tmpdir(), 'config-cron-fake-home-'))
     try {
       const run = runInFakeHome({
         modulePath: CONFIG_MODULE,
         call: 'process.stdout.write("PATH::" + mod.resolveDefaultCronTablePath(input.configDir, undefined, {}) + "\\n")',
-        input: { configDir: join(fakeHome, '.config', 'cscb') },
+        input: { configDir: join(fakeHome, '.config', 'claude-slack-channel-bots') },
         home: fakeHome,
         stateDir: join(fakeHome, 'state'),
       })
       expect(run.observedHomedir).toBe(fakeHome)
       expect(run.status).toBe(0)
-      expect(run.stdout).toContain(`PATH::${join(fakeHome, '.config', 'cscb', 'crontab')}\n`)
+      expect(run.stdout).toContain(`PATH::${join(fakeHome, '.config', 'claude-slack-channel-bots', 'crontab')}\n`)
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
     }

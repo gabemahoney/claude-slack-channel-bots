@@ -4,7 +4,7 @@ Saving `config.json` doesn't change what runs. The server runs the last configur
 
 ## Files beside the config file
 
-These files sit in the same directory as `config.json` (`~/.config/cscb/` by default, or `SLACK_STATE_DIR`). Never edit them by hand.
+These files sit in the same directory as `config.json` (`~/.config/claude-slack-channel-bots/` by default, or `SLACK_STATE_DIR`). Never edit them by hand.
 
 | File | What it is |
 |---|---|
@@ -47,8 +47,8 @@ While the server runs, it checks `config.json` and each credentials file the fil
 To see what is pending:
 
 ```sh
-cat ~/.config/cscb/config.json.pending
-grep -E 'reload-(preview|invalid|nothing-pending)' ~/.config/cscb/server.log | tail
+cat ~/.config/claude-slack-channel-bots/config.json.pending
+grep -E 'reload-(preview|invalid|nothing-pending)' ~/.config/claude-slack-channel-bots/server.log | tail
 ```
 
 ## Reading the preview
@@ -63,7 +63,7 @@ A configuration change is pending; nothing has been applied. personas: 1 added, 
 DESTRUCTIVE: persona "scribe" (key=scribe) is removed: the persona will be retired: its session stopped and never resumed.
 persona "helper" (key=helper) is added but cannot come up: working directory does not exist.
 persona "planner" (key=planner): channels changed: applied in place immediately, instance kept.
-persona "reviewer" (key=reviewer): credentials file "/home/operator/.config/cscb/reviewer-credentials.json" changed: a new connection opens, then the old one closes, instance kept.
+persona "reviewer" (key=reviewer): credentials file "/home/operator/.config/claude-slack-channel-bots/reviewer-credentials.json" changed: a new connection opens, then the old one closes, instance kept.
 server-wide setting port changed: once applied, it is recorded and takes effect at the next server start after that.
 server-wide setting claude_config_dir changed: inherited by "planner" (key=planner), "reviewer" (key=reviewer); takes effect at each one's next launch, which starts fresh (the conversation is not resumed), instance kept until then.
 ```
@@ -104,7 +104,7 @@ Paths in the preview are absolute: a `~` in `config.json` is shown expanded. In 
 To apply a pending change, rename `config.json.pending` to `config.json.apply` in the same directory, with the server running:
 
 ```sh
-cd "${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}" && mv config.json.pending config.json.apply
+cd "${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}" && mv config.json.pending config.json.apply
 ```
 
 Read the preview first. The server picks the confirmation up at its next check, within about 5 seconds; a check still running an earlier apply delays it, so `reload-applied` can come minutes later. It deletes the confirmation and applies it without a restart; next-launch and server-wide settings are recorded and take effect later, except the switch `allow_invited_channels`, which applies in place at once (see [What a confirmation applies](#what-a-confirmation-applies)).
@@ -114,7 +114,7 @@ You can direct an agent to do the rename for you. Nothing has to be computed, co
 Each confirmation logs one of these lines in `server.log`:
 
 ```sh
-grep -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed)' "${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}/server.log" | tail
+grep -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed)' "${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}/server.log" | tail
 ```
 
 | Line | Meaning |

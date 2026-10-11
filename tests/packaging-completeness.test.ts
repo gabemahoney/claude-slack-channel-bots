@@ -181,6 +181,8 @@ import {
   stateDirMergedLine,
   stateDirPendingLine,
   stateDirRenamedLine,
+  stateDirRepointedLine,
+  stateDirRepointFailedLine,
 } from '../src/state-dir-migration.ts'
 import { DM_DESTINATION, type ChannelMode } from '../src/config.ts'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
@@ -1019,6 +1021,10 @@ const STATE_TARGET = '<target>'
 const STATE_NAME = '<name>'
 const STATE_CAUSE = '<cause>'
 
+/** The two legacy paths the skill writes literally in the repoint lines (bug b.smv): the old server directory and the 0.15.0 default. */
+const LEGACY_SERVER_DIR = '~/.claude/channels/slack'
+const LEGACY_XDG_DIR = '~/.config/cscb'
+
 /** `rendered` from the first `start` through the first `end` after it: a quote of one stretch of a line. */
 function stretch(rendered: string, start: string, end: string): string {
   const from = rendered.indexOf(start)
@@ -1193,6 +1199,20 @@ const QUOTED_TEXTS: [label: string, where: HeadingMatch, render: () => string][]
       ),
   ],
   [
+    'the state directory renamed line, for the folder renamed within ~/.config (named after the package)',
+    STATE_LOCATION_HEADING,
+    () => quotedUpTo(stateDirRenamedLine(OLD_STATE, NEW_STATE, true), 'is now a symbolic link to it,'),
+  ],
+  [
+    'the state directory merged line, for the folder renamed within ~/.config, naming what moved',
+    STATE_LOCATION_HEADING,
+    () =>
+      quotedUpTo(
+        stateDirMergedLine(OLD_STATE, NEW_STATE, [STATE_NAME], true).replace(`moved "${STATE_NAME}" from`, `moved "${STATE_NAME}", … from`),
+        `is now a symbolic link to ${NEW_STATE},`,
+      ),
+  ],
+  [
     'the state directory merged line, when nothing needed to move',
     STATE_LOCATION_HEADING,
     () => stretch(stateDirMergedLine(OLD_STATE, NEW_STATE, []), 'nothing needed to move', 'nothing needed to move'),
@@ -1255,6 +1275,16 @@ const QUOTED_TEXTS: [label: string, where: HeadingMatch, render: () => string][]
     STATE_LOCATION_HEADING,
     () =>
       `${stretch(stateDirFailedLine(OLD_STATE, NEW_STATE, 'mkdir', STATE_CAUSE, []), 'Nothing was lost:', `is still in ${OLD_STATE}.`)} …`,
+  ],
+  [
+    'the state directory repointed line',
+    STATE_LOCATION_HEADING,
+    () => stateDirRepointedLine(LEGACY_SERVER_DIR, LEGACY_XDG_DIR, NEW_STATE),
+  ],
+  [
+    'the state directory repoint-failed WARN',
+    STATE_LOCATION_HEADING,
+    () => stateDirRepointFailedLine(LEGACY_SERVER_DIR, LEGACY_XDG_DIR, NEW_STATE, STATE_CAUSE),
   ],
   [
     'the state directory link-failed WARN',

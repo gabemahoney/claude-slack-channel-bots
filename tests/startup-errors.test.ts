@@ -949,19 +949,19 @@ describe('recordStartupError without a logDir writes under the server\'s state d
     expect(res.status).toBe(0)
   }
 
-  test('SLACK_STATE_DIR unset: <home>/.config/cscb/startup-errors.log, and nothing under ~/.claude', () => {
+  test('SLACK_STATE_DIR unset: <home>/.config/claude-slack-channel-bots/startup-errors.log, and nothing under ~/.claude', () => {
     recordWithoutLogDir({})
 
-    expectEntry(linesOf(readFileSync(join(home, '.config', 'cscb', LOG_NAME), 'utf-8')).at(0))
+    expectEntry(linesOf(readFileSync(join(home, '.config', 'claude-slack-channel-bots', LOG_NAME), 'utf-8')).at(0))
     expect(existsSync(join(home, '.claude'))).toBe(false)
   })
 
-  test('SLACK_STATE_DIR unset and an absolute XDG_CONFIG_HOME: <XDG_CONFIG_HOME>/cscb/startup-errors.log, and nothing under <home>/.config', () => {
+  test('SLACK_STATE_DIR unset and an absolute XDG_CONFIG_HOME: <XDG_CONFIG_HOME>/claude-slack-channel-bots/startup-errors.log, and nothing under <home>/.config', () => {
     const xdg = join(root, 'xdg')
 
     recordWithoutLogDir({ env: { XDG_CONFIG_HOME: xdg } })
 
-    expectEntry(linesOf(readFileSync(join(xdg, 'cscb', LOG_NAME), 'utf-8')).at(0))
+    expectEntry(linesOf(readFileSync(join(xdg, 'claude-slack-channel-bots', LOG_NAME), 'utf-8')).at(0))
     expect(existsSync(join(home, '.config'))).toBe(false)
   })
 })

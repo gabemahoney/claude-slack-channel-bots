@@ -266,7 +266,7 @@ describe('the live config', () => {
       ['persona_b', [{ id: 'C0DRYCOORD', delivery: 'mentions' }], { enabled: true, contact: 'U0DRYHUMAN' }, 'dm'],
       ['persona_c', null, { enabled: true, contact: 'U0DRYHUMAN' }, 'dm'],
     ])
-    expect([config.ack_reaction, config.append_system_prompt_file]).toEqual(['eyes', '/home/testuser/.config/cscb/system-prompt.md'])
+    expect([config.ack_reaction, config.append_system_prompt_file]).toEqual(['eyes', '/home/testuser/.config/claude-slack-channel-bots/system-prompt.md'])
     const loaded = load(config)
     expect(loaded.personas.map((p) => [p.key, p.credentials_file.endsWith(`.config/cscb-credentials/${p.name}-credentials.json`)])).toEqual([
       ['persona_a', true],
@@ -276,7 +276,7 @@ describe('the live config', () => {
     assertNoLeak(renderConfig(config))
   })
 
-  // Bug b.fc4: the default state directory, ~/.config/cscb, holds the
+  // Bug b.fc4: the default state directory, ~/.config/claude-slack-channel-bots, holds the
   // crontable; the read-only credentials mount is its sibling
   // (~/.config/cscb-credentials), never the directory the server writes to.
   // The runner's config still names the crontable (the path the default would

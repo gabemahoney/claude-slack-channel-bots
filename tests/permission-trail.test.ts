@@ -261,20 +261,20 @@ describe('emitTrail — the default state directory (b.fc4)', () => {
     expect(res.status).toBe(0)
   }
 
-  test('SLACK_STATE_DIR unset: the trail is <home>/.config/cscb/permission-trail.jsonl, and nothing is made under ~/.claude', () => {
+  test('SLACK_STATE_DIR unset: the trail is <home>/.config/claude-slack-channel-bots/permission-trail.jsonl, and nothing is made under ~/.claude', () => {
     emitInFakeHome(tempDir, {})
 
-    const lines = readFileSync(join(tempDir, '.config', 'cscb', 'permission-trail.jsonl'), 'utf-8').split('\n').filter(l => l.length > 0)
+    const lines = readFileSync(join(tempDir, '.config', 'claude-slack-channel-bots', 'permission-trail.jsonl'), 'utf-8').split('\n').filter(l => l.length > 0)
     expect(lines.map(l => (JSON.parse(l) as { event: string }).event)).toEqual(['cscb.default.dir'])
     expect(existsSync(join(tempDir, '.claude'))).toBe(false)
   })
 
-  test('SLACK_STATE_DIR unset and an absolute XDG_CONFIG_HOME: the trail is under <XDG_CONFIG_HOME>/cscb', () => {
+  test('SLACK_STATE_DIR unset and an absolute XDG_CONFIG_HOME: the trail is under <XDG_CONFIG_HOME>/claude-slack-channel-bots', () => {
     const xdg = join(tempDir, 'xdg')
 
     emitInFakeHome(tempDir, { env: { XDG_CONFIG_HOME: xdg } })
 
-    expect(existsSync(join(xdg, 'cscb', 'permission-trail.jsonl'))).toBe(true)
+    expect(existsSync(join(xdg, 'claude-slack-channel-bots', 'permission-trail.jsonl'))).toBe(true)
     expect(existsSync(join(tempDir, '.config'))).toBe(false)
   })
 })

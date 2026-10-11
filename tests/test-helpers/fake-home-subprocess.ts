@@ -54,8 +54,8 @@ export interface FakeHomeRunOptions {
   /**
    * SLACK_STATE_DIR for the child: where startup-errors.log lands. Leave it
    * out to start the child with SLACK_STATE_DIR unset, so the server's default
-   * state directory (`$XDG_CONFIG_HOME/cscb`, else `<home>/.config/cscb`, bug
-   * b.fc4) is under the fake home.
+   * state directory (`$XDG_CONFIG_HOME/claude-slack-channel-bots`, else `<home>/.config/claude-slack-channel-bots`, bugs
+   * b.fc4, b.smv) is under the fake home.
    */
   stateDir?: string
   /** More variables for the child (`XDG_CONFIG_HOME`, say); never SLACK_STATE_DIR or the helper's input. */
