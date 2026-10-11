@@ -2550,7 +2550,7 @@ This release and agent-director Phase 1 are installed together, and rolled back 
    sudo cp docs/logrotate-startup-errors.conf /etc/logrotate.d/claude-slack-channel-bots
    ```
    A snippet installed by an earlier release names `/home/USER/.claude/channels/slack/startup-errors.log`: copy the file again, or change that path to `/home/USER/.config/cscb/startup-errors.log`.
-4. **Stop the old server before the first start after an upgrade from a release that kept its state under `~/.claude`.** Claude Code asks the user before every write under `~/.claude`, so the state directory is now `~/.config/cscb` (`$XDG_CONFIG_HOME/cscb` when `XDG_CONFIG_HOME` is an absolute path), beside the credentials files and the crontable. The first `start` moves the old directory's files there and leaves a symbolic link at the old name; it refuses to start while a server is still running on the old directory. Run `claude-slack-channel-bots stop` (it finds the old directory), then `start`; `clean_restart` does both. With `SLACK_STATE_DIR` set, nothing moves. What the move does with each file, and with a file present in both places, is in the [CHANGELOG](CHANGELOG.md) entry "The state directory moves out of `~/.claude`".
+4. **Stop the old server before the first start after an upgrade from a release that kept its state under `~/.claude`.** Claude Code asks the user before every write under `~/.claude`, so the state directory is now `~/.config/cscb` (`$XDG_CONFIG_HOME/cscb` when `XDG_CONFIG_HOME` is an absolute path), beside the credentials files and the crontable. The first `start` moves the old directory's files there and leaves a symbolic link at the old name; it refuses to start while a server is still running on the old directory. Run `claude-slack-channel-bots stop` (it finds the old directory), then `start`; `clean_restart` does both. Until that start, `stop`, `credentials` and the other commands keep using the old directory. A host that follows the switch-over runbook stops the old server in step 3 and moves the directory at the first start, in step 10; create nothing at `~/.config/cscb` before that start, or it merges the old directory into the new one instead of moving it whole. With `SLACK_STATE_DIR` set, nothing moves. What the move does with each file, and with a file present in both places, is in the [CHANGELOG](CHANGELOG.md) entry "The state directory moves out of `~/.claude`".
 
 ### Switching over to agent-director Phase 1
 
@@ -2569,7 +2569,7 @@ Your new CSCB is installed and its server refused to start with `ad-below-phase1
 This block covers only a refusal before agent-director Phase 1 is installed on the host, by step 8 or otherwise. Act in this order:
 
 1. If `config.json` is in persona form and no pre-persona copy of it exists, neither step 1's copy nor one you kept elsewhere, stop here and change nothing: no reinstall, no start and no step 1. Rebuild the pre-persona `config.json` by hand, as [step 8 of "Rolling back the switch-over"](#step-8-reinstall-the-previous-cscb) says. Once you have rebuilt it, follow this block again from its start.
-2. Otherwise, first rebuild by hand to their pre-persona form, as [step 8 of "Rolling back the switch-over"](#step-8-reinstall-the-previous-cscb) says, the crontable targets and `/interject` callers that the conversion to personas left in persona form where step 1's copy of them is missing. Then reinstall the previous CSCB, the version step 1 recorded or else the version the host ran before, with the pre-persona `config.json`, crontable, `/interject` callers, `access.json` and Slack token environment variables: from step 1's files, or a pre-persona copy of `config.json` you kept, where they exist, and otherwise from those still in place. Start it, re-enabling the host's autostart for CSCB if it was disabled, as step 8's "no go" branch does.
+2. Otherwise, first rebuild by hand to their pre-persona form, as [step 8 of "Rolling back the switch-over"](#step-8-reinstall-the-previous-cscb) says, the crontable targets and `/interject` callers that the conversion to personas left in persona form where step 1's copy of them is missing. Then reinstall the previous CSCB, the version step 1 recorded or else the version the host ran before, with the pre-persona `config.json`, crontable, `/interject` callers, `access.json` and Slack token environment variables: from step 1's files, or a pre-persona copy of `config.json` you kept, where they exist, and otherwise from those still in place. Start it, re-enabling the host's autostart for CSCB if it was disabled, as step 8's "no go" branch does. Put the files back by the old state directory's name, `~/.claude/channels/slack`: a start of the new CSCB has already moved that directory to `~/.config/cscb` and left a symbolic link at the old name, which the previous CSCB reads through.
 3. Then, if agent-director is not 0.10.0 (below 0.7.0 under `ad-system-install-too-old`; 0.7.0 to 0.9.x under `ad-below-phase1-floor`), bring it to 0.10.0 outside this runbook. This block gives no command for it.
 4. Then start the runbook at [step 1](#step-1-check-the-host-and-stage-the-release). Step 3 is then the old CSCB's own stop.
 
@@ -2616,8 +2616,8 @@ Do this beforehand, with the old CSCB running and still installed as the global 
 
    `expire` is not among them: CSCB never calls it. [Sizing the agent-director call timeout](#sizing-the-agent-director-call-timeout) works through examples.
 8. **Leftover sessions.** As the workers' user, on the pinned socket, compare `tmux ls` with `agent-director list`, and record in the switch-over log every `slack_bot_` session that no row names.
-9. **Stage the new release without installing it.** Choose its exact version, record it in the switch-over log and confirm that it is available to install. Write the persona configuration, with `agent_director_call_timeout_ms`, in a separate file, never `config.json`, which the old CSCB reads. Prepare the Slack apps. Nothing is installed over the global package yet, so step 3's `stop --stop-bots` is the old version's own and reads the old, pre-persona `config.json`. Steps 1, 2, 3, 5 and 6 of [Upgrading to personas](#upgrading-to-personas) belong here.
-10. **Copies for rollback.** Keep copies of the pre-persona `config.json`, the crontable, the `/interject` callers (the host crontab's `curl` lines included), `access.json` and the Slack token environment variables the old CSCB uses. Record the old CSCB's exact version in the switch-over log beside them.
+9. **Stage the new release without installing it.** Choose its exact version, record it in the switch-over log and confirm that it is available to install. Write the persona configuration, with `agent_director_call_timeout_ms`, in a separate file, never `config.json`, which the old CSCB reads. Prepare the Slack apps. Nothing is installed over the global package yet, so step 3's `stop --stop-bots` is the old version's own and reads the old, pre-persona `config.json` from the old state directory, `~/.claude/channels/slack`, where the old package keeps it. In the staged file, name each persona's `credentials_file` in that directory too, never under `~/.config/cscb` (step 7 says why). Steps 1, 2, 3, 5 and 6 of [Upgrading to personas](#upgrading-to-personas) belong here.
+10. **Copies for rollback.** Keep copies of the pre-persona `config.json`, the crontable, the `/interject` callers (the host crontab's `curl` lines included), `access.json` and the Slack token environment variables the old CSCB uses. The old CSCB keeps `config.json`, the crontable and `access.json` in the old state directory, `~/.claude/channels/slack`: keep the copies outside it, because the first start in step 10 moves that directory. Record the old CSCB's exact version in the switch-over log beside them.
 11. **The orchestrator prompt (operator action).** The shared orchestrator prompt's "ship now" wording may go out any time before the switch-over. The shared orchestrator prompt is the system prompt your orchestrator bots load, for example the file `append_system_prompt_file` names.
 
 #### Step 2: Disable CSCB's autostart
@@ -2632,7 +2632,7 @@ With the old CSCB still installed, run its own stop:
 claude-slack-channel-bots stop --stop-bots
 ```
 
-This is the old version's own `stop --stop-bots`, which reads the old, pre-persona `config.json`, since nothing new is installed before step 7. An operator arriving from a startup refusal has first reinstalled the previous CSCB (see [Arrived here from a startup refusal?](#arrived-here-from-a-startup-refusal)), so this holds for them too. From here until step 10, no bot server runs.
+This is the old version's own `stop --stop-bots`, which reads the old, pre-persona `config.json` from the old state directory, `~/.claude/channels/slack`, where the old package keeps it, since nothing new is installed before step 7. An operator arriving from a startup refusal has first reinstalled the previous CSCB (see [Arrived here from a startup refusal?](#arrived-here-from-a-startup-refusal)), so this holds for them too. From here until step 10, no bot server runs.
 
 #### Step 4: Wait for the old rows to end
 
@@ -2674,12 +2674,14 @@ A leftover that cannot be ended this way means no Phase 1 install: take step 8's
    ```sh
    bun install -g claude-slack-channel-bots@<the version recorded in step 1>
    ```
-2. Put the persona configuration in place as `config.json`.
-3. Write each persona's credentials file with the new CLI (see [`claude-slack-channel-bots credentials`](#claude-slack-channel-bots-credentials)).
-4. Rewrite crontable targets and `/interject` callers to name personas.
+2. Put the persona configuration in place as `config.json`, in the old state directory, `~/.claude/channels/slack`, which the new CLI keeps using until the new CSCB's first start.
+3. Write each persona's credentials file with the new CLI (see [`claude-slack-channel-bots credentials`](#claude-slack-channel-bots-credentials)), into the same directory: each `credentials_file` in the staged configuration names a path there.
+4. Rewrite crontable targets and `/interject` callers to name personas, in the crontable in the same directory.
 5. Run the new install check (see [Checking your agent-director install](#checking-your-agent-director-install)). It passes on the still-installed 0.10.0, with its note.
 
 Steps 4, 7 and 8 of [Upgrading to personas](#upgrading-to-personas) belong here. From this step the new CSCB is deployed but not started.
+
+**Steps 7 and 8, the call-timeout edit included, must not create `~/.config/cscb`.** The credentials command makes the directory of a `credentials_file` that is missing, so a path under `~/.config/cscb` creates it. The new CSCB's first start moves the old state directory to `~/.config/cscb` in one rename when that does not exist; when it exists, the start merges the old directory into it entry by entry, and a file that differs in the two is a conflict that leaves the old directory in place.
 
 #### Step 8: Install agent-director Phase 1
 
@@ -2695,7 +2697,7 @@ Steps 4, 7 and 8 of [Upgrading to personas](#upgrading-to-personas) belong here.
 4. **Install agent-director Phase 1.** Its schema migration adds thirteen columns and the one-row `store_meta` table, which holds the store's id. Confirm that `agent-director version` shows the Phase 1 version.
 5. **Write the `[tmux]` values.** Right after the install, before the restarts that follow and so before the new CSCB starts, write any non-default `[tmux]` values you want into `~/.agent-director/config.toml`. A long-running agent-director process reads the file only when it starts.
 6. **Restart `serve` (operator action).** Restart every `agent-director serve` process and every other long-running agent-director process still running. Compare process start times to confirm that none is older than the install. Record the version and that result in the switch-over log.
-7. **Check the settings again.** Read the nine timing settings and `[pause] timeout_seconds` again as in step 1, and record the effective values. Confirm them and the call timeout as in step 1; if the need has grown, raise `agent_director_call_timeout_ms` in `config.json` before step 10. Confirm that `agent-director list` answers without `ErrConfigMalformed`.
+7. **Check the settings again.** Read the nine timing settings and `[pause] timeout_seconds` again as in step 1, and record the effective values. Confirm them and the call timeout as in step 1; if the need has grown, raise `agent_director_call_timeout_ms` in `config.json` before step 10, in the old state directory's copy (step 7's warning applies). Confirm that `agent-director list` answers without `ErrConfigMalformed`.
 
 #### Step 9: Start the other agents again
 
@@ -2709,6 +2711,8 @@ Every other agent on the host is started again by its owner (operator action), w
    claude-slack-channel-bots start
    ```
    The first start has no last-applied record yet, so it checks `config.json`, records it and applies it; after that, edits wait until you apply them (see [Reload](#reload)). Each persona starts fresh once. Pre-persona rows are kept and never resumed.
+
+   This start also moves the old state directory: `~/.claude/channels/slack` is renamed to `~/.config/cscb`, a symbolic link to it is left at the old name, and the server logs one `[slack] state-migrate: moved the state directory from …` line to `~/.config/cscb/server.log`. Edit `config.json` and the other state files through `~/.config/cscb` after it.
 3. **The post-install check (operator action).** Once every agent has been started again, confirm that `agent-director list --state pending` shows a `launch_started_at` on every row. Record the result in the switch-over log. A row without one is a human's to look at, and the persona whose row it is is held (see "A persona posts a *Held: launch start not recorded* notice" and "How a hold ends" in [Troubleshooting](#troubleshooting)).
 
 #### Step 11: Schedule the daily expire
@@ -2795,12 +2799,12 @@ Revert the shared orchestrator prompt's "hold until after" wording that switch-o
 
 #### Step 8: Reinstall the previous CSCB
 
-1. Move aside `config.json.last-applied` and `retired-keys.json` (see [Files beside the config file](#files-beside-the-config-file)).
+1. Move aside `config.json.last-applied` and `retired-keys.json` (see [Files beside the config file](#files-beside-the-config-file)), which are in `~/.config/cscb` after the new CSCB's first start.
 2. Reinstall the previous CSCB, the version switch-over step 1 recorded, or else the version the host ran before, without starting it:
    ```sh
    bun install -g claude-slack-channel-bots@<the previous version>
    ```
-3. Put back what switch-over step 1 saved: the pre-persona `config.json`, the crontable, the `/interject` callers (the host crontab's `curl` lines included), `access.json` and the Slack token environment variables.
+3. Put back what switch-over step 1 saved: the pre-persona `config.json`, the crontable, the `/interject` callers (the host crontab's `curl` lines included), `access.json` and the Slack token environment variables. Put `config.json`, the crontable and `access.json` back in the old state directory, by its old name, `~/.claude/channels/slack`: after the new CSCB's first start that name is a symbolic link to `~/.config/cscb`, and the previous CSCB reads its files through the link. Leave the link in place, and do not make a directory at the old name.
 4. Where switch-over step 1's copy of a file is missing, the operator rebuilds the pre-persona file by hand from the persona configuration, reversing the manual conversion in [Upgrading to personas](#upgrading-to-personas). No tooling does this: CSCB ships no conversion tooling in either direction.
 
 #### Step 9: Start the previous CSCB
@@ -2813,7 +2817,7 @@ claude-slack-channel-bots start
 
 ### Upgrading to personas
 
-This major version accepts only the persona configuration format. These are the configuration steps of an upgrade from an earlier major version. Do them inside the switch-over runbook, not on their own: steps 1, 2, 3, 5 and 6 (the persona file, names, reply settings, Slack apps and who can reach each persona) at [step 1 of the switch-over](#step-1-check-the-host-and-stage-the-release), and steps 4, 7 and 8 (credentials files, crontable and `/interject` callers) at [step 7 of the switch-over](#step-7-install-the-new-cscb-without-starting-it). At switch-over step 1, these steps are written into the separate staged file, not `config.json`; step 7 puts that file in place as `config.json`.
+This major version accepts only the persona configuration format. These are the configuration steps of an upgrade from an earlier major version. Do them inside the switch-over runbook, not on their own: steps 1, 2, 3, 5 and 6 (the persona file, names, reply settings, Slack apps and who can reach each persona) at [step 1 of the switch-over](#step-1-check-the-host-and-stage-the-release), and steps 4, 7 and 8 (credentials files, crontable and `/interject` callers) at [step 7 of the switch-over](#step-7-install-the-new-cscb-without-starting-it). At switch-over step 1, these steps are written into the separate staged file, not `config.json`; step 7 puts that file in place as `config.json`. Until the new CSCB's first start, the new CLI keeps using the old state directory, `~/.claude/channels/slack`, so the persona `config.json`, the credentials files and the crontable go there; the first start moves that directory to `~/.config/cscb`.
 
 1. **Rewrite `config.json` by hand.** A configuration from an earlier major version stops the server at start, with an error that names the offending setting and says the configuration must be converted to personas. Nothing is converted automatically and the file is not changed. Write a `personas` list as described in [Personas (config.json)](#personas-configjson); the server-wide settings keep their names. The `debug-slack-channel-bots` skill covers this error under "Pre-persona configuration".
 2. **Pick persona names whose keys don't start with one another.** The configuration check rejects such a pair. If your bots were named `horde`, `horde_admin`, …, don't name a persona `horde` beside `horde_admin`: give the shorter name a suffix, such as `horde_main` (see [Persona name and key](#persona-name-and-key)).
