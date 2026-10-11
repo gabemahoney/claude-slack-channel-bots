@@ -20,7 +20,7 @@ A single HTTP MCP server that runs several independent Claude Code bots, called 
    bun pm -g trust claude-slack-channel-bots
    ```
 
-   Bun blocks the lifecycle scripts of untrusted packages, so the postinstall does not run on the plain `install` above — you must trust the package for it to fire. The `-g` flag targets the global install; without it `bun pm trust` looks for a `package.json` in the current directory and errors with `No package.json was found`. (Run `bun pm -g untrusted` to confirm it is listed first.) The postinstall then creates skeleton config files in `~/.claude/channels/slack/` (or in `SLACK_STATE_DIR` when it is set and non-empty, the same directory the server reads) and `~/.claude/slack-mcp.json`, and links the `debug-slack-channel-bots` skill into `~/.claude/skills/`. Skip this step and a later `start` fails with `missing prerequisite: config.json`.
+   Bun blocks the lifecycle scripts of untrusted packages, so the postinstall does not run on the plain `install` above — you must trust the package for it to fire. The `-g` flag targets the global install; without it `bun pm trust` looks for a `package.json` in the current directory and errors with `No package.json was found`. (Run `bun pm -g untrusted` to confirm it is listed first.) The postinstall then creates skeleton config files in `~/.config/cscb/` (or in `SLACK_STATE_DIR` when it is set and non-empty, the same directory the server reads) and `~/.claude/slack-mcp.json`, and links the `debug-slack-channel-bots` skill into `~/.claude/skills/`. Skip this step and a later `start` fails with `missing prerequisite: config.json`.
 
 3. **Run the setup skill:**
 
@@ -63,13 +63,13 @@ A single HTTP MCP server that runs several independent Claude Code bots, called 
 | `darwin-x64` (Intel Mac) | **Not supported** by agent-director |
 | Windows | **Not supported** by agent-director |
 
-If the host is unsupported, the system-installed `agent-director` itself will refuse to install or run; CSCB's startup gate then exits non-zero with one of the `ad-system-install-*` class labels (see [Startup errors](docs/troubleshooting.md#startup-errors)) and writes the failure to `~/.claude/channels/slack/startup-errors.log` and stderr. Consult [agent-director's documentation](https://github.com/gabemahoney/agent-director) for the canonical platform support list.
+If the host is unsupported, the system-installed `agent-director` itself will refuse to install or run; CSCB's startup gate then exits non-zero with one of the `ad-system-install-*` class labels (see [Startup errors](docs/troubleshooting.md#startup-errors)) and writes the failure to `~/.config/cscb/startup-errors.log` and stderr. Consult [agent-director's documentation](https://github.com/gabemahoney/agent-director) for the canonical platform support list.
 
 ---
 
 ## A first configuration
 
-`config.json` lives in `~/.claude/channels/slack/` (or `SLACK_STATE_DIR`). This one runs one persona, `planner`, that receives every message in one channel and posts its permission prompts there:
+`config.json` lives in `~/.config/cscb/` (or `SLACK_STATE_DIR`). This one runs one persona, `planner`, that receives every message in one channel and posts its permission prompts there:
 
 ```json
 {
@@ -116,7 +116,7 @@ Talk to a persona in its channels or, when its `dm.enabled` is `true`, by direct
 On a running server, saving `config.json` changes nothing yet. Within about 5 seconds the server writes a preview of the change to `config.json.pending`. Read it, then confirm it by renaming it:
 
 ```sh
-cd "${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}" && mv config.json.pending config.json.apply
+cd "${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}" && mv config.json.pending config.json.apply
 ```
 
 The server applies it without a restart. Lines that start `DESTRUCTIVE:` name personas the change retires; their conversations are not resumed. [Reload](docs/reload.md) explains the preview and what each kind of change does.

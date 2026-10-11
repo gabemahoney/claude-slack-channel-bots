@@ -4,17 +4,13 @@ The server fires scheduled prompts into personas once per minute, reading them f
 
 ## The crontable
 
-Schedules live in the crontable file at `cron_table_path`. Without that key the crontable is at `~/.config/cscb/crontab` (`$XDG_CONFIG_HOME/cscb/crontab` when `XDG_CONFIG_HOME` is an absolute path), outside `~/.claude`, so a bot appending a schedule doesn't trigger Claude Code's approval prompt for writes under `~/.claude`. With `SLACK_STATE_DIR` set, the default is `crontab` beside `config.json` in that directory. Set `cron_table_path` in `config.json` to put it anywhere else (see [Server-wide settings](server-settings.md#server-wide-settings)).
+Schedules live in the crontable file at `cron_table_path`. Without that key the crontable is `crontab` in the state directory, `~/.config/cscb/crontab` by default, outside `~/.claude`, so a bot appending a schedule doesn't trigger Claude Code's approval prompt for writes under `~/.claude`. Set `cron_table_path` in `config.json` to put it anywhere else (see [Server-wide settings](server-settings.md#server-wide-settings)).
 
 ```sh
 cat ~/.config/cscb/crontab
 ```
 
-At start the server creates the default crontable's directory. It creates the file on first boot if it is absent, with a self-documenting comment header describing the line format. See [Crontable format](#crontable-format) below for the full reference. For a `cron_table_path` you set, the directory must already exist.
-
-If the server starts with the default and finds a crontable at `crontab` beside `config.json` (`~/.claude/channels/slack/crontab`), it moves that file to the default location, its lines unchanged. It leaves a symbolic link to the new file at the old path, so a resumed session whose `CSCB_CRONTABLE_PATH` still names the old path appends to the same file. A `prompts/` directory beside the old crontable moves with it and leaves a link at its old name, so relative prompt paths keep naming the same files.
-
-If both paths hold a crontable, the server uses the one at the default location and logs a warning. Nothing is moved when `config.json` sets `cron_table_path`, even to `~/.config/cscb/crontab`. The `debug-slack-channel-bots` skill covers each line the move logs.
+At start the server creates the state directory. It creates the crontable on first boot if it is absent, with a self-documenting comment header describing the line format. See [Crontable format](#crontable-format) below for the full reference. For a `cron_table_path` you set, the directory must already exist.
 
 ## Crontable format
 
@@ -128,7 +124,7 @@ Each load also writes one `warn` line for each line with no persona list, naming
 Add a persona list to that line. The warning comes back at every start and every edit until you do; an unchanged crontable is not reloaded, so it is not repeated each minute. To list them in the cron log at its default location:
 
 ```sh
-grep undeliverable ~/.claude/channels/slack/cron.log
+grep undeliverable ~/.config/cscb/cron.log
 ```
 
 ## Delivery semantics

@@ -4,7 +4,7 @@ The persona reference for `config.json`: every persona field, credentials files 
 
 ## Personas (config.json)
 
-`config.json` is read from `~/.claude/channels/slack/config.json` by default. Override the directory with `SLACK_STATE_DIR`. The server needs only this file and the credentials files it names.
+`config.json` is read from `~/.config/cscb/config.json` by default (`$XDG_CONFIG_HOME/cscb/config.json` when `XDG_CONFIG_HOME` is an absolute path). Override the directory with `SLACK_STATE_DIR`. The server needs only this file and the credentials files it names.
 
 Each bot is a **persona**: one Slack app, one Claude instance with its own working directory, and the channels it serves. In declarative mode, the default, those are the channels it is configured into, and its tools may target only them; in fungible mode, they are the public and private channels its app is invited to that are not externally shared, and its tools may target any channel ID: the call goes to Slack, which decides (see [Tools](bots.md#tools) and [Channel modes](channel-modes.md#channel-modes)). Create one Slack app per persona (see `slack-app-manifest.yml`); that app gives the persona its own name and avatar in Slack.
 

@@ -497,18 +497,30 @@ export const PRELOAD_ENV_NAMES = Object.freeze(['HOME', 'PATH', 'TMUX', 'TMUX_PA
 
 export type PreloadEnvName = (typeof PRELOAD_ENV_NAMES)[number]
 
-/** Where the preload guard points `SLACK_STATE_DIR`, relative to the new HOME: the server's default state directory. */
-export const PRELOAD_STATE_DIR_PATH = join('.claude', 'channels', 'slack')
-
 /**
  * The XDG configuration directory under a home, relative to it: where
  * `XDG_CONFIG_HOME` points by default, and where the preload guard points it
- * under the new HOME. `src/` puts the crontable's default under it (bug b.avm).
+ * under the new HOME. `src/` puts the server's default state directory under
+ * it (bug b.fc4; the crontable's default before that, bug b.avm).
  */
 export const XDG_CONFIG_DIR = '.config'
 
-/** CSCB's directory under the XDG configuration directory, relative to a home: the crontable's default directory (bug b.avm). */
+/** CSCB's directory under the XDG configuration directory, relative to a home: the server's default state directory (bug b.fc4). */
 export const CSCB_XDG_CONFIG_PATH = join(XDG_CONFIG_DIR, 'cscb')
+
+/** Where the preload guard points `SLACK_STATE_DIR`, relative to the new HOME: the server's default state directory (`CSCB_XDG_CONFIG_PATH`). */
+export const PRELOAD_STATE_DIR_PATH = CSCB_XDG_CONFIG_PATH
+
+/**
+ * The server's state directory before bug b.fc4, relative to a home. The
+ * server moves what it holds to the new default at start and leaves a
+ * symbolic link behind, and the CLI still reads it while it holds the only
+ * config; a run must reach neither (`holdsSlackState`).
+ */
+export const LEGACY_STATE_DIR_PATH = join('.claude', 'channels', 'slack')
+
+/** Both default state directories, relative to a home: the ones a launch-time home must not hold (`holdsSlackState`). */
+export const DEFAULT_STATE_DIR_PATHS: readonly string[] = Object.freeze([PRELOAD_STATE_DIR_PATH, LEGACY_STATE_DIR_PATH])
 
 /** The preload guard's variables; a missing name is unset. */
 export type PreloadEnv = { [Name in PreloadEnvName]?: string }
@@ -531,12 +543,12 @@ export type PreloadEnvSource = Readonly<PreloadEnv> | Readonly<NodeJS.ProcessEnv
  *   included); `EMPTY_CHILD_PATH` when no entry is left;
  * - `TMUX_TMPDIR`: `tmuxTmpDir`;
  * - `SLACK_STATE_DIR`: `<home>/PRELOAD_STATE_DIR_PATH`
- *   (`<home>/.claude/channels/slack`), the server's default state directory
- *   under the new HOME;
+ *   (`<home>/.config/cscb`), the server's default state directory under the
+ *   new HOME;
  * - `XDG_CONFIG_HOME`: `<home>/XDG_CONFIG_DIR` (`<home>/.config`). An
  *   inherited one (the operator's own `~/.config`, say) would put the
- *   crontable's default (`$XDG_CONFIG_HOME/cscb/crontab` with
- *   `SLACK_STATE_DIR` unset, bug b.avm) in the real home; unset, it would
+ *   server's default state directory (`$XDG_CONFIG_HOME/cscb` with
+ *   `SLACK_STATE_DIR` unset, bug b.fc4) in the real home; unset, it would
  *   fall back to the launch-time home.
  * `TMUX`, `TMUX_PANE` and `CLAUDE_CONFIG_DIR` are absent (unset):
  * `CLAUDE_CONFIG_DIR` names a Claude configuration directory (a run started
@@ -667,8 +679,8 @@ export const CLAUDE_DIR = '.claude'
  * - `.claude`: Claude's default configuration directory
  *   (`resolveClaudeConfigDir`, the directory the Stop-hook patcher refuses,
  *   the default transcript root in `cozempic.ts`);
- * - `.claude/channels/slack`: the server's default state directory
- *   (`PRELOAD_STATE_DIR_PATH`);
+ * - `.claude/channels/slack`: the server's state directory before bug b.fc4
+ *   (`LEGACY_STATE_DIR_PATH`);
  * - `.claude/projects`: the default JSONL transcript root
  *   (`resolveJsonlRoots`, `resolveJsonlPath`) and the root of the memory Read
  *   rules;
@@ -679,13 +691,14 @@ export const CLAUDE_DIR = '.claude'
  *   probe and the client's store), `config.toml` (agent-director's settings
  *   file) and `bin/agent-director` (`AGENT_DIRECTOR_INSTALL_PATH`);
  * - `.config` (`resolveXdgConfigHome` with `XDG_CONFIG_HOME` unset or
- *   relative) and, under it, `cscb` and `cscb/crontab`: the crontable's
- *   default with `SLACK_STATE_DIR` unset, whose directory the start creates
- *   and into which it moves a crontable left at the old default (bug b.avm).
+ *   relative) and, under it, `cscb` and `cscb/crontab`: the server's default
+ *   state directory with `SLACK_STATE_DIR` unset (`PRELOAD_STATE_DIR_PATH`),
+ *   which the start creates and into which it moves the old default's files
+ *   (bug b.fc4), and the crontable in it.
  */
 export const LAUNCH_HOME_DERIVED_PATHS: readonly string[] = Object.freeze([
   CLAUDE_DIR,
-  PRELOAD_STATE_DIR_PATH,
+  LEGACY_STATE_DIR_PATH,
   join(CLAUDE_DIR, 'projects'),
   join(CLAUDE_DIR, 'skills'),
   join(CLAUDE_DIR, 'slack-mcp.json'),
@@ -818,9 +831,11 @@ export function launchTimeHomes(): string[] {
  *   `holdsSlackState` or `holdsAgentDirector`;
  * - `notUnderTempDir` (passwd home unknown): `launchHome` does not resolve
  *   to a path strictly under the temp directory;
- * - `holdsSlackState`: anything exists at `<launchHome>/.claude/channels/slack`
- *   (`PRELOAD_STATE_DIR_PATH`, the server's default state directory), a
- *   dangling symlink or an entry that cannot be looked at included;
+ * - `holdsSlackState`: anything exists at `<launchHome>/.config/cscb`
+ *   (`PRELOAD_STATE_DIR_PATH`, the server's default state directory) or at
+ *   `<launchHome>/.claude/channels/slack` (`LEGACY_STATE_DIR_PATH`, its
+ *   default before bug b.fc4), a dangling symlink or an entry that cannot be
+ *   looked at included;
  * - `derivedPathInRealHome` (passwd home known): one of
  *   `LAUNCH_HOME_DERIVED_PATHS` under `launchHome` resolves to the real home
  *   (as given or resolved) or a path under it;
@@ -831,7 +846,7 @@ export function launchTimeHomes(): string[] {
  * For a home none of these apply to, no path in `LAUNCH_HOME_DERIVED_PATHS`
  * resolves into the real home (with the passwd home unknown: each resolves
  * strictly under the temp directory, which is not the root), and nothing
- * exists at its `.claude/channels/slack` or its agent-director install paths.
+ * exists at its `DEFAULT_STATE_DIR_PATHS` or its agent-director install paths.
  */
 export function launchHomeRefusal(launchHome: string, passwdHome: string | undefined, probe: LaunchHomeProbe): LaunchHomeRefusal | undefined {
   if (typeof launchHome !== 'string' || !isAbsolute(launchHome)) return LAUNCH_HOME_REFUSAL.notAbsolute
@@ -850,7 +865,7 @@ export function launchHomeRefusal(launchHome: string, passwdHome: string | undef
     leaves = (resolved) => resolved === temp || !isUnder(resolved, temp)
     if (leaves(probe.canonical(launchHome))) return LAUNCH_HOME_REFUSAL.notUnderTempDir
   }
-  if (probe.exists(join(launchHome, PRELOAD_STATE_DIR_PATH))) return LAUNCH_HOME_REFUSAL.holdsSlackState
+  if (DEFAULT_STATE_DIR_PATHS.some((path) => probe.exists(join(launchHome, path)))) return LAUNCH_HOME_REFUSAL.holdsSlackState
   if (LAUNCH_HOME_DERIVED_PATHS.some((path) => leaves(probe.canonical(join(launchHome, path))))) {
     return real !== undefined ? LAUNCH_HOME_REFUSAL.derivedPathInRealHome : LAUNCH_HOME_REFUSAL.derivedPathNotUnderTempDir
   }

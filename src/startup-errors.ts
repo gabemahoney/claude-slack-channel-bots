@@ -9,9 +9,9 @@
  *      `options.omitStderr` is set
  *   2. <stateDir>/startup-errors.log — append-only, created on demand
  *
- * <stateDir> resolution:
+ * <stateDir> resolution (`resolveServerStateDir`, config.ts, the one definition):
  *   SLACK_STATE_DIR env var → resolve(SLACK_STATE_DIR)
- *   fallback                → ~/.claude/channels/slack/
+ *   fallback                → <XDG config home>/cscb (~/.config/cscb/)
  *
  * Never throws. Never calls process.exit. Falls back to stderr-only on disk
  * failure and emits a one-line warning.
@@ -26,19 +26,15 @@
  */
 
 import { mkdirSync, openSync, writeSync, closeSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
+
+import { resolveServerStateDir } from './config.ts'
 
 export interface StartupErrorOptions {
   /** Override the directory where startup-errors.log is written. */
   logDir?: string
   /** Leave out the entry's copy on fd 2: the entry goes to startup-errors.log alone. */
   omitStderr?: boolean
-}
-
-function resolveStateDir(): string {
-  const fromEnv = process.env['SLACK_STATE_DIR']
-  return fromEnv ? resolve(fromEnv) : join(homedir(), '.claude', 'channels', 'slack')
 }
 
 function flatten(s: string): string {
@@ -86,7 +82,7 @@ export function recordStartupError(
 
   if (options?.omitStderr !== true) writeStderr(line)
 
-  const logDir = options?.logDir ?? resolveStateDir()
+  const logDir = options?.logDir ?? resolveServerStateDir()
   const logPath = join(logDir, 'startup-errors.log')
 
   let fd: number | undefined

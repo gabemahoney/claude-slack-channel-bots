@@ -144,11 +144,17 @@ you to reinstall by hand.
    untouched:
 
    ```sh
-   stat -c '%n %s %Y' ~/.claude/channels/slack/config.json \
+   stat -c '%n %s %Y' ~/.config/cscb/config.json \
                       ~/.claude/slack-mcp.json 2>&1 | tee /tmp/cscb-postinstall-before
-   sha256sum ~/.claude/channels/slack/config.json \
+   sha256sum ~/.config/cscb/config.json \
              ~/.claude/slack-mcp.json 2>&1 | tee -a /tmp/cscb-postinstall-before
    ```
+
+   On a host upgraded from a release that kept its state under `~/.claude`, the
+   old state directory still holds the real `config.json` until the server's
+   first start on the new default moves it, and the postinstall scaffolds into
+   whichever one holds it. Snapshot that file instead, and expect no new
+   `~/.config/cscb/config.json` there.
 
    Then trust:
 
@@ -160,7 +166,7 @@ you to reinstall by hand.
    The `-g` flag targets the global install; run from an arbitrary directory the
    non-`-g` form errors with `No package.json was found`. `bun pm -g trust` adds
    the package to `trustedDependencies` in the global manifest and runs the
-   blocked postinstall, which scaffolds `~/.claude/channels/slack/config.json`
+   blocked postinstall, which scaffolds `~/.config/cscb/config.json`
    and `~/.claude/slack-mcp.json` and links the `debug-slack-channel-bots`
    skill into `~/.claude/skills/`. Without this step, a later `start` fails
    with the cryptic `missing prerequisite: config.json`.
@@ -168,9 +174,9 @@ you to reinstall by hand.
    Re-run the same two commands into a second file and diff:
 
    ```sh
-   stat -c '%n %s %Y' ~/.claude/channels/slack/config.json \
+   stat -c '%n %s %Y' ~/.config/cscb/config.json \
                       ~/.claude/slack-mcp.json 2>&1 | tee /tmp/cscb-postinstall-after
-   sha256sum ~/.claude/channels/slack/config.json \
+   sha256sum ~/.config/cscb/config.json \
              ~/.claude/slack-mcp.json 2>&1 | tee -a /tmp/cscb-postinstall-after
    diff /tmp/cscb-postinstall-before /tmp/cscb-postinstall-after
    ```
@@ -259,7 +265,9 @@ src/cli.ts start` from the repo — customer-shaped boot.
   there is no self-match false positive. This is reboot-proof: the pidfile can
   survive a reboot while PIDs reset and get reused, so a bare `kill -0` on the
   pidfile PID could falsely match an unrelated reused-PID process.
-- The pidfile (`~/.claude/channels/slack/server.pid`) is additive, not primary.
+- The pidfile (`~/.config/cscb/server.pid`; the old state directory's, under
+  `~/.claude`, until the first start on the new default moves it) is additive,
+  not primary.
   When a daemon is live, the pidfile PID is trusted only after
   `ps -p <pid> -o args=` confirms that PID's argv is that daemon; otherwise the
   stale pidfile is removed with a logged warning so a later `stop` can't act on a

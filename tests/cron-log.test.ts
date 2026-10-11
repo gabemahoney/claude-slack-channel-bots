@@ -286,7 +286,7 @@ describe('all nine outcome classes round-trip into the log', () => {
 
 describe('detail key=value tokens', () => {
   test('carries the full prompt path in a prompt= token', () => {
-    const promptPath = '/home/horde/.claude/channels/slack/prompts/daily.md'
+    const promptPath = '/home/horde/.config/cscb/prompts/daily.md'
     const line = formatOutcomeLine(
       makeRecord({ detail: makeDetail({ promptPath }) }),
     )

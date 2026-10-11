@@ -16,9 +16,9 @@ fi
 set -euo pipefail
 
 TEST_NAME="test-3-cozempic-restart"
-LOG="${HOME}/.claude/channels/slack/server.log"
+LOG="${HOME}/.config/cscb/server.log"
 STOP_OUT="/tmp/test-3-stop.out"
-PID_FILE="${HOME}/.claude/channels/slack/server.pid"
+PID_FILE="${HOME}/.config/cscb/server.pid"
 
 fail() {
     echo "FAIL: ${TEST_NAME}: $1" >&2

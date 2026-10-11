@@ -1178,7 +1178,9 @@ install shares nothing with them:
 - **Capped.** `--memory 8g`, `--memory-swap 8g` and `--pids-limit 2048` (see
   [Memory bounds](#memory-bounds)).
 - **Two mounts only, both read-only.** The tarball (`/tmp/package.tgz`) and
-  `~/.config/cscb-test/credentials/` (as the test user's `~/.config/cscb`).
+  `~/.config/cscb-test/credentials/` (as the test user's
+  `~/.config/cscb-credentials`, beside the state directory `~/.config/cscb`,
+  which the server writes to).
   The host's `~/.claude` is never mounted, nor any directory that holds it.
   A guard checks every `docker run` argument list before it is spawned: it
   accepts only the flags the runner uses, in any spelling, and refuses
@@ -1203,7 +1205,8 @@ install shares nothing with them:
   sessions (with the host's `TMUX_TMPDIR`, so it reads the production bots'
   tmux server), the PID listening on host port 3100 (from `/proc`, nothing
   connects) and the sha256 of the host's
-  `~/.claude/channels/slack/config.json`. Any difference fails the run, and
+  `~/.config/cscb/config.json`, or the old state directory's `config.json`
+  when the host's server has not yet moved it. Any difference fails the run, and
   so does a probe that fails before or after (`probe failed: …`), since two
   failures would otherwise compare equal. It runs even when provisioning or
   an earlier check failed. Its two probes, `agent-director … list` on the
@@ -1768,7 +1771,7 @@ against it in `tests/ci-live-checks.test.ts`.
 |---|---|
 | Provisioning | A result row of its own (the stages above) |
 | Pre-flight, Part 1.4 install | Automated in the container. The install is `bun install -g --ignore-scripts` of the tarball, then `bun pm -g trust`; then `ad-client-check.sh --package "$PKG"` checks the agent-director client the installed package resolves, changing nothing (see [The client under test](#the-client-under-test)), before the package checksums Check S2 compares against |
-| Part 1.5 setup | The runner writes `config.json` and the system prompt as the wizard's answers would (a deviation noted in the results). `config.json` also sets `cron_table_path` to `/home/testuser/.claude/channels/slack/crontab`, in the state directory (`CONTAINER_CRON_TABLE_PATH` in `ci-live/lib/live-config.ts`), which the wizard leaves out: the default, `~/.config/cscb/crontab`, lies in the read-only credentials mount, where the scheduler could not create it. A path set in `config.json` is used as written, so the server moves nothing at start |
+| Part 1.5 setup | The runner writes `config.json` and the system prompt as the wizard's answers would (a deviation noted in the results). `config.json` also sets `cron_table_path` to `/home/testuser/.config/cscb/crontab`, in the state directory (`CONTAINER_CRON_TABLE_PATH` in `ci-live/lib/live-config.ts`), which the wizard leaves out: that path is the default's own, written out so the run does not depend on the start's default-crontable preparation. Each persona's `credentials_file` names `~/.config/cscb-credentials/`, where the runner mounts the credentials read-only, not the wizard's `~/.config/cscb/`: the state directory sits beside the mount, so the server can write to it |
 | S1 | `SKIPPED (manual only: the wizard chat)` |
 | S2, S3 | Automated, also in a dry run |
 | 1 to 6, 8 to 11, 13 | Automated |

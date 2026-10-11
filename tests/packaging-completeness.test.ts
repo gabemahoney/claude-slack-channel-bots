@@ -174,22 +174,14 @@ import {
 } from '../src/registry.ts'
 import { DECLARATIVE_DESTINATION_SETTING, FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
 import {
-  CRON_TABLE_CHANGED_DURING_COPY_CAUSE,
-  cronPromptsLinkedAcrossFileSystemsLine,
-  cronPromptsLinkedLine,
-  cronPromptsLinkFailedLine,
-  cronPromptsMovedLine,
-  cronPromptsMoveFailedLine,
-  cronPromptsOldNameLinkFailedLine,
-  cronRelativePromptMovedLine,
-  cronTableBothExistLine,
-  cronTableLinkedLine,
-  cronTableMkdirFailedLine,
-  cronTableMovedLine,
-  cronTableMoveFailedLine,
-  cronTableNotRegularLine,
-  cronTableSwapFailedLine,
-} from '../src/cron-table-migration.ts'
+  stateDirFailedLine,
+  stateDirLegacyServerRunningLine,
+  stateDirLegacyUnusableLine,
+  stateDirLinkFailedLine,
+  stateDirMergedLine,
+  stateDirPendingLine,
+  stateDirRenamedLine,
+} from '../src/state-dir-migration.ts'
 import { DM_DESTINATION, type ChannelMode } from '../src/config.ts'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
 import { HostSafetyError, hostSafeChildEnv, resolveToolDir } from './test-helpers/host-safe-env.ts'
@@ -1017,15 +1009,31 @@ function personaLineTemplate(label: PersonaDiagnosticClass, cause: string): stri
   return formatPersonaDiagnostic({ class: label, name: NAME, key: KEY, index: 0, cause }).replace('personas[0]', 'personas[<i>]')
 }
 
-/** The section quoting the start's `[slack] cron-migrate:` lines (bug b.avm). */
-const CRON_LOCATION_HEADING = "## The crontable's location and its move at start"
+/** The section quoting the start's `[slack] state-migrate:` lines (bug b.fc4). */
+const STATE_LOCATION_HEADING = "## The state directory's location and its move at start"
 
-/** The placeholders the skill writes in the crontable's lines (bug b.avm). */
-const OLD_CRONTAB = '<old>'
-const NEW_CRONTAB = '<new>'
-const CAUSE = '<error>'
-const OLD_PROMPTS = '<old dir>/prompts'
-const NEW_PROMPTS = '<new dir>/prompts'
+/** The placeholders the skill writes in the state directory's lines (bug b.fc4). */
+const OLD_STATE = '<old>'
+const NEW_STATE = '<new>'
+const STATE_TARGET = '<target>'
+const STATE_NAME = '<name>'
+const STATE_CAUSE = '<cause>'
+
+/** `rendered` from the first `start` through the first `end` after it: a quote of one stretch of a line. */
+function stretch(rendered: string, start: string, end: string): string {
+  const from = rendered.indexOf(start)
+  const to = rendered.indexOf(end, from)
+  if (from < 0 || to < 0) throw new Error(`"${start}" through "${end}" is not in the rendering "${rendered}"`)
+  return rendered.slice(from, to + end.length)
+}
+
+/** `rendered` with what lies between `after` and `before` (both kept) written as ` … `: a quote that skips a stretch. */
+function elide(rendered: string, after: string, before: string): string {
+  const from = rendered.indexOf(after)
+  const to = rendered.indexOf(before, from + after.length)
+  if (from < 0 || to < 0) throw new Error(`"${after}" then "${before}" is not in the rendering "${rendered}"`)
+  return `${rendered.slice(0, from + after.length)} … ${rendered.slice(to)}`
+}
 
 /** `rendered` up to and including the first `through`, then ` …`: a quote the skill cuts short there. */
 function quotedUpTo(rendered: string, through: string): string {
@@ -1057,9 +1065,9 @@ function modeSwitchTemplate(mode: ChannelMode): string {
  * `reload-record-write-failed` line (SRI-408), and the switch's and the
  * recorded change's preview lines (SRI-803, SRI-804), and the
  * `persona-invited-channel`, `persona-channel-delivery-set` and fungible-mode
- * `unclaimed-channel` lines (SRI-902, SRI-903), and the start's crontable
- * lines, `[slack] cron-migrate:` and `[slack] Warning: cron-migrate:` (bug
- * b.avm). Rendered when a case runs, never at collection.
+ * `unclaimed-channel` lines (SRI-902, SRI-903), and the start's state directory lines, `[slack] state-migrate:` and
+ * `[slack] Warning: state-migrate:` (bug b.fc4). Rendered when a case runs,
+ * never at collection.
  */
 const QUOTED_TEXTS: [label: string, where: HeadingMatch, render: () => string][] = [
   [
@@ -1170,57 +1178,93 @@ const QUOTED_TEXTS: [label: string, where: HeadingMatch, render: () => string][]
       return `\`${line.slice(line.lastIndexOf('; '))}\``
     },
   ],
-  ['the crontable moved line', CRON_LOCATION_HEADING, () => cronTableMovedLine(OLD_CRONTAB, NEW_CRONTAB)],
-  ['the crontable linked line', CRON_LOCATION_HEADING, () => cronTableLinkedLine(OLD_CRONTAB, NEW_CRONTAB, '<target>')],
   [
-    'the crontable both-exist WARN',
-    CRON_LOCATION_HEADING,
-    () => quotedUpTo(cronTableBothExistLine(OLD_CRONTAB, NEW_CRONTAB), 'its lines are not scheduled.'),
-  ],
-  ['the crontable not-regular WARN', CRON_LOCATION_HEADING, () => cronTableNotRegularLine(OLD_CRONTAB, NEW_CRONTAB)],
-  [
-    "the default directory's mkdir WARN, naming the old path the start runs on",
-    CRON_LOCATION_HEADING,
-    () => quotedUpTo(cronTableMkdirFailedLine('<dir>', OLD_CRONTAB, CAUSE), 'the old location:'),
+    'the state directory renamed line',
+    STATE_LOCATION_HEADING,
+    () => quotedUpTo(stateDirRenamedLine(OLD_STATE, NEW_STATE), 'is now a symbolic link to it,'),
   ],
   [
-    'the crontable move-failed WARN, naming the old path the start runs on',
-    CRON_LOCATION_HEADING,
-    () => quotedUpTo(cronTableMoveFailedLine(OLD_CRONTAB, NEW_CRONTAB, CAUSE), 'the old location:'),
+    'the state directory merged line, naming what moved',
+    STATE_LOCATION_HEADING,
+    () =>
+      quotedUpTo(
+        stateDirMergedLine(OLD_STATE, NEW_STATE, [STATE_NAME]).replace(`moved "${STATE_NAME}" from`, `moved "${STATE_NAME}", … from`),
+        `is now a symbolic link to ${NEW_STATE},`,
+      ),
   ],
   [
-    'the crontable move-failed WARN for a crontable that changed while it was copied',
-    CRON_LOCATION_HEADING,
-    () => quotedUpTo(cronTableMoveFailedLine(OLD_CRONTAB, NEW_CRONTAB, CRON_TABLE_CHANGED_DURING_COPY_CAUSE), 'Nothing was moved.'),
-  ],
-  ['the crontable swap-failed WARN after a hard link', CRON_LOCATION_HEADING, () => cronTableSwapFailedLine(OLD_CRONTAB, NEW_CRONTAB, CAUSE, true)],
-  [
-    'the crontable swap-failed WARN after a copy',
-    CRON_LOCATION_HEADING,
-    () => quotedUpTo(cronTableSwapFailedLine(OLD_CRONTAB, NEW_CRONTAB, CAUSE, false), 'a line appended there is not scheduled.'),
-  ],
-  ['the prompts moved line', CRON_LOCATION_HEADING, () => cronPromptsMovedLine(OLD_PROMPTS, NEW_PROMPTS)],
-  [
-    'the prompts move-failed WARN',
-    CRON_LOCATION_HEADING,
-    () => quotedUpTo(cronPromptsMoveFailedLine(OLD_PROMPTS, NEW_PROMPTS, CAUSE), 'no longer finds its prompt.'),
+    'the state directory merged line, when nothing needed to move',
+    STATE_LOCATION_HEADING,
+    () => stretch(stateDirMergedLine(OLD_STATE, NEW_STATE, []), 'nothing needed to move', 'nothing needed to move'),
   ],
   [
-    'the prompts old-name link WARN',
-    CRON_LOCATION_HEADING,
-    () => quotedUpTo(cronPromptsOldNameLinkFailedLine(OLD_PROMPTS, NEW_PROMPTS, CAUSE), 'no longer finds its prompt.'),
+    'the state directory conflict WARN',
+    STATE_LOCATION_HEADING,
+    () => quotedUpTo(stateDirPendingLine(OLD_STATE, NEW_STATE, [], [STATE_NAME], []), 'is left untouched.'),
   ],
   [
-    'the prompts linked-across-file-systems WARN',
-    CRON_LOCATION_HEADING,
-    () => quotedUpTo(cronPromptsLinkedAcrossFileSystemsLine(NEW_PROMPTS, OLD_PROMPTS, CAUSE), 'under ~/.claude.'),
+    'the state directory leftover WARN',
+    STATE_LOCATION_HEADING,
+    () =>
+      quotedUpTo(
+        stateDirPendingLine(OLD_STATE, NEW_STATE, [], [], [STATE_NAME]).replace(
+          ` from ${OLD_STATE} to its new default location ${NEW_STATE}:`,
+          ' …:',
+        ),
+        'during the move.',
+      ),
   ],
-  ['the prompts linked line, for a legacy prompts that is a link', CRON_LOCATION_HEADING, () => cronPromptsLinkedLine(NEW_PROMPTS, '<target dir>')],
-  ['the prompts link-failed WARN', CRON_LOCATION_HEADING, () => cronPromptsLinkFailedLine(NEW_PROMPTS, '<target dir>', CAUSE)],
   [
-    'the relative-prompt WARN',
-    CRON_LOCATION_HEADING,
-    () => cronRelativePromptMovedLine(7, '<path>', '<before>', '<after>').replace('crontable line 7:', 'crontable line <n>:'),
+    'the state directory link-elsewhere WARN',
+    STATE_LOCATION_HEADING,
+    () => quotedUpTo(stateDirLegacyUnusableLine(OLD_STATE, NEW_STATE, 'link-elsewhere', STATE_TARGET), `set SLACK_STATE_DIR=${STATE_TARGET}.`),
+  ],
+  [
+    'the state directory not-a-directory WARN',
+    STATE_LOCATION_HEADING,
+    () => quotedUpTo(stateDirLegacyUnusableLine(OLD_STATE, NEW_STATE, 'not-directory'), `Nothing was moved to ${NEW_STATE},`),
+  ],
+  [
+    'the state directory old-server-running stop line',
+    STATE_LOCATION_HEADING,
+    () =>
+      elide(stateDirLegacyServerRunningLine(OLD_STATE, NEW_STATE, 4242).replace('PID 4242', 'PID <pid>'), '(PID <pid>).', 'Stop that server'),
+  ],
+  [
+    'the state directory failed line for a directory that could not be created',
+    STATE_LOCATION_HEADING,
+    () => stretch(stateDirFailedLine(OLD_STATE, NEW_STATE, 'mkdir', STATE_CAUSE, []), '[slack] state-migrate:', `(${STATE_CAUSE})`),
+  ],
+  [
+    'the state directory failed line for an entry that could not be moved',
+    STATE_LOCATION_HEADING,
+    () =>
+      stretch(
+        stateDirFailedLine(OLD_STATE, NEW_STATE, 'move', STATE_CAUSE, [{ name: STATE_NAME, cause: STATE_CAUSE }]),
+        `could not move "${STATE_NAME}"`,
+        `(${STATE_CAUSE})`,
+      ),
+  ],
+  [
+    'the state directory failed line for an entry that could not be looked at',
+    STATE_LOCATION_HEADING,
+    () => stretch(stateDirFailedLine(OLD_STATE, NEW_STATE, 'unexpected', STATE_CAUSE, []), 'could not look at an entry', `(${STATE_CAUSE})`),
+  ],
+  [
+    "the state directory failed line's reassurance",
+    STATE_LOCATION_HEADING,
+    () =>
+      `${stretch(stateDirFailedLine(OLD_STATE, NEW_STATE, 'mkdir', STATE_CAUSE, []), 'Nothing was lost:', `is still in ${OLD_STATE}.`)} …`,
+  ],
+  [
+    'the state directory link-failed WARN',
+    STATE_LOCATION_HEADING,
+    () =>
+      elide(
+        elide(stateDirLinkFailedLine(OLD_STATE, NEW_STATE, STATE_CAUSE), `${STATE_CAUSE}.`, 'To restore it,'),
+        'To restore it,',
+        'run:',
+      ),
   ],
 ]
 

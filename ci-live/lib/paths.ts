@@ -40,7 +40,7 @@ export interface LivePaths {
    * token). Optional: without it an emailed code stops the run as before.
    */
   mailboxJson: string
-  /** Mounted read-only into the container as ~/.config/cscb (dir 700, files 600). */
+  /** Mounted read-only into the container as ~/.config/cscb-credentials (dir 700, files 600). */
   credentialsDir: string
   /** D's credentials wait here until Check 25 moves them into `credentialsDir`. */
   stagedCredentialsDir: string
@@ -85,7 +85,7 @@ export function dryRunLockFile(tempDir: string, uid: number): string {
 
 /**
  * Where a persona's credentials file lives on the host. D's lives in the
- * staging dir, so it is absent from the container's ~/.config/cscb until
+ * staging dir, so it is absent from the container's ~/.config/cscb-credentials until
  * Check 25 moves it in (AC 22: the file appears while the server runs).
  */
 export function hostCredentialsFile(paths: LivePaths, letter: PersonaLetter): string {

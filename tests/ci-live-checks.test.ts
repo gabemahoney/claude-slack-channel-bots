@@ -940,13 +940,25 @@ describe('host-state', () => {
       ['agent-director', '--store-path', hostStorePath('/home/tester'), 'list', '--label', 'service=cscb'],
       ['tmux', 'ls', '-F', '#{session_name}'],
     ])
-    expect([p.read, p.ports]).toEqual([['/home/tester/.claude/channels/slack/config.json'], [3100]])
+    // b.fc4: the new default's config.json, then the old default's (a host not yet moved); only reads.
+    expect([p.read, p.ports]).toEqual([['/home/tester/.config/cscb/config.json', '/home/tester/.claude/channels/slack/config.json'], [3100]])
     expect(snap).toEqual({
       adRows: ['cscb_prod_a'],
       tmuxSessions: ['slack_bot_prod_a'],
       port3100: '4242',
       configSha256: createHash('sha256').update(config).digest('hex'),
     })
+  })
+
+  test.each([
+    ['only the new default has a config', { '/h/.config/cscb/config.json': 'new' }, 'new'],
+    ['only the old default has a config (a host not yet moved)', { '/h/.claude/channels/slack/config.json': 'old' }, 'old'],
+    ['both have one, the new default wins', { '/h/.config/cscb/config.json': 'new', '/h/.claude/channels/slack/config.json': 'old' }, 'new'],
+    ['neither has one', {}, null],
+  ])('snapshotHost hashes the config in the new default state directory, else the old: %s', async (_what, files, hashed) => {
+    const { deps } = probe({ stdout: '{"spawns":[]}' }, { stdout: '' }, null)
+    const snap = await snapshotHost({ ...deps, readFile: (path: string) => (path in files ? Buffer.from(files[path as keyof typeof files]!) : null) }, '/h')
+    expect(snap.configSha256).toBe(hashed === null ? 'absent' : createHash('sha256').update(hashed).digest('hex'))
   })
 
   test.each([
@@ -1061,7 +1073,7 @@ describe('Check S2', () => {
   const PASSING: Record<string, string> = {
     'sha256sum -c': 'package unchanged',
     '-type f -print | wc -l': '42\n42',
-    'ls -A ~/.config/cscb/': 'persona_a-credentials.json\npersona_b-credentials.json\npersona_c-credentials.json',
+    'ls -A ~/.config/cscb-credentials/': 'persona_a-credentials.json\npersona_b-credentials.json\npersona_c-credentials.json',
     'ls -A "$S"': 'system-prompt.md\nconfig.json',
     tokcount: '0',
     'env | cut': '0',
@@ -1076,7 +1088,7 @@ describe('Check S2', () => {
     ['an extra state file', { 'ls -A "$S"': 'config.json\nsystem-prompt.md\nserver.pid' }, 'the state dir holds more than config.json and system-prompt.md'],
     ['a changed package file', { 'sha256sum -c': '' }, 'a file of the installed package changed'],
     ['a file added to the package', { '-type f -print | wc -l': '43\n42' }, 'the package gained or lost files'],
-    ["D's credentials file already mounted", { 'ls -A ~/.config/cscb/': 'persona_a-credentials.json\npersona_b-credentials.json\npersona_c-credentials.json\npersona_d-credentials.json' }, '~/.config/cscb/ holds'],
+    ["D's credentials file already mounted", { 'ls -A ~/.config/cscb-credentials/': 'persona_a-credentials.json\npersona_b-credentials.json\npersona_c-credentials.json\npersona_d-credentials.json' }, '~/.config/cscb-credentials/ holds'],
     ['a token-shaped line in config.json', { tokcount: '1' }, 'token-shaped lines in config.json: 1'],
     ['a token variable in the shell', { 'env | cut': '1' }, 'token variables set: 1'],
   ])('fails on %s', async (_what, changes, reason) => {
@@ -2297,7 +2309,7 @@ const RETRIED_NOTE =
 function retriedStartLog(opts: { up?: boolean; connected?: boolean; notBroughtUp?: number; extra?: [number, string][] } = {}): [number, string][] {
   const { up = true, connected = true, notBroughtUp = 1, extra = [] } = opts
   const ref = '"persona_a" (key=persona_a)'
-  const path = 'path="/home/testuser/.config/cscb/persona_a-credentials.json"'
+  const path = 'path="/home/testuser/.config/cscb-credentials/persona_a-credentials.json"'
   const session = (l: PersonaLetter) => `[slack] Session connected: persona "persona_${l}" (key=persona_${l}) cwd="/home/cscb/cscb-live/${l}"`
   const lines: [number, string][] = [
     [20, `[slack] Starting from the last-applied record "${S}/config.json.last-applied"`],
@@ -2893,7 +2905,7 @@ interface ReloadWorld {
  * first. `scripts` is every script run.
  */
 function reloadContainer(home: string, world: ReloadWorld, answers: ReadonlyArray<readonly [string, Reply]> = []) {
-  const state = join(home, '.claude', 'channels', 'slack')
+  const state = join(home, '.config', 'cscb')
   const copyFile = join(home, CONFIG_COPY.replace(/^~\//, ''))
   const files: Record<string, () => string | null> = {
     [CONFIG_COPY]: () => world.copy,
@@ -4497,7 +4509,7 @@ describe("tags and tagstext over a transcript (the container's helpers and the p
     })
 
     test('it reads every rotated server.log* and every transcript of every persona, and nothing else; priorContact counts what names the whole ID', async () => {
-      const state = join(home, '.claude', 'channels', 'slack')
+      const state = join(home, '.config', 'cscb')
       mkdirSync(state, { recursive: true })
       const current = `[slack] Dispatching to persona "persona_c" (key=persona_c) chat_id=${DRY_RUN_IDS.aHome} user=${SECOND_ID}`
       const rotated = `[slack] dropped message user=${SECOND_ID} channel=C0DRYOTHER`

@@ -36,7 +36,7 @@
  *
  * `start`, `stop` and `clean_restart` take their settings and persona set from
  * the configuration the server runs (b.av2 SR-8.7): the last-applied record
- * beside the configuration file (`resolveServerConfigPath`) when it exists,
+ * beside the configuration file (`resolveCliConfigPath`) when it exists,
  * otherwise the configuration file (`readAppliedPersonaConfig`).
  * `stop --stop-bots` and `clean_restart` read it before they initialize the
  * agent-director client (`initClient`, production `initProductionClient`),
@@ -135,11 +135,11 @@ import {
 import {
   agentDirectorCallTimeoutMsOf,
   loadPersonaConfig,
-  resolveServerConfigPath,
   resolveServerStateDir,
   type Persona,
   type PersonaConfig,
 } from './config.ts'
+import { resolveCliConfigPath, resolveCliStateDir } from './state-dir-migration.ts'
 import { readAppliedPersonaConfig, reloadFilePaths } from './reload.ts'
 import { appendLogLine, initLogging, type AppendLogLineResult } from './logging.ts'
 import { recordStartupError } from './startup-errors.ts'
@@ -400,9 +400,9 @@ export interface CliDeps {
   isProcessRunning: (pid: number) => boolean
   /** Kill a process with the given signal. */
   kill: (pid: number, signal: string | number) => void
-  /** The server's state directory (`resolveServerStateDir` in production). */
+  /** The server's state directory (`resolveCliStateDir` in production). */
   resolveStateDir: () => string
-  /** The configuration file the server loads (`resolveServerConfigPath` in production). */
+  /** The configuration file the server loads (`resolveCliConfigPath` in production). */
   resolveConfigPath: () => string
   /** Launch the server. Resolves when server startup completes (or throws). */
   startServer: () => Promise<void>
@@ -512,7 +512,7 @@ export interface CliDeps {
    * Append one line to `server.log` in the state directory, in the server
    * log's `[<ISO time>] <text>` form at `at` (ms since the epoch, from
    * `now`), through the shared rotation (`appendLogLine`, `src/logging.ts`,
-   * in production on `resolveServerStateDir()`'s `server.log`). The CLI
+   * in production on `resolveCliStateDir()`'s `server.log`). The CLI
    * writes it while the server is stopped (b.jg5 SRJ-909). Answers whether
    * the line was written; best effort: a failure (answered or thrown) is
    * reported in one line and changes no exit status. Writes nothing else.
@@ -1190,7 +1190,12 @@ export function createCli(deps: CliDeps): CliHandlers {
         deps.closeFd(logFd)
       }
       child.unref()
-      await awaitDaemonStartup(child, join(stateDir, 'server.pid'), logPath, logOffset)
+      // The daemon writes its PID where the server's state directory is once
+      // the start has moved the old one (b.fc4): `resolveServerStateDir()`, not
+      // the directory this process chose before the move (`stateDir`, the old
+      // one in the window between an upgrade and the first start). Both are polled.
+      const pidFiles = [...new Set([join(stateDir, 'server.pid'), join(resolveServerStateDir(), 'server.pid')])]
+      await awaitDaemonStartup(child, pidFiles, logPath, logOffset)
       return
     }
 
@@ -1218,7 +1223,7 @@ export function createCli(deps: CliDeps): CliHandlers {
    */
   async function awaitDaemonStartup(
     child: DaemonChild,
-    pidFile: string,
+    pidFiles: readonly string[],
     logPath: string,
     logOffset: number,
   ): Promise<void> {
@@ -1237,7 +1242,7 @@ export function createCli(deps: CliDeps): CliHandlers {
         reportDaemonFailure(outcome.failure, logPath, logOffset)
         deps.exit(1)
       }
-      if (daemonWrotePid(pidFile, child.pid)) {
+      if (pidFiles.some((pidFile) => daemonWrotePid(pidFile, child.pid))) {
         console.error(`[slack] Server starting in background (PID ${child.pid})`)
         deps.exit(0)
       }
@@ -1905,8 +1910,14 @@ if (import.meta.main) {
     unlinkSync,
     isProcessRunning,
     kill: (pid, signal) => process.kill(pid, signal as NodeJS.Signals),
-    resolveStateDir: () => resolveServerStateDir(),
-    resolveConfigPath: () => resolveServerConfigPath(),
+    // b.fc4: the new default state directory, except between an upgrade and
+    // the server's first start on it, while the configuration (and perhaps
+    // a running old server's PID file) is still in the old one: then that
+    // directory, so `start` finds the config, `stop`/`clean_restart`
+    // reach the old server, and nothing acts on an empty new folder. The
+    // server's start does the move (state-dir-migration.ts).
+    resolveStateDir: () => resolveCliStateDir(),
+    resolveConfigPath: () => resolveCliConfigPath(),
     startServer: async () => { const { main } = await import('./server.ts'); return main() },
     exit: (code) => process.exit(code),
     loadConfig: (path) => readAppliedPersonaConfig(path),
@@ -1925,9 +1936,9 @@ if (import.meta.main) {
     // b.jg5 SRJ-909: the teardown's server.log lines and startup-errors.log
     // entries, in the state directory the server uses, the entries with no
     // copy on fd 2.
-    appendServerLogLine: (line, at) => appendLogLine(join(resolveServerStateDir(), 'server.log'), line, at),
+    appendServerLogLine: (line, at) => appendLogLine(join(resolveCliStateDir(), 'server.log'), line, at),
     recordStartupErrorEntry: (classLabel, message) =>
-      recordStartupError(classLabel, message, undefined, { logDir: resolveServerStateDir(), omitStderr: true }),
+      recordStartupError(classLabel, message, undefined, { logDir: resolveCliStateDir(), omitStderr: true }),
     // b.jg5 SRJ-510: clear-latch's one request to 127.0.0.1, with no timeout of its own.
     dialClearLatch: (port, persona) => dialClearLatch(port, persona),
   }

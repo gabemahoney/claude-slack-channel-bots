@@ -71,7 +71,8 @@ export const CONTAINER_PIDS_LIMIT = 2048
 
 /** Where the container sees its inputs. */
 export const CONTAINER_TARBALL = '/tmp/package.tgz'
-export const CONTAINER_CREDENTIALS_DIR = `${CONTAINER_HOME}/.config/cscb`
+/** The credentials mount: beside the state directory (`~/.config/cscb`, bug b.fc4), never over it, so the server can write there. */
+export const CONTAINER_CREDENTIALS_DIR = `${CONTAINER_HOME}/.config/cscb-credentials`
 
 /** The named build context that holds the staged agent-director binary (Dockerfile.live copies it). */
 export const AGENT_DIRECTOR_BUILD_CONTEXT = 'agent-director-bin'

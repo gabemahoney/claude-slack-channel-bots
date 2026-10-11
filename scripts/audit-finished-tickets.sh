@@ -239,7 +239,7 @@ has_anti_marker() {
 #
 # A deliberate, greppable heading that a ticket carries when its fix landed in a
 # file OUTSIDE this repository (e.g. `~/startup/start-all.sh`, the bots' append
-# system prompt at `~/.claude/channels/slack/system-prompt.md`), so no commit on
+# system prompt at `~/.config/cscb/system-prompt.md`), so no commit on
 # main can ever land it. The heading NAMES the out-of-repo artifact:
 #
 #     ## +closed:out-of-repo ~/startup/start-all.sh
@@ -252,8 +252,9 @@ has_anti_marker() {
 # inference over natural language, which fails in BOTH directions:
 #
 #   * False positive, the one that matters. b.mqd's body says the out-of-repo
-#     mitigation "lives outside this repo in `~/.claude/channels/slack/
-#     system-prompt.md` … flagged but NOT actioned here". The sentence states
+#     mitigation "lives outside this repo in `<the bots' state dir>/
+#     system-prompt.md` … flagged but NOT actioned here" (the state dir's
+#     path as the ticket then wrote it, elided). The sentence states
 #     the work was declined; the heuristic read "~/ path + fix language" and
 #     returned success. A gate that reads a refusal as a closure is not a gate.
 #     No amount of further tightening fixes this, because the prose that says

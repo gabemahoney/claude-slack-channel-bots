@@ -4,7 +4,7 @@ Saving `config.json` doesn't change what runs. The server runs the last configur
 
 ## Files beside the config file
 
-These files sit in the same directory as `config.json` (`~/.claude/channels/slack/` by default, or `SLACK_STATE_DIR`). Never edit them by hand.
+These files sit in the same directory as `config.json` (`~/.config/cscb/` by default, or `SLACK_STATE_DIR`). Never edit them by hand.
 
 | File | What it is |
 |---|---|
@@ -47,8 +47,8 @@ While the server runs, it checks `config.json` and each credentials file the fil
 To see what is pending:
 
 ```sh
-cat ~/.claude/channels/slack/config.json.pending
-grep -E 'reload-(preview|invalid|nothing-pending)' ~/.claude/channels/slack/server.log | tail
+cat ~/.config/cscb/config.json.pending
+grep -E 'reload-(preview|invalid|nothing-pending)' ~/.config/cscb/server.log | tail
 ```
 
 ## Reading the preview
@@ -104,7 +104,7 @@ Paths in the preview are absolute: a `~` in `config.json` is shown expanded. In 
 To apply a pending change, rename `config.json.pending` to `config.json.apply` in the same directory, with the server running:
 
 ```sh
-cd "${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}" && mv config.json.pending config.json.apply
+cd "${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}" && mv config.json.pending config.json.apply
 ```
 
 Read the preview first. The server picks the confirmation up at its next check, within about 5 seconds; a check still running an earlier apply delays it, so `reload-applied` can come minutes later. It deletes the confirmation and applies it without a restart; next-launch and server-wide settings are recorded and take effect later, except the switch `allow_invited_channels`, which applies in place at once (see [What a confirmation applies](#what-a-confirmation-applies)).
@@ -114,7 +114,7 @@ You can direct an agent to do the rename for you. Nothing has to be computed, co
 Each confirmation logs one of these lines in `server.log`:
 
 ```sh
-grep -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed)' "${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}/server.log" | tail
+grep -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed)' "${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}/server.log" | tail
 ```
 
 | Line | Meaning |

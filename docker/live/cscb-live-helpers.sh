@@ -16,7 +16,7 @@
 TEST_HOST='@TEST_HOST@'   # the container's hostname
 TEST_USER='testuser'
 export PATH="/opt/agent-director/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin"
-S=~/.claude/channels/slack
+S=~/.config/cscb
 LOG="$S/server.log"
 TRAIL="$S/permission-trail.jsonl"
 
@@ -137,11 +137,11 @@ showpending() {
 }
 
 # leakcount FILE...: per file, how many times any token held in a persona
-# credentials file under ~/.config/cscb/ occurs in it (read inside bun, never printed).
+# credentials file under ~/.config/cscb-credentials/ occurs in it (read inside bun, never printed).
 leakcount() {
   bun -e '
     const fs = require("fs")
-    const dir = process.env.HOME + "/.config/cscb"
+    const dir = process.env.HOME + "/.config/cscb-credentials"
     const tokens = []
     for (const f of fs.readdirSync(dir)) {
       if (!f.endsWith("-credentials.json")) continue

@@ -266,9 +266,9 @@ describe('the live config', () => {
       ['persona_b', [{ id: 'C0DRYCOORD', delivery: 'mentions' }], { enabled: true, contact: 'U0DRYHUMAN' }, 'dm'],
       ['persona_c', null, { enabled: true, contact: 'U0DRYHUMAN' }, 'dm'],
     ])
-    expect([config.ack_reaction, config.append_system_prompt_file]).toEqual(['eyes', '/home/testuser/.claude/channels/slack/system-prompt.md'])
+    expect([config.ack_reaction, config.append_system_prompt_file]).toEqual(['eyes', '/home/testuser/.config/cscb/system-prompt.md'])
     const loaded = load(config)
-    expect(loaded.personas.map((p) => [p.key, p.credentials_file.endsWith(`.config/cscb/${p.name}-credentials.json`)])).toEqual([
+    expect(loaded.personas.map((p) => [p.key, p.credentials_file.endsWith(`.config/cscb-credentials/${p.name}-credentials.json`)])).toEqual([
       ['persona_a', true],
       ['persona_b', true],
       ['persona_c', true],
@@ -276,23 +276,28 @@ describe('the live config', () => {
     assertNoLeak(renderConfig(config))
   })
 
-  // Bug b.avm: the default crontable, ~/.config/cscb/crontab, lies in the
-  // container's read-only mount of the credentials directory, where the
-  // scheduler could not create it; the runner's config names one in the state
-  // directory instead, which the loader keeps as written (not flagged as a
-  // default, so the start prepares and moves nothing).
-  test('names the container\'s crontable in the state directory, outside the read-only credentials mount the default would fall in', () => {
+  // Bug b.fc4: the default state directory, ~/.config/cscb, holds the
+  // crontable; the read-only credentials mount is its sibling
+  // (~/.config/cscb-credentials), never the directory the server writes to.
+  // The runner's config still names the crontable (the path the default would
+  // give), which the loader keeps as written.
+  test('names the container\'s crontable in the state directory, outside the read-only credentials mount, which is not the state directory or inside it', () => {
     const config = buildLiveConfig(DRY_RUN_IDS)
     expect(config.cron_table_path).toBe(CONTAINER_CRON_TABLE_PATH)
     expect(CONTAINER_CRON_TABLE_PATH).toBe(`${CONTAINER_STATE_DIR}/crontab`)
     const loadInContainer = (c: unknown) =>
       parsePersonaConfigBytes(renderConfig(c), `${CONTAINER_STATE_DIR}/config.json`, CONTAINER_STATE_DIR, { home: CONTAINER_HOME, env: {} })
     const loaded = loadInContainer(config)
-    expect([loaded.cron_table_path, loaded.cron_table_path_defaulted]).toEqual([CONTAINER_CRON_TABLE_PATH, false])
+    expect(loaded.cron_table_path).toBe(CONTAINER_CRON_TABLE_PATH)
     expect(loaded.cron_table_path.startsWith(`${CONTAINER_CREDENTIALS_DIR}/`)).toBe(false)
-    // Without the key, the default would sit inside the read-only mount.
+    // The mount is a sibling of the state directory, so nothing the server writes lies in it.
+    expect(CONTAINER_CREDENTIALS_DIR).not.toBe(CONTAINER_STATE_DIR)
+    expect(CONTAINER_CREDENTIALS_DIR.startsWith(`${CONTAINER_STATE_DIR}/`)).toBe(false)
+    expect(CONTAINER_STATE_DIR.startsWith(`${CONTAINER_CREDENTIALS_DIR}/`)).toBe(false)
+    // Without the key, the default is the same path, outside the mount.
     const { cron_table_path: _written, ...withoutKey } = config
-    expect(loadInContainer(withoutKey).cron_table_path).toBe(`${CONTAINER_CREDENTIALS_DIR}/crontab`)
+    const defaulted = loadInContainer(withoutKey)
+    expect(defaulted.cron_table_path).toBe(CONTAINER_CRON_TABLE_PATH)
   })
 
   test("D's entry for Check 25 loads beside them", () => {

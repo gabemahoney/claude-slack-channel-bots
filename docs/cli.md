@@ -27,13 +27,13 @@ The server first runs the agent-director startup gate: it imports `agent-directo
 - **The server exits during startup:** `start` exits 1. It prints why the server stopped, followed by the last lines (at most 20) the server wrote to `server.log`, which carry the server's own reason:
 
   ```
-  [slack] Server failed to start (exit code 1). From /home/you/.claude/channels/slack/server.log:
+  [slack] Server failed to start (exit code 1). From /home/you/.config/cscb/server.log:
   ```
 
 - **The server is still starting after 30 seconds:** `start` exits 0 and leaves it running.
 
   ```
-  [slack] Server is still starting in the background (PID 12345) after 30s — its log is /home/you/.claude/channels/slack/server.log
+  [slack] Server is still starting in the background (PID 12345) after 30s — its log is /home/you/.config/cscb/server.log
   ```
 
 At a start with no last-applied record, a configuration from before personas stops the start. The server writes the conversion error to `server.log` and exits, so `start` shows the same line on the terminal and exits 1. In `server.log`, where each line is prefixed with a timestamp, it reads:
@@ -194,6 +194,6 @@ It needs no agent-director, reads no configuration file and writes or removes no
 
 ## PID file
 
-The PID file is stored at `STATE_DIR/server.pid` (default: `~/.claude/channels/slack/server.pid`). It is written on startup and removed on clean shutdown. A conflict check at startup prevents running two servers against the same state directory.
+The PID file is stored at `STATE_DIR/server.pid` (default: `~/.config/cscb/server.pid`). It is written on startup and removed on clean shutdown. A conflict check at startup prevents running two servers against the same state directory.
 
 Beside it, `STATE_DIR/server.port` records the server's process ID and the port it actually listens on. The server writes it once it is listening and removes it on shutdown. A start that finds a stale PID file removes a stale `server.port` with it, and `stop` removes it with the PID file. [`clear-latch`](#claude-slack-channel-bots-clear-latch) reads it to find the server, and uses it only when the process ID it records is the one in `server.pid`.

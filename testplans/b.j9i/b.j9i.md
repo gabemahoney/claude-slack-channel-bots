@@ -67,13 +67,13 @@ channels with `delivery: all` and takes its prompts in the first. Persona
 `bravo` has no channels, DMs on, a DM contact and a `dm` destination. The two
 working directories differ:
 ```bash
-mkdir -p ~/.claude/channels/slack
-cat > ~/.claude/channels/slack/config.json << 'EOF'
+mkdir -p ~/.config/cscb
+cat > ~/.config/cscb/config.json << 'EOF'
 {
   "personas": [
     {
       "name": "alpha",
-      "credentials_file": "~/.claude/channels/slack/credentials-alpha.json",
+      "credentials_file": "~/.config/cscb/credentials-alpha.json",
       "working_directory": "/tmp/test-repo-a",
       "channels": [
         { "id": "C0TEST1", "delivery": "all" },
@@ -83,7 +83,7 @@ cat > ~/.claude/channels/slack/config.json << 'EOF'
     },
     {
       "name": "bravo",
-      "credentials_file": "~/.claude/channels/slack/credentials-bravo.json",
+      "credentials_file": "~/.config/cscb/credentials-bravo.json",
       "working_directory": "/tmp/test-repo-b",
       "dm": { "enabled": true, "contact": "U0TEST1" },
       "permission_prompts": "dm"
@@ -106,8 +106,8 @@ done
 
 ### Start server in dry-run mode
 The `start` subcommand daemonizes: the parent process forks a detached child and
-exits. The child writes its own PID to `~/.claude/channels/slack/server.pid` and
-appends all stderr/stdout to `~/.claude/channels/slack/server.log`. So we do NOT
+exits. The child writes its own PID to `~/.config/cscb/server.pid` and
+appends all stderr/stdout to `~/.config/cscb/server.log`. So we do NOT
 need `nohup`, do NOT shell-redirect stderr, and do NOT trust `$!` — those refer
 to the parent which has already exited.
 ```bash
@@ -120,7 +120,7 @@ sleep 10
 ### Verify startup
 Check that the daemon started without error:
 ```bash
-cat ~/.claude/channels/slack/server.log
+cat ~/.config/cscb/server.log
 ```
 Expected: the log contains "[slack] Running in dry-run mode", no line matching
 `Error:|Traceback|Uncaught`, and not the pre-persona leg's conversion error.
@@ -138,6 +138,6 @@ curl -sf -X POST \
 - Pre-persona leg: `start` exits non-zero, its stderr carries the three strings above, no PID file is written in the temp state directory, and nothing listens on port 3100 afterwards
 - Persona config: `start` with both token variables unset exits 0
 - Daemon PID file exists and points at a live process:
-  `kill -0 $(cat ~/.claude/channels/slack/server.pid)`
-- `~/.claude/channels/slack/server.log` contains "[slack] Running in dry-run mode", no error stack trace and no conversion error
+  `kill -0 $(cat ~/.config/cscb/server.pid)`
+- `~/.config/cscb/server.log` contains "[slack] Running in dry-run mode", no error stack trace and no conversion error
 - MCP `initialize` on port 3100 returns a JSON-RPC `result`
