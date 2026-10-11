@@ -6,6 +6,10 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+---
+
+## 0.14.0 (2026-10-11)
+
 ### A restarted or resumed bot now loads the current system prompt
 
 The new server-wide setting `fresh_system_prompt` defaults to `true`, which adds `--system-prompt-snapshot off` to every bot's launch arguments. A restarted or resumed bot then loads the current system prompt file and `CLAUDE.md` and keeps its conversation. See `fresh_system_prompt` under [Server-wide settings](README.md#server-wide-settings).
