@@ -191,8 +191,9 @@
  *     debugging skill's one-line `read-pane` check, both caveats and the
  *     pointer;
  *   - SRJ-1103 over the README, a row per prerequisite and per section
- *     (`README_SRJ_1103_ROWS`), the Troubleshooting entry of each notice by
- *     its `src/`-rendered title, each SRJ-1013 class under "Startup errors",
+ *     (`README_SRJ_1103_ROWS`), each notice's symptom by its `src/`-rendered
+ *     title, read in the debugging-skill section its `### Symptom:` entry
+ *     links (`viaSymptom`), each SRJ-1013 class under "Startup errors",
  *     the cron line (`AD_VOCABULARY`'s `findMissingCron`), the refusal items
  *     and the runtime-stop paragraph, switch-over steps 1 and 7 linking
  *     "Upgrading to personas" in both carriers;
@@ -2398,14 +2399,17 @@ describe('the agent-director refusal classes name the switch-over runbook (b.jg5
   })
 
   describe(`${DEBUG_SKILL_FILE} "${SKILL_STARTUP_ERRORS_HEADING}"`, () => {
-    test.each(REFUSAL_LABELS)('the `%s` line names the runbook section by its title', (label) => {
-      expect(readmeItem(label)).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
+    // Each refusal's facts live once, in its `###` entry; the list's line links it.
+    test.each(REFUSAL_LABELS)('the `%s` line links its entry, which names the runbook section by its title', (label) => {
+      expect(readmeItem(label)).toContain(`(#${headingSlug(code(label))})`)
+      expect(debugEntry(label)).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
     })
 
     test.each(REFUSAL_LABELS.flatMap((label) => UPGRADE_FORMS.map(([form, pattern]) => [label, form, pattern] as const)))(
-      'the `%s` line carries no %s',
+      'the `%s` line and its entry carry no %s',
       (label, _form, pattern) => {
         expect(readmeItem(label)).not.toMatch(pattern)
+        expect(debugEntry(label)).not.toMatch(pattern)
       },
     )
   })
@@ -5311,13 +5315,23 @@ const STALE_AUTO_RESTART_CLAIM: readonly [label: string, pattern: RegExp][] = [
   ['will not restart or come back on its own', /\b(?:will not|won't|does not|doesn't|never|cannot|can't)\s+(?:be\s+)?(?:restart|come back|recover)\w*/gi],
 ]
 
-/** The troubleshooting entry's `auto-restart disabled` row in its lost-message recovery table ("Session not restarting after crash", in full in the debugging skill's symptom reference); throws unless there is exactly one. */
+/**
+ * The `auto-restart disabled` state in the lost-message recovery states, which
+ * live once, in the debugging skill's `No live session` row under "Other lines
+ * you may see" (the "Session not restarting after crash" symptom points
+ * there): the row's text from the state's label to the next state's
+ * (`restart limit reached`). Throws unless exactly one such row holds both.
+ */
 function readmeAutoRestartRow(): string {
-  const lead = `| \`${lostMessageStateLabel('auto-restart-disabled')}\` |`
-  const entry = requiredSection(operatorText(DEBUG_SKILL_FILE), `${SYMPTOM_PREFIX}Session not restarting after crash`, DEBUG_SKILL_FILE)
-  const rows = entry.split('\n').filter((line) => line.startsWith(lead))
-  if (rows.length !== 1) throw new Error(`${DEBUG_SKILL_FILE} "${SYMPTOM_PREFIX}Session not restarting after crash" has ${rows.length} rows starting ${lead}`)
-  return rows[0]
+  const lead = '| `[slack] No live session for persona '
+  const section = requiredSection(operatorText(DEBUG_SKILL_FILE), '## Other lines you may see', DEBUG_SKILL_FILE)
+  const rows = section.split('\n').filter((line) => line.startsWith(lead))
+  if (rows.length !== 1) throw new Error(`${DEBUG_SKILL_FILE} "## Other lines you may see" has ${rows.length} rows starting ${lead}`)
+  const row = flat(rows[0])
+  const start = row.indexOf(`\`${lostMessageStateLabel('auto-restart-disabled')}\`: `)
+  const end = row.indexOf(`\`${lostMessageStateLabel('restart-limit-reached')}\`: `, start)
+  if (start < 0 || end < 0) throw new Error(`${DEBUG_SKILL_FILE}'s No live session row has no auto-restart disabled state followed by restart limit reached`)
+  return row.slice(start, end)
 }
 
 /** The debugging skill's `auto-restart disabled` state, up to the next state (`restart limit reached`), in its lost-message entry. */
@@ -5331,7 +5345,7 @@ function debugSkillAutoRestartEntry(): string {
 
 describe("E8: the README's and debugging skill's `auto-restart disabled` text keeps not saying the persona will not restart on its own (b.jg5 SRJ-1011)", () => {
   test.each([
-    [`${DEBUG_SKILL_FILE}: the troubleshooting entry's lost-message recovery row`, readmeAutoRestartRow],
+    [`${DEBUG_SKILL_FILE}: the lost-message recovery states' row (No live session)`, readmeAutoRestartRow],
     [`${DEBUG_SKILL_FILE}: the lost-message entry's state`, debugSkillAutoRestartEntry],
   ] as const)('%s', (_label, passage) => {
     const text = passage()
@@ -6157,9 +6171,6 @@ const unitOf = (file: string, heading: HeadingMatch, lead: string) => (text: str
   return linkTexts(units[0])
 }
 
-/** The Troubleshooting entry whose title holds `*<title>*` (a row's passage). */
-const entryOf = (title: () => string) => (readme: string) => troubleshootingEntry(readme, `*${title()}*`)
-
 /**
  * An item a row's passage must hold: a literal, a pattern, or a thunk that
  * builds one when the row runs (a quote rendered by a `src/` builder), so a
@@ -6255,6 +6266,34 @@ function withItemCut(doc: string, passage: (text: string) => string, item: strin
   if (inPassage.length === 0) throw new Error(`the passage reads no occurrence of ${String(item)} in the document as written`)
   return inPassage.reduce((text, m) => cut(text, m), doc)
 }
+
+/**
+ * A symptom whose facts live once, in the debugging skill's section under
+ * `heading` (a row's passage): throws unless exactly one `### Symptom:` entry
+ * holds `titlePart` in its title and that entry links the section's anchor,
+ * then reads the section, flattened. So a row keeps its tie to the
+ * troubleshooting index and reads each fact where it lives.
+ */
+const viaSymptom = (titlePart: string | (() => string), heading: string) => (text: string) => {
+  const part = typeof titlePart === 'string' ? titlePart : titlePart()
+  const entry = troubleshootingEntry(text, part)
+  const anchor = `(#${headingSlug(heading.replace(/^#+ /, ''))})`
+  if (!entry.includes(anchor)) throw new Error(`${REFERENCE_NAME} "${SYMPTOM_REFERENCE_HEADING}": the entry "${part}" does not link ${anchor}`)
+  return sectionOf(REFERENCE_NAME, heading)(text)
+}
+
+/** The debugging skill's sections the SRI-1105 symptoms point to. */
+const SILENT_INVITED_SKILL_HEADING = '## A persona is silent in a channel its app was invited to'
+const RECEIVES_EVERYTHING_SKILL_HEADING = '### A persona receives every message in a channel'
+const UNCLAIMED_SKILL_HEADING = `### ${code(UNCLAIMED_CHANNEL)}`
+
+/** The debugging skill's sections the SRJ-1103 symptom rows read (each symptom entry links its own). */
+const HELD_CONFLICT_SKILL_HEADING = '## A persona posts a Held: tmux session conflict notice'
+const HELD_UNUSABLE_SKILL_HEADING = '## A persona posts a Held: unusable tmux session name notice'
+const HELD_LAUNCH_START_SKILL_HEADING = '## A persona posts a Held: launch start not recorded notice'
+const LAUNCH_STUCK_SKILL_HEADING = '## A persona posts a Launch stuck or Session not starting notice'
+const AD_REFUSES_SKILL_HEADING = '## agent-director refuses a persona: it is retried on its own'
+const NOT_ANSWERING_SKILL_HEADING = '## A persona posts a Not answering notice'
 
 /** A notice title from `TROUBLESHOOTING_NOTICES` by its source. */
 function troubleshootingNoticeTitle(source: string): () => string {
@@ -6367,34 +6406,35 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
   ]],
 
   // The latch.
-  [`the *${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}* entry: a CONFLICT and conflicting labels latch; the persona is ${lostMessageStateLabel('held-for-human')}`, entryOf(troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')), [
+  [`the *${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}* entry: a CONFLICT and conflicting labels latch; the persona is ${lostMessageStateLabel('held-for-human')}`, viaSymptom(() => `*${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}*`, HELD_CONFLICT_SKILL_HEADING), [
     ci('a session conflict'),
     ci("conflicting labels on the persona's own row"),
     code(lostMessageStateLabel('held-for-human')),
   ]],
-  [`the *${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}* entry: the re-check ${LATCH_RECHECK_WORDS} (SRJ-505), how a hold ends, clear-latch, and "Operator actions" for a human only`, entryOf(troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')), [
+  [`the *${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}* entry: the re-check ${LATCH_RECHECK_WORDS} (SRJ-505), how a hold ends, clear-latch, and "Operator actions" for a human only`, viaSymptom(() => `*${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}*`, HELD_CONFLICT_SKILL_HEADING), [
     ci(`**The server's own check.** ${LATCH_RECHECK_WORDS}`),
-    ci('**How a hold ends.**'),
-    docLink(DEBUG_SKILL_FILE, CLI_DOC, headingSlug(CLEAR_LATCH_CLI_HEADING.replace(/^#+ /, ''))),
+    ci('**How a hold clears.**'),
+    docLink(DEBUG_SKILL_FILE, DEBUG_SKILL_FILE, headingSlug(`Clearing a hold by hand: ${code(CLEAR_LATCH_COMMAND)}`)),
     vocab('operatorActions'),
     ci('for a human only'),
   ]],
-  [`the *${troubleshootingNoticeTitle('UNUSABLE_NAME_NOTICE_HEAD')()}* entry: an unusable recorded name latches`, entryOf(troubleshootingNoticeTitle('UNUSABLE_NAME_NOTICE_HEAD')), [
-    ci('recorded on it cannot be used'),
+  [`the *${troubleshootingNoticeTitle('UNUSABLE_NAME_NOTICE_HEAD')()}* entry: an unusable recorded name latches`, viaSymptom(() => `*${troubleshootingNoticeTitle('UNUSABLE_NAME_NOTICE_HEAD')()}*`, HELD_UNUSABLE_SKILL_HEADING), [
+    ci("its recorded tmux session name can't be used"),
     vocab('operatorActions'),
   ]],
-  [`the *${troubleshootingNoticeTitle('LAUNCH_START_NOTICE_HEAD')()}* entry: a pending row with no launch start latches`, entryOf(troubleshootingNoticeTitle('LAUNCH_START_NOTICE_HEAD')), [
+  [`the *${troubleshootingNoticeTitle('LAUNCH_START_NOTICE_HEAD')()}* entry: a pending row with no launch start latches`, viaSymptom(() => `*${troubleshootingNoticeTitle('LAUNCH_START_NOTICE_HEAD')()}*`, HELD_LAUNCH_START_SKILL_HEADING), [
     ci('reads pending but records no launch start'),
     vocab('operatorActions'),
   ]],
 
   // A pending launch and the stuck-launch post (SRJ-410 to SRJ-412, SRJ-1017).
-  ["\"A persona's instance is still starting\": a pending launch is never launched over, its retries check it after agent-director's grace period", (readme) => troubleshootingEntry(readme, "**A persona's instance is still starting**"), [
+  ["\"A persona's instance is still starting\": a pending launch is never launched over, its retries check it after agent-director's grace period", viaSymptom("**A persona's instance is still starting**", LAUNCH_STUCK_SKILL_HEADING), [
     code('pending_grace_seconds'),
-    ci('they never launch a second instance over it and never end it'),
+    ci("before agent-director's grace period (`pending_grace_seconds`) has passed since the launch's start, the persona's retries only read its state"),
+    ci('never ends such a launch and never launches over it'),
     ci('a launch that is still starting never counts as a failure'),
   ]],
-  [`the *${troubleshootingNoticeTitle('STUCK_LAUNCH_RELAUNCHING_HEAD')()}* or *${troubleshootingNoticeTitle('STUCK_LAUNCH_HELD_HEAD')()}* entry: the later of 5 minutes and pending_grace_seconds plus 60 s`, entryOf(troubleshootingNoticeTitle('STUCK_LAUNCH_RELAUNCHING_HEAD')), [
+  [`the *${troubleshootingNoticeTitle('STUCK_LAUNCH_RELAUNCHING_HEAD')()}* or *${troubleshootingNoticeTitle('STUCK_LAUNCH_HELD_HEAD')()}* entry: the later of 5 minutes and pending_grace_seconds plus 60 s`, viaSymptom(() => `*${troubleshootingNoticeTitle('STUCK_LAUNCH_RELAUNCHING_HEAD')()}*`, LAUNCH_STUCK_SKILL_HEADING), [
     `*${troubleshootingNoticeTitle('STUCK_LAUNCH_HELD_HEAD')()}*`,
     ci(`the later of ${DIALOG_READY_TIMEOUT_MS / 60_000} minutes and agent-director's \`pending_grace_seconds\` plus ${AD_LAUNCH_BOUND_GRACE_ADDEND_SECONDS} s`),
   ]],
@@ -6411,10 +6451,10 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
   ['timing settings: each key\'s default as src/ad-settings.ts holds it', sectionOf(USER_DOCS_NAME, TIMING_SETTINGS_HEADING), AD_TMUX_KEYS.map((key) => `| ${code(key)} | ${code(String(DEFAULT_AD_SETTINGS.tmux[key]))} |`)],
 
   // The ad-config-malformed outage (SRJ-316).
-  [`the *${troubleshootingNoticeTitle("ONSET_TEMPLATES['ad-config-malformed']")()}* entry (${PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED}): CSCB acts on nothing and retries`, entryOf(troubleshootingNoticeTitle("ONSET_TEMPLATES['ad-config-malformed']")), [
+  [`the *${troubleshootingNoticeTitle("ONSET_TEMPLATES['ad-config-malformed']")()}* entry (${PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED}): CSCB acts on nothing and retries`, viaSymptom(() => `*${troubleshootingNoticeTitle("ONSET_TEMPLATES['ad-config-malformed']")()}*`, AD_REFUSES_SKILL_HEADING), [
     code(`~/${AD_SETTINGS_RELATIVE_PATH}`),
-    ci('kills, deletes and relaunches nothing'),
-    ci('it retries the persona on its own'),
+    ci('Nothing is killed, deleted or relaunched because of it'),
+    ci("the persona's retries start with the `config` cause"),
   ]],
 
   // The call timeout, under "Configuration" (SRJ-213).
@@ -6456,11 +6496,11 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
   ]],
 
   // The retry timer (SRJ-301).
-  ['"A persona is retried after agent-director refuses it": the retry timer\'s schedule, whatever session_restart_delay and health_check_interval are, never toward the restart limit', (readme) => troubleshootingEntry(readme, '**A persona is retried after agent-director refuses it**'), [
-    ci(`${UNAVAILABLE_RETRY_BASE_S} seconds after the refusal`),
-    ci(`then every ${UNAVAILABLE_RETRY_CEILING_S} seconds`),
+  ['"A persona is retried after agent-director refuses it": the retry timer\'s schedule, whatever session_restart_delay and health_check_interval are, never toward the restart limit', viaSymptom('**A persona is retried after agent-director refuses it**', AD_REFUSES_SKILL_HEADING), [
+    ci(`${UNAVAILABLE_RETRY_BASE_S} s after the refusal`),
+    ci(`then every ${UNAVAILABLE_RETRY_CEILING_S} s`),
     ci('whatever `session_restart_delay` and `health_check_interval` are, `0` included'),
-    ci('a refusal never counts toward the restart limit'),
+    ci("the server doesn't count that against the persona's restart limit"),
   ]],
 
   // The files and the PID file (SRJ-510, SRJ-802).
@@ -6476,10 +6516,11 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
   ]],
 
   // The *Still not answering* read-only check (E19; SRJ-1101).
-  [`the *${troubleshootingNoticeTitle('tmuxUnresponsiveAlertText')()}* check: the one-line read-pane through agent-director, its caveats in the debugging skill`, entryOf(troubleshootingNoticeTitle('tmuxUnresponsiveOnsetText')), [
-    code(`agent-director read-pane --claude-instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key> --n-lines 1`),
+  [`the *${troubleshootingNoticeTitle('tmuxUnresponsiveAlertText')()}* check: the one-line read-pane through agent-director, its caveats in the debugging skill`, viaSymptom(() => `*${troubleshootingNoticeTitle('tmuxUnresponsiveOnsetText')()}*`, NOT_ANSWERING_SKILL_HEADING), [
+    `agent-director read-pane --claude-instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key> --n-lines 1`,
     docLink(DEBUG_SKILL_FILE, DEBUG_SKILL_FILE, headingSlug('Listing instances')),
-    ci("take ownership from agent-director's row, never from the pane"),
+    ci("ownership comes from agent-director's row"),
+    ci('so never act on a session because of it'),
   ]],
 ]
 
@@ -6565,13 +6606,20 @@ function debugClassSectionNames(skill: string, label: string): boolean {
 /** The refusal entries' old ending, which the "Arrived here from a startup refusal?" block replaced (E2-gate note; SRJ-1108). */
 const START_AGAIN = ci('start the server again')
 
-/** A README refusal item's problems: it names the refusal block by a link that resolves and step 10 by its link, and says no "start the server again". */
+/**
+ * A refusal's problems: its line in the skill's startup-error list links its
+ * `###` entry, and the entry names the refusal block by a link that resolves
+ * and step 10 by its link, and says no "start the server again".
+ */
 function readmeRefusalItemProblems(label: string, readme: string): string[] {
-  const item = readmeLabelItem(SKILL_STARTUP_ERRORS_HEADING, label, readme)
+  const line = readmeLabelItem(SKILL_STARTUP_ERRORS_HEADING, label, readme)
+  const item = flat(requiredSection(readme, classHeading(label), REFERENCE_NAME))
+  const entryLink = `(#${headingSlug(code(label))})`
   const carrier = readRunbookCarrier(USER_DOCS_NAME, readme, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
   return [
     ...lacking(item, [`["${REFUSAL_BLOCK_HEADING}"]${docLink(DEBUG_SKILL_FILE, RUNBOOK_DOC, headingSlug(REFUSAL_BLOCK_HEADING))}`, docLink(DEBUG_SKILL_FILE, RUNBOOK_DOC, carrier.stepAnchors[9])]),
     ...(START_AGAIN.test(item) ? [`says "start the server again": ${item}`] : []),
+    ...(line.includes(entryLink) ? [] : [`its startup-error line does not link ${entryLink}`]),
     ...(headingAt(readme, headingSlug(REFUSAL_BLOCK_HEADING))?.title === REFUSAL_BLOCK_HEADING ? [] : [`no heading "${REFUSAL_BLOCK_HEADING}" for the link`]),
   ]
 }
@@ -7201,10 +7249,13 @@ describe('E36 T4: the README describes the build (b.jg5 SRJ-1103; AC 78, AC 79)'
 
     test.each(REFUSAL_LABELS)('the `%s` item fails with "then start the server again" back', (label) => {
       const text = readme()
-      const edited = text.replace(
-        new RegExp(`(^- \`${escapeRegExp(label)}\`[^\\n]*?)Follow (?:that|the ${escapeRegExp(RUNBOOK_DOC)}) section[^\\n]*?starts it\\.`, 'm'),
-        `$1Follow the ${RUNBOOK_DOC} section "${PHASE1_RUNBOOK_SECTION_TITLE}", then start the server again.`,
-      )
+      // Put the old ending back inside this class's entry alone.
+      const range = sectionRange(text, classHeading(label))
+      if (range === undefined) throw new Error(`no entry for \`${label}\``)
+      const lines = text.split('\n')
+      const entry = lines.slice(range.start, range.end).join('\n')
+      const restored = entry.replace("(above); the runbook's step 10 starts the new server.", '(above), then start the server again.')
+      const edited = [...lines.slice(0, range.start), restored, ...lines.slice(range.end)].join('\n')
       expect(edited).not.toBe(text)
       expect(readmeRefusalItemProblems(label, edited)).not.toEqual([])
     })
@@ -7609,8 +7660,7 @@ const SILENT_INVITED_TITLE = 'A persona is silent in a channel it was invited to
 const RECEIVES_EVERYTHING_TITLE = 'A persona receives every message in a channel'
 const UNCLAIMED_ENTRY_TITLE = 'Messages in a channel no persona is configured into are not delivered'
 
-/** The one troubleshooting entry whose title line is `**<title>**`, its title and text flattened; throws unless exactly one is (a row's passage). */
-const titledEntry = (title: string) => (readme: string) => troubleshootingEntry(readme, `**${title}**`)
+
 
 /**
  * The part of `FUNGIBLE_MODE_ZERO_REASON` (src/jsonl-persistence-check.ts,
@@ -7951,51 +8001,52 @@ const README_DEO_ROWS: readonly DocRow[] = [
   ]],
 
   // SRI-1105, troubleshooting and downgrade (T20 S8).
-  [`"${SILENT_INVITED_TITLE}": declarative mode, listing the channel or turning fungible mode on`, titledEntry(SILENT_INVITED_TITLE), [
-    ci(`**Declarative mode.** With ${SWITCH} absent or ${code('false')}, a persona serves only the channels listed in its ${code(CHANNELS_KEY)}`),
-    ci(`each message from a channel no applied persona lists logs an ${code(UNCLAIMED_CHANNEL)} line`),
-    ci('List the channel, or turn fungible mode on'),
+  [`"${SILENT_INVITED_TITLE}": declarative mode, listing the channel or turning fungible mode on`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
+    ci(`No match, or ${code('false')}, is declarative mode`),
+    ci('not delivered: no applied persona lists this channel'),
+    ci(`List the channel in this persona's ${code(CHANNELS_KEY)} and confirm the change, or turn fungible mode on`),
   ]],
-  [`"${SILENT_INVITED_TITLE}": an externally shared channel`, titledEntry(SILENT_INVITED_TITLE), [
-    ci('**An externally shared channel.** Fungible mode never serves a Slack Connect channel'),
+  [`"${SILENT_INVITED_TITLE}": an externally shared channel`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
+    ci('**An externally shared channel** (fungible mode)'),
     ci(`with the reason ${code(UNCLAIMED_REASON_EXTERNALLY_SHARED)}`),
-    ci('Serve it in declarative mode, with the channel listed'),
+    ci('Fungible mode never serves it. Serve it in declarative mode, with the channel listed'),
   ]],
-  [`"${SILENT_INVITED_TITLE}": a group DM`, titledEntry(SILENT_INVITED_TITLE), [
-    ci('**A group DM.** A DM with more than one person is never served, in either mode'),
+  [`"${SILENT_INVITED_TITLE}": a group DM`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
+    ci('a group DM is never served, in either mode'),
   ]],
-  [`"${SILENT_INVITED_TITLE}": an edit that adds a mention`, titledEntry(SILENT_INVITED_TITLE), [
-    ci('**An edit that adds a mention.** In fungible mode, an @mention is delivered from its message'),
-    ci('Post a new message that mentions it'),
+  [`"${SILENT_INVITED_TITLE}": an edit that adds a mention`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
+    ci(`In fungible mode an @mention is delivered from its ${code('message')} event`),
+    ci('Post another message that @mentions the persona'),
   ]],
-  [`"${SILENT_INVITED_TITLE}": a message posted before the invite`, titledEntry(SILENT_INVITED_TITLE), [
-    ci("**A message posted before the invite.** Slack sends the persona's app no event for a message posted before the app joined the channel"),
+  [`"${SILENT_INVITED_TITLE}": a message posted before the invite`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
+    ci('Slack sends the app no event for a message posted before it joined the channel'),
   ]],
-  [`"${RECEIVES_EVERYTHING_TITLE}": an agent chose ${ALL}`, titledEntry(RECEIVES_EVERYTHING_TITLE), [
-    ci(`In fungible mode, the persona's agent chose ${code(ALL)} for that channel with ${TOOL}`),
-    ci(`each such choice logs a ${code(PERSONA_CHANNEL_DELIVERY_SET)} line`),
+  [`"${RECEIVES_EVERYTHING_TITLE}": an agent chose ${ALL}`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
+    ci(`The persona's agent chose ${code(ALL)} for that channel with ${TOOL}`),
+    ci(`Its sign is a [${code(PERSONA_CHANNEL_DELIVERY_SET)}](#${PERSONA_CHANNEL_DELIVERY_SET}) line`),
   ]],
-  [`"${RECEIVES_EVERYTHING_TITLE}": ask the persona to switch back`, titledEntry(RECEIVES_EVERYTHING_TITLE), [
-    ci(`Ask the persona, in that channel or by DM, to switch the channel back to ${code(MENTIONS)}`),
+  [`"${RECEIVES_EVERYTHING_TITLE}": ask the persona to switch back`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
+    ci(`ask the persona, in that channel or by DM, to switch the channel back to ${code(MENTIONS)}`),
   ]],
-  [`"${RECEIVES_EVERYTHING_TITLE}": remove the app from the channel`, titledEntry(RECEIVES_EVERYTHING_TITLE), [
-    ci("Remove the persona's app from the channel"),
+  [`"${RECEIVES_EVERYTHING_TITLE}": remove the app from the channel`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
+    ci("remove the persona's app from the channel"),
   ]],
-  [`"${RECEIVES_EVERYTHING_TITLE}": turn the switch off`, titledEntry(RECEIVES_EVERYTHING_TITLE), [
-    ci('Turn fungible mode off'),
+  [`"${RECEIVES_EVERYTHING_TITLE}": turn the switch off`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
+    ci('turn fungible mode off with a confirmed change'),
   ]],
-  [`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in declarative mode, fungible mode the other fix, never for a group DM`, titledEntry(UNCLAIMED_ENTRY_TITLE), [
-    ci(`**In declarative mode,** the channel is in no persona's ${code(CHANNELS_KEY)}`),
-    ci(`Add the channel to a persona's ${code(CHANNELS_KEY)} and apply the change`),
-    ci('For a public or private channel that is not externally shared, turning fungible mode on is the other fix'),
-    ci('a group DM is never served'),
+  [`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in declarative mode, fungible mode the other fix, never for a group DM`, viaSymptom(`**${UNCLAIMED_ENTRY_TITLE}**`, UNCLAIMED_SKILL_HEADING), [
+    ci(`In declarative mode, the persona's Slack app is a member of a channel that no persona lists in ${code(CHANNELS_KEY)}`),
+    ci(`Add the channel to the right persona's ${code(CHANNELS_KEY)} in ${code(CONFIG_FILE_NAME)}`),
+    ci('For a public or private channel that is not externally shared: turn fungible mode on'),
+    ci('a group DM is never served in either mode'),
   ]],
-  [`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in fungible mode, each reason (FUNGIBLE_REFUSAL_TEXTS); for every reason but a malformed channel ID, served only in declarative mode with the channel listed; a malformed channel ID served in neither mode`, titledEntry(UNCLAIMED_ENTRY_TITLE), [
-    ci("**In fungible mode,** the line says why fungible mode doesn't serve the channel"),
-    // Each reason inside the sentence that lists them, since one is named again after it.
-    ...Object.values(FUNGIBLE_REFUSAL_TEXTS).map((reason) => new RegExp(`${escapeRegExp("the line says why fungible mode doesn't serve the channel: ")}[^.]*${escapeRegExp(code(reason))}`, 'i')),
-    ci(`For every reason but ${code(UNCLAIMED_REASON_CHANNEL_ID_MALFORMED)}, the channel is served only in declarative mode, with the channel listed`),
-    ci('Neither mode serves a malformed channel ID: declarative mode rejects a listed one'),
+  [`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in fungible mode, each reason (FUNGIBLE_REFUSAL_TEXTS); for every reason but a malformed channel ID, served only in declarative mode with the channel listed; a malformed channel ID served in neither mode`, viaSymptom(`**${UNCLAIMED_ENTRY_TITLE}**`, UNCLAIMED_SKILL_HEADING), [
+    ci("In fungible mode, a `message` event the persona's app received was refused by the fungible path"),
+    // Each reason as a row of the reasons table, its first cell.
+    ...Object.values(FUNGIBLE_REFUSAL_TEXTS).map((reason) => ci(`| ${code(reason)} |`)),
+    ci(`For every reason but ${code(UNCLAIMED_REASON_CHANNEL_ID_MALFORMED)}, the line's own advice is the one way to serve such a channel: declarative mode, with the channel listed`),
+    ci('Neither mode serves a malformed channel ID'),
+    ci(`${code(CONFIG_FILE_NAME)} can't list such an ID either, so neither mode serves it`),
   ]],
   [`Downgrading: an earlier release rejects ${MODE_SWITCH_SETTING} and ${FUNGIBLE_SECTION_KEY}, so the record must hold neither`, readmeSection(DOWNGRADE_HEADING), [
     ci(`An earlier release's loader rejects ${SWITCH} and ${code(FUNGIBLE_SECTION_KEY)} as unknown keys`),
