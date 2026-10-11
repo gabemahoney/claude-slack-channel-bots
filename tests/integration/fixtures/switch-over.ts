@@ -2,7 +2,7 @@
  * switch-over.ts — what test-13-fmk-switch-over.sh reads from a package
  * directory, so the script retypes no runbook title, settings key, default,
  * minimum or margin (b.jg5 SRJ-1108, SRJ-1402; ruling Q13): the steps of the
- * README's switch-over runbook, and agent-director's settings in effect as
+ * switch-over runbook in docs/migration.md, and agent-director's settings in effect as
  * that package reads them.
  *
  * REFUSAL
@@ -26,8 +26,9 @@
  * writes nothing. Output is one named value per line, `<name> <value>`, the
  * name one word and the value the rest of the line.
  *
- * `steps` reads `<pkg-dir>/README.md`, finds the section whose heading title
- * is that package's own `PHASE1_RUNBOOK_SECTION_TITLE`
+ * `steps` reads the runbook doc that package's own `PHASE1_RUNBOOK_DOC`
+ * names (`<pkg-dir>/docs/migration.md`), finds the section whose heading
+ * title is that package's own `PHASE1_RUNBOOK_SECTION_TITLE`
  * (`src/ad-version-gate.ts`), and reads its steps through the one step
  * reader, `runbookSteps` (`tests/test-helpers/runbooks.ts`):
  *
@@ -129,27 +130,28 @@ interface RunbookStep {
 async function steps(pkgDir: string): Promise<number> {
   const gate = await packageModule(pkgDir, 'ad-version-gate.ts')
   const title = exported<string>(gate, `${pkgDir}/src/ad-version-gate.ts`, 'PHASE1_RUNBOOK_SECTION_TITLE')
+  const doc = exported<string>(gate, `${pkgDir}/src/ad-version-gate.ts`, 'PHASE1_RUNBOOK_DOC')
   const markdown = (await import(MARKDOWN_MODULE)) as Record<string, unknown>
   const runbooks = (await import(RUNBOOKS_MODULE)) as Record<string, unknown>
   const headings = exported<(text: string) => Heading[]>(markdown, MARKDOWN_MODULE, 'headings')
   const findSection = exported<(text: string, match: string) => string | undefined>(markdown, MARKDOWN_MODULE, 'findSection')
   const runbookSteps = exported<(section: string, options: { name?: string }) => RunbookStep[]>(runbooks, RUNBOOKS_MODULE, 'runbookSteps')
 
-  const readmePath = join(pkgDir, 'README.md')
-  let readme: string
+  const docPath = join(pkgDir, doc)
+  let text: string
   try {
-    readme = readFileSync(readmePath, 'utf8')
+    text = readFileSync(docPath, 'utf8')
   } catch (err) {
-    fail(`cannot read ${readmePath}: ${err instanceof Error ? err.message : String(err)}`)
+    fail(`cannot read ${docPath}: ${err instanceof Error ? err.message : String(err)}`)
   }
   // The section is found by its title, at whatever level it is written.
-  const matches = headings(readme).filter((h) => h.title === title)
-  if (matches.length !== 1) fail(`${readmePath} has ${matches.length} headings titled "${title}", not one`)
-  const section = findSection(readme, matches[0].text)
-  if (section === undefined) fail(`${readmePath} has no section "${matches[0].text}"`)
+  const matches = headings(text).filter((h) => h.title === title)
+  if (matches.length !== 1) fail(`${docPath} has ${matches.length} headings titled "${title}", not one`)
+  const section = findSection(text, matches[0].text)
+  if (section === undefined) fail(`${docPath} has no section "${matches[0].text}"`)
   let found: RunbookStep[]
   try {
-    found = runbookSteps(section, { name: `${readmePath} "${matches[0].text}"` })
+    found = runbookSteps(section, { name: `${docPath} "${matches[0].text}"` })
   } catch (err) {
     fail(err instanceof Error ? err.message : String(err))
   }

@@ -140,7 +140,7 @@ import {
   type AdErrorClassification,
   type AdVerb,
 } from './ad-error-class.ts'
-import { PHASE1_RUNBOOK_SECTION_TITLE } from './ad-version-gate.ts'
+import { PHASE1_RUNBOOK_DOC, PHASE1_RUNBOOK_SECTION_TITLE } from './ad-version-gate.ts'
 import { ErrSystemInstallDisappeared } from './agent-director-errors.ts'
 import { describeThrownValue, renderLogMessageText } from './persona-connection-errors.ts'
 import { escapeSlackControlCharacters } from './slack-text-escape.ts'
@@ -350,7 +350,7 @@ export const OUTAGE_CLASS_ORDER: readonly OutageClass[] = Object.freeze([
 /**
  * ONSET_TEMPLATES — one template function per outage class.
  * `ad-unreachable` says it affects every persona (the binary is host-wide)
- * and points to the README's switch-over runbook section by its title
+ * and points to the switch-over runbook section in docs/migration.md by its title
  * (`PHASE1_RUNBOOK_SECTION_TITLE`), with no install, reinstall or upgrade
  * command (b.jg5 SRJ-1001). The generic `tmux-unavailable` onset speaks for
  * this persona only, since the outage is raised and cleared per persona; the
@@ -366,7 +366,7 @@ export const OUTAGE_CLASS_ORDER: readonly OutageClass[] = Object.freeze([
  */
 export const ONSET_TEMPLATES: Record<OutageClass, (detail?: string) => string> = {
   'ad-unreachable': (binaryPath?: string) =>
-    `:rotating_light: *agent-director unreachable* — affects every persona.\nBinary: \`${binaryPath ?? '<unknown>'}\`\nRemediation: follow the README's switch-over runbook section "${PHASE1_RUNBOOK_SECTION_TITLE}".`,
+    `:rotating_light: *agent-director unreachable* — affects every persona.\nBinary: \`${binaryPath ?? '<unknown>'}\`\nRemediation: follow the switch-over runbook section "${PHASE1_RUNBOOK_SECTION_TITLE}" in ${PHASE1_RUNBOOK_DOC}.`,
 
   'tmux-unavailable': (_detail?: string) =>
     `:rotating_light: *tmux unavailable* — agent-director cannot reach tmux for this persona.\nRemediation: install or repair tmux.`,

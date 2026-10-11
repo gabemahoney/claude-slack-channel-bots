@@ -4,7 +4,7 @@
 # refuse the start (b.av2 SR-1.2, SR-1.5; E6/E7).
 #
 # Valid leg: one config in the scenario's own state dir, shaped like the
-# README's complete example (a shared channel, a DM-only persona, `dm`
+# docs/configuration.md's complete example (a shared channel, a DM-only persona, `dm`
 # destinations), with every path under the scenario's scratch root:
 #   personas[0] planner    two channels (one shared), DMs off, channel destination
 #   personas[1] reviewer   the shared channel (mentions), DMs on, `dm` destination, U contact

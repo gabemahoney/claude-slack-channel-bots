@@ -61,8 +61,12 @@ import { flat, headingAnchors, headings, requiredSection, sectionRange, splitFen
 const REPO_ROOT = resolve(import.meta.dirname, '..')
 const SKILL_FILE = 'skills/setup-slack-channel-bots/SKILL.md'
 const skill = readFileSync(resolve(REPO_ROOT, SKILL_FILE), 'utf-8')
-const readme = readFileSync(resolve(REPO_ROOT, 'README.md'), 'utf-8')
+/** The user docs the wizard points to: the README and the docs/ pages it lists. */
+const USER_DOCS = ['README.md', 'docs/configuration.md', 'docs/server-settings.md', 'docs/channel-modes.md', 'docs/reload.md', 'docs/cli.md', 'docs/bots.md', 'docs/scheduled-prompts.md', 'docs/agent-director.md', 'docs/troubleshooting.md', 'docs/migration.md']
+const userDocHeadings = new Map(USER_DOCS.map((file) => [file, headings(readFileSync(resolve(REPO_ROOT, file), 'utf-8')).map((h) => h.text)]))
 const debugSkill = readFileSync(resolve(REPO_ROOT, 'skills', 'debug-slack-channel-bots', 'SKILL.md'), 'utf-8')
+/** The debug skill's headings: the wizard names its `### The load-time rules`. */
+const debugSkillHeadings = headings(debugSkill).map((h) => h.text)
 
 /**
  * A level-`level` heading whose title holds `title` as whole words, such as
@@ -681,12 +685,24 @@ describe("setup wizard: rotating a persona's tokens", () => {
 })
 
 describe('setup wizard: cross-references resolve', () => {
-  const readmeTitles = headings(readme).map((h) => h.text)
+  const allTitles = [...[...userDocHeadings.values()].flat(), ...debugSkillHeadings]
 
-  test('every README heading the wizard names in a code span is a README heading', () => {
-    const named = [...flat(skill).matchAll(/`(#{2,4} [^`]+)`/g)].map((m) => m[1])
+  test('every heading the wizard names in a code span is a heading of a user doc or the debug skill', () => {
+    const named = [...flat(skill).matchAll(/`(#{1,4} [^`]+)`/g)].map((m) => m[1])
     expect(named.length).toBeGreaterThan(0)
-    expect(named.filter((h) => !readmeTitles.includes(h))).toEqual([])
+    expect(named.filter((h) => !allTitles.includes(h))).toEqual([])
+  })
+
+  test('a heading named after its doc (`docs/x.md`\'s `### Title`) is a heading of that doc', () => {
+    const pairs = [...flat(skill).matchAll(/`((?:README|docs\/[a-z-]+)\.md)`(?:'s)? `(#{1,4} [^`]+)`/g)].map((m) => [m[1], m[2]] as const)
+    expect(pairs.length).toBeGreaterThan(0)
+    expect(pairs.filter(([file, h]) => !(userDocHeadings.get(file) ?? []).includes(h)).map(([file, h]) => `${file}: ${h}`)).toEqual([])
+  })
+
+  test("a heading named after the debug skill (the debug skill's `### Title`) is a heading of the debug skill", () => {
+    const named = [...flat(skill).matchAll(/the debug skill's `(#{1,4} [^`]+)`/g)].map((m) => m[1])
+    expect(named.length).toBeGreaterThan(0)
+    expect(named.filter((h) => !debugSkillHeadings.includes(h))).toEqual([])
   })
 
   test('every same-file link targets a wizard heading', () => {

@@ -1,10 +1,10 @@
 /**
- * fmk-switch-over-runbook.test.ts — test-13 follows the README's switch-over
- * runbook, with exactly SRJ-1402's host-only substitutions (b.jg5 SRJ-1402;
+ * fmk-switch-over-runbook.test.ts — test-13 follows the switch-over runbook
+ * in docs/migration.md, with exactly SRJ-1402's host-only substitutions (b.jg5 SRJ-1402;
  * SRJ-1108's /ci Test line; the E35 hatch note; ruling Q13).
  *
  * Reads two texts and runs neither, spawning nothing (SRJ-1301):
- * - the README's switch-over section, found by its title imported from `src/`
+ * - the switch-over section of docs/migration.md, found by its title imported from `src/`
  *   and read through the shared step reader (`runbookSteps`,
  *   tests/test-helpers/runbooks.ts); N, its step count, comes from it;
  * - `tests/integration/test-13-fmk-switch-over.sh`, whose two runbook markers
@@ -27,7 +27,7 @@
 import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
+import { PHASE1_RUNBOOK_DOC, PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
 import { requiredSection } from './test-helpers/markdown.ts'
 import { runbookSteps, stepHeadingPrefix } from './test-helpers/runbooks.ts'
 
@@ -39,7 +39,7 @@ const SCRIPT_FILE = 'tests/integration/test-13-fmk-switch-over.sh'
 const SECTION_HEADING = `### ${PHASE1_RUNBOOK_SECTION_TITLE}`
 
 /** Where the steps come from, put before every step reader failure. */
-const SECTION_NAME = `README.md "${SECTION_HEADING}"`
+const SECTION_NAME = `${PHASE1_RUNBOOK_DOC} "${SECTION_HEADING}"`
 
 function readRepoFile(relPath: string): string {
   return readFileSync(resolve(REPO_ROOT, relPath), 'utf-8')
@@ -125,7 +125,7 @@ function scriptMarkers(script: string): { steps: Marker[]; substitutions: Marker
 }
 
 /**
- * What keeps `script` from following the runbook `section` (the README
+ * What keeps `script` from following the runbook `section` (the docs/migration.md
  * section's body) with exactly `SUBSTITUTIONS`, each naming its step and,
  * for a substitution, its kind. Empty when it follows it. Throws as the step
  * reader does when the section's steps are not 1 to N. Pure.
@@ -141,7 +141,7 @@ function runbookFindings(section: string, script: string): string[] {
     if (times > 1) findings.push(`step ${n}: entered ${times} times`)
   }
   for (const s of steps) {
-    if (s.step < 1 || s.step > count) findings.push(`step ${s.step}: entered at line ${s.line}, but the README's runbook has steps 1 to ${count}`)
+    if (s.step < 1 || s.step > count) findings.push(`step ${s.step}: entered at line ${s.line}, but the doc's runbook has steps 1 to ${count}`)
   }
   steps.forEach((s, k) => {
     if (k > 0 && s.step < steps[k - 1].step) findings.push(`step ${s.step}: entered at line ${s.line}, after step ${steps[k - 1].step}`)
@@ -181,16 +181,16 @@ function moveDeclaration(script: string, prefix: string, to: number, as?: number
   return edit(edit(script, line, ''), `\nrunbook_step ${to}\n`, `\nrunbook_step ${to}\n${moved}`)
 }
 
-describe(`test-13 follows the README's "${PHASE1_RUNBOOK_SECTION_TITLE}" runbook with exactly SRJ-1402's substitutions (b.jg5 SRJ-1402, SRJ-1108)`, () => {
-  const section = requiredSection(readRepoFile('README.md'), SECTION_HEADING, 'README.md')
+describe(`test-13 follows docs/migration.md's "${PHASE1_RUNBOOK_SECTION_TITLE}" runbook with exactly SRJ-1402's substitutions (b.jg5 SRJ-1402, SRJ-1108)`, () => {
+  const section = requiredSection(readRepoFile(PHASE1_RUNBOOK_DOC), SECTION_HEADING, PHASE1_RUNBOOK_DOC)
   const script = readRepoFile(SCRIPT_FILE)
   const count = runbookSteps(section, { name: SECTION_NAME }).length
 
-  test(`${SCRIPT_FILE} enters steps 1 to N of the README once each, in order, and declares exactly SRJ-1402's substitutions, each inside its step's section`, () => {
+  test(`${SCRIPT_FILE} enters steps 1 to N of the runbook once each, in order, and declares exactly SRJ-1402's substitutions, each inside its step's section`, () => {
     expect(runbookFindings(section, script)).toEqual([])
   })
 
-  /** A step heading one past the README's last, at the steps' own level. */
+  /** A step heading one past the runbook's last, at the steps' own level. */
   const withExtraStep = (): string => {
     const last = runbookSteps(section, { name: SECTION_NAME }).at(-1)!
     const heading = section.split('\n')[last.line]
@@ -205,8 +205,8 @@ describe(`test-13 follows the README's "${PHASE1_RUNBOOK_SECTION_TITLE}" runbook
       [/^step 5: entered at line \d+, after step 6$/],
     ],
     ['a step entered twice', () => [section, edit(script, '\nrunbook_step 4\n', '\nrunbook_step 4\nrunbook_step 4\n')], [/^step 4: entered 2 times$/]],
-    ['a step beyond the README', () => [section, `${script}runbook_step ${count + 1}\n`], [new RegExp(`^step ${count + 1}: entered at line \\d+, but the README's runbook has steps 1 to ${count}$`)]],
-    ['a README with one more step', () => [withExtraStep(), script], [new RegExp(`^step ${count + 1}: never entered \\(no runbook_step ${count + 1} call\\)$`)]],
+    ['a step beyond the runbook', () => [section, `${script}runbook_step ${count + 1}\n`], [new RegExp(`^step ${count + 1}: entered at line \\d+, but the doc's runbook has steps 1 to ${count}$`)]],
+    ['a runbook with one more step', () => [withExtraStep(), script], [new RegExp(`^step ${count + 1}: never entered \\(no runbook_step ${count + 1} call\\)$`)]],
     [
       'a step entered with a computed number',
       () => [section, edit(script, '\nrunbook_step 3\n', '\nrunbook_step "$((2 + 1))"\n')],
@@ -246,7 +246,7 @@ describe(`test-13 follows the README's "${PHASE1_RUNBOOK_SECTION_TITLE}" runbook
     expect(runbookFindings(mutatedSection, mutatedScript)).toEqual(expected.map((pattern) => expect.stringMatching(pattern)))
   })
 
-  test('self-check: a README step missing below N fails through the step reader, naming the section and the step', () => {
+  test('self-check: a runbook step missing below N fails through the step reader, naming the section and the step', () => {
     const last = runbookSteps(section, { name: SECTION_NAME }).at(-1)!
     const gap = edit(section, stepHeadingPrefix(last.number - 1), 'Then: ')
 

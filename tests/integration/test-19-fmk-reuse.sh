@@ -78,7 +78,7 @@
 #   harness plays the operator while the server is stopped: config.json is
 #   rewritten to the next leg's persona and settings and the last-applied
 #   record moved aside, so the next start applies config.json as it stands
-#   (README "Reload"). In scenario 18 the operator also edits config.json on
+#   (docs/reload.md). In scenario 18 the operator also edits config.json on
 #   the running server and confirms the change by renaming the pending file
 #   the reload tick writes to the apply file;
 # - checks read only their own leg's ids and window: server.log and

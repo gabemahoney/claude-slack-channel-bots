@@ -26,6 +26,17 @@ One broken persona never stops the server. Every healthy persona keeps serving,
 and nothing about a broken persona is posted to Slack under any identity. The
 server log is the place to look.
 
+**Where this skill comes from.** It ships in the package at
+`skills/debug-slack-channel-bots/SKILL.md`. The postinstall of an installed
+package (a global install) links it into
+`~/.claude/skills/debug-slack-channel-bots`; a copied directory or file
+already at that path is left in place, and postinstall logs
+`skipped: <path> (not a link; …)`: remove it and re-run postinstall to get
+the link. A postinstall run in a git checkout or worktree (including
+[an install from a local worktree](../../CONTRIBUTING.md#installing-from-a-local-worktree)),
+outside a `node_modules` directory or with `CI` set leaves `~/.claude/skills/`
+alone and logs `skipped: <home>/.claude/skills (skill links left alone: <reason>)`.
+
 ## Constraints
 
 Whoever runs this skill (the operator, or a Claude session acting for one):
@@ -79,7 +90,7 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
 - NEVER move, delete, relink or rewrite a crontable or its `prompts`
   directory, at its location or at the old path beside `config.json`, without
   the operator's say-so. Reading and listing them is fine (see
-  [The crontable](../../README.md#the-crontable)).
+  [The crontable](../../docs/scheduled-prompts.md#the-crontable)).
 
 ---
 
@@ -141,7 +152,7 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    floor is covered under
    [The server refuses the agent-director binary at start](#the-server-refuses-the-agent-director-binary-at-start);
    for a missing or unreachable agent-director, the `install-cscb` skill
-   diagnoses it and names the README section that installs it.
+   diagnoses it and names the docs/migration.md section that installs it.
    **The server was running and has stopped?** Read the latest lines of
    `startup-errors.log`. One that says `found by a runtime re-check while the
    server was running` is covered under
@@ -266,7 +277,7 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
     [`persona-channel-delivery-set`](#persona-channel-delivery-set).
 13. **Scheduled prompts stopped firing, `server.log` has a `failed to create
     crontable` line, or you're not sure which crontable the server reads?** See
-    [The crontable](../../README.md#the-crontable). A crontable left in the old
+    [The crontable](../../docs/scheduled-prompts.md#the-crontable). A crontable left in the old
     `~/.claude/channels/slack` moves with the state directory (see
     [The state directory's location and its move at start](#the-state-directorys-location-and-its-move-at-start)).
 14. **Old lines are missing from the cron log, or `server.log` has a
@@ -813,8 +824,8 @@ running are not affected. See
   - For a public or private channel that is not externally shared: turn
     fungible mode on, which serves every such channel each persona's app is
     a member of (see
-    [Turning fungible mode on or off](../../README.md#turning-fungible-mode-on-or-off)
-    and, before that, [Who can reach a persona in fungible mode](../../README.md#who-can-reach-a-persona-in-fungible-mode)).
+    [Turning fungible mode on or off](../../docs/channel-modes.md#turning-fungible-mode-on-or-off)
+    and, before that, [Who can reach a persona in fungible mode](../../docs/channel-modes.md#who-can-reach-a-persona-in-fungible-mode)).
   - Remove the app from the channel.
 
   Turning fungible mode on is a fix for a channel only,
@@ -846,7 +857,7 @@ running are not affected. See
 
   Serving a channel in declarative mode means turning fungible mode off for
   every persona (see
-  [Channel modes](../../README.md#channel-modes)); there is no per-channel
+  [Channel modes](../../docs/channel-modes.md#channel-modes)); there is no per-channel
   exception.
 
 ### `persona-dm-dropped`
@@ -927,7 +938,7 @@ running are not affected. See
 - **Two personas at `all` in one channel:** don't. Each receives every
   message there, the other's posts included, so the two can keep answering
   each other with no human involved. Keep at most one at `all` (see
-  [Channel delivery in fungible mode](../../README.md#channel-delivery-in-fungible-mode)).
+  [Channel delivery in fungible mode](../../docs/channel-modes.md#channel-delivery-in-fungible-mode)).
 
 ### `persona-channel-delivery-set`
 
@@ -1435,10 +1446,10 @@ line shows that the message's event reached the persona's app at all.
 | **The stored-choice file is unreadable** (fungible mode) | A [`channel-delivery-unreadable`](#channel-delivery-unreadable) line at the latest start. Every `persona-invited-channel` line shows `mentions`, and `set_channel_delivery` is refused. | See [`channel-delivery-unreadable`](#channel-delivery-unreadable). |
 | **The persona isn't up, or its instance isn't taking messages** | A class line after its latest `persona-start` line, or a *Message lost* notice at its destination with a `No live session` or `DROP: no _GET_stream` line. A lost message still logs the channel's `persona-invited-channel` line in fungible mode. | See [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running) and [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected). |
 
-The README's troubleshooting entry **A persona is silent in a channel it was
-invited to** (under [Troubleshooting](../../README.md#troubleshooting)) gives
+The troubleshooting entry **A persona is silent in a channel it was
+invited to** (under [Troubleshooting](../../docs/troubleshooting.md#troubleshooting)) gives
 the operator's short version, and
-[Channel modes](../../README.md#channel-modes) explains the two modes.
+[Channel modes](../../docs/channel-modes.md#channel-modes) explains the two modes.
 
 ### A persona receives every message in a channel
 
@@ -1457,7 +1468,7 @@ channel, not only @mentions and broadcasts.
     `mentions`;
   - remove the persona's app from the channel;
   - turn fungible mode off with a confirmed change (see
-    [Turning fungible mode on or off](../../README.md#turning-fungible-mode-on-or-off)).
+    [Turning fungible mode on or off](../../docs/channel-modes.md#turning-fungible-mode-on-or-off)).
     The stored choice stays on disk and applies again if fungible mode is
     turned back on.
 - **Declarative mode.** The channel's entry in the persona's `channels` has
@@ -1466,7 +1477,7 @@ channel, not only @mentions and broadcasts.
 
 Two personas at `all` in one channel each receive the other's posts and can
 keep answering each other: keep at most one at `all` (see
-[Channel delivery in fungible mode](../../README.md#channel-delivery-in-fungible-mode)).
+[Channel delivery in fungible mode](../../docs/channel-modes.md#channel-delivery-in-fungible-mode)).
 
 ---
 
@@ -1525,6 +1536,25 @@ or the persona is removed. `server.log` has, when the notice is posted:
 [slack] session-manager: persona=<key> is not connected (<reason>) — raising a not-connected notice (b.f2b)
 ```
 
+**How the health check recovers it.** An instance can lose its MCP
+connection while its process stays alive, with no disconnect event, or stay
+connected while its message stream is gone, dropping every message. Once the
+health check finds the persona alive but not connected, or its stream gone,
+on two consecutive ticks, it schedules a restart
+(`[slack] Scheduling restart for persona=<key> in <N>s (backoff)`). About
+3 s later `Clean-exit check for persona=<key>: its row does not read ended (live) — …`
+says the restart waits its full delay (see
+[Other lines you may see](#other-lines-you-may-see)); then
+`[slack] Session alive but disconnected — reconnecting MCP for persona=<key>`
+starts the reconnect below, or the persona is relaunched if its process has
+died meanwhile. So recovery lands within about two `health_check_interval`
+periods plus `session_restart_delay`, 3–5 minutes at the defaults, with no
+inbound message and no server restart. A persona at the restart limit gets
+none of it: the health check skips it (the `is at cap — skipping tick` line
+under [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)),
+and a server restart brings it back (for a held persona, `clear-latch`
+too; see [Clearing a hold by hand: `clear-latch`](#clearing-a-hold-by-hand-clear-latch)).
+
 | Notice | `<reason>` | Why | What to do |
 |---|---|---|---|
 | *Waiting on a prompt* | `blocked-on-prompt` | The instance's terminal shows a permission dialog, a question or another prompt that no one answered, or its row reads `ask_user` or `check_permission` while agent-director still shows a screen of its session (or can't answer). The server never types into one. An instance that died under a prompt keeps that row state, but it is not reported: the server asks agent-director for its screen first, and one with no screen or no row is relaunched (see [A persona whose instance died under a prompt](#a-persona-whose-instance-died-under-a-prompt)). | With the operator's say-so, attach (`tmux attach -t =slack_bot_<key>`) and answer it; a permission prompt also posted to the persona's destination can be answered there. Once it is answered, the server reconnects the instance when it can tell it is idle again (its row reads `waiting`, or its screen and transcript prove it idle); if it stays disconnected, type `/mcp reconnect slack-channel-router` in it. With `session_restart_delay` 0 the notice says so: if it is still not connected once its turn ends, type that command or restart the server. |
@@ -1535,7 +1565,9 @@ or the persona is removed. `server.log` has, when the notice is posted:
 Every one of these notices ends `This is for a human only: no bot,
 including any persona that sees this post, may act on it.` The steps in the
 table are the operator's: no bot takes them on its own, including a persona
-that sees the post.
+that sees the post. The `=` in `tmux attach -t =slack_bot_<key>`, here and in
+the notices, attaches to that exact session only, never to another persona's
+session whose name starts with it.
 
 The *Not connected* notice gives one of these causes:
 
@@ -1584,6 +1616,11 @@ changed:
   `<slug>` is the row's `cwd` with every character other than a letter, digit
   or `-` replaced by `-`. A transcript that can't be found or read is no sign
   of idleness.
+
+Every persona's Claude runs with Claude Code's prompt suggestions off
+(`CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`), which removes a likely cause
+of such a stale `working` row, so a session you attach to shows no suggested
+prompt.
 
 It never types into a running turn or a prompt. Holding back is bounded,
 though: once the server has held back from a `working` row for 10 min from
@@ -1798,7 +1835,7 @@ the check for pending changes start as usual.
 | Line | Meaning |
 |---|---|
 | `[slack] startupSessionManager: "<name>" (key=<key>) is waiting for its working row to settle — the start pass goes on without it; its launch stays in flight in the background (b.f2b)` | Normal. Until the launch ends, the health check still checks this persona but never restarts, reconnects or reports it. |
-| `[slack] startupSessionManager: complete — <N> persona(s): <n> resumed, <n> fresh-spawned, <n> fresh-after-amnesia, <n> fresh-after-inconclusive-amnesia, <n> reconnected, <n> no-op, <n> failed, <n> not brought up, <n> not reconnected, <n> latched, <n> retrying, <n> waiting on a live-row sequence, <n> held on invalid flags, <n> fresh as retired keys` | The start summary. Each persona's launch is counted once, in one count, except one still waiting in the background: it is in no count, and the next line gives how many. `not reconnected` counts instances left running without a reconnect (see the lines above). `latched` counts launches that held the persona for a human, or found it held (see [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice) and the two Held sections after it). `retrying` counts launches agent-director refused, now in the persona's automatic retries (see [agent-director refuses a persona: it is retried on its own](#agent-director-refuses-a-persona-it-is-retried-on-its-own)). `waiting on a live-row sequence` counts launches waiting while the server replaces the persona's old instance (the `replacing the row of …` and `not launching … — its live-row sequence runs` lines under [Other lines you may see](#other-lines-you-may-see)). `held on invalid flags` counts launches of a persona held because agent-director rejected its launch flags (see [A persona posts a Cannot launch notice](#a-persona-posts-a-cannot-launch-notice)). `fresh as retired keys` counts personas whose key is retired, brought up on a new conversation (see [Added again or renamed back](#added-again-or-renamed-back)). None of these five is a failure, and none is counted as `fresh-spawned`. A persona held before its launch (its credentials, working directory or Slack connection, still being retried) is counted under `not brought up`, never under `retrying`. |
+| `[slack] startupSessionManager: complete — <N> persona(s): <n> resumed, <n> fresh-spawned, <n> fresh-after-amnesia, <n> fresh-after-inconclusive-amnesia, <n> reconnected, <n> no-op, <n> failed, <n> not brought up, <n> not reconnected, <n> latched, <n> retrying, <n> waiting on a live-row sequence, <n> held on invalid flags, <n> fresh as retired keys` | The start summary. Each persona's launch is counted once, in one count, except one still waiting in the background: it is in no count, and the next line gives how many. `not reconnected` counts instances left running without a reconnect (see the lines above). `latched` counts launches that held the persona for a human, or found it held (see [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice) and the two Held sections after it). `retrying` counts launches agent-director refused, now in the persona's automatic retries (see [agent-director refuses a persona: it is retried on its own](#agent-director-refuses-a-persona-it-is-retried-on-its-own)). `waiting on a live-row sequence` counts launches waiting while the server replaces the persona's old instance (the `replacing the row of …` and `not launching … — its live-row sequence runs` lines under [Other lines you may see](#other-lines-you-may-see)). `held on invalid flags` counts launches of a persona held because agent-director rejected its launch flags (see [A persona posts a Cannot launch notice](#a-persona-posts-a-cannot-launch-notice)). `fresh as retired keys` counts personas whose key is retired, brought up on a new conversation (see [Added again or renamed back](#added-again-or-renamed-back)). None of these five is a failure, and none is counted as `fresh-spawned`. A persona held before its launch (missing credentials, a missing working directory, a `claude_config_dir` that can't be resolved yet, or Slack refusing or unreachable, still being retried) is counted under `not brought up`, never under `retrying`. |
 | `[slack] startupSessionManager: <n> persona(s) still waiting in the background for a working row to settle — not counted above; each logs its outcome when it settles (b.f2b)` | Launches still waiting when the summary was logged. |
 | `[slack] startupSessionManager: background launch for "<name>" (key=<key>) settled: <outcome> (b.f2b)` | The launch ended. `reconnected`: the reconnect was typed. `not-reconnected`: the instance was left running without it (the line before says what happens next), or the persona's removal cancelled the wait. A relaunch action (`resumed`, `spawned`, `fresh-after-amnesia` or `fresh-after-inconclusive-amnesia`): the instance had died and was relaunched; for the two amnesia actions, its transcript was missing, so the persona was brought up fresh on the same instance and its agent-director row was kept, and the persona's `[slack] ErrJsonlMissing diagnostic:` line says whether its conversation history was lost. `deferred`: its `claude_config_dir` stopped resolving, and the persona is held until it does. `latched`: the wait or the relaunch met a tmux session conflict, an unusable recorded tmux session name, or a row pending with no launch start, and the persona is held (see [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice), [A persona posts a Held: unusable tmux session name notice](#a-persona-posts-a-held-unusable-tmux-session-name-notice) and [A persona posts a Held: launch start not recorded notice](#a-persona-posts-a-held-launch-start-not-recorded-notice)). `failed`: see the persona's spawn-failure lines; after a *version re-check decided that the server stops* line, the server is stopping. |
 | `[slack] startupSessionManager: unexpected error in the background launch for "<name>" (key=<key>): <error>` | An internal error, also recorded as `spawn-failed` in `startup-errors.log`. Report it as a bug, with the persona's lines. |
@@ -1815,7 +1852,8 @@ the persona's session, `slack_bot_<key>`.
 
 **Launch stuck.** This server made the launch, and it is still that launch.
 The server ends it once and launches the persona again; a resumed persona
-keeps its conversation. The notice ends "Nothing is needed." A launch counts
+keeps its conversation. The notice says how long the launch was given and
+ends "Nothing is needed." A launch counts
 as the server's own only when all of these hold:
 
 - this server made it since its last start: the server noted the launch's
@@ -1866,7 +1904,8 @@ made, one from before a server restart, one whose `send-keys` was refused as
 not interactive, one whose session agent-director could not create (its
 `… a counted launch failure; nothing is killed …` line and `Spawn failure:`
 notice came first, also after a failed resume or reuse spawn that left the
-instance still starting), or a relaunch still stuck. The server never ends such a
+instance still starting), or a relaunch still stuck. The notice names the
+time the launch started, in UTC. The server never ends such a
 launch and never launches over it: the session holding the persona's name
 may be a leftover of an earlier launch of this persona, and ending it is a
 human's decision.
@@ -1886,7 +1925,8 @@ Either way, it keeps checking:
 - a check that agent-director can't decide yet leads to nothing more until
   the next retry, and a row read that fails ends the check;
 - once the row reads ended or missing, or is gone, the persona is brought up
-  again, keeping its conversation where it can;
+  again, keeping its conversation where it can; a launch that is still
+  starting never counts as a failure;
 - at or after the limit, while the row still reads `pending`, the persona
   posts one of the two notices, each once while the launch stays stuck.
 
@@ -2047,7 +2087,7 @@ grep -h -E '\(key=<key>\)|persona=<key>\b' "$STATE"/server.log.* "$STATE"/server
 |---|---|---|
 | `[slack] spawnForPersona: attempting resume for "<name>" (key=<key>)`, then `[slack] spawnForPersona: resumed "<name>" (key=<key>)` | The `resume` call succeeded. It is not counted until the persona's row is read after it. | Nothing yet. |
 | `[slack] <site>: <read> for <ref>: its resumed launch ended before reporting in (state=<state>) — <n> resume(s) in a row ended so; at 2 the ladder makes a reuse spawn in place of a resume (b.4q8)` | A read of the persona's row found that resume's row `ended`, `missing` or gone (`no-row`) before its session started. `<site>: <read>` names the read that found it, for example `isSessionAlive: status` (a health check's or a restart's), `unavailable-retry: retry row read` (a retry's) or `spawnForPersona: collision get` (the next launch's); `<ref>` is `"<name>" (key=<key>)` or `persona=<key>`. `<n>` is how many resumes in a row have ended so. | Check the transcript (**What to check**, below). At `<n>` 1 the next launch still resumes. |
-| `[slack] Resumed launch failed for persona=<key>: its row ended before reporting in — counted (b.4q8)` | That resume was counted as one failed launch toward the restart limit. At the limit, `[slack] Cap reached for persona=<key> — notifying and stopping restarts` and the `SpawnCapReached` notice follow. | As above. A persona at the limit stays down until the server restarts (see "Session not restarting after crash" under Troubleshooting in the README). |
+| `[slack] Resumed launch failed for persona=<key>: its row ended before reporting in — counted (b.4q8)` | That resume was counted as one failed launch toward the restart limit. At the limit, `[slack] Cap reached for persona=<key> — notifying and stopping restarts` and the `SpawnCapReached` notice follow. | As above. A persona at the limit stays down until the server restarts (see "Session not restarting after crash" in `docs/troubleshooting.md`). |
 | `[slack] spawnForPersona: "<name>" (key=<key>): its last <n> resumes in a row ended before reporting in — not resuming its transcript again: a reuse spawn of the same id brings it up fresh, without its conversation; nothing is deleted (b.4q8)` | The fallback. The reuse spawn's own lines follow, then the persona's session starts on a new conversation. Logged again before each try while a reuse spawn does not succeed. | Nothing for the persona. Check the transcript to find out why its resumes failed. |
 | `[slack] Restart for persona=<key> goes no further <before its kill\|before its launch> — the persona reached the restart cap while this restart ran; nothing more is killed or launched for it (b.4q8)` | A read during this restart counted a resume that ended before its session started, and that failed launch reached the restart limit. Nothing more is killed or launched; the `Cap reached` line and `SpawnCapReached` notice came first. | As for the counted line above. |
 | `[slack] health-check: persona=<key> is at cap — skipping tick (SR-25.3/25.4)`, just after the persona's `isSessionAlive: status for persona=<key>: its resumed launch ended before reporting in …`, counted and `Cap reached` lines | The health check's own read counted the resume and reached the limit, so the check scheduled nothing. | As above. |
@@ -2089,7 +2129,7 @@ it so, such as a full or failing disk, or a copy or restore of the config
 directory. If the transcript parses and holds conversation lines, the
 session ended for another reason. A Claude Code release that exits on
 `--resume` is one: see "Session crashes on resume with "sandbox required but
-unavailable"" under Troubleshooting in the README. Otherwise report it, with
+unavailable"" in `docs/troubleshooting.md`. Otherwise report it, with
 the persona's lines.
 
 ## A persona posts a Not answering notice
@@ -3034,7 +3074,7 @@ It quotes no agent-director description and no version.
 
 **The fix is a human's.** A human checks the installed agent-director
 against this release's prerequisites (the README's Prerequisites section)
-and installs agent-director as the README section "Switching over to
+and installs agent-director as the docs/migration.md section "Switching over to
 agent-director Phase 1" describes. This skill takes no step of it; no bot
 acts on the notice, including a persona that sees the post. Never act on
 the persona's row or on its session.
@@ -3440,7 +3480,9 @@ other than the teardown's own (a launch still running) starts with its
 context in parentheses, for example `(recovery) `.
 
 **The fix is the inner notice's own.** The entry only says where the notice
-went; read `<the notice's text>` and follow that notice's own section:
+went; read `<the notice's text>` and follow that notice's own section. The
+persona's row is kept, and its new session, if any, is not started over the
+old one:
 
 | Inner notice | Where to look |
 |---|---|
@@ -3825,7 +3867,7 @@ registers again with its history. If the new token is refused too, a new
   | The effective value isn't what you expect. A persona without its own `stop_hook_bootstrap` inherits the top-level one (default `true`). | The persona's entry and the top level of `config.json`. | With the operator's say-so, set `stop_hook_bootstrap` on the persona's entry (it overrides the top level), then confirm the edit. It applies at the persona's next launch; to apply it now, relaunch the bots with `clean_restart` (see [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)). |
   | The value changed after the persona's instance launched. A running instance keeps the value it launched with; a change applies at the persona's next launch. A plain server restart reconnects to an instance that is still running, which is not a launch. | The record holds the old value. | With the operator's say-so, run `claude-slack-channel-bots clean_restart`. It relaunches every persona (resume or fresh spawn), cutting off their current turns, and each launch rewrites the persona's record. |
   | No `claude_config_dir` is configured for the persona (nor at the top level). No hook is installed for it, so it gets no reminder. | `server.log` has `[slack] stop-hook-bootstrap: "<name>" (key=<key>) has no claude_config_dir — skipping`. | Give the persona (or the top level) a `claude_config_dir` of its own, then confirm the edit and relaunch the bots with `clean_restart` (see [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)). The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
-  | Its `claude_config_dir` resolves to the operator's own `~/.claude`. The server never installs the hook there, so the persona gets no reminder. | `startup-errors.log` has a `stop-hook-bootstrap-refuse-home` entry (recorded once per server start); `server.log` has `refusing to touch operator's own ~/.claude` at each launch. | Point the persona at a different `claude_config_dir`, then confirm the edit and relaunch the bots with `clean_restart` (see [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)). The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
+  | Its `claude_config_dir` resolves to the operator's own `~/.claude`. The server never installs the hook there, so the persona gets no reminder. | `startup-errors.log` has a `stop-hook-bootstrap-refuse-home` entry (recorded once per server start, naming the directory and the personas); `server.log` has `refusing to touch operator's own ~/.claude` at each launch. | Point the persona at a different `claude_config_dir`, then confirm the edit and relaunch the bots with `clean_restart` (see [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)). The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
   | `jq` is not on the host's `PATH`. The hook is installed but can't read the transcript, so it never reminds. | `startup-errors.log` has a `stop-hook-bootstrap-jq-missing` entry. | Install `jq`. No restart is needed; the next turn is checked. |
   | The hook couldn't be installed: the directory is missing, or its `settings.json` is unreadable or not valid JSON (left untouched). | `startup-errors.log` (at start) or `server.log` (at a launch) has `stop-hook-bootstrap-dir-missing`, `stop-hook-bootstrap-not-a-dir` or `stop-hook-bootstrap-settings-…`; the `jq` command above shows no `slack-reply-guard.sh` entry. | Create the directory or fix the file, then `clean_restart`. |
   | The record couldn't be written at launch. The stale record is removed, so the persona gets no reminder until its next launch. | No record file; `server.log` has `[slack] reply-guard: could not write the record for "<name>" (key=<key>) at <path>`. | Fix the state directory's permissions or free space, then `clean_restart`. |
@@ -3836,6 +3878,122 @@ registers again with its history. If the new token is refused too, a new
   that started from a Slack message the persona received, and only when it
   hasn't replied with the `reply` tool. A persona that replies, or a turn
   started by a scheduled prompt or `/interject`, gets no reminder.
+
+### How the guard is installed and what it reads
+
+- **The hook.** The server patches `<claude_config_dir>/settings.json` in
+  each applied persona's effective `claude_config_dir` (the persona's own
+  value, else the top-level value). Where the hook is installed, the file
+  holds exactly one managed Stop-hook group of this shape:
+
+  ```jsonc
+  {
+    "hooks": {
+      "Stop": [
+        { "hooks": [ { "type": "command", "command": "'<absolute path>/stop-hooks/slack-reply-guard.sh' '<state dir>/reply-guard'" } ] }
+      ]
+    }
+  }
+  ```
+
+  The command is the absolute path of the script inside CSCB's installed
+  package, then the record directory, each in single quotes. There is no
+  `matcher` field: Stop is not a tool-scoped event. The operator's other Stop
+  hooks, and every other key in `settings.json`, are preserved. Writes are
+  atomic (`.tmp` + `rename`). A missing `settings.json` is created with just
+  this group; a malformed one is left untouched and an error is recorded.
+- **Recognition rule.** Any Stop-hook `command` containing
+  `slack-reply-guard.sh` counts as CSCB-managed. Only the exact current
+  command is kept: duplicates collapse to one group, and an entry with an
+  older script path, no record directory or another record directory is
+  replaced. This is how the hook heals itself across upgrades.
+- **The record.** `reply-guard/<persona key>` in the state directory holds
+  `true` or `false`, the persona's effective `stop_hook_bootstrap`. The
+  server writes it atomically immediately before it spawns or resumes the
+  persona's instance; reconnecting to an instance that is still running
+  leaves it as it was.
+- **What the guard reads.** Every persona's instance runs with its key in
+  `CSCB_PERSONA`. The guard reads `<record directory>/<CSCB_PERSONA>` and
+  reminds only when it reads exactly `true`. A missing argument, an unset
+  `CSCB_PERSONA` or a missing record means no reminder.
+- **Shared directories.** Personas that share one `claude_config_dir` each
+  follow their own record. The managed hook stays installed in a directory
+  while any persona counting toward it has an effective `stop_hook_bootstrap`
+  of `true` or a record reading `true`. A persona counts toward its effective
+  directory and toward the directory its running instance launched with.
+  When no such persona is left, the server removes the hook from that
+  directory.
+- **Timing.** At server start the server patches the hook for every applied
+  persona before any launch. Immediately before each spawn or resume (a
+  restart included), it writes the persona's record and patches the hook in
+  the persona's new effective directory and, if it differs, the directory it
+  last launched with. A running instance keeps the value it launched with,
+  since the guard reads its own record. The hook itself may appear in or
+  vanish from a shared directory while an instance runs, for example when a
+  neighbour launches; Claude Code normally picks such edits up without a
+  restart, but the instance's own record still decides.
+- **No directory, or `~/.claude`.** A persona with no effective
+  `claude_config_dir` (an empty or whitespace-only value counts as none)
+  gets no reminder; this is a server-log line only, never a startup error.
+  The server never installs the hook in the operator's own `~/.claude` and
+  never edits `~/.claude/settings.json`: a persona whose directory resolves
+  there (symlinks followed) gets no reminder, recorded once per start as
+  `stop-hook-bootstrap-refuse-home` and as a server-log line at a later
+  launch.
+- **Fail-open.** When anything is missing or goes wrong, the guard exits `0`
+  and the turn ends normally: besides the cases above, when `jq` is missing
+  (the hook is installed anyway, so installing `jq` later is enough), when
+  the record could not be written before a launch (the stale record is
+  removed, one line is logged and the launch goes on), and when the
+  transcript is missing or unreadable or the message's opening `<channel>`
+  tag is not in the shape the guard expects (below).
+
+### Checking the guard after an upgrade
+
+The guard reads the `<channel …>` tag at the very start of each message that
+started the turn. It treats the tag as Slack's when its `source` starts with
+`slack`, and reads its `via` and `chat_id`; a tag quoted later in a
+message's text is ignored. CSCB sends only the message content and its
+attributes over MCP: the Claude Code harness renders the tag when it writes
+the message into the transcript, `source` being the MCP server name
+(`slack-channel-router`). The tag is an external, harness-owned contract: a
+Claude Code release can rename or restructure it, and the guard would
+silently stop reminding. The guard also relies on the harness escaping
+attribute values: `via` comes after the free-form `user` attribute, so if the
+harness stopped escaping `>`, a display name containing `>` would cut the
+tag short before `via` and the reminder would be silently skipped.
+
+After every CSCB or Claude Code upgrade, verify the guard end to end:
+
+1. Send a persona that has the reminder on a Slack message that needs a
+   reply.
+2. Confirm the reply lands in Slack.
+3. Inspect the persona's most recently modified transcript, in
+   `<claude_config_dir>/projects/<project_folder>/`, where
+   `<claude_config_dir>` is the persona's effective `claude_config_dir` (a
+   persona the guard covers always has one, never `~/.claude`). Claude Code
+   names `<project_folder>` after the absolute `working_directory`, every
+   character other than a letter, a digit or `-` replaced by `-`:
+   `/home/me/projects/alpha` becomes `-home-me-projects-alpha`. Other
+   personas sharing the config dir have their own folders, so use this one,
+   not `projects/*`. Replace both placeholders:
+
+   ```sh
+   f=$(ls -t <claude_config_dir>/projects/<project_folder>/*.jsonl | head -n 1)
+   grep -o '<channel source=\\"slack[^>]*>' "$f" | tail -n 1
+   grep -n '<channel source=\\"slack' "$f" | tail -n 1 | cut -d: -f1
+   grep -n '"name":"mcp__slack-channel-router__reply"' "$f" | tail -n 1 | cut -d: -f1
+   ```
+
+   The transcript stores the tag's quotes escaped (`\"`), hence the `\\"` in
+   the patterns. The first `grep` prints the last Slack tag, which must carry
+   both `via` and `chat_id`. The next two print the line numbers of the last
+   Slack tag and of the last `mcp__slack-channel-router__reply` `tool_use`.
+   The reply's line number must be greater than the tag's; no reply line, or
+   a smaller number, means the reply was not recorded after the message.
+
+If the tag, `via` or `chat_id` no longer appears, the guard is dark or
+misreading messages: report it to the operator to file an issue.
 
 ---
 
@@ -4041,7 +4199,7 @@ the persona's recorded session name), a store it can't open
 install disappearing (`ErrSystemInstallDisappeared`, which also posts the
 *agent-director unreachable* notice: it says the outage affects every
 persona, since the binary is host-wide, and its remedy points to the
-README section "Switching over to agent-director Phase 1"), any other error name the server gives no
+docs/migration.md section "Switching over to agent-director Phase 1"), any other error name the server gives no
 handling, or a resume's `ErrInvalidFlags` after the server re-checked the
 binary's version. The server does nothing destructive because of it:
 nothing is deleted, killed or relaunched after it, nothing counts toward the
@@ -4087,6 +4245,8 @@ running when it was removed), nothing reaches Slack. The server writes one
 startup-errors.log` line (below). The entry names the persona's key and the
 notice's text:
 `[<time>] [persona-unclassified-error] persona=<key>: :warning: *Unclassified agent-director error* — <rest of the notice>`.
+Nothing needs doing for the removed persona itself; a human checks the
+host's agent-director as for the notice.
 
 **During a teardown.** When the notice falls due while a confirmed change
 tears the persona down (a launch for it was still running), nothing reaches
@@ -4377,7 +4537,9 @@ included) is stopped; a finished one is left as it is. The server checks the
 result of every kill and never deletes an agent-director row: every row is
 kept, and a removed persona's row or one from before personas stays until
 agent-director's `expire` removes it, never resumed. A persona held at that
-start keeps its instances (see its *Held:* entry).
+start keeps its instances (see its *Held:* entry). The clean-up itself holds
+nobody: a kill of it that meets a session conflict or an unusable tmux
+session name holds no persona and posts nothing; it is only logged, and recorded as an `orphan-cleanup` entry.
 
 The clean-up also tracks each instance that may still be running in a
 directory: a running instance of a retired key (a removed persona's, or a
@@ -4411,7 +4573,7 @@ personas. Each kill's tries log their own lines (see
 | `[slack] reconcileOrphans: sweeping row (<reason>) persona=<persona> instanceId=<id> state=<state>[ cwd=<cwd>] — <it is live, so it is killed; the row is kept\|it is finished, so it is not killed (a finished row is never killed); the row is kept> (b.jg5 SRJ-714)` | An instance the start doesn't keep running: `<reason>` is `absent persona` (its persona isn't in the applied configuration), `wrong instance ID` or `wrong cwd`. A running one is stopped next; a finished one is left as it is. | Nothing. |
 | `[slack] reconcileOrphans: killing <row> state=<state> tmux_session=<session>; the row is kept whatever the outcome (b.jg5 SRJ-714)` | The server is stopping this running instance. | Nothing: its outcome follows. |
 | `[slack] reconcileOrphans: kill succeeded for <row> (<outcome>) — row kept` | The instance was stopped; its row is kept. `<outcome>` says how (`outcome=killed kill_sent=…`, `outcome=row-gone …`, `outcome=session-gone …`, or `outcome=row-finished read=…` when a read between tries found it already finished). When an earlier try named a surviving process, a `persona-kill-survivor` entry, `instanceId=<id> (start sweep): <text>`, follows. | Nothing, unless that entry is there: see [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice). |
-| `[orphan-cleanup] kill did not succeed for <row> state=<state> tmux_session=<session>: <outcome>; row kept, its session may still be running` (in `startup-errors.log`) | The kill did not succeed after its tries; the row is kept and the session may still run. `<outcome>` names the class. Nothing is held and no retries start: a session conflict or an unusable session name met here holds nobody, and an `ENVIRONMENT` or `CONFIG` class also raises the outage of a persona still in the configuration. With `; kill-failure alert: instanceId=<id> (start sweep): …` after it, agent-director couldn't stop the session: the *Kill failed* text. | The next start's clean-up tries the kill again. With the *Kill failed* text, see [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice). If the entry repeats start after start, check the row with `agent-director get --claude-instance-id <id>` and follow the "Operator actions" section of agent-director's README. |
+| `[orphan-cleanup] kill did not succeed for <row> state=<state> tmux_session=<session>: <outcome>; row kept, its session may still be running` (in `startup-errors.log`) | The kill did not succeed after its tries; the row is kept and the session may still run. `<outcome>` names the class. `<persona>` in `<row>` is the persona's name and key (`"<name>" (key=<key>)`) while the persona is in the applied configuration, and the label's value otherwise. Nothing is posted to Slack. Nothing is held and no retries start: a session conflict or an unusable session name met here holds nobody, and an `ENVIRONMENT` or `CONFIG` class also raises the outage of a persona still in the configuration. With `; kill-failure alert: instanceId=<id> (start sweep): …` after it, agent-director couldn't stop the session: the *Kill failed* text, whose last sentence says the server retries that kill only while a persona waits on that worker. | The next start's clean-up tries the kill again. With the *Kill failed* text, see [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice). If the entry repeats start after start, check the row with `agent-director get --claude-instance-id <id>` and follow the "Operator actions" section of agent-director's README. |
 | `[slack] old-life hold: began on "<real path>" for oldKey=<key> (instanceId="<id>"): its start-sweep kill did not succeed — the old life may still be running (b.jg5 SRJ-809)` | Follows the `orphan-cleanup` entry above when the instance wasn't already tracked: its session may still run, so the server tracks its directory. `oldKey` is the instance id itself (quoted) for an instance from before personas or one under another instance id than its persona's. | As for that entry. |
 | `[slack] reconcileOrphans: kill tries for <row> (start sweep) were stopped: the server is shutting down; its last outcome's class: <class>; no kill-failure alert is raised; <descriptions> (b.jg5 SRJ-702, SRJ-714)` | The server began stopping during this kill's tries, so no further try was made. The row is kept, and its `orphan-cleanup` entry says `its tries were stopped because the server is shutting down, so no kill-failure alert is raised`, with no *Kill failed* text. `<descriptions>` quotes agent-director's answers, a surviving process it named included. Nothing is posted to Slack. | Nothing: the next start's clean-up stops and checks the instance again. If `<descriptions>` names a surviving process, a human deals with it by pid, following "Operator actions". |
 | `[slack] reconcileOrphans: kill tries for <row> (start sweep) were stopped: the version re-check decided that the server stops; row kept; the sweep makes no further call; its last outcome's class: <class>; no kill-failure alert is raised; <descriptions> (b.jg5 SRJ-702, SRJ-714, SRJ-205)` | A clean-up kill answered `ErrInvalidFlags`, the version re-check found a binary the server can't run with, and the server stops. The row is kept, its `orphan-cleanup` entry (its `<outcome>` showing `recheck=stop`) carries no *Kill failed* text, and no later instance is stopped. `<descriptions>` quotes agent-director's answers, an earlier try's surviving process included. This is the clean-up's only stop line: no `the server began shutting down — the sweep stops` line follows, only the summary. Nothing is posted to Slack. | See [Found while the server was running](#found-while-the-server-was-running). If `<descriptions>` names a surviving process, a human deals with it by pid, following "Operator actions". |
@@ -4553,7 +4715,7 @@ Its `startup-errors.log` entries (none is posted):
 
 While an old instance may still run in a directory, the server brings no
 persona up there, admits no Claude session from there and types nothing into
-the old instance. A persona whose working directory it is waits: a renamed
+the old instance, so two workers never share one directory. A persona whose working directory it is waits: a renamed
 persona's new name, a persona added in a removed persona's directory, or one
 in the directory of an instance a start's clean-up could not stop. Its Slack
 connection stays up; it is not launched and posts nothing about the wait.
@@ -4730,7 +4892,7 @@ agent-director get --claude-instance-id <id>
 | `[slack] persona Socket Mode: personas[<i>] "<name>" (key=<key>): <text>` | A connection-health line from the Slack library: a ping or pong timeout, or `Failed to send ping to Slack`. The connection is treated as dead and reopened. See [`persona-connection-lost`](#persona-connection-lost). |
 | `[WARN]  web-api:WebClient …` (or `[INFO]`, `[ERROR]`) | The Slack library's own line for a persona's Web API client: a Slack response warning, a rate-limit wait, or a failed request. URLs show as `<redacted-url>` and token-like text as `<redacted-token>`. Nothing to do unless it repeats. |
 | `[slack] Session connected: persona "<name>" (key=<key>) cwd="<path>"` | The persona's instance registered: it's being served. |
-| `[slack] spawnForPersona: "<name>" (key=<key>) <spawn\|resume\|reuse spawn> pre_trust=<ok\|skipped\|failed> (logged only, b.jg5 SRJ-413)` | Written once for every launch that succeeded (`spawn`, `resume` or `reuse spawn`): agent-director's report of whether it accepted the persona's folder trust for this launch. `ok`: it did. `skipped`: it did not, as pre-trust was off for this launch. `failed`: it tried and could not. Cause: agent-director accepts the folder trust itself at each launch. The line never needs action by itself, and nothing the server does depends on it. After `skipped` or `failed` the instance may show Claude Code's folder-trust prompt; the server accepts it with Enter as it does any startup prompt (the `approvePreSessionDialogs` lines in this table; the README's Troubleshooting entry "A persona's instance waits at a startup prompt"). Look further only if the instance stays at that prompt: then follow the `approvePreSessionDialogs` lines for the persona. |
+| `[slack] spawnForPersona: "<name>" (key=<key>) <spawn\|resume\|reuse spawn> pre_trust=<ok\|skipped\|failed> (logged only, b.jg5 SRJ-413)` | Written once for every launch that succeeded (`spawn`, `resume` or `reuse spawn`): agent-director's report of whether it accepted the persona's folder trust for this launch. `ok`: it did. `skipped`: it did not, as pre-trust was off for this launch. `failed`: it tried and could not. Cause: agent-director accepts the folder trust itself at each launch. The line never needs action by itself, and nothing the server does depends on it. After `skipped` or `failed` the instance may show Claude Code's folder-trust prompt; the server accepts it with Enter as it does any startup prompt (the `approvePreSessionDialogs` lines in this table; the Troubleshooting entry "A persona's instance waits at a startup prompt" in `docs/troubleshooting.md`). Look further only if the instance stays at that prompt: then follow the `approvePreSessionDialogs` lines for the persona. |
 | `[slack] spawnForPersona: "<name>" (key=<key>) <spawn\|resume\|reuse spawn> result carries no pre_trust: it came from an agent-director older than Phase 1 (logged only, b.jg5 SRJ-413)` | Written once for every launch that succeeded, in place of the line above, when agent-director's answer did not report the folder trust at all. Cause: the agent-director binary that answered predates Phase 1. The launch goes on unchanged and a folder-trust prompt, if one shows, is accepted as above. No action is needed for the line itself; check the installed agent-director version as in [The server refuses the agent-director binary at start](#the-server-refuses-the-agent-director-binary-at-start). |
 | `[slack] approvePreSessionDialogs: "<name>" (key=<key>) reads <state>: the launch is over, so the approver stops with no pane read and the restart path decides (b.jg5 SRJ-402)` | While a newly launched instance was starting, agent-director reported it `ended` or `missing` (`<state>`): it died before its session started. The server stops watching it at once and reads nothing from its screen. During a server start the same text is in `startup-errors.log` as `dev-channels-approve-spawn-died`. The restart handling relaunches it as for any dead instance; if it keeps dying, attach with the operator's say-so (`tmux attach -t =slack_bot_<key>`) on its next launch to see what it shows, or read the persona's other lines around this one. |
 | `[slack] approvePreSessionDialogs: "<name>" (key=<key>) has no row (ErrSpawnNotFound): the approver stops; nothing is read or typed (b.jg5 SRJ-402)` | agent-director has no record of the newly launched instance, so the server stops watching it. Nothing is written to `startup-errors.log`. The restart handling or the next health check brings the persona back; nothing to do unless it repeats. |
@@ -4762,12 +4924,12 @@ agent-director get --claude-instance-id <id>
 | `[slack] Session disconnected[ (SSE abort)]: persona "<name>" (key=<key>) has its tmux-unavailable outage raised and no retry controller — no restart scheduled, no retry timer armed (b.jg5 SRJ-311)` | Follows the persona's `Session disconnected … cwd="<path>"` line. Its *tmux unavailable* or *tmux server changed* notice holds, but the disconnect came before the server had set up its retries during startup, so it scheduled no restart and started none. Nothing to do; the next health check that finds the persona not healthy starts its retries, unless `health_check_interval` is `0`. If it repeats after startup, report it as a bug, with the persona's lines. |
 | `[slack] Session disconnected[ (SSE abort)]: persona "<name>" (key=<key>) cwd="<path>"`, then `[slack] Skipping restart — server is shutting down (persona=<key>)` | The persona's instance's session closed while the server was stopping (stopping the server closes every session). Nothing is restarted and no retries are started. Nothing to do. |
 | `[slack] Lost message: persona=<key> has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)` | A message for the persona was lost while its *tmux unavailable* or *tmux server changed* notice holds and nothing was retrying it (its earlier retries stopped: it wasn't up at a retry, its relaunch was declined, or the retry failed internally), below the restart limit (at the limit nothing is started and this line is not logged). The lost-message notice reports `not answering`; no restart was started, and the retries were started with the `environment` cause instead; `[slack] unavailable-retry: persona=<key> armed (environment) — first retry in 30 s` follows. The retries come even with `session_restart_delay` and `health_check_interval` both `0`. Nothing to do; for tmux itself, see **tmux isn't available** under [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own). |
-| `[slack] No live session for persona "<name>" (key=<key>) chat_id=<id> — dropping message` | The persona's instance has no live MCP session (the persona is up but its instance isn't registered, or the persona stopped being up while the message was being handled), so a message for it is lost: not delivered, not saved and not replayed later. Nothing else is posted in `<id>`, the conversation it came from (the notice below lands there only when `<id>` is the destination), and it gets no ack reaction. The persona posts one lost-message notice to its destination: `Persona "<name>" (key=<key>): :warning: *Message lost* — a message from <sender> …`, naming the sender (display name, else user ID; for a bot or webhook post, its name or bot ID) and ending in a `Recovery:` state, never the message text. The notice reports the first state that applies, in this order. `not up`: the persona stopped being up (broken or retrying) while the message was being handled, so no restart was started; its instance is launched once the persona recovers: fix its cause (its class line), then resend. A persona that isn't up receives nothing, so this state appears only when the persona stops being up after its connection received a message and before the session lookup (for example Slack refuses a Web API call for its bot token), or when the old half of a persona being torn down by a destructive change receives a message just before its connection stops. `held for a human`: the persona is held until a human resolves a problem with its tmux session or agent-director row; follow [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice), [A persona posts a Held: unusable tmux session name notice](#a-persona-posts-a-held-unusable-tmux-session-name-notice) or [A persona posts a Held: launch start not recorded notice](#a-persona-posts-a-held-launch-start-not-recorded-notice), whichever notice its destination has, then resend. A persona whose row reads pending with no launch start reports `held for a human`, never `starting`, even when the one read made for the lost message is the one that held it. `cannot launch`: the host's agent-director rejected the persona's launch, so it is held until the agent-director binary changes or the server restarts, and no restart was started; follow [A persona posts a Cannot launch notice](#a-persona-posts-a-cannot-launch-notice), then resend once it's back. `kill failed`: the server could not end a worker of the persona, which may still be running, and posted a *Kill failed* notice; it applies until agent-director reports that worker's row ended or missing, or no longer has it, and a held persona reports `held for a human` instead; follow [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice), then resend once it's back. It also applies, with nothing posted, while the persona waits on an old instance (one in its working directory, or its own earlier one) whose kill failed: a confirmed change's teardown kill, a start's clean-up kill or the server's later kill of that instance could not end it (the *Kill failed* text is in its `persona-teardown-notice`, `orphan-cleanup` or `persona-kill-failed` entry), until agent-director reports that old instance finished; see [An old instance the server is ending](#an-old-instance-the-server-is-ending). A *Process outlived kill* notice never gives this state. `not answering`: the persona's *Not answering* record holds, or its *tmux unavailable* / *tmux server changed* or *agent-director refuses its config file* notice holds, and the server is retrying it (a persona at its restart limit never reports this, whatever is wrong with tmux or agent-director; one whose retries stopped reports the next state that applies); follow that notice's entry, then resend once it's back. `starting`: the persona's session is starting but hasn't come up yet: a launch of it is running, or the server is still answering the startup prompts of its just-launched instance (no check with agent-director is made then), or, when nothing earlier applies and nothing is running for it, the server checked with agent-director once, when it found the message lost, and its row still reads starting (a check that fails never gives `starting`); resend once it's up. No restart is started in these five states. `restarting`: a restart was already under way, the server is replacing the persona's old instance (its `live-row-sequence:` lines show it), or the server is ending an old instance the persona waits on (its `old-life-wait` lines show it; see [An old instance the server is ending](#an-old-instance-the-server-is-ending)), even while that instance's row still reads starting; no check with agent-director is made and no restart is started for the message; resend once it's back (after a clean exit, such as `agent-director pause`, the restart relaunches it about 3 s after the disconnect; after a crash, after `session_restart_delay`). `auto-restart disabled`: `session_restart_delay` is `0`, so no restart was started; a persona the server is already retrying (see [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)) comes back when a retry succeeds, otherwise a server restart recovers it. `restart limit reached`: the persona is capped, and this takes precedence over `not answering` even while tmux or agent-director is failing for it; nothing was started for it; the notice says to restart the server to recover. `starting now`: the message itself started a restart (not the same as `starting`); resend once it's back. A persona waiting on an old instance comes up only once that instance has ended: the restart the message started does nothing while it waits (see [A persona waiting on an old instance](#a-persona-waiting-on-an-old-instance)). If the notice doesn't arrive, look for a [`persona-destination-failed`](#persona-destination-failed) line. |
+| `[slack] No live session for persona "<name>" (key=<key>) chat_id=<id> — dropping message` | The persona's instance has no live MCP session (the persona is up but its instance isn't registered, or the persona stopped being up while the message was being handled), so a message for it is lost: not delivered, not saved and not replayed later. Nothing else is posted in `<id>`, the conversation it came from (the notice below lands there only when `<id>` is the destination), and it gets no ack reaction. The persona posts one lost-message notice to its destination: `Persona "<name>" (key=<key>): :warning: *Message lost* — a message from <sender> …`, naming the sender (display name, else user ID; for a bot or webhook post, its name or bot ID) and ending in a `Recovery:` state, never the message text. One notice is posted for each message lost: a persona whose instance can't take messages while its Slack connection is up posts one per lost message in a busy channel where it receives every message (`delivery: all` in declarative mode, a channel delivery of `all` in fungible mode), and with a `"dm"` destination each is a separate DM to its contact. The notice reports the first state that applies, in this order. `not up`: the persona stopped being up (broken or retrying) while the message was being handled, so no restart was started; its instance is launched once the persona recovers: fix its cause (its class line), then resend. A persona that isn't up receives nothing, so this state appears only when the persona stops being up after its connection received a message and before the session lookup (for example Slack refuses a Web API call for its bot token), or when the old half of a persona being torn down by a destructive change receives a message just before its connection stops. `held for a human`: the persona is held until a human resolves a problem with its tmux session or agent-director row; follow [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice), [A persona posts a Held: unusable tmux session name notice](#a-persona-posts-a-held-unusable-tmux-session-name-notice) or [A persona posts a Held: launch start not recorded notice](#a-persona-posts-a-held-launch-start-not-recorded-notice), whichever notice its destination has, then resend. A persona whose row reads pending with no launch start reports `held for a human`, never `starting`, even when the one read made for the lost message is the one that held it. `cannot launch`: the host's agent-director rejected the persona's launch, so it is held until the agent-director binary changes or the server restarts, and no restart was started; follow [A persona posts a Cannot launch notice](#a-persona-posts-a-cannot-launch-notice), then resend once it's back. `kill failed`: the server could not end a worker of the persona, which may still be running, and posted a *Kill failed* notice; it applies until agent-director reports that worker's row ended or missing, or no longer has it, and a held persona reports `held for a human` instead; follow [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice), then resend once it's back. It also applies, with nothing posted, while the persona waits on an old instance (one in its working directory, or its own earlier one) whose kill failed: a confirmed change's teardown kill, a start's clean-up kill or the server's later kill of that instance could not end it (the *Kill failed* text is in its `persona-teardown-notice`, `orphan-cleanup` or `persona-kill-failed` entry), until agent-director reports that old instance finished; see [An old instance the server is ending](#an-old-instance-the-server-is-ending). A *Process outlived kill* notice never gives this state. `not answering`: the persona's *Not answering* record holds, or its *tmux unavailable* / *tmux server changed* or *agent-director refuses its config file* notice holds, and the server is retrying it (a persona at its restart limit never reports this, whatever is wrong with tmux or agent-director; one whose retries stopped reports the next state that applies); follow that notice's entry, then resend once it's back. `starting`: the persona's session is starting but hasn't come up yet: a launch of it is running, or the server is still answering the startup prompts of its just-launched instance (no check with agent-director is made then), or, when nothing earlier applies and nothing is running for it, the server checked with agent-director once, when it found the message lost, and its row still reads starting (a check that fails never gives `starting`); resend once it's up. No restart is started in these five states. `restarting`: a restart was already under way, the server is replacing the persona's old instance (its `live-row-sequence:` lines show it), or the server is ending an old instance the persona waits on (its `old-life-wait` lines show it; see [An old instance the server is ending](#an-old-instance-the-server-is-ending)), even while that instance's row still reads starting; no check with agent-director is made and no restart is started for the message; resend once it's back (after a clean exit, such as `agent-director pause`, the restart relaunches it about 3 s after the disconnect; after a crash, after `session_restart_delay`). `auto-restart disabled`: `session_restart_delay` is `0`, so no restart was started; a persona the server is already retrying (see [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)) comes back when a retry succeeds, otherwise a server restart recovers it. `restart limit reached`: the persona is capped, and this takes precedence over `not answering` even while tmux or agent-director is failing for it; nothing was started for it; the notice says to restart the server to recover. `starting now`: the message itself started a restart (not the same as `starting`), with its backoff delay clamped down to 5 s, never raised; the restart still counts each failed launch toward the backoff and the restart limit, and is not stacked on a restart already pending or under way; resend once it's back. A persona waiting on an old instance comes up only once that instance has ended: the restart the message started does nothing while it waits (see [A persona waiting on an old instance](#a-persona-waiting-on-an-old-instance)). If the notice doesn't arrive, look for a [`persona-destination-failed`](#persona-destination-failed) line. |
 | `[slack] DROP: no _GET_stream for persona "<name>" (key=<key>) chat_id=<id> cwd="<path>" mcpSessionId=<id> — message will not reach the bot; triggering recovery` | The instance's session is registered and looks connected, but its message stream is gone (the `Dispatching to persona …` line just before it has `hasGetStream=false`). The message is lost exactly as for `No live session` above: the same lost-message notice at the destination, with the same `Recovery:` states in the same order, `starting now` last (`held for a human`, `cannot launch`, `kill failed`, `not answering`, `starting` and `restarting` included, none of which starts a restart), nothing else in the source conversation. |
 | `[slack] persona-routing: user-name lookup for persona "<name>" (key=<key>) failed, using the user ID: …` | The sender's display name couldn't be looked up through the persona's Slack client. The message is handled as usual, with the sender named by user ID (in the delivered message, or in a lost-message notice). Nothing to do unless it repeats; then check the persona's app and the host's Slack connectivity. |
 | `[slack] persona-routing: lost-message notice for persona "<name>" (key=<key>) failed: …` | An internal error raising a lost-message notice: the message was lost and its recovery still ran, but no notice reaches the destination. Report it as a bug, with the persona's lines around it. |
 | `[slack] persona-routing: lost-message row read for persona "<name>" (key=<key>) failed — session-starting left out: …` | The server's one check with agent-director for a lost message (see `starting` in the `No live session` row) failed internally, so the notice reports the next state that applies, never `starting`. The message was lost as usual and its notice still goes out. If the state is `starting now`, the restart it started checks agent-director again before launching and never launches over a session still starting. Nothing to do unless it repeats; then report it as a bug, with the persona's lines around it. |
-| `[slack] Session connected with CWD "<path>" — no matching persona` | A Claude session connected from a directory that is no persona's `working_directory` (compared by real path). It is not registered: the server disconnects it. Start it from the persona's directory, or fix `working_directory`. |
+| `[slack] Session connected with CWD "<path>" — no matching persona` | A Claude session connected from a directory that is no persona's `working_directory` (compared by real path, after `~` expansion with symlinks resolved, so a symlinked path to a persona's directory matches). It is not registered: the server disconnects it. A second session that connects from a persona's directory replaces the first. Start it from the persona's directory, or fix `working_directory`. |
 | `[slack] Session refused: its working directory "<path>" is held for an old life that may still be running (instanceId="<id>"[, instanceId="<id>" …]) — registered as no persona's session until the hold ends (b.jg5 SRJ-810, SRJ-1505)` | A Claude session connected from a directory where an old instance (each `<id>`) may still be running, so it is registered as no persona's and disconnected, whichever persona names the directory and whether or not that persona is up. It is checked before any persona is matched. With `(the held-directory query failed: <error> — taken as held)` in place of the ids, the server could not tell and refused it to be safe: report that as a bug. Nothing to do for the session itself: once agent-director reads the old instance finished, a session from the directory is decided as usual. Check the old instance read-only with `agent-director get --claude-instance-id <id>`, and see [A persona waiting on an old instance](#a-persona-waiting-on-an-old-instance). |
 | `[slack] persona-destination: <ref> has permission_prompts set to "dm" but dm.enabled is not true — no DM opened and nothing posted` (or `… dm.contact is not set …`; for a prompt the line starts `[slack] permission-poller: <ref>` and ends `— prompt for <instance> (request_token=…) not posted and no DM opened`). In fungible mode the line names the fungible destination's setting: `… <ref> has invited.permission_prompts set to "dm" but …`, also when `invited.permission_prompts` is absent and `"dm"` is its default | The persona's prompt or notice had a `"dm"` destination without DMs on or a contact, which the loader rejects in the mode in force, so it should not happen. Nothing is sent. Report it as a bug, with the persona's lines. |
 | `[slack] permission-poller: chat.postMessage failed for <instance> token=<token> (the prompt's message was rejected; a short prompt naming the tool is posted instead) (reason=<code>): …` | Slack refused the prompt's message itself (`<code>` is `invalid_blocks`, `msg_too_long` or the like), not its destination, so nothing is held. That message is not posted again: at the next poll a short prompt goes to the destination in its place, naming the tool and reading `The tool input is not shown: Slack rejected the full prompt (<code>).`, with the usual Allow and Deny buttons, which work as on any prompt. Report it as a bug, with the line. |
@@ -4786,8 +4948,8 @@ agent-director get --claude-instance-id <id>
 | `[slack] agent-director version re-check: the runtime re-check could not run: <description>; the server keeps running and checks again at the next 120 s re-check` | The server's 120 s check of the agent-director binary couldn't run: the binary is missing, unreadable, unreachable, or didn't answer within 30 s. `<description>` says which (an error name such as `ErrSystemInstallUnreachable (reason <reason>, binary at <path>)`, or `no answer within the 30 s time limit`). Nothing changes: the server keeps running and checks again every 120 s. One line per run of failures: the first failure after start, or after a check that passed, logs it, and the failures after it log nothing until a check passes. Nothing goes to `startup-errors.log` or Slack. If the line keeps coming back, check that the agent-director binary is present and executable. If a later check finds a version the server refuses, the server stops as in [Found while the server was running](#found-while-the-server-was-running). |
 | `[slack] agent-director settings: the [tmux] values in effect from "<path>": pending_grace_seconds <n> s, stopping_window_seconds <n> s, starting_session_seconds <n> s, sweep_budget_seconds <n> s, query_timeout_ms <n> ms, action_timeout_ms <n> ms, create_timeout_ms <n> ms, pipe_close_wait_ms <n> ms, kill_exit_wait_ms <n> ms (b.jg5 SRJ-209, SRJ-1014)` | The nine agent-director timing settings the server uses: written at its first accepted read of the settings file and whenever one of the nine changes. Nothing to do; see [agent-director's timing settings](#agent-directors-timing-settings). |
 | `[slack] agent-director settings: the read of "<path>" was refused: <reason>; <kept> stay in effect until a read is accepted (b.jg5 SRJ-209)` | The server refused agent-director's timing settings file and keeps its last accepted values (`the defaults` at start). One line per run of refused reads. See [agent-director's timing settings](#agent-directors-timing-settings). |
-| `[slack] agent-director settings: agent_director_call_timeout_ms is <value>, at or below its need of <need> ms (the <verb> ceiling plus the 15000 ms margin): a call can time out while its verb still acts; see the README's switch-over runbook, section "Switching over to agent-director Phase 1" (b.jg5 SRJ-213)` | Written once per start, before any persona is brought up. The call timeout is at or below the need that agent-director's timing settings give, so an agent-director call can end in an error while its verb still acts. The server still starts and no value changes. Fix: with the operator's say-so, raise the setting in `config.json` and confirm it. See [The call timeout](#the-call-timeout). |
-| `[slack] agent-director settings: agent_director_call_timeout_ms is <value>; its need is unknown: [pause] timeout_seconds holds <found>, a value that is not used, so pause's wait is not counted and the need without it is <need> ms; see the README's switch-over runbook, section "Switching over to agent-director Phase 1" (b.jg5 SRJ-213)` | Written once per start, in place of the line above, whatever the setting is. `[pause] timeout_seconds` holds a value that is not used (see below), so `pause`'s wait, and so the need, can't be known. The server still starts and no value changes. Fix: the operator gives it a positive whole number, or removes it for the 30 s default, then checks the setting against the need. See [The call timeout](#the-call-timeout). |
+| `[slack] agent-director settings: agent_director_call_timeout_ms is <value>, at or below its need of <need> ms (the <verb> ceiling plus the 15000 ms margin): a call can time out while its verb still acts; see the switch-over runbook in docs/migration.md, section "Switching over to agent-director Phase 1" (b.jg5 SRJ-213)` | Written once per start, before any persona is brought up. The call timeout is at or below the need that agent-director's timing settings give, so an agent-director call can end in an error while its verb still acts. The server still starts and no value changes. Fix: with the operator's say-so, raise the setting in `config.json` and confirm it. See [The call timeout](#the-call-timeout). |
+| `[slack] agent-director settings: agent_director_call_timeout_ms is <value>; its need is unknown: [pause] timeout_seconds holds <found>, a value that is not used, so pause's wait is not counted and the need without it is <need> ms; see the switch-over runbook in docs/migration.md, section "Switching over to agent-director Phase 1" (b.jg5 SRJ-213)` | Written once per start, in place of the line above, whatever the setting is. `[pause] timeout_seconds` holds a value that is not used (see below), so `pause`'s wait, and so the need, can't be known. The server still starts and no value changes. Fix: the operator gives it a positive whole number, or removes it for the 30 s default, then checks the setting against the need. See [The call timeout](#the-call-timeout). |
 | `… launch after its bring-up retry failed: …`, `… working-directory retry failed: …`, `… handling its change from up to <outcome> failed: …`, `persona … not brought up: Slack bring-up threw: …`, `persona <step> failed: personas[<i>] …`, `persona-destination-hold: retry of held notices failed for persona=<key>: …`, `persona-destination-hold: notice failure callback threw for persona=<key>: …`, `unhandled rejection (process keeps running): …` | An internal error. The server keeps running. Report it as a bug, with the persona's lines around it. |
 
 ---
@@ -4822,7 +4984,10 @@ one is skipped. When the check fails, the command stops nothing and exits 1.
   `server.log` or `startup-errors.log`.
 - **Effect:** nothing was stopped: the server and every bot keep running as
   before. The check latches nothing, posts no notice and writes no record.
-  A conflicting-labels note on an instance fails nothing on its own.
+  A conflicting-labels note on an instance fails nothing on its own. Every
+  persona is checked, even after one fails. Each of its two calls per
+  persona is tried up to 3 times, 2 s apart, each call bounded by
+  `agent_director_call_timeout_ms`.
 - **Fix:** fix the cause the class names, below, then, with the operator's
   say-so, run the command again.
 
@@ -4916,6 +5081,62 @@ order.
 | `UNCLASSIFIED` | An answer the teardown doesn't handle. | An `ErrInternal`; a store agent-director can't open (`ErrSchemaMismatch`, `ErrSchemaMigrationRequired`, `ErrStoreOpen`), never retried; any other error name agent-director reports. | Report the line to the operator as written; take no action on it. |
 | `STATE`, `DIRECTORY`, `LAUNCH_FAILURE` | An answer to the force-kill, or to a read of the instance, that does not fit it. | Not known from the line. | Report the line to the operator as written; take no action on it. |
 
+**How the pause and the force-kill decide.** Both commands share this one
+bot teardown, and the other personas are still torn down when one fails.
+
+- **A refused pause leads on to the force-kill**, the row kept, when the
+  session is already gone; when agent-director keeps not answering (the
+  pause is tried 3 times, 2 s apart); when the bot is still launching (its
+  instance is `pending`, for example at a launch dialog; it stays `pending`
+  until agent-director marks it `missing`, which the running server's checks
+  do from `pending_grace_seconds` after its launch's start, see
+  [A persona posts a Launch stuck or Session not starting notice](#a-persona-posts-a-launch-stuck-or-session-not-starting-notice));
+  when the pause times out (agent-director waits up to its
+  `[pause] timeout_seconds` for the bot to exit, and the default call timeout
+  covers that wait, see [The call timeout](#the-call-timeout)); and for any
+  reason not listed next.
+- **A refused pause fails the persona at once**, with no force-kill, on a
+  tmux session conflict (the session may not be the bot's own), an unusable
+  recorded tmux session name (the command puts no hold on the persona; only
+  the server does that), tmux unavailable, an agent-director internal
+  error, or a refused config file (the error names
+  `~/.agent-director/config.toml`).
+- **The force-kill** (after the pause, or once `exit_timeout` passes) ends
+  the bot's session and keeps its row; no force-kill ever removes a row. The
+  persona counts as stopped when the force-kill succeeds (through an
+  agent-director older than Phase 1, which only `stop --stop-bots` reaches,
+  that is a plain success), when agent-director finds no instance for it,
+  or when the read before a further try finds the instance ended, missing
+  or gone (no further force-kill is made). A force-kill whose answer names a
+  process that outlived it still counts as stopped, with a *Process outlived
+  kill* text and no change to the exit status.
+- **A force-kill is tried again** (up to 3 tries, 2 s apart, a read of the
+  instance before each further try) when agent-director doesn't answer in
+  time, answers that it could not end the worker or that tmux did not
+  answer, or answers with an error name the client doesn't recognise. A read
+  that fails for any reason but the config file lets the try go ahead. If
+  the last try fails, the persona fails.
+- **A force-kill fails the persona at once** on a tmux session conflict (a
+  session left over from an earlier launch of the bot included; the error
+  names the session), tmux unavailable, an unusable recorded session name,
+  `GONE`, an internal error, an error about agent-director's store or
+  another error that doesn't fit a force-kill, or a config-file refusal at a
+  try or at the read before a further try. `GONE` differs from a refused
+  pause, where the same answer leads on to the force-kill, and from a read
+  that finds the instance gone, which counts as stopped.
+- **A held persona is stopped too.** The server may be holding a persona for
+  a human; `stop --stop-bots` and `clean_restart` still stop it, since
+  running them is a human's deliberate action. For a bot whose launch has no
+  recorded start, the force-kill ends no session.
+
+**How long a teardown can take.** Personas are torn down in parallel. Each
+persona's teardown takes at most the sum of the read of its instance, the
+pause (up to 3 tries, 2 s apart), the wait for the bot to exit (up to
+`exit_timeout` seconds, then one last read) and the force-kill (up to 3
+tries, 2 s apart, with one read before each further try). Each
+agent-director call takes at most `agent_director_call_timeout_ms` (see
+[The call timeout](#the-call-timeout)).
+
 Only some steps print lines of their own: the force-kill's try, read and
 end lines (under [A kill that is tried again](#a-kill-that-is-tried-again))
 and `[slack] teardownBots: pause failed for persona <ref> — escalating to
@@ -4938,10 +5159,16 @@ try writes one line to `clean_restart.log` only:
   `[slack] clean_restart: agent-director answers — starting server after the failed teardown`,
   then `[slack] clean_restart: starting server`, and the server is started
   as at any start. In `server.log`, look for the new start and each
-  persona's own lines (`grep -F '(key=<key>)'`): the new server keeps a
-  configured persona's own instance that is still running, the one the
-  command could not stop included, and a persona whose launch meets a tmux
-  session conflict is held (see
+  persona's own lines (`grep -F '(key=<key>)'`): its clean-up of old
+  instances deletes no row, so every row is kept, the ones the command could
+  not stop included; the new server keeps a configured persona's own
+  instance that is still running, the one the command could not stop
+  included, and brings up the others. When the start lists its instances,
+  before its clean-up ends any of them, a persona whose own row has
+  conflicting labels, or reads pending with no launch start, is held for a
+  human, and that start ends none of its instances (see
+  [A persona posts a Held: launch start not recorded notice](#a-persona-posts-a-held-launch-start-not-recorded-notice));
+  a persona whose launch meets a tmux session conflict is held (see
   [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice)).
   A start that fails prints
   `[slack] clean_restart: start failed with exit code <n>` on the terminal
@@ -4950,9 +5177,13 @@ try writes one line to `clean_restart.log` only:
 - **agent-director did not answer:** the server is not started, so nothing
   starts on top of bots the command could not reach. One alert for the run
   is printed, appended to `server.log` and recorded as one
-  `clean-restart-not-restarted` entry (below).
+  `clean-restart-not-restarted` entry (below). With more than one persona,
+  each is named as `persona "<name>" (key=<key>), session
+  "slack_bot_<key>": <CLASS>`, separated by `; `.
 
-Either way the last line follows and the exit is 1.
+Either way the last line follows and the exit is 1. Rows are never deleted,
+so running `clean_restart` again once the cause is fixed is safe. The check
+adds at most 3 agent-director calls and two 2 s waits after the teardown.
 
 Read-only checks:
 
@@ -4989,10 +5220,10 @@ timestamped line in `startup-errors.log` and the same line in `server.log`:
 Nothing was launched, killed or deleted, no persona was brought up, and
 nothing was posted to Slack. Running agent-director instances are left as
 they were. For both classes, this CSCB release and agent-director Phase 1
-are installed together, through the README section "Switching over to
+are installed together, through the docs/migration.md section "Switching over to
 agent-director Phase 1": its `state.db` backup and restarts come with the
 install. The section opens with the block
-["Arrived here from a startup refusal?"](../../README.md#arrived-here-from-a-startup-refusal),
+["Arrived here from a startup refusal?"](../../docs/migration.md#arrived-here-from-a-startup-refusal),
 which says what a refused operator does, in order; tell the operator to
 follow that block. A bot or this skill never changes the agent-director
 install itself, and never starts the server on its own after a refusal. A
@@ -5036,7 +5267,7 @@ README.
 
 The binary is below CSCB's Phase 1 floor. The line names the version found,
 the version required (the Phase 1 release or later, its release candidates
-included), the binary path, that the startup check found it, and the README
+included), the binary path, that the startup check found it, and the docs/migration.md
 section "Switching over to agent-director Phase 1". It has no
 install-skill block.
 
@@ -5047,8 +5278,11 @@ install-skill block.
   check: the version does not parse, so the client refuses it first as
   `ad-system-install-unreachable` (reason `unparseable-version`).
 - **Fix:** the operator follows the block "Arrived here from a startup
-  refusal?" of the README section "Switching over to agent-director
-  Phase 1" (above); the runbook's step 10 starts the new server.
+  refusal?" of the docs/migration.md section "Switching over to agent-director
+  Phase 1" (above); the runbook's step 10 starts the new server. The block is
+  ["Arrived here from a startup refusal?"](../../docs/migration.md#arrived-here-from-a-startup-refusal);
+  the new CSCB is started only as
+  [step 10](../../docs/migration.md#step-10-start-the-new-cscb) starts it.
 
 ### `ad-system-install-too-old`
 
@@ -5057,7 +5291,7 @@ the version found, the version the client requires (its minimum, which the
 client reports), that this CSCB release needs CSCB's Phase 1 floor or later
 (release candidates included), the binary path, that this CSCB release and
 agent-director Phase 1 are installed together, and the
-README section "Switching over to agent-director Phase 1". It ends with the
+docs/migration.md section "Switching over to agent-director Phase 1". It ends with the
 install-skill block (the `install-cscb` skill's URL, target path and
 command); that skill names the same section and runs nothing for this
 class.
@@ -5065,8 +5299,11 @@ class.
 - **Cause:** the system-installed binary is older than the minimum that
   the npm `agent-director` client CSCB depends on accepts.
 - **Fix:** the operator follows the block "Arrived here from a startup
-  refusal?" of the README section "Switching over to agent-director
-  Phase 1" (above); the runbook's step 10 starts the new server.
+  refusal?" of the docs/migration.md section "Switching over to agent-director
+  Phase 1" (above); the runbook's step 10 starts the new server. The block is
+  ["Arrived here from a startup refusal?"](../../docs/migration.md#arrived-here-from-a-startup-refusal);
+  the new CSCB is started only as
+  [step 10](../../docs/migration.md#step-10-start-the-new-cscb) starts it.
 
 ### Found while the server was running
 
@@ -5083,7 +5320,7 @@ found by a runtime re-check while the server was running, so the server stopped
 
 in place of the floor entry's "found by the startup check" (for the too-old
 entry, right after the binary path), and it points here instead of to the
-README section or the install skill. The floor entry ends:
+docs/migration.md section or the install skill. The floor entry ends:
 
 ```text
 Note: this CSCB release requires agent-director Phase 1 or later; see the debug skill (skills/debug-slack-channel-bots/SKILL.md), section "Found while the server was running", for what to do.
@@ -5146,7 +5383,7 @@ exit code 1).
        actions" section of agent-director's README; this skill names no
        command for it. Once the server finds Phase 1, start CSCB.
      - If the host is being rolled back, follow
-       ["Rolling back the switch-over"](../../README.md#rolling-back-the-switch-over),
+       ["Rolling back the switch-over"](../../docs/migration.md#rolling-back-the-switch-over),
        which starts the previous CSCB.
 
   Installing agent-director Phase 1 migrated agent-director's store, so
@@ -5174,13 +5411,13 @@ switch-over first.
 `bun run install-check` passes a binary below CSCB's Phase 1 floor that the
 client accepts only with a `note`: the version found and CSCB's floor (its
 release candidates included), that the server refuses to start on it until
-agent-director Phase 1 is installed, and the README section
-["Switching over to agent-director Phase 1"](../../README.md#switching-over-to-agent-director-phase-1)
+agent-director Phase 1 is installed, and the docs/migration.md section
+["Switching over to agent-director Phase 1"](../../docs/migration.md#switching-over-to-agent-director-phase-1)
 (see
-[Checking your agent-director install](../../README.md#checking-your-agent-director-install)).
+[Checking your agent-director install](../../docs/agent-director.md#checking-your-agent-director-install)).
 The note names no command. A binary that passes
 with it is still refused at start as `ad-below-phase1-floor`. The operator
-follows that README section; this skill runs nothing for the note.
+follows that section; this skill runs nothing for the note.
 
 **`stop --stop-bots` on a binary the client refuses as too old.**
 
@@ -5194,7 +5431,7 @@ follows that README section; this skill runs nothing for the note.
 
   The too-old message is the one described under
   [`ad-system-install-too-old`](#ad-system-install-too-old): it names the
-  version found, the version required and the README section "Switching
+  version found, the version required and the docs/migration.md section "Switching
   over to agent-director Phase 1".
 - **Meaning:** no agent-director call could be made, so only the server was
   stopped. No bot was checked, paused or killed, and every bot and its
@@ -5208,7 +5445,7 @@ follows that README section; this skill runs nothing for the note.
   unknown.
 - **Cause:** the system-installed binary is older than the minimum the
   agent-director client accepts.
-- **Fix:** the operator follows the README section "Switching over to
+- **Fix:** the operator follows the docs/migration.md section "Switching over to
   agent-director Phase 1". A bot or this skill never changes the
   agent-director install itself.
 
@@ -5219,7 +5456,7 @@ follows that README section; this skill runs nothing for the note.
 agent-director keeps nine timing settings in the `[tmux]` table of
 `~/.agent-director/config.toml`. The file is agent-director's; CSCB only
 reads it, from the HOME the server process runs in (not a persona's
-directory). The README section "agent-director's timing settings" lists the
+directory). The docs/agent-director.md section "agent-director's timing settings" lists the
 nine keys and their defaults.
 
 - **When the server reads it:** once at start, after the agent-director
@@ -5281,7 +5518,7 @@ nine keys and their defaults.
   `<path>` is the file the server read (`~/.agent-director/config.toml` when
   it couldn't find its home directory). `<kept>` is `the defaults` or `the
   values of the last accepted read`. `<reason>` names the first broken rule,
-  in the key order of the README's table: for example
+  in the key order of the table in `docs/agent-director.md`: for example
   `[tmux] stopping_window_seconds is 10, below its minimum of 30`,
   `[tmux] query_timeout_ms is not an integer (it is a string)`,
   `[tmux] action_timeout_ms is too large for agent-director`,
@@ -5335,8 +5572,8 @@ read that configuration.
   value, else `config.json`'s, else 60000) with the need. The need is the
   largest ceiling among the verbs CSCB calls, computed from the host's
   `[tmux]` values and, for `pause`, `[pause] timeout_seconds`, plus 15 s. The
-  README section "Sizing the agent-director call timeout", under
-  "Configuration", has the formulas. At agent-director's defaults the need is
+  docs/agent-director.md section "Sizing the agent-director call timeout", under
+  "agent-director's timing settings", has the formulas. At agent-director's defaults the need is
   54000 ms, set by `pause` (9 s plus its 30 s wait, plus 15 s). With
   `create_timeout_ms` 40000 (with `pending_grace_seconds` 61) it is 60900 ms,
   set by the launch ceiling that `resume`, a spawn with reuse and a plain
@@ -5370,7 +5607,7 @@ classes above.
 
 When a record exists, a start runs the record and doesn't read `config.json`,
 so a restart doesn't apply an edit of `config.json`. The running server still
-checks an edit, within about 5 s once a start's bring-up is done (see
+checks an edit (a missing `config.json` included), within about 5 s once a start's bring-up is done (see
 [The last-applied record](#the-last-applied-record)). If the edit is wrong, it
 writes the error as one `INVALID:` line to `config.json.pending` and logs it
 once under [`reload-invalid`](#reload-invalid) in `server.log`; nothing is
@@ -5413,24 +5650,62 @@ load in fungible mode. `dm` and the rules [across personas](#across-personas)
 apply in both modes. A pending change is judged by the mode its own switch
 picks, not the mode in force: an edit that turns fungible mode on or off
 can give an `INVALID` preview for a persona section that loaded until then
-(see [`reload-invalid`](#reload-invalid)). The README's
-[Load-time rules](../../README.md#load-time-rules) list each mode's rules.
+(see [`reload-invalid`](#reload-invalid)). `docs/configuration.md`'s
+[Load-time rules](../../docs/configuration.md#load-time-rules) list each mode's rules.
+
+### The load-time rules
+
+The rules `config.json` must meet, by mode. The operator reference for each field is `docs/configuration.md`.
+
+Before it applies `config.json`, the server checks the whole file and reports the first rule it breaks. It checks the server-wide settings first, `allow_invited_channels` among them, before any persona, in either mode: a non-boolean `allow_invited_channels` is rejected naming the setting. The mode that switch picks then sets which rules each persona entry is checked by.
+
+In both modes:
+
+- A persona's name or key equals another persona's name or key.
+- A persona's key starts with another persona's key, such as `dev` and `dev_2` (see [Persona name and key](../../docs/configuration.md#persona-name-and-key)).
+- Two personas share a `working_directory` or a `credentials_file`, compared by real path.
+- A `dm.contact` is malformed. User IDs start with `U` or `W`, followed by capital letters and digits only; underscores are not allowed.
+- A path isn't absolute, `~` or `~/…`.
+- A required field is missing, or a key of the top level, a persona entry or `dm` is unknown.
+- A value has the wrong type, isn't an allowed value, or is out of range.
+
+In declarative mode (`allow_invited_channels` absent or `false`):
+
+- `permission_prompts` names a channel that isn't in the persona's `channels`.
+- `permission_prompts` is `"dm"` without `dm.enabled: true` or without a `dm.contact`.
+- A persona has no channels and `dm.enabled` isn't `true`.
+- A persona lists the same channel twice.
+- A channel ID is malformed, or a channel entry has an unknown key. Channel IDs start with `C` or `G`, followed by capital letters and digits only; underscores are not allowed.
+
+`invited` is neither checked nor read in declarative mode, so a malformed `invited` loads.
+
+In fungible mode (`allow_invited_channels` is `true`):
+
+- `invited` isn't an object, or holds a key other than `permission_prompts`.
+- `invited.permission_prompts` is neither `"dm"` nor a well-formed channel ID.
+- The persona's destination is `"dm"`, written or by default, without `dm.enabled: true` or without a `dm.contact`. The error names `invited.permission_prompts`, says whether `"dm"` is its default, and names each missing setting.
+
+`channels` and the top-level `permission_prompts` are neither checked nor read in fungible mode, whatever they hold, and `permission_prompts` isn't required. A channel destination needs no listing and no DMs, and a persona with DMs off and a channel destination is valid.
+
+A pending change is judged by the rules of the mode its own switch picks, not by the mode in effect. A change that turns fungible mode on is `INVALID` when a persona's `invited` section breaks the fungible-mode rules; a change that turns it off is `INVALID` when a persona's `channels` or `permission_prompts` breaks the declarative-mode rules.
+
+For a persona error, the error names the persona (`personas[<i>]`) and the field. A value that a format, type, range or allowed-value rule rejects is never shown; a type error names only the JSON type it got. Credentials content and whether directories exist are not checked here; they are checked when each persona comes up. At a start with no last-applied record, an error stops the start. On a running server, an error shows as an `INVALID` pending change (see [Reload](#the-last-applied-record)). The tables below give every rejection with its cause and fix.
 
 ### Before any persona is read
 
 | Message | Cause | Fix |
 |---|---|---|
-| `missing prerequisite: config.json not found at <path>, and no config.json.last-applied at <path>` (from `start`), or `The configuration file "<path>" does not exist. The server requires the configuration file to start.` | No `config.json` and no last-applied record in the state directory. | Create `config.json`; `{"personas": []}` is the smallest valid file. Check `SLACK_STATE_DIR`. |
+| `missing prerequisite: config.json not found at <path>, and no config.json.last-applied at <path>` (from `start`), or `The configuration file "<path>" does not exist. The server requires the configuration file to start.` | No `config.json` and no last-applied record in the state directory. | Run `bun src/postinstall.ts` from the installed package directory to create the skeleton, or create `config.json` by hand; `{"personas": []}` is the smallest valid file. Check that `SLACK_STATE_DIR` names the directory you populated. |
 | `The configuration file "<path>" cannot be read (<errno>). …` | Permissions, or the path is a directory (`EISDIR`). `(not a regular file)` in place of the errno: the path is a FIFO, socket or device, which is never read. | Make it a readable regular file. |
 | `The configuration file "<path>" is larger than the 64 KiB limit. …` | The file is over 64 KiB. Start and the reload check never read past that; a real configuration is far smaller, so the file is damaged or the wrong file. | Replace it with the intended configuration. |
 | `loadPersonaConfig: malformed JSON in "<path>" at line <L>, column <C>.` | Not valid JSON. The line and column (from 1) point at the first character that breaks it; the file's content is never echoed. | Fix the syntax at that position. |
 | `the configuration must be a JSON object, got <type>.` | Top level isn't an object. | Wrap it in `{ … }`. |
 | A key belonging to the pre-persona shape | See [Pre-persona configuration](#pre-persona-configuration). | |
-| `unknown top-level field(s) in config.json: "chanels".`, or `…: 1 field whose name is not shown (it is not a plain setting name, so it could be a pasted secret).`, or `…: "chanels", plus 2 fields whose names are not shown (they are not plain setting names, so they could be pasted secrets).` | A top-level key the server doesn't know (often a typo). Only names made of letters and underscores (up to 48 characters) are shown; any other name (one with a digit such as `channels2`, a dash, a dot, or a pasted token) is only counted. | Remove or correct it. For an unshown field, compare the file's top-level keys with the settings in the README. |
+| `unknown top-level field(s) in config.json: "chanels".`, or `…: 1 field whose name is not shown (it is not a plain setting name, so it could be a pasted secret).`, or `…: "chanels", plus 2 fields whose names are not shown (they are not plain setting names, so they could be pasted secrets).` | A top-level key the server doesn't know (often a typo). Only names made of letters and underscores (up to 48 characters) are shown; any other name (one with a digit such as `channels2`, a dash, a dot, or a pasted token) is only counted. | Remove or correct it. For an unshown field, compare the file's top-level keys with the settings in `docs/configuration.md`. |
 | `claude_director_poll_interval_ms has been renamed to agent_director_poll_interval_ms …` | Old key name. | Rename it. |
 | `personas is required: an array of persona entries, which may be empty.` / `personas must be an array, got <type>.` | Missing or wrong type. | Add `"personas": [ … ]`. |
 | Server-wide type and range errors: `<key> must be a non-negative number.`, `<key> is invalid. Allowed values are: ….`, `<key> must be a boolean.`, `<key> must be a non-empty string when set.`, `<key> must be a string when set.`, `<key> must be a positive integer (>= 1) when set.`, `agent_director_poll_interval_ms must be a positive integer in [200, 3600000].`, `agent_director_call_timeout_ms must be a positive integer in [1000, 3600000].`, `cron_table_path must be a non-empty string.`, `cron_log_path must be a non-empty string.` | A server-wide setting has the wrong type or is out of range. | Correct the named key. |
-| `allow_invited_channels must be a boolean.` | The channel-mode switch is a string, a number, `null`, an object or an array. Its value is never shown. Checked in either mode, after the other server-wide settings and before any persona entry. | Use `true` (fungible mode) or `false`, or remove the key (declarative mode). See [Channel modes](../../README.md#channel-modes). |
+| `allow_invited_channels must be a boolean.` | The channel-mode switch is a string, a number, `null`, an object or an array. Its value is never shown. Checked in either mode, after the other server-wide settings and before any persona entry. | Use `true` (fungible mode) or `false`, or remove the key (declarative mode). See [Channel modes](../../docs/channel-modes.md#channel-modes). |
 
 ### Persona entries
 
@@ -5441,7 +5716,7 @@ of one mode is never checked in the other.
 | Message (after the persona prefix) | Mode | Cause | Fix |
 |---|---|---|---|
 | `personas[<i>] must be a JSON object, got <type>.` | both | An array element isn't an object. | Make it a persona object. |
-| `unknown field(s) in the persona entry: "<key>".`, `… in dm: …`, each possibly with `1 field whose name is not shown …` or `plus <n> fields whose names are not shown …` | both | A key the schema doesn't have, at that level. As at the top level, only plain setting names are shown; others (a digit, as in `channels2`, a dash, a pasted token) are counted. `channels`, `permission_prompts` and `invited` are known persona-entry keys in both modes. | Remove or correct it. For an unshown field, compare that entry's keys with the persona keys in the README. |
+| `unknown field(s) in the persona entry: "<key>".`, `… in dm: …`, each possibly with `1 field whose name is not shown …` or `plus <n> fields whose names are not shown …` | both | A key the schema doesn't have, at that level. As at the top level, only plain setting names are shown; others (a digit, as in `channels2`, a dash, a pasted token) are counted. `channels`, `permission_prompts` and `invited` are known persona-entry keys in both modes. | Remove or correct it. For an unshown field, compare that entry's keys with the persona keys in `docs/configuration.md`. |
 | `unknown field(s) in channels[<j>]: …`, with the same forms | declarative | A key a channel entry doesn't have. | Remove or correct it. |
 | `invited must be a JSON object, got <type>.` | fungible | `invited` is a string, a number, an array or another non-object. | Make it an object, `{"permission_prompts": "<channel ID or dm>"}`, or remove it to use the default `"dm"`. |
 | `unknown field(s) in invited: "<key>".`, with the same forms as the persona entry's | fungible | `invited` holds a key other than `permission_prompts`. | Remove or correct it. |
@@ -5649,7 +5924,7 @@ line among them.
 | `persona "<name>" (key=<key>) is added; whether it can come up could not be checked.` | A new persona whose credentials and working directory the check couldn't examine (see the `cannot check` line below). It isn't counted differently in the header. |
 | `…: credentials file "<path>" changed; whether it is broken by its credentials now could not be checked.` | A credentials change whose persona's bring-up state couldn't be read (see the `cannot check` line below). With bad content it starts `credentials file "<path>" changed, but it cannot be used (<cause>);`. |
 | `persona "<name>" (key=<key>): <fields> changed in the <declarative or fungible> section: recorded, with no effect until allow_invited_channels selects <declarative or fungible> mode.` | A change to the section the edit's mode doesn't read: `channels` or `permission_prompts` (the declarative section) while the edit is in fungible mode, or `invited` (the fungible section) while it is in declarative mode. `<fields>` lists the changed keys, such as `channels, permission_prompts`. The change is written into the record at the confirmation and does nothing until the switch selects that section; it is never validated until then. The persona isn't counted as modified. |
-| `server-wide setting allow_invited_channels changed: turns <fungible or declarative> mode on, applied in place at once, from the next event, tool call, prompt and notice, for "<name>" (key=<key>), ….` | The channel-mode switch changed. Every persona present before and after the edit is named, in `config.json` order; with none, the line ends `; no persona is affected.` instead. It applies in place at the confirmation, with no restart and every session kept (see [Confirming a pending change](#confirming-a-pending-change)). Writing `false` where the switch was absent is no change. Before turning fungible mode on, review each app's channels and past `unclaimed-channel` lines (see [Turning fungible mode on or off](../../README.md#turning-fungible-mode-on-or-off)). |
+| `server-wide setting allow_invited_channels changed: turns <fungible or declarative> mode on, applied in place at once, from the next event, tool call, prompt and notice, for "<name>" (key=<key>), ….` | The channel-mode switch changed. Every persona present before and after the edit is named, in `config.json` order; with none, the line ends `; no persona is affected.` instead. It applies in place at the confirmation, with no restart and every session kept (see [Confirming a pending change](#confirming-a-pending-change)). Writing `false` where the switch was absent is no change. Before turning fungible mode on, review each app's channels and past `unclaimed-channel` lines (see [Turning fungible mode on or off](../../docs/channel-modes.md#turning-fungible-mode-on-or-off)). |
 | `server-wide setting <name> changed: once applied, it is recorded and takes effect at the next server start after that.` | A top-level setting such as `port` or `bind`. |
 | `server-wide setting <name> changed: once applied, it is recorded, and the CLI takes it from the record from then on (the running server does not use it).` | `stop_timeout` or `exit_timeout`, which only the CLI uses. |
 | `server-wide setting <name> changed: once applied, it is recorded, the CLI takes it from the record from then on, and the running server uses it from its next start.` | `agent_director_call_timeout_ms`, which both the CLI and the server use. |
@@ -5807,7 +6082,7 @@ What changes at once, with no restart:
   in `channel-delivery.json` and stop applying. Prompts and notices go to
   the destination of the mode turned on, held ones included, and prompts
   already posted stay answerable. See
-  [Channel modes](../../README.md#channel-modes).
+  [Channel modes](../../docs/channel-modes.md#channel-modes).
 - **A recorded change** to the section the mode doesn't read, the preview's
   `recorded, with no effect until …` lines: written into the record, with no
   effect until the switch selects that section.
@@ -6741,3 +7016,260 @@ For a leftover's pane, or a worker that runs with no session or pane of its
 launch, a human follows the "Operator actions" section of
 agent-director's README. This skill describes no step of it.
 
+## Startup errors (`startup-errors.log`)
+
+Every class `startup-errors.log` can record, what it means and where its detail is. `docs/troubleshooting.md` gives the file's location and links here.
+
+CSCB writes startup errors to `~/.config/cscb/startup-errors.log` (override the directory with `SLACK_STATE_DIR`) in addition to stderr. Each entry is a single timestamped line. The file is append-only and never rotated by CSCB — copy `docs/logrotate-startup-errors.conf` into `/etc/logrotate.d/` if you want host-level rotation.
+
+The classes in the first list are fatal: the process exits non-zero. Two of them can also be written while the server runs (see "Found while the server was running" after the list). The later groups (Slack Reply Guard setup, persona launch and conversation memory) are non-fatal: they are recorded, and the start continues. Four non-fatal classes, `persona-unclassified-error`, `persona-kill-failed`, `persona-teardown-notice` and `persona-kill-survivor`, are written while the server runs; of them only `persona-kill-survivor` can also be written at start (see "Written while the server runs" below). `stop --stop-bots` and `clean_restart` write `cli-teardown-failed`, `persona-kill-failed` and `persona-kill-survivor` entries while the server is stopped, and `clean_restart` also `clean-restart-not-restarted` (see "Written by `stop --stop-bots` and `clean_restart`" below).
+
+Fatal classes you may see:
+
+- `ad-system-install-not-found` — `Client.create()` could not locate an `agent-director` binary on PATH or at the standard install path. The startup gate runs on a bot host, where the binary may only be missing from the bot server's launcher HOME or PATH while agent-director's store and workers are live, so the log line does not point to the publishing-host block. It points to the docs/migration.md section "Switching over to agent-director Phase 1": its [step 1](../../docs/migration.md#step-1-check-the-host-and-stage-the-release) checks agent-director's version as the workers' user in the bot server's launcher environment, which shows whether this launcher's HOME or PATH differs from the workers'. The log line appends a manual-skill-install instructions block pointing at `skills/install-cscb/SKILL.md` (URL, target path under `~/.claude/skills/`, and invocation command `/install-cscb`).
+- `ad-system-install-too-old` — the system-installed binary is below the agent-director client's own minimum; the line appends the install-skill block. See [`ad-system-install-too-old`](#ad-system-install-too-old).
+- `ad-below-phase1-floor` — the binary passed the client's own minimum but is below CSCB's Phase 1 floor; the line appends no skill block. See [`ad-below-phase1-floor`](#ad-below-phase1-floor).
+- `ad-system-install-unreachable` — agent-director was discovered but the probe could not execute it (e.g. permission bits, broken symlink, runtime crash). The log line surfaces AD's supplied `err.reason` value verbatim (one of `not-executable`, `not-a-regular-file`, `probe-timeout`, `probe-nonzero-exit`, `probe-killed-by-signal`, `unparseable-version`, `spawn-failed`, `other`), says to diagnose with the install-cscb skill, names the docs/migration.md section "Switching over to agent-director Phase 1" and appends the manual-skill-install instructions block.
+- `ad-bun-version-too-old` — agent-director needs Bun `>= 1.0.21`. Upgrade Bun.
+- `ad-client-construct` — `Client.create()` failed with an error other than the `ad-system-install-*` ones; the line gives its detail. Check the install with the `install-cscb` skill, then retry.
+- `ad-shim-missing-get-permission` — the installed `agent-director` TS shim's `Client` does not expose `getPermission`. The npm-published package is out of sync with the system-installed binary. Check the agent-director npm package installed with CSCB; see the docs/migration.md section "Switching over to agent-director Phase 1".
+- `ad-shim-catalog-incomplete` — the installed `agent-director` TS error catalog is missing one or more of `ErrInvalidFlags`, `ErrPermissionRequestNotFound`, `ErrAmbiguousRequest`, `ErrTmuxKillFailed`, `ErrTmuxUnresponsive`, `ErrTmuxSessionConflict`. The log line lists the missing names: errors with these names would arrive as `ErrUnknownErrorName` and be misclassified. Same remedy as `ad-shim-missing-get-permission`.
+- `ad-shim-decide-drops-token` — the installed `agent-director` dist does not include `--request-token` in its bundled JS, meaning `buildDecide()` would resolve permission clicks against the wrong row. Same remedy as `ad-shim-missing-get-permission`.
+- `ad-version-floor-unreadable` — `node_modules/agent-director/dist/version-floor.json` could not be read or parsed, or its `.min_binary_version` is missing or is not a version. This is a packaging defect: check the agent-director npm package installed with CSCB; see the docs/migration.md section "Switching over to agent-director Phase 1". Surfaced by `bun run install-check`; the startup gate itself does not emit this label (it relies on `Client.create()`, which fails differently when the AD package is corrupt).
+- `ad-same-user` — `~/.agent-director/state.db` is owned by a different UID than the CSCB process. Run the server as the user that owns `~/.agent-director/state.db`; never remove or recreate the file. See the docs/migration.md section "Switching over to agent-director Phase 1".
+- `ad-same-user-stat` — Non-ENOENT stat error on the state DB (permissions, I/O). Investigate the file before re-launching.
+- `ad-template-install` — `client.makeTemplate(...)` rejected the boot-time refresh of the `slack-channel-bot` template. The line names the template and includes agent-director's error name and its description.
+- `retired-keys-unreadable` — the retired-key record, `retired-keys.json`, exists but can't be read, parsed or validated, so the server doesn't start. See [The retired-key record can't be read or is invalid](#the-retired-key-record-cant-be-read-or-is-invalid).
+- `state-dir-migration` — the start's move of the state directory out of `~/.claude/channels/slack` (see [Migration](../../docs/migration.md#migration)) refused to go on: a server of the earlier release is still running on the old directory, or a step of the move failed. Unlike every other class, this entry is written to the **old** directory's `startup-errors.log` (`~/.claude/channels/slack/startup-errors.log`), where an operator of the earlier release looks, and the same text goes to stderr. Nothing is lost: what did not move is still in the old directory. Each line and its fix is in [The state directory's location and its move at start](#the-state-directorys-location-and-its-move-at-start).
+
+**Found while the server was running.** `ad-system-install-too-old` and `ad-below-phase1-floor` can also be written by the runtime re-check of the agent-director binary, which then stops the server. This stop is not a switch-over case: see [Found while the server was running](#found-while-the-server-was-running).
+
+The following classes are **non-fatal**: the Slack Reply Guard's setup pass at server start (see [Slack Reply Guard (Stop hook)](../../docs/bots.md#slack-reply-guard-stop-hook)). The guard stays fail-open, so an affected persona gets no reminder, and every other persona and the rest of the start are unaffected. Directory and file failures at a later launch are server-log lines only, never records here.
+
+- `stop-hook-bootstrap-refuse-home` — a persona's effective `claude_config_dir` resolves to `~/.claude`, which the server never writes. See the causes table under [A persona isn't reminded to reply, or is reminded after opting out](#a-persona-isnt-reminded-to-reply-or-is-reminded-after-opting-out).
+- `stop-hook-bootstrap-jq-missing` — `jq` is not on `PATH`. See the same causes table.
+- `stop-hook-bootstrap-dir-missing` — a `claude_config_dir` that should get the hook doesn't exist, so it is skipped. Create the directory (for example with `claude auth login`, see [Next-launch settings](../../docs/configuration.md#next-launch-settings)); the persona's next launch installs the hook.
+- `stop-hook-bootstrap-not-a-dir` — a `claude_config_dir` exists but isn't a directory, so it is skipped. Fix the path.
+- `stop-hook-bootstrap-settings-read` — `<claude_config_dir>/settings.json` exists but can't be read (for example, permissions). The file is left untouched.
+- `stop-hook-bootstrap-settings-parse` — `settings.json` isn't valid JSON. The file is left untouched; fix its syntax.
+- `stop-hook-bootstrap-settings-shape` — the top level of `settings.json` isn't a JSON object. The file is left untouched.
+- `stop-hook-bootstrap-init` — the server couldn't resolve the path of its own `slack-reply-guard.sh`, so no directory is processed. Reinstall the package.
+- `stop-hook-bootstrap-dir` — an unexpected error while processing one directory; the line names the directory and the personas. Other directories are still processed.
+- `stop-hook-bootstrap` — an unexpected error in the setup pass itself. Report it as a bug.
+
+The following classes are **non-fatal** failures while preparing or launching personas at server start. A line for a failed agent-director call ends with agent-director's error name and, when it gives one, its description as `message="…"`, on one line, with token-like text redacted and long text cut short. At a later launch, the same failures are `server.log` lines only; the persona classes written while the server runs are listed under "Written while the server runs" below.
+
+- `ad-same-user-unenforced` — the platform gives no process user ID, so the check that `~/.agent-director/state.db` belongs to the CSCB user is skipped. Run CSCB on a supported platform (see [Supported platforms](../../README.md#supported-platforms-inherited-from-agent-director)).
+- `trust-bootstrap-config-missing` — a persona's `<claude_config_dir>/.claude.json` can't be read, so its workspace trust isn't pre-accepted. Log the directory in (see [Next-launch settings](../../docs/configuration.md#next-launch-settings)).
+- `trust-bootstrap-config-parse` — that `.claude.json` isn't valid JSON, so it is left untouched. Fix its syntax.
+- `trust-bootstrap` — an unexpected error while pre-accepting a persona's workspace trust, such as a failed write of `.claude.json`; the line names the persona and its working directory. Check that the file is writable.
+- `spawn-failed` — launching or resuming a persona's instance failed; the line names the persona and the step. The server keeps running; see "Session not restarting after crash" in [Symptom reference](#symptom-reference) for how restarts are retried. An instance the failed launch left still starting is waited out and never ended; see "A persona's instance is still starting" in [Symptom reference](#symptom-reference). A refusal by agent-director writes no entry: see [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
+- `dev-channels-approve-spawn-died` — during a server start, agent-director reported a persona's instance ended or missing before its startup prompt was cleared; the entry is written as soon as that is found. Restarts are retried as for `spawn-failed`. See "A persona's instance waits at a startup prompt" in [Symptom reference](#symptom-reference).
+- `dev-channels-approve-not-ready` — during a server start, a persona's instance didn't start within the time the server watches it (see "A persona's instance waits at a startup prompt" in [Symptom reference](#symptom-reference)): its startup dialog wasn't recognised or the session hung. The entry itself posts nothing to Slack; a session that still doesn't start gets the *Launch stuck* or *Session not starting* notice (see "A persona posts a *Launch stuck* or *Session not starting* notice" in [Symptom reference](#symptom-reference)). Inspect the instance with `agent-director read-pane --claude-instance-id <id>`.
+- `spawn-failure-post` — posting a `Spawn failure:` notice to a persona's destination failed. The notice is held and retried; see "A permission prompt or notice doesn't arrive" in [Symptom reference](#symptom-reference).
+- `orphan-cleanup-list-failed` — the server couldn't list its agent-director instances to clean up stale ones (see "Bots come back with no memory" in [Symptom reference](#symptom-reference)). At this start the server ends no stale instance, records no persona as retired and holds no persona from the listing; the start goes on.
+- `orphan-cleanup` — at a start, the kill of an old instance did not succeed after its tries; the row is kept and its session may still run. See the `[orphan-cleanup]` row under [A server start's clean-up of old instances](#a-server-starts-clean-up-of-old-instances).
+
+**Written by `stop --stop-bots` and `clean_restart`,** while the server is stopped, one entry per persona the teardown could not stop or stopped with a *Process outlived kill* text, and for `clean_restart` one more when it did not start the server. See [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona):
+
+- `cli-teardown-failed` — a persona the command could not stop, with no *Kill failed* text after its line.
+- `persona-kill-failed` and `persona-kill-survivor` — with the context `CLI teardown, <command>`; see [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice).
+- `clean-restart-not-restarted` — `clean_restart` could not stop a persona and agent-director did not answer, so the server was not started.
+
+**Written while the server runs.** Only `persona-kill-survivor` is also written at start:
+
+- `persona-unclassified-error` — the *Unclassified agent-director error* notice of a persona no longer in the applied configuration; see **A persona no longer configured** under [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
+- `persona-kill-failed` and `persona-kill-survivor` — the *Kill failed* and *Process outlived kill* notices with no Slack destination; see [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice) and [An old instance the server is ending](#an-old-instance-the-server-is-ending).
+- `persona-teardown-notice` — a notice raised for a persona while a confirmed change tears it down, written instead of posted; see [A notice raised during a teardown](#a-notice-raised-during-a-teardown).
+
+The following classes are **non-fatal warnings** about conversation-memory loss. They are recorded to the same log but never exit the process or block startup. The first four are written by the JSONL-persistence safeguard, which runs *before* the resume path to warn about an *impending* loss; the last two (`jsonl-transcript-lost-on-resume`, `jsonl-diagnosis-inconclusive`) are written *by the resume path itself* when it tried to resume a row and either confirmed a wipe or could not determine whether one occurred. Those two lines end with agent-director's error name and `message="…"`, as above:
+
+- `jsonl-non-persistent` — a session-transcript storage root (`<claude_config_dir>/projects`) is on a `tmpfs`/`ramfs` mount, so nothing there survives a reboot and session resume is structurally impossible on this host. A warning is also posted to the destination of each affected persona — those whose transcript storage root is the flagged mount, not every persona. Move the config dir to a persistent filesystem.
+- `jsonl-persistence-check-warning` — the safeguard could not determine the filesystem type of a transcript storage root (unreadable/unparseable `/proc/self/mountinfo`, or an unresolvable path), so persistence is unverified. No Slack post is made. Investigate the mount before relying on resume.
+- `jsonl-transcript-stale-path` — a persona's saved transcript exists on disk at the resolved fallback path, but agent-director's recorded `jsonl_path` points elsewhere (missing/empty). On the next restart the resume path would treat it as missing and wipe the persona's memory. A warning is posted to the persona's destination; an operator should reconcile the path before restarting.
+- `jsonl-transcript-lost` — in declarative mode, a persona's transcript is gone from disk (neither the recorded nor the fallback path exists), yet the message archive shows messages in the persona's `delivery: all` channels since the bot spawned. Only those channels are counted. In fungible mode the archive counts no channel, so this class is never reported: the safeguard logs only its quiet line. Conversation history has been lost and resume will start the bot fresh. A warning is posted to the persona's destination. Requires `message_archive_db` to be configured for the archive evidence. When the archive shows nothing, the safeguard logs a quiet line only: no transcript is expected for a persona idle since spawn, and for a persona with a `delivery: mentions` channel or DMs on a zero count proves nothing. A row the server will replace rather than resume (its working directory or config directory changed) is not checked.
+- `jsonl-transcript-lost-on-resume` — in declarative mode, resume actually threw `ErrJsonlMissing` for a persona, so the bot is brought up fresh on the same instance and its agent-director row is kept (its history archived to the earlier life), and the message archive shows messages in the persona's `delivery: all` channels since it spawned — so conversation history was lost, not merely at risk. Only those channels are counted. In fungible mode the resume path reports `jsonl-diagnosis-inconclusive` instead. Once the bot is up, a warning is also posted to the persona's destination ("my conversation memory has been lost and I was brought up fresh by a reuse spawn of the same instance, and its row is kept (its history archived to the earlier life)"); when bringing it up fails, the entry stays and no warning is posted. This is the resume path's own after-the-fact report (distinct from the pre-resume `jsonl-transcript-lost` warning above); the log line names every transcript path tried and whether each came from agent-director or was computed locally. A missing transcript on a persona that was *idle since spawn* — the archive was consulted and shows zero messages since spawn, and every one of the persona's channels is `delivery: all` with DMs off — is expected (the transcript is created lazily on first message) and produces a quiet log line only, no error class and no Slack post. Requires `message_archive_db` for the archive evidence; when the archive cannot be consulted the case is instead reported as `jsonl-diagnosis-inconclusive` below.
+- `jsonl-diagnosis-inconclusive` — resume threw `ErrJsonlMissing`, so the bot is brought up fresh on the same instance and its agent-director row is kept, but the diagnosis could not determine whether conversation history was lost: the agent-director row was already gone, `started_at` was unparseable, the message archive could not be read, `message_archive_db` is not configured at all, or the archive shows zero messages but the persona has a `delivery: mentions` channel or DMs on, so a zero count cannot show it was idle (the archive cannot attribute messages from `mentions` channels or DMs to a persona), or the server is in fungible mode (`allow_invited_channels` is true), where a persona serves every channel its app is a member of, so the archive counts no channel and a zero count proves nothing. Because "inconclusive" correlates with the same storage problems that cause real loss, this is surfaced (not silently downgraded to a benign never-created): the line records *why* the diagnosis failed, and once the bot is up, a warning is posted to the persona's destination worded as uncertainty ("on restart I was brought up fresh by a reuse spawn of the same instance, and its row is kept (its history archived to the earlier life); I could not determine whether my prior conversation history was preserved") rather than as a confirmed loss; when bringing it up fails, the entry stays and no warning is posted. When the reason is an unconfigured archive, the message notes that diagnosis is impossible without `message_archive_db` and suggests enabling it. These personas are counted separately in the startup summary as `fresh-after-inconclusive-amnesia` (distinct from the `fresh-after-amnesia` count). When agent-director can't answer that row fetch at all (it is unavailable, or any other error), nothing is diagnosed: no entry is recorded, no warning is posted, the bot is not brought up, and the launch is retried later like any other refused launch. When that row fetch finds conflicting labels noted on the persona's own row, nothing is diagnosed or brought up either: the persona is held (see "A persona posts a *Held: tmux session conflict* notice" under Troubleshooting). So is it when that row fetch answers that the row's recorded tmux session name can't be used (see "A persona posts a *Held: unusable tmux session name* notice" under Troubleshooting), or finds the persona's own row pending with no launch start (see "A persona posts a *Held: launch start not recorded* notice" under Troubleshooting).
+
+## Symptom reference
+
+The full entry for each symptom `docs/troubleshooting.md` lists, in the same order and under the same title. The sections above explain each log line in more detail.
+
+### Symptom: config.json not found
+
+No `config.json` and no last-applied record. See the `missing prerequisite: config.json not found …` row under [Before any persona is read](#before-any-persona-is-read); with a record, a missing `config.json` is a pending change that is invalid (see [Configuration rejections](#configuration-rejections)).
+
+### Symptom: The server won't start: last-applied record error
+
+See [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid).
+
+### Symptom: The server won't start: `reload-record-write-failed`
+
+See **At a start without a record** under [`reload-record-write-failed`](#reload-record-write-failed).
+
+### Symptom: A fix to config.json is ignored after a failed first start
+
+See [A first start that fails after recording](#a-first-start-that-fails-after-recording).
+
+### Symptom: Session connects but has no persona
+
+See the `Session connected with CWD "<path>" — no matching persona` and `Session refused: its working directory …` rows under [Other lines you may see](#other-lines-you-may-see). Two personas sharing a working directory or credentials file: see [Across personas](#across-personas), [`persona-directory-unusable`](#persona-directory-unusable) and [A credentials file shared by two personas](#a-credentials-file-shared-by-two-personas).
+
+### Symptom: A persona doesn't come up or doesn't answer
+
+See [Triage](#triage), [Reading a persona line](#reading-a-persona-line), the [persona diagnostic classes](#persona-diagnostic-classes) and [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running).
+
+### Symptom: A persona's instance waits at a startup prompt
+
+While a just-launched instance starts, the server answers only Claude Code's folder-trust and development-channels prompts, with Enter: see the `Deferring persona=<key>: its row reads pending …` row and the `approvePreSessionDialogs` and `pre_trust` rows under [Other lines you may see](#other-lines-you-may-see), and **What `pending_grace_seconds` sets on the server's side** under [agent-director's timing settings](#agent-directors-timing-settings) for how long and how often it watches. To follow the watch for one persona:
+
+```sh
+grep -E '\[slack\] approvePreSessionDialogs: .*(\(key=<key>\)|persona=<key>\b)' ~/.config/cscb/server.log
+```
+
+### Symptom: A persona's instance is still starting
+
+Normal for a short time after every launch: a start, a restart, a resume, a confirmed change's bring-up, a replacement of an old instance, or a retry's relaunch. What the retries do with it, and the *Launch stuck* and *Session not starting* notices at its time limit: [A persona posts a Launch stuck or Session not starting notice](#a-persona-posts-a-launch-stuck-or-session-not-starting-notice). After a launch that timed out or was refused: [A launch that timed out](#a-launch-that-timed-out). An old instance still starting: the `live-row-sequence` and `pending-row … is not covered` rows under [Other lines you may see](#other-lines-you-may-see). To follow it for one persona:
+
+```sh
+grep -E 'unavailable-retry: persona=<key> |Deferring persona=<key>: |pending-row: (not arming )?"[^"]*" \(key=<key>\)|pending-row: persona=<key> ' ~/.config/cscb/server.log
+```
+
+### Symptom: A persona doesn't receive messages in a channel or DM
+
+See [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to) (the mode in force, a pending edit, `delivery` or channel delivery, the loop guard) and, for DMs, [`persona-dm-dropped`](#persona-dm-dropped) and [A persona can't open a DM](#a-persona-cant-open-a-dm-re-install-its-app-to-gain-imwrite). A persona that is down: [Triage](#triage).
+
+### Symptom: A persona is silent in a channel it was invited to
+
+See [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to).
+
+### Symptom: A persona receives every message in a channel
+
+See [A persona receives every message in a channel](#a-persona-receives-every-message-in-a-channel).
+
+### Symptom: File attachment fails after a long wait
+
+Each attempt of a Slack request is limited to 30 s, and that includes uploading a file attached with `reply`. An upload that takes longer than 30 s fails on every attempt, so the tool returns an error only after about 30 minutes, once the standard retries are spent. This is not a hang: send smaller files, or split a large attachment into several smaller ones.
+
+### Symptom: Messages in a channel no persona is configured into are not delivered
+
+See [`unclaimed-channel`](#unclaimed-channel).
+
+### Symptom: Permission relay not working
+
+Check that the persona's Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state via `agent-director list --state check_permission --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json` and apply the change (see [Reload](../../docs/reload.md#reload)); like every server-wide setting but the switch `allow_invited_channels`, which applies at once, it takes effect at the next server start.
+
+### Symptom: A permission prompt or notice doesn't arrive
+
+See [`persona-destination-failed`](#persona-destination-failed).
+
+### Symptom: Bot appears dead / posts a "blocked on a native Claude Code permission prompt" warning
+
+The bot is wedged in `check_permission` on a native Claude Code TUI prompt that never reached Slack (a permission decision AD recorded but could not deliver). The bot stops responding, and after ~90 s the poller posts a one-shot warning naming the persona to the persona's destination (a channel or a DM with its contact). To recover, see the native prompt with `agent-director read-pane --claude-instance-id <id>`, then end the session with `agent-director kill --claude-instance-id <id>` and check the result; on an error, don't delete or respawn: follow the "Operator actions" section of agent-director's README. Once the kill has ended the session, the server brings the persona up again on its own. Do **not** use `send-keys` — agent-director hard-rejects it while the spawn is in this relayed permission state. These commands are for a human only: no bot runs them, including a persona that sees the post. The warning fires once per wedge episode; the detector re-arms if the bot later wedges again. While a confirmed change tears the persona down, see [A notice raised during a teardown](#a-notice-raised-during-a-teardown).
+
+### Symptom: Session not restarting after crash
+
+The persona's launches keep failing and it stays down. Auto-restart backs off exponentially on repeated launch failures — the delay doubles from `session_restart_delay` (default 60s) on each consecutive failure, up to a 15-minute ceiling. After 5 consecutive failures the persona hits a cap: a `SpawnCapReached` notice naming the persona is posted to the persona's destination (a channel or a DM with its contact, per its `permission_prompts` in declarative mode or its `invited.permission_prompts` in fungible mode) and automatic restarts stop. A launch that agent-director refuses is not counted: see [agent-director refuses a persona: it is retried on its own](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
+
+A clean exit (`/exit`, which `agent-director pause` sends) is relaunched about 3 s after the disconnect instead of after `session_restart_delay`, at most once per `session_restart_delay`; `grep b.4vm ~/.config/cscb/server.log` shows the check and its loop guard (the `b.4vm` lines under [Other lines you may see](#other-lines-you-may-see)). There is no such check while the persona's last launch failed, so failed launches still back off and cap; nothing is logged for that.
+
+A resume counts only once its session starts, and after 2 resumes in a row that end first the persona comes up fresh: see [A persona's resumed launch ends before it reports in](#a-personas-resumed-launch-ends-before-it-reports-in). Whether a restart kills the old instance before it relaunches: the `No kill before …` lines under [A persona whose instance died under a prompt](#a-persona-whose-instance-died-under-a-prompt), and the `Session kill for persona=<key> did not succeed` lines under [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own). A message lost meanwhile gets one lost-message notice; the `No live session` row under [Other lines you may see](#other-lines-you-may-see) explains its `Recovery:` state.
+
+**At the cap.** A capped persona (or any persona when auto-restart is disabled via `session_restart_delay: 0`) does **not** recover on an inbound message — firing another launch there would only burn a spawn attempt against a persona that cannot come up — and the health check skips it. A capped persona that is also held for a human gets no launch from the hold's own check either; `clear-latch` ends its hold, clears its restart limit and brings it up (see **A held persona at the restart limit** under [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice)). To clear the cap of a persona that is not held and retry, restart the server with `claude-slack-channel-bots stop && claude-slack-channel-bots start`; the failure counter is in-process and cleared on restart, giving each persona a fresh attempt. To disable auto-restart entirely, set `session_restart_delay` to `0` in `config.json` and apply the change (see [Reload](../../docs/reload.md#reload)); it takes effect at the next server start.
+
+### Symptom: A persona is retried after agent-director refuses it
+
+A persona stays down or silent while agent-director refuses the server's calls for it (it is unreachable, or answers that it can't act right now). The server retries it on its own, never counting it toward the restart limit, and the first retry after agent-director answers again recovers it: see [agent-director refuses a persona: it is retried on its own](#agent-director-refuses-a-persona-it-is-retried-on-its-own) for the schedule, its lines, when the retries stop, the notices an outage posts, and **It never clears**.
+
+### Symptom: A persona waits on an old instance in its working directory
+
+A persona stays silent and is not brought up, with no post about it, while an old instance may still be running in its working directory: after a confirmed removal, rename, or `working_directory` or `credentials_file` path change, or after a server start whose clean-up could not end a stale instance (a retired persona's, for example). It comes up by itself once agent-director reads the old instance ended or missing: see [A persona waiting on an old instance](#a-persona-waiting-on-an-old-instance) and [An old instance the server is ending](#an-old-instance-the-server-is-ending).
+
+### Symptom: Bot alive but silently unresponsive (MCP disconnected)
+
+A bot's process runs but it stops answering: it lost its MCP connection with no disconnect event, or its message stream is gone while it still looks connected. The health check recovers it on its own, within about 3–5 minutes at the defaults, waiting for a running turn to end and never typing into a prompt: see **How the health check recovers it** under [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected); [A row that reads `working` while the instance sits idle](#a-row-that-reads-working-while-the-instance-sits-idle) for a bot agent-director keeps reporting `working`; [A persona whose recovery is slow](#a-persona-whose-recovery-is-slow) for a bot killed mid-turn; and [At a start: one persona waiting doesn't hold up the others](#at-a-start-one-persona-waiting-doesnt-hold-up-the-others) at a server start.
+
+### Symptom: Reading the start summary
+
+Each server start logs one `[slack] startupSessionManager: complete — …` summary line in `server.log`. What each count means, and which counts are no failure: [At a start: one persona waiting doesn't hold up the others](#at-a-start-one-persona-waiting-doesnt-hold-up-the-others).
+
+### Symptom: A persona posts a *Waiting on a prompt*, *Not connected* or *Not receiving messages* notice
+
+The persona's session runs but messages can't reach it, so messages sent to it are lost. What each notice means and what to do: the notice table under [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected).
+
+### Symptom: A persona posts a *Not answering*, *Still not answering* or *Answering again* notice
+
+agent-director or tmux is not answering for this one persona's session, and the server keeps retrying it. When each notice is posted, the read-only checks after *Still not answering*, and the lines to follow: [A persona posts a Not answering notice](#a-persona-posts-a-not-answering-notice).
+
+### Symptom: A persona posts a *Slow recovery* notice
+
+The persona is silent, and its destination has a *Slow recovery* notice: its session is gone, but agent-director still reads its row live, so the server can't relaunch it yet. Nothing is needed unless it persists: see [A persona whose recovery is slow](#a-persona-whose-recovery-is-slow).
+
+### Symptom: A persona posts a *Launch stuck* or *Session not starting* notice
+
+The persona is silent, and its destination has a *Launch stuck* or *Session not starting* notice naming its session, `slack_bot_<key>`: its launch has not started within the later of 5 minutes and `pending_grace_seconds` plus 60 s. See [A persona posts a Launch stuck or Session not starting notice](#a-persona-posts-a-launch-stuck-or-session-not-starting-notice).
+
+### Symptom: A persona posts a *tmux unavailable* or *tmux server changed* notice
+
+agent-director answered a call for the persona that it can't use tmux for it. *tmux unavailable*: install or repair tmux; *tmux server changed*: a human follows the "Operator actions" section of agent-director's README. The server retries the persona on its own; see **tmux isn't available** in [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
+
+### Symptom: A persona posts a *Held: tmux session conflict* notice
+
+The persona is silent and held for a human: agent-director refused to act on its tmux session because of a session conflict, or noted conflicting labels on its own row. A human follows the "Operator actions" section of agent-director's README for the session the notice names; the hold clears on its own within 2 minutes, or at once with `clear-latch`. See [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice) and [Clearing a hold by hand: `clear-latch`](#clearing-a-hold-by-hand-clear-latch).
+
+### Symptom: A persona posts a *Held: unusable tmux session name* notice
+
+The persona is silent and held for a human: the tmux session name recorded on its agent-director row, `cscb_<key>`, can't be used, so agent-director's store was edited by hand. A human follows the "Operator actions" section of agent-director's README for that row. See [A persona posts a Held: unusable tmux session name notice](#a-persona-posts-a-held-unusable-tmux-session-name-notice).
+
+### Symptom: A persona posts a *Held: launch start not recorded* notice
+
+The persona is silent and held for a human: its agent-director row, `cscb_<key>`, reads pending but records no launch start, which only an older agent-director or a hand edit of its store writes. A human follows the "Operator actions" section of agent-director's README. See [A persona posts a Held: launch start not recorded notice](#a-persona-posts-a-held-launch-start-not-recorded-notice).
+
+### Symptom: A persona posts a *Cannot launch* notice
+
+The persona is silent: the host's agent-director rejected the flags of its launch (`ErrInvalidFlags`), so the installed agent-director may not match this CSCB release. A human checks `agent-director version` against the [Prerequisites](../../README.md#prerequisites). See [A persona posts a Cannot launch notice](#a-persona-posts-a-cannot-launch-notice).
+
+### Symptom: A persona posts a *Kill failed* or *Process outlived kill* notice
+
+The server could not end the persona's old worker (*Kill failed*), or ended it but a process of its session outlived the kill (*Process outlived kill*). For *Kill failed*, a human checks the worker with `read-pane`, then ends it with `agent-director kill` and checks the result; on an error, don't delete or respawn. For anything more, a human follows the "Operator actions" section of agent-director's README. See [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice).
+
+### Symptom: A persona posts an *agent-director refuses its config file* notice
+
+agent-director refuses `~/.agent-director/config.toml`, so it fails every call that reads its store; the persona stays down or silent. A human fixes the file following agent-director's documentation; the *All clear.* confirms it. See **agent-director refuses its config file** in [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
+
+### Symptom: A persona posts an *Unclassified agent-director error* notice
+
+agent-director has kept returning an error the server can't classify while launching or recovering the persona. The server keeps retrying it; a human checks the host's agent-director. See **agent-director returns an error the server can't classify** in [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
+
+### Symptom: Session stuck during clean_restart
+
+A bot that does not exit within `exit_timeout` after its pause is force-killed, its row kept; a force-kill that still fails fails that persona, and `clean_restart` exits 1. See [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona).
+
+### Symptom: `clean_restart` or `stop --stop-bots` exits non-zero with `nothing was stopped`
+
+The precheck failed, so the server and every bot keep running. Fix the cause each `precheck failed for persona` line names, then re-run the command. See [A precheck failed: nothing was stopped](#a-precheck-failed-nothing-was-stopped).
+
+### Symptom: `stop --stop-bots` exits non-zero with `only the server was stopped`
+
+The installed agent-director is below the agent-director client's own minimum, so only the server was stopped. See [The two CLI commands on an old binary](#the-two-cli-commands-on-an-old-binary), then follow the docs/migration.md section "Switching over to agent-director Phase 1".
+
+### Symptom: `clean_restart` or `stop --stop-bots` exits non-zero with `could not stop`
+
+At least one persona could not be stopped after a passed precheck; the command fails loudly rather than reporting a clean stop. Each `could not stop persona` line names the persona, its session and the class. See [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona).
+
+### Symptom: Bots come back with no memory of the prior conversation after a reboot
+
+With `resume_enabled: true`, a bot whose host rebooted (or pod resumed) should return with its conversation history. The agent-director version is not the cause: the server starts only on agent-director Phase 1, since the startup gate refuses any binary below it (`ad-system-install-too-old` or `ad-below-phase1-floor`, see [Startup errors](#startup-errors-startup-errorslog)). `bun run install-check` passes a binary below Phase 1 only with its note that the server will not start on it (see [Checking your agent-director install](../../docs/agent-director.md#checking-your-agent-director-install)). A bot that comes back amnesiac on a running server started a new conversation for one of the reasons below, which the log names.
+
+A bot also starts a new conversation, by design, when its session no longer matches the applied configuration. A config edit takes effect only once it is applied (see [Reload](../../docs/reload.md#reload)); a restart or reboot alone runs the last-applied record. When a change to a persona's `working_directory` is applied, the persona is torn down and brought up fresh, once its old instance has ended (see "A persona waits on an old instance in its working directory" above). When a change to a persona's effective `claude_config_dir` (its own or the top-level default) is applied, the bot starts a new conversation the next time it would be resumed (see [When next-launch and server-wide changes take effect](../../docs/reload.md#when-next-launch-and-server-wide-changes-take-effect)); a bot that keeps running keeps its old config directory until then. A bot whose instance no longer matches its working directory or config directory, or whose `resume_enabled` is false, starts a new conversation on the same instance: the old conversation stays in its directory as an earlier life of that instance, and nothing is deleted. A bot that is still running is first ended, with each kill checked, before the new conversation starts; one that is still starting is never typed into: it is ended with a checked kill, and the new conversation starts only once agent-director's grace period has passed since its launch start (see "A persona's instance is still starting" above). A persona retired by a confirmed change (removed and added again with the same key, renamed back, or brought up from its new entry after a `credentials_file` path or `working_directory` change) starts a new conversation on the same instance, restarts included, and its old conversation is never resumed. So does a persona whose instance a server start found while the persona was not in the applied configuration (for example, after `config.json.last-applied` was deleted) and that is added back later: that start recorded its key as retired. After upgrading from an earlier release, each bot also starts fresh once: a bot instance from before the upgrade is never resumed (see [Step 10: Start the new CSCB](../../docs/migration.md#step-10-start-the-new-cscb)). A bot whose last 2 resumes ended before its session started also starts fresh: its transcript holds no conversation Claude Code can load (see "Session not restarting after crash" above). The log names the reason: search `server.log` for `sweeping row`, `pre-persona row`, `replacing the row`, `not resuming; replacing its row`, `key is retired` or `not resuming its transcript again`.
+
+### Symptom: Session crashes on resume with "sandbox required but unavailable"
+
+This is a known regression in certain Claude Code releases (e.g. v2.1.120) where `--resume` triggers a sandbox check that fails in headless environments. Set `resume_enabled: false` in `config.json`, apply the change and restart the server (`resume_enabled`, like every server-wide setting but `allow_invited_channels`, takes effect at the next start; see [Reload](../../docs/reload.md#reload)) to disable `--resume` entirely — the bot will always start a fresh Claude session instead of resuming a prior conversation, both on startup and on runtime auto-restart:
+
+```json
+{
+  "personas": [ ... ],
+  "resume_enabled": false
+}
+```

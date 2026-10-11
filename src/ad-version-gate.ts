@@ -2,7 +2,7 @@
  * ad-version-gate.ts — CSCB's own Phase 1 floor for the agent-director binary.
  *
  * Role: holds the one named Phase 1 floor constant (b.jg5 SRJ-201), the floor
- * comparison over a version string (b.jg5 SRJ-202), the title of the README
+ * comparison over a version string (b.jg5 SRJ-202), the doc and title of the
  * switch-over runbook section that the startup gate's messages point the
  * operator to, the debug skill's path and section that a runtime re-check's
  * stop points to instead, the `ad-below-phase1-floor` message (b.jg5 SRJ-203,
@@ -112,8 +112,11 @@ import { redactSlackLogText } from './slack-log-redaction.ts'
  */
 export const PHASE1_FLOOR_VERSION = '0.11.0'
 
+/** The user doc that holds the switch-over and rollback runbooks. */
+export const PHASE1_RUNBOOK_DOC = 'docs/migration.md'
+
 /**
- * Title of the README runbook section for switching over to agent-director
+ * Title of the runbook section, in {@link PHASE1_RUNBOOK_DOC}, for switching over to agent-director
  * Phase 1. Every message, test and doc that names the section takes the
  * title from this constant.
  */
@@ -123,7 +126,7 @@ export const PHASE1_RUNBOOK_SECTION_TITLE = 'Switching over to agent-director Ph
  * Heading of the publishing-host block inside the
  * {@link PHASE1_RUNBOOK_SECTION_TITLE} section (b.jg5 SRJ-1108, SRJ-211,
  * SRJ-212): the host that publishes the release, or one with no
- * agent-director. The README's block heading must equal this constant. The
+ * agent-director. The runbook's block heading must equal this constant. The
  * install check's not-found message (`src/install-check.ts`) and `/publish`'s
  * not-found and below-client-minimum diagnostics
  * (`scripts/ad-version-check.ts`) name it, as publishing-host contexts. The
@@ -147,7 +150,7 @@ export const PHASE1_REQUIRED_PHRASE = 'this CSCB release requires agent-director
  * entry carries {@link PHASE1_REQUIRED_PHRASE} and
  * {@link DEBUG_SKILL_RUNTIME_STOP_POINTER} in its place.
  */
-export const PHASE1_SWITCH_OVER_INSTRUCTION = `${PHASE1_REQUIRED_PHRASE}: follow the switch-over runbook in the README`
+export const PHASE1_SWITCH_OVER_INSTRUCTION = `${PHASE1_REQUIRED_PHRASE}: follow the switch-over runbook in ${PHASE1_RUNBOOK_DOC}`
 
 /** The debug skill's path in the package, which a runtime re-check's entry points to (b.jg5 SRJ-205, SRJ-208). */
 export const DEBUG_SKILL_PATH = 'skills/debug-slack-channel-bots/SKILL.md'
@@ -369,7 +372,7 @@ export function buildSystemInstallTooOldMessage(
   const remedy = runtime
     ? `This CSCB release and agent-director Phase 1 are installed together; ${DEBUG_SKILL_RUNTIME_STOP_POINTER}.`
     : `This CSCB release and agent-director Phase 1 are installed together: ` +
-      `install agent-director by following the switch-over runbook in the README ` +
+      `install agent-director by following the switch-over runbook in ${PHASE1_RUNBOOK_DOC} ` +
       `(section "${PHASE1_RUNBOOK_SECTION_TITLE}").`
   return (
     `agent-director system install is too old: version ${parts.foundVersion} is below ` +
@@ -793,7 +796,7 @@ export function buildPhase1HostNote(parts: BelowPhase1FloorParts): string {
     `The host's agent-director ${parts.foundVersion} (binary at ${parts.binaryPath}) is below ` +
     `CSCB's Phase 1 floor ${PHASE1_FLOOR_VERSION} (release candidates ${PHASE1_FLOOR_VERSION}-rc.N included): ` +
     `${PHASE1_HOST_NOTE_PHRASE}. It meets the agent-director client's minimum, so it is accepted for now; ` +
-    `the host switches over to Phase 1 by the README's runbook section "${PHASE1_RUNBOOK_SECTION_TITLE}".`
+    `the host switches over to Phase 1 by the runbook section "${PHASE1_RUNBOOK_SECTION_TITLE}" in ${PHASE1_RUNBOOK_DOC}.`
   )
 }
 
@@ -819,7 +822,7 @@ export function buildInstallCheckPhase1Note(foundVersion: string): string {
     `agent-director ${foundVersion} meets the agent-director client's minimum but is below ` +
     `CSCB's Phase 1 floor ${PHASE1_FLOOR_VERSION} (release candidates ${PHASE1_FLOOR_VERSION}-rc.N included): ` +
     `${INSTALL_CHECK_PHASE1_NOTE_PHRASE}. ` +
-    `See the README's switch-over runbook section "${PHASE1_RUNBOOK_SECTION_TITLE}".`
+    `See the switch-over runbook section "${PHASE1_RUNBOOK_SECTION_TITLE}" in ${PHASE1_RUNBOOK_DOC}.`
   )
 }
 

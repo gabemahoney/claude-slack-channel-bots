@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Test 13 (b.jg5 SRJ-1402, SRJ-1108, SRJ-1401, SRJ-1418, SRJ-203, SRJ-1013):
 # scenario 1, the switch-over, legs A, B and C. The script follows the
-# README's switch-over runbook (section "Switching over to agent-director
+# switch-over runbook in docs/migration.md (section "Switching over to agent-director
 # Phase 1", steps 1 to 11, each a `Step <n>: …` heading) in the container,
 # entering each step once and in order, and replaces only the host-only parts
 # SRJ-1402 lists (the substitution table below). Legs B and C follow step 11.
@@ -46,7 +46,7 @@
 #   go-ahead is the operator's own, and no runbook step writes that entry.
 # - The build under test is unpacked from the image's package-under-test
 #   tarball into the staging directory (nothing runs from it), so the runbook
-#   the script follows is the staged release's own README; step 1 finishes
+#   the script follows is the staged release's own docs/migration.md; step 1 finishes
 #   staging it (its dependencies resolved).
 #
 # Each step is entered through `runbook_step <n>`, which prints the step's
@@ -560,12 +560,12 @@ runbook_step() {
             title="${line#"step ${n} "}"
         fi
     done < "${file}"
-    [[ -n "${title}" ]] || fail "runbook: step ${n} is not in ${RUNBOOK_PKG}/README.md's runbook"
+    [[ -n "${title}" ]] || fail "runbook: step ${n} is not in ${RUNBOOK_PKG}/docs/migration.md's runbook"
     if [[ -z "${RUNBOOK_COUNT}" ]]; then
         RUNBOOK_COUNT="${count}"
     fi
     [[ "${count}" == "${RUNBOOK_COUNT}" ]] \
-        || fail "runbook: ${RUNBOOK_PKG}/README.md's runbook has ${count} steps, not the ${RUNBOOK_COUNT} read before"
+        || fail "runbook: ${RUNBOOK_PKG}/docs/migration.md's runbook has ${count} steps, not the ${RUNBOOK_COUNT} read before"
     if (( n >= 4 && n <= 10 )); then
         no_bot_server "runbook step ${n}"
     fi
@@ -1125,9 +1125,9 @@ list_rows "setup" "${SCENARIO_ROOT}/fleet-rows.json" --label service=cscb
 no_bot_server "setup"
 
 # The build under test, unpacked into the staging directory: the runbook the
-# script follows is its README's.
+# script follows is its docs/migration.md's.
 tar -xzf "${PACKAGE_TGZ}" -C "${STAGING_DIR}" --no-same-owner || fail "setup: could not unpack ${PACKAGE_TGZ}"
-[[ -f "${STAGED_PKG}/README.md" ]] || fail "setup: ${PACKAGE_TGZ} holds no package/README.md"
+[[ -f "${STAGED_PKG}/docs/migration.md" ]] || fail "setup: ${PACKAGE_TGZ} holds no package/docs/migration.md"
 
 # ---------------------------------------------------------------------------
 # Step 1

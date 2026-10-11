@@ -18,8 +18,8 @@ channels its app is invited to. The wizard states the channel mode, or sets
 it, adds personas one at a time, then checks the rest of the setup. It skips
 anything already done.
 
-The README's persona configuration reference is the authority. This skill
-links to its sections instead of repeating them.
+The persona configuration reference, `docs/configuration.md` in the package,
+is the authority. This skill links to its sections instead of repeating them.
 
 ## Constraints
 
@@ -54,7 +54,7 @@ and move on.
 
 ---
 
-### Step 1 — Read the README
+### Step 1 — Read the configuration reference
 
 Find the installed package:
 
@@ -65,13 +65,13 @@ for d in "$HOME/.bun/install/global/node_modules/claude-slack-channel-bots" \
 done
 ```
 
-The directory printed is the package root: it holds `README.md`,
-`slack-app-manifest.yml` and `skills/`. Read the README's
-`### Personas (config.json)` section (its subsections are the persona
-reference), the `## Channel modes` section and the `## Reload` section, and use
-them as the authority for every
-later step. If the package isn't found, continue with this skill and point the
-operator at the README on the package's GitHub page.
+The directory printed is the package root: it holds `README.md`, `docs/`,
+`slack-app-manifest.yml` and `skills/`. Read `docs/configuration.md`
+(the persona reference), `docs/server-settings.md`, `docs/channel-modes.md`
+and `docs/reload.md`, and the debug skill's `### The load-time rules`
+(`skills/debug-slack-channel-bots/SKILL.md`), and use them as the authority
+for every later step. If the package isn't found, continue with this skill
+and point the operator at those pages in the package's GitHub repository.
 
 ---
 
@@ -87,7 +87,7 @@ ls -l "$STATE_DIR/config.json" 2>/dev/null || echo "NOT_FOUND"
 ```
 
 - **Missing, with `SLACK_STATE_DIR` unset and a `config.json` in
-  `~/.claude/channels/slack`:** the host kept its state there under an
+  `~/.config/cscb`:** the host kept its state there under an
   earlier release and its server has not started since the upgrade, which
   moves it. Don't create a configuration in the new folder. Tell the operator
   to run `claude-slack-channel-bots stop` (it finds the old directory), then
@@ -133,7 +133,7 @@ channels and sets each one's `delivery`; in fungible mode, inviting a
 persona's app to a channel decides who can reach the persona there, and the
 persona's agent then sets each channel's delivery with `set_channel_delivery`.
 Suggest declarative mode: the operator keeps choosing each persona's audience.
-See the README's `## Channel modes`.
+See `docs/channel-modes.md`.
 
 Find the switch in the last-applied record and in `config.json`:
 
@@ -150,8 +150,8 @@ mode in force is the record's when the record exists (Step 3), otherwise
 
 - **A fresh install** (no last-applied record and no persona in
   `config.json`): explain both modes, suggest declarative mode, and ask which
-  one. For fungible mode, have the operator read the README's
-  `### Who can reach a persona in fungible mode` first, then add
+  one. For fungible mode, have the operator read `docs/channel-modes.md`'s
+  `## Who can reach a persona in fungible mode` first, then add
   `"allow_invited_channels": true` to `config.json`, keeping every other
   field. For declarative mode, write nothing.
 - **An existing install:** state the mode in force and ask only whether to
@@ -175,7 +175,7 @@ section the mode turned on needs:
   contact may keep the default destination, `"dm"`, with no `invited`. Leave
   each persona's `channels` and `permission_prompts` in place: fungible mode
   doesn't read them, and declarative mode uses them again if the switch is
-  turned off. See the README's `### Permission prompts in fungible mode`.
+  turned off. See `docs/channel-modes.md`'s `## Permission prompts in fungible mode`.
 - **Turning fungible mode off** (remove `allow_invited_channels`, or set it to
   `false`): every persona needs a top-level `permission_prompts`, and
   `channels` unless its `dm.enabled` is `true`, valid by the declarative-mode
@@ -185,7 +185,7 @@ section the mode turned on needs:
   doesn't read it.
 
 Then check every persona against the load-time rules of the mode in force
-after the edit, in the README's `#### Load-time rules`: the rules for both
+after the edit, in the debug skill's `### The load-time rules`: the rules for both
 modes, plus the declarative-mode rules when the switch is off, or the
 fungible-mode rules when it is on. A pending change is judged by the rules of
 the mode its own switch picks, so a persona that passes only the other mode's
@@ -205,7 +205,7 @@ to review, for each persona's app:
   grep -h -F unclaimed-channel "$STATE_DIR"/server.log.* "$STATE_DIR"/server.log 2>/dev/null
   ```
 
-and to read the README's `### Who can reach a persona in fungible mode`, since
+and to read `docs/channel-modes.md`'s `## Who can reach a persona in fungible mode`, since
 an invite then changes who can reach a persona's worker. Step 10 says how the
 switch takes effect.
 
@@ -224,8 +224,8 @@ Ask for the persona's `name`. It is the persona's identity in `config.json`,
 logs and targets, not its Slack display name (that comes from its app). Any
 non-empty name is accepted. The server derives a **key** from the name, used
 for its agent-director instance and in targets, and shows it on the persona's
-`persona-start` line in `server.log`. See the README's
-`#### Persona name and key` for the rule.
+`persona-start` line in `server.log`. See `docs/configuration.md`'s
+`### Persona name and key` for the rule.
 
 Reject a name that equals an existing persona's name or key. A name of 1–40
 lower-case letters, digits and `_` is its own key, so compare it directly.
@@ -239,7 +239,7 @@ beside `"Dev Bot"` (key `dev_bot_…`). The server rejects such a pair. The
 reason: tmux matches a session target by prefix unless it is written with
 `=`, so a human's tmux command without `=` for one persona (for example
 `tmux attach -t slack_bot_dev`) could reach another persona's session. See
-the README section "Persona name and key". Keys that only
+the docs/configuration.md section "Persona name and key". Keys that only
 share a start, such as `dev_a` and `dev_b`, are fine. When a name clashes
 this way, propose the shorter one with `_main` appended (`horde_main`), or
 `_main_2`, `_main_3`, … if that still starts with, or is the start of,
@@ -318,13 +318,13 @@ share one, and the configuration is rejected.
   broadcasts).
 
 In declarative mode, a persona may have no channels only when its DMs are on
-(5.6). See the README's `#### Channel entries` and `#### Channel delivery`.
+(5.6). See `docs/configuration.md`'s `### Channel entries` and `### Channel delivery`.
 
 **In fungible mode,** skip the channels questions: the persona has no
 `channels` and no `delivery` to collect. It serves every public or private
 channel its app is invited to that is not externally shared, each at
 `mentions` unless its agent stores `all` for it with `set_channel_delivery`.
-Group DMs are never served. See the README's `### What each mode serves`.
+Group DMs are never served. See `docs/channel-modes.md`'s `## What each mode serves`.
 
 In either mode, tell the operator to invite the persona's app to each channel
 the persona should serve, in that channel:
@@ -348,7 +348,7 @@ In Slack, open that person's profile, then **⋮** → **Copy member ID**.
 
 In declarative mode, a persona with no channels must have DMs on. In fungible
 mode, no rule asks for DMs, but a persona with DMs off or no contact needs a
-channel destination (5.7). See the README's "Direct messages" subsection.
+channel destination (5.7). See `docs/configuration.md`'s "Direct messages" subsection.
 
 #### 5.7 Permission prompts
 
@@ -358,7 +358,7 @@ notices go (`permission_prompts`, required):
 - one of the persona's own channel IDs from 5.5, or
 - `dm`, which needs `dm.enabled: true` and a `dm.contact`.
 
-See the README's `#### Permission prompts`.
+See `docs/configuration.md`'s `### Permission prompts`.
 
 **In fungible mode,** ask instead for the fungible destination,
 `invited.permission_prompts`, where the persona's prompts and notices go; the
@@ -370,13 +370,12 @@ top-level `permission_prompts` is not read:
 - `"dm"`, the default when `invited` is left out, which needs
   `dm.enabled: true` and a `dm.contact` (5.6).
 
-Everyone in a destination channel sees the prompts and notices. See the
-README's `### Permission prompts in fungible mode`.
+Everyone in a destination channel sees the prompts and notices. See `docs/channel-modes.md`'s `## Permission prompts in fungible mode`.
 
 #### 5.8 Optional next-launch settings
 
 Offer these only if the operator wants to override the top-level defaults
-(README `#### Next-launch settings`):
+(`docs/configuration.md` `### Next-launch settings`):
 
 - **`claude_config_dir`**: the persona's own Claude config directory, so it can
   use a different Claude account. Never `~/.claude`. The operator populates it
@@ -423,7 +422,7 @@ top-level `permission_prompts`, for example:
 Add `"dm": { "enabled": true, "contact": "<user ID>" }` and the 5.8 settings
 only when chosen. In declarative mode, leave `channels` out of a DM-only
 persona; in fungible mode, leave `invited` out when the destination is the
-default `"dm"`. Check the entry against the README's `#### Load-time rules`
+default `"dm"`. Check the entry against the debug skill's `### The load-time rules`
 for the mode in force after Step 4, together with the personas already in the
 file. In both modes:
 
@@ -432,7 +431,7 @@ file. In both modes:
 - no persona's key starts with another persona's key (5.1);
 - `dm.contact` matches its pattern;
 - every path is absolute, `~` or `~/…`;
-- no key outside the README's `#### Persona fields` table.
+- no key outside `docs/configuration.md`'s `### Persona fields` table.
 
 The declarative-mode rules:
 
@@ -473,7 +472,7 @@ it (Step 10). Then ask whether to add another persona.
 
 Only if the operator asks, set top-level settings such as `ack_reaction`,
 `reply_chunk_limit`, `reply_chunk_mode`, `port` or `session_restart_delay`.
-The README's `#### Server-wide settings` table lists each field, its type and
+`docs/server-settings.md`'s `## Server-wide settings` table lists each field, its type and
 default. Write only the fields the operator sets.
 
 The channel-mode switch, `allow_invited_channels`, is a server-wide setting
@@ -520,7 +519,7 @@ needs, point the operator to the `install-cscb` skill
 (`skills/install-cscb/SKILL.md` in the package), which checks the install with
 `bun run install-check` and walks through the diagnosis. This release needs
 agent-director Phase 1, and the two are installed together through the
-README section "Switching over to agent-director Phase 1"; this wizard
+docs/migration.md section "Switching over to agent-director Phase 1"; this wizard
 changes nothing in the agent-director install. The server registers its
 agent-director template at start; an `ad-template-install` line in
 `$STATE_DIR/startup-errors.log` means that failed.
@@ -549,7 +548,7 @@ by hand any `PermissionRequest` entry whose `hooks[].command` ends in
 
 ### Step 10 — How the change takes effect
 
-Explain the case that matches Step 3. Link to the README's `## Reload` section.
+Explain the case that matches Step 3. Link to `docs/reload.md`.
 
 - **No last-applied record** (a fresh install): the first
   `claude-slack-channel-bots start` applies `config.json` as it stands. The
@@ -584,10 +583,10 @@ event, tool call, prompt and notice, with no restart, and every session is
 kept. Its preview line reads `server-wide setting allow_invited_channels
 changed: turns <mode> mode on, applied in place at once, from the next event,
 tool call, prompt and notice, for …`, naming the mode it turns on and every
-persona it affects. See the README's `### Turning fungible mode on or off`.
+persona it affects. See `docs/channel-modes.md`'s `## Turning fungible mode on or off`.
 
 A change to another server-wide setting, such as `port`, is recorded when
-confirmed and takes effect at the next server start (README `### When next-launch and server-wide
+confirmed and takes effect at the next server start (`docs/reload.md` `## When next-launch and server-wide
 changes take effect`). `append_system_prompt_file` and `system_prompt_mode` from Step 7
 are part of the agent-director template the server registers once, at start.
 On a running server, a confirmation doesn't change that template: every
@@ -725,7 +724,7 @@ persona whose tokens Slack refuses (`persona-credentials-refused`).
 
 Replacing an existing persona's file on a running server makes a pending
 credentials change: the server writes `config.json.pending`, and the change
-takes effect only once the operator confirms it (Step 10, README `## Reload`).
+takes effect only once the operator confirms it (Step 10, `docs/reload.md`).
 
 ---
 
@@ -740,4 +739,4 @@ operator to delete that file by hand afterwards. On a running server, the
 server then writes `config.json.pending` naming the persona's credentials
 change; once the operator confirms it by the rename (Step 10), only that
 persona reconnects. No restart is needed. On a stopped server, the next start
-reads the new file as it stands. See the README's `## Reload` section.
+reads the new file as it stands. See `docs/reload.md`.

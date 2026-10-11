@@ -383,8 +383,8 @@ describe('cron-scheduler — load-line wording', () => {
     expect(text).toContain('names no personas')
     expect(text).toContain('never be delivered in this version')
     expect(text).toContain('Add a persona list')
-    // The section it names is checked against the README in cron-bootstrap.test.ts.
-    expect(text).toMatch(/README section "[^"]+"/)
+    // The section it names is checked against docs/scheduled-prompts.md in cron-bootstrap.test.ts.
+    expect(text).toMatch(/section "[^"]+" in docs\/scheduled-prompts\.md/)
   })
 })
 
