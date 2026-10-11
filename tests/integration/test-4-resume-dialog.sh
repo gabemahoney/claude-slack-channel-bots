@@ -71,6 +71,11 @@ cp "${FIXTURES}/stub-claude.sh" "${STUB_BIN_DIR}/claude"
 chmod +x "${STUB_BIN_DIR}/claude"
 export PATH="${STUB_BIN_DIR}:${PATH}"
 
+# The stub records each launch's argument list, one line per launch, in this
+# file beside it; start from none so only this run's launches are read.
+LAUNCH_ARGS_FILE="${STUB_BIN_DIR}/stub-claude-launch-args"
+rm -f "${LAUNCH_ARGS_FILE}"
+
 command -v claude >/dev/null 2>&1 \
     || fail "stub claude not resolvable on PATH after install"
 [ "$(command -v claude)" = "${STUB_BIN_DIR}/claude" ] \
@@ -127,5 +132,22 @@ printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: PRECONDITION_OK' \
 #    `pending` row, kept that row's launch start, and the row went live.
 printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: PHASE2_OK' \
     || fail "phase 2: the approver did not clear the dev-channels dialog on the resumed launch's pending row"
+
+# 4. Both launches carried `--system-prompt-snapshot off` (the template
+#    installed from a config without `fresh_system_prompt`): the stub recorded
+#    one line per launch, the fresh one then the resumed one (phase 2's
+#    `resumed` result), and each holds the two words adjacent, in that order.
+test -f "${LAUNCH_ARGS_FILE}" \
+    || fail "launch arguments: the stub recorded no launch (${LAUNCH_ARGS_FILE} is absent)"
+LAUNCH_COUNT="$(wc -l < "${LAUNCH_ARGS_FILE}")"
+[ "${LAUNCH_COUNT}" -eq 2 ] \
+    || fail "launch arguments: expected 2 recorded launches (fresh, resumed), found ${LAUNCH_COUNT}: $(cat "${LAUNCH_ARGS_FILE}")"
+launch_no=0
+for launch_label in fresh resumed; do
+    launch_no=$((launch_no + 1))
+    launch_line="$(sed -n "${launch_no}p" "${LAUNCH_ARGS_FILE}")"
+    printf '%s\n' "${launch_line}" | grep -Eq '(^| )--system-prompt-snapshot off( |$)' \
+        || fail "launch arguments: the ${launch_label} launch lacks adjacent '--system-prompt-snapshot off': ${launch_line}"
+done
 
 echo "PASS: ${TEST_NAME}"

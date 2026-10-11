@@ -122,6 +122,7 @@ const SHARED_TOP_LEVEL_KEYS = [
   'append_system_prompt_file',
   'cozempic_prescription',
   'system_prompt_mode',
+  'fresh_system_prompt',
   'message_archive_db',
   'claude_config_dir',
   'resume_enabled',
@@ -271,6 +272,13 @@ export interface ServerSettingsInput {
   append_system_prompt_file?: string
   cozempic_prescription?: string
   system_prompt_mode?: string
+  /**
+   * Whether bots launch with `--system-prompt-snapshot off`, so a resumed or
+   * restarted bot reloads the current system prompt file and `CLAUDE.md`
+   * (b.b1j SR-1). Absent means `true`; must be a boolean. Server-wide only: a
+   * persona entry cannot set it. A change takes effect at the next start.
+   */
+  fresh_system_prompt?: boolean
   /** Optional path to a SQLite DB where every inbound Slack message will be archived. */
   message_archive_db?: string
   /**
@@ -351,6 +359,11 @@ export interface ServerSettings {
   append_system_prompt_file?: string
   cozempic_prescription: string
   system_prompt_mode: string
+  /**
+   * Whether bots launch with `--system-prompt-snapshot off` (b.b1j SR-1).
+   * Defaults to true when absent; read by the template builder.
+   */
+  fresh_system_prompt: boolean
   /** Absolute path to SQLite archive DB. Undefined disables the feature. */
   message_archive_db?: string
   claude_config_dir?: string
@@ -603,6 +616,9 @@ function applyServerDefaults(input: ServerSettingsInput, configDir: string, cron
     append_system_prompt_file: input.append_system_prompt_file,
     cozempic_prescription: input.cozempic_prescription ?? 'standard',
     system_prompt_mode: input.system_prompt_mode ?? 'append',
+    // b.b1j SR-1: only an absent key takes the default: any other value,
+    // `null` included, is kept so the key's boolean rule rejects it.
+    fresh_system_prompt: input.fresh_system_prompt === undefined ? true : input.fresh_system_prompt,
     message_archive_db: input.message_archive_db,
     claude_config_dir: input.claude_config_dir,
     resume_enabled: input.resume_enabled ?? true,
@@ -1129,6 +1145,7 @@ function validatePersonaServerSettings(settings: PersonaServerSettings): void {
   validateServerTimingsAndModes(settings, style)
   checkOptionalNonEmptyString(settings.claude_config_dir, 'claude_config_dir', style)
   checkBoolean(settings.stop_hook_bootstrap, 'stop_hook_bootstrap', style)
+  checkBoolean(settings.fresh_system_prompt, 'fresh_system_prompt', style) // b.b1j SR-1
   validateServerPollAndCron(settings, style)
   checkOptionalNonEmptyString(settings.ack_reaction, 'ack_reaction', style)
   checkOptionalPositiveInteger(settings.reply_chunk_limit, 'reply_chunk_limit', style)

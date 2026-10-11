@@ -6250,6 +6250,15 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
     `[${MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, ${underscored(MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS)}]`,
     `(#${headingSlug(CALL_TIMEOUT_SIZING_HEADING.slice('#### '.length))})`,
   ]],
+
+  // The fresh system prompt switch, under "Configuration" (b.b1j SR-6.1, SR-5.6).
+  ['Server-wide settings: fresh_system_prompt, a boolean defaulting to true, the flag pair, the next-start rule, the Claude Code version and the new-conversation note', (readme) => readme.split('\n').find((line) => line.startsWith(`| ${code('fresh_system_prompt')} |`)) ?? '', [
+    `| boolean | ${code('true')} |`,
+    code('--system-prompt-snapshot off'),
+    ci('takes effect at the next server start'),
+    MIN_CLAUDE_CODE_VERSION,
+    ci('a change reaches a bot only when it next starts a new conversation'),
+  ]],
   [`call timeout: its default ${DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, its range, and the need: the largest ceiling CSCB calls plus the ${AD_CALL_TIMEOUT_NEED_MARGIN_MS / 1000n} s margin`, sectionOf('README.md', CALL_TIMEOUT_SIZING_HEADING), [
     `${code('agent_director_call_timeout_ms')} (default ${code(String(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS))}, an integer in ${code(`[${MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, ${underscored(MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS)}]`)}`,
     ci('the largest ceiling among the agent-director verbs CSCB calls'),

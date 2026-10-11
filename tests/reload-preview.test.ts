@@ -1321,6 +1321,7 @@ describe('server-wide settings', () => {
     ['append_system_prompt_file', () => join(root, 'prompt.md')],
     ['cozempic_prescription', () => 'gentle'],
     ['system_prompt_mode', () => 'none'],
+    ['fresh_system_prompt', () => false], // b.b1j SR-3
     ['message_archive_db', () => join(root, 'archive.db')],
     ['resume_enabled', () => false],
     ['agent_director_poll_interval_ms', () => 2000],

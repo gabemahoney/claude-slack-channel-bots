@@ -406,6 +406,8 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         WHERE.entry,
         true,
       ],
+      // Server-wide only (b.b1j SR-1): a persona entry cannot set it, even to a valid boolean.
+      ['persona entry server-wide fresh_system_prompt', persona({ fresh_system_prompt: true }), 'fresh_system_prompt', WHERE.entry, true],
       ['dm object', inDm({ relay: true }), 'relay', WHERE.dm, true],
       ['dm object bot_token', inDm({ bot_token: fakeToken(BOT_TOKEN_PREFIX, 'dm') }), 'bot_token', WHERE.dm, true],
       ['dm object app_token', inDm({ app_token: fakeToken(APP_TOKEN_PREFIX, 'dm') }), 'app_token', WHERE.dm, true],
@@ -1284,6 +1286,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         append_system_prompt_file: '~/prompt.md',
         cozempic_prescription: 'aggressive',
         system_prompt_mode: 'none',
+        fresh_system_prompt: false,
         message_archive_db: '~/archive.db',
         claude_config_dir: '~/cfg',
         resume_enabled: false,
@@ -1359,6 +1362,45 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       ['agent_director_poll_interval_ms', '1000', 'agent_director_poll_interval_ms'],
     ])('%s = %p is rejected, naming %s', (key, value, named) => {
       expect(loadError({ ...makePersonaConfigInput({}, dir), [key]: value })).toContain(named)
+    })
+
+    // b.b1j SR-1: fresh_system_prompt is a server-wide boolean; only an absent key takes the default.
+    describe('fresh_system_prompt (b.b1j SR-1)', () => {
+      const withFresh = (value: unknown) => ({ ...makePersonaConfigInput({}, dir), fresh_system_prompt: value })
+
+      test.each([
+        ['absent', undefined, true],
+        ['true', true, true],
+        ['false', false, false],
+      ] as const)('%s loads and resolves to %p (SR-1.1)', (_label, value, resolved) => {
+        const input = value === undefined ? makePersonaConfigInput({}, dir) : withFresh(value)
+        expect(load(input).fresh_system_prompt).toBe(resolved)
+      })
+
+      test('absent and true resolve to the same configuration (SR-1.1)', () => {
+        expect(load(makePersonaConfigInput({}, dir))).toStrictEqual(load(withFresh(true)))
+      })
+
+      // LEAK_SENTINEL and fake-token rows: loadError's assertNoLeak proves the value is never echoed.
+      const REJECTED: [string, unknown][] = [
+        ['a string', 'true'],
+        ['a number', 1],
+        ['null', null],
+        ['an object', { enabled: true }],
+        ['an array', [true]],
+        ['the leak sentinel as a string', LEAK_SENTINEL],
+        ['a fake token as a string', fakeToken(BOT_TOKEN_PREFIX, 'fresh')],
+        ['an object holding the leak sentinel', { value: LEAK_SENTINEL }],
+        ['an array holding the leak sentinel', [LEAK_SENTINEL]],
+      ]
+
+      // The same full message for every value: it names the setting, no persona, and never echoes the value (SR-1.2).
+      test.each(REJECTED)('%s is rejected with the full message, naming the setting and no persona (SR-1.2)', (_label, value) => {
+        expect(loadError(withFresh(value))).toBe(
+          `loadPersonaConfig: invalid persona config in "${join(dir, 'config.json')}": Persona config validation error: ` +
+            'fresh_system_prompt must be a boolean.',
+        )
+      })
     })
 
     // b.jg5 SRJ-213: the error names the setting and both bounds of its range,

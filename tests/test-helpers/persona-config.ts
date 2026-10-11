@@ -214,6 +214,7 @@ export function makePersonaConfig(overrides: Partial<PersonaConfig> = {}, baseDi
     mcp_config_path: join(baseDir, 'slack-mcp.json'),
     cozempic_prescription: 'standard',
     system_prompt_mode: 'append',
+    fresh_system_prompt: true,
     resume_enabled: true,
     stop_hook_bootstrap: true,
     agent_director_poll_interval_ms: DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS,

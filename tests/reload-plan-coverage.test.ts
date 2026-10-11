@@ -197,6 +197,7 @@ describe('every top-level key the loader accepts is compared', () => {
     append_system_prompt_file: join(root, 'prompt.md'),
     cozempic_prescription: 'gentle',
     system_prompt_mode: 'none',
+    fresh_system_prompt: false,
     message_archive_db: join(root, 'archive.db'),
     claude_config_dir: join(root, 'claude-default'),
     resume_enabled: false,
@@ -393,11 +394,13 @@ describe('a change of the switch alone modifies no persona, in each direction (b
   })
 })
 
-describe('writing false where the switch was absent is no effective change (b.deo SRI-101)', () => {
+describe('writing a key\'s default where it was absent (or removing it) is no effective change (b.deo SRI-101; b.b1j SR-1.1, SR-3)', () => {
   test.each<[string, Record<string, unknown>, Record<string, unknown>]>([
-    ['absent to false', {}, { [MODE_SWITCH_SETTING]: false }],
-    ['false to absent', { [MODE_SWITCH_SETTING]: false }, {}],
-  ])('the switch from %s changes no setting and no persona', (_label, from, to) => {
+    ['the switch, absent to false', {}, { [MODE_SWITCH_SETTING]: false }],
+    ['the switch, false to absent', { [MODE_SWITCH_SETTING]: false }, {}],
+    ['fresh_system_prompt, absent to true', {}, { fresh_system_prompt: true }],
+    ['fresh_system_prompt, true to absent', { fresh_system_prompt: true }, {}],
+  ])('%s changes no setting and no persona', (_label, from, to) => {
     expect(classesOf(planBetween(input(from), input(to)))).toEqual(classes({ unchanged: ['alpha'], noEffectiveChange: true }))
   })
 })
