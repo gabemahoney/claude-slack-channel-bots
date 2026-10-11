@@ -2588,7 +2588,7 @@ describe('referencedCredentialsPaths (b.av2 SR-8.3)', () => {
 // ---------------------------------------------------------------------------
 
 /** Environment variables this block changes; restored after every test. */
-const START_ENV_KEYS = ['SLACK_STATE_DIR'] as const
+const START_ENV_KEYS = ['SLACK_STATE_DIR', 'XDG_CONFIG_HOME'] as const
 
 /** Save the variables in `START_ENV_KEYS` and return a restore function. */
 function saveStartEnv(): () => void {
@@ -2629,12 +2629,24 @@ describe('resolveServerConfigPath / resolveServerStateDir (b.av2 SR-1.1)', () =>
     expect(path).toBe(join(process.cwd(), 'rel', 'state', 'config.json'))
   })
 
+  // Bug b.fc4: the default sits outside ~/.claude, where Claude Code asks before every write.
   test.each([
-    ['unset', {}],
-    ['empty', { SLACK_STATE_DIR: '' }],
-  ])('SLACK_STATE_DIR %s gives <home>/.claude/channels/slack/config.json under the injected home', (_label, env) => {
-    expect(resolveServerStateDir(home, env)).toBe(join(home, '.claude', 'channels', 'slack'))
-    expect(resolveServerConfigPath(home, env)).toBe(join(home, '.claude', 'channels', 'slack', 'config.json'))
+    ['SLACK_STATE_DIR unset', {}],
+    ['SLACK_STATE_DIR empty', { SLACK_STATE_DIR: '' }],
+  ])('%s gives <home>/.config/cscb/config.json under the injected home, outside ~/.claude', (_label, env) => {
+    expect(resolveServerStateDir(home, env)).toBe(join(home, '.config', 'cscb'))
+    expect(resolveServerConfigPath(home, env)).toBe(join(home, '.config', 'cscb', 'config.json'))
+    expect(resolveServerStateDir(home, env).startsWith(join(home, '.claude'))).toBe(false)
+  })
+
+  test.each<[string, NodeJS.ProcessEnv, string]>([
+    ['SLACK_STATE_DIR unset: an absolute XDG_CONFIG_HOME is honoured', { XDG_CONFIG_HOME: '/xdg/conf' }, '/xdg/conf/cscb'],
+    ['SLACK_STATE_DIR unset: an empty XDG_CONFIG_HOME is ignored', { XDG_CONFIG_HOME: '' }, '$HOME/.config/cscb'],
+    ['SLACK_STATE_DIR unset: a relative XDG_CONFIG_HOME is ignored', { XDG_CONFIG_HOME: 'rel/conf' }, '$HOME/.config/cscb'],
+    ['SLACK_STATE_DIR wins over XDG_CONFIG_HOME', { SLACK_STATE_DIR: '/srv/state', XDG_CONFIG_HOME: '/xdg/conf' }, '/srv/state'],
+  ])('%s', (_label, env, expected) => {
+    expect(resolveServerStateDir(home, env)).toBe(expected.replace('$HOME', home))
+    expect(resolveServerConfigPath(home, env)).toBe(join(expected.replace('$HOME', home), 'config.json'))
   })
 
   test('process.env is read at call time: changing SLACK_STATE_DIR between calls changes the result', () => {
@@ -2645,7 +2657,10 @@ describe('resolveServerConfigPath / resolveServerStateDir (b.av2 SR-1.1)', () =>
     process.env['SLACK_STATE_DIR'] = second
     expect(resolveServerConfigPath(home)).toBe(join(second, 'config.json'))
     delete process.env['SLACK_STATE_DIR']
-    expect(resolveServerConfigPath(home)).toBe(join(home, '.claude', 'channels', 'slack', 'config.json'))
+    delete process.env['XDG_CONFIG_HOME']
+    expect(resolveServerConfigPath(home)).toBe(join(home, '.config', 'cscb', 'config.json'))
+    process.env['XDG_CONFIG_HOME'] = join(dir, 'xdg')
+    expect(resolveServerConfigPath(home)).toBe(join(dir, 'xdg', 'cscb', 'config.json'))
   })
 })
 

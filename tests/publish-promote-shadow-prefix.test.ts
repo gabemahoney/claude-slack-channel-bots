@@ -49,6 +49,7 @@ import {
   realpathSync,
   symlinkSync,
   chmodSync,
+  existsSync,
 } from 'node:fs'
 import { join, resolve, dirname } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -132,6 +133,10 @@ let SR70: string
 let SR74: string
 let SR74_ARM: string
 let SR74B: string
+/** SR-7.4b's `resolve_state_dir` function (b.fc4): the state directory the CLI would use. */
+let RESOLVE_STATE_DIR: string
+/** SR-8.1, the daemon-bounce handoff, which reads the PID file in that state directory. */
+let SR81: string
 
 beforeAll(() => {
   const script = readPromote()
@@ -140,6 +145,8 @@ beforeAll(() => {
   SR74 = extractSection(script, /^# SR-7\.4 — /, /^INSTALLED_PKG_JSON=/)
   SR74_ARM = extractSection(script, /^case "\$\{RESOLVED_BIN\}" in/, /^INSTALLED_PKG_JSON=/)
   SR74B = extractSection(script, /^# SR-7\.4b — /, /^# SR-7\.5 — /)
+  RESOLVE_STATE_DIR = extractSection(script, /^resolve_state_dir\(\) \{/, /^SR74B_STATE_DIR=/)
+  SR81 = extractSection(script, /^# SR-8\.1 — /, /^# SR-9\.1 — /)
   // Sanity: we captured the pieces under test, not empty slices.
   expect(HELPERS).toContain('cscb_shadow_report()')
   expect(SR70).toContain('cscb_is_outside_prefix')
@@ -147,6 +154,8 @@ beforeAll(() => {
   expect(SR74).toContain(SR74_ARM)
   expect(SR74_ARM).toContain('sr_exit 72')
   expect(SR74B).toContain('trustedDependencies')
+  expect(SR74B).toContain(RESOLVE_STATE_DIR)
+  expect(SR81).toContain('DAEMON_PID_FILE')
 })
 
 // ---------------------------------------------------------------------------
@@ -651,8 +660,20 @@ interface Sr74bOpts {
   artifacts?: boolean | { config: boolean; mcp: boolean }
   /** Write a leftover file with this name into the state dir (not an artifact). */
   leftover?: string
-  /** Point SLACK_STATE_DIR at a temp state dir instead of ~/.claude/…/slack. */
+  /** Point SLACK_STATE_DIR at a temp state dir instead of the default (~/.config/cscb, bug b.fc4). */
   stateDirOverride?: boolean
+  /**
+   * Where the run's state dir is, with SLACK_STATE_DIR unset: `default` is
+   * ~/.config/cscb; `xdg` is $XDG_CONFIG_HOME/cscb for an absolute
+   * XDG_CONFIG_HOME; `legacy` is the old default, ~/.claude/channels/slack, a
+   * host whose server has not yet moved it. `stateDir` in the run is that
+   * directory (and `artifacts` are written there).
+   */
+  layout?: 'default' | 'xdg' | 'legacy'
+  /** Files written into the old default directory (a real directory) next to wherever `layout` puts the state dir; not for `layout: 'legacy'`. */
+  legacyFiles?: string[]
+  /** Make the old default name a symbolic link to the state dir (a host the daemon has already moved), creating the state dir. */
+  legacyLinkToStateDir?: boolean
   /** Exit code of the stub `bun`. */
   bunExit?: number
 }
@@ -686,9 +707,14 @@ function runSr74b(opts: Sr74bOpts = {}): Sr74bRun {
     )
   }
 
+  const xdgHome = join(home, 'xdg-config')
   const stateDir = opts.stateDirOverride
     ? join(home, 'state')
-    : join(home, '.claude/channels/slack')
+    : opts.layout === 'xdg'
+      ? join(xdgHome, 'cscb')
+      : opts.layout === 'legacy'
+        ? join(home, '.claude/channels/slack')
+        : join(home, '.config/cscb')
   const mcpConfig = join(home, '.claude/slack-mcp.json')
   const artifacts =
     typeof opts.artifacts === 'object'
@@ -705,6 +731,16 @@ function runSr74b(opts: Sr74bOpts = {}): Sr74bRun {
   if (opts.leftover) {
     mkdirSync(stateDir, { recursive: true })
     writeFileSync(join(stateDir, opts.leftover), '{}\n')
+  }
+  for (const name of opts.legacyFiles ?? []) {
+    const legacyDir = join(home, '.claude/channels/slack')
+    mkdirSync(legacyDir, { recursive: true })
+    writeFileSync(join(legacyDir, name), '{}\n')
+  }
+  if (opts.legacyLinkToStateDir) {
+    mkdirSync(stateDir, { recursive: true })
+    mkdirSync(join(home, '.claude/channels'), { recursive: true })
+    symlinkSync(stateDir, join(home, '.claude/channels/slack'))
   }
 
   const stubBin = join(home, 'stub-bin')
@@ -730,7 +766,10 @@ function runSr74b(opts: Sr74bOpts = {}): Sr74bRun {
   const r = runBash(harness, home, {
     tools: SR74B_TOOLS,
     pathDirs: [stubBin],
-    extras: opts.stateDirOverride ? { SLACK_STATE_DIR: stateDir } : {},
+    extras: {
+      ...(opts.stateDirOverride ? { SLACK_STATE_DIR: stateDir } : {}),
+      ...(opts.layout === 'xdg' ? { XDG_CONFIG_HOME: xdgHome } : {}),
+    },
   })
   const lines = readFileSync(log, 'utf-8').split('\n').filter(Boolean)
   return {
@@ -742,6 +781,92 @@ function runSr74b(opts: Sr74bOpts = {}): Sr74bRun {
     mcpConfig,
   }
 }
+
+/** SR-8.1's daemon-bounce handoff over a temp HOME with a PID file at `pidFile(home)` holding `pid` (none when undefined). */
+function runDaemonNote(opts: {
+  pidFile?: (home: string) => string
+  pid?: number
+  extras?: (home: string) => Record<string, string>
+  /** Further files to lay down in the temp HOME before the run. */
+  setup?: (home: string) => void
+}): RunResult & { home: string } {
+  const home = makeHome()
+  opts.setup?.(home)
+  if (opts.pidFile !== undefined && opts.pid !== undefined) {
+    mkdirSync(dirname(opts.pidFile(home)), { recursive: true })
+    writeFileSync(opts.pidFile(home), `${opts.pid}\n`)
+  }
+  const harness = ['set -euo pipefail', 'NEXT_VERSION=9.9.9', RESOLVE_STATE_DIR, SR81, 'exit 0'].join('\n')
+  const r = runBash(harness, home, { tools: ['bash', 'cat'], extras: opts.extras?.(home) ?? {} })
+  return { ...r, home }
+}
+
+describe('b.fc4: SR-8.1 reads the daemon PID file from the state dir the CLI would use', () => {
+  // A PID that is alive: this test process's own.
+  const ALIVE = process.pid
+  const NO_DAEMON = 'no daemon currently running'
+
+  test.each([
+    { where: 'the default, ~/.config/cscb', file: (home: string) => join(home, '.config/cscb/server.pid'), extras: () => ({}) },
+    { where: 'an absolute XDG_CONFIG_HOME', file: (home: string) => join(home, 'xdg-config/cscb/server.pid'), extras: (home: string) => ({ XDG_CONFIG_HOME: join(home, 'xdg-config') }) },
+    { where: 'SLACK_STATE_DIR', file: (home: string) => join(home, 'state/server.pid'), extras: (home: string) => ({ SLACK_STATE_DIR: join(home, 'state') }) },
+    { where: 'the old directory of a host not yet moved (a real directory holding the PID file)', file: (home: string) => join(home, '.claude/channels/slack/server.pid'), extras: () => ({}) },
+  ])('a live PID in $where: the daemon is reported running', ({ file, extras }) => {
+    const r = runDaemonNote({ pidFile: file, pid: ALIVE, extras })
+    expect(r.code).toBe(0)
+    expect(r.stderr).toContain(`the daemon at PID ${ALIVE} is still running`)
+    expect(r.stderr).not.toContain(NO_DAEMON)
+  })
+
+  test('no PID file: no daemon, and the line names the new default\'s PID file', () => {
+    const r = runDaemonNote({})
+    expect(r.stderr).toContain(NO_DAEMON)
+    expect(r.stderr).toContain(`PID file ${join(r.home, '.config/cscb/server.pid')} is missing`)
+  })
+
+  /** A PID no process holds: the first from the top of the usual range that `kill -0` reports as missing. */
+  function deadPid(): number {
+    for (let pid = 4_194_000; ; pid++) {
+      try {
+        process.kill(pid, 0)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ESRCH') return pid
+      }
+    }
+  }
+
+  const OLD_PID_FILE = (home: string) => join(home, '.claude/channels/slack/server.pid')
+  const NEW_HOLDS_CONFIG = (home: string) => {
+    mkdirSync(join(home, '.config/cscb'), { recursive: true })
+    writeFileSync(join(home, '.config/cscb/config.json'), '{}\n')
+  }
+
+  // The old server's PID file is where the CLI's `stop` looks whatever the new
+  // directory holds (resolveCliStateDir: a live PID in the old directory wins).
+  test('a live PID in the old directory is seen even when the new directory holds a config.json', () => {
+    const r = runDaemonNote({ pidFile: OLD_PID_FILE, pid: ALIVE, setup: NEW_HOLDS_CONFIG })
+    expect(r.stderr).toContain(`the daemon at PID ${ALIVE} is still running`)
+    expect(r.stderr).not.toContain(NO_DAEMON)
+  })
+
+  test('a dead PID in the old directory is not the daemon: with a config.json in the new directory, the new default is used', () => {
+    const r = runDaemonNote({ pidFile: OLD_PID_FILE, pid: deadPid(), setup: NEW_HOLDS_CONFIG })
+    expect(r.stderr).toContain(NO_DAEMON)
+    expect(r.stderr).toContain(`PID file ${join(r.home, '.config/cscb/server.pid')} is missing`)
+  })
+
+  test('a PID file in the old directory that is a symbolic link is not the daemon, whatever it points at', () => {
+    const r = runDaemonNote({
+      setup: (home) => {
+        NEW_HOLDS_CONFIG(home)
+        mkdirSync(join(home, '.claude/channels/slack'), { recursive: true })
+        writeFileSync(join(home, 'elsewhere.pid'), `${ALIVE}\n`)
+        symlinkSync(join(home, 'elsewhere.pid'), OLD_PID_FILE(home))
+      },
+    })
+    expect(r.stderr).toContain(NO_DAEMON)
+  })
+})
 
 describe('b.r6x: SR-7.4b closes the fresh-prefix postinstall trust gap', () => {
   test('a trusted manifest with config.json + MCP config present and no access.json runs no bun and warns nothing', () => {
@@ -819,8 +944,82 @@ describe('b.r6x: SR-7.4b closes the fresh-prefix postinstall trust gap', () => {
     expect(missing.code).toBe(0)
     expect(missing.stderr).toContain(join(missing.stateDir, 'config.json'))
     expect(missing.stderr).not.toContain('access.json')
-    // The default location is not consulted when the override is set.
+    // The default locations are not consulted when the override is set.
+    expect(missing.stderr).not.toContain(join(missing.home, '.config/cscb'))
     expect(missing.stderr).not.toContain(join(missing.home, '.claude/channels/slack'))
+  })
+
+  // b.fc4: the state dir is the CLI's choice (src/state-dir-migration.ts
+  // resolveCliStateDir): the new default, ~/.config/cscb, unless the old one
+  // is still a real directory holding config.json or server.pid while the new
+  // one holds no config.json (the promote runs before the daemon's first start
+  // on the new default has moved it).
+  test('the default state dir is ~/.config/cscb, under none of ~/.claude', () => {
+    const missing = runSr74b({ manifest: 'trusted', artifacts: { config: false, mcp: true } })
+    expect(missing.stateDir).toBe(join(missing.home, '.config/cscb'))
+    expect(missing.stderr).toContain(join(missing.home, '.config/cscb/config.json'))
+    expect(missing.stderr).not.toContain(join(missing.home, '.claude/channels/slack'))
+  })
+
+  test('an absolute XDG_CONFIG_HOME moves the default to $XDG_CONFIG_HOME/cscb', () => {
+    const present = runSr74b({ manifest: 'trusted', artifacts: true, layout: 'xdg' })
+    expect(present.stateDir).toBe(join(present.home, 'xdg-config/cscb'))
+    expect(present.stderr).toBe('')
+    const missing = runSr74b({ manifest: 'trusted', artifacts: { config: false, mcp: true }, layout: 'xdg' })
+    expect(missing.stderr).toContain(join(missing.stateDir, 'config.json'))
+    expect(missing.stderr).not.toContain(join(missing.home, '.config/cscb'))
+  })
+
+  test.each<{ why: string; files: string[]; warnsOld: boolean }>([
+    { why: 'config.json (a host not yet moved)', files: ['config.json'], warnsOld: false },
+    { why: 'only server.pid (a running old daemon)', files: ['server.pid'], warnsOld: true },
+    { why: 'only config.json.last-applied (the record of the last applied configuration)', files: ['config.json.last-applied'], warnsOld: true },
+  ])('a real old directory holding $why and a new directory with no config.json: the old one is looked at, and no ~/.config is made', ({ files, warnsOld }) => {
+    const r = runSr74b({ manifest: 'trusted', artifacts: { config: false, mcp: true }, legacyFiles: files })
+    expect(r.code).toBe(0)
+    // The old directory's config.json is the one looked for: present (silence) or named as missing.
+    expect(r.stderr.includes(join(r.home, '.claude/channels/slack/config.json'))).toBe(warnsOld)
+    expect(r.stderr === '').toBe(!warnsOld)
+    expect(r.stderr).not.toContain(join(r.home, '.config/cscb'))
+    expect(existsSync(join(r.home, '.config'))).toBe(false)
+  })
+
+  test('a new directory holding only config.json.last-applied is the new default, beside an old directory holding config.json', () => {
+    const r = runSr74b({
+      manifest: 'trusted',
+      artifacts: { config: false, mcp: true },
+      leftover: 'config.json.last-applied',
+      legacyFiles: ['config.json'],
+    })
+    expect(r.stderr).toContain(join(r.home, '.config/cscb/config.json'))
+    expect(r.stderr).not.toContain('.claude/channels/slack')
+  })
+
+  test('an old directory holding only a log is not used: the new default is looked at', () => {
+    const r = runSr74b({ manifest: 'trusted', artifacts: { config: false, mcp: true }, legacyFiles: ['server.log'] })
+    expect(r.stderr).toContain(join(r.home, '.config/cscb/config.json'))
+    expect(r.stderr).not.toContain('.claude/channels/slack')
+  })
+
+  test('a new directory holding config.json wins over an old directory holding a PID file', () => {
+    const r = runSr74b({ manifest: 'trusted', artifacts: true, legacyFiles: ['server.pid'] })
+    expect(r.code).toBe(0)
+    expect(r.stderr).toBe('')
+  })
+
+  // The new directory holds a PID file but no config.json, so a wrongly chosen
+  // old name (a directory through the link, holding that PID file) would be
+  // looked at instead and named in the warning.
+  test('the old directory as a symlink to the new one is not the old directory: the new one is looked at', () => {
+    const r = runSr74b({
+      manifest: 'trusted',
+      artifacts: { config: false, mcp: true },
+      leftover: 'server.pid',
+      legacyLinkToStateDir: true,
+    })
+    expect(r.code).toBe(0)
+    expect(r.stderr).toContain(join(r.stateDir, 'config.json'))
+    expect(r.stderr).not.toContain('.claude/channels/slack')
   })
 
   test('a failing `bun pm -g trust` is tolerated: still exit 0', () => {

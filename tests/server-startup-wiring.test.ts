@@ -1121,7 +1121,7 @@ describe('main() runs the agent-director startup gate before any other work, alw
     for (const at of later) expect(gateCall()).toBeLessThan(at)
   })
 
-  test('inside main(), only the state and inbox directory creations and the unhandledRejection handler install come before it', () => {
+  test('inside main(), only the state-directory migration and its stop, the state and inbox directory creations and the unhandledRejection handler install come before it', () => {
     const [mainStart] = mainBody(SERVER_CODE)
     // The gate statement starts at its `await`, or at a single
     // `const <name> = ` that binds the gate's result (E3 reads its `adVersion`
@@ -1133,10 +1133,30 @@ describe('main() runs the agent-director startup gate before any other work, alw
     // guarded install `if (!unhandledRejectionHandlerInstalled) { … }`.
     const cuts: Array<[number, number]> = []
     const dirs: string[] = []
+    // b.fc4: the state-directory migration statement and the `if` that stops
+    // the start when it could not make the move safe (pinned in full by the
+    // b.fc4 describe below).
+    const migrations = indicesOf(/\bconst\s+stateDirMigration\s*=\s*migrateStateDirAtStart\s*\(/g, before)
+    expect(migrations).toHaveLength(1)
+    const [migrationArgsStart, migrationArgsEnd] = balancedAfter(before, migrations[0]!, '(', ')')
+    expect(migrationArgsStart).toBeLessThan(migrationArgsEnd)
+    cuts.push([migrations[0]!, migrationArgsEnd + 1])
+    const stops = indicesOf(/\bif\s*\(\s*stateDirMigration\.paths\s*!==\s*undefined\b/g, before)
+    expect(stops).toHaveLength(1)
+    const [, stopEnd] = balancedAfter(before, stops[0]!, '{', '}')
+    cuts.push([stops[0]!, stopEnd + 1])
     for (const at of indicesOf(/\bmkdirSync\s*\(/g, before)) {
       const [argsStart, argsEnd] = balancedAfter(before, at, '(', ')')
       dirs.push(splitTopLevel(before.slice(argsStart, argsEnd))[0]!)
       cuts.push([at, argsEnd + 1])
+    }
+    // b.fc4: the migration's outcome kind and the one-line `if` that repoints
+    // the console redirect at the new directory's server.log (pinned below).
+    for (const statement of [/\bconst\s+migrationKind\s*=/g, /\bif\s*\(\s*migrationKind\b/g]) {
+      const found = indicesOf(statement, before)
+      expect(found).toHaveLength(1)
+      const lineEnd = before.indexOf('\n', found[0]!)
+      cuts.push([found[0]!, lineEnd < 0 ? before.length : lineEnd])
     }
     const guards = indicesOf(/\bif\s*\(\s*!\s*unhandledRejectionHandlerInstalled\s*\)\s*\{/g, before)
     expect(guards).toHaveLength(1)
@@ -1150,6 +1170,88 @@ describe('main() runs the agent-director startup gate before any other work, alw
       .sort((a, b) => b[0] - a[0])
       .reduce((text, [from, to]) => text.slice(0, from) + text.slice(to), before)
     expect(rest.replace(/[\s;]/g, '')).toBe('')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: the state-directory migration runs first (b.fc4)
+//
+// What the migration does with each state of the old and new directories is
+// driven through its real module in tests/state-dir-migration.test.ts. What
+// only server.ts holds is WHERE it runs: before the state directory is made
+// and so before anything reads or writes it, and what the start does when the
+// migration says it could not make the move safe.
+// ---------------------------------------------------------------------------
+
+describe('main() migrates the state directory before anything reads or writes it (b.fc4)', () => {
+  /** Offset of the only `migrateStateDirAtStart(` call; fails unless there is exactly one. */
+  const migrationCall = (): number => onlyCallOf('migrateStateDirAtStart')
+
+  test('imports migrateStateDirAtStart from the state-dir-migration module and calls it exactly once, in main()\'s own statement list', () => {
+    expect(importSource(SERVER_CODE, 'migrateStateDirAtStart')).toBe('./state-dir-migration.ts')
+    const statement = SERVER_CODE.slice(0, migrationCall()).search(/\bconst\s+[A-Za-z_$][\w$]*\s*=\s*$/)
+    expect(statement).toBeGreaterThanOrEqual(0)
+    expect(atMainTopLevel(SERVER_CODE, statement)).toBe(true)
+  })
+
+  test('it is the first statement of main()', () => {
+    const [mainStart] = mainBody(SERVER_CODE)
+    const statement = SERVER_CODE.slice(0, migrationCall()).search(/\bconst\s+[A-Za-z_$][\w$]*\s*=\s*$/)
+    expect(SERVER_CODE.slice(mainStart + 1, statement).trim()).toBe('')
+  })
+
+  test.each([
+    ['the state directory creation', 'mkdirSync'],
+    ['the PID check', 'checkPidConflict'],
+    ['the start resolution', 'resolveStart'],
+    ['the retired-key read', 'readRetiredKeysAtStart'],
+    ['the agent-director startup gate', 'runAgentDirectorStartupGate'],
+    ['the persona connection manager', 'createPersonaConnectionManager'],
+  ])('calls it BEFORE %s', (_label, anchor) => {
+    const later = callsOf(anchor).filter((at) => insideMain(at))
+    expect(later.length).toBeGreaterThan(0)
+    for (const at of later) expect(migrationCall()).toBeLessThan(at)
+  })
+
+  test('the stop records the migration\'s error class and message in the OLD directory\'s startup-errors.log, then exits 1 (no state-directory file is touched first)', () => {
+    const ifAt = indicesOf(/\bif\s*\(\s*stateDirMigration\.paths\s*!==\s*undefined\b/g, SERVER_CODE)
+    expect(ifAt).toHaveLength(1)
+    expect(ifAt[0]!).toBeGreaterThan(migrationCall())
+    const [headStart, headEnd] = balancedAfter(SERVER_CODE, ifAt[0]!, '(', ')')
+    expect(SERVER_CODE.slice(headStart, headEnd).replace(/\s+/g, ' ')).toContain('stateDirMigrationStopsStart(stateDirMigration.outcome)')
+    const [bodyStart, bodyEnd] = balancedAfter(SERVER_CODE, headEnd, '{', '}')
+    const body = SERVER_CODE.slice(bodyStart, bodyEnd)
+    const record = indicesOf(/\brecordStartupError\s*\(/g, body)
+    expect(record).toHaveLength(1)
+    const args = splitTopLevel(onlyCallArguments(body, 'recordStartupError'))
+    expect(args[0]).toBe('STATE_MIGRATE_STARTUP_ERROR_CLASS')
+    expect(args[1]).toBe('stateDirStopMessage(stateDirMigration.paths, stateDirMigration.outcome)')
+    expect(args[3]!.replace(/\s+/g, ' ')).toBe('{ logDir: stateDirMigration.paths.legacyDir }')
+    const exits = indicesOf(/\bprocess\.exit\s*\(\s*1\s*\)/g, body)
+    expect(exits).toHaveLength(1)
+    expect(record[0]!).toBeLessThan(exits[0]!)
+    // Nothing else runs in the stop.
+    expect(indicesOf(/\bmkdirSync\s*\(/g, body)).toEqual([])
+  })
+
+  // The daemon's console redirect starts at the path the CLI chose before the
+  // move, in the old directory (src/logging.ts repointLogging says what the
+  // redirect does); only main() knows when the move has happened.
+  test('after the state directory is made, the console redirect is repointed to the new directory\'s server.log, for a moved or pending outcome only', () => {
+    expect(importSource(SERVER_CODE, 'repointLogging')).toBe('./logging.ts')
+    const call = onlyCallOf('repointLogging')
+    expect(insideMain(call)).toBe(true)
+    const stateDirMade = indicesOf(/\bmkdirSync\s*\(\s*STATE_DIR\b/g, SERVER_CODE)
+    expect(stateDirMade).toHaveLength(1)
+    expect(stateDirMade[0]!).toBeLessThan(call)
+    expect(call).toBeGreaterThan(migrationCall())
+    expect(onlyCallArguments(SERVER_CODE, 'repointLogging').replace(/\s+/g, ' ')).toBe("join(STATE_DIR, 'server.log')")
+    // The kind it reads is the migration's own, and the call is the body of a
+    // one-line `if` on those two kinds and no other.
+    expect(SERVER_CODE).toMatch(/\bconst\s+migrationKind\s*=\s*stateDirMigration\.outcome\.kind\b/)
+    const guard = SERVER_CODE.slice(0, call).match(/\bif\s*\(([^)]*)\)\s*$/)
+    expect(guard).not.toBeNull()
+    expect(guard![1]!.replace(/\s+/g, ' ').trim()).toBe("migrationKind === 'moved' || migrationKind === 'pending'")
   })
 })
 

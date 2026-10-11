@@ -158,6 +158,8 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/pending-row\.ts$/, "the pending-row rule, whose round, gate and failure lines quote the lap's and the bypassing run's agent-director outcomes (described, redacted) and whose lap Enter outcomes keep the thrown agent-director error raw"],
   [/^src\/persona-routing\.ts$/, "the persona routing, which receives a persona's Slack events, archives through its client and logs Slack failure text and its lost-message row read's agent-director failure text (described, redacted)"],
   [/^src\/clear-latch\.ts$/, "the clear-latch route and the server.port record, whose clear-failed line carries a clear by hand's rejection (described, redacted), which can be agent-director failure text"],
+  // b.fc4: the state directory move walks the directory that holds the credentials files and the config, and logs paths and errors.
+  [/^src\/state-dir-migration\.ts$/, "the state directory move, which compares and moves the files of the state directory (the credentials files among them) and logs only their names and errors"],
   // b.deo SRI-907: the stored-choice file holds the credentials file's path, never its content.
   [/^src\/channel-delivery\.ts$/, "the stored-choice store, which records each persona's declaration, a credentials file's path among them, and logs its read and write failures"],
 ]

@@ -400,8 +400,8 @@ import {
 // ---------------------------------------------------------------------------
 
 describe('assertSendable', () => {
-  const stateDir = '/home/user/.claude/channels/slack'
-  const inboxDir = '/home/user/.claude/channels/slack/inbox'
+  const stateDir = '/home/user/.config/cscb'
+  const inboxDir = '/home/user/.config/cscb/inbox'
 
   test('blocks .env in state dir', () => {
     expect(() => assertSendable(`${stateDir}/.env`, stateDir, inboxDir, [])).toThrow('Blocked')

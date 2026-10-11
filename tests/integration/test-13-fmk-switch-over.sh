@@ -21,8 +21,9 @@
 #   (the image's tarball), never swapped. Its CLI there is the old CLI; the
 #   CLI the build under test later has at the same path is the new one.
 # - Its pre-persona config.json (two routed channels) sits in the state
-#   directory both packages read by default, $HOME/.claude/channels/slack
-#   (exported as SLACK_STATE_DIR), with the host's other files the runbook
+#   directory both packages read because SLACK_STATE_DIR names it,
+#   $HOME/.config/cscb (the build under test's default since b.fc4; the old
+#   package's own default is $HOME/.claude/channels/slack), with the host's other files the runbook
 #   names: a crontable targeting channels, an `/interject` caller file naming
 #   channels, access.json, and the Slack token variables (fake tokens, from
 #   `fake_token`, in a file never sourced). These are fixtures (ruling Q13).
@@ -413,8 +414,10 @@ STAGED_PKG="${STAGING_DIR}/package"
 # the installed one from step 8.
 RUNBOOK_PKG="${STAGED_PKG}"
 
-# The state directory both packages read by default.
-STATE_DIR="${HOME}/.claude/channels/slack"
+# The state directory both packages read because SLACK_STATE_DIR names it: the
+# build under test's default since b.fc4, not the old package's (that one is
+# ~/.claude/channels/slack).
+STATE_DIR="${HOME}/.config/cscb"
 
 # The routed channels, their Slack names (the old package reads them from
 # Slack, never from config.json) and the persona each becomes.

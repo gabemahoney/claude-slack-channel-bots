@@ -11,7 +11,7 @@
  *
  * Side-effect-free (b.av2 SR-13.1): importing it touches nothing. Every path
  * comes from the caller's `stateDir` (b.av2 SR-13.2); nothing here reads the
- * environment, the real HOME or `~/.claude/channels/slack`. A key outside
+ * environment, the real HOME or the real state directory. A key outside
  * `PERSONA_KEY_RE` is refused before any filesystem call, so a record path
  * can never leave the record directory.
  *

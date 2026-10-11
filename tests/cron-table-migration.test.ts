@@ -122,7 +122,7 @@ import {
   type CronTableMigrationOutcome,
   type CronTablePaths,
 } from '../src/cron-table-migration.ts'
-import { legacyCronTablePath, resolveDefaultCronTablePath, resolvePersonaConfig } from '../src/config.ts'
+import { legacyCronTablePath, resolveDefaultCronTablePath, resolvePersonaConfig, resolveServerConfigPath } from '../src/config.ts'
 import { CRONTABLE_TEMPLATE_HEADER, ensureCrontableExists } from '../src/cron-bootstrap.ts'
 import { resolvePromptPath, type CronDispatcher } from '../src/cron-dispatch.ts'
 import { createCronLog } from '../src/cron-log.ts'
@@ -160,6 +160,9 @@ let lines: string[]
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'cron-table-migration-test-'))
   home = join(root, 'home')
+  // The pre-b.fc4 state directory, so the legacy path and the default's path differ
+  // and the move is exercised. With the b.fc4 default state directory they are one
+  // path and the preparation is dormant: see 'the default state directory' below.
   configDir = join(home, '.claude', 'channels', 'slack')
   mkdirSync(configDir, { recursive: true })
   legacyPath = legacyCronTablePath(configDir)
@@ -226,6 +229,13 @@ function refuseLegacyLink(code: string): Pick<CronTableMigrationFs, 'link'> {
   }
 }
 
+/** Write `crontab` with `LEGACY_BYTES` into `dir`; returns its path. */
+function writeCrontabAt(dir: string): string {
+  const path = join(dir, 'crontab')
+  writeFileSync(path, LEGACY_BYTES)
+  return path
+}
+
 /** Write the legacy crontable with `LEGACY_BYTES` and mode 0640; returns its inode. */
 function writeLegacy(bytes: Buffer = LEGACY_BYTES): number {
   writeFileSync(legacyPath, bytes)
@@ -280,7 +290,7 @@ function expectNothingPlaced(): void {
 // ---------------------------------------------------------------------------
 
 describe('prepareDefaultCronTable: only a default the loader filled in is prepared', () => {
-  test('cron_table_path left out: the paths main() builds from the loader are the default, flagged as filled in', () => {
+  test('cron_table_path left out: the loader fills in the default, flagged as filled in', () => {
     expect(pathsFromLoader({})).toEqual(pathsWith())
     expect(pathsFromLoader({ cron_table_path: null })).toEqual(pathsWith())
   })
@@ -307,6 +317,36 @@ describe('prepareDefaultCronTable: only a default the loader filled in is prepar
     expect(existsSync(join(home, 'mine'))).toBe(false)
     expectLegacyUntouched(inode)
     expect(treeSnapshot(home, { extended: true })).toEqual(before)
+    expect(lines).toEqual([])
+    expect(cronTablePathForStart(paths, outcome)).toBe(paths.inEffect)
+  })
+
+  // b.fc4: a default install's state directory is the crontable's default folder,
+  // so main() builds paths whose legacy and default are one file.
+  test.each<[string, () => NodeJS.ProcessEnv]>([
+    ['the default, ~/.config/cscb', () => ({})],
+    ['an absolute XDG_CONFIG_HOME', () => ({ XDG_CONFIG_HOME: join(root, 'xdg-config') })],
+  ])('the default state directory (%s): the default is the legacy path, and nothing is made, moved or logged', (_label, makeEnv) => {
+    const env = makeEnv()
+    const stateDir = dirname(resolveServerConfigPath(home, env))
+    mkdirSync(stateDir, { recursive: true })
+    const inode = statSync(writeCrontabAt(stateDir)).ino
+    const config = resolvePersonaConfig({ ...makePersonaConfigInput({}, root) }, stateDir, home, { env })
+    const paths: CronTablePaths = {
+      inEffect: config.cron_table_path,
+      defaulted: config.cron_table_path_defaulted === true,
+      defaultPath: resolveDefaultCronTablePath(stateDir, home, env),
+      legacyPath: legacyCronTablePath(stateDir),
+    }
+    expect(paths.defaultPath).toBe(paths.legacyPath)
+    expect(paths.defaultPath).toBe(join(stateDir, 'crontab'))
+    const before = treeSnapshot(root, { extended: true })
+
+    const outcome = prepare(undefined, paths)
+
+    expect(outcome).toEqual({ kind: 'legacy-is-default' })
+    expect(statSync(paths.legacyPath).ino).toBe(inode)
+    expect(treeSnapshot(root, { extended: true })).toEqual(before)
     expect(lines).toEqual([])
     expect(cronTablePathForStart(paths, outcome)).toBe(paths.inEffect)
   })

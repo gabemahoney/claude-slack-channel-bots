@@ -61,11 +61,12 @@ export const CONFIG_FILE_NAME = 'config.json'
 
 /**
  * The XDG Base Directory variable naming the user's configuration directory
- * (`~/.config` when unset). The default crontable sits under it (bug b.avm).
+ * (`~/.config` when unset). The default state directory, and with it the
+ * default crontable, sits under it (bugs b.fc4, b.avm).
  */
 export const XDG_CONFIG_HOME_ENV = 'XDG_CONFIG_HOME'
 
-/** CSCB's own directory under the XDG configuration directory (bug b.avm). */
+/** CSCB's own directory under the XDG configuration directory: the default state directory (bugs b.fc4, b.avm). */
 export const CSCB_XDG_DIR_NAME = 'cscb'
 
 /** The crontable's file name, in its default directory and beside `config.json` alike. */
@@ -389,7 +390,8 @@ export interface ServerSettings {
    * `null`), so `cron_table_path` holds the default the loader filled in
    * (bug b.avm). Not a configuration key: the loader sets it, true or false,
    * on every configuration it resolves. The start's crontable preparation
-   * (`prepareDefaultCronTable`, cron-table-migration.ts) acts only when it is
+   * (`prepareDefaultCronTable`, cron-table-migration.ts; since b.fc4 the
+   * default is the legacy path for every install, so it is dormant) acts only when it is
    * true, so a `cron_table_path` the operator wrote, even one naming the
    * default's file, is never prepared or moved (D-Q1). Absent (a
    * configuration built by hand) reads as false.
@@ -1822,21 +1824,36 @@ export function resolvePersonaConfig(
 // ---------------------------------------------------------------------------
 
 /**
- * The server's state directory: `SLACK_STATE_DIR` (made absolute) when it is
- * set and non-empty, otherwise `<home>/.claude/channels/slack`. The variable
- * and the home directory are read at call time, never at import.
+ * The server's state directory, the one definition of the default (bug
+ * b.fc4): `SLACK_STATE_DIR` (made absolute) when it is set and non-empty,
+ * otherwise `<XDG config dir>/cscb` (`resolveXdgConfigHome`), so
+ * `~/.config/cscb` unless `XDG_CONFIG_HOME` names another directory.
+ * `config.json`, its `.pending`, `.apply` and `.last-applied` files,
+ * `channel-delivery.json`, the logs, the PID file and the crontable all live
+ * here. The default sits outside `~/.claude` because
+ * Claude Code asks the user before every write under `.claude`, which stalled
+ * every unattended configuration change by an agent. Every earlier release
+ * kept it in the `slack` directory under `~/.claude/channels`;
+ * `src/state-dir-migration.ts` moves an existing one at the server's start
+ * and leaves a symbolic link at the old name. The variable and the home
+ * directory are read at call time, never at import.
+ *
+ * Pure: touches no file. A command that runs before the server's first start
+ * on the new default must not use it as is (it would find an empty folder
+ * while the real configuration is still in the old directory); those use
+ * `resolveCliStateDir` in `src/state-dir-migration.ts`.
  *
  * @param home  Home directory; defaults to the OS home, read only when needed.
- * @param env   Environment to read `SLACK_STATE_DIR` from; defaults to `process.env`.
+ * @param env   Environment to read `SLACK_STATE_DIR` and `XDG_CONFIG_HOME` from; defaults to `process.env`.
  */
 export function resolveServerStateDir(home?: string, env: NodeJS.ProcessEnv = process.env): string {
   const fromEnv = env[STATE_DIR_ENV]
   if (fromEnv) return resolve(fromEnv)
-  return join(home ?? homedir(), '.claude', 'channels', 'slack')
+  return join(resolveXdgConfigHome(home, env), CSCB_XDG_DIR_NAME)
 }
 
 /** Whether `SLACK_STATE_DIR` moves the state directory: set and non-empty, as `resolveServerStateDir` reads it. */
-function isStateDirOverridden(env: NodeJS.ProcessEnv): boolean {
+export function isStateDirOverridden(env: NodeJS.ProcessEnv = process.env): boolean {
   return Boolean(env[STATE_DIR_ENV])
 }
 
@@ -1856,9 +1873,13 @@ export function resolveXdgConfigHome(home?: string, env: NodeJS.ProcessEnv = pro
 
 /**
  * The crontable's pre-b.avm default: `crontab` beside the loaded
- * `config.json`, so under `~/.claude/channels/slack/` for a default install.
- * The start's migration moves a crontable found here to the new default
- * (`src/cron-table-migration.ts`).
+ * `config.json`, in the state directory. Before b.fc4 a default install's
+ * state directory was under `~/.claude`, so this was the path b.avm's
+ * migration (`src/cron-table-migration.ts`) moved a crontable away from. Now
+ * the default state directory is the crontable's default folder too, so for a
+ * default install the two are one path, and the state directory's own
+ * migration (`src/state-dir-migration.ts`) moves the legacy crontable with
+ * the rest of the old directory.
  *
  * @param configDir  Directory of the configuration file.
  */
@@ -1867,21 +1888,19 @@ export function legacyCronTablePath(configDir: string): string {
 }
 
 /**
- * The crontable's default path, used when `cron_table_path` is absent (bug
- * b.avm). The one definition of the default: the loader and the start's
+ * The crontable's default path, used when `cron_table_path` is absent (bugs
+ * b.avm, b.fc4). The one definition of the default: the loader and the start's
  * migration both use it.
  *
- * - `SLACK_STATE_DIR` unset (a default install, whose state directory is
- *   under `~/.claude`): `<XDG config dir>/cscb/crontab`
+ * - `SLACK_STATE_DIR` unset (a default install): `<XDG config dir>/cscb/crontab`
  *   (`resolveXdgConfigHome`), so `~/.config/cscb/crontab` unless
- *   `XDG_CONFIG_HOME` names another directory. Bots edit the crontable
- *   often, and Claude Code asks the user before every write under
- *   `.claude`, so the default sits outside it.
+ *   `XDG_CONFIG_HOME` names another directory: the default state directory
+ *   (`resolveServerStateDir`), outside `~/.claude`, which Claude Code asks
+ *   the user about before every write.
  * - `SLACK_STATE_DIR` set: `<config dir>/crontab`
- *   (`legacyCronTablePath`), as before. The variable already moves the
- *   state out of `~/.claude`, and it isolates an install (a second server,
- *   a test or CI run), so its schedules stay with the rest of its state and
- *   never share the per-user default.
+ *   (`legacyCronTablePath`), as before. The variable isolates an install (a
+ *   second server, a test or CI run), so its schedules stay with the rest of
+ *   its state and never share the per-user default.
  *
  * Touches no file; reads `process.env` only when `env` is absent and the OS
  * home only when `home` is absent and needed.
@@ -1897,13 +1916,13 @@ export function resolveDefaultCronTablePath(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
   if (isStateDirOverridden(env)) return legacyCronTablePath(configDir)
-  return resolve(resolveXdgConfigHome(home, env), CSCB_XDG_DIR_NAME, CRON_TABLE_FILE_NAME)
+  return resolve(resolveServerStateDir(home, env), CRON_TABLE_FILE_NAME)
 }
 
 /**
  * The configuration file the server loads (b.av2 SR-1.1): `config.json` in
  * the state directory (`resolveServerStateDir`). With `SLACK_STATE_DIR` unset
- * this is `~/.claude/channels/slack/config.json`. The one definition of the
+ * this is `~/.config/cscb/config.json`. The one definition of the
  * location: the server and the CLI both use it. Computed at call time.
  *
  * @param home  Home directory; defaults to the OS home, read only when needed.

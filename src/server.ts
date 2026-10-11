@@ -387,6 +387,13 @@ import {
 } from './clear-latch.ts'
 import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
 import { cronTablePathForStart, prepareDefaultCronTable, type CronTablePaths } from './cron-table-migration.ts'
+import { repointLogging } from './logging.ts'
+import {
+  migrateStateDirAtStart,
+  STATE_MIGRATE_STARTUP_ERROR_CLASS,
+  stateDirMigrationStopsStart,
+  stateDirStopMessage,
+} from './state-dir-migration.ts'
 import { configInEffect, createReloadController, reloadFilePaths, type ReloadController } from './reload.ts'
 import {
   channelDeliveryDeclarationOf,
@@ -3258,10 +3265,44 @@ async function escalateRowWithNoPane(
 // ---------------------------------------------------------------------------
 
 export async function main(): Promise<void> {
+  // Bug b.fc4: the state directory's default sits outside ~/.claude
+  // ($XDG_CONFIG_HOME/cscb, ~/.config/cscb), where Claude Code does not ask
+  // before a write. On an existing host the old default's files move there,
+  // and the old directory becomes a symbolic link to the new one
+  // (state-dir-migration.ts says what happens to each entry, and why it is
+  // not done by the CLI or postinstall). First of all: before the directory
+  // is made, and so before anything reads or writes it (the PID check, the
+  // retired keys, the last-applied record, config.json, channel-delivery.json,
+  // the logs, the permission trail). With SLACK_STATE_DIR set it does nothing.
+  // It never throws; a start it cannot make safe (an old server still running
+  // on the old directory, a step that failed) stops here with the reason in
+  // startup-errors.log (written to the old directory, where an operator of
+  // the old release looks) and on stderr, and moves nothing it has not placed.
+  const stateDirMigration = migrateStateDirAtStart({ log: (line) => console.error(line) })
+  if (stateDirMigration.paths !== undefined && stateDirMigrationStopsStart(stateDirMigration.outcome)) {
+    recordStartupError(
+      STATE_MIGRATE_STARTUP_ERROR_CLASS,
+      stateDirStopMessage(stateDirMigration.paths, stateDirMigration.outcome),
+      undefined,
+      { logDir: stateDirMigration.paths.legacyDir },
+    )
+    process.exit(1)
+  }
+
   // The state and inbox directories, before any file in the state directory
   // is read or written (nothing is created at import).
   mkdirSync(STATE_DIR, { recursive: true })
   mkdirSync(INBOX_DIR, { recursive: true })
+
+  // The CLI's daemon redirected the console to the server log at the path it
+  // chose before this move: in the old directory. After a move that is a name
+  // in the old directory (a link, per file while the move is pending), and a
+  // rotation would rename the link and reopen a file there. Log to the new
+  // directory's file from here on (the same file). Where nothing moved, or the
+  // old directory is not ours to move (legacy-unusable), the log stays where
+  // the CLI reads a startup failure from.
+  const migrationKind = stateDirMigration.outcome.kind
+  if (migrationKind === 'moved' || migrationKind === 'pending') repointLogging(join(STATE_DIR, 'server.log'))
 
   // b.av2 SR-3.3: one persona's stray rejection must not take the process
   // down. Installed once, before any persona connects; never at import.
@@ -3515,7 +3556,13 @@ export async function main(): Promise<void> {
     { log: (line) => console.error(line) },
   )
 
-  // Bug b.avm: the crontable's default sits outside ~/.claude
+  // Bug b.avm (dormant since b.fc4: the state directory, and with it the
+  // crontable's default, now sits outside ~/.claude, and the state directory's
+  // move above carried the old crontable and prompts/ along, so the default
+  // and the legacy path are one path and `prepareDefaultCronTable` answers
+  // 'legacy-is-default'; kept for a configuration that moves the state
+  // directory with SLACK_STATE_DIR, where it does the same: nothing). The
+  // crontable's default sits outside ~/.claude
   // ($XDG_CONFIG_HOME/cscb/crontab when SLACK_STATE_DIR is unset). When the
   // start-time configuration left cron_table_path out (the loader's
   // cron_table_path_defaulted; a path the operator wrote, even the default's,

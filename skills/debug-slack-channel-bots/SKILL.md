@@ -19,8 +19,8 @@ reason the last-applied record (`config.json.last-applied`) stops a start,
 how to read and confirm a pending configuration change
 (`config.json.pending`), both channel modes (declarative and fungible, set by
 `allow_invited_channels`), the stored-choice file
-(`channel-delivery.json`), and where the crontable is and how a start moves
-it out of `~/.claude`.
+(`channel-delivery.json`), where the state directory is and how a start moves
+it out of `~/.claude`, and where the crontable is.
 
 One broken persona never stops the server. Every healthy persona keeps serving,
 and nothing about a broken persona is posted to Slack under any identity. The
@@ -71,6 +71,11 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
 - NEVER edit, write or delete the stored-choice file `channel-delivery.json`,
   and move it aside only on the operator's say-so (see
   [The stored-choice file: `channel-delivery.json`](#the-stored-choice-file-channel-deliveryjson)).
+- NEVER move, delete, relink or rewrite the state directory, its old
+  location `~/.claude/channels/slack` or the symbolic link that may stand
+  there, or anything in them a `state-migrate:` line names, without the
+  operator's say-so. Reading and listing them is fine (see
+  [The state directory's location and its move at start](#the-state-directorys-location-and-its-move-at-start)).
 - NEVER move, delete, relink or rewrite a crontable or its `prompts`
   directory, at its location or at the old path beside `config.json`, without
   the operator's say-so. Reading and listing them is fine (see
@@ -276,6 +281,11 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
     `cron_log_max_bytes`, the server writes to that file until the server
     restarts. Don't rotate the cron log yourself; set `cron_log_max_bytes`
     instead.
+15. **`start` refuses after an upgrade, with a `state-migrate:` line or a
+    `state-dir-migration` entry in `startup-errors.log`? The files are not
+    where you expect, or `~/.claude/channels/slack` is now a symbolic
+    link?** See
+    [The state directory's location and its move at start](#the-state-directorys-location-and-its-move-at-start).
 
 ---
 
@@ -283,11 +293,14 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
 
 The server writes everything, persona diagnostics included, to `server.log` in
 its state directory: `$SLACK_STATE_DIR` when the server was started with it
-set, otherwise `~/.claude/channels/slack/`. Use the state directory the server
-was started with, which may differ from your shell's.
+set, otherwise `~/.config/cscb/` (`$XDG_CONFIG_HOME/cscb/` when the server's
+`XDG_CONFIG_HOME` is an absolute path). Use the state directory the server
+was started with, which may differ from your shell's. Releases up to 0.14.0
+kept it in `~/.claude/channels/slack`; see
+[The state directory's location and its move at start](#the-state-directorys-location-and-its-move-at-start).
 
 ```sh
-STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
 ls -l "$STATE"/server.log*
 ```
 
@@ -332,7 +345,11 @@ ls -l "$STATE"/server.log*
 - **`startup-errors.log`** in the same directory is a separate file, never
   rotated by CSCB. Most entries are written at start: the agent-director
   startup gate, the retired-key record's refusal
-  (`retired-keys-unreadable`) and a few start-time warnings. Some are written while the
+  (`retired-keys-unreadable`), the state directory migration's stop
+  (`state-dir-migration`, the one class written to the **old** directory's
+  `startup-errors.log`; see
+  [The state directory's location and its move at start](#the-state-directorys-location-and-its-move-at-start))
+  and a few start-time warnings. Some are written while the
   server runs: the runtime version re-check's stop (see
   [Found while the server was running](#found-while-the-server-was-running))
   and `persona-unclassified-error`, the *Unclassified agent-director error*
@@ -1384,7 +1401,7 @@ conversations. Work it out from two things.
 read the switch there (the record holds no token):
 
 ```sh
-STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
 grep -F '"allow_invited_channels"' "$STATE/config.json.last-applied"
 ```
 
@@ -1919,7 +1936,7 @@ persona that sees the post.
 The lines:
 
 ```sh
-grep -E 'pending-row: ("[^"]*" \(key=<key>\)|persona=<key> )|pendingRowRule: lap Enter .*\(key=<key>\)|the pending-row rule for "[^"]*" \(key=<key>\)|(Deferring persona|Pending deferral for persona)=<key>(: at this retry| read its row)|pendingRowRule stuck-launch abort: .*cscb_<key>|stopping the approver for "[^"]*" \(key=<key>\) \(stuck-launch-abort\)' ~/.claude/channels/slack/server.log
+grep -E 'pending-row: ("[^"]*" \(key=<key>\)|persona=<key> )|pendingRowRule: lap Enter .*\(key=<key>\)|the pending-row rule for "[^"]*" \(key=<key>\)|(Deferring persona|Pending deferral for persona)=<key>(: at this retry| read its row)|pendingRowRule stuck-launch abort: .*cscb_<key>|stopping the approver for "[^"]*" \(key=<key>\) \(stuck-launch-abort\)' ~/.config/cscb/server.log
 ```
 
 | Line | Meaning | Cause and fix |
@@ -4376,7 +4393,7 @@ that begins during the start ends it early (see
 A start's clean-up lines and entries (read-only):
 
 ```sh
-STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
 grep -h 'reconcileOrphans: ' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
 grep -h -E '\[orphan-cleanup\]|\(start sweep\)' "$STATE/startup-errors.log"
 grep -h 'old-life hold: ' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
@@ -4496,7 +4513,7 @@ tracked, or when the old instance is its own earlier one.
 **Read-only checks.** Its lines, its entries and the old instance's row:
 
 ```sh
-STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
 grep -h -E 'old-life-wait|old-life hold: |\(old-life form\)' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
 grep -h -E '\(old-life wait\)|raised during its old-life wait|\[persona-unclassified-error\] (persona|instanceId)=' "$STATE/startup-errors.log"
 agent-director get --claude-instance-id <id>
@@ -4581,7 +4598,7 @@ the old instance has ended.
 [Listing instances](#listing-instances)):
 
 ```sh
-STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
 grep -h -E 'held for an old life|old-life hold: |old-life-wait|retrying now( \(pending-only\))? \(old-life-hold-ended\)' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
 agent-director get --claude-instance-id <id>
 ```
@@ -4939,7 +4956,7 @@ Either way the last line follows and the exit is 1.
 Read-only checks:
 
 ```sh
-STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
 grep -h -E 'could not stop persona|\(CLI teardown, ' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
 grep -h -E '\[(cli-teardown-failed|persona-kill-failed|persona-kill-survivor|clean-restart-not-restarted)\]' "$STATE"/startup-errors.log
 grep -h -E 'teardownBots|clean_restart' "$STATE"/clean_restart.log | tail -n 60
@@ -5576,7 +5593,7 @@ any more. Nothing in it is applied, and it never reaches Slack.
 Read it, and compare the edit with the applied configuration:
 
 ```sh
-STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
 cat "$STATE/config.json.pending"
 diff "$STATE/config.json.last-applied" "$STATE/config.json"
 ```
@@ -5714,7 +5731,7 @@ design; saving, restarting and rebooting apply nothing.
 3. With the operator's say-so, rename the preview:
 
    ```sh
-   STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+   STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
    mv "$STATE/config.json.pending" "$STATE/config.json.apply"
    ```
 
@@ -5924,7 +5941,7 @@ Then keep a copy of the record if it can be read, delete it and start. Keep
 the `.bak` copy until the new configuration runs as intended:
 
 ```sh
-STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
 cp "$STATE/config.json.last-applied" "$STATE/config.json.last-applied.bak"
 diff "$STATE/config.json.last-applied.bak" "$STATE/config.json"
 rm "$STATE/config.json.last-applied" &&
@@ -6389,7 +6406,7 @@ writes it; it is absent until a key is first recorded. Never edit it.
   aside and start:
 
   ```sh
-  STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+  STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
   mv "$STATE/retired-keys.json" "$STATE/retired-keys.json.moved-aside"
   ```
 
@@ -6432,7 +6449,7 @@ token, no credentials content and no message text.
 To see whether the file exists and what it holds (no token is in it):
 
 ```sh
-STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
 ls -l "$STATE/channel-delivery.json"
 cat "$STATE/channel-delivery.json"
 ```
@@ -6486,7 +6503,7 @@ cat "$STATE/channel-delivery.json"
   place:
 
   ```sh
-  STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+  STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
   mv "$STATE/channel-delivery.json" "$STATE/channel-delivery.json.moved-aside"
   ```
 
@@ -6599,6 +6616,79 @@ a refused choice left on disk.
 
 ---
 
+## The state directory's location and its move at start
+
+The state directory holds `config.json` and its reload files, `server.log`,
+`startup-errors.log`, `server.pid`, `channel-delivery.json`, the crontable
+and the rest. The server uses, in order:
+
+- `$SLACK_STATE_DIR`, when it is set and non-empty. A server started with it
+  uses that directory and moves nothing.
+- Otherwise `~/.config/cscb`, or `$XDG_CONFIG_HOME/cscb` when the server's
+  `XDG_CONFIG_HOME` is an absolute path (an empty or relative one is
+  ignored).
+
+Releases up to 0.14.0 kept it in `~/.claude/channels/slack`, where Claude Code
+asks the user before every write, so an agent's change to `config.json` stalled
+on a permission prompt. The first start of the current release moves it. With
+nothing at the new path, the old directory is renamed to it. With a new
+directory already there (a 0.14.0 host has one, for its crontable), each entry
+of the old directory moves into it unless the new one holds a different file of
+the same name: then the new one wins and the old one stays where it was. When
+everything has moved, `~/.claude/channels/slack` becomes a symbolic link to the
+new directory, so a bot started before the upgrade, a path in `config.json` or
+a script that still names the old directory reaches the same files. Nothing is
+overwritten. `SLACK_STATE_DIR` set means nothing moves.
+
+The commands `start`, `stop`, `clean_restart`, `credentials`, `clear-latch` and
+`postinstall` never move anything. Until the first start has moved the
+directory they use the old one in two cases: when `<old>/server.pid` is a
+regular file naming a running process, whatever the new directory holds (an
+agent may have written a `config.json` there since the upgrade, and `stop` must
+still reach the old server); and when the old name is a directory holding
+`config.json` (or a `server.pid`) and the new one holds no `config.json`. The
+old name may be a real directory or a link to another directory. Otherwise, and
+once the move is done, they use the new one.
+
+The start's log lines go to `server.log` in the new directory once the move
+(or a pending merge) has happened; before that, and when nothing moved, they go
+to the directory the command chose.
+
+Each step a start takes is one `[slack] state-migrate:` line in `server.log`,
+or one `[slack] Warning: state-migrate:` line when something is left for the
+operator. Two outcomes stop the start (exit 1): an old server still running
+on the old directory, and a step that failed. Each is printed, and recorded as
+a `state-dir-migration` entry in `startup-errors.log` in the **old**
+directory, where an operator of the old release looks. Nothing is lost when a
+start stops: what did not move is still in the old directory.
+
+Look, read-only, with the server's environment (it may differ from your
+shell's; with a relative `XDG_CONFIG_HOME`, use `$HOME/.config`):
+
+```sh
+NEW="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
+OLD="$HOME/.claude/channels/slack"
+ls -ld "$OLD" "$NEW" 2>&1
+grep -h -F 'state-migrate:' "$NEW"/server.log.* "$NEW"/server.log 2>/dev/null | sort
+grep -F 'state-dir-migration' "$OLD"/startup-errors.log 2>/dev/null | tail -n 5
+```
+
+After a move, `ls -ld` shows `$OLD` as `channels/slack -> <new path>`. If it
+shows a real directory next to a populated `$NEW`, a conflict or a failed step
+is left (the table below), or the old server is still running.
+
+| Line | Meaning | What to do |
+|---|---|---|
+| `[slack] state-migrate: moved the state directory from <old> to <new>, its new default location outside ~/.claude, where Claude Code does not ask before a write. <old> is now a symbolic link to it, …` | The start renamed the old directory to the new path whole. Later starts find the link and log nothing. | Nothing. |
+| `[slack] state-migrate: the state directory's new default location is <new>, outside ~/.claude, where Claude Code does not ask before a write; moved "<name>", … from <old>. <old> is now a symbolic link to <new>, …` (or `nothing needed to move`) | The new directory already existed (a 0.14.0 host), so the entries it lacked were moved in, and the old directory became a link. An entry the earlier release's cross-file-system fallback left as a link in `<new>` back to `<old>` (a `prompts/`, say) is moved over the link, not reported as a conflict. A link of the earlier release left in `<old>` that points at its own place in `<new>` (`crontab`, `prompts`, target since deleted) is dropped, not moved. | Nothing. |
+| `[slack] Warning: state-migrate: the state directory could not be moved completely from <old> to its new default location <new>: "<name>" exists both in <old> and in <new> with different contents. Using <new>'s; <old>'s is left untouched. …` | A conflict: both directories hold a file of that name with different contents, usually a `crontab` or `prompts/` edited at one and created at the other. The start runs on `<new>`. The old directory stays a real directory holding the conflicting entries, and every start logs this line until it is settled. | With the operator's say-so: compare the two (`diff "<old>/<name>" "<new>/<name>"`), copy anything still wanted into `<new>`, remove the entry from `<old>`, then remove `<old>` and run `ln -s "<new>" "<old>"`, or restart: the next start finishes the move. Until then a program that rewrites a file through `<old>` (temporary file plus rename) writes into the old directory. |
+| `[slack] Warning: state-migrate: the state directory could not be moved completely …: "<name>" could not be removed from <old>, or appeared in it during the move. …` | Everything is at `<new>`, but an entry could not be removed from `<old>` (permissions), or a file appeared there during the move. | With the operator's say-so: fix the cause or look at what appeared, then restart, or remove the leftovers and link `<old>` as the line says. |
+| `[slack] Warning: state-migrate: <old>, the state directory's old default location, is a symbolic link to <target>, not to <new>. To keep using <target>, set SLACK_STATE_DIR=<target>. …` | The operator's own arrangement: the old name already links to another directory. Nothing moved. (If `<target>/server.pid` names a live process, the start refuses with the running-server line below instead, and logs no warning.) The CLI's checks use `<old>` (so `<target>`) while it holds the configuration, but the server itself runs on `<new>` and, finding no `config.json` there, refuses with its own message. | Have the operator choose: `SLACK_STATE_DIR=<target>` in the server's environment to keep that directory, or move its files into `<new>`. |
+| `[slack] Warning: state-migrate: <old>, the state directory's old default location, is not a directory. Nothing was moved to <new>, …` | A file or another non-directory sits at the old path. Nothing moved, and the commands use `<new>`. | Have the operator look at what is at `<old>`. |
+| `[slack] state-migrate: a server is still running on the old state directory <old> (PID <pid>). … Stop that server (claude-slack-channel-bots stop), then start again.` | `<old>/server.pid` (through the link, when `<old>` links to another directory) names a live process: a server of the old release is running. The start refused (exit 1), because moving its files from under it would split its state, and the check for a second server would not see its PID file at `<new>`. | Run `claude-slack-channel-bots stop` (it finds the old directory), confirm the old server is gone, then `start`. With the operator's say-so only. |
+| `[slack] state-migrate: could not move the state directory from <old> to its new default location <new>: could not create <new> (<cause>)`, or `could not move "<name>" (<cause>)`, or `could not look at an entry (<cause>)`. `Nothing was lost: what did not move is still in <old>. …` | A step failed (permissions, a full disk, a read-only file system, a file in the way of `<new>`). The start refused (exit 1). Every step keeps the source until the destination is in place, so a start that stops is safe to repeat. | Have the operator fix the cause and start again, or set `SLACK_STATE_DIR=<old>` in the server's environment to keep the old location. The line also gives a hand-fix that depends on `<new>`. With `<new>` absent: `move it by hand (mv <old> <new> && ln -s <new> <old>)`. With `<new>` present: `move each entry still in <old> that is not in <new> by hand (mv <old>/<name> <new>/<name>)`, because `mv "<old>" "<new>"` onto an existing directory would put the old one inside it. |
+| `[slack] Warning: state-migrate: the state directory is at <new>, which is in use, but <old> could not be replaced with a symbolic link to it: <cause>. … To restore it, … run: ln -s <new> <old>` | The data is at `<new>` and the server uses it, but the old name is not a link: a session or script that names `<old>` does not reach it. A later start does not restore the link. | With the operator's say-so: make sure nothing is left at `<old>` (a directory there should hold nothing that is not at `<new>`), then run the `ln -s` the line gives. |
+
 ## The crontable's location and its move at start
 
 Scheduled prompts are read from the crontable (see
@@ -6608,59 +6698,49 @@ reads it from the first of these that applies:
 - `cron_table_path`, when `config.json` sets it: the path as written, with `~`
   expanded, whatever it names (`~/.config/cscb/crontab` included). The server
   never creates its directory and never moves a crontable to it.
-- With `SLACK_STATE_DIR` unset: `~/.config/cscb/crontab`, or
+- Otherwise `crontab` in the state directory: `~/.config/cscb/crontab`,
   `$XDG_CONFIG_HOME/cscb/crontab` when the server's `XDG_CONFIG_HOME` is an
-  absolute path (an empty or relative one is ignored). Each start creates
-  that directory.
-- With `SLACK_STATE_DIR` set: `crontab` in the state directory, beside
-  `config.json`.
-
-The one exception: a start whose move (below) fails before the file is at the
-new path runs on the old path instead, and its WARN says so.
+  absolute path (an empty or relative one is ignored), or `crontab` beside
+  `config.json` when `SLACK_STATE_DIR` is set.
 
 The cron log, `cron.log`, stays in the state directory in every case (unless
 `cron_log_path` is set). The location is fixed at start: a confirmed change to
 `cron_table_path` takes effect at the next start. A bot finds the crontable
 through `CSCB_CRONTABLE_PATH`, set when its session was spawned. A resumed
-session keeps the value of its spawn, so a bot spawned before the move still
-names the old path.
+session keeps the value of its spawn, so a bot spawned by an earlier release
+still names its old path, `~/.claude/channels/slack/crontab`. That path
+resolves, through the link the state directory's move leaves at
+`~/.claude/channels/slack`, to the crontable the scheduler reads.
 
-When `config.json` leaves `cron_table_path` out (or sets it to `null`) and
-`SLACK_STATE_DIR` is unset, each start also looks at the old path, `crontab`
-beside `config.json` (`~/.claude/channels/slack/crontab`), where earlier
-releases kept it, and moves a crontable it finds there. The file goes to the
-new path with its bytes unchanged, and the old path becomes a symbolic link to
-it. A `prompts` directory beside the old crontable moves beside the new one,
-and its old name becomes a symbolic link to it.
-
-A start logs nothing when it finds nothing at the old path, a dangling link
-there, or both paths already naming one file through a symbolic link. One file
-under both names as a hard link, left by a move that stopped part way, is not
-done yet: the start finishes the move and logs the `moved` line. Each step a
-start takes is one `[slack] cron-migrate:` line in `server.log`, or one
-`[slack] Warning: cron-migrate:` line when something is left for the operator.
-None of them stops the start.
-
-If a step fails before the file is at the new path (creating the directory,
-placing the file, or looking at either path), nothing is changed and that
-start runs on the old path: its scheduler reads it, and the sessions it
-launches get it as `CSCB_CRONTABLE_PATH`, so its schedules keep firing. The
-next start tries the move again.
+The crontable and its `prompts` directory are entries of the state directory,
+so they move with it (see
+[The state directory's location and its move at start](#the-state-directorys-location-and-its-move-at-start)).
+Relative prompt paths keep resolving, because the two move together. An
+earlier release moved the crontable out of `~/.claude` to `~/.config/cscb/crontab`
+at its start and logged `cron-migrate:` lines. The current release does not
+(the default crontable already lies in the state directory), so the
+`cron-migrate:` lines in the table below appear only in a log written by that
+earlier release. The state directory's move treats a crontable present in both
+places as a conflict (the `state-migrate:` conflict row above).
 
 Look, read-only, with the server's environment (it may differ from your
 shell's; with a relative `XDG_CONFIG_HOME`, use `$HOME/.config`):
 
 ```sh
-STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
-NEW="${XDG_CONFIG_HOME:-$HOME/.config}/cscb"
-ls -ld "$NEW/crontab" "$NEW/prompts" "$STATE/crontab" "$STATE/prompts" 2>&1
+STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
+ls -ld "$STATE/crontab" "$STATE/prompts" "$HOME/.claude/channels/slack" 2>&1
 grep -h -F 'cron-migrate:' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
 grep -h -F 'cron-scheduler:' "$STATE"/server.log 2>/dev/null | tail -n 5
 ```
 
-After a move, `ls -ld` shows the old path as `crontab -> <new path>` and, when
-a `prompts` directory moved, `prompts -> <new dir>/prompts`. If it shows a
-plain file at the old `crontab` instead, something replaced the link (below).
+If `crontab` or `prompts` shows as a link into the state directory, an earlier
+release's move left it there; the state directory's move removes such links
+when it merges. A plain file at the old `crontab` next to a different one in
+the state directory is the conflict the table above describes.
+
+The `cron-migrate:` lines an earlier release wrote, and what to do about them
+(`<old>` is the crontable's former path under `~/.claude`, `<new>` its
+location outside it):
 
 | Line | Meaning | What to do |
 |---|---|---|

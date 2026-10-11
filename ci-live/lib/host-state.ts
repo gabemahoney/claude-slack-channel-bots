@@ -4,7 +4,9 @@
  * - the host's `service=cscb` agent-director rows (instance IDs);
  * - the host's `slack_bot_*` / `cscb_*` tmux sessions;
  * - the PID listening on host port 3100 (read from /proc, nothing connects);
- * - the sha256 of the host's `~/.claude/channels/slack/config.json`.
+ * - the sha256 of the host's `~/.config/cscb/config.json` (bug b.fc4; a host whose
+ *   server has not yet moved its state directory still has it in the old
+ *   default, `hostConfigPaths`).
  *
  * Only reads: `agent-director list`, `tmux ls`, /proc and a file hash. Never
  * a start, stop, kill, connect or write. The probes read the state the
@@ -116,12 +118,22 @@ export function hostStorePath(home: string): string {
  */
 export const TMUX_NO_SERVER_RE = /no server running|error connecting to .*\(No such file or directory\)/
 
+/**
+ * The host's config.json, in the order read: the state directory's default
+ * (`~/.config/cscb`, bug b.fc4), then the old default's (the `slack` directory
+ * in `.claude/channels` under the home), which a host keeps until its server's first start on the
+ * new default has moved it (the old one is then a link to the new one).
+ */
+export function hostConfigPaths(home: string): string[] {
+  return [join(home, '.config', 'cscb', 'config.json'), join(home, '.claude', 'channels', 'slack', 'config.json')]
+}
+
 export async function snapshotHost(deps: HostProbeDeps, home: string): Promise<HostSnapshot> {
   const ad = await deps.run(['agent-director', '--store-path', hostStorePath(home), 'list', '--label', 'service=cscb'])
   const adRows = ad.code === 0 ? (parseAdRows(ad.stdout) ?? 'agent-director list: unparsable output') : `agent-director list exit ${ad.code}`
   const tmux = await deps.run(['tmux', 'ls', '-F', '#{session_name}'])
   const tmuxSessions = tmux.code === 0 ? parseTmuxSessions(tmux.stdout) : TMUX_NO_SERVER_RE.test(tmux.stderr) ? [] : `tmux ls exit ${tmux.code}`
-  const config = deps.readFile(join(home, '.claude', 'channels', 'slack', 'config.json'))
+  const config = hostConfigPaths(home).map((path) => deps.readFile(path)).find((text) => text)
   const configSha256 = config ? createHash('sha256').update(config).digest('hex') : 'absent'
   return { adRows, tmuxSessions, port3100: deps.listener(HOST_PORT), configSha256 }
 }

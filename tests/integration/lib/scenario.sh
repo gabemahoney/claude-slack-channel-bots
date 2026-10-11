@@ -38,7 +38,7 @@
 # - makes the scenario's scratch root (SCENARIO_ROOT, `mktemp -d` under /tmp,
 #   exported, so every process the scenario starts carries it in its
 #   environment) and a first state dir under it, exported as SLACK_STATE_DIR,
-#   so the scenario never touches ~/.claude/channels/slack or another
+#   so the scenario never touches the default state dir (~/.config/cscb) or another
 #   script's state (a fresh state dir has no config.json.last-applied);
 # - in fmk mode, sets up the scenario's HOME, tmux, PATH and agent-director
 #   install (see "fmk mode");

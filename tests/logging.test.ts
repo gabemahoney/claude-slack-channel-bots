@@ -1,8 +1,9 @@
 /**
  * logging.test.ts — Tests for initLogging() and appendLogLine() in
  * src/logging.ts: the console redirect, the one-line append to a named log
- * file (the CLI's `server.log` lines, b.jg5 SRJ-909) and the rotation both
- * share (`CSCB_LOG_MAX_BYTES`, `CSCB_LOG_KEEP`).
+ * file (the CLI's `server.log` lines, b.jg5 SRJ-909), repointLogging() (the
+ * server moving its redirect to the moved state directory, b.fc4) and the
+ * rotation both share (`CSCB_LOG_MAX_BYTES`, `CSCB_LOG_KEEP`).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -11,7 +12,9 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { mkdtempSync, mkdirSync, symlinkSync, unlinkSync, readFileSync, existsSync, statSync, rmSync, closeSync, openSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { appendLogLine, initLogging } from '../src/logging.ts'
+import { spawnSync } from 'child_process'
+import { appendLogLine, initLogging, repointLogging } from '../src/logging.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
 // ---------------------------------------------------------------------------
 // Test isolation
@@ -264,6 +267,88 @@ describe('initLogging — switching to a different file', () => {
     // Only the write before the switch should be in the first file
     expect(lines1).toHaveLength(1)
     expect(lines1[0]).toContain('first file write')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// repointLogging — the redirect follows the state directory's move (b.fc4)
+// ---------------------------------------------------------------------------
+
+describe('repointLogging', () => {
+  /** The messages of the file's lines, their time stamps cut. */
+  function messagesOf(file: string): string[] {
+    return readFileSync(file, 'utf-8').split('\n').filter((l) => l.length > 0).map((l) => l.slice(l.indexOf('] ') + 2))
+  }
+
+  test('later lines go to the new file, appended to what it holds; the old file keeps its lines and is not written again', () => {
+    const next = join(tempDir, 'next.log')
+    writeFileSync(next, 'already there\n')
+    initLogging(logFile)
+    console.log('before')
+
+    repointLogging(next)
+    console.log('after')
+
+    expect(messagesOf(logFile)).toEqual(['before'])
+    expect(readFileSync(next, 'utf-8').split('\n').filter((l) => l.length > 0)[0]).toBe('already there')
+    expect(messagesOf(next).slice(1)).toEqual(['after'])
+  })
+
+  test('rotation follows the new file: a rotation renames it, never the old one', () => {
+    process.env['CSCB_LOG_MAX_BYTES'] = '200'
+    const next = join(tempDir, 'next.log')
+    initLogging(logFile)
+    repointLogging(next)
+
+    for (let i = 0; i < 20; i++) console.log(`line ${i} ${'x'.repeat(40)}`)
+
+    expect(existsSync(`${next}.1`)).toBe(true)
+    expect(existsSync(`${logFile}.1`)).toBe(false)
+  })
+
+  test('the path the redirect already writes to: nothing changes, the file keeps its one descriptor and its lines', () => {
+    initLogging(logFile)
+    console.log('one')
+
+    repointLogging(logFile)
+    console.log('two')
+
+    expect(messagesOf(logFile)).toEqual(['one', 'two'])
+  })
+
+  test('a file that cannot be opened leaves the redirect as it was, and does not throw', () => {
+    initLogging(logFile)
+    console.log('before')
+    const unopenable = join(tempDir, 'no-such-dir', 'next.log')
+
+    expect(() => repointLogging(unopenable)).not.toThrow()
+    console.log('after')
+
+    expect(messagesOf(logFile)).toEqual(['before', 'after'])
+    expect(existsSync(unopenable)).toBe(false)
+  })
+
+  test('with no redirect active it does nothing: no file is made and the console is the original', () => {
+    const next = join(tempDir, 'next.log')
+    const probe = [
+      "import { repointLogging } from './src/logging.ts'",
+      'const before = console.log',
+      `repointLogging(${JSON.stringify(next)})`,
+      'process.stdout.write(String(before === console.log))',
+    ].join('\n')
+    const home = mkdtempSync(join(tmpdir(), 'logging-test-home-'))
+    try {
+      const r = spawnSync('bun', ['-e', probe], {
+        cwd: join(import.meta.dir, '..'),
+        encoding: 'utf-8',
+        env: hostSafeChildEnv(home, { tools: ['bun'] }),
+      })
+      expect(r.status).toBe(0)
+      expect(r.stdout).toBe('true')
+      expect(existsSync(next)).toBe(false)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
   })
 })
 

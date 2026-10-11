@@ -6,7 +6,7 @@
  *
  * Where (SRJ-801). The file `retired-keys.json` ({@link RETIRED_KEYS_FILE_NAME})
  * in the server's state directory (`resolveServerStateDir()`,
- * `src/config.ts`: `~/.claude/channels/slack/` unless `SLACK_STATE_DIR` is
+ * `src/config.ts`: `~/.config/cscb/` unless `SLACK_STATE_DIR` is
  * set), beside `config.json.last-applied` ({@link retiredKeysPath}). Only the
  * server writes it, through the one store `main()` builds at start
  * ({@link readRetiredKeysAtStart}); the CLI never builds a store and never

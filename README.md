@@ -20,7 +20,7 @@ A single HTTP MCP server that runs several independent Claude Code bots, called 
    bun pm -g trust claude-slack-channel-bots
    ```
 
-   Bun blocks the lifecycle scripts of untrusted packages, so the postinstall does not run on the plain `install` above — you must trust the package for it to fire. The `-g` flag targets the global install; without it `bun pm trust` looks for a `package.json` in the current directory and errors with `No package.json was found`. (Run `bun pm -g untrusted` to confirm it is listed first.) The postinstall then creates skeleton config files in `~/.claude/channels/slack/` (or in `SLACK_STATE_DIR` when it is set and non-empty, the same directory the server reads) and `~/.claude/slack-mcp.json`, and links the `debug-slack-channel-bots` skill into `~/.claude/skills/`. Skip this step and a later `start` fails with `missing prerequisite: config.json`.
+   Bun blocks the lifecycle scripts of untrusted packages, so the postinstall does not run on the plain `install` above — you must trust the package for it to fire. The `-g` flag targets the global install; without it `bun pm trust` looks for a `package.json` in the current directory and errors with `No package.json was found`. (Run `bun pm -g untrusted` to confirm it is listed first.) The postinstall then creates skeleton config files in `~/.config/cscb/` (or in `SLACK_STATE_DIR` when it is set and non-empty, the same directory the server reads) and `~/.claude/slack-mcp.json`, and links the `debug-slack-channel-bots` skill into `~/.claude/skills/`. Skip this step and a later `start` fails with `missing prerequisite: config.json`.
 
 3. **Run the setup skill:**
 
@@ -65,7 +65,7 @@ See the sections below for manual configuration details if you prefer not to use
 | `darwin-x64` (Intel Mac) | **Not supported** by agent-director |
 | Windows | **Not supported** by agent-director |
 
-If the host is unsupported, the system-installed `agent-director` itself will refuse to install or run; CSCB's startup gate then exits non-zero with one of the `ad-system-install-*` class labels (see [Startup errors](#startup-errors)) and writes the failure to `~/.claude/channels/slack/startup-errors.log` and stderr. Consult [agent-director's documentation](https://github.com/gabemahoney/agent-director) for the canonical platform support list.
+If the host is unsupported, the system-installed `agent-director` itself will refuse to install or run; CSCB's startup gate then exits non-zero with one of the `ad-system-install-*` class labels (see [Startup errors](#startup-errors)) and writes the failure to `~/.config/cscb/startup-errors.log` and stderr. Consult [agent-director's documentation](https://github.com/gabemahoney/agent-director) for the canonical platform support list.
 
 ### Checking your agent-director install
 
@@ -166,8 +166,8 @@ Runtime options are read from environment variables. None of them is required. S
 
 | Variable | Description |
 |---|---|
-| `SLACK_STATE_DIR` | Override the directory where `config.json` and runtime state are stored. Defaults to `~/.claude/channels/slack`. When it is set, the crontable's default moves there too (see `cron_table_path` under [Server-wide settings](#server-wide-settings)). |
-| `XDG_CONFIG_HOME` | The standard XDG configuration directory. With `SLACK_STATE_DIR` unset and `XDG_CONFIG_HOME` an absolute path, the crontable defaults to `$XDG_CONFIG_HOME/cscb/crontab` instead of `~/.config/cscb/crontab`. An empty or relative value is ignored. |
+| `SLACK_STATE_DIR` | Override the directory where `config.json` and runtime state are stored. Defaults to `~/.config/cscb` (see `XDG_CONFIG_HOME` below), outside `~/.claude`, where Claude Code asks the user before every write. The crontable defaults to `crontab` in this directory (see `cron_table_path` under [Server-wide settings](#server-wide-settings)). |
+| `XDG_CONFIG_HOME` | The standard XDG configuration directory. With `SLACK_STATE_DIR` unset and `XDG_CONFIG_HOME` an absolute path, the state directory, and the crontable in it, is `$XDG_CONFIG_HOME/cscb` instead of `~/.config/cscb`. An empty or relative value is ignored. |
 | `SLACK_DRY_RUN` | Set to `1` (or `true` / `yes`) to start the server without Slack. No credentials file is read and no Slack call is made. Each persona runs with a placeholder identity (`U000DRY_<key>`), and MCP tool calls (`reply`, `react`, etc.) and server notices are logged instead of sent. Useful for integration testing. |
 | `CSCB_LOG_MAX_BYTES` | Rotate `server.log` / `clean_restart.log` when the active file reaches this many bytes. Defaults to `10485760` (10 MiB). Values `<= 0` or non-numeric are ignored. |
 | `CSCB_LOG_KEEP` | Number of rotated generations to retain (`server.log.1` … `server.log.N`). Defaults to `5`. Set to `0` to keep none (the log is truncated instead of rolled). Values `< 0` or non-numeric are ignored. |
@@ -187,7 +187,7 @@ export SLACK_DRY_RUN=1
 
 ### Personas (config.json)
 
-`config.json` is read from `~/.claude/channels/slack/config.json` by default. Override the directory with `SLACK_STATE_DIR`. The server needs only this file and the credentials files it names.
+`config.json` is read from `~/.config/cscb/config.json` by default (`$XDG_CONFIG_HOME/cscb/config.json` when `XDG_CONFIG_HOME` is an absolute path). Override the directory with `SLACK_STATE_DIR`. The server needs only this file and the credentials files it names.
 
 Each bot is a **persona**: one Slack app, one Claude instance with its own working directory, and the channels it serves. In declarative mode, the default, those are the channels it is configured into, and its tools may target only them; in fungible mode, they are the public and private channels its app is invited to that are not externally shared, and its tools may target any channel ID: the call goes to Slack, which decides (see [Tools](#tools) and [Channel modes](#channel-modes)). Create one Slack app per persona (see `slack-app-manifest.yml`); that app gives the persona its own name and avatar in Slack.
 
@@ -451,7 +451,7 @@ These top-level fields apply to the whole server. A confirmed change to one take
 | `agent_director_poll_interval_ms` | number | `1000` | Poll interval (ms) for the agent-director permission relay tick. Must be a positive integer in `[200, 3_600_000]`. Replaces the pre-rename `claude_director_poll_interval_ms` — the old name is rejected at startup. |
 | `agent_director_call_timeout_ms` | number | `60000` | How long (ms) CSCB waits on each agent-director call it makes for its personas, in the server and in `stop --stop-bots` and `clean_restart`. Must be an integer in `[1000, 3_600_000]`; out-of-range values are rejected at load. It should be greater than the need that agent-director's timing settings give; see [Sizing the agent-director call timeout](#sizing-the-agent-director-call-timeout). |
 | `stop_hook_bootstrap` | boolean | `true` | Default for every persona: whether the persona gets the Slack Reply Guard reminder (see [Slack Reply Guard (Stop hook)](#slack-reply-guard-stop-hook)). The value applies per persona, from the persona's first launch after the change is applied (see [Reload](#reload)). A persona's own `stop_hook_bootstrap` overrides this value. Non-boolean values are rejected at startup. |
-| `cron_table_path` | string | `~/.config/cscb/crontab` | Path to the crontable for the built-in cron scheduler (`cscb_cron`). When absent, it is `~/.config/cscb/crontab` (`$XDG_CONFIG_HOME/cscb/crontab` when `XDG_CONFIG_HOME` is an absolute path), outside `~/.claude`, so a bot's edit is not a write under `~/.claude`, which Claude Code asks the user to approve. With `SLACK_STATE_DIR` set, the default is `crontab` in the directory of the loaded `config.json` instead. A path you set is used as written, with `~` expanded like other path keys, even when it names `~/.config/cscb/crontab`: the server never creates its directory or moves a crontable to it. The resolved path is exported into every managed session as `CSCB_CRONTABLE_PATH` so bots can find the crontable and self-schedule (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)). Must be a non-empty string when set. |
+| `cron_table_path` | string | `~/.config/cscb/crontab` | Path to the crontable for the built-in cron scheduler (`cscb_cron`). When absent, it is `crontab` in the state directory, beside `config.json`: `~/.config/cscb/crontab` by default, outside `~/.claude`, so a bot's edit is not a write under `~/.claude`, which Claude Code asks the user to approve. A path you set is used as written, with `~` expanded like other path keys: the server never creates its directory or moves a crontable to it. The resolved path is exported into every managed session as `CSCB_CRONTABLE_PATH` so bots can find the crontable and self-schedule (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)). Must be a non-empty string when set. |
 | `cron_log_path` | string | `<config dir>/cron.log` | Path to the `cscb_cron` log file. Defaults to `cron.log` in the directory of the loaded `config.json`, wherever the crontable is. `~` is expanded like other path keys. Must be a non-empty string when set. |
 | `cron_log_max_bytes` | number | — | Size cap in bytes for the cron log. Once a line takes the log past the cap, the server drops its oldest whole lines until it fits. The newest line is always kept, even when it alone is larger than the cap. Nothing is rotated or archived, so dropped lines are gone. Absent means no cap: the log only grows. Must be a positive integer when set. |
 | `ack_reaction` | string | — | Emoji name, without colons (for example `"eyes"`), of the acknowledgement reaction. When set, each persona a message is dispatched to adds the reaction under its own Slack identity once the message has reached its instance, not on receipt, so a message that reaches several personas carries one reaction per persona. A message that isn't dispatched gets no reaction: one lost because the persona's instance is down, or one the persona doesn't receive. Messages sent through `/interject` or cron aren't Slack messages and get none either. A persona's first `reply` in that conversation carrying the message's `message_id` removes that persona's reaction only; other personas' reactions stay until they reply. Absent means no acknowledgement. Must be non-empty when set. |
@@ -630,7 +630,7 @@ The switch changes through a confirmed edit, like every other setting:
 Before you turn it on, review each persona's app's channel memberships in Slack, private channels included: each one becomes a channel the persona serves. Past `unclaimed-channel` lines in `server.log` show channels whose messages reached a persona's app with no persona serving them:
 
 ```sh
-grep unclaimed-channel ~/.claude/channels/slack/server.log*
+grep unclaimed-channel ~/.config/cscb/server.log*
 ```
 
 **Turning it off.** The change is checked by the declarative rules, so each persona needs a valid declarative section: a persona whose `channels` or `permission_prompts` breaks a declarative-mode rule makes the change `INVALID` (see [Load-time rules](#load-time-rules)). From the next event, each persona serves its listed channels again, each at its `delivery`. Turning it off changes no stored choice on disk: the choices stop applying, and they apply again when fungible mode is turned back on.
@@ -662,7 +662,7 @@ Saving `config.json` doesn't change what runs. The server runs the last configur
 
 ### Files beside the config file
 
-These files sit in the same directory as `config.json` (`~/.claude/channels/slack/` by default, or `SLACK_STATE_DIR`). Never edit them by hand.
+These files sit in the same directory as `config.json` (`~/.config/cscb/` by default, or `SLACK_STATE_DIR`). Never edit them by hand.
 
 | File | What it is |
 |---|---|
@@ -705,8 +705,8 @@ While the server runs, it checks `config.json` and each credentials file the fil
 To see what is pending:
 
 ```sh
-cat ~/.claude/channels/slack/config.json.pending
-grep -E 'reload-(preview|invalid|nothing-pending)' ~/.claude/channels/slack/server.log | tail
+cat ~/.config/cscb/config.json.pending
+grep -E 'reload-(preview|invalid|nothing-pending)' ~/.config/cscb/server.log | tail
 ```
 
 ### Reading the preview
@@ -762,7 +762,7 @@ Paths in the preview are absolute: a `~` in `config.json` is shown expanded. In 
 To apply a pending change, rename `config.json.pending` to `config.json.apply` in the same directory, with the server running:
 
 ```sh
-cd "${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}" && mv config.json.pending config.json.apply
+cd "${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}" && mv config.json.pending config.json.apply
 ```
 
 Read the preview first. The server picks the confirmation up at its next check, within about 5 seconds; a check still running an earlier apply delays it, so `reload-applied` can come minutes later. It deletes the confirmation and applies it without a restart; next-launch and server-wide settings are recorded and take effect later, except the switch `allow_invited_channels`, which applies in place at once (see [What a confirmation applies](#what-a-confirmation-applies)).
@@ -772,7 +772,7 @@ You can direct an agent to do the rename for you. Nothing has to be computed, co
 Each confirmation logs one of these lines in `server.log`:
 
 ```sh
-grep -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed)' "${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}/server.log" | tail
+grep -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed)' "${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}/server.log" | tail
 ```
 
 | Line | Meaning |
@@ -869,13 +869,13 @@ The server first runs the agent-director startup gate: it imports `agent-directo
 - **The server exits during startup:** `start` exits 1. It prints why the server stopped, followed by the last lines (at most 20) the server wrote to `server.log`, which carry the server's own reason:
 
   ```
-  [slack] Server failed to start (exit code 1). From /home/you/.claude/channels/slack/server.log:
+  [slack] Server failed to start (exit code 1). From /home/you/.config/cscb/server.log:
   ```
 
 - **The server is still starting after 30 seconds:** `start` exits 0 and leaves it running.
 
   ```
-  [slack] Server is still starting in the background (PID 12345) after 30s — its log is /home/you/.claude/channels/slack/server.log
+  [slack] Server is still starting in the background (PID 12345) after 30s — its log is /home/you/.config/cscb/server.log
   ```
 
 At a start with no last-applied record, a configuration from before personas stops the start. The server writes the conversion error to `server.log` and exits, so `start` shows the same line on the terminal and exits 1. In `server.log`, where each line is prefixed with a timestamp, it reads:
@@ -1157,7 +1157,7 @@ It needs no agent-director, reads no configuration file and writes or removes no
 
 ### PID file
 
-The PID file is stored at `STATE_DIR/server.pid` (default: `~/.claude/channels/slack/server.pid`). It is written on startup and removed on clean shutdown. A conflict check at startup prevents running two servers against the same state directory.
+The PID file is stored at `STATE_DIR/server.pid` (default: `~/.config/cscb/server.pid`). It is written on startup and removed on clean shutdown. A conflict check at startup prevents running two servers against the same state directory.
 
 Beside it, `STATE_DIR/server.port` records the server's process ID and the port it actually listens on. The server writes it once it is listening and removes it on shutdown. A start that finds a stale PID file removes a stale `server.port` with it, and `stop` removes it with the PID file. [`clear-latch`](#claude-slack-channel-bots-clear-latch) reads it to find the server, and uses it only when the process ID it records is the one in `server.pid`.
 
@@ -1293,17 +1293,13 @@ The server fires scheduled prompts into personas once per minute, reading them f
 
 ### The crontable
 
-Schedules live in the crontable file at `cron_table_path`. Without that key the crontable is at `~/.config/cscb/crontab` (`$XDG_CONFIG_HOME/cscb/crontab` when `XDG_CONFIG_HOME` is an absolute path), outside `~/.claude`, so a bot appending a schedule doesn't trigger Claude Code's approval prompt for writes under `~/.claude`. With `SLACK_STATE_DIR` set, the default is `crontab` beside `config.json` in that directory. Set `cron_table_path` in `config.json` to put it anywhere else (see [Server-wide settings](#server-wide-settings)).
+Schedules live in the crontable file at `cron_table_path`. Without that key the crontable is `crontab` in the state directory, `~/.config/cscb/crontab` by default, outside `~/.claude`, so a bot appending a schedule doesn't trigger Claude Code's approval prompt for writes under `~/.claude`. Set `cron_table_path` in `config.json` to put it anywhere else (see [Server-wide settings](#server-wide-settings)).
 
 ```sh
 cat ~/.config/cscb/crontab
 ```
 
-At start the server creates the default crontable's directory. It creates the file on first boot if it is absent, with a self-documenting comment header describing the line format. See [Crontable format](#crontable-format) below for the full reference. For a `cron_table_path` you set, the directory must already exist.
-
-If the server starts with the default and finds a crontable at `crontab` beside `config.json` (`~/.claude/channels/slack/crontab`), it moves that file to the default location, its lines unchanged. It leaves a symbolic link to the new file at the old path, so a resumed session whose `CSCB_CRONTABLE_PATH` still names the old path appends to the same file. A `prompts/` directory beside the old crontable moves with it and leaves a link at its old name, so relative prompt paths keep naming the same files.
-
-If both paths hold a crontable, the server uses the one at the default location and logs a warning. Nothing is moved when `config.json` sets `cron_table_path`, even to `~/.config/cscb/crontab`. The `debug-slack-channel-bots` skill covers each line the move logs.
+At start the server creates the state directory. It creates the crontable on first boot if it is absent, with a self-documenting comment header describing the line format. See [Crontable format](#crontable-format) below for the full reference. For a `cron_table_path` you set, the directory must already exist.
 
 ### Crontable format
 
@@ -1417,7 +1413,7 @@ Each load also writes one `warn` line for each line with no persona list, naming
 Add a persona list to that line. The warning comes back at every start and every edit until you do; an unchanged crontable is not reloaded, so it is not repeated each minute. To list them in the cron log at its default location:
 
 ```sh
-grep undeliverable ~/.claude/channels/slack/cron.log
+grep undeliverable ~/.config/cscb/cron.log
 ```
 
 ### Delivery semantics
@@ -1534,7 +1530,7 @@ Read this before turning fungible mode on. Each persona's Claude worker runs wit
 The audit lines in `server.log` are `persona-invited-channel`, logged the first time a persona hears a channel in fungible mode (naming the channel, `public` or `private`, and its channel delivery), and `persona-channel-delivery-set`, logged for each stored `set_channel_delivery` choice. The debugging skill explains both ([`persona-invited-channel`](skills/debug-slack-channel-bots/SKILL.md#persona-invited-channel), [`persona-channel-delivery-set`](skills/debug-slack-channel-bots/SKILL.md#persona-channel-delivery-set)). To list them:
 
 ```sh
-grep -E 'persona-(invited-channel|channel-delivery-set)' ~/.claude/channels/slack/server.log*
+grep -E 'persona-(invited-channel|channel-delivery-set)' ~/.config/cscb/server.log*
 ```
 
 A persona logs a channel's `persona-invited-channel` line only once until the server restarts or the persona is brought up fresh, so on a long-running server, log rotation can discard a channel's only audit line (see [Server log rotation](#server-log-rotation)). After a restart, the first event from each channel a persona hears in fungible mode logs its line again.
@@ -1592,7 +1588,7 @@ The command is the absolute path of the script inside CSCB's installed package, 
 
 **Recognition rule.** The server treats *any* Stop-hook `command` containing `slack-reply-guard.sh` as CSCB-managed. Only the exact current command is kept: duplicates collapse to one group, and an entry with an older script path, no record directory or another record directory is replaced. This is how the hook heals itself across upgrades.
 
-**The record.** Each persona has a record file, `reply-guard/<persona key>` in the state directory (`~/.claude/channels/slack/`, or `SLACK_STATE_DIR` when set). It holds `true` or `false`: the persona's effective `stop_hook_bootstrap`. The server writes it atomically immediately before it spawns or resumes the persona's instance. Reconnecting to an instance that is still running leaves the record as it was.
+**The record.** Each persona has a record file, `reply-guard/<persona key>` in the state directory (`~/.config/cscb/`, or `SLACK_STATE_DIR` when set). It holds `true` or `false`: the persona's effective `stop_hook_bootstrap`. The server writes it atomically immediately before it spawns or resumes the persona's instance. Reconnecting to an instance that is still running leaves the record as it was.
 
 **What the guard reads.** Every persona's instance runs with its key in `CSCB_PERSONA`. The guard reads the record `<record directory>/<CSCB_PERSONA>` and reminds only when it reads exactly `true`. A missing argument, an unset `CSCB_PERSONA`, or a missing record means no reminder.
 
@@ -1677,8 +1673,8 @@ A session from a directory where an old instance may still be running is refused
 Symptoms: the persona is silent, `/interject` returns 503 for it, or its scheduled prompts log `no-session`. One broken persona never stops the server or delays the others, and nothing about it is posted to Slack. Look in `server.log` instead. Find the persona's key on its `persona-start` line, then read its lines. Each failure line names a class, the persona's `personas[i]` entry and the file or directory at fault:
 
 ```sh
-grep persona-start ~/.claude/channels/slack/server.log | tail
-grep -E '\(key=<key>\)|persona=<key>\b' ~/.claude/channels/slack/server.log
+grep persona-start ~/.config/cscb/server.log | tail
+grep -E '\(key=<key>\)|persona=<key>\b' ~/.config/cscb/server.log
 ```
 
 | Class | Persona | What to do |
@@ -1721,7 +1717,7 @@ tmux attach -t =slack_bot_<key>
 To follow the server's watch for one persona:
 
 ```sh
-grep -E '\[slack\] approvePreSessionDialogs: .*(\(key=<key>\)|persona=<key>\b)' ~/.claude/channels/slack/server.log
+grep -E '\[slack\] approvePreSessionDialogs: .*(\(key=<key>\)|persona=<key>\b)' ~/.config/cscb/server.log
 ```
 
 agent-director also accepts the persona's folder trust itself at each launch and reports whether it did. The server writes one line to `server.log` with that report for each launch call that returns success (a failed launch call writes none), and does nothing else because of it:
@@ -1734,7 +1730,7 @@ agent-director also accepts the persona's folder trust itself at each launch and
 A folder-trust prompt that still shows is accepted by the server as described above. To see these lines for one persona:
 
 ```sh
-grep -F 'pre_trust' ~/.claude/channels/slack/server.log | grep -F '(key=<key>)'
+grep -F 'pre_trust' ~/.config/cscb/server.log | grep -F '(key=<key>)'
 ```
 
 **A persona's instance is still starting**
@@ -1768,13 +1764,13 @@ A still-starting instance whose launch start agent-director did not record holds
 To follow it for one persona:
 
 ```sh
-grep -E 'unavailable-retry: persona=<key> |Deferring persona=<key>: |pending-row: (not arming )?"[^"]*" \(key=<key>\)|pending-row: persona=<key> ' ~/.claude/channels/slack/server.log
+grep -E 'unavailable-retry: persona=<key> |Deferring persona=<key>: |pending-row: (not arming )?"[^"]*" \(key=<key>\)|pending-row: persona=<key> ' ~/.config/cscb/server.log
 ```
 
 To follow the read after a launch that timed out or was refused:
 
 ```sh
-grep -F 'one get after the' ~/.claude/channels/slack/server.log | grep -F '(key=<key>)'
+grep -F 'one get after the' ~/.config/cscb/server.log | grep -F '(key=<key>)'
 ```
 
 `[slack] spawnForPersona: one get after the <call> of "<name>" (key=<key>) ended in a launch timeout (ErrCallTimeout): read pending; this launch's row: yes (launch start <time>) — covered: the approver starts once the launch call has returned; the retry timer watches the row; no launch in this attempt (b.jg5 SRJ-407)` marks a timed-out launch whose instance is starting; the line names what was read and what follows (`ErrTmuxUnresponsive` in place of `ErrCallTimeout` for agent-director's own timeout, `UNAVAILABLE (…)` for another refusal).
@@ -1810,14 +1806,14 @@ An invite is enough only in fungible mode, and only for some conversations. Chec
 At `mentions`, a message that neither @mentions the persona nor broadcasts is not delivered (see "A persona doesn't receive messages in a channel or DM" above). The first message a persona hears from a channel in fungible mode logs a `persona-invited-channel` line (see [`persona-invited-channel`](skills/debug-slack-channel-bots/SKILL.md#persona-invited-channel) in the debugging skill):
 
 ```sh
-grep -E 'persona-invited-channel|unclaimed-channel' ~/.claude/channels/slack/server.log
+grep -E 'persona-invited-channel|unclaimed-channel' ~/.config/cscb/server.log
 ```
 
 **A persona receives every message in a channel**
 In fungible mode, the persona's agent chose `all` for that channel with `set_channel_delivery`; each such choice logs a `persona-channel-delivery-set` line (see [`persona-channel-delivery-set`](skills/debug-slack-channel-bots/SKILL.md#persona-channel-delivery-set) in the debugging skill):
 
 ```sh
-grep persona-channel-delivery-set ~/.claude/channels/slack/server.log
+grep persona-channel-delivery-set ~/.config/cscb/server.log
 ```
 
 To stop it, do one of these:
@@ -1835,7 +1831,7 @@ Each attempt of a Slack request is limited to 30 s, and that includes uploading 
 A message a persona's app receives in a channel that no persona serves reaches no bot. Each such message logs an `unclaimed-channel` line naming the channel and the persona whose app received it in `server.log`:
 
 ```sh
-grep unclaimed-channel ~/.claude/channels/slack/server.log
+grep unclaimed-channel ~/.config/cscb/server.log
 ```
 
 - **In declarative mode,** the channel is in no persona's `channels`, even though a persona's Slack app is a member. Add the channel to a persona's `channels` and apply the change (see [Reload](#reload)); restarting the server alone doesn't apply it. For a public or private channel that is not externally shared, turning fungible mode on is the other fix (see [Channel modes](#channel-modes)); a group DM is never served.
@@ -1848,7 +1844,7 @@ Check that the persona's Slack app has interactivity enabled (Interactivity & Sh
 When Slack refuses a post to a persona's destination, the server holds the persona's prompts and notices and retries them with backoff. Once Slack accepts posts again, held notices are delivered, and a prompt is posted if its request is still open. It logs one `persona-destination-failed` line in `server.log` naming the persona, its destination and Slack's error, and one `cleared` line when posting works again:
 
 ```sh
-grep persona-destination-failed ~/.claude/channels/slack/server.log
+grep persona-destination-failed ~/.config/cscb/server.log
 ```
 
 - `missing_scope` (the line names `im:write`): add the scope and re-install the persona's Slack app; see the `im:write` note under [Direct messages](#direct-messages-dmenabled).
@@ -1869,7 +1865,7 @@ There is no such check while the persona's last launch failed, so failed launche
 The check and the loop guard log these lines in `server.log`:
 
 ```sh
-grep b.4vm ~/.claude/channels/slack/server.log
+grep b.4vm ~/.config/cscb/server.log
 ```
 
 - `[slack] Session for persona=<key> ended cleanly (agent-director reads its row ended) — relaunching now instead of in <N>s (b.4vm)`: the clean exit is relaunched now.
@@ -1885,7 +1881,7 @@ After 2 such resumes in a row, the server stops resuming that transcript: the pe
 Below the restart limit nothing is posted to Slack; `server.log` shows these lines:
 
 ```sh
-grep b.4q8 ~/.claude/channels/slack/server.log
+grep b.4q8 ~/.config/cscb/server.log
 ```
 
 - `[slack] <site>: <read> for "<name>" (key=<key>): its resumed launch ended before reporting in (state=<ended|missing|no-row>) — <n> resume(s) in a row ended so; at 2 the ladder makes a reuse spawn in place of a resume (b.4q8)`: a resume ended before its session started (the persona may be named `persona=<key>` instead).
@@ -1932,7 +1928,7 @@ Symptom: a persona stays down or silent while agent-director refuses the server'
 The retries stop when the persona is recovered, when it reaches the restart limit through failed launches, when it stops being up (its own bring-up retry takes over), when it is held for a human (see "A persona posts a *Held: tmux session conflict* notice", "A persona posts a *Held: unusable tmux session name* notice" and "A persona posts a *Held: launch start not recorded* notice" below), while it is held because agent-director rejected its launch (see "A persona posts a *Cannot launch* notice" below), when it is removed from the configuration, and when the server stops. To follow them for one persona:
 
 ```sh
-grep -E 'unavailable-retry: persona=<key> |Session relaunch refused for persona=<key> |Session kill for persona=<key> did not succeed |Restart retry skipped for persona=<key> ' ~/.claude/channels/slack/server.log
+grep -E 'unavailable-retry: persona=<key> |Session relaunch refused for persona=<key> |Session kill for persona=<key> did not succeed |Restart retry skipped for persona=<key> ' ~/.config/cscb/server.log
 ```
 
 `[slack] unavailable-retry: persona=<key> armed (<cause>) — first retry in 30 s` starts them (after a launch, `armed in pending-only mode (pending-row)`), and `[slack] unavailable-retry: persona=<key> stopped — nothing left to recover` shows the persona is back (after a launch, the last line says `pending-only` instead). The `debug-slack-channel-bots` skill explains the other retry lines. If the persona keeps retrying and never clears, check that agent-director responds:
@@ -1974,8 +1970,8 @@ A message lost for the persona meanwhile reports `restarting` while the server i
 The persona comes up by itself, at once, once the old instance's row reads ended or missing: `[slack] old-life hold: ended for instanceId="<id>" — retrying its waiting personas at once: <keys>[; once the stopped wait on its own row has settled: <keys>][; not retried: <key> (<why>)] (b.jg5 SRJ-810)`, a persona removed, held for a human, held on rejected launch flags (see "A persona posts a *Cannot launch* notice" below) or not up meanwhile named as not retried (`not applied`, `latched`, `held on ErrInvalidFlags`, `not up`). A persona that is held or not up gets no retries from the server's work on the old instance either (`[slack] old-life-wait: persona=<key>: held on ErrInvalidFlags — no retry timer armed …` or `… not up — no retry timer armed; its bring-up owns it …`); a persona that is not up is brought up by its own bring-up retries. A persona whose own earlier instance is the old one is retried a moment later, once the server has stopped ending that instance: `[slack] old-life hold: the stopped wait on instanceId="<id>" has settled — persona=<key> retried at once (b.jg5 SRJ-810)`, or `… not retried (<why>) …` when it was removed, held or not up meanwhile. A renamed persona's new name then starts a new conversation. If the old instance's kill keeps failing, a human follows the "Operator actions" section of agent-director's README for it; the persona then comes up with no server restart. To follow it:
 
 ```sh
-grep -E 'held for an old life|old-life hold: |old-life-wait' ~/.claude/channels/slack/server.log
-grep -E '\(old-life wait\)|raised during its old-life wait' ~/.claude/channels/slack/startup-errors.log
+grep -E 'held for an old life|old-life hold: |old-life-wait' ~/.config/cscb/server.log
+grep -E '\(old-life wait\)|raised during its old-life wait' ~/.config/cscb/startup-errors.log
 agent-director get --claude-instance-id <id>
 ```
 
@@ -2035,7 +2031,7 @@ From the first refusal until the session answers again, a message sent to the pe
 The usual order is *Not answering*, *Still not answering*, *Answering again*; when *Still not answering* comes first (for example with `health_check_interval` `0` and a 3-minute alert threshold), *Not answering* is skipped. Each is posted at most once per episode, from the first refusal until the session answers again; a later refusal starts a new episode. After *Still not answering*, a human should check the host's tmux server and agent-director, with read-only checks only, for example `agent-director version`, `agent-director get --claude-instance-id cscb_<key>` and `agent-director read-pane --claude-instance-id cscb_<key> --n-lines 1`. Run them as the user the workers run as, in the bot server's launcher environment. The `read-pane` reaches the persona's tmux session through agent-director: an answer in time shows that tmux answers, and `ErrTmuxUnresponsive` or `ErrCallTimeout` shows it still doesn't. It never shows whose a session is (see its caveats under [Listing instances](skills/debug-slack-channel-bots/SKILL.md#listing-instances) in the debugging skill), so take ownership from agent-director's row, never from the pane. Never run a command that ends a session or deletes an agent-director row to clear it: once agent-director and tmux answer, the next retry recovers the persona and *Answering again* follows. To follow one persona's episode:
 
 ```sh
-grep -E 'persona-episodes: persona=<key> tmux-unresponsive (started|onset|alert|ended|recovery)' ~/.claude/channels/slack/server.log
+grep -E 'persona-episodes: persona=<key> tmux-unresponsive (started|onset|alert|ended|recovery)' ~/.config/cscb/server.log
 ```
 
 `[slack] persona-episodes: persona=<key> tmux-unresponsive started — <verb> failed: <error>` marks the first refusal, `… onset posted — still not answering at <a health tick|a retry>, <s> s after its first refusal` the *Not answering* notice, `… alert posted — not answering for <s> s, over its alert threshold of <s> s` the *Still not answering* notice, `… onset not posted — its alert already posted` and `… onset not posted — its retry timer stopped and no refusal has re-armed it` a skipped *Not answering*, `… alert check cancelled — its retry timer stopped: <reason>` and `… alert check armed again — a new refusal armed its retry timer again` the alert's check stopping and starting with the retries, and `… ended — <reason>` followed by `… recovery posted` the *Answering again* notice. Once a confirmed change's teardown of the persona is queued, none of the three notices is posted. Until the teardown starts, `… onset not posted — muted, its persona teardown was submitted; …`, `… alert not posted — muted, its persona teardown was submitted; …` and `… recovery not posted — muted, its persona teardown was submitted` take the place of the posted lines; while it runs, a notice is written as a `persona-teardown-notice` entry instead (see [Startup errors](#startup-errors)). The `debug-slack-channel-bots` skill explains every line.
@@ -2050,7 +2046,7 @@ Meanwhile the server asks agent-director to reconcile the row again at each heal
 Nothing is needed unless it persists. Then make read-only checks only: read the persona's row with `agent-director get --claude-instance-id cscb_<key>`, and follow the persona in `server.log`:
 
 ```sh
-grep -E 'slow-recovery: persona=<key> |escalate-dead: persona=<key> |after escalate-dead.*persona=<key>( |:|;|$)' ~/.claude/channels/slack/server.log
+grep -E 'slow-recovery: persona=<key> |escalate-dead: persona=<key> |after escalate-dead.*persona=<key>( |:|;|$)' ~/.config/cscb/server.log
 ```
 
 Each such health check logs `[slack] escalate-dead: persona=<key> verdict=<verdict> — <evidence>, triggering internal findMissing reconciliation (the row may stay live for further ticks, each escalate-dead tick sweeping again; ~/startup/find-missing-loop.sh is belt-and-braces)`, then `[slack] Session still reads live after escalate-dead — no relaunch in this restart run for persona=<key>; the row may stay live for further ticks, each escalate-dead tick sweeping again` and `[slack] slow-recovery: persona=<key> count <n> of 3 — an escalate-dead verdict's re-probe still reads the row live`. `[slack] slow-recovery: persona=<key> notice posted — <n> consecutive escalate-dead verdicts whose re-probe still reads the row live` marks the notice; once a confirmed change's teardown of the persona is queued and until it starts, `[slack] slow-recovery: persona=<key> notice not posted — muted, its persona teardown was submitted; …` takes its place and nothing is posted. `[slack] slow-recovery: persona=<key> count reset from <n> — <reason>` and `[slack] slow-recovery: persona=<key> episode ended — <reason>` show the count starting over and the episode ending, and `[slack] Session reads dead after escalate-dead reconciliation — relaunching in this restart run for persona=<key> (b.d61)` shows the relaunch. The `debug-slack-channel-bots` skill explains every line. Why agent-director leaves a row live or unverified is covered under "Maintenance" in agent-director's README. This is for a human only: no bot acts on it, including a persona that sees the post.
@@ -2101,7 +2097,7 @@ What to do: for *Launch stuck*, nothing. For *Session not starting*, a human cho
 To follow the checks, the notices and the relaunch for one persona:
 
 ```sh
-grep -E 'pending-row: ("[^"]*" \(key=<key>\)|persona=<key> )|pendingRowRule stuck-launch abort: .*cscb_<key>|stopping the approver for "[^"]*" \(key=<key>\) \(stuck-launch-abort\)' ~/.claude/channels/slack/server.log
+grep -E 'pending-row: ("[^"]*" \(key=<key>\)|persona=<key> )|pendingRowRule stuck-launch abort: .*cscb_<key>|stopping the approver for "[^"]*" \(key=<key>\) \(stuck-launch-abort\)' ~/.config/cscb/server.log
 ```
 
 Each check from the grace period on logs `[slack] pending-row: "<name>" (key=<key>) rule (retry): launch started <time>; …` naming what it found and what follows (`rule (approver-stop)` for the check when the startup-prompt watch stops). `… at B: the held text; the row is left, never killed (b.jg5 SRJ-410)` is logged at every check at or after the limit, not only the one that posts the notice. The poster's line logged right after it tells which: `[slack] pending-row: persona=<key> stuck-launch held text posted` (`held text (no attach line: …) posted` for the form without the attach line) means the notice was posted then, and `… stuck-launch held text not posted — already posted in this stuck-launch episode` means an earlier check posted it.
@@ -2126,7 +2122,7 @@ agent-director answered a call for the persona that it can't use tmux for it, an
 The notice clears only once the persona's tmux answers again: a call that works the persona's session succeeds, a call that works it is told the session is gone, or the health check or a retry finds the persona running, connected and receiving messages. A state read that succeeds while tmux still can't be used doesn't clear it. When it clears and nothing else is wrong for the persona, its destination gets an *All clear.* notice naming `tmux-unavailable`. To follow one persona:
 
 ```sh
-grep -E 'unavailable-retry: persona=<key> ' ~/.claude/channels/slack/server.log
+grep -E 'unavailable-retry: persona=<key> ' ~/.config/cscb/server.log
 ```
 
 `[slack] unavailable-retry: persona=<key> armed (environment: <error>) — first retry in 30 s` marks the first such answer, or `promoted to full mode (environment: <error>) — its due time is kept` when the persona's retries were only reading its state. Once it clears, the last line is usually `stopped — nothing left to recover` (a retry found the persona healthy) or, after a retry relaunched it, `kept — the tmux-unavailable condition cleared, but its row last read pending` followed later by `stopped (pending-only, row <state>) — its row is live out of pending; nothing else is called`; a clear between retries, by a health check or another call, logs `stopped — the tmux-unavailable condition cleared`.
@@ -2227,13 +2223,13 @@ The notice quotes the name for the shell: it is wrapped in single quotes, with e
 To follow one persona's hold in `server.log`:
 
 ```sh
-grep -E 'conflict-latch: (persona=<key> |re-check of .*\(key=<key>\) )|latch-recheck: .*\(key=<key>\)|latch-clear: .*(\(key=<key>\)|persona=<key> )|\(key=<key>\): .*— CONFLICT: |\(key=<key>\) latched from its own listed row |\(key=<key>\): forgetting its latch failed|\(key=<key>\) — .*latched \(case=|(Not scheduling|Skipping) restart for persona=<key> — the persona is latched|Session relaunch for persona=<key> ended latched|reconnectSession: persona=<key> is latched|unavailable-retry: persona=<key> (stopped.* — the persona is latched|the latched query failed)|persona-episodes: persona=<key> ((tmux-unresponsive|unclassified-error) ended — the persona latched|conflict notice failed)' ~/.claude/channels/slack/server.log
+grep -E 'conflict-latch: (persona=<key> |re-check of .*\(key=<key>\) )|latch-recheck: .*\(key=<key>\)|latch-clear: .*(\(key=<key>\)|persona=<key> )|\(key=<key>\): .*— CONFLICT: |\(key=<key>\) latched from its own listed row |\(key=<key>\): forgetting its latch failed|\(key=<key>\) — .*latched \(case=|(Not scheduling|Skipping) restart for persona=<key> — the persona is latched|Session relaunch for persona=<key> ended latched|reconnectSession: persona=<key> is latched|unavailable-retry: persona=<key> (stopped.* — the persona is latched|the latched query failed)|persona-episodes: persona=<key> ((tmux-unresponsive|unclassified-error) ended — the persona latched|conflict notice failed)' ~/.config/cscb/server.log
 ```
 
 `[slack] conflict-latch: persona=<key> latched — case=<case> session="<name>" refused=<operation> state=<state>` marks the hold (with ` message="<description>"` when agent-director gave one), and after it, once the hold is in place, the launch step that met it logs `[slack] spawnForPersona: <step> refused for "<name>" (key=<key>): <error> — CONFLICT: the persona latched; no spawn-failure notice; nothing more is called (b.jg5 SRJ-105, SRJ-501)`. Each launch the server then skips logs `[slack] spawnForPersona: not launching "<name>" (key=<key>) — it is latched (case=<case>); no agent-director call (b.jg5 SRJ-502)`, each restart it declines to schedule `[slack] Not scheduling restart for persona=<key> — the persona is latched; no timer armed (b.jg5 SRJ-502)`, each restart already pending that it skips `[slack] Skipping restart for persona=<key> — the persona is latched; no agent-director call, nothing recorded (b.jg5 SRJ-502)`, and each reconnect it declines to type `[slack] reconnectSession: persona=<key> is latched — not typing /mcp reconnect; nothing done (b.jg5 SRJ-502)`. When the server cannot tell whether the persona is held, it treats it as held: those lines then say `taken as latched`. A hold set by a start's listing is followed by `[slack] reconcileOrphans: "<name>" (key=<key>) latched from its own listed row instanceId=cscb_<key> (case=<case>) — its own row and every row labelled with it are left unkilled (b.jg5 SRJ-116, SRJ-502, SRJ-714)`. Each of the server's own checks logs one line, `[slack] conflict-latch: re-check of "<name>" (key=<key>) — case=<case> call=<call> answer=<answer>`: `call=none` when it made no call after its read, and `answer` what came of it (for example `still-latched`, or `no-information (…)` for an answer that told the server nothing). A clear logs `[slack] conflict-latch: persona=<key> cleared — case=<case> session="<name>" reason="<reason>"; recovery notice posted`, and the bring-up that follows it lines starting `[slack] latch-clear: `, such as `[slack] latch-clear: "<name>" (key=<key>)'s retry at once after its latch cleared answered <outcome> (b.jg5 SRJ-506)`. To follow only the clears:
 
 ```sh
-grep -E 'conflict-latch: persona=<key> cleared — |latch-clear: .*(\(key=<key>\)|persona=<key> )' ~/.claude/channels/slack/server.log
+grep -E 'conflict-latch: persona=<key> cleared — |latch-clear: .*(\(key=<key>\)|persona=<key> )' ~/.config/cscb/server.log
 ```
 
 The `debug-slack-channel-bots` skill explains every line.
@@ -2249,7 +2245,7 @@ What to do: a human follows the "Operator actions" section of agent-director's R
 
 ```sh
 agent-director get --claude-instance-id cscb_<key>
-grep -E 'conflict-latch: persona=<key> (latched|relatched) — case=unusable-recorded-name|(\(key=<key>\)|persona=<key>): .*— UNUSABLE NAME: |reconnectSession: persona=<key> is waiting and is latched' ~/.claude/channels/slack/server.log
+grep -E 'conflict-latch: persona=<key> (latched|relatched) — case=unusable-recorded-name|(\(key=<key>\)|persona=<key>): .*— UNUSABLE NAME: |reconnectSession: persona=<key> is waiting and is latched' ~/.config/cscb/server.log
 ```
 
 `[slack] conflict-latch: persona=<key> latched — case=unusable-recorded-name session="<name>" refused=none state=<state> message="<description>"` marks the hold, and the step that met the answer logs a line containing `— UNUSABLE NAME: the persona latched`. While the persona is held, the health check and the persona's own check still read its state; a read that gets the same answer logs a line containing `— UNUSABLE NAME: the persona was already latched with this case`, and nothing more is done for it. The `debug-slack-channel-bots` skill explains every line.
@@ -2269,7 +2265,7 @@ What to do: a human follows the "Operator actions" section of agent-director's R
 
 ```sh
 agent-director get --claude-instance-id cscb_<key>
-grep -E 'conflict-latch: persona=<key> (latched|relatched) — case=launch-start-not-recorded|(\(key=<key>\)|persona=<key>): (its row reads pending with no launch start|its row read latches the persona \(case=launch-start-not-recorded)|\(key=<key>\) latched from its own listed row ' ~/.claude/channels/slack/server.log
+grep -E 'conflict-latch: persona=<key> (latched|relatched) — case=launch-start-not-recorded|(\(key=<key>\)|persona=<key>): (its row reads pending with no launch start|its row read latches the persona \(case=launch-start-not-recorded)|\(key=<key>\) latched from its own listed row ' ~/.config/cscb/server.log
 ```
 
 `[slack] conflict-latch: persona=<key> latched — case=launch-start-not-recorded session="slack_bot_<key>" refused=none state=pending` marks the hold (`relatched` and `(was <case>)` after the case when the persona was held for another reason). The read that found the row logs a line containing `its row reads pending with no launch start (state=pending) — the persona latched` or `its row read latches the persona (case=launch-start-not-recorded, state=pending) — the persona latched`. While the row stays as it is, each health check and each of the persona's own checks reads it again and logs the second line ending `— the persona was already latched with this case; nothing more is called for it (b.jg5 SRJ-115, SRJ-501)`, and nothing more is done for the persona. A hold set by a start's listing is followed by `[slack] reconcileOrphans: "<name>" (key=<key>) latched from its own listed row instanceId=cscb_<key> (case=launch-start-not-recorded) — its own row and every row labelled with it are left unkilled (b.jg5 SRJ-116, SRJ-502, SRJ-714)`. The `debug-slack-channel-bots` skill explains every line.
@@ -2296,7 +2292,7 @@ How a hold ends:
 A persona whose hold ended and whose launch is rejected again is held again, with one new notice. To follow one persona's hold in `server.log`:
 
 ```sh
-grep -E 'invalid-flags-hold: persona=<key> |\(key=<key>\) answered ErrInvalidFlags|(persona=<key>|\(key=<key>\)) .*held on ErrInvalidFlags' ~/.claude/channels/slack/server.log
+grep -E 'invalid-flags-hold: persona=<key> |\(key=<key>\) answered ErrInvalidFlags|(persona=<key>|\(key=<key>\)) .*held on ErrInvalidFlags' ~/.config/cscb/server.log
 ```
 
 `[slack] invalid-flags-hold: persona=<key> held — a reuse spawn answered ErrInvalidFlags and the version re-check did not stop the server; …` marks the hold, and the launch's own line, `[slack] reuseSpawnForPersona: reuse spawn of "<name>" (key=<key>) answered ErrInvalidFlags …`, follows it. Each launch the server then skips logs `[slack] spawnForPersona: not launching "<name>" (key=<key>) — it is held on ErrInvalidFlags; no agent-director call (held; b.jg5 SRJ-207)`, and each restart it declines to schedule `[slack] Not scheduling restart for persona=<key> — the persona is held on ErrInvalidFlags; no timer armed (b.jg5 SRJ-207)`. `[slack] invalid-flags-hold: persona=<key> hold ended — agent-director version <old> changed to <new> (b.jg5 SRJ-207)` marks the end, followed by `[slack] invalid-flags-hold: persona=<key> retried at once after its hold ended (b.jg5 SRJ-207)`; removing the persona, a destructive change to it or stopping the server logs `… hold forgotten — …` instead. When the server cannot tell whether the persona is held, it treats it as held: those lines then say `taken as held`. The `debug-slack-channel-bots` skill explains every line.
@@ -2321,7 +2317,7 @@ For an old instance a persona waits on (see "A persona waits on an old instance 
 To follow one persona's kills and notices:
 
 ```sh
-grep -E 'persona-episodes: persona=<key> kill-failure |(kill try [0-9]+( of [0-9]+)?|kill tries) for cscb_<key>' ~/.claude/channels/slack/server.log
+grep -E 'persona-episodes: persona=<key> kill-failure |(kill try [0-9]+( of [0-9]+)?|kill tries) for cscb_<key>' ~/.config/cscb/server.log
 ```
 
 `[slack] persona-episodes: persona=<key> kill-failure ordinary alert posted to its destination (recovery; destination)` marks the *Kill failed* notice (`destination-latched` in place of `destination` for a held persona), `… survivor alert posted to its destination (recovery)` the *Process outlived kill* notice, `… ordinary alert not posted — its episode's alert already posted` a later failed kill in the same episode, and `… ended — its own row read ended or missing` or `… ended — its own row is gone (ErrSpawnNotFound)` the episode's end. `… alert written to the server log and startup-errors.log (<class>) — not-configured` is the notice for a persona no longer in the configuration (`<class>` `persona-kill-failed` or `persona-kill-survivor`), `… alert written to the server log and startup-errors.log (<class>) — persona-teardown, raised during its teardown (<context>)` is a notice raised while a confirmed change's teardown of the persona runs, whether or not the persona is still in the configuration (`<class>` `persona-teardown-notice` or `persona-kill-survivor`), and `… alert not posted to its destination — muted, its persona teardown was submitted …` one raised after the teardown was queued and before it started. `… ordinary alert not raised — its tries were stopped (<cause>)…, so nothing retries this kill; …` is a kill whose tries were stopped, `<cause>` naming the stop (such as `its keep-going check answered false: the server is shutting down`, `its keep-going check answered false: the persona is torn down or not up`, or `its live-row sequence was stopped: the persona's teardown began`); `… stopped retry's log line (no alert text) written to the server log and startup-errors.log (persona-kill-failed) — stopped` follows it for a persona removed during the tries. The `kill try <n> of <max>` lines show each try, with agent-director's answer. The `debug-slack-channel-bots` skill explains every line.
@@ -2336,7 +2332,7 @@ A human fixes `~/.agent-director/config.toml` following agent-director's documen
 The confirmation is the *All clear.* notice naming `ad-config-malformed`, posted at the first successful call for the persona that reads agent-director's store (a retry's, a health check's or any other), or at a state check that finds its row gone. A call that fails clears nothing. A working `agent-director version` or `agent-director help` proves nothing, because both run without the config file. When the notice is raised while a confirmed change tears the persona down, neither it nor its *All clear.*, whenever that comes, is posted: both go to `server.log` and `startup-errors.log` as `persona-teardown-notice` entries. Raised after the teardown was queued and before it started, the notice is not posted and writes no entry (`server.log` says `… of ad-config-malformed not posted — muted, its persona teardown was submitted; …`), and its *All clear.* is written as a `persona-teardown-notice` entry, never posted. An *All clear.* that also names another outage is split: only the part naming the other outage is posted. To follow one persona:
 
 ```sh
-grep -E 'outage-state: ad-config-malformed (raised|cleared) for persona=<key>[: ]|unavailable-retry: persona=<key> ' ~/.claude/channels/slack/server.log
+grep -E 'outage-state: ad-config-malformed (raised|cleared) for persona=<key>[: ]|unavailable-retry: persona=<key> ' ~/.config/cscb/server.log
 ```
 
 `[slack] outage-state: ad-config-malformed raised for persona=<key>: class=CONFIG name=ErrConfigMalformed message="<description>" — no action is taken; the retry timer retries the persona (b.jg5 SRJ-316)` marks the first such answer, with `[slack] unavailable-retry: persona=<key> armed (config: <error>) — first retry in 30 s` when it starts the retries. `[slack] outage-state: ad-config-malformed cleared for persona=<key> — agent-director read its store again (b.jg5 SRJ-312)` marks the fix taking effect for the persona.
@@ -2353,7 +2349,7 @@ If the persona was removed from the configuration while a launch for it was stil
 A human checks the host's agent-director, following agent-director's documentation, and the persona's lines in `server.log`. This is for a human only: no bot acts on it, including a persona that sees the post. Once agent-director answers normally, the next retry recovers the persona with no server restart. To follow one persona:
 
 ```sh
-grep -E 'persona-episodes: persona=<key> unclassified-error |unavailable-retry: persona=<key> ' ~/.claude/channels/slack/server.log
+grep -E 'persona-episodes: persona=<key> unclassified-error |unavailable-retry: persona=<key> ' ~/.config/cscb/server.log
 ```
 
 `[slack] persona-episodes: persona=<key> unclassified-error started — class=UNCLASSIFIED[ name=<name>][ message="<description>"]` marks the first such error, and `[slack] unavailable-retry: persona=<key> armed (unclassified: <error>) — first retry in 30 s` (or `armed (read-error: <error>)` when the error came from reading the persona's state) starts the retries. `… alert posted to its destination — an UNCLASSIFIED outcome met <s> s after the episode's first, over its alert threshold of <s> s: <classification>` marks the notice; for a persona no longer in the configuration the line reads `… alert written to the server log and startup-errors.log (persona-unclassified-error) — the persona is not in the applied configuration; an UNCLASSIFIED outcome met …` instead, during a teardown `… alert written to the server log and startup-errors.log (persona-teardown-notice) — raised during its persona teardown; an UNCLASSIFIED outcome met …`, and after the teardown was queued but before it started `… alert not posted to its destination — muted, its persona teardown was submitted; …`. `… ended — a retry found nothing left to recover`, `… ended — a retry read its row live out of pending`, `… ended — its retry timer stopped when its tmux condition ended`, `… ended — a retry read its row ended or gone`, `… ended — the persona reached the restart cap` or `… ended — the persona latched` ends the episode. Each launch step the error stopped logs `[slack] spawnForPersona: <step> refused for "<name>" (key=<key>): <error> — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)`, and a restart's kill that met it logs `[slack] killSession (restart adapter): kill for persona=<key>: outcome=not-killed class=UNCLASSIFIED …`, then `[slack] Session kill for persona=<key> did not succeed (…) — no relaunch; not counted`.
@@ -2371,8 +2367,8 @@ The installed agent-director is below the agent-director client's own minimum, s
 The precheck passed and the server was stopped, but at least one persona could not be stopped. This is intentional: the command fails loudly rather than reporting a clean stop. After `stop --stop-bots` the server stays stopped. After `clean_restart` the server was started again if agent-director answered its check; `[slack] clean_restart: start failed with exit code <n>` means that start failed (the reason is in `server.log`). If agent-director did not answer, the command printed the alert ending `the server was not started: start it once agent-director answers` and recorded `clean-restart-not-restarted`: start the server with `claude-slack-channel-bots start` once `agent-director version` answers (see [When `clean_restart` can't stop a bot](#when-clean_restart-cant-stop-a-bot)). Each `could not stop persona` line names the persona, its session and why, by class (see [What the command prints when a bot can't be stopped](#what-the-command-prints-when-a-bot-cant-be-stopped)); the same lines are in `server.log` and `startup-errors.log`, and for `clean_restart` in `clean_restart.log`:
 
 ```sh
-grep -E 'could not stop persona|\(CLI teardown, ' ~/.claude/channels/slack/server.log
-grep -E '\[(cli-teardown-failed|persona-kill-failed|persona-kill-survivor|clean-restart-not-restarted)\]' ~/.claude/channels/slack/startup-errors.log
+grep -E 'could not stop persona|\(CLI teardown, ' ~/.config/cscb/server.log
+grep -E '\[(cli-teardown-failed|persona-kill-failed|persona-kill-survivor|clean-restart-not-restarted)\]' ~/.config/cscb/startup-errors.log
 ```
 
 Fix the cause first: for `UNAVAILABLE`, confirm agent-director is installed and responsive with `agent-director version`; for the other classes, see [When a bot can't be paused](#when-a-bot-cant-be-paused) and [When a bot can't be force-killed](#when-a-bot-cant-be-force-killed). When the line is followed by a *Kill failed* text, the worker may still be running: a human follows the "Operator actions" section of agent-director's README for it, and no bot acts on it. Rows are never deleted on any failure path, so running the command again is safe once the cause is fixed.
@@ -2396,7 +2392,7 @@ This is a known regression in certain Claude Code releases (e.g. v2.1.120) where
 
 ## Server log rotation
 
-The server daemon writes runtime output to `~/.claude/channels/slack/server.log` (and `clean_restart.log` for the `clean_restart` subcommand). Rotation is built into CSCB, so it applies on every machine with no per-host logrotate config: when the active file crosses `CSCB_LOG_MAX_BYTES` it is rolled to `server.log.1`, the previous `.1` → `.2`, and so on up to `CSCB_LOG_KEEP` generations; the oldest is discarded. Rotated generations are not compressed. See the environment-variable table above for the size, retention, and verbosity settings that tune this behavior.
+The server daemon writes runtime output to `~/.config/cscb/server.log` (and `clean_restart.log` for the `clean_restart` subcommand). Rotation is built into CSCB, so it applies on every machine with no per-host logrotate config: when the active file crosses `CSCB_LOG_MAX_BYTES` it is rolled to `server.log.1`, the previous `.1` → `.2`, and so on up to `CSCB_LOG_KEEP` generations; the oldest is discarded. Rotated generations are not compressed. See the environment-variable table above for the size, retention, and verbosity settings that tune this behavior.
 
 `stop --stop-bots` and `clean_restart` append their bot-teardown lines to `server.log` while the server is stopped (see [What the command prints when a bot can't be stopped](#what-the-command-prints-when-a-bot-cant-be-stopped)); those lines take the same timestamped form and are rotated the same way.
 
@@ -2406,7 +2402,7 @@ Note this covers only `server.log` / `clean_restart.log`. `startup-errors.log` a
 
 ## Startup errors
 
-CSCB writes startup errors to `~/.claude/channels/slack/startup-errors.log` (override the directory with `SLACK_STATE_DIR`) in addition to stderr. Each entry is a single timestamped line. The file is append-only and never rotated by CSCB — copy `docs/logrotate-startup-errors.conf` into `/etc/logrotate.d/` if you want host-level rotation.
+CSCB writes startup errors to `~/.config/cscb/startup-errors.log` (override the directory with `SLACK_STATE_DIR`) in addition to stderr. Each entry is a single timestamped line. The file is append-only and never rotated by CSCB — copy `docs/logrotate-startup-errors.conf` into `/etc/logrotate.d/` if you want host-level rotation.
 
 The classes in the first list are fatal: the process exits non-zero. Two of them can also be written while the server runs (see "Found while the server was running" after the list). The later groups (Slack Reply Guard setup, persona launch and conversation memory) are non-fatal: they are recorded, and the start continues. Four non-fatal classes, `persona-unclassified-error`, `persona-kill-failed`, `persona-teardown-notice` and `persona-kill-survivor`, are written while the server runs; of them only `persona-kill-survivor` can also be written at start (see "Written while the server runs" below). `stop --stop-bots` and `clean_restart` write `cli-teardown-failed`, `persona-kill-failed` and `persona-kill-survivor` entries while the server is stopped, and `clean_restart` also `clean-restart-not-restarted` (see "Written by `stop --stop-bots` and `clean_restart`" below).
 
@@ -2428,9 +2424,11 @@ Fatal classes you may see:
 - `retired-keys-unreadable` — the retired-key record, `retired-keys.json` in the state directory, exists but can't be read, parsed or validated (it was edited or damaged, or the path isn't a regular file), so the server doesn't start: it never guesses which persona keys are retired. The entry names the file and what is wrong with it. Moving the file aside lets the server start, at the cost that the keys it held are no longer retired, so a persona whose key it held may resume the conversation of the life that was retired:
 
   ```sh
-  STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+  STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cscb}"
   mv "$STATE/retired-keys.json" "$STATE/retired-keys.json.moved-aside"
   ```
+
+- `state-dir-migration` — the start's move of the state directory out of `~/.claude/channels/slack` (see [Migration](#migration)) refused to go on: a server of the earlier release is still running on the old directory, or a step of the move failed. Unlike every other class, this entry is written to the **old** directory's `startup-errors.log` (`~/.claude/channels/slack/startup-errors.log`), where an operator of the earlier release looks, and the same text goes to stderr. Nothing is lost: what did not move is still in the old directory. Each line and its fix is in [The state directory's location and its move at start](skills/debug-slack-channel-bots/SKILL.md#the-state-directorys-location-and-its-move-at-start) in the debugging skill.
 
 **Found while the server was running.** `ad-system-install-too-old` and `ad-below-phase1-floor` can also be written by the runtime re-check: while the server runs, it re-checks the agent-director binary every 120 s, whatever `health_check_interval` is (`0` included), and stops with a non-zero exit when the binary fails either check. The entry names the version found, the version required, the binary path and that it was found by a runtime re-check while the server was running, so the server stopped. The stop posts nothing to Slack and leaves every bot and its agent-director row as it was: the bots keep running, but nothing serves them. This stop is not a switch-over case: what to do is under [Found while the server was running](skills/debug-slack-channel-bots/SKILL.md#found-while-the-server-was-running) in the debugging skill.
 
@@ -2522,7 +2520,7 @@ After all gates pass, the skill, in this order:
 7. Pushes the `v<version>` tag to `origin`, bringing GitHub and npm into agreement.
 8. Polls the npm registry every 5 seconds for up to 10 minutes until the new version is visible, printing a progress line every ~30 seconds. npm propagation commonly takes a few minutes, so a multi-minute wait here is normal.
 9. Sanitizes the bun-1.3.13 empty-string-dependency-key poison from the global `package.json` (see [Installing from a local worktree](#installing-from-a-local-worktree)), removes any pre-existing global install, then runs `bun install -g claude-slack-channel-bots@<version>` — the exact command an end user would run — and verifies the installed bin resolves under `~/.bun/install/global/` at the published version. If the `claude-slack-channel-bots` on PATH resolves somewhere else (an install in another bun prefix shadowing this one), the diagnostic names the shadowing path, the symlink chain, and the manual fix.
-10. Trusts the package if the global manifest does not already (`bun pm -g trust`) and checks that the postinstall's `~/.claude/channels/slack/config.json` (under `SLACK_STATE_DIR` when it is set) and `~/.claude/slack-mcp.json` exist — a missing file is a warning, not a release failure.
+10. Trusts the package if the global manifest does not already (`bun pm -g trust`) and checks that the postinstall's `config.json` in the state directory and `~/.claude/slack-mcp.json` exist. The state directory is `SLACK_STATE_DIR` when it is set, else `~/.config/cscb`, except that until the server's first start on the new default has moved the old directory the check looks in `~/.claude/channels/slack`: while a live server's `server.pid` is there, or while it holds the real `config.json` (or a `server.pid`) and `~/.config/cscb` holds none. A missing file is a warning, not a release failure.
 11. Prints a success summary identifying the published version, npm URL, GitHub release tag URL, resolved local install path, and the next-operator-action command.
 
 ### After the skill exits
@@ -2547,10 +2545,12 @@ This release and agent-director Phase 1 are installed together, and rolled back 
    * * * * * $HOME/.agent-director/bin/agent-director find-missing
    ```
    The job must run as the workers' user and resolve their tmux socket, the socket switch-over step 1 pins.
-3. **Install the startup-errors logrotate snippet** so `~/.claude/channels/slack/startup-errors.log` doesn't grow unboundedly. Edit `USER` in the file to match the OS account running CSCB:
+3. **Install the startup-errors logrotate snippet** so `~/.config/cscb/startup-errors.log` doesn't grow unboundedly. Edit `USER` in the file to match the OS account running CSCB:
    ```sh
    sudo cp docs/logrotate-startup-errors.conf /etc/logrotate.d/claude-slack-channel-bots
    ```
+   A snippet installed by an earlier release names `/home/USER/.claude/channels/slack/startup-errors.log`: copy the file again, or change that path to `/home/USER/.config/cscb/startup-errors.log`.
+4. **Stop the old server before the first start after an upgrade from a release that kept its state under `~/.claude`.** Claude Code asks the user before every write under `~/.claude`, so the state directory is now `~/.config/cscb` (`$XDG_CONFIG_HOME/cscb` when `XDG_CONFIG_HOME` is an absolute path), beside the credentials files and the crontable. The first `start` moves the old directory's files there and leaves a symbolic link at the old name; it refuses to start while a server is still running on the old directory. Run `claude-slack-channel-bots stop` (it finds the old directory), then `start`; `clean_restart` does both. With `SLACK_STATE_DIR` set, nothing moves. What the move does with each file, and with a file present in both places, is in the [CHANGELOG](CHANGELOG.md) entry "The state directory moves out of `~/.claude`".
 
 ### Switching over to agent-director Phase 1
 

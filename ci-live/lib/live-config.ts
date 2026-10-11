@@ -9,8 +9,9 @@
  * The runner writes these instead of running the wizard (a deviation the
  * results' Notes record). The configuration also names the container's
  * crontable (`cron_table_path`, `CONTAINER_CRON_TABLE_PATH`), which the
- * wizard leaves out: the default (`~/.config/cscb/crontab`, bug b.avm) is on
- * the read-only credentials mount. Neither the configuration it writes nor D's entry
+ * wizard leaves out: the path is the default's (bug b.fc4: the state
+ * directory, `~/.config/cscb`, now holds the crontable), written out so the
+ * start's default-crontable preparation is not in play. Neither the configuration it writes nor D's entry
  * carries the invited-channel switch or an `invited` section: every check
  * before Check 30 runs with the switch absent (b.deo SRI-1507).
  *
@@ -43,19 +44,23 @@ export interface WorkspaceIds {
   dHome: string
 }
 
-/** The container's state directory (the default; no SLACK_STATE_DIR). */
-export const CONTAINER_STATE_DIR = '/home/testuser/.claude/channels/slack'
+/**
+ * The container's state directory (the default, `~/.config/cscb` since bug
+ * b.fc4; no SLACK_STATE_DIR). The runner's read-only credentials mount is a
+ * sibling directory, `CONTAINER_CREDENTIALS_DIR` (`~/.config/cscb-credentials`),
+ * so the server can write here.
+ */
+export const CONTAINER_STATE_DIR = '/home/testuser/.config/cscb'
 export const SYSTEM_PROMPT_PATH = `${CONTAINER_STATE_DIR}/system-prompt.md`
 
 /**
  * The container's crontable, named in config.json (`cron_table_path`) in the
- * state directory, where every run before bug b.avm had it. A deviation from
- * the wizard's answers, which leave the key out: the default would be
- * `~/.config/cscb/crontab` (b.avm), and the container's `~/.config/cscb` is
- * the runner's read-only mount of the credentials directory, so the
- * scheduler could not create it there. The state directory exists before
- * the first start (the runner writes config.json in it), as a written path
- * needs (the server never makes its directory, D-Q1).
+ * state directory. A deviation from the wizard's answers, which leave the key
+ * out: the default is this same path (`<state dir>/crontab`, bug b.fc4), and
+ * writing it out keeps the run independent of the default-crontable
+ * preparation. The state directory exists before the first start (the runner
+ * writes config.json in it), as a written path needs (the server never makes
+ * a crontable's directory, D-Q1).
  */
 export const CONTAINER_CRON_TABLE_PATH = `${CONTAINER_STATE_DIR}/crontab`
 
@@ -132,7 +137,7 @@ export const SWITCH_VALUE_JQ = `(.${SWITCH_KEY} // false)`
 function base(letter: PersonaLetter): Pick<PersonaEntry, 'name' | 'credentials_file' | 'working_directory'> {
   return {
     name: personaName(letter),
-    credentials_file: `~/.config/cscb/${credentialsFileName(letter)}`,
+    credentials_file: `~/.config/cscb-credentials/${credentialsFileName(letter)}`,
     working_directory: `~/cscb-live/${letter}`,
   }
 }

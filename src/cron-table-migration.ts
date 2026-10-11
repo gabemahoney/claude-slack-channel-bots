@@ -3,12 +3,22 @@
  * location, and the move of a crontable left at the old default (bug b.avm).
  *
  * Before b.avm the crontable's default was `<config dir>/crontab`, which is
- * `~/.claude/channels/slack/crontab` for a default install. Claude Code asks
+ * the `crontab` file of the `slack` directory in `~/.claude/channels` for a
+ * default install. Claude Code asks
  * the user before every write under `.claude`, and bots edit the crontable
  * often, so each self-scheduled line cost the user a permission prompt. The
  * default now sits outside `~/.claude` (`resolveDefaultCronTablePath` in
  * `config.ts`: `$XDG_CONFIG_HOME/cscb/crontab`, `~/.config/cscb/crontab`
  * by default, when `SLACK_STATE_DIR` is unset).
+ *
+ * Bug b.fc4 made this migration dormant: the state directory itself now
+ * defaults to `$XDG_CONFIG_HOME/cscb`, and the start's state directory move
+ * (`state-dir-migration.ts`, which runs first in `main()`) carries the old
+ * crontable and `prompts/` along with every other file. The default crontable
+ * path is now `<state dir>/crontab`, the legacy path, so `prepareDefaultCronTable`
+ * answers `legacy-is-default` and does nothing. It is kept as it was, with
+ * its tests, until a later release removes it; its outcomes still describe
+ * the b.avm hosts the state directory move meets.
  *
  * `prepareDefaultCronTable` runs once per start, in `main()`, after the start
  * resolved its configuration and before the start sweep, the start bring-up

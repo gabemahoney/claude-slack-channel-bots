@@ -173,8 +173,10 @@ describe('cron config keys — defaults track loaded config dir', () => {
 // ---------------------------------------------------------------------------
 
 describe('crontable default outside ~/.claude (bug b.avm)', () => {
-  /** A default install's config directory under the case's home. */
-  const stateDirUnder = (h: string): string => join(h, '.claude', 'channels', 'slack')
+  /** A default install's state directory under the case's home (b.fc4: outside ~/.claude). */
+  const stateDirUnder = (h: string): string => join(h, '.config', 'cscb')
+  /** A configuration directory that is not the default state directory, so a crontable beside it is told from the default. */
+  const configDirUnder = (h: string): string => join(h, 'cfg')
 
   test.each<[string, NodeJS.ProcessEnv, (h: string) => string]>([
     ['SLACK_STATE_DIR and XDG_CONFIG_HOME unset → <home>/.config/cscb/crontab', {}, (h) => join(h, '.config', 'cscb', 'crontab')],
@@ -182,16 +184,17 @@ describe('crontable default outside ~/.claude (bug b.avm)', () => {
     ['XDG_CONFIG_HOME absolute → $XDG_CONFIG_HOME/cscb/crontab', { XDG_CONFIG_HOME: '/xdg/conf/' }, () => '/xdg/conf/cscb/crontab'],
     ['XDG_CONFIG_HOME empty is ignored', { XDG_CONFIG_HOME: '' }, (h) => join(h, '.config', 'cscb', 'crontab')],
     ['XDG_CONFIG_HOME relative is ignored', { XDG_CONFIG_HOME: 'rel/conf' }, (h) => join(h, '.config', 'cscb', 'crontab')],
-    ['SLACK_STATE_DIR set → <config dir>/crontab, beside the state directory\'s config.json, whatever XDG_CONFIG_HOME says',{ SLACK_STATE_DIR: '/srv/state', XDG_CONFIG_HOME: '/xdg/conf' }, (h) => join(stateDirUnder(h), 'crontab')],
+    ['SLACK_STATE_DIR set → <config dir>/crontab, beside the state directory\'s config.json, whatever XDG_CONFIG_HOME says',{ SLACK_STATE_DIR: '/srv/state', XDG_CONFIG_HOME: '/xdg/conf' }, (h) => join(configDirUnder(h), 'crontab')],
   ])('resolveDefaultCronTablePath: %s', (_label, env, expected) => {
-    expect(resolveDefaultCronTablePath(stateDirUnder(home), home, env)).toBe(expected(home))
+    expect(resolveDefaultCronTablePath(configDirUnder(home), home, env)).toBe(expected(home))
   })
 
-  test('over the server\'s own config path: SLACK_STATE_DIR set → <state dir>/crontab; unset → outside the default state dir under ~/.claude', () => {
+  test('over the server\'s own config path: SLACK_STATE_DIR set → <state dir>/crontab; unset → the default state dir, <home>/.config/cscb, outside ~/.claude', () => {
     const stateEnv = { SLACK_STATE_DIR: join(home, 'state') }
     expect(resolveDefaultCronTablePath(dirname(resolveServerConfigPath(home, stateEnv)), home, stateEnv)).toBe(join(home, 'state', 'crontab'))
     const configDir = dirname(resolveServerConfigPath(home, {}))
     expect(configDir).toBe(stateDirUnder(home))
+    expect(configDir.startsWith(join(home, '.claude'))).toBe(false)
     expect(resolveDefaultCronTablePath(configDir, home, {})).toBe(join(home, '.config', 'cscb', 'crontab'))
   })
 
@@ -209,13 +212,13 @@ describe('crontable default outside ~/.claude (bug b.avm)', () => {
   // the operator wrote, even the default's own file (D-Q1).
   test.each<[string, (h: string) => Record<string, unknown>, NodeJS.ProcessEnv, (h: string) => string, boolean]>([
     ['null → the default, flagged as filled in', () => ({ cron_table_path: null }), {}, (h) => join(h, '.config', 'cscb', 'crontab'), true],
-    ['absent with SLACK_STATE_DIR set → <config dir>/crontab, flagged as filled in', () => ({}), { SLACK_STATE_DIR: '/srv/state' }, (h) => join(stateDirUnder(h), 'crontab'), true],
+    ['absent with SLACK_STATE_DIR set → <config dir>/crontab, flagged as filled in', () => ({}), { SLACK_STATE_DIR: '/srv/state' }, (h) => join(configDirUnder(h), 'crontab'), true],
     ["written as the default's own file (~ expanded) → that path, not flagged", () => ({ cron_table_path: '~/.config/cscb/crontab' }), {}, (h) => join(h, '.config', 'cscb', 'crontab'), false],
     ["written as the default's own file (absolute) → that path, not flagged", (h) => ({ cron_table_path: join(h, '.config', 'cscb', 'crontab') }), {}, (h) => join(h, '.config', 'cscb', 'crontab'), false],
     ['written as another path → used verbatim (~ expanded under the home), not flagged', () => ({ cron_table_path: '~/cron/table' }), {}, (h) => join(h, 'cron', 'table'), false],
     ['written as an absolute path → used verbatim whatever XDG_CONFIG_HOME says, not flagged', () => ({ cron_table_path: '/etc/cron/table' }), { XDG_CONFIG_HOME: '/xdg/conf' }, () => '/etc/cron/table', false],
   ])('the loader: cron_table_path %s', (_label, keys, env, expected, defaulted) => {
-    const result = resolvePersonaConfig(makeInput(keys(home)), stateDirUnder(home), home, { env })
+    const result = resolvePersonaConfig(makeInput(keys(home)), configDirUnder(home), home, { env })
     expect([result.cron_table_path, result.cron_table_path_defaulted]).toEqual([expected(home), defaulted])
   })
 
@@ -230,7 +233,7 @@ describe('crontable default outside ~/.claude (bug b.avm)', () => {
       const run = runInFakeHome({
         modulePath: CONFIG_MODULE,
         call: 'process.stdout.write("PATH::" + mod.resolveDefaultCronTablePath(input.configDir, undefined, {}) + "\\n")',
-        input: { configDir: join(fakeHome, '.claude', 'channels', 'slack') },
+        input: { configDir: join(fakeHome, '.config', 'cscb') },
         home: fakeHome,
         stateDir: join(fakeHome, 'state'),
       })
