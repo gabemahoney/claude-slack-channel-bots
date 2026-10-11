@@ -72,6 +72,7 @@ import {
   HOST_VERSION_FAIL_VERSION_UNREADABLE,
   HOST_VERSION_OUTCOME_FAIL,
   HOST_VERSION_OUTCOME_PASS_BELOW_FLOOR,
+  PHASE1_RUNBOOK_DOC,
   PHASE1_RUNBOOK_SECTION_TITLE,
   PUBLISHING_HOST_BLOCK_HEADING,
   readField,
@@ -99,13 +100,13 @@ export {
 export type { InstallCheckClassLabel } from './install-check-labels.ts'
 
 /**
- * The README's switch-over runbook section, named by its title
+ * The switch-over runbook section in docs/migration.md, named by its title
  * (`PHASE1_RUNBOOK_SECTION_TITLE`), as the install check's and the startup
  * gate's texts point to it. No text that carries it advises installing,
  * reinstalling, upgrading or removing anything (b.jg5 SRJ-208, SRJ-212,
  * SRJ-1101).
  */
-export const RUNBOOK_SECTION_POINTER = `the README's switch-over runbook section "${PHASE1_RUNBOOK_SECTION_TITLE}"`
+export const RUNBOOK_SECTION_POINTER = `the switch-over runbook section "${PHASE1_RUNBOOK_SECTION_TITLE}" in ${PHASE1_RUNBOOK_DOC}`
 
 /**
  * The publishing-host block (`PUBLISHING_HOST_BLOCK_HEADING`) inside the

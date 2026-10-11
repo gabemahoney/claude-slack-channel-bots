@@ -7,7 +7,7 @@
  * from CSCB's GitHub repo, where to place it under `~/.claude/skills/`, and
  * how to invoke the skill once installed. The skill itself walks the operator
  * through the diagnosis; for a missing or too-old agent-director it names the
- * README's switch-over runbook and runs no agent-director install or upgrade
+ * switch-over runbook in docs/migration.md and runs no agent-director install or upgrade
  * itself (b.jg5 SRJ-208; the E2-gate hatch note).
  *
  * The append-on-three-branches rule lives in `agent-director-startup.ts` —

@@ -167,60 +167,57 @@ describe('CRONTABLE_TEMPLATE_HEADER — parser integration', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Group 6 — README / header drift guard
+// Group 6 — scheduled-prompts doc / header drift guard
 //
-// The README embeds CRONTABLE_TEMPLATE_HEADER verbatim in a fenced code block
-// and documents scheduler facts around it. These guards fail if the doc and
-// the shipped constant drift, or if a mandated fact is dropped from the docs.
-// README is resolved by path (repo root, relative to this test file) — never
-// by line number or section ordinal — and the header constant is imported,
-// never re-typed here.
+// docs/scheduled-prompts.md embeds CRONTABLE_TEMPLATE_HEADER verbatim in a
+// fenced code block and documents scheduler facts around it. These guards
+// fail if the doc and the shipped constant drift, or if a mandated fact is
+// dropped from the docs. The doc is resolved by path (repo root, relative to
+// this test file) — never by line number or section ordinal — and the header
+// constant is imported, never re-typed here.
 // ---------------------------------------------------------------------------
 
-// README lives at the repo root, one directory up from tests/.
-const README_PATH = join(import.meta.dir, '..', 'README.md')
-const README = readFileSync(README_PATH, 'utf-8')
+// The scheduled-prompts doc lives under docs/ at the repo root.
+const SCHEDULED_DOC = 'docs/scheduled-prompts.md'
+const SCHEDULED_DOC_TEXT = readFileSync(join(import.meta.dir, '..', SCHEDULED_DOC), 'utf-8')
 
-// Scope fact assertions to the Scheduled Prompts section so an unrelated
-// mention elsewhere can't mask a missing fact. Slice from the H2 heading to
-// the next H2 (the Permission Relay section). Falls back to the whole file if
-// the heading is ever renamed, so a rename fails on the verbatim guard rather
-// than silently narrowing to nothing.
-const SCHEDULED_PROMPTS_H2 = '## Scheduled Prompts (cscb_cron)'
-const schedStart = README.indexOf(SCHEDULED_PROMPTS_H2)
-const schedEnd = schedStart >= 0 ? README.indexOf('\n## ', schedStart + SCHEDULED_PROMPTS_H2.length) : -1
-const SCHEDULED_SECTION =
-  schedStart >= 0 ? README.slice(schedStart, schedEnd >= 0 ? schedEnd : undefined) : README
+// The doc is the Scheduled Prompts section: its H1 heads it, so fact
+// assertions scoped to it can't be masked by a mention in another doc. Falls
+// back to the whole file if the heading is ever renamed, so a rename fails on
+// the heading guard rather than silently narrowing to nothing.
+const SCHEDULED_PROMPTS_H1 = '# Scheduled Prompts (cscb_cron)'
+const schedStart = SCHEDULED_DOC_TEXT.indexOf(SCHEDULED_PROMPTS_H1)
+const SCHEDULED_SECTION = schedStart >= 0 ? SCHEDULED_DOC_TEXT.slice(schedStart) : SCHEDULED_DOC_TEXT
 // The section's own prose, without the embedded header: the header already
 // names CSCB_PERSONA, unknown-persona and name-or-key targets, so the new facts
-// must be stated in the README's prose, not only inside the embedded block.
+// must be stated in the doc's prose, not only inside the embedded block.
 const SCHEDULED_PROSE = SCHEDULED_SECTION.replace(CRONTABLE_TEMPLATE_HEADER.trim(), '')
 
-describe('README / CRONTABLE_TEMPLATE_HEADER drift guard', () => {
-  test('README embeds the exported header constant verbatim', () => {
-    // Primary guard: the fenced block in README must contain the shipped
+describe('scheduled-prompts doc / CRONTABLE_TEMPLATE_HEADER drift guard', () => {
+  test('the doc embeds the exported header constant verbatim', () => {
+    // Primary guard: the fenced block in the doc must contain the shipped
     // constant byte-for-byte (trimming only surrounding whitespace). Perturbing
-    // a single character inside the README header block fails this assertion.
-    expect(README).toContain(CRONTABLE_TEMPLATE_HEADER.trim())
+    // a single character inside the doc's header block fails this assertion.
+    expect(SCHEDULED_DOC_TEXT).toContain(CRONTABLE_TEMPLATE_HEADER.trim())
   })
 
-  test('Scheduled Prompts H2 section is present (fact assertions are scoped to it)', () => {
+  test('Scheduled Prompts H1 heading is present (fact assertions are scoped to it)', () => {
     expect(schedStart).toBeGreaterThanOrEqual(0)
   })
 
-  test('the README section the no-persona-list warning names is a heading in the Scheduled Prompts section (b.n4n)', () => {
+  test('the doc section the no-persona-list warning names is a heading in the scheduled-prompts doc (b.n4n)', () => {
     // The warning points there because an old crontable's own header may be
     // out of date; a renamed heading would leave it pointing at nothing.
-    const section = /README section "([^"]+)"/.exec(noPersonaListWarning(1, '/p/a.md'))?.[1]
-    expect(section).toBeDefined()
+    const pointer = /section "([^"]+)" in (\S+) is the reference/.exec(noPersonaListWarning(1, '/p/a.md'))
+    expect(pointer?.[2]).toBe(SCHEDULED_DOC)
     const headings = SCHEDULED_SECTION.split('\n')
       .filter((l) => /^#{2,6} /.test(l))
       .map((l) => l.replace(/^#+ /, ''))
-    expect(headings).toContain(section!)
+    expect(headings).toContain(pointer![1])
   })
 })
 
-describe('README — mandated crontable/scheduler facts', () => {
+describe('scheduled-prompts doc — mandated crontable/scheduler facts', () => {
   test('documents the CSCB_CRONTABLE_PATH env var name', () => {
     expect(SCHEDULED_SECTION).toContain('CSCB_CRONTABLE_PATH')
   })

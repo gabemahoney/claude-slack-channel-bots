@@ -124,7 +124,7 @@ import { join } from 'node:path'
 import { parse, TomlError } from 'smol-toml'
 
 import { AD_CONFIG_FILE_DISPLAY_NAME, AD_SETTINGS_RELATIVE_PATH } from './ad-config-file.ts'
-import { onAdVersionRecheckTick, PHASE1_RUNBOOK_SECTION_TITLE } from './ad-version-gate.ts'
+import { onAdVersionRecheckTick, PHASE1_RUNBOOK_DOC, PHASE1_RUNBOOK_SECTION_TITLE } from './ad-version-gate.ts'
 import {
   FILE_TOO_LARGE_CODE,
   MAX_RELOAD_FILE_SIZE_TEXT,
@@ -972,8 +972,8 @@ function isAtOrBelow(callTimeoutMs: number, needMs: bigint): boolean {
  * `resume`, `spawn-with-reuse` and `plain-spawn` share,
  * `resume/spawn-with-reuse/plain-spawn` ({@link AD_LAUNCH_CEILING_VERBS}).
  *
- *   [slack] agent-director settings: agent_director_call_timeout_ms is <value>, at or below its need of <need> ms (the <ceiling> ceiling plus the 15000 ms margin): a call can time out while its verb still acts; see the README's switch-over runbook, section "<title>" (b.jg5 SRJ-213)
- *   [slack] agent-director settings: agent_director_call_timeout_ms is <value>; its need is unknown: [pause] timeout_seconds holds <found>, a value that is not used, so pause's wait is not counted and the need without it is <need> ms; see the README's switch-over runbook, section "<title>" (b.jg5 SRJ-213)
+ *   [slack] agent-director settings: agent_director_call_timeout_ms is <value>, at or below its need of <need> ms (the <ceiling> ceiling plus the 15000 ms margin): a call can time out while its verb still acts; see the switch-over runbook in docs/migration.md, section "<title>" (b.jg5 SRJ-213)
+ *   [slack] agent-director settings: agent_director_call_timeout_ms is <value>; its need is unknown: [pause] timeout_seconds holds <found>, a value that is not used, so pause's wait is not counted and the need without it is <need> ms; see the switch-over runbook in docs/migration.md, section "<title>" (b.jg5 SRJ-213)
  *
  * The need is in milliseconds, like the setting. `<found>` is the reader's token-free
  * description; the line holds no file text, no string value and no token.
@@ -981,7 +981,7 @@ function isAtOrBelow(callTimeoutMs: number, needMs: bigint): boolean {
  */
 export function buildAdCallTimeoutWarningLine(callTimeoutMs: number, values: AdSettingsInEffect): string | undefined {
   const { needMs, setBy } = adCallTimeoutNeed(values)
-  const runbook = `see the README's switch-over runbook, section "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-213)`
+  const runbook = `see the switch-over runbook in ${PHASE1_RUNBOOK_DOC}, section "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-213)`
   const head = `${AD_SETTINGS_LOG_PREFIX} ${CALL_TIMEOUT_SETTING} is ${callTimeoutMs}`
   if (setBy.kind === 'unused-pause-value') {
     return (

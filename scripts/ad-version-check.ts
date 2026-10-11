@@ -49,6 +49,7 @@ import {
   HOST_VERSION_OUTCOME_FAIL,
   HOST_VERSION_OUTCOME_PASS_BELOW_FLOOR,
   PHASE1_FLOOR_VERSION,
+  PHASE1_RUNBOOK_DOC,
   PHASE1_RUNBOOK_SECTION_TITLE,
   PUBLISHING_HOST_BLOCK_HEADING,
   settleHostVersionCall,
@@ -73,7 +74,7 @@ export const AD_VERSION_CHECK_FAIL_EXIT_CODE = 15
 const BUMP_KIND_PLACEHOLDER = '<patch|minor|major>'
 
 /** Where every failure diagnostic points the operator. */
-const RUNBOOK_POINTER = `the switch-over runbook in the README (section "${PHASE1_RUNBOOK_SECTION_TITLE}")`
+const RUNBOOK_POINTER = `the switch-over runbook in ${PHASE1_RUNBOOK_DOC} (section "${PHASE1_RUNBOOK_SECTION_TITLE}")`
 
 /**
  * Where the not-found and below-client-minimum diagnostics point the

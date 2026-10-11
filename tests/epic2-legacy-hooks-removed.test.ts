@@ -8,8 +8,9 @@
  *   1. package.json `files` array does NOT contain "hooks/"
  *   2. hooks/ directory does NOT exist at the repo root
  *   3. skills/setup-slack-channel-bots/SKILL.md has no hook install instructions
- *   4. README.md has no hook install instructions outside the upgrade-notes section,
- *      and the new ## Upgrading from pre-Epic-2 section exists
+ *   4. README.md and the user docs have no hook install instructions outside the
+ *      upgrade-notes section, and the ## Upgrading from pre-Epic-2 section exists
+ *      in docs/migration.md
  *   5. docs/architecture.md describes the .sh files only as deleted/absent
  *
  * SPDX-License-Identifier: MIT
@@ -108,20 +109,23 @@ describe('b.hdk: SKILL.md has no legacy hook install instructions', () => {
 })
 
 // ---------------------------------------------------------------------------
-// 4. README.md — no hook install instructions; upgrade section exists
+// 4. README.md and the user docs — no hook install instructions; upgrade section exists
 //
-// The README has a legitimate "Upgrading from pre-Epic-2" section that tells
+// docs/migration.md has a legitimate "Upgrading from pre-Epic-2" section that tells
 // operators to *delete* old files. Deletion commands are fine — we only ban
 // install (cp / ln / chmod) instructions for these hooks.
 // The "## Upgrading from pre-Epic-2" heading must be present.
 // ---------------------------------------------------------------------------
 
-describe('b.hdk: README.md has no legacy hook install instructions', () => {
-  const readme = read('README.md')
+/** The README and every user doc under docs/ that the README's documentation table lists. */
+const USER_DOCS = ['README.md', 'docs/configuration.md', 'docs/reload.md', 'docs/cli.md', 'docs/bots.md', 'docs/scheduled-prompts.md', 'docs/agent-director.md', 'docs/troubleshooting.md', 'docs/migration.md']
 
-  test('## Upgrading from pre-Epic-2 section exists', () => {
+describe('b.hdk: README.md and the user docs have no legacy hook install instructions', () => {
+  const readme = USER_DOCS.map(read).join('\n')
+
+  test('## Upgrading from pre-Epic-2 section exists in docs/migration.md', () => {
     // Anchored regex so the heading must be an exact complete line (no extra text appended).
-    expect(readme).toMatch(/^## Upgrading from pre-Epic-2 \(v0\.5\.x → v0\.6\.x\)$/m)
+    expect(read('docs/migration.md')).toMatch(/^## Upgrading from pre-Epic-2 \(v0\.5\.x → v0\.6\.x\)$/m)
   })
 
   test('no `cp` install command targeting permission-relay.sh', () => {

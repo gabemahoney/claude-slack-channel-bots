@@ -92,7 +92,7 @@
  *   directory and nothing is at the latter: a symbolic link to the new
  *   directory is made beside the old one under a temporary name, the
  *   directory is renamed into the new folder, and the link is renamed to the
- *   old name. The README's convention keeps prompts there and names them
+ *   old name. The scheduled-prompts doc's convention keeps prompts there and names them
  *   `prompts/<file>`, so those lines resolve to the same files as before, a
  *   path through the old name still works, and a bot writing a prompt file
  *   writes outside `~/.claude`. When the rename fails with `EXDEV` (the two
@@ -144,7 +144,7 @@ import { parseCrontable } from './crontable.ts'
 // Constants
 // ---------------------------------------------------------------------------
 
-/** The prompts directory the README's convention keeps beside the crontable. */
+/** The prompts directory the scheduled-prompts doc's convention keeps beside the crontable. */
 export const CRON_PROMPTS_DIR_NAME = 'prompts'
 
 /** The start of every information line this module logs. */

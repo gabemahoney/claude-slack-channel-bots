@@ -37,7 +37,7 @@
 #   (not-restarted leg), D (pending-persona leg). Between legs the harness
 #   plays the operator while the server is stopped: config.json is rewritten
 #   to the next leg's personas and the last-applied record moved aside, so the
-#   next start applies config.json as it stands (README "Reload"); that
+#   next start applies config.json as it stands (docs/reload.md); that
 #   start's sweep kills the earlier leg's live rows (absent personas), in
 #   `log`, so no earlier persona's teardown enters a later leg's lines;
 # - stub workers: `dev-channels` (the reporting stub: the approver's Enter

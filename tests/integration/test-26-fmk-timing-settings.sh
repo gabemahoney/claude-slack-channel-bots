@@ -52,7 +52,7 @@
 #      plain stop and start
 # A persona added across a restart: a plain stop, the config written, the
 # state dir's config.json.last-applied removed, so the start applies
-# config.json as it stands with no preview to confirm (the README's
+# config.json as it stands with no preview to confirm (docs/reload.md,
 # "Reload"), and a start.
 #   R  work/r, `unrecognised-dialog`, answered by a harness Enter
 #      (`stub_press_enter`); added by a confirmed reload (config.json.pending
@@ -831,7 +831,7 @@ start_live() {
 
 # restart_with_personas <step> <x>...: a plain stop, the config with the
 # personas <x>..., the last-applied record removed (so the start applies
-# config.json as it stands, with no preview to confirm: the README's
+# config.json as it stands, with no preview to confirm: docs/reload.md,
 # "Reload"), and a start (`start_live`).
 restart_with_personas() {
     local step="$1"

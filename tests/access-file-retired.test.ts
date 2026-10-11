@@ -16,15 +16,18 @@
  *   5. The internal docs (engineering guide, architecture) name none of the
  *      retired access terms, and `access.json` only in the one allowed note
  *      that a leftover file is ignored and left in place (SR-12).
- *   6. README's Release section does not mention `access.json`. Outside
- *      "## Release", the README is governed by tests/shipped-docs.test.ts,
- *      whose `AUDIT_EXCEPTIONS` allow `access.json` only inside the two
- *      runbook sections, "Switching over to agent-director Phase 1" and
- *      "Rolling back the switch-over", by name, where the previous CSCB's file
- *      is saved and restored (b.jg5 SRJ-1516); it stays banned in every other
- *      README section. That exemption reaches no file read here: the skills
- *      stay fully in this file's scope (they point to the runbooks and do not
- *      repeat their steps), and no scope, term or matcher here is narrowed.
+ *   6. CONTRIBUTING.md's Release section ("## Release process", the H2
+ *      starting "Release") does not mention `access.json`. The release process
+ *      lives in CONTRIBUTING.md, not the README. Beyond this section, the
+ *      README, CONTRIBUTING.md and the user docs are governed by
+ *      tests/shipped-docs.test.ts, whose audit exceptions allow `access.json`
+ *      only inside the two runbook sections of docs/migration.md, "Switching
+ *      over to agent-director Phase 1" and "Rolling back the switch-over", by
+ *      name, where the previous CSCB's file is saved and restored (b.jg5
+ *      SRJ-1516); it stays banned in every other section. That exemption
+ *      reaches no file read here: the skills stay fully in this file's scope
+ *      (they point to the runbooks and do not repeat their steps), and no
+ *      scope, term or matcher here is narrowed.
  *
  * It reads repository files only and writes nothing. A failure lists every
  * offending `file:line` for the term named in the test title.
@@ -172,16 +175,22 @@ describe('the internal docs describe no retired access model', () => {
   }
 })
 
-describe("README's Release section", () => {
+const CONTRIBUTING_PATH = 'CONTRIBUTING.md'
+
+describe(`${CONTRIBUTING_PATH}'s Release section`, () => {
   test('names no access.json', () => {
-    const text = readFileSync(join(REPO_ROOT, 'README.md'), 'utf-8')
+    const text = readFileSync(join(REPO_ROOT, CONTRIBUTING_PATH), 'utf-8')
     // Fence-aware: a `# comment` in a shell block does not end the section.
     const range = sectionRange(text, /^## Release\b/)
     // Fail loudly rather than pass on an empty section when the heading moves.
-    if (range === undefined) throw new Error('README.md has no "## Release" heading; the Release-section guard cannot locate it')
+    if (range === undefined) {
+      throw new Error(`${CONTRIBUTING_PATH} has no "## Release" heading; the Release-section guard cannot locate it`)
+    }
     const { start, end } = range
     const section = text.split('\n').slice(start, end)
     expect(section.length).toBeGreaterThan(1)
-    expect(section.flatMap((line, i) => (ACCESS_JSON.test(line) ? [`README.md:${start + i + 1}`] : []))).toEqual([])
+    expect(
+      section.flatMap((line, i) => (ACCESS_JSON.test(line) ? [`${CONTRIBUTING_PATH}:${start + i + 1}`] : [])),
+    ).toEqual([])
   })
 })

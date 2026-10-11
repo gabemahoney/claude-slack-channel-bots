@@ -51,7 +51,7 @@
 #   mark's time;
 # - between legs the harness plays the operator: a plain `stop` (no
 #   teardown), an edit of config.json and the last-applied record moved aside,
-#   so the next start applies config.json as it stands (README "Reload");
+#   so the next start applies config.json as it stands (docs/reload.md);
 # - re-pointing a symlinked `working_directory` or `claude_config_dir`
 #   (`repoint_symlink`, a harness addition) is
 #   the working default that makes a real `cwd` or `config_dir` mismatch with
@@ -165,7 +165,7 @@
 #                   row `waiting`. `fail-kill` limited to R's session and
 #                   pane; the operator removes R from config.json and
 #                   confirms the apply by renaming the pending file to the
-#                   apply file (README "Reload"). R's teardown kill: each of
+#                   apply file (docs/reload.md). R's teardown kill: each of
 #                   its KILL_RETRY_TRIES tries answered ErrTmuxKillFailed, its
 #                   tries ended exhausted; exactly one `persona-teardown-notice`
 #                   entry naming R, "raised during its teardown", carrying the

@@ -205,7 +205,7 @@ AD_CHECK_EXIT=0
 bun scripts/ad-version-check.ts "${BUMP_KIND}" || AD_CHECK_EXIT=$?
 if [ "${AD_CHECK_EXIT}" -ne 0 ]; then
   if [ "${AD_CHECK_EXIT}" -ne 15 ]; then
-    echo "SR-2.5 (preflight): 'bun scripts/ad-version-check.ts' did not run to completion (exit ${AD_CHECK_EXIT}), so the host's agent-director could not be checked. Operator recovery: report the check's output above verbatim. State of the check is indeterminate; do NOT rerun '/publish ${BUMP_KIND}' until the operator has assessed. The host's agent-director is covered by the switch-over runbook in the README (section \"Switching over to agent-director Phase 1\")." >&2
+    echo "SR-2.5 (preflight): 'bun scripts/ad-version-check.ts' did not run to completion (exit ${AD_CHECK_EXIT}), so the host's agent-director could not be checked. Operator recovery: report the check's output above verbatim. State of the check is indeterminate; do NOT rerun '/publish ${BUMP_KIND}' until the operator has assessed. The host's agent-director is covered by the switch-over runbook in docs/migration.md (section \"Switching over to agent-director Phase 1\")." >&2
   fi
   sr_exit 15
 fi

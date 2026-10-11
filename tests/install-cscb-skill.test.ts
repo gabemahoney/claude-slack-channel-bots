@@ -22,8 +22,8 @@
  * it is not repeated here.
  *
  * Too-old branch (b.jg5 SRJ-208, C8): the `ad-system-install-too-old` branch,
- * found by its `###` heading naming the exported label, names the README
- * switch-over runbook section (title from `PHASE1_RUNBOOK_SECTION_TITLE`) and
+ * found by its `###` heading naming the exported label, names the
+ * switch-over runbook section in docs/migration.md (title from `PHASE1_RUNBOOK_SECTION_TITLE`) and
  * carries no agent-director upgrade or install command and no instruction to
  * run one. The forbidden forms are the shared upgrade forms
  * (tests/test-helpers/upgrade-forms.ts) plus the skill's own offers to run a
@@ -33,7 +33,7 @@
  *
  * The other branches (the E2-gate hatch note; b.jg5 SRJ-208, SRJ-1101; E36
  * T2): no branch names an install, re-install or upgrade command or runs the
- * installer, and each points to the README switch-over runbook.
+ * installer, and each points to the switch-over runbook in docs/migration.md.
  *   - `ad-system-install-not-found` names the runbook section's publishing-host
  *     block by its heading (`PUBLISHING_HOST_BLOCK_HEADING`, from
  *     src/ad-version-gate.ts) and the section by its title, holds no
@@ -86,9 +86,9 @@
  *     long-running agent-director process stopped before either binary
  *     change; started again after it), each self-checked against the
  *     statement with that clause dropped.
- *   - The runbooks: the skill names the README section of each runbook by its
+ *   - The runbooks: the skill names the docs/migration.md section of each runbook by its
  *     title (the switch-over title from `src/`, the rollback title from
- *     tests/test-helpers/runbooks.ts). No step title of either README section
+ *     tests/test-helpers/runbooks.ts). No step title of either runbook section
  *     (collected with the helper's step matcher) appears in the skill, and the
  *     skill has no heading in the runbook step form.
  * The too-old clause of SRJ-1110 is the too-old branch's block above; the
@@ -105,7 +105,7 @@ import { resolve } from 'node:path'
 import type { UnreachableReason } from 'agent-director'
 
 import { INSTALL_CHECK_NOTE_LABEL } from '../scripts/install-check.ts'
-import { PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE, PUBLISHING_HOST_BLOCK_HEADING } from '../src/ad-version-gate.ts'
+import { PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_DOC, PHASE1_RUNBOOK_SECTION_TITLE, PUBLISHING_HOST_BLOCK_HEADING } from '../src/ad-version-gate.ts'
 import { CLIENT_PACKAGE_REMEDY } from '../src/install-check.ts'
 import {
   AD_SYSTEM_INSTALL_NOT_FOUND,
@@ -275,9 +275,9 @@ const FORBIDDEN_TOO_OLD_FORMS: ForbiddenForm[] = [...UPGRADE_FORMS, ...RUN_OFFER
 describe(`install-cscb skill: the ${AD_SYSTEM_INSTALL_TOO_OLD} branch names the runbook and runs nothing (b.jg5 SRJ-208)`, () => {
   const branch = () => flat(classBranch(AD_SYSTEM_INSTALL_TOO_OLD))
 
-  test('the branch names the README switch-over runbook section by its title', () => {
+  test('the branch names the switch-over runbook section and its doc by title', () => {
     expect(branch()).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
-    expect(branch()).toContain('README')
+    expect(branch()).toContain(PHASE1_RUNBOOK_DOC)
   })
 
   test.each(FORBIDDEN_TOO_OLD_FORMS)('the branch carries no %s', (_label, pattern) => {
@@ -291,7 +291,7 @@ describe(`install-cscb skill: the ${AD_SYSTEM_INSTALL_TOO_OLD} branch names the 
   })
 
   test('self-check: no pattern matches the runbook pointer itself', () => {
-    const pointer = flat(`install agent-director by following the README section "${PHASE1_RUNBOOK_SECTION_TITLE}". Offer no command and run nothing.`)
+    const pointer = flat(`install agent-director by following the ${PHASE1_RUNBOOK_DOC} section "${PHASE1_RUNBOOK_SECTION_TITLE}". Offer no command and run nothing.`)
     expect(FORBIDDEN_TOO_OLD_FORMS.filter(([, pattern]) => pattern.test(pointer)).map(([label]) => label)).toEqual([])
   })
 
@@ -323,7 +323,7 @@ describe(`install-cscb skill: the ${AD_SYSTEM_INSTALL_TOO_OLD} branch names the 
 /**
  * SRJ-208's client-package check: the first clause of `CLIENT_PACKAGE_REMEDY`
  * (src/install-check.ts), before its pointer to the runbook section, which
- * the skill words as the README section.
+ * the skill words as the docs/migration.md section.
  */
 const CLIENT_PACKAGE_CHECK = (() => {
   const end = CLIENT_PACKAGE_REMEDY.indexOf(';')
@@ -395,7 +395,7 @@ function reasonBranchProblems(reason: UnreachableReason, text: string = skillCon
   const scanned = branch.split(PROBE_COMMAND_SPAN).join('')
   const blocks = splitFences(raw).blocks.map((block) => block.body.trim())
   return [
-    ...lacks(branch, [PHASE1_RUNBOOK_SECTION_TITLE, 'README']),
+    ...lacks(branch, [PHASE1_RUNBOOK_SECTION_TITLE, PHASE1_RUNBOOK_DOC]),
     ...formsIn(scanned, [...UPGRADE_FORMS, ...BRANCH_FORMS]),
     ...(reason === CHMOD_REASON
       ? blocks.filter((body) => body !== CHMOD_COMMAND).map((body) => `a fenced block other than ${CHMOD_COMMAND}: ${body}`)
@@ -403,7 +403,7 @@ function reasonBranchProblems(reason: UnreachableReason, text: string = skillCon
   ]
 }
 
-/** What the not-found and floor-unreadable branches must name besides the README section by its title. */
+/** What the not-found and floor-unreadable branches must name besides the runbook doc and section title. */
 const POINTER_BRANCHES: readonly [label: string, required: readonly string[]][] = [
   [AD_SYSTEM_INSTALL_NOT_FOUND, [`"${PUBLISHING_HOST_BLOCK_HEADING}"`]],
   [AD_VERSION_FLOOR_UNREADABLE, [CLIENT_PACKAGE_CHECK]],
@@ -418,14 +418,14 @@ function pointerBranchProblems(label: string, required: readonly string[], text:
   const raw = unquoted(classBranch(label, text))
   const branch = flat(raw)
   return [
-    ...lacks(branch, [PHASE1_RUNBOOK_SECTION_TITLE, 'README', ...required]),
+    ...lacks(branch, [PHASE1_RUNBOOK_SECTION_TITLE, PHASE1_RUNBOOK_DOC, ...required]),
     ...formsIn(branch, [...FORBIDDEN_TOO_OLD_FORMS, ...BRANCH_FORMS]),
     ...splitFences(raw).blocks.map((block) => `a fenced block: ${block.body.trim()}`),
   ]
 }
 
 describe(`install-cscb skill: the ${AD_SYSTEM_INSTALL_NOT_FOUND} and ${AD_VERSION_FLOOR_UNREADABLE} branches point to the runbook and run nothing (E2 gate; b.jg5 SRJ-208, SRJ-1101)`, () => {
-  test.each(POINTER_BRANCHES)('the %s branch names the README section and %p, and holds no command, upgrade, re-install or removal', (label, required) => {
+  test.each(POINTER_BRANCHES)('the %s branch names the runbook section and %p, and holds no command, upgrade, re-install or removal', (label, required) => {
     expect(pointerBranchProblems(label, required)).toEqual([])
   })
 
@@ -650,7 +650,7 @@ describe("install-cscb skill: the install check and its note (b.jg5 SRJ-1110, SR
 
   test('the note bullet says the server refuses to start until the switch-over, naming the runbook section', () => {
     expect(noteBullet()).toMatch(/\bserver refuses to start\b[^.]*\buntil the switch-over\b/i)
-    expect(noteBullet()).toContain(`README section "${PHASE1_RUNBOOK_SECTION_TITLE}"`)
+    expect(noteBullet()).toContain(`${PHASE1_RUNBOOK_DOC} section "${PHASE1_RUNBOOK_SECTION_TITLE}"`)
   })
 
   test('the note bullet offers no command and runs nothing', () => {
@@ -732,17 +732,17 @@ describe('install-cscb skill: the coupled install and rollback (b.jg5 SRJ-1110; 
   })
 })
 
-const README_TEXT = readFileSync(resolve(import.meta.dirname, '..', 'README.md'), 'utf-8')
+const RUNBOOK_TEXT = readFileSync(resolve(import.meta.dirname, '..', PHASE1_RUNBOOK_DOC), 'utf-8')
 
-/** The README's two runbooks: [which, section title]. */
+/** The two runbooks in docs/migration.md: [which, section title]. */
 const RUNBOOKS: [which: string, title: string][] = [
   ['switch-over', PHASE1_RUNBOOK_SECTION_TITLE],
   ['rollback', ROLLBACK_RUNBOOK_SECTION_TITLE],
 ]
 
-/** Each step heading's title in the README's `title` runbook section, without its `Step <n>: ` start. */
+/** Each step heading's title in the `title` runbook section, without its `Step <n>: ` start. */
 function runbookStepTitles(title: string): string[] {
-  return headings(requiredSection(README_TEXT, `### ${title}`, 'README.md')).flatMap((h) => {
+  return headings(requiredSection(RUNBOOK_TEXT, `### ${title}`, PHASE1_RUNBOOK_DOC)).flatMap((h) => {
     const n = stepNumberOf(h.title)
     return n === undefined ? [] : [h.title.slice(stepHeadingPrefix(n).length)]
   })
@@ -755,11 +755,11 @@ function repeatedSteps(text: string): string[] {
 }
 
 describe('install-cscb skill: the runbooks by title, their steps not repeated (b.jg5 SRJ-1110, SRJ-1516; hatch note E35)', () => {
-  test.each(RUNBOOKS)('dropping a runbook title: the skill names the README %s runbook section by its title', (_which, title) => {
-    expect(skillProse).toContain(`README section "${title}"`)
+  test.each(RUNBOOKS)('dropping a runbook title: the skill names the %s runbook section of docs/migration.md by its title', (_which, title) => {
+    expect(skillProse).toContain(`${PHASE1_RUNBOOK_DOC} section "${title}"`)
   })
 
-  test.each(RUNBOOKS)('sanity: the README %s runbook section yields at least one step', (_which, title) => {
+  test.each(RUNBOOKS)('sanity: the %s runbook section yields at least one step', (_which, title) => {
     expect(runbookStepTitles(title).length).toBeGreaterThan(0)
   })
 

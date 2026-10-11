@@ -4,6 +4,13 @@
  * and nothing else. It backs the SR-14 `shipped-docs` rows for AC 39, AC 46
  * and AC 74.
  *
+ * "The README" below names the user docs (`USER_DOC_FILES`): the README and
+ * the `docs/` pages that took its reference sections (configuration, reload,
+ * CLI, bots, scheduled prompts, agent-director, troubleshooting, and
+ * `docs/migration.md`, which holds both runbooks). Each check reads its
+ * section from the page that holds it; the row checks read the pages as one
+ * text (`userDocsText`), and every link check reads each page on its own.
+ *
  * Covers:
  * - the Slack app manifest (AC 39, SR-4.3, SR-12): `im:write` and the pinned
  *   scopes and events, and its comments;
@@ -213,8 +220,8 @@
  * - b.deo SRI-1308's README checks (SRI-1101 to SRI-1105; AC 42), beside
  *   T1's key-table, example and in-place-row cases above:
  *   - the headings T17 added, each exactly once where it was placed
- *     (`README_DEO_PLACEMENTS`): `## Channel modes` between `## Configuration`
- *     and `## Reload` with its four subsections in order, the security
+ *     (`README_DEO_PLACEMENTS`): `## Channel modes` the last section of
+ *     `# Configuration`, right before `# Reload`, with its four subsections in order, the security
  *     subsection inside "How a persona receives messages", and
  *     "Downgrading to an earlier release" a `###` of its own right after
  *     "Upgrading to personas";
@@ -237,7 +244,9 @@
  *     modes`; the tools table lists exactly six tools; the fungible-mode
  *     preview example is `renderPreviewLines` of the change it describes,
  *     loaded through the real loader in a `mkdtempSync` directory; the
- *     downgrade steps stand in order; every same-file README link resolves.
+ *     downgrade steps stand in order; in every user doc and CONTRIBUTING.md,
+ *     every same-file link resolves to its own heading and every repository
+ *     link to an existing file and heading.
  *   Each self-checked: every row item cut (`withItemCut`), each heading
  *   renamed, removed and moved, each pointer unlinked and its target
  *   renamed, the `set_channel_delivery` row removed, duplicated and renamed,
@@ -258,7 +267,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
-import { dirname, join, resolve } from 'path'
+import { dirname, join, relative, resolve } from 'path'
 
 import {
   CHANNEL_ENTRY_KEYS,
@@ -319,7 +328,7 @@ import {
   SET_CHANNEL_DELIVERY_DESCRIPTION,
 } from '../src/registry.ts'
 import { CHANNEL_DELIVERY_FILE_NAME, CHANNEL_DELIVERY_UNREADABLE, SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'
-import { AD_VERSION_RECHECK_INTERVAL_MS, DEBUG_SKILL_PATH, DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE, installAdVersionRecheck, meetsPhase1Floor, PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE, PUBLISHING_HOST_BLOCK_HEADING } from '../src/ad-version-gate.ts'
+import { AD_VERSION_RECHECK_INTERVAL_MS, DEBUG_SKILL_PATH, DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE, installAdVersionRecheck, meetsPhase1Floor, PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_DOC, PHASE1_RUNBOOK_SECTION_TITLE, PUBLISHING_HOST_BLOCK_HEADING } from '../src/ad-version-gate.ts'
 import {
   AD_BELOW_PHASE1_FLOOR,
   AD_SHIM_CATALOG_INCOMPLETE,
@@ -500,6 +509,47 @@ function readRepoFile(relPath: string): string {
   return readFileSync(resolve(REPO_ROOT, relPath), 'utf-8')
 }
 
+/**
+ * The user docs (docs/user-docs-guide.md): the README and the pages under
+ * `docs/` that took its reference sections. Each check that once read a README
+ * section reads it from the page that now holds it.
+ */
+const CONFIGURATION_DOC = 'docs/configuration.md'
+const RELOAD_DOC = 'docs/reload.md'
+const CLI_DOC = 'docs/cli.md'
+const BOTS_DOC = 'docs/bots.md'
+const SCHEDULED_PROMPTS_DOC = 'docs/scheduled-prompts.md'
+const AGENT_DIRECTOR_DOC = 'docs/agent-director.md'
+const TROUBLESHOOTING_DOC = 'docs/troubleshooting.md'
+/** The page holding both runbooks under `## Migration` (`PHASE1_RUNBOOK_DOC`). */
+const RUNBOOK_DOC = PHASE1_RUNBOOK_DOC
+const USER_DOC_FILES = [
+  'README.md',
+  CONFIGURATION_DOC,
+  RELOAD_DOC,
+  CLI_DOC,
+  BOTS_DOC,
+  SCHEDULED_PROMPTS_DOC,
+  AGENT_DIRECTOR_DOC,
+  TROUBLESHOOTING_DOC,
+  RUNBOOK_DOC,
+] as const
+/** CONTRIBUTING.md took the README's contributor sections (local install, release process). */
+const CONTRIBUTING_FILE = 'CONTRIBUTING.md'
+
+/**
+ * The name the user docs go by in a failure that reads them as one text
+ * (`userDocsText`): the checks written over the README's sections, which
+ * moved to the pages above, find each section there by its heading.
+ */
+const USER_DOCS_NAME = 'the user docs'
+
+/** A link target from user doc `from` to the repository file `to`, as `from` writes it: `(#<anchor>)` within `from`, else `(<relative path>#<anchor>)`. */
+const docLink = (from: string, to: string, anchor: string) => `(${from === to ? '' : relative(dirname(from), to)}#${anchor})`
+
+/** `RUNBOOK_DOC` as a link from a page under `docs/` writes it (`migration.md`). */
+const RUNBOOK_FROM_DOCS = relative('docs', RUNBOOK_DOC)
+
 /** A quote may open a YAML scalar only at its start: line start or after `:`, `-`, `[`, `{`, `,`. */
 function opensQuotedScalar(before: string): boolean {
   const prev = before.trimEnd()
@@ -569,8 +619,8 @@ describe('slack-app-manifest.yml', () => {
     expect(manifest.oauth_config.scopes.bot).toEqual(expect.arrayContaining(['lists:read', 'lists:write']))
   })
 
-  test('bug b.am4: the README names lists:read and lists:write and the re-install', () => {
-    const readme = readRepoFile('README.md')
+  test('bug b.am4: the configuration reference names lists:read and lists:write and the re-install', () => {
+    const readme = readRepoFile(CONFIGURATION_DOC)
     expect(readme).toContain('`lists:read` and `lists:write` bot scopes')
     expect(readme).toMatch(/earlier manifest must have both scopes added and be re-installed/)
   })
@@ -670,11 +720,11 @@ function codeSpans(cell: string): string[] {
   return [...cell.matchAll(/`([^`]+)`/g)].map((m) => m[1])
 }
 
-/** The README's persona configuration reference heading and its complete-example heading, DOC-1's interface. */
-const PERSONAS_HEADING = '### Personas (config.json)'
-const EXAMPLE_HEADING = '#### Example'
-/** The heading of the README's second complete example, in fungible mode (b.deo SRI-1101). */
-const FUNGIBLE_EXAMPLE_HEADING = '#### Example in fungible mode'
+/** The persona configuration reference heading (in `CONFIGURATION_DOC`) and its complete-example heading, DOC-1's interface. */
+const PERSONAS_HEADING = '## Personas (config.json)'
+const EXAMPLE_HEADING = '### Example'
+/** The heading of the reference's second complete example, in fungible mode (b.deo SRI-1101). */
+const FUNGIBLE_EXAMPLE_HEADING = '### Example in fungible mode'
 
 /**
  * The persona-entry key holding the fungible section (b.deo SRI-102): read
@@ -686,11 +736,11 @@ const FUNGIBLE_SECTION_KEY = 'invited' satisfies (typeof PERSONA_ENTRY_KEYS)[num
 const INVITED_DESTINATION_KEY = 'permission_prompts' satisfies (typeof PERSONA_INVITED_KEYS)[number]
 
 /** Where a section nested in the persona reference comes from, for `requiredSection` failures. */
-const IN_PERSONAS = `README.md, under "${PERSONAS_HEADING}",`
+const IN_PERSONAS = `${CONFIGURATION_DOC}, under "${PERSONAS_HEADING}",`
 
-/** The README's persona configuration reference, throwing when its heading is missing. */
-function personasSection(readme: string): string {
-  return requiredSection(readme, PERSONAS_HEADING, 'README.md')
+/** The persona configuration reference in `text` (`CONFIGURATION_DOC`), throwing when its heading is missing. */
+function personasSection(text: string): string {
+  return requiredSection(text, PERSONAS_HEADING, CONFIGURATION_DOC)
 }
 
 /**
@@ -751,6 +801,8 @@ function markdownLinks(text: string): { target: string; path: string; anchor: st
 
 describe('README.md', () => {
   const readme = readRepoFile('README.md')
+  const configuration = readRepoFile(CONFIGURATION_DOC)
+  const reloadDoc = readRepoFile(RELOAD_DOC)
 
   /**
    * b.av2 SR-12 / SR-8.6: the README's modify-semantics table, "What a
@@ -764,15 +816,15 @@ describe('README.md', () => {
    * new rows are self-checked on edited copies.
    */
   describe('What a confirmation applies (SR-8.6 rows)', () => {
-    const reload = markdownSection(readme, '## Reload')
-    const table = firstTable(markdownSection(reload, '### What a confirmation applies'))
+    const reload = markdownSection(reloadDoc, '# Reload')
+    const table = firstTable(markdownSection(reload, '## What a confirmation applies'))
 
     type Row = { change: string; confirmed: string; session: string }
     const rows: Row[] = table.rows.map(([change, confirmed, session]) => ({ change, confirmed, session }))
 
     /** The table's rows in `text` (the README, or an edited copy of it). */
     const rowsOf = (text: string): Row[] =>
-      firstTable(markdownSection(markdownSection(text, '## Reload'), '### What a confirmation applies')).rows.map(([change, confirmed, session]) => ({ change, confirmed, session }))
+      firstTable(markdownSection(markdownSection(text, '# Reload'), '## What a confirmation applies')).rows.map(([change, confirmed, session]) => ({ change, confirmed, session }))
 
     /** How the README row of a change is found, and the effect it must state. */
     type Expected = { label: string; find: (row: Row) => boolean; session: string; destructive: boolean }
@@ -945,14 +997,14 @@ describe('README.md', () => {
       /** `text` with `edit` applied to the raw line of the one table row `expected` finds; an edit to '' removes the line. */
       function withRowEdited(text: string, expected: Expected, edit: (line: string) => string): string {
         const lines = text.split('\n')
-        const range = sectionRange(text, '### What a confirmation applies')
-        if (range === undefined) throw new Error('README.md has no heading "### What a confirmation applies"')
+        const range = sectionRange(text, '## What a confirmation applies')
+        if (range === undefined) throw new Error(`${RELOAD_DOC} has no heading "## What a confirmation applies"`)
         const at = lines.flatMap((line, i) => {
           if (i <= range.start || i >= range.end || !line.startsWith('| ')) return []
           const [change, confirmed, session] = tableCells(line)
           return expected.find({ change, confirmed, session }) ? [i] : []
         })
-        if (at.length !== 1) throw new Error(`${at.length} README lines hold the row for ${expected.label}`)
+        if (at.length !== 1) throw new Error(`${at.length} ${RELOAD_DOC} lines hold the row for ${expected.label}`)
         const replaced = edit(lines[at[0]])
         return [...lines.slice(0, at[0]), ...(replaced === '' ? [] : replaced.split('\n')), ...lines.slice(at[0] + 1)].join('\n')
       }
@@ -967,8 +1019,8 @@ describe('README.md', () => {
       test.each(NEW_ROWS.flatMap((expected) => EDITS.map(([how, edit]) => [expected.label, how, expected, edit] as const)))(
         'the row for %s, %s, fails its case',
         (_label, _how, expected, edit) => {
-          const edited = withRowEdited(readme, expected, edit)
-          expect(edited).not.toBe(readme)
+          const edited = withRowEdited(reloadDoc, expected, edit)
+          expect(edited).not.toBe(reloadDoc)
           expect(rowProblems(rowsOf(edited), expected)).not.toEqual([])
         },
       )
@@ -978,14 +1030,14 @@ describe('README.md', () => {
         ['"next server start"', (line: string) => line.replaceAll('next server start', 'next start'), 'Once confirmed names no next server start'],
         ['"exception"', (line: string) => line.replace(/\bexception\b/gi, 'difference'), 'Once confirmed names no exception'],
       ] as const)('the server-wide row with %s cut fails the exception case on that leg alone', (_cut, edit, problem) => {
-        const edited = withRowEdited(readme, SERVER_WIDE_ROW, edit)
-        expect(edited).not.toBe(readme)
+        const edited = withRowEdited(reloadDoc, SERVER_WIDE_ROW, edit)
+        expect(edited).not.toBe(reloadDoc)
         expect(serverWideExceptionProblems(rowsOf(edited))).toEqual([problem])
       })
 
       test(`the recorded row with \`${RELOAD_NOOP}\` cut fails the ${RELOAD_NOOP} case`, () => {
-        const edited = withRowEdited(readme, RECORDED_ROW, (line) => line.replaceAll(`\`${RELOAD_NOOP}\``, 'a no-op line'))
-        expect(edited).not.toBe(readme)
+        const edited = withRowEdited(reloadDoc, RECORDED_ROW, (line) => line.replaceAll(`\`${RELOAD_NOOP}\``, 'a no-op line'))
+        expect(edited).not.toBe(reloadDoc)
         expect(recordedNoopProblems(rowsOf(edited))).toEqual([`Once confirmed names no \`${RELOAD_NOOP}\``])
       })
     })
@@ -999,8 +1051,8 @@ describe('README.md', () => {
    * and is complete for its own mode.
    */
   describe('persona configuration reference (SR-12, SR-13.5)', () => {
-    test.each(KEY_TABLES)('the "#### %s" table lists exactly the loader\'s keys, one code span per row', (heading, keys) => {
-      const table = firstTable(requiredSection(personasSection(readme), `#### ${heading}`, IN_PERSONAS))
+    test.each(KEY_TABLES)('the "### %s" table lists exactly the loader\'s keys, one code span per row', (heading, keys) => {
+      const table = firstTable(requiredSection(personasSection(configuration), `### ${heading}`, IN_PERSONAS))
       expect(table.header[0]).toBe('Field')
       const firstCells = table.rows.map(([cell]) => cell)
       expect(firstCells.filter((cell) => !/^`[^`]+`$/.test(cell))).toEqual([])
@@ -1035,7 +1087,7 @@ describe('README.md', () => {
        * rethrown with its message.
        */
       function loadExample(heading: string = EXAMPLE_HEADING): Example {
-        const text = completeExample(readme, heading)
+        const text = completeExample(configuration, heading)
         assertNoLeak(text, 'example')
         let raw: Example['raw']
         try {
@@ -1169,7 +1221,7 @@ describe('README.md', () => {
    */
   describe('setup wizard pointer', () => {
     function credentialsFiles(): string {
-      return requiredSection(personasSection(readme), '#### Credentials files', IN_PERSONAS)
+      return requiredSection(personasSection(configuration), '### Credentials files', IN_PERSONAS)
     }
 
     test('the Quick Start links to the wizard skill file', () => {
@@ -1177,28 +1229,35 @@ describe('README.md', () => {
       expect(markdownLinks(quickStart).map((link) => link.path)).toContain(WIZARD_FILE)
     })
 
-    test(`"#### Credentials files" names the wizard, ${WIZARD_NAME}, outside any link target`, () => {
+    test(`"### Credentials files" names the wizard, ${WIZARD_NAME}, outside any link target`, () => {
       const prose = splitFences(credentialsFiles()).prose.replace(/\]\([^)]*\)/g, ']')
       expect(prose).toMatch(new RegExp(`\\b${WIZARD_NAME}\\b`))
     })
 
-    test(`"#### Credentials files" links to the wizard's "## ${WIZARD_CREDENTIALS_HEADING}" heading`, () => {
+    test(`"### Credentials files" links to the wizard's "## ${WIZARD_CREDENTIALS_HEADING}" heading`, () => {
       const targets = markdownLinks(credentialsFiles()).map((link) => link.target)
       // That the heading exists in the wizard is the links-into-skills/ case below.
-      expect(targets).toContain(`${WIZARD_FILE}#${headingSlug(WIZARD_CREDENTIALS_HEADING)}`)
+      expect(targets).toContain(`../${WIZARD_FILE}#${headingSlug(WIZARD_CREDENTIALS_HEADING)}`)
     })
 
-    test('every README link into skills/ names an existing file and, with an anchor, one of its headings', () => {
-      const links = markdownLinks(readme).filter((link) => link.path.startsWith('skills/'))
-      expect(links.length).toBeGreaterThan(0)
+    test.each([...USER_DOC_FILES])('every %s link into skills/ names an existing file and, with an anchor, one of its headings', (doc) => {
+      const dir = dirname(resolve(REPO_ROOT, doc))
+      const links = markdownLinks(readRepoFile(doc)).filter((link) => relative(REPO_ROOT, resolve(dir, link.path)).startsWith('skills/') && link.path !== '')
       const broken = links
         .filter((link) => {
-          const file = resolve(REPO_ROOT, link.path)
+          const file = resolve(dir, link.path)
           if (!existsSync(file) || !statSync(file).isFile()) return true
           return link.anchor !== '' && !headingAnchors(readFileSync(file, 'utf-8')).includes(link.anchor)
         })
         .map((link) => link.target)
       expect(broken).toEqual([])
+    })
+
+    test('the README and the configuration reference link into skills/', () => {
+      for (const doc of ['README.md', CONFIGURATION_DOC]) {
+        const dir = dirname(resolve(REPO_ROOT, doc))
+        expect(markdownLinks(readRepoFile(doc)).filter((link) => link.path !== '' && relative(REPO_ROOT, resolve(dir, link.path)).startsWith('skills/')).length).toBeGreaterThan(0)
+      }
     })
   })
 })
@@ -1330,7 +1389,7 @@ function toolTextEntry([exportName, form, text]: (typeof SET_CHANNEL_DELIVERY_TE
  * (`SET_CHANNEL_DELIVERY_TEXTS`, b.deo SRI-1308).
  */
 const SHIPPED_TEXTS: [name: string, read: () => string][] = [
-  ['README.md', () => readRepoFile('README.md')],
+  ...[...USER_DOC_FILES, CONTRIBUTING_FILE].map((file): [string, () => string] => [file, () => readRepoFile(file)]),
   ...shippedSkillFiles().map((rel): [string, () => string] => [rel, () => readRepoFile(rel)]),
   ['slack-app-manifest.yml', () => readRepoFile('slack-app-manifest.yml')],
   [CREDENTIALS_SCRIPT, () => readRepoFile(CREDENTIALS_SCRIPT)],
@@ -1346,14 +1405,16 @@ const CHANGELOG_FILE = 'CHANGELOG.md'
 
 /**
  * b.jg5 SRJ-1101's operator texts, [name, text], read from the repository:
- * the README, the debugging, install and setup skills, the architecture doc,
- * the engineering guide and the CHANGELOG. SRJ-1107's checks (the CHANGELOG
- * release entry, at the end of this file) read their texts through this
- * list. It is not `SHIPPED_TEXTS`: the forbidden-term audit still reads only
- * that list, which holds neither the CHANGELOG nor `docs/`.
+ * the user docs (the README and its `docs/` pages), CONTRIBUTING.md, the
+ * debugging, install and setup skills, the architecture doc, the engineering
+ * guide and the CHANGELOG. SRJ-1107's checks (the CHANGELOG release entry, at
+ * the end of this file) read their texts through this list. It is not
+ * `SHIPPED_TEXTS`: the forbidden-term audit reads only that list, which holds
+ * the user docs but neither the CHANGELOG nor the internal `docs/` guides.
  */
 const OPERATOR_TEXTS: [name: string, read: () => string][] = [
-  'README.md',
+  ...USER_DOC_FILES,
+  CONTRIBUTING_FILE,
   DEBUG_SKILL_FILE,
   INSTALL_SKILL_FILE,
   WIZARD_FILE,
@@ -1361,6 +1422,15 @@ const OPERATOR_TEXTS: [name: string, read: () => string][] = [
   'docs/engineering-guide.md',
   CHANGELOG_FILE,
 ].map((file): [string, () => string] => [file, () => readRepoFile(file)])
+
+/**
+ * The user docs, `USER_DOC_FILES` in order, as one text. Each page opens with
+ * its `#` title, so a section read from it never runs into the next page; a
+ * same-file link is checked in its own page, never in this text.
+ */
+function userDocsText(): string {
+  return USER_DOC_FILES.map((doc) => operatorText(doc)).join('\n')
+}
 
 /** One operator text by its name; throws naming a name `OPERATOR_TEXTS` lacks. */
 function operatorText(name: string): string {
@@ -1554,38 +1624,38 @@ const SR_1_7_EXCEPTION: AuditException = {
 }
 
 /**
- * The switch-over runbook's exemption (b.jg5 SRJ-1108, SRJ-1516): the README
- * section may name `access.json` among the previous CSCB's files it saves and
+ * The switch-over runbook's exemption (b.jg5 SRJ-1108, SRJ-1516): the runbook
+ * section, in `RUNBOOK_DOC`, may name `access.json` among the previous CSCB's files it saves and
  * restores. Every other term stays banned there, the token variables' names
  * included, and `access.json` stays banned everywhere else. A missing heading
  * throws, as for the SR-1.7 entry. The rollback section has its own entry,
  * below.
  */
 const SWITCH_OVER_EXCEPTION: AuditException = {
-  file: 'README.md',
+  file: RUNBOOK_DOC,
   heading: `### ${PHASE1_RUNBOOK_SECTION_TITLE}`,
   terms: ['access.json'],
   reason: "b.jg5 SRJ-1108, SRJ-1516: the switch-over runbook saves and restores the previous CSCB's access.json",
 }
 
-/** The rollback section's heading as the README writes it: a `###` under `## Migration`, after the switch-over section. */
+/** The rollback section's heading as `RUNBOOK_DOC` writes it: a `###` under `## Migration`, after the switch-over section. */
 const ROLLBACK_HEADING = `### ${ROLLBACK_RUNBOOK_SECTION_TITLE}`
 
 /**
- * The rollback runbook's exemption (b.jg5 SRJ-1109, SRJ-1516): the README
- * section may name `access.json` among the files its step 8 restores. As for
+ * The rollback runbook's exemption (b.jg5 SRJ-1109, SRJ-1516): the runbook
+ * section, in `RUNBOOK_DOC`, may name `access.json` among the files its step 8 restores. As for
  * the switch-over entry: every other term stays banned there, the token
  * variables' names included, `access.json` stays banned everywhere else, and
  * a missing heading throws.
  */
 const ROLLBACK_EXCEPTION: AuditException = {
-  file: 'README.md',
+  file: RUNBOOK_DOC,
   heading: ROLLBACK_HEADING,
   terms: ['access.json'],
   reason: "b.jg5 SRJ-1109, SRJ-1516: the rollback runbook's step 8 restores the previous CSCB's access.json",
 }
 
-/** The two runbook entries (SRJ-1516): one per README runbook section, each exempting only `access.json`. */
+/** The two runbook entries (SRJ-1516): one per runbook section in `RUNBOOK_DOC`, each exempting only `access.json`. */
 const RUNBOOK_EXCEPTIONS: readonly AuditException[] = [SWITCH_OVER_EXCEPTION, ROLLBACK_EXCEPTION]
 
 const AUDIT_EXCEPTIONS: readonly AuditException[] = [SR_1_7_EXCEPTION, ...RUNBOOK_EXCEPTIONS]
@@ -1718,29 +1788,29 @@ describe(`AC 46: forbidden-term audit (README, skills, manifest, MCP instruction
     expect([...new Set(hits.map((hit) => hit.term))].sort()).toEqual([...SR_1_7_EXCEPTION.terms].sort())
   })
 
-  test('the exemptions are exactly the SR-1.7 entry and the two runbook entries, each runbook entry exempting only access.json in README.md (SRJ-1516)', () => {
+  test(`the exemptions are exactly the SR-1.7 entry and the two runbook entries, each runbook entry exempting only access.json in ${RUNBOOK_DOC} (SRJ-1516)`, () => {
     expect(AUDIT_EXCEPTIONS.map((e) => [e.file, e.heading, [...e.terms]])).toEqual([
       [SR_1_7_EXCEPTION.file, SR_1_7_EXCEPTION.heading, [...SR_1_7_EXCEPTION.terms]],
-      ['README.md', `### ${PHASE1_RUNBOOK_SECTION_TITLE}`, ['access.json']],
-      ['README.md', `### ${ROLLBACK_RUNBOOK_SECTION_TITLE}`, ['access.json']],
+      [RUNBOOK_DOC, `### ${PHASE1_RUNBOOK_SECTION_TITLE}`, ['access.json']],
+      [RUNBOOK_DOC, `### ${ROLLBACK_RUNBOOK_SECTION_TITLE}`, ['access.json']],
     ])
   })
 
-  test(`the only allowed hits: access.json in README.md under "${SWITCH_OVER_EXCEPTION.heading}" and under "${ROLLBACK_EXCEPTION.heading}" (SRJ-1108, SRJ-1109, SRJ-1516); with the exemptions off, it appears nowhere else in shipped text, and both exemptions are used`, () => {
+  test(`the only allowed hits: access.json in ${RUNBOOK_DOC} under "${SWITCH_OVER_EXCEPTION.heading}" and under "${ROLLBACK_EXCEPTION.heading}" (SRJ-1108, SRJ-1109, SRJ-1516); with the exemptions off, it appears nowhere else in shipped text, and both exemptions are used`, () => {
     const terms = ALL_FORBIDDEN_TERMS.filter(([label]) => label === 'access.json')
     expect(terms.map(([label]) => label)).toEqual(['access.json'])
-    const readme = operatorText('README.md')
+    const runbooks = operatorText(RUNBOOK_DOC)
     const ranges = RUNBOOK_EXCEPTIONS.map((exception) => {
-      const range = sectionRange(readme, exception.heading)
-      if (range === undefined) throw new Error(`README.md has no heading "${exception.heading}"`)
+      const range = sectionRange(runbooks, exception.heading)
+      if (range === undefined) throw new Error(`${RUNBOOK_DOC} has no heading "${exception.heading}"`)
       return range
     })
-    const inside = (hit: TermHit) => hit.file === 'README.md' && ranges.some((range) => hit.line > range.start && hit.line <= range.end)
+    const inside = (hit: TermHit) => hit.file === RUNBOOK_DOC && ranges.some((range) => hit.line > range.start && hit.line <= range.end)
     const hits = SHIPPED_TEXTS.flatMap(([name, read]) => auditText(name, read(), terms, []).hits)
     expect(hits.filter((hit) => !inside(hit)).map(formatHit)).toEqual([])
-    expect(auditText('README.md', readme, terms).hits.map(formatHit)).toEqual([])
+    expect(auditText(RUNBOOK_DOC, runbooks, terms).hits.map(formatHit)).toEqual([])
     // Each runbook entry, alone, allows at least one hit: neither exemption is idle.
-    expect(RUNBOOK_EXCEPTIONS.map((exception) => [exception.heading, auditText('README.md', readme, terms, [exception]).allowed.length > 0])).toEqual(
+    expect(RUNBOOK_EXCEPTIONS.map((exception) => [exception.heading, auditText(RUNBOOK_DOC, runbooks, terms, [exception]).allowed.length > 0])).toEqual(
       RUNBOOK_EXCEPTIONS.map((exception) => [exception.heading, true]),
     )
   })
@@ -1763,8 +1833,8 @@ describe(`AC 46: forbidden-term audit (README, skills, manifest, MCP instruction
     [SR_1_7_EXCEPTION.file, '#a-personas-routing-settings-were-changed-by-a-confirmed-change', "E14 decision 12: that heading's anchor"],
     [SR_1_7_EXCEPTION.file, '`[slack] persona-routing: ', "E14 decision 12: the server's real log prefix"],
     [SR_1_7_EXCEPTION.file, 'routinely', 'whole words: "routine" is not "routes"'],
-    ['README.md', 'remove any token environment variables you exported for the previous version', "E14 decision 12's upgrade wording: variables are banned by name and export form"],
-    ['README.md', 'slack-channel-router', 'the MCP server name; no route term matches it'],
+    [RUNBOOK_DOC, 'remove any token environment variables you exported for the previous version', "E14 decision 12's upgrade wording: variables are banned by name and export form"],
+    [CONFIGURATION_DOC, 'slack-channel-router', 'the MCP server name; no route term matches it'],
     [CREDENTIALS_SCRIPT, 'header = "Authorization: Bearer %s"', "the credentials script's curl config line, read from curl's stdin, not a command-line argument"],
     [WIZARD_FILE, /^allowed-tools:.*$/m, 'skill frontmatter: a tool list, not an allowlist'],
   ]
@@ -1925,9 +1995,9 @@ describe('AC 46: forbidden-term scanner self-checks', () => {
     )
   })
 
-  /** The two runbook exemptions (b.jg5 SRJ-1108, SRJ-1109, SRJ-1516), on a synthetic README. */
+  /** The two runbook exemptions (b.jg5 SRJ-1108, SRJ-1109, SRJ-1516), on a synthetic runbook page. */
   describe('the two runbook exemptions', () => {
-    const README = 'README.md'
+    const README = RUNBOOK_DOC
     const SAVE = 'Keep a copy of `access.json`.'
     const RESTORE = 'Put back `access.json`.'
     type Parts = { earlier: string; inSwitchOver: string; between: string; inRollback: string; later: string; other: string }
@@ -1955,7 +2025,7 @@ describe('AC 46: forbidden-term scanner self-checks', () => {
         RESTORE, //                                                   l.13
         '### Upgrading to personas', //                               l.14
         p.later, //                                                   l.15
-        '## Troubleshooting', //                                      l.16
+        '## Troubleshooting',//                                      l.16
         p.other, //                                                   l.17
       ].join('\n')
     }
@@ -2063,9 +2133,9 @@ function pipeTables(section: string): { header: string[]; rows: string[][] }[] {
   return tables
 }
 
-describe(`AC 46: README "${RECEIVING_HEADING}" (SR-12, SR-4.4)`, () => {
-  const readme = readRepoFile('README.md')
-  const section = () => requiredSection(readme, RECEIVING_HEADING, 'README.md')
+describe(`AC 46: ${BOTS_DOC} "${RECEIVING_HEADING}" (SR-12, SR-4.4)`, () => {
+  const bots = readRepoFile(BOTS_DOC)
+  const section = () => requiredSection(bots, RECEIVING_HEADING, BOTS_DOC)
 
   /**
    * The section's table of the ways a message reaches a persona: the one
@@ -2075,7 +2145,7 @@ describe(`AC 46: README "${RECEIVING_HEADING}" (SR-12, SR-4.4)`, () => {
   function kindsTable(): { viaColumn: number; rows: string[][] } {
     const tables = pipeTables(section()).filter((t) => t.header[0] === 'Kind' && t.header.includes('`via`'))
     if (tables.length !== 1) {
-      throw new Error(`README.md "${RECEIVING_HEADING}" must hold one table with a Kind column and a \`via\` column; found ${tables.length}`)
+      throw new Error(`${BOTS_DOC} "${RECEIVING_HEADING}" must hold one table with a Kind column and a \`via\` column; found ${tables.length}`)
     }
     return { viaColumn: tables[0].header.indexOf('`via`'), rows: tables[0].rows }
   }
@@ -2084,7 +2154,7 @@ describe(`AC 46: README "${RECEIVING_HEADING}" (SR-12, SR-4.4)`, () => {
   function viaCell(label: string): string {
     const { viaColumn, rows } = kindsTable()
     const matches = rows.filter((row) => row[0] === label)
-    if (matches.length !== 1) throw new Error(`README.md "${RECEIVING_HEADING}": ${matches.length} rows of kind "${label}", expected 1`)
+    if (matches.length !== 1) throw new Error(`${BOTS_DOC} "${RECEIVING_HEADING}": ${matches.length} rows of kind "${label}", expected 1`)
     return matches[0][viaColumn] ?? ''
   }
 
@@ -2107,8 +2177,8 @@ describe(`AC 46: README "${RECEIVING_HEADING}" (SR-12, SR-4.4)`, () => {
     expect(flat(section())).toMatch(pattern)
   })
 
-  test('no "Messages a bot receives" heading remains', () => {
-    expect(headings(readme).filter((h) => /messages a bot receives/i.test(h.title)).map((h) => h.text)).toEqual([])
+  test('no "Messages a bot receives" heading remains in any user doc', () => {
+    expect(USER_DOC_FILES.flatMap((doc) => headings(readRepoFile(doc)).filter((h) => /messages a bot receives/i.test(h.title)).map((h) => `${doc}: ${h.text}`))).toEqual([])
   })
 })
 
@@ -2225,11 +2295,12 @@ const REINSTALL_FORM: string = (() => {
 
 describe('the agent-director refusal classes name the switch-over runbook (b.jg5 SRJ-208)', () => {
   const debugSkill = operatorText(DEBUG_SKILL_FILE)
-  const readme = operatorText('README.md')
+  const troubleshooting = operatorText(TROUBLESHOOTING_DOC)
+  const runbooks = operatorText(RUNBOOK_DOC)
   const runbookAnchor = headingSlug(PHASE1_RUNBOOK_SECTION_TITLE)
   const debugEntry = (label: string) => flat(requiredSection(debugSkill, classHeading(label), DEBUG_SKILL_FILE))
   const readmeItem = (label: string) =>
-    labelItem(requiredSection(readme, STARTUP_ERRORS_HEADING, 'README.md'), label, `README.md "${STARTUP_ERRORS_HEADING}"`)
+    labelItem(requiredSection(troubleshooting, STARTUP_ERRORS_HEADING, TROUBLESHOOTING_DOC), label, `${TROUBLESHOOTING_DOC} "${STARTUP_ERRORS_HEADING}"`)
 
   describe(DEBUG_SKILL_FILE, () => {
     test.each(REFUSAL_LABELS)('has a `###` entry headed by `%s`', (label) => {
@@ -2282,7 +2353,7 @@ describe('the agent-director refusal classes name the switch-over runbook (b.jg5
     })
   })
 
-  describe(`README.md "${STARTUP_ERRORS_HEADING}"`, () => {
+  describe(`${TROUBLESHOOTING_DOC} "${STARTUP_ERRORS_HEADING}"`, () => {
     test.each(REFUSAL_LABELS)('the `%s` line names the runbook section by its title', (label) => {
       expect(readmeItem(label)).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
     })
@@ -2297,25 +2368,27 @@ describe('the agent-director refusal classes name the switch-over runbook (b.jg5
 
   // E2 gate (b.jg5 SRJ-1108): the section the refusals name exists once, under
   // `## Migration`, and every link into it resolves.
-  test('exactly one README heading carries the title every refusal names, a `###` under `## Migration`', () => {
-    expect(runbookTitleProblems(readme)).toEqual([])
+  test(`exactly one heading of the user docs carries the title every refusal names, a \`###\` under \`## Migration\` in ${RUNBOOK_DOC}`, () => {
+    expect(runbookTitleProblems(runbooks)).toEqual([])
+    expect(USER_DOC_FILES.filter((doc) => doc !== RUNBOOK_DOC && headings(readRepoFile(doc)).some((h) => h.title === PHASE1_RUNBOOK_SECTION_TITLE))).toEqual([])
   })
 
-  test(`every link from README.md, ${DEBUG_SKILL_FILE} and ${INSTALL_SKILL_FILE} into the runbook section resolves to a heading in it`, () => {
-    const texts: [string, string][] = [['README.md', readme], ...[DEBUG_SKILL_FILE, INSTALL_SKILL_FILE].map((file): [string, string] => [file, operatorText(file)])]
-    const { checked, broken } = runbookLinkProblems(readme, texts)
+  test(`every link from the user docs, ${CONTRIBUTING_FILE}, ${DEBUG_SKILL_FILE} and ${INSTALL_SKILL_FILE} into the runbook section resolves to a heading in it`, () => {
+    const texts: [string, string][] = [...USER_DOC_FILES, CONTRIBUTING_FILE, DEBUG_SKILL_FILE, INSTALL_SKILL_FILE].map((file): [string, string] => [file, operatorText(file)])
+    const { checked, broken } = runbookLinkProblems(runbooks, texts)
     expect(broken).toEqual([])
-    expect(checked).toContain(`README.md -> #${runbookAnchor}`)
+    expect(checked).toContain(`${RUNBOOK_DOC} -> #${runbookAnchor}`)
+    expect(checked).toContain(`README.md -> #${headingSlug(MIGRATION_HEADING.slice(3))}`)
   })
 
   test.each([
     ['renamed', (text: string) => text.replace(`### ${PHASE1_RUNBOOK_SECTION_TITLE}\n`, '### Switching over\n')],
     ['re-levelled', (text: string) => text.replace(`### ${PHASE1_RUNBOOK_SECTION_TITLE}\n`, `#### ${PHASE1_RUNBOOK_SECTION_TITLE}\n`)],
   ])('self-check: with the runbook heading %s, the title case and the link case both fail', (_how, edit) => {
-    const edited = edit(readme)
-    expect(edited).not.toBe(readme)
+    const edited = edit(runbooks)
+    expect(edited).not.toBe(runbooks)
     expect(runbookTitleProblems(edited)).not.toEqual([])
-    expect(runbookLinkProblems(edited, [['README.md', edited]]).broken).toContain(`README.md -> #${runbookAnchor}`)
+    expect(runbookLinkProblems(edited, [[RUNBOOK_DOC, edited]]).broken).toContain(`${RUNBOOK_DOC} -> #${runbookAnchor}`)
   })
 
   test.each(UPGRADE_FORMS)('self-check: the %s pattern matches its synthetic string', (_form, pattern, sample) => {
@@ -2323,7 +2396,7 @@ describe('the agent-director refusal classes name the switch-over runbook (b.jg5
   })
 
   test('self-check: no pattern matches the runbook pointer itself', () => {
-    const pointer = flat(`Follow the README section "${PHASE1_RUNBOOK_SECTION_TITLE}" from its block "${REFUSAL_BLOCK_HEADING}"; the new CSCB is started only as step 10 starts it.`)
+    const pointer = flat(`Follow the ${RUNBOOK_DOC} section "${PHASE1_RUNBOOK_SECTION_TITLE}" from its block "${REFUSAL_BLOCK_HEADING}"; the new CSCB is started only as step 10 starts it.`)
     expect(UPGRADE_FORMS.filter(([, pattern]) => pattern.test(pointer)).map(([form]) => form)).toEqual([])
   })
 
@@ -2349,11 +2422,11 @@ describe('the agent-director refusal classes name the switch-over runbook (b.jg5
     expect(upgradeFormsIn(flat(text))).not.toContain(REINSTALL_FORM)
   })
 
-  test('self-check: a README item missing its label fails naming the label', () => {
+  test('self-check: a startup-errors item missing its label fails naming the label', () => {
     expect(() => labelItem('- `other-class` — text', AD_BELOW_PHASE1_FLOOR, 'fixture')).toThrow(`0 list items open with \`${AD_BELOW_PHASE1_FLOOR}\``)
   })
 
-  test('self-check: a README item takes its indented continuation lines and stops at the next item', () => {
+  test('self-check: a startup-errors item takes its indented continuation lines and stops at the next item', () => {
     const fixture = `- \`${AD_BELOW_PHASE1_FLOOR}\` — first\n  second\n- \`next\` — third`
     expect(labelItem(fixture, AD_BELOW_PHASE1_FLOOR, 'fixture')).toBe(`- \`${AD_BELOW_PHASE1_FLOOR}\` — first second`)
   })
@@ -2366,23 +2439,23 @@ describe('the runtime re-check\'s pointer names a debug skill section that exist
   })
 })
 
-/** The README section the runbooks sit under. */
+/** The section of `RUNBOOK_DOC` the runbooks sit under. */
 const MIGRATION_HEADING = '## Migration'
 
-/** The switch-over section's heading as the README writes it: a `###` under `## Migration`. */
+/** The switch-over section's heading as `RUNBOOK_DOC` writes it: a `###` under `## Migration`. */
 const SWITCH_OVER_HEADING = `### ${PHASE1_RUNBOOK_SECTION_TITLE}`
 
-/** The README section the switch-over runbook replaced (b.jg5 SRJ-1103): no heading carries it and no link reaches it. */
+/** The README section the switch-over runbook replaced (b.jg5 SRJ-1103): no user-doc heading carries it and no link reaches it. */
 const GONE_TITLE = 'First start on a host with running bots'
 
 /**
- * What is wrong with the README heading the refusals name (E2 gate, b.jg5
- * SRJ-1108): exactly one heading carries `PHASE1_RUNBOOK_SECTION_TITLE`, at
- * `###`, inside `## Migration`. Pure; `[]` when all holds.
+ * What is wrong with the `RUNBOOK_DOC` heading the refusals name (E2 gate,
+ * b.jg5 SRJ-1108): exactly one heading carries `PHASE1_RUNBOOK_SECTION_TITLE`,
+ * at `###`, inside `## Migration`. Pure; `[]` when all holds.
  */
 function runbookTitleProblems(readme: string): string[] {
   const titled = headings(readme).filter((h) => h.title === PHASE1_RUNBOOK_SECTION_TITLE)
-  if (titled.length !== 1) return [`${titled.length} README headings are titled "${PHASE1_RUNBOOK_SECTION_TITLE}", expected 1`]
+  if (titled.length !== 1) return [`${titled.length} ${RUNBOOK_DOC} headings are titled "${PHASE1_RUNBOOK_SECTION_TITLE}", expected 1`]
   const [heading] = titled
   const problems: string[] = []
   if (heading.text !== SWITCH_OVER_HEADING) problems.push(`"${heading.text}" is not "${SWITCH_OVER_HEADING}"`)
@@ -2395,13 +2468,15 @@ function runbookTitleProblems(readme: string): string[] {
 
 /**
  * Every link from `texts` into the switch-over section, as `<file> -> #<anchor>`
- * (`checked`), and those that resolve to no heading inside the README section
- * (`broken`). A README link counts by its same-file anchor, a skill's by a
- * path ending in `README.md`. A link is into the section when its anchor is
+ * (`checked`), and those that resolve to no heading inside the section in
+ * `RUNBOOK_DOC` (`broken`). A link from `RUNBOOK_DOC` counts by its same-file
+ * anchor, any other file's by a path that resolves, from that file's
+ * directory, to `RUNBOOK_DOC`. A link is into the section when its anchor is
  * the section's or a block's slug, the anchor of a heading inside the
- * section, or a `step-<n>-…` anchor that resolves nowhere in the README (a
+ * section, or a `step-<n>-…` anchor that resolves nowhere in `RUNBOOK_DOC` (a
  * step anchor that resolves outside the section, such as the rollback's, is
- * not counted). Pure.
+ * not counted), or, from another file, `#migration`, the section the runbooks
+ * sit under. Pure.
  */
 function runbookLinkProblems(readme: string, texts: readonly [file: string, text: string][]): { checked: string[]; broken: string[] } {
   const range = sectionRange(readme, SWITCH_OVER_HEADING)
@@ -2411,10 +2486,16 @@ function runbookLinkProblems(readme: string, texts: readonly [file: string, text
   const named = [PHASE1_RUNBOOK_SECTION_TITLE, REFUSAL_BLOCK_HEADING, PUBLISHING_HOST_BLOCK_HEADING].map(headingSlug)
   const into = (anchor: string) =>
     named.includes(anchor) || inside.includes(anchor) || (/^step-\d+-/.test(anchor) && !anchors.includes(anchor))
+  const migrationAnchor = headingSlug(MIGRATION_HEADING.slice(3))
+  const toRunbookDoc = (file: string, path: string) =>
+    file === RUNBOOK_DOC ? path === '' : path !== '' && relative(REPO_ROOT, resolve(REPO_ROOT, dirname(file), path)) === RUNBOOK_DOC
   const links = texts.flatMap(([file, text]) =>
     markdownLinks(text)
-      .filter((link) => (file === 'README.md' ? link.path === '' : /(?:^|\/)README\.md$/.test(link.path)) && into(link.anchor))
-      .map((link) => ({ name: `${file} -> #${link.anchor}`, resolves: inside.includes(link.anchor) })),
+      .filter((link) => toRunbookDoc(file, link.path) && (into(link.anchor) || (file !== RUNBOOK_DOC && link.anchor === migrationAnchor)))
+      .map((link) => ({
+        name: `${file} -> #${link.anchor}`,
+        resolves: inside.includes(link.anchor) || (link.anchor === migrationAnchor && anchors.includes(migrationAnchor)),
+      })),
   )
   return { checked: links.map((l) => l.name), broken: links.filter((l) => !l.resolves).map((l) => l.name) }
 }
@@ -2530,8 +2611,8 @@ interface RunbookCarrier {
  * A runbook carrier read from `text` under `heading` (a section whose steps
  * sit one level below it), through the shared step reader (`runbookSteps`,
  * `tests/test-helpers/runbooks.ts`) at that level with `count` steps, each
- * step's text flattened with `flat`. Every carrier (the README's switch-over
- * and rollback sections and their CHANGELOG copies) is read here. Throws as
+ * step's text flattened with `flat`. Every carrier (the switch-over and
+ * rollback sections of `RUNBOOK_DOC` and their CHANGELOG copies) is read here. Throws as
  * the reader does, naming the carrier and the step.
  */
 function readRunbookCarrier(file: string, text: string, heading: string, count: number): RunbookCarrier {
@@ -2553,11 +2634,11 @@ function readRunbookCarrier(file: string, text: string, heading: string, count: 
 
 /**
  * Every carrier of the switch-over runbook: its name and its reader. The
- * README section, and the CHANGELOG release entry's copy (b.jg5 SRJ-1107;
+ * `RUNBOOK_DOC` section, and the CHANGELOG release entry's copy (b.jg5 SRJ-1107;
  * hatch A3), read through `OPERATOR_TEXTS` from the entry only.
  */
 const SWITCH_OVER_CARRIERS: [name: string, read: () => RunbookCarrier][] = [
-  ['README.md', lazy(() => readRunbookCarrier('README.md', operatorText('README.md'), SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT))],
+  [RUNBOOK_DOC, lazy(() => readRunbookCarrier(RUNBOOK_DOC, operatorText(RUNBOOK_DOC), SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT))],
   [CHANGELOG_FILE, lazy(() => readRunbookCarrier(CHANGELOG_FILE, releaseEntry(operatorText(CHANGELOG_FILE)), SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT))],
 ]
 
@@ -2599,17 +2680,25 @@ function missingItems(carrier: RunbookCarrier, text: string, required: readonly 
 /** A link to step n's heading in the carrier, as Markdown writes its target. */
 const stepLink = (n: number) => (carrier: RunbookCarrier) => `(#${carrier.stepAnchors[n - 1]})`
 
-/** The README section that keeps the conversion steps the switch-over's steps 1 and 7 point to (b.jg5 SRJ-1103). */
+/** The `RUNBOOK_DOC` section that keeps the conversion steps the switch-over's steps 1 and 7 point to (b.jg5 SRJ-1103). */
 const UPGRADING_TITLE = 'Upgrading to personas'
 
 /**
- * A link to the README heading titled `title` as the carrier writes it: a
- * same-file anchor in the README, `README.md#…` in the CHANGELOG copy (b.jg5
- * SRJ-1107; the E35 T1 PM note).
+ * A link to the `RUNBOOK_DOC` heading titled `title` as the carrier writes
+ * it: a same-file anchor in `RUNBOOK_DOC`, `docs/migration.md#…` in the
+ * CHANGELOG copy (b.jg5 SRJ-1107; the E35 T1 PM note).
  */
-const readmeLink = (title: string) => (carrier: RunbookCarrier) => `(${carrier.name.startsWith(`${CHANGELOG_FILE} `) ? 'README.md' : ''}#${headingSlug(title)})`
+const readmeLink = (title: string) => (carrier: RunbookCarrier) => `(${carrier.name.startsWith(`${CHANGELOG_FILE} `) ? RUNBOOK_DOC : ''}#${headingSlug(title)})`
 
-/** A link to `UPGRADING_TITLE`'s README heading as the carrier writes it. */
+/**
+ * The opening of a link to the repository file `file` (repo-relative) as the
+ * carrier writes it: relative to `RUNBOOK_DOC`'s directory in `RUNBOOK_DOC`,
+ * repo-relative in the CHANGELOG copy.
+ */
+const repoLink = (file: string) => (carrier: RunbookCarrier) =>
+  `(${carrier.name.startsWith(`${CHANGELOG_FILE} `) ? file : relative(dirname(RUNBOOK_DOC), file)}#`
+
+/** A link to `UPGRADING_TITLE`'s `RUNBOOK_DOC` heading as the carrier writes it. */
 const upgradingLink = readmeLink(UPGRADING_TITLE)
 
 /**
@@ -3083,7 +3172,7 @@ const REFUSAL_BRANCHES: [element: string, part: RegExp, required: readonly Item[
   ]],
   ['a stop by the runtime re-check: not a switch-over case; the debugging skill instead', ci('runtime re-check'), [
     ci('not a switch-over case'),
-    `(${DEBUG_SKILL_FILE}#`,
+    repoLink(DEBUG_SKILL_FILE),
   ]],
 ]
 
@@ -3360,15 +3449,15 @@ describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-
     })
   })
 
-  describe('README.md: the links and the sections the runbook replaced or kept', () => {
-    const readme = operatorText('README.md')
-    const migration = () => requiredSection(readme, MIGRATION_HEADING, 'README.md')
-    const readmeCarrier = () => readRunbookCarrier('README.md', readme, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
+  describe(`${RUNBOOK_DOC}: the links and the sections the runbook replaced or kept`, () => {
+    const readme = operatorText(RUNBOOK_DOC)
+    const migration = () => requiredSection(readme, MIGRATION_HEADING, RUNBOOK_DOC)
+    const readmeCarrier = () => readRunbookCarrier(RUNBOOK_DOC, readme, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
 
     test('the runtime-stop pointer links a heading inside the debugging skill\'s refusal section', () => {
       const skill = operatorText(DEBUG_SKILL_FILE)
       const part = refusalPart(readmeCarrier(), ci('runtime re-check'))
-      const anchors = markdownLinks(part).filter((link) => link.path === DEBUG_SKILL_FILE).map((link) => link.anchor)
+      const anchors = markdownLinks(part).filter((link) => link.path === relative(dirname(RUNBOOK_DOC), DEBUG_SKILL_FILE)).map((link) => link.anchor)
       expect(anchors).toHaveLength(1)
       const index = headingAnchors(skill).indexOf(anchors[0])
       const parent = sectionRange(skill, `## ${REFUSAL_SECTION_TITLE}`)
@@ -3378,17 +3467,17 @@ describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-
       expect(line > parent!.start && line < parent!.end).toBe(true)
     })
 
-    test(`no README heading is "${GONE_TITLE}"`, () => {
-      expect(headings(readme).filter((h) => h.title === GONE_TITLE).map((h) => h.text)).toEqual([])
+    test(`no user-doc heading is "${GONE_TITLE}"`, () => {
+      expect(USER_DOC_FILES.flatMap((doc) => headings(readRepoFile(doc)).filter((h) => h.title === GONE_TITLE).map((h) => `${doc}: ${h.text}`))).toEqual([])
     })
 
-    test.each(['README.md', ...shippedSkillFiles().filter((file) => file.endsWith('.md'))])(`%s links nowhere to "${GONE_TITLE}"`, (file) => {
+    test.each([...USER_DOC_FILES, ...shippedSkillFiles().filter((file) => file.endsWith('.md'))])(`%s links nowhere to "${GONE_TITLE}"`, (file) => {
       const anchor = headingSlug(GONE_TITLE)
       expect(markdownLinks(docText(file)).filter((link) => link.anchor === anchor).map((link) => link.target)).toEqual([])
     })
 
     const UPGRADING_HEADING = `### ${UPGRADING_TITLE}`
-    const upgrading = () => flat(requiredSection(migration(), UPGRADING_HEADING, `README.md, under "${MIGRATION_HEADING}",`))
+    const upgrading = () => flat(requiredSection(migration(), UPGRADING_HEADING, `${RUNBOOK_DOC}, under "${MIGRATION_HEADING}",`))
 
     test.each([
       ['config.json rewritten by hand', ci('rewrite `config.json` by hand')],
@@ -3425,9 +3514,9 @@ describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-
 /** The rollback runbook's step count (SRJ-1109: steps 1 to 9). */
 const ROLLBACK_STEP_COUNT = 9
 
-/** Every carrier of the rollback runbook: its name and its reader. The README section and the CHANGELOG release entry's copy, as for `SWITCH_OVER_CARRIERS`. */
+/** Every carrier of the rollback runbook: its name and its reader. The `RUNBOOK_DOC` section and the CHANGELOG release entry's copy, as for `SWITCH_OVER_CARRIERS`. */
 const ROLLBACK_CARRIERS: [name: string, read: () => RunbookCarrier][] = [
-  ['README.md', lazy(() => readRunbookCarrier('README.md', operatorText('README.md'), ROLLBACK_HEADING, ROLLBACK_STEP_COUNT))],
+  [RUNBOOK_DOC, lazy(() => readRunbookCarrier(RUNBOOK_DOC, operatorText(RUNBOOK_DOC), ROLLBACK_HEADING, ROLLBACK_STEP_COUNT))],
   [CHANGELOG_FILE, lazy(() => readRunbookCarrier(CHANGELOG_FILE, releaseEntry(operatorText(CHANGELOG_FILE)), ROLLBACK_HEADING, ROLLBACK_STEP_COUNT))],
 ]
 
@@ -3450,7 +3539,7 @@ const OLD_SESSION_NAMES = [`${PERSONA_TMUX_SESSION_PREFIX}<name>_<channel>`, `${
  * One row per SRJ-1109 element: where it sits (`frame`, `step <n>` or
  * `step <n> › <item lead>`), the element, and the items its text must hold.
  * The `operator action` rows mark each operator-only action at its step.
- * Links are checked only in the README (ruling C-2, below), so the rows hold
+ * Links are checked only in `RUNBOOK_DOC` (ruling C-2, below), so the rows hold
  * for a copy whose links differ.
  */
 const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Item[]][] = [
@@ -3493,7 +3582,7 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
   ['step 2', 'operator action: removing the daily expire', [ci(`loop script that runs it ${OPERATOR_ACTION}`)]],
 
   // Step 3.
-  ['step 3', `the new CSCB stopped with ${CLI_COMMAND_STOP_BOTS}, whose failure lines the README describes (E32, E33)`, [
+  ['step 3', `the new CSCB stopped with ${CLI_COMMAND_STOP_BOTS}, whose failure lines the CLI Reference describes (E32, E33)`, [
     `claude-slack-channel-bots ${CLI_COMMAND_STOP_BOTS}`,
     ci("the command's failure lines are described in"),
     'Precheck before stopping bots',
@@ -3670,13 +3759,20 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
 /** The steps that send a human beyond `agent-director kill`, each naming agent-director's "Operator actions" by title (SRJ-1109). */
 const OPERATOR_ACTIONS_STEPS: readonly number[] = [3, 4, 5]
 
+/** True when `path`, read repo-relative (the CHANGELOG copy) or relative to `RUNBOOK_DOC`'s directory, names a user doc. */
+function isUserDocPath(path: string): boolean {
+  const docs = USER_DOC_FILES as readonly string[]
+  return docs.includes(path) || docs.includes(join(dirname(RUNBOOK_DOC), path))
+}
+
 /**
  * What in a rollback step-8 text names a tool or command for the rebuild by
  * hand (hatch A3): a fenced block other than the previous CSCB's reinstall, a
  * code span naming a script or a CSCB subcommand, a link to a file, or
  * conversion wording tied to a tool, script or command. A link to a heading
- * of `README.md` is the CHANGELOG copy's form of the README's same-file link
- * (b.jg5 SRJ-1107), not a file. Takes the flattened step text. Pure; `[]`
+ * of a user doc (the CHANGELOG copy's form of a same-file link, b.jg5 SRJ-1107,
+ * or a link to the user doc that now holds a section the README once held) is
+ * not a file. Takes the flattened step text. Pure; `[]`
  * when none.
  */
 function conversionToolsIn(stepText: string): string[] {
@@ -3687,13 +3783,13 @@ function conversionToolsIn(stepText: string): string[] {
     ...blocks.filter((body) => !REINSTALL.test(body)).map((body) => `fenced block: ${body}`),
     ...[...prose.matchAll(/`[^`]*(?:\.(?:sh|ts|js|py)\b|claude-slack-channel-bots\s+\w)[^`]*`/g)].map((m) => `code span: ${m[0]}`),
     ...markdownLinks(prose)
-      .filter((link) => link.path !== '' && !(link.path === 'README.md' && link.anchor !== ''))
+      .filter((link) => link.path !== '' && !(isUserDocPath(link.path) && link.anchor !== ''))
       .map((link) => `link to a file: ${link.target}`),
     ...[...prose.matchAll(/\b(?:conver\w*|migrat\w*)\b[^.]*\b(?:tool|script|command|subcommand)s?\b|\b(?:tool|script|command|subcommand)s?\b[^.]*\bconver\w*/gi)].map((m) => `wording: ${m[0]}`),
   ]
 }
 
-/** The README heading `anchor` resolves to, as GitHub assigns anchors; undefined when none does. */
+/** The heading of `readme` (a user doc) `anchor` resolves to, as GitHub assigns anchors; undefined when none does. */
 function headingAt(readme: string, anchor: string): Heading | undefined {
   const index = headingAnchors(readme).indexOf(anchor)
   return index < 0 ? undefined : headings(readme)[index]
@@ -3711,7 +3807,7 @@ function linksWithText(text: string): { text: string; path: string; anchor: stri
  */
 function rollbackTitleProblems(readme: string): string[] {
   const titled = headings(readme).filter((h) => h.title === ROLLBACK_RUNBOOK_SECTION_TITLE)
-  if (titled.length !== 1) return [`${titled.length} README headings are titled "${ROLLBACK_RUNBOOK_SECTION_TITLE}", expected 1`]
+  if (titled.length !== 1) return [`${titled.length} ${RUNBOOK_DOC} headings are titled "${ROLLBACK_RUNBOOK_SECTION_TITLE}", expected 1`]
   const [heading] = titled
   const problems: string[] = []
   if (heading.text !== ROLLBACK_HEADING) problems.push(`"${heading.text}" is not "${ROLLBACK_HEADING}"`)
@@ -3736,12 +3832,12 @@ function rollbackTitleProblems(readme: string): string[] {
  */
 function rollbackPointerProblems(readme: string): string[] {
   const rollback = sectionRange(readme, ROLLBACK_HEADING)
-  if (rollback === undefined) return [`README.md has no heading "${ROLLBACK_HEADING}"`]
-  const switchOver = requiredSection(readme, SWITCH_OVER_HEADING, 'README.md')
+  if (rollback === undefined) return [`${RUNBOOK_DOC} has no heading "${ROLLBACK_HEADING}"`]
+  const switchOver = requiredSection(readme, SWITCH_OVER_HEADING, RUNBOOK_DOC)
   const lines = switchOver.split('\n')
   const first = headings(switchOver)[0]
   const frame = flat(lines.slice(0, first === undefined ? lines.length : first.line).join('\n'))
-  const block = flat(requiredSection(switchOver, `#### ${REFUSAL_BLOCK_HEADING}`, `README.md, under "${SWITCH_OVER_HEADING}",`))
+  const block = flat(requiredSection(switchOver, `#### ${REFUSAL_BLOCK_HEADING}`, `${RUNBOOK_DOC}, under "${SWITCH_OVER_HEADING}",`))
   const isSection = (h: Heading) => h.text === ROLLBACK_HEADING
   const isStep = (n: number) => (h: Heading) => h.line > rollback.start && h.line < rollback.end && h.level === 4 && stepNumberOf(h.title) === n
   const title = escapeRegExp(`"${ROLLBACK_RUNBOOK_SECTION_TITLE}"`)
@@ -3772,15 +3868,15 @@ function rollbackPointerProblems(readme: string): string[] {
 }
 
 describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1109)`, () => {
-  const readme = operatorText('README.md')
+  const readme = operatorText(RUNBOOK_DOC)
 
-  test('exactly one README heading carries the rollback title, a `###` under `## Migration`, after the switch-over section', () => {
+  test(`exactly one ${RUNBOOK_DOC} heading carries the rollback title, a \`###\` under \`## Migration\`, after the switch-over section`, () => {
     expect(rollbackTitleProblems(readme)).toEqual([])
   })
 
   test.each([
     ['re-levelled', (text: string) => text.replace(`${ROLLBACK_HEADING}\n`, `#${ROLLBACK_HEADING}\n`), 'is not "'],
-    ['duplicated', (text: string) => `${text}\n${ROLLBACK_HEADING}\n`, '2 README headings'],
+    ['duplicated', (text: string) => `${text}\n${ROLLBACK_HEADING}\n`, `2 ${RUNBOOK_DOC} headings`],
     ['placed before the switch-over section', (text: string) => text.replace(`${ROLLBACK_HEADING}\n`, '').replace(`${SWITCH_OVER_HEADING}\n`, `${ROLLBACK_HEADING}\n\n${SWITCH_OVER_HEADING}\n`), 'is not after'],
   ])('self-check: with the rollback heading %s, the title case fails', (_how, edit, problem) => {
     const edited = edit(readme)
@@ -3792,9 +3888,9 @@ describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1
     expect(read().steps).toHaveLength(ROLLBACK_STEP_COUNT)
   })
 
-  describe('the step reader on the rollback section (self-checks, on edited README text)', () => {
+  describe('the step reader on the rollback section (self-checks, on edited runbook text)', () => {
     const start = readme.indexOf(`${ROLLBACK_HEADING}\n`)
-    /** The README with `edit` applied to the rollback section and what follows it only. */
+    /** `RUNBOOK_DOC` with `edit` applied to the rollback section and what follows it only. */
     const inRollback = (edit: (rest: string) => string) => readme.slice(0, start) + edit(readme.slice(start))
     const step = (n: number) => `#### ${stepHeadingPrefix(n)}`
     test.each([
@@ -3804,7 +3900,7 @@ describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1
       ['beyond the count', inRollback((rest) => rest.replace(step(9), `${step(10)}Extra\n\n${step(9)}`)), 'step 10 is beyond the expected 9 steps'],
     ])('a rollback step %s fails naming the rollback section and the step', (_how, text, message) => {
       expect(start).toBeGreaterThan(0)
-      expect(() => readRunbookCarrier('README.md', text, ROLLBACK_HEADING, ROLLBACK_STEP_COUNT)).toThrow(`README.md "${ROLLBACK_HEADING}": ${message}`)
+      expect(() => readRunbookCarrier(RUNBOOK_DOC, text, ROLLBACK_HEADING, ROLLBACK_STEP_COUNT)).toThrow(`${RUNBOOK_DOC} "${ROLLBACK_HEADING}": ${message}`)
     })
   })
 
@@ -3880,14 +3976,14 @@ describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1
 
     test.each([
       ['a same-file heading link', '(see [Upgrading to personas](#upgrading-to-personas))', []],
-      ["a README heading link, the CHANGELOG copy's form of it (SRJ-1107)", '(see [Upgrading to personas](README.md#upgrading-to-personas))', []],
-      ['a link to the README file itself', '(see [the README](README.md))', ['link to a file']],
+      [`a ${RUNBOOK_DOC} heading link, the CHANGELOG copy's form of it (SRJ-1107)`, `(see [Upgrading to personas](${RUNBOOK_DOC}#upgrading-to-personas))`, []],
+      [`a link to ${RUNBOOK_DOC} itself`, `(see [the migration page](${RUNBOOK_DOC}))`, ['link to a file']],
     ] as const)('self-check (hatch A3): a step 8 with %s', (_label, text, kinds) => {
       expect(conversionToolsIn(flat(`Rebuild it by hand ${text}.`)).map((found) => found.split(':')[0])).toEqual([...kinds])
     })
   })
 
-  describe('README.md: ruling C-2 and the runbooks\' links', () => {
+  describe(`${RUNBOOK_DOC}: ruling C-2 and the runbooks' links`, () => {
     test("the switch-over runbook's pointers to the rollback runbook and its step 8 are links that resolve (ruling C-2; hatch A3)", () => {
       expect(rollbackPointerProblems(readme)).toEqual([])
     })
@@ -3902,8 +3998,8 @@ describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1
       expect(rollbackPointerProblems(edited).join('\n')).toContain(problem)
     })
 
-    test.each([SWITCH_OVER_HEADING, ROLLBACK_HEADING])('every same-file link in "%s" resolves to a README heading', (heading) => {
-      const section = requiredSection(readme, heading, 'README.md')
+    test.each([SWITCH_OVER_HEADING, ROLLBACK_HEADING])(`every same-file link in "%s" resolves to a ${RUNBOOK_DOC} heading`, (heading) => {
+      const section = requiredSection(readme, heading, RUNBOOK_DOC)
       const anchors = headingAnchors(readme)
       const links = linksWithText(section).filter((link) => link.path === '')
       expect(links.length).toBeGreaterThan(0)
@@ -3912,8 +4008,8 @@ describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1
 
     test('each "switch-over step <n>" link in the rollback section resolves to that step of the switch-over section', () => {
       const switchOver = sectionRange(readme, SWITCH_OVER_HEADING)
-      if (switchOver === undefined) throw new Error(`README.md has no heading "${SWITCH_OVER_HEADING}"`)
-      const links = linksWithText(requiredSection(readme, ROLLBACK_HEADING, 'README.md')).filter((link) => link.path === '' && /^switch-over step \d+$/i.test(link.text))
+      if (switchOver === undefined) throw new Error(`${RUNBOOK_DOC} has no heading "${SWITCH_OVER_HEADING}"`)
+      const links = linksWithText(requiredSection(readme, ROLLBACK_HEADING, RUNBOOK_DOC)).filter((link) => link.path === '' && /^switch-over step \d+$/i.test(link.text))
       expect(links.length).toBeGreaterThan(0)
       const wrong = links.filter((link) => {
         const h = headingAt(readme, link.anchor)
@@ -3924,7 +4020,7 @@ describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1
 
     test('docs/registry-install-runbook.md links both runbook sections, and the links resolve', () => {
       const anchors = markdownLinks(readRepoFile('docs/registry-install-runbook.md'))
-        .filter((link) => link.path === '../README.md')
+        .filter((link) => resolve(REPO_ROOT, 'docs', link.path) === resolve(REPO_ROOT, RUNBOOK_DOC))
         .map((link) => link.anchor)
       for (const heading of [SWITCH_OVER_HEADING, ROLLBACK_HEADING]) {
         const anchor = headingSlug(heading.slice('### '.length))
@@ -3937,9 +4033,9 @@ describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1
 
 /**
  * Paths that exist on one host only, which neither runbook names in either
- * carrier, nor the README's Migration section (b.3ut): the steps name the
- * host's sweep schedule and the shared orchestrator prompt generically
- * instead. Read over those sections only: elsewhere the README quotes a
+ * carrier, nor the Migration section of `RUNBOOK_DOC` (b.3ut): the steps name
+ * the host's sweep schedule and the shared orchestrator prompt generically
+ * instead. Read over those sections only: elsewhere the user docs quote a
  * server log line naming the sweep script, and `horde_admin` is an example
  * persona name.
  */
@@ -3957,7 +4053,7 @@ const RUNBOOK_SECTIONS: [name: string, read: () => string][] = [
 describe('the runbooks name no host-specific path (b.3ut)', () => {
   test.each([
     ...RUNBOOK_SECTIONS,
-    [`README.md "${MIGRATION_HEADING}" (to the next \`##\`, both runbooks included)`, () => requiredSection(operatorText('README.md'), MIGRATION_HEADING, 'README.md')],
+    [`${RUNBOOK_DOC} "${MIGRATION_HEADING}" (to the next \`##\`, both runbooks included)`, () => requiredSection(operatorText(RUNBOOK_DOC), MIGRATION_HEADING, RUNBOOK_DOC)],
   ] satisfies [string, () => string][])(`%s: the text, its headings included, names none of ${HOST_SPECIFIC_PATHS.join(', ')}`, (_name, read) => {
     expect(hostPathsIn(read())).toEqual([])
   })
@@ -3966,14 +4062,14 @@ describe('the runbooks name no host-specific path (b.3ut)', () => {
     expect(flat(read())).not.toMatch(ci('orchestrator system prompt'))
   })
 
-  test('self-check: the README with the host-specific wording put back in steps 10 and 11 and rollback steps 2 and 4 is reported in both runbooks', () => {
-    const edited = operatorText('README.md')
+  test('self-check: the runbooks with the host-specific wording put back in steps 10 and 11 and rollback steps 2 and 4 is reported in both runbooks', () => {
+    const edited = operatorText(RUNBOOK_DOC)
       .replace(', and in its source copy if you keep one,', ', `~/.claude/channels/slack/system-prompt.md`, and its source copy, `~/projects/horde_admin/cscb_system_prompt.md`,')
       .replace("Add it to the host's sweep schedule, the one", "Add it to the host's sweep loop, `~/startup/find-missing-loop.sh`, the script")
       .replace("added to the host's sweep schedule, the cron entry, systemd timer or loop script that runs it", "added to the host's sweep loop, `~/startup/find-missing-loop.sh`")
       .replace("restore step 2's daily `expire` to the host's sweep schedule", "restore step 2's daily `expire` in `~/startup/find-missing-loop.sh`")
-    const switchOver = readRunbookCarrier('README.md', edited, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
-    const rollback = readRunbookCarrier('README.md', edited, ROLLBACK_HEADING, ROLLBACK_STEP_COUNT)
+    const switchOver = readRunbookCarrier(RUNBOOK_DOC, edited, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
+    const rollback = readRunbookCarrier(RUNBOOK_DOC, edited, ROLLBACK_HEADING, ROLLBACK_STEP_COUNT)
     expect({ switchOver: hostPathsIn(switchOver.section), rollback: hostPathsIn(rollback.section) }).toEqual({
       switchOver: [...HOST_SPECIFIC_PATHS],
       rollback: ['find-missing-loop.sh', '~/startup/'],
@@ -4229,16 +4325,25 @@ function sectionChunks(section: string): { heading: string; text: string }[] {
   }))
 }
 
-/** The line of a CHANGELOG runbook copy that names the README section as the maintained copy. */
+/** The line of a CHANGELOG runbook copy that names the `RUNBOOK_DOC` section as the maintained copy. */
 const MAINTAINED_COPY = ci('is the maintained copy of this runbook')
 
-/** A CHANGELOG runbook copy as the README writes it: its maintained-copy line dropped, and each `README.md#` link read as a same-file link. */
+/**
+ * A CHANGELOG runbook copy as `RUNBOOK_DOC` writes it: its maintained-copy
+ * line dropped, each `docs/migration.md#` link read as a same-file link, and
+ * each other repository link, repo-relative in the CHANGELOG, read relative
+ * to `RUNBOOK_DOC`'s directory.
+ */
 function asReadmeText(section: string): string {
   return section
     .split('\n')
     .filter((line) => !MAINTAINED_COPY.test(line))
     .join('\n')
-    .replaceAll('](README.md#', '](#')
+    .replace(/\]\(([^)\s#]+)(#[^)\s]*)?\)/g, (whole, path: string, anchor: string | undefined) => {
+      if (/^[a-z]+:/i.test(path)) return whole
+      if (path === RUNBOOK_DOC) return `](${anchor ?? ''})`
+      return `](${relative(dirname(RUNBOOK_DOC), path)}${anchor ?? ''})`
+    })
 }
 
 /** The two runbooks the release entry copies: each section's title and heading. */
@@ -4251,9 +4356,18 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
   const changelog = () => operatorText(CHANGELOG_FILE)
 
   describe('OPERATOR_TEXTS', () => {
-    test("holds exactly SRJ-1101's seven operator texts, each read from the repository", () => {
+    test("holds exactly SRJ-1101's operator texts, the README's sections now spread over the user docs and CONTRIBUTING.md, each read from the repository", () => {
       expect(OPERATOR_TEXTS.map(([name]) => name)).toEqual([
         'README.md',
+        'docs/configuration.md',
+        'docs/reload.md',
+        'docs/cli.md',
+        'docs/bots.md',
+        'docs/scheduled-prompts.md',
+        'docs/agent-director.md',
+        'docs/troubleshooting.md',
+        'docs/migration.md',
+        'CONTRIBUTING.md',
         'skills/debug-slack-channel-bots/SKILL.md',
         'skills/install-cscb/SKILL.md',
         'skills/setup-slack-channel-bots/SKILL.md',
@@ -4264,8 +4378,10 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
       expect(OPERATOR_TEXTS.filter(([, read]) => read().trim() === '').map(([name]) => name)).toEqual([])
     })
 
-    test('SHIPPED_TEXTS, which the forbidden-term audit reads, still holds neither the CHANGELOG nor any docs/ file', () => {
-      expect(SHIPPED_TEXTS.map(([name]) => name).filter((name) => name === CHANGELOG_FILE || name.startsWith('docs/'))).toEqual([])
+    test('SHIPPED_TEXTS, which the forbidden-term audit reads, holds every user doc and CONTRIBUTING.md, and neither the CHANGELOG nor an internal docs/ guide', () => {
+      const names = SHIPPED_TEXTS.map(([name]) => name)
+      expect([...USER_DOC_FILES, CONTRIBUTING_FILE].filter((doc) => !names.includes(doc))).toEqual([])
+      expect(names.filter((name) => name === CHANGELOG_FILE || (name.startsWith('docs/') && !(USER_DOC_FILES as readonly string[]).includes(name)))).toEqual([])
     })
 
     test.each(OPERATOR_TEXTS)(`%s: no heading titled "${UPGRADE_STEPS_TITLE}" and no link to its anchor (SRJ-1107)`, (_name, read) => {
@@ -4332,7 +4448,7 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
     })
   })
 
-  describe('the runbook copies (SRJ-1107; hatch A3: the README is the maintained copy)', () => {
+  describe(`the runbook copies (SRJ-1107; hatch A3: the ${RUNBOOK_DOC} section is the maintained copy)`, () => {
     test.each(RUNBOOK_COPIES)(`the copy of "%s" sits in the ${RUNBOOK_RELEASE_VERSION} entry, the release that introduced it, and nowhere else in the file`, (_title, heading) => {
       const text = changelog()
       const { start, end } = releaseEntryRange(text)
@@ -4352,21 +4468,21 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
       )
     })
 
-    test.each(RUNBOOK_COPIES)('the copy of "%s" names the README section as the maintained copy, by a link that resolves', (title, heading) => {
+    test.each(RUNBOOK_COPIES)(`the copy of "%s" names the ${RUNBOOK_DOC} section as the maintained copy, by a link that resolves`, (title, heading) => {
       const units = textUnits(requiredSection(releaseEntry(changelog()), heading, CHANGELOG_FILE)).filter((unit) => MAINTAINED_COPY.test(unit))
       expect(units).toHaveLength(1)
       const anchor = headingSlug(title)
-      expect(linksWithText(units[0]).filter((link) => link.path === 'README.md' && link.anchor === anchor).map((link) => link.target)).toEqual([`README.md#${anchor}`])
-      expect(headingAt(operatorText('README.md'), anchor)?.text).toBe(heading)
+      expect(linksWithText(units[0]).filter((link) => link.path === RUNBOOK_DOC && link.anchor === anchor).map((link) => link.target)).toEqual([`${RUNBOOK_DOC}#${anchor}`])
+      expect(headingAt(operatorText(RUNBOOK_DOC), anchor)?.text).toBe(heading)
     })
 
-    test.each(RUNBOOK_COPIES)("the copy of \"%s\" is the README section word for word, headings included, once its maintained-copy line is dropped and its README.md# links read as the README's own", (_title, heading) => {
-      const readmeSection = requiredSection(operatorText('README.md'), heading, 'README.md')
+    test.each(RUNBOOK_COPIES)(`the copy of "%s" is the ${RUNBOOK_DOC} section word for word, headings included, once its maintained-copy line is dropped and its links read as ${RUNBOOK_DOC}'s own`, (_title, heading) => {
+      const readmeSection = requiredSection(operatorText(RUNBOOK_DOC), heading, RUNBOOK_DOC)
       const copy = asReadmeText(requiredSection(releaseEntry(changelog()), heading, CHANGELOG_FILE))
       expect(sectionChunks(copy)).toEqual(sectionChunks(readmeSection))
     })
 
-    // The audit reads only SHIPPED_TEXTS, so the README copies' token-variable check does not reach the CHANGELOG's.
+    // The audit reads only SHIPPED_TEXTS, so the runbooks' token-variable check does not reach the CHANGELOG's.
     test.each(RUNBOOK_COPIES)('the copy of "%s" names no Slack token environment variable (SRJ-1516: the runbooks never name one)', (_title, heading) => {
       const group = FORBIDDEN_TERMS.find((g) => g.name === 'the token environment variables')
       if (group === undefined) throw new Error('FORBIDDEN_TERMS has no group "the token environment variables"')
@@ -4494,14 +4610,14 @@ describe('bug b.7sd: no operator text sends the operator to an agent-director in
     ["agent-director's gate record to check", "Check agent-director's gate record for this host.", ['gate record']],
     ["the install gate's record to confirm", "Confirm the install gate's record has this host's approval.", ["install gate's record"]],
   ])("self-check: 0.11.0's or a new form, %s, is reported", (_label, text, matches) => {
-    expect(installGateHits('README.md', text).map((hit) => hit.match)).toEqual(matches)
+    expect(installGateHits(USER_DOCS_NAME, text).map((hit) => hit.match)).toEqual(matches)
   })
 
   test.each([
     ['as written', "The go-ahead is the operator's decision, and agent-director ships no install-gate file or record. agent-director's Phase 1 install gate is the set of CSCB fixes that must be in place on a host before Phase 1 is installed there."],
     ['across a line wrap', "The go-ahead is the operator's decision, and agent-director ships\n   no install-gate file or record."],
   ])("self-check: step 1's statement that agent-director ships no install-gate file or record passes, %s", (_label, statement) => {
-    expect(installGateHits('README.md', statement)).toEqual([])
+    expect(installGateHits(USER_DOCS_NAME, statement)).toEqual([])
   })
 })
 
@@ -4750,7 +4866,7 @@ const PREFIX_KEY_EXAMPLE = new RegExp(`\\btmux attach(?:-session)?\\s+-t\\s+${es
  * `RELEASE_ENTRY_CHECKS`.
  */
 const PREFIX_KEY_REASON_CARRIERS: readonly [file: string, heading: HeadingMatch][] = [
-  ['README.md', '#### Persona name and key'],
+  [CONFIGURATION_DOC, '### Persona name and key'],
   [DEBUG_SKILL_FILE, '### Across personas'],
   [WIZARD_FILE, /^#### .*\bName$/],
   ['docs/engineering-guide.md', '## Configuration'],
@@ -4849,17 +4965,17 @@ describe("E36 T2: the prefix-key rule's reason is SRJ-1102's in every carrier, a
 // b.jg5 SRJ-208, SRJ-212, SRJ-1101), read through OPERATOR_TEXTS
 // ---------------------------------------------------------------------------
 
-const INSTALL_CHECK_HEADING = '### Checking your agent-director install'
+const INSTALL_CHECK_HEADING = '## Checking your agent-director install'
 const PREFLIGHT_GATES_HEADING = '### Preflight gates'
-const TROUBLESHOOTING_HEADING = '## Troubleshooting'
+const TROUBLESHOOTING_HEADING = '# Troubleshooting'
 
 /** The script SR-2.5 runs in `/publish`'s preflight (b.jg5 SRJ-211). */
 const AD_VERSION_CHECK_SCRIPT = 'scripts/ad-version-check.ts'
 
 /** The README's list item for `label` under `heading`, a nested item (`  - \`label\``) read as a top-level one. */
 function readmeLabelItem(heading: string, label: string, readme: string): string {
-  const section = requiredSection(readme, heading, 'README.md').replace(/^ {2}(?=- `)/gm, '')
-  return labelItem(section, label, `README.md "${heading}"`)
+  const section = requiredSection(readme, heading, USER_DOCS_NAME).replace(/^ {2}(?=- `)/gm, '')
+  return labelItem(section, label, `${USER_DOCS_NAME} "${heading}"`)
 }
 
 /**
@@ -4883,7 +4999,7 @@ const README_REMEDY_ITEMS: readonly [heading: string, label: string, required: r
 ]
 
 /** A remedy item's problems: what it lacks and each upgrade form it carries (the re-install row included). */
-function remedyItemProblems(heading: string, label: string, required: readonly string[], readme: string = operatorText('README.md')): string[] {
+function remedyItemProblems(heading: string, label: string, required: readonly string[], readme: string = userDocsText()): string[] {
   const item = readmeLabelItem(heading, label, readme)
   return [...lacking(item, required), ...upgradeFormsIn(item)]
 }
@@ -4896,14 +5012,14 @@ function remedyItemProblems(heading: string, label: string, required: readonly s
  * that step's heading in the section; it names no publishing-host block, by
  * its quoted heading or a link to it.
  */
-function startupNotFoundItemProblems(readme: string = operatorText('README.md')): string[] {
+function startupNotFoundItemProblems(readme: string = userDocsText()): string[] {
   const item = readmeLabelItem(STARTUP_ERRORS_HEADING, AD_SYSTEM_INSTALL_NOT_FOUND, readme)
-  const carrier = readRunbookCarrier('README.md', readme, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
+  const carrier = readRunbookCarrier(USER_DOCS_NAME, readme, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
   const step1 = headingAt(readme, carrier.stepAnchors[0])
   const runbook = sectionRange(readme, SWITCH_OVER_HEADING)
-  const blockNames = [`"${PUBLISHING_HOST_BLOCK_HEADING}"`, `(#${headingSlug(PUBLISHING_HOST_BLOCK_HEADING)})`]
+  const blockNames = [`"${PUBLISHING_HOST_BLOCK_HEADING}"`, `(#${headingSlug(PUBLISHING_HOST_BLOCK_HEADING)})`, `(${RUNBOOK_FROM_DOCS}#${headingSlug(PUBLISHING_HOST_BLOCK_HEADING)})`]
   return [
-    ...lacking(item, [stepLink(1)(carrier)]),
+    ...lacking(item, [`(${RUNBOOK_FROM_DOCS}#${carrier.stepAnchors[0]})`]),
     ...(step1 !== undefined && stepNumberOf(step1.title) === 1 && runbook !== undefined && step1.line > runbook.start && step1.line < runbook.end
       ? []
       : [`#${carrier.stepAnchors[0]} resolves to no step 1 heading inside "${SWITCH_OVER_HEADING}"`]),
@@ -4922,7 +5038,7 @@ const NEVER_REMOVE_THE_FILE = 'never remove or recreate the file'
  * exactly one does.
  */
 function sameUserItem(readme: string): string {
-  const lines = requiredSection(readme, STARTUP_ERRORS_HEADING, 'README.md').split('\n')
+  const lines = requiredSection(readme, STARTUP_ERRORS_HEADING, USER_DOCS_NAME).split('\n')
   const items = lines
     .flatMap((line, i) => (line.startsWith('- `') ? [i] : []))
     .map((start) => {
@@ -4930,12 +5046,12 @@ function sameUserItem(readme: string): string {
       return flat(lines.slice(start, end < 0 ? undefined : end).join('\n'))
     })
     .filter((item) => item.includes(`${code(DEFAULT_STORE_PATH)} is owned by a different UID`))
-  if (items.length !== 1) throw new Error(`README.md "${STARTUP_ERRORS_HEADING}": ${items.length} class items say ${DEFAULT_STORE_PATH} is owned by a different UID, expected 1`)
+  if (items.length !== 1) throw new Error(`${USER_DOCS_NAME} "${STARTUP_ERRORS_HEADING}": ${items.length} class items say ${DEFAULT_STORE_PATH} is owned by a different UID, expected 1`)
   return items[0]
 }
 
 /** The same-user item's problems (the E2-gate ruling): run as the file's owner, the runbook section, no re-install and no removal but the ruling's own words. */
-function sameUserProblems(readme: string = operatorText('README.md')): string[] {
+function sameUserProblems(readme: string = userDocsText()): string[] {
   const item = sameUserItem(readme)
   const rest = item.split(NEVER_REMOVE_THE_FILE).join('')
   return [
@@ -4973,8 +5089,8 @@ const AD_VERSION_CLAIM = /\bagent-director`?[^.|]{0,40}?\d+\.\d+\.\d+/g
  * "≥ 0.8.0" and install check's `0.7.0` floor are gone), and the
  * `resume_enabled` row names no agent-director version.
  */
-function noMemoryProblems(readme: string = operatorText('README.md')): string[] {
-  const units = textUnits(requiredSection(readme, TROUBLESHOOTING_HEADING, 'README.md')).filter((unit) => ci('**Bots come back with no memory').test(unit))
+function noMemoryProblems(readme: string = userDocsText()): string[] {
+  const units = textUnits(requiredSection(readme, TROUBLESHOOTING_HEADING, USER_DOCS_NAME)).filter((unit) => ci('**Bots come back with no memory').test(unit))
   if (units.length !== 1) return [`${units.length} Troubleshooting units open with "Bots come back with no memory", expected 1`]
   const rows = readme.split('\n').filter((line) => line.startsWith('| `resume_enabled` |'))
   return [
@@ -4992,8 +5108,8 @@ function noMemoryProblems(readme: string = operatorText('README.md')): string[] 
  * prefix, the runbook section and its publishing-host block, with no upgrade
  * form.
  */
-function preflightGateProblems(readme: string = operatorText('README.md')): string[] {
-  const section = requiredSection(readme, PREFLIGHT_GATES_HEADING, 'README.md')
+function preflightGateProblems(readme: string = operatorText(CONTRIBUTING_FILE)): string[] {
+  const section = requiredSection(readme, PREFLIGHT_GATES_HEADING, CONTRIBUTING_FILE)
   const gates = section.split('\n').filter((line) => /^\d+\. /.test(line))
   const lead = /\benforces (\w+) fail-fast gates\b/.exec(flat(section))?.[1]
   const sr25 = gates.filter((gate) => gate.includes(code(AD_VERSION_CHECK_SCRIPT))).map(flat)
@@ -5022,10 +5138,10 @@ describe("E36 T2: the README's install and startup texts point to the runbook an
     expect(remedyItemProblems(heading, label, required)).toEqual([])
   })
 
-  test(`"${INSTALL_CHECK_HEADING.slice('### '.length)}": the not-found item's "${PUBLISHING_HOST_BLOCK_HEADING}" link resolves to that block's heading in the switch-over section`, () => {
-    const readme = operatorText('README.md')
+  test(`"${INSTALL_CHECK_HEADING.replace(/^#+ /, '')}": the not-found item's "${PUBLISHING_HOST_BLOCK_HEADING}" link resolves to that block's heading in the switch-over section`, () => {
+    const readme = userDocsText()
     const anchor = headingSlug(PUBLISHING_HOST_BLOCK_HEADING)
-    expect(readmeLabelItem(INSTALL_CHECK_HEADING, AD_SYSTEM_INSTALL_NOT_FOUND, readme)).toContain(`(#${anchor})`)
+    expect(readmeLabelItem(INSTALL_CHECK_HEADING, AD_SYSTEM_INSTALL_NOT_FOUND, readme)).toContain(`(${RUNBOOK_FROM_DOCS}#${anchor})`)
     expect(headingAt(readme, anchor)?.title).toBe(PUBLISHING_HOST_BLOCK_HEADING)
     const block = sectionRange(readme, new RegExp(`^#+ ${escapeRegExp(PUBLISHING_HOST_BLOCK_HEADING)}$`))
     const runbook = sectionRange(readme, SWITCH_OVER_HEADING)
@@ -5054,12 +5170,12 @@ describe("E36 T2: the README's install and startup texts point to the runbook an
   })
 
   describe('self-checks (each edits an in-memory README back to the wording this Task replaced)', () => {
-    const readme = () => operatorText('README.md')
+    const readme = () => userDocsText()
 
     test.each([
       [INSTALL_CHECK_HEADING, AD_SYSTEM_INSTALL_NOT_FOUND, 'Install AD and retry.', /The message points to the block [^\n]*?no agent-director\./],
       [INSTALL_CHECK_HEADING, AD_VERSION_FLOOR_UNREADABLE, 'The remediation is to check or reinstall the `agent-director` npm package.', /The message says to check the `agent-director` npm package [^\n]*?Phase 1"\./],
-      [STARTUP_ERRORS_HEADING, AD_SYSTEM_INSTALL_UNREACHABLE, 'Diagnose with the install-cscb skill or re-install agent-director.', /says to diagnose with the install-cscb skill, names the README section "[^"]*"/],
+      [STARTUP_ERRORS_HEADING, AD_SYSTEM_INSTALL_UNREACHABLE, 'Diagnose with the install-cscb skill or re-install agent-director.', /says to diagnose with the install-cscb skill, names the docs\/migration\.md section "[^"]*"/],
       [STARTUP_ERRORS_HEADING, AD_SHIM_CATALOG_INCOMPLETE, 'Envelopes with these names would surface as the base AgentDirectorError.', /errors with these names would arrive as `ErrUnknownErrorName` and be misclassified/],
     ] as const)('README.md "%s": the `%s` item fails with "%s"', (heading, label, old, current) => {
       const text = readme()
@@ -5072,16 +5188,16 @@ describe("E36 T2: the README's install and startup texts point to the runbook an
     test(`the startup gate's not-found item fails with the publishing-host pointer back, and with its step 1 link dropped or broken`, () => {
       const text = readme()
       const current = /(^- `ad-system-install-not-found` — `Client\.create\(\)`[^\n]*?)The startup gate runs on a bot host,[^\n]*?differs from the workers'\./m
-      const blockLink = `["${PUBLISHING_HOST_BLOCK_HEADING}"](#${headingSlug(PUBLISHING_HOST_BLOCK_HEADING)})`
-      const old = text.replace(current, `$1The message points to the block ${blockLink} in the README section "${PHASE1_RUNBOOK_SECTION_TITLE}", which covers a host with no agent-director.`)
+      const blockLink = `["${PUBLISHING_HOST_BLOCK_HEADING}"](${RUNBOOK_FROM_DOCS}#${headingSlug(PUBLISHING_HOST_BLOCK_HEADING)})`
+      const old = text.replace(current, `$1The message points to the block ${blockLink} in the ${RUNBOOK_DOC} section "${PHASE1_RUNBOOK_SECTION_TITLE}", which covers a host with no agent-director.`)
       expect(old).not.toBe(text)
-      expect(startupNotFoundItemProblems(old)).toEqual(expect.arrayContaining([`names the publishing-host block: "${PUBLISHING_HOST_BLOCK_HEADING}"`, expect.stringMatching(/^lacks \(#/)]))
-      const step1 = readRunbookCarrier('README.md', text, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT).stepAnchors[0]
+      expect(startupNotFoundItemProblems(old)).toEqual(expect.arrayContaining([`names the publishing-host block: "${PUBLISHING_HOST_BLOCK_HEADING}"`, `lacks (${RUNBOOK_FROM_DOCS}#${readRunbookCarrier(USER_DOCS_NAME, text, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT).stepAnchors[0]})`]))
+      const step1 = readRunbookCarrier(USER_DOCS_NAME, text, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT).stepAnchors[0]
       const lines = text.split('\n')
       const at = lines.findIndex((line) => line.startsWith(`- \`${AD_SYSTEM_INSTALL_NOT_FOUND}\` — \`Client.create()\``))
       expect(at).toBeGreaterThanOrEqual(0)
-      const broken = [...lines.slice(0, at), lines[at].replaceAll(`(#${step1})`, '(#no-such-step)'), ...lines.slice(at + 1)].join('\n')
-      expect(startupNotFoundItemProblems(broken)).toEqual([`lacks (#${step1})`])
+      const broken = [...lines.slice(0, at), lines[at].replaceAll(`(${RUNBOOK_FROM_DOCS}#${step1})`, `(${RUNBOOK_FROM_DOCS}#no-such-step)`), ...lines.slice(at + 1)].join('\n')
+      expect(startupNotFoundItemProblems(broken)).toEqual([`lacks (${RUNBOOK_FROM_DOCS}#${step1})`])
       // A heading of the same title before the runbook takes the anchor, so the link no longer reaches step 1.
       const shadowed = `## ${headingAt(text, step1)?.title}\n\n${text}`
       expect(startupNotFoundItemProblems(shadowed)).toEqual([`#${step1} resolves to no step 1 heading inside "${SWITCH_OVER_HEADING}"`])
@@ -5109,7 +5225,7 @@ describe("E36 T2: the README's install and startup texts point to the runbook an
     })
 
     test('"Preflight gates" fails as the seven-gate list without SR-2.5', () => {
-      const text = readme()
+      const text = operatorText(CONTRIBUTING_FILE)
       const edited = text
         .replace(/^6\. \*\*The host's agent-director[^\n]*\n/m, '')
         .replace('enforces eight fail-fast gates', 'enforces seven fail-fast gates')
@@ -5120,7 +5236,7 @@ describe("E36 T2: the README's install and startup texts point to the runbook an
     })
 
     test('"Preflight gates" fails when the lead\'s count and the list disagree', () => {
-      const text = readme()
+      const text = operatorText(CONTRIBUTING_FILE)
       const edited = text.replace('enforces eight fail-fast gates', 'enforces seven fail-fast gates')
       expect(edited).not.toBe(text)
       expect(preflightGateProblems(edited)).not.toEqual([])
@@ -5147,8 +5263,8 @@ const STALE_AUTO_RESTART_CLAIM: readonly [label: string, pattern: RegExp][] = [
 /** The README's `auto-restart disabled` row in its lost-message recovery table; throws unless there is exactly one. */
 function readmeAutoRestartRow(): string {
   const lead = `| \`${lostMessageStateLabel('auto-restart-disabled')}\` |`
-  const rows = operatorText('README.md').split('\n').filter((line) => line.startsWith(lead))
-  if (rows.length !== 1) throw new Error(`README.md has ${rows.length} rows starting ${lead}`)
+  const rows = userDocsText().split('\n').filter((line) => line.startsWith(lead))
+  if (rows.length !== 1) throw new Error(`${USER_DOCS_NAME} has ${rows.length} rows starting ${lead}`)
   return rows[0]
 }
 
@@ -5695,7 +5811,7 @@ describe('E36 T3: the architecture doc and the engineering guide match the build
     })
 
     test('a broken relative link from docs/ is reported, a resolving one is not', () => {
-      const readmeAnchor = headingSlug(PERSONAS_HEADING.slice('### '.length))
+      const readmeAnchor = headingSlug('Quick Start')
       expect(brokenRepoLinks(ARCHITECTURE_FILE, `See [the README](../README.md#${readmeAnchor}) and [gone](../README.md#no-such-heading).`).broken).toEqual([
         `${ARCHITECTURE_FILE} -> ../README.md#no-such-heading (no such heading in ../README.md)`,
       ])
@@ -5960,7 +6076,7 @@ const TROUBLESHOOTING_NOTICES: readonly [source: string, title: () => string][] 
 /** The README Troubleshooting section's entries: each bold title line (`**…**` alone on its line) with its text up to the next, flattened. Pure. */
 function troubleshootingEntries(readme: string): { title: string; text: string }[] {
   const entries: { title: string; lines: string[] }[] = []
-  for (const line of requiredSection(readme, TROUBLESHOOTING_HEADING, 'README.md').split('\n')) {
+  for (const line of requiredSection(readme, TROUBLESHOOTING_HEADING, USER_DOCS_NAME).split('\n')) {
     if (/^\*\*.+\*\*\s*$/.test(line)) entries.push({ title: line.trim(), lines: [] })
     else entries.at(-1)?.lines.push(line)
   }
@@ -5970,7 +6086,7 @@ function troubleshootingEntries(readme: string): { title: string; text: string }
 /** The one Troubleshooting entry whose title holds `titlePart`, its title and text flattened; throws unless exactly one does. */
 function troubleshootingEntry(readme: string, titlePart: string): string {
   const entries = troubleshootingEntries(readme).filter((entry) => entry.title.includes(titlePart))
-  if (entries.length !== 1) throw new Error(`README.md "${TROUBLESHOOTING_HEADING}": ${entries.length} entries' titles hold "${titlePart}", expected 1`)
+  if (entries.length !== 1) throw new Error(`${USER_DOCS_NAME} "${TROUBLESHOOTING_HEADING}": ${entries.length} entries' titles hold "${titlePart}", expected 1`)
   return `${entries[0].title} ${entries[0].text}`
 }
 
@@ -6119,17 +6235,17 @@ function callTimeoutWarningTemplate(): string {
 }
 
 /** The README's clear-latch CLI entry heading. */
-const CLEAR_LATCH_CLI_HEADING = `### \`claude-slack-channel-bots ${CLEAR_LATCH_COMMAND}\``
+const CLEAR_LATCH_CLI_HEADING = `## \`claude-slack-channel-bots ${CLEAR_LATCH_COMMAND}\``
 
 /** The all-interfaces `bind`, the other value through which `clear-latch` reaches the server (SRJ-510); the loopback one is `CLEAR_LATCH_DIAL_HOST`. */
 const ALL_INTERFACES_BIND = '0.0.0.0'
 
 /** The README section and subsection the call-timeout entry sits in (SRJ-1103: under "Configuration"). */
-const CONFIGURATION_HEADING = '## Configuration'
-const CALL_TIMEOUT_SIZING_HEADING = '#### Sizing the agent-director call timeout'
+const CONFIGURATION_HEADING = '# Configuration'
+const CALL_TIMEOUT_SIZING_HEADING = '### Sizing the agent-director call timeout'
 
 /** The README's timing-settings section (SRJ-209, SRJ-1103). */
-const TIMING_SETTINGS_HEADING = "### agent-director's timing settings"
+const TIMING_SETTINGS_HEADING = "## agent-director's timing settings"
 
 /** The README's prerequisites section. */
 const PREREQUISITES_HEADING = '## Prerequisites'
@@ -6146,49 +6262,49 @@ const LATCH_RECHECK_WORDS = `every ${LATCH_RECHECK_INTERVAL_MS / 60_000} minutes
  */
 const README_SRJ_1103_ROWS: readonly DocRow[] = [
   // The prerequisites.
-  [`prerequisites: Claude Code ${MIN_CLAUDE_CODE_VERSION} or later for the workers (MIN_CLAUDE_CODE_VERSION), the minimum agent-director states for its exec-form hooks and the fleet's version (RN-9; HO rev 31; SRJ-1304)`, unitOf('README.md', PREREQUISITES_HEADING, '- [Claude Code]'), [
+  [`prerequisites: Claude Code ${MIN_CLAUDE_CODE_VERSION} or later for the workers (MIN_CLAUDE_CODE_VERSION), the minimum agent-director states for its exec-form hooks and the fleet's version (RN-9; HO rev 31; SRJ-1304)`, unitOf(USER_DOCS_NAME, PREREQUISITES_HEADING, '- [Claude Code]'), [
     `Claude Code ${MIN_CLAUDE_CODE_VERSION} or later for the workers`,
     ci('installed and authenticated'),
     ci('the minimum agent-director states for its exec-form hooks'),
     ci('the version the fleet runs'),
   ]],
-  ['prerequisites: agent-director Phase 1 or later, installed system-wide', unitOf('README.md', PREREQUISITES_HEADING, '- [`agent-director`]'), [
+  ['prerequisites: agent-director Phase 1 or later, installed system-wide', unitOf(USER_DOCS_NAME, PREREQUISITES_HEADING, '- [`agent-director`]'), [
     ci('`agent-director` Phase 1 or later'),
     ci('installed system-wide'),
   ]],
-  ['prerequisites: this release and agent-director Phase 1 are installed, and rolled back, together; CSCB changes no agent-director code (SRJ-1515)', unitOf('README.md', PREREQUISITES_HEADING, '- [`agent-director`]'), [
+  ['prerequisites: this release and agent-director Phase 1 are installed, and rolled back, together; CSCB changes no agent-director code (SRJ-1515)', unitOf(USER_DOCS_NAME, PREREQUISITES_HEADING, '- [`agent-director`]'), [
     ci('installed on the host together with it, and the two are rolled back together'),
     ci('CSCB changes no agent-director code'),
   ]],
-  ['prerequisites: every agent and long-running agent-director process stopped before either binary change and started again after it (HO C15; ADA question 9)', unitOf('README.md', PREREQUISITES_HEADING, '- [`agent-director`]'), [
+  ['prerequisites: every agent and long-running agent-director process stopped before either binary change and started again after it (HO C15; ADA question 9)', unitOf(USER_DOCS_NAME, PREREQUISITES_HEADING, '- [`agent-director`]'), [
     ci(`every agent on the host, with every long-running agent-director process (${code('agent-director serve')} included), is stopped before either binary change`),
     ci("the Phase 1 install, and the rollback's restore of the previous binary"),
     ci('and started again after it'),
   ]],
-  [`prerequisites: tmux ${vocab('tmuxMinimum')} or later, with remain-on-exit off (HO rev 17)`, unitOf('README.md', PREREQUISITES_HEADING, '- [tmux]'), [
+  [`prerequisites: tmux ${vocab('tmuxMinimum')} or later, with remain-on-exit off (HO rev 17)`, unitOf(USER_DOCS_NAME, PREREQUISITES_HEADING, '- [tmux]'), [
     ci(`tmux ${vocab('tmuxMinimum')} or later, with ${vocab('remainOnExit')} off`),
   ]],
-  ['prerequisites: agent-director depends on neither base-index nor pane-base-index (HO rev 17)', unitOf('README.md', PREREQUISITES_HEADING, '- [tmux]'), [
+  ['prerequisites: agent-director depends on neither base-index nor pane-base-index (HO rev 17)', unitOf(USER_DOCS_NAME, PREREQUISITES_HEADING, '- [tmux]'), [
     ci(`agent-director does not depend on tmux's ${code(vocab('baseIndex'))} or ${code(vocab('paneBaseIndex'))}`),
   ]],
 
   // Migration, beside the runbooks.
-  ["Migration: the find-missing job runs as the workers' user and resolves their tmux socket (C7, C19)", sectionOf('README.md', MIGRATION_HEADING), [
+  ["Migration: the find-missing job runs as the workers' user and resolves their tmux socket (C7, C19)", sectionOf(USER_DOCS_NAME, MIGRATION_HEADING), [
     ci("the job must run as the workers' user and resolve their tmux socket"),
     ci('the socket switch-over step 1 pins'),
   ]],
-  ["Migration: a host that follows the switch-over runbook runs a periodic sweep, which switch-over step 11 (linked) adds where the host has none; it runs as a cron entry, a systemd timer or a loop script, the runbook's sweep schedule (b.3ut)", sectionOf('README.md', MIGRATION_HEADING), [
+  ["Migration: a host that follows the switch-over runbook runs a periodic sweep, which switch-over step 11 (linked) adds where the host has none; it runs as a cron entry, a systemd timer or a loop script, the runbook's sweep schedule (b.3ut)", sectionOf(USER_DOCS_NAME, MIGRATION_HEADING), [
     ci('a host that follows the switch-over runbook runs one'),
     '[switch-over step 11](#step-11-schedule-the-daily-expire) adds it where the host has none',
     ci("run it as a cron entry, a systemd timer or a loop script (the switch-over runbook calls this the host's sweep schedule)"),
   ]],
 
   // Destructive changes: the retired persona, no delete, checked kills.
-  ['Destructive changes: a removed, renamed or destructively modified persona is retired, never resumed, and a re-add starts fresh', sectionOf('README.md', '### Destructive changes'), [
+  ['Destructive changes: a removed, renamed or destructively modified persona is retired, never resumed, and a re-add starts fresh', sectionOf(USER_DOCS_NAME, '## Destructive changes'), [
     ci("a retired persona's session is stopped and never resumed"),
     ci('a persona removed and added again with the same key, or renamed and then renamed back, always starts a new conversation'),
   ]],
-  ["Destructive changes: CSCB never deletes a row and checks every kill; a removed persona's row is kept until expire", sectionOf('README.md', '### Destructive changes'), [
+  ["Destructive changes: CSCB never deletes a row and checks every kill; a removed persona's row is kept until expire", sectionOf(USER_DOCS_NAME, '## Destructive changes'), [
     ci('CSCB never deletes an agent-director row, and it checks the result of every kill it makes'),
     ci("a removed persona's row stays until agent-director's `expire` removes it, and is never resumed"),
   ]],
@@ -6202,7 +6318,7 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
   [`the *${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}* entry: the re-check ${LATCH_RECHECK_WORDS} (SRJ-505), how a hold ends, clear-latch, and "Operator actions" for a human only`, entryOf(troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')), [
     ci(`**The server's own check.** ${LATCH_RECHECK_WORDS}`),
     ci('**How a hold ends.**'),
-    `(#${headingSlug(CLEAR_LATCH_CLI_HEADING.slice('### '.length))})`,
+    docLink(TROUBLESHOOTING_DOC, CLI_DOC, headingSlug(CLEAR_LATCH_CLI_HEADING.replace(/^#+ /, ''))),
     vocab('operatorActions'),
     ci('for a human only'),
   ]],
@@ -6227,7 +6343,7 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
   ]],
 
   // agent-director's timing settings (SRJ-209, SRJ-210).
-  [`timing settings: the nine [${AD_TMUX_TABLE}] keys of ~/${AD_SETTINGS_RELATIVE_PATH}, read at start and every ${AD_VERSION_RECHECK_INTERVAL_MS / 1000} s with agent-director's rule; agent-director's answers decide`, sectionOf('README.md', TIMING_SETTINGS_HEADING), [
+  [`timing settings: the nine [${AD_TMUX_TABLE}] keys of ~/${AD_SETTINGS_RELATIVE_PATH}, read at start and every ${AD_VERSION_RECHECK_INTERVAL_MS / 1000} s with agent-director's rule; agent-director's answers decide`, sectionOf(USER_DOCS_NAME, TIMING_SETTINGS_HEADING), [
     code(`[${AD_TMUX_TABLE}]`),
     code(`~/${AD_SETTINGS_RELATIVE_PATH}`),
     ...AD_TMUX_KEYS.map(code),
@@ -6235,7 +6351,7 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
     ci("a missing file, a missing key or `0` means agent-director's default"),
     ci("agent-director's own answers always decide"),
   ]],
-  ['timing settings: each key\'s default as src/ad-settings.ts holds it', sectionOf('README.md', TIMING_SETTINGS_HEADING), AD_TMUX_KEYS.map((key) => `| ${code(key)} | ${code(String(DEFAULT_AD_SETTINGS.tmux[key]))} |`)],
+  ['timing settings: each key\'s default as src/ad-settings.ts holds it', sectionOf(USER_DOCS_NAME, TIMING_SETTINGS_HEADING), AD_TMUX_KEYS.map((key) => `| ${code(key)} | ${code(String(DEFAULT_AD_SETTINGS.tmux[key]))} |`)],
 
   // The ad-config-malformed outage (SRJ-316).
   [`the *${troubleshootingNoticeTitle("ONSET_TEMPLATES['ad-config-malformed']")()}* entry (${PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED}): CSCB acts on nothing and retries`, entryOf(troubleshootingNoticeTitle("ONSET_TEMPLATES['ad-config-malformed']")), [
@@ -6248,7 +6364,7 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
   [`Server-wide settings: agent_director_call_timeout_ms, default ${DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, range [${MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, ${MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS}]`, (readme) => readme.split('\n').find((line) => line.startsWith(`| ${code('agent_director_call_timeout_ms')} |`)) ?? '', [
     `| number | ${code(String(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS))} |`,
     `[${MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, ${underscored(MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS)}]`,
-    `(#${headingSlug(CALL_TIMEOUT_SIZING_HEADING.slice('#### '.length))})`,
+    docLink(CONFIGURATION_DOC, AGENT_DIRECTOR_DOC, headingSlug(CALL_TIMEOUT_SIZING_HEADING.replace(/^#+ /, ''))),
   ]],
 
   // The fresh system prompt switch, under "Configuration" (b.b1j SR-6.1, SR-5.6).
@@ -6259,24 +6375,24 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
     MIN_CLAUDE_CODE_VERSION,
     ci('a change reaches a bot only when it next starts a new conversation'),
   ]],
-  [`call timeout: its default ${DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, its range, and the need: the largest ceiling CSCB calls plus the ${AD_CALL_TIMEOUT_NEED_MARGIN_MS / 1000n} s margin`, sectionOf('README.md', CALL_TIMEOUT_SIZING_HEADING), [
+  [`call timeout: its default ${DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, its range, and the need: the largest ceiling CSCB calls plus the ${AD_CALL_TIMEOUT_NEED_MARGIN_MS / 1000n} s margin`, sectionOf(USER_DOCS_NAME, CALL_TIMEOUT_SIZING_HEADING), [
     `${code('agent_director_call_timeout_ms')} (default ${code(String(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS))}, an integer in ${code(`[${MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, ${underscored(MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS)}]`)}`,
     ci('the largest ceiling among the agent-director verbs CSCB calls'),
     ci(`plus a ${AD_CALL_TIMEOUT_NEED_MARGIN_MS / 1000n} s margin (${AD_CALL_TIMEOUT_NEED_MARGIN_MS} ms`),
   ]],
-  ['call timeout: the ceilings\' formulas, one table row per ceiling CSCB calls (ADSRD SR-13.2; SRJ-213)', sectionOf('README.md', CALL_TIMEOUT_SIZING_HEADING),
+  ['call timeout: the ceilings\' formulas, one table row per ceiling CSCB calls (ADSRD SR-13.2; SRJ-213)', sectionOf(USER_DOCS_NAME, CALL_TIMEOUT_SIZING_HEADING),
     CSCB_CEILINGS.map((name) => `| ${vocab(`ceiling ${name}`)} |`)],
-  ['call timeout: the startup warning, its line in server.log', sectionOf('README.md', CALL_TIMEOUT_SIZING_HEADING), [
+  ['call timeout: the startup warning, its line in server.log', sectionOf(USER_DOCS_NAME, CALL_TIMEOUT_SIZING_HEADING), [
     ci('**The startup warning.**'),
     callTimeoutWarningTemplate(),
   ]],
 
   // clear-latch under "CLI Reference" (SRJ-510).
-  [`clear-latch: it reaches the server at ${CLEAR_LATCH_DIAL_HOST}, so bind is ${CLEAR_LATCH_DIAL_HOST} or ${ALL_INTERFACES_BIND}`, sectionOf('README.md', CLEAR_LATCH_CLI_HEADING), [
+  [`clear-latch: it reaches the server at ${CLEAR_LATCH_DIAL_HOST}, so bind is ${CLEAR_LATCH_DIAL_HOST} or ${ALL_INTERFACES_BIND}`, sectionOf(USER_DOCS_NAME, CLEAR_LATCH_CLI_HEADING), [
     `It reaches the server at ${code(CLEAR_LATCH_DIAL_HOST)}`,
     `${code(CLEAR_LATCH_DIAL_HOST)} (the default) or ${code(ALL_INTERFACES_BIND)}`,
   ]],
-  ['clear-latch: on any other bind, a hold ends only by the re-check, the teardown or a server restart, which drops every hold', sectionOf('README.md', CLEAR_LATCH_CLI_HEADING), [
+  ['clear-latch: on any other bind, a hold ends only by the re-check, the teardown or a server restart, which drops every hold', sectionOf(USER_DOCS_NAME, CLEAR_LATCH_CLI_HEADING), [
     ci(`a hold ends only by the server's own check ${LATCH_RECHECK_WORDS}`),
     ci("by the persona's teardown"),
     ci('or by a server restart, which drops every hold'),
@@ -6291,8 +6407,8 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
   ]],
 
   // The files and the PID file (SRJ-510, SRJ-802).
-  [`Files beside the config file: ${RETIRED_KEYS_FILE_NAME}`, sectionOf('README.md', '### Files beside the config file'), [`| ${code(RETIRED_KEYS_FILE_NAME)} | The retired-key record`]],
-  [`PID file: ${SERVER_PORT_FILE_NAME}`, sectionOf('README.md', '### PID file'), [ci(`${code(`STATE_DIR/${SERVER_PORT_FILE_NAME}`)} records the server's process ID and the port it actually listens on`)]],
+  [`Files beside the config file: ${RETIRED_KEYS_FILE_NAME}`, sectionOf(USER_DOCS_NAME, '## Files beside the config file'), [`| ${code(RETIRED_KEYS_FILE_NAME)} | The retired-key record`]],
+  [`PID file: ${SERVER_PORT_FILE_NAME}`, sectionOf(USER_DOCS_NAME, '## PID file'), [ci(`${code(`STATE_DIR/${SERVER_PORT_FILE_NAME}`)} records the server's process ID and the port it actually listens on`)]],
 
   // The permission wedge (SRJ-1012, SRJ-1101).
   ['the permission-wedge entry names agent-director read-pane and kill, the kill with its result checked and nothing deleted or respawned, for a human only', (readme) => troubleshootingEntry(readme, '**Bot appears dead / posts a "blocked on a native Claude Code permission prompt" warning**'), [
@@ -6305,7 +6421,7 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
   // The *Still not answering* read-only check (E19; SRJ-1101).
   [`the *${troubleshootingNoticeTitle('tmuxUnresponsiveAlertText')()}* check: the one-line read-pane through agent-director, its caveats in the debugging skill`, entryOf(troubleshootingNoticeTitle('tmuxUnresponsiveOnsetText')), [
     code(`agent-director read-pane --claude-instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key> --n-lines 1`),
-    `(${DEBUG_SKILL_FILE}#${headingSlug('Listing instances')})`,
+    docLink(TROUBLESHOOTING_DOC, DEBUG_SKILL_FILE, headingSlug('Listing instances')),
     ci("take ownership from agent-director's row, never from the pane"),
   ]],
 ]
@@ -6357,7 +6473,7 @@ const SRJ_1013_CLASSES: readonly string[] = [
 
 /** Whether README "Startup errors" has a list item opening with `label` as a code span, alone or among other labels (`- \`a\` and \`b\` — …`). */
 function readmeListsClass(readme: string, label: string): boolean {
-  const section = requiredSection(readme, STARTUP_ERRORS_HEADING, 'README.md')
+  const section = requiredSection(readme, STARTUP_ERRORS_HEADING, USER_DOCS_NAME)
   return new RegExp(`^\\s*- (?:\`[^\`]+\`(?:,| and| or)\\s+)*\`${escapeRegExp(label)}\``, 'm').test(section)
 }
 
@@ -6395,9 +6511,9 @@ const START_AGAIN = ci('start the server again')
 /** A README refusal item's problems: it names the refusal block by a link that resolves and step 10 by its link, and says no "start the server again". */
 function readmeRefusalItemProblems(label: string, readme: string): string[] {
   const item = readmeLabelItem(STARTUP_ERRORS_HEADING, label, readme)
-  const carrier = readRunbookCarrier('README.md', readme, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
+  const carrier = readRunbookCarrier(USER_DOCS_NAME, readme, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
   return [
-    ...lacking(item, [`["${REFUSAL_BLOCK_HEADING}"](#${headingSlug(REFUSAL_BLOCK_HEADING)})`, stepLink(10)(carrier)]),
+    ...lacking(item, [`["${REFUSAL_BLOCK_HEADING}"]${docLink(TROUBLESHOOTING_DOC, RUNBOOK_DOC, headingSlug(REFUSAL_BLOCK_HEADING))}`, docLink(TROUBLESHOOTING_DOC, RUNBOOK_DOC, carrier.stepAnchors[9])]),
     ...(START_AGAIN.test(item) ? [`says "start the server again": ${item}`] : []),
     ...(headingAt(readme, headingSlug(REFUSAL_BLOCK_HEADING))?.title === REFUSAL_BLOCK_HEADING ? [] : [`no heading "${REFUSAL_BLOCK_HEADING}" for the link`]),
   ]
@@ -6405,8 +6521,8 @@ function readmeRefusalItemProblems(label: string, readme: string): string[] {
 
 /** README "Startup errors"' paragraph on a stop by the runtime re-check (SRJ-205): its one unit opening "**Found while the server was running.**". */
 function readmeRuntimeParagraph(readme: string): string {
-  const units = textUnits(requiredSection(readme, STARTUP_ERRORS_HEADING, 'README.md')).filter((unit) => unit.startsWith(`**${RUNTIME_STOP_HEADING.slice('### '.length)}.**`))
-  if (units.length !== 1) throw new Error(`README.md "${STARTUP_ERRORS_HEADING}": ${units.length} units open with the runtime-stop lead, expected 1`)
+  const units = textUnits(requiredSection(readme, STARTUP_ERRORS_HEADING, USER_DOCS_NAME)).filter((unit) => unit.startsWith(`**${RUNTIME_STOP_HEADING.slice('### '.length)}.**`))
+  if (units.length !== 1) throw new Error(`${USER_DOCS_NAME} "${STARTUP_ERRORS_HEADING}": ${units.length} units open with the runtime-stop lead, expected 1`)
   return units[0]
 }
 
@@ -6414,7 +6530,7 @@ function readmeRuntimeParagraph(readme: string): string {
 function readmeRuntimeParagraphProblems(readme: string, skill: string = operatorText(DEBUG_SKILL_FILE)): string[] {
   const paragraph = readmeRuntimeParagraph(readme)
   const anchor = headingSlug(RUNTIME_STOP_HEADING.slice('### '.length))
-  const linked = markdownLinks(paragraph).filter((link) => link.path === DEBUG_SKILL_FILE && link.anchor === anchor)
+  const linked = markdownLinks(paragraph).filter((link) => link.path === relative(dirname(TROUBLESHOOTING_DOC), DEBUG_SKILL_FILE) && link.anchor === anchor)
   const index = headingAnchors(skill).indexOf(anchor)
   const parent = sectionRange(skill, `## ${REFUSAL_SECTION_TITLE}`)
   const line = index < 0 ? -1 : headings(skill)[index].line
@@ -6455,7 +6571,7 @@ const RUNTIME_STOP_REMEDY_ROWS: readonly [element: string, required: readonly (s
   ]],
   ['once the server finds Phase 1, CSCB is started', [ci('once the server finds Phase 1, start CSCB')]],
   [`or the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}", which starts the previous CSCB`, [
-    `["${ROLLBACK_RUNBOOK_SECTION_TITLE}"](../../README.md#${headingSlug(ROLLBACK_RUNBOOK_SECTION_TITLE)})`,
+    `["${ROLLBACK_RUNBOOK_SECTION_TITLE}"](../../${RUNBOOK_DOC}#${headingSlug(ROLLBACK_RUNBOOK_SECTION_TITLE)})`,
     ci('which starts the previous CSCB'),
   ]],
   ['the old CSCB is never reinstalled onto the migrated store', [ci("installing agent-director Phase 1 migrated agent-director's store, so never reinstall the old CSCB onto it")]],
@@ -6488,7 +6604,7 @@ function runtimeStopProblems(skill: string): string[] {
 function debugRefusalEntryProblems(label: string, skill: string): string[] {
   const entry = flat(requiredSection(skill, classHeading(label), DEBUG_SKILL_FILE))
   return [
-    ...lacking(entry, [`the block "${flat(REFUSAL_BLOCK_HEADING)}" of the README section "${PHASE1_RUNBOOK_SECTION_TITLE}"`, ci("the runbook's step 10 starts the new server")]),
+    ...lacking(entry, [`the block "${flat(REFUSAL_BLOCK_HEADING)}" of the ${RUNBOOK_DOC} section "${PHASE1_RUNBOOK_SECTION_TITLE}"`, ci("the runbook's step 10 starts the new server")]),
     ...(START_AGAIN.test(entry) ? [`says "start the server again": ${entry}`] : []),
   ]
 }
@@ -6557,7 +6673,7 @@ const DEBUG_SKILL_SRJ_1104_ROWS: readonly DocRow[] = [
     code(CLEAN_RESTART_NOT_RESTARTED_LABEL),
   ]],
   [`the refusal section points to the runbook's "${REFUSAL_BLOCK_HEADING}" block by a link`, sectionOf(DEBUG_SKILL_FILE, `## ${REFUSAL_SECTION_TITLE}`), [
-    `["${REFUSAL_BLOCK_HEADING}"](../../README.md#${headingSlug(REFUSAL_BLOCK_HEADING)})`,
+    `["${REFUSAL_BLOCK_HEADING}"](../../${RUNBOOK_DOC}#${headingSlug(REFUSAL_BLOCK_HEADING)})`,
     ci('never starts the server on its own after a refusal'),
   ]],
   [`the install check's below-floor note points to the switch-over runbook (SRJ-1104, SRJ-1108; hatch A3)`, (skill) =>
@@ -6628,8 +6744,8 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
     expect(findTerms(name, read(), RAW_COMMAND_FORMS).map(formatHit)).toEqual([])
   })
 
-  test.each(['README.md', CHANGELOG_FILE])("%s: every kill advice adds \"check the result; on an error, don't delete or respawn\"", (name) => {
-    const text = operatorText(name)
+  test.each([USER_DOCS_NAME, CHANGELOG_FILE])("%s: every kill advice adds \"check the result; on an error, don't delete or respawn\"", (name) => {
+    const text = name === USER_DOCS_NAME ? userDocsText() : operatorText(name)
     expect([...flat(text).matchAll(KILL_INSTRUCTION)].length).toBeGreaterThan(0)
     expect(killAdviceProblems(text, CHECKS_AND_DOES_NOT_DELETE)).toEqual([])
   })
@@ -6673,14 +6789,14 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
         `#### ${stepHeadingPrefix(6)}End`, //                  l.10
         step6, //                                              l.11
         ...Array.from({ length: SWITCH_OVER_STEP_COUNT - 6 }, (_, k) => `#### ${stepHeadingPrefix(k + 7)}Later`), // l.12 to l.16
-        '## Troubleshooting', //                               l.17
+        '## Troubleshooting',//                               l.17
         after, //                                              l.18
       ].join('\n')
     const KILL = 'end it with `tmux kill-session -t =<name>`'
 
     test.each([
-      ['in steps 5 and 6 of a carrier', 'README.md', carrierText('-', KILL, KILL, '-'), []],
-      ['in step 4 of a carrier', 'README.md', carrierText(KILL, KILL, '-', '-'), ['README.md:7: tmux kill-session']],
+      ['in steps 5 and 6 of a carrier', RUNBOOK_DOC, carrierText('-', KILL, KILL, '-'), []],
+      ['in step 4 of a carrier', RUNBOOK_DOC, carrierText(KILL, KILL, '-', '-'), [`${RUNBOOK_DOC}:7: tmux kill-session`]],
       ['after the runbook in a carrier', CHANGELOG_FILE, carrierText('-', KILL, '-', `Or ${KILL.replace(' kill', '\nkill')}.`), [`${CHANGELOG_FILE}:18: tmux kill-session`]],
       ['in a text that is no carrier, steps 5 and 6 included', DEBUG_SKILL_FILE, carrierText('-', KILL, KILL, '-'), [`${DEBUG_SKILL_FILE}:9: tmux kill-session`, `${DEBUG_SKILL_FILE}:11: tmux kill-session`]],
     ] as const)('`tmux kill-session` %s', (_where, file, text, expected) => {
@@ -6688,8 +6804,8 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
     })
 
     test('a carrier with no switch-over section, or no step 6, throws naming the file', () => {
-      expect(() => killSessionsOutsideSteps('README.md', '# Doc\nNo runbook.')).toThrow(`README.md has no heading "${SWITCH_OVER_HEADING}"`)
-      expect(() => killSessionsOutsideSteps('README.md', carrierText('-', '-', '-', '-').replace(`${stepHeadingPrefix(6)}`, 'Then: '))).toThrow(`README.md "${SWITCH_OVER_HEADING}": step 6 is missing`)
+      expect(() => killSessionsOutsideSteps(RUNBOOK_DOC, '# Doc\nNo runbook.')).toThrow(`${RUNBOOK_DOC} has no heading "${SWITCH_OVER_HEADING}"`)
+      expect(() => killSessionsOutsideSteps(RUNBOOK_DOC, carrierText('-', '-', '-', '-').replace(`${stepHeadingPrefix(6)}`, 'Then: '))).toThrow(`${RUNBOOK_DOC} "${SWITCH_OVER_HEADING}": step 6 is missing`)
     })
 
     test('an attach without `=` is reported with file and line, wrapped or not; the exact target and the reason sentence are not', () => {
@@ -6733,8 +6849,8 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
     })
 
     test('the finder reads every allowed form in the README, so the allow-list case is not vacuous', () => {
-      const readme = operatorText('README.md')
-      const commands = findTermsAt('README.md', readme, [['a tmux command', TMUX_COMMAND]]).map(({ index }) => flat(readme.slice(index, index + 200)))
+      const readme = userDocsText()
+      const commands = findTermsAt(USER_DOCS_NAME, readme, [['a tmux command', TMUX_COMMAND]]).map(({ index }) => flat(readme.slice(index, index + 200)))
       expect(TMUX_ALLOWED_FORMS.filter(([, form]) => !commands.some((command) => form.test(command))).map(([label]) => label)).toEqual([])
     })
 
@@ -6818,11 +6934,11 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
     })
 
     test("the README's runbook kills fail their rows with the delete-or-respawn caveat dropped, in each step (SRJ-1101)", () => {
-      const readme = operatorText('README.md')
+      const readme = userDocsText()
       const edited = readme.replaceAll(`; on an error, don't delete or respawn`, '')
       expect(edited).not.toBe(readme)
-      const switchOver = readRunbookCarrier('README.md', edited, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
-      const rollback = readRunbookCarrier('README.md', edited, ROLLBACK_HEADING, ROLLBACK_STEP_COUNT)
+      const switchOver = readRunbookCarrier(USER_DOCS_NAME, edited, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
+      const rollback = readRunbookCarrier(USER_DOCS_NAME, edited, ROLLBACK_HEADING, ROLLBACK_STEP_COUNT)
       const caveatRows = <T extends readonly [string, string, readonly Item[]]>(rows: readonly T[]) => rows.filter(([, element]) => element.includes('deleted or respawned (SRJ-1101)'))
       const failing = [
         ...caveatRows(SWITCH_OVER_ELEMENTS).filter(([where, , required]) => missingItems(switchOver, textAt(switchOver, where), required).length > 0).map(([where]) => `switch-over ${where}`),
@@ -6833,13 +6949,13 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
     })
 
     test.each([1, 7])(`the README's switch-over step %d fails its "${UPGRADING_TITLE}" row with the link dropped`, (n) => {
-      const readme = operatorText('README.md')
+      const readme = userDocsText()
       const anchor = `#${headingSlug(UPGRADING_TITLE)}`
       const step = sectionRange(readme, new RegExp(`^#### ${escapeRegExp(stepHeadingPrefix(n))}`))!
       const lines = readme.split('\n')
       const edited = [...lines.slice(0, step.start), ...lines.slice(step.start, step.end).map((line) => line.replaceAll(`](${anchor})`, '](#no-such-heading)')), ...lines.slice(step.end)].join('\n')
       expect(edited).not.toBe(readme)
-      const carrier = readRunbookCarrier('README.md', edited, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
+      const carrier = readRunbookCarrier(USER_DOCS_NAME, edited, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
       expect(missingItems(carrier, carrier.steps[n - 1], [upgradingLink])).toEqual([`(${anchor})`])
     })
 
@@ -6873,7 +6989,7 @@ function versionNoteProblems(readme: string): string[] {
  * on it.
  */
 function prerequisiteBaseIndexProblems(readme: string): string[] {
-  const sentences = flat(requiredSection(readme, PREREQUISITES_HEADING, 'README.md'))
+  const sentences = flat(requiredSection(readme, PREREQUISITES_HEADING, USER_DOCS_NAME))
     .split(/(?<=\.)\s+/)
     .filter((sentence) => sentence.includes(vocab('baseIndex')))
   return [
@@ -6891,7 +7007,7 @@ const OLD_SYSTEM_BINARY_PATH = '/usr/local/bin/agent-director'
  * README names the old system binary path nowhere.
  */
 function migrationCronProblems(readme: string): string[] {
-  const migration = requiredSection(readme, MIGRATION_HEADING, 'README.md')
+  const migration = requiredSection(readme, MIGRATION_HEADING, USER_DOCS_NAME)
   const preamble = migration.split('\n').slice(0, headings(migration)[0]?.line).join('\n')
   const lines = splitFences(preamble).blocks.filter((block) => block.info === 'cron').map((block) => block.body.trim())
   return [
@@ -6901,7 +7017,7 @@ function migrationCronProblems(readme: string): string[] {
 }
 
 describe('E36 T4: the README describes the build (b.jg5 SRJ-1103; AC 78, AC 79)', () => {
-  const readme = () => operatorText('README.md')
+  const readme = () => userDocsText()
 
   test.each(README_SRJ_1103_ROWS)('%s', (element, passage, required) => {
     expect({ element, problems: docRowProblems(passage, required, readme()) }).toEqual({ element, problems: [] })
@@ -6936,14 +7052,15 @@ describe('E36 T4: the README describes the build (b.jg5 SRJ-1103; AC 78, AC 79)'
     expect(readmeRuntimeParagraphProblems(readme())).toEqual([])
   })
 
-  test(`"${CALL_TIMEOUT_SIZING_HEADING.slice('#### '.length)}" sits under "${CONFIGURATION_HEADING}" (SRJ-1103)`, () => {
-    const configuration = sectionRange(readme(), CONFIGURATION_HEADING)
-    const sizing = sectionRange(readme(), CALL_TIMEOUT_SIZING_HEADING)
+  test(`"${CALL_TIMEOUT_SIZING_HEADING.replace(/^#+ /, '')}" sits under "${TIMING_SETTINGS_HEADING}" in ${AGENT_DIRECTOR_DOC}, which the configuration reference's Server-wide settings row links (SRJ-1103)`, () => {
+    const doc = operatorText(AGENT_DIRECTOR_DOC)
+    const configuration = sectionRange(doc, TIMING_SETTINGS_HEADING)
+    const sizing = sectionRange(doc, CALL_TIMEOUT_SIZING_HEADING)
     expect(configuration !== undefined && sizing !== undefined && sizing.start > configuration.start && sizing.end <= configuration.end).toBe(true)
   })
 
   test('"Destructive changes" says neither that a teardown deletes a row nor that a bring-up may resume it', () => {
-    const section = requiredSection(readme(), '### Destructive changes', 'README.md')
+    const section = requiredSection(readme(), '## Destructive changes', USER_DOCS_NAME)
     expect(affirmedClaims(section, ROW_DELETE_CLAIMS)).toEqual([])
     expect(affirmedClaims(section, [['a resume', /\bresum\w*/gi]])).toEqual([])
   })
@@ -6986,14 +7103,14 @@ describe('E36 T4: the README describes the build (b.jg5 SRJ-1103; AC 78, AC 79)'
       const edited = text.replace(vocab('findMissingCron'), `* * * * * ${OLD_SYSTEM_BINARY_PATH} find-missing --timeout 30s`)
       expect(edited).not.toBe(text)
       expect(migrationCronProblems(edited)).toHaveLength(2)
-      expect(findTerms('README.md', edited, SRJ_1101_TERMS).map((hit) => hit.term)).toEqual(['find-missing --timeout'])
+      expect(findTerms(USER_DOCS_NAME, edited, SRJ_1101_TERMS).map((hit) => hit.term)).toEqual(['find-missing --timeout'])
     })
 
     test.each(REFUSAL_LABELS)('the `%s` item fails with "then start the server again" back', (label) => {
       const text = readme()
       const edited = text.replace(
-        new RegExp(`(^- \`${escapeRegExp(label)}\`[^\\n]*?)Follow (?:that|the README) section[^\\n]*?starts it\\.`, 'm'),
-        `$1Follow the README section "${PHASE1_RUNBOOK_SECTION_TITLE}", then start the server again.`,
+        new RegExp(`(^- \`${escapeRegExp(label)}\`[^\\n]*?)Follow (?:that|the ${escapeRegExp(RUNBOOK_DOC)}) section[^\\n]*?starts it\\.`, 'm'),
+        `$1Follow the ${RUNBOOK_DOC} section "${PHASE1_RUNBOOK_SECTION_TITLE}", then start the server again.`,
       )
       expect(edited).not.toBe(text)
       expect(readmeRefusalItemProblems(label, edited)).not.toEqual([])
@@ -7001,7 +7118,7 @@ describe('E36 T4: the README describes the build (b.jg5 SRJ-1103; AC 78, AC 79)'
 
     test('the runtime-stop paragraph fails with its old ending back', () => {
       const text = readme()
-      const edited = text.replace(/(\*\*Found while the server was running\.\*\*[^\n]*?)This stop is not a switch-over case:[^\n]*/, `$1Follow the README section "${PHASE1_RUNBOOK_SECTION_TITLE}", then start the server again.`)
+      const edited = text.replace(/(\*\*Found while the server was running\.\*\*[^\n]*?)This stop is not a switch-over case:[^\n]*/, `$1Follow the ${RUNBOOK_DOC} section "${PHASE1_RUNBOOK_SECTION_TITLE}", then start the server again.`)
       expect(edited).not.toBe(text)
       expect(readmeRuntimeParagraphProblems(edited)).toEqual(expect.arrayContaining([`0 links to ${DEBUG_SKILL_FILE}#${headingSlug(RUNTIME_STOP_HEADING.slice('### '.length))}, expected 1`, 'says "start the server again"']))
     })
@@ -7073,10 +7190,10 @@ describe('E36 T4: the debugging skill describes the build (b.jg5 SRJ-1104; AC 78
     expect(runtimeStopProblems(skill())).toEqual([])
   })
 
-  test(`the rollback link of "${RUNTIME_STOP_HEADING.slice('### '.length)}" resolves to the README's "${ROLLBACK_HEADING}"`, () => {
-    const links = markdownLinks(runtimeStopSection(skill())).filter((link) => link.path === '../../README.md')
+  test(`the rollback link of "${RUNTIME_STOP_HEADING.slice('### '.length)}" resolves to ${RUNBOOK_DOC}'s "${ROLLBACK_HEADING}"`, () => {
+    const links = markdownLinks(runtimeStopSection(skill())).filter((link) => link.path === `../../${RUNBOOK_DOC}`)
     expect(links.length).toBeGreaterThan(0)
-    expect(links.map((link) => headingAt(operatorText('README.md'), link.anchor)?.text)).toEqual(links.map(() => ROLLBACK_HEADING))
+    expect(links.map((link) => headingAt(operatorText(RUNBOOK_DOC), link.anchor)?.text)).toEqual(links.map(() => ROLLBACK_HEADING))
   })
 
   describe('self-checks', () => {
@@ -7108,9 +7225,9 @@ describe('E36 T4: the debugging skill describes the build (b.jg5 SRJ-1104; AC 78
       const text = skill()
       const entryStart = text.indexOf(`### \`${label}\``)
       const fix = new RegExp(
-        escapeRegExp(`- **Fix:** the operator follows the block "${REFUSAL_BLOCK_HEADING}" of the README section "${PHASE1_RUNBOOK_SECTION_TITLE}" (above); the runbook's step 10 starts the new server.`).replace(/ /g, '\\s+'),
+        escapeRegExp(`- **Fix:** the operator follows the block "${REFUSAL_BLOCK_HEADING}" of the ${RUNBOOK_DOC} section "${PHASE1_RUNBOOK_SECTION_TITLE}" (above); the runbook's step 10 starts the new server.`).replace(/ /g, '\\s+'),
       )
-      const rest = text.slice(entryStart).replace(fix, `- **Fix:** the operator follows the README section "${PHASE1_RUNBOOK_SECTION_TITLE}", then starts the server again.`)
+      const rest = text.slice(entryStart).replace(fix, `- **Fix:** the operator follows the ${RUNBOOK_DOC} section "${PHASE1_RUNBOOK_SECTION_TITLE}", then starts the server again.`)
       const edited = text.slice(0, entryStart) + rest
       expect(edited).not.toBe(text)
       expect(debugRefusalEntryProblems(label, edited)).not.toEqual([])
@@ -7332,7 +7449,9 @@ const WHO_CAN_REACH_HEADING = '### Who can reach a persona in fungible mode'
 const DOWNGRADE_HEADING = '### Downgrading to an earlier release'
 
 /** Other README headings the rows read. */
-const RELOAD_HEADING = '## Reload'
+const RELOAD_HEADING = '# Reload'
+/** The configuration reference's section before `## Channel modes`, its last. */
+const MCP_CONFIG_HEADING = '## MCP Server Config (slack-mcp.json)'
 const TOOLS_HEADING = '## Tools'
 const README_TITLE_HEADING = '# Claude Slack Channel Bots'
 
@@ -7366,12 +7485,12 @@ const INVALID = code(INVALID_PREFIX.replace(/:$/, ''))
 const TARGETING_TOOLS = ['reply', 'react', 'edit_message', 'fetch_messages', 'download_attachment'] as const
 
 /** A README section's flattened text (a row's passage). */
-const readmeSection = (heading: HeadingMatch) => sectionOf('README.md', heading)
+const readmeSection = (heading: HeadingMatch) => sectionOf(USER_DOCS_NAME, heading)
 
 /** The one line of the README section under `heading` that opens a table row with `| <prefix>`; throws unless exactly one does (a row's passage). */
 const tableRowOf = (heading: HeadingMatch, prefix: string) => (text: string) => {
-  const rows = requiredSection(text, heading, 'README.md').split('\n').filter((line) => line.startsWith(`| ${prefix}`))
-  if (rows.length !== 1) throw new Error(`README.md ${String(heading)}: ${rows.length} table rows open with "| ${prefix}", expected 1`)
+  const rows = requiredSection(text, heading, USER_DOCS_NAME).split('\n').filter((line) => line.startsWith(`| ${prefix}`))
+  if (rows.length !== 1) throw new Error(`${USER_DOCS_NAME} ${String(heading)}: ${rows.length} table rows open with "| ${prefix}", expected 1`)
   return rows[0]
 }
 
@@ -7383,13 +7502,13 @@ const toolRowOf = (tool: string) => tableRowOf(TOOLS_HEADING, `${code(tool)} |`)
 
 /** The numbered steps of "Downgrading to an earlier release", one line each, link targets dropped. */
 function downgradeSteps(readme: string): string[] {
-  return requiredSection(readme, DOWNGRADE_HEADING, 'README.md').split('\n').filter((line) => /^\d+\. /.test(line)).map((line) => linkTexts(flat(line)))
+  return requiredSection(readme, DOWNGRADE_HEADING, USER_DOCS_NAME).split('\n').filter((line) => /^\d+\. /.test(line)).map((line) => linkTexts(flat(line)))
 }
 
 /** Downgrade step `n` (a row's passage); throws when the `n`th numbered step is missing or not numbered `n`. */
 const downgradeStep = (n: number) => (readme: string) => {
   const step = downgradeSteps(readme)[n - 1]
-  if (step === undefined || !step.startsWith(`${n}. `)) throw new Error(`README.md "${DOWNGRADE_HEADING}": no step ${n} in place`)
+  if (step === undefined || !step.startsWith(`${n}. `)) throw new Error(`${USER_DOCS_NAME} "${DOWNGRADE_HEADING}": no step ${n} in place`)
   return step
 }
 
@@ -7519,58 +7638,58 @@ const README_DEO_ROWS: readonly DocRow[] = [
   ]],
 
   // SRI-1101, the configuration sections T1's cases do not read (T20 S3).
-  [`Server-wide settings: the opening paragraph names ${MODE_SWITCH_SETTING} as the one setting a confirmation applies in place`, unitOf('README.md', '#### Server-wide settings', 'These top-level fields apply'), [
+  [`Server-wide settings: the opening paragraph names ${MODE_SWITCH_SETTING} as the one setting a confirmation applies in place`, unitOf(USER_DOCS_NAME, '### Server-wide settings', 'These top-level fields apply'), [
     ci('A confirmed change to one takes effect at the next server start'),
     ci(`${SWITCH} is the one setting a confirmation applies in place, at once`),
   ]],
-  [`Persona fields: ${CHANNELS_KEY} is a declarative-mode field`, tableRowOf('#### Persona fields', `${code(CHANNELS_KEY)} |`), [
+  [`Persona fields: ${CHANNELS_KEY} is a declarative-mode field`, tableRowOf('### Persona fields', `${code(CHANNELS_KEY)} |`), [
     ci('in declarative mode, yes unless'),
     ci('Declarative mode only:'),
     ci('Not read in fungible mode'),
   ]],
-  [`Persona fields: ${PROMPTS_KEY} is a declarative-mode field`, tableRowOf('#### Persona fields', `${code(PROMPTS_KEY)} |`), [
+  [`Persona fields: ${PROMPTS_KEY} is a declarative-mode field`, tableRowOf('### Persona fields', `${code(PROMPTS_KEY)} |`), [
     ci('in declarative mode, yes'),
     ci('Declarative mode only:'),
     ci('Not read in fungible mode'),
   ]],
-  [`Persona fields: the note on ${DM_KEY} names ${FUNGIBLE_SECTION_KEY}`, unitOf('README.md', '#### Persona fields', `${code(DM_KEY)} is an object`), [
+  [`Persona fields: the note on ${DM_KEY} names ${FUNGIBLE_SECTION_KEY}`, unitOf(USER_DOCS_NAME, '### Persona fields', `${code(DM_KEY)} is an object`), [
     ci(`${code(FUNGIBLE_SECTION_KEY)} is an object holding ${code(INVITED_DESTINATION_KEY)}`),
   ]],
   // Each section's pointer into "## Channel modes" is read by `pointerProblems` (DECLARATIVE_POINTERS), not here.
-  ['Channel entries: applies in declarative mode', readmeSection('#### Channel entries'), [
+  ['Channel entries: applies in declarative mode', readmeSection('### Channel entries'), [
     ci('Channel entries apply in declarative mode'),
   ]],
-  ['Channel delivery: applies in declarative mode', readmeSection('#### Channel delivery'), [
+  ['Channel delivery: applies in declarative mode', readmeSection('### Channel delivery'), [
     ci('This section applies in declarative mode'),
   ]],
-  ['Permission prompts: applies in declarative mode', readmeSection('#### Permission prompts'), [
+  ['Permission prompts: applies in declarative mode', readmeSection('### Permission prompts'), [
     ci(`This section applies in declarative mode, where ${code(PROMPTS_KEY)} is required`),
   ]],
-  ['Load-time rules: the switch is checked before any persona, and a non-boolean value is rejected naming it', readmeSection('#### Load-time rules'), [
+  ['Load-time rules: the switch is checked before any persona, and a non-boolean value is rejected naming it', readmeSection('### Load-time rules'), [
     ci(`It checks the server-wide settings first, ${SWITCH} among them, before any persona, in either mode`),
     ci(`a non-boolean ${SWITCH} is rejected naming the setting`),
   ]],
-  [`Load-time rules: in declarative mode ${FUNGIBLE_SECTION_KEY} is neither checked nor read`, readmeSection('#### Load-time rules'), [
+  [`Load-time rules: in declarative mode ${FUNGIBLE_SECTION_KEY} is neither checked nor read`, readmeSection('### Load-time rules'), [
     ci(`${code(FUNGIBLE_SECTION_KEY)} is neither checked nor read in declarative mode`),
   ]],
-  [`Load-time rules: in fungible mode ${CHANNELS_KEY} and the top-level ${PROMPTS_KEY} are neither checked nor read`, readmeSection('#### Load-time rules'), [
+  [`Load-time rules: in fungible mode ${CHANNELS_KEY} and the top-level ${PROMPTS_KEY} are neither checked nor read`, readmeSection('### Load-time rules'), [
     ci(`${code(CHANNELS_KEY)} and the top-level ${code(PROMPTS_KEY)} are neither checked nor read in fungible mode`),
   ]],
-  [`Load-time rules: in fungible mode ${FUNGIBLE_SECTION_KEY} is an object holding only ${INVITED_DESTINATION_KEY}, "${DM_DESTINATION}" or a channel ID`, readmeSection('#### Load-time rules'), [
+  [`Load-time rules: in fungible mode ${FUNGIBLE_SECTION_KEY} is an object holding only ${INVITED_DESTINATION_KEY}, "${DM_DESTINATION}" or a channel ID`, readmeSection('### Load-time rules'), [
     ci(`${code(FUNGIBLE_SECTION_KEY)} isn't an object, or holds a key other than ${code(INVITED_DESTINATION_KEY)}`),
     ci(`${code(INVITED_DESTINATION)} is neither ${DM_VALUE} nor a well-formed channel ID`),
   ]],
-  [`Load-time rules: in fungible mode a "${DM_DESTINATION}" destination, written or by default, needs ${DM_ENABLED} true and a ${DM_CONTACT}`, readmeSection('#### Load-time rules'), [
+  [`Load-time rules: in fungible mode a "${DM_DESTINATION}" destination, written or by default, needs ${DM_ENABLED} true and a ${DM_CONTACT}`, readmeSection('### Load-time rules'), [
     ci(`The persona's destination is ${DM_VALUE}, written or by default, without ${code(`${DM_ENABLED}: true`)} or without a ${code(DM_CONTACT)}`),
   ]],
-  ['Load-time rules: in fungible mode a channel destination needs no listing and no DMs', readmeSection('#### Load-time rules'), [
+  ['Load-time rules: in fungible mode a channel destination needs no listing and no DMs', readmeSection('### Load-time rules'), [
     ci('A channel destination needs no listing and no DMs'),
   ]],
-  ['Load-time rules: the cross-persona rules apply in both modes', readmeSection('#### Load-time rules'), [
+  ['Load-time rules: the cross-persona rules apply in both modes', readmeSection('### Load-time rules'), [
     ci("In both modes: - A persona's name or key equals another persona's name or key. - A persona's key starts with another persona's key"),
     ci(`Two personas share a ${code('working_directory' satisfies (typeof PERSONA_ENTRY_KEYS)[number])} or a ${code('credentials_file' satisfies (typeof PERSONA_ENTRY_KEYS)[number])}, compared by real path`),
   ]],
-  ['Load-time rules: a change is judged by the mode it turns on, INVALID in each direction', readmeSection('#### Load-time rules'), [
+  ['Load-time rules: a change is judged by the mode it turns on, INVALID in each direction', readmeSection('### Load-time rules'), [
     ci('A pending change is judged by the rules of the mode its own switch picks, not by the mode in effect'),
     ci(`A change that turns fungible mode on is ${INVALID} when a persona's ${code(FUNGIBLE_SECTION_KEY)} section breaks the fungible-mode rules`),
     ci(`a change that turns it off is ${INVALID} when a persona's ${code(CHANNELS_KEY)} or ${code(PROMPTS_KEY)} breaks the declarative-mode rules`),
@@ -7590,11 +7709,11 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci(`In declarative mode: in a channel listed in its ${code(CHANNELS_KEY)} with ${code(`${DELIVERY_KEY}: ${ALL}`)}, when no other persona`),
     ci(`In fungible mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is ${code(ALL)}, when no other persona in the applied configuration has a channel delivery of ${code(ALL)} for that channel`),
   ]],
-  ['receiving: in fungible mode an @mention is delivered from its message event', unitOf('README.md', RECEIVING_HEADING, '- **In fungible mode, an @mention is delivered from its'), [
+  ['receiving: in fungible mode an @mention is delivered from its message event', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, '- **In fungible mode, an @mention is delivered from its'), [
     ci(`**In fungible mode, an @mention is delivered from its ${code('message')} event.**`),
     ci(`the ${code('app_mention')} event decides nothing and the ${code('message')} event carrying the same mention decides`),
   ]],
-  ['receiving: "Anyone in the workspace can reach a persona", in both modes', unitOf('README.md', RECEIVING_HEADING, '- **Anyone in the workspace can reach a persona,**'), [
+  ['receiving: "Anyone in the workspace can reach a persona", in both modes', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, '- **Anyone in the workspace can reach a persona,**'), [
     ci('**Anyone in the workspace can reach a persona,** in both modes'),
     ci(`in declarative mode in its listed channels, by each channel's ${code(DELIVERY_KEY)}`),
     ci('in fungible mode in every channel its app is invited to that it serves, by its channel delivery there'),
@@ -7633,20 +7752,20 @@ const README_DEO_ROWS: readonly DocRow[] = [
   ]],
 
   // SRI-1103, the introduction, "Personas (config.json)" and "Tools" (T20 S5).
-  ['introduction: the channels a persona serves, per mode', unitOf('README.md', README_TITLE_HEADING, 'A single HTTP MCP server'), [
+  ['introduction: the channels a persona serves, per mode', unitOf(USER_DOCS_NAME, README_TITLE_HEADING, 'A single HTTP MCP server'), [
     ci('in declarative mode, the default, the channels it is configured into; in fungible mode, every public or private channel its Slack app is invited to that is not externally shared'),
   ]],
-  ["introduction: what a persona's tool calls may target, per mode", unitOf('README.md', README_TITLE_HEADING, 'A single HTTP MCP server'), [
+  ["introduction: what a persona's tool calls may target, per mode", unitOf(USER_DOCS_NAME, README_TITLE_HEADING, 'A single HTTP MCP server'), [
     ci("Each persona's tool calls act as that persona: in declarative mode only in the channels it is configured into, in fungible mode in any channel ID it names, where the call goes to Slack, which decides"),
   ]],
-  ['Personas (config.json): the channels a persona serves and its tools may target, per mode', unitOf('README.md', PERSONAS_HEADING, 'Each bot is a **persona**'), [
+  ['Personas (config.json): the channels a persona serves and its tools may target, per mode', unitOf(USER_DOCS_NAME, PERSONAS_HEADING, 'Each bot is a **persona**'), [
     ci('In declarative mode, the default, those are the channels it is configured into, and its tools may target only them'),
     ci('in fungible mode, they are the public and private channels its app is invited to that are not externally shared, and its tools may target any channel ID: the call goes to Slack, which decides'),
   ]],
-  ['Tools: in declarative mode a refused target sends nothing to Slack', unitOf('README.md', TOOLS_HEADING, '- **In declarative mode,**'), [
+  ['Tools: in declarative mode a refused target sends nothing to Slack', unitOf(USER_DOCS_NAME, TOOLS_HEADING, '- **In declarative mode,**'), [
     ci("a tool call with any other target, a channel the persona isn't configured into included, is refused with a tool error naming the persona and the target, and nothing is sent to Slack"),
   ]],
-  ["Tools: in fungible mode a target that is no channel ID or allowed DM target is refused before any Slack call (FUNGIBLE_TARGET_REFUSAL), and Slack's refusal of any other reaches the persona", unitOf('README.md', TOOLS_HEADING, '- **In fungible mode,**'), [
+  ["Tools: in fungible mode a target that is no channel ID or allowed DM target is refused before any Slack call (FUNGIBLE_TARGET_REFUSAL), and Slack's refusal of any other reaches the persona", unitOf(USER_DOCS_NAME, TOOLS_HEADING, '- **In fungible mode,**'), [
     ci(`a target that ${FUNGIBLE_TARGET_REFUSAL.replace(/^it /, '').replace(/\.$/, '')} is refused before any Slack call, with a tool error naming the persona and the target`),
     ci('Any other channel target goes to Slack, which decides'),
     ci(`for example ${code('not_in_channel')} for a channel the persona's app is not in, reaches the persona as a tool error naming the persona, the channel and Slack's error code`),
@@ -7655,7 +7774,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci(tool === 'reply' ? "in declarative mode one of the persona's configured channels; in fungible mode any channel ID" : 'a configured channel in declarative mode; any channel ID in fungible mode'),
   ]]),
   [`Tools: the ${SET_CHANNEL_DELIVERY_TOOL} row, exactly one`, toolRowOf(SET_CHANNEL_DELIVERY_TOOL), [
-    anchorLink(FUNGIBLE_DELIVERY_HEADING),
+    docLink(BOTS_DOC, CONFIGURATION_DOC, anchorLink(FUNGIBLE_DELIVERY_HEADING).slice(2, -1)),
     ci(`Two inputs: ${code('channel')}, a channel ID, and ${code(DELIVERY_KEY)}, ${code(MENTIONS)} or ${code(ALL)}`),
     ci('It works only in fungible mode: every call is refused in declarative mode'),
     ci(`and while ${code(CHANNEL_DELIVERY_FILE_NAME)} is unreadable`),
@@ -7684,7 +7803,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
   ]],
 
   // SRI-1103, Reload outside "What a confirmation applies" (T20 S6).
-  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, what it holds, only the server writes it, never edit it by hand`, tableRowOf('### Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
+  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, what it holds, only the server writes it, never edit it by hand`, tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
     ci("The stored-choice file: each persona's stored channel-delivery choices"),
     ci('It holds no token and no message text'),
     ci('Only the server reads and writes it, never the CLI'),
@@ -7692,50 +7811,50 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci('Never edit it by hand'),
     ci('The server reads it once at each start'),
   ]],
-  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, the unreadable state, linked to the debugging skill`, tableRowOf('### Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
-    `[${code(CHANNEL_DELIVERY_UNREADABLE)}](${DEBUG_SKILL_FILE}${anchorLink(code(CHANNEL_DELIVERY_UNREADABLE)).slice(1)}`,
+  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, the unreadable state, linked to the debugging skill`, tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
+    `[${code(CHANNEL_DELIVERY_UNREADABLE)}]${docLink(RELOAD_DOC, DEBUG_SKILL_FILE, anchorLink(code(CHANNEL_DELIVERY_UNREADABLE)).slice(2, -1))}`,
     ci('starts and runs every persona, but for that run no stored choice applies'),
     ci(`in fungible mode every channel is at ${code(MENTIONS)}, ${TOOL} is refused, and nothing is written to the file or dropped from it`),
   ]],
-  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, its fix is moving it aside`, tableRowOf('### Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
+  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, its fix is moving it aside`, tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
     ci('To fix it, move the file aside, then restart the server; this discards every stored choice'),
   ]],
-  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, the residual of restoring an unreadable file (SRI-409)`, tableRowOf('### Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
+  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, the residual of restoring an unreadable file (SRI-409)`, tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
     ci('If you restore that same file in place instead of moving it aside, a persona removed and added back with the same'),
     ci('while it was unreadable gets its earlier choices again'),
   ]],
-  [`Size limit: ${CHANNEL_DELIVERY_FILE_NAME} has no size cap`, readmeSection('### Size limit'), [
+  [`Size limit: ${CHANNEL_DELIVERY_FILE_NAME} has no size cap`, readmeSection('## Size limit'), [
     ci(`and the stored-choice file (${code(CHANNEL_DELIVERY_FILE_NAME)}) have no size cap`),
   ]],
-  [`Reading the preview: the header counts the switch among the server-wide settings, and a persona with only recorded changes is not counted`, readmeSection('### Reading the preview'), [
+  [`Reading the preview: the header counts the switch among the server-wide settings, and a persona with only recorded changes is not counted`, readmeSection('## Reading the preview'), [
     ci(`and the server-wide settings changed, the switch ${SWITCH} among them`),
     ci('A persona whose only changes are recorded ones (changes to the section not in force, see the table below) is not counted as modified'),
   ]],
-  ["Reading the preview: the switch's line, as modeSwitchLine renders it in each direction, and its row", readmeSection('### Reading the preview'), [
+  ["Reading the preview: the switch's line, as modeSwitchLine renders it in each direction, and its row", readmeSection('## Reading the preview'), [
     () => `| ${code(switchLineQuote('fungible'))} |`,
     () => `| ${code(switchLineQuote('declarative'))} |`,
     () => ci(`ends ${code(switchLineNoPersonaEnding())} when there is none`),
     ci('Unlike other server-wide settings, it applies at once, with no restart, and every session is kept'),
   ]],
-  ['Reading the preview: the recorded lines, as recordedLine renders them for each section, and their row', readmeSection('### Reading the preview'), [
+  ['Reading the preview: the recorded lines, as recordedLine renders them for each section, and their row', readmeSection('## Reading the preview'), [
     () => code(recordedLineQuote('declarative')),
     () => code(recordedLineQuote('fungible')),
     ci(`(${code(CHANNELS_KEY)} or ${code(PROMPTS_KEY)} in fungible mode, ${code(FUNGIBLE_SECTION_KEY)} in declarative mode)`),
     ci('These lines come after every persona line and before the server-wide setting lines'),
     ci(`A change made only of recorded changes previews as ${code(NO_EFFECTIVE_CHANGE)}, followed by its recorded lines`),
   ]],
-  [`Confirming a change: the switch is the exception to "recorded and take effect later"`, readmeSection('### Confirming a change'), [
+  [`Confirming a change: the switch is the exception to "recorded and take effect later"`, readmeSection('## Confirming a change'), [
     ci(`next-launch and server-wide settings are recorded and take effect later, except the switch ${SWITCH}, which applies in place at once`),
   ]],
-  [`Confirming a change: ${RELOAD_NOOP} covers a confirmation of recorded changes only`, tableRowOf('### Confirming a change', `\`[slack] ${RELOAD_NOOP}:`), [
+  [`Confirming a change: ${RELOAD_NOOP} covers a confirmation of recorded changes only`, tableRowOf('## Confirming a change', `\`[slack] ${RELOAD_NOOP}:`), [
     ci('as for a confirmation whose only changes are recorded ones (changes to the section not in force)'),
   ]],
-  [`Confirming a change: ${RELOAD_RECORD_WRITE_FAILED} names the stored-choice file (SRI-408)`, tableRowOf('### Confirming a change', `\`[slack] ${RELOAD_RECORD_WRITE_FAILED}:`), [
+  [`Confirming a change: ${RELOAD_RECORD_WRITE_FAILED} names the stored-choice file (SRI-408)`, tableRowOf('## Confirming a change', `\`[slack] ${RELOAD_RECORD_WRITE_FAILED}:`), [
     ci(`The line can also name the stored-choice file (${code(CHANNEL_DELIVERY_FILE_NAME)})`),
     ci('a confirmation that brings up a persona whose stored choices were dropped earlier, by a write that failed, first writes that file'),
     ci("when it can't, nothing is applied, the retired-key record is not written, and the change stays pending"),
   ]],
-  ['When next-launch and server-wide changes take effect: the switch takes effect once confirmed, with no restart', readmeSection('### When next-launch and server-wide changes take effect'), [
+  ['When next-launch and server-wide changes take effect: the switch takes effect once confirmed, with no restart', readmeSection('## When next-launch and server-wide changes take effect'), [
     ci(`Server-wide settings take effect at the next server start, except the switch ${SWITCH}: it takes effect when the change is confirmed, and needs no ${code(CLI_COMMAND_CLEAN_RESTART)}`),
   ]],
 
@@ -7863,7 +7982,7 @@ function placementProblems(readme: string, p: Placement): string[] {
  * read that section alone) right after "Upgrading to personas".
  */
 const README_DEO_PLACEMENTS: readonly Placement[] = [
-  { heading: CHANNEL_MODES_HEADING, previous: CONFIGURATION_HEADING, next: RELOAD_HEADING },
+  { heading: CHANNEL_MODES_HEADING, parent: CONFIGURATION_HEADING, previous: MCP_CONFIG_HEADING, next: RELOAD_HEADING },
   ...CHANNEL_MODES_SUBSECTIONS.map((heading, i): Placement => ({
     heading,
     parent: CHANNEL_MODES_HEADING,
@@ -7875,15 +7994,15 @@ const README_DEO_PLACEMENTS: readonly Placement[] = [
 
 /** Each declarative-scoped configuration section and the `## Channel modes` subsection its pointer must link (b.deo SRI-1101). */
 const DECLARATIVE_POINTERS: readonly [section: string, target: string][] = [
-  ['#### Channel entries', WHAT_EACH_MODE_SERVES_HEADING],
-  ['#### Channel delivery', FUNGIBLE_DELIVERY_HEADING],
-  ['#### Permission prompts', FUNGIBLE_PROMPTS_HEADING],
+  ['### Channel entries', WHAT_EACH_MODE_SERVES_HEADING],
+  ['### Channel delivery', FUNGIBLE_DELIVERY_HEADING],
+  ['### Permission prompts', FUNGIBLE_PROMPTS_HEADING],
 ]
 
 /** The pointer from `section` to `target`'s problems: no same-file link to its anchor, or the anchor resolving to no heading, another heading, or one outside `## Channel modes`. Pure. */
 function pointerProblems(readme: string, section: string, target: string): string[] {
   const anchor = anchorLink(target).slice(2, -1)
-  const problems = markdownLinks(requiredSection(readme, section, 'README.md')).some((link) => link.path === '' && link.anchor === anchor) ? [] : [`no link to #${anchor}`]
+  const problems = markdownLinks(requiredSection(readme, section, USER_DOCS_NAME)).some((link) => link.path === '' && link.anchor === anchor) ? [] : [`no link to #${anchor}`]
   const heading = headingAt(readme, anchor)
   if (heading?.text !== target) problems.push(`#${anchor} resolves to ${heading === undefined ? 'no heading' : `"${heading.text}"`}`)
   const modes = sectionRange(readme, CHANNEL_MODES_HEADING)
@@ -7900,7 +8019,7 @@ function brokenReadmeAnchors(readme: string): string[] {
 /** `readme` with the section under `heading` (its heading line to the end of its range) cut and appended at the end. */
 function withSectionMovedToEnd(readme: string, heading: string): string {
   const range = sectionRange(readme, heading)
-  if (range === undefined) throw new Error(`README.md has no heading "${heading}"`)
+  if (range === undefined) throw new Error(`${USER_DOCS_NAME} has no heading "${heading}"`)
   const lines = readme.split('\n')
   return [...lines.slice(0, range.start), ...lines.slice(range.end), '', ...lines.slice(range.start, range.end)].join('\n')
 }
@@ -7913,7 +8032,7 @@ function withLineEdited(readme: string, match: (line: string) => boolean, edit: 
 }
 
 describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to SRI-1105; AC 42)', () => {
-  const readme = () => operatorText('README.md')
+  const readme = () => userDocsText()
 
   describe('headings', () => {
     test.each(README_DEO_PLACEMENTS.map((p) => [p.heading, p] as const))('"%s" appears once, where T17 placed it', (_heading, placement) => {
@@ -7944,7 +8063,7 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
     })
 
     test('self-check: an item whose builder throws fails its own row with the error, and the row still reads its other items', () => {
-      const passage = readmeSection('### Reading the preview')
+      const passage = readmeSection('## Reading the preview')
       const broken = () => {
         throw new Error('modeSwitchLine renders no mode or persona list')
       }
@@ -7971,7 +8090,7 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
   })
 
   describe(`the tools table (SRI-1103)`, () => {
-    const toolsTable = (text: string) => firstTable(requiredSection(text, TOOLS_HEADING, 'README.md'))
+    const toolsTable = (text: string) => firstTable(requiredSection(text, TOOLS_HEADING, USER_DOCS_NAME))
 
     test(`its first column lists exactly six tools: ${TARGETING_TOOLS.join(', ')} and ${SET_CHANNEL_DELIVERY_TOOL}`, () => {
       const { header, rows } = toolsTable(readme())
@@ -8031,7 +8150,7 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
     })
 
     test(`every example's header line opens with PENDING_PREVIEW_TITLE`, () => {
-      const blocks = splitFences(requiredSection(readme(), '### Reading the preview', 'README.md')).blocks
+      const blocks = splitFences(requiredSection(readme(), '## Reading the preview', USER_DOCS_NAME)).blocks
       expect(blocks.length).toBeGreaterThanOrEqual(2)
       for (const block of blocks) expect(block.body.split('\n').filter((line) => line.startsWith(PENDING_PREVIEW_TITLE))).toHaveLength(1)
     })
@@ -8079,7 +8198,7 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
         reviewer[CHANNELS_KEY] = [...(reviewer[CHANNELS_KEY] as unknown[]), { id: planner[PROMPTS_KEY], [DELIVERY_KEY]: MENTIONS }]
         const plan = buildChangePlan(applied, { kind: 'valid', config: load('candidate.json', candidate) }, { realPath: (path) => path, home })
         assertNoLeak(plan, 'preview plan')
-        const blocks = splitFences(requiredSection(readme(), '### Reading the preview', 'README.md')).blocks
+        const blocks = splitFences(requiredSection(readme(), '## Reading the preview', USER_DOCS_NAME)).blocks
         const excerpts = blocks.filter((block) => block.body.startsWith(PENDING_PREVIEW_TITLE))
         expect(excerpts).toHaveLength(1)
         expect(excerpts[0].body.trimEnd().split('\n')).toEqual(renderPreviewLines(plan))
@@ -8095,7 +8214,7 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
       for (const [element, passage, required] of rows) {
         expect({ element, problems: docRowProblems(passage, required, edited) }).toEqual({
           element,
-          problems: [`README.md "${TROUBLESHOOTING_HEADING}": 2 entries' titles hold "**${title}**", expected 1`],
+          problems: [`${USER_DOCS_NAME} "${TROUBLESHOOTING_HEADING}": 2 entries' titles hold "**${title}**", expected 1`],
         })
       }
     })
@@ -8139,16 +8258,29 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
     })
   })
 
-  describe('README-wide same-file links (T17 hatch note 10)', () => {
-    test('every same-file link in the README resolves to a README heading', () => {
-      const links = markdownLinks(splitFences(readme()).prose).filter((link) => link.path === '' && link.anchor !== '')
-      expect(links.length).toBeGreaterThan(25)
-      expect(brokenReadmeAnchors(readme())).toEqual([])
+  describe('same-file and cross-page links of the user docs (T17 hatch note 10)', () => {
+    test.each([...USER_DOC_FILES, CONTRIBUTING_FILE])('every same-file link in %s resolves to one of its own headings', (doc) => {
+      expect(brokenReadmeAnchors(operatorText(doc))).toEqual([])
     })
 
-    test('self-check: a linked heading renamed is reported', () => {
-      const edited = withLineEdited(readme(), (line) => line === CHANNEL_MODES_HEADING, (line) => `${line} again`)
-      expect(brokenReadmeAnchors(edited)).toContain(`#${headingSlug(CHANNEL_MODES_HEADING.slice(3))}`)
+    test('the user docs hold same-file links, so the case above is not vacuous', () => {
+      const links = USER_DOC_FILES.flatMap((doc) => markdownLinks(splitFences(operatorText(doc)).prose).filter((link) => link.path === '' && link.anchor !== ''))
+      expect(links.length).toBeGreaterThan(25)
+    })
+
+    test.each([...USER_DOC_FILES, CONTRIBUTING_FILE])('every repository link in %s resolves: to an existing file and, with an anchor, one of its headings', (doc) => {
+      const { checked, broken } = brokenRepoLinks(doc, operatorText(doc))
+      expect(broken).toEqual([])
+      expect(checked).toBeGreaterThan(0)
+    })
+
+    test('self-check: a linked heading renamed is reported, in its own page and from another page', () => {
+      const configuration = operatorText(CONFIGURATION_DOC)
+      const edited = withLineEdited(configuration, (line) => line === WHAT_EACH_MODE_SERVES_HEADING, (line) => `${line} again`)
+      expect(brokenReadmeAnchors(edited)).toContain(`#${headingSlug(WHAT_EACH_MODE_SERVES_HEADING.slice(4))}`)
+      expect(brokenRepoLinks('README.md', `See [modes](${CONFIGURATION_DOC}#no-such-heading).`).broken).toEqual([
+        `README.md -> ${CONFIGURATION_DOC}#no-such-heading (no such heading in ${CONFIGURATION_DOC})`,
+      ])
     })
   })
 })

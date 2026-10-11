@@ -46,7 +46,7 @@
 # operator from the scenario's own shell: a plain `stop` (no teardown, every
 # worker keeps running and every row stays live), X1 to X3 removed from
 # config.json and the last-applied record moved aside (so the next start
-# applies config.json as it stands, README "Reload"), `wedge`, and a start.
+# applies config.json as it stands, docs/reload.md), `wedge`, and a start.
 #
 # Section 1, the start sweep under `wedge` (AC 56; b.jg5 SRJ-702, SRJ-714):
 # the release's `list` is a store read with no tmux call, so the sweep lists

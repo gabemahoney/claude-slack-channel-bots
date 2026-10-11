@@ -136,7 +136,7 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    floor is covered under
    [The server refuses the agent-director binary at start](#the-server-refuses-the-agent-director-binary-at-start);
    for a missing or unreachable agent-director, the `install-cscb` skill
-   diagnoses it and names the README section that installs it.
+   diagnoses it and names the docs/migration.md section that installs it.
    **The server was running and has stopped?** Read the latest lines of
    `startup-errors.log`. One that says `found by a runtime re-check while the
    server was running` is covered under
@@ -795,8 +795,8 @@ running are not affected. See
   - For a public or private channel that is not externally shared: turn
     fungible mode on, which serves every such channel each persona's app is
     a member of (see
-    [Turning fungible mode on or off](../../README.md#turning-fungible-mode-on-or-off)
-    and, before that, [Who can reach a persona in fungible mode](../../README.md#who-can-reach-a-persona-in-fungible-mode)).
+    [Turning fungible mode on or off](../../docs/configuration.md#turning-fungible-mode-on-or-off)
+    and, before that, [Who can reach a persona in fungible mode](../../docs/bots.md#who-can-reach-a-persona-in-fungible-mode)).
   - Remove the app from the channel.
 
   Turning fungible mode on is a fix for a channel only,
@@ -828,7 +828,7 @@ running are not affected. See
 
   Serving a channel in declarative mode means turning fungible mode off for
   every persona (see
-  [Channel modes](../../README.md#channel-modes)); there is no per-channel
+  [Channel modes](../../docs/configuration.md#channel-modes)); there is no per-channel
   exception.
 
 ### `persona-dm-dropped`
@@ -909,7 +909,7 @@ running are not affected. See
 - **Two personas at `all` in one channel:** don't. Each receives every
   message there, the other's posts included, so the two can keep answering
   each other with no human involved. Keep at most one at `all` (see
-  [Channel delivery in fungible mode](../../README.md#channel-delivery-in-fungible-mode)).
+  [Channel delivery in fungible mode](../../docs/configuration.md#channel-delivery-in-fungible-mode)).
 
 ### `persona-channel-delivery-set`
 
@@ -1417,10 +1417,10 @@ line shows that the message's event reached the persona's app at all.
 | **The stored-choice file is unreadable** (fungible mode) | A [`channel-delivery-unreadable`](#channel-delivery-unreadable) line at the latest start. Every `persona-invited-channel` line shows `mentions`, and `set_channel_delivery` is refused. | See [`channel-delivery-unreadable`](#channel-delivery-unreadable). |
 | **The persona isn't up, or its instance isn't taking messages** | A class line after its latest `persona-start` line, or a *Message lost* notice at its destination with a `No live session` or `DROP: no _GET_stream` line. A lost message still logs the channel's `persona-invited-channel` line in fungible mode. | See [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running) and [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected). |
 
-The README's troubleshooting entry **A persona is silent in a channel it was
-invited to** (under [Troubleshooting](../../README.md#troubleshooting)) gives
+The troubleshooting entry **A persona is silent in a channel it was
+invited to** (under [Troubleshooting](../../docs/troubleshooting.md#troubleshooting)) gives
 the operator's short version, and
-[Channel modes](../../README.md#channel-modes) explains the two modes.
+[Channel modes](../../docs/configuration.md#channel-modes) explains the two modes.
 
 ### A persona receives every message in a channel
 
@@ -1439,7 +1439,7 @@ channel, not only @mentions and broadcasts.
     `mentions`;
   - remove the persona's app from the channel;
   - turn fungible mode off with a confirmed change (see
-    [Turning fungible mode on or off](../../README.md#turning-fungible-mode-on-or-off)).
+    [Turning fungible mode on or off](../../docs/configuration.md#turning-fungible-mode-on-or-off)).
     The stored choice stays on disk and applies again if fungible mode is
     turned back on.
 - **Declarative mode.** The channel's entry in the persona's `channels` has
@@ -1448,7 +1448,7 @@ channel, not only @mentions and broadcasts.
 
 Two personas at `all` in one channel each receive the other's posts and can
 keep answering each other: keep at most one at `all` (see
-[Channel delivery in fungible mode](../../README.md#channel-delivery-in-fungible-mode)).
+[Channel delivery in fungible mode](../../docs/configuration.md#channel-delivery-in-fungible-mode)).
 
 ---
 
@@ -2029,7 +2029,7 @@ grep -h -E '\(key=<key>\)|persona=<key>\b' "$STATE"/server.log.* "$STATE"/server
 |---|---|---|
 | `[slack] spawnForPersona: attempting resume for "<name>" (key=<key>)`, then `[slack] spawnForPersona: resumed "<name>" (key=<key>)` | The `resume` call succeeded. It is not counted until the persona's row is read after it. | Nothing yet. |
 | `[slack] <site>: <read> for <ref>: its resumed launch ended before reporting in (state=<state>) — <n> resume(s) in a row ended so; at 2 the ladder makes a reuse spawn in place of a resume (b.4q8)` | A read of the persona's row found that resume's row `ended`, `missing` or gone (`no-row`) before its session started. `<site>: <read>` names the read that found it, for example `isSessionAlive: status` (a health check's or a restart's), `unavailable-retry: retry row read` (a retry's) or `spawnForPersona: collision get` (the next launch's); `<ref>` is `"<name>" (key=<key>)` or `persona=<key>`. `<n>` is how many resumes in a row have ended so. | Check the transcript (**What to check**, below). At `<n>` 1 the next launch still resumes. |
-| `[slack] Resumed launch failed for persona=<key>: its row ended before reporting in — counted (b.4q8)` | That resume was counted as one failed launch toward the restart limit. At the limit, `[slack] Cap reached for persona=<key> — notifying and stopping restarts` and the `SpawnCapReached` notice follow. | As above. A persona at the limit stays down until the server restarts (see "Session not restarting after crash" under Troubleshooting in the README). |
+| `[slack] Resumed launch failed for persona=<key>: its row ended before reporting in — counted (b.4q8)` | That resume was counted as one failed launch toward the restart limit. At the limit, `[slack] Cap reached for persona=<key> — notifying and stopping restarts` and the `SpawnCapReached` notice follow. | As above. A persona at the limit stays down until the server restarts (see "Session not restarting after crash" in `docs/troubleshooting.md`). |
 | `[slack] spawnForPersona: "<name>" (key=<key>): its last <n> resumes in a row ended before reporting in — not resuming its transcript again: a reuse spawn of the same id brings it up fresh, without its conversation; nothing is deleted (b.4q8)` | The fallback. The reuse spawn's own lines follow, then the persona's session starts on a new conversation. Logged again before each try while a reuse spawn does not succeed. | Nothing for the persona. Check the transcript to find out why its resumes failed. |
 | `[slack] Restart for persona=<key> goes no further <before its kill\|before its launch> — the persona reached the restart cap while this restart ran; nothing more is killed or launched for it (b.4q8)` | A read during this restart counted a resume that ended before its session started, and that failed launch reached the restart limit. Nothing more is killed or launched; the `Cap reached` line and `SpawnCapReached` notice came first. | As for the counted line above. |
 | `[slack] health-check: persona=<key> is at cap — skipping tick (SR-25.3/25.4)`, just after the persona's `isSessionAlive: status for persona=<key>: its resumed launch ended before reporting in …`, counted and `Cap reached` lines | The health check's own read counted the resume and reached the limit, so the check scheduled nothing. | As above. |
@@ -2071,7 +2071,7 @@ it so, such as a full or failing disk, or a copy or restore of the config
 directory. If the transcript parses and holds conversation lines, the
 session ended for another reason. A Claude Code release that exits on
 `--resume` is one: see "Session crashes on resume with "sandbox required but
-unavailable"" under Troubleshooting in the README. Otherwise report it, with
+unavailable"" in `docs/troubleshooting.md`. Otherwise report it, with
 the persona's lines.
 
 ## A persona posts a Not answering notice
@@ -3016,7 +3016,7 @@ It quotes no agent-director description and no version.
 
 **The fix is a human's.** A human checks the installed agent-director
 against this release's prerequisites (the README's Prerequisites section)
-and installs agent-director as the README section "Switching over to
+and installs agent-director as the docs/migration.md section "Switching over to
 agent-director Phase 1" describes. This skill takes no step of it; no bot
 acts on the notice, including a persona that sees the post. Never act on
 the persona's row or on its session.
@@ -4023,7 +4023,7 @@ the persona's recorded session name), a store it can't open
 install disappearing (`ErrSystemInstallDisappeared`, which also posts the
 *agent-director unreachable* notice: it says the outage affects every
 persona, since the binary is host-wide, and its remedy points to the
-README section "Switching over to agent-director Phase 1"), any other error name the server gives no
+docs/migration.md section "Switching over to agent-director Phase 1"), any other error name the server gives no
 handling, or a resume's `ErrInvalidFlags` after the server re-checked the
 binary's version. The server does nothing destructive because of it:
 nothing is deleted, killed or relaunched after it, nothing counts toward the
@@ -4712,7 +4712,7 @@ agent-director get --claude-instance-id <id>
 | `[slack] persona Socket Mode: personas[<i>] "<name>" (key=<key>): <text>` | A connection-health line from the Slack library: a ping or pong timeout, or `Failed to send ping to Slack`. The connection is treated as dead and reopened. See [`persona-connection-lost`](#persona-connection-lost). |
 | `[WARN]  web-api:WebClient …` (or `[INFO]`, `[ERROR]`) | The Slack library's own line for a persona's Web API client: a Slack response warning, a rate-limit wait, or a failed request. URLs show as `<redacted-url>` and token-like text as `<redacted-token>`. Nothing to do unless it repeats. |
 | `[slack] Session connected: persona "<name>" (key=<key>) cwd="<path>"` | The persona's instance registered: it's being served. |
-| `[slack] spawnForPersona: "<name>" (key=<key>) <spawn\|resume\|reuse spawn> pre_trust=<ok\|skipped\|failed> (logged only, b.jg5 SRJ-413)` | Written once for every launch that succeeded (`spawn`, `resume` or `reuse spawn`): agent-director's report of whether it accepted the persona's folder trust for this launch. `ok`: it did. `skipped`: it did not, as pre-trust was off for this launch. `failed`: it tried and could not. Cause: agent-director accepts the folder trust itself at each launch. The line never needs action by itself, and nothing the server does depends on it. After `skipped` or `failed` the instance may show Claude Code's folder-trust prompt; the server accepts it with Enter as it does any startup prompt (the `approvePreSessionDialogs` lines in this table; the README's Troubleshooting entry "A persona's instance waits at a startup prompt"). Look further only if the instance stays at that prompt: then follow the `approvePreSessionDialogs` lines for the persona. |
+| `[slack] spawnForPersona: "<name>" (key=<key>) <spawn\|resume\|reuse spawn> pre_trust=<ok\|skipped\|failed> (logged only, b.jg5 SRJ-413)` | Written once for every launch that succeeded (`spawn`, `resume` or `reuse spawn`): agent-director's report of whether it accepted the persona's folder trust for this launch. `ok`: it did. `skipped`: it did not, as pre-trust was off for this launch. `failed`: it tried and could not. Cause: agent-director accepts the folder trust itself at each launch. The line never needs action by itself, and nothing the server does depends on it. After `skipped` or `failed` the instance may show Claude Code's folder-trust prompt; the server accepts it with Enter as it does any startup prompt (the `approvePreSessionDialogs` lines in this table; the Troubleshooting entry "A persona's instance waits at a startup prompt" in `docs/troubleshooting.md`). Look further only if the instance stays at that prompt: then follow the `approvePreSessionDialogs` lines for the persona. |
 | `[slack] spawnForPersona: "<name>" (key=<key>) <spawn\|resume\|reuse spawn> result carries no pre_trust: it came from an agent-director older than Phase 1 (logged only, b.jg5 SRJ-413)` | Written once for every launch that succeeded, in place of the line above, when agent-director's answer did not report the folder trust at all. Cause: the agent-director binary that answered predates Phase 1. The launch goes on unchanged and a folder-trust prompt, if one shows, is accepted as above. No action is needed for the line itself; check the installed agent-director version as in [The server refuses the agent-director binary at start](#the-server-refuses-the-agent-director-binary-at-start). |
 | `[slack] approvePreSessionDialogs: "<name>" (key=<key>) reads <state>: the launch is over, so the approver stops with no pane read and the restart path decides (b.jg5 SRJ-402)` | While a newly launched instance was starting, agent-director reported it `ended` or `missing` (`<state>`): it died before its session started. The server stops watching it at once and reads nothing from its screen. During a server start the same text is in `startup-errors.log` as `dev-channels-approve-spawn-died`. The restart handling relaunches it as for any dead instance; if it keeps dying, attach with the operator's say-so (`tmux attach -t =slack_bot_<key>`) on its next launch to see what it shows, or read the persona's other lines around this one. |
 | `[slack] approvePreSessionDialogs: "<name>" (key=<key>) has no row (ErrSpawnNotFound): the approver stops; nothing is read or typed (b.jg5 SRJ-402)` | agent-director has no record of the newly launched instance, so the server stops watching it. Nothing is written to `startup-errors.log`. The restart handling or the next health check brings the persona back; nothing to do unless it repeats. |
@@ -4768,8 +4768,8 @@ agent-director get --claude-instance-id <id>
 | `[slack] agent-director version re-check: the runtime re-check could not run: <description>; the server keeps running and checks again at the next 120 s re-check` | The server's 120 s check of the agent-director binary couldn't run: the binary is missing, unreadable, unreachable, or didn't answer within 30 s. `<description>` says which (an error name such as `ErrSystemInstallUnreachable (reason <reason>, binary at <path>)`, or `no answer within the 30 s time limit`). Nothing changes: the server keeps running and checks again every 120 s. One line per run of failures: the first failure after start, or after a check that passed, logs it, and the failures after it log nothing until a check passes. Nothing goes to `startup-errors.log` or Slack. If the line keeps coming back, check that the agent-director binary is present and executable. If a later check finds a version the server refuses, the server stops as in [Found while the server was running](#found-while-the-server-was-running). |
 | `[slack] agent-director settings: the [tmux] values in effect from "<path>": pending_grace_seconds <n> s, stopping_window_seconds <n> s, starting_session_seconds <n> s, sweep_budget_seconds <n> s, query_timeout_ms <n> ms, action_timeout_ms <n> ms, create_timeout_ms <n> ms, pipe_close_wait_ms <n> ms, kill_exit_wait_ms <n> ms (b.jg5 SRJ-209, SRJ-1014)` | The nine agent-director timing settings the server uses: written at its first accepted read of the settings file and whenever one of the nine changes. Nothing to do; see [agent-director's timing settings](#agent-directors-timing-settings). |
 | `[slack] agent-director settings: the read of "<path>" was refused: <reason>; <kept> stay in effect until a read is accepted (b.jg5 SRJ-209)` | The server refused agent-director's timing settings file and keeps its last accepted values (`the defaults` at start). One line per run of refused reads. See [agent-director's timing settings](#agent-directors-timing-settings). |
-| `[slack] agent-director settings: agent_director_call_timeout_ms is <value>, at or below its need of <need> ms (the <verb> ceiling plus the 15000 ms margin): a call can time out while its verb still acts; see the README's switch-over runbook, section "Switching over to agent-director Phase 1" (b.jg5 SRJ-213)` | Written once per start, before any persona is brought up. The call timeout is at or below the need that agent-director's timing settings give, so an agent-director call can end in an error while its verb still acts. The server still starts and no value changes. Fix: with the operator's say-so, raise the setting in `config.json` and confirm it. See [The call timeout](#the-call-timeout). |
-| `[slack] agent-director settings: agent_director_call_timeout_ms is <value>; its need is unknown: [pause] timeout_seconds holds <found>, a value that is not used, so pause's wait is not counted and the need without it is <need> ms; see the README's switch-over runbook, section "Switching over to agent-director Phase 1" (b.jg5 SRJ-213)` | Written once per start, in place of the line above, whatever the setting is. `[pause] timeout_seconds` holds a value that is not used (see below), so `pause`'s wait, and so the need, can't be known. The server still starts and no value changes. Fix: the operator gives it a positive whole number, or removes it for the 30 s default, then checks the setting against the need. See [The call timeout](#the-call-timeout). |
+| `[slack] agent-director settings: agent_director_call_timeout_ms is <value>, at or below its need of <need> ms (the <verb> ceiling plus the 15000 ms margin): a call can time out while its verb still acts; see the switch-over runbook in docs/migration.md, section "Switching over to agent-director Phase 1" (b.jg5 SRJ-213)` | Written once per start, before any persona is brought up. The call timeout is at or below the need that agent-director's timing settings give, so an agent-director call can end in an error while its verb still acts. The server still starts and no value changes. Fix: with the operator's say-so, raise the setting in `config.json` and confirm it. See [The call timeout](#the-call-timeout). |
+| `[slack] agent-director settings: agent_director_call_timeout_ms is <value>; its need is unknown: [pause] timeout_seconds holds <found>, a value that is not used, so pause's wait is not counted and the need without it is <need> ms; see the switch-over runbook in docs/migration.md, section "Switching over to agent-director Phase 1" (b.jg5 SRJ-213)` | Written once per start, in place of the line above, whatever the setting is. `[pause] timeout_seconds` holds a value that is not used (see below), so `pause`'s wait, and so the need, can't be known. The server still starts and no value changes. Fix: the operator gives it a positive whole number, or removes it for the 30 s default, then checks the setting against the need. See [The call timeout](#the-call-timeout). |
 | `… launch after its bring-up retry failed: …`, `… working-directory retry failed: …`, `… handling its change from up to <outcome> failed: …`, `persona … not brought up: Slack bring-up threw: …`, `persona <step> failed: personas[<i>] …`, `persona-destination-hold: retry of held notices failed for persona=<key>: …`, `persona-destination-hold: notice failure callback threw for persona=<key>: …`, `unhandled rejection (process keeps running): …` | An internal error. The server keeps running. Report it as a bug, with the persona's lines around it. |
 
 ---
@@ -4971,10 +4971,10 @@ timestamped line in `startup-errors.log` and the same line in `server.log`:
 Nothing was launched, killed or deleted, no persona was brought up, and
 nothing was posted to Slack. Running agent-director instances are left as
 they were. For both classes, this CSCB release and agent-director Phase 1
-are installed together, through the README section "Switching over to
+are installed together, through the docs/migration.md section "Switching over to
 agent-director Phase 1": its `state.db` backup and restarts come with the
 install. The section opens with the block
-["Arrived here from a startup refusal?"](../../README.md#arrived-here-from-a-startup-refusal),
+["Arrived here from a startup refusal?"](../../docs/migration.md#arrived-here-from-a-startup-refusal),
 which says what a refused operator does, in order; tell the operator to
 follow that block. A bot or this skill never changes the agent-director
 install itself, and never starts the server on its own after a refusal. A
@@ -5018,7 +5018,7 @@ README.
 
 The binary is below CSCB's Phase 1 floor. The line names the version found,
 the version required (the Phase 1 release or later, its release candidates
-included), the binary path, that the startup check found it, and the README
+included), the binary path, that the startup check found it, and the docs/migration.md
 section "Switching over to agent-director Phase 1". It has no
 install-skill block.
 
@@ -5029,7 +5029,7 @@ install-skill block.
   check: the version does not parse, so the client refuses it first as
   `ad-system-install-unreachable` (reason `unparseable-version`).
 - **Fix:** the operator follows the block "Arrived here from a startup
-  refusal?" of the README section "Switching over to agent-director
+  refusal?" of the docs/migration.md section "Switching over to agent-director
   Phase 1" (above); the runbook's step 10 starts the new server.
 
 ### `ad-system-install-too-old`
@@ -5039,7 +5039,7 @@ the version found, the version the client requires (its minimum, which the
 client reports), that this CSCB release needs CSCB's Phase 1 floor or later
 (release candidates included), the binary path, that this CSCB release and
 agent-director Phase 1 are installed together, and the
-README section "Switching over to agent-director Phase 1". It ends with the
+docs/migration.md section "Switching over to agent-director Phase 1". It ends with the
 install-skill block (the `install-cscb` skill's URL, target path and
 command); that skill names the same section and runs nothing for this
 class.
@@ -5047,7 +5047,7 @@ class.
 - **Cause:** the system-installed binary is older than the minimum that
   the npm `agent-director` client CSCB depends on accepts.
 - **Fix:** the operator follows the block "Arrived here from a startup
-  refusal?" of the README section "Switching over to agent-director
+  refusal?" of the docs/migration.md section "Switching over to agent-director
   Phase 1" (above); the runbook's step 10 starts the new server.
 
 ### Found while the server was running
@@ -5065,7 +5065,7 @@ found by a runtime re-check while the server was running, so the server stopped
 
 in place of the floor entry's "found by the startup check" (for the too-old
 entry, right after the binary path), and it points here instead of to the
-README section or the install skill. The floor entry ends:
+docs/migration.md section or the install skill. The floor entry ends:
 
 ```text
 Note: this CSCB release requires agent-director Phase 1 or later; see the debug skill (skills/debug-slack-channel-bots/SKILL.md), section "Found while the server was running", for what to do.
@@ -5128,7 +5128,7 @@ exit code 1).
        actions" section of agent-director's README; this skill names no
        command for it. Once the server finds Phase 1, start CSCB.
      - If the host is being rolled back, follow
-       ["Rolling back the switch-over"](../../README.md#rolling-back-the-switch-over),
+       ["Rolling back the switch-over"](../../docs/migration.md#rolling-back-the-switch-over),
        which starts the previous CSCB.
 
   Installing agent-director Phase 1 migrated agent-director's store, so
@@ -5156,13 +5156,13 @@ switch-over first.
 `bun run install-check` passes a binary below CSCB's Phase 1 floor that the
 client accepts only with a `note`: the version found and CSCB's floor (its
 release candidates included), that the server refuses to start on it until
-agent-director Phase 1 is installed, and the README section
-["Switching over to agent-director Phase 1"](../../README.md#switching-over-to-agent-director-phase-1)
+agent-director Phase 1 is installed, and the docs/migration.md section
+["Switching over to agent-director Phase 1"](../../docs/migration.md#switching-over-to-agent-director-phase-1)
 (see
-[Checking your agent-director install](../../README.md#checking-your-agent-director-install)).
+[Checking your agent-director install](../../docs/agent-director.md#checking-your-agent-director-install)).
 The note names no command. A binary that passes
 with it is still refused at start as `ad-below-phase1-floor`. The operator
-follows that README section; this skill runs nothing for the note.
+follows that section; this skill runs nothing for the note.
 
 **`stop --stop-bots` on a binary the client refuses as too old.**
 
@@ -5176,7 +5176,7 @@ follows that README section; this skill runs nothing for the note.
 
   The too-old message is the one described under
   [`ad-system-install-too-old`](#ad-system-install-too-old): it names the
-  version found, the version required and the README section "Switching
+  version found, the version required and the docs/migration.md section "Switching
   over to agent-director Phase 1".
 - **Meaning:** no agent-director call could be made, so only the server was
   stopped. No bot was checked, paused or killed, and every bot and its
@@ -5190,7 +5190,7 @@ follows that README section; this skill runs nothing for the note.
   unknown.
 - **Cause:** the system-installed binary is older than the minimum the
   agent-director client accepts.
-- **Fix:** the operator follows the README section "Switching over to
+- **Fix:** the operator follows the docs/migration.md section "Switching over to
   agent-director Phase 1". A bot or this skill never changes the
   agent-director install itself.
 
@@ -5201,7 +5201,7 @@ follows that README section; this skill runs nothing for the note.
 agent-director keeps nine timing settings in the `[tmux]` table of
 `~/.agent-director/config.toml`. The file is agent-director's; CSCB only
 reads it, from the HOME the server process runs in (not a persona's
-directory). The README section "agent-director's timing settings" lists the
+directory). The docs/agent-director.md section "agent-director's timing settings" lists the
 nine keys and their defaults.
 
 - **When the server reads it:** once at start, after the agent-director
@@ -5263,7 +5263,7 @@ nine keys and their defaults.
   `<path>` is the file the server read (`~/.agent-director/config.toml` when
   it couldn't find its home directory). `<kept>` is `the defaults` or `the
   values of the last accepted read`. `<reason>` names the first broken rule,
-  in the key order of the README's table: for example
+  in the key order of the table in `docs/agent-director.md`: for example
   `[tmux] stopping_window_seconds is 10, below its minimum of 30`,
   `[tmux] query_timeout_ms is not an integer (it is a string)`,
   `[tmux] action_timeout_ms is too large for agent-director`,
@@ -5317,7 +5317,7 @@ read that configuration.
   value, else `config.json`'s, else 60000) with the need. The need is the
   largest ceiling among the verbs CSCB calls, computed from the host's
   `[tmux]` values and, for `pause`, `[pause] timeout_seconds`, plus 15 s. The
-  README section "Sizing the agent-director call timeout", under
+  docs/agent-director.md section "Sizing the agent-director call timeout", under
   "Configuration", has the formulas. At agent-director's defaults the need is
   54000 ms, set by `pause` (9 s plus its 30 s wait, plus 15 s). With
   `create_timeout_ms` 40000 (with `pending_grace_seconds` 61) it is 60900 ms,
@@ -5395,8 +5395,8 @@ load in fungible mode. `dm` and the rules [across personas](#across-personas)
 apply in both modes. A pending change is judged by the mode its own switch
 picks, not the mode in force: an edit that turns fungible mode on or off
 can give an `INVALID` preview for a persona section that loaded until then
-(see [`reload-invalid`](#reload-invalid)). The README's
-[Load-time rules](../../README.md#load-time-rules) list each mode's rules.
+(see [`reload-invalid`](#reload-invalid)). `docs/configuration.md`'s
+[Load-time rules](../../docs/configuration.md#load-time-rules) list each mode's rules.
 
 ### Before any persona is read
 
@@ -5408,11 +5408,11 @@ can give an `INVALID` preview for a persona section that loaded until then
 | `loadPersonaConfig: malformed JSON in "<path>" at line <L>, column <C>.` | Not valid JSON. The line and column (from 1) point at the first character that breaks it; the file's content is never echoed. | Fix the syntax at that position. |
 | `the configuration must be a JSON object, got <type>.` | Top level isn't an object. | Wrap it in `{ … }`. |
 | A key belonging to the pre-persona shape | See [Pre-persona configuration](#pre-persona-configuration). | |
-| `unknown top-level field(s) in config.json: "chanels".`, or `…: 1 field whose name is not shown (it is not a plain setting name, so it could be a pasted secret).`, or `…: "chanels", plus 2 fields whose names are not shown (they are not plain setting names, so they could be pasted secrets).` | A top-level key the server doesn't know (often a typo). Only names made of letters and underscores (up to 48 characters) are shown; any other name (one with a digit such as `channels2`, a dash, a dot, or a pasted token) is only counted. | Remove or correct it. For an unshown field, compare the file's top-level keys with the settings in the README. |
+| `unknown top-level field(s) in config.json: "chanels".`, or `…: 1 field whose name is not shown (it is not a plain setting name, so it could be a pasted secret).`, or `…: "chanels", plus 2 fields whose names are not shown (they are not plain setting names, so they could be pasted secrets).` | A top-level key the server doesn't know (often a typo). Only names made of letters and underscores (up to 48 characters) are shown; any other name (one with a digit such as `channels2`, a dash, a dot, or a pasted token) is only counted. | Remove or correct it. For an unshown field, compare the file's top-level keys with the settings in `docs/configuration.md`. |
 | `claude_director_poll_interval_ms has been renamed to agent_director_poll_interval_ms …` | Old key name. | Rename it. |
 | `personas is required: an array of persona entries, which may be empty.` / `personas must be an array, got <type>.` | Missing or wrong type. | Add `"personas": [ … ]`. |
 | Server-wide type and range errors: `<key> must be a non-negative number.`, `<key> is invalid. Allowed values are: ….`, `<key> must be a boolean.`, `<key> must be a non-empty string when set.`, `<key> must be a string when set.`, `<key> must be a positive integer (>= 1) when set.`, `agent_director_poll_interval_ms must be a positive integer in [200, 3600000].`, `agent_director_call_timeout_ms must be a positive integer in [1000, 3600000].`, `cron_table_path must be a non-empty string.`, `cron_log_path must be a non-empty string.` | A server-wide setting has the wrong type or is out of range. | Correct the named key. |
-| `allow_invited_channels must be a boolean.` | The channel-mode switch is a string, a number, `null`, an object or an array. Its value is never shown. Checked in either mode, after the other server-wide settings and before any persona entry. | Use `true` (fungible mode) or `false`, or remove the key (declarative mode). See [Channel modes](../../README.md#channel-modes). |
+| `allow_invited_channels must be a boolean.` | The channel-mode switch is a string, a number, `null`, an object or an array. Its value is never shown. Checked in either mode, after the other server-wide settings and before any persona entry. | Use `true` (fungible mode) or `false`, or remove the key (declarative mode). See [Channel modes](../../docs/configuration.md#channel-modes). |
 
 ### Persona entries
 
@@ -5423,7 +5423,7 @@ of one mode is never checked in the other.
 | Message (after the persona prefix) | Mode | Cause | Fix |
 |---|---|---|---|
 | `personas[<i>] must be a JSON object, got <type>.` | both | An array element isn't an object. | Make it a persona object. |
-| `unknown field(s) in the persona entry: "<key>".`, `… in dm: …`, each possibly with `1 field whose name is not shown …` or `plus <n> fields whose names are not shown …` | both | A key the schema doesn't have, at that level. As at the top level, only plain setting names are shown; others (a digit, as in `channels2`, a dash, a pasted token) are counted. `channels`, `permission_prompts` and `invited` are known persona-entry keys in both modes. | Remove or correct it. For an unshown field, compare that entry's keys with the persona keys in the README. |
+| `unknown field(s) in the persona entry: "<key>".`, `… in dm: …`, each possibly with `1 field whose name is not shown …` or `plus <n> fields whose names are not shown …` | both | A key the schema doesn't have, at that level. As at the top level, only plain setting names are shown; others (a digit, as in `channels2`, a dash, a pasted token) are counted. `channels`, `permission_prompts` and `invited` are known persona-entry keys in both modes. | Remove or correct it. For an unshown field, compare that entry's keys with the persona keys in `docs/configuration.md`. |
 | `unknown field(s) in channels[<j>]: …`, with the same forms | declarative | A key a channel entry doesn't have. | Remove or correct it. |
 | `invited must be a JSON object, got <type>.` | fungible | `invited` is a string, a number, an array or another non-object. | Make it an object, `{"permission_prompts": "<channel ID or dm>"}`, or remove it to use the default `"dm"`. |
 | `unknown field(s) in invited: "<key>".`, with the same forms as the persona entry's | fungible | `invited` holds a key other than `permission_prompts`. | Remove or correct it. |
@@ -5631,7 +5631,7 @@ line among them.
 | `persona "<name>" (key=<key>) is added; whether it can come up could not be checked.` | A new persona whose credentials and working directory the check couldn't examine (see the `cannot check` line below). It isn't counted differently in the header. |
 | `…: credentials file "<path>" changed; whether it is broken by its credentials now could not be checked.` | A credentials change whose persona's bring-up state couldn't be read (see the `cannot check` line below). With bad content it starts `credentials file "<path>" changed, but it cannot be used (<cause>);`. |
 | `persona "<name>" (key=<key>): <fields> changed in the <declarative or fungible> section: recorded, with no effect until allow_invited_channels selects <declarative or fungible> mode.` | A change to the section the edit's mode doesn't read: `channels` or `permission_prompts` (the declarative section) while the edit is in fungible mode, or `invited` (the fungible section) while it is in declarative mode. `<fields>` lists the changed keys, such as `channels, permission_prompts`. The change is written into the record at the confirmation and does nothing until the switch selects that section; it is never validated until then. The persona isn't counted as modified. |
-| `server-wide setting allow_invited_channels changed: turns <fungible or declarative> mode on, applied in place at once, from the next event, tool call, prompt and notice, for "<name>" (key=<key>), ….` | The channel-mode switch changed. Every persona present before and after the edit is named, in `config.json` order; with none, the line ends `; no persona is affected.` instead. It applies in place at the confirmation, with no restart and every session kept (see [Confirming a pending change](#confirming-a-pending-change)). Writing `false` where the switch was absent is no change. Before turning fungible mode on, review each app's channels and past `unclaimed-channel` lines (see [Turning fungible mode on or off](../../README.md#turning-fungible-mode-on-or-off)). |
+| `server-wide setting allow_invited_channels changed: turns <fungible or declarative> mode on, applied in place at once, from the next event, tool call, prompt and notice, for "<name>" (key=<key>), ….` | The channel-mode switch changed. Every persona present before and after the edit is named, in `config.json` order; with none, the line ends `; no persona is affected.` instead. It applies in place at the confirmation, with no restart and every session kept (see [Confirming a pending change](#confirming-a-pending-change)). Writing `false` where the switch was absent is no change. Before turning fungible mode on, review each app's channels and past `unclaimed-channel` lines (see [Turning fungible mode on or off](../../docs/configuration.md#turning-fungible-mode-on-or-off)). |
 | `server-wide setting <name> changed: once applied, it is recorded and takes effect at the next server start after that.` | A top-level setting such as `port` or `bind`. |
 | `server-wide setting <name> changed: once applied, it is recorded, and the CLI takes it from the record from then on (the running server does not use it).` | `stop_timeout` or `exit_timeout`, which only the CLI uses. |
 | `server-wide setting <name> changed: once applied, it is recorded, the CLI takes it from the record from then on, and the running server uses it from its next start.` | `agent_director_call_timeout_ms`, which both the CLI and the server use. |
@@ -5789,7 +5789,7 @@ What changes at once, with no restart:
   in `channel-delivery.json` and stop applying. Prompts and notices go to
   the destination of the mode turned on, held ones included, and prompts
   already posted stay answerable. See
-  [Channel modes](../../README.md#channel-modes).
+  [Channel modes](../../docs/configuration.md#channel-modes).
 - **A recorded change** to the section the mode doesn't read, the preview's
   `recorded, with no effect until …` lines: written into the record, with no
   effect until the switch selects that section.
@@ -6602,7 +6602,7 @@ a refused choice left on disk.
 ## The crontable's location and its move at start
 
 Scheduled prompts are read from the crontable (see
-[Scheduled Prompts](../../README.md#scheduled-prompts-cscb_cron)). The server
+[Scheduled Prompts](../../docs/scheduled-prompts.md#scheduled-prompts-cscb_cron)). The server
 reads it from the first of these that applies:
 
 - `cron_table_path`, when `config.json` sets it: the path as written, with `~`

@@ -167,12 +167,15 @@ interface CompiledSchedule {
 // ---------------------------------------------------------------------------
 
 /**
- * The README section that documents the crontable line format. The no-persona-
+ * The section of docs/scheduled-prompts.md that documents the crontable line format. The no-persona-
  * list warning points there, not at the file's own comment header: the server
  * never rewrites an existing crontable (cron-bootstrap.ts), so a crontable
  * created by an older version keeps an out-of-date header for good.
  */
-const CRONTABLE_FORMAT_README_SECTION = 'Crontable format'
+const CRONTABLE_FORMAT_SECTION = 'Crontable format'
+
+/** The user doc that holds {@link CRONTABLE_FORMAT_SECTION}. */
+const CRONTABLE_FORMAT_DOC = 'docs/scheduled-prompts.md'
 
 /**
  * True for a schedule that can never be delivered in this version: a line with
@@ -199,7 +202,7 @@ export function noPersonaListWarning(lineNumber: number, promptPath: string): st
     `line=${lineNumber} prompt=${promptPath} undeliverable: this crontable line names no personas, ` +
     `so it will never be delivered in this version (all-bots fan-out is not built: each fire is ` +
     `logged fanout-deferred and dropped). Add a persona list (persona names or keys, comma-separated, ` +
-    `after the prompt path) to deliver it. The README section "${CRONTABLE_FORMAT_README_SECTION}" is ` +
+    `after the prompt path) to deliver it. The section "${CRONTABLE_FORMAT_SECTION}" in ${CRONTABLE_FORMAT_DOC} is ` +
     `the reference for the line format; a crontable created by an older version may carry an ` +
     `out-of-date header.`
   )
