@@ -50,7 +50,8 @@
 #   removing ~/.config/cscb leaves it intact), L2 (but for up to 0.13) a
 #   symbolic link to N, and each old name reaches N's config.json;
 # - server.log holds exactly the layout's `[slack] state-migrate:` lines and no
-#   `[slack] Warning: state-migrate:` line;
+#   `[slack] Warning: state-migrate:` line (once they match, the script prints
+#   each one, `<layout>: state-migrate line <n>: <line>`, as the run's evidence);
 # - the CLI's `stop` (no SLACK_STATE_DIR, so it finds the directory itself)
 #   finds the server and stops it.
 set -euo pipefail
@@ -283,6 +284,10 @@ check_layout_after_start() {
         grep -F -- "[slack] Warning: state-migrate:" "${N}/server.log" | sed 's/^/  | /' >&2
         fail "${step}: server.log carries ${n} state-migrate warning(s)"
     fi
+    # The evidence: the lines matched, in the scenario's log.
+    for i in "${!got[@]}"; do
+        printf '%s: state-migrate line %d: %s\n' "${layout}" "$(( i + 1 ))" "${got[i]}"
+    done
 }
 
 # --- The layouts ----------------------------------------------------------------
