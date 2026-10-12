@@ -6,6 +6,10 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+---
+
+## 0.15.1 (2026-10-12)
+
 ### The state directory is renamed to `~/.config/claude-slack-channel-bots`
 
 "cscb" is an acronym that could clash with another app, so the state directory's default is now named after the package: `~/.config/claude-slack-channel-bots`, or `$XDG_CONFIG_HOME/claude-slack-channel-bots` when `XDG_CONFIG_HOME` is an absolute path. It was `~/.config/cscb` in 0.14.0 and 0.15.0, and `~/.claude/channels/slack` before. `SLACK_STATE_DIR` still overrides it, and nothing moves while it is set. The crontable's default (`crontab`), the credentials files the setup wizard suggests and the startup-errors logrotate snippet follow the new name.
