@@ -129,7 +129,7 @@ Either way the last line follows, and the command exits 1. Rows are never delete
 
 Before `stop --stop-bots` or `clean_restart` stops anything, it checks that agent-director answers and that each persona's instance can be read:
 
-1. It connects to agent-director. `clean_restart` makes the same version checks as the server's start. `stop --stop-bots` makes no version check of its own: any agent-director the client accepts passes, one older than CSCB's Phase 1 floor included.
+1. It connects to agent-director. `clean_restart` makes the same version checks as the server's start. `stop --stop-bots` makes no version check of its own: any agent-director the client accepts passes, including the unsupported development placeholder `0.0.0-dev`. Ordinary 0.10.0/0.11.0 releases and 0.12.0 release candidates are refused by the client before teardown.
 2. For each persona in the last-applied record (or in `config.json` when there is no record), it reads the persona's instance, `cscb_<key>`. A persona with no instance, or whose instance has finished, is skipped. A running instance has one line of its screen read.
 
 A failed precheck prints one line per persona it could not check, naming its class (such as `CONFLICT`, `UNAVAILABLE` or `CONFIG`), then a closing line, and exits 1:

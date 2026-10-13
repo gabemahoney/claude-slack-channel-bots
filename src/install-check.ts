@@ -22,9 +22,10 @@
  *     not-found message its publishing-host block, the client-package texts
  *     {@link CLIENT_PACKAGE_REMEDY}, and no message advises installing,
  *     reinstalling or upgrading agent-director (b.jg5 SRJ-208, SRJ-1101);
- *   - a binary the client accepts but below CSCB's Phase 1 floor (`0.10.0`,
- *     `0.0.0-dev`) passes with the Phase 1 `note`: the server refuses to start
- *     on it until agent-director Phase 1 is installed;
+ *   - a binary the client accepts but below CSCB's Phase 1 floor passes with
+ *     the Phase 1 `note`: the server refuses to start on it until
+ *     agent-director Phase 1 is installed. With the released 0.12.0 client,
+ *     this is its `0.0.0-dev` sentinel; old releases fail the client minimum;
  *   - a binary that meets the floor passes with no note.
  *
  * A failure's `detail` keeps the thrown error's structural fields, but every

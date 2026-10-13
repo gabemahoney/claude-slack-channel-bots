@@ -261,7 +261,7 @@ import {
   installAdVersionRecheck,
   resetAdVersionRecheckForTests,
 } from '../src/ad-version-gate.ts'
-import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import { DEV_PLACEHOLDER_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_CONFLICT,
@@ -3867,7 +3867,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
 
     test.each([
       ['passes (then UNCLASSIFIED)', { version: PHASE1_RC_VERSION }, RECHECK_OUTCOME_PASS, 0],
-      ['decides that the server stops', { version: OLD_AD_VERSION }, RECHECK_OUTCOME_STOP, 1],
+      ['decides that the server stops', { version: DEV_PLACEHOLDER_VERSION }, RECHECK_OUTCOME_STOP, 1],
     ] as const)('the re-check %s → exactly one re-check; the kill step fails with its line naming the re-check, no delete is made; nothing armed or reported', async (_label, outcome, recheck, stopCount) => {
       installRecheck(outcome)
       const err = errInvalidFlags('kill')

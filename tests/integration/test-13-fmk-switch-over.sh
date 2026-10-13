@@ -288,7 +288,7 @@
 # `run_start --live` starts the new CSCB. The version required is the
 # installed package's PHASE1_FLOOR_VERSION. Each its own `fail`:
 #   - start exits non-zero, with its server-failed line;
-#   - exactly one new startup-errors.log entry, the ad-below-phase1-floor
+#   - exactly one new startup-errors.log entry, the ad-system-install-too-old
 #     entry naming 0.10.0 and the version required, and exactly one new
 #     server.log line carrying that label, matching it;
 #   - the stub's record has no new line (no auth.test, no
@@ -330,12 +330,12 @@
 #   src/cli-teardown.ts precheckBoundMs and teardownBoundMs: read from the
 #     installed package
 #   src/cli.ts reportDaemonFailure: `[slack] Server failed to start (`
-#   src/install-check-labels.ts AD_BELOW_PHASE1_FLOOR: `ad-below-phase1-floor`
+#   src/install-check-labels.ts AD_BELOW_PHASE1_FLOOR: `ad-system-install-too-old`
 #   src/startup-errors.ts recordStartupError: an entry and its server.log line
 #     are `[<time>] [<label>] <message>`
-#   src/ad-version-gate.ts buildBelowPhase1FloorMessage: `agent-director
-#     version <found> is below CSCB's Phase 1 floor: version <floor> or later
-#     is required`, then `found by the startup check`; PHASE1_FLOOR_VERSION
+#   src/ad-version-gate.ts buildSystemInstallTooOldMessage: `agent-director
+#     system install is too old: version <found> is below the client minimum`,
+#     naming both the client minimum and CSCB floor; PHASE1_FLOOR_VERSION
 #     is <floor>, read from the installed package
 #   src/session-manager.ts restartCapReachedError: the cap notice's
 #     `consecutive session-launch failures — automatic restarts suspended`
@@ -483,8 +483,8 @@ OLD_EXIT_TIMEOUT_S=5
 OLD_STOP_TIMEOUT_S=5
 
 # src/install-check-labels.ts AD_BELOW_PHASE1_FLOOR: the startup gate's class
-# label for a binary below CSCB's Phase 1 floor.
-AD_BELOW_PHASE1_FLOOR_LABEL=ad-below-phase1-floor
+# label for the native client's refusal before CSCB's floor check.
+AD_SYSTEM_INSTALL_TOO_OLD_LABEL=ad-system-install-too-old
 
 # The runbook's own bound in step 4: "wait at most 5 minutes".
 STEP4_WAIT_S=300
@@ -1457,11 +1457,11 @@ runbook_substitute 8 operator-go-ahead "the operator's go-ahead is the switch-ov
 
 # The harness's stop of every other agent: none is seeded.
 list_rows "step 8" "${SCENARIO_ROOT}/rows-step8.json"
-live="$(jq -r --arg key "${SCENARIO_AD_ID_COLUMN}" '[.[] | select((.labels.service // "") != "cscb") | select(.state != "ended" and .state != "missing") | .[$key]] | join(" ")' "${SCENARIO_ROOT}/rows-step8.json")"
-[[ -z "${live}" ]] || fail "step 8: other agents' rows still live: ${live}"
+live="$(jq -r --arg key "${SCENARIO_AD_ID_COLUMN}" '[.[] | select(.state != "ended" and .state != "missing") | .[$key]] | join(" ")' "${SCENARIO_ROOT}/rows-step8.json")"
+[[ -z "${live}" ]] || fail "step 8: agent rows still live: ${live}"
 tmux_sessions sessions
 (( ${#sessions[@]} == 0 )) || fail "step 8: tmux sessions are left: ${sessions[*]}"
-record "every other agent stopped: no non-CSCB row live, no tmux session"
+record "every other agent stopped: no agent row live, no tmux session"
 runbook_substitute 8 harness-stops-agents "the harness stops every other agent in the container; none is seeded"
 
 ad_store_backup "${STORE_BACKUP}"
@@ -2226,6 +2226,8 @@ REQUIRED_AD_VERSION="$(cd / && GATE_MODULE="${CSCB_PKG_DIR}/src/ad-version-gate.
     'const m = await import(process.env.GATE_MODULE); if (typeof m.PHASE1_FLOOR_VERSION !== "string") process.exit(1); process.stdout.write(m.PHASE1_FLOOR_VERSION)')" \
     || fail "leg C: could not read PHASE1_FLOOR_VERSION from ${CSCB_PKG_DIR}/src/ad-version-gate.ts"
 [[ -n "${REQUIRED_AD_VERSION}" ]] || fail "leg C: ${CSCB_PKG_DIR}/src/ad-version-gate.ts holds an empty PHASE1_FLOOR_VERSION"
+CLIENT_MIN_AD_VERSION="$(jq -er '.min_binary_version' "$(client_dir_of "${CSCB_PKG_DIR}")/dist/version-floor.json")"
+[[ -n "${CLIENT_MIN_AD_VERSION}" ]] || fail "leg C: the installed client minimum is empty"
 
 # Leg B's server stopped with its bots through the new CLI; every Slack
 # socket closed and no worker left to run a hook against 0.10.0.
@@ -2274,26 +2276,25 @@ if ! grep -qF '[slack] Server failed to start (' "${START_OUT}"; then
     fail "leg C: start exited ${START_RC} without its server-failed line"
 fi
 
-# It alerts once: one startup-errors entry, the floor's, naming the version
+# It alerts once: one startup-errors entry, the native client refusal, naming the version
 # found and the version required, and one matching server-log line.
-floor_entry="$(matcher "[${AD_BELOW_PHASE1_FLOOR_LABEL}] " \
-    "agent-director version ${SCENARIO_AD_010_VERSION} is below CSCB's Phase 1 floor: version ${REQUIRED_AD_VERSION} or later is required" \
-    "found by the startup check")"
+too_old_entry="$(matcher "[${AD_SYSTEM_INSTALL_TOO_OLD_LABEL}] " \
+    "agent-director system install is too old: version ${SCENARIO_AD_010_VERSION} is below the agent-director client's minimum; version ${CLIENT_MIN_AD_VERSION} or later is required by the client, and this CSCB release needs ${REQUIRED_AD_VERSION} or later")"
 n="$(line_count "${SCENARIO_ROOT}/leg-c-errors")"
 if [[ "${n}" != 1 ]]; then
     sed 's/^/  | /' "${SCENARIO_ROOT}/leg-c-errors" >&2
     fail "leg C: ${n} new startup-errors.log entries, not one"
 fi
-[[ "$(count_in "${SCENARIO_ROOT}/leg-c-errors" "${floor_entry}")" == 1 ]] \
-    || fail "leg C: the new startup-errors.log entry is not an ${AD_BELOW_PHASE1_FLOOR_LABEL} entry naming ${SCENARIO_AD_010_VERSION} and ${REQUIRED_AD_VERSION}: $(head -c 400 "${SCENARIO_ROOT}/leg-c-errors")"
-n="$(count_in "${SCENARIO_ROOT}/leg-c-server.log" "[${AD_BELOW_PHASE1_FLOOR_LABEL}] ")"
+[[ "$(count_in "${SCENARIO_ROOT}/leg-c-errors" "${too_old_entry}")" == 1 ]] \
+    || fail "leg C: the new startup-errors.log entry is not an ${AD_SYSTEM_INSTALL_TOO_OLD_LABEL} entry naming ${SCENARIO_AD_010_VERSION} and ${REQUIRED_AD_VERSION}: $(head -c 400 "${SCENARIO_ROOT}/leg-c-errors")"
+n="$(count_in "${SCENARIO_ROOT}/leg-c-server.log" "[${AD_SYSTEM_INSTALL_TOO_OLD_LABEL}] ")"
 if [[ "${n}" != 1 ]]; then
     sed 's/^/  | /' "${SCENARIO_ROOT}/leg-c-server.log" >&2
-    fail "leg C: ${n} new server.log lines carry ${AD_BELOW_PHASE1_FLOOR_LABEL}, not one"
+    fail "leg C: ${n} new server.log lines carry ${AD_SYSTEM_INSTALL_TOO_OLD_LABEL}, not one"
 fi
-[[ "$(count_in "${SCENARIO_ROOT}/leg-c-server.log" "${floor_entry}")" == 1 ]] \
+[[ "$(count_in "${SCENARIO_ROOT}/leg-c-server.log" "${too_old_entry}")" == 1 ]] \
     || fail "leg C: the server.log line does not name ${SCENARIO_AD_010_VERSION} and ${REQUIRED_AD_VERSION}"
-record "leg C: start exited ${START_RC}; one ${AD_BELOW_PHASE1_FLOOR_LABEL} entry and one server.log line naming ${SCENARIO_AD_010_VERSION} and ${REQUIRED_AD_VERSION}"
+record "leg C: start exited ${START_RC}; one ${AD_SYSTEM_INSTALL_TOO_OLD_LABEL} entry and one server.log line naming ${SCENARIO_AD_010_VERSION} and ${REQUIRED_AD_VERSION}"
 
 # Nothing reaches the Slack stub: no auth.test, no apps.connections.open, no
 # WebSocket, no post.

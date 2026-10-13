@@ -100,7 +100,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import * as agentDirectorClient from 'agent-director'
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { spawnSync } from 'node:child_process'
@@ -110,6 +110,9 @@ import ts from 'typescript'
 
 import { AD_TMUX_TABLE } from '../src/ad-settings.ts'
 import { PHASE1_ONLY_ERR_NAMES } from '../src/agent-director-errors.ts'
+import { buildSystemInstallTooOldMessage, compareAdVersions, FOUND_BY_RUNTIME_RECHECK, FOUND_BY_STARTUP_CHECK, meetsPhase1Floor, PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
+import { renderInstallSkillInstructions } from '../src/install-skill-pointer.ts'
+import { CLIENT_MIN_VERSION } from './test-helpers/agent-director-versions.ts'
 import { AD_NS, AGENT_DIRECTOR_MODULE, agentDirectorNamespaceArguments, agentDirectorValueReads, finding } from './test-helpers/ad-value-reads.ts'
 import {
   callArguments,
@@ -1643,6 +1646,177 @@ _scenario_row_json row test-id`)
   ])('mixed upgrade call logs decode %s exactly', (args) => {
     const result = shell(`${helper('_scenario_ad_id')}\n_L_ARGS=(${args})\n_scenario_ad_id\nprintf '%s' "$_L_ID"`)
     expect(result).toBe('test-id')
+  })
+  test.each(['test0', 'test14'].flatMap((script) => ['pass', 'live-row', 'live-worker', 'live-session', 'metadata-loss', 'state-loss', 'cwd-loss'].map((mode) => [script, mode])))('%s seed migration %s: quiesce before install and preserve terminal rows with no host executables', (script, mode) => {
+    const upgradeCheck = readFileSync(join(import.meta.dir, 'integration/test-14-fmk-kill-fails.sh'), 'utf8')
+    const count = script === 'test14' ? 4 : 3
+    const code = `${helper('_scenario_ad_contract')}
+${(script === 'test14' ? ['t14_upgrade_row_quiescent', 't14_upgrade_seeded_rows'] : ['nested_seed_row_quiescent', 'nested_quiesce_seed_row', 'nested_migrate_seed_rows', 'nested_expect_row']).map((name) => helper(name, script === 'test14' ? upgradeCheck : selfCheck)).join('\n')}
+SCENARIO_REAL_TMUX=fixture_tmux
+SCENARIO_WORKER_END_S=2
+SCENARIO_RELEASE_BIN=inert
+SCENARIO_ROOT="$HOME"
+AD_OUT="$HOME/row.json"
+AD_ERR="$HOME/err"
+MODE='${mode}'
+UA_ID=t0-010-row
+UB_ID=cscb_ops_team_C0T0AAA01
+P_ID=cscb_C0T0BBB02
+Q_ID=cscb_q
+phase=old
+polls=0
+kills=0
+_scenario_ad_contract 0.10.0
+fail() { printf 'REFUSED: %s\\n' "$*"; exit 1; }
+pid_alive() { [[ "$MODE" == live-worker ]]; }
+fixture_tmux() { if [[ "$1" == display-message ]]; then printf 101; return 0; fi; [[ "$MODE" == live-session ]]; }
+wait_until() {
+    local bound="$1"; shift 2
+    [[ "$bound" == 2 ]] || exit 9
+    for attempt in 1 2 3; do
+        polls=$((polls + 1))
+        "$@" && return 0
+    done
+    fail bounded-quiescence
+}
+ad_capture() {
+    AD_RC=0
+    printf '%s %s %s\\n' "$phase" "$1" "\${2:-}" >> "$HOME/calls"
+    case "$1" in
+      kill) [[ "$2" == "$SCENARIO_AD_ID_FLAG" ]] || exit 10; kills=$((kills + 1));;
+      find-missing) :;;
+      get)
+        local id="$3" session labels state=ended cwd="/fixture/$3"
+        case "$id" in
+          t0-010-row) session=t0_010_row; labels='{"team":"t0"}';;
+          cscb_ops_team_C0T0AAA01) session=slack_bot_ops_team_C0T0AAA01; labels='{"service":"cscb","channel":"C0T0AAA01"}';;
+          cscb_C0T0BBB02) session=slack_bot_C0T0BBB02; labels='{"service":"cscb","channel":"C0T0BBB02"}'; state=missing;;
+          cscb_q) session=slack_bot_q; labels='{}';;
+        esac
+        [[ "$MODE" != live-row ]] || state=waiting
+        if [[ "$phase" == release ]]; then
+          [[ "$MODE" != metadata-loss ]] || labels='{}'
+          [[ "$MODE" != state-loss ]] || state=waiting
+          [[ "$MODE" != cwd-loss ]] || cwd=/corrupted
+        fi
+        printf '{"%s":"%s","tmux_session_name":"%s","labels":%s,"state":"%s","cwd":"%s"}\\n' "$SCENARIO_AD_ID_COLUMN" "$id" "$session" "$labels" "$state" "$cwd" > "$AD_OUT";;
+      *) exit 11;;
+    esac
+}
+install_ad_release() {
+    [[ "$kills" == ${count} && "$polls" == ${count} ]] || exit 12
+    printf 'INSTALL\\n'
+    phase=release
+    _scenario_ad_contract release
+}
+check_ad_shim() { :; }
+expect_shim_in_place() { :; }
+ad_store_id() { printf 0123456789abcdef; }
+(${script === 'test14' ? 't14_upgrade_seeded_rows' : 'nested_migrate_seed_rows 101 102 103'})
+printf 'RESULT=%s\\n' "$?"
+while IFS= read -r line; do printf '%s\\n' "$line"; done < "$HOME/calls"`
+    const output = shell(code, ['jq', 'head', 'tr', 'cmp'])
+    assertNoLeak({ output })
+    if (mode === 'pass') {
+      expect(output).toContain('INSTALL')
+      if (script === 'test0') expect(output).toContain('CHECK: seeded rows quiescent before install\nINSTALL\nCHECK: rows survive the release\'s install')
+      expect(output).toContain('RESULT=0')
+      expect(output.match(/old kill /g)).toHaveLength(count)
+      expect(output.match(/old get /g)).toHaveLength(script === 'test14' ? 8 : 3)
+      expect(output.match(/release get /g)).toHaveLength(count)
+      expect(output).toContain('old kill --claude-instance-id')
+      expect(output).toContain('release get --instance-id')
+    } else {
+      expect(output).toContain('RESULT=1')
+      if (mode.startsWith('live-')) {
+        expect(output).toContain('REFUSED: bounded-quiescence')
+        expect(output).not.toContain('INSTALL')
+        expect(output.match(/old find-missing /g)).toHaveLength(3)
+      } else {
+        expect(output).toContain('INSTALL')
+        expect(output).not.toContain("CHECK: rows survive the release's install")
+      }
+    }
+    expect(output).not.toMatch(/--agent|expire|delete/)
+  })
+  test.each(['target', 'other', 'empty'])('rebuilt A must exercise its targeted kill fault: %s log', (mode) => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-14-fmk-kill-fails.sh'), 'utf8')
+    const call = mode === 'empty' ? '' : `call\t100\t1\t2\t3\tkill-session -t =${mode === 'target' ? 'ua' : 'unrelated'}\n`
+    writeFileSync(join(home, 'tmux.log'), call)
+    const output = shell(`${helper('t14_note_kills_at', source)}
+SCENARIO_TMUX_SHIM_LOG="$HOME/tmux.log"
+MARK_TIME=90
+TEST_NAME=inert
+fail() { printf 'REFUSED: %s\\n' "$*"; exit 1; }
+(t14_note_kills_at fault ua)
+printf 'RESULT=%s' "$?"`, ['awk'])
+    expect(output).toContain(mode === 'target' ? 'RESULT=0' : 'RESULT=1')
+    if (mode !== 'target') expect(output).toContain('the fail-kill fault was not exercised')
+  })
+  test('released fixture rebuilding explicitly reuses migrated terminal rows', () => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-14-fmk-kill-fails.sh'), 'utf8')
+    const start = source.indexOf('for fixture in A B P Q; do')
+    const end = source.indexOf("\n# P's intentionally injected", start)
+    expect(start).toBeGreaterThan(0)
+    expect(end).toBeGreaterThan(start)
+    const loop = source.slice(start, end)
+    const run = (body: string): string => shell(`
+UA_ID=a; UB_ID=b; P_ID=p; Q_ID=q
+UA_SESSION=a; UB_SESSION=b; P_SESSION=p; Q_SESSION=q
+UA_WORK="$HOME"; UB_WORK="$HOME"; P_ROW_WORK="$HOME"; Q_WORK="$HOME"
+UA_CHANNEL=C_A; UB_CHANNEL=C_B; SVC_LABEL=service=cscb; PERSONA_LABEL=persona; P_KEY=p; Q_KEY=q
+AD_ERR="$HOME/err"
+printf ErrSpawnExists > "$AD_ERR"
+fail() { printf 'REFUSED: %s\\n' "$*"; exit 1; }
+ad_capture() {
+  AD_RC=1
+  for arg in "$@"; do [[ "$arg" != --reuse-finished ]] || AD_RC=0; done
+  if (( AD_RC == 0 )); then printf 'REUSED\\n'; fi
+}
+(${body})
+printf 'RESULT=%s' "$?"`, ['head'])
+    expect(run(loop).match(/REUSED/g)).toHaveLength(4)
+    expect(run(loop.replace('--reuse-finished', ''))).toContain('RESULT=1')
+    const reinstall = helper('leg_reinstall', selfCheck)
+    expect(reinstall).toContain('--no-pre-trust --reuse-finished --label "t0=edited"')
+  })
+  test('test-20 passing prerelease meets both native and numeric floors', () => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-20-fmk-old-binary.sh'), 'utf8')
+    const assignment = source.match(/^IFS=\. read -r floor_major floor_minor floor_patch[^\n]*\nPASSING_VERSION=[^\n]*/m)
+    expect(assignment).not.toBeNull()
+    const passing = shell(`FLOOR='${PHASE1_FLOOR_VERSION}'\n${assignment![0]}\nprintf '%s' "$PASSING_VERSION"`)
+    expect(compareAdVersions(`${PHASE1_FLOOR_VERSION}-rc.1`, CLIENT_MIN_VERSION)).toBe(-1)
+    expect(compareAdVersions(passing, CLIENT_MIN_VERSION)).toBe(1)
+    expect(meetsPhase1Floor(passing)).toBe(true)
+    for (const leg of ['8a', '8c', '8e']) {
+      expect(source).toMatch(new RegExp(`expect_one_floor_entry "${leg}"[^\n]*"\\$\\{TOO_OLD_LABEL\\}"`))
+    }
+    expect(source).toContain('buildBelowPhase1FloorMessage "${DEV_SENTINEL}"')
+  })
+  test.each(['startup', 'runtime'] as const)('test-20 native %s message printer uses the real builder and client minimum', async (finder) => {
+    const source = readFileSync(join(import.meta.dir, 'integration/fixtures/fmk-texts.ts'), 'utf8')
+    const declarations = source.slice(source.indexOf('const clientMinimumVersion: Entry'), source.indexOf('/** `formatPersonaNotice'))
+    const compiled = ts.transpileModule(declarations, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+    const functions: Record<string, unknown> = {
+      readClientMinVersion: () => CLIENT_MIN_VERSION,
+      buildSystemInstallTooOldMessage,
+      renderInstallSkillInstructions,
+    }
+    const printer = new Function('packageFunction', 'packageString', 'expectArguments', 'usageFail', 'builtString', 'FOUND_BY_EXPORTS', `${compiled}\nreturn systemInstallTooOldMessage;`)(
+      async (_context: unknown, _file: string, name: string) => {
+        expect(functions[name]).toBeTypeOf('function')
+        return functions[name]
+      },
+      async (_context: unknown, _file: string, name: string) => name === 'FOUND_BY_STARTUP_CHECK' ? FOUND_BY_STARTUP_CHECK : FOUND_BY_RUNTIME_RECHECK,
+      (_entry: string, args: string[], expected: string[]) => expect(args).toHaveLength(expected.length),
+      (message: string) => { throw new Error(message) },
+      (_entry: string, value: unknown) => { expect(value).toBeTypeOf('string'); return value },
+      { startup: 'FOUND_BY_STARTUP_CHECK', runtime: 'FOUND_BY_RUNTIME_RECHECK' },
+    ) as { print: (args: string[], context: object) => Promise<string> }
+    const foundBy = finder === 'startup' ? FOUND_BY_STARTUP_CHECK : FOUND_BY_RUNTIME_RECHECK
+    const expected = buildSystemInstallTooOldMessage({ foundVersion: '0.10.0', binaryPath: '/fixture/bin/agent-director', requiredVersion: CLIENT_MIN_VERSION }, foundBy)
+      + (finder === 'startup' ? renderInstallSkillInstructions() : '')
+    expect(await printer.print(['0.10.0', '/fixture/bin/agent-director', finder], {})).toBe(expected.replace(/\r?\n/g, ' ').replace(/\r/g, ' '))
   })
   test('swapping a below-floor binary never changes the installed stage contract', () => {
     expect(helper('swap_ad_binary')).not.toContain('_scenario_ad_contract')

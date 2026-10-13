@@ -39,13 +39,13 @@
 #                (`restore_ad_install_with_stand_in unparseable pass`); the
 #                release
 #   8c           0.10.0, then the release once the server has stopped
-#   8d           the passing wrapper (`install_ad_stand_in <floor>-rc.1
+#   8d           the passing wrapper (`install_ad_stand_in <next-patch>-rc.1
 #                reject`), then the release
 #   8e           the release; the below-floor stand-in (`install_ad_stand_in
 #                <0.10.0's version> reject`) once the start-pass launch has
 #                failed; the release once the server has stopped
 #   23a          the stand-in reporting the floor's release-candidate form
-#                (`install_ad_stand_in <floor>-rc.1 pass`), then the release
+#                (`install_ad_stand_in <next-patch>-rc.1 pass`), then the release
 #                once the server has stopped
 #   23b          the stand-in reporting the client's development sentinel
 #                (`install_ad_stand_in 0.0.0-dev pass`), then the release
@@ -112,7 +112,7 @@
 #        `ad_store_mark_finished <P> ended`, then agent-director-admin's
 #        `kill-finished` through `ad_kill_include_finished`, which ends its
 #        session; a harness `get` reads `ended` or `missing`). The passing
-#        wrapper goes behind the shim: it reports the floor with an `-rc.1`
+#        wrapper goes behind the shim: it reports the next patch above the floor with an `-rc.1`
 #        tag (PASSING_VERSION), and a harness `version` call reads it.
 #        fmk-driver.ts's forced reuse of P (through `cscb_run`) prints one
 #        `DRIVER:` line naming ErrInvalidFlags and CSCB's class for it, the
@@ -147,7 +147,7 @@
 #        gate; no CSCB kill, kill-finished, delete or pause follows, and P's
 #        row (read with the release back) stays finished.
 #   23a  the server stopped, P's row finished (from 8e); the stand-in
-#        reporting PASSING_VERSION (the floor's `<floor>-rc.N` form) goes
+#        reporting PASSING_VERSION (the next-patch prerelease) goes
 #        behind the shim in `pass` mode, and a harness `version` call reads
 #        it. Start: the gate passes (the bot server's first probe; the
 #        server keeps running), at least one CSCB launch call (spawn or
@@ -177,7 +177,11 @@
 # package (never retyped):
 #   FLOOR                PHASE1_FLOOR_VERSION              src/ad-version-gate.ts
 #   FLOOR_LABEL          AD_BELOW_PHASE1_FLOOR             src/install-check-labels.ts
-#   floor messages       buildBelowPhase1FloorMessage <version> <path> <startup|runtime>
+#   TOO_OLD_LABEL        AD_SYSTEM_INSTALL_TOO_OLD         src/install-check-labels.ts
+#   CLIENT_MINIMUM       readClientMinVersion             src/install-check.ts
+#   version messages     buildBelowPhase1FloorMessage (sentinel) or
+#                        buildSystemInstallTooOldMessage (native minimum)
+#                        <version> <path> <startup|runtime>
 #                                                          src/ad-version-gate.ts
 #   RUNTIME_PHRASE       RUNTIME_RECHECK_PHRASE            src/ad-version-gate.ts
 #   RECHECK_S            AD_VERSION_RECHECK_INTERVAL_MS / 1000
@@ -222,8 +226,8 @@
 # - the below-floor binary is the stand-in reporting 0.10.0's own version
 #   (read in 8a), since a real 0.10.0 answers ErrSchemaMismatch on the
 #   migrated store before it parses flags;
-# - the passing wrapper reports PASSING_VERSION, the floor with an `-rc.1`
-#   tag: SRJ-202 compares only major.minor.patch, so it passes the floor,
+# - the passing wrapper reports PASSING_VERSION, the next patch with an `-rc.1`
+#   tag: both the native client and CSCB admit it,
 #   and putting the release (exactly the floor) back is the version change
 #   that ends the hold (the hold ends only on a different version string);
 # - the exit bound is RECHECK_S + EXIT_ALLOWANCE_S, measured from the swap;
@@ -255,6 +259,8 @@ TEXTS="${SCENARIO_FIXTURES}/fmk-texts.ts"
 
 FLOOR="$(bun "${TEXTS}" PHASE1_FLOOR_VERSION)" || fail "setup: fmk-texts PHASE1_FLOOR_VERSION"
 FLOOR_LABEL="$(bun "${TEXTS}" AD_BELOW_PHASE1_FLOOR)" || fail "setup: fmk-texts AD_BELOW_PHASE1_FLOOR"
+TOO_OLD_LABEL="$(bun "${TEXTS}" AD_SYSTEM_INSTALL_TOO_OLD)" || fail "setup: fmk-texts AD_SYSTEM_INSTALL_TOO_OLD"
+CLIENT_MINIMUM="$(bun "${TEXTS}" AD_CLIENT_MINIMUM)" || fail "setup: fmk-texts AD_CLIENT_MINIMUM"
 RUNTIME_PHRASE="$(bun "${TEXTS}" RUNTIME_RECHECK_PHRASE)" || fail "setup: fmk-texts RUNTIME_RECHECK_PHRASE"
 RECHECK_MS="$(bun "${TEXTS}" AD_VERSION_RECHECK_INTERVAL_MS)" || fail "setup: fmk-texts AD_VERSION_RECHECK_INTERVAL_MS"
 COULD_NOT_RUN_PREFIX="$(bun "${TEXTS}" AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX)" \
@@ -285,11 +291,11 @@ FINISH_AGE_S=$(( (AD_STARTING_BOUND_S > AD_STOPPING_WINDOW_S ? AD_STARTING_BOUND
 EXIT_ALLOWANCE_S=10
 RECHECK_WAIT_S=$(( RECHECK_S + EXIT_ALLOWANCE_S ))
 
-# SRJ-202 compares only major.minor.patch, so the floor with a pre-release
-# tag passes the floor while reading as a different version string from the
-# release put back (src/ad-version-gate.ts meetsPhase1Floor). The `-rc.1`
-# suffix is the scenario's own; the floor comes from the printer.
-PASSING_VERSION="${FLOOR}-rc.1"
+# A floor prerelease is below the native client minimum. The next patch
+# prerelease passes both checks while remaining a distinct version for the
+# version-change and ErrInvalidFlags-hold checks.
+IFS=. read -r floor_major floor_minor floor_patch <<< "${FLOOR}"
+PASSING_VERSION="${floor_major}.${floor_minor}.$(( 10#${floor_patch} + 1 ))-rc.1"
 
 # Scenario 23's development builds: a `make` build without a version stamp
 # reports the client's development sentinel; a plain `go build` reports
@@ -553,47 +559,47 @@ session_age_at_least() {
     [[ "${created}" =~ ^[0-9]+$ ]] && (( $(date +%s) - created >= $2 ))
 }
 
-# floor_entries <message>: how many startup-errors.log entries are
+# floor_entries <message> [<label>]: how many startup-errors.log entries are
 # `[<time>] [FLOOR_LABEL] <message>` exactly (src/startup-errors.ts).
 floor_entries() {
-    local file="${SLACK_STATE_DIR}/startup-errors.log"
+    local file="${SLACK_STATE_DIR}/startup-errors.log" label="${2:-${FLOOR_LABEL}}"
     [[ -f "${file}" ]] || { echo 0; return 0; }
-    LC_ALL=C awk -v want="[${FLOOR_LABEL}] $1" '
+    LC_ALL=C awk -v want="[${label}] $1" '
         /^\[[^]]*\] / { rest = substr($0, index($0, "] ") + 2); if (rest == want) n++ }
         END { print n + 0 }' "${file}"
 }
 
-# floor_entries_any: how many startup-errors.log entries carry FLOOR_LABEL.
+# floor_entries_any [<label>]: count a selected class (sentinel floor by default).
 floor_entries_any() {
-    count_in "${SLACK_STATE_DIR}/startup-errors.log" "] [${FLOOR_LABEL}] "
+    count_in "${SLACK_STATE_DIR}/startup-errors.log" "] [${1:-${FLOOR_LABEL}}] "
 }
 
-# server_log_entry_lines <message>: how many server.log lines end with
+# server_log_entry_lines <message> [<label>]: how many server.log lines end with
 # `[FLOOR_LABEL] <message>` (the entry's copy on the daemon's stderr).
 server_log_entry_lines() {
-    local file="${SLACK_STATE_DIR}/server.log"
+    local file="${SLACK_STATE_DIR}/server.log" label="${2:-${FLOOR_LABEL}}"
     [[ -f "${file}" ]] || { echo 0; return 0; }
-    LC_ALL=C awk -v want="[${FLOOR_LABEL}] $1" '
+    LC_ALL=C awk -v want="[${label}] $1" '
         { n0 = length($0); n1 = length(want); if (n0 >= n1 && substr($0, n0 - n1 + 1) == want) n++ }
         END { print n + 0 }' "${file}"
 }
 
-# expect_one_floor_entry <step> <message> <same-before> <any-before>: this
+# expect_one_floor_entry <step> <message> <same-before> <any-before> [<label>]: this
 # step added exactly one entry, equal to <message>: entries equal to it are
 # <same-before> + 1, entries of FLOOR_LABEL <any-before> + 1, and server.log
 # lines carrying it <same-before> + 1.
 expect_one_floor_entry() {
-    local step="$1" msg="$2" same="$3" any="$4" n
-    n="$(floor_entries "${msg}")"
+    local step="$1" msg="$2" same="$3" any="$4" label="${5:-${FLOOR_LABEL}}" n
+    n="$(floor_entries "${msg}" "${label}")"
     if [[ "${n}" != "$(( same + 1 ))" ]]; then
         sed 's/^/  | /' "${SLACK_STATE_DIR}/startup-errors.log" >&2 2> /dev/null || true
-        printf '  | want: [%s] %s\n' "${FLOOR_LABEL}" "${msg}" >&2
-        fail "${step}: $(( n - same )) new ${FLOOR_LABEL} entr(y/ies) equal to the expected message, not exactly one"
+        printf '  | want: [%s] %s\n' "${label}" "${msg}" >&2
+        fail "${step}: $(( n - same )) new ${label} entr(y/ies) equal to the expected message, not exactly one"
     fi
-    n="$(floor_entries_any)"
-    [[ "${n}" == "$(( any + 1 ))" ]] || fail "${step}: ${n} ${FLOOR_LABEL} entries in all, not ${any} + 1"
-    n="$(server_log_entry_lines "${msg}")"
-    [[ "${n}" == "$(( same + 1 ))" ]] || fail "${step}: $(( n - same )) new server.log line(s) carry the ${FLOOR_LABEL} entry, not exactly one"
+    n="$(floor_entries_any "${label}")"
+    [[ "${n}" == "$(( any + 1 ))" ]] || fail "${step}: ${n} ${label} entries in all, not ${any} + 1"
+    n="$(server_log_entry_lines "${msg}" "${label}")"
+    [[ "${n}" == "$(( same + 1 ))" ]] || fail "${step}: $(( n - same )) new server.log line(s) carry the ${label} entry, not exactly one"
 }
 
 # alert_posts: how many chat.postMessage texts in the stub's record hold the
@@ -798,13 +804,13 @@ OLD_VERSION="$(jq -r '.version // empty' "${AD_OUT}")" || fail "8a: version prin
     || fail "8a: 0.10.0's binary reports '${OLD_VERSION}', not an older version than the floor ${FLOOR}"
 echo "${TEST_NAME}: 8a: 0.10.0's binary reports version ${OLD_VERSION}"
 
-MSG_8A="$(bun "${TEXTS}" buildBelowPhase1FloorMessage "${OLD_VERSION}" "${AD_BIN_PATH}" startup)" \
-    || fail "8a: fmk-texts buildBelowPhase1FloorMessage startup"
-entries_before="$(floor_entries_any)"
+MSG_8A="$(bun "${TEXTS}" buildSystemInstallTooOldMessage "${OLD_VERSION}" "${AD_BIN_PATH}" startup)" \
+    || fail "8a: fmk-texts buildSystemInstallTooOldMessage startup"
+entries_before="$(floor_entries_any "${TOO_OLD_LABEL}")"
 begin_refused_start
 run_start --live
 expect_refused_start "8a"
-expect_one_floor_entry "8a" "${MSG_8A}" 0 "${entries_before}"
+expect_one_floor_entry "8a" "${MSG_8A}" 0 "${entries_before}" "${TOO_OLD_LABEL}"
 swap_ad_binary release "8a: the release back behind the shim"
 
 # ---------------------------------------------------------------------------
@@ -863,12 +869,12 @@ pid_alive "${SERVER_PID}" || fail "8b recovery: the server stopped"
 # ---------------------------------------------------------------------------
 
 leg 8c
-MSG_RUNTIME="$(bun "${TEXTS}" buildBelowPhase1FloorMessage "${OLD_VERSION}" "${AD_BIN_PATH}" runtime)" \
-    || fail "8c: fmk-texts buildBelowPhase1FloorMessage runtime"
+MSG_RUNTIME="$(bun "${TEXTS}" buildSystemInstallTooOldMessage "${OLD_VERSION}" "${AD_BIN_PATH}" runtime)" \
+    || fail "8c: fmk-texts buildSystemInstallTooOldMessage runtime"
 declare -A touch_8c=()
 cscb_counts touch_8c
-entries_before="$(floor_entries_any)"
-same_before="$(floor_entries "${MSG_RUNTIME}")"
+entries_before="$(floor_entries_any "${TOO_OLD_LABEL}")"
+same_before="$(floor_entries "${MSG_RUNTIME}" "${TOO_OLD_LABEL}")"
 shutdown_before="$(count_log "${RECHECK_SHUTDOWN_LINE}")"
 log_before="$(line_count "${SLACK_STATE_DIR}/server.log")"
 ad_lines_before="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
@@ -881,7 +887,7 @@ time_at_most "$(seconds_between "${T_SWAP}" "${T_EXIT}")" "${RECHECK_WAIT_S}" ||
 _scenario_cscb_after || fail "8c: could not update the CSCB process record"
 expect_count "${RECHECK_SHUTDOWN_LINE}" "$(( shutdown_before + 1 ))" "8c: the re-check's shutdown line"
 [[ "${MSG_RUNTIME}" == *"${RUNTIME_PHRASE}"* ]] || fail "8c: the runtime floor message lacks RUNTIME_RECHECK_PHRASE"
-expect_one_floor_entry "8c" "${MSG_RUNTIME}" "${same_before}" "${entries_before}"
+expect_one_floor_entry "8c" "${MSG_RUNTIME}" "${same_before}" "${entries_before}" "${TOO_OLD_LABEL}"
 expect_counts_unchanged "8c: after the swap" touch_8c
 # Recorded, not asserted: what CSCB's calls met while 0.10.0 sat behind the shim.
 echo "${TEST_NAME}: 8c: agent-director calls after the swap: $(tail -n "+$(( ad_lines_before + 1 ))" "${SCENARIO_AD_SHIM_LOG}" | awk -F'\t' '$1 == "call" { print $6 }' | awk '{ print $1 }' | sort | uniq -c | tr -s ' \n' ' ')"
@@ -1003,8 +1009,8 @@ declare -A touch_8e=()
 cscb_counts touch_8e
 n_reuse="$(cscb_ad_count spawn --reuse-finished)"
 n_version="$(cscb_ad_count version)"
-entries_before="$(floor_entries_any)"
-same_before="$(floor_entries "${MSG_RUNTIME}")"
+entries_before="$(floor_entries_any "${TOO_OLD_LABEL}")"
+same_before="$(floor_entries "${MSG_RUNTIME}" "${TOO_OLD_LABEL}")"
 shutdown_before="$(count_log "${RECHECK_SHUTDOWN_LINE}")"
 failed_before="$(count_log "${REUSE_FAILED_FRAGMENT}")"
 start_server --live
@@ -1052,13 +1058,13 @@ awk -v a="$(seconds_between "${T_GATE}" "${T_EXIT}")" -v b="${RECHECK_S}" 'BEGIN
     || fail "8e: the server exited $(seconds_between "${T_GATE}" "${T_EXIT}")s after the gate, not less than ${RECHECK_S}s"
 _scenario_cscb_after || fail "8e: could not update the CSCB process record"
 expect_count "${RECHECK_SHUTDOWN_LINE}" "$(( shutdown_before + 1 ))" "8e: the re-check's shutdown line"
-expect_one_floor_entry "8e" "${MSG_RUNTIME}" "${same_before}" "${entries_before}"
+expect_one_floor_entry "8e" "${MSG_RUNTIME}" "${same_before}" "${entries_before}" "${TOO_OLD_LABEL}"
 expect_counts_unchanged "8e: after the stop" touch_8e kill kill-finished delete pause
 swap_ad_binary release "8e: the release back behind the shim"
 expect_finished "8e: after the stop"
 
 # ---------------------------------------------------------------------------
-# 23a: the floor's release-candidate form passes the gate and launches
+# 23a: a prerelease above the floor passes the gate and launches
 # ---------------------------------------------------------------------------
 
 leg 23a

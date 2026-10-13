@@ -157,7 +157,7 @@ import {
   makeStubResolveSystemBinary,
   type StubResolveSystemBinaryOutcome,
 } from './test-helpers/agent-director-stub.ts'
-import { CLIENT_MIN_VERSION, OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import { CLIENT_MIN_VERSION, DEV_PLACEHOLDER_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { assertNoLeak, LEAK_SENTINEL, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
@@ -385,10 +385,10 @@ describe('b.jg5 SRJ-1013, SRJ-208 (hatch A3): ad-below-phase1-floor and ad-syste
   test('below the floor, at the startup gate: one entry naming the version found, the floor, the binary path, that the startup check found it, and the switch-over runbook sentence with its section', async () => {
     const path = binaryPath()
 
-    await startupGate(makeStubCreateClient({ client: makeStubClient({ binaryVersion: OLD_AD_VERSION, binaryPath: path }) }))
+    await startupGate(makeStubCreateClient({ client: makeStubClient({ binaryVersion: DEV_PLACEHOLDER_VERSION, binaryPath: path }) }))
 
     const text = onlyEntry(logDir, AD_BELOW_PHASE1_FLOOR)
-    expectNames(text, [OLD_AD_VERSION, PHASE1_FLOOR_VERSION, path, PHASE1_SWITCH_OVER_INSTRUCTION, PHASE1_RUNBOOK_SECTION_TITLE], [RUNTIME_RECHECK_PHRASE, DEBUG_SKILL_PATH])
+    expectNames(text, [DEV_PLACEHOLDER_VERSION, PHASE1_FLOOR_VERSION, path, PHASE1_SWITCH_OVER_INSTRUCTION, PHASE1_RUNBOOK_SECTION_TITLE], [RUNTIME_RECHECK_PHRASE, DEBUG_SKILL_PATH])
     expectNoUpgradeForm(text)
     assertNoLeak(writtenFile(join(logDir, LOG_NAME)))
   })
@@ -396,10 +396,10 @@ describe('b.jg5 SRJ-1013, SRJ-208 (hatch A3): ad-below-phase1-floor and ad-syste
   test('below the floor, at a runtime re-check: one entry naming the version found, the floor, the binary path, the runtime phrase, that this release requires Phase 1 and the debug skill; neither the runbook nor the install skill', async () => {
     const path = binaryPath()
 
-    await runtimeRecheck({ version: OLD_AD_VERSION, path })
+    await runtimeRecheck({ version: DEV_PLACEHOLDER_VERSION, path })
 
     const text = onlyEntry(logDir, AD_BELOW_PHASE1_FLOOR)
-    expectNames(text, [OLD_AD_VERSION, PHASE1_FLOOR_VERSION, path, PHASE1_REQUIRED_PHRASE])
+    expectNames(text, [DEV_PLACEHOLDER_VERSION, PHASE1_FLOOR_VERSION, path, PHASE1_REQUIRED_PHRASE])
     expectRuntimeEntryPointsToDebugSkill(text)
     assertNoLeak(writtenFile(join(logDir, LOG_NAME)))
   })

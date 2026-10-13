@@ -24,6 +24,10 @@
  *      before the client is installed as the singleton: a refused client is
  *      closed once and never installed. `runStartupGate`'s `skipPhase1Floor`
  *      option leaves this step out; the client's too-old refusal still runs.
+ *      The released 0.12.0 client admits `0.0.0-dev`, which reaches this
+ *      refusal; ordinary versions and prereleases below 0.12.0 fail step 2.
+ *      An unparseable probe also fails step 2, as unreachable. Step 3 keeps
+ *      failing closed on inconsistent injected or stale-client results.
  *   3.5. API surface probes (SR-6.1 publish-skew defense)  — short-circuit,
  *      run in order: probeGetPermission (ad-shim-missing-get-permission) →
  *      probeErrorCatalog (ad-shim-catalog-incomplete) → probeDecideArgv
@@ -360,6 +364,8 @@ export interface StartupGateOptions {
    * refusal, the API-surface probes and the same-user check still run. Only
    * `stop --stop-bots`'s client initialization is meant to set it; the
    * server's start and `clean_restart` always run the floor.
+   * With the released 0.12.0 client, this admits its `0.0.0-dev` sentinel
+   * for teardown; it cannot admit an older released binary.
    */
   skipPhase1Floor?: boolean
   /**
@@ -474,8 +480,10 @@ async function constructClient(
 /**
  * Step 3, shared by the gate and the persona client: CSCB's Phase 1 floor
  * (b.jg5 SRJ-203) on a client that is not installed yet. `Client.create()`
- * enforces only the client's own minimum, which sits below the floor and
- * admits `0.0.0-dev`. Below the floor or unparseable: the client is closed
+ * enforces the client's own minimum, now 0.12.0, but admits `0.0.0-dev`.
+ * That sentinel is the released client's reachable floor refusal. Below
+ * the floor or unparseable results from an injected or stale client still
+ * fail closed: the client is closed
  * once and the `ad-below-phase1-floor` outcome is answered; otherwise
  * `undefined`.
  */

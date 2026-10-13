@@ -34,8 +34,8 @@
  *   FLOOR="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" PHASE1_FLOOR_VERSION)" \
  *       || fail "fmk-texts: PHASE1_FLOOR_VERSION"
  *   STOP_MSG="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" \
- *       buildBelowPhase1FloorMessage "${OLD_VERSION}" "${BIN_PATH}" runtime)" \
- *       || fail "fmk-texts: buildBelowPhase1FloorMessage"
+ *       buildSystemInstallTooOldMessage "${OLD_VERSION}" "${BIN_PATH}" runtime)" \
+ *       || fail "fmk-texts: buildSystemInstallTooOldMessage"
  *
  * A command substitution drops trailing newlines. No value below ends with
  * one but CONFLICT_NOTICE_LINE_SEPARATOR, which is one; an entry whose value
@@ -57,7 +57,11 @@
  * ENTRIES (each named after its `src/` export)
  * -------
  *   PHASE1_FLOOR_VERSION                         src/ad-version-gate.ts, the Phase 1 floor
- *   AD_BELOW_PHASE1_FLOOR                        src/install-check-labels.ts, the class label
+ *   AD_BELOW_PHASE1_FLOOR                        src/install-check-labels.ts, sentinel guard class
+ *   AD_SYSTEM_INSTALL_TOO_OLD                   src/install-check-labels.ts, native minimum class
+ *   AD_CLIENT_MINIMUM                           src/install-check.ts, installed SDK minimum
+ *   buildSystemInstallTooOldMessage <found-version> <binary-path> <startup|runtime>
+ *                                               src/ad-version-gate.ts, startup block included
  *   buildBelowPhase1FloorMessage <found-version> <binary-path> <startup|runtime>
  *                                                src/ad-version-gate.ts, the floor message;
  *                                                `startup` and `runtime` select the package's
@@ -1254,6 +1258,37 @@ const belowPhase1FloorMessage: Entry = {
     const foundBy = await packageString(context, 'ad-version-gate.ts', foundByExport)
     const build = await packageFunction<(parts: object, foundBy: string) => unknown>(context, 'ad-version-gate.ts', entry)
     return builtString(entry, build({ foundVersion, binaryPath }, foundBy))
+  },
+}
+
+/** The installed client's actual minimum, without running its resolver. */
+const clientMinimumVersion: Entry = {
+  synopsis: '',
+  async print(args, context) {
+    expectArguments('AD_CLIENT_MINIMUM', args, [])
+    const read = await packageFunction<() => unknown>(context, 'install-check.ts', 'readClientMinVersion')
+    return builtString('AD_CLIENT_MINIMUM', read())
+  },
+}
+
+/** Native too-old refusal, including the startup gate's instruction block. */
+const systemInstallTooOldMessage: Entry = {
+  synopsis: '<found-version> <binary-path> <startup|runtime>',
+  async print(args, context) {
+    const entry = 'buildSystemInstallTooOldMessage'
+    expectArguments(entry, args, ['found-version', 'binary-path', 'startup|runtime'])
+    const [foundVersion, binaryPath, finder] = args
+    const foundByExport = Object.hasOwn(FOUND_BY_EXPORTS, finder) ? FOUND_BY_EXPORTS[finder] : undefined
+    if (foundByExport === undefined) usageFail(`${entry}: the finder must be startup or runtime (got '${finder}')`)
+    const foundBy = await packageString(context, 'ad-version-gate.ts', foundByExport)
+    const requiredVersion = await clientMinimumVersion.print([], context)
+    const build = await packageFunction<(parts: object, foundBy: string) => unknown>(context, 'ad-version-gate.ts', entry)
+    let message = builtString(entry, build({ foundVersion, binaryPath, requiredVersion }, foundBy))
+    if (finder === 'startup') {
+      const render = await packageFunction<() => unknown>(context, 'install-skill-pointer.ts', 'renderInstallSkillInstructions')
+      message += builtString(entry, render())
+    }
+    return message.replace(/\r?\n/g, ' ').replace(/\r/g, ' ')
   },
 }
 
@@ -3906,6 +3941,9 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   PHASE1_FLOOR_VERSION: constantEntry('ad-version-gate.ts', 'PHASE1_FLOOR_VERSION'),
   AD_BELOW_PHASE1_FLOOR: constantEntry('install-check-labels.ts', 'AD_BELOW_PHASE1_FLOOR'),
   buildBelowPhase1FloorMessage: belowPhase1FloorMessage,
+  AD_SYSTEM_INSTALL_TOO_OLD: constantEntry('install-check-labels.ts', 'AD_SYSTEM_INSTALL_TOO_OLD'),
+  AD_CLIENT_MINIMUM: clientMinimumVersion,
+  buildSystemInstallTooOldMessage: systemInstallTooOldMessage,
   RUNTIME_RECHECK_PHRASE: constantEntry('ad-version-gate.ts', 'RUNTIME_RECHECK_PHRASE'),
   AD_VERSION_RECHECK_INTERVAL_MS: constantEntry('ad-version-gate.ts', 'AD_VERSION_RECHECK_INTERVAL_MS'),
   AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX: constantEntry('ad-version-gate.ts', 'AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX'),

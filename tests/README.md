@@ -295,7 +295,7 @@ tests/
                                    # (`operator_actions`); the find-missing loop's runs, interval and parent (`find_missing_loop`); fmk-driver.ts's three
                                    # forced calls, each one `DRIVER: FORCED` line with every call during its run parented by the driver (`fmk_driver_reuse_spawn`,
                                    # `fmk_driver_read_pane`, `fmk_driver_resume`); the 0.10.0 seeders in a nested run started on 0.10.0, their rows
-                                   # surviving `install_ad_release` and each seeder's refusals (`seeders_010`); and, last, the tmux server restart and socket
+                                   # quiesced before `install_ad_release`, retaining exact terminal states and metadata after migration, and each seeder's refusals (`seeders_010`); and, last, the tmux server restart and socket
                                    # re-bind (`tmux_server_steps`). The re-fire legs wait out agent-director's default G (60 s); only after them does
                                    # `store_statements` write a `[tmux]` table (`starting_session_seconds = 60`, `stopping_window_seconds = 30`), so the
                                    # kill need not wait 300 s. It runs about two and a half minutes and ends with the three closing assertions
@@ -305,7 +305,7 @@ tests/
                                    # package's README through `switch-over.ts steps`, with only SRJ-1402's declared substitutions; leg A's checks follow step 10's live
                                    # start. After step 11, leg B runs the new CLI's `clean_restart` on Phase 1 (each persona back through a collision then `resume`,
                                    # its conversation kept, its row `pending` until it reports in) and leg C puts 0.10.0 behind the shim and checks that `start --live`
-                                   # refuses it once (one `ad-below-phase1-floor` entry, nothing at the Slack stub, only `version` calls), then puts the release
+                                   # refuses it once (one `ad-system-install-too-old` entry, nothing at the Slack stub, only `version` calls), then puts the release
                                    # back (see Scenario 1: the switch-over (Test 13)).
                                    # Its host files sit under SCENARIO_ROOT/host: the switch-over log (holding the operator's go-ahead), the staged persona
                                    # configuration, the crontable's prompt files, the `/interject` caller file, the token variables file, the store backup
@@ -655,6 +655,8 @@ is one script, named here; scenario 14 has no script, and scenario 17 is a
 closing assertion of every fmk script. Test 0 is the harness's
 self-check, not a scenario.
 
+Migration fixtures stop all workers and sessions with the still-installed CLI, reconcile every row to `ended` or `missing`, and verify those exact terminal states and metadata survive the released installer. Any later live coverage rebuilds its fixtures after upgrade; no agent runs across installation.
+
 Compatibility fixtures driving pre-0.12.0 agent-director releases must keep
 that release's original flags, schema, result keys and install layout;
 version and schema guards must precede old-release seed calls. Switch to
@@ -904,7 +906,7 @@ installed package's `PHASE1_FLOOR_VERSION`. Each check is its own `fail`:
 
 - `start` exits non-zero, with its server-failed line;
 - it alerts once: exactly one new `startup-errors.log` entry, the
-  `ad-below-phase1-floor` entry naming 0.10.0 and the Phase 1 floor, and
+  `ad-system-install-too-old` entry naming 0.10.0, the client minimum and the Phase 1 floor, and
   exactly one new `server.log` line carrying that label and matching it;
 - the stub's record has no new line: no `auth.test`, no
   `apps.connections.open`, no WebSocket and no post;
@@ -1938,8 +1940,8 @@ script's header comment is its full specification.
 
 | Scenario | Script | Sites | Outcomes checked | Modes, helpers and settings |
 |---|---|---|---|---|
-| 16 (b.jg5 SRJ-1417, SRJ-714; AC 1, AC 64) | `test-14-fmk-kill-fails.sh` (leg 0, its first) | An upgrade's first start sweep (`reconcileOrphans`) over rows seeded on 0.10.0 before `install_ad_release`: two pre-persona rows A and B (a `channel` label, no `persona` label, named as the pre-persona package names them, workers reporting in at once); persona P's own row (`cscb_<P key>`, its `persona` label, a working directory other than P's configured one, a worker that never reports in), which after the migration reads `pending` with no launch start (SRJ-513, SRJ-1020); and absent persona Q's live row. `config.json` names P (a Slack destination) and not Q | CSCB makes no `delete`, and every seeded row is present afterwards (harness `get`). The pass's retry budget, with A, B and Q in the order CSCB first killed them (not `list` order): the first whose kill failed makes exactly `KILL_RETRY_TRIES` kills and each later one exactly 1. A's kill: each of its tries answers `ErrTmuxKillFailed`, its session still runs, and exactly one `orphan-cleanup` startup-errors entry names A's row, state, session and class (the pre-persona row's head, then the alert's ordinary version in its start-sweep form), with one server-log line of it and nothing about A in the Slack stub's record. B's and Q's outcomes are logged as `NOTE:` lines, not asserted: the release answers `ErrTmuxKillFailed`, with no kill sent, for a session a 0.10.0 launch made, which carries no label the release reads; each either succeeded (the sweep's per-row line, no entry, its session gone) or did not (exactly one entry, its session still running). Every running stub worker is in a session a row of the harness's `list` records, and at least A's and P's workers are found running. P latches from its own listed row, with exactly one launch-start-not-recorded post at P's destination and no CSCB kill of P's row. Q's key is in the retired-key record with cause `absent-at-start`. The sweep's summary line gives its counts. After the leg the harness plays the operator acting on the alerts: it ends each old worker's session by its session id and runs `find-missing` until A's, B's, Q's and P's rows read finished, so no later start sweeps them live | tmux-shim `fail-kill` limited to A's session name, session id and pane id (`tmux_shim_mode fail-kill --targets`) (a guard: the release sends no kill for a 0.10.0-launched session; kills aimed at A's targets are logged), `log` once the sweep's summary line is logged; the seeders `seed_prepersona_fleet` (A, B) and `seed_010_row` (P, Q) on 0.10.0 (`SCENARIO_AD_START=0.10.0`) before `install_ad_release`; stub modes `at-once` (A, B and Q) and `silent` (P); agent-director's default settings; `health_check_interval` 0; values from `fixtures/fmk-texts.ts`; posts from the Slack stub's record |
-| 2 (b.jg5 SRJ-1403; AC 24, AC 64) | `test-14-fmk-kill-fails.sh` | The start sweep (a persona removed while its worker runs); a `config_dir` mismatch, met at the collision ladder's `pending` branch (SRJ-411) by a start; a `cwd` mismatch, met by a running server's first pending-only retry. `resume_enabled=false` is not driven here: SRJ-1403 leaves it, with `ErrSpawnNotResumable` with dead evidence, to SRJ-110's unit test (dead evidence means the session is gone, so agent-director's kill sends no kill for the shim to fail) | Every kill try answers `ErrTmuxKillFailed`, `KILL_RETRY_TRIES` tries; no CSCB delete or launch (spawn or resume) of the leg's id follows; the row is kept (read afterwards, present). One alert is routed per SRJ-704: at the start sweep, one `orphan-cleanup` startup-errors entry and one server-log line, nothing to Slack; at a `config_dir` or `cwd` mismatch, one ordinary alert at the persona's destination, quoting agent-director's description, and no second alert through one further retry (no post of any text at the destination for a hold of at least 5 s and at least twice the first alert's latency plus 5 s, and the same count just before the leg's stop). No `tmux-unresponsive` post and no `tmux-unresponsive` started line (for the start sweep, for any persona) (SRJ-307) | tmux-shim `fail-kill` for the kills checked (`log` while a leg launches); stub modes `dev-channels` (reporting, the start sweep's persona) and `silent` (the mismatch personas, whose rows stay `pending`); the mismatch made by re-pointing a symlinked directory (`repoint_symlink`); agent-director's default settings, no `config.toml`, so `kill_exit_wait_ms` is its default, 5000 ms, measured (slowest exit 603 ms), and the retry makes 3 tries 2 s apart; `health_check_interval` 0; starts on 0.10.0 (`SCENARIO_AD_START=0.10.0`), with scenario 16's seeding before `install_ad_release`, so legs 1 to 3 run on the release; values from `fixtures/fmk-texts.ts`; posts from the Slack stub's record |
+| 16 (b.jg5 SRJ-1417, SRJ-714; AC 1, AC 64) | `test-14-fmk-kill-fails.sh` (leg 0, its first) | Seed legacy rows A, B, P and Q on 0.10.0; end all workers with the old CLI and reconcile every row to `ended` or `missing` before `install_ad_release`. Verify migration preserves identity, session name, labels and exact terminal state, then rebuild released live fixtures with `--reuse-finished` using the migrated ids and session names. P's `pending` state without a launch start is injected only after upgrade | The first start sweep keeps all rows and performs bounded kills; A's current released launch owns its session, so targeted `fail-kill` drives every retry and the orphan-cleanup alert. P latches without a CSCB kill; Q is retired as absent at start. Cleanup ends fixture sessions and reconciles rows before later legs | Released live fixtures after quiescent migration; targeted tmux `fail-kill` for A; `at-once` workers for A, B and Q, `silent` for P; no worker crosses the installer |
+| 2 (b.jg5 SRJ-1403; AC 24, AC 64) | `test-14-fmk-kill-fails.sh` | The start sweep (a persona removed while its worker runs); a `config_dir` mismatch, met at the collision ladder's `pending` branch (SRJ-411) by a start; a `cwd` mismatch, met by a running server's first pending-only retry. `resume_enabled=false` is not driven here: SRJ-1403 leaves it, with `ErrSpawnNotResumable` with dead evidence, to SRJ-110's unit test (dead evidence means the session is gone, so agent-director's kill sends no kill for the shim to fail) | Every kill try answers `ErrTmuxKillFailed`, `KILL_RETRY_TRIES` tries; no CSCB delete or launch (spawn or resume) of the leg's id follows; the row is kept (read afterwards, present). One alert is routed per SRJ-704: at the start sweep, one `orphan-cleanup` startup-errors entry and one server-log line, nothing to Slack; at a `config_dir` or `cwd` mismatch, one ordinary alert at the persona's destination, quoting agent-director's description, and no second alert through one further retry (no post of any text at the destination for a hold of at least 5 s and at least twice the first alert's latency plus 5 s, and the same count just before the leg's stop). No `tmux-unresponsive` post and no `tmux-unresponsive` started line (for the start sweep, for any persona) (SRJ-307) | tmux-shim `fail-kill` for the kills checked (`log` while a leg launches); stub modes `dev-channels` (reporting, the start sweep's persona) and `silent` (the mismatch personas, whose rows stay `pending`); the mismatch made by re-pointing a symlinked directory (`repoint_symlink`); agent-director's default settings, no `config.toml`, so `kill_exit_wait_ms` is its default, 5000 ms, measured (slowest exit 603 ms), and the retry makes 3 tries 2 s apart; `health_check_interval` 0; starts on 0.10.0 (`SCENARIO_AD_START=0.10.0`), with scenario 16's seeding quiesced before `install_ad_release` and its live fixtures rebuilt afterwards, so legs 1 to 3 run on the release; values from `fixtures/fmk-texts.ts`; posts from the Slack stub's record |
 | 15 (b.jg5 SRJ-1417, SRJ-715; AC 1, AC 64) | `test-14-fmk-kill-fails.sh` (leg 4, after scenario 2's legs) | A persona removal's teardown: persona R (a Slack destination, its worker reporting in) is up and its row `waiting`; the operator removes R from `config.json` and confirms the apply by renaming the pending file to the apply file (README "Reload") | R's teardown kill: each of its `KILL_RETRY_TRIES` tries answers `ErrTmuxKillFailed`, its tries ending exhausted; exactly one `persona-teardown-notice` startup-errors entry naming R, carrying the alert's ordinary version with the log-only closing sentence, and one server-log line of it; no CSCB delete; R's row present; R's key in the retired-key record with cause `removed`; nothing about R in the Slack stub's record after the edit, no `tmux-unresponsive` post and no `tmux-unresponsive` started line for R's key | tmux-shim `fail-kill` limited to R's session name, session id and pane id (`tmux_shim_mode fail-kill --targets`), `log` at the leg's end; stub mode `dev-channels`; agent-director's default settings; `health_check_interval` 0; values from `fixtures/fmk-texts.ts`; posts from the Slack stub's record |
 | 6 (b.jg5 SRJ-1408, SRJ-702; AC 1, AC 56) | `test-18-fmk-wedged.sh` | Personas A and B (kept) and X1, X2 and X3, each with its own key, credentials, channel (its Slack destination) and directories, launched in `log` until each row reads `waiting`. The harness plays the operator: a plain `stop` (every worker keeps running and every row stays live), X1 to X3 removed from `config.json`, the last-applied record moved aside (so the next start applies `config.json` as it stands), `wedge`, then a live start. Section 1 is that start's sweep (`reconcileOrphans`): the release's `list` is a store read with no tmux call, so it lists all five rows and reaches the kills of X1 to X3's live rows. Section 2 is A's and B's condition: their rows are kept, the start pass's plain spawns collide and route to `get`, and the start pass and each retry run the reconnect (a pane read, then `/mcp reconnect`), whose tmux verbs are refused; the first refusal starts the persona's `tmux-unresponsive` condition and arms its retry timer, whose retries fall at 30, 90, 210, 450 and 750 s after it. The onset falls due at the first retry at least `TMUX_UNRESPONSIVE_ONSET_FLOOR_MS` after the first refusal and the alert once the threshold has passed; `wedge` is kept until both alerts have posted, so the retry at 450 s is the first after the unwedge | Section 1: the sweep's summary line reads 5 listed, none killed, 5 kept with 3 kills failed, 3 keys recorded as retired and none left for a latch; the first swept row gets exactly `KILL_RETRY_TRIES` (3) CSCB `kill` calls, its per-try lines (`killRetryTryLine`) ending `KILL_RETRY_NEXT_AGAIN` and then, on the last, `KILL_RETRY_NEXT_EXHAUSTED`, and each later row exactly 1, its one per-try line ending `KILL_RETRY_NEXT_BUDGET_SPENT` (the pass's retries are spent); the sweep's duration, from its CSCB `list` carrying the `service` label (read from the agent-director shim's log, as the sweep logs no start line) to its summary line, is at most (3 + the later rows) × CSCB's agent-director call timeout + 2 × `KILL_RETRY_SPACING_MS`, 304 s at the defaults (the measured duration is logged); CSCB makes no `delete`, and every X row is present (harness `get`). Section 2, for each of A and B: exactly one `tmux-unresponsive` started line; at most one onset post and none after its alert; exactly one alert, posted more than the alert threshold (360 s at agent-director's defaults) after the first refusal, and exactly one recovery, posted after the unwedge, each at the persona's destination as the persona notifier's prefix and then the printer's body; no restart-cap notice, cap-reached line, retry entry's cap-skip line or retry timer stopped at the cap (SRJ-305); CSCB calls naming its id continue after its alert; no CSCB `kill`, `delete`, `resume` or reuse spawn naming its id, and the start pass's one plain spawn is the only `spawn` naming it (no relaunch); its row is present. Logged as `NOTE:` lines, not asserted: each persona's CSCB calls by verb, whether its onset posted, every post at its destination (after the recovery the stub's answered dev-channels dialog is still on its screen, so CSCB posts its *Waiting on a prompt* notice, a limit of the stub that the SRD leaves open) and the status reads between the first swept row's tries. Ends with the three closing assertions | tmux-shim `log` while the personas launch, `wedge` (its default 60 s delay, longer than every tmux call timeout at agent-director's defaults) from just before the wedged start until both alerts have posted, then `log`; stub mode `dev-channels`; agent-director's default settings, no `config.toml` (alert threshold `adAlertThresholdMs` of the defaults); CSCB's agent-director call timeout at its default (`DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS`); `health_check_interval` 0 in `config.json`, so no health tick runs; the release start (`SCENARIO_AD_START` unset); live starts against the Slack stub; values from `fixtures/fmk-texts.ts`; posts from the Slack stub's record |
 | 7 (b.jg5 SRJ-1409, SRJ-707, SRJ-708, SRJ-711, SRJ-712, SRJ-413, SRJ-716; AC 1) | `test-19-fmk-reuse.sh` | First a harness check of the two harness additions on a stub the harness starts itself (`seed_unlabelled`, no agent-director and no CSCB process): in `transcript-on-first-message` no transcript exists at its dialog, nor after Enter reports it in, nor for 2 s after a typed `/exit`; one exists once a line is typed, the typed exit sentinel ends it, and `stub_type_line` aimed at a missing pane fails. Then two legs, each with its own persona: E with `resume_enabled=false`, and F with a missing transcript (`resume_enabled` true). Each persona's first life comes up (`waiting`); the harness types the exit sentinel, so the row reads `ended`; in leg F the harness unlinks the transcript file, the path under `SCENARIO_ROOT` that the row's `jsonl_path` names. The persona's directory is switched to `transcript-on-first-message`, then a plain `stop` and a start: CSCB's spawn collides with the finished row and, in E, reuses it with no `resume`; in F, CSCB's `resume` meets `ErrJsonlMissing`, the lost-transcript diagnosis runs, then the reuse spawn | A background harness `get`, started before the start, reads `pending` with a `launch_started_at`, then `waiting`, and no `waiting` before it. Exactly one CSCB-parented `spawn` of the persona's id carrying `--reuse-finished` (the agent-director shim's argv) after the leg's mark. E: no CSCB `resume`. F: a CSCB `resume`, and exactly one lost-transcript diagnosis line for the id, logged no later than the reuse spawn's call. A harness `get`'s `prior_sessions` does not hold the first life's session id. Exactly one server-log `pre_trust` line for the reuse spawn, with value `ok`. CSCB makes no `delete`, and the row is present. Then, with the server stopped by a plain `stop` and the new life ended by the exit sentinel before any message, the harness's own `resume` of the id (`ad_capture`) exits non-zero answering `ErrJsonlNeverWritten`, and the row is present. Logged as `NOTE:` lines, not asserted: each leg's CSCB calls of its id by verb, the new life's session id and `transcript_status`, the diagnosis's verdict (its startup-errors entries) and how many reads saw `pending`. Scenario 12's legs follow (next row), then scenario 18's, then the three closing assertions | Stub modes `dev-channels` (each first life) and `transcript-on-first-message` (each new life; a harness addition); `stub_type_line` with `STUB_EXIT_SENTINEL` (harness additions); each persona's `claude_config_dir` holding a `.claude.json` of `{}`, so agent-director's pre-trust answers `ok`; agent-director's default settings, no `config.toml`; `health_check_interval` 0 and `session_restart_delay` 0 in `config.json`; between legs `config.json` rewritten and the last-applied record moved aside while the server is stopped; the release start (`SCENARIO_AD_START` unset); live starts against the Slack stub; values from `fixtures/fmk-texts.ts` |
@@ -2009,7 +2011,7 @@ step; every other change replaces only the binary behind it:
 | 8a | 0.10.0 (`swap_ad_binary 0.10.0`), then the release |
 | 8b | the release; nothing at the standard path (`hide_ad_install` moves the shim and the binary aside, and no `agent-director` is on the server's PATH); the stand-in reporting no parseable version (`restore_ad_install_with_stand_in unparseable pass`); the release |
 | 8c | 0.10.0, then the release once the server has stopped |
-| 8d | the passing wrapper (`install_ad_stand_in <floor>-rc.1 reject`), then the release |
+| 8d | the passing wrapper (`install_ad_stand_in <next-patch-above-floor>-rc.1 reject`), then the release |
 | 8e | the release; the below-floor stand-in (`install_ad_stand_in <0.10.0's version> reject`) once the start-pass launch has failed; the release once the server has stopped |
 
 The legs run in order, each on the state the one before left:
@@ -2017,8 +2019,8 @@ The legs run in order, each on the state the one before left:
 - 8a, refused start. With 0.10.0 behind the shim (its version read with a
   harness `version` call and kept for 8e), a live `start` fails: the CLI
   reports the daemon's non-zero exit, and exactly one
-  `ad-below-phase1-floor` entry equals the startup form of the floor message
-  for that version and the binary's path, with its one server-log line. The
+  `ad-system-install-too-old` entry equals the startup form of the client-minimum message
+  for that version, the client minimum and the binary's path, with its one server-log line. The
   start makes no spawn, resume, kill, `kill-finished`, delete or pause call,
   no new tmux session and no new Slack stub record line (no Slack
   connection).
@@ -2033,7 +2035,7 @@ The legs run in order, each on the state the one before left:
 - 8c, a swap stops the server. Within the re-check interval plus 10 s of the
   swap to 0.10.0 (`health_check_interval` 0), the server exits with its
   re-check shutdown line (a non-zero exit) and exactly one new entry, equal to the runtime form
-  of the floor message (it carries the runtime re-check phrase and points to
+  of the `ad-system-install-too-old` message (it carries the runtime re-check phrase and points to
   the debug skill), with its one server-log line. No CSCB kill,
   `kill-finished`, pause, delete, spawn or resume follows the swap. With the
   release back, P's worker process and session are alive and its row's
@@ -2065,7 +2067,7 @@ The legs run in order, each on the state the one before left:
   first timed re-check (the script fails saying so when it is not); its
   `ErrInvalidFlags` is directly followed by a bot-server probe, and the server
   exits with its re-check shutdown line (a non-zero exit) and exactly one
-  more entry, the runtime form for 0.10.0's version,
+  more `ad-system-install-too-old` entry, the runtime form for 0.10.0's version and the client minimum,
   all less than the re-check interval after the gate. No CSCB kill,
   `kill-finished`, delete or pause follows, and P's row stays finished.
 
@@ -2084,8 +2086,9 @@ Why the legs are built this way:
 - The below-floor binary is a stand-in reporting 0.10.0's own version (read
   in 8a): a real 0.10.0 answers `ErrSchemaMismatch` on the migrated store
   before it parses flags, so it never answers `ErrInvalidFlags`.
-- The passing wrapper reports the floor with an `-rc.1` tag. CSCB compares
-  only major.minor.patch against the floor (b.jg5 SRJ-202), so it passes;
+- The passing wrapper reports the next patch above the floor with an
+  `-rc.1` tag (`0.12.1-rc.1` for floor `0.12.0`), so both the native
+  client minimum and CSCB's numeric comparison admit it;
   the release put back reads as a different version string, which ends the
   hold.
 - With `reject`, the stand-in turns `--reuse-finished` into a flag the
@@ -2101,8 +2104,9 @@ package (see The value printer):
 | Value | Printer entry | `src/` |
 |---|---|---|
 | The Phase 1 floor | `PHASE1_FLOOR_VERSION` | `src/ad-version-gate.ts` |
-| The entry's class label | `AD_BELOW_PHASE1_FLOOR` | `src/install-check-labels.ts` |
-| The floor message, startup and runtime forms | `buildBelowPhase1FloorMessage <version> <path> <startup\|runtime>` | `src/ad-version-gate.ts` |
+| The entry's class label | `AD_SYSTEM_INSTALL_TOO_OLD` | `src/install-check-labels.ts` |
+| The client's actual minimum | `AD_CLIENT_MINIMUM` | `src/install-check.ts` |
+| The client-minimum message, startup and runtime forms (including the startup instruction block) | `buildSystemInstallTooOldMessage <version> <path> <startup\|runtime>` | `src/ad-version-gate.ts`, `src/install-skill-pointer.ts` |
 | The runtime re-check phrase | `RUNTIME_RECHECK_PHRASE` | `src/ad-version-gate.ts` |
 | The re-check interval | `AD_VERSION_RECHECK_INTERVAL_MS` | `src/ad-version-gate.ts` |
 | The re-check stop's exit status (checked non-zero) | `AD_VERSION_RECHECK_STOP_EXIT_CODE` | `src/ad-version-gate.ts` |
@@ -2124,7 +2128,7 @@ collision, reuse-failed and reuse-spawned lines
 
 Scenario 23's legs run in Test 20 after scenario 8's and before the three
 closing assertions, on the same set-up, persona and config. They show that
-CSCB launches on the floor's release-candidate form, refuses the development
+CSCB launches on the next patch above the floor with a release-candidate tag, refuses the development
 builds `0.0.0-dev` and `dev` at startup, launching nothing, and judges the
 binary's version (the client's `binaryVersion`), never the client's package
 version (PRD AC 11). Each stand-in goes behind the shim with
@@ -2134,12 +2138,12 @@ three legs take a few seconds of Test 20's run.
 
 | Leg | Behind the shim, in order |
 |---|---|
-| 23a | the stand-in reporting the floor's release-candidate form (`install_ad_stand_in <floor>-rc.1 pass`), then the release once the server has stopped |
+| 23a | the stand-in reporting the next patch above the floor with a release-candidate tag (`install_ad_stand_in <next-patch-above-floor>-rc.1 pass`), then the release once the server has stopped |
 | 23b | the stand-in reporting the client's development sentinel (`install_ad_stand_in 0.0.0-dev pass`), then the release |
 | 23c | the stand-in reporting `dev` (`install_ad_stand_in dev pass`), then the release |
 
 - 23a, the release-candidate form launches. With the server stopped and P's
-  row finished (from 8e), the stand-in reporting the floor with an `-rc.1`
+  row finished (from 8e), the stand-in reporting the next patch above the floor with an `-rc.1`
   tag goes behind the shim in `pass` mode, handing every call to the
   release, and a harness `version` call reads it. The server starts: the
   gate passes (the bot server's first probe; the server keeps running), at
@@ -2174,12 +2178,12 @@ start (the shim log is read whole, since the refused daemon never wrote its
 PID file), no new tmux session and no new stub record line.
 
 The image holds the 0.12.0 release and no release candidate, so 23a runs on
-the stand-in reporting `<floor>-rc.1`, the form 8d's passing wrapper
+the stand-in reporting `<next-patch-above-floor>-rc.1`, the form 8d's passing wrapper
 reports. `dev` is not a CSCB constant: the script quotes it, citing b.jg5
 SRJ-202 and HO §7 scenario 23.
 
 Matched values, each printed by `fixtures/fmk-texts.ts` from the installed
-package, beside scenario 8's floor, floor label and floor message:
+package, beside scenario 8's floor, client-minimum label and client-minimum message:
 
 | Value | Printer entry | `src/` |
 |---|---|---|
@@ -2538,6 +2542,9 @@ builder's output for the given arguments.
 |---|---|---|
 | `PHASE1_FLOOR_VERSION` | the Phase 1 floor | `src/ad-version-gate.ts` |
 | `AD_BELOW_PHASE1_FLOOR` | the class label | `src/install-check-labels.ts` |
+| `AD_SYSTEM_INSTALL_TOO_OLD` | the native client-minimum refusal class | `src/install-check-labels.ts` |
+| `AD_CLIENT_MINIMUM` | the installed client's minimum | `src/install-check.ts` |
+| `buildSystemInstallTooOldMessage <found-version> <binary-path> <startup\|runtime>` | the native minimum message, with the startup instruction block when applicable | `src/ad-version-gate.ts`, `src/install-skill-pointer.ts` |
 | `buildBelowPhase1FloorMessage <found-version> <binary-path> <startup\|runtime>` | the floor message in the startup or runtime form | `src/ad-version-gate.ts` |
 | `RUNTIME_RECHECK_PHRASE` | the runtime re-check phrase | `src/ad-version-gate.ts` |
 | `AD_VERSION_RECHECK_INTERVAL_MS` | the re-check interval, in decimal | `src/ad-version-gate.ts` |
@@ -2918,8 +2925,10 @@ in the shell, and the store, if any, has no `store_meta` table.
   is made. Prints one line per row, `<channel id> <instance id> <session
   name> <session id> <pane id>`.
 
-After `install_ad_release` the rows are kept, with no `launch_started_at`, and
-their workers still run; the seeders then refuse.
+Before `install_ad_release`, end every seeded worker using the old CLI and
+reconcile the rows to `ended` or `missing`. After installation the terminal
+rows are kept, with no `launch_started_at`; their workers and sessions are
+absent, and the seeders refuse. Rebuild live fixtures only after the upgrade.
 
 ### The stub worker
 

@@ -638,9 +638,9 @@ describe('runtime re-check: a version that passes the floor changes nothing', ()
 
 describe('runtime re-check: a version below the floor stops the server (ad-below-phase1-floor)', () => {
   test.each([
-    ['the release before Phase 1', OLD_AD_VERSION, binaryPathFor('below-old')],
+    ['DEFENSIVE injected old resolved version (native resolver rejects it first)', OLD_AD_VERSION, binaryPathFor('below-old')],
     ["the client's dev sentinel", DEV_PLACEHOLDER_VERSION, binaryPathFor('below-dev')],
-    ['an unparseable version the client resolved with (fail closed)', DEV_UNPARSEABLE_VERSION, binaryPathFor('below-unparseable')],
+    ['DEFENSIVE injected unparseable resolved version (native resolver reports unreachable)', DEV_UNPARSEABLE_VERSION, binaryPathFor('below-unparseable')],
   ])('%s (%s): one record naming the found version, the floor, the path, the runtime phrase, that Phase 1 is required and the debug skill, then one non-zero stop; no re-check line and no notice (b.jg5 SRJ-1002)', async (_label, version, path) => {
     const rig = makeRecheckRig({ outcomes: [{ version, path }] })
     expect(await noticesDuring(() => rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS))).toEqual([])
@@ -737,7 +737,7 @@ describe('runtime re-check: a re-check that cannot run changes nothing', () => {
 
 describe('runtime re-check: a stop happens once, record before stop', () => {
   test('after a pass then a below-floor answer, further advances call nothing and record and stop are not called again (no tick on the stopping re-check)', async () => {
-    const rig = makeRecheckRig({ outcomes: [{ version: PHASE1_RC_VERSION }, { version: OLD_AD_VERSION, path: binaryPathFor('stop-once') }] })
+    const rig = makeRecheckRig({ outcomes: [{ version: PHASE1_RC_VERSION }, { version: DEV_PLACEHOLDER_VERSION, path: binaryPathFor('stop-once') }] })
     await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS * 2)
     expect(rig.events).toEqual(['call', 'tick', 'call', 'record', 'stop'])
     expect(rig.clock.pendingCount()).toBe(0)
@@ -748,7 +748,7 @@ describe('runtime re-check: a stop happens once, record before stop', () => {
 
   test('a record hook that throws is logged and the server still stops once', async () => {
     const rig = makeRecheckRig({
-      outcomes: [{ version: OLD_AD_VERSION, path: binaryPathFor('record-throws') }],
+      outcomes: [{ version: DEV_PLACEHOLDER_VERSION, path: binaryPathFor('record-throws') }],
       recordStartupError: () => {
         throw new Error('stub record failure')
       },
@@ -763,14 +763,14 @@ describe('runtime re-check: a stop happens once, record before stop', () => {
     tempDirs.push(logDir)
     const path = binaryPathFor('real-record')
     const rig = makeRecheckRig({
-      outcomes: [{ version: OLD_AD_VERSION, path }],
+      outcomes: [{ version: DEV_PLACEHOLDER_VERSION, path }],
       recordStartupError: (classLabel, message) => recordStartupError(classLabel, message, undefined, { logDir }),
     })
     await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
     expectStoppedOnce(rig, AD_BELOW_PHASE1_FLOOR)
     const lines = readFileSync(join(logDir, 'startup-errors.log'), 'utf-8').split('\n').filter((line) => line !== '')
     expect(lines).toHaveLength(1)
-    for (const text of [`[${AD_BELOW_PHASE1_FLOOR}]`, OLD_AD_VERSION, PHASE1_FLOOR_VERSION, path, PHASE1_REQUIRED_PHRASE]) {
+    for (const text of [`[${AD_BELOW_PHASE1_FLOOR}]`, DEV_PLACEHOLDER_VERSION, PHASE1_FLOOR_VERSION, path, PHASE1_REQUIRED_PHRASE]) {
       expect(lines[0]).toContain(text)
     }
     expectRuntimeEntryPointsToDebugSkill(lines[0]!)
@@ -779,7 +779,7 @@ describe('runtime re-check: a stop happens once, record before stop', () => {
 
 describe('runtime re-check: no agent-director call after a stop', () => {
   test.each([
-    ['below the floor', { version: OLD_AD_VERSION, path: binaryPathFor('no-verb-floor') }, AD_BELOW_PHASE1_FLOOR],
+    ['below the floor', { version: DEV_PLACEHOLDER_VERSION, path: binaryPathFor('no-verb-floor') }, AD_BELOW_PHASE1_FLOOR],
     ['too old for the client', { throws: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION, binaryPathFor('no-verb-too-old')) }, AD_SYSTEM_INSTALL_TOO_OLD],
   ] as Array<[string, StubResolveSystemBinaryOutcome, string]>)('%s: the installed stub client logs no verb and the exit code is non-zero', async (_label, outcome, classLabel) => {
     const calls = makeStubCallLog()
@@ -820,7 +820,7 @@ describe('runtime re-check: time limit', () => {
     const rig = makeRecheckRig({ resolveSystemBinary: () => late.promise })
     await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS + AD_VERSION_RECHECK_TIME_LIMIT_MS)
     expectNextRecheckArmed(rig)
-    late.resolve({ version: OLD_AD_VERSION, path: binaryPathFor('late-answer') })
+    late.resolve({ version: DEV_PLACEHOLDER_VERSION, path: binaryPathFor('late-answer') })
     await rig.clock.flush()
     expect(rig.events).toEqual(['call', 'tick'])
     expect(rig.records).toHaveLength(0)
@@ -886,7 +886,7 @@ describe('runtime re-check: dispose', () => {
     expect(rig.clock.pendingCount()).toBe(0)
     await rig.clock.flush()
     expect(answers).toEqual(waiters.map(() => NOT_RUNNING))
-    answer.resolve({ version: OLD_AD_VERSION, path: binaryPathFor(`disposed-${label}`) })
+    answer.resolve({ version: DEV_PLACEHOLDER_VERSION, path: binaryPathFor(`disposed-${label}`) })
     await rig.clock.flush()
     expect(answers).toEqual(waiters.map(() => NOT_RUNNING))
     expectNothingAfterTheCall(rig)
@@ -1056,7 +1056,7 @@ describe('runtime re-check: a run of could-not-run results logs one line', () =>
         { throws: first },
         { version: BASELINE_VERSION },
         { throws: second },
-        { version: OLD_AD_VERSION, path: binaryPathFor('run-then-stop') },
+        { version: DEV_PLACEHOLDER_VERSION, path: binaryPathFor('run-then-stop') },
       ],
     })
     for (let n = 1; n <= 3; n++) {
@@ -1160,7 +1160,7 @@ describe('runtime re-check: trigger', () => {
   })
 
   test.each([
-    ['below the floor', { version: OLD_AD_VERSION, path: binaryPathFor('trigger-below') }, AD_BELOW_PHASE1_FLOOR],
+    ['below the floor', { version: DEV_PLACEHOLDER_VERSION, path: binaryPathFor('trigger-below') }, AD_BELOW_PHASE1_FLOOR],
     ['too old for the client', { throws: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION, binaryPathFor('trigger-too-old')) }, AD_SYSTEM_INSTALL_TOO_OLD],
   ] as Array<[string, StubResolveSystemBinaryOutcome, string]>)('%s: with no clock advance, one record and one non-zero stop; a later trigger answers not-running and calls nothing', async (_label, outcome, classLabel) => {
     const rig = makeRecheckRig({ outcomes: [outcome] })
@@ -1272,7 +1272,7 @@ describe('runtime re-check: version-changed signal', () => {
     ['two changes in turn: one each, the second from the first', [{ version: LATER_PATCH }, { version: LATER_MINOR }], [[BASELINE_VERSION, LATER_PATCH], [LATER_PATCH, LATER_MINOR]]],
     ['A, could not run, B: one', [{ version: BASELINE_VERSION }, { throws: errSystemInstallNotFound() }, { version: LATER_MINOR }], [[BASELINE_VERSION, LATER_MINOR]]],
     ['A, could not run, A: none', [{ version: BASELINE_VERSION }, { throws: errSystemInstallNotFound() }, { version: BASELINE_VERSION }], []],
-    ['below the floor: none (the server stops)', [{ version: OLD_AD_VERSION, path: binaryPathFor('signal-below') }], []],
+    ['below the floor: none (the server stops)', [{ version: DEV_PLACEHOLDER_VERSION, path: binaryPathFor('signal-below') }], []],
   ] as Array<[string, StubResolveSystemBinaryOutcome[], Array<[string, string]>]>)('timed re-checks at %s', async (_label, outcomes, expected) => {
     const rig = makeRecheckRig({ outcomes })
     await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS * (outcomes.length + 1))
@@ -1532,7 +1532,7 @@ describe('the ErrInvalidFlags hold decision (b.jg5 SRJ-207, SRJ-204, SRJ-205): a
     ['could not run (the call timed out) holds under the last version seen', decideAdVersionRecheckOutcome({ kind: 'timed-out', timeLimitMs: AD_VERSION_RECHECK_TIME_LIMIT_MS }), BASELINE_VERSION, { kind: INVALID_FLAGS_HOLD_DECISION_HOLD, version: BASELINE_VERSION }],
     ['could not run with no last version seen holds under none', decideAdVersionRecheckOutcome({ kind: 'rejected', error: errSystemInstallNotFound() }), undefined, { kind: INVALID_FLAGS_HOLD_DECISION_HOLD }],
     ['not running (none installed, disposed or stopped: no last version seen) holds under none', NOT_RUNNING, undefined, { kind: INVALID_FLAGS_HOLD_DECISION_HOLD }],
-    ['a stop below the floor does not hold', decideAdVersionRecheckOutcome({ kind: 'resolved', value: { version: OLD_AD_VERSION, path: PATH } }), BASELINE_VERSION, { kind: INVALID_FLAGS_HOLD_DECISION_STOP }],
+    ['a stop below the floor does not hold', decideAdVersionRecheckOutcome({ kind: 'resolved', value: { version: DEV_PLACEHOLDER_VERSION, path: PATH } }), BASELINE_VERSION, { kind: INVALID_FLAGS_HOLD_DECISION_STOP }],
     ["a stop on the client's too-old refusal does not hold", decideAdVersionRecheckOutcome({ kind: 'rejected', error: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION, PATH) }), BASELINE_VERSION, { kind: INVALID_FLAGS_HOLD_DECISION_STOP }],
   ] as const)('%s', (_label, answer, lastSeen, expected) => {
     expect(decideInvalidFlagsHold(answer, lastSeen)).toEqual(expected)
@@ -1570,7 +1570,7 @@ describe('lastAdVersionSeen (b.jg5 SRJ-204, SRJ-207): the installed re-check\'s 
 
   test('none once a stop ended the re-check', async () => {
     const clock = createFakeClock()
-    installAdVersionRecheck(installDeps(clock, [], [], [{ version: OLD_AD_VERSION }]))
+    installAdVersionRecheck(installDeps(clock, [], [], [{ version: DEV_PLACEHOLDER_VERSION }]))
     expect((await triggerAdVersionRecheck()).kind).toBe(RECHECK_OUTCOME_STOP)
     expect(lastAdVersionSeen()).toBeUndefined()
     expect(clock.pendingCount()).toBe(0)
@@ -1583,7 +1583,7 @@ describe('lastAdVersionSeen (b.jg5 SRJ-204, SRJ-207): the installed re-check\'s 
     expect(idle.recheck.isRunning()).toBe(true)
     idle.recheck.dispose()
     expect(idle.recheck.isRunning()).toBe(false)
-    const stopped = makeRecheckRig({ outcomes: [{ version: OLD_AD_VERSION }] })
+    const stopped = makeRecheckRig({ outcomes: [{ version: DEV_PLACEHOLDER_VERSION }] })
     await stopped.recheck.trigger()
     expect(stopped.recheck.isRunning()).toBe(false)
     expect(stopped.clock.pendingCount()).toBe(0)
@@ -1878,7 +1878,7 @@ describe('the ErrInvalidFlags hold\'s other ends (b.jg5 SRJ-207, SRJ-715): a tea
 
 describe('the ErrInvalidFlags hold below the floor (b.jg5 SRJ-205, AC 23): a reuse\'s re-check answering stop holds nothing', () => {
   test('one startup-errors entry of the exported class and one non-zero stop; no hold, no alert, no timer stop, and no further agent-director call', async () => {
-    const rig = makeHoldRig({ outcomes: [{ version: OLD_AD_VERSION, path: binaryPathFor('hold-below-floor') }] })
+    const rig = makeHoldRig({ outcomes: [{ version: DEV_PLACEHOLDER_VERSION, path: binaryPathFor('hold-below-floor') }] })
 
     expect(await holdAsAReuseDoes(rig, HELD_P)).toEqual({ kind: INVALID_FLAGS_HOLD_DECISION_STOP })
 
@@ -2019,8 +2019,8 @@ describe('host-version decision: passes (SRJ-211)', () => {
 
 describe("host-version decision: below the client's minimum fails (SRJ-211)", () => {
   test.each([
-    ['a resolved release below the minimum', BELOW_CLIENT_MIN_VERSION],
-    ['the previous supported release', OLD_AD_VERSION],
+    ['DEFENSIVE injected resolved release below the minimum', BELOW_CLIENT_MIN_VERSION],
+    ['DEFENSIVE injected old resolved release', OLD_AD_VERSION],
     ["the floor's release candidate", PHASE1_RC_VERSION],
     ["the minimum's release candidate (below it in the client's order)", CLIENT_MIN_RC],
   ])('%s (%s): fails below the client minimum, carrying found, required and path', (label, version) => {

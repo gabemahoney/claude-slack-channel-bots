@@ -19,6 +19,12 @@
  * (client minimum 0.12.0) and gates on the version alone. The client ranks
  * its `0.0.0-dev` sentinel above every version, so `Client.create()`
  * admits it; the floor has no such special case and refuses it on its own.
+ * Released versions below 0.12.0 (including 0.12.0 prereleases) are refused
+ * by the client first as `ad-system-install-too-old`; an unparseable probe
+ * is `ErrSystemInstallUnreachable`, not a resolved floor refusal. With the
+ * released 0.12.0 client, the sentinel is the remaining native floor-refusal
+ * case. Resolved versions from injected or stale clients still face the
+ * fail-closed floor guard.
  *
  * Parse rule mirrors the client's strict SemVer parser (which the client
  * does not export): `major.minor.patch`, optional `-prerelease`, no
@@ -106,8 +112,9 @@ import { redactSlackLogText } from './slack-log-redaction.ts'
  * CSCB's Phase 1 floor: the Phase 1 agent-director release's version.
  *
  * The released agent-director 0.12.0 client requires a CLI of at least
- * 0.12.0. Only major.minor.patch is compared (SRJ-202), so a
- * `0.12.0-rc.1` binary counts as 0.12.0.
+ * 0.12.0, with prereleases below that minimum. CSCB's own comparison uses
+ * only major.minor.patch (SRJ-202), so `0.12.0-rc.1` meets this floor but
+ * is refused by the released client's earlier check.
  */
 export const PHASE1_FLOOR_VERSION = '0.12.0'
 
@@ -534,6 +541,13 @@ function safeReason(error: unknown): string {
  *   any other named error, a non-error throw, the time limit expiring): could
  *   not run (b.jg5 SRJ-206).
  *
+ * The released resolver admits `0.0.0-dev`, so that version reaches the
+ * resolved floor stop. It rejects ordinary old versions and prereleases
+ * below 0.12.0 as too old before returning, and rejects unparseable versions
+ * as unreachable. The resolved floor branch also guards inconsistent
+ * results from an injected or stale resolver; it does not reconstruct a
+ * client refusal that the resolver never raised.
+ *
  * Pure: classifies by name, reads fields structurally, never throws.
  */
 export function decideAdVersionRecheckOutcome(result: AdVersionRecheckCallResult): AdVersionRecheckOutcome {
@@ -588,7 +602,8 @@ export const HOST_VERSION_OUTCOME_PASS = 'pass'
 
 /**
  * The host binary passes with the Phase 1 note: at or above the client's
- * minimum but below CSCB's Phase 1 floor (`0.10.0`, `0.0.0-dev`).
+ * minimum but below CSCB's Phase 1 floor. With the released 0.12.0 client,
+ * this is its development sentinel `0.0.0-dev`, not an old released binary.
  */
 export const HOST_VERSION_OUTCOME_PASS_BELOW_FLOOR = 'pass-below-floor'
 
@@ -734,7 +749,7 @@ function hostVersionThrownFailure(error: unknown, clientMinimum: string): HostVe
  *   {@link UNREACHABLE_REASON_UNPARSEABLE_VERSION};
  * - resolved below the minimum: fails below the client minimum;
  * - resolved at or above the minimum and meeting the floor: pass;
- * - resolved at or above the minimum but below the floor (`0.10.0`, the
+ * - resolved at or above the minimum but below the floor (the released
  *   client's sentinel `0.0.0-dev`): pass below the floor; each caller
  *   builds its own Phase 1 note ({@link buildPhase1HostNote} for `/publish`,
  *   {@link buildInstallCheckPhase1Note} for the install check).

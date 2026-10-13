@@ -4,10 +4,10 @@
  *
  * Cases, each through `runInstallCheck`:
  *   - the released client minimum passes with no note, echoing the path and version;
- *   - `OLD_AD_VERSION`, `DEV_PLACEHOLDER_VERSION` and `CLIENT_MIN_VERSION`
- *     pass with the Phase 1 note (the note builder's output, naming the found
- *     version and the switch-over runbook section);
- *   - a resolved version below the client's minimum, and
+ *   - the native dev sentinel passes with the Phase 1 note, naming its
+ *     version and the switch-over runbook section; ordinary old releases and
+ *     the floor RC fail the released client minimum first;
+ *   - a DEFENSIVE injected resolved version below the client's minimum, and
  *     `ErrSystemInstallTooOld`, fail too old; the message names the found and
  *     required versions, the path and the runbook section;
  *   - `ErrSystemInstallNotFound` fails not found;

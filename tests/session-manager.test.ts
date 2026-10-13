@@ -1256,7 +1256,7 @@ import {
   RECHECK_OUTCOME_STOP,
   resetAdVersionRecheckForTests,
 } from '../src/ad-version-gate.ts'
-import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import { DEV_PLACEHOLDER_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
   AD_VERSION_RECHECK_INTERVAL_MS,
   AD_VERSION_RECHECK_STOP_EXIT_CODE,
@@ -2767,7 +2767,7 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
   }
 
   test('the re-check answers stop: no spawn-failure notice, { failed, stopping }, the one UNCLASSIFIED line kept, nothing more killed, deleted or launched', async () => {
-    reinstallRecheck({ version: OLD_AD_VERSION })
+    reinstallRecheck({ version: DEV_PLACEHOLDER_VERSION })
     const invalidFlags = errInvalidFlags('resume')
     const { cfg, calls } = installEndedRowResumeRejects(invalidFlags)
 
@@ -2792,7 +2792,7 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
   })
 
   test('the re-check answers stop: launchSession answers \'skipped\' (counted toward no failure or cap) and posts nothing', async () => {
-    reinstallRecheck({ version: OLD_AD_VERSION })
+    reinstallRecheck({ version: DEV_PLACEHOLDER_VERSION })
     const { cfg } = installEndedRowResumeRejects(errInvalidFlags('resume'))
 
     let result: LaunchSessionResult | undefined
@@ -5554,7 +5554,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       })
 
       test('the re-check decides that the server stops → exactly one re-check and one stop; the sweep stops: no delete, no further row handled, no findMissing sweep; one stop line; one orphan-cleanup entry for the stopped row with no alert text; the summary still logged, the unreached row kept', async () => {
-        installRecheck({ version: OLD_AD_VERSION })
+        installRecheck({ version: DEV_PLACEHOLDER_VERSION })
         const readLog = captureStartupErrors()
         const { cfg, home } = sweepConfig()
         const alpha = personaOf(cfg, 'alpha')
@@ -5604,7 +5604,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       })
 
       test('a live pre-persona row\'s kill whose re-check decides that the server stops → one re-check and one stop; the row kept (kill-failed 1) with one orphan-cleanup entry and no alert text, no further row handled and no findMissing sweep', async () => {
-        installRecheck({ version: OLD_AD_VERSION })
+        installRecheck({ version: DEV_PLACEHOLDER_VERSION })
         const readLog = captureStartupErrors()
         const { cfg } = sweepConfig()
         const killCalls: import('agent-director').KillParams[] = []
@@ -5646,7 +5646,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       // a survivor-naming try is a kill a shutdown stopped, so its one line
       // quotes that survivor; the entry carries no alert text.
       test('a survivor-naming ErrTmuxKillFailed, then an ErrInvalidFlags whose re-check decides that the server stops: one stopped line quoting the redacted survivor description, with the re-check\'s cause; the orphan-cleanup entry has no alert text and there is no persona-kill-survivor entry', async () => {
-        installRecheck({ version: OLD_AD_VERSION })
+        installRecheck({ version: DEV_PLACEHOLDER_VERSION })
         const survivor = survivorNaming('sweep-recheck-stop-survivor')
         const err = errInvalidFlags('kill')
 
@@ -22684,7 +22684,7 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
   test.each(PROMPT_STATES)('a %s row, its read-pane answering ErrInvalidFlags whose version re-check decides that the server stops → failed marked stopping: one stop, the read-pane the last call, no sweep; no spawn-failure notice, spawn-failed entry or count; one line saying the server stops', async (state) => {
     resetAdVersionRecheckForTests()
     installAdVersionRecheck({
-      resolveSystemBinary: makeStubResolveSystemBinary({ outcomes: [{ version: OLD_AD_VERSION }] }),
+      resolveSystemBinary: makeStubResolveSystemBinary({ outcomes: [{ version: DEV_PLACEHOLDER_VERSION }] }),
       baselineVersion: PHASE1_RC_VERSION,
       recordStartupError: () => {},
       stop: (exitCode) => { stops.push(exitCode) },
@@ -22842,7 +22842,7 @@ describe('b.jg5 SRJ-104, SRJ-204: an ErrInvalidFlags answer at the shared read-p
   })
 
   test('the re-check answers stop: one resolveSystemBinary call and one stop; answered UNCLASSIFIED carrying the stop mark, with one line naming stop; nothing armed or reported, even inside P\'s recovery attempt', async () => {
-    installRecheck({ version: OLD_AD_VERSION })
+    installRecheck({ version: DEV_PLACEHOLDER_VERSION })
     const { h, p } = srj105Build()
     const err = errInvalidFlags('read-pane')
     h.script({ readPaneError: err })
@@ -22881,7 +22881,7 @@ describe('b.jg5 SRJ-104, SRJ-204: an ErrInvalidFlags answer at the shared read-p
     [
       RECHECK_OUTCOME_STOP,
       'defer',
-      { version: OLD_AD_VERSION },
+      { version: DEV_PLACEHOLDER_VERSION },
       1,
       'the agent-director version re-check decided that the server stops; not typing /mcp reconnect, nothing more is called for it',
       'b.jg5 SRJ-204, SRJ-205',
@@ -22908,7 +22908,7 @@ describe('b.jg5 SRJ-104, SRJ-204: an ErrInvalidFlags answer at the shared read-p
   // outcome ends the wait with no further call and nothing typed; the ladder
   // answers a `failed` result marked `stopping`, as a resume's stop does.
   test('the launch wait\'s evidence read of P\'s working row, the re-check answering stop: the wait ends at once, with no further call though the next poll would read waiting, and nothing typed; one line; the ladder answers { failed, stopping } and launchSession \'skipped\'; nothing posted, armed, latched, counted or recorded spawn-failed', async () => {
-    installRecheck({ version: OLD_AD_VERSION })
+    installRecheck({ version: DEV_PLACEHOLDER_VERSION })
     const { h, p } = srj105Build()
     fastPolls(h)
     const err = errInvalidFlags('read-pane')
@@ -22940,7 +22940,7 @@ describe('b.jg5 SRJ-104, SRJ-204: an ErrInvalidFlags answer at the shared read-p
     expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
 
     // The restart path's launch meets the same stop: 'skipped', never counted.
-    installRecheck({ version: OLD_AD_VERSION })
+    installRecheck({ version: DEV_PLACEHOLDER_VERSION })
     h.script(script())
     expect(await launchSession(p, h.config)).toBe('skipped')
     expect(stops).toHaveLength(2)
@@ -24510,7 +24510,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
   // meaning: one immediate version re-check, then UNCLASSIFIED.
   test.each([
     [RECHECK_OUTCOME_PASS, undefined, false],
-    [RECHECK_OUTCOME_STOP, { version: OLD_AD_VERSION }, true],
+    [RECHECK_OUTCOME_STOP, { version: DEV_PLACEHOLDER_VERSION }, true],
   ] as const)('ErrInvalidFlags, the re-check answering %s: one re-check, then UNCLASSIFIED: transient (marked stopping when the re-check stops the server, and then nothing reported)', async (kind, outcome, stopping) => {
     installRecheck(outcome)
     const err = errInvalidFlags('send-keys')
@@ -24952,7 +24952,7 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
   test('waiting: an ErrInvalidFlags whose re-check stops the server → failed, marked stopping; nothing posted, recorded or counted, and nothing after the send-keys', async () => {
     const stops: number[] = []
     installAdVersionRecheck({
-      resolveSystemBinary: makeStubResolveSystemBinary({ outcomes: [{ version: OLD_AD_VERSION }] }),
+      resolveSystemBinary: makeStubResolveSystemBinary({ outcomes: [{ version: DEV_PLACEHOLDER_VERSION }] }),
       baselineVersion: PHASE1_RC_VERSION,
       recordStartupError: () => {},
       stop: (exitCode) => { stops.push(exitCode) },
@@ -26743,7 +26743,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
   // stops the server; nothing is held and nothing is posted.
   test.each([...REUSE_SITES, ...NO_TRANSCRIPT_SITES].map((site) => [site.name, site] as const))('SRJ-205, %s: ErrInvalidFlags at the reuse whose one re-check reads a binary below the floor answers the stopping result: the server stops once, non-zero; no hold, no alert, nothing counted or armed, no further call', async (_name, site) => {
     const { h, p } = srj105Build()
-    const rc = h.versionRecheck({ version: OLD_AD_VERSION })
+    const rc = h.versionRecheck({ version: DEV_PLACEHOLDER_VERSION })
     scriptReuseSite(h, p, site, errInvalidFlags('spawn'))
     const order = recordCallOrder(h)
 
@@ -28246,7 +28246,7 @@ describe('b.jg5 SRJ-207, SRJ-1008, SRJ-204 (AC 23) end to end: a forced reuse ge
 
   test('below the floor: the same forced reuse whose re-check reads a below-floor binary stops the server once, non-zero, with one startup-errors entry of its class; no hold, no alert, and no further stub call for P', async () => {
     const { h, p } = srj105Build()
-    const rc = h.versionRecheck({ version: OLD_AD_VERSION })
+    const rc = h.versionRecheck({ version: DEV_PLACEHOLDER_VERSION })
     scriptReuseInvalidFlags(h, p)
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', stopping: true })
@@ -30915,7 +30915,7 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
 
   test('ErrInvalidFlags at the first spawn whose re-check stops the server (a below-floor binary): failed and stopping, with no notice, no cause sent, nothing counted and no further call', async () => {
     const { h, p } = srj105Build()
-    const rc = h.versionRecheck({ version: OLD_AD_VERSION })
+    const rc = h.versionRecheck({ version: DEV_PLACEHOLDER_VERSION })
     h.script({ spawnError: errInvalidFlags('spawn') })
     const order = recordCallOrder(h)
 
@@ -31339,7 +31339,7 @@ describe('b.jg5 SRJ-410, SRJ-118: the lap\'s Enter (sendPendingRowLapEnter) is o
   // b.jg5 SRJ-104, SRJ-204, SRJ-205: send-keys gives ErrInvalidFlags no meaning.
   test.each([
     [RECHECK_OUTCOME_PASS, undefined, false],
-    [RECHECK_OUTCOME_STOP, { version: OLD_AD_VERSION }, true],
+    [RECHECK_OUTCOME_STOP, { version: DEV_PLACEHOLDER_VERSION }, true],
   ] as const)('ErrInvalidFlags, the re-check answering %s: one re-check, then UNCLASSIFIED (marked stopping when the re-check stops the server, and then nothing reported); one line', async (kind, outcome, stopping) => {
     installRecheck(outcome)
     const err = errInvalidFlags('send-keys')
@@ -32009,7 +32009,7 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
   // no entry.
   test('ErrInvalidFlags whose one re-check decides that the server stops: stopped after one try, with no further kill or read; no alert, one stop line and no entry; nothing latched', async () => {
     const { h, p } = srj105Build()
-    const { resolves, stops } = h.recheckAnswers(OLD_AD_VERSION)
+    const { resolves, stops } = h.recheckAnswers(DEV_PLACEHOLDER_VERSION)
     h.script({ killError: errInvalidFlags('kill') })
 
     const answer = await abortKill(h, p, 1, 0)

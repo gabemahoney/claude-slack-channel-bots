@@ -12,8 +12,8 @@
  *   - passes: `PHASE1_RC_VERSION` (the version the Phase 1 release
  *     candidate reports, built from the floor; a pre-release suffix is
  *     ignored, so it counts as the floor);
- *   - refused: `OLD_AD_VERSION` (the release before Phase 1, which the client
- *     itself admits), `DEV_PLACEHOLDER_VERSION` (the client's development
+ *   - refused: `OLD_AD_VERSION` (the release before Phase 1, which the released client
+ *     rejects first; resolved old fixtures are defensive injections), `DEV_PLACEHOLDER_VERSION` (the client's development
  *     sentinel, which the client ranks above every version) and
  *     `DEV_UNPARSEABLE_VERSION` (not strict SemVer, so it fails closed).
  *
@@ -49,16 +49,16 @@ import { DEV_SENTINEL_VERSION } from 'agent-director'
 
 import { compareAdVersions, PHASE1_FLOOR_VERSION } from '../../src/ad-version-gate.ts'
 
-/** The floor's first release candidate; passes the floor. */
+/** The floor RC passes CSCB's numeric comparison; the released native client rejects it first. */
 export const PHASE1_RC_VERSION = `${PHASE1_FLOOR_VERSION}-rc.1`
 
-/** The last agent-director release before Phase 1; the client admits it, CSCB's floor refuses it. */
+/** The last agent-director release before Phase 1; the released client rejects it before CSCB's floor. */
 export const OLD_AD_VERSION = '0.10.0'
 
 /** The client's development sentinel (`0.0.0-dev`); CSCB's floor refuses it. */
 export const DEV_PLACEHOLDER_VERSION: string = DEV_SENTINEL_VERSION
 
-/** A development version that is not strict SemVer; CSCB's floor refuses it. */
+/** An injected non-SemVer value; native resolution reports unreachable, CSCB fails closed. */
 export const DEV_UNPARSEABLE_VERSION = 'dev'
 
 /**

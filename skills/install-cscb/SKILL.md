@@ -69,7 +69,7 @@ Read the output carefully:
   This skill has nothing more to fix.
 
 - **Exit 0 + "OK", with a `note:` line**: the binary meets the client's
-  minimum but is below CSCB's Phase 1 floor. Print the success output as
+  admission check through its development placeholder `0.0.0-dev`, but is below CSCB's numeric Phase 1 floor. Ordinary older releases and 0.12.0 release candidates fail the client's minimum instead. Print the success output as
   above, then:
   1. Relay the note to the user exactly as printed after the `note:`
      label.

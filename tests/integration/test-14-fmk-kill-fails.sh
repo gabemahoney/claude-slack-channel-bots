@@ -20,9 +20,10 @@
 # - the 0.10.0 start (SCENARIO_AD_START=0.10.0: 0.10.0's binary behind the
 #   shim, no store); scenario 16's rows seeded on it from the scenario's own
 #   shell (`seed_prepersona_fleet`, `seed_010_row`: 0.10.0's own `spawn`,
-#   which makes the store); then the release's install.sh over it
+#   which makes the store); end and reconcile every worker, then install
 #   (`install_ad_release`, which migrates the store, re-shims both paths and
-#   checks the shims), after which every leg runs on the release;
+#   checks the shims), verify terminal rows survive unchanged, then rebuild
+#   live fixtures with the release; every leg runs on the release;
 # - agent-director at its default settings (no config.toml): kill_exit_wait_ms
 #   at its default, 5000 ms, measured (slowest exit 603 ms) (RN-6; HO rev 31);
 #   the bounded retry makes 3 tries 2 s apart (KILL_RETRY_TRIES,
@@ -68,16 +69,14 @@
 #                   pre-persona package names them, workers reporting in at
 #                   once); P's own row (`cscb_<P key>`, its `persona` label,
 #                   in a directory other than P's configured one, its worker
-#                   `silent`), which after the migration reads `pending` with
+#                   `silent`); all workers end before migration, then released
+#                   launches reuse their rows. P is injected as `pending` with
 #                   no launch start (SRJ-513, SRJ-1020); and absent persona
 #                   Q's live row. config.json names P (a Slack destination)
 #                   and not Q; `fail-kill` is limited to A's session and pane
-#                   (a guard only: the release sends no kill for a 0.10.0
-#                   launch's session, which carries no label it reads, and
-#                   answers ErrTmuxKillFailed with none sent, HO rev 31 §2
-#                   (a), so the target list does not decide A's outcome; how
-#                   many kills aimed at A's targets reached the tmux shim is
-#                   logged); a start; once the start sweep's summary line is
+#                   (the rebuilt release launch is owned, so fail-kill refuses
+#                   its actual tmux kill); the number of targeted calls is
+#                   logged; a start; once the start sweep's summary line is
 #                   logged, `log`. Then the summary's counts (4 listed, 1
 #                   recorded as retired, 1 left for a latch, and every live
 #                   stray not killed kept with its kill failed); the pass's
@@ -284,9 +283,8 @@ t14_value PERSONA_LABEL PERSONA_LABEL_KEY
 # Two pre-persona rows (a `channel` label, no `persona` label), each with a
 # worker that reports in at once. A's session and pane are `fail-kill`'s only
 # targets, and A's kill must fail; B's outcome is logged, not asserted. On the
-# release no kill is sent for any 0.10.0-launched session (HO rev 31 §2 (a)),
-# so the target list does not act here: each such kill answers
-# ErrTmuxKillFailed with none sent. Their routes' channel names give their
+# release each fixture is rebuilt after migration, so fail-kill refuses the
+# real owned launch's kill and produces ErrTmuxKillFailed. Their routes' channel names give their
 # ids and session names (`seed_prepersona_fleet`).
 U_CONFIG="${SCENARIO_ROOT}/prepersona-config.json"
 UA_CHANNEL="C0T14PPA"
@@ -302,8 +300,8 @@ read -r _ UB_ID UB_SESSION _ _ <<< "$(grep "^${UB_CHANNEL} " <<< "${U_ROWS}")"
 
 # P, which the configuration names: its own row (`cscb_<key>`, its `persona`
 # label) in a working directory other than P's configured one, with a worker
-# that never reports in, so after the migration it reads `pending` with no
-# launch start (b.jg5 SRJ-513, SRJ-1020).
+# that never reports in. After migration and respawn, explicitly inject
+# `pending` with no launch start (b.jg5 SRJ-513, SRJ-1020).
 P_NAME="${SCENARIO_TAG}latched"
 P_KEY="$(persona_key "${P_NAME}")"
 t14_value P_ID personaInstanceId "${P_KEY}"
@@ -322,8 +320,69 @@ t14_value Q_SESSION personaTmuxSessionName "${Q_KEY}"
 Q_WORK="$(make_workdir "${SCENARIO_TAG}absent_work")"
 seed_010_row "${Q_ID}" "${Q_SESSION}" "${Q_WORK}" "${SVC_LABEL}" "${PERSONA_LABEL}=${Q_KEY}" > /dev/null
 
-install_ad_release "setup: the release's install.sh over the 0.10.0 start"
-check_ad_shim "setup: the agent-director shim after the release's install"
+# No worker may cross the release upgrade. Keep the rows for migration, then
+# reconstruct live kill-failure fixtures with the released binary below.
+t14_upgrade_row_quiescent() {
+    local id="$1" session="$2" pid="$3"
+    ad_capture find-missing
+    (( AD_RC == 0 )) || return 1
+    ad_capture get "${SCENARIO_AD_ID_FLAG}" "${id}"
+    (( AD_RC == 0 )) || return 1
+    jq -e '.state == "ended" or .state == "missing"' "${AD_OUT}" > /dev/null || return 1
+    ! pid_alive "${pid}" || return 1
+    ! "${SCENARIO_REAL_TMUX}" has-session -t "=${session}" 2> /dev/null
+}
+
+t14_upgrade_seeded_rows() {
+    local id session pid before after
+    for id in "${UA_ID}" "${UB_ID}" "${P_ID}" "${Q_ID}"; do
+        ad_capture get "${SCENARIO_AD_ID_FLAG}" "${id}"
+        (( AD_RC == 0 )) || fail "setup: cannot read seeded row ${id}"
+        session="$(jq -er '.tmux_session_name' "${AD_OUT}")"
+        pid="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${session}:" '#{pane_pid}')"
+        ad_capture kill "${SCENARIO_AD_ID_FLAG}" "${id}"
+        (( AD_RC == 0 )) || fail "setup: the old binary could not end ${id}"
+        wait_until "${SCENARIO_WORKER_END_S}" "setup: seeded row ${id} remains live before upgrade" \
+            t14_upgrade_row_quiescent "${id}" "${session}" "${pid}"
+        jq -S --arg key "${SCENARIO_AD_ID_COLUMN}" '{id:.[$key],tmux_session_name,labels,cwd,state}' "${AD_OUT}" > "${SCENARIO_ROOT}/upgrade-${id}.json"
+    done
+    install_ad_release "setup: the release's install.sh over quiescent 0.10.0 rows"
+    check_ad_shim "setup: the agent-director shim after the release's install"
+    for id in "${UA_ID}" "${UB_ID}" "${P_ID}" "${Q_ID}"; do
+        ad_capture get "${SCENARIO_AD_ID_FLAG}" "${id}"
+        (( AD_RC == 0 )) || fail "setup: migration lost seeded row ${id}"
+        before="${SCENARIO_ROOT}/upgrade-${id}.json"
+        after="${SCENARIO_ROOT}/upgrade-${id}-after.json"
+        jq -S --arg key "${SCENARIO_AD_ID_COLUMN}" '{id:.[$key],tmux_session_name,labels,cwd,state}' "${AD_OUT}" > "${after}"
+        cmp -s "${before}" "${after}" || fail "setup: migration changed ${id}'s identity, metadata or terminal state"
+        session="$(jq -er '.tmux_session_name' "${AD_OUT}")"
+        ! "${SCENARIO_REAL_TMUX}" has-session -t "=${session}" 2> /dev/null || fail "setup: ${session} crossed the upgrade"
+    done
+}
+
+t14_upgrade_seeded_rows
+
+# Reuse the migrated rows after upgrade, preserving their legacy names and
+# labels. A's released launch now has ownership labels, so the targeted tmux
+# failure exercises a real refused kill rather than an unowned legacy pane.
+for fixture in A B P Q; do
+    case "${fixture}" in
+        A) id="${UA_ID}"; session="${UA_SESSION}"; work="${UA_WORK}"; labels=("${SVC_LABEL}" "channel=${UA_CHANNEL}");;
+        B) id="${UB_ID}"; session="${UB_SESSION}"; work="${UB_WORK}"; labels=("${SVC_LABEL}" "channel=${UB_CHANNEL}");;
+        P) id="${P_ID}"; session="${P_SESSION}"; work="${P_ROW_WORK}"; labels=("${SVC_LABEL}" "${PERSONA_LABEL}=${P_KEY}");;
+        Q) id="${Q_ID}"; session="${Q_SESSION}"; work="${Q_WORK}"; labels=("${SVC_LABEL}" "${PERSONA_LABEL}=${Q_KEY}");;
+    esac
+    args=()
+    for label in "${labels[@]}"; do args+=(--label "${label}"); done
+    ad_capture spawn --agent claude --cwd "${work}" --instance-id "${id}" \
+        --tmux-session-name "${session}" --no-pre-trust --reuse-finished "${args[@]}"
+    (( AD_RC == 0 )) || fail "setup: could not rebuild live fixture ${id} after upgrade"
+done
+# P's intentionally injected pre-launch row still tests the no-launch-start
+# latch (SRJ-513); this state is established after installer quiescence.
+ad_store_pending_no_launch "${P_ID}"
+read -r UA_SID UA_PANE < <("${SCENARIO_REAL_TMUX}" display-message -p -t "=${UA_SESSION}:" '#{session_id} #{pane_id}')
+
 
 # ---------------------------------------------------------------------------
 # Bounds (seconds)
@@ -1094,6 +1153,8 @@ t14_note_kills_at() {
             if (kill && hit) n++
         }
         END { print n + 0 }' "${SCENARIO_TMUX_SHIM_LOG}" 2> /dev/null)" || n="?"
+    [[ "${n}" =~ ^[0-9]+$ ]] && (( n > 0 )) \
+        || fail "${step}: no targeted kill reached the tmux shim; the fail-kill fault was not exercised"
     echo "${TEST_NAME}: NOTE: ${step}: ${n} tmux call(s) holding a kill aimed at $* reached the tmux shim after the mark (each refused under fail-kill --targets)"
 }
 
@@ -1159,12 +1220,21 @@ t14_end_old_workers() {
 # Leg 0 (scenario 16): an upgrade's start sweep with one failing kill
 # ---------------------------------------------------------------------------
 
+t14_upgrade_fixture_reported() {
+    local state
+    state="$(t14_row_state "$1")"
+    [[ "${state}" == waiting || "${state}" == working || "${state}" == ask_user || "${state}" == check_permission ]]
+}
+
 leg_upgrade_sweep() {
     local step="upgrade start sweep" ua_state id m n before kills entry_head alert expected prefix body
     local ids sid pane head tail
 
-    # After the migration: P's own row reads `pending` with no launch start;
-    # the other rows are live, their workers running.
+    for id in "${UA_ID}" "${UB_ID}" "${Q_ID}"; do
+        wait_until "${ROW_WAIT_S}" "${step}: rebuilt ${id} did not report in" t14_upgrade_fixture_reported "${id}"
+    done
+    # After migration and fixture reconstruction: P is injected as `pending`
+    # with no launch start; the other released workers report in and run.
     ad_capture status --instance-id "${P_ID}"
     [[ "${AD_RC}" == 0 ]] && jq -e '.state == "pending" and ((.launch_started_at // "") == "")' "${AD_OUT}" > /dev/null \
         || fail "${step}: after the migration ${P_ID} does not read pending with no launch start: $(tr '\n' ' ' < "${AD_OUT}" "${AD_ERR}")"
@@ -1179,8 +1249,7 @@ leg_upgrade_sweep() {
         || fail "${step}: ${UA_SESSION} is now '${ids}', not the seeded ${UA_SID} ${UA_PANE}"
 
     # The configuration names P (a Slack destination) and not Q; A's session
-    # and pane are fail-kill's only targets (a guard: on the release no kill
-    # is sent for a 0.10.0-launched session, so the list does not act here).
+    # and pane are fail-kill's only targets for its rebuilt, owned launch.
     stub_mode "${P_WORK}" "${STUB_MODE_SILENT}"
     tmux_shim_mode log
     t14_config_for_next_start "$(t14_persona_json "${P_NAME}" "${P_LABEL}" "${P_WORK}" "${P_CFG}" "${P_CHANNEL}")"
@@ -1196,10 +1265,9 @@ leg_upgrade_sweep() {
 
     # The sweep's counts: four rows listed; every live stray it did not kill
     # kept with its kill failed; Q's key recorded; P's row left for its latch.
-    # How many of B's and Q's kills succeed is agent-director's (a 0.10.0
-    # launch's session carries no label the release reads, so its kill may
-    # answer ErrTmuxKillFailed with no kill sent, HO rev 31 §2 (a)); it is
-    # logged, not asserted.
+    # B and Q are rebuilt owned launches; their observed kill outcomes are
+    # still logged and checked individually, preserving the sweep's budget
+    # checks while A is the deliberately targeted failure.
     t14_check_summary "${step}"
     t14_note_kills_at "${step}" "${UA_SESSION}" "${UA_SID}" "${UA_PANE}"
 

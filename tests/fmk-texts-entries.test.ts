@@ -62,6 +62,8 @@ import * as config from '../src/config.ts'
 import * as conflictLatch from '../src/conflict-latch.ts'
 import * as deliveryDecision from '../src/delivery-decision.ts'
 import * as installCheckLabels from '../src/install-check-labels.ts'
+import * as installCheck from '../src/install-check.ts'
+import * as installSkillPointer from '../src/install-skill-pointer.ts'
 import * as invalidFlagsHold from '../src/invalid-flags-hold.ts'
 import * as liveRowSequence from '../src/live-row-sequence.ts'
 import * as livenessReading from '../src/liveness-reading.ts'
@@ -87,6 +89,8 @@ const PRINTER_PATH = join(REPO_ROOT, 'tests', 'integration', 'fixtures', 'fmk-te
 
 /** The `src/` modules the printer reads, by the file name it passes. */
 const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
+  'install-check.ts': installCheck,
+  'install-skill-pointer.ts': installSkillPointer,
   'ad-description-phrases.ts': adDescriptionPhrases,
   'ad-config-file.ts': adConfigFile,
   'ad-error-class.ts': adErrorClass,
@@ -159,6 +163,7 @@ const LIST_HELPER = 'constantEntries'
 const CHOSEN_FROM: Readonly<Record<string, string>> = {
   'recoveryReasonArgument:name': 'RECOVERY_REASON_EXPORTS',
   'belowPhase1FloorMessage:foundByExport': 'FOUND_BY_EXPORTS',
+  'systemInstallTooOldMessage:foundByExport': 'FOUND_BY_EXPORTS',
   'conflictLatchSetHead:outcomeExport': 'LATCH_SET_OUTCOME_EXPORTS',
   'launchTimeoutFormTextOf:name': 'LAUNCH_TIMEOUT_FORM_EXPORTS',
 }

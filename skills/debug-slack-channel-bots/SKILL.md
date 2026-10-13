@@ -5241,11 +5241,14 @@ included), the binary path, that the startup check found it, and the docs/migrat
 section "Switching over to agent-director Phase 1". It has no
 install-skill block.
 
-- **Cause:** the binary passed the agent-director client's own minimum but
-  predates agent-director Phase 1. A development build that reports the
-  placeholder version `0.0.0-dev` is below the floor too and is refused the
-  same way. A build that reports the bare version `dev` does not reach this
-  check: the version does not parse, so the client refuses it first as
+- **Cause:** the released client admits the unsupported development placeholder
+  `0.0.0-dev` above any minimum, but CSCB's numeric 0.12.0 floor refuses it.
+  This class remains reachable at startup, persona-client construction and
+  runtime re-check. Ordinary 0.10.0/0.11.0 releases and 0.12.0 release
+  candidates fail the client's 0.12.0 minimum first as
+  `ad-system-install-too-old`. Older or malformed values resolved by an
+  injected or stale client are defensive guard cases, not normal admission
+  by the released client. A bare `dev` is refused by native resolution as
   `ad-system-install-unreachable` (reason `unparseable-version`).
 - **Fix:** the operator follows the block "Arrived here from a startup
   refusal?" of the docs/migration.md section "Switching over to agent-director
@@ -5371,15 +5374,17 @@ stop anything. They treat the two classes differently:
 
 | Binary | `stop --stop-bots` | `clean_restart` |
 |---|---|---|
-| Below CSCB's Phase 1 floor, accepted by the client (`ad-below-phase1-floor` at start) | Works as usual: it makes no version check of its own, so the precheck and the teardown run through that binary and every bot is stopped. | Stops nothing: its connection runs the same checks as the server's start and fails (see [A precheck failed: nothing was stopped](#a-precheck-failed-nothing-was-stopped)). Exit 1. |
+| Client-admitted development placeholder `0.0.0-dev`, below CSCB's numeric floor (`ad-below-phase1-floor` at start) | Works as usual: it makes no version check of its own, so the precheck and the teardown run through that binary and every bot is stopped. | Stops nothing: its connection runs the same checks as the server's start and fails (see [A precheck failed: nothing was stopped](#a-precheck-failed-nothing-was-stopped)). Exit 1. |
 | Below the client's own minimum (`ad-system-install-too-old`) | Stops the server only, as below. Exit 1. | Stops nothing, as above. Exit 1. |
 
-So an operator on an agent-director older than Phase 1 can stop the bots
-with `stop --stop-bots` before the switch-over; `clean_restart` needs the
-switch-over first.
+Only the client-admitted development placeholder can reach teardown below
+CSCB's floor. On ordinary older releases or 0.12.0 release candidates,
+`stop --stop-bots` stops only the server; end workers with the compatible
+previous CLI as the coordinated switch-over runbook directs. Every row
+must be non-live and every worker stopped before the installer runs.
 
-`bun run install-check` passes a binary below CSCB's Phase 1 floor that the
-client accepts only with a `note`: the version found and CSCB's floor (its
+`bun run install-check` passes the client-admitted development placeholder
+`0.0.0-dev` below CSCB's Phase 1 floor only with a `note`: the version found and CSCB's floor (its
 release candidates included), that the server refuses to start on it until
 agent-director Phase 1 is installed, and the docs/migration.md section
 ["Switching over to agent-director Phase 1"](../../docs/migration.md#switching-over-to-agent-director-phase-1)
@@ -7046,7 +7051,7 @@ Fatal classes you may see:
 
 - `ad-system-install-not-found` — `Client.create()` could not locate an `agent-director` binary on PATH or at the standard install path. The startup gate runs on a bot host, where the binary may only be missing from the bot server's launcher HOME or PATH while agent-director's store and workers are live, so the log line does not point to the publishing-host block. It points to the docs/migration.md section "Switching over to agent-director Phase 1": its [step 1](../../docs/migration.md#step-1-check-the-host-and-stage-the-release) checks agent-director's version as the workers' user in the bot server's launcher environment, which shows whether this launcher's HOME or PATH differs from the workers'. The log line appends a manual-skill-install instructions block pointing at `skills/install-cscb/SKILL.md` (URL, target path under `~/.claude/skills/`, and invocation command `/install-cscb`).
 - `ad-system-install-too-old` — the system-installed binary is below the agent-director client's own minimum; the line appends the install-skill block. See [`ad-system-install-too-old`](#ad-system-install-too-old).
-- `ad-below-phase1-floor` — the binary passed the client's own minimum but is below CSCB's Phase 1 floor; the line appends no skill block. See [`ad-below-phase1-floor`](#ad-below-phase1-floor).
+- `ad-below-phase1-floor` — the released client admitted the unsupported development placeholder `0.0.0-dev`, which CSCB's numeric floor refuses (older/malformed resolved values are defensive injected/stale-client cases); the line appends no skill block. See [`ad-below-phase1-floor`](#ad-below-phase1-floor).
 - `ad-system-install-unreachable` — agent-director was discovered but the probe could not execute it (e.g. permission bits, broken symlink, runtime crash). The log line surfaces AD's supplied `err.reason` value verbatim (one of `not-executable`, `not-a-regular-file`, `probe-timeout`, `probe-nonzero-exit`, `probe-killed-by-signal`, `unparseable-version`, `spawn-failed`, `other`), says to diagnose with the install-cscb skill, names the docs/migration.md section "Switching over to agent-director Phase 1" and appends the manual-skill-install instructions block.
 - `ad-bun-version-too-old` — agent-director needs Bun `>= 1.0.21`. Upgrade Bun.
 - `ad-client-construct` — `Client.create()` failed with an error other than the `ad-system-install-*` ones; the line gives its detail. Check the install with the `install-cscb` skill, then retry.

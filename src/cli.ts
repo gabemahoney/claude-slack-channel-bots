@@ -1371,6 +1371,8 @@ export function createCli(deps: CliDeps): CliHandlers {
     // The gate leaves CSCB's Phase 1 floor out here and only here (b.jg5
     // SRJ-203, SRJ-902): `stop --stop-bots` makes no version check of its own,
     // so a binary the client accepts runs the precheck and teardown.
+    // With client 0.12.0 this includes its 0.0.0-dev sentinel, but old
+    // released binaries still get the client's too-old refusal.
     if (deps.initClient) {
       try {
         await deps.initClient(agentDirectorCallTimeoutMsOf(config), { skipPhase1Floor: true })
@@ -1831,8 +1833,8 @@ export function createDirectorOps(getClient: () => DirectorClient): DirectorOps 
     // `include_finished` (b.jg5 SRJ-106, SRJ-904). The result is answered as
     // given and every error passes through, ErrSpawnNotFound included: the
     // teardown's checked kill reads both, and a result with no `kill_sent`
-    // field (a binary older than Phase 1, which only `stop --stop-bots`
-    // reaches) is a plain success there (b.jg5 SRJ-110, SRJ-902).
+    // field is a plain success there (b.jg5 SRJ-110, SRJ-902). This defensive
+    // result handling does not bypass the client's 0.12.0 binary minimum.
     directorKill: async (id) => {
       return getClient().kill({ instance_id: id })
     },

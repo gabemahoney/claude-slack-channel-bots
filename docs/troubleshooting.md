@@ -133,4 +133,6 @@ Note this covers only `server.log` / `clean_restart.log`. `startup-errors.log` a
 
 ## Startup errors
 
+Ordinary older agent-director releases and 0.12.0 release candidates are refused as `ad-system-install-too-old`. The unsupported development placeholder `0.0.0-dev` reaches CSCB's own guard and is refused as `ad-below-phase1-floor`. [Full entries](../skills/debug-slack-channel-bots/SKILL.md#ad-below-phase1-floor).
+
 CSCB writes startup errors to `~/.config/claude-slack-channel-bots/startup-errors.log` (under `SLACK_STATE_DIR` when it is set) and to stderr, one timestamped line each. The file is append-only and never rotated by CSCB; copy `docs/logrotate-startup-errors.conf` into `/etc/logrotate.d/` for host-level rotation. A fatal class, such as a refused agent-director binary or `retired-keys-unreadable`, stops the process; the others are recorded and the start continues. A refused state-directory move at the first start after an upgrade is the exception to where the file is: it is logged in the directory the CLI uses before the move, normally the old one (see [The state directory's location and its move at start](../skills/debug-slack-channel-bots/SKILL.md#the-state-directorys-location-and-its-move-at-start)). [Every class, what it means and what to do](../skills/debug-slack-channel-bots/SKILL.md#startup-errors-startup-errorslog).

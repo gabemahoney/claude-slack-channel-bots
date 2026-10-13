@@ -351,7 +351,7 @@ import {
   type StubClientOptions,
   type StubCreateClientOptions,
 } from './test-helpers/agent-director-stub.ts'
-import { BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
+import { BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION, DEV_PLACEHOLDER_VERSION } from './test-helpers/agent-director-versions.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import {
   makeMultiPersonaConfig,
@@ -866,12 +866,12 @@ const tooOldRefusal = (): Promise<StartupGateFailedError> => gateRefusalOf(tooOl
 
 /**
  * One build per refusal kind the whole gate gives (b.jg5 SRJ-203): the
- * client's own too-old refusal, CSCB's floor refusing `OLD_AD_VERSION`, and
+ * client's own too-old refusal, CSCB's floor refusing `DEV_PLACEHOLDER_VERSION`, and
  * another construction failure.
  */
 const GATE_REFUSAL_BUILDS: ReadonlyArray<readonly [StartupGateRefusalKind, () => StubCreateClientOptions]> = [
   [REFUSAL_KIND_CLIENT_TOO_OLD, () => tooOldBuild()],
-  [REFUSAL_KIND_BELOW_PHASE1_FLOOR, () => ({ client: makeStubClient({ binaryVersion: OLD_AD_VERSION }) })],
+  [REFUSAL_KIND_BELOW_PHASE1_FLOOR, () => ({ client: makeStubClient({ binaryVersion: DEV_PLACEHOLDER_VERSION }) })],
   [REFUSAL_KIND_OTHER, () => ({ error: errSystemInstallNotFound() })],
 ]
 
@@ -4882,9 +4882,9 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// stop --stop-bots on a binary older than Phase 1 (b.jg5 SRJ-902, AC 75's
+// stop --stop-bots on the development sentinel below Phase 1 (b.jg5 SRJ-902, AC 75's
 // part). Its init leaves CSCB's Phase 1 floor out, so on a binary the client
-// accepts (OLD_AD_VERSION) the precheck and teardown run through that client.
+// accepts (DEV_PLACEHOLDER_VERSION) the precheck and teardown run through that client.
 // Only the client's own too-old refusal, read from the gate's refusal kind and
 // never its label or message, stops the server alone: no precheck, no
 // teardown, the initialization-failed line carrying the gate's message, then
@@ -4895,7 +4895,7 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
 // runs.
 // ---------------------------------------------------------------------------
 
-describe('stop --stop-bots on a binary older than Phase 1 (b.jg5 SRJ-902, AC 75)', () => {
+describe('stop --stop-bots on the development sentinel below Phase 1 (b.jg5 SRJ-902, AC 75)', () => {
   beforeEach(() => resetClientForTests())
   afterEach(() => resetClientForTests())
 
@@ -4964,12 +4964,12 @@ describe('stop --stop-bots on a binary older than Phase 1 (b.jg5 SRJ-902, AC 75)
   // Through the stub client, as production wires it
   // -------------------------------------------------------------------------
 
-  test('on OLD_AD_VERSION, which the client accepts: the floor-exempt production init installs the stub with the configured call timeout, and per persona the stub gets get, a one-line readPane, status, pause and kill, in that order; the kill result with no kill_sent is a plain success, every persona is stopped and the server too; exit 0 (AC 75)', async () => {
+  test('on DEV_PLACEHOLDER_VERSION, which the client accepts: the floor-exempt production init installs the stub with the configured call timeout, and per persona the stub gets get, a one-line readPane, status, pause and kill, in that order; the kill result with no kill_sent is a plain success, every persona is stopped and the server too; exit 0 (AC 75)', async () => {
     const log = makeStubCallLog()
     const created: RecordedClientOptions = []
     const client = makeStubClient({
       ...log,
-      binaryVersion: OLD_AD_VERSION,
+      binaryVersion: DEV_PLACEHOLDER_VERSION,
       getFn: (params) => cannedGetResult({ instance_id: params.instance_id }),
       readPaneResults: [cannedReadPaneResult(FAKE_PANE)],
       statusResult: cannedStatusResult({ state: 'waiting' }),
@@ -5000,10 +5000,10 @@ describe('stop --stop-bots on a binary older than Phase 1 (b.jg5 SRJ-902, AC 75)
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls, created })
   })
 
-  test('the same OLD_AD_VERSION stub under clean_restart, whose init runs the whole gate: CSCB\'s floor refuses it, no stub verb is called, no client is installed, nothing is stopped; exit 1', async () => {
+  test('the same DEV_PLACEHOLDER_VERSION stub under clean_restart, whose init runs the whole gate: CSCB\'s floor refuses it, no stub verb is called, no client is installed, nothing is stopped; exit 1', async () => {
     const log = makeStubCallLog()
     const created: RecordedClientOptions = []
-    const client = makeStubClient({ ...log, binaryVersion: OLD_AD_VERSION })
+    const client = makeStubClient({ ...log, binaryVersion: DEV_PLACEHOLDER_VERSION })
     const b = productionWired(makeDeps, { client, calls: created })
 
     await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
@@ -5020,7 +5020,7 @@ describe('stop --stop-bots on a binary older than Phase 1 (b.jg5 SRJ-902, AC 75)
       agentDirectorInitFailedLine(CLI_COMMAND_CLEAN_RESTART, refusal.message),
       precheckNothingStoppedLine(CLI_COMMAND_CLEAN_RESTART),
     ])
-    expect(stderr[0]).toContain(OLD_AD_VERSION)
+    expect(stderr[0]).toContain(DEV_PLACEHOLDER_VERSION)
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
   })
 
@@ -5175,7 +5175,7 @@ describe('initProductionClient', () => {
 
   test.each<[StartupGateRefusalKind, string, () => StubCreateClientOptions]>([
     [REFUSAL_KIND_CLIENT_TOO_OLD, AD_SYSTEM_INSTALL_TOO_OLD, () => ({ error: errSystemInstallTooOld() })],
-    [REFUSAL_KIND_BELOW_PHASE1_FLOOR, AD_BELOW_PHASE1_FLOOR, () => ({ client: makeStubClient({ binaryVersion: OLD_AD_VERSION }) })],
+    [REFUSAL_KIND_BELOW_PHASE1_FLOOR, AD_BELOW_PHASE1_FLOOR, () => ({ client: makeStubClient({ binaryVersion: DEV_PLACEHOLDER_VERSION }) })],
     [REFUSAL_KIND_OTHER, AD_SYSTEM_INSTALL_NOT_FOUND, () => ({ error: errSystemInstallNotFound() })],
   ])('the whole gate (no gate options) refusing with kind %s (label %s): the client was built with the call timeout, the thrown StartupGateFailedError keeps that kind and label, and no client is installed', async (kind, label, stub) => {
     const calls: RecordedClientOptions = []
@@ -5194,9 +5194,9 @@ describe('initProductionClient', () => {
   })
 
   // b.jg5 SRJ-203, SRJ-902: the gate stop --stop-bots asks for leaves only CSCB's floor out.
-  test('with the floor-exempt gate, a client reporting OLD_AD_VERSION (below CSCB\'s floor, accepted by the client) passes: built with the call timeout and installed as the singleton', async () => {
+  test('with the floor-exempt gate, a client reporting DEV_PLACEHOLDER_VERSION (below CSCB\'s floor, ranked above every minimum by the client) passes: built with the call timeout and installed as the singleton', async () => {
     const calls: RecordedClientOptions = []
-    const client = makeStubClient({ binaryVersion: OLD_AD_VERSION })
+    const client = makeStubClient({ binaryVersion: DEV_PLACEHOLDER_VERSION })
 
     await initProductionClient(MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS, FLOOR_EXEMPT_GATE, passingGateSeams(makeStubCreateClient({ client, calls })))
 

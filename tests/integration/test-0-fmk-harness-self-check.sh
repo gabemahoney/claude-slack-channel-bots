@@ -54,9 +54,10 @@
 #   swap             after a swap to 0.10.0 the shim is in place with 0.10.0
 #                    behind it and a call through it reports 0.10.0; after the
 #                    swap back, the release again.
-#   reinstall        after a second run of the release's install.sh
+#   reinstall        quiesce the fixture before a second install.sh; then
 #                    and its re-shim, the shim is in place with the release
-#                    behind it at both paths, and the store id is unchanged.
+#                    behind it at both paths, the terminal row and store id
+#                    are unchanged; respawn the fixture for later checks.
 #   hide_restore     hide leaves no file at the standard path and none behind
 #                    it, and keeps the log; restore puts the shim back with the
 #                    release behind it.
@@ -470,7 +471,8 @@
 #                    `install_ad_release` (the release's install.sh, then
 #                    the re-shim) the shim check passes, the store has a store
 #                    id, every row is still present with its name and labels
-#                    and its worker still runs; then each seeder refuses for
+#                    and its terminal state; workers end before the install and stay gone;
+#                    then each seeder refuses for
 #                    each of its three reasons. The nested run ends with the
 #                    closing assertions over a stand-in bot server and passes.
 #   tmux_server_steps
@@ -1613,7 +1615,13 @@ leg_swap() {
 }
 
 leg_reinstall() {
-    local step="reinstall" store_id
+    local step="reinstall" store_id work worker_pid terminal_state
+    ad_capture get "${SCENARIO_AD_ID_FLAG}" "${T0_ROW_ID}"
+    (( AD_RC == 0 )) || fail "${step}: cannot read the fixture before quiescence"
+    work="$(jq -er '.cwd' "${AD_OUT}")"
+    worker_pid="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${T0_SESSION}:" '#{pane_pid}')"
+    nested_quiesce_seed_row "${T0_ROW_ID}" "${T0_SESSION}" "${worker_pid}"
+    terminal_state="$(jq -r '.state' "${AD_OUT}")"
     install_ad_release "${step}: install.sh again"
     expect_shim_in_place "${step}: after install.sh and its re-shim" "${SCENARIO_RELEASE_BIN}"
     expect_shim_in_place "${step}: agent-director-admin after install.sh and its re-shim" "${SCENARIO_RELEASE_ADMIN}" \
@@ -1621,6 +1629,14 @@ leg_reinstall() {
     expect_ad_version "${step}" "${REL_VERSION}" "${REL_COMMIT}"
     store_id="$(ad_store_id)"
     [[ "${store_id}" == "${T0_STORE_ID}" ]] || fail "${step}: the store id changed from ${T0_STORE_ID} to ${store_id}"
+    nested_expect_row "${T0_ROW_ID}" "${T0_SESSION}" '{"t0":"edited"}' "${terminal_state}"
+    # Later shim checks need a live fixture again; create it after reinstall.
+    ad_capture spawn --agent claude --cwd "${work}" --instance-id "${T0_ROW_ID}" \
+        --tmux-session-name "${T0_SESSION}" --no-pre-trust --reuse-finished --label "t0=edited"
+    (( AD_RC == 0 )) || fail "${step}: fixture respawn failed: $(head -c 300 "${AD_ERR}")"
+    nested_expect_row "${T0_ROW_ID}" "${T0_SESSION}" '{"t0":"edited"}'
+    T0_TMUX_PID="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${T0_SESSION}:" '#{pid}')"
+
 }
 
 leg_hide_restore() {
@@ -3871,21 +3887,74 @@ nested_expect_refused() {
 }
 
 # nested_expect_row <instance-id> <session> <labels-json>: in the nested run,
-# a harness get finds the row live or waiting, recording <session> and exactly
-# <labels-json>, and the session runs on the run's tmux server.
+# a harness get preserves identity, <session> and exactly <labels-json>.
+# Before upgrade its session runs; with <state>, that terminal state is
+# retained and the session must be gone.
 # Deliberate pre-0.12 argv: this assertion runs before and after migration.
 nested_expect_row() {
-    local id="$1" session="$2" labels="$3"
+    local id="$1" session="$2" labels="$3" state="${4:-}" cwd="${5:-}"
     ad_capture get "${SCENARIO_AD_ID_FLAG}" "${id}"
     (( AD_RC == 0 )) || fail "harness get of ${id} exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
-    jq -e --arg s "${session}" --argjson l "${labels}" '.tmux_session_name == $s and .labels == $l' "${AD_OUT}" > /dev/null \
+    jq -e --arg s "${session}" --argjson l "${labels}" --arg id "${id}" --arg key "${SCENARIO_AD_ID_COLUMN}" --arg state "${state}" --arg cwd "${cwd}" '.[$key] == $id and .tmux_session_name == $s and .labels == $l and ($state == "" or .state == $state) and ($cwd == "" or .cwd == $cwd)' "${AD_OUT}" > /dev/null \
         || fail "row ${id} reads $(tr '\n' ' ' < "${AD_OUT}" | head -c 600), not session ${session} with labels ${labels}"
-    "${SCENARIO_REAL_TMUX}" has-session -t "=${session}" 2> /dev/null || fail "no session ${session} for row ${id}"
+    if [[ -z "${state}" ]]; then
+        "${SCENARIO_REAL_TMUX}" has-session -t "=${session}" 2> /dev/null || fail "no session ${session} for row ${id}"
+    else
+        ! "${SCENARIO_REAL_TMUX}" has-session -t "=${session}" 2> /dev/null || fail "session ${session} survived the upgrade"
+    fi
+}
+
+# Reconcile with the active old binary: killing tmux alone leaves live rows
+# that the release installer correctly refuses. Never expire or delete rows.
+nested_seed_row_quiescent() {
+    local id="$1" session="$2" pid="$3"
+    ad_capture find-missing
+    (( AD_RC == 0 )) || return 1
+    ad_capture get "${SCENARIO_AD_ID_FLAG}" "${id}"
+    (( AD_RC == 0 )) || return 1
+    jq -e '.state == "ended" or .state == "missing"' "${AD_OUT}" > /dev/null || return 1
+    ! pid_alive "${pid}" || return 1
+    ! "${SCENARIO_REAL_TMUX}" has-session -t "=${session}" 2> /dev/null
+}
+
+nested_quiesce_seed_row() {
+    local id="$1" session="$2" pid="$3"
+    ad_capture kill "${SCENARIO_AD_ID_FLAG}" "${id}"
+    (( AD_RC == 0 )) || fail "old binary could not kill seeded row ${id}: $(head -c 300 "${AD_ERR}")"
+    wait_until "${SCENARIO_WORKER_END_S}" "seeded row ${id} must be terminal with its worker and session gone before install" \
+        nested_seed_row_quiescent "${id}" "${session}" "${pid}"
+}
+
+# Upgrade only after every seeded worker is gone, retaining rows and metadata.
+nested_migrate_seed_rows() {
+    local step="0.10.0 seeders" pids=("$@") states=() cwds=() n cwd
+    local ids=(t0-010-row cscb_ops_team_C0T0AAA01 cscb_C0T0BBB02)
+    local sessions=(t0_010_row slack_bot_ops_team_C0T0AAA01 slack_bot_C0T0BBB02)
+    for n in 0 1 2; do
+        nested_quiesce_seed_row "${ids[n]}" "${sessions[n]}" "${pids[n]}"
+        states+=("$(jq -r '.state' "${AD_OUT}")")
+        cwd="$(jq -er '.cwd | select(type == "string" and length > 0)' "${AD_OUT}")" \
+            || fail "seeded row ${ids[n]} has no cwd to preserve across migration"
+        cwds+=("${cwd}")
+    done
+    echo "CHECK: seeded rows quiescent before install"
+    install_ad_release "${step}: install_ad_release over the seeded rows"
+    check_ad_shim "${step}: after install_ad_release"
+    expect_shim_in_place "${step}: after install_ad_release" "${SCENARIO_RELEASE_BIN}"
+    [[ "$(ad_store_id)" =~ ^[0-9a-f]{16}$ ]] || fail "no store id after install_ad_release"
+    nested_expect_row t0-010-row t0_010_row '{"team":"t0"}' "${states[0]}" "${cwds[0]}"
+    nested_expect_row cscb_ops_team_C0T0AAA01 slack_bot_ops_team_C0T0AAA01 '{"service":"cscb","channel":"C0T0AAA01"}' "${states[1]}" "${cwds[1]}"
+    nested_expect_row cscb_C0T0BBB02 slack_bot_C0T0BBB02 '{"service":"cscb","channel":"C0T0BBB02"}' "${states[2]}" "${cwds[2]}"
+    for n in 0 1 2; do
+        ! pid_alive "${pids[n]}" || fail "seeded worker ${pids[n]} runs after install"
+    done
+    echo "CHECK: rows survive the release's install"
+
 }
 
 # The body of leg_seeders_010's nested fmk run (started on 0.10.0).
 nested_seed_010() {
-    local step="0.10.0 seeders" dir_row dir_a dir_b config out lines=() want=() id session sid pane pids=() i n
+    local step="0.10.0 seeders" dir_row dir_a dir_b config out lines=() want=() id session sid pane pids=() i
     expect_shim_in_place "${step}" "${SCENARIO_AD_010_BIN}"
     dir_row="$(make_workdir row)"
     dir_a="${HOME}/t0-route-a"
@@ -3926,24 +3995,11 @@ nested_seed_010() {
         || fail "the second route's worker does not run in ${dir_b}"
     echo "CHECK: seed_prepersona_fleet"
 
-    # The release's install over the 0.10.0 rows.
+    # Preserve rows across schema migration, with no worker across upgrade.
     for session in t0_010_row slack_bot_ops_team_C0T0AAA01 slack_bot_C0T0BBB02; do
         pids+=("$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${session}:" '#{pane_pid}')")
     done
-    install_ad_release "${step}: install_ad_release over the seeded rows"
-    check_ad_shim "${step}: after install_ad_release"
-    expect_shim_in_place "${step}: after install_ad_release" "${SCENARIO_RELEASE_BIN}"
-    [[ "$(ad_store_id)" =~ ^[0-9a-f]{16}$ ]] || fail "no store id after install_ad_release"
-    nested_expect_row t0-010-row t0_010_row '{"team":"t0"}'
-    nested_expect_row cscb_ops_team_C0T0AAA01 slack_bot_ops_team_C0T0AAA01 '{"service":"cscb","channel":"C0T0AAA01"}'
-    nested_expect_row cscb_C0T0BBB02 slack_bot_C0T0BBB02 '{"service":"cscb","channel":"C0T0BBB02"}'
-    n=0
-    for session in t0_010_row slack_bot_ops_team_C0T0AAA01 slack_bot_C0T0BBB02; do
-        [[ "$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${session}:" '#{pane_pid}')" == "${pids[n]}" ]] && pid_alive "${pids[n]}" \
-            || fail "the worker of ${session} (${pids[n]}) did not survive install_ad_release"
-        n=$(( n + 1 ))
-    done
-    echo "CHECK: rows survive the release's install"
+    nested_migrate_seed_rows "${pids[@]}"
 
     # Each seeder now refuses, for each of its reasons: install.sh has run;
     # the binary behind the shim is not 0.10.0; the store has a store_meta.
@@ -3973,10 +4029,10 @@ nested_with_no_install() {
 
 leg_seeders_010() {
     local step="0.10.0 seeders" name="test-0-fmk-nested-seeders-010"
-    run_nested "${name}" 0.10.0 nested_seed_010 nested_expect_refused nested_expect_row nested_with_no_install \
+    run_nested "${name}" 0.10.0 nested_seed_010 nested_expect_refused nested_expect_row nested_with_no_install nested_quiesce_seed_row nested_seed_row_quiescent nested_migrate_seed_rows \
         expect_shim_in_place nested_stand_in nested_closing
     expect_nested_markers "${step}" "fleet refused before its first row" seed_010_row seed_prepersona_fleet \
-        "rows survive the release's install" "seeders refuse after the install" \
+        "seeded rows quiescent before install" "rows survive the release's install" "seeders refuse after the install" \
         assert_no_server_tmux assert_no_cscb_include_finished assert_no_cscb_delete
     if (( NESTED_RC != 0 )) || grep -q '^FAIL:' "${NESTED_OUT}" || ! grep -qxF "PASS: ${name}" "${NESTED_OUT}"; then
         sed 's/^/  | /' "${NESTED_OUT}" >&2
