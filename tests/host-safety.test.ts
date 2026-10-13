@@ -2738,8 +2738,8 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       ['restore_tmux_socket', 'its socket move', 'mv'],
       ['stub_dialog_delay', 'its move', 'mv'],
       ['install_ad_release', 'its install.sh run', '${SCENARIO_RELEASE_INSTALL_SH}'],
-      ['ad_admin', 'its run of the HOME’s agent-director-admin', '${HOME}/.config/agent-director/admin/agent-director-admin'],
-      ['ad', 'its run of the HOME’s agent-director', '${HOME}/.config/agent-director/bin/agent-director'],
+      ['ad_admin', 'its run of the HOME’s agent-director-admin', '${SCENARIO_AD_ROOT}/admin/agent-director-admin'],
+      ['ad', 'its run of the HOME’s agent-director', '${SCENARIO_AD_ROOT}/bin/agent-director'],
       ['hide_ad_install', 'its move of the shim', 'mv'],
       ['_scenario_store_read', 'its sqlite3 read', 'sqlite3'],
     ])('%s without its require_scenario_home is flagged at %s', (helper, _label, step) => {

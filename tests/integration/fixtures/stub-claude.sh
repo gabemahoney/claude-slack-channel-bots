@@ -614,6 +614,12 @@ NEXT_TICK_MS=0
 # Set GRACE_S to G (see the header).
 read_grace() {
     local file="${HOME}/.config/agent-director/config.toml" v=""
+    # Deliberate pre-0.12 worker contract: the registered old hook selects
+    # the old config layout, just as it selects the old status flag below.
+    # A binary swap after migration keeps the installed hook's current layout.
+    case "${STATUS_BIN}" in
+        */.agent-director/bin/*) file="${HOME}/.agent-director/config.toml" ;;
+    esac
     GRACE_S="${DEFAULT_PENDING_GRACE_S}"
     [[ -f "${file}" ]] || return 0
     v="$(awk '
@@ -671,13 +677,19 @@ stop_refire() {
 # One tick: read the row, then re-fire, stop silently, or stop with the
 # stop line.
 refire_tick() {
-    local id="${AGENT_DIRECTOR_INSTANCE_ID:-}" rc=0 parsed state launch launch_ms
+    local id="${AGENT_DIRECTOR_INSTANCE_ID:-}" flag=--instance-id rc=0 parsed state launch launch_ms
+    # Deliberate pre-0.12 worker contract: the old hook binary lives in the
+    # old install layout and accepts only the old status flag. The worker id
+    # environment variable itself did not change between these releases.
+    case "${STATUS_BIN}" in
+        */.agent-director/bin/*) flag=--claude-instance-id ;;
+    esac
     if [[ -z "${id}" ]]; then
         stop_refire
         write_stop_line - AGENT_DIRECTOR_INSTANCE_ID is unset or empty
         return 0
     fi
-    "${STATUS_BIN}" status --instance-id "${id}" > "${STATUS_OUT}" 2> "${STATUS_OUT}.err" || rc=$?
+    "${STATUS_BIN}" status "${flag}" "${id}" > "${STATUS_OUT}" 2> "${STATUS_OUT}.err" || rc=$?
     if (( rc != 0 )); then
         stop_refire
         write_stop_line "${id}" the status read exited "${rc}"

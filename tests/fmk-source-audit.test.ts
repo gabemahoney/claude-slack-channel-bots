@@ -91,16 +91,21 @@
  * type literal or mapped type, so it declares no field the client declares
  * (b.jg5 SRJ-101, SRJ-1303); it is pinned the same way.
  *
- * The file starts no process and reads nothing outside the repository and
- * its installed client.
+ * Source audits read only the repository and installed client. Legacy
+ * contract regressions run extracted declarations in an inert bash child
+ * under a temporary HOME; they never source the harness or execute AD/tmux.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import * as agentDirectorClient from 'agent-director'
-import { readdirSync, readFileSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { spawnSync } from 'node:child_process'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import ts from 'typescript'
 
 import { AD_TMUX_TABLE } from '../src/ad-settings.ts'
@@ -1488,5 +1493,224 @@ describe('released client unknown-envelope classification audit', () => {
   test.each(['err.errName', 'err.name', "err['errName']"])("the unknown helper exemption still finds a native/base %s dispatch", (field) => {
     const code = `function classifyUnknownName(unknownName: unknown, err: AgentDirectorError) { if (${field} === 'ErrInternal') return 'CONFIG' }`
     expect(unsanctioned(byNameFindings([['src/ad-error-class.ts', code]]))).toHaveLength(1)
+  })
+})
+
+
+// b.m2o: evaluate only extracted helper declarations with inert shell stubs.
+// Never source the integration harness or start a real AD/tmux/worker process.
+describe('b.m2o: deliberate pre-0.12 integration contracts', () => {
+  const scenario = readFileSync(join(import.meta.dir, 'integration/lib/scenario.sh'), 'utf8')
+  const helper = (name: string, source = scenario): string => {
+    const match = source.match(new RegExp(`^${name}\\(\\) \\{\n[\\s\\S]*?^\\}`, 'm'))
+    expect(match).not.toBeNull()
+    return match![0]
+  }
+  let home: string
+  beforeEach(() => { home = mkdtempSync(join(tmpdir(), 'cscb-old-release-contract-')) })
+  afterEach(() => { rmSync(home, { recursive: true, force: true }) })
+  const shell = (code: string, tools: string[] = []): string => {
+    const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-c', code], {
+      encoding: 'utf8', timeout: 5000,
+      env: hostSafeChildEnv(home, { tools }),
+    })
+    expect(result.stderr).toBe('')
+    expect(result.status).toBe(0)
+    return result.stdout.trim()
+  }
+  test.each(['0.10.0', '0.11.0', '0.11.9', '0.12.0'])('install-stage contract for %s selects argv, SQL and result keys together', (version) => {
+    const legacy = version.startsWith('0.10.') || version.startsWith('0.11.')
+    const result = shell(`${helper('_scenario_ad_contract')}
+_scenario_ad_contract '${version}'
+printf '%s|%s|%s|%s' "$SCENARIO_AD_ROOT" "$SCENARIO_AD_ID_FLAG" "$SCENARIO_AD_ID_COLUMN" "$SCENARIO_AD_SESSION_KEY"`)
+    expect(result).toBe(legacy
+      ? `${home}/.agent-director|--claude-instance-id|claude_instance_id|claude_session_id`
+      : `${home}/.config/agent-director|--instance-id|instance_id|session_id`)
+  })
+  const worker = readFileSync(join(import.meta.dir, 'integration/fixtures/stub-claude.sh'), 'utf8')
+  test.each([
+    ['0.10 hook', '.agent-director', '17', '29', '17'],
+    ['0.11 hook', '.agent-director', '23', '31', '23'],
+    ['0.12 hook', '.config/agent-director', '37', '41', '41'],
+    ['old binary swapped into migrated hook', '.config/agent-director', '43', '47', '47'],
+    ['0.10 hook with absent config', '.agent-director', null, '53', '60'],
+    ['0.11 hook with absent config', '.agent-director', null, '59', '60'],
+    ['0.10 hook with invalid config', '.agent-director', 'invalid', '61', '60'],
+    ['0.11 hook with invalid config', '.agent-director', '0', '67', '60'],
+    ['current hook with absent config', '.config/agent-director', '71', null, '60'],
+    ['current hook with invalid config', '.config/agent-director', '73', '-1', '60'],
+  ])('pending grace follows the %s installed path', (_label, install, oldGrace, currentGrace, expected) => {
+    const configs = [['.agent-director', oldGrace], ['.config/agent-director', currentGrace]] as const
+    // Create config-only fixtures after the child environment has been checked.
+    const setup = configs.filter(([, grace]) => grace !== null).map(([directory, grace]) =>
+      `mkdir -p "$HOME/${directory}"\nprintf '[tmux]\\npending_grace_seconds = ${grace}\\n' > "$HOME/${directory}/config.toml"`).join('\n')
+    // The hook path is data only: neither directory contains an executable.
+    const output = shell(`${setup}
+${helper('read_grace', worker)}
+DEFAULT_PENDING_GRACE_S=60
+STATUS_BIN="$HOME/${install}/bin/agent-director"
+GRACE_S=999
+read_grace
+printf '%s' "$GRACE_S"`, ['awk', 'mkdir'])
+    assertNoLeak({ output, configs: configs.filter(([, grace]) => grace !== null).map(([directory]) => writtenFile(join(home, directory, 'config.toml'))) })
+    expect(output).toBe(expected!)
+  })
+  const selfCheck = readFileSync(join(import.meta.dir, 'integration/test-0-fmk-harness-self-check.sh'), 'utf8')
+  const shimHelpers = ['_scenario_ad_contract', '_scenario_is_shim', '_scenario_check_shim_at', 'check_ad_shim'].map((name) => helper(name)).join('\n')
+  const fixturePrelude = `${shimHelpers}
+${helper('expect_fails_in_home', selfCheck)}
+require_ci_image() { :; }
+require_scenario_home() { :; }
+fail() { printf 'FAIL: %s: %s\\n' "$TEST_NAME" "$*" >&2; exit 1; }
+TEST_NAME=test-fixture
+SCENARIO_ROOT="$HOME"
+SCENARIO_AD_SHIM_MARKER='# inert fixture shim'
+SCENARIO_AD_SHIM_SRC="$HOME/shim-source"
+SCENARIO_RELEASE_BIN="$HOME/inert-binary"
+printf '%s\\n' "$SCENARIO_AD_SHIM_MARKER" 'exit 97' > "$SCENARIO_AD_SHIM_SRC"
+printf '%s\\n' 'exit 98' > "$SCENARIO_RELEASE_BIN"`
+  test('shim self-check checks and rejects corruption in its alternate HOME', () => {
+    const output = shell(`${fixturePrelude}
+${helper('leg_shim_check', selfCheck)}
+${helper('_scenario_check_shim_at').replace('_scenario_check_shim_at()', 'check_fixture_shim()')}
+_scenario_check_shim_at() { printf '%s\\n' "$1"; check_fixture_shim "$@"; }
+_scenario_ad_contract release
+mkdir -p "$SCENARIO_AD_ROOT/bin"
+cp "$SCENARIO_AD_SHIM_SRC" "$SCENARIO_AD_BIN"
+cp "$SCENARIO_RELEASE_BIN" "$SCENARIO_AD_BIN.real"
+chmod 0755 "$SCENARIO_AD_BIN" "$SCENARIO_AD_BIN.real"
+leg_shim_check
+printf '%s' "$SCENARIO_AD_ROOT"`, ['grep', 'sed', 'mkdir', 'cp', 'chmod', 'rm', 'ln'])
+    expect(output).toBe(`${home}/home-shim-check/.config/agent-director/bin/agent-director\n${home}/.config/agent-director`)
+  })
+  test.each(['0.10.0', '0.11.0', '0.12.0'])('negative HOME fixture keeps the %s stage and leaves the parent contract intact', (version) => {
+    const output = shell(`${fixturePrelude}
+_scenario_ad_contract '${version}'
+original_root="$SCENARIO_AD_ROOT"
+original_flag="$SCENARIO_AD_ID_FLAG"
+original_bin="$SCENARIO_AD_BIN"
+original_log="$SCENARIO_AD_SHIM_LOG"
+_SCENARIO_REAL_AD_SHIM_LOG="$original_log"
+mkdir -p "$SCENARIO_AD_ROOT/bin"
+cp "$SCENARIO_AD_SHIM_SRC" "$SCENARIO_AD_BIN"
+cp "$SCENARIO_RELEASE_BIN" "$SCENARIO_AD_BIN.real"
+chmod 0755 "$SCENARIO_AD_BIN" "$SCENARIO_AD_BIN.real"
+fixture_home="$HOME/alternate"
+fixture_root="$fixture_home/\${SCENARIO_AD_ROOT#"$HOME/"}"
+mkdir -p "$fixture_root/bin"
+cp "$SCENARIO_RELEASE_BIN" "$fixture_root/bin/agent-director.real"
+chmod 0755 "$fixture_root/bin/agent-director.real"
+ln -s "$SCENARIO_AD_SHIM_SRC" "$fixture_root/bin/agent-director"
+expect_fails_in_home symlink "$fixture_home" 'is a symlink, not the shim' check_ad_shim
+grep -qF "$fixture_root/bin/agent-director is a symlink" "$SCENARIO_ROOT/expect-fails.out" || exit 2
+rm "$fixture_root/bin/agent-director"
+cp "$SCENARIO_RELEASE_BIN" "$fixture_root/bin/agent-director"
+chmod 0755 "$fixture_root/bin/agent-director"
+expect_fails_in_home marker "$fixture_home" "does not carry the shim's marker" check_ad_shim
+grep -qF "$fixture_root/bin/agent-director does not carry" "$SCENARIO_ROOT/expect-fails.out" || exit 3
+[[ "$SCENARIO_AD_ROOT" == "$original_root" && "$SCENARIO_AD_ID_FLAG" == "$original_flag" ]] || exit 4
+[[ "$SCENARIO_AD_BIN" == "$original_bin" && "$SCENARIO_AD_SHIM_LOG" == "$original_log" && "$_SCENARIO_REAL_AD_SHIM_LOG" == "$original_log" ]] || exit 5
+printf '%s' "$SCENARIO_AD_ROOT"`, ['grep', 'sed', 'mkdir', 'cp', 'chmod', 'rm', 'ln'])
+    expect(output).toBe(`${home}/${version === '0.12.0' ? '.config/agent-director' : '.agent-director'}`)
+  })
+  test('old seeder reaches capture with the guarded legacy argv and no agent flag', () => {
+    const output = shell(`${helper('seed_010_row')}
+
+require_ci_image() { :; }
+require_scenario_home() { :; }
+_scenario_tmux_check() { :; }
+_scenario_require_010() { printf 'guard\n'; }
+_scenario_check_instance_id() { :; }
+_scenario_tmux() { return 1; }
+_scenario_stub_mode_of() { printf 'silent'; }
+ad_capture() { printf '<%s>' "$@"; exit 0; }
+STUB_MODE_AT_ONCE=at-once
+seed_010_row test-old old-session "$HOME" service=cscb`)
+    expect(output).toBe(`guard\n<spawn><--cwd><${home}><--claude-instance-id><test-old><--tmux-session-name><old-session><--label><service=cscb>`)
+    expect(output).not.toContain('<--agent>')
+  })
+  test.each(['0.10.0', '0.11.0', '0.12.0'])('row query for %s uses the installed schema column', (version) => {
+    const output = shell(`${helper('_scenario_ad_contract')}
+${helper('_scenario_row_json')}
+_scenario_store_read() { printf '%s' "$2"; }
+_scenario_ad_contract '${version}'
+_scenario_row_json row test-id`)
+    expect(output).toBe(`SELECT * FROM spawns WHERE ${version === '0.12.0' ? 'instance_id' : 'claude_instance_id'} = 'test-id'`)
+  })
+  test.each([
+    ['--claude-instance-id test-id'], ['--claude-instance-id=test-id'],
+    ['--instance-id test-id'], ['--instance-id=test-id'],
+  ])('mixed upgrade call logs decode %s exactly', (args) => {
+    const result = shell(`${helper('_scenario_ad_id')}\n_L_ARGS=(${args})\n_scenario_ad_id\nprintf '%s' "$_L_ID"`)
+    expect(result).toBe('test-id')
+  })
+  test('swapping a below-floor binary never changes the installed stage contract', () => {
+    expect(helper('swap_ad_binary')).not.toContain('_scenario_ad_contract')
+    const install = helper('install_ad_release')
+    expect(install.indexOf('_scenario_ad_contract release')).toBeGreaterThan(install.indexOf('if [[ "${rc}" -ne 0 ]]'))
+    expect(install.indexOf('_scenario_ad_contract release')).toBeLessThan(install.indexOf('reshim_ad'))
+  })
+  test('legacy seeder verifies version and schema before spawn; a rename regression is detected', () => {
+    const guard = helper('_scenario_require_010')
+    expect(guard).toContain('"${ver}" == "${SCENARIO_AD_010_VERSION}"')
+    expect(guard).toContain("WHERE name = 'claude_instance_id'")
+    const seed = helper('seed_010_row')
+    expect(seed.indexOf('_scenario_require_010')).toBeLessThan(seed.indexOf('ad_capture spawn'))
+    expect(seed).toContain('spawn --cwd "${dir}" --claude-instance-id "${id}"')
+    const renamed = seed.replace('--claude-instance-id', '--instance-id').replace('spawn --cwd', 'spawn --agent claude --cwd')
+    expect(renamed).not.toContain('spawn --cwd "${dir}" --claude-instance-id "${id}"')
+  })
+})
+
+
+/** Old tokens are permitted only inside specific old-release/mixed-log helper
+ * bodies, with a deliberate legacy comment and the expected number of lines.
+ * Neither a whole file nor the integration tree gets an exemption. */
+const LEGACY_HELPER_CONTRACTS: Record<string, Record<string, number>> = {
+  'lib/scenario.sh': { _scenario_ad_contract: 4, _scenario_require_010: 2, _scenario_row_left_pending: 1, seed_010_row: 2, _scenario_ad_id: 2, ad_trail_events: 1 },
+  'fixtures/stub-claude.sh': { read_grace: 1, refire_tick: 1 },
+  'test-0-fmk-harness-self-check.sh': { leg_guard_refusals: 4 },
+}
+const LEGACY_TOKEN = /claude_instance_id|claude-instance-id|claude_session_id|claude_args|AGENT_DIRECTOR_CLAUDE_INSTANCE_ID|\.agent-director(?:\/|["'])/
+function legacyIntegrationFindings(file: string, source: string): string[] {
+  const allowed = LEGACY_HELPER_CONTRACTS[file] ?? {}
+  const permitted = new Set<number>()
+  const problems: string[] = []
+  for (const [name, count] of Object.entries(allowed)) {
+    const re = new RegExp(`^${name}\\(\\) \\{\n[\\s\\S]*?^\\}`, 'm')
+    const match = re.exec(source)
+    if (!match) { problems.push(`${file}: missing legacy helper ${name}`); continue }
+    const start = source.slice(0, match.index).split('\n').length - 1
+    const comment = source.slice(Math.max(0, source.lastIndexOf('\n}', match.index) + 2), match.index) + match[0]
+    if (!/Deliberate pre-0\.12/.test(comment)) problems.push(`${file}: ${name} lacks its deliberate legacy comment`)
+    const hits = match[0].split('\n').flatMap((line, offset) => !/^\s*#/.test(line) && LEGACY_TOKEN.test(line) ? [start + offset] : [])
+    if (hits.length !== count) problems.push(`${file}: ${name} has ${hits.length} legacy lines, expected ${count}`)
+    for (const line of hits) permitted.add(line)
+  }
+  source.split('\n').forEach((line, index) => {
+    if (!/^\s*#/.test(line) && LEGACY_TOKEN.test(line) && !permitted.has(index)) problems.push(`${file}:${index + 1}: legacy token outside an old-release contract`)
+  })
+  return problems
+}
+describe('b.m2o: old-name audit exempts only deliberate old-release contracts', () => {
+  const base = join(import.meta.dir, 'integration')
+  const files = (root: string): string[] => readdirSync(root, { withFileTypes: true }).flatMap((entry) => entry.isDirectory() ? files(join(root, entry.name)) : [join(root, entry.name)])
+  test('the integration tree has no old token outside its documented helper contracts', () => {
+    expect(files(base).flatMap((file) => legacyIntegrationFindings(file.slice(base.length + 1), readFileSync(file, 'utf8')))).toEqual([])
+  })
+  test.each(['other.sh', 'lib/other.sh', 'fixtures/driver.ts', 'test-13-fmk-switch-over.sh'])('an old call in %s has no exemption', (file) => {
+    expect(legacyIntegrationFindings(file, 'ad spawn --claude-instance-id x')).toHaveLength(1)
+  })
+  test('an extra legacy call inside a sanctioned helper is refused', () => {
+    const source = readFileSync(join(base, 'lib/scenario.sh'), 'utf8')
+    const planted = source.replace('seed_010_row() {', 'seed_010_row() {\n    ad get --claude-instance-id planted')
+    expect(legacyIntegrationFindings('lib/scenario.sh', planted)).toContain('lib/scenario.sh: seed_010_row has 3 legacy lines, expected 2')
+  })
+  test('an extra old config read inside the worker grace helper is refused', () => {
+    const source = readFileSync(join(base, 'fixtures/stub-claude.sh'), 'utf8')
+    const planted = source.replace('read_grace() {', 'read_grace() {\n    cat "$HOME/.agent-director/config.toml"')
+    expect(legacyIntegrationFindings('fixtures/stub-claude.sh', planted)).toContain('fixtures/stub-claude.sh: read_grace has 2 legacy lines, expected 1')
+    const outside = `${source}\ncat "$HOME/.agent-director/config.toml"\n`
+    expect(legacyIntegrationFindings('fixtures/stub-claude.sh', outside)).toEqual([`fixtures/stub-claude.sh:${source.split('\n').length + 1}: legacy token outside an old-release contract`])
   })
 })

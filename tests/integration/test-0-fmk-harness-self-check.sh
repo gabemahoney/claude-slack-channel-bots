@@ -595,7 +595,7 @@ REFIRE_QUIET_S=6
 # A reporting stub's first record comes within this long of its start (or
 # its Enter).
 REFIRE_FIRST_S=3
-REFIRE_TRAIL="${HOME}/.config/agent-director/ad-trail.jsonl"
+REFIRE_TRAIL="${SCENARIO_AD_ROOT}/ad-trail.jsonl"
 
 # Set by the re-fire legs: the held row's worker PID, its launch start
 # (epoch seconds with milliseconds, and as status printed it) and the
@@ -786,7 +786,13 @@ expect_fails_in_home() {
     local step="$1" home="$2" reason="$3"
     shift 3
     local out="${SCENARIO_ROOT}/expect-fails.out" rc=0 line
-    ( export HOME="${home}"; "$@" ) > "${out}" 2>&1 || rc=$?
+    # Rebind paths to the fixture HOME while retaining its installed stage.
+    # The subshell keeps the scenario's paths and enforcement snapshots intact.
+    (
+        export HOME="${home}"
+        _scenario_ad_contract "${SCENARIO_AD_CONTRACT_VERSION}"
+        "$@"
+    ) > "${out}" 2>&1 || rc=$?
     if (( rc == 0 )); then
         sed 's/^/  | /' "${out}" >&2
         fail "${step}: '$*' with HOME ${home} succeeded, not failing with '${reason}'"
@@ -1471,9 +1477,9 @@ leg_isolation() {
         || fail "${step}: ${SCENARIO_BIN}/claude is not the stub"
     [[ "$(type -P bun || true)" == /* ]] || fail "${step}: bun is not found on the scenario's PATH"
 
-    [[ "${SCENARIO_AD_BIN}" == "${HOME}/.config/agent-director/bin/agent-director" ]] \
+    [[ "${SCENARIO_AD_BIN}" == "${SCENARIO_AD_ROOT}/bin/agent-director" ]] \
         || fail "${step}: SCENARIO_AD_BIN ${SCENARIO_AD_BIN} is not the scenario HOME's standard path"
-    [[ "${SCENARIO_AD_SHIM_LOG}" == "${HOME}/.config/agent-director/bin/agent-director-shim.log" ]] \
+    [[ "${SCENARIO_AD_SHIM_LOG}" == "${SCENARIO_AD_ROOT}/bin/agent-director-shim.log" ]] \
         || fail "${step}: SCENARIO_AD_SHIM_LOG ${SCENARIO_AD_SHIM_LOG} is not beside the standard path"
     for found in agent-director-shim.log agent-director.real; do
         [[ ! -e "${passwd_home}/.config/agent-director/bin/${found}" ]] \
@@ -1497,8 +1503,8 @@ leg_setup_install() {
     expect_shim_in_place "${step}: after the setup's install" "${SCENARIO_RELEASE_BIN}"
     expect_ad_version "${step}" "${REL_VERSION}" "${REL_COMMIT}"
     expect_shim_in_place "${step}: agent-director-admin after the setup's install" "${SCENARIO_RELEASE_ADMIN}" \
-        "${HOME}/.config/agent-director/admin/agent-director-admin"
-    [[ -f "${HOME}/.config/agent-director/state.db" ]] || fail "${step}: no store at ${HOME}/.config/agent-director/state.db"
+        "${SCENARIO_AD_ROOT}/admin/agent-director-admin"
+    [[ -f "${SCENARIO_AD_ROOT}/state.db" ]] || fail "${step}: no store at ${SCENARIO_AD_ROOT}/state.db"
 }
 
 leg_harness_call_log() {
@@ -1611,7 +1617,7 @@ leg_reinstall() {
     install_ad_release "${step}: install.sh again"
     expect_shim_in_place "${step}: after install.sh and its re-shim" "${SCENARIO_RELEASE_BIN}"
     expect_shim_in_place "${step}: agent-director-admin after install.sh and its re-shim" "${SCENARIO_RELEASE_ADMIN}" \
-        "${HOME}/.config/agent-director/admin/agent-director-admin"
+        "${SCENARIO_AD_ROOT}/admin/agent-director-admin"
     expect_ad_version "${step}" "${REL_VERSION}" "${REL_COMMIT}"
     store_id="$(ad_store_id)"
     [[ "${store_id}" == "${T0_STORE_ID}" ]] || fail "${step}: the store id changed from ${T0_STORE_ID} to ${store_id}"
@@ -1648,7 +1654,7 @@ nested_start_on_010() {
         ! cmp -s -- "${SCENARIO_RELEASE_BIN}" "${file}" || fail "${step}: ${file} is the release's binary"
     done < <(find "${HOME}" -type f -print0)
     echo "CHECK: no release binary"
-    [[ ! -e "${HOME}/.config/agent-director/state.db" ]] || fail "${step}: a store exists before the release's install"
+    [[ ! -e "${SCENARIO_AD_ROOT}/state.db" ]] || fail "${step}: a store exists before the release's install"
     echo "CHECK: no store"
     expect_ad_version "${step}: a call through the shim" 0.10.0
     echo "CHECK: 0.10.0 answers"
@@ -1677,11 +1683,12 @@ leg_start_on_010() {
 leg_guard_refusals() {
     local step="guard refusals" link real_outside before home reason backup="${SCENARIO_ROOT}/t0-guard-backup.db"
     OUTSIDE_HOME="$(mktemp -d /tmp/test-0-outside-home.XXXXXX)" || fail "${step}: could not make a HOME outside SCENARIO_ROOT"
+    # Deliberate pre-0.12 decoy: real 0.10 binary, old layout and id column.
     # A decoy install and store each helper would act on, were it not refused.
-    mkdir -p "${OUTSIDE_HOME}/.config/agent-director/bin"
-    cp -- "${SCENARIO_AD_010_BIN}" "${OUTSIDE_HOME}/.config/agent-director/bin/agent-director"
-    sqlite3 "${OUTSIDE_HOME}/.config/agent-director/state.db" \
-        "CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO store_meta VALUES ('store_id', '0123456789abcdef'); CREATE TABLE spawns (instance_id TEXT PRIMARY KEY, labels TEXT NOT NULL DEFAULT '{}');" \
+    mkdir -p "${OUTSIDE_HOME}/.agent-director/bin"
+    cp -- "${SCENARIO_AD_010_BIN}" "${OUTSIDE_HOME}/.agent-director/bin/agent-director"
+    sqlite3 "${OUTSIDE_HOME}/.agent-director/state.db" \
+        "CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO store_meta VALUES ('store_id', '0123456789abcdef'); CREATE TABLE spawns (claude_instance_id TEXT PRIMARY KEY, labels TEXT NOT NULL DEFAULT '{}');" \
         || fail "${step}: could not make the decoy store"
     link="${SCENARIO_ROOT}/home-link-outside"
     ln -s -- "${OUTSIDE_HOME}" "${link}"
@@ -1778,7 +1785,7 @@ leg_shim_check() {
     cp -- "${SCENARIO_RELEASE_BIN}" "${bin}/agent-director.real"
     cp -- "${SCENARIO_AD_SHIM_SRC}" "${bin}/agent-director"
     chmod 0755 "${bin}/agent-director.real" "${bin}/agent-director"
-    ( export HOME="${home}"; check_ad_shim "${step}: a correct layout" ) \
+    ( export HOME="${home}"; _scenario_ad_contract release; check_ad_shim "${step}: a correct layout" ) \
         || fail "${step}: check_ad_shim refused a correct layout"
 
     rm -f -- "${bin}/agent-director"
@@ -2715,8 +2722,8 @@ with_tmux_tmpdir() {
 
 leg_refire_hold() {
     local step="re-fire hold" times=() bin
-    [[ ! -e "${HOME}/.config/agent-director/config.toml" ]] \
-        || fail "${step}: ${HOME}/.config/agent-director/config.toml exists, so G may not be the default ${REFIRE_GRACE_S}s"
+    [[ ! -e "${SCENARIO_AD_ROOT}/config.toml" ]] \
+        || fail "${step}: ${SCENARIO_AD_ROOT}/config.toml exists, so G may not be the default ${REFIRE_GRACE_S}s"
     REFIRE_AD_BEFORE="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
     REFIRE_CSCB_BEFORE="$(cscb_ad_count "")"
     hold_row "${step}" "${REFIRE_ID}" refire-held
@@ -3602,7 +3609,7 @@ leg_store_statements() {
     # default starting-session bound; `ad_store_mark_finished` reads the
     # window from this file.
     printf '[tmux]\nstarting_session_seconds = %s\nstopping_window_seconds = %s\n' \
-        "${T4_STARTING_BOUND_S}" "${T4_STOPPING_WINDOW_S}" | write_file "${HOME}/.config/agent-director/config.toml"
+        "${T4_STARTING_BOUND_S}" "${T4_STOPPING_WINDOW_S}" | write_file "${SCENARIO_AD_ROOT}/config.toml"
     session_age_at_least "${step}" "${T4_FIN_ID}" "${T4_STOPPING_WINDOW_S}"
     before="$(row_snapshot "${T4_FIN_ID}")"
     rv="$(jq -r '.row_version' <<< "${before}")"
@@ -3866,9 +3873,10 @@ nested_expect_refused() {
 # nested_expect_row <instance-id> <session> <labels-json>: in the nested run,
 # a harness get finds the row live or waiting, recording <session> and exactly
 # <labels-json>, and the session runs on the run's tmux server.
+# Deliberate pre-0.12 argv: this assertion runs before and after migration.
 nested_expect_row() {
     local id="$1" session="$2" labels="$3"
-    ad_capture get --instance-id "${id}"
+    ad_capture get "${SCENARIO_AD_ID_FLAG}" "${id}"
     (( AD_RC == 0 )) || fail "harness get of ${id} exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
     jq -e --arg s "${session}" --argjson l "${labels}" '.tmux_session_name == $s and .labels == $l' "${AD_OUT}" > /dev/null \
         || fail "row ${id} reads $(tr '\n' ' ' < "${AD_OUT}" | head -c 600), not session ${session} with labels ${labels}"
@@ -3890,7 +3898,7 @@ nested_seed_010() {
     # 0.10.0's first spawn makes the store).
     nested_expect_refused "no Slack channel name given for routed channel C0T0BBB02" \
         seed_prepersona_fleet "${config}" "C0T0AAA01=Ops Team!"
-    [[ ! -e "${HOME}/.config/agent-director/state.db" ]] || fail "a refused fleet made a store"
+    [[ ! -e "${SCENARIO_AD_ROOT}/state.db" ]] || fail "a refused fleet made a store"
     echo "CHECK: fleet refused before its first row"
 
     out="$(seed_010_row t0-010-row t0_010_row "${dir_row}" team=t0)"

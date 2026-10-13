@@ -318,9 +318,10 @@ write_credentials() {
 # (`absent` for ErrSpawnNotFound), ROW_SID (session_id), ROW_SESSION
 # (tmux_session_name) and ROW_LABELS (labels, compact JSON), each empty when
 # absent.
+# Deliberate pre-0.12 result contract: this reader straddles the install migration.
 poll_row_of() {
     local id="$1" fields
-    ad_capture get --instance-id "${id}"
+    ad_capture get "${SCENARIO_AD_ID_FLAG}" "${id}"
     if (( AD_RC != 0 )); then
         if grep -qF ErrSpawnNotFound "${AD_OUT}" "${AD_ERR}"; then
             ROW_STATE=absent ROW_SID="" ROW_SESSION="" ROW_LABELS=""
@@ -328,7 +329,7 @@ poll_row_of() {
         fi
         fail "$2: the harness get of ${id} exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
     fi
-    fields="$(jq -r '[.state // "", .session_id // "", .tmux_session_name // "", (.labels // {} | tojson)] | join("\u001f")' "${AD_OUT}")" \
+    fields="$(jq -r --arg key "${SCENARIO_AD_SESSION_KEY}" '[.state // "", .[$key] // "", .tmux_session_name // "", (.labels // {} | tojson)] | join("\u001f")' "${AD_OUT}")" \
         || fail "$2: the harness get of ${id} printed no row object: $(head -c 300 "${AD_OUT}")"
     IFS=$'\x1f' read -r ROW_STATE ROW_SID ROW_SESSION ROW_LABELS <<< "${fields}"
 }
@@ -630,7 +631,7 @@ leg_migrated_row() {
     install_ad_release "${step}: the release's install over 0.10.0"
     check_ad_shim "${step}: the agent-director shim after the install"
     check_ad_admin_shim "${step}: the agent-director-admin shim after the install"
-    cmp -s -- "${HOME}/.config/agent-director/bin/agent-director.real" "${SCENARIO_RELEASE_BIN}" \
+    cmp -s -- "${SCENARIO_AD_ROOT}/bin/agent-director.real" "${SCENARIO_RELEASE_BIN}" \
         || fail "${step}: the binary behind the shim is not the release's ${SCENARIO_RELEASE_BIN}"
     out="$(ad_store_id)"
     echo "${TEST_NAME}: ${step}: the migrated store's id ${out}"

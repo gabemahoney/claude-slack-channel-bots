@@ -658,7 +658,7 @@
 #   seed_010_row <instance-id> <session-name> <dir> [<key>=<value>...]
 #                                      one row made with 0.10.0's own `spawn` through the harness call
 #                                      (`ad_capture`, from the scenario's shell): --cwd <dir>,
-#                                      --instance-id, --tmux-session-name and a --label per
+#                                      the legacy id flag, --tmux-session-name and a --label per
 #                                      <key>=<value>; refuses a <session-name> that is taken, longer
 #                                      than 64 bytes or holds `.`, `:`, `#` or a control character, and
 #                                      a <dir> that is not an absolute path to a directory. Its worker
@@ -2354,18 +2354,19 @@ _scenario_check_shim_at() {
     ! _scenario_is_shim "${real}" || fail "${step}: the file behind the shim at ${real} is the shim itself"
 }
 
+# Deliberate pre-0.12 contract: the shim check follows the installed old layout until migration.
 check_ad_shim() {
     local step="${1:-the agent-director shim check}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    _scenario_check_shim_at "${HOME}/.config/agent-director/bin/agent-director" "${step}"
+    _scenario_check_shim_at "${SCENARIO_AD_ROOT}/bin/agent-director" "${step}"
 }
 
 check_ad_admin_shim() {
     local step="${1:-the agent-director-admin shim check}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    _scenario_check_shim_at "${HOME}/.config/agent-director/admin/agent-director-admin" "${step}"
+    _scenario_check_shim_at "${SCENARIO_AD_ROOT}/admin/agent-director-admin" "${step}"
 }
 
 # _scenario_shim_over <path> <step>: put the binary installed at <path>
@@ -2386,18 +2387,19 @@ _scenario_shim_over() {
     _scenario_check_shim_at "${path}" "${step}"
 }
 
+# Deliberate pre-0.12 contract: old clients resolve the legacy shim path before migration.
 install_ad_shim() {
     local step="${1:-install the agent-director shim}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    _scenario_shim_over "${HOME}/.config/agent-director/bin/agent-director" "${step}"
+    _scenario_shim_over "${SCENARIO_AD_ROOT}/bin/agent-director" "${step}"
 }
 
 install_ad_admin_shim() {
     local step="${1:-install the agent-director-admin shim}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    _scenario_shim_over "${HOME}/.config/agent-director/admin/agent-director-admin" "${step}"
+    _scenario_shim_over "${SCENARIO_AD_ROOT}/admin/agent-director-admin" "${step}"
 }
 
 reshim_ad() {
@@ -2406,7 +2408,7 @@ reshim_ad() {
     require_scenario_home "${step}"
     install_ad_shim "${step}"
     # install.sh installs agent-director-admin too; 0.10.0 had none.
-    if [[ -e "${HOME}/.config/agent-director/admin/agent-director-admin" ]]; then
+    if [[ -e "${SCENARIO_AD_ROOT}/admin/agent-director-admin" ]]; then
         install_ad_admin_shim "${step}: agent-director-admin"
     fi
 }
@@ -2435,15 +2437,43 @@ install_ad_release() {
         [[ -n "${last}" ]] || last="$(grep -v '^[[:space:]]*$' "${AD_INSTALL_OUT}" | tail -n 1 || true)"
         fail "${step}: install.sh exited ${rc}: ${last:-no output}"
     fi
+    _scenario_ad_contract release
+    _SCENARIO_REAL_AD_SHIM_LOG="${SCENARIO_AD_SHIM_LOG}"
     reshim_ad "${step}: re-shim"
     check_ad_admin_shim "${step}: agent-director-admin"
 }
 
+# Deliberate pre-0.12 contract: old installs use the old layout, flags and
+# result/store keys. Select only at install boundaries; swapping an old binary
+# onto a migrated store must keep the release layout for the refusal tests.
+_scenario_ad_contract() {
+    SCENARIO_AD_CONTRACT_VERSION="$1"
+    case "$1" in
+        0.10.* | 0.11.*)
+            SCENARIO_AD_ROOT="${HOME}/.agent-director"
+            SCENARIO_AD_ID_FLAG=--claude-instance-id
+            SCENARIO_AD_ID_COLUMN=claude_instance_id
+            SCENARIO_AD_SESSION_KEY=claude_session_id
+            ;;
+        *)
+            SCENARIO_AD_ROOT="${HOME}/.config/agent-director"
+            SCENARIO_AD_ID_FLAG=--instance-id
+            SCENARIO_AD_ID_COLUMN=instance_id
+            SCENARIO_AD_SESSION_KEY=session_id
+            ;;
+    esac
+    SCENARIO_AD_BIN="${SCENARIO_AD_ROOT}/bin/agent-director"
+    SCENARIO_AD_SHIM_LOG="${SCENARIO_AD_ROOT}/bin/agent-director-shim.log"
+}
+
+# Deliberate pre-0.12 install layout: the real 0.10 binary and its client
+# resolve ~/.agent-director; the release installer must migrate that directory.
 install_ad_010() {
     local step="${1:-install agent-director 0.10.0}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    local root="${HOME}/.config/agent-director"
+    _scenario_ad_contract "${SCENARIO_AD_010_VERSION}"
+    local root="${SCENARIO_AD_ROOT}"
     [[ -f "${SCENARIO_AD_010_BIN}" && -x "${SCENARIO_AD_010_BIN}" ]] \
         || fail "${step}: agent-director 0.10.0's binary is missing from the image (${SCENARIO_AD_010_BIN})"
     mkdir -p "${root}/bin" || fail "${step}: could not create ${root}/bin"
@@ -2469,7 +2499,7 @@ swap_ad_binary() {
     [[ -f "${src}" && -x "${src}" ]] || fail "${step}: ${src} is not an executable file"
     ! _scenario_is_shim "${src}" || fail "${step}: ${src} is the shim, not a binary"
     check_ad_shim "${step}: the shim before the swap"
-    _scenario_place "${src}" "${HOME}/.config/agent-director/bin/agent-director.real" "${step}"
+    _scenario_place "${src}" "${SCENARIO_AD_ROOT}/bin/agent-director.real" "${step}"
     check_ad_shim "${step}"
 }
 
@@ -2477,7 +2507,7 @@ hide_ad_install() {
     local step="${1:-move the agent-director shim and binary aside}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    local path="${HOME}/.config/agent-director/bin/agent-director"
+    local path="${SCENARIO_AD_ROOT}/bin/agent-director"
     local aside="${SCENARIO_ROOT}/ad-aside"
     [[ ! -e "${aside}" ]] || fail "${step}: ${aside} already exists (hidden twice?)"
     check_ad_shim "${step}: the shim before hiding"
@@ -2497,7 +2527,7 @@ restore_ad_install() {
     local step="${1:-restore the agent-director shim and binary}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    local path="${HOME}/.config/agent-director/bin/agent-director"
+    local path="${SCENARIO_AD_ROOT}/bin/agent-director"
     local aside="${SCENARIO_ROOT}/ad-aside"
     [[ -f "${aside}/agent-director" && -f "${aside}/agent-director.real" ]] \
         || fail "${step}: nothing hidden in ${aside}"
@@ -2521,7 +2551,7 @@ restore_ad_install() {
 # release binary. The caller has run both guards. Refuses a bin directory
 # that is not under SCENARIO_ROOT or resolves outside it.
 _scenario_stand_in_settings() {
-    local step="$1" version="$2" reuse="$3" bin="${HOME}/.config/agent-director/bin" real_root real_bin
+    local step="$1" version="$2" reuse="$3" bin="${SCENARIO_AD_ROOT}/bin" real_root real_bin
     [[ -n "${version}" && "${version}" != *[[:cntrl:]]* ]] \
         || fail "${step}: version '${version}' is empty or holds a control character"
     [[ "${reuse}" == reject || "${reuse}" == pass ]] || fail "${step}: '${reuse}' is neither reject nor pass"
@@ -2545,7 +2575,7 @@ _scenario_stand_in_settings() {
 # at the standard path carries the stand-in's marker and its settings file
 # is beside it.
 _scenario_check_stand_in() {
-    local real="${HOME}/.config/agent-director/bin/agent-director.real"
+    local real="${SCENARIO_AD_ROOT}/bin/agent-director.real"
     grep -qxF -- "${SCENARIO_AD_STAND_IN_MARKER}" "${real}" 2> /dev/null \
         || fail "$1: the binary behind the shim at ${real} is not the version stand-in"
     [[ -f "${real}.settings" ]] || fail "$1: no stand-in settings at ${real}.settings"
@@ -2570,7 +2600,7 @@ restore_ad_install_with_stand_in() {
     local step="${3:-restore the agent-director shim with the version stand-in (${1:-} ${2:-}) behind it}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    local path="${HOME}/.config/agent-director/bin/agent-director"
+    local path="${SCENARIO_AD_ROOT}/bin/agent-director"
     local aside="${SCENARIO_ROOT}/ad-aside"
     [[ -f "${SCENARIO_AD_STAND_IN_SRC}" ]] && grep -qxF -- "${SCENARIO_AD_STAND_IN_MARKER}" "${SCENARIO_AD_STAND_IN_SRC}" \
         || fail "${step}: the stand-in ${SCENARIO_AD_STAND_IN_SRC} is missing or carries no marker"
@@ -2595,12 +2625,14 @@ restore_ad_install_with_stand_in() {
     _scenario_check_stand_in "${step}"
 }
 
+# Deliberate pre-0.12 contract: harness calls use the installed old path before migration.
 ad() {
     require_ci_image "ad $*"
     require_scenario_home "ad $*"
-    "${HOME}/.config/agent-director/bin/agent-director" "$@"
+    "${SCENARIO_AD_ROOT}/bin/agent-director" "$@"
 }
 
+# Deliberate pre-0.12 contract: captured harness calls use the installed old path before migration.
 ad_capture() {
     require_ci_image "ad_capture $*"
     require_scenario_home "ad_capture $*"
@@ -2608,13 +2640,13 @@ ad_capture() {
     AD_OUT="${SCENARIO_ROOT}/ad.${_SCENARIO_AD_COUNT}.out"
     AD_ERR="${SCENARIO_ROOT}/ad.${_SCENARIO_AD_COUNT}.err"
     AD_RC=0
-    "${HOME}/.config/agent-director/bin/agent-director" "$@" > "${AD_OUT}" 2> "${AD_ERR}" || AD_RC=$?
+    "${SCENARIO_AD_ROOT}/bin/agent-director" "$@" > "${AD_OUT}" 2> "${AD_ERR}" || AD_RC=$?
 }
 
 ad_admin() {
     require_ci_image "ad_admin $*"
     require_scenario_home "ad_admin $*"
-    "${HOME}/.config/agent-director/admin/agent-director-admin" "$@"
+    "${SCENARIO_AD_ROOT}/admin/agent-director-admin" "$@"
 }
 
 ad_admin_capture() {
@@ -2624,7 +2656,7 @@ ad_admin_capture() {
     AD_OUT="${SCENARIO_ROOT}/ad.${_SCENARIO_AD_COUNT}.out"
     AD_ERR="${SCENARIO_ROOT}/ad.${_SCENARIO_AD_COUNT}.err"
     AD_RC=0
-    "${HOME}/.config/agent-director/admin/agent-director-admin" "$@" > "${AD_OUT}" 2> "${AD_ERR}" || AD_RC=$?
+    "${SCENARIO_AD_ROOT}/admin/agent-director-admin" "$@" > "${AD_OUT}" 2> "${AD_ERR}" || AD_RC=$?
 }
 
 # ---------------------------------------------------------------------------
@@ -2637,7 +2669,7 @@ SCENARIO_STORE_BUSY_MS=5000
 ad_store_edit() {
     require_ci_image "ad_store_edit"
     require_scenario_home "ad_store_edit"
-    local db="${HOME}/.config/agent-director/state.db" statement out
+    local db="${SCENARIO_AD_ROOT}/state.db" statement out
     (( $# == 1 )) || fail "ad_store_edit: takes one statement, not $# arguments"
     statement="$1"
     # One statement: no `;` but an optional one at its end.
@@ -2657,7 +2689,7 @@ ad_store_edit() {
 ad_store_id() {
     require_ci_image "ad_store_id"
     require_scenario_home "ad_store_id"
-    local db="${HOME}/.config/agent-director/state.db" out
+    local db="${SCENARIO_AD_ROOT}/state.db" out
     [[ -f "${db}" ]] || fail "ad_store_id: no store at ${db}"
     out="$(sqlite3 -batch -bail -readonly -cmd ".timeout ${SCENARIO_STORE_BUSY_MS}" "${db}" \
         "SELECT value FROM store_meta WHERE key = 'store_id';" 2>&1)" \
@@ -2678,12 +2710,13 @@ ad_store_row() {
     _scenario_row_json "${step}" "${id}"
 }
 
+# Deliberate pre-0.12 contract: backup reads the pre-upgrade store before migration.
 ad_store_backup() {
     local dest="${1:-}" step db real_root real_dir out
     step="ad_store_backup ${dest}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    db="${HOME}/.config/agent-director/state.db"
+    db="${SCENARIO_AD_ROOT}/state.db"
     (( $# == 1 )) || fail "${step}: takes one destination, not $# arguments"
     [[ "${dest}" == "${SCENARIO_ROOT}"/* ]] \
         || fail "${step}: refused: ${dest} is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
@@ -3057,10 +3090,11 @@ _scenario_check_instance_id() {
 # _scenario_store_read <step> <query> [json]: one read-only sqlite3 query of
 # the scenario store (both guards first); print its output (rows as a JSON
 # array with `json`, nothing for no row); fail with sqlite3's error.
+# Deliberate pre-0.12 contract: reads follow the pre-upgrade store until migration.
 _scenario_store_read() {
     require_ci_image "$1"
     require_scenario_home "$1"
-    local step="$1" query="$2" db="${HOME}/.config/agent-director/state.db" out mode=()
+    local step="$1" query="$2" db="${SCENARIO_AD_ROOT}/state.db" out mode=()
     if [[ "${3:-}" == json ]]; then
         mode=(-json)
     fi
@@ -3072,11 +3106,12 @@ _scenario_store_read() {
     fi
 }
 
+# Deliberate pre-0.12 store contract: select the installed stage's id column.
 # _scenario_row_json <step> <instance-id>: print the row as a one-element
 # JSON array; fail when no row has the id.
 _scenario_row_json() {
     local out
-    out="$(_scenario_store_read "$1" "SELECT * FROM spawns WHERE instance_id = '$2'" json)" || exit 1
+    out="$(_scenario_store_read "$1" "SELECT * FROM spawns WHERE ${SCENARIO_AD_ID_COLUMN} = '$2'" json)" || exit 1
     [[ -n "${out}" ]] || fail "$1: no row has instance id $2"
     printf '%s\n' "${out}"
 }
@@ -3107,7 +3142,7 @@ ad_new_token() {
     fi
     if [[ -n "${id}" ]]; then
         _scenario_check_instance_id "${step}" "${id}"
-        if [[ -f "${HOME}/.config/agent-director/state.db" ]]; then
+        if [[ -f "${SCENARIO_AD_ROOT}/state.db" ]]; then
             current="$(_scenario_store_read "${step}" "SELECT COALESCE(launch_token, '') FROM spawns WHERE instance_id = '${id}'")" \
                 || exit 1
         fi
@@ -3546,6 +3581,7 @@ _scenario_ad_settings_value() {
     [[ -n "$3" && "$3" != *[[:cntrl:]]* ]] || fail "$1: the value of $2 is empty or holds a control character"
 }
 
+# Deliberate pre-0.12 contract: settings live beside the real old binary until migration.
 write_ad_settings() {
     local step="write_ad_settings $*" pause="" have_pause=0 pairs=() seen=" " key value path dir real_root real_dir content
     require_ci_image "${step}"
@@ -3666,7 +3702,7 @@ repoint_symlink() {
 # <default> when the file or the key is absent; fail when it is not a whole
 # number.
 _scenario_ad_tmux_setting() {
-    local step="$1" key="$2" def="$3" file="${HOME}/.config/agent-director/config.toml" v=""
+    local step="$1" key="$2" def="$3" file="${SCENARIO_AD_ROOT}/config.toml" v=""
     if [[ -f "${file}" ]]; then
         v="$(awk -v key="${key}" '
             /^[[:space:]]*\[/ {
@@ -3975,8 +4011,9 @@ wait_find_missing_runs() {
 # run by its own name (no shim line), reports 0.10.0, no install_ad_release
 # has run in this shell, and the store, if any, has no store_meta table (the
 # release's install has not migrated it).
+# Deliberate pre-0.12 contract: version and schema checks precede legacy spawn calls.
 _scenario_require_010() {
-    local step="$1" real="${HOME}/.config/agent-director/bin/agent-director.real" out ver n
+    local step="$1" real="${SCENARIO_AD_ROOT}/bin/agent-director.real" out ver n
     (( _SCENARIO_INSTALL_COUNT == 0 )) \
         || fail "${step}: refused: the release's install.sh has run in this HOME (${_SCENARIO_INSTALL_COUNT} run(s)); the 0.10.0 seeders run before it"
     check_ad_shim "${step}"
@@ -3984,11 +4021,15 @@ _scenario_require_010() {
     ver="$(jq -r '.version // empty' <<< "${out}" 2> /dev/null)" || ver=""
     [[ "${ver}" == "${SCENARIO_AD_010_VERSION}" ]] \
         || fail "${step}: refused: the binary behind the shim reports version '${ver}', not ${SCENARIO_AD_010_VERSION}"
-    if [[ -f "${HOME}/.config/agent-director/state.db" ]]; then
+    if [[ -f "${SCENARIO_AD_ROOT}/state.db" ]]; then
         n="$(_scenario_store_read "${step}" "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_meta'")" \
             || exit 1
         [[ "${n}" == 0 ]] \
             || fail "${step}: refused: the store has a store_meta table, so the release's install has migrated it"
+        # Deliberate pre-0.12 schema guard before any spawn, even for an
+        # unmarked migrated store or an incorrect empty fixture.
+        n="$(_scenario_store_read "${step}" "SELECT count(*) FROM pragma_table_info('spawns') WHERE name = 'claude_instance_id'")" || exit 1
+        [[ "${n}" == 1 ]] || fail "${step}: refused: the store lacks the pre-0.12 claude_instance_id column"
     fi
 }
 
@@ -4004,13 +4045,15 @@ _scenario_stub_mode_of() {
     printf '%s\n' "${last}"
 }
 
+# Deliberate pre-0.12 store contract: only the guarded 0.10 seeder calls this.
 # True once the row's state is one other than `pending`.
 _scenario_row_left_pending() {
     local state
-    state="$(_scenario_store_read "$1" "SELECT state FROM spawns WHERE instance_id = '$2'")" || exit 1
+    state="$(_scenario_store_read "$1" "SELECT state FROM spawns WHERE claude_instance_id = '$2'")" || exit 1
     [[ -n "${state}" && "${state}" != pending ]]
 }
 
+# Deliberate pre-0.12 argv and SQL: this helper drives real 0.10, guarded below.
 seed_010_row() {
     local id="${1:-}" name="${2:-}" dir="${3:-}" step mode label args=() out sid pane ppid argv=() a is_stub=0 state
     step="seed_010_row ${id}"
@@ -4036,7 +4079,7 @@ seed_010_row() {
         stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
         mode="${STUB_MODE_AT_ONCE}"
     fi
-    ad_capture spawn --agent claude --cwd "${dir}" --instance-id "${id}" --tmux-session-name "${name}" \
+    ad_capture spawn --cwd "${dir}" --claude-instance-id "${id}" --tmux-session-name "${name}" \
         ${args[@]+"${args[@]}"}
     if (( AD_RC != 0 )); then
         sed 's/^/  | /' "${AD_OUT}" "${AD_ERR}" >&2
@@ -4055,7 +4098,7 @@ seed_010_row() {
     if [[ "${mode}" == "${STUB_MODE_AT_ONCE}" ]]; then
         wait_until "${SCENARIO_SEED_REPORT_S}" "${step}: the row never reported in" \
             _scenario_row_left_pending "${step}" "${id}"
-        state="$(_scenario_store_read "${step}" "SELECT state FROM spawns WHERE instance_id = '${id}'")" || exit 1
+        state="$(_scenario_store_read "${step}" "SELECT state FROM spawns WHERE claude_instance_id = '${id}'")" || exit 1
         case "${state}" in
             waiting | working | ask_user | check_permission) ;;
             *) fail "${step}: the row reads ${state} after its worker reported in, not a live state" ;;
@@ -4079,6 +4122,7 @@ _scenario_normalize_channel_name() {
     echo
 }
 
+# Deliberate pre-0.12 fleet: the guard and seed_010_row keep old argv/schema.
 seed_prepersona_fleet() {
     local config="${1:-}" step spec cid norm cwd out i ids=() insts=() sesss=() cwds=() lines=()
     local -A names=()
@@ -4812,18 +4856,19 @@ tmux_shim_mark() {
     _scenario_log_mark tmux_shim_mark "${SCENARIO_TMUX_SHIM_LOG}"
 }
 
-# Set _L_ID to the value of --instance-id in _L_ARGS (`--flag value`
+# Deliberate pre-0.12 log contract: old-client calls retain their old flag.
+# Set _L_ID to the value of either id flag in _L_ARGS (`--flag value`
 # or `--flag=value`); empty when the call carries none.
 _scenario_ad_id() {
     local i
     _L_ID=""
     for (( i = 0; i < ${#_L_ARGS[@]}; i++ )); do
         case "${_L_ARGS[i]}" in
-            --instance-id)
+            --instance-id | --claude-instance-id)
                 _L_ID="${_L_ARGS[i + 1]:-}"
                 return 0
                 ;;
-            --instance-id=*)
+            --instance-id=* | --claude-instance-id=*)
                 _L_ID="${_L_ARGS[i]#*=}"
                 return 0
                 ;;
@@ -5066,16 +5111,17 @@ slack_posts() {
         "${record}" || fail "slack_posts: jq could not read ${record}"
 }
 
+# Deliberate pre-0.12 trail contract: mixed upgrade logs carry either id key.
 ad_trail_events() {
     local event="${1:-}" id="${2:-}" step trail
     step="ad_trail_events ${event}${id:+ ${id}}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
     [[ -n "${event}" ]] || fail "${step}: no event named"
-    trail="${HOME}/.config/agent-director/ad-trail.jsonl"
+    trail="${SCENARIO_AD_ROOT}/ad-trail.jsonl"
     [[ -f "${trail}" ]] || return 0
     jq -c -R --arg e "${event}" --arg id "${id}" \
-        'fromjson? | select(type == "object" and .event == $e and ($id == "" or .instance_id == $id))' \
+        'fromjson? | select(type == "object" and .event == $e and ($id == "" or (.instance_id // .claude_instance_id) == $id))' \
         "${trail}" || fail "${step}: jq could not read ${trail}"
 }
 
@@ -5378,8 +5424,7 @@ _scenario_fmk_setup() {
         || fail "claude resolves to '$(command -v claude || true)', not the stub ${SCENARIO_BIN}/claude"
 
     # shellcheck disable=SC2034 # read by the scripts that source this file
-    SCENARIO_AD_BIN="${HOME}/.config/agent-director/bin/agent-director"
-    SCENARIO_AD_SHIM_LOG="${HOME}/.config/agent-director/bin/agent-director-shim.log"
+    _scenario_ad_contract "${SCENARIO_AD_START}"
     # The files the closing enforcement reads, whatever a script later sets
     # SCENARIO_TMUX_SHIM_LOG, SCENARIO_AD_SHIM_LOG or SCENARIO_CSCB_RECORD to.
     _SCENARIO_REAL_TMUX_SHIM_LOG="${SCENARIO_TMUX_SHIM_LOG}"
@@ -5389,8 +5434,8 @@ _scenario_fmk_setup() {
         install_ad_010 "fmk setup: install agent-director 0.10.0"
     else
         install_ad_release "fmk setup: install the release"
-        [[ -f "${HOME}/.config/agent-director/state.db" ]] \
-            || fail "fmk setup: the release's install.sh made no store at ${HOME}/.config/agent-director/state.db"
+        [[ -f "${SCENARIO_AD_ROOT}/state.db" ]] \
+            || fail "fmk setup: the release's install.sh made no store at ${SCENARIO_AD_ROOT}/state.db"
     fi
 }
 
@@ -5400,6 +5445,7 @@ _scenario_fmk_setup() {
 
 [[ "${TEST_NAME}" =~ ^test-([0-9]+)- ]] \
     || fail "TEST_NAME '${TEST_NAME}' is not test-<N>-<name>"
+_scenario_ad_contract release
 SCENARIO_TAG="t${BASH_REMATCH[1]}"
 export SCENARIO_TAG
 

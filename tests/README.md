@@ -655,6 +655,20 @@ is one script, named here; scenario 14 has no script, and scenario 17 is a
 closing assertion of every fmk script. Test 0 is the harness's
 self-check, not a scenario.
 
+Compatibility fixtures driving pre-0.12.0 agent-director releases must keep
+that release's original flags, schema, result keys and install layout;
+version and schema guards must precede old-release seed calls. Switch to
+the current contract only after the actual release installer migrates the
+fixture. Swapping an old binary into an already upgraded fixture tests
+CSCB's version-floor refusal and must leave the migrated layout intact.
+
+Keep legacy spellings confined to the documented compatibility helper
+bodies, including readers of mixed upgrade logs, with a comment explaining
+the pre-0.12 contract. The old-name audit in `tests/fmk-source-audit.test.ts`
+exempts only those bodies and checks their expected legacy-line counts;
+never exempt a whole file or the integration tree, or rename old-release
+contracts to satisfy a zero-match audit.
+
 | Scenario | Script | What it covers |
 |---|---|---|
 | 1 | `test-13-fmk-switch-over.sh` | The switch-over from a pre-persona 0.10.0 fleet to this build on agent-director Phase 1, by the README's runbook (leg A), then a `clean_restart` on Phase 1 that resumes every persona (leg B) and this build's refusal of agent-director 0.10.0 (leg C) (SRJ-1402, SRJ-203, SRJ-1013) |
@@ -1321,7 +1335,7 @@ Sourcing it, in both modes:
 fmk mode. Sourcing also:
 
 - exports HOME as `SCENARIO_HOME` (`$SCENARIO_ROOT/home`), so no step reads
-  or writes the container user's own `~/.config/agent-director`;
+  or writes the container user's own agent-director install or store;
 - exports `TMUX_TMPDIR` as `$SCENARIO_ROOT/tmux` and unsets `TMUX` and
   `TMUX_PANE`, so every tmux client the scenario's processes start talks to
   the scenario's own tmux server;
@@ -1332,7 +1346,9 @@ fmk mode. Sourcing also:
   `agent-director` (the image's default agent-director directory among them)
   and without relative or empty entries. bun's directory stays. No process of
   the scenario finds an agent-director on PATH: the client finds the scenario
-  HOME's at its standard path, `$HOME/.config/agent-director/bin/agent-director`;
+  HOME's install at the path for that fixture's stage: under
+  `$HOME/.agent-director` during pre-0.12 seeding, and
+  `$HOME/.config/agent-director` after the release installer migrates it;
 - installs agent-director into the scenario HOME behind the shim. By default
   that is the release: `install_ad_release` runs the release's `install.sh`
   (from agent-director's tree at the release tag, in the image) in the
@@ -1343,10 +1359,11 @@ fmk mode. Sourcing also:
   (`$HOME/.config/agent-director/admin/agent-director-admin`) and makes the HOME's
   store with its store id, then re-shims both. A script that sets
   `SCENARIO_AD_START=0.10.0` before its source line starts on agent-director
-  0.10.0 instead: `install_ad_010` copies 0.10.0's binary to the standard path
-  behind the shim, with no `install.sh` run, no agent-director-admin and no
-  store yet. `SCENARIO_AD_START` is `release` (the default) or `0.10.0`; a
-  shared-mode script that sets it fails;
+  0.10.0 instead: `install_ad_010` copies 0.10.0's binary to its old install
+  path behind the shim, with no `install.sh` run, no agent-director-admin and
+  no store yet. Only the real release installer transitions that fixture to
+  the current layout and contract. `SCENARIO_AD_START` is `release` (the
+  default) or `0.10.0`; a shared-mode script that sets it fails;
 - writes no agent-director `config.toml`, so agent-director runs on its
   default settings. Scenarios 10 and 24 (Test 26) are the exceptions: they
   write a `[tmux]` table with `write_ad_settings` (see Harness agent-director
@@ -1361,10 +1378,14 @@ fmk mode. Sourcing also:
 
 Keep HOME, `TMUX_TMPDIR` and PATH as sourcing set them. Sourcing also sets
 `SCENARIO_REAL_TMUX` (the real tmux, resolved before PATH changed, which the
-trap stops the server with), `SCENARIO_AD_BIN` (the standard path, which
+trap stops the server with), `SCENARIO_AD_ROOT` (the install root for the
+fixture's stage), `SCENARIO_AD_BIN` (that stage's binary path, which
 holds the shim), `SCENARIO_AD_SHIM_LOG` (the agent-director shim's log),
 `SCENARIO_TMUX_SHIM_LOG` (the tmux shim's log), `SCENARIO_CSCB_RECORD` (the
 record) and `SCENARIO_SHELL_CMDLINE` (the script's own command line).
+Helpers use the recorded fixture contract and rebind the install root when
+a harness self-check changes HOME, so its paths follow that scratch fixture.
+Below, the standard path means the path for the fixture's stage.
 
 The agent-director shim (`fixtures/agent-director-shim.sh`):
 
@@ -1410,7 +1431,9 @@ Each change to the install goes through one helper:
 - `swap_ad_binary <release|0.10.0|<abs-path>>` replaces only the binary behind
   the shim at the standard path (the release's, 0.10.0's, or a stand-in
   file), checking the shim before and after; agent-director-admin stays as
-  installed.
+  installed. An old binary swapped into a migrated fixture exercises CSCB's
+  version-floor refusal; it never downgrades the store or changes its layout
+  or recorded contract.
 - `hide_ad_install` and `restore_ad_install` are the one exception, for
   scenario 8's not-found step: hide moves the shim and the binary aside
   together (to `$SCENARIO_ROOT/ad-aside`), leaving no file at the standard
@@ -1469,13 +1492,15 @@ Harness agent-director calls and store helpers:
   through its shim; a scenario makes its `kill-finished` and `delete` only
   through `ad_kill_include_finished` and `ad_delete_unusable_row`.
 - `ad_store_edit <statement>` runs exactly one `sqlite3` statement on the
-  scenario HOME's `.config/agent-director/state.db` and fails with sqlite3's error;
+  scenario's `state.db` under `SCENARIO_AD_ROOT` and fails with sqlite3's error;
   `ad_store_id` opens the store read-only and prints its store id, failing,
   saying why, unless it is 16 lowercase hex characters. `ad_store_row
   <instance-id>` opens it read-only and prints that id's row as a
   one-element JSON array, failing when no row has it.
   `ad_store_pending_no_launch <instance-id>` is one such edit (see The stub
-  worker).
+  worker). The root and row schema follow the fixture's stage: the old
+  0.10.0 seed store until `install_ad_release` migrates it, then the current
+  0.12.0 store.
 - `ad_store_backup <dest>` is the switch-over runbook's online backup of the
   store (step 8): sqlite3's `.backup`, the store opened read-only, into
   `<dest>`, a new file under `SCENARIO_ROOT` (as written and by the real path
@@ -1696,9 +1721,9 @@ SRJ-1306 as amended by b.deo SRI-1402 to SRI-1404). Test 15 and the latch scenar
   order (see Slack stub).
 - `ad_trail_events <event> [<instance-id>]` runs `require_ci_image` and
   `require_scenario_home` first, then prints the scenario HOME's
-  agent-director trail records (`.config/agent-director/ad-trail.jsonl`) of that
+  agent-director trail records (`ad-trail.jsonl` under `SCENARIO_AD_ROOT`) of that
   event, and of that instance id when given, one JSON object per line. It
-  only reads.
+  only reads, using the root for the fixture's install stage as described above.
 
 Call windows (fmk mode; scenario 10; each a harness addition). The marks are `ad_shim_mark`'s (above).
 `cscb_ad_calls_between <from-mark> <to-mark|-> <verb> [<fragment>...]` and
@@ -3031,15 +3056,18 @@ report in (at once, a trusted folder, Enter at a dialog, a resume), the stub
 then reads its own row every 2 s and fires SessionStart again while the row
 reads `pending`, until G has passed since the row's launch start.
 
-- It reads the row with `status --instance-id <id>`, run with the
-  program its first registered SessionStart hook names. Under the release's
-  hooks that is the real binary, so the reads bypass the
-  agent-director shim. The id is `AGENT_DIRECTOR_INSTANCE_ID`, which
-  agent-director puts in the worker's environment; the hooks' `args` carry
-  none.
+- It reads the row with `status --instance-id <id>` under the release's
+  hooks. Pre-0.12 compatibility fixtures deliberately use
+  `status --claude-instance-id <id>` when the registered hook names the old
+  binary. Both run the program the first registered SessionStart hook names;
+  under the release's hooks that is the real binary, so the reads bypass the
+  agent-director shim. In both contracts the id is
+  `AGENT_DIRECTOR_INSTANCE_ID`, which agent-director puts in the worker's
+  environment; the hooks' `args` carry none.
 - G is `[tmux] pending_grace_seconds` in the scenario HOME's
-  `.config/agent-director/config.toml`, read at every tick; with no such value it is
-  agent-director's default, 60 s.
+  agent-director `config.toml`, at the install path for the hook binary's
+  contract, read at every tick; with no such value it is agent-director's
+  default, 60 s.
 - A row that reads another state, or `pending` past G, ends the re-fire with
   nothing written.
 - A failed read (no instance id, a non-zero exit, output that is not a status

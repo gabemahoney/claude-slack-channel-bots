@@ -132,7 +132,7 @@
 #       file written by the new CLI's `credentials`; the crontable targets and
 #       `/interject` callers rewritten to name personas (all of it in the old
 #       state directory, which the new CLI still uses until the first start); the new install check
-#       passing on the still-installed 0.10.0 with its Phase 1 note.
+#       refusing the still-installed 0.10.0 below the release client floor.
 #   8   the go-ahead, confirmed as still standing in the switch-over log (none
 #       fails the run there: "no go") and recorded; the harness's stop of
 #       other agents (none; every non-CSCB row ended or missing, no tmux
@@ -418,7 +418,7 @@ SUBSTITUTIONS="${HOST_DIR}/substitutions"
 # The agent-director settings step 1 records (`switch-over.ts settings`).
 STEP1_SETTINGS="${SCENARIO_ROOT}/settings-step1"
 # agent-director's trail in the scenario HOME.
-AD_TRAIL="${HOME}/.config/agent-director/ad-trail.jsonl"
+AD_TRAIL="${SCENARIO_AD_ROOT}/ad-trail.jsonl"
 
 # The global install (bun's global directory and bin directory under
 # SCENARIO_ROOT): the scenario's one install path, the old package's and then
@@ -671,14 +671,16 @@ check_windows() {
 
 # row_get <step> <instance-id>: a harness get of the row into AD_OUT; fail
 # unless it answers.
+# Deliberate pre-0.12 argv: the first runbook steps drive the old client/store.
 row_get() {
-    ad_capture get --instance-id "$2"
+    ad_capture get "${SCENARIO_AD_ID_FLAG}" "$2"
     (( AD_RC == 0 )) || fail "$1: harness get of ${2} exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
 }
 
 # row_state <instance-id>: print the row's state (empty when the get fails).
+# Deliberate pre-0.12 argv: select the installed stage on either side of step 8.
 row_state() {
-    ad_capture get --instance-id "$1"
+    ad_capture get "${SCENARIO_AD_ID_FLAG}" "$1"
     (( AD_RC == 0 )) || return 0
     jq -r '.state // empty' "${AD_OUT}"
 }
@@ -1115,8 +1117,8 @@ for i in "${!CHANNELS[@]}"; do
     cid="${CHANNELS[i]}"
     id="${OLD_IDS[i]}"
     row_get "setup" "${id}"
-    jq -e --arg id "${id}" --arg s "${OLD_SESSIONS[i]}" --arg c "${cid}" \
-        '.instance_id == $id and .tmux_session_name == $s and .labels.service == "cscb" and .labels.channel == $c and (.labels | has("persona") | not)' \
+    jq -e --arg key "${SCENARIO_AD_ID_COLUMN}" --arg id "${id}" --arg s "${OLD_SESSIONS[i]}" --arg c "${cid}" \
+        '.[$key] == $id and .tmux_session_name == $s and .labels.service == "cscb" and .labels.channel == $c and (.labels | has("persona") | not)' \
         "${AD_OUT}" > /dev/null \
         || fail "setup: row ${id} is not named and labelled as the old package does: $(head -c 400 "${AD_OUT}")"
     [[ "${id}" == cscb_*"_${cid}" && "${OLD_SESSIONS[i]}" == slack_bot_*"_${cid}" ]] \
@@ -1207,7 +1209,7 @@ STAGED_VERSION="$(jq -r '.version' "${STAGED_PKG}/package.json")"
 record "staged release: ${PKG_NAME} ${STAGED_VERSION} from ${PACKAGE_TGZ}, in ${STAGED_PKG}; available to install"
 runbook_substitute 1 staging-build-under-test "the release staged is the build under test, the image's ${PACKAGE_TGZ}, unpacked into ${STAGING_DIR}"
 
-[[ ! -e "${HOME}/.config/agent-director/config.toml" ]] || fail "step 1: the scenario HOME has an agent-director config.toml"
+[[ ! -e "${SCENARIO_AD_ROOT}/config.toml" ]] || fail "step 1: the scenario HOME has an agent-director config.toml"
 read_settings "${STAGED_PKG}" "${STEP1_SETTINGS}"
 [[ "${SETTINGS[file_exists]}" == false ]] || fail "step 1: the settings read found a config.toml"
 check_windows "step 1"
@@ -1288,7 +1290,7 @@ tail -n "+$(( ad_lines_before_3 + 1 ))" "${SCENARIO_AD_SHIM_LOG}" > "${SCENARIO_
 cscb_lines "${SCENARIO_ROOT}/step3-shim.log" "" "${SCENARIO_ROOT}/step3-calls"
 (( $(line_count "${SCENARIO_ROOT}/step3-calls") > 0 )) \
     || fail "step 3: the old CLI made no agent-director call through the shim"
-got="$("${HOME}/.config/agent-director/bin/agent-director.real" version | jq -r '.version // empty')"
+got="$("${SCENARIO_AD_ROOT}/bin/agent-director.real" version | jq -r '.version // empty')"
 [[ "${got}" == "${SCENARIO_AD_010_VERSION}" ]] || fail "step 3: the binary behind the shim reports '${got}', not ${SCENARIO_AD_010_VERSION}"
 record "stop --stop-bots (the old ${PKG_NAME} ${OLD_CSCB_VERSION}) exited 0 with one teardown outcome per routed channel; $(line_count "${SCENARIO_ROOT}/step3-calls") agent-director call(s) through the shim, ${got} behind it"
 
@@ -1319,7 +1321,7 @@ for s in ${sessions[@]+"${sessions[@]}"}; do
     done
 done
 list_rows "step 5" "${SCENARIO_ROOT}/rows-step5.json" --label service=cscb
-live="$(jq -r '[.[] | select(.state != "ended" and .state != "missing") | .instance_id] | join(" ")' "${SCENARIO_ROOT}/rows-step5.json")"
+live="$(jq -r --arg key "${SCENARIO_AD_ID_COLUMN}" '[.[] | select(.state != "ended" and .state != "missing") | .[$key]] | join(" ")' "${SCENARIO_ROOT}/rows-step5.json")"
 [[ -z "${live}" ]] || fail "step 5: old row(s) still live: ${live}"
 record "tmux ls: ${sessions[*]:-no session}; no old session and no live old row"
 
@@ -1434,19 +1436,14 @@ done
     || fail "step 7: the /interject callers do not each name a persona"
 record "crontable targets and /interject callers rewritten to name personas"
 
-# The new install check passes on the still-installed 0.10.0, with its note.
+# The release check deliberately refuses the still-installed pre-0.12 binary;
+# the upgrade remains step 8, after backup and operator authorization.
 rc=0
-cscb_run bun "${CSCB_PKG_DIR}/scripts/install-check.ts" < /dev/null > "${SCENARIO_ROOT}/install-check.out" 2>&1 || rc=$?
-if (( rc != 0 )) || ! grep -qxF 'agent-director install check: OK' "${SCENARIO_ROOT}/install-check.out" \
-    || ! grep -qxF "  version: ${SCENARIO_AD_010_VERSION}" "${SCENARIO_ROOT}/install-check.out" \
-    || ! grep -q '^  note:    ' "${SCENARIO_ROOT}/install-check.out"; then
-    sed 's/^/  | /' "${SCENARIO_ROOT}/install-check.out" >&2
-    fail "step 7: the install check did not pass on ${SCENARIO_AD_010_VERSION} with its Phase 1 note (exit ${rc})"
-fi
-section_title="$(sed -n 's/^section //p' "$(runbook_steps_file "${RUNBOOK_PKG}")")"
-grep '^  note:    ' "${SCENARIO_ROOT}/install-check.out" | grep -qF -- "${section_title}" \
-    || fail "step 7: the install check's note does not name the section \"${section_title}\""
-record "install check: OK on ${SCENARIO_AD_010_VERSION}, with its Phase 1 note"
+cscb_run env PATH="${SCENARIO_AD_ROOT}/bin:${PATH}" bun "${CSCB_PKG_DIR}/scripts/install-check.ts" < /dev/null > "${SCENARIO_ROOT}/install-check.out" 2>&1 || rc=$?
+(( rc != 0 )) || fail "step 7: the release install check accepted the pre-0.12 install"
+grep -qF 'agent-director install check: FAILED (ad-system-install-too-old)' "${SCENARIO_ROOT}/install-check.out" \
+    || fail "step 7: the failed check printed no install diagnostic"
+record "install check refuses the pre-0.12 install (exit ${rc}); step 8 installs the release"
 
 # ---------------------------------------------------------------------------
 # Step 8
@@ -1460,7 +1457,7 @@ runbook_substitute 8 operator-go-ahead "the operator's go-ahead is the switch-ov
 
 # The harness's stop of every other agent: none is seeded.
 list_rows "step 8" "${SCENARIO_ROOT}/rows-step8.json"
-live="$(jq -r '[.[] | select((.labels.service // "") != "cscb") | select(.state != "ended" and .state != "missing") | .instance_id] | join(" ")' "${SCENARIO_ROOT}/rows-step8.json")"
+live="$(jq -r --arg key "${SCENARIO_AD_ID_COLUMN}" '[.[] | select((.labels.service // "") != "cscb") | select(.state != "ended" and .state != "missing") | .[$key]] | join(" ")' "${SCENARIO_ROOT}/rows-step8.json")"
 [[ -z "${live}" ]] || fail "step 8: other agents' rows still live: ${live}"
 tmux_sessions sessions
 (( ${#sessions[@]} == 0 )) || fail "step 8: tmux sessions are left: ${sessions[*]}"
@@ -1473,22 +1470,23 @@ record "store backup: ${STORE_BACKUP} (sqlite3 .backup; integrity check ok)"
 install_ticks="$(_scenario_proc_starttime "${BASHPID}")"
 [[ "${install_ticks}" =~ ^[0-9]+$ ]] || fail "step 8: could not read the time before the install"
 install_ad_release "step 8: install agent-director Phase 1"
+AD_TRAIL="${SCENARIO_AD_ROOT}/ad-trail.jsonl"
 ad_capture version
 (( AD_RC == 0 )) || fail "step 8: agent-director version exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
 got="$(jq -r '.version // empty' "${AD_OUT}")"
 [[ "${got}" == "${REL_VERSION}" && "$(jq -r '.commit // empty' "${AD_OUT}")" == "${REL_COMMIT}" ]] \
     || fail "step 8: agent-director version reports '${got}', not the release's ${REL_VERSION} (${REL_COMMIT})"
-real_v="$("${HOME}/.config/agent-director/bin/agent-director.real" version | jq -r '.version // empty')"
+real_v="$("${SCENARIO_AD_ROOT}/bin/agent-director.real" version | jq -r '.version // empty')"
 [[ "${real_v}" == "${REL_VERSION}" ]] || fail "step 8: the binary behind the shim reports '${real_v}', not ${REL_VERSION}"
 runbook_substitute 8 release-install-script "the Phase 1 install is the release's install.sh, run in the scenario HOME, then the re-shim; the serve restart and start-time check cover the container's agent-director processes"
-[[ ! -e "${HOME}/.config/agent-director/config.toml" ]] || fail "step 8: a config.toml was written; the scenario writes no [tmux] table"
+[[ ! -e "${SCENARIO_AD_ROOT}/config.toml" ]] || fail "step 8: a config.toml was written; the scenario writes no [tmux] table"
 older=()
 count=0
 for proc in /proc/[0-9]*; do
     pid="${proc#/proc/}"
     exe="$(readlink -- "${proc}/exe" 2> /dev/null || true)"
     cmd="$(tr '\0' ' ' < "${proc}/cmdline" 2> /dev/null || true)"
-    [[ "${exe}" == "${HOME}/.config/agent-director/"* || "${cmd}" == *"${HOME}/.config/agent-director/bin/agent-director"* ]] || continue
+    [[ "${exe}" == "${SCENARIO_AD_ROOT}/"* || "${cmd}" == *"${SCENARIO_AD_ROOT}/bin/agent-director"* ]] || continue
     st="$(_scenario_proc_starttime "${pid}")"
     [[ -n "${st}" ]] || continue
     count=$(( count + 1 ))
@@ -2256,7 +2254,7 @@ LEG_C_SERVER_LOG_FROM="$(line_count "${SLACK_STATE_DIR}/server.log")"
 # 0.10.0 behind the shim (the swap checks the shim); the binary is compared,
 # never run, so the harness makes no 0.10.0 call against the migrated store.
 swap_ad_binary 0.10.0 "leg C: agent-director 0.10.0 behind the shim"
-cmp -s -- "${SCENARIO_AD_010_BIN}" "${HOME}/.config/agent-director/bin/agent-director.real" \
+cmp -s -- "${SCENARIO_AD_010_BIN}" "${SCENARIO_AD_ROOT}/bin/agent-director.real" \
     || fail "leg C: the binary behind the shim is not agent-director 0.10.0's"
 record "leg C: agent-director ${SCENARIO_AD_010_VERSION} behind the shim"
 
@@ -2347,7 +2345,7 @@ record "leg C: ${probes} version probe(s), no other agent-director call; nothing
 
 # The release back behind the shim (the swap checks the shim).
 swap_ad_binary release "leg C: the release back behind the shim"
-cmp -s -- "${SCENARIO_RELEASE_BIN}" "${HOME}/.config/agent-director/bin/agent-director.real" \
+cmp -s -- "${SCENARIO_RELEASE_BIN}" "${SCENARIO_AD_ROOT}/bin/agent-director.real" \
     || fail "leg C: the binary behind the shim is not the release's"
 record "leg C: the release ${REL_VERSION} back behind the shim"
 
