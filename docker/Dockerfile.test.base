@@ -1,13 +1,13 @@
-# docker/Dockerfile.test.base — the /ci base image, cscb-ci-base:v6.
+# docker/Dockerfile.test.base — the /ci base image, cscb-ci-base:v7.
 #
 # Source-independent layers shared by the /ci image (docker/Dockerfile.test)
 # and the /ci-live image (docker/Dockerfile.live). From the repo build context
 # it reads one file, docker/ad-client-check.sh (no package.json). Built once
-# per host by the /ci skill:
+# per host by the base-build step, scripts/ci-base-build.sh:
 #
 #   docker build --network=host --secret id=gh_token,env=GH_TOKEN \
 #     --build-context agent-director-install=<directory holding install.sh> \
-#     -f docker/Dockerfile.test.base -t cscb-ci-base:v6 .
+#     -f docker/Dockerfile.test.base -t cscb-ci-base:v7 .
 #
 # agent-director is the release pinned below (AD_VERSION, AD_COMMIT): its
 # binaries come from agent-director's GitHub release, installed by that
@@ -132,7 +132,7 @@ RUN set -eu; \
 # agent-director 0.10.0's binary, fetched for the pinned release v0.10.0 into
 # /opt/agent-director-0.10.0/bin, which is not on PATH. This leg reads the
 # release through GitHub's API with a token, so a GitHub token is required at
-# build time, as the BuildKit secret `gh_token` (see the /ci skill):
+# build time, as the BuildKit secret `gh_token` (see scripts/ci-base-build.sh):
 #   docker build --secret id=gh_token,env=GH_TOKEN ...
 # Never pass it as a build-arg or ENV: an ARG's value is recorded in the image
 # history (`docker history --no-trunc`) of this image and of every image built
@@ -178,8 +178,8 @@ RUN --mount=type=secret,id=gh_token set -eu; \
 # agent-director-install (never from the repo context), then run to install
 # the release's binaries.
 # - agent-director-install: a directory holding install.sh, taken from
-#   agent-director's source tree at the release tag v${AD_VERSION} (the /ci
-#   skill fills it with a read-only `git show`); it must match the pinned
+#   agent-director's source tree at the release tag v${AD_VERSION} (scripts/ci-base-build.sh
+#   fills it with a read-only `git show`); it must match the pinned
 #   AD_INSTALL_SH_SHA256. It goes to /opt/agent-director/install (off PATH).
 # - That install.sh then installs the release: `--from-release
 #   v${AD_VERSION}` downloads agent-director-linux-amd64 and

@@ -6,20 +6,20 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
 
 ## Images
 
-- **`cscb-ci-base:v6`** (built from `docker/Dockerfile.test.base`) — slow base
+- **`cscb-ci-base:v7`** (built from `docker/Dockerfile.test.base`) — slow base
   layers (apt deps incl. tmux, bun, nodejs, cozempic, agent-director). Built
   lazily once per host. ~1+ GB. No CSCB source inside. From the repo build
   context it reads one file, `docker/ad-client-check.sh`, and no
   `package.json`. What it holds is in
   [What the base holds](#what-the-base-holds).
 - **The run's test image** (built from `docker/Dockerfile.test`,
-  `FROM cscb-ci-base:v6`) — adds `docker/entrypoint.sh`, `tests/`,
+  `FROM cscb-ci-base:v7`) — adds `docker/entrypoint.sh`, `tests/`,
   `testplans/`, the `testuser` account, and the `ENTRYPOINT`. Each `/ci` run
   builds its own, once, with the owner label `cscb-ci-owner=<RUN_ID>-<PID>`,
   tags it only `cscb-ci-run:<RUN_ID>-<PID>-test`, and removes it at the run's
   end (see [The run's images and tags](#the-runs-images-and-tags)). The build
   should complete in under 10 s on a warm base.
-- **`cscb-ci-live:latest`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v6`)
+- **`cscb-ci-live:latest`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v7`)
   — the `/ci-live` image (see [/ci-live](#ci-live-the-live-slack-acceptance-run)
   below). It adds Claude Code at a pinned version with auto-update off, the
   agent-director binary the runner stages, checked against the release's
@@ -190,7 +190,7 @@ git -C "$CSCB_AD_SRC_DIR" show "v$AD_VERSION:skills/install-agent-director/insta
 GH_TOKEN="$(gh auth token)" docker build --network=host \
   --secret id=gh_token,env=GH_TOKEN --progress=quiet \
   --build-context agent-director-install="$AD_INSTALL_CTX" \
-  -f docker/Dockerfile.test.base -t cscb-ci-base:v6 .
+  -f docker/Dockerfile.test.base -t cscb-ci-base:v7 .
 rm -rf "$AD_INSTALL_CTX"
 ```
 
@@ -210,7 +210,7 @@ rm -rf "$AD_INSTALL_CTX"
   that message, and every other check's `ERROR:` line: rerun with
   `--progress=plain` to see which step failed and why.
 - **Check an image by counts only**, never by printing its history:
-  `docker history --no-trunc cscb-ci-base:v6 | grep -c GH_TOKEN=` prints `0`.
+  `docker history --no-trunc cscb-ci-base:v7 | grep -c GH_TOKEN=` prints `0`.
 - **Earlier tags are retired.** Nothing names `v4` or an earlier tag. Tags
   before `v4` took the token as a build-arg, so their image history held its
   value, as did every image built on them; they are removed from the hosts
@@ -247,7 +247,7 @@ against Anthropic's direct endpoint.
 
 ## When to bump the base image version
 
-Bump `cscb-ci-base`'s version tag (e.g. `v6` → `v7`) whenever you change
+Bump `cscb-ci-base`'s version tag (e.g. `v7` → `v8`) whenever you change
 `docker/Dockerfile.test.base`, its pins included: the release's
 `AD_VERSION`, `AD_COMMIT`, `AD_SHA256`, `AD_ADMIN_SHA256`,
 `AD_INSTALL_SH_SHA256` and `AD_CLIENT_TGZ_SHA256`, and the 0.10.0 legs'
@@ -311,7 +311,7 @@ still name it keep using it.
 To simulate a fresh host, remove the base tag by its name, and nothing else:
 
 ```sh
-docker rmi cscb-ci-base:v6
+docker rmi cscb-ci-base:v7
 /ci   # with CSCB_AD_SRC_DIR set; or run the hand build above
 ```
 
@@ -326,7 +326,7 @@ build comes near it, raise an issue.
 After a `/ci` run, confirm the base layers are intact:
 
 ```sh
-docker history cscb-ci-base:v6
+docker history cscb-ci-base:v7
 ```
 
 Then edit a comment in (e.g.) `tests/integration/test-1-install-startup.sh`
@@ -339,7 +339,7 @@ docker build -f docker/Dockerfile.test -t "$WARM_TAG" .
 ```
 
 This should complete in seconds, and needs neither build context nor the
-token. `docker history cscb-ci-base:v6` should show the same layer IDs as
+token. `docker history cscb-ci-base:v7` should show the same layer IDs as
 before — proof the source edit didn't invalidate the base. Then remove the
 tag by its name:
 
@@ -635,7 +635,7 @@ The sweep never touches:
 
 - anything whose owner is alive;
 - any `cscb-live=1` container, or any container without `cscb-ci=1`;
-- any other tag shape, such as `cscb-ci:latest`, `cscb-ci-base:v6`,
+- any other tag shape, such as `cscb-ci:latest`, `cscb-ci-base:v7`,
   `cscb-ci-live:latest` or a lane tag like `cscb-ci-l5:m5`;
 - an image that still has a tag, or an image with no owner label;
 - any file beside the lock but a dead owner's reservation;
@@ -1409,7 +1409,7 @@ checks against it.
   - Anything else (a missing or malformed release record, steps 1
     (tarball) to 4 (exports), a missing check script, the check's refusal or
     usage error):
-    `ERROR: the base image's global agent-director client or its ad-client check failed (the line above names what failed): the base image cscb-ci-base:v6 predates this tree's docker/Dockerfile.test.base or docker/ad-client-check.sh; bump the base image version as the When to bump the base image version section of docker/README.md describes`.
+    `ERROR: the base image's global agent-director client or its ad-client check failed (the line above names what failed): the base image cscb-ci-base:v7 predates this tree's docker/Dockerfile.test.base or docker/ad-client-check.sh; bump the base image version as the When to bump the base image version section of docker/README.md describes`.
 
   Whichever line it is, the run reports a `container` FAIL row for the failed
   build, `docker build of the live image failed (exit N)`, followed by what

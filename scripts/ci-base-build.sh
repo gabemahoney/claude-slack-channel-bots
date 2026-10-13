@@ -17,7 +17,7 @@
 # Exit status: 0 when the base build succeeded; 1 after one of its own
 # `non-runnable:` lines on standard error; otherwise the base build command's
 # own non-zero status.
-BASE_TAG=cscb-ci-base:v6  # bump when docker/Dockerfile.test.base or one of its pins (ARG defaults) changes; package.json is not read
+BASE_TAG=cscb-ci-base:v7  # bump when docker/Dockerfile.test.base or one of its pins (ARG defaults) changes; package.json is not read
 # (note) The skill's guard stood here: the runner checks that the base is
 # missing before it runs this step, so every line below always runs.
   # The agent-director release the base installs: read from

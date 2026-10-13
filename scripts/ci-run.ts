@@ -2779,7 +2779,7 @@ export function formatRunTag(owner: Owner, role: RunTagRole): string {
   return `${RUN_TAG_REPOSITORY}:${formatOwner(owner)}-${role}`
 }
 
-/** A run-private tag's owner and role, or null for a tag of any other shape, such as `cscb-ci:latest`, `cscb-ci-base:v6` or `cscb-ci-l5:m5` (b.uqm SR-6.4, SR-9.3). */
+/** A run-private tag's owner and role, or null for a tag of any other shape, such as `cscb-ci:latest`, `cscb-ci-base:v7` or `cscb-ci-l5:m5` (b.uqm SR-6.4, SR-9.3). */
 export function parseRunTag(tag: string): RunTag | null {
   const prefix = `${RUN_TAG_REPOSITORY}:`
   if (!tag.startsWith(prefix)) return null
@@ -6899,7 +6899,7 @@ export interface SweepPlan {
  * - reservations, valid or bad, whose owner is dead, as T2's reader judged it;
  *   files that are not reservations never appear;
  * - tags of exactly the run-private shape whose owner is dead; never a tag of
- *   another shape (`cscb-ci:latest`, `cscb-ci-base:v6`, `cscb-ci-live:latest`,
+ *   another shape (`cscb-ci:latest`, `cscb-ci-base:v7`, `cscb-ci-live:latest`,
  *   `cscb-ci-l5:m5`, a `cscb-ci-run:` tag that does not parse);
  * - the owner-label values of untagged images whose owner is dead or whose
  *   label is malformed; never a tagged image nor one without the label.

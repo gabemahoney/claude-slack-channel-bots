@@ -349,7 +349,7 @@ describe('E1: owners, the reservation format and the lock probe', () => {
 
     test.each([
       ['the base tag', 'cscb-ci:latest'],
-      ['the base image\'s tag', 'cscb-ci-base:v6'],
+      ['the base image\'s tag', 'cscb-ci-base:v7'],
       ['/ci-live\'s tag', 'cscb-ci-live:latest'],
       ['a lane tag', 'cscb-ci-l5:m5'],
       ['another repository with the run-private tail', `${RUN_TAG_REPOSITORY}x:${RUN_ID}-12-${RUN_TAG_ROLES[0]}`],
@@ -1236,7 +1236,7 @@ describe('E5: the sweep of dead runs\' leftovers', () => {
   const MALFORMED_OWNER = `${RUN_ID}-0`
   /** Test data: a lane's tag, and the tags of other repositories (the base image, its base, `/ci-live`'s image, a lane's). */
   const LANE_TAG = 'cscb-ci-l5:m5'
-  const FOREIGN_TAGS = ['cscb-ci:latest', 'cscb-ci-base:v6', 'cscb-ci-live:latest', LANE_TAG]
+  const FOREIGN_TAGS = ['cscb-ci:latest', 'cscb-ci-base:v7', 'cscb-ci-live:latest', LANE_TAG]
   /** Test data: a tag in the run-private repository that is no run-private tag (a PID with a leading zero). */
   const MALFORMED_RUN_TAG = `${RUN_TAG_REPOSITORY}:${RUN_ID}-012-${RUN_TAG_ROLES[0]}`
 

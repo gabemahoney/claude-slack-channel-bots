@@ -156,6 +156,7 @@ import {
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, writtenFile } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { treeSnapshot } from './test-helpers/tree-snapshot.ts'
+import { BASE_IMAGE } from '../ci-live/lib/docker.ts'
 
 // ===========================================================================
 // E1 (t1.t6s.te): the RUN_ID, the run directory and the status file; main and
@@ -2299,7 +2300,7 @@ describe('E8: the run\'s images and tags (b.uqm SR-9, SR-19.9, SR-14.2)', () => 
         expect(baseBuildStepProblems(text)).toEqual([...problems])
       })
 
-      test('every line but the shebang, header and note is the /ci skill\'s base-build line at the commit the header names, byte for byte, less the three-space list indent; only the guard, its fi and the test-image build are left out', () => {
+      test('every line but the shebang, header and note is the /ci skill\'s base-build line at the commit the header names, byte for byte, less the three-space list indent and with the current base tag; only the guard, its fi and the test-image build are left out', () => {
         const commit = /commands at ([0-9a-f]{7,40})\b/.exec(STEP_TEXT)?.[1]
         // Test data: SR-9.2 fixes the commit the step's lines were moved from.
         expect(commit).toBe('946be79')
@@ -2337,10 +2338,14 @@ describe('E8: the run\'s images and tags (b.uqm SR-9, SR-19.9, SR-14.2)', () => 
         expect(leftOut).toHaveLength(3)
         expect(leftOut[2]).toContain(`docker build -f ${TEST_DOCKERFILE_PATH} `)
         const moved = block.filter((_line, i) => i !== guardAt && i < fiAt).map((line) => line.slice(3))
+        // The historical tag stays in history; only its value follows a base-image version bump.
+        expect(moved.filter((line) => /^BASE_TAG=/.test(line))).toHaveLength(1)
+        expect(STEP_TEXT.match(/^BASE_TAG=(\S+)/m)?.[1]).toBe(BASE_IMAGE)
+        const current = moved.map((line) => line.replace(/^BASE_TAG=\S+/, `BASE_TAG=${BASE_IMAGE}`))
 
         // The step's own lines: the shebang, its header and its note, every one a comment at column 0.
         const stepLines = STEP_TEXT.replace(/\n$/, '').split('\n')
-        expect(stepLines.filter((line) => !line.startsWith('#'))).toEqual(moved)
+        expect(stepLines.filter((line) => !line.startsWith('#'))).toEqual(current)
       })
 
       /** How the stubs behave in one run of the step. */
