@@ -156,7 +156,7 @@ function errCwd(Cls: typeof ErrCwdNotFound | typeof ErrCwdNotADirectory): Error 
 }
 
 /** The one call every checked kill makes: the instance id alone, no `include_finished` (SRJ-106). */
-const PLAIN_KILL_CALL = { claude_instance_id: STUB_INSTANCE_ID }
+const PLAIN_KILL_CALL = { instance_id: STUB_INSTANCE_ID }
 
 /**
  * A non-success row: its label, the value the kill throws, the SRJ-110 class
@@ -359,7 +359,7 @@ describe('checkedKill: one plain call that never throws (SRJ-106, SRJ-701)', () 
   test('the recorded call carries the instance id alone: no include_finished key at all', async () => {
     const { calls } = await killThroughStub({ killResult: cannedKillResult(true) })
     expect(calls).toHaveLength(1)
-    expect(Object.keys(calls[0] as object)).toEqual(['claude_instance_id'])
+    expect(Object.keys(calls[0] as object)).toEqual(['instance_id'])
   })
 
   test.each<[string, () => Promise<unknown>]>([
@@ -517,7 +517,7 @@ describe('describeKillOutcome', () => {
       `outcome=${KILL_OUTCOME_NOT_KILLED} class=${AD_ERROR_CLASS_UNAVAILABLE} ${unresponsive.errName} message=${JSON.stringify(unresponsive.errDescription)}`,
     )
     expect(describeKillOutcome(killOutcomeOf({ thrown: unusable }))).toBe(
-      `outcome=${KILL_OUTCOME_NOT_KILLED} class=${AD_ERROR_CLASS_UNUSABLE_NAME} name=${unusable.unknownName} message=${JSON.stringify((unusable.envelope as { err_description: string }).err_description)}`,
+      `outcome=${KILL_OUTCOME_NOT_KILLED} class=${AD_ERROR_CLASS_UNUSABLE_NAME} name=${unusable.errName} message=${JSON.stringify(unusable.errDescription)}`,
     )
   })
 

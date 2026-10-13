@@ -533,7 +533,7 @@ row_json() {
 # line to the shim's log).
 row_reads() {
     local state
-    state="$(_scenario_store_read "row state" "SELECT state FROM spawns WHERE claude_instance_id = '$1'")" || exit 1
+    state="$(_scenario_store_read "row state" "SELECT state FROM spawns WHERE instance_id = '$1'")" || exit 1
     [[ "${state}" == "$2" ]]
 }
 
@@ -545,7 +545,7 @@ both_rows_read() {
 # reads <state>.
 expect_status() {
     local step="$1" id="$2" want="$3" got
-    ad_capture status --claude-instance-id "${id}"
+    ad_capture status --instance-id "${id}"
     (( AD_RC == 0 )) || fail "${step}: the harness status read of ${id} exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
     got="$(jq -r '.state // empty' "${AD_OUT}")"
     [[ "${got}" == "${want}" ]] || fail "${step}: row ${id} reads '${got}', not ${want}"
@@ -638,7 +638,7 @@ log_slice() {
 # window_calls <step> <from-mark> <to-mark|-> <id>: set WIN_VERBS, WIN_ARGS
 # (the arguments joined by single spaces), WIN_PPIDS and WIN_US (the line's
 # time, in microseconds since the epoch) to each CSCB-parented agent-director
-# call in the shim log's window that names `--claude-instance-id <id>`, in
+# call in the shim log's window that names `--instance-id <id>`, in
 # log order.
 window_calls() {
     local step="$1" out line a
@@ -646,7 +646,7 @@ window_calls() {
     WIN_ARGS=()
     WIN_PPIDS=()
     WIN_US=()
-    out="$(cscb_ad_calls_between "$2" "$3" "" "--claude-instance-id $4")" || exit 1
+    out="$(cscb_ad_calls_between "$2" "$3" "" "--instance-id $4")" || exit 1
     [[ -n "${out}" ]] || return 0
     while IFS= read -r line; do
         if ! _scenario_split_line "${line}" || ! _scenario_decode_words; then
@@ -922,7 +922,7 @@ restart_and_reconnect() {
 
 # window_any <step> <from-mark> <to-mark|-> <id>: set WIN_VERBS, WIN_ARGS and
 # WIN_PPIDS to each CSCB-parented agent-director call in the shim log's
-# window that names `--claude-instance-id <id>` or is a `find-missing` (which
+# window that names `--instance-id <id>` or is a `find-missing` (which
 # names no instance id), in log order, leaving out `version`.
 window_any() {
     local step="$1" out line a
@@ -938,7 +938,7 @@ window_any() {
         _scenario_ad_verb
         [[ "${_L_VERB}" == version ]] && continue
         printf -v a '%s ' ${_L_ARGS[@]+"${_L_ARGS[@]}"}
-        [[ "${_L_VERB}" == find-missing || " ${a}" == *" --claude-instance-id $4 "* ]] || continue
+        [[ "${_L_VERB}" == find-missing || " ${a}" == *" --instance-id $4 "* ]] || continue
         WIN_VERBS+=("${_L_VERB}")
         WIN_ARGS+=("${a% }")
         WIN_PPIDS+=("${_L_PPID}")
@@ -1629,7 +1629,7 @@ posts_of "${SUFFIX_A}" "${POSTS_E}"
 [[ "${POSTS[want-1]}" == "${CONFLICT_RECOVERY_A}" ]] || fail "${STEP}: the recovery post reads '${POSTS[want-1]}', not '${CONFLICT_RECOVERY_A}'"
 # One find-missing and one resume over the whole window since the dead
 # session's removal, not only up to the first resume.
-n="$(cscb_ad_count_between "${MARK_H}" - resume "--claude-instance-id ${ID_A}")"
+n="$(cscb_ad_count_between "${MARK_H}" - resume "--instance-id ${ID_A}")"
 [[ "${n}" == 1 ]] || fail "${STEP}: CSCB made ${n} resume call(s) of ${ID_A} since the dead session's removal, not 1"
 n="$(cscb_ad_count_between "${MARK_H}" - find-missing)"
 [[ "${n}" == 1 ]] || fail "${STEP}: CSCB made ${n} find-missing call(s) since the dead session's removal, not 1"

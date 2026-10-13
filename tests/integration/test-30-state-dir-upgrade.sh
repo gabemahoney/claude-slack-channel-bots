@@ -25,7 +25,7 @@
 # read or written. The agent-director binary is found on PATH
 # (/opt/agent-director/bin), as in every shared-mode scenario. Dry run still
 # runs the start's agent-director check (the version probe) and installs the
-# templates, both through $HOME/.agent-director, a symbolic link to the
+# templates, both through $HOME/.config/agent-director, a symbolic link to the
 # container's own, so the start finds what it needs. Neither
 # SLACK_STATE_DIR nor XDG_CONFIG_HOME reaches a CSCB process: the harness
 # reads N through a shell variable that is never exported, so the build finds
@@ -173,9 +173,9 @@ enter_layout() {
     export HOME
     mkdir -p "${HOME}" || fail "setup: could not create ${HOME}"
     # The container's agent-director install, which the start's check reads.
-    if [[ -e "${REAL_HOME}/.agent-director" ]]; then
-        ln -s "${REAL_HOME}/.agent-director" "${HOME}/.agent-director" \
-            || fail "setup: could not link ${HOME}/.agent-director"
+    if [[ -e "${REAL_HOME}/.config/agent-director" ]]; then
+        ln -s "${REAL_HOME}/.config/agent-director" "${HOME}/.config/agent-director" \
+            || fail "setup: could not link ${HOME}/.config/agent-director"
     fi
     L1="${HOME}/.claude/channels/slack"
     L2="${HOME}/.config/cscb"

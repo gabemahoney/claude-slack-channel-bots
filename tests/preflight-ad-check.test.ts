@@ -168,8 +168,7 @@ function expectFailure(run: AdVersionCheckRun, named: readonly string[]): void {
 
 describe('scripts/ad-version-check.ts', () => {
   test.each([
-    ['the Phase 1 release candidate passes with no note', PHASE1_RC_VERSION, false],
-    ['the release before Phase 1 passes with the note', OLD_AD_VERSION, true],
+    ['the released client minimum passes with no note', CLIENT_MIN_VERSION, false],
     ["the client's development sentinel passes with the note", DEV_PLACEHOLDER_VERSION, true],
   ])('%s', async (_name, version, noted) => {
     const { run, calls } = await runCheck({ version })
@@ -189,6 +188,8 @@ describe('scripts/ad-version-check.ts', () => {
   })
 
   test.each<[string, StubResolveSystemBinaryOutcome, readonly string[]]>([
+    ['the former floor release candidate', { version: PHASE1_RC_VERSION }, [PHASE1_RC_VERSION, CLIENT_MIN_VERSION, STUB_RESOLVE_DEFAULT_PATH, PUBLISHING_HOST_BLOCK]],
+    ['the previous supported release', { version: OLD_AD_VERSION }, [OLD_AD_VERSION, CLIENT_MIN_VERSION, STUB_RESOLVE_DEFAULT_PATH, PUBLISHING_HOST_BLOCK]],
     ['a version below the client minimum', { version: STALE_VERSION }, [STALE_VERSION, CLIENT_MIN_VERSION, STUB_RESOLVE_DEFAULT_PATH, PUBLISHING_HOST_BLOCK]],
     ['ErrSystemInstallTooOld', { throws: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION, STUB_RESOLVE_DEFAULT_PATH) }, [STALE_VERSION, CLIENT_MIN_VERSION, PUBLISHING_HOST_BLOCK]],
     ['ErrSystemInstallNotFound', { throws: errSystemInstallNotFound() }, [PUBLISHING_HOST_BLOCK]],

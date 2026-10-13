@@ -29,7 +29,7 @@
 #   container's, as the scripts found them, and no shim is installed (test-12
 #   checks where the hook commands resolve). The exception is test-30, which
 #   swaps HOME per layout (a fresh directory under SCENARIO_ROOT for each) and
-#   links the container's `$HOME/.agent-director` into it.
+#   links the container's `$HOME/.config/agent-director` into it.
 #
 # What sourcing does, in both modes:
 # - refuses outside a cscb-ci image (above);
@@ -60,7 +60,7 @@
 #
 # fmk mode. Sourcing also:
 # - exports HOME as SCENARIO_HOME, `$SCENARIO_ROOT/home`, so no step reads or
-#   writes the container user's own ~/.agent-director;
+#   writes the container user's own ~/.config/agent-director;
 # - exports TMUX_TMPDIR as `$SCENARIO_ROOT/tmux` and unsets TMUX and
 #   TMUX_PANE, so every tmux client the scenario's processes start talks to
 #   the scenario's own tmux server;
@@ -80,7 +80,7 @@
 #   (fixtures/agent-director-shim.sh): by default the release, through its
 #   install.sh (`install_ad_release`), which creates the HOME's store with its
 #   store id and installs agent-director-admin, behind the same shim, at
-#   $HOME/.agent-director/admin/agent-director-admin; or, for a script that
+#   $HOME/.config/agent-director/admin/agent-director-admin; or, for a script that
 #   sets SCENARIO_AD_START=0.10.0 before sourcing, agent-director 0.10.0's
 #   binary (`install_ad_010`), with no release install, no agent-director-admin
 #   and no store yet (SCENARIO_AD_START is `release` or `0.10.0`; a
@@ -240,8 +240,8 @@
 #   require_scenario_home <step>       fail unless SCENARIO_ROOT is a directory and HOME is under it,
 #                                      both as written and by real path
 #
-#   agent-director install (fmk mode; standard path = $HOME/.agent-director/bin/agent-director,
-#   admin path = $HOME/.agent-director/admin/agent-director-admin, the real binary beside
+#   agent-director install (fmk mode; standard path = $HOME/.config/agent-director/bin/agent-director,
+#   admin path = $HOME/.config/agent-director/admin/agent-director-admin, the real binary beside
 #   either = <path>.real; each runs both guards first, and each that changes the install
 #   checks the shim after its change, apart from `hide_ad_install`, which leaves no file at
 #   the standard path to check)
@@ -310,7 +310,7 @@
 #                                      scenario makes those only through `ad_kill_include_finished`
 #                                      and `ad_delete_unusable_row`
 #
-#   The scenario store ($HOME/.agent-director/state.db; both guards first; no other store)
+#   The scenario store ($HOME/.config/agent-director/state.db; both guards first; no other store)
 #   ad_store_edit <statement>          run exactly one sqlite3 statement (no `;` but one at its end);
 #                                      print its output; fail with sqlite3's error
 #   ad_store_id                        open the store read-only and print its store id (store_meta
@@ -569,7 +569,7 @@
 #                                      ended_at = now minus the stopping window, in whole seconds, in
 #                                      the store's `YYYY-MM-DD HH:MM:SS` UTC layout; launch_started_at
 #                                      NULL; row_version + 1. The window is [tmux]
-#                                      stopping_window_seconds from $HOME/.agent-director/config.toml,
+#                                      stopping_window_seconds from $HOME/.config/agent-director/config.toml,
 #                                      or agent-director's default (90) without one. Refuses unless
 #                                      that ended_at is later, in whole seconds, than the creation of
 #                                      the worker's session (read on the row's socket, under
@@ -593,7 +593,7 @@
 #                                      (row_version included)
 #   ad_kill_include_finished <instance-id>
 #                                      a human's finished-row kill, agent-director-admin's
-#                                      `kill-finished --claude-instance-id <id>` (agent-director's own
+#                                      `kill-finished --instance-id <id>` (agent-director's own
 #                                      `kill` takes no --include-finished), through
 #                                      `ad_admin_capture`, as a direct child of the shell that calls
 #                                      it: the scenario's own shell, or a subshell of it, which
@@ -605,7 +605,7 @@
 #                                      only for a finished row (`ended` or `missing`, as
 #                                      `ad_store_mark_finished` leaves it) whose session is past the
 #                                      starting-session bound ([tmux] starting_session_seconds in
-#                                      $HOME/.agent-director/config.toml: 300 s by default, 60 s at
+#                                      $HOME/.config/agent-director/config.toml: 300 s by default, 60 s at
 #                                      its safe minimum); before that it answers ErrSpawnNotResumable
 #                                      (a live row) or ErrTmuxUnresponsive (a younger session), and
 #                                      the step fails on that non-zero exit; a scenario that uses it
@@ -658,7 +658,7 @@
 #   seed_010_row <instance-id> <session-name> <dir> [<key>=<value>...]
 #                                      one row made with 0.10.0's own `spawn` through the harness call
 #                                      (`ad_capture`, from the scenario's shell): --cwd <dir>,
-#                                      --claude-instance-id, --tmux-session-name and a --label per
+#                                      --instance-id, --tmux-session-name and a --label per
 #                                      <key>=<value>; refuses a <session-name> that is taken, longer
 #                                      than 64 bytes or holds `.`, `:`, `#` or a control character, and
 #                                      a <dir> that is not an absolute path to a directory. Its worker
@@ -895,7 +895,7 @@
 #   states it). An agent-director row prints, TAB-separated:
 #     <position> TAB <time> TAB <ppid> TAB <verb> TAB <instance id, or -> TAB <arguments>
 #   where <position> is the line number in SCENARIO_AD_SHIM_LOG, <ppid> the CSCB process that
-#   ran the call, <instance id> the value of the call's --claude-instance-id (`--flag value`
+#   ran the call, <instance id> the value of the call's --instance-id (`--flag value`
 #   or `--flag=value`) and <arguments> the words after the verb, `printf %q`-quoted, joined by
 #   single spaces.
 #   ad_shim_mark                       print the agent-director shim log's position now
@@ -945,8 +945,8 @@
 #                                      Fails when the record is not a file. Works in shared mode too
 #   ad_trail_events <event> [<instance-id>]
 #                                      both guards first; print agent-director's trail records
-#                                      ($HOME/.agent-director/ad-trail.jsonl) whose `event` is <event>
-#                                      and, when given, whose `claude_instance_id` is <instance-id>, one
+#                                      ($HOME/.config/agent-director/ad-trail.jsonl) whose `event` is <event>
+#                                      and, when given, whose `instance_id` is <instance-id>, one
 #                                      JSON object per line, in trail order (none when there is no
 #                                      trail; a line that is not JSON, a record still being written, is
 #                                      skipped). Read-only: it never writes
@@ -2358,14 +2358,14 @@ check_ad_shim() {
     local step="${1:-the agent-director shim check}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    _scenario_check_shim_at "${HOME}/.agent-director/bin/agent-director" "${step}"
+    _scenario_check_shim_at "${HOME}/.config/agent-director/bin/agent-director" "${step}"
 }
 
 check_ad_admin_shim() {
     local step="${1:-the agent-director-admin shim check}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    _scenario_check_shim_at "${HOME}/.agent-director/admin/agent-director-admin" "${step}"
+    _scenario_check_shim_at "${HOME}/.config/agent-director/admin/agent-director-admin" "${step}"
 }
 
 # _scenario_shim_over <path> <step>: put the binary installed at <path>
@@ -2390,14 +2390,14 @@ install_ad_shim() {
     local step="${1:-install the agent-director shim}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    _scenario_shim_over "${HOME}/.agent-director/bin/agent-director" "${step}"
+    _scenario_shim_over "${HOME}/.config/agent-director/bin/agent-director" "${step}"
 }
 
 install_ad_admin_shim() {
     local step="${1:-install the agent-director-admin shim}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    _scenario_shim_over "${HOME}/.agent-director/admin/agent-director-admin" "${step}"
+    _scenario_shim_over "${HOME}/.config/agent-director/admin/agent-director-admin" "${step}"
 }
 
 reshim_ad() {
@@ -2406,7 +2406,7 @@ reshim_ad() {
     require_scenario_home "${step}"
     install_ad_shim "${step}"
     # install.sh installs agent-director-admin too; 0.10.0 had none.
-    if [[ -e "${HOME}/.agent-director/admin/agent-director-admin" ]]; then
+    if [[ -e "${HOME}/.config/agent-director/admin/agent-director-admin" ]]; then
         install_ad_admin_shim "${step}: agent-director-admin"
     fi
 }
@@ -2443,7 +2443,7 @@ install_ad_010() {
     local step="${1:-install agent-director 0.10.0}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    local root="${HOME}/.agent-director"
+    local root="${HOME}/.config/agent-director"
     [[ -f "${SCENARIO_AD_010_BIN}" && -x "${SCENARIO_AD_010_BIN}" ]] \
         || fail "${step}: agent-director 0.10.0's binary is missing from the image (${SCENARIO_AD_010_BIN})"
     mkdir -p "${root}/bin" || fail "${step}: could not create ${root}/bin"
@@ -2469,7 +2469,7 @@ swap_ad_binary() {
     [[ -f "${src}" && -x "${src}" ]] || fail "${step}: ${src} is not an executable file"
     ! _scenario_is_shim "${src}" || fail "${step}: ${src} is the shim, not a binary"
     check_ad_shim "${step}: the shim before the swap"
-    _scenario_place "${src}" "${HOME}/.agent-director/bin/agent-director.real" "${step}"
+    _scenario_place "${src}" "${HOME}/.config/agent-director/bin/agent-director.real" "${step}"
     check_ad_shim "${step}"
 }
 
@@ -2477,7 +2477,7 @@ hide_ad_install() {
     local step="${1:-move the agent-director shim and binary aside}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    local path="${HOME}/.agent-director/bin/agent-director"
+    local path="${HOME}/.config/agent-director/bin/agent-director"
     local aside="${SCENARIO_ROOT}/ad-aside"
     [[ ! -e "${aside}" ]] || fail "${step}: ${aside} already exists (hidden twice?)"
     check_ad_shim "${step}: the shim before hiding"
@@ -2497,7 +2497,7 @@ restore_ad_install() {
     local step="${1:-restore the agent-director shim and binary}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    local path="${HOME}/.agent-director/bin/agent-director"
+    local path="${HOME}/.config/agent-director/bin/agent-director"
     local aside="${SCENARIO_ROOT}/ad-aside"
     [[ -f "${aside}/agent-director" && -f "${aside}/agent-director.real" ]] \
         || fail "${step}: nothing hidden in ${aside}"
@@ -2516,12 +2516,12 @@ restore_ad_install() {
 
 # _scenario_stand_in_settings <step> <version|unparseable> <reject|pass>:
 # write the stand-in's settings file beside the binary behind the shim
-# ($HOME/.agent-director/bin/agent-director.real.settings), atomically, in
+# ($HOME/.config/agent-director/bin/agent-director.real.settings), atomically, in
 # fixtures/ad-version-stand-in.sh's format, its release_bin the image's
 # release binary. The caller has run both guards. Refuses a bin directory
 # that is not under SCENARIO_ROOT or resolves outside it.
 _scenario_stand_in_settings() {
-    local step="$1" version="$2" reuse="$3" bin="${HOME}/.agent-director/bin" real_root real_bin
+    local step="$1" version="$2" reuse="$3" bin="${HOME}/.config/agent-director/bin" real_root real_bin
     [[ -n "${version}" && "${version}" != *[[:cntrl:]]* ]] \
         || fail "${step}: version '${version}' is empty or holds a control character"
     [[ "${reuse}" == reject || "${reuse}" == pass ]] || fail "${step}: '${reuse}' is neither reject nor pass"
@@ -2545,7 +2545,7 @@ _scenario_stand_in_settings() {
 # at the standard path carries the stand-in's marker and its settings file
 # is beside it.
 _scenario_check_stand_in() {
-    local real="${HOME}/.agent-director/bin/agent-director.real"
+    local real="${HOME}/.config/agent-director/bin/agent-director.real"
     grep -qxF -- "${SCENARIO_AD_STAND_IN_MARKER}" "${real}" 2> /dev/null \
         || fail "$1: the binary behind the shim at ${real} is not the version stand-in"
     [[ -f "${real}.settings" ]] || fail "$1: no stand-in settings at ${real}.settings"
@@ -2570,7 +2570,7 @@ restore_ad_install_with_stand_in() {
     local step="${3:-restore the agent-director shim with the version stand-in (${1:-} ${2:-}) behind it}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    local path="${HOME}/.agent-director/bin/agent-director"
+    local path="${HOME}/.config/agent-director/bin/agent-director"
     local aside="${SCENARIO_ROOT}/ad-aside"
     [[ -f "${SCENARIO_AD_STAND_IN_SRC}" ]] && grep -qxF -- "${SCENARIO_AD_STAND_IN_MARKER}" "${SCENARIO_AD_STAND_IN_SRC}" \
         || fail "${step}: the stand-in ${SCENARIO_AD_STAND_IN_SRC} is missing or carries no marker"
@@ -2598,7 +2598,7 @@ restore_ad_install_with_stand_in() {
 ad() {
     require_ci_image "ad $*"
     require_scenario_home "ad $*"
-    "${HOME}/.agent-director/bin/agent-director" "$@"
+    "${HOME}/.config/agent-director/bin/agent-director" "$@"
 }
 
 ad_capture() {
@@ -2608,13 +2608,13 @@ ad_capture() {
     AD_OUT="${SCENARIO_ROOT}/ad.${_SCENARIO_AD_COUNT}.out"
     AD_ERR="${SCENARIO_ROOT}/ad.${_SCENARIO_AD_COUNT}.err"
     AD_RC=0
-    "${HOME}/.agent-director/bin/agent-director" "$@" > "${AD_OUT}" 2> "${AD_ERR}" || AD_RC=$?
+    "${HOME}/.config/agent-director/bin/agent-director" "$@" > "${AD_OUT}" 2> "${AD_ERR}" || AD_RC=$?
 }
 
 ad_admin() {
     require_ci_image "ad_admin $*"
     require_scenario_home "ad_admin $*"
-    "${HOME}/.agent-director/admin/agent-director-admin" "$@"
+    "${HOME}/.config/agent-director/admin/agent-director-admin" "$@"
 }
 
 ad_admin_capture() {
@@ -2624,7 +2624,7 @@ ad_admin_capture() {
     AD_OUT="${SCENARIO_ROOT}/ad.${_SCENARIO_AD_COUNT}.out"
     AD_ERR="${SCENARIO_ROOT}/ad.${_SCENARIO_AD_COUNT}.err"
     AD_RC=0
-    "${HOME}/.agent-director/admin/agent-director-admin" "$@" > "${AD_OUT}" 2> "${AD_ERR}" || AD_RC=$?
+    "${HOME}/.config/agent-director/admin/agent-director-admin" "$@" > "${AD_OUT}" 2> "${AD_ERR}" || AD_RC=$?
 }
 
 # ---------------------------------------------------------------------------
@@ -2637,7 +2637,7 @@ SCENARIO_STORE_BUSY_MS=5000
 ad_store_edit() {
     require_ci_image "ad_store_edit"
     require_scenario_home "ad_store_edit"
-    local db="${HOME}/.agent-director/state.db" statement out
+    local db="${HOME}/.config/agent-director/state.db" statement out
     (( $# == 1 )) || fail "ad_store_edit: takes one statement, not $# arguments"
     statement="$1"
     # One statement: no `;` but an optional one at its end.
@@ -2657,7 +2657,7 @@ ad_store_edit() {
 ad_store_id() {
     require_ci_image "ad_store_id"
     require_scenario_home "ad_store_id"
-    local db="${HOME}/.agent-director/state.db" out
+    local db="${HOME}/.config/agent-director/state.db" out
     [[ -f "${db}" ]] || fail "ad_store_id: no store at ${db}"
     out="$(sqlite3 -batch -bail -readonly -cmd ".timeout ${SCENARIO_STORE_BUSY_MS}" "${db}" \
         "SELECT value FROM store_meta WHERE key = 'store_id';" 2>&1)" \
@@ -2683,7 +2683,7 @@ ad_store_backup() {
     step="ad_store_backup ${dest}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    db="${HOME}/.agent-director/state.db"
+    db="${HOME}/.config/agent-director/state.db"
     (( $# == 1 )) || fail "${step}: takes one destination, not $# arguments"
     [[ "${dest}" == "${SCENARIO_ROOT}"/* ]] \
         || fail "${step}: refused: ${dest} is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
@@ -2715,13 +2715,13 @@ ad_store_pending_no_launch() {
     rv="$(jq -r '.[0].row_version' <<< "${before}")"
     [[ "${rv}" =~ ^[0-9]+$ ]] || fail "${step}: the row's row_version reads '${rv}'"
     # One statement, guarded by the row_version read; RETURNING names the row it changed.
-    out="$(ad_store_edit "UPDATE spawns SET state = 'pending', launch_started_at = NULL, launch_token = NULL, pid = NULL, proc_starttime = NULL, pane_id = NULL, pane_pid = NULL, pane_starttime = NULL, row_version = row_version + 1 WHERE claude_instance_id = '${id}' AND row_version = ${rv} RETURNING claude_instance_id")" \
+    out="$(ad_store_edit "UPDATE spawns SET state = 'pending', launch_started_at = NULL, launch_token = NULL, pid = NULL, proc_starttime = NULL, pane_id = NULL, pane_pid = NULL, pane_starttime = NULL, row_version = row_version + 1 WHERE instance_id = '${id}' AND row_version = ${rv} RETURNING instance_id")" \
         || exit 1
     [[ "${out}" == "${id}" ]] || fail "${step}: the row's row_version is no longer ${rv}: agent-director wrote it in between, and the edit wrote nothing"
     after="$(_scenario_row_json "${step}" "${id}")" || exit 1
     _scenario_row_diff_check "${step}" "${before}" "${after}" \
         "{\"state\": \"pending\", \"launch_started_at\": null, \"launch_token\": null, \"pid\": null, \"proc_starttime\": null, \"pane_id\": null, \"pane_pid\": null, \"pane_starttime\": null, \"row_version\": $(( rv + 1 ))}"
-    ad_capture status --claude-instance-id "${id}"
+    ad_capture status --instance-id "${id}"
     [[ "${AD_RC}" == 0 ]] \
         || fail "${step}: the harness status read exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
     jq -e 'type == "object" and .state == "pending" and (has("launch_started_at") | not)' "${AD_OUT}" > /dev/null 2>&1 \
@@ -3060,7 +3060,7 @@ _scenario_check_instance_id() {
 _scenario_store_read() {
     require_ci_image "$1"
     require_scenario_home "$1"
-    local step="$1" query="$2" db="${HOME}/.agent-director/state.db" out mode=()
+    local step="$1" query="$2" db="${HOME}/.config/agent-director/state.db" out mode=()
     if [[ "${3:-}" == json ]]; then
         mode=(-json)
     fi
@@ -3076,7 +3076,7 @@ _scenario_store_read() {
 # JSON array; fail when no row has the id.
 _scenario_row_json() {
     local out
-    out="$(_scenario_store_read "$1" "SELECT * FROM spawns WHERE claude_instance_id = '$2'" json)" || exit 1
+    out="$(_scenario_store_read "$1" "SELECT * FROM spawns WHERE instance_id = '$2'" json)" || exit 1
     [[ -n "${out}" ]] || fail "$1: no row has instance id $2"
     printf '%s\n' "${out}"
 }
@@ -3107,8 +3107,8 @@ ad_new_token() {
     fi
     if [[ -n "${id}" ]]; then
         _scenario_check_instance_id "${step}" "${id}"
-        if [[ -f "${HOME}/.agent-director/state.db" ]]; then
-            current="$(_scenario_store_read "${step}" "SELECT COALESCE(launch_token, '') FROM spawns WHERE claude_instance_id = '${id}'")" \
+        if [[ -f "${HOME}/.config/agent-director/state.db" ]]; then
+            current="$(_scenario_store_read "${step}" "SELECT COALESCE(launch_token, '') FROM spawns WHERE instance_id = '${id}'")" \
                 || exit 1
         fi
     fi
@@ -3286,7 +3286,7 @@ relabel_session() {
     pane="$(_scenario_worker_pane "${step}" "${sid}" "${old}")" || exit 1
     if [[ -n "${given}" ]]; then
         [[ "${given}" =~ ^[0-9a-f]{16}$ ]] || fail "${step}: token '${given}' is not 16 lowercase hex characters"
-        current="$(_scenario_store_read "${step}" "SELECT COALESCE(launch_token, '') FROM spawns WHERE claude_instance_id = '${id}'")" \
+        current="$(_scenario_store_read "${step}" "SELECT COALESCE(launch_token, '') FROM spawns WHERE instance_id = '${id}'")" \
             || exit 1
         [[ "${given}" != "${old}" && "${given}" != "${current}" ]] \
             || fail "${step}: token ${given} is the label's or the row's current launch token, not an earlier launch's"
@@ -3662,11 +3662,11 @@ repoint_symlink() {
 # ---------------------------------------------------------------------------
 
 # _scenario_ad_tmux_setting <step> <key> <default>: print the scenario HOME's
-# agent-director `[tmux] <key>` from $HOME/.agent-director/config.toml, or
+# agent-director `[tmux] <key>` from $HOME/.config/agent-director/config.toml, or
 # <default> when the file or the key is absent; fail when it is not a whole
 # number.
 _scenario_ad_tmux_setting() {
-    local step="$1" key="$2" def="$3" file="${HOME}/.agent-director/config.toml" v=""
+    local step="$1" key="$2" def="$3" file="${HOME}/.config/agent-director/config.toml" v=""
     if [[ -f "${file}" ]]; then
         v="$(awk -v key="${key}" '
             /^[[:space:]]*\[/ {
@@ -3723,7 +3723,7 @@ ad_store_mark_finished() {
     (( ended > created )) \
         || fail "${step}: refused: the worker's session was created $(( now - created )) s ago, not more than the stopping window (${window} s): ended_at must lie at least the window ago and later, in whole seconds, than the session's creation"
     ended_at="$(date -u -d "@${ended}" '+%Y-%m-%d %H:%M:%S')" || fail "${step}: date could not format ${ended}"
-    out="$(ad_store_edit "UPDATE spawns SET state = '${state}', ended_at = '${ended_at}', launch_started_at = NULL, row_version = row_version + 1 WHERE claude_instance_id = '${id}' AND row_version = ${rv} RETURNING claude_instance_id")" \
+    out="$(ad_store_edit "UPDATE spawns SET state = '${state}', ended_at = '${ended_at}', launch_started_at = NULL, row_version = row_version + 1 WHERE instance_id = '${id}' AND row_version = ${rv} RETURNING instance_id")" \
         || exit 1
     [[ "${out}" == "${id}" ]] || fail "${step}: the row's row_version is no longer ${rv}: agent-director wrote it in between, and the edit wrote nothing"
     after="$(_scenario_row_json "${step}" "${id}")" || exit 1
@@ -3747,13 +3747,13 @@ ad_store_seed_pending() {
     token="$(ad_new_token "${id}" ${leftover:+"${leftover}"})" || exit 1
     started="$(date +%s%3N)"
     [[ "${started}" =~ ^[0-9]+$ ]] || fail "${step}: date gave '${started}' milliseconds"
-    out="$(ad_store_edit "UPDATE spawns SET state = 'pending', launch_started_at = ${started}, launch_token = '${token}', ended_at = NULL, pid = NULL, proc_starttime = NULL, tmux_server_pid = NULL, tmux_server_started = NULL, tmux_server_starttime = NULL, pane_id = NULL, pane_pid = NULL, pane_starttime = NULL, row_version = row_version + 1 WHERE claude_instance_id = '${id}' AND row_version = ${rv} RETURNING claude_instance_id")" \
+    out="$(ad_store_edit "UPDATE spawns SET state = 'pending', launch_started_at = ${started}, launch_token = '${token}', ended_at = NULL, pid = NULL, proc_starttime = NULL, tmux_server_pid = NULL, tmux_server_started = NULL, tmux_server_starttime = NULL, pane_id = NULL, pane_pid = NULL, pane_starttime = NULL, row_version = row_version + 1 WHERE instance_id = '${id}' AND row_version = ${rv} RETURNING instance_id")" \
         || exit 1
     [[ "${out}" == "${id}" ]] || fail "${step}: the row's row_version is no longer ${rv}: agent-director wrote it in between, and the edit wrote nothing"
     after="$(_scenario_row_json "${step}" "${id}")" || exit 1
     _scenario_row_diff_check "${step}" "${before}" "${after}" \
         "{\"state\": \"pending\", \"launch_started_at\": ${started}, \"launch_token\": \"${token}\", \"ended_at\": null, \"pid\": null, \"proc_starttime\": null, \"tmux_server_pid\": null, \"tmux_server_started\": null, \"tmux_server_starttime\": null, \"pane_id\": null, \"pane_pid\": null, \"pane_starttime\": null, \"row_version\": $(( rv + 1 ))}"
-    ad_capture status --claude-instance-id "${id}"
+    ad_capture status --instance-id "${id}"
     [[ "${AD_RC}" == 0 ]] \
         || fail "${step}: the harness status read exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
     jq -e 'type == "object" and .state == "pending" and has("launch_started_at")' "${AD_OUT}" > /dev/null 2>&1 \
@@ -3775,7 +3775,7 @@ ad_store_unusable_name() {
     [[ "${state}" == ended || "${state}" == missing ]] \
         || fail "${step}: refused: the row reads ${state}, not a finished state (ended or missing)"
     [[ "${rv}" =~ ^[0-9]+$ ]] || fail "${step}: the row's row_version reads '${rv}'"
-    out="$(ad_store_edit "UPDATE spawns SET tmux_session_name = '${name}' WHERE claude_instance_id = '${id}' AND state IN ('ended', 'missing') AND row_version = ${rv} RETURNING claude_instance_id")" \
+    out="$(ad_store_edit "UPDATE spawns SET tmux_session_name = '${name}' WHERE instance_id = '${id}' AND state IN ('ended', 'missing') AND row_version = ${rv} RETURNING instance_id")" \
         || exit 1
     [[ "${out}" == "${id}" ]] || fail "${step}: the row changed under the edit (no longer finished at row_version ${rv}), and the edit wrote nothing"
     after="$(_scenario_row_json "${step}" "${id}")" || exit 1
@@ -3821,7 +3821,7 @@ ad_kill_include_finished() {
     before="$(_scenario_finished_kill_lines)"
     # ad_admin_capture runs agent-director-admin as a direct child of this
     # shell: the scenario's own shell, or the subshell of it this is called in.
-    ad_admin_capture kill-finished --claude-instance-id "${id}"
+    ad_admin_capture kill-finished --instance-id "${id}"
     AD_KILL_OUT="${AD_OUT}"
     AD_KILL_ERR="${AD_ERR}"
     AD_KILL_RC="${AD_RC}"
@@ -3842,7 +3842,7 @@ ad_delete_unusable_row() {
     require_ci_image "${step}"
     require_scenario_home "${step}"
     _scenario_check_instance_id "${step}" "${id}"
-    name="$(_scenario_store_read "${step}" "SELECT tmux_session_name FROM spawns WHERE claude_instance_id = '${id}'")" \
+    name="$(_scenario_store_read "${step}" "SELECT tmux_session_name FROM spawns WHERE instance_id = '${id}'")" \
         || exit 1
     [[ -n "${name}" ]] || fail "${step}: no row has instance id ${id}"
     # The one delete the harness makes: scenario 25's removal of the row
@@ -3850,14 +3850,14 @@ ad_delete_unusable_row() {
     [[ "${name}" == *.* ]] \
         || fail "${step}: refused: the row's recorded session name '${name}' holds no '.'; this step removes only the row scenario 25 made unusable"
     check_ad_admin_shim "${step}"
-    ad_admin_capture delete --claude-instance-id "${id}"
+    ad_admin_capture delete --instance-id "${id}"
     if (( AD_RC != 0 )); then
         sed 's/^/  | /' "${AD_OUT}" "${AD_ERR}" >&2
         fail "${step}: agent-director-admin delete exited ${AD_RC}"
     fi
     jq -e --arg id "${id}" '.results[$id] == "ok"' "${AD_OUT}" > /dev/null 2>&1 \
         || fail "${step}: agent-director-admin delete did not report ${id} ok: $(tr '\n' ' ' < "${AD_OUT}")"
-    n="$(_scenario_store_read "${step}" "SELECT count(*) FROM spawns WHERE claude_instance_id = '${id}'")" || exit 1
+    n="$(_scenario_store_read "${step}" "SELECT count(*) FROM spawns WHERE instance_id = '${id}'")" || exit 1
     [[ "${n}" == 0 ]] || fail "${step}: the row is still in the store after delete: $(tr '\n' ' ' < "${AD_OUT}")"
 }
 
@@ -3976,7 +3976,7 @@ wait_find_missing_runs() {
 # has run in this shell, and the store, if any, has no store_meta table (the
 # release's install has not migrated it).
 _scenario_require_010() {
-    local step="$1" real="${HOME}/.agent-director/bin/agent-director.real" out ver n
+    local step="$1" real="${HOME}/.config/agent-director/bin/agent-director.real" out ver n
     (( _SCENARIO_INSTALL_COUNT == 0 )) \
         || fail "${step}: refused: the release's install.sh has run in this HOME (${_SCENARIO_INSTALL_COUNT} run(s)); the 0.10.0 seeders run before it"
     check_ad_shim "${step}"
@@ -3984,7 +3984,7 @@ _scenario_require_010() {
     ver="$(jq -r '.version // empty' <<< "${out}" 2> /dev/null)" || ver=""
     [[ "${ver}" == "${SCENARIO_AD_010_VERSION}" ]] \
         || fail "${step}: refused: the binary behind the shim reports version '${ver}', not ${SCENARIO_AD_010_VERSION}"
-    if [[ -f "${HOME}/.agent-director/state.db" ]]; then
+    if [[ -f "${HOME}/.config/agent-director/state.db" ]]; then
         n="$(_scenario_store_read "${step}" "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_meta'")" \
             || exit 1
         [[ "${n}" == 0 ]] \
@@ -4007,7 +4007,7 @@ _scenario_stub_mode_of() {
 # True once the row's state is one other than `pending`.
 _scenario_row_left_pending() {
     local state
-    state="$(_scenario_store_read "$1" "SELECT state FROM spawns WHERE claude_instance_id = '$2'")" || exit 1
+    state="$(_scenario_store_read "$1" "SELECT state FROM spawns WHERE instance_id = '$2'")" || exit 1
     [[ -n "${state}" && "${state}" != pending ]]
 }
 
@@ -4036,7 +4036,7 @@ seed_010_row() {
         stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
         mode="${STUB_MODE_AT_ONCE}"
     fi
-    ad_capture spawn --cwd "${dir}" --claude-instance-id "${id}" --tmux-session-name "${name}" \
+    ad_capture spawn --agent claude --cwd "${dir}" --instance-id "${id}" --tmux-session-name "${name}" \
         ${args[@]+"${args[@]}"}
     if (( AD_RC != 0 )); then
         sed 's/^/  | /' "${AD_OUT}" "${AD_ERR}" >&2
@@ -4055,7 +4055,7 @@ seed_010_row() {
     if [[ "${mode}" == "${STUB_MODE_AT_ONCE}" ]]; then
         wait_until "${SCENARIO_SEED_REPORT_S}" "${step}: the row never reported in" \
             _scenario_row_left_pending "${step}" "${id}"
-        state="$(_scenario_store_read "${step}" "SELECT state FROM spawns WHERE claude_instance_id = '${id}'")" || exit 1
+        state="$(_scenario_store_read "${step}" "SELECT state FROM spawns WHERE instance_id = '${id}'")" || exit 1
         case "${state}" in
             waiting | working | ask_user | check_permission) ;;
             *) fail "${step}: the row reads ${state} after its worker reported in, not a live state" ;;
@@ -4812,18 +4812,18 @@ tmux_shim_mark() {
     _scenario_log_mark tmux_shim_mark "${SCENARIO_TMUX_SHIM_LOG}"
 }
 
-# Set _L_ID to the value of --claude-instance-id in _L_ARGS (`--flag value`
+# Set _L_ID to the value of --instance-id in _L_ARGS (`--flag value`
 # or `--flag=value`); empty when the call carries none.
 _scenario_ad_id() {
     local i
     _L_ID=""
     for (( i = 0; i < ${#_L_ARGS[@]}; i++ )); do
         case "${_L_ARGS[i]}" in
-            --claude-instance-id)
+            --instance-id)
                 _L_ID="${_L_ARGS[i + 1]:-}"
                 return 0
                 ;;
-            --claude-instance-id=*)
+            --instance-id=*)
                 _L_ID="${_L_ARGS[i]#*=}"
                 return 0
                 ;;
@@ -5072,10 +5072,10 @@ ad_trail_events() {
     require_ci_image "${step}"
     require_scenario_home "${step}"
     [[ -n "${event}" ]] || fail "${step}: no event named"
-    trail="${HOME}/.agent-director/ad-trail.jsonl"
+    trail="${HOME}/.config/agent-director/ad-trail.jsonl"
     [[ -f "${trail}" ]] || return 0
     jq -c -R --arg e "${event}" --arg id "${id}" \
-        'fromjson? | select(type == "object" and .event == $e and ($id == "" or .claude_instance_id == $id))' \
+        'fromjson? | select(type == "object" and .event == $e and ($id == "" or .instance_id == $id))' \
         "${trail}" || fail "${step}: jq could not read ${trail}"
 }
 
@@ -5378,8 +5378,8 @@ _scenario_fmk_setup() {
         || fail "claude resolves to '$(command -v claude || true)', not the stub ${SCENARIO_BIN}/claude"
 
     # shellcheck disable=SC2034 # read by the scripts that source this file
-    SCENARIO_AD_BIN="${HOME}/.agent-director/bin/agent-director"
-    SCENARIO_AD_SHIM_LOG="${HOME}/.agent-director/bin/agent-director-shim.log"
+    SCENARIO_AD_BIN="${HOME}/.config/agent-director/bin/agent-director"
+    SCENARIO_AD_SHIM_LOG="${HOME}/.config/agent-director/bin/agent-director-shim.log"
     # The files the closing enforcement reads, whatever a script later sets
     # SCENARIO_TMUX_SHIM_LOG, SCENARIO_AD_SHIM_LOG or SCENARIO_CSCB_RECORD to.
     _SCENARIO_REAL_TMUX_SHIM_LOG="${SCENARIO_TMUX_SHIM_LOG}"
@@ -5389,8 +5389,8 @@ _scenario_fmk_setup() {
         install_ad_010 "fmk setup: install agent-director 0.10.0"
     else
         install_ad_release "fmk setup: install the release"
-        [[ -f "${HOME}/.agent-director/state.db" ]] \
-            || fail "fmk setup: the release's install.sh made no store at ${HOME}/.agent-director/state.db"
+        [[ -f "${HOME}/.config/agent-director/state.db" ]] \
+            || fail "fmk setup: the release's install.sh made no store at ${HOME}/.config/agent-director/state.db"
     fi
 }
 

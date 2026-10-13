@@ -722,7 +722,7 @@ async function check23Steps(ctx: CheckContext, f: Findings): Promise<void> {
   const deadline = ctx.clock.now() + MINUTE
   while (ctx.clock.now() < deadline) {
     await pause(ctx, 10 * SECOND)
-    for (const extra of (await promptPosts(ctx, tm)).filter((p) => p.claude_instance_id === 'cscb_persona_b' && p.ok === true)) {
+    for (const extra of (await promptPosts(ctx, tm)).filter((p) => p.instance_id === 'cscb_persona_b' && p.ok === true)) {
       const key = promptKey(extra)
       if (done.has(key) || !extra.slack_ts) continue
       done.add(key)

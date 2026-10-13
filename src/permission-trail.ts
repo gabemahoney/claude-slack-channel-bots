@@ -40,7 +40,7 @@ export interface TrailEventBase {
   /** SR-V-1.1: AD-minted UUID, absent for events before token assignment (SR-V-1.2). */
   request_token?: string
   /** SR-V-1.2: present whenever known. */
-  claude_instance_id?: string
+  instance_id?: string
   /** SR-V-1.3: Slack channel id for events that touch Slack. */
   channel?: string
   /** SR-V-1.3: Slack message ts for events that touch Slack. */

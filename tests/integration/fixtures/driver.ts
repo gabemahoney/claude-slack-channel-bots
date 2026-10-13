@@ -60,7 +60,7 @@
  *   Precondition (a resumable ended row):
  *     the driver sends stub-claude its exit sentinel through agent-director
  *     `send-keys`; stub-claude fires SessionEnd and exits, so the row is
- *     `ended` (or `missing`) and keeps its claude_session_id.
+ *     `ended` (or `missing`) and keeps its session_id.
  *     ASSERT: a terminal state AND a session_id present (resume is possible).
  *
  *   Phase 2 (resumed launch past the dialog again):
@@ -156,7 +156,7 @@ function driverFail(reason: string): never {
 
 async function statusState(instanceId: string): Promise<string> {
   try {
-    const r = await getClient().status({ claude_instance_id: instanceId })
+    const r = await getClient().status({ instance_id: instanceId })
     return r.state
   } catch (err) {
     return `<status-error: ${String(err)}>`
@@ -282,13 +282,13 @@ async function main(): Promise<void> {
 
   // Capture the session_id while the row is still live — resume needs it and we
   // don't want to depend on it surviving the terminal transition.
-  const liveRow = await getClient().get({ claude_instance_id: instanceId })
-  const liveSid = (liveRow as { claude_session_id?: string }).claude_session_id ?? ''
+  const liveRow = await getClient().get({ instance_id: instanceId })
+  const liveSid = (liveRow as { session_id?: string }).session_id ?? ''
   if (!liveSid || liveSid === 'null') {
-    driverFail(`precondition: no claude_session_id on the live row (SessionStart hook did not record one) — resume would be impossible`)
+    driverFail(`precondition: no session_id on the live row (SessionStart hook did not record one) — resume would be impossible`)
   }
 
-  await getClient().sendKeys({ claude_instance_id: instanceId, text: '__CSCB_TEST_EXIT__' })
+  await getClient().sendKeys({ instance_id: instanceId, text: '__CSCB_TEST_EXIT__' })
 
   const TERMINAL = new Set(['ended', 'missing'])
   const preDeadline = Date.now() + 20_000
@@ -296,10 +296,10 @@ async function main(): Promise<void> {
   let termSid = ''
   while (Date.now() < preDeadline) {
     await new Promise((r) => setTimeout(r, 300))
-    const row = await getClient().get({ claude_instance_id: instanceId })
+    const row = await getClient().get({ instance_id: instanceId })
     if (TERMINAL.has(row.state)) {
       termState = row.state
-      termSid = (row as { claude_session_id?: string }).claude_session_id ?? ''
+      termSid = (row as { session_id?: string }).session_id ?? ''
       break
     }
   }
@@ -310,7 +310,7 @@ async function main(): Promise<void> {
   // which is what resume actually needs).
   const sid = termSid && termSid !== 'null' ? termSid : liveSid
   if (!sid || sid === 'null') {
-    driverFail(`precondition: terminal row has no claude_session_id — resume would be impossible`)
+    driverFail(`precondition: terminal row has no session_id — resume would be impossible`)
   }
   console.log(`DRIVER: PRECONDITION_OK state=${termState} session_id_present=true`)
 
@@ -327,7 +327,7 @@ async function main(): Promise<void> {
   // Read the resumed row's launch start now: the row shows it only while it
   // is `pending`, which lasts until stub-claude's SessionStart hook, after
   // the approver's first lap has read the pane and pressed Enter.
-  const pendingRow = (await getClient().get({ claude_instance_id: instanceId })) as {
+  const pendingRow = (await getClient().get({ instance_id: instanceId })) as {
     state: string
     launch_started_at?: string | null
   }
@@ -348,7 +348,7 @@ async function main(): Promise<void> {
 
   // Best-effort cleanup: end the session so the pane does not linger. The row
   // is kept, ended.
-  try { await getClient().kill({ claude_instance_id: instanceId }) } catch { /* ignore */ }
+  try { await getClient().kill({ instance_id: instanceId }) } catch { /* ignore */ }
   console.log('DRIVER: DONE')
   process.exit(0)
 }

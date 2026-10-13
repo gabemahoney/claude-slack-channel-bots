@@ -1,3 +1,4 @@
+import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
 /**
  * permission-click-handler.test.ts — SR-2.2 / SR-4 click → decide path under
  * the request_token / plural-projection wire (Epic 2 rewrite), resolved by
@@ -8,7 +9,7 @@
  *     branch. Every click code path calls decide(request_token) exactly once
  *     (SR-4.1, SR-4.3).
  *   - Composite-key routing: live entry lookup is keyed on
- *     (claude_instance_id, request_token) (SR-4.2).
+ *     (instance_id, request_token) (SR-4.2).
  *   - Stale click (no live entry): decide still fires; NO chat.update from
  *     the click handler. The next poller tick reconciles the rendering
  *     (SR-4.2).
@@ -96,6 +97,7 @@ import type { Persona } from '../src/config.ts'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import {
   cannedGetResultPlural,
+  cannedGetPermissionResponse,
   cannedListRow,
   cannedPermissionRequest,
   errAlreadyDecided,
@@ -305,8 +307,8 @@ async function runSeedTick(
     list: async () => ({
       spawns: spawns.map(([persona]) => cannedListRow({ state: 'check_permission' }, persona, h.dir)),
     }),
-    get: async ({ claude_instance_id }: { claude_instance_id: string }) => {
-      const [persona, requests] = spawns.find(([p]) => personaInstanceId(p.key) === claude_instance_id)!
+    get: async ({ instance_id }: { instance_id: string }) => {
+      const [persona, requests] = spawns.find(([p]) => personaInstanceId(p.key) === instance_id)!
       return cannedGetResultPlural(
         { state: 'check_permission', permission_requests: requests },
         persona,
@@ -371,7 +373,7 @@ async function seedTwoSiblings(opts: {
  * pass `throwOn` to inject an error on every call. The `calls` array is
  * mutated in place so individual tests can assert the decide-wire shape.
  */
-function makeDecideStub(opts: { throwOn?: Error } = {}): {
+function makeDecideStub(opts: { throwOn?: Error; delivery?: 'delivered' | 'not_confirmed' } = {}): {
   client: { decide: (params: DecideParams) => Promise<DecideResult> }
   calls: DecideParams[]
 } {
@@ -381,7 +383,7 @@ function makeDecideStub(opts: { throwOn?: Error } = {}): {
       decide: async (params: DecideParams): Promise<DecideResult> => {
         calls.push(params)
         if (opts.throwOn) throw opts.throwOn
-        return {}
+        return cannedDecideResult(opts.delivery)
       },
     },
     calls,
@@ -459,6 +461,73 @@ describe('handlePermissionClick — non-matching action ids', () => {
 // ---------------------------------------------------------------------------
 
 describe('handlePermissionClick — happy path', () => {
+  test.each(['allow', 'deny'] as const)('0.12 %s recorded but not_confirmed leaves the prompt unhandled for polling', async (decision) => {
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    const decide = makeDecideStub({ delivery: 'not_confirmed' })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+    expect(await handlePermissionClick(encodePermissionActionId(decision, h.instanceA, TOKEN_A), clickDeps())).toBe(true)
+    expect(decide.calls).toEqual([{ instance_id: h.instanceA, request_token: TOKEN_A, decision }])
+    expect(updatesOn(h.stubA)).toEqual([])
+    expect(updatesOn(h.stubB)).toEqual([])
+    expect(getLivePermission(h.instanceA, TOKEN_A)).toMatchObject({ handled: false, awaitingDelivery: true })
+  })
+
+  test.each(['delivered', 'fallen_back'] as const)('posted prompt → not_confirmed click → repeated open-row ticks → %s resolution', async (outcome) => {
+    let permission = cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })
+    const sibling = cannedPermissionRequest({ request_token: TOKEN_B, request_id: 2 })
+    const decideCalls: DecideParams[] = []
+    const permissionCalls: unknown[] = []
+    const client = {
+      list: async () => ({ spawns: [cannedListRow({ state: 'check_permission' }, h.personaA, h.dir)] }),
+      get: async () => cannedGetResultPlural({ state: 'check_permission', permission_requests: [permission, sibling] }, h.personaA, h.dir),
+      decide: async (params: DecideParams) => {
+        decideCalls.push(params)
+        permission = { ...permission, decision: 'allow', delivery: 'not_confirmed' }
+        return cannedDecideResult('not_confirmed')
+      },
+      getPermission: async (params: unknown) => {
+        permissionCalls.push(params)
+        return cannedGetPermissionResponse({ ...permission, decision_reason: null })
+      },
+    }
+    initOutageState({ getClient: () => client as unknown as Client, notify: () => {} })
+    const ivl = startManualPoller({ getClient: () => client as unknown as Client, clientFor: h.clients.clientFor, getPersona: h.getPersona, getPersonaConfig: () => null })
+    await ivl.tick()
+    const original = getLivePermission(h.instanceA, TOKEN_A)!
+    const siblingEntry = getLivePermission(h.instanceA, TOKEN_B)!
+    expect(posts(h.stubA)).toHaveLength(2)
+    expect(await handlePermissionClick(encodePermissionActionId('allow', h.instanceA, TOKEN_A), clickDeps())).toBe(true)
+    expect(decideCalls).toEqual([{ instance_id: h.instanceA, request_token: TOKEN_A, decision: 'allow' }])
+    for (let tick = 0; tick < 3; tick++) {
+      await ivl.tick()
+      expect(updatesOn(h.stubA)).toEqual([])
+      expect(posts(h.stubA)).toHaveLength(2)
+      expect(getLivePermission(h.instanceA, TOKEN_A)).toBe(original)
+      expect(original).toMatchObject({ handled: false, awaitingDelivery: true })
+      expect(getLivePermission(h.instanceA, TOKEN_B)).toBe(siblingEntry)
+      expect(slackCalls(h.stubB, h.stubD)).toBe(0)
+    }
+    expect(permissionCalls).toEqual(Array.from({ length: 3 }, () => ({ request_token: TOKEN_A })))
+    permission = { ...permission, delivery: outcome }
+    await ivl.tick()
+    if (outcome === 'fallen_back') {
+      expect(updatesOn(h.stubA).map((call) => call.text)).toEqual([RELAY_FALLEN_BACK_TEXT])
+      expect(getLivePermission(h.instanceA, TOKEN_A)).toBe(original)
+      await ivl.tick()
+      expect(updatesOn(h.stubA)).toHaveLength(1)
+      expect(getLivePermission(h.instanceA, TOKEN_A)).toBe(original)
+      permission = { ...permission, pane_answer: 'sent', decision_reason: 'pane' }
+      await ivl.tick()
+    }
+    expect(updatesOn(h.stubA).at(-1)).toMatchObject({ channel: CHANNEL_A, ts: original.messageTs, text: ALLOWED_TEXT })
+    expect(updatesOn(h.stubA)).toHaveLength(outcome === 'fallen_back' ? 2 : 1)
+    expect(posts(h.stubA)).toHaveLength(2)
+    expect(getLivePermission(h.instanceA, TOKEN_A)).toBeUndefined()
+    expect(getLivePermission(h.instanceA, TOKEN_B)).toBe(siblingEntry)
+    expect(slackCalls(h.stubB, h.stubD)).toBe(0)
+    assertNoLeak({ decideCalls, permissionCalls, calls: h.stubA.calls })
+  })
+
   test('allow → decide(allow, request_token) → chat.update "Allowed" through A\'s client → markHandled', async () => {
     await seedLiveEntry({ requestToken: TOKEN_A })
     const entryBefore = getLivePermission(h.instanceA, TOKEN_A)
@@ -475,7 +544,7 @@ describe('handlePermissionClick — happy path', () => {
     expect(handled).toBe(true)
     expect(decide.calls).toHaveLength(1)
     expect(decide.calls[0]).toEqual({
-      claude_instance_id: h.instanceA,
+      instance_id: h.instanceA,
       decision: 'allow',
       // SR-4.1 / SR-7.2: request_token is unconditionally on the wire.
       request_token: TOKEN_A,
@@ -531,7 +600,7 @@ describe('handlePermissionClick — happy path', () => {
     )
 
     expect(decide.calls).toHaveLength(1)
-    expect(decide.calls[0]!.claude_instance_id).toBe(h.instanceB)
+    expect(decide.calls[0]!.instance_id).toBe(h.instanceB)
     expect(h.stubB.calls.update).toHaveLength(1)
     expect(h.stubB.calls.update[0]!.channel).toBe(CHANNEL_B)
     expect(h.stubB.calls.update[0]!.ts).toBe(messageTs)
@@ -645,7 +714,7 @@ describe('handlePermissionClick — a prompt in a persona\'s DM (AC 29, AC 36)',
 
     expect(result).toBe(true)
     expect(decide.calls).toEqual([
-      { claude_instance_id: h.instanceD, decision: 'allow', request_token: TOKEN_A } as DecideParams & { request_token: string },
+      { instance_id: h.instanceD, decision: 'allow', request_token: TOKEN_A } as DecideParams & { request_token: string },
     ])
     // D's client made exactly one call after the seed: the update, in the DM, at the prompt's ts.
     const clickCalls = h.stubD.callLog.slice(seedCalls)
@@ -691,7 +760,7 @@ describe('handlePermissionClick — a prompt in a persona\'s DM (AC 29, AC 36)',
       clickDeps({ receivingPersonaKey: h.personaA.key }),
     )
 
-    expect(decide.calls.map((c) => c.claude_instance_id)).toEqual([h.instanceD, h.instanceA])
+    expect(decide.calls.map((c) => c.instance_id)).toEqual([h.instanceD, h.instanceA])
     expect(h.stubD.callLog.slice(seedCalls).map((c) => ({ method: c.method, args: c.args }))).toEqual([
       { method: 'chat.update', args: expect.objectContaining({ channel: DM_D, ts: entryD.messageTs, text: DENIED_TEXT }) },
     ])
@@ -731,7 +800,7 @@ describe('handlePermissionClick — a prompt posted before an in-place change', 
     )
 
     expect(decide.calls).toEqual([
-      { claude_instance_id: h.instanceB, decision: 'allow', request_token: TOKEN_B },
+      { instance_id: h.instanceB, decision: 'allow', request_token: TOKEN_B },
     ] as Array<DecideParams & { request_token: string }>)
     expect(h.stubB.callLog.slice(seedCalls).map((c) => ({ method: c.method, args: c.args }))).toEqual([
       { method: 'chat.update', args: expect.objectContaining({ channel: CHANNEL_B, ts: entry.messageTs, text: ALLOWED_TEXT }) },
@@ -788,7 +857,7 @@ describe('handlePermissionClick — stale click (SR-4.2)', () => {
     // SR-4.2: decide STILL fires on stale clicks — AD is the source of truth.
     expect(decide.calls).toHaveLength(1)
     expect(decide.calls[0]).toEqual({
-      claude_instance_id: h.instanceA,
+      instance_id: h.instanceA,
       decision: 'allow',
       request_token: TOKEN_C,
     } as DecideParams & { request_token: string })
@@ -801,7 +870,7 @@ describe('handlePermissionClick — stale click (SR-4.2)', () => {
   test('seeded entry on a DIFFERENT token → that other entry untouched; clicked token still fires decide', async () => {
     // Seed token A live; click token C (not in map). This makes sure the
     // composite-key lookup miss is taken on the click's token, not on the
-    // claude_instance_id alone.
+    // instance_id alone.
     await seedLiveEntry({ requestToken: TOKEN_A })
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
@@ -1142,7 +1211,7 @@ describe('handlePermissionClick — helper sanity', () => {
     await seedLiveEntry({ requestToken: TOKEN_A, requestId: 17 })
     const entry = getLivePermission(h.instanceA, TOKEN_A)
     expect(entry).toBeDefined()
-    expect(entry?.claudeInstanceId).toBe(h.instanceA)
+    expect(entry?.instanceId).toBe(h.instanceA)
     expect(entry?.requestToken).toBe(TOKEN_A)
     expect(entry?.requestId).toBe(17)
     expect(entry?.handled).toBe(false)
@@ -1218,7 +1287,7 @@ describe('trail events — cscb.chat_update.attempted (click-handler-triggered)'
     )
     const closure = trail.events.find(e => e.event === 'cscb.chat_update.attempted')
     expect(closure!.request_token).toBe(TOKEN_C)
-    expect(closure!.claude_instance_id).toBe(h.instanceA)
+    expect(closure!.instance_id).toBe(h.instanceA)
   })
 })
 
@@ -1245,7 +1314,7 @@ describe('trail events — cscb.click_handler.invoked', () => {
     expect(invoked).toBeDefined()
     expect(invoked!['live_pending']).toBe(true)
     expect(invoked!['decision']).toBe('allow')
-    expect(invoked!.claude_instance_id).toBe(h.instanceA)
+    expect(invoked!.instance_id).toBe(h.instanceA)
     expect(invoked!.request_token).toBe(TOKEN_A)
     // `channel` keeps its meaning: the payload's Slack channel, never the persona key.
     expect(invoked!.channel).toBe(CHANNEL_A)
@@ -1270,7 +1339,7 @@ describe('trail events — cscb.click_handler.invoked', () => {
     expect(invoked).toBeDefined()
     expect(invoked!['live_pending']).toBe(false)
     expect(invoked!['decision']).toBe('deny')
-    expect(invoked!.claude_instance_id).toBe(h.instanceA)
+    expect(invoked!.instance_id).toBe(h.instanceA)
     expect(invoked!.request_token).toBe(TOKEN_A)
     expect(invoked!.channel).toBe(CHANNEL_A)
   })
@@ -1327,7 +1396,7 @@ describe('trail events — cscb.ad_decide.attempted', () => {
     expect(event).toBeDefined()
     expect(event!['result_class']).toBe('ok')
     expect(event!['decision']).toBe('allow')
-    expect(event!.claude_instance_id).toBe(h.instanceA)
+    expect(event!.instance_id).toBe(h.instanceA)
     expect(event!.request_token).toBe(TOKEN_A)
     expect('raw_error_message' in event!).toBe(false)
   })
@@ -1665,7 +1734,7 @@ describe('handlePermissionClick — wrapper outage short-circuit', () => {
     expect(adDecides).toHaveLength(1)
     expect(adDecides[0]!['result_class']).toBe('ErrSystemInstallDisappeared')
     expect(adDecides[0]!['raw_error_message']).toBe(err.message)
-    expect(adDecides[0]!['claude_instance_id']).toBe(h.instanceA)
+    expect(adDecides[0]!['instance_id']).toBe(h.instanceA)
     expect(adDecides[0]!['request_token']).toBe(TOKEN_A)
     expect(getOutageFlags(h.personaA.key).has('ad-unreachable')).toBe(true)
     expect(getOutageFlags(CHANNEL_A).size).toBe(0)
@@ -1761,7 +1830,7 @@ describe('handlePermissionClick — no channel anywhere, receiving persona known
     )
     expect(handled).toBe(true)
     expect(decide.calls).toEqual([
-      { claude_instance_id: h.instanceA, decision: 'allow', request_token: TOKEN_C } as DecideParams & { request_token: string },
+      { instance_id: h.instanceA, decision: 'allow', request_token: TOKEN_C } as DecideParams & { request_token: string },
     ])
     expect(slackCalls(h.stubA, h.stubB)).toBe(0)
     expect(logs).toHaveLength(0)
@@ -1825,7 +1894,7 @@ describe('handlePermissionClick — persona client unavailable', () => {
     expect(handled).toBe(true)
     expect(decide.calls).toHaveLength(1)
     expect(decide.calls[0]).toEqual({
-      claude_instance_id: h.instanceA,
+      instance_id: h.instanceA,
       decision,
       request_token: TOKEN_A,
     } as DecideParams & { request_token: string })

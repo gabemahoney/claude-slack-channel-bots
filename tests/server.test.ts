@@ -1,3 +1,4 @@
+import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -991,8 +992,8 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(result).toEqual(LIVENESS_READING_LIVE)
     // b.av2 SR-2.2: the probe addresses the persona's cscb_<key> instance.
     expect(statusCalls).toHaveLength(1)
-    expect(statusCalls[0].claude_instance_id).toBe(personaInstanceId('C1'))
-    expect(statusCalls[0].claude_instance_id).toBe('cscb_C1')
+    expect(statusCalls[0].instance_id).toBe(personaInstanceId('C1'))
+    expect(statusCalls[0].instance_id).toBe('cscb_C1')
     expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
     expect(cleared).toEqual([{ key: 'C1', cls: 'ad-unreachable' }])
     expect(emissions.slice(before)).toEqual([])
@@ -1033,7 +1034,7 @@ describe('_buildIsSessionAliveAdapter', () => {
 
     expect(result).toEqual(reading)
     expect(isInstallGoneDeadReading(result)).toBe(false)
-    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('C1')])
     expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
     expect(cleared).toEqual([{ key: 'C1', cls: 'ad-unreachable' }])
     expect(emissions.slice(before)).toEqual([])
@@ -1097,7 +1098,7 @@ describe('_buildIsSessionAliveAdapter', () => {
 
     expect(result).toEqual(LIVENESS_READING_DEAD_NO_ROW)
     expect(isInstallGoneDeadReading(result)).toBe(false)
-    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+    expect(statusCalls.map((c) => c.instance_id)).toEqual(['cscb_C1'])
     expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
     expect(cleared).toEqual([{ key: 'C1', cls: 'ad-unreachable' }])
     expect(emissions.slice(before)).toEqual([])
@@ -1121,7 +1122,7 @@ describe('_buildIsSessionAliveAdapter', () => {
   // b.jg5 SRJ-610, SRJ-1016: the reading is `dead`, from no row read, so it
   // carries the install-gone source (a slow-recovery episode stays open).
   test('3. ErrSystemInstallDisappeared: status throws → sets ad-unreachable with binaryPath as detail; reads dead, from the install-gone source', async () => {
-    const binaryPath = '/home/horde/.agent-director/bin/agent-director'
+    const binaryPath = '/home/horde/.config/agent-director/bin/agent-director'
     const { emissions, statusCalls, adapter } = makeHarness(errSystemInstallDisappeared('status', binaryPath))
 
     const result = await adapter('C1')
@@ -1129,7 +1130,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(result).toEqual(LIVENESS_READING_DEAD_INSTALL_GONE)
     expect(livenessKindOf(result)).toBe(livenessKindOf(LIVENESS_READING_DEAD))
     expect(isInstallGoneDeadReading(result)).toBe(true)
-    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+    expect(statusCalls.map((c) => c.instance_id)).toEqual(['cscb_C1'])
     expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
     expect(getOutageFlags('C1').has('tmux-unavailable')).toBe(false)
     expect(emissions).toHaveLength(1)
@@ -1147,7 +1148,7 @@ describe('_buildIsSessionAliveAdapter', () => {
 
     expect(result).toEqual(LIVENESS_READING_UNKNOWN)
     expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, inside: false }])
-    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+    expect(statusCalls.map((c) => c.instance_id)).toEqual(['cscb_C1'])
     expect(getOutageFlags('C1').has('tmux-unavailable')).toBe(true)
     expect(getOutageFlags('C1').has('ad-unreachable')).toBe(false)
     expect(emissions).toHaveLength(1)
@@ -1174,7 +1175,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     const { result, errArgs } = await probeCapturingErrors(adapter, 'C1')
 
     expect(result).toEqual(LIVENESS_READING_UNKNOWN)
-    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('C1')])
     expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
     expect(emissions).toEqual([{ key: 'C1', text: onset() }])
     expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, inside: false }])
@@ -1221,7 +1222,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     const first = await probe()
 
     expect(first.result).toEqual(LIVENESS_READING_UNKNOWN)
-    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('C1')])
     expect([...getOutageFlags('C1')]).toEqual(['ad-config-malformed'])
     expect(emissions).toEqual([{ key: 'C1', text: adConfigMalformedOnset(err) }])
     // The quoted description is redacted, then Slack-escaped (b.jg5 SRJ-1018):
@@ -1292,7 +1293,7 @@ describe('_buildIsSessionAliveAdapter', () => {
   // The only post is the onset of a class the error itself raises (never an
   // all-clear).
   /** The binary path the ErrSystemInstallDisappeared row names (its `ad-unreachable` onset carries it). */
-  const disappearedBinaryPath = '/home/horde/.agent-director/bin/agent-director'
+  const disappearedBinaryPath = '/home/horde/.config/agent-director/bin/agent-director'
   test.each([
     ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('status', disappearedBinaryPath), LIVENESS_READING_DEAD_INSTALL_GONE, [ONSET_TEMPLATES['ad-unreachable'](disappearedBinaryPath)]],
     ['ErrTmuxNotAvailable (ENVIRONMENT)', () => errTmuxNotAvailable(undefined, 'status'), LIVENESS_READING_UNKNOWN, [ONSET_TEMPLATES['tmux-unavailable']()]],
@@ -1333,7 +1334,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     const { result, errArgs } = await probeCapturingErrors(adapter, 'C1')
 
     expect(result).toEqual(LIVENESS_READING_UNKNOWN)
-    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('C1')])
     expect(getOutageFlags('C1').size).toBe(0)
     expect(emissions).toHaveLength(0)
     expect(errArgs).toHaveLength(1)
@@ -1416,7 +1417,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(await adapter('C2')).toEqual(LIVENESS_READING_LIVE)
     expect(await adapter('C1')).toEqual(LIVENESS_READING_LIVE)
 
-    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([
+    expect(statusCalls.map((c) => c.instance_id)).toEqual([
       personaInstanceId('C2'),
       personaInstanceId('C1'),
     ])
@@ -1601,12 +1602,13 @@ describe('_buildReconnectSessionAdapter', () => {
     sendKeysErrors?: Error[]
     /** What every pane read shows unless `paneQueue` or `paneError` answers it (default: the stub's empty pane). */
     pane?: string
+  pane_sha256?: string
     /** When set, every pane read rejects with it unless `paneQueue` answers it. */
     paneError?: Error
     /** Pane-read answers in order, one per read, ahead of `paneError` and `pane`. */
     paneQueue?: CannedResponse<ReadPaneResult>[]
     /** The transcript fields of the `working` row `get` answers (default: the stub's row, which names no transcript). */
-    row?: { jsonl_path?: string; claude_session_id: string; cwd?: string }
+    row?: { jsonl_path?: string; session_id: string; cwd?: string }
     /** The adapter's persona lookup (production: `getAppliedPersona`). */
     getPersona?: (key: string) => Persona | undefined
     /** The state every status probe reads once a findMissing sweep has run (default: `statusState`). */
@@ -1671,11 +1673,11 @@ describe('_buildReconnectSessionAdapter', () => {
       spawnCalls,
       resumeCalls,
       // Read at each pane read, so a test may change them between attempts.
-      get readPaneResults() { return opts.pane === undefined ? undefined : [{ pane: opts.pane }] },
+      get readPaneResults() { return opts.pane === undefined ? undefined : [cannedReadPaneResult(opts.pane)] },
       get readPaneError() { return opts.paneError },
       readPaneQueue: opts.paneQueue,
       getCalls,
-      getResult: opts.getRow ?? (opts.row === undefined ? undefined : cannedGetResult({ claude_instance_id: 'cscb_C1', state: 'working', ...opts.row })),
+      getResult: opts.getRow ?? (opts.row === undefined ? undefined : cannedGetResult({ instance_id: 'cscb_C1', state: 'working', ...opts.row })),
     })
     _resetOutageState()
     const triggers = opts.triggers
@@ -1705,11 +1707,11 @@ describe('_buildReconnectSessionAdapter', () => {
 
   /** `n` full reads of C1's own row's pane. */
   const fullPaneReads = (n: number): ReadPaneParams[] =>
-    Array(n).fill({ claude_instance_id: personaInstanceId('C1'), n_lines: FULL_PANE_READ_LINES })
+    Array(n).fill({ instance_id: personaInstanceId('C1'), n_lines: FULL_PANE_READ_LINES })
 
   /** `n` one-line probe reads of C1's own row's pane (b.jdc's prompt rows, b.jg5 SRJ-606). */
   const probePaneReads = (n: number): ReadPaneParams[] =>
-    Array(n).fill({ claude_instance_id: personaInstanceId('C1'), n_lines: PROBE_PANE_READ_LINES })
+    Array(n).fill({ instance_id: personaInstanceId('C1'), n_lines: PROBE_PANE_READ_LINES })
 
   /** The escalate-dead sweep line for persona C1 with `verdict`, from the imported builder. */
   const escalateDeadLine = (verdict: EscalateDeadVerdict): string => escalateDeadSweepLine('C1', verdict)
@@ -1727,10 +1729,10 @@ describe('_buildReconnectSessionAdapter', () => {
   let dir: string
 
   /** A finished turn's transcript for C1's row, in the test's directory; the row fields that name it. */
-  function endedTranscript(): { jsonl_path: string; claude_session_id: string } {
+  function endedTranscript(): { jsonl_path: string; session_id: string } {
     const path = join(dir, `${TRANSCRIPT_SESSION_ID}.jsonl`)
     writeTranscript(path, endedTurn())
-    return { jsonl_path: path, claude_session_id: TRANSCRIPT_SESSION_ID }
+    return { jsonl_path: path, session_id: TRANSCRIPT_SESSION_ID }
   }
 
   beforeEach(() => {
@@ -1754,7 +1756,7 @@ describe('_buildReconnectSessionAdapter', () => {
   })
 
   test.each<[string, Parameters<typeof makeHarness>[0]]>([
-    ['its pane shows a running turn', { pane: SPINNER_PANE }],
+    ['its pane shows a running turn', cannedReadPaneResult(SPINNER_PANE)],
     ['its read-pane answers UNAVAILABLE (ErrCallTimeout)', { paneError: errCallTimeout('read-pane') }],
   ])("(i) AD state 'working', %s → returns 'transient' and does NOT attempt the send-keys reconnect or sweep; one read-pane of C1's own row", async (_label, pane) => {
     const { adapter, statusCalls, sendKeysCalls, findMissingCalls, readPaneCalls } = makeHarness({ statusState: 'working', ...pane })
@@ -1764,8 +1766,8 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(result).toBe('transient')
     // The probe ran against the persona's cscb_<key> instance...
     expect(statusCalls).toHaveLength(1)
-    expect(statusCalls[0].claude_instance_id).toBe(personaInstanceId('C1'))
-    expect(statusCalls[0].claude_instance_id).toBe('cscb_C1')
+    expect(statusCalls[0].instance_id).toBe(personaInstanceId('C1'))
+    expect(statusCalls[0].instance_id).toBe('cscb_C1')
     // ...then one read of its own pane (b.jg5 SRJ-603).
     expect(readPaneCalls).toEqual(fullPaneReads(1))
     // The working-state defer short-circuited before reconnectMcp — no
@@ -1788,7 +1790,7 @@ describe('_buildReconnectSessionAdapter', () => {
     const { result, errArgs } = await capturingErrorArgs(() => adapter('C1'))
 
     expect(result).toEqual(escalatedWith('working-tmux-gone'))
-    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+    expect(statusCalls.map((c) => c.instance_id)).toEqual(['cscb_C1'])
     // One read of the persona's own row.
     expect(readPaneCalls).toEqual(fullPaneReads(1))
     // Nothing is typed into a pane that no longer exists.
@@ -1820,7 +1822,7 @@ describe('_buildReconnectSessionAdapter', () => {
       const result = await adapter('C1')
 
       expect(result).toBe('transient')
-      expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+      expect(statusCalls.map((c) => c.instance_id)).toEqual(['cscb_C1'])
       expect(readPaneCalls).toEqual([])
       expect(findMissingCalls).toHaveLength(0)
       expect(sendKeysCalls).toHaveLength(0)
@@ -1844,8 +1846,8 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(sendKeysCalls).toHaveLength(1)
     expect(sendKeysCalls[0].text).toContain('/mcp reconnect')
     // Both the probe and the reconnect address cscb_<key>.
-    expect(statusCalls[0].claude_instance_id).toBe('cscb_C1')
-    expect(sendKeysCalls[0].claude_instance_id).toBe('cscb_C1')
+    expect(statusCalls[0].instance_id).toBe('cscb_C1')
+    expect(sendKeysCalls[0].instance_id).toBe('cscb_C1')
     // b.9a7: the success path never escalates, so no sweep fires.
     expect(findMissingCalls).toHaveLength(0)
   })
@@ -1908,7 +1910,7 @@ describe('_buildReconnectSessionAdapter', () => {
     }
 
     expect(result).toBe('transient')
-    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('C1')])
     expect(sendKeysCalls).toEqual([])
     expect(readPaneCalls).toEqual([])
     expect(findMissingCalls).toHaveLength(0)
@@ -1923,7 +1925,7 @@ describe('_buildReconnectSessionAdapter', () => {
     const { result, errArgs, statusCalls, sendKeysCalls, findMissingCalls, readPaneCalls, killCalls, spawnCalls, resumeCalls } = await reconnectCapturing({ statusError })
 
     expect(result).toBe('transient')
-    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('C1')])
     expect([sendKeysCalls, readPaneCalls, killCalls, spawnCalls, resumeCalls]).toEqual([[], [], [], [], []])
     expect(findMissingCalls).toHaveLength(0)
     expect([...getOutageFlags('C1')]).toEqual(['ad-config-malformed'])
@@ -1959,7 +1961,7 @@ describe('_buildReconnectSessionAdapter', () => {
     const h = await reconnectCapturing({})
 
     expect(h.result).toBe('success')
-    expect(h.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([[personaInstanceId('C1'), `/mcp reconnect ${MCP_SERVER_NAME}`]])
+    expect(h.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([[personaInstanceId('C1'), `/mcp reconnect ${MCP_SERVER_NAME}`]])
     expect(h.findMissingCalls).toEqual([])
     expect(h.raised).toEqual([])
     assertNoLeak({ errArgs: h.errArgs })
@@ -1978,7 +1980,7 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(escalateDeadLines(lines)).toEqual([escalateDeadLine('dead-session')])
     expect(escalateDeadLines(lines)[0]).toContain(ESCALATE_DEAD_EVIDENCE['dead-session'])
     expect(h.statusCalls).toHaveLength(1)
-    expect(h.sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+    expect(h.sendKeysCalls.map((c) => c.instance_id)).toEqual(['cscb_C1'])
     // The escalate-dead branch fires sweepDeadTmuxChannel → the memoized
     // reconcileMissingSweep → exactly ONE client.findMissing({}). No direct new
     // findMissing call site; the memoized helper is the only sweep mechanism.
@@ -1994,7 +1996,7 @@ describe('_buildReconnectSessionAdapter', () => {
     const lines = stringLines(h.errArgs)
     expect(escalateDeadLines(lines)).toEqual([escalateDeadLine(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)])
     expect(escalateDeadLines(lines)[0]).not.toContain(ESCALATE_DEAD_EVIDENCE['dead-session'])
-    expect(h.sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+    expect(h.sendKeysCalls.map((c) => c.instance_id)).toEqual(['cscb_C1'])
     expect(h.findMissingCalls).toHaveLength(1)
     expect(h.raised).toEqual([])
     assertNoLeak({ errArgs: h.errArgs })
@@ -2013,7 +2015,7 @@ describe('_buildReconnectSessionAdapter', () => {
     const { result, errArgs, raised, sendKeysCalls, findMissingCalls } = await reconnectCapturing({ sendKeysThrows: err })
 
     expect(result).toBe('transient')
-    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(sendKeysCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('C1')])
     expect(findMissingCalls).toHaveLength(0)
     expect(raised).toEqual([])
     const lines = stringLines(errArgs)
@@ -2047,7 +2049,7 @@ describe('_buildReconnectSessionAdapter', () => {
     const { result, errArgs, raised, sendKeysCalls, findMissingCalls, killCalls, spawnCalls, resumeCalls } = await reconnectCapturing({ sendKeysThrows: err })
 
     expect(result).toBe('transient')
-    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(sendKeysCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('C1')])
     expect(findMissingCalls).toHaveLength(0)
     expect([killCalls, spawnCalls, resumeCalls]).toEqual([[], [], []])
     expect(raised).toEqual([])
@@ -2076,7 +2078,7 @@ describe('_buildReconnectSessionAdapter', () => {
     const h = await reconnectCapturing({ statusState: state, sendKeysThrows: errSpawnNotInteractive('send-keys') })
 
     expect(h.result).toEqual(escalatedWith('row-not-interactive'))
-    expect(h.sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+    expect(h.sendKeysCalls.map((c) => c.instance_id)).toEqual(['cscb_C1'])
     expect(h.findMissingCalls).toHaveLength(1)
     expect(h.raised).toEqual([])
     const lines = escalateDeadLines(stringLines(h.errArgs))
@@ -2229,8 +2231,8 @@ describe('_buildReconnectSessionAdapter', () => {
     const result = await adapter('ops_bot')
 
     expect(result).toBe('success')
-    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('ops_bot')])
-    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_ops_bot'])
+    expect(statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('ops_bot')])
+    expect(sendKeysCalls.map((c) => c.instance_id)).toEqual(['cscb_ops_bot'])
   })
 
   // b.f2b: a `working` row can be stale (agent-director left it `working`
@@ -2277,7 +2279,7 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(await h.adapter('C1')).toBe('success')
 
       expect(h.readPaneCalls).toEqual(fullPaneReads(3))
-      expect(h.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
+      expect(h.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
       expect(h.findMissingCalls).toHaveLength(0)
       expect(raised).toEqual([])
     })
@@ -2293,7 +2295,7 @@ describe('_buildReconnectSessionAdapter', () => {
       const h = makeHarness({
         statusState: 'working',
         pane: IDLE_PANE,
-        row: { claude_session_id: TRANSCRIPT_SESSION_ID, cwd },
+        row: { session_id: TRANSCRIPT_SESSION_ID, cwd },
         getPersona: (key) => (looked.push(key), persona),
       })
 
@@ -2646,7 +2648,7 @@ describe('_buildReconnectSessionAdapter', () => {
       answer: Error,
       { then = [], inside = false }: { then?: CannedResponse<ReadPaneResult>[]; inside?: boolean } = {},
     ): Promise<{ h: Harness; verdict: AdapterAnswer; lines: string[] }> {
-      const h = cellHarness('working', { pane: IDLE_PANE, row: endedTranscript(), paneQueue: [cannedOk({ pane: IDLE_PANE }), cannedErr(answer), ...then] })
+      const h = cellHarness('working', { pane: IDLE_PANE, row: endedTranscript(), paneQueue: [cannedOk(cannedReadPaneResult(IDLE_PANE)), cannedErr(answer), ...then] })
       expect((await attempt(h)).verdict).toBe('transient')
       expect(hasPendingWorkingRowEvidence('C1')).toBe(true)
       await clock.advance(UNPROVEN_IDLE_NOTICE_AFTER_MS)
@@ -2725,7 +2727,7 @@ describe('_buildReconnectSessionAdapter', () => {
     // ---- a `waiting` row -------------------------------------------------
 
     test.each([
-      ['an idle pane', () => cannedOk<ReadPaneResult>({ pane: IDLE_PANE }), [], undefined],
+      ['an idle pane', () => cannedOk<ReadPaneResult>(cannedReadPaneResult(IDLE_PANE)), [], undefined],
       ...PANE_UNAVAILABLE_FORMS.map(([label, build]) => [`UNAVAILABLE: ${label}`, () => cannedErr<ReadPaneResult>(build('read-pane')), [], AD_ERROR_CLASS_UNAVAILABLE] as const),
       ['CONFIG (ErrConfigMalformed)', () => cannedErr<ReadPaneResult>(paneConfigMalformed()), ['ad-config-malformed'], AD_ERROR_CLASS_CONFIG] as const,
       ...PANE_UNCLASSIFIED.map(([label, build, flags]) => [`UNCLASSIFIED: ${label}`, () => cannedErr<ReadPaneResult>(build()), flags, AD_ERROR_CLASS_UNCLASSIFIED] as const),
@@ -2744,7 +2746,7 @@ describe('_buildReconnectSessionAdapter', () => {
 
       expect(verdict).toBe('success')
       expect(flagsAtTyping).toEqual([[...flags]])
-      expect(h.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
+      expect(h.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
       expect(h.readPaneCalls).toEqual(fullPaneReads(1))
       expect(h.findMissingCalls).toEqual([])
       expect(latch.isLatched('C1')).toBe(false)
@@ -2795,7 +2797,7 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(verdict).toBe('success')
       expect(callOrder).toEqual(['status', 'readPane', 'resolveSystemBinary', 'sendKeys'])
       expect(stops).toEqual([])
-      expect(h.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
+      expect(h.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
       expect(stoppingLines(lines, 'waiting')).toEqual([])
       expect(classLines(lines, 'is waiting and reading its pane failed: ', AD_ERROR_CLASS_UNCLASSIFIED).filter((l) => l.includes(' — reconnecting on the waiting row alone '))).toHaveLength(1)
     })
@@ -2947,7 +2949,7 @@ describe('_buildReconnectSessionAdapter', () => {
       ['C1 latched during the read', true],
       ['control: C1 not latched', false],
     ] as const)("a working row whose run of deferrals is due to raise unproven-idle, its read-pane showing a running turn: %s → 'transient', with the notice only when not latched; nothing typed or swept", async (_label, latched) => {
-      const h = cellHarness('working', { pane: SPINNER_PANE })
+      const h = cellHarness('working', cannedReadPaneResult(SPINNER_PANE))
       expect((await attempt(h)).verdict).toBe('transient') // the run starts
       await clock.advance(UNPROVEN_IDLE_NOTICE_AFTER_MS)
       if (latched) latchDuringNextPaneRead(h)
@@ -2966,7 +2968,7 @@ describe('_buildReconnectSessionAdapter', () => {
       ['C1 latched during the read', true],
       ['control: C1 not latched', false],
     ] as const)("a waiting row whose read-pane shows a dialog: %s → 'transient', with the blocked-on-prompt notice only when not latched; nothing typed or swept", async (_label, latched) => {
-      const h = cellHarness('waiting', { pane: PERMISSION_PANE })
+      const h = cellHarness('waiting', cannedReadPaneResult(PERMISSION_PANE))
       if (latched) latchDuringNextPaneRead(h)
 
       const { verdict, lines } = await attempt(h)
@@ -3002,7 +3004,7 @@ describe('_buildReconnectSessionAdapter', () => {
 
       await attempt(h)
 
-      expect(h.readPaneCalls).toEqual([{ claude_instance_id: 'cscb_C1', n_lines: 1 }])
+      expect(h.readPaneCalls).toEqual([{ instance_id: 'cscb_C1', n_lines: 1 }])
     })
 
     test.each(PROMPT_STATES)("a %s row whose read-pane answers a pane → 'transient' at every attempt with the blocked-on-prompt notice once for the episode; one one-line read-pane of C1's own row per attempt; nothing typed, swept or latched; no class line", async (state) => {
@@ -3239,7 +3241,7 @@ describe('_buildReconnectSessionAdapter', () => {
       }
 
       const PATHS: readonly BackstopPath[] = [
-        ['a waiting row whose read-pane answers an idle pane', 'waiting', () => ({ pane: IDLE_PANE }), undefined, () => fullPaneReads(1), []],
+        ['a waiting row whose read-pane answers an idle pane', 'waiting', () => (cannedReadPaneResult(IDLE_PANE)), undefined, () => fullPaneReads(1), []],
         ...NO_PANE.map(([label, build, cause]): BackstopPath => [
           `a waiting row whose read-pane gives no pane, ${label}`,
           'waiting',
@@ -3288,7 +3290,7 @@ describe('_buildReconnectSessionAdapter', () => {
         const { verdict, lines } = await attempt(h, true)
 
         expect(verdict).toBe('transient')
-        expect(h.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([[personaInstanceId('C1'), `/mcp reconnect ${MCP_SERVER_NAME}`]])
+        expect(h.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([[personaInstanceId('C1'), `/mcp reconnect ${MCP_SERVER_NAME}`]])
         expect(h.readPaneCalls).toEqual(reads())
         expect(latch.record('C1')).toStrictEqual(conflictRecord(row))
         expect(latchedLines()).toHaveLength(1)
@@ -3497,7 +3499,7 @@ describe('_buildReconnectSessionAdapter', () => {
           statusState: 'check_permission',
           statusAfterSweep: after,
           findMissingResult: cannedFindMissing({ rows: { [personaInstanceId('C1')]: 'unverified_ids' } }),
-          getRow: cannedGetResult({ claude_instance_id: personaInstanceId('C1'), state: 'check_permission', liveness_note: note }),
+          getRow: cannedGetResult({ instance_id: personaInstanceId('C1'), state: 'check_permission', liveness_note: note }),
         })
 
         expect(await attemptsAt(h.adapter, [0])).toEqual(['transient'])
@@ -3507,7 +3509,7 @@ describe('_buildReconnectSessionAdapter', () => {
 
         expect(latch.isLatched('C1')).toBe(latched)
         expect(h.findMissingCalls).toHaveLength(1)
-        expect(h.getCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+        expect(h.getCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('C1')])
         // One status read per attempt, and one more after the sweep unless C1 latched.
         expect(h.statusCalls).toHaveLength(latched ? 2 : 3)
         expect(h.sendKeysCalls).toEqual([])
@@ -3741,7 +3743,7 @@ describe('_buildReconnectSessionAdapter', () => {
       const { result, errArgs } = await capturingErrorArgs(() => h.adapter('C1'))
 
       expect(result).toBe('transient')
-      expect(h.statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+      expect(h.statusCalls.map((c) => c.instance_id)).toEqual(['cscb_C1'])
       expect(h.readPaneCalls).toEqual([])
       expect(latch.asked).toEqual(['C1'])
       expect(h.sendKeysCalls).toEqual([])
@@ -3935,7 +3937,7 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(result).toBe('success')
       expect(events).toEqual([...AFTER_READ, 'readPane', 'isLatched', 'sendKeys'])
       expect(latch.asked).toEqual(['C1', 'C1'])
-      expect(h.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
+      expect(h.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
       expect(latchedLines(errArgs)).toEqual([])
     })
 
@@ -3962,7 +3964,7 @@ describe('_buildReconnectSessionAdapter', () => {
       const { result, errArgs } = await capturingErrorArgs(() => adapter('C1'))
 
       expect(result).toBe('success')
-      expect(h.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
+      expect(h.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
       expect(stringLines(errArgs)).toEqual([`[slack] reconnecting MCP server "${MCP_SERVER_NAME}": persona=C1`])
     })
 
@@ -4173,8 +4175,8 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
     const log = makeStubCallLog()
     const stub = makeStubClient({
       ...log,
-      statusFn: ({ claude_instance_id }) =>
-        claude_instance_id === personaInstanceId('C1') ? c1Status : cannedStatusResult({ state: 'waiting' }),
+      statusFn: ({ instance_id }) =>
+        instance_id === personaInstanceId('C1') ? c1Status : cannedStatusResult({ state: 'waiting' }),
       sendKeysResult: {},
     })
     _resetOutageState()
@@ -4239,7 +4241,7 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
 
       expect([first, ...later].map((p) => p.result)).toEqual([LIVENESS_READING_UNKNOWN, LIVENESS_READING_UNKNOWN, LIVENESS_READING_UNKNOWN])
       expect(other.result).toEqual(LIVENESS_READING_LIVE)
-      expect(log.statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1', 'cscb_C2', 'cscb_C1', 'cscb_C1'])
+      expect(log.statusCalls.map((c) => c.instance_id)).toEqual(['cscb_C1', 'cscb_C2', 'cscb_C1', 'cscb_C1'])
       expect(stubCallCount(log)).toBe(4)
       expectLatchedOnce(c)
       expect(first.lines).toEqual([c.stepLine(LIVENESS_SITE, answer, 'the persona latched')])
@@ -4262,7 +4264,7 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
       const again = await run(() => runInAttempt('C1', 'recovery', () => adapter('C1')))
 
       expect([c1.result, again.result]).toEqual(['transient', 'transient'])
-      expect(log.statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1', 'cscb_C1'])
+      expect(log.statusCalls.map((c) => c.instance_id)).toEqual(['cscb_C1', 'cscb_C1'])
       expect(stubCallCount(log)).toBe(2)
       expect(tmuxTouchingCallsIn(log)).toEqual([])
       expectLatchedOnce(c)
@@ -4274,7 +4276,7 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
       const c2 = await run(() => runInAttempt('C2', 'recovery', () => adapter('C2')))
 
       expect(c2.result).toBe('success')
-      expect(log.sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C2'])
+      expect(log.sendKeysCalls.map((c) => c.instance_id)).toEqual(['cscb_C2'])
       expect(latch.isLatched('C2')).toBe(false)
       expect(posts).toHaveLength(1)
     },
@@ -4328,7 +4330,7 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
       expect(latchLines.filter((line) => line.startsWith('[slack] conflict-latch: persona=C1 relatched'))).toHaveLength(1)
       expect(first.lines).toEqual([c.stepLine(site, answer, 'the persona relatched')])
       expect(again.lines).toEqual([c.stepLine(site, answer, 'the persona was already latched with this case')])
-      expect(log.statusCalls.map((s) => s.claude_instance_id)).toEqual(['cscb_C1', 'cscb_C1'])
+      expect(log.statusCalls.map((s) => s.instance_id)).toEqual(['cscb_C1', 'cscb_C1'])
       expect(stubCallCount(log)).toBe(2)
       expect(tmuxTouchingCallsIn(log)).toEqual([])
       expect(raised).toEqual([])
@@ -4436,7 +4438,7 @@ describe('b.jg5 SRJ-704, SRJ-1016: the liveness and reconnect adapters\' own-row
   /** A stub whose `status` answers `answer` for `key`'s row (thrown when an error) and `waiting` for every other row; every send-keys succeeds. */
   function install(key: string, answer: Error | StatusResult): void {
     const stub = makeStubClient({
-      statusFn: ({ claude_instance_id }) => (claude_instance_id === personaInstanceId(key) ? answer : cannedStatusResult({ state: 'waiting' })),
+      statusFn: ({ instance_id }) => (instance_id === personaInstanceId(key) ? answer : cannedStatusResult({ state: 'waiting' })),
       sendKeysResult: {},
     })
     _resetOutageState()
@@ -4552,7 +4554,7 @@ describe('b.jg5 SRJ-1016, SRJ-1017: the liveness and reconnect adapters\' own-ro
   /** A stub whose `status` answers `answer` for `key`'s row and `waiting` for every other row; every send-keys succeeds. */
   function install(key: string, answer: StatusResult): void {
     const stub = makeStubClient({
-      statusFn: ({ claude_instance_id }) => (claude_instance_id === personaInstanceId(key) ? answer : cannedStatusResult({ state: 'waiting' })),
+      statusFn: ({ instance_id }) => (instance_id === personaInstanceId(key) ? answer : cannedStatusResult({ state: 'waiting' })),
       sendKeysResult: {},
     })
     _resetOutageState()
@@ -4667,7 +4669,7 @@ describe('b.jg5 SRJ-807, SRJ-115: the liveness and reconnect adapters clear a re
     const log = makeStubCallLog()
     const stub = makeStubClient({
       ...log,
-      statusFn: ({ claude_instance_id }) => (claude_instance_id === personaInstanceId('C1') ? answer : cannedStatusResult({ state: 'waiting' })),
+      statusFn: ({ instance_id }) => (instance_id === personaInstanceId('C1') ? answer : cannedStatusResult({ state: 'waiting' })),
       sendKeysResult: {},
     })
     _resetOutageState()
@@ -4709,7 +4711,7 @@ describe('b.jg5 SRJ-807, SRJ-115: the liveness and reconnect adapters clear a re
 
     expect(await livenessRead('C1')).toEqual(LIVENESS_READING_LIVE)
 
-    expect(log.statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+    expect(log.statusCalls.map((c) => c.instance_id)).toEqual(['cscb_C1'])
     expect(stubCallCount(log)).toBe(1)
     expectC1Cleared(state, LIVENESS_SITE)
   })
@@ -4733,7 +4735,7 @@ describe('b.jg5 SRJ-807, SRJ-115: the liveness and reconnect adapters clear a re
 
     expect(await reconnectRead('C1')).toBe('success')
 
-    expect(log.sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+    expect(log.sendKeysCalls.map((c) => c.instance_id)).toEqual(['cscb_C1'])
     expectC1Cleared('waiting', RECONNECT_SITE)
   })
 
@@ -4804,7 +4806,7 @@ describe('b.jg5 SRJ-809, SRJ-115: the liveness and reconnect adapters\' own-row 
   /** A stub whose `status` answers `answer` for C1's row (thrown when an error) and `waiting` for every other row; every send-keys succeeds. */
   function install(answer: Error | StatusResult): void {
     const stub = makeStubClient({
-      statusFn: ({ claude_instance_id }) => (claude_instance_id === personaInstanceId('C1') ? answer : cannedStatusResult({ state: 'waiting' })),
+      statusFn: ({ instance_id }) => (instance_id === personaInstanceId('C1') ? answer : cannedStatusResult({ state: 'waiting' })),
       sendKeysResult: {},
     })
     _resetOutageState()
@@ -5004,7 +5006,7 @@ describe('b.jg5 SRJ-805: the reconnect adapter starts the live-row sequence for 
 
     expect(await reconnect(h, key)).toBe('success')
 
-    expect(h.stub.calls.sendKeysCalls.map((call) => call.claude_instance_id)).toEqual([personaInstanceId(key)])
+    expect(h.stub.calls.sendKeysCalls.map((call) => call.instance_id)).toEqual([personaInstanceId(key)])
     expect([h.sequenceRunning(key), oldLifeLinesIn(h)]).toEqual([false, []])
     if (marked) expect(h.retiredEntry(p)).toMatchObject({ recorded: true, marked: true })
   })
@@ -5021,7 +5023,7 @@ describe('b.jg5 SRJ-805: the reconnect adapter starts the live-row sequence for 
     expect(await _buildReconnectSessionAdapter(undefined, (k) => h.latch.isLatched(k), applied)(p)).toBe('pending')
 
     expect([h.stub.calls.sendKeysCalls, h.stub.calls.readPaneCalls, oldLifeLinesIn(h)]).toEqual([[], [], []])
-    expect(h.stub.calls.getCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.getCalls).toEqual([{ instance_id: personaInstanceId(p) }])
     expect(starts).toEqual([pendingRowStartRequest(h, p, { retiredKey: true, retiredAtStart: { recorded: true, marked: false, generation: 1 } })])
     expect([h.triggers, h.controller.isArmed(p), getFailureCount(p)]).toEqual([[], false, 0])
   })
@@ -5125,7 +5127,7 @@ describe('b.jg5 SRJ-409, SRJ-411: the reconnect adapter\'s pending branch and de
   function expectNothingLaunchedOrTyped(h: RecoveryHarness, key: string): void {
     const id = personaInstanceId(key)
     const { spawnCalls, resumeCalls, killCalls, sendKeysCalls, readPaneCalls } = h.stub.calls
-    expect([spawnCalls, resumeCalls, killCalls, sendKeysCalls, readPaneCalls].map((calls) => calls.filter((c) => c.claude_instance_id === id))).toEqual([[], [], [], [], []])
+    expect([spawnCalls, resumeCalls, killCalls, sendKeysCalls, readPaneCalls].map((calls) => calls.filter((c) => c.instance_id === id))).toEqual([[], [], [], [], []])
     expect([getFailureCount(key), h.approverRunning(key)]).toEqual([0, false])
   }
 
@@ -5139,7 +5141,7 @@ describe('b.jg5 SRJ-409, SRJ-411: the reconnect adapter\'s pending branch and de
       expectPendingOnlyWatch(h, p)
       expect(h.controller.view(p)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] })
       expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
-      expect(h.stub.calls.getCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+      expect(h.stub.calls.getCalls).toEqual([{ instance_id: personaInstanceId(p) }])
       expectNothingLaunchedOrTyped(h, p)
       expect(h.sequenceRunning(p)).toBe(false)
       expect(deferralLinesOf(h, p)).toEqual([expect.stringContaining(`its row reads pending (launch started ${launch}) — `)])
@@ -5209,7 +5211,7 @@ describe('b.jg5 SRJ-409, SRJ-411: the reconnect adapter\'s pending branch and de
     expect(h.errors.filter((line) => line === undecidedPendingRowLine(renderPersonaRef(personaOf(h, p).name, p), PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED, true))).toHaveLength(1)
     expect(h.errors.filter((line) => line === uncoveredPendingRowLine(renderPersonaRef(personaOf(h, p).name, p), PENDING_ROW_REASON_CWD_MISMATCH))).toEqual([])
     expect(starts).toEqual([])
-    expect(h.stub.calls.getCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.getCalls).toEqual([{ instance_id: personaInstanceId(p) }])
     expectNothingLaunchedOrTyped(h, p)
   })
 
@@ -5333,7 +5335,7 @@ describe('b.jg5 SRJ-410: deferPendingRow runs the pending-row rule only at a ret
   const ruleVerbCalls = (h: RecoveryHarness, key: string): number[] => {
     const id = personaInstanceId(key)
     const { readPaneCalls, findMissingCalls, getCalls } = h.stub.calls
-    return [readPaneCalls.filter((c) => c.claude_instance_id === id).length, findMissingCalls.length, getCalls.filter((c) => c.claude_instance_id === id).length]
+    return [readPaneCalls.filter((c) => c.instance_id === id).length, findMissingCalls.length, getCalls.filter((c) => c.instance_id === id).length]
   }
 
   test.each(ORIGINS)('a covered pending row the run leaves unjudged, %s: pending, P\'s timer armed pending-only; the rule\'s one run (lap, find-missing, get) and its line only at the retry; no gone line, kill or launch', async (_origin, atRetry) => {
@@ -5523,7 +5525,7 @@ describe('b.jg5 SRJ-810: the reconnect adapter starts the live-row sequence for 
 
     h.script({ statusResult: cannedStatusResult({ state: 'waiting' }) })
     expect(await reconnect(h, q)).toBe('success')
-    expect(h.stub.calls.sendKeysCalls.map((call) => call.claude_instance_id)).toEqual([personaInstanceId(q)])
+    expect(h.stub.calls.sendKeysCalls.map((call) => call.instance_id)).toEqual([personaInstanceId(q)])
   })
 
   test('a second call while P\'s sequence runs (its first run held): transient again, no second sequence and nothing typed; once the run lists the row in its ids the hold ends and the sequence ends in its launch', async () => {
@@ -5545,7 +5547,7 @@ describe('b.jg5 SRJ-810: the reconnect adapter starts the live-row sequence for 
 
   test('while the old-life wait runs on P\'s own row (its first run held): transient, no sequence starts and nothing is typed; the start entry arms P\'s timer with the old-life cause, uncounted; the line names already-running', async () => {
     const { h, p } = heldOwnRow('waiting')
-    h.script({ getResult: cannedGetResult({ claude_instance_id: personaInstanceId(p), cwd: h.home }) })
+    h.script({ getResult: cannedGetResult({ instance_id: personaInstanceId(p), cwd: h.home }) })
     const hold = holdFindMissing(h.stub.client)
     const wait = h.startOldLifeWait(personaInstanceId(p))
     await h.driveSequence(hold.entered(1))
@@ -5775,7 +5777,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     const { result, errArgs } = await killInAttempt()
 
     expect(result).toEqual(killSent === undefined ? { kind: KILL_OUTCOME_KILLED } : { kind: KILL_OUTCOME_KILLED, killSent })
-    expect(killCalls).toEqual([{ claude_instance_id: personaInstanceId('C1') }])
+    expect(killCalls).toEqual([{ instance_id: personaInstanceId('C1') }])
     expect(stringLines(errArgs)).toEqual(killLines(result as KillOutcome))
     expect(triggers).toEqual([])
     expect(starts).toEqual([])
@@ -5808,7 +5810,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     expect(outcome.errorClass).toBe(AD_ERROR_CLASS_UNAVAILABLE)
     expect(outcome.error).toBe(err)
     expect(outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE && outcome.killFailed).toBe(causeKind === UNAVAILABLE_RETRY_CAUSE_KILL_FAILED)
-    expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(killCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('C1')])
     const lines = stringLines(errArgs)
     expect(lines).toEqual(killLines(outcome))
     if (redacted) for (const line of lines) expect(line).toContain(REDACTED_SENTINEL_TAIL)
@@ -5856,7 +5858,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     const outcome = notKilled(result)
     expect(outcome.errorClass).toBe(AD_ERROR_CLASS_ENVIRONMENT)
     expect(outcome.error).toBe(err)
-    expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(killCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('C1')])
     expect(stringLines(errArgs)).toEqual(killLines(outcome))
     expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
     expect(emissions).toEqual([{ key: 'C1', text: onset() }])
@@ -5877,7 +5879,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
 
     const outcome = notKilled(result)
     expect(outcome.errorClass).toBe(AD_ERROR_CLASS_CONFIG)
-    expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(killCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('C1')])
     const lines = stringLines(errArgs)
     expect(lines.filter((l) => l.includes('killSession (restart adapter)'))).toEqual(killLines(outcome))
     expect(lines.filter((l) => l.includes('ad-config-malformed raised for persona=C1'))).toHaveLength(1)
@@ -5909,7 +5911,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     const outcome = notKilled(result)
     expect(outcome.errorClass).toBe(AD_ERROR_CLASS_UNCLASSIFIED)
     expect(outcome.error).toBe(err)
-    expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(killCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('C1')])
     expect(stringLines(errArgs).filter((l) => l.includes('killSession (restart adapter)'))).toEqual(killLines(outcome))
     expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
     expect(reports).toEqual([{ key: 'C1', same: true }])
@@ -5933,7 +5935,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     const { result, errArgs } = await killInAttempt()
 
     expect(result).toEqual({ kind: KILL_OUTCOME_SESSION_GONE, name: err.errName })
-    expect(killCalls).toEqual([{ claude_instance_id: personaInstanceId('C1') }])
+    expect(killCalls).toEqual([{ instance_id: personaInstanceId('C1') }])
     expect(stringLines(errArgs)).toEqual(killLines(result as KillOutcome))
     expect(killLine(result as KillOutcome)).toContain(`outcome=${KILL_OUTCOME_SESSION_GONE} (${err.errName})`)
     expect(triggers).toEqual([])
@@ -6161,7 +6163,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
 
       await killInAttempt('C1', undefined, LIVENESS_READING_DEAD_INSTALL_GONE)
 
-      expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+      expect(statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('C1')])
       expect(latch.record('C1')?.rowState).toEqual(latchRowStateRead(LIVENESS_DEAD_ROW_ENDED))
     })
 

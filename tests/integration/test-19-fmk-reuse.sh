@@ -121,7 +121,7 @@
 # Scenario 7's legs (E, F); each:
 #   1. the persona's first life: config.json with the persona, a start, its
 #      row `waiting`; the harness reads the life's session id (`get`'s
-#      `claude_session_id`);
+#      `session_id`);
 #   2. the harness ends that life with the exit sentinel, so the row reads
 #      `ended` and its session is gone; leg F also deletes the life's
 #      transcript, the file the row's `jsonl_path` names (working default:
@@ -167,7 +167,7 @@
 #     the leftover seeded):
 #     1. `silent` selected for G's directory; config.json with G, the mark
 #        and a start: CSCB's plain spawn; the row reads `pending` with a
-#        launch start and no `claude_session_id`;
+#        launch start and no `session_id`;
 #     2. before G has passed from the launch start (checked against
 #        `adGraceMs.default`), the harness types the exit sentinel into G's
 #        pane (the silent stub exits with no hook, and its session closes
@@ -619,7 +619,7 @@ export CSCB_SLACK_API_URL
 # t19_row_state <id>: print the row's state (a harness `status`), or nothing
 # when the read fails.
 t19_row_state() {
-    ad_capture status --claude-instance-id "$1"
+    ad_capture status --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || return 0
     jq -r '.state // empty' "${AD_OUT}" 2> /dev/null || true
 }
@@ -631,7 +631,7 @@ t19_row_is() {
 # t19_row_get <id> <step>: a harness `get` of the row (AD_OUT holds it); fail
 # when it fails.
 t19_row_get() {
-    ad_capture get --claude-instance-id "$1"
+    ad_capture get --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || fail "$2: harness get of $1 exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
 }
 
@@ -793,7 +793,7 @@ t19_pid_gone() {
 # t19_poller_start <id> <file>: from now on, a subshell of the scenario's own
 # shell (`track_pid`) reads the row with the harness `get`, every
 # POLL_PERIOD_S, and appends one JSON line per answered read to <file>:
-# {t, state, launch_started_at, claude_session_id}. It ends at the top of its
+# {t, state, launch_started_at, session_id}. It ends at the top of its
 # loop once <file>.stop exists (`t19_bg_stop`).
 t19_poller_start() {
     local id="$1" file="$2"
@@ -804,9 +804,9 @@ t19_poller_start() {
         tmp="${file}.read"
         while :; do
             [[ -e "${file}.stop" ]] && exit 0
-            if ad get --claude-instance-id "${id}" > "${tmp}" 2> /dev/null; then
+            if ad get --instance-id "${id}" > "${tmp}" 2> /dev/null; then
                 jq -c --arg t "${EPOCHREALTIME/,/.}" \
-                    '{t: $t, state: .state, launch_started_at: (.launch_started_at // ""), claude_session_id: (.claude_session_id // "")}' \
+                    '{t: $t, state: .state, launch_started_at: (.launch_started_at // ""), session_id: (.session_id // "")}' \
                     "${tmp}" >> "${file}" 2> /dev/null
             fi
             sleep "${POLL_PERIOD_S}"
@@ -938,8 +938,8 @@ t19_leg() {
     t19_start_and_wait 1
     wait_until "${ROW_WAIT_S}" "${step}: ${id}'s first life never reported in (waiting)" t19_row_is "${id}" waiting
     t19_row_get "${id}" "${step}: the first life"
-    old_sid="$(jq -r '.claude_session_id // empty' "${AD_OUT}")"
-    [[ -n "${old_sid}" ]] || fail "${step}: ${id}'s first life has no claude_session_id"
+    old_sid="$(jq -r '.session_id // empty' "${AD_OUT}")"
+    [[ -n "${old_sid}" ]] || fail "${step}: ${id}'s first life has no session_id"
     jsonl="$(jq -r '.jsonl_path // empty' "${AD_OUT}")"
     echo "${TEST_NAME}: ${step}: ${id}'s first life: session ${old_sid}, transcript ${jsonl:-none}"
 
@@ -1006,7 +1006,7 @@ t19_leg() {
         sed 's/^/  | /' "${AD_OUT}" >&2
         fail "${step}: the harness get of ${id}'s new life lists the first life's session ${old_sid} in prior_sessions"
     fi
-    echo "${TEST_NAME}: NOTE: ${step}: ${id}'s new life: session '$(jq -r '.claude_session_id // ""' "${AD_OUT}")', transcript_status '$(jq -r '.transcript_status // ""' "${AD_OUT}")', prior_sessions $(jq -c '.prior_sessions' "${AD_OUT}")"
+    echo "${TEST_NAME}: NOTE: ${step}: ${id}'s new life: session '$(jq -r '.session_id // ""' "${AD_OUT}")', transcript_status '$(jq -r '.transcript_status // ""' "${AD_OUT}")', prior_sessions $(jq -c '.prior_sessions' "${AD_OUT}")"
 
     # The pre_trust line: ok, for the reuse spawn.
     t19_value line personaPreTrustLogLine "${name}" LAUNCH_VERB_REUSE_SPAWN ok
@@ -1026,7 +1026,7 @@ t19_leg() {
     #    stopped and the life ended.
     stop_server
     t19_end_life "${p}" "${step}: the new life"
-    ad_capture resume --claude-instance-id "${id}"
+    ad_capture resume --instance-id "${id}"
     rc="${AD_RC}"
     if [[ "${rc}" == 0 ]] || ! jq -e -s --arg n "${NEVER_WRITTEN}" 'any(.[]; type == "object" and .err_name == $n)' "${AD_OUT}" "${AD_ERR}" > /dev/null 2>&1; then
         sed 's/^/  | /' "${AD_OUT}" "${AD_ERR}" >&2
@@ -1060,7 +1060,7 @@ t19_poll() {
 # t19_watch_start <id> <file>: from now on, a subshell of the scenario's own
 # shell (`track_pid`) reads the row with the harness `get` every
 # WATCH_PERIOD_S and appends one JSON line per read to <file>: {t, rc, state,
-# claude_session_id} for an answered read, {t, rc, err} (its output and
+# session_id} for an answered read, {t, rc, err} (its output and
 # error, on one line) for a failed one. It ends at the top of its loop once
 # <file>.stop exists (`t19_bg_stop`).
 t19_watch_start() {
@@ -1073,10 +1073,10 @@ t19_watch_start() {
         while :; do
             [[ -e "${file}.stop" ]] && exit 0
             t="${EPOCHREALTIME/,/.}"
-            ad get --claude-instance-id "${id}" > "${tmp}" 2> "${tmp}.err"
+            ad get --instance-id "${id}" > "${tmp}" 2> "${tmp}.err"
             rc=$?
             if (( rc == 0 )); then
-                jq -c --arg t "${t}" '{t: $t, rc: 0, state: .state, claude_session_id: (.claude_session_id // "")}' \
+                jq -c --arg t "${t}" '{t: $t, rc: 0, state: .state, session_id: (.session_id // "")}' \
                     "${tmp}" >> "${file}" 2> /dev/null
             else
                 jq -cn --arg t "${t}" --argjson rc "${rc}" --rawfile o "${tmp}" --rawfile e "${tmp}.err" \
@@ -1270,7 +1270,7 @@ t19_all_find_missing_since() {
 }
 
 t19_row_pending_launched() {
-    ad_capture status --claude-instance-id "$1"
+    ad_capture status --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || return 1
     jq -e '.state == "pending" and ((.launch_started_at // "") != "")' "${AD_OUT}" > /dev/null 2>&1
 }
@@ -1299,8 +1299,8 @@ t19_leg_missing_row() {
     wait_until "${ROW_WAIT_S}" "${step}: ${id} never read pending with a launch start" t19_row_pending_launched "${id}"
     t19_row_get "${id}" "${step}: the launch"
     launch_start="$(jq -r '.launch_started_at // empty' "${AD_OUT}")"
-    [[ -z "$(jq -r '.claude_session_id // empty' "${AD_OUT}")" ]] \
-        || fail "${step}: ${id}'s silent launch has a claude_session_id: $(jq -c . "${AD_OUT}")"
+    [[ -z "$(jq -r '.session_id // empty' "${AD_OUT}")" ]] \
+        || fail "${step}: ${id}'s silent launch has a session_id: $(jq -c . "${AD_OUT}")"
     launch_s="$(date -u -d "${launch_start}" +%s.%3N)" || fail "${step}: could not read the launch start '${launch_start}'"
     watch="${SCENARIO_ROOT}/watch-G.jsonl"
     t19_watch_start "${id}" "${watch}"
@@ -1365,8 +1365,8 @@ t19_leg_missing_row() {
 
     # The new life; no delete; the row present throughout.
     t19_row_get "${id}" "${step}: the new life"
-    sid="$(jq -r '.claude_session_id // empty' "${AD_OUT}")"
-    [[ -n "${sid}" ]] || fail "${step}: ${id}'s new life reads waiting with no claude_session_id"
+    sid="$(jq -r '.session_id // empty' "${AD_OUT}")"
+    [[ -n "${sid}" ]] || fail "${step}: ${id}'s new life reads waiting with no session_id"
     echo "${TEST_NAME}: ${step}: ${id}'s new life reads waiting with session ${sid}"
     n="$(t19_cscb_count_since "${MARK_TIME}" delete)"
     [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB delete call(s) after the mark"
@@ -1376,7 +1376,7 @@ t19_leg_missing_row() {
     t19_note_calls "${MARK_TIME}" "${id}" "${step}"
     t19_note_posts "${G_CHANNEL}" "${mark_record}" "${step}"
     t19_note_pre_trust "${name}" "${step}"
-    echo "${TEST_NAME}: NOTE: ${step}: agent-director's trail records naming ${id}, by event: $(jq -r --arg id "${id}" 'select(.claude_instance_id == $id) | .event // "?"' "${HOME}/.agent-director/ad-trail.jsonl" 2> /dev/null | sort | uniq -c | awk '{ printf "%s=%s ", $2, $1 }')"
+    echo "${TEST_NAME}: NOTE: ${step}: agent-director's trail records naming ${id}, by event: $(jq -r --arg id "${id}" 'select(.instance_id == $id) | .event // "?"' "${HOME}/.config/agent-director/ad-trail.jsonl" 2> /dev/null | sort | uniq -c | awk '{ printf "%s=%s ", $2, $1 }')"
 
     # 6. A plain stop; the harness ends the new life.
     stop_server
@@ -1399,8 +1399,8 @@ t19_leg_stale_config_dir() {
     t19_start_and_wait 1
     wait_until "${ROW_WAIT_S}" "${step}: ${id}'s first life never reported in (waiting)" t19_row_is "${id}" waiting
     t19_row_get "${id}" "${step}: the first life"
-    old_sid="$(jq -r '.claude_session_id // empty' "${AD_OUT}")"
-    [[ -n "${old_sid}" ]] || fail "${step}: ${id}'s first life has no claude_session_id"
+    old_sid="$(jq -r '.session_id // empty' "${AD_OUT}")"
+    [[ -n "${old_sid}" ]] || fail "${step}: ${id}'s first life has no session_id"
     echo "${TEST_NAME}: ${step}: ${id}'s first life: session ${old_sid}, labels $(jq -c '.labels // null' "${AD_OUT}")"
 
     # 2. remain-on-exit, then the sentinel: ended, the session stays.
@@ -1452,7 +1452,7 @@ t19_leg_stale_config_dir() {
 
     # The new life; no delete; the row present throughout.
     t19_row_get "${id}" "${step}: the new life"
-    new_sid="$(jq -r '.claude_session_id // empty' "${AD_OUT}")"
+    new_sid="$(jq -r '.session_id // empty' "${AD_OUT}")"
     [[ -n "${new_sid}" && "${new_sid}" != "${old_sid}" ]] \
         || fail "${step}: ${id}'s new life reads session '${new_sid}', not a new session id (the first life's was ${old_sid})"
     echo "${TEST_NAME}: ${step}: ${id}'s new life reads waiting with session ${new_sid} (the first life's was ${old_sid}), labels $(jq -c '.labels // null' "${AD_OUT}")"
@@ -1525,7 +1525,7 @@ t19_message_life() {
     local p="$1" step="$2" id_var="$1_ID" session_var="$1_SESSION" cfg_var="$1_CFG" id sid cwd path
     id="${!id_var}"
     t19_row_get "${id}" "${step}"
-    sid="$(jq -r '.claude_session_id // empty' "${AD_OUT}")"
+    sid="$(jq -r '.session_id // empty' "${AD_OUT}")"
     cwd="$(jq -r '.cwd // empty' "${AD_OUT}")"
     [[ -n "${sid}" && -n "${cwd}" ]] || fail "${step}: ${id}'s row reads session '${sid}' and cwd '${cwd}'"
     # agent-director's transcript path for a session under a config directory
@@ -1543,9 +1543,9 @@ t19_message_life() {
 # t19_row_waiting_new <id> <old-sid>: true when a harness `get` reads the row
 # `waiting` with a session id other than <old-sid>.
 t19_row_waiting_new() {
-    ad_capture get --claude-instance-id "$1"
+    ad_capture get --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || return 1
-    jq -e --arg old "$2" '.state == "waiting" and ((.claude_session_id // "") != "") and .claude_session_id != $old' "${AD_OUT}" > /dev/null 2>&1
+    jq -e --arg old "$2" '.state == "waiting" and ((.session_id // "") != "") and .session_id != $old' "${AD_OUT}" > /dev/null 2>&1
 }
 
 # t19_check_first_spawn_reuse <id> <ref> <since> <step>: the first
@@ -1577,7 +1577,7 @@ t19_check_first_spawn_reuse() {
 t19_check_fresh() {
     local id="$1" old_sid="$2" since="$3" step="$4" sid n
     t19_row_get "${id}" "${step}: the new life"
-    sid="$(jq -r '.claude_session_id // empty' "${AD_OUT}")"
+    sid="$(jq -r '.session_id // empty' "${AD_OUT}")"
     [[ "$(jq -r '.state // empty' "${AD_OUT}")" == waiting && -n "${sid}" && "${sid}" != "${old_sid}" ]] \
         || { sed 's/^/  | /' "${AD_OUT}" >&2; fail "${step}: the harness get of ${id} does not read waiting with a session other than the old one (${old_sid})"; }
     jq -e '(.prior_sessions | type) == "array"' "${AD_OUT}" > /dev/null 2>&1 \

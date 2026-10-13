@@ -4,9 +4,9 @@
  * Action IDs are emitted by the permission poller and consumed by the
  * interactive-message click handler. The format encodes:
  *
- *   perm_<allow|deny>_<claude_instance_id>_<request_token>
+ *   perm_<allow|deny>_<instance_id>_<request_token>
  *
- * `claude_instance_id` is `cscb_<persona key>` (`personaInstanceId`, whose
+ * `instance_id` is `cscb_<persona key>` (`personaInstanceId`, whose
  * `PERSONA_INSTANCE_ID_PREFIX` is the regex's `cscb_` anchor) and can itself
  * contain underscores. The trailing `request_token` is an opaque per-request
  * identifier minted by agent-director — CSCB MUST NOT parse or otherwise
@@ -21,14 +21,14 @@ export type PermissionDecision = 'allow' | 'deny'
 
 export interface ParsedPermissionActionId {
   decision: PermissionDecision
-  claudeInstanceId: string
+  instanceId: string
   requestToken: string
 }
 
 /**
  * Anchored regex. The trailing UUIDv4-shape group is an outer-structure
  * anchor used to disambiguate the middle (underscore-bearing)
- * claude_instance_id capture — NOT a token-content validator.
+ * instance_id capture — NOT a token-content validator.
  */
 export const PERMISSION_ACTION_ID_RE: RegExp =
   /^perm_(allow|deny)_(cscb_.+)_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/
@@ -41,19 +41,19 @@ export const PERMISSION_ACTION_ID_RE: RegExp =
  */
 export function encodePermissionActionId(
   decision: PermissionDecision,
-  claudeInstanceId: string,
+  instanceId: string,
   requestToken: string,
 ): string {
   if (decision !== 'allow' && decision !== 'deny') {
     throw new Error(`encodePermissionActionId: invalid decision: ${String(decision)}`)
   }
-  if (!claudeInstanceId.startsWith('cscb_') || claudeInstanceId.length <= 'cscb_'.length) {
-    throw new Error(`encodePermissionActionId: claudeInstanceId must start with 'cscb_' and be non-empty after the prefix: ${claudeInstanceId}`)
+  if (!instanceId.startsWith('cscb_') || instanceId.length <= 'cscb_'.length) {
+    throw new Error(`encodePermissionActionId: instanceId must start with 'cscb_' and be non-empty after the prefix: ${instanceId}`)
   }
   if (typeof requestToken !== 'string' || requestToken.length === 0) {
     throw new Error(`encodePermissionActionId: request_token must be a non-empty string`)
   }
-  return `perm_${decision}_${claudeInstanceId}_${requestToken}`
+  return `perm_${decision}_${instanceId}_${requestToken}`
 }
 
 /**
@@ -65,7 +65,7 @@ export function parsePermissionActionId(actionId: string): ParsedPermissionActio
   const match = PERMISSION_ACTION_ID_RE.exec(actionId)
   if (match === null) return null
   const decision = match[1] as PermissionDecision
-  const claudeInstanceId = match[2]
+  const instanceId = match[2]
   const requestToken = match[3]
-  return { decision, claudeInstanceId, requestToken }
+  return { decision, instanceId, requestToken }
 }

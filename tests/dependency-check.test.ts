@@ -2,7 +2,7 @@
  * dependency-check.test.ts — SR-5.1 startup-gate sub-case matrix.
  *
  * Exercises src/agent-director-startup.ts via the dep-injection seam — never
- * touches the real Bun FFI or the real ~/.agent-director/state.db, and never
+ * touches the real Bun FFI or the real ~/.config/agent-director/state.db, and never
  * calls the production `createClient`. Covers:
  *
  *   1. ErrBunVersionTooOld at Client construction (Bun-version gate).
@@ -34,7 +34,7 @@
  *      `checkErrorCatalog` over dist text built in the test from
  *      `REQUIRED_ERR_NAMES`, never the installed client's dist, and a
  *      probe built from it through the gate and its wrapper.
- *   6. Same-user mismatch on ~/.agent-director/state.db.
+ *   6. Same-user mismatch on ~/.config/agent-director/state.db.
  *   7. Happy path: gate passes silently and installs the Client into the
  *      module-level singleton via setClient(...).
  *   8. `runAgentDirectorStartupGate`: one record call and one exit per

@@ -1,3 +1,4 @@
+import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 /**
  * cli.test.ts — Coverage for the CLI surface (`start`, `stop`,
  * `clean_restart`, `credentials`) at the createCli factory level, with all
@@ -2456,7 +2457,7 @@ describe('createDirectorOps', () => {
   const OPS: Array<keyof DirectorOps> = ['directorGet', 'directorReadPane', 'directorStatus', 'directorPause', 'directorKill', 'directorList']
 
   /** The one row the fake Client's `list` answers. */
-  const LIST_ROW = cannedListRow({ claude_instance_id: opsId() })
+  const LIST_ROW = cannedListRow({ instance_id: opsId() })
 
   /** The `get` row the fake Client answers: a live row carrying a note and a launch start, so each field read shows. */
   const GET_ROW: PrecheckRow = { state: 'pending', liveness_note: provenanceNote, launch_started_at: SAMPLE_LAUNCH_START_DEFAULT }
@@ -2473,8 +2474,8 @@ describe('createDirectorOps', () => {
       return result
     }
     const client = {
-      get: verb('get', { ...GET_ROW, claude_instance_id: opsId() }),
-      readPane: verb('readPane', { pane: FAKE_PANE }),
+      get: verb('get', { ...GET_ROW, instance_id: opsId() }),
+      readPane: verb('readPane', cannedReadPaneResult(FAKE_PANE)),
       status: verb('status', { state: 'working' }),
       pause: verb('pause', {}),
       kill: verb('kill', killResult),
@@ -2546,8 +2547,8 @@ describe('createDirectorOps', () => {
   ] as const)('directorKill resolves the Client\'s kill result unchanged (%s); its one request is exactly the instance ID', async (_label, result) => {
     const { client, calls } = fakeClient(undefined, result)
     expect(await createDirectorOps(() => client).directorKill(opsId())).toBe(result)
-    expect(calls).toEqual([['kill', { claude_instance_id: opsId() }]])
-    expect(Object.keys(calls[0]![1] as object)).toEqual(['claude_instance_id'])
+    expect(calls).toEqual([['kill', { instance_id: opsId() }]])
+    expect(Object.keys(calls[0]![1] as object)).toEqual(['instance_id'])
   })
 
   test.each(OPS)('%s rejects with getClient\'s own error when getClient throws (no Client installed)', async (op) => {
@@ -2555,7 +2556,7 @@ describe('createDirectorOps', () => {
     await expect(callOp(createDirectorOps(() => { throw err }), op)).rejects.toBe(err)
   })
 
-  test('getClient is called on every op (a Client installed later is used); each verb but list gets cscb_<key> as claude_instance_id, read-pane the given n_lines, list the service label filter; get answers the row\'s state, note and launch start, read-pane the pane, list the rows', async () => {
+  test('getClient is called on every op (a Client installed later is used); each verb but list gets cscb_<key> as instance_id, read-pane the given n_lines, list the service label filter; get answers the row\'s state, note and launch start, read-pane the pane, list the rows', async () => {
     let installed: DirectorClient | null = null
     let gets = 0
     const ops = createDirectorOps(() => {
@@ -2575,7 +2576,7 @@ describe('createDirectorOps', () => {
     expect(await ops.directorList()).toEqual([LIST_ROW])
 
     expect(gets).toBe(7)
-    const req = { claude_instance_id: opsId() }
+    const req = { instance_id: opsId() }
     expect(calls).toEqual([
       ['get', req],
       ['readPane', { ...req, n_lines: PROBE_PANE_READ_LINES }],
@@ -3955,9 +3956,9 @@ describe('a human-initiated teardown\'s ordinary kill (b.jg5 SRJ-503, SRJ-513; A
       const stateOf = (id: string): string => (id === alphaId() ? ENDED_ROW.state : AGENT_DIRECTOR_PENDING_STATE)
       const client = makeStubClient({
         ...log,
-        getFn: (params) => cannedGetResult({ claude_instance_id: params.claude_instance_id, state: stateOf(params.claude_instance_id), launch_started_at: SAMPLE_LAUNCH_START_NONE }),
-        readPaneResults: [{ pane: FAKE_PANE }],
-        statusFn: (params) => cannedStatusResult({ state: stateOf(params.claude_instance_id), launch_started_at: SAMPLE_LAUNCH_START_NONE }),
+        getFn: (params) => cannedGetResult({ instance_id: params.instance_id, state: stateOf(params.instance_id), launch_started_at: SAMPLE_LAUNCH_START_NONE }),
+        readPaneResults: [cannedReadPaneResult(FAKE_PANE)],
+        statusFn: (params) => cannedStatusResult({ state: stateOf(params.instance_id), launch_started_at: SAMPLE_LAUNCH_START_NONE }),
         pauseError: errSpawnNotPausable(PAUSE_VERB),
         killResult: cannedKillResult(false),
       })
@@ -3966,11 +3967,11 @@ describe('a human-initiated teardown\'s ordinary kill (b.jg5 SRJ-503, SRJ-513; A
 
       await settled(createCli(b.deps).stop({ stopBots: true }))
 
-      const ids = (calls: ReadonlyArray<{ claude_instance_id: string }>): string[] => calls.map((c) => c.claude_instance_id).sort()
+      const ids = (calls: ReadonlyArray<{ instance_id: string }>): string[] => calls.map((c) => c.instance_id).sort()
       expect(ids(log.getCalls)).toEqual([alphaId(), betaId()].sort())
       expect([ids(log.readPaneCalls), ids(log.statusCalls), ids(log.pauseCalls)]).toEqual([[betaId()], [alphaId(), betaId()].sort(), [betaId()]])
-      expect(log.killCalls).toEqual([{ claude_instance_id: betaId() }])
-      for (const request of log.killCalls) expect(Object.keys(request)).toEqual(['claude_instance_id'])
+      expect(log.killCalls).toEqual([{ instance_id: betaId() }])
+      for (const request of log.killCalls) expect(Object.keys(request)).toEqual(['instance_id'])
       expectTeardownStopped(b, CLI_COMMAND_STOP_BOTS)
       assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls, log })
     })
@@ -4969,8 +4970,8 @@ describe('stop --stop-bots on a binary older than Phase 1 (b.jg5 SRJ-902, AC 75)
     const client = makeStubClient({
       ...log,
       binaryVersion: OLD_AD_VERSION,
-      getFn: (params) => cannedGetResult({ claude_instance_id: params.claude_instance_id }),
-      readPaneResults: [{ pane: FAKE_PANE }],
+      getFn: (params) => cannedGetResult({ instance_id: params.instance_id }),
+      readPaneResults: [cannedReadPaneResult(FAKE_PANE)],
       statusResult: cannedStatusResult({ state: 'waiting' }),
       killResult: cannedKillResult(),
     })
@@ -4987,10 +4988,10 @@ describe('stop --stop-bots on a binary older than Phase 1 (b.jg5 SRJ-902, AC 75)
       const verbs = b.events.filter((e) => e.endsWith(`:${id}`)).map((e) => e.slice(0, -(id.length + 1)))
       expect([id, verbs]).toEqual([id, [PRECHECK_CALL_GET, PRECHECK_CALL_READ_PANE, 'status', 'pause', 'kill']])
     }
-    const idsOf = (calls: ReadonlyArray<{ claude_instance_id: string }>): string[] => calls.map((c) => c.claude_instance_id).sort()
+    const idsOf = (calls: ReadonlyArray<{ instance_id: string }>): string[] => calls.map((c) => c.instance_id).sort()
     expect([log.getCalls, log.statusCalls, log.pauseCalls, log.killCalls].map(idsOf)).toEqual(Array.from({ length: 4 }, twoIds))
-    expect([...log.readPaneCalls].sort((a, c) => a.claude_instance_id.localeCompare(c.claude_instance_id))).toEqual(
-      twoIds().map((id) => ({ claude_instance_id: id, n_lines: PROBE_PANE_READ_LINES })),
+    expect([...log.readPaneCalls].sort((a, c) => a.instance_id.localeCompare(c.instance_id))).toEqual(
+      twoIds().map((id) => ({ instance_id: id, n_lines: PROBE_PANE_READ_LINES })),
     )
     expect(stubCallCount(log)).toBe(twoIds().length * 5) // no other verb reached the stub
     expect(b.serverSignals).toEqual(['SIGTERM'])
@@ -5459,7 +5460,7 @@ function actingDeps(o: Overrides): ActingRun {
   const client = makeStubClient({
     statusResult: cannedStatusResult({ state: 'waiting' }),
     statusCalls,
-    getResult: cannedGetResult({ claude_instance_id: opsId(), state: 'waiting' }),
+    getResult: cannedGetResult({ instance_id: opsId(), state: 'waiting' }),
     getCalls,
     readPaneCalls,
   })
@@ -5506,8 +5507,8 @@ const ACTING_COMMANDS: ReadonlyArray<readonly [string, () => Overrides, (b: Bund
 function expectActed({ b, statusCalls, getCalls, readPaneCalls }: ActingRun, readsRows: boolean): void {
   expect(b.daemonSpawns.length + b.serverSignals.length + b.credentialsRuns.length + b.spawnCalls.length + b.dialCalls.length).toBeGreaterThan(0)
   if (readsRows) {
-    expect(getCalls).toEqual([{ claude_instance_id: opsId() }])
-    expect(readPaneCalls).toEqual([{ claude_instance_id: opsId(), n_lines: PROBE_PANE_READ_LINES }])
+    expect(getCalls).toEqual([{ instance_id: opsId() }])
+    expect(readPaneCalls).toEqual([{ instance_id: opsId(), n_lines: PROBE_PANE_READ_LINES }])
     expect(statusCalls.length).toBeGreaterThan(0)
     expect(b.killCalls).toEqual([opsId()])
   } else {

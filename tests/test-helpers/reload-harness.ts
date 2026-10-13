@@ -2902,7 +2902,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       const client = {
         ...stub,
         kill(params: Parameters<typeof stub.kill>[0]) {
-          const id = params.claude_instance_id
+          const id = params.instance_id
           agentDirectorOrder.push(`kill ${id}`)
           return tracked({ verb: 'kill', id }, async () => {
             const result = await stub.kill(params)
@@ -2915,12 +2915,12 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         // only recorded (`agentDirectorOrder`, `instanceCallsOf`), so a case's
         // exact expectation fails on it, and it changes no row.
         delete(params: Parameters<typeof stub.delete>[0]) {
-          const ids = params.claude_instance_id
+          const ids = params.instance_id
           agentDirectorOrder.push(`delete ${ids.join(',')}`)
           return tracked({ verb: 'delete', id: ids.join(',') }, () => stub.delete(params))
         },
         spawn(params: SpawnParams) {
-          const id = String(params.claude_instance_id)
+          const id = String(params.instance_id)
           const labels = parseLabels(params.label)
           const reuse = params.reuse_finished === true
           const call: AgentDirectorCall = {
@@ -2952,7 +2952,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           })
         },
         resume(params: Parameters<typeof stub.resume>[0]) {
-          const id = params.claude_instance_id
+          const id = params.instance_id
           return tracked({ verb: 'resume', id }, async () => {
             const result = await stub.resume(params)
             rowFor(id).state = 'waiting'
@@ -2960,12 +2960,12 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           })
         },
         get(params: Parameters<typeof stub.get>[0]) {
-          const id = params.claude_instance_id
+          const id = params.instance_id
           return tracked({ verb: 'get', id }, async () => {
             agentDirector.getCalls.push(params)
             const row = rowFor(id)
             return cannedGetResult({
-              claude_instance_id: id,
+              instance_id: id,
               state: row.state,
               cwd: row.cwd,
               labels: { ...row.labels },
@@ -2974,7 +2974,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           })
         },
         status(params: Parameters<typeof stub.status>[0]) {
-          const id = params.claude_instance_id
+          const id = params.instance_id
           return tracked({ verb: 'status', id }, async () => {
             agentDirector.statusCalls.push(params)
             const row = rowFor(id)
@@ -2984,9 +2984,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           })
         },
         sendKeys: (params: Parameters<typeof stub.sendKeys>[0]) =>
-          tracked({ verb: 'sendKeys', id: params.claude_instance_id }, () => stub.sendKeys(params)),
+          tracked({ verb: 'sendKeys', id: params.instance_id }, () => stub.sendKeys(params)),
         readPane: (params: Parameters<typeof stub.readPane>[0]) =>
-          tracked({ verb: 'readPane', id: params.claude_instance_id }, () => stub.readPane(params)),
+          tracked({ verb: 'readPane', id: params.instance_id }, () => stub.readPane(params)),
         findMissing: (params: Parameters<typeof stub.findMissing>[0]) =>
           tracked({ verb: 'findMissing' }, () => stub.findMissing(params)),
         makeTemplate: (params: MakeTemplateParams) =>

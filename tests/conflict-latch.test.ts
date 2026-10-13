@@ -1,3 +1,4 @@
+import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 /**
  * conflict-latch.test.ts — CONFLICT case recognition (b.jg5 SRJ-507), the
  * `tests/conflict-latch.test.ts` half of SRJ-1303, and the latch record
@@ -1697,7 +1698,7 @@ describe('no session-ending command', () => {
   const FORBIDDEN_SAMPLES = [
     'tmux kill-pane -t =slack_bot_alpha',
     'tmux set-option -t =slack_bot_alpha',
-    'run agent-director  delete --claude-instance-id cscb_alpha',
+    'run agent-director  delete --instance-id cscb_alpha',
     'cscb clear-latch alpha',
     'the clear_latch tool',
     'call clearLatch()',
@@ -1725,7 +1726,7 @@ describe('no session-ending command', () => {
   })
 
   test('a session-ending command in a line of CSCB\'s own is caught; the same words in the quoted description are let through', () => {
-    const named = 'run `agent-director kill --claude-instance-id cscb_alpha` now'
+    const named = 'run `agent-director kill --instance-id cscb_alpha` now'
     const notice = conflictNoticeText({ sessionName: STUB_TMUX_SESSION_NAME, latchCase: LATCH_CASE_OWN_ID, description: named })
     expect(cscbOwnLines(notice).flatMap(sessionEndingCommandsIn)).toEqual([])
     expect(sessionEndingCommandsIn(notice)).toEqual(['kill as a command'])
@@ -1733,12 +1734,12 @@ describe('no session-ending command', () => {
   })
 
   test.each([
-    ['kill as a command', 'run `agent-director kill --claude-instance-id cscb_alpha`'],
+    ['kill as a command', 'run `agent-director kill --instance-id cscb_alpha`'],
     ['kill as a command', 'agent-director kill'],
     ['kill as a command', 'then kill -9 4242'],
     ['kill as a command', 'run kill on that pane'],
     ['kill as a command', 'type `kill 4242`'],
-    ['pause', 'run `agent-director pause --claude-instance-id cscb_alpha`'],
+    ['pause', 'run `agent-director pause --instance-id cscb_alpha`'],
     ['pause', 'pause the session'],
     ['--include-finished', 'agent-director kill --include-finished'],
     ['--include-finished', 'the include-finished option'],
@@ -2280,7 +2281,7 @@ const latchUnusable = (latch: ConflictLatch, key: string, row: UnusableNameCaseR
 
 /** The description agent-director's envelope carries, before the classifier renders it. */
 const envelopeDescriptionOf = (err: unknown): string =>
-  String((err as { envelope?: { err_description?: unknown } }).envelope?.err_description)
+  String((err as { errDescription?: unknown; envelope?: { err_description?: unknown } }).errDescription ?? (err as { envelope?: { err_description?: unknown } }).envelope?.err_description)
 
 describe('the unusable-recorded-name hold: SRJ-1019\'s notice, the record and the episode (SRJ-512, SRJ-1019)', () => {
   test('SRJ-1019\'s text for one persona: the builder gives it word for word, on one line', () => {
@@ -2634,12 +2635,12 @@ function makeAutomatedPathsRun(options: Omit<RecoveryHarnessOptions, 'restartDep
   const spawn = h.stub.client.spawn.bind(h.stub.client)
   h.stub.client.spawn = async (params) => {
     const result = await spawn(params)
-    live.add(String(params.claude_instance_id))
+    live.add(String(params.instance_id))
     return result
   }
   h.script({
     statusFn: (params) => {
-      const id = String(params.claude_instance_id)
+      const id = String(params.instance_id)
       const once = statusErrorsOnce.get(id)
       if (once !== undefined) {
         statusErrorsOnce.delete(id)
@@ -2879,7 +2880,7 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
 
     // P: since the latch, only the tick's liveness read; never a kill of its instance.
     expect(callCountsSince(personaCallCounts(h, p), pAtLatch)).toEqual({ statusCalls: 1 })
-    expect(h.stub.calls.killCalls.filter((call) => call.claude_instance_id === personaInstanceId(p))).toEqual([])
+    expect(h.stub.calls.killCalls.filter((call) => call.instance_id === personaInstanceId(p))).toEqual([])
     expect(launched).toEqual([{ key: p, action: 'latched' }, { key: q, action: 'spawned' }])
     // P's only serialized work is the retry entry's, answered latched; neither restart request armed a timer for it.
     expect(outcomes).toEqual([
@@ -3355,7 +3356,7 @@ describe('SRJ-502, SRJ-1011: a message lost while P is latched reports held for 
 // ---------------------------------------------------------------------------
 
 /** The instance id a stub call's params name, if any. */
-const instanceOf = (params: unknown): unknown => (params as { claude_instance_id?: unknown } | undefined)?.claude_instance_id
+const instanceOf = (params: unknown): unknown => (params as { instance_id?: unknown } | undefined)?.instance_id
 
 /**
  * Each way an UNUSABLE NAME latches P through the launch driver: the row
@@ -3423,7 +3424,7 @@ describe('SRJ-512: an UNUSABLE NAME from resume and from the working-row read-pa
     // P's row reads working (the read-pane way's evidence read is then made); Q's reads no row.
     h.script({
       ...latchScript(h, p),
-      statusFn: (params) => (params.claude_instance_id === personaInstanceId(p) ? cannedStatusResult({ state: 'working' }) : errSpawnNotFound()),
+      statusFn: (params) => (params.instance_id === personaInstanceId(p) ? cannedStatusResult({ state: 'working' }) : errSpawnNotFound()),
     })
     expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
     expect(h.latch.record(p)).toEqual(row.record(p))
@@ -3506,7 +3507,7 @@ describe('SRJ-118, SRJ-505: a CONFLICT or UNUSABLE NAME at the reconnect\'s send
     h.script(latchScript(h, p))
     expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
     expect(h.latch.record(p)).toEqual(record(p))
-    expect(h.stub.calls.sendKeysCalls.map((call) => call.claude_instance_id)).toEqual([personaInstanceId(p)])
+    expect(h.stub.calls.sendKeysCalls.map((call) => call.instance_id)).toEqual([personaInstanceId(p)])
     h.script({ ...CLEARED, sendKeysError: undefined })
     const touchingAtLatch = tmuxTouchingCallCounts(h.stub.calls)
 
@@ -3515,7 +3516,7 @@ describe('SRJ-118, SRJ-505: a CONFLICT or UNUSABLE NAME at the reconnect\'s send
 
     // Nothing tmux-touching (the send-keys included) or deleting reached P after the latch.
     expect(tmuxTouchingCallsIn(h.stub.calls, touchingAtLatch).filter((call) => instanceOf(call.params) === personaInstanceId(p))).toEqual([])
-    expect(h.stub.calls.sendKeysCalls.filter((call) => call.claude_instance_id === personaInstanceId(p))).toHaveLength(1)
+    expect(h.stub.calls.sendKeysCalls.filter((call) => call.instance_id === personaInstanceId(p))).toHaveLength(1)
     expect(h.stub.calls.deleteCalls.filter((call) => instanceOf(call) === personaInstanceId(p))).toEqual([])
     // Each path stopped for P: the launch and the retry entry answered latched, no restart timer, the retry timer stopped latched, the tick scheduled nothing for it.
     expect(launched).toEqual([{ key: p, action: 'latched' }, { key: q, action: 'spawned' }])
@@ -3540,7 +3541,7 @@ describe('SRJ-118, SRJ-505: a CONFLICT or UNUSABLE NAME at the reconnect\'s send
     expect(tick.qCalls).toEqual({ statusCalls: 1 })
     h.script(collided(h, personaOf(h, q), { state: 'waiting' }))
     expect(await h.launch(q)).toEqual({ key: q, action: 'reconnected' })
-    expect(h.stub.calls.sendKeysCalls.filter((call) => call.claude_instance_id === personaInstanceId(q))).toHaveLength(1)
+    expect(h.stub.calls.sendKeysCalls.filter((call) => call.instance_id === personaInstanceId(q))).toHaveLength(1)
   })
 })
 
@@ -3640,7 +3641,7 @@ describe('SRJ-110, SRJ-505 (AC 9): a CONFLICT or UNUSABLE NAME at P\'s kill hold
 
     // Nothing tmux-touching or deleting reached P after the latch; the kill was sent once.
     expect(tmuxTouchingCallsIn(h.stub.calls, touchingAtLatch).filter((call) => instanceOf(call.params) === personaInstanceId(p))).toEqual([])
-    expect(h.stub.calls.killCalls.filter((call) => call.claude_instance_id === personaInstanceId(p))).toHaveLength(1)
+    expect(h.stub.calls.killCalls.filter((call) => call.instance_id === personaInstanceId(p))).toHaveLength(1)
     expect(h.stub.calls.deleteCalls.filter((call) => instanceOf(call) === personaInstanceId(p))).toEqual([])
     // Each path stopped for P.
     expect(launched).toEqual([{ key: p, action: 'latched' }, { key: q, action: 'spawned' }])
@@ -3708,7 +3709,7 @@ describe('SRJ-504: after a server restart a persona that was latched latches aga
       'the "no valid label" leg: collision, get ended with no session id, resume ErrNoSessionId, then the reuse spawn answering no-valid-id',
       noValidIdReuseRow,
       (h, key) => ({
-        ...collided(h, personaOf(h, key), { state: 'ended', claude_session_id: '' }, noValidIdReuseRow.build()),
+        ...collided(h, personaOf(h, key), { state: 'ended', session_id: '' }, noValidIdReuseRow.build()),
         resumeError: errNoSessionId(),
       }),
       ENDED,
@@ -3808,7 +3809,7 @@ describe('SRJ-507: the another-store description at the ladder\'s ErrNoSessionId
     const h = makeRecoveryHarness()
     harnesses.push(h)
     const [p, q] = h.keys as [string, string]
-    h.script({ ...collided(h, personaOf(h, p), { state: 'ended', claude_session_id: '' }, row.build()), resumeError: errNoSessionId() })
+    h.script({ ...collided(h, personaOf(h, p), { state: 'ended', session_id: '' }, row.build()), resumeError: errNoSessionId() })
     const order = recordCallOrder(h)
 
     expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
@@ -3843,8 +3844,8 @@ describe('SRJ-507: the another-store description at the ladder\'s ErrNoSessionId
  * stub's default launch start, as the canned builders give one, so the note
  * is what decides; the other states show none.
  */
-const rowRead = (claudeInstanceId: string, note: string | null | undefined, state = 'waiting'): RowReadRow => ({
-  claude_instance_id: claudeInstanceId,
+const rowRead = (instanceId: string, note: string | null | undefined, state = 'waiting'): RowReadRow => ({
+  instance_id: instanceId,
   state,
   liveness_note: note,
   ...(state === AGENT_DIRECTOR_PENDING_STATE ? { launch_started_at: SAMPLE_LAUNCH_START_DEFAULT } : {}),
@@ -3891,8 +3892,8 @@ describe('the note rules: the pure decision over one read of a persona\'s own ro
     ['another caller\'s row', LAUNCH_START_ANOTHER_CALLERS_ID, true],
     ['another persona\'s own row, read for P', personaInstanceId(OTHER), true],
     ['a row whose id only starts with P\'s own', `${personaInstanceId(KEY)}_x`, true],
-  ] as const)('the latching note on %s decides nothing', (_name, claudeInstanceId, configured) => {
-    expect(decideOwnRowRead({ key: KEY, row: rowRead(claudeInstanceId, provenanceNote), configured })).toEqual(ROW_READ_NO_DECISION)
+  ] as const)('the latching note on %s decides nothing', (_name, instanceId, configured) => {
+    expect(decideOwnRowRead({ key: KEY, row: rowRead(instanceId, provenanceNote), configured })).toEqual(ROW_READ_NO_DECISION)
   })
 })
 
@@ -4017,13 +4018,13 @@ describe('the note latch through the own-row read: record, notice, relatch and w
     ['no note on P\'s own row', (h, p) => ({ key: p, script: ownRowAnswer(h, p, undefined) })],
     [
       `a ${provenanceNote} note on another caller's row`,
-      (_h, p) => ({ key: p, script: { getResult: cannedGetResult({ claude_instance_id: LAUNCH_START_ANOTHER_CALLERS_ID, liveness_note: provenanceNote }) } }),
+      (_h, p) => ({ key: p, script: { getResult: cannedGetResult({ instance_id: LAUNCH_START_ANOTHER_CALLERS_ID, liveness_note: provenanceNote }) } }),
     ],
     [
       `a ${provenanceNote} note on the own row of a key outside the configuration (an absent persona)`,
       (h) => {
         expect(h.keys).not.toContain(LAUNCH_START_ABSENT_PERSONA_KEY)
-        return { key: LAUNCH_START_ABSENT_PERSONA_KEY, script: { getResult: cannedGetResult({ claude_instance_id: personaInstanceId(LAUNCH_START_ABSENT_PERSONA_KEY), liveness_note: provenanceNote }) } }
+        return { key: LAUNCH_START_ABSENT_PERSONA_KEY, script: { getResult: cannedGetResult({ instance_id: personaInstanceId(LAUNCH_START_ABSENT_PERSONA_KEY), liveness_note: provenanceNote }) } }
       },
     ],
     [
@@ -4283,7 +4284,7 @@ const harnessSetOutcomes = (h: RecoveryHarness) => h.latchEvents.flatMap((event)
 /** A `status` answer: persona `p`'s own row reads `pending` with no launch start; every other persona's row is gone. */
 const pNoLaunchStartStatus = (p: string): RecoveryStubScript => ({
   statusFn: (params) =>
-    params.claude_instance_id === personaInstanceId(p)
+    params.instance_id === personaInstanceId(p)
       ? cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE })
       : errSpawnNotFound(),
 })
@@ -4514,7 +4515,7 @@ describe('SRJ-513, SRJ-512: P latched on another case relatches through a real o
 
   /** A `status` answer: persona `p`'s own row answers UNUSABLE NAME; every other persona's row is gone. */
   const pUnusableStatus = (p: string): RecoveryStubScript => ({
-    statusFn: (params) => (params.claude_instance_id === personaInstanceId(p) ? unusable.build() : errSpawnNotFound()),
+    statusFn: (params) => (params.instance_id === personaInstanceId(p) ? unusable.build() : errSpawnNotFound()),
   })
 
   /** Each way P is latched first through a real path: the case it holds, its one post and the episode kind it opened. */
@@ -4633,7 +4634,7 @@ describe('SRJ-513, SRJ-1011: a message lost for P whose row reads pending with n
   test('the same lost-message read answering UNUSABLE NAME latches P with "unusable recorded name"; the message reports held for a human, with no restart; one SRJ-1019 post', async () => {
     const row = unusableRow('status', 'empty')
     const { h, p, q } = makeLostRun((key) => ({
-      statusFn: (params) => (params.claude_instance_id === personaInstanceId(key) ? errUnusableName('empty') : errSpawnNotFound()),
+      statusFn: (params) => (params.instance_id === personaInstanceId(key) ? errUnusableName('empty') : errSpawnNotFound()),
     }))
     await expectLostMessageReports(h, p, 'held-for-human', { calls: { statusCalls: 1 } })
     expect(h.latch.record(p)).toEqual(row.record(p))
@@ -4645,7 +4646,7 @@ describe('SRJ-513, SRJ-1011: a message lost for P whose row reads pending with n
   test('the same row with a launch start reports the session starting and latches nothing', async () => {
     const { h, p } = makeLostRun((key) => ({
       statusFn: (params) =>
-        params.claude_instance_id === personaInstanceId(key) ? cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }) : errSpawnNotFound(),
+        params.instance_id === personaInstanceId(key) ? cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }) : errSpawnNotFound(),
     }))
     await expectLostMessageReports(h, p, 'session-starting')
     expect([h.latch.isLatched(p), h.latchEvents, h.episodeNotices]).toEqual([false, [], []])
@@ -4745,7 +4746,7 @@ const APPROVER_LATCH_CASES: ReadonlyArray<readonly [string, ApproverLatchCase]> 
  */
 function approverMeets(run: AutomatedPathsRun, key: string, verb: ApproverVerb, err: Error): void {
   const { h } = run
-  h.script({ readPaneResults: [{ pane: TRUST_DIALOG_NEEDLE }] })
+  h.script({ readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_NEEDLE)] })
   const id = personaInstanceId(key)
   const client = h.stub.client
   if (verb === 'status') {
@@ -4754,14 +4755,14 @@ function approverMeets(run: AutomatedPathsRun, key: string, verb: ApproverVerb, 
     const readPane = client.readPane.bind(client)
     client.readPane = async (params) => {
       const result = await readPane(params)
-      if (params.claude_instance_id === id) throw err
+      if (params.instance_id === id) throw err
       return result
     }
   } else {
     const sendKeys = client.sendKeys.bind(client)
     client.sendKeys = async (params) => {
       const result = await sendKeys(params)
-      if (params.claude_instance_id === id) throw err
+      if (params.instance_id === id) throw err
       return result
     }
   }
@@ -4876,7 +4877,7 @@ describe('the dialog approver\'s latches: its own CONFLICT or UNUSABLE NAME latc
     const [p, q] = h.keys as [string, string]
     run.readPending(p)
     run.readPending(q)
-    h.script({ readPaneResults: [{ pane: TRUST_DIALOG_NEEDLE }] })
+    h.script({ readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_NEEDLE)] })
     let pAtLatch: Record<string, number> | undefined
     const latchNow = async (): Promise<void> => {
       await latchP(run, p)
@@ -4888,7 +4889,7 @@ describe('the dialog approver\'s latches: its own CONFLICT or UNUSABLE NAME latc
       const readPane = client.readPane.bind(client)
       client.readPane = async (params) => {
         const result = await readPane(params)
-        if (params.claude_instance_id === personaInstanceId(p) && pAtLatch === undefined) await latchNow()
+        if (params.instance_id === personaInstanceId(p) && pAtLatch === undefined) await latchNow()
         return result
       }
     }
@@ -5035,12 +5036,12 @@ describe('the live-row sequence\'s own latches: a kill CONFLICT or UNUSABLE NAME
     const client = h.stub.client
     const kill = client.kill.bind(client)
     client.kill = async (params) => {
-      if (params.claude_instance_id === personaInstanceId(p)) throw row!.build()
+      if (params.instance_id === personaInstanceId(p)) throw row!.build()
       return kill(params)
     }
     h.script({
       getFn: (params) =>
-        params.claude_instance_id === personaInstanceId(q)
+        params.instance_id === personaInstanceId(q)
           ? cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, personaOf(h, q), h.home)
           : cannedGetResult({}, personaOf(h, p), h.home),
     })
@@ -5054,7 +5055,7 @@ describe('the live-row sequence\'s own latches: a kill CONFLICT or UNUSABLE NAME
     expect(qOutcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED })
     expect([h.latch.isLatched(p), h.latch.isLatched(q)]).toEqual([true, false])
     expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
-    expect(h.reuseSpawns().map((reuse) => reuse.claude_instance_id)).toEqual([personaInstanceId(q)])
+    expect(h.reuseSpawns().map((reuse) => reuse.instance_id)).toEqual([personaInstanceId(q)])
   })
 
   test.each([
@@ -5222,10 +5223,10 @@ describe('the reuse spawn\'s latches at the sequence\'s final launch: CONFLICT w
     const client = h.stub.client
     const spawn = client.spawn.bind(client)
     client.spawn = async (params) => {
-      if (params.claude_instance_id === personaInstanceId(p)) throw row!.build()
+      if (params.instance_id === personaInstanceId(p)) throw row!.build()
       return spawn(params)
     }
-    h.script({ getFn: (params) => cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, personaOf(h, params.claude_instance_id === personaInstanceId(p) ? p : q), h.home) })
+    h.script({ getFn: (params) => cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, personaOf(h, params.instance_id === personaInstanceId(p) ? p : q), h.home) })
     const lastRead = cannedStatusResult().state
 
     const [pOutcome, qOutcome] = await h.driveSequence(
@@ -5236,7 +5237,7 @@ describe('the reuse spawn\'s latches at the sequence\'s final launch: CONFLICT w
     expect(qOutcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: q, action: 'spawned' } })
     expect([h.latch.isLatched(p), h.latch.isLatched(q)]).toEqual([true, false])
     expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
-    expect(h.reuseSpawns().map((reuse) => reuse.claude_instance_id)).toEqual([personaInstanceId(q)])
+    expect(h.reuseSpawns().map((reuse) => reuse.instance_id)).toEqual([personaInstanceId(q)])
   })
 })
 
@@ -5286,9 +5287,9 @@ describe('a running live-row sequence stops when P latches from another path: no
     expect(pOutcome).toEqual({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED, runs: 1, kills: 1, judgedRuns: 0 })
     expect(qOutcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: q, action: 'spawned' } })
     expect(callCountsSince(personaCallCounts(h, p), pAtLatch)).toEqual({})
-    expect(h.stub.calls.killCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }, { claude_instance_id: personaInstanceId(q) }])
+    expect(h.stub.calls.killCalls).toEqual([{ instance_id: personaInstanceId(p) }, { instance_id: personaInstanceId(q) }])
     expect(hold.calls).toHaveLength(2)
-    expect(h.reuseSpawns().map((reuse) => reuse.claude_instance_id)).toEqual([personaInstanceId(q)])
+    expect(h.reuseSpawns().map((reuse) => reuse.instance_id)).toEqual([personaInstanceId(q)])
     expect(h.latch.record(p)?.latchCase).toBe(latchCase)
     expect([h.latch.isLatched(q), latchSteps(h)]).toEqual([false, oneLatch(p)])
     expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
@@ -5675,12 +5676,12 @@ function recheckCallMethods(entry: RecheckEntry): string[] {
 
 /** The parameters persona `key`'s re-check call for `entry` must carry, checked on the row model's record; undefined for a call with none checked here. */
 function recheckCallParams(entry: RecheckEntry, key: string): Record<string, unknown> | undefined {
-  const claude_instance_id = personaInstanceId(key)
+  const instance_id = personaInstanceId(key)
   switch (entry.decision.call) {
     case RECHECK_CALL_PROBE:
-      return { claude_instance_id, n_lines: PROBE_PANE_READ_LINES }
+      return { instance_id, n_lines: PROBE_PANE_READ_LINES }
     case RECHECK_CALL_PENDING_READ_PANE:
-      return { claude_instance_id, n_lines: PROBE_PANE_READ_LINES, allow_pending: true }
+      return { instance_id, n_lines: PROBE_PANE_READ_LINES, allow_pending: true }
     default:
       return undefined
   }
@@ -6086,7 +6087,7 @@ describe('"conflicting labels": step 1 reads with get; the note keeps the latch 
     for (let n = 0; n < 3; n++) {
       const round = await recheckRound(h, p)
       expect(round.verbs).toEqual(['get', 'readPane'])
-      expect(model.calls.at(-1)?.params).toEqual({ claude_instance_id: personaInstanceId(p), n_lines: PROBE_PANE_READ_LINES, allow_pending: true })
+      expect(model.calls.at(-1)?.params).toEqual({ instance_id: personaInstanceId(p), n_lines: PROBE_PANE_READ_LINES, allow_pending: true })
       expectStillLatched(run, round.at)
     }
     expect([model.state(), model.dialog()]).toEqual([AGENT_DIRECTOR_PENDING_STATE, PENDING_ROW_DIALOG_TRUST])
@@ -6104,7 +6105,7 @@ describe('a retry\'s answer: a different case relatches with one new post, and t
     expect([h.episodeNotices.length, h.latchRecheck.pendingTimers()]).toEqual([2, 1])
     round = await recheckRound(h, p)
     expect(round.verbs).toEqual(['status', 'readPane'])
-    expect(model.calls.at(-1)?.params).toEqual({ claude_instance_id: personaInstanceId(p), n_lines: PROBE_PANE_READ_LINES })
+    expect(model.calls.at(-1)?.params).toEqual({ instance_id: personaInstanceId(p), n_lines: PROBE_PANE_READ_LINES })
     expect([h.latch.record(p)?.latchCase, h.episodeNotices.length]).toEqual([LATCH_CASE_PANE_NOT_FOUND, 2])
   })
 })
@@ -6442,7 +6443,7 @@ describe('a round\'s launch asks the gates every launch path asks: a persona not
     const { h, p } = run
     holdOldAt(h, PRE_PERSONA_ID, PRE_PERSONA_ID, p)
     // The old row reads ended at the wait's get, so the wait ends the hold.
-    h.script({ getResult: cannedGetResult({ claude_instance_id: PRE_PERSONA_ID, cwd: personaOf(h, p).working_directory, labels: { ...PRE_PERSONA_LABELS }, state: LIVENESS_DEAD_ROW_ENDED }) })
+    h.script({ getResult: cannedGetResult({ instance_id: PRE_PERSONA_ID, cwd: personaOf(h, p).working_directory, labels: { ...PRE_PERSONA_LABELS }, state: LIVENESS_DEAD_ROW_ENDED }) })
     const round = await recheckRound(h, p)
     expect(round.verbs).toEqual(['status'])
     expectStillLatched(run, round.at)
@@ -6741,11 +6742,11 @@ interface WatchedCall {
 function watchCalls(h: RecoveryHarness, key: string, verbs: readonly RecoveryStubVerb[] = ['status', 'get', 'readPane', 'findMissing', 'spawn', 'resume']): WatchedCall[] {
   const seen: WatchedCall[] = []
   const id = personaInstanceId(key)
-  const client = h.stub.client as unknown as Record<string, (params?: { claude_instance_id?: unknown }) => unknown>
+  const client = h.stub.client as unknown as Record<string, (params?: { instance_id?: unknown }) => unknown>
   for (const verb of verbs) {
     const original = client[verb]!.bind(client)
     client[verb] = (params) => {
-      const named = params?.claude_instance_id
+      const named = params?.instance_id
       if (named === undefined || named === id) {
         seen.push({ verb, posts: h.episodeNotices.length, latched: h.latch.isLatched(key), active: isRestartPendingOrActive(key) })
       }
@@ -6921,7 +6922,7 @@ describe('"not this launch\'s session": no post before its finished-row retry or
   test.each(FINISHED_ROW_CLEARS)('%s', async (_name, entry, answer) => {
     const noRow = entry.reading.kind === RECHECK_READING_NO_ROW_VALUE.kind
     const state = noRow ? PENDING_ROW_MODEL_NO_ROW : (entry.reading as { state: string }).state
-    const { h, p, model, record } = latchForRecheck(statusOnlyRow(), { state, ...(entry.hasSessionId ? {} : { row: { claude_session_id: '' } }) })
+    const { h, p, model, record } = latchForRecheck(statusOnlyRow(), { state, ...(entry.hasSessionId ? {} : { row: { session_id: '' } }) })
     scriptLaunchAnswer(model, entry.call, answer.answer())
     const watched = watchCalls(h, p)
     const from = h.timedCalls.length
@@ -7410,7 +7411,7 @@ describe('the after-clear job runs in P\'s serializer turn right after the round
     const status = h.stub.client.status.bind(h.stub.client)
     let held = true
     h.stub.client.status = async (params) => {
-      if (params.claude_instance_id === id) {
+      if (params.instance_id === id) {
         order.push('status')
         if (held) {
           held = false
@@ -7944,7 +7945,7 @@ describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared
     const status = h.stub.client.status.bind(h.stub.client)
     let held = true
     h.stub.client.status = async (params) => {
-      if (held && params.claude_instance_id === id) {
+      if (held && params.instance_id === id) {
         held = false
         reached.resolve()
         await gate.promise

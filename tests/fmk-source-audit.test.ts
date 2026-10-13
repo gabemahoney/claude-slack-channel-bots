@@ -414,16 +414,16 @@ describe('b.jg5 SRJ-716, SRJ-106, SRJ-612, SRJ-601: one source audit over every 
 /** [what is planted, the synthetic source (one line), the one rule it breaks]. */
 const PLANTED: ReadonlyArray<readonly [string, string, Rule]> = [
   // The agent-director client's delete.
-  ['client.delete', 'await client.delete({ claude_instance_id: id })', 'client-delete'],
-  ['client . delete with spacing', 'await client . delete ({ claude_instance_id: id })', 'client-delete'],
-  ['client?.delete', 'await client?.delete({ claude_instance_id: id })', 'client-delete'],
-  ['client.delete?.()', 'await client.delete?.({ claude_instance_id: id })', 'client-delete'],
-  ["client['delete']", "await client['delete']({ claude_instance_id: id })", 'client-delete'],
-  ['client?.["delete"]', 'await client?.["delete"]({ claude_instance_id: id })', 'client-delete'],
-  ['this.client.delete', 'await this.client.delete({ claude_instance_id: id })', 'client-delete'],
-  ['deps.adClient.delete', 'await deps.adClient.delete({ claude_instance_id: id })', 'client-delete'],
-  ['getClient().delete', 'await getClient().delete({ claude_instance_id: id })', 'client-delete'],
-  ['getClient() . delete with spacing', 'await getClient( ) . delete ({ claude_instance_id: id })', 'client-delete'],
+  ['client.delete', 'await client.delete({ instance_id: id })', 'client-delete'],
+  ['client . delete with spacing', 'await client . delete ({ instance_id: id })', 'client-delete'],
+  ['client?.delete', 'await client?.delete({ instance_id: id })', 'client-delete'],
+  ['client.delete?.()', 'await client.delete?.({ instance_id: id })', 'client-delete'],
+  ["client['delete']", "await client['delete']({ instance_id: id })", 'client-delete'],
+  ['client?.["delete"]', 'await client?.["delete"]({ instance_id: id })', 'client-delete'],
+  ['this.client.delete', 'await this.client.delete({ instance_id: id })', 'client-delete'],
+  ['deps.adClient.delete', 'await deps.adClient.delete({ instance_id: id })', 'client-delete'],
+  ['getClient().delete', 'await getClient().delete({ instance_id: id })', 'client-delete'],
+  ['getClient() . delete with spacing', 'await getClient( ) . delete ({ instance_id: id })', 'client-delete'],
   ['deps.delete', 'await deps.delete(id)', 'client-delete'],
   ['directorOps.delete', 'await directorOps.delete(id)', 'client-delete'],
   ['director.destroy', 'await director.destroy(id)', 'client-delete'],
@@ -432,7 +432,7 @@ const PLANTED: ReadonlyArray<readonly [string, string, Rule]> = [
     [`${name} in a string`, `log('${name} failed')`, 'delete-helper'],
   ]),
   // finished-row-option: include_finished or include-finished (SRJ-106).
-  ['include_finished in code', 'await c.kill({ claude_instance_id: id, include_finished: true })', 'finished-row-option'],
+  ['include_finished in code', 'await c.kill({ instance_id: id, include_finished: true })', 'finished-row-option'],
   ['include_finished in a string', "const key = 'include_finished'", 'finished-row-option'],
   ['include-finished in a string', 'const flag = "--include-finished"', 'finished-row-option'],
   ['include-finished in a template', 'const line = `kill --include-finished ${id}`', 'finished-row-option'],
@@ -505,7 +505,7 @@ const NEGATIVE: ReadonlyArray<readonly [string, string]> = [
   ['a Set delete', 'seen.delete(key)'],
   ['a delete on a map of clients', 'clients.delete(key)'],
   ['client.spawn(params)', 'await client.spawn(params)'],
-  ['getClient().spawn({ … })', 'await getClient().spawn({ claude_instance_id: id, cwd })'],
+  ['getClient().spawn({ … })', 'await getClient().spawn({ instance_id: id, cwd })'],
   ['a database exec', "db.exec('PRAGMA journal_mode = WAL;'); db.exec(SCHEMA_SQL)"],
   ['a regex exec', 'const m = RE.exec(line) ?? /x(\\d+)/.exec(text)'],
   ['a log line naming tmux attach -t', 'console.error(`[slack] attach with \\`tmux attach -t ${target}\\``)'],
@@ -616,10 +616,10 @@ const CLASS_NAMES: ReadonlySet<string> = new Set(CLIENT_CLASS_EXPORTS.map(([name
  * table does not list and E37's ruling keeps as they are (b.jg5 SRJ-101); the
  * version gate's three system-install comparisons; and the checked kill's
  * GONE-name log label. Every other class, at these files included, is decided
- * by `instanceof`. The A-13 rows
- * (`ErrInternal`, `ErrConfigMalformed`, the three store-open names) and CSCB's
- * `UnknownError` row in `src/ad-error-class.ts` need no entry: those names are
- * no class the client declares.
+ * by `instanceof`. The released client declares the A-13 rows too
+ * (`ErrInternal`, `ErrConfigMalformed`, the three store-open names). Only
+ * the explicitly guarded unknown-envelope helper decodes their old names;
+ * CSCB's `UnknownError` wrapper is not a declared client class.
  */
 interface SanctionedByName {
   readonly file: string
@@ -827,6 +827,17 @@ function byNameFindings(files: ReadonlyArray<readonly [string, string]>, base?: 
   for (const sf of sources) {
     const file = sf.fileName
     const add = (rule: ByNameRule, node: ts.Node, names: readonly string[]): void => {
+      // Native and base errors must dispatch by class. This helper alone decodes
+      // the unknownName field of an explicit ErrUnknownErrorName envelope.
+      let enclosing: ts.Node | undefined = node.parent
+      while (enclosing && !ts.isFunctionDeclaration(enclosing)) enclosing = enclosing.parent
+      const envelopeName = (expr: ts.Expression) => ts.isIdentifier(unwrap(expr)) && unwrap(expr).getText(sf) === 'unknownName'
+      const unknownEnvelopeRead = ts.isBinaryExpression(node)
+        ? envelopeName(node.left) || envelopeName(node.right)
+        : ts.isCallExpression(node) && node.arguments.some(envelopeName)
+      if (file === 'src/ad-error-class.ts' && enclosing && ts.isFunctionDeclaration(enclosing)
+        && enclosing.name?.text === 'classifyUnknownName' && unknownEnvelopeRead
+        && (rule === 'class-name-comparison' || rule === 'class-name-lookup')) return
       const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1
       findings.push({ file, rule, names: [...new Set(names)].sort(), at: `${line}: ${node.getText(sf).replace(/\s+/g, ' ').slice(0, 120)}` })
     }
@@ -1033,19 +1044,15 @@ const BY_NAME_ALLOWED: ReadonlyArray<readonly [string, string, string]> = [
     "return new ErrSpawnNotFound('get', 'ErrSpawnNotFound', 'spawn not found')",
   ].join('\n')],
   ['comparisons and base errors for names that are no client class', 'planted/other-names.ts', [
-    "if (err.errName === 'ErrConfigMalformed') return",
-    'if (err.unknownName === ERR_INTERNAL_NAME) return',
+    "if (err.errName === 'ErrFromALaterBinary') return",
+    "if (err.unknownName === 'ErrFromALaterBinary') return",
     'if (err.errName === ERR_SPAWN_CAP_REACHED_NAME) return capHint()',
-    "return new AgentDirectorError('decide', 'ErrInternal', 'internal error')",
+    "return new AgentDirectorError('decide', 'ErrFromALaterBinary', 'internal error')",
   ].join('\n')],
-  ["the A-13 and UnknownError rows in src/ad-error-class.ts", 'src/ad-error-class.ts', [
-    "import { ERR_INTERNAL_NAME, ERR_CONFIG_MALFORMED_NAME, STORE_OPEN_ERR_NAMES } from './agent-director-errors.ts'",
+  ['the CSCB UnknownError wrapper', 'src/ad-error-class.ts', [
     "const CSCB_UNKNOWN_ERROR_NAME = 'UnknownError'",
-    'const STORE_OPEN_NAMES: ReadonlySet<unknown> = new Set(STORE_OPEN_ERR_NAMES)',
     "const errName = readProp(value, 'errName')",
-    'if (errName === ERR_INTERNAL_NAME || errName === ERR_CONFIG_MALFORMED_NAME || STORE_OPEN_NAMES.has(errName)) return classifyUnknownName(errName, description)',
     'if (errName === CSCB_UNKNOWN_ERROR_NAME) return { errorClass: AD_ERROR_CLASS_UNAVAILABLE }',
-    'if (unknownName === ERR_INTERNAL_NAME) return internal()',
   ].join('\n')],
   ['the sanctioned ErrAmbiguousRequest comparisons in the click handler', 'src/permission-click-handler.ts', [
     "if (err instanceof AgentDirectorError && err.errName === 'ErrAmbiguousRequest') return 'ErrAmbiguousRequest'",
@@ -1459,5 +1466,27 @@ describe('b.jg5 SRJ-101, SRJ-1303: src/ad-phase1-types.ts declares no field; the
     ["a client field's own type, read through a type-only import", "import type { SpawnResult } from 'agent-director'\nexport type PreTrust = SpawnResult['pre_trust']"],
   ])('allows %s', (_label, source) => {
     expect(findings(source)).toEqual([])
+  })
+})
+
+// Keep the envelope exception bound to its typed guard and field, so a future
+// native/base errName dispatch cannot silently inherit the exception.
+describe('released client unknown-envelope classification audit', () => {
+  test('classifyUnknownName is called only behind the ErrUnknownErrorName class guard', () => {
+    const source = parseSource('src/ad-error-class.ts', readFileSync(join(SRC_DIR, 'ad-error-class.ts'), 'utf-8'))
+    const calls: ts.CallExpression[] = []
+    forEachNode(source, (node) => {
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'classifyUnknownName') calls.push(node)
+    })
+    expect(calls).toHaveLength(1)
+    let guard: ts.Node | undefined = calls[0]?.parent
+    while (guard && !ts.isIfStatement(guard)) guard = guard.parent
+    expect(guard && ts.isIfStatement(guard) ? guard.expression.getText(source) : '').toBe('isAdErrorInstance(value, ErrUnknownErrorName)')
+    expect(calls[0]!.arguments[0]!.getText(source)).toBe("readProp(value, 'unknownName')")
+  })
+
+  test.each(['err.errName', 'err.name', "err['errName']"])("the unknown helper exemption still finds a native/base %s dispatch", (field) => {
+    const code = `function classifyUnknownName(unknownName: unknown, err: AgentDirectorError) { if (${field} === 'ErrInternal') return 'CONFIG' }`
+    expect(unsanctioned(byNameFindings([['src/ad-error-class.ts', code]]))).toHaveLength(1)
   })
 })

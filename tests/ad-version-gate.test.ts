@@ -242,8 +242,8 @@ describe('PHASE1_FLOOR_VERSION', () => {
     expect(PHASE1_FLOOR_VERSION).toMatch(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/)
   })
 
-  test("is above the client's own minimum, so CSCB's check never sits below the client's", () => {
-    expect(semver.gt(PHASE1_FLOOR_VERSION, CLIENT_MIN_VERSION)).toBe(true)
+  test("matches the released client minimum", () => {
+    expect(semver.eq(PHASE1_FLOOR_VERSION, CLIENT_MIN_VERSION)).toBe(true)
   })
 })
 
@@ -328,8 +328,8 @@ describe('agent-director-versions helper', () => {
     expect(rc!.build).toEqual([])
   })
 
-  test('OLD_AD_VERSION is at or above the client minimum: the client admits it, only CSCB refuses it', () => {
-    expect(semver.gte(OLD_AD_VERSION, CLIENT_MIN_VERSION)).toBe(true)
+  test('OLD_AD_VERSION is below the released client minimum: both gates refuse it', () => {
+    expect(semver.lt(OLD_AD_VERSION, CLIENT_MIN_VERSION)).toBe(true)
     expect(meetsPhase1Floor(OLD_AD_VERSION)).toBe(false)
   })
 
@@ -1992,7 +1992,7 @@ describe('host-version decision: fixtures built from the helper versions', () =>
 
 describe('host-version decision: passes (SRJ-211)', () => {
   test.each([
-    ["the floor's release candidate", PHASE1_RC_VERSION],
+    ["the client's minimum", CLIENT_MIN_VERSION],
     ['the floor', PHASE1_FLOOR_VERSION],
     ['a later minor release built from the floor', LATER_MINOR],
     ['a later major release built from the floor', LATER_MAJOR],
@@ -2006,9 +2006,7 @@ describe('host-version decision: passes (SRJ-211)', () => {
   })
 
   test.each([
-    ['the release before Phase 1', OLD_AD_VERSION],
     ["the client's dev sentinel (ranked above every version by the client)", DEV_PLACEHOLDER_VERSION],
-    ["the client's minimum itself", CLIENT_MIN_VERSION],
   ])('%s (%s): pass below the floor (the Phase 1 note), carrying the version and path', (label, version) => {
     const path = hostBinaryPath(`pass-below-${label}`)
     expect(decideHostAdVersion(resolvedWith(version, path), CLIENT_MIN_VERSION)).toEqual({
@@ -2022,6 +2020,8 @@ describe('host-version decision: passes (SRJ-211)', () => {
 describe("host-version decision: below the client's minimum fails (SRJ-211)", () => {
   test.each([
     ['a resolved release below the minimum', BELOW_CLIENT_MIN_VERSION],
+    ['the previous supported release', OLD_AD_VERSION],
+    ["the floor's release candidate", PHASE1_RC_VERSION],
     ["the minimum's release candidate (below it in the client's order)", CLIENT_MIN_RC],
   ])('%s (%s): fails below the client minimum, carrying found, required and path', (label, version) => {
     const path = hostBinaryPath(`below-min-${label}`)
@@ -2236,7 +2236,7 @@ describe('host-version decision: install errors are recognised by name', () => {
 describe('host-version decision: every outcome is token-free', () => {
   test.each([
     ['a resolved pass with a token-bearing path', resolvedWith(PHASE1_RC_VERSION, `${hostBinaryPath('token-pass')}/${sentinelInMessage('pass')}`), CLIENT_MIN_VERSION],
-    ['a resolved pass below the floor with a token-bearing path', resolvedWith(OLD_AD_VERSION, `${hostBinaryPath('token-below')}/${sentinelInMessage('below')}`), CLIENT_MIN_VERSION],
+    ['a resolved older CLI refusal with a token-bearing path', resolvedWith(OLD_AD_VERSION, `${hostBinaryPath('token-below')}/${sentinelInMessage('below')}`), CLIENT_MIN_VERSION],
     ['a resolved token-bearing unparseable version', resolvedWith(sentinelInMessage('version'), hostBinaryPath('token-version')), CLIENT_MIN_VERSION],
     ['a token-bearing client minimum', resolvedWith(PHASE1_RC_VERSION, hostBinaryPath('token-min')), sentinelInMessage('minimum')],
     ['ErrSystemInstallTooOld with a token-bearing path', rejectedWith(errSystemInstallTooOld(BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION, `${hostBinaryPath('token-too-old')}/${sentinelInMessage('too-old')}`)), CLIENT_MIN_VERSION],
@@ -2381,7 +2381,6 @@ describe('buildPhase1HostNote', () => {
   }
 
   test.each([
-    ['the release before Phase 1', OLD_AD_VERSION],
     ["the client's dev sentinel", DEV_PLACEHOLDER_VERSION],
   ])('for %s (%s): names the found version, the path, the floor, the Phase 1 phrase and the runbook section title; no upgrade instruction, no package.json, no command and no link', (label, version) => {
     const { note, path } = noteFor(version, label)

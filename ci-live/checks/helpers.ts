@@ -179,7 +179,7 @@ export async function toolCalls(ctx: InContainer, letter: PersonaLetter, tool: s
 }
 
 export interface PromptPost {
-  claude_instance_id: string
+  instance_id: string
   channel: string
   ok: boolean
   error: unknown
@@ -198,7 +198,7 @@ export interface PromptPost {
  * command text (the prompt guard reads the same projection).
  */
 export const PROMPT_POST_JQ =
-  '{claude_instance_id, channel, ok, error, slack_ts, request_token, ts, command: (([.blocks[]? | select(.type? == "section") | .text.text? // empty] | first) // .text)}'
+  '{instance_id, channel, ok, error, slack_ts, request_token, ts, command: (([.blocks[]? | select(.type? == "section") | .text.text? // empty] | first) // .text)}'
 
 /** Parse jq's compact output lines, skipping any that don't parse. */
 export function jsonLines<T>(out: readonly string[]): T[] {
@@ -484,7 +484,7 @@ export async function waitPromptPost(
   const id = `cscb_${personaName(letter)}`
   return waitFor(
     async () => {
-      const posts = (await promptPosts(ctx, tm)).filter((p) => p.claude_instance_id === id && (command === undefined || commandMatches(command, p.command)))
+      const posts = (await promptPosts(ctx, tm)).filter((p) => p.instance_id === id && (command === undefined || commandMatches(command, p.command)))
       return posts.length >= nth ? posts : null
     },
     { timeoutMs, intervalMs: POLL_MS, clock: ctx.clock },

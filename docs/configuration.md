@@ -199,7 +199,7 @@ Use `--console` instead of `--claudeai` for a Console account. When neither the 
 
 - A directory that doesn't exist yet is fine when its parent exists.
 - A persona whose `claude_config_dir` can't be resolved to a real path (for example, a symlink on its path that points to nothing) is held: it closes or never opens its Slack connection and receives nothing, and `server.log` shows `persona-config-dir-unresolvable`. It reconnects once the directory resolves, with no restart.
-- A confirmed change to a persona's effective `claude_config_dir` makes it start a new conversation on the same instance at its next launch. Nothing is deleted: the old conversation stays in the old directory, kept as an earlier life of that instance.
+- A confirmed change to a persona's effective `claude_config_dir` makes it start a new conversation on the same instance at its next launch. Nothing is deleted: the old conversation stays in the old directory, with prior sessions retained in the same AD life.
 - The Slack Reply Guard never installs its hook in `~/.claude`, so a persona whose directory resolves there gets no reminder (see the debugging skill's [How the guard is installed and what it reads](../skills/debug-slack-channel-bots/SKILL.md#how-the-guard-is-installed-and-what-it-reads)).
 
 **`stop_hook_bootstrap`** turns the [Slack Reply Guard](bots.md#slack-reply-guard-stop-hook) reminder on (`true`, the default) or off for the persona. It applies to that persona alone, even when it shares its `claude_config_dir` with other personas. A running bot keeps the value it was launched with until it is relaunched. See [Personas that answer without `reply`](bots.md#personas-that-answer-without-reply--opt-them-out) for when to turn it off.

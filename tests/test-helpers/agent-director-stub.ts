@@ -1,3 +1,4 @@
+import { cannedReadPaneResult } from './ad-results.ts'
 /**
  * agent-director-stub.ts — Test helper that mints fake `agent-director`
  * `Client` instances for unit tests (SR-8.3).
@@ -142,6 +143,9 @@ import {
   ErrCwdNotFound,
   ErrInstanceIdCollision,
   ErrInvalidFlags,
+  ErrInternal,
+  ErrConfigMalformed,
+  ErrSchemaMismatch,
   ErrJsonlMissing,
   ErrJsonlNeverWritten,
   ErrNoOpenPermissionRequest,
@@ -267,9 +271,24 @@ import { makePersona } from './persona-config.ts'
 // Canned-result and canned-rejection factories
 // ---------------------------------------------------------------------------
 
+/** Relay delivery fields required by the released 0.12 client. */
+export function cannedDelivery(overrides: Partial<import('agent-director').RequestDelivery> = {}): import('agent-director').RequestDelivery {
+  return {
+    delivery: 'not_confirmed', confirm_by: '2026-05-24T12:05:00Z', hook_alive: true,
+    hook_gone_at: null, attempted_decision: null, attempted_at: null,
+    tool_use_id: null, pane_answer: 'none', pane_as: null,
+    proven_gone_at: null, proven_gone_how: null, unproven_since: null,
+    ...overrides,
+  }
+}
+
+export function cannedDecideResult(delivery: 'delivered' | 'not_confirmed' = 'delivered'): DecideResult {
+  return { ...cannedDelivery(), delivery }
+}
+
 /** Build a canned VersionResult. */
 export function cannedVersion(version: string, commit: string = 'deadbeef'): VersionResult {
-  return { version, commit }
+  return { version, commit, config_dir: "/tmp/cscb-test/.config/agent-director" }
 }
 
 /** Build a canned MakeTemplateResult. */
@@ -467,17 +486,17 @@ export function cannedStatusResult(overrides: Partial<StatusResult> = {}): Statu
  * `pre_trust` field (`ok`, `skipped`, `failed`); omit it for a result from a
  * binary older than Phase 1 (the key is then absent).
  */
-export function cannedSpawnResult(claudeInstanceId: string = 'cscb_test', preTrust?: PreTrust): StubSpawnResult {
+export function cannedSpawnResult(instanceId: string = 'cscb_test', preTrust?: PreTrust): StubSpawnResult {
   return preTrust === undefined
-    ? { claude_instance_id: claudeInstanceId }
-    : { claude_instance_id: claudeInstanceId, pre_trust: preTrust }
+    ? { instance_id: instanceId }
+    : { instance_id: instanceId, pre_trust: preTrust }
 }
 
 /** Build a canned `resume` result, with `pre_trust` as `cannedSpawnResult` takes it. */
-export function cannedResumeResult(claudeInstanceId: string = 'cscb_test', preTrust?: PreTrust): StubResumeResult {
+export function cannedResumeResult(instanceId: string = 'cscb_test', preTrust?: PreTrust): StubResumeResult {
   return preTrust === undefined
-    ? { claude_instance_id: claudeInstanceId }
-    : { claude_instance_id: claudeInstanceId, pre_trust: preTrust }
+    ? { instance_id: instanceId }
+    : { instance_id: instanceId, pre_trust: preTrust }
 }
 
 /**
@@ -598,7 +617,7 @@ export function errSendKeysWhileRelayed(): ErrSendKeysWhileRelayed {
 
 /** Build an ErrInstanceIdCollision (spawn / SR-1.4 collision path). */
 export function errInstanceIdCollision(): ErrInstanceIdCollision {
-  return new ErrInstanceIdCollision('spawn', 'ErrInstanceIdCollision', 'claude_instance_id already in use')
+  return new ErrInstanceIdCollision('spawn', 'ErrInstanceIdCollision', 'instance_id already in use')
 }
 
 /**
@@ -791,7 +810,7 @@ export const STUB_INSTANCE_ID = personaInstanceId('test_bot')
 export const STUB_TMUX_SOCKET_PATH = '/tmp/tmux-1000/default'
 
 /** The config file path `errConfigMalformed`'s description names. */
-const STUB_AD_CONFIG_PATH = '/home/agent/.agent-director/config.toml'
+const STUB_AD_CONFIG_PATH = '/home/agent/.config/agent-director/config.toml'
 
 /**
  * Build an `ErrTmuxUnresponsive` (the client's class, as
@@ -1254,7 +1273,7 @@ export function errUnknownErrorName(
 }
 
 /**
- * Build an `ErrSchemaMismatch`, which has no class in any client: an
+ * Build the released client's `ErrSchemaMismatch`: an
  * `ErrUnknownErrorName` whose `unknownName` is `ErrSchemaMismatch` and whose
  * envelope carries `description`, by default that the store could not be
  * opened. `ErrSchemaMigrationRequired` and `ErrStoreOpen` are built with
@@ -1262,17 +1281,17 @@ export function errUnknownErrorName(
  */
 export function errSchemaMismatch(
   description: string = 'the store could not be opened: its schema does not match this binary; nothing was done',
-): ErrUnknownErrorName {
-  return errUnknownErrorName(ERR_SCHEMA_MISMATCH_NAME, description)
+): ErrSchemaMismatch {
+  return new ErrSchemaMismatch('get', ERR_SCHEMA_MISMATCH_NAME, description)
 }
 
 /**
- * Build an `ErrInternal`, which has no class in any client: an
+ * Build the released client's `ErrInternal`: an
  * `ErrUnknownErrorName` whose `unknownName` is `ErrInternal` and whose
  * envelope carries `description`.
  */
-export function errInternal(description: string = 'the store could not be read'): ErrUnknownErrorName {
-  return errUnknownErrorName('ErrInternal', description)
+export function errInternal(description: string = 'the store could not be read'): ErrInternal {
+  return new ErrInternal('get', 'ErrInternal', description)
 }
 
 /**
@@ -1329,7 +1348,7 @@ export const UNUSABLE_NAME_FAULTS: readonly UnusableNameFault[] = ['empty', 'con
  * whose `unknownName` is `ErrInternal`) for `fault`; each description
  * carries "the recorded tmux session name".
  */
-export function errUnusableName(fault: UnusableNameFault = 'empty'): ErrUnknownErrorName {
+export function errUnusableName(fault: UnusableNameFault = 'empty'): ErrInternal {
   const text: Record<UnusableNameFault, string> = {
     'empty': `${UNUSABLE_RECORDED_NAME_PHRASE} is empty`,
     'control-character': `${UNUSABLE_RECORDED_NAME_PHRASE} contains a control character`,
@@ -1339,7 +1358,7 @@ export function errUnusableName(fault: UnusableNameFault = 'empty'): ErrUnknownE
 }
 
 /**
- * Build an `ErrConfigMalformed`, which has no class in any client: an
+ * Build the released client's `ErrConfigMalformed`: an
  * `ErrUnknownErrorName` whose `unknownName` is `ErrConfigMalformed` and whose
  * envelope description names a `[tmux]` key, its value and its safe minimum
  * in agent-director's form: `config <path>: refused [tmux] values: [tmux]
@@ -1353,8 +1372,8 @@ export function errConfigMalformed(
   value: string = '30',
   minimum: string = '60',
   unit: string = 's',
-): ErrUnknownErrorName {
-  return errUnknownErrorName(
+): ErrConfigMalformed {
+  return new ErrConfigMalformed('get',
     'ErrConfigMalformed',
     `config ${STUB_AD_CONFIG_PATH}: refused [tmux] values: [tmux] ${key} = ${value}, below its safe minimum ${minimum} ${unit}. A missing key, or 0, gives the default.`,
   )
@@ -1386,14 +1405,14 @@ export type CannedRowPersona = Pick<Persona, 'key' | 'working_directory' | 'clau
  */
 function personaRowDefaults(persona: CannedRowPersona, home: string): {
   cwd: string
-  claude_instance_id: string
+  instance_id: string
   tmux_session_name: string
   labels: Record<string, string>
 } {
   const configDir = personaConfigDirLabelValue(persona.claude_config_dir, home)
   return {
     cwd: persona.working_directory,
-    claude_instance_id: personaInstanceId(persona.key),
+    instance_id: personaInstanceId(persona.key),
     tmux_session_name: personaTmuxSessionName(persona.key),
     labels: { service: 'cscb', persona: persona.key, config_dir: configDir },
   }
@@ -1413,10 +1432,10 @@ export function defaultCannedRowCwd(): string {
  * The persona key a row built without a persona argument stands for: its
  * instance ID without the `cscb_` prefix (the ID itself when it lacks it).
  */
-function defaultRowPersonaKey(claudeInstanceId: string): string {
-  return claudeInstanceId.startsWith(PERSONA_INSTANCE_ID_PREFIX)
-    ? claudeInstanceId.slice(PERSONA_INSTANCE_ID_PREFIX.length)
-    : claudeInstanceId
+function defaultRowPersonaKey(instanceId: string): string {
+  return instanceId.startsWith(PERSONA_INSTANCE_ID_PREFIX)
+    ? instanceId.slice(PERSONA_INSTANCE_ID_PREFIX.length)
+    : instanceId
 }
 
 /**
@@ -1424,12 +1443,12 @@ function defaultRowPersonaKey(claudeInstanceId: string): string {
  * exactly `service=cscb` and `persona=<key>` (no `config_dir`, no `channel`),
  * tmux session `slack_bot_<key>`, and `cwd` `defaultCannedRowCwd()`.
  */
-function defaultRowFields(claudeInstanceId: string): {
+function defaultRowFields(instanceId: string): {
   cwd: string
   tmux_session_name: string
   labels: Record<string, string>
 } {
-  const key = defaultRowPersonaKey(claudeInstanceId)
+  const key = defaultRowPersonaKey(instanceId)
   return {
     cwd: defaultCannedRowCwd(),
     tmux_session_name: personaTmuxSessionName(key),
@@ -1440,12 +1459,12 @@ function defaultRowFields(claudeInstanceId: string): {
 /**
  * Build a canned ListRow with persona defaults. Override fields as needed.
  *
- * Without `persona`, `claude_instance_id` is required and the row stands for
+ * Without `persona`, `instance_id` is required and the row stands for
  * the persona whose key is that ID without its `cscb_` prefix: labels exactly
  * `service=cscb` and `persona=<key>`, tmux `slack_bot_<key>`, and `cwd`
  * `defaultCannedRowCwd()` (the default persona fixture's working directory).
  * With `persona` the defaults are what a spawn of that persona writes (see
- * `personaRowDefaults`), `claude_instance_id` defaults to `cscb_<key>`, and
+ * `personaRowDefaults`), `instance_id` defaults to `cscb_<key>`, and
  * `home` (required) is the home directory the `config_dir` label is computed
  * against. Explicit overrides always win, so a negative case can replace
  * `cwd` or `labels` (e.g. drop `persona` or `config_dir`, or carry only an
@@ -1459,7 +1478,7 @@ function defaultRowFields(claudeInstanceId: string): {
  * `undefined` (`SAMPLE_LAUNCH_START_NONE` for the launch start) is left out
  * of the row; a `null` launch start is shown as `null`.
  */
-export function cannedListRow(overrides: Partial<ListRow> & { claude_instance_id: string }): ListRow
+export function cannedListRow(overrides: Partial<ListRow> & { instance_id: string }): ListRow
 export function cannedListRow(overrides: Partial<ListRow>, persona: CannedRowPersona, home: string): ListRow
 export function cannedListRow(overrides: Partial<ListRow>, persona?: CannedRowPersona, home?: string): ListRow {
   if (persona) {
@@ -1467,6 +1486,8 @@ export function cannedListRow(overrides: Partial<ListRow>, persona?: CannedRowPe
     return omitUndefined(withDefaultLaunchStart({
       parent_id: undefined,
       state: 'waiting',
+      agent: 'claude',
+      permission_requests: [],
       relay_mode: 'on',
       started_at: '2026-05-24T12:00:00Z',
       last_seen_at: '2026-05-24T12:00:00Z',
@@ -1478,8 +1499,10 @@ export function cannedListRow(overrides: Partial<ListRow>, persona?: CannedRowPe
   return omitUndefined(withDefaultLaunchStart({
     parent_id: undefined,
     state: 'waiting',
+    agent: 'claude',
+    permission_requests: [],
     relay_mode: 'on',
-    ...defaultRowFields(overrides.claude_instance_id as string),
+    ...defaultRowFields(overrides.instance_id as string),
     started_at: '2026-05-24T12:00:00Z',
     last_seen_at: '2026-05-24T12:00:00Z',
     ended_at: null,
@@ -1497,40 +1520,31 @@ export function cannedPermissionRequest(
   overrides: Partial<PermissionRequestRow> = {},
 ): PermissionRequestRow {
   return {
+    ...cannedDelivery(),
     request_token: crypto.randomUUID(),
     request_id: 1,
     tool_name: 'Bash',
     tool_input: JSON.stringify({ command: 'ls /tmp' }),
     requested_at: '2026-05-24T12:00:00Z',
+    decision: null,
+    decision_reason: null,
     ...overrides,
   }
 }
 
-/**
- * Overrides accepted by `cannedGetResult` / `cannedGetResultPlural`. The
- * plural `permission_requests` field is not on the published agent-director
- * `GetResult`; the paired AD release replaces the legacy singular field
- * with the plural array, and CSCB consumes the new shape via a structural
- * cast inside the poller.
- */
+/** Row overrides; null/undefined projection is reserved for malformed-wire tests. */
 export type GetResultOverrides =
-  & Partial<GetResult>
-  & { claude_instance_id: string }
+  & Omit<Partial<GetResult>, 'permission_requests'>
+  & { instance_id: string }
   & { permission_requests?: PermissionRequestRow[] | null }
 
-/** `GetResultOverrides` for the persona form, where `claude_instance_id` defaults to `cscb_<key>`. */
+/** `GetResultOverrides` for the persona form, where `instance_id` defaults to `cscb_<key>`. */
 export type PersonaGetResultOverrides =
-  & Partial<GetResult>
+  & Omit<Partial<GetResult>, 'permission_requests'>
   & { permission_requests?: PermissionRequestRow[] | null }
 
-/**
- * `cannedGetResult` may carry a `permission_requests` field for check_permission
- * rows. Production code (`permission-poller.ts`,
- * `permission-click-handler.ts`) casts `GetResult` to
- * `GetResultWithPermissionRequests` at the use site, so the extra field
- * flows through without polluting the upstream type.
- */
-export type CannedGetResult = GetResult & { permission_requests?: PermissionRequestRow[] | null }
+/** The native released-client row, with deliberate malformed fixtures cast at the builder. */
+export type CannedGetResult = GetResult
 
 /**
  * Build a canned `GetResult`. Pass `permission_requests` for check_permission
@@ -1538,7 +1552,7 @@ export type CannedGetResult = GetResult & { permission_requests?: PermissionRequ
  * (poller skips when the plural field is absent), pass `null` or omit.
  *
  * The `cwd`, tmux name and label defaults match `cannedListRow`. Without
- * `persona`, `claude_instance_id` is required and the row stands for the
+ * `persona`, `instance_id` is required and the row stands for the
  * persona whose key is that ID without its `cscb_` prefix: labels exactly
  * `service=cscb` and `persona=<key>`, tmux `slack_bot_<key>`, `cwd`
  * `defaultCannedRowCwd()`. With `persona` they default to what a spawn of
@@ -1569,25 +1583,31 @@ export function cannedGetResult(
     return omitUndefined(withDefaultLaunchStart({
       parent_id: '',
       state: 'waiting',
-      claude_args: [],
+      agent: 'claude',
+      permission_requests: [],
+      unproven_requests: [],
+      agent_args: [],
       relay_mode: 'on',
       jsonl_path: '',
-      claude_session_id: '',
+      session_id: '',
       started_at: '2026-05-24T12:00:00Z',
       last_seen_at: '2026-05-24T12:00:00Z',
       ended_at: null,
       ...personaRowDefaults(persona, home),
       ...overrides,
-    }, overrides), PHASE1_ROW_FIELDS)
+    } as CannedGetResult, overrides), PHASE1_ROW_FIELDS)
   }
   return omitUndefined(withDefaultLaunchStart({
     parent_id: '',
     state: 'waiting',
-    claude_args: [],
+    agent: 'claude',
+    permission_requests: [],
+    unproven_requests: [],
+    agent_args: [],
     relay_mode: 'on',
     jsonl_path: '',
-    claude_session_id: '',
-    ...defaultRowFields((overrides as GetResultOverrides).claude_instance_id),
+    session_id: '',
+    ...defaultRowFields((overrides as GetResultOverrides).instance_id),
     started_at: '2026-05-24T12:00:00Z',
     last_seen_at: '2026-05-24T12:00:00Z',
     ended_at: null,
@@ -1622,17 +1642,17 @@ export function cannedGetResultPlural(
  * Build a canned plural projection with TWO open `permission_requests`
  * rows on the same spawn — the Epic-1 acceptance fixture for
  * "two concurrent prompts on one spawn each get their own Slack message
- * keyed on the composite (claude_instance_id, request_token)".
+ * keyed on the composite (instance_id, request_token)".
  *
- * Both rows share `claude_instance_id` and differ on `request_token`,
+ * Both rows share `instance_id` and differ on `request_token`,
  * `request_id`, and `tool_name` so the test can identify them.
  */
 export function cannedTwoRowPluralProjection(
-  claudeInstanceId: string,
-  overrides: Omit<GetResultOverrides, 'claude_instance_id' | 'permission_requests'> = {},
+  instanceId: string,
+  overrides: Omit<GetResultOverrides, 'instance_id' | 'permission_requests'> = {},
 ): CannedGetResult {
   return cannedGetResult({
-    claude_instance_id: claudeInstanceId,
+    instance_id: instanceId,
     state: 'check_permission',
     ...overrides,
     permission_requests: [
@@ -1654,6 +1674,7 @@ export function cannedGetPermissionResponse(
   overrides: Partial<GetPermissionResult> = {},
 ): GetPermissionResult {
   return {
+    ...cannedDelivery({ delivery: 'delivered' }),
     request_token: crypto.randomUUID(),
     request_id: 1,
     tool_name: 'Bash',
@@ -1928,7 +1949,7 @@ export interface StubClientOptions {
 
 /** The parameters the stub's tripwire `delete` records: the instance ids a call named. */
 export interface StubDeleteParams {
-  claude_instance_id: string[]
+  instance_id: string[]
 }
 
 /** The stub's tripwire `delete` answer: one outcome per instance id. */
@@ -2001,7 +2022,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
       opts.makeTemplateCalls?.push(params)
       if (opts.makeTemplateError) throw opts.makeTemplateError
       return (
-        opts.makeTemplateResult ?? cannedMakeTemplate(`~/.agent-director/templates/${params.name}.toml`)
+        opts.makeTemplateResult ?? cannedMakeTemplate(`~/.config/agent-director/templates/${params.name}.toml`)
       )
     },
     async spawn(params: SpawnParams): Promise<StubSpawnResult> {
@@ -2012,7 +2033,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
         if (r !== undefined) return r
       }
       return nextResponse('spawn', opts.spawnQueue, opts.spawnResult, opts.spawnError, {
-        claude_instance_id: params.claude_instance_id ?? 'cscb_test',
+        instance_id: params.instance_id ?? 'cscb_test',
       })
     },
     async status(params: StatusParams): Promise<StatusResult> {
@@ -2033,7 +2054,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
         if (r !== undefined) return r
       }
       return nextResponse('get', opts.getQueue, opts.getResult, opts.getError, cannedGetResult({
-        claude_instance_id: params.claude_instance_id,
+        instance_id: params.instance_id,
       }))
     },
     async sendKeys(params: SendKeysParams): Promise<SendKeysResult> {
@@ -2063,7 +2084,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
         // FIFO; the last remaining entry sticks (do not pop the tail).
         return seq.length === 1 ? seq[0] : seq.shift()!
       }
-      return { pane: '' }
+      return cannedReadPaneResult('')
     },
     async kill(params: KillParams): Promise<StubKillResult> {
       opts.killCalls?.push(params)
@@ -2076,7 +2097,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
     },
     async decide(params: DecideParams): Promise<DecideResult> {
       opts.decideCalls?.push(params)
-      return nextResponse('decide', opts.decideQueue, opts.decideResult, opts.decideError, {})
+      return nextResponse('decide', opts.decideQueue, opts.decideResult, opts.decideError, cannedDecideResult())
     },
     async resume(params: ResumeParams): Promise<StubResumeResult> {
       opts.callLog?.push('resume')
@@ -2087,7 +2108,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
         if (r !== undefined) return r
       }
       return nextResponse('resume', opts.resumeQueue, opts.resumeResult, opts.resumeError, {
-        claude_instance_id: params.claude_instance_id,
+        instance_id: params.instance_id,
       })
     },
     async findMissing(params: FindMissingParams): Promise<FindMissingResult> {
@@ -2109,7 +2130,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
     async delete(params: StubDeleteParams): Promise<StubDeleteResult> {
       opts.deleteCalls?.push(params)
       if (opts.deleteError) throw opts.deleteError
-      return opts.deleteResult ?? { results: Object.fromEntries(params.claude_instance_id.map((id) => [id, 'ok'])) }
+      return opts.deleteResult ?? { results: Object.fromEntries(params.instance_id.map((id) => [id, 'ok'])) }
     },
     async list(params: ListParams): Promise<ListResult> {
       opts.listCalls?.push(params)
@@ -2147,7 +2168,7 @@ export interface SpawnHold {
   held(): string[]
   /** Resolves once a spawn for `id` has been issued (at once if one already was). */
   entered(id: string): Promise<void>
-  /** Resolve the oldest held spawn for `id` with `{ claude_instance_id: id }`. */
+  /** Resolve the oldest held spawn for `id` with `{ instance_id: id }`. */
   release(id: string): void
   /** Reject the oldest held spawn for `id` with `err`. */
   fail(id: string, err: Error): void
@@ -2236,7 +2257,7 @@ export function holdSpawns(stub: StubClient, shouldHold: (id: string) => boolean
   const original = stub.spawn.bind(stub)
   stub.spawn = (params: SpawnParams): Promise<StubSpawnResult> => {
     calls.push(params)
-    const id = String(params.claude_instance_id)
+    const id = String(params.instance_id)
     entry(id).resolve()
     if (!shouldHold(id)) return original(params)
     return new Promise<StubSpawnResult>((resolve, reject) => { held.push({ id, resolve, reject }) })
@@ -2245,10 +2266,10 @@ export function holdSpawns(stub: StubClient, shouldHold: (id: string) => boolean
     calls,
     held: () => held.map((h) => h.id),
     entered: (id) => entry(id).promise,
-    release: (id) => take(id).resolve({ claude_instance_id: id }),
+    release: (id) => take(id).resolve({ instance_id: id }),
     fail: (id, err) => take(id).reject(err),
     releaseAll: () => {
-      for (const h of held.splice(0)) h.resolve({ claude_instance_id: h.id })
+      for (const h of held.splice(0)) h.resolve({ instance_id: h.id })
     },
   }
 }
@@ -2336,7 +2357,7 @@ export function installStubSpawnPath(homeDir: string): StubSpawnPath {
     calls,
     client,
     callCount: () => stubCallCount(calls),
-    spawnedIds: () => calls.spawnCalls.map((params) => String(params.claude_instance_id)),
+    spawnedIds: () => calls.spawnCalls.map((params) => String(params.instance_id)),
   }
 }
 

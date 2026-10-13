@@ -53,14 +53,14 @@ function readLines(): string[] {
 interface CallSiteEmission {
   callSite: string
   event: string
-  claudeInstanceId: string
+  instanceId: string
   requestToken: string
 }
 
 function emitForCallSite(c: CallSiteEmission): void {
   emitTrail({
     event: c.event,
-    claude_instance_id: c.claudeInstanceId,
+    instance_id: c.instanceId,
     request_token: c.requestToken,
     call_site: c.callSite,
   })
@@ -75,19 +75,19 @@ describe('permission-trail — concurrent emissions', () => {
     emitForCallSite({
       callSite: 'poller',
       event: 'cscb.chat_post.attempted',
-      claudeInstanceId: 'cscb_a_C123',
+      instanceId: 'cscb_a_C123',
       requestToken: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
     })
     emitForCallSite({
       callSite: 'click_handler',
       event: 'cscb.click_handler.invoked',
-      claudeInstanceId: 'cscb_b_C123',
+      instanceId: 'cscb_b_C123',
       requestToken: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
     })
     emitForCallSite({
       callSite: 'decide',
       event: 'cscb.decide.attempted',
-      claudeInstanceId: 'cscb_c_C123',
+      instanceId: 'cscb_c_C123',
       requestToken: 'cccccccc-cccc-cccc-cccc-cccccccccccc',
     })
 
@@ -99,19 +99,19 @@ describe('permission-trail — concurrent emissions', () => {
     emitForCallSite({
       callSite: 'poller',
       event: 'cscb.chat_post.attempted',
-      claudeInstanceId: 'cscb_a_C123',
+      instanceId: 'cscb_a_C123',
       requestToken: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
     })
     emitForCallSite({
       callSite: 'click_handler',
       event: 'cscb.click_handler.invoked',
-      claudeInstanceId: 'cscb_b_C123',
+      instanceId: 'cscb_b_C123',
       requestToken: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
     })
     emitForCallSite({
       callSite: 'decide',
       event: 'cscb.decide.attempted',
-      claudeInstanceId: 'cscb_c_C123',
+      instanceId: 'cscb_c_C123',
       requestToken: 'cccccccc-cccc-cccc-cccc-cccccccccccc',
     })
 
@@ -124,19 +124,19 @@ describe('permission-trail — concurrent emissions', () => {
     emitForCallSite({
       callSite: 'poller',
       event: 'cscb.chat_post.attempted',
-      claudeInstanceId: 'cscb_a_C123',
+      instanceId: 'cscb_a_C123',
       requestToken: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
     })
     emitForCallSite({
       callSite: 'click_handler',
       event: 'cscb.click_handler.invoked',
-      claudeInstanceId: 'cscb_b_C123',
+      instanceId: 'cscb_b_C123',
       requestToken: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
     })
     emitForCallSite({
       callSite: 'decide',
       event: 'cscb.decide.attempted',
-      claudeInstanceId: 'cscb_c_C123',
+      instanceId: 'cscb_c_C123',
       requestToken: 'cccccccc-cccc-cccc-cccc-cccccccccccc',
     })
 
@@ -162,7 +162,7 @@ describe('permission-trail — interleaved volume', () => {
       emitForCallSite({
         callSite: cs,
         event: `cscb.${cs}.tick`,
-        claudeInstanceId: `cscb_x_C${i}`,
+        instanceId: `cscb_x_C${i}`,
         requestToken: `00000000-0000-0000-0000-${String(i).padStart(12, '0')}`,
       })
     }
@@ -173,7 +173,7 @@ describe('permission-trail — interleaved volume', () => {
       const parsed = JSON.parse(line) as Record<string, unknown>
       expect(typeof parsed['call_site']).toBe('string')
       expect(typeof parsed['request_token']).toBe('string')
-      expect(typeof parsed['claude_instance_id']).toBe('string')
+      expect(typeof parsed['instance_id']).toBe('string')
     }
   })
 })

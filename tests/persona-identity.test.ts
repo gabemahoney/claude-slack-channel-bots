@@ -141,7 +141,7 @@ describe('fit constraints', () => {
     expect(actionId.length).toBeLessThanOrEqual(255)
     expect(parsePermissionActionId(actionId)).toEqual({
       decision: 'allow',
-      claudeInstanceId: instanceId,
+      instanceId: instanceId,
       requestToken,
     })
   })

@@ -51,7 +51,7 @@
 #    every hook's `command` path is an absolute path to an existing
 #    executable file whose real path is the user's agent-director install
 #    (the binary the agent-director client runs:
-#    ~/.agent-director/bin/agent-director when present, else agent-director
+#    ~/.config/agent-director/bin/agent-director when present, else agent-director
 #    on PATH), outside the customer's node_modules.
 # 4. CSCB's hooks, from <claude_config_dir>/settings.json: every hook's
 #    `command` path is an absolute path to an existing executable file.
@@ -104,8 +104,8 @@ GUARD_REAL="$(realpath -e -- "${GUARD}")"
 # discoverSystemBinary): the standard install path when it exists, else the
 # first agent-director on PATH. The stub bin dir prepended below holds only
 # `claude`, so it does not change this.
-if [[ -e "${HOME:?}/.agent-director/bin/agent-director" ]]; then
-    AD_BIN="${HOME}/.agent-director/bin/agent-director"
+if [[ -e "${HOME:?}/.config/agent-director/bin/agent-director" ]]; then
+    AD_BIN="${HOME}/.config/agent-director/bin/agent-director"
 else
     AD_BIN="$(command -v agent-director)"
 fi

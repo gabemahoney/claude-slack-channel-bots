@@ -54,12 +54,12 @@
 #      working directory, with a stub worker that reports in at once.
 #   2. [harness] The worker ends with the stub's sentinel, sent into its pane
 #      with the real tmux, and a harness `get` on 0.10.0 reads the row `ended`
-#      (or `missing`) with a claude_session_id.
+#      (or `missing`) with a session_id.
 #   3. [harness] The release's install.sh runs over 0.10.0 (the migration).
 #      Checked: the agent-director shim and the agent-director-admin shim are
 #      in place (`check_ad_shim`, `check_ad_admin_shim`), the binary behind the
 #      shim is the release's, the store has a store id (`ad_store_id`), and a
-#      harness `get` reads A's row finished with the same claude_session_id,
+#      harness `get` reads A's row finished with the same session_id,
 #      session name and labels.
 #   4. [harness] A's working directory is selected for `folder-trust`; whether
 #      the scenario HOME's `~/.claude.json` exists is recorded (the set-up
@@ -67,7 +67,7 @@
 #      to write).
 #   5. A live start: its start pass resumes A (the collision ladder's plain
 #      spawn collides with the finished row, its `get` reads it, then one
-#      `resume`). The row reads `waiting` with the same claude_session_id, and
+#      `resume`). The row reads `waiting` with the same session_id, and
 #      the approver has stopped (no bot-server pane read of A for
 #      APPROVER_QUIET_S).
 #   6. Checks, over the bot server's agent-director calls (`call_table`) and
@@ -105,7 +105,7 @@
 #   2. [harness] Both working directories are selected for `folder-trust`.
 #   3. A live start: its start pass makes a plain spawn of each (no row
 #      exists for either).
-#   4. Each row reads `waiting` with a claude_session_id, the server registers
+#   4. Each row reads `waiting` with a session_id, the server registers
 #      each stub's session, and the approver has stopped for each.
 #   5. B's checks, over the bot server's calls and the log lines from the
 #      start of step 3:
@@ -315,12 +315,12 @@ write_credentials() {
 }
 
 # poll_row_of <id> <step>: a harness `get` of row <id>. Sets ROW_STATE
-# (`absent` for ErrSpawnNotFound), ROW_SID (claude_session_id), ROW_SESSION
+# (`absent` for ErrSpawnNotFound), ROW_SID (session_id), ROW_SESSION
 # (tmux_session_name) and ROW_LABELS (labels, compact JSON), each empty when
 # absent.
 poll_row_of() {
     local id="$1" fields
-    ad_capture get --claude-instance-id "${id}"
+    ad_capture get --instance-id "${id}"
     if (( AD_RC != 0 )); then
         if grep -qF ErrSpawnNotFound "${AD_OUT}" "${AD_ERR}"; then
             ROW_STATE=absent ROW_SID="" ROW_SESSION="" ROW_LABELS=""
@@ -328,7 +328,7 @@ poll_row_of() {
         fi
         fail "$2: the harness get of ${id} exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
     fi
-    fields="$(jq -r '[.state // "", .claude_session_id // "", .tmux_session_name // "", (.labels // {} | tojson)] | join("\u001f")' "${AD_OUT}")" \
+    fields="$(jq -r '[.state // "", .session_id // "", .tmux_session_name // "", (.labels // {} | tojson)] | join("\u001f")' "${AD_OUT}")" \
         || fail "$2: the harness get of ${id} printed no row object: $(head -c 300 "${AD_OUT}")"
     IFS=$'\x1f' read -r ROW_STATE ROW_SID ROW_SESSION ROW_LABELS <<< "${fields}"
 }
@@ -368,7 +368,7 @@ end_worker() {
 # call_table <file>: write <file>, one TAB-separated line per agent-director
 # shim `call` line whose parent is a CSCB process (`cscb_ad_calls`), in log
 # order: its time, its PPID (the CSCB process), its verb, the row id its
-# `--claude-instance-id` names (`-` when none) and its arguments joined by
+# `--instance-id` names (`-` when none) and its arguments joined by
 # single spaces.
 call_table() {
     local out="$1" line time id i
@@ -381,8 +381,8 @@ call_table() {
         id=-
         for (( i = 0; i < ${#_L_ARGS[@]}; i++ )); do
             case "${_L_ARGS[i]}" in
-                --claude-instance-id) id="${_L_ARGS[i + 1]:--}" ;;
-                --claude-instance-id=*) id="${_L_ARGS[i]#*=}" ;;
+                --instance-id) id="${_L_ARGS[i + 1]:--}" ;;
+                --instance-id=*) id="${_L_ARGS[i]#*=}" ;;
             esac
         done
         printf '%s\t%s\t%s\t%s\t%s\n' "${time}" "${_L_PPID}" "${_L_VERB}" "${id}" "${_L_ARGS[*]}" >> "${out}"
@@ -438,7 +438,7 @@ calls_by_verb() {
 # is <verb> (`cscb_ad_calls`).
 server_calls_of() {
     local lines=()
-    mapfile -t lines < <(cscb_ad_calls "$2" "--claude-instance-id $1")
+    mapfile -t lines < <(cscb_ad_calls "$2" "--instance-id $1")
     (( ${#lines[@]} > 0 )) || return 0
     printf '%s\n' "${lines[@]}" | awk -F'\t' -v p="${SERVER_PID}" '$4 == p'
 }
@@ -532,13 +532,13 @@ expect_one_pre_trust_line() {
     (( n == 1 )) || fail "${step}: ${n} server.log line(s) equal to '${want}', not one (the pre_trust line is: ${lines[0]#*$'\t'})"
 }
 
-# wait_live <step> <id>: the row reads `waiting` with a claude_session_id
+# wait_live <step> <id>: the row reads `waiting` with a session_id
 # (LIVE_SID) within REPORT_WAIT_S, and the approver has stopped reading its
 # pane.
 wait_live() {
     wait_until "${REPORT_WAIT_S}" "$1: row $2 never reported in (waiting)" row_of_reads "$2" "$1" waiting
     LIVE_SID="${ROW_SID}"
-    [[ -n "${LIVE_SID}" ]] || fail "$1: the live row $2 has no claude_session_id"
+    [[ -n "${LIVE_SID}" ]] || fail "$1: the live row $2 has no session_id"
     wait_until "${APPROVER_STOP_WAIT_S}" "$1: the bot server still reads the pane of $2 ${APPROVER_STOP_WAIT_S}s after it reported in" \
         approver_quiet_of "$2"
 }
@@ -623,24 +623,24 @@ leg_migrated_row() {
     # Step 2 [harness]: the worker ends on 0.10.0; the row keeps its session id.
     end_worker "${A_ID}" "${step}: the 0.10.0 worker"
     sid="${ROW_SID}"
-    [[ -n "${sid}" ]] || fail "${step}: the ${ROW_STATE} 0.10.0 row has no claude_session_id"
-    echo "${TEST_NAME}: ${step}: on 0.10.0 the row reads ${ROW_STATE} with claude_session_id ${sid}"
+    [[ -n "${sid}" ]] || fail "${step}: the ${ROW_STATE} 0.10.0 row has no session_id"
+    echo "${TEST_NAME}: ${step}: on 0.10.0 the row reads ${ROW_STATE} with session_id ${sid}"
 
     # Step 3 [harness]: the release's install over 0.10.0 (the migration), and the shim checks.
     install_ad_release "${step}: the release's install over 0.10.0"
     check_ad_shim "${step}: the agent-director shim after the install"
     check_ad_admin_shim "${step}: the agent-director-admin shim after the install"
-    cmp -s -- "${HOME}/.agent-director/bin/agent-director.real" "${SCENARIO_RELEASE_BIN}" \
+    cmp -s -- "${HOME}/.config/agent-director/bin/agent-director.real" "${SCENARIO_RELEASE_BIN}" \
         || fail "${step}: the binary behind the shim is not the release's ${SCENARIO_RELEASE_BIN}"
     out="$(ad_store_id)"
     echo "${TEST_NAME}: ${step}: the migrated store's id ${out}"
     poll_row_of "${A_ID}" "${step}: the migrated row"
     [[ "${ROW_STATE}" == ended || "${ROW_STATE}" == missing ]] || fail "${step}: the migrated row reads ${ROW_STATE}, not ended or missing"
-    [[ "${ROW_SID}" == "${sid}" ]] || fail "${step}: the migrated row's claude_session_id is '${ROW_SID}', not ${sid}"
+    [[ "${ROW_SID}" == "${sid}" ]] || fail "${step}: the migrated row's session_id is '${ROW_SID}', not ${sid}"
     [[ "${ROW_SESSION}" == "${A_SESSION}" ]] || fail "${step}: the migrated row's session name is '${ROW_SESSION}', not ${A_SESSION}"
     jq -e --argjson want "${labels_json}" '. == $want' <<< "${ROW_LABELS}" > /dev/null \
         || fail "${step}: the migrated row's labels are ${ROW_LABELS}, not ${labels_json}"
-    echo "${TEST_NAME}: ${step}: after the release's install the row reads ${ROW_STATE}, claude_session_id ${ROW_SID}, labels ${ROW_LABELS}"
+    echo "${TEST_NAME}: ${step}: after the release's install the row reads ${ROW_STATE}, session_id ${ROW_SID}, labels ${ROW_LABELS}"
 
     # Step 4 [harness]: the folder-trust mode in A's directory.
     stub_mode "${work}" "${STUB_MODE_FOLDER_TRUST}"
@@ -658,8 +658,8 @@ leg_migrated_row() {
     srv="${SERVER_PID}"
     wait_for_log "$(completion_match 1)" "${START_WAIT_S}" "${step}: the start pass never completed"
     wait_live "${step}: the resume" "${A_ID}"
-    [[ "${LIVE_SID}" == "${sid}" ]] || fail "${step}: the resumed row's claude_session_id is '${LIVE_SID}', not the kept ${sid}"
-    echo "${TEST_NAME}: ${step}: the resumed row reads waiting with claude_session_id ${LIVE_SID}"
+    [[ "${LIVE_SID}" == "${sid}" ]] || fail "${step}: the resumed row's session_id is '${LIVE_SID}', not the kept ${sid}"
+    echo "${TEST_NAME}: ${step}: the resumed row reads waiting with session_id ${LIVE_SID}"
 
     # Step 6: the checks.
     call_table "${table}"
@@ -765,7 +765,7 @@ legs_new_personas() {
         log_fragment_seen "${log0}" "[slack] Session connected: persona ${B_REF}"
     wait_until "${CONNECT_WAIT_S}" "${step}: the server never registered C's session" \
         log_fragment_seen "${log0}" "[slack] Session connected: persona ${C_REF}"
-    echo "${TEST_NAME}: ${step}: B reads waiting (claude_session_id ${b_sid}), C reads waiting (claude_session_id ${c_sid})"
+    echo "${TEST_NAME}: ${step}: B reads waiting (session_id ${b_sid}), C reads waiting (session_id ${c_sid})"
 
     call_table "${table}"
     echo "${TEST_NAME}: ${step}: the start pass's summary (recorded): $(log_hits "${log0}" "$(completion_match 2)" | tail -n 1 | cut -f3)"

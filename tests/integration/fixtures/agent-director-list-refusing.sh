@@ -11,7 +11,7 @@
 # `get` and `read-pane` and the teardown's `status`, `pause` and `kill` still
 # answer. The scenario places this file behind the agent-director shim with
 # `swap_ad_binary <path of this file>` (lib/scenario.sh), which copies it to
-# $HOME/.agent-director/bin/agent-director.real and runs the shim check, and
+# $HOME/.config/agent-director/bin/agent-director.real and runs the shim check, and
 # puts the release back with `swap_ad_binary release`, which runs the shim
 # check again. The shim logs every call before it execs this file, so a
 # refused `list` is in the shim's log like any other call.

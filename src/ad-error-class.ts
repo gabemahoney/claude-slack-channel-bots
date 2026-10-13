@@ -37,18 +37,12 @@
  * declares, and a value is of that row when it is an instance of the class
  * (`instanceof`, through {@link isAdErrorInstance}), never by its `errName`
  * or `name`. The classes are the client's own, re-exported by
- * `src/agent-director-errors.ts`. An `ErrUnknownErrorName`
- * instance is then decided by its `unknownName` and the envelope's
- * `err_description`: `ErrInternal`, `ErrConfigMalformed` and the three
- * store-open names, which no client declares as a class, are matched exactly
- * (a differently cased name is any other name), and every other
- * `unknownName`, a Phase-1-only name included, is UNAVAILABLE. An instance of
- * a class the table names takes that class's row whatever its `errName`. Any
- * other value whose own `errName` is one of those five names is classified
- * the same way as that `unknownName`, its description taken from
- * `errDescription` (Assumption A-13), and CSCB's own `UnknownError` wrapper,
- * likewise not an instance of a class the table names, is recognised by its
- * `errName`.
+ * `src/agent-director-errors.ts`, including the native 0.12 internal,
+ * configuration and store errors. An explicit `ErrUnknownErrorName` keeps
+ * forward-compatible handling of the five legacy names through its
+ * `unknownName` and envelope description; any other unknown name is
+ * UNAVAILABLE. Base errors merely named like those classes are UNCLASSIFIED.
+ * CSCB's own `UnknownError` wrapper is recognised by its `errName`.
  *
  * An UNCLASSIFIED, UNUSABLE_NAME or CONFIG classification carries the
  * reported name (`unknownName` for an `ErrUnknownErrorName`, else `errName`)
@@ -143,6 +137,11 @@ import {
   AgentDirectorError,
   ERR_INTERNAL_NAME,
   ERR_TMUX_UNRESPONSIVE_NAME,
+  ErrInternal,
+  ErrConfigMalformed,
+  ErrSchemaMismatch,
+  ErrSchemaMigrationRequired,
+  ErrStoreOpen,
   ErrCallTimeout,
   ErrCwdNotADirectory,
   ErrCwdNotFound,
@@ -356,7 +355,7 @@ export function goneErrNameOf(value: unknown): AdGoneErrName | undefined {
   return index === -1 ? undefined : AD_GONE_ERR_NAMES[index]
 }
 
-/** `unknownName` of a malformed agent-director config (no class in any client). */
+/** Legacy unknown-name envelope label for a malformed agent-director config. */
 const ERR_CONFIG_MALFORMED_NAME = 'ErrConfigMalformed'
 
 /** `unknownName`s of a store agent-director cannot open (A-32; Q-15): UNCLASSIFIED. */
@@ -375,10 +374,9 @@ const ERR_INVALID_FLAGS_NAME = 'ErrInvalidFlags'
  * The class of each agent-director error class the table names directly,
  * tested by `instanceof` in this order. {@link classifyAdError} decides an
  * `ErrUnknownErrorName` before this table, and an instance of a class here by
- * this table, whatever its `errName`; only a value that is neither is then
- * decided by an `errName` of `ErrInternal`, `ErrConfigMalformed`, a store-open
- * name or CSCB's `UnknownError`, and any other agent-director error is
- * UNCLASSIFIED.
+ * this table, whatever its `errName`. Native internal, configuration and store
+ * classes have reported descriptions in the branches below. Every other
+ * agent-director error is UNCLASSIFIED, except CSCB's `UnknownError` wrapper.
  */
 const CLASS_BY_ERROR_CLASS: ReadonlyArray<readonly [AdErrorConstructor, AdErrorClass]> = [
   ...AD_GONE_ERROR_CLASSES.map((errorClass) => [errorClass, AD_ERROR_CLASS_GONE] as const),
@@ -437,8 +435,19 @@ export function classifyAdError(value: unknown): AdErrorClassification {
       if (isAdErrorInstance(value, errorClass)) return { errorClass: adErrorClass }
     }
     const errName = readProp(value, 'errName')
-    if (errName === ERR_INTERNAL_NAME || errName === ERR_CONFIG_MALFORMED_NAME || STORE_OPEN_NAMES.has(errName)) {
-      return classifyUnknownName(errName, readProp(value, 'errDescription'))
+    if (isAdErrorInstance(value, ErrInternal)) {
+      const description = readProp(value, 'errDescription')
+      return reported(
+        typeof description === 'string' && description.includes(UNUSABLE_RECORDED_NAME_PHRASE)
+          ? AD_ERROR_CLASS_UNUSABLE_NAME : AD_ERROR_CLASS_UNCLASSIFIED,
+        errName, description,
+      )
+    }
+    if (isAdErrorInstance(value, ErrConfigMalformed)) {
+      return reported(AD_ERROR_CLASS_CONFIG, errName, readProp(value, 'errDescription'))
+    }
+    if ([ErrSchemaMismatch, ErrSchemaMigrationRequired, ErrStoreOpen].some((errorClass) => isAdErrorInstance(value, errorClass))) {
+      return reported(AD_ERROR_CLASS_UNCLASSIFIED, errName, readProp(value, 'errDescription'))
     }
     if (errName === CSCB_UNKNOWN_ERROR_NAME) return { errorClass: AD_ERROR_CLASS_UNAVAILABLE }
     return reported(AD_ERROR_CLASS_UNCLASSIFIED, errName, readProp(value, 'errDescription'))
@@ -683,7 +692,7 @@ export function unclassifiedClassificationOf(value: unknown): AdErrorClassificat
   }
 }
 
-/** The class of an `ErrUnknownErrorName` (or an A-13 value) by `unknownName` and description. */
+/** The class of an `ErrUnknownErrorName` (legacy envelope compatibility) by `unknownName` and description. */
 function classifyUnknownName(unknownName: unknown, description: unknown): AdErrorClassification {
   if (unknownName === ERR_INTERNAL_NAME) {
     const unusable = typeof description === 'string' && description.includes(UNUSABLE_RECORDED_NAME_PHRASE)

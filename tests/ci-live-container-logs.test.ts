@@ -7,7 +7,7 @@
  *   startup-errors.log, cron.log and permission-trail.jsonl from the state
  *   dir the helpers call `$S`, the boot start's `~/cscb-live/boot-start.log`,
  *   and agent-director's errors.log and ad-trail.jsonl from the test user's
- *   `~/.agent-director/`, where the package, the entrypoint and
+ *   `~/.config/agent-director/`, where the package, the entrypoint and
  *   agent-director write them;
  * - a file is read with one `docker exec` of a fixed script, its path and the
  *   cap as arguments; at most its last 20 MiB are read, and a copy keeps only
@@ -362,7 +362,7 @@ describe('the files copied', () => {
     expect(new Set(names).size).toBe(names.length)
   })
 
-  test("the state dir is the helpers' $S under the test user's home, boot-start.log is where the entrypoint's boot start logs, and agent-director's dir is that home's ~/.agent-director, the store CSCB pins", () => {
+  test("the state dir is the helpers' $S under the test user's home, boot-start.log is where the entrypoint's boot start logs, and agent-director's dir is that home's ~/.config/agent-director, the store CSCB pins", () => {
     const helpers = readFileSync(join(REPO, 'docker', 'live', 'cscb-live-helpers.sh'), 'utf-8')
     expect(helpers).toContain('\nS=~/.config/claude-slack-channel-bots\n')
     expect(CONTAINER_STATE_DIR).toBe(`${CONTAINER_HOME}/.config/claude-slack-channel-bots`)
@@ -370,7 +370,7 @@ describe('the files copied', () => {
     const entrypoint = readFileSync(join(REPO, 'docker', 'live', 'entrypoint.sh'), 'utf-8')
     expect(entrypoint).toContain('claude-slack-channel-bots start >> "$HOME/cscb-live/boot-start.log" 2>&1')
     expect(CONTAINER_CSCB_LIVE_DIR).toBe(`${CONTAINER_HOME}/cscb-live`)
-    expect(CONTAINER_AGENT_DIRECTOR_DIR).toBe(`${CONTAINER_HOME}/.agent-director`)
+    expect(CONTAINER_AGENT_DIRECTOR_DIR).toBe(`${CONTAINER_HOME}/.config/agent-director`)
     expect(DEFAULT_STORE_PATH.replace(/^~\//, `${CONTAINER_HOME}/`)).toBe(`${CONTAINER_AGENT_DIRECTOR_DIR}/state.db`)
   })
 

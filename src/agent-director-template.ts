@@ -18,7 +18,7 @@
  * after a confirmed configuration change whose set of effective config
  * directories changed (the reload apply runs it only then, from the change
  * plan's `configDirsChanged`). Only the memory-read `allow` rules follow the
- * new persona set; every other field, the server-wide `claude_args`
+ * new persona set; every other field, the server-wide `agent_args`
  * included, is what the boot install wrote (they take effect at the next
  * start). A rejection is logged in one line and is not fatal, and nothing
  * retries it: the rules stay as last installed until the next refresh or
@@ -127,7 +127,7 @@ export function deriveMemoryReadAllowRules(personaConfig: PersonaConfig, home: s
  * Build the `MakeTemplateParams` for the slack-channel-bot template per
  * SR-3.1. Exported for direct testing.
  *
- * Always includes `--dangerously-load-development-channels` in `claude_args`:
+ * Always includes `--dangerously-load-development-channels` in `agent_args`:
  * the template is a per-installation artifact owned by agent-director; CSCB's
  * dry-run mode is a CSCB-side testing concern that does not propagate to AD.
  * (Session-manager spawn-time logic that omits this flag in dry-run is its
@@ -148,7 +148,7 @@ export function buildTemplateParams(
 ): MakeTemplateParams {
   const d = mergeDeps(deps)
 
-  const claude_args: string[] = [
+  const agent_args: string[] = [
     '--dangerously-load-development-channels',
     'server:slack-channel-router',
     '--mcp-config',
@@ -162,7 +162,7 @@ export function buildTemplateParams(
     const filePath = personaConfig.append_system_prompt_file
     try {
       d.accessSync(filePath, fs.constants.R_OK)
-      claude_args.push('--append-system-prompt-file', filePath)
+      agent_args.push('--append-system-prompt-file', filePath)
     } catch {
       d.stderrWrite(
         `[slack] template: append_system_prompt_file not readable, omitting flag: ${filePath}`,
@@ -174,7 +174,7 @@ export function buildTemplateParams(
   // resumed or restarted bot reloads the current system prompt file and
   // CLAUDE.md. Only a `fresh_system_prompt` of exactly `false` leaves it out.
   if (personaConfig.fresh_system_prompt !== false) {
-    claude_args.push('--system-prompt-snapshot', 'off')
+    agent_args.push('--system-prompt-snapshot', 'off')
   }
 
   return {
@@ -217,7 +217,8 @@ export function buildTemplateParams(
     // is therefore scoped to the `projects/*/memory/**` subdirectory — which
     // holds innocuous markdown notes — and NEVER the config-dir root.
     allow: deriveMemoryReadAllowRules(personaConfig),
-    claude_args,
+    agent: 'claude',
+    agent_args,
     overwrite: true,
     // `extra_env` is omitted: no installation-wide env-var source in today's
     // config schema. Per-persona CLAUDE_CONFIG_DIR and CSCB_CRONTABLE_PATH,
@@ -236,7 +237,7 @@ export function buildTemplateParams(
 export interface InstalledTemplate extends MakeTemplateResult {
   /**
    * The params the boot install passed to `makeTemplate`: its server-wide
-   * arguments (`claude_args`, with or without the append-system-prompt flag
+   * arguments (`agent_args`, with or without the append-system-prompt flag
    * as the boot probe decided) are what every apply-time refresh keeps.
    */
   params: MakeTemplateParams
@@ -332,7 +333,7 @@ export type TemplateRefreshResult =
  * rules derived afresh from `applied`'s personas (`deriveMemoryReadAllowRules`,
  * the boot install's derivation, so the rule shape and its per-project
  * memory scope are the same, never a config-dir root). Every other field is
- * `installed`'s: `claude_args` keeps the start-time MCP config and
+ * `installed`'s: `agent_args` keeps the start-time MCP config and
  * system-prompt flags (the append file is not probed again), and `name`,
  * `label`, `deny` and `relay_mode` are unchanged. `applied`'s server-wide
  * values are not read. Always overwrites. The caller decides when to refresh

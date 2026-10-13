@@ -380,7 +380,7 @@ export class PromptGuard implements CheckPromptGuard {
     const text = typeof post.command === 'string' ? post.command : ''
     let p = this.prompts.get(token)
     if (!p) {
-      const instanceId = typeof post.claude_instance_id === 'string' ? post.claude_instance_id : ''
+      const instanceId = typeof post.instance_id === 'string' ? post.instance_id : ''
       const persona = personaOfInstance(instanceId)
       const posted = typeof post.ts === 'string' ? Date.parse(post.ts) : NaN
       const owner = this.current === null ? null : (this.expectations.find((e) => e.persona === persona && commandMatches(e.command, text)) ?? null)
@@ -495,7 +495,7 @@ export type PromptGuardTarget = Pick<CheckContext, 'container' | 'clock' | 'ids'
 
 /** The fallback's command (run behind the plan's guard): deny the request by its instance and token. */
 export function denyScript(p: Pick<GuardedPrompt, 'instanceId' | 'token'>): string {
-  return `agent-director decide --claude-instance-id ${q(p.instanceId)} --decision deny --request-token ${q(p.token)} --reason ${q(PROMPT_GUARD_DENY_REASON)}`
+  return `agent-director decide --instance-id ${q(p.instanceId)} --decision deny --request-token ${q(p.token)} --reason ${q(PROMPT_GUARD_DENY_REASON)}`
 }
 
 /** agent-director's error name in its output, when it printed one (an identifier only). */

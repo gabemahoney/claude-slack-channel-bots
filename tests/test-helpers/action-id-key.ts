@@ -21,6 +21,6 @@ import { PERSONA_INSTANCE_ID_PREFIX } from '../../src/persona-identity.ts'
  */
 export function personaKeyFromActionId(actionId: string): string | undefined {
   const parsed = parsePermissionActionId(actionId)
-  if (parsed === null || !parsed.claudeInstanceId.startsWith(PERSONA_INSTANCE_ID_PREFIX)) return undefined
-  return parsed.claudeInstanceId.slice(PERSONA_INSTANCE_ID_PREFIX.length)
+  if (parsed === null || !parsed.instanceId.startsWith(PERSONA_INSTANCE_ID_PREFIX)) return undefined
+  return parsed.instanceId.slice(PERSONA_INSTANCE_ID_PREFIX.length)
 }

@@ -313,7 +313,7 @@ export CSCB_SLACK_API_URL
 # t18_row_state <id>: print the row's state (a harness `status`), or nothing
 # when the read fails.
 t18_row_state() {
-    ad_capture status --claude-instance-id "$1"
+    ad_capture status --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || return 0
     jq -r '.state // empty' "${AD_OUT}" 2> /dev/null || true
 }
@@ -325,7 +325,7 @@ t18_row_is() {
 # t18_row_get <id> <step>: a harness `get` of the row (AD_OUT holds it); fail
 # when it fails.
 t18_row_get() {
-    ad_capture get --claude-instance-id "$1"
+    ad_capture get --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || fail "$2: harness get of $1 exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
 }
 

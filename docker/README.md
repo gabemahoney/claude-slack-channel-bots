@@ -38,7 +38,7 @@ build is a one-time per-host cost per version tag. `/ci` builds no
 not build the base: it stops (exit 2) and asks for one `/ci` run when the base
 is missing.
 
-The images carry agent-director `0.11.0`, the release pinned in
+The images carry agent-director `0.12.0`, the release pinned in
 `docker/Dockerfile.test.base` (`AD_VERSION`, `AD_COMMIT`): its binaries from
 agent-director's GitHub release, its client from npm. Nothing of it is
 installed or run on the host. Its install script reaches only the base
@@ -67,13 +67,13 @@ Every path is readable by every user, `testuser` included, except the global cli
 
 | Path | What it is |
 |---|---|
-| `/opt/agent-director/bin/agent-director` | The release's binary (agent-director `0.11.0`, commit `AD_COMMIT`), the image's default agent-director. Its directory holds nothing else and is first on the default `PATH` (`/opt/agent-director/bin:/usr/local/sbin:/usr/local/bin:…`), so every `/ci` test (test-1 to test-12) finds it, and an fmk script (test-0, and every script whose name carries `-fmk-`) drops the directory from its `PATH` and still finds bun. `/usr/local/bin` holds no agent-director. In the live image the runner's staged binary takes this path (see [The live image's agent-director](#the-live-images-agent-director)), and `docker/live/`'s scripts put this directory first on their `PATH` |
+| `/opt/agent-director/bin/agent-director` | The release's binary (agent-director `0.12.0`, commit `AD_COMMIT`), the image's default agent-director. Its directory holds nothing else and is first on the default `PATH` (`/opt/agent-director/bin:/usr/local/sbin:/usr/local/bin:…`), so every `/ci` test (test-1 to test-12) finds it, and an fmk script (test-0, and every script whose name carries `-fmk-`) drops the directory from its `PATH` and still finds bun. `/usr/local/bin` holds no agent-director. In the live image the runner's staged binary takes this path (see [The live image's agent-director](#the-live-images-agent-director)), and `docker/live/`'s scripts put this directory first on their `PATH` |
 | `/opt/agent-director/admin/agent-director-admin` | The release's operator tool (`delete`, `kill-finished`), from the same install. It and its directory are mode 0755, so a scenario harness running as `testuser` can run it by this path; `install.sh --binary` takes it as `--admin-binary`, as the fmk harness's install does (`install_ad_release` in `tests/integration/lib/scenario.sh`). Never on `PATH`: the build fails if `command -v agent-director-admin` finds one |
-| `/opt/agent-director/install/install.sh` | The release's install script (mode 0755), from agent-director's source tree at the release tag `v0.11.0`. Off `PATH`; its directory holds nothing else |
-| `/opt/agent-director/client/agent-director-0.11.0.tgz` | The release's TypeScript client tarball, from the npm registry, checked against the pinned `AD_CLIENT_TGZ_SHA256` |
+| `/opt/agent-director/install/install.sh` | The release's install script (mode 0755), from agent-director's source tree at the release tag `v0.12.0`. Off `PATH`; its directory holds nothing else |
+| `/opt/agent-director/client/agent-director-0.12.0.tgz` | The release's TypeScript client tarball, from the npm registry, checked against the pinned `AD_CLIENT_TGZ_SHA256` |
 | `/opt/agent-director/client/release.json` | The release record: `version`, `commit`, `client_tarball` (the tarball's path above) and `client_tarball_sha256` |
 | `/opt/agent-director/check/ad-client-check.sh` | The client-under-test check (`docker/ad-client-check.sh`, mode 0755; `ci-live/lib/ad-client-check.ts` exports the path as `AD_CLIENT_CHECK`). Off `PATH`, outside the binary's directory. See [The client under test](#the-client-under-test) |
-| `/root/.bun/install/global/node_modules/agent-director` | The global agent-director client: the release's, installed with `bun add -g --ignore-scripts agent-director@0.11.0` from the npm registry at the exact version (it has no dependencies), then checked by the build with `ad-client-check.sh --client`. Root-only (`/root` is 0700): this base build and `docker/Dockerfile.live` read it, both as root; `testuser` cannot |
+| `/root/.bun/install/global/node_modules/agent-director` | The global agent-director client: the release's, installed with `bun add -g --ignore-scripts agent-director@0.12.0` from the npm registry at the exact version (it has no dependencies), then checked by the build with `ad-client-check.sh --client`. Root-only (`/root` is 0700): this base build and `docker/Dockerfile.live` read it, both as root; `testuser` cannot |
 | `/opt/agent-director-0.10.0/bin/agent-director` | agent-director 0.10.0's binary, off `PATH` |
 | `/opt/agent-director-0.10.0/agent-director-0.10.0.tgz` | The published agent-director 0.10.0 client, from npm |
 | `/opt/claude-slack-channel-bots-0.10.0/claude-slack-channel-bots-0.10.0.tgz` | The published pre-persona claude-slack-channel-bots 0.10.0 package, from npm |
@@ -84,7 +84,7 @@ It also installs `sqlite3` (the harness's store reads and edits) and `file`
 the 0.10.0 tarballs are fetched by exact version with
 `npm pack --ignore-scripts`, and nothing in the base installs them. The
 release's install leaves no store behind: `install.sh` runs with a throwaway
-`HOME`, which the build removes, so the image has no `~/.agent-director`.
+`HOME`, which the build removes, so the image has no `~/.config/agent-director`.
 
 ## The client under test
 
@@ -1201,7 +1201,7 @@ install shares nothing with them:
   memory watchdog stop still stops it (see [Memory bounds](#memory-bounds)).
 - **The HOST check.** Before the run and after it, the runner reads, and only
   reads: the host's `service=cscb` agent-director rows (from the store CSCB
-  uses, `~/.agent-director/state.db`), its `slack_bot_*` and `cscb_*` tmux
+  uses, `~/.config/agent-director/state.db`), its `slack_bot_*` and `cscb_*` tmux
   sessions (with the host's `TMUX_TMPDIR`, so it reads the production bots'
   tmux server), the PID listening on host port 3100 (from `/proc`, nothing
   connects) and the sha256 of the host's
@@ -1386,7 +1386,7 @@ checks against it.
   fails the check stops the run (exit 2) with the reason, and the runner
   never falls back to a binary of the host's. With no
   `--agent-director-binary`, the runner stages the host's own binary,
-  `~/.agent-director/bin/agent-director`, else the first one on `PATH`;
+  `~/.config/agent-director/bin/agent-director`, else the first one on `PATH`;
   unless that binary is the release's, the build refuses it (step 5,
   below). The runner copies the binary into a fresh temporary
   directory under the OS temp directory (`cscb-ci-live-ad-<RUN_ID>-…`) that
@@ -1424,11 +1424,11 @@ checks against it.
   has the build's `ERROR:` lines. No reason asks for a change on the host.
 - A run, a dry run included, stops with exit 2 when the given binary fails
   the runner's check, or when none is given and the host has none:
-  `no agent-director binary to stage in the live image: none was given with --agent-director-binary, and none was found at ~/.agent-director/bin/agent-director or on PATH; give the binary to stage with --agent-director-binary <path>, then rerun`.
+  `no agent-director binary to stage in the live image: none was given with --agent-director-binary, and none was found at ~/.config/agent-director/bin/agent-director or on PATH; give the binary to stage with --agent-director-binary <path>, then rerun`.
 
 **Claude Code.** The live image installs Claude Code at the build arg
-`CLAUDE_CODE_VERSION`, pinned at `2.1.280` in `docker/Dockerfile.live`; the
-runner passes no override. `2.1.280` is the minimum Claude Code version
+`CLAUDE_CODE_VERSION`, pinned at `2.1.296` in `docker/Dockerfile.live`; the
+runner passes no override. `2.1.296` is the minimum Claude Code version
 agent-director states, and agent-director's hooks are exec form, which Claude
 Code runs from `2.1.139`.
 

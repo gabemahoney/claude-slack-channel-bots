@@ -3,7 +3,7 @@
  * injected resolver (b.jg5 SRJ-212, SRJ-121; AC 81).
  *
  * Cases, each through `runInstallCheck`:
- *   - `PHASE1_RC_VERSION` passes with no note, echoing the path and version;
+ *   - the released client minimum passes with no note, echoing the path and version;
  *   - `OLD_AD_VERSION`, `DEV_PLACEHOLDER_VERSION` and `CLIENT_MIN_VERSION`
  *     pass with the Phase 1 note (the note builder's output, naming the found
  *     version and the switch-over runbook section);
@@ -268,10 +268,10 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('runInstallCheck: a binary at the Phase 1 floor passes with no note (SRJ-212)', () => {
-  test('PHASE1_RC_VERSION: success, path and version echoed, floor is the client minimum, no note', async () => {
-    const path = binaryPath('phase1-rc')
-    const { result, calls } = await check({ version: PHASE1_RC_VERSION, path })
-    expect(result).toEqual({ ok: true, binaryPath: path, binaryVersion: PHASE1_RC_VERSION, floor: CLIENT_MIN_VERSION })
+  test('CLIENT_MIN_VERSION: success, path and version echoed, floor is the client minimum, no note', async () => {
+    const path = binaryPath('released-floor')
+    const { result, calls } = await check({ version: CLIENT_MIN_VERSION, path })
+    expect(result).toEqual({ ok: true, binaryPath: path, binaryVersion: CLIENT_MIN_VERSION, floor: CLIENT_MIN_VERSION })
     if (result.ok) expect('note' in result).toBe(false)
     expect(calls).toHaveLength(1)
   })
@@ -279,9 +279,7 @@ describe('runInstallCheck: a binary at the Phase 1 floor passes with no note (SR
 
 describe('runInstallCheck: a binary below the Phase 1 floor passes with the note (SRJ-212, AC 81)', () => {
   test.each([
-    ['OLD_AD_VERSION', OLD_AD_VERSION],
     ['DEV_PLACEHOLDER_VERSION', DEV_PLACEHOLDER_VERSION],
-    ['CLIENT_MIN_VERSION', CLIENT_MIN_VERSION],
   ])('%s (%s): success carrying the builder\'s note, naming the runbook section and the version', async (label, version) => {
     const path = binaryPath(`below-floor-${label}`)
     const { result, calls } = await check({ version, path })
@@ -303,6 +301,17 @@ describe('runInstallCheck: a binary below the Phase 1 floor passes with the note
 // ---------------------------------------------------------------------------
 
 describe('runInstallCheck: below the client minimum fails too old, naming the runbook (SRJ-212)', () => {
+  test.each([PHASE1_RC_VERSION, OLD_AD_VERSION])('a formerly admitted %s is refused by the released client floor', async (version) => {
+    const path = binaryPath('formerly-admitted')
+    const { result, calls } = await check({ version, path })
+    const failure = failureOf(result)
+    expect(failure.classLabel).toBe(AD_SYSTEM_INSTALL_TOO_OLD)
+    expect(failure.detail).toEqual({ detected: version, required: CLIENT_MIN_VERSION, binaryPath: path })
+    expect(failure.message).toBe(buildSystemInstallTooOldMessage({ foundVersion: version, requiredVersion: CLIENT_MIN_VERSION, binaryPath: path }))
+    expect(calls).toHaveLength(1)
+    assertNoLeak({ result, calls })
+  })
+
   test.each([
     ['a resolved version below the client minimum', 'resolved', { version: BELOW_CLIENT_MIN_VERSION, path: binaryPath('resolved-too-old') }],
     [

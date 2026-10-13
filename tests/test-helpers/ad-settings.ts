@@ -3,7 +3,7 @@
  * `writeAgentDirectorConfig`, the shared table of refused forms and the
  * defaults and minimums, re-exported from `src/ad-settings.ts`.
  *
- * `writeAgentDirectorConfig(home, input)` writes `.agent-director/config.toml`
+ * `writeAgentDirectorConfig(home, input)` writes `.config/agent-director/config.toml`
  * (the relative path `src/ad-settings.ts` exports) under a temp HOME. Every
  * well-formed file goes through smol-toml's serializer with
  * `numbersAsFloat: true`: a `bigint` is written as a TOML integer and a plain
@@ -25,7 +25,7 @@
  *
  * The helper refuses the real home and any directory not under the OS temp
  * directory (host safety, b.jg5 SRJ-1301): it never writes under the real
- * `~/.agent-director`. It holds no module-scope state and starts no process.
+ * `~/.config/agent-director`. It holds no module-scope state and starts no process.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -106,7 +106,7 @@ function renderAdConfig(input: AdConfigInput): string {
 
 /**
  * Write agent-director's settings file under `home` and answer its path.
- * Creates `.agent-director/`. Throws, writing nothing, when `home` is the real
+ * Creates `.config/agent-director/`. Throws, writing nothing, when `home` is the real
  * home or is not under the OS temp directory.
  */
 export function writeAgentDirectorConfig(home: string, input: AdConfigInput): string {

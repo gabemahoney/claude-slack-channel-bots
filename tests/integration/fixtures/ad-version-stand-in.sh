@@ -7,7 +7,7 @@
 # tests/integration/lib/scenario.sh installs it; never run it on a dev box.
 #
 # scenario.sh puts it behind the agent-director shim, at
-# $HOME/.agent-director/bin/agent-director.real: `install_ad_stand_in`
+# $HOME/.config/agent-director/bin/agent-director.real: `install_ad_stand_in`
 # through the swap (`swap_ad_binary`), and `restore_ad_install_with_stand_in`
 # when it brings back the shim that `hide_ad_install` moved aside. The line
 # above is its marker; both helpers check for it after the install.

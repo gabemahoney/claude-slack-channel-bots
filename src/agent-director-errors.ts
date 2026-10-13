@@ -37,12 +37,12 @@
  * dist-text check (`REQUIRED_ERR_NAMES`, `src/agent-director-startup.ts`,
  * b.jg5 SRJ-102) and for log labels only. So are the three store-open
  * `unknownName`s (`ErrSchemaMismatch`, `ErrSchemaMigrationRequired`,
- * `ErrStoreOpen`) and `ErrInternal`, which no client declares as a class and
- * the classifier matches by `unknownName`.
+ * `ErrStoreOpen`) and `ErrInternal`, whose native classes the classifier recognises; explicit legacy envelopes
+ * also retain handling through `unknownName`.
  *
  * Catalog (SR-0.2):
  *   - ErrBunVersionTooOld       (Client constructor / Bun version gate)
- *   - ErrSystemInstallNotFound  (Client.create / resolveSystemBinary — no `agent-director` on PATH or at ~/.agent-director)
+ *   - ErrSystemInstallNotFound  (Client.create / resolveSystemBinary — no `agent-director` on PATH or at ~/.config/agent-director)
  *   - ErrSystemInstallTooOld    (Client.create / resolveSystemBinary — system binary older than required minimum)
  *   - ErrSystemInstallUnreachable (Client.create / resolveSystemBinary — system binary present but not executable or fails --version)
  *   - ErrSystemInstallDisappeared (any verb / binary gone after valid construction — b.xht)
@@ -152,30 +152,18 @@ export const PHASE1_ONLY_ERR_NAMES = [
 export type Phase1OnlyErrName = (typeof PHASE1_ONLY_ERR_NAMES)[number]
 
 /**
- * `unknownName`s of the three errors agent-director's CLI answers when it
- * cannot open its store (b.jg5 SRJ-104, A-32, Q-15): a schema the binary does
- * not match or a missing or malformed store id (`ErrSchemaMismatch`), a store
- * that still needs the install script's migration
- * (`ErrSchemaMigrationRequired`), and a store it cannot open at all
- * (`ErrStoreOpen`). They are outside agent-director's error catalogue, so
- * every client, the Phase 1 client included, delivers them as
- * `ErrUnknownErrorName`; the classifier recognises them by that name and
- * answers UNCLASSIFIED. No client declares a class of these names, so they are
- * not in `PHASE1_ONLY_ERR_NAMES`, whose names the startup gate requires as
- * classes in the client.
+ * Log labels for the three store errors, whose native client classes are
+ * re-exported below. Legacy explicit `ErrUnknownErrorName` envelopes carrying
+ * these labels remain UNCLASSIFIED through the classifier.
  */
 export const ERR_SCHEMA_MISMATCH_NAME = 'ErrSchemaMismatch'
 export const ERR_SCHEMA_MIGRATION_REQUIRED_NAME = 'ErrSchemaMigrationRequired'
 export const ERR_STORE_OPEN_NAME = 'ErrStoreOpen'
 
 /**
- * `unknownName` of agent-director's internal error (b.jg5 SRJ-104). No client
- * declares a class of this name, so every client delivers it as
- * `ErrUnknownErrorName`; the classifier answers UNUSABLE NAME when its
- * description carries the unusable-name phrase and UNCLASSIFIED, reporting
- * this name, otherwise. A site that must tell "another `ErrInternal`" apart
- * from other UNCLASSIFIED answers, such as the CLI teardown's pause (SRJ-903),
- * compares the classification's reported name with this constant.
+ * Log label of agent-director's internal error. The classifier recognises its
+ * native class and preserves explicit legacy unknown-name envelopes. A site
+ * that must distinguish another internal error uses this reported label.
  */
 export const ERR_INTERNAL_NAME = 'ErrInternal'
 
@@ -196,6 +184,11 @@ export const STORE_OPEN_ERR_NAMES = [
 
 export {
   AgentDirectorError,
+  ErrInternal,
+  ErrConfigMalformed,
+  ErrSchemaMismatch,
+  ErrSchemaMigrationRequired,
+  ErrStoreOpen,
   ErrClientClosed,
   ErrBunVersionTooOld,
   ErrSystemInstallNotFound,

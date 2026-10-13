@@ -1,3 +1,4 @@
+import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 /**
  * unavailable-retry.test.ts — The per-persona UNAVAILABLE retry timer
  * (b.jg5 SRJ-301 code line, SRJ-302, SRJ-303, SRJ-304, SRJ-305, SRJ-306), and
@@ -1711,7 +1712,7 @@ describe('unavailable retry: the next retry after a launch timeout\'s one get (S
       await h.runApproverToStop(key)
 
       expect(launchesSince(h, before)).toBe(1)
-      expect(h.stub.calls.spawnCalls.at(-1)).toMatchObject({ claude_instance_id: personaInstanceId(key) })
+      expect(h.stub.calls.spawnCalls.at(-1)).toMatchObject({ instance_id: personaInstanceId(key) })
       expect(h.attempts).toEqual([expect.objectContaining({ key, retry: 1, mode: UNAVAILABLE_RETRY_MODE_FULL })])
       expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }))
       expect([getFailureCount(key), h.capReached, h.notices]).toEqual([0, [], []])
@@ -1911,7 +1912,7 @@ function approverCallMeets(verb: ApproverVerb, err: Error): RecoveryStubScript {
   if (verb === 'status') return { statusError: err }
   const pending = { statusResult: cannedStatusResult({ state: 'pending' }) }
   if (verb === 'read-pane') return { ...pending, readPaneError: err }
-  return { ...pending, readPaneResults: [{ pane: TRUST_DIALOG_NEEDLE }], sendKeysError: err }
+  return { ...pending, readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_NEEDLE)], sendKeysError: err }
 }
 
 /**
@@ -2068,7 +2069,7 @@ describe('unavailable retry: P’s dialog approver is in flight for P, blocks no
 
 /** One live pre-persona row (no `persona` label), so the start sweep kills it and then runs its findMissing sweep. */
 function prePersonaRowScript(): RecoveryStubScript {
-  return { listResult: { spawns: [cannedListRow({ claude_instance_id: 'cscb_legacy', labels: { service: 'cscb' } })] } }
+  return { listResult: { spawns: [cannedListRow({ instance_id: 'cscb_legacy', labels: { service: 'cscb' } })] } }
 }
 
 /** Persona `key`'s escalate-dead sweep, made inside a recovery attempt for it. */
@@ -2596,14 +2597,14 @@ function modelRow(h: RecoveryHarness, initial: RowState | typeof UNAVAILABLE_RET
   client.spawn = async (params) => {
     spawnedAt.push(h.clock.now())
     const result = await spawn(params)
-    live.add(String(params.claude_instance_id))
+    live.add(String(params.instance_id))
     return result
   }
   const get = client.get.bind(client)
   client.get = async (params) => {
     const result = await get(params)
-    const key = h.keys.find((k) => personaInstanceId(k) === params.claude_instance_id)
-    return key !== undefined && stateOf(String(params.claude_instance_id)) === UNAVAILABLE_RETRY_ROW_PENDING
+    const key = h.keys.find((k) => personaInstanceId(k) === params.instance_id)
+    return key !== undefined && stateOf(String(params.instance_id)) === UNAVAILABLE_RETRY_ROW_PENDING
       ? personaRow(h, key, { state: UNAVAILABLE_RETRY_ROW_PENDING })
       : result
   }
@@ -2612,7 +2613,7 @@ function modelRow(h: RecoveryHarness, initial: RowState | typeof UNAVAILABLE_RET
     statusFn: (params) => {
       const refused = refuse?.()
       if (refused !== undefined) return refused
-      const state = stateOf(String(params.claude_instance_id))
+      const state = stateOf(String(params.instance_id))
       return state === UNAVAILABLE_RETRY_ROW_ABSENT ? errSpawnNotFound() : cannedStatusResult({ state })
     },
   })
@@ -2777,7 +2778,7 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     await retryNow(h, key)
     expect(h.attempts.at(-1)).toMatchObject({ key, retry: refusals + 2, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY })
     expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
-    expect(h.stub.calls.statusCalls.at(-1)).toMatchObject({ claude_instance_id: personaInstanceId(key) })
+    expect(h.stub.calls.statusCalls.at(-1)).toMatchObject({ instance_id: personaInstanceId(key) })
     expect(row.spawnedAt).toHaveLength(refusals + 2)
     expect(h.lines).toContain(pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'))
     expect(h.controller.isArmed(key)).toBe(false)
@@ -3197,7 +3198,7 @@ describe('unavailable retry: the stop rules that exist now on the recovery harne
 
     h.setConnected(other, true)
     await retryNow(h, other)
-    expect(h.stub.calls.statusCalls.map((params) => params.claude_instance_id)).toEqual([personaInstanceId(other)])
+    expect(h.stub.calls.statusCalls.map((params) => params.instance_id)).toEqual([personaInstanceId(other)])
     expect(h.lines).toContain(stoppedLine(other, UNAVAILABLE_RETRY_STOP_RECOVERED))
   })
 
@@ -3308,8 +3309,8 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
       const before = callCounts(h)
       await retryNow(h, key)
       expect(callsSince(h, before)).toEqual({ statusCalls: 1, getCalls: 1 })
-      expect(h.stub.calls.statusCalls.at(-1)).toEqual({ claude_instance_id: personaInstanceId(key) })
-      expect(h.stub.calls.getCalls.at(-1)).toEqual({ claude_instance_id: personaInstanceId(key) })
+      expect(h.stub.calls.statusCalls.at(-1)).toEqual({ instance_id: personaInstanceId(key) })
+      expect(h.stub.calls.getCalls.at(-1)).toEqual({ instance_id: personaInstanceId(key) })
       expect(retryLinesOf(h, key).slice(-2)).toEqual([
         pendingOnlyRetryLine(key, retry),
         reArmedLine(key, retry, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, retry, { ranPendingOnly: true }),
@@ -3517,7 +3518,7 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     await retryNow(h, key)
     expect(h.attempts.map((a) => a.mode)).toEqual([UNAVAILABLE_RETRY_MODE_FULL, UNAVAILABLE_RETRY_MODE_PENDING_ONLY])
     expect(callsSince(h, before)).toEqual({ statusCalls: 1, getCalls: 1 })
-    expect(h.stub.calls.statusCalls.at(-1)).toEqual({ claude_instance_id: personaInstanceId(key) })
+    expect(h.stub.calls.statusCalls.at(-1)).toEqual({ instance_id: personaInstanceId(key) })
     expect(h.lines).toContain(reArmedLine(key, 2, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, 2, { ranPendingOnly: true }))
     expect(h.controller.view(key)).toMatchObject({ dueAt: h.clock.now() + waitMs(2), refusals: 2, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
   })
@@ -3627,7 +3628,7 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     await h.advance(waitMs(refusalsToCeiling()) * 2)
 
     expect(h.attempts.filter((a) => a.key === key)).toHaveLength(retries)
-    expect(h.stub.calls.statusCalls.filter((params) => params.claude_instance_id === personaInstanceId(key))).toEqual([])
+    expect(h.stub.calls.statusCalls.filter((params) => params.instance_id === personaInstanceId(key))).toEqual([])
     expect(retryLinesOf(h, key).at(-1)).toBe(pendingOnlyStoppedLine(key, reason))
     expect(h.controller.isArmed(key)).toBe(false)
 
@@ -3643,7 +3644,7 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     // its one timer the only one pending.
     expect(otherRetries).toBeGreaterThan(0)
     expect(callCounts(h)).toEqual({ statusCalls: otherRetries, getCalls: otherRetries })
-    expect(new Set(h.stub.calls.statusCalls.map((params) => params.claude_instance_id))).toEqual(new Set([personaInstanceId(other)]))
+    expect(new Set(h.stub.calls.statusCalls.map((params) => params.instance_id))).toEqual(new Set([personaInstanceId(other)]))
     expect(h.controller.view(other)).toMatchObject({ phase: 'waiting', refusals: otherRetries, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
     expect(h.clock.pending().map((t) => t.dueAt)).toEqual([h.controller.view(other)!.dueAt!])
   })
@@ -4171,7 +4172,7 @@ async function refuseLaunch(h: RecoveryHarness, key: string, readsPending = fals
   h.script({ spawnError: undefined })
   // The refused spawn and its one get, of P's own row, and nothing else.
   expect(callsSince(h, before)).toEqual({ spawnCalls: 1, getCalls: 1 })
-  expect(h.stub.calls.getCalls.at(-1)).toMatchObject({ claude_instance_id: personaInstanceId(key) })
+  expect(h.stub.calls.getCalls.at(-1)).toMatchObject({ instance_id: personaInstanceId(key) })
   expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBe(refusedAt)
   expect(h.controller.view(key)).toMatchObject({
     phase: 'waiting',
@@ -4210,7 +4211,7 @@ const PENDING_ONLY_ARM: ConditionArm = async (h, key) => {
 /** A plain tmux-touching success for persona `key`, outside every attempt: one `read-pane` through the outage wrapper. */
 function readPaneSucceeds(h: RecoveryHarness, key: string): Promise<unknown> {
   return withOutageDetection(key, personaOf(h, key).working_directory, 'read-pane', (client) =>
-    client.readPane({ claude_instance_id: personaInstanceId(key), n_lines: 1 }))
+    client.readPane({ instance_id: personaInstanceId(key), n_lines: 1 }))
 }
 
 describe('unavailable retry: the tmux-unresponsive condition’s ends and the retry timer (SRJ-305, SRJ-306, SRJ-310)', () => {
@@ -5829,7 +5830,7 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
     h.script({ readPaneError: err })
     expect(isInsideAttempt(key)).toBe(false)
     await expect(
-      withOutageDetection(key, cwd, 'read-pane', (client) => client.readPane({ claude_instance_id: personaInstanceId(key), n_lines: 1 })),
+      withOutageDetection(key, cwd, 'read-pane', (client) => client.readPane({ instance_id: personaInstanceId(key), n_lines: 1 })),
     ).rejects.toBe(err)
     expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT)
     const before = callCounts(h)
@@ -7351,7 +7352,7 @@ function noSessionIdReuse(h: RecoveryHarness, key: string, make: () => Error): N
     return result
   }
   h.script({
-    getResult: cannedGetResult({ state: 'ended', claude_session_id: '' }, personaOf(h, key), h.home),
+    getResult: cannedGetResult({ state: 'ended', session_id: '' }, personaOf(h, key), h.home),
     resumeError: errNoSessionId(),
     statusFn: () => cannedStatusResult({ state: up ? 'waiting' : 'ended' }),
   })
@@ -7896,10 +7897,10 @@ describe('unavailable retry: a latch stops the timer and ends the unclassified-e
 /** From now on persona `key`'s `status` and `get` read its own row `pending` with `launchStartedAt` (the key left out for `undefined`), in its own directory with its labels; every other persona has no row. */
 function pendingRowFor(h: RecoveryHarness, key: string, launchStartedAt: string | null | undefined): void {
   h.script({
-    statusFn: (params) => params.claude_instance_id === personaInstanceId(key)
+    statusFn: (params) => params.instance_id === personaInstanceId(key)
       ? cannedStatusResult({ state: UNAVAILABLE_RETRY_ROW_PENDING, launch_started_at: launchStartedAt })
       : errSpawnNotFound(),
-    getFn: (params) => params.claude_instance_id === personaInstanceId(key)
+    getFn: (params) => params.instance_id === personaInstanceId(key)
       ? personaRow(h, key, { state: UNAVAILABLE_RETRY_ROW_PENDING, launch_started_at: launchStartedAt })
       : errSpawnNotFound(),
   })
@@ -7943,7 +7944,7 @@ describe('unavailable retry: a retry whose row read finds P’s own pending row 
     await retryNow(h, key)
 
     expect(callCounts(h)).toEqual({ statusCalls: 1 })
-    expect(h.stub.calls.statusCalls).toEqual([{ claude_instance_id: personaInstanceId(key) }])
+    expect(h.stub.calls.statusCalls).toEqual([{ instance_id: personaInstanceId(key) }])
     expectRetryStoppedByLaunchStartLatch(h, key)
     expectNeverDestructive(h, key)
     expect(retryLinesOf(h, key)).toEqual([
@@ -7977,7 +7978,7 @@ describe('unavailable retry: a retry whose row read finds P’s own pending row 
 
     expect(h.attempts.map((a) => [a.key, a.mode])).toEqual([[key, UNAVAILABLE_RETRY_MODE_FULL]])
     expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
-    expect(h.stub.calls.statusCalls.at(-1)).toEqual({ claude_instance_id: personaInstanceId(key) })
+    expect(h.stub.calls.statusCalls.at(-1)).toEqual({ instance_id: personaInstanceId(key) })
     expectRetryStoppedByLaunchStartLatch(h, key)
     // The launch's UNAVAILABLE spawn started the tmux-unresponsive condition; the latch's hold ended it.
     expect(conditionLines(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_LATCHED))
@@ -8525,7 +8526,7 @@ describe('unavailable retry: a message lost in not answering with P’s tmux-una
 const LIVE_STATE = cannedStatusResult().state
 
 /** Persona `key`'s own row read `ended` with a session id: step 6 resumes it when the request keeps P's conversation. */
-const ENDED_WITH_SESSION = { state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' } as const
+const ENDED_WITH_SESSION = { state: LIVENESS_DEAD_ROW_ENDED, session_id: 'a-session-id' } as const
 
 /** A failed step-6 launch's setup: the request and an undo. */
 interface FailedLaunchSetup {
@@ -8871,7 +8872,7 @@ describe('unavailable retry: SRJ-316\'s C21 half — no abort of CSCB\'s own stu
     expect(h.outageNotices).toEqual([configOnset(key, err), configAllClear(key)])
     expect(getOutageFlags(key).size).toBe(0)
     expect(h.episodeNotices).toEqual([{ key, text: stuckLaunchRelaunchingText(key, adLaunchBoundMsInEffect()) }])
-    expect(h.stub.calls.killCalls).toEqual([{ claude_instance_id: personaInstanceId(key) }])
+    expect(h.stub.calls.killCalls).toEqual([{ instance_id: personaInstanceId(key) }])
     expect(h.stuckLaunchAbortUsed(key)).toBe(true)
     // The abort's sequence launched P again (a reuse: the row has no session id), with no delete and nothing counted.
     expect([launches(), h.reuseSpawns().length, h.stub.calls.deleteCalls, getFailureCount(key)]).toEqual([2, 1, [], 0])
@@ -9037,13 +9038,13 @@ describe('unavailable retry: the collision ladder\'s second reuse collision, its
     const id = personaInstanceId(key)
     h.script({
       statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }),
-      statusFn: (params) => (params.claude_instance_id === id && h.stub.calls.resumeCalls.length > 1 ? cannedStatusResult({ state: 'waiting' }) : undefined),
+      statusFn: (params) => (params.instance_id === id && h.stub.calls.resumeCalls.length > 1 ? cannedStatusResult({ state: 'waiting' }) : undefined),
       spawnQueue: [cannedErr(errInstanceIdCollision())],
     })
     await retryNow(h, key)
 
     expect(h.attempts).toEqual([expect.objectContaining({ key, retry: 1, mode: UNAVAILABLE_RETRY_MODE_FULL, causes: [UNAVAILABLE_RETRY_CAUSE_LOST_RACE] })])
-    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(key) }, { claude_instance_id: personaInstanceId(key) }])
+    expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: personaInstanceId(key) }, { instance_id: personaInstanceId(key) }])
     // The resume's own pending-only arm (b.jg5 SRJ-301, SRJ-409) follows the lost race's.
     expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_LOST_RACE }, { key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
     // P was launched: its timer now waits on the launch's pending row (pending-only mode).
@@ -9460,7 +9461,7 @@ describe('unavailable retry: a retired key\'s retries launch by the reuse, never
     const [key] = h.keys as [string]
     h.retireKey(key)
     modelRow(h, 'ended')
-    h.script({ spawnError: errTmuxUnresponsive('spawn'), getResult: personaRow(h, key, { state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' }) })
+    h.script({ spawnError: errTmuxUnresponsive('spawn'), getResult: personaRow(h, key, { state: LIVENESS_DEAD_ROW_ENDED, session_id: 'a-session-id' }) })
 
     const answer = await launch(h, key)
     expect(answer).toEqual(typeof expected === 'object' ? { key, ...expected } : expected)
@@ -9553,7 +9554,7 @@ const WAIT_ROW_ID = PRE_PERSONA_ID
 /** Hold the pre-persona row in `q`'s working directory, start its wait and resolve once its first run is held; answers the outcome and the hold. */
 async function waitHeldForQ(h: RecoveryHarness, q: string): Promise<{ readonly outcome: Promise<unknown>; readonly hold: FindMissingHold }> {
   holdOldAt(h, WAIT_ROW_ID, WAIT_ROW_ID, q)
-  h.script({ getResult: cannedGetResult({ claude_instance_id: WAIT_ROW_ID, cwd: personaOf(h, q).working_directory }) })
+  h.script({ getResult: cannedGetResult({ instance_id: WAIT_ROW_ID, cwd: personaOf(h, q).working_directory }) })
   const hold = holdFindMissing(h.stub.client)
   const outcome = h.startOldLifeWait(WAIT_ROW_ID)
   await h.driveSequence(hold.entered(1))
@@ -9642,7 +9643,7 @@ describe('unavailable retry: an old-life wait step for a hold Q waits on blocks 
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [q] = h.keys as [string]
     holdOldAt(h, WAIT_ROW_ID, WAIT_ROW_ID, q)
-    h.script({ killError: errTmuxUnresponsive('kill'), getResult: cannedGetResult({ claude_instance_id: WAIT_ROW_ID, cwd: personaOf(h, q).working_directory }) })
+    h.script({ killError: errTmuxUnresponsive('kill'), getResult: cannedGetResult({ instance_id: WAIT_ROW_ID, cwd: personaOf(h, q).working_directory }) })
     await h.runOldLifeWait(WAIT_ROW_ID)
     expect(h.triggers).toEqual([{ key: q, kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD }])
     h.script({ killError: undefined })
@@ -9668,7 +9669,7 @@ describe('unavailable retry: an old-life wait step for a hold Q waits on blocks 
     const bId = personaInstanceId(b)
     h.remove(b)
     h.beginOldLifeHold({ instanceId: bId, oldKey: b, directory: personaOf(h, b).working_directory, cause: OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1 })
-    h.script({ getResult: cannedGetResult({ claude_instance_id: bId, cwd: personaOf(h, b).working_directory }) })
+    h.script({ getResult: cannedGetResult({ instance_id: bId, cwd: personaOf(h, b).working_directory }) })
     const hold = holdFindMissing(h.stub.client)
     const outcome = h.startOldLifeWait(bId)
     await h.driveSequence(hold.entered(1))
@@ -9714,7 +9715,7 @@ describe('unavailable retry: a launch held back by an old-life hold arms the tim
     await pastSampleGrace(h)
     const dir = personaOf(h, q).working_directory
     h.beginOldLifeHold({ instanceId: WAIT_ROW_ID, oldKey: WAIT_ROW_ID, directory: dir, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
-    h.script({ getResult: cannedGetResult({ claude_instance_id: WAIT_ROW_ID, cwd: dir, state: AGENT_DIRECTOR_PENDING_STATE }) })
+    h.script({ getResult: cannedGetResult({ instance_id: WAIT_ROW_ID, cwd: dir, state: AGENT_DIRECTOR_PENDING_STATE }) })
     rowReadsUntilSpawn(h, UNAVAILABLE_RETRY_ROW_ABSENT)
   }
 
@@ -9754,7 +9755,7 @@ describe('unavailable retry: a launch held back by an old-life hold arms the tim
 
     expect(h.holdEndRetries).toEqual([{ key: q, at: endedAt, result: UNAVAILABLE_RETRY_RUN_NOW_RAN }])
     expect(h.attempts.at(-1)).toMatchObject({ key: q, retry: fires + 1, at: endedAt })
-    expect(h.stub.calls.spawnCalls.map((params) => params.claude_instance_id)).toEqual([personaInstanceId(q)])
+    expect(h.stub.calls.spawnCalls.map((params) => params.instance_id)).toEqual([personaInstanceId(q)])
     await h.runApproverToStop(q)
     // Q is up: its next retry reads its row live with its session connected, and the timer stops.
     h.setConnected(q, true)

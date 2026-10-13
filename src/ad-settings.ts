@@ -18,9 +18,8 @@
  * holds one as a fixed value.
  *
  * agent-director offers no interface that reports its effective timing
- * values, so CSCB reads `~/.agent-director/config.toml` itself, under the
- * server process's HOME (`process.env.HOME` at read time, else
- * `os.homedir()`, the source the client uses for its store path).
+ * values, so CSCB reads `~/.config/agent-director/config.toml` itself, under the
+ * server process's absolute, nonempty `process.env.HOME` at read time.
  * The file is parsed only with `smol-toml`, integers as `BigInt`, so a TOML
  * integer is told apart from a float such as `60.0` or `6e1`; CSCB never
  * parses TOML by hand. Every value is kept as the `bigint` read, with no
@@ -118,8 +117,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 
 import { parse, TomlError } from 'smol-toml'
 
@@ -495,9 +493,11 @@ export interface AdSettingsReader {
   valuesInEffect(): AdSettingsInEffect
 }
 
-/** The server's HOME at read time, as the client finds it: `process.env.HOME`, else `os.homedir()` when it is unset. */
+/** The server's HOME at read time, as the client finds it: an absolute, nonempty `process.env.HOME`. */
 export function productionAdSettingsHome(): string {
-  return process.env.HOME ?? homedir()
+  const home = process.env.HOME
+  if (!home || !isAbsolute(home)) throw new Error('agent-director requires an absolute HOME')
+  return home
 }
 
 /** Build a reader over injected dependencies. Reads nothing until `read()`. */
@@ -510,7 +510,9 @@ export function createAdSettingsReader(deps: AdSettingsReaderDeps): AdSettingsRe
   function readOnce(): { path: string | undefined; outcome: AdSettingsReadOutcome } {
     let path: string
     try {
-      path = join(deps.home(), AD_SETTINGS_RELATIVE_PATH)
+      const home = deps.home()
+      if (!home || !isAbsolute(home)) throw new Error('agent-director requires an absolute HOME')
+      path = join(home, AD_SETTINGS_RELATIVE_PATH)
     } catch {
       return { path: undefined, outcome: { kind: 'refused', reason: 'the home directory cannot be found' } }
     }

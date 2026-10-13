@@ -33,7 +33,7 @@ exception is `hgx`, which takes a value only as an argument (see
   `CSCB_AD_SRC_DIR` set: see `docker/README.md`), Google Chrome
   (`google-chrome --version`), bun, and `CSCB_AD_SRC_DIR` set to a checkout
   of agent-director's source tree holding the tag of the release the base
-  pins (`ARG AD_VERSION` in `docker/Dockerfile.test.base`, `v0.11.0`). A run
+  pins (`ARG AD_VERSION` in `docker/Dockerfile.test.base`, `v0.12.0`). A run
   takes its agent-director binary explicitly: the release's
   `agent-director-linux-amd64`, downloaded from agent-director's GitHub
   release into a scratch directory and checked against the base's pinned
@@ -271,7 +271,7 @@ curl -fsSL -o "$AD_BIN" "https://github.com/$AD_REPO/releases/download/v$AD_VERS
 
 The last line prints the path only when the SHA-256 matches. The file only
 gets its execute bit, which the runner requires: never run it, and never
-copy it into `~/.agent-director`, `~/.local/bin`, `node_modules` or anything
+copy it into `~/.config/agent-director`, `~/.local/bin`, `node_modules` or anything
 on `PATH`. Remove `$AD_BIN_DIR` after your last run.
 
 ### The dry run

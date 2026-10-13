@@ -1,3 +1,4 @@
+import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
 /**
  * relay-repro.test.ts — Epic 3 SR-8.4 capstone acceptance scenario.
  *
@@ -6,9 +7,9 @@
  *   Tick N
  *     ├── list() reports 1 spawn in check_permission
  *     ├── get() returns the plural projection carrying two open rows
- *     │   (row_A = TOK_A, row_B = TOK_B) on the same claude_instance_id
+ *     │   (row_A = TOK_A, row_B = TOK_B) on the same instance_id
  *     └── poller posts TWO distinct chat.postMessage calls + records two
- *         pending-map entries keyed on (claudeInstanceId, TOK_*)
+ *         pending-map entries keyed on (instanceId, TOK_*)
  *
  *   Click row A as allow
  *     └── handlePermissionClick → decide({decision:'allow', request_token: TOK_A})
@@ -189,7 +190,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     const sharedClient = {
       list: async (): Promise<ListResult> => listResult,
       get: async () => cannedGetResultPlural({
-        claude_instance_id: INSTANCE_C,
+        instance_id: INSTANCE_C,
         state: 'check_permission',
         permission_requests: openRows.map((r) =>
           cannedPermissionRequest({
@@ -202,7 +203,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
       }),
       decide: async (params: DecideParams): Promise<DecideResult> => {
         decideCalls.push(params)
-        return {}
+        return cannedDecideResult()
       },
       getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
         getPermissionCalls.push(params)
@@ -261,7 +262,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     // Exactly one decide call so far: allow on TOK_A
     expect(decideCalls).toHaveLength(1)
     expect(decideCalls[0]).toEqual({
-      claude_instance_id: INSTANCE_C,
+      instance_id: INSTANCE_C,
       decision: 'allow',
       request_token: TOK_A,
     } as DecideParams & { request_token: string })
@@ -284,7 +285,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     // Two decide calls now: allow(TOK_A) followed by deny(TOK_B)
     expect(decideCalls).toHaveLength(2)
     expect(decideCalls[1]).toEqual({
-      claude_instance_id: INSTANCE_C,
+      instance_id: INSTANCE_C,
       decision: 'deny',
       request_token: TOK_B,
     } as DecideParams & { request_token: string })

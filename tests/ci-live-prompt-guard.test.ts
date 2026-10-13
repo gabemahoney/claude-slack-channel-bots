@@ -113,7 +113,7 @@ function fakeTrail(clock: Clock) {
       lines.push({
         kind: 'post',
         post: {
-          claude_instance_id: instance,
+          instance_id: instance,
           channel: o.channel ?? DRY_RUN_IDS.aHome,
           ok: o.ok ?? true,
           error: null,
@@ -600,11 +600,11 @@ describe('promptTrailScript over a fixture trail (bash and jq)', () => {
   afterEach(() => rmSync(dir, { recursive: true, force: true }))
 
   const LINES = [
-    { ts: '2026-09-26T18:46:07.653Z', event: 'cscb.poller.row_decision', claude_instance_id: 'cscb_persona_a', action: 'post_attempted', request_token: 't1' },
+    { ts: '2026-09-26T18:46:07.653Z', event: 'cscb.poller.row_decision', instance_id: 'cscb_persona_a', action: 'post_attempted', request_token: 't1' },
     {
       ts: '2026-09-26T18:46:07.700Z',
       event: 'cscb.chat_post.attempted',
-      claude_instance_id: 'cscb_persona_a',
+      instance_id: 'cscb_persona_a',
       request_token: 't1',
       channel: 'C0DRYAHOME',
       text: '🤖🛠️ permission request: Bash',
@@ -613,10 +613,10 @@ describe('promptTrailScript over a fixture trail (bash and jq)', () => {
       slack_ts: '1790447967.000100',
     },
     'not json {',
-    { ts: '2026-09-26T18:47:00.000Z', event: 'cscb.ad_decide.attempted', claude_instance_id: 'cscb_persona_b', request_token: 't2', decision: 'deny', result_class: 'ok' },
+    { ts: '2026-09-26T18:47:00.000Z', event: 'cscb.ad_decide.attempted', instance_id: 'cscb_persona_b', request_token: 't2', decision: 'deny', result_class: 'ok' },
     { ts: '2026-09-26T18:47:01.000Z', event: 'cscb.chat_update.attempted', request_token: 't3', verdict_tag: 'operator_allow' },
     { ts: '2026-09-26T18:47:02.000Z', event: 'cscb.poller.row_decision', action: 'reconciled_closed', request_token: 't4' },
-    { ts: '2026-09-26T18:47:03.000Z', event: 'cscb.chat_post.attempted', claude_instance_id: 'cscb_persona_b', request_token: 't5', text: 'permission request: Bash', ok: false, error: 'channel_not_found' },
+    { ts: '2026-09-26T18:47:03.000Z', event: 'cscb.chat_post.attempted', instance_id: 'cscb_persona_b', request_token: 't5', text: 'permission request: Bash', ok: false, error: 'channel_not_found' },
   ]
 
   function runScript(from: number, trail: string | null): { out: string[]; code: number } {
@@ -638,7 +638,7 @@ describe('promptTrailScript over a fixture trail (bash and jq)', () => {
     expect(read.lines).toBe(LINES.length)
     expect(read.posts as unknown[]).toEqual([
       {
-        claude_instance_id: 'cscb_persona_a',
+        instance_id: 'cscb_persona_a',
         channel: 'C0DRYAHOME',
         ok: true,
         error: null,
@@ -647,7 +647,7 @@ describe('promptTrailScript over a fixture trail (bash and jq)', () => {
         ts: '2026-09-26T18:46:07.700Z',
         command: section("env | grep -i -E 'cscb|slack'"),
       },
-      { claude_instance_id: 'cscb_persona_b', channel: null, ok: false, error: 'channel_not_found', slack_ts: null, request_token: 't5', ts: '2026-09-26T18:47:03.000Z', command: 'permission request: Bash' },
+      { instance_id: 'cscb_persona_b', channel: null, ok: false, error: 'channel_not_found', slack_ts: null, request_token: 't5', ts: '2026-09-26T18:47:03.000Z', command: 'permission request: Bash' },
     ])
     expect(read.closed).toEqual(['t2', 't3', 't4'])
     expect(runScript(4, text(LINES)).out.slice(1).map((l) => JSON.parse(l))).toEqual([{ closed: 't3' }, { closed: 't4' }, { post: expect.objectContaining({ request_token: 't5' }) }])
@@ -657,7 +657,7 @@ describe('promptTrailScript over a fixture trail (bash and jq)', () => {
   const decideLine = (token: string, resultClass: string | undefined, extra: Record<string, unknown> = {}) => ({
     ts: '2026-09-26T18:48:00.000Z',
     event: 'cscb.ad_decide.attempted',
-    claude_instance_id: 'cscb_persona_a',
+    instance_id: 'cscb_persona_a',
     request_token: token,
     decision: 'deny',
     ...(resultClass === undefined ? {} : { result_class: resultClass }),
@@ -668,7 +668,7 @@ describe('promptTrailScript over a fixture trail (bash and jq)', () => {
   const clickUpdateLine = (token: string, verdictTag: string) => ({
     ts: '2026-09-26T18:48:01.000Z',
     event: 'cscb.chat_update.attempted',
-    claude_instance_id: 'cscb_persona_a',
+    instance_id: 'cscb_persona_a',
     request_token: token,
     channel: 'C0DRYAHOME',
     message_ts: '1790447967.000100',
@@ -704,7 +704,7 @@ describe('promptTrailScript over a fixture trail (bash and jq)', () => {
     const post = (token: string, slackTs: string) => ({
       ts: at(20 * SECOND),
       event: 'cscb.chat_post.attempted',
-      claude_instance_id: 'cscb_persona_a',
+      instance_id: 'cscb_persona_a',
       request_token: token,
       channel: 'C0DRYAHOME',
       text: '🤖🛠️ permission request: Bash',
@@ -768,7 +768,7 @@ describe('containerPromptGuardDeps: the container, the guard, the click as the c
 
   test("the fallback is agent-director decide … --decision deny behind the plan's guard, every value one quoted word, with the reason Claude is shown", async () => {
     expect(denyScript(PROMPT)).toBe(
-      `agent-director decide --claude-instance-id 'cscb_persona_a' --decision deny --request-token 'tok'\\''1' --reason '${PROMPT_GUARD_DENY_REASON}'`,
+      `agent-director decide --instance-id 'cscb_persona_a' --decision deny --request-token 'tok'\\''1' --reason '${PROMPT_GUARD_DENY_REASON}'`,
     )
     const ok = container(() => ({}))
     const deps = containerPromptGuardDeps({ container: ok.c, clock: virtualClock(), ids: DRY_RUN_IDS, browser: null, human: null }, io)
@@ -832,7 +832,7 @@ describe('containerPromptGuardDeps: the container, the guard, the click as the c
 
   test('with no browser (the real deps), the guard falls back to agent-director decide', async () => {
     const clock = virtualClock()
-    const c = container((script) => (script.includes('LINES') ? { stdout: `LINES 1\n${JSON.stringify({ post: { claude_instance_id: 'cscb_persona_a', channel: 'C0DRYAHOME', ok: true, slack_ts: '1700000100.000001', request_token: 'tok-1', ts: new Date(clock.now() - 60_000).toISOString(), command: section('env') } })}` } : {}))
+    const c = container((script) => (script.includes('LINES') ? { stdout: `LINES 1\n${JSON.stringify({ post: { instance_id: 'cscb_persona_a', channel: 'C0DRYAHOME', ok: true, slack_ts: '1700000100.000001', request_token: 'tok-1', ts: new Date(clock.now() - 60_000).toISOString(), command: section('env') } })}` } : {}))
     const notes: string[] = []
     const guard = new PromptGuard(containerPromptGuardDeps({ container: c.c, clock, ids: DRY_RUN_IDS, browser: null, human: null }, { ...io, note: (n) => notes.push(n) }))
     await guard.tick()
@@ -850,7 +850,7 @@ describe('containerPromptGuardDeps: the container, the guard, the click as the c
 describe("the checks' prompt waits pick the declared prompt, not a detour", () => {
   test('waitPromptPost with a command skips the persona\'s other prompts (a detour the guard denies); without one it takes them all', async () => {
     const post = (token: string, command: string) =>
-      JSON.stringify({ claude_instance_id: 'cscb_persona_b', channel: 'D0DRYDM001', ok: true, error: null, slack_ts: '1700000100.000001', request_token: token, ts: '2026-09-26T19:00:00.000Z', command: section(command) })
+      JSON.stringify({ instance_id: 'cscb_persona_b', channel: 'D0DRYDM001', ok: true, error: null, slack_ts: '1700000100.000001', request_token: token, ts: '2026-09-26T19:00:00.000Z', command: section(command) })
     const c: ContainerExec = {
       name: 'cscb-live-1700000000',
       exec: async () => ({ code: 0, stdout: '', stderr: '', timedOut: false }),

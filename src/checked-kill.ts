@@ -55,7 +55,7 @@
  * included), is UNAVAILABLE and never a kill failure.
  *
  * {@link checkedKill} makes exactly one plain `kill` call through the
- * injected call, with `claude_instance_id` alone (CSCB never sets
+ * injected call, with `instance_id` alone (CSCB never sets
  * `include_finished`, SRJ-106), and answers the outcome. It never throws and
  * never retries. Every server site calls it with no options: GONE is the
  * `session-gone` success there.
@@ -432,7 +432,7 @@ export function killOutcomeStopsServer(value: unknown): boolean {
 
 /** A kill call's parameters: the instance id alone, so the kill is plain (no `include_finished`, SRJ-106). */
 export interface PlainKillParams {
-  readonly claude_instance_id: string
+  readonly instance_id: string
 }
 
 /** An injected kill call: one agent-director `kill` with `params`. */
@@ -440,7 +440,7 @@ export type KillCall = (params: PlainKillParams) => Promise<unknown>
 
 /**
  * One checked kill of `instanceId` (SRJ-110, SRJ-701): exactly one call of
- * `kill` with `{ claude_instance_id: instanceId }` and nothing else, and its
+ * `kill` with `{ instance_id: instanceId }` and nothing else, and its
  * outcome (`killOutcomeOf`, under `options`). A call that throws,
  * synchronously or by rejecting, gives the outcome of what it threw. Never
  * throws or rejects, and never retries.
@@ -450,7 +450,7 @@ export function checkedKill(instanceId: string, kill: KillCall, options: Checked
 export async function checkedKill(instanceId: string, kill: KillCall, options?: CheckedKillOptions): Promise<AnyKillOutcome> {
   let result: unknown
   try {
-    result = await kill({ claude_instance_id: instanceId })
+    result = await kill({ instance_id: instanceId })
   } catch (thrown) {
     return killOutcomeOf({ thrown }, options ?? {})
   }

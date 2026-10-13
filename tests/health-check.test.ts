@@ -1880,7 +1880,7 @@ describe('b.jg5 SRJ-316: a CONFIG answer at the health tick', () => {
     const config = makeMultiPersonaConfig([{ name: P }, { name: B }], baseDir)
     let pCalls = 0
     setClientForTests(makeStubClient({
-      statusFn: ({ claude_instance_id }) => claude_instance_id === personaInstanceId(P)
+      statusFn: ({ instance_id }) => instance_id === personaInstanceId(P)
         ? pAnswers[Math.min(pCalls++, pAnswers.length - 1)]!
         : DEAD_ROW,
     }) as unknown as Client)
@@ -3143,9 +3143,9 @@ describe('b.jg5 SRJ-512, SRJ-513: a tick whose own liveness read latches P', () 
     const config = makeMultiPersonaConfig([{ name: P }, { name: B }], baseDir)
     const statusCalls: string[] = []
     setClientForTests(makeStubClient({
-      statusFn: ({ claude_instance_id }) => {
-        statusCalls.push(String(claude_instance_id))
-        return claude_instance_id === personaInstanceId(P) ? pAnswer : DEAD_ROW
+      statusFn: ({ instance_id }) => {
+        statusCalls.push(String(instance_id))
+        return instance_id === personaInstanceId(P) ? pAnswer : DEAD_ROW
       },
     }) as unknown as Client)
     const adapter = _buildIsSessionAliveAdapter(() => config)

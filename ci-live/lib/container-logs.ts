@@ -10,7 +10,7 @@
  *   config.json: the runner's config sets none) and `permission-trail.jsonl`;
  * - `~/cscb-live/boot-start.log`: the output of the server the entrypoint
  *   starts at boot (Check 28's reboot);
- * - agent-director's `~/.agent-director/errors.log` and `ad-trail.jsonl`.
+ * - agent-director's `~/.config/agent-director/errors.log` and `ad-trail.jsonl`.
  *
  * And what tells a tool call still waiting on an unanswered permission
  * prompt apart from one that ran and never finished, for each persona A–D
@@ -130,8 +130,8 @@ export const CONTAINER_LOGS_WAIT_MS = 60_000
 /** The same on a memory watchdog stop, which must not hang (Chrome is closing meanwhile): a short wait. */
 export const CONTAINER_LOGS_URGENT_WAIT_MS = 15_000
 
-/** agent-director's directory in the container (the test user's `~/.agent-director`). */
-export const CONTAINER_AGENT_DIRECTOR_DIR = `${CONTAINER_HOME}/.agent-director`
+/** agent-director's directory in the container (the test user's `~/.config/agent-director`). */
+export const CONTAINER_AGENT_DIRECTOR_DIR = `${CONTAINER_HOME}/.config/agent-director`
 
 /** The runner's work dir in the container (the test user's `~/cscb-live`), where the boot start logs. */
 export const CONTAINER_CSCB_LIVE_DIR = `${CONTAINER_HOME}/cscb-live`

@@ -400,9 +400,9 @@ describe('precheck failure lines (b.jg5 SRJ-901)', () => {
     expect(agentDirectorInitFailedLine(CLI_COMMAND_CLEAN_RESTART, 'd')).toBe('[slack] clean_restart: agent-director initialization failed: d')
   })
 
-  test('the tries, their spacing and the config file\'s display name are SRJ-901\'s (pinned once): 3 tries 2 s apart, ~/.agent-director/config.toml, built from the settings path', () => {
+  test('the tries, their spacing and the config file\'s display name are SRJ-901\'s (pinned once): 3 tries 2 s apart, ~/.config/agent-director/config.toml, built from the settings path', () => {
     expect([PRECHECK_TRIES, PRECHECK_TRY_SPACING_MS]).toEqual([3, 2_000])
-    expect(AD_CONFIG_FILE_DISPLAY_NAME).toBe('~/.agent-director/config.toml')
+    expect(AD_CONFIG_FILE_DISPLAY_NAME).toBe('~/.config/agent-director/config.toml')
     expect(AD_CONFIG_FILE_DISPLAY_NAME).toBe(join('~', AD_SETTINGS_RELATIVE_PATH))
   })
 

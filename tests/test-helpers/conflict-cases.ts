@@ -1586,7 +1586,7 @@ export interface FinishedRowRetryEntry {
   readonly name: string
   /** What the one `get` gave. */
   readonly reading: LatchRecheckReading
-  /** Whether the row read has a session id (`claude_session_id`). */
+  /** Whether the row read has a session id (`session_id`). */
   readonly hasSessionId: boolean
   /** The launch (`decideFinishedRowLaunch`'s answer): a `resume`, a reuse, the plain first spawn, or none. */
   readonly call: LatchRecheckCall
@@ -2445,7 +2445,7 @@ interface LaunchStartRowOverrides {
   readonly liveness_note?: GetResult['liveness_note']
   readonly cwd?: string
   readonly labels?: Record<string, string>
-  readonly claude_instance_id?: string
+  readonly instance_id?: string
 }
 
 /** What a row is built from for persona P: the persona the persona-form builder takes, and the overrides. */
@@ -2482,7 +2482,7 @@ function buildLaunchStartRead<S extends LaunchStartReadShape>(
  * `status` step gives it (`applyOwnRowStatusStep`).
  */
 function launchStartReadRow(shape: LaunchStartReadShape, read: LaunchStartReadResults[LaunchStartReadShape], rowId: string): RowReadRow {
-  return shape === 'status' ? { ...read, claude_instance_id: rowId } : (read as RowReadRow)
+  return shape === 'status' ? { ...read, instance_id: rowId } : (read as RowReadRow)
 }
 
 /** The labels a spawn of `persona` writes, read off the stub's persona-form row. */
@@ -2520,7 +2520,7 @@ function launchStartColumns<S extends LaunchStartReadShape>(
   const build = (persona: CannedRowPersona, home: string) => buildLaunchStartRead(shape, specOf(persona, home), home)
   const readRow = (persona: CannedRowPersona, home: string): RowReadRow => {
     const spec = specOf(persona, home)
-    return launchStartReadRow(shape, buildLaunchStartRead(shape, spec, home), spec.overrides.claude_instance_id ?? personaInstanceId(spec.rowPersona.key))
+    return launchStartReadRow(shape, buildLaunchStartRead(shape, spec, home), spec.overrides.instance_id ?? personaInstanceId(spec.rowPersona.key))
   }
   return {
     name,
@@ -2787,7 +2787,7 @@ function nonLatchingRowsFor<S extends LaunchStartReadShape>(shape: S): LaunchSta
     nonLatchingRow(shape, 'absent persona', '', AGENT_DIRECTOR_PENDING_STATE, noLaunchStart,
       (persona) => ({ rowPersona: absentPersona(persona), overrides: pendingNone }), () => LAUNCH_START_ABSENT_PERSONA_KEY, false),
     nonLatchingRow(shape, 'another caller', '', AGENT_DIRECTOR_PENDING_STATE, noLaunchStart,
-      (persona) => ({ rowPersona: persona, overrides: { ...pendingNone, claude_instance_id: LAUNCH_START_ANOTHER_CALLERS_ID, labels: {} } }), own, true),
+      (persona) => ({ rowPersona: persona, overrides: { ...pendingNone, instance_id: LAUNCH_START_ANOTHER_CALLERS_ID, labels: {} } }), own, true),
     nonLatchingRow(shape, 'pre-persona', '', AGENT_DIRECTOR_PENDING_STATE, noLaunchStart,
       (persona, home) => {
         const { persona: _persona, config_dir: _configDir, ...labels } = personaLabels(persona, home)

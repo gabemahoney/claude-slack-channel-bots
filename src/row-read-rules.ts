@@ -118,7 +118,7 @@ export const RETIRED_ENTRY_CLEARING_STATES: ReadonlySet<RowReadState> = new Set<
  * rows only.
  */
 export interface RowReadRow {
-  readonly claude_instance_id: string
+  readonly instance_id: string
   readonly state: string
   readonly liveness_note?: string | null
   readonly launch_started_at?: string | null
@@ -189,8 +189,8 @@ export function isLatchingLivenessNote(note: unknown): boolean {
 }
 
 /** True when `row` is persona `key`'s own row: its id is exactly `cscb_<key>`. Pure. */
-export function isPersonaOwnRow(row: Pick<RowReadRow, 'claude_instance_id'>, key: string): boolean {
-  return row.claude_instance_id === personaInstanceId(key)
+export function isPersonaOwnRow(row: Pick<RowReadRow, 'instance_id'>, key: string): boolean {
+  return row.instance_id === personaInstanceId(key)
 }
 
 /**

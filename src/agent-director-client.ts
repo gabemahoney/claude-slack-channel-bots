@@ -42,7 +42,7 @@ import type {
 // ---------------------------------------------------------------------------
 
 /** Default AD store path; tilde-expanded library-side. */
-export const DEFAULT_STORE_PATH = '~/.agent-director/state.db'
+export const DEFAULT_STORE_PATH = '~/.config/agent-director/state.db'
 
 /** Name of the CSCB-shipped template (SR-3.1). */
 export const DEFAULT_TEMPLATE_NAME = 'slack-channel-bot'
@@ -138,22 +138,12 @@ export interface DecideParamsWithToken extends ADDecideParams {
   request_token: string
 }
 
-/**
- * Always-include-token decide wrapper. The `agent-director` package.json pin
- * is at `^0.6.0`+, which carries `request_token` on `DecideParams` natively.
- * The structural cast is retained because, until the lockfile is refreshed to
- * resolve the bumped pin, the imported `DecideParams` type still comes from
- * the locked `0.5.6` package — same lockfile-lag pattern as
- * `GetResultWithPermissionRequests`.
- *
- * Routing the single CSCB decide call site through this function gives the
- * codebase one definitive serializer for the decide wire shape (SR-7.2).
- */
+/** Send the required request token through the released client's native type. */
 export async function decideWithToken(
   client: Pick<Client, 'decide'>,
   params: DecideParamsWithToken,
 ): Promise<DecideResult> {
-  return client.decide(params as unknown as ADDecideParams)
+  return client.decide(params)
 }
 
 // ---------------------------------------------------------------------------

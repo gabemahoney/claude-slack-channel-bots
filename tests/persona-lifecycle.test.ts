@@ -496,7 +496,7 @@ const INSTALLED_TEMPLATE: MakeTemplateParams = {
   name: 'slack-channel-bot',
   label: ['app=cscb'],
   relay_mode: 'on',
-  claude_args: ['--dangerously-load-development-channels', 'server:slack-channel-router', '--mcp-config', '/start/mcp.json'],
+  agent_args: ['--dangerously-load-development-channels', 'server:slack-channel-router', '--mcp-config', '/start/mcp.json'],
   allow: ['Read(//start/claude/projects/*/memory/**)'],
   deny: ['Read(//start/secret/**)'],
 }
@@ -2024,7 +2024,7 @@ describe('persona teardown end to end over the recovery harness (b.jg5 SRJ-715):
 
     expect(leftFor(h, p)).toEqual(NOTHING_LEFT)
     // The row is kept: the teardown's one kill of P's row, and no delete at all.
-    expect(h.stub.calls.killCalls.slice(killsBefore)).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.killCalls.slice(killsBefore)).toEqual([{ instance_id: personaInstanceId(p) }])
     expect(h.stub.calls.deleteCalls).toEqual([])
     const ref = personaOf(h, p)
     expect(f.lines[0]).toBe(`${teardownPrefix(ref)}: starting`)
@@ -2109,7 +2109,7 @@ describe('persona teardown end to end over the recovery harness (b.jg5 SRJ-715):
     const oldId = PRE_PERSONA_ID
     const held = personaOf(h, p).working_directory
     holdOldAt(h, oldId, oldId, p)
-    h.script({ getResult: cannedGetResult({ claude_instance_id: oldId, cwd: held }) })
+    h.script({ getResult: cannedGetResult({ instance_id: oldId, cwd: held }) })
     rowReadsUntilSpawn(h, UNAVAILABLE_RETRY_ROW_ABSENT)
     const hold = holdFindMissing(h.stub.client)
     expect((await h.launch(p)).action).toBe('sequence-waiting')
@@ -2134,7 +2134,7 @@ describe('persona teardown end to end over the recovery harness (b.jg5 SRJ-715):
     if (shared) {
       expect(h.oldLifeHolds.holdOf(oldId)).toBeUndefined()
       expect(h.holdEndRetries.map((r) => r.key)).toEqual([q])
-      expect(h.stub.calls.spawnCalls.map((params) => params.claude_instance_id)).toEqual([personaInstanceId(q)])
+      expect(h.stub.calls.spawnCalls.map((params) => params.instance_id)).toEqual([personaInstanceId(q)])
       await h.runApproverToStop(q)
     } else {
       expect(h.oldLifeHolds.holdOf(oldId)?.waiting).toEqual([])
@@ -2979,9 +2979,9 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     const kill = stub.kill.bind(stub)
     const status = stub.status.bind(stub)
     const del = stub.delete.bind(stub)
-    stub.kill = (p) => { adOrder.push(`kill:${p.claude_instance_id}`); return kill(p) }
-    stub.status = (p) => { adOrder.push(`status:${p.claude_instance_id}`); return status(p) }
-    stub.delete = (p) => { adOrder.push(`delete:${p.claude_instance_id.join(',')}`); return del(p) }
+    stub.kill = (p) => { adOrder.push(`kill:${p.instance_id}`); return kill(p) }
+    stub.status = (p) => { adOrder.push(`status:${p.instance_id}`); return status(p) }
+    stub.delete = (p) => { adOrder.push(`delete:${p.instance_id.join(',')}`); return del(p) }
     setClientForTests(stub as unknown as Parameters<typeof setClientForTests>[0])
     const emissions: Array<{ key: string; text: string }> = []
     const arms: string[] = []

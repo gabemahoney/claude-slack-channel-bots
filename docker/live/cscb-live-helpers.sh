@@ -111,7 +111,7 @@ replies() {
 posts() {
   [ -e "$TRAIL" ] || return 0
   tail -n +"$(($1 + 1))" "$TRAIL" \
-    | jq -c 'select(.event == "cscb.chat_post.attempted") | {claude_instance_id, channel, ok, error}'
+    | jq -c 'select(.event == "cscb.chat_post.attempted") | {instance_id, channel, ok, error}'
 }
 
 # tmark: where the permission trail ends now (its line count; 0 when absent).
@@ -165,5 +165,5 @@ leakcount() {
 # rows: the service=cscb agent-director rows, one "<instance id> <persona label> <state>" per line.
 rows() {
   agent-director list --label service=cscb \
-    | jq -r '(.spawns // [])[] | "\(.claude_instance_id) \(.labels.persona // "-") \(.state)"'
+    | jq -r '(.spawns // [])[] | "\(.instance_id) \(.labels.persona // "-") \(.state)"'
 }

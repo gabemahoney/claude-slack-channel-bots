@@ -158,7 +158,7 @@
 #          CSCB `find-missing` between them; the round line once; the clear
 #          line, one recovery post ("a retry of the refused operation was not
 #          refused"), the row `waiting` on its first life's
-#          claude_session_id, a new MCP registration;
+#          session_id, a new MCP registration;
 #        - the held-dialog persona's rounds up to round k, as step 4 says,
 #          each answering the same CONFLICT, no post beyond the latch's;
 #        - AC 43's order and clear, as step 4 says;
@@ -725,13 +725,13 @@ write_personas_config() {
 }
 
 # read_row <step> <instance-id>: a harness `get` of the row. Sets ROW_STATE,
-# ROW_SID (claude_session_id) and ROW_SESSION (tmux_session_name), each
+# ROW_SID (session_id) and ROW_SESSION (tmux_session_name), each
 # empty when absent.
 read_row() {
     local fields
-    ad_capture get --claude-instance-id "$2"
+    ad_capture get --instance-id "$2"
     (( AD_RC == 0 )) || fail "$1: the harness get of $2 exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
-    fields="$(jq -r '[.state // "", .claude_session_id // "", .tmux_session_name // ""] | join("\u001f")' "${AD_OUT}")" \
+    fields="$(jq -r '[.state // "", .session_id // "", .tmux_session_name // ""] | join("\u001f")' "${AD_OUT}")" \
         || fail "$1: the harness get of $2 printed no row object: $(head -c 300 "${AD_OUT}")"
     IFS=$'\x1f' read -r ROW_STATE ROW_SID ROW_SESSION <<< "${fields}"
 }
@@ -776,7 +776,7 @@ store_row() {
 # store_rows_of <step> <instance-id>: print how many rows the store holds
 # with <instance-id> (the harness's read-only store read, both guards first).
 store_rows_of() {
-    _scenario_store_read "$1" "SELECT COUNT(*) FROM spawns WHERE claude_instance_id = '$2'"
+    _scenario_store_read "$1" "SELECT COUNT(*) FROM spawns WHERE instance_id = '$2'"
 }
 
 # True when the scenario's tmux server holds a session named exactly <name>
@@ -1269,7 +1269,7 @@ note_gone() {
 # and its session are among them (both exist at every call).
 p1_only() {
     local step="$1" ids id names name key ok err="${SCENARIO_ROOT}/p1-only-tmux.err"
-    ids="$(_scenario_store_read "${step}" "SELECT claude_instance_id FROM spawns")" || exit 1
+    ids="$(_scenario_store_read "${step}" "SELECT instance_id FROM spawns")" || exit 1
     grep -q -x -F -e "${PERSONA_ID[${CN_KEY}]}" <<< "${ids}" \
         || fail "${step}: positive control: the store's ids ($(tr '\n' ' ' <<< "${ids}")) do not hold the note persona's ${PERSONA_ID[${CN_KEY}]}"
     while IFS= read -r id; do
@@ -1334,7 +1334,7 @@ p1_life1() {
     wait_for_count "$(completion_match 1)" 1 "${START_WAIT_S}" "${step}: the start pass never completed"
     expect_completion 1 "${step}" "0 not brought up"
     wait_row "${step}: ${key}'s report-in" "${REPORT_WAIT_S}" "${id}" waiting
-    [[ -n "${ROW_SID}" ]] || fail "${step}: the live row ${id} has no claude_session_id"
+    [[ -n "${ROW_SID}" ]] || fail "${step}: the live row ${id} has no session_id"
     [[ "${ROW_SESSION}" == "${PERSONA_NAMED[${key}]}" ]] \
         || fail "${step}: the live row ${id} records session '${ROW_SESSION}', not ${PERSONA_NAMED[${key}]}"
     PERSONA_SID[${key}]="${ROW_SID}"
@@ -1343,7 +1343,7 @@ p1_life1() {
     sed "s/^/${TEST_NAME}: ${step}: stop said: /" "${STOP_OUT}"
     has_session "${PERSONA_NAMED[${key}]}" || fail "${step}: ${PERSONA_NAMED[${key}]} is gone after a plain stop"
     row_reads "${step}" "${id}" waiting || fail "${step}: ${id} reads '${ROW_STATE}' after a plain stop, not waiting"
-    echo "${TEST_NAME}: ${step}: ${id} reads waiting (claude_session_id ${ROW_SID}) in ${ROW_SESSION} after a plain stop"
+    echo "${TEST_NAME}: ${step}: ${id} reads waiting (session_id ${ROW_SID}) in ${ROW_SESSION} after a plain stop"
 }
 
 # p1_proc_starttime <step> <instance-id> <json>: the harness's statement on
@@ -1366,7 +1366,7 @@ p1_proc_starttime() {
     rv="$(jq -r '.[0].row_version' <<< "${before}")"
     [[ "${rv}" =~ ^[0-9]+$ ]] || fail "${step}: the row's row_version reads '${rv}'"
     old="$(jq -c '.[0].proc_starttime' <<< "${before}")"
-    out="$(ad_store_edit "UPDATE spawns SET proc_starttime = ${sql}, row_version = row_version + 1 WHERE claude_instance_id = '${id}' AND row_version = ${rv} RETURNING claude_instance_id")" \
+    out="$(ad_store_edit "UPDATE spawns SET proc_starttime = ${sql}, row_version = row_version + 1 WHERE instance_id = '${id}' AND row_version = ${rv} RETURNING instance_id")" \
         || exit 1
     [[ "${out}" == "${id}" ]] || fail "${step}: the row's row_version is no longer ${rv}: agent-director wrote it in between, and the edit wrote nothing"
     after="$(ad_store_row "${id}")" || exit 1
@@ -1865,13 +1865,13 @@ p2_life1() {
     for key in "${P2_LIFE1_KEYS[@]}"; do
         ref="$(persona_ref "${PERSONA_NAME[${key}]}")"
         wait_row "${step}: ${key}'s report-in" "${REPORT_WAIT_S}" "${PERSONA_ID[${key}]}" waiting
-        [[ -n "${ROW_SID}" ]] || fail "${step}: the live row ${PERSONA_ID[${key}]} has no claude_session_id"
+        [[ -n "${ROW_SID}" ]] || fail "${step}: the live row ${PERSONA_ID[${key}]} has no session_id"
         [[ "${ROW_SESSION}" == "${PERSONA_NAMED[${key}]}" ]] \
             || fail "${step}: the live row ${PERSONA_ID[${key}]} records session '${ROW_SESSION}', not ${PERSONA_NAMED[${key}]}"
         PERSONA_SID[${key}]="${ROW_SID}"
         wait_for_count "[slack] Session connected: persona ${ref}" 1 "${CONNECT_WAIT_S}" \
             "${step}: the server never registered the stub's session as ${key}'s"
-        echo "${TEST_NAME}: ${step}: ${PERSONA_ID[${key}]} reads waiting, claude_session_id ${ROW_SID}, session ${ROW_SESSION}"
+        echo "${TEST_NAME}: ${step}: ${PERSONA_ID[${key}]} reads waiting, session_id ${ROW_SID}, session ${ROW_SESSION}"
     done
 }
 
@@ -1925,7 +1925,7 @@ p2_human_exit() {
     wait_row "${step}" "${EXIT_WAIT_S}" "${id}" ended missing
     wait_until "${EXIT_WAIT_S}" "${step}: session ${session} is still there after the worker's exit" session_gone "${session}"
     [[ "${ROW_SID}" == "${PERSONA_SID[${key}]}" ]] \
-        || fail "${step}: ${id}'s claude_session_id is '${ROW_SID}', not ${PERSONA_SID[${key}]}"
+        || fail "${step}: ${id}'s session_id is '${ROW_SID}', not ${PERSONA_SID[${key}]}"
     LATCH_ROW_OF[${key}]="${ROW_STATE}"
     echo "${TEST_NAME}: ${step}: ${id} reads ${ROW_STATE}; ${session} is gone"
 }
@@ -2004,7 +2004,7 @@ p2_setup_relabel() {
     SEED_WID[${key}]="$("${SCENARIO_REAL_TMUX}" display-message -p -t "${SEEDED_PANE_ID}" '#{window_id}')" \
         || fail "${step}: tmux gives no window id for ${SEEDED_PANE_ID}"
     [[ "${SEED_WID[${key}]}" =~ ^@[0-9]+$ ]] || fail "${step}: tmux gave window id '${SEED_WID[${key}]}' for ${SEEDED_PANE_ID}"
-    current="$(_scenario_store_read "${step}" "SELECT COALESCE(launch_token, '') FROM spawns WHERE claude_instance_id = '${id}'")" \
+    current="$(_scenario_store_read "${step}" "SELECT COALESCE(launch_token, '') FROM spawns WHERE instance_id = '${id}'")" \
         || exit 1
     [[ "${current}" =~ ^[0-9a-f]{16}$ && "${current}" != "${SEEDED_TOKEN}" ]] \
         || fail "${step}: ${id} records launch token '${current}', not one other than the label's ${SEEDED_TOKEN}"
@@ -2249,7 +2249,7 @@ check_sweep_latch() {
     fi
     echo "${TEST_NAME}: ${step}: the start sweep's list at shim line ${pos} ($(secs_of "${LATCH_US[${key}]}")), then the latch ($(secs_of "${latch_us}")), before every call of ${id}"
     [[ "${CASE_OF[${key}]}" == "${CASE_LAUNCH_START}" ]] || return 0
-    started="$(_scenario_store_read "${step}" "SELECT COALESCE(launch_started_at, '') FROM spawns WHERE claude_instance_id = '${id}'")" \
+    started="$(_scenario_store_read "${step}" "SELECT COALESCE(launch_started_at, '') FROM spawns WHERE instance_id = '${id}'")" \
         || exit 1
     [[ -z "${started}" ]] || fail "${step}: ${id} records launch start '${started}' at its latch"
     echo "${TEST_NAME}: ${step}: ${id} records no launch start"
@@ -2593,7 +2593,7 @@ check_retry_unwritten() {
 # not refused: the clear line (reason <reason>, by default "a retry of the
 # refused operation was not refused", posted), once; the row reads `waiting`
 # on the persona's session name, a persona with a first life on that life's
-# claude_session_id (its `resume` kept the conversation); the server
+# session_id (its `resume` kept the conversation); the server
 # registers its stub's MCP session; exactly one recovery post, the printed
 # recovery notice, and no post since the latch life began but the latch's
 # notice and it.
@@ -2608,9 +2608,9 @@ check_launched() {
     fi
     expect_count "${cleared}" 1 "${step}: the clear line"
     wait_row "${step}: the launch's report-in" "${REPORT_WAIT_S}" "${id}" waiting
-    [[ -n "${ROW_SID}" ]] || fail "${step}: the launched row has no claude_session_id"
+    [[ -n "${ROW_SID}" ]] || fail "${step}: the launched row has no session_id"
     [[ -z "${PERSONA_SID[${key}]:-}" || "${ROW_SID}" == "${PERSONA_SID[${key}]}" ]] \
-        || fail "${step}: the resumed row's claude_session_id is '${ROW_SID}', not its first life's ${PERSONA_SID[${key}]}"
+        || fail "${step}: the resumed row's session_id is '${ROW_SID}', not its first life's ${PERSONA_SID[${key}]}"
     [[ "${ROW_SESSION}" == "${PERSONA_NAMED[${key}]}" ]] \
         || fail "${step}: the launched row records session '${ROW_SESSION}', not ${PERSONA_NAMED[${key}]}"
     wait_for_count "$(connected_match "${key}")" $(( FREE_CONNECTS[${key}] + 1 )) "${CONNECT_WAIT_S}" \
@@ -2627,7 +2627,7 @@ check_launched() {
     fi
     n="$(posts_since "${key}" "${POSTS_BEFORE[${key}]}")" || exit 1
     (( n == 2 )) || fail "${step}: ${PERSONA_CHANNEL[${key}]} holds ${n} posts since the latch life began, not the latch's notice and the recovery post"
-    echo "${TEST_NAME}: ${step}: ${id} reads waiting with claude_session_id ${ROW_SID}; one recovery post"
+    echo "${TEST_NAME}: ${step}: ${id} reads waiting with session_id ${ROW_SID}; one recovery post"
 }
 
 # check_retry_clear <key>: the batched round: its first two calls of the id

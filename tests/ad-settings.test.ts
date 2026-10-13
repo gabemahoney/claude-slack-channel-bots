@@ -1951,7 +1951,7 @@ const defaultCeilings = (): ReturnType<typeof adVerbCeilingsMs> => adVerbCeiling
 
 describe('ad settings: SRD pins (b.jg5 SRJ-209, SRJ-210, SRJ-213)', () => {
   test.each<[string, () => unknown, unknown]>([
-    ['the settings file path', () => AD_SETTINGS_RELATIVE_PATH, join('.agent-director', 'config.toml')],
+    ['the settings file path', () => AD_SETTINGS_RELATIVE_PATH, join('.config/agent-director', 'config.toml')],
     [
       'the nine [tmux] keys and their defaults',
       () => DEFAULT_AD_SETTINGS.tmux,
@@ -2023,5 +2023,23 @@ describe('ad settings: SRD pins (b.jg5 SRJ-209, SRJ-210, SRJ-213)', () => {
     ],
   ])('%s', (_label, actual, expected) => {
     expect(actual()).toEqual(expected)
+  })
+})
+
+
+describe('0.12 settings require an absolute HOME', () => {
+  test.each([undefined, '', 'relative/home'])('refuses HOME=%s before filesystem access', (home) => {
+    const lines: string[] = []
+    let reads = 0
+    const reader = createAdSettingsReader({
+      home: () => home as string,
+      fs: { openFile: (() => { reads++; throw new Error('must not read'); }) as never },
+      log: (line) => lines.push(line),
+    })
+    expect(reader.read()).toEqual({ kind: 'refused', reason: 'the home directory cannot be found' })
+    expect(reader.read()).toEqual({ kind: 'refused', reason: 'the home directory cannot be found' })
+    expect(reads).toBe(0)
+    expect(lines).toHaveLength(1)
+    assertNoLeak(lines)
   })
 })

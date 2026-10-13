@@ -57,7 +57,7 @@
 #       the image marker: tests/runner.sh and ad-client-check.sh refuse to
 #       run without it.
 # The install leaves no store behind: install.sh runs with a throwaway HOME,
-# which the build removes, so no ~/.agent-director exists in the image. The
+# which the build removes, so no ~/.config/agent-director exists in the image. The
 # 0.10.0 client is only kept as its tarball, and /usr/local/bin holds no
 # agent-director.
 #
@@ -188,7 +188,7 @@ RUN --mount=type=secret,id=gh_token set -eu; \
 #   AD_ADMIN_SHA256 (`--sha256`, `--admin-sha256`), refuses a pair whose
 #   version stamps differ, installs them and opens the store, migrating it to
 #   the release's schema. It runs with a throwaway HOME (its
-#   ~/.agent-director, store included, is removed afterwards), with
+#   ~/.config/agent-director, store included, is removed afterwards), with
 #   `--no-hooks` and `--no-symlink`, and with a stand-in `claude` on PATH for
 #   that one command: install.sh's pre-flight requires a `claude` on PATH and
 #   only prints its `--version`, and this image has no Claude Code.
@@ -199,11 +199,11 @@ RUN --mount=type=secret,id=gh_token set -eu; \
 # AD_VERSION and AD_COMMIT. The build then checks that the first
 # agent-director on PATH is the release's, that no other PATH directory holds
 # one, and that no agent-director-admin is on PATH.
-ARG AD_VERSION=0.11.0
-ARG AD_COMMIT=d0b1890d12e286c842439815fd6b8ecdb790bc24
-ARG AD_SHA256=a72e4c5001b96294427e06e3972c82b3f070ef8932a0fc83aef1dc73418747bf
-ARG AD_ADMIN_SHA256=103c1ee017230f5b6e97224b403a23cf942a332cf3e74bb30f7dd0072bf0dbb6
-ARG AD_INSTALL_SH_SHA256=be9de3727b1ddbeec333b1ee70634b4b6cbad39aca81fbd8d2b8ed41fe993825
+ARG AD_VERSION=0.12.0
+ARG AD_COMMIT=e1b6f2e769cd8dbf29161590046ca0e963c44b65
+ARG AD_SHA256=ea68fb7379ea44ae7ed1edba5c9ec561f297a1efd63487f1f3baea06a8064db1
+ARG AD_ADMIN_SHA256=1e0070f309768e763ea1fb69bd151299071278f0c90f055e1250a879c88df158
+ARG AD_INSTALL_SH_SHA256=dacd775d2345814a645cf65fdb36a2a6ff1ebd727dfc0ef40e162e36815fcd28
 RUN --mount=type=bind,from=agent-director-install,target=/mnt/agent-director-install \
     set -eu; \
     AD_TAG="v${AD_VERSION}"; \
@@ -239,15 +239,15 @@ RUN --mount=type=bind,from=agent-director-install,target=/mnt/agent-director-ins
         echo "ERROR: ${AD_INSTALL_SH} --from-release ${AD_TAG} failed: $(tr -s '\n\t ' ' ' < "${STAGE}/install.err" | cut -c1-800)" >&2; \
         exit 1; \
     fi; \
-    INSTALLED_BIN="${AD_HOME}/.agent-director/bin/agent-director"; \
-    INSTALLED_ADMIN="${AD_HOME}/.agent-director/admin/agent-director-admin"; \
+    INSTALLED_BIN="${AD_HOME}/.config/agent-director/bin/agent-director"; \
+    INSTALLED_ADMIN="${AD_HOME}/.config/agent-director/admin/agent-director-admin"; \
     for f in "${INSTALLED_BIN}" "${INSTALLED_ADMIN}"; do \
         if [ ! -f "${f}" ]; then \
             echo "ERROR: ${AD_INSTALL_SH} --from-release ${AD_TAG} installed no ${f}" >&2; \
             exit 1; \
         fi; \
     done; \
-    STORE_SCHEMA=$(sqlite3 "${AD_HOME}/.agent-director/state.db" 'PRAGMA user_version;' 2>/dev/null || echo unreadable); \
+    STORE_SCHEMA=$(sqlite3 "${AD_HOME}/.config/agent-director/state.db" 'PRAGMA user_version;' 2>/dev/null || echo unreadable); \
     mkdir -p "${AD_BIN_DIR}" "${AD_ADMIN_DIR}"; \
     install -m 0755 "${INSTALLED_BIN}" "${AD_BIN}"; \
     install -m 0755 "${INSTALLED_ADMIN}" "${AD_ADMIN}"; \
@@ -311,7 +311,7 @@ COPY --chmod=0755 docker/ad-client-check.sh /opt/agent-director/check/ad-client-
 # equal the tarball's, it exports the Phase 1 classes, and it pairs with the
 # release's binary first on PATH. The check's summary line is the last line
 # this layer prints.
-ARG AD_CLIENT_TGZ_SHA256=69cf2d1774c77ee706edb6e6d0d67049dd1039596c8e5239f26b03a8e71baa31
+ARG AD_CLIENT_TGZ_SHA256=66265d3ed575732312b1df43aab1eb328be910798f2a22ddb4cb86026c0d5340
 RUN set -eu; \
     AD_CHECK=/opt/agent-director/check/ad-client-check.sh; \
     CLIENT_DIR=/opt/agent-director/client; \

@@ -44,7 +44,7 @@ docs/migration.md section "Switching over to agent-director Phase 1", and rolled
 back together by the docs/migration.md section "Rolling back the switch-over". This
 skill points to those sections by title and does not repeat their steps.
 
-The agent-director client CSCB pins is `agent-director@0.11.0`. It comes
+The agent-director client CSCB pins is `agent-director@0.12.0`. It comes
 installed with CSCB as its npm dependency. This skill runs no client
 install and names no package-manager command for it: the client changes
 only with CSCB itself.
@@ -216,7 +216,7 @@ user through fixing the agent-director npm package.
 Tell the user:
 
 > The agent-director npm package installed with CSCB, the client CSCB
-> pins at `agent-director@0.11.0`, could not be read.
+> pins at `agent-director@0.12.0`, could not be read.
 > Check the agent-director npm package installed with CSCB; see the docs/migration.md
 > section "Switching over to agent-director Phase 1".
 
@@ -272,7 +272,7 @@ service=cscb` lists them once the server is running.
   says, and goes back only as the docs/migration.md section "Rolling back the
   switch-over" says.
 - This skill runs no install of the agent-director client. The client,
-  `agent-director@0.11.0`, comes installed with CSCB.
+  `agent-director@0.12.0`, comes installed with CSCB.
 - This skill does not touch the persona configuration
   (`~/.config/claude-slack-channel-bots/config.json`), the persona credentials
   files or the reload files beside the configuration. It only acts on

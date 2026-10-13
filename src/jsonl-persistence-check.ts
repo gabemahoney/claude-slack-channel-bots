@@ -15,10 +15,11 @@
  *
  *   Layer 2 — per-persona missing-transcript check (the 2026-09-20 incident class):
  *     For each persona, fetch the AD row and stat the persisted vs fallback
- *     JSONL path. If the persisted path is gone but a transcript exists
- *     (fallback path or archived messages since spawn), the resume path WILL
- *     wipe the persona's memory — say so loudly. Idle-since-spawn personas stay
- *     quiet. A row the collision ladder will replace rather than resume (its
+ *     JSONL path. If the persisted path is gone but the current-session fallback
+ *     exists, report the stale path with the fallback available for resume. If
+ *     both paths are gone and archived messages prove activity since spawn,
+ *     report transcript loss. Idle-since-spawn personas stay quiet. A row the
+ *     collision ladder will replace rather than resume (its
  *     `cwd` or `config_dir` label does not match the persona) is only logged.
  *
  * Archive evidence follows b.av2 SR-7.4 and b.deo SRI-704
@@ -97,7 +98,7 @@ export interface JsonlPersistenceSafeguardDeps {
    * Fetches the AD row for a persona's instance id (Layer 2). Default routes
    * through withOutageDetection so AD-unreachable is flagged per persona.
    */
-  getRow?: (key: string, claudeInstanceId: string) => Promise<GetResult>
+  getRow?: (key: string, instanceId: string) => Promise<GetResult>
   /**
    * Counts archived messages in a persona's evidence channels (Layer 2).
    * Default: `makeDefaultArchiveCount(config)`, which opens
@@ -449,9 +450,9 @@ function defaultStatFn(path: string): boolean {
  * start (SRJ-513) latch no one, and a retired key's row read live with its
  * mark set clears no retired-key entry (SRJ-807); they change nothing.
  */
-function defaultGetRow(key: string, claudeInstanceId: string): Promise<GetResult> {
+function defaultGetRow(key: string, instanceId: string): Promise<GetResult> {
   return withOutageDetection(key, undefined, 'get', (client) =>
-    client.get({ claude_instance_id: claudeInstanceId }),
+    client.get({ instance_id: instanceId }),
   )
 }
 
@@ -524,7 +525,7 @@ function rowReplacementReason(
 async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Promise<void> {
   const { key } = persona
   const ref = personaRef(persona)
-  const claudeInstanceId = personaInstanceId(key)
+  const instanceId = personaInstanceId(key)
 
   // Bug b.g57: a claude_config_dir with no real path (an unmounted drive, a
   // dropped mount, a symlink pointing to nothing) is not checked this pass:
@@ -542,7 +543,7 @@ async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Prom
 
   let row: GetResult
   try {
-    row = await fx.getRow(key, claudeInstanceId)
+    row = await fx.getRow(key, instanceId)
   } catch (err) {
     if (isAdErrorInstance(err, ErrSpawnNotFound)) {
       // Case 1: no row — nothing to lose.
@@ -566,15 +567,15 @@ async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Prom
   }
 
   // Case 1 (cont.): row exists but never produced a session — nothing to lose.
-  if (!row.claude_session_id) {
-    console.error(`[slack] jsonl-persistence-check: ${ref} has no claude_session_id — nothing to resume`)
+  if (!row.session_id) {
+    console.error(`[slack] jsonl-persistence-check: ${ref} has no session_id — nothing to resume`)
     return
   }
 
   const persistedPath = row.jsonl_path
   const fallbackPath = resolveJsonlPath(
     row.cwd,
-    row.claude_session_id,
+    row.session_id,
     resolveClaudeConfigDir(persona.claude_config_dir, fx.home),
   )
 
@@ -585,22 +586,21 @@ async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Prom
 
   const fallbackExists = fx.statFn(fallbackPath)
 
-  // Case 4: persisted gone but fallback exists — the transcript is on disk and
-  // AD 0.8.0 only stats the persisted path on resume, so it WILL throw
-  // ErrJsonlMissing and the resume path will wipe this persona's memory. LOUD.
+  // Case 4: persisted gone but the current-session fallback exists — report
+  // the stale recorded path; AD 0.12 tries this fallback on resume too.
   if (fallbackExists) {
     const detail =
-      `${ref} instance=${claudeInstanceId}: AD persisted jsonl_path is missing/empty ` +
+      `${ref} instance=${instanceId}: AD persisted jsonl_path is missing/empty ` +
       `("${persistedPath}") but the transcript EXISTS at the resolved fallback path ("${fallbackPath}"). ` +
-      `Resume will throw ErrJsonlMissing and fresh-spawn, destroying conversation history that is on disk.`
+      `The current-session fallback is available for agent-director to try on resume.`
     fx.recordError(ERR_KEY_STALE_PATH, detail)
     sendNotice(
       fx.notify,
       persona,
       `⚠️ CSCB startup warning: my saved conversation transcript exists on disk (\`${fallbackPath}\`) but ` +
-        `agent-director's recorded path (\`${persistedPath || '(empty)'}\`) points elsewhere. On resume this ` +
-        `would be treated as missing and my memory would be wiped. An operator should reconcile the path ` +
-        `before the next restart.`,
+        `agent-director's recorded path (\`${persistedPath || '(empty)'}\`) is missing or empty. ` +
+        `The current-session fallback is available for agent-director to try on resume. ` +
+        `An operator can investigate the stale recorded path.`,
     )
     return
   }
@@ -621,7 +621,7 @@ async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Prom
   if (archivedSinceSpawn !== null && archivedSinceSpawn > 0) {
     // Conversation provably happened since spawn, yet no transcript survives. LOST.
     const detail =
-      `${ref} instance=${claudeInstanceId}: no transcript at persisted ("${persistedPath}") ` +
+      `${ref} instance=${instanceId}: no transcript at persisted ("${persistedPath}") ` +
       `or fallback ("${fallbackPath}") path, but the message archive holds ${archivedSinceSpawn} message(s) ` +
       `since spawn (started_at=${row.started_at}). Conversation history has been LOST; resume will fresh-spawn.`
     fx.recordError(ERR_KEY_LOST, detail)

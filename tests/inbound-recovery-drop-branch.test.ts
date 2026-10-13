@@ -1,3 +1,4 @@
+import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 /**
  * inbound-recovery-drop-branch.test.ts — lost messages (b.av2 SR-4.6, SR-7.3,
  * SR-7.2 part; b.kvq and b.9cj recovery, keyed per persona). The AC 26
@@ -1343,7 +1344,7 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
     const hold = holdSpawns(h.stub.client)
     const launch = h.launch(key)
     await hold.entered(id)
-    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }), readPaneResults: [{ pane: TRUST_DIALOG_NEEDLE }] })
+    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }), readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_NEEDLE)] })
 
     // A launch running is state 6 with no read.
     await expectLostMessageReports(h, key, 'session-starting', { calls: {} })
@@ -1410,7 +1411,7 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
     expect(lost.restartPending).toBe(true)
     await waitFor(() => !isRestartPendingOrActive(key), 1000)
     expect(isRestartPendingOrActive(key)).toBe(false)
-    expect(h.stub.calls.statusCalls).toEqual([{ claude_instance_id: id }, { claude_instance_id: id }])
+    expect(h.stub.calls.statusCalls).toEqual([{ instance_id: id }, { instance_id: id }])
     expect(h.stub.calls.spawnCalls).toEqual([])
     expect(h.stub.calls.killCalls).toEqual([])
     expectNothingRaisedOrArmed(h, key)
@@ -1548,7 +1549,7 @@ describe('b.jg5 SRJ-805: a message lost for a retired key asks for a restart tha
     h.retireKey(key)
     h.script({
       statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }),
-      getResult: personaRow(h, key, { state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' }),
+      getResult: personaRow(h, key, { state: LIVENESS_DEAD_ROW_ENDED, session_id: 'a-session-id' }),
     })
 
     await expectLostMessageReports(h, key, 'starting-now', { restartRequested: true })
@@ -2604,7 +2605,7 @@ const Q_HOLDS: ReadonlyArray<readonly [string, QHold]> = [
     const row = absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)
     h.script({ listResult: { spawns: [row] } })
     await h.startSweep()
-    return row.claude_instance_id
+    return row.instance_id
   }],
 ]
 
@@ -2619,7 +2620,7 @@ describe('b.jg5 SRJ-812, SRJ-1011 (AC 54): a message lost while Q waits on an ol
     const h = makeRecovery()
     const [q, b] = h.keys as [string, string]
     const id = await begin(h, q, b)
-    h.script({ getResult: cannedGetResult({ claude_instance_id: id, cwd: personaOf(h, q).working_directory }) })
+    h.script({ getResult: cannedGetResult({ instance_id: id, cwd: personaOf(h, q).working_directory }) })
 
     await expectLostMessageReports(h, q, 'auto-restart-disabled')
 
@@ -2682,7 +2683,7 @@ describe('b.jg5 SRJ-812, SRJ-1011 state 4 (AC 54): once the old key\'s kill fail
     const [q, b] = h.keys as [string, string]
     await pastSampleGrace(h)
     const id = await Q_HOLDS[0]![1](h, q, b)
-    arrange(h, cannedGetResult({ claude_instance_id: id, cwd: personaOf(h, q).working_directory, state: AGENT_DIRECTOR_PENDING_STATE }))
+    arrange(h, cannedGetResult({ instance_id: id, cwd: personaOf(h, q).working_directory, state: AGENT_DIRECTOR_PENDING_STATE }))
 
     await h.runOldLifeWait(id)
 
@@ -2713,7 +2714,7 @@ describe('b.jg5 SRJ-812, SRJ-810 (AC 54): a restart a lost message triggers whil
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
     const [q, b] = h.keys as [string, string]
     const id = await begin(h, q, b)
-    h.script({ getResult: cannedGetResult({ claude_instance_id: id, cwd: personaOf(h, q).working_directory }) })
+    h.script({ getResult: cannedGetResult({ instance_id: id, cwd: personaOf(h, q).working_directory }) })
     rowReadsUntilSpawn(h, UNAVAILABLE_RETRY_ROW_ABSENT)
     const hold = holdFindMissing(h.stub.client)
 
@@ -2732,7 +2733,7 @@ describe('b.jg5 SRJ-812, SRJ-810 (AC 54): a restart a lost message triggers whil
 
     expect(h.oldLifeHolds.holdOf(id)).toBeUndefined()
     expect(h.holdEndRetries).toEqual([{ key: q, at: endedAt, result: UNAVAILABLE_RETRY_RUN_NOW_RAN }])
-    expect(h.stub.calls.spawnCalls.map((params) => params.claude_instance_id)).toEqual([personaInstanceId(q)])
+    expect(h.stub.calls.spawnCalls.map((params) => params.instance_id)).toEqual([personaInstanceId(q)])
     await h.runApproverToStop(q)
     h.controller.stopAll('the case is over')
     expectOnlyQNotices(h, q, 1)

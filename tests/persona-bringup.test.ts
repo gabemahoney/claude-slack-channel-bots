@@ -298,7 +298,7 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
   // Step 4 reaches agent-director: record the persona's connection as it stands then.
   const realSpawn = ad.client.spawn.bind(ad.client)
   ad.client.spawn = async (params) => {
-    const key = (params.claude_instance_id ?? '').replace(/^cscb_/, '')
+    const key = (params.instance_id ?? '').replace(/^cscb_/, '')
     order.push(`launch:${key}`)
     const stub = conn.slack.persona(key)
     launches.push({
@@ -783,7 +783,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     const seen: unknown[] = []
     const spawn = ad.client.spawn
     ad.client.spawn = async (params) => {
-      if (params.claude_instance_id === personaInstanceId(a.key)) seen.push(h.conn.manager.identity(a.key))
+      if (params.instance_id === personaInstanceId(a.key)) seen.push(h.conn.manager.identity(a.key))
       return spawn(params)
     }
     return seen
@@ -795,7 +795,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     const spawn = ad.client.spawn
     ad.client.spawn = async (params) => {
       const spawned = await spawn(params)
-      if (params.claude_instance_id === personaInstanceId(a.key)) throw errInstanceIdCollision()
+      if (params.instance_id === personaInstanceId(a.key)) throw errInstanceIdCollision()
       return spawned
     }
     ad.client.get = async (params) => {
@@ -1039,8 +1039,8 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     expect(h.retryLaunches).toEqual([a.key])
     expect(launched).toEqual([{ key: a.key, action: 'resumed' }])
     expect(ad.spawnedIds().slice(cp.spawns)).toEqual([personaInstanceId(a.key)])
-    expect(ad.calls.getCalls).toEqual([{ claude_instance_id: personaInstanceId(a.key) }])
-    expect(ad.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(a.key) }])
+    expect(ad.calls.getCalls).toEqual([{ instance_id: personaInstanceId(a.key) }])
+    expect(ad.calls.resumeCalls).toEqual([{ instance_id: personaInstanceId(a.key) }])
     expect(ad.calls.killCalls).toEqual([])
     expect(ad.calls.deleteCalls).toEqual([])
     expect(h.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
@@ -1131,7 +1131,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     const launched = await Promise.all(retryLaunchesInFlight)
 
     expect(launched.at(-1)).toEqual({ key: a.key, action: 'resumed' })
-    expect(ad.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(a.key) }])
+    expect(ad.calls.resumeCalls).toEqual([{ instance_id: personaInstanceId(a.key) }])
     expect(ad.calls.killCalls).toEqual([])
     expect(ad.calls.deleteCalls).toEqual([])
     expect(h.retryLaunches).toEqual([a.key, a.key])

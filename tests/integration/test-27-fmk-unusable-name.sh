@@ -50,7 +50,7 @@
 #   1. First life: the live start spawns U fresh; the approver clears the
 #      dialog (a bot-server `send-keys` of U's row); a harness `get` reads the
 #      row `waiting`, its tmux session name the package's
-#      (`personaTmuxSessionName`); its claude_session_id is recorded.
+#      (`personaTmuxSessionName`); its session_id is recorded.
 #      [harness] The human ends U's worker as a human ends Claude Code: the
 #      stub's exit line typed into its pane with the real tmux
 #      (`__CSCB_TEST_EXIT__`, fixtures/stub-claude.sh), which fires its
@@ -59,7 +59,7 @@
 #      and leave the row reading `waiting`, and 0.11.0's `kill` changes no
 #      row's state). Then `stop --stop-bots`, at once (the disconnect's
 #      restart waits `session_restart_delay`): the row reads `ended` or
-#      `missing` with the same claude_session_id, the session is gone, and no
+#      `missing` with the same session_id, the session is gone, and no
 #      CSCB `resume` or `spawn` of the row followed the exit.
 #   2. [harness] With the server stopped:
 #      - E39's scenario 25 statement (`ad_store_unusable_name`): U's row's
@@ -146,7 +146,7 @@
 #         and it equals the printed notice (`holdRecoveryText`,
 #         LATCH_RECOVERY_REASON_ROW_GONE);
 #      i. U comes up fresh: the row reads `waiting` on a new
-#         claude_session_id and the package's session name; the server
+#         session_id and the package's session name; the server
 #         registers the stub's MCP session; the bot server's calls of U's row
 #         after the `delete` hold exactly one `spawn`, with no
 #         `--reuse-finished` (a plain spawn), and no `resume`, `kill`,
@@ -177,7 +177,7 @@
 #      the closing `stop --stop-bots` pauses no live stub (a pause of the
 #      stub, which ignores the `/exit` it types, waits out its 30 s timeout);
 #      then `stop --stop-bots`. U's row is present at the end, with the fresh
-#      claude_session_id; the agent-director shim's log holds exactly one
+#      session_id; the agent-director shim's log holds exactly one
 #      `delete` call line, parented by the scenario's own shell (its PID and
 #      command line) and by no CSCB process.
 #   6. The three closing assertions.
@@ -375,13 +375,13 @@ EOF
 }
 
 # read_row <step> <instance-id>: a harness `get` of the row. Sets ROW_STATE,
-# ROW_SID (claude_session_id), ROW_SESSION (tmux_session_name) and ROW_NOTE
+# ROW_SID (session_id), ROW_SESSION (tmux_session_name) and ROW_NOTE
 # (liveness_note), each empty when absent.
 read_row() {
     local fields
-    ad_capture get --claude-instance-id "$2"
+    ad_capture get --instance-id "$2"
     (( AD_RC == 0 )) || fail "$1: the harness get of $2 exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
-    fields="$(jq -r '[.state // "", .claude_session_id // "", .tmux_session_name // "", .liveness_note // ""] | join("\u001f")' "${AD_OUT}")" \
+    fields="$(jq -r '[.state // "", .session_id // "", .tmux_session_name // "", .liveness_note // ""] | join("\u001f")' "${AD_OUT}")" \
         || fail "$1: the harness get of $2 printed no row object: $(head -c 300 "${AD_OUT}")"
     IFS=$'\x1f' read -r ROW_STATE ROW_SID ROW_SESSION ROW_NOTE <<< "${fields}"
 }
@@ -417,7 +417,7 @@ wait_row() {
 # the fresh spawn writes it, when `get` would fail).
 fresh_row_waiting() {
     local n
-    n="$(_scenario_store_read "$1" "SELECT COUNT(*) FROM spawns WHERE claude_instance_id = '${U_ID}'")" || exit 1
+    n="$(_scenario_store_read "$1" "SELECT COUNT(*) FROM spawns WHERE instance_id = '${U_ID}'")" || exit 1
     [[ "${n}" == 1 ]] || return 1
     row_reads "$1" "${U_ID}" waiting
 }
@@ -662,14 +662,14 @@ EOF
     expect_completion 1 "${step}" "0 not brought up"
     wait_row "${step}: the report-in" "${REPORT_WAIT_S}" "${U_ID}" waiting
     U_SID="${ROW_SID}"
-    [[ -n "${U_SID}" ]] || fail "${step}: the live row ${U_ID} has no claude_session_id"
+    [[ -n "${U_SID}" ]] || fail "${step}: the live row ${U_ID} has no session_id"
     [[ "${ROW_SESSION}" == "${U_SESSION}" ]] || fail "${step}: the live row records session '${ROW_SESSION}', not ${U_SESSION}"
     wait_for_count "${CONNECTED}" 1 "${CONNECT_WAIT_S}" "${step}: the server never registered the stub's session as ${U_KEY}'s"
     calls="$(ad_cscb_calls "${U_ID}")" || exit 1
     rows="$(verb_rows send-keys "${calls}")"
     rows="$(server_rows "${LIFE1_PID}" "${rows}")"
     (( $(rows_count "${rows}") >= 1 )) || fail "${step}: no bot-server send-keys of ${U_ID} (the approver's Enter)"
-    echo "${TEST_NAME}: ${step}: ${U_ID} reads waiting, claude_session_id ${U_SID}, session ${U_SESSION}"
+    echo "${TEST_NAME}: ${step}: ${U_ID} reads waiting, session_id ${U_SID}, session ${U_SESSION}"
 
     # [harness] The human ends the worker; then stop --stop-bots.
     EXIT_MARK="$(ad_shim_mark)"
@@ -677,7 +677,7 @@ EOF
     stop_server --stop-bots
     sed "s/^/${TEST_NAME}: ${step}: stop said: /" "${STOP_OUT}"
     row_reads "${step}" "${U_ID}" ended missing || fail "${step}: ${U_ID} reads '${ROW_STATE}', not ended or missing"
-    [[ "${ROW_SID}" == "${U_SID}" ]] || fail "${step}: ${U_ID}'s claude_session_id is '${ROW_SID}', not ${U_SID}"
+    [[ "${ROW_SID}" == "${U_SID}" ]] || fail "${step}: ${U_ID}'s session_id is '${ROW_SID}', not ${U_SID}"
     ! has_session "${U_SESSION}" || fail "${step}: session ${U_SESSION} is there"
     rows="$(ad_cscb_calls "${U_ID}" "${EXIT_MARK}")" || exit 1
     for verb in resume spawn; do
@@ -713,7 +713,7 @@ other_row_unusable() {
     before="$(ad_store_row "${OTHER_ID}")" || exit 1
     rv="$(jq -r '.[0].row_version' <<< "${before}")"
     [[ "${rv}" =~ ^[0-9]+$ ]] || fail "${step}: the row's row_version reads '${rv}'"
-    out="$(ad_store_edit "UPDATE spawns SET state = 'waiting', launch_started_at = NULL, pid = NULL, proc_starttime = NULL, pane_pid = NULL, pane_starttime = NULL, tmux_session_name = '${OTHER_UNUSABLE}', row_version = row_version + 1 WHERE claude_instance_id = '${OTHER_ID}' AND state = 'pending' AND row_version = ${rv} RETURNING claude_instance_id")" \
+    out="$(ad_store_edit "UPDATE spawns SET state = 'waiting', launch_started_at = NULL, pid = NULL, proc_starttime = NULL, pane_pid = NULL, pane_starttime = NULL, tmux_session_name = '${OTHER_UNUSABLE}', row_version = row_version + 1 WHERE instance_id = '${OTHER_ID}' AND state = 'pending' AND row_version = ${rv} RETURNING instance_id")" \
         || exit 1
     [[ "${out}" == "${OTHER_ID}" ]] || fail "${step}: the row is no longer pending at row_version ${rv}, and the edit wrote nothing"
     after="$(ad_store_row "${OTHER_ID}")" || exit 1
@@ -728,7 +728,7 @@ step_other_row() {
     [[ -z "$(server_pid)" ]] || fail "${step}: a server is running"
     dir="$(make_workdir other)"
     stub_mode "${dir}" "${STUB_MODE_SILENT}"
-    ad_capture spawn --cwd "${dir}" --claude-instance-id "${OTHER_ID}" --tmux-session-name "${OTHER_SESSION}" --no-pre-trust
+    ad_capture spawn --agent claude --cwd "${dir}" --instance-id "${OTHER_ID}" --tmux-session-name "${OTHER_SESSION}" --no-pre-trust
     if (( AD_RC != 0 )); then
         sed 's/^/  | /' "${AD_OUT}" "${AD_ERR}" >&2
         fail "${step}: the harness spawn of ${OTHER_ID} exited ${AD_RC}"
@@ -940,7 +940,7 @@ step_clear_fresh() {
     step="step 3i: U comes up fresh"
     wait_until "${START_WAIT_S}" "${step}: ${U_ID} never read waiting again" fresh_row_waiting "${step}"
     read_row "${step}" "${U_ID}"
-    [[ -n "${ROW_SID}" && "${ROW_SID}" != "${U_SID}" ]] || fail "${step}: the row's claude_session_id is '${ROW_SID}', not a new one"
+    [[ -n "${ROW_SID}" && "${ROW_SID}" != "${U_SID}" ]] || fail "${step}: the row's session_id is '${ROW_SID}', not a new one"
     [[ "${ROW_SESSION}" == "${U_SESSION}" ]] || fail "${step}: the row records session '${ROW_SESSION}', not ${U_SESSION}"
     U_FRESH_SID="${ROW_SID}"
     wait_for_count "${CONNECTED}" "$(( connections + 1 ))" "${CONNECT_WAIT_S}" "${step}: the server never registered the fresh stub's session as ${U_KEY}'s"
@@ -986,7 +986,7 @@ step_clear_fresh() {
         || fail "${step}: ${U_CHANNEL} got $(( ${#POSTS[@]} - POSTS_BEFORE )) posts since the second life began, not the notice and the recovery post"
     [[ "${POSTS[POSTS_BEFORE]}" == "${NOTICE_POST}" && "${POSTS[POSTS_BEFORE + 1]}" == "${recovery}" ]] \
         || fail "${step}: the posts on ${U_CHANNEL} since the second life began are not the unusable-name notice, then the recovery post"
-    echo "${TEST_NAME}: ${step}: ${U_ID} reads waiting with the fresh claude_session_id ${U_FRESH_SID}; one recovery post"
+    echo "${TEST_NAME}: ${step}: ${U_ID} reads waiting with the fresh session_id ${U_FRESH_SID}; one recovery post"
 }
 
 # Step 4: the other caller's row got its note from a CSCB find-missing, and

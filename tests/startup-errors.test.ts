@@ -775,7 +775,7 @@ describe('b.jg5 SRJ-1013, SRJ-714: orphan-cleanup from the start sweep, and spaw
     const b = h.keys[1]!
     const err = errTmuxKillFailed(sentinelInMessage('orphan-cleanup'))
     h.script({ killError: err })
-    const row = listed(h, b, { claude_instance_id: `${personaInstanceId(b)}_old` })
+    const row = listed(h, b, { instance_id: `${personaInstanceId(b)}_old` })
 
     await sweepOver(h, [row])
 
@@ -784,7 +784,7 @@ describe('b.jg5 SRJ-1013, SRJ-714: orphan-cleanup from the start sweep, and spaw
     expect(
       text.startsWith(
         startSweepKillFailedEntry({
-          instanceId: row.claude_instance_id,
+          instanceId: row.instance_id,
           persona: renderPersonaRef(personaOf(h, b).name, b),
           state: row.state,
           session: row.tmux_session_name,
@@ -796,10 +796,10 @@ describe('b.jg5 SRJ-1013, SRJ-714: orphan-cleanup from the start sweep, and spaw
     const content: KillFailureAlertContent = {
       version: KILL_FAILURE_VERSION_ORDINARY,
       session: row.tmux_session_name,
-      instanceId: row.claude_instance_id,
+      instanceId: row.instance_id,
       quotes: { lastKillFailedDescription: killFailedDescriptionOf(err)! },
     }
-    expect(text.endsWith(killFailureAlertEntryText(`instanceId=${row.claude_instance_id}`, KILL_FAILURE_CONTEXT_START_SWEEP, killFailureAlertText(content, KILL_FAILURE_CLOSING_LOG_ONLY, false)))).toBe(true)
+    expect(text.endsWith(killFailureAlertEntryText(`instanceId=${row.instance_id}`, KILL_FAILURE_CONTEXT_START_SWEEP, killFailureAlertText(content, KILL_FAILURE_CLOSING_LOG_ONLY, false)))).toBe(true)
     expect(h.stub.calls.deleteCalls).toEqual([])
     expect([h.episodeNotices, h.notices]).toEqual([[], []])
   })

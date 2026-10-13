@@ -630,7 +630,7 @@ first_cscb_call_at_or_after() {
 
 # row_state <instance-id>: a harness `get`'s state (empty when it fails).
 row_state() {
-    ad_capture get --claude-instance-id "$1"
+    ad_capture get --instance-id "$1"
     (( AD_RC == 0 )) || return 0
     jq -r '.state // empty' "${AD_OUT}"
 }
@@ -641,7 +641,7 @@ row_state_is() {
 
 # row_field <step> <instance-id> <field>: one field of a harness `get` (empty when absent).
 row_field() {
-    ad_capture get --claude-instance-id "$2"
+    ad_capture get --instance-id "$2"
     (( AD_RC == 0 )) || fail "$1: the harness get of $2 exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
     jq -r --arg f "$3" '.[$f] // empty' "${AD_OUT}"
 }
@@ -650,7 +650,7 @@ row_field() {
 # harness `get` of a `pending` row, as agent-director wrote it.
 launch_start_raw() {
     local raw
-    ad_capture get --claude-instance-id "$2"
+    ad_capture get --instance-id "$2"
     (( AD_RC == 0 )) || fail "$1: the harness get of $2 exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
     [[ "$(jq -r '.state // empty' "${AD_OUT}")" == pending ]] \
         || fail "$1: $2 reads '$(jq -r '.state // empty' "${AD_OUT}")', not pending"
@@ -936,8 +936,8 @@ leg_stopping() {
     # S comes back by `resume`: no spawn of S in the leg launches anything
     # (each is the collision ladder's plain spawn, which collides with S's
     # row) and none is a reuse spawn.
-    n_spawn="$(cscb_ad_count spawn --claude-instance-id "${ID[s]}")"
-    n_reuse="$(cscb_ad_count spawn --claude-instance-id "${ID[s]}" --reuse-finished)"
+    n_spawn="$(cscb_ad_count spawn --instance-id "${ID[s]}")"
+    n_reuse="$(cscb_ad_count spawn --instance-id "${ID[s]}" --reuse-finished)"
     collided_before="$(count_log "${COLLISION_HEAD}${REF[s]} ")"
     session="$(session_of "stopping" "${ID[s]}")" || exit 1
     S_CREATED="$(tmux_session_value "${session}" '#{session_created}')" || fail "stopping: S's session ${session} has no creation time"
@@ -959,9 +959,9 @@ leg_stopping() {
         || fail "stopping: S's worker or session ${session} is gone after stop --stop-bots (the stub did not linger)"
     echo "${TEST_NAME}: stopping: S's row ended at ${ended_raw}; its session ${session} was created $(( ${end_s%.*} - S_CREATED ))s before"
 
-    n_resume="$(cscb_ad_count resume --claude-instance-id "${ID[s]}")"
+    n_resume="$(cscb_ad_count resume --instance-id "${ID[s]}")"
     start_live "stopping" "${VALUES_LINE}"
-    line="$(wait_for_cscb_ad_call "${n_resume}" "${LAUNCH_WAIT_S}" "stopping: no resume of S" resume --claude-instance-id "${ID[s]}")" || exit 1
+    line="$(wait_for_cscb_ad_call "${n_resume}" "${LAUNCH_WAIT_S}" "stopping: no resume of S" resume --instance-id "${ID[s]}")" || exit 1
     call_fields "stopping" "${line}"
     t1="${CALL_T}"
     wait_for_count "${refused}" 1 "${LOG_WAIT_S}" "stopping: S's first resume was not refused"
@@ -971,7 +971,7 @@ leg_stopping() {
         || fail "stopping: S's still-stopping resume came $(seconds_between "${end_s}" "${t1}")s after the row's end, not inside ${STOPPING_S}s"
     echo "${TEST_NAME}: stopping: resume 1 at +$(seconds_between "${end_s}" "${t1}")s from the row's end: still stopping"
 
-    line="$(wait_for_cscb_ad_call "$(( n_resume + 1 ))" "${RETRY_WAIT_S}" "stopping: no second resume of S" resume --claude-instance-id "${ID[s]}")" || exit 1
+    line="$(wait_for_cscb_ad_call "$(( n_resume + 1 ))" "${RETRY_WAIT_S}" "stopping: no second resume of S" resume --instance-id "${ID[s]}")" || exit 1
     call_fields "stopping" "${line}"
     t2="${CALL_T}"
     pid_alive "$(tmux_session_value "${session}" '#{pane_pid}')" && has_session "${session}" \
@@ -990,7 +990,7 @@ leg_stopping() {
 
     stub_release "${S_PANE}"
     wait_until "$(( RETRY_WAIT_S + REPORT_WAIT_S ))" "stopping: S never reported in after the release" row_state_is "${ID[s]}" waiting
-    (( $(cscb_ad_count resume --claude-instance-id "${ID[s]}") >= n_resume + 3 )) || fail "stopping: S came up without a later resume"
+    (( $(cscb_ad_count resume --instance-id "${ID[s]}") >= n_resume + 3 )) || fail "stopping: S came up without a later resume"
     [[ "$(count_log "${stop_m}")" == 1 ]] || fail "stopping: $(count_log "${stop_m}") still-stopping refusals for S, not exactly one"
     [[ "$(count_log "$(matcher "${LATCH_HEAD}${KEY[s]} ")")" == 0 ]] || fail "stopping: S latched"
     while IFS= read -r line; do
@@ -1001,13 +1001,13 @@ leg_stopping() {
     [[ "$(count_in "${errors_log}" "$(matcher "] [${SPAWN_FAILED_LABEL}] " "${REF[s]}")")" == "${entries_before}" ]] \
         || fail "stopping: a ${SPAWN_FAILED_LABEL} entry for S"
     [[ "$(count_log "${RELAUNCH_FAILED}${KEY[s]}")" == 0 ]] || fail "stopping: a launch failure of S was counted"
-    [[ "$(cscb_ad_count spawn --claude-instance-id "${ID[s]}" --reuse-finished)" == "${n_reuse}" ]] \
+    [[ "$(cscb_ad_count spawn --instance-id "${ID[s]}" --reuse-finished)" == "${n_reuse}" ]] \
         || fail "stopping: CSCB made a reuse spawn of S; S comes back by resume"
-    n_spawn=$(( $(cscb_ad_count spawn --claude-instance-id "${ID[s]}") - n_spawn ))
+    n_spawn=$(( $(cscb_ad_count spawn --instance-id "${ID[s]}") - n_spawn ))
     collided=$(( $(count_log "${COLLISION_HEAD}${REF[s]} ") - collided_before ))
     [[ "${collided}" == "${n_spawn}" ]] \
         || fail "stopping: CSCB made ${n_spawn} spawn(s) of S and ${collided} collided with its row; S comes back by resume"
-    echo "${TEST_NAME}: stopping: S up after $(cscb_ad_count resume --claude-instance-id "${ID[s]}") resume(s) in all, $(count_log "${refused}") refusal(s); ${n_spawn} spawn(s) of S in the leg, each colliding with its row"
+    echo "${TEST_NAME}: stopping: S up after $(cscb_ad_count resume --instance-id "${ID[s]}") resume(s) in all, $(count_log "${refused}") refusal(s); ${n_spawn} spawn(s) of S in the leg, each colliding with its row"
 }
 
 # ---------------------------------------------------------------------------
@@ -1018,9 +1018,9 @@ leg_stopping() {
 leg_held() {
     leg held
     local n_spawn line l_p n2 allowed fm post post_t post_log_t kills posts stuck_m reads pace n_fast gap_max tail_s
-    n_spawn="$(cscb_ad_count spawn --claude-instance-id "${ID[p]}")"
+    n_spawn="$(cscb_ad_count spawn --instance-id "${ID[p]}")"
     restart_with_personas "held" s p
-    line="$(wait_for_cscb_ad_call "${n_spawn}" "${LAUNCH_WAIT_S}" "held: no spawn of P" spawn --claude-instance-id "${ID[p]}")" || exit 1
+    line="$(wait_for_cscb_ad_call "${n_spawn}" "${LAUNCH_WAIT_S}" "held: no spawn of P" spawn --instance-id "${ID[p]}")" || exit 1
     call_fields "held" "${line}"
     [[ "${CALL_PPID}" == "${SERVER_PID}" ]] || fail "held: P's spawn was not made by this server process"
     wait_until "${LAUNCH_WAIT_S}" "held: P's row never read pending" row_state_is "${ID[p]}" pending
@@ -1034,7 +1034,7 @@ leg_held() {
     # within the slow pace of L + G. From G, (G + 5, G + 65): at most what
     # the slow pace allows. The times are the shim lines' own.
     sleep_until "$(time_plus "${l_p}" "$(( G_S + 65 + 1 ))")"
-    reads="$(cscb_ad_calls read-pane --claude-instance-id "${ID[p]}" \
+    reads="$(cscb_ad_calls read-pane --instance-id "${ID[p]}" \
         | awk -F'\t' -v a="$(time_plus "${l_p}" 5)" -v b="$(time_plus "${l_p}" "${G_S}")" '$2 > a && $2 < b { print $2 }')"
     pace="$(awk -v end="$(time_plus "${l_p}" "${G_S}")" '
         NF { n++; if (n > 1 && $1 - prev > gap) gap = $1 - prev; prev = $1 }
@@ -1042,7 +1042,7 @@ leg_held() {
     read -r n_fast gap_max tail_s <<< "${pace}"
     # The window (G + 5, G + 65) is 60 s long.
     allowed=$(( 60 / SLOW_PACE_S + 1 ))
-    n2="$(cscb_calls_between "$(time_plus "${l_p}" "$(( G_S + 5 ))")" "$(time_plus "${l_p}" "$(( G_S + 65 ))")" read-pane --claude-instance-id "${ID[p]}")"
+    n2="$(cscb_calls_between "$(time_plus "${l_p}" "$(( G_S + 5 ))")" "$(time_plus "${l_p}" "$(( G_S + 65 ))")" read-pane --instance-id "${ID[p]}")"
     echo "${TEST_NAME}: held: P's read-pane calls: ${n_fast} in (5s, ${G_S}s), the longest gap ${gap_max}s (limit ${PACE_GAP_LIMIT_S}s), the last ${tail_s}s before G; ${n2} in ($(( G_S + 5 ))s, $(( G_S + 65 ))s), the slow pace allows ${allowed}"
     (( n_fast >= 2 )) || fail "held: ${n_fast} read-pane call(s) of P in (5s, ${G_S}s) from its launch start, not the approver's fast pace"
     time_before "${gap_max}" "${PACE_GAP_LIMIT_S}" \
@@ -1071,7 +1071,7 @@ leg_held() {
     [[ -n "${line}" ]] || fail "held: no stuck-launch line for P"
     post_log_t="$(log_time "${line}")" || exit 1
     time_before "$(time_plus "${l_p}" "${B_S}")" "$(time_plus "${post_log_t}" 0.001)" || fail "held: the stuck-launch line came before B: ${line}"
-    kills="$(cscb_calls_between "${T_START}" "${post_log_t}" kill --claude-instance-id "${ID[p]}")"
+    kills="$(cscb_calls_between "${T_START}" "${post_log_t}" kill --instance-id "${ID[p]}")"
     [[ "${kills}" == 0 ]] || fail "held: ${kills} CSCB kill(s) of P before the relaunching post"
     echo "${TEST_NAME}: held: P's pending-row lines (recorded):"
     log_lines "$(matcher "${STUCK_LINE_HEAD}${KEY[p]} ")" | sed 's/^/  | /' | cut -c1-260
@@ -1094,9 +1094,9 @@ leg_sequence() {
     leg sequence
     local n_spawn line l_q l_q_ms t_restart t_seq t_armed t_kill fm_line t_fm kill_line n_reuse ref_q not_judged step run l posts_before nj_t
     local seq_start_m armed_line ended_line
-    n_spawn="$(cscb_ad_count spawn --claude-instance-id "${ID[q]}")"
+    n_spawn="$(cscb_ad_count spawn --instance-id "${ID[q]}")"
     restart_with_personas "sequence" s p q
-    wait_for_cscb_ad_call "${n_spawn}" "${LAUNCH_WAIT_S}" "sequence: no spawn of Q" spawn --claude-instance-id "${ID[q]}" > /dev/null
+    wait_for_cscb_ad_call "${n_spawn}" "${LAUNCH_WAIT_S}" "sequence: no spawn of Q" spawn --instance-id "${ID[q]}" > /dev/null
     wait_until "${LAUNCH_WAIT_S}" "sequence: Q's row never read pending" row_state_is "${ID[q]}" pending
     l_q="$(launch_start_of "sequence" "${ID[q]}")" || exit 1
     l_q_ms="$(awk -v t="${l_q}" 'BEGIN { printf "%.0f\n", t * 1000 }')"
@@ -1141,7 +1141,7 @@ leg_sequence() {
         _scenario_log_has "${armed_line}"
     line="$(log_lines "${armed_line}" | tail -n 1)"
     t_armed="$(log_time "${line}")" || exit 1
-    kill_line="$(first_cscb_call_at_or_after "${t_seq}" kill --claude-instance-id "${ID[q]}")"
+    kill_line="$(first_cscb_call_at_or_after "${t_seq}" kill --instance-id "${ID[q]}")"
     [[ -n "${kill_line}" ]] || fail "sequence: Q's live-row sequence made no kill"
     call_fields "sequence" "${kill_line}"
     t_kill="${CALL_T}"
@@ -1164,7 +1164,7 @@ leg_sequence() {
 
     # Q brought up by a reuse spawn.
     wait_until "${REPORT_WAIT_S}" "sequence: Q never reported in" row_state_is "${ID[q]}" waiting
-    n_reuse="$(cscb_calls_between "${t_restart}" "$(now_s)" spawn --claude-instance-id "${ID[q]}" --reuse-finished)"
+    n_reuse="$(cscb_calls_between "${t_restart}" "$(now_s)" spawn --instance-id "${ID[q]}" --reuse-finished)"
     (( n_reuse >= 1 )) || fail "sequence: Q came up with no reuse spawn"
     print_cscb_calls "${t_restart}" "$(now_s)" "sequence: CSCB's calls from the restart until Q reported in (recorded)"
 
@@ -1177,7 +1177,7 @@ leg_sequence() {
             [[ -n "${not_judged}" ]] || continue
             nj_t="$(log_time "${not_judged}")" || exit 1
             echo "${TEST_NAME}: sequence: a run left Q's row in neither list: ${not_judged}"
-            [[ "$(cscb_calls_between "${nj_t}" "$(now_s)" kill --claude-instance-id "${ID[q]}")" == 0 ]] \
+            [[ "$(cscb_calls_between "${nj_t}" "$(now_s)" kill --instance-id "${ID[q]}")" == 0 ]] \
                 || fail "sequence: a CSCB kill of Q followed a run that left its row in neither list"
         done
     done
@@ -1214,18 +1214,18 @@ leg_change() {
     [[ "$(values_lines)" == "$(( before + 1 ))" ]] || fail "change: $(( $(values_lines) - before )) values lines after the grace change, not one"
 
     # R, added by a confirmed reload.
-    n_spawn="$(cscb_ad_count spawn --claude-instance-id "${ID[r]}")"
+    n_spawn="$(cscb_ad_count spawn --instance-id "${ID[r]}")"
     write_personas s p q r
     wait_for_file "${CONFIG}.pending" "${RELOAD_WAIT_S}" "change: the reload adding R was not previewed"
     check_pending_layout "change: the reload adding R" added=1
     mv -- "${CONFIG}.pending" "${CONFIG}.apply" || fail "change: could not confirm the reload"
     wait_for_log "${APPLIED_CLASS}" "${RELOAD_WAIT_S}" "change: the reload adding R was not applied"
-    wait_for_cscb_ad_call "${n_spawn}" "${LAUNCH_WAIT_S}" "change: no spawn of R" spawn --claude-instance-id "${ID[r]}" > /dev/null
+    wait_for_cscb_ad_call "${n_spawn}" "${LAUNCH_WAIT_S}" "change: no spawn of R" spawn --instance-id "${ID[r]}" > /dev/null
     wait_until "${LAUNCH_WAIT_S}" "change: R's row never read pending" row_state_is "${ID[r]}" pending
     l_r="$(launch_start_of "change" "${ID[r]}")" || exit 1
     sleep_until "$(time_plus "${l_r}" "$(( R_WINDOW_TO_S + 1 ))")"
     allowed=$(( (R_WINDOW_TO_S - R_WINDOW_FROM_S) / SLOW_PACE_S + 1 ))
-    n="$(cscb_calls_between "$(time_plus "${l_r}" "${R_WINDOW_FROM_S}")" "$(time_plus "${l_r}" "${R_WINDOW_TO_S}")" read-pane --claude-instance-id "${ID[r]}")"
+    n="$(cscb_calls_between "$(time_plus "${l_r}" "${R_WINDOW_FROM_S}")" "$(time_plus "${l_r}" "${R_WINDOW_TO_S}")" read-pane --instance-id "${ID[r]}")"
     echo "${TEST_NAME}: change: R's read-pane calls in (${R_WINDOW_FROM_S}s, ${R_WINDOW_TO_S}s) from its launch start: ${n}; the slow pace allows ${allowed}"
     (( n > allowed )) || fail "change: ${n} read-pane calls of R in (${R_WINDOW_FROM_S}s, ${R_WINDOW_TO_S}s), not more than the slow pace allows (${allowed}): the raised G is not in use"
 
@@ -1415,7 +1415,7 @@ refused_values_check() {
     [[ "$(values_lines)" == "${values_before}" ]] || fail "${label}: a values line at the refused read"
 
     # Persona <x> added by a confirmed reload.
-    n_spawn="$(cscb_ad_count spawn --claude-instance-id "${ID[${x}]}")"
+    n_spawn="$(cscb_ad_count spawn --instance-id "${ID[${x}]}")"
     n_applied="$(count_log "${APPLIED_CLASS}")"
     UP_PERSONAS+=("${x}")
     write_personas "${UP_PERSONAS[@]}"
@@ -1423,7 +1423,7 @@ refused_values_check() {
     check_pending_layout "${label}: the reload adding ${name}" added=1
     mv -- "${CONFIG}.pending" "${CONFIG}.apply" || fail "${label}: could not confirm the reload"
     wait_for_count "${APPLIED_CLASS}" "$(( n_applied + 1 ))" "${RELOAD_WAIT_S}" "${label}: the reload adding ${name} was not applied"
-    wait_for_cscb_ad_call "${n_spawn}" "${LAUNCH_WAIT_S}" "${label}: no spawn of ${name}" spawn --claude-instance-id "${ID[${x}]}" > /dev/null
+    wait_for_cscb_ad_call "${n_spawn}" "${LAUNCH_WAIT_S}" "${label}: no spawn of ${name}" spawn --instance-id "${ID[${x}]}" > /dev/null
 
     # The alert: one onset post, the printer's fixed parts around
     # agent-director's description.
@@ -1476,7 +1476,7 @@ refused_values_check() {
     done
     # One launch: <x>'s plain spawn at the reload; no launch for a persona already up.
     spawns="$(cscb_calls_between "${t_bad}" "${t_fix}" spawn)"
-    n="$(cscb_calls_between "${t_bad}" "${t_fix}" spawn --claude-instance-id "${ID[${x}]}")"
+    n="$(cscb_calls_between "${t_bad}" "${t_fix}" spawn --instance-id "${ID[${x}]}")"
     [[ "${spawns}" == 1 && "${n}" == 1 && "$(cscb_calls_between "${t_bad}" "${t_fix}" spawn --reuse-finished)" == 0 ]] \
         || fail "${label}: ${spawns} CSCB spawn(s) while refused, ${n} of them ${name}'s, not its one plain launch"
     # Each retry reran the recovery: its liveness read refused (read as
@@ -1490,7 +1490,7 @@ refused_values_check() {
         [[ "$(count_log "${m}")" == 1 ]] || fail "${label}: ${name}'s retry ${retries} was not re-armed as liveness unknown"
     done
     (( retries >= 2 )) || fail "${label}: ${retries} retries of ${name} while refused, not two or more"
-    n="$(cscb_calls_between "${t_bad}" "${t_fix}" status --claude-instance-id "${ID[${x}]}")"
+    n="$(cscb_calls_between "${t_bad}" "${t_fix}" status --instance-id "${ID[${x}]}")"
     [[ "${n}" == "${retries}" ]] || fail "${label}: ${n} CSCB status call(s) of ${name} for ${retries} retries"
     n="$(count_log_from "${t_bad}" "${t_fix}" "$(matcher "${STATUS_ERROR_HEAD}${KEY[${x}]}: " "${STATUS_ERROR_TAIL}")")"
     [[ "${n}" == "${retries}" ]] || fail "${label}: ${n} refused liveness read line(s) of ${name} for ${retries} retries"
@@ -1669,9 +1669,9 @@ start_call_timeout_leg() {
     rm -f -- "${CONFIG}.last-applied" || fail "${step}: could not remove ${CONFIG}.last-applied"
     tmux_shim_mode slow-create "${SLOW_CREATE_DELAY_S}"
     WARN_BEFORE="$(count_log "${WARN_STEM}")"
-    n_spawn="$(cscb_ad_count spawn --claude-instance-id "${ID[${x}]}")"
+    n_spawn="$(cscb_ad_count spawn --instance-id "${ID[${x}]}")"
     start_live "${step}" "${VALUES_LINE_CT}"
-    line="$(wait_for_cscb_ad_call "${n_spawn}" "${LAUNCH_WAIT_S}" "${step}: no spawn of ${SCENARIO_TAG}_${x}" spawn --claude-instance-id "${ID[${x}]}")" || exit 1
+    line="$(wait_for_cscb_ad_call "${n_spawn}" "${LAUNCH_WAIT_S}" "${step}: no spawn of ${SCENARIO_TAG}_${x}" spawn --instance-id "${ID[${x}]}")" || exit 1
     call_fields "${step}" "${line}"
     [[ "${CALL_PPID}" == "${SERVER_PID}" ]] || fail "${step}: ${SCENARIO_TAG}_${x}'s spawn was not made by this server process"
     [[ " ${_L_ARGS[*]} " != *" --reuse-finished "* ]] || fail "${step}: ${SCENARIO_TAG}_${x}'s first launch is a reuse spawn, not a plain spawn"
@@ -1696,7 +1696,7 @@ launch_answer_at() {
 approver_brought_up() {
     local step="$1" x="$2" n
     wait_until "${REPORT_WAIT_S}" "${step}: ${SCENARIO_TAG}_${x} never reported in after its launch timeout" row_state_is "${ID[${x}]}" waiting
-    n="$(cscb_calls_between "$3" "$(now_s)" send-keys --claude-instance-id "${ID[${x}]}")"
+    n="$(cscb_calls_between "$3" "$(now_s)" send-keys --instance-id "${ID[${x}]}")"
     (( n >= 1 )) || fail "${step}: ${SCENARIO_TAG}_${x} reported in with no CSCB send-keys (the approver's Enter) after its launch timeout"
 }
 
@@ -1728,7 +1728,7 @@ leg_call_timeout_low() {
     : > "${readings}"
     deadline=$(( SECONDS + CALL_TIMEOUT_LOW_MS / 1000 + REPORT_WAIT_S + RETRY_CEILING_S + LOG_WAIT_S ))
     while :; do
-        ad_capture get --claude-instance-id "${ID[${x}]}"
+        ad_capture get --instance-id "${ID[${x}]}"
         state=""
         start_raw=""
         if (( AD_RC == 0 )); then
@@ -1753,7 +1753,7 @@ leg_call_timeout_low() {
 
     # b.jg5 SRJ-407: one CSCB get after the timeout, which read this launch's
     # pending row; the approver brought it up.
-    get_line="$(first_cscb_call_at_or_after "${T_CALL}" get --claude-instance-id "${ID[${x}]}")"
+    get_line="$(first_cscb_call_at_or_after "${T_CALL}" get --instance-id "${ID[${x}]}")"
     [[ -n "${get_line}" ]] || fail "${step}: no CSCB get of T1 after its launch timeout"
     call_fields "${step}" "${get_line}"
     t_get="${CALL_T}"
@@ -1776,14 +1776,14 @@ leg_call_timeout_low() {
         last="$(awk -F'\t' -v t="${t}" '$1 < t { s = $2 } END { print s }' "${readings}")"
         [[ "${last}" == ended || "${last}" == missing ]] \
             || fail "${step}: a CSCB ${CALL_VERB} of T1 at +$(seconds_between "${T_CALL}" "${t}")s, while the harness read its row '${last:-nothing}'"
-        reads=$(( $(cscb_calls_between "${prev}" "${t}" get --claude-instance-id "${ID[${x}]}") + $(cscb_calls_between "${prev}" "${t}" status --claude-instance-id "${ID[${x}]}") ))
+        reads=$(( $(cscb_calls_between "${prev}" "${t}" get --instance-id "${ID[${x}]}") + $(cscb_calls_between "${prev}" "${t}" status --instance-id "${ID[${x}]}") ))
         (( reads >= 1 )) || fail "${step}: a CSCB ${CALL_VERB} of T1 at +$(seconds_between "${T_CALL}" "${t}")s with no CSCB read of its row before it"
         prev="${t}"
-    done < <({ cscb_ad_calls spawn --claude-instance-id "${ID[${x}]}"; cscb_ad_calls resume --claude-instance-id "${ID[${x}]}"; } | sort -t $'\t' -k2,2n)
+    done < <({ cscb_ad_calls spawn --instance-id "${ID[${x}]}"; cscb_ad_calls resume --instance-id "${ID[${x}]}"; } | sort -t $'\t' -k2,2n)
     n_pending="$(awk -F'\t' '$2 == "pending"' "${readings}" | wc -l | tr -d ' ')"
     n_live="$(awk -F'\t' '$2 != "pending" && $2 != "ended" && $2 != "missing" && $2 != "none"' "${readings}" | wc -l | tr -d ' ')"
     first_waiting="$(awk -F'\t' '$2 == "waiting" { print $1; exit }' "${readings}")"
-    echo "${TEST_NAME}: ${step}: T1's row read ${n_pending} time(s) pending and ${n_live} time(s) live (waiting from +$(seconds_between "${T_CALL}" "${first_waiting}")s), never ended or missing; $(( $(cscb_ad_count spawn --claude-instance-id "${ID[${x}]}") + $(cscb_ad_count resume --claude-instance-id "${ID[${x}]}") )) CSCB launch call(s) of T1 in all"
+    echo "${TEST_NAME}: ${step}: T1's row read ${n_pending} time(s) pending and ${n_live} time(s) live (waiting from +$(seconds_between "${T_CALL}" "${first_waiting}")s), never ended or missing; $(( $(cscb_ad_count spawn --instance-id "${ID[${x}]}") + $(cscb_ad_count resume --instance-id "${ID[${x}]}") )) CSCB launch call(s) of T1 in all"
     echo "${TEST_NAME}: ${step}: T1's retry timer: $(log_lines "${stopped_m}" | tail -n 1 | cut -c1-200)"
     print_cscb_calls "${T_CALL}" "$(now_s)" "${step}: CSCB's calls from T1's spawn until its timer stopped (recorded)"
 }
@@ -1813,7 +1813,7 @@ leg_call_timeout_high() {
 
     # b.jg5 SRJ-407: the one get read this launch's pending row, which CSCB
     # took as a launch timeout of that form; the approver brought it up.
-    get_line="$(first_cscb_call_at_or_after "${T_CALL}" get --claude-instance-id "${ID[${x}]}")"
+    get_line="$(first_cscb_call_at_or_after "${T_CALL}" get --instance-id "${ID[${x}]}")"
     [[ -n "${get_line}" ]] || fail "${step}: no CSCB get of T2 after its launch timeout"
     call_fields "${step}" "${get_line}"
     t_get="${CALL_T}"

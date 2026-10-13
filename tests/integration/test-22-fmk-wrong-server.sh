@@ -102,7 +102,7 @@
 #      worker runs and the row still reads `missing`.
 #   5. The human's finished-row kill (SRJ-1412 B (4); AC 16), right after the
 #      second re-check: `ad_kill_include_finished <id>`, agent-director-admin's
-#      `kill-finished --claude-instance-id <id>` (agent-director 0.11.0's form
+#      `kill-finished --instance-id <id>` (agent-director 0.11.0's form
 #      of `kill --include-finished`), from the scenario's own shell. It
 #      reports `kill_sent` true; the worker's session and process are gone;
 #      the row is unchanged: every column after the kill holds its value from
@@ -279,7 +279,7 @@ row_json() {
 # adds no line to the shim's log).
 row_reads() {
     local state
-    state="$(_scenario_store_read "row state" "SELECT state FROM spawns WHERE claude_instance_id = '${INSTANCE_ID}'")" || exit 1
+    state="$(_scenario_store_read "row state" "SELECT state FROM spawns WHERE instance_id = '${INSTANCE_ID}'")" || exit 1
     [[ "${state}" == "$1" ]]
 }
 
@@ -287,7 +287,7 @@ row_reads() {
 # reads <state>.
 expect_status() {
     local step="$1" want="$2" got
-    ad_capture status --claude-instance-id "${INSTANCE_ID}"
+    ad_capture status --instance-id "${INSTANCE_ID}"
     (( AD_RC == 0 )) || fail "${step}: the harness status read exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
     got="$(jq -r '.state // empty' "${AD_OUT}")"
     [[ "${got}" == "${want}" ]] || fail "${step}: the row reads '${got}', not ${want}"
@@ -410,8 +410,8 @@ expect_window() {
         [[ "${WIN_PPIDS[i]}" == "${SERVER_PID}" ]] \
             || fail "${step}: its ${WIN_VERBS[i]} has parent ${WIN_PPIDS[i]}, not the bot server ${SERVER_PID}"
         if [[ "${WIN_VERBS[i]}" != find-missing ]]; then
-            [[ " ${WIN_ARGS[i]} " == *" --claude-instance-id ${INSTANCE_ID} "* ]] \
-                || fail "${step}: its ${WIN_VERBS[i]} names no --claude-instance-id ${INSTANCE_ID}: ${WIN_ARGS[i]}"
+            [[ " ${WIN_ARGS[i]} " == *" --instance-id ${INSTANCE_ID} "* ]] \
+                || fail "${step}: its ${WIN_VERBS[i]} names no --instance-id ${INSTANCE_ID}: ${WIN_ARGS[i]}"
         fi
         if [[ "${WIN_VERBS[i]}" == read-pane ]]; then
             [[ " ${WIN_ARGS[i]} " == *" --n-lines ${PROBE_LINES} "* ]] \
@@ -506,7 +506,7 @@ expect_completion 1 "${STEP}" "0 not brought up"
 wait_until "${REPORT_WAIT_S}" "${STEP}: row ${INSTANCE_ID} never reported in (waiting)" row_reads waiting
 expect_status "${STEP}" waiting
 note_worker "${STEP}"
-n="$(cscb_ad_count send-keys "--claude-instance-id ${INSTANCE_ID}")"
+n="$(cscb_ad_count send-keys "--instance-id ${INSTANCE_ID}")"
 (( n >= 1 )) || fail "${STEP}: no CSCB send-keys cleared the stub's dialog"
 
 # ---------------------------------------------------------------------------
@@ -537,7 +537,7 @@ expect_worker_runs "${STEP}: after both runs"
 echo "${TEST_NAME}: ${STEP}: holding $(( RECHECK_S + HOLD_EXTRA_S ))s (one re-check interval and ${HOLD_EXTRA_S}s)"
 sleep "$(( RECHECK_S + HOLD_EXTRA_S ))"
 for verb in resume spawn kill read-pane send-keys; do
-    n="$(cscb_ad_count_between "${MARK_A}" - "${verb}" "--claude-instance-id ${INSTANCE_ID}")"
+    n="$(cscb_ad_count_between "${MARK_A}" - "${verb}" "--instance-id ${INSTANCE_ID}")"
     [[ "${n}" == 0 ]] || fail "${STEP}: a CSCB process made ${n} ${verb} call(s) for ${INSTANCE_ID} after part A"
 done
 n="$(cscb_ad_count_between "${MARK_A}" - find-missing)"
@@ -567,7 +567,7 @@ fi
 
 # The human's one store statement (the harness's only sqlite3 write here).
 ENDED_AT="$(ad_store_mark_finished "${INSTANCE_ID}" missing)"
-ad_capture status --claude-instance-id "${INSTANCE_ID}"
+ad_capture status --instance-id "${INSTANCE_ID}"
 if (( AD_RC != 0 )) || ! jq -e '.state == "missing" and (has("launch_started_at") | not)' "${AD_OUT}" > /dev/null; then
     fail "${STEP}: after the statement the harness status read answered $(tr '\n' ' ' < "${AD_OUT}") (exit ${AD_RC})"
 fi
@@ -585,7 +585,7 @@ wait_for_log "${LATCH_OWN_ID}" "${LATCH_WAIT_S}" "${STEP}: ${PERSONA_KEY} never 
 
 # The new bot server's resume met the own-id CONFLICT; any still-stopping or
 # still-starting UNAVAILABLE came first.
-out="$(cscb_ad_calls resume "--claude-instance-id ${INSTANCE_ID}")"
+out="$(cscb_ad_calls resume "--instance-id ${INSTANCE_ID}")"
 lines=()
 [[ -z "${out}" ]] || mapfile -t lines <<< "${out}"
 n=0
@@ -695,7 +695,7 @@ got="${got%x}"
     || fail "${STEP}: the recovery post reads '${got}', not '${RECOVERY_POST}'"
 # One find-missing and one resume over the whole window from the second
 # re-check on, not only up to the first resume.
-n="$(cscb_ad_count_between "${MARK_HELD}" - resume "--claude-instance-id ${INSTANCE_ID}")"
+n="$(cscb_ad_count_between "${MARK_HELD}" - resume "--instance-id ${INSTANCE_ID}")"
 [[ "${n}" == 1 ]] || fail "${STEP}: CSCB made ${n} resume call(s) of ${INSTANCE_ID} since the second re-check, not 1"
 n="$(cscb_ad_count_between "${MARK_HELD}" - find-missing)"
 [[ "${n}" == 1 ]] || fail "${STEP}: CSCB made ${n} find-missing call(s) since the second re-check, not 1"

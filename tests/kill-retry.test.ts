@@ -264,7 +264,7 @@ async function run(spec: RunSpec): Promise<Run> {
       else {
         if (step !== undefined) statusQueue.push(step)
         try {
-          const row = await client.status({ claude_instance_id: STUB_INSTANCE_ID })
+          const row = await client.status({ instance_id: STUB_INSTANCE_ID })
           answer = { kind: KILL_RETRY_READ_STATE, state: row.state }
         } catch (error) {
           answer = { kind: KILL_RETRY_READ_FAILED, error }

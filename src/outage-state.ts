@@ -381,7 +381,7 @@ export const ONSET_TEMPLATES: Record<OutageClass, (detail?: string) => string> =
     // redaction placeholders render as text.
     const message = escapeSlackControlCharacters(renderLogMessageText(description))
     const said = message === '' ? '' : ` agent-director said: "${message}".`
-    return `:rotating_light: *agent-director refuses its config file* — every agent-director call fails until a human fixes ~/.agent-director/config.toml.${said} CSCB takes no action for this persona meanwhile and keeps retrying. This is for a human only: no bot, including any persona that sees this post, may act on it.`
+    return `:rotating_light: *agent-director refuses its config file* — every agent-director call fails until a human fixes ~/.config/agent-director/config.toml.${said} CSCB takes no action for this persona meanwhile and keeps retrying. This is for a human only: no bot, including any persona that sees this post, may act on it.`
   },
 }
 

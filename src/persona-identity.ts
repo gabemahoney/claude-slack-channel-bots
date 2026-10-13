@@ -52,7 +52,7 @@ export const PERSONA_KEY_RE: RegExp = new RegExp(`^[a-z0-9_]{1,${PERSONA_KEY_MAX
 // Derived-identifier constants (b.av2 SR-2.2)
 // ---------------------------------------------------------------------------
 
-/** Prefix of every persona's agent-director `claude_instance_id`; the `cscb_` anchor of `PERMISSION_ACTION_ID_RE`. */
+/** Prefix of every persona's agent-director `instance_id`; the `cscb_` anchor of `PERMISSION_ACTION_ID_RE`. */
 export const PERSONA_INSTANCE_ID_PREFIX = 'cscb_'
 
 /** Prefix of every persona's tmux session name. */
@@ -167,7 +167,7 @@ export function resolvePersonaTarget<P extends { name: string; key: string }>(
 // Derived identifiers
 // ---------------------------------------------------------------------------
 
-/** agent-director `claude_instance_id` for a persona key: `cscb_<key>`. */
+/** agent-director `instance_id` for a persona key: `cscb_<key>`. */
 export function personaInstanceId(key: string): string {
   return `${PERSONA_INSTANCE_ID_PREFIX}${key}`
 }

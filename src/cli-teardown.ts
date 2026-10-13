@@ -225,7 +225,7 @@ export type CliTeardownCommand = typeof CLI_COMMAND_STOP_BOTS | typeof CLI_COMMA
 
 /**
  * agent-director's config file as the CLI's lines name it,
- * `~/.agent-director/config.toml` (b.jg5 SRJ-901, SRJ-316; defined in
+ * `~/.config/agent-director/config.toml` (b.jg5 SRJ-901, SRJ-316; defined in
  * `src/ad-config-file.ts`).
  */
 export { AD_CONFIG_FILE_DISPLAY_NAME }

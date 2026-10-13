@@ -180,6 +180,7 @@ interface ForcedLaunchOutcome {
 interface OwnPaneReadOutcome {
   readonly kind: string
   readonly pane?: string
+  pane_sha256?: string
   readonly errorClass?: string
   readonly description?: string
   readonly stopping?: boolean

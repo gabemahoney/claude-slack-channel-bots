@@ -749,7 +749,7 @@ async function renderJsonlSafeguardNotices(): Promise<ReadonlyMap<string, string
   }
   const noRecord = (): void => {}
   runPersonaStorageCheck(persona, capture(JSONL_NON_PERSISTENT), { readMountinfo: () => TMPFS_MOUNTINFO, recordStartupError: noRecord, home: JSONL_HOME })
-  const row = cannedGetResult({ state: 'live', jsonl_path: `${JSONL_BASE_DIR}/claude/projects/stale.jsonl`, claude_session_id: 'sess-notice' }, persona, JSONL_HOME)
+  const row = cannedGetResult({ state: 'live', jsonl_path: `${JSONL_BASE_DIR}/claude/projects/stale.jsonl`, session_id: 'sess-notice' }, persona, JSONL_HOME)
   const layer2 = (variant: string, deps: { statFn?: (path: string) => boolean; archiveCountSince?: () => number | null }) =>
     runJsonlPersistenceSafeguard(config, capture(variant), {
       readMountinfo: () => EXT4_MOUNTINFO,
@@ -1416,7 +1416,7 @@ describe('SRJ-1001: the rule patterns find what they look for (the checks are no
   })
 
   test('`agent-director kill` is flagged without "check the result" and passes with it', () => {
-    const kill = `\`agent-director kill --claude-instance-id ${personaInstanceId(KEY)}\``
+    const kill = `\`agent-director kill --instance-id ${personaInstanceId(KEY)}\``
     expect(namesKillWithoutResultCheck(`run ${kill}`)).toBe(true)
     expect(namesKillWithoutResultCheck(`run ${kill}, then check its result`)).toBe(false)
     expect(namesKillWithoutResultCheck(`run ${kill} and check the result`)).toBe(false)
@@ -1432,7 +1432,7 @@ describe('SRJ-1001: the rule patterns find what they look for (the checks are no
   })
 
   test('a command span is `agent-director` or `tmux` and a space; a class label is none', () => {
-    expect(COMMAND_SPAN.test(`run \`agent-director read-pane --claude-instance-id ${personaInstanceId(KEY)}\``)).toBe(true)
+    expect(COMMAND_SPAN.test(`run \`agent-director read-pane --instance-id ${personaInstanceId(KEY)}\``)).toBe(true)
     expect(COMMAND_SPAN.test(`attach with \`tmux attach -t ${exact}\``)).toBe(true)
     expect(COMMAND_SPAN.test('the `tmux-unavailable` outage')).toBe(false)
   })

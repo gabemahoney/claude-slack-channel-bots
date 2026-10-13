@@ -906,7 +906,7 @@ async function dryRunPromptGuardSelfTest(env: RunEnv, ws: Workspace, tc: Contain
     const line = {
       ts: new Date(Date.now() - 60_000).toISOString(),
       event: 'cscb.chat_post.attempted',
-      claude_instance_id: 'cscb_persona_a',
+      instance_id: 'cscb_persona_a',
       request_token: token,
       channel,
       text: '🤖🛠️ permission request: Bash',

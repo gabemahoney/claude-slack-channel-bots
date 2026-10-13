@@ -323,7 +323,7 @@ describe('hostSafeChildEnv', () => {
     ['HOME is the home the run started with', HOST_SAFETY_REFUSAL.realHome, () => ({ home: homedir() })],
     ['HOME holds an agent-director install directory with no binary in it', HOST_SAFETY_REFUSAL.homeHoldsInstall, () => {
       const home = dirUnder('home')
-      mkdirSync(join(home, AGENT_DIRECTOR_INSTALL_DIR))
+      mkdirSync(join(home, AGENT_DIRECTOR_INSTALL_DIR), { recursive: true })
       return { home }
     }],
     ['HOME holds the standard install path (a plain file)', HOST_SAFETY_REFUSAL.homeHoldsInstall, () => {
@@ -1764,7 +1764,7 @@ const STORE_OR_FILE_STEPS: readonly string[] = ['sqlite3', 'cp', 'mv', 'install'
 /** A command word that runs an install script (by its path or the variable holding it). */
 const INSTALL_SCRIPT_WORD = /install\.sh$|_INSTALL_SH\}?$/
 
-/** A path to agent-director's binary, agent-director-admin or the shim over either (`${HOME}/.agent-director/bin/agent-director`, `….real`, `${HOME}/.agent-director/admin/agent-director-admin`, an image copy). */
+/** A path to agent-director's binary, agent-director-admin or the shim over either (`${HOME}/.config/agent-director/bin/agent-director`, `….real`, `${HOME}/.config/agent-director/admin/agent-director-admin`, an image copy). */
 const AGENT_DIRECTOR_PATH = /(?:^|\/)agent-director(?:-admin)?(?:\.real)?$/
 
 /** Reserved words that may stand before a command name; they open or close no step themselves. */
@@ -2176,7 +2176,7 @@ const SHELL_DECLARATIONS: ReadonlySet<string> = new Set(['local', 'declare', 'ty
 
 /**
  * The variables `commands` assign an agent-director path to, anywhere
- * (`local real="${HOME}/.agent-director/bin/agent-director.real"`,
+ * (`local real="${HOME}/.config/agent-director/bin/agent-director.real"`,
  * `SCENARIO_AD_BIN="${HOME}/…"`, `SCENARIO_RELEASE_BIN=/opt/…/agent-director`).
  */
 function agentDirectorPathVariables(commands: readonly ShellCommand[]): Set<string> {
@@ -2520,34 +2520,34 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       '    cat > "$1.tmp" || fail "write_file: could not write $1"',
       '    mv -f "$1.tmp" "$1" || fail "write_file: could not rename into $1"',
       '}',
-      'SCENARIO_AD_BIN="${HOME}/.agent-director/bin/agent-director"',
+      'SCENARIO_AD_BIN="${HOME}/.config/agent-director/bin/agent-director"',
     )
     const GUARDS = lines('    require_ci_image "${step}"', `    ${HOME_GUARD} "\${step}"`)
     const BODIES: Readonly<Record<string, string>> = {
       install_ad_shim: lines(
         '    local step="${1:-install the agent-director shim}"',
         GUARDS,
-        '    local path="${HOME}/.agent-director/bin/agent-director"',
+        '    local path="${HOME}/.config/agent-director/bin/agent-director"',
         '    mv -f -- "${path}" "${path}.real" || fail "${step}: could not move ${path}"',
         '    _scenario_place "${SCENARIO_AD_SHIM_SRC}" "${path}" "${step}"',
       ),
       ad_store_edit: lines(
         '    local step=ad_store_edit out',
         GUARDS,
-        '    out="$(sqlite3 -batch -bail "${HOME}/.agent-director/state.db" "$1;" 2>&1)" \\',
+        '    out="$(sqlite3 -batch -bail "${HOME}/.config/agent-director/state.db" "$1;" 2>&1)" \\',
         '        || fail "ad_store_edit: sqlite3 failed: ${out}"',
       ),
       ad_store_id: lines(
         '    local step=ad_store_id out',
         GUARDS,
-        '    out="$(sqlite3 -batch -readonly "${HOME}/.agent-director/state.db" \\',
+        '    out="$(sqlite3 -batch -readonly "${HOME}/.config/agent-director/state.db" \\',
         `        "SELECT value FROM store_meta WHERE key = 'store_id';" 2>&1)" || fail "ad_store_id: \${out}"`,
       ),
       ad_store_backup: lines(
         '    local dest="${1:-}" step out',
         '    step="ad_store_backup ${dest}"',
         GUARDS,
-        `    out="$(sqlite3 -batch -bail -readonly "\${HOME}/.agent-director/state.db" ".backup '\${dest}'" 2>&1)" \\`,
+        `    out="$(sqlite3 -batch -bail -readonly "\${HOME}/.config/agent-director/state.db" ".backup '\${dest}'" 2>&1)" \\`,
         '        || fail "${step}: sqlite3 .backup failed: ${out}"',
       ),
     }
@@ -2570,25 +2570,25 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
     // Each row's source is audited as a whole: every function with a step,
     // less HOME_CHECK_EXEMPT and HOME_CHECKED_BY_CALLERS, is held to the rule.
     const flagged: [label: string, source: string][] = [
-      ['install_ad_shim: a copy before its HOME check', helperSource({ install_ad_shim: lines('    cp -- "${HOME}/.agent-director/bin/agent-director" /tmp/ad.bak', GUARDS, BODIES.install_ad_shim) })],
-      ['install_ad_shim: a move before its HOME check', helperSource({ install_ad_shim: lines('    require_ci_image x', '    mv -f -- "${HOME}/.agent-director/bin/agent-director" /tmp/ad', `    ${HOME_GUARD} x`) })],
-      ['install_ad_shim: the copy delegated to _scenario_place before its HOME check', helperSource({ install_ad_shim: lines('    require_ci_image x', '    _scenario_place "${SCENARIO_AD_SHIM_SRC}" "${HOME}/.agent-director/bin/agent-director" x', `    ${HOME_GUARD} x`) })],
+      ['install_ad_shim: a copy before its HOME check', helperSource({ install_ad_shim: lines('    cp -- "${HOME}/.config/agent-director/bin/agent-director" /tmp/ad.bak', GUARDS, BODIES.install_ad_shim) })],
+      ['install_ad_shim: a move before its HOME check', helperSource({ install_ad_shim: lines('    require_ci_image x', '    mv -f -- "${HOME}/.config/agent-director/bin/agent-director" /tmp/ad', `    ${HOME_GUARD} x`) })],
+      ['install_ad_shim: the copy delegated to _scenario_place before its HOME check', helperSource({ install_ad_shim: lines('    require_ci_image x', '    _scenario_place "${SCENARIO_AD_SHIM_SRC}" "${HOME}/.config/agent-director/bin/agent-director" x', `    ${HOME_GUARD} x`) })],
       ['install_ad_shim: an install.sh run before its HOME check', helperSource({ install_ad_shim: lines('    (cd "${HOME}" && "${SCENARIO_RELEASE_INSTALL_SH}" --binary /opt/ad --no-hooks) < /dev/null', GUARDS) })],
-      ['ad_store_edit: sqlite3 in a command substitution before its HOME check', helperSource({ ad_store_edit: lines('    require_ci_image x', '    local out="$(sqlite3 "${HOME}/.agent-director/state.db" "$1;")"', `    ${HOME_GUARD} x`) })],
-      ['ad_store_edit: the HOME check only after an ||', helperSource({ ad_store_edit: lines('    [[ -f "${HOME}/.agent-director/state.db" ]] || ' + `${HOME_GUARD} x`, '    sqlite3 "${HOME}/.agent-director/state.db" "$1;"') })],
-      ['ad_store_edit: the HOME check only in a subshell', helperSource({ ad_store_edit: lines(`    ( ${HOME_GUARD} x )`, '    sqlite3 "${HOME}/.agent-director/state.db" "$1;"') })],
-      ['ad_store_id: the HOME check only inside an if', helperSource({ ad_store_id: lines('    if [[ -n "${STRICT:-}" ]]; then', `        ${HOME_GUARD} x`, '    fi', '    sqlite3 -readonly "${HOME}/.agent-director/state.db" "SELECT 1;"') })],
-      ['ad_store_id: no HOME check at all', helperSource({ ad_store_id: lines('    require_ci_image x', '    sqlite3 -readonly "${HOME}/.agent-director/state.db" "SELECT 1;"') })],
-      ['ad_store_backup: the .backup before its HOME check', helperSource({ ad_store_backup: lines('    require_ci_image x', `    sqlite3 -readonly "\${HOME}/.agent-director/state.db" ".backup '$1'"`, `    ${HOME_GUARD} x`) })],
-      ['ad_store_backup: only the image check', helperSource({ ad_store_backup: lines('    require_ci_image x', `    sqlite3 -readonly "\${HOME}/.agent-director/state.db" ".backup '$1'"`) })],
-      ['a new helper with a copy and no HOME check', helperSource({}, fn('stash_store', '    require_ci_image x', '    cp -- "${HOME}/.agent-director/state.db" "${SCENARIO_ROOT}/s.db"'))],
-      ['a new helper running agent-director by its HOME path before the check', helperSource({}, fn('ad_version', '    "${HOME}/.agent-director/bin/agent-director" version', `    ${HOME_GUARD} x`))],
-      ['a new helper running the binary behind the shim through a local holding its path', helperSource({}, fn('ad_real_version', '    local real="${HOME}/.agent-director/bin/agent-director.real" out', '    out="$("${real}" version)"'))],
+      ['ad_store_edit: sqlite3 in a command substitution before its HOME check', helperSource({ ad_store_edit: lines('    require_ci_image x', '    local out="$(sqlite3 "${HOME}/.config/agent-director/state.db" "$1;")"', `    ${HOME_GUARD} x`) })],
+      ['ad_store_edit: the HOME check only after an ||', helperSource({ ad_store_edit: lines('    [[ -f "${HOME}/.config/agent-director/state.db" ]] || ' + `${HOME_GUARD} x`, '    sqlite3 "${HOME}/.config/agent-director/state.db" "$1;"') })],
+      ['ad_store_edit: the HOME check only in a subshell', helperSource({ ad_store_edit: lines(`    ( ${HOME_GUARD} x )`, '    sqlite3 "${HOME}/.config/agent-director/state.db" "$1;"') })],
+      ['ad_store_id: the HOME check only inside an if', helperSource({ ad_store_id: lines('    if [[ -n "${STRICT:-}" ]]; then', `        ${HOME_GUARD} x`, '    fi', '    sqlite3 -readonly "${HOME}/.config/agent-director/state.db" "SELECT 1;"') })],
+      ['ad_store_id: no HOME check at all', helperSource({ ad_store_id: lines('    require_ci_image x', '    sqlite3 -readonly "${HOME}/.config/agent-director/state.db" "SELECT 1;"') })],
+      ['ad_store_backup: the .backup before its HOME check', helperSource({ ad_store_backup: lines('    require_ci_image x', `    sqlite3 -readonly "\${HOME}/.config/agent-director/state.db" ".backup '$1'"`, `    ${HOME_GUARD} x`) })],
+      ['ad_store_backup: only the image check', helperSource({ ad_store_backup: lines('    require_ci_image x', `    sqlite3 -readonly "\${HOME}/.config/agent-director/state.db" ".backup '$1'"`) })],
+      ['a new helper with a copy and no HOME check', helperSource({}, fn('stash_store', '    require_ci_image x', '    cp -- "${HOME}/.config/agent-director/state.db" "${SCENARIO_ROOT}/s.db"'))],
+      ['a new helper running agent-director by its HOME path before the check', helperSource({}, fn('ad_version', '    "${HOME}/.config/agent-director/bin/agent-director" version', `    ${HOME_GUARD} x`))],
+      ['a new helper running the binary behind the shim through a local holding its path', helperSource({}, fn('ad_real_version', '    local real="${HOME}/.config/agent-director/bin/agent-director.real" out', '    out="$("${real}" version)"'))],
       ['a new helper running the shim by SCENARIO_AD_BIN', helperSource({}, fn('ad_list', '    "${SCENARIO_AD_BIN}" list'))],
-      ['a new helper running agent-director through exec -a', helperSource({}, fn('ad_exec', '    exec -a agent-director "${HOME}/.agent-director/bin/agent-director" list'))],
+      ['a new helper running agent-director through exec -a', helperSource({}, fn('ad_exec', '    exec -a agent-director "${HOME}/.config/agent-director/bin/agent-director" list'))],
       ['a new helper running agent-director under timeout with a signal option', helperSource({}, fn('ad_bounded', '    timeout -s KILL 5 "${SCENARIO_AD_BIN}" list'))],
       ['a new helper running install.sh', helperSource({}, fn('reinstall_ad', '    "${SCENARIO_RELEASE_INSTALL_SH}" --binary /opt/ad --no-hooks'))],
-      ['a new helper whose only step is a call of an exempt primitive (write_file)', helperSource({}, fn('write_ad_config', '    write_file "${HOME}/.agent-director/config.toml" <<< "x"'))],
+      ['a new helper whose only step is a call of an exempt primitive (write_file)', helperSource({}, fn('write_ad_config', '    write_file "${HOME}/.config/agent-director/config.toml" <<< "x"'))],
       ['a new helper whose only step is a call of another helper', helperSource({}, fn('store_id_twice', '    ad_store_id', '    ad_store_id'))],
     ]
 
@@ -2620,7 +2620,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
         ),
       })],
       ['a read-only grep of the shim before the HOME check', helperSource({ install_ad_shim: lines('    grep -qxF -- "# marker" "${SCENARIO_AD_SHIM_SRC}" || fail x', GUARDS, '    _scenario_place a "${HOME}/b" x') })],
-      ['a new helper with its HOME check before its agent-director run', helperSource({}, fn('ad_version', `    ${HOME_GUARD} x`, '    "${HOME}/.agent-director/bin/agent-director" version'))],
+      ['a new helper with its HOME check before its agent-director run', helperSource({}, fn('ad_version', `    ${HOME_GUARD} x`, '    "${HOME}/.config/agent-director/bin/agent-director" version'))],
       ['a lookup with command -v, and a run of another tool through a variable, before the check', helperSource({}, fn('ad_found', '    local tool="${HOME}/bin/jq"', '    command -v agent-director > /dev/null', '    "${tool}" -n 1', `    ${HOME_GUARD} x`, '    ad_store_id'))],
     ]
 
@@ -2638,7 +2638,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
     describe('the helpers checked by their callers (HOME_CHECKED_BY_CALLERS)', () => {
       const PRIVATE = '_scenario_store_peek'
       const LISTED: ReadonlyMap<string, string> = new Map([[PRIVATE, 'a synthetic private read']])
-      const PRIVATE_FN = fn(PRIVATE, '    sqlite3 -readonly "${HOME}/.agent-director/state.db" "$1;"')
+      const PRIVATE_FN = fn(PRIVATE, '    sqlite3 -readonly "${HOME}/.config/agent-director/state.db" "$1;"')
       const callerSource = (...extra: string[]): string => helperSource({}, PRIVATE_FN, ...extra)
 
       const flaggedCallers: [label: string, source: string, scripts: { file: string; source: string }[]][] = [
@@ -2738,8 +2738,8 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       ['restore_tmux_socket', 'its socket move', 'mv'],
       ['stub_dialog_delay', 'its move', 'mv'],
       ['install_ad_release', 'its install.sh run', '${SCENARIO_RELEASE_INSTALL_SH}'],
-      ['ad_admin', 'its run of the HOME’s agent-director-admin', '${HOME}/.agent-director/admin/agent-director-admin'],
-      ['ad', 'its run of the HOME’s agent-director', '${HOME}/.agent-director/bin/agent-director'],
+      ['ad_admin', 'its run of the HOME’s agent-director-admin', '${HOME}/.config/agent-director/admin/agent-director-admin'],
+      ['ad', 'its run of the HOME’s agent-director', '${HOME}/.config/agent-director/bin/agent-director'],
       ['hide_ad_install', 'its move of the shim', 'mv'],
       ['_scenario_store_read', 'its sqlite3 read', 'sqlite3'],
     ])('%s without its require_scenario_home is flagged at %s', (helper, _label, step) => {
@@ -2952,25 +2952,25 @@ function tsDeleteCalls(file: string, source: string): string[] {
 describe('static audit: the harness’s one agent-director delete is scenario 25’s step (b.jg5 SRJ-1306)', () => {
   describe('shell', () => {
     const flagged: [label: string, source: string][] = [
-      ['ad delete', 'ad delete --claude-instance-id t0-x'],
-      ['ad_capture delete', 'ad_capture delete --claude-instance-id "${id}"'],
-      ['ad_admin delete', 'ad_admin delete --claude-instance-id t0-x'],
-      ['ad_admin_capture delete', 'ad_admin_capture delete --claude-instance-id "${id}"'],
-      ['agent-director-admin by its path', '"${HOME}/.agent-director/admin/agent-director-admin" delete --claude-instance-id t0-x'],
-      ['agent-director-admin by its image variable', '"${SCENARIO_RELEASE_ADMIN}" delete --claude-instance-id t0-x'],
-      ['a delete after a global flag with its value', 'ad --home /h delete --claude-instance-id t0-x'],
-      ['a delete after a global flag joined by =', 'ad_capture --store-path=/s/state.db delete --claude-instance-id t0-x'],
-      ['the shim by its variable', '"${SCENARIO_AD_BIN}" delete --claude-instance-id t0-x'],
-      ['the binary by its path', '"${HOME}/.agent-director/bin/agent-director.real" delete --claude-instance-id t0-x'],
-      ['the binary by a local variable', '"${real}" delete --claude-instance-id t0-x'],
-      ['the hook binary by its variable', '"${STATUS_BIN}" delete --claude-instance-id "${id}"'],
-      ['a command of any other name', 'drop_row delete --claude-instance-id t0-x'],
-      ['a delete through exec -a', 'exec -a agent-director "${bin}" delete --claude-instance-id t0-x'],
-      ['a delete under timeout with a signal option', 'timeout -s KILL 5 "${bin}" delete --claude-instance-id t0-x'],
-      ['a delete under env with assignments', 'env -u TMUX HOME=/h "${bin}" delete --claude-instance-id t0-x'],
-      ['a delete in a command substitution', 'out="$(ad delete --claude-instance-id t0-x 2>&1)"'],
-      ['a delete in a subshell after cd', '( cd /x && "${ad_path}" delete --claude-instance-id t0-x )'],
-      ['a delete after &&', 'true && ad delete --claude-instance-id t0-x'],
+      ['ad delete', 'ad delete --instance-id t0-x'],
+      ['ad_capture delete', 'ad_capture delete --instance-id "${id}"'],
+      ['ad_admin delete', 'ad_admin delete --instance-id t0-x'],
+      ['ad_admin_capture delete', 'ad_admin_capture delete --instance-id "${id}"'],
+      ['agent-director-admin by its path', '"${HOME}/.config/agent-director/admin/agent-director-admin" delete --instance-id t0-x'],
+      ['agent-director-admin by its image variable', '"${SCENARIO_RELEASE_ADMIN}" delete --instance-id t0-x'],
+      ['a delete after a global flag with its value', 'ad --home /h delete --instance-id t0-x'],
+      ['a delete after a global flag joined by =', 'ad_capture --store-path=/s/state.db delete --instance-id t0-x'],
+      ['the shim by its variable', '"${SCENARIO_AD_BIN}" delete --instance-id t0-x'],
+      ['the binary by its path', '"${HOME}/.config/agent-director/bin/agent-director.real" delete --instance-id t0-x'],
+      ['the binary by a local variable', '"${real}" delete --instance-id t0-x'],
+      ['the hook binary by its variable', '"${STATUS_BIN}" delete --instance-id "${id}"'],
+      ['a command of any other name', 'drop_row delete --instance-id t0-x'],
+      ['a delete through exec -a', 'exec -a agent-director "${bin}" delete --instance-id t0-x'],
+      ['a delete under timeout with a signal option', 'timeout -s KILL 5 "${bin}" delete --instance-id t0-x'],
+      ['a delete under env with assignments', 'env -u TMUX HOME=/h "${bin}" delete --instance-id t0-x'],
+      ['a delete in a command substitution', 'out="$(ad delete --instance-id t0-x 2>&1)"'],
+      ['a delete in a subshell after cd', '( cd /x && "${ad_path}" delete --instance-id t0-x )'],
+      ['a delete after &&', 'true && ad delete --instance-id t0-x'],
     ]
 
     test.each(flagged)('finds %s', (_label, source) => {
@@ -2978,16 +2978,16 @@ describe('static audit: the harness’s one agent-director delete is scenario 25
     })
 
     const allowed: [label: string, source: string][] = [
-      ['a comment', '# ad delete --claude-instance-id t0-x'],
-      ['a string', 'echo "ad delete --claude-instance-id t0-x"'],
-      ['a synthetic shim log line', "printf 'call\\t1.000000\\t1\\t2\\tx\\t%s\\n' 'delete --claude-instance-id cscb_x' >> \"${log}\""],
-      ['another verb carrying the word', 'ad get --claude-instance-id delete'],
-      ['a global flag whose value is delete', 'ad --home delete get --claude-instance-id t0-x'],
-      ['a heredoc body', lines('cat << EOF', 'ad delete --claude-instance-id t0-x', 'EOF')],
+      ['a comment', '# ad delete --instance-id t0-x'],
+      ['a string', 'echo "ad delete --instance-id t0-x"'],
+      ['a synthetic shim log line', "printf 'call\\t1.000000\\t1\\t2\\tx\\t%s\\n' 'delete --instance-id cscb_x' >> \"${log}\""],
+      ['another verb carrying the word', 'ad get --instance-id delete'],
+      ['a global flag whose value is delete', 'ad --home delete get --instance-id t0-x'],
+      ['a heredoc body', lines('cat << EOF', 'ad delete --instance-id t0-x', 'EOF')],
       ['the word as a loop value', lines('for verb in kill delete; do', '    :', 'done')],
       ['the word as a later argument of a log reader', 'cscb_lines "${LOG}" delete "${SCENARIO_ROOT}/leg-b-delete"'],
       ['the word in a test and a case pattern', lines('[[ "${_L_VERB}" == delete ]] || continue', 'case "${verb}" in', '    delete) n=1 ;;', 'esac')],
-      ['the verb a log reader counts or prints', lines('[[ "$(cscb_ad_count delete)" == 0 ]] || fail x', 'cscb_ad_calls delete --claude-instance-id > "${out}"')],
+      ['the verb a log reader counts or prints', lines('[[ "$(cscb_ad_count delete)" == 0 ]] || fail x', 'cscb_ad_calls delete --instance-id > "${out}"')],
     ]
 
     test.each(allowed)('does not count %s', (_label, source) => {
@@ -2997,15 +2997,15 @@ describe('static audit: the harness’s one agent-director delete is scenario 25
 
   describe('TypeScript', () => {
     const flagged: [label: string, source: string][] = [
-      ['getClient().delete', 'await getClient().delete({ claude_instance_id: id })'],
-      ['a delete on the awaited client in parentheses', 'await (await getClient()).delete({ claude_instance_id: id })'],
-      ['client?.delete', 'await client?.delete({ claude_instance_id: id })'],
-      ['client.delete?.()', 'await client.delete?.({ claude_instance_id: id })'],
-      ["client['delete']", "await client['delete']({ claude_instance_id: id })"],
-      ['this.adClient.delete', 'await this.adClient.delete({ claude_instance_id: id })'],
+      ['getClient().delete', 'await getClient().delete({ instance_id: id })'],
+      ['a delete on the awaited client in parentheses', 'await (await getClient()).delete({ instance_id: id })'],
+      ['client?.delete', 'await client?.delete({ instance_id: id })'],
+      ['client.delete?.()', 'await client.delete?.({ instance_id: id })'],
+      ["client['delete']", "await client['delete']({ instance_id: id })"],
+      ['this.adClient.delete', 'await this.adClient.delete({ instance_id: id })'],
       ['deps.delete', 'await deps.delete(id)'],
       ['director.destroy', 'await director.destroy(id)'],
-      ["the CLI's verb in an argv", "spawnSync(adBin, ['delete', '--claude-instance-id', id])"],
+      ["the CLI's verb in an argv", "spawnSync(adBin, ['delete', '--instance-id', id])"],
     ]
 
     test.each(flagged)('finds %s', (_label, source) => {
@@ -3020,7 +3020,7 @@ describe('static audit: the harness’s one agent-director delete is scenario 25
       ['a Map and a Set delete', lines('tickets.delete(ticket)', 'sockets.delete(ws)', 'const seen = new Set<string>(); seen.delete(key)')],
       ['the delete operator', 'delete env.TMUX'],
       ['comments and longer strings', lines('// await getClient().delete(x)', "const s = 'client.delete(x)'", 'const t = `the delete verb`')],
-      ['another client verb', 'await getClient().kill({ claude_instance_id: id })'],
+      ['another client verb', 'await getClient().kill({ instance_id: id })'],
       ['destroy on a client', 'client.destroy()'],
     ]
 
@@ -3117,7 +3117,7 @@ describe('preload check', () => {
     }],
     ['HOME holds an agent-director install directory', PRELOAD_CHECK.homeHoldsInstall, () => {
       const home = preloadTempHome()
-      mkdirSync(join(home, AGENT_DIRECTOR_INSTALL_DIR))
+      mkdirSync(join(home, AGENT_DIRECTOR_INSTALL_DIR), { recursive: true })
       return { HOME: home, PATH: dirUnder('bin') }
     }],
     ['HOME holds the standard install path (a plain file)', PRELOAD_CHECK.homeHoldsInstall, () => {

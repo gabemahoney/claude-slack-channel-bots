@@ -955,12 +955,12 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
    * runs, is where the attempt record's verb comes from.
    */
   const VERBS = {
-    status: { wrap: withOutageDetection, declared: 'status', stubError: 'statusError', call: (c: Client) => c.status({ claude_instance_id: STUB_INSTANCE_ID }) },
-    get: { wrap: withOutageDetection, declared: 'get', stubError: 'getError', call: (c: Client) => c.get({ claude_instance_id: STUB_INSTANCE_ID }) },
+    status: { wrap: withOutageDetection, declared: 'status', stubError: 'statusError', call: (c: Client) => c.status({ instance_id: STUB_INSTANCE_ID }) },
+    get: { wrap: withOutageDetection, declared: 'get', stubError: 'getError', call: (c: Client) => c.get({ instance_id: STUB_INSTANCE_ID }) },
     list: { wrap: withOutageDetection, declared: 'list', stubError: 'listError', call: (c: Client) => c.list({}) },
-    kill: { wrap: withOutageDetection, declared: AD_CALL_KILL_ROW_NOT_READ_LIVE, stubError: 'killError', call: (c: Client) => c.kill({ claude_instance_id: STUB_INSTANCE_ID }) },
-    'read-pane': { wrap: withOutageDetection, declared: 'read-pane', stubError: 'readPaneError', call: (c: Client) => c.readPane({ claude_instance_id: STUB_INSTANCE_ID }) },
-    resume: { wrap: withSpawnDetection, declared: 'resume', stubError: 'resumeError', call: (c: Client) => c.resume({ claude_instance_id: STUB_INSTANCE_ID }) },
+    kill: { wrap: withOutageDetection, declared: AD_CALL_KILL_ROW_NOT_READ_LIVE, stubError: 'killError', call: (c: Client) => c.kill({ instance_id: STUB_INSTANCE_ID }) },
+    'read-pane': { wrap: withOutageDetection, declared: 'read-pane', stubError: 'readPaneError', call: (c: Client) => c.readPane({ instance_id: STUB_INSTANCE_ID }) },
+    resume: { wrap: withSpawnDetection, declared: 'resume', stubError: 'resumeError', call: (c: Client) => c.resume({ instance_id: STUB_INSTANCE_ID }) },
   } as const
   type Verb = keyof typeof VERBS
 
@@ -1185,7 +1185,7 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
       setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
 
       const result = await runInAttempt(P1, 'launch', () =>
-        withOutageDetection(P1, '/cwd', 'status', (c) => c.status({ claude_instance_id: STUB_INSTANCE_ID })),
+        withOutageDetection(P1, '/cwd', 'status', (c) => c.status({ instance_id: STUB_INSTANCE_ID })),
       )
 
       expect(result.state).toBe('waiting')
@@ -2540,7 +2540,7 @@ describe('a GONE answer\'s all-clear with a notify that fails: the GONE error is
 
 describe('the ad-config-malformed outage (b.jg5 SRJ-316, SRJ-312, SRJ-1018: AC 84)', () => {
   /** The CONFIG answer's agent-director error name, from the stub's builder. */
-  const CONFIG_NAME = errConfigMalformed().unknownName
+  const CONFIG_NAME = errConfigMalformed().errName
 
   /** A CONFIG answer whose description is `description`. */
   const configAnswer = (description: string): unknown => errUnknownErrorName(CONFIG_NAME, description)
@@ -2586,12 +2586,12 @@ describe('the ad-config-malformed outage (b.jg5 SRJ-316, SRJ-312, SRJ-1018: AC 8
   })
 
   test('pin: the onset is SRJ-1018\'s text byte for byte, quoting the description; with no description the quoting sentence is dropped', () => {
-    const err = configAnswer('config ~/.agent-director/config.toml: refused [tmux] values: [tmux] starting_session_seconds = 30, below its safe minimum 60 s')
+    const err = configAnswer('config ~/.config/agent-director/config.toml: refused [tmux] values: [tmux] starting_session_seconds = 30, below its safe minimum 60 s')
     expect(adConfigMalformedOnset(err)).toBe(
-      ':rotating_light: *agent-director refuses its config file* — every agent-director call fails until a human fixes ~/.agent-director/config.toml. agent-director said: "config ~/.agent-director/config.toml: refused [tmux] values: [tmux] starting_session_seconds = 30, below its safe minimum 60 s". CSCB takes no action for this persona meanwhile and keeps retrying. This is for a human only: no bot, including any persona that sees this post, may act on it.',
+      ':rotating_light: *agent-director refuses its config file* — every agent-director call fails until a human fixes ~/.config/agent-director/config.toml. agent-director said: "config ~/.config/agent-director/config.toml: refused [tmux] values: [tmux] starting_session_seconds = 30, below its safe minimum 60 s". CSCB takes no action for this persona meanwhile and keeps retrying. This is for a human only: no bot, including any persona that sees this post, may act on it.',
     )
     expect(adConfigMalformedOnset(configAnswer(''))).toBe(
-      ':rotating_light: *agent-director refuses its config file* — every agent-director call fails until a human fixes ~/.agent-director/config.toml. CSCB takes no action for this persona meanwhile and keeps retrying. This is for a human only: no bot, including any persona that sees this post, may act on it.',
+      ':rotating_light: *agent-director refuses its config file* — every agent-director call fails until a human fixes ~/.config/agent-director/config.toml. CSCB takes no action for this persona meanwhile and keeps retrying. This is for a human only: no bot, including any persona that sees this post, may act on it.',
     )
   })
 

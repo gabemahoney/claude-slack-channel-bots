@@ -302,7 +302,7 @@ export interface LiveRowSequenceRequest {
 export interface LiveRowSequenceRow {
   readonly state: string
   /** The row's session id; a resume needs a non-empty one. */
-  readonly claude_session_id?: unknown
+  readonly session_id?: unknown
   /** The row's raw launch start, shown on a `pending` row only. */
   readonly launch_started_at?: unknown
   readonly cwd?: string
@@ -425,7 +425,7 @@ export interface LiveRowLaunchKindInput {
   readonly keepsConversation: boolean
   readonly retiredKey: boolean
   /** The row the last `get` read; absent when it read no row. */
-  readonly row: Pick<LiveRowSequenceRow, 'claude_session_id'> | undefined
+  readonly row: Pick<LiveRowSequenceRow, 'session_id'> | undefined
   /** P's facts; absent when P is not in the applied configuration. */
   readonly persona: LiveRowSequencePersonaFacts | undefined
 }
@@ -449,7 +449,7 @@ export function decideLiveRowLaunchKind(input: LiveRowLaunchKindInput): LiveRowL
     if (input.retiredKey !== false) return reuse(LIVE_ROW_LAUNCH_REASON_RETIRED_KEY)
     if (input.keepsConversation !== true) return reuse(LIVE_ROW_LAUNCH_REASON_NOT_KEPT)
     if (input.row === undefined) return reuse(LIVE_ROW_LAUNCH_REASON_NO_ROW)
-    const sessionId = input.row.claude_session_id
+    const sessionId = input.row.session_id
     if (typeof sessionId !== 'string' || sessionId.trim() === '') return reuse(LIVE_ROW_LAUNCH_REASON_NO_SESSION_ID)
     const facts = input.persona
     if (facts === undefined) return reuse(LIVE_ROW_LAUNCH_REASON_NOT_APPLIED)

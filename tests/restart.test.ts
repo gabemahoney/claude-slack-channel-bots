@@ -587,7 +587,7 @@ function awaitRuns(deps: RestartDeps): { outcomes: unknown[]; tick: (key: string
  */
 function ownStubCalls(log: StubCallLog, instanceId: string): Record<string, number> {
   const isOwn = (params: unknown): boolean => {
-    const named = (params as { claude_instance_id?: unknown } | undefined)?.claude_instance_id
+    const named = (params as { instance_id?: unknown } | undefined)?.instance_id
     return named === undefined || named === instanceId
   }
   return Object.fromEntries(
@@ -2331,7 +2331,7 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
 
     // A's row is gone (a restart would kill and relaunch it); B's is live and
     // idle (a restart reconnects it).
-    rowStatus = (p) => (p.claude_instance_id === personaInstanceId(a.key) ? errSpawnNotFound() : { state: 'waiting' })
+    rowStatus = (p) => (p.instance_id === personaInstanceId(a.key) ? errSpawnNotFound() : { state: 'waiting' })
     const stub = makeStubClient({
       statusFn: (p) => rowStatus(p),
       statusCalls,
@@ -2382,7 +2382,7 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
   }
 
   const callsFor = (calls: Array<StatusParams | SendKeysParams>, p: Persona) =>
-    calls.filter((c) => c.claude_instance_id === personaInstanceId(p.key))
+    calls.filter((c) => c.instance_id === personaInstanceId(p.key))
 
   test.each<[string, () => void, string]>([
     // The gate names the reason: the connection when it is not serving, the
@@ -2507,10 +2507,10 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
   test('b.4vm, SR-8.6: both rows read ended; A leaves the applied set before the clean-exit checks fire — A gets no status, kill or spawn call and keeps its full delay; B, still applied, relaunches at its check through the real launch adapter', async () => {
     const LONG_S = 60
     const instanceOf = (p: Persona) => personaInstanceId(p.key)
-    const idsFor = <T extends { claude_instance_id?: unknown }>(list: T[], p: Persona): T[] =>
-      list.filter((c) => c.claude_instance_id === instanceOf(p))
+    const idsFor = <T extends { instance_id?: unknown }>(list: T[], p: Persona): T[] =>
+      list.filter((c) => c.instance_id === instanceOf(p))
     // Each row reads ended (a clean exit) until its persona is spawned again.
-    rowStatus = (p) => (spawnCalls.some((s) => s.claude_instance_id === p.claude_instance_id) ? { state: 'waiting' } : { state: 'ended' })
+    rowStatus = (p) => (spawnCalls.some((s) => s.instance_id === p.instance_id) ? { state: 'waiting' } : { state: 'ended' })
     mkdirSync(b.working_directory, { recursive: true })
     _setSpawnHomeDir(dir)
     _setDialogReadyTimeoutMs(200)
@@ -2806,8 +2806,8 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
     expect(isAtCap(KEY, RESTART_FAILURE_CAP)).toBe(false)
     // The adapter's AD calls address the persona's cscb_<key> instance: one
     // status probe, then exactly one send-keys reconnect (no second try).
-    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(KEY)])
-    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C_DEADTMUX'])
+    expect(statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(KEY)])
+    expect(sendKeysCalls.map((c) => c.instance_id)).toEqual(['cscb_C_DEADTMUX'])
 
     // --- Tick 2: the row has since been reconciled to `missing`, so the next
     // tick observes the session dead. The relaunch branch runs, with no kill
@@ -2929,7 +2929,7 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
       statusFn: () => ({ state: 'working' }),
       readPaneError: errTmuxCaptureFailed(),
       findMissingResult: cannedFindMissing({ rows: { [instanceId]: 'unverified_ids' } }),
-      getFn: () => cannedGetResult({ claude_instance_id: instanceId, state: 'working', liveness_note: noteOfRun(run) }),
+      getFn: () => cannedGetResult({ instance_id: instanceId, state: 'working', liveness_note: noteOfRun(run) }),
     })
     _resetOutageState()
     initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
@@ -3143,7 +3143,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     const stubCalls = (): Record<string, number> => ownStubCalls(log, instanceId)
     /** The run's pane reads, as `[instance id, lines]`. */
     const paneReads = (): Array<[string, number | undefined]> =>
-      log.readPaneCalls.filter((c) => c.claude_instance_id === instanceId).map((c) => [c.claude_instance_id, c.n_lines])
+      log.readPaneCalls.filter((c) => c.instance_id === instanceId).map((c) => [c.instance_id, c.n_lines])
     return { KEY: persona.key, CWD: persona.working_directory, kills, launches, carriedIn, armed, notes, outcomes, tick: () => tick(persona.key, persona.working_directory), stubCalls, paneReads }
   }
 
@@ -3450,7 +3450,7 @@ describe('b.dup: a persona whose row is ended just before its reconnect lands is
     const run = await refusedRun('missing')
 
     expect(run.outcome).toBe(RESTART_OUTCOME_LAUNCHED)
-    expect(run.sendKeysCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(run.KEY)])
+    expect(run.sendKeysCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(run.KEY)])
     expect(run.findMissingCalls).toHaveLength(1)
     expect(run.killSessionCalls).toEqual([])
     expect(run.launchSessionCalls).toEqual([run.KEY])
@@ -3481,7 +3481,7 @@ describe('b.dup: a persona whose row is ended just before its reconnect lands is
     const run = await refusedRun(AGENT_DIRECTOR_PENDING_STATE)
 
     expect(run.outcome).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
-    expect(run.sendKeysCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(run.KEY)])
+    expect(run.sendKeysCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(run.KEY)])
     expect(run.findMissingCalls).toHaveLength(1)
     expect(run.killSessionCalls).toEqual([])
     expect(run.launchSessionCalls).toEqual([])
@@ -3661,7 +3661,7 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
         cannedOk(cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, persona, h.home)),
         cannedOk(cannedGetResult(reread(h, persona), persona, h.home)),
       ],
-      getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' }, persona, h.home),
+      getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED, session_id: 'a-session-id' }, persona, h.home),
       statusFn: () => cannedStatusResult({ state: calls.findMissingCalls.length > 0 ? LIVENESS_DEAD_ROW_MISSING : reach.state }),
       resumeQueue: [cannedErr(errSpawnNotResumable())],
       ...reach.script,
@@ -3725,7 +3725,7 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
         cannedOk(cannedGetResult({ state: 'waiting' }, persona, h.home)),
         cannedOk(cannedGetResult({ state: 'waiting' }, persona, h.home)),
       ],
-      getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' }, persona, h.home),
+      getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED, session_id: 'a-session-id' }, persona, h.home),
       statusFn: () => {
         if (calls.findMissingCalls.length + runs() === 0) return cannedStatusResult({ state: 'working' })
         if (calls.resumeCalls.length > 1) return cannedStatusResult({ state: 'waiting' })
@@ -3758,7 +3758,7 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
     })
     // The restart path's checked kill, then the sequence's own kill and its resume of the row: never a reuse.
     expect(h.stub.calls.killCalls).toHaveLength(2)
-    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }, { claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: personaInstanceId(p) }, { instance_id: personaInstanceId(p) }])
     expect(h.stub.calls.spawnCalls).toHaveLength(1)
     // b.4q8: the resumed row reports in (waiting), so no failure is counted for it.
     await h.settle()
@@ -3909,7 +3909,7 @@ describe('b.jg5 SRJ-118, SRJ-609: the reconnect\'s transient and latching answer
 
   /** P's run made exactly one send-keys and nothing after it: no sweep, kill or launch; nothing counted or posted as a spawn failure. */
   function expectOneSendKeysAndNothingAfter(h: RecoveryHarness, p: string): void {
-    expect(h.stub.calls.sendKeysCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p)])
+    expect(h.stub.calls.sendKeysCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(p)])
     expect(h.stub.calls.findMissingCalls).toEqual([])
     expect(h.stub.calls.killCalls).toEqual([])
     expect(h.stub.spawnedIds()).toEqual([])
@@ -4527,11 +4527,11 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
   let origConsoleError: typeof console.error
 
   function spawnsFor(p: Persona): SpawnParams[] {
-    return hold.calls.filter((c) => c.claude_instance_id === personaInstanceId(p.key))
+    return hold.calls.filter((c) => c.instance_id === personaInstanceId(p.key))
   }
 
   function killsFor(p: Persona): number {
-    return killCalls.filter((k) => k.claude_instance_id === personaInstanceId(p.key)).length
+    return killCalls.filter((k) => k.instance_id === personaInstanceId(p.key)).length
   }
 
   function skipLine(p: Persona): string {
@@ -4607,7 +4607,7 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     expect(errLines).toContain(skipLine(a))
 
     await killSession(b.key, LIVENESS_READING_DEAD_ENDED)
-    expect(killCalls.map((k) => k.claude_instance_id)).toEqual([personaInstanceId(b.key)])
+    expect(killCalls.map((k) => k.instance_id)).toEqual([personaInstanceId(b.key)])
     expect(errLines).not.toContain(skipLine(b))
 
     hold.release(personaInstanceId(a.key))
@@ -4615,7 +4615,7 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     expect(isLaunchInFlight(a.key)).toBe(false)
     await _whenDialogApproverStopped(a.key)
     await killSession(a.key, LIVENESS_READING_DEAD_ENDED)
-    expect(killCalls.map((k) => k.claude_instance_id)).toEqual([personaInstanceId(b.key), personaInstanceId(a.key)])
+    expect(killCalls.map((k) => k.instance_id)).toEqual([personaInstanceId(b.key), personaInstanceId(a.key)])
     expect(errLines.filter((l) => l === skipLine(a))).toHaveLength(1)
   })
 
@@ -4662,7 +4662,7 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     expect(spawnsFor(a)).toHaveLength(2)
     expect(launchResults).toHaveLength(3)
     expect(launchResults[2]).toEqual({ key: a.key, ok: true })
-    expect(hold.calls.every((c) => c.claude_instance_id === personaInstanceId(a.key))).toBe(true)
+    expect(hold.calls.every((c) => c.instance_id === personaInstanceId(a.key))).toBe(true)
     expect(errLines.filter((l) => l === skipLine(a))).toHaveLength(1)
   })
 
@@ -4868,7 +4868,7 @@ describe('restart: the reply-guard record holds the effective value before the r
     scheduleRestart(a.key, a.working_directory)
     await waitFor(() => sendKeysCalls.length > 0 && !isRestartPendingOrActive(a.key))
 
-    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(a.key)])
+    expect(sendKeysCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(a.key)])
     expect(deps.killSessionCalls).toEqual([])
     expect(deps.launchSessionCalls).toEqual([])
     expect(events).toEqual([])
@@ -4899,9 +4899,9 @@ describe('restart: the reply-guard record holds the effective value before the r
       resumeCalls,
       deleteCalls,
       spawnQueue: [
-        cannedOk<StubSpawnResult>({ claude_instance_id: personaInstanceId(a.key) }),
+        cannedOk<StubSpawnResult>({ instance_id: personaInstanceId(a.key) }),
         cannedErr<SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: personaInstanceId(a.key) }),
+        cannedOk<StubSpawnResult>({ instance_id: personaInstanceId(a.key) }),
       ],
       getResult: oldRow,
     })
@@ -4937,7 +4937,7 @@ describe('restart: the reply-guard record holds the effective value before the r
     // b.jg5 SRJ-707, SRJ-1504: the finished old-label row is replaced by a reuse spawn of the same id; nothing is deleted.
     expect(deleteCalls).toEqual([])
     expect(spawnCalls).toHaveLength(3)
-    expect(spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+    expect(spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([
       [personaInstanceId(a.key), undefined],
       [personaInstanceId(a.key), undefined],
       [personaInstanceId(a.key), true],
@@ -5027,13 +5027,13 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     // spawn collides with it); B's row is gone. Each reports `waiting` once relaunched.
     calls = makeStubCallLog()
     const launched = (p: Persona) =>
-      calls.resumeCalls.some((r) => r.claude_instance_id === personaInstanceId(p.key)) ||
-      calls.spawnCalls.some((s) => s.claude_instance_id === personaInstanceId(p.key))
+      calls.resumeCalls.some((r) => r.instance_id === personaInstanceId(p.key)) ||
+      calls.spawnCalls.some((s) => s.instance_id === personaInstanceId(p.key))
     const stub = makeStubClient({
       ...calls,
       getResult: cannedGetResult({ state: 'ended' }, a, dir),
       statusFn: (p) => {
-        const persona = p.claude_instance_id === personaInstanceId(a.key) ? a : b
+        const persona = p.instance_id === personaInstanceId(a.key) ? a : b
         if (persona === a && calls.resumeCalls.length > 0) return { state: 'waiting' }
         if (persona === a) return { state: 'ended' }
         return launched(b) ? { state: 'waiting' } : errSpawnNotFound()
@@ -5041,14 +5041,14 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     })
     const realSpawn = stub.spawn.bind(stub)
     stub.spawn = async (params) => {
-      if (params.claude_instance_id !== personaInstanceId(a.key)) return realSpawn(params)
+      if (params.instance_id !== personaInstanceId(a.key)) return realSpawn(params)
       calls.spawnCalls.push(params)
       throw errInstanceIdCollision()
     }
     // The resume joins the shared step log, after the harness's `slack:<key>` markers.
     const realResume = stub.resume.bind(stub)
     stub.resume = async (params) => {
-      h.order.push(`resume:${String(params.claude_instance_id)}`)
+      h.order.push(`resume:${String(params.instance_id)}`)
       return realResume(params)
     }
     _resetOutageState()
@@ -5123,8 +5123,8 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
   }
 
   /** The calls in `list` addressed to `p`'s instance. */
-  const idsFor = <T extends { claude_instance_id?: unknown }>(list: T[], p: Persona): T[] =>
-    list.filter((c) => c.claude_instance_id === personaInstanceId(p.key))
+  const idsFor = <T extends { instance_id?: unknown }>(list: T[], p: Persona): T[] =>
+    list.filter((c) => c.instance_id === personaInstanceId(p.key))
 
   /** Every `persona-config-dir-unresolvable` line, from the controller and the console. */
   const classLines = () => [...controllerLines, ...errLines].filter((l) => l.includes(`${PERSONA_CONFIG_DIR_UNRESOLVABLE}:`))
@@ -5190,7 +5190,7 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     await waitFor(() => calls.resumeCalls.length > 0 && !isLaunchInFlight(a.key))
     await _whenDialogApproverStopped(a.key)
 
-    expect(calls.resumeCalls.map((r) => r.claude_instance_id)).toEqual([personaInstanceId(a.key)])
+    expect(calls.resumeCalls.map((r) => r.instance_id)).toEqual([personaInstanceId(a.key)])
     expect(calls.deleteCalls).toEqual([])
     expect(idsFor(calls.killCalls, a)).toEqual([])
     expect(idsFor(calls.spawnCalls, a)).toHaveLength(1) // the spawn that collided with the row
@@ -5339,7 +5339,7 @@ describe('AC 20: the restart kill adapter\'s lines carry no credential value', (
 
     expect(await _buildKillSessionAdapter()(a.key, LIVENESS_READING_DEAD_ENDED)).toMatchObject(expected)
 
-    expect(killCalls.map((k) => k.claude_instance_id)).toEqual([personaInstanceId(a.key)])
+    expect(killCalls.map((k) => k.instance_id)).toEqual([personaInstanceId(a.key)])
     // b.jg5 SRJ-702: the kill's one try (the run read the row dead) has its
     // own line from the bounded retry; then the adapter's outcome line.
     const [tryLine, ...outcomeLines] = adapterLines()
@@ -5558,7 +5558,7 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
 
     await runRestart(p.key)
 
-    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p.key)])
+    expect(statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(p.key)])
     expect(sendKeysCalls).toEqual([])
     expectArmedOnce(UNAVAILABLE_RETRY_CAUSE_READ_ERROR)
   })
@@ -5584,7 +5584,7 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
 
     await runRestart(p.key)
 
-    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p.key)])
+    expect(statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(p.key)])
     expectArmedOnce(cause)
     expect(deps.armRetryTimerCalls).toEqual([p.key])
     expect(deps.reconnectSessionCalls).toEqual([])
@@ -5652,7 +5652,7 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
       (calls) => ({
         ...calls,
         spawnError: errInstanceIdCollision(),
-        getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' }, p, dir),
+        getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED, session_id: 'a-session-id' }, p, dir),
         resumeError: errTmuxSessionCreate('resume'),
       }),
       { spawns: 1, resumes: 1 },
@@ -5742,7 +5742,7 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
 
     await runRestart(p.key)
 
-    expect(resumeCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p.key)])
+    expect(resumeCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(p.key)])
     expect(stops).toHaveLength(1)
     expect(launchResults).toEqual(['skipped'])
     expect(getFailureCount(p.key)).toBe(1)
@@ -6844,7 +6844,7 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
 
       expect(await runRestartRetry(KEY, config.personas[0]!.working_directory, notInFlight)).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
 
-      expect(log.statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(KEY)])
+      expect(log.statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(KEY)])
       expect(stubCallCount(log)).toBe(1)
       expect(deferred).toEqual([[KEY, pendingLivenessReading(start)]])
       expect(killSessionCalls).toEqual([])
@@ -7332,7 +7332,7 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
 
       expect(callCounts(h)).toEqual({ killCalls: 1 })
       expect(h.latch.isLatched(p)).toBe(false)
-      expect(h.stub.calls.killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p)])
+      expect(h.stub.calls.killCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(p)])
       expect(h.stub.spawnedIds()).toEqual([])
       expect(h.errors).toContain(KILL_REFUSED_LINE(p, killOutcomeOf({ thrown: err })))
       expect(h.triggers).toEqual([{ key: p, kind: cause }])
@@ -7406,7 +7406,7 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
       expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(outcome)
       await h.settle()
 
-      expect(h.stub.calls.killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p)])
+      expect(h.stub.calls.killCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(p)])
       expect(h.stub.calls.spawnCalls).toEqual([])
       expect(h.stub.calls.resumeCalls).toEqual([])
       expect(h.stub.calls.deleteCalls).toEqual([])
@@ -8187,7 +8187,7 @@ describe('b.jg5 SRJ-502: the restart path makes no attempt for a latched persona
       expect(await runRestartRetry(q, cwdOf(q), isLaunchInFlight)).toBe(RESTART_OUTCOME_LAUNCHED)
       await h.settle()
       expect(h.latch.isLatched(q)).toBe(false)
-      expect(h.stub.calls.killCalls.map((c) => c.claude_instance_id)).toEqual([])
+      expect(h.stub.calls.killCalls.map((c) => c.instance_id)).toEqual([])
       expect(h.stub.spawnedIds()).toEqual([personaInstanceId(p), personaInstanceId(q)])
       expect(getFailureCount(q)).toBe(0)
       expect(h.latchEvents).toHaveLength(5)
@@ -9014,7 +9014,7 @@ function ownReadLatchHarness(ownStatus: OwnStatusAnswer) {
   const othersRow = rowReadsUntilSpawn(h, 'ended')
   let ownReads = 0
   h.script({
-    statusFn: (params) => params.claude_instance_id === personaInstanceId(p) ? ownStatus(ownReads++) : othersRow(params),
+    statusFn: (params) => params.instance_id === personaInstanceId(p) ? ownStatus(ownReads++) : othersRow(params),
   })
   recordFailure(p)
   return { h, p, q, cwdOf, deferred, armHook, outcomes }
@@ -9065,7 +9065,7 @@ describe('b.jg5 SRJ-512, SRJ-513: a restart run whose own liveness read latches 
     expect(outcomes).toEqual([{ key: p, outcome: RESTART_OUTCOME_LATCHED }])
     expect(callCounts(h)).toEqual(expected.calls)
     expect(personaCallCounts(h, p)).toEqual(ownCalls)
-    expect(tmuxTouchingCallsIn(h.stub.calls).map((c) => [c.verb, (c.params as { claude_instance_id?: string }).claude_instance_id])).toEqual(tmuxBeforeLatch)
+    expect(tmuxTouchingCallsIn(h.stub.calls).map((c) => [c.verb, (c.params as { instance_id?: string }).instance_id])).toEqual(tmuxBeforeLatch)
     expect(h.latch.record(p)).toEqual(expected.record(p))
     expect(h.latchEvents.filter((event) => event.step === 'set').map((event) => event.key)).toEqual([p])
     expect(h.episodeNotices).toEqual([{ key: p, text: expected.notice(p) }])
@@ -9774,8 +9774,8 @@ describe('b.jg5 SRJ-505, SRJ-502: the latch re-check\'s own run of the restart p
       expect(await runRestartWorkInTurn(P, CWD[P]!, permit)).toBe(outcome)
 
       expect(refused()).toBe(refuseAtRead)
-      expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(P)])
-      expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(refuseAtRead ? [] : [personaInstanceId(P)])
+      expect(statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(P)])
+      expect(sendKeysCalls.map((c) => c.instance_id)).toEqual(refuseAtRead ? [] : [personaInstanceId(P)])
       if (refuseAtRead) expect(readPaneCalls).toEqual([])
       expect(deps.killSessionCalls).toEqual([])
       expect(deps.launchSessionCalls).toEqual([])
@@ -10077,12 +10077,12 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
     const freshLives = new Set<string>()
     const rowOf = (id: string): StatusResult['state'] | Error => {
       if (freshLives.has(id)) return 'waiting'
-      const resumes = calls.resumeCalls.filter((call) => call.claude_instance_id === id).length
+      const resumes = calls.resumeCalls.filter((call) => call.instance_id === id).length
       return resumes === 0 ? MISSING : afterResume(resumes)
     }
     h.script({
       spawnFn: (params) => {
-        const id = params.claude_instance_id ?? ''
+        const id = params.instance_id ?? ''
         if (!keyOf.has(id)) return undefined
         if (params.reuse_finished !== true) return errInstanceIdCollision()
         const failure = reuseFailures.get(id)!.shift()
@@ -10091,14 +10091,14 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
         return cannedSpawnResult(id, 'ok')
       },
       getFn: (params) => {
-        const key = keyOf.get(params.claude_instance_id)
+        const key = keyOf.get(params.instance_id)
         if (key === undefined) return undefined
-        const row = rowOf(params.claude_instance_id)
-        return row instanceof Error ? row : personaRow(h, key, { state: row, claude_session_id: 'a-session-id' })
+        const row = rowOf(params.instance_id)
+        return row instanceof Error ? row : personaRow(h, key, { state: row, session_id: 'a-session-id' })
       },
       statusFn: (params) => {
-        if (!keyOf.has(params.claude_instance_id)) return undefined
-        const row = rowOf(params.claude_instance_id)
+        if (!keyOf.has(params.instance_id)) return undefined
+        const row = rowOf(params.instance_id)
         return row instanceof Error ? row : cannedStatusResult({ state: row })
       },
     })
@@ -10163,7 +10163,7 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
     expect(answers).toEqual([...entry.answers(p)])
     expect(counts).toEqual([...entry.counts])
     expect(countedLinesOf(h.errors, p)).toHaveLength(entry.countedLines)
-    expect(h.stub.calls.resumeCalls).toEqual(RUN.map(() => ({ claude_instance_id: personaInstanceId(p) })))
+    expect(h.stub.calls.resumeCalls).toEqual(RUN.map(() => ({ instance_id: personaInstanceId(p) })))
     expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
     expect(resumeEndedLinesOf(h.errors, ref)).toEqual(RUN.map((n) => resumeEndedUnreportedLine(approverRead(ref), ref, MISSING, n)))
     expect(resumeFallbackLinesOf(h.errors, ref)).toEqual([unreportedResumeFallbackLine(ref, N)])
@@ -10279,7 +10279,7 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
     forgetLaunchCalls(p)
     for (const key of [p, q]) expect(await restartRun(loop, key)).toBe(RESTART_OUTCOME_LAUNCHED)
 
-    const resumesOf = (key: string): number => h.stub.calls.resumeCalls.filter((call) => call.claude_instance_id === personaInstanceId(key)).length
+    const resumesOf = (key: string): number => h.stub.calls.resumeCalls.filter((call) => call.instance_id === personaInstanceId(key)).length
     expect([resumesOf(p), resumesOf(q)]).toEqual([N + 1, N])
     expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, q)])
     expect(resumeFallbackLinesOf(h.errors, loop.refOf(p))).toEqual([])
@@ -10567,7 +10567,7 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
     })
     await h.settle()
 
-    expect(h.stub.calls.killCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.killCalls).toEqual([{ instance_id: personaInstanceId(p) }])
     expect(h.stub.calls.resumeCalls).toHaveLength(3)
     // Neither the kill's reads nor the sequence's get settled resume 2.
     expect([...resumeEndedLinesOf(h.errors, ref), ...resumeEndedLinesOf(h.errors, `persona=${p}`)]).toEqual([endedLine(1), endedLine(2)])
@@ -10694,7 +10694,7 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
 
     await h.runOldLifeWait(id)
 
-    expect(h.stub.calls.killCalls[0]).toEqual({ claude_instance_id: id })
+    expect(h.stub.calls.killCalls[0]).toEqual({ instance_id: id })
     expect(countsAtRead).toEqual([1 + counted])
     await readPersonaOwnRow(p, readAfterKill(ref))
     expect(getFailureCount(p)).toBe(1 + counted)
@@ -10765,7 +10765,7 @@ describe('b.4q8: a read that settles a resumed launch before its hand-over: noth
     const at = { ...EARLY_READ, ref }
     const stub = makeStubClient({
       spawnQueue: [cannedErr<SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' }, a, dir),
+      getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED, session_id: 'a-session-id' }, a, dir),
       statusResult: cannedStatusResult({ state }),
     })
     const countsAtRead: number[] = []

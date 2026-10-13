@@ -527,14 +527,14 @@ export CSCB_SLACK_API_URL
 # t14_row_get <id>: a harness `get` of the row (AD_OUT holds it); fail when it
 # fails.
 t14_row_get() {
-    ad_capture get --claude-instance-id "$1"
+    ad_capture get --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || fail "harness get of $1 exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
 }
 
 # t14_row_state <id>: print the row's state (`status`), or nothing when the
 # read fails.
 t14_row_state() {
-    ad_capture status --claude-instance-id "$1"
+    ad_capture status --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || return 0
     jq -r '.state // empty' "${AD_OUT}" 2> /dev/null || true
 }
@@ -545,7 +545,7 @@ t14_row_is() {
 
 # True when the row reads `pending` with a launch start.
 t14_row_pending_launched() {
-    ad_capture status --claude-instance-id "$1"
+    ad_capture status --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || return 1
     jq -e '.state == "pending" and (.launch_started_at // "" | length > 0)' "${AD_OUT}" > /dev/null 2>&1
 }
@@ -1165,7 +1165,7 @@ leg_upgrade_sweep() {
 
     # After the migration: P's own row reads `pending` with no launch start;
     # the other rows are live, their workers running.
-    ad_capture status --claude-instance-id "${P_ID}"
+    ad_capture status --instance-id "${P_ID}"
     [[ "${AD_RC}" == 0 ]] && jq -e '.state == "pending" and ((.launch_started_at // "") == "")' "${AD_OUT}" > /dev/null \
         || fail "${step}: after the migration ${P_ID} does not read pending with no launch start: $(tr '\n' ' ' < "${AD_OUT}" "${AD_ERR}")"
     for id in "${UA_ID}" "${UB_ID}" "${Q_ID}"; do

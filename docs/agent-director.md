@@ -1,5 +1,7 @@
 # agent-director
 
+CSCB requires agent-director CLI 0.12.0 or later and pins its TypeScript client to `agent-director@0.12.0`. Workers require Claude Code 2.1.296 or later. Upgrade the CLI with its released installer before upgrading CSCB; see [Migration](migration.md#migration).
+
 CSCB runs every bot through [agent-director](https://github.com/gabemahoney/agent-director), installed system-wide. This page covers checking that install, the `install-cscb` skill that walks you through a failed check, and the agent-director settings CSCB reads.
 
 ## Checking your agent-director install
@@ -64,7 +66,7 @@ The skill first states that this CSCB release and agent-director Phase 1
 are installed, and rolled back, together, by the docs/migration.md sections
 "Switching over to agent-director Phase 1" and "Rolling back the
 switch-over", which it points to by title. It names the agent-director
-client CSCB pins, `agent-director@0.11.0`, which comes installed with
+client CSCB pins, `agent-director@0.12.0`, which comes installed with
 CSCB; the skill runs no install or upgrade of the client or the binary.
 
 The skill calls `bun run install-check` on each iteration. On a pass that
@@ -95,7 +97,7 @@ who haven't yet installed CSCB at all.
 
 ## agent-director's timing settings
 
-agent-director keeps its timing settings in the `[tmux]` table of `~/.agent-director/config.toml`. They are agent-director's settings, not CSCB configuration: CSCB only reads them, from the file under the HOME the server runs in.
+agent-director keeps its timing settings in the `[tmux]` table of `~/.config/agent-director/config.toml`. They are agent-director's settings, not CSCB configuration: CSCB only reads them, from the file under the HOME the server runs in. Set HOME to a nonempty absolute path: CSCB refuses to read settings through an unset, empty or relative HOME, and the agent-director installer and uninstaller exit 2 for those values.
 
 The server reads the table when it starts and every 120 s after that, whatever `health_check_interval` is (`0` included), so a change on the host is used within about 120 s (each read follows the binary re-check, which runs 120 s after the previous one ends and can take up to its 30 s time limit). It applies agent-director's own rule: a missing file, a missing key or `0` means agent-director's default. At the first read it accepts, and at each later accepted read that changes any of them, the server writes one line to `server.log` with the nine `[tmux]` values in effect; a read that changes only `[pause] timeout_seconds` (see [Sizing the agent-director call timeout](#sizing-the-agent-director-call-timeout)) writes none.
 

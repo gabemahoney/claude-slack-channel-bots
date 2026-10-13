@@ -159,7 +159,7 @@ restart resumes.
 Read this section before every run.
 
 - **Operator-run only**, on a **test Slack workspace**. Never on a workspace that production bots serve.
-- **Never on the production install.** Use a dedicated host or VM whose HOME holds no production CSCB state (`~/.config/claude-slack-channel-bots/`, or `~/.config/cscb/` or `~/.claude/channels/slack/` from an earlier release) and no production `~/.agent-director`. The start sweep kills every live `service=cscb` agent-director row that names no configured persona (it keeps the row), so a test server sharing `~/.agent-director` with a production CSCB would kill the production bots. A dedicated OS user is acceptable only on a host that runs no production CSCB at all: only one CSCB server runs per host (they would both need port 3100).
+- **Never on the production install.** Use a dedicated host or VM whose HOME holds no production CSCB state (`~/.config/claude-slack-channel-bots/`, or `~/.config/cscb/` or `~/.claude/channels/slack/` from an earlier release) and no production `~/.config/agent-director`. The start sweep kills every live `service=cscb` agent-director row that names no configured persona (it keeps the row), so a test server sharing `~/.config/agent-director` with a production CSCB would kill the production bots. A dedicated OS user is acceptable only on a host that runs no production CSCB at all: only one CSCB server runs per host (they would both need port 3100).
 - **Never through `/ci` or `/release-test`.** Only the operator runs this plan, by hand, or starts `/ci-live`, which runs it in a throwaway container.
 - **Never type or paste a token** into a chat (the wizard's included), this ticket, the results table, a log or a shell command line. Tokens go only into the wizard's credentials command, at its hidden prompts, in the operator's own terminal (Check S1). Every token check in this plan counts matches and never prints one.
 - **A Linux host with bash.** The plan's commands need GNU/Linux and an interactive bash shell: they read `/proc/<pid>/environ`, and use `stat -c`, `sha256sum`, `history -a`, bash arrays, `jq`, `script`, `tmux` and a user crontab `@reboot` line. Only the optional Check 29b needs `sudo`, `iptables` and `systemd-run`. The pre-flight checks the rest.
@@ -405,7 +405,7 @@ replies() {
 # line TMARK (TMARK=$(wc -l < "$TRAIL")): instance, conversation, ok, error.
 posts() {
   tail -n +"$(($1 + 1))" "$TRAIL" \
-    | jq -c 'select(.event == "cscb.chat_post.attempted") | {claude_instance_id, channel, ok, error}'
+    | jq -c 'select(.event == "cscb.chat_post.attempted") | {instance_id, channel, ok, error}'
 }
 
 # tokcount FILE...: how many lines of the files hold token-shaped text (a
@@ -735,7 +735,7 @@ and the error named `persona_b` and `working_directory`.
 `SCRATCH SERVER STARTED` fails this check. The scratch server may have left
 `service=cscb` rows, which the pre-flight before Check 1 then refuses. For
 each row `agent-director list --label service=cscb` shows, run
-`agent-director kill <claude_instance_id>`, then remove the stopped row with
+`agent-director kill <instance_id>`, then remove the stopped row with
 agent-director's own tools (as after Teardown), until the list is empty.
 Then file a bug before going on.
 

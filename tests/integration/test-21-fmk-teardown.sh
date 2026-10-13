@@ -50,7 +50,7 @@
 #   CSCB's agent-director calls (`cscb_ad_calls`: only the agent-director
 #   shim's lines whose parent is a CSCB process) from the mark's time, and a
 #   command's own calls (CLI-parented) by its run's PID; rows by a harness
-#   `get`; agent-director's trail ($HOME/.agent-director/ad-trail.jsonl) for
+#   `get`; agent-director's trail ($HOME/.config/agent-director/ad-trail.jsonl) for
 #   its `find-missing` marks and its launch records.
 #
 # How the conflict is injected (S3): the harness respawns A's worker pane
@@ -373,7 +373,7 @@ export CSCB_SLACK_API_URL
 # t21_row_state <id>: print the row's state (a harness `status`), or nothing
 # when the read fails.
 t21_row_state() {
-    ad_capture status --claude-instance-id "$1"
+    ad_capture status --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || return 0
     jq -r '.state // empty' "${AD_OUT}" 2> /dev/null || true
 }
@@ -384,7 +384,7 @@ t21_row_is() {
 
 # True when the row reads `pending` with a launch start.
 t21_row_pending_launched() {
-    ad_capture status --claude-instance-id "$1"
+    ad_capture status --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || return 1
     jq -e '.state == "pending" and (.launch_started_at // "" | length > 0)' "${AD_OUT}" > /dev/null 2>&1
 }
@@ -392,7 +392,7 @@ t21_row_pending_launched() {
 # t21_row_get <id> <step>: a harness `get` of the row (AD_OUT holds it); fail
 # when it fails.
 t21_row_get() {
-    ad_capture get --claude-instance-id "$1"
+    ad_capture get --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || fail "$2: harness get of $1 exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
 }
 
@@ -790,7 +790,7 @@ t21_precheck_legs() {
     ids="$(t21_session_ids "${A_SESSION}")" || fail "${step}: no session ${A_SESSION}"
     read -r a_sid _ <<< "${ids}"
     end_session "${a_sid}"
-    ad_capture read-pane --claude-instance-id "${A_ID}" --n-lines 1
+    ad_capture read-pane --instance-id "${A_ID}" --n-lines 1
     if (( AD_RC == 0 )) || ! grep -qF -- "${CAPTURE_FAILED}" "${AD_OUT}" "${AD_ERR}"; then
         sed 's/^/  | /' "${AD_OUT}" "${AD_ERR}" >&2
         fail "${step}: after its session ended, a harness read-pane of ${A_ID} does not answer ${CAPTURE_FAILED} (GONE)"
@@ -953,10 +953,10 @@ t21_not_restarted_leg() {
 # at or after <time> (seconds since the epoch), one JSON per line, each with
 # `epoch` added.
 t21_trail_after() {
-    local trail="${HOME}/.agent-director/ad-trail.jsonl"
+    local trail="${HOME}/.config/agent-director/ad-trail.jsonl"
     [[ -f "${trail}" ]] || return 0
     jq -c --arg e "$2" --arg id "$3" --argjson t "$1" '
-        select(.event == $e and .claude_instance_id == $id)
+        select(.event == $e and .instance_id == $id)
         | (.ts | capture("^(?<s>[^.Z]+)(\\.(?<f>[0-9]+))?Z$")) as $ts
         | . + {epoch: (($ts.s + "Z" | fromdateiso8601) + ("0." + ($ts.f // "0") | tonumber))}
         | select(.epoch >= $t)' "${trail}" || fail "could not read ${trail}'s $2 records for $3"

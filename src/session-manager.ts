@@ -2865,7 +2865,7 @@ function ownRowActGoes(key: string, at: OwnRowReadSite): boolean {
  * is `no configured-persona query is installed`, `the configured-persona
  * query failed: <error>`, `persona=<key> is not a persona of the applied
  * configuration` or `the row is not the persona's own
- * (claude_instance_id="<id>")`. A row with no note logs nothing. The
+ * (instance_id="<id>")`. A row with no note logs nothing. The
  * "latches no one" line is logged once per note for a persona and again only
  * when the note on its row changes (`nonLatchingNoteLogged`). Never throws.
  */
@@ -2873,7 +2873,7 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
   let row: GetResult
   try {
     row = await withOutageDetection(key, undefined, 'get', (client) =>
-      client.get({ claude_instance_id: personaInstanceId(key) }),
+      client.get({ instance_id: personaInstanceId(key) }),
     )
   } catch (err) {
     // b.jg5 SRJ-714: an answer that settles after the caller stopped is not acted on.
@@ -3019,7 +3019,7 @@ function applyOwnRowRules(key: string, row: RowReadRow, at: OwnRowReadSite, clea
     return undefined
   }
   const why = !isPersonaOwnRow(row, key)
-    ? `the row is not the persona's own (claude_instance_id=${JSON.stringify(renderLogMessageText(row.claude_instance_id))})`
+    ? `the row is not the persona's own (instance_id=${JSON.stringify(renderLogMessageText(row.instance_id))})`
     : configured.why
   console.error(
     `${ownRowReadHead(key, at)}: its row carries the liveness note ${LATCHING_LIVENESS_NOTE}, but ${why} — the note is not applied (b.jg5 SRJ-114)`,
@@ -3211,7 +3211,7 @@ export function applyOwnRowStatusStep(key: string, answer: OwnRowStatusAnswer, a
       if (isAdErrorInstance(answer.thrown, ErrSpawnNotFound)) checkThisLaunchRowOnRead(key, THIS_LAUNCH_ROW_READ_ABSENT, false, at)
       return latchOnUnusableNameRead(key, answer.thrown, at)
     }
-    const row = { ...answer.result, claude_instance_id: personaInstanceId(key) }
+    const row = { ...answer.result, instance_id: personaInstanceId(key) }
     const decision = decideOwnRowRead({
       key,
       row,
@@ -3286,7 +3286,7 @@ export async function readPersonaOwnRowStatus(key: string, at: OwnRowReadSite): 
   let result: StatusResult
   try {
     result = await withOutageDetection(key, undefined, 'status', (client) =>
-      client.status({ claude_instance_id: personaInstanceId(key) }),
+      client.status({ instance_id: personaInstanceId(key) }),
     )
   } catch (err) {
     if (applyOwnRowStatusStep(key, { thrown: err }, at)) return { kind: OWN_ROW_STATUS_LATCHED, rowState: LATCH_ROW_STATE_UNREADABLE }
@@ -3339,7 +3339,7 @@ export type OwnPaneReadOutcome = Exclude<PaneReadOutcome, PaneReadConflict | Pan
  * SRJ-117): one `readPane` through `withOutageDetection`, declaring the
  * `read-pane` verb (tmux-touching: inside an attempt an UNAVAILABLE starts
  * `tmux-unresponsive` and a pane or GONE ends it, and ENVIRONMENT and CONFIG
- * raise their outages, all in the wrapper), with `claude_instance_id` and
+ * raise their outages, all in the wrapper), with `instance_id` and
  * `n_lines` only, and `allow_pending: true` when `request.allowPending` is
  * set (the pending-row rule's lap, b.jg5 SRJ-410). Answers the read's
  * outcome (`src/pane-read.ts`):
@@ -3394,12 +3394,12 @@ export async function readPersonaOwnPane(key: string, request: PersonaPaneReadRe
   if (personaLatchedNow(key)) return PANE_READ_NOT_READ_LATCHED
   let failure: PaneReadFailure
   try {
-    const claude_instance_id = personaInstanceId(key)
+    const instance_id = personaInstanceId(key)
     const result = await withOutageDetection(key, undefined, 'read-pane', (client) =>
       client.readPane(
         request.allowPending === true
-          ? { claude_instance_id, n_lines: request.nLines, allow_pending: true }
-          : { claude_instance_id, n_lines: request.nLines },
+          ? { instance_id, n_lines: request.nLines, allow_pending: true }
+          : { instance_id, n_lines: request.nLines },
       ),
     )
     return { kind: PANE_READ_PANE, pane: result.pane }
@@ -3549,7 +3549,7 @@ export async function sendPendingRowLapEnter(key: string, ref: string = keyRef(k
   let failure: PendingRowLapEnterFailure
   try {
     await withOutageDetection(key, undefined, 'send-keys', (client) =>
-      client.sendKeys({ claude_instance_id: personaInstanceId(key), text: '', allow_pending: true }),
+      client.sendKeys({ instance_id: personaInstanceId(key), text: '', allow_pending: true }),
     )
     return { kind: PENDING_ROW_LAP_ENTER_SENT }
   } catch (err) {
@@ -4101,7 +4101,7 @@ export async function reconnectMcpWithCause(
   try {
     await withOutageDetection(key, undefined, 'send-keys', (client) =>
       client.sendKeys({
-        claude_instance_id: personaInstanceId(key),
+        instance_id: personaInstanceId(key),
         text: `/mcp reconnect ${MCP_SERVER_NAME}`,
       }),
     )
@@ -5005,7 +5005,7 @@ function approverStopOrLatched(ctx: ApproverContext): ApproverStopReason | undef
  *     STATE name the approver gives no meaning): poll on within B at the pace
  *     in effect.
  *
- * Every call names only the persona's `claude_instance_id`, and the server
+ * Every call names only the persona's `instance_id`, and the server
  * runs no tmux command here; agent-director answers each call by the row's
  * current launch (HO rev 17). The pane a lap reads may be a single
  * leftover's: with no session of this launch there and exactly one leftover
@@ -5247,13 +5247,13 @@ async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | A
   const beforePane = approverStopMark(ctx)
   if (beforePane !== undefined) return beforePane
 
-  const claude_instance_id = personaInstanceId(key)
+  const instance_id = personaInstanceId(key)
   // b.jg5 SRJ-403: the next lap is paced from this pane read.
   const goesOn: ApproverLapGoesOn = { backOff: false, launchStartedAt, paneReadAtMs: ctx.clock.now() }
   let pane: string
   try {
     const result = await withOutageDetection(key, undefined, 'read-pane', (client) =>
-      client.readPane({ claude_instance_id, n_lines: APPROVER_PANE_LINES, allow_pending: true }),
+      client.readPane({ instance_id, n_lines: APPROVER_PANE_LINES, allow_pending: true }),
     )
     pane = result.pane
   } catch (err) {
@@ -5270,7 +5270,7 @@ async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | A
     // `ErrSpawnNotInteractive` stops the approver with nothing typed and no
     // kill (SRJ-404).
     await withOutageDetection(key, undefined, 'send-keys', (client) =>
-      client.sendKeys({ claude_instance_id, text: '', allow_pending: true }),
+      client.sendKeys({ instance_id, text: '', allow_pending: true }),
     )
   } catch (err) {
     // b.jg5 SRJ-118, SRJ-412, SRJ-1017: a `send-keys` that answered
@@ -8402,7 +8402,7 @@ export function promptRowLadderLatchedLine(ref: string, state: string): string {
 }
 
 /**
- * Poll `status({claude_instance_id})` until the spawn transitions to
+ * Poll `status({instance_id})` until the spawn transitions to
  * `waiting`, then call reconnectMcp. Transitions to live transient states
  * (ask_user, check_permission, pending) return 'not-reconnected' (b.f2b;
  * 'ok' before); recovery is then the health-check tick's job — post-b.9a7 the
@@ -9162,9 +9162,10 @@ function spawnHomeDir(): string {
 function buildSpawnParams(persona: Persona, config: PersonaConfig, configDirLabel: string): SpawnParams {
   const { key } = persona
   return {
+    agent: 'claude',
     template: TEMPLATE_NAME,
     cwd: persona.working_directory,
-    claude_instance_id: personaInstanceId(key),
+    instance_id: personaInstanceId(key),
     relay_mode: 'on',
     tmux_session_name: personaTmuxSessionName(key),
     label: [
@@ -9795,12 +9796,12 @@ async function readTeardownKillRow(key: string): Promise<KillRetryRead> {
       key,
       undefined,
       'status',
-      (client) => client.status({ claude_instance_id: personaInstanceId(key) }),
+      (client) => client.status({ instance_id: personaInstanceId(key) }),
       { armsNothing: { personaConfigured: () => configuredReadingOf(key).configured } },
     )
     const clear = decideRetiredEntryClear({
       key,
-      row: { ...result, claude_instance_id: personaInstanceId(key) },
+      row: { ...result, instance_id: personaInstanceId(key) },
       configured: false,
       retiredMarked: retiredMarkOf(key),
     })
@@ -10170,7 +10171,7 @@ export const JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS = 'jsonl-diagnosis-inconcl
  * kept; none of them says the row goes away.
  */
 export const JSONL_DIAGNOSIS_REUSE_WORDING =
-  'brought up fresh by a reuse spawn of the same instance, and its row is kept (its history archived to the earlier life)'
+  'brought up fresh by a reuse spawn of the same instance, and its row is kept (its prior sessions retained in the same life)'
 
 /** What the lost-transcript diagnosis concluded (b.wrb, b.fwu). */
 type JsonlDiagnosisVerdict = 'lost' | 'never-created' | 'inconclusive'
@@ -10188,15 +10189,13 @@ interface JsonlDiagnosis {
 
 /** The source tokens agent-director stamps on each candidate it stat'd
  *  (AD's `jsonlAttempt.source`): the persisted jsonl_path column, the
- *  CLAUDE_CONFIG_DIR-aware recomputed fallback, and archived session_history
- *  entries. Kept as the literal token set AD emits — never a version check. */
-type AdJsonlCandidateSource = 'persisted' | 'fallback' | 'history'
+ *  CLAUDE_CONFIG_DIR-aware recomputed fallback, for the latest session only. Kept as the literal token set AD emits — never a version check. */
+type AdJsonlCandidateSource = 'persisted' | 'fallback'
 
 /** Single source of truth for the tokens the candidate parser anchors on. */
 const AD_JSONL_CANDIDATE_SOURCES: readonly AdJsonlCandidateSource[] = [
   'persisted',
   'fallback',
-  'history',
 ]
 
 /** One transcript candidate resume tried (or that we recomputed locally). */
@@ -10220,7 +10219,7 @@ export interface JsonlCandidate {
  * path detail" and degrade to locally-computed candidates, never as "no paths".
  *
  * Strictly non-throwing and version-agnostic: it keys off the literal
- * `persisted` / `fallback` / `history` source tokens, not any version string.
+ * `persisted` / `fallback` source tokens, not any version string.
  * An AD that emits only a subset of those tokens simply yields fewer matches.
  */
 function parseJsonlMissingCandidates(description: string): JsonlCandidate[] {
@@ -10285,7 +10284,7 @@ function localStatNote(path: string): string {
  * provenance, and classifies the loss as never-created (expected, lossless),
  * lost (real context destroyed, operator-visible) or inconclusive. The
  * persona is then brought up fresh by a reuse spawn of its own id, which
- * keeps its row as an earlier life (`JSONL_DIAGNOSIS_REUSE_WORDING`).
+ * keeps its row and prior sessions in the same life (`JSONL_DIAGNOSIS_REUSE_WORDING`).
  *
  * It runs before that reuse spawn, because the reuse resets the row it reads
  * (its `jsonl_path`, session id, `cwd` and `started_at`). Never throws.
@@ -10344,7 +10343,7 @@ async function diagnoseJsonlMissing(
   // --- 2. Read the row before the reuse spawn resets it (best-effort). ----
   // b.jg5 SRJ-501: this get is the path's last read of the row before the
   // reuse spawn, so `read.lastRead` records what it gave.
-  const claudeInstanceId = personaInstanceId(key)
+  const instanceId = personaInstanceId(key)
   const what = 'ErrJsonlMissing diagnosis get'
   const ownRead = await readPersonaOwnRow(key, { site: 'spawnForPersona', what, ref })
   if (ownRead.kind === OWN_ROW_READ_LATCHED) {
@@ -10378,7 +10377,7 @@ async function diagnoseJsonlMissing(
     const adDetail = adCandidates.length
       ? jsonlCandidatesText(adCandidates)
       : renderLogMessageText(err.errDescription) || '(no path detail from agent-director)'
-    reportInconclusiveDiagnosis(ref, claudeInstanceId, JSONL_ROW_ABSENT_REASON_LEAD + adDetail, isStartup, err)
+    reportInconclusiveDiagnosis(ref, instanceId, JSONL_ROW_ABSENT_REASON_LEAD + adDetail, isStartup, err)
     return { verdict: 'inconclusive', notice: jsonlRowAbsentInconclusiveNoticeText(adDetail) }
   }
   const row = ownRead.row
@@ -10404,8 +10403,8 @@ async function diagnoseJsonlMissing(
         note: localStatNote(row.jsonl_path),
       })
     }
-    if (row.claude_session_id) {
-      const fallback = resolveJsonlPath(row.cwd, row.claude_session_id, effectiveConfigDir)
+    if (row.session_id) {
+      const fallback = resolveJsonlPath(row.cwd, row.session_id, effectiveConfigDir)
       if (fallback !== row.jsonl_path) {
         candidates.push({
           source: 'locally-computed(config-dir fallback)',
@@ -10445,7 +10444,7 @@ async function diagnoseJsonlMissing(
     // LOST: conversation provably happened since spawn, yet no transcript
     // survives. Real context destroyed — must be operator-visible.
     const detail =
-      `${ref} instance=${claudeInstanceId}: resume threw ErrJsonlMissing and the persona is ` +
+      `${ref} instance=${instanceId}: resume threw ErrJsonlMissing and the persona is ` +
       `${JSONL_DIAGNOSIS_REUSE_WORDING}, but the message archive holds ${archivedSinceSpawn} message(s) since spawn ` +
       `(started_at=${jsonlStartedAtText(row.started_at)}). Conversation history was LOST. Transcript candidates tried ` +
       `(${detailProvenance}): ${candidateStr}.`
@@ -10469,7 +10468,7 @@ async function diagnoseJsonlMissing(
     // lossless — quiet log, no error, no persona notice; counted with the
     // diagnosed amnesia (`fresh-after-amnesia`).
     console.error(
-      `[slack] ErrJsonlMissing diagnostic: ${ref} instance=${claudeInstanceId} — transcript never ` +
+      `[slack] ErrJsonlMissing diagnostic: ${ref} instance=${instanceId} — transcript never ` +
         `created (archive consulted: 0 archived messages since spawn). Nothing to lose; the persona is ` +
         `${JSONL_DIAGNOSIS_REUSE_WORDING}. Transcript candidates tried (${detailProvenance}): ${candidateStr}.`,
     )
@@ -10503,7 +10502,7 @@ async function diagnoseJsonlMissing(
       `the message archive (${config.message_archive_db}) could not be consulted (missing file, ` +
       `unreadable, or the count query failed) — see prior archive-count error line`
   }
-  reportInconclusiveDiagnosis(ref, claudeInstanceId, jsonlCandidatesReasonLead(reason, detailProvenance) + candidateStr, isStartup, err)
+  reportInconclusiveDiagnosis(ref, instanceId, jsonlCandidatesReasonLead(reason, detailProvenance) + candidateStr, isStartup, err)
   return { verdict: 'inconclusive', notice: jsonlCandidatesInconclusiveNoticeText(reason, detailProvenance, candidateStr) }
 }
 
@@ -10520,13 +10519,13 @@ async function diagnoseJsonlMissing(
  */
 function reportInconclusiveDiagnosis(
   ref: string,
-  claudeInstanceId: string,
+  instanceId: string,
   reason: string,
   isStartup: boolean,
   err: AgentDirectorError,
 ): void {
   const detail =
-    `${ref} instance=${claudeInstanceId}: resume threw ErrJsonlMissing and the persona is ` +
+    `${ref} instance=${instanceId}: resume threw ErrJsonlMissing and the persona is ` +
     `${JSONL_DIAGNOSIS_REUSE_WORDING}, but diagnosis was INCONCLUSIVE — could not determine whether conversation ` +
     `history was lost because ${reason}.`
   console.error(`[slack] ErrJsonlMissing diagnostic: ${detail}`)
@@ -11248,9 +11247,10 @@ function plainSpawnCollisionAtLadder(run: LadderRun, what: string): Promise<Spaw
  * missing label it does not resume, because agent-director's `ResumeParams`
  * carries only the instance ID and a resume keeps the old
  * `CLAUDE_CONFIG_DIR`: the row is replaced as for `resume_enabled: false`
- * (`replaceAtResumeSite`), by a reuse spawn of the same id (a new life),
+ * (`replaceAtResumeSite`), by a reuse spawn of the same id (a fresh conversation
+ * in the same AD life),
  * after the live-row sequence for a live row; no row is deleted. The old
- * history stays in the old directory, archived to the earlier life. No
+ * history stays in the old directory as a prior session in the same life. No
  * transcript was lost, so no JSONL diagnosis or amnesia action runs. A
  * directory that cannot be resolved keeps the row and answers `deferred`
  * with no call (bug b.g57).
@@ -11640,7 +11640,7 @@ async function resumeAtSite<R>(site: ResumeSite<R>): Promise<SpawnPersonaResult 
   const { key } = persona
   try {
     const launched: ResumeResult = await launchWithReplyGuard(persona, ref, 'resume', (client) =>
-      client.resume({ claude_instance_id: personaInstanceId(key) }),
+      client.resume({ instance_id: personaInstanceId(key) }),
     )
     console.error(`${head} resumed ${ref}`)
     // b.jg5 SRJ-506: a latch re-check's retry that was not refused clears the
@@ -15174,7 +15174,7 @@ function runPersonaLadder(
     params,
     what: 'spawn',
     lastRead: NOTHING_READ,
-    spawnedLine: (r) => `[slack] spawnForPersona: spawned ${ref} instanceId=${r.claude_instance_id}`,
+    spawnedLine: (r) => `[slack] spawnForPersona: spawned ${ref} instanceId=${r.instance_id}`,
     collided: () => {
       console.error(`[slack] spawnForPersona: ErrInstanceIdCollision for ${ref} — fetching current state`)
       return ladderGetThenAct(run)
@@ -15326,7 +15326,7 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
         params,
         what: LADDER_RETRY_SPAWN_WHAT,
         lastRead: LATCH_ROW_STATE_NO_ROW,
-        spawnedLine: (r) => `[slack] spawnForPersona: retry-spawn succeeded for ${ref} instanceId=${r.claude_instance_id}`,
+        spawnedLine: (r) => `[slack] spawnForPersona: retry-spawn succeeded for ${ref} instanceId=${r.instance_id}`,
         collided: () => plainSpawnCollisionAtLadder(run, LADDER_RETRY_SPAWN_WHAT),
       })
     }
@@ -15581,8 +15581,9 @@ export interface ReuseSpawnOptions {
 /**
  * The reuse spawn of persona `persona`'s `cscb_<key>` (b.jg5 SRJ-112,
  * SRJ-708): agent-director's `spawn` of the same fixed id with the reuse
- * flag, which brings the persona up fresh on its own id and keeps its row as
- * an earlier life. One launch, called by every reuse site; it runs inside its
+ * flag, which brings the persona up with a fresh conversation on its own id
+ * and retains its Claude row's AD life and prior sessions. One launch, called
+ * by every reuse site; it runs inside its
  * caller's launch or recovery attempt and opens none of its own, and its
  * caller registers the launch in flight.
  *   - The launch path's `claude_config_dir` check comes first (bug b.g57):
@@ -15597,10 +15598,11 @@ export interface ReuseSpawnOptions {
  *     as `launchWithReplyGuard` makes it (the reply guard immediately before
  *     it, then spawn detection, which reports an error by class).
  *   - A success logs one line naming the reuse spawn and the persona (and,
- *     when `options.lastRead` is no row, that no earlier life is kept: an
+ *     when `options.lastRead` is no row, that no prior sessions are kept: an
  *     ordinary fresh spawn, SRJ-112; when it is nothing read, a retired
  *     key's first launch or, with `options.forcedWhat`, the forced launch
- *     through its test seam, that any finished row is kept as an earlier life),
+ *     through its test seam, that any finished Claude row retains its AD life
+ *     and prior sessions),
  *     then, for a key the installed retired-key store had recorded when the
  *     launch attempt started (`options.retiredAtStart`; when the call was
  *     made, for a reuse with no attempt context) and still has recorded,
@@ -15667,17 +15669,17 @@ export async function reuseSpawnForPersona(
   // b.jg5 SRJ-506: a latch re-check's retry that was not refused clears the
   // latch before the after-launch step, so its approver runs unlatched.
   clearLatchBeforeOutcome(key)
-  // b.jg5 SRJ-112: a reuse of an id with no row is an ordinary fresh spawn; no earlier life is kept.
-  const earlierLife =
+  // b.jg5 SRJ-112: a reuse of an id with no row is an ordinary fresh spawn; no prior sessions are kept.
+  const retainedHistory =
     options.lastRead === LATCH_ROW_STATE_NO_ROW
-      ? 'the id had no row when last read (an ordinary fresh spawn), so no earlier life is kept'
+      ? 'the id had no row when last read (an ordinary fresh spawn), so no prior sessions are kept'
       : options.lastRead === NOTHING_READ
         ? options.forcedWhat !== undefined
-          ? `nothing of its row was read before it (the ${options.forcedWhat}, made through its test seam), so any finished row is kept as an earlier life`
-          : "nothing of its row was read before it (a retired key's first launch), so any finished row is kept as an earlier life"
-        : 'its row is kept as an earlier life'
+          ? `nothing of its row was read before it (the ${options.forcedWhat}, made through its test seam), so any finished Claude row retains its AD life and prior sessions`
+          : "nothing of its row was read before it (a retired key's first launch), so any finished Claude row retains its AD life and prior sessions"
+        : 'its Claude row retains its AD life and prior sessions'
   console.error(
-    `[slack] ${REUSE_SPAWN_SITE}: reuse-spawned ${ref} instanceId=${personaInstanceId(key)} — a new life on its own id; ${earlierLife} (b.jg5 SRJ-112)`,
+    `[slack] ${REUSE_SPAWN_SITE}: reuse-spawned ${ref} instanceId=${personaInstanceId(key)} — a fresh conversation on its own id; ${retainedHistory} (b.jg5 SRJ-112)`,
   )
   // b.jg5 SRJ-806: for a retired key the new life has begun; its mark is set.
   const action = reuseSuccessAction(key, ref, retiredAtStart)
@@ -17708,7 +17710,7 @@ async function readOldLifeRow(target: OldLifeWaitTarget, record: OldLifeWaitReco
     }
   }
   try {
-    const row = await withOutageDetection(oldKey, undefined, 'get', (client) => client.get({ claude_instance_id: instanceId }), oldLifeWaitCallOptions(target))
+    const row = await withOutageDetection(oldKey, undefined, 'get', (client) => client.get({ instance_id: instanceId }), oldLifeWaitCallOptions(target))
     clearOldLifeWaitConfigOutage(target)
     record.session = rowSessionName(row) ?? record.session
     // b.jg5 SRJ-809: a row read `ended` or `missing` ends the hold; a live one's `cwd` becomes the held directory.
@@ -17741,7 +17743,7 @@ async function readOldLifeKillRow(target: OldLifeWaitTarget, record: OldLifeWait
   const at: OwnRowReadSite = { site: OLD_LIFE_WAIT_SITE, what: OLD_LIFE_WAIT_STATUS_WHAT, ref }
   let result: StatusResult
   try {
-    result = await withOutageDetection(oldKey, undefined, 'status', (client) => client.status({ claude_instance_id: instanceId }), oldLifeWaitCallOptions(target))
+    result = await withOutageDetection(oldKey, undefined, 'status', (client) => client.status({ instance_id: instanceId }), oldLifeWaitCallOptions(target))
     clearOldLifeWaitConfigOutage(target)
   } catch (err) {
     if (isAdErrorInstance(err, ErrSpawnNotFound)) {
@@ -18475,7 +18477,7 @@ function sweepDecision(
   home: string,
 ): { action: 'sweep'; reason: string } | { action: 'keep' } | { action: 'deferred'; persona: Persona } {
   if (!persona) return { action: 'sweep', reason: 'absent persona' }
-  if (row.claude_instance_id !== personaInstanceId(persona.key)) return { action: 'sweep', reason: 'wrong instance ID' }
+  if (row.instance_id !== personaInstanceId(persona.key)) return { action: 'sweep', reason: 'wrong instance ID' }
   const comparison = compareRowToPersona(row, persona, home)
   if (comparison.cwdCheckDeferred) return { action: 'deferred', persona }
   if (!comparison.cwdMatches) return { action: 'sweep', reason: 'wrong cwd' }
@@ -18662,7 +18664,7 @@ export function startSweepStoppedKillLine(
  * nothing latches.
  */
 async function killStartSweepRow(pass: SweepPass, row: ListRow, target: StartSweepKillTarget): Promise<KillRetryResult> {
-  const id = row.claude_instance_id
+  const id = row.instance_id
   const name = startSweepRowName(id, target.persona)
   console.error(
     `${SWEEP_LOG_PREFIX}: killing ${name} state=${row.state} tmux_session=${row.tmux_session_name}; the row is kept whatever the outcome (b.jg5 SRJ-714)`,
@@ -18712,14 +18714,14 @@ function sweepKillAlertEntry(
 ): { readonly classLabel: string; readonly entry: string } | undefined {
   try {
     const session = typeof row.tmux_session_name === 'string' ? row.tmux_session_name : ''
-    const content = killFailureAlertContentOf(alert, session, row.claude_instance_id)
+    const content = killFailureAlertContentOf(alert, session, row.instance_id)
     if (content === undefined || content.version !== version) return undefined
     const route = selectKillFailureAlertRoute({ version, context: KILL_FAILURE_CONTEXT_START_SWEEP, configured: false, latched: false })
     if (route.classLabel === undefined) return undefined
     const text = killFailureAlertText(content, route.closing, false)
-    return { classLabel: route.classLabel, entry: killFailureAlertEntryText(`instanceId=${row.claude_instance_id}`, KILL_FAILURE_CONTEXT_START_SWEEP, text) }
+    return { classLabel: route.classLabel, entry: killFailureAlertEntryText(`instanceId=${row.instance_id}`, KILL_FAILURE_CONTEXT_START_SWEEP, text) }
   } catch (err) {
-    console.error(`${SWEEP_LOG_PREFIX}: building the kill-failure alert for instanceId=${row.claude_instance_id} failed: ${describeThrownValue(err)}`)
+    console.error(`${SWEEP_LOG_PREFIX}: building the kill-failure alert for instanceId=${row.instance_id} failed: ${describeThrownValue(err)}`)
     return undefined
   }
 }
@@ -18955,7 +18957,7 @@ export const START_SWEEP_KILL_STATUS_SITE: OwnRowReadSite = Object.freeze({ site
  */
 async function sweepKillRead(pass: SweepPass, instanceId: string, configuredKey: string | undefined): Promise<KillRetryRead> {
   try {
-    const result = await pass.client.status({ claude_instance_id: instanceId })
+    const result = await pass.client.status({ instance_id: instanceId })
     if (!sweepStopped(pass)) {
       clearOnSweepKillRead(instanceId, result)
       // b.jg5 SRJ-809: a row read `ended` or `missing` ends an old-life hold on it.
@@ -19014,7 +19016,7 @@ function clearOnSweepKillRead(instanceId: string, read: { readonly state: string
     if (key === undefined) return
     const clear = decideRetiredEntryClear({
       key,
-      row: { ...read, claude_instance_id: instanceId },
+      row: { ...read, instance_id: instanceId },
       configured: false,
       retiredMarked: retiredMarkOf(key),
     })
@@ -19120,7 +19122,7 @@ async function runStartSweepPostKillFindMissing(pass: SweepPass, killed: readonl
   const stillLive: string[] = []
   const notJudged: string[] = []
   for (const { row } of killed) {
-    const id = row.claude_instance_id
+    const id = row.instance_id
     const reading = readFindMissingRow(r, id, row.state)
     if (reading === FIND_MISSING_ROW_MARKED_MISSING) missing.push(id)
     else if (reading === FIND_MISSING_ROW_NOT_JUDGED) notJudged.push(id)
@@ -19176,7 +19178,7 @@ function latchFromListedRows(
 ): ReadonlySet<string> {
   const latched = new Set<string>()
   for (const row of rows) {
-    const key = ownRowKeyOfRowId(row.claude_instance_id)
+    const key = ownRowKeyOfRowId(row.instance_id)
     if (key === undefined) continue
     const persona = personasByKey.get(key)
     const ref = persona === undefined ? keyRef(key) : personaRef(persona)
@@ -19184,7 +19186,7 @@ function latchFromListedRows(
     const decision = actOnOwnRowRead(key, row, at, !recordedKeys.has(key))
     if (decision === undefined || latched.has(key)) continue
     latched.add(key)
-    console.error(startSweepLatchedFromOwnRowLine(ref, row.claude_instance_id, decision.latchCase))
+    console.error(startSweepLatchedFromOwnRowLine(ref, row.instance_id, decision.latchCase))
   }
   for (const persona of personasByKey.values()) {
     if (latched.has(persona.key)) continue
@@ -19230,7 +19232,7 @@ export function startSweepLatchedLine(ref: string, latchCase: string): string {
  * undefined when neither did. Pure; never throws.
  */
 function startSweepLatchOf(row: ListRow, latched: ReadonlySet<string>): string | undefined {
-  const own = ownRowKeyOfRowId(row.claude_instance_id)
+  const own = ownRowKeyOfRowId(row.instance_id)
   if (own !== undefined && latched.has(own)) return own
   const label = row.labels?.[PERSONA_LABEL_KEY]
   return typeof label === 'string' && latched.has(label) ? label : undefined
@@ -19468,7 +19470,7 @@ export async function reconcileOrphans(
   // the held directory.
   for (const row of rows) {
     noteOldLifeRowRead(
-      row.claude_instance_id,
+      row.instance_id,
       { kind: OLD_LIFE_ROW_READ_STATE, state: row.state, cwd: row.cwd },
       oldLifeReadName(START_SWEEP_LIST_SITE),
     )
@@ -19522,15 +19524,15 @@ function beginStartSweepListingHolds(pass: SweepPass, rows: readonly ListRow[]):
       if (!reading.recorded || reading.marked) continue
       if (typeof row.cwd !== 'string' || row.cwd === '') continue
       holds.begin({
-        instanceId: row.claude_instance_id,
-        oldKey: oldLifeKeyOf(row.claude_instance_id, label),
+        instanceId: row.instance_id,
+        oldKey: oldLifeKeyOf(row.instance_id, label),
         directory: row.cwd,
         cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING,
       })
-      noteOldLifeHoldSession(row.claude_instance_id, row.tmux_session_name)
+      noteOldLifeHoldSession(row.instance_id, row.tmux_session_name)
     } catch (err) {
       // Not reached (the hold set and the reading never throw).
-      console.error(`${SWEEP_LOG_PREFIX}: beginning the old-life hold of instanceId=${row.claude_instance_id} failed: ${describeThrownValue(err)} (b.jg5 SRJ-809)`)
+      console.error(`${SWEEP_LOG_PREFIX}: beginning the old-life hold of instanceId=${row.instance_id} failed: ${describeThrownValue(err)} (b.jg5 SRJ-809)`)
     }
   }
 }
@@ -19557,7 +19559,7 @@ function beginStartSweepKillHold(pass: SweepPass, record: SweepRowRecord): void 
   if (holds === undefined || record.disposition !== SWEEP_ROW_KILL_FAILED || record.kill === undefined) return
   if (sweepStopped(pass)) return
   const { row } = record
-  const id = row.claude_instance_id
+  const id = row.instance_id
   try {
     if (holds.holdOf(id) === undefined) {
       if (typeof row.cwd !== 'string' || row.cwd === '') return
@@ -19644,7 +19646,7 @@ async function sweepListedRow(pass: SweepPass, row: ListRow, context: StartSweep
       startSweepSweepingRowLine({
         reason: decision.reason,
         persona: displayPersona,
-        instanceId: row.claude_instance_id,
+        instanceId: row.instance_id,
         state: row.state,
         ...(decision.reason === 'wrong cwd' ? { cwd: row.cwd } : {}),
         live,
@@ -20660,12 +20662,12 @@ interface LatchRecheckPaneRead {
  */
 async function latchRecheckReadPane(key: string, allowPending: boolean): Promise<LatchRecheckPaneRead> {
   try {
-    const claude_instance_id = personaInstanceId(key)
+    const instance_id = personaInstanceId(key)
     await withOutageDetection(key, undefined, 'read-pane', (client) =>
       client.readPane(
         allowPending
-          ? { claude_instance_id, n_lines: PROBE_PANE_READ_LINES, allow_pending: true }
-          : { claude_instance_id, n_lines: PROBE_PANE_READ_LINES },
+          ? { instance_id, n_lines: PROBE_PANE_READ_LINES, allow_pending: true }
+          : { instance_id, n_lines: PROBE_PANE_READ_LINES },
       ),
     )
     return { answer: { kind: PANE_READ_PANE } }
@@ -20870,7 +20872,7 @@ export async function runLatchRecheckRound(key: string, deps: LatchRecheckRoundD
           return
         }
         scope.lastRead = latchRowStateOfReading(read)
-        const hasSessionId = got.kind === OWN_ROW_READ_ROW && typeof got.row.claude_session_id === 'string' && got.row.claude_session_id !== ''
+        const hasSessionId = got.kind === OWN_ROW_READ_ROW && typeof got.row.session_id === 'string' && got.row.session_id !== ''
         const launch = decideFinishedRowLaunch(read, hasSessionId, retiredKeyReadingOf(key).recorded)
         if (launch === RECHECK_CALL_NONE) {
           line(after.latchCase, RECHECK_CALL_FINISHED_ROW, `still-latched (row ${describeLatchRowState(scope.lastRead)}; no launch)`)

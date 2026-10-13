@@ -1023,7 +1023,7 @@
  * for or pending unless `restartRequested`; resolves with the outcome), `collided` (the stub answers of a launch whose optimistic spawn
  * collides), `callCounts` (the stub's calls by verb), `personaCallCounts`
  * (the stub's calls for one persona's instance, those whose
- * `claude_instance_id` is `personaInstanceId(key)`, by verb, leaving out
+ * `instance_id` is `personaInstanceId(key)`, by verb, leaving out
  * verbs with none; a case wanting the persona's total over every verb sums
  * its values), `callCountsSince` (what one by-verb count holds beyond an
  * earlier one, by verb, leaving out verbs with no increase), `recordCallOrder`
@@ -1112,7 +1112,7 @@
  * configured persona's own `pending` row with no launch start latches it.
  * Rows in any other state carry none.
  *
- * Isolation: no top-level `mock.module()`, no real HOME, `~/.agent-director`,
+ * Isolation: no top-level `mock.module()`, no real HOME, `~/.config/agent-director`,
  * tmux, child process or Slack client (the driver's clients are stubs). The
  * retry timer, the dialog approver, the waits between a kill's tries and the
  * live-row sequence's waits run on the fake clock only; the one real-time
@@ -1619,7 +1619,7 @@ export type RecoveryStubVerb = (typeof RECOVERY_STUB_VERBS)[number]
 
 /**
  * One stub call as the harness stamped it when it was made (b.jg5 SRJ-410,
- * AC 33): the verb, the harness clock's time, and the `claude_instance_id`
+ * AC 33): the verb, the harness clock's time, and the `instance_id`
  * it named (undefined for a verb that names none, such as `findMissing`).
  */
 export interface RecoveryTimedCall {
@@ -2568,7 +2568,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     for (const verb of RECOVERY_STUB_VERBS) {
       const call = client[verb]
       client[verb] = (...args: unknown[]): unknown => {
-        const named = (args[0] as { claude_instance_id?: unknown } | undefined)?.claude_instance_id
+        const named = (args[0] as { instance_id?: unknown } | undefined)?.instance_id
         timedCalls.push({ verb, at: clock.now(), instanceId: typeof named === 'string' ? named : undefined })
         return call.apply(client, args)
       }
@@ -3935,8 +3935,8 @@ export function expectUntouched(h: RecoveryHarness, other: string): void {
   expect(h.notices.filter((n) => n.key === other)).toEqual([])
   expect(getOutageFlags(other).size).toBe(0)
   const otherId = personaInstanceId(other)
-  const calls = Object.values(h.stub.calls).flat() as Array<{ claude_instance_id?: unknown }>
-  expect(calls.filter((params) => params?.claude_instance_id === otherId)).toEqual([])
+  const calls = Object.values(h.stub.calls).flat() as Array<{ instance_id?: unknown }>
+  expect(calls.filter((params) => params?.instance_id === otherId)).toEqual([])
 }
 
 /**
@@ -4032,7 +4032,7 @@ export async function expectLostMessageReports(
     restartPending: restartRequested ? expect.any(Boolean) : false,
     calls,
   }])
-  const instance = { claude_instance_id: personaInstanceId(key) }
+  const instance = { instance_id: personaInstanceId(key) }
   expect(h.stub.calls.statusCalls.slice(statusBefore)).toEqual(Array.from({ length: calls['statusCalls'] ?? 0 }, () => instance))
   return outcome
 }
@@ -4138,7 +4138,7 @@ export function callCounts(h: RecoveryHarness): Record<string, number> {
 }
 
 /**
- * The stub's calls for persona `key`'s instance (`claude_instance_id` is
+ * The stub's calls for persona `key`'s instance (`instance_id` is
  * `personaInstanceId(key)`), by verb, leaving out verbs with none. Its values
  * summed are the persona's calls over every verb.
  */
@@ -4146,7 +4146,7 @@ export function personaCallCounts(h: RecoveryHarness, key: string): Record<strin
   const id = personaInstanceId(key)
   return Object.fromEntries(
     Object.entries(h.stub.calls)
-      .map(([verb, calls]) => [verb, (calls as Array<{ claude_instance_id?: unknown } | undefined>).filter((c) => c?.claude_instance_id === id).length] as const)
+      .map(([verb, calls]) => [verb, (calls as Array<{ instance_id?: unknown } | undefined>).filter((c) => c?.instance_id === id).length] as const)
       .filter(([, count]) => count > 0),
   )
 }
@@ -4269,8 +4269,8 @@ export function ownRowsLiveThenMissing(h: RecoveryHarness): void {
   const read = new Set<string>()
   h.script({
     getFn: (params) => {
-      const key = h.keys.find((k) => personaInstanceId(k) === params.claude_instance_id)
-      if (key === undefined) throw new Error(`recovery harness: no configured persona has the instance id ${String(params.claude_instance_id)}`)
+      const key = h.keys.find((k) => personaInstanceId(k) === params.instance_id)
+      if (key === undefined) throw new Error(`recovery harness: no configured persona has the instance id ${String(params.instance_id)}`)
       const first = !read.has(key)
       read.add(key)
       return personaRow(h, key, first ? {} : { state: LIVENESS_DEAD_ROW_MISSING })
@@ -4286,7 +4286,7 @@ export function ownRowsLiveThenMissing(h: RecoveryHarness): void {
 export function reuseSpawnOf(h: RecoveryHarness, key: string): SpawnParams {
   const persona = personaOf(h, key)
   return expect.objectContaining({
-    claude_instance_id: personaInstanceId(key),
+    instance_id: personaInstanceId(key),
     reuse_finished: true,
     extra_env: personaSpawnEnv({ key, crontablePath: h.config.cron_table_path, claudeConfigDir: persona.claude_config_dir }),
   })
@@ -4347,11 +4347,11 @@ export function rowReadsUntilSpawn(
   const spawn = client.spawn.bind(client)
   client.spawn = async (params) => {
     const result = await spawn(params)
-    live.add(String(params.claude_instance_id))
+    live.add(String(params.instance_id))
     return result
   }
   const statusFn: NonNullable<RecoveryStubScript['statusFn']> = (params) => {
-    if (live.has(String(params.claude_instance_id))) return cannedStatusResult()
+    if (live.has(String(params.instance_id))) return cannedStatusResult()
     return before === UNAVAILABLE_RETRY_ROW_ABSENT ? errSpawnNotFound() : cannedStatusResult(beforeRow)
   }
   h.script({ statusFn })
@@ -4521,7 +4521,7 @@ export function scriptTimedLaunch(h: RecoveryHarness, key: string, options: Time
     h.script({
       spawnFn: (params) => {
         const kind = options.reuse === undefined || (params.reuse_finished === true) === options.reuse
-        if (!timed && String(params.claude_instance_id) === id && kind) return timedCall()
+        if (!timed && String(params.instance_id) === id && kind) return timedCall()
         return before?.(params)
       },
     })
@@ -4529,14 +4529,14 @@ export function scriptTimedLaunch(h: RecoveryHarness, key: string, options: Time
     const before = knobs.resumeFn
     h.script({
       resumeFn: (params) => {
-        if (!timed && String(params.claude_instance_id) === id) return timedCall()
+        if (!timed && String(params.instance_id) === id) return timedCall()
         return before?.(params)
       },
     })
   }
   const beforeGet = knobs.getFn
   h.script({
-    getFn: (params) => (ended() && params.claude_instance_id === id ? row() : beforeGet?.(params)),
+    getFn: (params) => (ended() && params.instance_id === id ? row() : beforeGet?.(params)),
   })
 
   return {
@@ -4610,8 +4610,8 @@ export function scriptModelLaunch(h: RecoveryHarness, row: PendingRowModel, opti
     return end === LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT ? errCallTimeout(verb) : errTmuxUnresponsiveLaunchTimeout(verb, row.instanceId)
   }
   h.script({
-    spawnFn: (params) => (!used && params.claude_instance_id === row.instanceId ? timed('spawn', () => modelSpawn(params)) : modelSpawn(params)),
-    resumeFn: (params) => (!used && params.claude_instance_id === row.instanceId ? timed('resume', () => modelResume(params)) : modelResume(params)),
+    spawnFn: (params) => (!used && params.instance_id === row.instanceId ? timed('spawn', () => modelSpawn(params)) : modelSpawn(params)),
+    resumeFn: (params) => (!used && params.instance_id === row.instanceId ? timed('resume', () => modelResume(params)) : modelResume(params)),
   })
 }
 

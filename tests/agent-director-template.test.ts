@@ -4,7 +4,7 @@
  * Covers:
  *   - buildTemplateParams() produces the SR-3.1 shape (relay_mode='on',
  *     label=['service=cscb'], deny=['AskUserQuestion'], overwrite: true,
- *     claude_args with the four required CLI flags).
+ *     agent_args with the four required CLI flags).
  *   - deriveMemoryReadAllowRules() emits one memory-subdir Read rule per
  *     distinct effective config dir across the personas (b.fae F5,
  *     b.av2 SR-6.2), never a config-dir root.
@@ -82,11 +82,12 @@ describe('buildTemplateParams (SR-3.1)', () => {
     }, baseDir)
     const params = buildTemplateParams(cfg)
     expect(params.name).toBe('slack-channel-bot')
+    expect(params.agent).toBe('claude')
     expect(params.relay_mode).toBe('on')
     expect(params.label).toEqual(['service=cscb'])
     expect(params.deny).toEqual(['AskUserQuestion'])
     expect(params.overwrite).toBe(true)
-    expect(params.claude_args).toEqual([
+    expect(params.agent_args).toEqual([
       '--dangerously-load-development-channels',
       'server:slack-channel-router',
       '--mcp-config',
@@ -228,9 +229,9 @@ describe('buildTemplateParams: --system-prompt-snapshot off (b.b1j SR-2)', () =>
         accessSync: () => { accessSyncCalls++; if (!readable) throw new Error('EACCES') },
         stderrWrite: (msg) => logged.push(msg),
       })
-      expect(params.claude_args).toEqual(pair ? [...args, ...PAIR] : args)
+      expect(params.agent_args).toEqual(pair ? [...args, ...PAIR] : args)
       // The pair is the same single occurrence at the end, and the probe and its warning are the setting's no-ops.
-      expect(params.claude_args!.filter((a) => a === '--system-prompt-snapshot')).toHaveLength(pair ? 1 : 0)
+      expect(params.agent_args!.filter((a) => a === '--system-prompt-snapshot')).toHaveLength(pair ? 1 : 0)
       expect(accessSyncCalls).toBe(probed ? 1 : 0)
       expect(logged).toHaveLength(warnings)
       if (warnings > 0) {
@@ -249,7 +250,7 @@ describe('installSlackChannelBotTemplate (SR-3.2)', () => {
   test('calls client.makeTemplate with the SR-3.1 params and returns the result', async () => {
     const makeTemplateCalls: import('agent-director').MakeTemplateParams[] = []
     const stub = makeStubClient({
-      makeTemplateResult: cannedMakeTemplate('/home/u/.agent-director/templates/slack-channel-bot.toml'),
+      makeTemplateResult: cannedMakeTemplate('/home/u/.config/agent-director/templates/slack-channel-bot.toml'),
       makeTemplateCalls,
     })
     const cfg = makePersonaConfig({
@@ -262,15 +263,16 @@ describe('installSlackChannelBotTemplate (SR-3.2)', () => {
       recordStartupError: () => { throw new Error('should not record on success') },
       exit: () => { throw new Error('should not exit on success') },
     })
-    expect(result.path).toBe('/home/u/.agent-director/templates/slack-channel-bot.toml')
+    expect(result.path).toBe('/home/u/.config/agent-director/templates/slack-channel-bot.toml')
     expect(makeTemplateCalls.length).toBe(1)
     const params = makeTemplateCalls[0]
     expect(params.name).toBe('slack-channel-bot')
+    expect(params.agent).toBe('claude')
     expect(params.relay_mode).toBe('on')
     expect(params.label).toEqual(['service=cscb'])
     expect(params.deny).toEqual(['AskUserQuestion'])
     expect(params.overwrite).toBe(true)
-    expect(params.claude_args).toEqual([
+    expect(params.agent_args).toEqual([
       '--dangerously-load-development-channels',
       'server:slack-channel-router',
       '--mcp-config',
@@ -294,7 +296,7 @@ describe('installSlackChannelBotTemplate (SR-3.2)', () => {
     })
     expect(makeTemplateCalls.length).toBe(1)
     expect(result.params).toEqual(makeTemplateCalls[0])
-    expect(makeTemplateCalls[0]!.claude_args).toEqual([
+    expect(makeTemplateCalls[0]!.agent_args).toEqual([
       '--dangerously-load-development-channels',
       'server:slack-channel-router',
       '--mcp-config',
@@ -426,7 +428,7 @@ describe('refreshSlackChannelBotTemplate (b.av2 SR-8.6 step 5)', () => {
   }
 
   // The applied config's server-wide values differ from the start's in every
-  // row; the refresh keeps the start's claude_args all the same. Row 2's
+  // row; the refresh keeps the start's agent_args all the same. Row 2's
   // applied append file really exists, so a refresh that probed it again
   // would gain the flag. Rows 1 and 2 start with fresh_system_prompt off and
   // apply it on: no pair is added.
@@ -469,7 +471,7 @@ describe('refreshSlackChannelBotTemplate (b.av2 SR-8.6 step 5)', () => {
 
     const allow = [memoryRule(join(home, '.claude')), memoryRule(infhub)]
     expect(calls).toEqual([{ ...installed, allow, overwrite: true }])
-    expect(calls[0]!.claude_args).toEqual(expectedArgs(baseDir))
+    expect(calls[0]!.agent_args).toEqual(expectedArgs(baseDir))
     // Scope (b.av2 SR-11): every refreshed rule reaches into projects/*/memory, never a config-dir root.
     for (const rule of calls[0]!.allow ?? []) expect(rule).toMatch(/\/projects\/\*\/memory\/\*\*\)$/)
     expect(calls[0]!.allow).not.toContain(`Read(/${infhub}/**)`)

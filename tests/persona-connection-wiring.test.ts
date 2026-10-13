@@ -1,3 +1,4 @@
+import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
 /**
  * persona-connection-wiring.test.ts — Each persona's connection feeds its own
  * pipeline and click handler, and the server's Slack seams resolve to the
@@ -748,7 +749,7 @@ describe('Task 6 carry: a click is decided only through the persona whose connec
       get: async () => cannedGetResultPlural({ state: 'check_permission', permission_requests: [request] }, h.A, dir),
       decide: async (params: DecideParams) => {
         decideCalls.push(params)
-        return {}
+        return cannedDecideResult()
       },
     }
     initOutageState({ getClient: () => ad as unknown as AdClient, notify: () => {} })
@@ -795,7 +796,7 @@ describe('Task 6 carry: a click is decided only through the persona whose connec
 
     await h.stub(h.A).socket.deliverInteractive(blockActions([actionId]))
 
-    expect(decideCalls).toEqual([{ claude_instance_id: instanceA, decision: 'allow', request_token: REQUEST_TOKEN } as DecideParams])
+    expect(decideCalls).toEqual([{ instance_id: instanceA, decision: 'allow', request_token: REQUEST_TOKEN } as DecideParams])
     expect(updates(h.stub(h.A)).map((c) => ({ channel: c.channel, ts: c.ts, text: c.text }))).toEqual([
       { channel: live.channelId, ts: live.messageTs, text: '*Permission* — Allowed' },
     ])

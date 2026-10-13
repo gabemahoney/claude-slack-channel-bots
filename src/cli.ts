@@ -1013,7 +1013,7 @@ export function createCli(deps: CliDeps): CliHandlers {
    * has none. Never throws for an agent-director answer.
    */
   async function teardownKill(id: string, ref: string, lastState: string): Promise<PersonaTeardownOutcome> {
-    const kill = (params: PlainKillParams): Promise<unknown> => deps.directorKill(params.claude_instance_id)
+    const kill = (params: PlainKillParams): Promise<unknown> => deps.directorKill(params.instance_id)
     const result = await runKillRetry({
       ...TEARDOWN_KILL_RETRY_OPTIONS,
       instanceId: id,
@@ -1804,7 +1804,7 @@ export function createDirectorOps(getClient: () => DirectorClient): DirectorOps 
   return {
     directorGet: async (id) => {
       try {
-        const r: GetResult = await getClient().get({ claude_instance_id: id })
+        const r: GetResult = await getClient().get({ instance_id: id })
         return { state: r.state, liveness_note: r.liveness_note, launch_started_at: r.launch_started_at }
       } catch (err) {
         if (isAdErrorInstance(err, ErrSpawnNotFound)) return null
@@ -1812,12 +1812,12 @@ export function createDirectorOps(getClient: () => DirectorClient): DirectorOps 
       }
     },
     directorReadPane: async (id, nLines) => {
-      const r = await getClient().readPane({ claude_instance_id: id, n_lines: nLines })
+      const r = await getClient().readPane({ instance_id: id, n_lines: nLines })
       return r.pane
     },
     directorStatus: async (id) => {
       try {
-        const r = await getClient().status({ claude_instance_id: id })
+        const r = await getClient().status({ instance_id: id })
         return { state: r.state }
       } catch (err) {
         if (isAdErrorInstance(err, ErrSpawnNotFound)) return null
@@ -1825,7 +1825,7 @@ export function createDirectorOps(getClient: () => DirectorClient): DirectorOps 
       }
     },
     directorPause: async (id) => {
-      await getClient().pause({ claude_instance_id: id })
+      await getClient().pause({ instance_id: id })
     },
     // The kill's parameters are the instance ID alone, never
     // `include_finished` (b.jg5 SRJ-106, SRJ-904). The result is answered as
@@ -1834,7 +1834,7 @@ export function createDirectorOps(getClient: () => DirectorClient): DirectorOps 
     // field (a binary older than Phase 1, which only `stop --stop-bots`
     // reaches) is a plain success there (b.jg5 SRJ-110, SRJ-902).
     directorKill: async (id) => {
-      return getClient().kill({ claude_instance_id: id })
+      return getClient().kill({ instance_id: id })
     },
     // The service label is the only filter: no state filter, no other label
     // (b.jg5 SRJ-906). Every error passes through; the answer check counts

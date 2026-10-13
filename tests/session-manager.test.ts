@@ -1,3 +1,4 @@
+import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 /**
  * session-manager.test.ts — Library-backed session-manager tests.
  *
@@ -1697,7 +1698,7 @@ function personaRowsGet(
   cfg: PersonaConfig,
   overrides: PersonaGetResultOverrides = {},
 ): (params: import('agent-director').GetParams) => Promise<CannedGetResult> {
-  return async (params) => personaRow(cfg, params.claude_instance_id.slice(PERSONA_INSTANCE_ID_PREFIX.length), overrides)
+  return async (params) => personaRow(cfg, params.instance_id.slice(PERSONA_INSTANCE_ID_PREFIX.length), overrides)
 }
 
 /** Capture of outage-state notices (onsets + all-clears), by persona key, across each test. */
@@ -2134,8 +2135,10 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
     expect(spawnCalls).toHaveLength(1)
     const params = spawnCalls[0]
     expect(params.template).toBe('slack-channel-bot')
+    expect(params.agent).toBe('claude')
+    expect(Object.keys(params.extra_env ?? {})).not.toContain('HOME')
     expect(params.cwd).toBe(workDir)
-    expect(params.claude_instance_id).toBe(`cscb_${key}`)
+    expect(params.instance_id).toBe(`cscb_${key}`)
     expect(params.tmux_session_name).toBe(`slack_bot_${key}`)
     expect(params.relay_mode).toBe('on')
     expect(params.label).toEqual(['service=cscb', `persona=${key}`, configDirLabelFor(configDir)])
@@ -2148,7 +2151,7 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
       CSCB_CRONTABLE_PATH: join(fixtureDir, 'crontab'),
       CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
     })
-    expect(params.claude_args).toBeUndefined()
+    expect(params.agent_args).toBeUndefined()
   })
 
   test('no claude_config_dir configured → CLAUDE_CONFIG_DIR absent (not empty), label is that of <home>/.claude', async () => {
@@ -2290,7 +2293,7 @@ describe('spawnForPersona: config_dir label (SR-2.2, SR-1.5)', () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     installStub({ spawnCalls })
     for (const persona of cfg.personas) await spawnForPersona(persona, cfg)
-    return new Map(spawnCalls.map((p) => [String(p.claude_instance_id).slice('cscb_'.length), p]))
+    return new Map(spawnCalls.map((p) => [String(p.instance_id).slice('cscb_'.length), p]))
   }
 
   test('a per-persona directory overrides the top-level one in the label and the env', async () => {
@@ -2380,7 +2383,7 @@ describe('spawnForPersona: persona identity (SR-2.2)', () => {
 
     await spawnForPersona(personaOf(cfg, 'ops_bot'), cfg)
 
-    expect(spawnCalls[0].claude_instance_id).toBe('cscb_ops_bot')
+    expect(spawnCalls[0].instance_id).toBe('cscb_ops_bot')
     expect(spawnCalls[0].tmux_session_name).toBe('slack_bot_ops_bot')
     expect(spawnCalls[0].label).toContain('persona=ops_bot')
   })
@@ -2399,7 +2402,7 @@ describe('spawnForPersona: persona identity (SR-2.2)', () => {
 
     expect(result).toEqual({ key: 'C0AMDDZEHCY', action: 'spawned' })
     const params = spawnCalls[0]
-    expect(params.claude_instance_id).toBe('cscb_C0AMDDZEHCY')
+    expect(params.instance_id).toBe('cscb_C0AMDDZEHCY')
     expect(params.tmux_session_name).toBe('slack_bot_C0AMDDZEHCY')
     expect(params.cwd).toBe('/repo/general')
     expect(params.label).toEqual([
@@ -2432,8 +2435,8 @@ describe('spawnForPersona: persona identity (SR-2.2)', () => {
     const result = await spawnForPersona(personaOf(cfg, key), cfg)
 
     expect(result.action).toBe('resumed')
-    expect(getCalls[0].claude_instance_id).toBe(`cscb_${key}`)
-    expect(resumeCalls[0].claude_instance_id).toBe(`cscb_${key}`)
+    expect(getCalls[0].instance_id).toBe(`cscb_${key}`)
+    expect(resumeCalls[0].instance_id).toBe(`cscb_${key}`)
   })
 })
 
@@ -2455,7 +2458,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('resumed')
     expect(resumeCalls).toHaveLength(1)
-    expect(resumeCalls[0].claude_instance_id).toBe('cscb_C')
+    expect(resumeCalls[0].instance_id).toBe('cscb_C')
   })
 
   // b.jg5 SRJ-707: the no-transcript answer brings the persona up by one
@@ -2469,14 +2472,14 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
       deleteCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' }),
       ],
       resumeError: errNoSessionId(),
       getResult: personaRow(cfg, 'C', { state: 'ended' }),
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
-    expect(spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+    expect(spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([
       ['cscb_C', undefined],
       ['cscb_C', true],
     ])
@@ -2498,14 +2501,14 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
       resumeCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' }),
       ],
       getResult: personaRow(cfg, 'C', { state: 'missing' }),
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
     expect(resumeCalls).toHaveLength(0)
-    expect(spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+    expect(spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([
       ['cscb_C', undefined],
       ['cscb_C', true],
     ])
@@ -2557,7 +2560,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
       deleteCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' }),
       ],
       resumeError: errSpawnNotFound(),
       getResult: personaRow(cfg, 'C', { state: 'ended' }),
@@ -2567,7 +2570,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     // initial collision spawn + the fresh spawn after ErrSpawnNotFound
     expect(spawnCalls).toHaveLength(2)
     // fresh spawn carries the original params (same persona labels / id)
-    expect(spawnCalls[1].claude_instance_id).toBe('cscb_C')
+    expect(spawnCalls[1].instance_id).toBe('cscb_C')
     expect(spawnCalls[1].label).toEqual(['service=cscb', 'persona=C', `config_dir=${personaConfigDirLabelValue(undefined, home)}`])
     // row was already gone — no kill and no delete of a missing row
     expect(killCalls).toHaveLength(0)
@@ -2617,7 +2620,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
       spawnCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' }),
       ],
       getError: errSpawnNotFound(),
     })
@@ -2680,7 +2683,7 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
       ...calls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' }),
       ],
       resumeError,
       getResult: personaRow(cfg, 'C', { state: 'ended' }),
@@ -2983,7 +2986,7 @@ describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
       ...calls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' }),
       ],
       getResult: row,
       ...extra,
@@ -3008,7 +3011,7 @@ describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
     expect(result).toEqual({ key: 'C', action: 'spawned' })
     expect([calls.killCalls, calls.deleteCalls]).toEqual([[], []])
     // The colliding plain spawn, then exactly one reuse spawn of the same id, in the persona's directory.
-    expect(calls.spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished, call.cwd])).toEqual([
+    expect(calls.spawnCalls.map((call) => [call.instance_id, call.reuse_finished, call.cwd])).toEqual([
       ['cscb_C', undefined, work],
       ['cscb_C', true, work],
     ])
@@ -3139,7 +3142,7 @@ function installResumeEntry(entry: ResumeEntry, row: CannedGetResult, calls: Lad
     ...calls,
     spawnQueue: [
       cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-      cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${key}` }),
+      cannedOk<StubSpawnResult>({ instance_id: `cscb_${key}` }),
     ],
     getResult: { ...row, state },
     sendKeysError: state === 'waiting' ? errTmuxSendKeys() : undefined,
@@ -3195,7 +3198,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
     if (variant === 'matching') {
       // Resumed as before the guard existed.
       expect(result).toEqual({ key: 'C', action: 'resumed' })
-      expect(calls.resumeCalls.map((r) => r.claude_instance_id)).toEqual(['cscb_C'])
+      expect(calls.resumeCalls.map((r) => r.instance_id)).toEqual(['cscb_C'])
       expect(calls.deleteCalls).toHaveLength(0)
       expect(calls.spawnCalls).toHaveLength(1)
       expect(errLog).not.toContain('config_dir label')
@@ -3265,7 +3268,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
       })
 
       expect(result).toEqual({ key: 'C', action: 'resumed' })
-      expect(calls.resumeCalls.map((r) => r.claude_instance_id)).toEqual(['cscb_C'])
+      expect(calls.resumeCalls.map((r) => r.instance_id)).toEqual(['cscb_C'])
       expect(calls.killCalls).toHaveLength(0)
       expect(calls.deleteCalls).toHaveLength(0)
       expect(calls.spawnCalls).toHaveLength(1)
@@ -3298,7 +3301,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
       ...calls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' }),
       ],
       getResult: personaRow(cfg, 'C', { state: 'ended', labels: labelsFor('changed', cfg, home) }),
     })
@@ -3353,7 +3356,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
       resumeCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' }),
       ],
       getResult: row,
     })
@@ -3363,7 +3366,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
     expect(result).toEqual({ key: 'C', action: 'spawned' })
     expect(resumeCalls).toHaveLength(0)
     expect(deleteCalls).toEqual([])
-    expect(spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([['cscb_C', undefined], ['cscb_C', true]])
+    expect(spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([['cscb_C', undefined], ['cscb_C', true]])
     expect(spawnCalls[1].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(later)
     expect(spawnCalls[1].label).toEqual(['service=cscb', 'persona=C', configDirLabelFor(later)])
     expect(spawnCalls[1].label).not.toContain(configDirLabelFor(earlier))
@@ -3451,7 +3454,7 @@ describe('pre-launch trust patch (b.av2 SR-6.2)', () => {
           ...calls,
           spawnQueue: [
             cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-            cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
+            cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' }),
           ],
           getResult: personaRow(cfg, 'C', { state: 'ended' }),
           resumeError: errJsonlMissing(),
@@ -3665,7 +3668,7 @@ describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
 
   type SpawnResult = import('agent-director').SpawnResult
   const collision = () => cannedErr<SpawnResult>(errInstanceIdCollision())
-  const spawnOk = () => cannedOk<StubSpawnResult>({ claude_instance_id: GUARD_INSTANCE })
+  const spawnOk = () => cannedOk<StubSpawnResult>({ instance_id: GUARD_INSTANCE })
 
   /**
    * The reply-guard persona with a real working directory and its own real
@@ -4026,7 +4029,7 @@ describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
 
     expect(result).toEqual({ key: GUARD_KEY, action: 'spawned' })
     expect(events).toEqual([...SPAWN])
-    expect(calls.spawnCalls.map((p) => p.claude_instance_id)).toEqual([GUARD_INSTANCE])
+    expect(calls.spawnCalls.map((p) => p.instance_id)).toEqual([GUARD_INSTANCE])
     const lines = errLog.split('\n').filter((l) => l.includes('reply-guard: could not write the record'))
     expect(lines).toHaveLength(1)
     expect(lines[0]).toStartWith(`[slack] reply-guard: could not write the record for ${renderPersonaRef(GUARD_NAME, GUARD_KEY)} at `)
@@ -4084,7 +4087,7 @@ describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
 describe('prompt suggestions off on every launch (b.svb, b.f2b)', () => {
   type SpawnResult = import('agent-director').SpawnResult
   const collision = () => cannedErr<SpawnResult>(errInstanceIdCollision())
-  const spawnOk = () => cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' })
+  const spawnOk = () => cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' })
 
   /** The env var and value every persona launch must run with, written out here, not taken from src. */
   const VAR = 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION'
@@ -4185,7 +4188,7 @@ describe('prompt suggestions off on every launch (b.svb, b.f2b)', () => {
     expect(calls.spawnCalls).toHaveLength(path.spawns)
     expect(calls.resumeCalls).toHaveLength(path.resumes)
     for (const params of calls.spawnCalls) expect(params.extra_env?.[VAR]).toBe(OFF)
-    for (const params of calls.resumeCalls) expect(params).toEqual({ claude_instance_id: 'cscb_C' })
+    for (const params of calls.resumeCalls) expect(params).toEqual({ instance_id: 'cscb_C' })
   })
 
   test('a row this version spawned resumes with it: agent-director restores the env stored at the spawn', async () => {
@@ -4201,11 +4204,11 @@ describe('prompt suggestions off on every launch (b.svb, b.f2b)', () => {
       stub.spawn = async (params) => {
         launches.push({ call: 'spawn', env: params.extra_env })
         const r = await spawn(params)
-        stored.set(String(params.claude_instance_id), params.extra_env)
+        stored.set(String(params.instance_id), params.extra_env)
         return r
       }
       stub.resume = async (params) => {
-        launches.push({ call: 'resume', env: stored.get(params.claude_instance_id) })
+        launches.push({ call: 'resume', env: stored.get(params.instance_id) })
         return resume(params)
       }
     }
@@ -4274,7 +4277,7 @@ describe('launchSession: the relaunch gate (canLaunch)', () => {
 
     expect(result).toBe(true)
     expect(f.events).toEqual(['patch', 'spawn'])
-    expect(f.calls.spawnCalls.map((p) => p.claude_instance_id)).toEqual(['cscb_C'])
+    expect(f.calls.spawnCalls.map((p) => p.instance_id)).toEqual(['cscb_C'])
   })
 
   // The gate is asked first (b.av2 SR-8.6: a key a confirmed apply removed is
@@ -4376,7 +4379,7 @@ describe('launchSession: a key outside the applied set (b.av2 SR-8.6)', () => {
     expect(result).toBe(true)
     expect(f.gateLines).toEqual([])
     expect(f.events).toEqual(['patch', 'guard', 'spawn'])
-    expect(f.calls.spawnCalls.map((p) => p.claude_instance_id)).toEqual([GUARD_INSTANCE])
+    expect(f.calls.spawnCalls.map((p) => p.instance_id)).toEqual([GUARD_INSTANCE])
     expect(f.rg.readRecord(GUARD_KEY)).toBe('true')
     expect(getLaunchedWithDir(GUARD_KEY)).toBe(f.configDir)
   })
@@ -4429,7 +4432,7 @@ describe('next launch: the applied values at launch time (b.av2 SR-8.6 next-laun
       ...second,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: GUARD_INSTANCE }),
+        cannedOk<StubSpawnResult>({ instance_id: GUARD_INSTANCE }),
       ],
       getResult: row,
     })
@@ -4441,7 +4444,7 @@ describe('next launch: the applied values at launch time (b.av2 SR-8.6 next-laun
     expect(result).toBe(true)
     expect(second.resumeCalls).toHaveLength(0)
     expect(second.deleteCalls).toEqual([])
-    expect(second.spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+    expect(second.spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([
       [GUARD_INSTANCE, undefined],
       [GUARD_INSTANCE, true],
     ])
@@ -4472,7 +4475,7 @@ describe('spawnForPersona: fixed instance ID and one launch in flight per person
       getCalls,
       sendKeysCalls,
       spawnQueue: [
-        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' }),
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
       ],
       getResult: personaRow(cfg, 'C', { state: 'waiting' }),
@@ -4484,8 +4487,8 @@ describe('spawnForPersona: fixed instance ID and one launch in flight per person
     expect(first).toEqual({ key: 'C', action: 'spawned' })
     expect(second).toEqual({ key: 'C', action: 'reconnected' })
     // No second instance ID is ever requested.
-    expect(spawnCalls.map((p) => p.claude_instance_id)).toEqual(['cscb_C', 'cscb_C'])
-    expect(getCalls.map((g) => g.claude_instance_id)).toEqual(['cscb_C'])
+    expect(spawnCalls.map((p) => p.instance_id)).toEqual(['cscb_C', 'cscb_C'])
+    expect(getCalls.map((g) => g.instance_id)).toEqual(['cscb_C'])
     expect(sendKeysCalls.map((s) => s.text)).toEqual([`/mcp reconnect ${MCP_SERVER_NAME}`])
   })
 
@@ -4544,7 +4547,7 @@ describe('spawnForPersona: fixed instance ID and one launch in flight per person
     held.release('cscb_K')
     expect(await k).toEqual({ key: 'K', action: 'spawned' })
 
-    expect(held.calls.map((p) => p.claude_instance_id).sort()).toEqual(['cscb_K', 'cscb_L'])
+    expect(held.calls.map((p) => p.instance_id).sort()).toEqual(['cscb_K', 'cscb_L'])
   })
 
   test('isLaunchInFlight is true for a persona only while its launch is unsettled; other keys stay false', async () => {
@@ -4568,13 +4571,13 @@ describe('spawnForPersona: fixed instance ID and one launch in flight per person
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const first =
       settlement === 'success'
-        ? cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' })
+        ? cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' })
         : settlement === 'failed'
           ? cannedErr<import('agent-director').SpawnResult>(errGeneric('spawn', 'ErrSpawnBroken'))
           : cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())
     const stub = installStub({
       spawnCalls,
-      spawnQueue: [first, cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' })],
+      spawnQueue: [first, cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' })],
     })
     // 'a throw': the collision get returns no row, so the ladder throws while reading it.
     stub.get = async () => undefined as unknown as import('agent-director').GetResult
@@ -4805,7 +4808,7 @@ describe('launch attempt: the retrying result and launchSession\'s \'refused\' (
     const stub = installStub({})
     const realSpawn = stub.spawn.bind(stub)
     stub.spawn = async (params) => {
-      if (params.claude_instance_id === 'cscb_beta') throw errTmuxUnresponsive('spawn')
+      if (params.instance_id === 'cscb_beta') throw errTmuxUnresponsive('spawn')
       return realSpawn(params)
     }
     const cfg = makeMultiPersonaConfig(
@@ -4913,7 +4916,7 @@ function countDeferredLines(errLog: string): number {
  */
 function prePersonaRow(state: string, id = `cscb_old_${state}_C0OLD`): import('agent-director').ListRow {
   return cannedListRow({
-    claude_instance_id: id,
+    instance_id: id,
     state,
     labels: { service: 'cscb', channel: 'C0OLD' },
     tmux_session_name: id.replace(/^cscb_/, 'slack_bot_'),
@@ -4974,7 +4977,7 @@ type SweepOrdinaryQuotes = Extract<KillFailureAlertContent, { version: typeof KI
 
 /** The start sweep's kill-failure alert entry text for `row`: `instanceId=<id> (start sweep): <text>`, the log-only closing, unescaped. */
 function sweepAlertEntry(row: import('agent-director').ListRow, content: KillFailureAlertContent): string {
-  return killFailureAlertEntryText(`instanceId=${row.claude_instance_id}`, KILL_FAILURE_CONTEXT_START_SWEEP, killFailureAlertText(content, KILL_FAILURE_CLOSING_LOG_ONLY, false))
+  return killFailureAlertEntryText(`instanceId=${row.instance_id}`, KILL_FAILURE_CONTEXT_START_SWEEP, killFailureAlertText(content, KILL_FAILURE_CLOSING_LOG_ONLY, false))
 }
 
 /** The survivor version's `persona-kill-survivor` entry for a sweep kill of `row` whose earlier try named `survivorDescription`. */
@@ -4997,7 +5000,7 @@ function sweepKillFailedEntry(
   stoppedAtShutdown = false,
 ): string {
   const entry = startSweepKillFailedEntry({
-    instanceId: row.claude_instance_id,
+    instanceId: row.instance_id,
     ...(persona === undefined ? {} : { persona }),
     state: row.state,
     session: row.tmux_session_name,
@@ -5005,7 +5008,7 @@ function sweepKillFailedEntry(
     stoppedAtShutdown,
   })
   if (ordinary === undefined) return entry
-  return `${entry}; kill-failure alert: ${sweepAlertEntry(row, { version: KILL_FAILURE_VERSION_ORDINARY, session: row.tmux_session_name, instanceId: row.claude_instance_id, quotes: ordinary })}`
+  return `${entry}; kill-failure alert: ${sweepAlertEntry(row, { version: KILL_FAILURE_VERSION_ORDINARY, session: row.tmux_session_name, instanceId: row.instance_id, quotes: ordinary })}`
 }
 
 
@@ -5033,7 +5036,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
   /** A swept row of persona `persona` (`alpha`'s directory), id `id`, listed `state`. */
   const sweptRow = (cfg: PersonaConfig, home: string, id: string, persona: string, state = 'waiting'): import('agent-director').ListRow =>
-    cannedListRow({ claude_instance_id: id, state, labels: { service: 'cscb', persona } }, personaOf(cfg, 'alpha'), home)
+    cannedListRow({ instance_id: id, state, labels: { service: 'cscb', persona } }, personaOf(cfg, 'alpha'), home)
 
   test('kills, with no delete, exactly the live rows with an absent persona, a wrong instance ID or a wrong cwd, and a live pre-persona row; keeps every row; leaves correct rows alone', async () => {
     const { cfg, home, betaReal } = sweepConfig()
@@ -5055,11 +5058,11 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
           // Kept: the persona's working_directory is a symlink; the row's cwd is its real directory.
           cannedListRow({ cwd: betaReal }, beta, home),
           // Pre-persona (only the interim `channel` label, no `persona` label), live: killed, kept.
-          cannedListRow({ claude_instance_id: 'cscb_legacy', labels: { service: 'cscb', channel: 'alpha' } }, alpha, home),
+          cannedListRow({ instance_id: 'cscb_legacy', labels: { service: 'cscb', channel: 'alpha' } }, alpha, home),
           // Swept: names a persona absent from the applied configuration.
-          cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed', channel: 'departed' } }, alpha, home),
+          cannedListRow({ instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed', channel: 'departed' } }, alpha, home),
           // Swept: right persona label, another instance ID.
-          cannedListRow({ claude_instance_id: 'cscb_alpha_old' }, alpha, home),
+          cannedListRow({ instance_id: 'cscb_alpha_old' }, alpha, home),
           // Swept: right label and instance ID, another cwd.
           cannedListRow({ cwd: elsewhere }, gamma, home),
         ],
@@ -5073,7 +5076,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
     expect(listCalls).toEqual([{ label: ['service=cscb'] }])
     expect(result).toEqual(sweepResult({ listed: 6, killed: 4, kept: 2 }))
-    expect(killCalls.map((k) => k.claude_instance_id).sort()).toEqual(['cscb_alpha_old', 'cscb_departed', 'cscb_gamma', 'cscb_legacy'])
+    expect(killCalls.map((k) => k.instance_id).sort()).toEqual(['cscb_alpha_old', 'cscb_departed', 'cscb_gamma', 'cscb_legacy'])
     expect(deleteCalls).toEqual([])
     // Each row is swept for its own reason, named in the log; the pre-persona row is killed, not swept.
     expect(errLog).toContain('reconcileOrphans: killing pre-persona row instanceId=cscb_legacy state=waiting ')
@@ -5120,11 +5123,11 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
             // Kept, check deferred: the directory-broken persona's own row.
             cannedListRow({ cwd: broken.rowCwd }, delta, home),
             // Swept: the directory-broken persona's label, another instance ID.
-            cannedListRow({ claude_instance_id: 'cscb_delta_old', cwd: broken.rowCwd }, delta, home),
+            cannedListRow({ instance_id: 'cscb_delta_old', cwd: broken.rowCwd }, delta, home),
             // Swept: an absent persona.
-            cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }, alpha, home),
+            cannedListRow({ instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }, alpha, home),
             // Pre-persona (no persona label), live: killed, kept.
-            cannedListRow({ claude_instance_id: 'cscb_legacy', labels: { service: 'cscb' } }, alpha, home),
+            cannedListRow({ instance_id: 'cscb_legacy', labels: { service: 'cscb' } }, alpha, home),
             // Kept: a correct row for a resolvable persona.
             cannedListRow({}, alpha, home),
             // Swept: a resolvable persona's row in another directory.
@@ -5139,7 +5142,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       })
 
       expect(result).toEqual(sweepResult({ listed: 6, killed: 4, kept: 2 }))
-      expect(killCalls.map((k) => k.claude_instance_id).sort()).toEqual(['cscb_delta_old', 'cscb_departed', 'cscb_gamma', 'cscb_legacy'])
+      expect(killCalls.map((k) => k.instance_id).sort()).toEqual(['cscb_delta_old', 'cscb_departed', 'cscb_gamma', 'cscb_legacy'])
       expect(deleteCalls).toEqual([])
       expect(errLog).toContain(deferredSweepLine('delta', 'delta', broken.workingDirectory))
       expect(countDeferredLines(errLog)).toBe(1)
@@ -5229,7 +5232,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     })
 
     expect(result).toEqual(sweepResult({ listed: 3, killed: 1, kept: 2 }))
-    expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_delta'])
+    expect(killCalls.map((k) => k.instance_id)).toEqual(['cscb_delta'])
     expect(deleteCalls).toEqual([])
     expect(errLog).toContain(`reconcileOrphans: sweeping row (wrong cwd) persona=${renderPersonaRef('delta', 'delta')} instanceId=cscb_delta state=waiting cwd=${alphaWork}`)
     expect(errLog).toContain(deferredSweepLine('epsilon', 'epsilon', epsilon.workingDirectory))
@@ -5326,9 +5329,9 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       return {
         result,
         rows: listed,
-        killCalls: killCalls.map((k) => k.claude_instance_id),
-        statusCalls: statusCalls.map((c) => c.claude_instance_id),
-        deleteCalls: deleteCalls.map((d) => d.claude_instance_id),
+        killCalls: killCalls.map((k) => k.instance_id),
+        statusCalls: statusCalls.map((c) => c.instance_id),
+        deleteCalls: deleteCalls.map((d) => d.instance_id),
         findMissingCalls: findMissingCalls.length,
         clock,
         errLog,
@@ -5448,7 +5451,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
     /** The two kinds of live stray: alpha's swept row under another instance id (named as the sweep names it), and a pre-persona row. */
     const STRAY_ROWS: ReadonlyArray<readonly [string, (cfg: PersonaConfig, home: string) => import('agent-director').ListRow, string | undefined]> = [
-      ['a configured persona\'s swept row', (cfg, home) => cannedListRow({ claude_instance_id: 'cscb_alpha_old' }, personaOf(cfg, 'alpha'), home), renderPersonaRef('alpha', 'alpha')],
+      ['a configured persona\'s swept row', (cfg, home) => cannedListRow({ instance_id: 'cscb_alpha_old' }, personaOf(cfg, 'alpha'), home), renderPersonaRef('alpha', 'alpha')],
       ['a live pre-persona row', () => prePersonaRow('waiting'), undefined],
     ]
 
@@ -5459,7 +5462,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
         const r = await sweepListed((cfg, home) => [row(cfg, home)], s.script)
         const listed = r.rows[0]!
-        const id = listed.claude_instance_id
+        const id = listed.instance_id
 
         expect(r.deleteCalls).toEqual([])
         expect(r.killCalls).toEqual(Array.from({ length: s.tries }, () => id))
@@ -5471,7 +5474,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         expect(r.findMissingCalls).toBe(1)
         expect(startupEntriesIn(r.entries, ORPHAN_CLEANUP_LABEL)).toEqual(s.killed ? [] : [sweepKillFailedEntry(listed, persona, s.standing, s.ordinary)])
         expect(startupEntriesIn(r.entries, PERSONA_KILL_SURVIVOR_LABEL)).toEqual(s.survivorDescription === undefined ? [] : [sweepSurvivorEntry(listed, s.survivorDescription)])
-        if (s.killed) expect(r.errLog.split('\n')).toContain(startSweepKillSucceededLine(listed.claude_instance_id, persona, s.standing))
+        if (s.killed) expect(r.errLog.split('\n')).toContain(startSweepKillSucceededLine(listed.instance_id, persona, s.standing))
         expect(r.latch.isLatched('alpha')).toBe(false)
         expect(notices).toEqual([])
         expect(armed).toEqual([])
@@ -5561,8 +5564,8 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         const err = errInvalidFlags('kill')
         const spawns = [
           prePersonaRow('waiting'),
-          cannedListRow({ claude_instance_id: 'cscb_alpha_old' }, alpha, home),
-          cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }, alpha, home),
+          cannedListRow({ instance_id: 'cscb_alpha_old' }, alpha, home),
+          cannedListRow({ instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }, alpha, home),
         ]
         installStub({
           killCalls,
@@ -5580,7 +5583,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
         expect(resolveCalls).toHaveLength(1)
         expect(stops).toHaveLength(1)
-        expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_old_waiting_C0OLD', 'cscb_alpha_old'])
+        expect(killCalls.map((k) => k.instance_id)).toEqual(['cscb_old_waiting_C0OLD', 'cscb_alpha_old'])
         expect(deleteCalls).toEqual([])
         expect(callLog).toEqual([])
         expect(result).toEqual(sweepResult({ listed: 3, killed: 1, kept: 2, killFailed: 1 }))
@@ -5617,7 +5620,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
           listResult: {
             spawns: [
               legacy,
-              cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }),
+              cannedListRow({ instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }),
             ],
           },
         })
@@ -5629,7 +5632,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
         expect(resolveCalls).toHaveLength(1)
         expect(stops).toHaveLength(1)
-        expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_old_waiting_C0OLD'])
+        expect(killCalls.map((k) => k.instance_id)).toEqual(['cscb_old_waiting_C0OLD'])
         expect(deleteCalls).toEqual([])
         expect(callLog).toEqual([])
         expect(result).toEqual(sweepResult({ listed: 2, kept: 2, killFailed: 1 }))
@@ -5734,7 +5737,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
           await reconcileOnClock(cfg)
         })
 
-        expect(killCalls.map((k) => k.claude_instance_id)).toEqual([...onePass, ...onePass])
+        expect(killCalls.map((k) => k.instance_id)).toEqual([...onePass, ...onePass])
         assertNoLeak({ errLog, entries: readLog() })
       })
 
@@ -5790,9 +5793,9 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
   describe('b.jg5 SRJ-714, SRJ-120: one findMissing run after the kills', () => {
     /** Every row id the default (empty) findMissing result leaves live, as the post-kill line lists them. */
     const POST_KILL_ROWS: ReadonlyArray<readonly [string, (cfg: PersonaConfig) => import('agent-director').ListRow[]]> = [
-      ['a swept row only', () => [cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } })]],
+      ['a swept row only', () => [cannedListRow({ instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } })]],
       ['a pre-persona row only', () => [prePersonaRow('waiting')]],
-      ['a pre-persona row and a swept row', () => [prePersonaRow('waiting'), cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } })]],
+      ['a pre-persona row and a swept row', () => [prePersonaRow('waiting'), cannedListRow({ instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } })]],
     ]
 
     test.each(POST_KILL_ROWS.flatMap(([label, rows]) => [
@@ -5811,7 +5814,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       })
       const kill = stub.kill.bind(stub)
       stub.kill = async (params) => {
-        order.push(`kill ${params.claude_instance_id}`)
+        order.push(`kill ${params.instance_id}`)
         return kill(params)
       }
       const findMissing = stub.findMissing.bind(stub)
@@ -5825,7 +5828,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         result = await reconcileOrphans(cfg)
       })
 
-      const ids = killed.map((row) => row.claude_instance_id)
+      const ids = killed.map((row) => row.instance_id)
       expect(order).toEqual([...ids.map((id) => `kill ${id}`), 'findMissing'])
       expect(deleteCalls).toEqual([])
       expect(errLog.split('\n')).toContain(startSweepPostKillLine(ids.length, [], ids, []))
@@ -5863,7 +5866,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
       const killedCount = liveIds.length + 1
       expect(result).toEqual(sweepResult({ listed: killedCount + 2, killed: killedCount, kept: 2 }))
-      expect(killCalls.map((k) => k.claude_instance_id)).toEqual([...liveIds, pendingLeftLive])
+      expect(killCalls.map((k) => k.instance_id)).toEqual([...liveIds, pendingLeftLive])
       expect(deleteCalls).toHaveLength(0)
       expect(findMissingCalls).toEqual([{}])
       // b.jg5 SRJ-120: the killed `pending` row the sweep left in neither list
@@ -5885,8 +5888,8 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       const { cfg, home } = sweepConfig()
       const noLaunchStart = { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: undefined }
       const rows = [
-        cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' }, ...noLaunchStart }),
-        cannedListRow({ claude_instance_id: 'cscb_alpha_old', ...noLaunchStart }, personaOf(cfg, 'alpha'), home),
+        cannedListRow({ instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' }, ...noLaunchStart }),
+        cannedListRow({ instance_id: 'cscb_alpha_old', ...noLaunchStart }, personaOf(cfg, 'alpha'), home),
       ]
       expect(rows.map((row) => 'launch_started_at' in row)).toEqual([false, false])
       const statusCalls: import('agent-director').StatusParams[] = []
@@ -5921,9 +5924,9 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
           spawns: [
             prePersonaRow('ended'),
             prePersonaRow('missing'),
-            cannedListRow({ claude_instance_id: 'cscb_departed', state: 'ended', labels: { service: 'cscb', persona: 'departed' } }),
-            cannedListRow({ claude_instance_id: 'cscb_departed_old', state: 'missing', labels: { service: 'cscb', persona: 'departed' } }),
-            cannedListRow({ claude_instance_id: 'cscb_alpha_old', state: 'missing' }, personaOf(cfg, 'alpha'), home),
+            cannedListRow({ instance_id: 'cscb_departed', state: 'ended', labels: { service: 'cscb', persona: 'departed' } }),
+            cannedListRow({ instance_id: 'cscb_departed_old', state: 'missing', labels: { service: 'cscb', persona: 'departed' } }),
+            cannedListRow({ instance_id: 'cscb_alpha_old', state: 'missing' }, personaOf(cfg, 'alpha'), home),
             cannedListRow({ cwd: fixtureSubdir('elsewhere'), state: 'ended' }, personaOf(cfg, 'gamma'), home),
             cannedListRow({}, personaOf(cfg, 'alpha'), home),
           ],
@@ -5971,17 +5974,17 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       const { cfg } = sweepConfig()
       const gone = prePersonaRow('waiting')
       const survivor = prePersonaRow('working')
-      const rows = new Map([gone, survivor].map((row) => [row.claude_instance_id, row]))
+      const rows = new Map([gone, survivor].map((row) => [row.instance_id, row]))
       const sessions = new Set([gone.tmux_session_name, survivor.tmux_session_name])
       const killCalls: string[] = []
       const findMissingCalls: import('agent-director').FindMissingParams[] = []
       const stub = installStub()
       stub.list = async () => ({ spawns: [...rows.values()] })
       stub.kill = async (params) => {
-        killCalls.push(params.claude_instance_id)
+        killCalls.push(params.instance_id)
         // The survivor's kill reports success while its session lives on.
-        if (params.claude_instance_id !== survivor.claude_instance_id) {
-          sessions.delete(rows.get(params.claude_instance_id)!.tmux_session_name)
+        if (params.instance_id !== survivor.instance_id) {
+          sessions.delete(rows.get(params.instance_id)!.tmux_session_name)
         }
         return {}
       }
@@ -5990,8 +5993,8 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         const ids: string[] = []
         for (const row of rows.values()) {
           if (!AGENT_DIRECTOR_LIVE_STATES.has(row.state) || sessions.has(row.tmux_session_name)) continue
-          rows.set(row.claude_instance_id, { ...row, state: 'missing' })
-          ids.push(row.claude_instance_id)
+          rows.set(row.instance_id, { ...row, state: 'missing' })
+          ids.push(row.instance_id)
         }
         return cannedFindMissing({ count: ids.length, ids: ids.sort() })
       }
@@ -5999,11 +6002,11 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       const firstLog = await withCapturedErr(async () => {
         await reconcileOrphans(cfg)
       })
-      expect(killCalls).toEqual([gone.claude_instance_id, survivor.claude_instance_id])
+      expect(killCalls).toEqual([gone.instance_id, survivor.instance_id])
       expect(findMissingCalls).toHaveLength(1)
-      expect(rows.get(gone.claude_instance_id)!.state).toBe('missing')
-      expect(rows.get(survivor.claude_instance_id)!.state).toBe('working')
-      expect(firstLog.split('\n')).toContain(startSweepPostKillLine(2, [gone.claude_instance_id], [survivor.claude_instance_id], []))
+      expect(rows.get(gone.instance_id)!.state).toBe('missing')
+      expect(rows.get(survivor.instance_id)!.state).toBe('working')
+      expect(firstLog.split('\n')).toContain(startSweepPostKillLine(2, [gone.instance_id], [survivor.instance_id], []))
 
       // The next start is a new server process: nothing memoized.
       _resetFindMissingMemo()
@@ -6012,11 +6015,11 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       const secondLog = await withCapturedErr(async () => {
         second = await reconcileOrphans(cfg)
       })
-      expect(killCalls).toEqual([survivor.claude_instance_id])
+      expect(killCalls).toEqual([survivor.instance_id])
       expect(findMissingCalls).toHaveLength(2)
-      expect(secondLog).not.toContain(`instanceId=${gone.claude_instance_id}`)
+      expect(secondLog).not.toContain(`instanceId=${gone.instance_id}`)
       expect(second).toEqual(sweepResult({ listed: 2, killed: 1, kept: 1 }))
-      expect([...rows.keys()]).toEqual([gone.claude_instance_id, survivor.claude_instance_id])
+      expect([...rows.keys()]).toEqual([gone.instance_id, survivor.instance_id])
     })
   })
 
@@ -6039,7 +6042,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
   }
 
   /** The ids the sweep sent a `kill` for, in order. */
-  const killedIds = (h: RecoveryHarness): string[] => h.stub.calls.killCalls.map((k) => k.claude_instance_id)
+  const killedIds = (h: RecoveryHarness): string[] => h.stub.calls.killCalls.map((k) => k.instance_id)
 
   /** The record file holds exactly `absent`, each recorded `absent-at-start` now with no mark, beside `others` as seeded. */
   function expectRecordedAbsent(h: RecoveryHarness, absent: readonly string[], others: Readonly<Record<string, RetiredKeySeed>> = {}): void {
@@ -6094,10 +6097,10 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       const { h, p, b } = srj105Build()
       const rows = [
         // Swept first: B's row under another instance id.
-        listed(h, b, { claude_instance_id: `${personaInstanceId(b)}_old` }),
-        ...EVERY_STATE.map((state, i) => absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { state, claude_instance_id: `${personaInstanceId(LAUNCH_START_ABSENT_PERSONA_KEY)}_${i}` })),
+        listed(h, b, { instance_id: `${personaInstanceId(b)}_old` }),
+        ...EVERY_STATE.map((state, i) => absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { state, instance_id: `${personaInstanceId(LAUNCH_START_ABSENT_PERSONA_KEY)}_${i}` })),
         absentRow(h, ABSENT_2, { state: LIVENESS_DEAD_ROW_MISSING }),
-        absentRow(h, ABSENT_2, { state: 'working', claude_instance_id: `${personaInstanceId(ABSENT_2)}_old` }),
+        absentRow(h, ABSENT_2, { state: 'working', instance_id: `${personaInstanceId(ABSENT_2)}_old` }),
         listed(h, p),
         prePersonaRow('waiting'),
       ]
@@ -6227,7 +6230,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     // The note on a row that is not a configured persona's own latches no one.
     // Each such row is live, so with no latch the sweep kills it as today.
     test.each<[string, (h: RecoveryHarness, p: string) => ListRow]>([
-      ['a row labelled P under another instance id', (h, p) => listed(h, p, { claude_instance_id: `${personaInstanceId(p)}_old`, liveness_note: provenanceNote })],
+      ['a row labelled P under another instance id', (h, p) => listed(h, p, { instance_id: `${personaInstanceId(p)}_old`, liveness_note: provenanceNote })],
       ['an absent persona\'s own row', (h) => absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { liveness_note: provenanceNote })],
       ['a pre-persona row', () => ({ ...prePersonaRow('waiting'), liveness_note: provenanceNote })],
     ])('the note on %s latches no one and posts nothing; the row is killed as today', async (_label, build) => {
@@ -6238,7 +6241,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
       expectNoNoteLatch(h)
       expect(run.result.leftForLatch).toBe(0)
-      expect(killedIds(h)).toEqual([row.claude_instance_id])
+      expect(killedIds(h)).toEqual([row.instance_id])
     })
 
     test.each([
@@ -6267,12 +6270,12 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       const { h, p, b } = srj105Build()
       const pRows = [
         listed(h, p, { liveness_note: provenanceNote }),
-        listed(h, p, { claude_instance_id: `${personaInstanceId(p)}_old` }),
-        listed(h, p, { claude_instance_id: `${personaInstanceId(p)}_older`, cwd: h.home, state: 'working' }),
+        listed(h, p, { instance_id: `${personaInstanceId(p)}_old` }),
+        listed(h, p, { instance_id: `${personaInstanceId(p)}_older`, cwd: h.home, state: 'working' }),
       ]
       const bOld = `${personaInstanceId(b)}_old`
 
-      const run = await sweepOver(h, [listed(h, b, { claude_instance_id: bOld }), ...order.map((i) => pRows[i]!)])
+      const run = await sweepOver(h, [listed(h, b, { instance_id: bOld }), ...order.map((i) => pRows[i]!)])
 
       expect(killedIds(h)).toEqual([bOld])
       expect(run.atFirstKill).toEqual({ writes: 0, latched: [p] })
@@ -6290,9 +6293,9 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
       const run = await sweepOver(h, [
         listed(h, p),
-        listed(h, p, { claude_instance_id: `${personaInstanceId(p)}_old` }),
-        listed(h, b, { claude_instance_id: bOld }),
-        listed(h, p, { claude_instance_id: `${personaInstanceId(p)}_older`, cwd: h.home }),
+        listed(h, p, { instance_id: `${personaInstanceId(p)}_old` }),
+        listed(h, b, { instance_id: bOld }),
+        listed(h, p, { instance_id: `${personaInstanceId(p)}_older`, cwd: h.home }),
       ])
 
       expect(killedIds(h)).toEqual([bOld])
@@ -6339,7 +6342,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       const before = readFileSync(h.retiredKeys.path)
       const bOld = `${personaInstanceId(b)}_old`
       h.failRetiredKeyWrites()
-      const run = await sweepOver(h, [listed(h, p, ENDED_WITH_SESSION), listed(h, b, { claude_instance_id: bOld })], withoutPersona(h, p))
+      const run = await sweepOver(h, [listed(h, p, ENDED_WITH_SESSION), listed(h, b, { instance_id: bOld })], withoutPersona(h, p))
       return { h, p, bOld, before, run }
     }
 
@@ -6471,11 +6474,11 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { state: LIVENESS_DEAD_ROW_ENDED }),
         legacy,
         listed(h, p, { liveness_note: provenanceNote, cwd: h.home }),
-        listed(h, p, { claude_instance_id: `${personaInstanceId(p)}_old`, cwd: h.home }),
+        listed(h, p, { instance_id: `${personaInstanceId(p)}_old`, cwd: h.home }),
       ])
 
       expect(run.order).toEqual(['list', 'kill', 'findMissing'])
-      expect(killedIds(h)).toEqual([legacy.claude_instance_id])
+      expect(killedIds(h)).toEqual([legacy.instance_id])
       expectRecordedAbsent(h, [LAUNCH_START_ABSENT_PERSONA_KEY])
       expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
       const expected = sweepResult({ listed: 4, killed: 1, kept: 1, recordedAsRetired: 1, leftForLatch: 2 })
@@ -6493,13 +6496,13 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       const run = await sweepOver(h, [
         listed(h, p, { liveness_note: provenanceNote }),
         listed(h, b),
-        listed(h, b, { claude_instance_id: bOld }),
+        listed(h, b, { instance_id: bOld }),
         failing,
-        absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { state: LIVENESS_DEAD_ROW_MISSING, claude_instance_id: `${personaInstanceId(LAUNCH_START_ABSENT_PERSONA_KEY)}_old` }),
+        absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { state: LIVENESS_DEAD_ROW_MISSING, instance_id: `${personaInstanceId(LAUNCH_START_ABSENT_PERSONA_KEY)}_old` }),
         prePersonaRow('working'),
       ])
 
-      expect(killedIds(h)).toEqual([bOld, failing.claude_instance_id, prePersonaRow('working').claude_instance_id])
+      expect(killedIds(h)).toEqual([bOld, failing.instance_id, prePersonaRow('working').instance_id])
       const expected = sweepResult({ listed: 6, killed: 2, kept: 3, killFailed: 1, recordedAsRetired: 1, leftForLatch: 1 })
       expect(run.result).toEqual(expected)
       expectSummaryLast(h.errors, expected)
@@ -6538,7 +6541,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
       await sweepOver(h, [listed(h, p, { state: AGENT_DIRECTOR_PENDING_STATE, cwd: h.home })], h.config, () => shutdownAtRead && h.stub.calls.statusCalls.length > 0)
 
-      expect(h.stub.calls.statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p)])
+      expect(h.stub.calls.statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(p)])
       expect(killedIds(h)).toHaveLength(shutdownAtRead ? 1 : 2)
       if (cleared) expectClearedOnce(h, p, b, clearedLine(h, p, state, START_SWEEP_KILL_STATUS_SITE))
       else expectNothingCleared(h, p, before)
@@ -6553,7 +6556,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       /** P's own row with the note (P latches), an absent persona's row (its key recorded) and B's row under another instance id (swept). */
       function stopRows(h: RecoveryHarness, p: string, b: string): ListRow[] {
         return [
-          listed(h, b, { claude_instance_id: `${personaInstanceId(b)}_old` }),
+          listed(h, b, { instance_id: `${personaInstanceId(b)}_old` }),
           listed(h, p, { liveness_note: provenanceNote }),
           absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY),
           prePersonaRow('waiting'),
@@ -6618,7 +6621,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         const standing = killOutcomeOf({ thrown: err })
         expect(killEntries(h)).toEqual([[sweepKillFailedEntry(rows[0]!, bRef, standing, undefined, true)], []])
         const stopped: KillRetryResult = { outcome: standing, end: KILL_RETRY_END_STOPPED, tries: 1, reads: 0, alert: alert(err) }
-        expect(linesEqual(h, startSweepStoppedKillLine(rows[0]!.claude_instance_id, bRef, stopped, START_SWEEP_KILL_STOP_SHUTDOWN))).toHaveLength(1)
+        expect(linesEqual(h, startSweepStoppedKillLine(rows[0]!.instance_id, bRef, stopped, START_SWEEP_KILL_STOP_SHUTDOWN))).toHaveLength(1)
         expect(linesEqual(h, START_SWEEP_SHUTDOWN_STOP_LINE)).toHaveLength(1)
         expectSummaryLast(h.errors, expected)
         expect([h.controller.armedKeys(), h.triggers, h.notices]).toEqual([[], [], []])
@@ -6833,7 +6836,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
       await sweepOver(h, [row])
 
-      expect(atFirstKill).toEqual({ writes: 1, holds: [row.claude_instance_id] })
+      expect(atFirstKill).toEqual({ writes: 1, holds: [row.instance_id] })
       const recordedAt = h.errors.findIndex((line) => line.startsWith(`${RETIRED_KEYS_LOG_PREFIX} recorded `))
       const beganAt = h.errors.indexOf(holdLines(h, 'began')[0]!)
       expect(recordedAt).toBeGreaterThanOrEqual(0)
@@ -6843,7 +6846,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     /** The sweep's two holds: an absent persona's live row (its kill succeeds, held by the listing) and B's row under another instance id (its kill fails, held by the failure and marked). */
     function heldRows(h: RecoveryHarness, b: string): { absent: ListRow; bOld: ListRow } {
       const absent = absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)
-      const bOld = listed(h, b, { claude_instance_id: `${personaInstanceId(b)}_old`, cwd: h.home })
+      const bOld = listed(h, b, { instance_id: `${personaInstanceId(b)}_old`, cwd: h.home })
       h.script({ killQueue: [cannedOk(cannedKillResult(true)), ...Array.from({ length: KILL_RETRY_TRIES }, () => cannedErr<StubKillResult>(errTmuxKillFailed()))] })
       return { absent, bOld }
     }
@@ -6851,17 +6854,17 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     test('the post-kill find-missing listing both rows in its ids ends both holds, the killed row\'s and the failed kill\'s, with one end line each naming the run', async () => {
       const { h, b } = srj105Build()
       const { absent, bOld } = heldRows(h, b)
-      h.script({ findMissingResult: cannedFindMissing({ rows: { [absent.claude_instance_id]: 'ids', [bOld.claude_instance_id]: 'ids' } }) })
+      h.script({ findMissingResult: cannedFindMissing({ rows: { [absent.instance_id]: 'ids', [bOld.instance_id]: 'ids' } }) })
 
       await sweepOver(h, [absent, bOld])
 
-      expect(killedIds(h)).toEqual([absent.claude_instance_id, ...Array.from({ length: KILL_RETRY_TRIES }, () => bOld.claude_instance_id)])
+      expect(killedIds(h)).toEqual([absent.instance_id, ...Array.from({ length: KILL_RETRY_TRIES }, () => bOld.instance_id)])
       expect(h.oldLifeHolds.snapshot()).toEqual([])
       const began = holdLines(h, 'began')
       expect(began).toHaveLength(2)
       const views: OldLifeHold[] = [
-        { instanceId: absent.claude_instance_id, oldKey: LAUNCH_START_ABSENT_PERSONA_KEY, directory: absent.cwd, realDirectory: realpathSync(absent.cwd), cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING, killFailed: false, waiting: [] },
-        { instanceId: bOld.claude_instance_id, oldKey: bOld.claude_instance_id, directory: h.home, realDirectory: realpathSync(h.home), cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL, killFailed: true, waiting: [] },
+        { instanceId: absent.instance_id, oldKey: LAUNCH_START_ABSENT_PERSONA_KEY, directory: absent.cwd, realDirectory: realpathSync(absent.cwd), cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING, killFailed: false, waiting: [] },
+        { instanceId: bOld.instance_id, oldKey: bOld.instance_id, directory: h.home, realDirectory: realpathSync(h.home), cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL, killFailed: true, waiting: [] },
       ]
       expect(began).toEqual(views.map((view) => oldLifeHoldBeganLine(view)))
       expect(holdLines(h, 'ended')).toEqual(views.map((view) => oldLifeHoldEndedLine(view, OLD_LIFE_HOLD_END_FIND_MISSING_IDS, findMissingRunReadName('reconcileOrphans'))))
@@ -6874,12 +6877,12 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       const { h, b } = srj105Build()
       const { absent, bOld } = heldRows(h, b)
       const rows = [{ ...absent, state }, { ...bOld, state }]
-      h.script({ findMissingResult: cannedFindMissing({ rows: Object.fromEntries(rows.map((row) => [row.claude_instance_id, placement])) }) })
+      h.script({ findMissingResult: cannedFindMissing({ rows: Object.fromEntries(rows.map((row) => [row.instance_id, placement])) }) })
 
       await sweepOver(h, rows)
 
       expect(h.stub.calls.findMissingCalls).toHaveLength(1)
-      expect(h.oldLifeHolds.snapshot().map((view) => [view.instanceId, view.killFailed])).toEqual([[absent.claude_instance_id, false], [bOld.claude_instance_id, true]])
+      expect(h.oldLifeHolds.snapshot().map((view) => [view.instanceId, view.killFailed])).toEqual([[absent.instance_id, false], [bOld.instance_id, true]])
       expect(holdLines(h, 'ended')).toEqual([])
     })
 
@@ -6925,7 +6928,7 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
   function collisionsThenOk(n: number): CannedResponse<StubSpawnResult>[] {
     return [
       ...Array.from({ length: n }, () => cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())),
-      cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
+      cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' }),
     ]
   }
 
@@ -6992,7 +6995,7 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
     const { result } = await launch(cfg)
 
     expect(result).toEqual({ key: 'C', action: 'failed' })
-    expect(calls.resumeCalls.map((r) => r.claude_instance_id)).toEqual(['cscb_C'])
+    expect(calls.resumeCalls.map((r) => r.instance_id)).toEqual(['cscb_C'])
     expect(calls.killCalls).toHaveLength(0)
     expect(calls.deleteCalls).toHaveLength(0)
     expect(calls.spawnCalls).toHaveLength(1)
@@ -7073,7 +7076,7 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
       expect(calls.killCalls).toHaveLength(0)
       expect(calls.deleteCalls).toHaveLength(0)
       expect(calls.spawnCalls).toHaveLength(1) // only the colliding spawn
-      expect(calls.resumeCalls.map((r) => r.claude_instance_id)).toEqual(action === 'resumed' ? ['cscb_C'] : [])
+      expect(calls.resumeCalls.map((r) => r.instance_id)).toEqual(action === 'resumed' ? ['cscb_C'] : [])
       expect(calls.sendKeysCalls.map((s) => s.text)).toEqual(action === 'reconnected' ? [`/mcp reconnect ${MCP_SERVER_NAME}`] : [])
       // The resume passed the config_dir check; neither guard fired.
       expect(errLog).not.toContain('config_dir label')
@@ -7225,7 +7228,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
 
       // b.4q8: a resume is counted once its row reports in.
       expect(result).toBe(LAUNCH_RESUMED_UNREPORTED)
-      expect(after.resumeCalls.map((r) => r.claude_instance_id)).toEqual([GUARD_INSTANCE])
+      expect(after.resumeCalls.map((r) => r.instance_id)).toEqual([GUARD_INSTANCE])
       expect(after.deleteCalls).toEqual([])
       expect(after.spawnCalls).toHaveLength(1)
       expect(f.rg.readRecord(GUARD_KEY)).toBe('true')
@@ -7433,7 +7436,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
     ])
     expect(result.notBroughtUp).toBe(1)
     expect(result.failed).toBe(0)
-    expect(calls.spawnCalls.map((p) => p.claude_instance_id)).toEqual([`cscb_${b.key}`])
+    expect(calls.spawnCalls.map((p) => p.instance_id)).toEqual([`cscb_${b.key}`])
     expect(configDirLines(errLog)).toHaveLength(1)
     expectConfigDirUnresolvableLine(configDirLines(errLog)[0], a, aDir)
     expect(readLog()).toBe('')
@@ -7474,7 +7477,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
     installResumeEntry('ended', personaRow(cfg, 'C', { labels: { service: 'cscb', persona: 'C', config_dir: expected } }), second)
 
     expect(await spawnForPersona(personaOf(cfg, 'C'), cfg)).toEqual({ key: 'C', action: 'resumed' })
-    expect(second.resumeCalls.map((r) => r.claude_instance_id)).toEqual(['cscb_C'])
+    expect(second.resumeCalls.map((r) => r.instance_id)).toEqual(['cscb_C'])
     expect(second.deleteCalls).toEqual([])
     assertNoLeak({ errLog })
   })
@@ -7638,14 +7641,14 @@ describe('startupSessionManager', () => {
 
     const result = await startupSessionManager(cfg)
 
-    const ids = spawnCalls.map((p) => p.claude_instance_id)
+    const ids = spawnCalls.map((p) => p.instance_id)
     expect(spawnCalls).toHaveLength(2)
     expect(ids.filter((id) => id === 'cscb_alpha')).toHaveLength(1)
     expect(ids.filter((id) => id === 'cscb_beta')).toHaveLength(1)
     // No spawn is keyed by a channel.
     expect(ids.some((id) => String(id).includes('C0HOME01') || String(id).includes('C0SHARED1'))).toBe(false)
     // Each spawn carries its own persona's working directory and persona label.
-    const byId = new Map(spawnCalls.map((p) => [p.claude_instance_id, p]))
+    const byId = new Map(spawnCalls.map((p) => [p.instance_id, p]))
     expect(byId.get('cscb_alpha')!.cwd).toBe('/x/alpha')
     expect(byId.get('cscb_alpha')!.label).toEqual(['service=cscb', 'persona=alpha', expect.stringMatching(/^config_dir=/)])
     expect(byId.get('cscb_beta')!.cwd).toBe('/x/beta')
@@ -7791,7 +7794,7 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     expect(result.failed).toBe(0)
     expect(result.succeeded).toBe(1)
     expect(result.freshSpawned).toBe(1)
-    expect(spawnCalls.map((p) => p.claude_instance_id)).toEqual([`cscb_${f.b.key}`])
+    expect(spawnCalls.map((p) => p.instance_id)).toEqual([`cscb_${f.b.key}`])
     expect(readLog()).toBe('')
     expect(notices).toEqual([])
     expect(outageEmissions).toEqual([])
@@ -7808,13 +7811,13 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     const stub = installStub({
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${f.b.key}` }),
+        cannedOk<StubSpawnResult>({ instance_id: `cscb_${f.b.key}` }),
       ],
       getResult: personaRow(f.cfg, f.a.key, { state: 'ended' }),
     })
     const realSpawn = stub.spawn.bind(stub)
     stub.spawn = async (params) => {
-      f.order.push(`spawn:${params.claude_instance_id}`)
+      f.order.push(`spawn:${params.instance_id}`)
       return realSpawn(params)
     }
 
@@ -7861,7 +7864,7 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     expect(result.failed).toBe(1)
     expect(result.succeeded).toBe(1)
     expect(result.notBroughtUp).toBe(0)
-    expect(spawnCalls.map((p) => p.claude_instance_id)).toEqual([`cscb_${f.b.key}`])
+    expect(spawnCalls.map((p) => p.instance_id)).toEqual([`cscb_${f.b.key}`])
     expect(errLog).toContain(`startupSessionManager: unexpected error for ${renderPersonaRef(f.a.name, f.a.key)}`)
     expect(countStartupEntries(readLog(), STARTUP_ERROR_SPAWN_FAILED)).toBe(1)
     expect(readLog()).toContain(`unexpected error spawning ${renderPersonaRef(f.a.name, f.a.key)}`)
@@ -7925,7 +7928,7 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     const f = bringUpFixture({}, names, Object.fromEntries(names.map((name) => [name, { connect: [connects.get(name)!.outcome] }])))
     const [alpha, beta, gamma, delta, echo] = f.h.personas as Persona[]
     const held = holdSpawns(installStub({}))
-    const launched = () => held.calls.map((p) => p.claude_instance_id)
+    const launched = () => held.calls.map((p) => p.instance_id)
     const id = (p: Persona) => `cscb_${p.key}`
     const settle = async (p: Persona, outcome?: Parameters<DeferredConnect['settle']>[0]) => {
       connects.get(p.name)!.settle(outcome)
@@ -7996,7 +7999,7 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     const [alpha, beta, gamma, delta] = f.h.personas as Persona[]
     rmSync(beta.credentials_file)
     const held = holdSpawns(installStub({}))
-    const launched = () => held.calls.map((p) => p.claude_instance_id)
+    const launched = () => held.calls.map((p) => p.instance_id)
     const id = (p: Persona) => `cscb_${p.key}`
 
     let result: Awaited<ReturnType<typeof startupSessionManager>> | undefined
@@ -8068,7 +8071,7 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
       fixtureDir,
     )
     const held = holdSpawns(installStub({}))
-    const launched = () => held.calls.map((p) => p.claude_instance_id)
+    const launched = () => held.calls.map((p) => p.instance_id)
 
     let result!: Awaited<ReturnType<typeof startupSessionManager>>
     await withCapturedErr(async () => {
@@ -8104,7 +8107,7 @@ describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
     installStub({ sendKeysCalls, sendKeysError: errTmuxSendKeys() })
     const result = await reconnectMcp('C')
     expect(result).toBe('dead-session')
-    expect(sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_C', RECONNECT_TEXT]])
+    expect(sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([['cscb_C', RECONNECT_TEXT]])
     // b.3ce: dead-session hands recovery to the caller — no premature failure notice
     expect(notices).toHaveLength(0)
   })
@@ -8148,7 +8151,7 @@ describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
       getCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
+        cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
       ],
       getQueue: [cannedOk(personaRow(cfg, 'C', { state: 'waiting' }))],
       getResult: personaRow(cfg, 'C', { state: LIVENESS_DEAD_ROW_ENDED }),
@@ -8212,7 +8215,7 @@ describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
     expect(result.succeeded).toBe(0)
     expect(result.perPersona.every((p) => p.action === 'failed')).toBe(true)
     // One send-keys per persona: no second try.
-    expect(sendKeysCalls.map((c) => c.claude_instance_id).sort()).toEqual(['cscb_C1', 'cscb_C2'])
+    expect(sendKeysCalls.map((c) => c.instance_id).sort()).toEqual(['cscb_C1', 'cscb_C2'])
   })
 })
 
@@ -8821,7 +8824,7 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
       spawnCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
+        cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
       ],
       getQueue: [cannedOk(personaRow(cfg, 'C', { state: 'waiting' }))],
       getResult: personaRow(cfg, 'C', { state: LIVENESS_DEAD_ROW_ENDED }),
@@ -8854,7 +8857,7 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
       deleteCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
+        cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
       ],
       getResult: personaRow(cfg, 'C', { state: 'waiting' }),
       sendKeysError: errTmuxSendKeys(),
@@ -9391,15 +9394,15 @@ function waitConfig(overrides: Partial<Omit<PersonaConfig, 'personas'>> = {}): P
 /** A persona's transcript file and the agent-director row fields that name it. */
 interface Transcript {
   path: string
-  /** The row's persisted `jsonl_path` and its `claude_session_id`. */
-  fields: { jsonl_path: string; claude_session_id: string }
+  /** The row's persisted `jsonl_path` and its `session_id`. */
+  fields: { jsonl_path: string; session_id: string }
 }
 
 /** Write `entries` (default: a finished turn) to `<fixtureDir>/transcripts/<session id>.jsonl`; the row fields name it. */
 function transcriptOf(entries: TranscriptEntry[] = endedTurn()): Transcript {
   const path = join(fixtureSubdir('transcripts'), `${TRANSCRIPT_SESSION_ID}.jsonl`)
   writeTranscript(path, entries)
-  return { path, fields: { jsonl_path: path, claude_session_id: TRANSCRIPT_SESSION_ID } }
+  return { path, fields: { jsonl_path: path, session_id: TRANSCRIPT_SESSION_ID } }
 }
 
 /** What a persona's row reads at a status poll: a state, or an Error the poll rejects with. */
@@ -9411,12 +9414,12 @@ type PaneReading = string | Error
 /** Make the stub's pane reads (every persona's) give `pane` from the next read on. */
 function showPane(opts: StubClientOptions, pane: PaneReading): void {
   opts.readPaneError = pane instanceof Error ? pane : undefined
-  opts.readPaneResults = pane instanceof Error ? undefined : [{ pane }]
+  opts.readPaneResults = pane instanceof Error ? undefined : [cannedReadPaneResult(pane)]
 }
 
 /** The pane read of persona `key`'s own instance: its last `FULL_PANE_READ_LINES` lines (b.jg5 SRJ-117). */
 function paneReadOf(key: string): import('agent-director').ReadPaneParams {
-  return { claude_instance_id: personaInstanceId(key), n_lines: FULL_PANE_READ_LINES }
+  return { instance_id: personaInstanceId(key), n_lines: FULL_PANE_READ_LINES }
 }
 
 /**
@@ -9625,7 +9628,7 @@ describe('b.f2b: the restart path\'s evidence for a working row across reconnect
    */
   function paneStub(first: string, fields: PersonaGetResultOverrides | null = transcriptOf().fields) {
     const opts: StubClientOptions = { sendKeysCalls: [], readPaneCalls: [], getCalls: [] }
-    if (fields !== null) opts.getResult = cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working', ...fields })
+    if (fields !== null) opts.getResult = cannedGetResult({ instance_id: 'cscb_C', state: 'working', ...fields })
     installStub(opts)
     let pane = first
     return {
@@ -9660,7 +9663,7 @@ describe('b.f2b: the restart path\'s evidence for a working row across reconnect
     expect(verdicts).toEqual(['defer', 'defer', 'defer', 'reconnect', 'defer'])
     expect(pending).toEqual([true, true, true, false, true])
     expect(stub.readPaneCalls).toEqual([])
-    expect(stub.getCalls).toEqual(Array(5).fill({ claude_instance_id: 'cscb_C' }))
+    expect(stub.getCalls).toEqual(Array(5).fill({ instance_id: 'cscb_C' }))
     expect(stub.sendKeysCalls).toEqual([])
     expect(notices).toEqual([])
   })
@@ -9675,7 +9678,7 @@ describe('b.f2b: the restart path\'s evidence for a working row across reconnect
 
     expect(await stub.check()).toBe('defer')
 
-    expect(stub.getCalls).toEqual(Array(gets).fill({ claude_instance_id: 'cscb_C' }))
+    expect(stub.getCalls).toEqual(Array(gets).fill({ instance_id: 'cscb_C' }))
     expect(stub.readPaneCalls).toEqual([])
     expect(stub.sendKeysCalls).toEqual([])
   })
@@ -9770,7 +9773,7 @@ describe('b.f2b: the restart path\'s evidence for a working row across reconnect
     const composed = resolveJsonlPath(cwd, TRANSCRIPT_SESSION_ID, configDir)
     mkdirSync(join(composed, '..'), { recursive: true })
     writeTranscript(composed, endedTurn())
-    const stub = paneStub(IDLE_PANE, { claude_session_id: TRANSCRIPT_SESSION_ID, cwd })
+    const stub = paneStub(IDLE_PANE, { session_id: TRANSCRIPT_SESSION_ID, cwd })
     const persona = { claude_config_dir: configDir }
 
     const verdicts = [await stub.check('C', { persona })]
@@ -10065,7 +10068,7 @@ describe('b.f2b: a working row whose idleness can\'t be proven is reported (unpr
    */
   function rowStub(pane: string, transcript?: Transcript) {
     const opts: StubClientOptions = { sendKeysCalls: [], readPaneCalls: [], getCalls: [] }
-    opts.getResult = cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working', ...transcript?.fields })
+    opts.getResult = cannedGetResult({ instance_id: 'cscb_C', state: 'working', ...transcript?.fields })
     installStub(opts)
     const stub = {
       pane,
@@ -10132,7 +10135,7 @@ describe('b.f2b: a working row whose idleness can\'t be proven is reported (unpr
   // A read that gave no pane (UNAVAILABLE or CONFIG) is the verdict's
   // deferral, with its unproven-idle case in tests/server.test.ts.
   test.each<[string, () => { pane: string | ((minute: number) => string); transcript?: Transcript }]>([
-    ['REPRO: an idle screen whose row names no transcript (unreadable)', () => ({ pane: IDLE_PANE })],
+    ['REPRO: an idle screen whose row names no transcript (unreadable)', () => (cannedReadPaneResult(IDLE_PANE))],
     ['REPRO: an idle screen whose transcript ends with a compaction summary', () => ({
       pane: IDLE_PANE,
       transcript: transcriptOf([...endedTurn(), { ...promptEntry('This session is being continued from a previous conversation that ran out of context.'), isCompactSummary: true }]),
@@ -10325,13 +10328,13 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
     })
 
     expect(result).toEqual({ key: 'C', action: 'reconnected' })
-    expect(row.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_C', RECONNECT_TEXT]])
+    expect(row.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([['cscb_C', RECONNECT_TEXT]])
     expect(clock.now()).toBeGreaterThanOrEqual(STALE_WORKING_WINDOW_MS)
     expect(clock.now()).toBeLessThan(STALE_WORKING_WINDOW_MS + 30_000)
     expect(row.readPaneCalls.length).toBeGreaterThan(0)
     expect(row.readPaneCalls).toEqual(row.readPaneCalls.map(() => paneReadOf('C')))
     // The ladder's collision lookup, then one row read per idle pane for its transcript.
-    expect(row.getCalls).toEqual(Array(row.readPaneCalls.length + 1).fill({ claude_instance_id: 'cscb_C' }))
+    expect(row.getCalls).toEqual(Array(row.readPaneCalls.length + 1).fill({ instance_id: 'cscb_C' }))
     expect(notices).toEqual([])
     expect(linesWith(errLog, 'treating the row as stale and reconnecting')).toHaveLength(1)
   })
@@ -10358,7 +10361,7 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
     mkdirSync(join(composed, '..'), { recursive: true })
     writeTranscript(composed, endedTurn())
     const row = installWorkingRow(clock, { pane: IDLE_PANE, stepMs: 10_000 }, {
-      getResult: personaRow(cfg, 'C', { state: 'working', claude_session_id: TRANSCRIPT_SESSION_ID }),
+      getResult: personaRow(cfg, 'C', { state: 'working', session_id: TRANSCRIPT_SESSION_ID }),
     })
 
     expect(await waitForWaitingAndReconnect('C', cfg)).toBe('ok')
@@ -10727,7 +10730,7 @@ describe('b.jg5 SRJ-613: the launch wait for a working row acts on no pane alone
     const script: RecoveryStubScript = {
       ...collided(h, persona, { state: 'working', ...transcriptOf().fields }),
       ...statuses(lastRead),
-      readPaneResults: [{ pane: IDLE_PANE }],
+      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
       sendKeysError: row.build(),
     }
     h.script(script)
@@ -10747,7 +10750,7 @@ describe('b.jg5 SRJ-613: the launch wait for a working row acts on no pane alone
     expect(h.stub.calls.readPaneCalls).toEqual(h.stub.calls.readPaneCalls.map(() => paneReadOf(p)))
     expect(order.indexOf('readPane')).toBeLessThan(order.indexOf('sendKeys'))
     expect(order.at(-1)).toBe('sendKeys')
-    expect(h.stub.calls.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([[personaInstanceId(p), RECONNECT_TEXT]])
+    expect(h.stub.calls.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([[personaInstanceId(p), RECONNECT_TEXT]])
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1 }))
     const latched = reconnectConflictLatch(p, row)
     expectLatchedOnce(h, p, latched)
@@ -10816,9 +10819,9 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
       ],
     })
-    stub.get = async ({ claude_instance_id }) => {
-      const key = claude_instance_id.slice(PERSONA_INSTANCE_ID_PREFIX.length)
-      const row = personaRow(cfg, key, { state: rows.get(claude_instance_id) })
+    stub.get = async ({ instance_id }) => {
+      const key = instance_id.slice(PERSONA_INSTANCE_ID_PREFIX.length)
+      const row = personaRow(cfg, key, { state: rows.get(instance_id) })
       if (key === 'A') await sweep
       return row
     }
@@ -10828,18 +10831,18 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
       swept()
       return cannedFindMissing({ count: 1, ids: ['cscb_A'] })
     }
-    stub.status = async ({ claude_instance_id }) =>
-      ({ state: rows.get(claude_instance_id) }) as import('agent-director').StatusResult
+    stub.status = async ({ instance_id }) =>
+      ({ state: rows.get(instance_id) }) as import('agent-director').StatusResult
     stub.sendKeys = async (params) => {
       sendKeysCalls.push(params)
-      const state = rows.get(params.claude_instance_id)
+      const state = rows.get(params.instance_id)
       if (state === 'ended' || state === 'missing') throw errSpawnNotInteractive('send-keys')
       return {}
     }
     stub.resume = async (params) => {
       resumeCalls.push(params)
-      rows.set(params.claude_instance_id, 'waiting')
-      return { claude_instance_id: params.claude_instance_id }
+      rows.set(params.instance_id, 'waiting')
+      return { instance_id: params.instance_id }
     }
     return { sendKeysCalls, resumeCalls }
   }
@@ -10856,8 +10859,8 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
 
     expect(results).toEqual([{ key: 'A', action: 'resumed' }, { key: 'B', action: 'reconnected' }])
     // A's keystrokes were refused once, with no second try; B's landed.
-    expect(race.sendKeysCalls.map((c) => c.claude_instance_id).sort()).toEqual(['cscb_A', 'cscb_B'])
-    expect(race.resumeCalls).toEqual([{ claude_instance_id: 'cscb_A' }])
+    expect(race.sendKeysCalls.map((c) => c.instance_id).sort()).toEqual(['cscb_A', 'cscb_B'])
+    expect(race.resumeCalls).toEqual([{ instance_id: 'cscb_A' }])
     expect(readLog()).toBe('')
     expect(notices).toEqual([])
     expect(errLog.split('\n').filter((line) => line === refusedLine(renderPersonaRef('A', 'A')))).toHaveLength(1)
@@ -10877,7 +10880,7 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
     })
 
     expect(result).toBe('dead-session')
-    expect(sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_C', RECONNECT_TEXT]])
+    expect(sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([['cscb_C', RECONNECT_TEXT]])
     expect(notices).toEqual([])
     expect(errLog.split('\n').filter((line) => line === refusedLine('persona=C'))).toHaveLength(1)
   })
@@ -10935,7 +10938,7 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
 
     expect(result).toEqual({ key: 'C', action: 'resumed' })
     expect(row.sendKeysCalls.map((c) => c.text)).toEqual([RECONNECT_TEXT])
-    expect(resumeCalls).toEqual([{ claude_instance_id: 'cscb_C' }])
+    expect(resumeCalls).toEqual([{ instance_id: 'cscb_C' }])
     expect(readLog()).toBe('')
     expect(notices).toEqual([])
   })
@@ -10973,7 +10976,7 @@ describe('b.jdc: checkPromptRowDeferral', () => {
     installStub({
       findMissingCalls,
       statusCalls,
-      statusFn: ({ claude_instance_id }) => ({ state: rows.get(claude_instance_id) }) as import('agent-director').StatusResult,
+      statusFn: ({ instance_id }) => ({ state: rows.get(instance_id) }) as import('agent-director').StatusResult,
     })
 
     const verdicts: string[] = []
@@ -10995,7 +10998,7 @@ describe('b.jdc: checkPromptRowDeferral', () => {
     expect(PROMPT_ROW_SWEEP_AFTER_MS).toBe(min(10))
     expect(verdicts).toEqual(['defer', 'defer', 'defer', 'defer', 'escalate', 'defer'])
     expect(findMissingCalls).toHaveLength(2)
-    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C', 'cscb_C'])
+    expect(statusCalls.map((c) => c.instance_id)).toEqual(['cscb_C', 'cscb_C'])
     expect(notices).toEqual([])
   })
 
@@ -11152,10 +11155,10 @@ describe('b.f2b: one persona waiting for its working row does not hold up the st
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: personaRow(cfg, 'A', { state: 'working' }),
       statusFn: (params) => {
-        const reading = params.claude_instance_id === 'cscb_A' ? aState() : 'waiting'
+        const reading = params.instance_id === 'cscb_A' ? aState() : 'waiting'
         return reading instanceof Error ? reading : ({ state: reading } as import('agent-director').StatusResult)
       },
-      readPaneResults: [{ pane: SPINNER_PANE }],
+      readPaneResults: [cannedReadPaneResult(SPINNER_PANE)],
     })
     return { cfg, sendKeysCalls, ref: renderPersonaRef('A', 'A') }
   }
@@ -11176,8 +11179,8 @@ describe('b.f2b: one persona waiting for its working row does not hold up the st
       // Only A (launched first) collides; B and C spawn fresh.
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: personaRow(cfg, 'A', { state: 'working' }),
-      statusFn: (params) => ({ state: params.claude_instance_id === 'cscb_A' ? aState : 'waiting' }) as import('agent-director').StatusResult,
-      readPaneResults: [{ pane: SPINNER_PANE }],
+      statusFn: (params) => ({ state: params.instance_id === 'cscb_A' ? aState : 'waiting' }) as import('agent-director').StatusResult,
+      readPaneResults: [cannedReadPaneResult(SPINNER_PANE)],
     })
 
     let result: Awaited<ReturnType<typeof startupSessionManager>> | undefined
@@ -11198,7 +11201,7 @@ describe('b.f2b: one persona waiting for its working row does not hold up the st
     expect(returnedWhileAWaits).toBe(true)
     expect(aInFlightAtReturn).toBe(true)
     expect(isLaunchInFlight('A')).toBe(false)
-    expect(spawnCalls.map((p) => p.claude_instance_id)).toEqual(['cscb_A', 'cscb_B', 'cscb_C'])
+    expect(spawnCalls.map((p) => p.instance_id)).toEqual(['cscb_A', 'cscb_B', 'cscb_C'])
     expect(result!.perPersona).toEqual([
       { key: 'A', action: 'waiting-in-background' },
       { key: 'B', action: 'spawned' },
@@ -11206,7 +11209,7 @@ describe('b.f2b: one persona waiting for its working row does not hold up the st
     ])
     // Read once A's launch has settled: the parked launch is counted in none of SRJ-1015's five counts either.
     expect(result!).toMatchObject({ waitingInBackground: 1, succeeded: 2, freshSpawned: 2, reconnected: 0, notReconnected: 0, failed: 0, latched: 0, retrying: 0, sequenceWaiting: 0, held: 0, freshRetired: 0 })
-    expect(sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_A', RECONNECT_TEXT]])
+    expect(sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([['cscb_A', RECONNECT_TEXT]])
     const ref = renderPersonaRef('A', 'A')
     expect(linesWith(errLog, `startupSessionManager: ${ref} is waiting for its working row to settle`)).toHaveLength(1)
     expect(errLog).toContain('0 reconnected, 0 no-op, 0 failed, 0 not brought up, 0 not reconnected')
@@ -11266,7 +11269,7 @@ describe('b.f2b: one persona waiting for its working row does not hold up the st
 
     expect(result!.perPersona).toEqual([{ key: 'A', action: 'waiting-in-background' }, { key: 'B', action: 'spawned' }])
     expect(isLaunchInFlight('A')).toBe(false)
-    expect(sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_A', RECONNECT_TEXT]])
+    expect(sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([['cscb_A', RECONNECT_TEXT]])
     const lines = linesWith(errLog, 'unexpected error in the background launch')
     expect(lines).toHaveLength(1)
     expect(lines[0]).toStartWith(
@@ -11334,7 +11337,7 @@ describe('SR-8.6 invariants', () => {
       spawnCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' }),
       ],
       resumeError: errNoSessionId(),
       getResult: personaRow(cfg, 'C', { state: 'ended' }),
@@ -11375,9 +11378,9 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
   const C_ID = personaInstanceId('C')
   const C_REF = renderPersonaRef('C', 'C')
   /** The one pane read a lap makes. */
-  const PANE_READ: import('agent-director').ReadPaneParams = { claude_instance_id: C_ID, n_lines: APPROVER_PANE_LINES, allow_pending: true }
+  const PANE_READ: import('agent-director').ReadPaneParams = { instance_id: C_ID, n_lines: APPROVER_PANE_LINES, allow_pending: true }
   /** The one Enter a lap presses on a dialog. */
-  const ENTER: import('agent-director').SendKeysParams = { claude_instance_id: C_ID, text: '', allow_pending: true }
+  const ENTER: import('agent-director').SendKeysParams = { instance_id: C_ID, text: '', allow_pending: true }
 
   /** Capture lists for the approver's verbs and the ladder's resume. */
   function approverCalls() {
@@ -11400,14 +11403,14 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     installStub({
       ...calls,
       statusQueue: statusReads('pending', 'waiting'),
-      readPaneResults: [{ pane: DEV_CHANNELS_PANE }, { pane: WELCOME_PANE }],
+      readPaneResults: [cannedReadPaneResult(DEV_CHANNELS_PANE), cannedReadPaneResult(WELCOME_PANE)],
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
 
     const result = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
 
     expect(result).toEqual({ key: 'C', action: 'spawned' })
-    expect(calls.statusCalls).toEqual([{ claude_instance_id: C_ID }, { claude_instance_id: C_ID }])
+    expect(calls.statusCalls).toEqual([{ instance_id: C_ID }, { instance_id: C_ID }])
     expect(calls.readPaneCalls).toEqual([PANE_READ])
     expect(calls.sendKeysCalls).toEqual([ENTER])
     expect(clock.now()).toBe(DIALOG_POLL_INTERVAL_MS)
@@ -11487,14 +11490,14 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: personaRow(cfg, 'C', { state: 'ended' }),
       statusQueue: statusReads('pending', 'waiting'),
-      readPaneResults: [{ pane }, { pane: WELCOME_PANE }],
+      readPaneResults: [cannedReadPaneResult(pane), cannedReadPaneResult(WELCOME_PANE)],
     })
 
     const result = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
 
     expect(result).toEqual({ key: 'C', action: 'resumed' })
-    expect(calls.resumeCalls).toEqual([{ claude_instance_id: C_ID }])
-    expect(calls.statusCalls).toEqual([{ claude_instance_id: C_ID }, { claude_instance_id: C_ID }])
+    expect(calls.resumeCalls).toEqual([{ instance_id: C_ID }])
+    expect(calls.statusCalls).toEqual([{ instance_id: C_ID }, { instance_id: C_ID }])
     expect(calls.readPaneCalls).toEqual([PANE_READ])
     expect(calls.sendKeysCalls).toEqual([ENTER])
   })
@@ -11526,7 +11529,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       ...calls,
       ...knobs(cfg),
       statusQueue: statusReads(state, 'pending', 'waiting'),
-      readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_PANE }],
+      readPaneResults: [cannedReadPaneResult(DEV_CHANNELS_DIALOG_PANE)],
     })
 
     let launched: SpawnPersonaResult | undefined
@@ -11535,7 +11538,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     })
 
     expect(launched).toStrictEqual(result)
-    expect(calls.statusCalls).toEqual([{ claude_instance_id: C_ID }])
+    expect(calls.statusCalls).toEqual([{ instance_id: C_ID }])
     expect(calls.readPaneCalls).toEqual([])
     expect(calls.sendKeysCalls).toEqual([])
     // At once: no timer fired and no virtual time passed.
@@ -11561,7 +11564,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     installStub({
       ...calls,
       statusQueue: statusReads('pending', 'waiting'),
-      readPaneResults: [{ pane: DEV_CHANNELS_PANE }, { pane: WELCOME_PANE }],
+      readPaneResults: [cannedReadPaneResult(DEV_CHANNELS_PANE), cannedReadPaneResult(WELCOME_PANE)],
     })
     const key = personaKey('My Chan')
     expect(key).not.toBe('My Chan')
@@ -11570,9 +11573,9 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
 
     expect(result.action).toBe('spawned')
     const id = personaInstanceId(key)
-    expect(calls.statusCalls).toEqual([{ claude_instance_id: id }, { claude_instance_id: id }])
-    expect(calls.readPaneCalls).toEqual([{ ...PANE_READ, claude_instance_id: id }])
-    expect(calls.sendKeysCalls).toEqual([{ ...ENTER, claude_instance_id: id }])
+    expect(calls.statusCalls).toEqual([{ instance_id: id }, { instance_id: id }])
+    expect(calls.readPaneCalls).toEqual([{ ...PANE_READ, instance_id: id }])
+    expect(calls.sendKeysCalls).toEqual([{ ...ENTER, instance_id: id }])
   })
 
   // -------------------------------------------------------------------------
@@ -11600,7 +11603,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       sendKeysCalls,
       statusQueue: statusReads('pending', 'pending', 'waiting'),
       // sticky: every readPane returns the dialog needle
-      readPaneResults: [{ pane: DEV_CHANNELS_PANE }],
+      readPaneResults: [cannedReadPaneResult(DEV_CHANNELS_PANE)],
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
@@ -11647,7 +11650,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
   /** Stub answers that reach the approver's Enter on a `pending` row, then (when the approver goes on) the ready state. */
   const toEnter = (err: Error): StubClientOptions => ({
     statusQueue: statusReads('pending', 'waiting'),
-    readPaneResults: [{ pane: DEV_CHANNELS_PANE }],
+    readPaneResults: [cannedReadPaneResult(DEV_CHANNELS_PANE)],
     sendKeysError: err,
   })
 
@@ -11805,7 +11808,7 @@ describe('b.jg5 SRJ-404, SRJ-405, SRJ-118, SRJ-316: what follows the dialog appr
     const clock = useApproverClock(SAMPLE_LAUNCH_START_MS)
     const limit = arrange()
     const calls = makeStubCallLog()
-    installStub({ ...calls, statusResult: cannedStatusResult({ state: 'pending' }), readPaneResults: [{ pane: NO_DIALOG_PANE }] })
+    installStub({ ...calls, statusResult: cannedStatusResult({ state: 'pending' }), readPaneResults: [cannedReadPaneResult(NO_DIALOG_PANE)] })
     const readLog = captureStartupErrors()
     const cfg = makeNoticeConfig()
     const h = installNoticeNotifier(cfg)
@@ -11856,7 +11859,7 @@ describe('b.jg5 SRJ-404, SRJ-405, SRJ-118, SRJ-316: what follows the dialog appr
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: personaRow(cfg, 'C', { state: 'ended', started_at: startedAt }),
       statusResult: cannedStatusResult({ state: 'pending' }),
-      readPaneResults: [{ pane: NO_DIALOG_PANE }],
+      readPaneResults: [cannedReadPaneResult(NO_DIALOG_PANE)],
     })
     const readLog = captureStartupErrors()
 
@@ -11866,7 +11869,7 @@ describe('b.jg5 SRJ-404, SRJ-405, SRJ-118, SRJ-316: what follows the dialog appr
     })
 
     expect(launched).toEqual({ key: 'C', action: 'resumed' })
-    expect(calls.resumeCalls).toEqual([{ claude_instance_id: C_ID }])
+    expect(calls.resumeCalls).toEqual([{ instance_id: C_ID }])
     expect(await _whenDialogApproverStopped('C')).toEqual({ reason: APPROVER_STOP_BOUND, launchStartMs: SAMPLE_LAUNCH_START_MS })
     expect(clock.now()).toBe(SAMPLE_LAUNCH_START_MS + boundMs)
     // It polled on past its first lap (started_at plus B had long passed there).
@@ -11896,7 +11899,7 @@ describe('b.jg5 SRJ-404, SRJ-405, SRJ-118, SRJ-316: what follows the dialog appr
     installStub({
       ...calls,
       statusResult: cannedStatusResult({ state: 'pending' }),
-      readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_PANE }],
+      readPaneResults: [cannedReadPaneResult(DEV_CHANNELS_DIALOG_PANE)],
       sendKeysError: refused,
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
@@ -11909,9 +11912,9 @@ describe('b.jg5 SRJ-404, SRJ-405, SRJ-118, SRJ-316: what follows the dialog appr
     expect(launched).toEqual({ key: 'C', action: 'spawned' })
     expect(await _whenDialogApproverStopped('C')).toEqual({ reason: APPROVER_STOP_NOT_INTERACTIVE, launchStartMs: SAMPLE_LAUNCH_START_MS })
     // The one refused Enter, and nothing after it: no sleep, no second lap.
-    expect(calls.statusCalls).toEqual([{ claude_instance_id: C_ID }])
+    expect(calls.statusCalls).toEqual([{ instance_id: C_ID }])
     expect(calls.readPaneCalls).toHaveLength(1)
-    expect(calls.sendKeysCalls).toEqual([{ claude_instance_id: C_ID, text: '', allow_pending: true }])
+    expect(calls.sendKeysCalls).toEqual([{ instance_id: C_ID, text: '', allow_pending: true }])
     expect(clock.firedCount()).toBe(0)
     expect(clock.now()).toBe(0)
     expect(clock.pendingCount()).toBe(0)
@@ -12201,11 +12204,11 @@ describe('b.jg5 SRJ-401: the approver runs after every launch that returns succe
   /** Record each call of `RECORDED_VERBS` through `stub` from now on, in order, with `isLaunchInFlight(key)` at the call. */
   function recordCallsWithInFlight(stub: StubClient, key: string): CallInFlight[] {
     const calls: CallInFlight[] = []
-    const client = stub as unknown as Record<string, (params: { claude_instance_id?: unknown }) => Promise<unknown>>
+    const client = stub as unknown as Record<string, (params: { instance_id?: unknown }) => Promise<unknown>>
     for (const verb of RECORDED_VERBS) {
       const original = client[verb]!
       client[verb] = (params) => {
-        calls.push({ verb, id: String(params.claude_instance_id), inFlight: isLaunchInFlight(key) })
+        calls.push({ verb, id: String(params.instance_id), inFlight: isLaunchInFlight(key) })
         return original.call(stub, params)
       }
     }
@@ -12661,7 +12664,7 @@ describe('b.jg5 SRJ-409, SRJ-404: the row an approver leaves pending when it sto
   /** A pane that shows no startup dialog: the approver presses nothing and polls on. */
   const NO_DIALOG_PANE = 'unrelated pane text'
   /** P's row read `pending` with the stub's default launch start, its pane showing no dialog. */
-  const PENDING_NO_DIALOG: StubClientOptions = { statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }), readPaneResults: [{ pane: NO_DIALOG_PANE }] }
+  const PENDING_NO_DIALOG: StubClientOptions = { statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }), readPaneResults: [cannedReadPaneResult(NO_DIALOG_PANE)] }
 
   /** How a case ends P's approver after its launch. */
   interface ApproverStopCase {
@@ -12681,7 +12684,7 @@ describe('b.jg5 SRJ-409, SRJ-404: the row an approver leaves pending when it sto
     ['GONE at its pane read (ErrTmuxCaptureFailed), the row read pending', { stub: { ...PENDING_NO_DIALOG, readPaneError: errTmuxCaptureFailed() }, reason: APPROVER_STOP_GONE, arms: true }],
     [
       'ErrSpawnNotInteractive on its Enter, the row read pending',
-      { stub: { ...PENDING_NO_DIALOG, readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_PANE }], sendKeysError: errSpawnNotInteractive('send-keys') }, reason: APPROVER_STOP_NOT_INTERACTIVE, arms: true },
+      { stub: { ...PENDING_NO_DIALOG, readPaneResults: [cannedReadPaneResult(DEV_CHANNELS_DIALOG_PANE)], sendKeysError: errSpawnNotInteractive('send-keys') }, reason: APPROVER_STOP_NOT_INTERACTIVE, arms: true },
     ],
     ['ErrTmuxNotAvailable at its pane read, the row read pending', { stub: { ...PENDING_NO_DIALOG, readPaneError: errTmuxNotAvailable(undefined, 'read-pane') }, reason: APPROVER_STOP_TMUX_UNAVAILABLE, arms: true }],
     ['ErrTmuxNotAvailable at its first status read (no row read)', { stub: { statusError: errTmuxNotAvailable(undefined, 'status') }, reason: APPROVER_STOP_TMUX_UNAVAILABLE, arms: true }],
@@ -12691,7 +12694,7 @@ describe('b.jg5 SRJ-409, SRJ-404: the row an approver leaves pending when it sto
         stub: {
           statusQueue: [cannedOk(cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_FRACTIONAL }))],
           statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_WHOLE }),
-          readPaneResults: [{ pane: NO_DIALOG_PANE }],
+          readPaneResults: [cannedReadPaneResult(NO_DIALOG_PANE)],
         },
         reason: APPROVER_STOP_SUPERSEDED,
         arms: true,
@@ -12732,7 +12735,7 @@ describe('b.jg5 SRJ-409, SRJ-404: the row an approver leaves pending when it sto
     [
       'the test cap after its last status read a state CSCB does not know',
       {
-        stub: { statusQueue: statusReads(AGENT_DIRECTOR_PENDING_STATE), statusResult: cannedStatusResult({ state: 'hibernating' }), readPaneResults: [{ pane: NO_DIALOG_PANE }] },
+        stub: { statusQueue: statusReads(AGENT_DIRECTOR_PENDING_STATE), statusResult: cannedStatusResult({ state: 'hibernating' }), readPaneResults: [cannedReadPaneResult(NO_DIALOG_PANE)] },
         arrange: () => _setDialogReadyTimeoutMs(4 * DIALOG_POLL_INTERVAL_MS),
         reason: APPROVER_STOP_CAP,
         arms: false,
@@ -12884,7 +12887,7 @@ describe('b.jg5 SRJ-413: each launch\'s pre_trust is logged once with the person
   ]
 
   /** The one Enter the approver presses on the folder-trust dialog. */
-  const ENTER: import('agent-director').SendKeysParams = { claude_instance_id: ID, text: '', allow_pending: true }
+  const ENTER: import('agent-director').SendKeysParams = { instance_id: ID, text: '', allow_pending: true }
 
   /** What one launch did, besides its `pre_trust` line. */
   interface LaunchEffects {
@@ -12927,7 +12930,7 @@ describe('b.jg5 SRJ-413: each launch\'s pre_trust is logged once with the person
         laps++
         return cannedStatusResult({ state: laps === 1 ? AGENT_DIRECTOR_PENDING_STATE : 'waiting' })
       },
-      readPaneResults: [{ pane: TRUST_DIALOG_NEEDLE }],
+      readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_NEEDLE)],
     })
     const readLog = captureStartupErrors()
     const before = { notices: notices.length, outage: outageEmissions.length, log: readLog().length }
@@ -13246,7 +13249,7 @@ describe('wrapper-migration: dialog outage cases (Group B)', () => {
       'sendKeys outage: status=pending + dialog pane, sendKeys throws ErrSystemInstallDisappeared',
       () => ({
         statusResult: cannedStatusResult({ state: 'pending' }),
-        readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_PANE }],
+        readPaneResults: [cannedReadPaneResult(DEV_CHANNELS_DIALOG_PANE)],
         sendKeysError: new ErrSystemInstallDisappeared('send-keys', BIN),
       }),
     ],
@@ -13313,7 +13316,7 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+        cannedOk<StubSpawnResult>({ instance_id: `cscb_${CH}` }),
       ],
       getError: errSpawnNotFound(),
     })
@@ -13333,7 +13336,7 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+        cannedOk<StubSpawnResult>({ instance_id: `cscb_${CH}` }),
       ],
       getResult: personaRow(cfg, CH, { state: 'ended' }),
     })
@@ -13368,7 +13371,7 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+        cannedOk<StubSpawnResult>({ instance_id: `cscb_${CH}` }),
       ],
       getResult: personaRow(cfg, CH, { state: 'ended' }),
       resumeError: errNoSessionId(),
@@ -13434,7 +13437,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       deleteCalls: opts.deleteCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${key}` }),
+        cannedOk<StubSpawnResult>({ instance_id: `cscb_${key}` }),
       ],
       resumeError: opts.resumeError ?? errJsonlMissing(opts.jsonlDescription),
       getResult: opts.getError
@@ -13464,7 +13467,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     installAmnesia({
       cfg,
-      getResult: { jsonl_path: '/data/proj/sess-1.jsonl', claude_session_id: 'sess-1', cwd: CWD },
+      getResult: { jsonl_path: '/data/proj/sess-1.jsonl', session_id: 'sess-1', cwd: CWD },
     })
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
@@ -13488,17 +13491,17 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       // C1 fresh (clean spawn), C2 collision→resumed, C3 collision→ErrJsonlMissing
       // amnesia, C4 spawn throws → failed.
       spawnQueue: [
-        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C1' }),
+        cannedOk<StubSpawnResult>({ instance_id: 'cscb_C1' }),
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: 'cscb_C3' }),
+        cannedOk<StubSpawnResult>({ instance_id: 'cscb_C3' }),
         cannedErr<import('agent-director').SpawnResult>(errGeneric('spawn', 'ErrSpawnBroken')),
       ],
     })
     // C2 resumes cleanly; C3 resume throws ErrJsonlMissing.
     stub.resume = async (params) => {
-      if (params.claude_instance_id === 'cscb_C3') throw errJsonlMissing()
-      return { claude_instance_id: params.claude_instance_id }
+      if (params.instance_id === 'cscb_C3') throw errJsonlMissing()
+      return { instance_id: params.instance_id }
     }
     const cfg = makeStandInPersonaConfig(
       {
@@ -13569,13 +13572,13 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       installAmnesia({
         cfg,
         jsonlDescription: desc,
-        getResult: { jsonl_path: '/data/proj/sess-1.jsonl', claude_session_id: 'sess-1', cwd: CWD },
+        getResult: { jsonl_path: '/data/proj/sess-1.jsonl', session_id: 'sess-1', cwd: CWD },
       })
       await spawnForPersona(personaOf(cfg, CH), cfg, true)
     })
   }
 
-  test('REGRESSION: all three AD source tokens are parsed, in the order AD reported them', async () => {
+  test('0.12 resume candidates include only persisted and fallback, ignoring older history', async () => {
     captureStartupErrors()
     const attempts = [
       adAttempt('persisted', '/data/proj/sess-1.jsonl'),
@@ -13586,21 +13589,19 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     // Exactly the three AD candidates, joined in AD's order — nothing dropped,
     // nothing reordered, no locally-computed padding.
     expect(log).toContain(
-      `Transcript candidates tried (paths+sources reported by agent-director): ${attempts.join('; ')}.`,
+      `Transcript candidates tried (paths+sources reported by agent-director): ${attempts.slice(0, 2).join('; ')}.`,
     )
     expect(log).not.toContain('locally-computed')
   })
 
-  test('history-only description yields exactly that one candidate', async () => {
+  test('history-only description gives no latest-session evidence and computes current candidates', async () => {
     captureStartupErrors()
     const attempt = adAttempt('history', '/home/u/.claude/projects/-old-repo/sess-0.jsonl')
     const log = await logForDescription(`no transcript found: ${attempt}`)
-    expect(log).toContain(
-      `Transcript candidates tried (paths+sources reported by agent-director): ${attempt}.`,
-    )
-    // A single AD candidate still counts as AD detail: no local reconstruction.
-    expect(log).not.toContain('locally-computed')
-    expect(log).not.toContain('agent-director gave no path detail')
+    expect(log).toContain('agent-director gave no path detail')
+    expect(log).toContain('locally-computed')
+    const candidates = log.split('Transcript candidates tried').slice(1).join('Transcript candidates tried')
+    expect(candidates).not.toContain('history /home/u/.claude/projects/-old-repo/sess-0.jsonl')
   })
 
   test.each([
@@ -13629,7 +13630,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       installAmnesia({
         cfg,
         jsonlDescription: 'jsonl missing', // no <source> <path> (<err>) enumeration
-        getResult: { jsonl_path: '/data/proj/sess-2.jsonl', claude_session_id: 'sess-2', cwd: CWD },
+        getResult: { jsonl_path: '/data/proj/sess-2.jsonl', session_id: 'sess-2', cwd: CWD },
       })
       const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
       // Never throws — the fresh-spawn still happens. No message_archive_db is
@@ -13654,7 +13655,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       cfg,
       getResult: {
         jsonl_path: '/data/proj/sess-3.jsonl',
-        claude_session_id: 'sess-3',
+        session_id: 'sess-3',
         cwd: CWD,
         started_at: '2026-09-20T05:00:00Z',
       },
@@ -13695,7 +13696,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       key: NOTICE_KEY,
       getResult: {
         jsonl_path: '/data/proj/sess-4.jsonl',
-        claude_session_id: 'sess-4',
+        session_id: 'sess-4',
         // cwd: the notice persona's own working directory (personaRow).
         started_at: startedAt,
       },
@@ -13743,7 +13744,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(result.action).toBe('fresh-after-inconclusive-amnesia')
     expect(deleteCalls).toEqual([])
     // The colliding optimistic spawn, then the one reuse spawn of the same id.
-    expect(spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+    expect(spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([
       [`cscb_${CH}`, undefined],
       [`cscb_${CH}`, true],
     ])
@@ -13822,7 +13823,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       deleteCalls: calls.deleteCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+        cannedOk<StubSpawnResult>({ instance_id: `cscb_${CH}` }),
       ],
       resumeError: errJsonlMissing(jsonlDescription),
     })
@@ -14041,7 +14042,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       cfg,
       spawnCalls,
       jsonlDescription: adDescription(),
-      getResult: { jsonl_path: '/data/proj/sess-5.jsonl', claude_session_id: 'sess-5', cwd: CWD, started_at: startedAt },
+      getResult: { jsonl_path: '/data/proj/sess-5.jsonl', session_id: 'sess-5', cwd: CWD, started_at: startedAt },
     })
     let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
     const errLog = await withCapturedErr(async () => {
@@ -14073,7 +14074,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     installAmnesia({
       cfg,
       spawnCalls: [],
-      getResult: { jsonl_path: jsonlPath, claude_session_id: 'sess-6', cwd: CWD, started_at: startedAt },
+      getResult: { jsonl_path: jsonlPath, session_id: 'sess-6', cwd: CWD, started_at: startedAt },
     })
     let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
     const errLog = await withCapturedErr(async () => {
@@ -14152,7 +14153,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       cfg,
       spawnCalls: [],
       jsonlDescription: `no transcript found: ${candidate.source} ${candidate.path} (${candidate.note})`,
-      getResult: { jsonl_path: '/data/proj/sess-7.jsonl', claude_session_id: 'sess-7', cwd: CWD, started_at: startedAt },
+      getResult: { jsonl_path: '/data/proj/sess-7.jsonl', session_id: 'sess-7', cwd: CWD, started_at: startedAt },
     })
     let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
     const errLog = await withCapturedErr(async () => {
@@ -14177,7 +14178,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     installAmnesia({
       cfg,
       spawnCalls: [],
-      getResult: { jsonl_path: '/data/proj/sess-8.jsonl', claude_session_id: 'sess-8', cwd: CWD, started_at: startedAt },
+      getResult: { jsonl_path: '/data/proj/sess-8.jsonl', session_id: 'sess-8', cwd: CWD, started_at: startedAt },
     })
     let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
     const errLog = await withCapturedErr(async () => {
@@ -14216,7 +14217,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   /** Enumerated attempts, over the cap: a URL-like path first, then a stat note of two lines. */
   const LONG_ATTEMPTS = [
     adAttempt('persisted', URL_PATH),
-    'history /home/u/.claude/projects/-old/sess-0.jsonl (stat failed:\nno such file or directory)',
+    'fallback /home/u/.claude/projects/-old/sess-0.jsonl (stat failed:\nno such file or directory)',
     ...Array.from({ length: 5 }, (_, i) => adAttempt('fallback', `/home/u/.claude/projects/-a-long-working-directory-name-${i}/sess-1.jsonl`)),
   ].join('; ')
   /** `LONG_ATTEMPTS` as the log line and the entry carry it: each field redacted and on one line, none over the cap. */
@@ -14262,7 +14263,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       entryClass: JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS,
       run: async (description) => {
         const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-        installAmnesia({ cfg, jsonlDescription: description, getResult: { jsonl_path: '/data/proj/sess-1.jsonl', claude_session_id: 'sess-1', cwd: CWD } })
+        installAmnesia({ cfg, jsonlDescription: description, getResult: { jsonl_path: '/data/proj/sess-1.jsonl', session_id: 'sess-1', cwd: CWD } })
         expect((await spawnForPersona(personaOf(cfg, CH), cfg, true)).action).toBe('fresh-after-inconclusive-amnesia')
       },
       long: { description: `no transcript found: ${LONG_ATTEMPTS}`, quoted: LONG_ATTEMPTS, logged: LONG_ATTEMPTS_LOGGED },
@@ -14278,7 +14279,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
         const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, {
           message_archive_db: makeArchiveWithMessagesSince(startedAt, 2),
         })
-        installAmnesia({ cfg, jsonlDescription: description, getResult: { jsonl_path: '/data/proj/sess-1.jsonl', claude_session_id: 'sess-1', cwd: CWD, started_at: startedAt } })
+        installAmnesia({ cfg, jsonlDescription: description, getResult: { jsonl_path: '/data/proj/sess-1.jsonl', session_id: 'sess-1', cwd: CWD, started_at: startedAt } })
         expect((await spawnForPersona(personaOf(cfg, CH), cfg, true)).action).toBe('fresh-after-amnesia')
       },
       long: { description: `no transcript found: ${LONG_ATTEMPTS}`, quoted: LONG_ATTEMPTS, logged: LONG_ATTEMPTS_LOGGED },
@@ -14354,7 +14355,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       getCalls,
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       resumeError: new ErrJsonlMissing('resume', tokenErrName(), adDescription()),
-      getResult: personaRow(cfg, CH, { state: 'ended', jsonl_path: '/data/proj/sess-5.jsonl', claude_session_id: 'sess-5', cwd: CWD, started_at: startedAt }),
+      getResult: personaRow(cfg, CH, { state: 'ended', jsonl_path: '/data/proj/sess-5.jsonl', session_id: 'sess-5', cwd: CWD, started_at: startedAt }),
     })
     let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
     const errLog = await withCapturedErr(async () => {
@@ -14382,7 +14383,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       cfg,
       getResult: {
         jsonl_path: '/data/proj/sess-b.jsonl',
-        claude_session_id: 'sess-b',
+        session_id: 'sess-b',
         cwd: CWD,
         started_at: 'not-a-timestamp',
       },
@@ -14411,7 +14412,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   ])('inconclusive (b): a started_at %s is quoted rendered in the line, the entry and the notice, and escaped in the notice only', async (_label, startedAt) => {
     const readLog = captureStartupErrors()
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    installAmnesia({ cfg, getResult: { jsonl_path: '/data/proj/sess-b2.jsonl', claude_session_id: 'sess-b2', cwd: CWD, started_at: startedAt } })
+    installAmnesia({ cfg, getResult: { jsonl_path: '/data/proj/sess-b2.jsonl', session_id: 'sess-b2', cwd: CWD, started_at: startedAt } })
     const errLog = await withCapturedErr(async () => {
       expect((await spawnForPersona(personaOf(cfg, CH), cfg, true)).action).toBe('fresh-after-inconclusive-amnesia')
     })
@@ -14444,7 +14445,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir) // no message_archive_db
     installAmnesia({
       cfg,
-      getResult: { jsonl_path: '/data/proj/sess-c1.jsonl', claude_session_id: 'sess-c1', cwd: CWD },
+      getResult: { jsonl_path: '/data/proj/sess-c1.jsonl', session_id: 'sess-c1', cwd: CWD },
     })
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
@@ -14465,7 +14466,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       cfg,
       getResult: {
         jsonl_path: '/data/proj/sess-c2.jsonl',
-        claude_session_id: 'sess-c2',
+        session_id: 'sess-c2',
         cwd: CWD,
         started_at: '2026-09-20T05:00:00Z',
       },
@@ -14499,7 +14500,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       cfg,
       getResult: {
         jsonl_path: '/data/proj/sess-lost.jsonl',
-        claude_session_id: 'sess-lost',
+        session_id: 'sess-lost',
         cwd: CWD,
         started_at: '2026-09-20T05:00:00Z',
       },
@@ -14538,7 +14539,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       cfg,
       getResult: {
         jsonl_path: '/data/proj/sess-nc.jsonl',
-        claude_session_id: 'sess-nc',
+        session_id: 'sess-nc',
         cwd: CWD,
         started_at: '2026-09-20T05:00:00Z',
       },
@@ -14560,7 +14561,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       cfg,
       key: NOTICE_KEY,
       // The row's cwd is the notice persona's own working directory (personaRow).
-      getResult: { jsonl_path: '/data/proj/sess-u.jsonl', claude_session_id: 'sess-u' },
+      getResult: { jsonl_path: '/data/proj/sess-u.jsonl', session_id: 'sess-u' },
     })
     const h = installNoticeNotifier(cfg)
     const result = await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg, true)
@@ -14677,7 +14678,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     installAmnesia({
       cfg,
       key: SR74_KEY,
-      getResult: { jsonl_path: '/data/proj/sess-sr74.jsonl', claude_session_id: 'sess-sr74', started_at: SR74_STARTED_AT },
+      getResult: { jsonl_path: '/data/proj/sess-sr74.jsonl', session_id: 'sess-sr74', started_at: SR74_STARTED_AT },
     })
 
     let result!: Awaited<ReturnType<typeof spawnForPersona>>
@@ -14757,7 +14758,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     installAmnesia({
       cfg,
       key: SR74_KEY,
-      getResult: { jsonl_path: '/data/proj/sess-sri704.jsonl', claude_session_id: 'sess-sri704', started_at: SR74_STARTED_AT },
+      getResult: { jsonl_path: '/data/proj/sess-sri704.jsonl', session_id: 'sess-sri704', started_at: SR74_STARTED_AT },
     })
 
     let result!: Awaited<ReturnType<typeof spawnForPersona>>
@@ -14802,7 +14803,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       spawnCalls,
       // No enumerated AD detail, so the diagnosis computes the candidates itself.
       jsonlDescription: 'jsonl missing',
-      getResult: { jsonl_path: '/data/proj/sess-own.jsonl', claude_session_id: 'sess-own', cwd: CWD },
+      getResult: { jsonl_path: '/data/proj/sess-own.jsonl', session_id: 'sess-own', cwd: CWD },
     })
 
     let result!: Awaited<ReturnType<typeof spawnForPersona>>
@@ -14831,7 +14832,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     installStub({
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+        cannedOk<StubSpawnResult>({ instance_id: `cscb_${CH}` }),
       ],
       getResult: personaRow(cfg, CH, { state: 'ended' }),
       resumeError: errNoSessionId(),
@@ -14871,7 +14872,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   /** CH's row as the diagnosis reads it: a transcript path and session id, started at `SRJ712_STARTED_AT`. */
   const SRJ712_ROW: PersonaGetResultOverrides = {
     jsonl_path: '/data/proj/sess-712.jsonl',
-    claude_session_id: 'sess-712',
+    session_id: 'sess-712',
     cwd: CWD,
     started_at: SRJ712_STARTED_AT,
   }
@@ -14996,13 +14997,13 @@ describe('b.jgf: ErrJsonlNeverWritten → a lossless reuse spawn of the same id'
       ...opts,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+        cannedOk<StubSpawnResult>({ instance_id: `cscb_${CH}` }),
       ],
       resumeError: errJsonlNeverWritten(),
       getResult: personaRow(cfg, CH, {
         state: 'ended',
         jsonl_path: '/data/proj/sess-jgf.jsonl',
-        claude_session_id: 'sess-jgf',
+        session_id: 'sess-jgf',
         cwd: CWD,
       }),
     })
@@ -15027,7 +15028,7 @@ describe('b.jgf: ErrJsonlNeverWritten → a lossless reuse spawn of the same id'
     expect(result).toEqual({ key: CH, action: 'spawned' })
     // Nothing deleted: the same id is spawned again with the reuse flag (b.jg5 SRJ-707).
     expect(deleteCalls).toEqual([])
-    expect(spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+    expect(spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([
       [`cscb_${CH}`, undefined],
       [`cscb_${CH}`, true],
     ])
@@ -15783,7 +15784,7 @@ describe('killPersonaInstance: the one checked kill each try of the persona tear
     const kill = await runQuietly(() => killPersonaInstance(B, TEARDOWN))
 
     expect(kill.outcome).toEqual({ ok: killSent === undefined ? { kind: KILL_OUTCOME_KILLED } : { kind: KILL_OUTCOME_KILLED, killSent } })
-    expect(calls.killCalls).toEqual([{ claude_instance_id: 'cscb_B' }])
+    expect(calls.killCalls).toEqual([{ instance_id: 'cscb_B' }])
     expect(stubCallCount(calls)).toBe(1)
     expect(kill.errLog).toBe('')
     expect(kill.startupLog).toBe('')
@@ -15887,8 +15888,8 @@ describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, check
     expect(h.clock.pending()).toEqual([])
     const id = personaInstanceId(p)
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ kill: kills }))
-    expect(h.stub.calls.killCalls).toEqual(Array.from({ length: kills }, () => ({ claude_instance_id: id })))
-    expect(h.stub.calls.statusCalls.map((c) => c.claude_instance_id)).toEqual(Array.from({ length: reads }, () => id))
+    expect(h.stub.calls.killCalls).toEqual(Array.from({ length: kills }, () => ({ instance_id: id })))
+    expect(h.stub.calls.statusCalls.map((c) => c.instance_id)).toEqual(Array.from({ length: reads }, () => id))
     expect(h.stub.callCount()).toBe(kills + reads)
     expect(h.triggers).toEqual([])
     expect(h.controller.isArmed(p)).toBe(false)
@@ -16151,7 +16152,7 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
     const r = await readQuietly()
 
     expect(r.outcome).toStrictEqual({ ok: { state } })
-    expect(calls.statusCalls).toEqual([{ claude_instance_id: `${PERSONA_INSTANCE_ID_PREFIX}${B}` }])
+    expect(calls.statusCalls).toEqual([{ instance_id: `${PERSONA_INSTANCE_ID_PREFIX}${B}` }])
     expect(stubCallCount(calls)).toBe(1)
     expectQuiet(r)
     expect(outageEmissions).toEqual([])
@@ -16455,7 +16456,7 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
   /** Stub alpha's sweep: one row with a wrong instance ID (swept and killed), its kill rejecting with `err`; answers the configuration and the row. */
   function installOrphan(err: Error): { cfg: PersonaConfig; row: import('agent-director').ListRow } {
     const { cfg, home } = orphanConfig()
-    const row = cannedListRow({ claude_instance_id: 'cscb_alpha_old' }, personaOf(cfg, 'alpha'), home)
+    const row = cannedListRow({ instance_id: 'cscb_alpha_old' }, personaOf(cfg, 'alpha'), home)
     installStub({ listResult: { spawns: [row] }, killError: err })
     return { cfg, row }
   }
@@ -16502,7 +16503,7 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
     expect(result).toEqual(sweepResult({ listed: 1, kept: 1, killFailed: 1 }))
     const entry = onlyStartupEntry(readLog(), ORPHAN_CLEANUP_LABEL)
     expect(entry.endsWith(startSweepKillFailedEntry({
-      instanceId: row.claude_instance_id,
+      instanceId: row.instance_id,
       persona: renderPersonaRef('alpha', 'alpha'),
       state: row.state,
       session: row.tmux_session_name,
@@ -17315,14 +17316,14 @@ async function launchBothThroughOneSweep(
   const rows = new Map(
     [p, b].map((key) => {
       const row = harnessRow(h, harnessPersona(h, key), { state: 'check_permission' })
-      return [row.claude_instance_id, [key, row] as const] as const
+      return [row.instance_id, [key, row] as const] as const
     }),
   )
   const read = new Set<string>()
   h.script({
     spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errInstanceIdCollision())],
     getFn: (params) => {
-      const entry = rows.get(params.claude_instance_id)
+      const entry = rows.get(params.instance_id)
       if (entry === undefined) return errSpawnNotFound()
       const [key, row] = entry
       if (!read.has(key)) {
@@ -17495,7 +17496,7 @@ describe('b.jg5 SRJ-105, SRJ-605: a read error at the collision get or the ErrJs
     expect(await checkWorkingRowPane(p, IDLE_PANE, { persona: harnessPersona(h, p) })).toBe('defer')
 
     expect(hasPendingWorkingRowEvidence(p)).toBe(false)
-    expect(h.stub.calls.getCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p)])
+    expect(h.stub.calls.getCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(p)])
     expect(h.stub.calls.readPaneCalls).toEqual([])
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
     expect(getFailureCount(p)).toBe(0)
@@ -18521,7 +18522,7 @@ describe('b.jg5 SRJ-311: ENVIRONMENT (ErrTmuxNotAvailable) at the collision ladd
   const readCross = SRJ311_ENVIRONMENT.flatMap(([what, make, text]) => READ_SITES.map((site) => [what, site.name, make, text, site] as const))
   test.each(readCross)('b.jg5 SRJ-311: %s at %s: no read-pane of P\'s row, no delete, kill, launch, notice, inconclusive entry or dead-session, refused and never counted, one tmux-unavailable onset, P\'s condition not started; B launches', async (_what, _site, make, text, site) => {
     const { h, p } = await expectRefusedAt(site, make(site.verb), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, text)
-    expect(h.stub.calls.readPaneCalls.filter((c) => c.claude_instance_id === personaInstanceId(p))).toEqual([])
+    expect(h.stub.calls.readPaneCalls.filter((c) => c.instance_id === personaInstanceId(p))).toEqual([])
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
     expect(conditionStartedLines(h, p)).toEqual([])
     expect(countStartupEntries(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
@@ -18602,7 +18603,7 @@ describe('b.jg5 SRJ-105, SRJ-316: a CONFIG answer (ErrConfigMalformed) at the co
     const err = errConfigMalformed()
     const onset = adConfigMalformedOnset(err)
     const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_CONFIG, onset, 'ad-config-malformed')
-    expect(h.stub.calls.readPaneCalls.filter((c) => c.claude_instance_id === personaInstanceId(p))).toEqual([])
+    expect(h.stub.calls.readPaneCalls.filter((c) => c.instance_id === personaInstanceId(p))).toEqual([])
     expect(countStartupEntries(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
     expectConfigOutageOnly(h, p, onset)
   })
@@ -18711,7 +18712,7 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNCLASSIFIED outcome at the collision ladde
   test.each(READ_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-105, SRJ-313: an ErrInternal at %s keeps the read-error outcome (no read-pane of P\'s row, no delete, kill, launch, notice, inconclusive entry or dead-session, refused and never counted, P armed with the read-error cause) and is reported once to P\'s episode; B launches', async (_name, site) => {
     const err = errInternal()
     const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_READ_ERROR)
-    expect(h.stub.calls.readPaneCalls.filter((c) => c.claude_instance_id === personaInstanceId(p))).toEqual([])
+    expect(h.stub.calls.readPaneCalls.filter((c) => c.instance_id === personaInstanceId(p))).toEqual([])
     expect(countStartupEntries(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
     expectReportedToEpisode(h, p, err)
   })
@@ -18951,7 +18952,7 @@ const APPROVER_CALL_SITES: readonly ApproverCallSite[] = [
   {
     name: 'the dialog approver\'s Enter on a dialog',
     verb: 'send-keys',
-    script: (err) => ({ statusResult: cannedStatusResult({ state: 'pending' }), readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_PANE }], sendKeysError: err }),
+    script: (err) => ({ statusResult: cannedStatusResult({ state: 'pending' }), readPaneResults: [cannedReadPaneResult(DEV_CHANNELS_DIALOG_PANE)], sendKeysError: err }),
     paneReadsPerLap: 1,
     entersPerLap: 1,
     line: (ref, err) => approverLogLine(approverPaneCallFailedMessage(ref, 'send-keys', describeAdFailureForLog(err))),
@@ -19520,7 +19521,7 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
     const latchTimeReads = site.lastRead === undefined ? 1 : 0
     expect(ladderCallsMade(h)).toEqual(site.calls)
     expect(h.stub.calls.getCalls).toHaveLength(site.reads.get)
-    expect(h.stub.calls.statusCalls.map((c) => c.claude_instance_id)).toEqual(
+    expect(h.stub.calls.statusCalls.map((c) => c.instance_id)).toEqual(
       Array(site.reads.status + latchTimeReads).fill(`${PERSONA_INSTANCE_ID_PREFIX}${p}`),
     )
     expect(order.slice(order.lastIndexOf(site.verb))).toEqual([site.verb, ...(latchTimeReads === 1 ? ['status'] : [])])
@@ -19607,7 +19608,7 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
     const pId = `${PERSONA_INSTANCE_ID_PREFIX}${p}`
     h.script({
       spawnQueue: [cannedErr(row.build())],
-      statusFn: (params) => (params.claude_instance_id === pId ? errSpawnNotFound() : cannedStatusResult()),
+      statusFn: (params) => (params.instance_id === pId ? errSpawnNotFound() : cannedStatusResult()),
     })
 
     const first = await startupSessionManager(h.config, { concurrency: 1 })
@@ -19625,14 +19626,14 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
     expect(h.latch.record(p)?.rowState).toEqual(LATCH_ROW_STATE_NO_ROW)
     expect(getFailureCount(p)).toBe(0)
 
-    const pSpawns = (): number => h.stub.calls.spawnCalls.filter((c) => c.claude_instance_id === pId).length
+    const pSpawns = (): number => h.stub.calls.spawnCalls.filter((c) => c.instance_id === pId).length
     expect(pSpawns()).toBe(1)
     const second = await startupSessionManager(h.config, { concurrency: 1 })
     expect(second.perPersona.find((o) => o.key === p)).toEqual({ key: p, action: 'latched' })
     expect(second.failed).toBe(0)
     expect(pSpawns()).toBe(1)
-    expect(h.stub.calls.statusCalls.filter((c) => c.claude_instance_id === pId)).toHaveLength(1)
-    expect(h.stub.calls.killCalls.filter((c) => c.claude_instance_id === pId)).toEqual([])
+    expect(h.stub.calls.statusCalls.filter((c) => c.instance_id === pId)).toHaveLength(1)
+    expect(h.stub.calls.killCalls.filter((c) => c.instance_id === pId)).toEqual([])
     expect(h.episodeNotices).toHaveLength(1)
   })
 })
@@ -19874,7 +19875,7 @@ const NOTE_SITES: readonly NoteSite[] = [
       getQueue: [cannedOk(harnessRow(h, p, { state: 'working' })), cannedOk(harnessRow(h, p, { state: 'working', ...noted }))],
       statusQueue: [cannedOk(cannedStatusResult({ state: 'working' }))],
       statusResult: cannedStatusResult({ state: 'waiting' }),
-      readPaneResults: [{ pane: IDLE_PANE }],
+      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
     }),
     plain: { action: 'reconnected', calls: ladderCallsOf({ spawn: 1, sendKeys: 1 }) },
     latched: { calls: ladderCallsOf({ spawn: 1 }), gets: 2, statusReads: 1, rowState: WORKING_READ },
@@ -19951,7 +19952,7 @@ const NOT_A_CONFIGURED_OWN_ROW: ReadonlyArray<readonly [string, (h: RecoveryHarn
       return {}
     },
   ],
-  ['the row is another caller\'s (its id is no persona\'s)', () => ({ claude_instance_id: ANOTHER_CALLERS_ROW })],
+  ['the row is another caller\'s (its id is no persona\'s)', () => ({ instance_id: ANOTHER_CALLERS_ROW })],
   [
     'the configured-persona query throws (taken as not configured)',
     () => {
@@ -20012,7 +20013,7 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
 
     expect(ladderCallsMade(h)).toEqual(site.latched.calls)
-    expect(h.stub.calls.getCalls.map((c) => c.claude_instance_id)).toEqual(Array(site.latched.gets).fill(personaInstanceId(p)))
+    expect(h.stub.calls.getCalls.map((c) => c.instance_id)).toEqual(Array(site.latched.gets).fill(personaInstanceId(p)))
     expect(h.stub.calls.statusCalls).toHaveLength(site.latched.statusReads)
     expect(order.slice(order.lastIndexOf('get'))).toEqual(['get'])
     expectNoteLatchedOnce(h, p, site.latched.rowState)
@@ -20105,7 +20106,7 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getFn: (params) =>
-        params.claude_instance_id !== pId
+        params.instance_id !== pId
           ? errSpawnNotFound()
           : harnessRow(h, persona, { state: 'ended', ...(++pGets === 2 ? { liveness_note: provenanceNote } : {}) }),
       resumeError: errJsonlMissing(),
@@ -20122,7 +20123,7 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
     expect(result.freshAfterAmnesia).toBe(0)
     expect(result.freshAfterInconclusiveAmnesia).toBe(0)
     expect(h.stub.calls.deleteCalls).toEqual([])
-    expect(h.stub.calls.spawnCalls.filter((c) => c.claude_instance_id === pId)).toHaveLength(1)
+    expect(h.stub.calls.spawnCalls.filter((c) => c.instance_id === pId)).toHaveLength(1)
     expectNoteLatchedOnce(h, p, ENDED_READ)
   })
 
@@ -20177,7 +20178,7 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getResult: harnessRow(h, persona, { state: 'working' }),
       statusResult: cannedStatusResult({ state: 'working' }),
-      readPaneResults: [{ pane: IDLE_PANE }],
+      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
     })
     const latchedAt = before.length + at
     const order = recordCallOrder(h, {
@@ -20241,7 +20242,7 @@ function dedupHead(key: string, at: OwnRowReadSite = DEDUP_SITE): string {
 function scriptNotedRows(h: RecoveryHarness, notes: Map<string, PersonaGetResultOverrides>): void {
   h.script({
     getFn: (params) => {
-      const key = h.keys.find((candidate) => personaInstanceId(candidate) === params.claude_instance_id)
+      const key = h.keys.find((candidate) => personaInstanceId(candidate) === params.instance_id)
       if (key === undefined) return errSpawnNotFound()
       return harnessRow(h, harnessPersona(h, key), { state: 'ended', ...(notes.get(key) ?? {}) })
     },
@@ -20296,7 +20297,7 @@ describe('b.jg5 SRJ-114: the "latches no one" line for a non-latching note on a 
       _resetConfiguredPersonaQuery()
       return { liveness_note: provenanceNote }
     }],
-    ['provenance_conflict on another caller\'s row (not applied)', () => ({ liveness_note: provenanceNote, claude_instance_id: ANOTHER_CALLERS_ROW })],
+    ['provenance_conflict on another caller\'s row (not applied)', () => ({ liveness_note: provenanceNote, instance_id: ANOTHER_CALLERS_ROW })],
     ['provenance_conflict on P\'s own row (P latches)', () => ({ liveness_note: provenanceNote })],
   ])('note A, then a read with %s, then note A again logs A twice', async (_label, between) => {
     const { h, p } = srj105Build()
@@ -20360,7 +20361,7 @@ describe('b.jg5 SRJ-114: the "latches no one" line for a non-latching note on a 
 
     expect(await h.launch(p)).toEqual({ key: p, action: 'fresh-after-inconclusive-amnesia' })
 
-    expect(h.stub.calls.getCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p), personaInstanceId(p)])
+    expect(h.stub.calls.getCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(p), personaInstanceId(p)])
     const lines = nonLatchingNoteLines(h)
     expect(lines).toHaveLength(1)
     expect(lines[0]![0]).toStartWith('spawnForPersona: collision get for ')
@@ -20396,7 +20397,7 @@ describe('b.jg5 SRJ-114, SRJ-122 (hatch A2): the gets SRJ-114 leaves alone latch
 
     await ivl.tick()
 
-    expect(h.stub.calls.getCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p)])
+    expect(h.stub.calls.getCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(p)])
     expect(posts(slack)).toHaveLength(1)
     expectNoNoteLatch(h)
     assertNoLeak({ posts: posts(slack), trail: trail.events })
@@ -20408,8 +20409,8 @@ describe('b.jg5 SRJ-114, SRJ-122 (hatch A2): the gets SRJ-114 leaves alone latch
     const pId = personaInstanceId(p)
     h.script({
       getFn: (params) =>
-        params.claude_instance_id === pId
-          ? harnessRow(h, persona, { state: 'ended', liveness_note: provenanceNote, claude_session_id: TRANSCRIPT_SESSION_ID, jsonl_path: join(h.home, 'gone.jsonl') })
+        params.instance_id === pId
+          ? harnessRow(h, persona, { state: 'ended', liveness_note: provenanceNote, session_id: TRANSCRIPT_SESSION_ID, jsonl_path: join(h.home, 'gone.jsonl') })
           : errSpawnNotFound(),
     })
     const posted: Array<{ key: string; text: string }> = []
@@ -20424,7 +20425,7 @@ describe('b.jg5 SRJ-114, SRJ-122 (hatch A2): the gets SRJ-114 leaves alone latch
       home: h.home,
     })
 
-    expect(h.stub.calls.getCalls.map((c) => c.claude_instance_id)).toContain(pId)
+    expect(h.stub.calls.getCalls.map((c) => c.instance_id)).toContain(pId)
     expect(posted.map((n) => n.key)).toEqual([p])
     expectNoNoteLatch(h)
     assertNoLeak({ posted })
@@ -20454,7 +20455,7 @@ describe('b.jg5 SRJ-114, SRJ-122 (hatch A2): the gets SRJ-114 leaves alone latch
 // ---------------------------------------------------------------------------
 
 /** The one live pre-persona row (no `persona` label) the observing start sweep kills. */
-const SWEPT_OLD_ID = prePersonaRow('waiting').claude_instance_id
+const SWEPT_OLD_ID = prePersonaRow('waiting').instance_id
 
 /** A result that marks the swept row missing. */
 const OLD_MARKED_MISSING = cannedFindMissing({ rows: { [SWEPT_OLD_ID]: 'ids' } })
@@ -20695,7 +20696,7 @@ function unverifiedRowsOf(...keys: string[]): import('agent-director').FindMissi
 
 /** The instance IDs the harness's stub was asked to `get`, in call order. */
 function getIds(h: RecoveryHarness): string[] {
-  return h.stub.calls.getCalls.map((c) => c.claude_instance_id)
+  return h.stub.calls.getCalls.map((c) => c.instance_id)
 }
 
 /** What the one line of a run's post-run gets lists: `persona=<key> <read|latched|absent|refused (…)|skipped (latched)>, …`. */
@@ -21003,7 +21004,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     const result = unverifiedRowsOf(p, b)
     h.script({
       findMissingResult: result,
-      getFn: (params) => (params.claude_instance_id === pId ? err() : harnessRow(h, harnessPersona(h, b), { state: 'ended', liveness_note: provenanceNote })),
+      getFn: (params) => (params.instance_id === pId ? err() : harnessRow(h, harnessPersona(h, b), { state: 'ended', liveness_note: provenanceNote })),
     })
 
     expect(await bypassingFindMissingSweep(p, BYPASS_SITE)).toBe(refused ? FIND_MISSING_REFUSED : result)
@@ -21030,7 +21031,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     const pId = personaInstanceId(p)
     h.script({
       findMissingResult: unverifiedRowsOf(p, b),
-      getFn: (params) => (params.claude_instance_id === pId ? row.build() : harnessRow(h, harnessPersona(h, b), { state: 'ended' })),
+      getFn: (params) => (params.instance_id === pId ? row.build() : harnessRow(h, harnessPersona(h, b), { state: 'ended' })),
     })
 
     expect(await bypassingFindMissingSweep(p, BYPASS_SITE)).toBe(FIND_MISSING_LATCHED)
@@ -21050,7 +21051,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     const { h, p } = srj105Build()
     setConflictLatch(undefined)
     const pId = personaInstanceId(p)
-    h.script({ findMissingResult: unverifiedRowsOf(p), getFn: (params) => (params.claude_instance_id === pId ? errUnusableName() : errSpawnNotFound()) })
+    h.script({ findMissingResult: unverifiedRowsOf(p), getFn: (params) => (params.instance_id === pId ? errUnusableName() : errSpawnNotFound()) })
 
     expect(await bypassingFindMissingSweep(p, BYPASS_SITE)).toBe(FIND_MISSING_LATCHED)
 
@@ -21070,7 +21071,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     const result = unverifiedRowsOf(p, b)
     h.script({
       findMissingResult: result,
-      getFn: (params) => (params.claude_instance_id === bId ? unavailable('get') : harnessRow(h, harnessPersona(h, p), { state: 'ended' })),
+      getFn: (params) => (params.instance_id === bId ? unavailable('get') : harnessRow(h, harnessPersona(h, p), { state: 'ended' })),
     })
 
     expect(await bypassingFindMissingSweep(p, BYPASS_SITE)).toEqual(result)
@@ -21089,7 +21090,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     const gets = new Map<string, (row: CannedGetResult) => void>()
     h.stub.client.get = (params) =>
       new Promise((resolve) => {
-        gets.set(params.claude_instance_id, (row) => resolve(row as Awaited<ReturnType<typeof h.stub.client.get>>))
+        gets.set(params.instance_id, (row) => resolve(row as Awaited<ReturnType<typeof h.stub.client.get>>))
       })
 
     const caller = bypassingFindMissingSweep(p, BYPASS_SITE)
@@ -21128,7 +21129,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     await reconcileOrphans(h.config)
 
     expect(order).toEqual(['list', 'kill', 'findMissing', 'get'])
-    expect(h.stub.calls.killCalls.map((k) => k.claude_instance_id)).toEqual([SWEPT_OLD_ID])
+    expect(h.stub.calls.killCalls.map((k) => k.instance_id)).toEqual([SWEPT_OLD_ID])
     expect(h.stub.calls.deleteCalls).toEqual([])
     expect(getIds(h)).toEqual([personaInstanceId(p)])
     expectNoteLatchedOnce(h, p, ENDED_READ)
@@ -21258,7 +21259,7 @@ describe('b.jg5 SRJ-120, SRJ-502: a persona latched by a run\'s get stops its ca
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getQueue: before.length === 0 ? [noted] : [cannedOk(harnessRow(h, persona, { state: 'working' })), noted],
       statusResult: cannedStatusResult({ state: 'working' }),
-      readPaneResults: [{ pane: IDLE_PANE }],
+      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
       findMissingResult: unverifiedRowsOf(p),
     })
     const order = recordCallOrder(h)
@@ -21475,7 +21476,7 @@ describe('b.jg5 SRJ-105, SRJ-512, SRJ-501, SRJ-502: an UNUSABLE NAME answer at a
     const latchTimeReads = site.lastRead === undefined ? 1 : 0
     expect(ladderCallsMade(h)).toEqual(site.calls)
     expect(h.stub.calls.getCalls).toHaveLength(site.reads.get)
-    expect(h.stub.calls.statusCalls.map((c) => c.claude_instance_id)).toEqual(Array(site.reads.status + latchTimeReads).fill(personaInstanceId(p)))
+    expect(h.stub.calls.statusCalls.map((c) => c.instance_id)).toEqual(Array(site.reads.status + latchTimeReads).fill(personaInstanceId(p)))
     expect(order.slice(order.lastIndexOf(site.verb))).toEqual([site.verb, ...(latchTimeReads === 1 ? ['status'] : [])])
     expect(h.reuseSpawns()).toEqual(site.reuse === true ? [reuseSpawnOf(h, p)] : [])
     expectLatchedOnce(h, p, unusableNameLatch(p, row, site.lastRead ?? row.rowState), site.inconclusiveEntries)
@@ -21507,7 +21508,7 @@ describe('b.jg5 SRJ-105, SRJ-512, SRJ-501, SRJ-502: an UNUSABLE NAME answer at a
     const pId = personaInstanceId(p)
     h.script({
       spawnQueue: [cannedErr(row.build())],
-      statusFn: (params) => (params.claude_instance_id === pId ? errSpawnNotFound() : cannedStatusResult()),
+      statusFn: (params) => (params.instance_id === pId ? errSpawnNotFound() : cannedStatusResult()),
     })
 
     const result = await startupSessionManager(h.config, { concurrency: 1 })
@@ -21893,7 +21894,7 @@ describe('b.jg5 SRJ-117, SRJ-501, SRJ-502, SRJ-512: the shared read-pane of a pe
 
   test('a pane: one read-pane of P\'s own row with the full-read line count, answered as the pane; no other verb; nothing latched or posted', async () => {
     const { h, p } = srj105Build()
-    h.script({ readPaneResults: [{ pane: IDLE_PANE }] })
+    h.script({ readPaneResults: [cannedReadPaneResult(IDLE_PANE)] })
     const order = recordCallOrder(h)
 
     expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual({ kind: PANE_READ_PANE, pane: IDLE_PANE })
@@ -22017,7 +22018,7 @@ describe('b.jg5 SRJ-117, SRJ-501, SRJ-502, SRJ-512: the shared read-pane of a pe
     const { h, p, b } = srj105Build()
     const elsewhere = installLatchElsewhere()
     elsewhere.latch.set(p, LATCHED_ELSEWHERE)
-    h.script({ readPaneResults: [{ pane: IDLE_PANE }] })
+    h.script({ readPaneResults: [cannedReadPaneResult(IDLE_PANE)] })
     const order = recordCallOrder(h)
 
     expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual(PANE_READ_NOT_READ_LATCHED)
@@ -22106,7 +22107,7 @@ describe('b.jg5 SRJ-117, SRJ-501, SRJ-502, SRJ-512: the shared read-pane of a pe
   test('control: P latched by a CONFLICT at its read leaves B alone: B\'s read is one read-pane of B\'s own row, answered as its pane; B is not latched and nothing is set for it', async () => {
     const { h, p, b } = srj105Build()
     const row = FIRST_LIVENESS_PANE_ROW
-    h.script({ readPaneQueue: [cannedErr(row.build()), cannedOk({ pane: SPINNER_PANE })] })
+    h.script({ readPaneQueue: [cannedErr(row.build()), cannedOk(cannedReadPaneResult(SPINNER_PANE))] })
 
     expect((await readPersonaOwnPane(p, fullPaneRead(row.rowState))).kind).toBe(PANE_READ_LATCHED)
     expect(await readPersonaOwnPane(b, fullPaneRead(WORKING_READ))).toStrictEqual({ kind: PANE_READ_PANE, pane: SPINNER_PANE })
@@ -22454,7 +22455,7 @@ const PROMPT_ROW_LADDER_SITE = 'spawnForPersona: prompt row'
 
 /** The ladder's one-line read of persona `key`'s own row. */
 function oneLineReadOf(key: string): import('agent-director').ReadPaneParams {
-  return { claude_instance_id: personaInstanceId(key), n_lines: PROBE_PANE_READ_LINES }
+  return { instance_id: personaInstanceId(key), n_lines: PROBE_PANE_READ_LINES }
 }
 
 /**
@@ -22539,7 +22540,7 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
 
     await launchOnPromptRow(h, p, promptRowLaunch(h, p, 'check_permission'))
 
-    expect(h.stub.calls.readPaneCalls).toEqual([{ claude_instance_id: personaInstanceId(p), n_lines: 1 }])
+    expect(h.stub.calls.readPaneCalls).toEqual([{ instance_id: personaInstanceId(p), n_lines: 1 }])
   })
 
   test.each(PROMPT_STATES)('a %s row whose read-pane answers a pane → no-op: one one-line read-pane of P\'s own row, the last call; no sweep, resume or keystroke; the no-action line; nothing latched, counted or posted', async (state) => {
@@ -22949,8 +22950,8 @@ describe('b.jg5 SRJ-104, SRJ-204: an ErrInvalidFlags answer at the shared read-p
     expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
   })
 
-  test.each<[string, () => { readPaneError?: Error; readPaneResults?: Array<{ pane: string }> }]>([
-    ['a pane', () => ({ readPaneResults: [{ pane: IDLE_PANE }] })],
+  test.each<[string, () => { readPaneError?: Error; readPaneResults?: Array<import('agent-director').ReadPaneResult> }]>([
+    ['a pane', () => ({ readPaneResults: [cannedReadPaneResult(IDLE_PANE)] })],
     ['GONE (ErrTmuxCaptureFailed)', () => ({ readPaneError: errTmuxCaptureFailed() })],
     ['the row absent (ErrSpawnNotFound)', () => ({ readPaneError: errSpawnNotFound() })],
     ['UNAVAILABLE (ErrTmuxUnresponsive)', () => ({ readPaneError: errTmuxUnresponsive('read-pane') })],
@@ -22996,7 +22997,7 @@ const UNUSABLE_STATUS_SITES: readonly StatusSite[] = [
       const sweepsBefore = h.stub.calls.findMissingCalls.length
       return {
         ...collided(h, p, { state: 'working' }),
-        readPaneResults: [{ pane: SPINNER_PANE }],
+        readPaneResults: [cannedReadPaneResult(SPINNER_PANE)],
         statusFn: () => (h.stub.calls.findMissingCalls.length >= sweepsBefore + 2 ? err : cannedStatusResult({ state: 'working' })),
       }
     },
@@ -23027,7 +23028,7 @@ describe('b.jg5 SRJ-115, SRJ-105, SRJ-512: the shared own-row status read, and a
 
     expect(await readPersonaOwnRowStatus(p, STATUS_READ_SITE)).toStrictEqual(expected)
 
-    expect(h.stub.calls.statusCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.statusCalls).toEqual([{ instance_id: personaInstanceId(p) }])
     expect(h.stub.callCount()).toBe(1)
     expectNoNoteLatch(h)
   })
@@ -23079,7 +23080,7 @@ describe('b.jg5 SRJ-115, SRJ-105, SRJ-512: the shared own-row status read, and a
 
     await retryNow(h, p)
 
-    expect(h.stub.calls.statusCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.statusCalls).toEqual([{ instance_id: personaInstanceId(p) }])
     expect(h.stub.callCount()).toBe(1)
     expect(h.stops.filter((stop) => stop.key === p).map((stop) => stop.reason)).toEqual([UNAVAILABLE_RETRY_STOP_LATCHED])
     expect(h.restartAsks).toEqual([])
@@ -23168,7 +23169,7 @@ const UNUSABLE_GET_SITES: readonly GetSite[] = [
       getQueue: [cannedOk(harnessRow(h, p, { state: 'working' })), cannedErr(err)],
       statusQueue: [cannedOk(cannedStatusResult({ state: 'working' }))],
       statusResult: cannedStatusResult({ state: 'waiting' }),
-      readPaneResults: [{ pane: IDLE_PANE }],
+      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
     }),
     calls: ladderCallsOf({ spawn: 1 }),
     reads: { get: 2, status: 1 },
@@ -23190,7 +23191,7 @@ describe('b.jg5 SRJ-114, SRJ-105, SRJ-512: an UNUSABLE NAME answer at E14\'s sha
 
     expect(order.at(-1)).toBe('get')
     expect(ladderCallsMade(h)).toEqual(site.calls)
-    expect(h.stub.calls.getCalls.map((c) => c.claude_instance_id)).toEqual(Array(site.reads.get).fill(personaInstanceId(p)))
+    expect(h.stub.calls.getCalls.map((c) => c.instance_id)).toEqual(Array(site.reads.get).fill(personaInstanceId(p)))
     expect(h.stub.calls.statusCalls).toHaveLength(site.reads.status)
     const log = h.startupErrors().join('\n')
     expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
@@ -23504,7 +23505,7 @@ const LAUNCH_START_GET_SITES: readonly LaunchStartGetSite[] = [
       getQueue: [cannedOk(harnessRow(h, p, { state: 'working' })), cannedOk(row)],
       statusQueue: [cannedOk(cannedStatusResult({ state: 'working' }))],
       statusResult: cannedStatusResult({ state: 'waiting' }),
-      readPaneResults: [{ pane: IDLE_PANE }],
+      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
     }),
     order: ['spawn', 'get', 'findMissing', 'status', 'readPane', 'get'],
     whole: true,
@@ -23585,7 +23586,7 @@ describe('b.jg5 SRJ-513, SRJ-114, SRJ-1020: a configured persona\'s own pending 
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getFn: (params) =>
-        params.claude_instance_id !== pId ? errSpawnNotFound() : ++pGets === 2 ? row.build(persona, h.home) : harnessRow(h, persona, { state: 'ended' }),
+        params.instance_id !== pId ? errSpawnNotFound() : ++pGets === 2 ? row.build(persona, h.home) : harnessRow(h, persona, { state: 'ended' }),
       resumeError: errJsonlMissing(),
     })
 
@@ -23600,7 +23601,7 @@ describe('b.jg5 SRJ-513, SRJ-114, SRJ-1020: a configured persona\'s own pending 
     expect(result.freshAfterAmnesia).toBe(0)
     expect(result.freshAfterInconclusiveAmnesia).toBe(0)
     expect(h.stub.calls.deleteCalls).toEqual([])
-    expect(h.stub.calls.spawnCalls.filter((c) => c.claude_instance_id === pId)).toHaveLength(1)
+    expect(h.stub.calls.spawnCalls.filter((c) => c.instance_id === pId)).toHaveLength(1)
     expectLatchedOnce(h, p, launchStartLatch(p, row))
   })
 
@@ -23631,7 +23632,7 @@ describe('b.jg5 SRJ-513, SRJ-114, SRJ-1020: a configured persona\'s own pending 
     const pId = personaInstanceId(p)
     h.script({
       findMissingResult: unverifiedRowsOf(p, b),
-      getFn: (params) => (params.claude_instance_id === pId ? row.build(harnessPersona(h, p), h.home) : harnessRow(h, harnessPersona(h, b), { state: 'ended' })),
+      getFn: (params) => (params.instance_id === pId ? row.build(harnessPersona(h, p), h.home) : harnessRow(h, harnessPersona(h, b), { state: 'ended' })),
     })
 
     expect(await bypassingFindMissingSweep(p, BYPASS_SITE)).toBe(FIND_MISSING_LATCHED)
@@ -23699,7 +23700,7 @@ const LAUNCH_START_STATUS_SITES: readonly LaunchStartStatusSite[] = [
       const sweepsBefore = h.stub.calls.findMissingCalls.length
       return {
         ...collided(h, p, { state: 'working' }),
-        readPaneResults: [{ pane: SPINNER_PANE }],
+        readPaneResults: [cannedReadPaneResult(SPINNER_PANE)],
         statusFn: () => (h.stub.calls.findMissingCalls.length >= sweepsBefore + 2 ? result : cannedStatusResult({ state: 'working' })),
       }
     },
@@ -23722,7 +23723,7 @@ describe('b.jg5 SRJ-513, SRJ-115, SRJ-1020: a configured persona\'s own pending 
 
     expect(await readPersonaOwnRowStatus(p, STATUS_READ_SITE)).toStrictEqual({ kind: OWN_ROW_STATUS_LATCHED, rowState: row.rowState })
 
-    expect(h.stub.calls.statusCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.statusCalls).toEqual([{ instance_id: personaInstanceId(p) }])
     expect(h.stub.callCount()).toBe(1)
     expectLatchedOnce(h, p, launchStartLatch(p, row))
   })
@@ -23765,7 +23766,7 @@ describe('b.jg5 SRJ-513, SRJ-115, SRJ-1020: a configured persona\'s own pending 
 
     await retryNow(h, p)
 
-    expect(h.stub.calls.statusCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.statusCalls).toEqual([{ instance_id: personaInstanceId(p) }])
     expect(h.stub.callCount()).toBe(1)
     expect(h.stops.filter((stop) => stop.key === p).map((stop) => stop.reason)).toEqual([UNAVAILABLE_RETRY_STOP_LATCHED])
     expect(h.restartAsks).toEqual([])
@@ -23855,8 +23856,8 @@ describe('b.jg5 SRJ-122, SRJ-513 (hatch A2): the gets SRJ-122 leaves alone latch
     const pId = personaInstanceId(p)
     h.script({
       getFn: (params) =>
-        params.claude_instance_id === pId
-          ? { ...row.build(persona, h.home), claude_session_id: TRANSCRIPT_SESSION_ID, jsonl_path: join(h.home, 'gone.jsonl') }
+        params.instance_id === pId
+          ? { ...row.build(persona, h.home), session_id: TRANSCRIPT_SESSION_ID, jsonl_path: join(h.home, 'gone.jsonl') }
           : errSpawnNotFound(),
     })
     const posted: Array<{ key: string; text: string }> = []
@@ -24407,7 +24408,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
   /** Exactly one send-keys of `/mcp reconnect` for P and no other call; nothing posted as a spawn failure, recorded or counted. */
   function expectOneSendKeysOnly(h: RecoveryHarness, p: string, order: readonly string[]): void {
     expect(order).toEqual(['sendKeys'])
-    expect(h.stub.calls.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([[personaInstanceId(p), RECONNECT_TEXT]])
+    expect(h.stub.calls.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([[personaInstanceId(p), RECONNECT_TEXT]])
     expect(h.notices).toEqual([])
     expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(getFailureCount(p)).toBe(0)
@@ -25027,7 +25028,7 @@ const LAUNCH_AND_READ_VERBS: ReadonlySet<string> = new Set(['spawn', 'resume', '
 const RETRYING_ANSWER = { action: SPAWN_ACTION_RETRYING } as const
 
 /** A `resume`'s collision: the client's `ErrInstanceIdCollision`, built for `resume` (decided by class, b.jg5 SRJ-101). */
-const resumeCollision = (): Error => new ErrInstanceIdCollision('resume', 'ErrInstanceIdCollision', 'claude_instance_id already in use')
+const resumeCollision = (): Error => new ErrInstanceIdCollision('resume', 'ErrInstanceIdCollision', 'instance_id already in use')
 
 /** The same outcome at both sites. */
 const atBothSites = (outcome: ResumeSiteOutcome): Pick<ResumeOutcomeRow, 'ladder' | 'entry'> => ({ ladder: outcome, entry: outcome })
@@ -25236,7 +25237,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
 
     expect(await launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)).toEqual({ key: p, action: 'resumed' })
 
-    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: id }])
+    expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: id }])
     expect(preTrustLines(h.errors.join('\n'))).toEqual([preTrustLogLine(renderPersonaRef(p, p), LAUNCH_VERB_RESUME, preTrust)])
     expect(h.approverRunning(p)).toBe(true)
     expect(await h.runApproverToStop(p)).toBeDefined()
@@ -25278,7 +25279,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     hold.release(id)
     expect(await first).toEqual({ key: p, action: 'spawned' })
     expect(await entry).toEqual({ key: p, action: 'resumed' })
-    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: id }])
+    expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: id }])
     expect(isLaunchInFlight(p)).toBe(false)
     await h.runApproverToStop(p)
   })
@@ -25344,7 +25345,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     expect(await launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)).toEqual({ key: p, action })
 
     expect(order.slice(0, calls.length)).toEqual([...calls])
-    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: personaInstanceId(p) }])
     expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
     expect(destructiveCalls(h)).toEqual([[], [], [...h.reuseSpawns()]])
     // The diagnosis's one line and its one notice, each carrying the reuse wording.
@@ -25439,7 +25440,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     expect([getFailureCount(p), h.notices, h.triggers]).toEqual([0, [], [pendingRowTrigger(p)]])
     expectPendingOnlyWatch(h, p)
     expect(order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))).toEqual(['kill', 'get', 'findMissing', 'get', 'resume', 'spawn'])
-    expect(h.stub.calls.spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([[personaInstanceId(p), undefined]])
+    expect(h.stub.calls.spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([[personaInstanceId(p), undefined]])
     await h.runApproverToStop(p)
   })
 
@@ -25511,11 +25512,11 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
 
     // SRJ-112: the success line says whether the id had a row when the
     // sequence last read it (step 3's `get`); with none the reuse is an
-    // ordinary fresh spawn and keeps no earlier life.
+    // ordinary fresh spawn and keeps no prior sessions.
     test.each([
       ['no row (ErrSpawnNotFound)', true],
       ['the row ended', false],
-    ] as const)('step 3\'s get reading %s, then a reuse that succeeds: one reuse success line, which says whether an earlier life is kept', async (_label, noRow) => {
+    ] as const)('step 3\'s get reading %s, then a reuse that succeeds: one reuse success line, which says whether the AD life and prior sessions are retained', async (_label, noRow) => {
       const { h, p } = srj105Build()
       h.script(noRow ? { getError: errSpawnNotFound() } : { getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, harnessPersona(h, p), h.home) })
 
@@ -25526,10 +25527,10 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       })
 
       const earlierLife = noRow
-        ? 'the id had no row when last read (an ordinary fresh spawn), so no earlier life is kept'
-        : 'its row is kept as an earlier life'
+        ? 'the id had no row when last read (an ordinary fresh spawn), so no prior sessions are kept'
+        : 'its Claude row retains its AD life and prior sessions'
       expect(h.errors.filter((line) => line.includes(': reuse-spawned '))).toEqual([
-        `[slack] reuseSpawnForPersona: reuse-spawned ${renderPersonaRef(p, p)} instanceId=${personaInstanceId(p)} — a new life on its own id; ${earlierLife} (b.jg5 SRJ-112)`,
+        `[slack] reuseSpawnForPersona: reuse-spawned ${renderPersonaRef(p, p)} instanceId=${personaInstanceId(p)} — a fresh conversation on its own id; ${earlierLife} (b.jg5 SRJ-112)`,
       ])
       expect(h.reuseSpawns()).toEqual(oneReuseOf(h, p))
       await h.runApproverToStop(p)
@@ -25779,7 +25780,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     expect(await h.sequenceDeps.readRow(p, renderPersonaRef(p, p))).toEqual({ kind: LIVE_ROW_READ_ROW, row })
     expect(await h.sequenceDeps.readRow(p, renderPersonaRef(p, p))).toEqual({ kind: LIVE_ROW_READ_LATCHED })
 
-    expect(h.stub.calls.getCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }, { claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.getCalls).toEqual([{ instance_id: personaInstanceId(p) }, { instance_id: personaInstanceId(p) }])
     expect(h.latch.record(p)?.latchCase).toBe(LATCH_CASE_CONFLICTING_LABELS)
   })
 
@@ -25794,7 +25795,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     expect(await h.sequenceDeps.runFindMissing(p, id, cannedStatusResult().state)).toBe(LIVE_ROW_RUN_LEFT_LIVE)
 
     expect(h.stub.calls.findMissingCalls).toHaveLength(2)
-    expect(h.stub.calls.getCalls.slice(getsBefore)).toEqual([{ claude_instance_id: personaInstanceId(b) }])
+    expect(h.stub.calls.getCalls.slice(getsBefore)).toEqual([{ instance_id: personaInstanceId(b) }])
   })
 
   /** One kill of P through the dependencies' kill binding, inside P's recovery attempt (as a sequence makes it), driven on the clock. */
@@ -25813,7 +25814,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     expect(await killThroughDeps(h, p)).toMatchObject({ tries: 2, reads: 1 })
 
     expect(order).toEqual(['kill', 'status', 'kill'])
-    expect(h.stub.calls.statusCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.statusCalls).toEqual([{ instance_id: personaInstanceId(p) }])
     expect([h.triggers, h.controller.isArmed(p)]).toEqual([[], false])
   })
 
@@ -25854,7 +25855,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       kind: LIVE_ROW_LAUNCH_ANSWER_LAUNCHED,
       result: { key: b, action: 'resumed' },
     })
-    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(b) }])
+    expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: personaInstanceId(b) }])
     await h.runApproverToStop(b)
   })
 
@@ -25982,7 +25983,7 @@ describe('b.4q8: the live-row sequence\'s start entry forwards whether P was bel
 // ---------------------------------------------------------------------------
 
 /** An `ended` row of the persona with a session id, so a `resume` of it would keep the conversation. */
-const ENDED_WITH_SESSION = { state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' } as const
+const ENDED_WITH_SESSION = { state: LIVENESS_DEAD_ROW_ENDED, session_id: 'a-session-id' } as const
 
 describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch failure that kills nothing, and a first spawn stays plain', () => {
   afterEach(srj105AfterEach)
@@ -26120,7 +26121,7 @@ describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch fai
     expect(await h.launch(p)).toEqual({ key: p, action: 'resumed' })
 
     expect(calls.slice(0, 3)).toEqual(['spawn', 'get', 'resume'])
-    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: personaInstanceId(p) }])
     expect(h.stub.calls.spawnCalls).toHaveLength(1)
     expect('reuse_finished' in h.stub.calls.spawnCalls[0]!).toBe(false)
     expect(h.reuseSpawns()).toEqual([])
@@ -26646,7 +26647,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
   function scriptReuseSite(h: RecoveryHarness, p: string, site: ReuseSite, ...spawns: Array<Error | undefined>): void {
     site.setup?.(h)
     h.script({
-      spawnQueue: [cannedErr(errInstanceIdCollision()), ...spawns.map((err) => (err === undefined ? cannedOk<StubSpawnResult>({ claude_instance_id: personaInstanceId(p) }) : cannedErr<import('agent-director').SpawnResult>(err)))],
+      spawnQueue: [cannedErr(errInstanceIdCollision()), ...spawns.map((err) => (err === undefined ? cannedOk<StubSpawnResult>({ instance_id: personaInstanceId(p) }) : cannedErr<import('agent-director').SpawnResult>(err)))],
       getResult: harnessRow(h, harnessPersona(h, p), site.row(h, p)),
       ...(site.resumeError === undefined ? {} : { resumeError: site.resumeError() }),
     })
@@ -26918,7 +26919,7 @@ describe('b.jg5 SRJ-706: the sequence registry\'s installer and entries, the sta
     await h.runApproverToStop(p)
     expect(await h.launch(p)).toEqual({ key: p, action: 'spawned' })
     // B's start-pass spawn, P's sequence's reuse spawn, then P's own launch.
-    expect(h.stub.calls.spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+    expect(h.stub.calls.spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([
       [personaInstanceId(b), undefined],
       [personaInstanceId(p), true],
       [personaInstanceId(p), undefined],
@@ -26951,7 +26952,7 @@ describe('b.jg5 SRJ-706: the sequence registry\'s installer and entries, the sta
     const pRun = await startSequenceHeldAtRun(h, p, hold)
     const bRun = await startSequenceHeldAtRun(h, b, hold)
     const pending = cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE })
-    h.script({ statusFn: (params) => (params.claude_instance_id === personaInstanceId(p) ? pending : cannedStatusResult()) })
+    h.script({ statusFn: (params) => (params.instance_id === personaInstanceId(p) ? pending : cannedStatusResult()) })
 
     // Another path's own-row read latches P (SRJ-513).
     await readPersonaRowState(p)
@@ -26964,7 +26965,7 @@ describe('b.jg5 SRJ-706: the sequence registry\'s installer and entries, the sta
     expect(pOutcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED })
     expect(bOutcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED })
     expect(personaCallCounts(h, p)).toEqual(pCalls)
-    expect(h.reuseSpawns().map((reuse) => reuse.claude_instance_id)).toEqual([personaInstanceId(b)])
+    expect(h.reuseSpawns().map((reuse) => reuse.instance_id)).toEqual([personaInstanceId(b)])
   })
 })
 
@@ -27184,9 +27185,9 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
     ['refused', { kind: ROW_REREAD_REFUSED }],
     ['finished', { kind: ROW_REREAD_FINISHED, lastRead: latchRowStateRead(LIVENESS_DEAD_ROW_ENDED) }],
     ['no row', { kind: ROW_REREAD_FINISHED, lastRead: LATCH_ROW_STATE_NO_ROW }],
-    ['pending', { kind: ROW_REREAD_PENDING, row: cannedGetResult({ claude_instance_id: STUB_INSTANCE_ID, state: AGENT_DIRECTOR_PENDING_STATE }), lastRead: latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE) }],
-    ['live', { kind: ROW_REREAD_LIVE, row: cannedGetResult({ claude_instance_id: STUB_INSTANCE_ID, state: 'waiting' }), lastRead: latchRowStateRead('waiting') }],
-    ...UNKNOWN_REREAD_STATES.map(([label, state]) => [`unknown (${label})`, { kind: ROW_REREAD_UNKNOWN, row: cannedGetResult({ claude_instance_id: STUB_INSTANCE_ID, state }), lastRead: latchRowStateRead(state) }] as const),
+    ['pending', { kind: ROW_REREAD_PENDING, row: cannedGetResult({ instance_id: STUB_INSTANCE_ID, state: AGENT_DIRECTOR_PENDING_STATE }), lastRead: latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE) }],
+    ['live', { kind: ROW_REREAD_LIVE, row: cannedGetResult({ instance_id: STUB_INSTANCE_ID, state: 'waiting' }), lastRead: latchRowStateRead('waiting') }],
+    ...UNKNOWN_REREAD_STATES.map(([label, state]) => [`unknown (${label})`, { kind: ROW_REREAD_UNKNOWN, row: cannedGetResult({ instance_id: STUB_INSTANCE_ID, state }), lastRead: latchRowStateRead(state) }] as const),
   ]
 
   /** The decision for each re-read: [no evidence, dead evidence, dead evidence with the sequence barred]. */
@@ -27261,7 +27262,7 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
   // which is neither counted nor posted.
   test.each([...PATHS])('a covered pending row with a launch start (AC 3: held at the dev-channels dialog, its session id kept), the path holding %s: the ladder\'s pending step answers no-op and arms P\'s timer in pending-only mode (b.jg5 SRJ-409); no sequence, kill, delete or launch; nothing counted or posted; its arms equal a direct call of the ladder\'s pending branch on the same row', async (path) => {
     const { h, p, b } = srj105Build()
-    const pendingOf = (key: string) => harnessRow(h, harnessPersona(h, key), { state: AGENT_DIRECTOR_PENDING_STATE, claude_session_id: ENDED_WITH_SESSION.claude_session_id })
+    const pendingOf = (key: string) => harnessRow(h, harnessPersona(h, key), { state: AGENT_DIRECTOR_PENDING_STATE, session_id: ENDED_WITH_SESSION.session_id })
     scriptNotResumable(h, p, path, cannedOk<GetResult>(pendingOf(p)))
     const order = recordCallOrder(h)
 
@@ -27277,7 +27278,7 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
     expectPendingOnlyWatch(h, p)
 
     // B's launch meets the same row at its collision get: the ladder's pending branch, called directly.
-    h.script({ ...collided(h, harnessPersona(h, b), { state: AGENT_DIRECTOR_PENDING_STATE, claude_session_id: ENDED_WITH_SESSION.claude_session_id }), sendKeysError: undefined })
+    h.script({ ...collided(h, harnessPersona(h, b), { state: AGENT_DIRECTOR_PENDING_STATE, session_id: ENDED_WITH_SESSION.session_id }), sendKeysError: undefined })
     const callsBeforeB = callCounts(h)
     expect(await h.launch(b)).toStrictEqual({ key: b, action: 'no-op' })
     expect(armsOf(h, p)).toEqual(armsOf(h, b))
@@ -27594,7 +27595,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
       kills: 1,
     })
     expect(fromResume(order)).toEqual(['resume', 'get', 'kill', 'get', 'findMissing', 'get', 'resume'])
-    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: id }, { claude_instance_id: id }])
+    expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: id }, { instance_id: id }])
     expect([h.reuseSpawns(), h.stub.calls.spawnCalls.length, getFailureCount(p)]).toEqual([[], 1, 0])
     // Nothing armed but the step-6 resume's pending-only watch (b.jg5 SRJ-409).
     expectOnlyPendingRowWatch(h, p)
@@ -28752,11 +28753,11 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(await h.launch(b)).toStrictEqual({ key: b, action: 'resumed' })
     expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_FRESH_RETIRED })
 
-    expect(h.stub.calls.spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+    expect(h.stub.calls.spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([
       [personaInstanceId(b), undefined],
       [personaInstanceId(p), true],
     ])
-    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(b) }])
+    expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: personaInstanceId(b) }])
     expect(h.retiredEntry(b).recorded).toBe(false)
     await h.runApproverToStop(b)
     await h.runApproverToStop(p)
@@ -29409,7 +29410,7 @@ describe('b.jg5 SRJ-1015 (AC 72): the start pass counts each launch result once,
       { key: 'R', action: 'not-brought-up', outcome: 'retrying', failures: [] },
     ])
     expect(startCountsOf(result)).toEqual({ ...NO_START_COUNTS, retrying: 1, notBroughtUp: 2 })
-    expect([spawnCalls.map((params) => params.claude_instance_id), armed]).toEqual([['cscb_L'], ['L']])
+    expect([spawnCalls.map((params) => params.instance_id), armed]).toEqual([['cscb_L'], ['L']])
     const summary = linesWith(errLog, 'startupSessionManager: complete — ')
     expect(summary).toHaveLength(1)
     expect(summary[0]!.endsWith(
@@ -29454,7 +29455,7 @@ describe('b.jg5 SRJ-205 (the E4 gate): the start pass\'s launch pool starts no q
       { key: third, action: NOT_LAUNCHED_FOR_SHUTDOWN },
     ])
     expect(startCountsOf(result)).toEqual({ ...NO_START_COUNTS, succeeded: 1, freshSpawned: 1 })
-    expect(held.calls.map((params) => params.claude_instance_id)).toEqual([personaInstanceId(first)])
+    expect(held.calls.map((params) => params.instance_id)).toEqual([personaInstanceId(first)])
     expect([personaCallCounts(h, second), personaCallCounts(h, third)]).toEqual([{}, {}])
     expect([second, third].map((key) => h.errors.filter((line) => line === notStartedLine(h, key)).length)).toEqual([1, 1])
     expect(h.errors.filter((line) => line === notStartedLine(h, first))).toEqual([])
@@ -29513,7 +29514,7 @@ describe('b.jg5 SRJ-811 (E27 T2): ensureOldLifeWait answers started, already-run
   test('a held id with nothing running: started, before the wait\'s first call; a second ensure while it runs: already-running, with no second chain', async () => {
     const { h, p } = srj105Build()
     holdOldAt(h, PRE_PERSONA_ID, PRE_PERSONA_ID, p)
-    h.script({ getResult: cannedGetResult({ claude_instance_id: PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
+    h.script({ getResult: cannedGetResult({ instance_id: PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
     const hold = holdFindMissing(h.stub.client)
 
     expect([ensureOldLifeWait(PRE_PERSONA_ID), h.stub.callCount()]).toEqual([LIVE_ROW_START_STARTED, 0])
@@ -29563,14 +29564,14 @@ describe('b.jg5 SRJ-811, SRJ-114, SRJ-1512 (E27 T2): buildOldLifeWaitDeps reads 
     const { id, oldKey } = form(h, p, b)
     const row = id === personaInstanceId(p)
       ? cannedGetResult({ liveness_note: provenanceNote }, harnessPersona(h, p), h.home)
-      : cannedGetResult({ claude_instance_id: id, liveness_note: provenanceNote })
+      : cannedGetResult({ instance_id: id, liveness_note: provenanceNote })
     h.script({ getResult: row })
     const deps = buildOldLifeWaitDeps({ target: { instanceId: id, oldKey }, record: createOldLifeWaitRecord(), clock: h.clock, log: () => {} })
 
     const read = await deps.readRow(oldKey, `persona=${oldKey}`)
     deps.armRetry(oldKey, LIVE_ROW_ARM_ENDED)
 
-    expect(h.stub.calls.getCalls).toEqual([{ claude_instance_id: id }])
+    expect(h.stub.calls.getCalls).toEqual([{ instance_id: id }])
     expect(read.kind).toBe(shared ? LIVE_ROW_READ_LATCHED : LIVE_ROW_READ_ROW)
     expect(h.keys.map((key) => h.latch.isLatched(key))).toEqual(h.keys.map((key) => shared && key === p))
     // Only the configured persona's own row answers its latch (SRJ-502, SRJ-513); nothing is armed for the old key (SRJ-1512).
@@ -29641,7 +29642,7 @@ describe('b.jg5 SRJ-303, SRJ-811, SRJ-1011 (E27 T2): what blocks P\'s retry, and
     }, [RETRY_BLOCK_LIVE_ROW_SEQUENCE, false, true]],
     ['a wait runs on a pre-persona row held in P\'s directory (its first run held)', async (h, p, _b, hold) => {
       holdOldAt(h, PRE_PERSONA_ID, PRE_PERSONA_ID, p)
-      h.script({ getResult: cannedGetResult({ claude_instance_id: PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
+      h.script({ getResult: cannedGetResult({ instance_id: PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
       return waitHeldAtRun(h, PRE_PERSONA_ID, hold)
     }, [RETRY_BLOCK_OLD_LIFE_WAIT, true, true]],
     ['a wait runs on P\'s own row (its first run held)', async (h, p, _b, hold) => {
@@ -29651,7 +29652,7 @@ describe('b.jg5 SRJ-303, SRJ-811, SRJ-1011 (E27 T2): what blocks P\'s retry, and
     }, [RETRY_BLOCK_OLD_LIFE_WAIT, true, true]],
     ['a wait runs on a row held in P\'s directory, but P is no longer applied', async (h, p, _b, hold) => {
       holdOldAt(h, PRE_PERSONA_ID, PRE_PERSONA_ID, p)
-      h.script({ getResult: cannedGetResult({ claude_instance_id: PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
+      h.script({ getResult: cannedGetResult({ instance_id: PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
       const started = await waitHeldAtRun(h, PRE_PERSONA_ID, hold)
       h.remove(p)
       return started
@@ -29895,7 +29896,7 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
   function heldAtP(): { h: RecoveryHarness; p: string; b: string; hold: ReturnType<typeof holdFindMissing>; steps: string[] } {
     const { h, p, b } = srj105Build()
     holdOldAt(h, PRE_PERSONA_ID, PRE_PERSONA_ID, p)
-    h.script({ getResult: cannedGetResult({ claude_instance_id: PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
+    h.script({ getResult: cannedGetResult({ instance_id: PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
     const hold = holdFindMissing(h.stub.client)
     const steps: string[] = []
     setPreLaunchTrustPatcher((persona) => {
@@ -29981,7 +29982,7 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
     expect([gateLinesIn(h), h.triggers, h.oldLifeHolds.holdOf(personaInstanceId(p))?.waiting]).toEqual([[], [], []])
 
     holdOldAt(h, PRE_PERSONA_ID, PRE_PERSONA_ID, p)
-    h.script({ getResult: cannedGetResult({ claude_instance_id: PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
+    h.script({ getResult: cannedGetResult({ instance_id: PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
     expect(oldLifeHoldStep(harnessPersona(h, p), 'runRestartWork')).toBe(true)
     await h.driveSequence(hold.entered(1))
 
@@ -30032,7 +30033,7 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
     expect(h.oldLifeHolds.holdOf(personaInstanceId(p))?.waiting).toEqual(applied ? [p] : [])
 
     expect(await reconnectMcpWithCause(b, latchRowStateRead('waiting'))).toEqual({ outcome: 'ok' })
-    expect(h.stub.calls.sendKeysCalls.map((params) => params.claude_instance_id)).toEqual([personaInstanceId(b)])
+    expect(h.stub.calls.sendKeysCalls.map((params) => params.instance_id)).toEqual([personaInstanceId(b)])
   })
 
   // b.jg5 SRJ-810, SRJ-1014: an arm asked for and not made (the controller
@@ -30260,11 +30261,11 @@ interface RowCallInFlight {
 /** Record each `status`, `read-pane` and `send-keys` of persona `key`'s instance from now on, in order, with `isLaunchInFlight(key)` at the call. */
 function recordRowCallsInFlight(h: RecoveryHarness, key: string): RowCallInFlight[] {
   const calls: RowCallInFlight[] = []
-  const client = h.stub.client as unknown as Record<string, (params: { claude_instance_id?: unknown }) => Promise<unknown>>
+  const client = h.stub.client as unknown as Record<string, (params: { instance_id?: unknown }) => Promise<unknown>>
   for (const verb of ['status', 'readPane', 'sendKeys']) {
     const original = client[verb]!
     client[verb] = (params) => {
-      if (params.claude_instance_id === personaInstanceId(key)) calls.push({ verb, inFlight: isLaunchInFlight(key) })
+      if (params.instance_id === personaInstanceId(key)) calls.push({ verb, inFlight: isLaunchInFlight(key) })
       return original.call(client, params)
     }
   }
@@ -30374,7 +30375,7 @@ describe('b.jg5 SRJ-407: each launch call\'s window, and one get after a launch 
       row: row.row?.(h) ?? { state: AGENT_DIRECTOR_PENDING_STATE },
     })
     const getError = row.getError
-    if (getError !== undefined) h.script({ getFn: (params) => (t.window()?.endMs !== undefined && params.claude_instance_id === personaInstanceId(p) ? getError() : undefined) })
+    if (getError !== undefined) h.script({ getFn: (params) => (t.window()?.endMs !== undefined && params.instance_id === personaInstanceId(p) ? getError() : undefined) })
     statusOnTimedRow(h, t)
     const order = recordCallOrder(h)
     const rowCalls = recordRowCallsInFlight(h, p)
@@ -30497,7 +30498,7 @@ describe('b.jg5 SRJ-407: each launch call\'s window, and one get after a launch 
     let stopped: Promise<unknown> | undefined
     h.script({
       getFn: (params) => {
-        if (t.window()?.endMs !== undefined && params.claude_instance_id === personaInstanceId(p)) stopped ??= stop(p)
+        if (t.window()?.endMs !== undefined && params.instance_id === personaInstanceId(p)) stopped ??= stop(p)
         return timedGet(params)
       },
     })
@@ -31154,7 +31155,7 @@ describe('b.jg5 SRJ-410, SRJ-117: the lap\'s read-pane is the shared reader with
     ['the shared reader asked with the option false', (p) => readPersonaOwnPane(p, { ...fullPaneRead(WORKING_READ), allowPending: false }), false],
   ])('%s: one read-pane of P\'s own row with the full-read line count, answered as the pane; allow_pending on the call: %p', async (_label, read, carries) => {
     const { h, p } = srj105Build()
-    h.script({ readPaneResults: [{ pane: IDLE_PANE }] })
+    h.script({ readPaneResults: [cannedReadPaneResult(IDLE_PANE)] })
     const order = recordCallOrder(h)
 
     expect(await read(p)).toStrictEqual({ kind: PANE_READ_PANE, pane: IDLE_PANE })
@@ -31247,7 +31248,7 @@ describe('b.jg5 SRJ-410, SRJ-118: the lap\'s Enter (sendPendingRowLapEnter) is o
   /** Exactly one send-keys, Enter on P's own row with allow_pending and nothing else, and no other call; nothing posted or counted. */
   function expectOneEnterOnly(h: RecoveryHarness, p: string, order: readonly string[]): void {
     expect(order).toEqual(['sendKeys'])
-    expect(h.stub.calls.sendKeysCalls).toStrictEqual([{ claude_instance_id: personaInstanceId(p), text: '', allow_pending: true }])
+    expect(h.stub.calls.sendKeysCalls).toStrictEqual([{ instance_id: personaInstanceId(p), text: '', allow_pending: true }])
     expect(h.notices).toEqual([])
     expect(getFailureCount(p)).toBe(0)
   }
@@ -31637,7 +31638,7 @@ describe('b.jg5 SRJ-412, SRJ-407: the record of CSCB\'s own launch, its set and 
     const windows: Array<LaunchCallWindowRecord | undefined> = []
     const status = h.stub.client.status.bind(h.stub.client)
     h.stub.client.status = async (params) => {
-      if (windows.length === 0 && t.window()?.endMs !== undefined && params.claude_instance_id === personaInstanceId(p)) {
+      if (windows.length === 0 && t.window()?.endMs !== undefined && params.instance_id === personaInstanceId(p)) {
         windows.push(launchCallWindowOf(p))
         await launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_RESUME, lastRead: ENDED_READ })
         windows.push(launchCallWindowOf(p))
@@ -31755,7 +31756,7 @@ describe('b.jg5 SRJ-412, SRJ-407: the record of CSCB\'s own launch, its set and 
     const timed = new Map([p, b].map((key) => [personaInstanceId(key), scriptTimedLaunch(h, key, { verb: 'spawn', reuse: false, takesMs: TIMED_CALL_MS, end: TIMED_LAUNCH_SUCCESS })] as const))
     h.script({
       statusFn: (params) => {
-        const t = timed.get(String(params.claude_instance_id))
+        const t = timed.get(String(params.instance_id))
         return t?.window()?.endMs !== undefined ? t.statusRow() : cannedStatusResult()
       },
     })
@@ -31871,8 +31872,8 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
     expect(h.clock.now() - startedAt).toBe(waits * KILL_RETRY_SPACING_MS)
     expect(h.controller.view(p)?.causes ?? []).toEqual([...armed])
     expect(h.clock.pending()).toHaveLength(armed.length === 0 ? 0 : 1)
-    expect(h.stub.calls.killCalls).toEqual(Array.from({ length: kills }, () => ({ claude_instance_id: id })))
-    expect(h.stub.calls.statusCalls.map((c) => c.claude_instance_id)).toEqual(Array.from({ length: reads }, () => id))
+    expect(h.stub.calls.killCalls).toEqual(Array.from({ length: kills }, () => ({ instance_id: id })))
+    expect(h.stub.calls.statusCalls.map((c) => c.instance_id)).toEqual(Array.from({ length: reads }, () => id))
     expect(h.stub.callCount()).toBe(kills + reads)
     return answer
   }
@@ -32449,7 +32450,7 @@ const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
     launch: RECHECK_CALL_REUSE_SPAWN,
     latch: NOT_THIS_LAUNCH_RECHECK_LATCH,
     recorded: ROW_WAITING,
-    script: (h, p) => ({ ...step1Status(LIVENESS_DEAD_ROW_ENDED), ...finishedRowGet(h, p, { state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: '' }) }),
+    script: (h, p) => ({ ...step1Status(LIVENESS_DEAD_ROW_ENDED), ...finishedRowGet(h, p, { state: LIVENESS_DEAD_ROW_ENDED, session_id: '' }) }),
     before: ['status', 'get'],
     step: RECHECK_STEP_FINISHED_ROW_RETRY,
     call: `${RECHECK_CALL_FINISHED_ROW}:${RECHECK_CALL_REUSE_SPAWN}`,
@@ -32504,7 +32505,7 @@ describe('b.jg5 SRJ-505, SRJ-111, SRJ-112, SRJ-113: each re-check launch goes th
     expect(recheckRoundCalls(order)).toEqual([...site.before, launchVerbAt(site)])
     switch (site.launch) {
       case RECHECK_CALL_PLAIN_SPAWN:
-        expect(h.stub.calls.spawnCalls.map((call) => [call.claude_instance_id, 'reuse_finished' in call])).toEqual([[personaInstanceId(p), false]])
+        expect(h.stub.calls.spawnCalls.map((call) => [call.instance_id, 'reuse_finished' in call])).toEqual([[personaInstanceId(p), false]])
         expect(h.stub.calls.resumeCalls).toEqual([])
         break
       case RECHECK_CALL_REUSE_SPAWN:
@@ -32512,7 +32513,7 @@ describe('b.jg5 SRJ-505, SRJ-111, SRJ-112, SRJ-113: each re-check launch goes th
         expect(h.stub.calls.resumeCalls).toEqual([])
         break
       case RECHECK_CALL_RESUME:
-        expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+        expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: personaInstanceId(p) }])
         expect(h.stub.calls.spawnCalls).toEqual([])
         break
     }
@@ -32881,7 +32882,7 @@ describe('b.jg5 SRJ-506: a re-check retry\'s definite answer is counted by its c
     const id = personaInstanceId(p)
     h.script({
       ...site.script(h, p),
-      statusFn: (params) => (params.claude_instance_id === id && h.stub.calls.resumeCalls.length > 0 ? cannedStatusResult({ state: 'waiting' }) : undefined),
+      statusFn: (params) => (params.instance_id === id && h.stub.calls.resumeCalls.length > 0 ? cannedStatusResult({ state: 'waiting' }) : undefined),
     })
 
     await h.advanceToRecheck()
@@ -33108,7 +33109,7 @@ describe('b.jg5 SRJ-505, SRJ-207, SRJ-810, b.av2 SR-6.4: a re-check retry stoppe
     const asked: string[] = []
     const gate = await arrange(h, p, asked)
     const record = latchForRecheckUnbound(h, p, REUSE_RECHECK_LATCH, ROW_ENDED)
-    h.script({ ...step1Status(LIVENESS_DEAD_ROW_ENDED), getResult: cannedGetResult({ claude_instance_id: PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
+    h.script({ ...step1Status(LIVENESS_DEAD_ROW_ENDED), getResult: cannedGetResult({ instance_id: PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
     const launchesBefore = [h.stub.calls.spawnCalls.length, h.stub.calls.resumeCalls.length]
     const eventsBefore = h.latchEvents.length
     const postsBefore = h.episodeNotices.length
@@ -33945,10 +33946,10 @@ describe('b.jg5 SRJ-1306, SRJ-1401: the forced-launch seams make their one call 
     const forced = await forceLaunch(h, p, row.seam)
 
     expect(order).toEqual([...row.calls])
-    expect(h.stub.calls.resumeCalls).toEqual(row.calls.includes('resume') ? [{ claude_instance_id: personaInstanceId(p) }] : [])
+    expect(h.stub.calls.resumeCalls).toEqual(row.calls.includes('resume') ? [{ instance_id: personaInstanceId(p) }] : [])
     // Every spawn is P's: its reuse (the reuse seam's call, or the reuse after a no-transcript answer), or the plain spawn after ErrSpawnNotFound.
     const spawned = row.calls.includes('spawn')
-    expect(h.stub.calls.spawnCalls).toEqual(spawned ? [row.plainSpawn === true ? expect.objectContaining({ claude_instance_id: personaInstanceId(p) }) : reuseSpawnOf(h, p)] : [])
+    expect(h.stub.calls.spawnCalls).toEqual(spawned ? [row.plainSpawn === true ? expect.objectContaining({ instance_id: personaInstanceId(p) }) : reuseSpawnOf(h, p)] : [])
     expect(h.stub.calls.spawnCalls.filter((call) => 'reuse_finished' in call)).toHaveLength(spawned && row.plainSpawn !== true ? 1 : 0)
     expect(rechecks?.resolves.length).toBe(rechecks === undefined ? undefined : 1)
     const forcedEffects = forcedComparedEffectsOf(h, p)
@@ -33988,7 +33989,7 @@ describe('b.jg5 SRJ-1306, SRJ-1401: the forced-launch seams make their one call 
     const forced = await forceLaunch(h, p, 'resume')
 
     expect(order).toEqual(['resume'])
-    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: personaInstanceId(p) }])
     expect<unknown>(forced).toStrictEqual({
       called: true,
       result: { ...((await sequenceEntryLaunch(LIVE_ROW_LAUNCH_RESUME)(h, b)) as object), key: p },

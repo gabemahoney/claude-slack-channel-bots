@@ -36,7 +36,7 @@
  * - `LIVE_LAUNCH_HOME_PROBE` on fixtures under the case's root, with a fake
  *   real home (one holding `.claude/channels/slack`) passed as the passwd
  *   home: symlinked homes, a symlinked real home, symlinks at and below
- *   `.claude` and `.agent-director` (live, dangling, relative, chained,
+ *   `.claude` and `.config/agent-director` (live, dangling, relative, chained,
  *   through a symlinked parent, looping), a dangling Slack-state symlink,
  *   agent-director entries, clean homes; then with no passwd home, against
  *   the OS temp directory. The fixtures are left unchanged. An entry that
@@ -353,11 +353,11 @@ describe('launchHomeRefusal (recording fake probe)', () => {
       exists: [AD_DIR],
       links: { [CLAUDE]: join(REAL, CLAUDE_DIR) },
     }, true],
-    ['a home whose .agent-director is a symlink into the real home (the derived-path rule wins)', R.derivedPathInRealHome, HOME, REAL, {
+    ['a home whose .config/agent-director is a symlink into the real home (the derived-path rule wins)', R.derivedPathInRealHome, HOME, REAL, {
       exists: [AD_DIR],
       links: { [AD_DIR]: join(REAL, AGENT_DIRECTOR_INSTALL_DIR) },
     }, true],
-    ['a home holding .agent-director', R.holdsAgentDirector, HOME, REAL, { exists: [AD_DIR] }, true],
+    ['a home holding .config/agent-director', R.holdsAgentDirector, HOME, REAL, { exists: [AD_DIR] }, true],
     ['a home holding only the standard install path', R.holdsAgentDirector, HOME, REAL, { exists: [AD_BIN] }, true],
     ['a clean home', undefined, HOME, REAL, {}, true],
     ['a home whose .claude leads outside the real home', undefined, HOME, REAL, { links: { [CLAUDE]: '/data/claude' } }, true],
@@ -401,18 +401,18 @@ describe('launchHomeRefusal (recording fake probe)', () => {
     ['a home whose .claude is the temp directory itself, with no passwd home', R.derivedPathNotUnderTempDir, T_HOME, undefined, {
       links: { [T_CLAUDE]: TEMP },
     }, true],
-    ['a home holding .agent-director, whose .claude leads out of the temp directory, with no passwd home (the derived-path rule wins)', R.derivedPathNotUnderTempDir, T_HOME, undefined, {
+    ['a home holding .config/agent-director, whose .claude leads out of the temp directory, with no passwd home (the derived-path rule wins)', R.derivedPathNotUnderTempDir, T_HOME, undefined, {
       exists: [T_AD_DIR],
       links: { [T_CLAUDE]: '/data/claude' },
     }, true],
-    ['a home under the temp directory holding .agent-director, with no passwd home', R.holdsAgentDirector, T_HOME, undefined, { exists: [T_AD_DIR] }, true],
+    ['a home under the temp directory holding .config/agent-director, with no passwd home', R.holdsAgentDirector, T_HOME, undefined, { exists: [T_AD_DIR] }, true],
     // The documented limit: a temp directory that is an ancestor of a home other than the root lets that home through the temp-directory rules.
     ['the would-be real home, empty, under the temp directory /home, with no passwd home (accepted)', undefined, REAL, undefined, { tempDir: '/home' }, true],
     ['the would-be real home holding Slack state, under the temp directory /home, with no passwd home', R.holdsSlackState, REAL, undefined, {
       exists: [join(REAL, PRELOAD_STATE_DIR_PATH)],
       tempDir: '/home',
     }, true],
-    ['the would-be real home holding .agent-director, under the temp directory /home, with no passwd home', R.holdsAgentDirector, REAL, undefined, {
+    ['the would-be real home holding .config/agent-director, under the temp directory /home, with no passwd home', R.holdsAgentDirector, REAL, undefined, {
       exists: [join(REAL, AGENT_DIRECTOR_INSTALL_DIR)],
       tempDir: '/home',
     }, true],
@@ -539,16 +539,16 @@ describe('launchHomeRefusal with LIVE_LAUNCH_HOME_PROBE (fixtures under the root
       linkUnder(join('home', CLAUDE_DIR, 'projects-b'), 'projects')
       return { launchHome: homeWithLink(join(CLAUDE_DIR, 'projects'), 'projects-b') }
     }],
-    ['a home whose .agent-director is a symlink loop', R.holdsAgentDirector, () => {
-      linkUnder(join('home', '.agent-director-b'), AGENT_DIRECTOR_INSTALL_DIR)
-      return { launchHome: homeWithLink(AGENT_DIRECTOR_INSTALL_DIR, '.agent-director-b') }
+    ['a home whose .config/agent-director is a symlink loop', R.holdsAgentDirector, () => {
+      linkUnder(join('home', '.config/agent-director-b'), AGENT_DIRECTOR_INSTALL_DIR)
+      return { launchHome: homeWithLink(AGENT_DIRECTOR_INSTALL_DIR, '.config/agent-director-b') }
     }],
-    ['a home holding a .agent-director directory', R.holdsAgentDirector, () => {
+    ['a home holding a .config/agent-director directory', R.holdsAgentDirector, () => {
       const home = dirUnder('home')
-      mkdirSync(join(home, AGENT_DIRECTOR_INSTALL_DIR))
+      mkdirSync(join(home, AGENT_DIRECTOR_INSTALL_DIR), { recursive: true })
       return { launchHome: home }
     }],
-    ['a home holding a dangling .agent-director symlink', R.holdsAgentDirector, () => ({
+    ['a home holding a dangling .config/agent-director symlink', R.holdsAgentDirector, () => ({
       launchHome: homeWithLink(AGENT_DIRECTOR_INSTALL_DIR, join(root, 'no-such-install')),
     })],
     ['an empty home', undefined, () => ({ launchHome: dirUnder('home') })],
@@ -590,9 +590,9 @@ describe('launchHomeRefusal with LIVE_LAUNCH_HOME_PROBE (fixtures under the root
     ]),
     ['a home whose .claude is a dangling symlink outside the OS temp directory', R.derivedPathNotUnderTempDir, () => homeWithLink(CLAUDE_DIR, join(outsideTemp(), CLAUDE_DIR))],
     ['a home whose .claude/projects is a symlink to the OS temp directory itself', R.derivedPathNotUnderTempDir, () => homeWithLink(join(CLAUDE_DIR, 'projects'), osTempDir())],
-    ['a home holding a .agent-director directory', R.holdsAgentDirector, () => {
+    ['a home holding a .config/agent-director directory', R.holdsAgentDirector, () => {
       const home = dirUnder('home')
-      mkdirSync(join(home, AGENT_DIRECTOR_INSTALL_DIR))
+      mkdirSync(join(home, AGENT_DIRECTOR_INSTALL_DIR), { recursive: true })
       return home
     }],
   ]
@@ -605,7 +605,7 @@ describe('launchHomeRefusal with LIVE_LAUNCH_HOME_PROBE (fixtures under the root
     expect(treeSnapshot(root)).toEqual(before)
   })
 
-  // .agent-director and the paths under it included: the derived-path rule wins over the install rule.
+  // .config/agent-director and the paths under it included: the derived-path rule wins over the install rule.
   test.each(LINKABLE_DERIVED_PATHS)('a home whose %s is a dangling symlink into the fake real home: derivedPathInRealHome', (path) => {
     const real = fakeRealHome()
     const home = homeWithLink(path, join(real, 'no-such-entry'))

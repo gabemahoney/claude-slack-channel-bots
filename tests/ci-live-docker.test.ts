@@ -38,7 +38,7 @@
  *   staged by its real path; a given path that does not qualify is refused
  *   with a reason naming the option, never replaced by a host binary. With
  *   none given it is the host's own, found as its client finds it
- *   (`~/.agent-director/bin` first, then PATH in order), by real path, and
+ *   (`~/.config/agent-director/bin` first, then PATH in order), by real path, and
  *   only a regular executable file (`lib/agent-director-binary.ts`). The
  *   runner only reads it and copies it into a fresh temp dir under the OS
  *   temp dir, the build's named context, removed in a finally: it never runs
@@ -846,7 +846,7 @@ describe('RunLock', () => {
 // ---------------------------------------------------------------------------
 
 describe('hostAgentDirectorBinary', () => {
-  const HOME_BIN = `${HOME}/.agent-director/bin/agent-director`
+  const HOME_BIN = `${HOME}/.config/agent-director/bin/agent-director`
   const onPath = (...dirs: string[]) => dirs.join(delimiter)
 
   /**
@@ -1016,13 +1016,13 @@ describe('hostAgentDirectorBinary', () => {
       const path = onPath(join(root, 'noexec'), join(root, 'dir'), join(root, 'linked'))
       expect(hostAgentDirectorBinary(home, path)).toBe(real)
       expect(hostAgentDirectorBinary(home, onPath(join(root, 'noexec'), join(root, 'dir')))).toBeNull()
-      const homeBin = file('home/.agent-director/bin/agent-director', 0o700)
+      const homeBin = file('home/.config/agent-director/bin/agent-director', 0o700)
       expect(hostAgentDirectorBinary(home, path)).toBe(homeBin)
     })
 
     /** A temp home install and a temp PATH directory (passed as an argument, never on the process PATH), each holding an executable agent-director. */
     function searchable(): { home: string; path: string } {
-      file('home/.agent-director/bin/agent-director', 0o755)
+      file('home/.config/agent-director/bin/agent-director', 0o755)
       file('path/agent-director', 0o755)
       return { home: join(root, 'home'), path: onPath(join(root, 'path')) }
     }
@@ -1648,7 +1648,7 @@ describe('runner wiring (source audit of ci-live/)', () => {
     // Its one agent-director command is the fallback deny, behind the plan's guard, through the checks' helpers (ctx.container).
     const guard = code(join('checks', 'prompt-guard.ts'))
     expect(indicesOf(/agent-director decide --/g, guard).length).toBe(1)
-    expect(guard).toContain('return `agent-director decide --claude-instance-id ${q(p.instanceId)} --decision deny --request-token ${q(p.token)} --reason ${q(PROMPT_GUARD_DENY_REASON)}`')
+    expect(guard).toContain('return `agent-director decide --instance-id ${q(p.instanceId)} --decision deny --request-token ${q(p.token)} --reason ${q(PROMPT_GUARD_DENY_REASON)}`')
     expect(guard).toContain('const r = await guarded(target, denyScript(p))')
     expect(guard).not.toMatch(/\bspawn\b|\bBun\.|\.docker\b|tmux|\.container\.(sh|exec|writeFile)\(/)
   })

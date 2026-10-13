@@ -4,7 +4,7 @@
  * Every tick, lists spawns in check_permission with the cscb service label
  * and reconciles CSCB's live Slack-prompt state against agent-director's
  * plural `permission_requests` projection. The pending map is keyed on a
- * composite of (claude_instance_id, request_token) so concurrent open
+ * composite of (instance_id, request_token) so concurrent open
  * requests on the same spawn each get their own Slack prompt without
  * colliding.
  *
@@ -35,7 +35,7 @@
  *   1. list({state:['check_permission'], label:['service=cscb']}).
  *   2. For each row, resolve the persona from its `persona` label; a row with
  *      no label, or one naming no applied persona, is logged and skipped.
- *      Then get({claude_instance_id}). When the plural projection is absent
+ *      Then get({instance_id}). When the plural projection is absent
  *      (undefined/null), log non-conformance and skip — do not mutate state
  *      for that row, and exclude that spawn's live entries from the
  *      newly-closed sweep this tick.
@@ -178,32 +178,9 @@ import type {
 // Wire-shape types (local — mirrors the `^0.6.0` wire)
 // ---------------------------------------------------------------------------
 
-/**
- * A single open permission_requests row from agent-director's plural
- * projection (`^0.6.0`+). CSCB treats `request_token` as opaque (no parsing,
- * no validation of the bytes themselves).
- */
-export interface PermissionRequestRow {
-  /** Opaque per-request token minted by agent-director. */
-  request_token: string
-  /** AD autoincrement PK; retained for logging only. */
-  request_id: number
-  tool_name: string
-  /** Raw JSON string per the typed contract. */
-  tool_input: string
-  requested_at: string
-}
-
-/**
- * Local view of the `^0.6.0` `GetResult`. The locked `0.5.6` types still
- * carry singular `permission_request`; `^0.6.0` replaces it with the plural
- * `permission_requests`. We strip the singular field via Omit and re-add the
- * plural one so we never accidentally read the old shape until the lockfile
- * catches up.
- */
-export interface GetResultWithPermissionRequests extends Omit<ADGetResult, 'permission_request'> {
-  permission_requests?: PermissionRequestRow[] | null
-}
+/** Released client's required plural projection, including delivery facts. */
+export type PermissionRequestRow = ADGetResult['permission_requests'][number]
+export type GetResultWithPermissionRequests = ADGetResult
 
 // ---------------------------------------------------------------------------
 // Live-permission state
@@ -211,7 +188,11 @@ export interface GetResultWithPermissionRequests extends Omit<ADGetResult, 'perm
 
 /** State CSCB tracks for each open Slack permission prompt. */
 export interface LivePermission {
-  claudeInstanceId: string
+  /** Whether the fallback notice has already replaced this prompt. */
+  relayFallbackShown?: boolean
+  /** A recorded click verdict still awaiting the relay acknowledgement. */
+  awaitingDelivery?: boolean
+  instanceId: string
   /** Opaque per-request token. */
   requestToken: string
   /** Key of the persona whose client posted the prompt; closing updates go through it. */
@@ -238,11 +219,11 @@ type PayloadRejection = { stage: 'fallback'; code: string } | { stage: 'skipped'
 
 /**
  * Deterministic composite key for the pending map. The null byte
- * separator is chosen because neither claude_instance_id nor a UUIDv4
+ * separator is chosen because neither instance_id nor a UUIDv4
  * token can contain \x00.
  */
-export function makeCompositeKey(claudeInstanceId: string, requestToken: string): string {
-  return `${claudeInstanceId}\x00${requestToken}`
+export function makeCompositeKey(instanceId: string, requestToken: string): string {
+  return `${instanceId}\x00${requestToken}`
 }
 
 /** The Slack surface the poller uses on a persona's client: posts, updates and DM opens. */
@@ -470,7 +451,7 @@ interface PerRequestRecord {
 function perRequestRecords(): PerRequestRecord[] {
   return [unpostedPrompts, payloadRejections, failedRequests, failedClosings]
 }
-/** claude_instance_id → wedge-detector state (b.fae F4). */
+/** instance_id → wedge-detector state (b.fae F4). */
 const wedgeStates = new Map<string, WedgeState>()
 /** Keys of the personas in a not-up skip episode, for its start and end lines (b.av2 SR-6.4). */
 const notUpSkipping = new Set<string>()
@@ -496,17 +477,17 @@ let defaultDestinationHold: PersonaDestinationHold | null = null
 // Module-state accessors (used by the click handler)
 // ---------------------------------------------------------------------------
 
-/** Return the live entry for a (claude_instance_id, request_token) pair. */
+/** Return the live entry for a (instance_id, request_token) pair. */
 export function getLivePermission(
-  claudeInstanceId: string,
+  instanceId: string,
   requestToken: string,
 ): LivePermission | undefined {
-  return livePermissions.get(makeCompositeKey(claudeInstanceId, requestToken))
+  return livePermissions.get(makeCompositeKey(instanceId, requestToken))
 }
 
 /** Mark the entry as handled — call from the click handler after its chat.update succeeds. */
-export function markHandled(claudeInstanceId: string, requestToken: string): boolean {
-  const entry = livePermissions.get(makeCompositeKey(claudeInstanceId, requestToken))
+export function markHandled(instanceId: string, requestToken: string): boolean {
+  const entry = livePermissions.get(makeCompositeKey(instanceId, requestToken))
   if (!entry) return false
   entry.handled = true
   return true
@@ -516,8 +497,8 @@ export function markHandled(claudeInstanceId: string, requestToken: string): boo
  * Drop the entry, and its closing-failure record (b.zmq) — the tick is the
  * sole owner of clearing entries.
  */
-export function dropPermission(claudeInstanceId: string, requestToken: string): void {
-  const compositeKey = makeCompositeKey(claudeInstanceId, requestToken)
+export function dropPermission(instanceId: string, requestToken: string): void {
+  const compositeKey = makeCompositeKey(instanceId, requestToken)
   livePermissions.delete(compositeKey)
   failedClosings.delete(compositeKey)
 }
@@ -533,11 +514,11 @@ export function dropPermission(claudeInstanceId: string, requestToken: string): 
  */
 export function forgetPersonaPrompts(key: string): number {
   const instanceId = personaInstanceId(key)
-  const ownedBy = (personaKey: string, claudeInstanceId: string) =>
-    personaKey === key || claudeInstanceId === instanceId
+  const ownedBy = (personaKey: string, rowInstanceId: string) =>
+    personaKey === key || rowInstanceId === instanceId
   let dropped = 0
   for (const [compositeKey, entry] of [...livePermissions]) {
-    if (!ownedBy(entry.personaKey, entry.claudeInstanceId)) continue
+    if (!ownedBy(entry.personaKey, entry.instanceId)) continue
     livePermissions.delete(compositeKey)
     dropped++
   }
@@ -548,8 +529,8 @@ export function forgetPersonaPrompts(key: string): number {
     }
   }
   failedRows.delete(instanceId)
-  for (const [claudeInstanceId, state] of [...wedgeStates]) {
-    if (ownedBy(state.personaKey, claudeInstanceId)) wedgeStates.delete(claudeInstanceId)
+  for (const [instanceId, state] of [...wedgeStates]) {
+    if (ownedBy(state.personaKey, instanceId)) wedgeStates.delete(instanceId)
   }
   notUpSkipping.delete(key)
   if (dropped > 0) {
@@ -653,7 +634,7 @@ function promptSectionText(toolName: string, content: string, max: number): stri
 export function buildPermissionBlocks(
   toolName: string,
   toolInput: Record<string, unknown>,
-  claudeInstanceId: string,
+  instanceId: string,
   requestToken: string,
 ): unknown[] {
   const field = toolName === 'Bash' ? 'command' : toolName === 'Edit' || toolName === 'Write' ? 'file_path' : undefined
@@ -661,7 +642,7 @@ export function buildPermissionBlocks(
   const section = value !== undefined && value !== null
     ? promptSectionText(toolName, String(value), Number.POSITIVE_INFINITY)
     : promptSectionText(toolName, JSON.stringify(toolInput), PROMPT_JSON_SUMMARY_MAX)
-  return permissionPromptBlocks(section, claudeInstanceId, requestToken)
+  return permissionPromptBlocks(section, instanceId, requestToken)
 }
 
 /**
@@ -673,16 +654,16 @@ export function buildPermissionBlocks(
 export function buildFallbackPermissionBlocks(
   toolName: string,
   code: string,
-  claudeInstanceId: string,
+  instanceId: string,
   requestToken: string,
 ): unknown[] {
   const section = `🤖🛠️ *${promptToolName(toolName)}*\n` +
     `_The tool input is not shown: Slack rejected the full prompt (${safeFailureCode(code)})._`
-  return permissionPromptBlocks(section, claudeInstanceId, requestToken)
+  return permissionPromptBlocks(section, instanceId, requestToken)
 }
 
 /** The prompt's blocks: the section with `sectionText`, then the Allow and Deny buttons. */
-function permissionPromptBlocks(sectionText: string, claudeInstanceId: string, requestToken: string): unknown[] {
+function permissionPromptBlocks(sectionText: string, instanceId: string, requestToken: string): unknown[] {
   return [
     {
       type: 'section',
@@ -695,13 +676,13 @@ function permissionPromptBlocks(sectionText: string, claudeInstanceId: string, r
           type: 'button',
           text: { type: 'plain_text', text: 'Allow' },
           style: 'primary',
-          action_id: encodePermissionActionId('allow', claudeInstanceId, requestToken),
+          action_id: encodePermissionActionId('allow', instanceId, requestToken),
         },
         {
           type: 'button',
           text: { type: 'plain_text', text: 'Deny' },
           style: 'danger',
-          action_id: encodePermissionActionId('deny', claudeInstanceId, requestToken),
+          action_id: encodePermissionActionId('deny', instanceId, requestToken),
         },
       ],
     },
@@ -739,42 +720,42 @@ function logFailureSafely(deps: PollerDeps, line: string): void {
 // `failureTail` is `describeDestinationFailure`'s ` (reason=<reason>): …`.
 
 /** A throw while handling one open request: its prompt built, posted or trailed. Pure. */
-export function buildPromptFailedLine(claudeInstanceId: string, requestToken: string, description: string): string {
-  return `[slack] permission-poller: prompt for ${claudeInstanceId} (request_token=${requestToken}) failed — ` +
+export function buildPromptFailedLine(instanceId: string, requestToken: string, description: string): string {
+  return `[slack] permission-poller: prompt for ${instanceId} (request_token=${requestToken}) failed — ` +
     `the tick goes on; a later tick tries it again unless it was posted: ${description}`
 }
 
 /** A throw while handling one listed row outside its requests. Pure. */
-export function buildSpawnFailedLine(claudeInstanceId: string, description: string): string {
-  return `[slack] permission-poller: spawn ${claudeInstanceId} failed — the tick goes on, ` +
+export function buildSpawnFailedLine(instanceId: string, description: string): string {
+  return `[slack] permission-poller: spawn ${instanceId} failed — the tick goes on, ` +
     `its tracked prompts and stuck-prompt state kept as if not read this tick: ${description}`
 }
 
 /** A throw while closing one tracked entry. Pure. */
-export function buildClosingFailedLine(claudeInstanceId: string, requestToken: string, description: string): string {
-  return `[slack] permission-poller: closing prompt for ${claudeInstanceId} token=${requestToken} failed — ` +
+export function buildClosingFailedLine(instanceId: string, requestToken: string, description: string): string {
+  return `[slack] permission-poller: closing prompt for ${instanceId} token=${requestToken} failed — ` +
     `kept for the next tick, the tick goes on: ${description}`
 }
 
 /** Slack rejected the full prompt's message (a payload error); the short prompt is posted instead. Pure. */
 export function buildPromptRejectedLine(
   step: DestinationStep,
-  claudeInstanceId: string,
+  instanceId: string,
   requestToken: string,
   failureTail: string,
 ): string {
-  return `[slack] permission-poller: ${step} failed for ${claudeInstanceId} token=${requestToken} ` +
+  return `[slack] permission-poller: ${step} failed for ${instanceId} token=${requestToken} ` +
     `(the prompt's message was rejected; a short prompt naming the tool is posted instead)${failureTail}`
 }
 
 /** Slack rejected the short prompt's message too; nothing more is posted for the request. Pure. */
 export function buildFallbackPromptRejectedLine(
   step: DestinationStep,
-  claudeInstanceId: string,
+  instanceId: string,
   requestToken: string,
   failureTail: string,
 ): string {
-  return `[slack] permission-poller: ${step} failed for ${claudeInstanceId} token=${requestToken} ` +
+  return `[slack] permission-poller: ${step} failed for ${instanceId} token=${requestToken} ` +
     `(the short prompt's message was rejected too; nothing more is posted for this request)${failureTail}`
 }
 
@@ -820,13 +801,13 @@ function destinationHoldFor(deps: PollerDeps): PersonaDestinationHold {
 function emitRowDecision(
   deps: PollerDeps,
   action: RowDecisionAction,
-  claudeInstanceId: string,
+  instanceId: string,
   requestToken: string | undefined,
 ): void {
   const emit = deps.emitTrail ?? defaultEmitTrail
   const event: Omit<TrailEventBase, 'ts'> & { [extra: string]: unknown } = {
     event: 'cscb.poller.row_decision',
-    claude_instance_id: claudeInstanceId,
+    instance_id: instanceId,
     action,
   }
   if (requestToken !== undefined) event.request_token = requestToken
@@ -844,25 +825,25 @@ function emitRowDecision(
  * offered: AD's relay guard hard-rejects send-keys whenever relay_mode=on &&
  * state=check_permission, with no open-row exemption.
  */
-export function buildWedgeWarningText(persona: Pick<Persona, 'name' | 'key'>, claudeInstanceId: string): string {
-  return formatPersonaNotice(persona, buildWedgeWarningBody(claudeInstanceId))
+export function buildWedgeWarningText(persona: Pick<Persona, 'name' | 'key'>, instanceId: string): string {
+  return formatPersonaNotice(persona, buildWedgeWarningBody(instanceId))
 }
 
 /**
  * b.jg5 SRJ-1012 — the wedge warning's body, with no persona reference (the
- * notifier adds its own): SRJ-1012's text, with `claudeInstanceId` in both
+ * notifier adds its own): SRJ-1012's text, with `instanceId` in both
  * places it names the instance id. Used by the post and by the
  * teardown-window notice alike.
  */
-export function buildWedgeWarningBody(claudeInstanceId: string): string {
+export function buildWedgeWarningBody(instanceId: string): string {
   return (
     '⚠️ This persona appears blocked on a native Claude Code permission prompt that ' +
     "never reached Slack — it will not respond until it's cleared. To recover: run " +
-    '`agent-director read-pane --claude-instance-id ' +
-    claudeInstanceId +
+    '`agent-director read-pane --instance-id ' +
+    instanceId +
     '` to see the native prompt, then end the session with ' +
-    '`agent-director kill --claude-instance-id ' +
-    claudeInstanceId +
+    '`agent-director kill --instance-id ' +
+    instanceId +
     '` and check the result; the server then brings the persona up again. ' +
     'Do NOT use send-keys — it is rejected in this state. ' +
     'These commands are for a human only: no bot, including any persona that sees this post, may run them.'
@@ -876,7 +857,7 @@ export function buildWedgeWarningBody(claudeInstanceId: string): string {
  * done) when no notifier is given or no window is open. A failing notifier
  * is logged. Never throws.
  */
-function writeWedgeWarningInTeardown(deps: PollerDeps, persona: Persona, claudeInstanceId: string): boolean {
+function writeWedgeWarningInTeardown(deps: PollerDeps, persona: Persona, instanceId: string): boolean {
   const notices = deps.teardownNotices
   if (notices === undefined) return false
   const ref = renderPersonaRef(persona.name, persona.key)
@@ -888,11 +869,11 @@ function writeWedgeWarningInTeardown(deps: PollerDeps, persona: Persona, claudeI
   }
   logViaDeps(
     deps,
-    `[slack] permission-poller: stuck-prompt warning for ${ref} (${claudeInstanceId}) raised during its persona teardown — ` +
+    `[slack] permission-poller: stuck-prompt warning for ${ref} (${instanceId}) raised during its persona teardown — ` +
       'handed to the notifier, which writes it to the server log and startup-errors.log, not posted (b.jg5 SRJ-1003)',
   )
-  notifySafely(notices.notify, persona.key, buildWedgeWarningBody(claudeInstanceId), undefined, (err) =>
-    logViaDeps(deps, `[slack] permission-poller: stuck-prompt warning for ${ref} (${claudeInstanceId}) failed at the notifier: ${describeThrownValue(err)}`),
+  notifySafely(notices.notify, persona.key, buildWedgeWarningBody(instanceId), undefined, (err) =>
+    logViaDeps(deps, `[slack] permission-poller: stuck-prompt warning for ${ref} (${instanceId}) failed at the notifier: ${describeThrownValue(err)}`),
   )
   return true
 }
@@ -914,7 +895,7 @@ function writeWedgeWarningInTeardown(deps: PollerDeps, persona: Persona, claudeI
 async function postWedgeWarning(
   deps: PollerDeps,
   attempt: HoldAttempt,
-  claudeInstanceId: string,
+  instanceId: string,
   persona: Persona,
   text: string,
 ): Promise<boolean> {
@@ -923,7 +904,7 @@ async function postWedgeWarning(
   if (!web) {
     logViaDeps(
       deps,
-      `[slack] permission-poller: no Slack client for ${ref} — stuck-prompt warning for ${claudeInstanceId} ` +
+      `[slack] permission-poller: no Slack client for ${ref} — stuck-prompt warning for ${instanceId} ` +
         'not posted; retrying on a later tick',
     )
     return false
@@ -934,7 +915,7 @@ async function postWedgeWarning(
   if (result.outcome === 'posted') {
     emit({
       event: 'cscb.poller.wedge_detected',
-      claude_instance_id: claudeInstanceId,
+      instance_id: instanceId,
       channel: result.channelId,
       text,
       ok: true,
@@ -947,13 +928,13 @@ async function postWedgeWarning(
   if (!isDestinationFailure(result)) {
     logViaDeps(
       deps,
-      `[slack] permission-poller: wedge warning postMessage failed for ${ref} (${claudeInstanceId})` +
+      `[slack] permission-poller: wedge warning postMessage failed for ${ref} (${instanceId})` +
         describeDestinationFailure(result),
     )
   }
   const event: Omit<TrailEventBase, 'ts'> & { [extra: string]: unknown } = {
     event: 'cscb.poller.wedge_detected',
-    claude_instance_id: claudeInstanceId,
+    instance_id: instanceId,
     text,
     ok: false,
     error: safeFailureCode(result.code),
@@ -982,14 +963,14 @@ async function postWedgeWarning(
  */
 async function observeWedgeCandidate(
   deps: PollerDeps,
-  claudeInstanceId: string,
+  instanceId: string,
   persona: Persona,
 ): Promise<void> {
   const k = wedgeTripTicks(deps.intervalMs)
-  let state = wedgeStates.get(claudeInstanceId)
+  let state = wedgeStates.get(instanceId)
   if (!state) {
     state = { personaKey: persona.key, emptyTicks: 0, warningFired: false, lastWarnAttemptTicks: 0 }
-    wedgeStates.set(claudeInstanceId, state)
+    wedgeStates.set(instanceId, state)
   }
   state.emptyTicks++
   if (state.emptyTicks < k || state.warningFired) return
@@ -1006,11 +987,11 @@ async function observeWedgeCandidate(
   }
   // b.jg5 SRJ-1003: inside the persona's teardown window the warning is a
   // teardown notice, written once and latched as delivered.
-  if (writeWedgeWarningInTeardown(deps, persona, claudeInstanceId)) {
+  if (writeWedgeWarningInTeardown(deps, persona, instanceId)) {
     state.warningFired = true
     return
   }
-  const text = buildWedgeWarningText(persona, claudeInstanceId)
+  const text = buildWedgeWarningText(persona, instanceId)
   const attempt = destinationHoldFor(deps).begin(persona.key)
   if (!attempt) return
   // The attempt always ends, even on a throw (a no-op after its post), so a
@@ -1019,9 +1000,9 @@ async function observeWedgeCandidate(
     state.lastWarnAttemptTicks = state.emptyTicks
     logViaDeps(
       deps,
-      `[slack] permission-poller: spawn ${claudeInstanceId} for ${renderPersonaRef(persona.name, persona.key)} wedged in check_permission with zero open rows for ${state.emptyTicks} ticks (~${Math.round((state.emptyTicks * deps.intervalMs) / 1000)}s) — sending one-shot warning`,
+      `[slack] permission-poller: spawn ${instanceId} for ${renderPersonaRef(persona.name, persona.key)} wedged in check_permission with zero open rows for ${state.emptyTicks} ticks (~${Math.round((state.emptyTicks * deps.intervalMs) / 1000)}s) — sending one-shot warning`,
     )
-    const warned = await postWedgeWarning(deps, attempt, claudeInstanceId, persona, text)
+    const warned = await postWedgeWarning(deps, attempt, instanceId, persona, text)
     // b.fae F3: latch only on success; a failed post leaves warningFired false so
     // a subsequent tick retries and exactly one message lands on recovery.
     if (warned) state.warningFired = true
@@ -1112,8 +1093,8 @@ async function runTick(deps: PollerDeps): Promise<void> {
           // The spawn's requests may still be open in agent-director: exempt its
           // live entries from the closing sweep and keep its wedge state, as for
           // any other spawn not read this tick.
-          nonConformingInstanceIds.add(row.claude_instance_id)
-          wedgeSkippedThisTick.add(row.claude_instance_id)
+          nonConformingInstanceIds.add(row.instance_id)
+          wedgeSkippedThisTick.add(row.instance_id)
           continue
         }
         if (resolved.kind === 'no_label') continue
@@ -1129,8 +1110,8 @@ async function runTick(deps: PollerDeps): Promise<void> {
             return true
           }
           logRowNotApplied(deps, row, persona.key)
-          nonConformingInstanceIds.add(row.claude_instance_id)
-          wedgeSkippedThisTick.add(row.claude_instance_id)
+          nonConformingInstanceIds.add(row.instance_id)
+          wedgeSkippedThisTick.add(row.instance_id)
           return false
         }
         if (!deps.isPersonaUp(persona.key)) {
@@ -1138,8 +1119,8 @@ async function runTick(deps: PollerDeps): Promise<void> {
           // not up; its requests stay open, so hold its live entries and wedge
           // state exactly as for a spawn that could not be read this tick.
           noteNotUpSkip(deps, persona)
-          nonConformingInstanceIds.add(row.claude_instance_id)
-          wedgeSkippedThisTick.add(row.claude_instance_id)
+          nonConformingInstanceIds.add(row.instance_id)
+          wedgeSkippedThisTick.add(row.instance_id)
           continue
         }
 
@@ -1152,7 +1133,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
         // no retired-key entry (SRJ-807); they change nothing.
         try {
           got = (await withOutageDetection(persona.key, undefined, 'get', () =>
-            client.get({ claude_instance_id: row.claude_instance_id })
+            client.get({ instance_id: row.instance_id })
           )) as unknown as GetResultWithPermissionRequests
         } catch (err) {
           // ErrSpawnNotFound is a POSITIVE observation the spawn is gone — it left
@@ -1160,23 +1141,23 @@ async function runTick(deps: PollerDeps): Promise<void> {
           // exempt). Every other error is a transient read failure: exempt the
           // spawn from re-arming so its counter survives the flaky tick.
           if (isAdErrorInstance(err, ErrSpawnNotFound)) continue
-          wedgeSkippedThisTick.add(row.claude_instance_id)
+          wedgeSkippedThisTick.add(row.instance_id)
           if (isAdErrorInstance(err, ErrSystemInstallDisappeared) || classifyAdError(err).errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
             // Outage flag raised; skip per-event log.
             continue
           }
-          logViaDeps(deps, `[slack] permission-poller: get failed for ${row.claude_instance_id}: ${describeAgentDirectorFailure(err)}`)
+          logViaDeps(deps, `[slack] permission-poller: get failed for ${row.instance_id}: ${describeAgentDirectorFailure(err)}`)
           continue
         }
 
         if (got.permission_requests === null || got.permission_requests === undefined) {
-          logViaDeps(deps, `[slack] permission-poller: non-conforming open-rows response for ${row.claude_instance_id} — skipping`)
-          nonConformingInstanceIds.add(row.claude_instance_id)
+          logViaDeps(deps, `[slack] permission-poller: non-conforming open-rows response for ${row.instance_id} — skipping`)
+          nonConformingInstanceIds.add(row.instance_id)
           // b.fae F4 follow-up: a non-conforming response is a read we could not
           // trust, not a positive non-wedged observation — exempt from re-arming.
-          wedgeSkippedThisTick.add(row.claude_instance_id)
+          wedgeSkippedThisTick.add(row.instance_id)
           // SR-V-2.3: request_token omitted (no row was readable) per SR-V-1.1.
-          emitRowDecision(deps, 'non_conforming_skipped', row.claude_instance_id, undefined)
+          emitRowDecision(deps, 'non_conforming_skipped', row.instance_id, undefined)
           continue
         }
 
@@ -1187,19 +1168,23 @@ async function runTick(deps: PollerDeps): Promise<void> {
         // will be re-armed by reconcileWedgeStates below.
         if (got.permission_requests.length === 0) {
           if (!reResolve()) continue
-          wedgeObservedEmpty.add(row.claude_instance_id)
-          await observeWedgeCandidate(deps, row.claude_instance_id, persona)
+          wedgeObservedEmpty.add(row.instance_id)
+          await observeWedgeCandidate(deps, row.instance_id, persona)
         }
 
         for (const perm of got.permission_requests) {
-          const key = makeCompositeKey(row.claude_instance_id, perm.request_token)
+          const key = makeCompositeKey(row.instance_id, perm.request_token)
           seenComposite.add(key)
           // b.zmq: a throw while handling this request is its own; the row's
           // other requests go on. The key is already observed, so the request
           // is not swept as closed.
           try {
-            if (livePermissions.has(key)) {
-              emitRowDecision(deps, 'already_tracked', row.claude_instance_id, perm.request_token)
+            const tracked = livePermissions.get(key)
+            if (tracked && perm.delivery === 'fallen_back' && !tracked.relayFallbackShown) {
+              tracked.relayFallbackShown = await renderClosureUpdate(deps, tracked, 'relay_fallen_back')
+            }
+            if (tracked) {
+              emitRowDecision(deps, 'already_tracked', row.instance_id, perm.request_token)
               continue
             }
             if (!reResolve()) break
@@ -1209,19 +1194,19 @@ async function runTick(deps: PollerDeps): Promise<void> {
               deps,
               failedRequests,
               key,
-              buildPromptFailedLine(row.claude_instance_id, perm.request_token, describeThrownValue(err)),
+              buildPromptFailedLine(row.instance_id, perm.request_token, describeThrownValue(err)),
             )
           }
         }
       } catch (err) {
         // b.zmq: the row counts as one not read this tick: its tracked prompts
         // are not swept as closed and its wedge state is kept.
-        nonConformingInstanceIds.add(row.claude_instance_id)
-        wedgeSkippedThisTick.add(row.claude_instance_id)
-        rowsFailedThisTick.add(row.claude_instance_id)
-        if (!failedRows.has(row.claude_instance_id)) {
-          failedRows.add(row.claude_instance_id)
-          logFailureSafely(deps, buildSpawnFailedLine(row.claude_instance_id, describeThrownValue(err)))
+        nonConformingInstanceIds.add(row.instance_id)
+        wedgeSkippedThisTick.add(row.instance_id)
+        rowsFailedThisTick.add(row.instance_id)
+        if (!failedRows.has(row.instance_id)) {
+          failedRows.add(row.instance_id)
+          logFailureSafely(deps, buildSpawnFailedLine(row.instance_id, describeThrownValue(err)))
         }
       }
     }
@@ -1242,8 +1227,8 @@ async function runTick(deps: PollerDeps): Promise<void> {
     // avoids mutating the map while iterating it.
     const closedEntries: LivePermission[] = []
     for (const [key, entry] of livePermissions) {
-      if (seenComposite.has(key)) continue
-      if (nonConformingInstanceIds.has(entry.claudeInstanceId)) continue
+      if (seenComposite.has(key) && !entry.awaitingDelivery) continue
+      if (nonConformingInstanceIds.has(entry.instanceId)) continue
       if (isHeld(entry.personaKey)) continue
       closedEntries.push(entry)
     }
@@ -1264,31 +1249,40 @@ async function runTick(deps: PollerDeps): Promise<void> {
             continue
           }
           if (isErrPermissionRequestNotFound(err)) {
-            logViaDeps(deps, `[slack] permission-poller: get-permission not-found for ${entry.claudeInstanceId} token=${entry.requestToken} — generic deny + drop`)
-            emitRowDecision(deps, 'not_found_generic_deny', entry.claudeInstanceId, entry.requestToken)
+            logViaDeps(deps, `[slack] permission-poller: get-permission not-found for ${entry.instanceId} token=${entry.requestToken} — generic deny + drop`)
+            emitRowDecision(deps, 'not_found_generic_deny', entry.instanceId, entry.requestToken)
             await renderClosureUpdate(deps, entry, 'not_found')
-            dropPermission(entry.claudeInstanceId, entry.requestToken)
+            dropPermission(entry.instanceId, entry.requestToken)
             continue
           }
-          logViaDeps(deps, `[slack] permission-poller: get-permission failed for ${entry.claudeInstanceId} token=${entry.requestToken}: ${describeAgentDirectorFailure(err)}`)
+          logViaDeps(deps, `[slack] permission-poller: get-permission failed for ${entry.instanceId} token=${entry.requestToken}: ${describeAgentDirectorFailure(err)}`)
           // SR-2.4 transient retry: leave entry alive; next tick will retry.
-          emitRowDecision(deps, 'transient_retry', entry.claudeInstanceId, entry.requestToken)
+          emitRowDecision(deps, 'transient_retry', entry.instanceId, entry.requestToken)
           continue
         }
 
+        // A recorded verdict does not prove delivery. Keep polling until AD
+        // confirms it or reports the request fell back to its pane.
+        if (info.delivery === 'not_confirmed') continue
+        if (info.delivery === 'fallen_back' && (info.pane_answer === 'none' || info.pane_answer === 'intent')) {
+          if (!entry.relayFallbackShown) {
+            entry.relayFallbackShown = await renderClosureUpdate(deps, entry, 'relay_fallen_back')
+          }
+          continue
+        }
         const verdict = classifyVerdict(info)
         if (verdict === 'unknown') {
-          logViaDeps(deps, `[slack] permission-poller: unknown verdict for ${entry.claudeInstanceId} token=${entry.requestToken} decision=${info.decision} decision_reason=${String(info.decision_reason)} — fail-closed generic deny`)
+          logViaDeps(deps, `[slack] permission-poller: unknown verdict for ${entry.instanceId} token=${entry.requestToken} decision=${info.decision} decision_reason=${String(info.decision_reason)} — fail-closed generic deny`)
         }
-        emitRowDecision(deps, 'reconciled_closed', entry.claudeInstanceId, entry.requestToken)
+        emitRowDecision(deps, 'reconciled_closed', entry.instanceId, entry.requestToken)
         await renderClosureUpdate(deps, entry, verdict)
-        dropPermission(entry.claudeInstanceId, entry.requestToken)
+        dropPermission(entry.instanceId, entry.requestToken)
       } catch (err) {
         logFailureOnce(
           deps,
           failedClosings,
-          makeCompositeKey(entry.claudeInstanceId, entry.requestToken),
-          buildClosingFailedLine(entry.claudeInstanceId, entry.requestToken, describeThrownValue(err)),
+          makeCompositeKey(entry.instanceId, entry.requestToken),
+          buildClosingFailedLine(entry.instanceId, entry.requestToken, describeThrownValue(err)),
         )
       }
     }
@@ -1356,9 +1350,9 @@ type RowPersona =
 function resolveRowPersona(deps: PollerDeps, row: ListRow): RowPersona {
   const key = row.labels[PERSONA_LABEL_KEY]
   if (!key) {
-    if (!noLabelLogged.has(row.claude_instance_id)) {
-      noLabelLogged.add(row.claude_instance_id)
-      logViaDeps(deps, `[slack] permission-poller: spawn ${row.claude_instance_id} has no persona label — skipping`)
+    if (!noLabelLogged.has(row.instance_id)) {
+      noLabelLogged.add(row.instance_id)
+      logViaDeps(deps, `[slack] permission-poller: spawn ${row.instance_id} has no persona label — skipping`)
     }
     return { kind: 'no_label' }
   }
@@ -1376,7 +1370,7 @@ function resolveRowPersona(deps: PollerDeps, row: ListRow): RowPersona {
  */
 function forgetUnlistedNoLabelRows(rows: ListRow[]): void {
   if (noLabelLogged.size === 0) return
-  const listed = new Set(rows.filter((row) => !row.labels[PERSONA_LABEL_KEY]).map((row) => row.claude_instance_id))
+  const listed = new Set(rows.filter((row) => !row.labels[PERSONA_LABEL_KEY]).map((row) => row.instance_id))
   for (const id of [...noLabelLogged]) {
     if (!listed.has(id)) noLabelLogged.delete(id)
   }
@@ -1384,7 +1378,7 @@ function forgetUnlistedNoLabelRows(rows: ListRow[]): void {
 
 /** Log that a listed row names no applied persona; the caller skips it. */
 function logRowNotApplied(deps: PollerDeps, row: ListRow, key: string): void {
-  logViaDeps(deps, `[slack] permission-poller: spawn ${row.claude_instance_id} names no applied persona (persona=${key}) — skipping`)
+  logViaDeps(deps, `[slack] permission-poller: spawn ${row.instance_id} names no applied persona (persona=${key}) — skipping`)
 }
 
 /**
@@ -1464,7 +1458,7 @@ async function dispatchPermissionPrompt(
       compositeKey,
       'destination-refused',
       `[slack] permission-poller: ${ref} has ${destinationSettingFrom(destinations, persona)} set to "dm" but ` +
-        `${describeDmDestinationRefusal(refusal)} — prompt for ${row.claude_instance_id} ` +
+        `${describeDmDestinationRefusal(refusal)} — prompt for ${row.instance_id} ` +
         `(request_token=${permission.request_token}) not posted and no DM opened`,
     )
     return
@@ -1475,7 +1469,7 @@ async function dispatchPermissionPrompt(
       deps,
       compositeKey,
       'client-unavailable',
-      `[slack] permission-poller: no Slack client for ${ref} — prompt for ${row.claude_instance_id} ` +
+      `[slack] permission-poller: no Slack client for ${ref} — prompt for ${row.instance_id} ` +
         `(request_token=${permission.request_token}) not posted; retrying on a later tick`,
     )
     return
@@ -1491,9 +1485,9 @@ async function dispatchPermissionPrompt(
   // The attempt always ends, even on a throw (a no-op after its post), so a
   // retrying persona is never left held with no timer.
   try {
-    emitRowDecision(deps, 'post_attempted', row.claude_instance_id, permission.request_token)
+    emitRowDecision(deps, 'post_attempted', row.instance_id, permission.request_token)
     if (prompt.toolInputUnparsed) {
-      logViaDeps(deps, `[slack] permission-poller: tool_input not JSON-parseable for ${row.claude_instance_id} — using raw string`)
+      logViaDeps(deps, `[slack] permission-poller: tool_input not JSON-parseable for ${row.instance_id} — using raw string`)
     }
     await postPermissionPrompt(deps, attempt, web, row, persona, permission, prompt)
   } finally {
@@ -1524,6 +1518,14 @@ function promptText(toolName: string): string {
  * nothing per tick.
  */
 function buildPromptMessage(row: ListRow, permission: PermissionRequestRow): PromptMessage {
+  if (permission.delivery === 'fallen_back') {
+    const { text, blocks } = buildVerdictRendering('relay_fallen_back')
+    return { text, blocks, toolInputUnparsed: false, fallback: false }
+  }
+  if (permission.delivery === 'not_confirmed' && permission.decision !== null) {
+    const text = '*Permission* — verdict recorded; waiting for agent delivery confirmation'
+    return { text, blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }], toolInputUnparsed: false, fallback: false }
+  }
   // tool_input is a raw JSON string per the typed contract; parse for the
   // Block Kit builder, fall back to the raw string + warning on parse fail.
   let toolInput: Record<string, unknown>
@@ -1540,7 +1542,7 @@ function buildPromptMessage(row: ListRow, permission: PermissionRequestRow): Pro
   const blocks = buildPermissionBlocks(
     permission.tool_name,
     toolInput,
-    row.claude_instance_id,
+    row.instance_id,
     permission.request_token,
   )
   return { text: promptText(permission.tool_name), blocks, toolInputUnparsed, fallback: false }
@@ -1553,10 +1555,15 @@ function buildPromptMessage(row: ListRow, permission: PermissionRequestRow): Pro
  * does; logs nothing.
  */
 function buildFallbackPromptMessage(row: ListRow, permission: PermissionRequestRow, code: string): PromptMessage {
+  // Payload retries must retain the delivery notice, never recreate buttons
+  // for a request whose relay has ended or already recorded a verdict.
+  if (permission.delivery === 'fallen_back' || (permission.delivery === 'not_confirmed' && permission.decision !== null)) {
+    return { ...buildPromptMessage(row, permission), fallback: true }
+  }
   const blocks = buildFallbackPermissionBlocks(
     permission.tool_name,
     code,
-    row.claude_instance_id,
+    row.instance_id,
     permission.request_token,
   )
   return { text: promptText(permission.tool_name), blocks, toolInputUnparsed: false, fallback: true }
@@ -1588,7 +1595,7 @@ async function postPermissionPrompt(
 ): Promise<void> {
   const { text, blocks } = prompt
   const emit = deps.emitTrail ?? defaultEmitTrail
-  const compositeKey = makeCompositeKey(row.claude_instance_id, permission.request_token)
+  const compositeKey = makeCompositeKey(row.instance_id, permission.request_token)
   const result = await attempt.post(persona, web, { text, blocks })
   if (result.outcome === 'refused') return
   if (result.outcome === 'failed') {
@@ -1606,16 +1613,16 @@ async function postPermissionPrompt(
         payloadRejections.set(compositeKey, { stage: 'skipped' })
         logViaDeps(
           deps,
-          buildFallbackPromptRejectedLine(result.step, row.claude_instance_id, permission.request_token, tail),
+          buildFallbackPromptRejectedLine(result.step, row.instance_id, permission.request_token, tail),
         )
       } else {
         payloadRejections.set(compositeKey, { stage: 'fallback', code: result.code })
-        logViaDeps(deps, buildPromptRejectedLine(result.step, row.claude_instance_id, permission.request_token, tail))
+        logViaDeps(deps, buildPromptRejectedLine(result.step, row.instance_id, permission.request_token, tail))
       }
     }
     const event: Omit<TrailEventBase, 'ts'> & { [extra: string]: unknown } = {
       event: 'cscb.chat_post.attempted',
-      claude_instance_id: row.claude_instance_id,
+      instance_id: row.instance_id,
       request_token: permission.request_token,
       text,
       blocks,
@@ -1632,13 +1639,15 @@ async function postPermissionPrompt(
     // b.zmq: registered before the trail event, so a throwing emitter cannot
     // leave a posted prompt untracked (and posted again next tick).
     livePermissions.set(compositeKey, {
-      claudeInstanceId: row.claude_instance_id,
+      instanceId: row.instance_id,
       requestToken: permission.request_token,
       personaKey: persona.key,
       channelId,
       messageTs,
       requestId: permission.request_id,
       handled: false,
+      relayFallbackShown: permission.delivery === 'fallen_back',
+      awaitingDelivery: permission.delivery === 'not_confirmed' && permission.decision !== null,
     })
     payloadRejections.delete(compositeKey)
     failedRequests.delete(compositeKey)
@@ -1647,7 +1656,7 @@ async function postPermissionPrompt(
   // Slack-returned ts. Full text + blocks pass through verbatim (SR-V-3.1).
   emit({
     event: 'cscb.chat_post.attempted',
-    claude_instance_id: row.claude_instance_id,
+    instance_id: row.instance_id,
     request_token: permission.request_token,
     channel: channelId,
     text,
@@ -1656,7 +1665,7 @@ async function postPermissionPrompt(
     slack_ts: messageTs,
   })
   if (!messageTs) {
-    logViaDeps(deps, `[slack] permission-poller: chat.postMessage returned no ts for ${row.claude_instance_id}`)
+    logViaDeps(deps, `[slack] permission-poller: chat.postMessage returned no ts for ${row.instance_id}`)
   }
 }
 
@@ -1668,6 +1677,7 @@ async function postPermissionPrompt(
 export type VerdictTag =
   | 'operator_allow'
   | 'operator_deny'
+  | 'relay_fallen_back'
   | 'timeout'
   | 'find_missing'
   | 'unknown'
@@ -1680,9 +1690,10 @@ export type VerdictTag =
  * collapses to `'unknown'` — the SR-5.2 fail-closed generic deny path.
  */
 export function classifyVerdict(info: GetPermissionResult): VerdictTag {
-  if (info.decision === 'allow' && info.decision_reason === null) return 'operator_allow'
+  if (info.delivery !== 'delivered' && !(info.delivery === 'fallen_back' && ['sent', 'outside', 'tool_ran'].includes(info.pane_answer))) return 'unknown'
+  if (info.decision === 'allow' && (info.decision_reason === null || ['pane', 'pane_outside', 'tool_ran'].includes(info.decision_reason ?? ''))) return 'operator_allow'
   if (info.decision === 'deny') {
-    if (info.decision_reason === 'operator') return 'operator_deny'
+    if (['operator', 'pane', 'pane_outside'].includes(info.decision_reason ?? '')) return 'operator_deny'
     if (info.decision_reason === 'timeout') return 'timeout'
     if (info.decision_reason === 'find_missing') return 'find_missing'
   }
@@ -1705,6 +1716,9 @@ export function classifyVerdict(info: GetPermissionResult): VerdictTag {
 function buildVerdictRendering(tag: VerdictTag): { text: string; blocks: unknown[] } {
   let text: string
   switch (tag) {
+    case 'relay_fallen_back':
+      text = '*Permission* — relay window elapsed; answer this prompt at the session\'s tmux pane'
+      break
     case 'operator_allow':
       text = '*Permission* — Allowed'
       break
@@ -1749,7 +1763,7 @@ async function renderClosureUpdate(
   deps: PollerDeps,
   entry: LivePermission,
   tag: VerdictTag,
-): Promise<void> {
+): Promise<boolean> {
   const web = deps.clientFor(entry.personaKey)
   if (!web) {
     const persona = deps.getPersona(entry.personaKey)
@@ -1757,15 +1771,15 @@ async function renderClosureUpdate(
     logViaDeps(
       deps,
       `[slack] permission-poller: no Slack client for ${ref} — closure update for ` +
-        `${entry.claudeInstanceId} token=${entry.requestToken} (verdict=${tag}) skipped`,
+        `${entry.instanceId} token=${entry.requestToken} (verdict=${tag}) skipped`,
     )
-    return
+    return false
   }
   const { text, blocks } = buildVerdictRendering(tag)
   const emit = deps.emitTrail ?? defaultEmitTrail
   const envelope = {
     event: 'cscb.chat_update.attempted',
-    claude_instance_id: entry.claudeInstanceId,
+    instance_id: entry.instanceId,
     request_token: entry.requestToken,
     channel: entry.channelId,
     message_ts: entry.messageTs,
@@ -1782,15 +1796,17 @@ async function renderClosureUpdate(
       blocks: blocks as never,
     })
     emit({ ...envelope, ok: true })
+    return true
   } catch (err) {
     // b.emk: failures land in BOTH server.log and the trail JSONL.
     logViaDeps(
       deps,
-      `[slack] permission-poller: closure chat.update failed for ${entry.claudeInstanceId} token=${entry.requestToken} ` +
+      `[slack] permission-poller: closure chat.update failed for ${entry.instanceId} token=${entry.requestToken} ` +
         `(verdict=${tag})${describeSlackCallFailure(err)}`,
     )
     emit({ ...envelope, ok: false, error: classifySlackError(err) })
   }
+  return false
 }
 
 // ---------------------------------------------------------------------------

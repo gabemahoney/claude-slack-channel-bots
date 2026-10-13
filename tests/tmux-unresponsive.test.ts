@@ -1,3 +1,4 @@
+import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 /**
  * tmux-unresponsive.test.ts — The per-persona `tmux-unresponsive` condition
  * and its three notices (b.jg5 SRJ-307 to SRJ-310, SRJ-1006; AC 25, AC 26,
@@ -766,7 +767,7 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
         ? { statusError: make(verb) }
         : verb === 'read-pane'
           ? { ...pending, readPaneError: make(verb) }
-          : { ...pending, readPaneResults: [{ pane: TRUST_DIALOG_NEEDLE }], sendKeysError: make(verb) },
+          : { ...pending, readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_NEEDLE)], sendKeysError: make(verb) },
     )
 
     expect(await h.launch(p)).toMatchObject({ key: p, action: 'spawned' })
@@ -1115,7 +1116,7 @@ describe('tmux-unresponsive: what ends it (SRJ-310)', () => {
   // live again.
   const restartRunEnds = RESTART_RUN_ROWS.flatMap((row) =>
     ([
-      ['a pane', { readPaneResults: [{ pane: '' }] }, { statusCalls: 2, readPaneCalls: 1, ...(row === 'waiting' ? { sendKeysCalls: 1 } : {}) }],
+      ['a pane', { readPaneResults: [cannedReadPaneResult('')] }, { statusCalls: 2, readPaneCalls: 1, ...(row === 'waiting' ? { sendKeysCalls: 1 } : {}) }],
       ['GONE (ErrTmuxCaptureFailed)', { readPaneError: errTmuxCaptureFailed() }, { statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 }],
     ] satisfies Array<[string, RecoveryStubScript, Record<string, number>]>).flatMap(([what, answer, calls]) => [
       [what, row, 'before any onset', answer, calls, false],
@@ -1495,7 +1496,7 @@ describe('tmux-unresponsive: the onset with the health check off (SRJ-308)', () 
 
     const oldId = PRE_PERSONA_ID
     holdOldAt(h, oldId, oldId, p)
-    h.script({ getResult: cannedGetResult({ claude_instance_id: oldId, cwd: personaOf(h, p).working_directory }) })
+    h.script({ getResult: cannedGetResult({ instance_id: oldId, cwd: personaOf(h, p).working_directory }) })
     const hold = holdFindMissing(h.stub.client)
     const outcome = h.startOldLifeWait(oldId)
     await h.driveSequence(hold.entered(1))
@@ -2475,7 +2476,7 @@ async function spawnTimingOut(h: RecoveryHarness, key: string, form: LaunchTimeo
   let state: string = AGENT_DIRECTOR_PENDING_STATE
   const id = personaInstanceId(key)
   h.script({
-    statusFn: (params) => (params.claude_instance_id === id ? launch.statusRow({ state: state as StatusResult['state'] }) : cannedStatusResult()),
+    statusFn: (params) => (params.instance_id === id ? launch.statusRow({ state: state as StatusResult['state'] }) : cannedStatusResult()),
     ...(paneAnswers ? {} : { readPaneError: errTmuxUnresponsive('read-pane') }),
   })
   expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })

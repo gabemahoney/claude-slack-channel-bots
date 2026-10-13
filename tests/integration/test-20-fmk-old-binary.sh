@@ -507,7 +507,7 @@ expect_counts_unchanged() {
 
 # row_state <instance-id>: a harness `get`'s state (empty when it fails).
 row_state() {
-    ad_capture get --claude-instance-id "$1"
+    ad_capture get --instance-id "$1"
     (( AD_RC == 0 )) || return 0
     jq -r '.state // empty' "${AD_OUT}"
 }
@@ -647,7 +647,7 @@ start_slack_stub() {
 # harness `get` then reads it finished.
 finish_p() {
     local step="$1" session pid t0
-    session="$(jq -r '.tmux_session_name // empty' <<< "$(ad get --claude-instance-id "${P_ID}")")"
+    session="$(jq -r '.tmux_session_name // empty' <<< "$(ad get --instance-id "${P_ID}")")"
     [[ -n "${session}" ]] || fail "${step}: P's row names no tmux session"
     t0="${SECONDS}"
     wait_until $(( FINISH_AGE_S + 30 )) "${step}: P's session ${session} never got ${FINISH_AGE_S}s old" \
@@ -817,7 +817,7 @@ start_server --live
 wait_server_probe "${n_version}" "${GATE_WAIT_S}" "8b: the startup gate's probe"
 T_GATE="${CALL_T}"
 wait_until "${REPORT_WAIT_S}" "8b: P (${P_ID}) never reported in (waiting)" row_state_is "${P_ID}" waiting
-ad_capture get --claude-instance-id "${P_ID}"
+ad_capture get --instance-id "${P_ID}"
 P_SESSION="$(jq -r '.tmux_session_name // empty' "${AD_OUT}")"
 [[ -n "${P_SESSION}" ]] && has_session "${P_SESSION}" || fail "8b: P's row names no running tmux session ('${P_SESSION}')"
 P_ROW0="$(row_snapshot)"

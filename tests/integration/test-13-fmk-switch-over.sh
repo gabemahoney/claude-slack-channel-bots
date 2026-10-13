@@ -69,7 +69,7 @@
 #                              steps 1 and 8 read it from there
 #   container-settings         steps 1, 8: the timing settings are the
 #                              container's (the scenario HOME's
-#                              ~/.agent-director/config.toml, through
+#                              ~/.config/agent-director/config.toml, through
 #                              `switch-over.ts settings`)
 #   one-socket                 step 1: C7's socket pinning and its
 #                              display-message check run against the
@@ -158,7 +158,7 @@
 #       every persona row has read waiting; every row a sample shows is
 #       pending with a launch_started_at. Each persona's row read pending
 #       from its launch until its SessionStart, from the scenario HOME's
-#       ~/.agent-director/ad-trail.jsonl (the records after its length noted
+#       ~/.config/agent-director/ad-trail.jsonl (the records after its length noted
 #       before the start): the row's first `ad.spawn.state_transition` record
 #       has prior_state pending, new_state waiting and triggering_event_name
 #       SessionStart, and an `ad.send_keys.called` record has row_state
@@ -212,7 +212,7 @@
 # naming it as a harness defect; no bound, matcher or count is weakened for it.
 #
 # Leg B (SRJ-1402, AC 12), after step 11: a clean_restart of the new CSCB on
-# Phase 1. Each persona's claude_session_id is read (`get`) first. The new
+# Phase 1. Each persona's session_id is read (`get`) first. The new
 # CLI's `clean_restart` runs through the install path as a CSCB process
 # (`cscb_run`, the tmux shim first on its PATH, start's environment), in the
 # background, while the harness reads each persona's row (`status`, from the
@@ -248,7 +248,7 @@
 #     reads waiting, within B_R. From clean_restart's "starting server" line
 #     (clean_restart.log) on, the rows are read with no pause between reads;
 #   - the row reads pending until its resumed worker reports in, from the
-#     scenario HOME's ~/.agent-director/ad-trail.jsonl (the records after its
+#     scenario HOME's ~/.config/agent-director/ad-trail.jsonl (the records after its
 #     length noted before clean_restart; a record's `ts` is UTC in whole
 #     milliseconds, taken as rounded down). The records read: the row's first
 #     `ad.spawn.state_transition` record in trail order with
@@ -267,7 +267,7 @@
 #     launch start;
 #   - read-pane and send-keys calls naming the row, by the bot server, after
 #     its last resume and before it read waiting;
-#   - the row keeps the claude_session_id read before, and the worker behind
+#   - the row keeps the session_id read before, and the worker behind
 #     its session's worker pane was started with --resume and that id;
 #   - with no refusal the start pass counts every persona resumed, none
 #     fresh-spawned and none not brought up (with one, none fresh-spawned);
@@ -418,7 +418,7 @@ SUBSTITUTIONS="${HOST_DIR}/substitutions"
 # The agent-director settings step 1 records (`switch-over.ts settings`).
 STEP1_SETTINGS="${SCENARIO_ROOT}/settings-step1"
 # agent-director's trail in the scenario HOME.
-AD_TRAIL="${HOME}/.agent-director/ad-trail.jsonl"
+AD_TRAIL="${HOME}/.config/agent-director/ad-trail.jsonl"
 
 # The global install (bun's global directory and bin directory under
 # SCENARIO_ROOT): the scenario's one install path, the old package's and then
@@ -672,13 +672,13 @@ check_windows() {
 # row_get <step> <instance-id>: a harness get of the row into AD_OUT; fail
 # unless it answers.
 row_get() {
-    ad_capture get --claude-instance-id "$2"
+    ad_capture get --instance-id "$2"
     (( AD_RC == 0 )) || fail "$1: harness get of ${2} exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
 }
 
 # row_state <instance-id>: print the row's state (empty when the get fails).
 row_state() {
-    ad_capture get --claude-instance-id "$1"
+    ad_capture get --instance-id "$1"
     (( AD_RC == 0 )) || return 0
     jq -r '.state // empty' "${AD_OUT}"
 }
@@ -893,13 +893,13 @@ check_pending_samples() {
         jq -e '.spawns | type == "array"' "${out}" > /dev/null 2>&1 \
             || fail "step 10: the pending sample ${n} printed no spawns array: $(head -c 300 "${out}")"
         bad="$(jq -r '[.spawns[] | select(.state != "pending" or (.launch_started_at // null) == null)
-            | "\(.claude_instance_id) (\(.state), launch_started_at \(.launch_started_at // "none"))"] | join(", ")' "${out}")" \
+            | "\(.instance_id) (\(.state), launch_started_at \(.launch_started_at // "none"))"] | join(", ")' "${out}")" \
             || fail "step 10: could not read the pending sample ${n}"
         [[ -z "${bad}" ]] || fail "step 10: the pending sample ${n} (${from} to ${to}) shows row(s) not pending with a launch_started_at: ${bad}"
         while IFS= read -r id; do
             [[ -n "${id}" ]] || continue
             SEEN_PENDING["${id}"]=$(( ${SEEN_PENDING[${id}]:-0} + 1 ))
-        done < <(jq -r '.spawns[].claude_instance_id' "${out}")
+        done < <(jq -r '.spawns[].instance_id' "${out}")
         SAMPLES=$(( SAMPLES + 1 ))
     done
     (( SAMPLES > 0 )) || fail "step 10: the pending sampler took no sample"
@@ -915,7 +915,7 @@ check_pending_samples() {
 # start; the samples show it. Sets TRAIL_NOTE.
 trail_fresh_pending() {
     local id="$1" file="${SCENARIO_ROOT}/step10-trail" kind ts a b c moved="" keys=0 keys_ts=""
-    jq -r --arg id "${id}" 'select(.claude_instance_id == $id)
+    jq -r --arg id "${id}" 'select(.instance_id == $id)
         | if .event == "ad.spawn.state_transition" then "moved \(.ts) \(.prior_state // "-") \(.new_state // "-") \(.triggering_event_name // "-")"
           elif .event == "ad.send_keys.called" then "keys \(.ts) \(.row_state // "-") - -"
           else empty end' "${file}" > "${file}-${id}" \
@@ -977,7 +977,7 @@ samples_inside_pending() {
         n="${n%.at}"
         read -r from to rc < "${at}" || fail "step 10: the pending sample ${n} has no times"
         (( from >= PENDING_FROM_US && to <= PENDING_TO_US )) || continue
-        jq -e --arg id "${id}" 'any(.spawns[]; .claude_instance_id == $id)' "${PENDING_SAMPLES}/${n}.out" > /dev/null \
+        jq -e --arg id "${id}" 'any(.spawns[]; .instance_id == $id)' "${PENDING_SAMPLES}/${n}.out" > /dev/null \
             || fail "step 10: the pending sample ${n} (${from} to ${to}), taken while row ${id} provably read pending, does not show it"
         INSIDE=$(( INSIDE + 1 ))
     done
@@ -1116,7 +1116,7 @@ for i in "${!CHANNELS[@]}"; do
     id="${OLD_IDS[i]}"
     row_get "setup" "${id}"
     jq -e --arg id "${id}" --arg s "${OLD_SESSIONS[i]}" --arg c "${cid}" \
-        '.claude_instance_id == $id and .tmux_session_name == $s and .labels.service == "cscb" and .labels.channel == $c and (.labels | has("persona") | not)' \
+        '.instance_id == $id and .tmux_session_name == $s and .labels.service == "cscb" and .labels.channel == $c and (.labels | has("persona") | not)' \
         "${AD_OUT}" > /dev/null \
         || fail "setup: row ${id} is not named and labelled as the old package does: $(head -c 400 "${AD_OUT}")"
     [[ "${id}" == cscb_*"_${cid}" && "${OLD_SESSIONS[i]}" == slack_bot_*"_${cid}" ]] \
@@ -1207,7 +1207,7 @@ STAGED_VERSION="$(jq -r '.version' "${STAGED_PKG}/package.json")"
 record "staged release: ${PKG_NAME} ${STAGED_VERSION} from ${PACKAGE_TGZ}, in ${STAGED_PKG}; available to install"
 runbook_substitute 1 staging-build-under-test "the release staged is the build under test, the image's ${PACKAGE_TGZ}, unpacked into ${STAGING_DIR}"
 
-[[ ! -e "${HOME}/.agent-director/config.toml" ]] || fail "step 1: the scenario HOME has an agent-director config.toml"
+[[ ! -e "${HOME}/.config/agent-director/config.toml" ]] || fail "step 1: the scenario HOME has an agent-director config.toml"
 read_settings "${STAGED_PKG}" "${STEP1_SETTINGS}"
 [[ "${SETTINGS[file_exists]}" == false ]] || fail "step 1: the settings read found a config.toml"
 check_windows "step 1"
@@ -1288,7 +1288,7 @@ tail -n "+$(( ad_lines_before_3 + 1 ))" "${SCENARIO_AD_SHIM_LOG}" > "${SCENARIO_
 cscb_lines "${SCENARIO_ROOT}/step3-shim.log" "" "${SCENARIO_ROOT}/step3-calls"
 (( $(line_count "${SCENARIO_ROOT}/step3-calls") > 0 )) \
     || fail "step 3: the old CLI made no agent-director call through the shim"
-got="$("${HOME}/.agent-director/bin/agent-director.real" version | jq -r '.version // empty')"
+got="$("${HOME}/.config/agent-director/bin/agent-director.real" version | jq -r '.version // empty')"
 [[ "${got}" == "${SCENARIO_AD_010_VERSION}" ]] || fail "step 3: the binary behind the shim reports '${got}', not ${SCENARIO_AD_010_VERSION}"
 record "stop --stop-bots (the old ${PKG_NAME} ${OLD_CSCB_VERSION}) exited 0 with one teardown outcome per routed channel; $(line_count "${SCENARIO_ROOT}/step3-calls") agent-director call(s) through the shim, ${got} behind it"
 
@@ -1319,7 +1319,7 @@ for s in ${sessions[@]+"${sessions[@]}"}; do
     done
 done
 list_rows "step 5" "${SCENARIO_ROOT}/rows-step5.json" --label service=cscb
-live="$(jq -r '[.[] | select(.state != "ended" and .state != "missing") | .claude_instance_id] | join(" ")' "${SCENARIO_ROOT}/rows-step5.json")"
+live="$(jq -r '[.[] | select(.state != "ended" and .state != "missing") | .instance_id] | join(" ")' "${SCENARIO_ROOT}/rows-step5.json")"
 [[ -z "${live}" ]] || fail "step 5: old row(s) still live: ${live}"
 record "tmux ls: ${sessions[*]:-no session}; no old session and no live old row"
 
@@ -1460,7 +1460,7 @@ runbook_substitute 8 operator-go-ahead "the operator's go-ahead is the switch-ov
 
 # The harness's stop of every other agent: none is seeded.
 list_rows "step 8" "${SCENARIO_ROOT}/rows-step8.json"
-live="$(jq -r '[.[] | select((.labels.service // "") != "cscb") | select(.state != "ended" and .state != "missing") | .claude_instance_id] | join(" ")' "${SCENARIO_ROOT}/rows-step8.json")"
+live="$(jq -r '[.[] | select((.labels.service // "") != "cscb") | select(.state != "ended" and .state != "missing") | .instance_id] | join(" ")' "${SCENARIO_ROOT}/rows-step8.json")"
 [[ -z "${live}" ]] || fail "step 8: other agents' rows still live: ${live}"
 tmux_sessions sessions
 (( ${#sessions[@]} == 0 )) || fail "step 8: tmux sessions are left: ${sessions[*]}"
@@ -1478,17 +1478,17 @@ ad_capture version
 got="$(jq -r '.version // empty' "${AD_OUT}")"
 [[ "${got}" == "${REL_VERSION}" && "$(jq -r '.commit // empty' "${AD_OUT}")" == "${REL_COMMIT}" ]] \
     || fail "step 8: agent-director version reports '${got}', not the release's ${REL_VERSION} (${REL_COMMIT})"
-real_v="$("${HOME}/.agent-director/bin/agent-director.real" version | jq -r '.version // empty')"
+real_v="$("${HOME}/.config/agent-director/bin/agent-director.real" version | jq -r '.version // empty')"
 [[ "${real_v}" == "${REL_VERSION}" ]] || fail "step 8: the binary behind the shim reports '${real_v}', not ${REL_VERSION}"
 runbook_substitute 8 release-install-script "the Phase 1 install is the release's install.sh, run in the scenario HOME, then the re-shim; the serve restart and start-time check cover the container's agent-director processes"
-[[ ! -e "${HOME}/.agent-director/config.toml" ]] || fail "step 8: a config.toml was written; the scenario writes no [tmux] table"
+[[ ! -e "${HOME}/.config/agent-director/config.toml" ]] || fail "step 8: a config.toml was written; the scenario writes no [tmux] table"
 older=()
 count=0
 for proc in /proc/[0-9]*; do
     pid="${proc#/proc/}"
     exe="$(readlink -- "${proc}/exe" 2> /dev/null || true)"
     cmd="$(tr '\0' ' ' < "${proc}/cmdline" 2> /dev/null || true)"
-    [[ "${exe}" == "${HOME}/.agent-director/"* || "${cmd}" == *"${HOME}/.agent-director/bin/agent-director"* ]] || continue
+    [[ "${exe}" == "${HOME}/.config/agent-director/"* || "${cmd}" == *"${HOME}/.config/agent-director/bin/agent-director"* ]] || continue
     st="$(_scenario_proc_starttime "${pid}")"
     [[ -n "${st}" ]] || continue
     count=$(( count + 1 ))
@@ -1813,8 +1813,8 @@ declare -A SID_OF=()
 for i in "${!PERSONA_IDS[@]}"; do
     id="${PERSONA_IDS[i]}"
     row_get "leg B: before the restart" "${id}"
-    SID_OF["${id}"]="$(jq -r '.claude_session_id // empty' "${AD_OUT}")"
-    [[ -n "${SID_OF[${id}]}" ]] || fail "leg B: before the restart, row ${id} has no claude_session_id"
+    SID_OF["${id}"]="$(jq -r '.session_id // empty' "${AD_OUT}")"
+    [[ -n "${SID_OF[${id}]}" ]] || fail "leg B: before the restart, row ${id} has no session_id"
     record "leg B: row ${id} ($(jq -r '.state' "${AD_OUT}")) holds conversation ${SID_OF[${id}]}"
 done
 
@@ -1897,7 +1897,7 @@ while :; do
             fi
         fi
         read_from_us="$(now_us)"
-        ad_capture status --claude-instance-id "${id}"
+        ad_capture status --instance-id "${id}"
         read_us="$(now_us)"
         (( AD_RC == 0 )) || fail "leg B: a harness status read of row ${id} exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
         if ! read -r state launch < <(jq -r '[.state // "-", .launch_started_at // "-"] | join(" ")' "${AD_OUT}"); then
@@ -2053,7 +2053,7 @@ for i in "${!PERSONA_IDS[@]}"; do
     # (the latest at or before it, else the first after it: the resumed
     # launch's SessionStart, whatever the records' order in the trail).
     lines_after "${AD_TRAIL}" "${LEG_B_TRAIL_FROM}" "${SCENARIO_ROOT}/leg-b-trail"
-    jq -r --arg id "${id}" 'select(.claude_instance_id == $id)
+    jq -r --arg id "${id}" 'select(.instance_id == $id)
         | (if .event == "ad.resume.moved_to_pending" then "pending"
            elif .event == "ad.spawn.state_transition" and .triggering_event_name == "SessionStart" and .prior_state == "pending" then "moved"
            elif .event == "ad.hook.fired" and .event_name == "SessionStart" then "fired"
@@ -2149,9 +2149,9 @@ for i in "${!PERSONA_IDS[@]}"; do
         (( cleared )) || fail "leg B: no ${verb} of row ${id} by the restarted server after its resume and before it read waiting"
     done
 
-    # Its conversation kept: the same claude_session_id, and a worker started with --resume and that id.
+    # Its conversation kept: the same session_id, and a worker started with --resume and that id.
     row_get "leg B: persona ${name}'s row is gone" "${id}"
-    got="$(jq -r '.claude_session_id // empty' "${AD_OUT}")"
+    got="$(jq -r '.session_id // empty' "${AD_OUT}")"
     [[ "${got}" == "${SID_OF[${id}]}" ]] \
         || fail "leg B: row ${id} holds conversation '${got}' after the restart, not ${SID_OF[${id}]}"
     session="$(jq -r '.tmux_session_name // empty' "${AD_OUT}")"
@@ -2256,7 +2256,7 @@ LEG_C_SERVER_LOG_FROM="$(line_count "${SLACK_STATE_DIR}/server.log")"
 # 0.10.0 behind the shim (the swap checks the shim); the binary is compared,
 # never run, so the harness makes no 0.10.0 call against the migrated store.
 swap_ad_binary 0.10.0 "leg C: agent-director 0.10.0 behind the shim"
-cmp -s -- "${SCENARIO_AD_010_BIN}" "${HOME}/.agent-director/bin/agent-director.real" \
+cmp -s -- "${SCENARIO_AD_010_BIN}" "${HOME}/.config/agent-director/bin/agent-director.real" \
     || fail "leg C: the binary behind the shim is not agent-director 0.10.0's"
 record "leg C: agent-director ${SCENARIO_AD_010_VERSION} behind the shim"
 
@@ -2347,7 +2347,7 @@ record "leg C: ${probes} version probe(s), no other agent-director call; nothing
 
 # The release back behind the shim (the swap checks the shim).
 swap_ad_binary release "leg C: the release back behind the shim"
-cmp -s -- "${SCENARIO_RELEASE_BIN}" "${HOME}/.agent-director/bin/agent-director.real" \
+cmp -s -- "${SCENARIO_RELEASE_BIN}" "${HOME}/.config/agent-director/bin/agent-director.real" \
     || fail "leg C: the binary behind the shim is not the release's"
 record "leg C: the release ${REL_VERSION} back behind the shim"
 

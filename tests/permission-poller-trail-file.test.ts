@@ -1,3 +1,4 @@
+import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
 /**
  * permission-poller-trail-file.test.ts — End-to-end persistence test for the
  * SR-V Epic 2 trail emissions. Drives `runTick` against a real
@@ -169,7 +170,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     const getClient = () => ({
       list: async () => ({ spawns: [checkPermRow()] }),
       get: async () => cannedGetResultPlural({
-        claude_instance_id: INSTANCE_C,
+        instance_id: INSTANCE_C,
         state: 'check_permission',
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
@@ -187,7 +188,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
       e => e['event'] === 'cscb.poller.row_decision' && e['action'] === 'post_attempted',
     )
     expect(decision).toBeDefined()
-    expect(decision!['claude_instance_id']).toBe(INSTANCE_C)
+    expect(decision!['instance_id']).toBe(INSTANCE_C)
 
     const post = matching.find(e => e['event'] === 'cscb.chat_post.attempted')
     expect(post).toBeDefined()
@@ -204,7 +205,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     const getClient = () => ({
       list: async () => ({ spawns: [checkPermRow()] }),
       get: async () => cannedGetResultPlural({
-        claude_instance_id: INSTANCE_C,
+        instance_id: INSTANCE_C,
         state: 'check_permission',
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
@@ -227,12 +228,12 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     const denyDecoded = parsePermissionActionId(actions!.elements[1]!.action_id)
     expect(allowDecoded).toEqual({
       decision: 'allow',
-      claudeInstanceId: INSTANCE_C,
+      instanceId: INSTANCE_C,
       requestToken: TOKEN_A,
     })
     expect(denyDecoded).toEqual({
       decision: 'deny',
-      claudeInstanceId: INSTANCE_C,
+      instanceId: INSTANCE_C,
       requestToken: TOKEN_A,
     })
     // The persisted buttons name persona A's instance, `cscb_<key>`.
@@ -247,7 +248,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     const getClient = () => ({
       list: async () => ({ spawns: [checkPermRow()] }),
       get: async () => cannedGetResultPlural({
-        claude_instance_id: INSTANCE_C,
+        instance_id: INSTANCE_C,
         state: 'check_permission',
         permission_requests: listProjection,
       }),
@@ -299,7 +300,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     const getClient = () => ({
       list: async () => ({ spawns: [checkPermRow()] }),
       get: async () => cannedGetResultPlural({
-        claude_instance_id: INSTANCE_C,
+        instance_id: INSTANCE_C,
         state: 'check_permission',
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
@@ -328,7 +329,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     const getClient = () => ({
       list: async () => ({ spawns: [checkPermRow()] }),
       get: async () => cannedGetResultPlural({
-        claude_instance_id: INSTANCE_C,
+        instance_id: INSTANCE_C,
         state: 'check_permission',
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
@@ -348,7 +349,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
       user: USER,
     })
     const decideStub: { client: { decide: (p: DecideParams) => Promise<DecideResult> } } = {
-      client: { decide: async (_p: DecideParams) => ({}) },
+      client: { decide: async (_p: DecideParams) => cannedDecideResult() },
     }
     initOutageState({ getClient: () => decideStub.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
@@ -394,7 +395,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     const getClient = () => ({
       list: async () => ({ spawns: [checkPermRow()] }),
       get: async () => cannedGetResultPlural({
-        claude_instance_id: INSTANCE_C,
+        instance_id: INSTANCE_C,
         state: 'check_permission',
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
@@ -404,7 +405,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     await ivl.tick(20)
 
     const decideStub: { client: { decide: (p: DecideParams) => Promise<DecideResult> } } = {
-      client: { decide: async (_p: DecideParams) => ({}) },
+      client: { decide: async (_p: DecideParams) => cannedDecideResult() },
     }
     initOutageState({ getClient: () => decideStub.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
@@ -430,7 +431,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     const getClient = () => ({
       list: async () => ({ spawns: [checkPermRow()] }),
       get: async () => cannedGetResultPlural({
-        claude_instance_id: INSTANCE_C,
+        instance_id: INSTANCE_C,
         state: 'check_permission',
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
@@ -471,7 +472,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
       user: USER,
     })
     const decideStub: { client: { decide: (p: DecideParams) => Promise<DecideResult> } } = {
-      client: { decide: async (_p: DecideParams) => ({}) },
+      client: { decide: async (_p: DecideParams) => cannedDecideResult() },
     }
     const handled = await handlePermissionClick(
       FORGED_ID,

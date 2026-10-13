@@ -1,3 +1,4 @@
+import { cannedReadPaneResult } from './ad-results.ts'
 /**
  * test-helpers/pending-row-model.ts — one persona's scripted agent-director
  * row over the stub's per-call knobs and a fake clock, for the pending-row
@@ -7,7 +8,7 @@
  * --------------
  * One row, the persona's own (`cscb_<key>`): its state, its raw launch start
  * (`launch_started_at`, either form: with or without fractional seconds, or
- * none), its session id (`claude_session_id`), its `started_at`, its `cwd`
+ * none), its session id (`session_id`), its `started_at`, its `cwd`
  * and labels (the persona's own by default, through the stub's persona-form
  * `cannedGetResult`), and the pane its session shows. It is installed on a
  * stub through the per-call knobs (`statusFn`, `getFn`, `readPaneFn`,
@@ -461,7 +462,7 @@ export interface PendingRowModelOptions {
    */
   readonly launchStartedAt?: string | null | undefined
   /**
-   * The row's `claude_session_id`; the stub's default when unset, which is
+   * The row's `session_id`; the stub's default when unset, which is
    * `''`: the default row has no session id (a finished-row case with one
    * sets it here, or through `row`).
    */
@@ -637,7 +638,7 @@ export function makePendingRowModel(host: PendingRowModelHost, key: string, opti
     applyDueChanges()
     if (state === PENDING_ROW_MODEL_NO_ROW) throw new Error(`makePendingRowModel: persona ${key} has no row`)
     const overrides: PersonaGetResultOverrides = {
-      ...(options.sessionId === undefined ? {} : { claude_session_id: options.sessionId }),
+      ...(options.sessionId === undefined ? {} : { session_id: options.sessionId }),
       ...(options.startedAt === undefined ? {} : { started_at: options.startedAt }),
       ...options.row,
       state,
@@ -678,7 +679,7 @@ export function makePendingRowModel(host: PendingRowModelHost, key: string, opti
     return scripted.error
   }
 
-  const ownId = (params: { claude_instance_id?: unknown }): boolean => params.claude_instance_id === id
+  const ownId = (params: { instance_id?: unknown }): boolean => params.instance_id === id
 
   const knobs: PendingRowModelKnobs = {
     statusFn: (params: StatusParams): StatusResult | Error | undefined => {
@@ -704,7 +705,7 @@ export function makePendingRowModel(host: PendingRowModelHost, key: string, opti
       const scripted = readPaneAnswers.shift()
       if (scripted !== undefined) return scripted
       if (state === PENDING_ROW_MODEL_NO_ROW) return errSpawnNotFound()
-      return { pane: pendingRowDialogPane(dialog) }
+      return cannedReadPaneResult(pendingRowDialogPane(dialog))
     },
     sendKeysFn: (params: SendKeysParams): StubCallAnswer<SendKeysResult> => {
       if (!ownId(params)) return earlier.sendKeysFn?.(params)

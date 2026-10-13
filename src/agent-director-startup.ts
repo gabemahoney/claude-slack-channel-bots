@@ -30,7 +30,7 @@
  *      (ad-shim-decide-drops-token). These exist because a passing version
  *      check does not prove the npm-shipped TS shim matches the bundled Go
  *      binary; each missing surface silently breaks the permission relay.
- *   4. stat ~/.agent-director/state.db           — compare st_uid to
+ *   4. stat ~/.config/agent-director/state.db           — compare st_uid to
  *      geteuid(). ENOENT passes (the row is created on first verb call);
  *      other stat errors are fatal.
  *
@@ -92,7 +92,7 @@ import { buildBelowPhase1FloorMessage, buildSystemInstallTooOldMessage, meetsPha
 // ---------------------------------------------------------------------------
 
 /** Where AD persists its store; tilde-expanded for the same-user stat probe. */
-const AD_STATE_DB_PATH = join(os.homedir(), '.agent-director', 'state.db')
+const AD_STATE_DB_PATH = join(os.homedir(), '.config/agent-director', 'state.db')
 
 /** Supported platforms surfaced in operator-facing remediation text. */
 const SUPPORTED_PLATFORMS = ['linux-x64', 'darwin-arm64'] as const
@@ -584,7 +584,7 @@ export async function runStartupGate(
     }
   }
 
-  // Step 4: same-user check on ~/.agent-director/state.db.
+  // Step 4: same-user check on ~/.config/agent-director/state.db.
   let expectedUid = d.geteuid()
   if (expectedUid === undefined || expectedUid === -1) {
     // No platform UID — defensive log, continue. CSCB targets Linux; this

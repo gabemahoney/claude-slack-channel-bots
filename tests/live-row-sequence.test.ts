@@ -584,8 +584,8 @@ describe('pacing and limits: one kill, three runs spaced apart, a second kill, t
       armed: LIVE_ROW_ARM_ENDED,
     })
     // Every read and run has the shared entries' shape: P's own instance, a whole-store run.
-    expect(h.stub.calls.getCalls).toEqual(Array.from({ length: LIVE_ROW_SEQUENCE_MAX_RUNS + 1 }, () => ({ claude_instance_id: id })))
-    expect(h.stub.calls.killCalls).toEqual(Array.from({ length: LIVE_ROW_SEQUENCE_MAX_KILLS }, () => ({ claude_instance_id: id })))
+    expect(h.stub.calls.getCalls).toEqual(Array.from({ length: LIVE_ROW_SEQUENCE_MAX_RUNS + 1 }, () => ({ instance_id: id })))
+    expect(h.stub.calls.killCalls).toEqual(Array.from({ length: LIVE_ROW_SEQUENCE_MAX_KILLS }, () => ({ instance_id: id })))
     expect(h.stub.calls.findMissingCalls).toEqual(Array.from({ length: LIVE_ROW_SEQUENCE_MAX_RUNS }, () => ({})))
     expect(h.stub.calls.statusCalls).toEqual([])
     expect(h.episodeNotices).toEqual([killFailureNotice(p, ordinaryAlertContent(p), KILL_FAILURE_CLOSING_DESTINATION)])
@@ -1451,8 +1451,8 @@ describe('a failed get: UNAVAILABLE ends the sequence with the timer armed; UNUS
 
     expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_READ_REFUSED, step, runs: before })
     const line = liveRowSequenceGetLine(`persona=${p}`, step, { kind: LIVE_ROW_READ_REFUSED, error: err })
-    expect(err.unknownName).toBe('ErrInternal')
-    expect(line).toContain(`: step ${step} get: failed: class=${AD_ERROR_CLASS_UNCLASSIFIED} name=${err.unknownName} message="the store could not be read (${REDACTED_SENTINEL_TAIL})" (b.jg5 `)
+    expect(err.errName).toBe('ErrInternal')
+    expect(line).toContain(`: step ${step} get: failed: class=${AD_ERROR_CLASS_UNCLASSIFIED} name=${err.errName} message="the store could not be read (${REDACTED_SENTINEL_TAIL})" (b.jg5 `)
     expect(h.lines.filter((logged) => logged === line)).toHaveLength(1)
     assertNoLeak({ line })
   })
@@ -1571,7 +1571,7 @@ function finishedAtRun1(h: RecoveryHarness, key: string, read: PersonaGetResultO
 const RESUMABLE: LiveRowLaunchKindInput = {
   keepsConversation: true,
   retiredKey: false,
-  row: { claude_session_id: SESSION_ID },
+  row: { session_id: SESSION_ID },
   persona: { resumeEnabled: true, cwdMatches: true, configDirMatches: true },
 }
 
@@ -1585,7 +1585,7 @@ describe('the launch kind: a resume only when every condition holds; a reuse wit
     ['the persona does not keep its conversation', { ...RESUMABLE, keepsConversation: false }, LIVE_ROW_LAUNCH_REASON_NOT_KEPT],
     ['no row was read, the conversation kept', { ...RESUMABLE, row: undefined }, LIVE_ROW_LAUNCH_REASON_NO_ROW],
     ['the row has no session id', { ...RESUMABLE, row: {} }, LIVE_ROW_LAUNCH_REASON_NO_SESSION_ID],
-    ['the row\'s session id is blank', { ...RESUMABLE, row: { claude_session_id: ' ' } }, LIVE_ROW_LAUNCH_REASON_NO_SESSION_ID],
+    ['the row\'s session id is blank', { ...RESUMABLE, row: { session_id: ' ' } }, LIVE_ROW_LAUNCH_REASON_NO_SESSION_ID],
     ['the persona is not applied', { ...RESUMABLE, persona: undefined }, LIVE_ROW_LAUNCH_REASON_NOT_APPLIED],
     ['resume_enabled is false', { ...RESUMABLE, persona: { ...RESUMABLE.persona!, resumeEnabled: false } }, LIVE_ROW_LAUNCH_REASON_RESUME_DISABLED],
     ['the cwd differs', { ...RESUMABLE, persona: { ...RESUMABLE.persona!, cwdMatches: false } }, LIVE_ROW_LAUNCH_REASON_CWD_MISMATCH],
@@ -1598,7 +1598,7 @@ describe('the launch kind: a resume only when every condition holds; a reuse wit
 describe('the launch: a resume when the row has a session id and P keeps its conversation, a reuse of the same id otherwise (SRJ-705 step 6, AC 63)', () => {
   test('a row with a session id whose persona keeps its conversation: one resume of the id, no reuse', async () => {
     const { h, p } = build()
-    finishedAtRun1(h, p, { claude_session_id: SESSION_ID })
+    finishedAtRun1(h, p, { session_id: SESSION_ID })
 
     const outcome = await h.runSequence(p, { lastReadState: LIVE, keepsConversation: true })
 
@@ -1608,7 +1608,7 @@ describe('the launch: a resume when the row has a session id and P keeps its con
       reason: LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION,
       result: { key: p },
     })
-    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: personaInstanceId(p) }])
     // SRJ-1014: step 6's line names the launch kind and its reason, once, before the launch.
     const launchLine = liveRowSequenceLaunchLine(`persona=${p}`, { kind: LIVE_ROW_LAUNCH_RESUME, reason: LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION })
     expect(h.lines.filter((line) => line === launchLine)).toHaveLength(1)
@@ -1628,15 +1628,15 @@ describe('the launch: a resume when the row has a session id and P keeps its con
   test.each<[string, string, RecoveryHarnessOptions, (h: RecoveryHarness, key: string) => PersonaGetResultOverrides | Error, boolean]>([
     ['the last get reading no row (ErrSpawnNotFound)', LIVE_ROW_LAUNCH_REASON_NO_ROW, {}, () => errSpawnNotFound(), false],
     ['no session id', LIVE_ROW_LAUNCH_REASON_NO_SESSION_ID, {}, () => ({}), false],
-    ['resume_enabled=false', LIVE_ROW_LAUNCH_REASON_RESUME_DISABLED, { resumeEnabled: false }, () => ({ claude_session_id: SESSION_ID }), false],
-    ['a cwd mismatch', LIVE_ROW_LAUNCH_REASON_CWD_MISMATCH, {}, (h) => ({ claude_session_id: SESSION_ID, cwd: h.home }), false],
+    ['resume_enabled=false', LIVE_ROW_LAUNCH_REASON_RESUME_DISABLED, { resumeEnabled: false }, () => ({ session_id: SESSION_ID }), false],
+    ['a cwd mismatch', LIVE_ROW_LAUNCH_REASON_CWD_MISMATCH, {}, (h) => ({ session_id: SESSION_ID, cwd: h.home }), false],
     [
       'a config_dir label missing',
       LIVE_ROW_LAUNCH_REASON_CONFIG_DIR_MISMATCH,
       {},
       (h, key) => {
         const { config_dir: _dropped, ...labels } = personaRow(h, key).labels
-        return { claude_session_id: SESSION_ID, labels }
+        return { session_id: SESSION_ID, labels }
       },
       false,
     ],
@@ -1644,10 +1644,10 @@ describe('the launch: a resume when the row has a session id and P keeps its con
       'a config_dir label that differs',
       LIVE_ROW_LAUNCH_REASON_CONFIG_DIR_MISMATCH,
       {},
-      (h, key) => ({ claude_session_id: SESSION_ID, labels: { ...personaRow(h, key).labels, config_dir: h.stateDir } }),
+      (h, key) => ({ session_id: SESSION_ID, labels: { ...personaRow(h, key).labels, config_dir: h.stateDir } }),
       false,
     ],
-    ['a retired key', LIVE_ROW_LAUNCH_REASON_RETIRED_KEY, {}, () => ({ claude_session_id: SESSION_ID }), true],
+    ['a retired key', LIVE_ROW_LAUNCH_REASON_RETIRED_KEY, {}, () => ({ session_id: SESSION_ID }), true],
   ])('%s: one reuse spawn of the same id through the session manager\'s reuse spawn, with the flag and the persona\'s extra_env, and no resume', async (_label, reason, options, overrides, retiredKey) => {
     const { h, p } = build(options)
     finishedAtRun1(h, p, overrides(h, p))
@@ -1671,7 +1671,7 @@ describe('the launch: a resume when the row has a session id and P keeps its con
     ['control: neither, P keeping its conversation', false, false, LIVE_ROW_LAUNCH_RESUME, LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION],
   ])('%s: one launch of the kind that decides, handed the request\'s attempt-start reading unchanged', async (_label, retiredKey, retired, kind, reason) => {
     const { h, p } = build()
-    finishedAtRun1(h, p, { claude_session_id: SESSION_ID })
+    finishedAtRun1(h, p, { session_id: SESSION_ID })
     const retiredAtStart: RetiredKeyAttemptStart = { recorded: true, marked: false, generation: 3 }
     const launches: Array<Parameters<LiveRowSequenceDeps['launch']>> = []
 
@@ -2300,9 +2300,9 @@ describe('scheduling: each sequence runs in the background, one per persona at a
     const outcomes = await h.driveSequence(Promise.all([pRun.outcome, qRun.outcome]))
     expect(outcomes.map((outcome) => outcome.kind)).toEqual([LIVE_ROW_OUTCOME_LAUNCHED, LIVE_ROW_OUTCOME_LAUNCHED])
     // One chain each: one kill and one run per persona.
-    expect(h.stub.calls.killCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }, { claude_instance_id: personaInstanceId(q) }])
+    expect(h.stub.calls.killCalls).toEqual([{ instance_id: personaInstanceId(p) }, { instance_id: personaInstanceId(q) }])
     expect(hold.calls).toHaveLength(2)
-    expect(h.reuseSpawns().map((reuse) => reuse.claude_instance_id)).toEqual([personaInstanceId(p), personaInstanceId(q)])
+    expect(h.reuseSpawns().map((reuse) => reuse.instance_id)).toEqual([personaInstanceId(p), personaInstanceId(q)])
   })
 
   test('while P\'s sequence runs, a start-pass launch of P answers sequence-waiting and a restart-path launchSession the uncounted refused, with no agent-director call for P; Q\'s launch and Q\'s own sequence go ahead', async () => {
@@ -2318,7 +2318,7 @@ describe('scheduling: each sequence runs in the background, one per persona at a
     expect(personaCallCounts(h, p)).toEqual(pCalls)
     expect([isLaunchInFlight(p), getFailureCount(p), h.notices, h.triggers]).toEqual([false, 0, [], []])
     expect(await h.launch(q)).toEqual({ key: q, action: 'spawned' })
-    expect(h.stub.calls.spawnCalls.map((call) => call.claude_instance_id)).toEqual([personaInstanceId(q)])
+    expect(h.stub.calls.spawnCalls.map((call) => call.instance_id)).toEqual([personaInstanceId(q)])
     await h.runApproverToStop(q)
     const qRun = await startSequenceHeldAtRun(h, q, hold)
 
@@ -2479,7 +2479,7 @@ describe('scheduling: each sequence runs in the background, one per persona at a
 describe('started at a collision ladder replacement site: the launch answers while the sequence runs in the background, the sequence ends in a reuse, and a later retry begins a new episode (SRJ-707, SRJ-706)', () => {
   /** P's row in another directory read `state`, with a session id: a resume would keep the conversation. */
   const elsewhereWithSession = (h: RecoveryHarness, key: string, state: string): GetResult =>
-    personaRow(h, key, { cwd: h.home, state, claude_session_id: SESSION_ID })
+    personaRow(h, key, { cwd: h.home, state, session_id: SESSION_ID })
 
   /** The start line of P's sequence as the ladder starts it, the state it last read the seed. */
   const ladderStartLine = (h: RecoveryHarness, key: string, lastReadState: string): string =>
@@ -2491,7 +2491,7 @@ describe('started at a collision ladder replacement site: the launch answers whi
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getQueue: [cannedOk(elsewhereWithSession(h, p, LIVE))],
-      getResult: personaRow(h, p, { state: MISSING, claude_session_id: SESSION_ID }),
+      getResult: personaRow(h, p, { state: MISSING, session_id: SESSION_ID }),
     })
     const order = recordCallOrder(h)
 
@@ -2522,7 +2522,7 @@ describe('started at a collision ladder replacement site: the launch answers whi
       spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errInstanceIdCollision())],
       getFn: () => {
         if (episode === 1) return elsewhereWithSession(h, p, PENDING)
-        return secondGets++ === 0 ? elsewhereWithSession(h, p, LIVE) : personaRow(h, p, { state: ENDED, claude_session_id: SESSION_ID })
+        return secondGets++ === 0 ? elsewhereWithSession(h, p, LIVE) : personaRow(h, p, { state: ENDED, session_id: SESSION_ID })
       },
     })
 
@@ -2669,7 +2669,7 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
 
   test('the launch resolves while the sequence it started runs (its first run held), answering sequence-waiting with no launch of its own; released, the sequence reads the row missing with a session id and makes one resume of it, no reuse', async () => {
     const { h, p } = build()
-    scriptGoneNotResumable(h, p, personaRow(h, p, { state: MISSING, claude_session_id: SESSION_ID }))
+    scriptGoneNotResumable(h, p, personaRow(h, p, { state: MISSING, session_id: SESSION_ID }))
     const hold = holdFindMissing(h.stub.client)
     const order = recordCallOrder(h)
 
@@ -2691,14 +2691,14 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
       result: { key: p, action: 'resumed' },
     })
     expectCallsThenApprover(order, [...LADDER_CALLS, 'kill', 'get', 'findMissing', 'get', 'resume'])
-    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }, { claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: personaInstanceId(p) }, { instance_id: personaInstanceId(p) }])
     expect(h.reuseSpawns()).toEqual([])
     await h.runApproverToStop(p)
   })
 
   test.each<[string, PersonaGetResultOverrides, LiveRowSequenceLaunchKind, LiveRowSequenceLaunchReason]>([
-    ['ended with a session id', { state: ENDED, claude_session_id: SESSION_ID }, LIVE_ROW_LAUNCH_RESUME, LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION],
-    ['missing with a session id', { state: MISSING, claude_session_id: SESSION_ID }, LIVE_ROW_LAUNCH_RESUME, LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION],
+    ['ended with a session id', { state: ENDED, session_id: SESSION_ID }, LIVE_ROW_LAUNCH_RESUME, LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION],
+    ['missing with a session id', { state: MISSING, session_id: SESSION_ID }, LIVE_ROW_LAUNCH_RESUME, LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION],
     ['ended with no session id', { state: ENDED }, LIVE_ROW_LAUNCH_REUSE, LIVE_ROW_LAUNCH_REASON_NO_SESSION_ID],
   ])('the sequence kills, gets, runs and gets; a row read %s gives step 6\'s launch kind: a resume of the session id, or one reuse of the same id when it has none', async (_label, row, launchKind, reason) => {
     const { h, p } = build()
@@ -2753,7 +2753,7 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
       statusFn: () => cannedStatusResult({ state: calls.findMissingCalls.length > sweptAfter ? ENDED : LIVE }),
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getQueue: [cannedOk(personaRow(h, p)), cannedOk(personaRow(h, p))],
-      getResult: personaRow(h, p, { state: ENDED, claude_session_id: SESSION_ID }),
+      getResult: personaRow(h, p, { state: ENDED, session_id: SESSION_ID }),
       sendKeysError: errTmuxSendKeys(),
       resumeQueue: [cannedErr(errSpawnNotResumable())],
     })
@@ -2779,7 +2779,7 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
 
   /** Run P's sequence to its step-6 `resume`, which answers `err`; the `get` after it (the not-resumable step's re-read) answers `reread`. */
   async function runToStep6Resume(h: RecoveryHarness, key: string, err: Error, reread?: GetResult | Error): Promise<{ outcome: LiveRowSequenceOutcome; order: string[] }> {
-    const row = personaRow(h, key, { state: ENDED, claude_session_id: SESSION_ID })
+    const row = personaRow(h, key, { state: ENDED, session_id: SESSION_ID })
     h.script({ resumeError: err, getResult: row, ...(reread === undefined ? {} : { getQueue: [cannedOk(row), cannedOk(row), reread instanceof Error ? cannedErr(reread) : cannedOk(reread)] }) })
     const order = recordCallOrder(h)
     const outcome = await h.runSequence(key, { lastReadState: LIVE, keepsConversation: true })
@@ -2807,7 +2807,7 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
     expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, result: { key: p, action: 'spawned' } })
     expect(outcome.armed).toBeUndefined()
     expectCallsThenApprover(order, [...SEQUENCE_CALLS, 'spawn'])
-    expect(h.stub.calls.spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([[personaInstanceId(p), undefined]])
+    expect(h.stub.calls.spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([[personaInstanceId(p), undefined]])
     expect([h.notices, h.triggers, getFailureCount(p)]).toEqual([[], [{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }], 0])
     await h.runApproverToStop(p)
   })
@@ -2821,8 +2821,8 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
     let ended = false
     const id = personaInstanceId(p)
     h.script({
-      getResult: personaRow(h, p, { state: ENDED, claude_session_id: SESSION_ID }),
-      statusFn: (params) => (params.claude_instance_id === id && h.stub.calls.resumeCalls.length > 0 ? cannedStatusResult({ state: ended ? MISSING : PENDING }) : undefined),
+      getResult: personaRow(h, p, { state: ENDED, session_id: SESSION_ID }),
+      statusFn: (params) => (params.instance_id === id && h.stub.calls.resumeCalls.length > 0 ? cannedStatusResult({ state: ended ? MISSING : PENDING }) : undefined),
     })
     recordFailure(p)
 
@@ -2873,7 +2873,7 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       resumeError: undefined,
       statusResult: cannedStatusResult({ state: ENDED }),
-      statusFn: (params) => (params.claude_instance_id === id && h.stub.calls.resumeCalls.length > 1 ? cannedStatusResult({ state: LIVE }) : undefined),
+      statusFn: (params) => (params.instance_id === id && h.stub.calls.resumeCalls.length > 1 ? cannedStatusResult({ state: LIVE }) : undefined),
     })
     const retryOrder = recordCallOrder(h)
     await retryNow(h, p)
@@ -2943,7 +2943,7 @@ const STEP6_REUSES: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: st
   ['a reuse step 6 on a finished row', (h, key) => finishedAtRun1(h, key, {}), LIVE_ROW_LAUNCH_REUSE, ['kill', 'get', 'findMissing', 'get', 'spawn'], false],
   [
     'a resume step 6 whose ErrNoSessionId fallback reaches the reuse',
-    (h, key) => h.script({ resumeError: errNoSessionId(), getResult: personaRow(h, key, { state: ENDED, claude_session_id: SESSION_ID }) }),
+    (h, key) => h.script({ resumeError: errNoSessionId(), getResult: personaRow(h, key, { state: ENDED, session_id: SESSION_ID }) }),
     LIVE_ROW_LAUNCH_RESUME,
     ['kill', 'get', 'findMissing', 'get', 'resume', 'spawn'],
     true,
@@ -3025,7 +3025,7 @@ describe('a retired key\'s sequence: its final launch is a reuse that sets the m
     ['the starter did not set it (the start entry sets it while the key is recorded)', false],
   ] as const)('%s: over a live row whose session id P could resume, the sequence ends in one reuse of cscb_<key>, no resume; fresh-retired, and the mark is set', async (_label, retiredKey) => {
     const { h, p } = retiredBuild()
-    finishedAtRun1(h, p, { claude_session_id: SESSION_ID })
+    finishedAtRun1(h, p, { session_id: SESSION_ID })
     // The new life reads pending to the approver, so no read of it clears the entry (b.jg5 SRJ-807).
     h.script({ statusResult: cannedStatusResult({ state: PENDING }) })
 
@@ -3049,7 +3049,7 @@ describe('a retired key\'s sequence: its final launch is a reuse that sets the m
     ['ErrInvalidFlags (P held)', () => errInvalidFlags('spawn'), { kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: 'p', action: 'held' } }],
   ])('the final reuse answering %s: no resume, and no mark set or held', async (_label, make, ended) => {
     const { h, p } = retiredBuild()
-    finishedAtRun1(h, p, { claude_session_id: SESSION_ID })
+    finishedAtRun1(h, p, { session_id: SESSION_ID })
     h.script({ spawnError: make() })
     const writes = h.retiredKeyWrites.length
 
@@ -3125,7 +3125,7 @@ const FINAL_LAUNCHES: ReadonlyArray<readonly [string, FinalLaunch]> = [
       call: 'resume',
       timed: { verb: 'resume' },
       request: { lastReadState: LIVE, keepsConversation: true },
-      setup: (h, key) => finishedAtRun1(h, key, { claude_session_id: SESSION_ID }),
+      setup: (h, key) => finishedAtRun1(h, key, { session_id: SESSION_ID }),
     },
   ],
 ]
@@ -3237,12 +3237,12 @@ describe('the no-launch form as an old-life wait: step 5\'s ordinary text for an
     const { h, p, q } = build()
     const old = form(h, p, q)
     h.beginOldLifeHold({ instanceId: old.id, oldKey: old.oldKey, directory: h.home, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
-    h.script({ getResult: cannedGetResult({ claude_instance_id: old.id, cwd: h.home, tmux_session_name: old.session, labels: old.labels }) })
+    h.script({ getResult: cannedGetResult({ instance_id: old.id, cwd: h.home, tmux_session_name: old.session, labels: old.labels }) })
 
     expect(await h.runOldLifeWait(old.id)).toMatchObject({ kind: LIVE_ROW_OUTCOME_ESCALATED })
 
     const text = killFailureAlertText({ version: KILL_FAILURE_VERSION_ORDINARY, session: old.session, instanceId: old.id, quotes: {} }, KILL_FAILURE_CLOSING_LOG_ONLY, false)
-    expect(text).toContain(`--claude-instance-id ${old.id}`)
+    expect(text).toContain(`--instance-id ${old.id}`)
     expect(startupEntriesOf(h, PERSONA_KILL_FAILED_LABEL)).toEqual([killFailureAlertEntryText(oldLifeWaitRef(old.id, old.oldKey), KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT, text)])
     expect(killFailureLines(h, old.oldKey)).toEqual([
       killFailureLoggedLine(old.oldKey, KILL_FAILURE_VERSION_ORDINARY, PERSONA_KILL_FAILED_LABEL, KILL_FAILURE_ROUTE_NOT_CONFIGURED),

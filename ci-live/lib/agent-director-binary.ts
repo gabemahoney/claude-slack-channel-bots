@@ -29,11 +29,11 @@ export const nodeBinaryProbe: BinaryProbe = {
 
 /**
  * The agent-director binary the production CSCB on this host runs, found as
- * agent-director's own client finds it: `~/.agent-director/bin/agent-director`,
+ * agent-director's own client finds it: `~/.config/agent-director/bin/agent-director`,
  * else `agent-director` on PATH. Its real path, or `null`.
  */
 export function hostAgentDirectorBinary(home: string, path: string | undefined, probe: BinaryProbe = nodeBinaryProbe): string | null {
-  const candidates = [join(home, '.agent-director', 'bin', 'agent-director'), ...(path ?? '').split(delimiter).filter(Boolean).map((d) => join(d, 'agent-director'))]
+  const candidates = [join(home, '.config/agent-director', 'bin', 'agent-director'), ...(path ?? '').split(delimiter).filter(Boolean).map((d) => join(d, 'agent-director'))]
   for (const candidate of candidates) {
     try {
       probe.assertExecutable(candidate)

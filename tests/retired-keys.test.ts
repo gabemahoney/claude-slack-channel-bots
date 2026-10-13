@@ -1358,9 +1358,9 @@ interface RowFields {
 function rowRead(shape: LaunchStartReadShape, rowId: string, fields: RowFields): RowReadRow {
   if (shape === 'status') {
     const { liveness_note: _status_carries_no_note, ...statusFields } = fields
-    return { ...cannedStatusResult(statusFields), claude_instance_id: rowId }
+    return { ...cannedStatusResult(statusFields), instance_id: rowId }
   }
-  return shape === 'get' ? cannedGetResult({ claude_instance_id: rowId, ...fields }) : cannedListRow({ claude_instance_id: rowId, ...fields })
+  return shape === 'get' ? cannedGetResult({ instance_id: rowId, ...fields }) : cannedListRow({ instance_id: rowId, ...fields })
 }
 
 /** Key `key`'s own row (`cscb_<key>`), read with `shape`. */
@@ -1691,7 +1691,7 @@ describe('a recorded key\'s reuse that timed out but launched sets its mark, kep
    */
   function timedReuse(h: RecoveryHarness, p: string, options: TimedLaunchOptions): TimedLaunch {
     const t = scriptTimedLaunch(h, p, { reuse: true, takesMs: CALL_MS, ...options })
-    h.script({ statusFn: (params) => (params.claude_instance_id === personaInstanceId(p) && t.window()?.endMs !== undefined ? t.statusRow() : cannedStatusResult()) })
+    h.script({ statusFn: (params) => (params.instance_id === personaInstanceId(p) && t.window()?.endMs !== undefined ? t.statusRow() : cannedStatusResult()) })
     return t
   }
 
@@ -1716,7 +1716,7 @@ describe('a recorded key\'s reuse that timed out but launched sets its mark, kep
   /** P's own calls the stub recorded, by verb (a replacement would be a `spawn`, a `resume` or a `kill`). */
   function replacementsOf(h: RecoveryHarness, p: string): { spawns: number; resumes: number; kills: number } {
     const id = personaInstanceId(p)
-    const on = (calls: readonly { claude_instance_id?: unknown }[]): number => calls.filter((params) => params.claude_instance_id === id).length
+    const on = (calls: readonly { instance_id?: unknown }[]): number => calls.filter((params) => params.instance_id === id).length
     return { spawns: on(h.stub.calls.spawnCalls), resumes: on(h.stub.calls.resumeCalls), kills: on(h.stub.calls.killCalls) }
   }
 
@@ -1732,7 +1732,7 @@ describe('a recorded key\'s reuse that timed out but launched sets its mark, kep
 
       // One reuse spawn, then the one get; this launch's row recorded.
       expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
-      expect(h.stub.calls.getCalls.map((params) => params.claude_instance_id)).toEqual([personaInstanceId(p)])
+      expect(h.stub.calls.getCalls.map((params) => params.instance_id)).toEqual([personaInstanceId(p)])
       expect(thisLaunchRowOf(p)?.launchStartMs).toBe(Date.parse(t.launchStartedAt()!))
       // The mark: written once, in the file, P's entry otherwise as it was; Q's untouched.
       const marked = readRetiredKeysRecord(h.stateDir)!

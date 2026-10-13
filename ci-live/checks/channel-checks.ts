@@ -222,7 +222,7 @@ export const check5: CheckDef<CheckContext> = {
     const files = await waitFile(ctx, '~/cscb-live/a/permission-check.txt', REPLY_TIMEOUT_MS)
     const files2 = await waitFile(ctx, '~/cscb-live/a/permission-check-2.txt', REPLY_TIMEOUT_MS)
     f.expect(files && files2, 'permission-check.txt or permission-check-2.txt is missing')
-    const posts = (await promptPosts(ctx, tm)).filter((p) => p.claude_instance_id === 'cscb_persona_a')
+    const posts = (await promptPosts(ctx, tm)).filter((p) => p.instance_id === 'cscb_persona_a')
     f.expect(posts.length >= 2, `posts shows ${posts.length} prompt post(s) for A, not 2`)
     f.expect(posts.every((p) => p.channel === ctx.ids.aHome && p.ok === true), 'a prompt post for A is not ok in A-home')
     if (posts.length > 2) f.note(`Check 5: A raised ${posts.length} prompts, all in A-home`)

@@ -6596,12 +6596,12 @@ describe('bring-up outcomes (E5)', () => {
     const del = client.delete.bind(client)
     client.spawn = async params => {
       const result = await spawn(params)
-      if (rows.has(String(params.claude_instance_id))) throw errInstanceIdCollision()
+      if (rows.has(String(params.instance_id))) throw errInstanceIdCollision()
       return result
     }
     client.get = async params => {
       await get(params)
-      const row = rows.get(params.claude_instance_id)
+      const row = rows.get(params.instance_id)
       if (!row) throw errSpawnNotFound()
       return row.get
     }
@@ -6611,7 +6611,7 @@ describe('bring-up outcomes (E5)', () => {
     }
     client.delete = async params => {
       const result = await del(params)
-      for (const id of params.claude_instance_id) rows.delete(id)
+      for (const id of params.instance_id) rows.delete(id)
       return result
     }
   }
@@ -6622,14 +6622,14 @@ describe('bring-up outcomes (E5)', () => {
       list: cannedListRow({ state, cwd }, persona, spawnHome()),
       get: cannedGetResult({ state, cwd }, persona, spawnHome()),
     })
-    rows.set(ORPHAN_ID, { list: cannedListRow({ claude_instance_id: ORPHAN_ID }), get: cannedGetResult({ claude_instance_id: ORPHAN_ID }) })
+    rows.set(ORPHAN_ID, { list: cannedListRow({ instance_id: ORPHAN_ID }), get: cannedGetResult({ instance_id: ORPHAN_ID }) })
   }
 
   /** The agent-director calls addressing instance `id`, counted by verb; verbs with none are left out. */
   function adCallsFor(id: string): Record<string, number> {
     const out: Record<string, number> = {}
     for (const [verb, calls] of Object.entries(ad.calls)) {
-      const n = (calls as { claude_instance_id?: unknown }[]).filter(call => [call.claude_instance_id].flat().includes(id)).length
+      const n = (calls as { instance_id?: unknown }[]).filter(call => [call.instance_id].flat().includes(id)).length
       if (n > 0) out[verb.replace(/Calls$/, '')] = n
     }
     return out

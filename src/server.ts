@@ -1661,9 +1661,9 @@ export function _buildIsSessionAliveAdapter(
   return async (key: string) => {
     const config = getPersonaConfig()
     if (!config?.personas.some((p) => p.key === key)) return LIVENESS_READING_DEAD
-    const claude_instance_id = personaInstanceId(key)
+    const instance_id = personaInstanceId(key)
     try {
-      const r = await getClient().status({ claude_instance_id })
+      const r = await getClient().status({ instance_id })
       // b.jg5 SRJ-312: a `status` is not tmux-touching, so its success never
       // clears `tmux-unavailable`. It reads agent-director's store, so it
       // clears `ad-unreachable` and `ad-config-malformed`.
@@ -2267,9 +2267,9 @@ export function _buildReconnectSessionAdapter(
     // b.jg5 SRJ-115: a `pending` row's raw launch start, for `deferPendingRow`.
     let launchStartedAt: string | undefined
     try {
-      const claude_instance_id = personaInstanceId(key)
+      const instance_id = personaInstanceId(key)
       const st = await withOutageDetection(key, undefined, 'status', (client) =>
-        client.status({ claude_instance_id }),
+        client.status({ instance_id }),
       )
       // b.jg5 SRJ-115: the own-row rules over this answer; a read that
       // latched the persona types nothing. b.jg5 SRJ-809: the same step ends
@@ -3320,7 +3320,7 @@ export async function main(): Promise<void> {
   // client's own minimum), refuses a binary below CSCB's Phase 1 floor
   // (b.jg5 SRJ-203) before the Client is installed as the singleton, probes
   // the library's API surface, and verifies that the existing
-  // ~/.agent-director/state.db (if any) is owned by the current user. Any
+  // ~/.config/agent-director/state.db (if any) is owned by the current user. Any
   // failure records to startup-errors.log and exits non-zero. The gate runs
   // before the configuration is read, so its client has the client's default
   // call timeout; the call-timeout start step below replaces it with the

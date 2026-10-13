@@ -68,7 +68,7 @@ export const DEV_UNPARSEABLE_VERSION = 'dev'
  * (`command` with `args`) need Claude Code 2.1.139 or later. The one place
  * this value is written in `tests/` or `src/` code.
  */
-export const MIN_CLAUDE_CODE_VERSION = '2.1.280'
+export const MIN_CLAUDE_CODE_VERSION = '2.1.296'
 
 /** The installed client's floor file, as its package exports it. */
 export const FLOOR_SUBPATH = 'agent-director/dist/version-floor.json'

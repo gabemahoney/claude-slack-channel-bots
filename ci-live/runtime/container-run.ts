@@ -134,7 +134,7 @@ export class ContainerRun {
       throw new NotRunnableError(`${selected.reason}: give ${AGENT_DIRECTOR_BINARY_OPTION} the path of an executable agent-director binary to stage in the live image, then rerun`)
     }
     throw new NotRunnableError(
-      `no agent-director binary to stage in the live image: none was given with ${AGENT_DIRECTOR_BINARY_OPTION}, and none was found at ~/.agent-director/bin/agent-director or on PATH; ` +
+      `no agent-director binary to stage in the live image: none was given with ${AGENT_DIRECTOR_BINARY_OPTION}, and none was found at ~/.config/agent-director/bin/agent-director or on PATH; ` +
         `give the binary to stage with ${AGENT_DIRECTOR_BINARY_OPTION} <path>, then rerun`,
     )
   }

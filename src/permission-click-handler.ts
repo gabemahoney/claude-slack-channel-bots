@@ -2,7 +2,7 @@
  * permission-click-handler.ts — Block Kit decision relay.
  *
  * Consumes Socket Mode interactive events whose `action_id` matches
- * `perm_(allow|deny)_<claude_instance_id>_<request_token>`. The handler is
+ * `perm_(allow|deny)_<instance_id>_<request_token>`. The handler is
  * a small, single-AD-call function: it parses the action_id, calls AD's
  * `decide` (always carrying `request_token`), and — when a live entry is
  * still present — renders the operator-decide verdict against just that
@@ -171,7 +171,7 @@ async function renderPromptUpdate(
   deps: ClickDeps,
   emit: (partial: Omit<TrailEventBase, 'ts'> & { [extra: string]: unknown }) => void,
   persona: Persona,
-  entry: { claudeInstanceId: string; requestToken: string; channelId: string; messageTs: string },
+  entry: { instanceId: string; requestToken: string; channelId: string; messageTs: string },
   text: string,
   blocks: unknown[],
   verdictTag: ClosureVerdictTag,
@@ -181,14 +181,14 @@ async function renderPromptUpdate(
     logDeps(
       deps,
       `[slack] permission-click: no Slack client for ${renderPersonaRef(persona.name, persona.key)} — ` +
-        `update for ${entry.claudeInstanceId} (request_token=${entry.requestToken}, verdict=${verdictTag}) ` +
+        `update for ${entry.instanceId} (request_token=${entry.requestToken}, verdict=${verdictTag}) ` +
         'skipped; the next poller tick reconciles the rendering',
     )
     return false
   }
   const envelope = {
     event: 'cscb.chat_update.attempted',
-    claude_instance_id: entry.claudeInstanceId,
+    instance_id: entry.instanceId,
     request_token: entry.requestToken,
     channel: entry.channelId,
     message_ts: entry.messageTs,
@@ -210,7 +210,7 @@ async function renderPromptUpdate(
     // b.emk: failures land in BOTH server.log and the trail JSONL.
     logDeps(
       deps,
-      `[slack] permission-click: decision chat.update failed for ${entry.claudeInstanceId}${describeSlackCallFailure(err)}`,
+      `[slack] permission-click: decision chat.update failed for ${entry.instanceId}${describeSlackCallFailure(err)}`,
     )
     emit({ ...envelope, ok: false, error: classifySlackError(err) })
     return false
@@ -248,16 +248,16 @@ export async function handlePermissionClick(
   const parsed = parsePermissionActionId(actionId)
   if (parsed === null) return false
 
-  const { decision, claudeInstanceId, requestToken } = parsed
+  const { decision, instanceId, requestToken } = parsed
   const emit = deps.emitTrail ?? defaultEmitTrail
   // SR-V-2.6: live_pending captures the click-time state. Read the entry
   // here so the trail event records the value at handler entry, before any
   // markHandled / drop later in this function (or in the next tick) mutates
   // the map.
-  const earlyEntry = getLivePermission(claudeInstanceId, requestToken)
+  const earlyEntry = getLivePermission(instanceId, requestToken)
   emit({
     event: 'cscb.click_handler.invoked',
-    claude_instance_id: claudeInstanceId,
+    instance_id: instanceId,
     request_token: requestToken,
     channel: context.channel ?? earlyEntry?.channelId,
     message_ts: context.messageTs ?? earlyEntry?.messageTs,
@@ -274,7 +274,7 @@ export async function handlePermissionClick(
       deps,
       `[slack] permission-click-handler: cannot resolve the receiving persona ` +
         `(receiving key=${receivingKey ?? 'undefined'}, ` +
-        `claude_instance_id=${claudeInstanceId}, ` +
+        `instance_id=${instanceId}, ` +
         `action_id=${actionId}, ` +
         `request_token=${requestToken}) ` +
         `— logging and bypassing this click. This is a CSCB bug — investigate.`,
@@ -286,10 +286,10 @@ export async function handlePermissionClick(
   // decided or updated through this persona. The request stays open and
   // times out on agent-director's side.
   const expectedInstanceId = personaInstanceId(persona.key)
-  if (claudeInstanceId !== expectedInstanceId) {
+  if (instanceId !== expectedInstanceId) {
     logDeps(
       deps,
-      `[slack] permission-click-handler: click for ${claudeInstanceId} received for ` +
+      `[slack] permission-click-handler: click for ${instanceId} received for ` +
         `${renderPersonaRef(persona.name, persona.key)} (instance ${expectedInstanceId}) — ` +
         `not deciding (request_token=${requestToken})`,
     )
@@ -302,20 +302,26 @@ export async function handlePermissionClick(
   // AD interaction (SR-4.3 retires the pre-decide get).
   const decideEnvelope = {
     event: 'cscb.ad_decide.attempted',
-    claude_instance_id: claudeInstanceId,
+    instance_id: instanceId,
     request_token: requestToken,
     decision,
   }
   try {
-    await withOutageDetection(persona.key, undefined, 'decide', (client) =>
+    const result = await withOutageDetection(persona.key, undefined, 'decide', (client) =>
       decideWithToken(client, {
-        claude_instance_id: claudeInstanceId,
+        instance_id: instanceId,
         decision,
         request_token: requestToken,
       }),
     )
     // SR-V-2.7 call-side success emission.
-    emit({ ...decideEnvelope, result_class: 'ok' satisfies AdDecideResponseClass })
+    emit({ ...decideEnvelope, result_class: 'ok' satisfies AdDecideResponseClass, delivery: result.delivery, confirm_by: result.confirm_by })
+    if (result.delivery !== 'delivered') {
+      const pending = getLivePermission(instanceId, requestToken)
+      if (pending) pending.awaitingDelivery = true
+      logDeps(deps, `[slack] permission-click: verdict recorded for ${instanceId} token=${requestToken}, delivery not confirmed; polling until ${result.confirm_by}`)
+      return true
+    }
   } catch (err) {
     // The `AgentDirectorError` check only narrows the type for the trail fields.
     if (
@@ -367,11 +373,11 @@ export async function handlePermissionClick(
     if (err instanceof ErrRelayFallenBack) {
       logDeps(
         deps,
-        `[slack] permission-click: ErrRelayFallenBack from decide for ${claudeInstanceId} ` +
+        `[slack] permission-click: ErrRelayFallenBack from decide for ${instanceId} ` +
           `(request_token=${requestToken}) — relay window elapsed; the prompt must be ` +
           `answered at the session's tmux pane`,
       )
-      const staleEntry = getLivePermission(claudeInstanceId, requestToken)
+      const staleEntry = getLivePermission(instanceId, requestToken)
       if (staleEntry) {
         // Deliberately no markHandled(): this is not a verdict. The request row
         // stays open on AD's side, so a later poller closure (timeout /
@@ -389,7 +395,7 @@ export async function handlePermissionClick(
       return true
     }
     if (isInvalidFlagsError(err)) {
-      logDeps(deps, `[slack] permission-click: ErrInvalidFlags from decide for ${claudeInstanceId} (request_token=${requestToken})`)
+      logDeps(deps, `[slack] permission-click: ErrInvalidFlags from decide for ${instanceId} (request_token=${requestToken})`)
       // b.jg5 SRJ-204, SRJ-104: the ErrInvalidFlags step — one immediate
       // version re-check (a stop it decides ends the process), class
       // UNCLASSIFIED. The line above, the trail event, the no-retry and the
@@ -405,17 +411,17 @@ export async function handlePermissionClick(
     // ErrAmbiguousRequest is a defense-in-depth backstop per SR-4.4; under
     // contract it should be unreachable.
     if (err instanceof AgentDirectorError && err.errName === 'ErrAmbiguousRequest') {
-      logDeps(deps, `[slack] permission-click: ErrAmbiguousRequest from decide for ${claudeInstanceId} (request_token=${requestToken})`)
+      logDeps(deps, `[slack] permission-click: ErrAmbiguousRequest from decide for ${instanceId} (request_token=${requestToken})`)
       return true
     }
-    logDeps(deps, `[slack] permission-click: decide failed for ${claudeInstanceId}: ${describeAgentDirectorFailure(err)}`)
+    logDeps(deps, `[slack] permission-click: decide failed for ${instanceId}: ${describeAgentDirectorFailure(err)}`)
     return true
   }
 
   // SR-4.2 stale-click semantics: decide already fired; no live entry means
   // nothing to render against here. (The poller's reconciliation tick will
   // surface the closure on whichever Slack message currently tracks it.)
-  const entry = getLivePermission(claudeInstanceId, requestToken)
+  const entry = getLivePermission(instanceId, requestToken)
   if (!entry) return true
 
   // SR-4.5 sibling independence: target only this row's messageTs.
@@ -427,7 +433,7 @@ export async function handlePermissionClick(
     ? 'click_handler_allow'
     : 'click_handler_deny'
   const ok = await renderPromptUpdate(deps, emit, persona, entry, text, blocks, verdictTag)
-  if (ok) markHandled(claudeInstanceId, requestToken)
+  if (ok) markHandled(instanceId, requestToken)
   return true
 }
 
@@ -484,7 +490,7 @@ export function emitBlockActionReceived(
   if (parsed !== null) {
     emit({
       ...base,
-      claude_instance_id: parsed.claudeInstanceId,
+      instance_id: parsed.instanceId,
       request_token: parsed.requestToken,
       decision: parsed.decision,
     })

@@ -11,7 +11,7 @@
  * Only reads: `agent-director list`, `tmux ls`, /proc and a file hash. Never
  * a start, stop, kill, connect or write. The probes read the state the
  * production bots use: `agent-director` with the store path CSCB pins
- * (`--store-path ~/.agent-director/state.db`), `tmux` with the host's
+ * (`--store-path ~/.config/agent-director/state.db`), `tmux` with the host's
  * `TMUX_TMPDIR` (passed through by `minimalChildEnv`). The run passes the HOST
  * check only when both snapshots are equal and no probe failed.
  */
@@ -89,7 +89,7 @@ export function parseAdRows(stdout: string): string[] | null {
     const parsed = JSON.parse(stdout) as { spawns?: unknown }
     if (!Array.isArray(parsed.spawns)) return null
     return parsed.spawns
-      .map((s) => (s && typeof s === 'object' ? String((s as Record<string, unknown>).claude_instance_id ?? '?') : '?'))
+      .map((s) => (s && typeof s === 'object' ? String((s as Record<string, unknown>).instance_id ?? '?') : '?'))
       .sort()
   } catch {
     return null
@@ -108,7 +108,7 @@ export function parseTmuxSessions(stdout: string): string[] {
 
 /** The agent-director store CSCB pins (`DEFAULT_STORE_PATH` in src/agent-director-client.ts), under `home`. */
 export function hostStorePath(home: string): string {
-  return join(home, '.agent-director', 'state.db')
+  return join(home, '.config/agent-director', 'state.db')
 }
 
 /**

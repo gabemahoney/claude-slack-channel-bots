@@ -469,7 +469,7 @@ const holdsOf = (h: RecoveryHarness): HoldFields[] => h.oldLifeHolds.snapshot().
 /** A live pre-persona row (b.1ix): only the `service` and `channel` labels. */
 function prePersonaRow(state = 'waiting'): ListRow {
   const id = `cscb_old_${state}_C0OLD`
-  return cannedListRow({ claude_instance_id: id, state, labels: { ...PRE_PERSONA_LABELS }, tmux_session_name: id.replace(/^cscb_/, 'slack_bot_') })
+  return cannedListRow({ instance_id: id, state, labels: { ...PRE_PERSONA_LABELS }, tmux_session_name: id.replace(/^cscb_/, 'slack_bot_') })
 }
 
 // ---------------------------------------------------------------------------
@@ -865,16 +865,16 @@ describe('b.jg5 SRJ-809 starts 2 and 3, SRJ-714: the start sweep holds the cwd o
     h.script({ killError: errTmuxKillFailed() })
     const pre = prePersonaRow()
     const absent = absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)
-    const bOld = listed(h, b, { claude_instance_id: `${personaInstanceId(b)}_old` })
+    const bOld = listed(h, b, { instance_id: `${personaInstanceId(b)}_old` })
     const bElsewhere = listed(h, b, { cwd: h.home })
 
     await sweepOver(h, [pre, absent, bOld, bElsewhere])
 
-    expect([...new Set(h.stub.calls.killCalls.map((k) => k.claude_instance_id))]).toEqual([pre, absent, bOld, bElsewhere].map((row) => row.claude_instance_id))
+    expect([...new Set(h.stub.calls.killCalls.map((k) => k.instance_id))]).toEqual([pre, absent, bOld, bElsewhere].map((row) => row.instance_id))
     expect(holdsOf(h)).toEqual([
-      hold(absent.claude_instance_id, LAUNCH_START_ABSENT_PERSONA_KEY, absent.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING, true),
-      hold(pre.claude_instance_id, pre.claude_instance_id, pre.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL, true),
-      hold(bOld.claude_instance_id, bOld.claude_instance_id, bOld.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL, true),
+      hold(absent.instance_id, LAUNCH_START_ABSENT_PERSONA_KEY, absent.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING, true),
+      hold(pre.instance_id, pre.instance_id, pre.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL, true),
+      hold(bOld.instance_id, bOld.instance_id, bOld.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL, true),
       hold(personaInstanceId(b), b, h.home, OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL, true),
     ])
     expect(beganLinesIn(h.errors)).toEqual(h.oldLifeHolds.snapshot().map((view) => oldLifeHoldBeganLine(view)))
@@ -911,8 +911,8 @@ describe('b.jg5 SRJ-809 starts 2 and 3, SRJ-714: the start sweep holds the cwd o
 
     await sweepOver(h, [row])
 
-    expect(h.stub.calls.killCalls.map((k) => k.claude_instance_id)).toEqual([row.claude_instance_id])
-    expect(holdsOf(h)).toEqual([hold(row.claude_instance_id, LAUNCH_START_ABSENT_PERSONA_KEY, row.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING)])
+    expect(h.stub.calls.killCalls.map((k) => k.instance_id)).toEqual([row.instance_id])
+    expect(holdsOf(h)).toEqual([hold(row.instance_id, LAUNCH_START_ABSENT_PERSONA_KEY, row.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING)])
     expect(beganLinesIn(h.errors)).toHaveLength(1)
   })
 
@@ -920,7 +920,7 @@ describe('b.jg5 SRJ-809 starts 2 and 3, SRJ-714: the start sweep holds the cwd o
     ['P\'s own row in its directory: kept, with no kill', (h, p) => listed(h, p), (_h, p) => p],
     ['P\'s own row listed pending (a launch start): kept, with no kill', (h, p) => listed(h, p, { state: AGENT_DIRECTOR_PENDING_STATE }), (_h, p) => p],
     ['P\'s own row carrying provenance_conflict: spared for P\'s latch, with no kill', (h, p) => listed(h, p, { liveness_note: provenanceNote }), (_h, p) => p],
-    ['P\'s row under another instance id: swept and killed, its instance id the old key', (h, p) => listed(h, p, { claude_instance_id: `${personaInstanceId(p)}_old` }), (_h, p) => `${personaInstanceId(p)}_old`],
+    ['P\'s row under another instance id: swept and killed, its instance id the old key', (h, p) => listed(h, p, { instance_id: `${personaInstanceId(p)}_old` }), (_h, p) => `${personaInstanceId(p)}_old`],
   ])('P recorded without its mark, %s: one listing hold at the row\'s cwd', async (_label, row, oldKey) => {
     const { h, p } = build()
     h.retireKey(p)
@@ -928,7 +928,7 @@ describe('b.jg5 SRJ-809 starts 2 and 3, SRJ-714: the start sweep holds the cwd o
 
     await sweepOver(h, [listedRow])
 
-    expect(holdsOf(h)).toEqual([hold(listedRow.claude_instance_id, oldKey(h, p), listedRow.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING)])
+    expect(holdsOf(h)).toEqual([hold(listedRow.instance_id, oldKey(h, p), listedRow.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING)])
     expect(beganLinesIn(h.errors)).toEqual([oldLifeHoldBeganLine(h.oldLifeHolds.snapshot()[0]!)])
   })
 
@@ -937,8 +937,8 @@ describe('b.jg5 SRJ-809 starts 2 and 3, SRJ-714: the start sweep holds the cwd o
       h.retireKey(p, { mark: true })
       return [listed(h, p, { state: AGENT_DIRECTOR_PENDING_STATE })]
     }],
-    ['an absent persona\'s finished rows (its key recorded)', (h) => [...AGENT_DIRECTOR_DEAD_STATES].map((state, i) => absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { state, claude_instance_id: `${personaInstanceId(LAUNCH_START_ABSENT_PERSONA_KEY)}_${i}` }))],
-    ['B not recorded: its row under another instance id, killed', (h, _p, b) => [listed(h, b, { claude_instance_id: `${personaInstanceId(b)}_old` })]],
+    ['an absent persona\'s finished rows (its key recorded)', (h) => [...AGENT_DIRECTOR_DEAD_STATES].map((state, i) => absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { state, instance_id: `${personaInstanceId(LAUNCH_START_ABSENT_PERSONA_KEY)}_${i}` }))],
+    ['B not recorded: its row under another instance id, killed', (h, _p, b) => [listed(h, b, { instance_id: `${personaInstanceId(b)}_old` })]],
     ['P recorded without its mark, its own row finished', (h, p) => {
       h.retireKey(p)
       return [listed(h, p, { state: 'ended' })]
@@ -958,7 +958,7 @@ describe('b.jg5 SRJ-809 starts 2 and 3, SRJ-714: the start sweep holds the cwd o
     [
       'during the first kill\'s tries (ErrTmuxKillFailed): the listing hold begun before stands, unmarked; the stopped kill begins and marks nothing, and no later row is killed',
       (h) => h.stub.calls.killCalls.length > 0,
-      (_h, absent) => [hold(absent.claude_instance_id, LAUNCH_START_ABSENT_PERSONA_KEY, absent.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING)],
+      (_h, absent) => [hold(absent.instance_id, LAUNCH_START_ABSENT_PERSONA_KEY, absent.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING)],
       1,
     ],
   ])('the sweep\'s shutdown query answering true %s: no hold begins after it', async (_label, shuttingDown, expected, kills) => {
@@ -966,7 +966,7 @@ describe('b.jg5 SRJ-809 starts 2 and 3, SRJ-714: the start sweep holds the cwd o
     h.script({ killError: errTmuxKillFailed() })
     const absent = absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)
 
-    await sweepOver(h, [absent, listed(h, b, { claude_instance_id: `${personaInstanceId(b)}_old` })], h.config, () => shuttingDown(h))
+    await sweepOver(h, [absent, listed(h, b, { instance_id: `${personaInstanceId(b)}_old` })], h.config, () => shuttingDown(h))
 
     expect(holdsOf(h)).toEqual(expected(h, absent))
     expect(h.stub.calls.killCalls).toHaveLength(kills)
@@ -1024,7 +1024,7 @@ describe('b.jg5 SRJ-809, SRJ-703, SRJ-812 (AC 54, AC 63): no kill outcome ends a
     await sweepOver(h, [row])
 
     expect(h.stub.calls.findMissingCalls).toHaveLength(1)
-    expect(holdsOf(h)).toEqual([hold(row.claude_instance_id, LAUNCH_START_ABSENT_PERSONA_KEY, row.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING, marks)])
+    expect(holdsOf(h)).toEqual([hold(row.instance_id, LAUNCH_START_ABSENT_PERSONA_KEY, row.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING, marks)])
     expect(endedLinesIn(h.errors)).toEqual([])
   })
 })
@@ -1132,7 +1132,7 @@ interface OldRow {
 
 /** A non-persona old row in P's working directory, with `extra` fields (its labels). */
 function oldRowAt(h: RecoveryHarness, p: string, instanceId: string, oldKey: string, extra: PersonaGetResultOverrides): OldRow {
-  return { instanceId, oldKey, row: (overrides = {}) => cannedGetResult({ claude_instance_id: instanceId, cwd: personaOf(h, p).working_directory, ...extra, ...overrides }) }
+  return { instanceId, oldKey, row: (overrides = {}) => cannedGetResult({ instance_id: instanceId, cwd: personaOf(h, p).working_directory, ...extra, ...overrides }) }
 }
 
 /** The id forms an old row comes in (SRJ-809's old key, SRJ-1007's ids), each on a harness over P and B; P waits on each. */
@@ -1204,8 +1204,8 @@ const killTries = (tries = KILL_RETRY_TRIES): string[] => ['kill', ...Array.from
 
 /** Every call that names an instance id names `id`; and no launch (`spawn`, `resume`) was made. */
 function expectOnlyOn(h: RecoveryHarness, id: string): void {
-  const named = (Object.values(h.stub.calls).flat() as Array<{ claude_instance_id?: unknown } | undefined>).filter((params) => params?.claude_instance_id !== undefined)
-  expect(named.filter((params) => params?.claude_instance_id !== id)).toEqual([])
+  const named = (Object.values(h.stub.calls).flat() as Array<{ instance_id?: unknown } | undefined>).filter((params) => params?.instance_id !== undefined)
+  expect(named.filter((params) => params?.instance_id !== id)).toEqual([])
   expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[], []])
 }
 
@@ -1262,13 +1262,13 @@ describe('b.jg5 SRJ-811, SRJ-1512: the wait\'s steps run on the old id only, wit
     const { h, p, b, old } = heldOld(OLD_ROWS[3]![1])
     const q = b
     h.script({
-      getFn: (params) => (params.claude_instance_id === personaInstanceId(q) ? personaRow(h, q) : personaRow(h, p)),
+      getFn: (params) => (params.instance_id === personaInstanceId(q) ? personaRow(h, q) : personaRow(h, p)),
       findMissingResult: cannedFindMissing({ rows: { [personaInstanceId(p)]: 'unverified_ids', [personaInstanceId(q)]: 'unverified_ids' } }),
     })
 
     await h.runOldLifeWait(old.instanceId)
 
-    const gets = h.stub.calls.getCalls.map((params) => params.claude_instance_id)
+    const gets = h.stub.calls.getCalls.map((params) => params.instance_id)
     // Step 2's get, then each of the four runs: Q's provenance get, then the wait's get of P's row.
     expect(gets).toEqual([personaInstanceId(p), ...Array.from({ length: LIVE_ROW_SEQUENCE_MAX_RUNS }, () => [personaInstanceId(q), personaInstanceId(p)]).flat()])
   })
@@ -1342,8 +1342,8 @@ describe('b.jg5 SRJ-811, SRJ-706: a wait on one id never refuses a waiting perso
     const read = new Set<string>()
     h.script({
       getFn: (params) => {
-        if (params.claude_instance_id === PRE_PERSONA_ID) return old.row()
-        const key = h.keys.find((k) => personaInstanceId(k) === params.claude_instance_id)!
+        if (params.instance_id === PRE_PERSONA_ID) return old.row()
+        const key = h.keys.find((k) => personaInstanceId(k) === params.instance_id)!
         const first = !read.has(key)
         read.add(key)
         return personaRow(h, key, first ? {} : { state: LIVENESS_DEAD_ROW_MISSING })
@@ -1553,11 +1553,11 @@ describe('b.jg5 SRJ-1001, SRJ-811: the session a wait\'s kill-failure alert name
     const row: ListRow = { ...prePersonaRow(), cwd: personaOf(h, p).working_directory }
     h.script({ killQueue: [cannedErr(errTmuxSessionConflict('kill', 'different-id'))] })
     await sweepOver(h, [row])
-    expect(holdsOf(h)).toEqual([hold(row.claude_instance_id, row.claude_instance_id, row.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL)])
+    expect(holdsOf(h)).toEqual([hold(row.instance_id, row.instance_id, row.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL)])
     const before = startupEntries(h).length
     const err = errTmuxKillFailed()
     h.script({ killQueue: [], killError: err })
-    const old = oldRowAt(h, p, row.claude_instance_id, row.claude_instance_id, {})
+    const old = oldRowAt(h, p, row.instance_id, row.instance_id, {})
 
     await h.runOldLifeWait(old.instanceId)
 
@@ -1712,17 +1712,17 @@ describe('b.jg5 SRJ-811, E12: UNCLASSIFIED and CONFIG in the wait', () => {
     h.retireKey(p)
     const row = listed(h, p, { state: AGENT_DIRECTOR_PENDING_STATE })
     await sweepOver(h, [row])
-    expect(holdsOf(h)).toEqual([hold(row.claude_instance_id, p, row.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING)])
+    expect(holdsOf(h)).toEqual([hold(row.instance_id, p, row.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING)])
     raiseAdConfigMalformed(p, errConfigMalformed())
     const order = recordCallOrder(h)
 
-    expect(await h.runOldLifeWait(row.claude_instance_id)).toMatchObject({ kind: LIVE_ROW_OUTCOME_CONFIG_MALFORMED, step: 1 })
+    expect(await h.runOldLifeWait(row.instance_id)).toMatchObject({ kind: LIVE_ROW_OUTCOME_CONFIG_MALFORMED, step: 1 })
 
     expect(order).toEqual([])
-    expect(h.oldLifeHolds.holdOf(row.claude_instance_id)?.killFailed).toBe(false)
+    expect(h.oldLifeHolds.holdOf(row.instance_id)?.killFailed).toBe(false)
     expect(oldLifeArms(h)).toEqual([p])
-    expect(h.errors.filter((line) => line.startsWith(waitEndLinePrefix(row.claude_instance_id, p)))).toEqual([
-      waitEndLine(row.claude_instance_id, p, { kind: OLD_LIFE_WAIT_END_CONFIG, kept: true }, [p]),
+    expect(h.errors.filter((line) => line.startsWith(waitEndLinePrefix(row.instance_id, p)))).toEqual([
+      waitEndLine(row.instance_id, p, { kind: OLD_LIFE_WAIT_END_CONFIG, kept: true }, [p]),
     ])
   })
 
@@ -1857,7 +1857,7 @@ describe('b.jg5 SRJ-502, SRJ-513, SRJ-812, SRJ-811, SRJ-305, SRJ-702: a wait on 
 
   test('a waiting persona\'s latch never stops a wait on a row it does not own: P latched by a read of its own row, the wait on a pre-persona row held in P\'s directory makes its kill and its get, which reads the row ended and ends the hold', async () => {
     const { h, p, old } = heldOld(OLD_ROWS[1]![1])
-    h.script({ getFn: (params) => (params.claude_instance_id === personaInstanceId(p) ? personaRow(h, p, { liveness_note: provenanceNote }) : old.row({ state: LIVENESS_DEAD_ROW_ENDED })) })
+    h.script({ getFn: (params) => (params.instance_id === personaInstanceId(p) ? personaRow(h, p, { liveness_note: provenanceNote }) : old.row({ state: LIVENESS_DEAD_ROW_ENDED })) })
     await readPersonaOwnRow(p, { site: 'old-life-wait.test', what: 'own-row get' })
     expect(h.latch.isLatched(p)).toBe(true)
     const order = recordCallOrder(h)
@@ -2187,10 +2187,10 @@ describe('b.jg5 SRJ-811\'s Test line, SRJ-702 (AC 64; option A): a hold that end
 const realDirOf = (h: RecoveryHarness, key: string): string => realpathSync(personaOf(h, key).working_directory)
 
 /** Persona `key`'s spawns the stub recorded. */
-const spawnsOf = (h: RecoveryHarness, key: string) => h.stub.calls.spawnCalls.filter((params) => params.claude_instance_id === personaInstanceId(key))
+const spawnsOf = (h: RecoveryHarness, key: string) => h.stub.calls.spawnCalls.filter((params) => params.instance_id === personaInstanceId(key))
 
 /** Every `send-keys` the stub recorded on `instanceId`. */
-const sendKeysOn = (h: RecoveryHarness, instanceId: string) => h.stub.calls.sendKeysCalls.filter((params) => params.claude_instance_id === instanceId)
+const sendKeysOn = (h: RecoveryHarness, instanceId: string) => h.stub.calls.sendKeysCalls.filter((params) => params.instance_id === instanceId)
 
 /**
  * End the hold on `instanceId` as its wait's held first run listing the old
@@ -2310,7 +2310,7 @@ describe('b.jg5 SRJ-810 bullet 3, SRJ-1502, SRJ-301: the launch gate holds back 
 
     expect(gateLinesIn(h)).toEqual([])
     expect([oldLifeArms(h), h.oldLifeWaitRunning(personaInstanceId(p)), h.oldLifeHolds.holdOf(personaInstanceId(p))]).toEqual([[], false, undefined])
-    expect(h.reuseSpawns().map((params) => params.claude_instance_id)).toEqual([personaInstanceId(p), personaInstanceId(p)])
+    expect(h.reuseSpawns().map((params) => params.instance_id)).toEqual([personaInstanceId(p), personaInstanceId(p)])
     expect(spawnsOf(h, p)).toHaveLength(2)
     await h.runApproverToStop(p)
   })
@@ -2320,7 +2320,7 @@ describe('b.jg5 SRJ-810 bullet 3, SRJ-1502, SRJ-301: the launch gate holds back 
 const SWEPT_IN_P_DIR: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string, b: string) => ListRow]> = [
   ['an absent persona\'s row', (h) => absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)],
   ['a live pre-persona row', (h, p) => ({ ...prePersonaRow(), cwd: personaOf(h, p).working_directory })],
-  ['a row swept for its instance id (B\'s label, another id)', (h, p, b) => listed(h, b, { claude_instance_id: `${personaInstanceId(b)}_old`, cwd: personaOf(h, p).working_directory })],
+  ['a row swept for its instance id (B\'s label, another id)', (h, p, b) => listed(h, b, { instance_id: `${personaInstanceId(b)}_old`, cwd: personaOf(h, p).working_directory })],
   ['a row swept for its cwd (B\'s own row in P\'s directory)', (h, p, b) => listed(h, b, { cwd: personaOf(h, p).working_directory })],
 ]
 
@@ -2332,10 +2332,10 @@ describe('b.jg5 SRJ-811\'s Test line (Q-9), SRJ-810: a persona in the cwd of eac
     const row = swept(h, p, b)
     h.script({ killError: errTmuxKillFailed() })
     await sweepOver(h, [row])
-    const id = row.claude_instance_id
+    const id = row.instance_id
     expect(h.oldLifeHolds.holdOf(id)).toMatchObject({ directory: personaOf(h, p).working_directory, killFailed: true })
     const killsBefore = h.stub.calls.killCalls.length
-    h.script({ killError: undefined, getFn: (params) => cannedGetResult({ claude_instance_id: params.claude_instance_id, cwd: row.cwd }) })
+    h.script({ killError: undefined, getFn: (params) => cannedGetResult({ instance_id: params.instance_id, cwd: row.cwd }) })
     rowReadsUntilSpawn(h, UNAVAILABLE_RETRY_ROW_ABSENT)
     const hold = holdFindMissing(h.stub.client)
 
@@ -2344,7 +2344,7 @@ describe('b.jg5 SRJ-811\'s Test line (Q-9), SRJ-810: a persona in the cwd of eac
 
     expect(h.oldLifeWaitRunning(id)).toBe(true)
     expect(h.oldLifeHolds.holdOf(id)?.waiting).toEqual([p])
-    expect(h.stub.calls.killCalls.slice(killsBefore).map((k) => k.claude_instance_id)).toEqual([id])
+    expect(h.stub.calls.killCalls.slice(killsBefore).map((k) => k.instance_id)).toEqual([id])
     expect(hold.calls).toHaveLength(1)
     expect(gateLinesIn(h)).toEqual([gateLine(h, p, id, LIVE_ROW_START_STARTED)])
     expect(spawnsOf(h, p)).toEqual([])
@@ -2376,7 +2376,7 @@ describe('b.jg5 SRJ-810 (hatch A3), SRJ-812: a persona already running when its 
     expect(h.holdEndRetries).toEqual([{ key: p, at: endedAt, result: UNAVAILABLE_RETRY_RUN_NOW_RAN }])
     expect(h.attempts.map((a) => [a.key, a.at])).toEqual([[p, endedAt]])
     expect(personaCallCounts(h, p)).toEqual({ statusCalls: 1 })
-    expect([h.stub.calls.killCalls.filter((k) => k.claude_instance_id === personaInstanceId(p)), h.stub.calls.sendKeysCalls, spawnsOf(h, p)]).toEqual([[], [], []])
+    expect([h.stub.calls.killCalls.filter((k) => k.instance_id === personaInstanceId(p)), h.stub.calls.sendKeysCalls, spawnsOf(h, p)]).toEqual([[], [], []])
     expect(h.controller.isArmed(p)).toBe(false)
   })
 })
@@ -2534,8 +2534,8 @@ describe('b.jg5 SRJ-810, SRJ-811 (Q-9): B\'s own row swept into P\'s directory, 
     h.script({ killError: errTmuxKillFailed() })
     await sweepOver(h, [row])
     const id = personaInstanceId(b)
-    expect(row.claude_instance_id).toBe(id)
-    h.script({ killError: undefined, getFn: (params) => cannedGetResult({ claude_instance_id: params.claude_instance_id, cwd: row.cwd }) })
+    expect(row.instance_id).toBe(id)
+    h.script({ killError: undefined, getFn: (params) => cannedGetResult({ instance_id: params.instance_id, cwd: row.cwd }) })
     rowReadsUntilSpawn(h, UNAVAILABLE_RETRY_ROW_ABSENT)
     const hold = holdFindMissing(h.stub.client)
 
@@ -2685,7 +2685,7 @@ describe('b.jg5 SRJ-809, SRJ-806, SRJ-407: a reuse that timed out but launched e
     h.retireKey(p, { cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY })
     beginApplyHold(h, p, b)
     const bReads = rowReadsUntilSpawn(h, UNAVAILABLE_RETRY_ROW_ABSENT)
-    h.script({ getFn: (params) => (params.claude_instance_id === id ? personaRow(h, p, { state: 'waiting', cwd: personaOf(h, b).working_directory }) : undefined) })
+    h.script({ getFn: (params) => (params.instance_id === id ? personaRow(h, p, { state: 'waiting', cwd: personaOf(h, b).working_directory }) : undefined) })
 
     expect(await h.launch(b)).toStrictEqual(heldBack(b))
     expect(await h.driveSequence(h.oldLifeWaitSettled(id))).toMatchObject({ kind: LIVE_ROW_OUTCOME_ESCALATED })
@@ -2693,7 +2693,7 @@ describe('b.jg5 SRJ-809, SRJ-806, SRJ-407: a reuse that timed out but launched e
     expect([h.oldLifeWaitRunning(id), h.oldLifeHolds.holdOf(id)?.waiting, h.holdEndRetries, h.controller.isArmed(b)]).toEqual([false, [b], [], true])
 
     const t = scriptTimedLaunch(h, p, { reuse: true, takesMs: CALL_MS, end: form, launchStart, offMs: CALL_MS })
-    h.script({ statusFn: (params) => (params.claude_instance_id === id && t.window()?.endMs !== undefined ? t.statusRow() : bReads(params)) })
+    h.script({ statusFn: (params) => (params.instance_id === id && t.window()?.endMs !== undefined ? t.statusRow() : bReads(params)) })
     // B's retry is due well after P's timed call ends: only the hold's end retries it.
     expect(h.controller.view(b)?.dueAt).toBeGreaterThan(h.clock.now() + CALL_MS * 2)
     return { h, p, b, id, t }

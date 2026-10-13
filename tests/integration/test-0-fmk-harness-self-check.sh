@@ -25,7 +25,7 @@
 #                    default binary's directory is gone) and the shell finds
 #                    none; `claude` is the stub; bun is still found; the shim
 #                    and its log are at the scenario HOME's standard path, and
-#                    the container user's own ~/.agent-director/bin holds no
+#                    the container user's own ~/.config/agent-director/bin holds no
 #                    shim log and no `.real` binary.
 #   real_binary      the binary behind the shim, run by its own name, reports
 #                    the recorded version and commit, and adds no log line.
@@ -100,7 +100,7 @@
 #                    shim without its marker line.
 #
 # The tmux shim's legs call it by its path from the scenario's own shell,
-# whose PATH never holds it, or run a harness agent-director spawn with the
+# whose PATH never holds it, or run a harness agent-director spawn --agent claude with the
 # shim's bin directory put first on that one call's PATH. Its delays are kept
 # short through `tmux_shim_mode`'s delay, each still longer than the
 # agent-director timeout the leg relies on: its create timeout
@@ -139,7 +139,7 @@
 #                    with no command (tmux's default new-session) each exit 1
 #                    with no standard output and one `tmux-shim:` line on
 #                    standard error, and leave no session; other commands
-#                    run. A real agent-director spawn with the shim first on
+#                    run. A real agent-director spawn --agent claude with the shim first on
 #                    its PATH reaches the shim (a new-session line whose parent
 #                    is that agent-director process), answers
 #                    ErrTmuxSessionCreate, makes no session and leaves its row
@@ -282,7 +282,7 @@
 #                    test-14's setup check.
 #
 # The re-fire legs read SessionStart records in the scenario HOME's
-# ~/.agent-director/ad-trail.jsonl: `ad.hook.fired` (by instance id) and
+# ~/.config/agent-director/ad-trail.jsonl: `ad.hook.fired` (by instance id) and
 # `ad.hook.ignored` (by instance id, and by the hook's parent PID, which is the
 # stub's own process). G is agent-director's default pending grace period
 # (REFIRE_GRACE_S): the self-check writes no config.toml before the
@@ -577,7 +577,7 @@ NOLS_ID="t0-refire-nols"
 NOROW_ID="t0-refire-no-row"
 REFIRE_PATHS=(at-once trusted-config-dir trusted-home dev-channels unrecognised folder-trust)
 # G: agent-director's default pending_grace_seconds (the self-check writes no
-# ~/.agent-director/config.toml before the re-fire legs end; the hold leg
+# ~/.config/agent-director/config.toml before the re-fire legs end; the hold leg
 # checks there is none).
 REFIRE_GRACE_S=60
 # The re-fire's period, and the gap allowed between two of one stub's records
@@ -595,7 +595,7 @@ REFIRE_QUIET_S=6
 # A reporting stub's first record comes within this long of its start (or
 # its Enter).
 REFIRE_FIRST_S=3
-REFIRE_TRAIL="${HOME}/.agent-director/ad-trail.jsonl"
+REFIRE_TRAIL="${HOME}/.config/agent-director/ad-trail.jsonl"
 
 # Set by the re-fire legs: the held row's worker PID, its launch start
 # (epoch seconds with milliseconds, and as status printed it) and the
@@ -855,7 +855,7 @@ expect_ad_error() {
 # shows <state>.
 expect_row_state() {
     local step="$1" id="$2" want="$3" got
-    ad_capture get --claude-instance-id "${id}"
+    ad_capture get --instance-id "${id}"
     (( AD_RC == 0 )) || fail "${step}: harness get of ${id} exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
     got="$(jq -r '.state // empty' "${AD_OUT}")"
     [[ "${got}" == "${want}" ]] || fail "${step}: row ${id} is '${got}', not ${want}"
@@ -863,7 +863,7 @@ expect_row_state() {
 
 # True when a harness get of row <instance-id> shows <state>.
 row_state_is() {
-    ad_capture get --claude-instance-id "$1"
+    ad_capture get --instance-id "$1"
     (( AD_RC == 0 )) && [[ "$(jq -r '.state // empty' "${AD_OUT}")" == "$2" ]]
 }
 
@@ -997,7 +997,7 @@ syn_base() {
     : > "${dir}/tmux-shim.log"
     syn_line "${dir}/agent-director-shim.log" call 1001.000000 6000001 "${SYN_SERVER}" "${SYN_SERVER_CMD}" version
     syn_line "${dir}/agent-director-shim.log" call 1002.000000 6000002 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
-        spawn --claude-instance-id cscb_alpha
+        spawn --instance-id cscb_alpha
     syn_line "${dir}/tmux-shim.log" call 1002.100000 7000001 6000002 "${SYN_AD_CMD}" \
         -u new-session -d -s slack_bot_alpha
 }
@@ -1104,7 +1104,7 @@ nested_violation_after() {
     # A delete whose parent is the stand-in server, inside its window,
     # written after the closing assertions passed.
     printf 'call\t%s\t%s\t%s\t%s\t%s\n' "${NESTED_T}" 6000002 "${NESTED_SERVER_PID}" 'sleep 300' \
-        'delete --claude-instance-id cscb_x' >> "${SCENARIO_AD_SHIM_LOG}"
+        'delete --instance-id cscb_x' >> "${SCENARIO_AD_SHIM_LOG}"
     echo "CHECK: violating line written"
     echo "PASS: ${TEST_NAME}"
 }
@@ -1179,8 +1179,8 @@ TRAIL_EPOCH_JQ='def epoch: (.ts[0:19] + "Z" | fromdateiso8601 | tostring) + "." 
 # ignored with parent $p for any reason but pid_mismatch, or naming a recorded
 # pane process other than $pane.
 TRAIL_IGNORED_FROM='.event == "ad.hook.ignored" and .hook_event == "SessionStart" and .parent_pid == $p'
-TRAIL_FIRED_FOR='.event == "ad.hook.fired" and .event_name == "SessionStart" and .claude_instance_id == $id'
-TRAIL_IGNORED_FOR='.event == "ad.hook.ignored" and .hook_event == "SessionStart" and .claude_instance_id == $id'
+TRAIL_FIRED_FOR='.event == "ad.hook.fired" and .event_name == "SessionStart" and .instance_id == $id'
+TRAIL_IGNORED_FOR='.event == "ad.hook.ignored" and .hook_event == "SessionStart" and .instance_id == $id'
 TRAIL_NOT_MISMATCH='.event == "ad.hook.ignored" and .hook_event == "SessionStart" and .parent_pid == $p and (.reason != "pid_mismatch" or .row_pane_pid != $pane)'
 
 # trail_read <array-name> <jq-condition> [<jq-option>...]: set the array to
@@ -1245,7 +1245,7 @@ hold_row() {
     local step="$1" id="$2" dir argv=() i launch
     dir="$(make_workdir "$3")"
     stub_mode "${dir}" "${STUB_MODE_SILENT}"
-    ad_capture spawn --cwd "${dir}" --claude-instance-id "${id}" --tmux-session-name "${id}" --no-pre-trust
+    ad_capture spawn --agent claude --cwd "${dir}" --instance-id "${id}" --tmux-session-name "${id}" --no-pre-trust
     if (( AD_RC != 0 )); then
         sed 's/^/  | /' "${AD_OUT}" "${AD_ERR}" >&2
         fail "${step}: harness spawn of ${id} exited ${AD_RC}"
@@ -1259,7 +1259,7 @@ hold_row() {
         [[ "${argv[i]}" == --settings ]] && HELD_SETTINGS="${argv[i + 1]:-}"
     done
     [[ -n "${HELD_SETTINGS}" ]] || fail "${step}: ${id}'s worker was given no --settings"
-    ad_capture status --claude-instance-id "${id}"
+    ad_capture status --instance-id "${id}"
     (( AD_RC == 0 )) || fail "${step}: harness status of ${id} exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
     [[ "$(jq -r '.state // empty' "${AD_OUT}")" == pending ]] \
         || fail "${step}: ${id} reads '$(jq -r '.state // empty' "${AD_OUT}")', not pending"
@@ -1471,13 +1471,13 @@ leg_isolation() {
         || fail "${step}: ${SCENARIO_BIN}/claude is not the stub"
     [[ "$(type -P bun || true)" == /* ]] || fail "${step}: bun is not found on the scenario's PATH"
 
-    [[ "${SCENARIO_AD_BIN}" == "${HOME}/.agent-director/bin/agent-director" ]] \
+    [[ "${SCENARIO_AD_BIN}" == "${HOME}/.config/agent-director/bin/agent-director" ]] \
         || fail "${step}: SCENARIO_AD_BIN ${SCENARIO_AD_BIN} is not the scenario HOME's standard path"
-    [[ "${SCENARIO_AD_SHIM_LOG}" == "${HOME}/.agent-director/bin/agent-director-shim.log" ]] \
+    [[ "${SCENARIO_AD_SHIM_LOG}" == "${HOME}/.config/agent-director/bin/agent-director-shim.log" ]] \
         || fail "${step}: SCENARIO_AD_SHIM_LOG ${SCENARIO_AD_SHIM_LOG} is not beside the standard path"
     for found in agent-director-shim.log agent-director.real; do
-        [[ ! -e "${passwd_home}/.agent-director/bin/${found}" ]] \
-            || fail "${step}: the container user's own ${passwd_home}/.agent-director/bin holds ${found}"
+        [[ ! -e "${passwd_home}/.config/agent-director/bin/${found}" ]] \
+            || fail "${step}: the container user's own ${passwd_home}/.config/agent-director/bin holds ${found}"
     done
 }
 
@@ -1497,13 +1497,13 @@ leg_setup_install() {
     expect_shim_in_place "${step}: after the setup's install" "${SCENARIO_RELEASE_BIN}"
     expect_ad_version "${step}" "${REL_VERSION}" "${REL_COMMIT}"
     expect_shim_in_place "${step}: agent-director-admin after the setup's install" "${SCENARIO_RELEASE_ADMIN}" \
-        "${HOME}/.agent-director/admin/agent-director-admin"
-    [[ -f "${HOME}/.agent-director/state.db" ]] || fail "${step}: no store at ${HOME}/.agent-director/state.db"
+        "${HOME}/.config/agent-director/admin/agent-director-admin"
+    [[ -f "${HOME}/.config/agent-director/state.db" ]] || fail "${step}: no store at ${HOME}/.config/agent-director/state.db"
 }
 
 leg_harness_call_log() {
     local step="harness call log" before t_before t_after mine=()
-    local want=(get --claude-instance-id "t0 no such row")
+    local want=(get --instance-id "t0 no such row")
     before="$(call_count)"
     t_before="${EPOCHREALTIME/,/.}"
     ad_capture "${want[@]}"
@@ -1558,13 +1558,13 @@ EOF
 leg_tmux_and_store() {
     local step="tmux and store" work row_socket info sock_path store_id got
     work="$(make_workdir self-check)"
-    ad_capture spawn --cwd "${work}" --claude-instance-id "${T0_ROW_ID}" \
+    ad_capture spawn --agent claude --cwd "${work}" --instance-id "${T0_ROW_ID}" \
         --tmux-session-name "${T0_SESSION}" --no-pre-trust --label "t0=spawned"
     if (( AD_RC != 0 )); then
         sed 's/^/  | /' "${AD_OUT}" "${AD_ERR}" >&2
         fail "${step}: harness spawn exited ${AD_RC}"
     fi
-    ad_capture get --claude-instance-id "${T0_ROW_ID}"
+    ad_capture get --instance-id "${T0_ROW_ID}"
     (( AD_RC == 0 )) || fail "${step}: harness get exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
     row_socket="$(jq -r '.tmux_socket // empty' "${AD_OUT}")"
     [[ "${row_socket}" == "${TMUX_TMPDIR}"/* && -S "${row_socket}" ]] \
@@ -1587,8 +1587,8 @@ leg_tmux_and_store() {
     store_id="$(ad_store_id)"
     [[ "${store_id}" =~ ^[0-9a-f]{16}$ ]] || fail "${step}: ad_store_id printed '${store_id}'"
     T0_STORE_ID="${store_id}"
-    ad_store_edit "UPDATE spawns SET labels = '{\"t0\":\"edited\"}' WHERE claude_instance_id = '${T0_ROW_ID}'"
-    ad_capture get --claude-instance-id "${T0_ROW_ID}"
+    ad_store_edit "UPDATE spawns SET labels = '{\"t0\":\"edited\"}' WHERE instance_id = '${T0_ROW_ID}'"
+    ad_capture get --instance-id "${T0_ROW_ID}"
     (( AD_RC == 0 )) || fail "${step}: harness get after the edit exited ${AD_RC}"
     got="$(jq -r '.labels.t0 // empty' "${AD_OUT}")"
     [[ "${got}" == edited ]] || fail "${step}: harness get after ad_store_edit shows label t0 '${got}', not edited"
@@ -1611,7 +1611,7 @@ leg_reinstall() {
     install_ad_release "${step}: install.sh again"
     expect_shim_in_place "${step}: after install.sh and its re-shim" "${SCENARIO_RELEASE_BIN}"
     expect_shim_in_place "${step}: agent-director-admin after install.sh and its re-shim" "${SCENARIO_RELEASE_ADMIN}" \
-        "${HOME}/.agent-director/admin/agent-director-admin"
+        "${HOME}/.config/agent-director/admin/agent-director-admin"
     expect_ad_version "${step}" "${REL_VERSION}" "${REL_COMMIT}"
     store_id="$(ad_store_id)"
     [[ "${store_id}" == "${T0_STORE_ID}" ]] || fail "${step}: the store id changed from ${T0_STORE_ID} to ${store_id}"
@@ -1648,7 +1648,7 @@ nested_start_on_010() {
         ! cmp -s -- "${SCENARIO_RELEASE_BIN}" "${file}" || fail "${step}: ${file} is the release's binary"
     done < <(find "${HOME}" -type f -print0)
     echo "CHECK: no release binary"
-    [[ ! -e "${HOME}/.agent-director/state.db" ]] || fail "${step}: a store exists before the release's install"
+    [[ ! -e "${HOME}/.config/agent-director/state.db" ]] || fail "${step}: a store exists before the release's install"
     echo "CHECK: no store"
     expect_ad_version "${step}: a call through the shim" 0.10.0
     echo "CHECK: 0.10.0 answers"
@@ -1678,10 +1678,10 @@ leg_guard_refusals() {
     local step="guard refusals" link real_outside before home reason backup="${SCENARIO_ROOT}/t0-guard-backup.db"
     OUTSIDE_HOME="$(mktemp -d /tmp/test-0-outside-home.XXXXXX)" || fail "${step}: could not make a HOME outside SCENARIO_ROOT"
     # A decoy install and store each helper would act on, were it not refused.
-    mkdir -p "${OUTSIDE_HOME}/.agent-director/bin"
-    cp -- "${SCENARIO_AD_010_BIN}" "${OUTSIDE_HOME}/.agent-director/bin/agent-director"
-    sqlite3 "${OUTSIDE_HOME}/.agent-director/state.db" \
-        "CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO store_meta VALUES ('store_id', '0123456789abcdef'); CREATE TABLE spawns (claude_instance_id TEXT PRIMARY KEY, labels TEXT NOT NULL DEFAULT '{}');" \
+    mkdir -p "${OUTSIDE_HOME}/.config/agent-director/bin"
+    cp -- "${SCENARIO_AD_010_BIN}" "${OUTSIDE_HOME}/.config/agent-director/bin/agent-director"
+    sqlite3 "${OUTSIDE_HOME}/.config/agent-director/state.db" \
+        "CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO store_meta VALUES ('store_id', '0123456789abcdef'); CREATE TABLE spawns (instance_id TEXT PRIMARY KEY, labels TEXT NOT NULL DEFAULT '{}');" \
         || fail "${step}: could not make the decoy store"
     link="${SCENARIO_ROOT}/home-link-outside"
     ln -s -- "${OUTSIDE_HOME}" "${link}"
@@ -1773,7 +1773,7 @@ leg_guard_refusals() {
 
 leg_shim_check() {
     local step="shim check" home="${SCENARIO_ROOT}/home-shim-check" bin
-    bin="${home}/.agent-director/bin"
+    bin="${home}/.config/agent-director/bin"
     mkdir -p "${bin}"
     cp -- "${SCENARIO_RELEASE_BIN}" "${bin}/agent-director.real"
     cp -- "${SCENARIO_AD_SHIM_SRC}" "${bin}/agent-director"
@@ -1969,9 +1969,9 @@ leg_fail_create() {
     (( SHIM_RC == 0 )) && grep -qxF -- "${T0_SESSION}" "${SHIM_OUT}" \
         || fail "${step}: list-sessions exited ${SHIM_RC} without ${T0_SESSION}"
 
-    # A real agent-director spawn with the shim first on its PATH.
+    # A real agent-director spawn --agent claude with the shim first on its PATH.
     work="$(make_workdir fail-create)"
-    PATH="${SCENARIO_TMUX_SHIM_BIN}:${PATH}" ad_capture spawn --cwd "${work}" --claude-instance-id "${id}" \
+    PATH="${SCENARIO_TMUX_SHIM_BIN}:${PATH}" ad_capture spawn --agent claude --cwd "${work}" --instance-id "${id}" \
         --tmux-session-name "${id}" --no-pre-trust
     expect_ad_error "${step}: the spawn" ErrTmuxSessionCreate
     read_call "${step}" "$(last_call_line)"
@@ -1991,7 +1991,7 @@ leg_slow_create() {
     tmux_shim_mode slow-create "${SLOW_CREATE_DELAY_S}"
     before="$(line_count "${SCENARIO_TMUX_SHIM_LOG}")"
     work="$(make_workdir slow-create)"
-    PATH="${SCENARIO_TMUX_SHIM_BIN}:${PATH}" ad_capture spawn --cwd "${work}" --claude-instance-id "${id}" \
+    PATH="${SCENARIO_TMUX_SHIM_BIN}:${PATH}" ad_capture spawn --agent claude --cwd "${work}" --instance-id "${id}" \
         --tmux-session-name "${id}" --no-pre-trust
     info="$("${SCENARIO_REAL_TMUX}" display-message -p -t "${id}" '#{@ad_owner}|#{@ad_pane}' 2> /dev/null || true)"
     t_read="${EPOCHREALTIME/,/.}"
@@ -2204,7 +2204,7 @@ EOF
     # The stub opened its session once it reported in, and the server
     # registered it as the persona's.
     wait_for_log "${connected}" "${MCP_CONNECT_WAIT_S}" "${step}: the server never registered the stub's session as ${ref}'s"
-    ad_capture get --claude-instance-id "${MCP_INSTANCE_ID}"
+    ad_capture get --instance-id "${MCP_INSTANCE_ID}"
     session="$(jq -r '.tmux_session_name // empty' "${AD_OUT}")"
     [[ -n "${session}" ]] || fail "${step}: row ${MCP_INSTANCE_ID} names no tmux session"
     stub_pid="$("${SCENARIO_REAL_TMUX}" display-message -p -t "${session}" '#{pane_pid}')" \
@@ -2715,8 +2715,8 @@ with_tmux_tmpdir() {
 
 leg_refire_hold() {
     local step="re-fire hold" times=() bin
-    [[ ! -e "${HOME}/.agent-director/config.toml" ]] \
-        || fail "${step}: ${HOME}/.agent-director/config.toml exists, so G may not be the default ${REFIRE_GRACE_S}s"
+    [[ ! -e "${HOME}/.config/agent-director/config.toml" ]] \
+        || fail "${step}: ${HOME}/.config/agent-director/config.toml exists, so G may not be the default ${REFIRE_GRACE_S}s"
     REFIRE_AD_BEFORE="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
     REFIRE_CSCB_BEFORE="$(cscb_ad_count "")"
     hold_row "${step}" "${REFIRE_ID}" refire-held
@@ -2789,7 +2789,7 @@ leg_refire_folder_trust() {
 
 leg_stop_status_failure() {
     local step="stop: the status read fails" dir pid times=()
-    ad_capture status --claude-instance-id "${NOROW_ID}"
+    ad_capture status --instance-id "${NOROW_ID}"
     (( AD_RC != 0 )) || fail "${step}: a harness status read of ${NOROW_ID} succeeded: a row has that id"
     dir="$(make_workdir refire-no-row)"
     stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
@@ -2878,7 +2878,7 @@ leg_refire_grace() {
     trail_read times "${TRAIL_IGNORED_FOR}" --arg id "${REFIRE_ID}"
     (( ${#fired[@]} == ${#times[@]} )) \
         || fail "${step}: ${#fired[@]} SessionStart fired for ${REFIRE_ID}, but ${#times[@]} ignored: one was applied"
-    ad_capture status --claude-instance-id "${REFIRE_ID}"
+    ad_capture status --instance-id "${REFIRE_ID}"
     [[ "$(jq -r '.state // empty' "${AD_OUT}")" == pending && "$(jq -r '.launch_started_at // empty' "${AD_OUT}")" == "${REFIRE_LAUNCH}" ]] \
         || fail "${step}: ${REFIRE_ID} reads $(tr '\n' ' ' < "${AD_OUT}"), not pending with launch start ${REFIRE_LAUNCH}"
     [[ -z "$(stop_lines_for "${REFIRE_ID}")" ]] || fail "${step}: a stop line names ${REFIRE_ID}: the stop past G wrote one"
@@ -2926,9 +2926,9 @@ leg_harness_include_finished() {
     local step="harness include-finished" before i mine=() lines=()
     before="$(call_count)"
     # The row is live, so agent-director-admin refuses each kill and sends none.
-    ad_admin kill-finished --claude-instance-id "${T0_ROW_ID}" > /dev/null 2>&1 || true
-    : "$(ad_admin kill-finished --claude-instance-id "${T0_ROW_ID}" 2>&1)"
-    ad_admin kill-finished --claude-instance-id "${T0_ROW_ID}" 2>&1 | cat > /dev/null || true
+    ad_admin kill-finished --instance-id "${T0_ROW_ID}" > /dev/null 2>&1 || true
+    : "$(ad_admin kill-finished --instance-id "${T0_ROW_ID}" 2>&1)"
+    ad_admin kill-finished --instance-id "${T0_ROW_ID}" 2>&1 | cat > /dev/null || true
     mapfile -t lines < <(awk -F'\t' '$1 == "call"' "${SCENARIO_AD_SHIM_LOG}" | tail -n "+$(( before + 1 ))")
     (( ${#lines[@]} == 3 )) || fail "${step}: the three calls added ${#lines[@]} call line(s)"
     mapfile -d '' -t mine < "/proc/$$/cmdline"
@@ -2973,7 +2973,7 @@ leg_synthetic_server_tmux() {
     dir="$(syn_case server-tmux-harness-only)"
     : > "${dir}/tmux-shim.log"
     syn_line "${dir}/agent-director-shim.log" call 1300.000000 6000010 "${SYN_SHELL}" "${SCENARIO_SHELL_CMDLINE}" \
-        spawn --claude-instance-id t0-h
+        spawn --instance-id t0-h
     syn_line "${dir}/tmux-shim.log" call 1300.100000 7000003 6000010 "${SYN_AD_CMD}" new-session -d -s t0-h
     expect_on_files "${step}: only the harness's agent-director" "${dir}" fail "${a}" "positive control"
 
@@ -3020,43 +3020,43 @@ leg_synthetic_include_finished() {
 
     dir="$(syn_case finished-server)"
     syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000040 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
-        kill --claude-instance-id cscb_alpha --include-finished
+        kill --instance-id cscb_alpha --include-finished
     expect_on_files "${step}: from the bot server" "${dir}" fail "${a}" "1 agent-director-shim.log line(s) ${why} (line 3)"
 
     # agent-director-admin's kill-finished, which the same shim logs.
     dir="$(syn_case finished-admin-server)"
     syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000047 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
-        kill-finished --claude-instance-id cscb_alpha
+        kill-finished --instance-id cscb_alpha
     syn_line "${dir}/agent-director-shim.log" call 1500.100000 6000048 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
-        --home /h kill-finished --claude-instance-id cscb_alpha
+        --home /h kill-finished --instance-id cscb_alpha
     expect_on_files "${step}: kill-finished from the bot server, and after a global flag" "${dir}" fail "${a}" \
         "2 agent-director-shim.log line(s) ${why} (line 3, 4)"
 
     dir="$(syn_case finished-run)"
     syn_line "${dir}/agent-director-shim.log" call 1150.000000 6000041 "${SYN_RUN}" "${SYN_RUN_CMD}" \
-        kill --claude-instance-id cscb_alpha --include-finished
+        kill --instance-id cscb_alpha --include-finished
     expect_on_files "${step}: from a CSCB CLI run" "${dir}" fail "${a}" "1 agent-director-shim.log line(s) ${why} (line 3)"
 
     dir="$(syn_case finished-wrapper)"
     syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000042 "${SYN_OTHER}" 'timeout 10 agent-director' \
-        kill --claude-instance-id cscb_alpha --include-finished
+        kill --instance-id cscb_alpha --include-finished
     expect_on_files "${step}: from a wrapper process" "${dir}" fail "${a}" "1 agent-director-shim.log line(s) ${why} (line 3)"
 
     # The shell's command line, but a PID a CSCB process held at that time.
     dir="$(syn_case finished-shell-text-cscb-pid)"
     syn_line "${dir}/agent-director-shim.log" call 1150.000000 6000043 "${SYN_RUN}" "${SCENARIO_SHELL_CMDLINE}" \
-        kill --claude-instance-id cscb_alpha --include-finished
+        kill --instance-id cscb_alpha --include-finished
     expect_on_files "${step}: the shell's command line on a CSCB process's PID" "${dir}" fail "${a}" \
         "1 agent-director-shim.log line(s) ${why} (line 3)"
 
     # The flag's other spellings, and a verb after a global flag.
     dir="$(syn_case finished-spellings)"
     syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000044 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
-        kill -include-finished --claude-instance-id cscb_alpha
+        kill -include-finished --instance-id cscb_alpha
     syn_line "${dir}/agent-director-shim.log" call 1500.100000 6000045 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
-        kill --claude-instance-id cscb_alpha --include-finished=true
+        kill --instance-id cscb_alpha --include-finished=true
     syn_line "${dir}/agent-director-shim.log" call 1500.200000 6000046 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
-        --home /h kill --claude-instance-id cscb_alpha --include-finished
+        --home /h kill --instance-id cscb_alpha --include-finished
     expect_on_files "${step}: -include-finished, =true and --home before the verb" "${dir}" fail "${a}" \
         "3 agent-director-shim.log line(s) ${why} (line 3, 4, 5)"
 
@@ -3065,15 +3065,15 @@ leg_synthetic_include_finished() {
     # shell's text, and a stop line.
     dir="$(syn_case finished-allowed)"
     syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000050 "${SYN_SHELL}" "${SCENARIO_SHELL_CMDLINE}" \
-        kill --claude-instance-id cscb_alpha --include-finished
+        kill --instance-id cscb_alpha --include-finished
     syn_line "${dir}/agent-director-shim.log" call 1500.050000 6000055 "${SYN_SHELL}" "${SCENARIO_SHELL_CMDLINE}" \
-        kill-finished --claude-instance-id cscb_alpha
+        kill-finished --instance-id cscb_alpha
     syn_line "${dir}/agent-director-shim.log" call 1500.100000 6000051 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
-        kill --claude-instance-id cscb_alpha
+        kill --instance-id cscb_alpha
     syn_line "${dir}/agent-director-shim.log" call 1500.200000 6000052 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
-        get --claude-instance-id cscb_alpha --include-finished
+        get --instance-id cscb_alpha --include-finished
     syn_line "${dir}/agent-director-shim.log" call 3000.000000 6000053 "${SYN_SERVER}" "${SCENARIO_SHELL_CMDLINE}" \
-        kill --claude-instance-id cscb_alpha --include-finished
+        kill --instance-id cscb_alpha --include-finished
     syn_line "${dir}/agent-director-shim.log" stop 1500.300000 6000054 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
         stub-claude kill --include-finished
     expect_on_files "${step}: the harness, no flag, another verb, a reused PID, a stop line" "${dir}" pass "${a}"
@@ -3108,14 +3108,14 @@ leg_synthetic_delete() {
 
     dir="$(syn_case delete-server)"
     syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000070 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
-        delete --claude-instance-id cscb_alpha
+        delete --instance-id cscb_alpha
     expect_on_files "${step}: from the bot server" "${dir}" fail "${a}" "1 agent-director-shim.log line(s) ${why} (line 3)"
 
     dir="$(syn_case delete-run-and-global-flag)"
     syn_line "${dir}/agent-director-shim.log" call 1150.000000 6000071 "${SYN_RUN}" "${SYN_RUN_CMD}" \
-        delete --claude-instance-id cscb_alpha
+        delete --instance-id cscb_alpha
     syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000072 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
-        --store-path=/s delete --claude-instance-id cscb_alpha
+        --store-path=/s delete --instance-id cscb_alpha
     expect_on_files "${step}: from a CLI run, and after --store-path=" "${dir}" fail "${a}" \
         "2 agent-director-shim.log line(s) ${why} (line 3, 4)"
 
@@ -3124,16 +3124,16 @@ leg_synthetic_delete() {
     # and a wrapper process.
     dir="$(syn_case delete-unrecorded)"
     syn_line "${dir}/agent-director-shim.log" call 3000.000000 6000073 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
-        delete --claude-instance-id cscb_alpha
+        delete --instance-id cscb_alpha
     syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000074 "${SYN_OTHER}" 'timeout 10 agent-director' \
-        delete --claude-instance-id cscb_alpha
+        delete --instance-id cscb_alpha
     expect_on_files "${step}: from the server's command line outside its window, and from a wrapper" "${dir}" fail "${a}" \
         "2 agent-director-shim.log line(s) ${why} (line 3, 4)"
 
     # The shell's command line, but a PID a CSCB process held at that time.
     dir="$(syn_case delete-shell-text-cscb-pid)"
     syn_line "${dir}/agent-director-shim.log" call 1150.000000 6000075 "${SYN_RUN}" "${SCENARIO_SHELL_CMDLINE}" \
-        delete --claude-instance-id cscb_alpha
+        delete --instance-id cscb_alpha
     expect_on_files "${step}: the shell's command line on a CSCB process's PID" "${dir}" fail "${a}" \
         "1 agent-director-shim.log line(s) ${why} (line 3)"
 
@@ -3141,9 +3141,9 @@ leg_synthetic_delete() {
     # server's PID outside the server's window, and a stop line.
     dir="$(syn_case delete-allowed)"
     syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000076 "${SYN_SHELL}" "${SCENARIO_SHELL_CMDLINE}" \
-        delete --claude-instance-id t0-h
+        delete --instance-id t0-h
     syn_line "${dir}/agent-director-shim.log" call 3000.000000 6000077 "${SYN_SERVER}" "${SCENARIO_SHELL_CMDLINE}" \
-        delete --claude-instance-id t0-h
+        delete --instance-id t0-h
     syn_line "${dir}/agent-director-shim.log" stop 1500.100000 6000078 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
         stub-claude delete
     expect_on_files "${step}: the harness from its shell (its own PID, a reused PID), a stop line" "${dir}" pass "${a}"
@@ -3162,18 +3162,18 @@ leg_count_helpers() {
     # after a global flag (6), the server's PID outside its window (7).
     syn_line "${dir}/agent-director-shim.log" call 1150.000000 6000080 "${SYN_RUN}" "${SYN_RUN_CMD}" list
     syn_line "${dir}/agent-director-shim.log" call 1500.000000 6000081 "${SYN_SHELL}" "${SCENARIO_SHELL_CMDLINE}" \
-        spawn --claude-instance-id cscb_alpha
+        spawn --instance-id cscb_alpha
     syn_line "${dir}/agent-director-shim.log" stop 1500.100000 6000082 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
-        stub-claude spawn --claude-instance-id cscb_alpha
+        stub-claude spawn --instance-id cscb_alpha
     syn_line "${dir}/agent-director-shim.log" call 1500.200000 6000083 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
-        --home /h spawn --tmux-session-name s --claude-instance-id cscb_alpha
+        --home /h spawn --tmux-session-name s --instance-id cscb_alpha
     syn_line "${dir}/agent-director-shim.log" call 3000.000000 6000084 "${SYN_SERVER}" "${SYN_SERVER_CMD}" \
-        spawn --claude-instance-id cscb_alpha
+        spawn --instance-id cscb_alpha
     expect_count_on "${step}" "${dir}" 4 ""
     expect_count_on "${step}" "${dir}" 2 spawn
     expect_count_on "${step}" "${dir}" 2 spawn cscb_alpha
-    expect_count_on "${step}" "${dir}" 2 spawn --claude-instance-id cscb_alpha
-    expect_count_on "${step}" "${dir}" 0 spawn cscb_alpha --claude-instance-id
+    expect_count_on "${step}" "${dir}" 2 spawn --instance-id cscb_alpha
+    expect_count_on "${step}" "${dir}" 0 spawn cscb_alpha --instance-id
     expect_count_on "${step}" "${dir}" 1 list
     expect_count_on "${step}" "${dir}" 1 version
     expect_count_on "${step}" "${dir}" 0 --home
@@ -3241,19 +3241,19 @@ leg_synthetic_readers() {
     # and spawn of cscb_alpha (2). Then:
     dir="$(syn_case readers-ad)"
     t="${dir}/agent-director-shim.log"
-    syn_line "${t}" call 1003.000000 6000090 "${SYN_SERVER}" "${SYN_SERVER_CMD}" resume --claude-instance-id=cscb_dev        # 3
-    syn_line "${t}" call 1004.000000 6000091 "${SYN_SERVER}" "${SYN_SERVER_CMD}" status --claude-instance-id cscb_dev        # 4
-    syn_line "${t}" call 1005.000000 6000092 "${SYN_SERVER}" "${SYN_SERVER_CMD}" status --claude-instance-id cscb_dev_x      # 5
-    syn_line "${t}" call 1006.000000 6000093 "${SYN_SHELL}" "${SCENARIO_SHELL_CMDLINE}" kill --claude-instance-id cscb_dev   # 6 harness
-    syn_line "${t}" stop 1007.000000 6000094 "${SYN_SERVER}" "${SYN_SERVER_CMD}" stub-claude status --claude-instance-id cscb_dev # 7 stop
+    syn_line "${t}" call 1003.000000 6000090 "${SYN_SERVER}" "${SYN_SERVER_CMD}" resume --instance-id=cscb_dev        # 3
+    syn_line "${t}" call 1004.000000 6000091 "${SYN_SERVER}" "${SYN_SERVER_CMD}" status --instance-id cscb_dev        # 4
+    syn_line "${t}" call 1005.000000 6000092 "${SYN_SERVER}" "${SYN_SERVER_CMD}" status --instance-id cscb_dev_x      # 5
+    syn_line "${t}" call 1006.000000 6000093 "${SYN_SHELL}" "${SCENARIO_SHELL_CMDLINE}" kill --instance-id cscb_dev   # 6 harness
+    syn_line "${t}" stop 1007.000000 6000094 "${SYN_SERVER}" "${SYN_SERVER_CMD}" stub-claude status --instance-id cscb_dev # 7 stop
     syn_line "${t}" call 1008.000000 6000095 "${SYN_SERVER}" "${SYN_SERVER_CMD}" find-missing                                 # 8
-    syn_line "${t}" call 3000.000000 6000096 "${SYN_SERVER}" "${SYN_SERVER_CMD}" status --claude-instance-id cscb_dev        # 9 outside the window
-    syn_line "${t}" call 1150.000000 6000097 "${SYN_RUN}" "${SYN_RUN_CMD}" kill --claude-instance-id cscb_dev                # 10 a CLI run
-    syn_line "${t}" call 1011.000000 6000098 "${SYN_SERVER}" "${SYN_SERVER_CMD}" --home /h status --claude-instance-id cscb_dev # 11
+    syn_line "${t}" call 3000.000000 6000096 "${SYN_SERVER}" "${SYN_SERVER_CMD}" status --instance-id cscb_dev        # 9 outside the window
+    syn_line "${t}" call 1150.000000 6000097 "${SYN_RUN}" "${SYN_RUN_CMD}" kill --instance-id cscb_dev                # 10 a CLI run
+    syn_line "${t}" call 1011.000000 6000098 "${SYN_SERVER}" "${SYN_SERVER_CMD}" --home /h status --instance-id cscb_dev # 11
     syn_line "${t}" call 1012.000000 6000099 "${SYN_SERVER}" "${SYN_SERVER_CMD}" find-missing                                # 12
     syn_line "${t}" call 1013.000000 6000100 "${SYN_SHELL}" "${SCENARIO_SHELL_CMDLINE}" find-missing                          # 13 harness
     expect_reader "${step}: ad_cscb_calls cscb_dev" "${dir}" "1-6" \
-        "$(printf '%s ' 3 1003.000000 "${SYN_SERVER}" resume cscb_dev)--claude-instance-id=cscb_dev|$(printf '%s ' 4 1004.000000 "${SYN_SERVER}" status cscb_dev)--claude-instance-id cscb_dev|$(printf '%s ' 10 1150.000000 "${SYN_RUN}" kill cscb_dev)--claude-instance-id cscb_dev|$(printf '%s ' 11 1011.000000 "${SYN_SERVER}" status cscb_dev)--claude-instance-id cscb_dev" \
+        "$(printf '%s ' 3 1003.000000 "${SYN_SERVER}" resume cscb_dev)--instance-id=cscb_dev|$(printf '%s ' 4 1004.000000 "${SYN_SERVER}" status cscb_dev)--instance-id cscb_dev|$(printf '%s ' 10 1150.000000 "${SYN_RUN}" kill cscb_dev)--instance-id cscb_dev|$(printf '%s ' 11 1011.000000 "${SYN_SERVER}" status cscb_dev)--instance-id cscb_dev" \
         ad_cscb_calls cscb_dev
     expect_reader "${step}: ad_cscb_calls cscb_dev_x" "${dir}" "1,5" "5 cscb_dev_x" ad_cscb_calls cscb_dev_x
     expect_reader "${step}: ad_cscb_calls *" "${dir}" "1,5" \
@@ -3343,7 +3343,7 @@ row_snapshot() {
     local cols
     cols="$(ad_store_edit "SELECT group_concat(quote(name) || ', \"' || name || '\"', ', ') FROM pragma_table_info('spawns')")"
     [[ -n "${cols}" ]] || fail "row snapshot: the store has no spawns columns"
-    ad_store_edit "SELECT json_object(${cols}) FROM spawns WHERE claude_instance_id = '$1'"
+    ad_store_edit "SELECT json_object(${cols}) FROM spawns WHERE instance_id = '$1'"
 }
 
 # expect_row_change <step> <before> <after> <want>: the row after an edit
@@ -3380,7 +3380,7 @@ spawn_at_once() {
     local step="$1" id="$2" dir
     dir="$(make_workdir "${id}")"
     stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
-    ad_capture spawn --cwd "${dir}" --claude-instance-id "${id}" --tmux-session-name "${id}" --no-pre-trust
+    ad_capture spawn --agent claude --cwd "${dir}" --instance-id "${id}" --tmux-session-name "${id}" --no-pre-trust
     if (( AD_RC != 0 )); then
         sed 's/^/  | /' "${AD_OUT}" "${AD_ERR}" >&2
         fail "${step}: harness spawn of ${id} exited ${AD_RC}"
@@ -3475,7 +3475,7 @@ leg_store_rows() {
     for id in "${T4_FIN_ID}" "${T4_KILL_ID}"; do
         wait_until "${T4_REPORT_WAIT_S}" "${step}: ${id} never reported in (waiting)" row_state_is "${id}" waiting
     done
-    current="$(ad_store_edit "SELECT launch_token FROM spawns WHERE claude_instance_id = '${T4_KILL_ID}'")"
+    current="$(ad_store_edit "SELECT launch_token FROM spawns WHERE instance_id = '${T4_KILL_ID}'")"
     [[ "${current}" =~ ^[0-9a-f]{16}$ ]] || fail "${step}: ${T4_KILL_ID}'s launch token is '${current}'"
     token="$(ad_new_token "${T4_KILL_ID}" 0123456789abcdef)"
     [[ "${token}" =~ ^[0-9a-f]{16}$ && "${token}" != "${current}" && "${token}" != 0123456789abcdef ]] \
@@ -3602,7 +3602,7 @@ leg_store_statements() {
     # default starting-session bound; `ad_store_mark_finished` reads the
     # window from this file.
     printf '[tmux]\nstarting_session_seconds = %s\nstopping_window_seconds = %s\n' \
-        "${T4_STARTING_BOUND_S}" "${T4_STOPPING_WINDOW_S}" | write_file "${HOME}/.agent-director/config.toml"
+        "${T4_STARTING_BOUND_S}" "${T4_STOPPING_WINDOW_S}" | write_file "${HOME}/.config/agent-director/config.toml"
     session_age_at_least "${step}" "${T4_FIN_ID}" "${T4_STOPPING_WINDOW_S}"
     before="$(row_snapshot "${T4_FIN_ID}")"
     rv="$(jq -r '.row_version' <<< "${before}")"
@@ -3668,14 +3668,14 @@ leg_operator_actions() {
     ad_kill_include_finished "${T4_KILL_ID}" > /dev/null
     (( AD_KILL_RC == 0 )) && [[ "$(jq -r '.kill_sent' "${AD_KILL_OUT}")" == true ]] \
         || fail "${step}: the include-finished kill answered $(tr '\n' ' ' < "${AD_KILL_OUT}") (exit ${AD_KILL_RC})"
-    want=(kill-finished --claude-instance-id "${T4_KILL_ID}")
+    want=(kill-finished --instance-id "${T4_KILL_ID}")
     expect_last_call "${step}: the include-finished kill" want
     ( assert_no_cscb_include_finished ) > "${SCENARIO_ROOT}/operator-include-finished.out" 2>&1 || {
         sed 's/^/  | /' "${SCENARIO_ROOT}/operator-include-finished.out" >&2
         fail "${step}: assert_no_cscb_include_finished failed after the harness's include-finished kill"
     }
     wait_until "${T4_END_WAIT_S}" "${step}: session ${T4_KILL_ID} outlived the kill" no_session "${T4_KILL_ID}"
-    ad_capture get --claude-instance-id "${T4_KILL_ID}"
+    ad_capture get --instance-id "${T4_KILL_ID}"
     echo "${TEST_NAME}: ${step}: after the kill ${T4_KILL_ID} reads $(jq -r '.state // empty' "${AD_OUT}")"
 
     # The pending row beside a leftover: a fresh token, its pane and server
@@ -3697,17 +3697,17 @@ leg_operator_actions() {
             state: "pending", launch_started_at: $ls, launch_token: $t, ended_at: null, pid: null, proc_starttime: null,
             tmux_server_pid: null, tmux_server_started: null, tmux_server_starttime: null,
             pane_id: null, pane_pid: null, pane_starttime: null, row_version: $rv}')"
-    ad_capture status --claude-instance-id "${T4_KILL_ID}"
+    ad_capture status --instance-id "${T4_KILL_ID}"
     (( AD_RC == 0 )) && jq -e '.state == "pending" and (.launch_started_at | type == "string")' "${AD_OUT}" > /dev/null \
         || fail "${step}: a harness status read of ${T4_KILL_ID} answered $(tr '\n' ' ' < "${AD_OUT}")"
 
     # Scenario 25's delete: the row the statement made unusable, from the
     # scenario's shell.
     ad_delete_unusable_row "${T4_FIN_ID}"
-    want=(delete --claude-instance-id "${T4_FIN_ID}")
+    want=(delete --instance-id "${T4_FIN_ID}")
     expect_last_call "${step}: the delete" want
     [[ -z "$(row_snapshot "${T4_FIN_ID}")" ]] || fail "${step}: ${T4_FIN_ID}'s row is still in the store"
-    ad_capture get --claude-instance-id "${T4_FIN_ID}"
+    ad_capture get --instance-id "${T4_FIN_ID}"
     (( AD_RC != 0 )) || fail "${step}: a harness get of the deleted ${T4_FIN_ID} succeeded"
     [[ "$(cscb_ad_count delete)" == 0 ]] || fail "${step}: a CSCB process made a delete"
     ( assert_no_cscb_delete ) > "${SCENARIO_ROOT}/operator-delete.out" 2>&1 || {
@@ -3868,7 +3868,7 @@ nested_expect_refused() {
 # <labels-json>, and the session runs on the run's tmux server.
 nested_expect_row() {
     local id="$1" session="$2" labels="$3"
-    ad_capture get --claude-instance-id "${id}"
+    ad_capture get --instance-id "${id}"
     (( AD_RC == 0 )) || fail "harness get of ${id} exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
     jq -e --arg s "${session}" --argjson l "${labels}" '.tmux_session_name == $s and .labels == $l' "${AD_OUT}" > /dev/null \
         || fail "row ${id} reads $(tr '\n' ' ' < "${AD_OUT}" | head -c 600), not session ${session} with labels ${labels}"
@@ -3890,7 +3890,7 @@ nested_seed_010() {
     # 0.10.0's first spawn makes the store).
     nested_expect_refused "no Slack channel name given for routed channel C0T0BBB02" \
         seed_prepersona_fleet "${config}" "C0T0AAA01=Ops Team!"
-    [[ ! -e "${HOME}/.agent-director/state.db" ]] || fail "a refused fleet made a store"
+    [[ ! -e "${HOME}/.config/agent-director/state.db" ]] || fail "a refused fleet made a store"
     echo "CHECK: fleet refused before its first row"
 
     out="$(seed_010_row t0-010-row t0_010_row "${dir_row}" team=t0)"

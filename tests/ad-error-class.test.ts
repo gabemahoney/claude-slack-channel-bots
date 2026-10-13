@@ -1,3 +1,4 @@
+import { ErrInternal, ErrConfigMalformed, ErrSchemaMismatch } from 'agent-director'
 /**
  * ad-error-class.test.ts — the one classifier of agent-director errors
  * (b.jg5 SRJ-104), which recognises every error the client declares as a
@@ -240,8 +241,8 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 /** `ErrInternal` and `ErrConfigMalformed`, as the builders name them (no class in any client). */
-const ERR_INTERNAL = errInternal().unknownName
-const ERR_CONFIG_MALFORMED = errConfigMalformed().unknownName
+const ERR_INTERNAL = errInternal().errName
+const ERR_CONFIG_MALFORMED = errConfigMalformed().errName
 
 /** The classes whose classification carries a reported name and message (b.jg5 SRJ-104). */
 const REPORTING_CLASSES: readonly AdErrorClass[] = [
@@ -386,7 +387,7 @@ describe('classifyAdError: every row of SRJ-104', () => {
   })
 
   test('the default errInternal description lacks the phrase (the UNCLASSIFIED row stands)', () => {
-    expect((errInternal().envelope as { err_description: string }).err_description).not.toContain(
+    expect(errInternal().errDescription).not.toContain(
       UNUSABLE_RECORDED_NAME_PHRASE,
     )
   })
@@ -409,7 +410,7 @@ describe('classifyAdError: ErrInternal by its envelope description', () => {
   })
 
   test('the phrase only in the error\'s own errDescription is UNCLASSIFIED', () => {
-    const err = errInternal('the store could not be read')
+    const err = errUnknownErrorName(ERR_INTERNAL, 'the store could not be read')
     Object.defineProperty(err, 'errDescription', { value: `the row: ${UNUSABLE_RECORDED_NAME_PHRASE} is empty` })
     expect(classifyAdError(err).errorClass).toBe(AD_ERROR_CLASS_UNCLASSIFIED)
   })
@@ -451,16 +452,16 @@ describe('classifyAdError: ErrInternal by its envelope description', () => {
   })
 })
 
-describe('classifyAdError: A-13 (a client class named ErrInternal, ErrConfigMalformed or a store-open name)', () => {
+describe('classifyAdError: native 0.12 class look-alikes stay unclassified', () => {
   test.each([
     ['ErrInternal without the phrase', ERR_INTERNAL, 'the store could not be read', AD_ERROR_CLASS_UNCLASSIFIED],
     ['ErrInternal with the phrase', ERR_INTERNAL, `${UNUSABLE_RECORDED_NAME_PHRASE} is empty`, AD_ERROR_CLASS_UNUSABLE_NAME],
     ['ErrConfigMalformed', ERR_CONFIG_MALFORMED, 'config refused', AD_ERROR_CLASS_CONFIG],
     ...STORE_OPEN_ERR_NAMES.map((name) => [name, name, 'the store could not be opened', AD_ERROR_CLASS_UNCLASSIFIED] as const),
-  ] as const)('a base error whose errName is %s classifies as the ErrUnknownErrorName form', (_label, name, description, expected) => {
+  ] as const)('a base error whose errName is %s stays unclassified', (_label, name, description, expected) => {
     const byErrName = classifyAdError(baseError(name, description))
-    expect(byErrName.errorClass).toBe(expected)
-    expect(byErrName).toEqual(classifyAdError(errUnknownErrorName(name, description)))
+    expect(byErrName).toEqual({ errorClass: AD_ERROR_CLASS_UNCLASSIFIED, reportedName: name, message: description })
+    expect(classifyAdError(errUnknownErrorName(name, description)).errorClass).toBe(expected)
   })
 })
 
@@ -469,8 +470,8 @@ const NAMED_BY_ERRNAME_DESCRIPTION = `${UNUSABLE_RECORDED_NAME_PHRASE} is empty`
 
 /** Each `errName` the classifier reads only off a value of no table class, with a base error's answer for it. */
 const ERRNAME_ROWS: ReadonlyArray<readonly [name: string, baseAnswer: AdErrorClass]> = [
-  [ERR_INTERNAL, AD_ERROR_CLASS_UNUSABLE_NAME],
-  [ERR_CONFIG_MALFORMED, AD_ERROR_CLASS_CONFIG],
+  [ERR_INTERNAL, AD_ERROR_CLASS_UNCLASSIFIED],
+  [ERR_CONFIG_MALFORMED, AD_ERROR_CLASS_UNCLASSIFIED],
   ...STORE_OPEN_ERR_NAMES.map((name) => [name, AD_ERROR_CLASS_UNCLASSIFIED] as const),
   [CSCB_UNKNOWN_ERROR_NAME, AD_ERROR_CLASS_UNAVAILABLE],
 ]
@@ -505,7 +506,7 @@ describe('classifyAdError: a table class wins over an A-13 or UnknownError errNa
 const SRD_STORE_OPEN_NAMES = ['ErrSchemaMismatch', 'ErrSchemaMigrationRequired', 'ErrStoreOpen']
 
 /** Each store-open name with the stub call that builds it around a description. */
-const STORE_OPEN_BUILDERS: ReadonlyArray<readonly [string, (description: string) => ErrUnknownErrorName]> = [
+const STORE_OPEN_BUILDERS: ReadonlyArray<readonly [string, (description: string) => AgentDirectorError]> = [
   [ERR_SCHEMA_MISMATCH_NAME, (description) => errSchemaMismatch(description)],
   [ERR_SCHEMA_MIGRATION_REQUIRED_NAME, (description) => errUnknownErrorName(ERR_SCHEMA_MIGRATION_REQUIRED_NAME, description)],
   [ERR_STORE_OPEN_NAME, (description) => errUnknownErrorName(ERR_STORE_OPEN_NAME, description)],
@@ -546,6 +547,9 @@ type ClassRow = readonly [errorClass: AdErrorConstructor, build: () => AgentDire
 
 /** Every class the classifier decides by `instanceof`: SRJ-104's classes and `ErrUnknownErrorName`. */
 const BY_CLASS_ROWS: readonly ClassRow[] = [
+  [ErrInternal, () => errUnusableName(), AD_ERROR_CLASS_UNUSABLE_NAME],
+  [ErrConfigMalformed, () => errConfigMalformed(), AD_ERROR_CLASS_CONFIG],
+  [ErrSchemaMismatch, () => errSchemaMismatch(), AD_ERROR_CLASS_UNCLASSIFIED],
   [ErrTmuxSendKeys, () => errTmuxSendKeys(), AD_ERROR_CLASS_GONE],
   [ErrTmuxCaptureFailed, () => errTmuxCaptureFailed(), AD_ERROR_CLASS_GONE],
   [ErrTmuxUnresponsive, () => errTmuxUnresponsive(), AD_ERROR_CLASS_UNAVAILABLE],
@@ -975,15 +979,15 @@ describe('stub builders: shape (SRJ-1303)', () => {
 
   test('errConfigMalformed names a [tmux] key, its value and its minimum', () => {
     const err = errConfigMalformed('launch_timeout_ms', '1500', '2000', 'ms')
-    const description = (err.envelope as { err_description: string }).err_description
+    const description = err.errDescription
     expect(description).toContain('[tmux] launch_timeout_ms = 1500')
     expect(description).toContain('2000 ms')
   })
 
   test.each([...UNUSABLE_NAME_FAULTS])('errUnusableName (%s) is an ErrInternal carrying the phrase', (f) => {
     const err = errUnusableName(f)
-    expect(err.unknownName).toBe(ERR_INTERNAL)
-    expect((err.envelope as { err_description: string }).err_description).toContain(UNUSABLE_RECORDED_NAME_PHRASE)
+    expect(err.errName).toBe(ERR_INTERNAL)
+    expect(err.errDescription).toContain(UNUSABLE_RECORDED_NAME_PHRASE)
   })
 
   test.each([
@@ -992,14 +996,13 @@ describe('stub builders: shape (SRJ-1303)', () => {
     ['errSchemaMismatch', () => errSchemaMismatch('store words'), ERR_SCHEMA_MISMATCH_NAME, 'store words'],
   ] as const)('%s puts the name and description where the client does', (_label, build, name, description) => {
     const err = build()
-    const envelope = { err_name: name, err_description: description }
-    const asClientBuildsIt = new ErrUnknownErrorName(name, envelope)
-    expect(err).toBeInstanceOf(ErrUnknownErrorName)
-    expect(err.errName).toBe(ErrUnknownErrorName.name)
-    expect(err.unknownName).toBe(name)
-    expect(err.envelope).toEqual(envelope)
-    expect(err.verb).toBe(asClientBuildsIt.verb)
-    expect(err.errDescription).toBe(asClientBuildsIt.errDescription)
+    if (err instanceof ErrUnknownErrorName) {
+      expect(err.unknownName).toBe(name)
+      expect(err.envelope).toEqual({ err_name: name, err_description: description })
+    } else {
+      expect(err.errName).toBe(name)
+      expect(err.errDescription).toBe(description)
+    }
   })
 })
 
@@ -1978,20 +1981,21 @@ describe('describeReportedAdFailure (b.jg5 SRJ-104)', () => {
   /** The envelope's `err_description` of an `ErrUnknownErrorName`. */
   const envelopeDescription = (value: ErrUnknownErrorName): string => (value.envelope as { err_description: string }).err_description
 
-  test.each<readonly [string, () => ErrUnknownErrorName, AdErrorClass]>([
+  test.each<readonly [string, () => AgentDirectorError, AdErrorClass]>([
     ['a plain ErrInternal', () => errInternal(), AD_ERROR_CLASS_UNCLASSIFIED],
     ['the unusable-name ErrInternal', () => errUnusableName(), AD_ERROR_CLASS_UNUSABLE_NAME],
     ['ErrConfigMalformed', () => errConfigMalformed(), AD_ERROR_CLASS_CONFIG],
     ['ErrSchemaMismatch', () => errSchemaMismatch(), AD_ERROR_CLASS_UNCLASSIFIED],
     [ERR_STORE_OPEN_NAME, () => errUnknownErrorName(ERR_STORE_OPEN_NAME, 'the store could not be opened'), AD_ERROR_CLASS_UNCLASSIFIED],
-  ])('an ErrUnknownErrorName (%s, %s) → its unknownName and the envelope description, not the client\'s own text', (_label, build, classified) => {
+  ])('released client error (%s, %s) preserves the reported name and description', (_label, build, classified) => {
     const value = build()
     expect(classifyAdError(value).errorClass).toBe(classified)
     const line = describeReportedAdFailure(value)
-    expect(line).toBe(`${value.unknownName} message=${JSON.stringify(envelopeDescription(value))}`)
-    expect(line).not.toContain(value.errName)
-    expect(line).not.toContain(value.errDescription)
-    expect(line).not.toBe(describeAgentDirectorFailure(value))
+    if (value instanceof ErrUnknownErrorName) {
+      expect(line).toBe(`${value.unknownName} message=${JSON.stringify(envelopeDescription(value))}`)
+    } else {
+      expect(line).toBe(`${value.errName} message=${JSON.stringify(value.errDescription)}`)
+    }
   })
 
   test('an error of its own class with a name CSCB gives no handling → its errName and its errDescription', () => {

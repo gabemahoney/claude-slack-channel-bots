@@ -344,7 +344,7 @@ function makeRow(overrides: Partial<GetResult> = {}, persona: Persona = layer2Pe
     {
       state: 'live',
       jsonl_path: `${CONFIG_DIR}/projects/-repo-app/sess-abc.jsonl`,
-      claude_session_id: 'sess-abc',
+      session_id: 'sess-abc',
       started_at: STARTED_AT,
       last_seen_at: '2026-09-20T05:10:00Z',
       ...overrides,
@@ -400,8 +400,8 @@ describe('runJsonlPersistenceSafeguard — Layer 2 classification', () => {
     const persona = layer2Persona()
     const lookups: Array<[string, string]> = []
     await runLayer2({
-      getRow: async (key: string, claudeInstanceId: string) => {
-        lookups.push([key, claudeInstanceId])
+      getRow: async (key: string, instanceId: string) => {
+        lookups.push([key, instanceId])
         return makeRow()
       },
     })
@@ -418,7 +418,7 @@ describe('runJsonlPersistenceSafeguard — Layer 2 classification', () => {
 
   test('stale-path: persisted missing but fallback exists → LOUD record + persona notice', async () => {
     const row = makeRow()
-    const fallback = resolveJsonlPath(row.cwd, row.claude_session_id, CONFIG_DIR)
+    const fallback = resolveJsonlPath(row.cwd, row.session_id, CONFIG_DIR)
     // Persisted path differs from fallback so persisted stat is false, fallback true.
     const staleRow = makeRow({ jsonl_path: STALE_PATH })
     const c = await runLayer2({
@@ -430,6 +430,10 @@ describe('runJsonlPersistenceSafeguard — Layer 2 classification', () => {
     expect(c.notices).toHaveLength(1)
     expect(c.notices[0]!.key).toBe(layer2Persona().key)
     expect(c.notices[0]!.text).toContain(fallback)
+    for (const detail of [c.errors[0]!.message, c.notices[0]!.text]) {
+      expect(detail).toContain('The current-session fallback is available for agent-director to try on resume.')
+      expect(detail).not.toMatch(/ErrJsonlMissing|fresh.spawn|history has been LOST/)
+    }
     expect(c.notices[0]!.text).not.toContain('this channel')
   })
 
@@ -467,8 +471,8 @@ describe('runJsonlPersistenceSafeguard — Layer 2 classification', () => {
     expect(c.notices).toEqual([])
   })
 
-  test('row present but empty claude_session_id → quiet skip (nothing to resume)', async () => {
-    const c = await runLayer2({ getRow: async () => makeRow({ claude_session_id: '' }) })
+  test('row present but empty session_id → quiet skip (nothing to resume)', async () => {
+    const c = await runLayer2({ getRow: async () => makeRow({ session_id: '' }) })
     expect(c.errors).toEqual([])
     expect(c.notices).toEqual([])
   })
@@ -522,7 +526,7 @@ describe('runJsonlPersistenceSafeguard — Layer 2 classification', () => {
     const config = makeMultiPersonaConfig([{ ...LAYER2_SPEC, claude_config_dir: undefined }], makeTempDir())
     const persona = config.personas[0]!
     const staleRow = makeRow({ jsonl_path: STALE_PATH }, persona)
-    const fallback = resolveJsonlPath(staleRow.cwd, staleRow.claude_session_id, join(home, '.claude'))
+    const fallback = resolveJsonlPath(staleRow.cwd, staleRow.session_id, join(home, '.claude'))
     // Only the temp home is tmpfs, so Layer 1 flags exactly the root under it.
     const homeTmpfs = `23 0 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n25 23 0:20 / ${home} rw shared:3 - tmpfs tmpfs rw\n`
     const c = await runLayer2(
@@ -728,7 +732,7 @@ describe('runJsonlPersistenceSafeguard — real per-persona notifier', () => {
     const h = makeNotifierHarness(personaConfig)
 
     const staleRow = makeRow({ jsonl_path: STALE_PATH }, a)
-    const fallback = resolveJsonlPath(staleRow.cwd, staleRow.claude_session_id, CONFIG_DIR)
+    const fallback = resolveJsonlPath(staleRow.cwd, staleRow.session_id, CONFIG_DIR)
     await runJsonlPersistenceSafeguard(personaConfig, h.notifier.notify, {
       readMountinfo: fixture(REALISTIC_MOUNTINFO),
       statFn: (p) => p === fallback,

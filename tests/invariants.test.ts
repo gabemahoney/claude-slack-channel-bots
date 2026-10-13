@@ -1,3 +1,4 @@
+import { cannedDelivery } from './test-helpers/agent-director-stub.ts'
 /**
  * invariants.test.ts — SR-0.3 / SR-8.6 grep-style + type-level tripwires.
  *
@@ -110,6 +111,7 @@ describe('SR-8.6: PermissionRequestInfo.request_id type', () => {
     // widens request_id beyond `number`, this assertion stops compiling.
     // No runtime expectation; the existence of the assignment is the test.
     const info: PermissionRequestInfo = {
+      ...cannedDelivery(), decision: null, decision_reason: null,
       request_id: Number.MAX_SAFE_INTEGER,
       request_token: '00000000-0000-4000-8000-000000000000',
       tool_name: 'Bash',

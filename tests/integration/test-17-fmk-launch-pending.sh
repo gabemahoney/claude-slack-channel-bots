@@ -5,7 +5,7 @@
 # SRJ-1418; AC 3, AC 6, AC 29, AC 32): a launch in progress, and a resume
 # right after an exit, in five legs, run in this order:
 # - scenario 5's leg (`leg_launch_pending`): a resume held at the
-#   dev-channels dialog reads `pending` with its kept claude_session_id and a
+#   dev-channels dialog reads `pending` with its kept session_id and a
 #   launch start; health ticks and a `resume` forced meanwhile change nothing
 #   (no launch, kill, counted failure or post; the forced `resume` gets
 #   ErrSpawnNotResumable, not counted and not posted); the approver clears
@@ -74,14 +74,14 @@
 #   3. [harness] P's worker is ended with the stub's sentinel, sent into P's
 #      pane with the real tmux: the stub fires SessionEnd and exits, and a
 #      harness `get` reads the row `ended` (or `missing`) with its
-#      claude_session_id.
+#      session_id.
 #   4. The bot server resumes P through its restart path (the session's
 #      disconnect, or a health tick that reads the row dead, schedules the
 #      restart; ruling S4): one `resume` of P's row, whose parent is the bot
 #      server. The resumed stub shows its starting screen for DIALOG_DELAY_S.
 #   5. During the hold:
 #      - [harness] a harness `get` reads `pending`, the same
-#        claude_session_id and a launch_started_at that parses, and neither
+#        session_id and a launch_started_at that parses, and neither
 #        P's pane nor the stub's record of the dialogs it printed
 #        (`stub_shown_dialogs`, keyed by the pane's process: the resumed
 #        stub's own, not the bring-up stub's, which showed a dialog) holds
@@ -111,7 +111,7 @@
 #      so the last read with no needle in either is a time before the dialog
 #      showed; it is the one after the forced resume when the first read of
 #      this step already finds the dialog. Then the row is read until it
-#      leaves `pending`: it reads `waiting` with the same claude_session_id,
+#      leaves `pending`: it reads `waiting` with the same session_id,
 #      and the record then holds the dev-channels dialog.
 #   7. Checks over the leg, counting only shim lines whose parent is the bot
 #      server (or, for the forced call, the driver):
@@ -144,15 +144,15 @@
 # by role: `spawn` (no row: a plain spawn), `reuse` (a finished row whose
 # `cwd` differs from the persona's working directory: the ladder's replace
 # step makes a reuse spawn, `spawn --reuse-finished`) and `resume` (a
-# finished row holding its claude_session_id: a `resume`).
+# finished row holding its session_id: a `resume`).
 #   1. In state dir `bringup`, the live start brings the reuse and resume
 #      personas up (working directories `reuse-a` and `resume`): each row
-#      reads `waiting` with a claude_session_id, each session is registered,
+#      reads `waiting` with a session_id, each session is registered,
 #      and the bring-up's approvers have stopped (APPROVER_QUIET_S with no
 #      pane read). A plain `stop` follows (the workers keep running and no
 #      restart path runs); [harness] each worker then ends with the stub's
 #      sentinel, and its row reads `ended` (or `missing`) with its
-#      claude_session_id.
+#      session_id.
 #   2. In state dir `launch`, the config names the three personas, the reuse
 #      persona now in `reuse-b`; [harness] the dialog delay
 #      LT_DIALOG_DELAY_S is set in the three working directories.
@@ -166,7 +166,7 @@
 #      post-timeout get line is in server.log (every launch call has ended),
 #      the shim is set back to `log`.
 #   5. Each row reads `waiting`, its session is registered, and the resume's
-#      row keeps the resumed claude_session_id.
+#      row keeps the resumed session_id.
 #   6. The leg waits until each persona's retry timer has a stopped line
 #      (recorded, not asserted, when one has not within LT_RETRY_WAIT_S).
 #   7. Checks per persona, over the bot server's agent-director calls of its
@@ -215,7 +215,7 @@
 # persona's agent-director calls with their times, the plain spawns'
 # collision lines, the timeout-phrase and get lines, its tmux-unresponsive
 # and retry-timer lines, its number of retries, and the reuse row's
-# claude_session_id before and after.
+# session_id before and after.
 #
 # The restart leg (`leg_restart_mid_launch`), in run order, in state dir
 # `restart`, `health_check_interval` 0, one persona Q (working directory
@@ -229,7 +229,7 @@
 #      `pending` with launch start L.
 #   3. [harness] The row is read every RESTART_POLL_S until it leaves
 #      `pending`, bounded at RESTART_CLEAR_BOUND_S from L; it reads `waiting`
-#      with a claude_session_id.
+#      with a session_id.
 #   4. Checks, over the CSCB processes' agent-director calls of Q's row:
 #      - the new server launched nothing: its one plain spawn of Q (its start
 #        pass's ladder's first step) is followed by its collision line
@@ -317,7 +317,7 @@
 # ST_TICK_S and `session_restart_delay` ST_RESTART_DELAY_S, through the
 # config.
 #   1. The live start brings S up: the row reads `waiting` with a
-#      claude_session_id, the server registers the stub's MCP session as
+#      session_id, the server registers the stub's MCP session as
 #      S's, the bring-up's approver has stopped (APPROVER_QUIET_S with no
 #      pane read), and the bring-up launch's pending-only retry timer has
 #      stopped (as many stopped lines as armed lines), so the refusal below
@@ -327,7 +327,7 @@
 #   3. [harness] At once, a harness `pause` of S from the scenario's own
 #      shell, through the agent-director shim (a human's `pause`): it
 #      returns success no later than ST_PAUSE_S after T0 (checked), the row
-#      reads `ended` with the same claude_session_id, and the worker's tmux
+#      reads `ended` with the same session_id, and the worker's tmux
 #      session and pane process still run.
 #   4. The stub's MCP session ended with SessionEnd, so the server schedules
 #      S's restart; after the restart delay the restart path resumes S, and
@@ -337,7 +337,7 @@
 #      the worker at once (it waits for the stub's process to end); its tmux
 #      session is gone within
 #      ST_SESSION_END_WAIT_S.
-#   6. The row reads `waiting` again with the same claude_session_id, and
+#   6. The row reads `waiting` again with the same session_id, and
 #      the server registers the resumed stub's session as S's.
 #   7. The next tick's read of S: the bot server's first `status` of S from
 #      T0 + ST_TICK_S - ST_TICK_JITTER_S on, no later than T0 + ST_TICK_S +
@@ -555,7 +555,7 @@
 # Every match on a persona is whole: no persona's name, key or row id is a
 # prefix of another's, a key is matched as `persona=<key>` followed by no
 # key character (`naming_persona`) or with the text after it, and a row id as
-# a whole word of the call (` --claude-instance-id <id> `).
+# a whole word of the call (` --instance-id <id> `).
 #
 # Closing: the script ends with `assert_no_server_tmux` (AC 3's "the bot
 # server starts no tmux process", over every leg's servers, the slow-create
@@ -610,7 +610,7 @@ HOLD_TROUBLE='reconnect|relaunch|Scheduling restart|not[- ]connected'
 
 # The launch-timeout legs' personas, by role: `spawn` (no row: a plain
 # spawn), `reuse` (a finished row in another working directory: a reuse
-# spawn) and `resume` (a finished row with its claude_session_id: a resume).
+# spawn) and `resume` (a finished row with its session_id: a resume).
 LT_ROLES=(spawn reuse resume)
 declare -A LT_NAME=([spawn]="${SCENARIO_TAG}_spawn" [reuse]="${SCENARIO_TAG}_reuse" [resume]="${SCENARIO_TAG}_resume")
 declare -A LT_CHANNEL=([spawn]=C0T17SPN1 [reuse]=C0T17REU1 [resume]=C0T17RSM1)
@@ -816,15 +816,15 @@ line_count() {
 }
 
 # read_row_of <id> <step>: a harness `get` of row <id>. Sets ROW_READ_AT (the
-# time just before the call), ROW_STATE, ROW_SID (claude_session_id),
+# time just before the call), ROW_STATE, ROW_SID (session_id),
 # ROW_LAUNCH (launch_started_at as printed) and ROW_SESSION
 # (tmux_session_name), each empty when absent.
 read_row_of() {
     local id="$1" fields
     ROW_READ_AT="$(now_s)"
-    ad_capture get --claude-instance-id "${id}"
+    ad_capture get --instance-id "${id}"
     (( AD_RC == 0 )) || fail "$2: the harness get of ${id} exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
-    fields="$(jq -r '[.state // "", .claude_session_id // "", (.launch_started_at // "" | tostring), .tmux_session_name // ""] | join("\u001f")' "${AD_OUT}")" \
+    fields="$(jq -r '[.state // "", .session_id // "", (.launch_started_at // "" | tostring), .tmux_session_name // ""] | join("\u001f")' "${AD_OUT}")" \
         || fail "$2: the harness get of ${id} printed no row object: $(head -c 300 "${AD_OUT}")"
     IFS=$'\x1f' read -r ROW_STATE ROW_SID ROW_LAUNCH ROW_SESSION <<< "${fields}"
 }
@@ -889,15 +889,15 @@ server_calls() {
 }
 
 # server_calls_of <id> <verb> <from> <to> [<fragment>...]: `server_calls` for
-# row <id>, named whole (` --claude-instance-id <id> ` in the line's words),
+# row <id>, named whole (` --instance-id <id> ` in the line's words),
 # so another row whose id <id> is a prefix of is never counted.
 server_calls_of() {
     local id="$1" verb="$2" from="$3" to="$4" lines=()
     shift 4
-    mapfile -t lines < <(cscb_ad_calls "${verb}" "--claude-instance-id ${id}" "$@")
+    mapfile -t lines < <(cscb_ad_calls "${verb}" "--instance-id ${id}" "$@")
     (( ${#lines[@]} > 0 )) || return 0
     printf '%s\n' "${lines[@]}" | awk -F'\t' -v p="${SERVER_PID}" -v id="${id}" -v a="${from}" -v b="${to}" '
-        $4 == p && index(" " $6 " ", " --claude-instance-id " id " ") \
+        $4 == p && index(" " $6 " ", " --instance-id " id " ") \
             && (a == "-" || $2 + 0 > a + 0) && (b == "-" || $2 + 0 <= b + 0)'
 }
 
@@ -950,7 +950,7 @@ any_calls_naming_of() {
 # call_table <file>: write <file>, one TAB-separated line per agent-director
 # shim `call` line whose parent is a CSCB process (`cscb_ad_calls`), in log
 # order: its time, its PPID (the CSCB process), its verb, the row id its
-# `--claude-instance-id` names (`-` when none) and its arguments joined by
+# `--instance-id` names (`-` when none) and its arguments joined by
 # single spaces. Read once per check, so each check reads the shim's log
 # once.
 call_table() {
@@ -964,8 +964,8 @@ call_table() {
         id=-
         for (( i = 0; i < ${#_L_ARGS[@]}; i++ )); do
             case "${_L_ARGS[i]}" in
-                --claude-instance-id) id="${_L_ARGS[i + 1]:--}" ;;
-                --claude-instance-id=*) id="${_L_ARGS[i]#*=}" ;;
+                --instance-id) id="${_L_ARGS[i + 1]:--}" ;;
+                --instance-id=*) id="${_L_ARGS[i]#*=}" ;;
             esac
         done
         printf '%s\t%s\t%s\t%s\t%s\n' "${time}" "${_L_PPID}" "${_L_VERB}" "${id}" "${_L_ARGS[*]}" >> "${out}"
@@ -1240,7 +1240,7 @@ EOF
         row_reads "${step}: bring-up" waiting
     sid="${ROW_SID}"
     session="${ROW_SESSION}"
-    [[ -n "${sid}" ]] || fail "${step}: the live row ${P_ID} has no claude_session_id"
+    [[ -n "${sid}" ]] || fail "${step}: the live row ${P_ID} has no session_id"
     [[ -n "${session}" ]] || fail "${step}: the live row ${P_ID} names no tmux session"
     # src/server.ts: the MCP session's registration line.
     connected="$(matcher "[slack] Session connected: persona ${P_REF}")"
@@ -1260,8 +1260,8 @@ EOF
     wait_until "${ENDED_WAIT_S}" "${step}: row ${P_ID} never read ended or missing after the sentinel" \
         row_reads "${step}: after the sentinel" ended missing
     [[ "${ROW_SID}" == "${sid}" ]] \
-        || fail "${step}: the ${ROW_STATE} row's claude_session_id is '${ROW_SID}', not the live row's ${sid}"
-    echo "${TEST_NAME}: ${step}: after the sentinel the row reads ${ROW_STATE} with claude_session_id ${ROW_SID}"
+        || fail "${step}: the ${ROW_STATE} row's session_id is '${ROW_SID}', not the live row's ${sid}"
+    echo "${TEST_NAME}: ${step}: after the sentinel the row reads ${ROW_STATE} with session_id ${ROW_SID}"
 
     # Step 4: the bot server resumes P through its restart path.
     wait_until "${RESUME_WAIT_S}" "${step}: row ${P_ID} never read pending after the sentinel (no resume)" \
@@ -1272,11 +1272,11 @@ EOF
 
     # Step 5: the hold. The row: pending, the same session id, a launch start.
     [[ "${ROW_SID}" == "${sid}" ]] \
-        || fail "${step}: the pending row's claude_session_id is '${ROW_SID}', not the kept ${sid}"
+        || fail "${step}: the pending row's session_id is '${ROW_SID}', not the kept ${sid}"
     [[ -n "${ROW_LAUNCH}" ]] || fail "${step}: the pending row has no launch_started_at"
     launch_ms="$(date -u -d "${ROW_LAUNCH}" +%s%3N 2> /dev/null)" && [[ "${launch_ms}" =~ ^[0-9]+$ ]] \
         || fail "${step}: the pending row's launch_started_at '${ROW_LAUNCH}' does not parse"
-    echo "${TEST_NAME}: ${step}: the held row reads pending, claude_session_id ${ROW_SID}, launch_started_at ${ROW_LAUNCH}"
+    echo "${TEST_NAME}: ${step}: the held row reads pending, session_id ${ROW_SID}, launch_started_at ${ROW_LAUNCH}"
     [[ -z "${ROW_SESSION}" ]] || session="${ROW_SESSION}"
     restart_lines="$(grep -F -- "Scheduling restart for persona=${P_KEY} " "${SLACK_STATE_DIR}/server.log" || true)"
     echo "${TEST_NAME}: ${step}: what scheduled the restart (src/restart.ts scheduleRestart lines): ${restart_lines:-none}"
@@ -1345,7 +1345,7 @@ EOF
         case "${_L_VERB}" in
             spawn) fail "${step}: the driver made a spawn: ${line}" ;;
             resume)
-                [[ " ${_L_ARGS[*]} " == *" --claude-instance-id ${P_ID} "* ]] \
+                [[ " ${_L_ARGS[*]} " == *" --instance-id ${P_ID} "* ]] \
                     || fail "${step}: the driver's resume names another row: ${line}"
                 launches=$(( launches + 1 )) ;;
         esac
@@ -1406,7 +1406,7 @@ EOF
         row_left_pending "${step}: after the dialog"
     live_at="${ROW_READ_AT}"
     [[ "${ROW_STATE}" == waiting ]] || fail "${step}: the row left pending for ${ROW_STATE}, not waiting"
-    [[ "${ROW_SID}" == "${sid}" ]] || fail "${step}: the waiting row's claude_session_id is '${ROW_SID}', not the kept ${sid}"
+    [[ "${ROW_SID}" == "${sid}" ]] || fail "${step}: the waiting row's session_id is '${ROW_SID}', not the kept ${sid}"
     hold_log1="$(line_count "${SLACK_STATE_DIR}/server.log")"
     # The dialog showed on the resumed stub's pane: its record holds it (the
     # stub writes the record before it reads the Enter that answers it).
@@ -1518,7 +1518,7 @@ write_personas_config() {
 poll_row_of() {
     local id="$1" fields
     ROW_READ_AT="$(now_s)"
-    ad_capture get --claude-instance-id "${id}"
+    ad_capture get --instance-id "${id}"
     if (( AD_RC != 0 )); then
         if grep -qF ErrSpawnNotFound "${AD_OUT}" "${AD_ERR}"; then
             ROW_STATE=absent ROW_SID="" ROW_LAUNCH="" ROW_SESSION=""
@@ -1526,7 +1526,7 @@ poll_row_of() {
         fi
         fail "$2: the harness get of ${id} exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
     fi
-    fields="$(jq -r '[.state // "", .claude_session_id // "", (.launch_started_at // "" | tostring), .tmux_session_name // ""] | join("\u001f")' "${AD_OUT}")" \
+    fields="$(jq -r '[.state // "", .session_id // "", (.launch_started_at // "" | tostring), .tmux_session_name // ""] | join("\u001f")' "${AD_OUT}")" \
         || fail "$2: the harness get of ${id} printed no row object: $(head -c 300 "${AD_OUT}")"
     IFS=$'\x1f' read -r ROW_STATE ROW_SID ROW_LAUNCH ROW_SESSION <<< "${fields}"
 }
@@ -1608,7 +1608,7 @@ leg_launch_timeouts() {
         wait_until "${REPORT_WAIT_S}" "${step}: row ${LT_ID[${role}]} never reported in (waiting) at the bring-up" \
             row_of_reads "${LT_ID[${role}]}" "${step}: the bring-up" waiting
         sid[${role}]="${ROW_SID}"
-        [[ -n "${sid[${role}]}" ]] || fail "${step}: the live ${role} row ${LT_ID[${role}]} has no claude_session_id"
+        [[ -n "${sid[${role}]}" ]] || fail "${step}: the live ${role} row ${LT_ID[${role}]} has no session_id"
         wait_for_log "$(matcher "[slack] Session connected: persona ${LT_REF[${role}]}")" "${CONNECT_WAIT_S}" \
             "${step}: the server never registered the ${role} persona's session at the bring-up"
     done
@@ -1619,8 +1619,8 @@ leg_launch_timeouts() {
     for role in reuse resume; do
         end_worker "${LT_ID[${role}]}" "${step}: the ${role} worker"
         [[ "${ROW_SID}" == "${sid[${role}]}" ]] \
-            || fail "${step}: the ${ROW_STATE} ${role} row's claude_session_id is '${ROW_SID}', not the live row's ${sid[${role}]}"
-        echo "${TEST_NAME}: ${step}: the ${role} row reads ${ROW_STATE} with claude_session_id ${ROW_SID}"
+            || fail "${step}: the ${ROW_STATE} ${role} row's session_id is '${ROW_SID}', not the live row's ${sid[${role}]}"
+        echo "${TEST_NAME}: ${step}: the ${role} row reads ${ROW_STATE} with session_id ${ROW_SID}"
     done
 
     # Step 2: the three personas, the reuse persona in another working
@@ -1685,8 +1685,8 @@ leg_launch_timeouts() {
             "${step}: ${role}: the server never registered the persona's session after its launch timeout"
     done
     [[ "${out_sid[resume]}" == "${sid[resume]}" ]] \
-        || fail "${step}: resume: the waiting row's claude_session_id is '${out_sid[resume]}', not the resumed ${sid[resume]}"
-    echo "${TEST_NAME}: ${step}: the reuse row's claude_session_id was ${sid[reuse]} and is now ${out_sid[reuse]} (recorded)"
+        || fail "${step}: resume: the waiting row's session_id is '${out_sid[resume]}', not the resumed ${sid[resume]}"
+    echo "${TEST_NAME}: ${step}: the reuse row's session_id was ${sid[reuse]} and is now ${out_sid[reuse]} (recorded)"
 
     # Step 6: each persona's retry timer has stopped (recorded when not).
     _scenario_poll_until "${LT_RETRY_WAIT_S}" lt_timers_stopped "${log0}" \
@@ -1869,7 +1869,7 @@ leg_restart_mid_launch() {
     done
     echo "${TEST_NAME}: ${step}: Q's row left pending for ${ROW_STATE} $(seconds_between "${l_s}" "${out_at}")s after its launch start"
     [[ "${ROW_STATE}" == waiting ]] || fail "${step}: Q's row left pending for ${ROW_STATE}, not waiting"
-    [[ -n "${ROW_SID}" ]] || fail "${step}: Q's waiting row has no claude_session_id"
+    [[ -n "${ROW_SID}" ]] || fail "${step}: Q's waiting row has no session_id"
 
     # Step 4: the checks, over the CSCB processes' calls (`call_table`).
     call_table "${table}"
@@ -1949,7 +1949,7 @@ fc_only_pending() {
     local ids
     ad_capture list --state pending
     (( AD_RC == 0 )) || fail "$1: the harness list exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
-    ids="$(jq -r '(if type == "array" then . else .spawns end)[] | .claude_instance_id' "${AD_OUT}" | sort | tr '\n' ' ')" \
+    ids="$(jq -r '(if type == "array" then . else .spawns end)[] | .instance_id' "${AD_OUT}" | sort | tr '\n' ' ')" \
         || fail "$1: the harness list printed no row list: $(head -c 300 "${AD_OUT}")"
     [[ "${ids}" == "${F_ID} " ]] || fail "$1: the pending rows are '${ids% }', not ${F_ID} alone"
 }
@@ -2122,7 +2122,7 @@ leg_fail_create() {
 server_status_after() {
     awk -F'\t' -v p="${SERVER_PID}" -v id="$1" -v t="$2" '
         $1 == "call" && $4 == p && $2 + 0 > t + 0 && index(" " $6 " ", " status ") \
-            && index(" " $6 " ", " --claude-instance-id " id " ") { print $2; exit }' "${SCENARIO_AD_SHIM_LOG}"
+            && index(" " $6 " ", " --instance-id " id " ") { print $2; exit }' "${SCENARIO_AD_SHIM_LOG}"
 }
 
 # server_status_seen <id> <time>: true once `server_status_after` prints a time.
@@ -2195,7 +2195,7 @@ leg_still_stopping() {
         row_of_reads "${S_ID}" "${step}: bring-up" waiting
     sid="${ROW_SID}"
     session="${ROW_SESSION}"
-    [[ -n "${sid}" && -n "${session}" ]] || fail "${step}: the live row ${S_ID} has no claude_session_id or names no tmux session"
+    [[ -n "${sid}" && -n "${session}" ]] || fail "${step}: the live row ${S_ID} has no session_id or names no tmux session"
     # src/server.ts: the MCP session's registration line.
     connected="$(matcher "[slack] Session connected: persona ${S_REF}")"
     wait_for_log "${connected}" "${CONNECT_WAIT_S}" "${step}: the server never registered the stub's session as S's"
@@ -2214,7 +2214,7 @@ leg_still_stopping() {
     tick0="$(server_status_after "${S_ID}" "${t}")"
 
     # Step 3 [harness]: pause S from the scenario's shell, at once.
-    ad_capture pause --claude-instance-id "${S_ID}"
+    ad_capture pause --instance-id "${S_ID}"
     paused_at="$(now_s)"
     (( AD_RC == 0 )) || fail "${step}: the harness pause of ${S_ID} exited ${AD_RC}: $(head -c 300 "${AD_ERR}") $(head -c 300 "${AD_OUT}")"
     awk -v a="${tick0}" -v b="${paused_at}" -v s="${ST_PAUSE_S}" 'BEGIN { exit !(b - a <= s) }' \
@@ -2247,7 +2247,7 @@ leg_still_stopping() {
     wait_until "$(( RETRY_BASE_S + ST_LAUNCH_SLACK_S + REPORT_WAIT_S ))" "${step}: row ${S_ID} never read waiting again after the release" \
         row_of_reads "${S_ID}" "${step}: after the release" waiting
     live_at="${ROW_READ_AT}"
-    [[ "${ROW_SID}" == "${sid}" ]] || fail "${step}: the waiting row's claude_session_id is '${ROW_SID}', not the paused row's ${sid}"
+    [[ "${ROW_SID}" == "${sid}" ]] || fail "${step}: the waiting row's session_id is '${ROW_SID}', not the paused row's ${sid}"
     wait_for_count "${connected}" 2 "${CONNECT_WAIT_S}" "${step}: the server never registered the resumed stub's session as S's"
 
     # Step 7: the next health tick's read (its onset check is covered by the

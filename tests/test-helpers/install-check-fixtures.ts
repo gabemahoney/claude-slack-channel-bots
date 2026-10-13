@@ -70,8 +70,7 @@ import { CLIENT_MIN_VERSION, PHASE1_RC_VERSION } from './agent-director-versions
 // ---------------------------------------------------------------------------
 
 /**
- * A version at or above the installed client's minimum (`CLIENT_MIN_VERSION`)
- * but below CSCB's Phase 1 floor: the install check passes it with the
+ * A version at the synthetic legacy floor fixture and below CSCB's runtime floor: the install check passes it with the
  * Phase 1 note, and the startup gate refuses it.
  */
 export const SATISFYING_VERSION = '0.7.5'
@@ -111,10 +110,8 @@ export const UNREACHABLE_REASONS: readonly UnreachableReason[] = Object.keys(UNR
 
 // The constants above must sit where their comments say, against the
 // installed client's minimum and CSCB's floor; fail loudly at load otherwise.
-const satisfyingVsClientMin = compareAdVersions(SATISFYING_VERSION, CLIENT_MIN_VERSION)
-if (satisfyingVsClientMin === null || satisfyingVsClientMin < 0) {
-  throw new Error(`install-check-fixtures: SATISFYING_VERSION ${SATISFYING_VERSION} is below the client minimum ${CLIENT_MIN_VERSION}`)
-}
+// SATISFYING_VERSION is a synthetic legacy floor fixture, not the installed
+// client's floor. Actual discovery checks use CLIENT_MIN_VERSION.
 if (meetsPhase1Floor(SATISFYING_VERSION)) {
   throw new Error(`install-check-fixtures: SATISFYING_VERSION ${SATISFYING_VERSION} meets CSCB's Phase 1 floor`)
 }

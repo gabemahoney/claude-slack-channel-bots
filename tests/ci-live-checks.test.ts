@@ -901,7 +901,7 @@ describe('host-state', () => {
   })
 
   test.each([
-    ['{"spawns":[{"claude_instance_id":"cscb_b"},{"claude_instance_id":"cscb_a"},{}]}', ['?', 'cscb_a', 'cscb_b']],
+    ['{"spawns":[{"instance_id":"cscb_b"},{"instance_id":"cscb_a"},{}]}', ['?', 'cscb_a', 'cscb_b']],
     ['{"spawns":[]}', []],
     ['{}', null],
     ['not json', null],
@@ -932,9 +932,9 @@ describe('host-state', () => {
 
   test("snapshotHost only reads: agent-director list on CSCB's own store, tmux ls, the port-3100 listener and a hash of the config file", async () => {
     const config = Buffer.from('{"personas":[]}')
-    const p = probe({ stdout: '{"spawns":[{"claude_instance_id":"cscb_prod_a"}]}' }, { stdout: 'slack_bot_prod_a\nwork\n' }, config)
+    const p = probe({ stdout: '{"spawns":[{"instance_id":"cscb_prod_a"}]}' }, { stdout: 'slack_bot_prod_a\nwork\n' }, config)
     const snap = await snapshotHost(p.deps, '/home/tester')
-    expect(hostStorePath('/home/tester')).toBe('/home/tester/.agent-director/state.db')
+    expect(hostStorePath('/home/tester')).toBe('/home/tester/.config/agent-director/state.db')
     // b.jg5 SRJ-1301: the HOST check's probes are exactly these two whole argvs, in order; a changed or extra probe fails.
     expect(p.argv).toEqual([
       ['agent-director', '--store-path', hostStorePath('/home/tester'), 'list', '--label', 'service=cscb'],

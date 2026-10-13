@@ -78,7 +78,7 @@ const LIVE_SHUTDOWN_QUERY = '() => shuttingDown'
 /**
  * An agent-director `delete` verb call: a `delete` on a client (`client.delete(`,
  * `pass.client.delete(`, `getClient().delete(`) or a `.delete(` given a params
- * object (`{ claude_instance_id: [...] }`). A `Map`'s `.delete(key)` is neither.
+ * object (`{ instance_id: [...] }`). A `Map`'s `.delete(key)` is neither.
  */
 const DELETE_VERB_CALL = /(?:\bclient|\bgetClient\s*\(\s*\))\s*\.\s*delete\s*\(|\.\s*delete\s*\(\s*\{/i
 

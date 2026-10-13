@@ -3,7 +3,7 @@
  * permission action_id encoder/decoder under the request_token wire.
  *
  * Covers:
- *   - Round-trip for representative `(decision, claude_instance_id, request_token)`
+ *   - Round-trip for representative `(decision, instance_id, request_token)`
  *     triples, including underscore-bearing instance ids.
  *   - Anchored decoder rejects trailing / leading garbage.
  *   - Decoder yields null (not throw) on malformed inputs.
@@ -50,7 +50,7 @@ describe('parsePermissionActionId — round-trip via encode', () => {
       const encoded = encodePermissionActionId('allow', INSTANCE_SIMPLE, token)
       expect(parsePermissionActionId(encoded)).toEqual({
         decision: 'allow',
-        claudeInstanceId: INSTANCE_SIMPLE,
+        instanceId: INSTANCE_SIMPLE,
         requestToken: token,
       })
     }
@@ -61,7 +61,7 @@ describe('parsePermissionActionId — round-trip via encode', () => {
     const encoded = encodePermissionActionId('deny', INSTANCE_SIMPLE, token)
     expect(parsePermissionActionId(encoded)).toEqual({
       decision: 'deny',
-      claudeInstanceId: INSTANCE_SIMPLE,
+      instanceId: INSTANCE_SIMPLE,
       requestToken: token,
     })
   })
@@ -71,7 +71,7 @@ describe('parsePermissionActionId — round-trip via encode', () => {
     const encoded = encodePermissionActionId('allow', INSTANCE_UNDERSCORED, token)
     expect(parsePermissionActionId(encoded)).toEqual({
       decision: 'allow',
-      claudeInstanceId: INSTANCE_UNDERSCORED,
+      instanceId: INSTANCE_UNDERSCORED,
       requestToken: token,
     })
   })
@@ -81,7 +81,7 @@ describe('parsePermissionActionId — round-trip via encode', () => {
     const encoded = encodePermissionActionId('deny', INSTANCE_LETTERS, token)
     expect(parsePermissionActionId(encoded)).toEqual({
       decision: 'deny',
-      claudeInstanceId: INSTANCE_LETTERS,
+      instanceId: INSTANCE_LETTERS,
       requestToken: token,
     })
   })
@@ -168,13 +168,13 @@ describe('parsePermissionActionId — malformed inputs return null (do not throw
   })
 
   test('embedded "perm_…" mid-instance still parses — the trailing-UUID anchor wins', () => {
-    // A `claude_instance_id` that literally contains `perm_allow_` earlier in
+    // A `instance_id` that literally contains `perm_allow_` earlier in
     // its body still round-trips: the regex's rightmost UUID-shaped boundary
     // is the only thing fixing the instance/token split.
     const embedded = `perm_allow_cscb_perm_allow_xyz_${token}`
     expect(parsePermissionActionId(embedded)).toEqual({
       decision: 'allow',
-      claudeInstanceId: 'cscb_perm_allow_xyz',
+      instanceId: 'cscb_perm_allow_xyz',
       requestToken: token,
     })
   })
@@ -191,7 +191,7 @@ describe('encodePermissionActionId — argument validation', () => {
     expect(() => encodePermissionActionId('maybe' as never, INSTANCE_SIMPLE, token)).toThrow(/invalid decision/)
   })
 
-  test('rejects claude_instance_id that does not start with cscb_', () => {
+  test('rejects instance_id that does not start with cscb_', () => {
     expect(() => encodePermissionActionId('allow', 'foo_C1', token)).toThrow(/must start with 'cscb_'/)
   })
 
@@ -255,7 +255,7 @@ describe('parsePermissionActionId — cscb_<persona key> round-trip', () => {
         expect(actionId.length).toBeLessThanOrEqual(SLACK_ACTION_ID_MAX_LENGTH)
         expect(parsePermissionActionId(actionId)).toEqual({
           decision,
-          claudeInstanceId: instanceId,
+          instanceId: instanceId,
           requestToken: token,
         })
       }

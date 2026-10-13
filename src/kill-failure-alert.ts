@@ -435,8 +435,8 @@ export function killFailureOrdinaryBody(input: KillFailureOrdinaryBodyInput): st
     `:rotating_light: *Kill failed* — agent-director could not end the worker in session ${session}: ` +
     "it, or another process in that session's panes, may still be running, and its agent-director row was kept. " +
     agentDirectorSaid(input.quotes, forSlack) +
-    `A human's next step: check it with \`agent-director read-pane --claude-instance-id ${id}\`; ` +
-    `if the worker still runs, run \`agent-director kill --claude-instance-id ${id}\` and check its result. ` +
+    `A human's next step: check it with \`agent-director read-pane --instance-id ${id}\`; ` +
+    `if the worker still runs, run \`agent-director kill --instance-id ${id}\` and check its result. ` +
     "A read-pane answer of ErrTmuxCaptureFailed does not prove the worker gone when agent-director's description says no session or pane of this launch was found, " +
     'and a pane does not prove it is the worker\'s when kill then answers "not this launch\'s session", ' +
     "because read-pane can return a leftover's pane; " +

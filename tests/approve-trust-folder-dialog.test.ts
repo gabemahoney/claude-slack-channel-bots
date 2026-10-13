@@ -1,3 +1,4 @@
+import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 /**
  * approve-trust-folder-dialog.test.ts — Direct unit tests of the startup-dialog
  * approver's lap (`approvePreSessionDialogs`, b.jg5 SRJ-402) over the
@@ -397,12 +398,12 @@ const NEEDLES: ReadonlyArray<readonly [string, string]> = [
 ]
 
 /** A pane showing a startup dialog whose pre-selected option is `needle`. */
-function dialogPane(needle: string): { pane: string } {
-  return { pane: ['  ┌──────────────────────────────────────┐', `  │ > 1. ${needle}`, '  │   2. No, exit', '  └──────────────────────────────────────┘'].join('\n') }
+function dialogPane(needle: string): import('agent-director').ReadPaneResult {
+  return cannedReadPaneResult(['  ┌──────────────────────────────────────┐', `  │ > 1. ${needle}`, '  │   2. No, exit', '  └──────────────────────────────────────┘'].join('\n'))
 }
 
 /** A pane with no startup dialog on it. */
-const CLEAR_PANE = { pane: 'Listening for channel messages from: server:slack-channel-router' }
+const CLEAR_PANE = cannedReadPaneResult('Listening for channel messages from: server:slack-channel-router')
 
 /** A `pending` row with a launch start (the stub's default sample). */
 const PENDING_ROW = cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE })
@@ -413,12 +414,12 @@ const LIVE_ROW = cannedStatusResult({ state: LIVE_STATES_BUT_PENDING[0]! })
 
 /** The expected `read-pane` of persona `id`: 40 lines, `allow_pending` (b.jg5 SRJ-402). */
 function expectedReadPane(id: string): ReadPaneParams {
-  return { claude_instance_id: id, n_lines: 40, allow_pending: true }
+  return { instance_id: id, n_lines: 40, allow_pending: true }
 }
 
 /** The expected `send-keys` of persona `id`: Enter (empty text), `allow_pending`, nothing else (no pane target). */
 function expectedEnter(id: string): SendKeysParams {
-  return { claude_instance_id: id, text: '', allow_pending: true }
+  return { instance_id: id, text: '', allow_pending: true }
 }
 
 /**
@@ -796,13 +797,13 @@ describe('approvePreSessionDialogs: the lap on a pending row with a launch start
       await clock.flush()
       // The first lap, before any timer fires.
       expect(run.stop()).toBeUndefined()
-      expect(calls.statusCalls).toEqual([{ claude_instance_id: who.id }])
+      expect(calls.statusCalls).toEqual([{ instance_id: who.id }])
       expect(calls.readPaneCalls).toEqual([expectedReadPane(who.id)])
       expect(calls.sendKeysCalls).toEqual([expectedEnter(who.id)])
 
       expect(await runToStop(run)).toBe(APPROVER_STOP_LIVE)
       // The second lap read a live row: nothing more was read or typed.
-      expect(calls.statusCalls).toEqual([{ claude_instance_id: who.id }, { claude_instance_id: who.id }])
+      expect(calls.statusCalls).toEqual([{ instance_id: who.id }, { instance_id: who.id }])
       expect(calls.readPaneCalls).toHaveLength(1)
       expect(calls.sendKeysCalls).toHaveLength(1)
       expect(approverLines()).toEqual([])
@@ -840,7 +841,7 @@ describe('approvePreSessionDialogs: the lap on a pending row with a launch start
 
     expect(await approve(NAMED, false)).toBe(APPROVER_STOP_LIVE)
 
-    const status = { claude_instance_id: NAMED.id }
+    const status = { instance_id: NAMED.id }
     expect(calls).toEqual({
       ...makeStubCallLog(),
       statusCalls: [status, status, status],
@@ -894,7 +895,7 @@ describe('approvePreSessionDialogs: the stops on a row state (b.jg5 SRJ-402)', (
       // One status per lap; only the earlier pending lap, if any, read the pane.
       expect(calls).toEqual({
         ...makeStubCallLog(),
-        statusCalls: [...before, state].map(() => ({ claude_instance_id: NAMED.id })),
+        statusCalls: [...before, state].map(() => ({ instance_id: NAMED.id })),
         readPaneCalls: before.map(() => expectedReadPane(NAMED.id)),
       })
       const message = approverFinishedMessage(NAMED.ref, state)
@@ -1892,7 +1893,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
   /** Status answers per instance id, the last sticking. */
   let rows: Map<string, Array<StatusResult | Error>>
   /** The pane per instance id (no dialog unless set). */
-  let panes: Map<string, { pane: string }>
+  let panes: Map<string, import('agent-director').ReadPaneResult>
   /** One-shot failures per `<verb> <instance id>`. */
   let failures: Map<string, Error>
   let holds: Map<string, CallHold>
@@ -1953,8 +1954,8 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     maxActive = new Map()
     insideAttempt = []
     const stub = makeStubClient({})
-    const wrap = <R>(verb: ApproverVerb, answer: (id: string) => R) => async (params: { claude_instance_id: string }): Promise<R> => {
-      const id = params.claude_instance_id
+    const wrap = <R>(verb: ApproverVerb, answer: (id: string) => R) => async (params: { instance_id: string }): Promise<R> => {
+      const id = params.instance_id
       const name = call(verb, id)
       events.push(name)
       insideAttempt.push(isInsideAttempt(keyOfId.get(id) ?? id))
@@ -2893,7 +2894,7 @@ function countsSince(after: Record<string, number>, before: Record<string, numbe
 describe('the pending-row rule runs once at the approver\'s stop, for the stops that leave the row to it (b.jg5 SRJ-404, SRJ-410)', () => {
   const who = PLAIN
   /** P's own row as the rule's `get` reads it: `pending`, with the stub's default launch start. */
-  const PENDING_GET = cannedGetResult({ claude_instance_id: who.id, state: AGENT_DIRECTOR_PENDING_STATE })
+  const PENDING_GET = cannedGetResult({ instance_id: who.id, state: AGENT_DIRECTOR_PENDING_STATE })
   /** The test cap of the cap cases: past the approver's second slow lap, before its third. */
   const CAP_MS = SLOW + FAST
   /** The run's lap, its run and its get, as call-list counts. */

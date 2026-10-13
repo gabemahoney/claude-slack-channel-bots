@@ -31,7 +31,7 @@
 #     store" at "duplicate session", the new row `ended`; the post's
 #     must-not-be-ended, pointer, list and human-only lines; reuse rounds;
 #   - a `pending` row beside a leftover (`pendleft`), seeded as a spawn whose
-#     process stopped before its create (so with no claude_session_id):
+#     process stopped before its create (so with no session_id):
 #     CSCB's own pending-row runs mark the row `missing` (`tmux_name_held`);
 #     the restart path's reuse spawn is refused as "left over from an earlier
 #     life"; rounds are `status` then a spawn with `--reuse-finished`.
@@ -71,7 +71,7 @@
 #   Phase 1. The live start spawns `nolabel` fresh (the start pass's
 #      completion line counts `0 failed` and `0 not brought up`); the
 #      approver clears the dialog; a harness `get` reads the row `waiting`; its
-#      claude_session_id and tmux session name are recorded.
+#      session_id and tmux session name are recorded.
 #   Phase 2. [harness] The human ends `nolabel`'s worker as a human ends
 #      Claude Code: the stub's exit line typed into its pane with the real
 #      tmux (`__CSCB_TEST_EXIT__`, the stub's `/exit`, fixtures/stub-claude.sh),
@@ -87,7 +87,7 @@
 #      stops the server first, and a check below shows no CSCB `resume` or
 #      `spawn` of the row between the exit and the second life. Then
 #      `stop --stop-bots`; a harness `get` reads the row `ended` or
-#      `missing`, with the same claude_session_id, and its session is gone.
+#      `missing`, with the same session_id, and its session is gone.
 #   Phase 3. [harness] With the server stopped, a session with no label and
 #      no @ad_pane, named as the row records (`slack_bot_<key>`), its pane
 #      running `sleep` (`seed_unlabelled`). The row still reads finished.
@@ -139,7 +139,7 @@
 #        not refused", posted), with no refused round line beyond those read
 #        before the end, the approver clears the dialog and the row reads
 #        `waiting` on its session name with the first life's
-#        claude_session_id; the server registers the stub's MCP session;
+#        session_id; the server registers the stub's MCP session;
 #        exactly one post holds the recovery head, and it equals the printed
 #        recovery notice (`conflictRecoveryText`, reason
 #        LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED); the channel holds only the
@@ -165,11 +165,11 @@
 # carries `@ad_pane` (its label's token and its pane id).
 #   Phase 1. `pendleft` joins `nolabel`'s first life (its statement in phase 3
 #      edits that row): spawned fresh, the approver clears the dialog, a
-#      harness `get` reads `waiting`; its claude_session_id and session name
+#      harness `get` reads `waiting`; its session_id and session name
 #      (which must be `personaTmuxSessionName`'s) are recorded.
 #   Phase 2. `stop --stop-bots`'s teardown ends `pendleft`'s worker: its
 #      session is gone within EXIT_WAIT_S; a harness `get` reads the row with
-#      its first life's claude_session_id (its state is recorded, not
+#      its first life's session_id (its state is recorded, not
 #      asserted: 0.11.0's `kill` changes no row's state).
 #   Phase 3. [harness] With the server stopped, in this order:
 #      - `scanleft`: `seed_leftover` (a label naming an earlier launch of
@@ -183,10 +183,10 @@
 #        (`ad_store_seed_pending`, given the leftover's token): the row reads
 #        `pending` with a launch start (recorded, PEND_LAUNCH_MS) and a launch
 #        token other than the leftover's, and still holds its first life's
-#        claude_session_id; then one script-local `ad_store_edit` UPDATE
-#        (s19_pend_no_session) clears that claude_session_id, since the
+#        session_id; then one script-local `ad_store_edit` UPDATE
+#        (s19_pend_no_session) clears that session_id, since the
 #        seeded launch is a spawn whose process stopped before its create and
-#        so recorded no Claude session (b.jg5 SRJ-1420): claude_session_id
+#        so recorded no Claude session (b.jg5 SRJ-1420): session_id
 #        NULL and row_version + 1, named by its id, its `pending` state and
 #        its row_version as read just before; a store read after it shows
 #        every other column as the seed set it.
@@ -233,7 +233,7 @@
 #        `find-missing` call in the whole shim log has a parent other than a
 #        CSCB process (the harness runs none); no CSCB `kill` of the id;
 #      - `pendleft` then latches (s19_latch, waited for within SETTLE_S): the
-#        restart path's launch on the `missing` row with no claude_session_id
+#        restart path's launch on the `missing` row with no session_id
 #        is one reuse spawn (a `spawn` carrying `--reuse-finished`, read from
 #        the shim's argv; a `resume` before it, which agent-director answers
 #        `ErrNoSessionId`, and the server's line for it, the no-transcript
@@ -276,7 +276,7 @@
 #        refused operation was not refused", posted) within SETTLE_S, once,
 #        and no refused round line beyond those read before the end; the row
 #        reads `waiting` within REPORT_WAIT_S, on the session name the latch
-#        quoted (`pendleft`'s on a fresh claude_session_id, not its first
+#        quoted (`pendleft`'s on a fresh session_id, not its first
 #        life's); the server registers the stub's MCP session; exactly one
 #        post holds the recovery head, equal to the printed recovery notice;
 #        the channel holds only the CONFLICT notice and that post; server.log
@@ -317,7 +317,7 @@
 #   pauses no live stub (each such pause waits out its 30 s timeout, one
 #   persona after another); then `stop --stop-bots`, and every persona's row
 #   is present at the end (`nolabel`'s with its first life's
-#   claude_session_id, `pendleft`'s with the one its reuse started).
+#   session_id, `pendleft`'s with the one its reuse started).
 #
 # Waits and their derivation (seconds): STUB_WAIT_S (20) for the Slack
 # stub's ready file; START_WAIT_S (120) per start pass (one bring-up, one
@@ -562,13 +562,13 @@ write_personas_config() {
 }
 
 # read_row <step> <instance-id>: a harness `get` of the row. Sets ROW_STATE,
-# ROW_SID (claude_session_id) and ROW_SESSION (tmux_session_name), each
+# ROW_SID (session_id) and ROW_SESSION (tmux_session_name), each
 # empty when absent.
 read_row() {
     local fields
-    ad_capture get --claude-instance-id "$2"
+    ad_capture get --instance-id "$2"
     (( AD_RC == 0 )) || fail "$1: the harness get of $2 exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
-    fields="$(jq -r '[.state // "", .claude_session_id // "", .tmux_session_name // ""] | join("\u001f")' "${AD_OUT}")" \
+    fields="$(jq -r '[.state // "", .session_id // "", .tmux_session_name // ""] | join("\u001f")' "${AD_OUT}")" \
         || fail "$1: the harness get of $2 printed no row object: $(head -c 300 "${AD_OUT}")"
     IFS=$'\x1f' read -r ROW_STATE ROW_SID ROW_SESSION <<< "${fields}"
 }
@@ -765,7 +765,7 @@ s19_settle() {
 # store_rows_of <step> <instance-id>: print how many rows the store holds
 # with <instance-id> (the harness's read-only store read, both guards first).
 store_rows_of() {
-    _scenario_store_read "$1" "SELECT COUNT(*) FROM spawns WHERE claude_instance_id = '$2'"
+    _scenario_store_read "$1" "SELECT COUNT(*) FROM spawns WHERE instance_id = '$2'"
 }
 
 # name_held_records <instance-id> <source> <row-result>: print the trail's
@@ -951,7 +951,7 @@ phase1_first_life() {
     for key in "${LIFE1_KEYS[@]}"; do
         ref="${PERSONA_REF[${key}]}"
         wait_row "${step}: ${key}'s report-in" "${REPORT_WAIT_S}" "${PERSONA_ID[${key}]}" waiting
-        [[ -n "${ROW_SID}" ]] || fail "${step}: the live row ${PERSONA_ID[${key}]} has no claude_session_id"
+        [[ -n "${ROW_SID}" ]] || fail "${step}: the live row ${PERSONA_ID[${key}]} has no session_id"
         [[ -n "${ROW_SESSION}" ]] || fail "${step}: the live row ${PERSONA_ID[${key}]} names no tmux session"
         PERSONA_SID[${key}]="${ROW_SID}"
         PERSONA_SESSION[${key}]="${ROW_SESSION}"
@@ -960,7 +960,7 @@ phase1_first_life() {
         calls="$(ad_cscb_calls "${PERSONA_ID[${key}]}")"
         rows="$(server_rows "${LIFE1_PID}" "$(verb_rows send-keys "${calls}")")"
         (( $(rows_count "${rows}") >= 1 )) || fail "${step}: no bot-server send-keys of ${PERSONA_ID[${key}]} (the approver's Enter)"
-        echo "${TEST_NAME}: ${step}: ${PERSONA_ID[${key}]} reads waiting, claude_session_id ${ROW_SID}, session ${ROW_SESSION}"
+        echo "${TEST_NAME}: ${step}: ${PERSONA_ID[${key}]} reads waiting, session_id ${ROW_SID}, session ${ROW_SESSION}"
     done
 }
 
@@ -992,7 +992,7 @@ phase2_stop_bots() {
     id="${PERSONA_ID[${S4_KEY}]}"
     row_reads "${step}" "${id}" ended missing || fail "${step}: ${id} reads '${ROW_STATE}', not ended or missing"
     [[ "${ROW_SID}" == "${PERSONA_SID[${S4_KEY}]}" ]] \
-        || fail "${step}: ${id}'s claude_session_id is '${ROW_SID}', not ${PERSONA_SID[${S4_KEY}]}"
+        || fail "${step}: ${id}'s session_id is '${ROW_SID}', not ${PERSONA_SID[${S4_KEY}]}"
     ! has_session "${PERSONA_SESSION[${S4_KEY}]}" || fail "${step}: session ${PERSONA_SESSION[${S4_KEY}]} is there"
     rows="$(ad_cscb_calls "${id}" "${S4_EXIT_MARK}")"
     echo "${TEST_NAME}: ${step}: CSCB calls of ${id} after the exit (recorded, not asserted): $(field_of 4 "${rows}" | tr '\n' ' ')"
@@ -1002,12 +1002,12 @@ phase2_stop_bots() {
     done
     S4_FINISHED_STATE="${ROW_STATE}"
     S19_LATCH_ROW[${S4_KEY}]="${S4_FINISHED_STATE}"
-    echo "${TEST_NAME}: ${step}: ${id} reads ${ROW_STATE} with claude_session_id ${ROW_SID}"
+    echo "${TEST_NAME}: ${step}: ${id} reads ${ROW_STATE} with session_id ${ROW_SID}"
     s19_pend_stopped
 }
 
 # Scenario 19, the `pending` variant: the teardown ended the persona's
-# worker's session; its row keeps its claude_session_id (its state is
+# worker's session; its row keeps its session_id (its state is
 # recorded, not asserted: the teardown's `kill` changes no row's state).
 s19_pend_stopped() {
     local step="phase 2: ${PEND_KEY}'s worker ended by the teardown" id="${PERSONA_ID[${PEND_KEY}]}" session="${PERSONA_SESSION[${PEND_KEY}]}"
@@ -1016,7 +1016,7 @@ s19_pend_stopped() {
     wait_until "${EXIT_WAIT_S}" "${step}: session ${session} is still there after stop --stop-bots" session_gone "${session}"
     read_row "${step}" "${id}"
     [[ -n "${ROW_STATE}" && "${ROW_SID}" == "${PERSONA_SID[${PEND_KEY}]}" ]] \
-        || fail "${step}: ${id} reads '${ROW_STATE}' with claude_session_id '${ROW_SID}', not its first life's ${PERSONA_SID[${PEND_KEY}]}"
+        || fail "${step}: ${id} reads '${ROW_STATE}' with session_id '${ROW_SID}', not its first life's ${PERSONA_SID[${PEND_KEY}]}"
     echo "${TEST_NAME}: ${step}: ${session} is gone; ${id} reads ${ROW_STATE} (recorded, not asserted)"
 }
 
@@ -1068,7 +1068,7 @@ s19_seed() {
 # Scenario 19, the `pending` variant [harness]: the leftover, then E39's
 # scenario 19 statement makes the persona's row `pending` beside it, with a
 # launch start and a launch token other than the leftover's, and then
-# s19_pend_no_session clears the row's claude_session_id. Records the launch
+# s19_pend_no_session clears the row's session_id. Records the launch
 # start (PEND_LAUNCH_MS).
 s19_seed_pending() {
     local step="phase 3: ${PEND_KEY}'s row pending beside a leftover" id="${PERSONA_ID[${PEND_KEY}]}" token json
@@ -1080,33 +1080,33 @@ s19_seed_pending() {
     [[ "$(jq -r '.[0].state' <<< "${json}")" == pending && "$(jq -r '.[0].launch_token' <<< "${json}")" == "${token}" ]] \
         || fail "${step}: the row does not read pending with launch token ${token}: ${json}"
     [[ "${token}" != "${SEEDED_TOKEN}" ]] || fail "${step}: the row's launch token is the leftover's"
-    # E39's statement keeps the first life's claude_session_id; the launch it
+    # E39's statement keeps the first life's session_id; the launch it
     # seeds recorded none, so s19_pend_no_session clears it.
-    [[ "$(jq -r '.[0].claude_session_id // ""' <<< "${json}")" == "${PERSONA_SID[${PEND_KEY}]}" ]] \
-        || fail "${step}: after E39's statement the row's claude_session_id is not its first life's ${PERSONA_SID[${PEND_KEY}]}"
+    [[ "$(jq -r '.[0].session_id // ""' <<< "${json}")" == "${PERSONA_SID[${PEND_KEY}]}" ]] \
+        || fail "${step}: after E39's statement the row's session_id is not its first life's ${PERSONA_SID[${PEND_KEY}]}"
     s19_pend_no_session "${step}" "${id}"
-    echo "${TEST_NAME}: ${step}: ${id} pending with no claude_session_id, launch start ${PEND_LAUNCH_MS} ms, token ${token}; the leftover's token ${SEEDED_TOKEN}"
+    echo "${TEST_NAME}: ${step}: ${id} pending with no session_id, launch start ${PEND_LAUNCH_MS} ms, token ${token}; the leftover's token ${SEEDED_TOKEN}"
 }
 
 # s19_pend_no_session <step> <instance-id> [harness]: the seeded `pending`
 # row is a spawn whose process stopped before its create, so its launch
 # recorded no Claude session: one `ad_store_edit` UPDATE (container only;
-# lib/scenario.sh's store-statement rules) sets claude_session_id NULL and
+# lib/scenario.sh's store-statement rules) sets session_id NULL and
 # advances row_version by one, naming the row by its id, its `pending` state
 # and its row_version as read just before; the store read after it shows
 # those two columns changed and every other as the seed set it. With no
-# claude_session_id, the restart path's decision on the row once it reads
+# session_id, the restart path's decision on the row once it reads
 # `missing` is a reuse spawn (b.jg5 SRJ-1420).
 s19_pend_no_session() {
-    local step="$1: claude_session_id cleared" id="$2" before after rv out
+    local step="$1: session_id cleared" id="$2" before after rv out
     before="$(ad_store_row "${id}")" || exit 1
     rv="$(jq -r '.[0].row_version' <<< "${before}")"
     [[ "${rv}" =~ ^[0-9]+$ ]] || fail "${step}: the row's row_version reads '${rv}'"
-    out="$(ad_store_edit "UPDATE spawns SET claude_session_id = NULL, row_version = row_version + 1 WHERE claude_instance_id = '${id}' AND state = 'pending' AND row_version = ${rv} RETURNING claude_instance_id")" \
+    out="$(ad_store_edit "UPDATE spawns SET session_id = NULL, row_version = row_version + 1 WHERE instance_id = '${id}' AND state = 'pending' AND row_version = ${rv} RETURNING instance_id")" \
         || exit 1
     [[ "${out}" == "${id}" ]] || fail "${step}: the row is no longer pending at row_version ${rv}, and the edit wrote nothing"
     after="$(ad_store_row "${id}")" || exit 1
-    _scenario_row_diff_check "${step}" "${before}" "${after}" "{\"claude_session_id\": null, \"row_version\": $(( rv + 1 ))}"
+    _scenario_row_diff_check "${step}" "${before}" "${after}" "{\"session_id\": null, \"row_version\": $(( rv + 1 ))}"
 }
 
 phase3_seed() {
@@ -1466,7 +1466,7 @@ s19_end() {
 # latch clears (latchClearedLine, reason "a retry of the refused operation
 # was not refused", posted), with no refused round line beyond those read
 # before the end, the persona reaches `waiting` on the session name the latch
-# quoted (scenario 4's on its first life's claude_session_id; the pending
+# quoted (scenario 4's on its first life's session_id; the pending
 # variant's on a fresh one, recorded as PEND_REUSED_SID) and the server
 # registers its MCP session; exactly one recovery post, the printed recovery
 # notice, and no post beyond it and the CONFLICT notices; no counted
@@ -1501,17 +1501,17 @@ s19_clear() {
 
     # The launch: the persona reaches waiting on its own session.
     wait_row "${step}: the launch's report-in" "${REPORT_WAIT_S}" "${id}" waiting
-    [[ -n "${ROW_SID}" ]] || fail "${step}: the launched row has no claude_session_id"
+    [[ -n "${ROW_SID}" ]] || fail "${step}: the launched row has no session_id"
     case "${key}" in
         "${S4_KEY}")
             # The resume keeps the first life's conversation.
             [[ "${ROW_SID}" == "${PERSONA_SID[${key}]}" ]] \
-                || fail "${step}: the resumed row's claude_session_id is '${ROW_SID}', not the first life's ${PERSONA_SID[${key}]}"
+                || fail "${step}: the resumed row's session_id is '${ROW_SID}', not the first life's ${PERSONA_SID[${key}]}"
             ;;
         "${PEND_KEY}")
             # The reuse starts a fresh session, not the first life's.
             [[ "${ROW_SID}" != "${PERSONA_SID[${key}]}" ]] \
-                || fail "${step}: the reused row's claude_session_id is the first life's ${PERSONA_SID[${key}]}, not a fresh session's"
+                || fail "${step}: the reused row's session_id is the first life's ${PERSONA_SID[${key}]}, not a fresh session's"
             PEND_REUSED_SID="${ROW_SID}"
             ;;
     esac
@@ -1543,7 +1543,7 @@ s19_clear() {
         s19_scan_trail "${step}" "$(( spawns - 1 ))"
     fi
     no_counted_failures "${step}" "${key}"
-    echo "${TEST_NAME}: ${step}: ${id} reads waiting with claude_session_id ${ROW_SID}; one recovery post"
+    echo "${TEST_NAME}: ${step}: ${id} reads waiting with session_id ${ROW_SID}; one recovery post"
 }
 
 # no_kill <label> <key>...: no CSCB `kill`, `kill-finished` or `delete`

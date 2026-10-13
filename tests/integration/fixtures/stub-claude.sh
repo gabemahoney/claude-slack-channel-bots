@@ -207,7 +207,7 @@
 # recorded the launch's pane once that record exists, waiting up to the
 # pending grace period G from the launch start; the re-fire keeps /ci
 # deterministic and is harmless under that wait.
-#   - The read: `<bin> status --claude-instance-id <id>`, where <bin> is the
+#   - The read: `<bin> status --instance-id <id>`, where <bin> is the
 #     program the first registered SessionStart entry names (exec form's
 #     `command`, or a shell form's first word), run as a direct child, and <id>
 #     is AGENT_DIRECTOR_INSTANCE_ID, which agent-director puts in the worker's
@@ -223,7 +223,7 @@
 #     with no launch start: stop re-firing, fire nothing more, and write one
 #     stop line (below).
 #   - G is `[tmux] pending_grace_seconds` from
-#     `$HOME/.agent-director/config.toml`, read at every tick; a missing file,
+#     `$HOME/.config/agent-director/config.toml`, read at every tick; a missing file,
 #     a missing key, 0 or a value that is not a whole number gives 60 s,
 #     agent-director's default (DefaultPendingGraceSeconds in its
 #     internal/config/tmux.go).
@@ -613,7 +613,7 @@ NEXT_TICK_MS=0
 
 # Set GRACE_S to G (see the header).
 read_grace() {
-    local file="${HOME}/.agent-director/config.toml" v=""
+    local file="${HOME}/.config/agent-director/config.toml" v=""
     GRACE_S="${DEFAULT_PENDING_GRACE_S}"
     [[ -f "${file}" ]] || return 0
     v="$(awk '
@@ -677,7 +677,7 @@ refire_tick() {
         write_stop_line - AGENT_DIRECTOR_INSTANCE_ID is unset or empty
         return 0
     fi
-    "${STATUS_BIN}" status --claude-instance-id "${id}" > "${STATUS_OUT}" 2> "${STATUS_OUT}.err" || rc=$?
+    "${STATUS_BIN}" status --instance-id "${id}" > "${STATUS_OUT}" 2> "${STATUS_OUT}.err" || rc=$?
     if (( rc != 0 )); then
         stop_refire
         write_stop_line "${id}" the status read exited "${rc}"

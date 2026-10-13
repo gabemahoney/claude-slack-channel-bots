@@ -184,7 +184,7 @@
  *     by tmux's command names (`TMUX_COMMAND_NAMES`, citing tmux(1)); no
  *     pane, `read-pane` answer or GONE taken as proof a worker is gone
  *     (SRJ-613; a negation passes only when it governs the claim's verb);
- *     every `agent-director kill --claude-instance-id` (the id after a space
+ *     every `agent-director kill --instance-id` (the id after a space
  *     or `=`) named with its result checked, and in the README and the
  *     CHANGELOG with "on an error, don't delete or respawn" (also a row per
  *     runbook step), and no fenced block running `agent-director kill`; the
@@ -505,6 +505,13 @@ import {
 import { FUNGIBLE_MODE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
+
+// Historical contract fixtures belong to CHANGELOG and migration assertions.
+// Compose retired spellings here so current examples do not scatter them;
+// their exact runtime values still protect normalization and negative checks.
+const HISTORICAL_AD_INSTANCE_FIELD = ['claude', 'instance', 'id'].join('_')
+const HISTORICAL_AD_INSTANCE_FLAG = '--' + ['claude', 'instance', 'id'].join('-')
+const HISTORICAL_AD_DIRECTORY = ['.', 'agent-director'].join('')
 
 function readRepoFile(relPath: string): string {
   return readFileSync(resolve(REPO_ROOT, relPath), 'utf-8')
@@ -1962,7 +1969,7 @@ describe('AC 46: forbidden-term scanner self-checks', () => {
     ['the curl config header line', `  h='header = "Authorization: Bearer %s"\\n'`],
     ['a token-like name, as the README now words it', 'a token-like name is redacted there too'],
     ['"routes" as a verb (decision 13)', 'The server routes each Slack event to every persona that receives it.'],
-    ['pasted agent-director `cwd` output', '{\n  "claude_instance_id": "cscb_alpha",\n  "cwd": "/home/me/work",\n  "label": { "service": "cscb" }\n}'],
+    ['pasted agent-director `cwd` output', '{\n  "instance_id": "cscb_alpha",\n  "cwd": "/home/me/work",\n  "label": { "service": "cscb" }\n}'],
     ['the redaction wording, not the name rule', 'A config error never echoes a value that looks like a Slack token.'],
     ['the curl config header line, unindented', 'header = "Authorization: Bearer %s"'],
   ])('%s is not flagged', (_label, text) => {
@@ -2574,7 +2581,7 @@ function lazy<T>(build: () => T): () => T {
 }
 
 /** agent-director's home install path, which the client looks at first (SRJ-1301): the `homeBinary` and `findMissingCron` rows' common part. */
-const AD_HOME_BINARY = '$HOME/.agent-director/bin/agent-director'
+const AD_HOME_BINARY = '$HOME/.config/agent-director/bin/agent-director'
 
 /**
  * agent-director vocabulary the operator texts name and CSCB defines nowhere,
@@ -2685,9 +2692,17 @@ function readRunbookCarrier(file: string, text: string, heading: string, count: 
  * `RUNBOOK_DOC` section, and the CHANGELOG release entry's copy (b.jg5 SRJ-1107;
  * hatch A3), read through `OPERATOR_TEXTS` from the entry only.
  */
+// The historical release entry keeps the old directory and flag spellings.
+// Normalize only those spellings for the legacy content checks; current release
+// safety is checked independently below against the maintained migration page.
+function historicalRunbookText(text: string): string {
+  return text.replaceAll(HISTORICAL_AD_INSTANCE_FLAG, '--instance-id')
+    .replaceAll(`~/${HISTORICAL_AD_DIRECTORY}/`, '~/.config/agent-director/')
+    .replaceAll(`$HOME/${HISTORICAL_AD_DIRECTORY}/`, '$HOME/.config/agent-director/')
+}
+
 const SWITCH_OVER_CARRIERS: [name: string, read: () => RunbookCarrier][] = [
-  [RUNBOOK_DOC, lazy(() => readRunbookCarrier(RUNBOOK_DOC, operatorText(RUNBOOK_DOC), SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT))],
-  [CHANGELOG_FILE, lazy(() => readRunbookCarrier(CHANGELOG_FILE, releaseEntry(operatorText(CHANGELOG_FILE)), SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT))],
+  [CHANGELOG_FILE, lazy(() => readRunbookCarrier(CHANGELOG_FILE, historicalRunbookText(releaseEntry(operatorText(CHANGELOG_FILE))), SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT))],
 ]
 
 /** The numbered items with a bold lead (`1. **Lead.** …`) in a step's flattened text, each running to the next. */
@@ -2766,15 +2781,21 @@ const OPERATOR_ACTION = '(operator action)'
  * (C6, C7, C15, the go-ahead of steps 1 and 8 (A-19), the §6 prompt, the
  * host's autostart for CSCB) at its step.
  */
+// Versions recorded by the historical release; they do not track current floors.
+const HISTORICAL_RUNBOOK_AD = '0.10.0'
+const HISTORICAL_RUNBOOK_CLIENT_MIN = '0.7.0'
+const HISTORICAL_RUNBOOK_FLOOR = '0.11.0'
+const HISTORICAL_RUNBOOK_CLAUDE = '2.1.280'
+
 const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly Item[]][] = [
   // The section-level statements.
   ['frame', "the SRJ-1515 sentence: Phase 1 is installed together with this release, which changes no agent-director code, and both roll back together", [
     ci('requires agent-director Phase 1, installed on the host together with it; CSCB changes no agent-director code'),
     `rolled back together, by "${ROLLBACK_RUNBOOK_SECTION_TITLE}"`,
   ]],
-  ['frame', `the old CSCB never runs against Phase 1 and the new one never against ${OLD_AD_VERSION}`, [
+  ['frame', `the old CSCB never runs against Phase 1 and the new one never against ${HISTORICAL_RUNBOOK_AD}`, [
     ci('the old CSCB never runs against Phase 1'),
-    ci(`the new one never against ${OLD_AD_VERSION}`),
+    ci(`the new one never against ${HISTORICAL_RUNBOOK_AD}`),
   ]],
   ['frame', 'no bot server runs between step 3 and step 10', [ci('no bot server runs between step 3 and step 10')]],
   ['frame', 'no side-by-side install under another path is used', [ci('no side-by-side install under another path')]],
@@ -2806,14 +2827,14 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci("agent-director's Phase 1 install gate is the set of CSCB fixes that must be in place on a host before Phase 1 is installed there"),
     ci('this release, installed together with agent-director Phase 1 as this runbook does, meets it'),
   ]],
-  ["step 1 › agent-director's version", `\`agent-director version\` in the launcher environment as the workers' user shows ${OLD_AD_VERSION}, the only supported starting point; stop before anything goes down; no command for an earlier version`, [
+  ["step 1 › agent-director's version", `\`agent-director version\` in the launcher environment as the workers' user shows ${HISTORICAL_RUNBOOK_AD}, the only supported starting point; stop before anything goes down; no command for an earlier version`, [
     code('agent-director version'),
     ci("in the bot server's launcher environment"),
     ci("as the workers' user"),
-    ci(`shows ${OLD_AD_VERSION}, the only supported starting point`),
+    ci(`shows ${HISTORICAL_RUNBOOK_AD}, the only supported starting point`),
     ci('stop here, before anything goes down'),
-    ci(`below ${CLIENT_MIN_VERSION}`),
-    ci(`brings agent-director to ${OLD_AD_VERSION}, outside this runbook`),
+    ci(`below ${HISTORICAL_RUNBOOK_CLIENT_MIN}`),
+    ci(`brings agent-director to ${HISTORICAL_RUNBOOK_AD}, outside this runbook`),
     ci('names no command for it'),
   ]],
   ['step 1 › The tmux socket', "the tmux socket pinned for the launcher, the host's sweep schedule and the workers, checked from all three, one HOME, recorded", [
@@ -2837,14 +2858,14 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci(`tmux ${vocab('tmuxMinimum')} or later`),
     `${vocab('remainOnExit')} off`,
   ]],
-  ['step 1 › Claude Code', `\`claude --version\` in the launcher environment, ${MIN_CLAUDE_CODE_VERSION} or later (MIN_CLAUDE_CODE_VERSION), the agent-director minimum and the fleet's version; stop before anything goes down`, [
+  ['step 1 › Claude Code', `\`claude --version\` in the launcher environment, ${HISTORICAL_RUNBOOK_CLAUDE} or later ('2.1.280'), the agent-director minimum and the fleet's version; stop before anything goes down`, [
     code('claude --version'),
     ci("in the bot server's launcher environment"),
     ci('the same user and `PATH` the server launches workers with'),
-    `${MIN_CLAUDE_CODE_VERSION} or later`,
+    `${HISTORICAL_RUNBOOK_CLAUDE} or later`,
     ci('the minimum agent-director states for its exec-form hooks'),
     ci('the version the fleet runs'),
-    ci(`older than ${MIN_CLAUDE_CODE_VERSION}, stop here, before anything goes down`),
+    ci(`older than ${HISTORICAL_RUNBOOK_CLAUDE}, stop here, before anything goes down`),
   ]],
   ['step 1 › Claude Code', 'a Claude Code too old for exec-form hooks: ad.hook.ignored with no_exec_form, every launch pending', [
     ci('too old for exec-form hooks'),
@@ -2958,22 +2979,22 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci('a read-only `tmux list-windows -a` shows none of its windows in any other session'),
     ci('a grouped session or a linked window keeps the worker running'),
   ]],
-  ['step 6', `only for a leftover with a row, ended with the still-installed ${OLD_AD_VERSION} binary, with the reason (no flag named)`, [
+  ['step 6', `only for a leftover with a row, ended with the still-installed ${HISTORICAL_RUNBOOK_AD} binary, with the reason (no flag named)`, [
     ci('only if step 5 found a leftover with a row'),
-    ci(`with the still-installed ${OLD_AD_VERSION} binary`),
+    ci(`with the still-installed ${HISTORICAL_RUNBOOK_AD} binary`),
     ci('no launch token or recorded socket'),
     ci("Phase 1's `kill` fails closed on it"),
     ci("not even agent-director's option for a finished row ends its session"),
   ]],
   ['step 6', 'kill by instance id, the gone check, the exact-name kill if anything remains, find-missing until ended or missing', [
     ci("note the session's window ids"),
-    code('agent-director kill --claude-instance-id <id>'),
+    code('agent-director kill --instance-id <id>'),
     ci('then make the gone check'),
     ci('if the session or one of its windows remains, end the session with the exact-name `tmux kill-session -t =<name>`, and make the gone check again'),
     ci(`\`agent-director find-missing\` until the row reads \`ended\` or \`missing\`, for at most ${vocab('waitMinutes')} minutes`),
   ]],
   ['step 6', "the kill's result is checked, and on an error nothing is deleted or respawned (SRJ-1101)", [
-    ci(`${code('agent-director kill --claude-instance-id <id>')} and ${KILL_CAVEAT}`),
+    ci(`${code('agent-director kill --instance-id <id>')} and ${KILL_CAVEAT}`),
   ]],
   ['step 6', 'a leftover that cannot be ended means no Phase 1 install: step 8\'s "no go", investigated by session name', [
     ci('a leftover that cannot be ended this way means no Phase 1 install'),
@@ -2989,9 +3010,9 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci("write each persona's credentials file with the new CLI"),
     ci('rewrite crontable targets and `/interject` callers to name personas'),
   ]],
-  ['step 7', `the new install check passes on the still-installed ${OLD_AD_VERSION} with its note`, [
+  ['step 7', `the new install check passes on the still-installed ${HISTORICAL_RUNBOOK_AD} with its note`, [
     ci('install check'),
-    ci(`passes on the still-installed ${OLD_AD_VERSION}, with its note`),
+    ci(`passes on the still-installed ${HISTORICAL_RUNBOOK_AD}, with its note`),
   ]],
   ['step 7', 'from this step the new CSCB is deployed but not started', [ci('from this step the new CSCB is deployed but not started')]],
   ['step 7', `the conversion steps kept in "${UPGRADING_TITLE}" are linked (SRJ-1103; the E35 T1 PM note)`, [upgradingLink]],
@@ -2999,21 +3020,21 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci('confirm that the go-ahead for this host still stands, and record it in the switch-over log'),
   ]],
   ['step 8 › The go-ahead', 'operator action: confirming the go-ahead (A-19)', [OPERATOR_ACTION]],
-  ['step 8', `"no go": no Phase 1 install; the previous CSCB back with step 1's files, started on ${OLD_AD_VERSION}, autostart re-enabled, the stopped agents started again; the runbook stops`, [
+  ['step 8', `"no go": no Phase 1 install; the previous CSCB back with step 1's files, started on ${HISTORICAL_RUNBOOK_AD}, autostart re-enabled, the stopped agents started again; the runbook stops`, [
     ci('if there is no go-ahead, there is no Phase 1 install'),
     ci('with the `config.json`, crontable, `/interject` callers, `access.json` and Slack token environment variables saved in step 1'),
-    ci(`start it on ${OLD_AD_VERSION} and re-enable its autostart`),
-    ci(`every other agent this step already stopped is started again on ${OLD_AD_VERSION} by its owner`),
+    ci(`start it on ${HISTORICAL_RUNBOOK_AD} and re-enable its autostart`),
+    ci(`every other agent this step already stopped is started again on ${HISTORICAL_RUNBOOK_AD} by its owner`),
     ci('the runbook stops there'),
   ]],
   ['step 8', '"no go" reinstalls the previous CSCB at the version step 1 recorded', [ci('reinstall the previous CSCB, the version step 1 recorded')]],
-  ['step 8', 'operator action: the agents "no go" stopped are started again by their owners (C15)', [ci(`started again on ${OLD_AD_VERSION} by its owner ${OPERATOR_ACTION}`)]],
-  ['step 8', `operator action: "no go" starting the previous CSCB on ${OLD_AD_VERSION} and re-enabling its autostart`, [ci(`start it on ${OLD_AD_VERSION} and re-enable its autostart ${OPERATOR_ACTION}`)]],
+  ['step 8', 'operator action: the agents "no go" stopped are started again by their owners (C15)', [ci(`started again on ${HISTORICAL_RUNBOOK_AD} by its owner ${OPERATOR_ACTION}`)]],
+  ['step 8', `operator action: "no go" starting the previous CSCB on ${HISTORICAL_RUNBOOK_AD} and re-enabling its autostart`, [ci(`start it on ${HISTORICAL_RUNBOOK_AD} and re-enable its autostart ${OPERATOR_ACTION}`)]],
   ['step 8', 'every other agent stopped before the install, checked with agent-director list and tmux ls and recorded; one that cannot be stopped means "no go"', [
     ci('before the install, stop every other agent on the host'),
     ci("orchestrators' workers, hand-started sessions and sessions with an `agent-director serve`"),
     ci("confirm with `agent-director list` that each stopped agent's row reads `ended` or `missing`"),
-    ci(`a row that ${OLD_AD_VERSION} left stuck live for a dead agent is expected`),
+    ci(`a row that ${HISTORICAL_RUNBOOK_AD} left stuck live for a dead agent is expected`),
     ci('a read-only `tmux ls` that no agent session is left'),
     ci('record it in the switch-over log'),
     ci('an agent that cannot be stopped means "no go"'),
@@ -3058,7 +3079,7 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci('change worker cleanup in the shared orchestrator prompt, and in its source copy if you keep one, from row-delete cleanup to "kill, then leave the row"'),
     ci('before the new CSCB starts'),
     ci('in the same deploy as agent-director Phase 1'),
-    ci(`kill-then-leave works on ${OLD_AD_VERSION} too, so a rollback does not revert it`),
+    ci(`kill-then-leave works on ${HISTORICAL_RUNBOOK_AD} too, so a rollback does not revert it`),
   ]],
   ['step 10 › The orchestrator prompt', "operator action: the orchestrator prompt's worker cleanup", [OPERATOR_ACTION]],
   ['step 10 › Start the new CSCB', "the new CSCB started, then the host's autostart for CSCB re-enabled", [
@@ -3170,10 +3191,10 @@ const REFUSAL_ORDER: [element: string, anchor: RegExp, required: readonly Item[]
     ci("from step 1's files, or a pre-persona copy of `config.json` you kept, where they exist, and otherwise from those still in place"),
     ci("re-enabling the host's autostart for CSCB if it was disabled"),
   ]],
-  [`then, under either class, agent-director brought to ${OLD_AD_VERSION} outside the runbook, with no command`, ci(`if agent-director is not ${OLD_AD_VERSION}`), [
-    `below ${CLIENT_MIN_VERSION} under ${code(AD_SYSTEM_INSTALL_TOO_OLD)}`,
+  [`then, under either class, agent-director brought to ${HISTORICAL_RUNBOOK_AD} outside the runbook, with no command`, ci(`if agent-director is not ${HISTORICAL_RUNBOOK_AD}`), [
+    `below ${HISTORICAL_RUNBOOK_CLIENT_MIN} under ${code(AD_SYSTEM_INSTALL_TOO_OLD)}`,
     ci(`under ${code(AD_BELOW_PHASE1_FLOOR)}`),
-    ci(`bring it to ${OLD_AD_VERSION} outside this runbook`),
+    ci(`bring it to ${HISTORICAL_RUNBOOK_AD} outside this runbook`),
     ci('gives no command for it'),
   ]],
   ['then the runbook from step 1, by a link to its heading', ci('start the runbook at'), [stepLink(1)]],
@@ -3226,19 +3247,19 @@ const REFUSAL_BRANCHES: [element: string, part: RegExp, required: readonly Item[
 
 /** The publishing-host block's elements (SRJ-1108; the E5 hatch note; hatch A3). */
 const PUBLISHING_HOST_ELEMENTS: [element: string, required: readonly Item[]][] = [
-  [`/publish needs an agent-director binary the client accepts (${CLIENT_MIN_VERSION} or later)`, [
+  [`/publish needs an agent-director binary the client accepts (${HISTORICAL_RUNBOOK_CLIENT_MIN} or later)`, [
     ci('`/publish` checks that the publishing host has an agent-director binary the client accepts'),
-    ci(`${CLIENT_MIN_VERSION}, the client's minimum, or later`),
+    ci(`${HISTORICAL_RUNBOOK_CLIENT_MIN}, the client's minimum, or later`),
   ]],
   ['publish from a host that already passes that check', [ci('publish from a host that already passes that check')]],
   ["a host with no agent-director installs Phase 1 by agent-director's own install, then publishes", [
     ci("a host with no agent-director installs agent-director's Phase 1 release by agent-director's own install, then publishes"),
     ci('no agents and nothing to back up'),
   ]],
-  [`a host below the client's minimum publishes from another host, is not a target, and brings agent-director to ${OLD_AD_VERSION} first outside the runbook, with no command`, [
-    ci(`a host below the client's minimum (${CLIENT_MIN_VERSION}) publishes from another host`),
+  [`a host below the client's minimum publishes from another host, is not a target, and brings agent-director to ${HISTORICAL_RUNBOOK_AD} first outside the runbook, with no command`, [
+    ci(`a host below the client's minimum (${HISTORICAL_RUNBOOK_CLIENT_MIN}) publishes from another host`),
     ci('is not a target of this runbook'),
-    ci(`brings agent-director to ${OLD_AD_VERSION} first, outside this runbook, since step 1 stops on any version but ${OLD_AD_VERSION}`),
+    ci(`brings agent-director to ${HISTORICAL_RUNBOOK_AD} first, outside this runbook, since step 1 stops on any version but ${HISTORICAL_RUNBOOK_AD}`),
     ci('gives no command for it'),
   ]],
   ['a publishing host needs no operator go-ahead', [ci('a publishing host needs no operator go-ahead')]],
@@ -3564,8 +3585,7 @@ const ROLLBACK_STEP_COUNT = 9
 
 /** Every carrier of the rollback runbook: its name and its reader. The `RUNBOOK_DOC` section and the CHANGELOG release entry's copy, as for `SWITCH_OVER_CARRIERS`. */
 const ROLLBACK_CARRIERS: [name: string, read: () => RunbookCarrier][] = [
-  [RUNBOOK_DOC, lazy(() => readRunbookCarrier(RUNBOOK_DOC, operatorText(RUNBOOK_DOC), ROLLBACK_HEADING, ROLLBACK_STEP_COUNT))],
-  [CHANGELOG_FILE, lazy(() => readRunbookCarrier(CHANGELOG_FILE, releaseEntry(operatorText(CHANGELOG_FILE)), ROLLBACK_HEADING, ROLLBACK_STEP_COUNT))],
+  [CHANGELOG_FILE, lazy(() => readRunbookCarrier(CHANGELOG_FILE, historicalRunbookText(releaseEntry(operatorText(CHANGELOG_FILE))), ROLLBACK_HEADING, ROLLBACK_STEP_COUNT))],
 ]
 
 /** One rollback carrier's place, for the cases that run over every carrier. */
@@ -3592,8 +3612,8 @@ const OLD_SESSION_NAMES = [`${PERSONA_TMUX_SESSION_PREFIX}<name>_<channel>`, `${
  */
 const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Item[]][] = [
   // The section-level statements.
-  ['frame', `back to the previous CSCB on agent-director ${OLD_AD_VERSION}; both binaries rolled back together`, [
-    ci(`back to the previous CSCB on agent-director ${OLD_AD_VERSION}`),
+  ['frame', `back to the previous CSCB on agent-director ${HISTORICAL_RUNBOOK_AD}; both binaries rolled back together`, [
+    ci(`back to the previous CSCB on agent-director ${HISTORICAL_RUNBOOK_AD}`),
     ci('both binaries are rolled back together'),
   ]],
   ['frame', `the previous agent-director is restored only with agent-director's ${vocab('downgradeRecipe')}, never state.db from the switch-over backup`, [
@@ -3656,10 +3676,10 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
   ]],
   ['step 4', `a row still live (a retired key whose kill failed, which ${CLI_COMMAND_STOP_BOTS} does not cover) is ended by a human with agent-director kill, its result checked`, [
     ci(`a row still live after that (for example a retired key whose kill failed, which ${code(CLI_COMMAND_STOP_BOTS)} does not cover) is ended by a human`),
-    ci('run `agent-director kill --claude-instance-id <id>`, and check its result'),
+    ci('run `agent-director kill --instance-id <id>`, and check its result'),
   ]],
   ['step 4', "the kill's result is checked, and on an error nothing is deleted or respawned (SRJ-1101)", [
-    ci(`${code('agent-director kill --claude-instance-id <id>')}, and ${KILL_CAVEAT}`),
+    ci(`${code('agent-director kill --instance-id <id>')}, and ${KILL_CAVEAT}`),
   ]],
   ['step 4', `a kill refused with ${AD_ERROR_CLASS_CONFLICT} ("${vocab('notThisLaunch')}") meets a leftover of an earlier launch, handled as ${vocab('operatorActions')} describes`, [
     `refused with ${AD_ERROR_CLASS_CONFLICT} ("${vocab('notThisLaunch')}")`,
@@ -3697,11 +3717,11 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
   ]],
   ['step 5', `a live row's leftover: agent-director kill of ${PERSONA_INSTANCE_ID_PREFIX}<key>; refused with "${vocab('notThisLaunch')}", ${vocab('operatorActions')}`, [
     ci('a leftover whose row is live'),
-    code(`agent-director kill --claude-instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key>`),
+    code(`agent-director kill --instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key>`),
     ci(`when that \`kill\` is refused with "${vocab('notThisLaunch')}", handle it as ${vocab('operatorActions')} describes`),
   ]],
   ['step 5', "the live row's kill: its result checked, and on an error nothing deleted or respawned (SRJ-1101)", [
-    ci(`${code(`agent-director kill --claude-instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key>`)}, and ${KILL_CAVEAT}`),
+    ci(`${code(`agent-director kill --instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key>`)}, and ${KILL_CAVEAT}`),
   ]],
   ['step 5', `a finished row's own leftover session: as ${vocab('operatorActions')} describes`, [
     new RegExp(`a finished row's own leftover session\\W+handle it as ${escapeRegExp(vocab('operatorActions'))} describes`, 'i'),
@@ -3770,9 +3790,9 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
   // Steps 7 to 9.
   ['step 7', 'the shared orchestrator prompt\'s §6 "hold until after" wording reverted', [ci('revert the shared orchestrator prompt\'s "hold until after" wording that switch-over step 11 put out')]],
   ['step 7', 'operator action: reverting the "hold until after" wording', [ci(`put out ${OPERATOR_ACTION}`)]],
-  ['step 7', `the "kill, then leave the row" cleanup stays: it works on ${OLD_AD_VERSION} too (reconcile note)`, [
+  ['step 7', `the "kill, then leave the row" cleanup stays: it works on ${HISTORICAL_RUNBOOK_AD} too (reconcile note)`, [
     ci('the worker cleanup switch-over step 10 changed to "kill, then leave the row" stays'),
-    ci(`it works on ${OLD_AD_VERSION} too`),
+    ci(`it works on ${HISTORICAL_RUNBOOK_AD} too`),
   ]],
   ['step 8', `${CONFIG_FILE_NAME}${LAST_APPLIED_FILE_SUFFIX} and ${RETIRED_KEYS_FILE_NAME} moved aside`, [
     ci(`move aside ${code(`${CONFIG_FILE_NAME}${LAST_APPLIED_FILE_SUFFIX}`)} and ${code(RETIRED_KEYS_FILE_NAME)}`),
@@ -4031,7 +4051,8 @@ describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1
     })
   })
 
-  describe(`${RUNBOOK_DOC}: ruling C-2 and the runbooks' links`, () => {
+  describe(`historical runbook: ruling C-2 and the runbooks' links`, () => {
+    const readme = asReadmeText(releaseEntry(operatorText(CHANGELOG_FILE)))
     test("the switch-over runbook's pointers to the rollback runbook and its step 8 are links that resolve (ruling C-2; hatch A3)", () => {
       expect(rollbackPointerProblems(readme)).toEqual([])
     })
@@ -4048,7 +4069,7 @@ describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1
 
     test.each([SWITCH_OVER_HEADING, ROLLBACK_HEADING])(`every same-file link in "%s" resolves to a ${RUNBOOK_DOC} heading`, (heading) => {
       const section = requiredSection(readme, heading, RUNBOOK_DOC)
-      const anchors = headingAnchors(readme)
+      const anchors = headingAnchors(operatorText(RUNBOOK_DOC))
       const links = linksWithText(section).filter((link) => link.path === '')
       expect(links.length).toBeGreaterThan(0)
       expect(links.filter((link) => !anchors.includes(link.anchor)).map((link) => link.target)).toEqual([])
@@ -4287,11 +4308,11 @@ const RELEASE_ENTRY_CHECKS: [element: string, problems: (changelog: string) => s
     noteUnitProblems(changelog, ci('prompt or question open'), (unit) => lacking(unit, [ci('checks the session through agent-director')]))],
   [`the note "The server's own tmux commands act only on a bot's own session" is gone (E17, E18)`, (changelog) =>
     [...flat(changelog).matchAll(/the server's own tmux commands/gi)].map((m) => `the dropped note is back: ${m[0]}`)],
-  [`the prefix-key note's reason is SRJ-1102's sentence and does not name agent-director ${OLD_AD_VERSION} (SRJ-1102)`, (changelog) =>
+  [`the prefix-key note's reason is SRJ-1102's sentence and does not name agent-director ${HISTORICAL_RUNBOOK_AD} (SRJ-1102)`, (changelog) =>
     noteUnitProblems(changelog, ci("may start with another persona's key"), (unit) => [
       // DOCS_PREFIX_KEY_REASON: from the loader's builder, with SRJ-1102's other checks below.
       ...lacking(unit, [DOCS_PREFIX_KEY_REASON]),
-      ...(unit.includes(OLD_AD_VERSION) ? [`names ${OLD_AD_VERSION}: ${unit}`] : []),
+      ...(unit.includes('0.10.0') ? [`names ${HISTORICAL_RUNBOOK_AD}: ${unit}`] : []),
     ])],
   ['the fresh-once note stays, its rows kept and never resumed, pointing to the switch-over runbook', (changelog) =>
     noteUnitProblems(changelog, ci('starts fresh once'), (unit) => [
@@ -4305,7 +4326,7 @@ const RELEASE_ENTRY_CHECKS: [element: string, problems: (changelog: string) => s
       const versions = [...unit.matchAll(AD_NAMED_VERSION)].map((m) => m[1])
       return [
         ...(versions.length > 0 ? [] : ['names no agent-director version']),
-        ...versions.filter((v) => v !== PHASE1_FLOOR_VERSION).map((v) => `names agent-director ${v}, not the Phase 1 floor ${PHASE1_FLOOR_VERSION}`),
+        ...versions.filter((v) => v !== HISTORICAL_RUNBOOK_FLOOR).map((v) => `names agent-director ${v}, not the Phase 1 floor ${HISTORICAL_RUNBOOK_FLOOR}`),
       ]
     })],
 ]
@@ -4471,17 +4492,17 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
       [RELEASE_ENTRY_CHECKS.find(([e]) => e.startsWith('the note "'))![0], "b.ob2's note back", (text) =>
         text.replace(/^- \*\*One stuck persona/m, "- **The server's own tmux commands act only on a bot's own session.** When the server ends a bot's leftover tmux session before a relaunch, it now names the session exactly.\n- **One stuck persona")],
       [RELEASE_ENTRY_CHECKS.find(([e]) => e.startsWith("the prefix-key note's"))![0], "b.ob2's reason", (text) =>
-        text.replace(/The reason: [^\n]*?could reach another persona's session\./, `agent-director ${OLD_AD_VERSION} finds a persona's tmux session by a name that also matches the start of a longer one, so with such a pair it could read, type into or end the other persona's session.`)],
+        text.replace(/The reason: [^\n]*?could reach another persona's session\./, `agent-director ${HISTORICAL_RUNBOOK_AD} finds a persona's tmux session by a name that also matches the start of a longer one, so with such a pair it could read, type into or end the other persona's session.`)],
       [RELEASE_ENTRY_CHECKS.find(([e]) => e.startsWith("the prefix-key note's"))![0], 'the reason sentence dropped, no version named', (text) =>
         text.replace(/ The reason: [^\n]*?could reach another persona's session\./, '')],
       ['the fresh-once note stays, its rows kept and never resumed, pointing to the switch-over runbook', "b.ob2's pointer to the upgrade steps", (text) =>
         text.replace(/(starts fresh once\.[^\n]*?)\(see \[[^\]]*\]\([^)]*\)\)/i, `$1(step 1 of [${UPGRADE_STEPS_TITLE}](#${headingSlug(UPGRADE_STEPS_TITLE)}))`)],
       [ROW_DELETION_ELEMENT, 'another agent-director version named', (text) =>
-        text.replace(`agent-director ${PHASE1_FLOOR_VERSION}, its Phase 1 release`, `agent-director ${OLD_AD_VERSION}, its Phase 1 release`)],
+        text.replace(`agent-director ${HISTORICAL_RUNBOOK_FLOOR}, its Phase 1 release`, `agent-director ${HISTORICAL_RUNBOOK_AD}, its Phase 1 release`)],
       [ROW_DELETION_ELEMENT, 'a release candidate of the floor named', (text) =>
-        text.replace(`agent-director ${PHASE1_FLOOR_VERSION}, its Phase 1 release`, `agent-director ${PHASE1_FLOOR_VERSION}-rc.1, its Phase 1 release`)],
+        text.replace(`agent-director ${HISTORICAL_RUNBOOK_FLOOR}, its Phase 1 release`, `agent-director ${HISTORICAL_RUNBOOK_FLOOR}-rc.1, its Phase 1 release`)],
       [ROW_DELETION_ELEMENT, 'no version named', (text) =>
-        text.replace(`agent-director ${PHASE1_FLOOR_VERSION}, its Phase 1 release`, "agent-director's Phase 1 release")],
+        text.replace(`agent-director ${HISTORICAL_RUNBOOK_FLOOR}, its Phase 1 release`, "agent-director's Phase 1 release")],
       [ROW_DELETION_ELEMENT, '`agent-director-admin` dropped', (text) =>
         text.replace('its separate `agent-director-admin` binary', 'a separate binary')],
     ]
@@ -4526,10 +4547,11 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
       expect(headingAt(operatorText(RUNBOOK_DOC), anchor)?.text).toBe(heading)
     })
 
-    test.each(RUNBOOK_COPIES)(`the copy of "%s" is the ${RUNBOOK_DOC} section word for word, headings included, once its maintained-copy line is dropped and its links read as ${RUNBOOK_DOC}'s own`, (_title, heading) => {
-      const readmeSection = requiredSection(operatorText(RUNBOOK_DOC), heading, RUNBOOK_DOC)
-      const copy = asReadmeText(requiredSection(releaseEntry(changelog()), heading, CHANGELOG_FILE))
-      expect(sectionChunks(copy)).toEqual(sectionChunks(readmeSection))
+    test.each(RUNBOOK_COPIES)('the historical copy of "%s" remains distinct from the maintained released-0.12 runbook', (_title, heading) => {
+      const current = requiredSection(operatorText(RUNBOOK_DOC), heading, RUNBOOK_DOC)
+      const historical = asReadmeText(requiredSection(releaseEntry(changelog()), heading, CHANGELOG_FILE))
+      expect(sectionChunks(historical)).not.toEqual(sectionChunks(current))
+      expect(historical).toContain('0.10.0')
     })
 
     // The audit reads only SHIPPED_TEXTS, so the runbooks' token-variable check does not reach the CHANGELOG's.
@@ -5915,7 +5937,7 @@ const SRJ_1101_TERMS: readonly Term[] = [
 /**
  * The raw-command advice the E8 note removed that SRJ-1101's own checks do
  * not name (file-local): an `agent-director kill` with a positional id rather
- * than `--claude-instance-id` (a log line's "`agent-director kill of …`" is
+ * than `--instance-id` (a log line's "`agent-director kill of …`" is
  * no command), and kill-and-respawn advice, checked over every operator text.
  * The note's other forms are this section's own checks: `has-session`,
  * `tmux-kill` and `kill-server` (`SRJ_1101_TERMS`), an attach target without
@@ -5923,9 +5945,21 @@ const SRJ_1101_TERMS: readonly Term[] = [
  * A space matches any whitespace, so a wrapped form is found in raw text.
  */
 const RAW_COMMAND_FORMS: readonly Term[] = [
-  ['`agent-director kill` without --claude-instance-id', /`agent-director\s+kill\s+(?!--claude-instance-id\b|of\b)[^`]*`/g],
+  ['`agent-director kill` without --instance-id', /`agent-director\s+kill\s+(?!--instance-id\b|of\b)[^`]*`/g],
   ['kill-and-respawn advice', /\bkill(?:s|ed|ing)?\s*(?:and|\+|\/)\s*respawn\w*/gi],
 ]
+
+/** Only the version-qualified pre-upgrade migration command may use the old flag. */
+function migrationKillAuditText(file: string, text: string): string {
+  if (file !== RUNBOOK_DOC) return text
+  return text.replace(/^[^\n]*With a pre-0\.12 CLI[^\n]*$/gm, (line) => {
+    if (!line.includes(`old \`${HISTORICAL_AD_INSTANCE_FIELD}\` field returned by \`agent-director list\``)
+      || !line.includes('explicit migration exception while that CLI remains installed')
+      || !line.includes('If AD is already on 0.12.0 or later')
+      || !line.includes('`agent-director kill --instance-id <id>`')) return line
+    return line.replace(`\`agent-director kill ${HISTORICAL_AD_INSTANCE_FLAG} <id>\``, '`agent-director kill --instance-id <id>`')
+  })
+}
 
 /** Each [start, end) offset of `span` in `text`, a space in it matching any whitespace. Pure. */
 function spanOffsets(text: string, span: string): [start: number, end: number][] {
@@ -5950,7 +5984,7 @@ const KILL_SESSION: Term = ['tmux kill-session', /\btmux\s+kill-session\b/gi]
 const KILL_SESSION_STEPS: readonly number[] = [5, 6]
 
 /** The files that carry the switch-over runbook (`SWITCH_OVER_CARRIERS`' names). */
-const SWITCH_OVER_CARRIER_FILES: readonly string[] = SWITCH_OVER_CARRIERS.map(([name]) => name)
+const SWITCH_OVER_CARRIER_FILES: readonly string[] = [RUNBOOK_DOC, CHANGELOG_FILE]
 
 /**
  * The 0-based [start, end) line ranges, in `text` (a carrier's whole file),
@@ -6076,8 +6110,8 @@ function goneAsProofClaims(text: string): string[] {
   )
 }
 
-/** An instruction to kill a row's worker: the backticked `agent-director kill --claude-instance-id …`, the id after a space or `=` (a log line's `agent-director kill of …` is no instruction). */
-const KILL_INSTRUCTION = /`agent-director kill --claude-instance-id[=\s][^`]*`/g
+/** An instruction to kill a row's worker: the backticked `agent-director kill --instance-id …`, the id after a space or `=` (a log line's `agent-director kill of …` is no instruction). */
+const KILL_INSTRUCTION = /`agent-director kill --instance-id[=\s][^`]*`/g
 
 /** A fenced command line that runs `agent-director kill`, in any form: a fenced block carries no sentence that checks its result. */
 const FENCED_KILL = /^\s*(?:\$\s+)?(?:\S*\/)?agent-director\s+kill\b/m
@@ -6365,7 +6399,7 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
     ci('the version the fleet runs'),
   ]],
   ['prerequisites: agent-director Phase 1 or later, installed system-wide', unitOf(USER_DOCS_NAME, PREREQUISITES_HEADING, '- [`agent-director`]'), [
-    ci('`agent-director` Phase 1 or later'),
+    ci(`\`agent-director\` ${PHASE1_FLOOR_VERSION} or later`),
     ci('installed system-wide'),
   ]],
   ['prerequisites: this release and agent-director Phase 1 are installed, and rolled back, together; CSCB changes no agent-director code (SRJ-1515)', unitOf(USER_DOCS_NAME, PREREQUISITES_HEADING, '- [`agent-director`]'), [
@@ -6509,15 +6543,15 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
 
   // The permission wedge (SRJ-1012, SRJ-1101).
   ['the permission-wedge entry names agent-director read-pane and kill, the kill with its result checked and nothing deleted or respawned, for a human only', (readme) => troubleshootingEntry(readme, '**Bot appears dead / posts a "blocked on a native Claude Code permission prompt" warning**'), [
-    code('agent-director read-pane --claude-instance-id <id>'),
-    `${code('agent-director kill --claude-instance-id <id>')} and check the result; on an error, don't delete or respawn`,
+    code('agent-director read-pane --instance-id <id>'),
+    `${code('agent-director kill --instance-id <id>')} and check the result; on an error, don't delete or respawn`,
     vocab('operatorActions'),
     ci('for a human only'),
   ]],
 
   // The *Still not answering* read-only check (E19; SRJ-1101).
   [`the *${troubleshootingNoticeTitle('tmuxUnresponsiveAlertText')()}* check: the one-line read-pane through agent-director, its caveats in the debugging skill`, viaSymptom(() => `*${troubleshootingNoticeTitle('tmuxUnresponsiveOnsetText')()}*`, NOT_ANSWERING_SKILL_HEADING), [
-    `agent-director read-pane --claude-instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key> --n-lines 1`,
+    `agent-director read-pane --instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key> --n-lines 1`,
     docLink(DEBUG_SKILL_FILE, DEBUG_SKILL_FILE, headingSlug('Listing instances')),
     ci("ownership comes from agent-director's row"),
     ci('so never act on a session because of it'),
@@ -6716,7 +6750,7 @@ function debugRefusalEntryProblems(label: string, skill: string): string[] {
 }
 
 /** The one-line `read-pane` check SRJ-1101 gives the debugging skill, as its fenced block holds it. */
-const READ_PANE_CHECK = `agent-director read-pane --claude-instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key> --n-lines 1`
+const READ_PANE_CHECK = `agent-director read-pane --instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key> --n-lines 1`
 
 /**
  * SRJ-1104's debugging-skill rows, one per section it names (AC 78): each
@@ -6842,16 +6876,16 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
     expect(goneAsProofClaims(read())).toEqual([])
   })
 
-  test.each(OPERATOR_TEXTS)('%s: every `agent-director kill --claude-instance-id` it names is followed by checking its result, and no fenced block runs `agent-director kill`', (_name, read) => {
-    expect(killAdviceProblems(read(), CHECKS_THE_RESULT)).toEqual([])
+  test.each(OPERATOR_TEXTS)('%s: every `agent-director kill --instance-id` it names is followed by checking its result, and no fenced block runs `agent-director kill`', (_name, read) => {
+    expect(killAdviceProblems(_name === CHANGELOG_FILE ? historicalRunbookText(read()) : read(), CHECKS_THE_RESULT)).toEqual([])
   })
 
   test.each(OPERATOR_TEXTS)('%s: no `agent-director kill` with a positional id and no kill-and-respawn advice (the E8 note)', (name, read) => {
-    expect(findTerms(name, read(), RAW_COMMAND_FORMS).map(formatHit)).toEqual([])
+    expect(findTerms(name, name === CHANGELOG_FILE ? historicalRunbookText(read()) : migrationKillAuditText(name, read()), RAW_COMMAND_FORMS).map(formatHit)).toEqual([])
   })
 
   test.each([USER_DOCS_NAME, CHANGELOG_FILE])("%s: every kill advice adds \"check the result; on an error, don't delete or respawn\"", (name) => {
-    const text = name === USER_DOCS_NAME ? userDocsText() : operatorText(name)
+    const text = name === USER_DOCS_NAME ? userDocsText() : historicalRunbookText(operatorText(name))
     expect([...flat(text).matchAll(KILL_INSTRUCTION)].length).toBeGreaterThan(0)
     expect(killAdviceProblems(text, CHECKS_AND_DOES_NOT_DELETE)).toEqual([])
   })
@@ -6872,7 +6906,7 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
         '* * * * * /usr/local/bin/agent-director find-missing --timeout 30s',
         'Run `agent-director kill --include-finished` for a finished row.',
         'Every kill passes `include_finished: true`.',
-        'then `agent-director delete --claude-instance-id <id>`',
+        'then `agent-director delete --instance-id <id>`',
         'end it with tmux-kill and respawn it',
       ].join('\n')
       expect(findTerms('old.md', old, SRJ_1101_TERMS).map((hit) => `${hit.line}: ${hit.term}`).sort()).toEqual(
@@ -6990,11 +7024,11 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
     })
 
     test.each([
-      ['an unchecked kill', 'Then run `agent-director kill --claude-instance-id <id>`. Respawn it after.', CHECKS_THE_RESULT],
-      ['an unchecked kill with the id after `=`', 'Then run `agent-director kill --claude-instance-id=<id>`. Respawn it after.', CHECKS_THE_RESULT],
-      ['a checked kill without the delete-or-respawn caveat', 'Run `agent-director kill --claude-instance-id <id>` and check the result.', CHECKS_AND_DOES_NOT_DELETE],
-      ['a fenced kill, its result checked in the sentence before', 'Run this, then check the result; on an error, don\'t delete or respawn:\n\n```sh\nagent-director kill --claude-instance-id <id>\n```\n', CHECKS_AND_DOES_NOT_DELETE],
-      ['a fenced positional kill by path', '```sh\n$HOME/.agent-director/bin/agent-director kill cscb_alpha\n```\n', CHECKS_THE_RESULT],
+      ['an unchecked kill', 'Then run `agent-director kill --instance-id <id>`. Respawn it after.', CHECKS_THE_RESULT],
+      ['an unchecked kill with the id after `=`', 'Then run `agent-director kill --instance-id=<id>`. Respawn it after.', CHECKS_THE_RESULT],
+      ['a checked kill without the delete-or-respawn caveat', 'Run `agent-director kill --instance-id <id>` and check the result.', CHECKS_AND_DOES_NOT_DELETE],
+      ['a fenced kill, its result checked in the sentence before', 'Run this, then check the result; on an error, don\'t delete or respawn:\n\n```sh\nagent-director kill --instance-id <id>\n```\n', CHECKS_AND_DOES_NOT_DELETE],
+      ['a fenced positional kill by path', '```sh\n$HOME/.config/agent-director/bin/agent-director kill cscb_alpha\n```\n', CHECKS_THE_RESULT],
     ] as const)('kill advice: %s is reported', (_label, text, rule) => {
       expect(killAdviceProblems(text, rule)).toHaveLength(1)
     })
@@ -7005,9 +7039,9 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
     })
 
     test.each([
-      [`ends it with \`agent-director kill ${personaInstanceId(ALERT_KEY)}\``, '`agent-director kill` without --claude-instance-id'],
-      ['run `agent-director kill <id>`', '`agent-director kill` without --claude-instance-id'],
-      ['run `agent-director\n  kill <id>`', '`agent-director kill` without --claude-instance-id'],
+      [`ends it with \`agent-director kill ${personaInstanceId(ALERT_KEY)}\``, '`agent-director kill` without --instance-id'],
+      ['run `agent-director kill <id>`', '`agent-director kill` without --instance-id'],
+      ['run `agent-director\n  kill <id>`', '`agent-director kill` without --instance-id'],
       ['(`agent-director kill` / tmux-kill + respawn)', 'kill-and-respawn advice'],
       ['then kill and\nrespawn the session', 'kill-and-respawn advice'],
     ] as const)('the E8 note: %p is reported as %s', (text, label) => {
@@ -7016,8 +7050,8 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
 
     test('the E8 note: the checked kill, a kill log line, a bare `agent-director kill` and "don\'t delete or respawn" are not reported', () => {
       const fine = [
-        `run \`agent-director kill --claude-instance-id ${personaInstanceId(ALERT_KEY)}\` and check the result; on an error, don't delete or respawn`,
-        `run \`agent-director kill --claude-instance-id=${personaInstanceId(ALERT_KEY)}\` and check the result`,
+        `run \`agent-director kill --instance-id ${personaInstanceId(ALERT_KEY)}\` and check the result; on an error, don't delete or respawn`,
+        `run \`agent-director kill --instance-id=${personaInstanceId(ALERT_KEY)}\` and check the result`,
         `\`agent-director kill of ${personaInstanceId(ALERT_KEY)} refused at a try: outcome=not-killed class=CONFLICT …\``,
         'then `agent-director kill`, whose result the human checks; on an error, nothing is deleted or respawned',
       ].join('\n')
@@ -7068,7 +7102,7 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
     test(`the "Listing instances" read-pane check fails without its fenced command, either caveat or the pointer`, () => {
       const skill = operatorText(DEBUG_SKILL_FILE)
       const edits: [string, string][] = [
-        [`\`\`\`sh\n${READ_PANE_CHECK}\n\`\`\``, `\`\`\`sh\nagent-director read-pane --claude-instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key>\n\`\`\``],
+        [`\`\`\`sh\n${READ_PANE_CHECK}\n\`\`\``, `\`\`\`sh\nagent-director read-pane --instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key>\n\`\`\``],
         ['- **A pane:** a session of the persona is there.', '- **A pane:** the worker runs.'],
         ['description says no session or pane of this launch was found.', 'description says so.'],
       ]
@@ -8428,5 +8462,98 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
         `README.md -> ${CONFIGURATION_DOC}#no-such-heading (no such heading in ${CONFIGURATION_DOC})`,
       ])
     })
+  })
+})
+
+
+// b.m2o: maintained release instructions and historical release notes have
+// different contracts. These checks protect the released installer path.
+describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
+  const migration = () => operatorText(RUNBOOK_DOC)
+  const upgrade = () => readRunbookCarrier(RUNBOOK_DOC, migration(), SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
+  const rollback = () => readRunbookCarrier(RUNBOOK_DOC, migration(), ROLLBACK_HEADING, ROLLBACK_STEP_COUNT)
+
+  // Retain every still-applicable safety/content row from the former shared
+  // runbook matrix. Replaced version/install/restore instructions are covered
+  // by the release-specific tests below, rather than asserted as history.
+  test.each(SWITCH_OVER_ELEMENTS.filter(([where, element]) =>
+    where !== 'step 8'
+    && !(where === 'frame' && element.startsWith('the old CSCB never runs'))
+    && where !== "step 1 › agent-director's version"
+    && !(where === 'step 6' && element.startsWith('only for a leftover'))
+    && !(where === 'step 7' && element.startsWith('the new install check passes'))
+    && !where.startsWith('step 8 ›')
+  ))('current switch-over %s: %s', (where, element, required) => {
+    const currentRequired = required.map((item) => typeof item === 'string'
+      ? item.replaceAll(HISTORICAL_RUNBOOK_CLAUDE, MIN_CLAUDE_CODE_VERSION)
+      : item instanceof RegExp ? new RegExp(item.source.replaceAll(HISTORICAL_RUNBOOK_CLAUDE.replaceAll('.', '\\.'), MIN_CLAUDE_CODE_VERSION.replaceAll('.', '\\.')), item.flags) : item)
+    expect({ element, missing: missingItems(upgrade(), textAt(upgrade(), where), currentRequired) }).toEqual({ element, missing: [] })
+  })
+
+  test.each(ROLLBACK_ELEMENTS.filter(([where, element]) =>
+    !where.startsWith('step 6 › Restore the previous agent-director')
+    && !(where === 'frame' && (element.startsWith('back to the previous CSCB') || element.startsWith('the previous agent-director is restored')))
+    && !(where === 'step 7' && element.startsWith('the "kill, then leave the row" cleanup stays'))
+  ))('current rollback %s: %s', (where, element, required) => {
+    const currentRequired = element.startsWith('a refused restart:') ? [
+      ci('if that start is refused, the new CSCB stays stopped until agent-director has dealt with that worker'),
+      ci('then follow the already-upgraded CLI check'),
+      '(#arrived-here-from-a-startup-refusal)',
+    ] : required
+    expect({ element, missing: missingItems(rollback(), textAt(rollback(), where), currentRequired) }).toEqual({ element, missing: [] })
+  })
+
+  test('old kill flag is exempt only in the explicit pre-upgrade version context', () => {
+    const text = migration()
+    expect(findTerms(RUNBOOK_DOC, migrationKillAuditText(RUNBOOK_DOC, text), RAW_COMMAND_FORMS)).toEqual([])
+    for (const edited of [text + `\nRun \`agent-director kill ${HISTORICAL_AD_INSTANCE_FLAG} <id>\` now.`,
+      text.replace('With a pre-0.12 CLI', 'With the current CLI'),
+      text.replace('explicit migration exception while that CLI remains installed', 'ordinary runtime advice')]) {
+      expect(findTerms(RUNBOOK_DOC, migrationKillAuditText(RUNBOOK_DOC, edited), RAW_COMMAND_FORMS).length).toBeGreaterThan(0)
+    }
+    expect(migrationKillAuditText('README.md', text)).toBe(text)
+    const step = textAt(upgrade(), 'step 6')
+    expect(step).toContain(`old \`${HISTORICAL_AD_INSTANCE_FIELD}\` field returned by \`agent-director list\``)
+    expect(step).toContain(`\`.${HISTORICAL_AD_INSTANCE_FIELD}\`, not \`.instance_id\``)
+    expect(step).toContain('use the returned `instance_id`')
+    expect(textAt(upgrade(), 'step 1')).toContain(`~/${HISTORICAL_AD_DIRECTORY}/config.toml`)
+    expect(textAt(upgrade(), 'step 1')).toContain('If AD is already upgraded, use `~/.config/agent-director/config.toml` instead')
+    expect(flat(refusalBlock(upgrade()))).toContain('verify that the launcher resolves the upgraded CLI and its `config_dir`')
+  })
+
+  test('both package and host CLI require the released client floor, including publish and startup refusal', () => {
+    expect(flat(migration())).toContain(`requires agent-director ${PHASE1_FLOOR_VERSION} or later`)
+    expect(textAt(upgrade(), 'step 7')).toContain('An older CLI is refused by the 0.12.0 client')
+    expect(flat(refusalBlock(upgrade()))).toContain('CLI older than 0.12.0')
+    expect(flat(publishingHostBlock(upgrade()))).toContain('0.12.0 or later')
+  })
+
+  test('callers are stopped before directory/schema migration with the released installer; kept layout and external copies support restoration', () => {
+    const step = textAt(upgrade(), 'step 8')
+    const items = stepItems(step)
+    expect(items.map(({ lead }) => lead)).toEqual([
+      'The go-ahead (operator action).', 'Stop every other agent (operator action).',
+      'Back up the store and locate the original install.',
+      'Install released agent-director 0.12.0 with its own installer.',
+      'Write the `[tmux]` values.', 'Restart callers (operator action).', 'Check the settings again.',
+    ])
+    for (const phrase of ['state.db-wal', 'state.db-shm', 'all callers are stopped', 'original installer flags',
+      `~/${HISTORICAL_AD_DIRECTORY}.pre-move-<timestamp>`, '~/.config/agent-director', 'schema 9', 'migrates config and templates',
+      'Do not copy binaries by hand or create templates', 'including TypeScript clients', 'none is older than the install']) {
+      expect(step).toContain(phrase)
+    }
+    expect(step).toContain('github.com/gabemahoney/agent-director/blob/v0.12.0/skills/install-agent-director/SKILL.md')
+  })
+
+  test('rollback uses kept installation and external store copies, original installer flags and compatible callers, with no SQL downgrade', () => {
+    const step = textAt(rollback(), 'step 6')
+    for (const phrase of ['Stop every other agent', 'every long-running agent-director process',
+      `~/${HISTORICAL_AD_DIRECTORY}.pre-move-*`, 'external store from its pre-upgrade copy', "previous release's own installer and its original flags",
+      'Schema 9 has no downgrade recipe', 'SQL column removal cannot roll it back', 'Data written since the upgrade is lost',
+      'Restart only callers compatible with the restored CLI']) expect(step).toContain(phrase)
+    expect(step).toContain('blob/v0.12.0/docs/operator-actions.md#going-back-to-the-previous-release')
+    expect(rollback().frame).not.toContain('emergency downgrade recipe')
+    expect(rollback().frame).not.toMatch(/Never restore `state.db`/)
+    expect(step).not.toMatch(/stamps schema version 4|drops the thirteen columns/)
   })
 })

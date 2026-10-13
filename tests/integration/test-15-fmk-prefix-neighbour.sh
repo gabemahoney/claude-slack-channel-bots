@@ -35,11 +35,11 @@
 #      dev-channels hold.
 #   2. First life: the live start spawns `dev` fresh; the approver clears the
 #      dialog (a bot-server `send-keys` of `dev`'s row); a harness `get` reads
-#      the row `waiting`; its claude_session_id and tmux session name are
+#      the row `waiting`; its session_id and tmux session name are
 #      recorded.
 #   3. `stop --stop-bots`: a harness tmux read shows `dev`'s session gone,
 #      and a harness `get` reads its row `ended`, `missing` or `waiting`, with
-#      the same claude_session_id. The stub ignores the `/exit` that
+#      the same session_id. The stub ignores the `/exit` that
 #      agent-director's `pause` types, so the teardown's `pause` times out and
 #      its `kill` ends the worker, which fires no SessionEnd: the row keeps
 #      reading `waiting` until a `find-missing` marks it, and none runs here
@@ -57,14 +57,14 @@
 #      `send-keys` finds the worker gone, the dead evidence the resume needs);
 #      the approver clears the resumed dialog (bot-server
 #      `read-pane` and `send-keys` of that row after the resume); the row
-#      reads `waiting` with the same claude_session_id, and the server
+#      reads `waiting` with the same session_id, and the server
 #      registers the stub's MCP session as `dev`'s.
 #   6. Restart leg: a plain `stop` (the bot keeps running: its session is
 #      still there and its row still reads `waiting`), then a live start:
 #      `dev`'s bring-up reads `waiting` and makes its reconnect, a bot-server
 #      `send-keys` of `dev`'s row, with no `resume` or `kill` of it; the
 #      server registers `dev`'s session again, the row still `waiting` with
-#      the same claude_session_id. Then `stop --stop-bots`.
+#      the same session_id. Then `stop --stop-bots`.
 #   7. Checks (each a stated `fail` step; each reader also finds a line it
 #      must find; each reader's output is saved by its own assignment before
 #      it is filtered or counted, so a reader that fails stops the script):
@@ -211,13 +211,13 @@ EOF
 }
 
 # read_row <step> <instance-id>: a harness `get` of the row. Sets ROW_STATE,
-# ROW_SID (claude_session_id), ROW_SESSION (tmux_session_name) and
+# ROW_SID (session_id), ROW_SESSION (tmux_session_name) and
 # ROW_LABELS (the labels as JSON), each empty when absent.
 read_row() {
     local fields
-    ad_capture get --claude-instance-id "$2"
+    ad_capture get --instance-id "$2"
     (( AD_RC == 0 )) || fail "$1: the harness get of $2 exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
-    fields="$(jq -r '[.state // "", .claude_session_id // "", .tmux_session_name // "", (.labels // null | tojson)] | join("\u001f")' "${AD_OUT}")" \
+    fields="$(jq -r '[.state // "", .session_id // "", .tmux_session_name // "", (.labels // null | tojson)] | join("\u001f")' "${AD_OUT}")" \
         || fail "$1: the harness get of $2 printed no row object: $(head -c 300 "${AD_OUT}")"
     IFS=$'\x1f' read -r ROW_STATE ROW_SID ROW_SESSION ROW_LABELS <<< "${fields}"
 }
@@ -394,7 +394,7 @@ EOF
     wait_row "${step}: the report-in" "${REPORT_WAIT_S}" "${DEV_ID}" waiting
     DEV_SID="${ROW_SID}"
     DEV_SESSION="${ROW_SESSION}"
-    [[ -n "${DEV_SID}" ]] || fail "${step}: the live row ${DEV_ID} has no claude_session_id"
+    [[ -n "${DEV_SID}" ]] || fail "${step}: the live row ${DEV_ID} has no session_id"
     [[ -n "${DEV_SESSION}" ]] || fail "${step}: the live row ${DEV_ID} names no tmux session"
     wait_for_count "${CONNECTED}" 1 "${CONNECT_WAIT_S}" "${step}: the server never registered the stub's session as dev's"
     # The approver cleared the dialog through agent-director on dev's row.
@@ -402,7 +402,7 @@ EOF
     rows="$(verb_rows send-keys "${calls}")"
     rows="$(server_rows "${LIFE1_PID}" "${rows}")"
     (( $(rows_count "${rows}") >= 1 )) || fail "${step}: no bot-server send-keys of ${DEV_ID}"
-    echo "${TEST_NAME}: ${step}: ${DEV_ID} reads waiting, claude_session_id ${DEV_SID}, session ${DEV_SESSION}"
+    echo "${TEST_NAME}: ${step}: ${DEV_ID} reads waiting, session_id ${DEV_SID}, session ${DEV_SESSION}"
 }
 
 # Step 3: stop --stop-bots ends dev's first life.
@@ -413,7 +413,7 @@ step_stop_bots() {
     ! has_session "${DEV_SESSION}" || fail "${step}: session ${DEV_SESSION} is still there"
     row_reads "${step}" "${DEV_ID}" ended missing waiting \
         || fail "${step}: ${DEV_ID} reads '${ROW_STATE}', not ended, missing or waiting"
-    [[ "${ROW_SID}" == "${DEV_SID}" ]] || fail "${step}: the row's claude_session_id is '${ROW_SID}', not ${DEV_SID}"
+    [[ "${ROW_SID}" == "${DEV_SID}" ]] || fail "${step}: the row's session_id is '${ROW_SID}', not ${DEV_SID}"
     echo "${TEST_NAME}: ${step}: ${DEV_ID} reads ${ROW_STATE}; ${DEV_SESSION} is gone"
 }
 
@@ -423,7 +423,7 @@ step_make_neighbour() {
     NB_SESSION="${DEV_SESSION}_x"
     dir="$(make_workdir neighbour)"
     TMUX_MARK="$(tmux_shim_mark)"
-    ad_capture spawn --cwd "${dir}" --claude-instance-id "${NB_ID}" --tmux-session-name "${NB_SESSION}" --no-pre-trust
+    ad_capture spawn --agent claude --cwd "${dir}" --instance-id "${NB_ID}" --tmux-session-name "${NB_SESSION}" --no-pre-trust
     if (( AD_RC != 0 )); then
         sed 's/^/  | /' "${AD_OUT}" "${AD_ERR}" >&2
         fail "${step}: the harness spawn of ${NB_ID} exited ${AD_RC}"
@@ -454,7 +454,7 @@ step_second_life() {
     wait_for_count "${COMPLETED}" "$(( completions + 1 ))" "${START_WAIT_S}" "${step}: the start pass never completed"
     expect_completion 1 "${step}" "0 not brought up"
     wait_row "${step}: the resume's report-in" "${REPORT_WAIT_S}" "${DEV_ID}" waiting
-    [[ "${ROW_SID}" == "${DEV_SID}" ]] || fail "${step}: the resumed row's claude_session_id is '${ROW_SID}', not ${DEV_SID}"
+    [[ "${ROW_SID}" == "${DEV_SID}" ]] || fail "${step}: the resumed row's session_id is '${ROW_SID}', not ${DEV_SID}"
     [[ "${ROW_SESSION}" == "${DEV_SESSION}" ]] || fail "${step}: the resumed row records session '${ROW_SESSION}', not ${DEV_SESSION}"
     wait_for_count "${CONNECTED}" "$(( connections + 1 ))" "${CONNECT_WAIT_S}" "${step}: the server never registered the resumed stub's session as dev's"
     rows="$(ad_cscb_calls "${DEV_ID}" "${mark}")" || exit 1
@@ -475,7 +475,7 @@ step_second_life() {
     DEV_SID2="${PART_SID}"
     DEV_WID2="${PART_WID}"
     DEV_PANE2="${PART_PANE}"
-    echo "${TEST_NAME}: ${step}: ${DEV_ID} resumed with claude_session_id ${ROW_SID} in ${DEV_SESSION} (${DEV_SID2}, window ${DEV_WID2}, pane ${DEV_PANE2})"
+    echo "${TEST_NAME}: ${step}: ${DEV_ID} resumed with session_id ${ROW_SID} in ${DEV_SESSION} (${DEV_SID2}, window ${DEV_WID2}, pane ${DEV_PANE2})"
 }
 
 # Step 6: the restart leg, then stop --stop-bots.
@@ -509,7 +509,7 @@ step_restart() {
     read_row "${step}" "${DEV_ID}"
     [[ "${ROW_STATE}" == waiting && "${ROW_SID}" == "${DEV_SID}" ]] \
         || fail "${step}: after the restart ${DEV_ID} reads ${ROW_STATE} (${ROW_SID}), not waiting with ${DEV_SID}"
-    echo "${TEST_NAME}: ${step}: ${DEV_ID} reconnected, still waiting with claude_session_id ${ROW_SID}"
+    echo "${TEST_NAME}: ${step}: ${DEV_ID} reconnected, still waiting with session_id ${ROW_SID}"
     stop_server --stop-bots
 }
 

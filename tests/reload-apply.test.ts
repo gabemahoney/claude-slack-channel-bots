@@ -5400,7 +5400,7 @@ describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-1
     rmSync(prompt)
     const installed = run.composition!.installedTemplate!
     // What the start installed: its MCP config, and the append flag (its file was readable then).
-    expect(installed.claude_args).toEqual(expect.arrayContaining(['--mcp-config', startTop.mcp_config_path!, '--append-system-prompt-file', prompt]))
+    expect(installed.agent_args).toEqual(expect.arrayContaining(['--mcp-config', startTop.mcp_config_path!, '--append-system-prompt-file', prompt]))
 
     await applyConfig(run, withDelta(personas), { mcp_config_path: join(h.root, 'mcp-next.json'), system_prompt_mode: 'none' })
 
@@ -5421,7 +5421,7 @@ describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-1
   test("a confirmed change of only fresh_system_prompt to false is recorded and makes no template call or lifecycle operation: the running server keeps true and the installed pair, and the next start installs the template without it (b.b1j SR-1.3, SR-2.3, SR-3; real composition)", async () => {
     const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true })
     const installed = run.composition!.installedTemplate!
-    expect(installed.claude_args!.slice(-2)).toEqual(['--system-prompt-snapshot', 'off'])
+    expect(installed.agent_args!.slice(-2)).toEqual(['--system-prompt-snapshot', 'off'])
     expect(run.serverConfig()!.fresh_system_prompt).toBe(true)
     const cp = run.checkpoint()
 
@@ -5437,7 +5437,7 @@ describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-1
     expect(run.logsOf(RELOAD_NOOP)).toEqual([])
     // The running server keeps its start-time value and the template as installed ...
     expect(run.composition!.installedTemplate).toEqual(installed)
-    expect(run.composition!.installedTemplate!.claude_args!.slice(-2)).toEqual(['--system-prompt-snapshot', 'off'])
+    expect(run.composition!.installedTemplate!.agent_args!.slice(-2)).toEqual(['--system-prompt-snapshot', 'off'])
     expect(run.serverConfig()!.fresh_system_prompt).toBe(true)
     // ... and the record holds the change.
     expect(JSON.parse(h.readRecord()!.toString('utf-8')).fresh_system_prompt).toBe(false)
@@ -5450,8 +5450,8 @@ describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-1
 
     expect(restarted.serverConfig()!.fresh_system_prompt).toBe(false)
     const restartedTemplate = restarted.composition!.installedTemplate!
-    expect(restartedTemplate.claude_args).not.toContain('--system-prompt-snapshot')
-    expect(restartedTemplate.claude_args).toEqual(installed.claude_args!.slice(0, -2))
+    expect(restartedTemplate.agent_args).not.toContain('--system-prompt-snapshot')
+    expect(restartedTemplate.agent_args).toEqual(installed.agent_args!.slice(0, -2))
     expectNoPostNoLeak(restarted)
   })
 
@@ -6615,7 +6615,7 @@ function promptRelay(run: ReloadRun, open: () => readonly string[]) {
     list: async () => ({ spawns: [cannedListRow({ state: 'check_permission' }, getPersona(bravoKey)!, h.home)] }),
     get: async () =>
       cannedGetResultPlural({
-        claude_instance_id: instance,
+        instance_id: instance,
         state: 'check_permission',
         permission_requests: open().map((request_token, i) => cannedPermissionRequest({ request_token, request_id: i + 1 })),
       }),
@@ -6738,7 +6738,7 @@ describe('b.deo SRI-703: prompts and notices after a confirmed switch change go 
       // The earlier prompt still takes a click: decided, and its message updated where it was posted.
       expect(await relay.click('allow', REQUEST_TOKEN_A)).toBe(true)
       expect(run.composition!.agentDirector.decideCalls).toEqual([
-        { claude_instance_id: relay.instance, decision: 'allow', request_token: REQUEST_TOKEN_A } as DecideParams,
+        { instance_id: relay.instance, decision: 'allow', request_token: REQUEST_TOKEN_A } as DecideParams,
       ])
       expect(updates(stub).map((u) => [u.channel, u.ts])).toEqual([[destinationIn(from), PROMPT_TS_A]])
       expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test'])

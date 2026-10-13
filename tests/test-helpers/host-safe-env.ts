@@ -113,7 +113,7 @@ import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from 'no
 export const AGENT_DIRECTOR_BINARY_NAME = 'agent-director'
 
 /** The install directory under a home, relative to it. */
-export const AGENT_DIRECTOR_INSTALL_DIR = '.agent-director'
+export const AGENT_DIRECTOR_INSTALL_DIR = '.config/agent-director'
 
 /** The standard install path the client tries first, relative to `HOME`. */
 export const AGENT_DIRECTOR_INSTALL_PATH = join(AGENT_DIRECTOR_INSTALL_DIR, 'bin', AGENT_DIRECTOR_BINARY_NAME)
@@ -235,7 +235,7 @@ export function dirHoldsAgentDirector(dir: string): boolean {
 
 /**
  * Whether `home` holds an agent-director install: an entry at the standard
- * install path, or any entry named `.agent-director` (directory, file or
+ * install path, or any entry named `.config/agent-director` (directory, file or
  * symlink) directly in it.
  */
 export function homeHoldsAgentDirectorInstall(home: string): boolean {
@@ -694,7 +694,7 @@ export const CLAUDE_DIR = '.claude'
  * - `.claude/skills`: where postinstall links the shipped skills;
  * - `.claude/slack-mcp.json`: postinstall's MCP configuration and the default
  *   `mcp_config_path`;
- * - `.agent-director` and, under it, `state.db` (the start gate's same-user
+ * - `.config/agent-director` and, under it, `state.db` (the start gate's same-user
  *   probe and the client's store), `config.toml` (agent-director's settings
  *   file) and `bin/agent-director` (`AGENT_DIRECTOR_INSTALL_PATH`);
  * - `.config` (`resolveXdgConfigHome` with `XDG_CONFIG_HOME` unset or
@@ -854,7 +854,7 @@ export function launchTimeHomes(): string[] {
  * - `derivedPathNotUnderTempDir` (passwd home unknown): one of them does not
  *   resolve to a path strictly under the temp directory;
  * - `holdsAgentDirector`: `launchHome` holds an agent-director install
- *   (`.agent-director`, or an entry at `AGENT_DIRECTOR_INSTALL_PATH`).
+ *   (`.config/agent-director`, or an entry at `AGENT_DIRECTOR_INSTALL_PATH`).
  * For a home none of these apply to, no path in `LAUNCH_HOME_DERIVED_PATHS`
  * resolves into the real home (with the passwd home unknown: each resolves
  * strictly under the temp directory, which is not the root), and nothing

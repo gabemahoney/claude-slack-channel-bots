@@ -68,7 +68,7 @@ function makeTrailEvent(overrides?: Partial<TrailEvent>): TrailEvent {
   return {
     ts: '2026-06-04T22:00:00.123Z',
     event: 'cscb.test.fixture',
-    claude_instance_id: 'cscb_fixture_C123',
+    instance_id: 'cscb_fixture_C123',
     ...overrides,
   }
 }
@@ -76,7 +76,7 @@ function makeTrailEvent(overrides?: Partial<TrailEvent>): TrailEvent {
 function makeEmitTrailInput(overrides?: Partial<EmitTrailInput>): EmitTrailInput {
   return {
     event: 'cscb.test.autostamp',
-    claude_instance_id: 'cscb_fixture_C123',
+    instance_id: 'cscb_fixture_C123',
     ...overrides,
   }
 }
@@ -105,7 +105,7 @@ describe('emitTrailEvent — schema serialization', () => {
     emitTrailEvent(ev)
     const parsed = readParsedLines()[0]!
     expect(parsed['event']).toBe('cscb.test.fixture')
-    expect(parsed['claude_instance_id']).toBe('cscb_fixture_C123')
+    expect(parsed['instance_id']).toBe('cscb_fixture_C123')
     expect(parsed['request_token']).toBe('6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd')
     expect(parsed['channel']).toBe('C0B1ZJJLJ9M')
     expect(parsed['message_ts']).toBe('1717536002.000100')
@@ -166,7 +166,7 @@ describe('emitTrail — ts auto-stamping', () => {
     // requirement, mirroring how a buggy caller would land here at runtime.
     emitTrailEvent({
       event: 'cscb.test.no_ts',
-      claude_instance_id: 'cscb_fixture_C123',
+      instance_id: 'cscb_fixture_C123',
     } as unknown as TrailEvent)
     const parsed = readParsedLines()[0]!
     expect(typeof parsed['ts']).toBe('string')

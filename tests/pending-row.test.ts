@@ -707,8 +707,8 @@ describe('parseLaunchStart: an absent or unparseable launch start gives none', (
 /** A `status` result, `get` row and `list` row with the given fields. */
 const ROW_FORMS: ReadonlyArray<[string, (fields: PendingRowFields) => PendingRowFields]> = [
   ['status result', (fields) => cannedStatusResult(fields)],
-  ['get row', (fields) => cannedGetResult({ claude_instance_id: 'cscb_alpha', ...fields })],
-  ['list row', (fields) => cannedListRow({ claude_instance_id: 'cscb_alpha', ...fields })],
+  ['get row', (fields) => cannedGetResult({ instance_id: 'cscb_alpha', ...fields })],
+  ['list row', (fields) => cannedListRow({ instance_id: 'cscb_alpha', ...fields })],
 ]
 
 /** Launch starts that are none: absent, `null`, empty and unparseable. */
@@ -850,7 +850,7 @@ const G_DOUBLED: AdConfigTables = { tmux: { pending_grace_seconds: DEFAULT_AD_SE
  */
 function resumedRow(raw: string, startedAtMs: number): ReturnType<typeof cannedGetResult> {
   return cannedGetResult({
-    claude_instance_id: 'cscb_alpha',
+    instance_id: 'cscb_alpha',
     state: 'pending',
     launch_started_at: raw,
     started_at: new Date(startedAtMs).toISOString(),
@@ -1295,7 +1295,7 @@ describe('readAndStepPendingRow: one get, then a covered or undecided row armed 
   function expectOneGetOnly(h: RecoveryHarness, key: string): void {
     const id = personaInstanceId(key)
     const { getCalls, killCalls, spawnCalls, resumeCalls, sendKeysCalls, readPaneCalls, statusCalls } = h.stub.calls
-    expect(getCalls).toEqual([{ claude_instance_id: id }])
+    expect(getCalls).toEqual([{ instance_id: id }])
     expect([killCalls, spawnCalls, resumeCalls, sendKeysCalls, readPaneCalls, statusCalls]).toEqual([[], [], [], [], [], []])
     expect([h.approverRunning(key), h.sequenceRunning(key)]).toEqual([false, false])
   }
@@ -1424,7 +1424,7 @@ describe('readAndStepPendingRow: one get, then a covered or undecided row armed 
   // pending-row step, whose no-launch-start answer logs its one line and
   // answers latched. Today nothing latches and nothing is armed or started.
   test.each(ROW_NO_LAUNCH_STARTS)('P\'s get answering a pending row with no launch start (%s) under another persona\'s id: the step\'s one no-launch-start line, the answer latched; no latch, nothing armed, no sequence', async (_form, launch) => {
-    const { h, p, q } = pendingP({ launch_started_at: launch, claude_instance_id: personaInstanceId('other') })
+    const { h, p, q } = pendingP({ launch_started_at: launch, instance_id: personaInstanceId('other') })
     expect(personaInstanceId('other')).not.toBe(personaInstanceId(q))
     const starts = recordSequenceStarts()
 
@@ -3173,11 +3173,11 @@ function failNextLaunch(h: RecoveryHarness, row: PendingRowModel, launch: Failed
     return launch.error()
   }
   if (launch.call === 'resume') {
-    wrapModelKnob(h, 'resumeFn', (modelResume) => (params) => (used || params.claude_instance_id !== row.instanceId ? modelResume(params) : fail()))
+    wrapModelKnob(h, 'resumeFn', (modelResume) => (params) => (used || params.instance_id !== row.instanceId ? modelResume(params) : fail()))
     return
   }
   const reuse = launch.call === 'reuse spawn'
-  wrapModelKnob(h, 'spawnFn', (modelSpawn) => (params) => (used || params.claude_instance_id !== row.instanceId || 'reuse_finished' in params !== reuse ? modelSpawn(params) : fail()))
+  wrapModelKnob(h, 'spawnFn', (modelSpawn) => (params) => (used || params.instance_id !== row.instanceId || 'reuse_finished' in params !== reuse ? modelSpawn(params) : fail()))
 }
 
 /** A failed fresh spawn: no row, then the spawn leaves the row `pending` and answers `ErrTmuxSessionCreate` (`launchError`, for the outage case). */
@@ -3445,8 +3445,8 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
       ['status', 'get', 'read-pane', 'send-keys', 'find-missing', 'get'],
       ['status', 'get', 'read-pane', 'send-keys', 'find-missing', 'get'],
     ])
-    expect(h.stub.calls.readPaneCalls).toEqual(lapping.map(() => ({ claude_instance_id: id, n_lines: FULL_PANE_READ_LINES, allow_pending: true })))
-    expect(h.stub.calls.sendKeysCalls).toEqual(lapping.map(() => ({ claude_instance_id: id, text: '', allow_pending: true })))
+    expect(h.stub.calls.readPaneCalls).toEqual(lapping.map(() => ({ instance_id: id, n_lines: FULL_PANE_READ_LINES, allow_pending: true })))
+    expect(h.stub.calls.sendKeysCalls).toEqual(lapping.map(() => ({ instance_id: id, text: '', allow_pending: true })))
     // The second Enter cleared the dialog; the round's get read the row live, and the retry stopped the timer.
     expect([row.dialog(), row.state()]).toEqual([PENDING_ROW_DIALOG_NONE, 'waiting'])
     expect(h.stops).toContainEqual({ key: p, reason: UNAVAILABLE_RETRY_STOP_ROW_LIVE })
@@ -3598,8 +3598,8 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     const lapAt = h.controller.view(p)!.dueAt!
     await retryNow(h, p)
 
-    expect(h.stub.calls.readPaneCalls).toEqual([{ claude_instance_id: row.instanceId, n_lines: FULL_PANE_READ_LINES, allow_pending: true }])
-    expect(h.stub.calls.sendKeysCalls).toEqual(typed ? [{ claude_instance_id: row.instanceId, text: '', allow_pending: true }] : [])
+    expect(h.stub.calls.readPaneCalls).toEqual([{ instance_id: row.instanceId, n_lines: FULL_PANE_READ_LINES, allow_pending: true }])
+    expect(h.stub.calls.sendKeysCalls).toEqual(typed ? [{ instance_id: row.instanceId, text: '', allow_pending: true }] : [])
     expect(h.callTimes('findMissing')).toEqual(runs ? [lapAt] : [])
     expect(h.latch.isLatched(p)).toBe(!runs)
     expect(getOutageFlags(p).has('tmux-unavailable')).toBe(effect === LAP_COLUMN_TMUX_UNAVAILABLE)
@@ -3772,7 +3772,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
       return modelFindMissing(params)
     })
     wrapModelKnob(h, 'getFn', (modelGet) => (params) => {
-      if (!failNextGet || params.claude_instance_id !== row.instanceId) return modelGet(params)
+      if (!failNextGet || params.instance_id !== row.instanceId) return modelGet(params)
       failNextGet = false
       return errCallTimeout('get')
     })
@@ -3792,7 +3792,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     const { h, p } = ruleHarnessOf()
     const directory = personaOf(h, p).working_directory
     // The old life's row reads live in P's directory, so its wait keeps the hold until its run lists it.
-    h.script({ getFn: (params) => (params.claude_instance_id === PRE_PERSONA_ID ? cannedGetResult({ claude_instance_id: PRE_PERSONA_ID, cwd: directory, state: 'waiting' }) : undefined) })
+    h.script({ getFn: (params) => (params.instance_id === PRE_PERSONA_ID ? cannedGetResult({ instance_id: PRE_PERSONA_ID, cwd: directory, state: 'waiting' }) : undefined) })
     const row = await ORIGIN_START_PASS.begin(h, p, { dialog: PENDING_ROW_DIALOG_TRUST })
     const launchStartMs = row.launchStartMs()!
     h.beginOldLifeHold({ instanceId: PRE_PERSONA_ID, oldKey: PRE_PERSONA_ID, directory, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
@@ -4052,7 +4052,7 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
   ])('AC 9, a resumed launch CSCB started, held at an unrecognised prompt, %s: at B one relaunching post, one kill with kill_sent true, the sequence from step 2 (no step-1 kill) and a resume of the same row; nothing counted', async (_label, judgment) => {
     const { h, p, row } = ownStuckLaunchOf({ judgment })
     const launchStart = await launchOwnPending(h, row)
-    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: row.instanceId }])
+    expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: row.instanceId }])
 
     const atB = await abortRoundAtB(h, p, row, ABORT_ORIGIN_APPROVER_STOP)
 
@@ -4061,8 +4061,8 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     expect(row.callTimes('kill')).toEqual([atB])
     expect(abortKillLinesOf(h, p)).toEqual([killedLineStart(p, true)])
     // The resume of the same row (its session id kept), and no reuse spawn or delete.
-    expect(row.getRow().claude_session_id).toBe(OWN_SESSION_ID)
-    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: row.instanceId }, { claude_instance_id: row.instanceId }])
+    expect(row.getRow().session_id).toBe(OWN_SESSION_ID)
+    expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: row.instanceId }, { instance_id: row.instanceId }])
     expect([h.reuseSpawns(), h.stub.calls.deleteCalls]).toEqual([[], []])
     expect(relaunchingPostsOf(h, p)).toEqual([relaunchingTextOf(p)])
     expect([heldPostsOf(h, p), otherNoticesOf(h, p), getFailureCount(p)]).toEqual([[], [], 0])
@@ -4443,7 +4443,7 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
   function keepPendingAfterKill(h: RecoveryHarness, row: PendingRowModel): void {
     wrapModelKnob(h, 'killFn', (modelKill) => (params) => {
       const answer = modelKill(params)
-      if (params.claude_instance_id === row.instanceId) row.setState(AGENT_DIRECTOR_PENDING_STATE)
+      if (params.instance_id === row.instanceId) row.setState(AGENT_DIRECTOR_PENDING_STATE)
       return answer
     })
   }
@@ -4641,8 +4641,8 @@ describe('SRJ-713: a failed launch\'s pending row, never CSCB\'s own, waited out
     expect(recovered.at).toBeLessThan(launchStartMs + adLaunchBoundMsInEffect())
     // The round's lap, run and get read the row missing; then the restart decision's plain spawn collides, its get reads the row and it resumes.
     expect(recovered.verbs.slice(0, LAP_RUN_ROUND.length + 3)).toEqual([...LAP_RUN_ROUND, 'spawn', 'get', 'resume'])
-    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: row.instanceId }])
-    expect([row.getRow().claude_session_id, h.reuseSpawns(), row.callTimes('kill')]).toEqual([OWN_SESSION_ID, [], []])
+    expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: row.instanceId }])
+    expect([row.getRow().session_id, h.reuseSpawns(), row.callTimes('kill')]).toEqual([OWN_SESSION_ID, [], []])
     expect([heldPostsOf(h, p), relaunchingPostsOf(h, p), getFailureCount(p)]).toEqual([[], [], 0])
     expect(dispatcherBugWordingIn(h)).toEqual([])
   })

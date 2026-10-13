@@ -16,7 +16,7 @@
  * {@link buildInstallCheckPhase1Note} for the install check.
  *
  * The floor check sits beside the agent-director client's own too-old refusal
- * (client minimum 0.7.0) and gates on the version alone. The client ranks
+ * (client minimum 0.12.0) and gates on the version alone. The client ranks
  * its `0.0.0-dev` sentinel above every version, so `Client.create()`
  * admits it; the floor has no such special case and refuses it on its own.
  *
@@ -105,12 +105,11 @@ import { redactSlackLogText } from './slack-log-redaction.ts'
 /**
  * CSCB's Phase 1 floor: the Phase 1 agent-director release's version.
  *
- * b.jg5 SRJ-201: confirmed from the Phase 1 release, agent-director 0.11.0
- * (tag `v0.11.0`; npm `agent-director@0.11.0`, the client `package.json`
- * pins). Only major.minor.patch is compared (SRJ-202), so a `0.11.0-rc.1`
- * binary counts as 0.11.0.
+ * The released agent-director 0.12.0 client requires a CLI of at least
+ * 0.12.0. Only major.minor.patch is compared (SRJ-202), so a
+ * `0.12.0-rc.1` binary counts as 0.12.0.
  */
-export const PHASE1_FLOOR_VERSION = '0.11.0'
+export const PHASE1_FLOOR_VERSION = '0.12.0'
 
 /** The user doc that holds the switch-over and rollback runbooks. */
 export const PHASE1_RUNBOOK_DOC = 'docs/migration.md'

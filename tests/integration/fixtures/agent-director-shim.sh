@@ -7,17 +7,17 @@
 #
 # `install_ad_shim` (scenario.sh) puts this file at the path a scenario
 # HOME's agent-director client resolves first, the standard path
-# $HOME/.agent-director/bin/agent-director, as a regular file (the client
+# $HOME/.config/agent-director/bin/agent-director, as a regular file (the client
 # follows symlinks, so a symlink there would bypass the shim): it copies the
 # binary that was installed there beside it, as
-# $HOME/.agent-director/bin/agent-director.real, then renames the shim over
+# $HOME/.config/agent-director/bin/agent-director.real, then renames the shim over
 # the standard path, so that path always holds the binary or the shim. The
 # line above is the shim's marker; scenario.sh's `check_ad_shim` checks for
 # it after every install, re-shim, swap and restore.
 #
 # The same file fronts agent-director-admin, the operator tool that holds
 # `kill-finished` and `delete` (agent-director 0.11.0 on):
-# `install_ad_admin_shim` puts it at $HOME/.agent-director/admin/agent-director-admin
+# `install_ad_admin_shim` puts it at $HOME/.config/agent-director/admin/agent-director-admin
 # with the binary beside it as agent-director-admin.real, and
 # `check_ad_admin_shim` checks it. Run by that name, the shim execs
 # agent-director-admin.real and logs to the one log below.
@@ -37,7 +37,7 @@
 # THE LOG
 # -------
 # <dir>/agent-director-shim.log, where <dir> is the directory holding the
-# shim and the real binary ($HOME/.agent-director/bin under the scenario
+# shim and the real binary ($HOME/.config/agent-director/bin under the scenario
 # HOME); run as agent-director-admin, the shim writes to that same file, in
 # the bin directory beside its own admin directory, so one log holds every
 # invocation of either binary. agent-director registers hook commands that name the real binary, so

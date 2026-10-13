@@ -1084,7 +1084,7 @@ describe('audit-finished-tickets.sh — out-of-repo closure MARKER (b.jpw AC-3; 
       '# some out of repo work\n\n' +
         'Background prose with no path here.\n\n' +
         '## Fix\n\n' +
-        'Lives in `~/.agent-director/config`, outside any repo.\n',
+        'Lives in `~/.config/agent-director/config`, outside any repo.\n',
     ],
     [
       'b.mqd shape — ~/ artifact named but explicitly NOT actioned',

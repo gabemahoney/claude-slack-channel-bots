@@ -94,7 +94,7 @@
  *     stuck-prompt warning unlatched and throttled.
  *   - Outage state keyed by the persona key, never the channel ID.
  *   - New row in `permission_requests` → posts Block Kit prompt + records
- *     live entry keyed on (claude_instance_id, request_token).
+ *     live entry keyed on (instance_id, request_token).
  *   - Two concurrent rows on a single tick → two distinct postMessage calls,
  *     two distinct map entries.
  *   - Repeat tick with the same plural projection → no duplicate postMessage,
@@ -548,7 +548,7 @@ const checkPermRow = (persona: Persona = A) =>
 function getResult(permission_requests?: PermissionRequestRow[] | null, persona: Persona = A): CannedGetResult {
   return cannedGetResult(
     permission_requests === undefined
-      ? { state: 'check_permission' }
+      ? { state: 'check_permission', permission_requests: undefined }
       : { state: 'check_permission', permission_requests },
     persona,
     personaDir,
@@ -710,7 +710,7 @@ describe('poller tick — Case 1: new entry', () => {
     const actions = (postCalls[0].blocks as Array<Record<string, unknown>>).find((b) => b['type'] === 'actions') as
       { elements: Array<{ action_id: string }> }
     for (const el of actions.elements) {
-      expect(parsePermissionActionId(el.action_id)?.claudeInstanceId).toBe(`cscb_${KEY_A}`)
+      expect(parsePermissionActionId(el.action_id)?.instanceId).toBe(`cscb_${KEY_A}`)
       expect(personaKeyFromActionId(el.action_id)).toBe(KEY_A)
     }
   })
@@ -759,8 +759,8 @@ describe('poller tick — persona routing (b.av2 SR-7.1)', () => {
     const bRows = [cannedPermissionRequest({ request_token: TOKEN_B, request_id: 2 })]
     const ivl = startPoller(() => ({
       list: async () => ({ spawns: [checkPermRow(A), checkPermRow(B)] }),
-      get: async (p: { claude_instance_id: string }) =>
-        p.claude_instance_id === INSTANCE_A ? getResult(aRows, A) : getResult(bRows, B),
+      get: async (p: { instance_id: string }) =>
+        p.instance_id === INSTANCE_A ? getResult(aRows, A) : getResult(bRows, B),
       getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> =>
         cannedGetPermissionResponse({ request_token: params.request_token, decision: 'allow', decision_reason: null }),
     }))
@@ -844,7 +844,7 @@ describe('poller tick — persona routing (b.av2 SR-7.1)', () => {
   test('a row with no persona label is logged once while it stays listed, per instance ID; a failed list forgets nothing; a row no longer listed logs again when it comes back', async () => {
     const logCalls: unknown[][] = []
     const getCalls: unknown[] = []
-    const unlabelled = (id: string) => cannedListRow({ claude_instance_id: id, state: 'check_permission', labels: { service: 'cscb' } })
+    const unlabelled = (id: string) => cannedListRow({ instance_id: id, state: 'check_permission', labels: { service: 'cscb' } })
     let spawns = [unlabelled('cscb_old_one'), unlabelled('cscb_old_two')]
     let listError: Error | undefined
     const ivl = startPoller(() => ({
@@ -1014,7 +1014,7 @@ describe('poller tick — persona routing (b.av2 SR-7.1)', () => {
   })
 
   test('a row in the default canned form (labels exactly service and persona, the default fixture cwd) routes by its persona label', async () => {
-    const row = cannedListRow({ claude_instance_id: INSTANCE_A, state: 'check_permission' })
+    const row = cannedListRow({ instance_id: INSTANCE_A, state: 'check_permission' })
     expect(row.labels).toEqual({ service: 'cscb', persona: KEY_A })
     expect(row.cwd).toBe(defaultCannedRowCwd())
     scriptPostTs(stubA, POST_TS)
@@ -1117,8 +1117,8 @@ describe('poller tick — `dm` destination (b.av2 SR-7.1, SR-5.1)', () => {
     scriptPostTs(stubD, POST_TS_2)
     const ivl = startPoller(() => ({
       list: async () => ({ spawns: [checkPermRow(A), checkPermRow(D)] }),
-      get: async (p: { claude_instance_id: string }) =>
-        p.claude_instance_id === INSTANCE_A ? getResult([request(TOKEN_A, 1)], A) : getResult([request(TOKEN_B, 2)], D),
+      get: async (p: { instance_id: string }) =>
+        p.instance_id === INSTANCE_A ? getResult([request(TOKEN_A, 1)], A) : getResult([request(TOKEN_B, 2)], D),
     }))
     await ivl.tick()
 
@@ -1197,7 +1197,7 @@ describe('poller tick — `dm` destination (b.av2 SR-7.1, SR-5.1)', () => {
     expect(rowDecisions(trail, 'post_attempted')).toHaveLength(1)
     const events = chatPosts(trail)
     expect(events).toHaveLength(1)
-    expect(events[0]).toMatchObject({ claude_instance_id: INSTANCE_D, request_token: TOKEN_A, ok: false, error: errorClass })
+    expect(events[0]).toMatchObject({ instance_id: INSTANCE_D, request_token: TOKEN_A, ok: false, error: errorClass })
     if (step === 'conversations.open') expect('channel' in events[0]).toBe(false)
     else expect(events[0].channel).toBe(D_DM)
     expectOneEpisodeLine(logCalls, trail, D, { step, destination: 'dm', code: errorClass, namesScope: false })
@@ -1636,7 +1636,7 @@ describe('poller tick — a destination failure holds the persona\'s prompts and
       const events = chatPosts(trail)
       expect(events).toHaveLength(n)
       for (const event of events) {
-        expect(event).toMatchObject({ claude_instance_id: instance, request_token: TOKEN_A, ok: false, error: c.code })
+        expect(event).toMatchObject({ instance_id: instance, request_token: TOKEN_A, ok: false, error: c.code })
         if (c.failedChannel === undefined) expect('channel' in event).toBe(false)
         else expect(event.channel).toBe(c.failedChannel)
       }
@@ -1809,8 +1809,8 @@ describe('poller tick — a destination failure holds the persona\'s prompts and
     let bRows = [request(TOKEN_A, 1)]
     const ivl = startPoller(() => ({
       list: async () => ({ spawns: [checkPermRow(D), checkPermRow(B)] }),
-      get: async (p: { claude_instance_id: string }) =>
-        p.claude_instance_id === INSTANCE_D ? getResult([request(TOKEN_A, 1)], D) : getResult(bRows, B),
+      get: async (p: { instance_id: string }) =>
+        p.instance_id === INSTANCE_D ? getResult([request(TOKEN_A, 1)], D) : getResult(bRows, B),
     }), { emitTrail: trail.emit, log: (...args) => { logCalls.push(args) }, destinationHold: hold })
 
     // t=0: D's open fails first in the tick; B's prompt still posts.
@@ -1828,7 +1828,7 @@ describe('poller tick — a destination failure holds the persona\'s prompts and
     expect(methods(stubD)).toEqual(['conversations.open'])
     expect(posts(stubB)).toHaveLength(2)
     expect(getLivePermission(INSTANCE_B, TOKEN_B)).toMatchObject({ personaKey: KEY_B, channelId: B_DEST, messageTs: POST_TS_2 })
-    expect(chatPosts(trail).map((e) => [e.claude_instance_id, e['ok']])).toEqual([
+    expect(chatPosts(trail).map((e) => [e.instance_id, e['ok']])).toEqual([
       [INSTANCE_D, false],
       [INSTANCE_B, true],
       [INSTANCE_B, true],
@@ -2092,7 +2092,7 @@ describe('poller tick — a throw while a persona\'s retry is due leaves it retr
     const instanceA = personaInstanceId(A.key)
     const instanceB = personaInstanceId(B.key)
     const row = (persona, id) => ad.cannedListRow(
-      id === undefined ? { state: 'check_permission' } : { state: 'check_permission', claude_instance_id: id },
+      id === undefined ? { state: 'check_permission', permission_requests: undefined } : { state: 'check_permission', instance_id: id },
       persona, input.personaDir)
     const request = (request_token, request_id) => ad.cannedPermissionRequest({ request_token, request_id })
     let spawns = [row(A)]
@@ -2103,8 +2103,8 @@ describe('poller tick — a throw while a persona\'s retry is due leaves it retr
       getClient: () => ({
         list: async () => ({ spawns }),
         get: async (p) => ad.cannedGetResult(
-          { state: 'check_permission', claude_instance_id: p.claude_instance_id, permission_requests: open[p.claude_instance_id] || [] },
-          p.claude_instance_id === instanceB ? B : A, input.personaDir),
+          { state: 'check_permission', instance_id: p.instance_id, permission_requests: open[p.instance_id] || [] },
+          p.instance_id === instanceB ? B : A, input.personaDir),
       }),
       clientFor: clients.clientFor, getPersona, isPersonaUp: () => true,
       setInterval: ivl.setInterval, clearInterval: ivl.clearInterval,
@@ -2296,7 +2296,7 @@ describe('poller tick — a throw while a persona\'s retry is due leaves it retr
 // Tick behavior — duplicate-tick no-op (Cases 2/3 collapsed)
 // ---------------------------------------------------------------------------
 
-describe('poller tick — duplicate (claude_instance_id, request_token) is a no-op', () => {
+describe('poller tick — duplicate (instance_id, request_token) is a no-op', () => {
   test('repeat tick with same plural projection → no extra postMessage, map entry unchanged', async () => {
     scriptPostTs(stubA, POST_TS)
     const row = cannedPermissionRequest({ request_token: TOKEN_A, request_id: 5 })
@@ -2623,6 +2623,7 @@ describe('poller tick — row disappears from plural projection (SR-2.4 closure 
  */
 async function seedAndClose(opts: {
   getPermissionResult?: GetPermissionResult
+  getPermissionQueue?: GetPermissionResult[]
   getPermissionError?: Error
   postTs?: string
   token?: string
@@ -2644,7 +2645,7 @@ async function seedAndClose(opts: {
     getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
       getPermissionCalls.push(params)
       if (opts.getPermissionError) throw opts.getPermissionError
-      return opts.getPermissionResult
+      return opts.getPermissionQueue?.shift() ?? opts.getPermissionResult
         ?? cannedGetPermissionResponse({ request_token: params.request_token })
     },
   }), { log: () => { /* swallow */ } })
@@ -2660,6 +2661,57 @@ async function seedAndClose(opts: {
 }
 
 describe('SR-2.4 / SR-5 — newly-closed reconciliation + verdict rendering', () => {
+  test.each([
+    ['not_confirmed', 'none', null, 'waiting for agent delivery confirmation'],
+    ['fallen_back', 'none', null, 'answer this prompt at the session'],
+    ['fallen_back', 'intent', null, 'answer this prompt at the session'],
+  ] as const)('0.12 a newly discovered %s request (%s) posts a notice without buttons and resolves later', async (delivery, pane_answer, reason, notice) => {
+    const initial = cannedPermissionRequest({ request_token: TOKEN_A, delivery, pane_answer, decision: 'allow', decision_reason: reason })
+    let closed = false
+    const getPermissionCalls: GetPermissionParams[] = []
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => getResult(closed ? [] : [initial]),
+      getPermission: async (params: GetPermissionParams) => {
+        getPermissionCalls.push(params)
+        return closed
+          ? cannedGetPermissionResponse({ request_token: TOKEN_A, delivery: delivery === 'fallen_back' ? 'fallen_back' : 'delivered', pane_answer: delivery === 'fallen_back' ? 'sent' : 'none', decision_reason: delivery === 'fallen_back' ? 'pane' : null })
+          : cannedGetPermissionResponse({ ...initial, decision_reason: reason })
+      },
+    }), { log: () => {} })
+    await ivl.tick()
+    expect(posts(stubA)).toHaveLength(1)
+    expect(posts(stubA)[0]!.text).toContain(notice)
+    expect(JSON.stringify(posts(stubA)[0]!.blocks)).not.toContain('"type":"actions"')
+    expect(updates(stubA)).toEqual([])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeDefined()
+    closed = true
+    await ivl.tick()
+    expect(getPermissionCalls.at(-1)).toEqual({ request_token: TOKEN_A })
+    expect(updates(stubA).map((c) => c.text)).toEqual(['*Permission* — Allowed'])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    expect(slackCalls(stubB, stubD)).toBe(0)
+  })
+
+  test.each([
+    ['confirmed allow', { delivery: 'delivered', decision: 'allow', decision_reason: null }, '*Permission* — Allowed'],
+    ['timeout deny', { delivery: 'delivered', decision: 'deny', decision_reason: 'timeout' }, '⏱ *Permission* — Timed out'],
+    ['fallback pane', { delivery: 'fallen_back', decision: 'allow', pane_answer: 'none' }, '*Permission* — relay window elapsed; answer this prompt at the session\'s tmux pane'],
+  ] as const)('0.12 recorded verdict remains pending until %s', async (_name, final, text) => {
+    const pending = cannedGetPermissionResponse({ delivery: 'not_confirmed', decision: 'allow' })
+    const queue = [pending, pending, cannedGetPermissionResponse(final)]
+    const { ivl, token, getPermissionCalls } = await seedAndClose({ getPermissionQueue: queue })
+    expect(updates(stubA)).toEqual([])
+    expect(getLivePermission(INSTANCE_A, token)).toBeDefined()
+    await ivl.tick()
+    expect(updates(stubA)).toEqual([])
+    await ivl.tick()
+    expect(getPermissionCalls).toEqual(Array.from({ length: 3 }, () => ({ request_token: token })))
+    expect(updates(stubA).map((c) => c.text)).toEqual([text])
+    expect(slackCalls(stubB, stubD)).toBe(0)
+    expect(getLivePermission(INSTANCE_A, token) !== undefined).toBe(final.delivery === 'fallen_back')
+  })
+
   test('SR-5.1 operator_allow rendering — decision=allow, decision_reason=null → "*Permission* — Allowed"', async () => {
     const { getPermissionCalls, token } = await seedAndClose({
       getPermissionResult: cannedGetPermissionResponse({ decision: 'allow', decision_reason: null }),
@@ -2920,7 +2972,7 @@ describe('poller tick — skipped-tick observability', () => {
         await new Promise<void>((resolve) => { resolveTick = resolve })
         return { spawns: [] }
       },
-      get: async () => cannedGetResult({ claude_instance_id: 'x' }),
+      get: async () => cannedGetResult({ instance_id: 'x' }),
     }), { log: (...args) => { logCalls.push(args) } })
 
     // Tick 1 goes in-flight (list() hangs) and never finishes
@@ -2955,7 +3007,7 @@ describe('poller tick — skipped-tick observability', () => {
         }
         return { spawns: [] }
       },
-      get: async () => cannedGetResult({ claude_instance_id: 'x' }),
+      get: async () => cannedGetResult({ instance_id: 'x' }),
     }), { log: (...args) => { logCalls.push(args) } })
 
     // First streak: hang + 5 skips → one warning.
@@ -2991,7 +3043,7 @@ describe('poller lifecycle', () => {
     const ivl = makeManualInterval()
     const getClient = () => ({
       list: async () => ({ spawns: [] }),
-      get: async () => cannedGetResult({ claude_instance_id: 'x' }),
+      get: async () => cannedGetResult({ instance_id: 'x' }),
     })
     const deps: PollerDeps = {
       getClient,
@@ -3064,7 +3116,7 @@ describe('trail events — cscb.poller.row_decision and cscb.chat_post.attempted
     const decisions = trail.events.filter(e => e.event === 'cscb.poller.row_decision')
     expect(decisions).toHaveLength(1)
     expect(decisions[0]!['action']).toBe('post_attempted')
-    expect(decisions[0]!.claude_instance_id).toBe(INSTANCE_A)
+    expect(decisions[0]!.instance_id).toBe(INSTANCE_A)
     expect(decisions[0]!.request_token).toBe(TOKEN_A)
   })
 
@@ -3102,7 +3154,7 @@ describe('trail events — cscb.poller.row_decision and cscb.chat_post.attempted
     )
     expect(reconciled).toBeDefined()
     expect(reconciled!.request_token).toBe(TOKEN_A)
-    expect(reconciled!.claude_instance_id).toBe(INSTANCE_A)
+    expect(reconciled!.instance_id).toBe(INSTANCE_A)
   })
 
   test('action=not_found_generic_deny when getPermission throws ErrPermissionRequestNotFound', async () => {
@@ -3142,7 +3194,7 @@ describe('trail events — cscb.poller.row_decision and cscb.chat_post.attempted
       e => e.event === 'cscb.poller.row_decision' && e['action'] === 'non_conforming_skipped',
     )
     expect(nc).toBeDefined()
-    expect(nc!.claude_instance_id).toBe(INSTANCE_A)
+    expect(nc!.instance_id).toBe(INSTANCE_A)
     // request_token MUST be absent — not an empty string (SR-V-1.1).
     expect('request_token' in nc!).toBe(false)
   })
@@ -3203,8 +3255,8 @@ describe('trail events — cscb.poller.row_decision and cscb.chat_post.attempted
 
     const decAllow = parsePermissionActionId(allow)
     const decDeny = parsePermissionActionId(deny)
-    expect(decAllow).toEqual({ decision: 'allow', claudeInstanceId: INSTANCE_A, requestToken: TOKEN_A })
-    expect(decDeny).toEqual({ decision: 'deny', claudeInstanceId: INSTANCE_A, requestToken: TOKEN_A })
+    expect(decAllow).toEqual({ decision: 'allow', instanceId: INSTANCE_A, requestToken: TOKEN_A })
+    expect(decDeny).toEqual({ decision: 'deny', instanceId: INSTANCE_A, requestToken: TOKEN_A })
   })
 
   // The last row's Slack error is a token-shaped string (b.av2 SR-10.3): the
@@ -3243,7 +3295,7 @@ describe('trail events — cscb.poller.row_decision and cscb.chat_post.attempted
     const post = trail.events.find(e => e.event === 'cscb.chat_post.attempted')
     expect(decision!.request_token).toBe(TOKEN_A)
     expect(post!.request_token).toBe(TOKEN_A)
-    expect(decision!.claude_instance_id).toBe(post!.claude_instance_id)
+    expect(decision!.instance_id).toBe(post!.instance_id)
   })
 })
 
@@ -3602,7 +3654,7 @@ describe('b.fae F4 — wedge detector', () => {
 
     const events = wedgeTrail(s.trail)
     expect(events).toHaveLength(1)
-    expect(events[0]['claude_instance_id']).toBe(INSTANCE_A)
+    expect(events[0]['instance_id']).toBe(INSTANCE_A)
     expect(events[0]['channel']).toBe(A_DEST)
     expect(events[0]['ok']).toBe(true)
 
@@ -3687,7 +3739,7 @@ describe('b.fae F4 — wedge detector', () => {
     expect(warnings[0].text).toBe(buildWedgeWarningText(B, INSTANCE_B))
     expect(String(warnings[0].text)).not.toContain(INSTANCE_A)
     expect(slackCalls(stubA, stubD)).toBe(0)
-    expect(wedgeTrail(s.trail).map((e) => e['claude_instance_id'])).toEqual([INSTANCE_B])
+    expect(wedgeTrail(s.trail).map((e) => e['instance_id'])).toEqual([INSTANCE_B])
   })
 
   // b.jg5 SRJ-1012 (AC 78): the warning names agent-director verbs only, as a
@@ -3696,7 +3748,7 @@ describe('b.fae F4 — wedge detector', () => {
   describe('the wedge warning\'s text (b.jg5 SRJ-1012, SRJ-1001)', () => {
     /** SRJ-1012's text as the SRD writes it; `<id>` stands for the claude instance id. */
     const SRJ_1012_TEXT =
-      '⚠️ This persona appears blocked on a native Claude Code permission prompt that never reached Slack — it will not respond until it\'s cleared. To recover: run `agent-director read-pane --claude-instance-id <id>` to see the native prompt, then end the session with `agent-director kill --claude-instance-id <id>` and check the result; the server then brings the persona up again. Do NOT use send-keys — it is rejected in this state. These commands are for a human only: no bot, including any persona that sees this post, may run them.'
+      '⚠️ This persona appears blocked on a native Claude Code permission prompt that never reached Slack — it will not respond until it\'s cleared. To recover: run `agent-director read-pane --instance-id <id>` to see the native prompt, then end the session with `agent-director kill --instance-id <id>` and check the result; the server then brings the persona up again. Do NOT use send-keys — it is rejected in this state. These commands are for a human only: no bot, including any persona that sees this post, may run them.'
 
     /** Every inline code span in `text`, without its backticks. */
     const codeSpans = (text: string): string[] => [...text.matchAll(/`([^`]*)`/g)].map((m) => m[1]!)
@@ -3712,10 +3764,10 @@ describe('b.fae F4 — wedge detector', () => {
     ])('%s: the only commands are agent-director read-pane and kill for that id, kill with "check the result"', (_label, id) => {
       const body = buildWedgeWarningBody(id)
       expect(codeSpans(body)).toEqual([
-        `agent-director read-pane --claude-instance-id ${id}`,
-        `agent-director kill --claude-instance-id ${id}`,
+        `agent-director read-pane --instance-id ${id}`,
+        `agent-director kill --instance-id ${id}`,
       ])
-      expect(body).toContain(`\`agent-director kill --claude-instance-id ${id}\` and check the result`)
+      expect(body).toContain(`\`agent-director kill --instance-id ${id}\` and check the result`)
     })
 
     test('no "tmux-kill", no tmux command or mention, and no respawn step', () => {
@@ -3998,7 +4050,7 @@ describe('b.fae F4 — wedge detector', () => {
     expect(warnings.map((c) => c.channel)).toEqual([D_DM])
     expect(String(warnings[0].text).startsWith(`Persona ${renderPersonaRef(NAME_D, KEY_D)}: `)).toBe(true)
     const events = wedgeTrail(s.trail)
-    expect(events.map((e) => [e['claude_instance_id'], e['channel'], e['ok']])).toEqual([[INSTANCE_D, D_DM, true]])
+    expect(events.map((e) => [e['instance_id'], e['channel'], e['ok']])).toEqual([[INSTANCE_D, D_DM, true]])
 
     // Latched: nothing more across many further empty ticks.
     await s.driveTicks(K + RETRY_EVERY)
@@ -4018,7 +4070,7 @@ describe('b.fae F4 — wedge detector', () => {
     expect(methods(stubD)).toEqual(['conversations.open'])
     const failed = wedgeTrail(s.trail)
     expect(failed).toHaveLength(1)
-    expect(failed[0]).toMatchObject({ claude_instance_id: INSTANCE_D, ok: false, error: errorClass })
+    expect(failed[0]).toMatchObject({ instance_id: INSTANCE_D, ok: false, error: errorClass })
     expect('channel' in failed[0]).toBe(false)
     expectOneEpisodeLine(s.logCalls, s.trail, D, { step: 'conversations.open', destination: 'dm', code: errorClass, namesScope: false })
 
@@ -4231,9 +4283,9 @@ function makeNotUpScenario(trailFault: (event: CapturedTrailEvent) => Error | un
   const byInstance = (id: string) => config.personas.find((p) => personaInstanceId(p.key) === id)
   const ivl = startPoller(() => ({
     list: async () => ({ spawns: [...[...listed].map((p) => checkPermRow(p)), ...extraRows] }),
-    get: async ({ claude_instance_id }) => {
-      getCalls.push(claude_instance_id)
-      return getResult(open.get(claude_instance_id) ?? [], byInstance(claude_instance_id))
+    get: async ({ instance_id }) => {
+      getCalls.push(instance_id)
+      return getResult(open.get(instance_id) ?? [], byInstance(instance_id))
     },
     getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
       getPermissionCalls.push(params.request_token)
@@ -4284,7 +4336,7 @@ const rejectedRequest = () => cannedPermissionRequest({ request_token: '', reque
 const NOT_A_LIST = {} as unknown as PermissionRequestRow[]
 const allUpdates = () => updates(stubA).length + updates(stubB).length + updates(stubD).length
 const trailFor = (trail: TrailCapture, instanceId: string) =>
-  trail.events.filter((e) => e['claude_instance_id'] === instanceId)
+  trail.events.filter((e) => e['instance_id'] === instanceId)
 const wedgeWarnings = () =>
   [stubA, stubB, stubD].flatMap((s) => posts(s)).filter((c) => String(c.text).includes('blocked on a native'))
 const skipStarts = (logCalls: unknown[][], persona: Persona) =>
@@ -4301,8 +4353,8 @@ describe('poller tick — a persona that is not up (b.av2 SR-6.4)', () => {
     scriptPostTs(stubB, POST_TS_2)
     // E3's handling of a row with no persona label, and of one naming no applied persona, is unchanged.
     s.extraRows.push(
-      cannedListRow({ claude_instance_id: 'cscb_unlabelled', state: 'check_permission', labels: { service: 'cscb' } }),
-      cannedListRow({ claude_instance_id: 'cscb_absent', state: 'check_permission', labels: { service: 'cscb', persona: 'absent' } }),
+      cannedListRow({ instance_id: 'cscb_unlabelled', state: 'check_permission', labels: { service: 'cscb' } }),
+      cannedListRow({ instance_id: 'cscb_absent', state: 'check_permission', labels: { service: 'cscb', persona: 'absent' } }),
     )
     await s.ivl.tick()
 
@@ -4317,7 +4369,7 @@ describe('poller tick — a persona that is not up (b.av2 SR-6.4)', () => {
     // B: posted once on its own client to its destination, tracked, with its trail.
     expect(posts(stubB).map((c) => c.channel)).toEqual([B_DEST])
     expect(getLivePermission(INSTANCE_B, TOKEN_B)).toMatchObject({ personaKey: KEY_B, channelId: B_DEST, messageTs: POST_TS_2 })
-    expect(rowDecisions(s.trail, 'post_attempted').map((e) => e['claude_instance_id'])).toEqual([INSTANCE_B])
+    expect(rowDecisions(s.trail, 'post_attempted').map((e) => e['instance_id'])).toEqual([INSTANCE_B])
     expect(chatPosts(s.trail)).toHaveLength(1)
 
     expect(logLines(s.logCalls, 'cscb_unlabelled has no persona label')).toHaveLength(1)
@@ -4490,9 +4542,9 @@ describe('forgetPersonaPrompts — a teardown drops one persona\'s poller state 
     s.listed.add(A)
     s.extraRows.push(
       // B's instance under A's label: B's by its instance.
-      cannedListRow({ claude_instance_id: INSTANCE_B, state: 'check_permission' }, A, personaDir),
+      cannedListRow({ instance_id: INSTANCE_B, state: 'check_permission' }, A, personaDir),
       // Another instance under B's label: B's by its key.
-      cannedListRow({ claude_instance_id: B_OTHER_INSTANCE, state: 'check_permission' }, B, personaDir),
+      cannedListRow({ instance_id: B_OTHER_INSTANCE, state: 'check_permission' }, B, personaDir),
     )
     s.open.set(INSTANCE_A, [requestA()])
     s.open.set(INSTANCE_B, [requestB()])
@@ -4652,7 +4704,7 @@ describe('forgetPersonaPrompts — a teardown drops one persona\'s poller state 
     expect(getLivePermission(INSTANCE_B, TOKEN_B)).toBeUndefined()
     expect(getLivePermission(INSTANCE_B, TOKEN_C)).toBeUndefined()
     expect(logLines(s.logCalls, `${INSTANCE_B} names no applied persona (persona=${KEY_B})`)).toHaveLength(2)
-    expect(rowDecisions(s.trail, 'post_attempted').map((e) => [e['claude_instance_id'], e['request_token']])).toEqual([
+    expect(rowDecisions(s.trail, 'post_attempted').map((e) => [e['instance_id'], e['request_token']])).toEqual([
       [INSTANCE_A, TOKEN_A],
       [INSTANCE_B, TOKEN_B],
       [INSTANCE_A, TOKEN_C],
