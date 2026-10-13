@@ -9,7 +9,7 @@ allowed-tools: [Bash]
 
 The live, pre-deploy acceptance run of CSCB: every `testplans/b.yko` check that can
 be automated, against the **test workspace** only (never a production workspace),
-in a fresh container built from the `/ci` base (`cscb-ci-base:v6`), with the
+in a fresh container built from the `/ci` base (`cscb-ci-base:v7`), with the
 package under test installed the way a customer installs it. The production
 bots on this host are never touched: the container has its own HOME, config,
 tmux, agent-director store and port, runs on the default docker network (no
@@ -31,7 +31,7 @@ tmux, agent-director store and port, runs on the default docker network (no
 - Never `bun install` in `ci-live/` without `--ignore-scripts`.
 - Never run the agent-director binary given with `--agent-director-binary`
   (or any agent-director binary) on the host, and never install, copy or
-  upgrade one there (`~/.agent-director`, `~/.local/bin`, anything on
+  upgrade one there (`~/.config/agent-director`, `~/.local/bin`, anything on
   `PATH`, `node_modules`). The runner only reads the given binary and stages
   a copy in the live image build; its version is checked inside the build.
 - Never run `bun ci-live/run.ts apps --delete-strays` or
@@ -76,12 +76,12 @@ installed Google Chrome, headless; no browser download):
 ## Procedure
 
 1. Check docker (`docker info`) and the `/ci` base image (`docker image inspect
-   cscb-ci-base:v6`; if missing, run `/ci` once). Then fetch the binary both
+   cscb-ci-base:v7`; if missing, run `/ci` once). Then fetch the binary both
    runs below stage in the live image: the `agent-director-linux-amd64` asset
    of the agent-director release the base pins (`ARG AD_VERSION` in
    `docker/Dockerfile.test.base`), downloaded from agent-director's GitHub
    release into a fresh scratch directory outside the worktree (never
-   `~/.agent-director`, `~/.local/bin`, anything on `PATH` or
+   `~/.config/agent-director`, `~/.local/bin`, anything on `PATH` or
    `node_modules`) and checked against the base's pinned `ARG AD_SHA256`.
    The release's repository is read from that release's own `install.sh`
    (`RELEASE_REPO_SLUG`) in agent-director's source tree in
