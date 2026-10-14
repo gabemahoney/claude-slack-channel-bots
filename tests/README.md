@@ -3408,8 +3408,8 @@ only), `schedule-coverage`, `isolation-mounts`, `isolation-config`,
 - `FAIL: run deadline: <phase> still running at the <m> min deadline`, the
   phase being `build`, `shards` or `merge`, and m the deadline's minutes from
   the start, rounded to the nearest whole minute, halves up.
-- `FAIL: memory watchdog: pod working set <x> GiB reached the <y> GiB stop line (<ceiling source>; <per-shard detail>)`.
-  x is the pod working set at the sample that reached the stop line, and y
+- `FAIL: memory watchdog: pod non-reclaimable memory <x> GiB reached the <y> GiB stop line (<ceiling source>; <per-shard detail>; reclaimable page cache excluded)`.
+  x is the pod non-reclaimable memory at the sample that reached the stop line, and y
   is that stop line (the ceiling less 0.5 GiB), each to one decimal place.
   The ceiling source reads `85% of the <L> GiB pod limit` or
   `/ci-live's 40 GiB line, /ci-live run <PID> active`. When no active
