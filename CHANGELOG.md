@@ -6,6 +6,10 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+---
+
+## 0.16.0 (2026-10-14)
+
 ### Requires agent-director 0.12.0 (breaking)
 
 CSCB now pins its agent-director client to exactly `agent-director@0.12.0` and needs the agent-director CLI at 0.12.0 or later on the host. agent-director 0.12.0 renamed fields and flags without aliases, requires every spawn to name its agent, and moved its directory, so this release does not run on an earlier CLI, and an earlier CSCB does not run on 0.12.0.
