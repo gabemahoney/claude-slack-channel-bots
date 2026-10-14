@@ -5832,19 +5832,27 @@ describe('the re-check timer: its cadence, P\'s serializer turn and its stops (r
     expect([LATCH_RECHECK_INTERVAL_MS, PROBE_PANE_READ_LINES]).toEqual([120_000, 1])
   })
 
-  test('health_check_interval 0: no call before 120 s after the latch, then one status read every 120 s over four intervals', async () => {
-    const run = latchForRecheck(statusOnlyRow(), { state: rowStateOfReading('waiting') }, { healthCheckInterval: 0 })
+  // b.2nr: the test-only override block's latch_recheck_interval_ms reaches the rounds through `buildLatchRecheck`'s `intervalMs`.
+  // Regression: before the fix `buildLatchRecheck` ignored any interval, so the 45 s row saw 120 s rounds.
+  test.each<[string, number | undefined, number]>([
+    ['no interval handed: LATCH_RECHECK_INTERVAL_MS (120 s)', undefined, LATCH_RECHECK_INTERVAL_MS],
+    ['an interval handed to buildLatchRecheck (b.2nr): 45 s', 45_000, 45_000],
+  ])('health_check_interval 0, %s: no call before one interval after the latch, then one status read every interval over four intervals', async (_label, handed, intervalMs) => {
+    const run = latchForRecheck(statusOnlyRow(), { state: rowStateOfReading('waiting') }, { healthCheckInterval: 0, latchRecheckIntervalMs: handed })
     const { h, p } = run
+    const latchedAt = h.clock.now()
+    expect(h.latchRecheck.nextDueAt()).toBe(latchedAt + intervalMs)
     const from = h.timedCalls.length
-    await h.advance(LATCH_RECHECK_INTERVAL_MS - 1)
+    await h.advance(intervalMs - 1)
     expect(personaCallsFrom(h, p, from)).toEqual([])
     const rounds: Array<readonly [number, readonly string[]]> = []
     for (let n = 0; n < 4; n++) {
       const round = await recheckRound(h, p)
       rounds.push([round.at, round.verbs])
     }
-    expect(rounds).toEqual([1, 2, 3, 4].map((n) => [n * LATCH_RECHECK_INTERVAL_MS, ['status']]))
-    expectStillLatched(run, 4 * LATCH_RECHECK_INTERVAL_MS)
+    expect(rounds).toEqual([1, 2, 3, 4].map((n) => [latchedAt + n * intervalMs, ['status']]))
+    expect(h.latchRecheck.nextDueAt()).toBe(latchedAt + 5 * intervalMs)
+    expect([h.latch.record(p), h.episodeNotices.length]).toEqual([run.record, 1])
   })
 
   test('health_check_interval 30: a health tick every 30 s between the rounds reads P\'s liveness only and schedules nothing; the rounds still come every 120 s from the latch, over four intervals, each one status read', async () => {

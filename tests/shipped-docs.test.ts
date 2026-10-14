@@ -8538,13 +8538,15 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
     }
   })
 
-  test('Unreleased records both the worker-floor correction and existing-persona resume correction (b.9v8)', () => {
-    const unreleased = readFileSync(join(REPO_ROOT, 'CHANGELOG.md'), 'utf-8').split('## Unreleased')[1]?.split('\n## ')[0] ?? ''
+  // v0.16.1 shipped the b.9v8 corrections, so they sit in that release's entry (the Unreleased entry holds only what comes after it).
+  test('the 0.16.1 release notes record both the worker-floor correction and existing-persona resume correction (b.9v8)', () => {
+    const released = readFileSync(join(REPO_ROOT, 'CHANGELOG.md'), 'utf-8').split(/^## 0\.16\.1 \(/m)[1]?.split('\n## ')[0] ?? ''
+    expect(released).not.toBe('')
     for (const phrase of [`Workers need Claude Code ${MIN_CLAUDE_CODE_VERSION} or later`,
       'pre-persona hosts (0.10.x)', 'Hosts already running personas (0.11.0 or later)',
       'pre-start row and transcript checks', 'post-start `server.log` resume check',
       'resumes only the current session', 'no longer falls back to an older transcript when the current one is missing']) {
-      expect(unreleased).toContain(phrase)
+      expect(released).toContain(phrase)
     }
   })
 

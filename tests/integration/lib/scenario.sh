@@ -196,6 +196,16 @@
 #                                      fail unless exactly <want> server.log lines match
 #   wait_for_log <matcher> <timeout-s> [<step>]
 #   wait_for_count <matcher> <min> <timeout-s> [<step>]
+#   overrides_stem <line>              print the text of <line> (the printer's TEST TIMER OVERRIDES
+#                                      ACTIVE line, b.2nr) up to its colon, the match for that line
+#                                      of any override set; exit 1 (after failing) unless it starts
+#                                      with `[slack] `. Call it as `X="$(overrides_stem ...)" || exit 1`
+#   expect_one_overrides_line <step> <count-before> <wait-s>
+#                                      since <count-before> (`count_log` of OVERRIDES_STEM taken
+#                                      before the start), wait up to <wait-s> for, then require,
+#                                      exactly one server.log line matching OVERRIDES_STEM, ending
+#                                      with OVERRIDES_LINE (both set by the calling script from the
+#                                      printer): the server read the test_timer_overrides block
 #   wait_for_file <path> <timeout-s> [<step>]
 #   wait_until <timeout-s> <step> <command> [<arg>...]
 #
@@ -340,8 +350,8 @@
 #                                      named. Then a harness `status` read (`ad_capture`) must read
 #                                      `pending` with no launch_started_at, or it fails
 #
-#   agent-director's settings file (fmk mode; harness addition, scenario 24, test-26, and
-#   scenario 10; the image guard, then the HOME check, before any write)
+#   agent-director's settings file (fmk mode; harness addition, scenarios 10, 20 and 24
+#   (test-22, test-23, test-26); the image guard, then the HOME check, before any write)
 #   write_ad_settings [--pause <value>] [<key>=<value>...]
 #                                      replace the scenario HOME's agent-director settings file
 #                                      (HOME joined with the package's AD_SETTINGS_RELATIVE_PATH,
@@ -1686,6 +1696,30 @@ wait_for_count() {
     _scenario_check_timeout "${timeout_s}" "${step}"
     _scenario_poll_until "${timeout_s}" _scenario_log_count_at_least "${m}" "${min}" \
         || fail "${step} (not within ${timeout_s}s; found $(count_log "${m}"))"
+}
+
+# overrides_stem <line>: see the header.
+overrides_stem() {
+    local stem="${1%%:*}"
+    [[ -n "$1" && "${stem}" == "[slack] "* ]] \
+        || fail "setup: the printer's overrides line does not start with the [slack] prefix: '$1'"
+    printf '%s\n' "${stem}"
+}
+
+# expect_one_overrides_line <step> <count-before> <wait-s>: see the header.
+expect_one_overrides_line() {
+    local step="$1" before="$2" wait_s="$3" last
+    [[ -n "${OVERRIDES_STEM:-}" && -n "${OVERRIDES_LINE:-}" ]] \
+        || fail "${step}: OVERRIDES_STEM and OVERRIDES_LINE are not set"
+    wait_for_count "${OVERRIDES_STEM}" "$(( before + 1 ))" "${wait_s}" \
+        "${step}: no TEST TIMER OVERRIDES ACTIVE line (the server read no test_timer_overrides block)"
+    [[ "$(count_log "${OVERRIDES_STEM}")" == "$(( before + 1 ))" ]] \
+        || fail "${step}: $(( $(count_log "${OVERRIDES_STEM}") - before )) TEST TIMER OVERRIDES ACTIVE lines, not exactly one"
+    last="$(_scenario_scan lastline "${SLACK_STATE_DIR}/server.log" "${OVERRIDES_STEM}")"
+    [[ "${last}" == *"${OVERRIDES_LINE}" ]] || {
+        printf '  | got:  %s\n  | want: %s\n' "${last}" "${OVERRIDES_LINE}" >&2
+        fail "${step}: the TEST TIMER OVERRIDES ACTIVE line is not the printer's line for the set in force (a stale config.json.last-applied?)"
+    }
 }
 
 wait_for_file() {
@@ -3547,8 +3581,8 @@ end_session() {
 }
 
 # ---------------------------------------------------------------------------
-# agent-director's settings file (fmk mode; harness addition, scenario 24,
-# test-26, and scenario 10)
+# agent-director's settings file (fmk mode; harness addition, scenarios 10, 20
+# and 24 (test-22, test-23, test-26))
 # ---------------------------------------------------------------------------
 
 # The settings file's path relative to HOME, the `[tmux]` and `[pause]`

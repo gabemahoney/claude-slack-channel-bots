@@ -1593,6 +1593,12 @@ export interface RecoveryHarnessOptions {
    * default broke 84 tests in 8 files.
    */
   latchRecheck?: boolean
+  /**
+   * The latch re-check's interval, handed to `buildLatchRecheck` as `main()`
+   * hands it the test-only override block's `latch_recheck_interval_ms`
+   * (b.2nr); unset: `LATCH_RECHECK_INTERVAL_MS`, as production.
+   */
+  latchRecheckIntervalMs?: number
 }
 
 /** The stub client's agent-director verbs, by method name, whose calls the harness stamps with the harness clock. */
@@ -2480,6 +2486,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const latchRecheck = buildLatchRecheck({
     latch,
     clock: latchRecheckClock,
+    intervalMs: options.latchRecheckIntervalMs,
     serialize: latchRecheckSerialize,
     appliedConfig,
     log: (line) => console.error(line),

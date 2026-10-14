@@ -600,6 +600,7 @@ export function resetAdSettingsForTests(): void {
   unsubscribeTick?.()
   unsubscribeTick = undefined
   installedReader = undefined
+  launchBoundFloorMs = DIALOG_READY_TIMEOUT_MS
 }
 
 // ---------------------------------------------------------------------------
@@ -660,10 +661,12 @@ export function adAlertThresholdMs(values: AdSettingsInEffect): number {
  * B, CSCB's launch bound, in milliseconds: the later of
  * `DIALOG_READY_TIMEOUT_MS` and G plus {@link AD_LAUNCH_BOUND_GRACE_ADDEND_SECONDS}
  * (300 000 at the defaults; 360 000 with `pending_grace_seconds` 300), or
- * {@link AD_WAIT_NEVER_ENDS}.
+ * {@link AD_WAIT_NEVER_ENDS}. `floorMs` is B's floor ({@link DIALOG_READY_TIMEOUT_MS}
+ * by default; the test-only override block's `dialog_ready_timeout_ms`, b.2nr,
+ * through {@link adLaunchBoundMsInEffect}).
  */
-export function adLaunchBoundMs(values: AdSettingsInEffect): number {
-  const floor = BigInt(DIALOG_READY_TIMEOUT_MS)
+export function adLaunchBoundMs(values: AdSettingsInEffect, floorMs: number = DIALOG_READY_TIMEOUT_MS): number {
+  const floor = BigInt(floorMs)
   const fromGrace = graceMsExact(values) + AD_LAUNCH_BOUND_GRACE_ADDEND_SECONDS * MS_PER_SECOND
   return exactMs(fromGrace > floor ? fromGrace : floor)
 }
@@ -678,9 +681,26 @@ export function adAlertThresholdMsInEffect(): number {
   return adAlertThresholdMs(adSettingsInEffect())
 }
 
-/** B from the values in effect at the moment of the call ({@link adSettingsInEffect}). */
+/**
+ * B's floor in effect: {@link DIALOG_READY_TIMEOUT_MS} unless the test-only
+ * timer override block (b.2nr, `src/test-timer-overrides.ts`) set another at
+ * server start through {@link installLaunchBoundFloorMs}.
+ */
+let launchBoundFloorMs: number = DIALOG_READY_TIMEOUT_MS
+
+/**
+ * Set B's floor for the rest of the process (b.2nr, test-only): called once at
+ * server start by `installTestTimerOverrides`, only when the override block
+ * sets `dialog_ready_timeout_ms`. The exported {@link DIALOG_READY_TIMEOUT_MS}
+ * stays the default and is never changed.
+ */
+export function installLaunchBoundFloorMs(floorMs: number): void {
+  launchBoundFloorMs = floorMs
+}
+
+/** B from the values in effect at the moment of the call ({@link adSettingsInEffect}), over B's floor in effect. */
 export function adLaunchBoundMsInEffect(): number {
-  return adLaunchBoundMs(adSettingsInEffect())
+  return adLaunchBoundMs(adSettingsInEffect(), launchBoundFloorMs)
 }
 
 /**

@@ -2,7 +2,8 @@
 # Test 23 (HO §7 scenario 20; b.jg5 SRJ-1422, SRJ-505, SRJ-506, SRJ-507,
 # SRJ-714, SRJ-1004, SRJ-1005, SRJ-1019, SRJ-1020, SRJ-1401; AC 1, AC 8,
 # AC 43, AC 44): each latch case is
-# re-checked every 120 s with exactly its call.
+# re-checked every interval (45 s here, by a test-only override; 120 s in
+# production) with exactly its call.
 #
 # With `health_check_interval` 0, every latched persona's re-check, one
 # interval apart, makes one read of its row (`status`) and exactly the call
@@ -37,8 +38,15 @@
 # The fmk set-up (lib/scenario.sh, fmk mode: TEST_NAME carries `-fmk-`):
 # - its own HOME, agent-director store and tmux server under SCENARIO_ROOT;
 #   the release installed through its install.sh, behind the agent-director
-#   shim (agent-director-admin too); agent-director's default settings (no
-#   config.toml);
+#   shim (agent-director-admin too); agent-director's settings file holding
+#   only a `[tmux]` table with `starting_session_seconds` 60 and
+#   `stopping_window_seconds` 30 (its minimum; below), every other setting
+#   its default;
+# - the server's config.json carries the test-only `test_timer_overrides`
+#   block with `latch_recheck_interval_ms` 45000 (b.2nr: the production
+#   interval is 120 s). The server reads the block once, at each start,
+#   and logs one loud `[slack] TEST TIMER OVERRIDES ACTIVE` line, which the
+#   script requires, exactly once, after every start (start_live);
 # - the tmux shim first on every CSCB process's PATH, in `log` mode
 #   throughout;
 # - the stub as `claude`: `dev-channels` (no selection, the default) in every
@@ -214,8 +222,8 @@
 #     Round: `status` (`ended`), then a spawn with `--reuse-finished`.
 #     Clear: batched round; the session is ended by its id.
 #   ownid: "this row's own id", a refused `resume`.
-#     Set-up: live row, its session at least the starting-session bound old
-#     and its worker running; E39's scenario 10 part B statement
+#     Set-up: live row, its session older than both the starting-session
+#     bound and the stopping window and its worker running; E39's scenario 10 part B statement
 #     (ad_store_mark_finished, `missing`).
 #     Round: `status` (`missing`), then one `read-pane` with one line, which
 #     returns a pane.
@@ -298,12 +306,15 @@
 #      reads `waiting` (a harness `get`), on the session name the package
 #      gives its launches (`personaTmuxSessionName`), and the server registers
 #      each stub's MCP session.
-#   2. The age wait (p2_age_wait): until the own-id persona's session is at
-#      least the starting-session bound old (agent-director's default
-#      `[tmux] starting_session_seconds`, 300 s, printed from
-#      src/ad-settings.ts DEFAULT_AD_SETTINGS) plus AGE_MARGIN_S, read from
-#      tmux's session_created. Before that bound agent-director may answer
-#      "still starting" (UNAVAILABLE), which latches nothing.
+#   2. The age wait (p2_age_wait): until the own-id persona's session is older
+#      than the larger of the starting-session bound and the stopping window
+#      (the `[tmux]` `starting_session_seconds` 60 s and `stopping_window_seconds`
+#      30 s the script writes, each read back from the written table; agent-director's
+#      defaults are 300 s and 90 s) plus AGE_MARGIN_S, so 65 s, read from tmux's
+#      session_created. Before the starting-session bound agent-director may
+#      answer "still starting" (UNAVAILABLE), which latches nothing; the
+#      set-up statement (ad_store_mark_finished) refuses a session not older
+#      than the stopping window.
 #   3. A plain `stop` (no --stop-bots; p2_stop): the bots keep running and
 #      their rows stay live.
 #   4. The set-up stop (p2_setup), with the server stopped: the finished
@@ -389,7 +400,7 @@
 #          `read-pane` with `--n-lines 1` and no `--allow-pending`); as many
 #          rounds as still-latched round lines (`latchRecheckRoundLine`, at
 #          least MIN_LATCHED_ROUNDS); the first round's `status` at least one
-#          interval (LATCH_RECHECK_INTERVAL_MS) after the persona's last call
+#          interval (the overridden latch_recheck_interval_ms) after the persona's last call
 #          before the latch and within the interval plus SETTLE_S, each next
 #          one at least one interval after the previous and within the
 #          interval plus SETTLE_S, each round's call within SETTLE_S of its
@@ -494,11 +505,13 @@
 # (30) for the server to register the stub's MCP session; EXIT_WAIT_S (30)
 # for the stub's SessionEnd hooks and its session's end after the exit line;
 # NOTICE_WAIT_S (30) for a post after the line that causes it; AGE_MARGIN_S
-# (5) past the starting-session bound for the own-id persona's session;
+# (5) past the larger of the starting-session bound and the stopping window
+# for the own-id persona's session;
 # HOLD_S (10) that the pane-not-found persona's row keeps reading `waiting`
 # after its respawn (a SessionEnd hook runs within a second or two). The
-# re-check interval is fixtures/fmk-texts.ts's LATCH_RECHECK_INTERVAL_MS
-# (120 s). SETTLE_S (30) is the stated settle: a round's own calls (one
+# re-check interval is the block's `latch_recheck_interval_ms` (45 s),
+# printed by fixtures/fmk-texts.ts's effectiveTestTimer; it must stay above
+# SETTLE_S, which the setup checks. SETTLE_S (30) is the stated settle: a round's own calls (one
 # `status` and one call, each one agent-director process, a few seconds at
 # most), the timer's start after the previous round settled, and the shim's
 # process start. Each round line is waited for within n times the sum of the
@@ -517,14 +530,15 @@
 # within the loop's interval plus 60 of the loop's start; the note persona's
 # clearing round line within twice the sum of the interval and twice
 # SETTLE_S; the held-dialog persona's worker's end within EXIT_WAIT_S.
-# Expected runtime: about 33 minutes. Part 1 about 8.5 (its first life and
-# the note under 0.5, the held-dialog persona's rounds k and k+1 and the note
-# persona's clearing round about 6, the checks and the end under 2); Part 2
-# about 25 (the first life and the age wait about 5.5, the set-up stop under
-# 1, the latch life's rounds to the last clearing round about 11, one more
-# leg round, the retry round and the following round about 6, the checks,
-# and the wait for the unusable recorded name's next round at the end, up to
-# 2.5).
+# Expected runtime: about 18 minutes (an estimate from the 45 s interval and
+# the 65 s age wait: the 60 s bound and the 30 s stopping window). Part 1
+# about 5 (its first life and the note under 0.5, the held-dialog persona's
+# rounds k and k+1 and the note persona's clearing round about 2.5, the checks
+# and the end under 2); Part 2 about 13 (the first life and the age wait
+# about 2, the set-up stop under 1, the latch life's rounds to the last
+# clearing round about 4, one more leg round, the retry round and the
+# following round about 2.5, the checks, and the wait for the unusable
+# recorded name's next round at the end, up to 1.75).
 #
 # Matched values. CSCB's values come from fixtures/fmk-texts.ts, printed from
 # the installed package, never retyped:
@@ -532,7 +546,7 @@
 #   personaNoticePrefix and formatPersonaNotice (src/persona-notifier.ts);
 # - from src/conflict-latch.ts: the LATCH_CASE_*, REFUSED_OPERATION_* and
 #   RECHECK_STEP_* / RECHECK_CALL_* values the table names,
-#   LATCH_ROW_STATE_KIND_NO_ROW, LATCH_RECHECK_INTERVAL_MS,
+#   LATCH_ROW_STATE_KIND_NO_ROW,
 #   RECHECK_VERDICT_STILL_LATCHED, the CONFLICT_NOTICE_* lines,
 #   CONFLICT_RECOVERY_HEAD, UNUSABLE_NAME_NOTICE_HEAD, and the builders
 #   unusableNameNoticeText (with a placeholder description, split there into
@@ -550,8 +564,14 @@
 #   the answer kinds a probe round's line names;
 # - LATCHING_LIVENESS_NOTE (src/row-read-rules.ts), the note a harness `get`
 #   shows on Part 1's note persona's row;
-# - agent-director's default `[tmux] starting_session_seconds`
-#   (src/ad-settings.ts DEFAULT_AD_SETTINGS).
+# - from src/test-timer-overrides.ts (b.2nr): testTimerOverridesBlock (the
+#   config.json block written), buildTestTimerOverridesLine (the loud line
+#   each start must log, matched whole and, up to its colon, counted) and
+#   effectiveTestTimer (the interval in effect, which the round bounds use);
+# - from src/ad-settings.ts: AD_TMUX_KEYS and AD_SETTING_MINIMUMS (the keys
+#   written to agent-director's `[tmux]` table, starting_session_seconds and
+#   stopping_window_seconds, and their minimums); the starting-session bound
+#   and the stopping window themselves are read back from the written file.
 # Fragments with no exported value, each quoted from its source:
 # - `[slack] Session connected: persona <ref>` (src/server.ts, the MCP
 #   session's registration line);
@@ -622,6 +642,15 @@ NOTICE_WAIT_S=30
 SETTLE_S=30
 AGE_MARGIN_S=5
 HOLD_S=10
+
+# The test-only settings (b.2nr), scenario inputs; every value read back goes
+# through the printer in "Values from the installed package", none is retyped:
+# the latch re-check interval, in config.json's `test_timer_overrides` block
+# (ms; it must stay above SETTLE_S, which the setup checks), and the
+# starting-session bound, in agent-director's `[tmux]` table (seconds; the
+# stopping window beside it is written at its printed minimum).
+OVR_LATCH_RECHECK_MS=45000
+OVR_STARTING_SESSION_S=60
 
 # The still-latched rounds every latched persona shows before its clearing
 # round (SRJ-1422: at least two).
@@ -709,7 +738,8 @@ prepare_persona() {
 }
 
 # write_personas_config <key>...: the server's config.json, configuring the
-# given personas (in that order) with `health_check_interval` 0.
+# given personas (in that order) with `health_check_interval` 0 and the
+# `test_timer_overrides` block (TEST_TIMER_BLOCK, set in the values section).
 write_personas_config() {
     local key personas="[]"
     for key in "$@"; do
@@ -719,8 +749,10 @@ write_personas_config() {
                    channels: [{id: $ch, delivery: "all"}], permission_prompts: $ch}]' <<< "${personas}")" \
             || fail "config: jq could not add persona ${key}"
     done
-    jq -n --argjson p "${personas}" --argjson port "${SCENARIO_PORT}" \
-        '{personas: $p, bind: "127.0.0.1", port: $port, health_check_interval: 0, exit_timeout: 5}' \
+    [[ -n "${TEST_TIMER_BLOCK}" ]] || fail "config: no test_timer_overrides block (the values section sets it)"
+    jq -n --argjson p "${personas}" --argjson port "${SCENARIO_PORT}" --argjson overrides "${TEST_TIMER_BLOCK}" \
+        '{personas: $p, bind: "127.0.0.1", port: $port, health_check_interval: 0, exit_timeout: 5,
+          test_timer_overrides: $overrides}' \
         | write_config
 }
 
@@ -982,15 +1014,64 @@ hold_waiting() {
 # Values from the installed package
 # ---------------------------------------------------------------------------
 
-INTERVAL_MS="$(fmk_text LATCH_RECHECK_INTERVAL_MS)" || fail "setup: fmk-texts.ts could not print LATCH_RECHECK_INTERVAL_MS"
-[[ "${INTERVAL_MS}" =~ ^[1-9][0-9]*$ ]] || fail "setup: LATCH_RECHECK_INTERVAL_MS is '${INTERVAL_MS}'"
+# The test-only timer overrides' block and loud line (the printer's, from the
+# scenario input above): the latch re-check interval.
+OVR_PAIRS=("latch_recheck_interval_ms=${OVR_LATCH_RECHECK_MS}")
+TEST_TIMER_BLOCK="$(fmk_text testTimerOverridesBlock "${OVR_PAIRS[@]}")" || fail "setup: fmk-texts.ts could not print testTimerOverridesBlock ${OVR_PAIRS[*]}"
+[[ "${TEST_TIMER_BLOCK}" == '{'*'}' && "${TEST_TIMER_BLOCK}" != '{}' ]] \
+    || fail "setup: the printer gives no override block for ${OVR_PAIRS[*]}: '${TEST_TIMER_BLOCK}'"
+OVERRIDES_LINE="$(fmk_text buildTestTimerOverridesLine "${OVR_PAIRS[@]}")" || fail "setup: fmk-texts.ts could not print buildTestTimerOverridesLine ${OVR_PAIRS[*]}"
+# The line's text up to its colon: the match for the line of any set.
+OVERRIDES_STEM="$(overrides_stem "${OVERRIDES_LINE}")" || exit 1
+
+# The re-check interval in effect: the block's value, through the package's own
+# helper.
+INTERVAL_MS="$(fmk_text effectiveTestTimer latch_recheck_interval_ms "${OVR_PAIRS[@]}")" \
+    || fail "setup: fmk-texts.ts could not print effectiveTestTimer latch_recheck_interval_ms"
+[[ "${INTERVAL_MS}" =~ ^[1-9][0-9]*$ ]] || fail "setup: the latch re-check interval in effect is '${INTERVAL_MS}'"
 INTERVAL_US=$(( INTERVAL_MS * 1000 ))
 INTERVAL_S=$(( (INTERVAL_MS + 999) / 1000 ))
 (( INTERVAL_S > SETTLE_S )) || fail "setup: the ${SETTLE_S} s settle is not shorter than the ${INTERVAL_S} s re-check interval"
-BOUND_S="$(fmk_text DEFAULT_AD_SETTINGS tmux starting_session_seconds)" \
-    || fail "setup: fmk-texts.ts could not print DEFAULT_AD_SETTINGS tmux starting_session_seconds"
-[[ "${BOUND_S}" =~ ^[1-9][0-9]*$ ]] || fail "setup: the starting-session bound is '${BOUND_S}'"
-echo "${TEST_NAME}: re-check interval ${INTERVAL_MS} ms, settle ${SETTLE_S} s, starting-session bound ${BOUND_S} s"
+
+# The `[tmux]` table written to the scenario HOME's agent-director settings
+# file before any start (both keys among the package's AD_TMUX_KEYS): the
+# starting-session bound (the value at or above its minimum) and the stopping
+# window at its minimum. BOUND_S and STOPPING_S are read back from the written
+# table. The own-id persona's session must be older than both before the
+# set-up statement (ad_store_mark_finished refuses unless the session is
+# older than the stopping window; agent-director answers "still starting"
+# before the starting-session bound), so the age wait is for
+# max(BOUND_S, STOPPING_S) plus AGE_MARGIN_S. No CSCB or harness call of this
+# script meets a stopping row, so the window bears on nothing else here.
+TMUX_KEYS_TEXT="$(fmk_text AD_TMUX_KEYS)" || fail "setup: fmk-texts.ts could not print AD_TMUX_KEYS"
+read -r -a TMUX_KEYS <<< "${TMUX_KEYS_TEXT}"
+KEY_STARTING=starting_session_seconds
+KEY_STOPPING=stopping_window_seconds
+for want_key in "${KEY_STARTING}" "${KEY_STOPPING}"; do
+    found=0
+    for key in "${TMUX_KEYS[@]}"; do
+        [[ "${key}" == "${want_key}" ]] && found=1
+    done
+    (( found )) || fail "setup: ${want_key} is not one of the package's AD_TMUX_KEYS (${TMUX_KEYS_TEXT})"
+done
+MIN_STARTING="$(fmk_text AD_SETTING_MINIMUMS "${KEY_STARTING}")" || fail "setup: fmk-texts.ts could not print AD_SETTING_MINIMUMS ${KEY_STARTING}"
+MIN_STOPPING="$(fmk_text AD_SETTING_MINIMUMS "${KEY_STOPPING}")" || fail "setup: fmk-texts.ts could not print AD_SETTING_MINIMUMS ${KEY_STOPPING}"
+[[ "${MIN_STARTING}" =~ ^[1-9][0-9]*$ ]] || fail "setup: the minimum of ${KEY_STARTING} is '${MIN_STARTING}'"
+[[ "${MIN_STOPPING}" =~ ^[1-9][0-9]*$ ]] || fail "setup: the minimum of ${KEY_STOPPING} is '${MIN_STOPPING}'"
+(( OVR_STARTING_SESSION_S >= MIN_STARTING )) \
+    || fail "setup: ${KEY_STARTING} ${OVR_STARTING_SESSION_S} is below its minimum ${MIN_STARTING}"
+AD_SETTINGS_FILE=""
+write_ad_settings "${KEY_STARTING}=${OVR_STARTING_SESSION_S}" "${KEY_STOPPING}=${MIN_STOPPING}"
+BOUND_S="$(sed -n "s/^${KEY_STARTING} = \([0-9][0-9]*\)\$/\1/p" "${AD_SETTINGS_FILE}")" \
+    || fail "setup: could not read ${KEY_STARTING} back from ${AD_SETTINGS_FILE}"
+STOPPING_S="$(sed -n "s/^${KEY_STOPPING} = \([0-9][0-9]*\)\$/\1/p" "${AD_SETTINGS_FILE}")" \
+    || fail "setup: could not read ${KEY_STOPPING} back from ${AD_SETTINGS_FILE}"
+[[ "${BOUND_S}" =~ ^[1-9][0-9]*$ ]] || fail "setup: the starting-session bound read back from ${AD_SETTINGS_FILE} is '${BOUND_S}'"
+[[ "${STOPPING_S}" =~ ^[1-9][0-9]*$ ]] || fail "setup: the stopping window read back from ${AD_SETTINGS_FILE} is '${STOPPING_S}'"
+# The age the own-id persona's session must pass: the larger of the two.
+AGE_BASE_S="${BOUND_S}"
+(( STOPPING_S <= AGE_BASE_S )) || AGE_BASE_S="${STOPPING_S}"
+echo "${TEST_NAME}: re-check interval ${INTERVAL_MS} ms, settle ${SETTLE_S} s, starting-session bound ${BOUND_S} s, stopping window ${STOPPING_S} s"
 
 # fmk_value <entry> [<arg>...]: print fixtures/fmk-texts.ts's value, failing
 # the scenario when the printer fails or prints nothing.
@@ -999,6 +1080,15 @@ fmk_value() {
     v="$(fmk_text "$@")" || fail "setup: fmk-texts.ts could not print $*"
     [[ -n "${v}" ]] || fail "setup: fmk-texts.ts printed an empty $*"
     printf '%s' "${v}"
+}
+
+# start_live <step>: start the server (live) and require its one loud TEST
+# TIMER OVERRIDES ACTIVE line.
+start_live() {
+    local step="$1" before
+    before="$(count_log "${OVERRIDES_STEM}")"
+    start_server --live
+    expect_one_overrides_line "${step}: startup" "${before}" "${START_WAIT_S}"
 }
 
 CASE_NO_VALID_ID="$(fmk_value LATCH_CASE_NO_VALID_ID)"
@@ -1330,7 +1420,7 @@ p1_life1() {
     # answered dialog when the restart path's reconnect reads it.
     stub_mode "${PERSONA_WORK[${key}]}" "${STUB_MODE_AT_ONCE}"
     write_personas_config "${key}"
-    start_server --live
+    start_live "${step}"
     wait_for_count "$(completion_match 1)" 1 "${START_WAIT_S}" "${step}: the start pass never completed"
     expect_completion 1 "${step}" "0 not brought up"
     wait_row "${step}: ${key}'s report-in" "${REPORT_WAIT_S}" "${id}" waiting
@@ -1525,7 +1615,7 @@ p1_latch_life() {
     new_state_dir p1-latch-life
     write_personas_config "${P1_KEYS[@]}"
     LATCH_LIFE_MARK="$(ad_shim_mark)"
-    start_server --live
+    start_live "${step}"
     LATCH_PID="${SERVER_PID}"
     wait_latch_set "${CN_KEY}" "${step}"
     # [harness] Right after the approver's first read-pane of the held
@@ -1859,7 +1949,7 @@ p2_life1() {
     new_state_dir p2-life1
     write_personas_config "${P1_KEYS[@]}" "${P2_LIFE1_KEYS[@]}"
     n=$(( ${#P1_KEYS[@]} + ${#P2_LIFE1_KEYS[@]} ))
-    start_server --live
+    start_live "${step}"
     wait_for_count "$(completion_match "${n}")" 1 "${START_WAIT_S}" "${step}: the start pass never completed"
     expect_completion "${n}" "${step}" "0 not brought up"
     for key in "${P2_LIFE1_KEYS[@]}"; do
@@ -1884,7 +1974,7 @@ p2_age_wait() {
     created="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${session}:" '#{session_created}')" \
         || fail "${step}: tmux gives no creation time for ${session}"
     [[ "${created}" =~ ^[0-9]+$ ]] || fail "${step}: tmux gave session_created '${created}' for ${session}"
-    want=$(( BOUND_S + AGE_MARGIN_S ))
+    want=$(( AGE_BASE_S + AGE_MARGIN_S ))
     age=$(( $(date +%s) - created ))
     # The wait's bound, at least 0 (a session already old enough is checked
     # once).
@@ -1958,7 +2048,7 @@ p2_no_row() {
 # live row, its worker running and its session past the bound.
 p2_setup_own_id() {
     local step="part 2: set-up: ${OI_KEY}'s row marked finished" id="${PERSONA_ID[${OI_KEY}]}" session="${PERSONA_NAMED[${OI_KEY}]}" ended
-    session_older_than "${session}" "${BOUND_S}" || fail "${step}: ${session} is not more than ${BOUND_S} s old"
+    session_older_than "${session}" "${AGE_BASE_S}" || fail "${step}: ${session} is not more than ${AGE_BASE_S} s old"
     ended="$(ad_store_mark_finished "${id}" missing)" || exit 1
     has_session "${session}" || fail "${step}: ${session} is gone"
     row_reads "${step}" "${id}" missing || fail "${step}: ${id} reads '${ROW_STATE}' after the statement, not missing"
@@ -2334,7 +2424,7 @@ p2_latch_life() {
     n=$(( ${#P1_KEYS[@]} + ${#P2_KEYS[@]} ))
     LATCH_LIFE_MARK="$(ad_shim_mark)"
     LATCH_LIFE_TMUX_MARK="$(tmux_shim_mark)"
-    start_server --live
+    start_live "${step}"
     LATCH_PID="${SERVER_PID}"
     wait_for_count "$(completion_match "${n}")" 1 "${START_WAIT_S}" "${step}: the start pass never completed"
     echo "${TEST_NAME}: ${step}: $(_scenario_scan lastline "${SLACK_STATE_DIR}/server.log" "$(completion_match "${n}")" | sed 's/^.*\] //')"

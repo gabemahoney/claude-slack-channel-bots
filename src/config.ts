@@ -105,6 +105,34 @@ export const MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS = 1000
 export const MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS = 3_600_000
 
 /**
+ * The top-level key of the test-only timer override block (b.2nr). It is not
+ * one of `PERSONA_TOP_LEVEL_KEYS` (it is an undocumented test hook, off by
+ * default), but the loader accepts it. See `src/test-timer-overrides.ts`.
+ */
+export const TEST_TIMER_OVERRIDES_KEY = 'test_timer_overrides'
+
+/** The keys of the test-only timer override block (b.2nr), each optional; milliseconds when the name ends `_ms`, seconds when it ends `_s`. */
+export const TEST_TIMER_OVERRIDE_KEYS = [
+  'latch_recheck_interval_ms',
+  'ad_version_recheck_interval_ms',
+  'dialog_ready_timeout_ms',
+  'unavailable_retry_base_s',
+  'unavailable_retry_ceiling_s',
+] as const
+
+/** A key of the test-only timer override block. */
+export type TestTimerOverrideKey = (typeof TEST_TIMER_OVERRIDE_KEYS)[number]
+
+/** The test-only timer override block as written and as validated: every key optional. */
+export type TestTimerOverrides = { [K in TestTimerOverrideKey]?: number }
+
+/** Inclusive upper bound on a test timer override given in milliseconds (one hour). */
+export const MAX_TEST_TIMER_OVERRIDE_MS = 3_600_000
+
+/** Inclusive upper bound on a test timer override given in seconds (one hour). */
+export const MAX_TEST_TIMER_OVERRIDE_S = 3600
+
+/**
  * The top-level keys of the pre-persona shape that the loader rejects with
  * the conversion message before any other check (b.av2 SR-1.7), in the order
  * they are looked for.
@@ -404,6 +432,12 @@ export interface ServerSettings {
    * mode); absent and `false` resolve alike. Read through `channelModeOf`.
    */
   allow_invited_channels: boolean
+  /**
+   * Test-only timer overrides (b.2nr): present only when the file has the
+   * block. Read once at server start (`installTestTimerOverrides`); a
+   * reload never applies a change of it live.
+   */
+  test_timer_overrides?: TestTimerOverrides
 }
 
 // ---------------------------------------------------------------------------
@@ -592,6 +626,11 @@ export function channelModeOf(config: Pick<ServerSettings, 'allow_invited_channe
 // Pure functions
 // ---------------------------------------------------------------------------
 
+/** The raw test-only timer override block of a parsed input (b.2nr), unvalidated; typed as validated because `validateTestTimerOverrides` runs before any use. */
+function testTimerOverridesOf(input: ServerSettingsInput): TestTimerOverrides | undefined {
+  return (input as { test_timer_overrides?: TestTimerOverrides }).test_timer_overrides
+}
+
 /**
  * Fill in the defaults of the server-wide settings (b.av2 SR-1.6). Paths are returned as given (defaults unexpanded, except
  * the cron paths, which are absolute: the crontable's is `cronTableDefault`,
@@ -627,6 +666,10 @@ function applyServerDefaults(input: ServerSettingsInput, configDir: string, cron
     // Only an absent switch takes the default: any other value, `null`
     // included, is kept so the switch's boolean rule rejects it.
     allow_invited_channels: input.allow_invited_channels === undefined ? false : input.allow_invited_channels,
+    // b.2nr: present only when the file has the block (any value, `null`
+    // included, is kept so its rule rejects it). Not a documented key, so it
+    // is not in `ServerSettingsInput`.
+    ...(testTimerOverridesOf(input) === undefined ? {} : { test_timer_overrides: testTimerOverridesOf(input) }),
   }
 }
 
@@ -951,6 +994,36 @@ function checkPositiveIntegerInRange(value: unknown, key: string, min: number, m
 }
 
 /**
+ * The test-only timer override block (b.2nr): absent, or an object whose
+ * keys are among `TEST_TIMER_OVERRIDE_KEYS`, each a positive integer (at most
+ * an hour: `MAX_TEST_TIMER_OVERRIDE_MS`, `MAX_TEST_TIMER_OVERRIDE_S`). The two
+ * retry values are given together, the ceiling not below the base. Messages
+ * name the key and the rule, never the value.
+ */
+function validateTestTimerOverrides(value: unknown, style: RuleStyle): void {
+  if (value === undefined) return
+  const where = TEST_TIMER_OVERRIDES_KEY
+  if (!isJsonObject(value)) throw ruleError(style, `${where} must be an object when set, got ${jsonTypeName(value)}.`)
+  const allowed: readonly string[] = TEST_TIMER_OVERRIDE_KEYS
+  const unknown = Object.keys(value).filter((key) => !allowed.includes(key))
+  if (unknown.length > 0) {
+    throw ruleError(style, `unknown field(s) in ${where}: ${describeUnknownKeys(unknown)} (known: ${allowed.join(', ')}).`)
+  }
+  for (const key of TEST_TIMER_OVERRIDE_KEYS) {
+    const max = key.endsWith('_ms') ? MAX_TEST_TIMER_OVERRIDE_MS : MAX_TEST_TIMER_OVERRIDE_S
+    if (value[key] !== undefined) checkPositiveIntegerInRange(value[key], `${where}.${key}`, 1, max, style)
+  }
+  const base = value['unavailable_retry_base_s']
+  const ceiling = value['unavailable_retry_ceiling_s']
+  if ((base === undefined) !== (ceiling === undefined)) {
+    throw ruleError(style, `${where}.unavailable_retry_base_s and ${where}.unavailable_retry_ceiling_s must be set together.`)
+  }
+  if (typeof base === 'number' && typeof ceiling === 'number' && ceiling < base) {
+    throw ruleError(style, `${where}.unavailable_retry_ceiling_s must not be below ${where}.unavailable_retry_base_s.`)
+  }
+}
+
+/**
  * The server-wide rules that come last: the SR-4.1 poll interval range
  * [200, 3_600_000], the b.jg5 SRJ-213 call timeout range [1000, 3_600_000]
  * and the b.he5 PD-5 cron settings (absent `cron_log_max_bytes` disables
@@ -1073,7 +1146,7 @@ export function describeUnknownKeys(keys: readonly string[]): string {
 // ---------------------------------------------------------------------------
 
 /** Lookup form of PERSONA_TOP_LEVEL_KEYS. */
-const PERSONA_TOP_LEVEL_KEY_SET: ReadonlySet<string> = new Set(PERSONA_TOP_LEVEL_KEYS)
+const PERSONA_TOP_LEVEL_KEY_SET: ReadonlySet<string> = new Set([...PERSONA_TOP_LEVEL_KEYS, TEST_TIMER_OVERRIDES_KEY])
 
 /**
  * Top-level path settings that today's resolution expands without a type
@@ -1143,6 +1216,7 @@ function validatePersonaServerSettings(settings: PersonaServerSettings): void {
   checkOptionalPositiveInteger(settings.reply_chunk_limit, 'reply_chunk_limit', style)
   checkAllowedValue(settings.reply_chunk_mode, 'reply_chunk_mode', REPLY_CHUNK_MODES, style)
   checkBoolean(settings.allow_invited_channels, 'allow_invited_channels', style)
+  validateTestTimerOverrides(settings.test_timer_overrides, style)
 }
 
 // ---------------------------------------------------------------------------

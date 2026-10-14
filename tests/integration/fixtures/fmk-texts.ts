@@ -126,7 +126,34 @@
  *                                                the arguments: the [tmux] values
  *                                                DEFAULT_AD_SETTINGS' own but for each given
  *                                                <key>, and DEFAULT_AD_SETTINGS_IN_EFFECT's
- *                                                pauseTimeout
+ *                                                pauseTimeout. adLaunchBoundMs also takes
+ *                                                dialog_ready_timeout_ms=<integer> (b.2nr: B's
+ *                                                floor in milliseconds, as the test-only
+ *                                                override sets it; no other override key), the
+ *                                                floor otherwise DIALOG_READY_TIMEOUT_MS
+ *   testTimerOverridesBlock [<key>=<integer>…]   src/config.ts TEST_TIMER_OVERRIDE_KEYS (b.2nr): the
+ *                                                `test_timer_overrides` JSON object of
+ *                                                config.json for the given override values,
+ *                                                compact, keys in the package's order; each <key>
+ *                                                one of latch_recheck_interval_ms,
+ *                                                ad_version_recheck_interval_ms,
+ *                                                dialog_ready_timeout_ms (milliseconds),
+ *                                                unavailable_retry_base_s,
+ *                                                unavailable_retry_ceiling_s (seconds), each
+ *                                                <integer> a positive integer within the
+ *                                                server's own bound (an unknown or repeated key,
+ *                                                a value out of range, only one of the two retry
+ *                                                keys, or a ceiling below the base is a usage
+ *                                                failure, as the server's loader would refuse
+ *                                                it). `{}` for none
+ *   buildTestTimerOverridesLine [<key>=<integer>…]
+ *                                                src/test-timer-overrides.ts: the loud line the
+ *                                                server writes at start naming every overridden
+ *                                                value; the empty text for no override
+ *   effectiveTestTimer <key> [<key>=<integer>…]  src/test-timer-overrides.ts: the value of timer
+ *                                                <key> (an override key, as above) in effect for
+ *                                                the given overrides, in decimal: the override,
+ *                                                else the production default
  *   wholeMinutes <ms>                            src/ad-settings.ts: <ms> in whole minutes,
  *                                                rounded down, in decimal
  *   STILL_STOPPING_PHRASE                        src/ad-description-phrases.ts
@@ -464,11 +491,14 @@
  *                                                timer's first wait, which each later wait doubles
  *   UNAVAILABLE_RETRY_CEILING_S                  src/unavailable-retry.ts, the retry timer's
  *                                                longest wait, in seconds, in decimal
- *   unavailableRetryDueS <retry>                 when the retry timer's retry <retry> (from 1)
+ *   unavailableRetryDueS <retry> [unavailable_retry_base_s=<integer> unavailable_retry_ceiling_s=<integer>]
+ *                                                when the retry timer's retry <retry> (from 1)
  *                                                falls due after its arm, in seconds, in
  *                                                decimal: the sum of src/backoff.ts
- *                                                doublingBackoffDelay(UNAVAILABLE_RETRY_BASE_S,
- *                                                <k>, UNAVAILABLE_RETRY_CEILING_S) for <k> from 0
+ *                                                doublingBackoffDelay(base, <k>, ceiling), the
+ *                                                base and ceiling UNAVAILABLE_RETRY_BASE_S and
+ *                                                UNAVAILABLE_RETRY_CEILING_S or, given together
+ *                                                (b.2nr), the two override values, for <k> from 0
  *                                                to <retry> - 1, the waits src/unavailable-retry.ts
  *                                                arms (each re-arm is measured from the end of the
  *                                                run before it, so the real due time is no earlier)
@@ -1948,25 +1978,31 @@ const unresponsiveAlert: Entry = {
 
 /**
  * When the retry timer's retry <retry> (from 1) falls due after its arm, in
- * seconds: `doublingBackoffDelay(UNAVAILABLE_RETRY_BASE_S, k,
- * UNAVAILABLE_RETRY_CEILING_S)` summed for k from 0 to <retry> - 1, the waits
- * src/unavailable-retry.ts arms (its first at the base, each later one after
- * k refusals).
+ * seconds: `doublingBackoffDelay(base, k, ceiling)` summed for k from 0 to
+ * <retry> - 1, the waits src/unavailable-retry.ts arms (its first at the base,
+ * each later one after k refusals). The base and ceiling are
+ * `UNAVAILABLE_RETRY_BASE_S` and `UNAVAILABLE_RETRY_CEILING_S`, or, when the
+ * `unavailable_retry_base_s=<integer>` and `unavailable_retry_ceiling_s=<integer>`
+ * arguments are given (together, as the server's loader requires: b.2nr), those.
  */
 const unavailableRetryDue: Entry = {
-  synopsis: '<retry>',
+  synopsis: '<retry> [unavailable_retry_base_s=<integer> unavailable_retry_ceiling_s=<integer>]',
   async print(args, context) {
     const entry = 'unavailableRetryDueS'
-    expectArguments(entry, args, ['retry'])
-    if (!/^[1-9][0-9]{0,2}$/.test(args[0])) usageFail(`${entry}: <retry> must be a whole number from 1 to 999 (got '${args[0]}')`)
-    const base = await packageExport(context, 'unavailable-retry.ts', 'UNAVAILABLE_RETRY_BASE_S')
-    const ceiling = await packageExport(context, 'unavailable-retry.ts', 'UNAVAILABLE_RETRY_CEILING_S')
+    const [retry, ...pairs] = args
+    if (retry === undefined || !/^[1-9][0-9]{0,2}$/.test(retry)) usageFail(`${entry}: <retry> must be a whole number from 1 to 999 (got '${retry ?? ''}')`)
+    for (const pair of pairs) {
+      if (!/^unavailable_retry_(base|ceiling)_s=/.test(pair)) usageFail(`${entry}: '${pair}' is not unavailable_retry_base_s=<integer> or unavailable_retry_ceiling_s=<integer>`)
+    }
+    const block = await overrideBlockFrom(entry, pairs, context)
+    const base = block['unavailable_retry_base_s'] ?? (await packageExport(context, 'unavailable-retry.ts', 'UNAVAILABLE_RETRY_BASE_S'))
+    const ceiling = block['unavailable_retry_ceiling_s'] ?? (await packageExport(context, 'unavailable-retry.ts', 'UNAVAILABLE_RETRY_CEILING_S'))
     if (typeof base !== 'number' || typeof ceiling !== 'number') {
       fail(PRINTER_FAIL_EXIT, "the installed package's src/unavailable-retry.ts UNAVAILABLE_RETRY_BASE_S or UNAVAILABLE_RETRY_CEILING_S is not a number")
     }
     const delay = await packageFunction<(base: number, priorAttempts: number, ceiling: number) => unknown>(context, 'backoff.ts', 'doublingBackoffDelay')
     let due = 0
-    for (let k = 0; k < Number(args[0]); k++) {
+    for (let k = 0; k < Number(retry); k++) {
       const wait = delay(base, k, ceiling)
       if (typeof wait !== 'number' || !Number.isFinite(wait)) fail(PRINTER_FAIL_EXIT, `${entry}: doublingBackoffDelay gave ${String(wait)}, not a finite number`)
       due += wait
@@ -2083,6 +2119,119 @@ function derivedWaitEntry(name: string): Entry {
       return decimal(name, derive(values))
     },
   }
+}
+
+// ---------------------------------------------------------------------------
+// The test-only timer override block's entries (b.2nr)
+// ---------------------------------------------------------------------------
+
+/** The package's `TEST_TIMER_OVERRIDE_KEYS` (src/config.ts): the override block's keys. */
+async function packageOverrideKeys(context: EntryContext): Promise<readonly string[]> {
+  const keys = await packageExport(context, 'config.ts', 'TEST_TIMER_OVERRIDE_KEYS')
+  if (!Array.isArray(keys) || keys.some((k) => typeof k !== 'string' || !/^[a-z_]+$/.test(k))) {
+    fail(PRINTER_FAIL_EXIT, "the installed package's src/config.ts export TEST_TIMER_OVERRIDE_KEYS is not an array of key names")
+  }
+  return keys as string[]
+}
+
+/** The package's inclusive upper bound for an override key: `MAX_TEST_TIMER_OVERRIDE_MS` for a `_ms` key, `MAX_TEST_TIMER_OVERRIDE_S` for a `_s` key. */
+async function packageOverrideMax(context: EntryContext, key: string): Promise<number> {
+  const inMs = key.endsWith('_ms')
+  const max = inMs ? await packageExport(context, 'config.ts', 'MAX_TEST_TIMER_OVERRIDE_MS') : await packageExport(context, 'config.ts', 'MAX_TEST_TIMER_OVERRIDE_S')
+  if (typeof max !== 'number' || !Number.isSafeInteger(max)) {
+    fail(PRINTER_FAIL_EXIT, `the installed package's src/config.ts export ${inMs ? 'MAX_TEST_TIMER_OVERRIDE_MS' : 'MAX_TEST_TIMER_OVERRIDE_S'} is not a whole number`)
+  }
+  return max
+}
+
+/**
+ * The override block for the `<key>=<integer>` arguments: each `<key>` one of
+ * the package's `TEST_TIMER_OVERRIDE_KEYS`, given once, each `<integer>` a
+ * positive integer within the key's bound (the loader's own rule, so the
+ * printer refuses what the server would). An unknown key, a repeat, a value
+ * out of range, only one of the two retry keys, or a retry ceiling below the
+ * retry base is a usage failure.
+ */
+async function overrideBlockFrom(entry: string, pairs: readonly string[], context: EntryContext): Promise<Record<string, number>> {
+  const keys = await packageOverrideKeys(context)
+  const block: Record<string, number> = {}
+  for (const pair of pairs) {
+    const eq = pair.indexOf('=')
+    const key = eq < 0 ? pair : pair.slice(0, eq)
+    if (eq < 0 || !keys.includes(key)) usageFail(`${entry}: '${pair}' is not <key>=<integer> for a test timer override key (${keys.join(', ')})`)
+    if (Object.hasOwn(block, key)) usageFail(`${entry}: ${key} is given twice`)
+    const value = integerArgument(entry, key, pair.slice(eq + 1))
+    const max = await packageOverrideMax(context, key)
+    if (value < 1n || value > BigInt(max)) usageFail(`${entry}: ${key} must be a positive integer in [1, ${max}]`)
+    block[key] = Number(value)
+  }
+  const base = block['unavailable_retry_base_s']
+  const ceiling = block['unavailable_retry_ceiling_s']
+  if ((base === undefined) !== (ceiling === undefined)) usageFail(`${entry}: unavailable_retry_base_s and unavailable_retry_ceiling_s must be given together`)
+  if (base !== undefined && ceiling !== undefined && ceiling < base) usageFail(`${entry}: unavailable_retry_ceiling_s must not be below unavailable_retry_base_s`)
+  return block
+}
+
+/** `testTimerOverridesBlock [<key>=<integer>…]`: the `test_timer_overrides` JSON object for the arguments, compact, keys in the package's order. */
+const testTimerOverridesBlock: Entry = {
+  synopsis: '[<key>=<integer>…]',
+  async print(args, context) {
+    const entry = 'testTimerOverridesBlock'
+    const block = await overrideBlockFrom(entry, args, context)
+    const ordered: Record<string, number> = {}
+    for (const key of await packageOverrideKeys(context)) if (Object.hasOwn(block, key)) ordered[key] = block[key]!
+    return JSON.stringify(ordered)
+  },
+}
+
+/** `buildTestTimerOverridesLine(<the block for the arguments>)`: the loud line the server writes at start; the empty text for no override. */
+const testTimerOverridesLine: Entry = {
+  synopsis: '[<key>=<integer>…]',
+  async print(args, context) {
+    const entry = 'buildTestTimerOverridesLine'
+    const block = await overrideBlockFrom(entry, args, context)
+    const build = await packageFunction<(overrides: object) => unknown>(context, 'test-timer-overrides.ts', entry)
+    const line = build(block)
+    return line === undefined ? '' : builtString(entry, line)
+  },
+}
+
+/** `effectiveTestTimer(<key>, <the block for the other arguments>)` in decimal: the timer's value in effect, the override or the production default. */
+const effectiveTestTimerEntry: Entry = {
+  synopsis: '<key> [<key>=<integer>…]',
+  async print(args, context) {
+    const entry = 'effectiveTestTimer'
+    const [key, ...pairs] = args
+    const keys = await packageOverrideKeys(context)
+    if (key === undefined || !keys.includes(key)) usageFail(`${entry} takes <key> [<key>=<integer>…], <key> one of ${keys.join(', ')}`)
+    const block = await overrideBlockFrom(entry, pairs, context)
+    const effective = await packageFunction<(key: string, overrides: object) => unknown>(context, 'test-timer-overrides.ts', entry)
+    return decimal(entry, effective(key, block))
+  },
+}
+
+/**
+ * `adLaunchBoundMs(<the values in effect>[, <B's floor in effect>])` in
+ * decimal: B. The arguments are `<key>=<integer>` for both kinds of key: a
+ * `[tmux]` key sets G's input, `dialog_ready_timeout_ms` (b.2nr: the test-only
+ * override of B's floor, milliseconds, within the server's bound) sets B's
+ * floor; with no `dialog_ready_timeout_ms` the function's own floor
+ * (`DIALOG_READY_TIMEOUT_MS`) applies. Any other override key does not bear on
+ * B and is a usage failure here.
+ */
+const adLaunchBoundEntry: Entry = {
+  synopsis: '[<tmux-key>=<integer>|dialog_ready_timeout_ms=<integer>…]',
+  async print(args, context) {
+    const entry = 'adLaunchBoundMs'
+    const floorKey = 'dialog_ready_timeout_ms'
+    const floorPairs = args.filter((a) => a.startsWith(`${floorKey}=`))
+    const tmuxPairs = args.filter((a) => !a.startsWith(`${floorKey}=`))
+    const block = await overrideBlockFrom(entry, floorPairs, context)
+    const values = await settingsInEffectFrom(entry, tmuxPairs, context)
+    const bound = await packageFunction<(values: object, floorMs?: number) => unknown>(context, 'ad-settings.ts', entry)
+    const floorMs = block[floorKey]
+    return decimal(entry, floorMs === undefined ? bound(values) : bound(values, floorMs))
+  },
 }
 
 /** `buildAdSettingsValuesLine(<path>, <the [tmux] values for the <key>=<integer> arguments>)`: the server's values line. */
@@ -3963,7 +4112,10 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   personaTmuxSessionName,
   LATCH_ROW_STATE_KIND_NO_ROW: constantEntry('conflict-latch.ts', 'LATCH_ROW_STATE_KIND_NO_ROW'),
   adGraceMs: derivedWaitEntry('adGraceMs'),
-  adLaunchBoundMs: derivedWaitEntry('adLaunchBoundMs'),
+  adLaunchBoundMs: adLaunchBoundEntry,
+  testTimerOverridesBlock,
+  buildTestTimerOverridesLine: testTimerOverridesLine,
+  effectiveTestTimer: effectiveTestTimerEntry,
   // Scenario 25 (test-27-fmk-unusable-name.sh).
   AD_ERROR_CLASS_UNUSABLE_NAME: constantEntry('ad-error-class.ts', 'AD_ERROR_CLASS_UNUSABLE_NAME'),
   // Scenario 20 (test-23-fmk-latch-recheck.sh); its DEFAULT_AD_SETTINGS and

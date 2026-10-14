@@ -75,6 +75,7 @@ import {
   DEFAULT_AD_SETTINGS_IN_EFFECT,
   DIALOG_READY_TIMEOUT_MS,
   installAdSettings,
+  installLaunchBoundFloorMs,
   pendingGraceMinimumSeconds,
   productionAdSettingsHome,
   resetAdSettingsForTests,
@@ -2041,5 +2042,42 @@ describe('0.12 settings require an absolute HOME', () => {
     expect(reads).toBe(0)
     expect(lines).toHaveLength(1)
     assertNoLeak(lines)
+  })
+})
+
+// b.2nr: B's floor is DIALOG_READY_TIMEOUT_MS unless the test-only timer override block set another at server start.
+// Regression: before the fix B was never below 300 s, so a floor of 120 s changed nothing.
+describe('B\'s floor (b.2nr: the test-only dialog_ready_timeout_ms override)', () => {
+  const FLOOR_MS = 120_000
+  const G30 = inEffect(tmuxWith({ pending_grace_seconds: 30n }))
+
+  test('adLaunchBoundMs takes the floor as an optional second argument, DIALOG_READY_TIMEOUT_MS by default', () => {
+    expect(adLaunchBoundMs(G30)).toBe(DIALOG_READY_TIMEOUT_MS)
+    expect(adLaunchBoundMs(G30, DIALOG_READY_TIMEOUT_MS)).toBe(DIALOG_READY_TIMEOUT_MS)
+    expect(adLaunchBoundMs(G30, FLOOR_MS)).toBe(FLOOR_MS)
+  })
+
+  test('a floor below G plus the addend leaves G plus the addend as B; a floor above it wins', () => {
+    const g60 = inEffect(tmuxWith({ pending_grace_seconds: 60n }))
+    expect(adLaunchBoundMs(g60, FLOOR_MS)).toBe(FLOOR_MS)
+    expect(adLaunchBoundMs(g60, 90_000)).toBe(120_000)
+    const g300 = inEffect(tmuxWith({ pending_grace_seconds: 300n }))
+    expect(adLaunchBoundMs(g300, FLOOR_MS)).toBe(360_000)
+  })
+
+  test('adLaunchBoundMsInEffect is the default floor until installLaunchBoundFloorMs sets one, and again after the reset', () => {
+    expect(adLaunchBoundMsInEffect()).toBe(adLaunchBoundMs(adSettingsInEffect()))
+    expect(adLaunchBoundMsInEffect()).toBe(DIALOG_READY_TIMEOUT_MS)
+    installLaunchBoundFloorMs(FLOOR_MS)
+    expect(adLaunchBoundMsInEffect()).toBe(adLaunchBoundMs(adSettingsInEffect(), FLOOR_MS))
+    expect(adLaunchBoundMsInEffect()).toBe(Math.max(FLOOR_MS, Number(AD_LAUNCH_BOUND_GRACE_ADDEND_SECONDS + DEFAULT_TMUX.pending_grace_seconds) * 1000))
+    resetAdSettingsForTests()
+    expect(adLaunchBoundMsInEffect()).toBe(DIALOG_READY_TIMEOUT_MS)
+  })
+
+  test('the installed floor leaves G and the alert threshold alone', () => {
+    const before = { grace: adGraceMsInEffect(), threshold: adAlertThresholdMsInEffect() }
+    installLaunchBoundFloorMs(FLOOR_MS)
+    expect({ grace: adGraceMsInEffect(), threshold: adAlertThresholdMsInEffect() }).toEqual(before)
   })
 })

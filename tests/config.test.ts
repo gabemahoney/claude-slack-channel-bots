@@ -28,7 +28,12 @@ import {
   type PersonaInvitedInput,
   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  MAX_TEST_TIMER_OVERRIDE_MS,
+  MAX_TEST_TIMER_OVERRIDE_S,
   MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  PERSONA_TOP_LEVEL_KEYS,
+  TEST_TIMER_OVERRIDE_KEYS,
+  TEST_TIMER_OVERRIDES_KEY,
   expandTilde,
   loadPersonaConfig,
   prePersonaConversionMessage,
@@ -1426,6 +1431,126 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       expect(agentDirectorCallTimeoutMsOf(config)).toBe(MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS)
       expect(agentDirectorCallTimeoutMsOf(null)).toBe(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS)
       expect(agentDirectorCallTimeoutMsOf(undefined)).toBe(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS)
+    })
+  })
+
+  // b.2nr: the test-only timer override block. Undocumented, off by default, so it is not one of PERSONA_TOP_LEVEL_KEYS
+  // (the documented-key tests see no change), but the loader accepts it and validates it with the rules below.
+  describe('the test-only timer override block test_timer_overrides (b.2nr)', () => {
+    const withBlock = (block: unknown) => ({ ...makePersonaConfigInput({}, dir), [TEST_TIMER_OVERRIDES_KEY]: block })
+    const MS_KEYS = TEST_TIMER_OVERRIDE_KEYS.filter((key) => key.endsWith('_ms'))
+    const S_KEYS = TEST_TIMER_OVERRIDE_KEYS.filter((key) => key.endsWith('_s'))
+
+    test('the key is named, the five keys are the ticket\'s, and it is not a documented top-level key', () => {
+      expect(TEST_TIMER_OVERRIDES_KEY).toBe('test_timer_overrides')
+      expect([...TEST_TIMER_OVERRIDE_KEYS]).toEqual([
+        'latch_recheck_interval_ms',
+        'ad_version_recheck_interval_ms',
+        'dialog_ready_timeout_ms',
+        'unavailable_retry_base_s',
+        'unavailable_retry_ceiling_s',
+      ])
+      expect(PERSONA_TOP_LEVEL_KEYS as readonly string[]).not.toContain(TEST_TIMER_OVERRIDES_KEY)
+    })
+
+    test('absent: the loaded configuration has no such property', () => {
+      expect(Object.hasOwn(load(makePersonaConfigInput({}, dir)), TEST_TIMER_OVERRIDES_KEY)).toBe(false)
+    })
+
+    test('an empty object loads and is kept as an empty block', () => {
+      expect(load(withBlock({})).test_timer_overrides).toEqual({})
+    })
+
+    test('every key except the two retry values loads alone and is kept as given', () => {
+      for (const key of TEST_TIMER_OVERRIDE_KEYS.filter((k) => !k.startsWith('unavailable_retry_'))) {
+        expect(load(withBlock({ [key]: 7 })).test_timer_overrides).toEqual({ [key]: 7 })
+      }
+    })
+
+    test('all five keys together load as given (the test-26 refused-leg set)', () => {
+      const block = {
+        latch_recheck_interval_ms: 45_000,
+        ad_version_recheck_interval_ms: 20_000,
+        dialog_ready_timeout_ms: 120_000,
+        unavailable_retry_base_s: 5,
+        unavailable_retry_ceiling_s: 60,
+      }
+      expect(load(withBlock(block)).test_timer_overrides).toEqual(block)
+    })
+
+    test('the bounds are inclusive: 1 and the hour load; one below and one above are refused', () => {
+      // The retry keys are only valid as a pair, so each is exercised with its partner at a valid value inside the range.
+      const partnerOf = (key: string) => (key === 'unavailable_retry_base_s' ? { unavailable_retry_ceiling_s: MAX_TEST_TIMER_OVERRIDE_S } : key === 'unavailable_retry_ceiling_s' ? { unavailable_retry_base_s: 1 } : {})
+      for (const key of MS_KEYS) {
+        expect(load(withBlock({ [key]: 1 })).test_timer_overrides).toEqual({ [key]: 1 })
+        expect(load(withBlock({ [key]: MAX_TEST_TIMER_OVERRIDE_MS })).test_timer_overrides).toEqual({ [key]: MAX_TEST_TIMER_OVERRIDE_MS })
+        expect(loadError(withBlock({ [key]: 0 }))).toContain(`${TEST_TIMER_OVERRIDES_KEY}.${key} must be a positive integer in [1, ${MAX_TEST_TIMER_OVERRIDE_MS}]`)
+        expect(loadError(withBlock({ [key]: MAX_TEST_TIMER_OVERRIDE_MS + 1 }))).toContain(`${TEST_TIMER_OVERRIDES_KEY}.${key} must be a positive integer in [1, ${MAX_TEST_TIMER_OVERRIDE_MS}]`)
+      }
+      for (const key of S_KEYS) {
+        const partner = partnerOf(key)
+        expect(load(withBlock({ ...partner, [key]: 1 })).test_timer_overrides).toEqual({ ...partner, [key]: 1 })
+        expect(load(withBlock({ ...partner, [key]: MAX_TEST_TIMER_OVERRIDE_S })).test_timer_overrides).toEqual({ ...partner, [key]: MAX_TEST_TIMER_OVERRIDE_S })
+        expect(loadError(withBlock({ ...partner, [key]: 0 }))).toContain(`${TEST_TIMER_OVERRIDES_KEY}.${key} must be a positive integer in [1, ${MAX_TEST_TIMER_OVERRIDE_S}]`)
+        expect(loadError(withBlock({ ...partner, [key]: MAX_TEST_TIMER_OVERRIDE_S + 1 }))).toContain(`${TEST_TIMER_OVERRIDES_KEY}.${key} must be a positive integer in [1, ${MAX_TEST_TIMER_OVERRIDE_S}]`)
+      }
+    })
+
+    test.each([
+      ['a string', 'x'],
+      ['null', null],
+      ['an array', [1]],
+      ['a number', 5],
+      ['a boolean', true],
+    ])('a block that is %s is refused as not an object, naming the key', (_label, block) => {
+      expect(loadError(withBlock(block))).toContain(`${TEST_TIMER_OVERRIDES_KEY} must be an object when set`)
+    })
+
+    test.each([
+      ['a numeric string', '5'],
+      ['null', null],
+      ['a non-integer number', 5.5],
+      ['negative', -5],
+      ['a boolean', true],
+      ['an object', { a: 1 }],
+      ['the placeholder string', PLACEHOLDER],
+    ])('a key whose value is %s is refused, naming the key and never the value', (_label, value) => {
+      for (const key of TEST_TIMER_OVERRIDE_KEYS) {
+        expect(loadError(withBlock({ [key]: value }))).toContain(`${TEST_TIMER_OVERRIDES_KEY}.${key} must be a positive integer`)
+      }
+    })
+
+    test('an unknown key is refused, naming it and the known keys', () => {
+      const message = loadError(withBlock({ latch_recheck_interval_ms: 45_000, dialog_ready_timeout: 1 }))
+      expect(message).toContain(`unknown field(s) in ${TEST_TIMER_OVERRIDES_KEY}`)
+      expect(message).toContain('dialog_ready_timeout')
+      expect(message).toContain('latch_recheck_interval_ms')
+    })
+
+    test('a ceiling below the base is refused; equal and above load', () => {
+      expect(loadError(withBlock({ unavailable_retry_base_s: 60, unavailable_retry_ceiling_s: 5 }))).toContain(
+        `${TEST_TIMER_OVERRIDES_KEY}.unavailable_retry_ceiling_s must not be below ${TEST_TIMER_OVERRIDES_KEY}.unavailable_retry_base_s`,
+      )
+      expect(load(withBlock({ unavailable_retry_base_s: 30, unavailable_retry_ceiling_s: 30 })).test_timer_overrides).toEqual({ unavailable_retry_base_s: 30, unavailable_retry_ceiling_s: 30 })
+      expect(load(withBlock({ unavailable_retry_base_s: 5, unavailable_retry_ceiling_s: 60 })).test_timer_overrides).toEqual({ unavailable_retry_base_s: 5, unavailable_retry_ceiling_s: 60 })
+    })
+
+    test.each([
+      ['a base alone', { unavailable_retry_base_s: 5 }],
+      ['a ceiling alone', { unavailable_retry_ceiling_s: 60 }],
+    ])('%s is refused: the two retry values are given together', (_label, block) => {
+      expect(loadError(withBlock(block))).toContain(
+        `${TEST_TIMER_OVERRIDES_KEY}.unavailable_retry_base_s and ${TEST_TIMER_OVERRIDES_KEY}.unavailable_retry_ceiling_s must be set together`,
+      )
+    })
+
+    test('the retry pair alongside the other keys loads; an invalid block refuses the whole load', () => {
+      expect(load(withBlock({ latch_recheck_interval_ms: 45_000, unavailable_retry_base_s: 5, unavailable_retry_ceiling_s: 60 })).test_timer_overrides).toEqual({
+        latch_recheck_interval_ms: 45_000,
+        unavailable_retry_base_s: 5,
+        unavailable_retry_ceiling_s: 60,
+      })
+      expect(loadError(withBlock({ latch_recheck_interval_ms: 45_000, unavailable_retry_base_s: 0, unavailable_retry_ceiling_s: 60 }))).toContain('unavailable_retry_base_s')
     })
   })
 

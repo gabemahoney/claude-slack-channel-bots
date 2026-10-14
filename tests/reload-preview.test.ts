@@ -1580,6 +1580,19 @@ describe('classification across a switch change, the resolved and section compar
     expect(lines).toEqual([NO_EFFECT_LINE])
   })
 
+  // b.2nr: the test-only timer override block is read once at start; a reload never applies a change of it live, and its preview says so.
+  test.each<[string, Record<string, number> | undefined, Record<string, number> | undefined]>([
+    ['the block added', undefined, { dialog_ready_timeout_ms: 120_000 }],
+    ['the block removed', { dialog_ready_timeout_ms: 120_000 }, undefined],
+    ['a value changed', { unavailable_retry_base_s: 5, unavailable_retry_ceiling_s: 60 }, { unavailable_retry_base_s: 6, unavailable_retry_ceiling_s: 60 }],
+  ])('test_timer_overrides %s is no effective change (b.2nr)', (_label, from, to) => {
+    const withBlock = (block: Record<string, number> | undefined) => edited((c) => { if (block !== undefined) (c as Record<string, unknown>)['test_timer_overrides'] = block })
+    const { plan, lines } = previewBetween(withBlock(from), withBlock(to))
+
+    expect(plan).toEqual(planWith({ unchanged: baseRefs(), noEffectiveChange: true }))
+    expect(lines).toEqual([NO_EFFECT_LINE])
+  })
+
   test.each<[string, boolean | undefined, boolean | undefined, (b: PersonaInput) => void, (b: PersonaInput) => void, InPlaceSetting]>([
     [
       'invited going from absent to {} as the switch turns on',

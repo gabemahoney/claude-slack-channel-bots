@@ -4154,7 +4154,8 @@ describe('main() builds the latch re-check once, through the session manager\'s 
 
   test('its input is exactly the one latch, the system clock, the one persona lifecycle serializer\'s run (the restart module\'s too, so a round never overlaps a teardown, a bring-up or a restart for the persona), the applied configuration read at each round, the server log, the one notice episodes instance, the relaunch gate the restart path asks, read at call time (b.av2 SR-6.4), the restart cap over the one failure counter (b.av2 SR-6.3; bug b.xkd: the cap wins over the re-check) and that counter\'s own reset, for the clear by hand (b.jg5 SRJ-509; bug b.ebi)', () => {
     const props = onlyCallProps(RECHECK_BUILDER)
-    expect([...props.keys()].sort()).toEqual([APPLIED_CONFIG, CAN_RELAUNCH, CLOCK, EPISODES, IS_AT_CAP, RECHECK_LATCH, LOG, RESET_RESTART_FAILURES, SERIALIZE].sort())
+    // b.2nr: `intervalMs` is the test-only override's latch interval (see the override block's wiring audit below).
+    expect([...props.keys()].sort()).toEqual([APPLIED_CONFIG, CAN_RELAUNCH, CLOCK, EPISODES, 'intervalMs', IS_AT_CAP, RECHECK_LATCH, LOG, RESET_RESTART_FAILURES, SERIALIZE].sort())
     expect(props.get(RECHECK_LATCH)).toBe(constOf(LATCH_FACTORY))
     expect(props.get(CLOCK)).toBe('SYSTEM_PERSONA_CONNECTION_CLOCK')
     expect(importSource(SERVER_CODE, 'SYSTEM_PERSONA_CONNECTION_CLOCK')).toBe('./persona-connections.ts')
@@ -6012,4 +6013,48 @@ describe('importing src/server.ts has no side effect (SR-3.1, SR-10.2, SR-13.2)'
     },
     90_000,
   )
+})
+
+// ---------------------------------------------------------------------------
+// The test-only timer override block (b.2nr)
+// ---------------------------------------------------------------------------
+
+describe('main() reads the test-only timer override block once, right after the start resolves, and feeds the latch re-check and the retry timers from it (b.2nr)', () => {
+  const INSTALL = 'installTestTimerOverrides'
+  const installAt = (): number => onlyCallOf(INSTALL)
+
+  test('it is imported from test-timer-overrides.ts, named only at the import and the one call, which sits in main()\'s own statement list (behind no branch)', () => {
+    expect(importSource(SERVER_CODE, INSTALL)).toBe('./test-timer-overrides.ts')
+    expect(indicesOf(new RegExp(`\\b${INSTALL}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
+    expect(atMainTopLevel(SERVER_CODE, installAt())).toBe(true)
+  })
+
+  test('it comes after the version re-check is installed, the start resolution and the start-time config assignment, and before the latch re-check, the retry controller, the settings install and the start bring-up', () => {
+    const at = installAt()
+    const { resolveAt, assignAt, bringUpAt } = startResolution(SERVER_CODE)
+    expect(at).toBeGreaterThan(onlyCallOf('installAdVersionRecheck'))
+    expect(at).toBeGreaterThan(resolveAt)
+    expect(at).toBeGreaterThan(assignAt)
+    expect(at).toBeLessThan(onlyCallOf('buildLatchRecheck'))
+    expect(at).toBeLessThan(onlyCallOf('createUnavailableRetryController'))
+    expect(at).toBeLessThan(onlyCallOf('installAdSettings'))
+    expect(at).toBeLessThan(bringUpAt)
+  })
+
+  test('its arguments are the start-time config\'s test_timer_overrides and the server log (stderr); its result is the one const the feeds below read', () => {
+    const [block, log] = onlyCallArgs(INSTALL)
+    expect(onlyCallArgs(INSTALL)).toHaveLength(2)
+    expect(block).toBe(`${loadedConfigName(SERVER_CODE)}.test_timer_overrides`)
+    expect(log).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
+    expect(constOf(INSTALL)).toMatch(/^\w+$/)
+  })
+
+  test('the latch re-check\'s interval and the retry controller\'s base and ceiling are the result\'s timers, and nothing else in server.ts names the block', () => {
+    const timers = constOf(INSTALL)
+    expect(onlyCallProps('buildLatchRecheck').get('intervalMs')).toBe(`${timers}.latchRecheckIntervalMs`)
+    const retry = onlyCallProps('createUnavailableRetryController')
+    expect(retry.get('baseS')).toBe(`${timers}.unavailableRetryBaseS`)
+    expect(retry.get('ceilingS')).toBe(`${timers}.unavailableRetryCeilingS`)
+    expect(indicesOf(/\btest_timer_overrides\b/g, SERVER_CODE)).toHaveLength(1)
+  })
 })

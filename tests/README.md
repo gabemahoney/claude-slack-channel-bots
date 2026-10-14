@@ -456,7 +456,7 @@ tests/
                                    # row's own id, the agent's pane was not found, the unusable recorded name, "not this launch's session" (two legs,
                                    # personas `relabelone` and `relabeltwo`) and "launch start not recorded" (persona `nostart`). The script header
                                    # holds the per-case table (each case's set-up step, round call and clear), the lives, the waits and the runtime. Checks: with
-                                   # `health_check_interval` 0, each re-check, 120 s apart, is one `status` read of the row plus exactly SRJ-505's
+                                   # `health_check_interval` 0, each re-check, one interval apart (45 s here, from the `latch_recheck_interval_ms` test-only override; 120 s in production), is one `status` read of the row plus exactly SRJ-505's
                                    # call for its case and nothing else, counted from the agent-director shim's log (CSCB-parented lines only); at
                                    # least two still-latched rounds per case; a same-case re-refusal posts nothing; each case latches with exactly one
                                    # post; the cadence retries clear with no CSCB `find-missing` before them; each probe clear makes exactly one
@@ -489,7 +489,12 @@ tests/
                                    # serves the latched personas' rows; the loop's calls are the harness's, never counted as CSCB's. Modes: tmux
                                    # shim `log`, the stub's dev-channels hold (report-in at once for the note persona and the pane-not-found persona's relaunch; the unrecognised-dialog mode for the held-dialog persona's latch life, then report-in at once),
                                    # `health_check_interval` 0 (so the waiting-row `read-pane` a health tick makes is not shown; the reconnect
-                                   # comes from a server restart), agent-director's defaults (no config.toml). It runs about 33 minutes (Part 1 about 8.5, Part 2 about 25) and ends
+                                   # comes from a server restart). agent-director runs on its defaults but for a `[tmux]` table holding
+                                   # `starting_session_seconds` 60 and `stopping_window_seconds` 30, both at their minimums and both read back from the
+                                   # written file. The own-id persona's age wait is the larger of the two plus 5 s, so 65 s.
+                                   # Every start's `config.json` holds the test-only override `latch_recheck_interval_ms` 45000. Each start must log
+                                   # its one loud `TEST TIMER OVERRIDES ACTIVE` line exactly once.
+                                   # The script runs about 18 minutes (Part 1 about 5, Part 2 about 13) and ends
                                    # with the loop stopped, a plain `stop`, the personas still latched (the unusable recorded name, leg 1, and
                                    # "launch start not recorded" when its retry left it latched) keeping their rows and sessions, then the three
                                    # closing assertions
@@ -520,7 +525,9 @@ tests/
                                    # the next read, a `[pause]`-only change logging none; refused values: one `ad-config-malformed` alert per affected
                                    # persona, nothing destroyed or counted, the last values kept, one all-clear once fixed; the call timeout: below the
                                    # need, the startup warning and a held launch ending in `ErrCallTimeout` with no launch over its row; above it, no warning
-                                   # and agent-director's launch-timeout `ErrTmuxUnresponsive` (see fmk scenarios below)
+                                   # and agent-director's launch-timeout `ErrTmuxUnresponsive` (see fmk scenarios below). The test-only timer overrides shorten
+                                   # B's floor, the version re-check and, in the refused-value and call-timeout legs, the retry timer (base and ceiling together);
+                                   # it runs about 18 minutes
     test-27-fmk-unusable-name.sh  # HO §7 scenario 25 (b.jg5 SRJ-1427), fmk: an unusable recorded name latches with no tmux call; after the harness's delete it clears and comes up fresh
                                    # Set-up: in the first life persona `unusable` (U) reaches `waiting`; the harness types the stub's exit sentinel into its
                                    # pane (a human quitting Claude Code), so the row ends; then `stop --stop-bots`. With the server stopped, E39's scenario
@@ -692,7 +699,7 @@ contracts to satisfy a zero-match audit.
 | 17 | every fmk script | `assert_no_server_tmux`: no bot server makes a tmux call of its own (see Closing assertions) |
 | 18 | `test-19-fmk-reuse.sh` | A persona removed and re-added comes back fresh by reuse, never resumed (SRJ-1419) |
 | 19 | `test-16-fmk-conflict.sh` | Each kind of leftover session latches its persona, and each clears once it ends (SRJ-1420) |
-| 20 | `test-23-fmk-latch-recheck.sh` | Every latch case is re-checked every 120 s with exactly its call (SRJ-1422) |
+| 20 | `test-23-fmk-latch-recheck.sh` | Every latch case is re-checked every interval (45 s here, by a test-only override; 120 s in production) with exactly its call (SRJ-1422) |
 | 21 | `test-24-fmk-stuck-launch.sh` | A launch stuck at an unrecognised prompt is aborted once at B and resumed (SRJ-1423) |
 | 22 | `test-25-fmk-pre-trust.sh` | Each launch's `pre_trust` is only logged (SRJ-1424) |
 | 23 | `test-20-fmk-old-binary.sh` | A `<P1>-rc.N` binary launches and development builds are refused (SRJ-1425); see Scenarios 8, 23 and 24 |
@@ -1367,7 +1374,7 @@ fmk mode. Sourcing also:
   the current layout and contract. `SCENARIO_AD_START` is `release` (the
   default) or `0.10.0`; a shared-mode script that sets it fails;
 - writes no agent-director `config.toml`, so agent-director runs on its
-  default settings. Scenarios 10 and 24 (Test 26) are the exceptions: they
+  default settings. Scenarios 10, 20 (Test 23) and 24 (Test 26) are the exceptions: they
   write a `[tmux]` table with `write_ad_settings` (see Harness agent-director
   calls and store helpers below). Test 0 writes one too, after its re-fire
   legs (see Layout);
@@ -1882,7 +1889,7 @@ These hold for every fmk script (b.jg5 SRJ-1401):
 - It runs on the release (binary, agent-director-admin, client, and
   `install.sh` with its migration) unless it sets `SCENARIO_AD_START=0.10.0`, and at
   agent-director's default settings, with no `config.toml`, unless it is
-  scenario 10 or 24 (Test 26), which write a `[tmux]` table with
+  scenario 10, 20 (Test 23) or 24 (Test 26), which write a `[tmux]` table with
   `write_ad_settings`. Test 0, the harness's
   self-check rather than a scenario, writes one once its re-fire legs are
   done, for its finished-row kill (see Layout).
@@ -1918,12 +1925,31 @@ These hold for every fmk script (b.jg5 SRJ-1401):
   any state.
 - CSCB's timings are shortened only through its configuration
   (`health_check_interval`, `session_restart_delay`) and the package's
-  exported seams, never by editing `src/`. agent-director's are changed only
-  through the `[tmux]` table of scenarios 10 and 24, written with
+  exported seams, never by editing `src/`; scenarios 20 (Test 23) and 24
+  (Test 26) also use the test-only `test_timer_overrides` block of that
+  configuration (next bullet). agent-director's are changed only
+  through the `[tmux]` table of scenarios 10, 20 and 24, written with
   `write_ad_settings`, beside which scenario 24 also writes a `[pause]`
   table; every other scenario
   waits out agent-director's default windows (at least 300 s where it needs
   the starting-session bound, as the finished-row kill does).
+- The test-only timer overrides (b.2nr) are used by scenarios 20 (Test 23) and
+  24 (Test 26) only. The block is the top-level `test_timer_overrides` object
+  of the `config.json` the scenario writes; it is off by default and
+  undocumented for users. The retry timer's base and ceiling
+  (`unavailable_retry_base_s`, `unavailable_retry_ceiling_s`) are set
+  together, the ceiling not below the base.
+- The server reads the block once at each start, from the start-time
+  configuration, so a leg that changes the set removes
+  `config.json.last-applied` and restarts. Every start with a non-empty block
+  logs exactly one `TEST TIMER OVERRIDES ACTIVE` line, which the script
+  requires (`expect_one_overrides_line`, with the line's stem from
+  `overrides_stem`) and compares whole with the printer's
+  `buildTestTimerOverridesLine` for the same set.
+- The scenario prints every value it uses from `fixtures/fmk-texts.ts`
+  (`testTimerOverridesBlock`, `effectiveTestTimer`, `adLaunchBoundMs`,
+  `unavailableRetryDueS`), never retyped. A timer whose production value an
+  assertion depends on is left at it.
 - Posts are read from the Slack stub's record (`slack-stub-server.ts
   --record`), with `slack_posts` (by channel) or `slack_label_posts` (by
   token label).
@@ -2203,33 +2229,49 @@ is warned about at start and never retried over a live row, while above it
 agent-director's own launch-timeout answer arrives. It runs in fmk mode on the release, with the Slack stub recording
 each `chat.postMessage` text whole. Before the first start it writes the
 scenario HOME's agent-director settings file with `write_ad_settings`, a
-`[tmux]` table holding the scenario inputs SRJ-1426 names; scenario 24 is
-one of the two scenarios that write `[tmux]` (b.jg5 SRJ-1401; b.jg5 SRJ-1306 as amended by b.deo SRI-1402 to SRI-1404).
+`[tmux]` table holding the scenario inputs SRJ-1426 names. Scenario 24 is
+one of the three scenarios that write `[tmux]`, with scenarios 10 and 20
+(b.jg5 SRJ-1401; b.jg5 SRJ-1306 as amended by b.deo SRI-1402 to SRI-1404).
+
 Each key is checked to be one of the package's `AD_TMUX_KEYS`, and each
-value of the first table (and the change leg's 240) to be at or above its
+value of the first table (and the change leg's 60) to be at or above its
 minimum, before it is written:
 
 | `[tmux]` key | Written | Minimum it is checked against |
 |---|---|---|
-| `pending_grace_seconds` | 120 (240 in the change leg; 61 in the call-timeout legs) | `pendingGraceMinimumSeconds` at the default `create_timeout_ms` and `pipe_close_wait_ms`; in the call-timeout legs the value is `pendingGraceMinimumSeconds` at 40000 and the default `pipe_close_wait_ms` |
+| `pending_grace_seconds` | 30 (60 in the change leg; 61 in the call-timeout legs) | `pendingGraceMinimumSeconds` at the default `create_timeout_ms` and `pipe_close_wait_ms`; in the call-timeout legs the value is `pendingGraceMinimumSeconds` at 40000 and the default `pipe_close_wait_ms` |
 | `stopping_window_seconds` | 30 | `AD_SETTING_MINIMUMS stopping_window_seconds` |
 | `starting_session_seconds` | 120 | `AD_SETTING_MINIMUMS starting_session_seconds` |
 | `create_timeout_ms` | 40000, in the call-timeout legs only | none (its key is checked, and the grace period is raised with it) |
 
 The other `[tmux]` values stay agent-director's defaults. At the first
-table's values G is 120 s, B 300 s and the alert threshold 180 s (printed,
-not used: the alert timings are unit-tested). CSCB's config sets
-`health_check_interval` 0 (no health tick launches anyone),
-`resume_enabled` true (S's finished row comes back by a `resume`),
+table's values G is 30 s, B 120 s (the greater of the `dialog_ready_timeout_ms`
+override and G + 60 s) and the alert threshold 180 s (printed,
+not used: the alert timings are unit-tested).
+
+CSCB's config sets `health_check_interval` 0 (no health tick launches
+anyone), `resume_enabled` true (S's finished row comes back by a `resume`),
 `exit_timeout` 5 and `agent_director_poll_interval_ms` 3600000 (the
 permission poller's `list` calls stay out of the shim's log), all CSCB's
-own, through its config; the refused-value legs also set
+own, through its config. The refused-value legs also set
 `session_restart_delay` 0, and the call-timeout legs
-`agent_director_call_timeout_ms` (30000, then 61000). Test 26 runs about 39
-minutes: about 17 for the legs before the refused values, most of it the
-held launch's B and the change leg's three waits for the next timed probe,
-about 9 for each refused-value leg, and about 4 for the two call-timeout
-legs.
+`agent_director_call_timeout_ms` (30000, then 61000).
+
+The test-only overrides in every start's `config.json` (see Rules for every
+fmk scenario) shorten the production timers the legs would wait out.
+`ad_version_recheck_interval_ms` 20000 and `dialog_ready_timeout_ms` 120000
+are set in every leg (B's floor, so the held leg's slow-pace window, (G + 5 s,
+G + 65 s), ends before B).
+
+The refused-stopping, refused-grace and both call-timeout legs add
+`unavailable_retry_base_s` 5 and `unavailable_retry_ceiling_s` 60, set
+together. The stopping leg keeps the production retry timer: S's first retry
+must fall due after the 30 s stopping window, for exactly one "still
+stopping" refusal. The latch re-check is not overridden.
+
+Test 26 runs about 18 minutes: about 8 for the legs before the refused
+values, about 2.5 for each refused-value leg and about 2 for each call-timeout
+leg.
 
 Each persona (`t26_<x>`, one channel each) has its stub mode selected for
 its working directory with `stub_mode`:
@@ -2318,15 +2360,18 @@ The legs run in order, each on the state the one before left:
   by no kill of Q, and there is no post to Q's channel.
 - change. A `[pause]`-only change (`timeout_seconds` 60, the `[tmux]`
   values kept) logs no values line through the next bot-server probe.
-  `pending_grace_seconds` raised to 240 logs exactly one values line,
-  naming 240, after the next probe and none before it. R, added by a
+  `pending_grace_seconds` raised to 60 logs exactly one values line,
+  naming 60, after the next probe and none before it. R, added by a
   confirmed reload and held at its dialog, makes more `read-pane` calls in
-  (L + 130 s, L + 170 s) from its launch start L than a 5 s pace allows, so
-  the raised G is in use; a harness Enter brings R up. The earlier `[tmux]`
+  (L + 35 s, L + 55 s) from its launch start L than a 5 s pace allows, so
+  the raised G is in use (the window lies past G, before the raised G and
+  before B); a harness Enter brings R up. The earlier `[tmux]`
   values are then written back with no `[pause]` table, and whether a
   values line follows the next probe is printed.
 - refused-stopping. The server restarts with `session_restart_delay` 0
-  (`health_check_interval` is 0 throughout) and S, P, Q and R up. The file
+  (`health_check_interval` is 0 throughout) and the retry timer's base and
+  ceiling added to the overrides (kept by every later leg), with S, P, Q and
+  R up. The file
   is written with `stopping_window_seconds` 10, below its minimum. After the
   next bot-server probe C1 is added by a confirmed reload; its launch meets
   agent-director's `ErrConfigMalformed`, which reaches CSCB as
@@ -2436,7 +2481,8 @@ up 61000; T1 is up by then.
 A bot-server probe is a CSCB `version` call in the agent-director shim's
 log whose parent is the bot server; the server reads the settings file
 again after each timed probe (`installAdSettings`, `src/ad-settings.ts`),
-so each change-leg wait is bounded by the re-check interval plus 10 s.
+so each change-leg wait is bounded by the re-check interval (20 s, by the
+`ad_version_recheck_interval_ms` override) plus 10 s.
 Every time comes from the script's own polling, a shim line's time field,
 a `server.log` line's ISO prefix, a stub record's `ts`, or a row's
 `launch_started_at` or `ended_at`.
@@ -2452,9 +2498,10 @@ package:
 | The settings file's path, table names and pause key (read by `write_ad_settings`) | `AD_SETTINGS_RELATIVE_PATH`, `AD_TMUX_TABLE`, `AD_PAUSE_TABLE`, `AD_PAUSE_TIMEOUT_KEY` | `src/ad-settings.ts` |
 | The values line's prefix | `AD_SETTINGS_LOG_PREFIX` | `src/ad-settings.ts` |
 | The values lines | `buildAdSettingsValuesLine <path> <key>=<value>...` | `src/ad-settings.ts` |
-| G, B and the alert threshold | `adGraceMs`, `adLaunchBoundMs`, `adAlertThresholdMs` | `src/ad-settings.ts` |
+| G, the alert threshold, and B over the written table and the floor override | `adGraceMs`, `adAlertThresholdMs`, `adLaunchBoundMs <the table> dialog_ready_timeout_ms=<override>` | `src/ad-settings.ts` |
 | B in whole minutes | `wholeMinutes <B>` | `src/ad-settings.ts` |
-| The re-check interval | `AD_VERSION_RECHECK_INTERVAL_MS` | `src/ad-version-gate.ts` |
+| The re-check interval in effect | `effectiveTestTimer ad_version_recheck_interval_ms <the overrides>` | `src/test-timer-overrides.ts` |
+| The test-only override block, and the loud line a start with it must log once | `testTimerOverridesBlock <key>=<integer>...`, `buildTestTimerOverridesLine <key>=<integer>...` | `src/config.ts`, `src/test-timer-overrides.ts` |
 | The approver's paces before and from G, and the held leg's gap limit (their mean) | `DIALOG_POLL_INTERVAL_MS`, `DIALOG_SLOW_POLL_INTERVAL_MS` | `src/session-manager.ts` |
 | The "still stopping" and "still starting" phrases | `STILL_STOPPING_PHRASE`, `STILL_STARTING_PHRASE` | `src/ad-description-phrases.ts` |
 | The relaunching post for P | `formatPersonaNotice <P> stuckLaunchRelaunchingText <P's key> <B>` | `src/persona-notifier.ts`, `src/pending-row.ts` |
@@ -2470,7 +2517,8 @@ package:
 | The onset's fixed parts, as posted for C | `formatPersonaNotice <C> adConfigMalformedOnset <marker>` | `src/persona-notifier.ts`, `src/outage-state.ts` |
 | The all-clear, as posted for C | `formatPersonaNotice <C> ALL_CLEAR_TEMPLATE ad-config-malformed` | `src/persona-notifier.ts`, `src/outage-state.ts` |
 | The raise line's fixed parts and the clear line | `adConfigMalformedRaisedLine <C's key> <marker>`, `adConfigMalformedClearedLine <C's key>` | `src/outage-state.ts` |
-| The retry timer's first and longest waits | `UNAVAILABLE_RETRY_BASE_S`, `UNAVAILABLE_RETRY_CEILING_S` | `src/unavailable-retry.ts` |
+| The retry timer's longest wait in effect | `effectiveTestTimer unavailable_retry_ceiling_s <the overrides>` | `src/test-timer-overrides.ts` |
+| When the retry timer's retries fall due: the production timer's first (the stopping leg) and the overridden timer's second (the refused-value legs) | `unavailableRetryDueS 1`, `unavailableRetryDueS 2 unavailable_retry_base_s=<n> unavailable_retry_ceiling_s=<n>` | `src/unavailable-retry.ts`, `src/backoff.ts` |
 | A stop's reasons: a pending-only retry read the row live; a retry found nothing left to recover | `UNAVAILABLE_RETRY_STOP_ROW_LIVE`, `UNAVAILABLE_RETRY_STOP_RECOVERED` | `src/unavailable-retry.ts` |
 | The could-not-run line's prefix (none across a refusal) | `AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX` | `src/ad-version-gate.ts` |
 | The re-armed reason of a retry read as unknown | `RESTART_OUTCOME_LIVENESS_UNKNOWN` | `src/restart.ts` |
@@ -2568,7 +2616,11 @@ builder's output for the given arguments.
 | `pendingGraceMinimumSeconds <create-timeout-ms> <pipe-close-wait-ms>` | the grace period's minimum, in decimal | `src/ad-settings.ts` |
 | `adGraceMs [<key>=<integer>...]` | G, in decimal | `src/ad-settings.ts` |
 | `adAlertThresholdMs [<key>=<integer>...]` | the alert threshold, in decimal | `src/ad-settings.ts` |
-| `adLaunchBoundMs [<key>=<integer>...]` | B, in decimal | `src/ad-settings.ts` |
+| `adLaunchBoundMs [<tmux-key>=<integer>\|dialog_ready_timeout_ms=<integer>...]` | B, in decimal, over the `[tmux]` values and, when given, the floor override `dialog_ready_timeout_ms` (otherwise the production floor) | `src/ad-settings.ts` |
+| `testTimerOverridesBlock [<key>=<integer>...]` | the `test_timer_overrides` JSON object for the arguments, compact, keys in the package's order (`{}` for none); `<key>` is one of the package's `TEST_TIMER_OVERRIDE_KEYS`, each value a positive integer within its bound, a key given twice, only one of the two retry keys or a retry ceiling below the base exits 64 | `src/config.ts` |
+| `buildTestTimerOverridesLine [<key>=<integer>...]` | the loud line the server writes at start for that block; empty for no override | `src/test-timer-overrides.ts` |
+| `effectiveTestTimer <key> [<key>=<integer>...]` | the timer `<key>` in effect for that block, in decimal: the override, else the production default | `src/test-timer-overrides.ts` |
+| `unavailableRetryDueS <retry> [unavailable_retry_base_s=<integer> unavailable_retry_ceiling_s=<integer>]` | seconds after its arm at which the retry timer's retry `<retry>` (from 1) falls due, in decimal, over the production base and ceiling or, when given (both together), the overridden pair | `src/unavailable-retry.ts`, `src/backoff.ts` |
 | `wholeMinutes <ms>` | `<ms>` in whole minutes, rounded down | `src/ad-settings.ts` |
 | `STILL_STOPPING_PHRASE` | the phrase an `ErrTmuxUnresponsive` carries for a row that still appears to be stopping | `src/ad-description-phrases.ts` |
 | `STILL_STARTING_PHRASE` | the phrase an `ErrTmuxUnresponsive` carries for a row that still appears to be starting | `src/ad-description-phrases.ts` |

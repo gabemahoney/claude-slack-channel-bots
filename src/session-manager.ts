@@ -21793,6 +21793,8 @@ export interface LatchRecheckInput {
   readonly latch: Pick<ConflictLatch, 'isLatched' | 'record' | 'forget' | 'addSetObserver' | 'setProbeDropped'>
   /** The re-check timers' clock (the system clock in production). */
   readonly clock: LatchRecheckClock
+  /** The interval between a persona's rounds; `LATCH_RECHECK_INTERVAL_MS` when absent (b.2nr: the test-only override block sets it). */
+  readonly intervalMs?: number
   /** The one persona lifecycle serializer's submit (`PersonaSerializer.run`). */
   readonly serialize: <T>(key: string, operation: () => T | Promise<T>) => Promise<T>
   /** The applied configuration now, read at each round. */
@@ -21900,6 +21902,7 @@ export function buildLatchRecheck(input: LatchRecheckInput): LatchRecheck {
     input.resetRestartFailures === undefined ? sequenceDeps : { ...sequenceDeps, resetRestartFailures: input.resetRestartFailures }
   controller = createLatchRecheckController({
     clock: input.clock,
+    intervalMs: input.intervalMs,
     isLatched: (key) => input.latch.isLatched(key),
     serialize: input.serialize,
     round: (key) => runLatchRecheckRoundThenOwed(key, input, sequenceDeps),

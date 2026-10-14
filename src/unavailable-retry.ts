@@ -1072,6 +1072,10 @@ export interface UnavailableRetryDeps {
   action: UnavailableRetryAction
   /** Clock and timers; `SYSTEM_PERSONA_CONNECTION_CLOCK` by default. */
   clock?: UnavailableRetryClock
+  /** The first wait, in seconds; {@link UNAVAILABLE_RETRY_BASE_S} when absent (b.2nr: the test-only override block sets it). */
+  baseS?: number
+  /** The longest wait, in seconds; {@link UNAVAILABLE_RETRY_CEILING_S} when absent (b.2nr: the test-only override block sets it). */
+  ceilingS?: number
   /**
    * b.jg5 SRJ-308: called once at every retry of a persona's timer, in
    * either mode, with the clock's time, after its retry line and before its
@@ -1299,6 +1303,8 @@ interface RetryEntry {
 /** Build one server's UNAVAILABLE retry controller; see the module comment. */
 export function createUnavailableRetryController(deps: UnavailableRetryDeps): UnavailableRetryController {
   const clock = deps.clock ?? SYSTEM_PERSONA_CONNECTION_CLOCK
+  const baseS = deps.baseS ?? UNAVAILABLE_RETRY_BASE_S
+  const ceilingS = deps.ceilingS ?? UNAVAILABLE_RETRY_CEILING_S
   const entries = new Map<string, RetryEntry>()
   /** Each persona's latest retry run, until it settles. Kept apart from `entries` so a run outlives a stop. */
   const runs = new Map<string, Promise<void>>()
@@ -1319,7 +1325,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
 
   /** The wait after `refusals` refused retries, in milliseconds. */
   function waitAfter(refusals: number): number {
-    return doublingBackoffDelay(UNAVAILABLE_RETRY_BASE_S, refusals, UNAVAILABLE_RETRY_CEILING_S) * 1000
+    return doublingBackoffDelay(baseS, refusals, ceilingS) * 1000
   }
 
   /**

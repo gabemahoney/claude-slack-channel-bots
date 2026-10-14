@@ -362,6 +362,7 @@ import {
 } from './registry.ts'
 import { buildPersonaClientOrExit, runAgentDirectorStartupGate } from './agent-director-startup.ts'
 import { disposeAdVersionRecheck, installAdVersionRecheck, onAdVersionChanged } from './ad-version-gate.ts'
+import { installTestTimerOverrides } from './test-timer-overrides.ts'
 import {
   adAlertThresholdMsInEffect,
   adSettingsInEffect,
@@ -3510,6 +3511,13 @@ export async function main(): Promise<void> {
   const start = reload.resolveStart()
   if (start.kind === 'refused') process.exit(1)
   personaConfig = start.config
+  // b.2nr: the test-only timer override block, read once here from the
+  // start-time configuration (never again: a reload does not apply a change
+  // of it live). Off unless the file has the block; when any override is
+  // active it logs one loud line, moves the version re-check's interval
+  // (installed before the configuration was read) and sets B's floor. The
+  // latch re-check and the retry timers below take their values from it.
+  const testTimers = installTestTimerOverrides(personaConfig.test_timer_overrides, (line) => console.error(line))
   // b.av2 SR-6.2: the trust patch precedes every launch. Installed as soon as
   // the persona config is set — before the Slack connections, Bun.serve and
   // initRestart — so no launch path (start, restart or a human trigger) can
@@ -3693,6 +3701,7 @@ export async function main(): Promise<void> {
   const latchRecheck = buildLatchRecheck({
     latch: conflictLatch,
     clock: SYSTEM_PERSONA_CONNECTION_CLOCK,
+    intervalMs: testTimers.latchRecheckIntervalMs,
     serialize: personaLifecycle.run,
     appliedConfig: () => personaConfig,
     log: (line) => console.error(line),
@@ -3923,6 +3932,8 @@ export async function main(): Promise<void> {
   }
   const retryTimers = createUnavailableRetryController({
     log: (line) => console.error(line),
+    baseS: testTimers.unavailableRetryBaseS,
+    ceilingS: testTimers.unavailableRetryCeilingS,
     onRetryFire: (key, firedAt) => tmuxUnresponsive.onsetAtRetry(key, firedAt),
     onStopped: (key, reason) => {
       try {

@@ -672,6 +672,7 @@ function makeRig(
   clock = createFakeClock(),
   onRetryFire?: UnavailableRetryDeps['onRetryFire'],
   onStopped?: UnavailableRetryDeps['onStopped'],
+  timing: Pick<UnavailableRetryDeps, 'baseS' | 'ceilingS'> = {},
 ): Rig {
   const lines: string[] = []
   const attempts: RecoveryAttempt[] = []
@@ -684,6 +685,7 @@ function makeRig(
     },
     ...(onRetryFire !== undefined ? { onRetryFire } : {}),
     ...(onStopped !== undefined ? { onStopped } : {}),
+    ...timing,
   })
   const rig = { clock, controller, lines, attempts }
   rigs.push(rig)
@@ -794,6 +796,27 @@ describe('unavailable retry: the schedule', () => {
     for (let i = 0; i < 7; i++) await clock.runNext()
 
     expect(attempts.map((a) => (a.at - armedAt) / 1000)).toEqual([30, 90, 210, 450, 750, 1050, 1350])
+  })
+
+  // b.2nr: the test-only override block's unavailable_retry_base_s / unavailable_retry_ceiling_s reach the timer through `baseS` / `ceilingS`.
+  // Regression: before the fix the deps had no such keys and the timer ran at 30 s / 300 s whatever the block said.
+  test.each<[string, Pick<UnavailableRetryDeps, 'baseS' | 'ceilingS'>, number[]]>([
+    ['base 5 and ceiling 60', { baseS: 5, ceilingS: 60 }, [5, 15, 35, 75, 135, 195]],
+    ['base 5 alone, the default ceiling 300', { baseS: 5 }, [5, 15, 35, 75, 155, 315, 615, 915]],
+    ['ceiling 60 alone, the default base 30', { ceilingS: 60 }, [30, 90, 150, 210]],
+  ])('b.2nr: %s sets the retry times after the arm', async (_label, timing, expected) => {
+    const { clock, controller, attempts } = makeRig(undefined, undefined, undefined, undefined, timing)
+    const armedAt = clock.now()
+    controller.arm(KEY, UNAVAILABLE)
+    for (let i = 0; i < expected.length; i++) await clock.runNext()
+    expect(attempts.map((a) => (a.at - armedAt) / 1000)).toEqual(expected)
+  })
+
+  test('b.2nr: the view of an armed timer states the overridden first wait', () => {
+    const { clock, controller } = makeRig(undefined, undefined, undefined, undefined, { baseS: 5, ceilingS: 60 })
+    controller.arm(KEY, UNAVAILABLE)
+    expect(delays(clock)).toEqual([5000])
+    expect(controller.view(KEY)).toMatchObject({ phase: 'waiting', waitMs: 5000, refusals: 0 })
   })
 
   test('a stop leaves nothing pending and runs nothing more, and a later arm starts at the first wait again', async () => {

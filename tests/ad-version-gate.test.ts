@@ -73,6 +73,7 @@ import {
   AD_VERSION_RECHECK_STOP_EXIT_CODE,
   AD_VERSION_RECHECK_TIME_LIMIT_MS,
   buildAdVersionRecheckCouldNotRunLine,
+  setAdVersionRecheckIntervalMs,
   buildPhase1HostNote,
   CLIENT_DEV_SENTINEL_VERSION,
   buildBelowPhase1FloorMessage,
@@ -394,6 +395,8 @@ interface RecheckRigOptions {
   versionChangedListeners?: readonly AdVersionChangedListener[]
   /** Call `start()` (default true). */
   start?: boolean
+  /** The re-check's interval (b.2nr's override); default `AD_VERSION_RECHECK_INTERVAL_MS`. */
+  intervalMs?: number
 }
 
 /**
@@ -452,6 +455,7 @@ function makeRecheckRig(opts: RecheckRigOptions = {}): RecheckRig {
     },
     log: (line) => { logs.push(line) },
     clock,
+    ...(opts.intervalMs !== undefined ? { intervalMs: opts.intervalMs } : {}),
     tickListeners: () => listeners,
     versionChangedListeners: () => changedListeners,
   })
@@ -609,6 +613,102 @@ describe('runtime re-check: schedule (health_check_interval 0)', () => {
     expect(rig.clock.pendingCount()).toBe(1)
     await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
     expect(rig.callCount()).toBe(1)
+  })
+})
+
+// b.2nr: the test-only override block's ad_version_recheck_interval_ms reaches the re-check through `intervalMs`
+// at build time, and through `setIntervalMs` / `setAdVersionRecheckIntervalMs` when the block is read after the
+// re-check is installed (main() installs the re-check before it reads the configuration).
+// Regression: before the fix the interval was the constant only, so the first call came at 120 s whatever was set.
+describe('runtime re-check: the interval override (b.2nr)', () => {
+  const SHORT_MS = 20_000
+
+  test('an interval in the deps sets the first call and each next one; the default is kept when it is absent', async () => {
+    const rig = makeRecheckRig({ intervalMs: SHORT_MS })
+    await rig.clock.advance(SHORT_MS - 1)
+    expect(rig.callCount()).toBe(0)
+    await rig.clock.advance(1)
+    expect(rig.callCount()).toBe(1)
+    expect(rig.clock.pending().map((t) => t.delayMs)).toEqual([SHORT_MS])
+    await rig.clock.advance(SHORT_MS)
+    expect(rig.callCount()).toBe(2)
+
+    const plain = makeRecheckRig()
+    expect(plain.clock.pending().map((t) => t.delayMs)).toEqual([AD_VERSION_RECHECK_INTERVAL_MS])
+  })
+
+  test('setIntervalMs moves the pending timer to a full new interval from now', async () => {
+    const rig = makeRecheckRig()
+    await rig.clock.advance(5_000)
+    rig.recheck.setIntervalMs(SHORT_MS)
+    expect(rig.clock.pendingCount()).toBe(1)
+    expect(rig.clock.pending()[0]!.dueAt).toBe(rig.clock.now() + SHORT_MS)
+    await rig.clock.advance(SHORT_MS - 1)
+    expect(rig.callCount()).toBe(0)
+    await rig.clock.advance(1)
+    expect(rig.callCount()).toBe(1)
+    expect(rig.clock.pending().map((t) => t.delayMs)).toEqual([SHORT_MS])
+  })
+
+  test('setIntervalMs lengthens the interval too, and leaves exactly one timer', async () => {
+    const rig = makeRecheckRig({ intervalMs: SHORT_MS })
+    rig.recheck.setIntervalMs(AD_VERSION_RECHECK_INTERVAL_MS * 2)
+    expect(rig.clock.pending().map((t) => t.delayMs)).toEqual([AD_VERSION_RECHECK_INTERVAL_MS * 2])
+  })
+
+  test('setIntervalMs during a check in flight: the next timer is armed at the new interval', async () => {
+    const answer = deferredAnswer()
+    const rig = makeRecheckRig({ resolveSystemBinary: () => answer.promise })
+    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+    expect(rig.callCount()).toBe(1)
+    rig.recheck.setIntervalMs(SHORT_MS)
+    answer.resolve({ version: PHASE1_RC_VERSION, path: binaryPathFor('in-flight') })
+    await rig.clock.flush()
+    expect(rig.clock.pending().map((t) => t.delayMs)).toEqual([SHORT_MS])
+  })
+
+  test('setIntervalMs before start sets the interval start arms with', () => {
+    const rig = makeRecheckRig({ start: false })
+    rig.recheck.setIntervalMs(SHORT_MS)
+    expect(rig.clock.pendingCount()).toBe(0)
+    rig.recheck.start()
+    expect(rig.clock.pending().map((t) => t.delayMs)).toEqual([SHORT_MS])
+  })
+
+  test('setIntervalMs after dispose arms nothing', () => {
+    const rig = makeRecheckRig()
+    rig.recheck.dispose()
+    rig.recheck.setIntervalMs(SHORT_MS)
+    expect(rig.clock.pendingCount()).toBe(0)
+  })
+
+  test('setIntervalMs after a stop arms nothing', async () => {
+    const rig = makeRecheckRig({ outcomes: [{ version: DEV_PLACEHOLDER_VERSION, path: binaryPathFor('stop-then-set') }] })
+    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+    expect(rig.stops).toHaveLength(1)
+    rig.recheck.setIntervalMs(SHORT_MS)
+    expect(rig.clock.pendingCount()).toBe(0)
+  })
+
+  test('setAdVersionRecheckIntervalMs moves the installed re-check; with none installed it is a no-op', async () => {
+    expect(() => setAdVersionRecheckIntervalMs(SHORT_MS)).not.toThrow()
+    const clock = createFakeClock()
+    const calls: Array<object | undefined> = []
+    installAdVersionRecheck(installDeps(clock, [], calls))
+    setAdVersionRecheckIntervalMs(SHORT_MS)
+    await clock.advance(SHORT_MS - 1)
+    expect(calls).toHaveLength(0)
+    await clock.advance(1)
+    expect(calls).toHaveLength(1)
+  })
+
+  test('the could-not-run line states the interval in effect; its default is the constant', async () => {
+    expect(buildAdVersionRecheckCouldNotRunLine('x')).toBe(buildAdVersionRecheckCouldNotRunLine('x', AD_VERSION_RECHECK_INTERVAL_MS))
+    expect(buildAdVersionRecheckCouldNotRunLine('x', SHORT_MS)).toContain('the next 20 s re-check')
+    expect(buildAdVersionRecheckCouldNotRunLine('x')).toContain('the next 120 s re-check')
+    const rig = makeRecheckRig({ intervalMs: SHORT_MS, outcomes: [{ throws: errSystemInstallNotFound() }] })
+    await rig.clock.advance(SHORT_MS)
+    expect(rig.logs).toEqual([buildAdVersionRecheckCouldNotRunLine('ErrSystemInstallNotFound', SHORT_MS)])
   })
 })
 

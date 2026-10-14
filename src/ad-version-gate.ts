@@ -878,10 +878,13 @@ export const AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX =
  * checks again at the next {@link AD_VERSION_RECHECK_INTERVAL_MS} re-check.
  * Built from the description and fixed text only.
  */
-export function buildAdVersionRecheckCouldNotRunLine(description: string): string {
+export function buildAdVersionRecheckCouldNotRunLine(
+  description: string,
+  intervalMs: number = AD_VERSION_RECHECK_INTERVAL_MS,
+): string {
   return (
     `${AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX}${description}; ` +
-    `the server keeps running and checks again at the next ${AD_VERSION_RECHECK_INTERVAL_MS / 1000} s re-check`
+    `the server keeps running and checks again at the next ${intervalMs / 1000} s re-check`
   )
 }
 
@@ -938,6 +941,8 @@ export interface AdVersionRecheckDeps {
   log: (line: string) => void
   /** Timers; the real ones by default. */
   clock?: AdVersionRecheckClock
+  /** The interval between re-checks; {@link AD_VERSION_RECHECK_INTERVAL_MS} when absent (b.2nr: the test-only override block sets it). */
+  intervalMs?: number
   /** The tick listeners, read at each tick; none by default. */
   tickListeners?: () => readonly AdVersionRecheckTickListener[]
   /** The version-changed listeners, read at each version change; none by default. */
@@ -958,6 +963,13 @@ export interface AdVersionRecheck {
   lastVersionSeen(): string
   /** True from `start` until `dispose` or a stop ends the chain. */
   isRunning(): boolean
+  /**
+   * Set the interval of the re-checks (b.2nr, test-only: the override block is
+   * read after this re-check starts). A timer pending between re-checks is
+   * moved to a full new interval from now; a check in flight arms its next
+   * timer at the new interval. A no-op after `dispose` or a stop.
+   */
+  setIntervalMs(intervalMs: number): void
   /**
    * Re-check at once (b.jg5 SRJ-204) and answer with the outcome acted on.
    * Joins a call in flight (timed or triggered) instead of making a second
@@ -1018,6 +1030,8 @@ export function createAdVersionRecheck(deps: AdVersionRecheckDeps): AdVersionRec
   let inFailureRun = false
   let timer: TimerBox | undefined
   let limitTimer: TimerBox | undefined
+  /** The interval between re-checks; moved by `setIntervalMs`. */
+  let intervalMs = deps.intervalMs ?? AD_VERSION_RECHECK_INTERVAL_MS
   /** The one check in flight (call, decision and action), shared by the timer and every trigger. */
   let inFlight: Promise<AdVersionRecheckTriggerAnswer> | undefined
   /** Answers the check in flight not-running at once; set while {@link inFlight} is. */
@@ -1059,7 +1073,7 @@ export function createAdVersionRecheck(deps: AdVersionRecheckDeps): AdVersionRec
       if (timer !== box) return
       timer = undefined
       void runTimedRecheck()
-    }, AD_VERSION_RECHECK_INTERVAL_MS)
+    }, intervalMs)
   }
 
   /**
@@ -1139,7 +1153,7 @@ export function createAdVersionRecheck(deps: AdVersionRecheckDeps): AdVersionRec
     if (outcome.kind === RECHECK_OUTCOME_COULD_NOT_RUN) {
       if (inFailureRun) return
       inFailureRun = true
-      log(buildAdVersionRecheckCouldNotRunLine(outcome.description))
+      log(buildAdVersionRecheckCouldNotRunLine(outcome.description, intervalMs))
       return
     }
     inFailureRun = false
@@ -1236,6 +1250,13 @@ export function createAdVersionRecheck(deps: AdVersionRecheckDeps): AdVersionRec
     isRunning() {
       return started && !ended
     },
+    setIntervalMs(nextIntervalMs) {
+      intervalMs = nextIntervalMs
+      if (!started || ended || timer === undefined) return
+      clearTimer(timer)
+      timer = undefined
+      arm()
+    },
     trigger() {
       if (!started || ended) return Promise.resolve(NOT_RUNNING_ANSWER)
       return runCheck()
@@ -1293,6 +1314,16 @@ export function installAdVersionRecheck(
   installedRecheck = recheck
   recheck.start()
   return recheck
+}
+
+/**
+ * Set the installed re-check's interval (b.2nr, test-only: `installTestTimerOverrides`
+ * calls it once at server start, when the override block sets
+ * `ad_version_recheck_interval_ms`; the block is read after the re-check is
+ * installed). A no-op when none is installed. See `AdVersionRecheck.setIntervalMs`.
+ */
+export function setAdVersionRecheckIntervalMs(intervalMs: number): void {
+  installedRecheck?.setIntervalMs(intervalMs)
 }
 
 /**

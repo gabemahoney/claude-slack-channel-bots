@@ -80,6 +80,7 @@ import * as reloadPlan from '../src/reload-plan.ts'
 import * as restart from '../src/restart.ts'
 import * as rowReadRules from '../src/row-read-rules.ts'
 import * as sessionManager from '../src/session-manager.ts'
+import * as testTimerOverrides from '../src/test-timer-overrides.ts'
 import * as unavailableRetry from '../src/unavailable-retry.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 
@@ -118,6 +119,7 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'restart.ts': restart,
   'row-read-rules.ts': rowReadRules,
   'session-manager.ts': sessionManager,
+  'test-timer-overrides.ts': testTimerOverrides,
   'unavailable-retry.ts': unavailableRetry,
 }
 
@@ -428,17 +430,33 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
   // what the scenario reads of the value beyond its kind, when it reads more.
   const named = new Set(reading.refs.map((r) => `${r.file}:${r.name}:${r.kind}`))
   const scenario20Values: Readonly<Record<string, () => void>> = {
-    // test-23 prints `DEFAULT_AD_SETTINGS tmux starting_session_seconds`, the
-    // starting-session bound it waits past: a positive number.
-    'ad-settings.ts:DEFAULT_AD_SETTINGS:defined': () => {
-      const tables: unknown = MODULES['ad-settings.ts']?.DEFAULT_AD_SETTINGS
-      const tmux: unknown = typeof tables === 'object' && tables !== null && Object.hasOwn(tables, 'tmux') ? (tables as Record<string, unknown>).tmux : undefined
-      const bound: unknown =
-        typeof tmux === 'object' && tmux !== null && Object.hasOwn(tmux, 'starting_session_seconds')
-          ? (tmux as Record<string, unknown>).starting_session_seconds
-          : undefined
-      expect(typeof bound === 'bigint' || (typeof bound === 'number' && Number.isFinite(bound))).toBe(true)
-      expect(Number(bound)).toBeGreaterThan(0)
+    // test-23 prints `AD_SETTING_MINIMUMS` for the two keys it writes at their
+    // minimums, `starting_session_seconds` and `stopping_window_seconds`, and
+    // looks both up in `AD_TMUX_KEYS`: each a positive whole number, each key listed.
+    'ad-settings.ts:AD_TMUX_KEYS:defined': () => {
+      expect(adSettings.AD_TMUX_KEYS).toContain('starting_session_seconds')
+      expect(adSettings.AD_TMUX_KEYS).toContain('stopping_window_seconds')
+    },
+    'ad-settings.ts:AD_SETTING_MINIMUMS:defined': () => {
+      const minimums: Readonly<Record<string, unknown>> = adSettings.AD_SETTING_MINIMUMS
+      for (const key of ['starting_session_seconds', 'stopping_window_seconds']) {
+        const minimum = Object.hasOwn(minimums, key) ? minimums[key] : undefined
+        expect(typeof minimum === 'bigint' || typeof minimum === 'number').toBe(true)
+        expect(Number(minimum)).toBeGreaterThan(0)
+      }
+    },
+    // The override block test-23 writes: the keys it names, the bound the printer checks them against.
+    'config.ts:TEST_TIMER_OVERRIDE_KEYS:defined': () => {
+      expect(config.TEST_TIMER_OVERRIDE_KEYS).toContain('latch_recheck_interval_ms')
+    },
+    'config.ts:MAX_TEST_TIMER_OVERRIDE_MS:defined': () => {
+      expect(config.MAX_TEST_TIMER_OVERRIDE_MS).toBeGreaterThan(0)
+    },
+    'test-timer-overrides.ts:effectiveTestTimer:function': () => {
+      expect(testTimerOverrides.effectiveTestTimer('latch_recheck_interval_ms', { latch_recheck_interval_ms: 7000 })).toBe(7000)
+    },
+    'test-timer-overrides.ts:buildTestTimerOverridesLine:function': () => {
+      expect(testTimerOverrides.buildTestTimerOverridesLine({ latch_recheck_interval_ms: 7000 })).toContain('latch_recheck_interval_ms=7000')
     },
     // The note a harness `get` shows on Part 1's note persona's row.
     'row-read-rules.ts:LATCHING_LIVENESS_NOTE:constant': () => {
@@ -451,7 +469,12 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
     'pane-read.ts:PANE_READ_CONFLICT:constant',
     'pane-read.ts:PANE_READ_GONE:constant',
     'conflict-latch.ts:RECHECK_VERDICT_STILL_LATCHED:constant',
-    'ad-settings.ts:DEFAULT_AD_SETTINGS:defined',
+    'ad-settings.ts:AD_TMUX_KEYS:defined',
+    'ad-settings.ts:AD_SETTING_MINIMUMS:defined',
+    'config.ts:TEST_TIMER_OVERRIDE_KEYS:defined',
+    'config.ts:MAX_TEST_TIMER_OVERRIDE_MS:defined',
+    'test-timer-overrides.ts:effectiveTestTimer:function',
+    'test-timer-overrides.ts:buildTestTimerOverridesLine:function',
     'session-manager.ts:latchClearRetryAtOnceLineHead:function',
     'row-read-rules.ts:LATCHING_LIVENESS_NOTE:constant',
   ])("scenario 20's printer reads %s", (ref) => {

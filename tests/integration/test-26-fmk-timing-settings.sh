@@ -1,21 +1,43 @@
 #!/usr/bin/env bash
 # Test 26 (HO §7 scenario 24; b.jg5 SRJ-1426; AC 80, 84): agent-director's
 # timing values are logged and govern CSCB's waits. With the scenario HOME's
-# agent-director settings file setting pending_grace_seconds 120,
+# agent-director settings file setting pending_grace_seconds 30,
 # stopping_window_seconds 30 and starting_session_seconds 120 (the scenario
-# inputs SRJ-1426 names), the server logs the nine [tmux] values it read; a
-# launch held at an unrecognised dialog gets no pending-row run, live-row
-# sequence `find-missing` run or slower approver read before G (120 s) from
-# its launch start, and its relaunching stuck-launch post at B (300 s);
-# scenario 13's "still stopping" follows the 30 s window; a value changed
-# while the server runs is used from the next read, and a [pause]-only change
-# logs no values line. A refused settings file raises one ad-config-malformed
+# inputs SRJ-1426 names; the grace period at its minimum), the server logs the
+# nine [tmux] values it read; a launch held at an unrecognised dialog gets no
+# pending-row run, live-row sequence `find-missing` run or slower approver
+# read before G (30 s) from its launch start, and its relaunching stuck-launch
+# post at B (120 s); scenario 13's "still stopping" follows the 30 s window; a
+# value changed while the server runs is used from the next read, and a
+# [pause]-only change logs no values line. A refused settings file raises one ad-config-malformed
 # alert per affected persona, changes nothing, keeps the last values and
 # clears once fixed. With create_timeout_ms raised to 40000 (the grace period
 # with it) and the tmux shim's create held past it, CSCB's call timeout at
 # 30000 gives SRJ-213's startup warning and a launch ending in ErrCallTimeout
 # with no launch over its row; at 61000 there is no warning and the same
 # launch ends in agent-director's launch-timeout ErrTmuxUnresponsive.
+#
+# Test-only timer overrides (b.2nr): the production timers this script would
+# otherwise wait out (B's 300 s floor, the 120 s version re-check, the 30 s to
+# 300 s retry timer) are shortened by the `test_timer_overrides` block of
+# CSCB's config.json (src/config.ts TEST_TIMER_OVERRIDE_KEYS), written into
+# every start's config.json by `write_personas` (`set_overrides`) and read
+# once at each start, from the start-time config. The server logs one loud
+# `TEST TIMER OVERRIDES ACTIVE` line naming each overridden timer at each
+# start, which `start_live` requires, equal to the printer's line for the leg's
+# set. Every leg runs with ad_version_recheck_interval_ms 20000 and
+# dialog_ready_timeout_ms 120000 (OVR_BASE); the refused-stopping,
+# refused-grace and both call-timeout legs add unavailable_retry_base_s 5 and
+# unavailable_retry_ceiling_s 60 (OVR_RETRY). The stopping leg keeps the
+# production retry timer: its first retry must fall due after the 30 s
+# stopping window, for exactly one "still stopping" refusal. The latch's
+# re-check (latch_recheck_interval_ms) is not overridden here. A leg that
+# changes the set restarts with config.json.last-applied removed
+# (`restart_with_personas`, `start_call_timeout_leg`), else the start would read
+# the old block from that record. Every timer value is read through
+# fixtures/fmk-texts.ts (effectiveTestTimer, adLaunchBoundMs,
+# unavailableRetryDueS, testTimerOverridesBlock,
+# buildTestTimerOverridesLine) from the same scenario inputs, never retyped.
 #
 # Set-up (fmk mode, lib/scenario.sh): the scenario's own HOME, store and tmux
 # server under SCENARIO_ROOT; the agent-director 0.11.0 release installed
@@ -26,9 +48,9 @@
 # chat.postMessage text whole. Before the first start the scenario writes the
 # scenario HOME's agent-director settings file (`write_ad_settings`, at
 # AD_SETTINGS_RELATIVE_PATH under HOME) with a [tmux] table holding
-# pending_grace_seconds 120, stopping_window_seconds 30 and
-# starting_session_seconds 120: scenario 24 is one of the two scenarios that
-# write [tmux] (b.jg5 SRJ-1401, SRJ-1306), and each key is checked to be one
+# pending_grace_seconds 30, stopping_window_seconds 30 and
+# starting_session_seconds 120: scenario 24 is one of the three scenarios that
+# write [tmux], with scenarios 10 and 20 (b.jg5 SRJ-1401, SRJ-1306), and each key is checked to be one
 # of the package's AD_TMUX_KEYS and each value to be at or above its
 # minimum (AD_SETTING_MINIMUMS, pendingGraceMinimumSeconds at the default
 # create_timeout_ms and pipe_close_wait_ms) before it is written.
@@ -65,12 +87,17 @@
 #      seeding rules); added across a restart in leg call-timeout-30000
 #   T2 work/t2, `dev-channels`; the same in leg call-timeout-61000
 #
-# Waits, all derived from the printer's values for the written table: G
-# (adGraceMs, 120 s), B (adLaunchBoundMs, 300 s), the alert threshold
-# (adAlertThresholdMs, 180 s, printed, not used: the alert timings are
-# unit-tested, SRJ-309, SRJ-313) and the version re-check's 120 s tick
-# (AD_VERSION_RECHECK_INTERVAL_MS), at which the server reads the settings
-# file again (src/ad-settings.ts installAdSettings: after each timed probe).
+# Waits, all derived from the printer's values for the written table and the
+# overrides: G (adGraceMs, 30 s), B (adLaunchBoundMs: the greater of
+# the dialog_ready_timeout_ms override, 120 s, and G + 60 s, so 120 s), the
+# alert threshold (adAlertThresholdMs, 180 s, printed, not used: the alert
+# timings are unit-tested, SRJ-309, SRJ-313) and the version re-check's 20 s
+# tick (the ad_version_recheck_interval_ms override, effectiveTestTimer), at
+# which the server reads the settings file again (src/ad-settings.ts
+# installAdSettings: after each timed probe). The change leg's raised G is 60 s
+# (B stays 120 s), and its window for R's `read-pane` calls, (35 s, 55 s) from
+# R's launch start, lies past G, before the raised G and before B; the held
+# leg's slow-pace window, (G + 5 s, G + 65 s) = (35 s, 95 s), ends before B.
 # A bot-server probe is a CSCB `version` call in the agent-director shim's log
 # whose parent is the bot server. Every time is taken by this script as it
 # polls, or from a log line's own time: a shim line's time field, a
@@ -86,19 +113,23 @@
 # call-timeout legs'
 # timing bounds come from their scenario inputs (CALL_TIMEOUT_LOW_MS,
 # CREATE_RAISED_MS, CALL_TIMEOUT_HIGH_MS) and the printer's need. The whole
-# script runs about 39 minutes: about 17 for the legs before the refused
-# values (most of it the held launch's B and the change leg's three waits for
-# the next timed probe), about 9 for each refused-value leg (the wait for the
-# next timed probe, the added persona's retries on its timer, and its timer's
-# pending-only retry after it comes up) and about 4 for the two call-timeout
-# legs (each held create, and T1's retry timer until it stops).
+# script runs about 18 minutes (an estimate from the legs' waits): about 8 for
+# the legs before the refused values (most of it the held launch's B, the
+# stopping leg's two retries on the production timer and the change leg's three
+# waits for the next timed probe), about 2.5 for each refused-value leg (the
+# two waits for a timed probe, one settled before the refused file is written
+# and one for its read, the added persona's retries on its timer, and its
+# timer's pending-only retry after it comes up) and about 2 for each
+# call-timeout leg (the held create, and T1's retry timer until it stops).
 #
 # Legs (in order, each a function below):
 #   values      the first start, with S: exactly one values line, equal to
 #               the printer's line for the written path, the three written
 #               values and the six defaults (it carries the nine [tmux]
 #               values only); every later start of the script logs exactly
-#               one such line too.
+#               one such line too. Every start also logs exactly one TEST
+#               TIMER OVERRIDES ACTIVE line, equal to the printer's line for
+#               the leg's override set (`start_live`).
 #   stopping    scenario 13's "still stopping" (hatch decision): S up and
 #               waiting (its session's creation time taken), `stop
 #               --stop-bots` (CSCB's `pause` makes S's row `ended` while its
@@ -123,8 +154,8 @@
 #               slower approver read before G: P's `read-pane` calls in
 #               (L + 5 s, L + G), at least two, no gap between consecutive
 #               ones as long as PACE_GAP_LIMIT_S, and the last within the slow
-#               pace of L + G; in (G + 5, G + 65) at most what the slow pace
-#               allows; no CSCB `find-missing` before the launch start
+#               pace of L + G; in (G + 5, G + 65), a window that ends before
+#               B, at most what the slow pace allows; no CSCB `find-missing` before the launch start
 #               plus G; no post to P's channel and no CSCB kill of P before
 #               the relaunching post; exactly one relaunching post, its stub
 #               record time no earlier than B and less than 30 s after it, its
@@ -138,7 +169,8 @@
 #               start L read; the symlink re-pointed at q_ready (one rename),
 #               so its row's `cwd` (agent-director records the real path) no
 #               longer matches (ruling S5); a plain stop and start before L +
-#               G (ruling S4: a restart without teardown). The restart's start
+#               G (ruling S4: a restart without teardown), whose gate probe
+#               must come inside G (30 s: asserted). The restart's start
 #               sweep (b.jg5 SRJ-714) kills that live row and makes its one
 #               `find-missing` run after its kills at once: recorded, since
 #               SRJ-1426's G rule is the live-row sequence's. The start pass
@@ -154,10 +186,10 @@
 #               channel.
 #   change      a [pause]-only change (timeout_seconds 60, the [tmux] values
 #               kept) logs no values line through the next bot-server probe;
-#               pending_grace_seconds raised to 240 (above its minimum) logs
-#               exactly one values line, naming 240, after the next probe and
+#               pending_grace_seconds raised to 60 (above its minimum) logs
+#               exactly one values line, naming 60, after the next probe and
 #               none before it; R, added by a confirmed reload, is held at its
-#               dialog, and its `read-pane` count in (L + 130 s, L + 170 s)
+#               dialog, and its `read-pane` count in (L + 35 s, L + 55 s)
 #               from its launch start L is above what the slow pace allows
 #               (the new G is in use); a harness Enter brings R up; the file's
 #               earlier [tmux] values come back with no [pause] table, and
@@ -166,8 +198,9 @@
 #               refused values (b.jg5 SRJ-1426, SRJ-209, SRJ-316, SRJ-1018;
 #               AC 84; the suite's only deliberately refused values, SRJ-1401's
 #               exception): the server restarted with `session_restart_delay`
-#               0 (and `health_check_interval` 0, as throughout), S, P, Q and
-#               R up; the file written with stopping_window_seconds 10, below
+#               0 (and `health_check_interval` 0, as throughout) and the retry
+#               timer's base 5 s and ceiling 60 s added to the overrides (kept
+#               by every later leg), S, P, Q and R up; the file written with stopping_window_seconds 10, below
 #               its minimum; after the next bot-server probe C1 is added by a
 #               confirmed reload, its launch meets agent-director's
 #               native ErrConfigMalformed
@@ -263,11 +296,12 @@
 #   VALUES_PREFIX        AD_SETTINGS_LOG_PREFIX              src/ad-settings.ts
 #   values lines         buildAdSettingsValuesLine <path> <key>=<value>...
 #                                                            src/ad-settings.ts
-#   G_MS, B_MS, ALERT_MS adGraceMs, adLaunchBoundMs, adAlertThresholdMs
+#   G_MS, ALERT_MS       adGraceMs, adAlertThresholdMs       src/ad-settings.ts
+#   B_MS                 adLaunchBoundMs <the table> dialog_ready_timeout_ms=<override>
 #                                                            src/ad-settings.ts
 #   B_MINUTES            wholeMinutes <B_MS>                 src/ad-settings.ts
-#   RECHECK_S            AD_VERSION_RECHECK_INTERVAL_MS / 1000
-#                                                            src/ad-version-gate.ts
+#   RECHECK_S            effectiveTestTimer ad_version_recheck_interval_ms <the OVR_BASE pairs> / 1000
+#                                                            src/test-timer-overrides.ts
 #   FAST_PACE_MS         DIALOG_POLL_INTERVAL_MS             src/session-manager.ts
 #   SLOW_PACE_MS         DIALOG_SLOW_POLL_INTERVAL_MS        src/session-manager.ts
 #   PACE_GAP_LIMIT_S     (FAST_PACE_MS + SLOW_PACE_MS) / 2, in seconds
@@ -292,8 +326,16 @@
 #   not-judged lines     liveRowSequenceRunLine <Q's ref> <step> <run> LIVE_ROW_RUN_NOT_JUDGED
 #                                                            src/live-row-sequence.ts
 #   CONFIG_FILE_NAME     AD_CONFIG_FILE_DISPLAY_NAME         src/ad-config-file.ts
-#   RETRY_BASE_S         UNAVAILABLE_RETRY_BASE_S            src/unavailable-retry.ts
-#   RETRY_CEILING_S      UNAVAILABLE_RETRY_CEILING_S         src/unavailable-retry.ts
+#   RETRY_CEILING_S      effectiveTestTimer unavailable_retry_ceiling_s <the OVR_RETRY pairs>
+#                                                            src/test-timer-overrides.ts
+#   RETRY2_DUE_S         unavailableRetryDueS 2 <the OVR_RETRY retry pairs>
+#                                                            fixtures/fmk-texts.ts, src/backoff.ts
+#   STOPPING_RETRY1_S    unavailableRetryDueS 1 (the production retry timer)
+#                                                            fixtures/fmk-texts.ts
+#   the override block and its line
+#                        testTimerOverridesBlock <pairs>, buildTestTimerOverridesLine <pairs>
+#                                                            src/config.ts,
+#                                                            src/test-timer-overrides.ts
 #   STOP_ROW_LIVE, STOP_RECOVERED
 #                        UNAVAILABLE_RETRY_STOP_ROW_LIVE, UNAVAILABLE_RETRY_STOP_RECOVERED
 #                                                            src/unavailable-retry.ts
@@ -390,18 +432,35 @@ TEXTS="${SCENARIO_FIXTURES}/fmk-texts.ts"
 # Values from src/ (through the printer) and the scenario's own
 # ---------------------------------------------------------------------------
 
-# The [tmux] table scenario 24 writes (b.jg5 SRJ-1426's scenario inputs).
-GRACE_S=120
+# The [tmux] table scenario 24 writes (b.jg5 SRJ-1426's scenario inputs). G is
+# agent-director's minimum for the pending grace period, 30 s (the ticket b.2nr
+# shortens every wait of this script to what its checks need).
+GRACE_S=30
 STOPPING_S=30
 STARTING_S=120
-# The raised grace period of the change leg (scenario input).
-GRACE_RAISED_S=240
+# The raised grace period of the change leg (scenario input): above G.
+GRACE_RAISED_S=60
 # The [pause] timeout_seconds of the [pause]-only change (scenario input).
 PAUSE_TIMEOUT_S=60
 # The change leg's window for R's read-pane calls, from its launch start, in
-# seconds: past the first G and before the raised one (scenario inputs).
-R_WINDOW_FROM_S=130
-R_WINDOW_TO_S=170
+# seconds: past the first G, before the raised one and before B (scenario
+# inputs; the setup checks the order).
+R_WINDOW_FROM_S=35
+R_WINDOW_TO_S=55
+# The held leg's slow-pace window, from P's launch start, as offsets from G in
+# seconds (scenario inputs): it must end before B.
+HELD_SLOW_FROM_S=5
+HELD_SLOW_TO_S=65
+
+# The test-only timer overrides (b.2nr): the config.json `test_timer_overrides`
+# block each server start of this script reads (the scenario inputs; every
+# value read back goes through the printer below, none is retyped). Every leg
+# runs with the first two; the refused-stopping, refused-grace and both
+# call-timeout legs add the retry timer's base and ceiling.
+OVR_RECHECK_MS=20000
+OVR_DIALOG_READY_MS=120000
+OVR_RETRY_BASE_S=5
+OVR_RETRY_CEILING_S=60
 
 TMUX_KEYS_TEXT="$(bun "${TEXTS}" AD_TMUX_KEYS)" || fail "setup: fmk-texts AD_TMUX_KEYS"
 read -r -a TMUX_KEYS <<< "${TMUX_KEYS_TEXT}"
@@ -429,6 +488,15 @@ printed() {
     bun "${TEXTS}" "$@" || fail "setup: fmk-texts $*"
 }
 
+# The override sets as <key>=<value> pairs, for the printer's entries: OVR_BASE
+# (every leg) and OVR_RETRY (the legs with the retry timer's base and ceiling).
+OVR_BASE=("ad_version_recheck_interval_ms=${OVR_RECHECK_MS}" "dialog_ready_timeout_ms=${OVR_DIALOG_READY_MS}")
+OVR_RETRY=("${OVR_BASE[@]}" "unavailable_retry_base_s=${OVR_RETRY_BASE_S}" "unavailable_retry_ceiling_s=${OVR_RETRY_CEILING_S}")
+# The set in force (set_overrides): its config.json block, which write_personas
+# writes, and the loud line the server logs at each start of it.
+TEST_TIMER_BLOCK=""
+OVERRIDES_LINE=""
+
 MIN_STOPPING="$(printed AD_SETTING_MINIMUMS "${KEY_STOPPING}")" || exit 1
 MIN_STARTING="$(printed AD_SETTING_MINIMUMS "${KEY_STARTING}")" || exit 1
 DEFAULT_CREATE="$(printed DEFAULT_AD_SETTINGS tmux "${KEY_CREATE}")" || exit 1
@@ -443,11 +511,11 @@ TABLE_RAISED=("${KEY_GRACE}=${GRACE_RAISED_S}" "${KEY_STOPPING}=${STOPPING_S}" "
 
 VALUES_PREFIX="$(printed AD_SETTINGS_LOG_PREFIX)" || exit 1
 G_MS="$(printed adGraceMs "${TABLE[@]}")" || exit 1
-B_MS="$(printed adLaunchBoundMs "${TABLE[@]}")" || exit 1
+B_MS="$(printed adLaunchBoundMs "${TABLE[@]}" "dialog_ready_timeout_ms=${OVR_DIALOG_READY_MS}")" || exit 1
 ALERT_MS="$(printed adAlertThresholdMs "${TABLE[@]}")" || exit 1
 B_MINUTES="$(printed wholeMinutes "${B_MS}")" || exit 1
 G_RAISED_MS="$(printed adGraceMs "${TABLE_RAISED[@]}")" || exit 1
-RECHECK_MS="$(printed AD_VERSION_RECHECK_INTERVAL_MS)" || exit 1
+RECHECK_MS="$(printed effectiveTestTimer ad_version_recheck_interval_ms "${OVR_BASE[@]}")" || exit 1
 FAST_PACE_MS="$(printed DIALOG_POLL_INTERVAL_MS)" || exit 1
 SLOW_PACE_MS="$(printed DIALOG_SLOW_POLL_INTERVAL_MS)" || exit 1
 STILL_STOPPING="$(printed STILL_STOPPING_PHRASE)" || exit 1
@@ -465,6 +533,11 @@ RECHECK_S=$(( RECHECK_MS / 1000 ))
 SLOW_PACE_S=$(( SLOW_PACE_MS / 1000 ))
 (( G_S < R_WINDOW_FROM_S && R_WINDOW_FROM_S < R_WINDOW_TO_S && R_WINDOW_TO_S < G_RAISED_S && R_WINDOW_TO_S < B_S )) \
     || fail "setup: R's window (${R_WINDOW_FROM_S}s, ${R_WINDOW_TO_S}s) does not lie past G ${G_S}s and before the raised G ${G_RAISED_S}s and B ${B_S}s"
+# The held leg's slow-pace window: from G + 5 s to G + 65 s, ending before B.
+HELD_WINDOW_FROM_S=$(( G_S + HELD_SLOW_FROM_S ))
+HELD_WINDOW_TO_S=$(( G_S + HELD_SLOW_TO_S ))
+(( HELD_SLOW_FROM_S > 0 && HELD_WINDOW_FROM_S < HELD_WINDOW_TO_S && HELD_WINDOW_TO_S < B_S )) \
+    || fail "setup: the held leg's slow-pace window (${HELD_WINDOW_FROM_S}s, ${HELD_WINDOW_TO_S}s) does not lie past G ${G_S}s and before B ${B_S}s"
 (( FAST_PACE_MS < SLOW_PACE_MS )) || fail "setup: the approver's pace before G (${FAST_PACE_MS} ms) is not faster than its slow pace (${SLOW_PACE_MS} ms)"
 # The longest gap between two approver reads of a launch before G: halfway
 # between the fast pace and the slow one, so a slow-paced read before G shows
@@ -517,7 +590,15 @@ GATE_WAIT_S=60      # a start's first bot-server probe (the startup gate)
 REPORT_WAIT_S=120   # a persona launching and reporting in (waiting)
 LAUNCH_WAIT_S=60    # a start or reload making a persona's launch call
 LOG_WAIT_S=30       # a server.log line following the call it reports
-RETRY_WAIT_S=120    # CSCB's next UNAVAILABLE retry of a persona
+# CSCB's next UNAVAILABLE retry of S in the stopping leg, which runs with the
+# production retry timer (no override of its base or ceiling): the first retry
+# must fall due after the stopping window, so S's first retry meets "still
+# starting" and exactly one refusal says "still stopping".
+STOPPING_RETRY1_S="$(printed unavailableRetryDueS 1)" || exit 1
+[[ "${STOPPING_RETRY1_S}" =~ ^[1-9][0-9]*$ ]] || fail "setup: the production retry timer's first wait '${STOPPING_RETRY1_S}' is not a whole number of seconds"
+(( STOPPING_RETRY1_S >= STOPPING_S )) \
+    || fail "setup: the production retry timer's first wait (${STOPPING_RETRY1_S}s) is shorter than ${KEY_STOPPING} ${STOPPING_S}s: S's first retry would meet 'still stopping'"
+RETRY_WAIT_S=$(( STOPPING_RETRY1_S + LAUNCH_WAIT_S ))
 PROBE_SETTLE_S=2    # after a probe's process has ended: the tick's listeners acting on it
 RELOAD_WAIT_S=30    # a config change previewed, or a confirmation applied
 
@@ -793,9 +874,24 @@ persona_files() {
         | write_file "${CREDS_DIR}/${x}.json" 600
 }
 
+# set_overrides <pair>...: the test-only timer overrides the next write_personas
+# writes as config.json's `test_timer_overrides` and the next starts log
+# (`<key>=<integer>` pairs: OVR_BASE or OVR_RETRY). The block and the loud line
+# come from the printer. The server reads the block once, at each start, from
+# the start-time config (the last-applied record when there is one), so a leg
+# that changes the set restarts through restart_with_personas or
+# start_call_timeout_leg, which remove the record first.
+set_overrides() {
+    TEST_TIMER_BLOCK="$(printed testTimerOverridesBlock "$@")" || exit 1
+    OVERRIDES_LINE="$(printed buildTestTimerOverridesLine "$@")" || exit 1
+    [[ "${TEST_TIMER_BLOCK}" == '{'*'}' && "${TEST_TIMER_BLOCK}" != '{}' && -n "${OVERRIDES_LINE}" ]] \
+        || fail "setup: the printer gives no override block or line for $*: '${TEST_TIMER_BLOCK}', '${OVERRIDES_LINE}'"
+}
+
 # write_personas <x>...: the config with the personas <x>..., in that order,
-# `session_restart_delay` RESTART_DELAY_S when that is set and
-# `agent_director_call_timeout_ms` CALL_TIMEOUT_MS when that is set.
+# the `test_timer_overrides` block of set_overrides, `session_restart_delay`
+# RESTART_DELAY_S when that is set and `agent_director_call_timeout_ms`
+# CALL_TIMEOUT_MS when that is set.
 write_personas() {
     local x personas="[]" one
     for x in "$@"; do
@@ -805,28 +901,33 @@ write_personas() {
                 channels: [{id: $ch, delivery: "all"}], permission_prompts: $ch}')"
         personas="$(jq -c --argjson one "${one}" '. + [$one]' <<< "${personas}")"
     done
+    [[ -n "${TEST_TIMER_BLOCK}" ]] || fail "write_personas: no test_timer_overrides block (set_overrides first)"
     jq -n --argjson personas "${personas}" --argjson port "${SCENARIO_PORT}" --arg delay "${RESTART_DELAY_S}" \
-        --arg call_timeout "${CALL_TIMEOUT_MS}" '{
+        --arg call_timeout "${CALL_TIMEOUT_MS}" --argjson overrides "${TEST_TIMER_BLOCK}" '{
         personas: $personas,
         bind: "127.0.0.1", port: $port,
         health_check_interval: 0, exit_timeout: 5, resume_enabled: true,
-        agent_director_poll_interval_ms: 3600000
+        agent_director_poll_interval_ms: 3600000,
+        test_timer_overrides: $overrides
     } + (if $delay == "" then {} else {session_restart_delay: ($delay | tonumber)} end)
       + (if $call_timeout == "" then {} else {agent_director_call_timeout_ms: ($call_timeout | tonumber)} end)' | write_config
 }
 
 # start_live <step> <expected-values-line>: start the server; wait for the
-# startup gate's probe (T_GATE) and for exactly one values line, equal to
-# <expected-values-line>. Sets T_START (before the start).
+# startup gate's probe (T_GATE), for exactly one values line, equal to
+# <expected-values-line>, and for exactly one loud TEST TIMER OVERRIDES ACTIVE
+# line, equal to OVERRIDES_LINE. Sets T_START (before the start).
 start_live() {
-    local step="$1" want="$2" n_version values_before
+    local step="$1" want="$2" n_version values_before overrides_before
     n_version="$(cscb_ad_count version)"
     values_before="$(values_lines)"
+    overrides_before="$(count_log "${OVERRIDES_STEM}")"
     T_START="$(now_s)"
     start_server --live
     wait_server_probe "${n_version}" "${GATE_WAIT_S}" "${step}: the startup gate's probe"
     T_GATE="${CALL_T}"
     expect_one_values_line "${step}: startup" "${values_before}" "${want}"
+    expect_one_overrides_line "${step}: startup" "${overrides_before}" "${LOG_WAIT_S}"
 }
 
 # restart_with_personas <step> <x>...: a plain stop, the config with the
@@ -876,6 +977,10 @@ VALUES_STEM="$(values_stem)" || exit 1
 [[ -n "${VALUES_STEM}" && "${VALUES_STEM}" == "${VALUES_PREFIX}"* ]] || fail "setup: the values line does not start with AD_SETTINGS_LOG_PREFIX"
 VALUES_LINE="$(printed buildAdSettingsValuesLine "${AD_SETTINGS_FILE}" "${TABLE[@]}")" || exit 1
 VALUES_LINE_RAISED="$(printed buildAdSettingsValuesLine "${AD_SETTINGS_FILE}" "${TABLE_RAISED[@]}")" || exit 1
+# The loud line's text up to its colon (the printer's line for the base set),
+# which matches the line of any set (OVERRIDES_LINE is set by set_overrides).
+OVERRIDES_STEM="$(overrides_stem "$(printed buildTestTimerOverridesLine "${OVR_BASE[@]}")")" || exit 1
+set_overrides "${OVR_BASE[@]}"
 
 start_slack_stub
 CREDS_DIR="${SCENARIO_ROOT}/credentials"
@@ -1031,9 +1136,10 @@ leg_held() {
     # Before G, (L + 5 s, L + G): the approver reads at its fast pace
     # throughout, so no slower read: every gap between two consecutive
     # read-pane calls of P is below PACE_GAP_LIMIT_S, and the last read lies
-    # within the slow pace of L + G. From G, (G + 5, G + 65): at most what
-    # the slow pace allows. The times are the shim lines' own.
-    sleep_until "$(time_plus "${l_p}" "$(( G_S + 65 + 1 ))")"
+    # within the slow pace of L + G. From G, (G + 5, G + 65), which ends before
+    # B (checked at set-up): at most what the slow pace allows. The times are
+    # the shim lines' own.
+    sleep_until "$(time_plus "${l_p}" "$(( HELD_WINDOW_TO_S + 1 ))")"
     reads="$(cscb_ad_calls read-pane --instance-id "${ID[p]}" \
         | awk -F'\t' -v a="$(time_plus "${l_p}" 5)" -v b="$(time_plus "${l_p}" "${G_S}")" '$2 > a && $2 < b { print $2 }')"
     pace="$(awk -v end="$(time_plus "${l_p}" "${G_S}")" '
@@ -1041,9 +1147,9 @@ leg_held() {
         END { printf "%d %.3f %.3f\n", n, gap + 0, (n > 0 ? end - prev : end) }' <<< "${reads}")"
     read -r n_fast gap_max tail_s <<< "${pace}"
     # The window (G + 5, G + 65) is 60 s long.
-    allowed=$(( 60 / SLOW_PACE_S + 1 ))
-    n2="$(cscb_calls_between "$(time_plus "${l_p}" "$(( G_S + 5 ))")" "$(time_plus "${l_p}" "$(( G_S + 65 ))")" read-pane --instance-id "${ID[p]}")"
-    echo "${TEST_NAME}: held: P's read-pane calls: ${n_fast} in (5s, ${G_S}s), the longest gap ${gap_max}s (limit ${PACE_GAP_LIMIT_S}s), the last ${tail_s}s before G; ${n2} in ($(( G_S + 5 ))s, $(( G_S + 65 ))s), the slow pace allows ${allowed}"
+    allowed=$(( (HELD_WINDOW_TO_S - HELD_WINDOW_FROM_S) / SLOW_PACE_S + 1 ))
+    n2="$(cscb_calls_between "$(time_plus "${l_p}" "${HELD_WINDOW_FROM_S}")" "$(time_plus "${l_p}" "${HELD_WINDOW_TO_S}")" read-pane --instance-id "${ID[p]}")"
+    echo "${TEST_NAME}: held: P's read-pane calls: ${n_fast} in (5s, ${G_S}s), the longest gap ${gap_max}s (limit ${PACE_GAP_LIMIT_S}s), the last ${tail_s}s before G; ${n2} in (${HELD_WINDOW_FROM_S}s, ${HELD_WINDOW_TO_S}s), the slow pace allows ${allowed}"
     (( n_fast >= 2 )) || fail "held: ${n_fast} read-pane call(s) of P in (5s, ${G_S}s) from its launch start, not the approver's fast pace"
     time_before "${gap_max}" "${PACE_GAP_LIMIT_S}" \
         || fail "held: a gap of ${gap_max}s between two read-pane calls of P before G, not below ${PACE_GAP_LIMIT_S}s: a slower approver read before G"
@@ -1288,14 +1394,16 @@ REFUSED_STOPPING_S=10
 REFUSED_GRACE_TEXT='"60"'
 (( REFUSED_STOPPING_S < MIN_STOPPING )) || fail "setup: ${KEY_STOPPING} ${REFUSED_STOPPING_S} is not below its minimum ${MIN_STOPPING}"
 CONFIG_FILE_NAME="$(printed AD_CONFIG_FILE_DISPLAY_NAME)" || exit 1
-RETRY_BASE_S="$(printed UNAVAILABLE_RETRY_BASE_S)" || exit 1
-RETRY_CEILING_S="$(printed UNAVAILABLE_RETRY_CEILING_S)" || exit 1
+# The retry timer's ceiling of the legs with OVR_RETRY (the refused and
+# call-timeout legs), and when its second retry falls due after its arm.
+RETRY_CEILING_S="$(printed effectiveTestTimer unavailable_retry_ceiling_s "${OVR_RETRY[@]}")" || exit 1
+RETRY2_DUE_S="$(printed unavailableRetryDueS 2 "unavailable_retry_base_s=${OVR_RETRY_BASE_S}" "unavailable_retry_ceiling_s=${OVR_RETRY_CEILING_S}")" || exit 1
 # The reasons of a retry timer's stop: a pending-only retry read the row
 # live; a retry found nothing left to recover.
 STOP_ROW_LIVE="$(printed UNAVAILABLE_RETRY_STOP_ROW_LIVE)" || exit 1
 STOP_RECOVERED="$(printed UNAVAILABLE_RETRY_STOP_RECOVERED)" || exit 1
-[[ "${RETRY_BASE_S}" =~ ^[1-9][0-9]*$ && "${RETRY_CEILING_S}" =~ ^[1-9][0-9]*$ ]] \
-    || fail "setup: UNAVAILABLE_RETRY_BASE_S '${RETRY_BASE_S}' or UNAVAILABLE_RETRY_CEILING_S '${RETRY_CEILING_S}' is not a whole number of seconds"
+[[ "${RETRY_CEILING_S}" =~ ^[1-9][0-9]*$ && "${RETRY2_DUE_S}" =~ ^[1-9][0-9]*$ ]] \
+    || fail "setup: the retry ceiling '${RETRY_CEILING_S}' or second retry's due time '${RETRY2_DUE_S}' is not a whole number of seconds"
 # The ad-config-malformed class, as the all-clear lists it: src/outage-state.ts
 # keeps the label in a const it does not export (its OutageClass
 # `ad-config-malformed`), so it is quoted here (ruling S7); the printer's
@@ -1394,8 +1502,14 @@ refused_values_check() {
     done
     [[ "$(count_log "${raised_m}")" == 0 ]] || fail "${label}: ${name} was raised before the leg"
 
-    # The refused file; the next bot-server probe's read refuses it.
+    # The refused file; the next bot-server probe's read refuses it. A probe
+    # that is already running when the file is written could read it before
+    # t_bad's settle, so wait for one probe and let it settle first: the next
+    # probe is then a whole tick away, and it is the one that reads the file.
     could_not_run_before="$(count_log "${COULD_NOT_RUN_PREFIX}")"
+    n_version="$(cscb_ad_count version)"
+    wait_server_probe "${n_version}" "$(( RECHECK_S + PROBE_ALLOWANCE_S ))" "${label}: no bot-server probe before the refused file was written"
+    settle_probe "${label}: the probe before the refused file"
     t_bad="$(now_s)"
     write_ad_settings "$@"
     n_version="$(cscb_ad_count version)"
@@ -1446,7 +1560,7 @@ refused_values_check() {
     t_probe="${CALL_T}"
     settle_probe "${label}: the probe inside the refusal"
     m="$(rearmed_matcher "${label}" "${x}" 2)" || exit 1
-    wait_for_count "${m}" 1 "$(( 3 * RETRY_BASE_S + LAUNCH_WAIT_S ))" "${label}: ${name} was not retried twice on its timer"
+    wait_for_count "${m}" 1 "$(( RETRY2_DUE_S + LAUNCH_WAIT_S ))" "${label}: ${name} was not retried twice on its timer"
     sleep "${PROBE_SETTLE_S}"
     t_fix="$(now_s)"
 
@@ -1483,8 +1597,11 @@ refused_values_check() {
     # unknown, not dead), no launch, nothing counted, and the timer re-armed.
     retries=0
     while :; do
+        # Only the retries before the fix count (the timer's short waits mean
+        # another can fall due while this check runs); a line of a later
+        # retry is neither counted nor required.
         m="$(printed unavailableRetryRetryLine "${KEY[${x}]}" "$(( retries + 1 ))" full)" || exit 1
-        [[ "$(count_log "${m}")" == 1 ]] || break
+        [[ "$(count_log_from "${t_bad}" "${t_fix}" "${m}")" == 1 ]] || break
         retries=$(( retries + 1 ))
         m="$(rearmed_matcher "${label}" "${x}" "${retries}")" || exit 1
         [[ "$(count_log "${m}")" == 1 ]] || fail "${label}: ${name}'s retry ${retries} was not re-armed as liveness unknown"
@@ -1508,7 +1625,8 @@ refused_values_check() {
     write_ad_settings "${TABLE[@]}"
     t_fix="$(now_s)"
     n_version="$(cscb_ad_count version)"
-    wait_until "$(( 4 * RETRY_BASE_S + REPORT_WAIT_S ))" "${label}: ${name} never reported in after the fix" row_state_is "${ID[${x}]}" waiting
+    # The next retry falls due within the ceiling, and its launch reports in.
+    wait_until "$(( RETRY_CEILING_S + REPORT_WAIT_S ))" "${label}: ${name} never reported in after the fix" row_state_is "${ID[${x}]}" waiting
     wait_until "${LOG_WAIT_S}" "${label}: no all-clear post to ${name}'s channel after the fix" \
         posts_above "${CHANNEL[${x}]}" "$(( posts_before[${x}] + 1 ))"
     # The timer that launched <x> runs on in pending-only mode until a retry
@@ -1557,7 +1675,10 @@ posts_above() {
 leg_refused_stopping() {
     leg refused-stopping
     # The server restarted with session_restart_delay 0 (health_check_interval
-    # is 0 throughout).
+    # is 0 throughout) and the retry timer's base and ceiling shortened, which
+    # this and every later leg keeps (the restart removes the last-applied
+    # record, so the start reads the new block).
+    set_overrides "${OVR_RETRY[@]}"
     RESTART_DELAY_S=0
     UP_PERSONAS=(s p q r)
     restart_with_personas "refused-stopping" "${UP_PERSONAS[@]}"
