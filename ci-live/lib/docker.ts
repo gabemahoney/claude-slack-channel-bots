@@ -38,7 +38,7 @@ import { countTokenShaped } from './redact.ts'
 import type { ProcResult, SpawnFn } from './proc.ts'
 
 export const BASE_IMAGE = 'cscb-ci-base:v7'
-export const LIVE_IMAGE = 'cscb-ci-live:latest'
+export const LIVE_IMAGE = 'cscb-ci-live:v1'
 export const CONTAINER_LABEL_KEY = 'cscb-live'
 export const CONTAINER_LABEL = `${CONTAINER_LABEL_KEY}=1`
 /** The label holding the PID of the runner that started the container (leftover removal spares a live owner's). */

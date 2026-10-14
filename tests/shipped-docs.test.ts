@@ -467,7 +467,7 @@ import { slowRecoveryText } from '../src/slow-recovery.ts'
 import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
 import { errTmuxKillFailed, KILL_FAILED_DESCRIPTIONS, STUB_SURVIVOR_PIDS } from './test-helpers/agent-director-stub.ts'
 import { humanOnlySentencesIn } from './test-helpers/conflict-cases.ts'
-import { CLIENT_MIN_VERSION, MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
+import { CLIENT_MIN_VERSION, HISTORICAL_PHASE1_CLAUDE_CODE_VERSION, MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
   REFUSAL_BLOCK_HEADING,
   ROLLBACK_RUNBOOK_SECTION_TITLE,
@@ -2785,7 +2785,7 @@ const OPERATOR_ACTION = '(operator action)'
 const HISTORICAL_RUNBOOK_AD = '0.10.0'
 const HISTORICAL_RUNBOOK_CLIENT_MIN = '0.7.0'
 const HISTORICAL_RUNBOOK_FLOOR = '0.11.0'
-const HISTORICAL_RUNBOOK_CLAUDE = '2.1.280'
+const HISTORICAL_RUNBOOK_CLAUDE = HISTORICAL_PHASE1_CLAUDE_CODE_VERSION
 
 const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly Item[]][] = [
   // The section-level statements.
@@ -2858,7 +2858,7 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci(`tmux ${vocab('tmuxMinimum')} or later`),
     `${vocab('remainOnExit')} off`,
   ]],
-  ['step 1 › Claude Code', `\`claude --version\` in the launcher environment, ${HISTORICAL_RUNBOOK_CLAUDE} or later ('2.1.280'), the agent-director minimum and the fleet's version; stop before anything goes down`, [
+  ['step 1 › Claude Code', `\`claude --version\` in the launcher environment, ${HISTORICAL_RUNBOOK_CLAUDE} or later (${HISTORICAL_RUNBOOK_CLAUDE}), the agent-director minimum and the fleet's version; stop before anything goes down`, [
     code('claude --version'),
     ci("in the bot server's launcher environment"),
     ci('the same user and `PATH` the server launches workers with'),
@@ -6392,10 +6392,10 @@ const LATCH_RECHECK_WORDS = `every ${LATCH_RECHECK_INTERVAL_MS / 60_000} minutes
  */
 const README_SRJ_1103_ROWS: readonly DocRow[] = [
   // The prerequisites.
-  [`prerequisites: Claude Code ${MIN_CLAUDE_CODE_VERSION} or later for the workers (MIN_CLAUDE_CODE_VERSION), the minimum agent-director states for its exec-form hooks and the fleet's version (RN-9; HO rev 31; SRJ-1304)`, unitOf(USER_DOCS_NAME, PREREQUISITES_HEADING, '- [Claude Code]'), [
+  [`prerequisites: Claude Code ${MIN_CLAUDE_CODE_VERSION} or later for the workers (MIN_CLAUDE_CODE_VERSION), CSCB's supported minimum and the fleet's version (b.9v8)`, unitOf(USER_DOCS_NAME, PREREQUISITES_HEADING, '- [Claude Code]'), [
     `Claude Code ${MIN_CLAUDE_CODE_VERSION} or later for the workers`,
     ci('installed and authenticated'),
-    ci('the minimum agent-director states for its exec-form hooks'),
+    ci("CSCB's supported minimum"),
     ci('the version the fleet runs'),
   ]],
   ['prerequisites: agent-director Phase 1 or later, installed system-wide', unitOf(USER_DOCS_NAME, PREREQUISITES_HEADING, '- [`agent-director`]'), [
@@ -8473,6 +8473,81 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
   const upgrade = () => readRunbookCarrier(RUNBOOK_DOC, migration(), SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
   const rollback = () => readRunbookCarrier(RUNBOOK_DOC, migration(), ROLLBACK_HEADING, ROLLBACK_STEP_COUNT)
 
+  // b.9v8: only pre-persona hosts start fresh once. Existing persona rows
+  // resume when their current transcript and unchanged identity permit it.
+  const resumeRequirements = [
+    'On a host switching over from a pre-persona release (0.10.x)',
+    'Each persona starts fresh once on that host. Pre-persona rows are kept and never resumed.',
+    'On a host already running personas (0.11.0 or later), each persona resumes its conversation when the resume conditions above hold.',
+    'agent-director get --instance-id cscb_<key>',
+    '`state` as `ended` or `missing`, a non-empty `session_id`, and `transcript_status: present`',
+    "Keep the persona's key, `working_directory` and `claude_config_dir` unchanged, leave `resume_enabled` enabled",
+    "no leftover session has the persona's session name",
+    'check `server.log` for `spawnForPersona: attempting resume for …`',
+    "agent-director 0.12.0 resumes only the current session: it no longer falls back to an older session's transcript when the current one is missing.",
+  ]
+  const resumeGuidanceProblems = (step: string) => resumeRequirements.filter((phrase) => !flat(step).includes(phrase))
+  const workerFloorProblems = (passage: string) => [
+    `${MIN_CLAUDE_CODE_VERSION} or later`, '2.1.139',
+  ].filter((phrase) => !passage.includes(phrase))
+
+  test('the supported Claude Code floor agrees across worker prerequisites, migration and released notes (b.9v8)', () => {
+    const passages = [
+      userDocsText().split('\n').find((line) => line.startsWith('- [Claude Code]')) ?? '',
+      textAt(upgrade(), 'step 1 › Claude Code'),
+      readFileSync(join(REPO_ROOT, 'CHANGELOG.md'), 'utf-8').split('## 0.16.0')[1]?.split('## 0.15.1')[0] ?? '',
+    ]
+    for (const passage of passages) {
+      expect(workerFloorProblems(passage)).toEqual([])
+      expect(passage).not.toContain('2.1.296 or later')
+      const oldFloor = passage.replaceAll(MIN_CLAUDE_CODE_VERSION, '2.1.296')
+      expect(workerFloorProblems(oldFloor)).toContain(`${MIN_CLAUDE_CODE_VERSION} or later`)
+    }
+  })
+
+  test('step 10 qualifies fresh starts and gives the resume pre-check, post-check and current-session restriction (b.9v8)', () => {
+    expect(resumeGuidanceProblems(textAt(upgrade(), 'step 10'))).toEqual([])
+  })
+
+  test.each(resumeRequirements)('self-check: step 10 loses its resume guarantee when %s is removed', (phrase) => {
+    const step = flat(textAt(upgrade(), 'step 10'))
+    expect(step).toContain(phrase)
+    expect(resumeGuidanceProblems(step.replace(phrase, ''))).toContain(phrase)
+  })
+
+  test('the former unqualified fresh-once advice fails the existing-persona resume requirements (b.9v8)', () => {
+    const oldAdvice = 'Each persona starts fresh once. Pre-persona rows are kept and never resumed.'
+    expect(resumeGuidanceProblems(oldAdvice)).toContain(resumeRequirements[2])
+  })
+
+  test('existing-persona upgrades retain their files and rollback restores applied and retired state (b.9v8)', () => {
+    const checks = [
+      [textAt(upgrade(), 'step 1'), 'retain the current persona configuration and credentials files',
+        '`config.json.last-applied` and `retired-keys.json` when present'],
+      [textAt(upgrade(), 'step 7'), 'retain its current persona configuration and paths',
+        'retain its credentials files and paths', 'For a host whose state has not yet moved'],
+      [textAt(upgrade(), 'step 10'), 'A host already using the current state directory keeps that path',
+        'with `SLACK_STATE_DIR` set, nothing moves'],
+      [textAt(rollback(), 'step 5'), 'This row-deletion warning does not apply when restoring an existing-persona release (0.11.0 or later)'],
+      [textAt(rollback(), 'step 8'), 'restore their switch-over step 1 copies',
+        "do not discard the previous release's applied configuration or retired-key state",
+        'at the paths recorded in switch-over step 1'],
+    ]
+    for (const [passage, ...phrases] of checks) {
+      for (const phrase of phrases) expect(flat(passage)).toContain(phrase)
+    }
+  })
+
+  test('Unreleased records both the worker-floor correction and existing-persona resume correction (b.9v8)', () => {
+    const unreleased = readFileSync(join(REPO_ROOT, 'CHANGELOG.md'), 'utf-8').split('## Unreleased')[1]?.split('\n## ')[0] ?? ''
+    for (const phrase of [`Workers need Claude Code ${MIN_CLAUDE_CODE_VERSION} or later`,
+      'pre-persona hosts (0.10.x)', 'Hosts already running personas (0.11.0 or later)',
+      'pre-start row and transcript checks', 'post-start `server.log` resume check',
+      'resumes only the current session', 'no longer falls back to an older transcript when the current one is missing']) {
+      expect(unreleased).toContain(phrase)
+    }
+  })
+
   // Retain every still-applicable safety/content row from the former shared
   // runbook matrix. Replaced version/install/restore instructions are covered
   // by the release-specific tests below, rather than asserted as history.
@@ -8485,8 +8560,8 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
     && !where.startsWith('step 8 ›')
   ))('current switch-over %s: %s', (where, element, required) => {
     const currentRequired = required.map((item) => typeof item === 'string'
-      ? item.replaceAll(HISTORICAL_RUNBOOK_CLAUDE, MIN_CLAUDE_CODE_VERSION)
-      : item instanceof RegExp ? new RegExp(item.source.replaceAll(HISTORICAL_RUNBOOK_CLAUDE.replaceAll('.', '\\.'), MIN_CLAUDE_CODE_VERSION.replaceAll('.', '\\.')), item.flags) : item)
+      ? item.replaceAll(HISTORICAL_RUNBOOK_CLAUDE, MIN_CLAUDE_CODE_VERSION).replace('the minimum agent-director states for its exec-form hooks', "CSCB's supported minimum")
+      : item instanceof RegExp ? new RegExp(item.source.replaceAll(HISTORICAL_RUNBOOK_CLAUDE.replaceAll('.', '\\.'), MIN_CLAUDE_CODE_VERSION.replaceAll('.', '\\.')).replace('the minimum agent-director states for its exec-form hooks', "CSCB's supported minimum"), item.flags) : item)
     expect({ element, missing: missingItems(upgrade(), textAt(upgrade(), where), currentRequired) }).toEqual({ element, missing: [] })
   })
 

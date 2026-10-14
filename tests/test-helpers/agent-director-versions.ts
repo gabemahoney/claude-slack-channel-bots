@@ -1,7 +1,7 @@
 /**
  * agent-director-versions.ts — the shared agent-director versions tests check
  * against CSCB's Phase 1 floor, and the minimum Claude Code version
- * agent-director states (b.jg5 SRJ-1304).
+ * CSCB supports with agent-director (b.9v8; b.jg5 SRJ-1304).
  *
  * Tests import every agent-director version they check from here or from
  * `src/`, never as a literal, so a change to the floor constant
@@ -25,9 +25,8 @@
  * client refuses as too old; it is checked against the minimum when this
  * module loads.
  *
- * `MIN_CLAUDE_CODE_VERSION` is the minimum Claude Code version agent-director
- * states for its exec-form hooks, and the version the fleet runs (RN-9; the
- * 0.11.0 release notes' "New minimum requirements"). This helper is its one definition: no `src/` module defines or
+ * `MIN_CLAUDE_CODE_VERSION` is CSCB's supported minimum with agent-director
+ * 0.12.0, and the version the fleet runs (b.9v8). This helper is its one definition: no `src/` module defines or
  * reads a Claude Code version, and every test that needs it (a fixture's
  * recorded version, the runbook, docs and `Dockerfile.live` pin checks)
  * imports it from here. `tests/ad-version-gate.test.ts` checks that no other
@@ -62,13 +61,16 @@ export const DEV_PLACEHOLDER_VERSION: string = DEV_SENTINEL_VERSION
 export const DEV_UNPARSEABLE_VERSION = 'dev'
 
 /**
- * The minimum Claude Code version agent-director states for its exec-form
- * hooks, having checked its hooks on it, and the version the fleet runs: the
- * 0.11.0 release notes' "New minimum requirements" (RN-9). Exec-form hooks
+ * CSCB's supported minimum with agent-director 0.12.0, verified by its
+ * install, spawn, reuse and resume checks, and the version the fleet runs
+ * (b.9v8). Exec-form hooks
  * (`command` with `args`) need Claude Code 2.1.139 or later. The one place
  * this value is written in `tests/` or `src/` code.
  */
-export const MIN_CLAUDE_CODE_VERSION = '2.1.296'
+export const MIN_CLAUDE_CODE_VERSION = '2.1.280'
+
+/** The frozen 0.11.0 runbooks' Claude Code version, independent of today's supported floor. */
+export const HISTORICAL_PHASE1_CLAUDE_CODE_VERSION = '2.1.280'
 
 /** The installed client's floor file, as its package exports it. */
 export const FLOOR_SUBPATH = 'agent-director/dist/version-floor.json'

@@ -6904,7 +6904,7 @@ export interface SweepPlan {
  * - reservations, valid or bad, whose owner is dead, as T2's reader judged it;
  *   files that are not reservations never appear;
  * - tags of exactly the run-private shape whose owner is dead; never a tag of
- *   another shape (`cscb-ci:latest`, `cscb-ci-base:v7`, `cscb-ci-live:latest`,
+ *   another shape (`cscb-ci:latest`, `cscb-ci-base:v7`, `cscb-ci-live:v1`,
  *   `cscb-ci-l5:m5`, a `cscb-ci-run:` tag that does not parse);
  * - the owner-label values of untagged images whose owner is dead or whose
  *   label is malformed; never a tagged image nor one without the label.

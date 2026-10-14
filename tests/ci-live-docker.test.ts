@@ -271,7 +271,7 @@ describe('buildRunArgs and assertSafeRunArgs', () => {
       '--mount', `type=bind,source=${HOME}/.config/cscb-test/credentials,target=/home/testuser/.config/cscb-credentials,readonly`,
       '--env', 'ANTHROPIC_API_KEY', '--env', 'ANTHROPIC_BASE_URL', '--env', 'ANTHROPIC_MODEL',
       '--env', `CSCB_LIVE_TEST_HOST=${NAME}`,
-      'cscb-ci-live:latest',
+      'cscb-ci-live:v1',
     ])
     expect(() => assertSafeRunArgs(args, HOME)).not.toThrow()
   })
@@ -480,7 +480,7 @@ describe('buildRunArgs and assertSafeRunArgs', () => {
   test('buildImageArgs builds Dockerfile.live with the host uid and gid and the staged agent-director binary as a named build context', () => {
     expect(buildImageArgs({ repoRoot: '/repo', uid: 1000, gid: 1001, agentDirectorDir: '/tmp/ad-stage' })).toEqual([
       'build', '-f', '/repo/docker/Dockerfile.live', '--build-context', 'agent-director-bin=/tmp/ad-stage',
-      '--build-arg', 'HOST_UID=1000', '--build-arg', 'HOST_GID=1001', '-t', 'cscb-ci-live:latest', '/repo',
+      '--build-arg', 'HOST_UID=1000', '--build-arg', 'HOST_GID=1001', '-t', 'cscb-ci-live:v1', '/repo',
     ])
     expect(() => buildImageArgs({ repoRoot: '/repo', uid: 1000, gid: 1001 })).toThrow('needs the staged agent-director binary dir')
   })
@@ -3008,13 +3008,20 @@ describe("Dockerfile.live's Claude Code pin", () => {
   const MIN = MIN_CLAUDE_CODE_VERSION
   const live = (): string => repoFile(LIVE_DOCKERFILE)
   /** The value of Dockerfile.live's one ARG CLAUDE_CODE_VERSION declaration. */
-  const pinnedValue = (): string => {
-    const values = [...live().matchAll(new RegExp(`^ARG ${CLAUDE_CODE_ARG}=(\\S+)$`, 'gm'))].map((m) => m[1]!)
+  const pinnedValue = (text = live()): string => {
+    const values = [...text.matchAll(new RegExp(`^ARG ${CLAUDE_CODE_ARG}=(\\S+)$`, 'gm'))].map((m) => m[1]!)
     expect(values.length).toBe(1)
     return values[0]!
   }
   /** Dockerfile.live's text with its declaration's value replaced by `value`. */
   const withPin = (value: string): string => live().replace(`ARG ${CLAUDE_CODE_ARG}=${pinnedValue()}`, `ARG ${CLAUDE_CODE_ARG}=${value}`)
+
+  test('the live Slack image uses the fleet version; the former channel-dropping pin fails this choice (b.9v8)', () => {
+    const usesFleetVersion = (text: string) => pinnedValue(text) === MIN_CLAUDE_CODE_VERSION
+    expect(pinnedValue()).toBe(MIN_CLAUDE_CODE_VERSION)
+    expect(usesFleetVersion(live())).toBe(true)
+    expect(usesFleetVersion(withPin('2.1.296'))).toBe(false)
+  })
 
   test('Dockerfile.live declares CLAUDE_CODE_VERSION once, a plain release at or above MIN_CLAUDE_CODE_VERSION, and installs Claude Code only at it; a pin one patch below MIN_CLAUDE_CODE_VERSION is refused', () => {
     expect(MIN).toMatch(PLAIN_RELEASE)

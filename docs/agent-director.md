@@ -1,6 +1,6 @@
 # agent-director
 
-CSCB requires agent-director CLI 0.12.0 or later and pins its TypeScript client to `agent-director@0.12.0`. Workers require Claude Code 2.1.296 or later. Upgrade the CLI with its released installer before upgrading CSCB; see [Migration](migration.md#migration).
+CSCB requires agent-director CLI 0.12.0 or later and pins its TypeScript client to `agent-director@0.12.0`. Workers require Claude Code 2.1.280 or later. Upgrade the CLI with its released installer before upgrading CSCB; see [Migration](migration.md#migration).
 
 CSCB runs every bot through [agent-director](https://github.com/gabemahoney/agent-director), installed system-wide. This page covers checking that install, the `install-cscb` skill that walks you through a failed check, and the agent-director settings CSCB reads.
 

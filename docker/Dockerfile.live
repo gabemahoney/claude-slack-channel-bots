@@ -23,9 +23,10 @@
 #   the base image predates this tree, and names docker/README.md's "When to
 #   bump the base image version";
 # - real Claude Code (the bot Claudes answer real Slack messages), pinned by
-#   CLAUDE_CODE_VERSION at 2.1.296, the minimum agent-director states and the
-#   version supported by this release (agent-director's hooks are exec form, which Claude
-#   Code runs from 2.1.139); the runner passes no override;
+#   CLAUDE_CODE_VERSION at 2.1.280, the supported fleet version that receives
+#   incoming Slack channel messages (2.1.296 drops them; agent-director's
+#   hooks are exec form, which Claude Code runs from 2.1.139); the runner
+#   passes no override;
 # - `testuser` with the host's uid/gid, so the mode-600 credentials files the
 #   runner bind-mounts read-only are readable in the container;
 # - the live entrypoint and the testplan's shell helpers and pre-flight
@@ -38,7 +39,7 @@ FROM cscb-ci-base:v7
 
 ARG HOST_UID=1000
 ARG HOST_GID=1000
-ARG CLAUDE_CODE_VERSION=2.1.296
+ARG CLAUDE_CODE_VERSION=2.1.280
 
 COPY docker/live/entrypoint.sh /usr/local/bin/cscb-live-entrypoint.sh
 COPY docker/live/cscb-live-helpers.sh docker/live/cscb-live-preflight.sh /opt/cscb-live/
