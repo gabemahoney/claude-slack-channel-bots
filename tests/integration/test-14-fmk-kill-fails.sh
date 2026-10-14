@@ -300,7 +300,7 @@ read -r _ UB_ID UB_SESSION _ _ <<< "$(grep "^${UB_CHANNEL} " <<< "${U_ROWS}")"
 
 # P, which the configuration names: its own row (`cscb_<key>`, its `persona`
 # label) in a working directory other than P's configured one, with a worker
-# that never reports in. After migration and respawn, explicitly inject
+# that reports in before upgrade. After migration, rebuild it silent and inject
 # `pending` with no launch start (b.jg5 SRJ-513, SRJ-1020).
 P_NAME="${SCENARIO_TAG}latched"
 P_KEY="$(persona_key "${P_NAME}")"
@@ -308,7 +308,6 @@ t14_value P_ID personaInstanceId "${P_KEY}"
 t14_value P_SESSION personaTmuxSessionName "${P_KEY}"
 P_WORK="$(make_workdir "${SCENARIO_TAG}latched_work")"
 P_ROW_WORK="$(make_workdir "${SCENARIO_TAG}latched_row")"
-stub_mode "${P_ROW_WORK}" "${STUB_MODE_SILENT}"
 seed_010_row "${P_ID}" "${P_SESSION}" "${P_ROW_WORK}" "${SVC_LABEL}" "${PERSONA_LABEL}=${P_KEY}" > /dev/null
 
 # Q, which the configuration does not name: its live row, its worker
@@ -365,6 +364,9 @@ t14_upgrade_seeded_rows
 # Reuse the migrated rows after upgrade, preserving their legacy names and
 # labels. A's released launch now has ownership labels, so the targeted tmux
 # failure exercises a real refused kill rather than an unowned legacy pane.
+# Keep the old P seed in the seeder's at-once mode so it leaves pending
+# before kill/reconciliation. Silent startup belongs to the released fixture.
+stub_mode "${P_ROW_WORK}" "${STUB_MODE_SILENT}"
 for fixture in A B P Q; do
     case "${fixture}" in
         A) id="${UA_ID}"; session="${UA_SESSION}"; work="${UA_WORK}"; labels=("${SVC_LABEL}" "channel=${UA_CHANNEL}");;

@@ -54,7 +54,8 @@
 #   swap             after a swap to 0.10.0 the shim is in place with 0.10.0
 #                    behind it and a call through it reports 0.10.0; after the
 #                    swap back, the release again.
-#   reinstall        quiesce the fixture before a second install.sh; then
+#   reinstall        answer startup, await report-in, and quiesce the fixture
+#                    before a second install.sh; then
 #                    and its re-shim, the shim is in place with the release
 #                    behind it at both paths, the terminal row and store id
 #                    are unchanged; respawn the fixture for later checks.
@@ -1620,6 +1621,12 @@ leg_reinstall() {
     (( AD_RC == 0 )) || fail "${step}: cannot read the fixture before quiescence"
     work="$(jq -er '.cwd' "${AD_OUT}")"
     worker_pid="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${T0_SESSION}:" '#{pane_pid}')"
+    # The default stub waits at the dev-channels dialog. A kill while it is
+    # pending leaves find-missing inside the 60 s launch grace, even once
+    # the worker is gone. Complete startup before the bounded shutdown.
+    stub_press_enter "${T0_SESSION}"
+    wait_until "${SCENARIO_SEED_REPORT_S}" "${step}: fixture must report in before shutdown" \
+        nested_seed_row_reported "${T0_ROW_ID}"
     nested_quiesce_seed_row "${T0_ROW_ID}" "${T0_SESSION}" "${worker_pid}"
     terminal_state="$(jq -r '.state' "${AD_OUT}")"
     install_ad_release "${step}: install.sh again"
@@ -3902,6 +3909,14 @@ nested_expect_row() {
     else
         ! "${SCENARIO_REAL_TMUX}" has-session -t "=${session}" 2> /dev/null || fail "session ${session} survived the upgrade"
     fi
+}
+
+# Startup completion is separate from the worker-exit deadline: a pending
+# launch is protected from find-missing by the install's pending grace.
+nested_seed_row_reported() {
+    ad_capture get "${SCENARIO_AD_ID_FLAG}" "$1"
+    (( AD_RC == 0 )) || return 1
+    jq -e '.state == "waiting" or .state == "working" or .state == "ask_user" or .state == "check_permission"' "${AD_OUT}" > /dev/null
 }
 
 # Reconcile with the active old binary: killing tmux alone leaves live rows

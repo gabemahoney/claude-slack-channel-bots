@@ -1739,6 +1739,81 @@ while IFS= read -r line; do printf '%s\\n' "$line"; done < "$HOME/calls"`
     }
     expect(output).not.toMatch(/--agent|expire|delete/)
   })
+  test.each(['reports', 'never-reports'])('reinstall %s: answer startup and await report before kill', (mode) => {
+    const output = shell(`${helper('leg_reinstall', selfCheck)}
+${helper('nested_seed_row_quiescent', selfCheck)}
+${helper('nested_quiesce_seed_row', selfCheck)}
+${helper('nested_seed_row_reported', selfCheck)}
+SCENARIO_AD_ID_FLAG=--instance-id
+SCENARIO_REAL_TMUX=fixture_tmux
+SCENARIO_WORKER_END_S=10
+SCENARIO_SEED_REPORT_S=90
+T0_ROW_ID=t0-self-check
+T0_SESSION=t0-self-check
+AD_OUT="$HOME/row.json"
+AD_ERR="$HOME/err"
+state=pending
+entered=0
+polls=0
+killed=0
+fail() { printf 'REFUSED: %s\\n' "$*"; exit 1; }
+stub_press_enter() { [[ "$1" == "$T0_SESSION" ]] || exit 8; entered=1; printf 'ENTER\\n'; }
+fixture_tmux() { [[ "$1" != display-message ]] || { printf 101; return 0; }; (( killed == 0 )); }
+pid_alive() { (( killed == 0 )); }
+ad_capture() {
+  AD_RC=0
+  case "$1" in
+    get) printf '{"state":"%s","cwd":"/fixture"}' "$state" > "$AD_OUT";;
+    kill) printf 'KILL:%s\\n' "$state"; killed=1;;
+    find-missing) [[ "$state" != waiting ]] || state=missing;;
+    *) exit 9;;
+  esac
+}
+wait_until() {
+  local bound="$1"; shift 2
+  for attempt in 1 2 3; do
+    polls=$((polls + 1))
+    if [[ '${mode}' == reports && "$entered" == 1 && "$polls" == 2 ]]; then state=waiting; fi
+    "$@" && return 0
+  done
+  fail "bounded wait $bound"
+}
+install_ad_release() { [[ "$state" == missing && "$killed" == 1 ]] || exit 10; printf 'INSTALL\\n'; exit 0; }
+(leg_reinstall)
+printf 'RESULT=%s' "$?"`, ['jq', 'head'])
+    if (mode === 'reports') {
+      expect(output).toBe('ENTER\nKILL:waiting\nINSTALL\nRESULT=0')
+    } else {
+      expect(output).toContain('REFUSED: bounded wait 90')
+      expect(output).toContain('RESULT=1')
+      expect(output).not.toContain('KILL:')
+      expect(output).not.toContain('INSTALL')
+    }
+  })
+  test('test-14 seeds P with report-in and enables silent mode only after upgrade', () => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-14-fmk-kill-fails.sh'), 'utf8')
+    const seed = source.slice(source.indexOf('P_NAME='), source.indexOf('\n# Q, which'))
+    const output = shell(`
+SCENARIO_TAG=inert
+SVC_LABEL=service=cscb
+PERSONA_LABEL=persona
+STUB_MODE_SILENT=silent
+STUB_MODE_AT_ONCE=at-once
+mode=at-once
+persona_key() { printf p; }
+t14_value() { printf -v "$1" p; }
+make_workdir() { printf /fixture; }
+stub_mode() { mode="$2"; }
+seed_010_row() { [[ "$mode" == at-once ]] || exit 7; }
+(${seed})
+printf 'RESULT=%s' "$?"`)
+    expect(output).toBe('RESULT=0')
+    const upgrade = source.indexOf('\nt14_upgrade_seeded_rows\n')
+    const rebuild = source.indexOf('for fixture in A B P Q; do', upgrade)
+    const silent = source.indexOf('stub_mode "${P_ROW_WORK}" "${STUB_MODE_SILENT}"', upgrade)
+    expect(silent).toBeGreaterThan(upgrade)
+    expect(silent).toBeLessThan(rebuild)
+  })
   test.each(['target', 'other', 'empty'])('rebuilt A must exercise its targeted kill fault: %s log', (mode) => {
     const source = readFileSync(join(import.meta.dir, 'integration/test-14-fmk-kill-fails.sh'), 'utf8')
     const call = mode === 'empty' ? '' : `call\t100\t1\t2\t3\tkill-session -t =${mode === 'target' ? 'ua' : 'unrelated'}\n`
