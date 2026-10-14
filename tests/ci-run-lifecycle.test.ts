@@ -6533,7 +6533,7 @@ describe('E13: the composed run (b.t6s E13 T5; b.uqm SR-5.3 to SR-5.9)', () => {
         },
       ],
       ['step 9: the disk', { host: { volume: { mountPoint: '/e13-volume', usedGib: 199, availableGib: 1 } }, events: UP_TO.admission, packed: true, refusal: () => 'disk' }],
-      ['step 9: memory', { host: { pod: { limitGib: 64, workingSetGib: 52, anonGib: 30, activeFileGib: 10 } }, events: UP_TO.admission, packed: true, refusal: () => 'memory' }],
+      ['step 9: memory', { host: { pod: { limitGib: 64, workingSetGib: 52, anonGib: 52, activeFileGib: 0 } }, events: UP_TO.admission, packed: true, refusal: () => 'memory' }],
       [
         'step 9: CPU, another live run holding the 12 CI CPUs',
         { host: { lockDir: { reservations: [{ owner: { runId: OTHER_RUN_ID, alive: true }, shards: e13.MAX_SHARDS }] } }, events: UP_TO.admission, packed: true, refusal: () => 'cpu' },
@@ -6775,7 +6775,7 @@ describe('E13: the composed run (b.t6s E13 T5; b.uqm SR-5.3 to SR-5.9)', () => {
   describe('stops before the end of run: traps, the first stop, builds\' process groups, AC 33 and AC 37 (SR-5.4, SR-5.6, SR-10.6)', () => {
     const interrupt = (signal: e13.TrappedSignal): e13.RunLevelStop => ({ kind: 'interrupt', signal })
     /** The pod with W above the stop line: 60 of its 64 GiB limit in use. */
-    const HIGH_POD: e13Helper.PodFigures = { limitGib: 64, workingSetGib: 60, anonGib: 40, activeFileGib: 10 }
+    const HIGH_POD: e13Helper.PodFigures = { limitGib: 64, workingSetGib: 60, anonGib: 60, activeFileGib: 0 }
 
     /** Rewrites the pod's cgroup files to `pod` at `atMs`, so the next sample reads it. */
     function podAt(host: E13Host, pod: e13Helper.PodFigures, atMs: number): void {
@@ -6938,7 +6938,7 @@ describe('E13: the composed run (b.t6s E13 T5; b.uqm SR-5.3 to SR-5.9)', () => {
       await e13RunToEnd(host, run)
       const noShards = watchdogLineWithNoShards()
       const verdict = run.verdict()!
-      expect(verdict.startsWith(noShards.slice(0, -e13.NO_SHARDS_RUNNING_TEXT.length - 1))).toBe(true)
+      expect(verdict.startsWith(noShards.split(e13.NO_SHARDS_RUNNING_TEXT)[0]!)).toBe(true)
       for (let k = 1; k <= e13.MAX_SHARDS; k++) expect(verdict).toContain(`${e13.SHARD_DIR_PREFIX}${k}`)
       expect(run.logLines().filter((line) => line.endsWith(verdict))).toHaveLength(1)
       expectShardsStopped(host, run, { kind: 'memory-watchdog', line: verdict }, [1, 2, 3, 4, 5, 6])
@@ -6953,7 +6953,7 @@ describe('E13: the composed run (b.t6s E13 T5; b.uqm SR-5.3 to SR-5.9)', () => {
       podAt(host, HIGH_POD, START_MS + 10_000)
       await e13RunToEnd(host, run)
       expect(run.verdict()).toBe(watchdogLineWithNoShards())
-      expect(run.verdict()!.endsWith(`${e13.NO_SHARDS_RUNNING_TEXT})`)).toBe(true)
+      expect(run.verdict()!.endsWith(`${e13.NO_SHARDS_RUNNING_TEXT}; reclaimable page cache excluded)`)).toBe(true)
       const skipped: e13.IntegrityCheck[] = ['fault-fired', 'schedule-coverage']
       const results = run.results()!
       for (const check of skipped) expect(results.skippedChecks).toContain(check)
@@ -7188,7 +7188,7 @@ describe('E13: the composed run (b.t6s E13 T5; b.uqm SR-5.3 to SR-5.9)', () => {
       [
         'a watchdog stop',
         { shard: () => ({ endsAfterMs: null }) },
-        (host) => host.clock.setTimeout(() => host.readings.cgroups.writePod('/', e13Helper.podBytes({ limitGib: 64, workingSetGib: 60, anonGib: 40, activeFileGib: 10 })), 50_000),
+        (host) => host.clock.setTimeout(() => host.readings.cgroups.writePod('/', e13Helper.podBytes({ limitGib: 64, workingSetGib: 60, anonGib: 60, activeFileGib: 0 })), 50_000),
       ],
     ]
 

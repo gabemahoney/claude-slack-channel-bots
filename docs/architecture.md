@@ -4159,3 +4159,30 @@ Clears one persona's latch by hand on the running server (b.jg5 SRJ-510, SRJ-506
   - The latch notices quote agent-director's description only as the latch record holds it: redacted, on one line and capped (`renderLogMessageText`), then escaped once for Slack (`escapeSlackControlCharacters`). This holds for the CONFLICT notice (b.jg5 SRJ-1004) and for the *Held: unusable tmux session name* notice (b.jg5 SRJ-1019, `unusableNameNoticeText` in `src/conflict-latch.ts`), whose description is the classifier's message, rendered the same way. The *Held: launch start not recorded* notice (b.jg5 SRJ-1020, `launchStartNotRecordedNoticeText`) quotes no description; its session name is rendered and escaped the same way. CSCB's own text in them names no session-ending command and no label option.
   - The kill-failure alert (b.jg5 SRJ-704, SRJ-1007; `src/kill-failure-alert.ts`) quotes agent-director's descriptions only through the redactor (`renderLogMessageText`: redacted, one line, capped), escaped once for Slack after that, and takes its pid list only from `survivorPids` (`src/ad-description-phrases.ts`), never from a pattern of its own. The agent-director commands its ordinary version names are a human's next step: the text says no bot, including any persona that sees the post, may run them, and points to agent-director's README "Operator actions" for anything beyond. The survivor version names no command, and nothing in CSCB acts on a pid it lists. Its log-only routes and the CLI teardown's route carry the same redacted text, unescaped, to `server.log` and `startup-errors.log` (the CLI's also to the terminal and, for `clean_restart`, `clean_restart.log`).
   - The *Cannot launch* alert (b.jg5 SRJ-1008; `INVALID_FLAGS_HOLD_ALERT_TEXT` in `src/invalid-flags-hold.ts`) is fixed text: it quotes no agent-director description and no version. The hold's lines show a version agent-director reported only as `describeHoldVersion` renders it (a short version string, else `unknown` or `unreadable`), and a thrown value only through `describeThrownValue`; `src/invalid-flags-hold.ts` is one of the secrecy audit's source surfaces.
+
+## Sharded CI resource gate
+
+The host runner `scripts/ci-run.ts` reads the cgroup-namespace root under its
+shared admission lock. Admission and the 30 s memory watchdog both use
+`nonReclaimableMemoryBytes`: the larger of `anon + shmem` and
+`active_anon + inactive_anon + unevictable` from `memory.stat`.
+
+The type and
+LRU sums account for locked anonymous, shared and file pages without adding
+locked anonymous or shared pages twice; reclaimable file cache is excluded.
+
+Production requires these counters and refuses admission when a reading
+fails. The extra counters are optional on in-memory `WorkingSetReading`
+values so older diagnostics remain readable.
+
+Working set (`memory.current`
+minus `inactive_file`, floored at zero) stays diagnostic; `results.json`
+version 1 retains its existing fields and schema.
+
+The ceiling remains 85% of the pod limit, rounded down, lowered to at most
+40 GiB while `/ci-live` is active. Admission adds existing run commitments,
+shard caps and a 1 GiB margin; the watchdog stops at the ceiling less 0.5 GiB.
+Container readings and reservation commitments keep their existing rules.
+The disk gate still uses actual allocated filesystem blocks plus a 1 GiB
+admission allowance after packing the run's tarball; no disk watchdog runs.
+See [Admission: memory, disk and CPU](../docker/README.md#admission-memory-disk-and-cpu).

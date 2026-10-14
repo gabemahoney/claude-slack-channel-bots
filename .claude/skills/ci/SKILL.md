@@ -96,7 +96,7 @@ apply:
 |---|---|
 | `FAIL: interrupted: <signal>` | The runner got `SIGINT`, `SIGTERM` or `SIGHUP` (see [Cancelling a run](#cancelling-a-run)) |
 | `FAIL: run deadline: <phase> still running at the <m> min deadline` | The run passed its deadline; phase is `build`, `shards` or `merge`, and m is the deadline's minutes from the runner's start |
-| `FAIL: memory watchdog: pod working set <x> GiB reached the <y> GiB stop line (<ceiling source>; <per-shard detail>)` | The pod working set reached the stop line (see [Admission](#admission)) |
+| `FAIL: memory watchdog: pod non-reclaimable memory <x> GiB reached the <y> GiB stop line (<ceiling source>; <per-shard detail>; reclaimable page cache excluded)` | The pod non-reclaimable memory reached the stop line (see [Admission](#admission)) |
 | `FAIL: image build: base image build failed (exit <code>)` | `scripts/ci-base-build.sh` failed (see [The base image](#the-base-image)) |
 | `FAIL: image build: test image build failed (exit <code>)` | The run's test image build failed; its output is in `runner.log` |
 | `FAIL: ci-run: internal error: <error>` | The runner met an error of its own after the run started. The run directory and `runner.log` are kept; report it as a runner bug |
@@ -474,15 +474,23 @@ the host and fits the run. Every figure below is a runner constant.
 | CPUs | 2 per shard; all live `/ci` runs together hold at most 12 CI CPUs |
 | Memory per shard | The per-shard memory cap, 2 GiB to start (see [The cap line](#the-cap-line)) |
 | Admission margin | 1 GiB |
-| Ceiling C | 85% of the pod memory limit (54.4 GiB on the 64 GiB pod), matching the sysadmin monitor's warn line; while a `/ci-live` run is active, 40 GiB, `/ci-live`'s working-set stop line |
-| Memory fit | pod working set W + other runs' commitments + N × the cap + 1 GiB ≤ C |
-| Stop line | C less 0.5 GiB (53.9 GiB, or 39.5 GiB while `/ci-live` runs). The memory watchdog checks W every 30 s and stops the run there |
+| Ceiling C | 85% of the pod memory limit (54.4 GiB on the 64 GiB pod); while a `/ci-live` run is active, the lower of that and 40 GiB, `/ci-live`'s working-set stop line |
+| Memory fit | pod non-reclaimable memory U + other runs' commitments + N × the cap + 1 GiB ≤ C |
+| Stop line | C less 0.5 GiB (53.9 GiB, or 39.5 GiB while `/ci-live` runs). The memory watchdog checks U every 30 s and stops the run there |
 | Disk line | 85%: (used + 1 GiB) ÷ (used + available) must stay under it on the volume holding the run directory |
-| Observed idle W | 33 to 43 GiB, mostly active page cache; about 42.3 GiB gives a default run 5 shards, 33.1 GiB gives 6 |
+| U | The larger of `anon + shmem` and `active_anon + inactive_anon + unevictable` from the pod's `memory.stat`; reclaimable file cache is excluded, locked pages accounted without double-counting |
+
+Missing or malformed required memory counters refuse admission. The working
+set remains diagnostic in readings and results; high reclaimable page cache
+alone does not block admission or stop the run. The sysadmin monitor's
+working-set reading can differ from U.
 
 An active `/ci-live` run counts 13 GiB. Each other live `/ci` run counts its
 reserved memory less what its shards use now. Docker's storage on
-`/var/lib/docker` is not checked.
+`/var/lib/docker` is not checked. The disk gate uses actual allocated blocks
+plus the 1 GiB allowance, after packing the tarball under the run directory's
+`package` directory. It does not discount temporary usage, and there is no
+disk watchdog.
 
 Detail: [`docker/README.md`'s Admission: memory, disk and CPU](../../../docker/README.md#admission-memory-disk-and-cpu)
 and [The admission lock, reservations and the sweep](../../../docker/README.md#the-admission-lock-reservations-and-the-sweep).
@@ -519,7 +527,7 @@ image read-back refuses after the build.
 | `NOT RUN: the admission lock <path> could not be taken: <error>` | Fix what the error names (the lock file's directory under the account's home, its permissions, the volume), then re-run |
 | A reading that fails: `NOT RUN: memory: could not read <what>: <error>` or `NOT RUN: disk: could not read <what>: <error>`, an unreadable reservation of a live run included | Fix what the line names (a cgroup file, the volume, docker, the reservation), then re-run |
 | The account's home not found in `/etc/passwd` | Fix the account's password-file entry; the lock lives under that home |
-| `NOT RUN: memory: <n> shard(s) need <x> GiB; <f> GiB fits under the <C> GiB ceiling` | Finish or kill idle agent-director workers and confirm their tmux sessions are gone; stop the other CI runs or builds listed; re-run once the sysadmin monitor's reading is back below its 85% warn line, or W is back below the ceiling. Page cache cannot be dropped in this pod. A smaller `--shards` value, when the refusal names one, may fit now |
+| `NOT RUN: memory: <n> shard(s) need <x> GiB; <f> GiB fits under the <C> GiB ceiling` | Finish or kill idle agent-director workers and confirm their tmux sessions are gone; stop the other CI runs or builds listed; re-run once the printed non-reclaimable memory and commitments leave room for the shards and margin. Reclaimable page cache is excluded from the gate. A smaller `--shards` value, when the refusal names one, may fit now |
 | A blocking container: `blocking every run: container <name>, an uncapped cscb-ci* container; /ci never removes it` | An uncapped `cscb-ci…` container, such as a run of the old serial `/ci`, blocks every run. Wait for it to finish, or stop and remove it by hand once it is not needed, then re-run |
 | A labelled blocking container: `blocking every run: container <name>, an uncapped container labelled cscb-ci=1 with no live reservation (owner <RUN_ID>-<PID>); a later /ci run's sweep removes it once its owner is dead` | Wait for its owner to end; the next run's sweep removes it. If the owner stays alive, cancel it by signalling its runner PID, then re-run |
 | `NOT RUN: disk: <volume> is <p>% used; this run's 1 GiB would take it to <q>%, at or over /ci's 85% disk line` | Remove kept results directories (the refusal lists them, largest first) and other large files on that volume, then re-run |

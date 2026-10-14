@@ -1692,6 +1692,22 @@ describe('E10: outcomes, verdict and results (b.t6s E10 T4)', () => {
   /** The standard run's `results.json` value, with a stated change to its inputs. */
   const assembled = (change: Partial<e10.ResultsInputs> = {}): Results => e10.assembleResults(resultsInputsOf(decideRun(standardRunSpec()), change))
 
+  test('b.rmn: gate-only counters stay out of every v1 working-set diagnostic', () => {
+    const reading = { bytes: 60, anonBytes: 4, activeFileBytes: 44, shmemBytes: 2, activeAnonBytes: 3, inactiveAnonBytes: 2, unevictableBytes: 1 }
+    const results = assembled({ workingSet: { before: reading, peak: reading, after: reading } })
+    const serialized = serializeResults(results)
+    const parsed = parseResults(serialized)
+    expect(parsed.ok).toBe(true)
+    expect(results.workingSet).toEqual({
+      before: { bytes: 60, anonBytes: 4, activeFileBytes: 44 },
+      peak: { bytes: 60, anonBytes: 4, activeFileBytes: 44 },
+      after: { bytes: 60, anonBytes: 4, activeFileBytes: 44 },
+    })
+    expect(serialized).not.toContain('unevictableBytes')
+    expect(serialized).not.toContain('shmemBytes')
+    assertNoLeak([results, serialized, parsed])
+  })
+
   /** A redactor, built here (E11 owns the real one), masking `values` in the results and `values` plus `textOnly` in the summary text. */
   function maskingRedactor(values: readonly string[], textOnly: readonly string[] = []): e10.ResultsRedactor {
     const masked = (text: string, all: readonly string[]): string => all.reduce((out, value) => out.replaceAll(value, e10.REDACTION_PLACEHOLDER), text)
