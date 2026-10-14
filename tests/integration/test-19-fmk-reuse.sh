@@ -9,7 +9,7 @@
 # `launch_started_at`, then `waiting`; `get`'s `prior_sessions` archives
 # the earlier life's session; the launch's `pre_trust` line says `ok`; and a
 # `resume` of the new life before it is messaged answers
-# ErrJsonlNeverWritten. In the missing-transcript leg the lost-transcript
+# ErrJsonlMissing. In the missing-transcript leg the lost-transcript
 # diagnosis runs before the reuse spawn (b.jg5 SRJ-707, SRJ-708, SRJ-711,
 # SRJ-712, SRJ-413, SRJ-716, SRJ-1306, SRJ-1401, SRJ-1418; E22's hatch note:
 # no CSCB `delete`).
@@ -156,7 +156,7 @@
 #      harness ends the unmessaged new life with the exit sentinel (the row
 #      reads `ended`), then one `resume` of the persona's id through the
 #      harness agent-director call (`ad_capture`), which must exit non-zero
-#      answering ErrJsonlNeverWritten; the row is present afterwards.
+#      answering ErrJsonlMissing; the row is present afterwards.
 #
 # Scenario 12's legs (G, H), each with a background harness `get` of the row
 # (a subshell of the scenario's own shell, every WATCH_PERIOD_S) from the
@@ -294,8 +294,7 @@
 # src/session-manager.ts, b.jg5 SRJ-413); the diagnosis's fixed fragment
 # (JSONL_DIAGNOSIS_REUSE_WORDING) and its startup-errors classes
 # (JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS,
-# src/session-manager.ts); the error names ErrJsonlNeverWritten and
-# ErrJsonlMissing, and ErrNoSessionId, ErrSpawnNotFound and
+# src/session-manager.ts); the error names ErrJsonlMissing and ErrNoSessionId, ErrSpawnNotFound and
 # ErrInstanceIdCollision (`adErrorName`,
 # src/agent-director-errors.ts); the class labels UNAVAILABLE and CONFLICT
 # (`adErrorClass`, src/ad-error-class.ts) and the class of each refusal's
@@ -361,7 +360,6 @@ t19_value() {
     t19_value_out="$(bun "${T19_PRINTER}" "$@")" || fail "the value printer failed for $*"
 }
 
-t19_value NEVER_WRITTEN adErrorName ErrJsonlNeverWritten
 t19_value JSONL_MISSING adErrorName ErrJsonlMissing
 t19_value REUSE_WORDING JSONL_DIAGNOSIS_REUSE_WORDING
 t19_value INCONCLUSIVE_CLASS JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS
@@ -1021,13 +1019,15 @@ t19_leg() {
     #    stopped and the life ended.
     stop_server
     t19_end_life "${p}" "${step}: the new life"
+    t19_row_get "${id}" "${step}: unmessaged reused life before resume"
+    t19_check_unmessaged_reuse "${step}" "${old_sid}"
     ad_capture resume --instance-id "${id}"
     rc="${AD_RC}"
-    if [[ "${rc}" == 0 ]] || ! jq -e -s --arg n "${NEVER_WRITTEN}" 'any(.[]; type == "object" and .err_name == $n)' "${AD_OUT}" "${AD_ERR}" > /dev/null 2>&1; then
+    if [[ "${rc}" == 0 ]] || ! jq -e -s --arg n "${JSONL_MISSING}" 'any(.[]; type == "object" and .err_name == $n)' "${AD_OUT}" "${AD_ERR}" > /dev/null 2>&1; then
         sed 's/^/  | /' "${AD_OUT}" "${AD_ERR}" >&2
-        fail "${step}: the harness resume of ${id}'s unmessaged new life exited ${rc}, not answering ${NEVER_WRITTEN}"
+        fail "${step}: the harness resume of ${id}'s unmessaged new life exited ${rc}, not answering ${JSONL_MISSING}"
     fi
-    echo "${TEST_NAME}: ${step}: the harness resume of ${id} answered ${NEVER_WRITTEN}"
+    echo "${TEST_NAME}: ${step}: the harness resume of ${id} answered ${JSONL_MISSING}"
     t19_row_get "${id}" "${step}: after the harness resume"
     echo "${TEST_NAME}: ${step}: ${id}'s row is kept, reading $(jq -r '.state' "${AD_OUT}")"
     if t19_has_session "${!session_var}"; then
@@ -1569,6 +1569,13 @@ t19_check_first_spawn_reuse() {
 # (present) `waiting` with a session other than <old-sid>, and its
 # `prior_sessions` archives <old-sid> exactly once; no CSCB `resume`
 # of <id> and no CSCB `delete` at or after <since>.
+# Retained same-agent history makes this missing current transcript rotated.
+t19_check_unmessaged_reuse() {
+    t19_check_reuse_history "$@"
+    jq -e '.transcript_status == "rotated" and ((.jsonl_path // "") == "")' "${AD_OUT}" > /dev/null 2>&1 \
+        || fail "$1: unmessaged same-agent reuse must have rotated history and no current recorded transcript"
+}
+
 t19_check_reuse_history() {
     local step="$1" old_sid="$2"
     jq -e --arg sid "${old_sid}" '

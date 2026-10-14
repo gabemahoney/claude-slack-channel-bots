@@ -1865,6 +1865,51 @@ printf '%s' "$?"`)
     expect(classifyAdError(conflict).errorClass).toBe(AD_ERROR_CLASS_CONFLICT)
     expect(recogniseConflictCase(conflict.errDescription)).toBe(LATCH_CASE_OWN_ID)
   })
+  test.each([
+    ['own-id probe', 'read-pane', 'read-pane', '--n-lines 1', true],
+    ['wrong own-id reuse', 'read-pane', 'spawn', '--reuse-finished', false],
+    ['wrong probe width', 'read-pane', 'read-pane', '--n-lines 2', false],
+    ['direct reuse control', 'reuse-spawn', 'spawn', '--reuse-finished', true],
+    ['incomplete probe', 'read-pane', '', '', true],
+  ])('latched round %s has the specified status/call shape', (_label, call, verb, args, accepted) => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-16-fmk-conflict.sh'), 'utf8')
+    const output = shell(`${helper('round_call_is', source)}
+${helper('latch_rounds', source)}
+CALL_PROBE=read-pane
+CALL_RESUME=resume
+CALL_PLAIN_SPAWN=plain-spawn
+CALL_REUSE_SPAWN=reuse-spawn
+us_of() { printf '%s' "$1"; }
+ad_cscb_calls() {
+  printf '1\\t100\\t9\\tstatus\\trow\\t--instance-id row\\n'
+  ${verb ? `printf '2\\t110\\t9\\t${verb}\\trow\\t${args}\\n'` : ':'}
+}
+fail() { printf 'REFUSED'; exit 1; }
+(latch_rounds fixture row '${call}' 0) 2>/dev/null
+printf '\\nRESULT=%s' "$?"`, ['sed'])
+    expect(output).toBe(accepted ? `${verb ? '1 100 2 110' : '1 100 - -'}\n\nRESULT=0` : 'REFUSED\nRESULT=1')
+    if (call === 'read-pane') {
+      expect(source).toMatch(/declare -A S19_CALL=[\s\S]*?\[\$\{PEND_KEY\}\]="\$\{CALL_PROBE\}"/)
+    }
+  })
+  test.each([
+    ['retained history', 'rotated', null, true],
+    ['never written without history', 'never_written', null, false],
+    ['recorded current transcript', 'present', '/current.jsonl', false],
+  ] as const)('unmessaged reuse %s checks the real transcript status', (_label, status, path, accepted) => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-19-fmk-reuse.sh'), 'utf8')
+    writeFileSync(join(home, 'row.json'), JSON.stringify({ session_id: 'new', prior_sessions: [{ session_id: 'old' }], transcript_status: status, jsonl_path: path }))
+    const output = shell(`${helper('t19_check_reuse_history', source)}
+${helper('t19_check_unmessaged_reuse', source)}
+AD_OUT="$HOME/row.json"
+fail() { exit 1; }
+(t19_check_unmessaged_reuse fixture old) 2>/dev/null
+printf '%s' "$?"`, ['jq', 'sed'])
+    expect(output).toBe(accepted ? '0' : '1')
+    const step6 = source.slice(source.indexOf('    # 6. The harness'), source.indexOf('# Scenario 12 (b.jg5 SRJ-1414): helpers', source.indexOf('    # 6. The harness')))
+    expect(step6).toContain('--arg n "${JSONL_MISSING}"')
+    expect(step6).not.toContain('${NEVER_WRITTEN}')
+  })
   test.each(['target', 'other', 'empty'])('rebuilt A must exercise its targeted kill fault: %s log', (mode) => {
     const source = readFileSync(join(import.meta.dir, 'integration/test-14-fmk-kill-fails.sh'), 'utf8')
     const call = mode === 'empty' ? '' : `call\t100\t1\t2\t3\tkill-session -t =${mode === 'target' ? 'ua' : 'unrelated'}\n`

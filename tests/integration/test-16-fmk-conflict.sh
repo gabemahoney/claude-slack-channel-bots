@@ -255,7 +255,7 @@
 #        `plain-spawn`: the `status` found no row), for `envonly` and
 #        `otherstore` a `spawn` carrying `--reuse-finished` (read from the
 #        shim's argv; step `step-2`, call `reuse-spawn`), for `pendleft` the
-#        same reuse spawn (step `step-2`, call `reuse-spawn`, after a
+#        one-line pane probe (step `step-2`, call `read-pane`, after a
 #        `status` reading `missing`); every round line since the latch
 #        answers `still-latched`; cadence as scenario 4's (`check_cadence`,
 #        the first round from the refused launch); the store still holds no
@@ -695,6 +695,7 @@ check_cadence() {
 # the agent-director shim's argv).
 round_call_is() {
     case "$1" in
+        "${CALL_PROBE}") [[ "$2" == read-pane && " $3 " == *" --n-lines 1 "* ]] ;;
         "${CALL_RESUME}") [[ "$2" == resume ]] ;;
         "${CALL_PLAIN_SPAWN}") [[ "$2" == spawn && " $3 " != *" --reuse-finished "* ]] ;;
         "${CALL_REUSE_SPAWN}") [[ "$2" == spawn && " $3 " == *" --reuse-finished "* ]] ;;
@@ -854,6 +855,7 @@ INTERVAL_S=$(( (INTERVAL_MS + 999) / 1000 ))
 CASE_NO_VALID_ID="$(fmk_text LATCH_CASE_NO_VALID_ID)" || fail "setup: fmk-texts.ts could not print LATCH_CASE_NO_VALID_ID"
 OP_RESUME="$(fmk_text REFUSED_OPERATION_RESUME)" || fail "setup: fmk-texts.ts could not print REFUSED_OPERATION_RESUME"
 STEP_TABLE="$(fmk_text RECHECK_STEP_TABLE)" || fail "setup: fmk-texts.ts could not print RECHECK_STEP_TABLE"
+CALL_PROBE="$(fmk_text RECHECK_CALL_PROBE)" || fail "setup: cannot read probe call"
 CALL_RESUME="$(fmk_text RECHECK_CALL_RESUME)" || fail "setup: fmk-texts.ts could not print RECHECK_CALL_RESUME"
 NO_VALID_ID_PHRASE="$(fmk_text CONFLICT_NO_VALID_ID_PHRASE)" || fail "setup: fmk-texts.ts could not print CONFLICT_NO_VALID_ID_PHRASE"
 CONFLICT_HEAD="$(fmk_text CONFLICT_NOTICE_FIRST_LINE_HEAD)" || fail "setup: fmk-texts.ts could not print CONFLICT_NOTICE_FIRST_LINE_HEAD"
@@ -908,7 +910,7 @@ done
 # refused launch was (and so the latch-set line's refused operation), the
 # row state that line records (`nolabel`'s, its finished state, set in
 # phase 2), its re-check rounds' step and call (one `status`, then that
-# call), and the case phrase agent-director's description carries.
+# call; own-id uses its one-line pane probe), and the case phrase agent-director's description carries.
 AD_STARTING_S="$(fmk_text DEFAULT_AD_SETTINGS tmux starting_session_seconds)" || fail "setup: cannot read AD starting bound"
 [[ "${AD_STARTING_S}" =~ ^[1-9][0-9]*$ ]] || fail "setup: invalid AD starting bound"
 AD_STARTING_MS=$(( AD_STARTING_S * 1000 ))
@@ -923,7 +925,7 @@ declare -A S19_LATCH_ROW=([${SCAN_KEY}]="${ROW_NO_ROW}" [${ENV_KEY}]=ended [${ST
 declare -A S19_STEP=([${S4_KEY}]="${STEP_TABLE}" [${SCAN_KEY}]="${STEP_SPAWN_RETRY}" [${ENV_KEY}]="${STEP_TABLE}"
     [${STORE_KEY}]="${STEP_TABLE}" [${PEND_KEY}]="${STEP_TABLE}")
 declare -A S19_CALL=([${S4_KEY}]="${CALL_RESUME}" [${SCAN_KEY}]="${CALL_PLAIN_SPAWN}" [${ENV_KEY}]="${CALL_REUSE_SPAWN}"
-    [${STORE_KEY}]="${CALL_REUSE_SPAWN}" [${PEND_KEY}]="${CALL_REUSE_SPAWN}")
+    [${STORE_KEY}]="${CALL_REUSE_SPAWN}" [${PEND_KEY}]="${CALL_PROBE}")
 declare -A S19_PHRASE=([${S4_KEY}]="${NO_VALID_ID_PHRASE}" [${SCAN_KEY}]="${LEFTOVER_PHRASE}" [${ENV_KEY}]="${NO_VALID_ID_PHRASE}"
     [${STORE_KEY}]="${ANOTHER_STORE_PHRASE}" [${PEND_KEY}]="this id's own abandoned launch")
 # Filled in by the phases, by key: the seeded session's id and pane, the
@@ -1480,7 +1482,8 @@ s19_end() {
 # s19_clear <key> <label>: the round after the harness ended the session:
 # its first two calls are one `status` then the persona's re-check call, at
 # the cadence, with no CSCB find-missing between them; the call launches: the
-# latch clears (latchClearedLine, reason "a retry of the refused operation
+# own-id additionally sweeps and retries reuse after its probe returns GONE.
+# The latch clears (latchClearedLine, reason "a retry of the refused operation
 # was not refused", posted), with no refused round line beyond those read
 # before the end, the persona reaches `waiting` on the session name the latch
 # quoted (scenario 4's on its first life's session_id; the pending
@@ -1491,7 +1494,15 @@ s19_end() {
 s19_clear() {
     local key="$1" step="$2: $1's clear" id="${PERSONA_ID[$1]}" name="${PERSONA_NAME[$1]}" session="${S19_SESSION[$1]}"
     local rows s_pos s_time s_verb c_pos c_time c_verb c_args s_us c_us between cleared recovery n calls spawns
-    wait_for_count "${S19_ROUND_HEAD[${key}]}" $(( S19_ROUND_BASE[${key}] + S19_ROUNDS[${key}] + 1 )) $(( INTERVAL_S + 2 * SETTLE_S )) \
+    local clear_round_head="${S19_ROUND_HEAD[${key}]}" clear_round_count=$(( S19_ROUND_BASE[${key}] + S19_ROUNDS[${key}] + 1 ))
+    if [[ "${key}" == "${PEND_KEY}" ]]; then
+        # A successful own-id round logs the probe plus its single retry.
+        clear_round_head="$(fmk_text latchRecheckRoundLine "${name}" "${S19_CASE[${key}]}" "${S19_STEP[${key}]}" "${CALL_PROBE}+${CALL_REUSE_SPAWN}" ANSWER)" \
+            || fail "${step}: cannot print cleared-probe round line"
+        clear_round_head="${clear_round_head%ANSWER}"
+        clear_round_count=1
+    fi
+    wait_for_count "${clear_round_head}" "${clear_round_count}" $(( INTERVAL_S + 2 * SETTLE_S )) \
         "${step}: no round line after the session ended"
     rows="$(ad_cscb_calls "${id}" "${S19_LAST_POS[${key}]}")"
     IFS=$'\t' read -r s_pos s_time _ s_verb _ <<< "$(sed -n 1p <<< "${rows}")"
@@ -1505,6 +1516,19 @@ s19_clear() {
     check_cadence "${step}" "${S19_PREV_US[${key}]}" "${s_us}" "${c_us}" "${S19_CALL[${key}]}"
     between="$(ad_cscb_verb_between find-missing "${s_pos}" "${c_pos}")"
     [[ -z "${between}" ]] || { sed 's/^/  | /' <<< "${between}" >&2; fail "${step}: a CSCB find-missing between the round's status and its ${S19_CALL[${key}]}"; }
+
+    if [[ "${key}" == "${PEND_KEY}" ]]; then
+        # Own-id recovery first probes. GONE requires a bypassing sweep
+        # before the single reuse retry; the other cases retry directly.
+        local retry_pos retry_time retry_verb retry_args
+        IFS=$'\t' read -r retry_pos retry_time _ retry_verb _ retry_args <<< "$(sed -n 3p <<< "${rows}")"
+        round_call_is "${CALL_REUSE_SPAWN}" "${retry_verb}" "${retry_args}" \
+            || fail "${step}: cleared own-id probe was not followed by one reuse retry"
+        between="$(ad_cscb_verb_between find-missing "${c_pos}" "${retry_pos}")"
+        [[ -n "${between}" ]] || fail "${step}: no bypassing find-missing between the cleared probe and reuse"
+        (( $(us_of "${retry_time}") - c_us <= SETTLE_S * 1000000 )) \
+            || fail "${step}: own-id reuse did not follow its cleared probe within the settle"
+    fi
 
     # The retry was not refused: the latch clears, posted.
     cleared="$(fmk_text latchClearedLine "${key}" "${S19_CASE[${key}]}" "${session}" posted LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)" \

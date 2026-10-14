@@ -4200,3 +4200,6 @@ Container readings and reservation commitments keep their existing rules.
 The disk gate still uses actual allocated filesystem blocks plus a 1 GiB
 admission allowance after packing the run's tarball; no disk watchdog runs.
 See [Admission: memory, disk and CPU](../docker/README.md#admission-memory-disk-and-cpu).
+
+
+The AD 0.12 abandoned-launch alias uses the own-id row-2 policy above: refused rounds are `status` followed by the one-line `read-pane` probe. Once that probe returns GONE, one bypassing `find-missing` precedes the single reuse retry. Same-agent reuse can have `transcript_status: rotated` even before the new conversation receives a message; a resume then reports `ErrJsonlMissing` because inspectable prior history exists. CSCB diagnoses that error using evidence for the current session and activity since its launch, and retains the distinction between conclusive and inconclusive amnesia.

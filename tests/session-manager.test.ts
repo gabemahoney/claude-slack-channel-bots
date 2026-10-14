@@ -26175,6 +26175,28 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
     await h.runApproverToStop(p)
   })
 
+  test('AD 0.12 unmessaged same-agent reuse with rotated history diagnoses ErrJsonlMissing before reuse, preserving uncertainty', async () => {
+    const { h, p } = srj105Build()
+    // The native CLI includes these history fields beyond the SDK row type.
+    const rotatedRow = {
+      ...ENDED_WITH_SESSION,
+      jsonl_path: undefined,
+      transcript_status: 'rotated',
+      prior_sessions: [{ session_id: 'previous-session', jsonl_path: '/archived/previous.jsonl', recorded_at: '2026-01-01T00:00:00Z' }],
+    }
+    h.script({
+      ...collided(h, harnessPersona(h, p), rotatedRow),
+      resumeError: errJsonlMissing(),
+    })
+    const order = recordCallOrder(h)
+    expect(await h.launch(p)).toEqual({ key: p, action: 'fresh-after-inconclusive-amnesia' })
+    expect(order).toEqual(['spawn', 'get', 'resume', 'get', 'spawn'])
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    expect([h.stub.calls.deleteCalls, h.stub.calls.killCalls]).toEqual([[], []])
+    expect(h.startupErrors().join('\n')).toContain(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
+    await h.runApproverToStop(p)
+  })
+
   // b.jg5 SRJ-112, SRJ-301: the first reuse collision re-runs the ladder's
   // get-then-act once (its get reads the row ended again, so the resume and
   // its no-transcript answer repeat); a collision in that re-run arms P's

@@ -174,3 +174,6 @@ For the second line, give `[pause] timeout_seconds` a positive whole number, or 
 
 
 AD 0.12 keeps archived sessions in `prior_sessions` across same-agent reuse. A fresh spawn uses a new current session; archived sessions are available for inspection and are never resumed as a fallback. A launch with no recorded tmux server or pane can leave an abandoned session: AD reports it unavailable until the starting-session bound, then refuses it as an own-id conflict. CSCB latches that conflict for human review and retries only through the existing own-id recheck policy.
+
+
+An unmessaged conversation created by same-agent reuse can report `transcript_status: rotated`: its current transcript has not been written, but earlier sessions remain inspectable. A resume with missing current-session paths then returns `ErrJsonlMissing`. `ErrJsonlNeverWritten` requires both an empty current recorded path and empty visible prior history. CSCB still diagnoses missing transcripts before reusing the row, reports uncertainty when evidence is insufficient, and never resumes an archived session as a fallback.
