@@ -5,8 +5,8 @@
 # Persona `unusable` (U) has a finished row whose recorded tmux session name
 # the harness hand-edits to hold a `.`, which tmux stores differently, so
 # agent-director will not pass it to tmux. U's `resume`, and a reuse spawn
-# forced through fixtures/fmk-driver.ts, get `ErrUnknownErrorName` with
-# `unknownName` "ErrInternal" and a description naming the recorded tmux
+# forced through fixtures/fmk-driver.ts, get native `ErrInternal` with
+# a description naming the recorded tmux
 # session name; U latches ("unusable recorded name") with one post that names
 # the persona and its instance id, quotes the description, points to
 # "Operator actions" and names no command. CSCB then makes no delete, kill,
@@ -105,8 +105,8 @@
 #         phrase and the unusable name; so the post names no command;
 #      c. [harness] the forced reuse spawn: fixtures/fmk-driver.ts
 #         `reuse-spawn`, through `cscb_run`, prints one outcome line with
-#         `called=true`, `counted=false`, `error=ErrUnknownErrorName`, CSCB's
-#         class for an unusable name, `unknown_name=ErrInternal` and a
+#         `called=true`, `counted=false`, `error=ErrInternal`, CSCB's
+#         class for an unusable name, `action=latched`, `latched=true` and a
 #         description holding the phrase and the unusable name; its only
 #         agent-director call naming U's row is one `spawn` carrying
 #         `--reuse-finished`, parented by the driver; the store row is the
@@ -242,8 +242,8 @@
 # - "Operator actions", the README section SRJ-1019's post points to;
 # - fixtures/fmk-driver.ts's outcome line fields (its header);
 # - `--reuse-finished`, the agent-director client's flag for a spawn's
-#   reuse_finished (the agent-director 0.11.0 npm client), and its error
-#   names `ErrUnknownErrorName` and the `unknownName` "ErrInternal";
+#   reuse_finished (the agent-director 0.12.0 npm client), and its native
+#   error class `ErrInternal`;
 # - agent-director's note `tmux_session_name_rewritten` (agent-director
 #   0.11.0, pkg/api/find_missing.go) and its row states `pending`, `waiting`,
 #   `ended` and `missing`.
@@ -836,7 +836,7 @@ step_forced_reuse() {
     fi
     line="${lines[0]}"
     echo "${TEST_NAME}: ${step}: ${line:0:600}"
-    for want in " called=true " " counted=false " " error=ErrUnknownErrorName " " class=${CLASS_UNUSABLE} " " unknown_name=ErrInternal "; do
+    for want in " called=true " " action=latched " " counted=false " " latched=true " " error=ErrInternal " " class=${CLASS_UNUSABLE} "; do
         [[ "${line}" == *"${want}"* ]] || fail "${step}: the outcome line lacks '${want# }'"
     done
     [[ "${line}" == *" description="*" result="* ]] || fail "${step}: the outcome line has no description and result"

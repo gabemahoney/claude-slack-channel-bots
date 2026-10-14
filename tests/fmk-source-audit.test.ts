@@ -108,7 +108,7 @@ import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import ts from 'typescript'
 
-import { classifyAdError, AD_ERROR_CLASS_CONFIG, AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_CONFLICT } from '../src/ad-error-class.ts'
+import { classifyAdError, AD_ERROR_CLASS_UNUSABLE_NAME, AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_CONFIG, AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_CONFLICT } from '../src/ad-error-class.ts'
 import { adConfigMalformedOnset } from '../src/outage-state.ts'
 import { paneReadFailureOf, PANE_READ_GONE } from '../src/pane-read.ts'
 import { latchRecheckRoundLine, decideLatchRecheckProbe, RECHECK_VERDICT_CLEARED, recogniseConflictCase, LATCH_CASE_OWN_ID } from '../src/conflict-latch.ts'
@@ -1952,6 +1952,31 @@ printf '\\nRESULT=%s' "$?"`)
     const failure = paneReadFailureOf(err)
     expect(failure.kind).toBe(PANE_READ_GONE)
     expect(decideLatchRecheckProbe(LATCH_CASE_OWN_ID, { kind: PANE_READ_GONE })).toBe(RECHECK_VERDICT_CLEARED)
+  })
+  test.each(['native', 'legacy unknown', 'wrong classification', 'counted', 'wrong description'])('forced unusable-name reuse %s checks the native error and refusal behavior', (mode) => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-27-fmk-unusable-name.sh'), 'utf8')
+    const body = helper('step_forced_reuse', source)
+    const start = body.indexOf('    for want in ')
+    const end = body.indexOf("    # The driver's record entry", start)
+    expect(start).toBeGreaterThan(0)
+    expect(end).toBeGreaterThan(start)
+    const description = 'instance cscb_unusable: tmux session "slack_bot_unusable.x": the recorded tmux session name contains a character tmux stores differently (\'.\'); no tmux call was made'
+    const err = agentDirectorClient.errorFromEnvelope('spawn', 'ErrInternal', mode === 'wrong description' ? 'unrelated internal failure' : description)
+    expect(err).toBeInstanceOf(agentDirectorClient.ErrInternal)
+    const classification = classifyAdError(err)
+    expect(classification.errorClass).toBe(mode === 'wrong description' ? AD_ERROR_CLASS_UNCLASSIFIED : AD_ERROR_CLASS_UNUSABLE_NAME)
+    const line = `DRIVER: FORCED reuse-spawn called=true action=latched counted=${mode === 'counted'} latched=true error=${mode === 'legacy unknown' ? 'ErrUnknownErrorName' : err.errName} class=${mode === 'wrong classification' ? 'UNCLASSIFIED' : classification.errorClass}${mode === 'legacy unknown' ? ' unknown_name=ErrInternal' : ''} description=${JSON.stringify(err.errDescription)} result={}`
+    writeFileSync(join(home, 'outcome'), line + '\n')
+    const output = shell(`
+IFS= read -r line < "$HOME/outcome"
+CLASS_UNUSABLE=UNUSABLE_NAME
+UNUSABLE_PHRASE='the recorded tmux session name'
+U_UNUSABLE=slack_bot_unusable.x
+step=fixture
+fail() { printf REFUSED; exit 1; }
+(${body.slice(start, end)})
+printf '\\nRESULT=%s' "$?"`, ['jq'])
+    expect(output).toBe(mode === 'native' ? 'RESULT=0' : 'REFUSED\nRESULT=1')
   })
   test.each(['target', 'other', 'empty'])('rebuilt A must exercise its targeted kill fault: %s log', (mode) => {
     const source = readFileSync(join(import.meta.dir, 'integration/test-14-fmk-kill-fails.sh'), 'utf8')

@@ -170,7 +170,7 @@
 #               R up; the file written with stopping_window_seconds 10, below
 #               its minimum; after the next bot-server probe C1 is added by a
 #               confirmed reload, its launch meets agent-director's
-#               ErrConfigMalformed (which reaches CSCB as ErrUnknownErrorName)
+#               native ErrConfigMalformed
 #               and it is retried on its timer at least twice, with a
 #               bot-server probe inside the refusal; then the earlier accepted
 #               file is written back. The checks (`refused_values_check`, one
