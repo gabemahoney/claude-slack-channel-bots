@@ -1496,8 +1496,8 @@ s19_clear() {
     local rows s_pos s_time s_verb c_pos c_time c_verb c_args s_us c_us between cleared recovery n calls spawns
     local clear_round_head="${S19_ROUND_HEAD[${key}]}" clear_round_count=$(( S19_ROUND_BASE[${key}] + S19_ROUNDS[${key}] + 1 ))
     if [[ "${key}" == "${PEND_KEY}" ]]; then
-        # A successful own-id round logs the probe plus its single retry.
-        clear_round_head="$(fmk_text latchRecheckRoundLine "${name}" "${S19_CASE[${key}]}" "${S19_STEP[${key}]}" "${CALL_PROBE}+${CALL_REUSE_SPAWN}" ANSWER)" \
+        # A successful own-id round logs the probe, bypassing sweep and retry.
+        clear_round_head="$(fmk_text latchRecheckRoundLine "${name}" "${S19_CASE[${key}]}" "${S19_STEP[${key}]}" "${CALL_PROBE}+find-missing+${CALL_REUSE_SPAWN}" ANSWER)" \
             || fail "${step}: cannot print cleared-probe round line"
         clear_round_head="${clear_round_head%ANSWER}"
         clear_round_count=1

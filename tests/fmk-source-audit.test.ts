@@ -110,7 +110,8 @@ import ts from 'typescript'
 
 import { classifyAdError, AD_ERROR_CLASS_CONFIG, AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_CONFLICT } from '../src/ad-error-class.ts'
 import { adConfigMalformedOnset } from '../src/outage-state.ts'
-import { recogniseConflictCase, LATCH_CASE_OWN_ID } from '../src/conflict-latch.ts'
+import { paneReadFailureOf, PANE_READ_GONE } from '../src/pane-read.ts'
+import { latchRecheckRoundLine, decideLatchRecheckProbe, RECHECK_VERDICT_CLEARED, recogniseConflictCase, LATCH_CASE_OWN_ID } from '../src/conflict-latch.ts'
 import { AD_TMUX_TABLE } from '../src/ad-settings.ts'
 import { PHASE1_ONLY_ERR_NAMES } from '../src/agent-director-errors.ts'
 import { buildSystemInstallTooOldMessage, compareAdVersions, FOUND_BY_RUNTIME_RECHECK, FOUND_BY_STARTUP_CHECK, meetsPhase1Floor, PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
@@ -1909,6 +1910,48 @@ printf '%s' "$?"`, ['jq', 'sed'])
     const step6 = source.slice(source.indexOf('    # 6. The harness'), source.indexOf('# Scenario 12 (b.jg5 SRJ-1414): helpers', source.indexOf('    # 6. The harness')))
     expect(step6).toContain('--arg n "${JSONL_MISSING}"')
     expect(step6).not.toContain('${NEVER_WRITTEN}')
+  })
+  test.each(['native recovery', 'omitted sweep'])('own-id clear matcher %s preserves the full round call chain', (mode) => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-16-fmk-conflict.sh'), 'utf8')
+    const printed = (call: string, answer: string) => latchRecheckRoundLine('"pendleft" (key=pendleft)', LATCH_CASE_OWN_ID, 'step-2', call, answer)
+    const chain = 'read-pane+find-missing+reuse-spawn'
+    writeFileSync(join(home, 'native-template'), printed(chain, 'ANSWER') + '\n')
+    writeFileSync(join(home, 'old-template'), printed('read-pane+reuse-spawn', 'ANSWER') + '\n')
+    writeFileSync(join(home, 'actual-line'), printed(mode === 'native recovery' ? chain : 'read-pane+reuse-spawn', 'probe-cleared (gone); cleared (spawned)') + '\n')
+    const output = shell(`${helper('s19_clear', source)}
+PEND_KEY=p
+CALL_PROBE=read-pane
+CALL_REUSE_SPAWN=reuse-spawn
+INTERVAL_S=120
+SETTLE_S=30
+declare -A PERSONA_ID=([p]=row) PERSONA_NAME=([p]=pendleft) S19_SESSION=([p]=slack_bot_p)
+declare -A S19_CASE=([p]=own-id) S19_STEP=([p]=step-2)
+declare -A S19_ROUND_HEAD=([p]=unused) S19_ROUND_BASE=([p]=0) S19_ROUNDS=([p]=1)
+fail() { printf REFUSED; exit 1; }
+fmk_text() {
+  local line
+  case "$5" in
+    read-pane+find-missing+reuse-spawn) IFS= read -r line < "$HOME/native-template";;
+    read-pane+reuse-spawn) IFS= read -r line < "$HOME/old-template";;
+    *) fail;;
+  esac
+  printf '%s' "$line"
+}
+wait_for_count() {
+  local actual
+  IFS= read -r actual < "$HOME/actual-line"
+  [[ "$actual" == *"$1"* && "$2" == 1 && "$3" == 180 ]] || fail
+  printf MATCH; exit 0
+}
+(s19_clear p fixture)
+printf '\\nRESULT=%s' "$?"`)
+    expect(output).toBe(mode === 'native recovery' ? 'MATCH\nRESULT=0' : 'REFUSED\nRESULT=1')
+  })
+  test('released AD gone-session capture error is GONE and clears an own-id probe', () => {
+    const err = agentDirectorClient.errorFromEnvelope('read-pane', 'ErrTmuxCaptureFailed', 'tmux: capture-pane failed: instance fix7-probe: the row\'s session is not there: no tmux session of this launch was found (recorded name "cscb-fix7-probe"); nothing was read')
+    const failure = paneReadFailureOf(err)
+    expect(failure.kind).toBe(PANE_READ_GONE)
+    expect(decideLatchRecheckProbe(LATCH_CASE_OWN_ID, { kind: PANE_READ_GONE })).toBe(RECHECK_VERDICT_CLEARED)
   })
   test.each(['target', 'other', 'empty'])('rebuilt A must exercise its targeted kill fault: %s log', (mode) => {
     const source = readFileSync(join(import.meta.dir, 'integration/test-14-fmk-kill-fails.sh'), 'utf8')

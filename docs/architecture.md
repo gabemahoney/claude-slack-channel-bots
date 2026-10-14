@@ -4203,3 +4203,6 @@ See [Admission: memory, disk and CPU](../docker/README.md#admission-memory-disk-
 
 
 The AD 0.12 abandoned-launch alias uses the own-id row-2 policy above: refused rounds are `status` followed by the one-line `read-pane` probe. Once that probe returns GONE, one bypassing `find-missing` precedes the single reuse retry. Same-agent reuse can have `transcript_status: rotated` even before the new conversation receives a message; a resume then reports `ErrJsonlMissing` because inspectable prior history exists. CSCB diagnoses that error using evidence for the current session and activity since its launch, and retains the distinction between conclusive and inconclusive amnesia.
+
+
+A successful own-id cleared-probe round logs the full call chain `read-pane+find-missing+reuse-spawn` (or the corresponding resume retry). The `find-missing` segment is part of the round line as well as an actual bypassing sweep; matching `read-pane+reuse-spawn` would miss that recovery. Released AD 0.12 returns `ErrTmuxCaptureFailed` when the row’s session no longer exists, which the pane mapper classifies as GONE and the own-id probe treats as cleared.
