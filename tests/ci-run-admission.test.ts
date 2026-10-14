@@ -2170,7 +2170,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
       expect(rig.built.runnerCgroup?.pod.maxBytes).toBeLessThan(pod.maxBytes as number)
 
       expect(readPodMemory(rig.input.deps)).toEqual(
-        okReading({ limitBytes: pod.maxBytes as number, workingSet: { bytes: pod.workingSetBytes, anonBytes: pod.anonBytes, activeFileBytes: pod.activeFileBytes } }),
+        okReading({ limitBytes: pod.maxBytes as number, workingSet: { bytes: pod.workingSetBytes, anonBytes: pod.anonBytes, activeFileBytes: pod.activeFileBytes, shmemBytes: 0, activeAnonBytes: 0, inactiveAnonBytes: pod.anonBytes, unevictableBytes: 0 } }),
       )
       expect(new Set(rig.built.cgroups.reads().map((read) => read.cgroupPath))).toEqual(new Set(['/']))
     })
@@ -2183,7 +2183,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
       const { pod } = rig.built
       const read = readPodWorkingSet(rig.input.deps)
 
-      expect(read).toEqual(okReading({ bytes: pod.workingSetBytes, anonBytes: pod.anonBytes, activeFileBytes: pod.activeFileBytes }))
+      expect(read).toEqual(okReading({ bytes: pod.workingSetBytes, anonBytes: pod.anonBytes, activeFileBytes: pod.activeFileBytes, shmemBytes: 0, activeAnonBytes: 0, inactiveAnonBytes: pod.anonBytes, unevictableBytes: 0 }))
       if (!read.ok) return
       expect(workingSetRestBytes(read.value)).toBe(pod.restBytes)
       if (pod.restBytes > 0) expect(read.value.anonBytes + read.value.activeFileBytes + workingSetRestBytes(read.value)).toBe(read.value.bytes)
@@ -2322,7 +2322,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
 
       const { readings } = await rig.figures()
 
-      expect(readings.beforeWorkingSet).toEqual({ bytes: pod.workingSetBytes, anonBytes: pod.anonBytes, activeFileBytes: pod.activeFileBytes })
+      expect(readings.beforeWorkingSet).toEqual({ bytes: pod.workingSetBytes, anonBytes: pod.anonBytes, activeFileBytes: pod.activeFileBytes, shmemBytes: 0, activeAnonBytes: 0, inactiveAnonBytes: pod.anonBytes, unevictableBytes: 0 })
     })
 
     /** Test data: the errors constructed failures report. */
@@ -2480,7 +2480,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
       [
         'MEMORY_REFUSAL_ADVICE',
         MEMORY_REFUSAL_ADVICE,
-        "what to do: finish or kill idle agent-director workers and confirm their tmux sessions are gone; stop the other CI runs or builds listed; then re-run /ci. Page cache cannot be dropped in this pod and is reclaimed only by the kernel. A re-run is worthwhile once the sysadmin monitor's reading is back below its 85% warn line, or once W is back below the ceiling.",
+        'what to do: finish or kill idle agent-director workers and confirm their tmux sessions are gone; stop the other CI runs or builds listed; then re-run /ci. A re-run is worthwhile once the printed pod non-reclaimable memory used by gate leaves room under the ceiling for the listed commitments, shard caps and admission margin. Reclaimable page cache is excluded from this gate.',
       ],
       ['DISK_REFUSAL_ADVICE', DISK_REFUSAL_ADVICE, 'what to do: remove results directories and other large files that are not needed on that volume, then re-run.'],
       ['DOCKER_STORAGE_NOTE', DOCKER_STORAGE_NOTE, "Docker's images live on /var/lib/docker, which this check does not count."],
@@ -2989,13 +2989,74 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
   // T7.S6: the fits, choosing N and the shard-count line (b.uqm SR-6.7; AC 16, AC 18's W cases, AC 20, AC 35's decision)
   // -------------------------------------------------------------------------
 
+  describe('b.rmn: reclaimable cache does not consume admission headroom', () => {
+    test.each([
+      ['shared memory makes anon plus shmem larger than the LRU total', 48, 4, 20, 26, 2, 52, 'refused'],
+      ['locked pages make the LRU plus unevictable total larger than anon plus shmem', 48, 1, 20, 26, 6, 52, 'refused'],
+      ['locked anon already counted in anon is counted once', 50, 0, 20, 25, 5, 50, 'admitted'],
+      ['shared and locked memory already counted in the anon LRU is counted once', 46, 4, 20, 25, 5, 50, 'admitted'],
+    ] as const)('%s', async (_name, anonGib, shmemGib, activeAnonGib, inactiveAnonGib, unevictableGib, gateGib, expected) => {
+      const rig = makeAdmission({ pod: { limitGib: POD_LIMIT_GIB, workingSetGib: 56, anonGib, activeFileGib: 4 } })
+      const request = requestFor(['--shards', '1'], MAX_SHARDS).request
+      // The factory's anon-only fixture fits. These actual memory.stat counters
+      // must change that decision when shared or locked pages consume headroom.
+      expect(decideAdmission(await rig.figures(), request, rig.listResultsDirs).kind).toBe('admitted')
+      const statPath = rig.built.cgroups.pathOf('/', CGROUP_FILE.stat)
+      let stat = readFileSync(statPath, 'utf8')
+      for (const [key, gib] of [['shmem', shmemGib], ['active_anon', activeAnonGib], ['inactive_anon', inactiveAnonGib], ['unevictable', unevictableGib]] as const) {
+        stat = stat.replace(new RegExp(`^${key} \\d+$`, 'm'), `${key} ${gibToBytes(gib)}`)
+      }
+      rig.built.cgroups.writeFile('/', CGROUP_FILE.stat, stat)
+
+      const figures = await rig.figures()
+      expect(figures.readings.beforeWorkingSet).toEqual({
+        bytes: gibToBytes(56), anonBytes: gibToBytes(anonGib), activeFileBytes: gibToBytes(4),
+        shmemBytes: gibToBytes(shmemGib), activeAnonBytes: gibToBytes(activeAnonGib),
+        inactiveAnonBytes: gibToBytes(inactiveAnonGib), unevictableBytes: gibToBytes(unevictableGib),
+      })
+      const decision = decideAdmission(figures, request, rig.listResultsDirs)
+      expect(decision.kind).toBe(expected)
+      expect(decision.figures.freeBytes).toBe(podCeilingBytes() - gibToBytes(gateGib) - ADMISSION_MARGIN_BYTES)
+      if (decision.kind === 'refused') {
+        expect(decision.failedLimits).toEqual(['memory'])
+        expect(decision.refusal.details).toContain(
+          `pod non-reclaimable memory used by gate: ${formatGib(gibToBytes(gateGib))} GiB (anon ${formatGib(gibToBytes(anonGib))} GiB, shmem ${formatGib(gibToBytes(shmemGib))} GiB; anon LRU plus unevictable accounted without double-counting); reclaimable page cache is excluded`,
+        )
+      }
+    })
+
+    test.each([
+      ['high active page cache and low anon', 4.7, 44, 'admitted'],
+      ['high anon without page cache', 52, 0, 'refused'],
+    ] as const)('%s', async (_name, anonGib, activeFileGib, expected) => {
+      const rig = makeAdmission({ pod: { limitGib: 64, workingSetGib: 52, anonGib, activeFileGib } })
+      const decision = decideAdmission(await rig.figures(), requestFor(['--shards', '1'], MAX_SHARDS).request, rig.listResultsDirs)
+      expect(decision.kind).toBe(expected)
+      if (decision.kind === 'refused') {
+        expect(refusalLine(decision.refusal)).toContain('memory:')
+        expect(decision.refusal.details.join(' ')).toContain('reclaimable page cache is excluded')
+      }
+    })
+
+    test.each(['shmem', 'active_anon', 'inactive_anon', 'unevictable'])('missing %s refuses admission as unreadable memory', async (key) => {
+      const rig = makeAdmission({ pod: { limitGib: 64, workingSetGib: 52, anonGib: 4.7, activeFileGib: 44 } })
+      rig.built.cgroups.change('/', CGROUP_FILE.stat, { kind: 'without-key', key })
+      const reading = readPodWorkingSet(rig.input.deps)
+      expect(reading.ok).toBe(false)
+      if (!reading.ok) expect(reading.error).toContain(key)
+      const taken = await rig.take()
+      expect(taken.ok).toBe(false)
+      if (!taken.ok) expect(taken.error).toContain(key)
+    })
+  })
+
   describe('the fits, choosing N and the shard-count line (b.uqm SR-6.7)', () => {
     /** An unlabelled, capped `cscb-ci*` container: one counted commitment. */
     const CAPPED_SCRATCH = `${CI_CONTAINER_NAME_PREFIX}-capped-scratch`
     /** A pod at the factory's L whose W is exactly `bytes`. */
-    const podWithWorkingSet = (bytes: number): PodFigures => ({ limitGib: POD_LIMIT_GIB, workingSetGib: bytes / GIB_BYTES })
+    const podWithWorkingSet = (bytes: number): PodFigures => ({ limitGib: POD_LIMIT_GIB, workingSetGib: bytes / GIB_BYTES, anonGib: bytes / GIB_BYTES })
     /** A pod at the factory's L whose W is `gib` GiB. */
-    const podAt = (gib: number): PodFigures => ({ limitGib: POD_LIMIT_GIB, workingSetGib: gib })
+    const podAt = (gib: number): PodFigures => ({ limitGib: POD_LIMIT_GIB, workingSetGib: gib, anonGib: gib })
     /** The admitted decision, or a failure naming the refusal. */
     function admittedOf(decision: AdmissionDecision): Extract<AdmissionDecision, { kind: 'admitted' }> {
       if (decision.kind !== 'admitted') throw new Error(`expected an admission, got ${refusalLine(decision.refusal)}`)
@@ -3343,9 +3404,9 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
     const REQUESTED_SHARDS = 3
 
     test.each([
-      ['a default run, judged at 1 shard', [], { workingSetGib: 52.5, anonGib: 20, activeFileGib: 30 }, OPTION_RANGE_MIN],
-      ['a --shards run, judged at its effective N', ['--shards', String(REQUESTED_SHARDS)], { workingSetGib: 48, anonGib: 18, activeFileGib: 28 }, REQUESTED_SHARDS],
-      ['an --inject run, judged at its effective N', ['--inject', 'kill:1'], { workingSetGib: 45, anonGib: 15, activeFileGib: 27.5 }, MAX_SHARDS],
+      ['a default run, judged at 1 shard', [], { workingSetGib: 52.5, anonGib: 52.5 }, OPTION_RANGE_MIN],
+      ['a --shards run, judged at its effective N', ['--shards', String(REQUESTED_SHARDS)], { workingSetGib: 48, anonGib: 48 }, REQUESTED_SHARDS],
+      ['an --inject run, judged at its effective N', ['--inject', 'kill:1'], { workingSetGib: 45, anonGib: 45 }, MAX_SHARDS],
     ] satisfies [string, string[], Omit<PodFigures, 'limitGib'>, number][])(
       'the memory refusal of %s: its first line, W split, nothing else counted, the margin and cap, the largest value that fits and the advice',
       async (_name, args, pod, judged) => {
@@ -3362,10 +3423,10 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
           `${NOT_RUN_PREFIX}memory: ${judged} shard(s) need ${formatGib(judged * SHARD_MEMORY_CAP_BYTES)} GiB; ${formatGib(freeBytes)} GiB fits under the ${podCeilingGibText()} GiB ceiling`,
         )
         const w = rig.built.pod
-        const split = detailWith(refusal, `anon ${formatGib(w.anonBytes)} GiB`)
-        for (const part of [`${formatGib(w.workingSetBytes)} GiB`, `active page cache ${formatGib(w.activeFileBytes)} GiB`, `the rest ${formatGib(w.restBytes)} GiB`]) expect(split).toContain(part)
+        const split = detailWith(refusal, 'pod non-reclaimable memory used by gate:')
+        for (const part of [`${formatGib(w.workingSetBytes)} GiB`, 'non-reclaimable memory used by gate', 'reclaimable page cache is excluded']) expect(split).toContain(part)
         detailWith(refusal, NOTHING_ELSE_COUNTED_TEXT)
-        const margin = detailWith(refusal, 'margin')
+        const margin = detailWith(refusal, 'admission margin:')
         for (const part of [`${formatGib(ADMISSION_MARGIN_BYTES)} GiB`, 'cap', `${formatGib(SHARD_MEMORY_CAP_BYTES)} GiB`]) expect(margin).toContain(part)
         expect(refusal.details).toContain(largest < OPTION_RANGE_MIN ? NO_FITTING_SHARDS_TEXT : `${LARGEST_FITTING_SHARDS_PREFIX}${largest}`)
         expect(refusal.details.at(-1)).toBe(MEMORY_REFUSAL_ADVICE)
@@ -3397,7 +3458,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
         },
       ],
     ] satisfies [string, number, (rig: AdmissionRig) => { marker: string; named: string[] }][])('the memory refusal names the ceiling and its source: %s', async (_name, workingSetGib, setUp) => {
-      const rig = makeAdmission({ pod: { limitGib: POD_LIMIT_GIB, workingSetGib } })
+      const rig = makeAdmission({ pod: { limitGib: POD_LIMIT_GIB, workingSetGib, anonGib: workingSetGib } })
       const { marker, named } = setUp(rig)
 
       const refusal = refusalOf(decideAdmission(await rig.figures(), defaultFullRun(), rig.listResultsDirs))
@@ -3418,7 +3479,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
       const blockedUnowned = `${CI_CONTAINER_NAME_PREFIX}-blocked-unowned`
       const blockedMisowned = `${CI_CONTAINER_NAME_PREFIX}-blocked-misowned`
       const rig = makeAdmission({
-        pod: { limitGib: POD_LIMIT_GIB, workingSetGib: 10 },
+        pod: { limitGib: POD_LIMIT_GIB, workingSetGib: 10, anonGib: 10 },
         reservations: reservationListing({ valid: [live] }),
         containers: [
           { name: liveShard, labels: ciShardLabels(LIVE_OWNER), capGib: 2, memoryGib: 1.5 },
@@ -3605,7 +3666,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
 
     test('memory, disk and CPU all failing: memory gives the kind and summary, then disk and CPU follow as <kind>: <summary> lines with their details, in that order', async () => {
       const rig = makeAdmission({
-        pod: { limitGib: POD_LIMIT_GIB, workingSetGib: 45 },
+        pod: { limitGib: POD_LIMIT_GIB, workingSetGib: 45, anonGib: 45 },
         volume: FULL_VOLUME,
         reservations: reservationListing({ valid: [listedReservation({ owner: LIVE_OWNER, shards: 6, ownerAlive: true })] }),
       })
@@ -3637,7 +3698,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
       'two limits failing keep the order memory, disk, CPU: %s',
       async (_name, args, workingSetGib, volume, otherShards, failed, namesLargest) => {
         const valid = otherShards === 0 ? [] : [listedReservation({ owner: LIVE_OWNER, shards: otherShards, ownerAlive: true })]
-        const rig = makeAdmission({ pod: { limitGib: POD_LIMIT_GIB, workingSetGib }, volume, reservations: reservationListing({ valid }) })
+        const rig = makeAdmission({ pod: { limitGib: POD_LIMIT_GIB, workingSetGib, anonGib: workingSetGib }, volume, reservations: reservationListing({ valid }) })
 
         const decision = decideAdmission(await rig.figures(), requestFor(args, MAX_SHARDS).request, rig.listResultsDirs)
         const refusal = refusalOf(decision)
@@ -3660,7 +3721,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
 
     test('a run that can choose its N is judged at 1 shard: refused for memory there, its CPU fit passing at 1 though it would fail at its effective N, it lists memory only', async () => {
       const other = listedReservation({ owner: LIVE_OWNER, shards: 3, ownerAlive: true })
-      const rig = makeAdmission({ pod: { limitGib: POD_LIMIT_GIB, workingSetGib: 48 }, reservations: reservationListing({ valid: [other] }) })
+      const rig = makeAdmission({ pod: { limitGib: POD_LIMIT_GIB, workingSetGib: 48, anonGib: 48 }, reservations: reservationListing({ valid: [other] }) })
       const request = defaultFullRun()
 
       const decision = decideAdmission(await rig.figures(), request, rig.listResultsDirs)

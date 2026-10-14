@@ -1242,6 +1242,11 @@ export interface WorkingSetReading {
   readonly bytes: number
   readonly anonBytes: number
   readonly activeFileBytes: number
+  /** Gate-only counters; omitted from the version 1 results diagnostics. */
+  readonly shmemBytes?: number
+  readonly activeAnonBytes?: number
+  readonly inactiveAnonBytes?: number
+  readonly unevictableBytes?: number
 }
 
 /** One active `/ci-live` run as admission or a sample saw it (b.uqm SR-6.6). */
@@ -7095,6 +7100,10 @@ const STAT_ANON_KEY = 'anon'
 const STAT_ACTIVE_FILE_KEY = 'active_file'
 /** `memory.stat`'s whole page cache. */
 const STAT_FILE_KEY = 'file'
+const STAT_SHMEM_KEY = 'shmem'
+const STAT_ACTIVE_ANON_KEY = 'active_anon'
+const STAT_INACTIVE_ANON_KEY = 'inactive_anon'
+const STAT_UNEVICTABLE_KEY = 'unevictable'
 /** `memory.events`' count of out-of-memory kills. */
 const EVENTS_OOM_KILL_KEY = 'oom_kill'
 /** A cgroup file's whole number: decimal digits only. */
@@ -7242,7 +7251,8 @@ export function readPodLimit(deps: Pick<RunnerDeps, 'readCgroupFile'>): ReadingR
 /**
  * W with its parts, from the cgroup-namespace root (b.uqm SR-7.1): W is
  * `memory.current` minus `inactive_file`, never below 0; its parts are `anon`
- * and `active_file`. Each missing or garbled file or `memory.stat` key is a
+ * and `active_file`. The gate also reads shmem and the anon/unevictable LRU
+ * counters. Each missing or garbled file or `memory.stat` key is a
  * failed reading naming it.
  */
 export function readPodWorkingSet(deps: Pick<RunnerDeps, 'readCgroupFile'>): ReadingResult<WorkingSetReading> {
@@ -7256,7 +7266,26 @@ export function readPodWorkingSet(deps: Pick<RunnerDeps, 'readCgroupFile'>): Rea
   if (!anon.ok) return anon
   const activeFile = keyedCgroupNumber(stat, STAT_ACTIVE_FILE_KEY, statWhat)
   if (!activeFile.ok) return activeFile
-  return { ok: true, value: { bytes: bytes.value, anonBytes: anon.value, activeFileBytes: activeFile.value } }
+  const shmem = keyedCgroupNumber(stat, STAT_SHMEM_KEY, statWhat)
+  if (!shmem.ok) return shmem
+  const activeAnon = keyedCgroupNumber(stat, STAT_ACTIVE_ANON_KEY, statWhat)
+  if (!activeAnon.ok) return activeAnon
+  const inactiveAnon = keyedCgroupNumber(stat, STAT_INACTIVE_ANON_KEY, statWhat)
+  if (!inactiveAnon.ok) return inactiveAnon
+  const unevictable = keyedCgroupNumber(stat, STAT_UNEVICTABLE_KEY, statWhat)
+  if (!unevictable.ok) return unevictable
+  return {
+    ok: true,
+    value: {
+      bytes: bytes.value,
+      anonBytes: anon.value,
+      activeFileBytes: activeFile.value,
+      shmemBytes: shmem.value,
+      activeAnonBytes: activeAnon.value,
+      inactiveAnonBytes: inactiveAnon.value,
+      unevictableBytes: unevictable.value,
+    },
+  }
 }
 
 /** L and W with its parts (b.uqm SR-6.5, SR-7.1); the first failed reading, L's first, when any fails. */
@@ -7271,6 +7300,21 @@ export function readPodMemory(deps: Pick<RunnerDeps, 'readCgroupFile'>): Reading
 /** W's rest: W minus anon and active page cache, never below 0 (b.uqm SR-7.1). */
 export function workingSetRestBytes(reading: WorkingSetReading): number {
   return Math.max(0, reading.bytes - reading.anonBytes - reading.activeFileBytes)
+}
+
+/**
+ * Memory counted by admission and the watchdog, excluding reclaimable file
+ * cache. anon and shmem are separate type counters. shmem is on the anon LRU
+ * lists; locked anon/shmem move to the unevictable list, so adding unevictable
+ * to the type counters would count those pages twice. The disjoint anon and
+ * unevictable lists account for locked file pages too. Take the larger of
+ * that sum and anon + shmem because type and LRU counters can differ.
+ * Legacy diagnostics have only anon; production reads all four extra keys.
+ */
+export function nonReclaimableMemoryBytes(reading: WorkingSetReading): number {
+  const anonAndShmem = reading.anonBytes + (reading.shmemBytes ?? 0)
+  const anonAndUnevictableLists = (reading.activeAnonBytes ?? 0) + (reading.inactiveAnonBytes ?? 0) + (reading.unevictableBytes ?? 0)
+  return Math.max(anonAndShmem, anonAndUnevictableLists)
 }
 
 /** Throws unless `bytes` is a whole number of bytes, 0 or more. */
@@ -8136,23 +8180,23 @@ export function canChooseShards(invocation: Invocation): boolean {
 }
 
 /**
- * f (b.uqm SR-6.7): C − W − the memory commitments − the 1 GiB admission
+ * f (b.uqm SR-6.7, corrected by b.rmn): C − non-reclaimable memory − the memory commitments − the 1 GiB admission
  * margin, never below 0, the memory left for shards. Blocking containers count
  * nothing here; they fail the memory fit on their own.
  */
 export function freeShardMemoryBytes(figures: AdmissionFigures): number {
-  const free = BigInt(figures.ceiling.bytes) - BigInt(figures.readings.beforeWorkingSet.bytes) - BigInt(figures.commitments.totalBytes) - BigInt(ADMISSION_MARGIN_BYTES)
+  const free = BigInt(figures.ceiling.bytes) - BigInt(nonReclaimableMemoryBytes(figures.readings.beforeWorkingSet)) - BigInt(figures.commitments.totalBytes) - BigInt(ADMISSION_MARGIN_BYTES)
   return free > BigInt(0) ? Number(free) : 0
 }
 
 /**
- * The memory fit at N shards (b.uqm SR-6.7): W + the commitments + N × the cap
+ * The memory fit at N shards (b.uqm SR-6.7, corrected by b.rmn): non-reclaimable memory + the commitments + N × the cap
  * + the 1 GiB admission margin ≤ C, compared in whole bytes. Any blocking
  * container fails it whatever the readings.
  */
 export function memoryFits(figures: AdmissionFigures, shards: number, capBytes: number): boolean {
   if (figures.commitments.blocking.length > 0) return false
-  const need = BigInt(figures.readings.beforeWorkingSet.bytes) + BigInt(figures.commitments.totalBytes) + BigInt(shards) * BigInt(capBytes) + BigInt(ADMISSION_MARGIN_BYTES)
+  const need = BigInt(nonReclaimableMemoryBytes(figures.readings.beforeWorkingSet)) + BigInt(figures.commitments.totalBytes) + BigInt(shards) * BigInt(capBytes) + BigInt(ADMISSION_MARGIN_BYTES)
   return need <= BigInt(figures.ceiling.bytes)
 }
 
@@ -8208,7 +8252,7 @@ export interface AdmissionDecisionFigures {
   readonly request: AdmissionRequest
   /** The readings, C with its source, and the commitments. */
   readonly admission: AdmissionFigures
-  /** f: C − W − commitments − margin, never below 0. */
+  /** f: C − non-reclaimable memory − commitments − margin, never below 0. */
   readonly freeBytes: number
   /** h: the CPUs of the other live `/ci` reservations. */
   readonly reservedCpus: number
@@ -8354,8 +8398,8 @@ export function endedBeforeAdmissionShardCountLine(requestedShards: number): str
 
 // --- 10/T5 (E6 T5): refusal messages ---
 
-/** The memory refusal's advice, its last detail line, exactly as b.uqm SR-6.8 gives it. */
-export const MEMORY_REFUSAL_ADVICE = `what to do: finish or kill idle agent-director workers and confirm their tmux sessions are gone; stop the other CI runs or builds listed; then re-run /ci. Page cache cannot be dropped in this pod and is reclaimed only by the kernel. A re-run is worthwhile once the sysadmin monitor's reading is back below its ${MEMORY_CEILING_PERCENT}% warn line, or once W is back below the ceiling.`
+/** The memory refusal's advice, its last detail line (b.uqm SR-6.8, corrected by b.rmn). */
+export const MEMORY_REFUSAL_ADVICE = 'what to do: finish or kill idle agent-director workers and confirm their tmux sessions are gone; stop the other CI runs or builds listed; then re-run /ci. A re-run is worthwhile once the printed pod non-reclaimable memory used by gate leaves room under the ceiling for the listed commitments, shard caps and admission margin. Reclaimable page cache is excluded from this gate.'
 /** The disk refusal's advice (b.uqm SR-6.8). */
 export const DISK_REFUSAL_ADVICE = 'what to do: remove results directories and other large files that are not needed on that volume, then re-run.'
 /** The disk refusal's last detail line: Docker's storage, which the disk check does not count (b.uqm SR-6.8, SR-19.9). */
@@ -8622,7 +8666,8 @@ function blockingText(container: BlockingContainer): string {
 /**
  * The memory refusal (b.uqm SR-6.8): `<n> shard(s) need <x> GiB; <f> GiB fits
  * under the <C> GiB ceiling`, n being the judged N and x n × the cap; then the
- * ceiling and its source, W split into anon, active page cache and the rest,
+ * ceiling and its source, the non-reclaimable memory used by the gate, and
+ * diagnostic W split into anon, active page cache and the rest,
  * the counted commitments with each item's counted GiB, each blocking
  * container, the admission margin and the cap, the largest `--shards` value
  * that fits now (or that none does), and the advice.
@@ -8640,6 +8685,7 @@ export function memoryRefusalPart(judgedShards: number, figures: AdmissionDecisi
     summary: `${judgedShards} shard(s) need ${formatGib(judgedShards * request.capBytes)} GiB; ${formatGib(figures.freeBytes)} GiB fits under the ${formatGib(admission.ceiling.bytes)} GiB ceiling`,
     details: [
       ceilingSourceText(admission.ceiling),
+      `pod non-reclaimable memory used by gate: ${formatGib(nonReclaimableMemoryBytes(w))} GiB (anon ${formatGib(w.anonBytes)} GiB, shmem ${formatGib(w.shmemBytes ?? 0)} GiB; anon LRU plus unevictable accounted without double-counting); reclaimable page cache is excluded`,
       `pod working set W: ${formatGib(w.bytes)} GiB (anon ${formatGib(w.anonBytes)} GiB, active page cache ${formatGib(w.activeFileBytes)} GiB, the rest ${formatGib(workingSetRestBytes(w))} GiB)`,
       ...counted,
       ...commitments.blocking.map(blockingText),
@@ -8751,8 +8797,8 @@ export function admissionRefusal(
 // with admission's "before" W, L and the ceiling with its source, and calls
 // `start`. Every `SAMPLE_INTERVAL_MS` it asks `runningShards` which shards
 // run (none during the build), takes one `Sample` and hands it to `onSample`;
-// the first sample whose W reaches the stop line also decides the run-level
-// stop, handed once to `onStop` with its exact line. E13 performs that stop
+// the first sample whose non-reclaimable memory reaches the stop line decides
+// the run-level stop, handed once to `onStop` with its exact line. E13 performs that stop
 // and calls `stop` at end-of-run step 4, which takes the after-cleanup W
 // reading and answers W before, at its peak and after cleanup with the
 // failed-reading counts. Every read goes through the injected dependencies
@@ -8949,22 +8995,24 @@ export function watchdogShardDetail(shards: readonly Pick<ShardSample, 'shard' |
 
 /**
  * The memory watchdog's exact line (b.uqm SR-7.4): `FAIL: memory watchdog:
- * pod working set <x> GiB reached the <y> GiB stop line (<ceiling source>;
- * <per-shard detail>)`, x being W and y the stop line, each to one decimal
+ * pod non-reclaimable memory <x> GiB reached the <y> GiB stop line (<ceiling source>;
+ * <per-shard detail>; reclaimable page cache excluded)`, x being the gate's
+ * memory figure and y the stop line, each to one decimal
  * place, rounded to the nearest tenth.
  */
-export function memoryWatchdogLine(workingSetBytes: number, ceiling: MemoryCeiling, shards: readonly Pick<ShardSample, 'shard' | 'memoryBytes'>[]): string {
+export function memoryWatchdogLine(nonReclaimableBytes: number, ceiling: MemoryCeiling, shards: readonly Pick<ShardSample, 'shard' | 'memoryBytes'>[]): string {
   return (
-    `${FAIL_PREFIX}memory watchdog: pod working set ${formatGib(workingSetBytes)} GiB reached the ${formatGib(memoryStopLineBytes(ceiling))} GiB stop line ` +
-    `(${watchdogCeilingSourceText(ceiling)}; ${watchdogShardDetail(shards)})`
+    `${FAIL_PREFIX}memory watchdog: pod non-reclaimable memory ${formatGib(nonReclaimableBytes)} GiB reached the ${formatGib(memoryStopLineBytes(ceiling))} GiB stop line ` +
+    `(${watchdogCeilingSourceText(ceiling)}; ${watchdogShardDetail(shards)}; reclaimable page cache excluded)`
   )
 }
 
-/** The stop a sample decides (b.uqm SR-7.4): its W at or above its own ceiling's stop line, in whole bytes; null for a W below it or unreadable. */
+/** The stop a sample decides (b.uqm SR-7.4, corrected by b.rmn): non-reclaimable memory at or above its ceiling's stop line; null below it or unreadable. */
 export function decideMemoryStop(sample: Pick<Sample, 'workingSet' | 'ceiling' | 'shards'>): MemoryWatchdogStop | null {
   if (sample.workingSet === UNREADABLE_READING) return null
-  if (sample.workingSet.bytes < memoryStopLineBytes(sample.ceiling)) return null
-  return { kind: 'memory-watchdog', line: memoryWatchdogLine(sample.workingSet.bytes, sample.ceiling, sample.shards) }
+  const usedBytes = nonReclaimableMemoryBytes(sample.workingSet)
+  if (usedBytes < memoryStopLineBytes(sample.ceiling)) return null
+  return { kind: 'memory-watchdog', line: memoryWatchdogLine(usedBytes, sample.ceiling, sample.shards) }
 }
 
 /** A reading's value, or `unreadable` with one failed reading recorded under the value's name. */

@@ -70,6 +70,8 @@ import {
   createMemoryWatchdog,
   formatGib,
   memoryCeiling,
+  nonReclaimableMemoryBytes,
+  decideMemoryStop,
   memoryStopLineBytes,
   memoryWatchdogLine,
   oomFailureOf,
@@ -185,11 +187,11 @@ function shardSamplesOf(samples: readonly Sample[], shard: number): ShardSample[
 
 /** W with its parts, in whole bytes from GiB figures. */
 function workingSetOf(workingSetGib: number, anonGib: number, activeFileGib: number): WorkingSetReading {
-  return { bytes: gib(workingSetGib), anonBytes: gib(anonGib), activeFileBytes: gib(activeFileGib) }
+  return { bytes: gib(workingSetGib), anonBytes: gib(anonGib), activeFileBytes: gib(activeFileGib), shmemBytes: 0, activeAnonBytes: 0, inactiveAnonBytes: gib(anonGib), unevictableBytes: 0 }
 }
 
 /** Test data: admission's "before" W, unlike any sample's. */
-const BEFORE = workingSetOf(19, 7, 3)
+const BEFORE: WorkingSetReading = { bytes: gib(19), anonBytes: gib(7), activeFileBytes: gib(3) }
 
 /** What the memory-run factory takes beside the sequence. */
 interface MemoryRunOptions {
@@ -286,7 +288,7 @@ function memoryRun(spec: Omit<SampleSequenceSpec, 'limit'> & { readonly limit?: 
 
 /** A quiet sample: W well below the line, with the given running shards. */
 function quiet(shards: readonly SampleShard[] = [], extra: Partial<SampleStep> = {}): SampleStep {
-  return { pod: { workingSet: QUIET_W_GIB }, shards, ...extra }
+  return { pod: { workingSet: QUIET_W_GIB , anon: QUIET_W_GIB }, shards, ...extra }
 }
 
 // Result-file events (b.uqm SR-11.3), built as data and written by the run-directory builder.
@@ -432,7 +434,7 @@ describe('samples (b.uqm SR-7.3)', () => {
           throw new Error('stop callback broke')
         },
       }),
-      firstStep: { pod: { workingSet: LIMIT_GIB - 1 } } as Partial<SampleStep>,
+      firstStep: { pod: { workingSet: LIMIT_GIB - 1, anon: LIMIT_GIB - 1 } } as Partial<SampleStep>,
       stopped: true,
       samples: 3,
       failedReadings: 0,
@@ -513,7 +515,7 @@ describe('samples (b.uqm SR-7.3)', () => {
       steps: [
         { pod: { workingSet: 10, anon: 3, activeFile: 1 } },
         // W's files hold 40 GiB, but its memory.stat is gone: unreadable, never a peak.
-        { pod: { workingSet: 40, unreadable: { file: CGROUP_FILE.stat } } },
+        { pod: { workingSet: 40, anon: 40, unreadable: { file: CGROUP_FILE.stat } } },
         { pod: { workingSet: 8, anon: 2, activeFile: 1 } },
       ],
     })
@@ -682,7 +684,7 @@ describe('samples (b.uqm SR-7.3)', () => {
 
 /** The stop line's expected text from constructed values. */
 function expectedStopLine(workingSetBytes: number, ceilingBytes: number, source: string, detail: string): string {
-  return `${FAIL_PREFIX}memory watchdog: pod working set ${formatGib(workingSetBytes)} GiB reached the ${formatGib(ceilingBytes - STOP_LINE_OFFSET_BYTES)} GiB stop line (${source}; ${detail})`
+  return `${FAIL_PREFIX}memory watchdog: pod non-reclaimable memory ${formatGib(workingSetBytes)} GiB reached the ${formatGib(ceilingBytes - STOP_LINE_OFFSET_BYTES)} GiB stop line (${source}; ${detail}; reclaimable page cache excluded)`
 }
 
 /** The pod-limit ceiling source for L. */
@@ -700,15 +702,50 @@ function podStopLineBytes(limitBytes: number): number {
   return memoryCeiling(limitBytes, []).bytes - STOP_LINE_OFFSET_BYTES
 }
 
+describe('b.rmn: the watchdog gates non-reclaimable memory', () => {
+  test('high page cache stays below the gate, then high anon stops at the next sample', async () => {
+    const run = memoryRun({ limit: 64, steps: [
+      { pod: { workingSet: 60, anon: 4.7, activeFile: 44 } },
+      { pod: { workingSet: 60, anon: 54, activeFile: 0 } },
+    ] })
+    const report = await run.runAll()
+    expect(run.stops.map(({ sample }) => sample.atMs)).toEqual([report.samples[1]!.atMs])
+    expect(report.stop?.line).toContain('pod non-reclaimable memory 54.0 GiB')
+    expect(report.stop?.line).toContain('reclaimable page cache excluded')
+  })
+
+  test.each([
+    ['shmem counted once despite appearing on anon LRU', 4, 6, 10, 0, 0, 10],
+    ['locked anon is already in anon and moves out of LRU', 10, 0, 8, 0, 2, 10],
+    ['locked file cache is added by unevictable LRU', 10, 0, 10, 0, 3, 13],
+    ['inactive anon and locked shmem accounted once', 4, 6, 3, 4, 3, 10],
+  ])('%s', (_name, anon, shmem, activeAnon, inactiveAnon, unevictable, expected) => {
+    const reading = { bytes: gib(60), anonBytes: gib(anon), activeFileBytes: gib(44), shmemBytes: gib(shmem), activeAnonBytes: gib(activeAnon), inactiveAnonBytes: gib(inactiveAnon), unevictableBytes: gib(unevictable) }
+    expect(nonReclaimableMemoryBytes(reading)).toBe(gib(expected))
+    const ceiling = { bytes: gib(expected) + STOP_LINE_OFFSET_BYTES, source: { kind: 'pod-limit' as const, limitBytes: gib(64) } }
+    expect(decideMemoryStop({ workingSet: reading, ceiling, shards: [] })?.line).toContain(`pod non-reclaimable memory ${formatGib(gib(expected))} GiB`)
+    expect(decideMemoryStop({ workingSet: reading, ceiling: { ...ceiling, bytes: ceiling.bytes + 1 }, shards: [] })).toBeNull()
+  })
+
+  test.each(['shmem', 'active_anon', 'inactive_anon', 'unevictable'])('a sample missing %s is counted as unreadable and cannot stop the run', async (key) => {
+    const run = memoryRun({ limit: 64, steps: [{ pod: { workingSet: 60, anon: 54, unreadable: { file: CGROUP_FILE.stat, change: { kind: 'without-key', key } } } }] })
+    const report = await run.runAll()
+    expect(report.samples[0]!.workingSet).toBe(UNREADABLE_READING)
+    expect(report.failedReadings).toBe(2)
+    expect(report.stop).toBeNull()
+    expect(report.failures.every((failure) => failure.error.includes(key))).toBe(true)
+  })
+})
+
 describe('the stop line (b.uqm SR-7.4)', () => {
   test('PRD line: W at the stop line of a 64 GiB pod limit stops the run with its exact line, the shards in shard order', async () => {
     const limit = gib(64)
     const run = memoryRun({
       limit: { bytes: limit },
-      steps: [{ pod: { workingSet: { bytes: podStopLineBytes(limit) } }, shards: [{ shard: 2, memory: 0.8 }, { shard: 1, memory: 1.1 }] }],
+      steps: [{ pod: { workingSet: { bytes: podStopLineBytes(limit) }, anon: { bytes: podStopLineBytes(limit) } }, shards: [{ shard: 2, memory: 0.8 }, { shard: 1, memory: 1.1 }] }],
     })
     const report = await run.runAll()
-    const line = 'FAIL: memory watchdog: pod working set 53.9 GiB reached the 53.9 GiB stop line (85% of the 64.0 GiB pod limit; shard-1 1.1 GiB, shard-2 0.8 GiB)'
+    const line = 'FAIL: memory watchdog: pod non-reclaimable memory 53.9 GiB reached the 53.9 GiB stop line (85% of the 64.0 GiB pod limit; shard-1 1.1 GiB, shard-2 0.8 GiB; reclaimable page cache excluded)'
     expect(run.stops.map(({ stop }) => stop)).toEqual([{ kind: 'memory-watchdog', line }])
     expect(report.stop).toEqual({ kind: 'memory-watchdog', line })
   })
@@ -716,7 +753,7 @@ describe('the stop line (b.uqm SR-7.4)', () => {
   test('demo: a /ci-live lock appearing mid-run moves the stop line from 53.9 to 39.5 GiB at the next sample, and the line names the run', async () => {
     const run = memoryRun({
       limit: 64,
-      steps: [quiet([{ shard: 1, memory: 1 }], { pod: { workingSet: 45 } }), quiet([{ shard: 1, memory: 1 }], { pod: { workingSet: 45 }, locks: { realRun: 'held' } })],
+      steps: [quiet([{ shard: 1, memory: 1 }], { pod: { workingSet: 45 , anon: 45 } }), quiet([{ shard: 1, memory: 1 }], { pod: { workingSet: 45 , anon: 45 }, locks: { realRun: 'held' } })],
     })
     const report = await run.runAll()
     const [before, after] = report.samples
@@ -730,7 +767,7 @@ describe('the stop line (b.uqm SR-7.4)', () => {
   test('one byte below the stop line does not stop; exactly on it stops', async () => {
     const limit = gib(LIMIT_GIB)
     const stopLine = podStopLineBytes(limit)
-    const run = memoryRun({ steps: [{ pod: { workingSet: { bytes: stopLine - 1 } } }, { pod: { workingSet: { bytes: stopLine } } }] })
+    const run = memoryRun({ steps: [{ pod: { workingSet: { bytes: stopLine - 1 }, anon: { bytes: stopLine - 1 } } }, { pod: { workingSet: { bytes: stopLine }, anon: { bytes: stopLine } } }] })
     const report = await run.runAll()
     expect(run.stops.map(({ sample }) => sample.atMs)).toEqual([report.samples[1]!.atMs])
     expect(report.stop?.line).toBe(expectedStopLine(stopLine, memoryCeiling(limit, []).bytes, podLimitSource(limit), NO_SHARDS_RUNNING_TEXT))
@@ -738,13 +775,13 @@ describe('the stop line (b.uqm SR-7.4)', () => {
 
   test('during the build, with no shard started, the stop reads no shards running', async () => {
     const limit = gib(LIMIT_GIB)
-    const run = memoryRun({ steps: [{ pod: { workingSet: LIMIT_GIB - 1 } }] })
+    const run = memoryRun({ steps: [{ pod: { workingSet: LIMIT_GIB - 1, anon: LIMIT_GIB - 1 } }] })
     const report = await run.runAll()
     expect(report.stop?.line).toBe(expectedStopLine(gib(LIMIT_GIB - 1), memoryCeiling(limit, []).bytes, podLimitSource(limit), NO_SHARDS_RUNNING_TEXT))
   })
 
   test("with the real-run and dry-run locks both held, the line names the real-run lock's PID", async () => {
-    const run = memoryRun({ steps: [{ pod: { workingSet: 41 }, locks: { dryRun: 'held', realRun: 'held' } }] })
+    const run = memoryRun({ steps: [{ pod: { workingSet: 41 , anon: 41 }, locks: { dryRun: 'held', realRun: 'held' } }] })
     const report = await run.runAll()
     expect(report.samples[0]!.ciLive.map((seen) => seen.pid)).toEqual([run.seq.realRunPid, run.seq.dryRunPid])
     expect(report.stop?.line).toBe(expectedStopLine(gib(41), CI_LIVE_WORKING_SET_LIMIT_BYTES, ciLiveSource(run.seq.realRunPid), NO_SHARDS_RUNNING_TEXT))
@@ -753,8 +790,8 @@ describe('the stop line (b.uqm SR-7.4)', () => {
   test('a failed /ci-live re-check after a /ci-live run was seen keeps its line and source at that sample', async () => {
     const run = memoryRun({
       steps: [
-        { pod: { workingSet: 38 }, locks: { realRun: 'held' } },
-        { pod: { workingSet: 41 }, locks: { realRun: 'held' }, containerList: 'fails' },
+        { pod: { workingSet: 38 , anon: 38 }, locks: { realRun: 'held' } },
+        { pod: { workingSet: 41 , anon: 41 }, locks: { realRun: 'held' }, containerList: 'fails' },
       ],
     })
     const report = await run.runAll()
@@ -767,7 +804,7 @@ describe('the stop line (b.uqm SR-7.4)', () => {
     const run = memoryRun({
       steps: [
         {
-          pod: { workingSet: LIMIT_GIB - 1 },
+          pod: { workingSet: LIMIT_GIB - 1, anon: LIMIT_GIB - 1 },
           shards: [{ shard: 3, memory: 1.4 }, { shard: 2, memory: 0.9, unreadable: [{ file: CGROUP_FILE.current }] }, { shard: 1, memory: 0.6 }],
         },
       ],
@@ -781,9 +818,9 @@ describe('the stop line (b.uqm SR-7.4)', () => {
     const stopLine = podStopLineBytes(gib(LIMIT_GIB))
     const run = memoryRun({
       steps: [
-        { pod: { workingSet: { bytes: stopLine - 1 } } },
-        { pod: { workingSet: LIMIT_GIB, unreadable: { file: CGROUP_FILE.current } } },
-        { pod: { workingSet: { bytes: stopLine - 1 } } },
+        { pod: { workingSet: { bytes: stopLine - 1 }, anon: { bytes: stopLine - 1 } } },
+        { pod: { workingSet: LIMIT_GIB, anon: LIMIT_GIB, unreadable: { file: CGROUP_FILE.current } } },
+        { pod: { workingSet: { bytes: stopLine - 1 }, anon: { bytes: stopLine - 1 } } },
       ],
     })
     const report = await run.runAll()
@@ -799,12 +836,12 @@ describe('the stop line (b.uqm SR-7.4)', () => {
   ])('figures are given to one decimal place, rounded to the nearest tenth: $name', ({ workingSetGib, shardGib, texts }) => {
     const ceiling = memoryCeiling(gib(LIMIT_GIB), [{ via: 'real-run-lock', what: 'run.lock', pid: 777 }])
     const line = memoryWatchdogLine(gib(workingSetGib), ceiling, [{ shard: 1, memoryBytes: gib(shardGib) }])
-    expect(line).toBe(`${FAIL_PREFIX}memory watchdog: pod working set ${texts[0]} GiB reached the ${formatGib(CI_LIVE_WORKING_SET_LIMIT_BYTES - STOP_LINE_OFFSET_BYTES)} GiB stop line (${ciLiveSource(777)}; ${SHARD_DIR_PREFIX}1 ${texts[1]} GiB)`)
+    expect(line).toBe(`${FAIL_PREFIX}memory watchdog: pod non-reclaimable memory ${texts[0]} GiB reached the ${formatGib(CI_LIVE_WORKING_SET_LIMIT_BYTES - STOP_LINE_OFFSET_BYTES)} GiB stop line (${ciLiveSource(777)}; ${SHARD_DIR_PREFIX}1 ${texts[1]} GiB; reclaimable page cache excluded)`)
     produced.push(line)
   })
 
   test("the stop is decided once, handed to onStop before that sample's onSample, and the watchdog stops, kills and removes nothing", async () => {
-    const over = (): SampleStep => ({ pod: { workingSet: LIMIT_GIB - 1 }, shards: [{ shard: 1, memory: 1 }] })
+    const over = (): SampleStep => ({ pod: { workingSet: LIMIT_GIB - 1, anon: LIMIT_GIB - 1 }, shards: [{ shard: 1, memory: 1 }] })
     const run = memoryRun({ steps: [quiet([{ shard: 1, memory: 1 }]), over(), over(), over()] })
     const report = await run.runAll()
     const at = report.samples.map((sample) => sample.atMs)
@@ -1327,7 +1364,7 @@ describe('out-of-memory detection and lines (b.uqm SR-12.2)', () => {
 
   test.each([
     { name: 'its container was never created', steps: [quiet([{ shard: 1 }]), quiet([{ shard: 1 }])], stopped: false },
-    { name: 'its container was not yet created at a run-level stop', steps: [quiet([{ shard: 1 }]), { pod: { workingSet: LIMIT_GIB - 1 }, shards: [{ shard: 1 }] }], stopped: true },
+    { name: 'its container was not yet created at a run-level stop', steps: [quiet([{ shard: 1 }]), { pod: { workingSet: LIMIT_GIB - 1, anon: LIMIT_GIB - 1 }, shards: [{ shard: 1 }] }], stopped: true },
   ])('a shard with no final reading gets no out-of-memory failure, never the unreadable line: $name', async ({ steps, stopped }) => {
     const run = memoryRun({ steps })
     const report = await run.runAll()

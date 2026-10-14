@@ -369,26 +369,33 @@ Every shard is judged at the per-shard memory cap, 2 GiB to start (see
 [The per-shard memory cap and out-of-memory kills](#the-per-shard-memory-cap-and-out-of-memory-kills)
 for the current cap).
 
-**Pod memory.** Both figures come from the cgroup-namespace root, never from
-a cgroup on the runner's own path:
+**Pod memory.** The pod figures come from the cgroup-namespace root, never
+from a cgroup on the runner's own path:
 
 | Figure | What it is |
 |---|---|
 | L, the pod limit | The root's `memory.max`. A root with no limit (`max`) is a failed reading, and the run is refused |
-| W, the pod working set | The root's `memory.current` minus the `inactive_file` value of its `memory.stat`, never below 0. Messages split it into anon (`anon`), active page cache (`active_file`) and the rest |
-| A container's memory | The same figure from the container's own cgroup, found from the container itself |
+| U, the pod non-reclaimable memory | The larger of `anon + shmem` and `active_anon + inactive_anon + unevictable` from the root's `memory.stat`. Admission and the memory watchdog use this figure |
+| W, the diagnostic pod working set | The root's `memory.current` minus the `inactive_file` value of its `memory.stat`, never below 0. Messages split it into anon (`anon`), active page cache (`active_file`) and the rest |
+| A container's memory | Its working set (`memory.current` minus `inactive_file`, never below 0) from its own cgroup, found from the container itself |
 
-The W read here is the run's "before" reading.
+U excludes reclaimable file cache, including active page cache. The two
+sums cover anonymous and shared memory and locked pages without counting
+locked anonymous or shared pages twice. Required counters that are missing
+or malformed refuse admission; they are not treated as zero.
+
+W remains the run's diagnostic "before" reading and is retained in results;
+it does not decide admission or a watchdog stop.
 
 **The ceiling.** The ceiling C is 85% of L, in whole bytes rounded down. The
-85% matches the sysadmin monitor's warn line: the monitor checks the same
-cgroup with the same figure, W ÷ L. `/ci` reads no monitor setting; its 85% is
-its own constant.
+85% is `/ci`'s own constant; it reads no monitor setting. The sysadmin
+monitor uses the working set, so its reading can differ from U.
 
 While a `/ci-live` run is active, C is the lower of that and 40 GiB,
 `/ci-live`'s working-set stop line (see [Memory bounds](#memory-bounds)).
-Shard containers run under the root, so their memory, page cache included,
-is in W; page cache that removed containers leave stays charged to the pod.
+Shard containers run under the root, so their anonymous, shared and locked
+memory is in U. Reclaimable page cache left by removed containers can remain
+charged to the pod and visible in W without consuming the gate's headroom.
 
 **When `/ci-live` counts as active.** A `/ci-live` run is active while either
 of its locks is held (see [One run at a time](#one-run-at-a-time)), or while a
@@ -410,7 +417,7 @@ holds more than 64 bytes is a failed reading.
 
 `/ci` counts `/ci-live`, but `/ci-live` does not count `/ci`.
 
-**What admission counts.** Besides W, the memory fit adds these commitments:
+**What admission counts.** Besides U, the memory fit adds these commitments:
 
 | Commitment | Counted as |
 |---|---|
@@ -437,11 +444,16 @@ The CPU fit counts the CPUs of every other live `/ci` reservation;
 
 | Fit | Passes when |
 |---|---|
-| Memory | W + the commitments + N × the cap + the 1 GiB admission margin ≤ C, and no container blocks every run |
+| Memory | U + the commitments + N × the cap + the 1 GiB admission margin ≤ C, and no container blocks every run |
 | Disk | (used + 1 GiB) ÷ (used + available) < 85% on the volume holding the run directory. The 1 GiB is an allowance for the run's own files; the 85% is `/ci`'s own disk line |
 | CPU | The other live reservations' CPUs + 2 × N ≤ the 12 CI CPUs |
 
-The disk fit does not depend on N; the memory and CPU fits do.
+The disk fit uses actual allocated filesystem blocks and available space;
+it does not discount temporary usage. The tarball is packed under the run
+directory's `package` directory before admission, and `runner.log` and
+`status.json` already exist at that point. The 1 GiB allowance covers their
+subsequent growth and the remaining run artifacts. There is no disk
+watchdog. The disk fit does not depend on N; the memory and CPU fits do.
 
 **Choosing N.** The effective N is the smaller of the requested N and the
 run's scheduling units, at least 1. A run given neither `--shards` nor
@@ -456,7 +468,7 @@ reasons that applied follow, in this order, separated by a comma:
 | Reason | Given when |
 |---|---|
 | `<u> scheduling unit(s)` | The run has fewer scheduling units than r |
-| `memory: <f> GiB free under the <C> GiB ceiling` | One more shard fails the memory fit. f is C − W − the commitments − the 1 GiB margin, never below 0 |
+| `memory: <f> GiB free under the <C> GiB ceiling` | One more shard fails the memory fit. f is C − U − the commitments − the 1 GiB margin, never below 0 |
 | `cpu: <h> of 12 CI CPUs in use` | One more shard fails the CPU fit. h is the CPUs of the other live `/ci` reservations |
 
 A run given `--shards` or `--inject` can show only the scheduling-unit
@@ -492,11 +504,12 @@ largest `--shards` value, at most the effective N, that passes both of those
 fits now (`largest --shards value that fits now: <k>`), or say
 `no --shards value fits now, not even 1`.
 
-The memory refusal also gives the ceiling and its source (85% of L, the
-sysadmin monitor's warn line, or `/ci-live`'s 40 GiB line with the lock or
-container that showed the `/ci-live` run, and its PID), W split into its
-parts, each counted item with its GiB, each blocking container, the margin
-and the cap. The CPU refusal lists each active `/ci` run with its runner PID.
+The memory refusal also gives the ceiling and its source (85% of L
+or `/ci-live`'s 40 GiB line with the lock or container that showed the
+`/ci-live` run, and its PID), U with its anonymous and shared memory and an
+explanation that reclaimable page cache is excluded, W split into its parts
+as a diagnostic, each counted item with its GiB, each blocking container,
+the margin and the cap. The CPU refusal lists each active `/ci` run with its runner PID.
 
 A reading that fails refuses the run before any fit is judged:
 `NOT RUN: disk: could not read <what>: <error>` for the run directory's
@@ -506,32 +519,30 @@ reading.
 **What the figures mean on the development host.** At the 2 GiB starting cap,
 with a 64 GiB pod limit:
 
-- C is 54.4 GiB, so the shards may use 53.4 GiB minus W and the commitments.
-- 6 shards pass the memory fit while W plus the commitments is at most
+- C is 54.4 GiB, so the shards may use 53.4 GiB minus U and the commitments.
+- 6 shards pass the memory fit while U plus the commitments is at most
   41.4 GiB, and 5 up to 43.4 GiB.
 - While a `/ci-live` run is active, C is 40 GiB and that run counts 13 GiB,
-  so no `/ci` run fits once W is above 24 GiB.
+  so no `/ci` run fits once U is above 24 GiB.
 - A second default full run beside a 6-shard run is refused for CPU: the
   6-shard run holds all 12 CI CPUs.
 
-**The observed idle working set** is 33–43 GiB, mostly active page cache.
-With nothing else counted, about 42.3 GiB gives a default full run 5 shards
-and refuses `--shards 6`, naming 5 as the largest value that fits; 33.1 GiB
-gives 6. The reading
-varies through the day, and the count with it. While `/ci-live` runs, these
-readings admit no `/ci` run. Load unrelated to `/ci` can push W high enough
-that no run is admitted at all.
+**The memory watchdog** checks U every 30 s against C less 0.5 GiB
+(53.9 GiB for a 64 GiB pod, or 39.5 GiB while `/ci-live` lowers C). At or
+above that stop line it stops the run. Its message prints U and states that
+reclaimable page cache is excluded; the sampled W remains diagnostic.
 
-**When W is high,** do what the memory refusal's advice says:
+**When U is high,** do what the memory refusal's advice says:
 
 1. Finish or kill idle agent-director workers, and confirm their tmux
    sessions are gone.
 2. Stop the other CI runs or builds the refusal lists.
-3. Re-run `/ci` once the sysadmin monitor's reading is back below its 85%
-   warn line, or once W is back below the ceiling.
+3. Re-run `/ci` once the printed non-reclaimable memory and commitments
+   leave enough room for the shards and admission margin.
 
-Page cache cannot be dropped in this pod; only the kernel reclaims it. A
-smaller `--shards` value, when the refusal names one, may fit now.
+A high working set caused by reclaimable page cache alone does not block
+admission or stop a run. A smaller `--shards` value, when the refusal names
+one, may fit now.
 
 **On a disk refusal,** the message lists the `/ci` results directories kept
 in the system temp directory (`$TMPDIR`, else `/tmp`), both the current

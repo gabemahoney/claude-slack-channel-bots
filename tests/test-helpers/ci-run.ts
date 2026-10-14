@@ -4105,8 +4105,8 @@ function memoryStatText(stat: { readonly anonBytes: number; readonly fileBytes: 
     ['shmem', 0],
     ['file_mapped', 0],
     ['anon_thp', 0],
-    // Unlike `anon`, so a reader matching `anon` as a prefix reads the wrong figure.
-    ['inactive_anon', stat.anonBytes + 1],
+    // Anon LRU accounting for these fixtures, with no locked pages.
+    ['inactive_anon', stat.anonBytes],
     ['active_anon', 0],
     ['inactive_file', stat.inactiveFileBytes],
     ['active_file', stat.activeFileBytes],

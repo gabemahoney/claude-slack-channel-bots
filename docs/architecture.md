@@ -4174,3 +4174,29 @@ Clears one persona's latch by hand on the running server (b.jg5 SRJ-510, SRJ-506
 
 
 AD 0.12 compatibility: `recogniseConflictCase` maps the native “this id's own abandoned launch” description to the existing own-id case. Classification still depends on the native error class: an `ErrTmuxUnresponsive` before the starting bound remains unavailable; only `ErrTmuxSessionConflict` latches. Malformed configuration uses native `ErrConfigMalformed` with legacy unknown-name envelope compatibility. Same-agent reuse retains inspectable `prior_sessions` while launching a fresh current conversation.
+## Sharded CI resource gate
+
+The host runner `scripts/ci-run.ts` reads the cgroup-namespace root under its
+shared admission lock. Admission and the 30 s memory watchdog both use
+`nonReclaimableMemoryBytes`: the larger of `anon + shmem` and
+`active_anon + inactive_anon + unevictable` from `memory.stat`.
+
+The type and
+LRU sums account for locked anonymous, shared and file pages without adding
+locked anonymous or shared pages twice; reclaimable file cache is excluded.
+
+Production requires these counters and refuses admission when a reading
+fails. The extra counters are optional on in-memory `WorkingSetReading`
+values so older diagnostics remain readable.
+
+Working set (`memory.current`
+minus `inactive_file`, floored at zero) stays diagnostic; `results.json`
+version 1 retains its existing fields and schema.
+
+The ceiling remains 85% of the pod limit, rounded down, lowered to at most
+40 GiB while `/ci-live` is active. Admission adds existing run commitments,
+shard caps and a 1 GiB margin; the watchdog stops at the ceiling less 0.5 GiB.
+Container readings and reservation commitments keep their existing rules.
+The disk gate still uses actual allocated filesystem blocks plus a 1 GiB
+admission allowance after packing the run's tarball; no disk watchdog runs.
+See [Admission: memory, disk and CPU](../docker/README.md#admission-memory-disk-and-cpu).
