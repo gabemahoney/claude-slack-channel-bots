@@ -174,6 +174,7 @@ enter_layout() {
     mkdir -p "${HOME}" || fail "setup: could not create ${HOME}"
     # The container's agent-director install, which the start's check reads.
     if [[ -e "${REAL_HOME}/.config/agent-director" ]]; then
+        mkdir -p "${HOME}/.config" || fail "setup: could not create ${HOME}/.config"
         ln -s "${REAL_HOME}/.config/agent-director" "${HOME}/.config/agent-director" \
             || fail "setup: could not link ${HOME}/.config/agent-director"
     fi

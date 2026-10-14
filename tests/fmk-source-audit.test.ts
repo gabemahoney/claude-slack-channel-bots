@@ -100,7 +100,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import * as agentDirectorClient from 'agent-director'
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, readlinkSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { spawnSync } from 'node:child_process'
@@ -1977,6 +1977,58 @@ fail() { printf REFUSED; exit 1; }
 (${body.slice(start, end)})
 printf '\\nRESULT=%s' "$?"`, ['jq'])
     expect(output).toBe(mode === 'native' ? 'RESULT=0' : 'REFUSED\nRESULT=1')
+  })
+  test.each(['0.13', '0.14.0', '0.15.0'].flatMap((layout) => [true, false].map((linked) => [layout, linked] as const)))('scratch layout %s with AD link=%s seeds only historical directories', (layout, linked) => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-30-state-dir-upgrade.sh'), 'utf8')
+    const output = shell(`${['enter_layout', 'seed_layout', 'seed_into'].map((name) => helper(name, source)).join('\n')}
+SCENARIO_ROOT="$HOME"
+REAL_HOME="$HOME/container"
+SEED="$HOME/seed"
+CREDENTIALS_NAME=credentials-alpha.json
+mkdir -p "$REAL_HOME" "$SEED/prompts"
+${linked ? 'mkdir -p "$REAL_HOME/.config/agent-director"' : ':'}
+for name in config.json credentials-alpha.json crontab server.log server.pid; do printf fixture > "$SEED/$name"; done
+printf prompt > "$SEED/prompts/daily.md"
+fail() { printf 'REFUSED: %s' "$*"; exit 1; }
+enter_layout '${layout}'
+[[ ! -e "$N" && ! -L "$N" ]] || exit 7
+seed_layout '${layout}'
+[[ ! -e "$N" && ! -L "$N" ]] || exit 8
+printf seeded`, ['mkdir', 'ln', 'cp'])
+    expect(output).toBe('seeded')
+    const scratchHome = join(home, `home-${layout}`)
+    const old = join(scratchHome, '.claude/channels/slack')
+    const xdg = join(scratchHome, '.config/cscb')
+    expect(existsSync(join(scratchHome, '.config/claude-slack-channel-bots'))).toBe(false)
+    const ad = join(scratchHome, '.config/agent-director')
+    expect(existsSync(ad)).toBe(linked)
+    if (linked) expect(readlinkSync(ad)).toBe(join(home, 'container/.config/agent-director'))
+    const allFiles = ['config.json', 'credentials-alpha.json', 'crontab', 'prompts', 'server.log', 'server.pid'].sort()
+    expect(readdirSync(old).sort()).toEqual(allFiles)
+    if (layout === '0.13') {
+      expect(existsSync(xdg)).toBe(false)
+      expect(lstatSync(old).isDirectory()).toBe(true)
+      expect(lstatSync(join(old, 'crontab')).isFile()).toBe(true)
+    } else if (layout === '0.14.0') {
+      expect(readdirSync(xdg).sort()).toEqual(['crontab', 'prompts'])
+      expect(readlinkSync(join(old, 'crontab'))).toBe(join(xdg, 'crontab'))
+      expect(readlinkSync(join(old, 'prompts'))).toBe(join(xdg, 'prompts'))
+    } else {
+      expect(readdirSync(xdg).sort()).toEqual(allFiles)
+      expect(readlinkSync(old)).toBe(xdg)
+    }
+  })
+  test('scratch AD parent creation failure is reported before attempting the link', () => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-30-state-dir-upgrade.sh'), 'utf8')
+    const output = shell(`${helper('enter_layout', source)}
+SCENARIO_ROOT="$HOME"
+REAL_HOME="$HOME/container"
+mkdir -p "$REAL_HOME/.config/agent-director" "$SCENARIO_ROOT/home-0.13"
+printf blocked > "$SCENARIO_ROOT/home-0.13/.config"
+fail() { printf 'REFUSED: %s' "$*"; exit 1; }
+(enter_layout 0.13) 2>/dev/null
+printf '\\nRESULT=%s' "$?"`, ['mkdir', 'ln'])
+    expect(output).toBe(`REFUSED: setup: could not create ${home}/home-0.13/.config\nRESULT=1`)
   })
   test.each(['target', 'other', 'empty'])('rebuilt A must exercise its targeted kill fault: %s log', (mode) => {
     const source = readFileSync(join(import.meta.dir, 'integration/test-14-fmk-kill-fails.sh'), 'utf8')
