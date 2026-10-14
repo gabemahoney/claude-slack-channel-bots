@@ -205,3 +205,6 @@ export const STILL_STOPPING_PHRASE = 'appears to still be stopping'
 
 /** Carried by an `ErrTmuxUnresponsive` for a row that appears to still be starting. */
 export const STILL_STARTING_PHRASE = 'appears to still be starting'
+
+/** AD 0.12 own-id conflict for a launch with no recorded server or pane. */
+export const CONFLICT_ABANDONED_LAUNCH_PHRASE = "this id's own abandoned launch"

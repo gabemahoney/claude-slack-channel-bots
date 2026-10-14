@@ -185,6 +185,7 @@ import {
   AD_ERROR_CLASS_UNUSABLE_NAME,
 } from './ad-error-class.ts'
 import {
+  CONFLICT_ABANDONED_LAUNCH_PHRASE,
   CONFLICT_ANOTHER_STORE_PHRASE,
   CONFLICT_CONFLICTING_LABELS_PHRASE,
   CONFLICT_DIFFERENT_ID_PHRASE,
@@ -328,7 +329,10 @@ export function takesUnrecognisedHandling(latchCase: LatchCase): boolean {
  */
 export function recogniseConflictCase(description: unknown): ConflictLatchCase {
   if (typeof description !== 'string') return LATCH_CASE_UNRECOGNISED
-  return CONFLICT_CASE_ORDER.find((entry) => description.includes(entry.phrase))?.latchCase ?? LATCH_CASE_UNRECOGNISED
+  const recognised = CONFLICT_CASE_ORDER.find((entry) => description.includes(entry.phrase))?.latchCase
+  // AD 0.12 refuses an untracked abandoned launch as this id's own session
+  // after its starting bound. Keep human-only own-id handling and rechecks.
+  return recognised ?? (description.includes(CONFLICT_ABANDONED_LAUNCH_PHRASE) ? LATCH_CASE_OWN_ID : LATCH_CASE_UNRECOGNISED)
 }
 
 /** Each double-quoted span, quotes paired left to right. */

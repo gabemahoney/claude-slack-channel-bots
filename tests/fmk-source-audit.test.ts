@@ -108,6 +108,9 @@ import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import ts from 'typescript'
 
+import { classifyAdError, AD_ERROR_CLASS_CONFIG, AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_CONFLICT } from '../src/ad-error-class.ts'
+import { adConfigMalformedOnset } from '../src/outage-state.ts'
+import { recogniseConflictCase, LATCH_CASE_OWN_ID } from '../src/conflict-latch.ts'
 import { AD_TMUX_TABLE } from '../src/ad-settings.ts'
 import { PHASE1_ONLY_ERR_NAMES } from '../src/agent-director-errors.ts'
 import { buildSystemInstallTooOldMessage, compareAdVersions, FOUND_BY_RUNTIME_RECHECK, FOUND_BY_STARTUP_CHECK, meetsPhase1Floor, PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
@@ -1813,6 +1816,54 @@ printf 'RESULT=%s' "$?"`)
     const silent = source.indexOf('stub_mode "${P_ROW_WORK}" "${STUB_MODE_SILENT}"', upgrade)
     expect(silent).toBeGreaterThan(upgrade)
     expect(silent).toBeLessThan(rebuild)
+  })
+  test('released malformed-config printer decodes the native error and preserves CONFIG onset', async () => {
+    const source = readFileSync(join(import.meta.dir, 'integration/fixtures/fmk-texts.ts'), 'utf8')
+    const start = source.indexOf('const CONFIG_MALFORMED_ERR_NAME')
+    const end = source.indexOf('/** `adConfigMalformedOnset', start)
+    const compiled = ts.transpileModule(source.slice(start, end), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+    const decode = new Function('fail', 'PRINTER_FAIL_EXIT', `${compiled}\nreturn configMalformedError;`)(
+      (_code: number, reason: string) => { throw new Error(reason) }, 1,
+    )
+    const err = await decode('adConfigMalformedOnset', 'invalid timer', { importAgentDirectorClient: async () => agentDirectorClient })
+    expect(err).toBeInstanceOf(agentDirectorClient.ErrConfigMalformed)
+    expect(classifyAdError(err)).toEqual({ errorClass: AD_ERROR_CLASS_CONFIG, reportedName: 'ErrConfigMalformed', message: 'invalid timer' })
+    expect(adConfigMalformedOnset(err)).toContain('invalid timer')
+    await expect(decode('adConfigMalformedOnset', 'bad', { importAgentDirectorClient: async () => ({}) })).rejects.toThrow('native malformed-config')
+  })
+  test.each([
+    ['valid', { session_id: 'new', prior_sessions: [{ session_id: 'old', jsonl_path: '/archived' }] }, true],
+    ['resumed old', { session_id: 'old', prior_sessions: [{ session_id: 'old' }] }, false],
+    ['lost archive', { session_id: 'new', prior_sessions: [] }, false],
+    ['duplicate archive', { session_id: 'new', prior_sessions: [{ session_id: 'old' }, { session_id: 'old' }] }, false],
+    ['wrong archive', { session_id: 'new', prior_sessions: [{ session_id: 'other' }] }, false],
+    ['no current', { session_id: null, prior_sessions: [{ session_id: 'old' }] }, false],
+  ] as const)('same-agent fresh reuse %s preserves archive without resuming it', (_label, row, accepted) => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-19-fmk-reuse.sh'), 'utf8')
+    writeFileSync(join(home, 'row.json'), JSON.stringify(row))
+    const output = shell(`${helper('t19_check_reuse_history', source)}
+AD_OUT="$HOME/row.json"
+TEST_NAME=inert
+fail() { exit 1; }
+(t19_check_reuse_history fixture old) 2>/dev/null
+printf '%s' "$?"`, ['jq', 'sed'])
+    expect(output).toBe(accepted ? '0' : '1')
+  })
+  test.each([299999, 300000, 300001])('abandoned-session age %s respects the real B boundary', (age) => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-16-fmk-conflict.sh'), 'utf8')
+    const output = shell(`${helper('s19_abandoned_session_ready', source)}
+AD_STARTING_MS=300000
+now_ms() { printf '%s' '${1000000 + age}'; }
+s19_abandoned_session_ready 1000
+printf '%s' "$?"`)
+    expect(output).toBe(age < 300000 ? '1' : '0')
+  })
+  test('abandoned launch remains unavailable before B; native conflict after B uses own-id handling', () => {
+    const description = 'instance p: this id\'s own abandoned launch: session "slack_bot_p" ($4); nothing was done'
+    expect(classifyAdError(agentDirectorClient.errorFromEnvelope('spawn', 'ErrTmuxUnresponsive', description)).errorClass).toBe(AD_ERROR_CLASS_UNAVAILABLE)
+    const conflict = agentDirectorClient.errorFromEnvelope('spawn', 'ErrTmuxSessionConflict', description)
+    expect(classifyAdError(conflict).errorClass).toBe(AD_ERROR_CLASS_CONFLICT)
+    expect(recogniseConflictCase(conflict.errDescription)).toBe(LATCH_CASE_OWN_ID)
   })
   test.each(['target', 'other', 'empty'])('rebuilt A must exercise its targeted kill fault: %s log', (mode) => {
     const source = readFileSync(join(import.meta.dir, 'integration/test-14-fmk-kill-fails.sh'), 'utf8')

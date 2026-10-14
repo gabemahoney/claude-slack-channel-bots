@@ -6,7 +6,7 @@
 # missing transcript, a
 # persona whose row is finished is brought up by a reuse spawn of its own id
 # (`spawn --reuse-finished`), never a delete: the row reads `pending` with a
-# `launch_started_at`, then `waiting`; `get`'s `prior_sessions` does not list
+# `launch_started_at`, then `waiting`; `get`'s `prior_sessions` archives
 # the earlier life's session; the launch's `pre_trust` line says `ok`; and a
 # `resume` of the new life before it is messaged answers
 # ErrJsonlNeverWritten. In the missing-transcript leg the lost-transcript
@@ -29,7 +29,7 @@
 # directory and config directory, comes back by a reuse spawn of its id and
 # is never resumed: the first CSCB spawn after the re-add carries
 # `--reuse-finished`, no CSCB `resume` of its id is made from the removal on,
-# and a harness `get` shows the old session neither as current nor in
+# and a harness `get` shows a different current session and archives the old one in
 # `prior_sessions`. The same holds for a messaged persona whose
 # `credentials_file` path changes, a destructive modify (AC 49). A removal
 # records the key `removed`, the old half of a destructive modify
@@ -145,7 +145,7 @@
 #        - E: no CSCB `resume` of its id after the mark; F: at least one, and
 #          exactly one diagnosis log line for F after the mark, its time no later
 #          than the reuse spawn's call;
-#        - a harness `get`: `prior_sessions` is an array that does not hold
+#        - a harness `get`: `prior_sessions` is an array that holds
 #          the first life's session id;
 #        - exactly one server.log line after the mark that is the launch's
 #          `pre_trust` line for a reuse spawn with value `ok`, as the printer
@@ -255,7 +255,7 @@
 #     5. checked: the first CSCB-parented `spawn` naming J's id after the
 #        re-add mark carries `--reuse-finished`; a harness `get` reads the row
 #        `waiting` with a session other than the old one, and `prior_sessions`
-#        is an array that does not hold the old session; from the removal
+#        archives the old session exactly once; from the removal
 #        mark on, no CSCB `resume` of J's id and no CSCB `delete`;
 #     6. a plain `stop`, and the harness ends J's new life with the exit
 #        sentinel.
@@ -998,14 +998,9 @@ t19_leg() {
         echo "${TEST_NAME}: NOTE: ${step}: the diagnosis's startup-errors entries after the mark: ${INCONCLUSIVE_CLASS}=$(t19_count_after "${SLACK_STATE_DIR}/startup-errors.log" "${MARK_ERRORS}" "] [${INCONCLUSIVE_CLASS}] ") ${LOST_CLASS}=$(t19_count_after "${SLACK_STATE_DIR}/startup-errors.log" "${MARK_ERRORS}" "] [${LOST_CLASS}] ")"
     fi
 
-    # prior_sessions does not list the first life's session.
+    # Same-agent reuse starts a new conversation and archives the previous one.
     t19_row_get "${id}" "${step}: the new life"
-    jq -e '(.prior_sessions | type) == "array"' "${AD_OUT}" > /dev/null 2>&1 \
-        || { sed 's/^/  | /' "${AD_OUT}" >&2; fail "${step}: the harness get of ${id} carries no prior_sessions array"; }
-    if jq -e --arg sid "${old_sid}" '.prior_sessions | tostring | contains($sid)' "${AD_OUT}" > /dev/null 2>&1; then
-        sed 's/^/  | /' "${AD_OUT}" >&2
-        fail "${step}: the harness get of ${id}'s new life lists the first life's session ${old_sid} in prior_sessions"
-    fi
+    t19_check_reuse_history "${step}" "${old_sid}"
     echo "${TEST_NAME}: NOTE: ${step}: ${id}'s new life: session '$(jq -r '.session_id // ""' "${AD_OUT}")', transcript_status '$(jq -r '.transcript_status // ""' "${AD_OUT}")', prior_sessions $(jq -c '.prior_sessions' "${AD_OUT}")"
 
     # The pre_trust line: ok, for the reuse spawn.
@@ -1570,23 +1565,28 @@ t19_check_first_spawn_reuse() {
 }
 
 # t19_check_fresh <id> <old-sid> <since> <step>: the persona came back fresh
-# and its old session is gone from its row: a harness `get` reads the row
+# and its old session is archived on its row: a harness `get` reads the row
 # (present) `waiting` with a session other than <old-sid>, and its
-# `prior_sessions` is an array that does not hold <old-sid>; no CSCB `resume`
+# `prior_sessions` archives <old-sid> exactly once; no CSCB `resume`
 # of <id> and no CSCB `delete` at or after <since>.
+t19_check_reuse_history() {
+    local step="$1" old_sid="$2"
+    jq -e --arg sid "${old_sid}" '
+      (.session_id | type) == "string" and .session_id != "" and .session_id != $sid
+      and (.prior_sessions | type) == "array"
+      and ([.prior_sessions[] | select(.session_id == $sid)] | length) == 1
+    ' "${AD_OUT}" > /dev/null 2>&1 \
+        || { sed 's/^/  | /' "${AD_OUT}" >&2; fail "${step}: reuse must have a fresh current session and archive the previous session exactly once"; }
+}
+
 t19_check_fresh() {
     local id="$1" old_sid="$2" since="$3" step="$4" sid n
     t19_row_get "${id}" "${step}: the new life"
     sid="$(jq -r '.session_id // empty' "${AD_OUT}")"
     [[ "$(jq -r '.state // empty' "${AD_OUT}")" == waiting && -n "${sid}" && "${sid}" != "${old_sid}" ]] \
         || { sed 's/^/  | /' "${AD_OUT}" >&2; fail "${step}: the harness get of ${id} does not read waiting with a session other than the old one (${old_sid})"; }
-    jq -e '(.prior_sessions | type) == "array"' "${AD_OUT}" > /dev/null 2>&1 \
-        || { sed 's/^/  | /' "${AD_OUT}" >&2; fail "${step}: the harness get of ${id} carries no prior_sessions array"; }
-    if jq -e --arg sid "${old_sid}" '.prior_sessions | tostring | contains($sid)' "${AD_OUT}" > /dev/null 2>&1; then
-        sed 's/^/  | /' "${AD_OUT}" >&2
-        fail "${step}: the harness get of ${id}'s new life lists the old session ${old_sid} in prior_sessions"
-    fi
-    echo "${TEST_NAME}: ${step}: the harness get reads ${id} waiting with session ${sid}; the old session ${old_sid} is neither current nor in prior_sessions"
+    t19_check_reuse_history "${step}" "${old_sid}"
+    echo "${TEST_NAME}: ${step}: ${id} waiting with fresh session ${sid}; old session ${old_sid} retained for inspection only"
     echo "${TEST_NAME}: NOTE: ${step}: ${id}'s new life: transcript_status '$(jq -r '.transcript_status // ""' "${AD_OUT}")', prior_sessions $(jq -c '.prior_sessions' "${AD_OUT}")"
     n="$(t19_cscb_count_since "${since}" resume "${id}")"
     [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB resume call(s) of ${id} after the mark: a retired key is never resumed"

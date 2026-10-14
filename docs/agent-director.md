@@ -171,3 +171,6 @@ Either way the server still starts, and no value changes. The check runs only at
 To fix it, raise `agent_director_call_timeout_ms` in `config.json` above the need and confirm the change (see [Reload](reload.md#reload)). `stop --stop-bots` and `clean_restart` use the new value at once; the server uses it from its next start.
 
 For the second line, give `[pause] timeout_seconds` a positive whole number, or remove it for the 30 s default; the next start checks the setting against the need that gives.
+
+
+AD 0.12 keeps archived sessions in `prior_sessions` across same-agent reuse. A fresh spawn uses a new current session; archived sessions are available for inspection and are never resumed as a fallback. A launch with no recorded tmux server or pane can leave an abandoned session: AD reports it unavailable until the starting-session bound, then refuses it as an own-id conflict. CSCB latches that conflict for human review and retries only through the existing own-id recheck policy.

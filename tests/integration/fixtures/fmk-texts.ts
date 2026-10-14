@@ -164,10 +164,8 @@
  *   adConfigMalformedOnset <description>         src/outage-state.ts: the `ad-config-malformed`
  *                                                onset for agent-director's ErrConfigMalformed
  *                                                answer with <description>, built as the
- *                                                installed client throws it (its
- *                                                ErrUnknownErrorName with that unknownName
- *                                                and the error envelope; a client with a
- *                                                class of that name fails). Given a
+ *                                                installed client decodes it (the native
+ *                                                ErrConfigMalformed class). Given a
  *                                                marker <description>, the text around the
  *                                                marker is the onset's fixed part (posted as a
  *                                                persona notice: wrap it in formatPersonaNotice)
@@ -2171,26 +2169,22 @@ const liveRowWaitEndedLine: Entry = {
   },
 }
 
-/** The `unknownName` agent-director's malformed-config answer carries (no client has a class for it). */
+/** The released client's native malformed-config error name. */
 const CONFIG_MALFORMED_ERR_NAME = 'ErrConfigMalformed'
 
-/**
- * agent-director's `ErrConfigMalformed` answer, with `description` as its
- * description, as CSCB meets it: the installed client has no class for the
- * name, so it throws its `ErrUnknownErrorName` with that `unknownName` and
- * the error envelope (`err_name`, `err_description`). The client's own
- * `errorFromEnvelope` must not know the name either (it answers its base
- * class for an unknown one); a client that has a class for it is a failure.
- */
+/** Decode the real 0.12 error envelope rather than inventing an unknown-name error. */
 async function configMalformedError(entry: string, description: string, context: EntryContext): Promise<unknown> {
   const client = await context.importAgentDirectorClient()
-  const unknownClass = client['ErrUnknownErrorName']
-  if (typeof unknownClass !== 'function') fail(PRINTER_FAIL_EXIT, 'the installed agent-director client exports no ErrUnknownErrorName')
-  if (Object.hasOwn(client, CONFIG_MALFORMED_ERR_NAME)) {
-    fail(PRINTER_FAIL_EXIT, `${entry}: the installed agent-director client has a class ${CONFIG_MALFORMED_ERR_NAME}, so the answer would not arrive as an ErrUnknownErrorName`)
+  const decode = client['errorFromEnvelope']
+  const nativeClass = client[CONFIG_MALFORMED_ERR_NAME]
+  if (typeof decode !== 'function' || typeof nativeClass !== 'function') {
+    fail(PRINTER_FAIL_EXIT, `${entry}: the installed client lacks the native malformed-config decoder or class`)
   }
-  const envelope = { err_name: CONFIG_MALFORMED_ERR_NAME, err_description: description }
-  return new (unknownClass as new (unknownName: string, envelope: unknown) => unknown)(CONFIG_MALFORMED_ERR_NAME, envelope)
+  const err = (decode as (verb: string, name: string, description: string) => unknown)('status', CONFIG_MALFORMED_ERR_NAME, description)
+  if (!(err instanceof (nativeClass as new (...args: never[]) => object))) {
+    fail(PRINTER_FAIL_EXIT, `${entry}: malformed-config decoding did not return the native class`)
+  }
+  return err
 }
 
 /** `adConfigMalformedOnset(<agent-director's ErrConfigMalformed with <description>>)`: the `ad-config-malformed` onset. */

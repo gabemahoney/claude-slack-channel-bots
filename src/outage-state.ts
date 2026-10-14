@@ -527,7 +527,7 @@ function setOutageFlagIsolated(key: string, cls: 'ad-unreachable' | 'cwd-unreach
  * raiseAdConfigMalformed — the one raise entry for `ad-config-malformed`
  * (b.jg5 SRJ-316, SRJ-1018), for every site that raises it on a CONFIG answer
  * (`ErrConfigMalformed`, decided by the caller through `src/ad-error-class.ts`
- * by the `ErrUnknownErrorName`'s `unknownName`): the wrappers and the liveness adapter's bare `status`. `err` is
+ * by native class, with legacy unknown-name envelope compatibility): the wrappers and the liveness adapter's bare `status`. `err` is
  * the thrown value. The flag is set first, then one server-log line names
  * the persona and the classification (`describeAdErrorClassification`: the
  * reported name and the rendered message, no token), then the onset

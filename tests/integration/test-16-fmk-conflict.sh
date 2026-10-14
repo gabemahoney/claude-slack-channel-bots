@@ -33,8 +33,8 @@
 #   - a `pending` row beside a leftover (`pendleft`), seeded as a spawn whose
 #     process stopped before its create (so with no session_id):
 #     CSCB's own pending-row runs mark the row `missing` (`tmux_name_held`);
-#     the restart path's reuse spawn is refused as "left over from an earlier
-#     life"; rounds are `status` then a spawn with `--reuse-finished`.
+#     the real session is aged to AD's starting bound before startup; the reuse is refused
+#     as "this id's own abandoned launch" (the own-id case); rounds are `status` then a spawn with `--reuse-finished`.
 #
 # The script is built in five phases, each a function below, every
 # scenario's personas joining the same phases:
@@ -237,9 +237,9 @@
 #        is one reuse spawn (a `spawn` carrying `--reuse-finished`, read from
 #        the shim's argv; a `resume` before it, which agent-director answers
 #        `ErrNoSessionId`, and the server's line for it, the no-transcript
-#        step's (SRJ-707), are recorded, not asserted), refused as "left over
-#        from an earlier life": case
-#        `leftover`, refused operation `reuse-spawn`, state `missing`; one
+#        step's (SRJ-707), are recorded, not asserted), refused as
+#        "this id's own abandoned launch": case
+#        `own-id`, refused operation `reuse-spawn`, state `missing`; one
 #        post, the CONFLICT notice; the store reads `missing`;
 #      - scenario 4's refused rounds;
 #      - the refused rounds (s19_rounds): at least two each for `scanleft`,
@@ -909,8 +909,12 @@ done
 # row state that line records (`nolabel`'s, its finished state, set in
 # phase 2), its re-check rounds' step and call (one `status`, then that
 # call), and the case phrase agent-director's description carries.
+AD_STARTING_S="$(fmk_text DEFAULT_AD_SETTINGS tmux starting_session_seconds)" || fail "setup: cannot read AD starting bound"
+[[ "${AD_STARTING_S}" =~ ^[1-9][0-9]*$ ]] || fail "setup: invalid AD starting bound"
+AD_STARTING_MS=$(( AD_STARTING_S * 1000 ))
+CASE_OWN_ID="$(fmk_text LATCH_CASE_OWN_ID)" || fail "setup: cannot read own-id case"
 declare -A S19_CASE=([${S4_KEY}]="${CASE_NO_VALID_ID}" [${SCAN_KEY}]="${CASE_LEFTOVER}" [${ENV_KEY}]="${CASE_NO_VALID_ID}"
-    [${STORE_KEY}]="${CASE_ANOTHER_STORE}" [${PEND_KEY}]="${CASE_LEFTOVER}")
+    [${STORE_KEY}]="${CASE_ANOTHER_STORE}" [${PEND_KEY}]="${CASE_OWN_ID}")
 declare -A S19_OP=([${S4_KEY}]="${OP_RESUME}" [${SCAN_KEY}]="${OP_PLAIN_SPAWN}" [${ENV_KEY}]="${OP_PLAIN_SPAWN}"
     [${STORE_KEY}]="${OP_PLAIN_SPAWN}" [${PEND_KEY}]="${OP_REUSE_SPAWN}")
 declare -A S19_REFUSED_CALL=([${S4_KEY}]="${CALL_RESUME}" [${SCAN_KEY}]="${CALL_PLAIN_SPAWN}" [${ENV_KEY}]="${CALL_PLAIN_SPAWN}"
@@ -921,7 +925,7 @@ declare -A S19_STEP=([${S4_KEY}]="${STEP_TABLE}" [${SCAN_KEY}]="${STEP_SPAWN_RET
 declare -A S19_CALL=([${S4_KEY}]="${CALL_RESUME}" [${SCAN_KEY}]="${CALL_PLAIN_SPAWN}" [${ENV_KEY}]="${CALL_REUSE_SPAWN}"
     [${STORE_KEY}]="${CALL_REUSE_SPAWN}" [${PEND_KEY}]="${CALL_REUSE_SPAWN}")
 declare -A S19_PHRASE=([${S4_KEY}]="${NO_VALID_ID_PHRASE}" [${SCAN_KEY}]="${LEFTOVER_PHRASE}" [${ENV_KEY}]="${NO_VALID_ID_PHRASE}"
-    [${STORE_KEY}]="${ANOTHER_STORE_PHRASE}" [${PEND_KEY}]="${LEFTOVER_PHRASE}")
+    [${STORE_KEY}]="${ANOTHER_STORE_PHRASE}" [${PEND_KEY}]="this id's own abandoned launch")
 # Filled in by the phases, by key: the seeded session's id and pane, the
 # session name the latch quotes, the post count before phase 4, the latch's
 # shim mark, refused call's time and row reads, the round lines, the rounds'
@@ -1070,9 +1074,22 @@ s19_seed() {
 # launch start and a launch token other than the leftover's, and then
 # s19_pend_no_session clears the row's session_id. Records the launch
 # start (PEND_LAUNCH_MS).
+s19_abandoned_session_ready() {
+    (( $(now_ms) >= $1 * 1000 + AD_STARTING_MS ))
+}
+
 s19_seed_pending() {
     local step="phase 3: ${PEND_KEY}'s row pending beside a leftover" id="${PERSONA_ID[${PEND_KEY}]}" token json
     s19_seed "${PEND_KEY}" seed_leftover
+    # AD 0.12 treats no recorded server/pane as an abandoned launch, not
+    # an ordinary leftover. Before that bound it refuses transiently; afterward it emits
+    # the own-abandoned-launch conflict. Age the real session before the
+    # pending-row scenario so its first recovery is deterministically CONFLICT.
+    local created
+    created="$("${SCENARIO_REAL_TMUX}" display-message -p -t "${S19_SID[${PEND_KEY}]}" '#{session_created}')"
+    [[ "${created}" =~ ^[0-9]+$ ]] || fail "${step}: invalid session creation time"
+    wait_until "$(( AD_STARTING_S + SETTLE_S ))" "${step}: abandoned session must reach AD's starting bound" \
+        s19_abandoned_session_ready "${created}"
     token="$(ad_store_seed_pending "${id}" "${SEEDED_TOKEN}")" || exit 1
     json="$(ad_store_row "${id}")" || exit 1
     PEND_LAUNCH_MS="$(jq -r '.[0].launch_started_at' <<< "${json}")"
