@@ -564,10 +564,11 @@
 #   the answer kinds a probe round's line names;
 # - LATCHING_LIVENESS_NOTE (src/row-read-rules.ts), the note a harness `get`
 #   shows on Part 1's note persona's row;
-# - from src/test-timer-overrides.ts (b.2nr): testTimerOverridesBlock (the
-#   config.json block written), buildTestTimerOverridesLine (the loud line
-#   each start must log, matched whole and, up to its colon, counted) and
-#   effectiveTestTimer (the interval in effect, which the round bounds use);
+# - b.2nr: testTimerOverridesBlock (src/config.ts TEST_TIMER_OVERRIDE_KEYS;
+#   the config.json block written), and from src/test-timer-overrides.ts:
+#   buildTestTimerOverridesLine (the loud line each start must log, matched
+#   whole and, up to its colon, counted) and effectiveTestTimer (the
+#   interval in effect, which the round bounds use);
 # - from src/ad-settings.ts: AD_TMUX_KEYS and AD_SETTING_MINIMUMS (the keys
 #   written to agent-director's `[tmux]` table, starting_session_seconds and
 #   stopping_window_seconds, and their minimums); the starting-session bound

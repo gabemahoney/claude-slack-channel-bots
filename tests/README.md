@@ -492,7 +492,7 @@ tests/
                                    # comes from a server restart). agent-director runs on its defaults but for a `[tmux]` table holding
                                    # `starting_session_seconds` 60 and `stopping_window_seconds` 30, both at their minimums and both read back from the
                                    # written file. The own-id persona's age wait is the larger of the two plus 5 s, so 65 s.
-                                   # Every start's `config.json` holds the test-only override `latch_recheck_interval_ms` 45000. Each start must log
+                                   # Every start's `config.json` holds the test-only override `latch_recheck_interval_ms` 45000 (the interval the round bounds use is printed with `effectiveTestTimer`). Each start must log
                                    # its one loud `TEST TIMER OVERRIDES ACTIVE` line exactly once.
                                    # The script runs about 18 minutes (Part 1 about 5, Part 2 about 13) and ends
                                    # with the loop stopped, a plain `stop`, the personas still latched (the unusable recorded name, leg 1, and
@@ -2617,7 +2617,7 @@ builder's output for the given arguments.
 | `adGraceMs [<key>=<integer>...]` | G, in decimal | `src/ad-settings.ts` |
 | `adAlertThresholdMs [<key>=<integer>...]` | the alert threshold, in decimal | `src/ad-settings.ts` |
 | `adLaunchBoundMs [<tmux-key>=<integer>\|dialog_ready_timeout_ms=<integer>...]` | B, in decimal, over the `[tmux]` values and, when given, the floor override `dialog_ready_timeout_ms` (otherwise the production floor) | `src/ad-settings.ts` |
-| `testTimerOverridesBlock [<key>=<integer>...]` | the `test_timer_overrides` JSON object for the arguments, compact, keys in the package's order (`{}` for none); `<key>` is one of the package's `TEST_TIMER_OVERRIDE_KEYS`, each value a positive integer within its bound, a key given twice, only one of the two retry keys or a retry ceiling below the base exits 64 | `src/config.ts` |
+| `testTimerOverridesBlock [<key>=<integer>...]` | the `test_timer_overrides` JSON object for the arguments, compact, keys in the package's order (`{}` for none); `<key>` is one of the package's `TEST_TIMER_OVERRIDE_KEYS`, each value a positive integer within its bound (`MAX_TEST_TIMER_OVERRIDE_MS` or `MAX_TEST_TIMER_OVERRIDE_S`); an unknown or repeated key, a value out of range, only one of the two retry keys or a retry ceiling below the base exits 64 | `src/config.ts` |
 | `buildTestTimerOverridesLine [<key>=<integer>...]` | the loud line the server writes at start for that block; empty for no override | `src/test-timer-overrides.ts` |
 | `effectiveTestTimer <key> [<key>=<integer>...]` | the timer `<key>` in effect for that block, in decimal: the override, else the production default | `src/test-timer-overrides.ts` |
 | `unavailableRetryDueS <retry> [unavailable_retry_base_s=<integer> unavailable_retry_ceiling_s=<integer>]` | seconds after its arm at which the retry timer's retry `<retry>` (from 1) falls due, in decimal, over the production base and ceiling or, when given (both together), the overridden pair | `src/unavailable-retry.ts`, `src/backoff.ts` |
