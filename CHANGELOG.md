@@ -6,6 +6,10 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+---
+
+## 0.16.1 (2026-10-14)
+
 ### Corrected worker prerequisites and upgrade resume guidance
 
 - **Workers need Claude Code 2.1.280 or later.** The README and [switch-over pre-check](docs/migration.md#step-1-check-the-host-and-stage-the-release) now accept 2.1.280 with agent-director 0.12.0, correcting the erroneous 2.1.296 floor in the 0.16.0 notes below. The exec-form hooks cutoff is still 2.1.139. The live Slack test image pins 2.1.280 and advances to `cscb-ci-live:v1`, because 2.1.296 drops incoming Slack channel messages.
