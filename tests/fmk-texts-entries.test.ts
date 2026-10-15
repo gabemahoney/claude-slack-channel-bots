@@ -438,8 +438,8 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
       expect(adSettings.AD_TMUX_KEYS).toContain('stopping_window_seconds')
     },
     'ad-settings.ts:AD_SETTING_MINIMUMS:defined': () => {
-      const minimums: Readonly<Record<string, unknown>> = adSettings.AD_SETTING_MINIMUMS
-      for (const key of ['starting_session_seconds', 'stopping_window_seconds']) {
+      const minimums = adSettings.AD_SETTING_MINIMUMS
+      for (const key of ['starting_session_seconds', 'stopping_window_seconds'] as const) {
         const minimum = Object.hasOwn(minimums, key) ? minimums[key] : undefined
         expect(typeof minimum === 'bigint' || typeof minimum === 'number').toBe(true)
         expect(Number(minimum)).toBeGreaterThan(0)

@@ -1,0 +1,4 @@
+# group	spec	cfg	cap_s	expect	tier	what	props
+proof	TraceProof	proof_simulation	1800	pass	fast	simulate num=2 depth=5 seed=104729; exploratory structured behavior emission	-
+proof	TraceProof	proof_safety	1800	violation	fast	exploratory safety counterexample JSON and ALIAS	SafetyProbe
+proof	TraceProof	proof_temporal	1800	violation	fast	exploratory complete lasso JSON and ALIAS	TemporalProbe

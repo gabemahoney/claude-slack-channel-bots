@@ -31,6 +31,7 @@
     "bun": ">=1.0.21"
   },
   "scripts": {
+    "tla": "bash spec/tla/ci/run_ci.sh",
     "postinstall": "bun src/postinstall.ts && bun scripts/fixup-bun-cache.ts",
     "start": "bun install --no-summary && bun src/server.ts",
     "pretest": "bun scripts/fixup-bun-cache.ts && bun scripts/check-no-toplevel-mock-module.ts",
