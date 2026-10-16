@@ -1,5 +1,6 @@
 /** b.omv SR-5.3/5.4: the adapter reads the bottom composer, never history. */
 import { describe, expect, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import { readDeliveryScreen } from '../src/delivery-screen.ts'
 import * as panes from './test-helpers/working-row-panes.ts'
 
@@ -86,5 +87,43 @@ describe('observed native Claude composer forms', () => {
     expect(readDeliveryScreen('claude', pane(shown), own).kind).toBe('own')
     expect(readDeliveryScreen('claude', pane(shown.replace('tail', 'human draft')), own).kind).toBe('input')
     expect(readDeliveryScreen('claude', pane(shown.replace('</channel>', '</wrong>')), own).kind).toBe('input')
+  })
+})
+
+// Verbatim safe read-pane capture from Test 39, full CI 20261016t203545z-4p0a3mof.
+// Keep the native header/history, 80-column rules, NBSP and l> residue together.
+const observedSeparatorPane = readFileSync(new URL('./fixtures/claude-observed-separator-pane.txt', import.meta.url), 'utf8')
+
+describe('observed native empty frame after an emoji turn', () => {
+  test.each([
+    ['verbatim capture', observedSeparatorPane],
+    ['ANSI and trailing blank pane padding', `\x1b[32m${observedSeparatorPane}\x1b[0m\n   \n\n`],
+  ])('%s is an empty composer', (_name, pane) => {
+    expect(readDeliveryScreen('claude', pane)).toEqual({ kind: 'empty', running: false })
+  })
+  test('the frame does not hide a running turn above it', () => {
+    expect(readDeliveryScreen('claude', observedSeparatorPane.replace('✻ Baked for 4s · done 8:42 PM', '✻ Thinking… (2s · ↓ 100 tokens)'))).toEqual({ kind: 'empty', running: true })
+  })
+  test.each([
+    ['human draft', observedSeparatorPane.replace('❯\u00a0\n', '❯\u00a0a human draft\n')],
+    ['known in-flight text', observedSeparatorPane.replace('❯\u00a0\n', '❯\u00a0<channel>mine</channel>\n')],
+    ['literal residue in the composer', observedSeparatorPane.replace('❯\u00a0\n', '❯\u00a0l>draft\n')],
+    ['numbered selection', observedSeparatorPane.replace('❯\u00a0\n', '❯\u00a01. Yes\n')],
+    ['multiline draft', observedSeparatorPane.replace('❯\u00a0\n', '❯\u00a0\n  a human draft\n')],
+    ['extra empty composer row', observedSeparatorPane.replace('❯\u00a0\n', '❯\u00a0\n\n')],
+    ['different upper width', observedSeparatorPane.replace('─'.repeat(80) + '\n', '─'.repeat(79) + '\n')],
+    ['missing upper rule', observedSeparatorPane.replace('─'.repeat(80) + '\n', '')],
+    ['unknown residue', observedSeparatorPane.replace('l>─', 'x>─')],
+    ['missing footer', observedSeparatorPane.slice(0, observedSeparatorPane.lastIndexOf('  ⏸'))],
+    ['unknown footer', observedSeparatorPane.replace('⏸ manual mode on · ? for shortcuts · ← for agents', '⏸ manual mode on · unknown status')],
+    ['menu overlay', `${observedSeparatorPane}Enter to select · Esc to cancel\n`],
+  ])('%s supplies no empty or own-text proof', (_name, pane) => {
+    expect(readDeliveryScreen('claude', pane, '<channel>mine</channel>')).toEqual({ kind: 'menu', running: false })
+  })
+  test('a normal lower rule preserves a literal l> draft as input', () => {
+    expect(readDeliveryScreen('claude', panes.deliveryPane('l>draft'))).toEqual({ kind: 'input', text: 'l>draft', running: false })
+  })
+  test('a historical observed frame cannot hide the current human draft', () => {
+    expect(readDeliveryScreen('claude', panes.deliveryPane('current human draft', { history: observedSeparatorPane }))).toEqual({ kind: 'input', text: 'current human draft', running: false })
   })
 })

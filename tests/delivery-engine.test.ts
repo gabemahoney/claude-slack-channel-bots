@@ -285,6 +285,31 @@ describe('durable FIFO and send sequence', () => {
 })
 
 describe('fresh send guards', () => {
+  test.each(['unchanged', 'draft', 'menu'] as const)('observed native frame with %s on the independent gate read', async change => {
+    const h = await harness(), p = h.p()
+    const observed = readFileSync(new URL('./fixtures/claude-observed-separator-pane.txt', import.meta.url), 'utf8')
+    p.pane = observed
+    await h.accept(); await h.tick()
+    let readyReads = 0
+    p.readHook = () => {
+      if (h.clock.now() >= LAUNCH_SETTLE_MS && ++readyReads === 2 && change !== 'unchanged') {
+        p.pane = change === 'draft' ? deliveryPane('new human draft') : `${observed}Enter to select · Esc to cancel\n`
+      }
+    }
+    // Once sent, the harness must show the typed text, then its receipt.
+    p.keyHook = () => { p.pane = undefined; return undefined }
+    await h.advance(LAUNCH_SETTLE_MS + RECEIPT_WAIT_MS)
+    expect(readyReads).toBeGreaterThanOrEqual(2)
+    if (change !== 'unchanged') {
+      expect(h.keyCalls()).toEqual([])
+      expect(h.queue.openCount('alpha')).toBe(1)
+      p.readHook = undefined; p.pane = observed
+    }
+    await delivered(h)
+    expect(h.textCalls()).toHaveLength(1)
+    expect(h.keyCalls().map(call => call.params.key ?? call.params.text)).toEqual(['message', 'Enter'])
+    expect(h.events.filter(event => event.type === 'delivered')).toHaveLength(1)
+  })
   test.each(['menu', 'input', 'relay', 'pending', 'check_permission', 'ask_user', 'latched', 'held', 'down', 'mcp', 'marker'] as const)('%s blocks and then releases the head', async guard => {
     const h = await harness(), p = h.p()
     await h.accept()

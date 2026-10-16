@@ -6,6 +6,20 @@ export function stripDeliveryAnsi(text: string): string {
   return text.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '').replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/\r/g, '')
 }
 const rule = (line: string): boolean => /^\s*[─━\-]{8,}\s*$/.test(line)
+/** b.omv SR-5.3/14.2: native 2.1.296 left `l>` over the first two
+ * columns of the lower rule after case 10's emoji turn. Recognize only
+ * that empty frame: one NBSP prompt row, an intact upper rule of the
+ * same width, and the observed manual footer at the bottom. The residue
+ * is never removed from composer text or accepted around a draft.
+ */
+function observedEmptyClaudeLowerRule(lines: readonly string[], index: number): boolean {
+  const lower = lines[index]!
+  return /^l>─{8,}$/.test(lower)
+    && lines[index - 2] === '─'.repeat(lower.length)
+    && lines[index - 1] === '❯\u00a0'
+    && index + 2 === lines.length
+    && lines[index + 1]!.trim() === '⏸ manual mode on · ? for shortcuts · ← for agents'
+}
 const menuFooter = /esc to cancel|enter to select|enter to confirm|to navigate/i
 const runningLine = /^[✢✳✶✻✽·*].*…(?:\s|$)|^[✢✳✶✻✽·*].*[……].*(?:\(|tokens|thinking)|esc to interrupt|interrupt.*esc/i
 /** Native Claude wraps the current composer at a column or a word boundary.
@@ -45,7 +59,7 @@ export function readDeliveryScreen(agent: DeliveryAgent, pane: string, ownText?:
   while (lines.length && !lines[lines.length - 1]!.trim()) lines.pop()
   if (agent === 'claude') {
     let lower = -1
-    for (let i = lines.length - 1; i >= 0; i--) if (rule(lines[i]!)) { lower = i; break }
+    for (let i = lines.length - 1; i >= 0; i--) if (rule(lines[i]!) || observedEmptyClaudeLowerRule(lines, i)) { lower = i; break }
     if (lower < 0) return { kind: 'menu', running: false }
     const footer = lines.slice(lower + 1)
     if (footer.some(line => menuFooter.test(line))) return { kind: 'menu', running: false }

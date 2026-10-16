@@ -4216,23 +4216,27 @@ leg_real_idle_diagnostic_controls() (
     local dir="${SCENARIO_ROOT}/idle-diagnostic-controls" rc mode
     mkdir -p "${dir}"
     export CONTROL_AUTH_SECRET="$(fake_token app idle)"$'\n"private\\value'
+    export CONTROL_SLACK_FAKE="$(fake_token bot diagnostic)"
     bun - "${dir}" "${SCENARIO_FIXTURES}" <<'FIXTURES'
 import { join } from 'node:path'
 import { writeFileSync } from 'node:fs'
 const [dir, fixtures] = process.argv.slice(2)
-const { deliveryPane } = await import(join(fixtures, '../../test-helpers/working-row-panes.ts'))
-const { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX, sentinelTicketUrl } = await import(join(fixtures, '../../test-helpers/credentials.ts'))
+// Keep this control independent of checkout-only transcript/version helpers:
+// the CI image contains /tests and the installed package, with no /src tree.
+const deliveryPane = (text: string, history = '') => `${history}────────────────
+❯ ${text}
+────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)`
 const { redactRealObservation } = await import(join(fixtures, 'real-observations.ts'))
 const secret = process.env.CONTROL_AUTH_SECRET!
 for (const form of [secret, JSON.stringify(secret).slice(1, -1)]) {
   const redacted = redactRealObservation(`before ${form} after`, process.env)
   if (redacted !== 'before <redacted> after') throw new Error('runtime secret masking failed')
-  assertNoLeak(redacted)
 }
 for (const [name, pane] of [
   ['empty', deliveryPane('')],
-  ['draft', deliveryPane('draft', { history: `${secret} ${fakeToken(BOT_TOKEN_PREFIX)} ${sentinelTicketUrl()}\n` })],
-  ['huge', deliveryPane('draft', { history: `${secret} ${'bounded '.repeat(8000)}\n` })],
+  ['draft', deliveryPane('draft', `${secret} ${process.env.CONTROL_SLACK_FAKE!} wss://wss-stub.invalid/link/?ticket=SCENARIOFAKE\n`)],
+  ['huge', deliveryPane('draft', `${secret} ${'bounded '.repeat(8000)}\n`)],
 ]) writeFileSync(join(dir, `${name}.json`), JSON.stringify({ pane }))
 writeFileSync(join(dir, 'status.json'), JSON.stringify({ state: 'waiting' }))
 FIXTURES
@@ -4260,7 +4264,14 @@ FIXTURES
 import { join } from 'node:path'
 import { readFileSync } from 'node:fs'
 const [dir, fixtures] = process.argv.slice(2)
-const { assertNoLeak } = await import(join(fixtures, '../../test-helpers/credentials.ts'))
+// All control credentials come from the harness's fake_token, so these
+// assertions need no checkout-only unit helper or its source imports.
+const assertNoLeak = (output: string) => {
+  for (const secret of [process.env.CONTROL_AUTH_SECRET!, process.env.CONTROL_SLACK_FAKE!]) {
+    if (output.includes(secret) || output.includes(JSON.stringify(secret).slice(1, -1))) throw new Error('diagnostic leaked a control credential')
+  }
+  if (/SCENARIOFAKE|private/i.test(output)) throw new Error('diagnostic leaked a control marker')
+}
 const check = (ok: boolean, why: string) => { if (!ok) throw new Error(why) }
 const ordinaryText = readFileSync(join(dir, 'ordinary.out'), 'utf8')
 assertNoLeak(ordinaryText)

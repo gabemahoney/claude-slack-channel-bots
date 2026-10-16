@@ -797,6 +797,8 @@ idle controls inspect the installed pinned binaries and reject inactive panes
 and foreign-session/directory compaction boundaries.
 Idle diagnostic controls check success silence, preserved failure status,
 bounded redacted output and unreadable-pane evidence without starting a bot.
+They construct minimal bordered panes locally and load helpers from `/tests`
+and the installed package; validation must not mount the checkout's `src/`.
 The Slack stub's optional user/channel metadata controls retain the ordinary
 defaults and token rules; interactive `/_push` uses the actual recorded
 allow/deny button and a separate human identity.
