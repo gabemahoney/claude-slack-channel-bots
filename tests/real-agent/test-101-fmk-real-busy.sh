@@ -6,7 +6,18 @@ source "$(dirname "$0")/../integration/lib/scenario.sh"
 source "$(dirname "$0")/../integration/lib/real-scenario.sh"
 CASE_ASSERT="${SCENARIO_FIXTURES}/real-case-assertions.ts"
 case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${@:2}"; }
-real_prepare "${REAL_AGENT_CLAUDE_VERSION:-2.1.296}" 'Bash(sleep *)'
+real_prepare "${REAL_AGENT_CLAUDE_VERSION:-2.1.296}" 'Bash(sleep *)' mcp__slack-channel-router__reply
+# Native Claude can auto-allow harmless printf commands. Force only these
+# deliberate probes to ask, in the guarded scenario's disposable HOME.
+python3 - "${HOME}/.claude/settings.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+settings = json.loads(path.read_text())
+settings['permissions']['ask'] = [
+    'Bash(printf permission-probe)', 'Bash(printf subagent-deny-probe)']
+path.write_text(json.dumps(settings))
+print('recorded: busy native permissions ' + json.dumps(settings['permissions']))
+PY
 real_persona busy 'Follow each explicit tool request. When asked for a subagent use Agent, have it ask permission for its requested command, and keep the subagent dialog open after a deny. Otherwise acknowledge OK.'
 real_write_config '{"test_timer_overrides":{"delivery_stuck_after_ms":3000}}'
 real_start_stub
