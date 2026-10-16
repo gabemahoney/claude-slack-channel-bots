@@ -29,6 +29,9 @@ for n in {1..10}; do
 done
 wait_until 180 'scheduled item not durably accepted while down' case_assert accepted 13
 printf '' > "${SLACK_STATE_DIR}/crontab"
+# The first minute fire can precede the production retry's first attempt.
+# Keep the bot down until that attempt has exercised the counted refusal.
+wait_until 180 'message-triggered relaunch was not refused while down' case_assert fault unknown-untyped 1
 stop_server
 real_ad get --instance-id "$(real_instance "${REAL_KEY}")" > "${DOWN_ROW}.end"
 case_assert down "${DOWN_ROW}" "${DOWN_MARK}" 13
