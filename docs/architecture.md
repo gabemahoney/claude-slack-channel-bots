@@ -210,7 +210,11 @@ Inbound delivery lives in `src/persona-routing.ts`. Each persona has its own Soc
 | `refused` | Attempt that typed nothing; paired sends do not count as retypes. |
 | `noticed` | Persisted once-per-item notice fact for delivery reporting. |
 
-Each persona has one serialized writer for appends and compaction. An append opens the current path, writes its own newline-terminated record, fsyncs the file and directory and closes; a file missing its final newline gets a separating newline first. Failed writes do not claim acceptance and remain retryable. No descriptor survives a write to race a compaction rename.
+Each persona has one serialized writer for appends and compaction. An append opens the current path, writes its own newline-terminated record, fsyncs the journal and queue directory and closes; a file missing its final newline gets a separating newline first. Failed writes do not claim acceptance or publish item/key/count changes and remain retryable. No descriptor survives a write to race a compaction rename.
+
+The queue reuses its directory's device/inode identity only after a successful parent-directory fsync and while its mode remains 0700. Creation, replacement or mode correction clears that cached identity and requires another parent sync; a failed sync leaves it uncached for the next retry. Every append still requires its journal and queue-directory fsyncs before success.
+
+Each journal maintains item and Slack-key indexes and a constant-time open count, publishing updates only after a durable append. An item record recomputes only that item's summary; replay and successful compaction rebuild the indexes and count from retained records. Single-item and duplicate lookups return detached snapshots, and full item reads remain ordered by acceptance sequence.
 
 Startup reads every journal in full before admission, exempt from `MAX_RELOAD_FILE_BYTES`. Invalid/torn lines and orphan records go byte-for-byte to `<key>.unreadable-<UTC start time>` (0600); readable items replay in sequence. A missing/damaged `fixed` is rebuilt from readable `accepted`, an unreadable `delivered` leaves the item open, and an unreadable `sent` preserves an unknown outcome. Events expose the quarantine path/line and whether an alert is needed, without implementing the later notice/log layer.
 

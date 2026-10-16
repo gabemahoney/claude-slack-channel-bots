@@ -16,6 +16,23 @@ afterEach(async () => { await Promise.all(queues.map(q => q.stop())); fs.rmSync(
 async function open(options: Parameters<typeof makeQueue>[1] = {}) { const q = await makeQueue(dir, options); queues.push(q); return q }
 const accepted = (): QueueRecord => ({ ...slackInput(), v: 1, kind: 'accepted', seq: 1, received_at: 1000, ts: '1700000000.000001' })
 const kinds: QueueRecord[] = [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['exact bytes\n🙂'] }, sentRecord(), deliveredRecord(), { v: 1, kind: 'refused', seq: 1, attempt: 1, at: 1000 }, { v: 1, kind: 'noticed', seq: 1, at: 1000 }]
+function recordSyncs() {
+  const paths = new Map<number, string>(), synced: string[] = []
+  let failingPath: string | undefined
+  return {
+    synced,
+    fail(path?: string) { failingPath = path },
+    fs: { ...fs,
+      openSync(...args: Parameters<typeof fs.openSync>) { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd },
+      fsyncSync(fd: number) {
+        const path = paths.get(fd)!
+        synced.push(path)
+        if (path === failingPath) throw new Error('EIO injected sync')
+        fs.fsyncSync(fd)
+      },
+    } as typeof fs,
+  }
+}
 describe('six record schemas', () => {
   test.each(kinds.map(r => [r.kind, r] as const))('%s roundtrips and rejects invalid versions, sequence and missing payload', (_, r) => {
     expect(parseQueueRecord(JSON.stringify(r))).toEqual(r)
@@ -34,6 +51,101 @@ test('real file acceptance fsyncs file and new directory, enforces permissions a
   expect(fs.statSync(join(dir, 'queue')).mode & 0o777).toBe(QUEUE_DIRECTORY_MODE)
   expect(fs.statSync(queuePath(dir)).mode & 0o777).toBe(QUEUE_FILE_MODE)
   await q.stop(); const replay = await open(); expect(replay.items('alpha')[0]!.accepted.text).toBe('message')
+})
+test('reuses a durably synced parent while every acceptance and append still syncs its journal and queue directory', async () => {
+  const sync = recordSyncs(), queueDir = join(dir, 'queue')
+  const q = await open({ fs: sync.fs })
+  expect(sync.synced).toEqual([dir])
+  expect((await q.accept('alpha', injectedInput())).status).toBe('accepted')
+  await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['fixed'] })
+  expect((await q.accept('beta', injectedInput())).status).toBe('accepted')
+  expect(sync.synced).toEqual([dir, queuePath(dir), queueDir, queuePath(dir), queueDir, queuePath(dir, 'beta'), queueDir])
+  await q.stop()
+  const replay = await open({ fs: sync.fs })
+  expect(sync.synced.filter(path => path === dir)).toHaveLength(2)
+  expect(replay.item('alpha', 1)!.fixed!.parts).toEqual(['fixed'])
+  expect(replay.openCount('alpha')).toBe(1)
+  expect(replay.openCount('beta')).toBe(1)
+})
+test.each(['mode correction', 'directory replacement', 'same-inode directory recreation'] as const)('%s retries two failed parent syncs before publishing acceptance or reusing directory identity', async change => {
+  const sync = recordSyncs(), queueDir = join(dir, 'queue')
+  // A setgid scratch parent would make recreation exercise mode correction instead.
+  if (change === 'same-inode directory recreation') fs.chmodSync(dir, QUEUE_DIRECTORY_MODE)
+  let originalIdentity: { dev: number; ino: number } | undefined
+  const seam = { ...sync.fs,
+    statSync(path: fs.PathLike) {
+      const stat = fs.statSync(path)
+      if (change === 'same-inode directory recreation' && String(path) === queueDir) {
+        originalIdentity ??= { dev: stat.dev, ino: stat.ino }
+        // Deterministically model the filesystem reusing the removed directory's inode.
+        Object.assign(stat, originalIdentity)
+      }
+      return stat
+    },
+  } as typeof fs
+  const q = await open({ fs: seam })
+  if (change === 'mode correction') fs.chmodSync(queueDir, 0o755)
+  else if (change === 'same-inode directory recreation') fs.rmdirSync(queueDir)
+  else {
+    fs.renameSync(queueDir, join(dir, 'old-queue'))
+    fs.mkdirSync(queueDir, { mode: QUEUE_DIRECTORY_MODE })
+  }
+  sync.fail(dir)
+  for (let retry = 0; retry < 2; retry++) {
+    expect((await q.accept('alpha', slackInput())).status).toBe('failed')
+    expect(q.items('alpha')).toEqual([])
+    expect(q.item('alpha', 1)).toBeUndefined()
+    expect(q.openCount('alpha')).toBe(0)
+    expect(q.lookupSlackKey('alpha', slackInput().key!)).toBeUndefined()
+    expect(fs.existsSync(queuePath(dir))).toBe(false)
+  }
+  expect(sync.synced).toEqual([dir, dir, dir])
+  sync.fail()
+  expect(await q.accept('alpha', slackInput())).toMatchObject({ status: 'accepted', seq: 1 })
+  expect(sync.synced).toEqual([dir, dir, dir, dir, queuePath(dir), queueDir])
+  expect(fs.statSync(queueDir).mode & 0o7777).toBe(QUEUE_DIRECTORY_MODE)
+  expect((await q.accept('beta', injectedInput())).status).toBe('accepted')
+  expect(sync.synced.filter(path => path === dir)).toHaveLength(4)
+  await q.stop()
+  const replay = await open()
+  expect(replay.openCount('alpha')).toBe(1)
+  expect(replay.lookupSlackKey('alpha', slackInput().key!)).toMatchObject({ status: 'duplicate', seq: 1 })
+})
+test('queue-directory sync failures publish neither new Slack keys nor completed delivery summaries until retry succeeds', async () => {
+  const sync = recordSyncs(), queueDir = join(dir, 'queue')
+  const q = await open({ fs: sync.fs })
+  sync.fail(queueDir)
+  for (let retry = 0; retry < 2; retry++) {
+    expect((await q.accept('alpha', slackInput())).status).toBe('failed')
+    expect(q.items('alpha')).toEqual([])
+    expect(q.openCount('alpha')).toBe(0)
+    expect(q.lookupSlackKey('alpha', slackInput().key!)).toBeUndefined()
+    expect(readQueue(dir)).toEqual([])
+  }
+  sync.fail()
+  expect(await q.accept('alpha', slackInput())).toMatchObject({ status: 'accepted', seq: 1 })
+  await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['fixed'] })
+  const before = q.item('alpha', 1)!
+  sync.fail(queueDir)
+  for (let retry = 0; retry < 2; retry++) {
+    await expect(q.append('alpha', deliveredRecord())).rejects.toThrow('EIO injected sync')
+    expect(q.item('alpha', 1)).toEqual(before)
+    expect(q.lookupSlackKey('alpha', slackInput().key!)).toEqual({ status: 'duplicate', seq: 1, item: before })
+    expect(q.openCount('alpha')).toBe(1)
+    expect(readQueue(dir).map(record => record.kind)).toEqual(['accepted', 'fixed'])
+  }
+  sync.fail()
+  await q.append('alpha', deliveredRecord())
+  expect(q.item('alpha', 1)!.delivered).toBe(true)
+  expect(q.openCount('alpha')).toBe(0)
+  expect(sync.synced.filter(path => path === dir)).toHaveLength(1)
+  expect(sync.synced.filter(path => path === queueDir)).toHaveLength(7)
+  // Four failed appends each sync their rollback as well as their candidate.
+  expect(sync.synced.filter(path => path === queuePath(dir))).toHaveLength(11)
+  await q.stop()
+  const replay = await open()
+  expect(replay.openCount('alpha')).toBe(0)
+  expect(replay.lookupSlackKey('alpha', slackInput().key!)).toEqual({ status: 'duplicate', seq: 1 })
 })
 test('failed fsync never accepts; successful retry reconciles bytes and gets the same first sequence', async () => {
   let fail = false
@@ -78,6 +190,57 @@ test('open fixed bytes never expire; sent is not delivered; only refused send pa
   expect(item.fixed!.parts).toEqual(['exact\nbytes🙂']); expect(item.delivered).toBe(false); expect(item.retypeCount).toBe(1); expect(item.nextAttempt).toBe(3)
   expect(item.records.filter(r => r.kind === 'sent')).toHaveLength(1)
   await expect(replay.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['changed'] })).rejects.toThrow('immutable')
+})
+test('live summaries preserve multipart delivery counts, refused retypes and unknown attempts through repeated compaction and reload', async () => {
+  const edited = slackInput({ key: { ...slackInput().key!, edited_ts: 'edit' } })
+  let q = await open({ now: () => 1000 })
+  await q.accept('alpha', slackInput())
+  await q.accept('alpha', injectedInput())
+  await q.accept('alpha', edited)
+  await q.accept('beta', injectedInput())
+  await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['one', 'two'] })
+  await q.append('alpha', sentRecord(1, 1, 'retype'))
+  expect(q.item('alpha', 1)!.retypeCount).toBe(1)
+  await q.append('alpha', { v: 1, kind: 'refused', seq: 1, attempt: 1, at: 1000 })
+  expect(q.item('alpha', 1)).toMatchObject({ retypeCount: 0, nextAttempt: 2 })
+  await q.append('alpha', sentRecord(1, 2, 'retype'))
+  await q.append('alpha', deliveredRecord())
+  expect(q.item('alpha', 1)).toMatchObject({ delivered: false, retypeCount: 1, nextAttempt: 3 })
+  expect(q.openCount('alpha')).toBe(3)
+  await q.append('alpha', { ...deliveredRecord(), part: 2 })
+  expect(q.openCount('alpha')).toBe(2)
+  await q.append('alpha', { ...deliveredRecord(), part: 2 })
+  await q.append('alpha', { v: 1, kind: 'noticed', seq: 1, at: 1000 })
+  expect(q.openCount('alpha')).toBe(2)
+  expect(q.item('alpha', 1)).toMatchObject({ delivered: true, retypeCount: 1, nextAttempt: 3 })
+  await q.append('alpha', sentRecord(2, 7, 'retype'))
+  await q.append('alpha', { v: 1, kind: 'refused', seq: 2, attempt: 7, at: 1000 })
+  await q.append('alpha', { v: 1, kind: 'sent', seq: 3, attempt: 3, unknown_outcome: true, at: 1000, quarantine: { path: join(dir, 'unknown'), line: 1 } })
+  expect(q.items('alpha').map(item => [item.accepted.seq, item.delivered, item.unknownSend, item.retypeCount, item.nextAttempt])).toEqual([
+    [1, true, false, 1, 3], [2, false, false, 0, 8], [3, false, true, 0, 4],
+  ])
+  expect(q.lookupSlackKey('alpha', edited.key!)).toEqual({ status: 'duplicate', seq: 3, item: q.item('alpha', 3) })
+  for (let cycle = 0; cycle < 3; cycle++) {
+    await q.compact('alpha')
+    await q.stop()
+    q = await open({ now: () => 1000 })
+    const items = q.items('alpha')
+    expect(items.map(item => [item.accepted.seq, item.delivered, item.unknownSend, item.retypeCount, item.nextAttempt])).toEqual([
+      [2, false, false, 0, 8], [3, false, true, 0, 4],
+    ])
+    expect(q.openCount('alpha')).toBe(2)
+    expect(q.openCount('beta')).toBe(1)
+    for (const item of items) expect(q.item('alpha', item.accepted.seq)).toEqual(item)
+    expect(q.item('alpha', 1)).toBeUndefined()
+    expect(q.lookupSlackKey('alpha', slackInput().key!)).toEqual({ status: 'duplicate', seq: 1 })
+    expect(q.lookupSlackKey('alpha', edited.key!)).toEqual({ status: 'duplicate', seq: 3, item: items[1] })
+    expect(await q.accept('alpha', edited)).toEqual({ status: 'duplicate', seq: 3, item: items[1] })
+    await expect(q.append('alpha', sentRecord(2, 7, 'retype'))).rejects.toThrow('Attempt number must increase')
+  }
+  expect(await q.accept('alpha', injectedInput())).toMatchObject({ status: 'accepted', seq: 4 })
+  expect(q.items('alpha').map(item => item.accepted.seq)).toEqual([2, 3, 4])
+  expect(q.openCount('alpha')).toBe(3)
+  expect(q.openCount('beta')).toBe(1)
 })
 test('delivered Slack tombstone survives compaction and restart until received_at retention expires without restoring content', async () => {
   const clock = createFakeClock({ start: 1000 }); const q = await open({ now: clock.now }); await q.accept('alpha', slackInput({ text: 'private delivered content' }))

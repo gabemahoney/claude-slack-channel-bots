@@ -136,7 +136,11 @@ function isAccepted(r: QueueRecord): r is AcceptedRecord { return r.kind === 'ac
 function microseconds(ts: string): bigint { const [s, f = ''] = ts.split('.'); return BigInt(s!) * 1000000n + BigInt(f.padEnd(6, '0').slice(0, 6)) }
 function formatMicros(us: bigint): string { return `${us / 1000000n}.${String(us % 1000000n).padStart(6, '0')}` }
 interface AppendRollback { pendingRollback?: number }
-interface Journal extends AppendRollback { records: QueueRecord[]; nextSeq: number; lastInjected?: bigint; loaded: boolean; quarantineRollback?: AppendRollback }
+interface Journal extends AppendRollback {
+  records: QueueRecord[]; nextSeq: number; lastInjected?: bigint; loaded: boolean; quarantineRollback?: AppendRollback
+  items: Map<number, QueueItem>; slackKeys: Map<string, AcceptedRecord | QueueKeyRecord>; openCount: number
+}
+function emptyJournal(): Journal { return { records: [], nextSeq: 1, loaded: false, items: new Map(), slackKeys: new Map(), openCount: 0 } }
 /** All file access is explicit; construction allocates only memory (SR-13.1). */
 export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueue {
   const fs = options.fs ?? nodeFs
@@ -147,6 +151,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
   const appendBlocked = new Set<string>()
   const startId = `${new Date(now()).toISOString().replace(/[:]/g, '-')}-${randomUUID()}`
   let started = false, stopped = false
+  let durableDirectory: { dev: number; ino: number } | undefined
   let timer: ReturnType<typeof globalThis.setInterval> | undefined
   const findings: QueueEvent[] = []
   function event(e: QueueEvent): void { if (e.type === 'record-unreadable') findings.push({ ...e }); try { void Promise.resolve(options.onEvent?.(e)).catch(() => {}) } catch { /* observers cannot change durable outcomes */ } }
@@ -157,7 +162,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
   function journal(key: string): Journal {
     pathFor(key)
     let j = journals.get(key)
-    if (!j) { j = { records: [], nextSeq: 1, loaded: false }; journals.set(key, j) }
+    if (!j) { j = emptyJournal(); journals.set(key, j) }
     return j
   }
   function serial<T>(key: string, work: () => T | Promise<T>): Promise<T> {
@@ -167,10 +172,16 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
   }
   function syncDir(path: string): void { const fd = fs.openSync(path, 'r'); try { fs.fsyncSync(fd) } finally { fs.closeSync(fd) } }
   function ensureDir(): void {
-    fs.mkdirSync(dir, { recursive: true, mode: QUEUE_DIRECTORY_MODE })
+    // A recreated directory may reuse the cached device/inode identity.
+    if (fs.mkdirSync(dir, { recursive: true, mode: QUEUE_DIRECTORY_MODE }) !== undefined) durableDirectory = undefined
+    const stat = fs.statSync(dir)
+    if (durableDirectory?.dev === stat.dev && durableDirectory.ino === stat.ino && (stat.mode & 0o7777) === QUEUE_DIRECTORY_MODE) return
+    durableDirectory = undefined
     fs.chmodSync(dir, QUEUE_DIRECTORY_MODE)
-    // Persist the queue directory entry too, before any acceptance.
+    // Persist a new/replaced queue directory before any acceptance (SR-3.3).
+    // Publish this identity only after success; a failed sync remains retryable.
     syncDir(options.stateDir)
+    durableDirectory = { dev: stat.dev, ino: stat.ino }
   }
   function writeAll(fd: number, bytes: Uint8Array): void {
     let offset = 0
@@ -202,39 +213,66 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
       throw error
     } finally { try { fs.closeSync(fd) } catch { /* fsync is the durability boundary */ } }
   }
-  function update(j: Journal, record: QueueRecord): void {
+  function update(j: Journal, record: QueueRecord, replay = false): void {
     j.records.push(record); j.nextSeq = Math.max(j.nextSeq, record.seq + 1)
+    if (!replay) indexRecord(j, record)
     if (record.kind === 'accepted') {
       const ts = 'compact' in record ? record.compact === 'allocation' ? record.injected_ts : undefined : record.source !== 'slack' ? record.ts : undefined
       if (ts) j.lastInjected = j.lastInjected !== undefined && j.lastInjected > microseconds(ts) ? j.lastInjected : microseconds(ts)
     }
   }
-  function materialize(j: Journal): QueueItem[] {
-    const result = new Map<number, QueueItem>()
-    for (const r of j.records) {
-      if (isAccepted(r)) { if (!result.has(r.seq)) result.set(r.seq, { accepted: r, records: [r], delivered: false, unknownSend: false, retypeCount: 0, nextAttempt: (r.attempt_high_watermark ?? 0) + 1 }); continue }
-      if (r.kind === 'accepted') continue
-      const item = result.get(r.seq)
-      if (item) { item.records.push(r); if (r.kind === 'fixed') item.fixed ??= r }
+  /** Derive only the changed item; public snapshots never expose these records. */
+  function summarize(accepted: AcceptedRecord, records: ItemRecord[]): QueueItem {
+    const item: QueueItem = { accepted, records, delivered: false, unknownSend: false, retypeCount: 0, nextAttempt: (accepted.attempt_high_watermark ?? 0) + 1 }
+    for (const r of records) if (r.kind === 'fixed') item.fixed ??= r
+    const refused = new Set(records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
+    for (const r of records) if (r.kind === 'refused') item.nextAttempt = Math.max(item.nextAttempt, r.attempt + 1)
+    for (const r of records) if (r.kind === 'sent') {
+      item.nextAttempt = Math.max(item.nextAttempt, r.attempt + 1)
+      if ('unknown_outcome' in r) item.unknownSend = true
+      else if (r.send_kind === 'retype' && !refused.has(r.attempt)) item.retypeCount++
     }
-    for (const item of result.values()) {
-      const refused = new Set(item.records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
-      for (const r of item.records) if (r.kind === 'refused') item.nextAttempt = Math.max(item.nextAttempt, r.attempt + 1)
-      for (const r of item.records) if (r.kind === 'sent') {
-        item.nextAttempt = Math.max(item.nextAttempt, r.attempt + 1)
-        if ('unknown_outcome' in r) item.unknownSend = true
-        else if (r.send_kind === 'retype' && !refused.has(r.attempt)) item.retypeCount++
+    if (item.fixed) item.delivered = item.fixed.parts.every((_, i) => records.some(r => r.kind === 'delivered' && r.part === i + 1))
+    return item
+  }
+  function indexRecord(j: Journal, record: QueueRecord): void {
+    if (record.kind === 'accepted') {
+      if ('key' in record && record.key) {
+        const encoded = slackKeyString(record.key)
+        if (!j.slackKeys.has(encoded)) j.slackKeys.set(encoded, record)
       }
-      if (item.fixed) item.delivered = item.fixed.parts.every((_, i) => item.records.some(r => r.kind === 'delivered' && r.part === i + 1))
+      if (isAccepted(record) && !j.items.has(record.seq)) { j.items.set(record.seq, summarize(record, [record])); j.openCount++ }
+      return
     }
-    return [...result.values()].sort((a, b) => a.accepted.seq - b.accepted.seq)
+    const previous = j.items.get(record.seq)
+    if (!previous) return
+    const item = summarize(previous.accepted, [...previous.records, record])
+    j.items.set(record.seq, item)
+    j.openCount += Number(previous.delivered) - Number(item.delivered)
+  }
+  function rebuild(j: Journal): void {
+    j.items = new Map(); j.slackKeys = new Map(); j.openCount = 0
+    // Replay groups records once, rather than repeatedly copying a long
+    // history of retypes for the same item.
+    for (const record of j.records) {
+      if (record.kind === 'accepted') indexRecord(j, record)
+      else j.items.get(record.seq)?.records.push(record)
+    }
+    for (const [seq, previous] of j.items) {
+      const item = summarize(previous.accepted, previous.records)
+      j.items.set(seq, item)
+      if (item.delivered) j.openCount--
+    }
+  }
+  function materialize(j: Journal): QueueItem[] {
+    return [...j.items.values()].sort((a, b) => a.accepted.seq - b.accepted.seq)
   }
   function load(key: string): void {
     const stored = journal(key)
     if (stored.loaded) return
     // Publish only a complete replay: a failed read or quarantine append must
     // remain retryable without exposing partial rows or dedupe facts.
-    const j: Journal = { records: [], nextSeq: 1, loaded: false }
+    const j = emptyJournal()
     let bytes: Buffer
     try { bytes = fs.readFileSync(pathFor(key)) } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') { stored.loaded = true; return }
@@ -269,10 +307,11 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
       const duplicate = r && isAccepted(r) && seenAccept.has(r.seq)
       if (!r || orphan || duplicate) { damaged.push(l); continue }
       if (isAccepted(r)) seenAccept.add(r.seq)
-      update(j, r)
+      update(j, r, true)
     }
     // Put accepted records first for recovery of valid out-of-order journal rows.
     j.records.sort((a, b) => a.seq - b.seq || (isAccepted(a) ? -1 : isAccepted(b) ? 1 : 0))
+    rebuild(j)
     if (damaged.length) {
       // Exact original bytes, including torn tails, preserved before rewriting the source.
       durableAppend(quarantinePath, Buffer.concat(damaged.map(l => l.bytes)), stored.quarantineRollback ??= {})
@@ -280,14 +319,14 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
         const raw = l.raw
         const seq = raw?.seq
         if (raw?.kind === 'sent' && integer(seq) && accepted.has(seq)) {
-          const item = materialize(j).find(i => i.accepted.seq === seq)!
+          const item = j.items.get(seq)!
           const attempt = positive(raw.attempt) && !item.records.some(r => r.kind === 'sent' && r.attempt === raw.attempt) ? raw.attempt : item.nextAttempt
           update(j, { v: 1, kind: 'sent', seq, attempt, unknown_outcome: true, at: item.accepted.received_at, quarantine: { path: quarantinePath, line: l.line } })
         }
         event({ type: 'record-unreadable', key, line: l.line, quarantinePath, alert: l.line !== lines.length && !(integer(seq) && accepted.has(seq)) && (raw?.kind === 'accepted' || !['fixed', 'sent', 'delivered', 'refused', 'noticed'].includes(String(raw?.kind))) })
       }
     }
-    stored.records = j.records; stored.nextSeq = j.nextSeq; stored.lastInjected = j.lastInjected; stored.loaded = true
+    stored.records = j.records; stored.nextSeq = j.nextSeq; stored.lastInjected = j.lastInjected; stored.items = j.items; stored.slackKeys = j.slackKeys; stored.openCount = j.openCount; stored.loaded = true
   }
   function rewrite(key: string, records: QueueRecord[]): void {
     const path = pathFor(key), temp = `${path}.${randomUUID()}.tmp`
@@ -321,12 +360,13 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
     retained.push({ v: 1, kind: 'accepted', seq: j.nextSeq - 1, compact: 'allocation', ...(j.lastInjected === undefined ? {} : { injected_ts: formatMicros(j.lastInjected) }) })
     rewrite(key, retained)
     j.records = retained
+    rebuild(j)
   }
   function lookupSlackKey(key: string, slack: SlackKey): QueueAcceptResult | undefined {
     const j = journal(key)
     const encoded = slackKeyString(slack)
-    const r = j.records.find(r => r.kind === 'accepted' && !('compact' in r && r.compact === 'allocation') && 'key' in r && r.key && slackKeyString(r.key) === encoded)
-    return r ? structuredClone({ status: 'duplicate' as const, seq: r.seq, item: materialize(j).find(i => i.accepted.seq === r.seq) }) : undefined
+    const r = j.slackKeys.get(encoded)
+    return r ? structuredClone({ status: 'duplicate' as const, seq: r.seq, item: j.items.get(r.seq) }) : undefined
   }
   async function compact(key?: string): Promise<void> {
     await Promise.all((key ? [key] : [...journals.keys()]).map(k => serial(k, () => { try { compactOne(k) } catch (error) { event({ type: 'compaction-failed', key: k, error }); throw error } })))
@@ -354,7 +394,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
           durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j)
           update(j, record)
           event({ type: 'stored', key })
-          return { status: 'accepted' as const, seq: record.seq, item: structuredClone(materialize(j).find(i => i.accepted.seq === record.seq)!) }
+          return { status: 'accepted' as const, seq: record.seq, item: structuredClone(j.items.get(record.seq)!) }
         })
       } catch (error) { event({ type: 'store-failed', key, path: PERSONA_KEY_RE.test(key) ? pathFor(key) : undefined, source: input.source, sender: input.sender, user: input.user, bot_id: input.bot_id, channel: input.channel, ts: input.ts ?? input.key?.ts, error }); return { status: 'failed', error } }
     },
@@ -365,7 +405,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
         await serial(key, () => {
           load(key); const j = journal(key)
           if (!isQueueRecord(record) || record.kind === 'accepted') throw new Error('Invalid append record')
-          const item = materialize(j).find(i => i.accepted.seq === record.seq)
+          const item = j.items.get(record.seq)
           if (!item) throw new Error('Append has no accepted item')
           // Immutable fixation and stable attempt identifiers allow safe retry after failures.
           if (record.kind === 'fixed' && item.fixed) {
@@ -385,11 +425,11 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
     },
     lookupSlackKey,
     item(key, seq) {
-      const item = materialize(journal(key)).find(item => item.accepted.seq === seq)
+      const item = journal(key).items.get(seq)
       return item ? structuredClone(item) : undefined
     },
     items: key => materialize(journal(key)).map(item => structuredClone(item)),
-    openCount: key => materialize(journal(key)).filter(item => !item.delivered).length,
+    openCount: key => journal(key).openCount,
     isWritable: key => !appendBlocked.has(key),
     keys: () => [...journals.keys()],
     compact,
