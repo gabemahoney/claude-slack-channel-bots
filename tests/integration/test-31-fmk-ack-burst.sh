@@ -32,7 +32,7 @@ printf '{"bot_token":"%s","app_token":"%s"}\n' "$(fake_token bot "${LABEL}")" "$
 STUB_DIR="${SCENARIO_ROOT}/slack-stub"
 mkdir "${STUB_DIR}"
 SCENARIO_SLACK_RECORD="${STUB_DIR}/record.jsonl"
-jq -n --arg label "${LABEL}" '{tokens:[{suffix:$label,label:$label,auth:"ok",connections:"ok"}],
+jq -n --arg token_label "${LABEL}" '{tokens:[{suffix:$token_label,label:$token_label,auth:"ok",connections:"ok"}],
     default:{auth:"invalid_auth",connections:"invalid_auth"}}' | write_file "${STUB_DIR}/control.json"
 bun "${SCENARIO_FIXTURES}/slack-stub-server.ts" --record "${SCENARIO_SLACK_RECORD}" \
     --control "${STUB_DIR}/control.json" --ready-file "${STUB_DIR}/ready.json" > "${STUB_DIR}/out" 2>&1 &
@@ -51,7 +51,7 @@ start_server --live
 wait_for_log "$(completion_match 1)" 150 "silent persona startup never completed"
 silent_worker() {
     local pid
-    pid="$(tmux display-message -p -t "=${SESSION}" '#{pane_pid}' 2> /dev/null)" || return 1
+    pid="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${SESSION}:" '#{pane_pid}' 2> /dev/null)" || return 1
     grep -qzxF -- "${SCENARIO_BIN}/claude" "/proc/${pid}/cmdline" 2> /dev/null
 }
 wait_until 20 "the silent stub worker never started" silent_worker
@@ -88,7 +88,7 @@ bun "${SCENARIO_ROOT}/submit.ts" "${SCENARIO_SLACK_STUB_URL}" "${LABEL}" "${CHAN
 # Poll only for positive completion. A generous observation bound never
 # relaxes the per-event 3,000 ms measurement from pre-send to actual ACK.
 burst_acked() {
-    jq -se --arg label "${LABEL}" '[.[] | select(.event == "ws-message" and .label == $label)] | length >= 1000' \
+    jq -se --arg token_label "${LABEL}" '[.[] | select(.event == "ws-message" and .label == $token_label)] | length >= 1000' \
         "${SCENARIO_SLACK_RECORD}" > /dev/null
 }
 wait_until 30 "not all 1,000 actual WebSocket ACKs arrived" burst_acked
@@ -125,8 +125,18 @@ for push in pushes:
     start, end = push.get("sent_mono_ms"), ack.get("ack_mono_ms")
     assert all(type(t) in (int, float) and math.isfinite(t) and t >= 0 for t in (start, end)), "missing/invalid monotonic clock"
     elapsed = end - start
-    assert 0 <= elapsed <= 3000, f"ACK outside deadline: {elapsed} ms"
     latencies.append(elapsed)
+# Collect every matched ACK before applying the deadline, so a failure
+# retains the full burst rather than stopping at the first slow event.
+# Only numeric timing metadata is logged, never message bodies or tokens.
+maximum = max(latencies)
+p95 = sorted(latencies)[math.ceil(len(latencies) * .95) - 1]
+over_limit = sum(elapsed > 3000 for elapsed in latencies)
+negative = sum(elapsed < 0 for elapsed in latencies)
+print("ACK burst elapsed_ms (push order): " + json.dumps([round(elapsed, 3) for elapsed in latencies], separators=(",", ":")), flush=True)
+timing = f"acked={len(latencies)} max_ms={maximum:.3f} p95_ms={p95:.3f} over_limit={over_limit} negative={negative}"
+print(f"ACK burst timing: {timing}", flush=True)
+assert over_limit == negative == 0, f"ACK outside deadline: {timing} (limit_ms=3000)"
 assert len(accepted) == 1000 and len({a["seq"] for a in accepted}) == 1000, "wrong distinct queue count"
 assert collections.Counter((a.get("channel"), a.get("ts")) for a in accepted) == collections.Counter(intended), "queue set differs"
 assert all(a.get("source") == "slack" and a.get("user") == human and a.get("via") == "receive_all" for a in accepted), "wrong acceptance identity"
@@ -135,7 +145,7 @@ assert all(a.get("source") == "slack" and a.get("user") == human and a.get("via"
 assert len([r for r in journal if r["kind"] == "accepted"]) == 1000, "unexpected compacted/extra acceptance"
 assert not any(r["kind"] in ("sent", "delivered", "refused") for r in journal), "message typing/delivery occurred"
 assert not any(r["event"] == "api" and r.get("method") == "reactions.add" for r in stub), "premature receipt reaction"
-print(f"ACK burst: sent=1000 acked=1000 outstanding=1000 max_ms={max(latencies):.3f}")
+print(f"ACK burst: sent=1000 acked=1000 outstanding=1000 max_ms={maximum:.3f} p95_ms={p95:.3f} over_limit={over_limit}")
 EOF
 
 # Positive ACK completion above settles these absence checks; no quiet sleep.

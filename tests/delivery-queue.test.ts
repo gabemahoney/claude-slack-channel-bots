@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -6,6 +6,7 @@ import { createDeliveryQueue, isQueueRecord, parseQueueRecord, QUEUE_DIRECTORY_M
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { MAX_RELOAD_FILE_BYTES } from '../src/config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { deliveredRecord, injectedInput, makeQueue, queuePath, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 
 let dir: string
@@ -145,6 +146,65 @@ test('simultaneous redeliveries share one durable Slack acceptance; per-persona 
   const q = await open(); const results = await Promise.all(Array.from({ length: 20 }, () => q.accept('alpha', slackInput())))
   expect(results.filter(r => r.status === 'accepted')).toHaveLength(1); expect(results.filter(r => r.status === 'duplicate')).toHaveLength(19); expect(q.items('alpha')).toHaveLength(1); expect(q.items('beta')).toEqual([])
   expect((await q.accept('beta', slackInput())).status).toBe('accepted'); expect(q.items('beta')).toHaveLength(1)
+})
+
+test.each([16, 64])('%i concurrent accepts and preparations clone only two item snapshots per acceptance', async count => {
+  const q = await open()
+  const preparation = createDeliveryPreparation({ queue: q, resolveUserName: async () => 'human', clientFor: () => undefined, clock: createFakeClock() })
+  const clone = globalThis.structuredClone
+  let snapshots = 0
+  const cloning = spyOn(globalThis, 'structuredClone').mockImplementation(value => {
+    if (value && typeof value === 'object' && 'accepted' in value && 'records' in value) snapshots++
+    return clone(value)
+  })
+  try {
+    await Promise.all(Array.from({ length: count }, (_, i) => {
+      const ts = `1700000000.${String(i + 1).padStart(6, '0')}`
+      return q.accept('alpha', slackInput({ ts, key: { chat_id: slackInput().channel!, ts } })).then(async result => {
+        expect(result.status).toBe('accepted')
+        if (result.status === 'failed' || !result.item) throw new Error('missing accepted item')
+        await preparation.prepare('alpha', result.item)
+      })
+    }))
+    console.info(`queue preparation accepts=${count} item_snapshots=${snapshots} expected=${2 * count}`)
+    // One detached acceptance result and one fresh preparation snapshot. A
+    // whole-queue refresh instead grows quadratically as this burst queues.
+    expect(snapshots).toBe(2 * count)
+  } finally {
+    cloning.mockRestore()
+    await preparation.stop()
+  }
+  expect(q.openCount('alpha')).toBe(count)
+  expect(q.items('alpha').every(item => item.fixed !== undefined)).toBe(true)
+})
+
+test('single-item snapshots are fresh, deeply detached and absent after compaction removes their item', async () => {
+  const q = await open()
+  await q.accept('alpha', slackInput({ files: [{ name: 'original.txt' }] }))
+  await q.accept('alpha', injectedInput())
+  await q.accept('beta', injectedInput({ text: 'other persona' }))
+  expect(q.item('missing', 1)).toBeUndefined()
+  expect(q.item('alpha', 99)).toBeUndefined()
+  const stale = q.item('alpha', 1)!
+  await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['fixed bytes'] })
+  await q.append('alpha', sentRecord())
+  const current = q.item('alpha', 1)!
+  expect(stale.fixed).toBeUndefined()
+  expect(current).toEqual(q.items('alpha')[0])
+  const unchanged = q.item('alpha', 1)!
+  current.accepted.text = 'changed'
+  current.accepted.files![0]!.name = 'changed.txt'
+  current.fixed!.parts[0] = 'changed bytes'
+  current.records.find(record => record.kind === 'sent')!.attempt = 99
+  expect(q.item('alpha', 1)).toEqual(unchanged)
+  expect(q.item('beta', 1)!.accepted.text).toBe('other persona')
+  await q.append('alpha', deliveredRecord())
+  expect(q.item('alpha', 1)!.delivered).toBe(true)
+  expect(current.delivered).toBe(false)
+  await q.compact('alpha')
+  expect(q.item('alpha', 1)).toBeUndefined()
+  expect(q.item('alpha', 2)).toEqual(q.items('alpha')[0])
+  expect(q.item('beta', 1)!.accepted.text).toBe('other persona')
 })
 test('closing drains accepted writes and rejects new intake without leaving an open descriptor', async () => {
   let opens = 0; const seam = { ...fs, openSync: (...args: Parameters<typeof fs.openSync>) => { const fd = fs.openSync(...args); opens++; return fd }, closeSync: (fd: number) => { fs.closeSync(fd); opens-- } } as typeof fs

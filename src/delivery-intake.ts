@@ -68,7 +68,9 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     return result
   }
   async function fix(key: string, item: QueueItem): Promise<void> {
-    item = deps.queue.items(key).find(i => i.accepted.seq === item.accepted.seq) ?? item
+    // b.omv SR-4.1/13.6: post-ack fixation must not clone every queued item
+    // while a burst's remaining events still await durable acceptance.
+    item = deps.queue.item(key, item.accepted.seq) ?? item
     if (stopped || item.delivered) return
     if (!item.fixed) {
       const a = item.accepted, id = `${key}:${a.seq}`

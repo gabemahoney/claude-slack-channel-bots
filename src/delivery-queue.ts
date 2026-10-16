@@ -74,6 +74,8 @@ export interface DeliveryQueue {
   accept: QueueAccept
   append(key: string, record: QueueRecord): Promise<void>
   lookupSlackKey(key: string, slackKey: SlackKey): QueueAcceptResult | undefined
+  /** A current snapshot of one item, without cloning the rest of the queue. */
+  item(key: string, seq: number): QueueItem | undefined
   items(key: string): QueueItem[]
   openCount(key: string): number
   /** A failed post-accept append suspends all keys until an append succeeds. */
@@ -382,6 +384,10 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
       } catch (error) { appendBlocked.add(key); event({ type: 'append-failed', key, path: pathFor(key), seq: record.seq, error }); throw error }
     },
     lookupSlackKey,
+    item(key, seq) {
+      const item = materialize(journal(key)).find(item => item.accepted.seq === seq)
+      return item ? structuredClone(item) : undefined
+    },
     items: key => materialize(journal(key)).map(item => structuredClone(item)),
     openCount: key => materialize(journal(key)).filter(item => !item.delivered).length,
     isWritable: key => !appendBlocked.has(key),

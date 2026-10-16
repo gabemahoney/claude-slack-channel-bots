@@ -3369,10 +3369,16 @@ missing, duplicated, mismatched or late ACKs. Every elapsed time must be
 between 0 and 3,000 ms; the 30-second observation deadline does not relax
 that bound. The `/_push` HTTP response proves submission only.
 
-The script prints the measurement line below and a final elapsed wall time:
+Before asserting the deadline, the script prints every numeric elapsed
+interval in push order and a timing summary, including the maximum, p95,
+over-limit count and negative count. These lines remain available on a
+deadline failure. A successful check also prints the outstanding-item
+summary and a final elapsed wall time:
 
 ```text
-ACK burst: sent=1000 acked=1000 outstanding=1000 max_ms=<measured maximum>
+ACK burst elapsed_ms (push order): [<1000 measured intervals>]
+ACK burst timing: acked=1000 max_ms=<measured maximum> p95_ms=<measured p95> over_limit=0 negative=0
+ACK burst: sent=1000 acked=1000 outstanding=1000 max_ms=<measured maximum> p95_ms=<measured p95> over_limit=0
 ```
 Successful completion deliberately retains exactly 1,000 outstanding items
 through server shutdown until scratch cleanup. It asserts no typing,
