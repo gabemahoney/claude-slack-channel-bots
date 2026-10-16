@@ -203,8 +203,9 @@
 #                    stub still runs.
 #   mcp_end          `stub_type_exit` types the sentinel into that pane: the
 #                    server logs the session's end, the stub and its current
-#                    client are gone and /interject answers 503: the persona
-#                    reads not connected. The start is stopped with
+#                    client are gone and /interject answers 200, appending
+#                    one accepted queue record despite the ended session.
+#                    The start is stopped with
 #                    --stop-bots.
 #   slack_stub_record
 #                    the Slack stub (fixtures/slack-stub-server.ts) records a
@@ -2333,9 +2334,9 @@ mcp_new_client() {
 }
 
 # The mcp_session leg's stub ends (the sentinel, through `stub_type_exit`):
-# its session ends with it, and the persona reads not connected.
+# its session ends with it, and /interject still durably accepts for it.
 leg_mcp_end() {
-    local step="MCP session end" ref disconnected n
+    local step="MCP session end" ref disconnected n key accepted_before
     ref="$(persona_ref "${MCP_NAME}")"
     disconnected="$(matcher "[slack] Session disconnected" ": persona ${ref}")"
     n="$(count_log "${disconnected}")"
@@ -2343,7 +2344,14 @@ leg_mcp_end() {
     wait_for_count "${disconnected}" "$(( n + 1 ))" "${MCP_END_WAIT_S}" "${step}: the server never saw ${ref}'s session end"
     wait_until 10 "${step}: the stub ${MCP_STUB_PID} still runs after the sentinel" _scenario_pid_gone "${MCP_STUB_PID}"
     wait_until 10 "${step}: the MCP session client ${MCP_CLIENT_PID} outlived the stub" _scenario_pid_gone "${MCP_CLIENT_PID}"
-    expect_interject "${MCP_NAME}" 503 "${step}: after the stub ended"
+    key="$(persona_key "${MCP_NAME}")"
+    accepted_before="$(queue_accepted "${key}" | jq -s 'length')"
+    expect_interject "${MCP_NAME}" 200 "${step}: after the stub ended"
+    queue_accepted "${key}" > "${SCENARIO_ROOT}/mcp-ended-accepted.jsonl"
+    jq -se --argjson want "$(( accepted_before + 1 ))" --arg text "${TEST_NAME} interject" \
+        'length == $want and (last | .source == "interject" and .text == $text)' \
+        "${SCENARIO_ROOT}/mcp-ended-accepted.jsonl" > /dev/null \
+        || fail "${step}: /interject did not append exactly one accepted queue record after the session ended"
 
     stop_server --stop-bots
     stop_tracked_pid "${SLACK_STUB_PID}" 10 "${step}: the Slack stub did not exit on SIGTERM"

@@ -5510,9 +5510,10 @@ if [[ "${SCENARIO_FMK}" == 1 ]]; then
 fi
 
 # queue_accepted <persona-key>: durable accepted records only, normalized across compaction.
+# Both modes: new_state_dir keeps SLACK_STATE_DIR under SCENARIO_ROOT; this
+# read-only helper needs no scenario HOME in the shared-mode scripts.
 queue_accepted() {
-    require_ci_image queue_accepted
-    require_scenario_home queue_accepted
+    require_ci_image "queue_accepted"
     local key="${1:-}" file
     [[ "${key}" =~ ^[a-z0-9_]+$ ]] || fail "queue_accepted: invalid persona key"
     file="${SLACK_STATE_DIR}/queue/${key}.jsonl"

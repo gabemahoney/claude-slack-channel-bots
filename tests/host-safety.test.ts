@@ -62,9 +62,9 @@
  *   `realpath -e` (the SCENARIO_ROOT containment check) before they write
  *   there: `write_ad_settings` before its `rm` and its `mkdir`,
  *   `_scenario_stand_in_settings` before its `write_file`.
- * - scenario.sh's Slack stub and stub MCP session helpers (harness additions,
+ * - scenario.sh's Slack stub, stub MCP session and queue readers (harness additions,
  *   b.jg5 SRJ-1306, b.deo SRI-1404), read and never run: `slack_stub_push`,
- *   `stub_session_deliveries` and `stub_session_call`
+ *   `stub_session_deliveries`, `stub_session_call` and `queue_accepted`
  *   (`IMAGE_GUARDED_STUB_HELPERS`) each run `require_ci_image`, called
  *   directly, as their first command after their declarations and outside any
  *   `if`, `||`, pipeline, background or subshell, and none runs
@@ -1708,7 +1708,7 @@ const IMAGE_GUARD_RULE = {
   realpathCheckFirst: 'realpath-check-before-write',
   /** The image-guarded TypeScript fixtures statically import only `node:` built-ins. */
   driverStaticImport: 'driver-static-import',
-  /** scenario.sh's Slack stub and stub MCP session helpers run `require_ci_image` as their first step after their declarations (b.deo SRI-1404). */
+  /** scenario.sh's Slack stub, stub MCP session and queue readers run `require_ci_image` as their first step after their declarations (b.deo SRI-1404). */
   helperImageCheckFirst: 'image-check-first-in-helper',
   /** The Slack stub, which has no marker check, statically imports only `node:` built-ins (b.deo SRI-1402). */
   stubStaticImport: 'stub-static-import',
@@ -3521,17 +3521,17 @@ describe(`${MCP_SESSION_END_HELPER}: both guards before its signal`, () => {
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: the Slack stub and stub MCP session helpers refuse outside the
+// Static audit: the Slack stub, stub MCP session and queue readers refuse outside the
 // /ci image (harness additions, b.jg5 SRJ-1306, b.deo SRI-1404)
 // ---------------------------------------------------------------------------
 
 /**
  * scenario.sh's helpers for the Slack stub's pushes and the stub MCP
- * session's records. They work in both modes, so none runs
+ * session's records, and durable queue records. They work in both modes, so none runs
  * `require_scenario_home` (shared mode has no scenario HOME); `/ci` always
  * carries the marker, so this static pin is the only proof of their refusal.
  */
-const IMAGE_GUARDED_STUB_HELPERS: readonly string[] = ['slack_stub_push', 'stub_session_deliveries', 'stub_session_call']
+const IMAGE_GUARDED_STUB_HELPERS: readonly string[] = ['slack_stub_push', 'stub_session_deliveries', 'stub_session_call', 'queue_accepted']
 
 /**
  * The image-check findings for `helpers` in the shell file `file`: the first
@@ -3630,11 +3630,11 @@ describe('static audit: the Slack stub and stub MCP session helpers run require_
 
   const source = readFileSync(SCENARIO_PATH, 'utf-8')
 
-  test('the current tree: slack_stub_push, stub_session_deliveries and stub_session_call each run require_ci_image first', () => {
+  test('the current tree: every shared-mode stub or queue helper runs require_ci_image first', () => {
     expect(helperImageCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), source)).toEqual([])
   })
 
-  test('the current tree: none of the three runs require_scenario_home, nor any function it calls, so each works in shared mode', () => {
+  test('the current tree: no shared-mode stub or queue helper runs require_scenario_home, nor any function it calls', () => {
     expect(homeGuardCallFindings(source, IMAGE_GUARDED_STUB_HELPERS)).toEqual([])
   })
 
