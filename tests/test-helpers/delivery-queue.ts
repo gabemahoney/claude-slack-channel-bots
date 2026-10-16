@@ -1,7 +1,7 @@
 /** Shared durable queue fixtures; all paths belong to the caller's scratch directory. */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { createDeliveryQueue, parseQueueRecord, type AcceptedInput, type DeliveryQueueOptions, type QueueRecord } from '../../src/delivery-queue.ts'
+import { createDeliveryQueue, parseQueueRecord, type AcceptedInput, type DeliveredRecord, type DeliveryQueueOptions, type QueueRecord } from '../../src/delivery-queue.ts'
 
 export const slackInput = (overrides: Partial<AcceptedInput> = {}): AcceptedInput => ({
   source: 'slack', text: 'message', channel: 'C0TEST001', channel_type: 'channel', user: 'U0TEST001',
@@ -26,4 +26,4 @@ export async function makeQueue(stateDir: string, options: Omit<DeliveryQueueOpt
   return queue
 }
 export const sentRecord = (seq = 1, attempt = 1, send_kind: 'text' | 'enter' | 'retype' = 'text'): QueueRecord => ({ v: 1, kind: 'sent', seq, attempt, part: 1, send_kind, at: 1000, launch_id: 'launch', session_id: 'session', transcript_path: '/scratch/transcript.jsonl', transcript_size: 0 })
-export const deliveredRecord = (seq = 1, at = 1000): QueueRecord => ({ v: 1, kind: 'delivered', seq, part: 1, at, receipt: { path: '/scratch/transcript.jsonl', uuid: 'receipt' } })
+export const deliveredRecord = (seq = 1, at = 1000): DeliveredRecord => ({ v: 1, kind: 'delivered', seq, part: 1, at, receipt: { path: '/scratch/transcript.jsonl', uuid: 'receipt' } })

@@ -15,6 +15,7 @@ import { isFrom, messageText, notYetOnTransient, tsAfter } from '../lib/human-se
 import { personaName, type PersonaLetter } from '../lib/personas.ts'
 import { waitFor, BRINGUP_TIMEOUT_MS, MINUTE, POLL_MS, REPLY_TIMEOUT_MS, SECOND } from '../lib/wait.ts'
 import type { CheckContext } from './context.ts'
+import { waitDeliveryLines } from './delivery-evidence.ts'
 import { Findings, type CheckDef } from './framework.ts'
 import {
   askAndWait,
@@ -363,8 +364,11 @@ export const check9: CheckDef<CheckContext> = {
       f.expect(byText.msg === 1 && byText.app === 1, `RAW lines for the message: message=${byText.msg} app_mention=${byText.app}, not one each`)
     }
     expectOneTag(f, await tags(ctx, 'a', x.ts), 'tags a TS', { via: 'mention', user_id: ctx.ids.humanUserId })
-    const disp = (await sinceGrep(ctx, m, `Dispatching to persona "persona_a" (key=persona_a) chat_id=${ctx.ids.coordination}`)).filter((l) => l.includes('reply with the word once'))
-    f.expect(disp.length === 1, `${disp.length} Dispatching lines for the message, not 1`)
+    // Acceptance and final receipt are correlated to this Slack event (b.omv SR-13.6).
+    for (const kind of ['message-received', 'message-delivered'] as const) {
+      const found = await waitDeliveryLines(ctx, m, kind, 'a', ctx.ids.coordination, x.ts)
+      f.expect(found.length === 1, `${found.length} correlated ${kind} lines for the message, not 1`)
+    }
     await pause(ctx, 30 * SECOND)
     const onces = (await personaPostsAfter(ctx, ctx.ids.coordination, x.ts)).filter((p) => isFrom(p, bot(ctx, 'a')) && /\bonce\b/i.test(messageText(p)))
     f.expect(onces.length === 1, `A replied "once" ${onces.length} times`)
@@ -415,8 +419,8 @@ export const check11: CheckDef<CheckContext> = {
   },
 }
 
-/** Log lines that carry a message's text (a RAW event prefix, a Dispatching line's `text=`): the step 5 search skips them. */
-const MESSAGE_TEXT_LINE_RE = /\[slack\] RAW [a-z_]+ event persona=|\[slack\] Dispatching to persona /
+/** RAW and first-typing dispatch excerpts carry message text; metadata diagnostics do not (b.omv SR-13.6). */
+const MESSAGE_TEXT_LINE_RE = /\[slack\] RAW [a-z_]+ event persona=|\[slack\] dispatch: persona=/
 
 /**
  * The known Slack rate-limit lines: the Web API library's retry and
@@ -551,8 +555,10 @@ export const check12: CheckDef<CheckContext> = {
       expectOneTag(f, await tags(ctx, 'b', laterA.ts), "tags b <A's later post>", { via: 'mention' })
       expectOneTag(f, await tags(ctx, 'a', laterB.ts), "tags a <B's later post>", { via: 'mention' })
       for (const [letter, post] of [['b', laterA], ['a', laterB]] as const) {
-        const disp = (await sinceGrep(ctx, m, `Dispatching to persona "${personaName(letter)}" (key=${personaName(letter)}) chat_id=${ids.coordination}`)).length
-        f.expect(disp >= 1, `no Dispatching line to ${personaName(letter)} (post ${post.ts})`)
+        for (const kind of ['message-received', 'message-delivered'] as const) {
+          const found = await waitDeliveryLines(ctx, m, kind, letter, ids.coordination, post.ts)
+          f.expect(found.length === 1, `${found.length} correlated ${kind} lines to ${personaName(letter)} for post ${post.ts}, not 1`)
+        }
       }
     }
     // Stop the exchange (step 4). From here on the stop is always lifted (step 6), even when a step throws.
@@ -643,8 +649,12 @@ export const check13: CheckDef<CheckContext> = {
     f.expect((await tags(ctx, 'b', w2)).length === 0, 'B received the unaddressed coordination message')
     const bDrops = await sinceGrep(ctx, m2, `persona "persona_b" (key=persona_b) dropped message from channel=${ids.coordination}`)
     f.expect(bDrops.some((l) => l.endsWith(`user=${ids.humanUserId}: not-mentioned`)), "no not-mentioned drop line for B")
-    const disp = await sinceGrep(ctx, m2, 'Dispatching to persona "persona_a"')
-    f.expect(disp.length === 2, `${disp.length} Dispatching lines for A, not 2`)
+    for (const [channel, ts] of [[ids.aHome, w1], [ids.coordination, w2]] as const) {
+      for (const kind of ['message-received', 'message-delivered'] as const) {
+        const found = await waitDeliveryLines(ctx, m2, kind, 'a', channel, ts)
+        f.expect(found.length === 1, `${found.length} correlated ${kind} lines for A in ${channel} ts=${ts}, not 1`)
+      }
+    }
     const paneNow = (await lines(ctx, "tmux list-panes -t slack_bot_persona_a -F '#{pane_pid}'"))[0] ?? ''
     f.expect(paneNow === paneBefore, 'A\'s pane process changed')
     f.expect((await rows(ctx)).filter((r) => r.persona === 'persona_a').length === 1, 'A does not have exactly one row')

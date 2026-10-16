@@ -32,6 +32,7 @@
 import { isFrom, messageText, tsAfter, type BotRef, type SlackMessage } from '../lib/human-session.ts'
 import { MINUTE, REPLY_TIMEOUT_MS, SECOND } from '../lib/wait.ts'
 import type { CheckContext } from './context.ts'
+import { deliveryLines, waitDeliveryLines } from './delivery-evidence.ts'
 import { expectOneTag, tagAttr } from './channel-checks.ts'
 import { Findings, skipped, type CheckDef } from './framework.ts'
 import {
@@ -339,7 +340,9 @@ export const check15: CheckDef<CheckContext> = {
     const dropped = (await sinceGrep(ctx, m, 'persona-dm-dropped:')).filter((l) => l.includes(`ts=${ts}`))
     const want = `[slack] persona-dm-dropped: personas[0] "persona_a" (key=persona_a): direct message in conversation ${aDm} ts=${ts} dropped: dm.enabled is off for this persona`
     f.expect(dropped.length === 1 && dropped[0]!.includes(want), `expected one persona-dm-dropped line naming persona_a, found ${dropped.length}`)
-    f.expect((await sinceGrep(ctx, m, 'Dispatching to persona "persona_a"')).filter((l) => l.includes(`chat_id=${aDm}`)).length === 0, 'A was dispatched the DM')
+    for (const kind of ['message-received', 'message-delivered'] as const) {
+      f.expect((await deliveryLines(ctx, m, kind, 'a', aDm, ts)).length === 0, `A has a ${kind} line for the disabled DM`)
+    }
     f.expect((await tags(ctx, 'a', ts)).length === 0, 'A received the DM')
     f.expect((await sinceGrepE(ctx, m, 'persona=persona_(b|c):')).filter((l) => l.includes(ts)).length === 0, "B's or C's connection saw the DM")
     const after = await human.everythingAfter(aDm, ts)
@@ -609,8 +612,14 @@ export const check21: CheckDef<CheckContext> = {
     const tagA = await tagstext(ctx, 'a', 'edit check')
     expectOneTag(f, tagA, "tagstext a 'edit check'", { via: 'mention', user_id: ctx.ids.humanUserId })
     f.expect((await tagstext(ctx, 'b', 'edit check')).length === 0, 'B received the edit')
-    const disp = (await sinceGrep(ctx, m, 'Dispatching to persona "persona_a"')).filter((l) => l.includes('edit check'))
-    f.expect(disp.length === 1, `${disp.length} Dispatching lines for the edit, not 1`)
+    // An edited event may carry an edited timestamp; use the received tag's identity (b.omv SR-13.6).
+    const deliveryTs = tagA[0] ? tagAttr(tagA[0], 'ts') : null
+    if (f.expect(deliveryTs !== null, 'the edit tag has no delivery timestamp')) {
+      for (const kind of ['message-received', 'message-delivered'] as const) {
+        const found = await waitDeliveryLines(ctx, m, kind, 'a', ctx.ids.coordination, deliveryTs!)
+        f.expect(found.length === 1, `${found.length} correlated ${kind} lines for the edit, not 1`)
+      }
+    }
     const edited = (await personaPostsAfter(ctx, ctx.ids.coordination, ts)).filter((x) => isFrom(x, bot(ctx, 'a')) && /\bedited\b/i.test(messageText(x)))
     f.expect(edited.length === 1, `A replied "edited" ${edited.length} times`)
     const byTs = await tags(ctx, 'a', ts)

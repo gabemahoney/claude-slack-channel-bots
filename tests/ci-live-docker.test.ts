@@ -190,7 +190,7 @@ import { isLiveRunnerPid, lockHolder, lockPid, nodeLockDeps, RunLock, type LockD
 import { AD_CLIENT_CHECK, AD_CLIENT_CHECK_SOURCE } from '../ci-live/lib/ad-client-check.ts'
 import { NotRunnableError } from '../ci-live/lib/secrets.ts'
 import { DEBUG_SKILL_PATH, meetsPhase1Floor, PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
-import { MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import { LIVE_CLAUDE_CODE_VERSION, MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { balancedAfter, callArguments, callsOf, indicesOf, objectProperties, onlyCallArguments, splitTopLevel, stripComments } from './test-helpers/source-audit.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 
@@ -271,7 +271,7 @@ describe('buildRunArgs and assertSafeRunArgs', () => {
       '--mount', `type=bind,source=${HOME}/.config/cscb-test/credentials,target=/home/testuser/.config/cscb-credentials,readonly`,
       '--env', 'ANTHROPIC_API_KEY', '--env', 'ANTHROPIC_BASE_URL', '--env', 'ANTHROPIC_MODEL',
       '--env', `CSCB_LIVE_TEST_HOST=${NAME}`,
-      'cscb-ci-live:v1',
+      'cscb-ci-live:v2',
     ])
     expect(() => assertSafeRunArgs(args, HOME)).not.toThrow()
   })
@@ -480,7 +480,7 @@ describe('buildRunArgs and assertSafeRunArgs', () => {
   test('buildImageArgs builds Dockerfile.live with the host uid and gid and the staged agent-director binary as a named build context', () => {
     expect(buildImageArgs({ repoRoot: '/repo', uid: 1000, gid: 1001, agentDirectorDir: '/tmp/ad-stage' })).toEqual([
       'build', '-f', '/repo/docker/Dockerfile.live', '--build-context', 'agent-director-bin=/tmp/ad-stage',
-      '--build-arg', 'HOST_UID=1000', '--build-arg', 'HOST_GID=1001', '-t', 'cscb-ci-live:v1', '/repo',
+      '--build-arg', 'HOST_UID=1000', '--build-arg', 'HOST_GID=1001', '-t', 'cscb-ci-live:v2', '/repo',
     ])
     expect(() => buildImageArgs({ repoRoot: '/repo', uid: 1000, gid: 1001 })).toThrow('needs the staged agent-director binary dir')
   })
@@ -3016,11 +3016,13 @@ describe("Dockerfile.live's Claude Code pin", () => {
   /** Dockerfile.live's text with its declaration's value replaced by `value`. */
   const withPin = (value: string): string => live().replace(`ARG ${CLAUDE_CODE_ARG}=${pinnedValue()}`, `ARG ${CLAUDE_CODE_ARG}=${value}`)
 
-  test('the live Slack image uses the fleet version; the former channel-dropping pin fails this choice (b.9v8)', () => {
-    const usesFleetVersion = (text: string) => pinnedValue(text) === MIN_CLAUDE_CODE_VERSION
-    expect(pinnedValue()).toBe(MIN_CLAUDE_CODE_VERSION)
-    expect(usesFleetVersion(live())).toBe(true)
-    expect(usesFleetVersion(withPin('2.1.296'))).toBe(false)
+  // b.omv SR-13.6: live coverage advances independently of the supported floor.
+  test('the live Slack image uses the E9 target; the former minimum-version pin is refused', () => {
+    const usesLiveTarget = (text: string) => pinnedValue(text) === LIVE_CLAUDE_CODE_VERSION
+    expect(pinnedValue()).toBe(LIVE_CLAUDE_CODE_VERSION)
+    expect(usesLiveTarget(live())).toBe(true)
+    expect(usesLiveTarget(withPin(MIN_CLAUDE_CODE_VERSION))).toBe(false)
+    expect(semver.gt(LIVE_CLAUDE_CODE_VERSION, MIN_CLAUDE_CODE_VERSION)).toBe(true)
   })
 
   test('Dockerfile.live declares CLAUDE_CODE_VERSION once, a plain release at or above MIN_CLAUDE_CODE_VERSION, and installs Claude Code only at it; a pin one patch below MIN_CLAUDE_CODE_VERSION is refused', () => {

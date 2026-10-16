@@ -566,7 +566,7 @@ tests/
                                    # servers (see fmk scenario list). Its legs: a renamed session, another TMUX_TMPDIR, a re-bound socket, a restarted tmux
                                    # server (health ticks for that leg only), remain-on-exit, a `pending` row with no launch start, and no CSCB-parented
                                    # tmux line. It runs at agent-director's default settings, holds past the outage's third retry and runs about 22 minutes
-    test-29-invited-channels.sh    # b.deo SRI-1401 to SRI-1410, AC 45, shared mode, live against the Slack stub: a 0.11.x configuration; fungible mode switched on and exercised; the stored choice across a restart; fungible mode switched off
+    test-29-invited-channels.sh    # b.deo SRI-1401 to SRI-1410, AC 45, shared mode, live against the Slack stub: a 0.11.x configuration; fungible mode switched on and exercised; the stored choice across a restart; fungible mode switched off; exact received-log acceptance set, paired-event dedupe, shared recipients and direct DM evidence (b.omv SR-13.6)
     test-30-state-dir-upgrade.sh   # b.smv, shared mode, dry run: the state directory's first start of this build from each layout an earlier release left,
                                    # each in a fresh HOME under SCENARIO_ROOT (the container's agent-director install linked in) with no SLACK_STATE_DIR or
                                    # XDG_CONFIG_HOME: up to 0.13 (only ~/.claude/channels/slack), 0.14.0 (that, plus ~/.config/cscb holding only the crontable
@@ -574,6 +574,8 @@ tests/
                                    # ~/.config/claude-slack-channel-bots. Each layout checks the files at the new directory, each old name a link to it (the
                                    # 0.15.0 link to ~/.config/cscb repointed straight at it), exactly the layout's `state-migrate:` lines and no state-migrate
                                    # warning, and that the CLI's `stop` finds the server
+    test-31-fmk-ack-burst.sh       # b.omv SR-13.6 / AC75, fmk mode: 1,000 concurrent Slack events for one silent stub persona, every actual WebSocket ACK
+                                   # within 3,000 ms of its pre-send monotonic timestamp; exactly 1,000 items remain outstanding with no typing, receipts or model calls
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
@@ -590,7 +592,7 @@ tests/
                                    # for the dialog approvers to stop (`stopAllDialogApprovers`) before it prints its outcome and exits, so no agent-director
                                    # call it caused is in flight; refuses to run without the image marker /etc/cscb-ci-image and imports the installed package
                                    # only after that check
-      fmk-texts.ts                 # the one value printer of the fmk scenarios and Test 29: prints the installed package's own export (a constant, or a builder's output for
+      fmk-texts.ts                 # the one value printer of the fmk scenarios and Tests 29 and 31: prints the installed package's own export (a constant, or a builder's output for
                                    # the given arguments) by entry name, so no script retypes a value src/ exports; refuses to run without the image marker
                                    # /etc/cscb-ci-image and imports the package only after that check (see The value printer)
       ad-version-stand-in.sh       # scenarios 8 and 23's agent-director version stand-in, behind the shim: reports a chosen version (or none a client parses), can turn the
@@ -3305,15 +3307,17 @@ Any other method on `/_push` answers 404, as an unknown path does.
 
 The record gains two line kinds:
 
-- `{"event":"push","label","envelope_id","event_type","channel","channel_type","flag","flag_value"}`,
+- `{"event":"push","label","envelope_id","connection_id","sent_mono_ms","event_ts","event_type","channel","channel_type","flag","flag_value"}`,
   once per sent push, written right after the send and so before CSCB's
-  ack. `event_type`, `channel`
+  ack. `event_ts` is the Slack event's timestamp. `event_type`, `channel`
   and `channel_type` are the event's `type`, `channel` and `channel_type`
   (null when not a string). `flag` is `false`, `true`, `non-boolean` or
   `absent`, and `flag_value` the JSON text of the flag as sent (`"true"`,
   `"\"yes\""`, `"null"`, …), null when the flag is left out. The line
   carries no `event_id`. CSCB's ack is not a `push` line: it is the existing
-  `ws-message` line carrying the push's `envelope_id`.
+  `ws-message` line carrying the push's `envelope_id`, `connection_id` and
+  `ack_mono_ms`. `connection_id` is a generated UUID independent of tickets
+  or credentials, shared by that socket's push and ACK records.
 - `{"event":"push-refused","label","reason"}`, once per refused push, its
   `reason` the answer's `error` and its `label` null when the push named
   none.
@@ -3332,10 +3336,55 @@ opens an MCP session. An fmk script's start finds the copy `scenario.sh` put
 first on its PATH, with the stub's MCP session client beside it.
 
 Test 29 starts the stub with `--record` and `--control`, as Tests 10 and 12
-do, and is the scenario that exercises the push control, the session's
-delivery record and its tool calls end to end: `slack_stub_push` sends each
-event, `stub_session_deliveries` shows what reached the persona, and
-`stub_session_call` calls `set_channel_delivery`.
+do. `slack_stub_push` sends each event; `queue_accepted` reads durable
+acceptance from the persona's queue, and `stub_session_call` calls
+`set_channel_delivery`. Acceptance alone does not prove transcript delivery.
+The scenario waits for all fixed parts' receipts before its restart, saves
+the pre-restart acceptances, and checks the retained dedupe facts after
+startup compaction.
+
+For b.omv SR-13.6, Test 29 reads every `server.log*` after the writers stop
+and compares the exact `message-received` Counter against its complete
+accepted set by persona, source, conversation, timestamp and sender. It
+requires one diagnostic for each accepted item, none for refused inputs or
+nonrecipients, one total for a paired `message` / `app_mention` input, and one for each
+shared recipient. `via` is checked in queue evidence. The direct-DM E5 export keeps
+received/delivered metadata, queue receipt metadata and the matching actual
+transcript tag before cleanup.
+
+### Slack acknowledgement burst (b.omv SR-13.6 / AC75)
+
+`test-31-fmk-ack-burst.sh` runs through `/ci` containers with one silent
+stub bot and production delivery timers. It submits 1,000 distinct events
+concurrently, without waiting for an ACK between submissions. Each has a
+unique envelope ID and event ID; the intended channel/timestamp set must
+match all 1,000 durable acceptances exactly.
+
+For every event, elapsed time is `ack_mono_ms - sent_mono_ms` on the Slack
+stub process's monotonic clock. The start is captured immediately before
+WebSocket send; the end is captured when the actual WebSocket ACK arrives,
+before parsing or record I/O. The check matches envelope ID, socket UUID
+and persona label, requires send-before-ACK record order, and rejects
+missing, duplicated, mismatched or late ACKs. Every elapsed time must be
+between 0 and 3,000 ms; the 30-second observation deadline does not relax
+that bound. The `/_push` HTTP response proves submission only.
+
+The script prints the measurement line below and a final elapsed wall time:
+
+```text
+ACK burst: sent=1000 acked=1000 outstanding=1000 max_ms=<measured maximum>
+```
+Successful completion deliberately retains exactly 1,000 outstanding items
+through server shutdown until scratch cleanup. It asserts no typing,
+connected MCP session, receipt, delivered diagnostic or receipt reaction;
+the silent bot makes no model calls. This proves Slack acknowledgement
+latency and retained intake under load. Queue-store accept p99 and
+real-agent transcript latency have separate proofs.
+
+Record the measured script duration from the container `/ci` run; no
+measurement is inferred from unit checks. An absent duration-table entry
+uses the runner's default estimate until that run supplies its refresh
+block (see [The duration table](#the-duration-table)).
 
 ### Verdict file format
 

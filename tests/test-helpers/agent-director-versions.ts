@@ -28,7 +28,7 @@
  * `MIN_CLAUDE_CODE_VERSION` is CSCB's supported minimum with agent-director
  * 0.12.0, and the version the fleet runs (b.9v8). This helper is its one definition: no `src/` module defines or
  * reads a Claude Code version, and every test that needs it (a fixture's
- * recorded version, the runbook, docs and `Dockerfile.live` pin checks)
+ * recorded version, the runbook and supported-minimum docs)
  * imports it from here. `tests/ad-version-gate.test.ts` checks that no other
  * `tests/` TypeScript file, and no `src/` TypeScript file, writes its value
  * in code (comments stripped).
@@ -68,6 +68,9 @@ export const DEV_UNPARSEABLE_VERSION = 'dev'
  * this value is written in `tests/` or `src/` code.
  */
 export const MIN_CLAUDE_CODE_VERSION = '2.1.280'
+
+/** The independent /ci-live target (b.omv SR-13.6), not the supported minimum. */
+export const LIVE_CLAUDE_CODE_VERSION = '2.1.296'
 
 /** The frozen 0.11.0 runbooks' Claude Code version, independent of today's supported floor. */
 export const HISTORICAL_PHASE1_CLAUDE_CODE_VERSION = '2.1.280'

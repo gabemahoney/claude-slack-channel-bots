@@ -19,7 +19,7 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   tags it only `cscb-ci-run:<RUN_ID>-<PID>-test`, and removes it at the run's
   end (see [The run's images and tags](#the-runs-images-and-tags)). The build
   should complete in under 10 s on a warm base.
-- **`cscb-ci-live:v1`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v7`)
+- **`cscb-ci-live:v2`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v7`)
   — the `/ci-live` image (see [/ci-live](#ci-live-the-live-slack-acceptance-run)
   below). It adds Claude Code at a pinned version with auto-update off, the
   agent-director binary the runner stages, checked against the release's
@@ -308,7 +308,7 @@ still name it keep using it.
 
 ## When to bump the live image version
 
-Bump `cscb-ci-live`'s numbered tag (e.g. `v1` → `v2`) when changing
+Bump `cscb-ci-live`'s numbered tag (e.g. `v2` → `v3`) when changing
 `docker/Dockerfile.live`'s `CLAUDE_CODE_VERSION` pin. Update `LIVE_IMAGE` in
 `ci-live/lib/docker.ts` and every live-image tag in this file together.
 `/ci-live` builds the live image on every run; the numbered tag identifies
@@ -655,7 +655,7 @@ The sweep never touches:
 - anything whose owner is alive;
 - any `cscb-live=1` container, or any container without `cscb-ci=1`;
 - any other tag shape, such as `cscb-ci:latest`, `cscb-ci-base:v7`,
-  `cscb-ci-live:v1` or a lane tag like `cscb-ci-l5:m5`;
+  `cscb-ci-live:v2` or a lane tag like `cscb-ci-l5:m5`;
 - an image that still has a tag, or an image with no owner label;
 - any file beside the lock but a dead owner's reservation;
 - the run directories of swept runs, which are kept.
@@ -1037,7 +1037,7 @@ tag goes and no container, even a stopped one, uses it.
 Cleanup and the sweep never touch:
 
 - `cscb-ci:latest`, the base tag (the one `docker/Dockerfile.test`'s `FROM`
-  line names) or `cscb-ci-live:v1`;
+  line names) or `cscb-ci-live:v2`;
 - lane tags, such as `cscb-ci-l5:m5`, or the `cscb-ci-warm:*` tags of
   [Verifying warm-cache parity](#verifying-warm-cache-parity);
 - any image that still has a tag, any image without an owner label, a live
@@ -1446,9 +1446,9 @@ checks against it.
   `no agent-director binary to stage in the live image: none was given with --agent-director-binary, and none was found at ~/.config/agent-director/bin/agent-director or on PATH; give the binary to stage with --agent-director-binary <path>, then rerun`.
 
 **Claude Code.** The live image installs Claude Code at the build arg
-`CLAUDE_CODE_VERSION`, pinned at `2.1.280` in `docker/Dockerfile.live`; the
-runner passes no override. `2.1.280` is CSCB's supported minimum and the
-fleet version used for real Slack channel delivery. agent-director's hooks
+`CLAUDE_CODE_VERSION`, pinned at `2.1.296` in `docker/Dockerfile.live`; the
+runner passes no override. The live checks exercise typed delivery with this
+version. agent-director's hooks
 are exec form, which Claude Code runs from `2.1.139`.
 
 ### Secrets

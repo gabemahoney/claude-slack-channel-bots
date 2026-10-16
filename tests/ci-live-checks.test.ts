@@ -37,7 +37,7 @@
  *   agent-director store;
  * - 29a fails on any token-shaped or credential count, on a host-side scan
  *   finding, on missing output, and on a persona this run brought up and
- *   dispatched a message to that has no transcript; an empty or malformed
+ *   delivered a message to that has no transcript; an empty or malformed
  *   count is a parse failure (NaN), never 0, so it never skips a scan or a
  *   persona's transcript;
  * - Checks 16 and 20 ask A for the outbound call at most twice: a second ask
@@ -163,6 +163,8 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { buildMessagesWaitingNotice, deliveryAge } from '../src/delivery-notices.ts'
+import { queueEvidence, queueEvidenceScript, type QueueEvidence } from '../ci-live/checks/delivery-evidence.ts'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
 import { channelModeOf, DM_DESTINATION, MCP_SERVER_NAME, parsePersonaConfigBytes, PERSONA_ENTRY_KEYS, PERSONA_INVITED_KEYS, PERSONA_TOP_LEVEL_KEYS } from '../src/config.ts'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -228,8 +230,10 @@ import type { CheckPromptGuard, PromptExpectation } from '../ci-live/checks/prom
 import {
   callsTo,
   check14,
+  check15,
   check16,
   check20,
+  check21,
   check23,
   CHECK18_PROMPT,
   CHECK22_PROMPT,
@@ -281,6 +285,10 @@ import {
   type Row,
 } from '../ci-live/checks/helpers.ts'
 import {
+  check24,
+  check24Setup,
+  check24Teardown,
+  check24WaitingNotice,
   check27,
   check28,
   CHECK27_PROMPT,
@@ -365,6 +373,7 @@ import { personaName, type PersonaLetter } from '../ci-live/lib/personas.ts'
 import { MINUTE, SECOND } from '../ci-live/lib/wait.ts'
 import { emptyAppsState } from '../ci-live/lib/apps-state.ts'
 import { cannedErr, errTmuxKillFailed, type StubClientOptions } from './test-helpers/agent-director-stub.ts'
+import { deliveredRecord, makeQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { virtualClock } from './test-helpers/ci-live.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
@@ -820,8 +829,8 @@ describe('the check list', () => {
     expect(runs(['workspace', 'claude'], ['S2'])).toEqual(['preflight', 'install', 'setup', 'S2', '1', '29a', 'teardown', 'HOST'])
   })
 
-  test('the setup checks and Check 1 are blocking', () => {
-    expect(PLAN_CHECKS.filter((c) => c.blocking).map((c) => c.id)).toEqual(['preflight', 'install', 'setup', '1'])
+  test('the setup checks, Check 1 and original-item recovery are blocking', () => {
+    expect(PLAN_CHECKS.filter((c) => c.blocking).map((c) => c.id)).toEqual(['preflight', 'install', 'setup', '1', '24-teardown'])
   })
 
   test("Part 11's invited-channel checks run 30 to 34 in order, after every Check 28 entry and before the closing 29a and 29b (b.deo SRI-1501)", () => {
@@ -1219,24 +1228,24 @@ describe('Check 29a', () => {
     expect(parseCount(value)).toEqual(expected)
   })
 
-  describe('a transcript for each persona this run brought up and dispatched a message to', () => {
+  describe('a transcript for each persona this run brought up and delivered a message to', () => {
     const counts = { PERSONA_a: '1 3', PERSONA_b: '2 1', PERSONA_c: '1 1', PERSONA_d: '0 0' }
     const real = (over: Record<string, string | undefined>, broughtUp: CheckContext['shared']['broughtUp'], t = ['tokens checked: 6']) =>
       run(lines({ TRANSCRIPTS: '4', ...counts, ...over }, { t }), { mode: 'real', shared: { broughtUp } })
 
-    test('passes with one per dispatched persona; a persona brought up but never dispatched to needs none, and is noted', async () => {
+    test('passes with one per delivered persona; a persona brought up but never delivered to needs none, and is noted', async () => {
       const r = await real({}, ['a', 'b', 'c', 'd'])
       expect([r.status, r.reason]).toEqual(['PASS', undefined])
-      expect(r.evidence).toContain('persona d: 0 transcript(s), 0 dispatched message(s)')
-      expect(r.notes).toContain('Check 29a: persona d was brought up but no message was dispatched to it, so no transcript is required')
+      expect(r.evidence).toContain('persona d: 0 transcript(s), 0 delivered message(s)')
+      expect(r.notes).toContain('Check 29a: persona d was brought up but no message was confirmed delivered to it, so no transcript is required')
     })
 
     test.each([
-      ['a dispatched persona with no transcript', { PERSONA_b: '0 2' }, ['a', 'b', 'c'], 'persona b was brought up and sent 2 message(s), but has no transcript'],
+      ['a delivered persona with no transcript', { PERSONA_b: '0 2' }, ['a', 'b', 'c'], 'persona b was brought up and sent 2 message(s), but has no transcript'],
       ['D brought up by Check 25 with no transcript', { PERSONA_d: '0 1' }, ['a', 'b', 'c', 'd'], 'persona d was brought up and sent 1 message(s), but has no transcript'],
       ['no count printed for a persona brought up', { PERSONA_c: undefined }, ['c'], 'persona c: no transcript count'],
-      ['an empty count', { PERSONA_a: '' }, ['a'], 'persona a: empty transcript count (PERSONA_a is empty, not "<transcripts> <dispatched>")'],
-      ['a malformed count (one number)', { PERSONA_c: '3' }, ['c'], 'persona c: malformed transcript count (PERSONA_c is not "<transcripts> <dispatched>")'],
+      ['an empty count', { PERSONA_a: '' }, ['a'], 'persona a: empty transcript count (PERSONA_a is empty, not "<transcripts> <delivered>")'],
+      ['a malformed count (one number)', { PERSONA_c: '3' }, ['c'], 'persona c: malformed transcript count (PERSONA_c is not "<transcripts> <delivered>")'],
     ] as const)('fails on %s', async (_what, over, broughtUp, reason) => {
       const r = await real(over, [...broughtUp])
       expect([r.status, r.reason]).toEqual(['FAIL', reason])
@@ -1244,8 +1253,8 @@ describe('Check 29a', () => {
 
     test('an empty count is not read as "0 0" (no transcript required): no evidence line and no note for that persona', async () => {
       const r = await real({ PERSONA_b: '' }, ['a', 'b'])
-      expect([r.status, r.reason]).toEqual(['FAIL', 'persona b: empty transcript count (PERSONA_b is empty, not "<transcripts> <dispatched>")'])
-      expect(r.evidence.filter((l) => /^persona [a-d]:/.test(l))).toEqual(['persona a: 1 transcript(s), 3 dispatched message(s)'])
+      expect([r.status, r.reason]).toEqual(['FAIL', 'persona b: empty transcript count (PERSONA_b is empty, not "<transcripts> <delivered>")'])
+      expect(r.evidence.filter((l) => /^persona [a-d]:/.test(l))).toEqual(['persona a: 1 transcript(s), 3 delivered message(s)'])
       expect((r.notes ?? []).filter((n) => n.includes('persona b'))).toEqual([])
     })
 
@@ -1274,9 +1283,9 @@ describe('Check 29a', () => {
 
     test.each([
       ['no line at all', undefined, 'persona a: no transcript count'],
-      ['an empty value', '', 'persona a: empty transcript count (PERSONA_a is empty, not "<transcripts> <dispatched>")'],
-      ['a blank value', ' \t', 'persona a: empty transcript count (PERSONA_a is empty, not "<transcripts> <dispatched>")'],
-      ['anything else', '3', 'persona a: malformed transcript count (PERSONA_a is not "<transcripts> <dispatched>")'],
+      ['an empty value', '', 'persona a: empty transcript count (PERSONA_a is empty, not "<transcripts> <delivered>")'],
+      ['a blank value', ' \t', 'persona a: empty transcript count (PERSONA_a is empty, not "<transcripts> <delivered>")'],
+      ['anything else', '3', 'persona a: malformed transcript count (PERSONA_a is not "<transcripts> <delivered>")'],
     ])('personaCountsProblem: %s', (_what, value, reason) => {
       expect(personaCountsProblem('a', value)).toBe(reason)
     })
@@ -1328,6 +1337,11 @@ describe('Check 29a', () => {
 const A = DRY_RUN_IDS.bots.a
 const COORD = DRY_RUN_IDS.coordination
 
+/** Metadata-only typed-delivery evidence (b.omv SR-13.6). */
+function deliveryLog(kind: 'message-received' | 'message-delivered', letter: PersonaLetter, channel: string, ts: string, sender = DRY_RUN_IDS.humanUserId): string {
+  return `[slack] ${kind}: persona="persona_${letter}" (key=persona_${letter}) source=slack chat_id=${JSON.stringify(channel)} ts=${JSON.stringify(ts)} sender_id=${JSON.stringify(sender)}`
+}
+
 /** A live-run context: the human session over `canned` bot messages, the container answering `answers`. */
 function liveCtx(canned: Record<string, CannedMessage[]>, answers: ReadonlyArray<readonly [string, Reply]>): CheckContext {
   const clock = virtualClock()
@@ -1370,10 +1384,11 @@ describe('Check 9: one mention is delivered once', () => {
   const HUMAN_TS = '1700000100.000001'
   const raw = (kind: 'message' | 'app_mention', withTs: boolean) =>
     `[slack] RAW ${kind} event persona=persona_a: {"user":"${DRY_RUN_IDS.humanUserId}","text":"<@${A.userId}> ${TEXT}"${withTs ? `,"ts":"${HUMAN_TS}"` : ''}`
-  const run = (rawLines: string[]) =>
+  const run = (rawLines: string[], evidence: Partial<Record<'message-received' | 'message-delivered', string>> = {}) =>
     check9.run(
       liveCtx({ [COORD]: [{ ts: '1700000200.000001', text: 'once', user: A.userId }] }, [
-        ['Dispatching to persona', `[slack] Dispatching to persona "persona_a" (key=persona_a) chat_id=${COORD} text=<@${A.userId}> ${TEXT}`],
+        ['message-received:', evidence['message-received'] ?? deliveryLog('message-received', 'a', COORD, HUMAN_TS)],
+        ['message-delivered:', evidence['message-delivered'] ?? deliveryLog('message-delivered', 'a', COORD, HUMAN_TS)],
         ['persona=persona_a:', rawLines.join('\n')],
         [`tags a '${HUMAN_TS}'`, `<channel source="slack" chat_id="${COORD}" user_id="${DRY_RUN_IDS.humanUserId}" via="mention">`],
         ['mark', '1:0'],
@@ -1392,6 +1407,311 @@ describe('Check 9: one mention is delivered once', () => {
     expect(byText.notes).toContain('Check 9: RAW lines matched by ts: message=0 app_mention=0; by the message text: message=1 app_mention=1')
     const twice = await run([raw('message', false), raw('message', false), raw('app_mention', false)])
     expect([twice.status, twice.reason]).toEqual(['FAIL', 'RAW lines for the message: message=2 app_mention=1, not one each'])
+  })
+  // b.omv SR-13.6: RAW events and a reply cannot replace correlated final evidence.
+  test.each((['message-received', 'message-delivered'] as const).flatMap((kind) => [
+    [kind, 'missing', ''],
+    [kind, 'duplicated', [deliveryLog(kind, 'a', COORD, HUMAN_TS), deliveryLog(kind, 'a', COORD, HUMAN_TS)].join('\n')],
+    [kind, 'another persona', deliveryLog(kind, 'b', COORD, HUMAN_TS)],
+    [kind, 'another conversation', deliveryLog(kind, 'a', DRY_RUN_IDS.aHome, HUMAN_TS)],
+    [kind, 'another timestamp', deliveryLog(kind, 'a', COORD, `${HUMAN_TS}0`)],
+  ] as const))('%s evidence that is %s fails', async (kind, _name, evidence) => {
+    const r = await run([raw('message', true), raw('app_mention', true)], { [kind]: evidence })
+    expect(r.status).toBe('FAIL')
+    expect(r.reason).toContain(`correlated ${kind} lines for the message, not 1`)
+    assertNoLeak(r)
+  })
+})
+
+// b.omv SR-13.6: the live observer must prove durable acceptance and recover
+// the original FIFO head; a successful later Slack probe is not that proof.
+describe('Check 24: typed-delivery waiting and original-item recovery', () => {
+  const TS = '1700000100.000001'
+  const MARK = '1:0'
+  const tag = `<channel source="slack-channel-router" chat_id="${COORD}" ts="${TS}" user_id="${DRY_RUN_IDS.humanUserId}" via="mention">`
+  const outstanding: QueueEvidence = { accepted: 1, compacted: 0, seqs: [7], outstanding: 1, confirmed: 0, sent: 0, receipts: 0, totalOutstanding: 1 }
+  const completed: QueueEvidence = { ...outstanding, outstanding: 0, confirmed: 1, sent: 2, receipts: 1, totalOutstanding: 0 }
+  interface Options {
+    notice?: string
+    noticeUser?: string
+    home?: CannedMessage[]
+    coord?: CannedMessage[]
+    received?: string[]
+    extraLog?: string[]
+    queue?: Partial<QueueEvidence>
+    transcript?: string
+    recoveryLog?: string[]
+    reactionUser?: string
+    original?: boolean
+    seq?: number
+    origDelay?: string
+  }
+  function scenario(opts: Options = {}, recovery = false) {
+    const clock = virtualClock()
+    const notice = { ts: '1700000200.000001', text: opts.notice ?? check24WaitingNotice('2m'), user: opts.noticeUser ?? A.userId }
+    const workspace = scriptedHuman(clock, { [DRY_RUN_IDS.aHome]: opts.home ?? [notice], [COORD]: opts.coord ?? [] })
+    const api: HumanApi = { call: async (method, params) => {
+      const answer = await workspace.api.call(method, params)
+      if (method === 'conversations.history' && params?.latest === TS && opts.reactionUser) {
+        return { ...answer, messages: [{ ts: TS, text: 'waiting-message check waiting-marker-7Q3Z', user: DRY_RUN_IDS.humanUserId, reactions: [{ name: 'eyes', users: [opts.reactionUser] }] }] }
+      }
+      return answer
+    } }
+    const log = recovery ? [...startLog(100).map(([, l]) => l),
+      '[slack] reload-applied: server-wide settings: 1 changed)',
+      ...(opts.recoveryLog ?? [deliveryLog('message-delivered', 'a', COORD, TS)])] : [
+      '[slack] Session disconnected: persona "persona_a" (key=persona_a)',
+      '[slack] Auto-restart disabled (delay=0) — skipping restart for persona=persona_a',
+      ...(opts.received ?? [deliveryLog('message-received', 'a', COORD, TS)]), ...(opts.extraLog ?? []),
+    ]
+    const preview = [PENDING_HEADER, `fingerprint: sha256:${'a'.repeat(64)}`, '', previewHeader({ settings: 1 }),
+      'server-wide setting session_restart_delay changed: once applied, it is recorded and takes effect at the next server start after that.'].join('\n')
+    const c = fakeContainer([['', (script) => {
+      if (script === 'mark') return MARK
+      if (script === 'rows') return 'cscb_persona_a persona_a ended'
+      if (script === 'showpending') return preview
+      if (script.startsWith('[ -e ')) return { code: 1 }
+      if (script.includes('jq -c .session_restart_delay')) return '0'
+      if (script.includes("jq -c '.session_restart_delay'")) return opts.origDelay ?? 'null'
+      if (script.includes("jq -r '.ack_reaction'")) return 'eyes'
+      if (script.includes('jq -sc --arg channel')) return JSON.stringify({ ...(recovery ? completed : outstanding), ...opts.queue })
+      if (script.startsWith('tags a ')) return opts.transcript ?? (recovery ? tag : '')
+      return sinceOver(script, log) ?? ''
+    }]])
+    const ctx = makeCtx({ mode: 'real', clock, human: new HumanSession(api, clock), container: c.container,
+      shared: recovery ? { origDelay: opts.origDelay ?? 'null', ...(opts.original === false ? {} : { waitingMessage: { ts: TS, seq: opts.seq ?? 7, mark: MARK } }) } : {} })
+    return { ctx, ...c, workspace }
+  }
+
+  test.each([0, 59 * SECOND, 2 * MINUTE, 75 * MINUTE])('the copied waiting notice matches the production builder at age %p', (age) => {
+    expect(check24WaitingNotice(deliveryAge(age))).toBe(buildMessagesWaitingNotice('"persona_a" (key=persona_a)', 1, age, 'down with automatic restarts off'))
+  })
+
+  test('accepted outstanding item, exact destination notice and no early receipt or reaction pass', async () => {
+    const s = scenario()
+    const r = await check24.run(s.ctx)
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    expect(s.ctx.shared.waitingMessage).toEqual({ ts: TS, seq: 7, mark: MARK })
+    expect(s.workspace.posts).toHaveLength(1)
+    expect(s.workspace.posts[0]!.channel).toBe(COORD)
+    expect(s.scripts.some((x) => /Dispatching|Message lost/.test(x))).toBe(false)
+    assertNoLeak(r)
+  })
+
+  test.each([
+    ['missing acceptance', { received: [] }, '0 correlated message-received'],
+    ['wrong persona', { received: [deliveryLog('message-received', 'b', COORD, TS)] }, '0 correlated message-received'],
+    ['wrong conversation', { received: [deliveryLog('message-received', 'a', DRY_RUN_IDS.aHome, TS)] }, '0 correlated message-received'],
+    ['wrong timestamp', { received: [deliveryLog('message-received', 'a', COORD, `${TS}0`)] }, '0 correlated message-received'],
+    ['wrong sender', { received: [deliveryLog('message-received', 'a', COORD, TS, DRY_RUN_IDS.bots.b.userId)] }, 'acceptance names another sender'],
+    ['duplicate acceptance', { received: [deliveryLog('message-received', 'a', COORD, TS), deliveryLog('message-received', 'a', COORD, TS)] }, '2 correlated message-received'],
+    ['missing queue acceptance', { queue: { accepted: 0, seqs: [] } }, 'not the single durably accepted'],
+    ['another outstanding item', { queue: { totalOutstanding: 2 } }, 'not the single durably accepted'],
+    ['premature send', { queue: { sent: 1 } }, 'has a send or receipt'],
+    ['premature receipt', { queue: { receipts: 1, confirmed: 1 } }, 'has a send or receipt'],
+    ['premature completion', { extraLog: [deliveryLog('message-delivered', 'a', COORD, TS)] }, 'message-delivered line appeared before recovery'],
+    ['premature transcript', { transcript: tag }, 'message was delivered to A'],
+    ['restart scheduled', { extraLog: ['[slack] Scheduling restart for persona=persona_a'] }, 'restart was scheduled'],
+    ['persona restarted', { extraLog: ['[slack] Session connected: persona "persona_a" (key=persona_a)'] }, 'A restarted before recovery'],
+    ['destination failure', { extraLog: ['[slack] persona-destination-failed: persona_a'] }, 'persona-destination-failed line appeared'],
+    ['wrong waiting count', { notice: check24WaitingNotice('2m').replace('1 message(s)', '2 message(s)') }, 'not the exact fixed Messages waiting text'],
+    ['wrong down state', { notice: check24WaitingNotice('2m').replace('down with automatic restarts off', 'latched') }, 'not the exact fixed Messages waiting text'],
+    ['duplicate notice', { home: [1, 2].map((n) => ({ ts: `1700000200.00000${n}`, text: check24WaitingNotice('2m'), user: A.userId })) }, '2 waiting notice(s)'],
+    ['notice for another persona', { notice: check24WaitingNotice('2m').replaceAll('persona_a', 'persona_b') }, 'not the exact fixed Messages waiting text'],
+    ['notice from another bot', { noticeUser: DRY_RUN_IDS.bots.b.userId }, '0 waiting notice(s)'],
+    ['missing notice', { home: [] }, '0 waiting notice(s)'],
+    ['wrong destination', { home: [], coord: [{ ts: '1700000200.000001', text: check24WaitingNotice('2m'), user: A.userId }] }, 'post(s) in coordination'],
+    ['body in notice', { notice: `${check24WaitingNotice('2m')} waiting-marker-7Q3Z` }, 'notice carries the message text'],
+    ['sender mention in notice', { notice: `${check24WaitingNotice('2m')} <@${DRY_RUN_IDS.humanUserId}>` }, 'notice @-mentions the sender'],
+    ['early own reaction', { reactionUser: A.userId }, "message got A's ack_reaction"],
+  ] satisfies [string, Options, string][])('%s fails while retaining the original item for teardown', async (_name, opts, reason) => {
+    const s = scenario(opts)
+    const r = await check24.run(s.ctx)
+    expect(r.status).toBe('FAIL')
+    expect(r.reason).toContain(reason)
+    expect(s.ctx.shared.waitingMessage?.ts).toBe(TS)
+    assertNoLeak(r)
+  })
+
+  test('a different persona reaction does not stand in for A', async () => {
+    const r = await check24.run(scenario({ reactionUser: DRY_RUN_IDS.bots.b.userId }).ctx)
+    expect(r.status).toBe('PASS')
+    assertNoLeak(r)
+  })
+
+  test.each(['null', '30'])('setup records original delay %s, confirms restarts off and performs a guarded restart', async (origDelay) => {
+    const s = scenario({ origDelay }, true)
+    s.ctx.shared = {}
+    const r = await check24Setup.run(s.ctx)
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    expect(s.ctx.shared.origDelay).toBe(origDelay)
+    expect(s.scripts).toContain(`guard || exit 90\njq '.session_restart_delay = 0' "$S/config.json" > "$S/config.json.tmp" && mv "$S/config.json.tmp" "$S/config.json"`)
+    assertNoLeak(r)
+  })
+
+  test.each([
+    ['full completed journal', {}],
+    ['compacted delivered key', { accepted: 0, compacted: 1, sent: 0, receipts: 0 }],
+  ] satisfies [string, Partial<QueueEvidence>][])('restoring configuration confirms the ORIGINAL item via %s', async (_name, queue) => {
+    const s = scenario({ queue }, true)
+    const r = await check24Teardown.run(s.ctx)
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    expect(r.evidence).toContain(`original item ts=${TS} seq=7 confirmed; outstanding=0`)
+    expect(s.workspace.posts).toEqual([])
+    expect(s.scripts.some((x) => x.includes("jq 'del(.session_restart_delay)'"))).toBe(true)
+    expect(s.scripts).toContain('guard || exit 90\nclaude-slack-channel-bots stop')
+    expect(s.scripts).toContain('guard || exit 90\nclaude-slack-channel-bots start')
+    assertNoLeak(r)
+  })
+
+  test.each([
+    ['no original item recorded', { original: false }, 'original Check 24 item was not recorded'],
+    ['only a fresh probe completed', { queue: { seqs: [8], outstanding: 1, confirmed: 0 }, transcript: tag.replace(TS, '1700000300.000001'), recoveryLog: [deliveryLog('message-delivered', 'a', COORD, '1700000300.000001')] }, 'ORIGINAL queued item lacks'],
+    ['wrong original sequence', { queue: { seqs: [8] } }, 'ORIGINAL queued item lacks'],
+    ['original still outstanding', { queue: { outstanding: 1 } }, 'ORIGINAL queued item lacks'],
+    ['no durable confirmation', { queue: { confirmed: 0 } }, 'ORIGINAL queued item lacks'],
+    ['no transcript', { transcript: '' }, 'ORIGINAL queued item lacks'],
+    ['wrong transcript source', { transcript: tag.replace('slack-channel-router', 'other') }, 'ORIGINAL queued item lacks'],
+    ['wrong transcript conversation', { transcript: tag.replace(COORD, DRY_RUN_IDS.aHome) }, 'ORIGINAL queued item lacks'],
+    ['wrong transcript sender', { transcript: tag.replace(DRY_RUN_IDS.humanUserId, A.userId) }, 'ORIGINAL queued item lacks'],
+    ['missing delivered diagnostic', { recoveryLog: [] }, 'ORIGINAL queued item lacks'],
+    ['wrong delivered persona', { recoveryLog: [deliveryLog('message-delivered', 'b', COORD, TS)] }, 'ORIGINAL queued item lacks'],
+    ['duplicate delivered diagnostics', { recoveryLog: [deliveryLog('message-delivered', 'a', COORD, TS), deliveryLog('message-delivered', 'a', COORD, TS)] }, 'ORIGINAL queued item lacks'],
+  ] satisfies [string, Options, string][])('recovery with %s fails and blocks later checks', async (_name, opts, reason) => {
+    const s = scenario(opts, true)
+    const r = await check24Teardown.run(s.ctx)
+    expect(r.status).toBe('FAIL')
+    expect(r.reason).toContain(reason)
+    expect(check24Teardown.blocking).toBe(true)
+    expect(s.workspace.posts).toEqual([])
+    assertNoLeak(r)
+  })
+})
+
+describe('live typed-delivery evidence reads the durable queue (b.omv SR-13.6)', () => {
+  let home: string
+  let queue: Awaited<ReturnType<typeof makeQueue>>
+  const TS = '1700000100.000001'
+  const BODY = 'waiting-private-body-83QX'
+  beforeEach(async () => {
+    home = mkdtempSync(join(tmpdir(), 'live-delivery-evidence-'))
+    queue = await makeQueue(home)
+    await queue.accept('persona_a', slackInput({ channel: COORD, ts: TS, key: { chat_id: COORD, ts: TS }, user: DRY_RUN_IDS.humanUserId, text: `${BODY} ${fakeToken(BOT_TOKEN_PREFIX)}` }))
+  })
+  afterEach(async () => {
+    await queue.stop()
+    rmSync(home, { recursive: true, force: true })
+  })
+  function containerForQueue() {
+    return fakeContainer([['', (script) => {
+      const r = Bun.spawnSync([Bun.which('bash')!, '-c', `S=${q(home)}
+${script}`], { env: hostSafeChildEnv(home, { tools: ['bash', 'jq'] }) })
+      return { code: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString() }
+    }]])
+  }
+  const read = async () => {
+    const result = await queueEvidence(makeCtx({ container: containerForQueue().container }), 'a', COORD, TS)
+    expect(JSON.stringify(result)).not.toContain(BODY)
+    assertNoLeak(result)
+    return result
+  }
+  test.each(['accepted', 'sent', 'partial', 'completed', 'compacted'] as const)('%s is projected from real persisted records without message content', async (stage) => {
+    if (stage !== 'accepted') {
+      await queue.append('persona_a', { v: 1, kind: 'fixed', seq: 1, parts: [BODY, `${BODY}-second`] })
+      await queue.append('persona_a', sentRecord())
+    }
+    if (['partial', 'completed', 'compacted'].includes(stage)) await queue.append('persona_a', deliveredRecord())
+    if (['completed', 'compacted'].includes(stage)) await queue.append('persona_a', { ...deliveredRecord(), part: 2 })
+    if (stage === 'compacted') await queue.compact()
+    const done = ['completed', 'compacted'].includes(stage)
+    expect(await read()).toEqual({
+      accepted: stage === 'compacted' ? 0 : 1, compacted: stage === 'compacted' ? 1 : 0, seqs: [1],
+      outstanding: done ? 0 : 1, confirmed: done ? 1 : 0, totalOutstanding: done ? 0 : 1,
+      sent: stage === 'accepted' || stage === 'compacted' ? 0 : 1,
+      receipts: stage === 'compacted' || stage === 'accepted' || stage === 'sent' ? 0 : stage === 'partial' ? 1 : 2,
+    })
+  })
+  test('matching channel, timestamp and sender are all required, and another persona file is isolated', async () => {
+    const ctx = makeCtx({ container: containerForQueue().container })
+    for (const [letter, channel, ts, sender] of [
+      ['a', DRY_RUN_IDS.aHome, TS, DRY_RUN_IDS.humanUserId],
+      ['a', COORD, `${TS}0`, DRY_RUN_IDS.humanUserId],
+      ['a', COORD, TS, A.userId],
+    ] as const) {
+      const out = await ctx.container.sh(queueEvidenceScript(letter, channel, ts, sender))
+      const parsed = JSON.parse(out.stdout)
+      expect(parsed).toMatchObject({ accepted: 0, compacted: 0, seqs: [], confirmed: 0, outstanding: 0, totalOutstanding: 1 })
+      assertNoLeak(parsed)
+    }
+    await queue.accept('persona_b', slackInput({ channel: COORD, ts: TS, key: { chat_id: COORD, ts: TS }, user: A.userId }))
+    expect(await queueEvidence(ctx, 'b', COORD, TS)).toMatchObject({ accepted: 0, seqs: [], totalOutstanding: 1 })
+    expect(await read()).toMatchObject({ accepted: 1, seqs: [1], totalOutstanding: 1 })
+  })
+  test.each([
+    ['unreadable queue', { code: 1 }, 'could not be read'],
+    ['invalid JSON', { stdout: 'not-json' }, 'malformed'],
+    ['missing fields', { stdout: '{}' }, 'malformed'],
+    ['negative count', { stdout: JSON.stringify({ accepted: -1, compacted: 0, seqs: [1], outstanding: 1, confirmed: 0, sent: 0, receipts: 0, totalOutstanding: 1 }) }, 'malformed'],
+  ])('%s fails closed', async (_name, reply, reason) => {
+    await expect(queueEvidence(makeCtx({ container: fakeContainer([['', reply]]).container }), 'a', COORD, TS)).rejects.toThrow(reason)
+  })
+})
+
+describe('DM and edit checks consume typed-delivery evidence (b.omv SR-13.6)', () => {
+  const TS = '1700000100.000001'
+  const DM = 'D0DRYDM001'
+  test.each([undefined, 'message-received', 'message-delivered'] as const)('a disabled DM with %p evidence is judged from metadata', async (kind) => {
+    const clock = virtualClock()
+    const workspace = scriptedHuman(clock)
+    const log = [`[slack] persona-dm-dropped: personas[0] "persona_a" (key=persona_a): direct message in conversation ${DM} ts=${TS} dropped: dm.enabled is off for this persona`,
+      ...(kind ? [deliveryLog(kind, 'a', DM, TS)] : [])]
+    const c = fakeContainer([['', (script) => script === 'mark' ? '1:0' : sinceOver(script, log) ?? '']])
+    const r = await check15.run(makeCtx({ mode: 'real', clock, human: workspace.human, container: c.container }))
+    expect(r.status).toBe(kind ? 'FAIL' : 'PASS')
+    if (kind) expect(r.reason).toContain(`A has a ${kind} line for the disabled DM`)
+    expect(c.scripts.some((x) => x.includes('Dispatching'))).toBe(false)
+    assertNoLeak(r)
+  })
+
+  function editScenario(opts: { diagnosticTs?: string; noTagTs?: boolean; delayedReceipt?: boolean } = {}) {
+    const EDIT_TS = '1700000160.000001'
+    const clock = virtualClock()
+    const workspace = scriptedHuman(clock, { [COORD]: [{ ts: '1700000200.000001', text: 'edited', user: A.userId }] })
+    let edited = false
+    let deliveredReads = 0
+    const api: HumanApi = { call: async (method, params) => {
+      if (method === 'chat.update') edited = true
+      return workspace.api.call(method, params)
+    } }
+    const c = fakeContainer([['', (script) => {
+      if (script === 'mark') return '1:0'
+      if (script.startsWith('tagstext a ') && edited) return `<channel source="slack-channel-router" chat_id="${COORD}" user_id="${DRY_RUN_IDS.humanUserId}" via="mention"${opts.noTagTs ? '' : ` ts="${EDIT_TS}"`}>`
+      for (const kind of ['message-received', 'message-delivered'] as const) {
+        if (script.includes(`${kind}:`)) {
+          if (kind === 'message-delivered' && opts.delayedReceipt && ++deliveredReads < 3) return ''
+          return sinceOver(script, [deliveryLog(kind, 'a', COORD, opts.diagnosticTs ?? EDIT_TS)]) ?? ''
+        }
+      }
+      return ''
+    }]])
+    return { ctx: makeCtx({ mode: 'real', clock, human: new HumanSession(api, clock), container: c.container }), ...c, reads: () => deliveredReads }
+  }
+  test('an edit correlates to the delivered tag timestamp and waits for the final receipt diagnostic', async () => {
+    const s = editScenario({ delayedReceipt: true })
+    const r = await check21.run(s.ctx)
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    expect(s.reads()).toBe(3)
+    expect(s.scripts.some((x) => x.includes('Dispatching'))).toBe(false)
+    assertNoLeak(r)
+  })
+  test.each([
+    ['no tag timestamp', { noTagTs: true }, 'edit tag has no delivery timestamp'],
+    ['only the unedited timestamp', { diagnosticTs: TS }, 'correlated message-delivered lines for the edit, not 1'],
+  ])('an edit with %s fails', async (_name, opts, reason) => {
+    const r = await check21.run(editScenario(opts).ctx)
+    expect(r.status).toBe('FAIL')
+    expect(r.reason).toContain(reason)
+    assertNoLeak(r)
   })
 })
 
@@ -1883,7 +2203,7 @@ describe("Check 14: a first-time user to this run's server, with the same second
   })
 
   test.each([
-    ['a server log line', { log: [`[slack] Dispatching to persona "persona_a" (key=persona_a) chat_id=C0DRYAHOME user=${SECOND_ID}`] }, '1 server log line(s)'],
+    ['a server log line', { log: [deliveryLog('message-received', 'a', DRY_RUN_IDS.aHome, '1700000100.000001', SECOND_ID)] }, '1 server log line(s)'],
     ['a persona tag', { tagLines: [`<channel source="slack" chat_id="C0DRYAHOME" user_id="${SECOND_ID}" via="receive_all">`] }, '1 persona tag(s)'],
   ])("this run's server already saw the second user (%s): SKIPPED \"not verified\" before any setup, post, invite or Slack read", async (_what, opts, what) => {
     const run = check14Run(opts)
@@ -1912,7 +2232,7 @@ describe("Check 12: the stop bans nothing, and is lifted once coordination is qu
    * answers, three posts each. With `keepPosting`, A posts again at every
    * read of coordination after the stop until the stop is typed into the
    * personas' terminals. The container answers `mark`, `tags` (the mention
-   * tag from the other persona) and the Dispatching grep; `fail` names a
+   * tag from the other persona) and the delivery diagnostics; `fail` names a
    * script that throws. `events` is every human post and container script,
    * in order; `refuseLift` has Slack refuse the lift's post.
    */
@@ -1962,7 +2282,10 @@ describe("Check 12: the stop bans nothing, and is lifted once coordination is qu
           if (script === 'mark') return '1:0'
           if (script.startsWith('tags b ')) return tagFrom(A)
           if (script.startsWith('tags a ')) return tagFrom(B)
-          if (script.includes('Dispatching to persona')) return `[slack] Dispatching to persona "persona_b" (key=persona_b) chat_id=${COORD} text=…`
+          for (const kind of ['message-received', 'message-delivered'] as const) {
+            if (script.includes(`${kind}:`)) return messages.filter((m) => m.channel === COORD && m.user !== DRY_RUN_IDS.humanUserId)
+              .map((m) => deliveryLog(kind, m.user === A.userId ? 'b' : 'a', COORD, m.ts, m.user)).join('\n')
+          }
           return ''
         },
       ],
@@ -4335,7 +4658,7 @@ describe('check helpers', () => {
   test("judgeLimitLines (Check 12's search): message-text lines are skipped, the known Slack rate-limit lines are notes, anything else fails", () => {
     const skipped = [
       '12:[slack] RAW message event persona=persona_b: {"text":"what is the limit of 7 times 6?"}',
-      '13:[slack] Dispatching to persona "persona_a" (key=persona_a) chat_id=C0DRYCOORD text=no limit here',
+      '13:[slack] dispatch: persona="persona_a" (key=persona_a) source=slack chat_id="C0DRYCOORD" text="no limit here"',
     ]
     const rateLimit = [
       '20:[WARN]  web-api:WebClient:0 API Call failed due to rate limiting. Will retry in 3 seconds.',
@@ -4400,7 +4723,7 @@ describe("tags and tagstext over a transcript (the container's helpers and the p
   }
 
   const TS = { idle: '1700000100.000001', midTurn: '1700000100.000002', blocks: '1700000100.000003', userBlocks: '1700000100.000004' }
-  const tag = (ts: string, via: string) => `<channel source="slack" chat_id="${COORD}" user_id="${DRY_RUN_IDS.humanUserId}" ts="${ts}" via="${via}">`
+  const tag = (ts: string, via: string) => `<channel source="slack-channel-router" chat_id="${COORD}" user_id="${DRY_RUN_IDS.humanUserId}" ts="${ts}" via="${via}">`
   const body = (ts: string, via: string, text: string) => `${tag(ts, via)}\n${text}\n</channel>`
   const midTurn = body(TS.midTurn, 'receive_all', 'Window check two.')
   /**
@@ -4472,7 +4795,7 @@ describe("tags and tagstext over a transcript (the container's helpers and the p
   // two scripts it hands the container, run by bash over the fixture home.
   describe("Check 14's search for the second user in this container's server log and persona transcripts", () => {
     const SECOND_ID = 'U0DRYSECND'
-    const secondTag = (ts: string) => `<channel source="slack" chat_id="${DRY_RUN_IDS.aHome}" user_id="${SECOND_ID}" ts="${ts}" via="receive_all">`
+    const secondTag = (ts: string) => `<channel source="slack-channel-router" chat_id="${DRY_RUN_IDS.aHome}" user_id="${SECOND_ID}" ts="${ts}" via="receive_all">`
     const secondBody = (ts: string) => `${secondTag(ts)}\nHello from the second user.\n</channel>`
     /** What the two scripts run by name. */
     const CONTACT_TOOLS = ['bash', 'cat', 'grep', 'jq']
@@ -4520,7 +4843,7 @@ describe("tags and tagstext over a transcript (the container's helpers and the p
     test('it reads every rotated server.log* and every transcript of every persona, and nothing else; priorContact counts what names the whole ID', async () => {
       const state = join(home, '.config', 'claude-slack-channel-bots')
       mkdirSync(state, { recursive: true })
-      const current = `[slack] Dispatching to persona "persona_c" (key=persona_c) chat_id=${DRY_RUN_IDS.aHome} user=${SECOND_ID}`
+      const current = deliveryLog('message-received', 'c', DRY_RUN_IDS.aHome, '1700000100.000001', SECOND_ID)
       const rotated = `[slack] dropped message user=${SECOND_ID} channel=C0DRYOTHER`
       const longer = `[slack] dropped message user=${SECOND_ID}9 channel=C0DRYOTHER`
       writeFileSync(join(state, 'server.log'), `[slack] started\n${current}\n[slack] dropped message user=U0DRYOTHER\n`)

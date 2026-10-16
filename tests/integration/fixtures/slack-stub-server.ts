@@ -133,7 +133,7 @@
  *   {"event":"ws-open"|"ws-close"|"ws-refused"|"ws-message", "label", "ticket", …}
  *   {"event":"control","source":"file"|"http","labels":[…]}  /  "control-error"
  *   {"event":"upload"} / {"event":"stop"}
- *   {"event":"push","label","envelope_id","event_type","channel","channel_type",
+ *   {"event":"push","label","envelope_id","connection_id","sent_mono_ms","event_ts","event_type","channel","channel_type",
  *    "flag":"false"|"true"|"non-boolean"|"absent","flag_value"}
  *   {"event":"push-refused","label","reason"}
  *
@@ -148,6 +148,10 @@
  * push named none. Neither line carries the event's text: every value they
  * copy from a push has token-like text replaced by `<token>` and is cut to at
  * most 100 characters.
+ * b.omv SR-13.6: `sent_mono_ms` is captured immediately before WebSocket send;
+ * `ws-message` carries `ack_mono_ms` captured on arrival, before parsing/I/O.
+ * Both use this process's monotonic clock. `connection_id` is a generated
+ * UUID independent of the ticket or credentials, shared by push and ACK.
  *
  * `api` lines also carry `channel`, `user` and `text` when the request has
  * them, and `args_token_like` (whether any argument held token-like text).
@@ -226,6 +230,7 @@ export interface SlackStub {
 interface ConnData {
   label: string
   ticket: string
+  connectionId: string
   hello: boolean
 }
 
@@ -584,9 +589,13 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
       retry_reason: '',
       payload,
     }
+    const wire = JSON.stringify(envelope)
     let sendStatus: number
+    // b.omv SR-13.6 / AC75: the clock starts BEFORE the actual WebSocket
+    // send, including backpressure. Both clocks belong to this stub process.
+    const sentMonoMs = performance.now()
     try {
-      sendStatus = target.send(JSON.stringify(envelope)) // -1 queued under backpressure, 0 dropped, >0 bytes sent
+      sendStatus = target.send(wire) // -1 queued under backpressure, 0 dropped, >0 bytes sent
     } catch {
       sendStatus = 0
     }
@@ -594,6 +603,9 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
     record('push', {
       label: pushFieldText(label),
       envelope_id: envelopeId,
+      connection_id: target.data.connectionId,
+      sent_mono_ms: sentMonoMs,
+      event_ts: pushFieldText(event.ts),
       event_type: pushFieldText(event.type),
       channel: pushFieldText(event.channel),
       channel_type: pushFieldText(event.channel_type),
@@ -634,7 +646,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
           return new Response('handshake refused', { status: 400 })
         }
         tickets.delete(ticket) // single use, like Slack's
-        if (srv.upgrade(req, { data: { label: issued.label, ticket, hello: issued.mode !== 'no-hello' } })) return undefined
+        if (srv.upgrade(req, { data: { label: issued.label, ticket, connectionId: randomUUID(), hello: issued.mode !== 'no-hello' } })) return undefined
         record('ws-refused', { label: issued.label, ticket, reason: 'not-an-upgrade' })
         return new Response('expected a WebSocket upgrade', { status: 400 })
       }
@@ -727,6 +739,8 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
         }
       },
       message(ws, message) {
+        // Capture arrival before parsing or synchronous record-file I/O.
+        const ackMonoMs = performance.now()
         let envelopeId: unknown
         try {
           const parsed: unknown = JSON.parse(typeof message === 'string' ? message : message.toString())
@@ -734,7 +748,11 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
         } catch {
           envelopeId = undefined
         }
-        record('ws-message', { label: ws.data.label, envelope_id: typeof envelopeId === 'string' ? envelopeId : null })
+        record('ws-message', {
+          label: ws.data.label, connection_id: ws.data.connectionId,
+          envelope_id: typeof envelopeId === 'string' ? envelopeId : null,
+          ack_mono_ms: ackMonoMs,
+        })
       },
       close(ws, code) {
         sockets.delete(ws)

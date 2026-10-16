@@ -1209,7 +1209,7 @@ cmp -s -- "${STORE_FILE}" "${STORE_BEFORE_OFF}" || fail "switch off: ${STORE_FIL
 # E5 demo (b.omv SR-8.6): retain one real stub DM's log and transcript
 # metadata before the successful scenario's EXIT trap deletes both. The
 # existing queue checks establish acceptance and receipt completion; this
-# export prints the observed evidence without adding E9's log assertions.
+# export prints the observed evidence; E9's exact log assertion follows below.
 push_message "${BRAVO_LABEL}" "${DM}" im "$(plain_text)"
 DM_TS="${PUSH_TS}"
 wait_queued "E5: bravo direct DM" "${BRAVO_DIR}" "${DM}" "${DM_TS}" dm
@@ -1268,6 +1268,43 @@ done
 stop_server --stop-bots
 port_closed "${SCENARIO_PORT}" || fail "closing: something still answers on 127.0.0.1:${SCENARIO_PORT}"
 stop_tracked_pid "${STUB_PID}" 10 "the Slack stub did not exit on SIGTERM"
+
+# b.omv SR-13.6: the complete accepted sets also pin exactly one received
+# diagnostic per persona/source/conversation/ts/sender. This includes paired
+# event dedupe, both shared recipients and the DM, and excludes every refused
+# input and nonrecipient. DELIVERIES_BEFORE preserves pre-compaction evidence;
+# via remains a queue assertion, not a diagnostic field. Read every rotation
+# after stopping the writers, following the positive decisions above.
+python3 - "${SLACK_STATE_DIR}" "${SCENARIO_ROOT}" "${RECEIVED_LABEL}" "${HUMAN}" "${ALPHA_KEY}" "${BRAVO_KEY}" "${ALPHA}" "${BRAVO}" << 'EOF' \
+    || fail "closing: received diagnostics differ from the exact accepted set"
+import collections, glob, json, os, re, sys
+state, root, label, sender, alpha_key, bravo_key, alpha, bravo = sys.argv[1:]
+names = {alpha_key: alpha, bravo_key: bravo}
+keys = list(names)
+expected = collections.Counter()
+for key in keys:
+    with open(os.path.join(root, f"expected-queue-{key}.jsonl")) as f:
+        for line in f:
+            channel, ts, via = json.loads(line)
+            expected[(key, "slack", channel, ts, sender)] += 1
+assert expected and all(n == 1 for n in expected.values()), "invalid expected acceptance set"
+quoted = r'("(?:\\.|[^"\\])*")'
+pattern = re.compile(r'persona=' + quoted + r' \(key=(\S+)\) source=(slack) chat_id=' + quoted + r' ts=' + quoted + r' sender_id=' + quoted)
+actual = collections.Counter()
+for path in glob.glob(os.path.join(state, "server.log*")):
+    with open(path) as f:
+        for line in f:
+            marker = f"[slack] {label}: "
+            if marker not in line:
+                continue
+            match = pattern.fullmatch(line.split(marker, 1)[1].rstrip("\n"))
+            assert match, "malformed received diagnostic"
+            name, key, source, channel, ts, user = match.groups()
+            assert key in names and json.loads(name) == names[key], "wrong received persona identity"
+            actual[(key, source, json.loads(channel), json.loads(ts), json.loads(user))] += 1
+assert actual == expected, f"received mismatch: missing={expected - actual}, extra={actual - expected}"
+print(f"received evidence: {sum(actual.values())} exact acceptances, paired events deduped")
+EOF
 
 # The token scan, read once every writer has stopped (the files stay until
 # the EXIT trap removes the scratch root). SRI-1410's files: server.log and

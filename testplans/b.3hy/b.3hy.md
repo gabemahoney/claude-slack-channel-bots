@@ -72,7 +72,7 @@ interject_status() {
         http://127.0.0.1:3100/interject || true
 }
 interject_status no_such_persona   # expect 404: no such persona
-interject_status alpha             # expect 503: known persona, no connected session (dry run launches none)
+interject_status alpha             # expect 200: known persona, durably queued (dry run launches no session)
 ```
 
 ### Pass criteria
@@ -82,4 +82,4 @@ interject_status alpha             # expect 503: known persona, no connected ses
 - `~/.config/claude-slack-channel-bots/server.log` contains `[slack] dry-run: skipping spawn for "bravo" (key=bravo) cwd=/tmp/test-repo-b`
 - The last `~/.config/claude-slack-channel-bots/server.log` line containing `[slack] startupSessionManager: complete — 2 persona(s):` contains `2 no-op`, `0 failed` and `0 not brought up`, each after `:` or `,` and followed by `,` or the end of the line
 - `/interject` with `"persona": "no_such_persona"` returns 404
-- `/interject` with `"persona": "alpha"` returns 503
+- `/interject` with `"persona": "alpha"` returns 200 after durable acceptance; the item remains queued without a connected session

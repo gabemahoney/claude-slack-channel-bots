@@ -1,5 +1,5 @@
 /**
- * lifecycle-checks.ts — testplans/b.yko Parts 8–10 and 12: the lost message
+ * lifecycle-checks.ts — testplans/b.yko Parts 8–10 and 12: the queued message
  * (24, with its setup and teardown), runtime add and remove (25–27), the
  * reboot (28, a `docker restart` of the container with the start-at-boot
  * marker set) and the closing secrecy check (29a), plus the optional 26 and
@@ -15,6 +15,7 @@ import { ROTATED_APP_TOKEN_NAME, type PersonaLetter } from '../lib/personas.ts'
 import { describeScan } from '../lib/secrecy-scan.ts'
 import { waitFor, MINUTE, POLL_MS, SECOND } from '../lib/wait.ts'
 import type { CheckContext } from './context.ts'
+import { deliveryLines, queueEvidence } from './delivery-evidence.ts'
 import { Findings, pass, type CheckDef } from './framework.ts'
 import {
   appliedLine,
@@ -80,6 +81,14 @@ function nowTs(ctx: CheckContext): string {
   return `${Math.floor(ctx.clock.now() / 1000)}.000000`
 }
 
+/**
+ * Copied from the fixed E5 builder: ci-live may not import delivery-notices.ts.
+ * Unit tests pin this text to buildMessagesWaitingNotice (b.omv SR-13.6).
+ */
+export function check24WaitingNotice(age: string): string {
+  return `:warning: *Messages waiting* — 1 message(s) for "persona_a" (key=persona_a) are waiting; the oldest has waited ${age}. The persona is down with automatic restarts off. The messages are kept and delivered once the persona is up.`
+}
+
 // ---------------------------------------------------------------------------
 // Part 8
 // ---------------------------------------------------------------------------
@@ -107,13 +116,15 @@ export const check24Setup: CheckDef<CheckContext> = {
 
 export const check24: CheckDef<CheckContext> = {
   id: '24',
-  title: 'Check 24: a message to a downed persona is reported at its destination, not in the channel (AC 26)',
+  title: 'Check 24: a message to a downed persona stays queued, with one waiting notice at its destination (b.omv SR-13.6)',
   needs: LIVE,
   row: '24',
   async run(ctx) {
     const f = new Findings()
     const ids = ctx.ids
     const human = needHuman(ctx)
+    const delay = (await lines(ctx, 'jq -c .session_restart_delay "$S/config.json.last-applied"'))[0]
+    if (!f.expect(delay === '0', 'automatic restarts are not disabled in the applied record')) return f.result()
     f.expect((await rows(ctx)).some((r) => r.id === 'cscb_persona_a'), 'no cscb_persona_a row')
     const m = await mark(ctx)
     const kill = await guarded(ctx, 'tmux kill-session -t slack_bot_persona_a')
@@ -127,35 +138,34 @@ export const check24: CheckDef<CheckContext> = {
     )
     f.expect(down !== null, 'no Session disconnected + Auto-restart disabled lines for A within a minute')
     const m2 = await mark(ctx)
-    const ts = await human.post(ids.coordination, `${mention(ctx, 'a')} lost-message check lost-marker-7Q3Z, reply with the word back.`)
+    const ts = await human.post(ids.coordination, `${mention(ctx, 'a')} waiting-message check waiting-marker-7Q3Z, reply with the word back.`)
+    // Save immediately: teardown must recover this item even if a later assertion fails.
+    ctx.shared.waitingMessage = { ts, mark: m2 }
     f.add(`TS ${ts}`)
     await pause(ctx, 2 * MINUTE)
-    const noLive = await sinceGrep(ctx, m2, 'No live session for persona "persona_a" (key=persona_a)')
-    const drop = await sinceGrep(ctx, m2, 'DROP: no _GET_stream for persona "persona_a"')
-    const disp = await sinceGrep(ctx, m2, 'Dispatching to persona "persona_a"')
-    if (noLive.length > 0) {
-      f.note('Check 24: the "No live session" path')
-      f.expect(noLive.length === 1 && noLive[0]!.includes(`[slack] No live session for persona "persona_a" (key=persona_a) chat_id=${ids.coordination} — dropping message`), 'the No live session line is not the expected single line')
-      f.expect(disp.length === 0, 'a Dispatching line appeared on the No live session path')
-    } else {
-      f.note('Check 24: the "DROP: no _GET_stream" path')
-      f.expect(drop.length >= 1, 'neither a No live session nor a DROP line appeared')
-      f.expect(disp.length === 1 && disp[0]!.includes('hasGetStream=false'), 'the DROP path has no single Dispatching line with hasGetStream=false')
-    }
+    const received = await deliveryLines(ctx, m2, 'message-received', 'a', ids.coordination, ts)
+    f.expect(received.length === 1, `${received.length} correlated message-received lines for the original item, not 1`)
+    f.expect(received.every((line) => line.endsWith(` sender_id="${ids.humanUserId}"`)), 'the original item acceptance names another sender')
+    const queued = await queueEvidence(ctx, 'a', ids.coordination, ts)
+    if (queued.seqs.length === 1) ctx.shared.waitingMessage.seq = queued.seqs[0]
+    f.expect(queued.accepted === 1 && queued.seqs.length === 1 && queued.outstanding === 1 && queued.totalOutstanding === 1, 'the original message is not the single durably accepted outstanding item for A')
+    f.expect(queued.sent === 0 && queued.receipts === 0 && queued.confirmed === 0 && queued.compacted === 0, 'the downed persona has a send or receipt for the original item')
+    f.expect((await deliveryLines(ctx, m2, 'message-delivered', 'a', ids.coordination, ts)).length === 0, 'a message-delivered line appeared before recovery')
     f.expect((await sinceGrep(ctx, m2, 'persona-destination-failed:')).length === 0, 'a persona-destination-failed line appeared')
     f.expect((await sinceGrep(ctx, m2, 'Scheduling restart for persona=persona_a')).length === 0, 'a restart was scheduled')
+    const lifecycle = await since(ctx, m2)
+    f.expect(!lifecycle.some((line) => /Relaunching session for persona=persona_a|spawnForPersona:.*"persona_a"|Session connected: persona "persona_a"/.test(line)), 'A restarted before recovery')
     f.expect((await tags(ctx, 'a', ts)).length === 0, 'the message was delivered to A')
     const inHome = (await human.everythingAfter(ids.aHome, ts))
-    const notices = inHome.filter((x) => isFrom(x, bot(ctx, 'a')) && messageText(x).includes('Message lost'))
-    f.expect(inHome.length === 1 && notices.length === 1, `A-home got ${inHome.length} message(s), ${notices.length} lost-message notice(s); expected exactly one notice`)
+    const notices = inHome.filter((x) => isFrom(x, bot(ctx, 'a')) && messageText(x).includes('*Messages waiting*'))
+    f.expect(inHome.length === 1 && notices.length === 1, `A-home got ${inHome.length} message(s), ${notices.length} waiting notice(s); expected exactly one notice`)
     if (notices[0]) {
       const text = messageText(notices[0])
       f.add(`notice ${notices[0].ts}`)
-      f.expect(text.includes('Persona "persona_a" (key=persona_a)') && text.includes('auto-restart disabled'), 'the notice does not name persona_a and "auto-restart disabled"')
-      f.expect(!text.includes('lost-marker-7Q3Z') && !text.includes('lost-message check'), 'the notice carries the message text')
+      const age = /the oldest has waited (\d+s|\d+m|\d+h \d+m)\./.exec(text)?.[1]
+      f.expect(age !== undefined && text === check24WaitingNotice(age), 'the notice is not the exact fixed Messages waiting text for persona_a with automatic restarts off')
+      f.expect(!text.includes('waiting-marker-7Q3Z') && !text.includes('waiting-message check'), 'the notice carries the message text')
       f.expect(!text.includes(`<@${ids.humanUserId}>`), 'the notice @-mentions the sender')
-      const names = [...(await human.userNames(ids.humanUserId)), ids.humanUserId]
-      f.expect(names.some((n) => text.includes(`a message from ${n} was not delivered`)), "the notice does not name the human (display name, full name or user ID)")
     }
     const inCoord = await personaPostsAfter(ctx, ids.coordination, ts)
     f.expect(inCoord.length === 0, `${inCoord.length} post(s) in coordination after the message`)
@@ -167,9 +177,12 @@ export const check24: CheckDef<CheckContext> = {
 
 export const check24Teardown: CheckDef<CheckContext> = {
   id: '24-teardown',
-  title: 'Check 24 teardown: restore the delay, guarded restart, A answers again',
+  title: 'Check 24 teardown: restore the delay and confirm the original queued item after recovery',
   needs: LIVE,
   row: null,
+  // Later checks must not run with the original item still blocking A's FIFO.
+  blocking: true,
+  undoes: ['24', '24-setup'],
   async run(ctx) {
     const f = new Findings()
     const orig = ctx.shared.origDelay
@@ -181,8 +194,26 @@ export const check24Teardown: CheckDef<CheckContext> = {
     const now = (await lines(ctx, `jq -c '.session_restart_delay' "$S/config.json"`))[0]
     f.expect(now === orig, `session_restart_delay is ${now}, not ${orig}`)
     await guardedRestart(ctx, f)
-    const back = await askAndWait(ctx, ctx.ids.aHome, 'Reply with the word back.', 'a', 'back')
-    f.expect(back.reply !== null, 'A did not answer after the teardown (later parts need all three personas)')
+    const original = ctx.shared.waitingMessage
+    if (!original) {
+      f.expect(false, 'the original Check 24 item was not recorded; recovery cannot be verified')
+      return f.result()
+    }
+    const recovered = await waitFor(async () => {
+      const found = await tags(ctx, 'a', original.ts)
+      const delivered = await deliveryLines(ctx, original.mark, 'message-delivered', 'a', ctx.ids.coordination, original.ts)
+      const queued = await queueEvidence(ctx, 'a', ctx.ids.coordination, original.ts)
+      const same = original.seq !== undefined && queued.seqs.length === 1 && queued.seqs[0] === original.seq
+      const transcript = found.some((tag) =>
+        tag.startsWith('<channel source="slack-channel-router" ') &&
+        tag.includes(` chat_id="${ctx.ids.coordination}"`) &&
+        tag.includes(` ts="${original.ts}"`) &&
+        tag.includes(` user_id="${ctx.ids.humanUserId}"`),
+      )
+      return transcript && delivered.length === 1 && same && queued.outstanding === 0 && queued.confirmed === 1 ? queued : null
+    }, { timeoutMs: 5 * MINUTE, intervalMs: POLL_MS, clock: ctx.clock })
+    f.expect(recovered !== null, 'the ORIGINAL queued item lacks transcript-backed message-delivered confirmation or is still outstanding after recovery')
+    if (recovered) f.add(`original item ts=${original.ts} seq=${original.seq} confirmed; outstanding=0`)
     return f.result()
   },
 }
@@ -350,7 +381,7 @@ export const check27: CheckDef<CheckContext> = {
     const dDm = await human.openDm(ids.bots.d.userId)
     const t2 = await human.post(dDm, 'Reply with the word gone.')
     await pause(ctx, 2 * MINUTE)
-    f.expect((await sinceGrepE(ctx, m2, 'persona=persona_d:|Dispatching to persona "persona_d"|persona-dm-dropped: .*"persona_d"')).length === 0, "D's connection still delivered events")
+    f.expect((await sinceGrepE(ctx, m2, 'persona=persona_d:|message-(received|delivered): persona="persona_d"|persona-dm-dropped: .*"persona_d"')).length === 0, "D's connection still accepted or delivered events")
     f.expect((await personaPostsAfter(ctx, ids.dHome, t1)).filter((x) => isFrom(x, bot(ctx, 'd'))).length === 0, 'D posted in D-home')
     f.expect((await personaPostsAfter(ctx, dDm, t2)).filter((x) => isFrom(x, bot(ctx, 'd'))).length === 0, 'D posted in its DM')
     if (promptTs && ctx.browser) {
@@ -545,7 +576,7 @@ export interface PersonaCounts {
 
 /**
  * `PERSONA_<l>=<transcripts> <delivered>` from Check 29a's script: a
- * persona's transcript and Dispatching counts. Unless the value is exactly
+ * persona's transcript and message-delivered counts. Unless the value is exactly
  * two whole numbers, both are NaN (a parse failure, never 0).
  */
 export function parsePersonaCounts(value: string): PersonaCounts {
@@ -557,8 +588,8 @@ export function parsePersonaCounts(value: string): PersonaCounts {
 export function personaCountsProblem(letter: string, value: string | undefined): string {
   const what = `PERSONA_${letter}`
   if (value === undefined) return `persona ${letter}: no transcript count`
-  if (value.trim() === '') return `persona ${letter}: empty transcript count (${what} is empty, not "<transcripts> <dispatched>")`
-  return `persona ${letter}: malformed transcript count (${what} is not "<transcripts> <dispatched>")`
+  if (value.trim() === '') return `persona ${letter}: empty transcript count (${what} is empty, not "<transcripts> <delivered>")`
+  return `persona ${letter}: malformed transcript count (${what} is not "<transcripts> <delivered>")`
 }
 
 /**
@@ -594,10 +625,10 @@ export const check29a: CheckDef<CheckContext> = {
       `F=(${CHECK29A_STATE_FILES.join(' ')})`,
       "mapfile -d '' T < <(find ~/.claude/projects/ -path '*-cscb-live-[abcd]/*' -name '*.jsonl' -print0 2>/dev/null)",
       'echo "TRANSCRIPTS=${#T[@]}"',
-      // Per persona: its transcripts, and how many messages the server dispatched to it (all of server.log*).
+      // Per persona: its transcripts, and final receipt confirmations (b.omv SR-13.6).
       'for l in a b c d; do',
       '  n=$(find ~/.claude/projects/ -path "*-cscb-live-$l/*" -name \'*.jsonl\' 2>/dev/null | wc -l)',
-      '  d=$(cat "$S"/server.log* 2>/dev/null | grep -cF "Dispatching to persona \\"persona_$l\\" (key=persona_$l)")',
+      '  d=$(cat "$S"/server.log* 2>/dev/null | grep -cF "[slack] message-delivered: persona=\\"persona_$l\\" (key=persona_$l) ")',
       '  echo "PERSONA_$l=$n $d"',
       'done',
       '[ -e "$S/config.json.pending" ] && echo PENDING=present || echo PENDING=absent',
@@ -619,7 +650,7 @@ export const check29a: CheckDef<CheckContext> = {
     const transcripts = parseCount(field('TRANSCRIPTS'))
     f.add(`persona transcripts: ${transcripts}`)
     f.expect(Number.isFinite(transcripts), `persona transcripts: ${transcripts} (the scan printed no count)`)
-    // Each persona this run brought up and dispatched a message to has a transcript for leakcount to read.
+    // Each persona this run brought up and delivered a message to has a transcript for leakcount to read.
     for (const l of ctx.shared.broughtUp ?? []) {
       const value = rawField(`PERSONA_${l}`)
       const c = parsePersonaCounts(value ?? '')
@@ -627,9 +658,9 @@ export const check29a: CheckDef<CheckContext> = {
         f.expect(false, personaCountsProblem(l, value))
         continue
       }
-      f.add(`persona ${l}: ${c.transcripts} transcript(s), ${c.delivered} dispatched message(s)`)
+      f.add(`persona ${l}: ${c.transcripts} transcript(s), ${c.delivered} delivered message(s)`)
       if (c.delivered > 0) f.expect(c.transcripts >= 1, `persona ${l} was brought up and sent ${c.delivered} message(s), but has no transcript`)
-      else f.note(`Check 29a: persona ${l} was brought up but no message was dispatched to it, so no transcript is required`)
+      else f.note(`Check 29a: persona ${l} was brought up but no message was confirmed delivered to it, so no transcript is required`)
     }
     f.expect(field('PENDING') === 'absent', 'config.json.pending exists')
     for (const [name, what] of [['TOKF', 'the state files'], ['TOKT', 'the persona transcripts'], ['TOKH', 'the shell history and wizard transcripts'], ['WSS', 'wss:// or ticket= in server.log'], ['MSG', 'message="…" fields']] as const) {

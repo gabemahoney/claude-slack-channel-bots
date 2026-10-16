@@ -135,6 +135,14 @@ scripts/
 
 CSCB has no tmux module, no Claude session-id store and no permission hook script of its own: agent-director owns the tmux integration and the Claude session-id state, the SR-2.1 poller carries permission requests, and AskUserQuestion is denied at the template level (SR-3.1). The permission trail has no CLI query wrapper: the trail file itself is the surface; see [Trail file location and query recipes](#trail-file-location-and-query-recipes--sr-v-5--sr-v-6).
 
+The live acceptance runner's `ci-live/checks/delivery-evidence.ts` (b.omv
+SR-13.6) correlates metadata diagnostics with persona, Slack conversation
+and timestamp, and projects queue acceptance, attempts, receipts and
+compacted delivered keys inside the container. Only that metadata projection
+reaches the host. Check 24's blocking recovery also requires the original
+item's transcript tag and sequence; the helper loads no production adapter
+on the host. See `docs/testing-guide.md`, The /ci-live runner.
+
 ## Data Flow
 
 ### Inbound (Slack → Claude Code)
