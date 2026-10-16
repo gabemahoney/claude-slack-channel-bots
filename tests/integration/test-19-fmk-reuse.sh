@@ -900,7 +900,7 @@ t19_harness_check() {
     pane="${SEEDED_PANE_ID}"
     # The stub's own texts (fixtures/stub-claude.sh): its dialog's first line,
     # and the banner it prints on reporting in.
-    wait_until "${TRANSCRIPT_WAIT_S}" "${step}: the stub never showed its dialog" t19_pane_shows "${pane}" 'WARNING: Loading development channels'
+    wait_until "${TRANSCRIPT_WAIT_S}" "${step}: the stub never showed its dialog" t19_pane_shows "${pane}" 'Yes, I trust this folder'
     [[ "$(t19_transcripts)" == "${before}" ]] || fail "${step}: a transcript was written at the dialog"
     stub_press_enter "${pane}"
     wait_until "${TRANSCRIPT_WAIT_S}" "${step}: the stub never reported in after Enter" t19_pane_shows "${pane}" 'Listening for channel messages from:'

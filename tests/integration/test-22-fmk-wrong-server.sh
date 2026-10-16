@@ -111,7 +111,8 @@
 #   6. The cleared probe (SRJ-1412 B (5), (6); SRJ-506, SRJ-1005; AC 5). From
 #      the end of the second re-check to the first CSCB `resume` after it, the
 #      bot server makes exactly `status`, the one-line `read-pane`,
-#      `find-missing` and `resume`, in that order, once each; the round logs
+#      `find-missing`, the fresh provenance `get`, and `resume`, in that
+#      order, once each; the round logs
 #      the probe cleared on PANE_READ_GONE (the pane read's outcome for
 #      agent-director's ErrTmuxCaptureFailed) with its retry; the resumed
 #      launch proceeds (the approver clears the new stub's dialog and the row
@@ -667,7 +668,7 @@ answer="$(jq -c '.' "${AD_KILL_OUT}")"
 echo "${TEST_NAME}: ${STEP}: kill-finished answered ${answer}"
 
 # ---------------------------------------------------------------------------
-# Leg 6: the cleared probe, one find-missing and one resume, one recovery post
+# Leg 6: the cleared probe, fresh provenance get and resume, one recovery post
 # ---------------------------------------------------------------------------
 
 STEP="leg 6 (cleared probe)"
@@ -682,7 +683,7 @@ for i in "${!WIN_VERBS[@]}"; do
         break
     fi
 done
-expect_window "${STEP}: from the second re-check to its resume" status read-pane find-missing resume
+expect_window "${STEP}: from the second re-check to its resume" status read-pane find-missing get resume
 wait_for_log "${ROUND_CLEARED}" "${POST_WAIT_S}" "${STEP}: the round logged no probe cleared on ${READ_GONE}"
 wait_until "${REPORT_WAIT_S}" "${STEP}: the resumed row never reported in (waiting)" row_reads waiting
 expect_status "${STEP}" waiting

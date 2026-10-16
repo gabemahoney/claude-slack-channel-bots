@@ -116,8 +116,9 @@
 #      - at least REFUSED_ROUNDS (2) re-check rounds, and then every round
 #        run since the latch (as many as have run; none is in flight and
 #        each has its round line): `latch_rounds` reads the persona's CSCB
-#        calls after the latch, which must be exactly one `status` then one
-#        `resume` per round, no `read-pane` and no other call; the first
+#        calls after the latch, which must be exactly one `status`, one fresh
+#        provenance `get`, then one `resume` per round, no `read-pane` and no
+#        other call; the first
 #        round's `status` comes at least one interval
 #        (LATCH_RECHECK_INTERVAL_MS) after the refused bring-up `resume` and
 #        within the interval plus SETTLE_S, each next round's at least one
@@ -708,12 +709,14 @@ round_call_is() {
 # of a persona latched with the re-check call <call> (as round_call_is reads
 # it), from E42 T1's reader (`ad_cscb_calls`): its CSCB-parented calls after
 # <from-mark> must be, in log order, one `status` then one <call> per round,
-# and no other call; fails otherwise. Prints one line per round,
+# with one fresh provenance `get` immediately before a `resume` and no other
+# call; fails otherwise. Prints one line per round,
 # `<status-pos> <status-us> <call-pos> <call-us>`; a last `status` with no
 # <call> after it yet (a round in flight) is printed as
 # `<status-pos> <status-us> - -`.
 latch_rounds() {
-    local step="$1" id="$2" call="$3" from="$4" rows pos time verb args us want=status s_pos="" s_us=""
+    local step="$1" id="$2" call="$3" from="$4" rows pos time verb args us want=status s_pos="" s_us="" shape="one status then one $3"
+    [[ "${call}" != "${CALL_RESUME}" ]] || shape="one status then one get then one ${call}"
     rows="$(ad_cscb_calls "${id}" "${from}")" || exit 1
     [[ -n "${rows}" ]] || return 0
     while IFS=$'\t' read -r pos time _ verb _ args; do
@@ -721,13 +724,16 @@ latch_rounds() {
             s_pos="${pos}"
             s_us="$(us_of "${time}")" || exit 1
             want="${call}"
+            [[ "${call}" != "${CALL_RESUME}" ]] || want=get
+        elif [[ "${want}" == get && "${verb}" == get ]]; then
+            want="${call}"
         elif [[ "${want}" == "${call}" ]] && round_call_is "${call}" "${verb}" "${args}"; then
             us="$(us_of "${time}")" || exit 1
             printf '%s %s %s %s\n' "${s_pos}" "${s_us}" "${pos}" "${us}"
             want=status
         else
             sed 's/^/  | /' <<< "${rows}" >&2
-            fail "${step}: CSCB call ${verb} of ${id} at shim line ${pos}, where a round's ${want} belongs (a round is one status then one ${call}, and nothing else)"
+            fail "${step}: CSCB call ${verb} of ${id} at shim line ${pos}, where a round's ${want} belongs (a round is ${shape}, and nothing else)"
         fi
     done <<< "${rows}"
     [[ "${want}" == status ]] || printf '%s %s - -\n' "${s_pos}" "${s_us}"
@@ -1481,8 +1487,9 @@ s19_end() {
 }
 
 # s19_clear <key> <label>: the round after the harness ended the session:
-# its first two calls are one `status` then the persona's re-check call, at
-# the cadence, with no CSCB find-missing between them; the call launches: the
+# its first calls are one `status`, one fresh provenance `get` for a resume,
+# then the persona's re-check call, at the cadence, with no CSCB find-missing
+# between them; the call launches: the
 # own-id additionally sweeps and retries reuse after its probe returns GONE.
 # The latch clears (latchClearedLine, reason "a retry of the refused operation
 # was not refused", posted), with no refused round line beyond those read
@@ -1495,6 +1502,7 @@ s19_end() {
 s19_clear() {
     local key="$1" step="$2: $1's clear" id="${PERSONA_ID[$1]}" name="${PERSONA_NAME[$1]}" session="${S19_SESSION[$1]}"
     local rows s_pos s_time s_verb c_pos c_time c_verb c_args s_us c_us between cleared recovery n calls spawns
+    local call_line=2 g_verb
     local clear_round_head="${S19_ROUND_HEAD[${key}]}" clear_round_count=$(( S19_ROUND_BASE[${key}] + S19_ROUNDS[${key}] + 1 ))
     if [[ "${key}" == "${PEND_KEY}" ]]; then
         # A successful own-id round logs the probe, bypassing sweep and retry.
@@ -1507,7 +1515,12 @@ s19_clear() {
         "${step}: no round line after the session ended"
     rows="$(ad_cscb_calls "${id}" "${S19_LAST_POS[${key}]}")"
     IFS=$'\t' read -r s_pos s_time _ s_verb _ <<< "$(sed -n 1p <<< "${rows}")"
-    IFS=$'\t' read -r c_pos c_time _ c_verb _ c_args <<< "$(sed -n 2p <<< "${rows}")"
+    if [[ "${S19_CALL[${key}]}" == "${CALL_RESUME}" ]]; then
+        IFS=$'\t' read -r _ _ _ g_verb _ <<< "$(sed -n 2p <<< "${rows}")"
+        [[ "${g_verb}" == get ]] || { sed 's/^/  | /' <<< "${rows}" >&2; fail "${step}: the resume has no fresh provenance get after its status"; }
+        call_line=3
+    fi
+    IFS=$'\t' read -r c_pos c_time _ c_verb _ c_args <<< "$(sed -n "${call_line}p" <<< "${rows}")"
     if [[ "${s_verb}" != status ]] || ! round_call_is "${S19_CALL[${key}]}" "${c_verb}" "${c_args}"; then
         sed 's/^/  | /' <<< "${rows}" >&2
         fail "${step}: the round's first calls of ${id} are '${s_verb}' and '${c_verb}', not status then ${S19_CALL[${key}]}"

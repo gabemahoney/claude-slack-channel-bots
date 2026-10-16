@@ -1610,8 +1610,8 @@ wait_until $(( RECHECK_S + RECHECK_ALLOWANCE_S )) "${STEP}: no resume of ${ID_A}
     shim_line_after "${MARK_H}" resume "${ID_A}"
 window_any "${STEP}" "${MARK_H}" - "${ID_A}"
 window_until resume
-[[ "${WIN_VERBS[*]}" == "status read-pane find-missing resume" ]] \
-    || fail "${STEP}: the bot server's calls up to the resume were '${WIN_VERBS[*]}', not 'status read-pane find-missing resume'"
+[[ "${WIN_VERBS[*]}" == "status read-pane find-missing get resume" ]] \
+    || fail "${STEP}: the bot server's calls up to the resume were '${WIN_VERBS[*]}', not 'status read-pane find-missing get resume'"
 for i in "${!WIN_VERBS[@]}"; do
     [[ "${WIN_PPIDS[i]}" == "${SERVER_PID}" ]] \
         || fail "${STEP}: its ${WIN_VERBS[i]} has parent ${WIN_PPIDS[i]}, not the bot server ${SERVER_PID}"

@@ -160,7 +160,7 @@
 # session name (src/persona-identity.ts personaInstanceId,
 # personaTmuxSessionName); A's seeded labels (`personaDefaultConfigDirLabels`:
 # src/persona-identity.ts SERVICE_LABEL, PERSONA_LABEL_PREFIX and
-# CONFIG_DIR_LABEL_PREFIX, with src/session-manager.ts
+# CONFIG_DIR_LABEL_PREFIX plus the SR-7 tag-prompt marker, with src/session-manager.ts
 # personaConfigDirLabelValue). Values CSCB does not define, each quoted from
 # its source:
 # - the `pre_trust` values `ok`, `skipped` and `failed`: agent-director
@@ -614,7 +614,7 @@ leg_migrated_row() {
 
     work="$(make_workdir migrated)"
     mapfile -t labels < <(fmk_text personaDefaultConfigDirLabels "${A_KEY}" "${HOME}")
-    (( ${#labels[@]} == 3 )) || fail "${step}: fmk-texts.ts printed ${#labels[@]} label(s) for A, not three"
+    (( ${#labels[@]} == 4 )) || fail "${step}: fmk-texts.ts printed ${#labels[@]} label(s) for A, not four"
     labels_json="$(printf '%s\n' "${labels[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0) | capture("^(?<k>[^=]+)=(?<v>.*)$")) | map({(.k): .v}) | add')"
 
     # Step 1 [harness]: A's row, made by 0.10.0's own spawn, with a stub worker.

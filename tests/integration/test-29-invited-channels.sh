@@ -423,9 +423,29 @@ queued() {
     (( $(queued_count "$@") == 1 ))
 }
 
+declare -A EXPECTED_QUEUE_ROWS=()
+
+# Receipt completion, rather than acceptance, makes the restart's idle-bot
+# precondition true. Every fixed part of every accepted item has a receipt.
+queue_drained() {
+    local file="${DELIVERIES_FILE[$1]}"
+    jq -se '
+      . as $records
+      | [$records[] | select(.kind == "accepted" and .compact == null)] as $accepted
+      | ($accepted | length) > 0
+        and all($accepted[];
+          .seq as $seq
+          | ([$records[] | select(.seq == $seq and .kind == "fixed")][-1].parts // null) as $parts
+          | ($parts | type) == "array"
+            and ($parts | length) > 0
+            and all(range(1; ($parts | length) + 1);
+              . as $part
+              | any($records[]; .seq == $seq and .kind == "delivered" and .part == $part)))
+    ' "${file}" > /dev/null 2>&1
+}
+
 # wait_queued <step> <dir> <chat-id> <ts> <via>: the delivery reaches the
 # accepted queue record, with that `via`.
-declare -A EXPECTED_QUEUE_ROWS=()
 wait_queued() {
     local step="$1"; shift
     wait_until "${EVENT_WAIT_S}" "${step}: no delivery with via $4 in the accepted queue record of $1" queued "$@"
@@ -1075,6 +1095,11 @@ expect_queued "step 11: alpha F1 plain (shared)" 1 "${ALPHA_DIR}" "${F1}" "${B11
 expect_queued "step 11: bravo F1 plain (shared)" 1 "${BRAVO_DIR}" "${F1}" "${B11_TS}"
 
 # --- Persistence across a restart (SRI-1408, SRI-1403) ----------------------
+# Queue acceptance above can precede typing and its receipt. Settle both
+# personas before checking an immediate idle-session reconnect on restart.
+for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
+    wait_until "${SESSION_WAIT_S}" "restart: accepted deliveries of ${dir} never received all their receipts" queue_drained "${dir}"
+done
 STORE_BEFORE_RESTART="${SCENARIO_ROOT}/store-before-restart.json"
 cp -- "${STORE_FILE}" "${STORE_BEFORE_RESTART}"
 declare -A DELIVERIES_BEFORE=()
@@ -1113,9 +1138,17 @@ wait_until "${RECORD_WAIT_S}" "restart: no new WebSocket for ${BRAVO_LABEL}" \
     rec_at_least $(( bravo_sockets_before + 1 )) event=ws-open label="${BRAVO_LABEL}"
 cmp -s -- "${STORE_FILE}" "${STORE_BEFORE_RESTART}" || fail "restart: ${STORE_FILE} changed across the restart"
 for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
+    # Delivered content is compacted at startup; its exact dedupe facts
+    # survive, while this scenario retains its own acceptance evidence.
+    jq -sS 'map({seq,key,received_at}) | sort_by(.seq)' "${DELIVERIES_BEFORE[${dir}]}" \
+        > "${SCENARIO_ROOT}/expected-dedupe-after-restart"
+    jq -sS 'map(select(.kind == "accepted" and .compact != "allocation") | {seq,key,received_at}) | sort_by(.seq)' \
+        "${DELIVERIES_FILE[${dir}]}" > "${SCENARIO_ROOT}/actual-dedupe-after-restart"
+    cmp -s -- "${SCENARIO_ROOT}/expected-dedupe-after-restart" "${SCENARIO_ROOT}/actual-dedupe-after-restart" \
+        || fail "restart: dedupe facts of ${dir} changed"
     queue_accepted "${QUEUE_KEY[${dir}]}" > "${SCENARIO_ROOT}/accepted-after-restart"
-    cmp -s -- "${DELIVERIES_BEFORE[${dir}]}" "${SCENARIO_ROOT}/accepted-after-restart" \
-        || fail "restart: accepted queue records of ${dir} changed"
+    [[ ! -s "${SCENARIO_ROOT}/accepted-after-restart" ]] \
+        || fail "restart: receipted message content of ${dir} survived startup compaction"
 done
 
 # alpha calls the tool for F1 with `all` before any F1 event: accepted as a
@@ -1174,7 +1207,8 @@ cmp -s -- "${STORE_FILE}" "${STORE_BEFORE_OFF}" || fail "switch off: ${STORE_FIL
 
 # Every persona's complete accepted set, including absence of all other inputs.
 # Multiple journal records per item never count as additional acceptances.
-for key in "${ALPHA_KEY}" "${BRAVO_KEY}"; do
+for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
+    key="${QUEUE_KEY[${dir}]}"
     expected_rows="${SCENARIO_ROOT}/expected-queue-${key}.jsonl"
     : > "${expected_rows}"
     for fact in "${!EXPECTED_QUEUE_ROWS[@]}"; do
@@ -1182,7 +1216,9 @@ for key in "${ALPHA_KEY}" "${BRAVO_KEY}"; do
         printf '%s\n' "${EXPECTED_QUEUE_ROWS[${fact}]}" >> "${expected_rows}"
     done
     jq -sS 'sort' "${expected_rows}" > "${expected_rows}.sorted"
-    queue_accepted "${key}" | jq -sS 'map([.channel,.ts,.via]) | sort' > "${SCENARIO_ROOT}/actual-queue-${key}"
+    queue_accepted "${key}" > "${SCENARIO_ROOT}/current-queue-${key}"
+    jq -sS 'map([.channel,.ts,.via]) | sort' "${DELIVERIES_BEFORE[${dir}]}" "${SCENARIO_ROOT}/current-queue-${key}" \
+        > "${SCENARIO_ROOT}/actual-queue-${key}"
     cmp -s -- "${expected_rows}.sorted" "${SCENARIO_ROOT}/actual-queue-${key}" \
         || fail "closing: persona ${key} has an unexpected accepted queue set"
 done
