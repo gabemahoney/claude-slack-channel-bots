@@ -139,7 +139,7 @@ import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD
 import { RECHECK_READING_NO_ROW, RECHECK_READING_STATE, type LatchRecheckReading } from '../../src/conflict-latch.ts'
 import { parseLaunchStart } from '../../src/pending-row.ts'
 import { personaInstanceId } from '../../src/persona-identity.ts'
-import { DEV_CHANNELS_DIALOG_NEEDLE, TRUST_DIALOG_NEEDLE } from '../../src/session-manager.ts'
+import { IDLE_PANE, TRUST_DIALOG_PANE, DEV_CHANNELS_DIALOG_PANE } from './working-row-panes.ts'
 import {
   cannedFindMissing,
   cannedGetResult,
@@ -207,9 +207,9 @@ export type PendingRowDialog =
 
 /** The pane each dialog shows: the known ones carry the approver's needle, the unrecognised one none. */
 const DIALOG_PANES: Readonly<Record<PendingRowDialog, string>> = Object.freeze({
-  [PENDING_ROW_DIALOG_NONE]: '',
-  [PENDING_ROW_DIALOG_TRUST]: `Do you trust the files in this folder?\n\n> 1. ${TRUST_DIALOG_NEEDLE}\n  2. No, exit\n`,
-  [PENDING_ROW_DIALOG_DEV_CHANNELS]: `Loading development channels\n\n> 1. ${DEV_CHANNELS_DIALOG_NEEDLE}\n  2. Exit\n`,
+  [PENDING_ROW_DIALOG_NONE]: IDLE_PANE,
+  [PENDING_ROW_DIALOG_TRUST]: TRUST_DIALOG_PANE,
+  [PENDING_ROW_DIALOG_DEV_CHANNELS]: DEV_CHANNELS_DIALOG_PANE,
   [PENDING_ROW_DIALOG_UNRECOGNISED]: 'Choose an option to continue\n\n> 1. Continue later\n  2. Exit\n',
 })
 

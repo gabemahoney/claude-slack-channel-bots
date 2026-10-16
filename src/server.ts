@@ -56,6 +56,12 @@
 
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
 
+import { randomBytes } from 'node:crypto'
+import type { Client } from 'agent-director'
+import { createDeliveryEngines, createDeliveryLifecycle, type DeliveryEngines, type DeliveryLifecycle, type DeliveryEngineEvent } from './delivery-engine.ts'
+import { createDeliveryAdScope } from './delivery-ad-scope.ts'
+import { parseLaunchStart } from './pending-row.ts'
+import { setDeliveryLifecycle, setDeliveryPersonaLookup, applyDeliveryOwnRowRead, handleDeliveryKeyError, handleDeliveryReadError, classifyWorkingPane } from './session-manager.ts'
 import type { WebClient } from '@slack/web-api'
 import { join, resolve } from 'path'
 import { fileURLToPath } from 'url'
@@ -77,7 +83,7 @@ import {
   type ServerSettings,
   MCP_SERVER_NAME,
 } from './config.ts'
-import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
+import { personaInstanceId, renderPersonaRef, resolvePersonaTarget, resolveClaudeConfigDir } from './persona-identity.ts'
 import {
   APPROVER_STOP_RETIRED_KEY,
   APPROVER_STOP_TEARDOWN,
@@ -362,7 +368,7 @@ import {
   type SessionToolDeps,
   type SessionEntry,
 } from './registry.ts'
-import { buildPersonaClientOrExit, runAgentDirectorStartupGate } from './agent-director-startup.ts'
+import { buildPersonaClientOrExit, runAgentDirectorStartupGate, createDeliveryClientFactory } from './agent-director-startup.ts'
 import { disposeAdVersionRecheck, installAdVersionRecheck, onAdVersionChanged } from './ad-version-gate.ts'
 import { installTestTimerOverrides } from './test-timer-overrides.ts'
 import {
@@ -1170,6 +1176,15 @@ async function handleInitialized(
 // Holders are populated in main(), after the duplicate-server guard and before admission.
 let deliveryQueue: DeliveryQueue | undefined
 let deliveryPreparation: DeliveryPreparation | undefined
+let deliveryEngines: DeliveryEngines | undefined
+let deliveryLifecycle: DeliveryLifecycle | undefined
+/** Test seam: share one typing gate and launch identity with the session manager; undefined resets both. */
+export function _setDeliveryLifecycle(value: DeliveryLifecycle | undefined): void {
+  deliveryLifecycle = value
+  setDeliveryLifecycle(value)
+}
+let deliveryClients: ReturnType<typeof createDeliveryClientFactory> | undefined
+export const deliveryEngineEvents = { emit: (_event: DeliveryEngineEvent): void => {} }
 /** E5 binds event handling here; E2 supplies facts without notices or wording. */
 export const deliveryQueueEvents = { emit: (_event: QueueEvent): void => {} }
 /** E3's engine binds this hook after startup; until then queued work waits. */
@@ -1485,7 +1500,10 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
 
   // b.omv SR-3.3: finish fixation and drain the shared writers after every
   // synchronous stop above, before closing the transports and clients.
+  const deliveryStopping = deliveryEngines?.stop()
   await deliveryPreparation?.stop()
+  await deliveryStopping
+  await deliveryClients?.close()
   await deliveryQueue?.stop()
 
   // Close all pending (not yet routed) MCP transports
@@ -2278,9 +2296,13 @@ export function _buildReconnectSessionAdapter(
   getPersona?: (key: string) => Persona | undefined,
   isLatched?: (key: string) => boolean,
   appliedPersona: (key: string) => Persona | undefined = getAppliedPersona,
+  options: { noNotice?: boolean } = {},
 ):(key: string) => Promise<'success' | ReconnectEscalateDead | 'transient' | 'pending'> {
   // `key` is the persona key.
-  return async (key: string) => {
+  const run: (key: string) => Promise<'success' | ReconnectEscalateDead | 'transient' | 'pending'> = async (key: string) => {
+    if (getSessionByPersona(key)?.connected === true) { deliveryLifecycle?.clearDeferred(key); return 'success' }
+    if (deliveryLifecycle?.owner(key) !== undefined && deliveryLifecycle.owner(key) !== 'free') { deliveryLifecycle.defer(key); return 'transient' }
+    if (deliveryLifecycle && !await deliveryLifecycle.recoverBeforeReconnect(key)) { deliveryLifecycle.defer(key); return 'transient' }
     let state: string
     // b.jg5 SRJ-115: a `pending` row's raw launch start, for `deferPendingRow`.
     let launchStartedAt: string | undefined
@@ -2326,11 +2348,12 @@ export function _buildReconnectSessionAdapter(
     }
     // b.jdc: likewise the run of deferrals on a row waiting on a prompt.
     if (!PROMPT_ROW_STATES.has(state)) endPromptRowDeferral(key)
+    const workingLaunch = state === 'working' ? { launchId: deliveryLifecycle?.launchId(key) } : undefined
     if (state === 'working') {
-      const verdict = await workingReconnectVerdict(key, getPersona, latchedNow)
+      const verdict = await workingReconnectVerdict(key, getPersona, latchedNow, options.noNotice)
       if (verdict !== 'reconnect') return verdict
     } else if (PROMPT_ROW_STATES.has(state)) {
-      return promptRowReconnectVerdict(key, state, latchedNow)
+      return promptRowReconnectVerdict(key, state, latchedNow, options.noNotice)
     } else if (state === 'pending') {
       // A deliberate deviation from b.jg5 SRJ-410 ("at each retry"): no
       // pending-row rule run here. This branch is reached only in a race,
@@ -2340,7 +2363,7 @@ export function _buildReconnectSessionAdapter(
       await deferPendingRow(key, launchStartedAt, appliedPersona, { mayRunRule: false })
       return 'pending'
     } else if (state === 'waiting') {
-      const check = await checkWaitingRowPane(key, latchedNow)
+      const check = await checkWaitingRowPane(key, latchedNow, options)
       // b.f2b: its pane shows a running turn or a prompt, or the read latched
       // the persona, met ENVIRONMENT, or carried the stop mark of a version
       // re-check that decided the server stops (b.jg5 SRJ-205); logged
@@ -2401,7 +2424,7 @@ export function _buildReconnectSessionAdapter(
     if (oldLifeNow !== undefined) return replaceOwnRowOldLife(key, state, oldLifeNow)
     // b.jg5 SRJ-118, SRJ-501: the reconnect's last read is this adapter's
     // `status` read (`waiting`, or a stale `working` row).
-    const result = await reconnectMcpWithCause(key, latchRowStateRead(state))
+    const result = await reconnectMcpWithCause(key, latchRowStateRead(state), undefined, { workingChecked: workingLaunch })
     if (result.outcome === 'ok') return 'success'
     if (result.outcome === 'dead-session') {
       // b.sv7: trigger the internal memoized findMissing sweep (b.m4r) before
@@ -2433,6 +2456,16 @@ export function _buildReconnectSessionAdapter(
     }
     // b.jg5 SRJ-118: 'transient' — nothing typed, no sweep, nothing counted.
     return 'transient'
+  }
+  return async key => {
+    // Pause prior screen-only time; only this run's real screen finding
+    // resumes it. Failed reads and other guards never count as screen time.
+    if (deliveryLifecycle?.deferred(key)) deliveryLifecycle.defer(key)
+    const result = await run(key)
+    if (result === 'transient' || result === 'pending') {
+      if (!deliveryLifecycle?.deferred(key)) deliveryLifecycle?.defer(key)
+    } else deliveryLifecycle?.clearDeferred(key)
+    return result
   }
 }
 
@@ -2702,6 +2735,7 @@ async function promptRowReconnectVerdict(
   key: string,
   state: string,
   latchedNow: () => boolean,
+  noNotice = false,
 ): Promise<ReconnectEscalateDead | 'transient'> {
   if (isLaunchInFlight(key)) {
     console.error(`[slack] reconnectSession: persona=${key} is ${state} and a launch for it is in flight — deferring to a later tick (b.jdc)`)
@@ -2727,7 +2761,7 @@ async function promptRowReconnectVerdict(
   if (latchedNow()) return 'transient'
   switch (read.kind) {
     case PANE_READ_PANE:
-      return promptRowDeferral(key, state, latchedNow)
+      return promptRowDeferral(key, state, latchedNow, noNotice, true)
     case PANE_READ_GONE:
       endPromptRowDeferral(key)
       console.error(promptRowPaneGoneLine(key, state, read))
@@ -2740,7 +2774,7 @@ async function promptRowReconnectVerdict(
     case PANE_READ_CONFIG:
     case PANE_READ_UNCLASSIFIED:
       console.error(promptRowTakenAsAliveLine(key, state, read))
-      return promptRowDeferral(key, state, latchedNow)
+      return promptRowDeferral(key, state, latchedNow, noNotice)
     case PANE_READ_ENVIRONMENT:
       console.error(promptRowPaneReadEnvironmentLine(key, state, read))
       return 'transient'
@@ -2765,6 +2799,8 @@ async function promptRowDeferral(
   key: string,
   state: string,
   latchedNow: () => boolean,
+  noNotice = false,
+  paneRead = false,
 ): Promise<ReconnectEscalateDead | 'transient'> {
   const deferral = await checkPromptRowDeferral(key, state)
   if (deferral === 'escalate') return escalateDeadWith(DEAD_SESSION_CAUSE_ROW_READ_FINISHED)
@@ -2774,7 +2810,10 @@ async function promptRowDeferral(
   // b.jg5 SRJ-502: latched elsewhere while the read or the deferral check was
   // awaited (the gate logs its line): no notice.
   if (latchedNow()) return 'transient'
-  return deferPromptRow(key, state)
+  // b.omv SR-5.5: a failed read preserves prompt-row liveness retries,
+  // but only a prompt row with a readable pane starts screen-block time.
+  deliveryLifecycle?.defer(key, paneRead ? 'menu' : undefined)
+  return deferPromptRow(key, state, noNotice)
 }
 
 /**
@@ -2861,11 +2900,11 @@ export function promptRowLatchedLine(key: string, state: string): string {
  * its later attempts reconnect a `waiting` row, or a `working` row the
  * positive-idle rule shows stale.
  */
-function deferPromptRow(key: string, state: string): 'transient' {
+function deferPromptRow(key: string, state: string, noNotice = false): 'transient' {
   console.error(
     `[slack] reconnectSession: persona=${key} is ${state} — its session waits on a prompt or dialog; not typing /mcp reconnect into it, deferring to a later tick (b.f2b/b.rmy)`,
   )
-  notifyPersonaNotConnected(key, { reason: 'blocked-on-prompt', autoRestartDisabled: false })
+  if (!noNotice) notifyPersonaNotConnected(key, { reason: 'blocked-on-prompt', autoRestartDisabled: false })
   return 'transient'
 }
 
@@ -3169,6 +3208,7 @@ async function workingReconnectVerdict(
   key: string,
   getPersona: ((key: string) => Persona | undefined) | undefined,
   latchedNow: () => boolean,
+  noNotice = false,
 ): Promise<ReconnectEscalateDead | 'transient' | 'reconnect'> {
   if (isLaunchInFlight(key)) {
     console.error(`[slack] reconnectSession: persona=${key} is working and a launch for it is in flight — deferring /mcp reconnect to a later tick (b.d61)`)
@@ -3204,10 +3244,11 @@ async function workingReconnectVerdict(
   }
   switch (read.kind) {
     case PANE_READ_PANE:
+      if (classifyWorkingPane(read.pane) === 'prompt') deliveryLifecycle?.defer(key, 'menu')
       // b.f2b: the fold on this pane (and the transcript, for an idle one),
       // kept across attempts; `checkWorkingRowPane` logs what it found (a
       // running turn logs the b.9a7 deferral line).
-      return (await checkWorkingRowPane(key, read.pane, { persona: getPersona?.(key), latchedNow })) === 'reconnect'
+      return (await checkWorkingRowPane(key, read.pane, { persona: getPersona?.(key), latchedNow, noNotice })) === 'reconnect'
         ? 'reconnect'
         : 'transient'
     case PANE_READ_GONE:
@@ -3224,7 +3265,7 @@ async function workingReconnectVerdict(
       )
       // b.f2b: held back from the row once more; a long run is reported. The
       // restart path runs only with auto-restart on.
-      noteWorkingRowDeferral(key, false)
+      if (!noNotice) noteWorkingRowDeferral(key, false)
       return 'transient'
     case PANE_READ_ENVIRONMENT:
     case PANE_READ_UNCLASSIFIED:
@@ -3396,6 +3437,7 @@ export async function main(): Promise<void> {
     resolveUserName: resolvePersonaUserName,
     clientFor,
     wake: key => deliveryQueueWake.wake(key),
+    onPending: key => deliveryEngines?.wake(key),
   })
 
   // b.jg5 SRJ-801, SRJ-802: the retired-key record (retired-keys.json in the
@@ -3475,7 +3517,7 @@ export async function main(): Promise<void> {
     // b.jg5 SRJ-808, SRJ-404: apply step 1 stops the dialog approver of each
     // key it records, right after the record and before the last-applied
     // rewrite and the teardown's kill; no pending-row rule run follows.
-    stopApprover: (key) => stopDialogApprover(key, APPROVER_STOP_RETIRED_KEY),
+    stopApprover: async (key) => { const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); await stopDialogApprover(key, APPROVER_STOP_RETIRED_KEY); await stopping },
     // b.av2 SR-8.6 as amended by b.jg5 SRJ-1511, beside b.deo SRI-406,
     // SRI-408 and SRI-502: a confirmed apply's step 1 writes the unwritten
     // drops of a key it brings up, drops the retired keys' stored choices and
@@ -4130,7 +4172,9 @@ export async function main(): Promise<void> {
   // reading the clear brought (the live reading of a tick or a retry that
   // found the row healthy, or a launch call's `pending`), so the timer stops
   // unless its `pending` or kill-failure exception holds.
+  const deliveryScope = createDeliveryAdScope()
   initOutageState({
+    deliveryScope,
     // b.jg5 SRJ-1002, SRJ-1003: each onset and all-clear carries its phase
     // and classes, so the notifier writes the all-clear of an outage whose
     // onset a persona teardown's window routed as that onset was.
@@ -4147,6 +4191,51 @@ export async function main(): Promise<void> {
       }
     },
   })
+
+
+  // b.omv SR-5/6: one gate for every automatic key path, independent
+  // delivery clients and retry ownership even with health checks disabled.
+  deliveryLifecycle = createDeliveryLifecycle({
+    startId: randomBytes(16).toString('hex'), parseLaunchStart,
+    onReconnectScreen: (key, reason, blockedMs) => deliveryEngineEvents.emit({ type: 'reconnect-screen', key, reason, blockedMs }),
+    onError: error => console.error(`[slack] deferred reconnect failed: ${describeThrownValue(error)}`),
+  })
+  setDeliveryLifecycle(deliveryLifecycle)
+  setDeliveryPersonaLookup(getAppliedPersona)
+  deliveryClients = createDeliveryClientFactory(agentDirectorCallTimeoutMsOf(personaConfig))
+  const deferredReconnect = _buildReconnectSessionAdapter(getAppliedPersona, key => conflictLatch.isLatched(key), getAppliedPersona, { noNotice: true })
+  deliveryEngines = createDeliveryEngines({
+    queue: deliveryQueue!, lifecycle: deliveryLifecycle,
+    clientFor: key => deliveryClients!.clientFor(key),
+    call: (key, verb, client, run) => withOutageDetection(key, undefined, verb, c => run(c), { client: client as Client, armsNothing: { personaConfigured: () => !!getAppliedPersona(key) } }),
+    instanceId: personaInstanceId,
+    persona: key => { const p = getAppliedPersona(key); return p ? { cwd: p.working_directory, configDir: resolveClaudeConfigDir(p.claude_config_dir) } : undefined },
+    isUp: key => !shuttingDown && isPersonaUp(key),
+    isLatched: key => conflictLatch.isLatched(key),
+    isHeld: key => invalidFlagsHold.isHeld(key) || personaKillFailureAlerts?.isOpen(key) === true || waitsOnKillFailedHold(key) || isOwnRowOldLifeHeld(key),
+    isConnected: key => getSessionByPersona(key)?.connected === true,
+    // The engine can notice a newly accepted head while its Slack handler
+    // is still acknowledging it. Only post-ack intake/recovery may start
+    // name lookups; an unfixed head waits for that owner's durable wake.
+    prepare: (key, item) => deliveryPreparation!.owns(key, item.accepted.seq) ? deliveryPreparation!.prepare(key, item) : Promise.resolve(),
+    onRow: applyDeliveryOwnRowRead,
+    onKeyError: handleDeliveryKeyError,
+    onReadError: handleDeliveryReadError,
+    isRestartPendingOrActive, scheduleRestart,
+    onEvent: event => deliveryEngineEvents.emit(event),
+    onError: (key, error) => console.error(`[slack] delivery persona=${key}: ${describeThrownValue(error)}`),
+    reconnect: (key, client, beforeCall) => deliveryScope.run(key, client as Client, beforeCall, async () => {
+      const result = await deferredReconnect(key)
+      if (typeof result === 'object' && !isRestartPendingOrActive(key)) {
+        const p = getAppliedPersona(key)
+        if (p) scheduleRestart(key, p.working_directory)
+      }
+    }),
+  })
+  deliveryQueueWake.wake = key => deliveryEngines?.wake(key)
+  // Retained in-flight items need recovery before launch reconnects; an
+  // accepted-only head has no keys to recover and is fixed after bring-up.
+  for (const p of personaConfig.personas) if (deliveryQueue!.items(p.key).some(i => !i.delivered && i.records.some(r => r.kind === 'sent'))) deliveryEngines.wake(p.key)
   setSessionNotifier(personaNotifier.notify)
 
   // b.av2 SR-3.1: one Slack connection per persona. Each connection's
@@ -4233,7 +4322,7 @@ export async function main(): Promise<void> {
     serialize: personaLifecycle.run,
     bringUps: personaBringUps,
     connections: manager,
-    routing: { ...personaRouting, forget: key => { personaRouting.forget(key); deliveryPreparation?.forget(key) } },
+    routing: { ...personaRouting, forget: key => { personaRouting.forget(key); deliveryPreparation?.forget(key); void deliveryEngines?.forget(key); deliveryLifecycle?.forget(key) } },
     destinations: personaDestinations,
     destinationHold: personaDestinationHold,
     notifier: personaNotifier,
@@ -4244,7 +4333,7 @@ export async function main(): Promise<void> {
     whenLaunchSettled,
     // b.jg5 SRJ-404, SRJ-715: a teardown stops the key's dialog approver
     // first, and the one its launch in flight would start.
-    stopApprover: (key) => stopDialogApprover(key, APPROVER_STOP_TEARDOWN),
+    stopApprover: async (key) => { const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); await stopDialogApprover(key, APPROVER_STOP_TEARDOWN); await stopping },
     // b.jg5 SRJ-706, SRJ-715: right after the approver, the key's live-row
     // sequence, before the wait for its launch in flight; the teardown waits
     // for the sequence's call in flight to return.

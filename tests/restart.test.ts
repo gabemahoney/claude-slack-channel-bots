@@ -1,3 +1,7 @@
+import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
+import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
+import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
+useImmediateTypingLifecycle()
 /**
  * restart.test.ts — Tests for auto-restart scheduling logic.
  *
@@ -223,7 +227,11 @@ import {
   _resetOutageState,
   initOutageState,
 } from '../src/outage-state.ts'
-import { makeStubClient } from './test-helpers/agent-director-stub.ts'
+import { makeStubClient as makeBaseStubClient } from './test-helpers/agent-director-stub.ts'
+
+function makeStubClient(options: Parameters<typeof makeBaseStubClient>[0] = {}) {
+  return makeBaseStubClient({ readPaneResults: [cannedReadPaneResult(IDLE_PANE)], ...options })
+}
 import { AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_UNCLASSIFIED, CSCB_UNKNOWN_ERROR_NAME, describeAgentDirectorFailure } from '../src/ad-error-class.ts'
 import {
   cannedErr,
@@ -2415,7 +2423,7 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
     // B: the liveness probe and the reconnect adapter's probe, then one
     // `/mcp reconnect`; never killed or respawned.
     expect(callsFor(statusCalls, b)).toHaveLength(2)
-    expect(callsFor(sendKeysCalls, b)).toHaveLength(1)
+    expect(callsFor(sendKeysCalls, b)).toHaveLength(2)
     expect(getFailureCount(b.key)).toBe(0)
   })
 
@@ -2462,7 +2470,7 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
 
     // Control: B is probed and reconnected exactly as today.
     expect(callsFor(statusCalls, b)).toHaveLength(2)
-    expect(callsFor(sendKeysCalls, b)).toHaveLength(1)
+    expect(callsFor(sendKeysCalls, b)).toHaveLength(2)
     expect(getFailureCount(b.key)).toBe(0)
     expect(isRestartPendingOrActive(b.key)).toBe(false)
   })
@@ -2497,7 +2505,7 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
 
     // Control: B is probed and reconnected exactly as today.
     expect(callsFor(statusCalls, b)).toHaveLength(2)
-    expect(callsFor(sendKeysCalls, b)).toHaveLength(1)
+    expect(callsFor(sendKeysCalls, b)).toHaveLength(2)
     expect(getFailureCount(b.key)).toBe(0)
   })
 
@@ -3658,6 +3666,7 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
     h.script({
       spawnQueue: [cannedErr<SpawnResult>(errInstanceIdCollision())],
       getQueue: [
+        ...(reach.script.sendKeysError ? [cannedOk(cannedGetResult({ state: 'waiting' }, persona, h.home))] : []),
         cannedOk(cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, persona, h.home)),
         cannedOk(cannedGetResult(reread(h, persona), persona, h.home)),
       ],
@@ -3722,6 +3731,7 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
     h.script({
       spawnQueue: [cannedErr<SpawnResult>(errInstanceIdCollision())],
       getQueue: [
+        cannedOk(cannedGetResult({ state: 'waiting' }, persona, h.home)),
         cannedOk(cannedGetResult({ state: 'waiting' }, persona, h.home)),
         cannedOk(cannedGetResult({ state: 'waiting' }, persona, h.home)),
       ],
@@ -4795,7 +4805,7 @@ describe('restart: the reply-guard record holds the effective value before the r
    * installed over it; and a stub AD client whose row is gone (`row: 'gone'`,
    * the spawn succeeds) or `ended` (the spawn collides and the row resumes).
    */
-  function setup(stopHookBootstrap: boolean, row: 'gone' | 'ended'): { config: PersonaConfig; a: Persona } {
+  function setup(stopHookBootstrap: boolean, row: 'gone' | 'ended' | 'waiting'): { config: PersonaConfig; a: Persona } {
     const config = makeMultiPersonaConfig(
       [{ name: 'Alpha Desk', claude_config_dir: configDir, stop_hook_bootstrap: stopHookBootstrap }],
       dir,
@@ -4810,7 +4820,7 @@ describe('restart: the reply-guard record holds the effective value before the r
       resumeCalls,
       sendKeysCalls,
       spawnQueue: row === 'ended' ? [cannedErr<SpawnResult>(errInstanceIdCollision())] : undefined,
-      getResult: cannedGetResult({ state: 'ended' }, a, dir),
+      getResult: cannedGetResult({ state: row === 'waiting' ? 'waiting' : 'ended' }, a, dir),
     }), (call) => {
       events.push(call)
       seen.push({ call, record: rg.readRecord(a.key), launchedWith: getLaunchedWithDir(a.key) })
@@ -4860,7 +4870,7 @@ describe('restart: the reply-guard record holds the effective value before the r
   })
 
   test('live session: the restart reconnects through the real adapter — no launch, no reply-guard step, no record', async () => {
-    const { a } = setup(true, 'gone')
+    const { a } = setup(true, 'waiting')
     const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
     deps.reconnectSession = _buildReconnectSessionAdapter()
     initRestart(deps)
@@ -4868,7 +4878,7 @@ describe('restart: the reply-guard record holds the effective value before the r
     scheduleRestart(a.key, a.working_directory)
     await waitFor(() => sendKeysCalls.length > 0 && !isRestartPendingOrActive(a.key))
 
-    expect(sendKeysCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(a.key)])
+    expect(sendKeysCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(a.key), personaInstanceId(a.key)])
     expect(deps.killSessionCalls).toEqual([])
     expect(deps.launchSessionCalls).toEqual([])
     expect(events).toEqual([])
@@ -7621,7 +7631,7 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
       // no sweep, no kill, no spawn or resume.
       expect(h.stub.calls.statusCalls).toHaveLength(2)
       expect(h.stub.calls.sendKeysCalls).toHaveLength(1)
-      expect(Object.keys(callCounts(h)).sort()).toEqual(['readPaneCalls', 'sendKeysCalls', 'statusCalls'])
+      expect(callCounts(h)).toEqual({ getCalls: 1, readPaneCalls: 3, sendKeysCalls: 1, statusCalls: 2 })
       expect(h.errors.filter((l) => l.startsWith('[slack] escalate-dead'))).toEqual([])
       expect(h.triggers).toEqual([{ key: p, kind: cause }])
       expectNothingCounted(h, p)
@@ -9775,7 +9785,7 @@ describe('b.jg5 SRJ-505, SRJ-502: the latch re-check\'s own run of the restart p
 
       expect(refused()).toBe(refuseAtRead)
       expect(statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(P)])
-      expect(sendKeysCalls.map((c) => c.instance_id)).toEqual(refuseAtRead ? [] : [personaInstanceId(P)])
+      expect(sendKeysCalls.map((c) => c.instance_id)).toEqual(refuseAtRead ? [] : [personaInstanceId(P), personaInstanceId(P)])
       if (refuseAtRead) expect(readPaneCalls).toEqual([])
       expect(deps.killSessionCalls).toEqual([])
       expect(deps.launchSessionCalls).toEqual([])

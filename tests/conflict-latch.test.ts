@@ -1,4 +1,8 @@
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
+import { TRUST_DIALOG_PANE } from './test-helpers/working-row-panes.ts'
+import { MCP_SERVER_NAME } from '../src/config.ts'
+import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
+useImmediateTypingLifecycle()
 /**
  * conflict-latch.test.ts — CONFLICT case recognition (b.jg5 SRJ-507), the
  * `tests/conflict-latch.test.ts` half of SRJ-1303, and the latch record
@@ -683,7 +687,6 @@ import {
   APPROVER_STOP_CAP,
   APPROVER_STOP_LATCHED,
   DIALOG_POLL_INTERVAL_MS,
-  TRUST_DIALOG_NEEDLE,
   _resetNotConnectedEpisodes,
   isLaunchInFlight,
   notifyPersonaNotConnected,
@@ -3537,7 +3540,10 @@ describe('SRJ-118, SRJ-505: a CONFLICT or UNUSABLE NAME at the reconnect\'s send
     expect(tick.qCalls).toEqual({ statusCalls: 1 })
     h.script(collided(h, personaOf(h, q), { state: 'waiting' }))
     expect(await h.launch(q)).toEqual({ key: q, action: 'reconnected' })
-    expect(h.stub.calls.sendKeysCalls.filter((call) => call.instance_id === personaInstanceId(q))).toHaveLength(1)
+    expect(h.stub.calls.sendKeysCalls.filter((call) => call.instance_id === personaInstanceId(q))).toEqual([
+      { instance_id: personaInstanceId(q), text: `/mcp reconnect ${MCP_SERVER_NAME}`, no_enter: true },
+      { instance_id: personaInstanceId(q), key: 'Enter' },
+    ])
   })
 })
 
@@ -4688,8 +4694,9 @@ function approverVerbOf(site: string): ApproverVerb {
   return site.slice('approver '.length) as ApproverVerb
 }
 
-/** The calls one approver lap makes up to and including its call at `verb`, by verb (one each). */
+/** Calls through `verb`, including the fresh status and pane guard before Enter. */
 function lapCallsThrough(verb: ApproverVerb): Record<string, number> {
+  if (verb === 'send-keys') return { statusCalls: 2, readPaneCalls: 2, sendKeysCalls: 1 }
   const verbs = APPROVER_SITES.map(approverVerbOf)
   return Object.fromEntries(verbs.slice(0, verbs.indexOf(verb) + 1).map((v) => [APPROVER_VERB_CALLS[v], 1]))
 }
@@ -4741,7 +4748,7 @@ const APPROVER_LATCH_CASES: ReadonlyArray<readonly [string, ApproverLatchCase]> 
  */
 function approverMeets(run: AutomatedPathsRun, key: string, verb: ApproverVerb, err: Error): void {
   const { h } = run
-  h.script({ readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_NEEDLE)] })
+  h.script({ readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)] })
   const id = personaInstanceId(key)
   const client = h.stub.client
   if (verb === 'status') {
@@ -4872,7 +4879,7 @@ describe('the dialog approver\'s latches: its own CONFLICT or UNUSABLE NAME latc
     const [p, q] = h.keys as [string, string]
     run.readPending(p)
     run.readPending(q)
-    h.script({ readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_NEEDLE)] })
+    h.script({ readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)] })
     let pAtLatch: Record<string, number> | undefined
     const latchNow = async (): Promise<void> => {
       await latchP(run, p)
@@ -5335,11 +5342,11 @@ describe('the not-resumable step\'s re-read latches (recovery harness; SRJ-710, 
     expect([h.latch.isLatched(q), personaCallCounts(h, q)]).toEqual([false, {}])
   }
 
-  /** P's launch: the colliding spawn, the collision `get` reading P's `waiting` row, its reconnect's GONE, the find-missing run, the `resume`'s ErrSpawnNotResumable and its re-read reading `reread`. */
+  /** P's collision and fresh reconnect gets both read waiting; after GONE and resume's ErrSpawnNotResumable, the re-read sees `reread`. */
   function scriptReread(h: RecoveryHarness, p: string, reread: Record<string, unknown>): void {
     h.script({
       ...collided(h, personaOf(h, p), { state: 'waiting' }),
-      getQueue: [cannedOk(cannedGetResult({ state: 'waiting' }, personaOf(h, p), h.home))],
+      getQueue: Array.from({ length: 2 }, () => cannedOk(cannedGetResult({ state: 'waiting' }, personaOf(h, p), h.home))),
       getResult: cannedGetResult(reread, personaOf(h, p), h.home),
       sendKeysError: errTmuxSendKeys(),
       resumeError: errSpawnNotResumable(),
@@ -5347,7 +5354,7 @@ describe('the not-resumable step\'s re-read latches (recovery harness; SRJ-710, 
   }
 
   /** The ladder's calls up to the re-read: nothing after it. */
-  const LADDER_TO_REREAD = ['spawn', 'get', 'sendKeys', 'findMissing', 'resume', 'get']
+  const LADDER_TO_REREAD = ['spawn', 'get', 'get', 'readPane', 'readPane', 'sendKeys', 'findMissing', 'resume', 'get']
 
   test('the re-read carries a provenance_conflict note: P latches once with the shared own-row read\'s record ("conflicting labels", slack_bot_<key>, no description) and one post; no sequence starts, though the path holds dead evidence; no call after the re-read', async () => {
     const { h, p, q } = makeRun()

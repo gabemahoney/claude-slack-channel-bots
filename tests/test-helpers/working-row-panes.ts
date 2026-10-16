@@ -240,7 +240,7 @@ export function withLastLine(line: string): string {
 }
 
 /** Claude Code's prompt box on Linux (2.1.280): the `❯` prompt, and the footer. */
-const LINUX_PROMPT_BOX = [
+export const LINUX_PROMPT_BOX = [
   '────────────────────────────────────────────────────────────────────────',
   '❯ ',
   '────────────────────────────────────────────────────────────────────────',
@@ -458,4 +458,29 @@ export function writeTranscript(path: string, entries: readonly TranscriptEntry[
 /** Append `entries` to the transcript at `path`, as Claude Code does while a session runs. */
 export function appendTranscript(path: string, entries: readonly TranscriptEntry[]): void {
   appendFileSync(path, transcriptJsonl(entries))
+}
+
+/** Concrete composer drawings, shared by delivery, replay and reconnect tests
+ * (b.omv SR-5.3/5.4). No long/tall-paste research assumptions are added here. */
+export function deliveryPane(text = '', options: { agent?: 'claude' | 'codex'; running?: boolean; marker?: '>' | '❯'; footer?: string; history?: string } = {}): string {
+  const history = options.history ?? (options.running ? '✻ Thinking… (2s · ↓ 100 tokens)\n' : '')
+  if (options.agent === 'codex') return `${history}› ${text.replace(/\n/g, '\n  ')}\n${options.footer ?? '? for shortcuts'}`
+  const [upper, , lower, footer] = LINUX_PROMPT_BOX
+  return `${history}${upper}\n${options.marker ?? '❯'} ${text.replace(/\n/g, '\n  ')}\n${lower}\n${options.footer ?? footer}`
+}
+
+export function queuedCommandEntry(text: string, extra: TranscriptEntry = {}): TranscriptEntry {
+  return { ...hookAttachmentEntry('queued_command'), attachment: { type: 'queued_command', prompt: text }, ...extra }
+}
+export function queueOperationEntry(operation: string, text: string, reason?: string): TranscriptEntry {
+  return { type: 'queue-operation', operation, content: text, ...(reason ? { reason } : {}) }
+}
+export function codexPromptEntry(text: string): TranscriptEntry {
+  return { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } }
+}
+export function codexTurnEntry(type: 'task_started' | 'task_complete'): TranscriptEntry {
+  return { type: 'event_msg', payload: { type } }
+}
+export function pastedText(text: string, id = 'abcd'): string {
+  return `<pasted_content id="${id}">\n${text}\n</pasted_content id="${id}">`
 }

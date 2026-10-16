@@ -444,6 +444,10 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { ENTER_DELAY_MS } from './delivery-constants.ts'
+import type { DeliveryLifecycle } from './delivery-lifecycle.ts'
+import { readDeliveryScreen } from './delivery-screen.ts'
+import { decideGate, createDeliveryPolicyState, type DeliveryReading } from './delivery-policy.ts'
 import type {
   Client,
   FindMissingResult,
@@ -2869,6 +2873,40 @@ function ownRowActGoes(key: string, at: OwnRowReadSite): boolean {
  * "latches no one" line is logged once per note for a persona and again only
  * when the note on its row changes (`nonLatchingNoteLogged`). Never throws.
  */
+/** Shared E3 gate, installed by main before any launch (b.omv SR-5.5). */
+let deliveryLifecycle: DeliveryLifecycle | undefined
+export function setDeliveryLifecycle(value: DeliveryLifecycle | undefined): void { deliveryLifecycle = value }
+
+/** Delivery reads retain row/pane classification without opening a recovery episode. */
+export async function handleDeliveryReadError(key: string, error: unknown, verb: 'get' | 'read-pane'): Promise<void> {
+  if (isInvalidFlagsError(error)) { await classifyWithInvalidFlagsRecheck(error); return }
+  const at = { site: 'delivery engine', what: verb }
+  if (verb === 'get') { applyOwnRowStatusStep(key, { thrown: error }, at); return }
+  const cls = classifyAdError(error).errorClass
+  if (cls === AD_ERROR_CLASS_CONFLICT) latchOnConflict(key, error, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, LATCH_ROW_STATE_UNREADABLE)
+  if (cls === AD_ERROR_CLASS_UNUSABLE_NAME) latchOnUnusableNameRead(key, error, at)
+}
+
+/** Apply the existing own-row rules to an isolated delivery-client reading. */
+export function applyDeliveryOwnRowRead(key: string, row: GetResult): boolean {
+  const at = { site: 'delivery engine', what: 'get' }
+  endKillFailureEpisodeOnRead(key, { state: row.state })
+  endStuckLaunchEpisodeOnRead(key, row.state)
+  settleResumeOnRead(key, { state: row.state }, at)
+  noteOldLifeRowRead(personaInstanceId(key), { kind: OLD_LIFE_ROW_READ_STATE, state: row.state, cwd: row.cwd }, oldLifeReadName(at))
+  deliveryLifecycle?.observeRow(key, row)
+  const latched = actOnOwnRowRead(key, row, at, true) !== undefined
+  checkThisLaunchRowOnRead(key, { state: row.state, launchStartedAt: row.launch_started_at }, latched, at)
+  return latched
+}
+/** Use the existing reconnect classifier for delivery call errors without
+ * treating a possibly pending row as a dead session (SR-5.6). */
+export async function handleDeliveryKeyError(key: string, error: unknown, row: GetResult): Promise<void> {
+  if (isInvalidFlagsError(error)) { await classifyWithInvalidFlagsRecheck(error); return }
+  if (isAdErrorInstance(error, ErrSpawnNotInteractive) || isAdErrorInstance(error, ErrSpawnNotFound)) return
+  await reconnectAnswerTo(key, latchRowStateRead(row.state), keyRef(key), error)
+}
+
 export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promise<OwnRowRead> {
   let row: GetResult
   try {
@@ -2911,6 +2949,7 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
   // b.jg5 SRJ-809: a row read `ended` or `missing` ends an old-life hold on
   // it, and a live one's `cwd` becomes the held directory.
   noteOldLifeRowRead(personaInstanceId(key), { kind: OLD_LIFE_ROW_READ_STATE, state: row.state, cwd: row.cwd }, oldLifeReadName(at))
+  deliveryLifecycle?.observeRow(key, row)
   const latched = actOnOwnRowRead(key, row, at, true) !== undefined
   // b.jg5 SRJ-310 rule 3, SRJ-407: this launch's row read live other than `pending` ends the condition.
   checkThisLaunchRowOnRead(key, { state: row.state, launchStartedAt: row.launch_started_at }, latched, at)
@@ -3194,6 +3233,7 @@ export type OwnRowStatusAnswer =
  */
 export function applyOwnRowStatusStep(key: string, answer: OwnRowStatusAnswer, at: OwnRowReadSite): boolean {
   try {
+    if (!('thrown' in answer)) deliveryLifecycle?.observeRow(key, answer.result)
     // b.jg5 SRJ-704, SRJ-1016: a row read `ended` or `missing`, or gone, ends
     // the persona's kill-failure episode, whoever made the call.
     endKillFailureEpisodeOnRead(key, 'thrown' in answer ? { thrown: answer.thrown } : { state: answer.result.state })
@@ -3489,7 +3529,10 @@ export const PENDING_ROW_RULE_GET_SITE: OwnRowReadSite = Object.freeze({ site: P
  * most to Enter through `send-keys`, the backstop. Pure; never throws.
  */
 export function paneShowsStartupDialog(pane: string): boolean {
-  return typeof pane === 'string' && PRE_SESSION_DIALOG_NEEDLES.some((needle) => pane.includes(needle))
+  return typeof pane === 'string' &&
+    readDeliveryScreen('claude', pane).kind === 'menu' &&
+    paneShowsDialog(paneLines(pane).slice(-40)) &&
+    PRE_SESSION_DIALOG_NEEDLES.some((needle) => pane.includes(needle))
 }
 
 /**
@@ -3548,9 +3591,10 @@ export async function sendPendingRowLapEnter(key: string, ref: string = keyRef(k
   if (personaLatchedNow(key)) return PENDING_ROW_LAP_ENTER_NOT_SENT_LATCHED
   let failure: PendingRowLapEnterFailure
   try {
-    await withOutageDetection(key, undefined, 'send-keys', (client) =>
+    const sent = await withStartupTyping(key, () => withOutageDetection(key, undefined, 'send-keys', (client) =>
       client.sendKeys({ instance_id: personaInstanceId(key), text: '', allow_pending: true }),
-    )
+    ).then(() => {}))
+    if (!sent) return { kind: 'unclassified', errorClass: AD_ERROR_CLASS_UNCLASSIFIED, description: 'Startup answer deferred by typing gate or fresh prompt check' }
     return { kind: PENDING_ROW_LAP_ENTER_SENT }
   } catch (err) {
     if (isInvalidFlagsError(err)) return lapEnterInvalidFlagsOutcome(key, ref, err)
@@ -4005,11 +4049,17 @@ export async function reconnectMcp(
 }
 
 /**
- * Send `/mcp reconnect <MCP_SERVER_NAME>` to persona `key`'s row: exactly one
- * `sendKeys` through `withOutageDetection`, declaring the `send-keys` verb
- * (tmux-touching), with the library appending Enter. It never retries, never
- * starts a tmux server and makes no tmux call of its own (b.jg5 SRJ-609, HO
- * C20). Each answer is decided by class through `src/ad-error-class.ts`
+ * Send `/mcp reconnect <MCP_SERVER_NAME>` to persona `key`'s row after fresh
+ * recovery, own-row and screen guards establish an empty, idle input and
+ * the persona's typing gate is acquired (b.omv SR-5.5). Send the text with
+ * `no_enter: true`, wait `ENTER_DELAY_MS`, recheck lifecycle ownership,
+ * latch and old-life hold, then send `key: 'Enter'`. Both `sendKeys` calls
+ * go through `withOutageDetection`, declaring the `send-keys` verb
+ * (tmux-touching). A failed key is never retried inline; blocked or
+ * transient runs are deferred for the active delivery engine or the
+ * lifecycle timer to retry under fresh guards. It never starts a tmux
+ * server and makes no tmux call of its own (b.jg5 SRJ-609, HO C20).
+ * Each answer is decided by class through `src/ad-error-class.ts`
  * (`classifyAdError`, `isAdErrorInstance`), never by an error's name (b.jg5
  * SRJ-118's reconnect row):
  *
@@ -4067,8 +4117,9 @@ export async function reconnectMcp(
  *     UNAVAILABLE column.
  *
  * No path posts a spawn-failure notice, records a `spawn-failed` entry or
- * counts anything. Nothing is typed on any path but success. One line per
- * call, from an exported builder (`reconnectStartLine`, then one of
+ * counts anything. A failure or deferral after the text call can leave text
+ * without Enter. Guard deferrals can return before the start line; typing
+ * logs use exported builders (`reconnectStartLine`, then one of
  * `reconnectLatchedLine`, `reconnectGoneLine`, `reconnectNotInteractiveLine`,
  * `reconnectRowAbsentLine`, `reconnectConflictLine`,
  * `reconnectUnusableNameLine`, `reconnectInvalidFlagsLine` and
@@ -4085,30 +4136,103 @@ export async function reconnectMcpWithCause(
   key: string,
   lastRead: LatchRowState,
   ref: string = keyRef(key),
+  options: { workingChecked?: { launchId: string | undefined } } = {},
 ): Promise<ReconnectResult> {
+  const life = deliveryLifecycle
+  // Direct launch callers share the adapter's screen-time accounting: only
+  // a finding in this run may resume the previously accumulated screen wait.
+  if (life?.deferred(key)) life.defer(key)
+  const defer = (screen?: 'input' | 'menu'): ReconnectResult => { life?.defer(key, screen); return { outcome: 'transient' } }
   if (personaLatchedNow(key)) {
     console.error(reconnectLatchedLine(ref))
+    life?.defer(key)
     return { outcome: 'transient', latched: true }
   }
-  // b.jg5 SRJ-810: no `/mcp reconnect` is typed into a held old life; the
-  // persona waits on that hold, so the hold's end retries it at once.
   if (isOwnRowOldLifeHeld(key)) {
     recordOwnRowWaiting(key)
     console.error(reconnectHeldLine(ref, personaInstanceId(key), armOldLifeHoldTimer(key)))
-    return { outcome: 'transient' }
+    return defer()
   }
+  if (life && (!life.active(key) || life.owner(key) !== 'free')) return defer()
+  // Recovery owns old in-flight text before even a launch's reconnect,
+  // including while MCP is disconnected (b.omv SR-5.5/6.5).
+  if (life && !await life.recoverBeforeReconnect(key)) return defer()
+  if (personaLatchedNow(key)) { life?.defer(key); return { outcome: 'transient', latched: true } }
+  if (isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key)) return defer()
+  const read = await readPersonaOwnRow(key, { site: 'reconnect', what: 'fresh get' })
+  if (read.kind === OWN_ROW_READ_ABSENT) { life?.clearDeferred(key); return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_ABSENT } }
+  if (read.kind !== OWN_ROW_READ_ROW || read.latched) return defer()
+  const row = read.row
+  if (life && !await life.recoverBeforeReconnect(key)) return defer()
+  if (AGENT_DIRECTOR_DEAD_STATES.has(row.state)) { life?.clearDeferred(key); return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE } }
+  if (!['waiting', 'working'].includes(row.state) || row.relay_mode !== 'on') return defer()
+  // Every caller receives the existing positive-idle/prompt guard. Only the
+  // restart adapter's outer run may raise its existing prompt notices.
+  if (row.state === 'waiting') {
+    const checked = await checkWaitingRowPane(key, () => personaLatchedNow(key), { noNotice: true })
+    if (checked === WAITING_ROW_PANE_GONE || checked === WAITING_ROW_PANE_ABSENT) { life?.clearDeferred(key); return { outcome: 'dead-session', deadCause: checked === WAITING_ROW_PANE_GONE ? DEAD_SESSION_CAUSE_TMUX_GONE : DEAD_SESSION_CAUSE_ROW_ABSENT } }
+    if (checked === 'defer') {
+      // A prompt finding has already recorded its reason and elapsed time.
+      if (!life?.deferred(key)) life?.defer(key)
+      return { outcome: 'transient' }
+    }
+  }
+  let pane: string
+  try {
+    pane = (await withOutageDetection(key, undefined, 'read-pane', client => client.readPane({ instance_id: personaInstanceId(key), n_lines: 40 }))).pane
+  } catch (err) {
+    const deliveryPaneFailureOutcome = await reconnectAnswerTo(key, lastRead, ref, err)
+    if (deliveryPaneFailureOutcome.outcome === 'dead-session') life?.clearDeferred(key)
+    else life?.defer(key) // a failed read is never screen-blocked time
+    return deliveryPaneFailureOutcome
+  }
+  const screen = readDeliveryScreen(row.agent === 'codex' ? 'codex' : 'claude', pane)
+  if (screen.kind !== 'empty') return defer(screen.kind === 'input' || screen.kind === 'own' ? 'input' : 'menu')
+  if (screen.running || classifyWorkingPane(pane) === 'busy') return defer()
+  const workingChecked = options.workingChecked !== undefined && options.workingChecked.launchId === life?.launchId(key)
+  if (row.state === 'working' && !workingChecked && await checkWorkingRowPane(key, pane, { noNotice: true, persona: configuredPersonaForDelivery(key), latchedNow: () => personaLatchedNow(key) }) !== 'reconnect') return defer()
+  const reading: DeliveryReading = { row: row.state, screen: 'empty', box: '', relay: true, marker: true, mcp: false, up: true, latched: personaLatchedNow(key), held: isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key), readable: true, receipts: [], idleEvidence: row.state === 'working', launch: '', session: row.session_id, compactions: '', gate: life?.owner(key) ?? 'free', offset: 0, records: [] }
+  const gateChoice = decideGate({ p: { accepted: [], fixed: [], sent: [], refused: [], delivered: [] }, e: createDeliveryPolicyState(), r: reading, g: { owner: life?.owner(key) ?? 'free', stage: 'none', deferred: true, due: true }, writer: { kind: 'none' }, compact: 'none' })
+  if (gateChoice !== 'runReconnect') return defer()
+  const release = life?.acquire(key, 'reconnect')
+  if (life && !release) return defer()
   console.error(reconnectStartLine(ref))
   try {
-    await withOutageDetection(key, undefined, 'send-keys', (client) =>
-      client.sendKeys({
-        instance_id: personaInstanceId(key),
-        text: `/mcp reconnect ${MCP_SERVER_NAME}`,
-      }),
-    )
+    await withOutageDetection(key, undefined, 'send-keys', client => client.sendKeys({ instance_id: personaInstanceId(key), text: `/mcp reconnect ${MCP_SERVER_NAME}`, no_enter: true }))
+    if (life) await life.pause(ENTER_DELAY_MS)
+    else await new Promise(resolve => setTimeout(resolve, ENTER_DELAY_MS))
+    if (life && (!life.active(key) || life.owner(key) !== 'reconnect')) return { outcome: 'transient' }
+    if (personaLatchedNow(key) || isOwnRowOldLifeHeld(key)) return defer()
+    await withOutageDetection(key, undefined, 'send-keys', client => client.sendKeys({ instance_id: personaInstanceId(key), key: 'Enter' }))
+    life?.clearDeferred(key)
     return { outcome: 'ok' }
   } catch (err) {
-    return reconnectAnswerTo(key, lastRead, ref, err)
-  }
+    const deliveryKeyFailureOutcome = await reconnectAnswerTo(key, lastRead, ref, err)
+    if (deliveryKeyFailureOutcome.outcome === 'dead-session') life?.clearDeferred(key)
+    else life?.defer(key)
+    return deliveryKeyFailureOutcome
+  } finally { release?.() }
+}
+
+/** The server supplies the applied persona for the existing working guard. */
+let configuredPersonaForDelivery: (key: string) => Persona | undefined = () => undefined
+export function setDeliveryPersonaLookup(lookup: (key: string) => Persona | undefined): void { configuredPersonaForDelivery = lookup }
+
+/** Fresh startup-prompt proof under the same gate as delivery/reconnect. */
+async function withStartupTyping(key: string, work: () => Promise<void>): Promise<boolean> {
+  const life = deliveryLifecycle
+  if (life?.hasWaited(key)) return false
+  const release = life?.acquire(key, 'startup')
+  if (life && !release) return false
+  try {
+    const status = await readPersonaOwnRowStatus(key, { site: 'startup answer', what: 'fresh status' })
+    if (status.kind !== OWN_ROW_STATUS_STATE || status.state !== 'pending' || life?.hasWaited(key) || (life && !life.active(key))) return false
+    const pane = await readPendingRowLapPane(key)
+    if (pane.kind !== PANE_READ_PANE || !paneShowsStartupDialog(pane.pane)) return false
+    if (personaLatchedNow(key) || life?.hasWaited(key) || (life && !life.active(key))) return false
+    await work()
+    return true
+  } finally { release?.() }
 }
 
 /**
@@ -5269,9 +5393,9 @@ async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | A
     // (b.jg5 SRJ-613): this `send-keys` is the backstop, and its
     // `ErrSpawnNotInteractive` stops the approver with nothing typed and no
     // kill (SRJ-404).
-    await withOutageDetection(key, undefined, 'send-keys', (client) =>
+    await withStartupTyping(key, () => withOutageDetection(key, undefined, 'send-keys', (client) =>
       client.sendKeys({ instance_id, text: '', allow_pending: true }),
-    )
+    ).then(() => {}))
   } catch (err) {
     // b.jg5 SRJ-118, SRJ-412, SRJ-1017: a `send-keys` that answered
     // `ErrSpawnNotInteractive` makes this launch (the launch start the first
@@ -5657,7 +5781,9 @@ export function classifyWorkingPane(pane: string): WorkingPaneReading {
   const lines = paneLines(pane)
   if (lines.length === 0) return 'blank'
   const bottomLines = lines.slice(-WORKING_PANE_BOTTOM_LINES)
-  if (paneShowsDialog(bottomLines)) return 'prompt'
+  // An actual bottom composer makes earlier quoted options/history inert
+  // (b.omv SR-5.3). A dialog has replaced that composer.
+  if (readDeliveryScreen('claude', pane).kind === 'menu' && paneShowsDialog(bottomLines)) return 'prompt'
   if (BUSY_SPINNER_LINE_RE.test(lines.join('\n'))) return 'busy'
   const bottom = bottomLines.join('\n').toLowerCase()
   if (BUSY_PANE_NEEDLES.some((needle) => bottom.includes(needle))) return 'busy'
@@ -6138,6 +6264,7 @@ export function waitingRowAbsentAtPaneReadLine(key: string, read: PaneReadFailur
 
 /** What `checkWorkingRowPane` is given beside the persona's key and pane. */
 export interface WorkingRowPaneCheckOptions {
+  readonly noNotice?: boolean
   /**
    * The persona, for locating its transcript under its claude_config_dir;
    * absent, only the row's persisted transcript path is read.
@@ -6223,7 +6350,7 @@ export async function checkWorkingRowPane(
     return 'defer'
   }
   // The restart path runs only with auto-restart on.
-  noteWorkingRowDeferral(key, false)
+  if (!options.noNotice) noteWorkingRowDeferral(key, false)
   return 'defer'
 }
 
@@ -6284,7 +6411,7 @@ async function workingRowPaneVerdict(
   )
   // The restart path runs only with auto-restart on: `scheduleRestart` arms
   // nothing while `session_restart_delay` is 0.
-  notifyPersonaNotConnected(key, { reason: 'blocked-on-prompt', autoRestartDisabled: false })
+  if (!options.noNotice) notifyPersonaNotConnected(key, { reason: 'blocked-on-prompt', autoRestartDisabled: false })
   return 'defer'
 }
 
@@ -6340,13 +6467,13 @@ function logNoWorkingRowEvidence(ref: string, reading: WorkingPaneReading, trans
  * gets no notice and `defer`. Logs one line for each answer but a plain
  * `reconnect`; never throws.
  */
-export async function checkWaitingRowPane(key: string, latchedNow?: () => boolean): Promise<WaitingRowPaneVerdict> {
+export async function checkWaitingRowPane(key: string, latchedNow?: () => boolean, options: { noNotice?: boolean } = {}): Promise<WaitingRowPaneVerdict> {
   const ref = keyRef(key)
   // The adapter called this for a row it has just read `waiting`.
   const read = await readWorkingPane(key, latchRowStateRead('waiting'))
   switch (read.kind) {
     case PANE_READ_PANE:
-      return waitingRowPaneJudgement(key, ref, read.pane, latchedNow)
+      return waitingRowPaneJudgement(key, ref, read.pane, latchedNow, options.noNotice)
     case PANE_READ_LATCHED:
       console.error(`[slack] reconnectSession: ${ref} is waiting and is latched — deferring; nothing typed (b.jg5 SRJ-502)`)
       return 'defer'
@@ -6394,6 +6521,7 @@ function waitingRowPaneJudgement(
   ref: string,
   pane: string,
   latchedNow: (() => boolean) | undefined,
+  noNotice = false,
 ): WorkingRowPaneVerdict {
   const reading = classifyWorkingPane(pane)
   if (reading === 'busy') {
@@ -6401,12 +6529,13 @@ function waitingRowPaneJudgement(
     return 'defer'
   }
   if (reading === 'prompt') {
+    deliveryLifecycle?.defer(key, 'menu')
     // b.jg5 SRJ-502: asked right before the notice; the gate logs its line.
     if (latchedNow?.() === true) return 'defer'
     console.error(
       `[slack] reconnectSession: ${ref} is waiting but its pane shows a prompt or dialog — not typing into it; deferring /mcp reconnect to a later tick (answer it in tmux session "${personaTmuxSessionName(key)}") (b.f2b/b.rmy)`,
     )
-    notifyPersonaNotConnected(key, { reason: 'blocked-on-prompt', autoRestartDisabled: false })
+    if (!noNotice) notifyPersonaNotConnected(key, { reason: 'blocked-on-prompt', autoRestartDisabled: false })
     return 'defer'
   }
   return 'reconnect'
@@ -8570,8 +8699,8 @@ export async function waitForWaitingAndReconnectWithCause(
  * `dead-session` with the reconnect's cause (b.jg5 SRJ-611), and noting on
  * `wait` a `transient` one's latch or stop.
  */
-async function reconnectInWait(key: string, ref: string, wait: WorkingRowWait, lastRead: LatchRowState): Promise<WaitEnd> {
-  const result = await reconnectMcpWithCause(key, lastRead, ref)
+async function reconnectInWait(key: string, ref: string, wait: WorkingRowWait, lastRead: LatchRowState, workingChecked?: { launchId: string | undefined }): Promise<WaitEnd> {
+  const result = await reconnectMcpWithCause(key, lastRead, ref, { workingChecked })
   if (result.outcome === 'dead-session') return { outcome: 'dead-session', deadCause: result.deadCause }
   if (result.outcome === 'transient') {
     if (result.latched) wait.latched = true
@@ -8693,6 +8822,7 @@ async function waitForWorkingRow(
       // b.f2b: a stale row — the positive-idle rule held for the whole window
       // (the same idle screen and the same ended, unchanged transcript) — is
       // reconnected like a `waiting` one.
+      const workingChecked = { launchId: deliveryLifecycle?.launchId(key) }
       const stale = await staleWorkingRowIsIdle(key, ref, config, paneWatch, wait)
       // b.jg5 SRJ-608: the evidence read latched P (a pane read's CONFLICT
       // or UNUSABLE NAME): `latched` at once, nothing more called or typed.
@@ -8707,7 +8837,9 @@ async function waitForWorkingRow(
       if (waitMustEnd(key, wait)) return endWait(ref, wait)
       if (stale) {
         endWorkingRowDeferral(key)
-        return reconnectInWait(key, ref, wait, latchRowStateRead(state))
+        // Reuse this wait's completed idle window only for the same launch.
+        // The reconnect still reads its own fresh row and delivery screen.
+        return reconnectInWait(key, ref, wait, latchRowStateRead(state), workingChecked)
       }
       // b.f2b: held back again; a run that has lasted
       // UNPROVEN_IDLE_NOTICE_AFTER_MS raises the unproven-idle notice.
@@ -8853,6 +8985,7 @@ export const SPAWN_ACTION_FRESH_RETIRED = 'fresh-retired'
  * outcome (`PersonaBringUpOutcome`), which holds a persona before its launch
  * and is counted under `not brought up`.
  */
+/** A reconnect deferred by E3 is owned by its per-persona deferred-reconnect timer. */
 export const SPAWN_ACTION_RETRYING = 'retrying'
 
 /** `sequence-waiting` held back by a live-row sequence (b.jg5 SRJ-706). */
@@ -14073,6 +14206,7 @@ async function launchCallWithWindow<T>(
   verb: 'spawn' | 'resume',
   call: (client: Client) => Promise<T>,
 ): Promise<T> {
+  deliveryLifecycle?.beforeLaunch(key)
   const keptThisLaunchRow = thisLaunchRows.get(key)
   const keptOwnLaunch = ownLaunches.get(key)
   thisLaunchRows.delete(key)
@@ -15053,7 +15187,7 @@ export function transientReconnectLine(ref: string, state: string, answer: Trans
       ? 'the persona is latched — answering latched'
       : answer === 'stopping'
         ? 'a version re-check decided that the server stops — answering failed, marked stopping'
-        : 'answering retrying'
+        : 'answering retrying; the per-persona deferred-reconnect timer owns its retry'
   return `[slack] spawnForPersona: the reconnect for ${ref} (state=${state}) was transient: nothing was typed; ${what}; no spawn-failure notice, no spawn-failed entry, nothing counted (b.jg5 SRJ-118)`
 }
 

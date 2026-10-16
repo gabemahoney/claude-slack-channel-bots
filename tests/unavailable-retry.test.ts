@@ -1,4 +1,7 @@
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
+import { TRUST_DIALOG_PANE } from './test-helpers/working-row-panes.ts'
+import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
+useImmediateTypingLifecycle()
 /**
  * unavailable-retry.test.ts — The per-persona UNAVAILABLE retry timer
  * (b.jg5 SRJ-301 code line, SRJ-302, SRJ-303, SRJ-304, SRJ-305, SRJ-306), and
@@ -1291,7 +1294,7 @@ const LAUNCH_SITES: readonly LaunchSite[] = [
     name: 'the working-row read',
     verb: 'status',
     action: 'reconnected',
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), statusQueue: [cannedErr(err)] }),
+    script: (h, p, err) => ({ ...workingThenWaiting(h, p), statusQueue: [cannedErr(err)] }),
   },
   // b.jg5 SRJ-707, SRJ-1503: the collision get reads a finished row in
   // another directory, so the ladder replaces it by one reuse spawn of the
@@ -1309,6 +1312,15 @@ const LAUNCH_SITES: readonly LaunchSite[] = [
   },
   { name: 'the resume of an ended row', verb: 'resume', action: 'failed', script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: err }) },
 ]
+
+/** The first collision sees working; the later waiting poll and its fresh
+ * reconnect get see the same new state (b.omv SR-5.5). */
+function workingThenWaiting(h: RecoveryHarness, p: Persona): RecoveryStubScript {
+  return {
+    ...collided(h, p, { state: 'waiting' }),
+    getQueue: [cannedOk(personaRow(h, p.key, { state: 'working' }))],
+  }
+}
 
 /** The sites whose verb is a read (`status`, `get`). */
 const READ_SITES = LAUNCH_SITES.filter((site) => site.verb === 'status' || site.verb === 'get')
@@ -1855,14 +1867,14 @@ describe('unavailable retry: a status error at the launch’s working-row wait a
     const [p, q] = h.keys as [string, string]
     const persona = personaOf(h, p)
     const err = make('status')
-    h.script({ ...collided(h, persona, { state: 'working' }), statusQueue: [cannedErr(err)] })
+    h.script({ ...workingThenWaiting(h, persona), statusQueue: [cannedErr(err)] })
 
     const result = await h.launch(p)
 
     expect(result).toEqual({ key: p, action: 'reconnected' })
     expectArmedOnce(h, p, kind)
     // The failed poll, then the poll that reads `waiting` and the reconnect's keystrokes.
-    expect(personaCallCounts(h, p)).toMatchObject({ statusCalls: 2, sendKeysCalls: 1 })
+    expect(personaCallCounts(h, p)).toMatchObject({ statusCalls: 2, sendKeysCalls: 2 })
     expect(h.errors.filter((line) => line === pollStatusErrorLine(persona, err))).toHaveLength(1)
     // ErrSystemInstallDisappeared raises `ad-unreachable` once; the next read's success clears it.
     expect(adUnreachableOnsets(h)).toHaveLength(adUnreachable ? 1 : 0)
@@ -1935,7 +1947,7 @@ function approverCallMeets(verb: ApproverVerb, err: Error): RecoveryStubScript {
   if (verb === 'status') return { statusError: err }
   const pending = { statusResult: cannedStatusResult({ state: 'pending' }) }
   if (verb === 'read-pane') return { ...pending, readPaneError: err }
-  return { ...pending, readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_NEEDLE)], sendKeysError: err }
+  return { ...pending, readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)], sendKeysError: err }
 }
 
 /**
@@ -2909,7 +2921,7 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
 
   test.each<[string, RowState, boolean, Record<string, number>, string | ReArmed]>([
     ['live and connected with its stream: nothing left to recover, no launch', 'waiting', true, { statusCalls: 1 }, UNAVAILABLE_RETRY_STOP_RECOVERED],
-    ['live and not connected: a reconnect that succeeds, never a spawn, and nothing left to recover', 'waiting', false, { statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 }, UNAVAILABLE_RETRY_STOP_RECOVERED],
+    ['live and not connected: a reconnect that succeeds, never a spawn, and nothing left to recover', 'waiting', false, { statusCalls: 2, getCalls: 1, readPaneCalls: 3, sendKeysCalls: 2 }, UNAVAILABLE_RETRY_STOP_RECOVERED],
     // A `pending` liveness reading is deferred by the restart work itself
     // (b.jg5 SRJ-314), whatever the connection shows: its one status read,
     // and no reconnect (so no second status read), send-keys, kill or spawn;
@@ -4597,7 +4609,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     // The reconnect's read-pane ends the condition while the retry runs (the
     // end is deferred); its send-keys is refused and starts it again, arming
     // the timer in the same run, which cancels the deferred end.
-    expect(callsSince(h, before)).toEqual({ statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 })
+    expect(callsSince(h, before)).toEqual({ statusCalls: 2, getCalls: 1, readPaneCalls: 3, sendKeysCalls: 1 })
     expect(h.conditionEnds).toEqual([{ key, reading: undefined, result: 'deferred' }])
     expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }, { key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
     const lines = conditionLines(h, key)
@@ -4618,7 +4630,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     await h.advance(waitMs(1) - 1)
     expect(callsSince(h, beforeSecond)).toEqual({})
     await retryNow(h, key)
-    expect(callsSince(h, beforeSecond)).toEqual({ statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 })
+    expect(callsSince(h, beforeSecond)).toEqual({ statusCalls: 2, getCalls: 1, readPaneCalls: 3, sendKeysCalls: 2 })
     expect(h.tmuxUnresponsive.holds(key)).toBe(false)
     expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED))
     expectStopped(h, key)
@@ -6007,7 +6019,7 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
 
     await retryNow(h, key)
 
-    expect(callsSince(h, before)).toEqual({ statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 })
+    expect(callsSince(h, before)).toEqual({ statusCalls: 2, getCalls: 1, readPaneCalls: 3, sendKeysCalls: 2 })
     expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
     expect(getOutageFlags(key).size).toBe(0)
     // The clear reaches the condition-end entry once, while the retry runs.
@@ -6257,7 +6269,7 @@ describe('unavailable retry: a re-bound tmux socket gives SRJ-1021’s onset and
     const before = callCounts(h)
     expect(await retryNow(h, key)).toBe(dueAt)
 
-    expect(callsSince(h, before)).toEqual({ statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 })
+    expect(callsSince(h, before)).toEqual({ statusCalls: 2, getCalls: 1, readPaneCalls: 3, sendKeysCalls: 2 })
     expect(h.outageNotices).toEqual([reBoundOnset, tmuxUnavailableAllClear(key)])
     expect(getOutageFlags(key).size).toBe(0)
     expect(h.outageClears).toEqual([{ key, reading: undefined, result: 'deferred' }])
@@ -9133,7 +9145,7 @@ describe('unavailable retry: ErrSpawnNotResumable\'s re-read as a trigger: pendi
   function scriptGone(h: RecoveryHarness, key: string, reread: GetResult, after: GetResult): void {
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk(personaRow(h, key)), cannedOk(reread)],
+      getQueue: [cannedOk(personaRow(h, key)), cannedOk(personaRow(h, key)), cannedOk(reread)],
       getResult: after,
       sendKeysError: errTmuxSendKeys(),
       resumeQueue: [cannedErr(errSpawnNotResumable())],

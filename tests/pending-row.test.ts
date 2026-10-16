@@ -1,3 +1,5 @@
+import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
+useImmediateTypingLifecycle()
 /**
  * pending-row.test.ts — `src/pending-row.ts`: the launch-start reader and the
  * pending-with-no-launch-start predicate (b.jg5 SRJ-406, SRJ-408, SRJ-513).
@@ -3442,10 +3444,10 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     const lapping = rounds.filter((round) => round.at >= launchStartMs + adGraceMsInEffect())
     expect(rounds.filter((round) => !lapping.includes(round)).every((round) => round.verbs.join() === READ_ONLY_ROUND.join())).toBe(true)
     expect(lapping.map((round) => round.verbs)).toEqual([
-      ['status', 'get', 'read-pane', 'send-keys', 'find-missing', 'get'],
-      ['status', 'get', 'read-pane', 'send-keys', 'find-missing', 'get'],
+      ['status', 'get', 'read-pane', 'status', 'read-pane', 'send-keys', 'find-missing', 'get'],
+      ['status', 'get', 'read-pane', 'status', 'read-pane', 'send-keys', 'find-missing', 'get'],
     ])
-    expect(h.stub.calls.readPaneCalls).toEqual(lapping.map(() => ({ instance_id: id, n_lines: FULL_PANE_READ_LINES, allow_pending: true })))
+    expect(h.stub.calls.readPaneCalls).toEqual(lapping.flatMap(() => [0, 1].map(() => ({ instance_id: id, n_lines: FULL_PANE_READ_LINES, allow_pending: true }))))
     expect(h.stub.calls.sendKeysCalls).toEqual(lapping.map(() => ({ instance_id: id, text: '', allow_pending: true })))
     // The second Enter cleared the dialog; the round's get read the row live, and the retry stopped the timer.
     expect([row.dialog(), row.state()]).toEqual([PENDING_ROW_DIALOG_NONE, 'waiting'])
@@ -3598,7 +3600,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     const lapAt = h.controller.view(p)!.dueAt!
     await retryNow(h, p)
 
-    expect(h.stub.calls.readPaneCalls).toEqual([{ instance_id: row.instanceId, n_lines: FULL_PANE_READ_LINES, allow_pending: true }])
+    expect(h.stub.calls.readPaneCalls).toEqual(Array.from({ length: typed ? 2 : 1 }, () => ({ instance_id: row.instanceId, n_lines: FULL_PANE_READ_LINES, allow_pending: true })))
     expect(h.stub.calls.sendKeysCalls).toEqual(typed ? [{ instance_id: row.instanceId, text: '', allow_pending: true }] : [])
     expect(h.callTimes('findMissing')).toEqual(runs ? [lapAt] : [])
     expect(h.latch.isLatched(p)).toBe(!runs)
@@ -3635,7 +3637,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
 
     // The one Enter that met it, and at most the one lap that made it; none after.
     expect(h.stub.calls.sendKeysCalls).toHaveLength(1)
-    expect(readPaneTimesOf(h, row, launchStartMs + adGraceMsInEffect())).toHaveLength(lapsBefore)
+    expect(readPaneTimesOf(h, row, launchStartMs + adGraceMsInEffect())).toHaveLength(lapsBefore * 2)
     expect(rounds.filter((round) => round.at >= launchStartMs + adGraceMsInEffect()).every((round) => round.verbs.includes('find-missing'))).toBe(true)
     expect(heldPostsOf(h, p)).toEqual([stuckLaunchHeldText(p, row.launchStartedAt(), true)])
     expect(heldPostsOf(h, p)[0]).not.toContain(stuckLaunchAttachRemedyLine(p))
@@ -3651,7 +3653,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     const firstStartMs = row.launchStartMs()!
     await retryUntil(h, p, firstStartMs + adGraceMsInEffect())
     await runRounds(h, p, row, 2)
-    expect(readPaneTimesOf(h, row)).toHaveLength(1)
+    expect(readPaneTimesOf(h, row)).toHaveLength(2)
 
     // Marked missing: P is brought up with a new launch, whose pane shows no needle.
     row.setJudgment(judgeMissingFrom(h.clock.now()))
@@ -3817,7 +3819,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     await hold.entered(2)
     hold.release(cannedFindMissing({ rows: { [row.instanceId]: 'neither' } }))
     await h.settle()
-    expect(h.stub.calls.readPaneCalls!.filter(isLapRead)).toHaveLength(1)
+    expect(h.stub.calls.readPaneCalls!.filter(isLapRead)).toHaveLength(2)
     expect(ruleLinesOf(h, p)).toHaveLength(1)
   })
 })

@@ -1,4 +1,5 @@
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
+import { TRUST_DIALOG_PANE } from './test-helpers/working-row-panes.ts'
 /**
  * inbound-recovery-drop-branch.test.ts — lost messages (b.av2 SR-4.6, SR-7.3,
  * SR-7.2 part; b.kvq and b.9cj recovery, keyed per persona). The AC 26
@@ -231,7 +232,6 @@ import {
   APPROVER_STOP_LIVE,
   APPROVER_STOP_TEARDOWN,
   DIALOG_POLL_INTERVAL_MS,
-  TRUST_DIALOG_NEEDLE,
   isLaunchInFlight,
   readPersonaRowState,
   stopDialogApprover,
@@ -1242,7 +1242,7 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
     const hold = holdSpawns(h.stub.client)
     const launch = h.launch(key)
     await hold.entered(id)
-    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }), readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_NEEDLE)] })
+    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }), readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)] })
 
     // A launch running is state 6 with no read.
     await expectLostMessageReports(h, key, 'session-starting', { calls: {} })

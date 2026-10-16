@@ -1,4 +1,8 @@
 import { queuePath, readQueue } from './test-helpers/delivery-queue.ts'
+import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
+import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
+import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
+useImmediateTypingLifecycle()
 /**
  * reload-apply.test.ts — What a confirmed change does to the personas (b.av2
  * SR-6.1 at apply, SR-6.4, SR-6.5, SR-6.6, SR-8.6 steps 2 to 6 and every
@@ -3337,7 +3341,7 @@ async function useConfigDirs(): Promise<void> {
 }
 
 /** The real launch path (`spawnForPersona` over the row table; implies the real composition). */
-const REAL_LAUNCH: RunningOptions = { realLaunch: true }
+const REAL_LAUNCH: RunningOptions = { realLaunch: true, agentDirector: { readPaneResults: [cannedReadPaneResult(IDLE_PANE)] } }
 
 /** The temp `claude_config_dir` `personaConfigDirs` gives the persona named `name`. */
 function ownConfigDir(name: string): string {

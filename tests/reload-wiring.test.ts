@@ -491,7 +491,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       // change nothing the server serves.
       ['bringUps', constOf('createPersonaBringUpController')],
       ['connections', constOf('createPersonaConnectionManager')],
-      ['routing', `{ ...${constOf('createPersonaRouting')}, forget: key => { ${constOf('createPersonaRouting')}.forget(key); deliveryPreparation?.forget(key) } }`],
+      ['routing', `{ ...${constOf('createPersonaRouting')}, forget: key => { ${constOf('createPersonaRouting')}.forget(key); deliveryPreparation?.forget(key); void deliveryEngines?.forget(key); deliveryLifecycle?.forget(key) } }`],
       ['destinations', constOf('createPersonaDestinations')],
       ['destinationHold', constOf('createPersonaDestinationHold')],
       ['notifier', notifier],
@@ -613,11 +613,11 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     // its launch in flight would start), first: the session manager's approver
     // stop for that key with the teardown reason, not a stub, not another
     // key's or every persona's stop (imported above, not shadowed).
-    const stopApprover = (props.get('stopApprover') ?? '').match(
-      /^\(?(\w+)\)? => stopDialogApprover\((\w+), APPROVER_STOP_TEARDOWN\)$/,
-    )
+    const stopBody = props.get('stopApprover') ?? ''
+    const stopApprover = stopBody.match(/^async \(?(\w+)\)? => \{ const (\w+) = /)
     expect(stopApprover).not.toBeNull()
-    expect(stopApprover![2]).toBe(stopApprover![1])
+    const [, stopKey, stoppingDelivery] = stopApprover!
+    expect(stopBody).toBe(`async (${stopKey}) => { const ${stoppingDelivery} = deliveryEngines?.forget(${stopKey}); deliveryLifecycle?.forget(${stopKey}); await stopDialogApprover(${stopKey}, APPROVER_STOP_TEARDOWN); await ${stoppingDelivery} }`)
 
     // b.jg5 SRJ-706, SRJ-715: optional in the deps, so only this pin makes
     // sure a production teardown stops the key's live-row sequence (right
@@ -853,11 +853,11 @@ describe('server.ts binds apply step 1\'s approver stop, and no src file keeps t
   // tests/reload-apply.test.ts; what the stop does in
   // tests/approve-trust-folder-dialog.test.ts.
   test('the reload controller\'s stopApprover is exactly the session manager\'s approver stop for the key it is given, with the retired-key reason (imported, not shadowed)', () => {
-    const stop = (controllerProps().get('stopApprover') ?? '').match(
-      /^\(?(\w+)\)? => stopDialogApprover\((\w+), APPROVER_STOP_RETIRED_KEY\)$/,
-    )
+    const body = controllerProps().get('stopApprover') ?? ''
+    const stop = body.match(/^async \(?(\w+)\)? => \{ const (\w+) = /)
     expect(stop).not.toBeNull()
-    expect(stop![2]).toBe(stop![1])
+    const [, key, stopping] = stop!
+    expect(body).toBe(`async (${key}) => { const ${stopping} = deliveryEngines?.forget(${key}); deliveryLifecycle?.forget(${key}); await stopDialogApprover(${key}, APPROVER_STOP_RETIRED_KEY); await ${stopping} }`)
     for (const name of ['stopDialogApprover', 'APPROVER_STOP_RETIRED_KEY']) {
       expect([name, importSource(SERVER_CODE, name)]).toEqual([name, './session-manager.ts'])
       expect([name, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])

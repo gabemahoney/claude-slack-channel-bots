@@ -1,3 +1,7 @@
+import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
+import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
+import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
+useImmediateTypingLifecycle()
 /**
  * old-life-wait.test.ts — The old-life hold: start and end (b.jg5 SRJ-809;
  * SRJ-703's old-life clause, SRJ-714's sweep holds, SRJ-715's teardown hold,
@@ -2618,7 +2622,7 @@ describe('b.jg5 SRJ-810, SRJ-811 (Q-9): B\'s own row swept into P\'s directory, 
   test.each<[string, string, (h: RecoveryHarness, b: string) => Promise<void>, string]>([
     ['removed', OLD_LIFE_HOLD_END_NOT_RETRIED_NOT_APPLIED, async (h, b) => h.remove(b), LIVE_ROW_STOP_HOLD_ENDED],
     ['latched (a reconnect of its own row, no longer held, answered CONFLICT)', OLD_LIFE_HOLD_END_NOT_RETRIED_LATCHED, async (h, b) => {
-      h.script({ sendKeysError: errTmuxSessionConflict('send-keys', 'different-id') })
+      h.script({ readPaneResults: [cannedReadPaneResult(IDLE_PANE)], sendKeysError: errTmuxSessionConflict('send-keys', 'different-id') })
       expect(await reconnectMcpWithCause(b, latchRowStateRead('waiting'))).toMatchObject({ outcome: 'transient', latched: true })
       expect(h.latch.isLatched(b)).toBe(true)
     }, LIVE_ROW_STOP_LATCHED],

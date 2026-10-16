@@ -3950,3 +3950,36 @@ describe('getClient() allowlist content-anchoring (b.qbn)', () => {
     ])
   })
 })
+
+// b.omv SR-5.1 / D8: isolated delivery clients retain the same outage
+// classification and per-persona all-clear behavior as recovery calls.
+test('explicit persona clients preserve outage wrapping and never read the singleton', async () => {
+  const emissions: Emission[] = []
+  let singletonReads = 0
+  initOutageState({
+    getClient: () => { singletonReads++; throw new Error('delivery must use its own client') },
+    notify: (key, text) => { emissions.push({ key, text }) },
+  })
+  const aCalls: Parameters<Client['sendKeys']>[0][] = []
+  const bCalls: Parameters<Client['sendKeys']>[0][] = []
+  const failure = errTmuxNotAvailable(undefined, 'send-keys')
+  const options: Parameters<typeof makeStubClient>[0] = { sendKeysCalls: aCalls, sendKeysError: failure }
+  const a = makeStubClient(options) as unknown as Client
+  const b = makeStubClient({ sendKeysCalls: bCalls }) as unknown as Client
+  const params = (key: string) => ({ instance_id: `cscb_${key}`, key: 'Enter' })
+  const send = (key: string, client: Client) => withOutageDetection(key, undefined, 'send-keys', selected => selected.sendKeys(params(key)), { client })
+  await expect(send('A', a)).rejects.toBe(failure)
+  expect(getOutageFlags('A').has('tmux-unavailable')).toBe(true)
+  await send('B', b)
+  expect([...getOutageFlags('B')]).toEqual([])
+  expect(getOutageFlags('A').has('tmux-unavailable')).toBe(true)
+  expect(aCalls).toEqual([params('A')])
+  expect(bCalls).toEqual([params('B')])
+  expect(emissions.map(post => post.key)).toEqual(['A'])
+  options.sendKeysError = undefined
+  await send('A', a)
+  expect([...getOutageFlags('A')]).toEqual([])
+  expect(emissions.map(post => post.key)).toEqual(['A', 'A'])
+  expect(singletonReads).toBe(0)
+  assertNoLeak({ emissions })
+})

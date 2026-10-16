@@ -111,6 +111,9 @@ import ts from 'typescript'
 import { classifyAdError, AD_ERROR_CLASS_UNUSABLE_NAME, AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_CONFIG, AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_CONFLICT } from '../src/ad-error-class.ts'
 import { adConfigMalformedOnset } from '../src/outage-state.ts'
 import { paneReadFailureOf, PANE_READ_GONE } from '../src/pane-read.ts'
+import { ENTER_DELAY_MS } from '../src/delivery-constants.ts'
+import { FULL_PANE_READ_LINES, readDeliveryScreen } from '../src/delivery-screen.ts'
+import { parseDeliveryTranscriptRecord } from '../src/delivery-receipt.ts'
 import { latchRecheckRoundLine, decideLatchRecheckProbe, RECHECK_VERDICT_CLEARED, recogniseConflictCase, LATCH_CASE_OWN_ID } from '../src/conflict-latch.ts'
 import { AD_TMUX_TABLE } from '../src/ad-settings.ts'
 import { PHASE1_ONLY_ERR_NAMES } from '../src/agent-director-errors.ts'
@@ -1535,6 +1538,107 @@ printf '%s|%s|%s|%s' "$SCENARIO_AD_ROOT" "$SCENARIO_AD_ID_FLAG" "$SCENARIO_AD_ID
       : `${home}/.config/agent-director|--instance-id|instance_id|session_id`)
   })
   const worker = readFileSync(join(import.meta.dir, 'integration/fixtures/stub-claude.sh'), 'utf8')
+  // b.omv SR-13.6: inspect only extracted byte-writing declarations, never
+  // execute the integration worker, source the harness, or launch AD/tmux.
+  test.each(['at-once', 'transcript-on-first-message'])('b.omv SR-13.6: %s retains literal LF until CR writes one main-user receipt and clears the box', mode => {
+    const text = '<channel source="slack">\n  first line\nsecond line\n</channel>\n'
+    const output = shell(`${['ensure_transcript', 'append_user_receipt', 'handle_line', 'handle_key'].map(name => helper(name, worker)).join('\n')}
+MODE='${mode}'
+MODE_TRANSCRIPT_ON_FIRST_MESSAGE=transcript-on-first-message
+MODE_SILENT=silent
+MODE_LINGER_ON_EXIT=linger-on-exit
+SENTINEL=__CSCB_TEST_EXIT__
+REPORTED=1
+AWAITING_ENTER=0
+composer=''
+SESSION_ID=fixture-session
+PROJ_DIR="$HOME/project"
+TRANSCRIPT="$PROJ_DIR/$SESSION_ID.jsonl"
+ensure_transcript
+if [[ "$MODE" == "$MODE_TRANSCRIPT_ON_FIRST_MESSAGE" ]]; then
+    [[ ! -e "$TRANSCRIPT" ]] || exit 7
+else
+    [[ -f "$TRANSCRIPT" ]] || exit 7
+fi
+draw_composer() { :; }
+handle_key x
+handle_key $'\\025'
+handle_key x
+handle_key $'\\177'
+typed='${text}'
+while IFS= read -r -N 1 key; do
+    handle_key "$key"
+done < <(printf '%s' "$typed")
+[[ "$composer" == "$typed" ]] || exit 8
+if [[ -f "$TRANSCRIPT" ]]; then
+    [[ "$(jq -s '[.[] | select(.type == "user")] | length' "$TRANSCRIPT")" == 0 ]] || exit 8
+fi
+handle_key $'\\r'
+[[ -z "$composer" ]] || exit 9
+cat "$TRANSCRIPT"`, ['mkdir', 'jq', 'cat', 'date'])
+    const records = output.split('\n').map(line => JSON.parse(line))
+    expect(records).toHaveLength(2) // initial summary, exactly one submission
+    expect(records[1]).toMatchObject({ type: 'user', isSidechain: false, origin: { kind: 'human' }, sessionId: 'fixture-session' })
+    expect(Number.isFinite(Date.parse(records[1].timestamp))).toBe(true)
+    expect(parseDeliveryTranscriptRecord('claude', records[1])).toMatchObject({ kind: 'take-in', text })
+    assertNoLeak(output)
+  })
+  test('b.omv SR-13.6: reported Linux box is accepted by the production screen reader', () => {
+    const pane = shell(`${helper('draw_composer', worker)}\ncomposer=''\ndraw_composer`)
+    expect(readDeliveryScreen('claude', pane)).toEqual({ kind: 'empty', running: false })
+  })
+  test('b.omv SR-13.6: first-message mode ignores blank/slash commands, reconnects, and recognises a sentinel in submitted text', () => {
+    const output = shell(`${helper('handle_line', worker)}
+MODE=transcript-on-first-message
+MODE_TRANSCRIPT_ON_FIRST_MESSAGE=transcript-on-first-message
+MODE_SILENT=silent
+MODE_LINGER_ON_EXIT=linger-on-exit
+SENTINEL=__CSCB_TEST_EXIT__
+REPORTED=1
+AWAITING_ENTER=0
+append_user_receipt() { printf 'receipt:<%s>\\n' "$1"; }
+reconnect_mcp_session() { printf 'reconnect\\n'; }
+fire_session_end() { printf 'end\\n'; }
+handle_line '   '
+handle_line '/exit'
+handle_line '/mcp reconnect slack-channel-router'
+handle_line $'first\\nmessage'
+handle_line $'leftover\\n__CSCB_TEST_EXIT__'
+exit 9`)
+    expect(output).toBe('reconnect\nreceipt:<first\nmessage>\nend')
+  })
+  const reconnectRows = (change: string): string => {
+    const pane = `--instance-id fixture --n-lines ${FULL_PANE_READ_LINES}`
+    const rows = [
+      ['1', '1.000000', '42', 'read-pane', 'fixture', pane],
+      ['2', '1.100000', '42', 'read-pane', 'fixture', pane],
+      ['3', '1.200000', '42', 'send-keys', 'fixture', "--instance-id fixture --text '/mcp reconnect slack-channel-router' --no-enter"],
+      ['4', `${Math.floor((1200 + ENTER_DELAY_MS) / 1000)}.${String(((1200 + ENTER_DELAY_MS) % 1000) * 1000).padStart(6, '0')}`, '42', 'send-keys', 'fixture', '--instance-id fixture --key Enter'],
+    ]
+    if (change === 'wrong-parent') rows[2]![2] = '43'
+    if (change === 'short-read') rows[1]![5] = '--instance-id fixture --n-lines 1'
+    if (change === 'no-fresh-screen') rows.splice(1, 1)
+    if (change === 'early-enter') rows[3]![1] = '1.200001'
+    if (change === 'combined-enter') rows[2]![5] = rows[2]![5]!.replace(' --no-enter', '')
+    if (change === 'wrong-key') rows[3]![5] = '--instance-id fixture --key Escape'
+    if (change === 'guard-bypass') rows[2]![5] += ' --allow-pending'
+    if (change === 'hash-guard') rows[3]![5] += ' --expect-pane-sha256 fixture'
+    return rows.map(row => row.join('\t')).join('\n')
+  }
+  test.each(['pass', 'wrong-parent', 'short-read', 'no-fresh-screen', 'early-enter', 'combined-enter', 'wrong-key', 'guard-bypass', 'hash-guard'])(
+    'b.omv SR-5.3/5.4/5.5: fmk reconnect assertion %s keeps provenance, screen proof, delay and guards', change => {
+      const rows = reconnectRows(change).replaceAll("'", "'\\''")
+      const output = shell(`${['_scenario_to_us', '_scenario_eval_words', '_scenario_assert_reconnect_rows'].map(name => helper(name)).join('\n')}
+fail() { printf 'REFUSED: %s\\n' "$*"; exit 1; }
+(_scenario_assert_reconnect_rows fixture 42 ${ENTER_DELAY_MS} ${FULL_PANE_READ_LINES} '${rows}')
+printf 'RESULT=%s\\n' "$?"`)
+      if (change === 'pass') expect(output).toBe('RESULT=0')
+      else {
+        expect(output).toContain('REFUSED: fixture:')
+        expect(output).toEndWith('RESULT=1')
+      }
+    },
+  )
   test.each([
     ['0.10 hook', '.agent-director', '17', '29', '17'],
     ['0.11 hook', '.agent-director', '23', '31', '23'],

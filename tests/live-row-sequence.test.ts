@@ -1,3 +1,5 @@
+import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
+useImmediateTypingLifecycle()
 /**
  * live-row-sequence.test.ts — The live-row sequence (b.jg5 SRJ-705, SRJ-717;
  * AC 61, AC 62, AC 63, AC 84): its steps, its alert, the not-judged stop and
@@ -2650,7 +2652,7 @@ describe('b.jg5 SRJ-411: a pending row whose cwd or config_dir differs from P\'s
 
 describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the launch answers while the sequence runs, the conversation is kept, and step 6\'s resume answers end it by SRJ-113 and SRJ-710', () => {
   /** The ladder's calls before the sequence: the colliding spawn, the collision get, the reconnect, the find-missing run, the resume and its re-read. */
-  const LADDER_CALLS = ['spawn', 'get', 'sendKeys', 'findMissing', 'resume', 'get'] as const
+  const LADDER_CALLS = ['spawn', 'get', 'get', 'readPane', 'readPane', 'sendKeys', 'findMissing', 'resume', 'get'] as const
 
   /**
    * P's launch over its `waiting` row whose reconnect answers GONE and whose
@@ -2660,7 +2662,7 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
   function scriptGoneNotResumable(h: RecoveryHarness, key: string, sequenceRow: GetResult): void {
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk(personaRow(h, key)), cannedOk(personaRow(h, key))],
+      getQueue: [cannedOk(personaRow(h, key)), cannedOk(personaRow(h, key)), cannedOk(personaRow(h, key))],
       getResult: sequenceRow,
       sendKeysError: errTmuxSendKeys(),
       resumeQueue: [cannedErr(errSpawnNotResumable())],
@@ -2752,7 +2754,7 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
     h.script({
       statusFn: () => cannedStatusResult({ state: calls.findMissingCalls.length > sweptAfter ? ENDED : LIVE }),
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk(personaRow(h, p)), cannedOk(personaRow(h, p))],
+      getQueue: [cannedOk(personaRow(h, p)), cannedOk(personaRow(h, p)), cannedOk(personaRow(h, p)), cannedOk(personaRow(h, p))],
       getResult: personaRow(h, p, { state: ENDED, session_id: SESSION_ID }),
       sendKeysError: errTmuxSendKeys(),
       resumeQueue: [cannedErr(errSpawnNotResumable())],

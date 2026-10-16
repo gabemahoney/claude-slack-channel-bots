@@ -49,8 +49,9 @@
 # session from the client's side (`end_stub_mcp_session`), and the restart
 # path's reconnect of A's live `waiting` row (src/server.ts
 # _buildReconnectSessionAdapter) reads its pane (src/session-manager.ts
-# checkWaitingRowPane: one `read-pane` of FULL_PANE_READ_LINES), finds no
-# prompt (classifyWorkingPane) and types `/mcp reconnect …`. That restart is
+# checkWaitingRowPane), then reconnect rechecks the row/pane and reads a
+# fresh screen (b.omv SR-5.3/5.5). Three FULL_PANE_READ_LINES reads precede
+# `/mcp reconnect …` typed with no_enter and delayed Enter. That restart is
 # scheduled by the server's session-disconnect handler, which sees the
 # client's stream end (src/server.ts _buildRestartDisconnectedPersona, after
 # `session_restart_delay`); a health tick skips a persona with a restart
@@ -60,9 +61,8 @@
 # trigger of the other legs' calls: the re-bound socket leg's tmux-touching
 # call, leg 6's `resume` and the first read of leg 7's edited row (the SRD
 # names no trigger for these). For a live `waiting` row the restart's call is
-# the start pass's reconnect, a `send-keys` of `/mcp reconnect` (the stub's
-# MCP session ended with the old bot server), not a pane read: the restart
-# makes `get`, `spawn`, `get`, `send-keys` for the persona. Leg 2 keeps that
+# the start pass's guarded reconnect (the stub's MCP session ended with the
+# old bot server): fresh row and pane checks precede its two key calls. Leg 2 keeps that
 # restart's `send-keys` reaching the renamed pane, fmk-driver.ts's pane read
 # (the package's readPersonaOwnPane) and the teardown's precheck `read-pane`
 # as further evidence beside the health check's read; the restart path's
@@ -104,9 +104,9 @@
 #      (`end_stub_mcp_session` on A's pane; the stub runs on), and the restart
 #      the server schedules for the disconnected persona (above) reconnects
 #      it. Since then:
-#      exactly one CSCB `read-pane` of A, by the bot server, with `--n-lines`
-#      FULL_PANE_READ_LINES, after the client ended, followed by a
-#      bot-server `send-keys` of A (the reconnect), and A's stub opens a new
+#      exactly three CSCB `read-pane` calls of A, by the bot server, with
+#      FULL_PANE_READ_LINES, after the client ended, followed by no_enter
+#      reconnect text and Enter at least ENTER_DELAY_MS later; A's stub opens a new
 #      MCP session; no CSCB `spawn`, `resume`, `kill` or `delete` of A; no
 #      waiting-row GONE, reconnect GONE or escalate-dead line for A in
 #      server.log; A's worker, pane process and launch token as before, its
@@ -361,6 +361,7 @@ SESSION_A="$(_scenario_printed "${STEP_VALUES}" personaTmuxSessionName "${KEY_A}
 # src/pane-read.ts.
 PROBE_LINES="$(_scenario_printed "${STEP_VALUES}" PROBE_PANE_READ_LINES)"
 FULL_LINES="$(_scenario_printed "${STEP_VALUES}" FULL_PANE_READ_LINES)"
+ENTER_DELAY_MS="$(_scenario_printed "${STEP_VALUES}" ENTER_DELAY_MS)"
 READ_PANE="$(_scenario_printed "${STEP_VALUES}" PANE_READ_PANE)"
 # src/config.ts.
 POLL_INTERVAL_MS="$(_scenario_printed "${STEP_VALUES}" MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS)"
@@ -1138,7 +1139,7 @@ expect_worker_runs "${STEP}: after the plain stop" "${ID_A}"
 start_and_settle "${STEP}"
 [[ "${SERVER_PID}" != "${OLD_SERVER_PID}" ]] || fail "${STEP}: the restart kept bot server ${SERVER_PID}"
 
-# The start pass's reconnect of A's live `waiting` row: a send-keys that
+# The start pass's reconnect of A's live `waiting` row: guarded keys that
 # reaches the renamed session's pane, where the stub opens a new MCP session.
 window_calls "${STEP}" "${MARK_R}" - "${ID_A}"
 window_has send-keys "${SERVER_PID}" \
@@ -1146,6 +1147,8 @@ window_has send-keys "${SERVER_PID}" \
 wait_until "${REPORT_WAIT_S}" "${STEP}: A's stub opened no new MCP session after the restart's reconnect" \
     new_mcp_session "${ID_A}"
 sleep "${SETTLE_S}"
+_scenario_assert_reconnect_rows "${STEP}" "${SERVER_PID}" "${ENTER_DELAY_MS}" "${FULL_LINES}" \
+    "$(ad_cscb_calls "${ID_A}" "${MARK_R}" -)"
 window_calls "${STEP}" "${MARK_R}" - "${ID_A}"
 echo "${TEST_NAME}: ${STEP}: CSCB calls of ${ID_A} since the restart: ${WIN_VERBS[*]-none}; A's stub reconnected"
 SLICE="$(log_slice "${LOG_R}")"
@@ -1164,8 +1167,8 @@ expect_status "${STEP}" "${ID_A}" waiting
 # (`end_stub_mcp_session`); the server schedules a restart for the
 # disconnected persona, and the restart path's reconnect of A's live
 # `waiting` row reads its pane (src/session-manager.ts checkWaitingRowPane:
-# one `read-pane` of FULL_PANE_READ_LINES), finds no prompt and types
-# `/mcp reconnect …`, which reaches the renamed session's pane.
+# its existing waiting-row proof), finds no prompt; reconnect rechecks the
+# row/pane and fresh screen before its delayed keys reach the renamed pane.
 STEP="leg 2 (health check's pane read)"
 expect_same_launch "${STEP}" "${ID_B}"
 for id in "${ID_A}" "${ID_B}"; do
@@ -1191,25 +1194,21 @@ echo "${TEST_NAME}: ${STEP}: the client ended at +$(( (ENDED_US - FROM_US) / 100
 echo_window_timed "${STEP}" "${FROM_US}"
 SLICE="$(log_slice "${LOG_H}")"
 echo_log_lines "${STEP}" "${SLICE}" "${KEY_A}"
-read_at=-1
 n=0
 for i in "${!WIN_VERBS[@]}"; do
     if [[ "${WIN_VERBS[i]}" == read-pane ]]; then
         n=$(( n + 1 ))
-        read_at="${i}"
     fi
 done
-(( n == 1 )) || fail "${STEP}: CSCB processes made ${n} read-pane call(s) of ${ID_A} after its MCP session ended, not 1"
-[[ "${WIN_PPIDS[read_at]}" == "${SERVER_PID}" ]] \
-    || fail "${STEP}: the read-pane of ${ID_A} has parent ${WIN_PPIDS[read_at]}, not the bot server ${SERVER_PID}"
-[[ " ${WIN_ARGS[read_at]} " == *" --n-lines ${FULL_LINES} "* ]] \
-    || fail "${STEP}: the read-pane of ${ID_A} does not read ${FULL_LINES} lines: ${WIN_ARGS[read_at]}"
-(( WIN_US[read_at] > ENDED_US )) || fail "${STEP}: the read-pane of ${ID_A} came before its MCP session ended"
-reconnect=0
-for (( i = read_at + 1; i < ${#WIN_VERBS[@]}; i++ )); do
-    [[ "${WIN_VERBS[i]}" == send-keys && "${WIN_PPIDS[i]}" == "${SERVER_PID}" ]] && reconnect=1
+# b.omv SR-5.5: the restart adapter's waiting-row proof, the reconnect's
+# independent waiting-row proof, then its fresh SR-5.3 screen check.
+(( n == 3 )) || fail "${STEP}: CSCB processes made ${n} read-pane call(s) of ${ID_A} after its MCP session ended, not 3"
+for i in "${!WIN_VERBS[@]}"; do
+    [[ "${WIN_VERBS[i]}" != read-pane ]] && continue
+    (( WIN_US[i] > ENDED_US )) || fail "${STEP}: a read-pane of ${ID_A} came before its MCP session ended"
 done
-(( reconnect )) || fail "${STEP}: no bot-server send-keys of ${ID_A} followed its pane read (its calls: ${WIN_VERBS[*]-none})"
+_scenario_assert_reconnect_rows "${STEP}" "${SERVER_PID}" "${ENTER_DELAY_MS}" "${FULL_LINES}" \
+    "$(ad_cscb_calls "${ID_A}" "${MARK_H}" -)"
 for verb in spawn resume kill delete; do
     n="$(window_count "${verb}")"
     [[ "${n}" == 0 ]] || fail "${STEP}: a CSCB process made ${n} ${verb} call(s) of ${ID_A} after its MCP session ended"

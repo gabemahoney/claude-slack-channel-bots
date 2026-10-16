@@ -2432,7 +2432,7 @@ leg_stub_direct() {
     # Silent: no output, no SessionStart, and the sentinel fires no SessionEnd.
     dir="$(make_workdir stub-silent)"
     stub_mode "${dir}" "${STUB_MODE_SILENT}"
-    (cd "${dir}" && printf 'hello\n__CSCB_TEST_EXIT__\n' | "${SCENARIO_BIN}/claude" --settings "${settings}") \
+    (cd "${dir}" && printf 'hello\r__CSCB_TEST_EXIT__\r' | "${SCENARIO_BIN}/claude" --settings "${settings}") \
         > "${out}" 2> "${err}" || rc=$?
     (( rc == 0 )) || fail "${step}: the silent stub exited ${rc}"
     [[ ! -s "${out}" && ! -s "${err}" ]] || fail "${step}: the silent stub printed: $(head -c 300 "${out}" "${err}")"
@@ -2445,7 +2445,7 @@ leg_stub_direct() {
     dir="$(make_workdir stub-no-id)"
     stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
     before="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
-    (cd "${dir}" && { sleep "$(seconds_plus "${REFIRE_PERIOD_S}" 1.5)"; echo __CSCB_TEST_EXIT__; } \
+    (cd "${dir}" && { sleep "$(seconds_plus "${REFIRE_PERIOD_S}" 1.5)"; printf '__CSCB_TEST_EXIT__\r'; } \
         | env -u AGENT_DIRECTOR_INSTANCE_ID "${SCENARIO_BIN}/claude" --settings "${settings}") > "${out}" 2> "${err}" || rc=$?
     (( rc == 0 )) || fail "${step}: the at-once stub exited ${rc}"
     grep -qxF "Listening for channel messages from: server:slack-channel-router" "${out}" \
@@ -2461,6 +2461,7 @@ leg_stub_direct() {
 
     stub_direct_delay "${step}: dialog delay" "${fixture}"
     stub_direct_linger "${step}: linger on exit"
+    stub_direct_composer "${step}: composer"
 }
 
 # fifo_stub <step> <dir> <name> <settings>: start the stub in <dir> from the
@@ -2476,6 +2477,50 @@ fifo_stub() {
     FIFO_PID=$!
     track_pid "${FIFO_PID}"
     exec {FIFO_FD}> "${fifo}"
+}
+
+# b.omv SR-13.6: exact main-user receipt, with meaningful LFs retained.
+stub_user_receipt_matches() {
+    jq -se --arg text "$2" '
+        [.[] | select(.type == "user")] as $users |
+        ($users | length) == 1 and $users[0].isSidechain == false and
+        $users[0].origin.kind == "human" and
+        $users[0].message.role == "user" and $users[0].message.content == $text
+    ' "$1" > /dev/null
+}
+
+# Exercise the complete worker read loop in the image, including no_enter
+# text arriving before its CR. All transcript paths belong to this HOME.
+stub_direct_composer() {
+    local step="$1" dir name=stub-composer mark key transcript rc=0 files=()
+    local text=$'<channel source="slack">\n  first line\nsecond line\n</channel>\n'
+    dir="$(make_workdir "${name}")"
+    mark="${SCENARIO_ROOT}/${name}-mark"
+    stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
+    fifo_stub "${step}" "${dir}" "${name}" "$(linger_settings "${mark}")"
+    wait_until 10 "${step}: no SessionStart" test -s "${mark}.start"
+    key="$(printf '%s' "$(realpath -e -- "${dir}")" | sed 's#[/._]#-#g')"
+    files=("${HOME}/.claude/projects/${key}/"*.jsonl)
+    (( ${#files[@]} == 1 )) && [[ -f "${files[0]}" ]] \
+        || fail "${step}: no unique transcript for the stub's working directory"
+    transcript="${files[0]}"
+    printf '%s' "${text}" >&"${FIFO_FD}"
+    wait_until 10 "${step}: no_enter text never appeared in the composer" \
+        grep -qF '</channel>' "${SCENARIO_ROOT}/${name}.out"
+    [[ "$(jq -s '[.[] | select(.type == "user")] | length' "${transcript}")" == 0 ]] \
+        || fail "${step}: LF submitted text before Enter"
+    printf '\r' >&"${FIFO_FD}"
+    wait_until 10 "${step}: CR did not write exactly one LF-preserving receipt" \
+        stub_user_receipt_matches "${transcript}" "${text}"
+    # A blank Enter writes no second user record; the sentinel still ends it.
+    printf '\r__CSCB_TEST_EXIT__\r' >&"${FIFO_FD}"
+    wait "${FIFO_PID}" || rc=$?
+    exec {FIFO_FD}>&-
+    (( rc == 0 )) || fail "${step}: stub exited ${rc} on the sentinel"
+    stub_user_receipt_matches "${transcript}" "${text}" \
+        || fail "${step}: blank Enter or sentinel wrote another user record"
+    [[ "$(cat -- "${mark}.end")" == "${FIFO_PID}" ]] \
+        || fail "${step}: sentinel did not fire exactly one SessionEnd from the worker"
 }
 
 # linger_settings <mark>: --settings JSON whose SessionStart and SessionEnd
@@ -2511,11 +2556,11 @@ stub_direct_linger() {
     stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
     fifo_stub "${step}" "${dir}" "${name}" "$(linger_settings "${mark}")"
     wait_until 10 "${step}: the at-once stub never fired SessionStart" test -s "${mark}.start"
-    printf '\x15/exit\n' >&"${FIFO_FD}"
+    printf '\x15/exit\r' >&"${FIFO_FD}"
     sleep "${STUB_LINGER_HOLD_S}"
     pid_alive "${FIFO_PID}" || fail "${step}: the at-once stub ended on a /exit line"
     [[ ! -e "${mark}.end" ]] || fail "${step}: the at-once stub fired SessionEnd on a /exit line"
-    printf '__CSCB_TEST_EXIT__\n' >&"${FIFO_FD}"
+    printf '__CSCB_TEST_EXIT__\r' >&"${FIFO_FD}"
     wait "${FIFO_PID}" || rc=$?
     exec {FIFO_FD}>&-
     (( rc == 0 )) || fail "${step}: the at-once stub exited ${rc} on the sentinel"
@@ -2533,7 +2578,7 @@ stub_direct_linger() {
         || fail "${step}: the linger-on-exit stub printed no banner: $(head -c 300 "${SCENARIO_ROOT}/${name}.out")"
     [[ "$(cat -- "${mark}.start")" == "${FIFO_PID}" ]] \
         || fail "${step}: the linger-on-exit stub's SessionStart record is '$(tr '\n' ' ' < "${mark}.start")', not once from its process ${FIFO_PID}"
-    printf '/exit\n' >&"${FIFO_FD}"
+    printf '/exit\r' >&"${FIFO_FD}"
     wait_until 10 "${step}: the linger-on-exit stub never fired SessionEnd on /exit" test -s "${mark}.end"
     marker="${SCENARIO_BIN}/${SCENARIO_STUB_LINGER_PREFIX}${FIFO_PID}"
     wait_until 10 "${step}: the linger-on-exit stub wrote no lingering marker ${marker}" test -f "${marker}"
@@ -2544,7 +2589,7 @@ stub_direct_linger() {
         || fail "${step}: the linger-on-exit stub's SessionEnd record is '$(tr '\n' ' ' < "${mark}.end")', not once from its process ${FIFO_PID}"
     # Lines while it lingers are ignored: it still runs STUB_LINGER_HOLD_S
     # after them.
-    printf 'hello\n/exit\n' >&"${FIFO_FD}"
+    printf 'hello\r/exit\r' >&"${FIFO_FD}"
     sleep "${STUB_LINGER_HOLD_S}"
     pid_alive "${FIFO_PID}" \
         || fail "${step}: the linger-on-exit stub ended within ${STUB_LINGER_HOLD_S}s of the lines written while it lingered, before its release"
@@ -2578,7 +2623,7 @@ stub_direct_delay() {
 
     dir="$(make_workdir stub-delay)"
     stub_dialog_delay "${dir}" "${STUB_DELAY_S}"
-    (cd "${dir}" && { sleep "$(( STUB_DELAY_S + 2 ))"; echo __CSCB_TEST_EXIT__; } | "${SCENARIO_BIN}/claude") \
+    (cd "${dir}" && { sleep "$(( STUB_DELAY_S + 2 ))"; printf '__CSCB_TEST_EXIT__\r'; } | "${SCENARIO_BIN}/claude") \
         > "${out}" 2> "${err}" &
     pid=$!
     track_pid "${pid}"
@@ -2617,10 +2662,11 @@ leg_stub_helpers() {
     file="${SCENARIO_BIN}/stub-claude-modes"
     [[ "$(tail -n 1 "${file}")" == "${STUB_MODE_AT_ONCE}"$'\t'"$(realpath -e -- "${dir}")" ]] \
         || fail "${step}: the selection file's last line is '$(tail -n 1 "${file}")'"
-    got="$(cd "${dir}" && printf '__CSCB_TEST_EXIT__\n' | "${SCENARIO_BIN}/claude")" \
+    got="$(cd "${dir}" && printf '__CSCB_TEST_EXIT__\r' | "${SCENARIO_BIN}/claude")" \
         || fail "${step}: the stub in ${dir} exited non-zero"
-    [[ "${got}" == "Listening for channel messages from: server:slack-channel-router" ]] \
-        || fail "${step}: after silent then at-once, the stub printed '${got}', not the at-once banner"
+    [[ "${got}" == "Listening for channel messages from: server:slack-channel-router"$'\n'* \
+        && "${got}" == *$'\n❯ \n'* && "${got}" == *'← for agents' ]] \
+        || fail "${step}: after silent then at-once, the stub did not print its banner and empty Linux composer: ${got}"
 
     # The dialog delay's setter: its refusals, and the last setting of a
     # directory wins (written as a whole number).

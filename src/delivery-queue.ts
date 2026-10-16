@@ -74,6 +74,8 @@ export interface DeliveryQueue {
   lookupSlackKey(key: string, slackKey: SlackKey): QueueAcceptResult | undefined
   items(key: string): QueueItem[]
   openCount(key: string): number
+  /** A failed post-accept append suspends all keys until an append succeeds. */
+  isWritable?(key: string): boolean
   keys(): string[]
   compact(key?: string): Promise<void>
   startMaintenance(): void
@@ -137,6 +139,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
   const dir = join(options.stateDir, 'queue')
   const journals = new Map<string, Journal>()
   const writers = new Map<string, Promise<unknown>>()
+  const appendBlocked = new Set<string>()
   const startId = `${new Date(now()).toISOString().replace(/[:]/g, '-')}-${randomUUID()}`
   let started = false, stopped = false
   let timer: ReturnType<typeof globalThis.setInterval> | undefined
@@ -369,12 +372,15 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
           }
           if (record.kind === 'delivered' && (!item.fixed || record.part > item.fixed.parts.length)) throw new Error('Receipt has no fixed part')
           durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j); update(j, record)
+          appendBlocked.delete(key)
         })
-      } catch (error) { event({ type: 'append-failed', key, seq: record.seq, error }); throw error }
+        appendBlocked.delete(key)
+      } catch (error) { appendBlocked.add(key); event({ type: 'append-failed', key, seq: record.seq, error }); throw error }
     },
     lookupSlackKey,
     items: key => materialize(journal(key)).map(item => structuredClone(item)),
     openCount: key => materialize(journal(key)).filter(item => !item.delivered).length,
+    isWritable: key => !appendBlocked.has(key),
     keys: () => [...journals.keys()],
     compact,
     startMaintenance() {

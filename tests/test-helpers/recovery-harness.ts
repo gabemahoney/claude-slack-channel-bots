@@ -1,5 +1,7 @@
 import { createDeliveryQueue } from '../../src/delivery-queue.ts'
 import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
+import { cannedReadPaneResult } from './ad-results.ts'
+import { IDLE_PANE } from './working-row-panes.ts'
 /**
  * test-helpers/recovery-harness.ts — `makeRecoveryHarness`, the recovery
  * harness (b.jg5 SRJ-1304): the UNAVAILABLE retry timer and the recovery
@@ -2504,6 +2506,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const oldLifeHolds = createOldLifeHoldSet({ log: (line) => console.error(line) })
 
   const stub = installStubSpawnPath(home)
+  // b.omv SR-5.3: an ordinary live terminal has an empty composer. Explicit
+  // pane/error scripts replace this non-enumerable knob as usual.
+  Object.defineProperty(stub.calls, 'readPaneResults', { value: [cannedReadPaneResult(IDLE_PANE)], writable: true, configurable: true, enumerable: false })
   // Every agent-director verb of the stub client is wrapped, in place, so
   // each call is stamped with the harness clock when it is made (b.jg5
   // SRJ-410, AC 33: the cadence of a persona's calls), before the stub

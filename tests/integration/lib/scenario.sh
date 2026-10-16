@@ -4956,6 +4956,59 @@ ad_cscb_calls() {
     _scenario_cscb_ad_rows ad_cscb_calls "${id}" "" "${from}" "${to}"
 }
 
+# _scenario_assert_reconnect_rows <step> <server-pid> <delay-ms> <full-lines> <rows>:
+# inspect an already-filtered ad_cscb_calls table for one persona/window.
+# b.omv SR-5.3/5.4/5.5: existing waiting-row proof, fresh screen, text with
+# no_enter, delayed Enter. Extra reads are allowed for earlier refused runs;
+# every read/key must retain the server parent and AD's dialog guards.
+_scenario_assert_reconnect_rows() {
+    local step="$1" server="$2" delay="$3" full="$4" rows="$5"
+    local pos time parent verb id args words=() i text key no_enter reads=0 sends=0 typed_at=0 n_lines
+    while IFS=$'\t' read -r pos time parent verb id args; do
+        [[ -n "${pos}" ]] || continue
+        [[ "${verb}" == read-pane || "${verb}" == send-keys ]] || continue
+        [[ "${parent}" == "${server}" ]] || fail "${step}: ${verb} has parent ${parent}, not server ${server}"
+        _scenario_eval_words words "${args}" || fail "${step}: cannot decode ${verb} arguments"
+        text=""
+        key=""
+        no_enter=0
+        n_lines=""
+        for (( i = 0; i < ${#words[@]}; i++ )); do
+            case "${words[i]}" in
+                --text) text="${words[i + 1]:-}" ;;
+                --key) key="${words[i + 1]:-}" ;;
+                --no-enter) no_enter=1 ;;
+                --n-lines) n_lines="${words[i + 1]:-}" ;;
+                --allow-pending|--allow-pending=*|--expect-pane-sha256|--expect-pane-sha256=*)
+                    fail "${step}: ${verb} bypasses the ordinary dialog guard: ${args}"
+                    ;;
+            esac
+        done
+        if [[ "${verb}" == read-pane ]]; then
+            [[ "${n_lines}" == "${full}" ]] || fail "${step}: reconnect read-pane is not ${full} lines: ${args}"
+            (( sends == 0 )) || fail "${step}: a pane read interrupted the reconnect's keys"
+            reads=$(( reads + 1 ))
+            continue
+        fi
+        _scenario_to_us "${time}" || fail "${step}: invalid key timestamp ${time}"
+        sends=$(( sends + 1 ))
+        if (( sends == 1 )); then
+            (( reads >= 2 )) || fail "${step}: reconnect typed without waiting-row proof and a fresh screen"
+            [[ "${text}" == '/mcp reconnect '?* && -z "${key}" && "${no_enter}" == 1 ]] \
+                || fail "${step}: first reconnect key is not no_enter text: ${args}"
+            typed_at="${_SCENARIO_US}"
+        elif (( sends == 2 )); then
+            [[ "${key}" == Enter && -z "${text}" && "${no_enter}" == 0 ]] \
+                || fail "${step}: second reconnect key is not Enter alone: ${args}"
+            (( _SCENARIO_US - typed_at >= delay * 1000 )) \
+                || fail "${step}: reconnect Enter came before ${delay} ms"
+        else
+            fail "${step}: more than one reconnect text/Enter pair in the window"
+        fi
+    done <<< "${rows}"
+    (( sends == 2 )) || fail "${step}: reconnect has ${sends} key calls, not text then Enter"
+}
+
 # True when `ad_cscb_calls <instance-id>` holds at least <min> rows of <verb>;
 # sets _SCENARIO_FOUND to how many it holds.
 _scenario_ad_cscb_at_least() {

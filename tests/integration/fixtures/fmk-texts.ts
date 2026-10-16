@@ -542,6 +542,8 @@
  *                                                a spawn-failure notice (several lines)
  *   FULL_PANE_READ_LINES                         src/pane-read.ts, in decimal: the line count of a
  *                                                full pane read (the waiting-row check's)
+ *   ENTER_DELAY_MS                              src/delivery-constants.ts, reconnect's delay
+ *                                                between text/no_enter and Enter (b.omv SR-5.4)
  *
  * The fixed-argument entries of scenarios 2, 6, 7, 9, 12, 15, 16 and 18
  * (`ARGS_ENTRIES`; test-14, test-18, test-19 and test-21). Each takes
@@ -4155,6 +4157,8 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   tmuxUnresponsiveAlertText: unresponsiveAlert,
   restartCapReachedNoticeText: builderEntry('session-manager.ts', 'restartCapReachedNoticeText', []),
   FULL_PANE_READ_LINES: constantEntry('pane-read.ts', 'FULL_PANE_READ_LINES'),
+  // b.omv SR-5.4: reconnect's text and Enter use the production delay.
+  ENTER_DELAY_MS: constantEntry('delivery-constants.ts', 'ENTER_DELAY_MS'),
   // Scenario 8 (test-20-fmk-old-binary.sh).
   classifyAdError: adErrorClass,
   // Scenario 23 (test-20-fmk-old-binary.sh).

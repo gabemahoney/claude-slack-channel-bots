@@ -407,6 +407,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } 
 import { tmpdir } from 'node:os'
 import { basename, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import ts from 'typescript'
 import {
   atMainTopLevel,
   balancedAfter,
@@ -493,6 +494,21 @@ const SERVER_CODE = stripComments(readFileSync(SERVER_PATH, 'utf-8'))
 
 /** The production kill-retry clock (b.jg5 SRJ-702); renaming it fails the typecheck. */
 const KILL_RETRY_PRODUCTION_CLOCK: keyof typeof KillRetryModule = 'KILL_RETRY_SYSTEM_CLOCK'
+
+/** Awaits main itself executes, including branches, excluding stored callbacks. */
+function mainExecutionAwaits(): number[] {
+  const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
+  const main = tree.statements.find((node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node) && node.name?.text === 'main')
+  expect(main?.body).toBeDefined()
+  const offsets: number[] = []
+  const visit = (node: ts.Node): void => {
+    if (ts.isFunctionLike(node)) return
+    if (ts.isAwaitExpression(node)) offsets.push(node.getStart(tree))
+    ts.forEachChild(node, visit)
+  }
+  visit(main!.body!)
+  return offsets
+}
 
 /** Offsets of every code call of `name` in server.ts. */
 function callsOf(name: string): number[] {
@@ -626,11 +642,15 @@ function latchStartPass(): number[] {
 /** The reconnect adapter's builder (b.f2b, b.jg5 SRJ-502); renaming it fails the typecheck. */
 const RECONNECT_ADAPTER: keyof typeof ServerModule = '_buildReconnectSessionAdapter'
 
-/** The offset of the reconnect adapter's only build in server.ts (its declaration aside); fails unless there is exactly one. */
+/** The restart module's reconnect build; the other build drives deferred reconnects without duplicate prompt notices. */
 function onlyReconnectAdapterBuild(): number {
   const builds = indicesOf(new RegExp(`(?<![\\w.$]|function\\s+)${RECONNECT_ADAPTER}\\s*\\(`, 'g'), SERVER_CODE)
-  expect(builds).toHaveLength(1)
-  return builds[0]!
+  expect(builds).toHaveLength(2)
+  const restart = onlyCallOf('initRestart')
+  const [open, close] = balancedAfter(SERVER_CODE, restart, '(', ')')
+  const inRestart = builds.filter(at => at > open && at < close)
+  expect(inRestart).toHaveLength(1)
+  return inRestart[0]!
 }
 
 /** The top-level arguments of the reconnect adapter's only build (whitespace collapsed). */
@@ -911,7 +931,9 @@ function routingHolder(
     expect(named.filter((offset) => offset > check.start && offset < check.end)).toHaveLength(checkReaders.length)
   }
   for (const [start, end] of alsoIn) expect(named.filter((offset) => offset > start && offset < end)).toHaveLength(1)
-  expect(named).toHaveLength(3 + checkReaders.length + alsoIn.length)
+  const engineReads = indicesOf(new RegExp(`\\b${holder}\\?\\.${query}\\s*\\(`, 'g'), SERVER_CODE).filter(at => withinCall([at], onlyCallOf('createDeliveryEngines')) === 1)
+  expect(engineReads).toHaveLength(query === 'isOpen' ? 1 : 0)
+  expect(named).toHaveLength(3 + checkReaders.length + alsoIn.length + engineReads.length)
   return { holder, at, end: at + assigned[0]![0].length }
 }
 
@@ -1464,8 +1486,8 @@ describe('main() installs the runtime agent-director version re-check right afte
   // so a version re-check's stop changes no agent-director row (b.jg5
   // SRJ-205, SRJ-714). main() can only observe that after it resumes from an
   // await, so each of those calls needs an `if (shuttingDown) return` between
-  // the last await before it and the call. Every `await` in main()'s text
-  // counts, a closure's included, so the rule errs strict.
+  // the last await in main's execution and the call. Awaits inside a stored
+  // callback do not run during startup; awaits in conditional blocks do count.
   test.each<[string, (controller: string) => RegExp]>([
     ['the HTTP server (Bun.serve)', () => /\bBun\s*\.\s*serve\s*\(/g],
     ['the start bring-up (<controller>.runStartBringUp)', (controller) => new RegExp(`\\b${controller}\\s*\\.\\s*runStartBringUp\\s*\\(`, 'g')],
@@ -1485,7 +1507,7 @@ describe('main() installs the runtime agent-director version re-check right afte
     // The call's own `await`, when it has one, is not an await before it.
     const own = SERVER_CODE.slice(start, at).match(/\bawait\s*$/)
     const callStart = own ? at - own[0].length : at
-    const awaits = indicesOf(/\bawait\b/g, SERVER_CODE).filter((a) => a > start && a < callStart)
+    const awaits = mainExecutionAwaits().filter(a => a > start && a < callStart)
     expect(awaits.length).toBeGreaterThan(0)
     const lastAwait = awaits[awaits.length - 1]!
     const guards = indicesOf(/\bif\s*\(\s*shuttingDown\s*\)\s*return\b/g, SERVER_CODE)
@@ -2147,11 +2169,12 @@ describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, 
 
   test('durable intake binds preparation to the shared queue, persona name resolver and wake hook on the production clock', () => {
     const props = onlyCallProps('createDeliveryPreparation')
-    expect([...props.keys()].sort()).toEqual(['queue', 'resolveUserName', 'clientFor', 'wake'].sort())
+    expect([...props.keys()].sort()).toEqual(['queue', 'resolveUserName', 'clientFor', 'wake', 'onPending'].sort())
     expect(props.get('queue')).toBe('deliveryQueue')
     expect(props.get('resolveUserName')).toBe('resolvePersonaUserName')
     expect(props.get('clientFor')).toBe('clientFor')
     expect(props.get('wake')).toMatch(/^\(?([a-zA-Z]+)\)? => deliveryQueueWake\.wake\(\1\)$/)
+    expect(props.get('onPending')).toMatch(/^\(?([a-zA-Z]+)\)? => deliveryEngines\?\.wake\(\1\)$/)
     const routing = onlyCallProps('createPersonaRouting')
     expect(routing.get('prepare')).toMatch(/^\((\w+), (\w+)\) => deliveryPreparation\?\.prepare\(\1, \2\) \?\? Promise\.resolve\(\)$/)
     expect(routing.has('notify')).toBe(false)
@@ -3870,7 +3893,7 @@ describe('main() builds the one per-persona latch, in server memory only, before
     // queries' forms are pinned in the describe below; the holder's in the
     // persona routing's describe.
     const named = indicesOf(new RegExp(`\\b${latch}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(12)
+    expect(named).toHaveLength(14)
     const decl = SERVER_CODE.match(new RegExp(`\\bconst\\s+${latch}\\b`))!
     expect(named[0]).toBe(decl.index! + decl[0].length - latch.length)
     const withinAt = (at: number) => {
@@ -3882,6 +3905,7 @@ describe('main() builds the one per-persona latch, in server memory only, before
       [BIND_LATCH_HOLDS, BIND, RECHECK_BUILDER, RECHECK_BIND, 'setConflictLatch', 'createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaLifecycle'].map(within),
     ).toEqual([1, 1, 1, 1, 1, 0, 2, 1, 1])
     expect(onlyCallProps(RECHECK_BUILDER).get(RECHECK_LATCH)).toBe(latch)
+    expect(within('createDeliveryEngines')).toBe(1)
     expect(withinRetryRunGate(named)).toBe(1)
     // The restart module's second: the reconnect adapter's, built inside its call.
     const [restartOpen, restartClose] = balancedAfter(SERVER_CODE, onlyCallOf('initRestart'), '(', ')')
@@ -4053,7 +4077,7 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     // the action spreads (b.jg5 SRJ-404; see the gate's describe).
     const allMembers = indicesOf(new RegExp(`\\b${IS_LATCHED}\\s*:`, 'g'), SERVER_CODE)
     const members = allMembers.filter(insideMain)
-    expect(members).toHaveLength(3)
+    expect(members).toHaveLength(4)
     expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map((call) => within(members, onlyCallOf(call)))).toEqual([0, 1, 1])
     expect(withinRetryRunGate(members)).toBe(1)
     const outside = allMembers.filter((offset) => !insideMain(offset))
@@ -4064,7 +4088,7 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     expect(inCheck(outside)).toBe(1)
     expect(within(outside, SERVER_CODE.search(/\bfunction\s+reconnectLatchedAt\s*\(/))).toBe(1)
     const queries = indicesOf(new RegExp(`\\.\\s*${IS_LATCHED}\\s*\\(`, 'g'), SERVER_CODE)
-    expect(queries).toHaveLength(7)
+    expect(queries).toHaveLength(9)
     expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaRouting'].map((call) => within(queries, onlyCallOf(call)))).toEqual([0, 2, 1, 1])
     expect(withinRetryRunGate(queries)).toBe(1)
     expect(within(queries, onlyReconnectAdapterBuild())).toBe(1)
@@ -4573,11 +4597,11 @@ describe('main() builds the one ErrInvalidFlags hold before the start pass, inst
     // The retry action's member and query sit in the retry run's gate, which
     // the action spreads (b.jg5 SRJ-404; see the gate's describe).
     const members = indicesOf(new RegExp(`\\b${IS_HELD}\\s*:`, 'g'), SERVER_CODE)
-    expect(members).toHaveLength(3)
+    expect(members).toHaveLength(4)
     expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map((call) => withinCall(members, onlyCallOf(call)))).toEqual([0, 1, 1])
     expect(withinRetryRunGate(members)).toBe(1)
     const queries = indicesOf(new RegExp(`\\.\\s*${IS_HELD}\\s*\\(`, 'g'), SERVER_CODE)
-    expect(queries).toHaveLength(4)
+    expect(queries).toHaveLength(5)
     expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaRouting'].map((call) => withinCall(queries, onlyCallOf(call)))).toEqual([0, 1, 1, 1])
     expect(withinRetryRunGate(queries)).toBe(1)
     expect(indicesOf(new RegExp(`\\b${ROUTING_HELD}\\s*:`, 'g'), SERVER_CODE)).toHaveLength(1)
@@ -4598,7 +4622,7 @@ describe('main() builds the one ErrInvalidFlags hold before the start pass, inst
     expect(indicesOf(new RegExp(`\\b${holderName()}\\s*[?!]?\\.\\s*${SET}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
 
     const named = indicesOf(new RegExp(`\\b${hold}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(9)
+    expect(named).toHaveLength(10)
     const decl = SERVER_CODE.match(new RegExp(`\\bconst\\s+${hold}\\b`))!
     expect(named[0]).toBe(decl.index! + decl[0].length - hold.length)
     const within = (call: string) => {
@@ -4722,8 +4746,9 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
     expect(importSource(SERVER_CODE, KILL_FAILED_HOLD)).toBe('./session-manager.ts')
     // Named in server.ts only at its import and this member.
     const named = indicesOf(new RegExp(`\\b${KILL_FAILED_HOLD}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(2)
+    expect(named).toHaveLength(3)
     expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
+    expect(withinCall(named, onlyCallOf('createDeliveryEngines'))).toBe(1)
   })
 
   // b.jg5 SRJ-706, SRJ-811, SRJ-1011: the sequence/wait input is the session
@@ -5414,7 +5439,8 @@ describe('server.ts refuses service to a persona that is not up (b.av2 SR-6.3, S
     expect(outcomes.get('isUp')).toMatch(/^\((\w+)\) => bringUps\?\.isUp\(\1\) \?\? false$/)
     expect(outcomes.get('isApplied')).toMatch(/^\((\w+)\) => bringUps\?\.isApplied\(\1\) \?\? false$/)
     // Never called directly, and no serving check copied in.
-    expect(callsOf('isPersonaUp')).toEqual([])
+    expect(callsOf('isPersonaUp')).toHaveLength(1)
+    expect(withinCall(callsOf('isPersonaUp'), onlyCallOf('createDeliveryEngines'))).toBe(1)
     expect(indicesOf(/\bisPersonaClientServing\b/g, SERVER_CODE)).toEqual([])
   })
 
@@ -6057,5 +6083,56 @@ describe('main() reads the test-only timer override block once, right after the 
     expect(retry.get('baseS')).toBe(`${timers}.unavailableRetryBaseS`)
     expect(retry.get('ceilingS')).toBe(`${timers}.unavailableRetryCeilingS`)
     expect(indicesOf(/\btest_timer_overrides\b/g, SERVER_CODE)).toHaveLength(1)
+  })
+})
+
+// b.omv SR-5.1 / SR-5.5 / D8: runtime unit suites use injected clients and
+// clocks; these bindings prove the server shares that ownership in main.
+describe('delivery ownership wiring', () => {
+  test('main installs the same lifecycle in the session manager and engines before the start bring-up', () => {
+    const built = onlyCallOf('createDeliveryLifecycle')
+    const engines = onlyCallOf('createDeliveryEngines')
+    const installed = callsOf('setDeliveryLifecycle').filter(insideMain)
+    expect(installed).toHaveLength(1)
+    expect(callArguments(SERVER_CODE, installed[0]!).trim()).toBe('deliveryLifecycle')
+    expect(onlyCallProps('createDeliveryEngines').get('lifecycle')).toBe('deliveryLifecycle')
+    expect(installed[0]).toBeGreaterThan(built)
+    expect(installed[0]).toBeLessThan(engines)
+    expect(engines).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
+    // These are unconditional main statements, including with health checks
+    // disabled. The lifecycle's timer, rather than a health tick, retries.
+    for (const at of [built, installed[0]!, engines]) expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+  })
+
+  test('delivery uses independent configured clients through outage wrapping, with the same latch and held guards', () => {
+    expect(onlyCallArgs('createDeliveryClientFactory')).toEqual(['agentDirectorCallTimeoutMsOf(personaConfig)'])
+    const engine = onlyCallProps('createDeliveryEngines')
+    expect(engine.get('clientFor')).toBe('key => deliveryClients!.clientFor(key)')
+    expect(engine.get('call')).toContain('withOutageDetection(key, undefined, verb, c => run(c), { client: client as Client, armsNothing:')
+    expect(engine.get('isLatched')).toBe('key => conflictLatch.isLatched(key)')
+    expect(engine.get('isHeld')).toContain('invalidFlagsHold.isHeld(key)')
+    for (const [hook, handler] of [
+      ['onRow', 'applyDeliveryOwnRowRead'],
+      ['onKeyError', 'handleDeliveryKeyError'],
+      ['onReadError', 'handleDeliveryReadError'],
+    ]) {
+      expect(engine.get(hook!)).toBe(handler)
+      expect(importSource(SERVER_CODE, handler!)).toBe('./session-manager.ts')
+    }
+    expect(engine.get('prepare')).toContain('deliveryPreparation!.owns(key, item.accepted.seq)')
+    const [shutdownStart, shutdownEnd] = shutdownBody(SERVER_CODE)
+    const stopping = SERVER_CODE.slice(shutdownStart, shutdownEnd)
+    expect(stopping).toContain('deliveryEngines?.stop()')
+    expect(stopping).toContain('await deliveryClients?.close()')
+    expect(stopping.indexOf('deliveryEngines?.stop()')).toBeLessThan(stopping.indexOf('await deliveryClients?.close()'))
+  })
+
+  test('deferred reconnects use the guarded adapter without a second prompt notice and run in the persona client scope', () => {
+    const adapters = indicesOf(new RegExp(`(?<![\\w.$]|function\\s+)${RECONNECT_ADAPTER}\\s*\\(`, 'g'), SERVER_CODE)
+    const deferred = adapters.find(at => at !== onlyReconnectAdapterBuild())!
+    expect(splitTopLevel(callArguments(SERVER_CODE, deferred))).toEqual(['getAppliedPersona', 'key => conflictLatch.isLatched(key)', 'getAppliedPersona', '{ noNotice: true }'])
+    const reconnect = onlyCallProps('createDeliveryEngines').get('reconnect')!
+    expect(reconnect).toContain('deliveryScope.run(key, client as Client, beforeCall, async () =>')
+    expect(reconnect).toContain('await deferredReconnect(key)')
   })
 })

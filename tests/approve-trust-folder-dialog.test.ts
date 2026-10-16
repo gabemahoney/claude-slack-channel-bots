@@ -1,4 +1,7 @@
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
+import { TRUST_DIALOG_PANE, DEV_CHANNELS_DIALOG_PANE } from './test-helpers/working-row-panes.ts'
+import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
+useImmediateTypingLifecycle()
 /**
  * approve-trust-folder-dialog.test.ts — Direct unit tests of the startup-dialog
  * approver's lap (`approvePreSessionDialogs`, b.jg5 SRJ-402) over the
@@ -8,7 +11,8 @@ import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
  * (HO C5), so every lap works on the `pending` row through agent-director
  * only: one own-row `status` read; on `pending` with a launch start one
  * `read-pane` (40 lines, `allow_pending`) and, when a needle of either
- * startup dialog shows, one `send-keys` (empty text, `allow_pending`, the
+ * startup dialog shows, a fresh status and pane read under the typing gate
+ * before one `send-keys` (empty text, `allow_pending`, the
  * persona's instance id and nothing else). A live state ends it; `ended` or
  * `missing` stops it at that lap with no pane read and, for a start-pass
  * launch, `dev-channels-approve-spawn-died` written at once; an absent row
@@ -399,7 +403,7 @@ const NEEDLES: ReadonlyArray<readonly [string, string]> = [
 
 /** A pane showing a startup dialog whose pre-selected option is `needle`. */
 function dialogPane(needle: string): import('agent-director').ReadPaneResult {
-  return cannedReadPaneResult(['  ┌──────────────────────────────────────┐', `  │ > 1. ${needle}`, '  │   2. No, exit', '  └──────────────────────────────────────┘'].join('\n'))
+  return cannedReadPaneResult(needle === TRUST_DIALOG_NEEDLE ? TRUST_DIALOG_PANE : DEV_CHANNELS_DIALOG_PANE)
 }
 
 /** A pane with no startup dialog on it. */
@@ -493,7 +497,7 @@ const G_AT_B_FLOOR: AdConfigTables = { tmux: { pending_grace_seconds: BigInt(DIA
 
 let clock: FakeClock
 let calls: StubCallLog
-/** The virtual time of each `status` call: one per lap. */
+/** The virtual time of every `status` call, including the fresh typing guard. */
 let statusAt: number[]
 /** The virtual time of each `read-pane` call. */
 let readPaneAt: number[]
@@ -627,7 +631,8 @@ type StatusAnswer = StatusResult | Error
 /**
  * Install the stub. `status` answers `statusAnswers` in order, one per lap,
  * the last sticking, or, given a function, its answer for the lap's index
- * (from 0); each call's virtual time goes to `statusAt`, and each
+ * (from 0). A dialog's fresh guard reads the same lap's row and pane;
+ * every extra call remains recorded and its time goes to `statusAt`, and each
  * `read-pane`'s to `readPaneAt`. Every call is recorded in `calls`. Given
  * `statusDelayMs`, each `status` call is recorded when it starts and answers
  * `statusDelayMs(lap)` later on the case's clock (a slow agent-director; 0
@@ -643,18 +648,39 @@ function installStub(
       ? statusAnswers
       : (lap: number): StatusAnswer => statusAnswers[Math.min(lap, statusAnswers.length - 1)]!
   let next = 0
+  // Scripts describe successive laps; the gate's fresh reads see this lap's
+  // stable fixture, with their own captured calls and timestamps.
+  let lapRow: StatusAnswer
+  let freshStatus = false
+  let freshPane = false
+  let lapPane: import('agent-director').ReadPaneResult
   const stub = makeStubClient({
     ...calls,
     ...knobs,
     statusFn: (_params: StatusParams) => {
       statusAt.push(clock.now())
-      return answerAt(next++)
+      if (freshStatus) {
+        freshStatus = false
+        return lapRow
+      }
+      lapRow = answerAt(next++)
+      return lapRow
     },
   })
   const readPane = stub.readPane
-  stub.readPane = (params) => {
+  stub.readPane = async (params) => {
     readPaneAt.push(clock.now())
-    return readPane(params)
+    if (freshPane) {
+      freshPane = false
+      calls.readPaneCalls.push(params)
+      return lapPane
+    }
+    lapPane = await readPane(params)
+    if (NEEDLES.some(([, needle]) => lapPane.pane.includes(needle))) {
+      freshStatus = true
+      freshPane = true
+    }
+    return lapPane
   }
   if (statusDelayMs !== undefined) {
     const status = stub.status
@@ -789,7 +815,7 @@ describe('approvePreSessionDialogs: the lap on a pending row with a launch start
   const ROWS = PERSONAS.flatMap((who) => NEEDLES.map(([dialog, needle]) => [dialog, who.label, who, needle] as const))
 
   test.each(ROWS)(
-    '%s needle, %s: one status, one read-pane (40 lines, allow_pending), exactly one send-keys (instance id, empty text, allow_pending); a live row then ends it',
+    '%s needle, %s: two statuses and two pane reads (lap plus fresh guard, 40 lines, allow_pending), exactly one send-keys (instance id, empty text, allow_pending); a live row then ends it',
     async (_dialog, _label, who, needle) => {
       installStub([PENDING_ROW, LIVE_ROW], { readPaneResults: [dialogPane(needle)] })
       const run = startApprover(who, true)
@@ -797,14 +823,14 @@ describe('approvePreSessionDialogs: the lap on a pending row with a launch start
       await clock.flush()
       // The first lap, before any timer fires.
       expect(run.stop()).toBeUndefined()
-      expect(calls.statusCalls).toEqual([{ instance_id: who.id }])
-      expect(calls.readPaneCalls).toEqual([expectedReadPane(who.id)])
+      expect(calls.statusCalls).toEqual([{ instance_id: who.id }, { instance_id: who.id }])
+      expect(calls.readPaneCalls).toEqual([expectedReadPane(who.id), expectedReadPane(who.id)])
       expect(calls.sendKeysCalls).toEqual([expectedEnter(who.id)])
 
       expect(await runToStop(run)).toBe(APPROVER_STOP_LIVE)
       // The second lap read a live row: nothing more was read or typed.
-      expect(calls.statusCalls).toEqual([{ instance_id: who.id }, { instance_id: who.id }])
-      expect(calls.readPaneCalls).toHaveLength(1)
+      expect(calls.statusCalls).toEqual([{ instance_id: who.id }, { instance_id: who.id }, { instance_id: who.id }])
+      expect(calls.readPaneCalls).toHaveLength(2)
       expect(calls.sendKeysCalls).toHaveLength(1)
       expect(approverLines()).toEqual([])
       expect(startupEntries()).toEqual([])
@@ -826,11 +852,11 @@ describe('approvePreSessionDialogs: the lap on a pending row with a launch start
 
     expect(await approve(PLAIN, true)).toBe(APPROVER_STOP_LIVE)
 
-    expect(calls.readPaneCalls).toHaveLength(3)
+    expect(calls.readPaneCalls).toHaveLength(6)
     expect(calls.sendKeysCalls).toEqual([expectedEnter(PLAIN.id), expectedEnter(PLAIN.id), expectedEnter(PLAIN.id)])
   })
 
-  test('resumed row reading pending (HO C5): both dialogs are cleared through readPane and sendKeys (allow_pending) alone: three status reads, two pane reads, two Enters and no other agent-director call', async () => {
+  test('resumed row reading pending (HO C5): both dialogs are cleared through readPane and sendKeys (allow_pending) alone: five status reads, four pane reads, two Enters and no other agent-director call', async () => {
     // A resumed launch reads `pending` with this launch's start until it
     // reports in; a `status` result shows no `started_at`, so the lap is the
     // same as after a fresh spawn. Folder-trust then dev-channels.
@@ -844,8 +870,8 @@ describe('approvePreSessionDialogs: the lap on a pending row with a launch start
     const status = { instance_id: NAMED.id }
     expect(calls).toEqual({
       ...makeStubCallLog(),
-      statusCalls: [status, status, status],
-      readPaneCalls: [expectedReadPane(NAMED.id), expectedReadPane(NAMED.id)],
+      statusCalls: [status, status, status, status, status],
+      readPaneCalls: Array.from({ length: 4 }, () => expectedReadPane(NAMED.id)),
       sendKeysCalls: [expectedEnter(NAMED.id), expectedEnter(NAMED.id)],
     })
   })
@@ -1369,9 +1395,9 @@ describe('approvePreSessionDialogs: each answer by class, one case per cell (b.j
 
   /** Stopped at the first lap, at once: its calls up to the refused one, no further call, nothing typed but the refused Enter, no kill. */
   function expectStoppedAtFirstLap(verb: ApproverVerb): void {
-    expect(statusAt).toEqual([LAUNCH_START_MS])
+    expect(statusAt).toEqual(Array(verb === 'send-keys' ? 2 : 1).fill(LAUNCH_START_MS))
     expect(clock.now()).toBe(LAUNCH_START_MS)
-    expect(calls.readPaneCalls).toHaveLength(verb === 'status' ? 0 : 1)
+    expect(calls.readPaneCalls).toHaveLength(verb === 'status' ? 0 : verb === 'send-keys' ? 2 : 1)
     expect(calls.sendKeysCalls).toHaveLength(verb === 'send-keys' ? 1 : 0)
     expect(calls.killCalls).toEqual([])
   }
@@ -1394,7 +1420,11 @@ describe('approvePreSessionDialogs: each answer by class, one case per cell (b.j
 
     expect(await approve(PLAIN, true)).toBe(APPROVER_STOP_LIVE)
 
-    expect(statusAt).toEqual([LAUNCH_START_MS, LAUNCH_START_MS + firstGapMs, LAUNCH_START_MS + firstGapMs + FAST])
+    expect(statusAt).toEqual([
+      ...Array(verb === 'send-keys' ? 2 : 1).fill(LAUNCH_START_MS),
+      ...Array(verb === 'send-keys' ? 2 : 1).fill(LAUNCH_START_MS + firstGapMs),
+      LAUNCH_START_MS + firstGapMs + FAST,
+    ])
     expect(calls.sendKeysCalls).toHaveLength(verb === 'send-keys' ? 2 : 0)
     expect(approverLines()).toEqual([pollingOnLine(verb, err)])
     expect(startupEntries()).toEqual([])
@@ -1591,9 +1621,11 @@ describe('approvePreSessionDialogs: each answer by class, one case per cell (b.j
     expect(await runToStop(startApprover(PLAIN, true), MANY_TIMERS)).toBe(APPROVER_STOP_BOUND)
 
     expect(clock.now()).toBe(LAUNCH_START_MS + boundMs)
-    expect(readPaneAt).toEqual(evenTimes(LAUNCH_START_MS, SLOW, boundMs / SLOW))
-    expect(calls.sendKeysCalls).toHaveLength(readPaneAt.length)
-    expect(approverLines()).toHaveLength(readPaneAt.length + 1)
+    const lapTimes = evenTimes(LAUNCH_START_MS, SLOW, boundMs / SLOW)
+    expect(readPaneAt).toEqual(lapTimes.flatMap((at) => [at, at]))
+    expect(statusAt).toEqual(readPaneAt)
+    expect(calls.sendKeysCalls).toHaveLength(lapTimes.length)
+    expect(approverLines()).toHaveLength(lapTimes.length + 1)
   })
 
   test('UNCLASSIFIED from every read-pane: polling goes on at the pace in effect until B from the launch start (bound)', async () => {
@@ -1953,6 +1985,10 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     active = new Map()
     maxActive = new Map()
     insideAttempt = []
+    // Keep per-lap row scripts stable during the additional typing guard.
+    const freshRows = new Map<string, StatusAnswer>()
+    const lapRows = new Map<string, StatusAnswer>()
+    const freshPanes = new Set<string>()
     const stub = makeStubClient({})
     const wrap = <R>(verb: ApproverVerb, answer: (id: string) => R) => async (params: { instance_id: string }): Promise<R> => {
       const id = params.instance_id
@@ -1983,13 +2019,27 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     }
     Object.assign(stub, {
       status: wrap('status', (id) => {
+        if (freshRows.has(id)) {
+          const answer = freshRows.get(id)!
+          freshRows.delete(id)
+          return answer
+        }
         const answers = rows.get(id)
         if (answers === undefined || answers.length === 0) throw new Error(`no status answer set for ${id}`)
         const answer = answers.length > 1 ? answers.shift()! : answers[0]!
         if (answer instanceof Error) throw answer
+        lapRows.set(id, answer)
         return answer
       }),
-      readPane: wrap('read-pane', (id) => panes.get(id) ?? CLEAR_PANE),
+      readPane: wrap('read-pane', (id) => {
+        const pane = panes.get(id) ?? CLEAR_PANE
+        if (freshPanes.delete(id)) return pane
+        if (NEEDLES.some(([, needle]) => pane.pane.includes(needle))) {
+          freshRows.set(id, lapRows.get(id)!)
+          freshPanes.add(id)
+        }
+        return pane
+      }),
       sendKeys: wrap('send-keys', () => ({})),
     })
     setClientForTests(stub as unknown as Parameters<typeof setClientForTests>[0])
@@ -2015,7 +2065,11 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
 
   /** The events after index `from` that are calls for `who`. */
   const callsOf = (who: ApproverPersona, from = 0): string[] => events.slice(from).filter((e) => e.endsWith(` ${who.id}`))
-  const lap = (who: ApproverPersona, ...verbs: ApproverVerb[]): string[] => verbs.map((v) => call(v, who.id))
+  // Reaching Enter includes the gate's own fresh row and pane reads.
+  const lap = (who: ApproverPersona, ...verbs: ApproverVerb[]): string[] =>
+    verbs.flatMap((verb) => verb === 'send-keys'
+      ? [call('status', who.id), call('read-pane', who.id), call(verb, who.id)]
+      : [call(verb, who.id)])
   const sendKeysCount = (who: ApproverPersona): number => events.filter((e) => e === call('send-keys', who.id)).length
 
   /** Fire timers until `who`'s approver has stopped; answers its outcome. */
@@ -2543,7 +2597,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
 
     expect(startedInside).toBe(true)
     expect(events).toEqual(lap(PLAIN, 'status', 'read-pane', 'send-keys'))
-    expect(insideAttempt).toEqual([false, false, false])
+    expect(insideAttempt).toEqual([false, false, false, false, false])
     endAttempt()
     expect(await attempt).toBeUndefined()
 
@@ -2790,7 +2844,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
       const outcome = rule.run !== undefined ? await rule.run(PLAIN, start) : (startDialogApprover(PLAIN.key, false, PLAIN.ref, start), await runUntilStopped(PLAIN))
 
       expect(outcome).toEqual({ reason: rule.reason, launchStartMs: rule.kept })
-      if (rule.calls !== undefined) expect(callsOf(PLAIN).slice(0, rule.calls.length)).toEqual(lap(PLAIN, ...rule.calls))
+      if (rule.calls !== undefined) expect(callsOf(PLAIN).slice(0, lap(PLAIN, ...rule.calls).length)).toEqual(lap(PLAIN, ...rule.calls))
       if (rule.calls !== undefined && rule.run === undefined) expect(callsOf(PLAIN)).toEqual(lap(PLAIN, ...rule.calls))
       const lines = approverLines()
       const own = startLines(PLAIN)

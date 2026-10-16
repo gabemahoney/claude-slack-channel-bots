@@ -72,21 +72,20 @@
 # sweep keeps them, and the start pass's plain spawns collide and route to
 # `get` (expected; neither a reuse nor a resume). The `get` reads `waiting`,
 # and the plain stop ended the stub's MCP session, so the start pass and each
-# retry run the reconnect (a pane read, then `send-keys` of `/mcp reconnect`,
-# b.jg5 SRJ-118), whose tmux verbs are refused: the first refusal starts the
+# retry run the reconnect's waiting-row proof and fresh screen check
+# (b.omv SR-5.3/5.5), whose tmux verbs are refused: the first refusal starts the
 # persona's `tmux-unresponsive` condition (its started line) and arms its
 # retry timer. After the unwedge the next retry's pane read succeeds, which
 # ends the condition (a tmux-touching call succeeded, SRJ-310).
-# Waits, from the retry schedule (SRJ-302: UNAVAILABLE_RETRY_BASE_S doubling
-# to UNAVAILABLE_RETRY_CEILING_S): with `health_check_interval` 0, retries
-# fall at 30, 90, 210, 450 and 750 s after the first refusal; the onset falls
-# due at the first retry at least TMUX_UNRESPONSIVE_ONSET_FLOOR_MS after it
-# (210 s; SRJ-308), and the alert once more than the threshold (360 s) has
+# Both the UNAVAILABLE retry schedule (SRJ-302) and E3's per-persona
+# deferred-reconnect timer drive checks with `health_check_interval` 0.
+# The onset falls due on a check at least TMUX_UNRESPONSIVE_ONSET_FLOOR_MS
+# after the first refusal (SRJ-308), and the alert once more than the threshold (360 s) has
 # passed (SRJ-309). `wedge` is kept until both alerts have posted (each
 # waited for up to ALERT_SLACK_S past its persona's threshold), then `log`,
 # and each recovery is waited for up to one retry interval (at most
-# UNAVAILABLE_RETRY_CEILING_S, SRJ-302) and RECOVERY_SLACK_S: the retry at
-# 450 s is the first after the unwedge. Checked, for each of A and B:
+# UNAVAILABLE_RETRY_CEILING_S, SRJ-302) and RECOVERY_SLACK_S. Recovery must
+# finish the guarded no_enter text and delayed Enter. Checked, for each of A and B:
 #   - at most one onset, none after its alert (SRJ-308: SRD over Epic, *at
 #     most* one; whether it posted is logged);
 #   - exactly one alert, posted more than the threshold after the first
@@ -174,6 +173,8 @@ t18_whole CALL_TIMEOUT_MS DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS
 t18_whole THRESHOLD_MS adAlertThresholdMs.default
 t18_whole RETRY_BASE_S UNAVAILABLE_RETRY_BASE_S
 t18_whole RETRY_CEILING_S UNAVAILABLE_RETRY_CEILING_S
+t18_whole ENTER_DELAY_MS ENTER_DELAY_MS
+t18_whole FULL_LINES FULL_PANE_READ_LINES
 t18_whole ONSET_FLOOR_MS TMUX_UNRESPONSIVE_ONSET_FLOOR_MS
 t18_value SVC_LABEL SERVICE_LABEL
 t18_value SUMMARY_HEAD startSweepSummaryLine.head
@@ -654,9 +655,15 @@ t18_texts() {
     printf -v "$1_RECOVERY" '%s' "${prefix}${body}"
 }
 
+t18_reconnect_submitted() {
+    local n
+    n="$(cscb_ad_count_between "$2" - send-keys "--instance-id $1" "--key Enter")" || return 1
+    (( n >= 1 ))
+}
+
 t18_condition_section() {
     local step="wedged condition" p head n deadline_s wait_s alert_t unwedge_t times t onset_n
-    local id_var key_var ch_var at_var alert_var onset_var rec_var verb calls
+    local id_var key_var ch_var at_var alert_var onset_var rec_var verb calls unwedge_mark
 
     # Each persona's first refusal: its condition's started line.
     for p in "${KEPT[@]}"; do
@@ -688,6 +695,7 @@ t18_condition_section() {
     done
 
     # tmux answers again.
+    unwedge_mark="$(ad_shim_mark)"
     unwedge_t="${EPOCHREALTIME/,/.}"
     tmux_shim_mode log
 
@@ -707,6 +715,13 @@ t18_condition_section() {
         alert_var="${p}_ALERT"
         onset_var="${p}_ONSET"
         rec_var="${p}_RECOVERY"
+
+        # An outage all-clear precedes the reconnect's Enter. Wait for both
+        # key calls before inspecting their order, provenance and delay.
+        wait_until "${RECOVERY_SLACK_S}" "${step}: ${p}'s reconnect never submitted" \
+            t18_reconnect_submitted "${!id_var}" "${unwedge_mark}"
+        _scenario_assert_reconnect_rows "${step}: ${p}" "${SERVER_PID}" "${ENTER_DELAY_MS}" "${FULL_LINES}" \
+            "$(ad_cscb_calls "${!id_var}" "${unwedge_mark}" -)"
 
         # Exactly one alert and one recovery, the recovery after the unwedge.
         n="$(t18_count_posts "" "${!alert_var}")"

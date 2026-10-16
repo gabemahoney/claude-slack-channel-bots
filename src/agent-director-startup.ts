@@ -739,6 +739,40 @@ export async function buildPersonaClientOrExit(
   return { client: outcome.client, adVersion: outcome.adVersion }
 }
 
+/** Lazy, independent delivery clients; never swap the singleton (b.omv SR-5.1, D8). */
+export function createDeliveryClientFactory(callTimeoutMs: number, deps?: Partial<PersonaClientDeps>): {
+  clientFor(key: string): Promise<Client>
+  close(): Promise<void>
+} {
+  const d = mergeDeps(deps), clients = new Map<string, Promise<Client>>()
+  let stopped = false
+  return {
+    clientFor(key) {
+      if (stopped) return Promise.reject(new Error('Delivery clients are closed'))
+      let pending = clients.get(key)
+      if (!pending) {
+        pending = (async () => {
+          const built = await constructClient(d, callTimeoutMs)
+          if (!built.ok) throw new Error(built.message)
+          const refused = refuseBelowPhase1Floor(d, built.client, built.adVersion)
+          if (refused) throw new Error(refused.message)
+          if (stopped) { d.closeClient(built.client); throw new Error('Delivery clients are closed') }
+          return built.client as Client
+        })()
+        clients.set(key, pending)
+        void pending.catch(() => { if (clients.get(key) === pending) clients.delete(key) })
+      }
+      return pending
+    },
+    async close() {
+      stopped = true
+      const results = await Promise.allSettled([...clients.values()])
+      for (const r of results) if (r.status === 'fulfilled') try { d.closeClient(r.value) } catch {}
+      clients.clear()
+    },
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Re-exports for callers / tests
 // ---------------------------------------------------------------------------

@@ -808,10 +808,44 @@ report_in() {
     REPORTED=1
     AWAITING_ENTER=0
     fire_session_start
-    echo "Listening for channel messages from: server:slack-channel-router"
+    draw_composer
     open_mcp_session
     start_refire
 }
+
+# b.omv SR-13.6: the Linux composer is visible to delivery-screen.ts. Read
+# raw keys below so literal LF belongs to the message; CR alone submits it.
+# C-u is the clear used by agent-director's pause path.
+composer=""
+draw_composer() {
+    # Keep the report-in banner visible above the box: the harness reads it
+    # after answering a startup dialog. FIFO self-check output stays plain.
+    if [[ -t 1 ]]; then
+        printf '\033[H\033[2J'
+    fi
+    printf '%s\n' 'Listening for channel messages from: server:slack-channel-router'
+    printf '%s\n' '────────────────────────────────────────────────────────────────────────'
+    printf '❯ %s\n' "${composer}"
+    printf '%s\n' '────────────────────────────────────────────────────────────────────────'
+    printf '%s\n' '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents'
+}
+
+append_user_receipt() {
+    local text="$1" uuid timestamp
+    TRANSCRIPT_DUE=1
+    ensure_transcript
+    uuid="$(cat /proc/sys/kernel/random/uuid)"
+    timestamp="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+    jq -nc --arg text "${text}" --arg uuid "${uuid}" --arg session "${SESSION_ID}" --arg timestamp "${timestamp}" \
+        '{type:"user",isSidechain:false,origin:{kind:"human"},uuid:$uuid,timestamp:$timestamp,sessionId:$session,message:{role:"user",content:$text}}' \
+        >> "${TRANSCRIPT}"
+}
+
+# Disable terminal translations before reporting in: a prompt answer may be
+# queued as soon as SessionStart fires. Literal LF is text; tmux's Enter is CR.
+if [[ -t 0 ]]; then
+    stty -icanon -echo -icrnl -inlcr -igncr min 1 time 0
+fi
 
 case "${MODE}" in
     "${MODE_DEV_CHANNELS}")
@@ -879,10 +913,10 @@ linger_after_exit() {
     exit 0
 }
 
-# handle_line <line>: one line from stdin.
+# handle_line <line>: the complete submitted composer (literal LFs retained).
 handle_line() {
     local line="$1"
-    if [[ "${line}" == "${SENTINEL}" ]]; then
+    if [[ "${line}" == *"${SENTINEL}"* ]]; then
         [[ "${MODE}" == "${MODE_SILENT}" ]] || fire_session_end
         exit 0
     fi
@@ -892,10 +926,8 @@ handle_line() {
     # transcript-on-first-message: the first message after reporting in
     # writes the transcript; a slash command (a line starting with `/`, such
     # as `/exit` or `/mcp reconnect`) is no message.
-    if (( REPORTED )) && [[ "${MODE}" == "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}" \
-        && "${line}" =~ [^[:space:]] && ! "${line}" =~ ^[[:space:]]*/ ]]; then
-        TRANSCRIPT_DUE=1
-        ensure_transcript
+    if (( REPORTED )) && [[ "${line}" =~ [^[:space:]] && ! "${line}" =~ ^[[:space:]]*/ ]]; then
+        append_user_receipt "${line}"
     fi
     if (( AWAITING_ENTER )); then
         clear_answered_dialog
@@ -907,13 +939,34 @@ handle_line() {
 
 # Read loop. While the dialog delay runs, each read waits at most until the
 # dialog is due, and once it is due the dialog is shown. While the re-fire
-# runs, each read waits at most until the next tick, and a read that times
-# out runs the tick. In either wait, the part of a line read by the timeout
-# (none from a terminal, which hands over whole lines) is kept for the next
-# read.
-partial=""
+# runs, each read waits at most until the next tick. A timeout cannot discard
+# a partially typed message: each completed key is already in the composer.
+handle_key() {
+    case "$1" in
+        $'\r')
+            local submitted="${composer}"
+            composer=""
+            handle_line "${submitted}"
+            (( REPORTED )) && draw_composer
+            ;;
+        $'\025')
+            composer=""
+            (( REPORTED )) && draw_composer
+            ;;
+        $'\177'|$'\b')
+            composer="${composer%?}"
+            (( REPORTED )) && draw_composer
+            ;;
+        *)
+            composer+="$1"
+            (( REPORTED )) && draw_composer
+            ;;
+    esac
+    return 0
+}
+
 while :; do
-    line=""
+    key=""
     if (( DIALOG_DUE_MS > 0 )); then
         now_ms
         wait_ms=$(( DIALOG_DUE_MS - NOW_MS ))
@@ -925,10 +978,9 @@ while :; do
             continue
         fi
         printf -v wait_s '%d.%03d' $(( wait_ms / 1000 )) $(( wait_ms % 1000 ))
-        IFS= read -r -t "${wait_s}" line
+        IFS= read -r -N 1 -t "${wait_s}" key
         rc=$?
         if (( rc > 128 )); then
-            partial+="${line}"
             continue
         fi
     elif (( REFIRE_ON )); then
@@ -941,21 +993,18 @@ while :; do
             continue
         fi
         printf -v wait_s '%d.%03d' $(( wait_ms / 1000 )) $(( wait_ms % 1000 ))
-        IFS= read -r -t "${wait_s}" line
+        IFS= read -r -N 1 -t "${wait_s}" key
         rc=$?
         if (( rc > 128 )); then
-            partial+="${line}"
             continue
         fi
     else
-        IFS= read -r line
+        IFS= read -r -N 1 key
         rc=$?
     fi
     # stdin closed (tmux pane killed): exit.
     (( rc == 0 )) || break
-    line="${partial}${line}"
-    partial=""
-    handle_line "${line}"
+    handle_key "${key}"
 done
 
 exit 0

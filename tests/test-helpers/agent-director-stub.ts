@@ -232,6 +232,8 @@ import {
   ErrTmuxKillFailed,
   ErrTmuxSessionConflict,
   ErrTmuxUnresponsive,
+  ErrDialogMaybeOpen,
+  ErrPaneChanged,
 } from '../../src/agent-director-errors.ts'
 import {
   CONFLICT_ANOTHER_STORE_PHRASE,
@@ -613,6 +615,14 @@ export function errSendKeysWhileRelayed(): ErrSendKeysWhileRelayed {
     'ErrSendKeysWhileRelayed',
     'the row sits on a relayed permission prompt; nothing was sent',
   )
+}
+
+/** E3 per-key refusals, before any text was typed (b.omv SR-5.6). */
+export function errDialogMaybeOpen(): ErrDialogMaybeOpen {
+  return new ErrDialogMaybeOpen('send-keys', 'ErrDialogMaybeOpen', 'a dialog may still be open')
+}
+export function errPaneChanged(): ErrPaneChanged {
+  return new ErrPaneChanged('send-keys', 'ErrPaneChanged', 'the pane changed before typing')
 }
 
 /** Build an ErrInstanceIdCollision (spawn / SR-1.4 collision path). */
@@ -1542,9 +1552,10 @@ export type GetResultOverrides =
 export type PersonaGetResultOverrides =
   & Omit<Partial<GetResult>, 'permission_requests'>
   & { permission_requests?: PermissionRequestRow[] | null }
+  & { transcript_status?: string; prior_sessions?: { jsonl_path?: string; session_id?: string; cwd?: string }[] }
 
 /** The native released-client row, with deliberate malformed fixtures cast at the builder. */
-export type CannedGetResult = GetResult
+export type CannedGetResult = GetResult & Pick<PersonaGetResultOverrides, 'transcript_status' | 'prior_sessions'>
 
 /**
  * Build a canned `GetResult`. Pass `permission_requests` for check_permission
