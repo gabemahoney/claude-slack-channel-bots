@@ -587,3 +587,37 @@ describe('rolling load bound and lifecycle', () => {
     expect(h.clock.pendingCount()).toBe(0)
   })
 })
+
+// b.omv SR-8.6: events distinguish a confirmed part from durable item completion.
+describe('operational delivery events', () => {
+  test('failed final append emits neither part nor whole-item completion until the receipt is durable', async () => {
+    const h = await harness()
+    await h.accept('body')
+    h.failAppend('delivered')
+    await start(h)
+    await h.until(() => h.errors.length > 0)
+    expect(h.events.filter(e => e.type === 'item-delivered' || e.type === 'delivered')).toEqual([])
+    expect(h.queue.openCount('alpha')).toBe(1)
+    await delivered(h)
+    expect(h.events.filter(e => e.type === 'item-delivered')).toEqual([{ type: 'item-delivered', key: 'alpha', seq: 1, at: expect.any(Number), waitMs: expect.any(Number) }])
+    expect(h.events.filter(e => e.type === 'delivered')).toHaveLength(1)
+    expect(h.textCalls()).toHaveLength(1)
+  })
+  test('first typing happens once after refusal and fixation, not at Enter retries or later parts', async () => {
+    const h = await harness()
+    await h.accept('message', 'alpha', ['part one', 'part two'])
+    h.p().box = 'operator text'
+    await start(h)
+    expect(h.events.filter(e => e.type === 'first-typed')).toEqual([])
+    const status = h.engine.status('alpha')!
+    expect(status).toMatchObject({ key: 'alpha', seq: 1, count: 1, row: 'waiting', marker: true, relay: true, connected: true, ageMs: expect.any(Number), retypeCount: 0 })
+    expect(JSON.stringify(status)).not.toContain('message')
+    expect(JSON.stringify(status)).not.toContain('operator text')
+    h.p().box = ''; h.p().lostEnters = 1
+    await delivered(h)
+    expect(h.events.filter(e => e.type === 'first-typed')).toEqual([{ type: 'first-typed', key: 'alpha', seq: 1, part: 1 }])
+    expect(h.events.filter(e => e.type === 'delivered').map(e => 'part' in e && e.part)).toEqual([1, 2])
+    expect(h.events.filter(e => e.type === 'item-delivered')).toHaveLength(1)
+    expect(h.keyCalls().filter(c => c.params.key === 'Enter')).toHaveLength(3)
+  })
+})

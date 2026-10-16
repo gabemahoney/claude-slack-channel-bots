@@ -10,7 +10,7 @@
  */
 
 import { describe, test, expect, beforeEach, jest, spyOn } from 'bun:test'
-import { trackAck, consumeAck, forgetPersonaAcks, _resetAckTracker } from '../src/ack-tracker.ts'
+import { trackAck, consumeAck, forgetPersonaAcks, _resetAckTracker, addDeliveryAck, EARLY_REPLY_EXPIRY_MS } from '../src/ack-tracker.ts'
 
 type Triple = [personaKey: string, channelId: string, messageTs: string]
 
@@ -157,5 +157,39 @@ describe('_resetAckTracker', () => {
 
     expect(consumeAck('A', 'C_ALPHA', '1234567890.001000')).toBe(false)
     expect(consumeAck('B', 'C_BETA', '1234567890.001100')).toBe(false)
+  })
+})
+
+// b.omv SR-8.7: successful replies have a separate, memory-only 24h lifetime.
+describe('early successful replies', () => {
+  test.each([['other persona', 'B', 'C_ALPHA', 'early'], ['other channel', 'A', 'C_OTHER', 'early'], ['other message', 'A', 'C_ALPHA', 'other']])('%s does not suppress another delivery', async (_label, persona, channel, ts) => {
+    consumeAck('A', 'C_ALPHA', 'early')
+    let adds = 0
+    await addDeliveryAck(persona!, channel!, ts!, async () => { adds++ }, async () => {})
+    expect(adds).toBe(1)
+  })
+  test('reply without an ack suppresses a later add through exactly 24 hours, then expires', async () => {
+    const at = Date.now()
+    try {
+      jest.setSystemTime(at)
+      expect(consumeAck('A', 'C_ALPHA', 'early')).toBe(false)
+      trackAck('B', 'C_ALPHA', 'existing')
+      let adds = 0
+      const add = () => addDeliveryAck('A', 'C_ALPHA', 'early', async () => { adds++ }, async () => {})
+      jest.setSystemTime(at + EARLY_REPLY_EXPIRY_MS)
+      await add(); expect(adds).toBe(0)
+      jest.setSystemTime(at + EARLY_REPLY_EXPIRY_MS + 1)
+      await add(); expect(adds).toBe(1)
+      // Existing pending acks retain their 30-day contract.
+      expect(consumeAck('B', 'C_ALPHA', 'existing')).toBe(true)
+    } finally { jest.setSystemTime() }
+  })
+  test.each(['reset', 'teardown'])('%s clears early replies while a sibling remains suppressed after teardown', async kind => {
+    consumeAck('A', 'C_ALPHA', 'early'); consumeAck('B', 'C_ALPHA', 'early')
+    if (kind === 'reset') _resetAckTracker()
+    else forgetPersonaAcks('A')
+    const adds: string[] = []
+    for (const key of ['A', 'B']) await addDeliveryAck(key, 'C_ALPHA', 'early', async () => { adds.push(key) }, async () => {})
+    expect(adds).toEqual(kind === 'reset' ? ['A', 'B'] : ['A'])
   })
 })

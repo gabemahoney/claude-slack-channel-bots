@@ -1,6 +1,6 @@
 /**
  * The test-only timer override block (b.2nr). Undocumented for users; OFF by
- * default. It lets a `/ci` scenario shorten five production timers so it does
+ * default. It lets a `/ci` scenario shorten production timers so it does
  * not wait them out, without changing any of them for a real configuration.
  *
  * The block is the top-level `test_timer_overrides` object of `config.json`
@@ -30,6 +30,7 @@
  * overridden value ({@link buildTestTimerOverridesLine}).
  */
 
+import { DELIVERY_STUCK_AFTER_MS } from './delivery-constants.ts'
 import { TEST_TIMER_OVERRIDE_KEYS, type TestTimerOverrideKey, type TestTimerOverrides } from './config.ts'
 import { installLaunchBoundFloorMs, DIALOG_READY_TIMEOUT_MS } from './ad-settings.ts'
 import { AD_VERSION_RECHECK_INTERVAL_MS, setAdVersionRecheckIntervalMs } from './ad-version-gate.ts'
@@ -39,8 +40,9 @@ import { UNAVAILABLE_RETRY_BASE_S, UNAVAILABLE_RETRY_CEILING_S } from './unavail
 /** The head of the one line written at start when any override is active. */
 export const TEST_TIMER_OVERRIDES_LOG_PREFIX = '[slack] TEST TIMER OVERRIDES ACTIVE'
 
-/** The five timers in effect: each the override when the block gives one, else the production default. */
+/** The timers in effect: each the override when the block gives one, else the production default. */
 export interface EffectiveTestTimers {
+  readonly deliveryStuckAfterMs: number
   /** The latch re-check interval, ms. */
   readonly latchRecheckIntervalMs: number
   /** The agent-director version re-check interval, ms. */
@@ -60,6 +62,8 @@ function defaultOf(key: TestTimerOverrideKey): number {
       return LATCH_RECHECK_INTERVAL_MS
     case 'ad_version_recheck_interval_ms':
       return AD_VERSION_RECHECK_INTERVAL_MS
+    case 'delivery_stuck_after_ms':
+      return DELIVERY_STUCK_AFTER_MS
     case 'dialog_ready_timeout_ms':
       return DIALOG_READY_TIMEOUT_MS
     case 'unavailable_retry_base_s':
@@ -80,9 +84,10 @@ export function effectiveTestTimer(key: TestTimerOverrideKey, overrides?: TestTi
   return overrides?.[key] ?? defaultOf(key)
 }
 
-/** The five timers in effect for `overrides` (none: the production defaults). Pure. */
+/** The timers in effect for `overrides` (none: the production defaults). Pure. */
 export function effectiveTestTimers(overrides?: TestTimerOverrides): EffectiveTestTimers {
   return {
+    deliveryStuckAfterMs: effectiveTestTimer('delivery_stuck_after_ms', overrides),
     latchRecheckIntervalMs: effectiveTestTimer('latch_recheck_interval_ms', overrides),
     adVersionRecheckIntervalMs: effectiveTestTimer('ad_version_recheck_interval_ms', overrides),
     dialogReadyTimeoutMs: effectiveTestTimer('dialog_ready_timeout_ms', overrides),

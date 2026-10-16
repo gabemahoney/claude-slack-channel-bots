@@ -17,6 +17,8 @@ export interface DeliveryPreparationDeps {
   /** Post-ack ownership starts E3 even when fixation must retry. */
   onPending?(key: string): void
   onEvent?(event: QueueEvent): void
+  /** Called only from post-ack/answer preparation or startup recovery. */
+  onReceived?(key: string, item: QueueItem): void
   lookupTimeoutMs?: number
   clock?: DeliveryPreparationClock
   retryBackoffMs?: readonly number[]
@@ -96,6 +98,7 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     if (!stopped) await deps.wake?.(key)
   }
   function prepare(key: string, item: QueueItem): Promise<void> {
+    try { void Promise.resolve(deps.onReceived?.(key, item)).catch(() => {}) } catch { /* reporting never owns acceptance */ }
     const id = `${key}:${item.accepted.seq}`
     const existing = inFlight.get(id)
     if (existing) return existing
@@ -127,7 +130,11 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     },
     async accept(key, input) {
       const result = await deps.queue.accept(key, input)
-      if (result.status !== 'failed' && result.item) void prepare(key, result.item).catch(() => { /* queue emits append-failed; acceptance remains durable */ })
+      if (result.status !== 'failed' && result.item) {
+        const item = result.item
+        // Yield through the caller's HTTP answer/cron outcome before reporting or preparing.
+        clock.setTimeout(() => { if (!stopped) void prepare(key, item).catch(() => {}) }, 0)
+      }
       return result
     },
     forget(key) { channels.delete(key); for (const [id, retry] of retries) if (retry.key === key) { if (retry.timer !== undefined) clock.clearTimeout(retry.timer); retries.delete(id) } },

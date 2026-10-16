@@ -92,12 +92,35 @@ describe('fungible mode', () => {
 test('partial fanout suppresses ack; retry prepares retained accepted-only A and newly stored B after aggregate ack', async () => {
   const queue = await makeQueue(dir); const config = makeMultiPersonaConfig([{ name: 'alpha', channels: [{ id: CS, delivery: 'all' }] }, { name: 'beta', channels: [{ id: CS, delivery: 'all' }] }], dir)
   let failing = true; const order: string[] = []
-  const routing = createPersonaRouting({ getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }), archive: () => {}, log: () => {}, queue: { lookupSlackKey: queue.lookupSlackKey, accept: async (key, input) => { order.push('store:' + key); return key === 'beta' && failing ? { status: 'failed', error: new Error('EIO') } : queue.accept(key, input) } }, prepare: async (key, item) => { order.push('prepare:' + key); await queue.append(key, { v: 1, kind: 'fixed', seq: item.accepted.seq, parts: ['fixed'] }) } })
+  const routing = createPersonaRouting({ getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }), archive: () => {}, log: () => {}, queue: { lookupSlackKey: queue.lookupSlackKey, accept: async (key, input) => { order.push('store:' + key); return key === 'beta' && failing ? { status: 'failed', error: new Error('EIO') } : queue.accept(key, input) } }, onReceived: (key) => { order.push('received:' + key) }, prepare: async (key, item) => { order.push('prepare:' + key); await queue.append(key, { v: 1, kind: 'fixed', seq: item.accepted.seq, parts: ['fixed'] }) } })
   const event = makeChannelMessage({ channel: CS }); await routing.receive(event, () => { order.push('ack') }, ['alpha', 'beta'])
   expect(order).toEqual(['store:alpha', 'store:beta']); expect(queue.items('alpha')).toHaveLength(1); expect(queue.items('beta')).toEqual([])
   failing = false; order.length = 0; await routing.receive(event, () => { order.push('ack') }, ['alpha', 'beta'])
-  expect(order).toEqual(['store:beta', 'ack', 'prepare:alpha', 'prepare:beta'])
+  expect(order).toEqual(['store:beta', 'ack', 'received:alpha', 'received:beta', 'prepare:alpha', 'prepare:beta'])
   for (const key of ['alpha', 'beta']) { expect(queue.items(key)).toHaveLength(1); expect(queue.items(key)[0]!.fixed!.parts).toEqual(['fixed']); expect(readQueue(dir, key).filter(r => r.kind === 'accepted' && !('compact' in r))).toHaveLength(1) }; await queue.stop()
+})
+test('a fresh routing factory acknowledges a preexisting fixed undelivered Slack item without recovery or another received report', async () => {
+  const queue = await makeQueue(dir)
+  const config = makeMultiPersonaConfig([{ name: 'alpha', channels: [{ id: CA, delivery: 'all' }] }], dir)
+  const event = makeChannelMessage({ channel: CA })
+  const stored = await queue.accept('alpha', slackInput({ channel: CA, ts: event.ts as string, key: { chat_id: CA, ts: event.ts as string } }))
+  if (stored.status === 'failed') throw new Error('store failed')
+  await queue.append('alpha', { v: 1, kind: 'fixed', seq: stored.seq, parts: ['preexisting fixed bytes'] })
+  const before = readQueue(dir)
+  const calls: string[] = []
+  // No earlier call has populated this factory's in-memory dedupe map.
+  const routing = createPersonaRouting({ getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }),
+    queue, archive: () => {}, log: () => {}, prepare: async () => { calls.push('prepare') }, onReceived: () => { calls.push('received') },
+    isPersonaUp: () => { calls.push('recovery'); return true }, readRowLiveness: async () => { calls.push('read'); return { kind: 'dead', cause: 'ended' } },
+  })
+  try {
+    expect(queue.items('alpha')[0]!.delivered).toBe(false)
+    await routing.receive(event, () => { calls.push('ack') }, 'alpha')
+    expect(calls).toEqual(['ack'])
+    expect(queue.items('alpha')).toHaveLength(1)
+    expect(queue.items('alpha')[0]!.fixed!.parts).toEqual(['preexisting fixed bytes'])
+    expect(readQueue(dir)).toEqual(before)
+  } finally { await queue.stop() }
 })
 test('ack precedes row read and all lookups; fixed bytes are durable before wake and survive replay/name changes', async () => {
   const queue = await makeQueue(dir); const order: string[] = []; const config = makeMultiPersonaConfig([{ name: 'alpha' }], dir)

@@ -60,13 +60,16 @@ The server retries the persona on its own (after 30, 60, 120 and 240 s, then eve
 After a removal, rename or path change, or a start whose clean-up could not end an old instance, no persona comes up in that directory until the old instance has ended; the server keeps ending it. If its kill keeps failing, a human follows the "Operator actions" section of agent-director's README. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-waits-on-an-old-instance-in-its-working-directory).
 
 **Bot alive but silently unresponsive (MCP disconnected)**
-The health check reconnects or relaunches such a bot on its own, within about 3–5 minutes at the default settings. With `session_restart_delay` set to `0`, a *Not connected* or *Not receiving messages* notice reports it instead. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-bot-alive-but-silently-unresponsive-mcp-disconnected).
+The health check reconnects or relaunches such a bot on its own, within about 3–5 minutes at the default settings. With `session_restart_delay` set to `0`, a *Not connected* notice reports it instead. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-bot-alive-but-silently-unresponsive-mcp-disconnected).
 
 **Reading the start summary**
 Each start logs one `[slack] startupSessionManager: complete — …` line counting its personas by outcome. `latched`, `retrying`, `waiting on a live-row sequence`, `held on invalid flags` and `fresh as retired keys` are not failures. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-reading-the-start-summary).
 
-**A persona posts a *Waiting on a prompt*, *Not connected* or *Not receiving messages* notice**
-The session runs, but messages can't reach it. A human attaches with `tmux attach -t =slack_bot_<key>`, deals with anything on screen and, if it stays disconnected, types `/mcp reconnect slack-channel-router`, or restarts the server. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-waiting-on-a-prompt-not-connected-or-not-receiving-messages-notice).
+**Delivery notices or delivery diagnostic lines**
+For *Message not saved*, check the server disk; for *Delivery stuck* or *Message not taken in*, follow the notice's remedy; for *Messages waiting*, resolve the persona's state; for *Queue record unreadable*, preserve its file and ask the senders to resend. Accepted messages stay queued in order. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-delivery-notices-or-delivery-diagnostic-lines).
+
+**A persona posts a *Waiting on a prompt* or *Not connected* notice**
+The session runs but is disconnected; accepted messages are kept until it reconnects. A human attaches with `tmux attach -t =slack_bot_<key>`, deals with anything on screen and, if it stays disconnected, types `/mcp reconnect slack-channel-router`, or restarts the server. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-waiting-on-a-prompt-or-not-connected-notice).
 
 **A persona posts a *Not answering*, *Still not answering* or *Answering again* notice**
 agent-director or tmux is not answering for this persona's session; the server keeps retrying and posts *Answering again* when it recovers. After *Still not answering*, a human checks tmux and agent-director with read-only commands only. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-not-answering-still-not-answering-or-answering-again-notice).

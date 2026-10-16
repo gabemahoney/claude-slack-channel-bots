@@ -1585,12 +1585,26 @@ describe('classification across a switch change, the resolved and section compar
     ['the block added', undefined, { dialog_ready_timeout_ms: 120_000 }],
     ['the block removed', { dialog_ready_timeout_ms: 120_000 }, undefined],
     ['a value changed', { unavailable_retry_base_s: 5, unavailable_retry_ceiling_s: 60 }, { unavailable_retry_base_s: 6, unavailable_retry_ceiling_s: 60 }],
+    ['delivery-stuck timer added (b.omv SR-14.1)', undefined, { delivery_stuck_after_ms: 7_000 }],
+    ['delivery-stuck timer removed (b.omv SR-14.1)', { delivery_stuck_after_ms: 7_000 }, undefined],
+    ['delivery-stuck timer changed (b.omv SR-14.1)', { delivery_stuck_after_ms: 7_000 }, { delivery_stuck_after_ms: 9_000 }],
   ])('test_timer_overrides %s is no effective change (b.2nr)', (_label, from, to) => {
     const withBlock = (block: Record<string, number> | undefined) => edited((c) => { if (block !== undefined) (c as Record<string, unknown>)['test_timer_overrides'] = block })
     const { plan, lines } = previewBetween(withBlock(from), withBlock(to))
 
     expect(plan).toEqual(planWith({ unchanged: baseRefs(), noEffectiveChange: true }))
     expect(lines).toEqual([NO_EFFECT_LINE])
+  })
+
+  test('a delivery-stuck override beside a real change stays out of the settings count and preview (b.omv SR-14.1)', () => {
+    const { plan, lines } = preview(edited((c) => {
+      c.port = 3200
+      c.test_timer_overrides = { delivery_stuck_after_ms: 7_000 }
+    }))
+
+    expect(plan.settings).toEqual([{ name: 'port' }])
+    expect(changePlanCounts(plan)).toEqual(counts({ settings: 1 }))
+    expect(lines).toEqual(preview(edited((c) => { c.port = 3200 })).lines)
   })
 
   test.each<[string, boolean | undefined, boolean | undefined, (b: PersonaInput) => void, (b: PersonaInput) => void, InPlaceSetting]>([

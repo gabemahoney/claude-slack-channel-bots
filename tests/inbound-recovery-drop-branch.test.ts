@@ -2300,17 +2300,8 @@ describe('b.kvq (7) server.ts holds no copy of the lost-message branch', () => {
     expect(indicesOf(/\.receive\s*\(/g, SERVER_CODE)).toEqual([])
   })
 
-  test('the restart guard and the health check take the stream probe from the routing module', () => {
-    expect(SERVER_SRC).toMatch(
-      /import\s*\{[^}]*\bhasSessionStream\b[^}]*\}\s*from\s*['"]\.\/persona-routing\.ts['"]/,
-    )
-    // No local probe that could drift from the module's.
-    expect(indicesOf(/(?:function|const|let)\s+hasSessionStream\w*\b/g, SERVER_CODE)).toEqual([])
-    for (const init of ['initRestart', 'initHealthCheck']) {
-      const block = SERVER_CODE.match(new RegExp(`\\b${init}\\(\\{[\\s\\S]*?\\n\\s*\\}\\)`))
-      expect(block).not.toBeNull()
-      expect(block![0]).toMatch(/\bhasSessionStream\s*(?:,|:\s*hasSessionStream\b)/)
-    }
+  test('server recovery has no standalone stream probe (b.omv SR-9)', () => {
+    expect(SERVER_CODE).not.toMatch(/\bhasSessionStream\b/)
   })
 })
 

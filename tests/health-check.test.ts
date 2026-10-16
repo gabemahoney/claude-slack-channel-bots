@@ -198,10 +198,6 @@ type DepsOpts = {
   // many ticks the case drives past its end. When the queue
   // for a persona is exhausted, the LAST scripted value repeats.
   connectedSequence?: Record<string, boolean[]>
-  hasSessionStreamResult?: boolean   // default: true (stream present — prior semantics; b.9cj)
-  // b.9cj: per-persona scripted stream-presence, consumed one-per-hasSessionStream
-  // call like connectedSequence. When the queue is exhausted the LAST value repeats.
-  streamSequence?: Record<string, boolean[]>
   statRouteResult?: boolean          // default: true (working directory is reachable)
   statRouteHangs?: boolean           // if true, statRoute never resolves
   isShuttingDownResult?: boolean     // default: false
@@ -226,7 +222,6 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
   scheduleRestartCalls: Array<{ key: string; cwd: string }>
   isSessionAliveCalls: string[]
   isSessionConnectedCalls: string[]
-  hasSessionStreamCalls: string[]
   statRouteCalls: string[]
   /** Number of tick bodies run so far (getPersonas calls). */
   tickCount(): number
@@ -234,9 +229,6 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
   // called for that persona at fire time. Lets a test assert a reconnect was
   // scheduled on the Nth disconnected observation (streak semantics).
   scheduleRestartAtConnectedCount: number[]
-  // b.9cj: same idea keyed on hasSessionStream call count — lets a streamless
-  // test assert the fire landed on the Nth stream observation (streak debounce).
-  scheduleRestartAtStreamCount: number[]
   /** b.jg5 SRJ-311: every key `isRetryArmed` was asked for (present only with `retryArmedResult`). */
   isRetryArmedCalls: string[]
   /** b.jg5 SRJ-311: every `armRetryTimer` call, with its tick number (present only with `recordRetryArms`). */
@@ -245,14 +237,11 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
   const scheduleRestartCalls: Array<{ key: string; cwd: string }> = []
   const isSessionAliveCalls: string[] = []
   const isSessionConnectedCalls: string[] = []
-  const hasSessionStreamCalls: string[] = []
   const statRouteCalls: string[] = []
   const scheduleRestartAtConnectedCount: number[] = []
-  const scheduleRestartAtStreamCount: number[] = []
   const isRetryArmedCalls: string[] = []
   const armRetryTimerCalls: Array<{ key: string; tick: number }> = []
   const connectedCallCount = new Map<string, number>()
-  const streamCallCount = new Map<string, number>()
   const aliveCallCount = new Map<string, number>()
   let pendingCallCount = 0
   let atCapCallCount = 0
@@ -262,11 +251,9 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
     scheduleRestartCalls,
     isSessionAliveCalls,
     isSessionConnectedCalls,
-    hasSessionStreamCalls,
     statRouteCalls,
     tickCount: () => ticks,
     scheduleRestartAtConnectedCount,
-    scheduleRestartAtStreamCount,
     isRetryArmedCalls,
     armRetryTimerCalls,
 
@@ -308,16 +295,6 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
       }
       return opts.isSessionConnectedResult ?? true
     },
-    hasSessionStream(key) {
-      hasSessionStreamCalls.push(key)
-      const n = (streamCallCount.get(key) ?? 0) + 1
-      streamCallCount.set(key, n)
-      const seq = opts.streamSequence?.[key]
-      if (seq && seq.length > 0) {
-        return seq[Math.min(n - 1, seq.length - 1)]
-      }
-      return opts.hasSessionStreamResult ?? true
-    },
     isRestartPendingOrActive(_key) {
       const seq = opts.pendingSequence
       if (seq && seq.length > 0) {
@@ -342,7 +319,6 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
     scheduleRestart(key, cwd) {
       scheduleRestartCalls.push({ key, cwd })
       scheduleRestartAtConnectedCount.push(connectedCallCount.get(key) ?? 0)
-      scheduleRestartAtStreamCount.push(streamCallCount.get(key) ?? 0)
     },
     isShuttingDown() {
       if (opts.maxTicks !== undefined && ticks >= opts.maxTicks) return true
@@ -755,9 +731,6 @@ describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
       isSessionConnected(_key) {
         return true
       },
-      hasSessionStream(_key) {
-        return true
-      },
       isRestartPendingOrActive(_key) {
         return false
       },
@@ -1067,86 +1040,17 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.9cj — connected-but-streamless tick recovery
-//
-// Before b.9cj the alive-tick's unhealthy condition was `!isSessionConnected`
-// alone. A session that was alive AND connected but whose standalone GET SSE
-// stream had been silently dropped (`hasSessionStream === false`) landed in the
-// healthy `else` and was never recovered. The fix widens the unhealthy
-// condition to `!isSessionConnected || !hasSessionStream`, composing with the
-// EXISTING two-consecutive-tick disconnectedStreak debounce (no new streak
-// map). These tests pin: (a) a streamless session fires on the 2nd consecutive
-// streamless tick, not the 1st; (b) a stream-present session is healthy and
-// resets the streak.
-// ---------------------------------------------------------------------------
-
-describe('b.9cj connected-but-streamless tick recovery', () => {
-  test('REGRESSION: alive + connected but STREAMLESS → scheduleRestart fires on the 2nd consecutive tick, not the 1st', async () => {
-    // Pre-fix, a connected session was "healthy" regardless of stream presence,
-    // so scheduleRestart was NEVER called here. Post-fix it fires — and only on
-    // the SECOND streamless observation (shares the b.9a7 debounce for the
-    // freshly-launched, stream-not-yet-open window).
-    const deps = makeDeps({
-      isSessionAliveResult: LIVENESS_READING_LIVE,
-      isSessionConnectedResult: true,   // connected …
-      hasSessionStreamResult: false,    // … but streamless
-    })
+// b.omv SR-9: connected sessions need no standalone GET stream.
+describe('connection-only health', () => {
+  test('a live connected persona stays healthy on every tick', async () => {
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: true })
     initHealthCheck(deps)
-
-    await driveTicks(4)
-
-    expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }, { key: KEY, cwd: WD }])
-    // Each fire landed on the 2nd streamless observation of its streak, never the 1st.
-    expect(deps.scheduleRestartAtStreamCount).toEqual([2, 4])
-  })
-
-  test('alive + connected + stream present → healthy: no scheduleRestart and streak resets', async () => {
-    // A fully healthy session (alive, connected, stream present) is never
-    // scheduled. Prove it also RESETS the streak: a lone streamless blip
-    // followed by a stream-present tick never reaches two consecutive.
-    const deps = makeDeps({
-      isSessionAliveResult: LIVENESS_READING_LIVE,
-      isSessionConnectedResult: true,
-      // false (streak→1), true (reset), false (fresh streak→1), true (reset) …
-      streamSequence: { [KEY]: [false, true, false, true] },
-    })
-    initHealthCheck(deps)
-
     await driveTicks(6)
-
-    // No two CONSECUTIVE streamless observations ever occurred — the healthy
-    // (stream-present) branch cleared the streak each time.
-    expect(deps.scheduleRestartCalls).toHaveLength(0)
-    // Anti-vacuity: the scripted sequence was actually observed, once per tick.
-    expect(deps.hasSessionStreamCalls).toHaveLength(6)
-  })
-
-  test('DISCONNECTED (connected===false) short-circuits the OR: hasSessionStream is never consulted, recovery still fires on every 2nd tick', async () => {
-    // The unhealthy condition is `!isSessionConnected || !hasSessionStream`
-    // (health-check.ts:184). When connected===false the FIRST operand is already
-    // true, so JS short-circuits and hasSessionStream is NEVER called for this
-    // persona — the disconnected path (b.9a7) and the streamless path (b.9cj)
-    // share the same debounced branch and streak map. hasSessionStreamResult is
-    // set false here only to prove it is irrelevant when disconnected.
-    const deps = makeDeps({
-      isSessionAliveResult: LIVENESS_READING_LIVE,
-      isSessionConnectedResult: false,   // disconnected — first operand short-circuits
-      hasSessionStreamResult: false,     // would also route here, but is never reached
-    })
-    initHealthCheck(deps)
-
-    await driveTicks(6)
-
-    // Proof of short-circuit: the stream probe was never consulted for the persona.
-    expect(deps.hasSessionStreamCalls).toHaveLength(0)
-    // The disconnected session was recovered on the 2nd, 4th and 6th
-    // CONNECTED observations: the shared streak is consumed on fire and must
-    // re-accumulate two observations.
-    expect(deps.scheduleRestartAtConnectedCount).toEqual([2, 4, 6])
+    expect(deps.isSessionConnectedCalls).toHaveLength(6)
+    expect(deps.scheduleRestartCalls).toEqual([])
   })
 })
 
-// ---------------------------------------------------------------------------
 // b.av2 SR-6.3 — the tick's work list and streaks are keyed by persona
 //
 // A persona listed in two channels is one instance, so it is checked once per
@@ -1319,11 +1223,9 @@ describe('b.f2b: launches in flight, the delay-0 not-connected notice, pending w
     expect(deps.scheduleRestartAtConnectedCount).toEqual([4])
   })
 
-  test.each<[string, boolean, DepsOpts, 'disconnected' | 'streamless', string[]]>([
+  test.each<[string, boolean, DepsOpts, 'disconnected', string[]]>([
     ['disabled (session_restart_delay 0), disconnected', true, { isSessionConnectedResult: false }, 'disconnected', [':warning: *Not connected*', 'its connection has been down on two health checks in a row']],
-    ['disabled (session_restart_delay 0), connected with its stream gone', true, { hasSessionStreamResult: false }, 'streamless', [':warning: *Not receiving messages*', 'its message stream is gone']],
     ['enabled, disconnected', false, { isSessionConnectedResult: false }, 'disconnected', []],
-    ['enabled, connected with its stream gone', false, { hasSessionStreamResult: false }, 'streamless', []],
   ])('auto-restart %s: the alive persona is scheduled every second tick; with auto-restart disabled each schedule asks for the not-connected notice with the persona and why, raised once for the episode', async (_label, disabled, down, cause, notice) => {
     const raised: Array<{ key: string; text: string }> = []
     setSessionNotifier((key, text) => { raised.push({ key, text }) })
@@ -1452,7 +1354,6 @@ describe('b.jg5 SRJ-314: an unknown reading or a thrown probe skips the persona 
     expect(notified).toEqual([])
     expect(ended).toEqual([])
     expect(deps.isSessionConnectedCalls).toEqual([])
-    expect(deps.hasSessionStreamCalls).toEqual([])
     const skips = lines.filter((line) => line.includes('liveness unknown'))
     expect(skips).toHaveLength(3)
     for (const line of skips) {
@@ -1508,7 +1409,7 @@ describe('b.jg5 SRJ-314: an unknown reading or a thrown probe skips the persona 
 // two-tick streak, then scheduleRestart, whose run defers it: pinned in
 // tests/restart.test.ts), never ends the not-connected episode and gets no
 // delay-0 notice, whose "disconnected" or "streamless" wording would be false.
-// A disconnected or streamless `pending` row keeps the alive branch, notice
+// A disconnected `pending` row keeps the alive branch, notice
 // included. Each case runs with and without a launch start on the reading.
 // ---------------------------------------------------------------------------
 
@@ -1551,8 +1452,7 @@ describe('b.jg5 SRJ-314: a pending row is never counted healthy', () => {
 
   test.each(PENDING_READINGS.flatMap(([label, pending]) => [
     [`${label}, disconnected`, pending, { isSessionConnectedResult: false }, 'disconnected'],
-    [`${label}, connected with its stream gone`, pending, { hasSessionStreamResult: false }, 'streamless'],
-  ] as Array<[string, LivenessReading, DepsOpts, 'disconnected' | 'streamless']>))('pending (%s): the alive branch — scheduled every second tick, each schedule asking for the notice with its true reason, no episode ended', async (_label, pending, down, cause) => {
+  ] as Array<[string, LivenessReading, DepsOpts, 'disconnected']>))('pending (%s): the alive branch — scheduled every second tick, each schedule asking for the notice with its true reason, no episode ended', async (_label, pending, down, cause) => {
     const { deps, notified, ended } = pendingDeps({ ...down, aliveSequence: { [KEY]: [pending] }, maxTicks: 4 })
 
     await runTicks(deps, 4)
@@ -1577,7 +1477,6 @@ function notHealthyReadings(persona: string): Array<[string, DepsOpts]> {
     ['a thrown probe', { aliveSequence: { [persona]: [new Error('simulated status failure')] } }],
     ['dead', { aliveSequence: { [persona]: [LIVENESS_READING_DEAD] } }],
     ['live but disconnected', { isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false }],
-    ['live and connected but streamless', { isSessionAliveResult: LIVENESS_READING_LIVE, hasSessionStreamResult: false }],
   ]
 }
 
@@ -1589,7 +1488,7 @@ function notHealthyReadings(persona: string): Array<[string, DepsOpts]> {
 // condition's end with reason `tick` and the `live` reading; the binding is
 // pinned in tests/server-startup-wiring.test.ts). `pending` (never healthy),
 // `unknown`, a thrown probe, `dead`, and a live session that is disconnected
-// or connected but streamless never call it. Every other case in this file
+//  never call it. Every other case in this file
 // leaves the hook at its default (absent).
 // ---------------------------------------------------------------------------
 
@@ -1659,7 +1558,7 @@ describe('b.jg5 SRJ-310: a live, connected tick with its stream ends the persona
 // binds the observer to the retry timer's condition-end entry; the binding is
 // pinned in tests/server-startup-wiring.test.ts). `pending` (never healthy),
 // `unknown`, a thrown probe, `dead`, and a live session that is disconnected
-// or connected but streamless leave it raised and post nothing. Another
+//  leave it raised and post nothing. Another
 // persona's flag is never touched. The flag is raised with no detail, as the
 // wrappers raise it.
 // ---------------------------------------------------------------------------
@@ -1744,7 +1643,7 @@ describe('b.jg5 SRJ-312: a live, connected tick with its stream clears the perso
 // tests/server-startup-wiring.test.ts, and what the tracker does in
 // tests/slow-recovery.test.ts). `pending` (never healthy), `unknown`, a
 // thrown probe, `dead`, and a live session that is disconnected or connected
-// but streamless never call it. A throwing hook is the persona's error for
+// disconnected never call it. A throwing hook is the persona's error for
 // the tick: logged, and the tick goes on to the next persona. Every other
 // case in this file leaves the hook at its default (absent).
 // ---------------------------------------------------------------------------
@@ -1766,7 +1665,6 @@ describe('b.jg5 SRJ-610: a live, connected tick with its stream resets the perso
         [Q]: [LIVENESS_READING_LIVE],
       },
       connectedSequence: { [B]: [opts.isSessionConnectedResult ?? true] },
-      streamSequence: { [B]: [opts.hasSessionStreamResult ?? true] },
       maxTicks: 2,
     })
     const reset: string[] = []
@@ -2030,7 +1928,6 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
   const NOT_HEALTHY: Array<[string, DepsOpts, string[]]> = [
     ['dead', { aliveSequence: { [P]: [LIVENESS_READING_DEAD] } }, []],
     ['live but disconnected', { isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false }, [P, P]],
-    ['live and connected but streamless', { isSessionAliveResult: LIVENESS_READING_LIVE, hasSessionStreamResult: false }, [P, P]],
     ['pending, connected with its stream', { aliveSequence: { [P]: [LIVENESS_READING_PENDING] } }, [P, P]],
     // Skipped after the read (b.jg5 SRJ-314), so never probed for its connection.
     ['unknown', { aliveSequence: { [P]: [LIVENESS_READING_UNKNOWN] } }, []],
@@ -2157,7 +2054,6 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     expect(deps.statRouteCalls).toEqual([])
     expect(deps.isSessionAliveCalls).toEqual([])
     expect(deps.isSessionConnectedCalls).toEqual([])
-    expect(deps.hasSessionStreamCalls).toEqual([])
     expect(deps.scheduleRestartCalls).toEqual([])
     expect(notified).toEqual([])
     expect(episodesEnded).toEqual([])
@@ -2293,7 +2189,6 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     'pending (a launch start), connected with its stream',
     'dead',
     'live but disconnected',
-    'live and connected but streamless',
   )
   // Skipped after the read (b.jg5 SRJ-314): never reaches that branch.
   const SKIPPED_READINGS = readingsLabelled('unknown', 'a thrown probe')
@@ -2935,7 +2830,6 @@ describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', 
     initHealthCheck({
       isSessionAlive: async (key) => (calls.alive.push(key), LIVENESS_READING_DEAD),
       isSessionConnected: () => false,
-      hasSessionStream: () => false,
       isRestartPendingOrActive: (key) => (calls.pending.push(key), false),
       isAtCap: (key) => {
         calls.atCap.push(key)

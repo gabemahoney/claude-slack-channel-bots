@@ -62,7 +62,7 @@ import type { Client } from 'agent-director'
 import { createDeliveryEngines, createDeliveryLifecycle, type DeliveryEngines, type DeliveryLifecycle, type DeliveryEngineEvent } from './delivery-engine.ts'
 import { createDeliveryAdScope } from './delivery-ad-scope.ts'
 import { parseLaunchStart } from './pending-row.ts'
-import { setDeliveryLifecycle, setDeliveryPersonaLookup, inspectPersonaUpgrade, applyDeliveryOwnRowRead, handleDeliveryKeyError, handleDeliveryReadError, classifyWorkingPane } from './session-manager.ts'
+import { setDeliveryLifecycle, setDeliveryPersonaLookup, inspectPersonaUpgrade, isTagUpgradePending, hasNotConnectedEpisode, applyDeliveryOwnRowRead, handleDeliveryKeyError, handleDeliveryReadError, classifyWorkingPane } from './session-manager.ts'
 import type { WebClient } from '@slack/web-api'
 import { join, resolve } from 'path'
 import { fileURLToPath } from 'url'
@@ -224,7 +224,9 @@ import {
 import { createPersonaDestinations } from './persona-destination.ts'
 import { createPersonaDestinationHold } from './persona-destination-hold.ts'
 import { createSlowRecoveryTracker } from './slow-recovery.ts'
-import { createPersonaRouting, hasSessionStream } from './persona-routing.ts'
+import { createDeliveryReporting } from './delivery-notices.ts'
+import { buildDeliveryDiagnostic, buildQueuedMessageRetryLine, SYSTEM_PROMPT_UNWRITABLE, queueErrorCode } from './persona-diagnostics.ts'
+import { createPersonaRouting } from './persona-routing.ts'
 import { createDeliveryQueue, type DeliveryQueue, type QueueEvent } from './delivery-queue.ts'
 import { createDeliveryPreparation, type DeliveryPreparation } from './delivery-intake.ts'
 import {
@@ -241,6 +243,7 @@ import {
 import { KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN, KILL_FAILURE_CONTEXT_RECOVERY } from './kill-failure-alert.ts'
 import { resolveSlackApiUrlOverride } from './persona-slack-clients.ts'
 import { createUnhandledRejectionHandler, describeThrownValue, renderLogMessageText } from './persona-connection-errors.ts'
+import { redactSlackLogText } from './slack-log-redaction.ts'
 import { createPersonaEventRouter } from './persona-event-router.ts'
 import {
   composePersonaStatusListeners,
@@ -301,7 +304,7 @@ import {
   stopHookLaunchPass,
   teardownPersonaReplyGuard,
 } from './stop-hook-bootstrap.ts'
-import { forgetPersonaPrompts, startPermissionPoller, stopPermissionPoller } from './permission-poller.ts'
+import { forgetPersonaPrompts, startPermissionPoller, stopPermissionPoller, hasNativePromptWarning } from './permission-poller.ts'
 import {
   initRestart,
   scheduleRestart,
@@ -345,7 +348,7 @@ import {
 import { forgetFailures, isAtCap as backoffIsAtCap } from './backoff.ts'
 import { isDryRun } from './tokens.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
-import { consumeAck, forgetPersonaAcks } from './ack-tracker.ts'
+import { createDeliveryAckCallback, consumeAck, forgetPersonaAcks } from './ack-tracker.ts'
 import {
   openArchiveDatabase,
   createPersonaArchiveWriter,
@@ -1185,10 +1188,12 @@ export function _setDeliveryLifecycle(value: DeliveryLifecycle | undefined): voi
   deliveryLifecycle = value
   setDeliveryLifecycle(value)
 }
+let deliveryReporting: ReturnType<typeof createDeliveryReporting> | undefined
+const bufferedQueueEvents: QueueEvent[] = []
 let deliveryClients: ReturnType<typeof createDeliveryClientFactory> | undefined
-export const deliveryEngineEvents = { emit: (_event: DeliveryEngineEvent): void => {} }
+export const deliveryEngineEvents = { emit: (event: DeliveryEngineEvent): void => { deliveryReporting?.engineEvent(event) } }
 /** E5 binds event handling here; E2 supplies facts without notices or wording. */
-export const deliveryQueueEvents = { emit: (_event: QueueEvent): void => {} }
+export const deliveryQueueEvents = { emit: (event: QueueEvent): void => { if (deliveryReporting) deliveryReporting.queueEvent(event); else bufferedQueueEvents.push(event) } }
 /** E3's engine binds this hook after startup; until then queued work waits. */
 export const deliveryQueueWake = { wake: (_key: string): void => {} }
 const personaRouting = createPersonaRouting({
@@ -1202,6 +1207,7 @@ const personaRouting = createPersonaRouting({
     lookupSlackKey: (key, slackKey) => deliveryQueue?.lookupSlackKey(key, slackKey),
   },
   prepare: (key, item) => deliveryPreparation?.prepare(key, item) ?? Promise.resolve(),
+  onReceived: (key, item) => deliveryReporting?.received(key, item),
   archive: (key, event) => archiveWrite?.(key, event),
   log: (line) => console.error(line),
   // b.av2 SR-4.2 beside b.deo SRI-305, SRI-403: the stored choices and their
@@ -1264,7 +1270,7 @@ const personaRouting = createPersonaRouting({
     armMissingTmuxUnavailableRetry(
       key,
       tmuxUnavailableRetryDeps,
-      `[slack] Lost message: persona=${key} has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)`,
+      buildQueuedMessageRetryLine(key),
     )
   },
   // b.jg5 SRJ-1011 state 4: P's kill-failure episode is open (the ordinary
@@ -3438,6 +3444,7 @@ export async function main(): Promise<void> {
   deliveryQueue.startMaintenance()
   deliveryPreparation = createDeliveryPreparation({
     queue: deliveryQueue,
+    onReceived: (key, item) => deliveryReporting?.received(key, item),
     resolveUserName: resolvePersonaUserName,
     clientFor,
     wake: key => deliveryQueueWake.wake(key),
@@ -3606,7 +3613,8 @@ export async function main(): Promise<void> {
       if (personaConfig === null) throw new Error('persona configuration unavailable')
       prepareBotSystemPrompt(personaConfig, STATE_DIR)
     } catch (err) {
-      console.error(`[slack] system-prompt-unwritable: persona=${key} path=${JSON.stringify(botSystemPromptPath(STATE_DIR))}`)
+      const code = redactSlackLogText(queueErrorCode(err))
+      console.error(buildDeliveryDiagnostic(SYSTEM_PROMPT_UNWRITABLE, key, `path=${JSON.stringify(botSystemPromptPath(STATE_DIR))} code=${code}`))
       throw err
     }
   }
@@ -4047,7 +4055,6 @@ export async function main(): Promise<void> {
       retryBlockCause: personaRetryBlockCause,
       readRow: readPersonaRowState,
       isSessionConnected: (key) => getSessionByPersona(key)?.connected === true,
-      hasSessionStream,
       endTmuxUnresponsive: (key, reading) => {
         tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_RETRY, reading)
         clearOutageFlag(key, 'tmux-unavailable', reading)
@@ -4212,6 +4219,27 @@ export async function main(): Promise<void> {
 
   // b.omv SR-5/6: one gate for every automatic key path, independent
   // delivery clients and retry ownership even with health checks disabled.
+  deliveryReporting = createDeliveryReporting({
+    queue: deliveryQueue!, episodes: noticeEpisodes,
+    persona: getAppliedPersona,
+    state: key => ({
+      up: !shuttingDown && isPersonaUp(key),
+      latched: conflictLatch.isLatched(key), invalidFlags: invalidFlagsHold.isHeld(key),
+      killFailed: personaKillFailureAlerts?.isOpen(key) === true || waitsOnKillFailedHold(key),
+      oldLife: isOwnRowOldLifeHeld(key) || !!(getAppliedPersona(key) && oldLifeHeldDirectory(getAppliedPersona(key)!.working_directory)), upgrade: isTagUpgradePending(key),
+      atRestartLimit: backoffIsAtCap(key, RESTART_FAILURE_CAP), restartsOff: personaConfig?.session_restart_delay === 0,
+      outage: getOutageFlags(key).size > 0,
+      prompt: hasNotConnectedEpisode(key) || hasNativePromptWarning(key),
+      launch: noticeEpisodes.isOpen(key, 'stuck-launch') || isLaunchInFlight(key),
+    }),
+    stuckAfterMs: testTimers.deliveryStuckAfterMs,
+    log: line => console.error(line),
+    notify: (key, text) => personaNotifier.notify(key, text),
+    reconnectBlocked: (key, rule) => { notifyPersonaNotConnected(key, { reason: 'reconnect-blocked', rule }) },
+    delivered: createDeliveryAckCallback({ getReaction: () => getReplySettings().ack_reaction, clientFor }),
+  })
+  for (const event of bufferedQueueEvents.splice(0)) deliveryReporting.queueEvent(event)
+  deliveryReporting.startupFindings(deliveryQueue!.startupFindings())
   deliveryLifecycle = createDeliveryLifecycle({
     startId: randomBytes(16).toString('hex'), parseLaunchStart,
     onReconnectScreen: (key, reason, blockedMs) => deliveryEngineEvents.emit({ type: 'reconnect-screen', key, reason, blockedMs }),
@@ -4236,6 +4264,7 @@ export async function main(): Promise<void> {
     // name lookups; an unfixed head waits for that owner's durable wake.
     prepare: (key, item) => deliveryPreparation!.owns(key, item.accepted.seq) ? deliveryPreparation!.prepare(key, item) : Promise.resolve(),
     onRow: applyDeliveryOwnRowRead,
+    inspectUpgrade: (key, _row, client, beforeCall) => deliveryScope.run(key, client as Client, beforeCall, async () => { await inspectPersonaUpgrade(key, getAppliedPersona(key)) }),
     onKeyError: handleDeliveryKeyError,
     onReadError: handleDeliveryReadError,
     isRestartPendingOrActive, scheduleRestart,
@@ -4339,7 +4368,7 @@ export async function main(): Promise<void> {
     serialize: personaLifecycle.run,
     bringUps: personaBringUps,
     connections: manager,
-    routing: { ...personaRouting, forget: key => { personaRouting.forget(key); deliveryPreparation?.forget(key); void deliveryEngines?.forget(key); deliveryLifecycle?.forget(key) } },
+    routing: { ...personaRouting, forget: key => { personaRouting.forget(key); deliveryReporting?.forget(key); deliveryPreparation?.forget(key); void deliveryEngines?.forget(key); deliveryLifecycle?.forget(key) } },
     destinations: personaDestinations,
     destinationHold: personaDestinationHold,
     notifier: personaNotifier,
@@ -4617,12 +4646,6 @@ export async function main(): Promise<void> {
   // persona's connection.
   personaRowLiveness = isSessionAliveAdapter
 
-  // b.9cj: the restart guard and the health-check tick share persona-routing's
-  // stream-presence probe (`hasSessionStream`), the same `_GET_stream` check
-  // the dispatch path applies to the session it sends to, so a
-  // connected-but-streamless session is treated as unhealthy, not "healed",
-  // everywhere alike.
-
   // Initialize restart module with library-backed adapters. Every key is a
   // persona key.
   initRestart({
@@ -4633,7 +4656,6 @@ export async function main(): Promise<void> {
       const session = getSessionByPersona(key)
       return session?.connected === true
     },
-    hasSessionStream,
     // b.f2b: the persona locates a `working` row's transcript (its
     // claude_config_dir) for the positive-idle rule.
     reconnectSession: _buildReconnectSessionAdapter(getAppliedPersona, (key) => conflictLatch.isLatched(key)),
@@ -4819,6 +4841,7 @@ export async function main(): Promise<void> {
   // Initialize and start the health-check poller.
   initHealthCheck({
     isSessionAlive: isSessionAliveAdapter,
+    isReconnectDeferred: key => !!deliveryLifecycle?.deferred(key),
     inspectUpgrade: async key => (await inspectPersonaUpgrade(key)) !== 'current',
     // b.9a7: same connectedness adapter wired into initRestart above
     // (registry entry with connected === true). Lets the tick notice
@@ -4827,9 +4850,6 @@ export async function main(): Promise<void> {
       const session = getSessionByPersona(key)
       return session?.connected === true
     },
-    // b.9cj: same stream-presence probe wired into initRestart above, so the
-    // tick can notice connected-but-streamless rows and route them to recovery.
-    hasSessionStream,
     isRestartPendingOrActive,
     // b.f2b, b.jg5 SRJ-315: "in flight for P", a running dialog approver
     // included (SRJ-401). Work in flight owns the session (a start launch
@@ -4850,7 +4870,7 @@ export async function main(): Promise<void> {
     armRetryTimer: armEnvironmentRetryTimer,
     // b.f2b: with session_restart_delay 0 scheduleRestart does nothing, so an
     // alive persona the tick would reconnect gets the not-connected notice
-    // (once per episode, worded for a disconnected or a streamless session)
+    // (once per episode, for a disconnected session)
     // instead of being left down silently; the episode ends when the tick
     // finds it deliverable again.
     isAutoRestartDisabled: () => appliedConfig.session_restart_delay === 0,

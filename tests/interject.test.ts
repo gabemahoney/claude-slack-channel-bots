@@ -3,6 +3,9 @@ import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:tes
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createDeliveryPreparation } from '../src/delivery-intake.ts'
+import { MESSAGE_RECEIVED, buildDeliveryDiagnostic, deliveryIdentity } from '../src/delivery-notices.ts'
+import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { handleInterject, INTERJECT_BODY_CAP_BYTES, type InterjectDeps } from '../src/interject.ts'
 import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
@@ -258,4 +261,28 @@ test('logging follows durable acceptance and keeps the existing 80-character mes
 test('a throwing accept function answers Message not stored with no success log', async () => {
   const result = await handleInterject(new Request('http://127.0.0.1/interject', { method: 'POST', body: JSON.stringify({ persona: A_NAME, message: 'prompt' }) }), '127.0.0.1', { ...deps(), accept: async () => { throw new Error('EIO') } })
   expect(result.status).toBe(500); expect(await result.json()).toEqual({ error: 'Message not stored' }); expectNoDelivery(); expect(logs).toEqual([])
+})
+
+// b.omv SR-8.6: injected acceptance reports after the HTTP answer, without a body.
+test('received reporting follows the successful interject response', async () => {
+  const clock = createFakeClock(), diagnostics: string[] = []
+  let answered = false
+  const preparation = createDeliveryPreparation({ queue, clock, clientFor: () => undefined, resolveUserName: async () => '',
+    onReceived: (key, item) => {
+      expect(answered).toBe(true)
+      diagnostics.push(buildDeliveryDiagnostic(MESSAGE_RECEIVED, renderPersonaRef(A_NAME, key), deliveryIdentity(item.accepted)))
+    },
+  })
+  try {
+    const response = await handleInterject(new Request('http://127.0.0.1/interject', { method: 'POST', body: JSON.stringify({ persona: A_NAME, message: 'private injected body', sender: 'ops' }) }), '127.0.0.1', { ...deps(), accept: preparation.accept })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ ok: true, persona: A_NAME })
+    expect(diagnostics).toEqual([])
+    answered = true
+    await clock.advance(1)
+    expect(diagnostics).toEqual([buildDeliveryDiagnostic(MESSAGE_RECEIVED, renderPersonaRef(A_NAME, A_KEY), deliveryIdentity(queue.items(A_KEY)[0]!.accepted))])
+    expect(JSON.stringify(diagnostics)).not.toContain('private injected body')
+    expect(queue.items(B_KEY)).toEqual([])
+    assertNoLeak({ diagnostics, logs })
+  } finally { await preparation.stop() }
 })

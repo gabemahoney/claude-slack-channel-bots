@@ -12,7 +12,7 @@ import { makeQueue, injectedInput, readQueue } from './delivery-queue.ts'
 import { cannedGetResult, makeStubClient, type CannedGetResult } from './agent-director-stub.ts'
 import { appendTranscript, codexPromptEntry, deliveryPane, endedTurn, promptEntry, replyEntry, writeTranscript } from './working-row-panes.ts'
 
-export async function makeEngineHarness(options: { keys?: string[]; constants?: DeliveryEngineDeps['constants']; stateDir?: string; configuredAgent?: 'claude' | 'codex'; clientFor?: DeliveryEngineDeps['clientFor'] } = {}) {
+export async function makeEngineHarness(options: { keys?: string[]; constants?: DeliveryEngineDeps['constants']; stateDir?: string; configuredAgent?: 'claude' | 'codex'; clientFor?: DeliveryEngineDeps['clientFor']; inspectUpgrade?: DeliveryEngineDeps['inspectUpgrade']; onEvent?: DeliveryEngineDeps['onEvent'] } = {}) {
   const root = options.stateDir ?? mkdtempSync(join(tmpdir(), 'delivery-engine-'))
   const clock = createFakeClock(), events: DeliveryEngineEvent[] = [], errors: unknown[] = []
   const calls: { key: string; verb: string; at: number; params: unknown }[] = []
@@ -73,7 +73,7 @@ export async function makeEngineHarness(options: { keys?: string[]; constants?: 
       prepare: (key, item) => preparation.owns(key, item.accepted.seq) ? preparation.prepare(key, item) : Promise.resolve(),
       isRestartPendingOrActive: key => personas.get(key)?.state.restartPending ?? false, scheduleRestart: (key, cwd) => restarts.push({ key, cwd }),
       reconnect: async (key, _client, beforeCall) => { beforeCall(); calls.push({ key, verb: 'reconnect', at: clock.now(), params: {} }) },
-      onEvent: event => events.push(event), onError: (_key, error) => errors.push(error),
+      inspectUpgrade: options.inspectUpgrade, onEvent: event => { events.push(event); options.onEvent?.(event) }, onError: (_key, error) => errors.push(error),
       onKeyError: async (_key, error) => { errors.push(error) },
     })
   }

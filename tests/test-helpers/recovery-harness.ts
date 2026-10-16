@@ -32,8 +32,8 @@ import { IDLE_PANE } from './working-row-panes.ts'
  *   skips a retry, SRJ-401), with that cause query as `retryBlockCause` (the
  *   skip's again-reason and the restart retry's skip line), and the condition's
  *   retry hooks: the
- *   connection and stream probes (`isSessionConnected` and
- *   `hasSessionStream`, both over `setConnected`) and `endTmuxUnresponsive`,
+ *   connection and stream probes (`isSessionConnected`
+ *   over `setConnected`) and `endTmuxUnresponsive`,
  *   the condition's end with reason `TMUX_UNRESPONSIVE_END_RETRY` and the
  *   retry's reading followed by the clear of the persona's
  *   `tmux-unavailable` outage with that reading (b.jg5 SRJ-311, SRJ-312),
@@ -137,7 +137,7 @@ import { IDLE_PANE } from './working-row-panes.ts'
  *   configured persona up at first) and the live applied set (its lines go
  *   to `lines`). `setConnected(key, connected)` controls whether the
  *   persona's session is registered as connected with its message stream
- *   (`isSessionConnected` and `hasSessionStream`; none at first).
+ *   (`isSessionConnected`; none at first).
  * - Drivers, each as the server does it: `shutdown()` raises the
  *   shutting-down flag, closes the live-row sequence registry
  *   (`close()`, not awaited: every sequence's stop signal is set, so none
@@ -2235,7 +2235,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     isInFlight: isPersonaRetryBlocked,
     retryBlockCause: personaRetryBlockCause,
     isSessionConnected: (key) => connected.has(key),
-    hasSessionStream: (key) => connected.has(key),
+
     endTmuxUnresponsive: (key, reading) => {
       tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_RETRY, reading)
       clearOutageFlag(key, 'tmux-unavailable', reading)
@@ -2809,7 +2809,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     canRestart: canRelaunch,
     isSessionAlive: isSessionAliveAdapter,
     isSessionConnected: (key) => connected.has(key),
-    hasSessionStream: (key) => connected.has(key),
+
     // As main() builds it: with the latch's latched query (b.jg5 SRJ-502).
     reconnectSession: _buildReconnectSessionAdapter(appliedPersona, (key) => latch.isLatched(key), appliedPersona),
     killSession: _buildKillSessionAdapter(appliedPersona, killRetryClock),

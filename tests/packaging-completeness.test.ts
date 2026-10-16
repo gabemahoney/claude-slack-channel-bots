@@ -21,7 +21,7 @@
  *      excluded by the package.json `files` globs would ship a broken tarball
  *      without anyone noticing. A hermetic companion checks package.json's
  *      inclusion and exclusion patterns for every runtime source file, including
- *      E2's tag-wrapper, delivery-queue and delivery-intake modules. The npm
+ *      the tag-wrapper, delivery-queue, delivery-intake and delivery-notices modules. The npm
  *      probe gives the authoritative file list and skips only if npm is absent.
  *
  * b.av2 AC 27 guard (SR-12, SR-13.5): the shipped debugging skill
@@ -138,6 +138,7 @@ import {
   PERSONA_CHANNEL_DELIVERY_SET,
   PERSONA_DESTINATION_FAILED,
   PERSONA_DIAGNOSTIC_CLASSES,
+  DELIVERY_DIAGNOSTIC_CLASSES,
   PERSONA_INVITED_CHANNEL,
   UNCLAIMED_CHANNEL,
   channelDeliverySetCause,
@@ -546,19 +547,28 @@ describe('b.av2 SR-12: the credentials script ships in the package', () => {
 function skillHasClassHeading(label: string): boolean {
   const text = readFileSync(resolve(REPO_ROOT, SKILL_REL), 'utf-8')
   const re = new RegExp(
-    `^#{2,4} [^\\n]*(?<![\\w-])${escapeRegExp(label)}(?![\\w-])`,
-    'm',
+    `(?<![\\w-])${escapeRegExp(label)}(?![\\w-])`,
   )
-  return re.test(text)
+  return headings(text).some((heading) => heading.level >= 2 && heading.level <= 4 && re.test(heading.title))
 }
 
 describe('b.av2 AC 27: the debugging skill covers every persona diagnostic class', () => {
+  test('b.omv SR-8.6: delivery diagnostic labels belong to the audited persona catalogue', () => {
+    expect(DELIVERY_DIAGNOSTIC_CLASSES.length).toBeGreaterThan(0)
+    expect(new Set(DELIVERY_DIAGNOSTIC_CLASSES).size).toBe(DELIVERY_DIAGNOSTIC_CLASSES.length)
+    expect(PERSONA_DIAGNOSTIC_CLASSES).toEqual(expect.arrayContaining([...DELIVERY_DIAGNOSTIC_CLASSES]))
+  })
   // Labels come from the exported closed set, never a hand-copied list, so a
   // class added later without a skill entry fails here (b.av2 SR-12).
   test.each([...PERSONA_DIAGNOSTIC_CLASSES])(
     'AC 27: the skill has a heading for class %s',
     (label) => {
       expect(skillHasClassHeading(label)).toBe(true)
+      if ((DELIVERY_DIAGNOSTIC_CLASSES as readonly string[]).includes(label)) {
+        const entry = requiredSection(debugSkill(), classHeading(label), SKILL_REL)
+        expect(['Line', 'Meaning', 'Cause', 'Fix'].filter((part) => !new RegExp(`^- \\*\\*${part}:\\*\\*\\s+\\S`, 'm').test(entry))).toEqual([])
+        expect(entry).toContain(`[slack] ${label}:`)
+      }
     },
   )
 })

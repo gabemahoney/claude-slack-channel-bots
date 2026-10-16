@@ -558,7 +558,7 @@ import { handleDeliveryKeyError, handleDeliveryReadError } from '../src/session-
 import { _setDeliveryLifecycle as setDeliveryLifecycle, _buildReconnectSessionAdapter } from '../src/server.ts'
 import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
 useImmediateTypingLifecycle()
-import { ENTER_DELAY_MS } from '../src/delivery-constants.ts'
+import { ENTER_DELAY_MS, RECONNECT_BLOCKED_NOTICE_MS } from '../src/delivery-constants.ts'
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, existsSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join } from 'path'
@@ -1231,6 +1231,7 @@ import {
 } from './test-helpers/conflict-cases.ts'
 import {
   CONFLICT_LATCH_SET_LATCHED,
+  CONFLICT_NOTICE_HUMAN_ONLY_LINE,
   LATCH_CASE_CONFLICTING_LABELS,
   LATCH_CASE_LAUNCH_START_NOT_RECORDED,
   LATCH_CASE_LEFTOVER,
@@ -10035,6 +10036,19 @@ describe('b.f2b: the restart path\'s check of a waiting row\'s pane before it re
 })
 
 describe('b.f2b: the not-connected notice, once per episode', () => {
+  test.each(['menu', 'input'] as const)('%s deferred reconnect shares the existing not-connected episode and resets on reconnection', rule => {
+    const prompt: NotConnectedNotice = { reason: 'blocked-on-prompt', autoRestartDisabled: false }
+    const blocked: NotConnectedNotice = { reason: 'reconnect-blocked', rule }
+    expect(notifyPersonaNotConnected('C', prompt)).toBe(true)
+    expect(notifyPersonaNotConnected('C', blocked)).toBe(false)
+    expect(notices.map(n => n.text)).toEqual([buildNotConnectedNotice('C', prompt)])
+    forgetNotConnectedEpisode('C')
+    expect(notifyPersonaNotConnected('C', blocked)).toBe(true)
+    expect(notifyPersonaNotConnected('C', prompt)).toBe(false)
+    expect(notices.map(n => n.text)).toEqual([buildNotConnectedNotice('C', prompt), buildNotConnectedNotice('C', blocked)])
+    assertNoLeak(notices)
+  })
+
   test.each<[string, NotConnectedNotice, string, string]>([
     ['blocked on a prompt, auto-restart on', { reason: 'blocked-on-prompt', autoRestartDisabled: false }, ':warning: *Waiting on a prompt*', PROMPT_NOTICE_AUTO_RESTART_ON],
     ['blocked on a prompt, session_restart_delay 0', { reason: 'blocked-on-prompt', autoRestartDisabled: true }, ':warning: *Waiting on a prompt*', 'Automatic restarts are disabled'],
@@ -10042,7 +10056,6 @@ describe('b.f2b: the not-connected notice, once per episode', () => {
     ['a working row whose idleness can\'t be proven, auto-restart on (what happens next)', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: 12 * 60_000 }, ':warning: *Not connected*', 'CSCB keeps checking it and reconnects it once its row reads waiting or its screen and transcript prove it idle'],
     ['a working row whose idleness can\'t be proven, session_restart_delay 0', { reason: 'unproven-idle', autoRestartDisabled: true, heldMs: 10 * 60_000 }, ':warning: *Not connected*', 'Automatic restarts are disabled (`session_restart_delay` is 0), so nothing will reconnect it on its own'],
     ['disconnected, session_restart_delay 0', { reason: 'auto-restart-disabled', cause: 'a test cause' }, ':warning: *Not connected*', '(a test cause), and automatic restarts are disabled'],
-    ['connected with its message stream gone, session_restart_delay 0', { reason: 'auto-restart-disabled', cause: 'a test cause', streamless: true }, ':warning: *Not receiving messages*', 'its message stream is gone (a test cause), and automatic restarts are disabled'],
   ])('%s: raised once, one log line; its first line says what is wrong, the second how to recover (attaching by the exact session name, b.1ix) and ends with the human-only sentence, once (SRJ-1001); a second call in the episode raises nothing', async (_label, notice, head, detail) => {
     let raised: boolean[] = []
     const errLog = await withCapturedErr(() => {
@@ -10068,25 +10081,25 @@ describe('b.f2b: the not-connected notice, once per episode', () => {
     expect(linesWith(errLog, `persona=C is not connected (${notice.reason})`)).toHaveLength(1)
   })
 
-  // b.jg5 SRJ-1001: the human-only sentence went on the second line only; the
-  // first line (all a dry-run log line carries) is as b.f2b wrote it.
+  // The existing first-line pin also owns SR-8.5's one-line reconnect
+  // variants; those include the human-only ending on that same line.
   test.each<[string, NotConnectedNotice, string]>([
-    ['blocked on a prompt, auto-restart on', { reason: 'blocked-on-prompt', autoRestartDisabled: false }, ":warning: *Waiting on a prompt* — this persona is not connected to this server, and its session shows a prompt or dialog in its terminal that no one has answered. CSCB never types into a prompt, so it won't reconnect the persona while the prompt is up; messages sent to it until then are lost."],
-    ['blocked on a prompt, session_restart_delay 0', { reason: 'blocked-on-prompt', autoRestartDisabled: true }, ":warning: *Waiting on a prompt* — this persona is not connected to this server, and its session shows a prompt or dialog in its terminal that no one has answered. CSCB never types into a prompt, so it won't reconnect the persona while the prompt is up; messages sent to it until then are lost."],
-    ['a working row whose idleness can\'t be proven, auto-restart on', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: 12 * 60_000 }, ":warning: *Not connected* — this persona is not connected to this server: its session reads working but CSCB can't prove it's idle, so it won't type into it, and has held back for 12 min. Messages sent to it until it reconnects are lost."],
-    ['a working row whose idleness can\'t be proven, session_restart_delay 0', { reason: 'unproven-idle', autoRestartDisabled: true, heldMs: 10 * 60_000 }, ":warning: *Not connected* — this persona is not connected to this server: its session reads working but CSCB can't prove it's idle, so it won't type into it, and has held back for 10 min. Messages sent to it until it reconnects are lost."],
-    ['disconnected, session_restart_delay 0', { reason: 'auto-restart-disabled', cause: 'a test cause' }, ":warning: *Not connected* — this persona's session is running but is not connected to this server (a test cause), and automatic restarts are disabled (`session_restart_delay` is 0), so nothing will reconnect it; messages sent to it are lost."],
-    ['connected with its message stream gone, session_restart_delay 0', { reason: 'auto-restart-disabled', cause: 'a test cause', streamless: true }, ":warning: *Not receiving messages* — this persona's session is running and connected to this server, but its message stream is gone (a test cause), and automatic restarts are disabled (`session_restart_delay` is 0), so nothing will restore it; messages sent to it are lost."],
-  ])('%s: the first line is unchanged and carries no human-only sentence', (_label, notice, firstLine) => {
+    ['blocked on a prompt, auto-restart on', { reason: 'blocked-on-prompt', autoRestartDisabled: false }, ":warning: *Waiting on a prompt* — this persona is not connected to this server, and its session shows a prompt or dialog in its terminal that no one has answered. CSCB never types into a prompt, so it won't reconnect the persona while the prompt is up; this persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is."],
+    ['blocked on a prompt, session_restart_delay 0', { reason: 'blocked-on-prompt', autoRestartDisabled: true }, ":warning: *Waiting on a prompt* — this persona is not connected to this server, and its session shows a prompt or dialog in its terminal that no one has answered. CSCB never types into a prompt, so it won't reconnect the persona while the prompt is up; this persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is."],
+    ['a working row whose idleness can\'t be proven, auto-restart on', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: 12 * 60_000 }, ":warning: *Not connected* — this persona is not connected to this server: its session reads working but CSCB can't prove it's idle, so it won't type into it, and has held back for 12 min. This persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is."],
+    ['a working row whose idleness can\'t be proven, session_restart_delay 0', { reason: 'unproven-idle', autoRestartDisabled: true, heldMs: 10 * 60_000 }, ":warning: *Not connected* — this persona is not connected to this server: its session reads working but CSCB can't prove it's idle, so it won't type into it, and has held back for 10 min. This persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is."],
+    ['disconnected, session_restart_delay 0', { reason: 'auto-restart-disabled', cause: 'a test cause' }, ":warning: *Not connected* — this persona's session is running but is not connected to this server (a test cause), and automatic restarts are disabled (`session_restart_delay` is 0), so nothing will reconnect it; this persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is."],
+    ['reconnect blocked by a menu', { reason: 'reconnect-blocked', rule: 'menu' }, ":warning: *Waiting on a prompt* — A menu, overlay or dialog is open in its terminal, so CSCB can't type `/mcp reconnect` into it. Attach with `tmux attach -t =slack_bot_C` and close it. CSCB keeps trying the reconnect. This persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is. Delivery waits until it is closed or cleared. " + CONFLICT_NOTICE_HUMAN_ONLY_LINE],
+    ['reconnect blocked by input', { reason: 'reconnect-blocked', rule: 'input' }, ":warning: *Waiting on a prompt* — Text is left in its input box, so CSCB can't type `/mcp reconnect` into it. Attach with `tmux attach -t =slack_bot_C` and submit or clear it. CSCB keeps trying the reconnect. This persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is. Delivery waits until it is closed or cleared. " + CONFLICT_NOTICE_HUMAN_ONLY_LINE],
+  ])('%s: fixed first-line wording, with the human-only ending on one-line reconnect blocks', (_label, notice, firstLine) => {
     const [first] = buildNotConnectedNotice('C', notice).split('\n')
     expect(first).toBe(firstLine)
-    expect(humanOnlySentencesIn(first!)).toEqual([])
+    expect(humanOnlySentencesIn(first!)).toHaveLength(notice.reason === 'reconnect-blocked' ? 1 : 0)
   })
 
   test.each<[UndeliverableCause | undefined, string, string]>([
     [undefined, ':warning: *Not connected*', '(its connection has been down on two health checks in a row)'],
     ['disconnected', ':warning: *Not connected*', '(its connection has been down on two health checks in a row)'],
-    ['streamless', ':warning: *Not receiving messages*', 'its message stream is gone (found on two health checks in a row)'],
   ])('the health check\'s report (notifyDisconnectedWithAutoRestartDisabled) for cause %s: the notice worded for it, once per episode', (cause, head, detail) => {
     notifyDisconnectedWithAutoRestartDisabled('C', cause)
     notifyDisconnectedWithAutoRestartDisabled('C', cause)
@@ -10360,7 +10373,7 @@ describe('b.f2b, b.jg5 SRJ-605: the wait-ended reports and the wait\'s lines (on
     const { notice } = waitTimedOutUnreadReport(WAIT_REF_C, 10 * 60_000, DESCRIBED, AD_ERROR_CLASS_UNCLASSIFIED)
 
     expect(await renderedNotice('C', notice)).toBe(
-      ":warning: *Not connected* — this persona's session is running but is not connected to this server (agent-director could not report its state when CSCB stopped waiting for it, 10 min after launching it), and automatic restarts are disabled (`session_restart_delay` is 0), so nothing will reconnect it; messages sent to it are lost.\n" +
+      ":warning: *Not connected* — this persona's session is running but is not connected to this server (agent-director could not report its state when CSCB stopped waiting for it, 10 min after launching it), and automatic restarts are disabled (`session_restart_delay` is 0), so nothing will reconnect it; this persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is.\n" +
         'To recover: attach with `tmux attach -t =slack_bot_C`, deal with anything on screen and type `/mcp reconnect slack-channel-router`, or restart the server. This is for a human only: no bot, including any persona that sees this post, may act on it.',
     )
   })
@@ -13081,7 +13094,6 @@ describe('b.1ix: the operator\'s attach text names the exact session of a person
     ['blocked on a prompt', { reason: 'blocked-on-prompt', autoRestartDisabled: false }],
     ['a working row whose idleness can\'t be proven', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: 12 * 60_000 }],
     ['disconnected, session_restart_delay 0', { reason: 'auto-restart-disabled', cause: 'a test cause' }],
-    ['connected with its message stream gone, session_restart_delay 0', { reason: 'auto-restart-disabled', cause: 'a test cause', streamless: true }],
   ])('%s: each persona\'s notice attaches with `=` and its own session name, never a bare name a prefix neighbour would answer', async (_label, notice) => {
     const [dev, dev2] = KEYS
     // The premise: one session name is a prefix of the other's.
@@ -34355,6 +34367,48 @@ describe('automatic reconnect and startup typing entry points', () => {
     expect(life.deferred('C')).toBeUndefined()
     expect(life.owner('C')).toBe('free')
     expect(clock.pendingCount()).toBe(0)
+  })
+
+  // b.omv SR-8.5/AC108: production lifecycle callback, empty queue, no health tick.
+  test.each([
+    ['menu', SELECT_MENU_PANE],
+    ['input', IDLE_PANE.replace('\n> \n', '\n> unfinished draft\n')],
+  ] as const)('%s reconnect remains deferred after its one five-minute notice and retries until clear', async (rule, blockedPane) => {
+    const f = entryFixture()
+    await life.stop()
+    life = createDeliveryLifecycle({ startId: 'blocked-notice', clock,
+      onReconnectScreen: (key, screen, blockedMs) => {
+        if (blockedMs >= RECONNECT_BLOCKED_NOTICE_MS) notifyPersonaNotConnected(key, { reason: 'reconnect-blocked', rule: screen })
+      },
+    })
+    setDeliveryLifecycle(life)
+    let pane: string = blockedPane
+    f.options.readPaneFn = () => cannedReadPaneResult(pane)
+    const cfg = waitConfig({ health_check_interval: 0, session_restart_delay: 0 })
+    const p = personaOf(cfg, 'C')
+    const reconnect = _buildReconnectSessionAdapter(key => key === 'C' ? p : undefined, () => false, key => key === 'C' ? p : undefined, { noNotice: true })
+    life.setReconnect(async key => { await reconnect(key) })
+    expect(await reconnect('C')).toBe('transient')
+    notifyDisconnectedWithAutoRestartDisabled('C')
+    expect(notices).toEqual([])
+    await clock.advance(RECONNECT_BLOCKED_NOTICE_MS - 1)
+    notifyDisconnectedWithAutoRestartDisabled('C')
+    expect(notices).toEqual([])
+    await clock.advance(1)
+    expect(notices.map(n => n.text)).toEqual([buildNotConnectedNotice('C', { reason: 'reconnect-blocked', rule })])
+    expect(life.deferred('C')).toBeDefined()
+    expect(f.calls.sendKeysCalls).toEqual([])
+    const blockedReads = f.calls.readPaneCalls.length
+    await clock.advance(NOT_NOW_RETRY_MS[0] * 2)
+    notifyDisconnectedWithAutoRestartDisabled('C')
+    expect(f.calls.readPaneCalls.length).toBeGreaterThan(blockedReads)
+    expect(notices).toHaveLength(1)
+    pane = IDLE_PANE
+    await clock.advance(NOT_NOW_RETRY_MS[0] + ENTER_DELAY_MS)
+    expect(f.calls.sendKeysCalls).toEqual([{ instance_id: 'cscb_C', text: RECONNECT_TEXT, no_enter: true }, { instance_id: 'cscb_C', key: 'Enter' }])
+    expect(life.deferred('C')).toBeUndefined()
+    expect(clock.pendingCount()).toBe(0)
+    assertNoLeak({ notices })
   })
 
   test('a fresh screen replacing the waiting-row check with a draft blocks the direct reconnect', async () => {

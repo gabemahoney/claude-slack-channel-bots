@@ -62,7 +62,9 @@ export interface QueueItem {
   unknownSend: boolean; retypeCount: number; nextAttempt: number
 }
 export type QueueEvent =
-  | { type: 'store-failed' | 'append-failed' | 'recovery-failed' | 'compaction-failed'; key: string; seq?: number; error: unknown }
+  | { type: 'store-failed'; key: string; path?: string; source?: DeliverySource; sender?: string; user?: string; bot_id?: string; channel?: string; ts?: string; error: unknown }
+  | { type: 'stored' | 'writable'; key: string }
+  | { type: 'append-failed' | 'recovery-failed' | 'compaction-failed'; key: string; path?: string; seq?: number; error: unknown }
   | { type: 'record-unreadable'; key: string; line: number; quarantinePath: string; alert: boolean }
   | { type: 'retained'; key: string; count: number }
 export type QueueAcceptResult = { status: 'accepted' | 'duplicate'; item?: QueueItem; seq: number } | { status: 'failed'; error: unknown }
@@ -81,6 +83,7 @@ export interface DeliveryQueue {
   startMaintenance(): void
   stop(): Promise<void>
   retained(key: string): void
+  startupFindings(): QueueEvent[]
 }
 export interface DeliveryQueueOptions {
   stateDir: string
@@ -143,7 +146,8 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
   const startId = `${new Date(now()).toISOString().replace(/[:]/g, '-')}-${randomUUID()}`
   let started = false, stopped = false
   let timer: ReturnType<typeof globalThis.setInterval> | undefined
-  function event(e: QueueEvent): void { try { options.onEvent?.(e) } catch { /* observers cannot change durable outcomes */ } }
+  const findings: QueueEvent[] = []
+  function event(e: QueueEvent): void { if (e.type === 'record-unreadable') findings.push({ ...e }); try { void Promise.resolve(options.onEvent?.(e)).catch(() => {}) } catch { /* observers cannot change durable outcomes */ } }
   function pathFor(key: string): string {
     if (!PERSONA_KEY_RE.test(key)) throw new Error('Invalid queue persona key')
     return join(dir, `${key}.jsonl`)
@@ -278,7 +282,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
           const attempt = positive(raw.attempt) && !item.records.some(r => r.kind === 'sent' && r.attempt === raw.attempt) ? raw.attempt : item.nextAttempt
           update(j, { v: 1, kind: 'sent', seq, attempt, unknown_outcome: true, at: item.accepted.received_at, quarantine: { path: quarantinePath, line: l.line } })
         }
-        event({ type: 'record-unreadable', key, line: l.line, quarantinePath, alert: l.line !== lines.length && (raw?.kind === 'accepted' || !str(raw?.kind)) })
+        event({ type: 'record-unreadable', key, line: l.line, quarantinePath, alert: l.line !== lines.length && !(integer(seq) && accepted.has(seq)) && (raw?.kind === 'accepted' || !['fixed', 'sent', 'delivered', 'refused', 'noticed'].includes(String(raw?.kind))) })
       }
     }
     stored.records = j.records; stored.nextSeq = j.nextSeq; stored.lastInjected = j.lastInjected; stored.loaded = true
@@ -347,9 +351,10 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
           if (!isQueueRecord(record)) throw new Error('Invalid accepted record')
           durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j)
           update(j, record)
+          event({ type: 'stored', key })
           return { status: 'accepted' as const, seq: record.seq, item: structuredClone(materialize(j).find(i => i.accepted.seq === record.seq)!) }
         })
-      } catch (error) { event({ type: 'store-failed', key, error }); return { status: 'failed', error } }
+      } catch (error) { event({ type: 'store-failed', key, path: PERSONA_KEY_RE.test(key) ? pathFor(key) : undefined, source: input.source, sender: input.sender, user: input.user, bot_id: input.bot_id, channel: input.channel, ts: input.ts ?? input.key?.ts, error }); return { status: 'failed', error } }
     },
     async append(key, record) {
       try {
@@ -372,10 +377,9 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
           }
           if (record.kind === 'delivered' && (!item.fixed || record.part > item.fixed.parts.length)) throw new Error('Receipt has no fixed part')
           durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j); update(j, record)
-          appendBlocked.delete(key)
         })
-        appendBlocked.delete(key)
-      } catch (error) { appendBlocked.add(key); event({ type: 'append-failed', key, seq: record.seq, error }); throw error }
+        if (appendBlocked.delete(key)) event({ type: 'writable', key })
+      } catch (error) { appendBlocked.add(key); event({ type: 'append-failed', key, path: pathFor(key), seq: record.seq, error }); throw error }
     },
     lookupSlackKey,
     items: key => materialize(journal(key)).map(item => structuredClone(item)),
@@ -394,6 +398,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
       timer = undefined
       await Promise.allSettled([...writers.values()])
     },
+    startupFindings: () => findings.map(e => ({ ...e })),
     retained(key) { event({ type: 'retained', key, count: api.openCount(key) }) },
   }
   return api

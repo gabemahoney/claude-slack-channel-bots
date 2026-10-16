@@ -434,7 +434,6 @@ const KILL_SUCCEEDED: KillSuccessOutcome = { kind: KILL_OUTCOME_KILLED, killSent
 type DepsOpts = {
   isSessionAliveResult?: LivenessReading  // default: LIVENESS_READING_DEAD (session is dead)
   isSessionConnectedResult?: boolean  // default: false (not yet reconnected)
-  hasSessionStreamResult?: boolean  // default: true (stream present — prior semantics)
   launchSessionResult?: LaunchSessionResult  // default: true (launch succeeds); 'skipped': the relaunch gate declined
   launchSession?: (key: string, cwd: string, sessionId?: string, deadEvidence?: CarriedDeadEvidence) => Promise<LaunchSessionResult>  // override entire launchSession
   killSession?: (key: string, lastRead: DeadLivenessReading) => Promise<KillSessionResult>  // runs after the capture (e.g. the real kill adapter), given the run's dead reading; its answer is the kill's (default: KILL_SUCCEEDED)
@@ -500,9 +499,6 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
     },
     isSessionConnected(_key) {
       return opts.isSessionConnectedResult ?? false
-    },
-    hasSessionStream(_key) {
-      return opts.hasSessionStreamResult ?? true
     },
     async reconnectSession(key) {
       reconnectSessionCalls.push(key)
@@ -759,45 +755,15 @@ describe('scheduleRestart', () => {
     expect(isRestartPendingOrActive('test_bot_1')).toBe(false)
   })
 
-  // b.9cj: the "already reconnected" early return is only taken when the session
-  // is connected AND its standalone GET stream is present. A connected-but-
-  // streamless session (the exact state scheduleRestart is invoked for) must NOT
-  // be waved through — it proceeds to recovery.
-  test('b.9cj: alive + connected + stream present — skips reconnect (already-healed guard holds)', async () => {
-    const deps = makeDeps({
-      isSessionAliveResult: LIVENESS_READING_LIVE,
-      isSessionConnectedResult: true,
-      hasSessionStreamResult: true,
-    })
+  // b.omv SR-9: connection alone makes a live session deliverable.
+  test('live and connected skips reconnect without a stream dependency', async () => {
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: true })
     initRestart(deps)
-
     scheduleRestart('test_bot_1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
-
-    // Genuinely healed: the guard returns before any recovery action.
-    expect(deps.reconnectSessionCalls).toHaveLength(0)
-    expect(deps.launchSessionCalls).toHaveLength(0)
-    expect(deps.killSessionCalls).toHaveLength(0)
-  })
-
-  test('b.9cj REGRESSION: alive + connected but STREAMLESS — recovery proceeds (no already-reconnected short-circuit)', async () => {
-    // Pre-fix, restart.ts skipped whenever isSessionConnected was true, so this
-    // connected-but-streamless session took the "already reconnected" early
-    // return and never recovered. Post-fix the guard also requires the stream,
-    // so recovery proceeds: alive → reconnectSession is called.
-    const deps = makeDeps({
-      isSessionAliveResult: LIVENESS_READING_LIVE,
-      isSessionConnectedResult: true,
-      hasSessionStreamResult: false,
-    })
-    initRestart(deps)
-
-    scheduleRestart('test_bot_1', '/cwd/test')
-    await Bun.sleep(WAIT_MS)
-
-    // The alive branch ran reconnectSession — the guard did NOT short-circuit.
-    expect(deps.reconnectSessionCalls).toEqual(['test_bot_1'])
-    expect(deps.launchSessionCalls).toHaveLength(0)
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(deps.killSessionCalls).toEqual([])
   })
 
   // b.jg5 SRJ-110, SRJ-314: a `dead` reading of a row gets no kill (every
@@ -1141,7 +1107,6 @@ describe('isRestartPendingOrActive', () => {
       canRestart: () => true,
       isSessionAlive: (_key) => alivePromise,  // never resolves until we say so
       isSessionConnected: () => false,
-      hasSessionStream: () => true,
       reconnectSession: async () => {},
       killSession: async () => KILL_SUCCEEDED,
       launchSession: async () => true,
@@ -2379,7 +2344,6 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
       canRestart: gate,
       isSessionAlive: _buildIsSessionAliveAdapter(() => config),
       isSessionConnected: () => false,
-      hasSessionStream: () => false,
       reconnectSession: _buildReconnectSessionAdapter(),
       killSession: _buildKillSessionAdapter(),
       launchSession: (key) => launchPersonaSession(key, config, { canLaunch: gate }),
@@ -2770,7 +2734,6 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
       canRestart: () => true,
       async isSessionAlive() { return alive },
       isSessionConnected() { return false },
-      hasSessionStream() { return true },
       reconnectSession,
       async killSession(key) { killSessionCalls.push(key); return KILL_SUCCEEDED },
       async launchSession(key) { launchSessionCalls.push(key); return true },
@@ -2951,7 +2914,6 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
       canRestart: () => true,
       isSessionAlive: _buildIsSessionAliveAdapter(() => config),
       isSessionConnected: () => connectedOnRun(run),
-      hasSessionStream: () => connectedOnRun(run),
       reconnectSession: _buildReconnectSessionAdapter(),
       async killSession(key) { kills.push(key); return KILL_SUCCEEDED },
       async launchSession(key) { launches.push(key); return true },
@@ -3136,7 +3098,6 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
       canRestart: () => true,
       isSessionAlive: _buildIsSessionAliveAdapter(() => config),
       isSessionConnected: () => false,
-      hasSessionStream: () => false,
       reconnectSession: _buildReconnectSessionAdapter(),
       async killSession(key) { kills.push(key); return KILL_SUCCEEDED },
       async launchSession(key, _cwd, _sessionId, deadEvidence) { launches.push(key); carriedIn.push(deadEvidence); return launchResult },
@@ -3431,7 +3392,6 @@ describe('b.dup: a persona whose row is ended just before its reconnect lands is
       canRestart: () => true,
       isSessionAlive: _buildIsSessionAliveAdapter(() => config),
       isSessionConnected: () => false,
-      hasSessionStream: () => false,
       reconnectSession: _buildReconnectSessionAdapter(),
       async killSession(key) { killSessionCalls.push(key); return KILL_SUCCEEDED },
       async launchSession(key, _cwd, _sessionId, deadEvidence) { launchSessionCalls.push(key); carriedIn.push(deadEvidence); return true },
@@ -5117,7 +5077,6 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
       canRestart: gate,
       isSessionAlive: _buildIsSessionAliveAdapter(() => h.config),
       isSessionConnected: () => false,
-      hasSessionStream: () => false,
       reconnectSession: _buildReconnectSessionAdapter(),
       killSession: _buildKillSessionAdapter((key) => h.getPersona(key)),
       launchSession: (key) => launchPersonaSession(key, h.config!, { canLaunch: gate }),
@@ -5916,7 +5875,7 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
 
   test('the row reads live and P is connected with its stream → already-connected: no reconnect, kill or launch, nothing counted', async () => {
     recordFailure(P)
-    const deps = retryDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: true, hasSessionStreamResult: true })
+    const deps = retryDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: true })
     initRestart(deps)
 
     expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_ALREADY_CONNECTED)
@@ -6501,8 +6460,7 @@ describe('b.jg5 SRJ-314: an unknown or thrown liveness probe kills and launches 
 // session has not started) hands the row to the `pending` deferral
 // (`RestartDeps.deferPendingRow`) once, with its reading (the launch start
 // carried), whatever the session's connection shows: connected with its
-// stream (never "already reconnected"), connected but streamless, or
-// disconnected. Nothing is reconnected, killed or launched, no success or
+// connection (never "already reconnected"), or disconnected. Nothing is reconnected, killed or launched, no success or
 // failure is recorded, nothing is armed, and the work answers
 // `RESTART_OUTCOME_PENDING_DEFERRED`. The connection is never read. A
 // deferral that throws is logged by its redacted description and changes
@@ -6535,11 +6493,10 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
     cancelAllRestartTimers()
   })
 
-  /** P's connection as the registry shows it: [label, connected, stream present]. */
-  const CONNECTIONS: ReadonlyArray<readonly [string, boolean, boolean]> = [
-    ['connected with its stream', true, true],
-    ['connected but streamless', true, false],
-    ['disconnected', false, true],
+  /** P's connection as the registry shows it: [label, connected present]. */
+  const CONNECTIONS: ReadonlyArray<readonly [string, boolean]> = [
+    ['connected', true],
+    ['disconnected', false],
   ]
   const LAUNCH_STARTS: ReadonlyArray<readonly [string, string | undefined]> = [
     ['with a launch start', SAMPLE_LAUNCH_START_FRACTIONAL],
@@ -6552,7 +6509,7 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
    * `reading`, P's connection as given (each read recorded) and launches
    * failing, so a launch would be counted.
    */
-  function pendingDeps(reading: LivenessReading, connected: boolean, stream: boolean, restartDelay = 0): {
+  function pendingDeps(reading: LivenessReading, connected: boolean, restartDelay = 0): {
     deps: ReturnType<typeof makeDeps>
     deferred: Array<[string, PendingLivenessReading]>
     connectionReads: string[]
@@ -6561,7 +6518,6 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
     const deferred: Array<[string, PendingLivenessReading]> = []
     const connectionReads: string[] = []
     deps.isSessionConnected = (key) => { connectionReads.push(`connected:${key}`); return connected }
-    deps.hasSessionStream = (key) => { connectionReads.push(`stream:${key}`); return stream }
     deps.deferPendingRow = (key, r) => { deferred.push([key, r]) }
     return { deps, deferred, connectionReads }
   }
@@ -6583,13 +6539,13 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
     errLines.filter((l) => !l.startsWith('[slack] Scheduling restart') && !l.startsWith(DEFER_FAILED))
 
   const DEFER_CASES = ENTRIES.flatMap((entry) =>
-    CONNECTIONS.flatMap(([conn, connected, stream]) =>
-      LAUNCH_STARTS.map(([startLabel, start]) => [entry, conn, startLabel, connected, stream, start] as const)))
+    CONNECTIONS.flatMap(([conn, connected]) =>
+      LAUNCH_STARTS.map(([startLabel, start]) => [entry, conn, startLabel, connected, start] as const)))
 
-  test.each(DEFER_CASES)('through %s, a pending first probe, P %s, %s → the deferral once with the key and the reading; no reconnect, kill or launch; nothing counted or armed; the connection never read; pending-deferred', async (entry, _conn, _startLabel, connected, stream, start) => {
+  test.each(DEFER_CASES)('through %s, a pending first probe, P %s, %s → the deferral once with the key and the reading; no reconnect, kill or launch; nothing counted or armed; the connection never read; pending-deferred', async (entry, _conn, _startLabel, connected, start) => {
     recordFailure(P)
     const reading = pendingLivenessReading(start)
-    const { deps, deferred, connectionReads } = pendingDeps(reading, connected, stream, entry === 'the retry entry' ? 0 : FAST_DELAY_S)
+    const { deps, deferred, connectionReads } = pendingDeps(reading, connected, entry === 'the retry entry' ? 0 : FAST_DELAY_S)
     initRestart(deps)
 
     if (entry === 'the retry entry') {
@@ -6619,7 +6575,7 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
   ])('the probe\'s pending reading carries %s', async (_label, raw, handedStart) => {
     recordFailure(P)
     const reading = { kind: LIVENESS_PENDING, launchStartedAt: raw } as unknown as LivenessReading
-    const { deps, deferred } = pendingDeps(reading, true, true)
+    const { deps, deferred } = pendingDeps(reading, true)
     initRestart(deps)
 
     expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
@@ -6630,10 +6586,10 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
     expectNothingDone(deps)
   })
 
-  test.each(CONNECTIONS)('a deferral that throws, P %s → one redacted line; still no reconnect, kill or launch, nothing counted or armed; pending-deferred', async (_conn, connected, stream) => {
+  test.each(CONNECTIONS)('a deferral that throws, P %s → one redacted line; still no reconnect, kill or launch, nothing counted or armed; pending-deferred', async (_conn, connected) => {
     recordFailure(P)
     const thrown = Object.assign(new Error(`defer refused (${sentinelInMessage('defer')})`), { note: LEAK_SENTINEL })
-    const { deps, deferred, connectionReads } = pendingDeps(pendingLivenessReading(SAMPLE_LAUNCH_START_FRACTIONAL), connected, stream)
+    const { deps, deferred, connectionReads } = pendingDeps(pendingLivenessReading(SAMPLE_LAUNCH_START_FRACTIONAL), connected)
     deps.deferPendingRow = (key, r) => {
       deferred.push([key, r])
       throw thrown
@@ -6652,9 +6608,9 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
     assertNoLeak({ errArgs })
   })
 
-  test.each(CONNECTIONS)('no deferral member, P %s → nothing called or logged; still no reconnect, kill or launch, nothing counted or armed; pending-deferred', async (_conn, connected, stream) => {
+  test.each(CONNECTIONS)('no deferral member, P %s → nothing called or logged; still no reconnect, kill or launch, nothing counted or armed; pending-deferred', async (_conn, connected) => {
     recordFailure(P)
-    const { deps, connectionReads } = pendingDeps(pendingLivenessReading(SAMPLE_LAUNCH_START_FRACTIONAL), connected, stream)
+    const { deps, connectionReads } = pendingDeps(pendingLivenessReading(SAMPLE_LAUNCH_START_FRACTIONAL), connected)
     delete deps.deferPendingRow
     initRestart(deps)
 
@@ -6675,8 +6631,8 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
 
   /** `pendingDeps` whose probe at `point` reads `reading`: at the re-probe, the first probe reads `live` and the reconnect answers escalate-dead with dead evidence. */
   function pendingAt(point: ProbePoint, reading: LivenessReading): ReturnType<typeof pendingDeps> {
-    if (point === 'the first probe') return pendingDeps(reading, false, true)
-    const built = pendingDeps(LIVENESS_READING_LIVE, false, true)
+    if (point === 'the first probe') return pendingDeps(reading, false)
+    const built = pendingDeps(LIVENESS_READING_LIVE, false)
     const { deps } = built
     deps.isSessionAlive = async (key) => {
       deps.isSessionAliveCalls.push(key)
@@ -6770,14 +6726,13 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
   // `live` and `dead` never reach the deferral: a connected `live` row with
   // its stream is still already-connected, another `live` row is reconnected,
   // and a `dead` one is launched and counted, as before (with no kill, b.jg5 SRJ-314).
-  test.each<[string, LivenessReading, boolean, boolean, RestartRetryOutcome]>([
-    ['live, connected with its stream → already-connected, no reconnect', LIVENESS_READING_LIVE, true, true, RESTART_OUTCOME_ALREADY_CONNECTED],
-    ['live, connected but streamless → reconnected', LIVENESS_READING_LIVE, true, false, RESTART_OUTCOME_RECONNECTED],
-    ['live, disconnected → reconnected', LIVENESS_READING_LIVE, false, true, RESTART_OUTCOME_RECONNECTED],
-    ['dead → a launch (no kill for a dead reading that is no install-gone one), the failed launch counted', LIVENESS_READING_DEAD, false, true, RESTART_OUTCOME_COUNTED_FAILURE],
-  ])('%s; the deferral is never called', async (_label, reading, connected, stream, outcome) => {
+  test.each<[string, LivenessReading, boolean, RestartRetryOutcome]>([
+    ['live, connected with its stream → already-connected, no reconnect', LIVENESS_READING_LIVE, true, RESTART_OUTCOME_ALREADY_CONNECTED],
+    ['live, disconnected → reconnected', LIVENESS_READING_LIVE, false, RESTART_OUTCOME_RECONNECTED],
+    ['dead → a launch (no kill for a dead reading that is no install-gone one), the failed launch counted', LIVENESS_READING_DEAD, false, RESTART_OUTCOME_COUNTED_FAILURE],
+  ])('%s; the deferral is never called', async (_label, reading, connected, outcome) => {
     recordFailure(P)
-    const { deps, deferred } = pendingDeps(reading, connected, stream)
+    const { deps, deferred } = pendingDeps(reading, connected)
     deps.reconnectSession = async (key) => { deps.reconnectSessionCalls.push(key); return 'success' }
     initRestart(deps)
 
@@ -6817,10 +6772,10 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
       rmSync(dir, { recursive: true, force: true })
     })
 
-    const REAL_CASES = CONNECTIONS.flatMap(([conn, connected, stream]) =>
-      LAUNCH_STARTS.map(([startLabel, start]) => [conn, startLabel, connected, stream, start] as const))
+    const REAL_CASES = CONNECTIONS.flatMap(([conn, connected]) =>
+      LAUNCH_STARTS.map(([startLabel, start]) => [conn, startLabel, connected, start] as const))
 
-    test.each(REAL_CASES)('status answers pending, P %s, %s, its key one no configured persona uses → one status read and no other agent-director call; no kill or launch; nothing counted; one deferral line; pending-deferred', async (_conn, _startLabel, connected, stream, start) => {
+    test.each(REAL_CASES)('status answers pending, P %s, %s, its key one no configured persona uses → one status read and no other agent-director call; no kill or launch; nothing counted; one deferral line; pending-deferred', async (_conn, _startLabel, connected, start) => {
       const config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
       const KEY = config.personas[0]!.key
       const log = makeStubCallLog()
@@ -6838,7 +6793,6 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
         canRestart: () => true,
         isSessionAlive: _buildIsSessionAliveAdapter(() => config),
         isSessionConnected: () => connected,
-        hasSessionStream: () => stream,
         reconnectSession: _buildReconnectSessionAdapter(),
         async killSession(key) { killSessionCalls.push(key); return KILL_SUCCEEDED },
         async launchSession(key) { launchSessionCalls.push(key); return false },
@@ -10344,7 +10298,6 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
       isShuttingDown: () => false,
       isSessionAlive: _buildIsSessionAliveAdapter(() => loop.h.config),
       isSessionConnected: () => false,
-      hasSessionStream: () => false,
       isRestartPendingOrActive,
       isLaunchInFlight,
       isAtCap: (k) => isAtCap(k, RESTART_FAILURE_CAP),

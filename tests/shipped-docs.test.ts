@@ -310,6 +310,14 @@ import { CLEAR_LATCH_TERMS, clearLatchTermsIn } from './test-helpers/clear-latch
 import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 import { DELETE_HELPERS, REMOVED_IDENTIFIERS, SOURCE_WORD_RULES, type SourceWordRule } from './test-helpers/source-audit.ts'
 import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
+import {
+  buildMessageNotSavedNotice, buildDeliveryStuckNotice, deliveryStuckRemedy, deliveryAge,
+  buildMessageNotTakenInNotice, buildMessagesWaitingNotice,
+  buildQueueRecordUnreadableNotice, MESSAGES_WAITING_STATES,
+  type DeliveryStuckReason,
+} from '../src/delivery-notices.ts'
+import { DELIVERY_STUCK_AFTER_MS, RECONNECT_BLOCKED_NOTICE_MS } from '../src/delivery-constants.ts'
+import { buildNotConnectedNotice } from '../src/session-manager.ts'
 import type { Via } from '../src/delivery-decision.ts'
 import * as registryExports from '../src/registry.ts'
 import {
@@ -1584,6 +1592,11 @@ interface TermGroup {
  */
 const FORBIDDEN_TERMS: readonly TermGroup[] = [
   {
+    name: 'the retired stream notice',
+    cites: 'b.omv SR-8.5, SR-9',
+    terms: [['Not receiving messages', /\bnot\s+receiving\s+messages\b/gi]],
+  },
+  {
     name: 'the pre-persona shape',
     cites: 'b.av2 SR-1.7, SR-10.2',
     terms: [
@@ -1894,6 +1907,7 @@ describe(`AC 46: forbidden-term audit (README, skills, manifest, MCP instruction
 describe('AC 46: forbidden-term scanner self-checks', () => {
   /** One sample per term, so a term added to the list needs a sample here. */
   const SAMPLES: Record<string, string> = {
+    'Not receiving messages': 'A persona posts a *Not receiving messages* notice.',
     routes: 'Set `routes` to a map of channels.',
     default_route: 'Set `default_route` to a channel.',
     default_dm_session: 'Set `default_dm_session`.',
@@ -1971,6 +1985,9 @@ describe('AC 46: forbidden-term scanner self-checks', () => {
     ['pasted agent-director `cwd` output', '{\n  "instance_id": "cscb_alpha",\n  "cwd": "/home/me/work",\n  "label": { "service": "cscb" }\n}'],
     ['the redaction wording, not the name rule', 'A config error never echoes a value that looks like a Slack token.'],
     ['the curl config header line, unindented', 'header = "Authorization: Bearer %s"'],
+    ['b.omv SR-8.1 unsaved-message loss', buildMessageNotSavedNotice('Alpha', 'U0SENDER1')],
+    ['b.omv SR-8.8 unreadable-record non-delivery', buildQueueRecordUnreadableNotice('Alpha', 2, '/state/queue/quarantined.jsonl')],
+    ['conversation history loss', 'The transcript is missing; conversation history was lost.'],
   ])('%s is not flagged', (_label, text) => {
     expect(findTerms('sample', text, ALL_FORBIDDEN_TERMS).map(formatHit)).toEqual([])
   })
@@ -8401,6 +8418,54 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
   })
 })
 
+
+/** E5 only: the shipped failure catalogue, separate from E8's broad doc migration. */
+describe('b.omv SR-8: shipped delivery and MCP guidance', () => {
+  const skill = () => operatorText(DEBUG_SKILL_FILE)
+  const delivery = () => requiredSection(skill(), '## Delivery notices', DEBUG_SKILL_FILE)
+  const mcp = () => flat(requiredSection(skill(), "## A persona's instance runs but isn't connected", DEBUG_SKILL_FILE))
+  // Check each fixed fragment independently: persona, sender, counts, age and
+  // quarantine path are examples, not a contract on the documentation's sample.
+  const noticeRows = [
+    ['Message not saved', () => buildMessageNotSavedNotice('PLACEHOLDER_PERSONA', 'PLACEHOLDER_SENDER')],
+    ['Delivery stuck', () => buildDeliveryStuckNotice('PLACEHOLDER_PERSONA', 'PLACEHOLDER_KEY', 2, DELIVERY_STUCK_AFTER_MS, 'menu', 3)],
+    ['Message not taken in', () => buildMessageNotTakenInNotice('PLACEHOLDER_PERSONA', 'PLACEHOLDER_SENDER')],
+    ['Messages waiting', () => buildMessagesWaitingNotice('PLACEHOLDER_PERSONA', 2, DELIVERY_STUCK_AFTER_MS, 'down')],
+    ['Queue record unreadable', () => buildQueueRecordUnreadableNotice('PLACEHOLDER_PERSONA', 2, 'PLACEHOLDER_PATH')],
+  ] as const
+  test.each(noticeRows)('%s has its fixed notice guidance and an actionable explanation in the debugging skill', (title, render) => {
+    const section = requiredSection(delivery(), `### ${title}`, DEBUG_SKILL_FILE)
+    const text = render()
+    assertNoLeak(text)
+    const fragments = text.replace(/\b2 (?=(?:queued )?message\(s\))/g, 'PLACEHOLDER_COUNT').replace(deliveryAge(DELIVERY_STUCK_AFTER_MS), 'PLACEHOLDER_AGE').split(/PLACEHOLDER_[A-Z]+/).map(flat).filter(Boolean)
+    for (const fragment of fragments) expect(flat(section)).toContain(fragment)
+    expect(['Meaning', 'Cause', 'Fix'].filter(part => !new RegExp(`^- \\*\\*${part}:\\*\\*\\s+\\S`, 'm').test(section))).toEqual([])
+  })
+  test.each(['menu', 'input', 'relay-off', 'mcp', 'refused', 'transcript', 'queue-unwritable', 'not-taken-in', 'dialog-hold'] as const)(
+    'Delivery stuck documents the fixed %s remedy', (reason: DeliveryStuckReason) => {
+      const section = requiredSection(delivery(), '### Delivery stuck', DEBUG_SKILL_FILE)
+      const remedy = deliveryStuckRemedy(reason, '<key>', 3).replace(/(?<=typed it )3(?= times)/, 'PLACEHOLDER_COUNT')
+      for (const fragment of remedy.split('PLACEHOLDER_COUNT').map(flat).filter(Boolean)) expect(flat(section)).toContain(fragment)
+    },
+  )
+  test.each([...MESSAGES_WAITING_STATES])('Messages waiting includes the state %s', state => {
+    expect(requiredSection(delivery(), '### Messages waiting', DEBUG_SKILL_FILE)).toContain(state)
+  })
+  test.each(['menu', 'input'] as const)('MCP guidance documents the fixed %s reconnect block and continued retries', rule => {
+    const text = buildNotConnectedNotice('<key>', { reason: 'reconnect-blocked', rule })
+    const screen = text.split(' — ')[1]!.split(' CSCB keeps trying the reconnect.')[0]!
+    expect(mcp()).toContain(flat(screen))
+    expect(mcp()).toContain('CSCB keeps trying the reconnect')
+    expect(mcp()).toContain(`${RECONNECT_BLOCKED_NOTICE_MS / 60000} minutes`)
+    expect(mcp()).toContain('reconnect-blocked')
+    expect(mcp()).toContain('Messages sent to it are kept and delivered once it is')
+    expect(mcp()).toContain("can't reply or use its Slack tools until it is connected again")
+  })
+  test('MCP guidance keeps accepted messages while disconnected and omits stream recovery', () => {
+    expect(mcp()).not.toMatch(/messages?[^.]*\b(?:are|is|will be)\s+lost\b/i)
+    expect(mcp()).not.toMatch(/\b(?:message\s+stream|stream\s+gone|streamless)\b/i)
+  })
+})
 
 // b.m2o: maintained release instructions and historical release notes have
 // different contracts. These checks protect the released installer path.

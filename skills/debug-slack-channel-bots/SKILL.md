@@ -156,7 +156,7 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    **No class line, but the persona still isn't served?** See
    [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running)
    and [Other lines you may see](#other-lines-you-may-see). A *Waiting on a
-   prompt*, *Not connected* or *Not receiving messages* notice at its
+   prompt*, *Not connected* notice at its
    destination, or a row that reads `working` while the instance sits idle,
    is covered under
    [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected).
@@ -433,6 +433,81 @@ running server brings it up exactly as a start does, so every class below is
 logged for it the same way, with the same fix. Personas that were already
 running are not affected. See
 [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change).
+
+Delivery diagnostics carry metadata only: the persona, source, conversation or sender,
+timestamp, sender ID and the diagnostic's counts, paths or reason. They never carry
+message text. RAW event, injected-message and first actual Slack dispatch lines
+retain their existing text excerpts; receipt confirmation has its own line.
+
+### `message-not-saved`
+
+- **Line:** `[slack] message-not-saved: persona="<name>" (key=<key>) source=slack chat_id="<chat>" ts="<ts>" sender_id="<sender>" count=<n> path="<path>" code=<errno>`
+- **Meaning:** The incoming message could not be durably stored; it has not been accepted. Every failure is counted, including Slack retries.
+- **Cause:** The queue directory or disk cannot be written.
+- **Fix:** Check free space, mount availability and permissions on the named path. For Slack, follow **Message not saved** below; retry a failed injected message once storage works.
+
+### `message-received`
+
+- **Line:** `[slack] message-received: persona="<name>" (key=<key>) source=<source> chat_id="<chat>" ts="<ts>" sender_id="<sender>"`
+- **Meaning:** The item was stored and acknowledged to its source. It remains queued until its transcript confirms delivery.
+- **Cause:** An incoming Slack message, injected message or scheduled fire was accepted. Injected sources show sender instead of chat_id.
+- **Fix:** No action is needed. Find the corresponding message-delivered line to confirm take-in.
+
+### `message-delivered`
+
+- **Line:** `[slack] message-delivered: persona="<name>" (key=<key>) source=<source> chat_id="<chat>" ts="<ts>" sender_id="<sender>" at=<time> wait_ms=<ms>`
+- **Meaning:** All parts have transcript receipts and the final delivery record is durable. The next item can proceed.
+- **Cause:** The bot took in the typed message; a successful typing call alone does not produce this line.
+- **Fix:** No action is needed. A configured acknowledgement reaction is added through this persona only, unless it already replied.
+
+### `message-retyped`
+
+- **Line:** `[slack] message-retyped: persona="<name>" (key=<key>) source=<source> chat_id="<chat>" ts="<ts>" sender_id="<sender>" retype_count=<n>`
+- **Meaning:** CSCB offered the queued message again; it may reach the bot more than once.
+- **Cause:** The transcript has not confirmed the earlier copy.
+- **Fix:** Check **Message not taken in** and **Delivery stuck** below if it persists. Retries continue indefinitely; later messages wait behind it.
+
+### `message-not-taken-in`
+
+- **Line:** `[slack] message-not-taken-in: persona="<name>" (key=<key>) source=<source> chat_id="<chat>" ts="<ts>" sender_id="<sender>"`
+- **Meaning:** The first unconfirmed retype triggered one notice for this item.
+- **Cause:** The bot has not recorded the message in its transcript.
+- **Fix:** Follow **Message not taken in** below. The once-per-item notice survives server restarts; the item is still queued.
+
+### `delivery-stuck`
+
+- **Line:** `[slack] delivery-stuck: persona="<name>" (key=<key>) source=<source> chat_id="<chat>" ts="<ts>" sender_id="<sender>" reason=<reason> age_ms=<ms>`
+- **Meaning:** The oldest item has waited over five minutes in a reportable blocked state.
+- **Cause:** The reason identifies the current obstacle to typing or confirming the head item.
+- **Fix:** Follow the matching reason under **Delivery stuck** below. Nothing behind it skips ahead.
+
+### `queue-record-unreadable`
+
+- **Line:** `[slack] queue-record-unreadable: persona="<name>" (key=<key>) line=<n> path="<quarantine path>"`
+- **Meaning:** A journal record could not be read at startup; its bytes were preserved in quarantine.
+- **Cause:** The queue file contains a damaged or invalid record.
+- **Fix:** Keep the quarantine file and follow **Queue record unreadable** below. Readable accepted items keep their order and continue.
+
+### `queue-unwritable`
+
+- **Line:** `[slack] queue-unwritable: persona="<name>" (key=<key>) path="<path>" code=<errno>`
+- **Meaning:** An append failed after acceptance. CSCB retains the item and types nothing further for this persona until the write succeeds.
+- **Cause:** The queue file cannot be written or synced; one line reports each unwritable episode.
+- **Fix:** Check the server disk and the named path permissions or mount. Restore writing; the queued work resumes without resending it.
+
+### `queue-kept`
+
+- **Line:** `[slack] queue-kept: persona="<name>" (key=<key>) count=<n>`
+- **Meaning:** A removed or renamed persona still owns queued items under its old key.
+- **Cause:** A configuration change removed that key while work was open.
+- **Fix:** Restore the same persona key to deliver its retained queue. A different key does not inherit the items.
+
+### `system-prompt-unwritable`
+
+- **Line:** `[slack] system-prompt-unwritable: persona="<name>" (key=<key>) path="<path>" code=<errno>`
+- **Meaning:** CSCB cannot write the shared bot system prompt, so this persona is not launched.
+- **Cause:** The state directory or its disk cannot be written.
+- **Fix:** Check the named file, state directory permissions, mount and free space. Launch retries follow the existing backoff; other personas continue.
 
 ### `persona-start`
 
@@ -882,7 +957,7 @@ running are not affected. See
     that channel that takes the persona's fungible path (a `message` event
     in a public or private channel that isn't externally shared), whether
     the message is delivered or not, and in addition to any drop line for
-    that event. A message that doesn't mention the persona, or one lost
+    that event. A message that doesn't mention the persona, or one queued
     because the persona has no live session, logs it too;
   - is logged by each persona for each channel: two personas in one channel
     log a line each, and one persona logs a line per channel;
@@ -1479,6 +1554,89 @@ down, report it as a bug, with the persona's lines.
 
 ---
 
+## Delivery notices
+
+These notices go only to the persona's destination under its Slack identity, never
+to the conversation that sent the message merely because it was the source. They
+carry no message text. Accepted items never expire: every source shares the
+persona's strict FIFO queue, with one item in flight until its transcript confirms
+all parts. A blocked head holds every later item. Delivery can repeat a message
+when confirmation is missing.
+
+### Message not saved
+
+```text
+:warning: *Message not saved* — a message from U0SENDER1 for Alpha could not be saved. Slack will send it again a few times; it is delivered if one copy is saved, otherwise it is lost and should be sent again. Further messages to this persona may fail the same way until storing works; server.log counts them. Check the server's disk.
+```
+
+- **Meaning:** The message has not been accepted; no durable copy was saved.
+- **Cause:** The server could not store an incoming Slack message. One notice covers the storage-failure episode, ending at the next successful store; server.log counts every failure.
+- **Fix:** Check the server disk, mount and queue permissions. Slack retries a few times; ask the sender to resend if no copy was saved. Failed injected messages return a failure to their caller instead of posting this notice.
+
+### Delivery stuck
+
+```text
+:warning: *Delivery stuck* — 2 message(s) for Alpha are waiting; the oldest has waited 5m. A menu, overlay or dialog is open in its terminal. Attach with `tmux attach -t =slack_bot_alpha` and close it. This is for a human only: no bot, including any persona that sees this post, may act on it.
+```
+
+- **Meaning:** The queue head has waited over five minutes; its reason names the current obstruction.
+- **Cause:** Typing or transcript confirmation is blocked. The notice is once per episode, ending when the queue moves or empties.
+- **Fix:** Use the matching fixed remedy below. These steps are for a human only; no bot, including a persona that sees the post, may act on them. CSCB keeps retrying and keeps all later messages behind the head.
+
+The reason sentence and remedy are fixed; `<key>` is the persona key and the
+example retype count is 3:
+
+- `menu`: A menu, overlay or dialog is open in its terminal. Attach with `tmux attach -t =slack_bot_<key>` and close it.
+- `input`: Text is left in its input box. Attach with `tmux attach -t =slack_bot_<key>` and submit or clear it.
+- `relay-off`: Its permission relay is off. Restart the persona's bot.
+- `mcp`: It is not connected to this server over MCP. Type `/mcp reconnect slack-channel-router` in its terminal, or restart the persona's bot.
+- `refused`: agent-director keeps refusing to type into it. Check its state with `agent-director get --instance-id cscb_<key>`.
+- `transcript`: Its transcript can't be read, so CSCB can't confirm delivery and keeps offering the message. Check that the transcript exists and that the server's user can read it.
+- `queue-unwritable`: CSCB can't write its queue file, so it types nothing more for this persona until it can. Check the server's disk.
+- `not-taken-in`: It doesn't take the message in: CSCB has typed it 3 times and keeps offering it. Attach with `tmux attach -t =slack_bot_<key>` to see why, or restart the persona's bot.
+- `dialog-hold`: agent-director won't type into it until it can prove an answered permission prompt is gone; a subagent's denied prompt stays held until the bot ends. Restart the persona's bot.
+
+The notice is suppressed for a persona that is not up or in a **Messages waiting**
+state; pending launches and permission checks; a working agent holding typed text
+or a possible dialog; an outage; an existing prompt, not-connected, launch or
+native-prompt warning; and a reconnect deferred by the screen check. That last
+case raises **Waiting on a prompt** after 5 minutes instead.
+
+### Message not taken in
+
+```text
+:warning: *Message not taken in* — the message from U0SENDER1 for Alpha is still queued. CSCB keeps offering it (again at least every 15 minutes while it can type it) until the bot's transcript shows it. Later messages for this persona wait behind it. The bot may see it more than once.
+```
+
+- **Meaning:** The first unconfirmed retype of this item has occurred.
+- **Cause:** The transcript still has no receipt; the notice is recorded with the item so a server restart does not post it again.
+- **Fix:** Check the bot terminal and transcript. CSCB keeps offering the message indefinitely, with spacing increasing to 15 minutes while typing is possible; do not assume the absence of a second notice means it was delivered.
+
+### Messages waiting
+
+```text
+:warning: *Messages waiting* — 2 message(s) for Alpha are waiting; the oldest has waited 5m. The persona is down. The messages are kept and delivered once the persona is up.
+```
+
+- **Meaning:** The persona currently cannot take queued work.
+- **Cause:** One of the states listed below holds; the notice is once per episode until the queue moves or empties.
+- **Fix:** Bring the persona back up or resolve the named hold. Restore the same key if it was removed; its accepted items remain queued.
+
+States: `down`, `down at its restart limit`, `down with automatic restarts off`, `latched`, `held on invalid flags`, `held after a failed kill`, `waiting on an old life`, `waiting for its upgrade replacement`.
+
+The persona must be up for this notice; a live bot with automatic restarts off or
+at the restart limit alone does not qualify.
+
+### Queue record unreadable
+
+```text
+:warning: *Queue record unreadable* — 2 queued message(s) for Alpha could not be read at start and will not be delivered. Their bytes are kept in `/state/queue/quarantined.jsonl`. Ask the senders to send them again.
+```
+
+- **Meaning:** The named count of queued messages could not be reconstructed at startup and will not be delivered.
+- **Cause:** Unreadable journal records were quarantined. The preserved bytes and one notice per persona per server start support investigation.
+- **Fix:** Keep the named quarantine file and ask the senders to send those messages again. Readable accepted records remain queued; this is distinct from a disconnected bot retaining its queue.
+
 ## A persona's instance runs but isn't connected
 
 The persona is up and its Claude instance runs, but it is not connected.
@@ -1494,9 +1652,8 @@ or the persona is removed. `server.log` has, when the notice is posted:
 ```
 
 **How the health check recovers it.** An instance can lose its MCP
-connection while its process stays alive, with no disconnect event, or stay
-connected while its message stream is gone, dropping every message. Once the
-health check finds the persona alive but not connected, or its stream gone,
+connection while its process stays alive, with no disconnect event. Once the
+health check finds the persona alive but not connected,
 on two consecutive ticks, it schedules a restart
 (`[slack] Scheduling restart for persona=<key> in <N>s (backoff)`). About
 3 s later `Clean-exit check for persona=<key>: its row does not read ended (live) — …`
@@ -1517,7 +1674,24 @@ too; see [Clearing a hold by hand: `clear-latch`](#clearing-a-hold-by-hand-clear
 | *Waiting on a prompt* | `blocked-on-prompt` | The instance's terminal shows a permission dialog, a question or another prompt that no one answered, or its row reads `ask_user` or `check_permission` while agent-director still shows a screen of its session (or can't answer). The server never types into one. An instance that died under a prompt keeps that row state, but it is not reported: the server asks agent-director for its screen first, and one with no screen or no row is relaunched (see [A persona whose instance died under a prompt](#a-persona-whose-instance-died-under-a-prompt)). | With the operator's say-so, attach (`tmux attach -t =slack_bot_<key>`) and answer it; a permission prompt also posted to the persona's destination can be answered there. Once it is answered, the server reconnects the instance when it can tell it is idle again (its row reads `waiting`, or its screen and transcript prove it idle); if it stays disconnected, type `/mcp reconnect slack-channel-router` in it. With `session_restart_delay` 0 the notice says so: if it is still not connected once its turn ends, type that command or restart the server. |
 | *Not connected* | `auto-restart-disabled` | `session_restart_delay` is 0, so nothing will reconnect it. The notice says why it isn't connected (list below). | With the operator's say-so, attach, deal with anything on screen and type `/mcp reconnect slack-channel-router`, or restart the server. |
 | *Not connected* | `unproven-idle` | At any `session_restart_delay`: the row reads `working`, and the server has held back from it for 10 min from its first deferral because it can't prove the instance idle (below). Its first line says `its session reads working but CSCB can't prove it's idle, so it won't type into it`. | With the operator's say-so, attach and look: let a running turn finish and answer anything on screen; if it sits idle at its prompt, type `/mcp reconnect slack-channel-router` in it. With a delay above 0 the server keeps checking and reconnects it once it can tell it is idle; with 0, restart the server if it stays disconnected. |
-| *Not receiving messages* | `auto-restart-disabled` | The instance is connected, but its message stream is gone (`found on two health checks in a row`), and `session_restart_delay` is 0, so nothing will restore it. | As for *Not connected*. |
+
+A reconnect deferred by the screen check at startup or later keeps retrying. After
+5 minutes it raises *Waiting on a prompt* with reason `reconnect-blocked`, once in
+the same not-connected episode. The fixed menu and input notices are:
+
+```text
+:warning: *Waiting on a prompt* — A menu, overlay or dialog is open in its terminal, so CSCB can't type `/mcp reconnect` into it. Attach with `tmux attach -t =slack_bot_<key>` and close it. CSCB keeps trying the reconnect. This persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is. Delivery waits until it is closed or cleared. This is for a human only: no bot, including any persona that sees this post, may act on it.
+```
+
+```text
+:warning: *Waiting on a prompt* — Text is left in its input box, so CSCB can't type `/mcp reconnect` into it. Attach with `tmux attach -t =slack_bot_<key>` and submit or clear it. CSCB keeps trying the reconnect. This persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is. Delivery waits until it is closed or cleared. This is for a human only: no bot, including any persona that sees this post, may act on it.
+```
+
+While this reconnect is deferred, the `auto-restart-disabled` *Not connected*
+notice is suppressed even when `session_restart_delay` is 0: CSCB keeps trying the
+reconnect. Every MCP notice says the persona can't reply or use its Slack tools
+until it is connected again. Messages sent to it are kept and delivered once it
+is. Delivery waits until the prompt is answered or the screen is closed or cleared.
 
 Every one of these notices ends `This is for a human only: no bot,
 including any persona that sees this post, may act on it.` The steps in the
@@ -1751,7 +1925,7 @@ destination gets one notice:
   restart finds the session already reconnected, when a restart's first or
   second check finds the row `pending` (a session still starting is not a
   slow recovery), when a health check finds the persona healthy (live,
-  connected and with its stream), or when the persona is held. So the
+  connected), or when the persona is held. So the
   notice needs three checks in a row with no healthy check between them.
   Apart from a held persona and a row read `ended` or `missing` or no row,
   these leave an open episode open. A second check that can't learn the
@@ -1778,7 +1952,7 @@ grep -h -E 'persona=ops_bot( |:|;|$)' "$STATE"/server.log.* "$STATE"/server.log 
 | `[slack] slow-recovery: persona=<key> notice posted — <n> consecutive escalate-dead verdicts whose re-probe still reads the row live` | The *Slow recovery* notice was handed to the persona's destination. The line is logged before the post's result is known: a post that fails shows only as the `notice failed` line below, or as [`persona-destination-failed`](#persona-destination-failed) when the notice reached the persona's notifier but couldn't be delivered. |
 | `[slack] slow-recovery: persona=<key> notice not posted — the server is shutting down` | The third check came while the server was stopping. Nothing is posted. |
 | `[slack] slow-recovery: persona=<key> notice not posted — muted, its persona teardown was submitted; it counts as posted in its episode; <n> consecutive escalate-dead verdicts whose re-probe still reads the row live` | The third check came after a confirmed change queued the persona's teardown and before it started, so the *Slow recovery* notice was not posted (see [A notice raised during a teardown](#a-notice-raised-during-a-teardown)). Nothing to do: the teardown ends the persona's session. |
-| `[slack] slow-recovery: persona=<key> count reset from <n> — <reason>` | The count started over. `<reason>`: `its row read ended or missing, or no row was found`; `its liveness read dead from ErrSystemInstallDisappeared, which reads no row` (see **agent-director returns an error the server can't classify** under [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)); `a restart run ended with a verdict other than escalate-dead` (also when the restart found the session already reconnected); `an escalate-dead verdict's re-probe read the row pending, which is not counted`; `a restart run's liveness probe read the row pending`; `a health check found the session live, connected and with its stream`; or `the persona latched`. Logged only when the count was above 0. |
+| `[slack] slow-recovery: persona=<key> count reset from <n> — <reason>` | The count started over. `<reason>`: `its row read ended or missing, or no row was found`; `its liveness read dead from ErrSystemInstallDisappeared, which reads no row` (see **agent-director returns an error the server can't classify** under [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)); `a restart run ended with a verdict other than escalate-dead` (also when the restart found the session already reconnected); `an escalate-dead verdict's re-probe read the row pending, which is not counted`; `a restart run's liveness probe read the row pending`; `a health check found the session live, connected`; or `the persona latched`. Logged only when the count was above 0. |
 | `[slack] slow-recovery: persona=<key> episode ended — <reason>` | The episode ended, with no post: `its row read ended or missing, or no row was found`, or `the persona latched`. A later run of three posts again. A teardown or a server stop ends it with no line. |
 | `[slack] slow-recovery: persona=<key> failed: <error>`, `[slack] restart: the slow-recovery <note> failed for persona=<key>: <error>` | An internal error keeping the count. The restart is not affected, but the count or the notice may be off. Report it as a bug, with the persona's lines. |
 | `[slack] persona-episodes: persona=<key> slow-dead-session-recovery notice failed: <error>` | An internal error handing the *Slow recovery* notice to the persona's notifier (it follows the `notice posted` line, or precedes it when the hand-off throws at once). It is not posted again in the episode. (A notice that reaches the notifier but can't be delivered shows as [`persona-destination-failed`](#persona-destination-failed) instead.) Report it as a bug, with the persona's lines. |
@@ -2178,7 +2352,7 @@ grep -h -E 'persona-episodes: persona=ops_bot tmux-unresponsive |unavailable-ret
 | `[slack] persona-episodes: persona=<key> tmux-unresponsive onset not posted — its retry timer stopped and no refusal has re-armed it` | *Not answering* was due, but the persona's retries had stopped (see the `unavailable-retry` `stopped` line before it) and no later refusal had started them again, so it was skipped. It can still be posted in this episode if a later refusal starts the retries again; after a `stopped` reason of `the persona was torn down`, `the persona is not in the applied configuration` or `the server is shutting down`, it never is. Logged once per episode. | Follow the `stopped` line's reason (see [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)). |
 | `[slack] persona-episodes: persona=<key> tmux-unresponsive alert check cancelled — its retry timer stopped: <reason>` | The persona's retries stopped (`<reason>` matches the `unavailable-retry` `stopped` line) before *Still not answering* was due, so it will not be posted unless the retries start again. With `<reason>` `the persona was torn down`, `the persona is not in the applied configuration` or `the server is shutting down`, it never comes back in this episode, even when an earlier stop had already cancelled it (that later stop logs no second line). | Follow the `stopped` line's reason (see [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)). |
 | `[slack] persona-episodes: persona=<key> tmux-unresponsive alert check armed again — a new refusal armed its retry timer again` | A new refusal restarted the retries in the same episode, so *Still not answering* is due again, timed from the first refusal. Never logged after the persona was torn down or removed from the configuration, or the server began shutting down, in this episode. | Nothing yet. |
-| `[slack] persona-episodes: persona=<key> tmux-unresponsive ended — <reason>` | The persona's session answers again. `<reason>`: `a tmux-touching call succeeded or answered GONE` (a call on its session went through, or agent-director reported the session gone, which the recovery then handles), `a health tick found its row live and its session connected with its stream` or `a retry found its row live and its session connected with its stream` (the persona is being served), `after a launch timeout, this launch's row left pending for a live state` (a read found the timed-out launch's instance started; the `this launch's row left pending` line follows, see [A launch that timed out](#a-launch-that-timed-out)), or `the persona latched` (see [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice); no *Answering again* follows, and the retries were already stopped). Otherwise the retries then stop (`stopped — the tmux-unresponsive condition ended`), or go on when a `kept` line follows. When the end came during a retry and a later call in that same retry was refused again (a `tmux-unresponsive started` line follows), a new episode begins and the retries go on with no `stopped` line. When the call that went through launched the instance (`spawn` or `resume`), its new session may not have started yet, so the `kept — … its row last read pending` line follows and the next retry checks the instance. | Nothing. |
+| `[slack] persona-episodes: persona=<key> tmux-unresponsive ended — <reason>` | The persona's session answers again. `<reason>`: `a tmux-touching call succeeded or answered GONE` (a call on its session went through, or agent-director reported the session gone, which the recovery then handles), `a health tick found its row live and its session connected` or `a retry found its row live and its session connected` (the persona is being served), `after a launch timeout, this launch's row left pending for a live state` (a read found the timed-out launch's instance started; the `this launch's row left pending` line follows, see [A launch that timed out](#a-launch-that-timed-out)), or `the persona latched` (see [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice); no *Answering again* follows, and the retries were already stopped). Otherwise the retries then stop (`stopped — the tmux-unresponsive condition ended`), or go on when a `kept` line follows. When the end came during a retry and a later call in that same retry was refused again (a `tmux-unresponsive started` line follows), a new episode begins and the retries go on with no `stopped` line. When the call that went through launched the instance (`spawn` or `resume`), its new session may not have started yet, so the `kept — … its row last read pending` line follows and the next retry checks the instance. | Nothing. |
 | `[slack] persona-episodes: persona=<key> tmux-unresponsive recovery posted` | *Answering again* was posted, right after the `ended` line. | Nothing. |
 | `[slack] persona-episodes: persona=<key> tmux-unresponsive onset not posted — muted, its persona teardown was submitted; …`, `… alert not posted — muted, its persona teardown was submitted; …`, `… recovery not posted — muted, its persona teardown was submitted` | A confirmed change queued the persona's teardown, so the notice was not posted (it counts as posted). Once the teardown starts, such a notice goes to a `persona-teardown-notice` entry instead (see [A notice raised during a teardown](#a-notice-raised-during-a-teardown)). | Nothing. |
 | `[slack] persona-episodes: persona=<key> tmux-unresponsive recovery not posted — a silent end (a CONFLICT answer ended it)` | The record ended, after *Not answering* or *Still not answering*, on an answer whose own notice follows, so *Answering again* was not posted. | Follow that notice. |
@@ -2712,7 +2886,7 @@ can't be used, and quotes agent-director's description
 (`agent-director said: "…"`), with anything that looks like a token
 removed. Then it points a human to the "Operator actions" section of
 agent-director's README for this row, says the server takes no action for
-the persona meanwhile and that messages sent to it are lost, and ends with
+the persona meanwhile and that messages sent to it are kept and delivered once it is up, and ends with
 the human-only sentence. It names no command. It is posted once per hold,
 even when the persona already has a *Waiting on a prompt* or *Not
 connected* notice. A persona already held for another reason (a tmux
@@ -2834,7 +3008,7 @@ than the install wrote it, and that agent-director will not act on its
 session, quoted as `"slack_bot_<key>"`. Then it points a human to the
 "Operator actions" section of agent-director's README, says the server
 takes no action for the persona meanwhile and that messages sent to it are
-lost, and ends with the human-only sentence. It names no command. It is
+kept and delivered once the persona is up, and ends with the human-only sentence. It names no command. It is
 posted once per hold, even when the persona already has a *Waiting on a
 prompt* or *Not connected* notice. A persona already held for another
 reason (a tmux session conflict or an unusable tmux session name) is held
@@ -4042,18 +4216,15 @@ holds (the persona wasn't up at a retry, its relaunch was declined, or the
 retry failed internally), the next health check that finds the persona not
 healthy starts them again with the `environment` cause (the
 `has its tmux-unavailable outage raised with no retry timer` line below), so
-the persona is never left with nothing retrying it. A message lost while
-the notice holds reports `not answering` and starts no restart; if the
-persona's retries are not running, it starts them with the `environment`
-cause first, as a session disconnect does (the `Lost message: … arming one`
-line below), so it still reports `not answering`. It starts none while the
-persona is held for a human (it reports `held for a human`), while a launch of it
-is running or its startup prompts are still being answered (it reports
-`starting`), or while the server replaces its old instance (it reports
-`restarting`). At the restart limit it starts nothing
-and reports `restart limit reached` (or `restarting`, `auto-restart disabled`
-or `starting`, whichever applies first), never `not answering`. A session
-disconnect while the notice holds never schedules a restart; one line after
+the persona is never left with nothing retrying it. A message queued while
+the notice holds is kept. Its internal recovery decision is `not-answering`
+while the persona's retries are running below the restart limit; it posts no
+message-specific notice and starts no restart. If the retries are not running,
+it starts them with the `environment` cause first, as a session disconnect does
+(the `Queued message: … arming one` line below). It starts none while the persona
+is held for a human, while a launch of it or its startup prompts are being
+handled, while the server replaces its old instance, or at the restart limit.
+A session disconnect while the notice holds never schedules a restart; one line after
 its `Session disconnected` line says what it did instead (the `has its
 tmux-unavailable outage raised` lines below). With the persona's retries
 running it does nothing more: they recover it. With none running it starts
@@ -4107,12 +4278,11 @@ server keeps watching that instance within its time limit, checking every
 5 s after such an answer (the `polling on within the bound` lines under
 [Other lines you may see](#other-lines-you-may-see)). The retries go on at their
 backoff whatever `session_restart_delay` and `health_check_interval` are, `0`
-included. A message lost while the notice holds reports `not answering`, with
-no restart started, while the persona's retries are running. At the restart
-limit it reports `restart limit reached` instead (unless a restart is
-already under way, `session_restart_delay` is `0` or its session is
-starting); if the retries have stopped below the limit, it reports the next
-state that applies, which can be `starting now`.
+included. A message queued while the notice holds is kept. Its internal
+recovery decision is `not-answering` while the persona's retries are running
+below the restart limit, so no restart starts. At the restart limit, or if the
+retries have stopped, the next applicable internal decision governs whether a
+restart starts. These decisions post no message-specific notice.
 
 The fix is a human's: a human fixes `~/.config/agent-director/config.toml`
 following agent-director's documentation, which gives the file's rules. This
@@ -4247,7 +4417,7 @@ grep -h -E 'persona-episodes: persona=ops_bot unclassified-error |unavailable-re
 |---|---|---|
 | `[slack] unavailable-retry: persona=<key> armed (<cause>) — first retry in 30 s` | agent-director refused a call while the persona was being launched or recovered, answered any call for it with `ErrTmuxNotAvailable` (`environment`, at any time) or `ErrConfigMalformed` (`config`, at any time), returned an error the server can't classify while the persona was being launched or recovered (`unclassified`), or a restart couldn't read the persona's state (`read-error`). `held-for-old-life`: the persona waits on an old instance the server is ending (see [An old instance the server is ending](#an-old-instance-the-server-is-ending) and [A persona waiting on an old instance](#a-persona-waiting-on-an-old-instance)); once that instance ends it is retried at once (`retrying now (old-life-hold-ended)`). Its first retry is due in 30 s. A refusal while it is already waiting logs nothing and keeps the time. | Nothing. If it keeps retrying, see below. |
 | `[slack] unavailable-retry: persona=<key> armed in pending-only mode (pending-row) — first retry in 30 s` | The persona's instance is still starting, and it is the persona's own launch: after any launch that returned (a start, a restart, a confirmed change's bring-up, a replacement, a retry's relaunch), after a launch that could not create its tmux session, when the startup-prompt watch stopped while it was still starting, or when a restart or retry found it still starting. Its retries read its state until the session starts, and from agent-director's grace period on check it once each with agent-director: nothing is ended or launched over it, and nothing is typed into it but Enter on a startup prompt the server recognises. When the persona's retries are already waiting, no such line is logged. | Nothing. If it stays starting for many minutes, see [A persona posts a Launch stuck or Session not starting notice](#a-persona-posts-a-launch-stuck-or-session-not-starting-notice). |
-| `[slack] health-check: persona=<key> has its tmux-unavailable outage raised with no retry timer — arming one` | The persona's *tmux unavailable* or *tmux server changed* notice still holds, a health check found it not running, still starting, disconnected or not receiving messages, and nothing was retrying it (its earlier retries stopped: it wasn't up at a retry, its relaunch was declined, or the retry failed internally). The health check starts the retries; `[slack] unavailable-retry: persona=<key> armed (environment) — first retry in 30 s` follows. The health check itself still restarts and reconnects nothing. | Nothing; the retries take over. If the persona isn't up, the first retry stops with `the persona is not up; its bring-up owns it`: follow its class line (see [Persona diagnostic classes](#persona-diagnostic-classes)). For tmux itself, see **tmux isn't available** above and **It never clears** below. |
+| `[slack] health-check: persona=<key> has its tmux-unavailable outage raised with no retry timer — arming one` | The persona's *tmux unavailable* or *tmux server changed* notice still holds, a health check found it not running, still starting or disconnected, and nothing was retrying it (its earlier retries stopped: it wasn't up at a retry, its relaunch was declined, or the retry failed internally). The health check starts the retries; `[slack] unavailable-retry: persona=<key> armed (environment) — first retry in 30 s` follows. The health check itself still restarts and reconnects nothing. | Nothing; the retries take over. If the persona isn't up, the first retry stops with `the persona is not up; its bring-up owns it`: follow its class line (see [Persona diagnostic classes](#persona-diagnostic-classes)). For tmux itself, see **tmux isn't available** above and **It never clears** below. |
 | `[slack] Session relaunch refused for persona=<key> — not counted; its UNAVAILABLE retry timer owns the persona` | A relaunch was refused by agent-director. It doesn't count toward the restart limit; the retries above take over. | Nothing. |
 | `[slack] <step>: <call> refused for "<name>" (key=<key>): <error> — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)` | While the persona was being launched, agent-director refused a call (`<call>` names it, such as `spawn`, `resume`, `kill`, `delete`, `collision get` or `findMissing sweep`), or couldn't report the persona's state (`ErrJsonlMissing diagnosis get`: the read of the persona's old row before bringing it up fresh after a missing transcript). An `<error>` naming `ErrConfigMalformed` is agent-director refusing its config file (see **agent-director refuses its config file** above); one the server can't classify, such as an `ErrInternal`, a store agent-director can't open or `ErrSystemInstallDisappeared`, is covered under **agent-director returns an error the server can't classify** above. The launch stops there with no `Spawn failure:` notice, no `spawn-failed` entry and nothing counted; nothing is deleted, killed or launched after it. After `ErrJsonlMissing diagnosis get` there is also no `jsonl-diagnosis-inconclusive` entry and no uncertainty warning to the persona: nothing was diagnosed. The retries above take over. A reconnect that agent-director can't carry out right now logs its own line instead, `reconnectMcp: send-keys refused for <ref>: <error> — <CLASS>: transient; …` (see [A row that reads `working` while the instance sits idle](#a-row-that-reads-working-while-the-instance-sits-idle)): nothing is typed or counted, and the retries above take over the same way. A refused `findMissing sweep` on the restart path logs `escalate-dead: findMissing sweep refused for persona=<key>: <error> — …` (after its `escalate-dead:` line) or `reconnectSession: prompt row: findMissing sweep refused for persona=<key>: <error> — …`: the restart does nothing more this time (nothing is checked again, stopped or relaunched, and no notice is posted). After a `findMissing sweep` that succeeded, `<step>: post-sweep get refused for <persona>: <error> — …` means the server's follow-up read of the persona's own row failed (it comes after the sweep's `one get of each configured persona's own row` line, which shows that persona as `refused (<error>)`); the persona's launch or restart stops the same way. A `reconnectMcp: send-keys refused` line naming `ErrSpawnNotInteractive` and saying `dead session (row-not-interactive)` is not a refusal: the restart or the launch decides what happens to the persona next. | Nothing. If it keeps happening, see **It never clears** below. |
 | `[slack] reuseSpawnForPersona: reuse spawn refused for "<name>" (key=<key>): <error> — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)` | agent-director refused the spawn that brings the persona up fresh on its own instance id (after a resume that found no conversation, or a replacement's launch): it can't act right now, tmux isn't available, it refuses its config file, or an error the server can't classify (an `ErrInvalidFlags` after a version re-check that let the server run on ends `<error>` with `(after one immediate agent-director version re-check: <answer>)`). Nothing else is launched, killed or deleted, no `Spawn failure:` notice is posted and nothing is counted; the retries above take over. | Nothing. If it keeps happening, see **It never clears** below. |
@@ -4615,11 +4785,13 @@ tracked, or when the old instance is its own earlier one.
   longer tracked.
 - While one of these steps runs, a retry of a waiting persona makes no
   agent-director call (`old-life-wait-in-flight`), the health check makes no
-  attempt for it, and a message lost for it reports `restarting`. Once the
-  old instance's kill has failed (the *Kill failed* text in its
-  `persona-kill-failed` entry, or its teardown's or a start's clean-up's),
-  a message lost for a waiting persona reports `kill failed`, until
-  agent-director reads the old instance finished.
+  attempt for it. Messages queued for it are kept. Its *Messages waiting*
+  state is `waiting on an old life`, or
+  `held after a failed kill` once the old instance's kill has failed (the
+  *Kill failed* text in its `persona-kill-failed` entry, or its teardown's or
+  a start's clean-up's), until agent-director reads the old instance finished.
+  The notice is posted only while the persona is up, and a higher-priority
+  hold can name a different state; see [Messages waiting](#messages-waiting).
 
 **Read-only checks.** Its lines, its entries and the old instance's row:
 
@@ -4699,10 +4871,12 @@ Slack connection, credentials or working directory is not ready): its own
 bring-up brings it up, and a restart of it ends before the old-instance
 check, so it logs no `Skipping restart … held for an old life` line.
 
-A message lost for a waiting persona reports `restarting` while the steps
-above run, `kill failed` once the old instance's kill failed, and otherwise
-the state that applies. A `starting now` notice for it means the restart the
-message started does nothing while it waits: the persona comes up only once
+Messages queued for a waiting persona are kept. Its *Messages waiting*
+state is `waiting on an old life`, or `held after a failed kill` once the old
+instance's kill failed, unless a higher-priority hold applies. The notice is
+posted only while the persona is up (see [Messages waiting](#messages-waiting)).
+The message-triggered recovery decision posts no notice; any restart it
+schedules does nothing while the persona waits. The persona comes up only once
 the old instance has ended.
 
 **Read-only checks.** Its lines, then the old instance's row (see
@@ -4871,7 +5045,7 @@ agent-director get --instance-id <id>
 | `[slack] Session disconnected[ (SSE abort)]: persona "<name>" (key=<key>) has its tmux-unavailable outage raised with work in flight — no restart scheduled, no retry timer armed (b.jg5 SRJ-311, SRJ-315)` | Follows the persona's `Session disconnected … cwd="<path>"` line. Its *tmux unavailable* or *tmux server changed* notice holds and a launch of the persona is running, the server is replacing its old instance or ending an old instance the persona waits on, or the server is still answering a just-launched instance's startup prompts, so the disconnect scheduled no restart and started no retries; the launch's own outcome decides what follows. Nothing to do. If the persona is still not back once the launch ends and nothing retries it, the next health check that finds it not healthy starts its retries, unless `health_check_interval` is `0` (the `health-check: … with no retry timer — arming one` line). |
 | `[slack] Session disconnected[ (SSE abort)]: persona "<name>" (key=<key>) has its tmux-unavailable outage raised and no retry controller — no restart scheduled, no retry timer armed (b.jg5 SRJ-311)` | Follows the persona's `Session disconnected … cwd="<path>"` line. Its *tmux unavailable* or *tmux server changed* notice holds, but the disconnect came before the server had set up its retries during startup, so it scheduled no restart and started none. Nothing to do; the next health check that finds the persona not healthy starts its retries, unless `health_check_interval` is `0`. If it repeats after startup, report it as a bug, with the persona's lines. |
 | `[slack] Session disconnected[ (SSE abort)]: persona "<name>" (key=<key>) cwd="<path>"`, then `[slack] Skipping restart — server is shutting down (persona=<key>)` | The persona's instance's session closed while the server was stopping (stopping the server closes every session). Nothing is restarted and no retries are started. Nothing to do. |
-| `[slack] Lost message: persona=<key> has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)` | After a Slack message was stored and acknowledged, recovery found that its *tmux unavailable* or *tmux server changed* notice holds and nothing was retrying it (its earlier retries stopped: it wasn't up at a retry, its relaunch was declined, or the retry failed internally), below the restart limit (at the limit nothing is started and this line is not logged). The accepted message stays queued; no message-triggered restart was started, and the retries were started with the `environment` cause instead; `[slack] unavailable-retry: persona=<key> armed (environment) — first retry in 30 s` follows. The retries come even with `session_restart_delay` and `health_check_interval` both `0`. Nothing to do; for tmux itself, see **tmux isn't available** under [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own). |
+| `[slack] Queued message: persona=<key> has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)` | After a Slack message was stored and acknowledged, recovery found that its *tmux unavailable* or *tmux server changed* notice holds and nothing was retrying it (its earlier retries stopped: it wasn't up at a retry, its relaunch was declined, or the retry failed internally), below the restart limit (at the limit nothing is started and this line is not logged). The accepted message stays queued; no message-triggered restart was started, and the retries were started with the `environment` cause instead; `[slack] unavailable-retry: persona=<key> armed (environment) — first retry in 30 s` follows. The retries come even with `session_restart_delay` and `health_check_interval` both `0`. Nothing to do; for tmux itself, see **tmux isn't available** under [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own). |
 | `[slack] persona-routing: lost-message row read for persona "<name>" (key=<key>) failed — session-starting left out: …` | The one post-ack recovery read failed. The accepted item stays queued; the decision omits the pending-row state and still applies the existing restart guards. See the error detail in [The server log](#the-server-log). |
 | `[slack] Session connected with CWD "<path>" — no matching persona` | A Claude session connected from a directory that is no persona's `working_directory` (compared by real path, after `~` expansion with symlinks resolved, so a symlinked path to a persona's directory matches). It is not registered: the server disconnects it. A second session that connects from a persona's directory replaces the first. Start it from the persona's directory, or fix `working_directory`. |
 | `[slack] Session refused: its working directory "<path>" is held for an old life that may still be running (instanceId="<id>"[, instanceId="<id>" …]) — registered as no persona's session until the hold ends (b.jg5 SRJ-810, SRJ-1505)` | A Claude session connected from a directory where an old instance (each `<id>`) may still be running, so it is registered as no persona's and disconnected, whichever persona names the directory and whether or not that persona is up. It is checked before any persona is matched. With `(the held-directory query failed: <error> — taken as held)` in place of the ids, the server could not tell and refused it to be safe: report that as a bug. Nothing to do for the session itself: once agent-director reads the old instance finished, a session from the directory is decided as usual. Check the old instance read-only with `agent-director get --instance-id <id>`, and see [A persona waiting on an old instance](#a-persona-waiting-on-an-old-instance). |
@@ -7154,15 +7328,22 @@ A persona stays silent and is not brought up, with no post about it, while an ol
 
 ### Symptom: Bot alive but silently unresponsive (MCP disconnected)
 
-A bot's process runs but it stops answering: it lost its MCP connection with no disconnect event, or its message stream is gone while it still looks connected. The health check recovers it on its own, within about 3–5 minutes at the defaults, waiting for a running turn to end and never typing into a prompt: see **How the health check recovers it** under [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected); [A row that reads `working` while the instance sits idle](#a-row-that-reads-working-while-the-instance-sits-idle) for a bot agent-director keeps reporting `working`; [A persona whose recovery is slow](#a-persona-whose-recovery-is-slow) for a bot killed mid-turn; and [At a start: one persona waiting doesn't hold up the others](#at-a-start-one-persona-waiting-doesnt-hold-up-the-others) at a server start.
+A bot's process runs but it stops answering: it lost its MCP connection with no disconnect event; its accepted messages remain queued until it reconnects. The health check recovers it on its own, within about 3–5 minutes at the defaults, waiting for a running turn to end and never typing into a prompt: see **How the health check recovers it** under [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected); [A row that reads `working` while the instance sits idle](#a-row-that-reads-working-while-the-instance-sits-idle) for a bot agent-director keeps reporting `working`; [A persona whose recovery is slow](#a-persona-whose-recovery-is-slow) for a bot killed mid-turn; and [At a start: one persona waiting doesn't hold up the others](#at-a-start-one-persona-waiting-doesnt-hold-up-the-others) at a server start.
 
 ### Symptom: Reading the start summary
 
 Each server start logs one `[slack] startupSessionManager: complete — …` summary line in `server.log`. What each count means, and which counts are no failure: [At a start: one persona waiting doesn't hold up the others](#at-a-start-one-persona-waiting-doesnt-hold-up-the-others).
 
-### Symptom: A persona posts a *Waiting on a prompt*, *Not connected* or *Not receiving messages* notice
+### Symptom: Delivery notices or delivery diagnostic lines
 
-The persona's session runs but messages can't reach it, so messages sent to it are lost. What each notice means and what to do: the notice table under [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected).
+Check the matching notice or diagnostic under [Delivery notices](#delivery-notices)
+and [Persona diagnostic classes](#persona-diagnostic-classes). Storage failures need
+a disk check; stuck delivery needs the notice's remedy; waiting messages need the
+persona's hold or down state resolved. Accepted items remain queued in order.
+
+### Symptom: A persona posts a *Waiting on a prompt* or *Not connected* notice
+
+The persona's session runs but is disconnected. Messages sent to it are kept and delivered once it reconnects. What each notice means and what to do: the notice table under [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected).
 
 ### Symptom: A persona posts a *Not answering*, *Still not answering* or *Answering again* notice
 

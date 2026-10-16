@@ -3679,8 +3679,7 @@ function latchOnConflict(key: string, err: unknown, operation: RefusedOperation,
  *   wait that ended there). With `autoRestartDisabled` the notice also says
  *   nothing will reconnect it once the prompt is answered.
  * - `auto-restart-disabled`: its session runs but messages can't reach it
- *   (`cause`, fixed token-free text): its MCP connection is down, or, with
- *   `streamless`, it is connected but its message stream is gone. With
+ *   (`cause`, fixed token-free text): its MCP connection is down. With
  *   `session_restart_delay` 0 nothing will reconnect it.
  * - `unproven-idle`: its row reads `working` and CSCB has held back from it,
  *   typing nothing, for `heldMs` (at least `UNPROVEN_IDLE_NOTICE_AFTER_MS`,
@@ -3691,15 +3690,15 @@ function latchOnConflict(key: string, err: unknown, operation: RefusedOperation,
  */
 export type NotConnectedNotice =
   | { reason: 'blocked-on-prompt'; autoRestartDisabled: boolean }
-  | { reason: 'auto-restart-disabled'; cause: string; streamless?: boolean }
+  | { reason: 'auto-restart-disabled'; cause: string }
+  | { reason: 'reconnect-blocked'; rule: 'menu' | 'input' }
   | { reason: 'unproven-idle'; autoRestartDisabled: boolean; heldMs: number }
 
 /**
  * Why the health check finds an alive persona undeliverable (b.f2b): its MCP
- * session is not connected, or it is connected but has no message stream
- * (b.9cj).
+ * session is not connected (b.omv SR-9).
  */
-export type UndeliverableCause = 'disconnected' | 'streamless'
+export type UndeliverableCause = 'disconnected'
 
 /**
  * Personas whose not-connected notice was raised in the current episode
@@ -3728,20 +3727,11 @@ export function notifyPersonaNotConnected(key: string, notice: NotConnectedNotic
  * The health check's report for an alive persona it would reconnect while
  * auto-restart is disabled (b.f2b): the `auto-restart-disabled` notice, once
  * per episode (`notifyPersonaNotConnected`), worded for why it is
- * undeliverable: its MCP connection is down (`disconnected`, the default), or
- * it is connected but its message stream is gone (`streamless`).
+ * undeliverable: its MCP connection is down (`disconnected`, the default).
  */
 export function notifyDisconnectedWithAutoRestartDisabled(key: string, cause: UndeliverableCause = 'disconnected'): void {
-  notifyPersonaNotConnected(
-    key,
-    cause === 'streamless'
-      ? {
-          reason: 'auto-restart-disabled',
-          cause: 'found on two health checks in a row',
-          streamless: true,
-        }
-      : { reason: 'auto-restart-disabled', cause: 'its connection has been down on two health checks in a row' },
-  )
+  if (deliveryLifecycle?.deferred(key)) return
+  notifyPersonaNotConnected(key, { reason: 'auto-restart-disabled', cause: 'its connection has been down on two health checks in a row' })
 }
 
 /**
@@ -3755,6 +3745,8 @@ export function notifyDisconnectedWithAutoRestartDisabled(key: string, cause: Un
  * liveness note logged for its own row (`nonLatchingNoteLogged`, b.jg5
  * SRJ-114). Silent; other personas are untouched.
  */
+export function hasNotConnectedEpisode(key: string): boolean { return notConnectedNoticeRaised.has(key) }
+
 export function forgetNotConnectedEpisode(key: string): void {
   notConnectedNoticeRaised.delete(key)
   workingRowPaneRuns.delete(key)
@@ -3786,13 +3778,19 @@ export function _resetNotConnectedEpisodes(): void {
 export function buildNotConnectedNotice(key: string, notice: NotConnectedNotice): string {
   const attach = `\`tmux attach -t ${tmuxExactSessionTarget(personaTmuxSessionName(key))}\``
   const reconnect = `\`/mcp reconnect ${MCP_SERVER_NAME}\``
+  if (notice.reason === 'reconnect-blocked') {
+    const screen = notice.rule === 'menu'
+      ? `A menu, overlay or dialog is open in its terminal, so CSCB can't type \`/mcp reconnect\` into it. Attach with ${attach} and close it.`
+      : `Text is left in its input box, so CSCB can't type \`/mcp reconnect\` into it. Attach with ${attach} and submit or clear it.`
+    return `:warning: *Waiting on a prompt* — ${screen} CSCB keeps trying the reconnect. This persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is. Delivery waits until it is closed or cleared. ${CONFLICT_NOTICE_HUMAN_ONLY_LINE}`
+  }
   if (notice.reason === 'blocked-on-prompt') {
     const after = notice.autoRestartDisabled
       ? `Automatic restarts are disabled (\`session_restart_delay\` is 0): if it is still not connected once its turn ends, type ${reconnect} there or restart the server.`
       : `Once it is answered, CSCB reconnects it when it can tell the session is idle again (its row reads waiting, or its screen and transcript prove it idle); if it stays disconnected, type ${reconnect} there.`
     return (
-      `:warning: *Waiting on a prompt* — this persona is not connected to this server, and its session shows a prompt or dialog in its terminal that no one has answered. CSCB never types into a prompt, so it won't reconnect the persona while the prompt is up; messages sent to it until then are lost.\n` +
-      `Attach with ${attach} and answer it. ${after} ${CONFLICT_NOTICE_HUMAN_ONLY_LINE}`
+      `:warning: *Waiting on a prompt* — this persona is not connected to this server, and its session shows a prompt or dialog in its terminal that no one has answered. CSCB never types into a prompt, so it won't reconnect the persona while the prompt is up; this persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is.\n` +
+      `Attach with ${attach} and answer it. Delivery waits until the prompt is answered. ${after} ${CONFLICT_NOTICE_HUMAN_ONLY_LINE}`
     )
   }
   if (notice.reason === 'unproven-idle') {
@@ -3800,18 +3798,12 @@ export function buildNotConnectedNotice(key: string, notice: NotConnectedNotice)
       ? `Automatic restarts are disabled (\`session_restart_delay\` is 0), so nothing will reconnect it on its own; if it stays disconnected, restart the server.`
       : `Otherwise CSCB keeps checking it and reconnects it once its row reads waiting or its screen and transcript prove it idle.`
     return (
-      `:warning: *Not connected* — this persona is not connected to this server: its session reads working but CSCB can't prove it's idle, so it won't type into it, and has held back for ${describeWaitSpan(notice.heldMs)}. Messages sent to it until it reconnects are lost.\n` +
+      `:warning: *Not connected* — this persona is not connected to this server: its session reads working but CSCB can't prove it's idle, so it won't type into it, and has held back for ${describeWaitSpan(notice.heldMs)}. This persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is.\n` +
       `Check it with ${attach}: let a running turn finish and answer anything on screen; if it sits idle at its prompt, type ${reconnect} there. ${after} ${CONFLICT_NOTICE_HUMAN_ONLY_LINE}`
     )
   }
-  if (notice.streamless === true) {
-    return (
-      `:warning: *Not receiving messages* — this persona's session is running and connected to this server, but its message stream is gone (${notice.cause}), and automatic restarts are disabled (\`session_restart_delay\` is 0), so nothing will restore it; messages sent to it are lost.\n` +
-      `To recover: attach with ${attach}, deal with anything on screen and type ${reconnect}, or restart the server. ${CONFLICT_NOTICE_HUMAN_ONLY_LINE}`
-    )
-  }
   return (
-    `:warning: *Not connected* — this persona's session is running but is not connected to this server (${notice.cause}), and automatic restarts are disabled (\`session_restart_delay\` is 0), so nothing will reconnect it; messages sent to it are lost.\n` +
+    `:warning: *Not connected* — this persona's session is running but is not connected to this server (${notice.cause}), and automatic restarts are disabled (\`session_restart_delay\` is 0), so nothing will reconnect it; this persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is.\n` +
     `To recover: attach with ${attach}, deal with anything on screen and type ${reconnect}, or restart the server. ${CONFLICT_NOTICE_HUMAN_ONLY_LINE}`
   )
 }

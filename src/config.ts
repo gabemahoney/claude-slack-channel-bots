@@ -116,6 +116,7 @@ export const TEST_TIMER_OVERRIDE_KEYS = [
   'latch_recheck_interval_ms',
   'ad_version_recheck_interval_ms',
   'dialog_ready_timeout_ms',
+  'delivery_stuck_after_ms',
   'unavailable_retry_base_s',
   'unavailable_retry_ceiling_s',
 ] as const

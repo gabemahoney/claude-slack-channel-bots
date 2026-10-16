@@ -476,6 +476,9 @@ export const PERSONA_EPISODE_KIND_STUCK_LAUNCH = 'stuck-launch'
 
 /** Every notice kind with a latch here, one per row of SRJ-1016's table. */
 export const PERSONA_EPISODE_KINDS = [
+  'message-not-saved',
+  'delivery-stuck',
+  'messages-waiting',
   PERSONA_EPISODE_KIND_CONFLICT,
   PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME,
   PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED,
@@ -885,10 +888,10 @@ const RECOVERY_MARK = 'recovery'
 /** End reason: a tmux-touching call for the persona succeeded or answered GONE (SRJ-310 rule 1). */
 export const TMUX_UNRESPONSIVE_END_TMUX_VERB = 'tmux-verb'
 
-/** End reason: a health tick found the persona's row live, not `pending`, connected with its stream (SRJ-310 rule 2). */
+/** End reason: a health tick found the persona's row live, not `pending`, and its session connected (SRJ-310 rule 2). */
 export const TMUX_UNRESPONSIVE_END_TICK = 'tick'
 
-/** End reason: a retry found the persona's row live, not `pending`, connected with its stream (SRJ-310 rule 2). */
+/** End reason: a retry found the persona's row live, not `pending`, and its session connected (SRJ-310 rule 2). */
 export const TMUX_UNRESPONSIVE_END_RETRY = 'retry'
 
 /**
@@ -918,8 +921,8 @@ export type TmuxUnresponsiveEndReason =
 /** The text each end reason's ended line carries. */
 export const TMUX_UNRESPONSIVE_END_TEXT: Readonly<Record<TmuxUnresponsiveEndReason, string>> = Object.freeze({
   [TMUX_UNRESPONSIVE_END_TMUX_VERB]: 'a tmux-touching call succeeded or answered GONE',
-  [TMUX_UNRESPONSIVE_END_TICK]: 'a health tick found its row live and its session connected with its stream',
-  [TMUX_UNRESPONSIVE_END_RETRY]: 'a retry found its row live and its session connected with its stream',
+  [TMUX_UNRESPONSIVE_END_TICK]: 'a health tick found its row live and its session connected',
+  [TMUX_UNRESPONSIVE_END_RETRY]: 'a retry found its row live and its session connected',
   [TMUX_UNRESPONSIVE_END_LATCHED]: 'the persona latched',
   [TMUX_UNRESPONSIVE_END_LAUNCH_ROW_LIVE]: "after a launch timeout, this launch's row left pending for a live state",
 })

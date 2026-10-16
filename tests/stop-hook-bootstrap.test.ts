@@ -95,9 +95,9 @@ const STOP_HOOK_BOOTSTRAP_SRC = fileURLToPath(new URL('../src/stop-hook-bootstra
 /** The packaged guard, resolved independently of the module under test. */
 const GUARD_PATH = fileURLToPath(new URL('../stop-hooks/slack-reply-guard.sh', import.meta.url))
 
-/** A via-carrying delivered Slack message with no reply: the guard reminds on it. */
+/** A genuine typed Slack message with no reply: the installed guard reminds on it. */
 const NO_REPLY_FIXTURE = fileURLToPath(
-  new URL('./fixtures/slack-reply-guard/mention-no-reply.jsonl', import.meta.url),
+  new URL('./fixtures/slack-reply-guard/typed-user-raw.jsonl', import.meta.url),
 )
 
 // ---------------------------------------------------------------------------

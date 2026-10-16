@@ -491,7 +491,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       // change nothing the server serves.
       ['bringUps', constOf('createPersonaBringUpController')],
       ['connections', constOf('createPersonaConnectionManager')],
-      ['routing', `{ ...${constOf('createPersonaRouting')}, forget: key => { ${constOf('createPersonaRouting')}.forget(key); deliveryPreparation?.forget(key); void deliveryEngines?.forget(key); deliveryLifecycle?.forget(key) } }`],
+      ['routing', `{ ...${constOf('createPersonaRouting')}, forget: key => { ${constOf('createPersonaRouting')}.forget(key); deliveryReporting?.forget(key); deliveryPreparation?.forget(key); void deliveryEngines?.forget(key); deliveryLifecycle?.forget(key) } }`],
       ['destinations', constOf('createPersonaDestinations')],
       ['destinationHold', constOf('createPersonaDestinationHold')],
       ['notifier', notifier],
@@ -1088,8 +1088,13 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
     expect(props().get('getReplySettings')).toBe('getReplySettings')
     // Nothing in server.ts calls it (a value read once and handed on): the
     // only `getReplySettings(` is its declaration.
-    expect(anyCallOf('getReplySettings')).toEqual(indicesOf(/(?<=\bfunction\s+)getReplySettings\s*\(/g, SERVER_CODE))
-    expect(anyCallOf('getReplySettings')).toHaveLength(1)
+    const reads = anyCallOf('getReplySettings')
+    const declaration = indicesOf(/(?<=\bfunction\s+)getReplySettings\s*\(/g, SERVER_CODE)
+    expect(reads).toHaveLength(declaration.length + 1)
+    const reporting = callsOf(SERVER_CODE, 'createDeliveryReporting')[0]!
+    const [open, close] = balancedAfter(SERVER_CODE, reporting, '(', ')')
+    expect(reads.filter(at => at > open && at < close)).toHaveLength(1)
+    expect(anyCallOf('getReplySettings')).toHaveLength(2)
   })
 
   test('getReplySettings, declared once at module scope, is exactly `return replySettingsOf(<applied config holder>)`, with config.ts\'s replySettingsOf', () => {

@@ -23,9 +23,9 @@
  * injected prompt and never triggers the reminder. The reminder states the
  * provenance of the last delivered message from its `via` and `chat_id`.
  *
- *   - SR-6.2 cases 1–7 run on the via-carrying copies of their fixtures; the
- *     fail-open cases, the negative control and the no-real-user-message case
- *     are unchanged.
+ *   - SR-6.2 cases 1–7 run on explicit typed copies of their via-carrying
+ *     fixtures; fail-open inputs remain unchanged. Historical captures keep
+ *     their provenance on disk (see typedFixture).
  *   - The per-`via` block covers the five provenance wordings, the omitted
  *     conversation, an unknown or empty `via`, `via` (not the chat_id prefix)
  *     choosing the wording, the last delivered message winning, how the
@@ -34,7 +34,7 @@
  *   - Every original Slack-wrapper fixture (no `via`) is an injected prompt
  *     and exits 0 under a `true` record, including AC 51's
  *     `injected-no-reply.jsonl`.
- *   - Every via-carrying copy keeps its original's b.wr5 / SR-6.3 result.
+ *   - Each typed via-carrying copy keeps its original's b.wr5 / SR-6.3 result.
  *   - The record-gate block: a positive control and the reminding cases
  *     (`true` plus a newline, a record directory path with a space and a
  *     single quote, a 49-character hashed key), then every no-reminder case
@@ -65,6 +65,10 @@ import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { makeReloadHarness, type ReloadHarness, type ReloadRun } from './test-helpers/reload-harness.ts'
+import {
+  pastedText, promptEntry, queuedCommandEntry, queueOperationEntry, replyEntry,
+  toolResultEntry, writeTranscript, type TranscriptEntry,
+} from './test-helpers/working-row-panes.ts'
 import {
   makeReplyGuardRecordDir,
   RECORD_EMPTY,
@@ -224,9 +228,41 @@ function reminder(via: Via, chatId?: string): string {
   return `${WORDING[via]}${where} ${TAIL}`
 }
 
+// Historical channel-transport captures remain unchanged on disk. Behavioral
+// cases explicitly use synthetic typed copies: replace each channel-origin
+// meta user record with a genuine promptEntry, retaining its message and the
+// sidechain/summary flags. Other records (including replies) are unchanged.
+// This also converts injected cron/interject prompts, so their no-via and
+// turn-boundary coverage exercises typed input instead of being vacuous.
+let typedFixtureDir: string
+beforeEach(() => {
+  typedFixtureDir = mkdtempSync(join(tmpdir(), 'srg-converted-fixtures-'))
+})
+afterEach(() => {
+  rmSync(typedFixtureDir, { recursive: true, force: true })
+})
+
+function typedFixture(fixture: string): string {
+  const path = join(typedFixtureDir, `typed-copy-${fixture}`)
+  if (!existsSync(path)) {
+    const entries = readFileSync(join(FIX, fixture), 'utf8').trim().split('\n').map(line => {
+      const entry = JSON.parse(line)
+      if (entry.type !== 'user' || entry.isMeta !== true || entry.origin?.kind !== 'channel') return entry
+      return {
+        ...promptEntry(),
+        message: entry.message,
+        isSidechain: entry.isSidechain === true,
+        ...(entry.isCompactSummary === undefined ? {} : { isCompactSummary: entry.isCompactSummary }),
+      }
+    })
+    writeTranscript(path, entries)
+  }
+  return path
+}
+
 // ---------------------------------------------------------------------------
-// Runtime-derived transcripts. Each copy is the source fixture with its FIRST
-// opening <channel …> tag edited as listed and nothing else; the tag is
+// Runtime-derived typed transcripts. Each starts with typedFixture(source),
+// then edits only its FIRST opening <channel …> tag as listed; the tag is
 // unescaped from JSON (\" → "), edited, and re-escaped. Every requested edit
 // must hit, so a derived case can never pass vacuously on an unedited tag.
 //   author — `user_id="U0TESTAUTHOR"` or `bot_id="B0TESTAUTHOR"` inserted right
@@ -248,8 +284,8 @@ function editOnce(tag: string, re: RegExp, to: (m: string) => string): string {
   return tag.replace(re, to)
 }
 
-function deriveTranscript(dir: string, fixture: string, edit: TagEdit): string {
-  const raw = readFileSync(join(FIX, fixture), 'utf-8')
+function deriveTypedTranscript(dir: string, fixture: string, edit: TagEdit): string {
+  const raw = readFileSync(typedFixture(fixture), 'utf-8')
   const derived = raw.replace(/<channel [^>]*>/, (escaped) => {
     let tag = escaped.replaceAll('\\"', '"')
     if (edit.author) {
@@ -280,7 +316,7 @@ describe('slack-reply-guard.sh — SR-6.2 exit-code contract', () => {
     ['case 3', 'non-slack.jsonl', 'non-Slack latest user msg'],
     ['case 7b', 'via-slack-then-sidechain-with-reply.jsonl', 'trailing sidechain entries + reply present'],
   ])('SR-6.2 %s: %s (%s) → exit 0, no output', (_case, fixture) => {
-    const r = runGuard(harness(join(FIX, fixture)))
+    const r = runGuard(harness(typedFixture(fixture)))
     expect(r.exitCode).toBe(0)
     expect(r.stderr).toBe('')
     expect(r.stdout).toBe('')
@@ -301,7 +337,7 @@ describe('slack-reply-guard.sh — SR-6.2 exit-code contract', () => {
       reminder('receive_all_shared', 'C777'),
     ],
   ])('SR-6.2 %s: %s (%s) → exit 2, stderr is the via wording naming the tool', (_case, fixture, _label, line) => {
-    const r = runGuard(harness(join(FIX, fixture)))
+    const r = runGuard(harness(typedFixture(fixture)))
     expect(r.exitCode).toBe(2)
     expect(r.stderr).toBe(`${line}\n`)
     expect(r.stderr).toContain(REPLY_TOOL)
@@ -309,7 +345,7 @@ describe('slack-reply-guard.sh — SR-6.2 exit-code contract', () => {
 
   test('SR-6.2 case 4: stop_hook_active=true on a delivered no-reply transcript (via-slack-no-reply.jsonl) under a true record → exit 0; the same run with stop_hook_active=false (control) → exit 2', () => {
     withTrueRecord((setup) => {
-      const transcript = join(FIX, 'via-slack-no-reply.jsonl')
+      const transcript = typedFixture('via-slack-no-reply.jsonl')
       const r = spawnGuard(harness(transcript, true), setup)
       expect(r.exitCode).toBe(0)
       expect(r.stderr).toBe('')
@@ -386,7 +422,7 @@ describe('slack-reply-guard.sh — SR-6.2 exit-code contract', () => {
     test('jq missing from PATH on a delivered no-reply transcript (via-slack-no-reply.jsonl) under a true record → exit 0 with the one-line missing-jq warning; the same run with the guard tools (jq included) on PATH (control) → exit 2', () => {
       withNoJqPath((shimDir) =>
         withTrueRecord((setup) => {
-          const input = harness(join(FIX, 'via-slack-no-reply.jsonl'))
+          const input = harness(typedFixture('via-slack-no-reply.jsonl'))
           // The restricted PATH carries the same record, argument and
           // explicit CSCB_PERSONA as the control.
           const r = spawnGuard(input, { ...setup, shimDir })
@@ -439,11 +475,181 @@ describe('slack-reply-guard.sh — additional fixtures', () => {
   test.each([
     ['negative-control-server-name.jsonl', 'negative control: string "slack-channel-router" without <channel source="slack'],
     ['no-real-user-message.jsonl', 'no real user message anywhere (assistant + tool_result + sidechain only)'],
-    ['via-verbatim-live-with-reply.jsonl', 'SR-6.3: verbatim live transcript (source="slack-channel-router", via="receive_all") + reply present'],
+    ['via-verbatim-live-with-reply.jsonl', 'SR-6.3: typed copy of live transcript content (source="slack-channel-router", via="receive_all") + reply present'],
   ])('%s (%s) → exit 0, silent', (fixture) => {
-    const r = runGuard(harness(join(FIX, fixture)))
+    const r = runGuard(harness(typedFixture(fixture)))
     expect(r.exitCode).toBe(0)
     expect(r.stderr).toBe('')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.omv SR-10: synthetic typed transcripts built with working-row-panes.
+// Whole paste holds the tag; mixed paste keeps the envelope plain and wraps
+// its body. queued_command follows an assistant record to prove mid-turn
+// take-in, rather than relying on consecutive user records.
+// ---------------------------------------------------------------------------
+
+const TYPED_DM = JSON.parse(readFileSync(join(FIX, 'typed-user-raw.jsonl'), 'utf8').split('\n')[0]!).message.content as string
+
+/** The other paste shape: the envelope stays plain and only its body is pasted. */
+function mixedPaste(text: string): string {
+  return text.replace(/\n([\s\S]*)\n<\/channel>$/, (_match, body) => `\n${pastedText(body)}\n</channel>`)
+}
+
+function runTypedTranscript(entries: TranscriptEntry[]): RunResult {
+  const dir = mkdtempSync(join(tmpdir(), 'srg-typed-'))
+  try {
+    const path = join(dir, 'transcript.jsonl')
+    writeTranscript(path, entries)
+    return runGuard(harness(path))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+function quotedTakeIns(text: string): [string, TranscriptEntry][] {
+  return [
+    ['quoted text', promptEntry(`The earlier message said:\n${text}`)],
+    ['assistant text', { ...replyEntry(), message: { role: 'assistant', content: [{ type: 'text', text }] } }],
+    ['sidechain user', { ...promptEntry(text), isSidechain: true }],
+    ['meta user', { ...promptEntry(text), isMeta: true }],
+    ['agent-origin user', { ...promptEntry(text), origin: { kind: 'agent' } }],
+    ['channel-origin user', { ...promptEntry(text), origin: { kind: 'channel' } }],
+    ['compaction summary', { ...promptEntry(text), isCompactSummary: true }],
+    ['tool result', { ...toolResultEntry(), message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_01', content: text }] } }],
+    ['enqueue only', queueOperationEntry('enqueue', text)],
+    ['pop only', queueOperationEntry('pop', text)],
+    ['remove only', queueOperationEntry('remove', text)],
+    ['injected user without via', promptEntry(text.replace(' via="dm"', ''))],
+    ['injected queued command without via', queuedCommandEntry(text.replace(' via="dm"', ''))],
+    ['sidechain queued command', queuedCommandEntry(text, { isSidechain: true })],
+    ['summary queued command', queuedCommandEntry(text, { isCompactSummary: true })],
+    ['meta queued command', queuedCommandEntry(text, { isMeta: true })],
+    ['agent-origin queued command', queuedCommandEntry(text, { origin: { kind: 'agent' } })],
+    ['agent-origin attachment', queuedCommandEntry(text, { attachment: { type: 'queued_command', prompt: text, origin: { kind: 'agent' } } })],
+  ]
+}
+
+describe('slack-reply-guard.sh — typed take-ins and repeats (b.omv SR-10)', () => {
+  test.each([
+    'typed-user-raw.jsonl', 'typed-user-whole.jsonl', 'typed-user-mixed.jsonl',
+    'typed-queued-raw.jsonl', 'typed-queued-whole.jsonl', 'typed-queued-mixed.jsonl',
+  ])('%s reminds once; stop_hook_active suppresses the retry', fixture => {
+    withTrueRecord(setup => {
+      const path = join(FIX, fixture)
+      expect(spawnGuard(harness(path), setup)).toEqual({ exitCode: 2, stdout: '', stderr: `${reminder('dm', 'D0TYPED')}\n` })
+      expect(spawnGuard(harness(path, true), setup)).toEqual({ exitCode: 0, stdout: '', stderr: '' })
+    })
+  })
+
+  test.each(['raw', 'whole', 'mixed'])('user text blocks retain the %s take-in', form => {
+    const entry = JSON.parse(readFileSync(join(FIX, `typed-user-${form}.jsonl`), 'utf8').split('\n')[0]!)
+    entry.message.content = [{ type: 'text', text: entry.message.content }]
+    const r = runTypedTranscript([entry, replyEntry()])
+    expect(r).toEqual({ exitCode: 2, stdout: '', stderr: `${reminder('dm', 'D0TYPED')}\n` })
+  })
+
+  test.each([
+    ['raw user', (text: string) => promptEntry(text)],
+    ['whole-paste user', (text: string) => promptEntry(pastedText(text))],
+    ['mixed-paste user', (text: string) => promptEntry(mixedPaste(text))],
+    ['raw queued command', (text: string) => queuedCommandEntry(text)],
+    ['whole-paste queued command', (text: string) => queuedCommandEntry(pastedText(text))],
+    ['mixed-paste queued command', (text: string) => queuedCommandEntry(mixedPaste(text))],
+  ] as const)('%s with a later reply tool call is quiet; without via it is quiet too', (_label, takeIn) => {
+    const reply = { ...replyEntry(), message: { role: 'assistant', content: [{ type: 'tool_use', id: 'reply', name: REPLY_TOOL, input: {} }] } }
+    expect(runTypedTranscript([promptEntry('Start the turn.'), takeIn(TYPED_DM), reply])).toEqual({ exitCode: 0, stdout: '', stderr: '' })
+    expect(runTypedTranscript([promptEntry('Start the turn.'), takeIn(TYPED_DM.replace(' via="dm"', '')), replyEntry()])).toEqual({ exitCode: 0, stdout: '', stderr: '' })
+  })
+
+  test('a reply before a mid-turn queued take-in cannot satisfy that later message', () => {
+    const reply = { ...replyEntry(), message: { role: 'assistant', content: [{ type: 'tool_use', id: 'reply', name: REPLY_TOOL, input: {} }] } }
+    const r = runTypedTranscript([promptEntry('Start locally.'), reply, queuedCommandEntry(pastedText(TYPED_DM)), replyEntry()])
+    expect(r).toEqual({ exitCode: 2, stdout: '', stderr: `${reminder('dm', 'D0TYPED')}\n` })
+  })
+
+  test.each<[string, TranscriptEntry]>([
+    ['raw user', promptEntry(TYPED_DM)],
+    ['whole-paste user', promptEntry(pastedText(TYPED_DM))],
+    ['mixed-paste user', promptEntry(mixedPaste(TYPED_DM))],
+    ['queued command', queuedCommandEntry(TYPED_DM)],
+    ['whole-paste queued command', queuedCommandEntry(pastedText(TYPED_DM))],
+    ['mixed-paste queued command', queuedCommandEntry(mixedPaste(TYPED_DM))],
+    ['part absent versus empty', promptEntry(TYPED_DM.replace(' via=', ' part="" via='))],
+    ['message_id is not identity', promptEntry(TYPED_DM.replace('message_id="1789840421.151669"', 'message_id="different"'))],
+  ])('%s repeating an earlier taken-in chat_id/ts/part never starts a reminder', (_label, repeat) => {
+    const r = runTypedTranscript([promptEntry(pastedText(TYPED_DM)), replyEntry(), promptEntry('Continue locally.'), repeat, replyEntry()])
+    expect(r).toEqual({ exitCode: 0, stdout: '', stderr: '' })
+  })
+
+  test.each([
+    ['raw user', (text: string) => promptEntry(text)],
+    ['whole-paste user', (text: string) => promptEntry(pastedText(text))],
+    ['mixed-paste user', (text: string) => promptEntry(mixedPaste(text))],
+    ['raw queued command', (text: string) => queuedCommandEntry(text)],
+    ['whole-paste queued command', (text: string) => queuedCommandEntry(pastedText(text))],
+    ['mixed-paste queued command', (text: string) => queuedCommandEntry(mixedPaste(text))],
+  ] as const)('a multipart identity previously taken in as a %s is suppressed; a distinct part reminds', (_label, takeIn) => {
+    const part = TYPED_DM.replace(' via=', ' part="1/2" via=')
+    const earlier = [promptEntry('Start locally.'), takeIn(part), replyEntry(), promptEntry('Continue locally.')]
+    expect(runTypedTranscript([...earlier, takeIn(part), replyEntry()])).toEqual({ exitCode: 0, stdout: '', stderr: '' })
+    expect(runTypedTranscript([...earlier, takeIn(part.replace('part="1/2"', 'part="2/2"')), replyEntry()])).toEqual({ exitCode: 2, stdout: '', stderr: `${reminder('dm', 'D0TYPED')}\n` })
+  })
+
+  test.each([
+    ['distinct part', TYPED_DM.replace(' via=', ' part="2/2" via='), 'D0TYPED'],
+    ['distinct timestamp', TYPED_DM.replaceAll('1789840421.151669', '1789840422.151669').replace(' via=', ' part="1/2" via='), 'D0TYPED'],
+    ['distinct conversation', TYPED_DM.replace('D0TYPED', 'D0OTHER').replace(' via=', ' part="1/2" via='), 'D0OTHER'],
+  ])('%s remains a fresh take-in', (_label, text, chatId) => {
+    const prior = TYPED_DM.replace(' via=', ' part="1/2" via=')
+    const r = runTypedTranscript([promptEntry(prior), replyEntry(), promptEntry('Continue locally.'), queuedCommandEntry(pastedText(text)), replyEntry()])
+    expect(r).toEqual({ exitCode: 2, stdout: '', stderr: `${reminder('dm', chatId)}\n` })
+  })
+
+  test('a repeated latest tag cannot override the last fresh take-in provenance', () => {
+    const fresh = TYPED_DM.replace('D0TYPED', 'C0FRESH').replace('via="dm"', 'via="mention"')
+    const r = runTypedTranscript([promptEntry(TYPED_DM), replyEntry(), promptEntry(fresh), queuedCommandEntry(pastedText(TYPED_DM)), replyEntry()])
+    expect(r).toEqual({ exitCode: 2, stdout: '', stderr: `${reminder('mention', 'C0FRESH')}\n` })
+  })
+
+  test('a duplicate in the same turn leaves one reminder for its first take-in', () => {
+    const r = runTypedTranscript([promptEntry(TYPED_DM), replyEntry(null), queuedCommandEntry(pastedText(TYPED_DM)), replyEntry()])
+    expect(r).toEqual({ exitCode: 2, stdout: '', stderr: `${reminder('dm', 'D0TYPED')}\n` })
+  })
+
+  test.each([
+    ['raw', TYPED_DM], ['whole paste', pastedText(TYPED_DM)], ['mixed paste', mixedPaste(TYPED_DM)],
+  ])('a %s queued attachment before any real user cannot consume the first genuine take-in identity', (_label, text) => {
+    const r = runTypedTranscript([queuedCommandEntry(text), promptEntry(TYPED_DM), replyEntry()])
+    expect(r).toEqual({ exitCode: 2, stdout: '', stderr: `${reminder('dm', 'D0TYPED')}\n` })
+  })
+
+  test('a genuine user with explicit human origin reminds', () => {
+    expect(runTypedTranscript([{ ...promptEntry(TYPED_DM), origin: { kind: 'human' } }, replyEntry()]))
+      .toEqual({ exitCode: 2, stdout: '', stderr: `${reminder('dm', 'D0TYPED')}\n` })
+  })
+
+  test('the historical channel meta capture is silent; its explicitly typed copy reminds', () => {
+    const fixture = 'via-verbatim-live-no-reply.jsonl'
+    expect(runGuard(harness(join(FIX, fixture)))).toEqual({ exitCode: 0, stdout: '', stderr: '' })
+    expect(runGuard(harness(typedFixture(fixture))))
+      .toEqual({ exitCode: 2, stdout: '', stderr: `${reminder('receive_all', 'C0B1ZJJLJ9M')}\n` })
+  })
+
+  test.each(quotedTakeIns(pastedText(TYPED_DM)))('%s neither triggers nor consumes a later genuine identity', (_label, entry) => {
+    expect(runTypedTranscript([promptEntry('Work locally.'), entry, replyEntry()])).toEqual({ exitCode: 0, stdout: '', stderr: '' })
+    expect(runTypedTranscript([promptEntry('Work locally.'), entry, replyEntry(), promptEntry(TYPED_DM), replyEntry()])).toEqual({ exitCode: 2, stdout: '', stderr: `${reminder('dm', 'D0TYPED')}\n` })
+  })
+
+  test.each([
+    ['queued command before the first user', [queuedCommandEntry(TYPED_DM), promptEntry('Work locally.'), replyEntry()]],
+    ['queued command without a real user', [queuedCommandEntry(pastedText(TYPED_DM)), replyEntry()]],
+    ['quoted paste with trailing prose', [promptEntry(`${pastedText(TYPED_DM)}\nThis is only a quotation.`), replyEntry()]],
+    ['two tags in one paste', [promptEntry(pastedText(`${TYPED_DM}\n${TYPED_DM}`)), replyEntry()]],
+    ['mismatched paste IDs', [promptEntry(pastedText(TYPED_DM).replace('</pasted_content id="abcd">', '</pasted_content id="ffff">')), replyEntry()]],
+  ] as const)('%s is silent', (_label, entries) => {
+    expect(runTypedTranscript([...entries])).toEqual({ exitCode: 0, stdout: '', stderr: '' })
   })
 })
 
@@ -453,10 +659,10 @@ describe('slack-reply-guard.sh — additional fixtures', () => {
 // trigger run. Per-`via` fixtures are checked in (provenance below); the other
 // cases derive temp transcripts from verbatim-live-no-reply.jsonl (or, for the
 // retired b.ob2 E4 rows and the non-Slack envelope case, the fixture named in
-// the test) with deriveTranscript.
+// the test) with deriveTypedTranscript, after the explicit typedFixture conversion.
 // ---------------------------------------------------------------------------
 
-describe('slack-reply-guard.sh — via detection and provenance wordings (b.ob2 SR-9.4)', () => {
+describe('slack-reply-guard.sh — typed fixture copies: via detection and provenance wordings (b.ob2 SR-9.4)', () => {
   let tmp: string
   beforeEach(() => {
     tmp = mkdtempSync(join(tmpdir(), 'srg-via-'))
@@ -472,11 +678,11 @@ describe('slack-reply-guard.sh — via detection and provenance wordings (b.ob2 
     ['receive-all-shared-no-reply.jsonl', 'receive_all_shared', 'C0B1ZJJLJ9M'],
     ['receive-all-no-reply.jsonl', 'receive_all', 'C0B1ZJJLJ9M'],
   ] as const)('per-via fixture %s (via=%s) → exit 2 once, stderr is its wording naming %s; the stop_hook_active retry exits 0 silently', (fixture, via, chatId) => {
-    const r = runGuard(harness(join(FIX, fixture)))
+    const r = runGuard(harness(typedFixture(fixture)))
     expect(r.exitCode).toBe(2)
     expect(r.stderr).toBe(`${reminder(via, chatId)}\n`)
     // SR-14: reminded once — the harness's retry (stop_hook_active=true) passes.
-    const retry = runGuard(harness(join(FIX, fixture), true))
+    const retry = runGuard(harness(typedFixture(fixture), true))
     expect(retry.exitCode).toBe(0)
     expect(retry.stderr).toBe('')
     expect(retry.stdout).toBe('')
@@ -498,7 +704,7 @@ describe('slack-reply-guard.sh — via detection and provenance wordings (b.ob2 
     const fixtures = ['dm', 'mention', 'broadcast', 'receive-all-shared', 'receive-all'].map((v) => `${v}-no-reply.jsonl`)
     // Each fixture's stderr with the " (channel|conversation <id>)" part cut out.
     const wordings = fixtures.map((f) =>
-      runGuard(harness(join(FIX, f))).stderr.replace(/ \((?:channel|conversation) [A-Z0-9]+\)/, ''),
+      runGuard(harness(typedFixture(f))).stderr.replace(/ \((?:channel|conversation) [A-Z0-9]+\)/, ''),
     )
     expect(new Set(wordings).size).toBe(5)
     expect(wordings).not.toContain(`${B_WR5_CHANNEL_NO_ID}\n`)
@@ -513,7 +719,7 @@ describe('slack-reply-guard.sh — via detection and provenance wordings (b.ob2 
     ['dm', 'c0b1zjjlj9m'] as const,
     ['dm', ''] as const,
   ])('via=%s with chat_id %p → exit 2, wording omits the conversation', (via, chatId) => {
-    const p = deriveTranscript(tmp, 'verbatim-live-no-reply.jsonl', { chatId, attrs: ` via="${via}"` })
+    const p = deriveTypedTranscript(tmp, 'verbatim-live-no-reply.jsonl', { chatId, attrs: ` via="${via}"` })
     const r = runGuard(harness(p))
     expect(r.exitCode).toBe(2)
     expect(r.stderr).toBe(`${reminder(via)}\n`)
@@ -527,7 +733,7 @@ describe('slack-reply-guard.sh — via detection and provenance wordings (b.ob2 
     ['DM', 'D0B1ZJJLJ9M', `This turn started from a Slack channel message (channel D0B1ZJJLJ9M) ${TAIL}`],
     ['receive_all ', 'C0B1ZJJLJ9M', B_WR5_CHANNEL],
   ] as const)('unknown via=%p with chat_id %p → exit 2 with b.wr5\'s channel wording, raw via never echoed', (via, chatId, line) => {
-    const p = deriveTranscript(tmp, 'verbatim-live-no-reply.jsonl', { chatId, attrs: ` via="${via}"` })
+    const p = deriveTypedTranscript(tmp, 'verbatim-live-no-reply.jsonl', { chatId, attrs: ` via="${via}"` })
     const r = runGuard(harness(p))
     expect(r.exitCode).toBe(2)
     expect(r.stderr).toBe(`${line}\n`)
@@ -539,20 +745,20 @@ describe('slack-reply-guard.sh — via detection and provenance wordings (b.ob2 
     ['mention', 'D0B1ZJJLJ9M', 'a D-prefixed chat_id does not make a mention a DM'],
     ['receive_all', 'D0B1ZJJLJ9M', 'a D-prefixed chat_id does not make a receive_all message a DM'],
   ] as const)('via selects the wording: via=%s with chat_id %s → %s', (via, chatId) => {
-    const p = deriveTranscript(tmp, 'verbatim-live-no-reply.jsonl', { chatId, attrs: ` via="${via}"` })
+    const p = deriveTypedTranscript(tmp, 'verbatim-live-no-reply.jsonl', { chatId, attrs: ` via="${via}"` })
     const r = runGuard(harness(p))
     expect(r.exitCode).toBe(2)
     expect(r.stderr).toBe(`${reminder(via, chatId)}\n`)
   })
 
   test('last delivered message wins: dm-then-mention-no-reply.jsonl (DM then mention, no reply) → exit 2 with the mention wording', () => {
-    const r = runGuard(harness(join(FIX, 'dm-then-mention-no-reply.jsonl')))
+    const r = runGuard(harness(typedFixture('dm-then-mention-no-reply.jsonl')))
     expect(r.exitCode).toBe(2)
     expect(r.stderr).toBe(`${reminder('mention', 'C0B1ZJJLJ9M')}\n`)
   })
 
   test('via replaces b.wr5\'s cscb-cron:/ts test: cron-shape-with-via-no-reply.jsonl (cscb-cron: user, 3-decimal ts, via) → exit 2', () => {
-    const r = runGuard(harness(join(FIX, 'cron-shape-with-via-no-reply.jsonl')))
+    const r = runGuard(harness(typedFixture('cron-shape-with-via-no-reply.jsonl')))
     expect(r.exitCode).toBe(2)
     expect(r.stderr).toBe(`${reminder('receive_all', 'C0B1ZJJLJ9M')}\n`)
   })
@@ -564,13 +770,13 @@ describe('slack-reply-guard.sh — via detection and provenance wordings (b.ob2 
     ['x_via="dm" and no via', { attrs: ' x_via="dm"' }],
     ['sender label user="Operator via=" and no via', { user: 'Operator via=' }],
   ] as const)('attribute parsing: %s → exit 0, silent (no via attribute)', (_label, edit) => {
-    const r = runGuard(harness(deriveTranscript(tmp, 'verbatim-live-no-reply.jsonl', edit)))
+    const r = runGuard(harness(deriveTypedTranscript(tmp, 'verbatim-live-no-reply.jsonl', edit)))
     expect(r.exitCode).toBe(0)
     expect(r.stderr).toBe('')
   })
 
   test('attribute parsing: a real via after a sender label containing " via=" is still read → exit 2 with its wording', () => {
-    const p = deriveTranscript(tmp, 'verbatim-live-no-reply.jsonl', { user: 'Operator via=', attrs: ' via="broadcast"' })
+    const p = deriveTypedTranscript(tmp, 'verbatim-live-no-reply.jsonl', { user: 'Operator via=', attrs: ' via="broadcast"' })
     const r = runGuard(harness(p))
     expect(r.exitCode).toBe(2)
     expect(r.stderr).toBe(`${reminder('broadcast', 'C0B1ZJJLJ9M')}\n`)
@@ -605,7 +811,7 @@ describe('slack-reply-guard.sh — via detection and provenance wordings (b.ob2 
     ],
     ['verbatim-live-with-reply.jsonl', 'user_id', 'mention', 'exit 0, silent (reply present)', 0, ''],
   ] as const)('%s with %s and via=%s → %s', (fixture, author, via, _outcome, exitCode, stderr) => {
-    const r = runGuard(harness(deriveTranscript(tmp, fixture, { author, attrs: ` via="${via}"` })))
+    const r = runGuard(harness(deriveTypedTranscript(tmp, fixture, { author, attrs: ` via="${via}"` })))
     expect(r.exitCode).toBe(exitCode)
     expect(r.stderr).toBe(stderr)
   })
@@ -614,7 +820,7 @@ describe('slack-reply-guard.sh — via detection and provenance wordings (b.ob2 
   // `source="slack…"` envelope can be a delivered message. A telegram envelope carrying `via` (its body quoting a
   // via-less Slack wrapper) is not Slack, so it never triggers the reminder.
   test('non-Slack envelope carrying via: telegram-quoting-slack-wrapper-no-reply.jsonl with via="mention" on the telegram tag → exit 0, silent', () => {
-    const p = deriveTranscript(tmp, 'telegram-quoting-slack-wrapper-no-reply.jsonl', { attrs: ' via="mention"' })
+    const p = deriveTypedTranscript(tmp, 'telegram-quoting-slack-wrapper-no-reply.jsonl', { attrs: ' via="mention"' })
     expect(readFileSync(p, 'utf-8')).toContain('<channel source=\\"telegram\\" chat_id=\\"C0B1ZJJLJ9M\\" message_id=\\"1789840421.151669\\" user=\\"Operator\\" ts=\\"1789840421.151669\\" via=\\"mention\\">')
     const r = runGuard(harness(p))
     expect(r.exitCode).toBe(0)
@@ -749,9 +955,9 @@ describe('slack-reply-guard.sh — via detection and provenance wordings (b.ob2 
 //   telegram-quoting-slack-wrapper-no-reply    receive_all_shared   the quoted Slack wrapper only
 //   cron-quoting-slack-wrapper-no-reply        mention              the quoted Slack wrapper only
 //
-// RUNTIME-DERIVED transcripts (deriveTranscript, written to the describe
+// RUNTIME-DERIVED transcripts (deriveTypedTranscript, written to the describe
 // block's mkdtempSync directory and removed after each test, never checked
-// in). Each is the named source with its first opening tag edited as follows:
+// in). Each starts from typedFixture(source), then edits its first opening tag:
 //   - omitted conversation: verbatim-live-no-reply.jsonl + ` via="<v>"` after
 //     `ts`, with chat_id removed or its value set to "-1001234567890" (every
 //     v), or set to "c0b1zjjlj9m" or "" (v = "dm" only).
@@ -779,13 +985,13 @@ describe('slack-reply-guard.sh — injected prompts (no via) never trigger the r
   test('AC 51: injected-no-reply.jsonl (scheduled prompt, user and ts only, asks for no reply) under a true record, the record directory argument and CSCB_PERSONA → exit 0, silent', () => {
     withTrueRecord((setup, rec) => {
       expect(rec.readRecord(TEST_KEY)).toBe(RECORD_TRUE)
-      const r = spawnGuard(harness(join(FIX, 'injected-no-reply.jsonl')), setup)
+      const r = spawnGuard(harness(typedFixture('injected-no-reply.jsonl')), setup)
       expect(r.exitCode).toBe(0)
       expect(r.stderr).toBe('')
       expect(r.stdout).toBe('')
       // Control: the same setup reminds for a delivered message, so the exit 0
       // above is the injected prompt's, not the record gate's.
-      const control = spawnGuard(harness(join(FIX, 'mention-no-reply.jsonl')), setup)
+      const control = spawnGuard(harness(typedFixture('mention-no-reply.jsonl')), setup)
       expect(control.exitCode).toBe(2)
       expect(control.stderr).toBe(`${reminder('mention', 'C0B1ZJJLJ9M')}\n`)
     })
@@ -820,18 +1026,18 @@ describe('slack-reply-guard.sh — injected prompts (no via) never trigger the r
     ['slack-then-sidechain-with-reply.jsonl', 'SR-6.2 case 7b original — no via (reply also present)'],
     ['verbatim-live-with-reply.jsonl', 'SR-6.3 original — no via (reply also present)'],
   ])('%s (%s) → exit 0, silent', (fixture) => {
-    const r = runGuard(harness(join(FIX, fixture)))
+    const r = runGuard(harness(typedFixture(fixture)))
     expect(r.exitCode).toBe(0)
     expect(r.stderr).toBe('')
   })
 })
 
 // ---------------------------------------------------------------------------
-// b.wr5 cases on their via-carrying copies: each copy keeps its original's
-// b.wr5 result, and exit-2 copies get the wording of their via.
+// b.wr5 cases on explicit typed copies of the via-carrying fixtures: the
+// content keeps its b.wr5 result, and exit-2 copies get the wording of their via.
 // ---------------------------------------------------------------------------
 
-describe('slack-reply-guard.sh — b.wr5 cases on via-carrying copies', () => {
+describe('slack-reply-guard.sh — b.wr5 behavior on typed via-carrying copies', () => {
   test.each([
     ['via-channel-assistant-then-cron-no-reply.jsonl', 'unreplied delivered message, assistant entry, then cron — the assistant entry ends the run'],
     ['via-cron-quoting-slack-wrapper-no-reply.jsonl', 'cron envelope quoting a via-carrying Slack wrapper — only the envelope at the start counts'],
@@ -839,13 +1045,13 @@ describe('slack-reply-guard.sh — b.wr5 cases on via-carrying copies', () => {
     ['via-telegram-quoting-slack-wrapper-no-reply.jsonl', 'non-Slack envelope whose body quotes a via-carrying Slack wrapper'],
     ['via-verbatim-compact-summary-after-reply.jsonl', 'replied delivered message, then a compaction summary quoting a via-carrying wrapper'],
   ])('no reminder: %s (%s) → exit 0, silent', (fixture) => {
-    const r = runGuard(harness(join(FIX, fixture)))
+    const r = runGuard(harness(typedFixture(fixture)))
     expect(r.exitCode).toBe(0)
     expect(r.stderr).toBe('')
   })
 
   test.each([
-    ['via-verbatim-live-no-reply.jsonl', 'SR-6.3 verbatim channel message', `${reminder('receive_all', 'C0B1ZJJLJ9M')}\n`],
+    ['via-verbatim-live-no-reply.jsonl', 'SR-6.3 typed copy of captured channel content', `${reminder('receive_all', 'C0B1ZJJLJ9M')}\n`],
     ['via-dm-from-live-no-reply.jsonl', 'direct message — b.wr5\'s DM text byte for byte', `${B_WR5_DM}\n`],
     ['via-slack-no-chat-id-no-reply.jsonl', 'wrapper without chat_id — wording omits the conversation', `${reminder('mention')}\n`],
     ['via-channel-then-cron-no-reply.jsonl', 'delivered message then cron back to back — cron does not hide it', `${reminder('receive_all', 'C0B1ZJJLJ9M')}\n`],
@@ -856,14 +1062,14 @@ describe('slack-reply-guard.sh — b.wr5 cases on via-carrying copies', () => {
       `${reminder('receive_all', 'C0B1ZJJLJ9M')}\n`,
     ],
   ])('delivered Slack message, no reply: %s (%s) → exit 2 with the declinable reminder', (fixture, _label, stderr) => {
-    const r = runGuard(harness(join(FIX, fixture)))
+    const r = runGuard(harness(typedFixture(fixture)))
     expect(r.exitCode).toBe(2)
     expect(r.stderr).toBe(stderr)
   })
 
   test('b.wr5 retry with stop_hook_active=true: via-verbatim-live-no-reply.jsonl under a true record → exit 0, silent (reminder shown once); the same run with stop_hook_active=false (control) → exit 2', () => {
     withTrueRecord((setup) => {
-      const transcript = join(FIX, 'via-verbatim-live-no-reply.jsonl')
+      const transcript = typedFixture('via-verbatim-live-no-reply.jsonl')
       const r = spawnGuard(harness(transcript, true), setup)
       expect(r.exitCode).toBe(0)
       expect(r.stderr).toBe('')
@@ -916,7 +1122,7 @@ function runGateCase(c: GateCase, opts: { shimDir?: string } = {}): RunResult {
   try {
     c.prepare?.(rec)
     const setup = c.setup?.(rec) ?? defaultSetup(rec)
-    return spawnGuard(harness(join(FIX, GATE_FIXTURE)), { ...setup, shimDir: opts.shimDir ?? setup.shimDir })
+    return spawnGuard(harness(typedFixture(GATE_FIXTURE)), { ...setup, shimDir: opts.shimDir ?? setup.shimDir })
   } finally {
     if (saved === undefined) delete process.env.CSCB_PERSONA
     else process.env.CSCB_PERSONA = saved
@@ -1119,7 +1325,7 @@ describe('slack-reply-guard.sh — AC 59: records left by a confirmed reload (b.
 
   /** The real guard for `persona` over the harness's record directory. */
   function guardFor(persona: PersonaInput): RunResult {
-    const r = spawnGuard(harness(join(FIX, GATE_FIXTURE)), { args: [h.replyGuardDir], persona: h.key(persona.name) })
+    const r = spawnGuard(harness(typedFixture(GATE_FIXTURE)), { args: [h.replyGuardDir], persona: h.key(persona.name) })
     guardRuns.push(r)
     return r
   }

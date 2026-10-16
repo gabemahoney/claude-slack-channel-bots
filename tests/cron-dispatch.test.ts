@@ -3,6 +3,9 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createDeliveryPreparation } from '../src/delivery-intake.ts'
+import { MESSAGE_RECEIVED, buildDeliveryDiagnostic, deliveryIdentity } from '../src/delivery-notices.ts'
+import { renderPersonaRef } from '../src/persona-identity.ts'
 import { createCronDispatcher, resolvePromptPath } from '../src/cron-dispatch.ts'
 import { createCronLog } from '../src/cron-log.ts'
 import { INTERJECT_BODY_CAP_BYTES } from '../src/interject.ts'
@@ -65,4 +68,27 @@ test('relative prompt paths anchor to crontable directory and preserve bytes', a
 })
 test('target resolution reads configuration anew at fire time', async () => {
   const path = prompt(); config = makeMultiPersonaConfig([{ name: 'reviewer' }], dir); await fire(schedule(path)); expect(attempts).toEqual(['reviewer']); expect(lines()[0]!.outcome).toBe('unknown-persona'); expect(texts('reviewer')).toEqual(['prompt'])
+})
+
+// b.omv SR-8.6: every scheduled fire reports independently after its outcome.
+test('each repeated cron fire reports received only after queued is logged', async () => {
+  const diagnostics: string[] = []
+  const preparation = createDeliveryPreparation({ queue, clock, clientFor: () => undefined, resolveUserName: async () => '',
+    onReceived: (key, item) => {
+      expect(lines().filter(line => line.outcome === 'queued')).toHaveLength(2)
+      diagnostics.push(buildDeliveryDiagnostic(MESSAGE_RECEIVED, renderPersonaRef('reviewer', key), deliveryIdentity(item.accepted)))
+    },
+  })
+  const dispatch = createCronDispatcher({ accept: preparation.accept, now: clock.now, cronTablePath: join(dir, 'crontab'), resolveTarget: target => resolvePersonaTarget(config, target)?.key, cronLog: createCronLog(join(dir, 'cron.log')) })
+  try {
+    const s = schedule(prompt('private cron body'), ['reviewer'])
+    await dispatch.fire(s); await dispatch.fire(s)
+    expect(diagnostics).toEqual([])
+    await clock.advance(1)
+    expect(diagnostics).toEqual(queue.items('reviewer').map(item => buildDeliveryDiagnostic(MESSAGE_RECEIVED, renderPersonaRef('reviewer', 'reviewer'), deliveryIdentity(item.accepted))))
+    expect(diagnostics).toHaveLength(2)
+    expect(JSON.stringify(diagnostics)).not.toContain('private cron body')
+    expect(queue.items(config.personas[0]!.key)).toEqual([])
+    assertNoLeak(diagnostics)
+  } finally { await preparation.stop() }
 })

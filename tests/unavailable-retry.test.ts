@@ -9612,7 +9612,6 @@ async function tickOver(h: RecoveryHarness, key: string): Promise<string[]> {
     now: () => h.clock.now(),
     isSessionAlive: async () => LIVENESS_READING_DEAD,
     isSessionConnected: () => false,
-    hasSessionStream: () => false,
     isRestartPendingOrActive: () => false,
     isLaunchInFlight: (k) => personaRetryBlockCause(k) !== undefined || isDialogApproverRunning(k),
     isAtCap: () => false,

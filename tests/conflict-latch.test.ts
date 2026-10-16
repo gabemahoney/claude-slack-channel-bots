@@ -2811,7 +2811,6 @@ async function runHealthTick({ h, killRow }: AutomatedPathsRun): Promise<{ sched
   initHealthCheck({
     isSessionAlive: _buildIsSessionAliveAdapter(() => h.config),
     isSessionConnected: () => false,
-    hasSessionStream: () => false,
     isRestartPendingOrActive,
     isLaunchInFlight,
     isLatched: (key) => h.latch.isLatched(key),
@@ -5878,7 +5877,6 @@ describe('the re-check timer: its cadence, P\'s serializer turn and its stops (r
     initHealthCheck({
       isSessionAlive: _buildIsSessionAliveAdapter(() => h.config),
       isSessionConnected: () => false,
-      hasSessionStream: () => false,
       isRestartPendingOrActive,
       isLaunchInFlight,
       isLatched: (key) => h.latch.isLatched(key),
@@ -7454,7 +7452,6 @@ describe('the after-clear job runs in P\'s serializer turn right after the round
     initHealthCheck({
       isSessionAlive: _buildIsSessionAliveAdapter(() => h.config),
       isSessionConnected: () => false,
-      hasSessionStream: () => false,
       isRestartPendingOrActive,
       isLaunchInFlight,
       isLatched: (key) => h.latch.isLatched(key),

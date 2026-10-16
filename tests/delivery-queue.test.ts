@@ -3,6 +3,7 @@ import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createDeliveryQueue, isQueueRecord, parseQueueRecord, QUEUE_DIRECTORY_MODE, QUEUE_FILE_MODE, QUEUE_KEY_KEEP_MS, QUEUE_COMPACT_INTERVAL_MS, type QueueRecord, type QueueEvent, type DeliveryQueue } from '../src/delivery-queue.ts'
+import { assertNoLeak } from './test-helpers/credentials.ts'
 import { MAX_RELOAD_FILE_BYTES } from '../src/config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { deliveredRecord, injectedInput, makeQueue, queuePath, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
@@ -285,4 +286,21 @@ test('maintenance compacts at the exported interval once and stop cancels its ti
   expect(q.items('alpha')).toEqual([])
   expect(clock.pendingCount()).toBe(1)
   await q.stop(); expect(clock.pendingCount()).toBe(0)
+})
+
+test('startup findings remain available to a notifier installed after queue start and are safe copies', async () => {
+  const damaged = '{"v":99,"kind":"accepted","seq":2,"text":"private queued body"}\n'
+  seedQueue(dir, [accepted(), damaged, { ...accepted(), seq: 3 }])
+  const q = await open()
+  const findings = q.startupFindings()
+  expect(findings).toMatchObject([{ type: 'record-unreadable', key: 'alpha', line: 2, alert: true }])
+  expect(JSON.stringify(findings)).not.toContain('private queued body')
+  assertNoLeak(findings)
+  const finding = findings[0]!
+  if (finding.type !== 'record-unreadable') throw new Error('expected corruption finding')
+  const path = finding.quarantinePath
+  finding.alert = false
+  expect(q.startupFindings()).toMatchObject([{ alert: true }])
+  expect(fs.readFileSync(path, 'utf8')).toBe(damaged)
+  expect(q.items('alpha').map(item => item.accepted.seq)).toEqual([1, 3])
 })

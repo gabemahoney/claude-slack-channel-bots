@@ -470,7 +470,6 @@ function startTicks(getPersonas: () => Record<string, string>) {
   initHealthCheck({
     isSessionAlive: async (key) => (calls.alive.push(key), LIVENESS_READING_DEAD),
     isSessionConnected: () => false,
-    hasSessionStream: () => false,
     isRestartPendingOrActive: () => false,
     isAtCap: () => false,
     statRoute: async (cwd) => (calls.stat.push(cwd), false),

@@ -639,7 +639,6 @@ export function makeRestartDeps(opts: RestartFakeOptions = {}): RestartDeps & Re
     },
     isSessionAlive: async () => LIVENESS_READING_DEAD,
     isSessionConnected: () => false,
-    hasSessionStream: () => false,
     reconnectSession: async () => 'success',
     killSession: async () => ({ kind: KILL_OUTCOME_KILLED, killSent: true }),
     launchSession: async (key, cwd, sessionId) => {

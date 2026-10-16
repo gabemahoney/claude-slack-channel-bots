@@ -1504,6 +1504,13 @@ export function createSessionServer(
           uploaded++
         }
 
+        if (firstChunk && uploaded > 0 && messageId) {
+          const reaction = settings.ack_reaction
+          if (consumeAck(persona.key, chatId, messageId) && reaction) {
+            try { await web.reactions.remove({ channel: chatId, timestamp: messageId, name: reaction }) } catch { /* non-critical */ }
+          }
+        }
+
         return {
           content: [
             {

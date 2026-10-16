@@ -2061,7 +2061,6 @@ async function healthTick(h: RecoveryHarness, key: string): Promise<string[]> {
     },
     isSessionAlive: async () => LIVENESS_READING_DEAD,
     isSessionConnected: () => false,
-    hasSessionStream: () => false,
     isRestartPendingOrActive: () => false,
     isLaunchInFlight: () => false,
     isAtCap: (k) => isAtCap(k, RESTART_FAILURE_CAP),

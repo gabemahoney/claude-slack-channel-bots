@@ -933,7 +933,9 @@ function routingHolder(
   for (const [start, end] of alsoIn) expect(named.filter((offset) => offset > start && offset < end)).toHaveLength(1)
   const engineReads = indicesOf(new RegExp(`\\b${holder}\\?\\.${query}\\s*\\(`, 'g'), SERVER_CODE).filter(at => withinCall([at], onlyCallOf('createDeliveryEngines')) === 1)
   expect(engineReads).toHaveLength(query === 'isOpen' ? 1 : 0)
-  expect(named).toHaveLength(3 + checkReaders.length + alsoIn.length + engineReads.length)
+  const reportingReads = named.filter(at => withinCall([at], onlyCallOf('createDeliveryReporting')) === 1)
+  expect(reportingReads).toHaveLength(query === 'isOpen' ? 1 : 0)
+  expect(named).toHaveLength(3 + checkReaders.length + alsoIn.length + engineReads.length + reportingReads.length)
   return { holder, at, end: at + assigned[0]![0].length }
 }
 
@@ -2169,7 +2171,7 @@ describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, 
 
   test('durable intake binds preparation to the shared queue, persona name resolver and wake hook on the production clock', () => {
     const props = onlyCallProps('createDeliveryPreparation')
-    expect([...props.keys()].sort()).toEqual(['queue', 'resolveUserName', 'clientFor', 'wake', 'onPending'].sort())
+    expect([...props.keys()].sort()).toEqual(['queue', 'resolveUserName', 'clientFor', 'wake', 'onPending', 'onReceived'].sort())
     expect(props.get('queue')).toBe('deliveryQueue')
     expect(props.get('resolveUserName')).toBe('resolvePersonaUserName')
     expect(props.get('clientFor')).toBe('clientFor')
@@ -3168,8 +3170,6 @@ describe('main() builds the one tmux-unresponsive condition over the notice epis
   const TICK_HOOK: keyof HealthCheckDeps = 'endTmuxUnresponsive'
   const RETRY_HOOK: keyof FullModeRetryDeps = 'endTmuxUnresponsive'
   const RETRY_CONNECTED: keyof FullModeRetryDeps = 'isSessionConnected'
-  const RETRY_STREAM: keyof FullModeRetryDeps = 'hasSessionStream'
-  const TICK_STREAM: keyof HealthCheckDeps = 'hasSessionStream'
   const CONTROLLER_END: keyof UnavailableRetryController = 'conditionEnded'
   const RETRY_CONDITION: keyof typeof UnavailableRetryModule = 'UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE'
   const LIVE: keyof typeof LivenessReadingModule = 'LIVENESS_LIVE'
@@ -3248,9 +3248,6 @@ describe('main() builds the one tmux-unresponsive condition over the notice epis
     // health check also reads.
     expect(props.get(RETRY_CONNECTED)).toMatch(/^\(?(\w+)\)? => getSessionByPersona\(\1\)\?\.connected === true$/)
     expect(importSource(SERVER_CODE, 'getSessionByPersona')).toBe('./registry.ts')
-    expect(props.get(RETRY_STREAM)).toBe('hasSessionStream')
-    expect(onlyCallProps('initHealthCheck').get(TICK_STREAM)).toBe(props.get(RETRY_STREAM))
-    expect(importSource(SERVER_CODE, 'hasSessionStream')).toBe('./persona-routing.ts')
   })
 
   test('the tick\'s and the retry\'s hooks and the latch\'s silent-end hold (b.jg5 SRJ-310, SRJ-502) are the only ends server.ts calls on the condition, one each', () => {
@@ -3893,7 +3890,8 @@ describe('main() builds the one per-persona latch, in server memory only, before
     // queries' forms are pinned in the describe below; the holder's in the
     // persona routing's describe.
     const named = indicesOf(new RegExp(`\\b${latch}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(14)
+    expect(named).toHaveLength(15)
+    expect(withinCall(named, onlyCallOf('createDeliveryReporting'))).toBe(1)
     const decl = SERVER_CODE.match(new RegExp(`\\bconst\\s+${latch}\\b`))!
     expect(named[0]).toBe(decl.index! + decl[0].length - latch.length)
     const withinAt = (at: number) => {
@@ -4088,7 +4086,8 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     expect(inCheck(outside)).toBe(1)
     expect(within(outside, SERVER_CODE.search(/\bfunction\s+reconnectLatchedAt\s*\(/))).toBe(1)
     const queries = indicesOf(new RegExp(`\\.\\s*${IS_LATCHED}\\s*\\(`, 'g'), SERVER_CODE)
-    expect(queries).toHaveLength(9)
+    expect(queries).toHaveLength(10)
+    expect(withinCall(queries, onlyCallOf('createDeliveryReporting'))).toBe(1)
     expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaRouting'].map((call) => within(queries, onlyCallOf(call)))).toEqual([0, 2, 1, 1])
     expect(withinRetryRunGate(queries)).toBe(1)
     expect(within(queries, onlyReconnectAdapterBuild())).toBe(1)
@@ -4601,7 +4600,8 @@ describe('main() builds the one ErrInvalidFlags hold before the start pass, inst
     expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map((call) => withinCall(members, onlyCallOf(call)))).toEqual([0, 1, 1])
     expect(withinRetryRunGate(members)).toBe(1)
     const queries = indicesOf(new RegExp(`\\.\\s*${IS_HELD}\\s*\\(`, 'g'), SERVER_CODE)
-    expect(queries).toHaveLength(5)
+    expect(queries).toHaveLength(6)
+    expect(withinCall(queries, onlyCallOf('createDeliveryReporting'))).toBe(1)
     expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaRouting'].map((call) => withinCall(queries, onlyCallOf(call)))).toEqual([0, 1, 1, 1])
     expect(withinRetryRunGate(queries)).toBe(1)
     expect(indicesOf(new RegExp(`\\b${ROUTING_HELD}\\s*:`, 'g'), SERVER_CODE)).toHaveLength(1)
@@ -4622,7 +4622,8 @@ describe('main() builds the one ErrInvalidFlags hold before the start pass, inst
     expect(indicesOf(new RegExp(`\\b${holderName()}\\s*[?!]?\\.\\s*${SET}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
 
     const named = indicesOf(new RegExp(`\\b${hold}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(10)
+    expect(named).toHaveLength(11)
+    expect(withinCall(named, onlyCallOf('createDeliveryReporting'))).toBe(1)
     const decl = SERVER_CODE.match(new RegExp(`\\bconst\\s+${hold}\\b`))!
     expect(named[0]).toBe(decl.index! + decl[0].length - hold.length)
     const within = (call: string) => {
@@ -4746,7 +4747,8 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
     expect(importSource(SERVER_CODE, KILL_FAILED_HOLD)).toBe('./session-manager.ts')
     // Named in server.ts only at its import and this member.
     const named = indicesOf(new RegExp(`\\b${KILL_FAILED_HOLD}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(3)
+    expect(named).toHaveLength(4)
+    expect(withinCall(named, onlyCallOf('createDeliveryReporting'))).toBe(1)
     expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
     expect(withinCall(named, onlyCallOf('createDeliveryEngines'))).toBe(1)
   })
@@ -4815,7 +4817,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
   // fungible-mode event (b.deo SRI-305, SRI-403).
   test('the routing\'s call binds exactly these members, no more', () => {
     const MEMBERS: Array<keyof PersonaRoutingDeps> = [
-      'getPersonaConfig', 'getBotIdentity', 'queue', 'prepare', 'archive', 'log',
+      'getPersonaConfig', 'getBotIdentity', 'queue', 'prepare', 'onReceived', 'archive', 'log',
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
       'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery',
     ]
@@ -5017,12 +5019,12 @@ describe('the session-disconnect handler and the routing\'s retry-timer arm deci
     const binding = onlyCallProps('createPersonaRouting').get(ROUTING_ARM)
     expect(binding).toBeDefined()
     const flag = shutdownFlag()
-    const shape = blankLiterals(binding!).replace(/\s+/g, ' ').trim()
+    const shape = blankLiterals(binding!.replace(/buildQueuedMessageRetryLine\([^)]*\)/, '"line"')).replace(/\s+/g, ' ').trim()
     expect(shape).toMatch(new RegExp(`^\\(?(\\w+)\\)? => \\{ if \\(${flag}\\) return;? ${CHECK}\\([^()]*\\);? \\}$`))
     const key = shape.match(/^\(?(\w+)\)?/)![1]!
     const args = splitTopLevel(callArguments(binding!, binding!.indexOf(`${CHECK}(`)))
     expect(args.slice(0, 2)).toEqual([key, retryCheckDeps().name])
-    expect(args[2]).toBe(`\`[slack] Lost message: persona=\${${key}} has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)\``)
+    expect(args[2]).toBe(`buildQueuedMessageRetryLine(${key})`)
 
     // The check: its declaration, the builder's call and the routing's.
     expect(importSource(SERVER_CODE, CHECK)).toBeUndefined()
@@ -5285,7 +5287,8 @@ describe('main() binds what a hold refuses: the held-directory query into the MC
     importedOnly(HELD_QUERY, './session-manager.ts')
     // Named only at its import and this member: never called with a captured set, never wrapped.
     const named = indicesOf(new RegExp(`\\b${HELD_QUERY}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(2)
+    expect(named).toHaveLength(3)
+    expect(withinCall(named, onlyCallOf('createDeliveryReporting'))).toBe(1)
     expect(withinCall(named, onlyCallOf('decideSessionAdmission'))).toBe(1)
   })
 
@@ -5439,7 +5442,8 @@ describe('server.ts refuses service to a persona that is not up (b.av2 SR-6.3, S
     expect(outcomes.get('isUp')).toMatch(/^\((\w+)\) => bringUps\?\.isUp\(\1\) \?\? false$/)
     expect(outcomes.get('isApplied')).toMatch(/^\((\w+)\) => bringUps\?\.isApplied\(\1\) \?\? false$/)
     // Never called directly, and no serving check copied in.
-    expect(callsOf('isPersonaUp')).toHaveLength(1)
+    expect(callsOf('isPersonaUp')).toHaveLength(2)
+    expect(withinCall(callsOf('isPersonaUp'), onlyCallOf('createDeliveryReporting'))).toBe(1)
     expect(withinCall(callsOf('isPersonaUp'), onlyCallOf('createDeliveryEngines'))).toBe(1)
     expect(indicesOf(/\bisPersonaClientServing\b/g, SERVER_CODE)).toEqual([])
   })
@@ -6134,5 +6138,48 @@ describe('delivery ownership wiring', () => {
     const reconnect = onlyCallProps('createDeliveryEngines').get('reconnect')!
     expect(reconnect).toContain('deliveryScope.run(key, client as Client, beforeCall, async () =>')
     expect(reconnect).toContain('await deferredReconnect(key)')
+  })
+})
+
+// b.omv SR-8: main cannot run in units; behavior belongs to the reporting suites.
+describe('typed delivery reporting production wiring', () => {
+  test('one reporting consumer uses the live applied lookup, notifier, episodes and timer', () => {
+    expect(callsOf('createDeliveryReporting')).toHaveLength(1)
+    const props = onlyCallProps('createDeliveryReporting')
+    expect(props.get('queue')).toBe('deliveryQueue!')
+    expect(props.get('episodes')).toBe(constOf('createPersonaEpisodes'))
+    expect(props.get('persona')).toBe('getAppliedPersona')
+    expect(props.get('notify')).toMatch(/personaNotifier\.notify\(key, text\)/)
+    expect(props.get('stuckAfterMs')).toBe('testTimers.deliveryStuckAfterMs')
+    const state = props.get('state')!
+    for (const dependency of ['isPersonaUp', 'isLatched', 'isHeld', 'waitsOnKillFailedHold', 'isOwnRowOldLifeHeld', 'isTagUpgradePending', 'backoffIsAtCap', 'getOutageFlags', 'hasNotConnectedEpisode', 'hasNativePromptWarning', 'isLaunchInFlight']) expect(state).toContain(dependency + '(')
+    expect(state).toContain('!shuttingDown')
+  })
+  test('startup corruption evidence is buffered before reporting exists, then replayed after its creation', () => {
+    expect(SERVER_CODE).toMatch(/else bufferedQueueEvents\.push\(event\)/)
+    expect(SERVER_CODE).toMatch(/for \(const event of bufferedQueueEvents\.splice\(0\)\) deliveryReporting\.queueEvent\(event\)/)
+    expect(SERVER_CODE).toMatch(/deliveryReporting\.startupFindings\(deliveryQueue!\.startupFindings\(\)\)/)
+    const created = onlyCallOf('createDeliveryReporting')
+    expect(SERVER_CODE.indexOf('bufferedQueueEvents.splice(0)')).toBeGreaterThan(created)
+    expect(SERVER_CODE.indexOf('deliveryReporting.startupFindings')).toBeGreaterThan(created)
+  })
+  test('intake and engine report through the one consumer; upgrade inspection retains the per-persona scope', () => {
+    for (const factory of ['createPersonaRouting', 'createDeliveryPreparation']) expect(onlyCallProps(factory).get('onReceived')).toMatch(/deliveryReporting\?\.received\(key, item\)/)
+    const engine = onlyCallProps('createDeliveryEngines')
+    expect(engine.get('onEvent')).toBe('event => deliveryEngineEvents.emit(event)')
+    expect(engine.get('inspectUpgrade')).toContain('deliveryScope.run(key, client as Client, beforeCall,')
+    expect(engine.get('inspectUpgrade')).toContain('inspectPersonaUpgrade(key, getAppliedPersona(key))')
+    const life = onlyCallProps('createDeliveryLifecycle')
+    expect(life.get('onReconnectScreen')).toContain("type: 'reconnect-screen'")
+    expect(onlyCallProps('createDeliveryReporting').get('reconnectBlocked')).toContain("reason: 'reconnect-blocked'")
+  })
+  test('durable completion adds configured reactions through the persona own client and pairs its remover', () => {
+    const effect = onlyCallProps('createDeliveryReporting').get('delivered')!
+    expect(effect).toBe('createDeliveryAckCallback({ getReaction: () => getReplySettings().ack_reaction, clientFor })')
+    expect(callsOf('createDeliveryAckCallback')).toHaveLength(1)
+    const adapter = onlyCallProps('createDeliveryAckCallback')
+    expect(adapter.get('getReaction')).toBe('() => getReplySettings().ack_reaction')
+    expect(adapter.get('clientFor')).toBe('clientFor')
+    expect(effect).not.toContain('consumeAck(')
   })
 })

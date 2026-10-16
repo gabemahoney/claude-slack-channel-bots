@@ -140,7 +140,8 @@ TRANSCRIPT_PATH="$(printf '%s' "${INPUT}" | jq -r '.transcript_path // ""' 2>/de
 # Walking back from the latest real user message, the run collects every real
 # user message up to the first non-sidechain assistant entry. Other entries
 # (attachments, system entries, tool_result-only user entries, sidechain
-# entries, compaction summaries) neither join nor end the run.
+# entries, compaction summaries) neither join nor end the run. A genuine
+# queued_command attachment after the first message joins the turn's take-ins.
 #
 # Envelope = the opening `<channel …>` tag at the very start of a message's
 # text (after optional leading whitespace). Only a tag in that position counts:
@@ -151,6 +152,9 @@ TRANSCRIPT_PATH="$(printf '%s' "${INPUT}" | jq -r '.transcript_path // ""' 2>/de
 # starts with `slack` (covers the legacy `source="slack"` form and the on-wire
 # `source="slack-channel-router"` form). Attributes are read by name, so their
 # order does not matter.
+#
+# Whole single-tag pasted_content wraps are unwrapped before this check.
+# Repeated chat_id/ts/part identities from earlier genuine take-ins are skipped.
 #
 # Delivered envelope = a Slack envelope that carries a `via` attribute, whatever
 # its value (an empty or unrecognised `via` still counts). A Slack envelope
@@ -190,13 +194,15 @@ JQ_OUT="$(jq -rRn '
         | if (.type // "") == "text" then (.text // "")
           else empty
           end
-      ] | join("\n")
+      ] | join("")
     else "" end;
 
   def is_real_user:
     (.type // "") == "user"
     and (.isSidechain != true)
     and (.isCompactSummary != true)
+    and (.isMeta != true)
+    and (.origin == null or .origin.kind == "human")
     and ((.message // {}) | type == "object")
     and (((.message.content // null) | text_of_content) | length > 0);
 
@@ -236,6 +242,26 @@ JQ_OUT="$(jq -rRn '
     | if $t != null and (($t | attr("source") // "") | startswith("slack"))
       then $t else null end;
 
+  # Only a whole single-tag paste is unwrapped; quoted or sibling text is ignored.
+  def take_in_text:
+    if is_real_user then .message.content | text_of_content
+    elif (.type == "attachment" and .isSidechain != true and .isCompactSummary != true
+          and .isMeta != true and (.origin == null or .origin.kind == "human")
+          and .attachment.type == "queued_command"
+          and (.attachment.origin == null or .attachment.origin.kind == "human"))
+      then .attachment.prompt | text_of_content
+    else "" end;
+  def delivered_envelope:
+    . as $text
+    | (first(capture("\\A\\s*<pasted_content id=\"(?<id>[^\"]+)\">\\n(?<body>[\\s\\S]*)\\n</pasted_content id=\"\\k<id>\">\\s*\\z")) // null) as $paste
+    | if $paste == null then $text | slack_envelope
+      elif ($paste.body | test("\\A\\s*<channel\\s[^>\\n]*>[\\s\\S]*</channel>\\s*\\z"))
+           and (($paste.body | [scan("<channel\\s")] | length) == 1)
+        then $paste.body | slack_envelope
+      else null end;
+  def identity:
+    [attr("chat_id"), attr("ts"), (attr("part") // "")];
+
   # A delivered Slack envelope carries `via`; an empty value is still present.
   def is_delivered: attr("via") != null;
 
@@ -260,12 +286,20 @@ JQ_OUT="$(jq -rRn '
       # message (-1 when none); the trigger run is every real user message
       # after it.
       | (first(range($last - 1; -1; -1) | select($es[.] | is_main_assistant)) // -1) as $start
-      # Delivered Slack messages in the run, oldest first.
-      | [ $user_idx[]
-          | select(. > $start)
-          | { i: ., w: ($es[.].message.content | text_of_content | slack_envelope) }
-          | select(.w != null and (.w | is_delivered))
-        ] as $delivered
+      # Genuine take-ins across the transcript establish repeat identity. Attachments
+      # after the first user in the trigger run can arrive during the turn.
+      | ([$user_idx[] | select(. > $start)] | first) as $first
+      # An orphan queued attachment cannot establish a repeat identity.
+      | [range(0; $es | length) | . as $i
+          | select(($es[$i] | is_real_user) or $i > $user_idx[0])
+          | {i: $i, w: ($es[$i] | take_in_text | delivered_envelope)}
+          | select(.w != null and (.w | is_delivered))] as $all
+      | reduce $all[] as $entry ({seen: [], delivered: []};
+          ($entry.w | identity) as $id
+          | (if $id[0] != null and $id[1] != null then (.seen | any(. == $id)) else false end) as $repeat
+          | .seen += [$id]
+          | if ($entry.i >= $first and ($repeat | not)) then .delivered += [$entry] else . end)
+      | .delivered as $delivered
       | if ($delivered | length) == 0 then "OK"
         elif any($es[($delivered[0].i + 1):][]; is_reply_tool_use) then "OK"
         else $delivered[-1].w | verdict

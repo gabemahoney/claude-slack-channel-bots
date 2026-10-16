@@ -5051,7 +5051,6 @@ describe('persona teardown serialization (SR-6.6)', () => {
         canRestart: (key) => { f.trail.push(`restart.canRestart:${key}`); return up() },
         isSessionAlive: async () => LIVENESS_READING_DEAD,
         isSessionConnected: () => false,
-        hasSessionStream: () => true,
         reconnectSession: async () => undefined,
         killSession: async (): Promise<KillOutcome> => KILL_SUCCEEDED,
         launchSession: async (key) => { f.trail.push(`restart.launchSession:${key}`); return launch() },

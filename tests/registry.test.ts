@@ -101,7 +101,7 @@ import {
   type SessionEntry,
   type SessionToolDeps,
 } from '../src/registry.ts'
-import { trackAck, consumeAck, _resetAckTracker } from '../src/ack-tracker.ts'
+import { trackAck, consumeAck, _resetAckTracker, addDeliveryAck } from '../src/ack-tracker.ts'
 import {
   makeFungiblePersona,
   makeMultiPersonaConfig,
@@ -2860,5 +2860,36 @@ describe('session instructions in both channel modes (b.av2 SR-12; b.deo SRI-604
     expect(MCP_INSTRUCTIONS).toMatch(
       new RegExp(`${literal(SET_CHANNEL_DELIVERY_TOOL)} sets listening to mentions[^\\n]*when someone in that channel asks`),
     )
+  })
+})
+
+// b.omv SR-8.7: registry records only successful replies, using the resolved target.
+describe('reply before delivery', () => {
+  test.each([A_ALL, USER_U])('successful reply to %s suppresses only the calling persona in the resolved conversation', async target => {
+    applyPersona(h.alpha, true)
+    if (target === USER_U) stubOf(h.alpha).script.open.push(openedDm(OPENED_DM))
+    const session = await openWithSettings(h.alpha)
+    const result = await session.call('reply', { chat_id: target, text: 'early', message_id: MSG_TS })
+    expect(result.isError).toBeUndefined()
+    const channel = target === USER_U ? OPENED_DM : A_ALL
+    const adds: string[] = []
+    for (const [key, conversation] of [[h.alpha.key, channel], [h.beta.key, channel], [h.alpha.key, 'C0OTHER01']]) {
+      await addDeliveryAck(key!, conversation!, MSG_TS, async () => { adds.push(key! + ':' + conversation) }, async () => {})
+    }
+    expect(adds).toEqual([h.beta.key + ':' + channel, h.alpha.key + ':C0OTHER01'])
+    expect(stubOf(h.alpha).calls.postMessage).toMatchObject([{ channel }])
+    expect(stubOf(h.beta).calls.postMessage).toEqual([])
+    assertNoLeak({ result, lines: h.lines })
+  })
+  test('failed reply cannot suppress the later delivery reaction', async () => {
+    stubOf(h.alpha).web.chat.postMessage = async () => { throw new Error('Slack refused') }
+    const session = await openWithSettings(h.alpha)
+    const result = await session.call('reply', { chat_id: A_ALL, text: 'early', message_id: MSG_TS })
+    expect(result.isError).toBe(true)
+    let added = false
+    await addDeliveryAck(h.alpha.key, A_ALL, MSG_TS, async () => { added = true }, async () => {})
+    expect(added).toBe(true)
+    expect(stubOf(h.beta).calls.postMessage).toEqual([])
+    assertNoLeak({ result, lines: h.lines })
   })
 })

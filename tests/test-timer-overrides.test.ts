@@ -24,6 +24,7 @@ import {
 } from '../src/ad-version-gate.ts'
 import { TEST_TIMER_OVERRIDE_KEYS, type TestTimerOverrides } from '../src/config.ts'
 import { LATCH_RECHECK_INTERVAL_MS } from '../src/conflict-latch.ts'
+import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
 import {
   buildTestTimerOverridesLine,
   effectiveTestTimer,
@@ -42,6 +43,7 @@ const DEFAULTS = {
   latch_recheck_interval_ms: LATCH_RECHECK_INTERVAL_MS,
   ad_version_recheck_interval_ms: AD_VERSION_RECHECK_INTERVAL_MS,
   dialog_ready_timeout_ms: DIALOG_READY_TIMEOUT_MS,
+  delivery_stuck_after_ms: DELIVERY_STUCK_AFTER_MS,
   unavailable_retry_base_s: UNAVAILABLE_RETRY_BASE_S,
   unavailable_retry_ceiling_s: UNAVAILABLE_RETRY_CEILING_S,
 } as const
@@ -75,12 +77,17 @@ function installedRecheck(): { clock: ReturnType<typeof createFakeClock>; calls:
 }
 
 describe('effectiveTestTimer and effectiveTestTimers', () => {
+  test('pin: the production delivery-stuck wait is five minutes (b.omv SR-8.2)', () => {
+    expect(DELIVERY_STUCK_AFTER_MS).toBe(300_000)
+  })
+
   test.each([undefined, {}])('with %p every key is its production default', (overrides) => {
     for (const key of TEST_TIMER_OVERRIDE_KEYS) expect(effectiveTestTimer(key, overrides)).toBe(DEFAULTS[key])
     expect(effectiveTestTimers(overrides)).toEqual({
       latchRecheckIntervalMs: DEFAULTS.latch_recheck_interval_ms,
       adVersionRecheckIntervalMs: DEFAULTS.ad_version_recheck_interval_ms,
       dialogReadyTimeoutMs: DEFAULTS.dialog_ready_timeout_ms,
+      deliveryStuckAfterMs: DEFAULTS.delivery_stuck_after_ms,
       unavailableRetryBaseS: DEFAULTS.unavailable_retry_base_s,
       unavailableRetryCeilingS: DEFAULTS.unavailable_retry_ceiling_s,
     })
@@ -99,6 +106,7 @@ describe('effectiveTestTimer and effectiveTestTimers', () => {
       latchRecheckIntervalMs: LATCH_RECHECK_INTERVAL_MS,
       adVersionRecheckIntervalMs: 20_000,
       dialogReadyTimeoutMs: 120_000,
+      deliveryStuckAfterMs: DELIVERY_STUCK_AFTER_MS,
       unavailableRetryBaseS: 5,
       unavailableRetryCeilingS: 60,
     })
@@ -129,17 +137,20 @@ describe('buildTestTimerOverridesLine', () => {
     )
   })
 
-  test('all five keys are named, each once, and the line starts with the exported head', () => {
+  test('all six keys are named, each once, and the line starts with the exported head', () => {
     const line = buildTestTimerOverridesLine({
       latch_recheck_interval_ms: 45_000,
       ad_version_recheck_interval_ms: 20_000,
       dialog_ready_timeout_ms: 120_000,
+      delivery_stuck_after_ms: 7_000,
       unavailable_retry_base_s: 5,
       unavailable_retry_ceiling_s: 60,
     })!
     expect(line.startsWith(`${TEST_TIMER_OVERRIDES_LOG_PREFIX}: `)).toBe(true)
     for (const key of TEST_TIMER_OVERRIDE_KEYS) expect(line.split(`${key}=`)).toHaveLength(2)
     expect(line.indexOf('latch_recheck_interval_ms=')).toBeLessThan(line.indexOf('ad_version_recheck_interval_ms='))
+    expect(line.indexOf('dialog_ready_timeout_ms=')).toBeLessThan(line.indexOf('delivery_stuck_after_ms='))
+    expect(line.indexOf('delivery_stuck_after_ms=')).toBeLessThan(line.indexOf('unavailable_retry_base_s='))
     expect(line.indexOf('unavailable_retry_base_s=')).toBeLessThan(line.indexOf('unavailable_retry_ceiling_s='))
     expect(line.split('\n')).toHaveLength(1)
     assertNoLeak(line, 'the overrides line')
@@ -184,6 +195,28 @@ describe('installTestTimerOverrides', () => {
     installTestTimerOverrides({ unavailable_retry_base_s: 5, unavailable_retry_ceiling_s: 60, latch_recheck_interval_ms: 45_000 }, () => {})
     expect(adLaunchBoundMsInEffect()).toBe(DIALOG_READY_TIMEOUT_MS)
     expect(clock.pending().map((t) => t.delayMs)).toEqual([AD_VERSION_RECHECK_INTERVAL_MS])
+  })
+
+  test('the delivery-stuck override is captured at start and logged once without changing the defaults or other timers (b.omv SR-14.1)', () => {
+    const { clock } = installedRecheck()
+    const lines: string[] = []
+    const overrides: TestTimerOverrides = { delivery_stuck_after_ms: 7_000 }
+
+    const timers = installTestTimerOverrides(overrides, (line) => lines.push(line))
+
+    expect(timers).toEqual({ ...effectiveTestTimers(undefined), deliveryStuckAfterMs: 7_000 })
+    expect(lines).toEqual([buildTestTimerOverridesLine(overrides)!])
+    expect(lines[0]).toContain(`${TEST_TIMER_OVERRIDES_LOG_PREFIX}: delivery_stuck_after_ms=7000 (default ${DELIVERY_STUCK_AFTER_MS})`)
+    expect(lines[0]).toContain('read once at this start; not for production use')
+    expect(adLaunchBoundMsInEffect()).toBe(DIALOG_READY_TIMEOUT_MS)
+    expect(clock.pending().map((timer) => timer.delayMs)).toEqual([AD_VERSION_RECHECK_INTERVAL_MS])
+
+    // A later config object cannot change the values the running server captured.
+    overrides.delivery_stuck_after_ms = 9_000
+    expect(timers.deliveryStuckAfterMs).toBe(7_000)
+    expect(effectiveTestTimers(undefined).deliveryStuckAfterMs).toBe(DELIVERY_STUCK_AFTER_MS)
+    expect(lines).toHaveLength(1)
+    assertNoLeak(lines, 'the delivery-stuck override startup line')
   })
 
   test('the latch, base and ceiling overrides reach the caller through the answer, for the latch re-check and the retry timers', () => {

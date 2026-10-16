@@ -17,7 +17,6 @@ import {
   type StoredChoices,
 } from './delivery-decision.ts'
 import { fungibleDestinationsOf } from './persona-destination.ts'
-import { hasGetStreamKey } from './lib.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import {
   formatPersonaDiagnostic,
@@ -83,6 +82,7 @@ export interface PersonaRoutingDeps {
   queue: Pick<DeliveryQueue, 'accept' | 'lookupSlackKey'>
   /** Fix stored text after the envelope ack; E3's wake follows durable fixation. */
   prepare(key: string, item: QueueItem): Promise<void>
+  onReceived?(key: string, item: QueueItem): void
   /** Fire-and-forget archive, before the decision, with no pre-ack await. */
   archive(key: string, event: unknown): void
   /** Writes one log line. */
@@ -234,28 +234,13 @@ export interface PersonaRouting {
 }
 
 // ---------------------------------------------------------------------------
-// Session stream-presence probe (b.9cj; b.av2 SR-11 unchanged)
-// ---------------------------------------------------------------------------
-
-/**
- * True when the session registered for persona `key` has its standalone GET
- * SSE stream (`_GET_stream`); false when it has none, or when no session is
- * registered. A session can read `connected` in the registry while the SDK
- * has silently dropped the stream, and then a notification never reaches the
- * bot. Used by the restart guard and the health check. Intake does not probe streams (b.omv SR-4.1).
- */
-export function hasSessionStream(key: string): boolean {
-  const session = getSessionByPersona(key)
-  return session ? hasGetStreamKey(session.transport) : false
-}
-
-// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
 /** Build a persona-routing instance over the injected dependencies. */
 export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   const heardSets = new Map<string, Set<string>>()
+  const postAcked = new Map<string, Set<number>>()
   /** The persona reference for a key: its rendered name when applied, else the bare key. */
   function refForKey(key: string): string {
     const persona = deps.getPersonaConfig()?.personas.find((p) => p.key === key)
@@ -287,6 +272,13 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
           const duplicate = slackKey ? deps.queue.lookupSlackKey(key, slackKey) : undefined
           const persona = config?.personas.find(p => p.key === key)
           const post = (item: QueueItem) => async () => {
+            const posted = postAcked.get(key) ?? new Set<number>()
+            if (posted.has(item.accepted.seq)) return
+            // Claim only after the aggregate ack: retained partial fanout can
+            // retry here, but concurrent/redelivered copies recover just once.
+            posted.add(item.accepted.seq)
+            postAcked.set(key, posted)
+            try { void Promise.resolve(deps.onReceived?.(key, item)).catch(() => {}) } catch { /* reporting cannot prevent preparation */ }
             const session = getSessionByPersona(key)
             if (persona && config && (!session || !session.connected)) await handleLostMessage(persona, persona.working_directory, config)
             await deps.prepare(key, item)

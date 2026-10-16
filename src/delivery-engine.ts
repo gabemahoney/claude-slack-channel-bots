@@ -14,10 +14,20 @@ export type { DeliveryLifecycle, DeliveryClock } from './delivery-lifecycle.ts'
 import { LAUNCH_SETTLE_MS, ENTER_DELAY_MS, ENTER_ONLY_RETRY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS, IDLE_EVIDENCE_MAX_WAIT_MS, DELIVERY_MAX_AD_CALLS_PER_S, DELIVERY_ROW_POLL_MS } from './delivery-constants.ts'
 export * from './delivery-constants.ts'
 export type DeliveryReason = 'state' | 'marker' | 'mcp' | 'launch-settle' | 'menu' | 'input' | 'relay-off' | 'held' | 'dialog-hold' | 'transcript-unreadable' | 'queue-unwritable' | 'not-now' | 'receipt' | 'idle-evidence'
+/** Safe operational facts; never composer or message body text (b.omv SR-8). */
+export interface DeliveryStatus {
+  key: string; seq: number; count: number; ageMs: number; retypeCount: number
+  row?: string; marker: boolean; relay: boolean; connected: boolean; up: boolean
+  latched: boolean; held: boolean; receiptWorking: boolean; dialogMaybeOpen: boolean
+  reconnectDeferred: boolean
+  reconnectScreen?: 'input' | 'menu'
+}
 export type DeliveryEngineEvent =
   | { type: 'delivered'; key: string; seq: number; part: number }
+  | { type: 'item-delivered'; key: string; seq: number; at: number; waitMs: number }
+  | { type: 'first-typed'; key: string; seq: number; part: number }
   | { type: 'retyped' | 'first-unconfirmed-retype'; key: string; seq: number; part: number; count: number }
-  | { type: 'waiting'; key: string; seq: number; reason: DeliveryReason; ageMs: number }
+  | { type: 'waiting'; key: string; seq: number; reason: DeliveryReason; ageMs: number; status?: DeliveryStatus }
   | { type: 'marker-missing'; key: string }
   | { type: 'reconnect-screen'; key: string; reason: 'input' | 'menu'; blockedMs: number }
 export type DeliveryClient = Pick<Client, 'get' | 'readPane' | 'sendKeys'>
@@ -31,6 +41,8 @@ export interface DeliveryEngineDeps {
   isUp(key: string): boolean; isLatched(key: string): boolean; isHeld(key: string): boolean; isConnected(key: string): boolean
   prepare(key: string, item: QueueItem): Promise<void>
   onRow?(key: string, row: GetResult): boolean
+  /** E4's shared replacement only, under the engine's client and call budget. */
+  inspectUpgrade?(key: string, row: GetResult, client: DeliveryClient, beforeCall: () => void): Promise<void>
   onReadError?(key: string, error: unknown, verb: 'get' | 'read-pane'): Promise<void>
   onError?(key: string, error: unknown): void
   onEvent?(event: DeliveryEngineEvent): void
@@ -51,6 +63,7 @@ export interface DeliveryEngines {
   stop(): Promise<void>
   running(key: string): boolean
   snapshot(key: string): DeliveryPolicyKnowledge | undefined
+  status(key: string): DeliveryStatus | undefined
 }
 export class DeliveryBudgetWait extends Error { constructor(readonly delayMs: number) { super('Delivery call budget') } }
 /** The sliding ten-second window counts every engine and deferred call. */
@@ -76,20 +89,29 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     reader: DeliveryReceiptReader; receiptTarget?: DeliveryPair; receiptAttempt?: number; deadlines: Partial<Record<DeliveryTimer, number>>; budget: () => void
     rowAt: number; waitingAt?: number; notNowStep: number; retryStep: number; appendRetryStep: number; lastSeq?: number; lastPart?: number
     pending?: { record: QueueRecord; complete(): void }; lease?: () => void; timer?: unknown; busy?: Promise<void>; stopped: boolean
-    recover: boolean; restarted?: string; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; lastBox?: string; cleanup: boolean
+    recover: boolean; restarted?: string; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; lastBox?: string; cleanup: boolean; dialogMaybeOpen: boolean
   }
   const states = new Map<string, State>(), budgets = new Map<string, () => void>(), lastDelivered = new Map<string, { pair: DeliveryPair; text: string }>()
   let stopped = false
-  function emit(event: DeliveryEngineEvent): void { try { deps.onEvent?.(event) } catch {} }
+  const typed = new Set<string>()
+  function emit(event: DeliveryEngineEvent): void { try { void Promise.resolve(deps.onEvent?.(event)).catch(() => {}) } catch {} }
   function budget(key: string): () => void { let b = budgets.get(key); if (!b) { b = createDeliveryCallBudget(clock.now); budgets.set(key, b) }; return b }
   function create(key: string): State {
-    const s: State = { e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createDeliveryReceiptReader(), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, recover: true, receiptWorking: false, pollAfter: 0, dialogHold: false, cleanup: false }
+    const s: State = { e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createDeliveryReceiptReader(), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, recover: true, receiptWorking: false, pollAfter: 0, dialogHold: false, cleanup: false, dialogMaybeOpen: false }
     s.e.lastDelivered = lastDelivered.get(key)?.pair ?? NO_DELIVERY_PAIR
     states.set(key, s); life.engineRunning(key, true); return s
   }
   function release(s: State): void { s.lease?.(); s.lease = undefined; s.e.request = 'none' }
   function timers(s: State): void { for (const name of Object.keys(s.e.timers) as DeliveryTimer[]) s.e.timers[name] = Math.max(0, (s.deadlines[name] ?? 0) - clock.now()) }
-  function wait(key: string, s: State, reason: DeliveryReason): void { const head = deps.queue.items(key).find(i => !i.delivered); if (head) emit({ type: 'waiting', key, seq: head.accepted.seq, reason, ageMs: Math.max(0, clock.now() - head.accepted.received_at) }) }
+  function status(key: string, s: State): DeliveryStatus | undefined {
+    const items = deps.queue.items(key).filter(i => !i.delivered), head = items[0]
+    if (!head) return undefined
+    const deferred = life.deferred(key)
+    return { key, seq: head.accepted.seq, count: items.length, ageMs: Math.max(0, clock.now() - head.accepted.received_at), retypeCount: head.retypeCount,
+      row: s.restarted === life.launchId(key) ? (s.row?.state === 'ended' || s.row?.state === 'missing' ? s.row.state : 'absent') : s.row?.state, marker: s.row?.labels?.tag_prompt === '1', relay: s.row?.relay_mode === 'on', connected: deps.isConnected(key), up: deps.isUp(key),
+      latched: deps.isLatched(key), held: deps.isHeld(key), receiptWorking: s.receiptWorking, dialogMaybeOpen: s.dialogMaybeOpen, reconnectDeferred: !!deferred, reconnectScreen: deferred?.screen }
+  }
+  function wait(key: string, s: State, reason: DeliveryReason): void { const facts = status(key, s); if (facts) emit({ type: 'waiting', key, seq: facts.seq, reason, ageMs: facts.ageMs, status: facts }) }
   function schedule(key: string, s: State, delay = DELIVERY_ROW_POLL_MS): void {
     if (stopped || s.stopped) return
     if (s.timer !== undefined) clock.clearTimeout(s.timer)
@@ -112,7 +134,19 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       if (row.state !== 'waiting' || !row.unproven_requests?.length || row.unproven_requests.some(r => r.decision === null)) s.dialogHold = false
       life.observeRow(key, row)
       if (row.state === 'ended' || row.state === 'missing') restart(key, s)
-      if (deps.onRow?.(key, row)) return false
+      if (deps.onRow?.(key, row)) { wait(key, s, 'held'); return false }
+      if (deps.inspectUpgrade) {
+        const markerMissing = row.labels?.tag_prompt !== '1'
+        if (markerMissing) release(s)
+        const client = await deps.clientFor(key)
+        if (stopped || s.stopped) return false
+        await deps.inspectUpgrade(key, row, client, s.budget)
+        if (markerMissing) {
+          wait(key, s, 'marker')
+          // Replacement may have started. Never continue with the old reading.
+          return false
+        }
+      }
       if (s.e.phase === 'receipt' || s.receiptWorking) {
         if (row.state === 'working') s.receiptWorking = true
         else if (s.receiptWorking) { s.e.phase = 'receipt'; s.deadlines.receipt = clock.now() + ms('RECEIPT_WAIT_MS', RECEIPT_WAIT_MS); s.receiptWorking = false }
@@ -123,7 +157,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       if (error instanceof DeliveryBudgetWait) throw error
       await deps.onReadError?.(key, error, 'get')
       deps.onError?.(key, error)
-      if (isAdErrorInstance(error, ErrSpawnNotFound)) { life.clearDeferred(key); restart(key, s) }
+      if (isAdErrorInstance(error, ErrSpawnNotFound)) { life.clearDeferred(key); restart(key, s); wait(key, s, 'state') }
       return false
     }
   }
@@ -221,7 +255,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         else if (s.row?.state === 'ended' || s.row?.state === 'missing') restart(key, s)
       }
     } else if (classifyAdError(error).errorClass === 'GONE') restart(key, s)
-    if (isAdErrorInstance(error, ErrDialogMaybeOpen)) {
+    s.dialogMaybeOpen = isAdErrorInstance(error, ErrDialogMaybeOpen)
+    if (s.dialogMaybeOpen) {
       const fresh = await readRow(key, s, true)
       const requests = s.row?.unproven_requests
       s.dialogHold = fresh && s.row?.state === 'waiting' && !!requests?.length && requests.every(r => r.decision !== null)
@@ -281,7 +316,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         }
         if (action === 'observeLaunch') {
           release(s); s.e.phase = 'ready'; s.e.launchSeen = k.r.launch; s.e.sessionSeen = k.r.session; s.e.compactionSeen = k.r.compactions
-          s.e.retypes = {}; s.dialogHold = false; s.e.enterRetries = 0; s.retryStep = 0; s.notNowStep = 0; s.recover = true
+          s.e.retypes = {}; s.dialogHold = false; s.dialogMaybeOpen = false; s.e.enterRetries = 0; s.retryStep = 0; s.notNowStep = 0; s.recover = true
           s.deadlines.backoff = 0; s.deadlines.notNow = 0; s.deadlines.enterDelay = 0; s.deadlines.idleEvidence = clock.now() + ms('IDLE_EVIDENCE_MAX_WAIT_MS', IDLE_EVIDENCE_MAX_WAIT_MS)
           s.waitingAt = s.row?.state === 'waiting' ? clock.now() : undefined
           s.deadlines.settle = s.waitingAt === undefined ? Infinity : s.waitingAt + ms('LAUNCH_SETTLE_MS', LAUNCH_SETTLE_MS)
@@ -294,6 +329,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           queueWrite(s, { v: 1, kind: 'delivered', seq: pair[0], part, at: clock.now(), receipt: { path: receipt.path, uuid: receipt.uuid, offset: receipt.offset } }, () => {
             s.e.lastDelivered = pair; lastDelivered.set(key, { pair, text: head!.fixed!.parts[part - 1]! }); s.e.phase = 'ready'; s.e.target = NO_DELIVERY_PAIR; s.recover = false; release(s)
             emit({ type: 'delivered', key, seq: pair[0], part })
+            const item = deps.queue.items(key).find(i => i.accepted.seq === pair[0])
+            if (item?.delivered) emit({ type: 'item-delivered', key, seq: pair[0], at: clock.now(), waitMs: Math.max(0, clock.now() - item.accepted.received_at) })
           }); continue
         }
         if (action === 'fixText') {
@@ -340,6 +377,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           try {
             const params: SendKeysParams = { instance_id: deps.instanceId(key), text: head!.fixed!.parts[part - 1], no_enter: true }
             await ad(key, s, 'send-keys', client => client.sendKeys(params))
+            if (part === 1 && effectiveSends(head!, part).at(-1)?.send_kind === 'text' && !typed.has(`${key}:${pair[0]}`)) { typed.add(`${key}:${pair[0]}`); emit({ type: 'first-typed', key, seq: pair[0], part }) }
+            s.dialogMaybeOpen = false
             s.notNowStep = 0; s.e.enterRetries = 0; s.deadlines.notNow = 0; s.e.phase = 'enter'; s.deadlines.enterDelay = clock.now() + ms('ENTER_DELAY_MS', ENTER_DELAY_MS)
           } catch (error) { await keyError(key, s, error, true) }
           if (s.e.phase === 'enter') { nextDelay = ms('ENTER_DELAY_MS', ENTER_DELAY_MS); break }
@@ -380,7 +419,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           release(s); s.recover = false
           await life.retryReconnect(key); break
         }
-        if (action === 'stopAbsent') { release(s); break }
+        if (action === 'stopAbsent') { release(s); wait(key, s, 'state'); break }
         if (s.e.phase === 'enter' || s.e.phase === 'retry') {
           // A wake can run between a text and its delayed Enter. Keep the
           // key sequence's lease until the Enter (including retry delays).
@@ -432,6 +471,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     async stop() { stopped = true; const stoppingLife = life.stop(); for (const [key, s] of states) { s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); life.engineRunning(key, false) }; await Promise.allSettled([...states.values()].flatMap(s => s.busy ? [s.busy] : [])); await stoppingLife; states.clear(); lastDelivered.clear() },
     running: key => states.has(key),
     snapshot: key => states.get(key)?.snapshot,
+    status: key => { const s = states.get(key); return s ? status(key, s) : undefined },
   }
   life.setRecovery(api.recoverBeforeReconnect)
   life.setReconnect(async key => {
