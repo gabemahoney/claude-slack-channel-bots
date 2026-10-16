@@ -720,8 +720,25 @@ t18_condition_section() {
         # key calls before inspecting their order, provenance and delay.
         wait_until "${RECOVERY_SLACK_S}" "${step}: ${p}'s reconnect never submitted" \
             t18_reconnect_submitted "${!id_var}" "${unwedge_mark}"
+        # The unwedge may land between an in-flight attempt's pane reads
+        # and its successful text/Enter. Include that complete attempt:
+        # from the preceding send through the first post-unwedge Enter,
+        # excluding the preceding send itself. Earlier refused attempts
+        # must not count as another text/Enter pair in this audit.
+        calls="$(ad_cscb_calls "${!id_var}" - -)" || exit 1
+        calls="$(awk -F '\t' -v mark="${unwedge_mark}" '
+            { rows[NR] = $0 }
+            $4 == "send-keys" {
+                sends[++n] = NR
+                if ($1 > mark && $6 ~ /--key Enter/) {
+                    first = n > 2 ? sends[n - 2] + 1 : 1
+                    for (i = first; i <= NR; i++) print rows[i]
+                    exit
+                }
+            }
+        ' <<< "${calls}")"
         _scenario_assert_reconnect_rows "${step}: ${p}" "${SERVER_PID}" "${ENTER_DELAY_MS}" "${FULL_LINES}" \
-            "$(ad_cscb_calls "${!id_var}" "${unwedge_mark}" -)"
+            "${calls}"
 
         # Exactly one alert and one recovery, the recovery after the unwedge.
         n="$(t18_count_posts "" "${!alert_var}")"

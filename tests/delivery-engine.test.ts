@@ -3,7 +3,7 @@
  * own suite. Every timestamp and retry is driven by the injected fake clock. */
 import { afterEach, describe, expect, test } from 'bun:test'
 import { readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
-import { createDeliveryCallBudget, DeliveryBudgetWait, deliveryTextWasRefused, LAUNCH_SETTLE_MS, ENTER_DELAY_MS, ENTER_ONLY_RETRY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS, NOT_NOW_RETRY_MS, IDLE_EVIDENCE_MAX_WAIT_MS, DELIVERY_MAX_AD_CALLS_PER_S } from '../src/delivery-engine.ts'
+import { createDeliveryCallBudget, DeliveryBudgetWait, deliveryTextWasRefused, LAUNCH_SETTLE_MS, ENTER_DELAY_MS, ENTER_ONLY_RETRY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS, NOT_NOW_RETRY_MS, IDLE_EVIDENCE_MAX_WAIT_MS, DELIVERY_MAX_AD_CALLS_PER_S, RECONNECT_BLOCKED_NOTICE_MS } from '../src/delivery-engine.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
 import { appendTranscript, codexPromptEntry, deliveryPane, promptEntry, queueOperationEntry, replyEntry, writeTranscript } from './test-helpers/working-row-panes.ts'
 import { cannedPermissionRequest, errCallTimeout, errConfigMalformed, errDialogMaybeOpen, errInternal, errInvalidFlags, errPaneChanged, errRelayFallenBack, errSendKeysWhileRelayed, errSpawnNotFound, errSpawnNotInteractive, errSystemInstallDisappeared, errTmuxNotAvailable, errTmuxSendKeys, errTmuxSessionConflict, errTmuxUnresponsive, errUnusableName } from './test-helpers/agent-director-stub.ts'
@@ -227,6 +227,67 @@ describe('fresh send guards', () => {
     expect(h.queue.openCount('alpha')).toBe(1)
     p.row.state = 'waiting'; p.running = false; p.autoReceipt = true
     await delivered(h)
+  })
+})
+
+describe('deferred reconnect latch guard', () => {
+  // b.omv SR-5.5 and b.jg5 SRJ-502: the no-engine timer must leave all
+  // agent-director calls to the latch re-check until the latch clears.
+  test.each(['before-client', 'during-client'] as const)('a latch set %s pauses reconnect and its screen clock, then the timer retries after clear', async when => {
+    let h!: EngineHarness, releaseClient!: () => void
+    const clientReady = new Promise<void>(resolve => { releaseClient = resolve })
+    const clients: string[] = []
+    h = await harness({ keys: ['alpha', 'beta'], clientFor: async key => {
+      clients.push(key)
+      if (key === 'alpha' && when === 'during-client' && clients.filter(k => k === 'alpha').length === 1) await clientReady
+      return h.client(key)
+    } })
+    const p = h.p()
+    p.connected = false
+    p.latched = when === 'before-client'
+    h.lifecycle.defer('alpha', 'menu')
+    try {
+      expect(h.engine.running('alpha')).toBe(false)
+      await h.clock.advance(NOT_NOW_RETRY_MS[0] - 1)
+      expect(clients).toEqual([])
+      expect(h.calls).toEqual([])
+      await h.clock.advance(1)
+      if (when === 'during-client') {
+        expect(clients).toEqual(['alpha'])
+        p.latched = true
+        releaseClient()
+        await h.clock.flush()
+      }
+      const blockedMs = NOT_NOW_RETRY_MS[0]
+      expect(h.lifecycle.deferred('alpha')).toEqual({ due: false, screen: undefined, blockedMs })
+      await h.clock.advance(RECONNECT_BLOCKED_NOTICE_MS)
+      expect(h.calls).toEqual([])
+      expect(clients).toEqual(when === 'before-client' ? [] : ['alpha'])
+      expect(h.lifecycle.deferred('alpha')).toEqual({ due: false, screen: undefined, blockedMs })
+
+      await h.accept('healthy sibling', 'beta')
+      await h.tick('beta'); await delivered(h, 'beta'); await h.tick('beta')
+      expect(h.textCalls('beta').map(call => call.params.text)).toEqual(['healthy sibling'])
+      expect(h.calls.filter(call => call.key === 'alpha')).toEqual([])
+      expect(h.lifecycle.deferred('alpha')?.blockedMs).toBe(blockedMs)
+
+      // Clearing the latch supplies no wake or manual retry: only the
+      // already-armed production timer may resume this empty-queue persona.
+      p.latched = false
+      expect(h.clock.pending()).toHaveLength(1)
+      const retryAt = h.clock.pending()[0]!.dueAt
+      await h.clock.advanceTo(retryAt - 1)
+      expect(h.calls.filter(call => call.key === 'alpha')).toEqual([])
+      await h.clock.advance(1)
+      expect(h.calls.filter(call => call.key === 'alpha')).toEqual([{ key: 'alpha', verb: 'reconnect', at: retryAt, params: {} }])
+      expect(clients.filter(key => key === 'alpha')).toHaveLength(when === 'before-client' ? 1 : 2)
+      expect(h.errors).toEqual([])
+      p.connected = true
+      await h.clock.advance(NOT_NOW_RETRY_MS[0])
+      expect(h.lifecycle.deferred('alpha')).toBeUndefined()
+      expect(h.calls.filter(call => call.key === 'alpha')).toHaveLength(1)
+      expect(h.clock.pending()).toEqual([])
+    } finally { releaseClient() }
   })
 })
 

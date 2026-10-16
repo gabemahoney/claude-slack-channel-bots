@@ -430,7 +430,7 @@ Use these shared fixtures for delivery cases. The architecture's [code/model map
 
 | Helper | Contract |
 |---|---|
-| `delivery-engine.ts` | `makeEngineHarness({ keys?, constants?, stateDir?, configuredAgent? })` and `EngineHarness`: real durable queue/production executor, per-persona shared AD stubs, fake clock, concrete pane/transcript adapters and recorded events/errors/restarts/calls. No bot launches. |
+| `delivery-engine.ts` | `makeEngineHarness({ keys?, constants?, stateDir?, configuredAgent?, clientFor? })` and `EngineHarness`: real durable queue/production executor, per-persona shared AD stubs, fake clock, concrete pane/transcript adapters and recorded events/errors/restarts/calls. `clientFor` overrides `DeliveryEngineDeps.clientFor` to hold asynchronous client creation; it defaults to the persona's shared AD stub. No bot launches. |
 | `delivery-model-replay.ts` | `traceTimerConstants`, `decodeDeliveryFixture`, `renderDeliveryKnowledge`, `replayDeliveryFixture`: hash-checked decoding, concrete rendering, frozen separate readings and production decision/target calls. Never copy policy rules into this helper. |
 | `delivery-model-evidence.ts` | `deliveryEvidencePython`: shared read-only certificate/trace validator for verdict and conformance suites, including canonical accepted-work bundles and class-specific temporal evidence. Children use `hostSafeChildEnv`, scratch state and bounded output/time. |
 | `legacy-typing.ts` | `useImmediateTypingLifecycle()` installs/resets the shared fake lifecycle with only its injected `pause` made immediate for older outcome matrices. E3 entry tests use `createDeliveryLifecycle` with its real fake-clock pause to prove timing. |

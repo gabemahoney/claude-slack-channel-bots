@@ -436,8 +436,14 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   life.setRecovery(api.recoverBeforeReconnect)
   life.setReconnect(async key => {
     if (stopped || !deps.persona(key) || deps.isConnected(key)) { life.clearDeferred(key); return }
+    // b.omv SR-5.5, b.jg5 SRJ-502: only the latch re-check may call
+    // agent-director while latched. Keep the reconnect for after the clear,
+    // pausing screen-only time, and recheck after client creation awaits.
+    if (deps.isLatched(key)) { life.defer(key); return }
     const client = await deps.clientFor(key)
-    if (!stopped) await deps.reconnect(key, client, () => { if (stopped || !life.active(key)) throw new Error('Delivery stopped'); budget(key)() })
+    if (stopped || !life.active(key)) return
+    if (deps.isLatched(key)) { life.defer(key); return }
+    await deps.reconnect(key, client, () => { if (stopped || !life.active(key)) throw new Error('Delivery stopped'); budget(key)() })
   })
   return api
 }

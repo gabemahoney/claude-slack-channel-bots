@@ -12,7 +12,7 @@ import { makeQueue, injectedInput, readQueue } from './delivery-queue.ts'
 import { cannedGetResult, makeStubClient, type CannedGetResult } from './agent-director-stub.ts'
 import { appendTranscript, codexPromptEntry, deliveryPane, endedTurn, promptEntry, replyEntry, writeTranscript } from './working-row-panes.ts'
 
-export async function makeEngineHarness(options: { keys?: string[]; constants?: DeliveryEngineDeps['constants']; stateDir?: string; configuredAgent?: 'claude' | 'codex' } = {}) {
+export async function makeEngineHarness(options: { keys?: string[]; constants?: DeliveryEngineDeps['constants']; stateDir?: string; configuredAgent?: 'claude' | 'codex'; clientFor?: DeliveryEngineDeps['clientFor'] } = {}) {
   const root = options.stateDir ?? mkdtempSync(join(tmpdir(), 'delivery-engine-'))
   const clock = createFakeClock(), events: DeliveryEngineEvent[] = [], errors: unknown[] = []
   const calls: { key: string; verb: string; at: number; params: unknown }[] = []
@@ -65,7 +65,7 @@ export async function makeEngineHarness(options: { keys?: string[]; constants?: 
   })
   function build() {
     engines = createDeliveryEngines({ queue, lifecycle, clock, constants: options.constants,
-      clientFor: async key => personas.get(key)!.stub,
+      clientFor: options.clientFor ?? (async key => personas.get(key)!.stub),
       instanceId: key => `cscb_${key}`,
       persona: key => personas.get(key)?.state.applied ? { cwd: root, agent: options.configuredAgent ?? (personas.get(key)!.state.row.agent === 'codex' ? 'codex' : 'claude') } : undefined,
       isUp: key => personas.get(key)?.state.up ?? false, isLatched: key => personas.get(key)?.state.latched ?? false,

@@ -792,7 +792,15 @@ close_mcp_session() {
     fi
 }
 
-trap 'close_mcp_session; rm -f "${HOOK_FILE}" "${STATUS_OUT}" "${STATUS_OUT}.err"' EXIT
+KEY_READER_PID=""
+close_key_reader() {
+    if [[ -n "${KEY_READER_PID}" ]]; then
+        kill "${KEY_READER_PID}" 2> /dev/null || true
+        wait "${KEY_READER_PID}" 2> /dev/null || true
+    fi
+}
+
+trap 'close_key_reader; close_mcp_session; rm -f "${HOOK_FILE}" "${STATUS_OUT}" "${STATUS_OUT}.err"' EXIT
 
 # ---------------------------------------------------------------------------
 # Reporting in, and the read loop
@@ -845,6 +853,11 @@ append_user_receipt() {
 # queued as soon as SessionStart fires. Literal LF is text; tmux's Enter is CR.
 if [[ -t 0 ]]; then
     stty -icanon -echo -icrnl -inlcr -igncr min 1 time 0
+    # Bash's character read re-enables ICRNL on a terminal. Read through a
+    # pipe instead, so CR stays Enter and a literal LF stays draft content.
+    # The forwarding child reads the original terminal and is reaped on exit.
+    exec < <(exec cat)
+    KEY_READER_PID=$!
 fi
 
 case "${MODE}" in
@@ -898,7 +911,7 @@ RELEASED=0
 linger_after_exit() {
     local rc
     trap 'RELEASED=1' USR1
-    trap 'close_mcp_session; rm -f "${HOOK_FILE}" "${STATUS_OUT}" "${STATUS_OUT}.err" "${LINGER_MARKER}"' EXIT
+    trap 'close_key_reader; close_mcp_session; rm -f "${HOOK_FILE}" "${STATUS_OUT}" "${STATUS_OUT}.err" "${LINGER_MARKER}"' EXIT
     { printf '%s\n' "${REALCWD}" > "${LINGER_MARKER}.tmp" && mv -f -- "${LINGER_MARKER}.tmp" "${LINGER_MARKER}"; } 2> /dev/null \
         || printf 'stub-claude[%s]: could not write %s\n' "$$" "${LINGER_MARKER}" >&2
     fire_session_end

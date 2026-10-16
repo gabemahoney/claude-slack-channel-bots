@@ -889,6 +889,8 @@ t19_transcripts_hold() {
 
 t19_harness_check() {
     local step="harness check" dir pane before out
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
     dir="$(make_workdir "${SCENARIO_TAG}selfcheck_work")"
     stub_mode "${dir}" "${STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE}"
     before="$(t19_transcripts)"
@@ -901,10 +903,12 @@ t19_harness_check() {
     stub_press_enter "${pane}"
     wait_until "${TRANSCRIPT_WAIT_S}" "${step}: the stub never reported in after Enter" t19_pane_shows "${pane}" 'Listening for channel messages from:'
     [[ "$(t19_transcripts)" == "${before}" ]] || fail "${step}: a transcript was written at report-in"
-    # A slash command typed into the pane (CSCB's `pause` types `/exit`) is no
-    # message: once the pane shows it, no transcript follows for the hold.
-    stub_type_line "${pane}" "/exit"
+    # Observe the slash command's draft before Enter clears the composer.
+    # Submitting it (as CSCB's `pause` does) must create no transcript.
+    "${SCENARIO_REAL_TMUX}" send-keys -t "${pane}" -l -- "/exit" \
+        || fail "${step}: could not type /exit into the stub's pane"
     wait_until "${TRANSCRIPT_WAIT_S}" "${step}: the pane never showed the typed /exit" t19_pane_shows "${pane}" "/exit"
+    stub_press_enter "${pane}"
     t19_transcripts_hold "${before}" "${SLASH_HOLD_S}" "${step}: after a typed /exit"
     stub_type_line "${pane}" "a first message"
     wait_until "${TRANSCRIPT_WAIT_S}" "${step}: no transcript after a typed line" t19_transcripts_are "$(( before + 1 ))"
