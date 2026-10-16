@@ -1,6 +1,6 @@
 # Scheduled Prompts (cscb_cron)
 
-The server fires scheduled prompts into personas once per minute, reading them from a crontable. Each fire is delivered as an `/interject` message to the target persona, exactly as if a script had POSTed it.
+The server fires scheduled prompts into personas once per minute, reading them from a crontable. Each fire is stored in the target persona’s queue as its own injected message.
 
 ## The crontable
 
@@ -91,11 +91,11 @@ The prompt-file path resolves as follows:
 
 ## How fires appear
 
-A scheduled fire reaches only the target persona's instance, as an `/interject` message with no Slack conversation attached. Its `sender` label is `cscb-cron:<prompt-file-basename>` — for a prompt file `standup.md` the sender is `cscb-cron:standup`. This distinguishes a cron tick from a human and from peer-bot traffic. The [Slack Reply Guard](bots.md#slack-reply-guard-stop-hook) never reminds a bot to reply to a scheduled prompt: like every injected message, a fire carries no `via`. Because a fire carries no channel, a prompt file that wants a Slack reply must say where to post it. Each schedule delivers its own message independently, so when several schedules match the same minute for the same persona each one arrives as its own `/interject` message.
+A scheduled fire is queued only for the target persona, as an injected message with no Slack conversation attached. Its `sender` label is `cscb-cron:<prompt-file-basename>` — for a prompt file `standup.md` the sender is `cscb-cron:standup`. This distinguishes a cron tick from a human and from peer-bot traffic. The [Slack Reply Guard](bots.md#slack-reply-guard-stop-hook) never reminds a bot to reply to a scheduled prompt: like every injected message, a fire carries no `via`. Because a fire carries no channel, a prompt file that wants a Slack reply must say where to post it. Each schedule queues its own message independently, so when several schedules match the same minute for the same persona each one is its own queued item.
 
 ## The cron log
 
-Every fire outcome is recorded in the cron log at `cron_log_path` (default `<config dir>/cron.log`, beside `config.json` wherever the crontable is; override with the `cron_log_path` key). Each attempt writes one line per persona targeted (showing the target as first written in the crontable), plus a per-fire summary line carrying `delivered=N failed=M` counts. The log is plain text, so `grep no-session cron.log` yields readable lines.
+Every fire outcome is recorded in the cron log at `cron_log_path` (default `<config dir>/cron.log`, beside `config.json` wherever the crontable is; override with the `cron_log_path` key). Each attempt writes one line per persona targeted (showing the target as first written in the crontable), plus a per-fire summary line carrying `queued=N failed=M` counts. The log is plain text, so `grep queue-failed cron.log` yields readable lines.
 
 By default the log only grows. To cap it, set `cron_log_max_bytes` in `config.json`: once the log passes that many bytes, its oldest whole lines are dropped, so the oldest fires disappear from it while the newest stay. There is no rotated copy; copy the log elsewhere if you need a longer history. Don't move or delete it yourself: the server keeps writing to the old file until that file passes the cap. A changed cap takes effect at the next server start.
 
@@ -103,14 +103,13 @@ The `outcome` field of each line is one of these classes:
 
 | Outcome | What happened | What to do |
 |---|---|---|
-| `delivered` | The prompt reached the target persona's session. | Nothing — success. |
-| `no-session` | The persona exists but is not up (broken or retrying) or has no live connected session, so the message was dropped. | Check the persona's lines in the server log for the cause. A retrying persona comes up on its own; otherwise bring the session up. Failed fires are **never** retried or queued (see below). |
+| `queued` | The prompt was durably stored for the target persona. | Nothing — storage succeeded; this is not a delivery confirmation. |
+| `queue-failed` | The prompt could not be stored. | Check storage availability and permissions in the server log. |
 | `unknown-persona` | No persona in the applied configuration has that name or key. | Correct the target in the crontable. |
 | `prompt-missing` | The prompt file did not exist at fire time. | Create the file or correct its path in the crontable. |
 | `prompt-unreadable` | The prompt file existed but could not be read (see the `errno`). | Fix file permissions or the path. |
 | `prompt-oversize` | The prompt exceeds the 32KB `/interject` cap and was skipped, never truncated. | Shorten the prompt file. |
 | `parse-error` | The crontable line could not be parsed. | Fix the line — see [Crontable format](#crontable-format). |
-| `http-error` | The localhost POST hit an unexpected HTTP status or a network failure. | Check that the server is listening on loopback (see the `bind` note below) and inspect the `errno`/`status` in the line. |
 | `fanout-deferred` | A line with no persona list (all-bots) was matched but not delivered. | Add a persona list to the line — all-bots delivery is not built yet. |
 
 Each load of the crontable, at start and after each edit, writes one line with its counts. At start it is `scheduler started, N schedules loaded, M undeliverable (no persona list)`; after an edit it is `crontable reloaded, N schedules, M undeliverable (no persona list)`. `M` counts the lines that will never be delivered, and it is written even when it is 0.
@@ -129,13 +128,12 @@ grep undeliverable ~/.config/claude-slack-channel-bots/cron.log
 
 ## Delivery semantics
 
-- **No retry.** A failed fire is logged and dropped — never queued or re-sent. A persona that is not up, or has no live session, fails every fire until it is up and its session is running again; the server does not queue the missed prompts.
+- **Accepted fires stay queued.** A configured persona can accept prompts while it is down or disconnected. Every accepted fire is kept independently; a failed store is logged as `queue-failed` and is not an accepted item.
 - **Missed fires are skipped, not caught up.** While the server is down, no scheduled prompts fire, and they are not replayed on restart. The `scheduler started, N schedules loaded, M undeliverable (no persona list)` line in the cron log marks when scheduling resumed, bounding the outage window.
 - **Edits take effect within a minute — no restart.** The scheduler checks the crontable fresh on every tick, so an edit by hand or a line appended by a bot starts (or stops) firing within about a minute. The server is never restarted for a schedule change.
 - **Deleting the crontable stops all schedules.** Nothing fires from that moment, a WARN appears in the cron log, and the server re-creates the file empty (with its header) within about two minutes — detection and re-creation happen on separate once-a-minute passes, so the re-create lands up to two tick boundaries after the deletion. Add lines back and they schedule on the next check.
 - **Server-local time.** Cron expressions are evaluated in the server's local timezone.
 - **A line without a persona list is never delivered.** Each load logs a `warn` naming it and counts it undeliverable; each time it matches, it is logged `fanout-deferred` and dropped. Give the line a persona list to have it fire.
-- **`bind` must include loopback.** The scheduler delivers via `127.0.0.1`, so a `bind` set to a single non-loopback interface makes every fire fail with `http-error`. Use the default `127.0.0.1` or `0.0.0.0`.
 
 ## Bot self-scheduling
 

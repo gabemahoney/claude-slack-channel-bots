@@ -14,7 +14,7 @@
 # (SCENARIO_STUB_DIR), and config.json's `mcp_config_path` names an MCP config
 # under the scratch root, so each persona's stub opens an MCP session to this
 # server. The stub's push control (`slack_stub_push`) sends each event; the
-# session's delivery record (`stub_session_deliveries`) shows what reached
+# session's accepted queue record (`stub_session_deliveries`) shows what reached
 # the persona; its tool calls (`stub_session_call`) call set_channel_delivery.
 # `health_check_interval` is 0 (no restart chases anything) and `exit_timeout`
 # is 5 (stub-claude ignores the `/exit` that `stop --stop-bots` sends).
@@ -28,7 +28,8 @@
 #   stored-choice file; no server.log line names the switch's key, fungible
 #   mode or a class this work adds. alpha A1 plain is delivered `receive_all`
 #   (the first-delivery control); U1, unlisted, one mention as both its
-#   events, logs exactly one 0.11.1 `unclaimed-channel` line; A2 plain is a
+#   events, logs exactly two `unclaimed-channel` lines (drops store no dedupe
+#   fact); A2 plain is a
 #   `not-mentioned` drop; A2 and B1 mentions are delivered `mention`; the
 #   tool is refused with the declarative text (the first-tool-result control),
 #   and nothing is written.
@@ -209,7 +210,7 @@ plain_drop() {
 DROP_NOT_MENTIONED='not-mentioned'
 DROP_GROUP_DM='group-dm'
 # src/delivery-decision.ts Via (a type only): how a delivered message reached
-# its persona, the delivery record's `meta.via`.
+# its persona, the accepted queue record's `meta.via`.
 VIA_MENTION='mention'
 VIA_BROADCAST='broadcast'
 VIA_RECEIVE_ALL='receive_all'
@@ -330,7 +331,7 @@ rec_at_least() {
     (( $(rec_count "$@") >= min ))
 }
 
-# The delivery-record query: lines of a stub MCP session's delivery record
+# The delivery-record query: lines of a stub MCP session's accepted queue record
 # whose `meta.chat_id` and `meta.ts` are given, and `meta.via` when given.
 DELIVERY_QUERY="${SCENARIO_ROOT}/delivery-query.py"
 cat > "${DELIVERY_QUERY}" << 'EOF'
@@ -343,10 +344,10 @@ with open(path) as f:
             rec = json.loads(line)
         except ValueError:
             continue
-        meta = rec.get("meta") if isinstance(rec, dict) else None
+        meta = rec if isinstance(rec, dict) and rec.get("kind") == "accepted" and rec.get("compact") is None else None
         if not isinstance(meta, dict):
             continue
-        if meta.get("chat_id") == chat and meta.get("ts") == ts and (via == "" or meta.get("via") == via):
+        if meta.get("channel") == chat and meta.get("ts") == ts and (via == "" or meta.get("via") == via):
             count += 1
 print(count)
 EOF
@@ -406,28 +407,36 @@ EOF
 
 # deliveries <dir> <chat-id> <ts> [<via>]: how many deliveries the persona
 # working in <dir> received for that message (with that `via`, when given).
-deliveries() {
+queued_count() {
     local snapshot="${SCENARIO_ROOT}/deliveries-snapshot"
-    stub_session_deliveries "$1" > "${snapshot}"
+    local key
+    case "$1" in
+        "${ALPHA_DIR}") key="${ALPHA_KEY}" ;;
+        "${BRAVO_DIR}") key="${BRAVO_KEY}" ;;
+        *) fail "queued_count: unknown persona working directory" ;;
+    esac
+    queue_accepted "${key}" > "${snapshot}"
     python3 "${DELIVERY_QUERY}" "${snapshot}" "$2" "$3" "${4:-}"
 }
 
-delivered() {
-    (( $(deliveries "$@") >= 1 ))
+queued() {
+    (( $(queued_count "$@") == 1 ))
 }
 
-# wait_delivered <step> <dir> <chat-id> <ts> <via>: the delivery reaches the
-# delivery record, with that `via`.
-wait_delivered() {
+# wait_queued <step> <dir> <chat-id> <ts> <via>: the delivery reaches the
+# accepted queue record, with that `via`.
+declare -A EXPECTED_QUEUE_ROWS=()
+wait_queued() {
     local step="$1"; shift
-    wait_until "${EVENT_WAIT_S}" "${step}: no delivery with via $4 in the delivery record of $1" delivered "$@"
+    wait_until "${EVENT_WAIT_S}" "${step}: no delivery with via $4 in the accepted queue record of $1" queued "$@"
+    EXPECTED_QUEUE_ROWS["${QUEUE_KEY[$1]}|$2|$3|$4"]="$(jq -cn --arg c "$2" --arg t "$3" --arg v "$4" '[$c,$t,$v]')"
 }
 
-# expect_deliveries <step> <want> <dir> <chat-id> <ts> [<via>]
-expect_deliveries() {
+# expect_queued <step> <want> <dir> <chat-id> <ts> [<via>]
+expect_queued() {
     local step="$1" want="$2" got; shift 2
-    got="$(deliveries "$@")"
-    [[ "${got}" == "${want}" ]] || fail "${step}: ${got} deliveries of $2 ts $3${4:+ via $4} in the delivery record of $1, expected ${want}"
+    got="$(queued_count "$@")"
+    [[ "${got}" == "${want}" ]] || fail "${step}: ${got} deliveries of $2 ts $3${4:+ via $4} in the accepted queue record of $1, expected ${want}"
 }
 
 # The stub MCP session's records of each persona's working directory
@@ -437,11 +446,15 @@ expect_deliveries() {
 # use) under the real path of SCENARIO_STUB_DIR (_scenario_stub_dir). Either
 # helper prints its FAIL line when it cannot resolve or hash a path. Every
 # later read of a record takes these paths.
-declare -A DELIVERIES_FILE=() REQUESTS_FILE=() RESULTS_FILE=()
+declare -A DELIVERIES_FILE=() QUEUE_KEY=() REQUESTS_FILE=() RESULTS_FILE=()
 STUB_REAL_DIR="$(_scenario_stub_dir "the stub MCP session's records")" || exit 1
 for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
     record_key="$(_scenario_stub_key "the stub MCP session's records of ${dir}" "${dir}")" || exit 1
-    DELIVERIES_FILE["${dir}"]="${STUB_REAL_DIR}/${SCENARIO_STUB_DELIVERIES_PREFIX}${record_key}${SCENARIO_STUB_RECORD_SUFFIX}"
+    case "${dir}" in
+        "${ALPHA_DIR}") QUEUE_KEY["${dir}"]="${ALPHA_KEY}" ;;
+        "${BRAVO_DIR}") QUEUE_KEY["${dir}"]="${BRAVO_KEY}" ;;
+    esac
+    DELIVERIES_FILE["${dir}"]="${SLACK_STATE_DIR}/queue/${QUEUE_KEY[${dir}]}.jsonl"
     REQUESTS_FILE["${dir}"]="${STUB_REAL_DIR}/${SCENARIO_STUB_REQUESTS_PREFIX}${record_key}${SCENARIO_STUB_RECORD_SUFFIX}"
     RESULTS_FILE["${dir}"]="${STUB_REAL_DIR}/${SCENARIO_STUB_RESULTS_PREFIX}${record_key}${SCENARIO_STUB_RECORD_SUFFIX}"
 done
@@ -834,19 +847,19 @@ cmp -s -- "${CONFIG}" "${LAST}" || fail "phase A: config.json.last-applied does 
 [[ ! -e "${STORE_FILE}" ]] || fail "phase A: ${STORE_FILE} exists in declarative mode"
 check_upgrade_log "phase A after the start"
 
-# alpha A1 plain: delivered `receive_all`, found in the delivery record (the
+# alpha A1 plain: delivered `receive_all`, found in the accepted queue record (the
 # first-delivery control, SRI-1404).
 push_message "${ALPHA_LABEL}" "${A1}" channel "$(plain_text)"
 A_A1_TS="${PUSH_TS}"
-wait_delivered "phase A: alpha A1 plain" "${ALPHA_DIR}" "${A1}" "${A_A1_TS}" "${VIA_RECEIVE_ALL}"
+wait_queued "phase A: alpha A1 plain" "${ALPHA_DIR}" "${A1}" "${A_A1_TS}" "${VIA_RECEIVE_ALL}"
 
-# alpha U1, unlisted: one mention as both its events: exactly one 0.11.1
-# `unclaimed-channel` line, no delivery.
+# alpha U1, unlisted: one mention as both its events: exactly two
+# `unclaimed-channel` lines, no delivery; drops store no durable dedupe fact.
 A_U1_MARK="$(log_mark)"
 push_mention "${ALPHA_LABEL}" "${U1}" channel "$(mention_text "${ALPHA_BOT_USER}")" app-first
 A_U1_TS="${PUSH_TS}"
 wait_since "${A_U1_MARK}" "${U1_UNCLAIMED}" "${EVENT_WAIT_S}" "phase A: alpha U1: no 0.11.1 unclaimed-channel line"
-expect_deliveries "phase A: alpha U1" 0 "${ALPHA_DIR}" "${U1}" "${A_U1_TS}"
+expect_queued "phase A: alpha U1" 0 "${ALPHA_DIR}" "${U1}" "${A_U1_TS}"
 
 # alpha A2 plain: a `not-mentioned` drop, no delivery.
 A_A2_MARK="$(log_mark)"
@@ -854,19 +867,19 @@ push_message "${ALPHA_LABEL}" "${A2}" channel "$(plain_text)"
 A_A2_TS="${PUSH_TS}"
 wait_since "${A_A2_MARK}" "$(plain_drop "${ALPHA_REF}" "${A2}" "${DROP_NOT_MENTIONED}")" "${EVENT_WAIT_S}" \
     "phase A: alpha A2 plain: no not-mentioned line"
-expect_deliveries "phase A: alpha A2 plain" 0 "${ALPHA_DIR}" "${A2}" "${A_A2_TS}"
+expect_queued "phase A: alpha A2 plain" 0 "${ALPHA_DIR}" "${A2}" "${A_A2_TS}"
 
 # alpha A2 mention: delivered `mention`; a later positive control on alpha's
 # connection, after which U1's and A1's counts are final.
 push_message "${ALPHA_LABEL}" "${A2}" channel "$(mention_text "${ALPHA_BOT_USER}")"
-wait_delivered "phase A: alpha A2 mention" "${ALPHA_DIR}" "${A2}" "${PUSH_TS}" "${VIA_MENTION}"
-expect_since "${A_U1_MARK}" "${U1_UNCLAIMED}" 1 "phase A: alpha U1's unclaimed-channel lines"
-expect_deliveries "phase A: alpha U1, after a later delivery" 0 "${ALPHA_DIR}" "${U1}" "${A_U1_TS}"
-expect_deliveries "phase A: alpha A1 plain" 1 "${ALPHA_DIR}" "${A1}" "${A_A1_TS}"
+wait_queued "phase A: alpha A2 mention" "${ALPHA_DIR}" "${A2}" "${PUSH_TS}" "${VIA_MENTION}"
+expect_since "${A_U1_MARK}" "${U1_UNCLAIMED}" 2 "phase A: alpha U1's unclaimed-channel lines"
+expect_queued "phase A: alpha U1, after a later delivery" 0 "${ALPHA_DIR}" "${U1}" "${A_U1_TS}"
+expect_queued "phase A: alpha A1 plain" 1 "${ALPHA_DIR}" "${A1}" "${A_A1_TS}"
 
 # bravo B1 mention: delivered `mention`.
 push_message "${BRAVO_LABEL}" "${B1}" channel "$(mention_text "${BRAVO_BOT_USER}")"
-wait_delivered "phase A: bravo B1 mention" "${BRAVO_DIR}" "${B1}" "${PUSH_TS}" "${VIA_MENTION}"
+wait_queued "phase A: bravo B1 mention" "${BRAVO_DIR}" "${B1}" "${PUSH_TS}" "${VIA_MENTION}"
 
 # alpha calls the tool for A1 with `all`: refused with the declarative text,
 # found in the results record with isError set (the first-tool-result
@@ -901,11 +914,11 @@ confirm_switch() {
 # the switch kept both sessions: no registration and no launch line for
 # either persona since confirm_switch noted them. Read after a delivery on
 # each persona's connection made since the confirmation (the message given
-# for each), which this checks is in that persona's delivery record.
+# for each), which this checks is in that persona's accepted queue record.
 expect_sessions_kept() {
     local step="$1"
-    delivered "${ALPHA_DIR}" "$2" "$3" || fail "${step}: no delivery of $2 ts $3 to ${ALPHA}, the positive control"
-    delivered "${BRAVO_DIR}" "$4" "$5" || fail "${step}: no delivery of $4 ts $5 to ${BRAVO}, the positive control"
+    queued "${ALPHA_DIR}" "$2" "$3" || fail "${step}: no delivery of $2 ts $3 to ${ALPHA}, the positive control"
+    queued "${BRAVO_DIR}" "$4" "$5" || fail "${step}: no delivery of $4 ts $5 to ${BRAVO}, the positive control"
     [[ "$(launch_counts "${ALPHA_REF}" "${ALPHA_START}" "${ALPHA_RELAUNCH}")" == "${ALPHA_LAUNCHES}" ]] \
         || fail "${step}: a session registration or launch line for ${ALPHA} after the confirmation"
     [[ "$(launch_counts "${BRAVO_REF}" "${BRAVO_START}" "${BRAVO_RELAUNCH}")" == "${BRAVO_LAUNCHES}" ]] \
@@ -923,7 +936,7 @@ push_message "${ALPHA_LABEL}" "${F1}" channel "$(plain_text)" false
 B1_TS="${PUSH_TS}"
 wait_since "${B1_MARK}" "$(plain_drop "${ALPHA_REF}" "${F1}" "${DROP_NOT_MENTIONED}")" "${EVENT_WAIT_S}" \
     "step 1: no not-mentioned line for alpha F1"
-expect_deliveries "step 1: alpha F1 plain" 0 "${ALPHA_DIR}" "${F1}" "${B1_TS}"
+expect_queued "step 1: alpha F1 plain" 0 "${ALPHA_DIR}" "${F1}" "${B1_TS}"
 expect_since "${B1_MARK}" "${ALPHA_HEARS_F1}" 1 "step 1: alpha's persona-invited-channel lines for F1"
 
 # 2. alpha, F1, a mention as app_mention then message: one delivery with
@@ -931,7 +944,7 @@ expect_since "${B1_MARK}" "${ALPHA_HEARS_F1}" 1 "step 1: alpha's persona-invited
 B2_MARK="$(log_mark)"
 push_mention "${ALPHA_LABEL}" "${F1}" channel "$(mention_text "${ALPHA_BOT_USER}")" app-first
 B2_TS="${PUSH_TS}"
-wait_delivered "step 2: alpha F1 mention (app_mention first)" "${ALPHA_DIR}" "${F1}" "${B2_TS}" "${VIA_MENTION}"
+wait_queued "step 2: alpha F1 mention (app_mention first)" "${ALPHA_DIR}" "${F1}" "${B2_TS}" "${VIA_MENTION}"
 expect_since "${B2_MARK}" "[slack] ${UNCLAIMED_CHANNEL}:" 0 "step 2: unclaimed-channel lines"
 
 # 3. alpha, F1, a mention as message then app_mention: one delivery with
@@ -939,13 +952,13 @@ expect_since "${B2_MARK}" "[slack] ${UNCLAIMED_CHANNEL}:" 0 "step 2: unclaimed-c
 B3_MARK="$(log_mark)"
 push_mention "${ALPHA_LABEL}" "${F1}" channel "$(mention_text "${ALPHA_BOT_USER}")" message-first
 B3_TS="${PUSH_TS}"
-wait_delivered "step 3: alpha F1 mention (message first)" "${ALPHA_DIR}" "${F1}" "${B3_TS}" "${VIA_MENTION}"
+wait_queued "step 3: alpha F1 mention (message first)" "${ALPHA_DIR}" "${F1}" "${B3_TS}" "${VIA_MENTION}"
 push_message "${ALPHA_LABEL}" "${F1}" channel "<!here> ${TEST_NAME} broadcast"
 B3_HERE_TS="${PUSH_TS}"
-wait_delivered "step 3: alpha F1 <!here>" "${ALPHA_DIR}" "${F1}" "${B3_HERE_TS}" "${VIA_BROADCAST}"
+wait_queued "step 3: alpha F1 <!here>" "${ALPHA_DIR}" "${F1}" "${B3_HERE_TS}" "${VIA_BROADCAST}"
 # Read after a later delivery on alpha's connection.
-expect_deliveries "step 2: alpha F1 mention (app_mention first)" 1 "${ALPHA_DIR}" "${F1}" "${B2_TS}"
-expect_deliveries "step 3: alpha F1 mention (message first)" 1 "${ALPHA_DIR}" "${F1}" "${B3_TS}"
+expect_queued "step 2: alpha F1 mention (app_mention first)" 1 "${ALPHA_DIR}" "${F1}" "${B2_TS}"
+expect_queued "step 3: alpha F1 mention (message first)" 1 "${ALPHA_DIR}" "${F1}" "${B3_TS}"
 expect_since "${B3_MARK}" "[slack] ${UNCLAIMED_CHANNEL}:" 0 "step 3: unclaimed-channel lines"
 
 # 4. bravo, private F2 (`group`, a G… ID), a mention: one delivery with
@@ -953,7 +966,7 @@ expect_since "${B3_MARK}" "[slack] ${UNCLAIMED_CHANNEL}:" 0 "step 3: unclaimed-c
 B4_MARK="$(log_mark)"
 push_message "${BRAVO_LABEL}" "${F2}" group "$(mention_text "${BRAVO_BOT_USER}")"
 B4_TS="${PUSH_TS}"
-wait_delivered "step 4: bravo F2 mention" "${BRAVO_DIR}" "${F2}" "${B4_TS}" "${VIA_MENTION}"
+wait_queued "step 4: bravo F2 mention" "${BRAVO_DIR}" "${F2}" "${B4_TS}" "${VIA_MENTION}"
 expect_since "${B4_MARK}" "${BRAVO_HEARS_F2}" 1 "step 4: bravo's persona-invited-channel lines for F2"
 # The switch kept both sessions (SRI-1406), read after alpha's step 3
 # broadcast and bravo's step 4 mention, each delivered since the confirmation.
@@ -971,12 +984,12 @@ b5_refused() {
     wait_since "${mark}" "${line}" "${EVENT_WAIT_S}" "${step}: no unclaimed-channel line with its reason"
     expect_since "${mark}" "${line}" 1 "${step}: unclaimed-channel lines"
     expect_since "${mark}" "[slack] ${UNCLAIMED_CHANNEL}:" 1 "${step}: unclaimed-channel lines of any cause"
-    expect_deliveries "${step}" 0 "${ALPHA_DIR}" "${channel}" "${ts}"
+    expect_queued "${step}" 0 "${ALPHA_DIR}" "${channel}" "${ts}"
     expect_since "${mark}" "[slack] ${PERSONA_INVITED_CHANNEL}:" 0 "${step}: persona-invited-channel lines"
 }
 b5_refused "step 5: alpha X1, flag true" "${X1}" true "${X1_UNCLAIMED}"
 # The broadcast's count is final after a later decision on alpha's connection.
-expect_deliveries "step 3: alpha F1 <!here>" 1 "${ALPHA_DIR}" "${F1}" "${B3_HERE_TS}"
+expect_queued "step 3: alpha F1 <!here>" 1 "${ALPHA_DIR}" "${F1}" "${B3_HERE_TS}"
 b5_refused "step 5: alpha X2, no flag" "${X2}" omit "${X2_UNCLAIMED}"
 b5_refused "step 5: alpha X3, a non-boolean flag" "${X3}" '"yes"' "${X3_UNCLAIMED}"
 
@@ -990,7 +1003,7 @@ push_event "${ALPHA_LABEL}" "$(message_event "${GDM}" mpim "$(mention_text "${AL
 wait_since "${B6_MARK}" "$(plain_drop "${ALPHA_REF}" "${GDM}" "${DROP_GROUP_DM}")" "${EVENT_WAIT_S}" \
     "step 6: no group-dm line for alpha's group DM"
 expect_since "${B6_MARK}" "$(plain_drop "${ALPHA_REF}" "${GDM}" "${DROP_GROUP_DM}")" 1 "step 6: group-dm lines"
-expect_deliveries "step 6: alpha's group DM" 0 "${ALPHA_DIR}" "${GDM}" "${B6_TS}"
+expect_queued "step 6: alpha's group DM" 0 "${ALPHA_DIR}" "${GDM}" "${B6_TS}"
 expect_since "${B6_MARK}" "[slack] ${UNCLAIMED_CHANNEL}:" 0 "step 6: unclaimed-channel lines"
 
 # 7. alpha, A1 (listed `all`, alpha's own fungible destination, no stored
@@ -1001,7 +1014,7 @@ push_message "${ALPHA_LABEL}" "${A1}" channel "$(plain_text)"
 B7_TS="${PUSH_TS}"
 wait_since "${B7_MARK}" "$(plain_drop "${ALPHA_REF}" "${A1}" "${DROP_NOT_MENTIONED}")" "${EVENT_WAIT_S}" \
     "step 7: no not-mentioned line for alpha A1"
-expect_deliveries "step 7: alpha A1 plain" 0 "${ALPHA_DIR}" "${A1}" "${B7_TS}"
+expect_queued "step 7: alpha A1 plain" 0 "${ALPHA_DIR}" "${A1}" "${B7_TS}"
 expect_since "${B7_MARK}" "${ALPHA_HEARS_A1}" 1 "step 7: alpha's persona-invited-channel lines for A1"
 
 # 8. alpha stores `all` for F1: accepted, naming F1, the stored `all` and the
@@ -1012,7 +1025,7 @@ expect_tool "step 8: alpha's set_channel_delivery F1 all" "${ALPHA_DIR}" "${F1_A
 expect_since "${B8_MARK}" "${ALPHA_SET_F1}" 1 "step 8: alpha's persona-channel-delivery-set lines"
 [[ -f "${STORE_FILE}" ]] || fail "step 8: the accepted call wrote no ${STORE_FILE}"
 push_message "${ALPHA_LABEL}" "${F1}" channel "$(plain_text)"
-wait_delivered "step 8: alpha F1 plain" "${ALPHA_DIR}" "${F1}" "${PUSH_TS}" "${VIA_RECEIVE_ALL}"
+wait_queued "step 8: alpha F1 plain" "${ALPHA_DIR}" "${F1}" "${PUSH_TS}" "${VIA_RECEIVE_ALL}"
 
 # 9. alpha's refused calls: X1 with `all` (naming X1), F1 with "everything"
 #    (naming the value); neither stores anything.
@@ -1028,7 +1041,7 @@ expect_since "${B9_MARK}" "[slack] ${PERSONA_CHANNEL_DELIVERY_SET}:" 0 "step 9: 
 #     held at `mentions`; bravo, A1, plain: no delivery.
 B10_MARK="$(log_mark)"
 push_message "${BRAVO_LABEL}" "${A1}" channel "$(mention_text "${BRAVO_BOT_USER}")"
-wait_delivered "step 10: bravo A1 mention" "${BRAVO_DIR}" "${A1}" "${PUSH_TS}" "${VIA_MENTION}"
+wait_queued "step 10: bravo A1 mention" "${BRAVO_DIR}" "${A1}" "${PUSH_TS}" "${VIA_MENTION}"
 expect_since "${B10_MARK}" "${BRAVO_HEARS_A1}" 1 "step 10: bravo's persona-invited-channel lines for A1"
 expect_tool "step 10: bravo's set_channel_delivery A1 all" "${BRAVO_DIR}" \
     "$(jq -c -n --arg c "${A1}" '{channel: $c, delivery: "all"}')" false "${RESULT_A1_HELD}"
@@ -1038,28 +1051,28 @@ push_message "${BRAVO_LABEL}" "${A1}" channel "$(plain_text)"
 B10_TS="${PUSH_TS}"
 wait_since "${B10_PLAIN_MARK}" "$(plain_drop "${BRAVO_REF}" "${A1}" "${DROP_NOT_MENTIONED}")" "${EVENT_WAIT_S}" \
     "step 10: no not-mentioned line for bravo A1"
-expect_deliveries "step 10: bravo A1 plain" 0 "${BRAVO_DIR}" "${A1}" "${B10_TS}"
+expect_queued "step 10: bravo A1 plain" 0 "${BRAVO_DIR}" "${A1}" "${B10_TS}"
 
 # 11. bravo and F1, shared delivery: a mention is delivered, bravo stores
 #     `all` for F1, then one plain F1 message pushed to both personas is
 #     delivered to each with `receive_all_shared`.
 B11_MARK="$(log_mark)"
 push_message "${BRAVO_LABEL}" "${F1}" channel "$(mention_text "${BRAVO_BOT_USER}")"
-wait_delivered "step 11: bravo F1 mention" "${BRAVO_DIR}" "${F1}" "${PUSH_TS}" "${VIA_MENTION}"
+wait_queued "step 11: bravo F1 mention" "${BRAVO_DIR}" "${F1}" "${PUSH_TS}" "${VIA_MENTION}"
 expect_tool "step 11: bravo's set_channel_delivery F1 all" "${BRAVO_DIR}" "${F1_ALL_ARGS}" false "${RESULT_F1_ALL}"
 expect_since "${B11_MARK}" "${BRAVO_SET_F1}" 1 "step 11: bravo's persona-channel-delivery-set lines for F1"
 push_both "${F1}" channel "$(plain_text)"
 B11_TS="${PUSH_TS}"
-wait_delivered "step 11: alpha F1 plain (shared)" "${ALPHA_DIR}" "${F1}" "${B11_TS}" "${VIA_RECEIVE_ALL_SHARED}"
-wait_delivered "step 11: bravo F1 plain (shared)" "${BRAVO_DIR}" "${F1}" "${B11_TS}" "${VIA_RECEIVE_ALL_SHARED}"
+wait_queued "step 11: alpha F1 plain (shared)" "${ALPHA_DIR}" "${F1}" "${B11_TS}" "${VIA_RECEIVE_ALL_SHARED}"
+wait_queued "step 11: bravo F1 plain (shared)" "${BRAVO_DIR}" "${F1}" "${B11_TS}" "${VIA_RECEIVE_ALL_SHARED}"
 # A later delivery on each persona's connection (an F1 mention, `mention`),
 # after which the shared message's counts are final: exactly one each.
 push_message "${ALPHA_LABEL}" "${F1}" channel "$(mention_text "${ALPHA_BOT_USER}")"
-wait_delivered "step 11: alpha F1 mention, after the shared message" "${ALPHA_DIR}" "${F1}" "${PUSH_TS}" "${VIA_MENTION}"
+wait_queued "step 11: alpha F1 mention, after the shared message" "${ALPHA_DIR}" "${F1}" "${PUSH_TS}" "${VIA_MENTION}"
 push_message "${BRAVO_LABEL}" "${F1}" channel "$(mention_text "${BRAVO_BOT_USER}")"
-wait_delivered "step 11: bravo F1 mention, after the shared message" "${BRAVO_DIR}" "${F1}" "${PUSH_TS}" "${VIA_MENTION}"
-expect_deliveries "step 11: alpha F1 plain (shared)" 1 "${ALPHA_DIR}" "${F1}" "${B11_TS}"
-expect_deliveries "step 11: bravo F1 plain (shared)" 1 "${BRAVO_DIR}" "${F1}" "${B11_TS}"
+wait_queued "step 11: bravo F1 mention, after the shared message" "${BRAVO_DIR}" "${F1}" "${PUSH_TS}" "${VIA_MENTION}"
+expect_queued "step 11: alpha F1 plain (shared)" 1 "${ALPHA_DIR}" "${F1}" "${B11_TS}"
+expect_queued "step 11: bravo F1 plain (shared)" 1 "${BRAVO_DIR}" "${F1}" "${B11_TS}"
 
 # --- Persistence across a restart (SRI-1408, SRI-1403) ----------------------
 STORE_BEFORE_RESTART="${SCENARIO_ROOT}/store-before-restart.json"
@@ -1067,7 +1080,7 @@ cp -- "${STORE_FILE}" "${STORE_BEFORE_RESTART}"
 declare -A DELIVERIES_BEFORE=()
 for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
     DELIVERIES_BEFORE["${dir}"]="${SCENARIO_ROOT}/deliveries-before-restart.$(basename "${dir}")"
-    cp -- "${DELIVERIES_FILE[${dir}]}" "${DELIVERIES_BEFORE[${dir}]}"
+    queue_accepted "${QUEUE_KEY[${dir}]}" > "${DELIVERIES_BEFORE[${dir}]}"
 done
 completions_before="$(count_log "${STARTUP_COMPLETE}")"
 alpha_connected_before="$(count_log "$(session_connected "${ALPHA_REF}")")"
@@ -1100,8 +1113,9 @@ wait_until "${RECORD_WAIT_S}" "restart: no new WebSocket for ${BRAVO_LABEL}" \
     rec_at_least $(( bravo_sockets_before + 1 )) event=ws-open label="${BRAVO_LABEL}"
 cmp -s -- "${STORE_FILE}" "${STORE_BEFORE_RESTART}" || fail "restart: ${STORE_FILE} changed across the restart"
 for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
-    cmp -s -n "$(stat -c '%s' "${DELIVERIES_BEFORE[${dir}]}")" -- "${DELIVERIES_BEFORE[${dir}]}" \
-        "${DELIVERIES_FILE[${dir}]}" || fail "restart: the delivery record of ${dir} no longer holds its earlier lines"
+    queue_accepted "${QUEUE_KEY[${dir}]}" > "${SCENARIO_ROOT}/accepted-after-restart"
+    cmp -s -- "${DELIVERIES_BEFORE[${dir}]}" "${SCENARIO_ROOT}/accepted-after-restart" \
+        || fail "restart: accepted queue records of ${dir} changed"
 done
 
 # alpha calls the tool for F1 with `all` before any F1 event: accepted as a
@@ -1124,7 +1138,7 @@ python3 "${STUB_RECORDS}" once "${REQUESTS_FILE[${ALPHA_DIR}]}" "${RESULTS_FILE[
 # alpha, F1, plain: delivered `receive_all_shared`; exactly one
 # persona-invited-channel line for alpha and F1 in this server run.
 push_message "${ALPHA_LABEL}" "${F1}" channel "$(plain_text)"
-wait_delivered "restart: alpha F1 plain" "${ALPHA_DIR}" "${F1}" "${PUSH_TS}" "${VIA_RECEIVE_ALL_SHARED}"
+wait_queued "restart: alpha F1 plain" "${ALPHA_DIR}" "${F1}" "${PUSH_TS}" "${VIA_RECEIVE_ALL_SHARED}"
 expect_since "${RESTART_MARK}" "${ALPHA_HEARS_F1_ALL}" 1 "restart: alpha's persona-invited-channel lines for F1 in this run"
 expect_since "${RESTART_MARK}" "$(matcher "${ALPHA_INVITED_HEAD}" " ${F1} ")" 1 \
     "restart: alpha's persona-invited-channel lines naming F1 in this run"
@@ -1140,23 +1154,38 @@ push_message "${ALPHA_LABEL}" "${F1}" channel "$(plain_text)"
 OFF_F1_TS="${PUSH_TS}"
 wait_since "${OFF_MARK}" "${F1_UNCLAIMED}" "${EVENT_WAIT_S}" "switch off: no 0.11.1 unclaimed-channel line for alpha F1"
 expect_since "${OFF_MARK}" "${F1_UNCLAIMED}" 1 "switch off: alpha F1's unclaimed-channel lines"
-expect_deliveries "switch off: alpha F1 plain" 0 "${ALPHA_DIR}" "${F1}" "${OFF_F1_TS}"
+expect_queued "switch off: alpha F1 plain" 0 "${ALPHA_DIR}" "${F1}" "${OFF_F1_TS}"
 
 # alpha, A1, plain: delivered `receive_all`, by its listed entry.
 push_message "${ALPHA_LABEL}" "${A1}" channel "$(plain_text)"
 OFF_A1_TS="${PUSH_TS}"
-wait_delivered "switch off: alpha A1 plain" "${ALPHA_DIR}" "${A1}" "${OFF_A1_TS}" "${VIA_RECEIVE_ALL}"
+wait_queued "switch off: alpha A1 plain" "${ALPHA_DIR}" "${A1}" "${OFF_A1_TS}" "${VIA_RECEIVE_ALL}"
 
 # bravo, B1, a mention: delivered `mention`, by its listed entry.
 push_message "${BRAVO_LABEL}" "${B1}" channel "$(mention_text "${BRAVO_BOT_USER}")"
 OFF_B1_TS="${PUSH_TS}"
-wait_delivered "switch off: bravo B1 mention" "${BRAVO_DIR}" "${B1}" "${OFF_B1_TS}" "${VIA_MENTION}"
+wait_queued "switch off: bravo B1 mention" "${BRAVO_DIR}" "${B1}" "${OFF_B1_TS}" "${VIA_MENTION}"
 # Both sessions kept, read after the two deliveries above.
 expect_sessions_kept "switch off" "${A1}" "${OFF_A1_TS}" "${B1}" "${OFF_B1_TS}"
 
 # alpha's call for F1: refused with the declarative text; the file unchanged.
 expect_tool "switch off: alpha's set_channel_delivery F1 all" "${ALPHA_DIR}" "${F1_ALL_ARGS}" true "${ALPHA_DECLARATIVE_REFUSAL}"
 cmp -s -- "${STORE_FILE}" "${STORE_BEFORE_OFF}" || fail "switch off: ${STORE_FILE} changed"
+
+# Every persona's complete accepted set, including absence of all other inputs.
+# Multiple journal records per item never count as additional acceptances.
+for key in "${ALPHA_KEY}" "${BRAVO_KEY}"; do
+    expected_rows="${SCENARIO_ROOT}/expected-queue-${key}.jsonl"
+    : > "${expected_rows}"
+    for fact in "${!EXPECTED_QUEUE_ROWS[@]}"; do
+        [[ "${fact}" == "${key}|"* ]] || continue
+        printf '%s\n' "${EXPECTED_QUEUE_ROWS[${fact}]}" >> "${expected_rows}"
+    done
+    jq -sS 'sort' "${expected_rows}" > "${expected_rows}.sorted"
+    queue_accepted "${key}" | jq -sS 'map([.channel,.ts,.via]) | sort' > "${SCENARIO_ROOT}/actual-queue-${key}"
+    cmp -s -- "${expected_rows}.sorted" "${SCENARIO_ROOT}/actual-queue-${key}" \
+        || fail "closing: persona ${key} has an unexpected accepted queue set"
+done
 
 # --- Closing (SRI-1410) -----------------------------------------------------
 stop_server --stop-bots

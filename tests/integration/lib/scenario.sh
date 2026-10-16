@@ -5508,3 +5508,16 @@ export SCENARIO_PORT
 if [[ "${SCENARIO_FMK}" == 1 ]]; then
     write_mcp_config "${SCENARIO_PORT}"
 fi
+
+# queue_accepted <persona-key>: durable accepted records only, normalized across compaction.
+queue_accepted() {
+    require_ci_image queue_accepted
+    require_scenario_home queue_accepted
+    local key="${1:-}" file
+    [[ "${key}" =~ ^[a-z0-9_]+$ ]] || fail "queue_accepted: invalid persona key"
+    file="${SLACK_STATE_DIR}/queue/${key}.jsonl"
+    [[ -e "${file}" || -L "${file}" ]] || return 0
+    [[ -f "${file}" && ! -L "${file}" ]] || fail "queue_accepted: not a regular queue file"
+    jq -cS 'select(.v == 1 and .kind == "accepted" and .compact == null) | del(.attempt_high_watermark)' "${file}" \
+        || fail "queue_accepted: could not read accepted queue records"
+}

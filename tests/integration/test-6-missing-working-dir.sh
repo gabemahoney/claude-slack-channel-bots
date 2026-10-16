@@ -36,15 +36,13 @@
 #               src/session-manager.ts startupSessionManager
 #   [slack] dry-run: skipping spawn for "<name>" (key=<key>) cwd=<dir>
 #               src/session-manager.ts spawnForPersona
-#   [slack] /interject: refused for persona "<name>" (key=<key>) …
+#   [slack] /interject: queued for persona "<name>" (key=<key>) …
 #               src/interject.ts handleInterject
 #   <either diagnostic prefix above> cleared: … continuing the bring-up
 #   [slack] persona "<name>" (key=<key>): up after … (directory) … — launching
 #   [slack] persona "<name>" (key=<key>): up after … claude_config_dir … — launching
 #               src/persona-bringup-controller.ts recheckDirectory / recheckConfigDir / launchUp
-# /interject bodies (src/interject.ts): "Persona is not up" (503) for a
-# persona that is not up, "No active session for this persona" (503) for one
-# that is up with no session (dry run launches none).
+# /interject: every configured persona answers 200 after durable acceptance, including held personas.
 set -euo pipefail
 
 TEST_NAME="test-6-missing-working-dir"
@@ -187,11 +185,10 @@ expect_count "$(completion_match 3)" 1 "completion"
 expect_completion 3 "completion" '1 no-op' '0 failed' '2 not brought up'
 
 # The healthy persona is up (known, no session); the held ones are not up.
-expect_interject "${READY_NAME}" 503 "start: healthy persona" 'No active session for this persona'
-expect_interject "${NODIR_NAME}" 503 "start: missing-directory persona" 'Persona is not up'
-expect_interject "${CFG_NAME}" 503 "start: held claude_config_dir persona" 'Persona is not up'
-expect_count "$(matcher "[slack] /interject: refused for persona ${NODIR_REF}" 'not up')" 1 \
-    "start: /interject refusal line for nodir"
+expect_interject "${READY_NAME}" 200 "start: healthy persona"
+expect_interject "${NODIR_NAME}" 200 "start: missing-directory persona"
+expect_interject "${CFG_NAME}" 200 "start: held claude_config_dir persona"
+
 
 # --- Past the first re-check: still down, and no line repeated --------------
 nodir_failed_ms="$(log_line_ms "${NODIR_MISSING}")"
@@ -204,8 +201,8 @@ expect_count "${CFG_HELD}" 1 "retry: claude_config_dir line logged again on a re
 for line in "${NODIR_CLEARED}" "${NODIR_UP}" "${NODIR_SKIP}" "${CFG_CLEARED}" "${CFG_UP}" "${CFG_SKIP}"; do
     expect_count "${line}" 0 "retry: held persona came up before its directory existed"
 done
-expect_interject "${NODIR_NAME}" 503 "retry: missing-directory persona" 'Persona is not up'
-expect_interject "${CFG_NAME}" 503 "retry: held claude_config_dir persona" 'Persona is not up'
+expect_interject "${NODIR_NAME}" 200 "retry: missing-directory persona"
+expect_interject "${CFG_NAME}" 200 "retry: held claude_config_dir persona"
 
 # --- Create the directories: both come up with no confirmation --------------
 created_dir="$(make_workdir nodir)"
@@ -244,9 +241,9 @@ check_recovery_order() {
 check_recovery_order nodir "${NODIR_CLEARED}" "${NODIR_UP}" "${NODIR_SKIP}"
 check_recovery_order cfgheld "${CFG_CLEARED}" "${CFG_UP}" "${CFG_SKIP}"
 
-expect_interject "${NODIR_NAME}" 503 "recover: missing-directory persona" 'No active session for this persona'
-expect_interject "${CFG_NAME}" 503 "recover: held claude_config_dir persona" 'No active session for this persona'
-expect_interject "${READY_NAME}" 503 "recover: healthy persona" 'No active session for this persona'
+expect_interject "${NODIR_NAME}" 200 "recover: missing-directory persona"
+expect_interject "${CFG_NAME}" 200 "recover: held claude_config_dir persona"
+expect_interject "${READY_NAME}" 200 "recover: healthy persona"
 
 n="$(count_token_like "${LOG}" "${START_OUT}")"
 [[ "${n}" == 0 ]] || fail "secrecy: ${n} token-like string(s) in server.log or the start output"

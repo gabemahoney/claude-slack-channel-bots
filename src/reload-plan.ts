@@ -41,6 +41,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { queueRetentionClause } from './reload-preview-clauses.ts'
 import {
   channelModeOf,
   configReadFailurePredicate,
@@ -119,6 +120,8 @@ export interface AddedPersonaCause {
  * number of times.
  */
 export interface ChangePlanFacts {
+  /** External open-item fact; this planner performs no queue I/O (b.omv SR-3.7). */
+  queueOpenCount?(key: string): number
   /**
    * The comparison form of a configured path (b.av2 SR-1.5; production:
    * `resolveRealPath`): the only source of path identity. Consulted only to
@@ -381,7 +384,7 @@ export interface ValidChangePlan {
   /** Candidate personas whose key the applied set lacks, in candidate order. */
   added: AddedPersonaChange[]
   /** Applied personas whose key the candidate lacks, in applied order. */
-  removed: ChangePlanPersonaRef[]
+  removed: Array<ChangePlanPersonaRef & { queueOpenCount?: number }>
   /** In candidate order; never also in `inPlace`, `credentials` or `nextLaunch`. */
   destructive: DestructivePersonaChange[]
   /** In candidate order. */
@@ -681,7 +684,7 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
   const plan: ValidChangePlan = {
     valid: true,
     added: [],
-    removed: applied.personas.filter((p) => !nextKeys.has(p.key)).map(refOf),
+    removed: applied.personas.filter((p) => !nextKeys.has(p.key)).map(p => ({ ...refOf(p), queueOpenCount: facts.queueOpenCount?.(p.key) ?? 0 })),
     destructive: [],
     inPlace: [],
     credentials: [],
@@ -869,8 +872,8 @@ function personaRef(p: Pick<ChangePlanPersonaRef, 'name' | 'key'>): string {
  * (key=<key>) is removed: the persona will be retired: its session stopped
  * and never resumed.` Pure; unescaped (`renderPreviewLines` escapes).
  */
-export function removedLine(p: ChangePlanPersonaRef): string {
-  return `${DESTRUCTIVE_PREFIX} ${personaRef(p)} is removed: ${REMOVED_RETIRED_CLAUSE}.`
+export function removedLine(p: ChangePlanPersonaRef & { queueOpenCount?: number }): string {
+  return `${DESTRUCTIVE_PREFIX} ${personaRef(p)} is removed: ${REMOVED_RETIRED_CLAUSE}; ${queueRetentionClause(p.queueOpenCount ?? 0)}.`
 }
 
 /**

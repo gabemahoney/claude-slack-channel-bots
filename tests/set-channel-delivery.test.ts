@@ -1269,7 +1269,7 @@ describe('dry run: the same rules, the choice stored, no Slack call (b.deo SRI-5
     // The stubs exist and record calls: a mention delivered to P makes its users.info call.
     const before = run.stub(P).callLog.length
     await hear(run, P, plainMessage(PUBLIC, { text: `${mentionText(run.stub(P).identity.botUserId)} hello` }))
-    expect(run.stub(P).callLog.slice(before).map((c) => c.method)).toEqual(['users.info'])
+    expect(run.stub(P).callLog.slice(before).map((c) => c.method)).toEqual(['users.info', 'conversations.info'])
     const recorded = run.stub(P).callLog.length
     process.env['SLACK_DRY_RUN'] = '1'
 

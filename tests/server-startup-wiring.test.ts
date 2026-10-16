@@ -2137,25 +2137,24 @@ describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, 
     expect(onlyCallArgs('createPersonaIdentityLookup')).toEqual(['connectionView', `() => ${loaded}`])
   })
 
-  test('the persona routing reads bot identities through identityFor, clients through clientFor and archives through archiveWrite', () => {
+  test('the persona routing reads bot identities through identityFor and archives through archiveWrite; preparation uses clientFor', () => {
     const props = onlyCallProps('createPersonaRouting')
     expect(props.get('getBotIdentity')).toBe('identityFor')
     expect(props.has('getBotUserId')).toBe(false)
-    expect(props.get('clientFor')).toBe('clientFor')
+    expect(onlyCallProps('createDeliveryPreparation').get('clientFor')).toBe('clientFor')
     expect(props.get('archive')).toMatch(/^\((\w+), (\w+)\) => archiveWrite\?\.\(\1, \2\)$/)
   })
 
-  test('the persona routing raises lost-message notices through the one persona notifier\'s notify (b.av2 SR-7.3), with every argument passed on', () => {
-    const notifier = constOf('createPersonaNotifier')
-    const notify = onlyCallProps('createPersonaRouting').get('notify')
-    expect(notify).toBeDefined()
-    if (notify === `${notifier}.notify`) {
-      // Read at build time: the notifier must already exist (no temporal dead zone at import).
-      expect(onlyCallOf('createPersonaRouting')).toBeGreaterThan(onlyCallOf('createPersonaNotifier'))
-    } else {
-      // Read at call time, so the routing may be built before the notifier.
-      expect(notify).toMatch(new RegExp(`^\\((\\w+), (\\w+), (\\w+)\\) => ${notifier}\\.notify\\(\\1, \\2, \\3\\)$`))
-    }
+  test('durable intake binds preparation to the shared queue, persona name resolver and wake hook on the production clock', () => {
+    const props = onlyCallProps('createDeliveryPreparation')
+    expect([...props.keys()].sort()).toEqual(['queue', 'resolveUserName', 'clientFor', 'wake'].sort())
+    expect(props.get('queue')).toBe('deliveryQueue')
+    expect(props.get('resolveUserName')).toBe('resolvePersonaUserName')
+    expect(props.get('clientFor')).toBe('clientFor')
+    expect(props.get('wake')).toMatch(/^\(?([a-zA-Z]+)\)? => deliveryQueueWake\.wake\(\1\)$/)
+    const routing = onlyCallProps('createPersonaRouting')
+    expect(routing.get('prepare')).toMatch(/^\((\w+), (\w+)\) => deliveryPreparation\?\.prepare\(\1, \2\) \?\? Promise\.resolve\(\)$/)
+    expect(routing.has('notify')).toBe(false)
   })
 
   test('archiveWrite is set only inside main(), to the persona archive writer over the name resolver source on clientFor', () => {
@@ -4791,7 +4790,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
   // fungible-mode event (b.deo SRI-305, SRI-403).
   test('the routing\'s call binds exactly these members, no more', () => {
     const MEMBERS: Array<keyof PersonaRoutingDeps> = [
-      'getPersonaConfig', 'getBotIdentity', 'clientFor', 'resolveUserName', 'archive', 'getReplySettings', 'notify', 'log',
+      'getPersonaConfig', 'getBotIdentity', 'queue', 'prepare', 'archive', 'log',
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
       'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery',
     ]
@@ -5419,11 +5418,13 @@ describe('server.ts refuses service to a persona that is not up (b.av2 SR-6.3, S
     expect(indicesOf(/\bisPersonaClientServing\b/g, SERVER_CODE)).toEqual([])
   })
 
-  test('the permission poller, /interject and the MCP admission decision each get isPersonaUp', () => {
+  test('the permission poller and MCP admission decision get isPersonaUp; interject uses durable acceptance regardless of up state', () => {
     expect(onlyCallProps('startPermissionPoller').get('isPersonaUp')).toBe('isPersonaUp')
     const interject = onlyCallArgs('handleInterject')
     expect(interject).toHaveLength(3)
-    expect(objectProperties(interject[2]!).get('isPersonaUp')).toBe('isPersonaUp')
+    const intake = objectProperties(interject[2]!)
+    expect([...intake.keys()].sort()).toEqual(['accept', 'getPersonaConfig'])
+    expect(intake.get('accept')).toMatch(/^\((\w+), (\w+)\) => deliveryPreparation!\.accept\(\1, \2\)$/)
     expect(onlyCallProps('decideSessionAdmission').get('isPersonaUp')).toBe('isPersonaUp')
   })
 

@@ -1,181 +1,27 @@
-/**
- * interject.test.ts — The `/interject` handler (b.av2 SR-6.4, SR-9.1, SR-9.2,
- * SR-10.2, SR-13.1; the `/interject` legs of AC 50 and AC 51).
- *
- * Drives the real `handleInterject` from src/interject.ts with injected
- * dependencies: a two-persona config from `makeMultiPersonaConfig`, stub
- * sessions keyed by persona key that capture `notification` calls, a
- * hand-written `isPersonaUp` stand-in over a set of not-up keys (every persona
- * up by default; the handler sees only the boolean, and the production
- * predicate is pinned by tests/server-startup-wiring.test.ts), a fixed clock
- * and a capturing logger. Most cases call the handler directly; the
- * body-size cap and the loopback check also run over a real HTTP request to a
- * port-0 `Bun.serve` bound to 127.0.0.1 in this process, the way server.ts
- * hands the request over (`server.requestIP(req)?.address`).
- *
- * server.ts cannot be imported (module-scope side effects), so its delegation
- * to the handler and its cron-target resolver are checked statically against
- * its comment-stripped source text.
- *
- * SPDX-License-Identifier: MIT
- */
-
-import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+/** /interject validation and real durable acceptance over isolated queue files. */
+import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-
-import {
-  INTERJECT_BODY_CAP_BYTES,
-  handleInterject,
-  type InterjectDeps,
-  type InterjectSession,
-} from '../src/interject.ts'
-import type { PersonaConfig } from '../src/config.ts'
+import { handleInterject, INTERJECT_BODY_CAP_BYTES, type InterjectDeps } from '../src/interject.ts'
 import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeQueue, readQueue } from './test-helpers/delivery-queue.ts'
 import { indicesOf, stripComments } from './test-helpers/source-audit.ts'
-
-// ---------------------------------------------------------------------------
-// Fixture: persona A has a name with capitals and a space (so its key is the
-// hashed form), persona B a plain `a-z0-9_` name (its key is its name). Their
-// channels are the helper's C0TEST001 / C0TEST002, which no key equals.
-// ---------------------------------------------------------------------------
-
-const A_NAME = 'Planner Bot'
-const A_KEY = personaKey(A_NAME)
-const B_NAME = 'reviewer'
-const B_KEY = personaKey(B_NAME)
-
-/** Fixed clock: 1_700_000_000.123 s. */
-const NOW_MS = 1_700_000_000_123
-
-interface CapturedNotification {
-  method: string
-  params: { content: string; meta: Record<string, string> }
-}
-
-interface StubSession {
-  session: InterjectSession
-  calls: CapturedNotification[]
-}
-
-/** A stub session that records each notification; `result` is what it returns. */
-function makeStubSession(connected = true, result: () => Promise<void> = () => Promise.resolve()): StubSession {
-  const calls: CapturedNotification[] = []
-  const server = {
-    notification: (n: CapturedNotification) => {
-      calls.push(n)
-      return result()
-    },
-  }
-  return { session: { connected, server } as unknown as InterjectSession, calls }
-}
-
-let dir: string
-let config: PersonaConfig | null
-let sessions: Map<string, InterjectSession>
-let a: StubSession
-let b: StubSession
-let logs: string[]
-/** Keys of the personas that are not up; every other persona is up. */
-let notUp: Set<string>
-/** Keys passed to `isPersonaUp` / `getSessionByPersona`, in call order. */
-let upChecks: string[]
-let sessionLookups: string[]
-
-beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), 'cscb-interject-'))
-  config = makeMultiPersonaConfig([{ name: A_NAME }, { name: B_NAME }], dir)
-  a = makeStubSession()
-  b = makeStubSession()
-  sessions = new Map([
-    [A_KEY, a.session],
-    [B_KEY, b.session],
-  ])
-  logs = []
-  notUp = new Set()
-  upChecks = []
-  sessionLookups = []
-})
-
-afterEach(() => {
-  rmSync(dir, { recursive: true, force: true })
-})
-
-function deps(): InterjectDeps {
-  return {
-    getPersonaConfig: () => config,
-    isPersonaUp: (key) => {
-      upChecks.push(key)
-      return !notUp.has(key)
-    },
-    getSessionByPersona: (key) => {
-      sessionLookups.push(key)
-      return sessions.get(key)
-    },
-    now: () => NOW_MS,
-    log: (line) => logs.push(line),
-  }
-}
-
-/** Call the handler directly. A string body is sent raw; anything else as JSON. */
-function interject(
-  body: unknown,
-  opts: { method?: string; remote?: string | null | undefined } = {},
-): Promise<Response> {
-  const method = opts.method ?? 'POST'
-  const init: RequestInit = { method, headers: { 'Content-Type': 'application/json' } }
-  if (method !== 'GET' && method !== 'HEAD' && body !== undefined) {
-    init.body = typeof body === 'string' ? body : JSON.stringify(body)
-  }
-  const remote = 'remote' in opts ? opts.remote : '127.0.0.1'
-  return handleInterject(new Request('http://127.0.0.1/interject', init), remote, deps())
-}
-
-function expectNoDelivery(): void {
-  expect(a.calls).toHaveLength(0)
-  expect(b.calls).toHaveLength(0)
-}
-
-// ---------------------------------------------------------------------------
-// In-process HTTP path: port 0 on 127.0.0.1, handed over as server.ts does.
-// ---------------------------------------------------------------------------
-
-const httpServer = Bun.serve({
-  hostname: '127.0.0.1',
-  port: 0,
-  fetch: (req, server) => handleInterject(req, server.requestIP(req)?.address, deps()),
-})
+import { assertNoLeak } from './test-helpers/credentials.ts'
+import type { PersonaConfig } from '../src/config.ts'
+let dir: string, config: PersonaConfig | null, queue: Awaited<ReturnType<typeof makeQueue>>, logs: string[]
+const A_NAME = 'Planner Bot', B_NAME = 'reviewer', A_KEY = personaKey(A_NAME), B_KEY = personaKey(B_NAME), NOW_MS = 1700000000123
+let failure: boolean
+beforeEach(async () => { dir = mkdtempSync(join(tmpdir(), 'interject-')); config = makeMultiPersonaConfig([{name:A_NAME},{name:B_NAME}],dir); queue=await makeQueue(dir,{now:()=>NOW_MS}); logs=[]; failure=false })
+afterEach(async () => { assertNoLeak({logs}); await queue.stop(); rmSync(dir,{recursive:true,force:true}) })
+function deps(): InterjectDeps { return {getPersonaConfig:()=>config, accept: (key,input)=> failure ? Promise.resolve({status:'failed',error:new Error('EIO')}) : queue.accept(key,input), now:()=>NOW_MS, log:line=>logs.push(line)} }
+function interject(body: unknown, opts: { method?: string; remote?: string | null } = {}) { const method=opts.method??'POST'; return handleInterject(new Request('http://127.0.0.1/interject',{method,...(method==='GET'||method==='HEAD'?{}:{body: typeof body==='string'?body:JSON.stringify(body)})}), 'remote' in opts ? opts.remote : '127.0.0.1', deps()) }
+function expectNoDelivery() { expect(queue.items(A_KEY)).toEqual([]); expect(queue.items(B_KEY)).toEqual([]) }
+const httpServer = Bun.serve({hostname:'127.0.0.1',port:0,fetch:(req,server)=>handleInterject(req,server.requestIP(req)?.address,deps())})
 const HTTP_URL = `http://127.0.0.1:${httpServer.port}/interject`
-
-afterAll(() => {
-  httpServer.stop(true)
-})
-
-/** UTF-8 byte length. */
-function byteLength(s: string): number {
-  return new TextEncoder().encode(s).byteLength
-}
-
-/**
- * A serialized body for persona B of exactly `bytes` UTF-8 bytes. The message
- * opens with a two-byte character, so the byte count exceeds the character
- * count and a character-counting cap would get the boundary wrong.
- */
-function bodyOfBytes(bytes: number): { text: string; message: string } {
-  const head = 'é'
-  const overhead = byteLength(JSON.stringify({ persona: B_NAME, message: head }))
-  const message = head + 'x'.repeat(bytes - overhead)
-  const text = JSON.stringify({ persona: B_NAME, message })
-  expect(byteLength(text)).toBe(bytes)
-  return { text, message }
-}
-
-// ---------------------------------------------------------------------------
-// SR-9.1 status table
-// ---------------------------------------------------------------------------
-
+afterAll(()=>httpServer.stop(true))
+function bodyOfBytes(bytes: number) {const head='é';const overhead=Buffer.byteLength(JSON.stringify({persona:B_NAME,message:head}));const message=head+'x'.repeat(bytes-overhead);return {text:JSON.stringify({persona:B_NAME,message}),message}}
 describe('/interject status table (SR-9.1)', () => {
   test.each([
     ['GET', 405],
@@ -206,7 +52,7 @@ describe('/interject status table (SR-9.1)', () => {
   test.each([['127.0.0.1'], ['::1'], ['::ffff:127.0.0.1']])('loopback remote address %s → 200', async (remote) => {
     const res = await interject({ persona: B_NAME, message: 'hi' }, { remote })
     expect(res.status).toBe(200)
-    expect(b.calls).toHaveLength(1)
+    expect(queue.items(B_KEY)).toHaveLength(1)
   })
 
   test.each([
@@ -267,120 +113,7 @@ describe('/interject status table (SR-9.1)', () => {
     expectNoDelivery()
   })
 
-  test.each([
-    ['no session registered', (): StubSession | undefined => undefined],
-    ['a disconnected session', (): StubSession | undefined => makeStubSession(false)],
-  ])('%s → 503, nothing delivered', async (_label, build) => {
-    const stub = build()
-    if (stub) sessions.set(B_KEY, stub.session)
-    else sessions.delete(B_KEY)
-    const res = await interject({ persona: B_NAME, message: 'hi' })
-    expect(res.status).toBe(503)
-    expect(await res.json()).toEqual({ error: 'No active session for this persona' })
-    expectNoDelivery()
-    expect(stub?.calls ?? []).toHaveLength(0)
-  })
 })
-
-// ---------------------------------------------------------------------------
-// SR-6.4 — a persona that is not up gets 503 (checked before the session lookup)
-// ---------------------------------------------------------------------------
-
-describe('/interject refuses a persona that is not up (SR-6.4)', () => {
-  const NOT_UP_BODY = { error: 'Persona is not up', persona: A_NAME }
-  const NOT_UP_LOG = `[slack] /interject: refused for persona ${renderPersonaRef(A_NAME, A_KEY)} — the persona is not up; nothing delivered`
-
-  // Persona A's key is the hashed form, so a handler that asked the up check
-  // with the name instead of the key would find A "up" and fail these cases.
-  test.each([
-    ['by name', A_NAME],
-    ['by key', A_KEY],
-  ] as const)(
-    'a not-up persona addressed %s, with a registered and connected session → 503 naming it as not up; no session notified, no session lookup, and the log line carries no message text',
-    async (_label, persona) => {
-      notUp.add(A_KEY)
-      expect(sessions.get(A_KEY)?.connected).toBe(true)
-      const res = await interject({ persona, message: 'secret-body-text' })
-      expect(res.status).toBe(503)
-      expect(await res.json()).toEqual(NOT_UP_BODY)
-      expectNoDelivery()
-      expect(upChecks).toEqual([A_KEY])
-      expect(sessionLookups).toEqual([])
-      expect(logs).toEqual([NOT_UP_LOG])
-    },
-  )
-
-  test('a not-up persona with no session → 503 "Persona is not up" (the up check comes first)', async () => {
-    notUp.add(A_KEY)
-    sessions.delete(A_KEY)
-    const res = await interject({ persona: A_KEY, message: 'hi' })
-    expect(res.status).toBe(503)
-    expect(await res.json()).toEqual(NOT_UP_BODY)
-    expect(sessionLookups).toEqual([])
-  })
-
-  test('an up persona beside a not-up one → 200 with its name; only its session gets the message, meta exactly { user, ts }', async () => {
-    notUp.add(A_KEY)
-    const res = await interject({ persona: B_NAME, message: 'for B', sender: 'ops-script' })
-    expect(res.status).toBe(200)
-    expect(await res.json()).toEqual({ ok: true, persona: B_NAME })
-    expect(a.calls).toHaveLength(0)
-    expect(b.calls).toEqual([
-      {
-        method: 'notifications/claude/channel',
-        params: { content: 'for B', meta: { user: 'ops-script', ts: '1700000000.123' } },
-      },
-    ])
-  })
-
-  test('a persona that comes up with a connected session → 200 after being refused while not up', async () => {
-    notUp.add(A_KEY)
-    const refused = await interject({ persona: A_NAME, message: 'too early' })
-    expect(refused.status).toBe(503)
-    expect(a.calls).toHaveLength(0)
-
-    notUp.delete(A_KEY)
-    const res = await interject({ persona: A_NAME, message: 'now up' })
-    expect(res.status).toBe(200)
-    expect(await res.json()).toEqual({ ok: true, persona: A_NAME })
-    expect(a.calls).toHaveLength(1)
-    expect(a.calls[0]!.params.content).toBe('now up')
-    expect(b.calls).toHaveLength(0)
-  })
-
-  test('a persona absent from the config → 404 (never 503) even when no persona is up; the up check is not asked', async () => {
-    notUp.add(A_KEY)
-    notUp.add(B_KEY)
-    const res = await interject({ persona: 'nobody', message: 'hi' })
-    expect(res.status).toBe(404)
-    expect(await res.json()).toEqual({ error: 'Persona not found in the applied config' })
-    expect(upChecks).toEqual([])
-    expectNoDelivery()
-  })
-
-  test.each([
-    ['a missing persona field (400)', { message: 'hi' }, 400],
-    ['a missing message field (400)', { persona: A_NAME }, 400],
-  ] as const)('%s for a not-up persona keeps its status; the up check is not asked', async (_label, body, status) => {
-    notUp.add(A_KEY)
-    const res = await interject(body)
-    expect(res.status).toBe(status)
-    expect(upChecks).toEqual([])
-    expectNoDelivery()
-  })
-
-  test('a non-loopback caller naming a not-up persona → 403, not 503', async () => {
-    notUp.add(A_KEY)
-    const res = await interject({ persona: A_NAME, message: 'hi' }, { remote: '10.0.0.5' })
-    expect(res.status).toBe(403)
-    expect(upChecks).toEqual([])
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Body-size cap, over a real loopback HTTP request
-// ---------------------------------------------------------------------------
-
 describe('/interject 32 KB body cap (in-process HTTP, port 0)', () => {
   test('the cap is 32768 bytes', () => {
     expect(INTERJECT_BODY_CAP_BYTES).toBe(32768)
@@ -390,9 +123,9 @@ describe('/interject 32 KB body cap (in-process HTTP, port 0)', () => {
     const { text, message } = bodyOfBytes(32768)
     const res = await fetch(HTTP_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: text })
     expect(res.status).toBe(200)
-    expect(b.calls).toHaveLength(1)
-    expect(b.calls[0]!.params.content).toBe(message)
-    expect(a.calls).toHaveLength(0)
+    expect(queue.items(B_KEY)).toHaveLength(1)
+    expect(queue.items(B_KEY)[0]!.accepted.text).toBe(message)
+    expect(queue.items(A_KEY)).toHaveLength(0)
   })
 
   test('a body of 32769 UTF-8 bytes → 413, nothing delivered', async () => {
@@ -416,9 +149,9 @@ describe('AC 50: /interject reaches only the named persona', () => {
     const res = await interject({ persona, message: 'for A only' })
     expect(res.status).toBe(200)
     expect(await res.json()).toEqual({ ok: true, persona: A_NAME })
-    expect(a.calls).toHaveLength(1)
-    expect(a.calls[0]!.params.content).toBe('for A only')
-    expect(b.calls).toHaveLength(0)
+    expect(queue.items(A_KEY)).toHaveLength(1)
+    expect(queue.items(A_KEY)[0]!.accepted.text).toBe('for A only')
+    expect(queue.items(B_KEY)).toHaveLength(0)
     expect(logs.some((l) => l.includes(renderPersonaRef(A_NAME, A_KEY)))).toBe(true)
   })
 
@@ -426,8 +159,8 @@ describe('AC 50: /interject reaches only the named persona', () => {
     const res = await interject({ persona: B_NAME, message: 'for B only' })
     expect(res.status).toBe(200)
     expect(await res.json()).toEqual({ ok: true, persona: B_NAME })
-    expect(b.calls).toHaveLength(1)
-    expect(a.calls).toHaveLength(0)
+    expect(queue.items(B_KEY)).toHaveLength(1)
+    expect(queue.items(A_KEY)).toHaveLength(0)
   })
 
   test('AC 50: a real loopback HTTP request by key reaches only that persona', async () => {
@@ -438,115 +171,17 @@ describe('AC 50: /interject reaches only the named persona', () => {
     })
     expect(res.status).toBe(200)
     expect(await res.json()).toEqual({ ok: true, persona: A_NAME })
-    expect(a.calls).toHaveLength(1)
-    expect(b.calls).toHaveLength(0)
+    expect(queue.items(A_KEY)).toHaveLength(1)
+    expect(queue.items(B_KEY)).toHaveLength(0)
   })
 })
 
-// ---------------------------------------------------------------------------
-// SR-9.2 — notification shape and meta
-// ---------------------------------------------------------------------------
 
-describe('/interject notification meta (SR-9.2)', () => {
-  // b.av2 AC 51 (the /interject leg): the reply guard tells an injected prompt
-  // by the absence of via, so the injected meta must never carry via (nor the
-  // Slack-only chat_id / message_id), and a normal delivery logs no failure.
-  test('AC 51: 200; method and content unchanged; meta is exactly { user, ts } — no chat_id, message_id or via; only the normal delivery line is logged', async () => {
-    const consoleError = spyOn(console, 'error').mockImplementation(() => {})
-    const consoleWarn = spyOn(console, 'warn').mockImplementation(() => {})
-    try {
-      const res = await interject({ persona: B_NAME, message: 'Hello from interject', sender: 'cscb-cron:tick' })
-      expect(res.status).toBe(200)
-      expect(await res.json()).toEqual({ ok: true, persona: B_NAME })
-      expect(b.calls).toEqual([
-        {
-          method: 'notifications/claude/channel',
-          params: { content: 'Hello from interject', meta: { user: 'cscb-cron:tick', ts: '1700000000.123' } },
-        },
-      ])
-      const meta = b.calls[0]!.params.meta
-      expect(Object.keys(meta).sort()).toEqual(['ts', 'user'])
-      for (const key of ['chat_id', 'message_id', 'via']) expect(meta).not.toHaveProperty(key)
-
-      // A rejected notification is logged asynchronously; let it surface first.
-      await Bun.sleep(0)
-      // Exactly the one delivery line, nothing else (no failure line).
-      expect(logs).toEqual([
-        `[slack] /interject: delivering to persona ${renderPersonaRef(B_NAME, B_KEY)} sender="cscb-cron:tick" message="Hello from interject"`,
-      ])
-      // Nothing bypasses the injected logger to report a problem either.
-      expect(consoleError).not.toHaveBeenCalled()
-      expect(consoleWarn).not.toHaveBeenCalled()
-    } finally {
-      consoleError.mockRestore()
-      consoleWarn.mockRestore()
-    }
-  })
-
-  test.each([
-    ['a custom sender', { sender: 'ops-script' }, 'ops-script'],
-    ['an omitted sender', {}, 'interject'],
-    ['an empty sender', { sender: '' }, 'interject'],
-    ['a non-string sender', { sender: 42 }, 'interject'],
-  ])('%s → meta is exactly { user, ts } with the expected user (no via, user_id or bot_id)', async (_label, extra, user) => {
-    await interject({ persona: B_NAME, message: 'hi', ...extra })
-    expect(b.calls[0]!.params.meta.user).toBe(user)
-    // b.av2 SR-9.2: the reply guard (E10) tells injected prompts by the absence of via.
-    expect(Object.keys(b.calls[0]!.params.meta).sort()).toEqual(['ts', 'user'])
-  })
-
-  // ts is String(epoch ms / 1000) — Unix seconds with at most three
-  // fractional digits, never a Slack-shaped ts (b.av2 SR-9.2). The reply guard
-  // tells an injected prompt by the absence of via (see the AC 51 test above).
-  test.each([
-    [1_700_000_000_123, '1700000000.123'],
-    [1_700_000_000_120, '1700000000.12'],
-    [1_700_000_000_000, '1700000000'],
-  ])('clock %i ms → ts %p (Unix seconds, never six fractional digits)', async (nowMs, ts) => {
-    const res = await handleInterject(
-      new Request('http://127.0.0.1/interject', { method: 'POST', body: JSON.stringify({ persona: B_NAME, message: 'hi' }) }),
-      '127.0.0.1',
-      { ...deps(), now: () => nowMs },
-    )
-    expect(res.status).toBe(200)
-    const meta = b.calls[0]!.params.meta
-    expect(meta.ts).toBe(ts)
-    expect(Number(meta.ts)).toBe(nowMs / 1000)
-    expect(meta.ts).not.toMatch(/\.\d{6}$/)
-  })
-
-  test('with the default clock, ts is the current Unix time in seconds and not Slack-shaped', async () => {
-    const before = Date.now() / 1000
-    const res = await handleInterject(
-      new Request('http://127.0.0.1/interject', { method: 'POST', body: JSON.stringify({ persona: B_NAME, message: 'hi' }) }),
-      '127.0.0.1',
-      { ...deps(), now: undefined },
-    )
-    const after = Date.now() / 1000
-    expect(res.status).toBe(200)
-    const ts = b.calls[0]!.params.meta.ts!
-    expect(ts).toMatch(/^\d+(\.\d{1,3})?$/)
-    expect(Number(ts)).toBeGreaterThanOrEqual(before)
-    expect(Number(ts)).toBeLessThanOrEqual(after)
-  })
-
-  test('a notification that rejects later still answers 200 and logs the failure with the persona', async () => {
-    const failing = makeStubSession(true, () => Promise.reject(new Error('transport closed')))
-    sessions.set(B_KEY, failing.session)
-    const res = await interject({ persona: B_NAME, message: 'hi' })
-    expect(res.status).toBe(200)
-    expect(failing.calls).toHaveLength(1)
-    await Bun.sleep(0)
-    const failure = logs.find((l) => l.includes('failed'))
-    expect(failure).toContain(`notification to persona ${renderPersonaRef(B_NAME, B_KEY)} failed`)
-  })
+test('known persona accepts with exact 200 after durable storage',async () => {
+ const result=await interject({persona:A_NAME,message:'queued',sender:'ops'});expect(result.status).toBe(200);expect(await result.json()).toEqual({ok:true,persona:A_NAME});expect(readQueue(dir,A_KEY)).toMatchObject([{kind:'accepted',source:'interject',sender:'ops',text:'queued',ts:'1700000000.123000'}]);expect(queue.items(B_KEY)).toEqual([])
 })
-
-// ---------------------------------------------------------------------------
-// Static wiring: server.ts delegates /interject to the handler module and
-// resolves cron targets through resolvePersonaTarget
-// ---------------------------------------------------------------------------
-
+test('store failure answers 500 Message not stored, leaves queue and success logs empty',async()=>{failure=true;const result=await interject({persona:A_NAME,message:'queued'});expect(result.status).toBe(500);expect(await result.json()).toEqual({error:'Message not stored'});expectNoDelivery();expect(logs).toEqual([])})
+test('identical injected requests remain separate with increasing timestamps and stored excerpt logs',async()=>{for(let i=0;i<2;i++)expect((await interject({persona:B_KEY,message:'repeat'})).status).toBe(200);expect(queue.items(B_KEY).map(i=>i.accepted.ts)).toEqual(['1700000000.123000','1700000000.123001']);expect(logs).toHaveLength(2);expect(logs[0]).toContain('queued for persona');expect(logs[0]).toContain('message="repeat"')})
 describe('server.ts wires /interject and cron targets by persona (static audit)', () => {
   // Comments stripped (see stripComments), so commented-out code or prose
   // naming a call can never satisfy an assertion.
@@ -581,8 +216,10 @@ describe('server.ts wires /interject and cron targets by persona (static audit)'
     const branch = interjectBranch()
     expect(branch).toMatch(/return\s+handleInterject\(\s*req,\s*server\.requestIP\(req\)\?\.address,/)
     expect(branch).toMatch(/getPersonaConfig:\s*\(\)\s*=>\s*personaConfig\b/)
-    expect(branch).toContain('getSessionByPersona')
+    expect(branch).toMatch(/accept:\s*\(key, input\)\s*=>\s*deliveryPreparation[?!]?\.accept\(key, input\)/)
     expect(branch).not.toContain('notifications/claude/channel')
+    expect(branch).not.toContain('getSessionByPersona')
+    expect(branch).not.toContain('isPersonaUp')
   })
 
   test('the cron dispatcher resolves each target to a persona key against the applied persona config', () => {
@@ -601,4 +238,24 @@ describe('server.ts wires /interject and cron targets by persona (static audit)'
   ])('the old inline handler text %p is gone', (text) => {
     expect(SERVER_CODE).not.toContain(text)
   })
+})
+
+test.each([[undefined, 'interject'], [null, 'interject'], ['', 'interject'], [42, 'interject'], ['script-label', 'script-label']])('sender %p is accepted as %s', async (sender, expected) => {
+  expect((await interject({ persona: B_NAME, message: 'prompt', sender })).status).toBe(200)
+  expect(queue.items(B_KEY).map(i => i.accepted.sender)).toEqual([expected])
+  expect(queue.items(A_KEY)).toEqual([])
+})
+test('logging follows durable acceptance and keeps the existing 80-character message excerpt', async () => {
+  const text = 'x'.repeat(90)
+  let logged = false
+  const result = await handleInterject(new Request('http://127.0.0.1/interject', { method: 'POST', body: JSON.stringify({ persona: A_NAME, message: text }) }), '127.0.0.1', { ...deps(), log: line => {
+    logged = true
+    expect(readQueue(dir, A_KEY)).toMatchObject([{ kind: 'accepted', text }])
+    expect(line).toBe(`[slack] /interject: queued for persona ${renderPersonaRef(A_NAME, A_KEY)} sender="interject" message="${text.slice(0, 80)}"`)
+  } })
+  expect(result.status).toBe(200); expect(logged).toBe(true)
+})
+test('a throwing accept function answers Message not stored with no success log', async () => {
+  const result = await handleInterject(new Request('http://127.0.0.1/interject', { method: 'POST', body: JSON.stringify({ persona: A_NAME, message: 'prompt' }) }), '127.0.0.1', { ...deps(), accept: async () => { throw new Error('EIO') } })
+  expect(result.status).toBe(500); expect(await result.json()).toEqual({ error: 'Message not stored' }); expectNoDelivery(); expect(logs).toEqual([])
 })

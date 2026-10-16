@@ -158,7 +158,6 @@ import {
   type KillFailureClosing,
 } from '../src/kill-failure-alert.ts'
 import { KILL_RETRY_ALERT_ORDINARY } from '../src/kill-retry.ts'
-import { buildLostMessageNotice, LOST_MESSAGE_STATES } from '../src/lost-message.ts'
 import {
   OLD_LIFE_WAIT_AT_FIND_MISSING,
   OLD_LIFE_WAIT_AT_GET,
@@ -476,13 +475,6 @@ function unclassifiedEntries(): NoticeEntry[] {
 /** SRJ-1010: slow dead-session recovery. */
 function slowRecoveryEntries(): NoticeEntry[] {
   return [entry('SRJ-1010', 'slowRecoveryText', 'the post', () => slowRecoveryText(KEY))]
-}
-
-/** SRJ-1011: the lost-message notice in every state. */
-function lostMessageEntries(): NoticeEntry[] {
-  return LOST_MESSAGE_STATES.map((state) =>
-    entry('SRJ-1011', 'buildLostMessageNotice', state, () => buildLostMessageNotice('stub-user', state)),
-  )
 }
 
 /** SRJ-1012: the permission wedge warning, for a persona whose name and key differ. */
@@ -935,7 +927,6 @@ const NOTICE_CATALOGUE: readonly NoticeEntry[] = Object.freeze([
   ...invalidFlagsEntries(),
   ...unclassifiedEntries(),
   ...slowRecoveryEntries(),
-  ...lostMessageEntries(),
   ...wedgeWarningEntries(),
   ...startupErrorEntries(),
   ...stuckLaunchEntries(),
@@ -947,6 +938,7 @@ const NOTICE_CATALOGUE: readonly NoticeEntry[] = Object.freeze([
 
 /** The SRJ-10xx ids from SRJ-1001 to SRJ-1021 with no notice builder in the catalogue, each with its reason. */
 const NOT_APPLICABLE: Readonly<Partial<Record<NoticeSrj, string>>> = Object.freeze({
+  'SRJ-1011': 'SR-4.2 removes Message lost; accepted inputs remain in the queue and recovery posts nothing.',
   'SRJ-1002': 'log-only routing: it routes other notices and has no text of its own',
   'SRJ-1014': 'log lines, not notices: each is asserted with its behaviour',
   'SRJ-1015': 'the start summary line is a server-log line, not a notice',
@@ -967,7 +959,6 @@ const GUARDED_IDS: readonly NoticeSrj[] = Array.from({ length: 21 - 1 + 1 }, (_,
  */
 const NAMED_SLACK_NOTICES: readonly string[] = Object.freeze([
   buildWedgeWarningText.name,
-  buildLostMessageNotice.name,
   'ONSET_TEMPLATES',
   'ALL_CLEAR_TEMPLATE',
   spawnFailureNoticeText.name,
@@ -1130,7 +1121,6 @@ describe('the notice catalogue is complete (SRJ-1001 to SRJ-1021, and every name
   test('the named notices are catalogued in every variant: each outage onset, each lost-message state, each not-connected rendering, each JSONL safeguard notice', () => {
     const variantsOf = (...builders: string[]) => NOTICE_CATALOGUE.filter((e) => builders.includes(e.builder)).map((e) => e.variant)
     expect(variantsOf('ONSET_TEMPLATES')).toEqual(expect.arrayContaining(OUTAGE_CLASS_ORDER.map((outage) => `${outage} onset`)))
-    expect(variantsOf(buildLostMessageNotice.name)).toEqual(expect.arrayContaining([...LOST_MESSAGE_STATES]))
     expect(variantsOf(buildNotConnectedNotice.name)).toEqual(notConnectedVariants().map(([label]) => label))
     expect(new Set(notConnectedVariants().map(([, notice]) => notice.reason))).toEqual(new Set(['blocked-on-prompt', 'unproven-idle', 'auto-restart-disabled']))
     expect(variantsOf(runPersonaStorageCheck.name, runJsonlPersistenceSafeguard.name)).toEqual([JSONL_NON_PERSISTENT, JSONL_STALE_PATH, JSONL_LOST])

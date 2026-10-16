@@ -1,6 +1,6 @@
 /**
  * cron-log.test.ts — Tests for the dedicated cron-fire log writer
- * (src/cron-log.ts). Covers the pure formatters (five-field layout, all nine
+ * (src/cron-log.ts). Covers the pure formatters (five-field layout, all current and legacy
  * outcome classes, detail tokens, newline escaping) and the I/O half
  * (createCronLog: append accumulation, unwritable-path resilience, self-heal,
  * whole-line rapid appends) and the `cron_log_max_bytes` cap (b.p4i, E5): the
@@ -179,6 +179,8 @@ function recordingWriter(): { write: CronLogWriter; rewrites: number[] } {
 }
 
 const OUTCOME_CLASSES = [
+  'queued',
+  'queue-failed',
   'delivered',
   'no-session',
   'unknown-persona',
@@ -262,13 +264,13 @@ describe('formatOutcomeLine — five-field layout', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Pure formatting — all nine outcome classes round-trip
+// Pure formatting — all current and legacy outcome classes round-trip
 // ---------------------------------------------------------------------------
 
-describe('all nine outcome classes round-trip into the log', () => {
-  test('the list is the CronOutcome union: nine distinct classes', () => {
+describe('all current and legacy outcome classes round-trip into the log', () => {
+  test('the list is the CronOutcome union: eleven distinct classes', () => {
     expect(COVERS_UNION).toBe(true)
-    expect(new Set(ALL_OUTCOMES).size).toBe(9)
+    expect(new Set(ALL_OUTCOMES).size).toBe(11)
   })
 
   test.each(ALL_OUTCOMES)('outcome=%s appears in field 4 of the written line', (outcome) => {
@@ -358,8 +360,8 @@ describe('formatSummaryLine', () => {
   // The module does no counting — it formats caller-supplied numbers — so a
   // single formatter test covers both count combinations.
   test.each<[number, number, string]>([
-    [2, 2, 'delivered=2 failed=2'],
-    [0, 3, 'delivered=0 failed=3'],
+    [2, 2, 'queued=2 failed=2'],
+    [0, 3, 'queued=0 failed=3'],
   ])('formats delivered=%d failed=%d into the detail field', (delivered, failed, expected) => {
     const line = formatSummaryLine(TS, 'daily-standup', delivered, failed)
     const detail = fields(line).slice(4).join(' ')

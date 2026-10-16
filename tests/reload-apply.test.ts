@@ -1,3 +1,4 @@
+import { queuePath, readQueue } from './test-helpers/delivery-queue.ts'
 /**
  * reload-apply.test.ts — What a confirmed change does to the personas (b.av2
  * SR-6.1 at apply, SR-6.4, SR-6.5, SR-6.6, SR-8.6 steps 2 to 6 and every
@@ -7276,4 +7277,53 @@ describe('b.deo SRI-409, SRI-502: the destructive-modify window with the teardow
     expect(run.channelDelivery.isRetiring(bravoKey)).toBe(false)
     expectModeNoLeak()
   })
+})
+
+describe('durable queues across confirmed persona changes (SR-3.7)', () => {
+  test('three open items stay under a removed key; re-add restores their order and rename does not transfer them', async () => {
+    const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
+    const key = h.key('bravo')
+    for (const source of ['slack', 'interject', 'cron'] as const) {
+      const input = source === 'slack'
+        ? { source, text: 'slack', channel: bravo!.channels![0]!.id, via: 'receive_all', key: { chat_id: bravo!.channels![0]!.id, ts: '1700000000.000001' }, ts: '1700000000.000001' }
+        : { source, text: source, sender: source }
+      expect((await run.queue.accept(key, input)).status).toBe('accepted')
+    }
+    const durableBefore = readQueue(h.stateDir, key)
+    const before = run.queued('bravo').map(i => ({ seq: i.accepted.seq, source: i.accepted.source, text: i.accepted.text, via: i.accepted.via }))
+    const preview = await previewConfig(run, [alpha!])
+    expect(preview.find(line => line.startsWith('DESTRUCTIVE:'))).toContain('3 open queued items kept, delivered only if a persona with the same key is added again')
+    h.confirm(); await run.ticks.tick()
+    expect(run.queueEvents).toContainEqual({ type: 'retained', key, count: 3 })
+    expect(existsSync(queuePath(h.stateDir, key))).toBe(true)
+    expect(readQueue(h.stateDir, key)).toEqual(durableBefore)
+    expect(run.queued('bravo').map(i => ({ seq: i.accepted.seq, source: i.accepted.source, text: i.accepted.text, via: i.accepted.via }))).toEqual(before)
+    await applyConfig(run, [alpha!, bravo!])
+    expect(run.queued('bravo').map(i => i.accepted.seq)).toEqual([1, 2, 3]); expect(run.queued('bravo').every(i => i.delivered === false)).toBe(true)
+    const renamed = h.persona('bravo_two'); h.materialize(renamed); await applyConfig(run, [alpha!, renamed])
+    expect(run.queued('bravo_two')).toEqual([]); expect(run.queue.openCount(key)).toBe(3); assertNoLeak(run.captured())
+  })
+  test('routing edits affect future arrivals while old accepted via and text remain fixed under their original key', async () => {
+    const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
+    const channel = alpha!.channels![0]!.id
+    await run.deliver('alpha', makeChannelMessage({ channel, text: 'accepted before edit', ts: '1700000001.000001' }))
+    const accepted = structuredClone(run.queued('alpha')[0]!.accepted)
+    const changed = { ...alpha!, channels: [{ id: channel, delivery: 'mentions' as const }], dm: { enabled: false } }
+    await applyConfig(run, [changed, bravo!])
+    await run.deliver('alpha', makeChannelMessage({ channel, text: 'new plain input', ts: '1700000001.000002' }))
+    expect(run.queued('alpha').map(i => i.accepted)).toEqual([accepted]); expect(run.queued('bravo')).toEqual([]); assertNoLeak(run.captured())
+  })
+})
+
+test.each(['credentials_file', 'working_directory'] as const)('a destructive %s edit retains fixed open work under the same key', async field => {
+  const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
+  const key = h.key('alpha')
+  expect((await run.queue.accept(key, { source: 'interject', sender: 'ops', text: 'pending' })).status).toBe('accepted')
+  await run.queue.append(key, { v: 1, kind: 'fixed', seq: 1, parts: ['immutable fixed input'] })
+  const nextPath = join(h.root, field === 'credentials_file' ? 'rotated-credentials.json' : 'new-working-directory')
+  const changed = { ...alpha!, [field]: nextPath }; h.materialize(changed)
+  await applyConfig(run, [changed, bravo!])
+  expect(run.queued('alpha')).toHaveLength(1); expect(run.queued('alpha')[0]!.fixed!.parts).toEqual(['immutable fixed input']); expect(run.queue.openCount(key)).toBe(1)
+  expect(readQueue(h.stateDir, key).filter(r => r.kind === 'accepted' && !('compact' in r))).toHaveLength(1)
+  expect(run.queued('bravo')).toEqual([]); assertNoLeak(run.captured())
 })

@@ -217,6 +217,8 @@ import { createPersonaDestinations } from './persona-destination.ts'
 import { createPersonaDestinationHold } from './persona-destination-hold.ts'
 import { createSlowRecoveryTracker } from './slow-recovery.ts'
 import { createPersonaRouting, hasSessionStream } from './persona-routing.ts'
+import { createDeliveryQueue, type DeliveryQueue, type QueueEvent } from './delivery-queue.ts'
+import { createDeliveryPreparation, type DeliveryPreparation } from './delivery-intake.ts'
 import {
   createPersonaConnectionManager,
   SYSTEM_PERSONA_CONNECTION_CLOCK,
@@ -698,11 +700,13 @@ function assertSendable(filePath: string): void {
 // Resolve user display name
 // ---------------------------------------------------------------------------
 
-// One cache for every persona: the server serves one workspace (b.av2 SR-11).
-const userNameCache = new Map<string, string>()
+// Persona-scoped names: credentials and workspaces may differ (b.omv SR-2.1).
+const userNameCache = new WeakMap<WebClient, Map<string, string>>()
 
 async function lookupUserName(client: WebClient, userId: string): Promise<string> {
-  if (userNameCache.has(userId)) return userNameCache.get(userId)!
+  let cache = userNameCache.get(client)
+  if (!cache) { cache = new Map(); userNameCache.set(client, cache) }
+  if (cache.has(userId)) return cache.get(userId)!
   try {
     const res = await client.users.info({ user: userId })
     const name =
@@ -710,7 +714,7 @@ async function lookupUserName(client: WebClient, userId: string): Promise<string
       res.user?.profile?.real_name ||
       res.user?.name ||
       userId
-    userNameCache.set(userId, name)
+    cache.set(userId, name)
     return name
   } catch {
     return userId
@@ -1163,17 +1167,25 @@ async function handleInitialized(
  * and `app_mention` event to it with the receiving persona as the only
  * receiver.
  */
+// Holders are populated in main(), after the duplicate-server guard and before admission.
+let deliveryQueue: DeliveryQueue | undefined
+let deliveryPreparation: DeliveryPreparation | undefined
+/** E5 binds event handling here; E2 supplies facts without notices or wording. */
+export const deliveryQueueEvents = { emit: (_event: QueueEvent): void => {} }
+/** E3's engine binds this hook after startup; until then queued work waits. */
+export const deliveryQueueWake = { wake: (_key: string): void => {} }
 const personaRouting = createPersonaRouting({
   getPersonaConfig: () => personaConfig,
   getBotIdentity: identityFor,
-  clientFor,
-  resolveUserName: resolvePersonaUserName,
+  queue: {
+    accept: (key, input) => {
+      if (!deliveryQueue) return Promise.resolve({ status: 'failed' as const, error: new Error('Queue not started') })
+      return deliveryQueue.accept(key, input)
+    },
+    lookupSlackKey: (key, slackKey) => deliveryQueue?.lookupSlackKey(key, slackKey),
+  },
+  prepare: (key, item) => deliveryPreparation?.prepare(key, item) ?? Promise.resolve(),
   archive: (key, event) => archiveWrite?.(key, event),
-  getReplySettings,
-  // Lost-message notices go through the one notifier. It is built further
-  // down, so it is read at call time: naming it here would throw while this
-  // module is still loading.
-  notify: (key, text, options) => personaNotifier.notify(key, text, options),
   log: (line) => console.error(line),
   // b.av2 SR-4.2 beside b.deo SRI-305, SRI-403: the stored choices and their
   // readability, read at each fungible-mode event through the holder main()
@@ -1470,6 +1482,11 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
     httpServer.stop(true)
     httpServer = null
   }
+
+  // b.omv SR-3.3: finish fixation and drain the shared writers after every
+  // synchronous stop above, before closing the transports and clients.
+  await deliveryPreparation?.stop()
+  await deliveryQueue?.stop()
 
   // Close all pending (not yet routed) MCP transports
   for (const pending of getAllPendingSessions()) {
@@ -3370,6 +3387,17 @@ export async function main(): Promise<void> {
   // Bun.serve). A duplicate start must fail fast without mutating shared state.
   checkPidConflict(PID_FILE)
 
+  // b.omv SR-3.6: replay and compact every journal before Slack/HTTP admission.
+  deliveryQueue = createDeliveryQueue({ stateDir: STATE_DIR, onEvent: event => deliveryQueueEvents.emit(event) })
+  await deliveryQueue.start()
+  deliveryQueue.startMaintenance()
+  deliveryPreparation = createDeliveryPreparation({
+    queue: deliveryQueue,
+    resolveUserName: resolvePersonaUserName,
+    clientFor,
+    wake: key => deliveryQueueWake.wake(key),
+  })
+
   // b.jg5 SRJ-801, SRJ-802: the retired-key record (retired-keys.json in the
   // state directory) is read once here, after the PID check (so a duplicate
   // start reads nothing) and before the reload controller's start resolution
@@ -3439,6 +3467,8 @@ export async function main(): Promise<void> {
   const reload = createReloadController({
     paths: reloadFilePaths(CONFIG_PATH),
     retiredKeys,
+    queueOpenCount: key => deliveryQueue?.openCount(key) ?? 0,
+    onQueueRetained: key => deliveryQueue?.retained(key),
     // b.jg5 SRJ-809: apply step 1 begins its old-life holds in the one hold
     // set, once the last-applied rewrite has succeeded.
     oldLifeHolds,
@@ -3505,6 +3535,7 @@ export async function main(): Promise<void> {
     onApplied: (config) => {
       if (appliedConfig === undefined) throw new Error('a confirmed apply ran before the start resolved its configuration')
       personaConfig = configInEffect(appliedConfig, config)
+      void deliveryPreparation?.recover(config.personas.map(p => p.key))
     },
   })
   reloadController = reload
@@ -4202,7 +4233,7 @@ export async function main(): Promise<void> {
     serialize: personaLifecycle.run,
     bringUps: personaBringUps,
     connections: manager,
-    routing: personaRouting,
+    routing: { ...personaRouting, forget: key => { personaRouting.forget(key); deliveryPreparation?.forget(key) } },
     destinations: personaDestinations,
     destinationHold: personaDestinationHold,
     notifier: personaNotifier,
@@ -4341,8 +4372,7 @@ export async function main(): Promise<void> {
       if (url.pathname === '/interject') {
         return handleInterject(req, server.requestIP(req)?.address, {
           getPersonaConfig: () => personaConfig,
-          isPersonaUp,
-          getSessionByPersona,
+          accept: (key, input) => deliveryPreparation!.accept(key, input),
         })
       }
 
@@ -4441,22 +4471,11 @@ export async function main(): Promise<void> {
   console.error(`  claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:${MCP_SERVER_NAME}`)
   console.error('')
 
-  // Cron scheduler — the once-per-minute dispatch tick (b.he5). It is its
-  // own /interject client, so it MUST start only AFTER Bun.serve() is listening
-  // (unlike startPermissionPoller, which starts before Bun.serve — do not copy
-  // that placement). Uses the ACTUAL bound port (httpServer.port) so port-0
-  // configs still reach the right listener. Any construction/start failure is
-  // non-fatal — the server keeps serving without a scheduler.
-  // scheduler.start() also owns the crontable bootstrap (the sole ensure-exists
-  // caller) and is failure-isolated internally.
+  // b.omv SR-4.4: scheduler acceptance goes directly to the shared queue.
   try {
     const cronLog = createCronLog(personaConfig.cron_log_path, { maxBytes: personaConfig.cron_log_max_bytes })
-    // Prefer the ACTUAL bound port (covers port-0 configs); fall back to the
-    // requested port only if Bun leaves it undefined (never expected once the
-    // server is listening).
-    const boundPort = httpServer.port ?? mcpPort
     const dispatcher = createCronDispatcher({
-      port: boundPort,
+      accept: (key, input) => deliveryPreparation!.accept(key, input),
       cronLog,
       cronTablePath: personaConfig.cron_table_path,
       // Resolved against the applied persona config at each fire.
@@ -4777,6 +4796,8 @@ export async function main(): Promise<void> {
   // run, the credentials files it references) with what is applied and keeps
   // config.json.pending in step, and applies a change the operator confirmed.
   reload.startDetection()
+  // Fix accepted-only items with the clients available after bring-up, including retained keys.
+  await deliveryPreparation?.recover()
 }
 
 if (import.meta.main) {

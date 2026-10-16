@@ -414,7 +414,6 @@ import {
   type KillFailureAlertVersion,
   type KillFailureClosing,
 } from '../src/kill-failure-alert.ts'
-import { STATE_WORDING } from '../src/lost-message.ts'
 import { renderLogMessageText } from '../src/persona-connection-errors.ts'
 import {
   abortKillOwnStuckLaunch,
@@ -4352,7 +4351,6 @@ const HATCH_NOTE_NAMES: [name: string, source: string][] = [
   [CLEAN_RESTART_NOT_RESTARTED_LABEL, 'E33: src/cli-teardown.ts CLEAN_RESTART_NOT_RESTARTED_LABEL (SRJ-906, SRJ-1013)'],
   ...startSummaryCountLabels().map((label): [string, string] => [label, 'E26: src/session-manager.ts startupSummaryEnding (SRJ-1015)']),
   [UNAVAILABLE_RETRY_CAUSE_COLLISION, "E36 T1: src/unavailable-retry.ts UNAVAILABLE_RETRY_CAUSE_COLLISION (the retry cause's rename, reconcile ruling)"],
-  [lostMessageStateLabel('auto-restart-disabled'), "E8, E36 T4: src/lost-message.ts STATE_WORDING['auto-restart-disabled'] (SRJ-1011)"],
 ]
 
 /**
@@ -5318,67 +5316,6 @@ describe("E36 T2: the README's install and startup texts point to the runbook an
       expect(edited).not.toBe(text)
       expect(preflightGateProblems(edited)).not.toEqual([])
     })
-  })
-})
-
-/** A lost-message state's label as the notice and the docs name it: the words between `Recovery: ` and ` —`. */
-function lostMessageStateLabel(state: keyof typeof STATE_WORDING): string {
-  const label = /^Recovery: (.+?) —/.exec(STATE_WORDING[state])?.[1]
-  if (label === undefined) throw new Error(`STATE_WORDING["${state}"] has no "Recovery: <label> —" lead`)
-  return label
-}
-
-/**
- * The claim the E8 note removed, that an `auto-restart disabled` persona will
- * not restart or come back on its own (false since E8 for a persona its
- * UNAVAILABLE retry timer owns). File-local, citing the E8 note.
- */
-const STALE_AUTO_RESTART_CLAIM: readonly [label: string, pattern: RegExp][] = [
-  ['will not restart or come back on its own', /\b(?:will not|won't|does not|doesn't|never|cannot|can't)\s+(?:be\s+)?(?:restart|come back|recover)\w*/gi],
-]
-
-/**
- * The `auto-restart disabled` state in the lost-message recovery states, which
- * live once, in the debugging skill's `No live session` row under "Other lines
- * you may see" (the "Session not restarting after crash" symptom points
- * there): the row's text from the state's label to the next state's
- * (`restart limit reached`). Throws unless exactly one such row holds both.
- */
-function readmeAutoRestartRow(): string {
-  const lead = '| `[slack] No live session for persona '
-  const section = requiredSection(operatorText(DEBUG_SKILL_FILE), '## Other lines you may see', DEBUG_SKILL_FILE)
-  const rows = section.split('\n').filter((line) => line.startsWith(lead))
-  if (rows.length !== 1) throw new Error(`${DEBUG_SKILL_FILE} "## Other lines you may see" has ${rows.length} rows starting ${lead}`)
-  const row = flat(rows[0])
-  const start = row.indexOf(`\`${lostMessageStateLabel('auto-restart-disabled')}\`: `)
-  const end = row.indexOf(`\`${lostMessageStateLabel('restart-limit-reached')}\`: `, start)
-  if (start < 0 || end < 0) throw new Error(`${DEBUG_SKILL_FILE}'s No live session row has no auto-restart disabled state followed by restart limit reached`)
-  return row.slice(start, end)
-}
-
-/** The debugging skill's `auto-restart disabled` state, up to the next state (`restart limit reached`), in its lost-message entry. */
-function debugSkillAutoRestartEntry(): string {
-  const text = flat(operatorText(DEBUG_SKILL_FILE))
-  const start = text.indexOf(`\`${lostMessageStateLabel('auto-restart-disabled')}\`: `)
-  const end = text.indexOf(`\`${lostMessageStateLabel('restart-limit-reached')}\`: `, start)
-  if (start < 0 || end < 0) throw new Error(`${DEBUG_SKILL_FILE} has no lost-message entry with the auto-restart disabled and restart limit reached states`)
-  return text.slice(start, end)
-}
-
-describe("E8: the README's and debugging skill's `auto-restart disabled` text keeps not saying the persona will not restart on its own (b.jg5 SRJ-1011)", () => {
-  test.each([
-    [`${DEBUG_SKILL_FILE}: the lost-message recovery states' row (No live session)`, readmeAutoRestartRow],
-    [`${DEBUG_SKILL_FILE}: the lost-message entry's state`, debugSkillAutoRestartEntry],
-  ] as const)('%s', (_label, passage) => {
-    const text = passage()
-    expect(text).toContain(lostMessageStateLabel('auto-restart-disabled'))
-    expect(termsIn(text, STALE_AUTO_RESTART_CLAIM)).toEqual([])
-  })
-
-  test('self-check: the old claim is reported; the lost-message notice\'s own wording is not', () => {
-    expect(termsIn('`session_restart_delay` is `0`, so the instance will not restart on its own.', STALE_AUTO_RESTART_CLAIM)).not.toEqual([])
-    expect(termsIn("the persona won't come back on its own", STALE_AUTO_RESTART_CLAIM)).not.toEqual([])
-    expect(termsIn(STATE_WORDING['auto-restart-disabled'], STALE_AUTO_RESTART_CLAIM)).toEqual([])
   })
 })
 
@@ -6440,10 +6377,9 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
   ]],
 
   // The latch.
-  [`the *${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}* entry: a CONFLICT and conflicting labels latch; the persona is ${lostMessageStateLabel('held-for-human')}`, viaSymptom(() => `*${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}*`, HELD_CONFLICT_SKILL_HEADING), [
+  [`the *${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}* entry: a CONFLICT and conflicting labels latch the persona`, viaSymptom(() => `*${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}*`, HELD_CONFLICT_SKILL_HEADING), [
     ci('a session conflict'),
     ci("conflicting labels on the persona's own row"),
-    code(lostMessageStateLabel('held-for-human')),
   ]],
   [`the *${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}* entry: the re-check ${LATCH_RECHECK_WORDS} (SRJ-505), how a hold ends, clear-latch, and "Operator actions" for a human only`, viaSymptom(() => `*${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}*`, HELD_CONFLICT_SKILL_HEADING), [
     ci(`**The server's own check.** ${LATCH_RECHECK_WORDS}`),

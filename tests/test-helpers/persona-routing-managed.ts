@@ -1,3 +1,5 @@
+import { createDeliveryQueue } from '../../src/delivery-queue.ts'
+import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
 /**
  * test-helpers/persona-routing-managed.ts — The real inbound routing module
  * over the real connection manager's seams, built as `src/server.ts` builds
@@ -50,6 +52,9 @@ export interface ManagedRouting {
   /** Lines from the module's log seam. */
   logs: string[]
   /** Notifications each persona's registered session received, by persona key. */
+  queue: ReturnType<typeof createDeliveryQueue>
+  ready: Promise<void>
+  queued(key: string): ReturnType<ReturnType<typeof createDeliveryQueue>['items']>
   notifications: Map<string, ChannelNotification[]>
 }
 
@@ -66,22 +71,21 @@ export function makeManagedRouting(h: ConnectionHarness, baseDir: string, opts: 
   // The notifier reads the same configuration as the routing, so a notice
   // goes to the destination of the channel mode in force (b.deo SRI-701).
   const { notifier } = makeNotifierStack({ getPersona: h.getPersona, clientFor: h.clientFor, getPersonaConfig: () => h.config, log })
-  const routing = createPersonaRouting({
+  const queue = createDeliveryQueue({ stateDir: baseDir })
+  const ready = queue.start()
+  const preparation = createDeliveryPreparation({ queue, clientFor: h.clientFor, resolveUserName: async (key, userId) => {
+    const client = h.clientFor(key)
+    const result = await client?.users.info({ user: userId })
+    return result?.user?.profile?.display_name || userId
+  } })
+  const core = createPersonaRouting({
     getPersonaConfig: () => h.config,
-    getBotIdentity: (key) => h.identityFor(key),
-    clientFor: h.clientFor,
-    resolveUserName: async (key, userId) => {
-      const client = h.clientFor(key)
-      if (!client) return userId
-      const res = await client.users.info({ user: userId })
-      return res.user?.profile?.display_name || userId
-    },
+    getBotIdentity: key => h.identityFor(key),
+    queue,
+    prepare: preparation.prepare,
     archive: opts.archive ?? (() => {}),
-    // As server.ts's getReplySettings: the applied config's ack_reaction, read
-    // at call time (none unless the harness's `overrides` set one).
-    getReplySettings: () => ({ ack_reaction: h.config?.ack_reaction }),
-    notify: (key, text, options) => notifier.notify(key, text, options),
     log,
   })
-  return { routing, logs, notifications }
+  const routing = { ...core, receive: async (...args: Parameters<typeof core.receive>) => { await ready; return core.receive(...args) } }
+  return { routing, logs, queue, ready, queued: key => queue.items(key), notifications }
 }

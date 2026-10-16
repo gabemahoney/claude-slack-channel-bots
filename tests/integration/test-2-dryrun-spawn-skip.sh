@@ -65,7 +65,7 @@ status="$(interject_status "no_such_persona")"
 
 # A known persona with no connected session (dry run never launches one).
 status="$(interject_status "alpha")"
-[ "${status}" = "503" ] \
-    || fail "/interject for persona alpha (no connected session) returned ${status}, expected 503"
+[ "${status}" = "200" ] \
+    || fail "/interject for persona alpha (no connected session) returned ${status}, expected 200"
 
 echo "PASS: ${TEST_NAME}"

@@ -1003,7 +1003,7 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     // The connection before the routing: an event for the key would create
     // a new dedupe store.
     await step('stopping its Slack connection', () => deps.connections.stop(key))
-    await step('forgetting its inbound dedupe store', () => deps.routing.forget(key))
+    await step('forgetting its ephemeral routing state', () => deps.routing.forget(key))
     await step('forgetting its ack-reaction entries', () => deps.forgetAcks(key))
     await step('forgetting its DM destination', () => deps.destinations.forget(key))
     // Again: a re-derived prompt's failure in the window can have opened a

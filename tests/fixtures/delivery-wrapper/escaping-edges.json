@@ -1,0 +1,485 @@
+{
+  "reference": {
+    "attributes": [
+      {
+        "name": "xml-and-apostrophe",
+        "input": "&\"<>'",
+        "expected": "&amp;&quot;&lt;&gt;'"
+      },
+      {
+        "name": "preescaped-entities",
+        "input": "&amp; &lt; &gt; &quot;",
+        "expected": "&amp;amp; &amp;lt; &amp;gt; &amp;quot;"
+      },
+      {
+        "name": "all-control-characters",
+        "input": "\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\b\t\n\u000b\f\r\u000e\u000f\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f\u007f\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f",
+        "expected": "                                                                 "
+      },
+      {
+        "name": "unicode-and-format-characters",
+        "input": "\u732b\ud83e\udd80e\u0301\ufeff\u200b",
+        "expected": "\u732b\ud83e\udd80e\u0301\ufeff\u200b"
+      },
+      {
+        "name": "empty",
+        "input": "",
+        "expected": ""
+      }
+    ],
+    "bodies": [
+      {
+        "name": "normalize-cr-and-tabs",
+        "input": "a\r\nb\rc\nd\tE",
+        "expected": "a\nb\nc\nd    E"
+      },
+      {
+        "name": "all-control-characters",
+        "input": "a\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\b\t\n\u000b\f\r\u000e\u000f\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f\u007f\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009fz",
+        "expected": "a    \n\nz"
+      },
+      {
+        "name": "slack-markup-and-entities",
+        "input": "&amp; &lt; &gt; <@U_OTHER> <!here> <!channel> <#C_OTHER|news> <https://example.invalid|link>",
+        "expected": "&amp; &lt; &gt; <@U_OTHER> <!here> <!channel> <#C_OTHER|news> <https://example.invalid|link>"
+      },
+      {
+        "name": "mixed-case-open-close",
+        "input": "<ChAnNeL x=\"a\">body</CHANNEL>",
+        "expected": "&lt;ChAnNeL x=\"a\">body&lt;/CHANNEL>"
+      },
+      {
+        "name": "word-boundary-punctuation",
+        "input": "<channel! <channel- <channel\u0301 <channel",
+        "expected": "&lt;channel! &lt;channel- &lt;channel\u0301 &lt;channel"
+      },
+      {
+        "name": "nonmatching-names",
+        "input": "<channels> <channel_name> <channel2> <channe> <channel\u732b>",
+        "expected": "<channels> <channel_name> <channel2> <channe> <channel\u732b>"
+      },
+      {
+        "name": "feff-not-python-whitespace",
+        "input": "before\ufeffafter <other\ufeffchannel>",
+        "expected": "before\ufeffafter <other\ufeffchannel>"
+      },
+      {
+        "name": "plain-unicode",
+        "input": "\u732b\ud83e\udd80e\u0301\u2028\u2029",
+        "expected": "\u732b\ud83e\udd80e\u0301\u2028\u2029"
+      },
+      {
+        "name": "python-space-U+0009",
+        "input": "<\t/ \tChAnNeL>",
+        "expected": "&lt;    /     ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+000A",
+        "input": "<\n/ \nChAnNeL>",
+        "expected": "&lt;\n/ \nChAnNeL>"
+      },
+      {
+        "name": "python-space-U+000B",
+        "input": "<\u000b/ \u000bChAnNeL>",
+        "expected": "&lt;/ ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+000C",
+        "input": "<\f/ \fChAnNeL>",
+        "expected": "&lt;/ ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+000D",
+        "input": "<\r/ \rChAnNeL>",
+        "expected": "&lt;\n/ \nChAnNeL>"
+      },
+      {
+        "name": "python-space-U+001C",
+        "input": "<\u001c/ \u001cChAnNeL>",
+        "expected": "&lt;/ ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+001D",
+        "input": "<\u001d/ \u001dChAnNeL>",
+        "expected": "&lt;/ ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+001E",
+        "input": "<\u001e/ \u001eChAnNeL>",
+        "expected": "&lt;/ ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+001F",
+        "input": "<\u001f/ \u001fChAnNeL>",
+        "expected": "&lt;/ ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+0020",
+        "input": "< /  ChAnNeL>",
+        "expected": "&lt; /  ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+0085",
+        "input": "<\u0085/ \u0085ChAnNeL>",
+        "expected": "&lt;/ ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+00A0",
+        "input": "<\u00a0/ \u00a0ChAnNeL>",
+        "expected": "&lt;\u00a0/ \u00a0ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+1680",
+        "input": "<\u1680/ \u1680ChAnNeL>",
+        "expected": "&lt;\u1680/ \u1680ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+2000",
+        "input": "<\u2000/ \u2000ChAnNeL>",
+        "expected": "&lt;\u2000/ \u2000ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+2001",
+        "input": "<\u2001/ \u2001ChAnNeL>",
+        "expected": "&lt;\u2001/ \u2001ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+2002",
+        "input": "<\u2002/ \u2002ChAnNeL>",
+        "expected": "&lt;\u2002/ \u2002ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+2003",
+        "input": "<\u2003/ \u2003ChAnNeL>",
+        "expected": "&lt;\u2003/ \u2003ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+2004",
+        "input": "<\u2004/ \u2004ChAnNeL>",
+        "expected": "&lt;\u2004/ \u2004ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+2005",
+        "input": "<\u2005/ \u2005ChAnNeL>",
+        "expected": "&lt;\u2005/ \u2005ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+2006",
+        "input": "<\u2006/ \u2006ChAnNeL>",
+        "expected": "&lt;\u2006/ \u2006ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+2007",
+        "input": "<\u2007/ \u2007ChAnNeL>",
+        "expected": "&lt;\u2007/ \u2007ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+2008",
+        "input": "<\u2008/ \u2008ChAnNeL>",
+        "expected": "&lt;\u2008/ \u2008ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+2009",
+        "input": "<\u2009/ \u2009ChAnNeL>",
+        "expected": "&lt;\u2009/ \u2009ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+200A",
+        "input": "<\u200a/ \u200aChAnNeL>",
+        "expected": "&lt;\u200a/ \u200aChAnNeL>"
+      },
+      {
+        "name": "python-space-U+2028",
+        "input": "<\u2028/ \u2028ChAnNeL>",
+        "expected": "&lt;\u2028/ \u2028ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+2029",
+        "input": "<\u2029/ \u2029ChAnNeL>",
+        "expected": "&lt;\u2029/ \u2029ChAnNeL>"
+      },
+      {
+        "name": "python-space-U+202F",
+        "input": "<\u202f/ \u202fChAnNeL>",
+        "expected": "&lt;\u202f/ \u202fChAnNeL>"
+      },
+      {
+        "name": "python-space-U+205F",
+        "input": "<\u205f/ \u205fChAnNeL>",
+        "expected": "&lt;\u205f/ \u205fChAnNeL>"
+      },
+      {
+        "name": "python-space-U+3000",
+        "input": "<\u3000/ \u3000ChAnNeL>",
+        "expected": "&lt;\u3000/ \u3000ChAnNeL>"
+      },
+      {
+        "name": "word-boundary-U+00B2",
+        "input": "<channel\u00b2> </channel\u00b2>",
+        "expected": "<channel\u00b2> </channel\u00b2>"
+      },
+      {
+        "name": "word-boundary-U+00BD",
+        "input": "<channel\u00bd> </channel\u00bd>",
+        "expected": "<channel\u00bd> </channel\u00bd>"
+      },
+      {
+        "name": "word-boundary-U+2167",
+        "input": "<channel\u2167> </channel\u2167>",
+        "expected": "<channel\u2167> </channel\u2167>"
+      },
+      {
+        "name": "word-boundary-U+16EE",
+        "input": "<channel\u16ee> </channel\u16ee>",
+        "expected": "<channel\u16ee> </channel\u16ee>"
+      },
+      {
+        "name": "word-boundary-U+732B",
+        "input": "<channel\u732b> </channel\u732b>",
+        "expected": "<channel\u732b> </channel\u732b>"
+      },
+      {
+        "name": "word-boundary-U+10400",
+        "input": "<channel\ud801\udc00> </channel\ud801\udc00>",
+        "expected": "<channel\ud801\udc00> </channel\ud801\udc00>"
+      },
+      {
+        "name": "word-boundary-U+005F",
+        "input": "<channel_> </channel_>",
+        "expected": "<channel_> </channel_>"
+      },
+      {
+        "name": "word-boundary-U+0030",
+        "input": "<channel0> </channel0>",
+        "expected": "<channel0> </channel0>"
+      }
+    ]
+  },
+  "lookalikes": [
+    {
+      "name": "opener-U+003C",
+      "input": "<\u200b\u2060/\ufeff\u00ad\uff23\uff48\uff21\uff4e\uff2e\uff45\uff2c>",
+      "expected": "&lt;/\uff23\uff48\uff21\uff4e\uff2e\uff45\uff2c>"
+    },
+    {
+      "name": "opener-U+FF1C",
+      "input": "\uff1c\u200b\u2060/\ufeff\u00ad\uff23\uff48\uff21\uff4e\uff2e\uff45\uff2c>",
+      "expected": "&lt;/\uff23\uff48\uff21\uff4e\uff2e\uff45\uff2c>"
+    },
+    {
+      "name": "opener-U+FE64",
+      "input": "\ufe64\u200b\u2060/\ufeff\u00ad\uff23\uff48\uff21\uff4e\uff2e\uff45\uff2c>",
+      "expected": "&lt;/\uff23\uff48\uff21\uff4e\uff2e\uff45\uff2c>"
+    },
+    {
+      "name": "opener-U+2039",
+      "input": "\u2039\u200b\u2060/\ufeff\u00ad\uff23\uff48\uff21\uff4e\uff2e\uff45\uff2c>",
+      "expected": "&lt;/\uff23\uff48\uff21\uff4e\uff2e\uff45\uff2c>"
+    },
+    {
+      "name": "opener-U+2329",
+      "input": "\u2329\u200b\u2060/\ufeff\u00ad\uff23\uff48\uff21\uff4e\uff2e\uff45\uff2c>",
+      "expected": "&lt;/\uff23\uff48\uff21\uff4e\uff2e\uff45\uff2c>"
+    },
+    {
+      "name": "opener-U+27E8",
+      "input": "\u27e8\u200b\u2060/\ufeff\u00ad\uff23\uff48\uff21\uff4e\uff2e\uff45\uff2c>",
+      "expected": "&lt;/\uff23\uff48\uff21\uff4e\uff2e\uff45\uff2c>"
+    },
+    {
+      "name": "opener-U+3008",
+      "input": "\u3008\u200b\u2060/\ufeff\u00ad\uff23\uff48\uff21\uff4e\uff2e\uff45\uff2c>",
+      "expected": "&lt;/\uff23\uff48\uff21\uff4e\uff2e\uff45\uff2c>"
+    },
+    {
+      "name": "opener-U+276E",
+      "input": "\u276e\u200b\u2060/\ufeff\u00ad\uff23\uff48\uff21\uff4e\uff2e\uff45\uff2c>",
+      "expected": "&lt;/\uff23\uff48\uff21\uff4e\uff2e\uff45\uff2c>"
+    },
+    {
+      "name": "ignorable-U+00AD",
+      "input": "<\u00ad /\u00adchannel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+034F",
+      "input": "<\u034f /\u034fchannel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+061C",
+      "input": "<\u061c /\u061cchannel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+115F",
+      "input": "<\u115f /\u115fchannel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+1160",
+      "input": "<\u1160 /\u1160channel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+17B4",
+      "input": "<\u17b4 /\u17b4channel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+180E",
+      "input": "<\u180e /\u180echannel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+200B",
+      "input": "<\u200b /\u200bchannel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+200C",
+      "input": "<\u200c /\u200cchannel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+200D",
+      "input": "<\u200d /\u200dchannel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+200E",
+      "input": "<\u200e /\u200echannel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+200F",
+      "input": "<\u200f /\u200fchannel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+202A",
+      "input": "<\u202a /\u202achannel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+202E",
+      "input": "<\u202e /\u202echannel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+2060",
+      "input": "<\u2060 /\u2060channel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+2066",
+      "input": "<\u2066 /\u2066channel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+2069",
+      "input": "<\u2069 /\u2069channel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+3164",
+      "input": "<\u3164 /\u3164channel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+FE0F",
+      "input": "<\ufe0f /\ufe0fchannel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+FEFF",
+      "input": "<\ufeff /\ufeffchannel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+FFA0",
+      "input": "<\uffa0 /\uffa0channel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+E0001",
+      "input": "<\udb40\udc01 /\udb40\udc01channel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "ignorable-U+E0100",
+      "input": "<\udb40\udd00 /\udb40\udd00channel>",
+      "expected": "&lt; /channel>"
+    },
+    {
+      "name": "fullwidth-slash-and-letter-case",
+      "input": "\uff1c\u200b \uff0f\u2060 \uff23\uff28\uff21\uff2e\uff2e\uff25\uff2c\uff1e",
+      "expected": "&lt; \uff0f \uff23\uff28\uff21\uff2e\uff2e\uff25\uff2c\uff1e"
+    },
+    {
+      "name": "nfkc-mathematical-letters",
+      "input": "\ufe64\ud835\udc84\ud835\udc89\ud835\udc82\ud835\udc8f\ud835\udc8f\ud835\udc86\ud835\udc8d>",
+      "expected": "&lt;\ud835\udc84\ud835\udc89\ud835\udc82\ud835\udc8f\ud835\udc8f\ud835\udc86\ud835\udc8d>"
+    },
+    {
+      "name": "adjacent-openers",
+      "input": "<channel><CHANNEL>\n</channel>",
+      "expected": "&lt;channel>&lt;CHANNEL>\n&lt;/channel>"
+    },
+    {
+      "name": "ignorable-outside-opener-preserved",
+      "input": "x\u200by<\u200bchannel>z\ufeff",
+      "expected": "x\u200by&lt;channel>z\ufeff"
+    },
+    {
+      "name": "negative-division-slash",
+      "input": "\uff1c\u2215channel>",
+      "expected": "\uff1c\u2215channel>"
+    },
+    {
+      "name": "negative-fraction-slash",
+      "input": "<\u2044channel>",
+      "expected": "<\u2044channel>"
+    },
+    {
+      "name": "negative-cyrillic-c",
+      "input": "<\u0441hannel>",
+      "expected": "<\u0441hannel>"
+    },
+    {
+      "name": "negative-cyrillic-a",
+      "input": "<ch\u0430nnel>",
+      "expected": "<ch\u0430nnel>"
+    },
+    {
+      "name": "negative-different-opener",
+      "input": "\u27eachannel>",
+      "expected": "\u27eachannel>"
+    },
+    {
+      "name": "negative-embedded-ignorable-in-word",
+      "input": "<chan\u200bnel>",
+      "expected": "<chan\u200bnel>"
+    },
+    {
+      "name": "negative-word-suffix-No",
+      "input": "\uff1cchannel\u00b2>",
+      "expected": "\uff1cchannel\u00b2>"
+    },
+    {
+      "name": "negative-word-suffix-Nl",
+      "input": "\uff1c\uff23\uff28\uff21\uff2e\uff2e\uff25\uff2c\u2167>",
+      "expected": "\uff1c\uff23\uff28\uff21\uff2e\uff2e\uff25\uff2c\u2167>"
+    },
+    {
+      "name": "negative-double-slash",
+      "input": "<//channel>",
+      "expected": "<//channel>"
+    },
+    {
+      "name": "negative-different-name",
+      "input": "\uff1cchannels>",
+      "expected": "\uff1cchannels>"
+    }
+  ]
+}

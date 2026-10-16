@@ -432,7 +432,7 @@ describe('b.ujn: the manager wired with the per-persona serializer, as server.ts
     c = makeConnectionHarness([{ name: 'alpha' }, { name: 'bravo' }], dir, { serialize: serializer.run })
     const [A, B] = [c.p('alpha'), c.p('bravo')]
     for (const p of [A, B]) expect(await c.bringUp(p)).toMatchObject({ state: 'up' })
-    const { routing, logs, notifications } = makeManagedRouting(c, dir)
+    const { routing, logs, queue: notifications } = makeManagedRouting(c, dir)
     c.onEvent = createPersonaEventRouter({ routing, clientFor: c.clientFor, getPersona: c.getPersona, log: (line) => void logs.push(line) })
     const socketA = c.stub(A).socket
     const channelA = A.channels[0]!.id
@@ -454,11 +454,11 @@ describe('b.ujn: the manager wired with the per-persona serializer, as server.ts
     // Still open on the network, but detached: the event reaches no session.
     expect(socketA.connected).toBe(true)
     await socketA.deliver(makeChannelMessage({ channel: channelA, text: 'to alpha after the revocation' }))
-    expect(notifications.get(A.key)).toEqual([])
+    expect(notifications.items(A.key)).toEqual([])
     expect(logs.filter((line) => line.includes(`persona=${A.key}`))).toEqual([])
     await c.stub(B).socket.deliver(makeChannelMessage({ channel: channelB, text: 'to bravo' }))
-    expect(notifications.get(B.key)!.map((n) => n.params.content)).toEqual(['to bravo'])
-    expect(notifications.get(A.key)).toEqual([])
+    expect(notifications.items(B.key)!.map((n) => n.accepted.text)).toEqual(['to bravo'])
+    expect(notifications.items(A.key)).toEqual([])
 
     turn.resolve()
     await held

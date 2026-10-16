@@ -69,6 +69,8 @@ import { describeThrownValueWithoutStack } from './persona-connection-errors.ts'
  * interpretable. Do not omit it.
  */
 export type CronOutcome =
+  | 'queued'
+  | 'queue-failed'
   /** Prompt delivered to the target persona's session successfully. */
   | 'delivered'
   /** No live, connected session for the target persona (HTTP 503) — message dropped. */
@@ -209,7 +211,7 @@ export function formatOutcomeLine(record: CronLogRecord): string {
  * Format a per-fire summary line. Shares the five-field layout with `summary`
  * in the outcome position — a LINE KIND, not an outcome class, so it is
  * deliberately absent from `CronOutcome`:
- *   <ts> <identity> - summary delivered=N failed=M
+ *   <ts> <identity> - summary queued=N failed=M
  */
 export function formatSummaryLine(
   timestamp: string,
@@ -223,7 +225,7 @@ export function formatSummaryLine(
     ABSENT,
     'summary',
   ]
-  return joinFields(fields, `delivered=${delivered} failed=${failed}`)
+  return joinFields(fields, `queued=${delivered} failed=${failed}`)
 }
 
 /**

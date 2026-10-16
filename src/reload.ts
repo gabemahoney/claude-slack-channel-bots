@@ -470,6 +470,10 @@ export type BringUpStateQuery = (key: string) => PersonaBringUpState | undefined
 
 /** Dependencies of `createReloadController`. */
 export interface ReloadControllerDeps {
+  /** b.omv SR-3.7: facts gathered outside the pure change planner. */
+  queueOpenCount?(key: string): number
+  /** Confirmation-time E5 seam; no E2 log or notice wording. */
+  onQueueRetained?(key: string, count: number): void
   /** The configuration file and its reload files (`reloadFilePaths`). */
   paths: ReloadFilePaths
   /** The lifecycle operations. */
@@ -1126,6 +1130,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
     factFailed = false
     const facts: ChangePlanFacts = {
       realPath: realPathOf,
+      queueOpenCount: key => deps.queueOpenCount?.(key) ?? 0,
       home: deps.home,
       dryRun,
       currentCredentialsDigest: (path) => (dryRun ? undefined : digestOf(path)),
@@ -1822,6 +1827,9 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     // holds its old life's working directory from now, before any teardown's
     // kill; a failed write or rewrite above began none.
     beginStepOneHolds(plan, current.config)
+    for (const persona of plan.removed) {
+      try { deps.onQueueRetained?.(persona.key, deps.queueOpenCount?.(persona.key) ?? 0) } catch { /* observer cannot interrupt apply */ }
+    }
     // b.deo SRI-406: the retired keys' stored choices stop applying now, in
     // the same synchronous stretch; a failed write never fails the apply.
     dropRetiredChoices(channelDelivery, plan)

@@ -3304,12 +3304,12 @@ describe('SRJ-1016, SRJ-502: P\'s latch and relatch end its open stuck-launch ep
 // harness's latch's latched query bound as `main()` binds it
 // ---------------------------------------------------------------------------
 
-describe('SRJ-502, SRJ-1011: a message lost while P is latched reports held for a human and fires no restart (recovery harness)', () => {
+describe('SRJ-502, SRJ-1011: an accepted message while P is latched stays queued and fires no restart (recovery harness)', () => {
   const leftoverRow = rowWhere(
     (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.stubCase === 'scan-leftover' && row.rowState === LATCH_ROW_STATE_NO_ROW,
   )
 
-  test('a CONFLICT at P’s spawn latches P; a message lost then reports held for a human with its exported wording at P’s destination, asks for no restart and makes no call, and nothing fires for P afterwards; Q’s lost message reports its own state after its one row read', async () => {
+  test('a CONFLICT at P’s spawn latches P; an accepted message stays queued without a notice, restart or call, and nothing fires for P afterwards; Q makes its own row read', async () => {
     const h = makeRecoveryHarness()
     harnesses.push(h)
     expect(h.config.session_restart_delay).toBe(0)
@@ -3322,12 +3322,9 @@ describe('SRJ-502, SRJ-1011: a message lost while P is latched reports held for 
 
     // Ignoring the latch would report the delay 0's auto-restart disabled; a
     // restart request is seen even though the latched restart module arms none.
-    const lost = await expectLostMessageReports(h, p, 'held-for-human')
-    const persona = personaOf(h, p)
-    expect(posts(h.slack(p)).map((post) => [post.channel, post.text])).toEqual([
-      [persona.permission_prompts, formatPersonaNotice(persona, lost.notice)],
-    ])
-    expect(h.lostMessageNotices).toEqual([{ key: p, text: lost.notice }])
+    await expectLostMessageReports(h, p, 'held-for-human')
+    expect(posts(h.slack(p))).toEqual([])
+    expect(h.lostMessageNotices).toEqual([])
     expect(h.episodeNotices).toEqual([{ key: p, text: leftoverRow.notice.text }])
 
     // Nothing fires for P afterwards: several retry waits on, no attempt, no call, nothing pending.
@@ -3339,8 +3336,8 @@ describe('SRJ-502, SRJ-1011: a message lost while P is latched reports held for 
     // its message makes the routing's one row read (SRJ-1011), a `status` of
     // Q's instance, which reads no row (dead), not `pending`.
     await expectLostMessageReports(h, q, 'auto-restart-disabled')
-    expect(h.slack(q).calls.postMessage).toHaveLength(1)
-    expect(h.slack(p).calls.postMessage).toHaveLength(1)
+    expect(h.slack(q).calls.postMessage).toHaveLength(0)
+    expect(h.slack(p).calls.postMessage).toHaveLength(0)
     expect(h.latch.isLatched(q)).toBe(false)
     expect(personaCallCounts(h, q)).toEqual({ statusCalls: 1 })
     // The latched P's own calls are still those of its launch.
@@ -3416,7 +3413,7 @@ describe('SRJ-512: an UNUSABLE NAME from resume and from the working-row read-pa
     expect(qCalls).toEqual([...Q_CALLS_ON_EVERY_PATH])
   })
 
-  test.each(UNUSABLE_LATCH_WAYS)('P latched by %s: a message lost then reports held for a human with its exported wording at P\'s destination, with no status read and no restart; Q\'s lost message reports its own state', async (_label, row, latchScript) => {
+  test.each(UNUSABLE_LATCH_WAYS)('P latched by %s: an accepted message stays queued without a notice, status read or restart; Q makes its own row read', async (_label, row, latchScript) => {
     const h = makeRecoveryHarness()
     harnesses.push(h)
     expect(h.config.session_restart_delay).toBe(0)
@@ -3430,9 +3427,8 @@ describe('SRJ-512: an UNUSABLE NAME from resume and from the working-row read-pa
     expect(h.latch.record(p)).toEqual(row.record(p))
     const pCallsAtLatch = personaCallCounts(h, p)
 
-    const lost = await expectLostMessageReports(h, p, 'held-for-human')
-    const persona = personaOf(h, p)
-    expect(posts(h.slack(p)).map((post) => [post.channel, post.text])).toEqual([[persona.permission_prompts, formatPersonaNotice(persona, lost.notice)]])
+    await expectLostMessageReports(h, p, 'held-for-human')
+    expect(posts(h.slack(p))).toEqual([])
     expect(h.restartAsks.filter((key) => key === p)).toEqual([])
     expect([isRestartPendingOrActive(p), personaCallCounts(h, p)]).toEqual([false, pCallsAtLatch])
     expect(h.episodeNotices).toEqual([{ key: p, text: row.notice(p) }])
@@ -4618,11 +4614,10 @@ describe('SRJ-513, SRJ-1011: a message lost for P whose row reads pending with n
     expect(getFailureCount(p)).toBe(0)
   }
 
-  test('with nothing latched, the message\'s one status read latches P and the message reports held for a human at P\'s destination, with no restart; one SRJ-1020 post; Q reports its own state', async () => {
+  test('with nothing latched, the message\'s one status read latches P and the accepted message stays queued with no intake notice or restart; one SRJ-1020 episode post; Q makes its own row read', async () => {
     const { h, p, q } = makeLostRun(pNoLaunchStartStatus)
-    const lost = await expectLostMessageReports(h, p, 'held-for-human', { calls: { statusCalls: 1 } })
-    const persona = personaOf(h, p)
-    expect(posts(h.slack(p)).map((post) => [post.channel, post.text])).toEqual([[persona.permission_prompts, formatPersonaNotice(persona, lost.notice)]])
+    await expectLostMessageReports(h, p, 'held-for-human', { calls: { statusCalls: 1 } })
+    expect(posts(h.slack(p))).toEqual([])
     expect(h.latch.record(p)).toEqual(launchStartRecord(p))
     expect(h.episodeNotices).toEqual([{ key: p, text: launchStartNotRecordedNoticeText(p) }])
     expectNoRestartFor(h, p)

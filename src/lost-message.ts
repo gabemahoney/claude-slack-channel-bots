@@ -1,33 +1,4 @@
-/**
- * lost-message.ts — The lost-message recovery state and notice text (b.av2
- * SR-4.6, SR-7.3; b.jg5 SRJ-1011, SRJ-1509).
- *
- * A Slack message that finds no live, stream-bearing session for persona P is
- * lost: it is not delivered to P's instance and not saved. P's destination is
- * told once, through the persona notifier, with the text built here. Nothing
- * is posted in the conversation the message came from. The inbound pipeline
- * (`src/persona-routing.ts`) reads the real state of P, fires the
- * human-triggered restart and raises the notice; this module only decides the
- * state and builds the text.
- *
- * The state is the first that applies, in the order of `LOST_MESSAGE_STATES`
- * (b.jg5 SRJ-1011): not up; held for a human; cannot launch; kill failed; not
- * answering; session starting; restarting; auto-restart disabled; restart
- * limit reached; starting now. One input is asked out of that order: a
- * live-row sequence or old-life wait step running for P answers `restarting`
- * after states 1 to 5 and before `session-starting`, so such a step reports
- * `restarting` even while P's row reads `pending` (b.jg5 SRJ-706, SRJ-410,
- * SRJ-812). Only `starting-now` fires the human-triggered restart
- * (`firesHumanTriggeredRestart`); in the five states from `held-for-human` to
- * `session-starting` none fires (b.jg5 SRJ-1501).
- *
- * Pure module (b.av2 SR-13.1): no state, no I/O, no timers and no logging;
- * nothing runs at import. The state queries are injected.
- *
- * SPDX-License-Identifier: MIT
- */
-
-import { escapeSlackControlCharacters } from './slack-text-escape.ts'
+/** Existing pure message-triggered recovery decisions (b.omv SR-4.2). */
 
 // ---------------------------------------------------------------------------
 // Types
@@ -189,61 +160,4 @@ export function decideLostMessageState(queries: LostMessageRecoveryQueries): Los
  */
 export function firesHumanTriggeredRestart(state: LostMessageState): boolean {
   return state === 'starting-now'
-}
-
-// ---------------------------------------------------------------------------
-// Notice text
-// ---------------------------------------------------------------------------
-
-/**
- * The recovery wording each state adds to the notice, one line each. The five
- * from `held-for-human` to `session-starting` are SRJ-1011's table; the
- * `auto-restart-disabled` wording names the retry that brings back a persona
- * CSCB is already retrying (b.jg5 SRJ-1011, hatch A3). Read-only; tests
- * import it and keep no copy.
- */
-export const STATE_WORDING: Readonly<Record<LostMessageState, string>> = Object.freeze({
-  'not-up':
-    'Recovery: not up — this persona is not up, so no restart was started; its instance will be launched once it recovers.',
-  'held-for-human':
-    'Recovery: held for a human — this persona is held until a human resolves a problem with its tmux session or agent-director row; no restart was started.',
-  'cannot-launch':
-    'Recovery: cannot launch — the host\'s agent-director rejected this persona\'s launch; no restart was started.',
-  'kill-failed':
-    'Recovery: kill failed — a kill of a worker this persona depends on failed, and that worker may still be running; no restart was started.',
-  'not-answering':
-    'Recovery: not answering — agent-director or tmux is not answering for this persona, tmux is not available, or agent-director refuses its config file; CSCB is retrying, and no restart was started.',
-  'session-starting':
-    'Recovery: starting — this persona\'s session is starting but has not come up yet; CSCB is checking with agent-director, and no restart was started.',
-  'restarting': 'Recovery: restarting — a restart of this persona\'s instance was already under way.',
-  'auto-restart-disabled':
-    'Recovery: auto-restart disabled — no restart was started because session_restart_delay is 0; if CSCB is already retrying this persona, it comes back when a retry succeeds; otherwise a server restart recovers it.',
-  'restart-limit-reached':
-    'Recovery: restart limit reached — automatic restarts are suspended for this persona; restart the server to recover.',
-  'starting-now': 'Recovery: starting now — a restart of this persona\'s instance has just been started.',
-})
-
-/**
- * The sender label as notice text: Slack's control characters `&`, `<` and
- * `>` escaped, so a label such as `<!channel>` or `<@U…>` (a webhook
- * `username` is set by the sender) renders as text and notifies no one, and
- * line breaks folded to spaces, so the label stays on the notice's first line.
- */
-function escapeSenderLabel(label: string): string {
-  return escapeSlackControlCharacters(label).replace(/\s*[\r\n]+\s*/g, ' ')
-}
-
-/**
- * The lost-message notice body for the persona's destination: that a message
- * from `senderLabel` (a readable name, or the user or bot ID when there is
- * none) was lost, not delivered and not saved, and the recovery state. One
- * line, so a dry-run log line (which carries only the first line) keeps the
- * sender and the state. Carries no message text, no mention of the sender and
- * no persona name (the notifier adds the persona reference).
- */
-export function buildLostMessageNotice(senderLabel: string, state: LostMessageState): string {
-  return (
-    `:warning: *Message lost* — a message from ${escapeSenderLabel(senderLabel)} was not delivered to ` +
-    `this persona's instance and was not saved; it will not be delivered later. ${STATE_WORDING[state]}`
-  )
 }

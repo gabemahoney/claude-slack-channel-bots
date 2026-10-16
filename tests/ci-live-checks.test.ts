@@ -3981,10 +3981,10 @@ describe('expected texts match the package', () => {
     ])
   })
 
-  test("a persona's removal line (Checks 27 and 28) is the package's retired removal line, never the old 'will be destroyed' one", () => {
+  test.each([0, 3])("a persona's removal line (Checks 27 and 28) matches the package with %i queued items", queueOpenCount => {
     const n = personaName('d')
-    const line = removedPreviewLine('d')
-    expect(line).toBe(removedLine({ key: n, name: n, index: 0 }))
+    const line = removedPreviewLine('d', queueOpenCount)
+    expect(line).toBe(removedLine({ key: n, name: n, index: 0, queueOpenCount }))
     expect(line).not.toContain('destroyed')
   })
 

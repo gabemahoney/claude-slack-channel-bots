@@ -213,7 +213,7 @@ function startTimeConfig(): string {
     new RegExp(
       `^\\(?\\s*(\\w+)\\s*\\)?\\s*=>\\s*\\{\\s*` +
         `if\\s*\\(\\s*(\\w+)\\s*===\\s*undefined\\s*\\)\\s*throw\\s+new\\s+Error\\s*\\(\\s*'[^']*'\\s*\\)\\s*;?\\s*` +
-        `${loaded}\\s*=\\s*configInEffect\\s*\\(\\s*\\2\\s*,\\s*\\1\\s*\\)\\s*;?\\s*\\}$`,
+        `${loaded}\\s*=\\s*configInEffect\\s*\\(\\s*\\2\\s*,\\s*\\1\\s*\\)\\s*;?\\s*void\\s+deliveryPreparation\\?\\.recover\\(\\1\\.personas\\.map\\(p\\s*=>\\s*p\\.key\\)\\)\\s*;?\\s*\\}$`,
     ),
   )
   expect(swap).not.toBeNull()
@@ -491,7 +491,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       // change nothing the server serves.
       ['bringUps', constOf('createPersonaBringUpController')],
       ['connections', constOf('createPersonaConnectionManager')],
-      ['routing', constOf('createPersonaRouting')],
+      ['routing', `{ ...${constOf('createPersonaRouting')}, forget: key => { ${constOf('createPersonaRouting')}.forget(key); deliveryPreparation?.forget(key) } }`],
       ['destinations', constOf('createPersonaDestinations')],
       ['destinationHold', constOf('createPersonaDestinationHold')],
       ['notifier', notifier],
@@ -1083,7 +1083,6 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
   // the accessor itself (not a value taken once, not a stand-in), so each
   // use reads it again.
   test.each([
-    ['the persona routing (the inbound ack reaction)', () => onlyCallProps('createPersonaRouting')],
     ['the MCP session tools (the reply tool\'s chunking and ack removal)', () => constObjectProps('sessionToolDeps')],
   ])('%s get getReplySettings: getReplySettings, the one accessor', (_consumer, props) => {
     expect(props().get('getReplySettings')).toBe('getReplySettings')
@@ -1182,4 +1181,10 @@ describe('replySettingsOf (b.av2 SR-1.6)', () => {
 
     expect(replySettingsOf(rest as PersonaConfig)).toEqual({ ...DEFAULTS, ack_reaction: 'eyes' })
   })
+})
+
+test('production removal previews consume queue counts as facts and confirmation exposes the retained event', () => {
+  const props = controllerProps()
+  expect(props.get('queueOpenCount')).toMatch(/^key\s*=>\s*deliveryQueue\?\.openCount\(key\)\s*\?\?\s*0$/)
+  expect(props.get('onQueueRetained')).toMatch(/^key\s*=>\s*deliveryQueue\?\.retained\(key\)$/)
 })

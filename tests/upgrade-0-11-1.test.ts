@@ -810,7 +810,9 @@ const SAMPLES: Readonly<Record<string, (h: ReloadHarness, fixture: UpgradeFixtur
       [{ event: 'bravo, B1, mention', to: 'bravo', kind: 'mention', channel: b1 }, { deliveries: deliveredTo(f, 'bravo', b1, 'mention'), dropLines: [] }],
       [
         { event: 'alpha, an unlisted channel, a mention as both its events', to: 'alpha', kind: 'mention', channel: UNLISTED_CHANNEL, bothEvents: true },
-        { deliveries: noDelivery(f), dropLines: [unclaimedLine(h, f, 'alpha', UNLISTED_CHANNEL)] },
+        // b.omv SR-3.4: only accepted Slack keys are durable dedupe facts;
+        // both rejected envelopes are diagnosed without creating a queue row.
+        { deliveries: noDelivery(f), dropLines: Array.from({ length: 2 }, () => unclaimedLine(h, f, 'alpha', UNLISTED_CHANNEL)) },
       ],
     ]
   },
@@ -863,7 +865,7 @@ async function openListingClient(run: ReloadRun, name: string): Promise<Client> 
 
 describe('a 0.11.1 configuration decides sample events as SRI-308 says (b.deo SRI-1307, SRI-308, SRI-106)', () => {
   test.each(FIXTURES.map((f) => [f.file, f] as const))(
-    '%s: listed channels deliver by their entries, an unlisted one logs one unclaimed-channel line, a channel another persona lists logs nothing',
+    '%s: listed channels deliver by their entries, each dropped unlisted event logs one unclaimed-channel line, a channel another persona lists logs nothing',
     async (_file, fixture) => {
       const h = makeHarness()
       const { run, placed } = await startWithSessions(h, fixture)

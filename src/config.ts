@@ -2104,7 +2104,7 @@ export interface PersonaConfigFs {
 /** How `readPersonaConfigBytes` reads. */
 export interface ReadPersonaConfigBytesOptions {
   /**
-   * Read the whole file, with no `MAX_RELOAD_FILE_BYTES` cap. Only three reads
+   * Read the whole file, with no `MAX_RELOAD_FILE_BYTES` cap. Queue journals (b.omv SR-3.6) also read in full. Only three configuration reads
    * set it: the SR-5.2 file guard's read (`credentialsFilesToProtect`), the
    * start's read of the retired-key record (`loadRetiredKeyStore`), and the
    * start's read of the stored-choice file (`loadChannelDeliveryStore` in

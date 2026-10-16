@@ -32,7 +32,7 @@
 #                                                                  src/session-manager.ts startupSessionManager
 #   [slack] Fatal: …  (a refused start; none expected)             src/reload.ts
 # /interject (src/interject.ts): 404 for no applied persona with that exact
-# name or key, 503 for a known persona that is not up or has no session.
+# name or key, 200 for a known persona that is not up or has no session.
 set -euo pipefail
 
 TEST_NAME="test-5-two-personas"
@@ -159,9 +159,9 @@ n="$(count_token_like "${LOG}" "${START_OUT}")"
 [[ "${n}" == 0 ]] || fail "secrecy: ${n} token-like string(s) in server.log or the start output"
 
 # --- /interject: each persona by name and by key, and unknown targets -------
-expect_interject "${ALPHA_NAME}" 503 "/interject for alpha by name (= key), known with no session"
-expect_interject "${BRAVO_NAME}" 503 "/interject for bravo by name, known with no session"
-expect_interject "${BRAVO_KEY}" 503 "/interject for bravo by its derived key, known with no session"
+expect_interject "${ALPHA_NAME}" 200 "/interject for alpha by name (= key), known with no session"
+expect_interject "${BRAVO_NAME}" 200 "/interject for bravo by name, known with no session"
+expect_interject "${BRAVO_KEY}" 200 "/interject for bravo by its derived key, known with no session"
 expect_interject "${SCENARIO_TAG}_nobody" 404 "/interject for an unknown persona"
 # Names match exactly (case-sensitive): bravo's name lower-cased is unknown.
 expect_interject "${BRAVO_NAME,,}" 404 "/interject for bravo's name lower-cased"

@@ -19,8 +19,10 @@
  *      include every runtime src/*.ts file in the repo. This is the general
  *      guard against the whole class of bug: a future new src file silently
  *      excluded by the package.json `files` globs would ship a broken tarball
- *      without anyone noticing. Hermetic where possible; shells out to npm for
- *      the authoritative file list and skips cleanly if npm is unavailable.
+ *      without anyone noticing. A hermetic companion checks package.json's
+ *      inclusion and exclusion patterns for every runtime source file, including
+ *      E2's tag-wrapper, delivery-queue and delivery-intake modules. The npm
+ *      probe gives the authoritative file list and skips only if npm is absent.
  *
  * b.av2 AC 27 guard (SR-12, SR-13.5): the shipped debugging skill
  * `skills/debug-slack-channel-bots/SKILL.md` must be in the npm pack list
@@ -416,6 +418,13 @@ describe('b.q9t: npm pack ships every runtime src file', () => {
       expect(missing).toEqual([])
     },
   )
+
+  test('(hermetic): package.json files covers every runtime src/*.ts file with no ! entry excluding it', () => {
+    const runtimeFiles = runtimeSrcFiles()
+    expect(runtimeFiles.length).toBeGreaterThan(0)
+    const files = readPkg().files ?? []
+    expect(runtimeFiles.filter((rel) => !filesCover(files, rel))).toEqual([])
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -783,7 +792,6 @@ function triageStep(text: string, n: number): string {
  * `invited.permission_prompts`, or `"dm"` when it is absent.
  */
 const DESTINATION_PASSAGES: [string, (text: string) => string][] = [
-  ['Triage step 1', (text) => triageStep(text, 1)],
   [`the \`${PERSONA_DESTINATION_FAILED}\` entry's fungible-mode <dest>`, (text) => destinationFailedBullet(text, '- **Fungible mode:**')],
   [`the \`${PERSONA_DESTINATION_FAILED}\` entry's not_in_channel fix`, (text) => destinationFailedBullet(text, '- `not_in_channel`:')],
   [
@@ -809,7 +817,6 @@ const DESTINATION_PASSAGES: [string, (text: string) => string][] = [
         `${SKILL_REL}, under "## A persona can't open a DM",`,
       ),
   ],
-  ['"Two personas post lost-message notices about each other"', (text) => requiredSection(text, '### Two personas post lost-message notices about each other', SKILL_REL)],
   [
     "the silence entry's loop-guard row",
     (text) => rowHolding(requiredSection(text, `## ${SILENCE_TITLE}`, SKILL_REL), '| **The loop guard**', `${SKILL_REL}, under "## ${SILENCE_TITLE}",`),

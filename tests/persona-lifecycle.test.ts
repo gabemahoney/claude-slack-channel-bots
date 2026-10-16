@@ -1344,7 +1344,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     ['stopRetryTimer', ['stopping its UNAVAILABLE retry timer', 'stopping its UNAVAILABLE retry timer again, after its launch in flight settled', TEARDOWN_RETRY_TIMER_STOP_AFTER_KILL_STEP]],
     ['whenLaunchSettled', ['waiting for its launch in flight']],
     ['connections.stop', ['stopping its Slack connection']],
-    ['routing.forget', ['forgetting its inbound dedupe store']],
+    ['routing.forget', ['forgetting its ephemeral routing state']],
     ['forgetAcks', ['forgetting its ack-reaction entries']],
     ['destinations.forget', ['forgetting its DM destination']],
     ['destinationHold.cancel', [DESTINATION_HOLD_CANCEL_AT_WINDOW_STEP, 'cancelling its held destination notices']],

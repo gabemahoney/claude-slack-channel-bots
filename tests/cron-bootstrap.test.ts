@@ -226,8 +226,10 @@ describe('scheduled-prompts doc — mandated crontable/scheduler facts', () => {
     expect(SCHEDULED_SECTION).toContain('cscb-cron:')
   })
 
-  test('documents no-retry delivery semantics', () => {
-    expect(SCHEDULED_SECTION).toContain('No retry')
+  test('documents durable acceptance independently of a failed store', () => {
+    expect(SCHEDULED_SECTION).toContain('Accepted fires stay queued')
+    expect(SCHEDULED_SECTION).toContain('Every accepted fire is kept independently')
+    expect(SCHEDULED_SECTION).toContain('a failed store is logged as `queue-failed` and is not an accepted item')
   })
 
   test('documents append-do-not-rewrite etiquette', () => {
