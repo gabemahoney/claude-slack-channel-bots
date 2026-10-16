@@ -146,13 +146,14 @@ X1="C0${CH_TAG}X1"          # externally shared (flag true)
 X2="C0${CH_TAG}X2"          # no flag
 X3="C0${CH_TAG}X3"          # a flag that is not a boolean
 GDM="G0${CH_TAG}GD"         # a group DM (`mpim`)
+DM="D0${CH_TAG}DM"          # bravo's direct DM for the E5 delivery evidence
 ALPHA_BOT_USER="U0${CH_TAG}ALPHA"
 ALPHA_BOT_ID="B0${CH_TAG}ALPHA"
 BRAVO_BOT_USER="U0${CH_TAG}BRAVO"
 BRAVO_BOT_ID="B0${CH_TAG}BRAVO"
 HUMAN="U0${CH_TAG}HUMAN"    # every event's author
 CONTACT="U0${CH_TAG}CONTACT" # bravo's dm.contact
-for id in "${A1}" "${A2}" "${B1}" "${F1}" "${F2}" "${U1}" "${X1}" "${X2}" "${X3}" "${GDM}" \
+for id in "${A1}" "${A2}" "${B1}" "${F1}" "${F2}" "${U1}" "${X1}" "${X2}" "${X3}" "${GDM}" "${DM}" \
     "${ALPHA_BOT_USER}" "${BRAVO_BOT_USER}" "${HUMAN}" "${CONTACT}"; do
     [[ "${id}" =~ ^[A-Z0-9]{1,24}$ ]] || fail "ID ${id} is not 1 to 24 characters from A-Z0-9"
 done
@@ -1204,6 +1205,46 @@ expect_sessions_kept "switch off" "${A1}" "${OFF_A1_TS}" "${B1}" "${OFF_B1_TS}"
 # alpha's call for F1: refused with the declarative text; the file unchanged.
 expect_tool "switch off: alpha's set_channel_delivery F1 all" "${ALPHA_DIR}" "${F1_ALL_ARGS}" true "${ALPHA_DECLARATIVE_REFUSAL}"
 cmp -s -- "${STORE_FILE}" "${STORE_BEFORE_OFF}" || fail "switch off: ${STORE_FILE} changed"
+
+# E5 demo (b.omv SR-8.6): retain one real stub DM's log and transcript
+# metadata before the successful scenario's EXIT trap deletes both. The
+# existing queue checks establish acceptance and receipt completion; this
+# export prints the observed evidence without adding E9's log assertions.
+push_message "${BRAVO_LABEL}" "${DM}" im "$(plain_text)"
+DM_TS="${PUSH_TS}"
+wait_queued "E5: bravo direct DM" "${BRAVO_DIR}" "${DM}" "${DM_TS}" dm
+wait_until "${SESSION_WAIT_S}" "E5: bravo's direct DM never received its receipt" queue_drained "${BRAVO_DIR}"
+RECEIVED_LABEL="$(printed MESSAGE_RECEIVED)"
+DELIVERED_LABEL="$(printed MESSAGE_DELIVERED)"
+python3 - "${SLACK_STATE_DIR}/server.log" "${DELIVERIES_FILE[${BRAVO_DIR}]}" "${DM}" "${DM_TS}" \
+    "${RECEIVED_LABEL}" "${DELIVERED_LABEL}" << 'EOF'
+import json, re, sys
+log, journal, channel, ts, *labels = sys.argv[1:]
+print("E5 stub DM evidence (metadata only):")
+with open(log) as f:
+    for line in f:
+        if any(f"[slack] {label}:" in line for label in labels) and f'chat_id="{channel}"' in line and f'ts="{ts}"' in line:
+            print(line.rstrip())
+with open(journal) as f:
+    records = [json.loads(line) for line in f if line.strip()]
+accepted = next(r for r in records if r["kind"] == "accepted" and r.get("channel") == channel and r.get("ts") == ts)
+print("queue acceptance: " + json.dumps({k: accepted[k] for k in ("seq", "channel", "ts", "via", "received_at")}))
+for delivered in records:
+    if delivered["kind"] != "delivered" or delivered["seq"] != accepted["seq"]:
+        continue
+    receipt = delivered["receipt"]
+    print("queue receipt: " + json.dumps({k: delivered[k] for k in ("seq", "part", "at", "receipt")}))
+    with open(receipt["path"]) as f:
+        for line in f:
+            record = json.loads(line)
+            if record.get("uuid") != receipt.get("uuid"):
+                continue
+            content = record.get("message", {}).get("content", "")
+            tag = re.search(r"<channel\b([^>]*)>", content)
+            metadata = {k: record[k] for k in ("type", "uuid", "timestamp", "sessionId")}
+            metadata["tag"] = dict(re.findall(r'([a-z_]+)="([^"]*)"', tag[1])) if tag else None
+            print("transcript receipt: " + json.dumps(metadata))
+EOF
 
 # Every persona's complete accepted set, including absence of all other inputs.
 # Multiple journal records per item never count as additional acceptances.

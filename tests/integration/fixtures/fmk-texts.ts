@@ -300,6 +300,7 @@
  *   invitedChannelCause <channel> <public|private> <delivery>
  *                                                src/persona-diagnostics.ts: its cause
  *   PERSONA_CHANNEL_DELIVERY_SET                 src/persona-diagnostics.ts, the class label
+ *   MESSAGE_RECEIVED, MESSAGE_DELIVERED          src/persona-diagnostics.ts, delivery evidence labels
  *   channelDeliverySetCause <channel> <before> <after> <delivery>
  *                                                src/persona-diagnostics.ts: its cause; <before>
  *                                                is the package's NO_STORED_CHOICE for no stored
@@ -4212,6 +4213,8 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   PERSONA_INVITED_CHANNEL: constantEntry('persona-diagnostics.ts', 'PERSONA_INVITED_CHANNEL'),
   invitedChannelCause: invitedCause,
   PERSONA_CHANNEL_DELIVERY_SET: constantEntry('persona-diagnostics.ts', 'PERSONA_CHANNEL_DELIVERY_SET'),
+  MESSAGE_RECEIVED: constantEntry('persona-diagnostics.ts', 'MESSAGE_RECEIVED'),
+  MESSAGE_DELIVERED: constantEntry('persona-diagnostics.ts', 'MESSAGE_DELIVERED'),
   channelDeliverySetCause: deliverySetCause,
   NO_STORED_CHOICE: constantEntry('persona-diagnostics.ts', 'NO_STORED_CHOICE'),
   SET_CHANNEL_DELIVERY_TOOL: constantEntry('channel-delivery.ts', 'SET_CHANNEL_DELIVERY_TOOL'),
