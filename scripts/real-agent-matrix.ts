@@ -14,6 +14,7 @@ export const MATRIX_VERSIONS = ['2.1.280', '2.1.296'] as const
 export const GATE_SLUGS = ['order', 'keys', 'compact', 'restarts', 'crash', 'mcp', 'cron', 'fidelity', 'downgrade'] as const
 export const HEAVY_SCRIPTS = [
   'test-101-fmk-real-busy.sh', 'test-102-fmk-real-replies.sh', 'test-103-fmk-real-latency100.sh',
+  'test-104-fmk-real-idle-compact.sh',
 ] as const
 export const AI_CRITERIA = [11, 12, 15, 20, 23, 91, 106] as const
 export const AI_VERSION = MATRIX_VERSIONS[1]
@@ -58,6 +59,7 @@ export function matrixPlan(latest: string, gates: string[], heavyNames: readonly
   const invocations: MatrixInvocation[] = [
     ...gates.map(script => ({ script, trial: 1, model: 'default' as const })),
     ...HEAVY_SCRIPTS.slice(0, 2).map(file => ({ script: `real-agent/${file}`, trial: 1, model: 'default' as const })),
+    { script: `real-agent/${HEAVY_SCRIPTS[3]}`, trial: 1, model: 'default' as const },
   ]
   // Keep three jobs even if latest equals a pin: runtime-latest remains an
   // independently executed job whose actual native version is recorded.

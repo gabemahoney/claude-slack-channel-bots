@@ -44,7 +44,8 @@ describe('heavy planning and result validation', () => {
       [MATRIX_VERSIONS[0], false], [MATRIX_VERSIONS[1], false], [MATRIX_VERSIONS[1], true],
     ])
     for (const job of jobs) {
-      const requiredHeavy = HEAVY_SCRIPTS.filter((_name, index) => index < 2 || (!job.runtimeLatest && job.version === MATRIX_VERSIONS[1]))
+      const requiredHeavy = [HEAVY_SCRIPTS[0], HEAVY_SCRIPTS[1], HEAVY_SCRIPTS[3],
+        ...(!job.runtimeLatest && job.version === MATRIX_VERSIONS[1] ? [HEAVY_SCRIPTS[2]] : [])]
       expect(job.invocations.filter(i => i.model === 'default')).toEqual([
         ...gates().map(script => ({ script, trial: 1, model: 'default' as const })),
         ...requiredHeavy.map(name => ({ script: `real-agent/${name}`, trial: 1, model: 'default' as const })),
@@ -58,6 +59,17 @@ describe('heavy planning and result validation', () => {
     const invocations = plan().flatMap(job => job.invocations)
     for (const ac of AI_CRITERIA) expect(invocations.filter(i => i.script.endsWith(`-ai-ac${ac}.sh`)))
       .toEqual([1, 2, 3].map(trial => ({ script: `real-agent/test-${100 + ac}-fmk-real-ai-ac${ac}.sh`, trial, model: 'opus' as const })))
+  })
+
+  test('native idle runs once per version job and a missing or failed case blocks that job; latency100 runs once overall', () => {
+    const jobs = plan(MATRIX_VERSIONS[1])
+    for (const job of jobs) {
+      const results = resultsFor(job), idle = 'real-agent/test-104-fmk-real-idle-compact.sh'
+      expect(job.invocations.filter(i => i.script === idle)).toEqual([{ script: idle, trial: 1, model: 'default' }])
+      expect(() => assertJobComplete(job, results.filter(r => r.script !== idle), model, opus)).toThrow()
+      expect(() => assertJobComplete(job, results.map(r => r.script === idle ? { ...r, exit: 1 } : r), model, opus)).toThrow()
+    }
+    expect(jobs.flatMap(j => j.invocations).filter(i => i.script.endsWith('-latency100.sh'))).toHaveLength(1)
   })
 
   test.each(['latest', '2.1', '2.1.296-beta', '2.1.296\nextra'])('rejects non-exact runtime latest %j', version => {

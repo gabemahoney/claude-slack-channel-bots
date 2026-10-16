@@ -187,8 +187,9 @@ why:
   built-ins and loads the installed package only after the check.
 - `lib/real-scenario.sh`: checks the image and scenario HOME at source time,
   then requires a `-fmk-real-` test name. `transcript-receipts.ts`,
-  `real-observations.ts` and `real-case-assertions.ts` guard their executable
-  packed-package loads; their importable pure helpers perform no launch.
+  `real-observations.ts`, `real-case-assertions.ts` and
+  `native-idle-compaction.ts` guard their executable entry points;
+  their importable helpers perform no launch.
 - `fixtures/agent-director-list-refusing.sh`: its first step. It prints one
   line to stderr and exits 70 before it reads an argument or runs a binary.
 - `fixtures/ad-version-stand-in.sh`: checks the marker before it reads its
@@ -585,7 +586,7 @@ tests/
                                    # within 3,000 ms of its pre-send monotonic timestamp; exactly 1,000 items remain outstanding with no typing, receipts or model calls
     test-32-fmk-real-order.sh      # real Claude: down-queue order, one in flight with faults/restart, 20-DM p95 latency
     test-33-fmk-real-keys.sh       # swallowed text/Enter, repeated misses, unknown outcomes and 5,000-byte multipart recovery
-    test-34-fmk-real-compact.sh    # explicit and supported idle compaction, retaining ordered exact receipts
+    test-34-fmk-real-compact.sh    # explicit /compact on every gate run proves AC42 with ordered exact receipts
     test-35-fmk-real-restarts.sh   # restart, resume, new conversation and markerless upgrade replacement
     test-36-fmk-real-crash.sh      # server SIGKILL between text and Enter, then durable recovery
     test-37-fmk-real-mcp.sh        # server restart, test-only MCP drop, deferred reconnect and an occupied draft
@@ -596,9 +597,10 @@ tests/
       real-scenario.sh             # native agent setup, minimal permissions, exact evidence, faults, bounds and once-only EXIT accounting
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
-      transcript-receipts.ts       # imports the packed production matcher; persona/session/directory-scoped receipts, order, latency and usage
+      transcript-receipts.ts       # packed production matcher; scoped receipts, observed pre-restart journal history, order, latency and usage
       real-observations.ts         # packed screen observations through agent-director pane reads
       real-case-assertions.ts      # deterministic gate/heavy case checks and negative self-check controls
+      native-idle-compaction.ts    # installed-binary/rollout capability and current-launch context/boundary observations for heavy Test 104
       agent-director-unresponsive.json
                                    # real 0.12.0 ErrTmuxUnresponsive envelope used by counted unknown-outcome faults
       agent-director-unresponsive.provenance.json
@@ -701,27 +703,21 @@ No real bot, agent-director or tmux runs on the host.
 `lib/real-scenario.sh` provides native version checks, persona/Slack stub
 setup, fault installation, MCP drop, waiting/launch helpers and exact receipt
 assertions. Its delivery wait is 180 s, launch wait 300 s and compact wait
-120 s. A timeout fails the scenario; no script or coordinator automatically
-reruns a failed case. Product delivery retries within a scenario remain part
+120 s. Test 34 starts its boundary wait after queueing messages, then uses a
+separate 180 s delivery wait. Heavy Test 104 has a 45-minute start-observation
+bound, then shares one 120 s deadline for the boundary and queued deliveries
+from observed compaction start. A timeout fails the scenario;
+no script or coordinator automatically reruns a failed case. Product delivery
+retries within a scenario remain part
 of the behavior under test.
 
-**Current validation limitation (2026-10-16):** Test 34 on native 2.1.296
-passed explicit `/compact` and four deliveries, then failed to observe idle
-compaction within 120 s (run `20261016t184510z-tyztec33`).
-
-Container binary inspection found that
-`CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS=1` is clamped to
-100,000 tokens; the idle-compaction mode defaults off behind a remote gate,
-and `idleCompaction:true` does not enable it. It also requires a 1 h cache
-and a firing fraction clamped to 0.5–0.95 (earliest 30 min, default 54 min),
-while the API-key cache TTL defaults to 5 min.
-
-A low token setting cannot
-force this step within its bound; the remote noninteractive SleepCompactor
-is not an interactive substitute. Native 2.1.280 lacks the feature and
-retains its unsupported-step skip. The 2.1.296 step remains required;
-full `/ci` and heavy acceptance need owner reconciliation of this native
-capability premise. No production defect was established by this failure.
+Test 34 types explicit `/compact` in every gate run, immediately queues three
+messages, and requires an own-session compaction boundary and ordered exact
+receipts whether delivery occurs during compaction or afterward. This proves
+AC42 through the compaction-record, re-check and retype-spacing paths on every
+gate run (review decision 16).
+Native idle compaction is heavy-only; lowering
+`CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS` alone does not force it.
 
 `fixtures/transcript-receipts.ts` loads the installed tarball's
 `src/delivery-receipt.ts` parser and exact matcher. It correlates a persona's
@@ -732,6 +728,17 @@ Allowed evidence is the bot's own transcript, CSCB `server.log`, the shim
 call log and the Slack stub record. Gate cases assert no particular model
 answer. Panes are read only through agent-director `read-pane`, using the
 packed screen adapter via `real-observations.ts`.
+
+Before each real scenario's server start and each receipt audit, the helper
+observes the real durable journal into private scenario state at
+`receipt-history/<key>.jsonl`. Recovery can compact completed entries out of
+the queue; an audit restores their observed proof only when current compact
+keys or allocation records authorize it. A current full/open item wins over
+archived completion. Removed injected items need both observed durable
+completion and current allocation evidence. The helper never writes the
+product queue or invents a receipt; restored evidence still passes the exact
+own-session/path, FIFO, predecessor-delivered, single-flight and no-open-work
+checks. This history is not a new assertion source or a retained result artifact.
 
 A pass requires every accepted part to appear at least once, first
 appearances in accept order, no successor send before the prior delivery
@@ -777,9 +784,23 @@ record the real released agent-director 0.12.0 envelope and capture setup.
 These scenario faults are distinct from the host runner's `--inject` faults.
 Test 0 self-checks counted consumption, unknown outcomes, packed receipt
 rejection controls, once-only usage and actual Slack button push behavior.
+Its packed-queue compact/restart control retains all five mixed-source
+acceptances (including multipart and injected items), with 20 corruption/order
+negative controls plus a current-open-versus-stale-history control. Native
+idle controls inspect the installed pinned binaries and reject inactive panes
+and foreign-session/directory compaction boundaries.
 The Slack stub's optional user/channel metadata controls retain the ordinary
 defaults and token rules; interactive `/_push` uses the actual recorded
 allow/deny button and a separate human identity.
+
+Test 32 installs counted `unknown-untyped` spawn/resume faults before pausing
+the bot, so message-triggered recovery cannot relaunch it during intake.
+It proves all 13 items (10 Slack, two interject and one cron) were accepted
+while the actual agent-director row stayed ended and unchanged, every
+attempted relaunch was refused before execution, and no send or delivery
+occurred. Only after this proof, with the server stopped, does it release the
+faults under their lock and restart; cumulative delivery checks remain
+13, 33 and 53 items.
 
 #### Heavy inventory and invocation
 
@@ -787,7 +808,7 @@ The heavy leg must pass once on the final build before this work is
 complete, and again before any release that changes the delivery path,
 the tag description or the agent versions tested (PRD R60, SR-14.4).
 
-The following ten scripts live under `tests/real-agent/`, outside `/ci`
+The following eleven scripts live under `tests/real-agent/`, outside `/ci`
 discovery. `ai-scenario.sh` is their seven-criterion shared body; its JSON
 read-back checks compare required fields through `real-case-assertions.ts`.
 
@@ -796,6 +817,7 @@ read-back checks compare required fields through `real-case-assertions.ts`.
 | `test-101-fmk-real-busy.sh` | Active pre-allowed tool, permission hold and subagent denial/dialog-hold recovery |
 | `test-102-fmk-real-replies.sh` | DM, mention and thread reply destinations; three fresh-launch first messages |
 | `test-103-fmk-real-latency100.sh` | The 100-DM AC76 latency step |
+| `test-104-fmk-real-idle-compact.sh` | Decision 16 native idle capability, genuine context buildup and observed compaction with queued delivery |
 | `test-111-fmk-real-ai-ac11.sh` | Original wrapper corpus attributes/body read-back |
 | `test-112-fmk-real-ai-ac12.sh` | Prefix hazards read as text, with no native shell-input execution |
 | `test-115-fmk-real-ai-ac15.sh` | Multipart reassembly into one 5,000-character message |
@@ -803,6 +825,22 @@ read-back checks compare required fields through `real-case-assertions.ts`.
 | `test-123-fmk-real-ai-ac23.sh` | Sender read-back and reply after compact/resume |
 | `test-191-fmk-real-ai-ac91.sh` | DM/thread replies without an operator prompt file |
 | `test-206-fmk-real-ai-ac106.sh` | Duplicate copy recognized as one logical DM |
+
+Test 104 checks the actual installed binary and its cached rollout after
+launch. It records the binary digest and available native token floor/timer; unsupported
+binaries (including 2.1.280), disabled settings, off/log rollout modes and
+timers beyond 45 minutes produce a specific `recorded:` skip reason. Unknown
+implementation semantics fail for investigation. The scenario requests a 1 h
+cache but never seeds or rewrites rollout flags to enable the feature.
+
+For an eligible version, genuine pre-allowed `Read(./idle-budget/**)` tool
+calls build the required context. The budget is the latest own request's
+input plus cache-read/cache-creation usage, excluding output and earlier
+requests; total run tokens cannot satisfy it. Test 104 observes an active
+compaction pane within 45 minutes, queues three messages, then requires a new
+current-session boundary and all ordered deliveries within one shared 120 s
+deadline from observed start. Old launches, foreign paths and subagents
+cannot supply budget or boundary evidence.
 
 With CI credentials already provided privately in the invoking environment,
 run from the repo root:
@@ -820,10 +858,12 @@ it is not acceptance evidence. Use a fresh output directory each time.
 
 The coordinator resolves latest afresh for each invocation and makes three
 sequential Docker jobs: 2.1.280, 2.1.296 and runtime latest, even when latest
-equals a pin. Each executes all nine gate scripts plus busy/replies; the
-downgrade script retains its explicit 2.1.280 selection. The 2.1.296 job
+equals a pin. Each executes all nine gate scripts plus busy/replies and
+Test 104; the downgrade script retains its explicit 2.1.280 selection. The 2.1.296 job
 alone runs 100 DMs once and seven Opus 5.5 criteria three times each: **21 AI
 trials total**, requiring 3 of 3 for every criterion.
+The three jobs contain 12, 34 and 12 invocations respectively: **58 total**,
+including recorded native-idle skips where the actual capability is unavailable.
 
 Local jobs use the committed `/ci` caps, currently 2 GiB, 2 CPUs and 2,048
 PIDs, with 3 h per job. `docker/Dockerfile.real-agent` and

@@ -12,7 +12,14 @@ real_write_config '{"session_restart_delay":0}'
 real_start_stub
 start_server --live
 real_wait_launch "${REAL_KEY}"
+# A pause alone permits message-triggered relaunch during intake. Refuse
+# launches before pausing; these faults never invoke the real launch binary.
+real_fault spawn '*' unknown-untyped 999999
+real_fault resume '*' unknown-untyped 999999
 real_ad pause --instance-id "$(real_instance "${REAL_KEY}")" >/dev/null
+DOWN_ROW="${SCENARIO_ROOT}/order-down-row.json"
+real_ad get --instance-id "$(real_instance "${REAL_KEY}")" > "${DOWN_ROW}"
+DOWN_MARK="$(ad_shim_mark)"
 # Ten DMs interleaved with interject and a real minute fire while down.
 printf 'order cron fire\n' > "${SCENARIO_ROOT}/order.prompt"
 printf '* * * * * %s %s\n' "${SCENARIO_ROOT}/order.prompt" "${REAL_NAME}" > "${SLACK_STATE_DIR}/crontab"
@@ -23,6 +30,11 @@ done
 wait_until 180 'scheduled item not durably accepted while down' case_assert accepted 13
 printf '' > "${SLACK_STATE_DIR}/crontab"
 stop_server
+real_ad get --instance-id "$(real_instance "${REAL_KEY}")" > "${DOWN_ROW}.end"
+case_assert down "${DOWN_ROW}" "${DOWN_MARK}" 13
+# The server is stopped, so no new launch can race the verified interval's
+# release. Only this phase's two launch rules exist in this fault file.
+{ flock -x 8; printf '' > "${SCENARIO_AD_SHIM_LOG%.log}.faults"; } 8> "${SCENARIO_AD_SHIM_LOG%.log}.faults.lock"
 start_server --live
 real_wait_launch "${REAL_KEY}"
 real_wait_delivery "${REAL_KEY}" 13

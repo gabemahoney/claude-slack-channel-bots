@@ -2,7 +2,7 @@
  * Only the installed tarball's parser and exact matcher decide take-in.
  * Importing this helper performs no I/O; CLI entry points require the CI image.
  */
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join, resolve } from 'node:path'
 
 export interface TranscriptEntry { path: string; offset: number; at: number; value: any; kind: string; text?: string; uuid?: string }
@@ -17,6 +17,69 @@ export async function packedReceiptAdapters(pkg = process.env.CSCB_PKG_DIR ?? '/
 }
 export function jsonLines(path: string): any[] {
   return readFileSync(path, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line))
+}
+function queuePath(stateDir: string, key: string): string {
+  if (!/^[a-z0-9_]+$/.test(key)) throw new Error('Invalid receipt persona key')
+  return join(stateDir, 'queue', `${key}.jsonl`)
+}
+/** Preserve observations of the real durable journal before recovery replaces
+ * it. This private scenario evidence is never read by CSCB or written into its
+ * queue. Keep every distinct record: attempts and multipart receipts matter.
+ */
+export function captureReceiptJournal(stateDir: string, key: string): any[] {
+  const current = jsonLines(queuePath(stateDir, key))
+  const directory = join(stateDir, 'receipt-history'), path = join(directory, `${key}.jsonl`)
+  const prior = existsSync(path) ? jsonLines(path) : []
+  const records = new Map(prior.map(record => [JSON.stringify(record), record]))
+  for (const record of current) if (!(record.kind === 'accepted' && record.compact)) records.set(JSON.stringify(record), record)
+  if (records.size !== prior.length) {
+    mkdirSync(directory, { recursive: true, mode: 0o700 })
+    const temp = `${path}.${process.pid}.tmp`
+    writeFileSync(temp, [...records.keys()].join('\n') + '\n', { mode: 0o600 })
+    renameSync(temp, path)
+  }
+  return current
+}
+export function captureReceiptJournals(stateDir: string): void {
+  const directory = join(stateDir, 'queue')
+  if (!existsSync(directory)) return
+  for (const name of readdirSync(directory)) if (name.endsWith('.jsonl')) captureReceiptJournal(stateDir, basename(name, '.jsonl'))
+}
+/** A current full item always owns its state. Restore historical records only
+ * for an item the current journal proves was compacted, and only if the
+ * observed durable records prove every part completed. A compact:key marker
+ * alone is insufficient, and allocation never invents an injected item.
+ */
+export function receiptJournal(stateDir: string, key: string): any[] {
+  const current = captureReceiptJournal(stateDir, key)
+  const path = join(stateDir, 'receipt-history', `${key}.jsonl`)
+  const history = existsSync(path) ? jsonLines(path) : []
+  const full = new Set(current.filter(r => r.kind === 'accepted' && !r.compact).map(r => r.seq))
+  const compact = current.filter(r => r.kind === 'accepted' && r.compact === 'key')
+  const allocation = Math.max(0, ...current.filter(r => r.kind === 'accepted' && r.compact === 'allocation').map(r => r.seq))
+  const highest = Math.max(allocation, 0, ...current.filter(r => r.kind === 'accepted').map(r => r.seq))
+  if (!Number.isSafeInteger(highest) || highest < 0) throw new Error('Invalid queue allocation evidence')
+  const restored: any[] = []
+  for (let seq = 1; seq <= highest; seq++) {
+    if (full.has(seq)) continue
+    const marker = compact.find(r => r.seq === seq)
+    if (!marker && seq > allocation) throw new Error(`Item ${seq} has no compaction evidence`)
+    const records = history.filter(r => r.seq === seq)
+    const accepts = records.filter(r => r.kind === 'accepted' && !r.compact)
+    const accepted = accepts[0], fixed = records.find(r => r.kind === 'fixed')
+    const identity = (r: any) => JSON.stringify({ ...r, attempt_high_watermark: undefined })
+    if (!accepted || accepts.some(r => identity(r) !== identity(accepted))) throw new Error(`Compacted item ${seq} has no unambiguous observed acceptance`)
+    if (!fixed?.parts?.length || records.filter(r => r.kind === 'fixed').some(r => JSON.stringify(r) !== JSON.stringify(fixed))) throw new Error(`Compacted item ${seq} has no unambiguous observed fixed parts`)
+    const delivered = fixed.parts.map((_: string, i: number) => records.find(r => r.kind === 'delivered' && r.part === i + 1))
+    if (delivered.some((r: any) => !r || !Number.isFinite(r.at))) throw new Error(`Compacted item ${seq} has no observed durable completion`)
+    const slackIdentity = (r: any) => JSON.stringify([r?.chat_id, r?.ts, r?.edited_ts ?? null])
+    if (marker && (accepted.source !== 'slack' || slackIdentity(marker.key) !== slackIdentity(accepted.key)
+      || marker.received_at !== accepted.received_at || marker.delivered_at !== Math.max(...records.filter(r => r.kind === 'delivered').map(r => r.at)))) throw new Error(`Compacted key ${seq} disagrees with observed durable completion`)
+    // Accept metadata may gain an attempt watermark across recovery. Include
+    // one canonical acceptance without duplicating the logical item.
+    restored.push(accepted, ...records.filter(r => r.kind !== 'accepted'))
+  }
+  return [...current, ...restored].sort((a, b) => a.seq - b.seq)
 }
 export function transcriptFiles(root: string): string[] {
   if (!existsSync(root)) return []
@@ -168,7 +231,7 @@ function diagnosticTime(log: readonly string[], kind: string, key: string, item:
 }
 export interface AuditOptions { stateDir: string; key: string; shimLog: string; transcripts: string[]; expectedCount?: number; noRetype?: boolean }
 export function auditReceipts(options: AuditOptions, entries: readonly TranscriptEntry[], adapters: ReceiptAdapters) {
-  const journal = jsonLines(join(options.stateDir, 'queue', `${options.key}.jsonl`))
+  const journal = receiptJournal(options.stateDir, options.key)
   const accepted = journal.filter(r => r.kind === 'accepted' && !r.compact).sort((a, b) => a.seq - b.seq)
   if (!accepted.length || (options.expectedCount !== undefined && accepted.length !== options.expectedCount)) throw new Error('Accepted item count differs')
   const log = readFileSync(join(options.stateDir, 'server.log'), 'utf8').split('\n')
@@ -224,7 +287,7 @@ export function reportUsage(stateDir: string, entries: readonly TranscriptEntry[
   for (const key of new Set(personaKeys)) {
     const path = join(queue, `${key}.jsonl`)
     if (!existsSync(path)) continue
-    const journal = jsonLines(path), own = personaTranscripts(key, journal, log, entries)
+    const journal = receiptJournal(stateDir, key), own = personaTranscripts(key, journal, log, entries)
     for (const item of journal.filter(r => r.kind === 'accepted' && !r.compact)) {
       const fixed = journal.find(r => r.seq === item.seq && r.kind === 'fixed')
       for (const text of fixed?.parts ?? []) {
@@ -237,6 +300,13 @@ export function reportUsage(stateDir: string, entries: readonly TranscriptEntry[
 }
 if (import.meta.main) {
   try {
+    if (process.argv[2] === 'capture') {
+      if (!existsSync('/etc/cscb-ci-image')) throw new Error('receipt capture requires the CI image')
+      const stateDir = process.argv[3]
+      if (!stateDir) throw new Error('capture requires state-dir')
+      captureReceiptJournals(stateDir)
+      process.exit(0)
+    }
     if (process.argv[2] === 'report') {
       const [stateDir, shimLog, root, ...keys] = process.argv.slice(3)
       if (!stateDir || !shimLog || !root) throw new Error('report requires state-dir shim-log transcript-root [keys...]')

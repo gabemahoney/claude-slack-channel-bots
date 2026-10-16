@@ -4201,6 +4201,11 @@ leg_real_receipt_controls() {
     bun "${SCENARIO_FIXTURES}/real-case-assertions.ts" selfcheck "${SCENARIO_ROOT}"
 }
 
+leg_real_native_idle_controls() {
+    bun "${SCENARIO_FIXTURES}/real-case-assertions.ts" native-idle-selfcheck "${SCENARIO_ROOT}" \
+        /opt/claude-code/2.1.280/claude /opt/claude-code/2.1.296/claude
+}
+
 nested_real_usage() {
     source "${SCENARIO_FIXTURES}/../lib/real-scenario.sh"
     nested_stand_in
@@ -4253,6 +4258,7 @@ CHECK_USAGE
 LEGS=(
     real_fault_contract
     real_receipt_controls
+    real_native_idle_controls
     real_usage_controls
     isolation
     real_binary

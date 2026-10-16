@@ -1269,6 +1269,7 @@ _SCENARIO_STATE_DIRS=()   # every state dir a `start` ran in
 _SCENARIO_SERVER_PIDS=()  # daemon PIDs a start reported and no stop_server saw gone
 _SCENARIO_TRACKED_PIDS=() # background processes registered with track_pid
 _SCENARIO_EXIT_HOOKS=()   # functions registered with on_exit
+_SCENARIO_BEFORE_START_HOOKS=() # read-only evidence observers registered by real scenarios
 _SCENARIO_LIVE=0          # 1 once a start ran with --live
 _SCENARIO_STATE_COUNT=0
 _SCENARIO_START_COUNT=0
@@ -1384,6 +1385,11 @@ stop_tracked_pid() {
 on_exit() {
     declare -F -- "${1:-}" > /dev/null || fail "on_exit: '${1:-}' is not a function"
     _SCENARIO_EXIT_HOOKS+=("$1")
+}
+
+on_before_start() {
+    declare -F -- "${1:-}" > /dev/null || fail "on_before_start: '${1:-}' is not a function"
+    _SCENARIO_BEFORE_START_HOOKS+=("$1")
 }
 
 # ---------------------------------------------------------------------------
@@ -1919,6 +1925,10 @@ run_start() {
     esac
     [[ "${SLACK_STATE_DIR}" == "${SCENARIO_ROOT}"/* ]] \
         || fail "run_start: SLACK_STATE_DIR ${SLACK_STATE_DIR} is not under ${SCENARIO_ROOT}"
+    local hook
+    for hook in ${_SCENARIO_BEFORE_START_HOOKS[@]+"${_SCENARIO_BEFORE_START_HOOKS[@]}"}; do
+        "${hook}" || fail "run_start: evidence hook ${hook} failed"
+    done
     _SCENARIO_START_COUNT=$(( _SCENARIO_START_COUNT + 1 ))
     START_OUT="${SCENARIO_ROOT}/start.${_SCENARIO_START_COUNT}.out"
     # Registered before the start: a start that reports failure may still

@@ -8,7 +8,9 @@ require_scenario_home real-scenario
 REAL_DELIVERY_WAIT_S=180
 REAL_LAUNCH_WAIT_S=300
 REAL_COMPACT_WAIT_S=120
+REAL_IDLE_WAIT_S=2700
 REAL_RECEIPTS="${SCENARIO_FIXTURES}/transcript-receipts.ts"
+REAL_IDLE_OBSERVER="${SCENARIO_FIXTURES}/native-idle-compaction.ts"
 REAL_PERSONAS="${SCENARIO_ROOT}/real-personas.jsonl"
 REAL_TOKENS="${SCENARIO_ROOT}/real-stub-tokens.jsonl"
 REAL_USAGE_REPORTED=0
@@ -21,6 +23,11 @@ _real_usage_on_exit() {
     real_report
 }
 on_exit _real_usage_on_exit
+
+_real_capture_before_start() {
+    bun "${REAL_RECEIPTS}" capture "${SLACK_STATE_DIR}"
+}
+on_before_start _real_capture_before_start
 
 # real_prepare [version] [permission-allow-rule ...]
 real_prepare() {
@@ -156,6 +163,28 @@ real_record_pane() {
     real_pane "$1" "${3:-40}" > "${pane}"
     observation="$(bun "${SCENARIO_FIXTURES}/real-observations.ts" "${pane}" "${2:-}")" || fail 'cannot observe real pane'
     printf 'recorded: pane %s\n' "${observation}"
+}
+# Heavy-only callers set these before starting their isolated bot. The real
+# native token floor and rollout are checked after launch, never overridden.
+real_idle_environment() {
+    require_scenario_home real_idle_environment
+    [[ "${TEST_NAME}" == test-*-fmk-real-idle-compact ]] || fail 'native idle preparation requires its heavy-only scenario'
+    export CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS=100000
+    export CLAUDE_CODE_PROMPT_CACHE_TTL=1h
+}
+real_idle_capability() {
+    local capability
+    capability="$(bun "${REAL_IDLE_OBSERVER}" capability "${REAL_CLAUDE}" "${HOME}")" || fail 'cannot determine native idle capability'
+    printf 'recorded: native idle capability version=%s %s\n' "${REAL_CLAUDE_VERSION}" "${capability}"
+    if ! jq -e '.supported' <<< "${capability}" >/dev/null; then
+        printf 'recorded: native idle compaction step skipped: %s\n' "$(jq -r .reason <<< "${capability}")"
+        return 1
+    fi
+    REAL_IDLE_MIN_TOKENS="$(jq -r .minTokens <<< "${capability}")"
+    REAL_IDLE_FIRE_MS="$(jq -r .fireAfterMs <<< "${capability}")"
+}
+real_idle_observation() {
+    bun "${REAL_IDLE_OBSERVER}" observe "${SLACK_STATE_DIR}" "$1" "${HOME}/.claude/projects"
 }
 real_clear_draft() {
     local key="$1" text="$2" clear
