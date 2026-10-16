@@ -510,6 +510,7 @@ function rowReplacementReason(
   if (!cmp.cwdMatches) {
     return `row cwd=${row.cwd || '<none>'} differs from working_directory=${persona.working_directory}`
   }
+  if (!cmp.tagPrompt) return 'row tag_prompt marker missing (b.omv SR-7.6)'
   if (cmp.configDirMatches === false) {
     const was = cmp.configDirLabel === undefined ? 'missing' : `was=${cmp.configDirLabel}`
     return `row config_dir label ${was}, now=${cmp.expectedConfigDirLabel}`

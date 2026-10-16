@@ -1146,7 +1146,7 @@ const OLD_ROWS: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string, 
     return oldRowAt(h, p, personaInstanceId(b), b, {})
   }],
   ['a pre-persona row\'s id', (h, p) => oldRowAt(h, p, PRE_PERSONA_ID, PRE_PERSONA_ID, { labels: { ...PRE_PERSONA_LABELS } })],
-  ['an id that is not its label\'s cscb_<key> (B\'s, B still applied)', (h, p, b) => oldRowAt(h, p, `${personaInstanceId(b)}_old`, `${personaInstanceId(b)}_old`, { labels: { service: 'cscb', persona: b } })],
+  ['an id that is not its label\'s cscb_<key> (B\'s, B still applied)', (h, p, b) => oldRowAt(h, p, `${personaInstanceId(b)}_old`, `${personaInstanceId(b)}_old`, { labels: { tag_prompt: '1', service: 'cscb', persona: b } })],
   ['P\'s own row (P configured)', (h, p) => ({ instanceId: personaInstanceId(p), oldKey: p, row: (overrides = {}) => personaRow(h, p, overrides) })],
 ]
 

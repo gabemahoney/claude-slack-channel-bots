@@ -32,6 +32,8 @@ import { join, resolve } from 'node:path'
 import {
   PERSONA_KEY_MAX_LENGTH,
   PROMPT_SUGGESTION_OFF_ENV,
+  AUTOUPDATER_OFF_ENV,
+  FEEDBACK_SURVEY_OFF_ENV,
   configDirLabelValue,
   effectiveClaudeConfigDirs,
   personaInstanceId,
@@ -274,6 +276,8 @@ describe('personaSpawnEnv', () => {
       CSCB_CRONTABLE_PATH: join(home, 'crontab'),
       CLAUDE_CONFIG_DIR: join(home, 'alt'),
       CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
+      DISABLE_AUTOUPDATER: '1',
+      CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: '1',
     })
   })
 
@@ -281,10 +285,12 @@ describe('personaSpawnEnv', () => {
     const home = makeTempDir()
     const env = personaSpawnEnv({ key: 'ops_bot', crontablePath: join(home, 'crontab'), claudeConfigDir })
     expect(Object.keys(env).sort()).toEqual([
+      'CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY',
       'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION',
       'CLAUDE_MANAGED_CHANNEL',
       'CSCB_CRONTABLE_PATH',
       'CSCB_PERSONA',
+      'DISABLE_AUTOUPDATER',
     ])
   })
 
@@ -309,7 +315,8 @@ describe('personaSpawnEnv', () => {
       const env = personaSpawnEnv({ key: 'ops_bot', ...input })
       expect(env['CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION']).toBe('false')
       // It is spread last: the final key of the env object.
-      expect(Object.keys(env).at(-1)).toBe('CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION')
+      expect(Object.keys(env).slice(-3)).toEqual(['CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION', 'DISABLE_AUTOUPDATER', 'CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY'])
+      expect(env).toMatchObject({ ...AUTOUPDATER_OFF_ENV, ...FEEDBACK_SURVEY_OFF_ENV })
       expect(Object.keys(env).filter((k) => k.startsWith('AGENT_DIRECTOR_'))).toEqual([])
     })
   })
@@ -438,4 +445,12 @@ describe('module import', () => {
     expect(result.stderr.toString()).toBe('')
     expect(readdirSync(home)).toEqual([])
   })
+})
+
+// b.omv SR-7.4: frozen literal launch controls, never user-wide settings.
+test('updater and survey controls are fixed and frozen', () => {
+  expect(AUTOUPDATER_OFF_ENV).toEqual({ DISABLE_AUTOUPDATER: '1' })
+  expect(FEEDBACK_SURVEY_OFF_ENV).toEqual({ CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: '1' })
+  expect(Object.isFrozen(AUTOUPDATER_OFF_ENV)).toBe(true)
+  expect(Object.isFrozen(FEEDBACK_SURVEY_OFF_ENV)).toBe(true)
 })

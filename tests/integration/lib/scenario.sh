@@ -1212,8 +1212,10 @@ STUB_MODE_AT_ONCE=at-once
 STUB_MODE_SILENT=silent
 STUB_MODE_UNRECOGNISED=unrecognised-dialog
 STUB_MODE_FOLDER_TRUST=folder-trust
+# b.omv SR-13.6: forced supported trust dialog, independent of pre-trust.
+STUB_MODE_STARTUP_TRUST=startup-trust
 SCENARIO_STUB_MODES=("${STUB_MODE_DEV_CHANNELS}" "${STUB_MODE_AT_ONCE}" "${STUB_MODE_SILENT}"
-    "${STUB_MODE_UNRECOGNISED}" "${STUB_MODE_FOLDER_TRUST}")
+    "${STUB_MODE_UNRECOGNISED}" "${STUB_MODE_FOLDER_TRUST}" "${STUB_MODE_STARTUP_TRUST}")
 # Harness additions: the stub mode that writes
 # its transcript only at the first message after reporting in, and the
 # stub's exit sentinel line (fixtures/stub-claude.sh SENTINEL), which a
@@ -2488,12 +2490,14 @@ _scenario_ad_contract() {
             SCENARIO_AD_ID_FLAG=--claude-instance-id
             SCENARIO_AD_ID_COLUMN=claude_instance_id
             SCENARIO_AD_SESSION_KEY=claude_session_id
+            SCENARIO_AD_ARGS_KEY=claude_args
             ;;
         *)
             SCENARIO_AD_ROOT="${HOME}/.config/agent-director"
             SCENARIO_AD_ID_FLAG=--instance-id
             SCENARIO_AD_ID_COLUMN=instance_id
             SCENARIO_AD_SESSION_KEY=session_id
+            SCENARIO_AD_ARGS_KEY=agent_args
             ;;
     esac
     SCENARIO_AD_BIN="${SCENARIO_AD_ROOT}/bin/agent-director"

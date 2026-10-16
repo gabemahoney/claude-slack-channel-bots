@@ -3784,7 +3784,7 @@ async function personaDefaultConfigDirLabels(key: string, home: string): Promise
   const configDirPrefix = await stringExport('persona-identity.ts', 'CONFIG_DIR_LABEL_PREFIX')
   const labelOf = await functionExport('session-manager.ts', 'personaConfigDirLabelValue')
   const label = builtText('session-manager.ts', 'personaConfigDirLabelValue', labelOf(undefined, home))
-  return [service, `${personaPrefix}${key}`, `${configDirPrefix}${label}`].join('\n')
+  return [service, 'tag_prompt=1', `${personaPrefix}${key}`, `${configDirPrefix}${label}`].join('\n')
 }
 
 /** The one-function entries, by the name a script passes. */

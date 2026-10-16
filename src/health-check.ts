@@ -90,6 +90,8 @@ export interface HealthCheckDeps {
    * the alive-but-disconnected case. Returns false when there is no session.
    */
   hasSessionStream(key: string): boolean
+  /** b.omv SR-7.6: inspect even connected rows; true defers ordinary health recovery. */
+  inspectUpgrade?(key: string): Promise<boolean>
   isRestartPendingOrActive(key: string): boolean
   /**
    * True while anything is in flight for the persona (b.f2b, b.jg5 SRJ-315;
@@ -575,6 +577,11 @@ async function runHealthCheckTick(): Promise<void> {
         if (reading === LIVENESS_UNKNOWN) {
           disconnectedStreak.delete(key)
           console.error(`[slack] health-check: liveness unknown for persona=${key}${failure} — skipping it this tick; not read as dead`)
+          continue
+        }
+        // b.omv SR-7.6: an old connected bot still needs provenance inspection.
+        if (!holdOff && reading !== LIVENESS_DEAD && await deps.inspectUpgrade?.(key)) {
+          disconnectedStreak.delete(key)
           continue
         }
         // `live` and `pending` take the alive branches below; only `live`

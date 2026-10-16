@@ -55,8 +55,8 @@
 #   config.toml);
 # - the tmux shim first on every CSCB process's PATH, in `log` mode
 #   throughout;
-# - the stub as `claude`, in `dev-channels` (no selection, the default) in
-#   every persona's working directory: it prints the dev-channels dialog and
+# - the stub as `claude`, explicitly in `startup-trust` in
+#   every persona's working directory: it prints the startup-trust dialog and
 #   reports in only on Enter (CSCB's approver);
 # - the live server against the Slack stub (fixtures/slack-stub-server.ts
 #   with `--record`; posts are read from that record with `slack_posts`, on
@@ -536,6 +536,7 @@ prepare_persona() {
     local key="$1" label="${PERSONA_TOKEN[$1]}" creds="${SCENARIO_ROOT}/credentials"
     [[ -d "${creds}" ]] || mkdir -m 700 "${creds}"
     PERSONA_WORK[${key}]="$(make_workdir "${key}")"
+    stub_mode "${PERSONA_WORK[${key}]}" "${STUB_MODE_STARTUP_TRUST}"
     PERSONA_CREDS[${key}]="${creds}/${key}.json"
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${label}")" "$(fake_token app "${label}")" \
         | write_file "${PERSONA_CREDS[${key}]}" 600

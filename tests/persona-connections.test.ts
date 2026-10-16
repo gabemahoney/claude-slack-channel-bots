@@ -6927,10 +6927,10 @@ describe('bring-up outcomes (E5)', () => {
     // Rows: the row's state, how the row spells A's directory, what the ladder does with it and
     // the calls it makes for A's instance (the spawn is the one that collides with the row).
     test.each<[string, 'waiting' | 'ended', 'configured' | 'old symlink target', 'reconnected' | 'resumed', Record<string, number>]>([
-      ['a waiting row is reconnected', 'waiting', 'configured', 'reconnected', { spawn: 1, get: 2, readPane: 2, sendKeys: 2 }],
+      ['a waiting row is reconnected', 'waiting', 'configured', 'reconnected', { spawn: 1, get: 4, readPane: 2, sendKeys: 2 }],
       // The status read is the resumed instance's dialog check.
       ['an ended row is resumed', 'ended', 'configured', 'resumed', { spawn: 1, get: 1, resume: 1, status: 1 }],
-      ['a waiting row recorded under the target of a working_directory symlink that now dangles is reconnected', 'waiting', 'old symlink target', 'reconnected', { spawn: 1, get: 2, readPane: 2, sendKeys: 2 }],
+      ['a waiting row recorded under the target of a working_directory symlink that now dangles is reconnected', 'waiting', 'old symlink target', 'reconnected', { spawn: 1, get: 4, readPane: 2, sendKeys: 2 }],
     ])('AC 23, AC 24: a directory-broken persona’s surviving row is kept, and once its directory exists it comes up with no confirmation and its launch reuses the row — %s, with no kill, delete or fresh spawn; its instance, refused while it retried, is then admitted', async (_label, state, spelling, action, reuseCalls) => {
       let launched: Awaited<ReturnType<typeof spawnForPersona>> | undefined
       const f: BringUpFixture = makeBringUpFixture({

@@ -8409,17 +8409,16 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
   const upgrade = () => readRunbookCarrier(RUNBOOK_DOC, migration(), SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
   const rollback = () => readRunbookCarrier(RUNBOOK_DOC, migration(), ROLLBACK_HEADING, ROLLBACK_STEP_COUNT)
 
-  // b.9v8: only pre-persona hosts start fresh once. Existing persona rows
-  // resume when their current transcript and unchanged identity permit it.
+  // b.omv SR-7.6: every earlier-release bot starts fresh once; marked rows resume later.
   const resumeRequirements = [
-    'On a host switching over from a pre-persona release (0.10.x)',
-    'Each persona starts fresh once on that host. Pre-persona rows are kept and never resumed.',
-    'On a host already running personas (0.11.0 or later), each persona resumes its conversation when the resume conditions above hold.',
+    'Every earlier-release bot starts a fresh conversation once',
+    'Memory files are kept',
+    '`tag_prompt=1`',
+    'A row without the marker is never resumed',
+    '`working` or `check_permission`',
+    '`waiting`, `pending` or `ask_user`',
+    'Later restarts resume the marked replacement',
     'agent-director get --instance-id cscb_<key>',
-    '`state` as `ended` or `missing`, a non-empty `session_id`, and `transcript_status: present`',
-    "Keep the persona's key, `working_directory` and `claude_config_dir` unchanged, leave `resume_enabled` enabled",
-    "no leftover session has the persona's session name",
-    'check `server.log` for `spawnForPersona: attempting resume for …`',
     "agent-director 0.12.0 resumes only the current session: it no longer falls back to an older session's transcript when the current one is missing.",
   ]
   const resumeGuidanceProblems = (step: string) => resumeRequirements.filter((phrase) => !flat(step).includes(phrase))
@@ -8441,7 +8440,7 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
     }
   })
 
-  test('step 10 qualifies fresh starts and gives the resume pre-check, post-check and current-session restriction (b.9v8)', () => {
+  test('step 10 documents the one-time tag-prompt upgrade and later marked resume (b.omv SR-7.6)', () => {
     expect(resumeGuidanceProblems(textAt(upgrade(), 'step 10'))).toEqual([])
   })
 
@@ -8569,4 +8568,10 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
     expect(rollback().frame).not.toMatch(/Never restore `state.db`/)
     expect(step).not.toMatch(/stamps schema version 4|drops the thirteen columns/)
   })
+})
+
+// b.omv SR-7.1/2/4/6: maintained release notes describe this breaking upgrade.
+test('Unreleased records fresh conversations, retained memory and the typed launch contract', () => {
+  const unreleased = readFileSync(join(REPO_ROOT, 'CHANGELOG.md'), 'utf-8').split(/^## \[Unreleased\]|^## Unreleased/m)[1]?.split('\n## ')[0] ?? ''
+  for (const term of ['fresh conversation', 'memory', 'tag_prompt', 'bot-system-prompt.md']) expect(unreleased.toLowerCase()).toContain(term)
 })

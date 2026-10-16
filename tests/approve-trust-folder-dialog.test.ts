@@ -398,7 +398,6 @@ const PERSONAS: readonly ApproverPersona[] = [PLAIN, NAMED]
 /** Both startup-dialog needles, by dialog. */
 const NEEDLES: ReadonlyArray<readonly [string, string]> = [
   ['folder-trust', TRUST_DIALOG_NEEDLE],
-  ['dev-channels', DEV_CHANNELS_DIALOG_NEEDLE],
 ]
 
 /** A pane showing a startup dialog whose pre-selected option is `needle`. */
@@ -657,12 +656,13 @@ function installStub(
   const stub = makeStubClient({
     ...calls,
     ...knobs,
+    getFn: params => {
+      if (knobs.getFn) return knobs.getFn(params)
+      if (lapRow instanceof Error) return lapRow
+      return cannedGetResult({ instance_id: params.instance_id, ...lapRow })
+    },
     statusFn: (_params: StatusParams) => {
       statusAt.push(clock.now())
-      if (freshStatus) {
-        freshStatus = false
-        return lapRow
-      }
       lapRow = answerAt(next++)
       return lapRow
     },
@@ -677,7 +677,6 @@ function installStub(
     }
     lapPane = await readPane(params)
     if (NEEDLES.some(([, needle]) => lapPane.pane.includes(needle))) {
-      freshStatus = true
       freshPane = true
     }
     return lapPane
@@ -823,13 +822,14 @@ describe('approvePreSessionDialogs: the lap on a pending row with a launch start
       await clock.flush()
       // The first lap, before any timer fires.
       expect(run.stop()).toBeUndefined()
-      expect(calls.statusCalls).toEqual([{ instance_id: who.id }, { instance_id: who.id }])
+      expect(calls.statusCalls).toEqual([{ instance_id: who.id }])
+      expect(calls.getCalls).toEqual([{ instance_id: who.id }, { instance_id: who.id }])
       expect(calls.readPaneCalls).toEqual([expectedReadPane(who.id), expectedReadPane(who.id)])
       expect(calls.sendKeysCalls).toEqual([expectedEnter(who.id)])
 
       expect(await runToStop(run)).toBe(APPROVER_STOP_LIVE)
       // The second lap read a live row: nothing more was read or typed.
-      expect(calls.statusCalls).toEqual([{ instance_id: who.id }, { instance_id: who.id }, { instance_id: who.id }])
+      expect(calls.statusCalls).toEqual([{ instance_id: who.id }, { instance_id: who.id }])
       expect(calls.readPaneCalls).toHaveLength(2)
       expect(calls.sendKeysCalls).toHaveLength(1)
       expect(approverLines()).toEqual([])
@@ -847,6 +847,17 @@ describe('approvePreSessionDialogs: the lap on a pending row with a launch start
     expect(calls.sendKeysCalls).toEqual([])
   })
 
+  // b.omv SR-7.5: detection survives, but this approver never confirms development channels.
+  test('development-channels dialog is left unanswered while pending and the next live read stops the approver', async () => {
+    installStub([PENDING_ROW, PENDING_ROW, LIVE_ROW], { readPaneResults: [cannedReadPaneResult(DEV_CHANNELS_DIALOG_PANE)] })
+    expect(await approve(PLAIN, true)).toBe(APPROVER_STOP_LIVE)
+    expect(calls.statusCalls).toHaveLength(3)
+    expect(calls.readPaneCalls).toHaveLength(2)
+    expect(calls.getCalls).toEqual([])
+    expect(calls.sendKeysCalls).toEqual([])
+    expect(startupEntries()).toEqual([])
+  })
+
   test('sticky needle: Enter is pressed again at each lap while the row stays pending', async () => {
     installStub([PENDING_ROW, PENDING_ROW, PENDING_ROW, LIVE_ROW], { readPaneResults: [dialogPane(TRUST_DIALOG_NEEDLE)] })
 
@@ -862,7 +873,7 @@ describe('approvePreSessionDialogs: the lap on a pending row with a launch start
     // same as after a fresh spawn. Folder-trust then dev-channels.
     const resumedRow = cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_WHOLE })
     installStub([resumedRow, resumedRow, LIVE_ROW], {
-      readPaneResults: [dialogPane(TRUST_DIALOG_NEEDLE), dialogPane(DEV_CHANNELS_DIALOG_NEEDLE)],
+      readPaneResults: [dialogPane(TRUST_DIALOG_NEEDLE), dialogPane(TRUST_DIALOG_NEEDLE)],
     })
 
     expect(await approve(NAMED, false)).toBe(APPROVER_STOP_LIVE)
@@ -870,7 +881,8 @@ describe('approvePreSessionDialogs: the lap on a pending row with a launch start
     const status = { instance_id: NAMED.id }
     expect(calls).toEqual({
       ...makeStubCallLog(),
-      statusCalls: [status, status, status, status, status],
+      statusCalls: [status, status, status],
+      getCalls: [status, status, status, status],
       readPaneCalls: Array.from({ length: 4 }, () => expectedReadPane(NAMED.id)),
       sendKeysCalls: [expectedEnter(NAMED.id), expectedEnter(NAMED.id)],
     })
@@ -1395,7 +1407,7 @@ describe('approvePreSessionDialogs: each answer by class, one case per cell (b.j
 
   /** Stopped at the first lap, at once: its calls up to the refused one, no further call, nothing typed but the refused Enter, no kill. */
   function expectStoppedAtFirstLap(verb: ApproverVerb): void {
-    expect(statusAt).toEqual(Array(verb === 'send-keys' ? 2 : 1).fill(LAUNCH_START_MS))
+    expect(statusAt).toEqual(Array(1).fill(LAUNCH_START_MS))
     expect(clock.now()).toBe(LAUNCH_START_MS)
     expect(calls.readPaneCalls).toHaveLength(verb === 'status' ? 0 : verb === 'send-keys' ? 2 : 1)
     expect(calls.sendKeysCalls).toHaveLength(verb === 'send-keys' ? 1 : 0)
@@ -1421,8 +1433,8 @@ describe('approvePreSessionDialogs: each answer by class, one case per cell (b.j
     expect(await approve(PLAIN, true)).toBe(APPROVER_STOP_LIVE)
 
     expect(statusAt).toEqual([
-      ...Array(verb === 'send-keys' ? 2 : 1).fill(LAUNCH_START_MS),
-      ...Array(verb === 'send-keys' ? 2 : 1).fill(LAUNCH_START_MS + firstGapMs),
+      ...Array(1).fill(LAUNCH_START_MS),
+      ...Array(1).fill(LAUNCH_START_MS + firstGapMs),
       LAUNCH_START_MS + firstGapMs + FAST,
     ])
     expect(calls.sendKeysCalls).toHaveLength(verb === 'send-keys' ? 2 : 0)
@@ -1615,7 +1627,7 @@ describe('approvePreSessionDialogs: each answer by class, one case per cell (b.j
 
   test('UNAVAILABLE from every Enter (a needle on screen): polling goes on, backing off, until B from the launch start (bound)', async () => {
     const err = errTmuxUnresponsive('send-keys')
-    installStub([PENDING_ROW], { readPaneResults: [dialogPane(DEV_CHANNELS_DIALOG_NEEDLE)], sendKeysError: err })
+    installStub([PENDING_ROW], { readPaneResults: [dialogPane(TRUST_DIALOG_NEEDLE)], sendKeysError: err })
     const boundMs = adLaunchBoundMsInEffect()
 
     expect(await runToStop(startApprover(PLAIN, true), MANY_TIMERS)).toBe(APPROVER_STOP_BOUND)
@@ -1623,7 +1635,8 @@ describe('approvePreSessionDialogs: each answer by class, one case per cell (b.j
     expect(clock.now()).toBe(LAUNCH_START_MS + boundMs)
     const lapTimes = evenTimes(LAUNCH_START_MS, SLOW, boundMs / SLOW)
     expect(readPaneAt).toEqual(lapTimes.flatMap((at) => [at, at]))
-    expect(statusAt).toEqual(readPaneAt)
+    expect(statusAt).toEqual(lapTimes)
+    expect(calls.getCalls).toHaveLength(lapTimes.length * 2)
     expect(calls.sendKeysCalls).toHaveLength(lapTimes.length)
     expect(approverLines()).toHaveLength(lapTimes.length + 1)
   })
@@ -1939,7 +1952,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
   let latchLines: string[]
 
   const keyOfId = new Map(PERSONAS.map((p) => [p.id, p.key]))
-  const call = (verb: ApproverVerb, id: string): string => `${verb} ${id}`
+  const call = (verb: ApproverVerb | 'get', id: string): string => `${verb} ${id}`
 
   /** A CONFLICT another site met (a pane read outside the approver), with which it latches a persona. */
   const OTHER_SITE_ROW = CONFLICT_CASE_ROWS.find((row) => !isApproverSite(row.site) && row.verb === 'read-pane')!
@@ -1990,7 +2003,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     const lapRows = new Map<string, StatusAnswer>()
     const freshPanes = new Set<string>()
     const stub = makeStubClient({})
-    const wrap = <R>(verb: ApproverVerb, answer: (id: string) => R) => async (params: { instance_id: string }): Promise<R> => {
+    const wrap = <R>(verb: ApproverVerb | 'get', answer: (id: string) => R) => async (params: { instance_id: string }): Promise<R> => {
       const id = params.instance_id
       const name = call(verb, id)
       events.push(name)
@@ -2018,12 +2031,8 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
       }
     }
     Object.assign(stub, {
+      get: wrap('get', id => cannedGetResult({ instance_id: id, ...lapRows.get(id)! })),
       status: wrap('status', (id) => {
-        if (freshRows.has(id)) {
-          const answer = freshRows.get(id)!
-          freshRows.delete(id)
-          return answer
-        }
         const answers = rows.get(id)
         if (answers === undefined || answers.length === 0) throw new Error(`no status answer set for ${id}`)
         const answer = answers.length > 1 ? answers.shift()! : answers[0]!
@@ -2035,7 +2044,6 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
         const pane = panes.get(id) ?? CLEAR_PANE
         if (freshPanes.delete(id)) return pane
         if (NEEDLES.some(([, needle]) => pane.pane.includes(needle))) {
-          freshRows.set(id, lapRows.get(id)!)
           freshPanes.add(id)
         }
         return pane
@@ -2068,7 +2076,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
   // Reaching Enter includes the gate's own fresh row and pane reads.
   const lap = (who: ApproverPersona, ...verbs: ApproverVerb[]): string[] =>
     verbs.flatMap((verb) => verb === 'send-keys'
-      ? [call('status', who.id), call('read-pane', who.id), call(verb, who.id)]
+      ? [call('get', who.id), call('read-pane', who.id), call('get', who.id), call(verb, who.id)]
       : [call(verb, who.id)])
   const sendKeysCount = (who: ApproverPersona): number => events.filter((e) => e === call('send-keys', who.id)).length
 
@@ -2445,11 +2453,11 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     'a second start for P with the first approver %s: the first stops (superseded) before the second\'s first call, never two approvers work at once, and one Enter is sent for the one dialog',
     async (where, keptByFirst) => {
       rows.set(PLAIN.id, [PENDING_ROW])
-      panes.set(PLAIN.id, where === 'asleep between laps' ? CLEAR_PANE : dialogPane(DEV_CHANNELS_DIALOG_NEEDLE))
+      panes.set(PLAIN.id, where === 'asleep between laps' ? CLEAR_PANE : dialogPane(TRUST_DIALOG_NEEDLE))
       const hold = where === 'in a read-pane showing a needle' ? holdNext('read-pane', PLAIN) : undefined
       startDialogApprover(PLAIN.key, true, PLAIN.ref)
       if (where !== 'before its first call') await clock.flush()
-      if (where === 'asleep between laps') panes.set(PLAIN.id, dialogPane(DEV_CHANNELS_DIALOG_NEEDLE))
+      if (where === 'asleep between laps') panes.set(PLAIN.id, dialogPane(TRUST_DIALOG_NEEDLE))
       if (hold !== undefined) expect(hold.reached).toBe(true)
       const firstCalls = events.length
       const first = _whenDialogApproverStopped(PLAIN.key)
@@ -2597,7 +2605,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
 
     expect(startedInside).toBe(true)
     expect(events).toEqual(lap(PLAIN, 'status', 'read-pane', 'send-keys'))
-    expect(insideAttempt).toEqual([false, false, false, false, false])
+    expect(insideAttempt).toEqual([false, false, false, false, false, false])
     endAttempt()
     expect(await attempt).toBeUndefined()
 

@@ -253,3 +253,18 @@ describe(`test-13 follows docs/migration.md's "${PHASE1_RUNBOOK_SECTION_TITLE}" 
     expect(() => runbookFindings(gap, script)).toThrow(`${SECTION_NAME}: step ${last.number - 1} is missing`)
   })
 })
+
+// b.omv SR-13.6: provenance must precede replacement; later marked rows resume.
+test('test-13 explicitly proves earlier-release provenance before the fresh upgrade and later ordinary resume', () => {
+  const script = readRepoFile(SCRIPT_FILE)
+  const seed = script.indexOf('# E4_EARLIER_RELEASE_PROVENANCE')
+  const replace = script.indexOf('# E4_FRESH_UPGRADE_REPLACEMENT')
+  const resume = script.indexOf('# E4_LATER_MARKED_RESUME')
+  expect(seed).toBeGreaterThan(-1)
+  expect(replace).toBeGreaterThan(seed)
+  expect(resume).toBeGreaterThan(replace)
+  expect(script.slice(seed, replace)).toContain('tag_prompt')
+  expect(script.slice(replace, resume)).toContain('session_id')
+  expect(script.slice(replace, resume)).toContain('cmp -s')
+  expect(script.slice(resume)).toContain('tag_prompt')
+})

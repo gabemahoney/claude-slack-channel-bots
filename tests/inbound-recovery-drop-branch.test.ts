@@ -1242,7 +1242,8 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
     const hold = holdSpawns(h.stub.client)
     const launch = h.launch(key)
     await hold.entered(id)
-    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }), readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)] })
+    // b.omv SR-7.6: fresh startup Enter proofs see the same pending row.
+    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }), getResult: personaRow(h, key, { state: AGENT_DIRECTOR_PENDING_STATE }), readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)] })
 
     // A launch running is state 6 with no read.
     await expectLostMessageReports(h, key, 'session-starting', { calls: {} })

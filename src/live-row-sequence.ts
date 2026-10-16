@@ -258,6 +258,8 @@ export interface RetiredKeyAttemptStart {
 
 /** What a starter asks for. */
 export interface LiveRowSequenceRequest {
+  /** b.omv SR-7.6: recheck eligibility and provenance before each upgrade kill. */
+  readonly tagUpgrade?: boolean
   /** Persona P's key. */
   readonly key: string
   /** P's reference for the log lines; `persona=<key>` when absent. */
@@ -619,6 +621,8 @@ export const LIVE_ROW_OUTCOME_NOT_LAUNCHED = 'not-launched'
 export const LIVE_ROW_OUTCOME_ROW_FINISHED = 'row-finished'
 /** A run did not judge a `pending` row: the episode stops (SRJ-717). */
 export const LIVE_ROW_OUTCOME_NOT_JUDGED = 'not-judged'
+/** Upgrade observer lost eligibility or found a replacement already installed (b.omv SR-7.6). */
+export const LIVE_ROW_OUTCOME_UPGRADE_DEFERRED = 'upgrade-deferred'
 /** A kill's standing non-success aborted the sequence by its class. */
 export const LIVE_ROW_OUTCOME_ABORTED = 'aborted'
 /** Step 5: the row stayed live after runs that judged it; the alert was raised. */
@@ -748,6 +752,7 @@ export type LiveRowSequenceOutcome = OutcomeCounts &
       }
     | { readonly kind: typeof LIVE_ROW_OUTCOME_ROW_FINISHED }
     | { readonly kind: typeof LIVE_ROW_OUTCOME_NOT_JUDGED; readonly step: 3 | 4 }
+    | { readonly kind: typeof LIVE_ROW_OUTCOME_UPGRADE_DEFERRED; readonly current: boolean }
     | {
         readonly kind: typeof LIVE_ROW_OUTCOME_ABORTED
         readonly step: 1 | 4
@@ -831,6 +836,8 @@ function callIsolated(fn: () => void): void {
 
 /** What step 1's and step 4's kill is given. */
 export interface LiveRowSequenceKillOptions {
+  /** b.omv SR-7.6: between-try reads retain upgrade eligibility. */
+  readonly tagUpgrade?: boolean
   /** The row state last read: the kill retry's seed (`killRetrySeedOfState`). */
   readonly lastReadState: string
   /** The wait between tries; it ends early once the sequence is stopped. */
@@ -1109,6 +1116,8 @@ function describeOutcome(outcome: LiveRowSequenceOutcome): string {
       return `not launched (${outcome.launchKind}; ${outcome.notLaunched})`
     case LIVE_ROW_OUTCOME_ROW_FINISHED:
       return 'the row is finished (no launch)'
+    case LIVE_ROW_OUTCOME_UPGRADE_DEFERRED:
+      return outcome.current ? 'upgrade already installed; no further kill or launch' : 'upgrade waits for an eligible row; no further kill or launch'
     case LIVE_ROW_OUTCOME_NOT_JUDGED:
       return `stopped at step ${outcome.step}: a run did not judge the pending row; no alert, no further kill, nothing counted`
     case LIVE_ROW_OUTCOME_ABORTED:
@@ -1402,6 +1411,8 @@ export async function runLiveRowSequence(
       case LIVE_ROW_OUTCOME_ROW_FINISHED:
       case LIVE_ROW_OUTCOME_STOPPED:
         return undefined
+      case LIVE_ROW_OUTCOME_UPGRADE_DEFERRED:
+        return body.current ? undefined : LIVE_ROW_ARM_ENDED
       case LIVE_ROW_OUTCOME_NOT_JUDGED:
         return LIVE_ROW_ARM_NOT_JUDGED
       case LIVE_ROW_OUTCOME_ABORTED:
@@ -1417,6 +1428,16 @@ export async function runLiveRowSequence(
   const killStep = async (step: 1 | 4): Promise<StepEnd> => {
     const stopped = halted()
     if (stopped) return stopped
+    if (request.tagUpgrade) {
+      // An observer's old reading never authorizes killing a newly busy or upgraded row.
+      const fresh = await getStep(step === 1 ? 2 : 4)
+      if ('end' in fresh) return fresh.end
+      if (lastRead.kind === 'state' && lastRead.row?.labels?.tag_prompt === '1') return { kind: LIVE_ROW_OUTCOME_UPGRADE_DEFERRED, current: true }
+      if (fresh.finished) return undefined
+      if (lastRead.kind !== 'state' || !['waiting', 'pending', 'ask_user'].includes(lastRead.state)) {
+        return { kind: LIVE_ROW_OUTCOME_UPGRADE_DEFERRED, current: false }
+      }
+    }
     if (lastReadPending() && configMalformedRaised()) {
       log(liveRowSequenceNoKillLine(ref, step))
       return { kind: LIVE_ROW_OUTCOME_CONFIG_MALFORMED, step }
@@ -1424,6 +1445,7 @@ export async function runLiveRowSequence(
     counts.kills++
     const seed = lastRead.kind === 'state' ? lastRead.state : LIVE_ROW_SEQUENCE_NO_ROW
     const retried = await deps.killWithRetry(key, {
+      tagUpgrade: request.tagUpgrade,
       lastReadState: seed,
       wait: (ms: number) => pause(ms).then(() => undefined),
       keepGoing: () => stop.reason === undefined && !latchedNow(),
@@ -1581,6 +1603,12 @@ export async function runLiveRowSequence(
     if (!request.launches) return { kind: LIVE_ROW_OUTCOME_ROW_FINISHED }
     const stopped = halted()
     if (stopped) return stopped
+    if (request.tagUpgrade) {
+      const fresh = await getStep(4)
+      if ('end' in fresh) return fresh.end
+      if (lastRead.kind === 'state' && lastRead.row?.labels?.tag_prompt === '1') return { kind: LIVE_ROW_OUTCOME_UPGRADE_DEFERRED, current: true }
+      if (!fresh.finished) return { kind: LIVE_ROW_OUTCOME_UPGRADE_DEFERRED, current: false }
+    }
     const row = lastRead.kind === 'state' ? lastRead.row : undefined
     let facts: LiveRowSequencePersonaFacts | undefined
     try {

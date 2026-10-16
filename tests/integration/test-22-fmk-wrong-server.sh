@@ -10,8 +10,8 @@
 # shim; agent-director-admin behind the same shim), store and tmux server, all
 # under SCENARIO_ROOT. The tmux shim stays in `log` mode, first on every CSCB
 # process's PATH. One persona, PERSONA_NAME, whose working directory selects
-# the stub's `dev-channels` mode (STUB_MODE_DEV_CHANNELS: the stub holds at
-# the dev-channels dialog until the dialog approver's Enter, then reports in).
+# the stub's `startup-trust` mode (STUB_MODE_DEV_CHANNELS: the stub holds at
+# the startup-trust dialog until the dialog approver's Enter, then reports in).
 # A live start against the Slack stub (fixtures/slack-stub-server.ts, one
 # token pair answered ok), with `health_check_interval` 0 (ruling S3: no leg
 # needs a health tick; the latch re-check runs on its own timer whatever the
@@ -468,7 +468,8 @@ mkdir -m 700 "${CREDS}" || fail "${STEP}: could not create ${CREDS}"
 CONFIG_DIR="${SCENARIO_ROOT}/claude-config"
 mkdir -p "${CONFIG_DIR}" || fail "${STEP}: could not create ${CONFIG_DIR}"
 WORK="$(make_workdir wrong)"
-stub_mode "${WORK}" "${STUB_MODE_DEV_CHANNELS}"
+stub_mode "${WORK}" "${STUB_MODE_STARTUP_TRUST}"
+stub_mode "${WORK}" "${STUB_MODE_STARTUP_TRUST}"
 
 # The [tmux] table, before the server starts: both keys at their minimums.
 write_ad_settings "${TMUX_PAIRS[@]}"

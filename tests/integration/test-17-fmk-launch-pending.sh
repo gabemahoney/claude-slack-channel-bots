@@ -5,7 +5,7 @@
 # SRJ-1418; AC 3, AC 6, AC 29, AC 32): a launch in progress, and a resume
 # right after an exit, in five legs, run in this order:
 # - scenario 5's leg (`leg_launch_pending`): a resume held at the
-#   dev-channels dialog reads `pending` with its kept session_id and a
+#   startup-trust dialog reads `pending` with its kept session_id and a
 #   launch start; health ticks and a `resume` forced meanwhile change nothing
 #   (no launch, kill, counted failure or post; the forced `resume` gets
 #   ErrSpawnNotResumable, not counted and not posted); the approver clears
@@ -44,7 +44,7 @@
 #   config.toml, so no `[tmux]` table);
 # - the tmux shim first on every CSCB process's PATH, in `log` mode apart
 #   from the launch-timeout legs' start and scenario 11's start (below);
-# - the stub as `claude`, in `dev-channels` (no selection) in every persona's
+# - the stub as `claude`, in `startup-trust` (no selection) in every persona's
 #   working directory but scenario 13's, with the dialog delay
 #   (`stub_dialog_delay`) where a leg sets it; scenario 13's working
 #   directory is selected for `linger-on-exit` (`stub_mode`; the stub's
@@ -65,7 +65,7 @@
 # Scenario 5's leg (`leg_launch_pending`), in run order. Steps marked
 # [harness] are the harness playing a human from the scenario's own shell;
 # no CSCB process makes them.
-#   1. The live start brings P up: the stub holds at the dev-channels dialog
+#   1. The live start brings P up: the stub holds at the startup-trust dialog
 #      (no delay yet), the approver clears it, the row reads `waiting`, the
 #      server registers the stub's MCP session as P's, and the bring-up's
 #      approver has stopped (no bot-server pane read of P for
@@ -103,7 +103,7 @@
 #        reads status, then the pane; a tick reads status only) number at
 #        least ⌊D / HEALTH_TICK_S⌋ - 1 (see Waits).
 #   6. [harness] The pane, then the stub's record, is read every
-#      SCENARIO_POLL_S until either holds the dev-channels needle (the
+#      SCENARIO_POLL_S until either holds the startup-trust needle (the
 #      delay's end). The stub clears an answered dialog from its pane, so a
 #      pane read alone can miss a dialog shown and answered between two reads
 #      (under parallel /ci load it did; b.fyq); the record keeps every dialog
@@ -112,7 +112,7 @@
 #      showed; it is the one after the forced resume when the first read of
 #      this step already finds the dialog. Then the row is read until it
 #      leaves `pending`: it reads `waiting` with the same session_id,
-#      and the record then holds the dev-channels dialog.
+#      and the record then holds the startup-trust dialog.
 #   7. Checks over the leg, counting only shim lines whose parent is the bot
 #      server (or, for the forced call, the driver):
 #      - exactly one `resume` of P by the bot server, and no `spawn`
@@ -1066,7 +1066,7 @@ PACE_MS="$(fmk_text DIALOG_POLL_INTERVAL_MS)" || fail "setup: fmk-texts.ts could
 [[ "${PACE_MS}" =~ ^[1-9][0-9]*$ ]] || fail "setup: the approver's pace '${PACE_MS}' is not a whole number of milliseconds"
 # Three approver laps' worth of time, in whole seconds (at least one).
 APPROVER_QUIET_S=$(( (3 * PACE_MS + 999) / 1000 ))
-[[ -n "${APPROVER_PREFIX}" && -n "${DEV_NEEDLE}" && -n "${TRUST_NEEDLE}" ]] || fail "setup: fmk-texts.ts printed an empty value"
+[[ -n "${APPROVER_PREFIX}" && -n "${TRUST_NEEDLE}" && -n "${TRUST_NEEDLE}" ]] || fail "setup: fmk-texts.ts printed an empty value"
 [[ "${G_S}" =~ ^[0-9]+$ ]] || fail "setup: G '${G_S}' is not a whole number of seconds"
 (( DIALOG_DELAY_S + APPROVER_CLEAR_S < G_S )) \
     || fail "setup: the dialog delay ${DIALOG_DELAY_S}s plus the approver's clear ${APPROVER_CLEAR_S}s is not shorter than G ${G_S}s"
@@ -1212,6 +1212,7 @@ leg_launch_pending() {
     creds="${SCENARIO_ROOT}/credentials"
     mkdir -m 700 "${creds}"
     work="$(make_workdir p)"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     start_slack_stub "${SCENARIO_ROOT}/slack-stub" t17p1
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot t17p1)" "$(fake_token app t17p1)" \
         | write_file "${creds}/p.json" 600
@@ -1251,6 +1252,7 @@ EOF
         approver_quiet
 
     # Step 2 [harness]: the dialog delay in P's working directory.
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     stub_dialog_delay "${work}" "${DIALOG_DELAY_S}"
 
     # Step 3 [harness]: P's worker ends with the stub's sentinel.
@@ -1363,7 +1365,7 @@ EOF
     last_clear="$(now_s)"
     pane_capture "${step}" "${session}" "${pane}"
     stub_shown_dialogs "${session}" > "${shown}" || fail "${step}: could not read the stub's record of the dialogs P's pane showed"
-    if grep -qF -- "${DEV_NEEDLE}" "${pane}" "${shown}"; then
+    if grep -qF -- "${TRUST_NEEDLE}" "${pane}" "${shown}"; then
         fail "${step}: the dialog showed before the forced resume returned (${drv_s}s): the hold did not cover it"
     fi
     expect_no_needle "${step}: after the forced resume" "${pane}"
@@ -1382,7 +1384,7 @@ EOF
         line="$(now_s)"
         pane_capture "${step}" "${session}" "${pane}"
         stub_shown_dialogs "${session}" > "${shown}" || fail "${step}: could not read the stub's record of the dialogs P's pane showed"
-        if grep -qF -- "${DEV_NEEDLE}" "${pane}" "${shown}"; then
+        if grep -qF -- "${TRUST_NEEDLE}" "${pane}" "${shown}"; then
             dialog_at="${line}"
             break
         fi
@@ -1390,11 +1392,11 @@ EOF
         expect_no_needle "${step}: before the dialog" "${shown}" "the stub's record of P's dialogs"
         last_clear="${line}"
         (( $(_scenario_now_ms) < deadline )) \
-            || fail "${step}: P's pane never showed the dev-channels dialog within ${DIALOG_WAIT_S}s (neither the pane nor the stub's record holds it)"
+            || fail "${step}: P's pane never showed the startup-trust dialog within ${DIALOG_WAIT_S}s (neither the pane nor the stub's record holds it)"
         sleep "${SCENARIO_POLL_S}"
     done
     on_pane=no
-    grep -qF -- "${DEV_NEEDLE}" "${pane}" && on_pane=yes
+    grep -qF -- "${TRUST_NEEDLE}" "${pane}" && on_pane=yes
     echo "${TEST_NAME}: ${step}: the dialog showed between $(seconds_between "${hold_at}" "${last_clear}")s and $(seconds_between "${hold_at}" "${dialog_at}")s after the hold's first read (still on the pane at the read that found it, recorded: ${on_pane})"
     awk -v s="$(seconds_between "${hold_at}" "${last_clear}")" -v t="${HEALTH_TICK_S}" 'BEGIN { exit !(s >= t) }' \
         || fail "${step}: the hold lasted less than one health tick interval (${HEALTH_TICK_S}s)"
@@ -1411,8 +1413,8 @@ EOF
     # The dialog showed on the resumed stub's pane: its record holds it (the
     # stub writes the record before it reads the Enter that answers it).
     stub_shown_dialogs "${session}" > "${shown}" || fail "${step}: could not read the stub's record of the dialogs P's pane showed"
-    grep -qF -- "${DEV_NEEDLE}" "${shown}" \
-        || fail "${step}: the row reads waiting, but the resumed stub's record holds no dev-channels dialog"
+    grep -qF -- "${TRUST_NEEDLE}" "${shown}" \
+        || fail "${step}: the row reads waiting, but the resumed stub's record holds no startup-trust dialog"
 
     # Step 7: the checks. Health ticks ran in the hold: the bot server's
     # status reads of P whose next call of P's row (status or read-pane) is
@@ -1631,6 +1633,7 @@ leg_launch_timeouts() {
     LT_WORK[spawn]="$(make_workdir spawn)"
     LT_WORK[reuse]="$(make_workdir reuse-b)"
     for role in "${LT_ROLES[@]}"; do
+        stub_mode "${LT_WORK[${role}]}" "${STUB_MODE_STARTUP_TRUST}"
         stub_dialog_delay "${LT_WORK[${role}]}" "${LT_DIALOG_DELAY_S}"
     done
     write_personas_config \
@@ -1825,6 +1828,8 @@ leg_restart_mid_launch() {
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${Q_SUFFIX}")" "$(fake_token app "${Q_SUFFIX}")" \
         | write_file "${creds}/q.json" 600
     work="$(make_workdir restart)"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     stub_dialog_delay "${work}" "${RESTART_DIALOG_DELAY_S}"
     write_personas_config "$(persona_json "${Q_NAME}" "${creds}/q.json" "${work}" "${Q_CHANNEL}")"
 
@@ -1966,6 +1971,7 @@ leg_fail_create() {
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${F_SUFFIX}")" "$(fake_token app "${F_SUFFIX}")" \
         | write_file "${creds}/f.json" 600
     work="$(make_workdir failcreate)"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     write_personas_config "$(persona_json "${F_NAME}" "${creds}/f.json" "${work}" "${F_CHANNEL}")"
 
     # Step 1 [harness]: F has no row.
@@ -2180,6 +2186,7 @@ leg_still_stopping() {
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${S_SUFFIX}")" "$(fake_token app "${S_SUFFIX}")" \
         | write_file "${creds}/s.json" 600
     work="$(make_workdir paused)"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     stub_mode "${work}" "${STUB_MODE_LINGER_ON_EXIT}"
     persona_json "${S_NAME}" "${creds}/s.json" "${work}" "${S_CHANNEL}" \
         | jq -s --argjson port "${SCENARIO_PORT}" --argjson tick "${ST_TICK_S}" --argjson delay "${ST_RESTART_DELAY_S}" \

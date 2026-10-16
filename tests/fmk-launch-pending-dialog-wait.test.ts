@@ -1,5 +1,5 @@
 /**
- * fmk-launch-pending-dialog-wait.test.ts — test-17 waits for the dev-channels
+ * fmk-launch-pending-dialog-wait.test.ts — test-17 waits for the trust
  * dialog through the stub's record of the dialogs it printed, never through
  * the pane alone (b.fyq).
  *
@@ -9,10 +9,10 @@
  * (tests/README.md, the stub's entry). A wait that polls only the pane can
  * miss a dialog shown and answered between two reads: test-17's scenario 5
  * did under parallel /ci load, failing with "P's pane never showed the
- * dev-channels dialog" though the approver had answered it.
+ * trust dialog" though the approver had answered it.
  *
  * Reads the script and runs nothing (it runs only in /ci). The rule: every
- * loop of the script that breaks on the dev-channels needle (`${DEV_NEEDLE}`)
+ * loop of the script that breaks on the trust needle (`${TRUST_NEEDLE}`)
  * reads the pane (`pane_capture`) and then writes `stub_shown_dialogs`'s
  * output to a file, and each of its breaks stops on a condition that ORs in a
  * plain (not negated) grep of that file for the needle; and the script has at
@@ -35,8 +35,8 @@ const REPO_ROOT = resolve(import.meta.dir, '..')
 
 const SCRIPT_FILE = 'tests/integration/test-17-fmk-launch-pending.sh'
 
-/** The dev-channels needle as the script names it (fixtures/fmk-texts.ts prints its value at run time). */
-const NEEDLE = '${DEV_NEEDLE}'
+/** The trust needle as the script names it (fixtures/fmk-texts.ts prints its value at run time). */
+const NEEDLE = '${TRUST_NEEDLE}'
 
 /** A line that ends a loop's head: `while …; do`, `for …; do` or a lone `do`. */
 const LOOP_OPEN = /(?:^|[\s;])do\s*$/
@@ -108,7 +108,7 @@ function stopsOnRecord(condition: string, records: string[]): boolean {
 }
 
 /**
- * What keeps `script`'s waits for the dev-channels dialog (its loops whose
+ * What keeps `script`'s waits for the trust dialog (its loops whose
  * body names the needle and breaks) from reading the stub's record: empty
  * when each wait reads the pane, then writes `stub_shown_dialogs`'s output
  * to a file, and stops only on a condition that ORs in a plain grep of that
@@ -118,25 +118,25 @@ function dialogWaitFindings(script: string): string[] {
   const { loops, unpaired } = scriptLoops(script)
   if (unpaired.length > 0) return [`unpaired loop line(s) ${unpaired.join(', ')}: the audit cannot pair each loop head with its done`]
   const waits = loops.filter(({ body }) => body.some((text) => text.includes(NEEDLE)) && body.some((text) => /\bbreak\b/.test(text)))
-  if (waits.length === 0) return ['no loop breaks on the dev-channels needle: the audit found no wait for the dialog to read']
+  if (waits.length === 0) return ['no loop breaks on the trust needle: the audit found no wait for the dialog to read']
   return waits.flatMap(({ line, body }) => {
     const records = body.flatMap((text) => {
       const read = RECORD_READ.exec(text)
       return read === null ? [] : [read[2]!]
     })
     if (records.length === 0) {
-      return [`line ${line}: the wait for the dev-channels dialog reads no stub record (stub_shown_dialogs), so it misses a dialog shown and answered between two pane reads`]
+      return [`line ${line}: the wait for the trust dialog reads no stub record (stub_shown_dialogs), so it misses a dialog shown and answered between two pane reads`]
     }
     const findings: string[] = []
     const paneAt = body.findIndex((text) => PANE_READ_CALL.test(text))
     if (paneAt === -1 || paneAt > body.findIndex((text) => RECORD_READ.test(text))) {
-      findings.push(`line ${line}: the wait for the dev-channels dialog does not read the pane (pane_capture) before the stub's record, so a read clear in both is no proof the dialog had not shown at its time (last_clear)`)
+      findings.push(`line ${line}: the wait for the trust dialog does not read the pane (pane_capture) before the stub's record, so a read clear in both is no proof the dialog had not shown at its time (last_clear)`)
     }
     for (const condition of stopConditions(body)) {
       if (condition === undefined) {
-        findings.push(`line ${line}: the audit cannot read the condition of a break in the wait for the dev-channels dialog (write \`if <condition>; then … break\` or \`<condition> && break\`)`)
+        findings.push(`line ${line}: the audit cannot read the condition of a break in the wait for the trust dialog (write \`if <condition>; then … break\` or \`<condition> && break\`)`)
       } else if (!stopsOnRecord(condition, records)) {
-        findings.push(`line ${line}: the wait for the dev-channels dialog stops on \`${condition}\`, which does not OR in a plain grep of the stub's record (${records.join(', ')}) for the needle`)
+        findings.push(`line ${line}: the wait for the trust dialog stops on \`${condition}\`, which does not OR in a plain grep of the stub's record (${records.join(', ')}) for the needle`)
       }
     }
     return findings
@@ -148,8 +148,8 @@ const lines = (...text: string[]): string => text.join('\n')
 const PANE_READ = '    pane_capture "${step}" "${session}" "${pane}"'
 const RECORD_LINE = '    stub_shown_dialogs "${session}" > "${shown}" || fail "${step}: could not read the record"'
 
-describe("test-17 waits for the dev-channels dialog through the stub's record, not the pane alone (b.fyq)", () => {
-  test(`${SCRIPT_FILE}: every loop that breaks on the dev-channels needle reads the pane, then stub_shown_dialogs, and stops on a grep of the record for the needle`, () => {
+describe("test-17 waits for the trust dialog through the stub's record, not the pane alone (b.fyq)", () => {
+  test(`${SCRIPT_FILE}: every loop that breaks on the trust needle reads the pane, then stub_shown_dialogs, and stops on a grep of the record for the needle`, () => {
     expect(dialogWaitFindings(readFileSync(resolve(REPO_ROOT, SCRIPT_FILE), 'utf-8'))).toEqual([])
   })
 
@@ -160,7 +160,7 @@ describe("test-17 waits for the dev-channels dialog through the stub's record, n
         'while :; do',
         '    line="$(now_s)"',
         PANE_READ,
-        '    if grep -qF -- "${DEV_NEEDLE}" "${pane}"; then',
+        '    if grep -qF -- "${TRUST_NEEDLE}" "${pane}"; then',
         '        dialog_at="${line}"',
         '        break',
         '    fi',
@@ -169,16 +169,16 @@ describe("test-17 waits for the dev-channels dialog through the stub's record, n
         '    sleep "${SCENARIO_POLL_S}"',
         'done',
       ),
-      /^line 1: the wait for the dev-channels dialog reads no stub record \(stub_shown_dialogs\)/,
+      /^line 1: the wait for the trust dialog reads no stub record \(stub_shown_dialogs\)/,
     ],
     [
       'a wait that reads the record but tests only the pane',
-      lines('while :; do', PANE_READ, RECORD_LINE, '    if grep -qF -- "${DEV_NEEDLE}" "${pane}"; then', '        break', '    fi', 'done'),
-      /^line 1: .* stops on `grep -qF -- "\$\{DEV_NEEDLE\}" "\$\{pane\}"`, which does not OR in a plain grep of the stub's record \(\$\{shown\}\)/,
+      lines('while :; do', PANE_READ, RECORD_LINE, '    if grep -qF -- "${TRUST_NEEDLE}" "${pane}"; then', '        break', '    fi', 'done'),
+      /^line 1: .* stops on `grep -qF -- "\$\{TRUST_NEEDLE\}" "\$\{pane\}"`, which does not OR in a plain grep of the stub's record \(\$\{shown\}\)/,
     ],
     [
       'a stop that needs the needle in both the pane and the record',
-      lines('while :; do', PANE_READ, RECORD_LINE, '    grep -qF -- "${DEV_NEEDLE}" "${pane}" && grep -qF -- "${DEV_NEEDLE}" "${shown}" && break', 'done'),
+      lines('while :; do', PANE_READ, RECORD_LINE, '    grep -qF -- "${TRUST_NEEDLE}" "${pane}" && grep -qF -- "${TRUST_NEEDLE}" "${shown}" && break', 'done'),
       /^line 1: .* stops on `grep [^`]*"\$\{pane\}" && grep [^`]*"\$\{shown\}"`, which does not OR in/,
     ],
     [
@@ -187,13 +187,13 @@ describe("test-17 waits for the dev-channels dialog through the stub's record, n
         'while :; do',
         PANE_READ,
         RECORD_LINE,
-        '    ! grep -qF -- "${DEV_NEEDLE}" "${shown}" || fail "${step}: the record holds a dialog the pane missed"',
-        '    if grep -qF -- "${DEV_NEEDLE}" "${pane}"; then',
+        '    ! grep -qF -- "${TRUST_NEEDLE}" "${shown}" || fail "${step}: the record holds a dialog the pane missed"',
+        '    if grep -qF -- "${TRUST_NEEDLE}" "${pane}"; then',
         '        break',
         '    fi',
         'done',
       ),
-      /^line 1: .* stops on `grep -qF -- "\$\{DEV_NEEDLE\}" "\$\{pane\}"`, which does not OR in/,
+      /^line 1: .* stops on `grep -qF -- "\$\{TRUST_NEEDLE\}" "\$\{pane\}"`, which does not OR in/,
     ],
     [
       'a break in the else branch of the record test (it stops on a clear read)',
@@ -201,14 +201,14 @@ describe("test-17 waits for the dev-channels dialog through the stub's record, n
         'while :; do',
         PANE_READ,
         RECORD_LINE,
-        '    if grep -qF -- "${DEV_NEEDLE}" "${pane}" "${shown}"; then',
+        '    if grep -qF -- "${TRUST_NEEDLE}" "${pane}" "${shown}"; then',
         '        sleep "${SCENARIO_POLL_S}"',
         '    else',
         '        break',
         '    fi',
         'done',
       ),
-      /^line 1: the audit cannot read the condition of a break in the wait for the dev-channels dialog/,
+      /^line 1: the audit cannot read the condition of a break in the wait for the trust dialog/,
     ],
     [
       'a wait that reads the record before the pane',
@@ -217,27 +217,27 @@ describe("test-17 waits for the dev-channels dialog through the stub's record, n
         '    line="$(now_s)"',
         RECORD_LINE,
         PANE_READ,
-        '    if grep -qF -- "${DEV_NEEDLE}" "${pane}" "${shown}"; then',
+        '    if grep -qF -- "${TRUST_NEEDLE}" "${pane}" "${shown}"; then',
         '        break',
         '    fi',
         '    last_clear="${line}"',
         'done',
       ),
-      /^line 1: the wait for the dev-channels dialog does not read the pane \(pane_capture\) before the stub's record/,
+      /^line 1: the wait for the trust dialog does not read the pane \(pane_capture\) before the stub's record/,
     ],
     [
       'a record read only before the wait',
-      lines(RECORD_LINE.trimStart(), 'while :; do', PANE_READ, '    if grep -qF -- "${DEV_NEEDLE}" "${pane}" "${shown}"; then', '        break', '    fi', 'done'),
-      /^line 2: the wait for the dev-channels dialog reads no stub record/,
+      lines(RECORD_LINE.trimStart(), 'while :; do', PANE_READ, '    if grep -qF -- "${TRUST_NEEDLE}" "${pane}" "${shown}"; then', '        break', '    fi', 'done'),
+      /^line 2: the wait for the trust dialog reads no stub record/,
     ],
     [
       'a script whose only wait is a pane predicate under wait_until',
-      lines('wait_until 40 "the dialog never showed" pane_shows_dev_dialog', 'for needle in "${DEV_NEEDLE}" "${TRUST_NEEDLE}"; do', '    grep -qF -- "${needle}" "${pane}"', 'done'),
-      /^no loop breaks on the dev-channels needle/,
+      lines('wait_until 40 "the dialog never showed" pane_shows_dev_dialog', 'for needle in "${TRUST_NEEDLE}" "${TRUST_NEEDLE}"; do', '    grep -qF -- "${needle}" "${pane}"', 'done'),
+      /^no loop breaks on the trust needle/,
     ],
     [
       'a loop left open',
-      lines('while :; do', PANE_READ, RECORD_LINE, '    grep -qF -- "${DEV_NEEDLE}" "${pane}" "${shown}" && break'),
+      lines('while :; do', PANE_READ, RECORD_LINE, '    grep -qF -- "${TRUST_NEEDLE}" "${pane}" "${shown}" && break'),
       /^unpaired loop line\(s\) 1: the audit cannot pair each loop head with its done$/,
     ],
   ]

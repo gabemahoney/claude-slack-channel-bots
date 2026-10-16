@@ -500,6 +500,7 @@ import {
   reportDeferredUnavailable,
   reportLostRaceAtSite,
   reportReuseCollisionAtSite,
+  reportSystemPromptFailureAtSite,
   reportUnclassifiedAtSite,
   setOutageFlag,
   withOutageDetection,
@@ -985,6 +986,7 @@ import {
   PENDING_ROW_NO_LAUNCH_START,
   PENDING_ROW_NOT_COVERED,
   PENDING_ROW_REASON_CONFIG_DIR_MISMATCH,
+  PENDING_ROW_REASON_TAG_PROMPT_MISSING,
   PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED,
   PENDING_ROW_REASON_CWD_MISMATCH,
   PENDING_ROW_REASON_CWD_UNRESOLVED,
@@ -1123,6 +1125,8 @@ const CONFIG_DIR_LABEL_KEY = CONFIG_DIR_LABEL_PREFIX.slice(0, -1)
 
 /** How an agent-director row compares with a persona (b.av2 SR-6.2, SR-6.3). */
 export interface RowPersonaComparison {
+  /** b.omv SR-7.6: the current tag prompt and launch contract. */
+  tagPrompt: boolean
   /** The row's `cwd` and the persona's working_directory have the same real path. */
   cwdMatches: boolean
   /**
@@ -1215,6 +1219,7 @@ export function compareRowToPersona(
   const expected = strictConfigDirLabel(persona.claude_config_dir, home, configDirFs)
   const expectedConfigDirLabel = 'label' in expected ? expected.label : undefined
   return {
+    tagPrompt: row.labels?.tag_prompt === '1',
     cwdMatches,
     workingDirectoryResolved: workingDirectory !== undefined,
     cwdCheckDeferred,
@@ -3522,8 +3527,7 @@ export const PENDING_ROW_RULE_GET_SITE: OwnRowReadSite = Object.freeze({ site: P
 
 /**
  * Whether `pane` shows a startup dialog the dialog approver recognises: one
- * of its needles (`PRE_SESSION_DIALOG_NEEDLES`: the folder-trust and
- * dev-channels option labels; b.jg5 SRJ-402). The approver's laps and the
+ * of its needles (`PRE_SESSION_DIALOG_NEEDLES`: folder trust; b.omv SR-7.5). The approver's laps and the
  * pending-row rule's lap (b.jg5 SRJ-410) both read a pane through it. A pane
  * may be a single leftover's (b.jg5 SRJ-613), so a dialog on it leads at
  * most to Enter through `send-keys`, the backstop. Pure; never throws.
@@ -4163,6 +4167,10 @@ export async function reconnectMcpWithCause(
   if (read.kind === OWN_ROW_READ_ABSENT) { life?.clearDeferred(key); return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_ABSENT } }
   if (read.kind !== OWN_ROW_READ_ROW || read.latched) return defer()
   const row = read.row
+  if (noteTagPromptReading(key, row) && !AGENT_DIRECTOR_DEAD_STATES.has(row.state)) {
+    await inspectPersonaUpgrade(key)
+    return defer()
+  }
   if (life && !await life.recoverBeforeReconnect(key)) return defer()
   if (AGENT_DIRECTOR_DEAD_STATES.has(row.state)) { life?.clearDeferred(key); return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE } }
   if (!['waiting', 'working'].includes(row.state) || row.relay_mode !== 'on') return defer()
@@ -4191,18 +4199,32 @@ export async function reconnectMcpWithCause(
   if (screen.running || classifyWorkingPane(pane) === 'busy') return defer()
   const workingChecked = options.workingChecked !== undefined && options.workingChecked.launchId === life?.launchId(key)
   if (row.state === 'working' && !workingChecked && await checkWorkingRowPane(key, pane, { noNotice: true, persona: configuredPersonaForDelivery(key), latchedNow: () => personaLatchedNow(key) }) !== 'reconnect') return defer()
-  const reading: DeliveryReading = { row: row.state, screen: 'empty', box: '', relay: true, marker: true, mcp: false, up: true, latched: personaLatchedNow(key), held: isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key), readable: true, receipts: [], idleEvidence: row.state === 'working', launch: '', session: row.session_id, compactions: '', gate: life?.owner(key) ?? 'free', offset: 0, records: [] }
+  const reading: DeliveryReading = { row: row.state, screen: 'empty', box: '', relay: true, marker: row.labels?.tag_prompt === '1', mcp: false, up: true, latched: personaLatchedNow(key), held: isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key), readable: true, receipts: [], idleEvidence: row.state === 'working', launch: '', session: row.session_id, compactions: '', gate: life?.owner(key) ?? 'free', offset: 0, records: [] }
   const gateChoice = decideGate({ p: { accepted: [], fixed: [], sent: [], refused: [], delivered: [] }, e: createDeliveryPolicyState(), r: reading, g: { owner: life?.owner(key) ?? 'free', stage: 'none', deferred: true, due: true }, writer: { kind: 'none' }, compact: 'none' })
   if (gateChoice !== 'runReconnect') return defer()
   const release = life?.acquire(key, 'reconnect')
   if (life && !release) return defer()
-  console.error(reconnectStartLine(ref))
   try {
+    const textRow = await readPersonaOwnRow(key, { site: 'reconnect', what: 'before text' })
+    if (textRow.kind !== OWN_ROW_READ_ROW || textRow.latched || textRow.row.labels?.tag_prompt !== '1' ||
+        textRow.row.session_id !== row.session_id || textRow.row.launch_started_at !== row.launch_started_at ||
+        !['waiting', 'working'].includes(textRow.row.state) || personaLatchedNow(key) ||
+        isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||
+        (life && (!life.active(key) || life.owner(key) !== 'reconnect'))) return defer()
+    console.error(reconnectStartLine(ref))
     await withOutageDetection(key, undefined, 'send-keys', client => client.sendKeys({ instance_id: personaInstanceId(key), text: `/mcp reconnect ${MCP_SERVER_NAME}`, no_enter: true }))
     if (life) await life.pause(ENTER_DELAY_MS)
     else await new Promise(resolve => setTimeout(resolve, ENTER_DELAY_MS))
     if (life && (!life.active(key) || life.owner(key) !== 'reconnect')) return { outcome: 'transient' }
     if (personaLatchedNow(key) || isOwnRowOldLifeHeld(key)) return defer()
+    const enterRow = await readPersonaOwnRow(key, { site: 'reconnect', what: 'before Enter' })
+    // b.omv SR-5.5/7.6: the final read is awaited; a teardown, shutdown or
+    // concurrent latch/hold during it must still prevent the control key.
+    if (enterRow.kind !== OWN_ROW_READ_ROW || enterRow.latched || enterRow.row.labels?.tag_prompt !== '1' ||
+        enterRow.row.session_id !== row.session_id || enterRow.row.launch_started_at !== row.launch_started_at ||
+        !['waiting', 'working'].includes(enterRow.row.state) || personaLatchedNow(key) ||
+        isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||
+        (life && (!life.active(key) || life.owner(key) !== 'reconnect'))) return defer()
     await withOutageDetection(key, undefined, 'send-keys', client => client.sendKeys({ instance_id: personaInstanceId(key), key: 'Enter' }))
     life?.clearDeferred(key)
     return { outcome: 'ok' }
@@ -4225,11 +4247,16 @@ async function withStartupTyping(key: string, work: () => Promise<void>): Promis
   const release = life?.acquire(key, 'startup')
   if (life && !release) return false
   try {
-    const status = await readPersonaOwnRowStatus(key, { site: 'startup answer', what: 'fresh status' })
-    if (status.kind !== OWN_ROW_STATUS_STATE || status.state !== 'pending' || life?.hasWaited(key) || (life && !life.active(key))) return false
+    const status = await readPersonaOwnRow(key, { site: 'startup answer', what: 'fresh get' })
+    if (status.kind !== OWN_ROW_READ_ROW || status.latched || status.row.labels?.tag_prompt !== '1' || status.row.state !== 'pending' || life?.hasWaited(key) || (life && !life.active(key))) return false
     const pane = await readPendingRowLapPane(key)
     if (pane.kind !== PANE_READ_PANE || !paneShowsStartupDialog(pane.pane)) return false
     if (personaLatchedNow(key) || life?.hasWaited(key) || (life && !life.active(key))) return false
+    const final = await readPersonaOwnRow(key, { site: 'startup answer', what: 'before Enter' })
+    if (final.kind !== OWN_ROW_READ_ROW || final.latched || final.row.labels?.tag_prompt !== '1' || final.row.state !== 'pending' ||
+        final.row.launch_started_at !== status.row.launch_started_at || personaLatchedNow(key) ||
+        isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||
+        life?.hasWaited(key) || (life && (!life.active(key) || life.owner(key) !== 'startup'))) return false
     await work()
     return true
   } finally { release?.() }
@@ -4896,8 +4923,8 @@ function approverRowRefusal(start: ApproverStart): string | undefined {
   }
 }
 
-/** Every pre-SessionStart dialog the approver answers (option 1 pre-selected; Enter accepts). Both kept: a folder-trust prompt can follow a `pre_trust` of `skipped` or `failed`. */
-const PRE_SESSION_DIALOG_NEEDLES = [TRUST_DIALOG_NEEDLE, DEV_CHANNELS_DIALOG_NEEDLE]
+/** b.omv SR-7.5: only folder trust is answered; it may follow skipped/failed pre-trust. */
+const PRE_SESSION_DIALOG_NEEDLES = [TRUST_DIALOG_NEEDLE]
 
 /**
  * One armed time limit of an approver (B, or the cap): its reason, where B
@@ -5721,6 +5748,7 @@ const DIALOG_NEEDLES = [
   'Enter to select',
   'Enter to confirm',
   ...PRE_SESSION_DIALOG_NEEDLES,
+  DEV_CHANNELS_DIALOG_NEEDLE, // b.omv SR-7.5: detect, never approve.
 ].map((needle) => needle.toLowerCase())
 
 /** What a pane read from a `working` row shows (b.f2b). */
@@ -8811,6 +8839,14 @@ async function waitForWorkingRow(
       continue
     }
     if (waitMustEnd(key, wait)) return endWait(ref, wait)
+    // b.omv SR-7.6: status has no provenance; read the current row before any old-row action.
+    const upgrade = await inspectPersonaUpgrade(key, config.personas.find(p => p.key === key), true)
+    if (waitMustEnd(key, wait)) return endWait(ref, wait)
+    if (upgrade === 'replacing') return 'transient'
+    if (upgrade !== 'current' && !AGENT_DIRECTOR_DEAD_STATES.has(state)) {
+      await sleepUnlessCancelled(wait, pollIntervalMs)
+      continue
+    }
     // b.f2b: a run of deferrals on the `working` row ends with any other state.
     if (state !== 'working') endWorkingRowDeferral(key)
 
@@ -9303,6 +9339,7 @@ function buildSpawnParams(persona: Persona, config: PersonaConfig, configDirLabe
     tmux_session_name: personaTmuxSessionName(key),
     label: [
       SERVICE_LABEL,
+      'tag_prompt=1', // b.omv SR-7.6: every plain and reuse spawn.
       `${PERSONA_LABEL_PREFIX}${key}`,
       `${CONFIG_DIR_LABEL_PREFIX}${configDirLabel}`,
     ],
@@ -9523,6 +9560,8 @@ function personaKillStopCause(key: string): string {
 
 /** What `retryPersonaKill` is given. */
 export interface PersonaKillRetryOptions {
+  /** b.omv SR-7.6: stop between tries if the row becomes busy or is upgraded. */
+  readonly tagUpgrade?: boolean
   /** True when the path read the row in a live state: each try is a tmux-touching kill (`AdKillCall`). */
   readonly rowReadLive: boolean
   /** The row state the path last read (`src/kill-retry.ts`'s seed): only a live one gets the tries. */
@@ -9583,16 +9622,27 @@ const KILL_RETRY_READ_WHAT = 'status read between kill tries'
  */
 export async function retryPersonaKill(key: string, options: PersonaKillRetryOptions): Promise<KillRetryResult> {
   const call = adKillCall(options.rowReadLive)
+  let upgradeEligible = true
   // b.4q8: CSCB's own kill of the persona's row is no failed resume.
   const result = await withResumeHeldForOwnKill(key, () =>
     runKillRetry({
       instanceId: personaInstanceId(key),
       kill: () =>
         killPersonaInstance(key, { context: KILL_CONTEXT_ATTEMPT, rowReadLive: options.rowReadLive, deferUnavailableReport: true }),
-      read: () => readPersonaKillRow(key, options.site, options.ref),
+      read: async () => {
+        if (!options.tagUpgrade) return readPersonaKillRow(key, options.site, options.ref)
+        const read = await readPersonaOwnRow(key, { site: options.site, what: KILL_RETRY_READ_WHAT, ref: options.ref })
+        if (read.kind === OWN_ROW_READ_ROW && !read.latched) {
+          upgradeEligible = read.row.labels?.tag_prompt !== '1' && ['waiting', 'pending', 'ask_user'].includes(read.row.state)
+          return { kind: KILL_RETRY_READ_STATE, state: read.row.state }
+        }
+        if (read.kind === OWN_ROW_READ_ABSENT) return { kind: KILL_RETRY_READ_NO_ROW }
+        if (read.kind === OWN_ROW_READ_LATCHED || (read.kind === OWN_ROW_READ_ROW && read.latched)) return { kind: KILL_RETRY_READ_LATCHED }
+        return { kind: KILL_RETRY_READ_FAILED, error: read.kind === OWN_ROW_READ_REFUSED ? read.error : undefined }
+      },
       wait: options.clock,
       lastRead: options.lastRead,
-      keepGoing: () => personaKillKeepsGoing(key) && (options.keepGoing === undefined || options.keepGoing() === true),
+      keepGoing: () => upgradeEligible && personaKillKeepsGoing(key) && (options.keepGoing === undefined || options.keepGoing() === true),
       log: (line) => console.error(line),
       logPrefix: `[slack] ${options.site}`,
     }),
@@ -10266,6 +10316,8 @@ export async function plainSpawnOutcomeAt<R>(site: PlainSpawnSite<R>): Promise<S
   try {
     launched = await launchCallWithWindow(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
   } catch (err) {
+    const promptFailure = promptFailureResult(key, err)
+    if (promptFailure) { undoPreLaunchReplyGuard(replyGuardUndo, ref); return promptFailure }
     if (isAdErrorInstance(err, ErrInstanceIdCollision)) {
       // b.av2 SR-9.4: a collision means an instance already exists, so this
       // spawn's reply-guard steps are undone; any later launch runs them again.
@@ -11078,6 +11130,7 @@ function startRecoverySequence(
   lastRead: LatchRowState,
   keepsConversation: boolean,
   retiredKey: boolean,
+  tagUpgrade = false,
 ): { startAnswer: LiveRowSequenceStartEntryAnswer; action: 'held' | 'sequence-waiting'; result: SpawnPersonaResult } {
   const { persona, ref } = run
   const { key } = persona
@@ -11089,6 +11142,7 @@ function startRecoverySequence(
     entryStep: LIVE_ROW_SEQUENCE_ENTRY_KILL,
     keepsConversation,
     retiredKey,
+    tagUpgrade,
     retiredAtStart: run.retiredAtStart,
     launches: true,
     alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
@@ -11149,7 +11203,7 @@ async function replacePersonaRow(
     )
   }
   const retired = retiredKey ?? retiredKeyReadingOf(key).recorded
-  const { startAnswer, action, result } = startRecoverySequence(run, lastRead, false, retired)
+  const { startAnswer, action, result } = startRecoverySequence(run, lastRead, false, retired, replacing === TAG_UPGRADE_WHY)
   console.error(
     `[slack] spawnForPersona: replacing the row of ${ref} (${replacing}; last read ${describeLatchRowState(lastRead)}): a live row goes through the live-row sequence first${retired ? ' (its key is retired)' : ''}, which ends in a reuse spawn of the same id; start answered ${startAnswer} — answering ${action}; no other call, nothing counted (b.jg5 SRJ-707, SRJ-705, SRJ-706${retired ? ', SRJ-805' : ''})`,
   )
@@ -11544,6 +11598,7 @@ async function resumeOrFreshSpawn(
   // A key read recorded above whose entry was cleared during the sweep
   // (SRJ-807) still takes the `resume_enabled` false step.
   if (config.resume_enabled === false) return resumeDisabledAtResumeSite(run, lastRead, deadEvidence)
+  if (!configDir.tagPrompt) return replaceAtResumeSite(run, lastRead, TAG_UPGRADE_WHY, deadEvidence)
   if (!configDir.configDirMatches) {
     console.error(`[slack] spawnForPersona: ${configDirMismatchText(persona, ref, configDir)} — not resuming; replacing its row by a reuse spawn of the same id`)
     return replaceAtResumeSite(run, lastRead, CONFIG_DIR_MISMATCH_WHY, deadEvidence)
@@ -11786,6 +11841,8 @@ async function resumeAtSite<R>(site: ResumeSite<R>): Promise<SpawnPersonaResult 
     afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_RESUME, launched)
     return { key, action: 'resumed' }
   } catch (err) {
+    const promptFailure = promptFailureResult(key, err)
+    if (promptFailure) return promptFailure
     // b.jg5 SRJ-506: a latch re-check's retry whose answer is definite clears
     // the latch before the answer's own row (the no-transcript reuse, the
     // spawn after ErrSpawnNotFound, a counted failure) is handled.
@@ -12435,6 +12492,8 @@ function pendingRowNotCoveredWhy(reason: PendingRowNotCoveredReason): string {
       return `${RETIRED_KEY_WHY} and no new life has begun yet, so the row is the old life`
     case PENDING_ROW_REASON_CWD_MISMATCH:
       return CWD_MISMATCH_WHY
+    case PENDING_ROW_REASON_TAG_PROMPT_MISSING:
+      return TAG_UPGRADE_WHY
     case PENDING_ROW_REASON_CONFIG_DIR_MISMATCH:
       return CONFIG_DIR_MISMATCH_WHY
   }
@@ -12758,6 +12817,7 @@ export async function readAndStepPendingRow(persona: Persona): Promise<PendingRo
         latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE),
         false,
         cover.reason === PENDING_ROW_REASON_RETIRED_OLD_LIFE,
+        row.labels?.tag_prompt !== '1',
       )
       console.error(`${PENDING_ROW_STEP_LOG_PREFIX} ${ref}'s live-row sequence start answered ${startAnswer}; no other call, nothing counted (b.jg5 SRJ-411, SRJ-706)`)
       return { kind: PENDING_ROW_NOT_COVERED, reason: cover.reason, startAnswer }
@@ -13864,11 +13924,65 @@ async function afterLaunchUnavailable(
         latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE),
         false,
         cover.reason === PENDING_ROW_REASON_RETIRED_OLD_LIFE,
+        row.labels?.tag_prompt !== '1',
       )
       log(readText, thisLaunchRow, launchUnavailableSequenceOutcome(cover.reason, startAnswer, result.action))
       return result
     }
   }
+}
+
+// b.omv SR-7.6: provenance is durable in AD; this set is only an observation for E5.
+export const TAG_UPGRADE_WHY = 'tag_prompt marker missing (b.omv SR-7.6)'
+const tagUpgradeCandidates = new Set<string>()
+const tagUpgradeReads = new Map<string, Promise<TagUpgradeInspection>>()
+export function isTagUpgradePending(key: string): boolean { return tagUpgradeCandidates.has(key) }
+function noteTagPromptReading(key: string, row: Pick<GetResult, 'labels'>): boolean {
+  const missing = row.labels?.tag_prompt !== '1'
+  if (missing) tagUpgradeCandidates.add(key)
+  else tagUpgradeCandidates.delete(key)
+  return missing
+}
+export type TagUpgradeInspection = 'current' | 'deferred' | 'replacing' | 'unreadable'
+/** Shared reader for health/restart and E5. It always re-reads provenance before replacement. */
+export function inspectPersonaUpgrade(
+  key: string,
+  persona: Persona | undefined = configuredPersonaForDelivery(key),
+  withinOwnLaunch = false,
+): Promise<TagUpgradeInspection> {
+  const running = tagUpgradeReads.get(key)
+  if (running) return running
+  const promise = (async (): Promise<TagUpgradeInspection> => {
+    if (personaLatchedNow(key) || heldGateReadingOf(key) !== undefined || isKnownUnapplied(key)) return 'unreadable'
+    if ((!withinOwnLaunch && isLaunchInFlight(key)) || isLiveRowSequenceRunning(key)) return 'deferred'
+    const read = await readPersonaOwnRow(key, { site: 'tag upgrade', what: 'fresh get' })
+    if (read.kind !== OWN_ROW_READ_ROW || read.latched) return 'unreadable'
+    if (!noteTagPromptReading(key, read.row)) return 'current'
+    if (AGENT_DIRECTOR_DEAD_STATES.has(read.row.state)) return 'current'
+    if (persona === undefined || !['waiting', 'pending', 'ask_user'].includes(read.row.state)) return 'deferred'
+    const configDir = checkLaunchConfigDir(persona)
+    if (!configDir.ok) { deferLaunchForConfigDir(persona, configDir); return 'deferred' }
+    const comparison = compareRowToPersona(read.row, persona, spawnHomeDir())
+    if (comparison.cwdCheckDeferred) return 'deferred'
+    if (isKnownUnapplied(key) || personaLatchedNow(key) || heldGateReadingOf(key) !== undefined ||
+        (deliveryLifecycle && (!deliveryLifecycle.active(key) || deliveryLifecycle.owner(key) !== 'free'))) return 'deferred'
+    const { startAnswer } = startRecoverySequence({ persona, ref: personaRef(persona) }, latchRowStateRead(read.row.state), false, false, true)
+    return startAnswer === LIVE_ROW_START_STARTED || startAnswer === LIVE_ROW_START_ALREADY_RUNNING ? 'replacing' : 'deferred'
+  })()
+  tagUpgradeReads.set(key, promise)
+  void promise.finally(() => { if (tagUpgradeReads.get(key) === promise) tagUpgradeReads.delete(key) }).catch(() => {})
+  return promise
+}
+
+// b.omv SR-7.2: fail closed before every actual launch, including a reuse and resume.
+let systemPromptPreparer: ((key: string) => void) | undefined
+export function setSystemPromptPreparer(prepare: ((key: string) => void) | undefined): void {
+  systemPromptPreparer = prepare
+}
+class SystemPromptPreparationError extends Error {}
+function promptFailureResult(key: string, err: unknown): SpawnPersonaResult | undefined {
+  if (!(err instanceof SystemPromptPreparationError)) return undefined
+  return { key, action: SPAWN_ACTION_RETRYING }
 }
 
 // ---------------------------------------------------------------------------
@@ -13981,8 +14095,11 @@ function launchWithReplyGuard<T>(
   verb: 'spawn' | 'resume',
   call: (client: Client) => Promise<T>,
 ): Promise<T> {
-  runPreLaunchReplyGuard(persona, ref)
-  return launchCallWithWindow(persona.key, persona.working_directory, verb, call)
+  const undo = runPreLaunchReplyGuard(persona, ref)
+  return launchCallWithWindow(persona.key, persona.working_directory, verb, call).catch(err => {
+    if (err instanceof SystemPromptPreparationError) undoPreLaunchReplyGuard(undo, ref)
+    throw err
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -14206,6 +14323,12 @@ async function launchCallWithWindow<T>(
   verb: 'spawn' | 'resume',
   call: (client: Client) => Promise<T>,
 ): Promise<T> {
+  try {
+    systemPromptPreparer?.(key)
+  } catch (err) {
+    reportSystemPromptFailureAtSite(key, err)
+    throw new SystemPromptPreparationError('system-prompt-unwritable')
+  }
   deliveryLifecycle?.beforeLaunch(key)
   const keptThisLaunchRow = thisLaunchRows.get(key)
   const keptOwnLaunch = ownLaunches.get(key)
@@ -14389,6 +14512,8 @@ const inFlightLaunches = new Map<string, Promise<SpawnPersonaResult>>()
  */
 export function _resetInFlightLaunches(): void {
   inFlightLaunches.clear()
+  tagUpgradeCandidates.clear()
+  tagUpgradeReads.clear()
   cancelledLaunchWaits.clear()
   launchCallWindows.clear()
   thisLaunchRows.clear()
@@ -15497,6 +15622,19 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
   // through the live-row sequence, then a reuse spawn; a finished row by a
   // reuse spawn (the replace step, b.jg5 SRJ-707).
   const comparison = compareRowToPersona(row, persona, spawnHomeDir())
+  noteTagPromptReading(key, row)
+  if (!comparison.tagPrompt && (AGENT_DIRECTOR_DEAD_STATES.has(state) || ['waiting', 'pending', 'ask_user'].includes(state))) {
+    return replacePersonaRow(run, lastRead, TAG_UPGRADE_WHY)
+  }
+  if (!comparison.tagPrompt) {
+    // b.omv SR-7.6: working/check_permission wait for a fresh eligible read.
+    hooks?.onWorkingRowWait?.()
+    const waited = await waitForWaitingAndReconnectWithCause(key, config, ref)
+    if (waited.outcome === 'dead-session') return ladderGetThenAct(run)
+    if (waited.outcome === WAIT_OUTCOME_LATCHED) return { key, action: 'latched' }
+    if (waited.stopping) return { key, action: 'failed', stopping: true }
+    return { key, action: isLiveRowSequenceRunning(key) ? 'sequence-waiting' : SPAWN_ACTION_RETRYING }
+  }
   if (!comparison.cwdMatches) {
     if (comparison.cwdCheckDeferred) {
       // b.av2 SR-6.4: neither the working directory nor the row's cwd has a
@@ -15794,6 +15932,8 @@ export async function reuseSpawnForPersona(
   try {
     launched = await launchCallWithWindow(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
   } catch (err) {
+    const promptFailure = promptFailureResult(key, err)
+    if (promptFailure) { undoPreLaunchReplyGuard(replyGuardUndo, ref); return promptFailure }
     if (options.firstLaunch === true && isAdErrorInstance(err, ErrInstanceIdCollision)) undoPreLaunchReplyGuard(replyGuardUndo, ref)
     // b.jg5 SRJ-506: a latch re-check's retry whose answer is definite clears
     // the latch before the answer's class handling.
@@ -17136,6 +17276,7 @@ export function buildLiveRowSequenceDeps(input: LiveRowSequenceDepsInput): LiveR
     runFindMissing: (key, instanceId, stateBefore) => runSequenceFindMissing(key, instanceId, stateBefore),
     killWithRetry: (key, options) =>
       retryPersonaKill(key, {
+        tagUpgrade: options.tagUpgrade,
         rowReadLive: true,
         lastRead:
           options.lastReadState === LIVE_ROW_SEQUENCE_NO_ROW ? KILL_RETRY_SEED_NOT_LIVE_VALUE : killRetrySeedOfState(options.lastReadState),
@@ -17163,7 +17304,7 @@ export function buildLiveRowSequenceDeps(input: LiveRowSequenceDepsInput): LiveR
         // b.av2 SR-6.4: a `cwd` check that cannot be made now is no mismatch.
         cwdMatches: comparison.cwdMatches || comparison.cwdCheckDeferred,
         // Bug b.g57: an unresolvable directory gives no verdict; the launch's own check holds it.
-        configDirMatches: !comparison.configDirResolved || comparison.configDirMatches === true,
+        configDirMatches: comparison.tagPrompt && (!comparison.configDirResolved || comparison.configDirMatches === true),
       }
     },
     launch: async (key, kind, lastRead, ref, stop, retiredAtStart, belowCapAtStart) => {
@@ -21183,7 +21324,7 @@ async function latchRecheckLaunch(
   found: { readonly persona: Persona; readonly config: PersonaConfig },
   ref: string,
   lastRead: LatchRowState,
-  deps: Pick<LatchRecheckRoundDeps, 'canRelaunch' | 'isAtCap'>,
+  deps: Pick<LatchRecheckRoundDeps, 'canRelaunch' | 'isAtCap' | 'latch'>,
 ): Promise<string> {
   const { persona, config } = found
   const { key } = persona
@@ -21217,7 +21358,7 @@ async function latchRecheckLaunch(
   forgetWorkingRowEvidence(key)
   endWorkingRowDeferral(key)
   endPromptRowDeferral(key)
-  const launch = runInAttempt(key, 'launch', () => latchRecheckLaunchCall(call, found, ref, params, lastRead))
+  const launch = runInAttempt(key, 'launch', () => latchRecheckLaunchCall(call, found, ref, params, lastRead, deps.latch))
   inFlightLaunches.set(key, launch)
   try {
     const result = await launch
@@ -21261,6 +21402,7 @@ async function latchRecheckLaunchCall(
   ref: string,
   params: SpawnParams,
   lastRead: LatchRowState,
+  latch: Pick<ConflictLatch, 'addSetObserver'>,
 ): Promise<SpawnPersonaResult> {
   const { persona, config } = found
   const { key } = persona
@@ -21282,6 +21424,38 @@ async function latchRecheckLaunchCall(
       spawnedLine: () => `[slack] ${LATCH_RECHECK_SITE}: ${LATCH_RECHECK_PLAIN_SPAWN_WHAT} of ${ref} was not refused — spawned`,
       collided: () => Promise.resolve(latchRecheckCollided(key, ref, LATCH_RECHECK_PLAIN_SPAWN_WHAT)),
     })
+  }
+  // b.omv SR-7.6: a latch retry also cannot restore an old conversation.
+  // b.jg5 SRJ-502/505: this retry starts latched, so observe new sets while
+  // its provenance read is in flight, including a same-case set that keeps
+  // the existing record. Neither that refusal nor this read's own latch may
+  // be cleared by a subsequent launch's success.
+  let relatched = false
+  let removeObserver: () => void
+  try {
+    removeObserver = latch.addSetObserver(event => { if (event.key === key) relatched = true })
+  } catch (err) {
+    console.error(`[slack] ${LATCH_RECHECK_SITE}: could not observe latch changes before the resume of ${ref}: ${describeThrownValue(err)} — no launch is made; the persona stays latched (b.jg5 SRJ-502, SRJ-505)`)
+    return { key, action: SPAWN_ACTION_RETRYING }
+  }
+  let provenance: OwnRowRead
+  try {
+    provenance = await readPersonaOwnRow(key, { site: LATCH_RECHECK_SITE, what: 'before resume', ref })
+  } finally {
+    try { removeObserver() } catch { /* the observer only records sets during this read */ }
+  }
+  if (relatched || (provenance.kind === OWN_ROW_READ_ROW && provenance.latched)) return { key, action: 'latched' }
+  if (provenance.kind === OWN_ROW_READ_ROW) {
+    if (!noteTagPromptReading(key, provenance.row)) {
+      // The shared resume handler below keeps its existing outcome table.
+    } else if (AGENT_DIRECTOR_DEAD_STATES.has(provenance.row.state)) {
+      const reused = await reuseSpawnForPersona(persona, config, { isStartup: false, lastRead: latchRowStateRead(provenance.row.state) })
+      return isReuseSpawnCollided(reused) ? latchRecheckCollided(key, ref, REUSE_SPAWN_WHAT) : reused
+    } else {
+      return { key, action: SPAWN_ACTION_RETRYING }
+    }
+  } else if (provenance.kind !== OWN_ROW_READ_ABSENT) {
+    return { key, action: SPAWN_ACTION_RETRYING }
   }
   return resumeAtSite<SpawnPersonaResult>({
     persona,

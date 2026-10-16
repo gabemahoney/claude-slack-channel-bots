@@ -6,6 +6,12 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+### Earlier-release bots start a fresh conversation once (breaking)
+
+Every earlier-release bot starts a fresh conversation once at upgrade, including existing personas. Memory files are kept; the old conversation context is not retained. Later restarts resume the marked replacement under the normal resume conditions. Follow the maintained [switch-over step 10](docs/migration.md#step-10-start-the-new-cscb) for the row checks and verification.
+
+Every new conversation carries `tag_prompt=1` and loads the shared composed prompt, `bot-system-prompt.md`, with CSCB's tag description and the applicable operator text. CSCB regenerates it before every spawn, reuse and resume; a failed write blocks that launch until a retry succeeds. The launch uses one `--append-system-prompt-file` in every prompt mode.
+
 ---
 
 ## 0.16.1 (2026-10-14)

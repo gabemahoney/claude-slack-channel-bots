@@ -150,7 +150,7 @@
 #   9   the no-agents-restarted substitution.
 #   10  the new CSCB started live through the CLI at the install path,
 #       against the Slack stub, each persona's working directory in the
-#       stub's dev-channels mode; each persona's row reads waiting within B,
+#       stub's startup-trust mode; each persona's row reads waiting within B,
 #       CSCB's launch bound as the installed build computes it from the
 #       settings step 8 recorded. The launch-start check: `agent-director list
 #       --state pending`, through the harness call from a subshell of the
@@ -191,7 +191,7 @@
 #     start pass counts every persona fresh-spawned and none resumed;
 #   - pre-persona rows are kept and never resumed: no CSCB call names a
 #     seeded instance id, and each seeded row is present (any state);
-#   - each persona's dev-channels dialog is cleared through agent-director:
+#   - each persona's startup-trust dialog is cleared through agent-director:
 #     read-pane and send-keys calls naming its own row, made by the bot
 #     server, before the row read waiting;
 #   - no unknown or UNAVAILABLE error leads to a delete, kill or respawn: no
@@ -218,7 +218,7 @@
 # background, while the harness reads each persona's row (`status`, from the
 # scenario's shell) until it reads waiting; clean_restart's own pause and kill
 # are expected. Each persona's working directory stays in the stub's
-# dev-channels mode, so the resume lap shows the dialog again. The bound B_R
+# startup-trust mode, so the resume lap shows the dialog again. The bound B_R
 # on each row reading waiting after clean_restart ends is the stopping window
 # and G as step 1 recorded them (`tmux.stopping_window_seconds`, `grace_ms`)
 # plus one health tick (config.json's health_check_interval). clean_restart
@@ -1445,6 +1445,37 @@ grep -qF 'agent-director install check: FAILED (ad-system-install-too-old)' "${S
     || fail "step 7: the failed check printed no install diagnostic"
 record "install check refuses the pre-0.12 install (exit ${rc}); step 8 installs the release"
 
+# E4_EARLIER_RELEASE_PROVENANCE
+# b.omv SR-7.6/SR-13.6: create real 0.10.0 worker conversations, with persona
+# identity but no tag_prompt and no appended system prompt. Merely relabelling
+# a current-build conversation would not establish earlier-release provenance.
+declare -A E4_OLD_SESSION=() E4_MEMORY=()
+for cid in "${CHANNELS[@]}"; do
+    name="${PERSONA_OF[${cid}]}"
+    key="$(persona_key "${name}")"
+    id="cscb_${key}"
+    mapfile -t e4_labels < <(CSCB_PKG_DIR="${CSCB_PKG_DIR}" bun --no-install "${SCENARIO_FIXTURES}/fmk-texts.ts" personaDefaultConfigDirLabels "${key}" "${HOME}")
+    e4_old_labels=()
+    for e4_label in "${e4_labels[@]}"; do
+        [[ "${e4_label}" == tag_prompt=* ]] || e4_old_labels+=("${e4_label}")
+    done
+    stub_mode "${WORKDIR_OF[${name}]}" "${STUB_MODE_AT_ONCE}"
+    seed_010_row "${id}" "slack_bot_${key}" "${WORKDIR_OF[${name}]}" "${e4_old_labels[@]}" > "${SCENARIO_ROOT}/e4-seed-${key}"
+    row_get "E4 earlier-release provenance" "${id}"
+    jq -e --arg args_key "${SCENARIO_AD_ARGS_KEY}" \
+        '.labels.tag_prompt == null and (.[$args_key] | type == "array" and (index("--append-system-prompt-file") | not))' "${AD_OUT}" >/dev/null \
+        || fail "E4: seed ${id} unexpectedly has the current contract"
+    E4_OLD_SESSION["${id}"]="$(jq -er --arg session_key "${SCENARIO_AD_SESSION_KEY}" '.[$session_key] | select(type == "string" and length > 0)' "${AD_OUT}")" \
+        || fail "E4: seed ${id} has no earlier-release conversation id"
+    E4_MEMORY["${id}"]="${HOME}/.claude/projects/${WORKDIR_OF[${name}]//\//-}/memory/MEMORY.md"
+    mkdir -p "$(dirname "${E4_MEMORY[${id}]}")"
+    printf 'Retained earlier-release memory for %s\n' "${id}" | write_file "${E4_MEMORY[${id}]}" 0600
+    cp -- "${E4_MEMORY[${id}]}" "${SCENARIO_ROOT}/e4-memory-${key}.before"
+    stub_type_exit "slack_bot_${key}"
+    wait_until "${SCENARIO_SEED_REPORT_S}" "E4: seed ${id} never ended" row_state_is "${id}" ended missing
+    record "E4: genuine ${SCENARIO_AD_010_VERSION} markerless conversation ${E4_OLD_SESSION[${id}]} seeded for ${id} without an appended prompt; memory saved"
+done
+
 # ---------------------------------------------------------------------------
 # Step 8
 # ---------------------------------------------------------------------------
@@ -1538,12 +1569,13 @@ runbook_substitute 9 no-agents-restarted "no other agent runs in the container, 
 # ---------------------------------------------------------------------------
 # Step 10
 # ---------------------------------------------------------------------------
+# E4_FRESH_UPGRADE_REPLACEMENT
 
 runbook_step 10
 runbook_substitute 10 prompt-wording-skipped "the orchestrator prompt's worker-cleanup wording is skipped"
 for cid in "${CHANNELS[@]}"; do
     name="${PERSONA_OF[${cid}]}"
-    stub_mode "${WORKDIR_OF[${name}]}" "${STUB_MODE_DEV_CHANNELS}"
+    stub_mode "${WORKDIR_OF[${name}]}" "${STUB_MODE_STARTUP_TRUST}"
     # src/persona-identity.ts personaInstanceId.
     PERSONA_IDS+=("cscb_$(persona_key "${name}")")
 done
@@ -1712,22 +1744,29 @@ leg_a_window
 for i in "${!PERSONA_IDS[@]}"; do
     id="${PERSONA_IDS[i]}"
     name="${PERSONA_OF[${CHANNELS[i]}]}"
-    # Exactly one plain spawn, no reuse, no resume, no second launch.
+    # One colliding plain spawn and one fresh reuse of the old conversation; no resume.
     calls_naming "${LEG_A_LOG}" spawn "${id}" "${SCENARIO_ROOT}/leg-a-spawn"
     calls_naming "${LEG_A_LOG}" resume "${id}" "${SCENARIO_ROOT}/leg-a-resume"
     n="$(line_count "${SCENARIO_ROOT}/leg-a-spawn")"
-    [[ "${n}" == 1 ]] || fail "leg A: persona ${name} (${id}) has ${n} spawn(s) by CSCB, not one fresh start"
+    [[ "${n}" == 2 ]] || fail "leg A: persona ${name} (${id}) has ${n} spawn calls, expected one collision and one reuse"
     [[ "$(line_count "${SCENARIO_ROOT}/leg-a-resume")" == 0 ]] || fail "leg A: persona ${name} (${id}) was resumed"
-    if ! _scenario_split_line "$(cat "${SCENARIO_ROOT}/leg-a-spawn")" || ! _scenario_decode_words; then
+    if ! _scenario_split_line "$(tail -n 1 "${SCENARIO_ROOT}/leg-a-spawn")" || ! _scenario_decode_words; then
         fail "leg A: persona ${name}'s spawn line does not parse"
     fi
     _scenario_ad_verb
+    e4_reuse=0
     for a in ${_L_ARGS[@]+"${_L_ARGS[@]}"}; do
-        # src/ad-phase1-types.ts: a reuse spawn's flag.
-        [[ "${a}" != --reuse-finished* ]] || fail "leg A: persona ${name} (${id}) was spawned with ${a}, not a plain spawn"
+        [[ "${a}" == --reuse-finished* ]] && e4_reuse=1
     done
+    (( e4_reuse == 1 )) || fail "E4: ${id} was not freshly replaced by reuse"
     [[ "${_L_PPID}" == "${SERVER_PID}" ]] || fail "leg A: persona ${name}'s spawn has parent ${_L_PPID}, not the bot server ${SERVER_PID}"
-    # Its dev-channels dialog cleared through agent-director, before it read waiting.
+    row_get "E4 replacement" "${id}"
+    jq -e '.labels.tag_prompt == "1"' "${AD_OUT}" >/dev/null || fail "E4: replacement ${id} lacks tag_prompt=1"
+    e4_new_session="$(jq -er '.session_id | select(length > 0)' "${AD_OUT}")"
+    [[ "${e4_new_session}" != "${E4_OLD_SESSION[${id}]}" ]] || fail "E4: ${id} resumed its earlier-release conversation"
+    key="$(persona_key "${name}")"
+    cmp -s -- "${E4_MEMORY[${id}]}" "${SCENARIO_ROOT}/e4-memory-${key}.before" || fail "E4: ${id}'s memory bytes changed"
+    # Its startup-trust dialog cleared through agent-director, before it read waiting.
     for verb in read-pane send-keys; do
         calls_naming "${LEG_A_LOG}" "${verb}" "${id}" "${SCENARIO_ROOT}/leg-a-${verb}"
         cleared=0
@@ -1764,7 +1803,7 @@ for verb in spawn resume; do
     cscb_lines "${LEG_A_LOG}" "${verb}" "${SCENARIO_ROOT}/leg-a-all-${verb}"
     launches=$(( launches + $(line_count "${SCENARIO_ROOT}/leg-a-all-${verb}") ))
 done
-(( launches == ${#PERSONA_IDS[@]} )) || fail "leg A: CSCB made ${launches} launch(es), not one per persona (${#PERSONA_IDS[@]})"
+(( launches == 2 * ${#PERSONA_IDS[@]} )) || fail "leg A: CSCB made ${launches} launch(es), not one collision plus one fresh reuse per persona (${#PERSONA_IDS[@]})"
 # No persona reaches the restart cap.
 for m in '[slack] Cap reached for persona=' 'the persona is at the restart cap' 'is at cap — skipping tick'; do
     if (( $(count_log "${m}") > 0 )); then
@@ -1793,6 +1832,7 @@ runbook_substitute 11 expire-skipped "the daily agent-director expire schedule i
 runbook_substitute 11 prompt-wording-skipped "the orchestrator prompt's hold-until-after wording (§6) is skipped"
 
 # ---------------------------------------------------------------------------
+# E4_LATER_MARKED_RESUME
 # Leg B: a clean_restart on Phase 1
 # ---------------------------------------------------------------------------
 
@@ -1811,6 +1851,7 @@ declare -A SID_OF=()
 for i in "${!PERSONA_IDS[@]}"; do
     id="${PERSONA_IDS[i]}"
     row_get "leg B: before the restart" "${id}"
+    jq -e '.labels.tag_prompt == "1"' "${AD_OUT}" >/dev/null || fail "E4: later resume requires a marked replacement"
     SID_OF["${id}"]="$(jq -r '.session_id // empty' "${AD_OUT}")"
     [[ -n "${SID_OF[${id}]}" ]] || fail "leg B: before the restart, row ${id} has no session_id"
     record "leg B: row ${id} ($(jq -r '.state' "${AD_OUT}")) holds conversation ${SID_OF[${id}]}"

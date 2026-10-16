@@ -82,10 +82,10 @@
 #   C1 work/c1, `at-once`; added by a confirmed reload while the settings file
 #      is refused (leg refused-stopping)
 #   C2 work/c2, `at-once`; the same in leg refused-grace
-#   T1 work/t1, `dev-channels` (reports in on the approver's Enter: a launch
+#   T1 work/t1, `startup-trust` (reports in on the approver's Enter: a launch
 #      that loses its create reply runs the stub in that mode, scenario.sh's
 #      seeding rules); added across a restart in leg call-timeout-30000
-#   T2 work/t2, `dev-channels`; the same in leg call-timeout-61000
+#   T2 work/t2, `startup-trust`; the same in leg call-timeout-61000
 #
 # Waits, all derived from the printer's values for the written table and the
 # overrides: G (adGraceMs, 30 s), B (adLaunchBoundMs: the greater of
@@ -993,7 +993,9 @@ WORK[c2]="$(make_workdir c2)"
 WORK[t1]="$(make_workdir t1)"
 WORK[t2]="$(make_workdir t2)"
 Q_HELD="$(make_workdir q_held)"
+stub_mode "${Q_HELD}" "${STUB_MODE_STARTUP_TRUST}"
 Q_READY="$(make_workdir q_ready)"
+stub_mode "${Q_READY}" "${STUB_MODE_STARTUP_TRUST}"
 WORK[q]="${SCENARIO_ROOT}/work/q_link"
 ln -s -- "${Q_HELD}" "${WORK[q]}" || fail "setup: could not link ${WORK[q]} to ${Q_HELD}"
 stub_mode "${WORK[s]}" "${STUB_MODE_LINGER_ON_EXIT}"
@@ -1005,8 +1007,8 @@ stub_mode "${WORK[c1]}" "${STUB_MODE_AT_ONCE}"
 stub_mode "${WORK[c2]}" "${STUB_MODE_AT_ONCE}"
 # A launch that loses its create reply (`slow-create`) waits for the
 # approver's Enter (scenario.sh's seeding rules, b.jg5 SRJ-1306).
-stub_mode "${WORK[t1]}" "${STUB_MODE_DEV_CHANNELS}"
-stub_mode "${WORK[t2]}" "${STUB_MODE_DEV_CHANNELS}"
+stub_mode "${WORK[t1]}" "${STUB_MODE_STARTUP_TRUST}"
+stub_mode "${WORK[t2]}" "${STUB_MODE_STARTUP_TRUST}"
 for x in s p q r c1 c2 t1 t2; do
     persona_files "${x}"
 done

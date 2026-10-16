@@ -220,7 +220,7 @@ export function pendingRowDialogPane(dialog: PendingRowDialog): string {
 
 /** Whether `dialog` is one the approver (and the lap) recognises, so an Enter clears it here. */
 function isKnownDialog(dialog: PendingRowDialog): boolean {
-  return dialog === PENDING_ROW_DIALOG_TRUST || dialog === PENDING_ROW_DIALOG_DEV_CHANNELS
+  return dialog === PENDING_ROW_DIALOG_TRUST
 }
 
 /**

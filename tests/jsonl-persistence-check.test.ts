@@ -608,11 +608,11 @@ describe('runJsonlPersistenceSafeguard — one pass per persona', () => {
 // ---------------------------------------------------------------------------
 
 describe('runJsonlPersistenceSafeguard — rows the collision ladder will replace', () => {
-  type RowKind = 'other-cwd' | 'empty-cwd' | 'absent-cwd' | 'no-label' | 'wrong-label' | 'matching' | 'symlinked-cwd'
+  type RowKind = 'markerless' | 'other-cwd' | 'empty-cwd' | 'absent-cwd' | 'no-label' | 'wrong-label' | 'matching' | 'symlinked-cwd'
   type Condition = 'fallback exists' | 'archived rows since spawn'
 
   /** The reason texts of the skip line (rowReplacementReason): one per guard. */
-  const SKIP_REASONS = ['differs from working_directory', 'config_dir label']
+  const SKIP_REASONS = ['differs from working_directory', 'config_dir label', 'tag_prompt']
 
   /** A persona whose working directory really exists, plus a sibling dir and a symlink to it. */
   function ladderFixture(): { config: PersonaConfig; persona: Persona; otherWork: string; link: string } {
@@ -631,6 +631,10 @@ describe('runJsonlPersistenceSafeguard — rows the collision ladder will replac
     const base = makeRow({ jsonl_path: STALE_PATH }, fx.persona)
     const { config_dir: _label, ...labelsWithout } = base.labels
     switch (kind) {
+      case 'markerless': {
+        const { tag_prompt: _old, ...labels } = base.labels
+        return { ...base, labels }
+      }
       case 'other-cwd':
         return { ...base, cwd: fx.otherWork }
       case 'empty-cwd':
@@ -677,6 +681,8 @@ describe('runJsonlPersistenceSafeguard — rows the collision ladder will replac
   }
 
   test.each([
+    ['markerless', 'fallback exists', 'tag_prompt'],
+    ['markerless', 'archived rows since spawn', 'tag_prompt'],
     ['other-cwd', 'fallback exists', 'differs from working_directory'],
     ['other-cwd', 'archived rows since spawn', 'differs from working_directory'],
     // No cwd on the row (empty or absent): printed as `<none>`.
@@ -1784,4 +1790,27 @@ describe('AC 20: jsonl-persistence-check lines carry no credential value', () =>
     expect(recorded.map(([key]) => key)).toEqual(failing === 'notify' ? ['jsonl-non-persistent'] : [])
     assertNoLeak({ errArgs, recorded })
   })
+})
+
+// b.omv SR-7.6: classification only; replacement execution belongs to upgrade-replacement.test.ts.
+test('a markerless persona is log-only while a marked neighbor still gets its genuine lost-history notice', async () => {
+  const config = makeMultiPersonaConfig([{ ...LAYER2_SPEC, name: 'old_bot' }, { ...LAYER2_SPEC, name: 'current_bot', working_directory: join(home, 'neighbor-work'), credentials_file: join(home, 'neighbor-credentials') }], makeTempDir())
+  const [old, current] = config.personas
+  const h = makeNotifierHarness(config), errors: string[] = [], lookedUp: string[] = []
+  const log = captureErrorLog()
+  await runJsonlPersistenceSafeguard(config, h.notifier.notify, {
+    readMountinfo: fixture(REALISTIC_MOUNTINFO), statFn: () => false, home, archiveCountSince: () => 4,
+    getRow: async key => {
+      lookedUp.push(key)
+      const row = makeRow({}, key === old!.key ? old! : current!)
+      if (key === old!.key) delete row.labels.tag_prompt
+      return row
+    },
+    recordStartupError: key => { errors.push(key) },
+  })
+  expect(lookedUp).toEqual([old!.key, current!.key])
+  expect(errors).toEqual(['jsonl-transcript-lost'])
+  expect(h.posts(old!.key)).toEqual([])
+  expect(h.posts(current!.key)).toHaveLength(1)
+  expect(log.filter(line => line.includes('tag_prompt'))).toHaveLength(1)
 })

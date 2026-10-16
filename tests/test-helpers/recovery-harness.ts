@@ -1912,6 +1912,8 @@ export interface RecoveryHarness {
    * the one member `main()` hands the reload controller. Answers the hold.
    */
   beginOldLifeHold(begin: OldLifeHoldBegin): OldLifeHold
+  /** Mark a held old row as a failed kill, as the old-life wait does. */
+  markOldLifeKillFailed(instanceId: string): boolean
   /**
    * Run the start sweep as `main()` runs it (`reconcileOrphans` over the
    * applied configuration on `killRetryClock`, driven with `drive`), its
@@ -3136,6 +3138,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       entryStep: request.entryStep ?? LIVE_ROW_SEQUENCE_ENTRY_KILL,
       keepsConversation: request.keepsConversation ?? false,
       retiredKey: request.retiredKey ?? false,
+      tagUpgrade: false,
       launches: request.launches ?? true,
       alertContext: request.alertContext ?? KILL_FAILURE_CONTEXT_RECOVERY,
       ...(request.retiredAtStart === undefined ? {} : { retiredAtStart: request.retiredAtStart }),
@@ -3356,6 +3359,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // As main() hands the reload controller the set (b.jg5 SRJ-809): apply
     // step 1 begins its holds through `begin` alone.
     beginOldLifeHold: (begin) => oldLifeHolds.begin(begin),
+    markOldLifeKillFailed: (instanceId) => oldLifeHolds.markKillFailed(instanceId),
     // As main() runs it (b.jg5 SRJ-714): over the applied configuration, on
     // the kill-retry clock, its shutdown query the shutting-down flag.
     startSweep: (isShuttingDown = () => shuttingDown) => drive(reconcileOrphans(appliedConfig(), killRetryClock, isShuttingDown)),

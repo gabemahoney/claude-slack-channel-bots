@@ -4079,7 +4079,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         state: 'ended',
         cwd: persona.working_directory,
         labels: {
-          service: 'cscb',
+          tag_prompt: '1', service: 'cscb',
           persona: personaKey(persona.name),
           [CONFIG_DIR_LABEL]: personaConfigDirLabelValue(persona.claude_config_dir, home),
         },

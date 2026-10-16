@@ -1167,41 +1167,19 @@ async function fetchSlackHostedFile(url: string, token: string): Promise<SlackFi
   }
 }
 
-/**
- * The MCP instructions handed to every bot instance. `createSessionServer`
- * passes this exact value as the server's `instructions`, so a test importing
- * it reads the string instances receive. The example tag's `source` is the MCP
- * server name (`MCP_SERVER_NAME`), which the Claude Code harness renders on
- * every delivered `<channel>` tag.
- */
+/** b.omv SR-7.3: every session receives the nine retained points in order. */
+export const MCP_INSTRUCTIONS_MAX_CHARS = 2048
 export const MCP_INSTRUCTIONS = [
-  'The sender reads Slack, not this session. Anything you want them to see must go through the reply tool.',
-  '',
-  `Messages from Slack arrive as <channel source="${MCP_SERVER_NAME}" chat_id="C..." message_id="1234567890.123456" user="display name" user_id="U..." thread_ts="..." ts="..." via="mention">.`,
-  'user_id is the author\'s Slack user ID. When a bot or integration without a user posted the message, the tag carries bot_id instead of user_id.',
-  'via says how the message reached you: dm (a direct message to you), mention (you were @mentioned), broadcast (@here or @channel), ' +
-    'receive_all_shared (a channel where you and at least one other persona receive every message), ' +
-    'receive_all (a channel where you alone receive every message).',
-  '<@ID> in message text mentions a Slack user or another persona. Mention another persona the same way, with <@ID>, to address it.',
-  'A message without via is an injected prompt (a scheduled prompt or an /interject message). It needs no reply unless it asks for one.',
-  'If the tag has attachment_count, call download_attachment(chat_id, message_id) to fetch them.',
-  'Reply with the reply tool — pass chat_id back. Use thread_ts to reply in a thread.',
-  'Where you may act: every channel message you receive comes from a channel you may act in. ' +
-    'With invited channels off, those are the channels your persona is configured into. ' +
-    'With invited channels on, they are any channel your persona\'s Slack app is a member of, and Slack refuses the others.',
-  `${SET_CHANNEL_DELIVERY_TOOL} sets how closely you listen in a channel: mentions (only @mentions of you and @here or @channel broadcasts) or all (every message). ` +
-    'Call it when someone in that channel asks for it. It works only with invited channels on.',
-  'When your persona\'s DMs are on, you may also reply in a DM conversation you are part of (a D... chat_id), ' +
-    'and use react, edit_message, fetch_messages and download_attachment there. ' +
-    'To start a DM, pass a user ID (U... or W...) as reply\'s chat_id: the server opens the conversation, ' +
-    'and the result names the conversation ID (D...) to use for later edits, reactions, reads and thread replies. ' +
-    'The other tools do not take a user ID.',
-  'When your persona\'s DMs are off, you have no DM target.',
-  'Any other target is refused with an error.',
-  'Pass message_id (the triggering message ts) to reply to automatically remove the ack reaction when done.',
-  'reply accepts file paths (files: ["/abs/path.png"]) for attachments.',
-  'Use react to add emoji reactions, edit_message to update a previously sent message.',
-  'fetch_messages pulls real Slack history from conversations.history.',
+  'The sender reads Slack. Answer with reply, using chat_id and thread_ts for a thread; terminal output is not seen there.',
+  'Messages arrive as the <channel> tag described in the system prompt, carrying channel_name and, for a long message, part.',
+  'via: dm = a direct message; mention = you were @mentioned; broadcast = @here or @channel; receive_all_shared = a channel where you and another persona receive every message; receive_all = a channel where only you receive every message.',
+  '<@ID> mentions a Slack user or persona. Use <@ID> to address another persona.',
+  'If attachment_count is present, use download_attachment(chat_id, message_id) to fetch attachments.',
+  'You may act in every channel you receive. With invited channels off, these are your configured channels; with it on, channels your Slack app belongs to (Slack refuses others).',
+  `${SET_CHANNEL_DELIVERY_TOOL} sets listening to mentions (@mentions and @here/@channel broadcasts) or all (every message). Use it when someone in that channel asks; it requires invited channels on.`,
+  'With DMs on, you may reply, react, edit_message, fetch_messages and download_attachment in a DM you belong to (D... chat_id). To start a DM, reply takes a user ID (U... or W...) as chat_id and returns the D... ID for later edits, reactions, reads and thread replies. Other tools take no user ID. With DMs off you have no DM target. Any other target is refused.',
+  'Pass message_id (the triggering message ts) to reply to remove the ack reaction.',
+  'reply accepts files: ["/abs/path.png"] for attachments. react adds emoji reactions; edit_message updates a sent message; fetch_messages reads real Slack history from conversations.history.',
 ].join('\n')
 
 /**
@@ -1220,7 +1198,6 @@ export function createSessionServer(
     { name: MCP_SERVER_NAME, version: '0.1.0' },
     {
       capabilities: {
-        experimental: { 'claude/channel': {} },
         tools: {},
       },
       instructions: MCP_INSTRUCTIONS,

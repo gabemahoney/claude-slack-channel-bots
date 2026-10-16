@@ -204,11 +204,16 @@ describe('server.ts installs the pre-launch reply guard with its state dir (b.av
     expect(SERVER_CODE).toMatch(/\bconst\s+STATE_DIR\s*=\s*resolveServerStateDir\s*\(\s*\)/)
   })
 
-  test('installs the reply guard exactly once, immediately after the trust patcher', () => {
-    // onlyCallArguments throws unless there is exactly one install.
+  test('installs trust, the shared prompt gate and the reply guard once in that order', () => {
     expect(() => onlyCallArguments(SERVER_CODE, 'setPreLaunchReplyGuard')).not.toThrow()
-    // Nothing but whitespace (and the statement's `;`) between the two installs.
-    expect(indicesOf(TRUST_THEN_GUARD, SERVER_CODE)).toHaveLength(1)
+    expect(() => onlyCallArguments(SERVER_CODE, 'setSystemPromptPreparer')).not.toThrow()
+    const trust = SERVER_CODE.indexOf('setPreLaunchTrustPatcher(trustPatchPersona)')
+    const prompt = SERVER_CODE.indexOf('setSystemPromptPreparer(prepareSystemPrompt)')
+    const guard = SERVER_CODE.indexOf('setPreLaunchReplyGuard(', prompt)
+    expect(trust).toBeGreaterThan(-1)
+    expect(prompt).toBeGreaterThan(trust)
+    expect(guard).toBeGreaterThan(prompt)
+    expect(SERVER_CODE).toContain("prepareSystemPrompt('server-start')")
   })
 
   test.each([

@@ -39,7 +39,7 @@ Save this to ~/.claude/slack-mcp.json:
 }
 
 Then launch Claude from a project directory with:
-  claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:slack-channel-router
+  claude --mcp-config ~/.claude/slack-mcp.json
 ```
 
 With `SLACK_DRY_RUN=1`, `[slack] Running in dry-run mode — Slack disabled` follows the persona count.

@@ -972,6 +972,11 @@ export function reportUnclassifiedAtSite(
   return armed
 }
 
+/** Prompt preparation refused a launch; existing retry backoff, no AD error episode (b.omv SR-7.2). */
+export function reportSystemPromptFailureAtSite(key: string, err: unknown): boolean {
+  return reportAttemptCause(key, { kind: 'system-prompt-unwritable', error: err }, undefined, deps?.triggerSink)
+}
+
 /**
  * reportReuseCollisionAtSite — a reuse spawn's second collision
  * (`ErrInstanceIdCollision`, b.jg5 SRJ-112, SRJ-301) at a launch site that

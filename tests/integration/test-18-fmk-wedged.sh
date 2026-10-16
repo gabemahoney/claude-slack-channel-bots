@@ -30,7 +30,7 @@
 #   stub (fixtures/slack-stub-server.ts, one for the script, every persona's
 #   token pair answered ok); posts are read from the stub's record;
 # - every persona has its own key, credentials, channel (its Slack
-#   destination) and directories, and every stub worker runs `dev-channels`
+#   destination) and directories, and every stub worker runs `startup-trust`
 #   (the approver's Enter makes it report in);
 # - the tmux shim: `log` while the personas are launched, `wedge` (its
 #   default delay, 60 s, longer than every tmux call timeout at
@@ -228,6 +228,7 @@ t18_persona() {
     printf -v "${p}_LABEL" '%s' "${SCENARIO_TAG}${short}1"
     printf -v "${p}_CHANNEL" '%s' "${channel}"
     work="$(make_workdir "${SCENARIO_TAG}${short}_work")"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     printf -v "${p}_WORK" '%s' "${work}"
     printf -v "${p}_CFG" '%s' "${CFG_ROOT}/${SCENARIO_TAG}${short}_cfg"
     key="$(persona_key "${SCENARIO_TAG}${short}")"
@@ -249,7 +250,7 @@ for t18_p in "${KEPT[@]}" "${ABSENT[@]}"; do
     t18_cfg_var="${t18_p}_CFG"
     t18_work_var="${t18_p}_WORK"
     mkdir -p "${!t18_cfg_var}"
-    stub_mode "${!t18_work_var}" "${STUB_MODE_DEV_CHANNELS}"
+    stub_mode "${!t18_work_var}" "${STUB_MODE_STARTUP_TRUST}"
     t18_bot="$(fake_token bot "${!t18_label_var}")"
     t18_app="$(fake_token app "${!t18_label_var}")"
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "${t18_bot}" "${t18_app}" \

@@ -1568,6 +1568,7 @@ EOF
 leg_tmux_and_store() {
     local step="tmux and store" work row_socket info sock_path store_id got
     work="$(make_workdir self-check)"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     ad_capture spawn --agent claude --cwd "${work}" --instance-id "${T0_ROW_ID}" \
         --tmux-session-name "${T0_SESSION}" --no-pre-trust --label "t0=spawned"
     if (( AD_RC != 0 )); then
@@ -1622,7 +1623,7 @@ leg_reinstall() {
     (( AD_RC == 0 )) || fail "${step}: cannot read the fixture before quiescence"
     work="$(jq -er '.cwd' "${AD_OUT}")"
     worker_pid="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${T0_SESSION}:" '#{pane_pid}')"
-    # The default stub waits at the dev-channels dialog. A kill while it is
+    # This fixture uses an explicit dialog mode. A kill while it is
     # pending leaves find-missing inside the 60 s launch grace, even once
     # the worker is gone. Complete startup before the bounded shutdown.
     stub_press_enter "${T0_SESSION}"
@@ -2111,6 +2112,7 @@ leg_live_start() {
     config_dir="${SCENARIO_ROOT}/claude-config"
     mkdir -p "${config_dir}"
     work="$(make_workdir live)"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
 
     # The Slack stub: one token pair, answered ok; any other refused.
     start_slack_stub "${SCENARIO_ROOT}/slack-stub" livev1
@@ -2198,6 +2200,7 @@ leg_mcp_session() {
     config_dir="${SCENARIO_ROOT}/claude-config-mcp"
     mkdir -p "${config_dir}"
     work="$(make_workdir mcp)"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     ref="$(persona_ref "${MCP_NAME}")"
     connected="$(matcher "[slack] Session connected: persona ${ref}")"
 
@@ -2417,17 +2420,29 @@ leg_stub_direct() {
     got="$("${SCENARIO_BIN}/claude" --version)" || fail "${step}: claude --version exited non-zero"
     [[ "${got}" == "2.1.280 (Claude Code)" ]] || fail "${step}: claude --version printed '${got}'"
 
-    # A directory with no selection: the dev-channels dialog, byte for byte,
-    # on its output and in its record of the dialogs it showed.
+    # A directory with no selection reports in immediately, with no dialog.
     dir="$(make_workdir stub-default)"
     (cd "${dir}" && exec "${SCENARIO_BIN}/claude" < /dev/null) > "${out}" 2> "${err}" &
     pid=$!
     wait "${pid}" || rc=$?
-    (( rc == 0 )) || fail "${step}: the stub in a directory with no selection exited ${rc}"
-    cmp -s -- "${fixture}" "${out}" || fail "${step}: with no selection the stub's output is not ${fixture##*/}, byte for byte"
+    (( rc == 0 )) || fail "${step}: default at-once stub exited ${rc}"
+    grep -qxF "Listening for channel messages from: server:slack-channel-router" "${out}" \
+        || fail "${step}: default stub did not report in immediately"
+    [[ ! -s "${SCENARIO_BIN}/${SCENARIO_STUB_SHOWN_DIALOGS_PREFIX}${pid}" ]] \
+        || fail "${step}: default stub showed a dialog"
+    [[ ! -s "${err}" ]] || fail "${step}: default stub wrote to standard error"
+
+    # Explicit dev mode preserves the dialog bytes and the shown-dialog record.
+    dir="$(make_workdir stub-dev-dialog)"
+    stub_mode "${dir}" "${STUB_MODE_DEV_CHANNELS}"
+    (cd "${dir}" && exec "${SCENARIO_BIN}/claude" < /dev/null) > "${out}" 2> "${err}" &
+    pid=$!
+    wait "${pid}" || rc=$?
+    (( rc == 0 )) || fail "${step}: the explicit dev stub exited ${rc}"
+    cmp -s -- "${fixture}" "${out}" || fail "${step}: the explicit dev stub's output is not ${fixture##*/}, byte for byte"
     cmp -s -- "${fixture}" "${SCENARIO_BIN}/${SCENARIO_STUB_SHOWN_DIALOGS_PREFIX}${pid}" \
         || fail "${step}: the stub's record of the dialogs it showed (${SCENARIO_STUB_SHOWN_DIALOGS_PREFIX}${pid}) is not ${fixture##*/}, byte for byte"
-    [[ ! -s "${err}" ]] || fail "${step}: with no selection the stub wrote to standard error: $(head -c 300 "${err}")"
+    [[ ! -s "${err}" ]] || fail "${step}: the explicit dev stub wrote to standard error: $(head -c 300 "${err}")"
 
     # Silent: no output, no SessionStart, and the sentinel fires no SessionEnd.
     dir="$(make_workdir stub-silent)"
@@ -2622,6 +2637,7 @@ stub_direct_delay() {
     grep -qF -- "${dev}" "${fixture}" || fail "${step}: ${fixture##*/} does not hold the dev-channels needle '${dev}'"
 
     dir="$(make_workdir stub-delay)"
+    stub_mode "${dir}" "${STUB_MODE_DEV_CHANNELS}"
     stub_dialog_delay "${dir}" "${STUB_DELAY_S}"
     (cd "${dir}" && { sleep "$(( STUB_DELAY_S + 2 ))"; printf '__CSCB_TEST_EXIT__\r'; } | "${SCENARIO_BIN}/claude") \
         > "${out}" 2> "${err}" &

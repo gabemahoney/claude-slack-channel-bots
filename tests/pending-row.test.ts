@@ -1236,6 +1236,7 @@ function rowComparison(overrides: Partial<RowPersonaComparison> = {}): RowPerson
   return {
     ...MATCHING,
     workingDirectoryResolved: true,
+    tagPrompt: true,
     configDirLabel: 'the label',
     expectedConfigDirLabel: 'the label',
     ...overrides,
@@ -2130,7 +2131,7 @@ const enterFailure = (err: Error): PendingRowLapEnterOutcome => pendingRowLapEnt
  */
 const LAP_PANE_CELLS: ReadonlyArray<readonly [string, () => PaneReadOutcome, PendingRowLapNext]> = [
   ['a pane showing the trust dialog', () => ({ kind: PANE_READ_PANE, pane: pendingRowDialogPane(PENDING_ROW_DIALOG_TRUST) }), PENDING_ROW_LAP_NEXT_ENTER],
-  ['a pane showing the dev-channels dialog', () => ({ kind: PANE_READ_PANE, pane: pendingRowDialogPane(PENDING_ROW_DIALOG_DEV_CHANNELS) }), PENDING_ROW_LAP_NEXT_ENTER],
+  ['a pane showing the dev-channels dialog', () => ({ kind: PANE_READ_PANE, pane: pendingRowDialogPane(PENDING_ROW_DIALOG_DEV_CHANNELS) }), PENDING_ROW_LAP_NEXT_RUN],
   ['a pane with no needle (a prompt the approver does not know)', () => ({ kind: PANE_READ_PANE, pane: pendingRowDialogPane(PENDING_ROW_DIALOG_UNRECOGNISED) }), PENDING_ROW_LAP_NEXT_RUN],
   ['an empty pane', () => ({ kind: PANE_READ_PANE, pane: pendingRowDialogPane(PENDING_ROW_DIALOG_NONE) }), PENDING_ROW_LAP_NEXT_RUN],
   ['GONE (ErrTmuxCaptureFailed)', () => paneFailure(errTmuxCaptureFailed()), PENDING_ROW_LAP_NEXT_RUN],
@@ -3444,8 +3445,8 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     const lapping = rounds.filter((round) => round.at >= launchStartMs + adGraceMsInEffect())
     expect(rounds.filter((round) => !lapping.includes(round)).every((round) => round.verbs.join() === READ_ONLY_ROUND.join())).toBe(true)
     expect(lapping.map((round) => round.verbs)).toEqual([
-      ['status', 'get', 'read-pane', 'status', 'read-pane', 'send-keys', 'find-missing', 'get'],
-      ['status', 'get', 'read-pane', 'status', 'read-pane', 'send-keys', 'find-missing', 'get'],
+      ['status', 'get', 'read-pane', 'get', 'read-pane', 'get', 'send-keys', 'find-missing', 'get'],
+      ['status', 'get', 'read-pane', 'get', 'read-pane', 'get', 'send-keys', 'find-missing', 'get'],
     ])
     expect(h.stub.calls.readPaneCalls).toEqual(lapping.flatMap(() => [0, 1].map(() => ({ instance_id: id, n_lines: FULL_PANE_READ_LINES, allow_pending: true }))))
     expect(h.stub.calls.sendKeysCalls).toEqual(lapping.map(() => ({ instance_id: id, text: '', allow_pending: true })))
@@ -3581,7 +3582,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
   // and the answer's own effect (tmux-unavailable raised, or CONFIG's cause armed).
   test.each<[string, PendingRowModelOptions['dialog'], (key: string) => Error | undefined, boolean, boolean, LapColumnEffect]>([
     ['a pane showing the trust dialog: Enter typed, the run follows', PENDING_ROW_DIALOG_TRUST, () => undefined, true, true, undefined],
-    ['a pane showing the dev-channels dialog: Enter typed, the run follows', PENDING_ROW_DIALOG_DEV_CHANNELS, () => undefined, true, true, undefined],
+    ['a pane showing the dev-channels dialog: never answered, the run follows', PENDING_ROW_DIALOG_DEV_CHANNELS, () => undefined, false, true, undefined],
     ['a pane with no needle: nothing typed, the run follows', PENDING_ROW_DIALOG_UNRECOGNISED, () => undefined, false, true, undefined],
     ['GONE (ErrTmuxCaptureFailed): nothing typed, the run follows', PENDING_ROW_DIALOG_TRUST, () => errTmuxCaptureFailed(), false, true, undefined],
     ['ErrSpawnNotFound: nothing typed, the run follows', PENDING_ROW_DIALOG_TRUST, () => errSpawnNotFound(), false, true, undefined],

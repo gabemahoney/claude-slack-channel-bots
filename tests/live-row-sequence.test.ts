@@ -2652,7 +2652,7 @@ describe('b.jg5 SRJ-411: a pending row whose cwd or config_dir differs from P\'s
 
 describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the launch answers while the sequence runs, the conversation is kept, and step 6\'s resume answers end it by SRJ-113 and SRJ-710', () => {
   /** The ladder's calls before the sequence: the colliding spawn, the collision get, the reconnect, the find-missing run, the resume and its re-read. */
-  const LADDER_CALLS = ['spawn', 'get', 'get', 'readPane', 'readPane', 'sendKeys', 'findMissing', 'resume', 'get'] as const
+  const LADDER_CALLS = ['spawn', 'get', 'get', 'readPane', 'readPane', 'get', 'sendKeys', 'findMissing', 'resume', 'get'] as const
 
   /**
    * P's launch over its `waiting` row whose reconnect answers GONE and whose
@@ -2662,7 +2662,7 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
   function scriptGoneNotResumable(h: RecoveryHarness, key: string, sequenceRow: GetResult): void {
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk(personaRow(h, key)), cannedOk(personaRow(h, key)), cannedOk(personaRow(h, key))],
+      getQueue: [cannedOk(personaRow(h, key)), cannedOk(personaRow(h, key)), cannedOk(personaRow(h, key)), cannedOk(personaRow(h, key))],
       getResult: sequenceRow,
       sendKeysError: errTmuxSendKeys(),
       resumeQueue: [cannedErr(errSpawnNotResumable())],
@@ -2751,10 +2751,12 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
     // new evidence of that life; the resume answers ErrSpawnNotResumable and
     // the re-read finds the row waiting.
     const sweptAfter = calls.findMissingCalls.length
+    let rowState: string = LIVE
     h.script({
       statusFn: () => cannedStatusResult({ state: calls.findMissingCalls.length > sweptAfter ? ENDED : LIVE }),
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk(personaRow(h, p)), cannedOk(personaRow(h, p)), cannedOk(personaRow(h, p)), cannedOk(personaRow(h, p))],
+      getFn: () => personaRow(h, p, { state: rowState, session_id: SESSION_ID }),
+      killFn: () => { rowState = ENDED; return cannedKillResult(true) },
       getResult: personaRow(h, p, { state: ENDED, session_id: SESSION_ID }),
       sendKeysError: errTmuxSendKeys(),
       resumeQueue: [cannedErr(errSpawnNotResumable())],
@@ -3232,7 +3234,7 @@ describe('the no-launch form as an old-life wait: step 5\'s ordinary text for an
   test.each<[string, (h: RecoveryHarness, p: string, q: string) => { readonly id: string; readonly oldKey: string; readonly session: string; readonly labels: Record<string, string> }]>([
     ['a renamed-away key\'s own cscb_<old> (Q, no longer applied)', (h, _p, q) => {
       h.remove(q)
-      return { id: personaInstanceId(q), oldKey: q, session: personaTmuxSessionName(q), labels: { service: 'cscb', persona: q } }
+      return { id: personaInstanceId(q), oldKey: q, session: personaTmuxSessionName(q), labels: { tag_prompt: '1', service: 'cscb', persona: q } }
     }],
     ['a pre-persona row\'s id (no persona label)', () => ({ id: PRE_PERSONA_ID, oldKey: PRE_PERSONA_ID, session: PRE_PERSONA_SESSION, labels: { ...PRE_PERSONA_LABELS } })],
   ])('%s: still live after runs that judged it, one persona-kill-failed entry and one log line, the context old-life wait, the id and the row\'s session in the text; nothing to Slack', async (_label, form) => {

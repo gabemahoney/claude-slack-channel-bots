@@ -12,9 +12,9 @@
 #   config.toml);
 # - the tmux shim first on every CSCB process's PATH, in `log` mode
 #   throughout;
-# - the stub as `claude`, in `dev-channels` (no selection, the default) in
+# - the stub as `claude`, in `startup-trust` (no selection, the default) in
 #   both working directories, `dev`'s and the neighbour's: it prints the
-#   dev-channels dialog and reports in only on Enter;
+#   startup-trust dialog and reports in only on Enter;
 # - the live server against the Slack stub (fixtures/slack-stub-server.ts
 #   with `--record`; posts are read from that record with `slack_posts`), one
 #   persona `dev` (key `dev`), `health_check_interval` 0.
@@ -32,7 +32,7 @@
 #      equal the notice composed from the per-line entries, and `slack_posts`
 #      must return it whole, its human-only line its last.
 #   1. Configuration: persona `dev`, its working directory in the stub's
-#      dev-channels hold.
+#      startup-trust hold.
 #   2. First life: the live start spawns `dev` fresh; the approver clears the
 #      dialog (a bot-server `send-keys` of `dev`'s row); a harness `get` reads
 #      the row `waiting`; its session_id and tmux session name are
@@ -367,6 +367,7 @@ step_first_life() {
     creds="${SCENARIO_ROOT}/credentials"
     mkdir -m 700 "${creds}"
     work="$(make_workdir dev)"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${TOKEN_LABEL}")" "$(fake_token app "${TOKEN_LABEL}")" \
         | write_file "${creds}/dev.json" 600
     write_config << EOF
@@ -422,6 +423,7 @@ step_make_neighbour() {
     local step="step 4: the neighbour" dir
     NB_SESSION="${DEV_SESSION}_x"
     dir="$(make_workdir neighbour)"
+    stub_mode "${dir}" "${STUB_MODE_STARTUP_TRUST}"
     TMUX_MARK="$(tmux_shim_mark)"
     ad_capture spawn --agent claude --cwd "${dir}" --instance-id "${NB_ID}" --tmux-session-name "${NB_SESSION}" --no-pre-trust
     if (( AD_RC != 0 )); then

@@ -1,6 +1,8 @@
 import { queuePath, readQueue } from './test-helpers/delivery-queue.ts'
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
+import { botSystemPromptPath } from '../src/bot-system-prompt.ts'
+import { resolveServerStateDir } from '../src/config.ts'
 import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
 useImmediateTypingLifecycle()
 /**
@@ -1670,9 +1672,14 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     await gate.entered
     await run.stop()
 
-    const restarted = await h.startDetecting(REAL_LAUNCH)
+    // b.omv SR-7.6: install the hold before start, because extra provenance
+    // reads can let the sequence reach reuse before startDetecting returns.
+    const restarted = h.build(REAL_LAUNCH)
     let first = true
     const spawns = restarted.composition!.holdSpawns((id) => id === bravoId && first && !(first = false))
+    expect(restarted.resolveStart().kind).toBe('applied')
+    await restarted.controller.runStartBringUp()
+    expect(restarted.startDetection()).toBe(true)
     expect(launchesOf(restarted, 'bravo')).toEqual([{ op: 'launch', key: bravoKey, via: 'start', action: 'sequence-waiting' }])
     await spawns.entered(bravoId)
     expect(restarted.retiredKeys.recordGeneration(bravoKey)).toBe(0)
@@ -5399,13 +5406,12 @@ describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-1
     writeFileSync(prompt, 'be brief\n')
     const startTop: TopLevel = { mcp_config_path: join(h.root, 'mcp-start.json'), system_prompt_mode: 'append', append_system_prompt_file: prompt }
     const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true, top: startTop })
-    // Gone now, before anything reads the installed template: a refresh (or
-    // an install captured after the start) that probed the file again would
-    // drop the flag.
+    // b.omv SR-7.2: the template always appends the generated prompt; an
+    // operator file's later absence cannot change the installed arguments.
     rmSync(prompt)
     const installed = run.composition!.installedTemplate!
-    // What the start installed: its MCP config, and the append flag (its file was readable then).
-    expect(installed.agent_args).toEqual(expect.arrayContaining(['--mcp-config', startTop.mcp_config_path!, '--append-system-prompt-file', prompt]))
+    expect(installed.agent_args).toEqual(expect.arrayContaining(['--mcp-config', startTop.mcp_config_path!, '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir())]))
+    expect(installed.agent_args).not.toContain(prompt)
 
     await applyConfig(run, withDelta(personas), { mcp_config_path: join(h.root, 'mcp-next.json'), system_prompt_mode: 'none' })
 

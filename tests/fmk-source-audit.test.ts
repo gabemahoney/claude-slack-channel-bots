@@ -1532,10 +1532,56 @@ describe('b.m2o: deliberate pre-0.12 integration contracts', () => {
     const legacy = version.startsWith('0.10.') || version.startsWith('0.11.')
     const result = shell(`${helper('_scenario_ad_contract')}
 _scenario_ad_contract '${version}'
-printf '%s|%s|%s|%s' "$SCENARIO_AD_ROOT" "$SCENARIO_AD_ID_FLAG" "$SCENARIO_AD_ID_COLUMN" "$SCENARIO_AD_SESSION_KEY"`)
+printf '%s|%s|%s|%s|%s' "$SCENARIO_AD_ROOT" "$SCENARIO_AD_ID_FLAG" "$SCENARIO_AD_ID_COLUMN" "$SCENARIO_AD_SESSION_KEY" "$SCENARIO_AD_ARGS_KEY"`)
     expect(result).toBe(legacy
-      ? `${home}/.agent-director|--claude-instance-id|claude_instance_id|claude_session_id`
-      : `${home}/.config/agent-director|--instance-id|instance_id|session_id`)
+      ? `${home}/.agent-director|--claude-instance-id|claude_instance_id|claude_session_id|claude_args`
+      : `${home}/.config/agent-director|--instance-id|instance_id|session_id|agent_args`)
+  })
+  // b.omv SR-13.6: run the actual pre-upgrade proofs against the old row
+  // shape; current-field fallbacks must not hide missing or injected argv.
+  test.each([
+    ['old row', { claude_session_id: 'old-session', claude_args: [], labels: {} }, true],
+    ['appended prompt', { claude_session_id: 'old-session', claude_args: ['--append-system-prompt-file', '/prompt'], agent_args: [], labels: {} }, false],
+    ['missing old args', { claude_session_id: 'old-session', agent_args: [], labels: {} }, false],
+    ['malformed old args', { claude_session_id: 'old-session', claude_args: 'unreadable', labels: {} }, false],
+    ['marked old row', { claude_session_id: 'old-session', claude_args: [], labels: { tag_prompt: '1' } }, false],
+    ['current session only', { session_id: 'current-session', claude_args: [], labels: {} }, false],
+    ['empty old session', { claude_session_id: '', claude_args: [], labels: {} }, false],
+  ] as const)('test-13 earlier-release provenance: %s', (_label, row, accepted) => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-13-fmk-switch-over.sh'), 'utf8')
+    const start = source.indexOf('    row_get "E4 earlier-release provenance"')
+    const end = source.indexOf('    E4_MEMORY[', start)
+    expect(start).toBeGreaterThan(-1)
+    expect(end).toBeGreaterThan(start)
+    writeFileSync(join(home, 'row.json'), JSON.stringify(row))
+    const output = shell(`${helper('_scenario_ad_contract')}
+_scenario_ad_contract 0.10.0
+AD_OUT="$HOME/row.json"
+id=old-persona
+declare -A E4_OLD_SESSION
+row_get() { :; }
+fail() { exit 1; }
+(${source.slice(start, end)}
+printf 'SESSION=%s\\n' "\${E4_OLD_SESSION[$id]}")
+printf 'RESULT=%s' "$?"`, ['jq'])
+    expect(output).toBe(accepted ? 'SESSION=old-session\nRESULT=0' : 'RESULT=1')
+  })
+  test.each(['test-16-fmk-conflict.sh', 'test-23-fmk-latch-recheck.sh'])('%s ordinary personas explicitly await supported trust input', file => {
+    const source = readFileSync(join(import.meta.dir, 'integration', file), 'utf8')
+    const output = shell(`${helper('prepare_persona', source)}
+SCENARIO_ROOT="$HOME"
+STUB_MODE_STARTUP_TRUST=startup-trust
+declare -A PERSONA_TOKEN=([fixture]=fixture) PERSONA_WORK PERSONA_CREDS PERSONA_ID PERSONA_NAMED PERSONA_REF PERSONA_NAME
+make_workdir() { printf /fixture; }
+stub_mode() { printf 'MODE=%s:%s\\n' "$1" "$2"; }
+fake_token() { printf inert; }
+write_file() { while IFS= read -r line; do :; done; }
+fmk_text() { printf fixture; }
+persona_ref() { printf fixture; }
+fail() { exit 1; }
+prepare_persona fixture`, ['mkdir'])
+    expect(output).toBe('MODE=/fixture:startup-trust')
+    assertNoLeak({ output })
   })
   const worker = readFileSync(join(import.meta.dir, 'integration/fixtures/stub-claude.sh'), 'utf8')
   // b.omv SR-13.6: inspect only extracted byte-writing declarations, never
@@ -1898,23 +1944,32 @@ printf 'RESULT=%s' "$?"`, ['jq', 'head'])
       expect(output).not.toContain('INSTALL')
     }
   })
-  test('test-14 seeds P with report-in and enables silent mode only after upgrade', () => {
+  test('test-14 harness seeds report in without an approver and P becomes silent only after upgrade', () => {
     const source = readFileSync(join(import.meta.dir, 'integration/test-14-fmk-kill-fails.sh'), 'utf8')
-    const seed = source.slice(source.indexOf('P_NAME='), source.indexOf('\n# Q, which'))
+    const seed = source.slice(source.indexOf('U_CONFIG='), source.indexOf('\n# No worker may cross'))
     const output = shell(`
 SCENARIO_TAG=inert
+SCENARIO_ROOT="$HOME"
 SVC_LABEL=service=cscb
 PERSONA_LABEL=persona
 STUB_MODE_SILENT=silent
 STUB_MODE_AT_ONCE=at-once
-mode=at-once
-persona_key() { printf p; }
+STUB_MODE_STARTUP_TRUST=startup-trust
+declare -A modes
+persona_key() { printf '%s' "$1"; }
 t14_value() { printf -v "$1" p; }
-make_workdir() { printf /fixture; }
-stub_mode() { mode="$2"; }
-seed_010_row() { [[ "$mode" == at-once ]] || exit 7; }
-(${seed})
-printf 'RESULT=%s' "$?"`)
+make_workdir() { printf '/fixture/%s' "$1"; }
+stub_mode() { modes[$1]="$2"; }
+seed_prepersona_fleet() {
+  [[ "\${modes[$UA_WORK]}" == at-once && "\${modes[$UB_WORK]}" == at-once ]] || exit 7
+  printf '%s a a-session a-sid a-pane\\n%s b b-session b-sid b-pane\\n' "$UA_CHANNEL" "$UB_CHANNEL"
+}
+seed_010_row() { [[ "\${modes[$3]}" == at-once ]] || exit 7; }
+fail() { exit 1; }
+(set -e
+${seed}
+[[ "\${modes[$P_WORK]}" == startup-trust ]])
+printf 'RESULT=%s' "$?"`, ['jq', 'grep'])
     expect(output).toBe('RESULT=0')
     const upgrade = source.indexOf('\nt14_upgrade_seeded_rows\n')
     const rebuild = source.indexOf('for fixture in A B P Q; do', upgrade)
@@ -2236,7 +2291,7 @@ printf 'RESULT=%s' "$?"`, ['head'])
  * bodies, with a deliberate legacy comment and the expected number of lines.
  * Neither a whole file nor the integration tree gets an exemption. */
 const LEGACY_HELPER_CONTRACTS: Record<string, Record<string, number>> = {
-  'lib/scenario.sh': { _scenario_ad_contract: 4, _scenario_require_010: 2, _scenario_row_left_pending: 1, seed_010_row: 2, _scenario_ad_id: 2, ad_trail_events: 1 },
+  'lib/scenario.sh': { _scenario_ad_contract: 5, _scenario_require_010: 2, _scenario_row_left_pending: 1, seed_010_row: 2, _scenario_ad_id: 2, ad_trail_events: 1 },
   'fixtures/stub-claude.sh': { read_grace: 1, refire_tick: 1 },
   'test-0-fmk-harness-self-check.sh': { leg_guard_refusals: 4 },
 }

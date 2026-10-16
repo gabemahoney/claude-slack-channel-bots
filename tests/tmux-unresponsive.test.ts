@@ -431,15 +431,16 @@ const RESTART_RUN_ROWS = ['working', 'waiting', 'check_permission'] as const
 /**
  * One restart run's calls on P's live `row` (not connected) whose `read-pane`
  * is refused: the liveness read and the reconnect adapter's state read, the
- * one `read-pane`, and on a `waiting` row the fresh reconnect row and pane
- * checks. The failed fresh screen stops all keys (b.omv SR-5.5); a
- * `check_permission` row's refused read is taken as alive and deferred.
+ * one `read-pane`, E4's provenance `get`, and on a `waiting` row the fresh
+ * reconnect row and pane checks. The failed fresh screen stops all keys
+ * (b.omv SR-5.5, SR-7.6); a `check_permission` row's refused read is taken
+ * as alive and deferred.
  * No kill or spawn.
  */
 function restartRunPaneReadCalls(row: (typeof RESTART_RUN_ROWS)[number], readable = false): Record<string, number> {
   return row === 'waiting'
-    ? { statusCalls: 2, getCalls: 1, readPaneCalls: 3, ...(readable ? { sendKeysCalls: 2 } : {}) }
-    : { statusCalls: 2, readPaneCalls: 1, ...(readable && row === 'working' ? { getCalls: 1 } : {}) }
+    ? { statusCalls: 2, getCalls: readable ? 4 : 2, readPaneCalls: 3, ...(readable ? { sendKeysCalls: 2 } : {}) }
+    : { statusCalls: 2, getCalls: readable && row === 'working' ? 2 : 1, readPaneCalls: 1 }
 }
 
 describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
@@ -765,7 +766,8 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     ['AC 27: ErrCallTimeout', 'status', errCallTimeout],
   ])('%s answering the dialog approver’s %s, after the launch returned, starts nothing, posts nothing and arms nothing beyond the launch’s pending-only watch', async (_what, verb, make) => {
     const { h, p, b } = build()
-    const pending = { statusResult: cannedStatusResult({ state: 'pending' }) }
+    // b.omv SR-7.6: startup Enter requires a fresh marked pending row.
+    const pending = { statusResult: cannedStatusResult({ state: 'pending' }), getResult: personaRow(h, p, { state: 'pending' }) }
     h.script(
       verb === 'status'
         ? { statusError: make(verb) }
@@ -1121,7 +1123,7 @@ describe('tmux-unresponsive: what ends it (SRJ-310)', () => {
   const restartRunEnds = RESTART_RUN_ROWS.flatMap((row) =>
     ([
       ['a pane', { readPaneResults: [cannedReadPaneResult(IDLE_PANE)] }, restartRunPaneReadCalls(row, true)],
-      ['GONE (ErrTmuxCaptureFailed)', { readPaneError: errTmuxCaptureFailed() }, { statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 }],
+      ['GONE (ErrTmuxCaptureFailed)', { readPaneError: errTmuxCaptureFailed() }, { statusCalls: 3, getCalls: 1, readPaneCalls: 1, findMissingCalls: 1 }],
     ] satisfies Array<[string, RecoveryStubScript, Record<string, number>]>).flatMap(([what, answer, calls]) => [
       [what, row, 'before any onset', answer, calls, false],
       [what, row, 'after its onset', answer, calls, true],

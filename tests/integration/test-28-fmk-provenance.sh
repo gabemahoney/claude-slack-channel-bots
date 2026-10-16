@@ -17,8 +17,8 @@
 # under SCENARIO_ROOT, with agent-director's default settings (no `[tmux]`
 # table). The tmux shim stays in `log` mode, first on every CSCB process's
 # PATH. Two personas, A (PERSONA_A) and B (PERSONA_B), each with its own
-# working directory in the stub's `dev-channels` mode (STUB_MODE_DEV_CHANNELS:
-# each stub worker is held at the dev-channels dialog until CSCB's dialog
+# working directory in the stub's `startup-trust` mode (STUB_MODE_DEV_CHANNELS:
+# each stub worker is held at the startup-trust dialog until CSCB's dialog
 # approver answers it, then clears its screen and scrollback, reports in and
 # opens its MCP session; it answers `/mcp reconnect` with a new session and
 # ignores every other line but its sentinel, so a teardown's pause, whose
@@ -1086,9 +1086,11 @@ mkdir -m 700 "${CREDS}" || fail "${STEP}: could not create ${CREDS}"
 mkdir -p "${SCENARIO_ROOT}/claude-config-a" "${SCENARIO_ROOT}/claude-config-b" \
     || fail "${STEP}: could not create the personas' config dirs"
 WORK_A="$(make_workdir alpha)"
+stub_mode "${WORK_A}" "${STUB_MODE_STARTUP_TRUST}"
 WORK_B="$(make_workdir beta)"
-stub_mode "${WORK_A}" "${STUB_MODE_DEV_CHANNELS}"
-stub_mode "${WORK_B}" "${STUB_MODE_DEV_CHANNELS}"
+stub_mode "${WORK_B}" "${STUB_MODE_STARTUP_TRUST}"
+stub_mode "${WORK_A}" "${STUB_MODE_STARTUP_TRUST}"
+stub_mode "${WORK_B}" "${STUB_MODE_STARTUP_TRUST}"
 # The other TMUX_TMPDIR of the driver's pane reads: empty, under SCENARIO_ROOT.
 EMPTY_TMPDIR="${SCENARIO_ROOT}/tmux-empty"
 mkdir -m 700 "${EMPTY_TMPDIR}" || fail "${STEP}: could not create ${EMPTY_TMPDIR}"

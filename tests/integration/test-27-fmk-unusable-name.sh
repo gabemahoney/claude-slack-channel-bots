@@ -34,8 +34,8 @@
 #   config.toml);
 # - the tmux shim first on every CSCB process's PATH, in `log` mode
 #   throughout;
-# - the stub as `claude`: in `dev-channels` (no selection, the default) in
-#   U's working directory, where it prints the dev-channels dialog and reports
+# - the stub as `claude`: in `startup-trust` (no selection, the default) in
+#   U's working directory, where it prints the startup-trust dialog and reports
 #   in only on Enter (CSCB's approver); in `silent` in the other caller's
 #   working directory, where it never reports in and opens no MCP session;
 # - the live server against the Slack stub (fixtures/slack-stub-server.ts
@@ -636,6 +636,7 @@ step_first_life() {
     creds="${SCENARIO_ROOT}/credentials"
     mkdir -m 700 "${creds}"
     U_WORK="$(make_workdir "${U_KEY}")"
+    stub_mode "${U_WORK}" "${STUB_MODE_STARTUP_TRUST}"
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${TOKEN_LABEL}")" "$(fake_token app "${TOKEN_LABEL}")" \
         | write_file "${creds}/${U_KEY}.json" 600
     write_config << EOF
@@ -727,6 +728,7 @@ step_other_row() {
     local step="step 2: the other caller's row" dir pid out
     [[ -z "$(server_pid)" ]] || fail "${step}: a server is running"
     dir="$(make_workdir other)"
+    stub_mode "${dir}" "${STUB_MODE_STARTUP_TRUST}"
     stub_mode "${dir}" "${STUB_MODE_SILENT}"
     ad_capture spawn --agent claude --cwd "${dir}" --instance-id "${OTHER_ID}" --tmux-session-name "${OTHER_SESSION}" --no-pre-trust
     if (( AD_RC != 0 )); then

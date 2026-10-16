@@ -57,11 +57,12 @@
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
 
 import { randomBytes } from 'node:crypto'
+import { prepareBotSystemPrompt, botSystemPromptPath } from './bot-system-prompt.ts'
 import type { Client } from 'agent-director'
 import { createDeliveryEngines, createDeliveryLifecycle, type DeliveryEngines, type DeliveryLifecycle, type DeliveryEngineEvent } from './delivery-engine.ts'
 import { createDeliveryAdScope } from './delivery-ad-scope.ts'
 import { parseLaunchStart } from './pending-row.ts'
-import { setDeliveryLifecycle, setDeliveryPersonaLookup, applyDeliveryOwnRowRead, handleDeliveryKeyError, handleDeliveryReadError, classifyWorkingPane } from './session-manager.ts'
+import { setDeliveryLifecycle, setDeliveryPersonaLookup, inspectPersonaUpgrade, applyDeliveryOwnRowRead, handleDeliveryKeyError, handleDeliveryReadError, classifyWorkingPane } from './session-manager.ts'
 import type { WebClient } from '@slack/web-api'
 import { join, resolve } from 'path'
 import { fileURLToPath } from 'url'
@@ -159,6 +160,7 @@ import {
   waitsOnKillFailedHold,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
+  setSystemPromptPreparer,
   setRetiredKeyStore,
   setSessionNotifier,
   spawnForPersona,
@@ -2300,6 +2302,8 @@ export function _buildReconnectSessionAdapter(
 ):(key: string) => Promise<'success' | ReconnectEscalateDead | 'transient' | 'pending'> {
   // `key` is the persona key.
   const run: (key: string) => Promise<'success' | ReconnectEscalateDead | 'transient' | 'pending'> = async (key: string) => {
+    const upgrade = await inspectPersonaUpgrade(key, getPersona?.(key) ?? appliedPersona(key))
+    if (upgrade !== 'current') { deliveryLifecycle?.defer(key); return 'transient' }
     if (getSessionByPersona(key)?.connected === true) { deliveryLifecycle?.clearDeferred(key); return 'success' }
     if (deliveryLifecycle?.owner(key) !== undefined && deliveryLifecycle.owner(key) !== 'free') { deliveryLifecycle.defer(key); return 'transient' }
     if (deliveryLifecycle && !await deliveryLifecycle.recoverBeforeReconnect(key)) { deliveryLifecycle.defer(key); return 'transient' }
@@ -3596,6 +3600,19 @@ export async function main(): Promise<void> {
   // initRestart — so no launch path (start, restart or a human trigger) can
   // run unpatched.
   setPreLaunchTrustPatcher(trustPatchPersona)
+  // b.omv SR-7.2: startup failure is local; every launch retries the write and fails closed.
+  const prepareSystemPrompt = (key: string): void => {
+    try {
+      if (personaConfig === null) throw new Error('persona configuration unavailable')
+      prepareBotSystemPrompt(personaConfig, STATE_DIR)
+    } catch (err) {
+      console.error(`[slack] system-prompt-unwritable: persona=${key} path=${JSON.stringify(botSystemPromptPath(STATE_DIR))}`)
+      throw err
+    }
+  }
+  setSystemPromptPreparer(prepareSystemPrompt)
+  try { prepareSystemPrompt('server-start') } catch { /* persona launches retry independently */ }
+
   // b.av2 SR-9.4: the reply-guard steps (record, launched-with dir, hook
   // install) run immediately before each spawn or resume. The step gets a
   // getter for the applied persona set (read at the launch and again by its
@@ -4557,7 +4574,7 @@ export async function main(): Promise<void> {
   console.error(JSON.stringify({ mcpServers: { [MCP_SERVER_NAME]: { type: 'http', url: `http://${mcpHost}:${mcpPort}/mcp` } } }, null, 2))
   console.error('')
   console.error('Then launch Claude from a project directory with:')
-  console.error(`  claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:${MCP_SERVER_NAME}`)
+  console.error(`  claude --mcp-config ~/.claude/slack-mcp.json`)
   console.error('')
 
   // b.omv SR-4.4: scheduler acceptance goes directly to the shared queue.
@@ -4611,6 +4628,7 @@ export async function main(): Promise<void> {
   initRestart({
     canRestart: canRelaunch,
     isSessionAlive: isSessionAliveAdapter,
+    inspectUpgrade: async key => (await inspectPersonaUpgrade(key)) !== 'current',
     isSessionConnected: (key) => {
       const session = getSessionByPersona(key)
       return session?.connected === true
@@ -4801,6 +4819,7 @@ export async function main(): Promise<void> {
   // Initialize and start the health-check poller.
   initHealthCheck({
     isSessionAlive: isSessionAliveAdapter,
+    inspectUpgrade: async key => (await inspectPersonaUpgrade(key)) !== 'current',
     // b.9a7: same connectedness adapter wired into initRestart above
     // (registry entry with connected === true). Lets the tick notice
     // alive-but-disconnected rows and route them to scheduleRestart.

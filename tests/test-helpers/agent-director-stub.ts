@@ -1424,7 +1424,7 @@ function personaRowDefaults(persona: CannedRowPersona, home: string): {
     cwd: persona.working_directory,
     instance_id: personaInstanceId(persona.key),
     tmux_session_name: personaTmuxSessionName(persona.key),
-    labels: { service: 'cscb', persona: persona.key, config_dir: configDir },
+    labels: { tag_prompt: '1', service: 'cscb', persona: persona.key, config_dir: configDir },
   }
 }
 
@@ -1462,7 +1462,7 @@ function defaultRowFields(instanceId: string): {
   return {
     cwd: defaultCannedRowCwd(),
     tmux_session_name: personaTmuxSessionName(key),
-    labels: { service: 'cscb', persona: key },
+    labels: { tag_prompt: '1', service: 'cscb', persona: key },
   }
 }
 

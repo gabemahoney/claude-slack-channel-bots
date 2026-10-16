@@ -28,6 +28,8 @@
  */
 
 import * as fs from 'node:fs'
+import { botSystemPromptPath } from './bot-system-prompt.ts'
+import { resolveServerStateDir } from './config.ts'
 import { homedir } from 'node:os'
 import { posix as pathPosix } from 'node:path'
 import type { MakeTemplateParams, MakeTemplateResult } from 'agent-director'
@@ -48,7 +50,7 @@ import { describeLogMessage, describeThrownValue, isSafeIdentifier } from './per
 export interface TemplateInstallDeps {
   /** Hook that returns the live singleton Client. */
   getClient: () => unknown
-  /** R_OK readability probe for the append-system-prompt file. */
+  /** Legacy install dependency, retained for callers; composition owns file reads. */
   accessSync: (path: string, mode?: number) => void
   /** Hook for diagnostic stderr lines (single line, no trailing newline appended). */
   stderrWrite: (msg: string) => void
@@ -127,15 +129,8 @@ export function deriveMemoryReadAllowRules(personaConfig: PersonaConfig, home: s
  * Build the `MakeTemplateParams` for the slack-channel-bot template per
  * SR-3.1. Exported for direct testing.
  *
- * Always includes `--dangerously-load-development-channels` in `agent_args`:
- * the template is a per-installation artifact owned by agent-director; CSCB's
- * dry-run mode is a CSCB-side testing concern that does not propagate to AD.
- * (Session-manager spawn-time logic that omits this flag in dry-run is its
- * own decision.)
- *
- * Conditionally appends `--append-system-prompt-file <path>` when
- * `system_prompt_mode === 'append'` and the path is R_OK-readable. An
- * unreadable path produces a single stderr warning and the flag is omitted.
+ * b.omv SR-7.1, SR-7.2: MCP tools without channel arguments, and one
+ * mandatory appended prompt file shared by every persona.
  *
  * Then appends `--system-prompt-snapshot off` (b.b1j SR-2) unless
  * `fresh_system_prompt` is exactly `false`; a configuration without the field
@@ -146,31 +141,15 @@ export function buildTemplateParams(
   personaConfig: PersonaConfig,
   deps?: Partial<TemplateInstallDeps>,
 ): MakeTemplateParams {
-  const d = mergeDeps(deps)
-
   const agent_args: string[] = [
-    '--dangerously-load-development-channels',
-    'server:slack-channel-router',
     '--mcp-config',
     personaConfig.mcp_config_path,
   ]
 
-  if (
-    personaConfig.system_prompt_mode === 'append' &&
-    personaConfig.append_system_prompt_file !== undefined
-  ) {
-    const filePath = personaConfig.append_system_prompt_file
-    try {
-      d.accessSync(filePath, fs.constants.R_OK)
-      agent_args.push('--append-system-prompt-file', filePath)
-    } catch {
-      d.stderrWrite(
-        `[slack] template: append_system_prompt_file not readable, omitting flag: ${filePath}`,
-      )
-    }
-  }
+  // b.omv SR-7.2: the shared composed file is mandatory in every mode.
+  agent_args.push('--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir()))
 
-  // b.b1j SR-2: last, whatever the append-file decision above was, so a
+  // b.b1j SR-2: last, after the mandatory composed prompt, so a
   // resumed or restarted bot reloads the current system prompt file and
   // CLAUDE.md. Only a `fresh_system_prompt` of exactly `false` leaves it out.
   if (personaConfig.fresh_system_prompt !== false) {

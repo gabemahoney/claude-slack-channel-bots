@@ -38,10 +38,10 @@
 #   legs 0 and 4 limit `fail-kill` to one row's session name, session id and
 #   pane id (`tmux_shim_mode fail-kill --targets`, a harness addition), so every other kill runs the real tmux;
 # - the stub worker's mode per working directory (`stub_mode`): the start
-#   sweep's persona reports in (`dev-channels`, the approver's Enter), the
+#   sweep's persona reports in (`startup-trust`, the approver's Enter), the
 #   `config_dir` and `cwd` personas never do (`silent`), so their rows stay
 #   `pending` with a launch start; the removed persona reports in
-#   (`dev-channels`); of the 0.10.0 rows, P's never reports in (`silent`) and
+#   (`startup-trust`); of the 0.10.0 rows, P's never reports in (`silent`) and
 #   the others report in at once (`at-once`, `seed_010_row`'s default);
 # - each leg has its own persona (key, credentials, channel, directories) and
 #   reads only its own ids, and only lines written after its start mark (a
@@ -160,7 +160,7 @@
 #                   sequence's kill fails. Then the same checks as leg 2,
 #                   for W, through one further retry.
 #   4. persona_removal (scenario 15; SRJ-1417, SRJ-715, SRJ-1003, SRJ-803)
-#                   persona R (Slack destination, `dev-channels`) is up, its
+#                   persona R (Slack destination, `startup-trust`) is up, its
 #                   row `waiting`. `fail-kill` limited to R's session and
 #                   pane; the operator removes R from config.json and
 #                   confirms the apply by renaming the pending file to the
@@ -290,7 +290,9 @@ U_CONFIG="${SCENARIO_ROOT}/prepersona-config.json"
 UA_CHANNEL="C0T14PPA"
 UB_CHANNEL="C0T14PPB"
 UA_WORK="$(make_workdir "${SCENARIO_TAG}prepersona_a")"
+stub_mode "${UA_WORK}" "${STUB_MODE_AT_ONCE}"
 UB_WORK="$(make_workdir "${SCENARIO_TAG}prepersona_b")"
+stub_mode "${UB_WORK}" "${STUB_MODE_AT_ONCE}"
 jq -n --arg a "${UA_CHANNEL}" --arg b "${UB_CHANNEL}" --arg da "${UA_WORK}" --arg db "${UB_WORK}" \
     '{routes: {($a): {cwd: $da}, ($b): {cwd: $db}}}' > "${U_CONFIG}" || fail "setup: could not write ${U_CONFIG}"
 U_ROWS="$(seed_prepersona_fleet "${U_CONFIG}" "${UA_CHANNEL}=${SCENARIO_TAG} fails" "${UB_CHANNEL}=${SCENARIO_TAG} ends")"
@@ -307,7 +309,9 @@ P_KEY="$(persona_key "${P_NAME}")"
 t14_value P_ID personaInstanceId "${P_KEY}"
 t14_value P_SESSION personaTmuxSessionName "${P_KEY}"
 P_WORK="$(make_workdir "${SCENARIO_TAG}latched_work")"
+stub_mode "${P_WORK}" "${STUB_MODE_STARTUP_TRUST}"
 P_ROW_WORK="$(make_workdir "${SCENARIO_TAG}latched_row")"
+stub_mode "${P_ROW_WORK}" "${STUB_MODE_AT_ONCE}"
 seed_010_row "${P_ID}" "${P_SESSION}" "${P_ROW_WORK}" "${SVC_LABEL}" "${PERSONA_LABEL}=${P_KEY}" > /dev/null
 
 # Q, which the configuration does not name: its live row, its worker
@@ -317,6 +321,7 @@ Q_KEY="$(persona_key "${Q_NAME}")"
 t14_value Q_ID personaInstanceId "${Q_KEY}"
 t14_value Q_SESSION personaTmuxSessionName "${Q_KEY}"
 Q_WORK="$(make_workdir "${SCENARIO_TAG}absent_work")"
+stub_mode "${Q_WORK}" "${STUB_MODE_AT_ONCE}"
 seed_010_row "${Q_ID}" "${Q_SESSION}" "${Q_WORK}" "${SVC_LABEL}" "${PERSONA_LABEL}=${Q_KEY}" > /dev/null
 
 # No worker may cross the release upgrade. Keep the rows for migration, then
@@ -451,6 +456,7 @@ X_NAME="${SCENARIO_TAG}sweep"
 X_LABEL="${SCENARIO_TAG}sweep1"
 X_CHANNEL="C0T14SWP1"
 X_WORK="$(make_workdir "${SCENARIO_TAG}sweep_work")"
+stub_mode "${X_WORK}" "${STUB_MODE_STARTUP_TRUST}"
 X_CFG="${CFG_ROOT}/${SCENARIO_TAG}sweep_cfg"
 X_KEY="$(persona_key "${X_NAME}")"
 t14_value X_ID personaInstanceId "${X_KEY}"
@@ -460,6 +466,7 @@ C_NAME="${SCENARIO_TAG}cfgdir"
 C_LABEL="${SCENARIO_TAG}cfgdir1"
 C_CHANNEL="C0T14CFG1"
 C_WORK="$(make_workdir "${SCENARIO_TAG}cfgdir_work")"
+stub_mode "${C_WORK}" "${STUB_MODE_STARTUP_TRUST}"
 C_CFG_ONE="${CFG_ROOT}/${SCENARIO_TAG}cfgdir_one"
 C_CFG_TWO="${CFG_ROOT}/${SCENARIO_TAG}cfgdir_two"
 C_CFG_LINK="${CFG_ROOT}/${SCENARIO_TAG}cfgdir_link"
@@ -471,7 +478,9 @@ W_NAME="${SCENARIO_TAG}cwd"
 W_LABEL="${SCENARIO_TAG}cwd1"
 W_CHANNEL="C0T14CWD1"
 W_ONE="$(make_workdir "${SCENARIO_TAG}cwd_one")"
+stub_mode "${W_ONE}" "${STUB_MODE_STARTUP_TRUST}"
 W_TWO="$(make_workdir "${SCENARIO_TAG}cwd_two")"
+stub_mode "${W_TWO}" "${STUB_MODE_STARTUP_TRUST}"
 W_LINK="${SCENARIO_ROOT}/work/${SCENARIO_TAG}cwd_link"
 W_CFG="${CFG_ROOT}/${SCENARIO_TAG}cwd_cfg"
 W_KEY="$(persona_key "${W_NAME}")"
@@ -488,6 +497,7 @@ R_NAME="${SCENARIO_TAG}removed"
 R_LABEL="${SCENARIO_TAG}removed1"
 R_CHANNEL="C0T14REM1"
 R_WORK="$(make_workdir "${SCENARIO_TAG}removed_work")"
+stub_mode "${R_WORK}" "${STUB_MODE_STARTUP_TRUST}"
 R_CFG="${CFG_ROOT}/${SCENARIO_TAG}removed_cfg"
 R_KEY="$(persona_key "${R_NAME}")"
 t14_value R_ID personaInstanceId "${R_KEY}"
@@ -1353,7 +1363,7 @@ leg_upgrade_sweep() {
 
 leg_start_sweep() {
     local step="start sweep" session entry_head alert m n kills
-    stub_mode "${X_WORK}" "${STUB_MODE_DEV_CHANNELS}"
+    stub_mode "${X_WORK}" "${STUB_MODE_STARTUP_TRUST}"
     tmux_shim_mode log
     t14_config_for_next_start "$(t14_persona_json "${X_NAME}" "${X_LABEL}" "${X_WORK}" "${X_CFG}" "${X_CHANNEL}")"
     t14_start_and_wait 1
@@ -1572,7 +1582,7 @@ leg_cwd() {
 
 leg_persona_removal() {
     local step="persona removal" session ids sid pane pending apply end kills entry ref n state
-    stub_mode "${R_WORK}" "${STUB_MODE_DEV_CHANNELS}"
+    stub_mode "${R_WORK}" "${STUB_MODE_STARTUP_TRUST}"
     tmux_shim_mode log
     t14_config_for_next_start "$(t14_persona_json "${R_NAME}" "${R_LABEL}" "${R_WORK}" "${R_CFG}" "${R_CHANNEL}")"
     t14_start_and_wait 1

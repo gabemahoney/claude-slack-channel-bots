@@ -362,6 +362,8 @@ export const PENDING_ROW_REASON_RETIRED_OLD_LIFE = 'retired-key-old-life'
 export const PENDING_ROW_REASON_CWD_MISMATCH = 'cwd-mismatch'
 /** Not covered: the row's `config_dir` label is missing or differs from the persona's (SRJ-411, SRJ-1504). */
 export const PENDING_ROW_REASON_CONFIG_DIR_MISMATCH = 'config-dir-mismatch'
+/** An old release's row cannot receive startup answers (b.omv SR-7.6). */
+export const PENDING_ROW_REASON_TAG_PROMPT_MISSING = 'tag-prompt-missing'
 /**
  * Undecided: the `cwd` condition cannot be evaluated now (b.av2 SR-6.4): the
  * working directory has no real path, and the row's `cwd` has none either or
@@ -380,6 +382,7 @@ export type PendingRowNotCoveredReason =
   | typeof PENDING_ROW_REASON_RETIRED_OLD_LIFE
   | typeof PENDING_ROW_REASON_CWD_MISMATCH
   | typeof PENDING_ROW_REASON_CONFIG_DIR_MISMATCH
+  | typeof PENDING_ROW_REASON_TAG_PROMPT_MISSING
 
 /** Why a `pending` row's cover is undecided. */
 export type PendingRowUndecidedReason = typeof PENDING_ROW_REASON_CWD_UNRESOLVED | typeof PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED
@@ -397,6 +400,8 @@ export type PendingRowCover =
  * passed in so this module stays pure.
  */
 export interface PendingRowComparison {
+  /** b.omv SR-7.6; a returned production comparison always supplies it. */
+  readonly tagPrompt?: boolean
   /** The row's `cwd` and the persona's working directory have the same real path. */
   readonly cwdMatches: boolean
   /** The `cwd` condition cannot be evaluated now (b.av2 SR-6.4). */
@@ -474,6 +479,7 @@ export function decidePendingRowCover(input: PendingRowCoverInput): PendingRowCo
   if (comparison.configDirMatches !== true) {
     return { answer: PENDING_ROW_NOT_COVERED, reason: PENDING_ROW_REASON_CONFIG_DIR_MISMATCH }
   }
+  if (comparison.tagPrompt === false) return { answer: PENDING_ROW_NOT_COVERED, reason: PENDING_ROW_REASON_TAG_PROMPT_MISSING }
   return { answer: PENDING_ROW_COVERED }
 }
 

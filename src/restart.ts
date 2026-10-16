@@ -437,6 +437,8 @@ export interface RestartDeps {
    * launch or accounting, and calls `armRetryTimer`.
    */
   isSessionAlive(key: string): Promise<LivenessReading>
+  /** b.omv SR-7.6: read provenance before pending/connected shortcuts. */
+  inspectUpgrade?(key: string): Promise<boolean>
   /** Check if the session already has a live MCP connection in the registry. */
   isSessionConnected(key: string): boolean
   /**
@@ -1723,6 +1725,9 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     armOnUnknown(d, key)
     return RESTART_OUTCOME_LIVENESS_UNKNOWN
   }
+
+  // b.omv SR-7.6: markerless rows never self-heal through the connected shortcut.
+  if (probe.kind !== LIVENESS_DEAD && await d.inspectUpgrade?.(key)) return RESTART_OUTCOME_RECONNECT_DEFERRED
 
   // b.jg5 SRJ-314: the row reads `pending`, so its session has not started.
   // It goes to the `pending` deferral whatever the session's connection

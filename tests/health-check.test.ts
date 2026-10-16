@@ -97,6 +97,7 @@ import {
   errConfigMalformed,
   errInternal,
   errSpawnNotFound,
+  errSystemInstallDisappeared,
   makeStubClient,
 } from './test-helpers/agent-director-stub.ts'
 
@@ -3271,5 +3272,48 @@ describe('b.jg5 SRJ-512, SRJ-513: a tick whose own liveness read latches P', () 
     expect(posts).toEqual([])
     expect(lines.filter((line) => line.includes('liveness unknown'))).toEqual([])
     assertNoLeak({ lines, latchLines, posts, notices })
+  })
+})
+
+// b.omv SR-7.6: installed upgrade inspection must not suppress ordinary
+// dead-persona recovery, even when inspection would defer or fail.
+describe('E4 guard: health liveness with upgrade inspection installed', () => {
+  afterEach(resetClientForTests)
+
+  test.each([
+    ['absent row', errSpawnNotFound()],
+    ['ended row', cannedStatusResult({ state: 'ended' })],
+    ['missing row', cannedStatusResult({ state: 'missing' })],
+    ['dead without a row read (install gone)', errSystemInstallDisappeared('status')],
+  ] as const)('%s bypasses inspection and schedules normal recovery immediately', async (_label, answer) => {
+    const config = makeMultiPersonaConfig([{ name: KEY }], baseDir)
+    const statusCalls: string[] = []
+    setClientForTests(makeStubClient({ statusFn: params => { statusCalls.push(params.instance_id!); return answer } }) as unknown as Client)
+    const deps = makeDeps({ personas: buildPersonaWorkList(config) })
+    deps.isSessionAlive = _buildIsSessionAliveAdapter(() => config)
+    const inspections: string[] = []
+    deps.inspectUpgrade = async key => { inspections.push(key); throw new Error('dead row must bypass upgrade inspection') }
+    initHealthCheck(deps)
+    await driveTicks(1)
+    expect(statusCalls).toEqual([personaInstanceId(KEY)])
+    expect(inspections).toEqual([])
+    expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: config.personas[0]!.working_directory }])
+    expect(deps.isSessionConnectedCalls).toEqual([])
+  })
+
+  test.each([
+    ['live', LIVENESS_READING_LIVE, true],
+    ['pending', LIVENESS_READING_PENDING, true],
+    ['unknown', LIVENESS_READING_UNKNOWN, false],
+  ] as const)('%s preserves its existing inspection or unknown-read gate', async (_label, reading, inspected) => {
+    const deps = makeDeps({ isSessionAliveResult: reading })
+    const inspections: string[] = []
+    deps.inspectUpgrade = async key => { inspections.push(key); return true }
+    initHealthCheck(deps)
+    const lines = await capturingErrors(() => driveTicks(1))
+    expect(inspections).toEqual(inspected ? [KEY] : [])
+    expect(deps.scheduleRestartCalls).toEqual([])
+    expect(deps.isSessionConnectedCalls).toEqual([])
+    expect(lines.filter(line => line.includes('liveness unknown'))).toHaveLength(inspected ? 0 : 1)
   })
 })
