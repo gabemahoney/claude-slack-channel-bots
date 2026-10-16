@@ -4206,6 +4206,87 @@ leg_real_native_idle_controls() {
         /opt/claude-code/2.1.280/claude /opt/claude-code/2.1.296/claude
 }
 
+leg_real_idle_diagnostic_controls() (
+    # Exercise the real wait/formatter without starting a bot or calling AD.
+    # The enclosing self-check already owns the image and scratch HOME.
+    TEST_NAME='test-0-fmk-real-idle-diagnostic-controls'
+    on_exit() { :; }
+    on_before_start() { :; }
+    source "${SCENARIO_FIXTURES}/../lib/real-scenario.sh"
+    local dir="${SCENARIO_ROOT}/idle-diagnostic-controls" rc mode
+    mkdir -p "${dir}"
+    export CONTROL_AUTH_SECRET="$(fake_token app idle)"$'\n"private\\value'
+    bun - "${dir}" "${SCENARIO_FIXTURES}" <<'FIXTURES'
+import { join } from 'node:path'
+import { writeFileSync } from 'node:fs'
+const [dir, fixtures] = process.argv.slice(2)
+const { deliveryPane } = await import(join(fixtures, '../../test-helpers/working-row-panes.ts'))
+const { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX, sentinelTicketUrl } = await import(join(fixtures, '../../test-helpers/credentials.ts'))
+const { redactRealObservation } = await import(join(fixtures, 'real-observations.ts'))
+const secret = process.env.CONTROL_AUTH_SECRET!
+for (const form of [secret, JSON.stringify(secret).slice(1, -1)]) {
+  const redacted = redactRealObservation(`before ${form} after`, process.env)
+  if (redacted !== 'before <redacted> after') throw new Error('runtime secret masking failed')
+  assertNoLeak(redacted)
+}
+for (const [name, pane] of [
+  ['empty', deliveryPane('')],
+  ['draft', deliveryPane('draft', { history: `${secret} ${fakeToken(BOT_TOKEN_PREFIX)} ${sentinelTicketUrl()}\n` })],
+  ['huge', deliveryPane('draft', { history: `${secret} ${'bounded '.repeat(8000)}\n` })],
+]) writeFileSync(join(dir, `${name}.json`), JSON.stringify({ pane }))
+writeFileSync(join(dir, 'status.json'), JSON.stringify({ state: 'waiting' }))
+FIXTURES
+    real_instance() { echo 'idle-control'; }
+    real_ad() { cat "${dir}/status.json"; }
+    real_pane() {
+        [[ "$2" == 40 ]] || fail 'idle diagnostic requested an unbounded pane'
+        if [[ "${mode}" == unreadable ]]; then return 1; fi
+        cat "${dir}/${mode}.json"
+    }
+    # One actual observation per control; avoid wall-clock waiting here.
+    _scenario_poll_until() { "$2" "$3"; }
+    mode=empty
+    real_wait_idle control 1 > "${dir}/success.out" 2>&1
+    [[ ! -s "${dir}/success.out" && ! -e "${SCENARIO_ROOT}/real-idle-pane.json" ]] \
+        || fail 'successful idle wait emitted failure diagnostics'
+    bun "${SCENARIO_FIXTURES}/real-observations.ts" "${dir}/empty.json" > "${dir}/ordinary.out"
+    for mode in draft unreadable; do
+        rc=0
+        (real_wait_idle control 1) > "${dir}/${mode}.out" 2>&1 || rc=$?
+        [[ "${rc}" == 1 ]] || fail 'failed idle wait lost its failure status'
+    done
+    bun "${SCENARIO_FIXTURES}/real-observations.ts" --idle-diagnostic "${dir}/huge.json" "${dir}/status.json" > "${dir}/huge.out"
+    bun - "${dir}" "${SCENARIO_FIXTURES}" <<'CHECK_DIAGNOSTICS'
+import { join } from 'node:path'
+import { readFileSync } from 'node:fs'
+const [dir, fixtures] = process.argv.slice(2)
+const { assertNoLeak } = await import(join(fixtures, '../../test-helpers/credentials.ts'))
+const check = (ok: boolean, why: string) => { if (!ok) throw new Error(why) }
+const ordinaryText = readFileSync(join(dir, 'ordinary.out'), 'utf8')
+assertNoLeak(ordinaryText)
+const ordinary = JSON.parse(ordinaryText)
+check(JSON.stringify(Object.keys(ordinary).sort()) === JSON.stringify(['pane', 'screen']), 'ordinary observation shape changed')
+check(ordinary.screen.kind === 'empty' && ordinary.screen.running === false, 'ordinary idle observation changed')
+for (const mode of ['draft', 'unreadable', 'huge']) {
+  const output = readFileSync(join(dir, `${mode}.out`), 'utf8')
+  assertNoLeak(output)
+  check(!output.includes('private') && !output.includes('SCENARIOFAKE'), 'diagnostic leaked runtime secret fragments')
+  const lines = output.trim().split('\n'), prefix = 'recorded: idle diagnostic '
+  check(lines[0].startsWith(prefix), 'failure evidence missing')
+  if (mode === 'huge') {
+    check(lines.length === 1 && lines[0].length <= prefix.length + 24000 + ' [truncated]'.length && lines[0].endsWith(' [truncated]'), 'diagnostic output is unbounded')
+    continue
+  }
+  check(lines.length === 2 && lines[1].startsWith('FAIL:'), 'diagnostic changed idle-wait failure')
+  const evidence = JSON.parse(lines[0].slice(prefix.length))
+  check(evidence.state === 'waiting', 'last row state was not retained')
+  if (mode === 'unreadable') check(evidence.pane === null && evidence.screen === null, 'unreadable pane invented idle proof')
+  else check(evidence.screen.kind !== 'empty' && evidence.pane.includes('<redacted>') && evidence.pane.includes('<redacted-token>') && evidence.pane.includes('<redacted-url>'), 'draft evidence lost screen or redaction')
+}
+console.log('recorded: idle diagnostics failure-only, bounded, redacted; unreadable pane unproved')
+CHECK_DIAGNOSTICS
+)
+
 nested_real_usage() {
     source "${SCENARIO_FIXTURES}/../lib/real-scenario.sh"
     nested_stand_in
@@ -4259,6 +4340,7 @@ LEGS=(
     real_fault_contract
     real_receipt_controls
     real_native_idle_controls
+    real_idle_diagnostic_controls
     real_usage_controls
     isolation
     real_binary

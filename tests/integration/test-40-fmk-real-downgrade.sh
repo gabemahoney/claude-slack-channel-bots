@@ -33,10 +33,11 @@ start_server --live
 real_wait_launch "${REAL_KEY}"
 # Its actual recorded template must carry channels; resume=false means no resume.
 [[ "$(cscb_ad_count_between "${OLD_MARK}" - resume)" == 0 ]] || fail 'previous release resumed instead of starting fresh'
-python3 - "${SCENARIO_AD_SHIM_LOG}" <<'CHECK'
+python3 - "${SCENARIO_AD_SHIM_LOG}" "${OLD_MARK}" <<'CHECK'
 import sys
-lines=open(sys.argv[1]).read().splitlines()
-assert any(l.startswith('call\t') and 'make-template' in l and '--channels' in l for l in lines), 'prior release template has no channels flag'
+lines=open(sys.argv[1]).read().splitlines()[int(sys.argv[2]):]
+templates=[l.split('\t',5)[5].split() for l in lines if l.startswith('call\t') and 'make-template' in l.split('\t',5)[5].split()]
+assert any('--dangerously-load-development-channels' in words and 'server:slack-channel-router' in words for words in templates), 'prior release template has no channels flag and router target'
 CHECK
 ! grep -Ei 'failed to load config|invalid persona config|load error' "${START_OUT}" || fail 'previous release load error'
 echo 'recorded: R55 step 4 prior release started fresh with channels'

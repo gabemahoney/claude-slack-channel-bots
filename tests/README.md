@@ -729,6 +729,12 @@ call log and the Slack stub record. Gate cases assert no particular model
 answer. Panes are read only through agent-director `read-pane`, using the
 packed screen adapter via `real-observations.ts`.
 
+If `real_wait_idle` times out, it captures the final status and a 40-line
+pane before cleanup and prints a `recorded:` idle diagnostic. Runtime
+credentials (including JSON-escaped forms), Slack tokens and URLs are
+redacted before the 24,000-character evidence limit. An unreadable pane is
+reported with null pane/screen evidence; it never substitutes for idle proof.
+
 Before each real scenario's server start and each receipt audit, the helper
 observes the real durable journal into private scenario state at
 `receipt-history/<key>.jsonl`. Recovery can compact completed entries out of
@@ -789,6 +795,8 @@ acceptances (including multipart and injected items), with 20 corruption/order
 negative controls plus a current-open-versus-stale-history control. Native
 idle controls inspect the installed pinned binaries and reject inactive panes
 and foreign-session/directory compaction boundaries.
+Idle diagnostic controls check success silence, preserved failure status,
+bounded redacted output and unreadable-pane evidence without starting a bot.
 The Slack stub's optional user/channel metadata controls retain the ordinary
 defaults and token rules; interactive `/_push` uses the actual recorded
 allow/deny button and a separate human identity.

@@ -13,6 +13,14 @@ afterEach(async () => { for (const h of harnesses.splice(0).reverse()) await h.c
 async function harness(options: Parameters<typeof makeEngineHarness>[0] = {}) { const h = await makeEngineHarness(options); harnesses.push(h); return h }
 async function start(h: EngineHarness, key = 'alpha') { await h.tick(key); await h.advance(LAUNCH_SETTLE_MS) }
 async function delivered(h: EngineHarness, key = 'alpha') { await h.until(() => h.queue.openCount(key) === 0) }
+async function drainTimers(h: EngineHarness) {
+  for (let turns = 0; h.engine.running('alpha') && turns < 1000; turns++) {
+    await new Promise<void>(resolve => setImmediate(resolve))
+    await h.clock.runNext()
+  }
+  expect(h.queue.openCount('alpha')).toBe(0)
+  expect(h.engine.running('alpha')).toBe(false)
+}
 
 describe('durable FIFO and send sequence', () => {
   test.each([
@@ -148,6 +156,81 @@ describe('durable FIFO and send sequence', () => {
     expect(launches[0]!.launchId).not.toBe(launches[1]!.launchId)
     expect(h.errors).toEqual([])
   })
+  test('20 sequential idle-ready messages meet AC76 with autonomous timers across empty queues', async () => {
+    const h = await harness(), typing: number[] = [], confirmation: number[] = []
+    for (let n = 0; n < 20; n++) {
+      // A real idle gap, rather than a permanently nonempty batch, exercises
+      // retirement of each engine while the native launch stays the same.
+      const calls = h.calls.length
+      await h.clock.advance(50)
+      expect(h.calls).toHaveLength(calls)
+      expect(h.clock.pending()).toEqual([])
+      expect(h.p().row.state).toBe('waiting')
+      expect(h.p().connected).toBe(true)
+      expect(h.p().box).toBe('')
+      const at = h.clock.now()
+      await h.accept(`latency ${n}`)
+      h.engine.wake('alpha')
+      await drainTimers(h)
+      typing.push(h.textCalls()[n]!.at - at)
+      confirmation.push(h.clock.now() - at)
+    }
+    const p95 = (values: number[]) => [...values].sort((a, b) => a - b)[Math.ceil(values.length * .95) - 1]!
+    // PRD N2 / AC76: these are latency requirements, independent of retry
+    // or receipt-wait constants that happen to have similar values.
+    expect(p95(typing)).toBeLessThanOrEqual(2000)
+    expect(p95(confirmation)).toBeLessThanOrEqual(10000)
+    expect(h.events.filter(e => e.type.startsWith('launch-')).map(e => e.type)).toEqual(['launch-observed', 'launch-first-waiting'])
+    expect(h.events.filter(e => e.type === 'delivered').map(e => e.seq)).toEqual(Array.from({ length: 20 }, (_, i) => i + 1))
+    expect(h.textCalls().map(c => c.params.text)).toEqual(Array.from({ length: 20 }, (_, i) => `latency ${i}`))
+    for (const c of h.calls) expect(h.calls.filter(x => x.at > c.at - 10000 && x.at <= c.at).length).toBeLessThanOrEqual(DELIVERY_MAX_AD_CALLS_PER_S * 10)
+    const calls = h.calls.length
+    await h.clock.advance(RECEIPT_WAIT_MS)
+    expect(h.calls).toHaveLength(calls)
+    expect(h.clock.pending()).toEqual([])
+    expect(h.errors).toEqual([])
+  })
+  test.each(['launch', 'session', 'forget', 'server'] as const)('%s after an empty queue starts a new first-waiting settle window', async change => {
+    const h = await harness()
+    await h.accept('before'); h.engine.wake('alpha'); await drainTimers(h)
+    const prior = h.events.filter(e => e.type === 'launch-first-waiting')[0]!
+    await h.clock.advance(50)
+    if (change === 'launch') h.lifecycle.beforeLaunch('alpha')
+    else if (change === 'session') {
+      h.p().row.session_id = 'replacement-session'
+      h.p().path = `${h.root}/replacement-session.jsonl`
+      h.p().row.jsonl_path = h.p().path
+      writeTranscript(h.p().path, endedTurn())
+    }
+    else if (change === 'forget') await h.engine.forget('alpha')
+    else await h.restartServer()
+    await h.accept('after'); await h.tick()
+    const waiting = h.events.filter(e => e.type === 'launch-first-waiting').at(-1)!
+    expect(h.events.filter(e => e.type === 'launch-observed')).toHaveLength(2)
+    expect(h.events.filter(e => e.type === 'launch-first-waiting')).toHaveLength(2)
+    expect(waiting.at).toBe(h.clock.now())
+    expect(waiting.at).toBeGreaterThan(prior.at)
+    await h.clock.advance(LAUNCH_SETTLE_MS - 1)
+    expect(h.textCalls().map(c => c.params.text)).toEqual(['before'])
+    await drainTimers(h)
+    expect(h.textCalls()[1]!.at).toBeGreaterThanOrEqual(waiting.at + LAUNCH_SETTLE_MS)
+    expect(h.textCalls().map(c => c.params.text)).toEqual(['before', 'after'])
+    expect(h.errors).toEqual([])
+  })
+  test('a working row after queue retirement keeps its real first-waiting evidence without inventing another', async () => {
+    const h = await harness()
+    await h.accept('before'); h.engine.wake('alpha'); await drainTimers(h)
+    const launchEvents = h.events.filter(e => e.type.startsWith('launch-'))
+    await h.clock.advance(50)
+    h.p().row.state = 'working'
+    const at = h.clock.now()
+    await h.accept('while working'); h.engine.wake('alpha')
+    await drainTimers(h)
+    expect(h.textCalls().map(c => c.params.text)).toEqual(['before', 'while working'])
+    expect(h.textCalls()[1]!.at - at).toBeLessThan(LAUNCH_SETTLE_MS)
+    expect(h.events.filter(e => e.type.startsWith('launch-'))).toEqual(launchEvents)
+    expect(h.errors).toEqual([])
+  })
   test('an intake wake during the text-to-Enter pause keeps delivery ownership until the separate Enter', async () => {
     const h = await harness(); await h.accept()
     let notifyText!: () => void
@@ -225,8 +308,12 @@ describe('fresh send guards', () => {
   test('gate obtains an independent fresh read before typing, even when the prior screen was empty', async () => {
     const h = await harness(), p = h.p()
     await h.accept(); await h.tick()
-    p.readHook = () => { if (h.clock.now() >= LAUNCH_SETTLE_MS && p.reads >= 3) p.box = 'a new human draft' }
+    let freshReads = 0
+    // The engine sees an empty composer on the first read of a ready tick;
+    // only the next, independent gate read sees the newly arrived draft.
+    p.readHook = () => { if (h.clock.now() >= LAUNCH_SETTLE_MS && ++freshReads === 2) p.box = 'a new human draft' }
     await h.advance(LAUNCH_SETTLE_MS + RECEIPT_WAIT_MS)
+    expect(freshReads).toBeGreaterThanOrEqual(2)
     expect(h.keyCalls()).toEqual([])
     p.readHook = undefined; p.box = ''
     await delivered(h)

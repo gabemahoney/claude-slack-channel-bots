@@ -94,6 +94,9 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     recover: boolean; restarted?: string; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; lastBox?: string; cleanup: boolean; dialogMaybeOpen: boolean
   }
   const states = new Map<string, State>(), budgets = new Map<string, () => void>(), lastDelivered = new Map<string, { pair: DeliveryPair; text: string }>()
+  // Empty queues retire their engine, not the already observed launch. Keep
+  // its first waiting read without polling an otherwise idle persona.
+  const launches = new Map<string, { launchId: string; sessionId: string; waitingAt?: number }>()
   let stopped = false
   const typed = new Set<string>()
   function emit(event: DeliveryEngineEvent): void { try { void Promise.resolve(deps.onEvent?.(event)).catch(() => {}) } catch {} }
@@ -155,6 +158,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       }
       if (row.state === 'waiting' && s.waitingAt === undefined && life.launchId(key) === s.e.launchSeen) {
         s.waitingAt = clock.now()
+        const launch = launches.get(key)
+        if (launch?.launchId === life.launchId(key) && launch.sessionId === row.session_id) launch.waitingAt = s.waitingAt
         emit({ type: 'launch-first-waiting', key, launchId: life.launchId(key), sessionId: row.session_id, at: s.waitingAt })
       }
       return true
@@ -275,6 +280,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   }
   async function run(key: string, s: State): Promise<void> {
     let nextDelay = DELIVERY_ROW_POLL_MS
+    let observedPair: DeliveryPair | undefined, readyObserved = false
     try {
       // Finish our own append/call continuations without replacing the key
       // reading. Every new operation obtains a new screen and gate grant.
@@ -299,9 +305,14 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           s.lastSeq = head.accepted.seq; s.lastPart = part; s.e.enterRetries = 0; s.lastRetypeEvent = undefined; s.e.target = pair; s.notNowStep = 0
           s.recover = effectiveSends(head, part).length > 0 || head.unknownSend
         }
-        if (!s.pending && observedItem && (s.e.phase === 'ready' || s.e.phase === 'receipt' || !s.row)) {
+        if (!s.pending && observedItem && (s.e.phase === 'ready' || s.e.phase === 'receipt' || !s.row)
+          && (!observedPair || observedPair[0] !== observedItem.accepted.seq || observedPair[1] !== observedPart || (s.e.phase === 'ready' && !readyObserved))) {
           const needScreen = s.e.phase === 'ready'
           if (!await observe(key, s, observedItem, observedPart, needScreen)) { release(s); break }
+          // Pure transitions and durable appends consume this tick's reading.
+          // The gate still obtains its own fresh observation below; do not
+          // replace the engine reading again after that independent grant.
+          observedPair = [observedItem.accepted.seq, observedPart]; readyObserved = needScreen
           k = build(key, s)
         }
         const action = decideEngine(k)
@@ -323,10 +334,15 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           release(s); s.e.phase = 'ready'; s.e.launchSeen = k.r.launch; s.e.sessionSeen = k.r.session; s.e.compactionSeen = k.r.compactions
           s.e.retypes = {}; s.dialogHold = false; s.dialogMaybeOpen = false; s.e.enterRetries = 0; s.retryStep = 0; s.notNowStep = 0; s.recover = true
           s.deadlines.backoff = 0; s.deadlines.notNow = 0; s.deadlines.enterDelay = 0; s.deadlines.idleEvidence = clock.now() + ms('IDLE_EVIDENCE_MAX_WAIT_MS', IDLE_EVIDENCE_MAX_WAIT_MS)
-          s.waitingAt = s.row?.state === 'waiting' ? clock.now() : undefined
+          const previous = launches.get(key), launchId = life.launchId(key), sessionId = s.row!.session_id
+          const sameLaunch = previous?.launchId === launchId && previous.sessionId === sessionId
+          s.waitingAt = sameLaunch ? previous.waitingAt : undefined
+          const firstWaiting = s.waitingAt === undefined && s.row?.state === 'waiting'
+          if (firstWaiting) s.waitingAt = clock.now()
+          launches.set(key, { launchId, sessionId, waitingAt: s.waitingAt })
           s.deadlines.settle = s.waitingAt === undefined ? Infinity : s.waitingAt + ms('LAUNCH_SETTLE_MS', LAUNCH_SETTLE_MS)
-          emit({ type: 'launch-observed', key, launchId: life.launchId(key), sessionId: s.row!.session_id, at: clock.now() })
-          if (s.waitingAt !== undefined) emit({ type: 'launch-first-waiting', key, launchId: life.launchId(key), sessionId: s.row!.session_id, at: s.waitingAt })
+          if (!sameLaunch) emit({ type: 'launch-observed', key, launchId, sessionId, at: clock.now() })
+          if (firstWaiting) emit({ type: 'launch-first-waiting', key, launchId, sessionId, at: s.waitingAt! })
           continue
         }
         if (action === 'observeCompaction') { s.e.compactionSeen = k.r.compactions; s.recover = true; s.e.phase = 'ready'; release(s); continue }
@@ -474,8 +490,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       await api.tick(key)
       return !s.recover && life.owner(key) !== 'delivery'
     },
-    async forget(key) { lastDelivered.delete(key); const s = states.get(key); if (!s) { life.forget(key); return }; s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); await s.busy; states.delete(key); life.engineRunning(key, false); life.forget(key) },
-    async stop() { stopped = true; const stoppingLife = life.stop(); for (const [key, s] of states) { s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); life.engineRunning(key, false) }; await Promise.allSettled([...states.values()].flatMap(s => s.busy ? [s.busy] : [])); await stoppingLife; states.clear(); lastDelivered.clear() },
+    async forget(key) { lastDelivered.delete(key); launches.delete(key); const s = states.get(key); if (!s) { life.forget(key); return }; s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); await s.busy; states.delete(key); life.engineRunning(key, false); life.forget(key) },
+    async stop() { stopped = true; const stoppingLife = life.stop(); for (const [key, s] of states) { s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); life.engineRunning(key, false) }; await Promise.allSettled([...states.values()].flatMap(s => s.busy ? [s.busy] : [])); await stoppingLife; states.clear(); lastDelivered.clear(); launches.clear() },
     running: key => states.has(key),
     snapshot: key => states.get(key)?.snapshot,
     status: key => { const s = states.get(key); return s ? status(key, s) : undefined },

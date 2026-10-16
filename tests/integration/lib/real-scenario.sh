@@ -156,7 +156,16 @@ _real_empty() {
     jq -e '.screen.kind == "empty" and .screen.running == false' <<< "${observation}" >/dev/null
 }
 real_wait_idle() {
-    wait_until "${2:-${REAL_DELIVERY_WAIT_S}}" "real persona $1 never showed an empty idle composer" _real_empty "$1"
+    local timeout="${2:-${REAL_DELIVERY_WAIT_S}}" pane="${SCENARIO_ROOT}/real-idle-pane.json" status="${SCENARIO_ROOT}/real-idle-status.json"
+    _scenario_check_timeout "${timeout}" real_wait_idle
+    if _scenario_poll_until "${timeout}" _real_empty "$1"; then return 0; fi
+    # Capture the actual final row and pane before cleanup kills the native
+    # session. This is failure evidence only, never an idle-state substitute.
+    real_ad status --instance-id "$(real_instance "$1")" > "${status}" 2>/dev/null || printf '{}\n' > "${status}"
+    real_pane "$1" 40 > "${pane}" 2>/dev/null || printf '{}\n' > "${pane}"
+    bun "${SCENARIO_FIXTURES}/real-observations.ts" --idle-diagnostic "${pane}" "${status}" \
+        || echo 'recorded: idle diagnostic unavailable'
+    fail "real persona $1 never showed an empty idle composer (not within ${timeout}s)"
 }
 real_record_pane() {
     local pane="${SCENARIO_ROOT}/real-pane.json" observation
