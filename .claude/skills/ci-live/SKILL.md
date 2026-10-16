@@ -9,7 +9,7 @@ allowed-tools: [Bash]
 
 The live, pre-deploy acceptance run of CSCB: every `testplans/b.yko` check that can
 be automated, against the **test workspace** only (never a production workspace),
-in a fresh container built from the `/ci` base (`cscb-ci-base:v7`), with the
+in a fresh container built from the `/ci` base (`cscb-ci-base:v8`), with the
 package under test installed the way a customer installs it. The production
 bots on this host are never touched: the container has its own HOME, config,
 tmux, agent-director store and port, runs on the default docker network (no
@@ -76,7 +76,7 @@ installed Google Chrome, headless; no browser download):
 ## Procedure
 
 1. Check docker (`docker info`) and the `/ci` base image (`docker image inspect
-   cscb-ci-base:v7`; if missing, run `/ci` once). Then fetch the binary both
+   cscb-ci-base:v8`; if missing, run `/ci` once). Then fetch the binary both
    runs below stage in the live image: the `agent-director-linux-amd64` asset
    of the agent-director release the base pins (`ARG AD_VERSION` in
    `docker/Dockerfile.test.base`), downloaded from agent-director's GitHub

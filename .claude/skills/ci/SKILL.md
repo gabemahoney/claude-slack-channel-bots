@@ -543,9 +543,9 @@ that may choose its N is judged at 1 shard for these messages.
 The runner reads credentials from its own environment, which the launch
 passes on unchanged.
 
-- `ANTHROPIC_API_KEY` must be set and not empty. The bot Claudes the daemon
-  under test spawns need an API key, not Claude Code's OAuth; in the image
-  they run a stub `claude`, so the key serves no model call.
+- `ANTHROPIC_API_KEY` must be set and not empty. The real-agent `-fmk-real-`
+  scripts use it for Claude Code model calls in every full `/ci` run. Other
+  scripts use stub `claude`; the bots do not use Claude Code OAuth.
 - A key that does not begin `sk-ant-` is a gateway credential, not a raw
   Anthropic key, and needs `ANTHROPIC_BASE_URL` (and `ANTHROPIC_MODEL`) set
   too. An empty `ANTHROPIC_BASE_URL` counts as unset.
@@ -612,7 +612,7 @@ ANTHROPIC_API_KEY="${CI_ANTHROPIC_API_KEY}" ANTHROPIC_BASE_URL="${CI_ANTHROPIC_B
 
 ### The base image
 
-The test image is built `FROM` the base image `cscb-ci-base:v7`, the one
+The test image is built `FROM` the base image `cscb-ci-base:v8`, the one
 `docker/Dockerfile.test`'s `FROM` line names. It is built once per host. When
 it is missing, the runner checks its build prerequisites before the
 admission lock, without changing anything, and refuses when one fails:
