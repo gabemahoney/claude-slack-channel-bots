@@ -1,11 +1,12 @@
 # Tests
 
-`claude-slack-channel-bots` has three kinds of tests:
+`claude-slack-channel-bots` has four kinds of tests:
 
 | Kind | Where | Run by |
 |---|---|---|
 | Unit suite | `tests/*.test.ts`, `tests/integration/session-leader.test.ts` | `bun test`, on a dev box |
 | Docker integration suite | `tests/integration/test-*.sh`, `tests/runner.sh`, `tests/ci-durations.tsv`, `docker/` | `/ci`: the host runner `scripts/ci-run.ts` builds the run's own test image (a run-private tag, pinned by its image ID) and runs the scripts in up to 6 shard containers from it |
+| Real-agent heavy leg | `tests/real-agent/`, `scripts/real-agent-matrix.ts` | Explicit local Docker matrix run; separate from `/ci` |
 | Live acceptance plan | `testplans/b.yko/b.yko.md` | an operator, by hand, on a test host and test Slack workspace; or `/ci-live` (`ci-live/`), in a throwaway container against the test workspace |
 
 Conventions for unit tests are in `docs/testing-guide.md`; this file covers how
@@ -130,7 +131,9 @@ Bash scripts that install the packed package, write a persona config and
 start the server in dry run. Test 4, Test 0, Tests 10, 12 and 29 and every
 fmk scenario leave dry run: Test 4 runs its driver, which spawns under a stub
 `claude` and starts no server, and the others start a live server, against
-the loopback Slack stub.
+the loopback Slack stub. Ordinary scenarios use the stub Claude; the nine
+`-fmk-real-` scripts select native Claude Code and make real model calls on
+every full `/ci` run.
 
 The `/ci` skill (`.claude/skills/ci/SKILL.md`) launches the host runner,
 `scripts/ci-run.ts`, detached, and polls it with the verdict reader,
@@ -182,6 +185,10 @@ why:
 - `fixtures/fmk-texts.ts`: the same first statement, exiting 2 before it
   reads an argument or loads a module; it statically imports only `node:`
   built-ins and loads the installed package only after the check.
+- `lib/real-scenario.sh`: checks the image and scenario HOME at source time,
+  then requires a `-fmk-real-` test name. `transcript-receipts.ts`,
+  `real-observations.ts` and `real-case-assertions.ts` guard their executable
+  packed-package loads; their importable pure helpers perform no launch.
 - `fixtures/agent-director-list-refusing.sh`: its first step. It prints one
   line to stderr and exits 70 before it reads an argument or runs a binary.
 - `fixtures/ad-version-stand-in.sh`: checks the marker before it reads its
@@ -576,9 +583,26 @@ tests/
                                    # warning, and that the CLI's `stop` finds the server
     test-31-fmk-ack-burst.sh       # b.omv SR-13.6 / AC75, fmk mode: 1,000 concurrent Slack events for one silent stub persona, every actual WebSocket ACK
                                    # within 3,000 ms of its pre-send monotonic timestamp; exactly 1,000 items remain outstanding with no typing, receipts or model calls
+    test-32-fmk-real-order.sh      # real Claude: down-queue order, one in flight with faults/restart, 20-DM p95 latency
+    test-33-fmk-real-keys.sh       # swallowed text/Enter, repeated misses, unknown outcomes and 5,000-byte multipart recovery
+    test-34-fmk-real-compact.sh    # explicit and supported idle compaction, retaining ordered exact receipts
+    test-35-fmk-real-restarts.sh   # restart, resume, new conversation and markerless upgrade replacement
+    test-36-fmk-real-crash.sh      # server SIGKILL between text and Enter, then durable recovery
+    test-37-fmk-real-mcp.sh        # server restart, test-only MCP drop, deferred reconnect and an occupied draft
+    test-38-fmk-real-cron.sh       # three down-persona fires in order, fire-time timestamps and non-loopback bind
+    test-39-fmk-real-fidelity.sh   # Unicode and 850/1,400/1,900-byte bodies, exact receipts with no retype
+    test-40-fmk-real-downgrade.sh  # R55/decision 15 downgrade to published 0.16.1 on native Claude 2.1.280
     lib/
+      real-scenario.sh             # native agent setup, minimal permissions, exact evidence, faults, bounds and once-only EXIT accounting
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
+      transcript-receipts.ts       # imports the packed production matcher; persona/session/directory-scoped receipts, order, latency and usage
+      real-observations.ts         # packed screen observations through agent-director pane reads
+      real-case-assertions.ts      # deterministic gate/heavy case checks and negative self-check controls
+      agent-director-unresponsive.json
+                                   # real 0.12.0 ErrTmuxUnresponsive envelope used by counted unknown-outcome faults
+      agent-director-unresponsive.provenance.json
+                                   # captured binary/version/hash, image, command and fault setup for that envelope
       agent-director-shim.sh       # the logging agent-director shim of fmk mode: logs each call's argv and parent, then execs the real binary beside it
       agent-director-list-refusing.sh
                                    # scenario 9's agent-director stand-in (a harness addition), swapped in behind the shim with
@@ -600,7 +624,7 @@ tests/
                                    # the image marker or its settings file (see Scenario helper)
       driver.ts                    # Test 4 driver: builds a one-persona config, calls spawnForPersona directly, then follows the persona's dialog approver through the package's seams
                                    # (running when the launch returns, stops because the row went live, keeps the launch start); deletes no row
-      stub-claude.sh               # fake `claude` (Tests 4, 10, 12 and 29, and every fmk script): runs the mode its working directory selects (the
+      stub-claude.sh               # fake `claude` (Tests 4, 10, 12 and 29, and ordinary fmk scripts): runs the mode its working directory selects (the
                                    # at-once default, explicitly selected startup-trust or dev-channels dialog, silent, an unrecognised dialog, the trust-aware folder-trust prompt, startup-trust with the
                                    # transcript written only at the first message, at once and lingering after `pause`'s `/exit`), reports in by firing every SessionStart
                                    # hook its `--settings` registers, and SessionEnd on its exit sentinel, as direct children of its own process (exec form:
@@ -656,6 +680,179 @@ of its own (b.jg5 SRJ-601), and fmk scenarios 3 and 17 replace it (b.jg5
 SRJ-1305). Scenario 3 is Test 15 (`test-15-fmk-prefix-neighbour.sh`);
 scenario 17 is `assert_no_server_tmux` across every fmk script (see Closing
 assertions).
+
+### Real Claude gate and heavy legs (b.omv SR-14)
+
+Tests 32–40 are the nine real Claude gates included in every full `/ci` run.
+They drive the packed CSCB against the loopback Slack stub, select native
+Claude Code 2.1.296 through agent-director's `[launch].claude_path`, and keep
+the stub first on PATH for ordinary scripts. The downgrade gate explicitly
+selects 2.1.280. Each real script owns an isolated HOME, agent-director
+install/store and tmux server, with onboarding completed, the run's key
+approved and only its required permission allow rules; no bypass mode.
+
+Only the run's API key, base URL and model are used (`ANTHROPIC_API_KEY`,
+`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`); supply the CI credentials through
+`/ci`'s existing `CI_ANTHROPIC_*` route. These scripts make real model calls,
+whose cost the owner accepted. They clear inherited subscription/OAuth
+credentials. No key goes into an image, repository, log or result file.
+No real bot, agent-director or tmux runs on the host.
+
+`lib/real-scenario.sh` provides native version checks, persona/Slack stub
+setup, fault installation, MCP drop, waiting/launch helpers and exact receipt
+assertions. Its delivery wait is 180 s, launch wait 300 s and compact wait
+120 s. A timeout fails the scenario; no script or coordinator automatically
+reruns a failed case. Product delivery retries within a scenario remain part
+of the behavior under test.
+
+**Current validation limitation (2026-10-16):** Test 34 on native 2.1.296
+passed explicit `/compact` and four deliveries, then failed to observe idle
+compaction within 120 s (run `20261016t184510z-tyztec33`).
+
+Container binary inspection found that
+`CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS=1` is clamped to
+100,000 tokens; the idle-compaction mode defaults off behind a remote gate,
+and `idleCompaction:true` does not enable it. It also requires a 1 h cache
+and a firing fraction clamped to 0.5–0.95 (earliest 30 min, default 54 min),
+while the API-key cache TTL defaults to 5 min.
+
+A low token setting cannot
+force this step within its bound; the remote noninteractive SleepCompactor
+is not an interactive substitute. Native 2.1.280 lacks the feature and
+retains its unsupported-step skip. The 2.1.296 step remains required;
+full `/ci` and heavy acceptance need owner reconciliation of this native
+capability premise. No production defect was established by this failure.
+
+`fixtures/transcript-receipts.ts` loads the installed tarball's
+`src/delivery-receipt.ts` parser and exact matcher. It correlates a persona's
+journal attempts and launch observations with session IDs and transcript
+directories; subagent records cannot confirm the parent's take-in. Diagnostic
+correlation also checks source, conversation/sender, timestamp and sender ID.
+Allowed evidence is the bot's own transcript, CSCB `server.log`, the shim
+call log and the Slack stub record. Gate cases assert no particular model
+answer. Panes are read only through agent-director `read-pane`, using the
+packed screen adapter via `real-observations.ts`.
+
+A pass requires every accepted part to appear at least once, first
+appearances in accept order, no successor send before the prior delivery
+line, and no open item at the end. At-least-once delivery can produce full
+text duplicates; count and report them without failing solely for duplicates.
+The first-launch check permits full-text reoffers but rejects an Enter-only
+retry; it verifies the observed first-waiting settle and text-to-Enter timing.
+The busy case proves the target message arrived during the matching tool's
+active interval and was taken in in that turn or the immediately following
+turn, rather than inferring overlap from a `working` row alone.
+
+Print panes, fidelity observations and measurements only as `recorded:`
+lines in the script log. The shared EXIT hook prints one `duplicates:` count
+and one `tokens:` JSON object (`input`, `output`, `cache_read`,
+`cache_creation`), including on failure, after teardown and before deleting
+HOME/transcripts. Usage includes launch and subagent work and deduplicates
+streamed assistant message IDs. An incomplete/damaged report is a failure,
+not zero usage. Nothing is written under `/test-results/`.
+
+The gate latency step sends 20 DMs only with a connected, waiting bot,
+empty composer and nothing in flight. It measures `message-received` to the
+shim's first send and `message-delivered`: p95 typing start ≤2 s and delivery
+≤10 s. The separate stub-only 3 s Slack Socket Mode acknowledgement check
+measures intake/ACK, not those receipt-confirmed latency limits.
+
+#### Counted key faults
+
+The shim reads `agent-director-shim.faults` beside its log on every call,
+without fault environment variables. Each line is
+`<verb> <match> <action> <count>`; matching forms include `*`, `key=Enter`
+and `no_enter`. Rules are consumed by count under a stable lock and an atomic
+rewrite, with one `fault` log line per application.
+
+| Action | Effect |
+|---|---|
+| `swallow` | Return success without running the binary |
+| `delay=3000` | Delay the real call by the given milliseconds |
+| `unknown-typed` | Run the binary, then answer the captured unresponsive envelope |
+| `unknown-untyped` | Answer that envelope without running the binary |
+
+`fixtures/agent-director-unresponsive.json` and its `.provenance.json`
+record the real released agent-director 0.12.0 envelope and capture setup.
+These scenario faults are distinct from the host runner's `--inject` faults.
+Test 0 self-checks counted consumption, unknown outcomes, packed receipt
+rejection controls, once-only usage and actual Slack button push behavior.
+The Slack stub's optional user/channel metadata controls retain the ordinary
+defaults and token rules; interactive `/_push` uses the actual recorded
+allow/deny button and a separate human identity.
+
+#### Heavy inventory and invocation
+
+The heavy leg must pass once on the final build before this work is
+complete, and again before any release that changes the delivery path,
+the tag description or the agent versions tested (PRD R60, SR-14.4).
+
+The following ten scripts live under `tests/real-agent/`, outside `/ci`
+discovery. `ai-scenario.sh` is their seven-criterion shared body; its JSON
+read-back checks compare required fields through `real-case-assertions.ts`.
+
+| Script | Checks |
+|---|---|
+| `test-101-fmk-real-busy.sh` | Active pre-allowed tool, permission hold and subagent denial/dialog-hold recovery |
+| `test-102-fmk-real-replies.sh` | DM, mention and thread reply destinations; three fresh-launch first messages |
+| `test-103-fmk-real-latency100.sh` | The 100-DM AC76 latency step |
+| `test-111-fmk-real-ai-ac11.sh` | Original wrapper corpus attributes/body read-back |
+| `test-112-fmk-real-ai-ac12.sh` | Prefix hazards read as text, with no native shell-input execution |
+| `test-115-fmk-real-ai-ac15.sh` | Multipart reassembly into one 5,000-character message |
+| `test-120-fmk-real-ai-ac20.sh` | Outer sender identity despite body spoofing/attribute quoting |
+| `test-123-fmk-real-ai-ac23.sh` | Sender read-back and reply after compact/resume |
+| `test-191-fmk-real-ai-ac91.sh` | DM/thread replies without an operator prompt file |
+| `test-206-fmk-real-ai-ac106.sh` | Duplicate copy recognized as one logical DM |
+
+With CI credentials already provided privately in the invoking environment,
+run from the repo root:
+
+```sh
+bun scripts/real-agent-matrix.ts --output /tmp/cscb-real-agent-run
+```
+
+It reads `CI_ANTHROPIC_API_KEY`, `CI_ANTHROPIC_MODEL` and optional
+`CI_ANTHROPIC_BASE_URL`; a gateway key requires the base URL. The optional
+`CI_ANTHROPIC_OPUS_MODEL` selects an Opus 5.5 identifier (default
+`claude-opus-5-5`); other models are refused for AI criteria. `--plan`
+resolves runtime latest and writes the plan without building or running bots;
+it is not acceptance evidence. Use a fresh output directory each time.
+
+The coordinator resolves latest afresh for each invocation and makes three
+sequential Docker jobs: 2.1.280, 2.1.296 and runtime latest, even when latest
+equals a pin. Each executes all nine gate scripts plus busy/replies; the
+downgrade script retains its explicit 2.1.280 selection. The 2.1.296 job
+alone runs 100 DMs once and seven Opus 5.5 criteria three times each: **21 AI
+trials total**, requiring 3 of 3 for every criterion.
+
+Local jobs use the committed `/ci` caps, currently 2 GiB, 2 CPUs and 2,048
+PIDs, with 3 h per job. `docker/Dockerfile.real-agent` and
+`docker/real-agent-job.sh` install/check the packed package and run each
+scenario as testuser. The coordinator owns temporary staging, containers
+and its image; failed cleanup fails the run. Child process groups are
+terminated on timeout/interruption, with bounded output drain. It runs no
+scheduler jobs today. The future scheduler contract records 8 GiB, 4 CPUs,
+3 h, network on and the key as a scheduler secret, after scheduler secrets
+are available. Codex login/harness integration is E7 work, not supplied by
+this Claude runner.
+
+Output is private `run.log`, `plan.json` and completed `job-N.json` files,
+including the packed package SHA-256, versions and per-scenario results.
+Output paths inside the checkout or `/test-results/`, including symlink
+aliases, are refused; result files are exclusive, no-follow and secret
+scanned, with child output masked before logging. `real-agent-result:` uses
+`reported:false` and nullable token/duplicate fields when reports are
+missing; totals retain observed usage even on failure. A real run ends with
+one `REAL-AGENT-VERDICT PASS|FAIL <run-id>` line; plan-only ends with
+`REAL-AGENT-PLAN`. Do not interpret a plan or missing report as a pass.
+
+The downgrade scenario follows PRD R55 and review decision 15, not a
+transcription of `docs/migration.md`: empty queues, confirm
+`resume_enabled:false`, stop server/bots, restore native 2.1.280 and install
+the published 0.16.1 tarball, start fresh with channels, then confirm resume
+on again. E8 documents the executed operator process later. Measured script
+durations belong in `tests/ci-durations.tsv` after an actual run; no paid
+gate/full-CI or heavy result or duration is established by this inventory.
 
 ### fmk scenarios
 
@@ -1927,17 +2124,23 @@ These hold for every fmk script (b.jg5 SRJ-1401):
 - CSCB's timings are shortened only through its configuration
   (`health_check_interval`, `session_restart_delay`) and the package's
   exported seams, never by editing `src/`; scenarios 20 (Test 23) and 24
-  (Test 26) also use the test-only `test_timer_overrides` block of that
-  configuration (next bullet). agent-director's are changed only
-  through the `[tmux]` table of scenarios 10, 20 and 24, written with
+  (Test 26), delivery scenarios and real-agent scenarios also use the
+  test-only `test_timer_overrides` block of that configuration (next bullet).
+  agent-director's are changed only through the `[tmux]` table of scenarios
+  10, 20 and 24, written with
   `write_ad_settings`, beside which scenario 24 also writes a `[pause]`
   table; every other scenario
   waits out agent-director's default windows (at least 300 s where it needs
   the starting-session bound, as the finished-row kill does).
-- The test-only timer overrides (b.2nr) are used by scenarios 20 (Test 23) and
-  24 (Test 26) only. The block is the top-level `test_timer_overrides` object
-  of the `config.json` the scenario writes; it is off by default and
-  undocumented for users. The retry timer's base and ceiling
+- The test-only timer overrides (b.2nr) are used by scenarios 20 (Test 23),
+  24 (Test 26), delivery scenarios and real-agent scenarios. These include
+  the existing E5 `delivery_stuck_after_ms` override. The block is the
+  top-level `test_timer_overrides` object of the `config.json` the scenario
+  writes; it is off by default, never written into a user's configuration
+  or shipped settings example, and undocumented for users. Keep any timer
+  whose actual duration the case asserts at its production value (see
+  [Test-only timer overrides](../docs/testing-guide.md#integration-scripts-run-only-in-docker-ci)).
+  The retry timer's base and ceiling
   (`unavailable_retry_base_s`, `unavailable_retry_ceiling_s`) are set
   together, the ceiling not below the base.
 - The server reads the block once at each start, from the start-time
@@ -2985,10 +3188,13 @@ absent, and the seeders refuse. Rebuild live fixtures only after the upgrade.
 
 ### The stub worker
 
-`fixtures/stub-claude.sh` stands in for `claude` in every script that
-launches through the real agent-director (Test 4, Tests 10, 12 and 29, every
-fmk script). Its header comment is the full statement; this is the part every
-scenario relies on (b.jg5 SRJ-1306 as amended by b.deo SRI-1402 to SRI-1404).
+`fixtures/stub-claude.sh` stands in for `claude` in the ordinary scenarios
+that launch through the real agent-director: Test 4, Tests 10, 12 and 29,
+and the stub fmk scripts. The `-fmk-real-` scripts select a native Claude
+binary through `[launch].claude_path` and make real model calls (see
+[Real Claude gate and heavy legs](#real-claude-gate-and-heavy-legs-bomv-sr-14)).
+The stub's header comment is the full statement; the contract below applies
+to stub scenarios (b.jg5 SRJ-1306 as amended by b.deo SRI-1402 to SRI-1404).
 
 Modes. The stub's working directory, by its real path, selects its mode.
 `stub_mode <dir> <mode>` adds the selection to `stub-claude-modes` beside the
@@ -3772,7 +3978,13 @@ the limits get tighter, so refresh it.
   `cscb_ad_calls`, `cscb_ad_count`), never from a pane. The harness's tmux
   steps (see Harness-only steps) play the human; they are never assertions
   made by reading a pane's text.
-- Retries, fix-it-yourself logic, or self-healing. A test is a strict assertion.
+- For `-fmk-real-` scripts only, b.omv SR-14.1 permits the bot's native
+  transcript through `fixtures/transcript-receipts.ts`, importing the packed
+  production matcher, and pane reads through agent-director `read-pane`.
+  Evidence stays within that bot's transcript, server/shim logs and Slack
+  record; observations print as `recorded:` lines, never `/test-results/`
+  artifacts. AI field comparisons belong only to the explicit heavy leg.
+- Automatic scenario reruns, fix-it-yourself logic, or self-healing. A test is a strict assertion.
 
 ### Fault injection
 

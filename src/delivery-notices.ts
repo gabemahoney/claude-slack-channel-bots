@@ -136,6 +136,10 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
   }
   function engineEvent(event: DeliveryEngineEvent): void {
     const key = event.key
+    if (event.type === 'launch-observed' || event.type === 'launch-first-waiting') {
+      deps.log(`[slack] delivery-${event.type}: ${JSON.stringify({ key, launch_id: event.launchId, session_id: event.sessionId, at: event.at })}`)
+      return
+    }
     if (event.type === 'reconnect-screen') { if (event.blockedMs >= RECONNECT_BLOCKED_NOTICE_MS && deps.state(key).up) deps.reconnectBlocked(key, event.reason); return }
     if (event.type === 'marker-missing' || event.type === 'delivered') return
     const item = deps.queue.items(key).find(i => i.accepted.seq === event.seq)

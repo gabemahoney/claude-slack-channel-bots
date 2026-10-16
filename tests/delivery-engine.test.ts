@@ -3,9 +3,9 @@
  * own suite. Every timestamp and retry is driven by the injected fake clock. */
 import { afterEach, describe, expect, test } from 'bun:test'
 import { readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
-import { createDeliveryCallBudget, DeliveryBudgetWait, deliveryTextWasRefused, LAUNCH_SETTLE_MS, ENTER_DELAY_MS, ENTER_ONLY_RETRY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS, NOT_NOW_RETRY_MS, IDLE_EVIDENCE_MAX_WAIT_MS, DELIVERY_MAX_AD_CALLS_PER_S, RECONNECT_BLOCKED_NOTICE_MS } from '../src/delivery-engine.ts'
+import { createDeliveryCallBudget, DeliveryBudgetWait, deliveryTextWasRefused, LAUNCH_SETTLE_MS, ENTER_DELAY_MS, ENTER_ONLY_RETRY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS, NOT_NOW_RETRY_MS, IDLE_EVIDENCE_MAX_WAIT_MS, DELIVERY_MAX_AD_CALLS_PER_S, RECONNECT_BLOCKED_NOTICE_MS, DELIVERY_ROW_POLL_MS } from '../src/delivery-engine.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
-import { appendTranscript, codexPromptEntry, deliveryPane, promptEntry, queueOperationEntry, replyEntry, writeTranscript } from './test-helpers/working-row-panes.ts'
+import { appendTranscript, codexPromptEntry, deliveryPane, endedTurn, promptEntry, queueOperationEntry, replyEntry, writeTranscript } from './test-helpers/working-row-panes.ts'
 import { cannedPermissionRequest, errCallTimeout, errConfigMalformed, errDialogMaybeOpen, errInternal, errInvalidFlags, errPaneChanged, errRelayFallenBack, errSendKeysWhileRelayed, errSpawnNotFound, errSpawnNotInteractive, errSystemInstallDisappeared, errTmuxNotAvailable, errTmuxSendKeys, errTmuxSessionConflict, errTmuxUnresponsive, errUnusableName } from './test-helpers/agent-director-stub.ts'
 
 const harnesses: EngineHarness[] = []
@@ -90,6 +90,10 @@ describe('durable FIFO and send sequence', () => {
     const h = await harness()
     await h.accept()
     await h.tick()
+    const launch = { key: 'alpha', launchId: h.lifecycle.launchId('alpha'), sessionId: h.p().row.session_id, at: h.clock.now() }
+    expect(h.events.filter(e => e.type.startsWith('launch-'))).toEqual([
+      { type: 'launch-observed', ...launch }, { type: 'launch-first-waiting', ...launch },
+    ])
     await h.advance(LAUNCH_SETTLE_MS - 1)
     expect(h.keyCalls()).toEqual([])
     await h.advance(1)
@@ -106,6 +110,43 @@ describe('durable FIFO and send sequence', () => {
     const count = h.calls.length
     await h.advance(RECEIPT_WAIT_MS)
     expect(h.calls).toHaveLength(count)
+    expect(h.events.filter(e => e.type.startsWith('launch-'))).toHaveLength(2)
+  })
+  test('first-waiting diagnostics start the settle window once per launch, including a replacement session', async () => {
+    // b.omv SR-14.2: launch timing evidence must report the same origin that
+    // actually gates typing, even when the first observed row is still busy.
+    const h = await harness()
+    await h.clock.advance(137)
+    for (const [i, state] of (['working', 'pending'] as const).entries()) {
+      h.p().row.state = state
+      h.p().row.session_id = `session-${i}`
+      h.p().path = `${h.root}/session-${i}.jsonl`
+      h.p().row.jsonl_path = h.p().path
+      writeTranscript(h.p().path, endedTurn())
+      await h.accept(`message-${i}`)
+      await h.tick()
+      await h.until(() => h.events.filter(e => e.type === 'launch-observed').length === i + 1)
+      const observed = h.events.filter(e => e.type === 'launch-observed')[i]!
+      expect(observed).toEqual({ type: 'launch-observed', key: 'alpha', launchId: h.lifecycle.launchId('alpha'), sessionId: `session-${i}`, at: h.clock.now() })
+      await h.advance(LAUNCH_SETTLE_MS + DELIVERY_ROW_POLL_MS)
+      expect(h.textCalls()).toHaveLength(i)
+      expect(h.events.filter(e => e.type === 'launch-first-waiting')).toHaveLength(i)
+
+      const beforeWaiting = h.calls.length
+      h.p().row.state = 'waiting'
+      await h.until(() => h.events.filter(e => e.type === 'launch-first-waiting').length === i + 1)
+      const firstWaiting = h.events.filter(e => e.type === 'launch-first-waiting')[i]!
+      expect(firstWaiting).toEqual({ ...observed, type: 'launch-first-waiting', at: h.calls.slice(beforeWaiting).find(c => c.verb === 'get')!.at })
+      await h.advance(firstWaiting.at + LAUNCH_SETTLE_MS - h.clock.now() - 1)
+      expect(h.textCalls()).toHaveLength(i)
+      await h.advance(1)
+      expect(h.textCalls()[i]).toMatchObject({ at: firstWaiting.at + LAUNCH_SETTLE_MS, params: { text: `message-${i}`, no_enter: true } })
+      await delivered(h)
+      expect(h.events.filter(e => e.type.startsWith('launch-'))).toHaveLength((i + 1) * 2)
+    }
+    const launches = h.events.filter(e => e.type === 'launch-observed')
+    expect(launches[0]!.launchId).not.toBe(launches[1]!.launchId)
+    expect(h.errors).toEqual([])
   })
   test('an intake wake during the text-to-Enter pause keeps delivery ownership until the separate Enter', async () => {
     const h = await harness(); await h.accept()

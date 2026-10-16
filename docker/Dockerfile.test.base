@@ -1,13 +1,14 @@
-# docker/Dockerfile.test.base — the /ci base image, cscb-ci-base:v7.
+# docker/Dockerfile.test.base — the /ci base image, cscb-ci-base:v8.
 #
 # Source-independent layers shared by the /ci image (docker/Dockerfile.test)
 # and the /ci-live image (docker/Dockerfile.live). From the repo build context
-# it reads one file, docker/ad-client-check.sh (no package.json). Built once
+# it reads docker/ad-client-check.sh and the native agent installers (no
+# package.json). Built once
 # per host by the base-build step, scripts/ci-base-build.sh:
 #
 #   docker build --network=host --secret id=gh_token,env=GH_TOKEN \
 #     --build-context agent-director-install=<directory holding install.sh> \
-#     -f docker/Dockerfile.test.base -t cscb-ci-base:v7 .
+#     -f docker/Dockerfile.test.base -t cscb-ci-base:v8 .
 #
 # agent-director is the release pinned below (AD_VERSION, AD_COMMIT): its
 # binaries come from agent-director's GitHub release, installed by that
@@ -297,7 +298,7 @@ RUN --mount=type=bind,from=agent-director-install,target=/mnt/agent-director-ins
     fi; \
     echo "agent-director ${REPORTED_VERSION} (${REPORTED_COMMIT}) installed by ${AD_INSTALL_SH} --from-release ${AD_TAG} at ${AD_BIN}, agent-director-admin at ${AD_ADMIN} (off PATH); the install's store reached schema v${STORE_SCHEMA}"
 
-# The client-under-test check, the one file this image reads from the repo
+# The client-under-test check, read from the repo
 # context, at a fixed path off PATH and outside the default binary's
 # directory. It refuses to run without /etc/cscb-ci-image (written above).
 COPY --chmod=0755 docker/ad-client-check.sh /opt/agent-director/check/ad-client-check.sh
@@ -339,3 +340,23 @@ RUN set -eu; \
         exit 1; \
     fi; \
     "${AD_CHECK}" --client "${GLOBAL_CLIENT}"
+
+ENV DISABLE_AUTOUPDATER=1
+# b.omv SR-14.3: genuine native agents, selected through AD's launch paths;
+# the ordinary scenario stub remains the only Claude on its PATH.
+COPY docker/install-real-agents.sh docker/install-real-codex.sh /opt/cscb-ci/
+RUN bash /opt/cscb-ci/install-real-agents.sh 2.1.280 2.1.296 && bash /opt/cscb-ci/install-real-codex.sh
+
+# b.omv SR-14.8: npm publication 2026-10-14T17:20:30.700Z, the last
+# published version preceding b.omv. Preserve the separate 0.10.0 fixture.
+ARG CSCB_DOWNGRADE_VERSION=0.16.1
+ARG CSCB_DOWNGRADE_SHA256=95bd53d19f4950caf8a13a4d9a4b7a8c85d22433ba87dd69cabbba20570e8164
+RUN set -eu; \
+    d="/opt/claude-slack-channel-bots-${CSCB_DOWNGRADE_VERSION}"; \
+    mkdir -p "$d"; \
+    npm pack --ignore-scripts --pack-destination "$d" "claude-slack-channel-bots@${CSCB_DOWNGRADE_VERSION}" >/dev/null; \
+    f="$d/claude-slack-channel-bots-${CSCB_DOWNGRADE_VERSION}.tgz"; \
+    printf '%s  %s\n' "$CSCB_DOWNGRADE_SHA256" "$f" | sha256sum --check --status; \
+    test "$(tar -xOf "$f" package/package.json | jq -r .version)" = "$CSCB_DOWNGRADE_VERSION"; \
+    printf '{"version":"%s","published":"2026-10-14T17:20:30.700Z","sha256":"%s","registry":"https://registry.npmjs.org/claude-slack-channel-bots"}\n' "$CSCB_DOWNGRADE_VERSION" "$CSCB_DOWNGRADE_SHA256" > "$d/release.json"; \
+    chmod -R a+rX "$d"

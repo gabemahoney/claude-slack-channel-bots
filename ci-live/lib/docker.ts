@@ -37,7 +37,7 @@ import { join, resolve, sep } from 'node:path'
 import { countTokenShaped } from './redact.ts'
 import type { ProcResult, SpawnFn } from './proc.ts'
 
-export const BASE_IMAGE = 'cscb-ci-base:v7'
+export const BASE_IMAGE = 'cscb-ci-base:v8'
 /** Claude Code 2.1.296 for typed delivery (b.omv SR-13.6); the base pin is separate. */
 export const LIVE_IMAGE = 'cscb-ci-live:v2'
 export const CONTAINER_LABEL_KEY = 'cscb-live'

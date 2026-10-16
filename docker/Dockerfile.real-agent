@@ -1,0 +1,10 @@
+FROM cscb-ci-base:v8
+# Self-contained heavy context: the same packed production package as /ci,
+# the pinned release binary/client in the base, and all executable scenarios.
+COPY package.tgz /tmp/package.tgz
+COPY tests /tests
+COPY docker/real-agent-job.sh /opt/cscb-ci/real-agent-job.sh
+RUN useradd -m -s /bin/bash testuser && mkdir -p /test-repo && chown testuser:testuser /test-repo
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=xterm-256color DISABLE_AUTOUPDATER=1
+WORKDIR /test-repo
+ENTRYPOINT ["bash", "/opt/cscb-ci/real-agent-job.sh"]

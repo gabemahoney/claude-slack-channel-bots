@@ -117,6 +117,7 @@ const CREDENTIALS_HELPER = 'tests/test-helpers/credentials.ts'
  */
 const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/config\.ts$/, 'the persona config loader and record validation'],
+  [/^src\/test-mcp-drop\.ts$/, 'the test-only MCP disconnect route, which reads applied persona config and logs and returns the configured persona key'],
   [/^src\/persona-credentials\.ts$/, 'the credentials reader and classifier'],
   [/^src\/persona-bringup\.ts$/, 'the local bring-up checks, which read the credentials file'],
   [/^src\/persona-bringup-controller\.ts$/, 'the bring-up controller, which reads credentials and holds their digests'],
@@ -418,6 +419,26 @@ describe('every suite that touches config, credentials or reload calls assertNoL
       ...(SOURCE_FILES.some((file) => re.test(file)) ? [] : [`${re.source}: stale surface: matches no module under src/`]),
     ])
     expect(checked(failures, 'source-surface failures')).toEqual([])
+  })
+
+  test('the test-only MCP route is a source surface: handlers and key rendering touch; constants and types alone do not; every consumer leak-checks', () => {
+    const suite = 'tests/test-mcp-drop.test.ts'
+    expect(SOURCE_SURFACES.some(([re]) => re.test('src/test-mcp-drop.ts'))).toBe(true)
+    for (const code of [
+      "import { handleTestMcpDrop } from '../src/test-mcp-drop.ts'",
+      "import { testMcpDropLine as line } from '../src/test-mcp-drop.ts'",
+      "import * as drop from '../src/test-mcp-drop.ts'",
+      "const drop = await import('../src/test-mcp-drop.ts')",
+    ]) expect(touchReasonsOf(suite, code).some(reason => reason.includes('src/test-mcp-drop.ts'))).toBe(true)
+    for (const code of [
+      "import { TEST_MCP_DROP_ROUTE, TEST_MCP_DROP_START_LINE } from '../src/test-mcp-drop.ts'",
+      "import type { TestMcpDropDeps } from '../src/test-mcp-drop.ts'",
+      "import { type TestMcpDropDeps } from '../src/test-mcp-drop.ts'",
+    ]) expect(touchReasonsOf(suite, code)).toEqual([])
+    expect(touchReasons(suite).some(reason => reason.includes('src/test-mcp-drop.ts'))).toBe(true)
+    const consumers = SUITES.filter(file => touchReasons(file).some(reason => reason.includes('src/test-mcp-drop.ts')))
+    expect(consumers.length).toBeGreaterThan(0)
+    expect(consumers.map(file => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(consumers.map(file => [file, true, false]))
   })
 
   // b.jg5 SRJ-501, SRJ-507: the conflict latch's lines and record carry text from agent-director's CONFLICT description.

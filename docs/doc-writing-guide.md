@@ -66,7 +66,7 @@ After completing work that:
 - Adds a user-facing feature → update the user doc that [user-docs-guide.md](user-docs-guide.md) names for it
 - Changes how the system works internally → update docs/architecture.md
 - Introduces new coding patterns → update relevant guide
-- Adds new config fields → update both docs/configuration.md and docs/architecture.md (except the test-only `test_timer_overrides` block, which no user doc names; see docs/engineering-guide.md, Configuration)
+- Adds new config fields → update both docs/configuration.md and docs/architecture.md (except the test-only `test_timer_overrides` block and `test_mcp_drop_endpoint` switch, which no user doc names; see docs/engineering-guide.md, Configuration). Keep both out of shipped settings examples and operator instructions; document their startup-only behavior internally.
 - Changes behaviour an upgrading operator must act on → add an entry to CHANGELOG.md
 - Changes the switch-over or rollback runbook in `docs/migration.md` → say what changed in the CHANGELOG's "Unreleased" entry; leave the frozen 0.11.0 copies as they are
 - Changes "Downgrading to an earlier release" in `docs/migration.md` → make the same change to its CHANGELOG copy in the 0.12.0 entry

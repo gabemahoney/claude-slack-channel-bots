@@ -29,7 +29,7 @@ exception is `hgx`, which takes a value only as an argument (see
     created on the current VM through mail.tm's API, and its address is also
     in `/tmp/cscb-test-mailbox-address.txt`.
 - On the VM: docker, the `/ci` base image (if
-  `docker image inspect cscb-ci-base:v7` fails, run `/ci` once, with
+  `docker image inspect cscb-ci-base:v8` fails, run `/ci` once, with
   `CSCB_AD_SRC_DIR` set: see `docker/README.md`), Google Chrome
   (`google-chrome --version`), bun, and `CSCB_AD_SRC_DIR` set to a checkout
   of agent-director's source tree holding the tag of the release the base

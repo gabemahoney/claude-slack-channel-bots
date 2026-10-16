@@ -6,20 +6,21 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
 
 ## Images
 
-- **`cscb-ci-base:v7`** (built from `docker/Dockerfile.test.base`) — slow base
-  layers (apt deps incl. tmux, bun, nodejs, cozempic, agent-director). Built
-  lazily once per host. ~1+ GB. No CSCB source inside. From the repo build
-  context it reads one file, `docker/ad-client-check.sh`, and no
-  `package.json`. What it holds is in
+- **`cscb-ci-base:v8`** (built from `docker/Dockerfile.test.base`) — slow base
+  layers (apt deps incl. tmux, bun, nodejs, cozempic, agent-director and native
+  Claude/Codex versions). Built lazily once per host. No checkout source
+  inside; published CSCB tarballs are fixtures. From the repo build context
+  it reads `docker/ad-client-check.sh`, `docker/install-real-agents.sh` and
+  `docker/install-real-codex.sh`, and no `package.json`. What it holds is in
   [What the base holds](#what-the-base-holds).
 - **The run's test image** (built from `docker/Dockerfile.test`,
-  `FROM cscb-ci-base:v7`) — adds `docker/entrypoint.sh`, `tests/`,
+  `FROM cscb-ci-base:v8`) — adds `docker/entrypoint.sh`, `tests/`,
   `testplans/`, the `testuser` account, and the `ENTRYPOINT`. Each `/ci` run
   builds its own, once, with the owner label `cscb-ci-owner=<RUN_ID>-<PID>`,
   tags it only `cscb-ci-run:<RUN_ID>-<PID>-test`, and removes it at the run's
   end (see [The run's images and tags](#the-runs-images-and-tags)). The build
   should complete in under 10 s on a warm base.
-- **`cscb-ci-live:v2`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v7`)
+- **`cscb-ci-live:v2`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v8`)
   — the `/ci-live` image (see [/ci-live](#ci-live-the-live-slack-acceptance-run)
   below). It adds Claude Code at a pinned version with auto-update off, the
   agent-director binary the runner stages, checked against the release's
@@ -29,6 +30,14 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   and the testplan's shell helpers and pre-flight adapted to the container.
   The package under test is not in the image; the runner mounts its tarball.
   Built on every `/ci-live` run.
+
+- **The heavy run's image** (`docker/Dockerfile.real-agent`,
+  `FROM cscb-ci-base:v8`) — a self-contained packed `package.tgz`, tests and
+  `docker/real-agent-job.sh`, tagged `cscb-real-agent:<run-id>` and removed
+  by `scripts/real-agent-matrix.ts`. Jobs select native Claude through
+  agent-director, install runtime latest inside the container when needed,
+  and run sequentially with runtime-only credentials. See
+  [the heavy invocation](../tests/README.md#heavy-inventory-and-invocation).
 
 `/ci` builds the base only when the tag that `docker/Dockerfile.test`'s `FROM`
 line names is missing locally, through the base-build step
@@ -51,8 +60,9 @@ the live image build, where it is checked (see
 [The live image's agent-director](#the-live-images-agent-director)).
 
 The base build fetches bun, agent-director 0.10.0's binary and the release's
-two binaries from GitHub, and the release's client tarball and two 0.10.0
-tarballs from the npm registry, and `/ci` runs it with
+two binaries from GitHub, native Claude releases from their distribution
+service, and the release's client, two 0.10.0 fixtures, the 0.16.1 downgrade
+fixture and native Codex platform package from the npm registry. `/ci` runs it with
 `docker build --network=host`. On some hosts the default docker bridge network
 intermittently fails those fetches with SSL/timeout errors even when the host
 itself reaches the same URLs fine; host networking sidesteps that. It affects
@@ -77,10 +87,19 @@ Every path is readable by every user, `testuser` included, except the global cli
 | `/opt/agent-director-0.10.0/bin/agent-director` | agent-director 0.10.0's binary, off `PATH` |
 | `/opt/agent-director-0.10.0/agent-director-0.10.0.tgz` | The published agent-director 0.10.0 client, from npm |
 | `/opt/claude-slack-channel-bots-0.10.0/claude-slack-channel-bots-0.10.0.tgz` | The published pre-persona claude-slack-channel-bots 0.10.0 package, from npm |
+| `/opt/claude-code/2.1.280/claude`, `/opt/claude-code/2.1.296/claude` | Native Linux x64 Claude programs, off PATH; manifests supply SHA-256 checks, and each `--version` must match. `DISABLE_AUTOUPDATER=1` is set in the base |
+| `/opt/codex/0.159.2/codex` | Native ELF from the Codex platform npm package, off PATH; build requires `codex-cli 0.159.2`. E7 owns login/harness integration |
+| `/opt/cscb-ci/install-real-agents.sh`, `/opt/cscb-ci/install-real-codex.sh` | Marked-image-only native installers; the Claude installer also supports the heavy job's resolved latest |
+| `/opt/claude-slack-channel-bots-0.16.1/claude-slack-channel-bots-0.16.1.tgz` and `release.json` | Published-before-work downgrade fixture, separate from the retained 0.10.0 fixture. Publication: `2026-10-14T17:20:30.700Z`; SHA-256: `95bd53d19f4950caf8a13a4d9a4b7a8c85d22433ba87dd69cabbba20570e8164`. Build checks the hash/version; record includes registry provenance |
 | `/etc/cscb-ci-image` | The image marker (see [Image marker](#image-marker)) |
 
 It also installs `sqlite3` (the harness's store reads and edits) and `file`
-(the install script's pre-flight) with apt. The 0.10.0 legs are unchanged:
+(the install script's pre-flight) with apt. Native agent directories stay off
+PATH. Ordinary scenarios retain their stub
+`claude`; real scenarios select `[launch].claude_path` explicitly and check
+the native version again. No login or API credential is baked into an image.
+
+The 0.10.0 legs are unchanged:
 the 0.10.0 tarballs are fetched by exact version with
 `npm pack --ignore-scripts`, and nothing in the base installs them. The
 release's install leaves no store behind: `install.sh` runs with a throwaway
@@ -155,7 +174,7 @@ it stop with an `ERROR:` line naming the missing context.
   `--from-release v<AD_VERSION> --sha256 <AD_SHA256> --admin-sha256 <AD_ADMIN_SHA256> --no-hooks --no-symlink`,
   with a throwaway `HOME` and, for that one command, a stand-in `claude` on
   `PATH` (the script's pre-flight only prints `claude --version`, and the
-  base has no Claude Code). The script downloads `agent-director-linux-amd64`
+  native agents are not on PATH). The script downloads `agent-director-linux-amd64`
   and `agent-director-admin-linux-amd64` from agent-director's GitHub release
   (no token) and checks them against the two pins. The build copies the
   binary to `/opt/agent-director/bin` and the admin binary to
@@ -190,7 +209,7 @@ git -C "$CSCB_AD_SRC_DIR" show "v$AD_VERSION:skills/install-agent-director/insta
 GH_TOKEN="$(gh auth token)" docker build --network=host \
   --secret id=gh_token,env=GH_TOKEN --progress=quiet \
   --build-context agent-director-install="$AD_INSTALL_CTX" \
-  -f docker/Dockerfile.test.base -t cscb-ci-base:v7 .
+  -f docker/Dockerfile.test.base -t cscb-ci-base:v8 .
 rm -rf "$AD_INSTALL_CTX"
 ```
 
@@ -210,7 +229,7 @@ rm -rf "$AD_INSTALL_CTX"
   that message, and every other check's `ERROR:` line: rerun with
   `--progress=plain` to see which step failed and why.
 - **Check an image by counts only**, never by printing its history:
-  `docker history --no-trunc cscb-ci-base:v7 | grep -c GH_TOKEN=` prints `0`.
+  `docker history --no-trunc cscb-ci-base:v8 | grep -c GH_TOKEN=` prints `0`.
 - **Earlier tags are retired.** Nothing names `v4` or an earlier tag. Tags
   before `v4` took the token as a build-arg, so their image history held its
   value, as did every image built on them; they are removed from the hosts
@@ -235,7 +254,9 @@ Image marker).
 `/ci`'s `docker run` step forwards `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, and
 `ANTHROPIC_MODEL` from the host environment (each via the no-value `--env VAR`
 pass-through form). The bot Claudes spawned by the daemon-under-test consume
-these. A raw `sk-ant-api…` key needs only `ANTHROPIC_API_KEY` — Claude Code
+these. Every full `/ci` run uses the key for real model calls in the nine
+`-fmk-real-` scripts; other scripts keep the stub. No OAuth or subscription
+credential is used. A raw `sk-ant-api…` key needs only `ANTHROPIC_API_KEY` — Claude Code
 defaults to `api.anthropic.com` when `ANTHROPIC_BASE_URL` is absent. A gateway
 credential (e.g. NVIDIA InferenceHub) additionally requires `ANTHROPIC_BASE_URL`
 and `ANTHROPIC_MODEL` so the bot Claudes hit the gateway rather than
@@ -247,12 +268,14 @@ against Anthropic's direct endpoint.
 
 ## When to bump the base image version
 
-Bump `cscb-ci-base`'s version tag (e.g. `v7` → `v8`) whenever you change
+Bump `cscb-ci-base`'s version tag (next, `v8` → `v9`) whenever you change
 `docker/Dockerfile.test.base`, its pins included: the release's
 `AD_VERSION`, `AD_COMMIT`, `AD_SHA256`, `AD_ADMIN_SHA256`,
 `AD_INSTALL_SH_SHA256` and `AD_CLIENT_TGZ_SHA256`, and the 0.10.0 legs'
-`AD_PREV_VERSION` and `CSCB_PREV_VERSION`, or its one repo input,
-`docker/ad-client-check.sh`. `/ci` builds a base only when its
+`AD_PREV_VERSION` and `CSCB_PREV_VERSION`, the downgrade fixture's
+`CSCB_DOWNGRADE_VERSION`/`CSCB_DOWNGRADE_SHA256`, native agent versions, or
+its repo inputs `docker/ad-client-check.sh`, `docker/install-real-agents.sh`
+and `docker/install-real-codex.sh`. `/ci` builds a base only when its
 tag is missing, so without a bump every host keeps testing the base it
 already has. The base reads no `package.json`, so a change there needs no
 bump. There is **no** automatic version derivation — bump it manually in
@@ -261,7 +284,7 @@ every place that names it:
 1. The `FROM` line in `docker/Dockerfile.test`.
 2. The `BASE_TAG` variable in `scripts/ci-base-build.sh`, the base-build
    step, and the tag wherever `.claude/skills/ci/SKILL.md` names it.
-3. The `FROM` line in `docker/Dockerfile.live`.
+3. The `FROM` lines in `docker/Dockerfile.live` and `docker/Dockerfile.real-agent`, and the base inspection tag in `scripts/real-agent-matrix.ts`.
 4. `BASE_IMAGE` in `ci-live/lib/docker.ts`.
 5. The tag in `.claude/skills/ci-live/SKILL.md` (twice) and in
    `ci-live/README.md`'s "Where you start".
@@ -298,7 +321,8 @@ skill types a commit, and when an image file, the base-build step, a
 `ci-live/lib` module or a skill pins a release candidate.
 
 Common reasons to bump: a new agent-director release, a change of the 0.10.0
-pins, a change to `docker/ad-client-check.sh`, bumping the bun
+or downgrade pins, native agent versions/installers, a change to
+`docker/ad-client-check.sh`, bumping the bun
 installer, changing the nodejs major, adding/removing an apt package, or
 changing the cozempic install.
 
@@ -319,7 +343,7 @@ the pin revision. A live-only pin change leaves `cscb-ci-base`'s tag alone.
 To simulate a fresh host, remove the base tag by its name, and nothing else:
 
 ```sh
-docker rmi cscb-ci-base:v7
+docker rmi cscb-ci-base:v8
 /ci   # with CSCB_AD_SRC_DIR set; or run the hand build above
 ```
 
@@ -334,7 +358,7 @@ build comes near it, raise an issue.
 After a `/ci` run, confirm the base layers are intact:
 
 ```sh
-docker history cscb-ci-base:v7
+docker history cscb-ci-base:v8
 ```
 
 Then edit a comment in (e.g.) `tests/integration/test-1-install-startup.sh`
@@ -347,7 +371,7 @@ docker build -f docker/Dockerfile.test -t "$WARM_TAG" .
 ```
 
 This should complete in seconds, and needs neither build context nor the
-token. `docker history cscb-ci-base:v7` should show the same layer IDs as
+token. `docker history cscb-ci-base:v8` should show the same layer IDs as
 before — proof the source edit didn't invalidate the base. Then remove the
 tag by its name:
 
@@ -654,7 +678,7 @@ The sweep never touches:
 
 - anything whose owner is alive;
 - any `cscb-live=1` container, or any container without `cscb-ci=1`;
-- any other tag shape, such as `cscb-ci:latest`, `cscb-ci-base:v7`,
+- any other tag shape, such as `cscb-ci:latest`, `cscb-ci-base:v8`,
   `cscb-ci-live:v2` or a lane tag like `cscb-ci-l5:m5`;
 - an image that still has a tag, or an image with no owner label;
 - any file beside the lock but a dead owner's reservation;
@@ -1428,7 +1452,7 @@ checks against it.
   - Anything else (a missing or malformed release record, steps 1
     (tarball) to 4 (exports), a missing check script, the check's refusal or
     usage error):
-    `ERROR: the base image's global agent-director client or its ad-client check failed (the line above names what failed): the base image cscb-ci-base:v7 predates this tree's docker/Dockerfile.test.base or docker/ad-client-check.sh; bump the base image version as the When to bump the base image version section of docker/README.md describes`.
+    `ERROR: the base image's global agent-director client or its ad-client check failed (the line above names what failed): the base image cscb-ci-base:v8 predates this tree's docker/Dockerfile.test.base or docker/ad-client-check.sh; bump the base image version as the When to bump the base image version section of docker/README.md describes`.
 
   Whichever line it is, the run reports a `container` FAIL row for the failed
   build, `docker build of the live image failed (exit N)`, followed by what

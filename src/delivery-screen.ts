@@ -7,7 +7,28 @@ export function stripDeliveryAnsi(text: string): string {
 }
 const rule = (line: string): boolean => /^\s*[─━\-]{8,}\s*$/.test(line)
 const menuFooter = /esc to cancel|enter to select|enter to confirm|to navigate/i
-const runningLine = /^[✢✳✶✻✽·*].*[……].*(?:\(|tokens|thinking)|esc to interrupt|interrupt.*esc/i
+const runningLine = /^[✢✳✶✻✽·*].*…(?:\s|$)|^[✢✳✶✻✽·*].*[……].*(?:\(|tokens|thinking)|esc to interrupt|interrupt.*esc/i
+/** Native Claude wraps the current composer at a column or a word boundary.
+ * Resolve only those observed display breaks against the known complete
+ * item; an unrelated draft sharing a tag's first visual line is not ours.
+ * This is a screen ownership rule, never transcript normalization.
+ */
+function renderedOwnText(displayed: string, own: string): boolean {
+  const lines = displayed.split('\n')
+  let offsets = new Set([0])
+  for (let index = 0; index < lines.length; index++) {
+    const next = new Set<number>(), line = lines[index]!
+    for (const offset of offsets) {
+      for (const separator of index === 0 ? [''] : ['', ' ', '\n']) {
+        const start = offset + separator.length
+        if (own.startsWith(separator, offset) && own.startsWith(line, start)) next.add(start + line.length)
+      }
+    }
+    if (!next.size) return false
+    offsets = next
+  }
+  return offsets.has(own.length)
+}
 function observation(text: string, own: string | undefined, running: boolean, claude: boolean): DeliveryScreen {
   const empty = text.trim() === '' || (claude
     ? /^(?:Try ["“].*["”]|Press up to edit queued messages|Message @\S+…)\s*$/.test(text.trim())
@@ -16,7 +37,7 @@ function observation(text: string, own: string | undefined, running: boolean, cl
   // Prefix recognition is deliberately conservative: it must start at the
   // composer, never at a quoted historical prompt. Long-paste drawing is SR-5.4.
   const prefix = own?.split('\n')[0]
-  if (own && ((prefix && text.startsWith(prefix)) || (claude && text.startsWith('[Pasted text')))) return { kind: 'own', text, running }
+  if (own && ((prefix && text.startsWith(prefix)) || (claude && (text.startsWith('[Pasted text') || renderedOwnText(text, own))))) return { kind: 'own', text, running }
   return { kind: 'input', text, running }
 }
 export function readDeliveryScreen(agent: DeliveryAgent, pane: string, ownText?: string): DeliveryScreen {
@@ -29,12 +50,14 @@ export function readDeliveryScreen(agent: DeliveryAgent, pane: string, ownText?:
     const footer = lines.slice(lower + 1)
     if (footer.some(line => menuFooter.test(line))) return { kind: 'menu', running: false }
     // A completed prompt box is followed only by actual footer/status lines.
-    if (footer.some(line => line.trim() && !/^\s*(?:[⏵▶▸]|\?|shift\+|ctrl\+|context|\d+%|\$|auto|accept|bypass|plan mode|permission|←|!)/i.test(line))) return { kind: 'menu', running: false }
+    // b.omv SR-14.2: native 2.1.296's default/manual-mode footer uses
+    // the pause glyph. Observed via real AD read-pane in the E6 container.
+    if (footer.some(line => line.trim() && !/^\s*(?:[⏵▶▸]|⏸ manual mode on|paste again to expand(?:\s+◐ medium · \/effort)?$|\?|shift\+|ctrl\+|context|\d+%|\$|auto|accept|bypass|plan mode|permission|←|!)/i.test(line))) return { kind: 'menu', running: false }
     let upper = lower - 1
     while (upper >= 0 && !rule(lines[upper]!)) upper--
     if (upper < 0) return { kind: 'menu', running: false }
     const box = lines.slice(upper + 1, lower)
-    const first = box[0]?.match(/^\s*[❯>] ?(.*)$/)
+    const first = box[0]?.match(/^\s*[❯>][ \u00a0]?(.*)$/)
     if (!first) return { kind: 'menu', running: false }
     // A menu cursor (❯ 1. …) inside a bordered dialog is not a composer.
     if (/^\d+[.)]\s/.test(first[1]!)) return { kind: 'menu', running: false }

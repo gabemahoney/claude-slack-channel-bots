@@ -13,6 +13,27 @@ const runs: DeliveryNoticeHarness[] = []
 async function run() { const h = await makeDeliveryNoticeHarness(); runs.push(h); return h }
 afterEach(async () => { for (const r of runs.splice(0)) { try { assertNoLeak({ logs: r.logs, posts: r.h.allPosts(), lines: r.rig.lines }) } finally { await r.cleanup() } } })
 
+test('launch timing diagnostics preserve structured engine evidence without posting a notice or requiring queued work', async () => {
+  // b.omv SR-14.2: the real-agent timing assertion consumes these JSON facts.
+  const r = await run()
+  const events = [
+    { type: 'launch-observed' as const, key: r.alpha, launchId: 'launch:"one"', sessionId: 'session\\one', at: 137 },
+    { type: 'launch-first-waiting' as const, key: r.alpha, launchId: 'launch:"one"', sessionId: 'session\\one', at: 971 },
+    { type: 'launch-observed' as const, key: r.beta, launchId: 'launch-two', sessionId: 'session-two', at: 2001 },
+  ]
+  for (const event of events) r.reporting.engineEvent(event)
+  await r.flush()
+  expect(r.logs).toHaveLength(events.length)
+  for (const [i, event] of events.entries()) {
+    const prefix = `[slack] delivery-${event.type}: `
+    expect(r.logs[i]!.startsWith(prefix)).toBe(true)
+    expect(JSON.parse(r.logs[i]!.slice(prefix.length))).toEqual({ key: event.key, launch_id: event.launchId, session_id: event.sessionId, at: event.at })
+  }
+  expect(r.h.totalPosts()).toBe(0)
+  expect(r.queue.items(r.alpha)).toEqual([])
+  expect(r.queue.items(r.beta)).toEqual([])
+})
+
 // The sole literal wording pin for this notice module; behavior uses its builders.
 test('SR-8 delivery notices and all nine fixed remedies keep their required wording', () => {
   expect(reasons.map(([reason]) => deliveryStuckRemedy(reason, 'alpha', 3))).toEqual([

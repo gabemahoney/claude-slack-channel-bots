@@ -23,6 +23,8 @@ export interface DeliveryStatus {
   reconnectScreen?: 'input' | 'menu'
 }
 export type DeliveryEngineEvent =
+  | { type: 'launch-observed'; key: string; launchId: string; sessionId: string; at: number }
+  | { type: 'launch-first-waiting'; key: string; launchId: string; sessionId: string; at: number }
   | { type: 'delivered'; key: string; seq: number; part: number }
   | { type: 'item-delivered'; key: string; seq: number; at: number; waitMs: number }
   | { type: 'first-typed'; key: string; seq: number; part: number }
@@ -151,7 +153,10 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         if (row.state === 'working') s.receiptWorking = true
         else if (s.receiptWorking) { s.e.phase = 'receipt'; s.deadlines.receipt = clock.now() + ms('RECEIPT_WAIT_MS', RECEIPT_WAIT_MS); s.receiptWorking = false }
       }
-      if (row.state === 'waiting' && (s.waitingAt === undefined || life.launchId(key) !== s.e.launchSeen)) s.waitingAt = clock.now()
+      if (row.state === 'waiting' && s.waitingAt === undefined && life.launchId(key) === s.e.launchSeen) {
+        s.waitingAt = clock.now()
+        emit({ type: 'launch-first-waiting', key, launchId: life.launchId(key), sessionId: row.session_id, at: s.waitingAt })
+      }
       return true
     } catch (error) {
       if (error instanceof DeliveryBudgetWait) throw error
@@ -320,6 +325,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           s.deadlines.backoff = 0; s.deadlines.notNow = 0; s.deadlines.enterDelay = 0; s.deadlines.idleEvidence = clock.now() + ms('IDLE_EVIDENCE_MAX_WAIT_MS', IDLE_EVIDENCE_MAX_WAIT_MS)
           s.waitingAt = s.row?.state === 'waiting' ? clock.now() : undefined
           s.deadlines.settle = s.waitingAt === undefined ? Infinity : s.waitingAt + ms('LAUNCH_SETTLE_MS', LAUNCH_SETTLE_MS)
+          emit({ type: 'launch-observed', key, launchId: life.launchId(key), sessionId: s.row!.session_id, at: clock.now() })
+          if (s.waitingAt !== undefined) emit({ type: 'launch-first-waiting', key, launchId: life.launchId(key), sessionId: s.row!.session_id, at: s.waitingAt })
           continue
         }
         if (action === 'observeCompaction') { s.e.compactionSeen = k.r.compactions; s.recover = true; s.e.phase = 'ready'; release(s); continue }

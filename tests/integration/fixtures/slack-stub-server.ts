@@ -112,6 +112,20 @@
  *   chosen.
  * - A push carries no token, and `/_push` reads none.
  *
+ * For a recorded button click, replace `event`/`envelope` with:
+ *   "interactive": { "type": "block_actions", "user": { "id": "U…" },
+ *     "channel": { "id": "C…" }, "message": { "ts": "<response_ts>" },
+ *     "actions": [{ "type": "button", "action_id": "<posted action_id>" }] }
+ * Exactly one button is allowed. Copy its `value` and the enclosing block's
+ * `block_id` only when present. All fields are checked; team, app and message
+ * container are generated. The button must match the last successful post or
+ * update in this stub instance for the same label/channel/message timestamp.
+ * Invalid interactive controls answer 400 `interactive-invalid`; a context
+ * or button mismatch answers 409 `interactive-context-mismatch`. A successful
+ * click sends an `interactive` Socket Mode envelope and answers with its
+ * `envelope_id`. Its `push` record has `event_type: "block_actions"`, the
+ * message timestamp, clicking user and redacted button fields.
+ *
  * Answers (a refused push sends nothing):
  *   200 {"ok":true,"envelope_id":"<uuid>","event_id":"Ev…"}   sent
  *   400 {"ok":false,"error":"<reason>"}   malformed, the reason one of:
@@ -155,6 +169,9 @@
  *
  * `api` lines also carry `channel`, `user` and `text` when the request has
  * them, and `args_token_like` (whether any argument held token-like text).
+ * Posts/updates with `blocks` additionally record their redacted structured
+ * display/button fields (no arbitrary fields or URLs), and successful ones
+ * carry `response_ts`, the returned message timestamp used for a click.
  * `text` always has token-like text replaced by `<token>`, before it is
  * written. A `chat.postMessage` text is then recorded whole, so a scenario
  * can compare a posted notice in full; every other method's `text` is cut to
@@ -195,6 +212,8 @@ export interface StubTokenRule extends StubAnswers {
 export interface StubControl {
   tokens?: StubTokenRule[]
   default?: StubAnswers
+  users?: Record<string, { name?: string; real_name?: string; profile?: { display_name?: string; real_name?: string } }>
+  channels?: Record<string, { name?: string; is_member?: boolean }>
 }
 
 export interface SlackStubOptions {
@@ -273,6 +292,32 @@ function recordedText(method: string, text: string): string {
   return method === WHOLE_TEXT_METHOD ? redacted : redacted.slice(0, RECORDED_TEXT_MAX)
 }
 
+/** Keep only Block Kit display/button evidence; never copy arbitrary fields or URLs. */
+function recordedBlocks(text: string): Record<string, unknown>[] | null {
+  let blocks: unknown
+  try { blocks = JSON.parse(text) } catch { return null }
+  if (!Array.isArray(blocks)) return null
+  function evidence(value: unknown, depth: number): Record<string, unknown> | null {
+    if (!isObject(value)) return null
+    const out: Record<string, unknown> = {}
+    for (const key of ['type', 'block_id', 'action_id', 'value', 'style'] as const) {
+      if (typeof value[key] === 'string') out[key] = value[key].replace(TOKEN_LIKE_ALL, '<token>')
+    }
+    if (typeof value.text === 'string') out.text = recordedText('blocks', value.text)
+    else if (isObject(value.text)) {
+      const text: Record<string, string> = {}
+      if (typeof value.text.type === 'string') text.type = value.text.type.replace(TOKEN_LIKE_ALL, '<token>')
+      if (typeof value.text.text === 'string') text.text = recordedText('blocks', value.text.text)
+      out.text = text
+    }
+    if (depth > 0 && Array.isArray(value.elements)) {
+      out.elements = value.elements.slice(0, 25).map(element => evidence(element, depth - 1)).filter(element => element !== null)
+    }
+    return out
+  }
+  return blocks.slice(0, 50).map(block => evidence(block, 1)).filter(block => block !== null)
+}
+
 // ---------------------------------------------------------------------------
 // Control validation
 // ---------------------------------------------------------------------------
@@ -312,6 +357,31 @@ export function parseControl(value: unknown): StubControl {
     })
   }
   if (value.default !== undefined) control.default = checkAnswers(value.default, 'default')
+  for (const kind of ['users', 'channels'] as const) {
+    const entries = value[kind]
+    if (entries === undefined) continue
+    if (!isObject(entries)) throw new Error(`control.${kind} must be an object`)
+    const checked: Record<string, Record<string, unknown>> = {}
+    for (const [id, metadata] of Object.entries(entries)) {
+      if (!(kind === 'users' ? /^[UW][A-Z0-9]+$/ : /^[CDG][A-Z0-9]+$/).test(id) || !isObject(metadata)) throw new Error(`control.${kind} entry is invalid`)
+      const entry: Record<string, unknown> = {}
+      for (const [field, data] of Object.entries(metadata)) {
+        if (field === 'name' || (kind === 'users' && field === 'real_name')) {
+          if (typeof data !== 'string') throw new Error(`control.${kind} text must be a string`)
+          entry[field] = data
+        } else if (kind === 'channels' && field === 'is_member') {
+          if (typeof data !== 'boolean') throw new Error('control.channels.is_member must be boolean')
+          entry[field] = data
+        } else if (kind === 'users' && field === 'profile') {
+          if (!isObject(data) || Object.keys(data).some(key => !['display_name', 'real_name'].includes(key)) || Object.values(data).some(text => typeof text !== 'string')) throw new Error('control.users.profile is invalid')
+          entry.profile = { ...data }
+        } else throw new Error(`control.${kind} has an unknown field`)
+      }
+      checked[id] = entry
+    }
+    if (kind === 'users') control.users = checked as StubControl['users']
+    else control.channels = checked as StubControl['channels']
+  }
   return control
 }
 
@@ -329,7 +399,7 @@ function slackTs(seq: number): string {
 }
 
 /** The `ok: true` body for a method other than `auth.test` / `apps.connections.open`. */
-function okBody(method: string, args: Record<string, string>, seq: number, uploadBase: string): Record<string, unknown> {
+function okBody(method: string, args: Record<string, string>, seq: number, uploadBase: string, control: StubControl): Record<string, unknown> {
   const channel = args.channel ?? 'C0STUBCHAN'
   switch (method) {
     case 'chat.postMessage':
@@ -341,13 +411,14 @@ function okBody(method: string, args: Record<string, string>, seq: number, uploa
     case 'conversations.open':
       return { ok: true, channel: { id: `D0STUB${String(seq).padStart(4, '0')}` } }
     case 'conversations.info':
-      return { ok: true, channel: { id: channel, name: `stub-${channel.toLowerCase()}`, is_member: true } }
+      return { ok: true, channel: { id: channel, name: `stub-${channel.toLowerCase()}`, is_member: true, ...control.channels?.[channel] } }
     case 'conversations.history':
     case 'conversations.replies':
       return { ok: true, messages: [], has_more: false, response_metadata: { next_cursor: '' } }
     case 'users.info': {
       const id = args.user ?? 'U0STUBUSER'
-      return { ok: true, user: { id, name: `stub-${id.toLowerCase()}`, profile: { display_name: `stub-${id.toLowerCase()}`, real_name: 'Stub User' } } }
+      const user = control.users?.[id]
+      return { ok: true, user: { id, name: `stub-${id.toLowerCase()}`, ...user, profile: { display_name: `stub-${id.toLowerCase()}`, real_name: 'Stub User', ...user?.profile } } }
     }
     case 'bots.info':
       return { ok: true, bot: { id: args.bot ?? 'B0STUBBOT', app_id: APP_ID, name: 'stub-bot' } }
@@ -376,7 +447,7 @@ function httpStatusOf(answer: string): number | undefined {
 const PUSH_FLAG = 'is_ext_shared_channel'
 
 /** The keys a push request may carry, and the keys its `envelope` may carry. */
-const PUSH_KEYS: readonly string[] = ['label', 'event', 'envelope']
+const PUSH_KEYS: readonly string[] = ['label', 'event', 'envelope', 'interactive']
 const PUSH_ENVELOPE_KEYS: readonly string[] = [PUSH_FLAG, 'omit']
 
 /** The most characters of a push-supplied value a `push` or `push-refused` line carries. */
@@ -392,6 +463,8 @@ type PushRefusalReason =
   | 'unknown-field'
   | 'no-label'
   | 'event-not-object'
+  | 'interactive-invalid'
+  | 'interactive-context-mismatch'
   | 'envelope-not-object'
   | 'envelope-field-fixed'
   | 'omit-invalid'
@@ -405,6 +478,8 @@ const PUSH_REFUSAL_STATUS: Readonly<Record<PushRefusalReason, number>> = {
   'unknown-field': 400,
   'no-label': 400,
   'event-not-object': 400,
+  'interactive-invalid': 400,
+  'interactive-context-mismatch': 409,
   'envelope-not-object': 400,
   'envelope-field-fixed': 400,
   'omit-invalid': 400,
@@ -415,9 +490,43 @@ const PUSH_REFUSAL_STATUS: Readonly<Record<PushRefusalReason, number>> = {
 /** The flag a push asks for: a value sent as given, or left out. */
 type PushFlag = { sent: true; value: unknown } | { sent: false }
 
+interface PushAction {
+  type: 'button'
+  action_id: string
+  block_id?: string
+  value?: string
+}
+
+interface PushInteractive {
+  type: 'block_actions'
+  user: { id: string }
+  channel: { id: string }
+  message: { ts: string }
+  actions: PushAction[]
+}
+
 type ParsedPush =
   | { ok: true; label: string; event: Record<string, unknown>; flag: PushFlag }
+  | { ok: true; label: string; interactive: PushInteractive }
   | { ok: false; label: string | null; reason: PushRefusalReason }
+
+/** The interactive control accepts only button clicks; team/app/container are generated. */
+function parseInteractive(value: unknown): PushInteractive | undefined {
+  if (!isObject(value) || Object.keys(value).some(key => !['type', 'user', 'channel', 'message', 'actions'].includes(key))) return
+  if (value.type !== 'block_actions') return
+  const onlyId = (item: unknown, pattern: RegExp): item is { id: string } =>
+    isObject(item) && Object.keys(item).length === 1 && typeof item.id === 'string' && pattern.test(item.id)
+  if (!onlyId(value.user, /^[UW][A-Z0-9]+$/) || !onlyId(value.channel, /^[CDG][A-Z0-9]+$/)) return
+  if (!isObject(value.message) || Object.keys(value.message).length !== 1 || typeof value.message.ts !== 'string' || !/^\d+\.\d{1,6}$/.test(value.message.ts)) return
+  if (!Array.isArray(value.actions) || value.actions.length !== 1) return
+  for (const action of value.actions) {
+    if (!isObject(action) || Object.keys(action).some(key => !['type', 'action_id', 'block_id', 'value'].includes(key))) return
+    if (action.type !== 'button' || typeof action.action_id !== 'string' || action.action_id.length === 0 || action.action_id.length > 255 || /[\x00-\x1f\x7f]/.test(action.action_id)) return
+    if (action.block_id !== undefined && (typeof action.block_id !== 'string' || action.block_id.length === 0 || action.block_id.length > 255)) return
+    if (action.value !== undefined && (typeof action.value !== 'string' || action.value.length > 2000)) return
+  }
+  return value as unknown as PushInteractive
+}
 
 /** Read a `POST /_push` body; a malformed one names its reason and, when it has one, its label. */
 function parsePush(text: string): ParsedPush {
@@ -431,6 +540,11 @@ function parsePush(text: string): ParsedPush {
   const label = typeof body.label === 'string' && body.label !== '' ? body.label : null
   if (Object.keys(body).some(key => !PUSH_KEYS.includes(key))) return { ok: false, label, reason: 'unknown-field' }
   if (label === null) return { ok: false, label, reason: 'no-label' }
+  if (body.interactive !== undefined) {
+    const interactive = parseInteractive(body.interactive)
+    if (body.event !== undefined || body.envelope !== undefined || interactive === undefined) return { ok: false, label, reason: 'interactive-invalid' }
+    return { ok: true, label, interactive }
+  }
   const event = body.event
   if (!isObject(event)) return { ok: false, label, reason: 'event-not-object' }
   if (body.envelope === undefined) return { ok: true, label, event, flag: { sent: true, value: false } }
@@ -497,6 +611,9 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
   let controlStamp = ''
   const tickets = new Map<string, { label: string; mode: string }>()
   const sockets = new Set<Bun.ServerWebSocket<ConnData>>()
+  // Only this stub instance's successful posts/updates authorize a click.
+  const messageActions = new Map<string, PushAction[]>()
+  const messageKey = (label: string, channel: string, ts: string): string => JSON.stringify([label, channel, ts])
   const closedPort = reserveClosedPort()
 
   appendFileSync(recordPath, '')
@@ -559,16 +676,58 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
     return Response.json({ ok: false, error: reason }, { status: PUSH_REFUSAL_STATUS[reason] })
   }
 
-  /** `POST /_push`: one `events_api` envelope over the label's newest open WebSocket (b.deo SRI-1402). */
+  /** `POST /_push`: one event or recorded button click over the label's newest open WebSocket. */
   function push(text: string): Response {
     const parsed = parsePush(text)
     if (!parsed.ok) return refusePush(parsed.label, parsed.reason)
-    const { label, event, flag } = parsed
+    const { label } = parsed
+    const interactive = 'interactive' in parsed ? parsed.interactive : undefined
+    if (interactive !== undefined) {
+      const posted = messageActions.get(messageKey(label, interactive.channel.id, interactive.message.ts))
+      if (posted === undefined || interactive.actions.some(action => !posted.some(button =>
+        button.action_id === action.action_id && button.value === action.value && button.block_id === action.block_id))) {
+        return refusePush(label, 'interactive-context-mismatch')
+      }
+    }
     let target: Bun.ServerWebSocket<ConnData> | undefined
     for (const ws of sockets) {
       if (ws.data.label === label && ws.readyState === WS_OPEN) target = ws // insertion order: the last match was opened last
     }
     if (target === undefined) return refusePush(label, 'no-open-socket')
+    if (interactive !== undefined) {
+      const envelopeId = randomUUID()
+      const wire = JSON.stringify({
+        envelope_id: envelopeId,
+        type: 'interactive',
+        accepts_response_payload: false,
+        payload: {
+          ...interactive,
+          team: { id: TEAM_ID },
+          api_app_id: APP_ID,
+          container: { type: 'message', channel_id: interactive.channel.id, message_ts: interactive.message.ts, is_ephemeral: false },
+        },
+      })
+      const sentMonoMs = performance.now()
+      let sendStatus: number
+      try { sendStatus = target.send(wire) } catch { sendStatus = 0 }
+      if (sendStatus === 0) return refusePush(label, 'send-failed')
+      record('push', {
+        label: pushFieldText(label), envelope_id: envelopeId,
+        connection_id: target.data.connectionId, sent_mono_ms: sentMonoMs,
+        event_type: 'block_actions', channel: interactive.channel.id,
+        message_ts: interactive.message.ts, user: interactive.user.id,
+        actions: interactive.actions.map(action => ({
+          type: action.type,
+          action_id: action.action_id.replace(TOKEN_LIKE_ALL, '<token>'),
+          ...(action.block_id === undefined ? {} : { block_id: action.block_id.replace(TOKEN_LIKE_ALL, '<token>') }),
+          ...(action.value === undefined ? {} : { value: action.value.replace(TOKEN_LIKE_ALL, '<token>') }),
+        })),
+      })
+      return Response.json({ ok: true, envelope_id: envelopeId })
+    }
+    // The original events_api path and its records remain unchanged.
+    if (!('event' in parsed)) return refusePush(label, 'event-not-object')
+    const { event, flag } = parsed
     pushSeq += 1
     const envelopeId = randomUUID()
     const eventId = `Ev0STUB${String(pushSeq).padStart(4, '0')}${randomUUID().slice(0, 8).toUpperCase()}`
@@ -675,10 +834,33 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
       }
       if (args.channel !== undefined) fields.channel = args.channel
       if (args.user !== undefined) fields.user = args.user
+      if (args.thread_ts !== undefined) fields.thread_ts = recordedText(method, args.thread_ts)
       if (args.text !== undefined) fields.text = recordedText(method, args.text)
+      if (args.blocks !== undefined && (method === 'chat.postMessage' || method === 'chat.update')) fields.blocks = recordedBlocks(args.blocks)
       fields.args_token_like = Object.entries(args).some(([k, v]) => k !== 'token' && TOKEN_LIKE.test(v))
 
       const answer = (name: string, body: Record<string, unknown> | undefined, status = 200): Response => {
+        if (body?.ok === true && typeof body.ts === 'string' && typeof body.channel === 'string' &&
+            (method === 'chat.postMessage' || method === 'chat.update') && args.blocks !== undefined) {
+          fields.response_ts = body.ts.replace(TOKEN_LIKE_ALL, '<token>')
+          let blocks: unknown
+          try { blocks = JSON.parse(args.blocks) } catch { blocks = undefined }
+          const actions: PushAction[] = []
+          if (Array.isArray(blocks)) {
+            for (const block of blocks.slice(0, 50)) {
+              if (!isObject(block) || block.type !== 'actions' || !Array.isArray(block.elements)) continue
+              for (const element of block.elements.slice(0, 25)) {
+                if (!isObject(element) || element.type !== 'button' || typeof element.action_id !== 'string') continue
+                actions.push({
+                  type: 'button', action_id: element.action_id,
+                  ...(typeof block.block_id === 'string' ? { block_id: block.block_id } : {}),
+                  ...(typeof element.value === 'string' ? { value: element.value } : {}),
+                })
+              }
+            }
+          }
+          messageActions.set(messageKey(label, body.channel, body.ts), actions)
+        }
         record('api', { ...fields, answer: name, status })
         return body === undefined ? new Response(null, { status }) : Response.json(body, { status })
       }
@@ -719,7 +901,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
           is_enterprise_install: false,
         })
       }
-      return answer('ok', okBody(method, args, n, `http://127.0.0.1:${srv.port}/upload/`))
+      return answer('ok', okBody(method, args, n, `http://127.0.0.1:${srv.port}/upload/`, control))
     },
     websocket: {
       // Slack's pings would start the client's 30 s server-ping watch; the

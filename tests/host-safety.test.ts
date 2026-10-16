@@ -2876,8 +2876,11 @@ const AD_GLOBAL_FLAGS: readonly string[] = ['--store-path', '--home', '--tmux-co
 /** The scenario.sh helper that holds the harness's one `delete`: scenario 25's removal of the row with the unusable name. */
 const HARNESS_DELETE_HELPER = 'ad_delete_unusable_row'
 
-/** The files under tests/integration that are neither shell nor TypeScript, so hold no command or call: shellcheck's and bun's config. */
-const INTEGRATION_NON_CODE_FILES: readonly string[] = ['.shellcheckrc', 'bunfig.toml']
+/** Non-executable integration data: tool configs and the captured error envelope with its provenance. */
+const INTEGRATION_NON_CODE_FILES: readonly string[] = [
+  '.shellcheckrc', 'bunfig.toml',
+  'fixtures/agent-director-unresponsive.json', 'fixtures/agent-director-unresponsive.provenance.json',
+]
 
 /**
  * scenario.sh's readers of the agent-director shim's log, whose first
@@ -3045,7 +3048,7 @@ describe('static audit: the harness’s one agent-director delete is scenario 25
     }
   }
 
-  test('the audited files: every file under tests/integration is shell or TypeScript, shellcheck’s and bun’s config aside', () => {
+  test('the audited files: every file under tests/integration is shell or TypeScript, except the exact config and captured JSON inventory', () => {
     const { shell, typescript, other } = integrationFiles()
     const named = (paths: string[]): string[] => paths.map((path) => relative(INTEGRATION_DIR, path))
 

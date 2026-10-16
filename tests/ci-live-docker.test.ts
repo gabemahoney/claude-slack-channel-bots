@@ -75,12 +75,13 @@
  *   behind the plan's `guard`;
  * - the /ci images carry agent-director's release, never a release
  *   candidate. They name one base tag, `BASE_IMAGE`: the `FROM` lines of
- *   `docker/Dockerfile.test` and `docker/Dockerfile.live`, the `/ci`
+ *   `docker/Dockerfile.test`, `docker/Dockerfile.live` and
+ *   `docker/Dockerfile.real-agent`, the `/ci`
  *   base-build step (`scripts/ci-base-build.sh`) and the `/ci` and
  *   `/ci-live` skills (a planted previous tag is refused). The base
- *   (`docker/Dockerfile.test.base`) reads one file from the repo context, the
- *   client-under-test check (`AD_CLIENT_CHECK_SOURCE`, never
- *   `package.json`), and only `install.sh` from its one named build context
+ *   (`docker/Dockerfile.test.base`) reads the client-under-test check
+ *   (`AD_CLIENT_CHECK_SOURCE`) and the two native agent installers from the
+ *   repo context (never `package.json`), and only `install.sh` from its one named build context
  *   (no release-candidate context, no SHA256SUMS); pins a plain release that
  *   is CSCB's Phase 1 floor (`PHASE1_FLOOR_VERSION`) and `package.json`'s
  *   pin, with its commit and SHA-256s (b.jg5 SRJ-201); checks `install.sh`
@@ -2328,7 +2329,7 @@ function previousBaseTag(): string {
 
 /**
  * What is wrong with a base Dockerfile text (`docker/Dockerfile.test.base`'s
- * shape): empty when it reads only the client check from the repo context
+ * shape): empty when it reads only the client check and native agent installers from the repo context
  * and only the install script from its one named context (no
  * release-candidate context, no SHA256SUMS); pins a plain release that is
  * CSCB's Phase 1 floor and package.json's pin, with its commit and SHA-256s;
@@ -2355,7 +2356,8 @@ function baseLayoutProblems(text: string): string[] {
 
   const copy = `COPY --chmod=0755 ${AD_CLIENT_CHECK_SOURCE} ${AD_CLIENT_CHECK}`
   const copies = instructions.filter((i) => /^(COPY|ADD)\s/i.test(i))
-  if (copies.length !== 1 || copies[0] !== copy) problems.push(`the repo context is read by ${JSON.stringify(copies)}, not only ${copy}`)
+  const nativeInstallers = 'COPY docker/install-real-agents.sh docker/install-real-codex.sh /opt/cscb-ci/'
+  if (JSON.stringify(copies) !== JSON.stringify([copy, nativeInstallers])) problems.push(`the repo context is read by ${JSON.stringify(copies)}, not only ${copy} and ${nativeInstallers}`)
   const installs = statements.filter((s) => /\bnpm\s+(i|install|add)\b|\bbun\s+(add|install)\b|\s(-g|--global)\b/.test(s))
   if (installs.length !== 1 || installs[0] !== GLOBAL_CLIENT_INSTALL) problems.push(`the package installs are ${JSON.stringify(installs)}, not only ${GLOBAL_CLIENT_INSTALL}`)
 
@@ -2585,6 +2587,7 @@ describe('the /ci images (source audit)', () => {
   const TAGGED = [
     join('docker', 'Dockerfile.test'),
     join('docker', 'Dockerfile.live'),
+    join('docker', 'Dockerfile.real-agent'),
     BASE_DOCKERFILE,
     CI_BASE_BUILD_STEP,
     // The /ci skill stays while it names a base tag.
@@ -2600,7 +2603,15 @@ describe('the /ci images (source audit)', () => {
     expect(baseTagProblems(planted(text, BASE_IMAGE, previous))).toEqual([`names ${previous}, not ${BASE_IMAGE}`])
   })
 
-  test.each([join('docker', 'Dockerfile.test'), join('docker', 'Dockerfile.live')])('%s is built FROM BASE_IMAGE and nothing else', (rel) => {
+  test('the actual CI skill discloses real-agent model calls in its Credentials section', () => {
+    const credentials = repoFile(CI_SKILL).split('\n### Credentials\n')[1]?.split('\n### ')[0]
+    expect(credentials).toBeDefined()
+    expect(/\breal-agent\b/.test(credentials!)).toBe(true)
+    expect(/\bmodel calls?\b/.test(credentials!)).toBe(true)
+    expect(/\bkey serves no model call\b/.test(credentials!)).toBe(false)
+  })
+
+  test.each([join('docker', 'Dockerfile.test'), join('docker', 'Dockerfile.live'), join('docker', 'Dockerfile.real-agent')])('%s is built FROM BASE_IMAGE and nothing else', (rel) => {
     expect(dockerInstructions(rel).filter((i) => /^FROM\s/i.test(i))).toEqual([`FROM ${BASE_IMAGE}`])
   })
 
@@ -2728,8 +2739,30 @@ describe('the /ci images (source audit)', () => {
   test('the 0.10.0 legs are packed at exact versions', () => {
     const { instructions, args } = baseImage()
     expect([args.AD_PREV_VERSION, args.CSCB_PREV_VERSION].map((v) => /^\d+\.\d+\.\d+$/.test(v ?? ''))).toEqual([true, true])
-    const pack = runWith(instructions, 'npm pack')
+    const pack = runWith(instructions, '"agent-director@${AD_PREV_VERSION}"')
     expect([pack.includes('"agent-director@${AD_PREV_VERSION}"'), pack.includes('"claude-slack-channel-bots@${CSCB_PREV_VERSION}"')]).toEqual([true, true])
+  })
+
+  test('the base installs native Claude versions and Codex off PATH, retaining the ordinary stub selection', () => {
+    const { instructions, path } = baseImage()
+    expect(instructions).toContain('ENV DISABLE_AUTOUPDATER=1')
+    expect(instructions).toContain(`RUN bash /opt/cscb-ci/install-real-agents.sh ${MIN_CLAUDE_CODE_VERSION} ${LIVE_CLAUDE_CODE_VERSION} && bash /opt/cscb-ci/install-real-codex.sh`)
+    expect(path.some(p => /claude-code|codex/.test(p))).toBe(false)
+    const ordinary = repoFile('tests/integration/lib/scenario.sh')
+    expect(ordinary.includes('_scenario_place "${SCENARIO_FIXTURES}/stub-claude.sh" "${SCENARIO_BIN}/claude"')).toBe(true)
+  })
+
+  test('the prior published downgrade package has its own exact version, checksum, manifest and tarball beside the retained 0.10.0 fixture', () => {
+    const { instructions, args } = baseImage()
+    expect(args.CSCB_PREV_VERSION).toBe('0.10.0')
+    expect(args.CSCB_DOWNGRADE_VERSION).toBe('0.16.1')
+    expect(args.CSCB_DOWNGRADE_SHA256).toMatch(/^[a-f0-9]{64}$/)
+    const run = runWith(instructions, '"claude-slack-channel-bots@${CSCB_DOWNGRADE_VERSION}"')
+    expect(run).toContain('npm pack --ignore-scripts --pack-destination "$d" "claude-slack-channel-bots@${CSCB_DOWNGRADE_VERSION}"')
+    expect(run).toContain('sha256sum --check --status')
+    expect(run).toContain('test "$(tar -xOf "$f" package/package.json | jq -r .version)" = "$CSCB_DOWNGRADE_VERSION"')
+    expect(run).toContain('release.json')
+    expect(run).toContain('https://registry.npmjs.org/claude-slack-channel-bots')
   })
 
   test('the base installs sqlite3 and file with apt and writes the marker /etc/cscb-ci-image', () => {
@@ -2752,6 +2785,67 @@ describe('the /ci images (source audit)', () => {
     const firsts = [...repoFile(join('docker', 'live', file)).matchAll(/^\s*export PATH="([^"]*)"/gm)].map((m) => m[1]!.split(':')[0])
     expect(firsts.length).toBeGreaterThan(0)
     expect(firsts.filter((dir) => dir !== binDir)).toEqual([])
+  })
+})
+
+describe('native agent installers and contained heavy image', () => {
+  function nativeProblems(claude: string, codex: string): string[] {
+    const problems: string[] = []
+    for (const [name, text] of [['Claude', claude], ['Codex', codex]]) {
+      if (!text!.includes('[[ -e /etc/cscb-ci-image ]]')) problems.push(`${name} lacks the container refusal`)
+      if (/^\s*(?:export\s+)?PATH=|\bln\s+-s|npm\s+install\s+.*claude-code/m.test(text!)) problems.push(`${name} installs a launcher or changes PATH`)
+    }
+    for (const fragment of [
+      'dir="/opt/claude-code/${version}"',
+      '"$release_root/$version/manifest.json"',
+      '.platforms["linux-x64"].checksum',
+      '"$release_root/$version/linux-x64/claude"',
+      'sha256sum --check --status',
+      'DISABLE_AUTOUPDATER=1 "$dir/claude" --version',
+      '[[ "${actual%% *}" == "$version" ]]',
+    ]) if (!claude.includes(fragment)) problems.push(`Claude lacks ${fragment}`)
+    for (const fragment of [
+      'version=0.159.2', 'dir="/opt/codex/$version"',
+      'npm pack --ignore-scripts --pack-destination "$stage" "@openai/codex@$version-linux-x64"',
+      'file "$native" | grep -q ELF', 'install -m 0755 "$native" "$dir/codex"',
+      '"$dir/codex" --version', '[[ "$actual" == "codex-cli $version" ]]',
+    ]) if (!codex.includes(fragment)) problems.push(`Codex lacks ${fragment}`)
+    return problems
+  }
+  const claude = () => repoFile('docker/install-real-agents.sh')
+  const codex = () => repoFile('docker/install-real-codex.sh')
+
+  test('installs manifest-verified native Claude and the Codex ELF, verifies their actual versions and refuses use outside a CI image', () => {
+    expect(nativeProblems(claude(), codex())).toEqual([])
+  })
+
+  test.each([
+    ['Claude checksum omitted', 'claude', 'sha256sum --check --status', 'true'],
+    ['Claude version verification omitted', 'claude', '[[ "${actual%% *}" == "$version" ]]', 'true'],
+    ['Codex launcher accepted', 'codex', 'file "$native" | grep -q ELF', 'true'],
+    ['Codex version verification omitted', 'codex', '[[ "$actual" == "codex-cli $version" ]]', 'true'],
+    ['Claude installer on host', 'claude', '[[ -e /etc/cscb-ci-image ]]', 'true'],
+    ['Codex on PATH', 'codex', 'set -euo pipefail', 'set -euo pipefail\nexport PATH=/opt/codex:$PATH'],
+  ])('rejects %s', (_name, file, from, to) => {
+    const changed = planted(file === 'claude' ? claude() : codex(), from!, to!)
+    expect(nativeProblems(file === 'claude' ? changed : claude(), file === 'codex' ? changed : codex()).length).toBeGreaterThan(0)
+  })
+
+  test('the heavy image copies only the packed package, test tree and entrypoint, and accepts credentials solely at run time', () => {
+    const instructions = dockerInstructions('docker/Dockerfile.real-agent')
+    expect(instructions.filter(i => /^(?:COPY|ADD)\s/.test(i))).toEqual([
+      'COPY package.tgz /tmp/package.tgz', 'COPY tests /tests',
+      'COPY docker/real-agent-job.sh /opt/cscb-ci/real-agent-job.sh',
+    ])
+    expect(instructions.filter(i => /^(?:ARG|ENV)\s/.test(i) && /API_KEY|TOKEN|CI_ANTHROPIC/.test(i))).toEqual([])
+    expect(instructions).toContain('ENTRYPOINT ["bash", "/opt/cscb-ci/real-agent-job.sh"]')
+    const job = repoFile('docker/real-agent-job.sh')
+    expect(job).toContain('[[ -e /etc/cscb-ci-image ]] || exit 2')
+    expect(job).toContain('gosu testuser bun install /tmp/package.tgz')
+    expect(job).toContain('gosu testuser /opt/agent-director/check/ad-client-check.sh --package /test-repo/node_modules/claude-slack-channel-bots')
+    expect(job).toContain('"/opt/claude-code/$version/claude" --version')
+    expect(job).toContain('if int(rc)!=0 or not valid: sys.exit(1)')
+    expect(job).not.toMatch(/^\s*(?:agent-director|tmux|claude)\s/m)
   })
 })
 

@@ -7375,12 +7375,20 @@ describe('E36 T4: the debugging skill describes the build (b.jg5 SRJ-1104; AC 78
 
 const TESTS_README_FILE = 'tests/README.md'
 const INTEGRATION_DIR = 'tests/integration'
+const REAL_AGENT_DIR = 'tests/real-agent'
 
 /** Every `test-*.sh` file name in tests/integration/, listed read-only, sorted. */
 function integrationScripts(): string[] {
   return readdirSync(resolve(REPO_ROOT, INTEGRATION_DIR))
     .filter((name) => /^test-.*\.sh$/.test(name))
     .sort()
+}
+
+/** Existing integration and heavy real-agent scripts that the README may name. */
+function existingScenarioScripts(): string[] {
+  const heavyScripts = readdirSync(resolve(REPO_ROOT, REAL_AGENT_DIR))
+    .filter((name) => /^test-.*\.sh$/.test(name))
+  return [...integrationScripts(), ...heavyScripts].sort()
 }
 
 /** Whether `text` names the file `name` as a whole name: not inside a longer name, a path ending in it (`tests/integration/<name>`) included. */
@@ -7475,8 +7483,8 @@ describe(`E39 T5: ${TESTS_README_FILE} names every integration script and keeps 
     expect(unnamedScripts(readme(), scripts)).toEqual([])
   })
 
-  test(`every test-<n>-<name>.sh ${TESTS_README_FILE} names exists in ${INTEGRATION_DIR} (no removed script)`, () => {
-    expect(removedScriptsNamed(readme(), integrationScripts())).toEqual([])
+  test(`every test-<n>-<name>.sh ${TESTS_README_FILE} names exists in ${INTEGRATION_DIR} or ${REAL_AGENT_DIR} (no removed script)`, () => {
+    expect(removedScriptsNamed(readme(), existingScenarioScripts())).toEqual([])
   })
 
   test(`no passage of ${TESTS_README_FILE} about the start sweep says it deletes, removes or loses a row`, () => {
@@ -7503,10 +7511,25 @@ describe(`E39 T5: ${TESTS_README_FILE} names every integration script and keeps 
     })
 
     test('a removed script the README names is reported, added to the README or gone from disk', () => {
-      const scripts = integrationScripts()
+      const scripts = existingScenarioScripts()
       const added = `${readme()}\n\`test-11-exact-tmux-targets.sh\` checks the exact tmux targets.\n`
       expect(removedScriptsNamed(added, scripts)).toEqual(['test-11-exact-tmux-targets.sh'])
       expect(removedScriptsNamed(readme(), scripts.filter((name) => name !== 'test-12-bot-hook-absoluteness.sh'))).toEqual(['test-12-bot-hook-absoluteness.sh'])
+    })
+
+    test('an existing heavy script is recognized, and removing it from the inventory is reported', () => {
+      const name = 'test-101-fmk-real-busy.sh'
+      const scripts = existingScenarioScripts()
+      expect(scripts).toContain(name)
+      expect(namesFile(readme(), name)).toBe(true)
+      expect(removedScriptsNamed(`Run \`${REAL_AGENT_DIR}/${name}\`.`, scripts)).toEqual([])
+      expect(removedScriptsNamed(readme(), scripts.filter((script) => script !== name))).toEqual([name])
+    })
+
+    test('a heavy script whose whole name is missing from the README is reported', () => {
+      const name = 'test-101-fmk-real-busy.sh'
+      const edited = readme().replaceAll(name, `${name}.bak`)
+      expect(unnamedScripts(edited, [name])).toEqual([name])
     })
 
     test('the new-script template test-N-<short-name>.sh names no script', () => {

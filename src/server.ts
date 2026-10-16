@@ -397,6 +397,7 @@ import {
   serverPortWriteFailedLine,
   writeServerPortRecord,
 } from './clear-latch.ts'
+import { handleTestMcpDrop, TEST_MCP_DROP_ROUTE, TEST_MCP_DROP_START_LINE } from './test-mcp-drop.ts'
 import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
 import { repointLogging } from './logging.ts'
 import {
@@ -3602,6 +3603,8 @@ export async function main(): Promise<void> {
   // (installed before the configuration was read) and sets B's floor. The
   // latch re-check and the retry timers below take their values from it.
   const testTimers = installTestTimerOverrides(personaConfig.test_timer_overrides, (line) => console.error(line))
+  const testMcpDropEnabled = personaConfig.test_mcp_drop_endpoint === true
+  if (testMcpDropEnabled) console.error(TEST_MCP_DROP_START_LINE)
   // b.av2 SR-6.2: the trust patch precedes every launch. Installed as soon as
   // the persona config is set — before the Slack connections, Bun.serve and
   // initRestart — so no launch path (start, restart or a human trigger) can
@@ -4495,6 +4498,24 @@ export async function main(): Promise<void> {
     async fetch(req: Request, server: { requestIP(r: Request): { address: string } | null; timeout(req: Request, seconds: number): void }): Promise<Response> {
       const url = new URL(req.url)
       const mcpSid = req.headers.get('mcp-session-id')
+      if (testMcpDropEnabled && url.pathname === TEST_MCP_DROP_ROUTE) {
+        return handleTestMcpDrop(req, server.requestIP(req)?.address, {
+          getPersonaConfig: () => personaConfig,
+          log: (line) => console.error(line),
+          disconnect: async (key) => {
+            const entry = getSessionByPersona(key)
+            if (!entry?.connected) return
+            const sessionId = entry.transport.sessionId
+            if (!sessionId) throw new Error('No MCP session ID')
+            // Exercise the SDK's actual client DELETE path: it invokes
+            // onsessionclosed BEFORE closing, preserving normal reconnect.
+            const response = await entry.transport.handleRequest(new Request('http://127.0.0.1/mcp', {
+              method: 'DELETE', headers: { 'mcp-session-id': sessionId },
+            }))
+            if (!response.ok) throw new Error('MCP session termination refused')
+          },
+        })
+      }
       if (isHttpVerbose()) {
         console.error(`[slack] HTTP ${req.method} ${url.pathname} session=${mcpSid ?? '(none)'}`)
       }

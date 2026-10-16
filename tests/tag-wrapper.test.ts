@@ -192,3 +192,16 @@ describe('metadata truncation preserves the minimum body allowance', () => {
     expect(message).toEqual(before)
   })
 })
+
+// Native input observations extend body escaping only; reference corpus is unchanged.
+describe('b.omv SR-14.2 native input rewrites', () => {
+  test.each([
+    ['line separator', '\u2028', '&#8232;'],
+    ['combining acute', 'e\u0301', 'e&#769;'],
+    ['combining diaeresis', 'u\u0308', 'u&#776;'],
+  ])('escapes %s in the body while preserving attribute bytes', (_name, raw, escaped) => {
+    expect(escapeBody(raw)).toBe(escaped)
+    expect(escapeAttr(raw)).toBe(raw)
+    expect(buildTagParts(injected(raw))).toEqual([injectedFrame().replace('></channel>', `>${escaped}</channel>`)])
+  })
+})

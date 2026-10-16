@@ -110,6 +110,7 @@ export const MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS = 3_600_000
  * default), but the loader accepts it. See `src/test-timer-overrides.ts`.
  */
 export const TEST_TIMER_OVERRIDES_KEY = 'test_timer_overrides'
+export const TEST_MCP_DROP_ENDPOINT_KEY = 'test_mcp_drop_endpoint'
 
 /** The keys of the test-only timer override block (b.2nr), each optional; milliseconds when the name ends `_ms`, seconds when it ends `_s`. */
 export const TEST_TIMER_OVERRIDE_KEYS = [
@@ -439,6 +440,8 @@ export interface ServerSettings {
    * reload never applies a change of it live.
    */
   test_timer_overrides?: TestTimerOverrides
+  /** b.omv SR-14.1: test-only, captured at startup and never applied by reload. */
+  test_mcp_drop_endpoint?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -671,6 +674,9 @@ function applyServerDefaults(input: ServerSettingsInput, configDir: string, cron
     // included, is kept so its rule rejects it). Not a documented key, so it
     // is not in `ServerSettingsInput`.
     ...(testTimerOverridesOf(input) === undefined ? {} : { test_timer_overrides: testTimerOverridesOf(input) }),
+    ...((input as { test_mcp_drop_endpoint?: boolean }).test_mcp_drop_endpoint === undefined ? {} : {
+      test_mcp_drop_endpoint: (input as { test_mcp_drop_endpoint?: boolean }).test_mcp_drop_endpoint,
+    }),
   }
 }
 
@@ -1147,7 +1153,7 @@ export function describeUnknownKeys(keys: readonly string[]): string {
 // ---------------------------------------------------------------------------
 
 /** Lookup form of PERSONA_TOP_LEVEL_KEYS. */
-const PERSONA_TOP_LEVEL_KEY_SET: ReadonlySet<string> = new Set([...PERSONA_TOP_LEVEL_KEYS, TEST_TIMER_OVERRIDES_KEY])
+const PERSONA_TOP_LEVEL_KEY_SET: ReadonlySet<string> = new Set([...PERSONA_TOP_LEVEL_KEYS, TEST_TIMER_OVERRIDES_KEY, TEST_MCP_DROP_ENDPOINT_KEY])
 
 /**
  * Top-level path settings that today's resolution expands without a type
@@ -1218,6 +1224,7 @@ function validatePersonaServerSettings(settings: PersonaServerSettings): void {
   checkAllowedValue(settings.reply_chunk_mode, 'reply_chunk_mode', REPLY_CHUNK_MODES, style)
   checkBoolean(settings.allow_invited_channels, 'allow_invited_channels', style)
   validateTestTimerOverrides(settings.test_timer_overrides, style)
+  if (settings.test_mcp_drop_endpoint !== undefined) checkBoolean(settings.test_mcp_drop_endpoint, TEST_MCP_DROP_ENDPOINT_KEY, style)
 }
 
 // ---------------------------------------------------------------------------

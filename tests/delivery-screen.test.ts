@@ -53,3 +53,38 @@ describe('Codex known composer contract (popup research belongs to E7)', () => {
     expect(readDeliveryScreen('codex', 'No composer')).toEqual({ kind: 'menu', running: false })
   })
 })
+
+// b.omv SR-14.2 case 10: native 2.1.280/296 panes captured in E6.
+describe('observed native Claude composer forms', () => {
+  test.each([
+    '⏸ manual mode on · ? for shortcuts · ← for agents         ◐ medium · /effort',
+    '⏸ manual mode on                                          ◐ medium · /effort',
+  ])('NBSP prompt and manual footer %p are idle', footer => {
+    expect(readDeliveryScreen('claude', `────────────────
+❯\u00a0
+────────────────
+  ${footer}
+`)).toEqual({ kind: 'empty', running: false })
+  })
+  test.each(['[Pasted text #1]', '[Pasted text #2 +59 lines]'])('long/taller-than-read marker %p belongs only to an in-flight item', marker => {
+    const pane = `────────────────
+❯\u00a0${marker}
+────────────────
+  paste again to expand
+`
+    expect(readDeliveryScreen('claude', pane, '<channel>known item</channel>')).toEqual({ kind: 'own', text: marker, running: false })
+    expect(readDeliveryScreen('claude', pane).kind).toBe('input')
+  })
+  test('soft wraps at words and columns recognize the complete item, rejecting an unrelated draft', () => {
+    const own = '<channel source="slack-channel-router" chat_id="D1">longword tail</channel>'
+    const shown = '<channel source="slack-channel-router"\nchat_id="D1">longwo\nrd tail</channel>'
+    const pane = (text: string) => `────────────────
+❯\u00a0${text.replaceAll('\n', '\n  ')}
+────────────────
+  ⏸ manual mode on
+`
+    expect(readDeliveryScreen('claude', pane(shown), own).kind).toBe('own')
+    expect(readDeliveryScreen('claude', pane(shown.replace('tail', 'human draft')), own).kind).toBe('input')
+    expect(readDeliveryScreen('claude', pane(shown.replace('</channel>', '</wrong>')), own).kind).toBe('input')
+  })
+})

@@ -18,6 +18,10 @@ export function escapeAttr(value: unknown): string {
 }
 /** Python whitespace and alphanumeric boundaries, plus SR-2.2's extended openers. */
 export function escapeBody(value: string): string {
+  // b.omv SR-14.2 case 10: native Claude 2.1.296 rewrites U+2028 to
+  // LF and composes U+0301/U+0308 with their preceding letters. Escape
+  // those observed characters in the body before fixing parts;
+  // receipt matching stays exact, with no normalization in the matcher.
   const chars = Array.from(replaceLoneSurrogates(value).replace(/\r\n?/g, '\n').replace(/\t/g, '    ').replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, ''))
   let out = ''
   for (let i = 0; i < chars.length; i++) {
@@ -37,7 +41,7 @@ export function escapeBody(value: string): string {
     out += chars.slice(nameStart, j).join('')
     i = j - 1
   }
-  return out
+  return out.replace(/[\u0301\u0308\u2028]/g, c => `&#${c.codePointAt(0)};`)
 }
 export function tagByteLength(value: string): number { return new TextEncoder().encode(value).byteLength }
 function render(attrs: TagAttributes, body: string, part?: string): string {

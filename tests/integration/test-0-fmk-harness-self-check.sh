@@ -4153,7 +4153,107 @@ leg_tmux_server_steps() {
 # Run
 # ---------------------------------------------------------------------------
 
+# b.omv SR-14.1: counted fault contract, exercised in this one container check.
+# This tiny binary is an input fixture: no real agent or alternate store is started.
+leg_real_fault_contract() {
+    local dir="${SCENARIO_ROOT}/fault-controls" shim faults n pid pids=() rc start elapsed
+    mkdir -p "${dir}"
+    shim="${dir}/agent-director"
+    faults="${dir}/agent-director-shim.faults"
+    cp "${SCENARIO_FIXTURES}/agent-director-shim.sh" "${shim}"
+    cp "${SCENARIO_FIXTURES}/agent-director-unresponsive.json" "${dir}/agent-director-unresponsive.json"
+    cat > "${dir}/agent-director.real" <<'REAL'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${0%/*}/effects"
+printf '{"effect":true}\n'
+REAL
+    chmod 700 "${shim}" "${dir}/agent-director.real"
+    printf 'send-keys no_enter swallow 1\n' > "${faults}"
+    "${shim}" send-keys --text swallowed --no-enter > "${dir}/out"
+    [[ ! -e "${dir}/effects" ]] || fail 'swallow ran the real binary'
+    "${shim}" send-keys --text passed --no-enter > "${dir}/out"
+    [[ "$(wc -l < "${dir}/effects")" == 1 ]] || fail 'consumed swallow repeated'
+    for action in unknown-typed unknown-untyped; do
+        printf 'send-keys * %s 1\n' "${action}" > "${faults}"
+        rc=0
+        "${shim}" send-keys --text "${action}" --no-enter > "${dir}/out" 2> "${dir}/err" || rc=$?
+        [[ "${rc}" == 1 ]] || fail 'unknown outcome did not fail'
+        cmp "${dir}/err" "${SCENARIO_FIXTURES}/agent-director-unresponsive.json" || fail 'unknown envelope differs from real capture'
+    done
+    [[ "$(wc -l < "${dir}/effects")" == 2 ]] || fail 'unknown typed/untyped effects differ'
+    printf 'send-keys key=Enter delay=250 1\n' > "${faults}"
+    start="$(date +%s%3N)"
+    "${shim}" send-keys --key Enter > "${dir}/out"
+    elapsed=$(( $(date +%s%3N) - start ))
+    (( elapsed >= 250 )) || fail 'delayed call ran early'
+    printf 'send-keys no_enter swallow 3\n' > "${faults}"
+    for n in {1..12}; do
+        "${shim}" send-keys --text "concurrent-${n}" --no-enter > "${dir}/out-${n}" &
+        pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do wait "${pid}" || fail 'concurrent shim call failed'; done
+    [[ "$(wc -l < "${dir}/effects")" == 12 ]] || fail 'concurrent calls double-consumed or lost a count'
+    [[ "$(cat "${faults}")" == 'send-keys no_enter swallow 0' ]] || fail 'concurrent count not exhausted exactly'
+    echo "recorded: fault effects/concurrency passed; delay_ms=${elapsed}"
+}
+
+leg_real_receipt_controls() {
+    bun "${SCENARIO_FIXTURES}/real-case-assertions.ts" selfcheck "${SCENARIO_ROOT}"
+}
+
+nested_real_usage() {
+    source "${SCENARIO_FIXTURES}/../lib/real-scenario.sh"
+    nested_stand_in
+    # No accepted items: this exercises the downgrade's launch-only report.
+    # Final usage is written only on teardown, so an early report loses it.
+    mkdir -p "${HOME}/.claude/projects/control"
+    python3 - "${HOME}/.claude/projects/control/launch.jsonl" "${SCENARIO_ROOT}/usage-ready" <<'USAGE' &
+import json,pathlib,signal,sys,time
+transcript,ready=map(pathlib.Path,sys.argv[1:])
+def append(input_tokens,output_tokens):
+ with transcript.open('a') as f:
+  f.write(json.dumps({'type':'assistant','timestamp':'2026-10-16T00:00:00Z','message':{'id':'launch-message','role':'assistant','content':[], 'usage':{'input_tokens':input_tokens,'output_tokens':output_tokens,'cache_read_input_tokens':2,'cache_creation_input_tokens':1}}})+'\n')
+def finish(*_):
+ append(7,11)
+ raise SystemExit(0)
+signal.signal(signal.SIGTERM,finish)
+append(2,3)
+ready.touch()
+while True: signal.pause()
+USAGE
+    track_pid "$!"
+    wait_for_file "${SCENARIO_ROOT}/usage-ready" 10 'usage control did not start'
+    real_finish
+    if [[ "${TEST_NAME}" == *-failure ]]; then exit 23; fi
+}
+
+leg_real_usage_controls() {
+    local outcome want
+    for outcome in success failure; do
+        want=0
+        if [[ "${outcome}" == failure ]]; then want=23; fi
+        run_nested "test-0-fmk-real-usage-${outcome}" release nested_real_usage nested_stand_in
+        if [[ "${NESTED_RC}" != "${want}" ]]; then
+            sed 's/^/  | /' "${NESTED_OUT}" >&2
+            fail "launch-only ${outcome} changed its exit status to ${NESTED_RC}"
+        fi
+        [[ "$(grep -c '^tokens: ' "${NESTED_OUT}")" == 1 ]] || fail "launch-only ${outcome} did not report usage exactly once"
+        [[ "$(grep -c '^duplicates: ' "${NESTED_OUT}")" == 1 ]] || fail "launch-only ${outcome} did not report duplicates exactly once"
+        python3 - "${NESTED_OUT}" <<'CHECK_USAGE'
+import json,sys
+lines=open(sys.argv[1]).read().splitlines()
+usage=json.loads(next(l.removeprefix('tokens: ') for l in lines if l.startswith('tokens: ')))
+assert usage=={'input':7,'output':11,'cache_read':2,'cache_creation':1}, 'report missed final teardown usage or double-counted streamed usage'
+assert 'duplicates: 0' in lines, 'launch-only report invented duplicates'
+CHECK_USAGE
+        echo "recorded: launch-only ${outcome} reports final usage once; original exit=${want}"
+    done
+}
+
 LEGS=(
+    real_fault_contract
+    real_receipt_controls
+    real_usage_controls
     isolation
     real_binary
     setup_install

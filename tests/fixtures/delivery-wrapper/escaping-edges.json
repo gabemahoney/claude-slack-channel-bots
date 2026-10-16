@@ -51,7 +51,7 @@
       {
         "name": "word-boundary-punctuation",
         "input": "<channel! <channel- <channel\u0301 <channel",
-        "expected": "&lt;channel! &lt;channel- &lt;channel\u0301 &lt;channel"
+        "expected": "&lt;channel! &lt;channel- &lt;channel&#769; &lt;channel"
       },
       {
         "name": "nonmatching-names",
@@ -66,7 +66,7 @@
       {
         "name": "plain-unicode",
         "input": "\u732b\ud83e\udd80e\u0301\u2028\u2029",
-        "expected": "\u732b\ud83e\udd80e\u0301\u2028\u2029"
+        "expected": "\u732b\ud83e\udd80e&#769;&#8232;\u2029"
       },
       {
         "name": "python-space-U+0009",
@@ -191,7 +191,7 @@
       {
         "name": "python-space-U+2028",
         "input": "<\u2028/ \u2028ChAnNeL>",
-        "expected": "&lt;\u2028/ \u2028ChAnNeL>"
+        "expected": "&lt;&#8232;/ &#8232;ChAnNeL>"
       },
       {
         "name": "python-space-U+2029",

@@ -2429,6 +2429,7 @@ install_ad_shim() {
     require_ci_image "${step}"
     require_scenario_home "${step}"
     _scenario_shim_over "${SCENARIO_AD_ROOT}/bin/agent-director" "${step}"
+    _scenario_place "${SCENARIO_FIXTURES}/agent-director-unresponsive.json" "${SCENARIO_AD_ROOT}/bin/agent-director-unresponsive.json" "${step}: captured envelope"
 }
 
 install_ad_admin_shim() {
