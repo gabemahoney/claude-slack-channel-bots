@@ -836,6 +836,44 @@ read-back checks compare required fields through `real-case-assertions.ts`.
 | `test-191-fmk-real-ai-ac91.sh` | DM/thread replies without an operator prompt file |
 | `test-206-fmk-real-ai-ac106.sh` | Duplicate copy recognized as one logical DM |
 
+For AC11, AC12 and AC20, `ai-scenario.sh` asks for the received BODY
+verbatim, preserving characters, whitespace and entity spelling with only
+JSON string escaping. It does not ask the model to reconstruct the original
+Slack text. Uniform opaque labels (`case_01`, `case_02`, …) correlate JSON
+answers with cases; original fixture names remain in private
+`ai-expected/case-labels.json` and `recorded:` diagnostics, outside the model
+prompt. The original 15-case corpus, input order, expected attributes/body,
+exact comparator, model and timeouts remain unchanged.
+
+`tests/real-agent/ai-readback-controls.ts` is a manual, unpaid check of the
+actual scenario generator and read-back comparator, outside `/ci` and the
+heavy matrix. It checks all 15 AC11, six AC12 and two AC20 generated cases,
+opaque labels and original-name diagnostics, and byte preservation of the
+original corpus. The actual comparator must accept exact received text and
+reject tabs substituted for received spaces, wrong attributes, another
+case's opaque label and the original semantic fixture label.
+
+Run these controls only in the marked `cscb-ci-base:v8` image (see
+`docker/README.md`), which supplies Bun, Python 3, Bash and jq. Set
+`AI_CONTROLS_PACKAGE` to an absolute scratch directory containing the
+`package/` contents extracted from a fresh `npm pack --ignore-scripts` of
+the current checkout. From the repo root, run:
+
+```sh
+docker run --rm --network none --memory 512m --cpus 1 --pids-limit 128 \
+  --read-only --tmpfs /tmp:rw,nosuid,nodev,size=128m \
+  -e HOME=/tmp/controls-home -e CSCB_PKG_DIR=/packed \
+  --mount type=bind,src="$PWD/tests",dst=/tests,readonly \
+  --mount type=bind,src="$AI_CONTROLS_PACKAGE",dst=/packed,readonly \
+  --entrypoint /usr/local/bin/bun cscb-ci-base:v8 \
+  /tests/real-agent/ai-readback-controls.ts
+```
+
+The controls launch no native agent, model, agent-director or tmux and need
+no API credentials. Remove the scratch package after the check. Their pass
+does not establish paid AI acceptance: all 21 trials at three successes per
+criterion and the complete 58-invocation heavy matrix remain required.
+
 Test 101 pre-allows `Bash(sleep *)` and the Slack reply tool, and sets exact
 `permissions.ask` rules for `Bash(printf permission-probe)` and
 `Bash(printf subagent-deny-probe)` in its disposable HOME. These rules keep

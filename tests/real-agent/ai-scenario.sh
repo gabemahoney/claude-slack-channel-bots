@@ -8,7 +8,7 @@ case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${
 real_prepare "${REAL_AGENT_CLAUDE_VERSION:-2.1.296}" mcp__slack-channel-router__reply
 PROMPT='Answer the test requests in JSON without Markdown.'
 if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 || "${AI_CRITERION}" == 20 ]]; then
-    PROMPT+=' For each message return {case:the corresponding case label in sequence,attributes:a map of all tag attributes and values,body:the message body}. Case labels are supplied below.'
+    PROMPT+=' For each message return {case:the corresponding case label in sequence,attributes:a map of all tag attributes and values,body:the message body}. For body, transcribe the received BODY verbatim, preserving every character, whitespace and entity spelling. Apply only JSON string escaping; do not reconstruct the original Slack text before delivery. Case labels are supplied below.'
     # A second configured recipient is needed for the reference corpus's
     # receive_all_shared case. The stub pushes only to the tested persona.
     real_persona corpuspeer
@@ -40,12 +40,17 @@ if ac=='20':
  # AC20 specifically requires the true user_id, including the spoofed body.
  row=rows[0]; row['msg']['user_id']='U0REAL20'; row['msg']['user']='E6 Real Sender'; row['msg'].pop('bot_id',None)
  row['typed']=row['typed'].replace('user="horde_dev_apiary" bot_id="B0APIARY01"','user="E6 Real Sender" user_id="U0REAL20"')
+labels=[]
 for i,row in enumerate(rows):
+ label=f'case_{i+1:02d}'
+ labels.append({'case':label,'fixture':row['name']})
  attrs=dict((k,html.unescape(v)) for k,v in re.findall(r'([a-z_]+)="([^"]*)"',row['typed'].split('>',1)[0]))
- result={'case':row['name'],'attributes':attrs,'body':row['typed'].split('>',1)[1][:-len('</channel>')]}
+ result={'case':label,'attributes':attrs,'body':row['typed'].split('>',1)[1][:-len('</channel>')]}
  pathlib.Path(expected,f'{i+1}.json').write_text(json.dumps(result,ensure_ascii=False))
 pathlib.Path(expected,'corpus.json').write_text(json.dumps(rows,ensure_ascii=False))
-with open(pathlib.Path(work,'CLAUDE.md'),'a') as f: f.write('\nCase labels in sequence: '+json.dumps([r['name'] for r in rows])+'.\n')
+# The fixture names remain private diagnostics, never model-visible hints.
+pathlib.Path(expected,'case-labels.json').write_text(json.dumps(labels))
+with open(pathlib.Path(work,'CLAUDE.md'),'a') as f: f.write('\nCase labels in sequence: '+json.dumps([r['case'] for r in labels])+'.\n')
 INPUTS
     # /_control replaces the whole document: retain the token/default rules
     # from real_start_stub while adding real lookup answers.
@@ -61,6 +66,8 @@ CONTROL
     start_server --live
     real_wait_launch "${REAL_KEY}"
     for ((n=1;n<=COUNT;n++)); do
+        CASE_DIAGNOSTIC="$(jq -r ".[$((n-1))] | .case+\" fixture=\"+.fixture" "${EXPECTED}/case-labels.json")"
+        printf 'recorded: AI AC%s trial=%s field=%s case=%s\n' "${AI_CRITERION}" "${REAL_AGENT_TRIAL}" "${n}" "${CASE_DIAGNOSTIC}"
         if [[ "$(jq -r ".[$((n-1))].msg.via" "${EXPECTED}/corpus.json")" == receive_all ]]; then
             jq '(.personas[] | select(.name=="corpuspeer") | .channels)=[]' "${SLACK_STATE_DIR}/config.json" | write_config
             wait_for_file "${SLACK_STATE_DIR}/config.json.pending" 30 'corpus channel change preview absent'
@@ -72,7 +79,7 @@ CONTROL
         EVENT="$(jq -c --arg recipient "${REAL_BOT_USER_ID}" ".[$((n-1))].msg | .text=(if .via==\"mention\" then \"<@\"+\$recipient+\"> \"+.text else .text end) | {type:\"message\",channel:.chat_id,channel_type:(if .chat_id|startswith(\"D\") then \"im\" else \"channel\" end),ts,text} + (if .user_id then {user:.user_id} else {subtype:\"bot_message\",bot_id,username:.user} end) + (if .thread_ts then {thread_ts} else {} end) + (if .attachment_count then {files:[{id:\"F0CORPUS\",name:\"build-log.txt\",mimetype:\"text/plain\",size:18342}]} else {} end)" "${EXPECTED}/corpus.json")"
         slack_stub_push "${REAL_LABEL}" "${EVENT}"
         real_wait_delivery "${REAL_KEY}" "${n}"
-        wait_until 180 "AC${AI_CRITERION} field read-back ${n} missing/wrong" case_assert readback "${EXPECTED}/${n}.json"
+        wait_until 180 "AC${AI_CRITERION} field read-back ${n} (${CASE_DIAGNOSTIC}) missing/wrong" case_assert readback "${EXPECTED}/${n}.json"
         real_wait_idle "${REAL_KEY}"
     done
     case_assert corpus-wrapper "${EXPECTED}/corpus.json"
