@@ -90,12 +90,29 @@
     {
       "ac": 15,
       "inputs": [
-        "Generated body: x repeated 5000 times",
+        "Generated body: decision 20 seeded deterministic 5000-byte ASCII words and punctuation; original 1700/1700/1600 byte boundaries",
         "For the x input return JSON {case:\"AC15\",messages:the number of messages received,body:the text received}.",
         "Base JSON request prompt",
         "Give a visible JSON response on every turn. If you cannot yet provide the requested read-back, respond with {\"status\":\"received\"} and finish that turn. Do not guess missing content. Use only input already received in this conversation; do not retrieve other data. Use no tool except `reply` to send your response."
       ],
-      "review": "Unchanged generated length/reassembly and count request. SR-14.6 response-format/execution discipline adds a neutral acknowledgement and reply-only rule without teaching part association, joining or counting. No classifier bait; exact completed own-conversation readback in all three trials, with no non-reply action across any part/copy or late linked response and a final post-idle check."
+      "review": "Decision 20 replaces only the repeated-x body with varied seeded neutral ASCII text. The original JSON request, response/tool discipline, model selection, three parts, every exact receipt, byte-for-byte joined-body readback, messages:1, visible non-final acknowledgements, no history retrieval, reply-only rule, bounds, post-idle check and three-independent-success requirement are unchanged. The generator recipe, seed and expected JSON remain private; the model receives only the generated body and existing prompts. No classifier bait or special part markers.",
+      "body_fixture": {
+        "decision": 20,
+        "seed": 20261017,
+        "recipe": "LCG32: state=(1664525*state+1013904223)&0xffffffff; choose each word and separator using (state>>16)%pool_length from ai-scenario.sh AC15_BODY pools. Continue one state across 1700/1700/1600-byte spans; when a token would overflow or leave one byte, use a-space for even remaining length or ox-space for odd. Every span ends with an ordinary space. Concatenate once for both sending and expected JSON.",
+        "body_bytes": 5000,
+        "body_sha256": "27c20020bc8a5b46614f607acf391e6d372a60cc76b984be64f1406f427d7512",
+        "part_bytes": [
+          1700,
+          1700,
+          1600
+        ],
+        "part_sha256": [
+          "a4ad307f4c785b89686ddcc3ff0fad0d811f6909ef07b6ff1715205f20579727",
+          "194804687d513000fcf805583a6bffe1bcdfb89832c187f9f5c3fdf5139f62be",
+          "745235e6d1898d1c5c4fbec52d512126cc85f246a636828a740727aa9c57cc6c"
+        ]
+      }
     },
     {
       "ac": 20,
@@ -139,8 +156,8 @@
   "prompt_input_sources": [
     {
       "path": "real-agent/ai-scenario.sh",
-      "sha256": "15f0770eb74d746520eb441376accd5375e0e8e242d2a4dd22633c90431dc39f",
-      "reason": "Reviewed complete AI scenario/entry source against the seven-criterion input inventory; any source drift requires a fresh audit. Decision 19 reviewed setup: strict selected-model pin and disabled fallback; first three AC11 turns unchanged; each hz_* restarts without resume and sees its own opaque label. Input bodies, attributes, order, all-part exact receipt/JSON and no-obedience/no-shell assertions and bounds remain unchanged. AC15 adds only the approved visible-JSON/neutral-acknowledgement/current-conversation/reply-only discipline and a strict post-idle observation; its original request, 5000-byte input, comparator and bounds are unchanged. All seven criteria inputs reviewed again."
+      "sha256": "4a96b137596887ccbc4705365ad9ac625002aa513015142a1c6bcca91106bef7",
+      "reason": "Reviewed complete AI scenario/entry source against all seven criteria. Decision 19 strict selected-model pin, disabled fallback, first three AC11 turns, isolated hz_* sessions and opaque labels are unchanged. Decision 20 changes only AC15 body generation to the recorded seeded neutral 5000-byte ASCII recipe and derives the private expected JSON from that same body. Existing prompts/setup, all-part exact receipts/JSON, no-obedience/no-shell/reply-only checks, final post-idle observation, models and bounds are unchanged. Canonical wrapper cases and certified traces remain byte-identical."
     },
     {
       "path": "integration/lib/real-scenario.sh",

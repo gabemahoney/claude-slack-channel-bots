@@ -898,6 +898,12 @@ already received in the conversation.
 
 SR-7.2's fixed shipped description alone teaches multipart semantics.
 
+Decision 20 uses LCG32 with seed `20261017` to generate a deterministic
+5,000-byte ASCII body of varied words and punctuation, with no classifier
+bait and the original 1700/1700/1600-byte parts. Generate one body for both
+sending and private expected JSON; `tests/real-agent/fixtures/input-audit.json` records the
+recipe, seed and body/part hashes, kept outside the model prompt.
+
 The AC15-only guard checks every part's own native turn, every exact duplicate
 copy and late responses still linked to those turns. It requires valid own
 receipts and send windows, rejects malformed or stale copy timestamps, and
@@ -945,12 +951,16 @@ It rejects classifier stops before, beside or after exact JSON, including
 late linked stops, fallback/API errors, synthetic answers and incomplete
 duplicates. Shell controls require sequence 3 and check silent successful
 final observation; a separate control rejects the withdrawn `stop` mode. Its pass does not
-certify an AI trial. Thirty AC15 controls in this existing test file cover
+certify an AI trial. The AC15 controls in this existing test file cover
 completed acknowledgements, all-part receipts, exact final JSON, intermediate
 and late retrieval, non-reply tools, duplicate copies with invalid/stale
 timestamps, classifier stops, permitted reply completion and the actual
 scenario's post-idle check. They also check the generated response/tool
 discipline and that the AC15 restriction stays local to that criterion.
+
+Generation controls pin the seeded body's determinism, variation, ASCII
+length, absence of bait, exact part boundaries and audited hashes. The
+actual scenario's post-idle controls use that generated body.
 
 `tests/real-agent/ai-readback-controls.ts` is a manual, unpaid check of the
 actual scenario generator and read-back comparator, outside `/ci` and the
@@ -1125,14 +1135,14 @@ passes a deterministic sustained-load regression (typing p95 2880 ms before,
 1567 ms after); the recorded-gap control passes before the fix too.
 The previous focused AI run on `azure/openai/gpt-6-astra`, native 2.1.296,
 with fallback disabled recorded 18 PASS and three FAIL: AC11, AC12, AC20,
-AC23, AC91 and AC106 each passed all three trials; AC15 failed all three
+AC23, AC91 and AC106 each passed all three trials; all-`x` AC15 failed all three
 180 s runs. No classifier stop occurred. The observed AC15 sequence after
 part one was an empty assistant turn, a native visible-response follow-up,
 then a permission-held `fetch_messages` request; parts two and three were
 not sent. No production defect is established; the roughly 15-second delay
 before the permission prompt remains unexplained.
 
-The three fresh AC15 trials in
+The three subsequent all-`x` AC15 trials in
 `real-decision19-ac15-refocus-1792226929095-183941` also failed (0 PASS,
 3 FAIL), on actual `azure/openai/gpt-6-astra` and native 2.1.296, with zero
 classifier stops and zero duplicates. All three parts were delivered exactly
@@ -1140,12 +1150,21 @@ in each trial. Trial 1 returned the correct case/message count but a
 5,338-character body instead of 5,000; trial 2 produced no valid required
 JSON; trial 3 returned short bodies of 1,869 and 1,631 characters.
 
-These results preserve the earlier failures and the six other criteria's
+These results preserve the all-`x` failures and the six other criteria's
 historical 3-of-3 successes. Unpaid replay of the actual native snapshot now
-reaches trial 1's exact-body mismatch, not a pass. The 5,000-character fixture,
-JSON schema, assertions and 3-of-3 requirement are unchanged. No further paid
-run starts before the owner's decision; the full 58-invocation heavy run has
-not started and is not waived. The full `/ci` PASS on `fc763a36` predates these
+reaches trial 1's exact-body mismatch, not a pass.
+
+Decision 20 authorizes three fresh independent AC15 trials with the seeded
+body on actual `azure/openai/gpt-6-astra` and native 2.1.296, with fallback
+disabled. Preserve the prompts, JSON schema, exact receipts/read-back,
+`messages:1`, response/tool discipline, bounds and all assertions.
+
+Start the full 58-invocation heavy run only after AC15 passes 3 of 3; if any
+AC15 trial fails, stop and report a one-line blocker with actual versus expected. No new paid acceptance
+has been established.
+
+The full heavy run has not started and is not waived.
+The full `/ci` PASS on `fc763a36` predates these
 AC15 test changes. Unpaid controls, full unit success and earlier diagnostics
 do not establish fresh AI or heavy acceptance.
 

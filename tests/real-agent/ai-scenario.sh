@@ -150,13 +150,33 @@ else
     start_server --live
     real_wait_launch "${REAL_KEY}"
     if [[ "${AI_CRITERION}" == 15 ]]; then
-        BODY="$(python3 -c 'print("x"*5000,end="")')"
+        BODY="$(python3 - "${EXPECTED}/1.json" <<'AC15_BODY'
+import json,sys
+# Decision 20: fixed ASCII words/punctuation, with natural spaces at the
+# original byte boundaries. The seed/recipe/hashes stay in the private audit.
+state=20261017
+words='amber birch cedar dawn elm fern grove harbor iris jade kelp lake maple nest oak pine quartz reed shore thyme umber vale willow yarrow zephyr acorn brook coral dune ember field garden hazel island juniper kite linen meadow nutmeg olive pebble robin sage tulip violet walnut azure blossom clover drift feather ginger honey ivory jasmine lilac moss orchard petal ripple sorrel'.split()
+separators=[' ', ' ', ' ', ', ', '. ', '; ', ': ', ' - ', '! ', '? ']
+def pick(values):
+ global state
+ state=(1664525*state+1013904223)&0xffffffff
+ return values[(state>>16)%len(values)]
+body=''
+for width in (1700,1700,1600):
+ span=''
+ while len(span)<width:
+  token=pick(words)+pick(separators)
+  remaining=width-len(span)
+  if len(token)>remaining or remaining-len(token)==1:
+   token='a ' if remaining%2==0 else 'ox '
+  span+=token
+ body+=span
+with open(sys.argv[1],'w') as f: json.dump({'case':'AC15','messages':1,'body':body},f)
+sys.stdout.write(body)
+AC15_BODY
+)"
         real_dm "${REAL_LABEL}" "${BODY}"
         real_wait_delivery "${REAL_KEY}" 1
-        python3 - "${EXPECTED}/1.json" <<'EXPECT'
-import json,sys
-json.dump({'case':'AC15','messages':1,'body':'x'*5000},open(sys.argv[1],'w'))
-EXPECT
         wait_until 180 'AC15 reassembly JSON differs' ai_readback "${EXPECTED}/1.json" 1
         real_wait_idle "${REAL_KEY}"
         ai_readback "${EXPECTED}/1.json" 1

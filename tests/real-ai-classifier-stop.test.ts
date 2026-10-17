@@ -3,13 +3,15 @@ import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { classifierObservation, spoofTurn } from './real-agent/ai-classifier-stop.ts'
-import { auditedAICorpus } from './real-agent/ai-fixture-audit.ts'
+import { auditedAICorpus, incidentalBait } from './real-agent/ai-fixture-audit.ts'
 import { assertAIReadbackNoShell } from './real-agent/ai-no-shell.ts'
 import { freshHazardSession } from './real-agent/ai-fresh-session.ts'
 import { completedAIReadback, safeSelectedModel } from './real-agent/ai-readback.ts'
 import { parseDeliveryTranscriptRecord, receiptTextMatches } from '../src/delivery-receipt.ts'
+import { buildTagParts, escapeBody, TAG_MAX_BYTES } from '../src/tag-wrapper.ts'
 import type { TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
 
 // Unpaid native-evidence controls only; no unit result certifies a real AI trial.
@@ -284,11 +286,11 @@ test('multipart reassembly requires every durable part and the final part respon
 
 // AC15 execution discipline is neutral: acknowledgements can finish earlier
 // turns, while only the final part's exact completed JSON proves reassembly.
-function multipartAC15(native = 'user') {
+function multipartAC15(native = 'user', body = 'x'.repeat(5000)) {
   const e = ordinaryEvidence()
-  e.seq = 1; e.expected = { case: 'AC15', messages: 1, body: 'x'.repeat(5000) } as any
+  e.seq = 1; e.expected = { case: 'AC15', messages: 1, body } as any
   const lengths = [1700, 1700, 1600]
-  const parts = lengths.map((n, i) => `<channel source="slack-channel-router" chat_id="D0AIAC15" ts="123.4" part="${i + 1}/3">${'x'.repeat(n)}</channel>`)
+  const parts = lengths.map((n, i) => `<channel source="slack-channel-router" chat_id="D0AIAC15" ts="123.4" part="${i + 1}/3">${body.slice(i * 1700, i * 1700 + n)}</channel>`)
   e.own = []; e.journal = [{ kind: 'accepted', seq: 1, received_at: 10 }, { kind: 'fixed', seq: 1, parts }]
   for (const [i, text] of parts.entries()) {
     const offset = 20 + i * 20, uuid = `part-${i + 1}`
@@ -518,6 +520,52 @@ test('the AC15-only tool restriction does not reject another criterion\'s valid 
   expect(completedAIReadback(e).receipt_uuid).toBe('case3')
 })
 
+function generatedAC15(root: string): string {
+  const source = readFileSync(new URL('./real-agent/ai-scenario.sh', import.meta.url), 'utf8')
+  const start = source.indexOf('        BODY="$(python3')
+  const block = source.slice(start, source.indexOf('        real_dm ', start))
+  const child = spawnSync('bash', ['-eu', '-c', block + '\nprintf \'%s\' "$BODY"'], {
+    env: hostSafeChildEnv(root, { tools: ['bash', 'python3'], extras: { EXPECTED: root } }), encoding: 'utf8', timeout: 5000,
+  })
+  expect(child.error).toBeUndefined(); expect(child.signal).toBeNull(); expect(child.status).toBe(0)
+  expect(child.stderr).toBe('')
+  expect(JSON.parse(readFileSync(join(root, '1.json'), 'utf8'))).toEqual({ case: 'AC15', messages: 1, body: child.stdout })
+  return child.stdout
+}
+
+test('decision 20 AC15 generation is deterministic, varied, bait-free and exactly 5000 ASCII bytes', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ai-ac15-body-'))
+  try {
+    const body = generatedAC15(root), repeated = generatedAC15(root)
+    const { manifest } = auditedAICorpus(), recipe = manifest.criteria.find((c: any) => c.ac === 15).body_fixture
+    const hash = (text: string) => createHash('sha256').update(text).digest('hex')
+    expect(repeated).toBe(body)
+    expect(Buffer.byteLength(body)).toBe(5000)
+    expect(body).toMatch(/^[a-z ,.;:!?-]+$/)
+    expect(new Set(body.match(/[a-z]+/g)).size).toBeGreaterThan(50)
+    expect(new Set(body.match(/[,.;:!?-]/g)).size).toBe(7)
+    expect(incidentalBait.test(body)).toBe(false)
+    expect(escapeBody(body)).toBe(body)
+    expect(JSON.stringify(body)).toBe('"' + body + '"')
+    expect(recipe.seed).toBe(20261017)
+    expect(recipe.body_sha256).toBe(hash(body))
+    expect(recipe.body_bytes).toBe(5000)
+    expect(recipe.part_bytes).toEqual([1700, 1700, 1600])
+    // Same DM metadata/width as real_dm, including the six-digit timestamp.
+    const ts = '1792226929.000001'
+    const parts = buildTagParts({ chat_id: 'D0AIAC15', channel_name: 'dm', message_id: ts,
+      user: 'stub-u0aiac15', user_id: 'U0AIAC15', ts, via: 'dm', text: body })
+    const bodies = parts.map((part, i) => {
+      expect(part).toContain(` part="${i + 1}/3">`)
+      expect(Buffer.byteLength(part)).toBeLessThanOrEqual(TAG_MAX_BYTES)
+      return part.slice(part.indexOf('>') + 1, -'</channel>'.length)
+    })
+    expect(bodies.map(part => Buffer.byteLength(part))).toEqual([1700, 1700, 1600])
+    expect(bodies.join('')).toBe(body)
+    expect(bodies.map(hash)).toEqual(recipe.part_sha256)
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
 test('AC15 appends only the approved response discipline to its existing request', () => {
   const root = mkdtempSync(join(tmpdir(), 'ai-ac15-prompt-'))
   try {
@@ -534,7 +582,7 @@ test('AC15 appends only the approved response discipline to its existing request
 test.each([false, true])('actual AC15 scenario checks again after idle, late retrieval=%s', late => {
   const root = mkdtempSync(join(tmpdir(), 'ai-ac15-shell-'))
   try {
-    const e = multipartAC15(), data = join(root, 'evidence.json'), observer = join(root, 'observer.ts')
+    const e = multipartAC15('user', generatedAC15(root)), data = join(root, 'evidence.json'), observer = join(root, 'observer.ts')
     writeFileSync(data, JSON.stringify(e))
     writeFileSync(observer, `import { readFileSync, writeFileSync } from 'node:fs'
 import { completedAIReadback } from ${JSON.stringify(new URL('./real-agent/ai-readback.ts', import.meta.url).pathname)}
@@ -555,7 +603,7 @@ if (mode === 'idle') {
     const block = source.slice(start, source.indexOf('    elif [[ "${AI_CRITERION}" == 106', start))
     const script = join(root, 'scenario.sh')
     writeFileSync(script, `set -eu
-real_dm() { [[ "$2" == "$(python3 -c 'print("x"*5000,end="")')" ]]; }
+real_dm() { [[ "$2" == "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["body"],end="")' "$EXPECTED/1.json")" ]]; }
 real_wait_delivery() { [[ "$2" == 1 ]]; }
 wait_until() { shift 2; "$@"; }
 ai_readback() { "${process.execPath}" "${observer}" readback "${data}" "$1" "$2"; }
